@@ -1,0 +1,138 @@
+[package]
+name = "ghost-brain"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+tokio-util = "0.7"
+
+# Solana SDK
+solana-sdk = "1.18"
+solana-client = "1.18"
+solana-rpc-client = "1.18"
+solana-transaction-status = "1.18"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"
+base64 = "0.21"
+toml = "0.8"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+async-trait = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Metrics
+metrics = "0.21"
+prometheus = "0.13"
+
+# Configuration
+dotenv = "0.15"
+shellexpand = "3.1"
+
+# CLI parsing (for test runner)
+clap = { version = "4.4", features = ["derive"] }
+
+# Datetime utilities (for report generation)
+chrono = "0.4"
+
+# Lock-free data structures and memory management
+crossbeam-queue = "0.3"
+object-pool = "0.5"
+parking_lot = "0.12"
+once_cell = "1.19"
+rand = "0.8"
+rand_xoshiro = "0.6"
+rayon = "1.8"
+blake3 = "1.5"
+dashmap = "5.5"
+rustc-hash = "1.1"
+bitflags = "2.4"
+
+# Yellowstone gRPC for leader schedule monitoring
+yellowstone-grpc-client = "1.14"
+yellowstone-grpc-proto = "1.14"
+futures-util = "0.3"
+futures = "0.3"
+
+# HTTP client for Vision Critic
+reqwest = { version = "0.11", features = ["json"] }
+
+# HyperOracle dependencies
+rustfft = "6.1"
+nalgebra = "0.32"
+
+# Machine Learning / Statistics (for calibration)
+linfa = { version = "0.7", features = ["serde"] }
+linfa-linear = "0.7"
+
+# Data processing and export
+csv = "1.3"
+arrow = { version = "53", features = ["prettyprint"] }
+parquet = { version = "53", features = ["arrow"] }
+walkdir = "2.5"
+
+# Internal dependencies
+ghost-core = { path = "../ghost-core" }
+seer = { path = "../off-chain/components/seer" }
+trigger = { path = "../off-chain/components/trigger" }
+gui-backend = { path = "../gui-backend" }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+ghost-launcher = { path = "../ghost-launcher" }
+proptest = "1.4"
+tempfile = "3.8"
+
+[lib]
+name = "ghost_brain"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ghost-e2e-runner"
+path = "src/main.rs"
+
+[[bin]]
+name = "e2e-test-runner"
+path = "src/bin/e2e-test-runner.rs"
+
+[[bin]]
+name = "ghost-brain-calibrate-qedd"
+path = "src/bin/calibrate_qedd.rs"
+
+[[bin]]
+name = "ghost-brain-backtest-qedd"
+path = "src/bin/backtest_qedd.rs"
+
+[[bench]]
+name = "oracle_bench"
+harness = false
+
+[[bench]]
+name = "fast_pipeline_bench"
+harness = false
+
+[[bench]]
+name = "amm_math_bench"
+harness = false
+
+[[bench]]
+name = "qedd_mci_bench"
+harness = false
+
+[[bench]]
+name = "scoring_benchmarks"
+harness = false
+
+[[bench]]
+name = "cabal_bench"
+harness = false

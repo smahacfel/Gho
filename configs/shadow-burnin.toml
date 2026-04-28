@@ -1,0 +1,122 @@
+# PR-6 rollout profile: canonical shadow burn-in
+# First-class standalone shadow runtime. Live sender remains disabled; the
+# trigger.shadow_run block is only the launcher shadow transport adapter.
+# Guardian/AEM thresholds live in ../../ghost-brain/ghost_brain_config.toml.
+# Shadow exits reuse the same simple take-profit / stop-loss percentages as
+# live / dual-live and do not use the Revolver shadow target ladder.
+# Wszystkie wartości sekretowe muszą być dostarczone przez env/.env.
+
+mode = "production"
+ghost_brain_config_path = "../../ghost-brain/ghost_brain_config.toml"
+# Active Gatekeeper profile for this rollout is enforced by the referenced
+# ghost_brain_config.toml:
+# - window: max_wait_time_ms = 8001
+# - Phase 1: total_tx >= 12, unique_signers >= 8, buy_count >= 6
+# - Phase 2: avg_interval_ms <= 450ms, interval_cv <= 2.3
+# - Phase 3: hhi <= 0.155, volume_gini >= 0.53, top3_volume_pct <= 0.70
+# - Fingerprint choke: early_top3_buy_volume_pct_3s <= 0.71 to catch hidden
+#   2-3s concentration that full-window top3 can miss
+# - Phase 4: buy_ratio >= 0.80, min_consecutive_buys >= 3
+# - Phase 5: dev_buy_sol <= 2.0, dev_volume_ratio <= 0.23
+# - Phase 6: market_cap_sol >= 60, bonding_pct >= 40
+# - Prosperity floor: market_cap_sol >= 45 before Balanced branch / overlay checks
+# - Alpha gate ON, prosperity ON, prosperity overlay OFF for this rerun
+# - Exit strategy: TP ladder +12%→+20%→+35%→+50%, SL -12%, max 30min hold
+
+[seer]
+enabled = true
+source_mode = "grpc"
+commitment = "processed"
+stream_mode = "single_global"
+tx_filter_strategy = "per_pool"
+# Canonical PR-6 shadow burn-in profile keeps the authoritative funding lane on,
+# so the standard operator command exercises standalone shadow + real FSC coverage.
+funding_lane_mode = "full_chain"
+grpc_endpoint = "yellowstone.example.invalid:443"
+grpc_x_token = ""
+rpc_endpoint = "https://rpc.example.invalid/seer"
+enable_pumpfun = true
+enable_bonkfun = false
+enable_raydium = false
+
+[trigger]
+enabled = true
+rpc_url = "https://rpc.example.invalid/trigger"
+# REQUIRED in production: override via GHOST_TRIGGER_KEYPAIR_PATH.
+keypair_path = "replace-me"
+entry_mode = "shadow_only"
+# Even without live send, canonical shadow burn-in keeps the same production
+# bulkhead contract: these values are still the primary wallet/risk guardrails.
+max_concurrent_positions = 5
+max_position_size_sol = 0.007
+emergency_floor_sol = 0.0001
+position_size_buffer_sol = 0.0001
+slippage_tolerance = 0.20
+# Shadow burn-in now uses data-driven exit strategy from exit_strategy section.
+# Take-profit ladder: +12% (20%), +20% (25%), +35% (30%), +50% (25%)
+# Stop-loss: -12%, Max hold: 30 minutes
+# Entry delay: 6s verification wait post-BOUGHT to re-check momentum metrics
+live_exit_take_profit_pct = 0.50  # Updated: use ladder (not flat 25%)
+live_exit_stop_loss_pct = 0.50  # Updated: hard stop at -12%
+
+[trigger.shadow_run]
+enabled = true
+# REQUIRED in production: override via GHOST_TRIGGER_SHADOW_RPC_URL.
+shadow_rpc_url = "https://shadow-rpc.example.invalid/mainnet"
+commitment = "processed"
+sig_verify = false
+replace_recent_blockhash = true
+timeout_ms = 1600
+max_retries = 1
+max_concurrent = 8
+output_path = "../../logs/shadow_run/shadow-burnin-buys.jsonl"
+emit_event_bus = true
+
+[execution]
+execution_mode = "shadow"
+
+[execution.shadow]
+tx_build_compensation_ms = 200
+max_quote_age_ms = 1500
+# Canonical shadow proof artifacts.
+entry_log_path = "../../logs/shadow_run/shadow-burnin/shadow_entries.jsonl"
+lifecycle_log_path = "../../logs/shadow_run/shadow-burnin/shadow_lifecycle.jsonl"
+timing_model = "prepared_entry_mirror"
+stale_policy = "emit_warning"
+
+[execution.events]
+output_dir = "../../datasets/events/shadow-burnin"
+rotation_interval_ms = 300000
+flush_interval_ms = 1000
+max_file_size_bytes = 50000000
+enable_aem_ticks = true
+enable_optional_events = false
+
+[oracle]
+# Dedicated Gatekeeper decision artifacts for canonical shadow burn-in.
+decision_log_path = "../../logs/rollout/shadow-burnin/decisions"
+
+[durability]
+wal_enabled = false
+wal_dir = "../../data/rollout/shadow-burnin/wal"
+snapshot_dir = "../../data/rollout/shadow-burnin/snapshots"
+
+[metrics]
+enabled = true
+bind = "0.0.0.0"
+port = 9090
+
+[gui_backend]
+enabled = true
+bind_address = "127.0.0.1"
+port = 8801
+
+[logging]
+level = "info"
+console_enabled = true
+json_format = false
+file_enabled = true
+file_path = "../../logs/rollout/shadow-burnin/system.log"
+oracle_log_enabled = true
+oracle_log_path = "../../logs/rollout/shadow-burnin/oracle.log"
+oracle_json_format = false

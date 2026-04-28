@@ -1,0 +1,29 @@
+Replay Equivalence Proof v2 | case=n500_baseline_f1_channel_full | verdict=PASS
+mode_compare=Live-only_vs_Dual(live_lane) n=500 seed=128182 profile=baseline scenario=f1_channel_full
+
+A) Lifecycle accounting
+- submitted == terminal_total: live=true dual_live=true
+- candidate == opened + terminal_entry_fail: live=true dual_live=true
+- in_flight==0: live=true dual_live=true
+
+B) Exactly-once
+- duplicates fill/opened/closed: live=0/0/0 dual_live=0/0/0
+
+C) Gaps
+- missing_terminal_orders (dual_live): []
+- multiple_terminal_orders (dual_live): []
+- candidate_without_opened_or_failed (dual_live): []
+
+D) Timing
+- p50 live=305.00 dual_live=305.00
+- p90 live=380.00 dual_live=380.00
+- threshold=10.00% timing_pass=true
+
+E) Terminal deltas
+- filled: live=368 dual_live=368 delta=0 allowed=25 pass=true
+- failed: live=132 dual_live=132 delta=0 allowed=25 pass=true
+- timeout: live=0 dual_live=0 delta=0 allowed=25 pass=true
+- unknown: live=0 dual_live=0 delta=0 allowed=25 pass=true
+
+F) Failed checks
+- []

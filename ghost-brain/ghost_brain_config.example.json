@@ -1,0 +1,116 @@
+{
+  "version": 1,
+  "mpcf": {
+    "bot_entropy_threshold": 3.5,
+    "human_entropy_threshold": 5.5,
+    "bot_iss_variance_threshold": 0.15,
+    "human_iss_variance_threshold": 0.35,
+    "sybil_entropy_threshold": 3.5,
+    "min_payload_size": 32,
+    "max_payload_size": 4096,
+    "unknown_confidence": 0.3,
+    "low_confidence_small_payload": 0.4
+  },
+  "ssmi": {
+    "bot_scr_threshold": 0.7,
+    "bot_ar_threshold": 0.8,
+    "bot_entropy_threshold": 1.5,
+    "human_entropy_threshold": 3.0,
+    "human_ar_threshold": 0.3,
+    "human_scr_threshold": 0.4,
+    "viral_min_tx_count": 6,
+    "viral_entropy_min": 2.5,
+    "viral_entropy_max": 4.0,
+    "viral_scr_threshold": 0.5,
+    "score_weight_entropy": 0.35,
+    "score_weight_scr": 0.4,
+    "score_weight_ar": 0.25,
+    "viral_score_bonus": 0.15,
+    "human_score_bonus": 0.05,
+    "bot_score_penalty": 0.2,
+    "histogram_bins": 64,
+    "max_jitter_ms": 2000
+  },
+  "iwim": {
+    "iapp_rug_threshold": 2,
+    "min_iapp_rug_score": 0.95,
+    "at_window_ms": 1500,
+    "quiet_window_ms": 5000,
+    "max_tx_analyze": 50,
+    "confidence_threshold": 0.6,
+    "target_analysis_time_us": 120
+  },
+  "qass": {
+    "collapse_threshold": 0.5,
+    "score_threshold_viral": 0.85,
+    "score_threshold_moderate": 0.7,
+    "score_threshold_neutral": 0.5,
+    "score_threshold_suspicious": 0.3,
+    "default_signal_weight": 1.0
+  },
+  "sobp": {
+    "human_weight_multiplier": 2.0,
+    "sniper_weight_multiplier": 0.5,
+    "default_weight_multiplier": 1.0,
+    "base_transaction_weight": 1.0,
+    "hyper_pump_threshold": 3.0,
+    "growth_threshold": 1.5,
+    "stagnation_threshold": 0.8,
+    "implosion_threshold": 0.4,
+    "confidence_weight_history": 0.4,
+    "confidence_weight_tx_count": 0.3,
+    "confidence_weight_intensity": 0.3,
+    "slot_capacity": 64,
+    "min_slot_history": 2
+  },
+  "qofsv": {
+    "state_vector_dim": 6,
+    "epsilon": 0.000001,
+    "target_construction_time_us": 200,
+    "target_normalization_time_us": 50
+  },
+  "frb": {
+    "min_amplitude_threshold": 0.001,
+    "enable_filtering": true
+  },
+  "resonance": {
+    "bot_threshold_cv": 0.3,
+    "human_threshold_cv": 0.8
+  },
+  "mci": {
+    "version": 1,
+    "weight_dc": 0.6,
+    "weight_sc": 0.4,
+    "coherence_abort_threshold": 0.3
+  },
+  "qedd": {
+    "version": 1,
+    "lambda_base": 0.5,
+    "lambda_sensitivity": 0.1,
+    "lambda_abort_threshold": 0.95,
+    "alpha_sobp_drop": 0.3,
+    "beta_outflow": 0.25,
+    "gamma_resonance": 0.15,
+    "delta_deviation": 0.20,
+    "horizon_1s": 1000,
+    "horizon_5s": 5000,
+    "horizon_30s": 30000,
+    "horizon_60s": 60000
+  },
+  "confidence": {
+    "weight_sobp": 12.0,
+    "weight_mpcf": 10.0,
+    "weight_iwim": 8.0,
+    "weight_ssmi": 9.0,
+    "weight_qass": 15.0,
+    "weight_qofsv": 11.0,
+    "weight_scr": 13.0,
+    "weight_frb": 7.0,
+    "weight_qman": 14.0,
+    "weight_gene_mapper": 10.0,
+    "weight_chaos_engine": 11.0,
+    "threshold_high_confidence": 0.8,
+    "threshold_medium_confidence": 0.5,
+    "threshold_low_confidence": 0.3
+  }
+}

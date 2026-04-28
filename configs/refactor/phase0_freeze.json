@@ -1,0 +1,306 @@
+{
+  "schema_name": "ghost.refactor.phase0.freeze",
+  "schema_version": 1,
+  "plan_path": "PLANS/PLAN_WYKONAWCZY_DOMKNIECIA_REFAKTORU_ARCHITEKTURY_20260401.md",
+  "audit_path": "docs/ADR/ADR-0072-refactor-architecture-audit-2026-04-01.md",
+  "description": "Phase 0 freeze contract for safe closure of PR2/PR6/PR7/PR8.",
+  "phase_gates": [
+    "compile/test",
+    "structural-search",
+    "replay/shadow",
+    "rollout"
+  ],
+  "critical_paths": [
+    "ghost-core/src/account_state_core/reducer.rs",
+    "ghost-launcher/src/oracle_runtime.rs",
+    "ghost-launcher/src/session/observation.rs",
+    "ghost-launcher/src/components/gatekeeper.rs",
+    "ghost-launcher/src/components/gatekeeper_policy.rs",
+    "ghost-brain/src/config/ghost_brain_config.rs",
+    "ghost-launcher/src/config.rs",
+    "ghost-launcher/src/main.rs",
+    "off-chain/components/seer/src/config.rs",
+    "off-chain/components/seer/src/lib.rs",
+    "ghost-launcher/src/components/post_buy_runtime.rs",
+    "off-chain/components/trigger/src/revolver_price_feed.rs",
+    "ghost-core/src/shadow_ledger/reconciliation.rs",
+    "ghost-core/src/shadow_ledger/reconciliation_runtime.rs",
+    "ghost-core/src/shadow_ledger/ledger.rs",
+    "ghost-core/tests/refactor_invariants_tests.rs",
+    "ghost-launcher/tests/refactor_invariants_tests.rs"
+  ],
+  "baseline": {
+    "summary": {
+      "targets": 11,
+      "tests_total": 70,
+      "tests_passed": 70,
+      "tests_failed": 0
+    },
+    "known_failures": [],
+    "targets": [
+      {
+        "id": "ghost-core-account-state-core",
+        "command": "cargo test -p ghost-core --test account_state_core_tests",
+        "expected": "green"
+      },
+      {
+        "id": "ghost-core-checkpoint-engine",
+        "command": "cargo test -p ghost-core --test checkpoint_engine_tests",
+        "expected": "green"
+      },
+      {
+        "id": "ghost-core-feature-builder",
+        "command": "cargo test -p ghost-core --test feature_builder_tests",
+        "expected": "green"
+      },
+      {
+        "id": "ghost-launcher-session-lifecycle",
+        "command": "cargo test -p ghost-launcher --test session_lifecycle_tests",
+        "expected": "green"
+      },
+      {
+        "id": "ghost-launcher-gatekeeper-policy",
+        "command": "cargo test -p ghost-launcher --test gatekeeper_policy_tests",
+        "expected": "green"
+      },
+      {
+        "id": "ghost-launcher-full-pipeline",
+        "command": "cargo test -p ghost-launcher --test full_pipeline_integration",
+        "expected": "green"
+      },
+      {
+        "id": "ghost-launcher-tx-intelligence",
+        "command": "cargo test -p ghost-launcher --test tx_intelligence_tests",
+        "expected": "green"
+      },
+      {
+        "id": "ghost-launcher-post-buy-runtime",
+        "command": "cargo test -p ghost-launcher --test post_buy_runtime_integration",
+        "expected": "green"
+      },
+      {
+        "id": "ghost-launcher-wal-startup-recovery",
+        "command": "cargo test -p ghost-launcher --test wal_startup_recovery",
+        "expected": "green"
+      },
+      {
+        "id": "ghost-launcher-seer-connection-mode",
+        "command": "cargo test -p ghost-launcher --test seer_connection_mode_test",
+        "expected": "green"
+      },
+      {
+        "id": "trigger-jito-bundle-integration",
+        "command": "cargo test -p trigger --test jito_bundle_integration",
+        "expected": "green"
+      }
+    ]
+  },
+  "blast_radius": {
+    "repo_rs_counts": {
+      "evaluate_from_features_legacy": 2,
+      "account_updates_enabled": 61,
+      "repaired": 25,
+      "legacy_repair": 9,
+      "repair": 113,
+      "shadow_ledger_get_curve": 15,
+      "shadow_ledger_get_quote": 2,
+      "dot_on_transaction": 157
+    }
+  },
+  "monotonic_counts": [
+    {
+      "name": "evaluate_from_features_legacy",
+      "description": "Legacy terminal verdict surface must not grow after Phase 0 freeze.",
+      "paths": [
+        "ghost-launcher/src/**/*.rs",
+        "ghost-core/src/**/*.rs",
+        "ghost-brain/src/**/*.rs",
+        "off-chain/components/seer/src/**/*.rs",
+        "off-chain/components/trigger/src/**/*.rs"
+      ],
+      "pattern": "evaluate_from_features_legacy",
+      "match": "literal",
+      "baseline": 2,
+      "max": 2
+    },
+    {
+      "name": "account_updates_enabled",
+      "description": "Compatibility flag surface must not grow after Phase 0 freeze.",
+      "paths": [
+        "config.toml",
+        "ghost-launcher/src/**/*.rs",
+        "ghost-core/src/**/*.rs",
+        "ghost-brain/src/**/*.rs",
+        "off-chain/components/seer/src/**/*.rs",
+        "off-chain/components/trigger/src/**/*.rs"
+      ],
+      "pattern": "account_updates_enabled",
+      "match": "literal",
+      "baseline": 60,
+      "max": 60
+    },
+    {
+      "name": "repaired_surface",
+      "description": "Repair-centric operator language must not grow after Phase 0 freeze.",
+      "paths": [
+        "ghost-launcher/src/**/*.rs",
+        "ghost-core/src/**/*.rs",
+        "ghost-brain/src/**/*.rs",
+        "off-chain/components/seer/src/**/*.rs",
+        "off-chain/components/trigger/src/**/*.rs"
+      ],
+      "pattern": "\\bRepaired\\b",
+      "match": "regex",
+      "baseline": 25,
+      "max": 25
+    },
+    {
+      "name": "legacy_repair_surface",
+      "description": "Legacy repair helpers must not grow after Phase 0 freeze.",
+      "paths": [
+        "ghost-launcher/src/**/*.rs",
+        "ghost-core/src/**/*.rs",
+        "ghost-brain/src/**/*.rs",
+        "off-chain/components/seer/src/**/*.rs",
+        "off-chain/components/trigger/src/**/*.rs"
+      ],
+      "pattern": "legacy_repair[a-zA-Z0-9_]*",
+      "match": "regex",
+      "baseline": 9,
+      "max": 9
+    },
+    {
+      "name": "repair_surface",
+      "description": "Repair-prefixed surfaces must not grow after Phase 0 freeze.",
+      "paths": [
+        "ghost-launcher/src/**/*.rs",
+        "ghost-core/src/**/*.rs",
+        "ghost-brain/src/**/*.rs",
+        "off-chain/components/seer/src/**/*.rs",
+        "off-chain/components/trigger/src/**/*.rs"
+      ],
+      "pattern": "\\brepair[a-zA-Z0-9_]*",
+      "match": "regex",
+      "baseline": 114,
+      "max": 114
+    }
+  ],
+  "zero_count_checks": [
+    {
+      "name": "production_on_transaction_path",
+      "description": "Production hot path must not route decisions through gatekeeper_buffer.on_transaction().",
+      "paths": [
+        "ghost-launcher/src/**/*.rs"
+      ],
+      "pattern": "gatekeeper_buffer\\.on_transaction\\(",
+      "match": "regex",
+      "expected": 0
+    }
+  ],
+  "presence_checks": [
+    {
+      "name": "metric_account_update_before_identity_total",
+      "description": "Phase 0 must count account updates arriving before identity registration.",
+      "path": "ghost-launcher/src/oracle_runtime.rs",
+      "needle": "\"account_update_before_identity_total\""
+    },
+    {
+      "name": "metric_account_update_build_none_total",
+      "description": "Phase 0 must count build_account_state_update None exits.",
+      "path": "ghost-launcher/src/oracle_runtime.rs",
+      "needle": "\"account_update_build_none_total\""
+    },
+    {
+      "name": "metric_canonical_first_update_latency_ms",
+      "description": "Phase 0 must measure NewPoolDetected to first canonical update latency.",
+      "path": "ghost-launcher/src/session/observation.rs",
+      "needle": "\"canonical_first_update_latency_ms\""
+    },
+    {
+      "name": "metric_shadow_truth_fallback_total_oracle_runtime",
+      "description": "Phase 0 must meter ShadowLedger fallback sites in oracle_runtime.",
+      "path": "ghost-launcher/src/oracle_runtime.rs",
+      "needle": "\"shadow_truth_fallback_total\""
+    },
+    {
+      "name": "metric_post_buy_price_source_total",
+      "description": "Phase 0 must expose post-buy price source telemetry.",
+      "path": "ghost-launcher/src/components/post_buy_runtime.rs",
+      "needle": "\"post_buy_price_source_total\""
+    },
+    {
+      "name": "metric_legacy_terminal_verdict_total",
+      "description": "Phase 0 must meter legacy terminal verdict reachability.",
+      "path": "ghost-launcher/src/oracle_runtime.rs",
+      "needle": "\"legacy_terminal_verdict_total\""
+    },
+    {
+      "name": "metric_timeout_without_canonical_updates_total",
+      "description": "Phase 0 must count timeout exits without canonical updates.",
+      "path": "ghost-launcher/src/oracle_runtime.rs",
+      "needle": "\"timeout_without_canonical_updates_total\""
+    },
+    {
+      "name": "label_shadow_truth_fallback_site_resolve_price_context",
+      "description": "Shadow truth fallback must expose resolve_price_context site label.",
+      "path": "ghost-launcher/src/oracle_runtime.rs",
+      "needle": "\"site\" => \"resolve_price_context\""
+    },
+    {
+      "name": "label_shadow_truth_fallback_site_resolve_gatekeeper_initial_reserves",
+      "description": "Shadow truth fallback must expose resolve_gatekeeper_initial_reserves site label.",
+      "path": "ghost-launcher/src/oracle_runtime.rs",
+      "needle": "\"site\" => \"resolve_gatekeeper_initial_reserves\""
+    },
+    {
+      "name": "label_shadow_truth_fallback_site_tx_curve_enrichment_shadow",
+      "description": "Shared shadow fallback metric must explicitly record tx_curve_enrichment_shadow usage.",
+      "path": "ghost-launcher/src/oracle_runtime.rs",
+      "needle": "record_shadow_truth_fallback(\"tx_curve_enrichment_shadow\")"
+    },
+    {
+      "name": "label_post_buy_price_source_canonical_account_state",
+      "description": "Post-buy price source metric must expose canonical_account_state source label.",
+      "path": "ghost-launcher/src/components/post_buy_runtime.rs",
+      "needle": "\"canonical_account_state\""
+    },
+    {
+      "name": "label_post_buy_price_source_rpc_point_query",
+      "description": "Post-buy price source metric must expose rpc_point_query source label.",
+      "path": "ghost-launcher/src/components/post_buy_runtime.rs",
+      "needle": "\"rpc_point_query\""
+    },
+    {
+      "name": "label_post_buy_price_source_unavailable",
+      "description": "Post-buy price source metric must expose unavailable source label.",
+      "path": "ghost-launcher/src/components/post_buy_runtime.rs",
+      "needle": "\"unavailable\""
+    }
+  ],
+  "block_absence_checks": [
+    {
+      "name": "resolve_price_context_no_shadow_ledger_get_curve",
+      "description": "resolve_price_context must not fall back to shadow_ledger.get_curve().",
+      "path": "ghost-launcher/src/oracle_runtime.rs",
+      "start": "fn resolve_price_context(",
+      "end": "pub fn set_panic_retention_ms",
+      "needle": "shadow_ledger.get_curve("
+    },
+    {
+      "name": "resolve_gatekeeper_initial_reserves_no_shadow_ledger_get_curve",
+      "description": "resolve_gatekeeper_initial_reserves must not fall back to shadow_ledger.get_curve().",
+      "path": "ghost-launcher/src/oracle_runtime.rs",
+      "start": "fn resolve_gatekeeper_initial_reserves(",
+      "end": "fn stage_gatekeeper_history_for_commit(",
+      "needle": "shadow_ledger.get_curve("
+    },
+    {
+      "name": "revolver_price_feed_no_shadow_ledger_get_quote",
+      "description": "Production revolver price feed must not use shadow_ledger.get_quote() as truth source.",
+      "path": "off-chain/components/trigger/src/revolver_price_feed.rs",
+      "start": "use",
+      "end": "#[cfg(test)]",
+      "needle": "shadow_ledger.get_quote("
+    }
+  ]
+}

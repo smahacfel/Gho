@@ -1,0 +1,51 @@
+[package]
+name = "gui-backend"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+
+# Web framework
+axum = { version = "0.7", features = ["ws", "macros"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }
+futures-util = "0.3"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml_edit = "0.22"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Solana SDK (for types)
+solana-sdk = "1.18"
+solana-client = "1.18"
+
+[[bin]]
+name = "ghost-gui"
+path = "src/main.rs"
+
+[lib]
+name = "gui_backend"
+path = "src/lib.rs"
+
+[[example]]
+name = "simple_server"
+path = "examples/simple_server.rs"
+
+[[example]]
+name = "portfolio_tracker"
+path = "examples/portfolio_tracker.rs"
+
+[[example]]
+name = "test_server"
+path = "examples/test_server.rs"

@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ghost Control Panel</title>
+    <link rel="stylesheet" href="css/style.css?v=20260312e">
+</head>
+<body>
+    <div class="app-shell">
+        <section class="banner-card">
+            <div class="banner-slot" id="bannerSlot">
+                <div class="banner-status-panel">
+                    <div class="connection-chip is-disconnected" id="connectionChip">Disconnected</div>
+                    <div class="wallet-summary" id="walletSummary">
+                        <div class="wallet-summary-line" id="walletAddressLine">✅ Portfel:</div>
+                        <div class="wallet-summary-line" id="walletBalanceLine">💰 Wartość portfela w SOL:</div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <header class="top-header">
+            <div class="title-wrap">
+                <h1 style="font-size: calc(2.5rem - 1px); margin-top: 3px;">PANEL STEROWANIA</h1>
+                <p style="font-size: calc(0.95rem + 1px); color: white;">Runtime + konfiguracja + zarządzanie + live statusy</p>
+            </div>
+        </header>
+
+        <section class="card">
+            <div class="card-head">
+                <h2>Runtime:</h2>
+                <button class="btn btn-primary" id="refreshStatusBtn">Odśwież status</button>
+            </div>
+            <div class="status-grid">
+                <div class="status-item">
+                    <span>Tryb GUI</span>
+                    <strong id="systemMode">✅ODPALONE</strong>
+                </div>
+                <div class="status-item">
+                    <span>tmux session</span>
+                    <strong id="tmuxStatus">✅ODPALONE</strong>
+                </div>
+                <div class="status-item">
+                    <span>ghost-launcher PID</span>
+                    <strong id="launcherStatus">✅ODPALONE</strong>
+                </div>
+            </div>
+            <div class="control-row action-btns">
+                <button class="btn btn-success" id="startRunBtn">START</button>
+                <button class="btn btn-danger" id="stopRunBtn">WYŁĄCZ</button>
+            </div>
+            <div class="message" id="controlMessage"></div>
+        </section>
+
+        <section class="card">
+            <div class="card-head">
+                <h2>Tryb połączenia data streamingu:</h2>
+            </div>
+            <div class="connection-mode-row">
+                <label class="check-label">
+                    <input type="checkbox" id="modeGrpc" checked>
+                    <span>gRPC (Yellowstone)</span>
+                </label>
+                <label class="check-label">
+                    <input type="checkbox" id="modePumpPortal">
+                    <span>PumpPortal WS</span>
+                </label>
+            </div>
+        </section>
+
+        <section class="card">
+            <div class="card-head">
+                <h2>Konfiguracja:</h2>
+                <button class="btn btn-primary" id="saveConfigBtn">ZAPISZ</button>
+            </div>
+            <p class="hint">Edycja: <code>Ustawienia główne</code> + <code>ustawienia Gatekeepera</code>.</p>
+
+            <div class="tab-bar">
+                <button class="tab-btn active" data-tab="tabMain">Główna konfiguracja</button>
+                <button class="tab-btn" data-tab="tabGatekeeper">Filtry parametryczne</button>
+                <button class="tab-btn" data-tab="tabIwim">Ustawienia główne IWIM</button>
+                <button class="tab-btn" data-tab="tabIwimVeto">Ustawienia IWIM Veto</button>
+            </div>
+
+            <div class="tab-content active" id="tabMain">
+                <div class="form-grid" id="mainConfigGrid">
+                    <div class="field">
+                        <label>logging.level</label>
+                        <select><option>info</option><option>debug</option></select>
+                    </div>
+                    <div class="field">
+                        <label>trigger.jito_tip.base_tip_percent</label>
+                        <input type="text" value="0.01">
+                    </div>
+                    <div class="field">
+                        <label>trigger.jito_tip.dynamic_tip_percent</label>
+                        <input type="text" value="0.02">
+                    </div>
+                    <div class="field">
+                        <label>trigger.jito_tip.max_tip_percent</label>
+                        <input type="text" value="0.05">
+                    </div>
+                    <div class="field">
+                        <label>trigger.jito_tip.max_tip_absolute_sol</label>
+                        <input type="text" value="0.04">
+                    </div>
+                </div>
+            </div>
+
+            <div class="tab-content" id="tabGatekeeper">
+                <div class="form-grid" id="gatekeeperGrid"></div>
+            </div>
+
+            <div class="tab-content" id="tabIwim">
+                <div class="form-grid" id="iwimGrid"></div>
+            </div>
+
+            <div class="tab-content" id="tabIwimVeto">
+                <div class="form-grid" id="iwimVetoGrid"></div>
+            </div>
+
+            <div class="message" id="configMessage"></div>
+        </section>
+
+        <section class="card">
+            <div class="card-head">
+                <h2>Personalizacja</h2>
+            </div>
+            <p class="hint">Ustawienia zapisywane lokalnie w przeglądarce.</p>
+            <div class="form-grid">
+                <div class="field">
+                    <label>Obraz tła (URL)</label>
+                    <input type="text" id="bgImageUrl" placeholder="https://example.com/bg.jpg">
+                    <button class="btn btn-muted btn-sm" id="bgApplyBtn">Ustaw tło</button>
+                    <button class="btn btn-muted btn-sm" id="bgClearBtn">Resetuj tło</button>
+                </div>
+                <div class="field">
+                    <label>Obraz tła (plik)</label>
+                    <input type="file" id="bgFileInput" accept="image/*">
+                </div>
+                <div class="field">
+                    <label>Obraz bannera (plik)</label>
+                    <input type="file" id="bannerFileInput" accept="image/*">
+                    <button class="btn btn-muted btn-sm" id="bannerClearBtn">Resetuj banner</button>
+                </div>
+
+            </div>
+        </section>
+    </div>
+
+    <script src="js/app.js?v=20260312e"></script>
+</body>
+</html>

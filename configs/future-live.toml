@@ -1,0 +1,92 @@
+# PR-6 rollout profile: future live
+# Profil jest przygotowany wyłącznie jako artefakt konfiguracyjny.
+# Nie używać przed zamknięciem PR-7 i formalnym go/no-go.
+# Wszystkie wartości sekretowe muszą być dostarczone przez env/.env.
+
+mode = "production"
+ghost_brain_config_path = "../../ghost-brain/ghost_brain_config.toml"
+
+[seer]
+enabled = true
+source_mode = "grpc"
+commitment = "processed"
+stream_mode = "single_global"
+tx_filter_strategy = "per_pool"
+# PR-6 guardrail: committed future-live profile stays neutral until post-shadow go/no-go.
+funding_lane_mode = "disabled"
+grpc_endpoint = "yellowstone-solana-mainnet.core.chainstack.com:443"
+grpc_x_token = "f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+helius_endpoint = "https://mainnet.helius-rpc.com/?api-key=0ef958d5-c877-47ab-89da-c8a001dd0f12"
+rpc_endpoint = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+enable_pumpfun = true
+enable_bonkfun = false
+enable_raydium = false
+
+[trigger]
+enabled = true
+rpc_url = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+keypair_path = "../../wallets/dual-micro-live-wallet.json"
+entry_mode = "live"
+max_concurrent_positions = 1
+max_position_size_sol = 0.015
+emergency_floor_sol = 0.002
+position_size_buffer_sol = 0.002
+slippage_tolerance = 0.25
+live_preflight_max_state_age_slots = 10
+live_exit_take_profit_pct = 0.58
+live_exit_stop_loss_pct = 0.46
+
+[trigger.tip_guard]
+max_tip_absolute_sol = 0.001
+fallback_tip_sol = 0.00
+
+[trigger.shadow_run]
+enabled = false
+shadow_rpc_url = "https://mainnet.helius-rpc.com/?api-key=0ef958d5-c877-47ab-89da-c8a001dd0f12"
+commitment = "processed"
+sig_verify = false
+replace_recent_blockhash = true
+timeout_ms = 1600
+max_retries = 1
+max_concurrent = 8
+output_path = "../../logs/shadow_run/future-live-buys.jsonl"
+emit_event_bus = true
+
+[execution]
+execution_mode = "live"
+
+[execution.events]
+output_dir = "../../datasets/events/future-live"
+rotation_interval_ms = 300000
+flush_interval_ms = 1000
+max_file_size_bytes = 50000000
+enable_aem_ticks = true
+enable_optional_events = false
+
+[oracle]
+decision_log_path = "../../logs/decisions.jsonl"
+
+[durability]
+wal_enabled = true
+wal_dir = "../../data/rollout/future-live/wal"
+snapshot_dir = "../../data/rollout/future-live/snapshots"
+
+[metrics]
+enabled = true
+bind = "0.0.0.0"
+port = 9093
+
+[gui_backend]
+enabled = true
+bind_address = "127.0.0.1"
+port = 8803
+
+[logging]
+level = "info"
+console_enabled = true
+json_format = false
+file_enabled = true
+file_path = "../../logs/rollout/future-live/system.log"
+oracle_log_enabled = true
+oracle_log_path = "../../logs/rollout/future-live/oracle.log"
+oracle_json_format = false

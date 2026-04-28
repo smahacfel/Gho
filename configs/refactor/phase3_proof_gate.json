@@ -1,0 +1,87 @@
+{
+  "schema_name": "ghost.refactor.phase3.proof-gate",
+  "schema_version": 1,
+  "plan_path": "PLANS/PLAN_WYKONAWCZY_DOMKNIECIA_REFAKTORU_ARCHITEKTURY_20260401.md",
+  "audit_path": "docs/ADR/ADR-0066-buy-regression-grpc-canonical-state-forensics.md",
+  "description": "Historical Phase 3 proof/acceptance gate for canonical ingest health and bounded degraded helpers before the Phase 4 truth-source cutover.",
+  "successor_contract": "configs/refactor/phase4_proof_gate.json",
+  "phase_gates": [
+    "structural-proof",
+    "runtime-proof"
+  ],
+  "required_metrics": [
+    {
+      "name": "account_update_before_identity_total",
+      "path": "ghost-launcher/src/oracle_runtime.rs",
+      "needle": "\"account_update_before_identity_total\""
+    },
+    {
+      "name": "account_update_promoted_from_bootstrap_total",
+      "path": "ghost-launcher/src/oracle_runtime.rs",
+      "needle": "\"account_update_promoted_from_bootstrap_total\""
+    },
+    {
+      "name": "canonical_first_update_latency_ms",
+      "path": "ghost-launcher/src/session/observation.rs",
+      "needle": "\"canonical_first_update_latency_ms\""
+    },
+    {
+      "name": "timeout_without_canonical_updates_total",
+      "path": "ghost-launcher/src/oracle_runtime.rs",
+      "needle": "\"timeout_without_canonical_updates_total\""
+    },
+    {
+      "name": "post_buy_price_source_total",
+      "path": "ghost-launcher/src/components/post_buy_runtime.rs",
+      "needle": "\"post_buy_price_source_total\""
+    },
+    {
+      "name": "degraded_truth_helper_total",
+      "path": "ghost-launcher/src/oracle_runtime.rs",
+      "needle": "\"degraded_truth_helper_total\""
+    },
+    {
+      "name": "seer_account_updates_before_mapping_total",
+      "path": "off-chain/components/seer/src/lib.rs",
+      "needle": "\"seer.account_updates.before_mapping_total\""
+    },
+    {
+      "name": "seer_account_updates_pending_curve_replay_total",
+      "path": "off-chain/components/seer/src/lib.rs",
+      "needle": "\"seer.account_updates.pending_curve_replay_total\""
+    }
+  ],
+  "required_fallback_sites": [
+    {
+      "site": "resolve_price_context",
+      "category": "degraded_diagnostic",
+      "helper": "shadow_ledger_snapshot"
+    },
+    {
+      "site": "resolve_gatekeeper_initial_reserves",
+      "category": "degraded_diagnostic",
+      "helper": "shadow_ledger_snapshot"
+    },
+    {
+      "site": "post_buy_price_read",
+      "category": "degraded_diagnostic",
+      "helper": "shadow_ledger_snapshot"
+    },
+    {
+      "site": "tx_curve_enrichment_shadow",
+      "category": "bootstrap_only",
+      "helper": "shadow_ledger_curve"
+    }
+  ],
+  "runtime_thresholds": {
+    "min_cov_avg_coverage": 0.95,
+    "require_cov_complete": true,
+    "max_cov_unresolved_count": 0,
+    "max_timeout_without_canonical_updates_windows": 0,
+    "max_truth_windows_without_canonical_updates": 0,
+    "max_hidden_primary_sites": 0,
+    "max_runtime_invariant_breaks": 0,
+    "max_pending_replay_send_failed": 0,
+    "max_pending_replay_parse_failed": 0
+  }
+}

@@ -1,0 +1,28 @@
+Replay Equivalence Proof (Live-only vs Dual[Live lane])
+Verdict: PASS
+
+A) Lifecycle accounting
+- submitted == (filled + failed + timeout + unknown): true
+- candidate == (opened + terminal_entry_fail): true
+- 0 in_flight at end: true
+
+B) Exactly-once
+- exactly-one terminal/order_id + position opened/closed max1: true
+
+C) Gaps
+- missing terminal orders (dual live): []
+- multiple terminal orders (dual live): []
+- candidate without opened/failed (dual live): []
+
+D) Timing
+- threshold: dual <= live * (1 + 10.00%)
+- live p50/p90 = 295.00/400.00 ms
+- dual-live p50/p90 = 295.00/400.00 ms
+- timing pass: true
+
+E) Evidence
+- live events: ghost-brain/artifacts/replay_equivalence/live/events.jsonl
+- dual events: ghost-brain/artifacts/replay_equivalence/dual/events.jsonl
+- live report: ghost-brain/artifacts/replay_equivalence/live/live_only_report.json
+- dual live report: ghost-brain/artifacts/replay_equivalence/dual/dual_live_lane_report.json
+- verdict report txt: ghost-brain/artifacts/replay_equivalence/replay_equivalence_verdict.txt

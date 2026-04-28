@@ -1,0 +1,3 @@
+- `project_refactor_reaudit_2026-03-30.md` — Re-audit boundary: PR3B/PR5/PR6/PR7 closed, PR8 still open.
+- `project_live_validation_blocker_2026-03-30.md` — Live BUY-path validation blocked by reject-only flow and trigger floor budget.
+- ADR-0066: /root/Gho/docs/ADR/ADR-0066-buy-regression-grpc-canonical-state-forensics.md

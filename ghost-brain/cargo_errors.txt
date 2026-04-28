@@ -1,0 +1,1106 @@
+warning: unused variable: `pool_idx`
+   --> ghost-core/src/init_pool_parser.rs:475:20
+    |
+475 |     let (mint_idx, pool_idx, bc_idx, creator_idx) = match amm_type {
+    |                    ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_pool_idx`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `find_max_char_run` is never used
+  --> ghost-core/src/context_analysis.rs:96:4
+   |
+96 | fn find_max_char_run(s: &str) -> usize {
+   |    ^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `build_trade_snapshots` is never used
+   --> ghost-core/src/shadow_ledger/gatekeeper.rs:793:8
+    |
+483 | impl GatekeeperMintBuffer {
+    | ------------------------- method in this implementation
+...
+793 |     fn build_trade_snapshots(&self) -> Result<Vec<TradeSnapshot>, GatekeeperError> {
+    |        ^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `UNKNOWN_SLOT` is never used
+  --> ghost-core/src/shadow_ledger/types.rs:37:7
+   |
+37 | const UNKNOWN_SLOT: u64 = 0;
+   |       ^^^^^^^^^^^^
+
+warning: `ghost-core` (lib) generated 4 warnings (run `cargo fix --lib -p ghost-core` to apply 1 suggestion)
+warning: unused variable: `bundle_id`
+   --> off-chain/components/trigger/src/jito_client.rs:817:13
+    |
+817 |         let bundle_id = bundle.bundle_id;
+    |             ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_bundle_id`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `TPU_QUIC_PORT_OFFSET` is never used
+  --> off-chain/components/trigger/src/tpu_connection_manager.rs:18:7
+   |
+18 | const TPU_QUIC_PORT_OFFSET: u16 = 6;
+   |       ^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `rpc_client` is never read
+   --> off-chain/components/trigger/src/udp_client.rs:274:5
+    |
+272 | pub struct TpuClient {
+    |            --------- field in this struct
+273 |     /// RPC client for fetching leader schedule and slots
+274 |     rpc_client: Arc<RpcClient>,
+    |     ^^^^^^^^^^
+
+warning: `trigger` (lib) generated 3 warnings (run `cargo fix --lib -p trigger` to apply 1 suggestion)
+warning: unused import: `RawBytesMissingReason`
+  --> off-chain/components/seer/src/binary_parser.rs:36:66
+   |
+36 | ...t, InitializePoolEvent, RawBytesMissingReason};
+   |                            ^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `RawBytesMissingReason`
+ --> off-chain/components/seer/src/enhanced_builder.rs:6:60
+  |
+6 | ...idatePool, GeyserEvent, RawBytesMissingReason};
+  |                            ^^^^^^^^^^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+   --> off-chain/components/seer/src/helius_websocket_adapter.rs:784:29
+    |
+784 |                         let mut account_data = HashMap::new();
+    |                             ----^^^^^^^^^^^^
+    |                             |
+    |                             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unreachable pattern
+   --> off-chain/components/seer/src/binary_parser.rs:544:33
+    |
+530 | ...                   Err(e) => {
+    |                       ------ matches all the relevant values
+...
+544 | ...                   Err(e) => {
+    |                       ^^^^^^ no value can reach this
+    |
+    = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `state` is never read
+   --> off-chain/components/seer/src/grpc_connection.rs:255:25
+    |
+255 |         let mut state = ConnectionState::Disconnected;
+    |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `last_event_time` is never read
+   --> off-chain/components/seer/src/grpc_connection.rs:492:39
+    |
+492 |             let mut last_event_time = Instant::now();
+    |                                       ^^^^^^^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+
+warning: unused variable: `versioned_err`
+    --> off-chain/components/seer/src/helius_websocket_adapter.rs:1001:21
+     |
+1001 |                 Err(versioned_err) => {
+     |                     ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_versioned_err`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `bonding_curve` is never read
+   --> off-chain/components/seer/src/pumpportal_connection.rs:984:29
+    |
+984 |   ...   Some(bc_str) => Pubkey::from_str(bc_str).map_err(|e| {
+    |  _______________________^
+985 | | ...       SeerError::ParseError(format!("Invalid bonding curve pubkey...
+986 | | ...   })?,
+    | |_________^
+    |
+    = help: maybe it is overwritten before being read?
+
+warning: value assigned to `bonding_curve` is never read
+   --> off-chain/components/seer/src/pumpportal_connection.rs:987:21
+    |
+987 |             None => mint,
+    |                     ^^^^
+    |
+    = help: maybe it is overwritten before being read?
+
+warning: function `fetch_account_data_patient` is never used
+   --> off-chain/components/seer/src/helius_websocket_adapter.rs:870:10
+    |
+870 | async fn fetch_account_data_patient(
+    |          ^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: fields `virtual_sol_reserves` and `virtual_token_reserves` are never read
+   --> off-chain/components/seer/src/pumpportal_connection.rs:326:5
+    |
+289 | struct TradePayload {
+    |        ------------ fields in this struct
+...
+326 |     virtual_sol_reserves: Option<u64>,
+    |     ^^^^^^^^^^^^^^^^^^^^
+...
+332 |     virtual_token_reserves: Option<u64>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `TradePayload` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: field `mint` is never read
+   --> off-chain/components/seer/src/pumpportal_connection.rs:357:5
+    |
+356 | struct MintStats {
+    |        --------- field in this struct
+357 |     mint: Pubkey,
+    |     ^^^^
+    |
+    = note: `MintStats` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: field `shadow_ledger` is never read
+   --> off-chain/components/seer/src/websocket_connection.rs:294:5
+    |
+287 | pub struct WebSocketConnection {
+    |            ------------------- field in this struct
+...
+294 |     shadow_ledger: Option<Arc<ShadowLedger>>,
+    |     ^^^^^^^^^^^^^
+
+warning: `seer` (lib) generated 13 warnings (run `cargo fix --lib -p seer` to apply 4 suggestions)
+    Checking ghost-brain v0.1.0 (/root/gh/ghost-brain)
+error[E0433]: failed to resolve: use of undeclared type `Uuid`
+    --> ghost-brain/src/pipeline/execution.rs:1064:34
+     |
+1064 | ... prefix, Uuid::new_v4())
+     |             ^^^^ use of undeclared type `Uuid`
+     |
+help: consider importing this struct
+     |
+  14 + use uuid::Uuid;
+     |
+
+error[E0603]: module `execution` is private
+   --> ghost-brain/src/execution/live.rs:170:30
+    |
+170 | ...e::execution::E2EPipeline::emi...
+    |       ^^^^^^^^^ private module
+    |
+note: the module `execution` is defined here
+   --> ghost-brain/src/pipeline/mod.rs:35:1
+    |
+ 35 | mod execution;
+    | ^^^^^^^^^^^^^^
+help: consider importing this struct through its public re-export instead
+    |
+170 -             crate::pipeline::execution::E2EPipeline::emit_entry_filled(
+170 +             crate::E2EPipeline::emit_entry_filled(
+    |
+
+warning: unused import: `SwapResult`
+  --> ghost-brain/src/chaos/engine.rs:26:53
+   |
+26 | ... AmmPool, SwapResult};
+   |              ^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `warn`
+  --> ghost-brain/src/events/writer.rs:23:35
+   |
+23 | ...error, info, warn};
+   |                 ^^^^
+
+warning: unused import: `debug`
+  --> ghost-brain/src/execution/live.rs:12:15
+   |
+12 | use tracing::{debug, info, error, ...
+   |               ^^^^^
+
+warning: unused import: `solana_sdk::pubkey::Pubkey`
+  --> ghost-brain/src/execution/live.rs:21:5
+   |
+21 | use solana_sdk::pubkey::Pubkey;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `Arc` and `Mutex`
+ --> ghost-brain/src/mar/engine.rs:7:17
+  |
+7 | use std::sync::{Arc, Mutex};
+  |                 ^^^  ^^^^^
+
+warning: unused import: `warn`
+ --> ghost-brain/src/mar/engine.rs:8:21
+  |
+8 | use tracing::{info, warn};
+  |                     ^^^^
+
+warning: unused import: `warn`
+  --> ghost-brain/src/oracle/cluster_hunter.rs:64:40
+   |
+64 | ... instrument, warn};
+   |                 ^^^^
+
+warning: unused import: `solana_sdk::signature::Signature`
+  --> ghost-brain/src/oracle/engine.rs:29:5
+   |
+29 | use solana_sdk::signature::Signature;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `std::str::FromStr`
+  --> ghost-brain/src/oracle/engine.rs:31:5
+   |
+31 | use std::str::FromStr;
+   |     ^^^^^^^^^^^^^^^^^
+
+warning: unused import: `PriceReason`
+  --> ghost-brain/src/oracle/engine.rs:63:40
+   |
+63 | ...::types::{PriceReason, PriceSta...
+   |              ^^^^^^^^^^^
+
+warning: unnecessary parentheses around function argument
+    --> ghost-brain/src/oracle/engine.rs:3368:17
+     |
+3368 | ...   (mpcf * 2.0 - 1.0), // ord...
+     |       ^                ^
+     |
+     = note: `#[warn(unused_parens)]` (part of `#[warn(unused)]`) on by default
+help: remove these parentheses
+     |
+3368 -                 (mpcf * 2.0 - 1.0), // order_flow
+3368 +                 mpcf * 2.0 - 1.0, // order_flow
+     |
+
+warning: unused import: `crate::chaos::amm_math::AmmPool`
+  --> ghost-brain/src/oracle/hyper_prediction/cyclic_hyper_predictor.rs:41:5
+   |
+41 | use crate::chaos::amm_math::AmmPool;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `CYCLE_WEIGHTS` and `is_early_stage_cycle`
+  --> ghost-brain/src/oracle/hyper_prediction/cyclic_hyper_predictor.rs:46:63
+   |
+46 |     calculate_weighted_geometric_mean, get_gunshot_threshold, is_early_stage_cycle, S...
+   |                                                               ^^^^^^^^^^^^^^^^^^^^
+47 |     CYCLE_WEIGHTS,
+   |     ^^^^^^^^^^^^^
+
+warning: unused import: `crate::oracle::scoring::RiskLevel`
+  --> ghost-brain/src/oracle/hyper_prediction/cyclic_hyper_predictor.rs:49:5
+   |
+49 | use crate::oracle::scoring::RiskLevel;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `TrendCohesionField`
+  --> ghost-brain/src/oracle/hyper_prediction/cyclic_hyper_predictor.rs:50:58
+   |
+50 | ...nals, TrendCohesionField};
+   |          ^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `iwim`, `mpcf`, and `sobp`
+  --> ghost-brain/src/oracle/hyper_prediction/cyclic_hyper_predictor.rs:51:32
+   |
+51 | ...fast::{iwim, mpcf, sobp};
+   |           ^^^^  ^^^^  ^^^^
+
+warning: unused import: `anyhow`
+  --> ghost-brain/src/oracle/hyper_prediction/cyclic_hyper_predictor.rs:54:14
+   |
+54 | use anyhow::{anyhow, Result};
+   |              ^^^^^^
+
+warning: unused imports: `DataSource`, `FractalEngine`, `HyperOracle`, `SecondWaveAction`, `SecondWaveDetector`, `SecondWaveResult`, `SignalDetector`, `SourceType`, `SubSlotMicroentropy`, `TransitionMatrix`, `UnitaryEvolution`, `build_cluster_wave`, `build_profiler_wave`, `build_vision_wave`, `scr_extended::SCRExtended`, `ulvf_extended::ULVFExtended`, and `wallet_energy_tracker::WalletEnergyTracker`
+  --> ghost-brain/src/oracle/hyper_prediction/orchestrator.rs:43:9
+   |
+43 |         SignalDetector, SignalResult as QmanSignalResult, TradingSignal, TransitionMatrix,
+   |         ^^^^^^^^^^^^^^                                                   ^^^^^^^^^^^^^^^^
+44 |         UnitaryEvolution,
+   |         ^^^^^^^^^^^^^^^^
+45 |     },
+46 |     scr_extended::SCRExtended,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+47 |     second_wave_detector::{SecondWaveAction, SecondWaveDetector, SecondWaveResult},
+   |                            ^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^
+...
+52 |         build_cluster_wave, build_iwim_wave, build_ligma_wave, build_povc_wave, build_praecog_wave,
+   |         ^^^^^^^^^^^^^^^^^^
+53 |         build_profiler_wave, build_scr_wave, build_ssmi_wave, build_ulvf_wave, build_vision_wave,
+   |         ^^^^^^^^^^^^^^^^^^^                                                    ^^^^^^^^^^^^^^^^^
+54 |         fre::{FractalAction, FractalEngine, FractalVerdict},
+   |                              ^^^^^^^^^^^^^
+55 |         mpcf_infer, praecog_analyze, ActorInference, ActorType, DataSource, EctoSignal,
+   |                                                                 ^^^^^^^^^^
+56 |         HeuristicWave, PanicOutput, PraecogInput, PraecogParams, QASSResult,
+57 |         QuantumAmplitudeScorer, SourceType, SsmiResult, SubSlotMicroentropy, TcrScore,
+   |                                 ^^^^^^^^^^              ^^^^^^^^^^^^^^^^^^^
+58 |     },
+59 |     ulvf_extended::ULVFExtended,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+60 |     wallet_energy_tracker::WalletEnergyTracker,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+61 |     HyperOracle, MarketSnapshot, ScoredCandidate,
+   |     ^^^^^^^^^^^
+
+warning: unused imports: `FinalVerdict`, `HyperPredictionConfig`, `OracleDecision`, and `RiskThresholds`
+  --> ghost-brain/src/oracle/hyper_prediction/orchestrator.rs:73:15
+   |
+73 |     verdict::{FinalVerdict, OracleDecision, RiskLevel, RiskThresholds},
+   |               ^^^^^^^^^^^^  ^^^^^^^^^^^^^^             ^^^^^^^^^^^^^^
+74 |     HyperPredictionConfig, HyperPredictionOracle,
+   |     ^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `error` and `instrument`
+  --> ghost-brain/src/oracle/hyper_prediction/orchestrator.rs:83:22
+   |
+83 | ...ug, error, info, instrument, wa...
+   |        ^^^^^        ^^^^^^^^^^
+
+warning: unnecessary parentheses around assigned value
+    --> ghost-brain/src/oracle/hyper_prediction/orchestrator.rs:1714:29
+     |
+1714 | ... = (verdict.organic_score as f32 * 0.4);
+     |       ^                                  ^
+     |
+help: remove these parentheses
+     |
+1714 -                 let boost = (verdict.organic_score as f32 * 0.4);
+1714 +                 let boost = verdict.organic_score as f32 * 0.4;
+     |
+
+warning: unused import: `ghost_brain_config::ScoringWeightsConfig`
+ --> ghost-brain/src/oracle/hyper_prediction/scoring/weights.rs:6:21
+  |
+6 | ...::{ghost_brain_config::ScoringWeightsConfig, G...
+  |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `hash_map::Entry`
+ --> ghost-brain/src/oracle/hyper_prediction/signals/cluster.rs:2:24
+  |
+2 | ...tions::{hash_map::Entry, HashMap...
+  |            ^^^^^^^^^^^^^^^
+
+warning: unused import: `SignalSource`
+  --> ghost-brain/src/oracle/hyper_prediction/signals/ligma.rs:22:62
+   |
+22 | ...lResult, SignalSource};
+   |             ^^^^^^^^^^^^
+
+warning: unused import: `SignalSource`
+  --> ghost-brain/src/oracle/hyper_prediction/signals/mci.rs:19:62
+   |
+19 | ...lResult, SignalSource};
+   |             ^^^^^^^^^^^^
+
+warning: unused import: `SignalSource`
+  --> ghost-brain/src/oracle/hyper_prediction/signals/paradox.rs:14:62
+   |
+14 | ...lResult, SignalSource};
+   |             ^^^^^^^^^^^^
+
+warning: unused import: `SignalSource`
+  --> ghost-brain/src/oracle/hyper_prediction/signals/qedd.rs:19:62
+   |
+19 | ...lResult, SignalSource};
+   |             ^^^^^^^^^^^^
+
+warning: unused import: `warn`
+  --> ghost-brain/src/oracle/hyper_prediction/signals/mod.rs:54:22
+   |
+54 | use tracing::{debug, warn};
+   |                      ^^^^
+
+warning: unused import: `warn`
+  --> ghost-brain/src/oracle/profiler.rs:63:28
+   |
+63 | use tracing::{debug, info, warn};
+   |                            ^^^^
+
+warning: unused import: `QASSResult`
+    --> ghost-brain/src/oracle/scoring.rs:1261:51
+     |
+1261 | ...ticWave, QASSResult, QuantumA...
+     |             ^^^^^^^^^^
+
+warning: unused import: `solana_sdk::pubkey::Pubkey`
+  --> ghost-brain/src/oracle/scr_extended.rs:27:5
+   |
+27 | use solana_sdk::pubkey::Pubkey;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `super::observation::OBSERVATION_DIM`
+  --> ghost-brain/src/oracle/tcf/cohesion.rs:49:5
+   |
+49 | use super::observation::OBSERVATION_DIM;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `ExpectedTransition`
+  --> ghost-brain/src/oracle/tcf/field.rs:40:23
+   |
+40 | ...ted::{ExpectedTransition, Expec...
+   |          ^^^^^^^^^^^^^^^^^^
+
+warning: unnecessary parentheses around assigned value
+   --> ghost-brain/src/oracle/tcf/field.rs:483:22
+    |
+483 | ...*= (1.0 - penalty.min(0.4));
+    |       ^                      ^
+    |
+help: remove these parentheses
+    |
+483 -             score *= (1.0 - penalty.min(0.4));
+483 +             score *= 1.0 - penalty.min(0.4);
+    |
+
+warning: unknown lint: `arithmetic_side_effects`
+ --> ghost-brain/src/oracle/ultrafast/ecto.rs:1:10
+  |
+1 | #![allow(arithmetic_side_effects)]
+  |          ^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unknown_lints)]` on by default
+
+warning: unknown lint: `arithmetic_side_effects`
+ --> ghost-brain/src/oracle/ultrafast/panic.rs:1:10
+  |
+1 | #![allow(arithmetic_side_effects)]
+  |          ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unknown lint: `arithmetic_side_effects`
+  --> ghost-brain/src/oracle/ultrafast/panic.rs:64:9
+   |
+64 | #[allow(arithmetic_side_effects)]
+   |         ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unknown lint: `arithmetic_side_effects`
+  --> ghost-brain/src/oracle/ultrafast/panic.rs:84:13
+   |
+84 |     #[allow(arithmetic_side_effects)]
+   |             ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unknown lint: `arithmetic_side_effects`
+   --> ghost-brain/src/oracle/ultrafast/panic.rs:125:13
+    |
+125 | ...ow(arithmetic_side_effects)]
+    |       ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unknown lint: `arithmetic_side_effects`
+   --> ghost-brain/src/oracle/ultrafast/panic.rs:160:13
+    |
+160 | ...ow(arithmetic_side_effects)]
+    |       ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unknown lint: `arithmetic_side_effects`
+   --> ghost-brain/src/oracle/ultrafast/panic.rs:178:13
+    |
+178 | ...ow(arithmetic_side_effects)]
+    |       ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unknown lint: `arithmetic_side_effects`
+ --> ghost-brain/src/oracle/ultrafast/tcr_phi.rs:1:10
+  |
+1 | #![allow(arithmetic_side_effects)]
+  |          ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `Duration`
+  --> ghost-brain/src/oracle/wallet_energy_tracker.rs:40:17
+   |
+40 | use std::time::{Duration, SystemTi...
+   |                 ^^^^^^^^
+
+warning: unused import: `solana_sdk::signer::Signer`
+  --> ghost-brain/src/pipeline/execution.rs:17:5
+   |
+17 | use solana_sdk::signer::Signer;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `LeapfrogConfig`, `MagazineConfig`, `TpuClient`, `create_magazine_after_buy`, and `register_shot_context`
+  --> ghost-brain/src/pipeline/execution.rs:23:5
+   |
+23 |     create_magazine_after_buy, register_shot_context, set_shot_event_sink, DirectBuyBuilder,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^
+24 |     LeapfrogConfig, MagazineConfig, ShotEvent, ShotEventSink, ShotEventStage, TpuClient,
+   |     ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^                                            ^^^^^^^^^
+
+warning: unused import: `crate::leader_predictor::LeaderPredictor`
+  --> ghost-brain/src/pipeline/execution.rs:37:5
+   |
+37 | use crate::leader_predictor::LeaderPredictor;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `ClusterAnalysis`, `DevProfile`, `RiskAggregator`, and `VisionCriticResult`
+  --> ghost-brain/src/pipeline/execution.rs:39:5
+   |
+39 |     ClusterAnalysis, DevProfile, MarketSnapshot, RiskAggregator, VisionCriticResult,
+   |     ^^^^^^^^^^^^^^^  ^^^^^^^^^^                  ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `ghost_core::shadow_ledger::ShadowLedger`
+  --> ghost-brain/src/pipeline/stages.rs:22:5
+   |
+22 | use ghost_core::shadow_ledger::ShadowLedger;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::oracle_scoring::score_enhanced`
+   --> ghost-brain/src/pipeline/stages.rs:238:25
+    |
+238 | ...se crate::oracle_scoring::score_enhanced;
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `solana_sdk::pubkey::Pubkey`
+ --> ghost-brain/src/scenarios/scenario_enhanced_initialize_pool.rs:9:5
+  |
+9 | use solana_sdk::pubkey::Pubkey;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `SystemTime` and `UNIX_EPOCH`
+  --> ghost-brain/src/scenarios/scenario_enhanced_initialize_pool.rs:10:17
+   |
+10 | ...e::{SystemTime, UNIX_EPOCH};
+   |        ^^^^^^^^^^  ^^^^^^^^^^
+
+warning: unused import: `tracing::info`
+  --> ghost-brain/src/scenarios/scenario_enhanced_initialize_pool.rs:11:5
+   |
+11 | use tracing::info;
+   |     ^^^^^^^^^^^^^
+
+warning: unused imports: `CacheLinePadding` and `EnhancedCandidate`
+  --> ghost-brain/src/scenarios/scenario_enhanced_initialize_pool.rs:13:28
+   |
+13 | ...::{CacheLinePadding, EnhancedCandidate};
+   |       ^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `RiskLevel` and `score_enhanced`
+  --> ghost-brain/src/scenarios/scenario_enhanced_initialize_pool.rs:14:29
+   |
+14 | ...::{score_enhanced, RiskLevel};
+   |       ^^^^^^^^^^^^^^  ^^^^^^^^^
+
+warning: unused import: `hash_map::Entry`
+ --> ghost-brain/src/security/cabal_detector.rs:2:24
+  |
+2 | ...tions::{hash_map::Entry, HashMap...
+  |            ^^^^^^^^^^^^^^^
+
+warning: unused imports: `OpcodePattern` and `get_max_severity`
+  --> ghost-brain/src/security/gene_mapper.rs:46:5
+   |
+46 |     get_max_severity, is_malicious_program, scan_dangerous_opcodes, OpcodePattern,
+   |     ^^^^^^^^^^^^^^^^                                                ^^^^^^^^^^^^^
+
+warning: unused imports: `BandProfile` and `ResonanceConfig`
+  --> ghost-brain/src/signals/frb_integrator.rs:60:27
+   |
+60 | ...::{BandProfile, FrbResult, FrbSignal, ResonanceConfig};
+   |       ^^^^^^^^^^^                        ^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::models::mci_result`
+  --> ghost-brain/src/telemetry/dataset_writer.rs:43:5
+   |
+43 | use crate::models::mci_result;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::models::qedd_result`
+  --> ghost-brain/src/telemetry/dataset_writer.rs:45:5
+   |
+45 | use crate::models::qedd_result;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `error`
+  --> ghost-brain/src/telemetry/dataset_writer.rs:51:22
+   |
+51 | use tracing::{debug, error};
+   |                      ^^^^^
+
+warning: unused import: `CorrectionReason`
+  --> ghost-brain/src/tuning/hysteresis_loop.rs:50:21
+   |
+50 | ...acle::{CorrectionReason, Decisi...
+   |           ^^^^^^^^^^^^^^^^
+
+warning: use of deprecated struct `config::ghost_brain_config::GatekeeperConfig`: Use GatekeeperV2Config from ghost-launcher instead.
+  --> ghost-brain/src/config/mod.rs:26:5
+   |
+26 |     GatekeeperConfig,
+   |     ^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated struct `config::ghost_brain_config::GatekeeperConfig`: Use GatekeeperV2Config from ghost-launcher instead.
+  --> ghost-brain/src/config/ghost_brain_config.rs:62:21
+   |
+62 |     pub gatekeeper: GatekeeperConfig,
+   |                     ^^^^^^^^^^^^^^^^
+
+warning: use of deprecated struct `config::ghost_brain_config::GatekeeperConfig`: Use GatekeeperV2Config from ghost-launcher instead.
+    --> ghost-brain/src/config/ghost_brain_config.rs:3392:18
+     |
+3392 | impl Default for GatekeeperConfig {
+     |                  ^^^^^^^^^^^^^^^^
+
+warning: use of deprecated struct `config::ghost_brain_config::GatekeeperConfig`: Use GatekeeperV2Config from ghost-launcher instead.
+    --> ghost-brain/src/config/ghost_brain_config.rs:3313:25
+     |
+3313 | ...eper: GatekeeperConfig::defau...
+     |          ^^^^^^^^^^^^^^^^
+
+error[E0053]: method `submit_exit` has an incompatible type for trait
+   --> ghost-brain/src/execution/live.rs:231:23
+    |
+231 |         fraction_bps: u32,
+    |                       ^^^ expected `u16`, found `u32`
+    |
+note: type in trait
+   --> ghost-brain/src/execution/backend.rs:199:23
+    |
+199 |         fraction_bps: u16,
+    |                       ^^^
+    = note: expected signature `fn(&'life0 LiveBackend, &'life1 std::string::String, u16, std::string::String, std::option::Option<_>) -> Pin<_>`
+               found signature `fn(&'life0 LiveBackend, &'life1 std::string::String, u32, std::string::String, std::option::Option<_>) -> Pin<_>`
+help: change the parameter type to match the trait
+    |
+231 -         fraction_bps: u32,
+231 +         fraction_bps: u16,
+    |
+
+error[E0195]: lifetime parameters or bounds on method `get_execution_stress` do not match the trait declaration
+   --> ghost-brain/src/execution/live.rs:273:14
+    |
+188 | #[async_trait]
+    | -------------- this `where` clause might not match the one in the trait
+...
+273 |     async fn get_execution_stress(&self, position_id: &PositionId) ->...
+    |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ lifetimes do not match method in trait
+    |
+   ::: ghost-brain/src/execution/backend.rs:208:28
+    |
+208 | ...tion_stress(&self, position_id...
+    |               - lifetimes in impl do not match this method in trait
+
+error[E0609]: no field `config` on type `&LiveBackend`
+   --> ghost-brain/src/execution/live.rs:169:37
+    |
+169 | ...self.config.event_emitter.as_r...
+    |         ^^^^^^ unknown field
+    |
+    = note: available fields are: `pending_orders`, `completed_fills`, `completed_order_ids`, `stress_snapshots`, `next_order_id` ... and 2 others
+
+error[E0624]: associated function `emit_entry_filled` is private
+    --> ghost-brain/src/execution/live.rs:170:54
+     |
+ 170 |   ...e::emit_entry_filled(
+     |         ^^^^^^^^^^^^^^^^^ private associated function
+     |
+    ::: ghost-brain/src/pipeline/execution.rs:1120:5
+     |
+1120 | /     pub(super) fn emit_entry_f...
+1121 | |         emitter: &EventEmitter,
+1122 | |         candidate_id: &str,
+1123 | |         order_id: &str,
+...    |
+1130 | |         latency_ms: u64,
+1131 | |     ) {
+     | |_____- private associated function defined here
+
+error[E0624]: associated function `resolve_quote_ref_with_provider` is private
+    --> ghost-brain/src/execution/live.rs:357:135
+     |
+ 357 |   ...e::resolve_quote_ref_with_provider(
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ private associated function
+     |
+    ::: ghost-brain/src/pipeline/execution.rs:1013:5
+     |
+1013 | /     pub(super) async fn resolve_quote_ref_with_provider(
+1014 | |         quote_provider: &Arc<RwLock<ExecutableQuoteProvid...
+1015 | |         snapshot_engine: &Arc<crate::oracle::SnapshotEngi...
+1016 | |         swap_plan: &SwapPlan,
+...    |
+1020 | |         fallback_slot: Option<u64>,
+1021 | |     ) -> (String, Option<u64>, bool, u64, Option<f64>) {
+     | |______________________________________________________- private associated function defined here
+
+warning: variable does not need to be mutable
+   --> ghost-brain/src/execution/live.rs:406:24
+    |
+406 | ...let Some(mut req) = self.entry...
+    |             ----^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+error[E0599]: no variant or associated item named `Buy` found for enum `backend::OrderSide` in the current scope
+   --> ghost-brain/src/execution/live.rs:509:30
+    |
+509 |             side: OrderSide::Buy,
+    |                              ^^^ variant or associated item not found in `backend::OrderSide`
+    |
+   ::: ghost-brain/src/execution/backend.rs:85:1
+    |
+ 85 | pub enum OrderSide {
+    | ------------------ variant or associated item `Buy` not found for this enum
+
+error[E0599]: no variant or associated item named `Buy` found for enum `backend::OrderSide` in the current scope
+   --> ghost-brain/src/execution/live.rs:529:30
+    |
+529 |             side: OrderSide::Buy,
+    |                              ^^^ variant or associated item not found in `backend::OrderSide`
+    |
+   ::: ghost-brain/src/execution/backend.rs:85:1
+    |
+ 85 | pub enum OrderSide {
+    | ------------------ variant or associated item `Buy` not found for this enum
+
+warning: variable does not need to be mutable
+   --> ghost-brain/src/oracle/followup_scoring.rs:171:9
+    |
+171 |     let mut last_mci: Option<f32>...
+    |         ----^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> ghost-brain/src/oracle/followup_scoring.rs:172:9
+    |
+172 | ...et mut last_qedd_survival: Opt...
+    |       ----^^^^^^^^^^^^^^^^^^
+    |       |
+    |       help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> ghost-brain/src/oracle/followup_scoring.rs:173:9
+    |
+173 | ...et mut last_qedd_lambda: Optio...
+    |       ----^^^^^^^^^^^^^^^^
+    |       |
+    |       help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> ghost-brain/src/oracle/hyper_prediction/cyclic_hyper_predictor.rs:131:13
+    |
+131 | ...et mut current_candidate = ini...
+    |       ----^^^^^^^^^^^^^^^^^
+    |       |
+    |       help: remove this `mut`
+
+error[E0609]: no field `rpc_client` on type `e2e_config::E2EConfig`
+   --> ghost-brain/src/pipeline/execution.rs:121:37
+    |
+121 | ...ig.rpc_client.clone(),
+    |       ^^^^^^^^^^ unknown field
+    |
+    = note: available fields are: `rpc_url`, `websocket_url`, `authority_keypair_path`, `payer_keypair_path`, `seer` ... and 8 others
+
+error[E0609]: no field `jito_redundancy` on type `TriggerConfig`
+   --> ghost-brain/src/pipeline/execution.rs:125:52
+    |
+125 | ...gger.jito_redundancy as usize,
+    |         ^^^^^^^^^^^^^^^ unknown field
+    |
+    = note: available fields are: `redundancy_factor`, `max_span_slots`, `enable_jito`, `jito_block_engine_url`, `dry_run` ... and 4 others
+
+error[E0609]: no field `tpu_redundancy` on type `TriggerConfig`
+   --> ghost-brain/src/pipeline/execution.rs:130:43
+    |
+130 | ...rigger.tpu_redundancy as usize...
+    |           ^^^^^^^^^^^^^^ unknown field
+    |
+    = note: available fields are: `redundancy_factor`, `max_span_slots`, `enable_jito`, `jito_block_engine_url`, `dry_run` ... and 4 others
+
+warning: variable does not need to be mutable
+  --> ghost-brain/src/scenarios/scenario_e2e_full.rs:99:13
+   |
+99 | ... let mut pool_latencies: Vec<f6...
+   |         ----^^^^^^^^^^^^^^
+   |         |
+   |         help: remove this `mut`
+
+warning: use of deprecated field `config::ghost_brain_config::GatekeeperConfig::min_tx_count`: Use GatekeeperV2Config from ghost-launcher instead.
+    --> ghost-brain/src/config/ghost_brain_config.rs:3395:13
+     |
+3395 |             min_tx_count: 15,
+     |             ^^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `config::ghost_brain_config::GatekeeperConfig::min_unique_signers`: Use GatekeeperV2Config from ghost-launcher instead.
+    --> ghost-brain/src/config/ghost_brain_config.rs:3396:13
+     |
+3396 |             min_unique_signers: 10,
+     |             ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `config::ghost_brain_config::GatekeeperConfig::max_wait_time_ms`: Use GatekeeperV2Config from ghost-launcher instead.
+    --> ghost-brain/src/config/ghost_brain_config.rs:3397:13
+     |
+3397 |             max_wait_time_ms: 2000,
+     |             ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `config::ghost_brain_config::GatekeeperConfig::early_pass_tx_count`: Use GatekeeperV2Config from ghost-launcher instead.
+    --> ghost-brain/src/config/ghost_brain_config.rs:3398:13
+     |
+3398 | ...   early_pass_tx_count: 50,
+     |       ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `config::ghost_brain_config::GatekeeperConfig::min_volume_sol`: Use GatekeeperV2Config from ghost-launcher instead.
+    --> ghost-brain/src/config/ghost_brain_config.rs:3399:13
+     |
+3399 |             min_volume_sol: 0.0,
+     |             ^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `config::ghost_brain_config::GatekeeperConfig::min_tx_count_for_scoring`: Use GatekeeperV2Config from ghost-launcher instead.
+    --> ghost-brain/src/config/ghost_brain_config.rs:3400:13
+     |
+3400 | ...   min_tx_count_for_scoring: None,
+     |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `config::ghost_brain_config::GatekeeperConfig::max_cycles`: Use GatekeeperV2Config from ghost-launcher instead.
+    --> ghost-brain/src/config/ghost_brain_config.rs:3401:13
+     |
+3401 |             max_cycles: None,
+     |             ^^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `config::ghost_brain_config::GatekeeperConfig::max_observation_cycles`: Use GatekeeperV2Config from ghost-launcher instead.
+    --> ghost-brain/src/config/ghost_brain_config.rs:3402:13
+     |
+3402 | ...   max_observation_cycles: None,
+     |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated field `config::ghost_brain_config::GatekeeperConfig::min_tx_count`: Use GatekeeperV2Config from ghost-launcher instead.
+   --> ghost-brain/src/oracle/hyper_prediction/config.rs:710:45
+    |
+710 | ... = config.gatekeeper.min_tx_count.ma...
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: value assigned to `features_opt` is never read
+    --> ghost-brain/src/guardian/post_buy/engine.rs:1102:32
+     |
+1102 | ...t = None::<StateFeatures>;
+     |        ^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: maybe it is overwritten before being read?
+     = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `event_ctx` is never read
+    --> ghost-brain/src/guardian/post_buy/engine.rs:1103:29
+     |
+1103 |   ...   let mut event_ctx = None...
+     |  ___________________________^
+1104 | | ...       String,      // cand...
+1105 | | ...       String,      // posi...
+1106 | | ...       u64,         // posi...
+...    |
+1112 | | ...       Option<StressBucket>,
+1113 | | ...   )>;
+     | |________^
+     |
+     = help: maybe it is overwritten before being read?
+
+warning: value assigned to `unique_tx_in_window` is never read
+    --> ghost-brain/src/oracle/engine.rs:2829:13
+     |
+2829 | ...   unique_tx_in_window = self.txs_in_cycle_window_count;
+     |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: maybe it is overwritten before being read?
+
+warning: unused variable: `followup`
+   --> ghost-brain/src/oracle/followup_scoring.rs:212:13
+    |
+212 |         let followup = FollowupSc...
+    |             ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_followup`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `qedd`
+    --> ghost-brain/src/oracle/hyper_prediction/orchestrator.rs:1860:5
+     |
+1860 |     qedd: &QeddResult,
+     |     ^^^^ help: if this is intentional, prefix it with an underscore: `_qedd`
+
+warning: unused variable: `mci`
+    --> ghost-brain/src/oracle/hyper_prediction/orchestrator.rs:1861:5
+     |
+1861 |     mci: &MciResult,
+     |     ^^^ help: if this is intentional, prefix it with an underscore: `_mci`
+
+warning: unused variable: `base_risk`
+    --> ghost-brain/src/oracle/hyper_prediction/orchestrator.rs:1869:5
+     |
+1869 |     base_risk: RiskLevel,
+     |     ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_base_risk`
+
+warning: unused variable: `hunter_score`
+    --> ghost-brain/src/oracle/hyper_prediction/orchestrator.rs:1873:5
+     |
+1873 |     hunter_score: Option<u8>,
+     |     ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_hunter_score`
+
+warning: unused variable: `cold_start_active`
+    --> ghost-brain/src/oracle/hyper_prediction/orchestrator.rs:1875:5
+     |
+1875 |     cold_start_active: bool,
+     |     ^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_cold_start_active`
+
+warning: unused variable: `candidate`
+    --> ghost-brain/src/oracle/hyper_prediction/orchestrator.rs:1876:5
+     |
+1876 |     candidate: &EnhancedCandidate,
+     |     ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_candidate`
+
+warning: unused variable: `qman_result`
+    --> ghost-brain/src/oracle/hyper_prediction/orchestrator.rs:1878:5
+     |
+1878 |     qman_result: &Option<QmanRes...
+     |     ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_qman_result`
+
+warning: unused variable: `tuned_weights`
+    --> ghost-brain/src/oracle/hyper_prediction/orchestrator.rs:1879:5
+     |
+1879 |     tuned_weights: Option<&Tunab...
+     |     ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_tuned_weights`
+
+warning: unused variable: `ssmi`
+    --> ghost-brain/src/oracle/hyper_prediction/orchestrator.rs:1933:5
+     |
+1933 |     ssmi: &Option<SsmiResult>,
+     |     ^^^^ help: if this is intentional, prefix it with an underscore: `_ssmi`
+
+warning: unused variable: `mpcf`
+    --> ghost-brain/src/oracle/hyper_prediction/orchestrator.rs:1934:5
+     |
+1934 |     mpcf: &Option<ActorInference>,
+     |     ^^^^ help: if this is intentional, prefix it with an underscore: `_mpcf`
+
+warning: unused variable: `risk`
+    --> ghost-brain/src/oracle/hyper_prediction/orchestrator.rs:1938:5
+     |
+1938 |     risk: RiskLevel,
+     |     ^^^^ help: if this is intentional, prefix it with an underscore: `_risk`
+
+warning: unused variable: `oracle`
+    --> ghost-brain/src/oracle/hyper_prediction/orchestrator.rs:2538:5
+     |
+2538 |     oracle: &HyperPredictionOracle,
+     |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_oracle`
+
+warning: unused variable: `risk_thresholds`
+  --> ghost-brain/src/oracle/hyper_prediction/scoring/mod.rs:55:5
+   |
+55 |     risk_thresholds: &RiskThresholds,
+   |     ^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_risk_thresholds`
+
+warning: unused variable: `survivor_confidence`
+  --> ghost-brain/src/oracle/hyper_prediction/scoring/mod.rs:64:43
+   |
+64 | ...sed, survivor_confidence) =
+   |         ^^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_survivor_confidence`
+
+warning: unused variable: `candidate`
+   --> ghost-brain/src/oracle/hyper_prediction/signals/mod.rs:213:9
+    |
+213 |         candidate: &EnhancedCandi...
+    |         ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_candidate`
+
+warning: value assigned to `score` is never read
+    --> ghost-brain/src/oracle/survivor_score.rs:1786:25
+     |
+1786 |         let mut score = 0u8;
+     |                         ^^^
+     |
+     = help: maybe it is overwritten before being read?
+
+warning: value assigned to `raw_score` is never read
+    --> ghost-brain/src/oracle/survivor_score.rs:1787:29
+     |
+1787 |         let mut raw_score = 0.0;
+     |                             ^^^
+     |
+     = help: maybe it is overwritten before being read?
+
+warning: value assigned to `interpretation` is never read
+    --> ghost-brain/src/oracle/survivor_score.rs:1788:34
+     |
+1788 | ...ation = String::new();
+     |            ^^^^^^^^^^^^^
+     |
+     = help: maybe it is overwritten before being read?
+
+warning: value assigned to `passed` is never read
+    --> ghost-brain/src/oracle/survivor_score.rs:1789:26
+     |
+1789 |         let mut passed = false;
+     |                          ^^^^^
+     |
+     = help: maybe it is overwritten before being read?
+
+warning: value assigned to `behavioral_score` is never read
+    --> ghost-brain/src/oracle/survivor_score.rs:1874:40
+     |
+1874 | ...al_score = 1.0f32;
+     |               ^^^^^^
+     |
+     = help: maybe it is overwritten before being read?
+
+warning: unused variable: `observed`
+   --> ghost-brain/src/oracle/tcf/expected.rs:291:40
+    |
+291 | ...a(&self, observed: &Transition...
+    |             ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_observed`
+
+warning: unused variable: `pool_latencies`
+  --> ghost-brain/src/scenarios/scenario_e2e_full.rs:99:13
+   |
+99 | ... let mut pool_latencies: Vec<f6...
+   |         ^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_pool_latencies`
+
+warning: unused variable: `metrics`
+   --> ghost-brain/src/scenarios/scenario_e2e_full.rs:110:17
+    |
+110 | ...     let metrics = Arc::clone(...
+    |             ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_metrics`
+
+warning: unused variable: `now_ms`
+   --> ghost-brain/src/security/gene_mapper.rs:229:51
+    |
+229 | ...d: &str, now_ms: u64) -> Optio...
+    |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_now_ms`
+
+warning: unused variable: `avg_loss`
+   --> ghost-brain/src/signals/ligma.rs:140:9
+    |
+140 |     let avg_loss = mean(&round_tr...
+    |         ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_avg_loss`
+
+warning: unused variable: `context`
+   --> ghost-brain/src/tuning/hysteresis_loop.rs:472:35
+    |
+472 | ...s(&self, context: &TuningConte...
+    |             ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_context`
+
+warning: variable does not need to be mutable
+   --> ghost-brain/src/tuning/integration.rs:100:12
+    |
+100 |         Ok(mut loop_guard) => {
+    |            ----^^^^^^^^^^
+    |            |
+    |            help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> ghost-brain/src/tuning/integration.rs:120:12
+    |
+120 |         Ok(mut loop_guard) => {
+    |            ----^^^^^^^^^^
+    |            |
+    |            help: remove this `mut`
+
+Some errors have detailed explanations: E0053, E0195, E0433, E0599, E0603, E0609, E0624.
+For more information about an error, try `rustc --explain E0053`.
+warning: `ghost-brain` (lib) generated 114 warnings (2 duplicates)
+error: could not compile `ghost-brain` (lib) due to 12 previous errors; 114 warnings emitted

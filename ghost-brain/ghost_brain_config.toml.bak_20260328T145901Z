@@ -1,0 +1,904 @@
+# Ghost Brain Unified Configuration - PREDATOR v11 (Data-Driven A/B Calibration)
+# Strategy: "Aggressive Precision" — maximise A-pool capture, eliminate B-pool ściek
+# Kalibracja: 700-pool A vs B percentile analysis (2026-02-22)
+# Kluczowe zmiany: ilościowe progi GK v2, HHI/top3 sito, reject_on_dev_sell=false, mcap=48
+version = 11
+
+[engine]
+cycle_duration_ms = 1
+
+# ==============================================================================
+# 🛡️ GATEKEEPER V2: 6-Phase Analytical Filter
+# ==============================================================================
+[gatekeeper_v2]
+
+# ── Mode ────────────────────────────────────────────────────────────────────────
+# "standard" = Tryb reaktywny: Phase 1 trigger → re-eval → wczesne Buy/Reject możliwe
+# "long"     = Tryb akumulacyjny: czeka pełne max_wait_time_ms, zbiera WSZYSTKIE TX,
+#              jedna finalna ewaluacja na deadline. Brak wczesnych decyzji.
+mode = "long"
+
+# ── Pre-filter ──────────────────────────────────────────────────────────────────
+min_sol_threshold = 0.00001
+
+# ── Phase 1: Quantity Gate ─────────────────────────────────────────────────────
+# Aktywne tylko progi wskazane w nowej kalibracji.
+min_tx_count = 1
+min_unique_signers = 1
+min_buy_count = 1
+
+
+max_wait_time_ms = 8000
+
+# ── Phase 2: Velocity Profile ──────────────────────────────────────────────────
+# Aktywny tylko avg_interval_ms < 277 zgodnie z rekomendacją dla bimodalnego rozkładu.
+min_interval_cv = 0.0
+max_burst_ratio = 1.0
+min_avg_interval_ms = 0.0
+max_avg_interval_ms = 1.0
+min_timing_entropy = 0.0
+min_dust_filtered_count = 0
+
+# ── Phase 3: Signer Diversity ──────────────────────────────────────────────────
+# Aktywne: unique_signers >= 20, hhi < 0.056, volume_gini >= 0.654.
+min_unique_ratio = 0.0
+max_unique_ratio = 1.0
+max_hhi = 5.0
+max_tx_per_signer = 999999
+min_volume_gini = 0.001
+max_volume_gini = 1.0
+max_top3_volume_pct = 1.0
+max_same_ms_tx_ratio = 1.0
+
+# ── Phase 4: Volume Sanity ─────────────────────────────────────────────────────
+# Aktywne: total_volume_sol >= 33.2, max_consecutive_buys >= 10.
+min_buy_ratio = 0.0
+max_buy_ratio = 1.0
+min_sol_buy_ratio = 0.0
+min_avg_tx_sol = 0.0
+max_avg_tx_sol = 9999.0
+min_volume_cv = 0.0
+min_total_volume_sol = 1.0
+min_consecutive_buys = 1
+
+# ── Phase 5: Dev Behavior ──────────────────────────────────────────────────────
+# Aktywny tylko dev_tx_ratio < 0.055 zgodnie z konserwatywną rekomendacją.
+min_dev_buy_sol = 0.0
+max_dev_buy_sol = 9999.0
+max_dev_tx_ratio = 0.99
+max_dev_volume_ratio = 0.99
+min_dev_volume_ratio = 0.0
+reject_on_dev_sell = false
+
+# ── Phase 6: Bonding Curve Dynamics ────────────────────────────────────────────
+# Aktywne: bonding_progress_pct >= 32.4, current_market_cap_sol >= 61.3.
+max_price_change_ratio = 9999.0
+max_single_tx_price_impact_pct = 9999.0
+max_single_sell_impact_pct = 9999.0
+max_bonding_progress_pct = 100.0
+min_bonding_progress_pct = 2.4
+min_market_cap_sol = 1.3
+
+# ── Decision ────────────────────────────────────────────────────────────────────
+# 3-layer decision ON: tokeny nie giną od razu przy lekkim przekroczeniu progów —
+# dostają flagę soft_score i mogą nadrobić w innych metrykach
+min_phases_to_pass = 1
+re_eval_tx_interval = 1
+use_three_layer_decision = true
+
+# Hard Fails ────────────────────────────────────────────────────────────────────
+# Wyłączone, żeby nie dokładały dodatkowych odcięć poza listą aktywnych progów.
+hard_fail_hhi = 6.999
+hard_fail_same_ms_tx_ratio = 0.99
+hard_fail_top3_volume_pct = 0.99
+
+# Soft signals ── AKTYWNE (3L scoring) ──────────────────────────────────────────
+# manipulation (3) >> diversity (2) > timing (1) > ecosystem (1) 
+max_soft_points = 255  # ❄ FROZEN (soft scoring neutralized)
+soft_weight_timing = 1
+soft_weight_manipulation = 3
+soft_weight_diversity = 2
+soft_weight_ecosystem = 1
+max_soft_score = 255
+
+# Dev Unknown ── AKTYWNE (dev nieznany = podejrzane) ────────────────────────────
+dev_unknown_min_market_cap_sol = 1.3    # ✅ mirrors min_market_cap_sol
+dev_unknown_min_sol_buy_ratio = 0.0       # ❄ FROZEN
+dev_unknown_max_soft_points = 255         # ❄ FROZEN
+dev_unknown_max_single_tx_price_impact_pct = 9999.0  # ❄ FROZEN
+
+# ── Hybrid gRPC / Yellowstone fingerprint thresholds ──────────────────────────
+# Aktywne: avg_inner_ix_count >= 11.5, fixed_size_buy_ratio >= 0.216,
+# early_slot_vol_dom_buy < 0.301.
+max_sell_buy_ratio = 0.99
+max_compute_unit_cluster_dominance = 1.0
+max_static_fee_profile_ratio = 0.99
+min_avg_inner_ix_count_50tx = 1.0
+min_fixed_size_buy_ratio = 0.001
+max_fixed_size_buy_ratio = 0.99
+max_fixed_size_buy_ratio_1e4 = 0.99
+max_flipper_presence_ratio = 0.99
+max_jito_tip_intensity = 1.0
+max_early_slot_volume_dominance_buy = 0.99
+max_whale_reversal_ratio_top3 = 9999.0
+max_whale_reversal_ratio_top1 = 9999.0
+min_dev_paperhand_latency_ms = 0
+
+# Bot Detection guard ── AKTYWNE ─────────────────────────────────────────────────
+hard_fail_bot_min_tx = 999999          # ❄ FROZEN (HF-9 bot guard disabled)
+hard_fail_bot_min_observation_ms = 1500
+
+# ── Yellowstone-only (opcjonalne) ───────────────────────────────────────────────
+# use_slot_ordering = false
+# min_failed_tx_ratio_for_bot_flag = 0.5
+
+
+
+# ==============================================================================
+# 🧠 GŁÓWKA PRACUJE: DECISION CORE
+# ==============================================================================
+[confidence]
+# OFENSYWA (75%)
+weight_sobp = 40.0        # Presja (Siła nabywcza).
+weight_mpcf = 35.0        # Fingerprinting (Kto kupuje).
+weight_iwim = 25.0        # IWIM - real dev check weight.
+weight_ssmi = 0.0         # SSMI wyłączone w tej konfiguracji.
+weight_qass = 0.0         # QASS wyłączone.
+weight_qofsv = 0.0        # Wyłączam, żeby nie szumiał. Skupmy się na IWIM.
+weight_scr = 0.0
+weight_frb = 0.0
+weight_qman = 0.0
+weight_gene_mapper = 0.0  # Zgodnie z rozkazem - usunięte.
+weight_chaos_engine = 0.0
+# PROGI (ADAPTIVE THRESHOLDS)
+threshold_high = 0.75     # Used for Full Analysis (TX >= 100) - Converted to 75/100
+threshold_medium = 0.50   # Kept for backward compatibility
+threshold_low = 0.30
+
+# ==============================================================================
+# 🧮 SECTION 1.5: MCI & QEDD
+# ==============================================================================
+[mci]
+version = 1
+weight_dc = 0.9
+weight_sc = 0.1
+coherence_abort_threshold = 0.20
+
+[mci.initial_state]
+base_sentiment = 0.5
+volatility_index = 0.5
+force_override = false
+
+# [QEDD] - OFF (neutralized coefficients)
+[qedd]
+version = 1
+lambda_base = 0.0
+lambda_sensitivity = 0.0
+lambda_abort_threshold = 0.95
+alpha_sobp_drop = 0.0
+beta_outflow = 0.0
+gamma_resonance = 0.0
+delta_deviation = 0.0
+horizon_1s = 1000
+horizon_5s = 5000
+horizon_30s = 30000
+horizon_60s = 60000
+
+# ==============================================================================
+# 👁️ SECTION 2: SIGNAL PROCESSORS
+# ==============================================================================
+[iwim]
+# Kod pobiera 50-100 tx. Ustawiamy limit analizy na 100.
+max_tx_analyze = 100
+# Czas analizy (ponieważ dane są fetchowane w tle, analiza w pamięci jest ultra szybka).
+target_analysis_time_us = 120
+# DEATH STAR RULES
+# Jeśli w historii deva znajdziemy choćby cień 2 rugów -> VETO.
+iapp_rug_threshold = 2
+min_iapp_rug_score = 0.95
+# Okna czasowe (teraz działają na prawdziwych timestampach!)
+at_window_ms = 3000
+quiet_window_ms = 6000
+confidence_threshold = 0.8
+
+# [IWIM_VETO_GATE] - Post-Gatekeeper IWIM Veto Gate
+# After Gatekeeper V2 produces a BUY verdict, IWIM Veto Gate fetches dev wallet
+# history via RPC and runs iwim_analyze to check for rug/sybil patterns.
+# Policy matrix: (dev_known × iwim_quality × fetch_status × gk_strength) → verdict.
+# Thresholds lowered for initial data collection phase.
+[iwim_veto_gate]
+enabled = false
+mode = "pp"
+max_wait_ms = 1
+primary_rpc_url = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+fallback_rpc_url = ""
+min_confidence = 0.6
+min_tx_pp = 15
+min_tx_grpc = 15
+rug_threat_threshold = 0.7
+sybil_threshold = 0.7
+organic_floor = 0.15
+strong_margin = 3
+strong_max_manipulation_flags = 0
+
+# [PANIC] - CIR-weighted congestion detector (0-7s)
+[panic]
+min_pressure_for_confidence = 0.8
+high_friction_threshold = 0.6
+demand_spring_threshold = 2.0
+impulse_threshold_txps = 15
+entropy_threshold = 0.8
+min_unique_signers = 3
+zero_entropy_confidence_cap = 0.3
+low_signer_confidence_cap = 0.3
+entropy_inconsistency_confidence_cap = 0.4
+cir_confidence_threshold = 0.5
+mute_sobp_score_threshold = 0.7
+mute_sobp_confidence_threshold = 0.6
+mute_scr_score_threshold = 0.8
+mute_scr_friction_threshold = 0.6
+scr_fee_spike_weight = 0.15
+scr_failed_ratio_weight = 0.2
+scr_inconsistency_penalty = 0.15
+
+# [TCR-Φ] - Temporal Causality Resonance (Phi Edition)
+[tcr_phi]
+window_size_slots = 0
+tempo_window = 12
+min_samples = 2
+confidence_samples = 2
+default_slot_ms = 400.0
+min_confidence_emit = 0.25
+synergy_timing_threshold = 0.75
+synergy_bias_threshold = 0.8
+synergy_boost = 1.25
+max_impacts = 256
+
+# [BEHAVIORAL] - ECTO/BVA/PANIC/TCR/CIR scoring multiplier
+[behavioral_scoring]
+enabled = true
+w_ecto = 0.10
+w_bva = 0.10
+w_panic = 0.40
+w_tcr = 0.30
+w_cir = 0.10
+early_stage_seconds = 2
+min_behavioral_floor = 0.30
+use_additive_mode = true
+max_adjustment_points = 15.0
+neutral_point = 0.5
+
+# [SOBP] - BUYING PRESSURE
+[sobp]
+human_weight_multiplier = 5.0
+sniper_weight_multiplier = 0.5
+default_weight_multiplier = 1.0
+base_transaction_weight = 1.25
+hyper_pump_threshold = 2.95
+growth_threshold = 1.3
+stagnation_threshold = 0.9
+implosion_threshold = 0.8
+confidence_weight_history = 0.9
+confidence_weight_tx_count = 0.1
+confidence_weight_intensity = 0.0
+slot_capacity = 128
+min_slot_history = 3
+
+# [MPCF] - FINGERPRINTING
+[mpcf]
+bot_entropy_threshold = 3.0
+human_entropy_threshold = 4.5
+bot_iss_variance_threshold = 0.10
+human_iss_variance_threshold = 0.25
+sybil_entropy_threshold = 3.0
+min_payload_size = 0
+max_payload_size = 8192
+unknown_confidence = 0.5
+low_confidence_small_payload = 0.5
+
+# [SSMI] - Sub-Slot Microentropy Index
+[ssmi]
+bot_scr_threshold = 0.7
+bot_ar_threshold = 0.8
+bot_entropy_threshold = 1.5
+human_entropy_threshold = 3.0
+human_ar_threshold = 0.3
+human_scr_threshold = 0.4
+viral_min_tx_count = 6
+viral_entropy_min = 2.5
+viral_entropy_max = 4.0
+viral_scr_threshold = 0.5
+score_weight_entropy = 0.35
+score_weight_scr = 0.40
+score_weight_ar = 0.25
+viral_score_bonus = 0.15
+human_score_bonus = 0.05
+bot_score_penalty = 0.20
+histogram_bins = 64
+max_jitter_ms = 2000
+
+# [QASS] - Quantum Amplitude Scoring System
+[qass]
+collapse_threshold = 0.5
+score_threshold_viral = 0.85
+score_threshold_moderate = 0.70
+score_threshold_neutral = 0.50
+score_threshold_suspicious = 0.30
+default_signal_weight = 1.0
+
+# [QOFSV] - Quantum Order-Flow State Vector
+[qofsv]
+state_vector_dim = 6
+epsilon = 0.000001
+target_construction_time_us = 200
+target_normalization_time_us = 50
+
+# [FRB] - Frequency Resonance Bands
+[frb]
+min_amplitude_threshold = 0.001
+enable_filtering = true
+
+# [RESONANCE] - Coefficient of Variation Analysis
+[resonance]
+bot_threshold_cv = 0.3
+human_threshold_cv = 0.8
+
+# ==============================================================================
+# 🎯 SECTION 3: NORMALIZATION
+# ==============================================================================
+[normalization]
+liquidity_scale = 100.0
+
+# Kalibracja: A med_total_volume = 47.9 SOL, B med = 27.7 SOL
+# Skala 50.0 centruje sigmoid na medianie A (pool kt\u00f3re chcemy)
+volume_scale = 50.0
+
+# Wy\u017csza wra\u017cliwo\u015b\u0107 na volatility \u2014 A ma wy\u017cszy price_change_ratio (2.63 vs 1.82)
+volatility_factor = 5.0
+
+# ==============================================================================
+# 🧬 SECTION 5: LIGMA (Global Guard)
+# ==============================================================================
+[ligma]
+enabled = true
+
+# Pump.fun settings
+retail_impact_limit_bps = 2500.0
+soft_impact_bps = 3500.0
+hard_impact_bps = 8000.0
+micro_jump_bps = 2500.0
+weight_in_survivor_score = 0.15
+veto_trap_threshold = 0.95
+veto_psi_ligma_threshold = -0.9
+
+# ==============================================================================
+# 🔮 SECTION 6: FRE (Fractal Resonance Engine)
+# ==============================================================================
+[fre]
+# Minimum transaction count for STT (Scale-Transition Test) analysis
+stt_min_tx_count = 12
+
+# FSW (Fractal Stability Window) thresholds
+fsw_sigma_watch = 0.12   # Threshold for WATCH state (jittery)
+fsw_sigma_skip = 0.18    # Threshold for SKIP state (chaotic)
+
+# Minimum organic score to consider BUY
+min_organic_score = 75
+
+# Penalty factor for scale incoherence (ARB logic)
+arb_penalty_factor = 1.5
+
+# ==============================================================================
+# 🎯 SECTION 7: HYPER PREDICTION ORACLE
+# ==============================================================================
+
+[hyper_prediction]
+# SurvivorScore Configuration
+# Early exit if score < this threshold (prevents wasting compute on hopeless candidates)
+survivor_critical_threshold = 35
+
+# Max ±pts from QASS (QASS is now secondary to SurvivorScore)
+qass_secondary_max_adjustment = 10
+
+# Min confidence to apply QASS modifier (low-confidence QASS is ignored)
+qass_min_confidence_for_modifier = 0.6
+
+# Cold Start Configuration
+# Max adjustment factor (30%) based on Chaos Engine pump probability
+# Example: base_score=50, pump_prob=80% → adjustment=+9% → final=54.5
+cold_start_max_adjustment = 0.3
+
+# Weight for first-candle volume extrapolation in QEDD/MCI (cold start only)
+# Makes 5 SOL burst in S1 equivalent to 50 SOL accumulated volume
+cold_start_qedd_mci_weight = 10.0
+
+# MESA Microstructure Thresholds
+# Wash trading above 85% triggers -25pts and VeryHigh risk
+# Based on historical analysis of pump.fun wash patterns
+mesa_wash_severe_threshold = 0.85
+
+# Wash trading above 70% triggers -12pts
+mesa_wash_elevated_threshold = 0.70
+
+# Bot pattern above 90% triggers -15pts
+# Indicates automated snipers with identical tx sizes
+mesa_bot_high_threshold = 0.90
+
+# Bot pattern above 75% triggers -8pts
+mesa_bot_moderate_threshold = 0.75
+
+# Organic activity above 75% (with wash < 40%) triggers +8pts bonus
+# Indicates genuine community interest with retail momentum
+mesa_organic_bonus_threshold = 0.75
+mesa_organic_max_wash = 0.40
+
+# High entropy above 80% (with wash < 50%) triggers +5pts bonus
+# Indicates genuine decentralized activity
+mesa_entropy_bonus_threshold = 0.80
+mesa_entropy_max_wash = 0.50
+
+# Scoring Normalization
+# Floor value for volume normalization (prevents division by zero)
+min_volume_scale = 0.0001  # 1e-4
+
+# Maximum multiplier for volume burst normalization
+# Caps extreme spikes to prevent single-transaction manipulation
+relative_factor_cap = 2.0
+
+# Divides relative burst factor to dampen volatility
+burst_normalization = 2.0
+
+# Risk Assessment Thresholds
+[hyper_prediction.risk_thresholds]
+# Confidence < 50% → VeryHigh risk (insufficient data quality)
+very_high_confidence = 0.5
+
+# Confidence < 70% → High risk (some data quality issues)
+high_confidence = 0.7
+
+# Score < 60 → Medium risk (fundamental weakness even with good data)
+medium_score = 60
+
+# ==============================================================================
+# 📉 SECTION 7.5: FOLLOWUP SCORING (Trend Detection)
+# ==============================================================================
+[hyper_prediction.followup_scoring]
+# MCI drop threshold - if MCI falls below this during observation cycles, apply penalty
+# Lower = more forgiving (allows more MCI degradation)
+# Higher = stricter (kills tokens faster when coherence drops)
+# Was hardcoded at 0.50, which caused S9-S12 crashes (66→28pts)
+mci_drop_threshold = 0.35
+
+# QEDD survival drop percentage - maximum allowed survival drop between cycles
+# If survival drops by more than this %, token gets penalized
+# Higher = more forgiving (allows bigger survival drops)
+# Was hardcoded at 0.30 (30%), which caused false positives on natural volatility
+qedd_survival_drop_pct = 0.50  # 50%
+
+# Enable/disable followup penalties (useful for A/B testing)
+enable_followup_penalties = true
+
+# ==============================================================================
+# 🎯 SECTION 7.6: SURVIVOR SCORE THRESHOLDS
+# ==============================================================================
+[hyper_prediction.survivor_thresholds]
+# Minimum survival component to avoid instant penalty
+# If survival < this, score gets "⚠️ Rug risk" flag
+# Was hardcoded at 0.4, lowered to 0.35 for more tolerance
+min_survival_threshold = 0.25
+
+# Minimum quality component to avoid instant penalty
+# If quality < this, score gets "🤖 Bot dominated" flag
+# Was hardcoded at 0.4, lowered to 0.35 for more tolerance
+min_quality_threshold = 0.25
+
+# Minimum LIGMA tradability to avoid liquidity trap penalty
+# If LIGMA tradability < this, token gets "⚠️ Low tradability" flag
+# Was hardcoded at 0.4, lowered to 0.35 for more tolerance
+min_ligma_threshold = 0.25
+
+# Wallet quality threshold for bonus calculation
+# If unique_wallet_ratio > this, apply wallet quality multiplier
+# Below this, no wallet quality bonus is applied
+# Was hardcoded at 0.6 in survivor_score.rs
+wallet_quality_threshold = 0.25
+
+# Wash trading threshold for risk penalty
+# If MESA wash_likeness > this, apply wash trading penalty
+# Was hardcoded at 0.6 in survivor_score.rs
+wash_trading_threshold = 0.25
+
+# MESA wash trading severe threshold
+# Wash likeness above this triggers severe penalties and VeryHigh risk
+# Was hardcoded at 0.85 in orchestrator.rs (used in HyperPrediction config)
+mesa_wash_severe = 0.85
+
+# MESA wash trading elevated threshold
+# Wash likeness above this triggers moderate penalties
+# Was hardcoded at 0.70 in orchestrator.rs (MESA_INTERPRETATION_WASH_THRESHOLD)
+mesa_wash_elevated = 0.70
+
+# ==============================================================================
+# ⚠️ SECTION 7.7: RISK MULTIPLIERS
+# ==============================================================================
+[hyper_prediction.risk_multipliers]
+# Exit signal penalty weight (used in risk_discount calculation)
+# Weight applied to smart money exit signals when calculating risk discount
+# Was hardcoded at 0.5 in survivor_score.rs line 467
+exit_signal_weight = 0.5
+
+# Crash risk discount factor
+# Factor applied to price crash penalties
+# Was hardcoded at 0.5 in various calculations
+crash_risk_factor = 0.1
+
+# Anomaly penalty factor (volume anomalies, pattern breaks)
+# Factor applied to ParadoxSensor and other anomaly penalties
+# Was hardcoded at 0.5 in various calculations
+anomaly_penalty_factor = 0.2
+
+# Wallet quality multiplier
+# Multiplier applied to wallet ratio when calculating quality bonus
+# If wallet_ratio > wallet_quality_threshold, quality = wallet_ratio * this
+# Was hardcoded at 0.5 in survivor_score.rs line 448
+wallet_quality_multiplier = 0.5
+
+# Wash trading penalty multiplier
+# Multiplier applied to wash likeness when calculating wash penalty
+# If wash_likeness > wash_threshold, penalty = wash_likeness * this
+# Was hardcoded at 0.5 in survivor_score.rs line 475
+wash_penalty_multiplier = 0.5
+
+# ==============================================================================
+# 🔧 SECTION 7.8: ORCHESTRATOR THRESHOLDS
+# ==============================================================================
+[hyper_prediction.orchestrator_thresholds]
+# Cabal risk threshold for cluster hunter veto
+# If ClusterHunter detects cabal risk above this, token is vetoed immediately
+# Was hardcoded as CABAL_RISK_THRESHOLD = 0.65 in orchestrator.rs
+cabal_risk_threshold = 0.65
+
+# MESA bot pattern threshold for interpretation/display
+# Used for logging bot-dominated launches
+# Was hardcoded as MESA_INTERPRETATION_BOT_THRESHOLD = 0.75
+mesa_interpretation_bot_threshold = 0.75
+
+# MESA organic activity threshold for interpretation/display
+# Used for logging organic launches
+# Was hardcoded as MESA_INTERPRETATION_ORGANIC_THRESHOLD = 0.70
+mesa_interpretation_organic_threshold = 0.70
+
+# ==============================================================================
+# 🎯 SECTION 8: SCORING WEIGHTS
+# ==============================================================================
+
+[scoring]
+# Signal Weights (baseline = 1.0)
+ligma = 1.0
+qedd = 1.0
+survivor = 1.0
+qass_secondary = 1.0
+mci = 1.0
+cluster = 1.2          # B ma wyższe HHI / top3_volume_pct — cluster jest separatorem
+chaos = 1.0
+
+# Penalty Multipliers — wzmocnione bo B ≈ skoncentrowane/zmanipulowane pool
+wash_penalty_mult = 1.3          # Wash trading detection penalty
+bot_penalty_mult = 1.2           # Bot pattern penalty
+rug_penalty_mult = 1.0           # Rug threat penalty
+cluster_penalty_mult = 1.4       # B ma wyższy top3/HHI — główny dyskryminator
+ssmi_bot_penalty_mult = 1.0      # SSMI bot detection penalty
+scr_penalty_mult = 1.0           # SCR bot detection penalty
+ulvf_div_penalty_mult = 1.0      # ULVF divergence penalty
+ulvf_curl_penalty_mult = 1.0     # ULVF curl penalty
+povc_penalty_mult = 1.2          # POVC cluster penalty
+mpcf_sniper_penalty_mult = 1.2   # MPCF sniper/MEV penalty
+mpcf_sybil_penalty_mult = 1.3    # MPCF sybil penalty
+
+# Boost Multipliers — A ma cechy organiczne, wspieramy to
+organic_boost_mult = 1.2         # Organic activity boost
+smart_money_boost_mult = 1.0     # Smart money boost
+ssmi_viral_boost_mult = 1.1      # SSMI viral launch boost
+ssmi_human_boost_mult = 1.1      # SSMI human activity boost
+mesa_organic_boost_mult = 1.1    # MESA organic bonus
+mesa_entropy_boost_mult = 1.0    # MESA entropy bonus
+chaos_pump_boost_mult = 1.0      # Chaos pump probability boost
+resonance_human_boost_mult = 1.1 # Resonance human detection boost
+cluster_clean_boost_mult = 1.2   # Clean cluster bonus
+povc_organic_boost_mult = 1.0    # POVC organic cluster boost
+
+# =============================================================================
+# TCF (Trend Cohesion Field) Configuration
+# =============================================================================
+# TCF measures the coherence of market dynamics across scoring cycles.
+# It evaluates whether the mechanism generating market changes remains consistent.
+# TCF participates ONLY in Final Verdict (after S13), modulating momentum.
+#
+# Formula: effective_momentum = base_momentum * (tcf_min_modulation + tcf_modulation_range * tcf_score)
+# Example: base_momentum=50, tcf_score=0.8 → effective_momentum = 50 * (0.6 + 0.4*0.8) = 46
+
+[tcf]
+# Enable TCF analysis
+enabled = false
+
+# Weight of TCF in Final Verdict calculation (0.0-1.0)
+# Higher values give TCF more influence on the final score
+weight_in_final_verdict = 0.15
+
+# Minimum modulation factor (floor when tcf_score = 0)
+# Value of 0.6 means momentum can be reduced to 60% at worst
+tcf_min_modulation = 0.6
+
+# Modulation range (added to min when tcf_score = 1)
+# Value of 0.4 means full momentum preserved when tcf_score = 1.0
+tcf_modulation_range = 0.4
+
+# Decay factor for cohesion history integral (0.5-0.99)
+# Higher = faster forgetting of old cohesions, faster adaptation
+# Lower = longer memory, more stable but slower to detect changes
+decay_factor = 0.85
+
+# Minimum TCF updates before considered "primed" for reliable scoring
+# TCF needs at least this many cycles to establish baseline expectations
+min_updates_for_primed = 3
+
+# Direction alignment weight in cohesion calculation (0.0-1.0)
+# How much weight is given to direction consistency
+cohesion_direction_weight = 0.40
+
+# Rhythm (magnitude) weight in cohesion calculation (0.0-1.0)
+# How much weight is given to volatility similarity
+cohesion_rhythm_weight = 0.30
+
+# Stability weight in cohesion calculation (0.0-1.0)
+# How much weight is given to internal consistency preservation
+cohesion_stability_weight = 0.30
+
+# Volatility sensitivity (higher = more penalty for volatility spikes)
+volatility_sensitivity = 2.0
+
+# Direction sensitivity (higher = more penalty for direction contradictions)
+direction_sensitivity = 1.5
+
+# Penalty for price-volume divergence
+price_volume_divergence_penalty = 0.15
+
+# Maximum bonus for perfect alignment
+alignment_bonus_max = 0.10
+
+# Cliff detection threshold (drop in cohesion that triggers cliff warning)
+cliff_threshold = 0.25
+
+# High cohesion threshold (above this is considered "good" cohesion)
+high_cohesion_threshold = 0.7
+
+# Low cohesion threshold (below this triggers consecutive low counter)
+low_cohesion_threshold = 0.4
+
+# ==============================================================================
+# BVA (Behavioral Vacuum Analysis) Configuration
+# ==============================================================================
+[bva]
+# Primary window where BVA is dominant (seconds)
+primary_window_secs = 3
+
+# Slot duration estimate for normalization
+slot_duration_ms = 400
+
+# Early reaction window in slots
+early_reaction_slots = 2
+
+# Metric weights (sum to 1.0)
+weight_tds = 0.20
+weight_dc = 0.30
+weight_se = 0.10
+weight_cer = 0.10
+weight_erp = 0.30
+
+# SOBP directional blend weight
+sobp_dc_blend = 0.4
+
+# SCR prior weight from BVA classification
+scr_prior_weight = 0.15
+
+# Minimum weight for CIR echo timing decay
+cir_min_weight = 0.10
+
+# Confidence divisors
+confidence_tx_divisor = 5
+confidence_signer_divisor = 3
+confidence_time_divisor_ms = 2000
+
+# Confidence penalties
+sobp_fallback_confidence_penalty = 0.15
+congestion_confidence_penalty = 0.10
+
+# Classification thresholds
+classification_confidence_floor = 0.30
+classification_organic_tds_min = 0.55
+classification_organic_se_min = 0.55
+classification_organic_dc_min = 0.35
+classification_steered_dc_min = 0.70
+classification_steered_erp_min = 0.60
+
+# ==============================================================================
+# 🎯 SECTION 9: SURVIVOR SCORE CONFIGURATION
+# ==============================================================================
+# Controls the formula: S = (survival)^Ws × (momentum)^Wm × (quality)^Wq × (1 - risk_discount)
+# All exponent weights control how much each component contributes to the final score.
+
+[survivor_score]
+# Exponent weights (NOT linear weights - these are powers in the formula)
+weight_survival = 0.35   # Ws (exponent, not linear weight)
+weight_momentum = 0.30   # Wm (exponent)
+weight_quality = 0.20    # Wq (exponent)
+
+# Survival component weights for scoring cycles (no IWIM)
+# During cycles S1-S13, IWIM is NOT included. Weights: QEDD (62.5%) + Cluster (37.5%)
+[survivor_score.survival_cycle]
+qedd = 0.625
+cluster = 0.375
+
+# Survival component weights for Final Verdict (with IWIM)
+# At Final Verdict, IWIM is included: QEDD (50%) + IWIM (30%) + Cluster (20%)
+[survivor_score.survival_final_verdict]
+qedd = 0.5
+iwim = 0.3
+cluster = 0.2
+
+# Quality component weights for Early Stage (S1-S6, no SCR)
+# SCR is excluded because FFT requires ~20+ samples for statistical significance
+[survivor_score.quality_early_stage]
+mpcf = 0.44
+mesa = 0.31
+wallet = 0.25
+
+# Quality component weights for Full Analysis (S7-S12, with SCR)
+# All metrics active including SCR for bot detection
+[survivor_score.quality_full_analysis]
+mpcf = 0.35
+mesa = 0.25
+scr = 0.20
+wallet = 0.20
+
+# Momentum component configuration
+# Controls how SOBP and Chaos Engine contribute to momentum
+[survivor_score.momentum]
+sobp_base = 1.0
+sobp_multiplier = 0.5
+chaos_base = 0.7
+chaos_multiplier = 0.6
+
+# ==============================================================================
+# 🎯 SECTION 10: CYCLE WEIGHTS & GUNSHOT THRESHOLDS
+# ==============================================================================
+# Controls the scoring loop timing and immediate buy triggers
+
+[cycle_weights]
+# Exponential weights for weighted geometric mean calculation
+# Later cycles have exponentially higher influence on the final decision
+# Weight distribution follows geometric progression with multiplier ~1.3:
+# - S1-S6 (Early Stage): Lower weights
+# - S7-S12 (Full Analysis): Higher weights
+s1 = 1.3
+s2 = 1.7
+s3 = 2.2
+s4 = 2.8
+s5 = 3.6
+s6 = 4.6
+s7 = 6.0
+s8 = 7.8
+s9 = 10.0
+s10 = 13.0
+s11 = 17.0
+s12 = 22.0
+
+[gunshot_thresholds]
+# Immediate buy triggers (descending thresholds)
+# If raw score meets/exceeds threshold, buy immediately without waiting for S13
+# Early Stage (S1-S6): Higher thresholds due to limited data confidence
+# Full Analysis (S7-S12): Lower thresholds as confidence increases
+s1 = 100.0  # God Candle - requires perfection
+s2 = 99.0
+s3 = 98.0
+s4 = 97.0
+s5 = 96.0
+s6 = 95.0
+s7 = 88.0   # Transition to Full Analysis
+s8 = 87.0
+s9 = 86.0
+s10 = 85.0  # Strong trend confirmation
+s11 = 83.5
+s12 = 82.0  # Final Stand
+
+# ==============================================================================
+# 🛰️ SECTION 11: PARADOX SENSOR (HFT/Paradox Gate)
+# ==============================================================================
+[paradox]
+enabled = true
+window_size_ms = 500
+analysis_interval_ms = 50
+anomaly_tension_threshold = 80.0
+max_samples = 2000
+min_samples_for_analysis = 10
+
+# ==============================================================================
+# 🛡️ SECTION 12: POST-BUY GUARDIAN (Real-time Position Monitoring)
+# ==============================================================================
+# All fields have sensible defaults via #[serde(default)].
+# Only override values you want to change from production defaults.
+[post_buy_guardian]
+enabled = true
+tick_interval_ms = 500
+max_monitored_positions = 10
+signal_channel_buffer = 256
+
+# LIGMA thresholds (liquidity depth monitoring)
+ligma_warning_impact_bps = 3500.0
+ligma_critical_impact_bps = 8000.0
+ligma_warning_tradability = 0.4
+ligma_critical_tradability = 0.15
+ligma_probe_sol = 0.1
+
+# WHF thresholds (wash trading / manipulation detection)
+whf_min_confidence = 0.6
+whf_wash_trading_is_critical = true
+whf_min_net_flow_sol = 0.5
+whf_wash_max_price_change = 0.02
+whf_decay_min_price_drop = 0.05
+whf_decay_max_volume_cv = 0.3
+
+# TCF thresholds (trend cohesion / regime change)
+tcf_warning_cohesion = 0.4
+tcf_critical_cohesion = 0.2
+tcf_cliff_is_warning = true
+tcf_consecutive_low_max = 5
+
+# PANIC thresholds (congestion / coordinated sell detection)
+panic_warning_txps = 15.0
+panic_critical_txps = 30.0
+panic_low_entropy_threshold = 1.0
+panic_rate_window_ms = 2000
+
+# Signal aggregation / escalation
+escalation_warning_count = 3
+escalation_critical_count = 1
+signal_aggregation_window_ms = 5000
+max_signals_per_position = 200
+
+[post_buy_guardian.aem]
+enabled = true
+t_s = 120
+min_stabilization_ticks = 2
+n_min_per_key = 20
+min_edge = 0.02
+k_ci = 1.28
+tail_risk_limit_wait = 0.20
+oracle_stale_hard_ms = 1500
+partial_fraction_bps = 5000
+ci_compare_against_sell_now = true
+ci_compare_against_partial = true
+decay_half_life_days = 7.0
+replay_window_days = 14
+replay_max_events = 200000
+stress_low_requeue_max = 1
+stress_med_requeue_min = 2
+stress_med_requeue_max = 4
+stress_high_requeue_min = 5
+stress_low_send_fail_max = 0
+stress_med_send_fail_eq = 1
+stress_high_send_fail_min = 2
+stress_low_relax_max = 0
+stress_med_relax_eq = 1
+stress_high_relax_min = 2
+drawdown_bucket_edges_pct = [20.0, 40.0]
+time_bucket_edges_s = [30, 120]
+slope_fast_down_pct_per_s = -0.8
+slope_slow_down_pct_per_s = -0.15
+slope_up_pct_per_s = 0.15
+shadow_positions = 200
+pilot_drawdown_min_pct = 40.0
+pilot_requires_stress_low = true
+full_live_requires_positive_mean_delta = true
+full_live_tail_risk_max = 0.20
+ledger_dir = "datasets/decisions/aem"

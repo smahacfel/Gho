@@ -1,0 +1,37 @@
+/* Import fonts — must precede @tailwind directives */
+@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=JetBrains+Mono:wght@400;500&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Scrollbar styling — hidden but functional */
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: #0a0a0f; }
+::-webkit-scrollbar-thumb { background: #1e1e2e; border-radius: 4px; }
+
+/* Neon glow utility classes */
+@layer utilities {
+  .glow-cyan {
+    box-shadow: 0 0 12px rgba(0, 212, 255, 0.3),
+                0 0 24px rgba(0, 212, 255, 0.1);
+  }
+  .glow-green {
+    box-shadow: 0 0 8px rgba(0, 255, 136, 0.4);
+  }
+  .glow-red {
+    box-shadow: 0 0 8px rgba(255, 51, 102, 0.4);
+  }
+  .text-glow-cyan {
+    text-shadow: 0 0 10px rgba(0, 212, 255, 0.8);
+  }
+}
+
+body {
+  background-color: #0a0a0f;
+  color: #e0e0f0;
+  font-family: 'Inter', sans-serif;
+  /* Prevent zoom on mobile */
+  touch-action: manipulation;
+  -webkit-text-size-adjust: 100%;
+}

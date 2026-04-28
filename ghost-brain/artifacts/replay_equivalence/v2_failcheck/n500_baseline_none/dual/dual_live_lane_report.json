@@ -1,0 +1,53 @@
+{
+  "run_id": "n500_baseline_none_dual",
+  "mode": "dual",
+  "lane": "live",
+  "n": 500,
+  "seed": 128068,
+  "profile": "baseline",
+  "scenario": "none",
+  "submitted": 500,
+  "filled": 400,
+  "failed": 100,
+  "timeout": 0,
+  "unknown": 0,
+  "terminal_total": 500,
+  "in_flight": 0,
+  "opened": 400,
+  "closed": 400,
+  "terminal_entry_fail": 100,
+  "duplicates_fill": 0,
+  "duplicates_opened": 0,
+  "duplicates_closed": 0,
+  "missing_terminal_orders": [],
+  "multiple_terminal_orders": [],
+  "candidate_without_opened_or_failed": [],
+  "recovery_unknown_orders": [],
+  "unknown_non_recovery_orders": [],
+  "p50_time_to_fill_ms": 292.0,
+  "p90_time_to_fill_ms": 379.0,
+  "timing_histogram": [
+    {
+      "bucket": "0-199",
+      "count": 0
+    },
+    {
+      "bucket": "200-299",
+      "count": 212
+    },
+    {
+      "bucket": "300-399",
+      "count": 188
+    },
+    {
+      "bucket": "400-599",
+      "count": 0
+    },
+    {
+      "bucket": "600+",
+      "count": 0
+    }
+  ],
+  "verdict": "PASS",
+  "failed_checks": []
+}

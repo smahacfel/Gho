@@ -1,0 +1,135 @@
+{
+  "schema_name": "ghost.refactor.phase4.proof-gate",
+  "schema_version": 1,
+  "plan_path": "PLANS/PLAN_WYKONAWCZY_DOMKNIECIA_REFAKTORU_ARCHITEKTURY_20260401.md",
+  "audit_path": "docs/ADR/ADR-0072-refactor-architecture-audit-2026-04-01.md",
+  "description": "Phase 4 proof/acceptance gate for PR7 full truth-source closure outside observation runtime.",
+  "phase_gates": [
+    "structural-proof",
+    "runtime-proof"
+  ],
+  "required_metrics": [
+    {
+      "name": "account_update_before_identity_total",
+      "path": "ghost-launcher/src/oracle_runtime.rs",
+      "needle": "\"account_update_before_identity_total\""
+    },
+    {
+      "name": "account_update_promoted_from_bootstrap_total",
+      "path": "ghost-launcher/src/oracle_runtime.rs",
+      "needle": "\"account_update_promoted_from_bootstrap_total\""
+    },
+    {
+      "name": "canonical_first_update_latency_ms",
+      "path": "ghost-launcher/src/session/observation.rs",
+      "needle": "\"canonical_first_update_latency_ms\""
+    },
+    {
+      "name": "timeout_without_canonical_updates_total",
+      "path": "ghost-launcher/src/oracle_runtime.rs",
+      "needle": "\"timeout_without_canonical_updates_total\""
+    },
+    {
+      "name": "shadow_truth_fallback_total",
+      "path": "ghost-launcher/src/oracle_runtime.rs",
+      "needle": "\"shadow_truth_fallback_total\""
+    },
+    {
+      "name": "degraded_truth_helper_total",
+      "path": "ghost-launcher/src/oracle_runtime.rs",
+      "needle": "\"degraded_truth_helper_total\""
+    },
+    {
+      "name": "post_buy_price_source_total",
+      "path": "ghost-launcher/src/components/post_buy_runtime.rs",
+      "needle": "\"post_buy_price_source_total\""
+    },
+    {
+      "name": "post_buy_shadow_compare_total",
+      "path": "ghost-launcher/src/components/post_buy_runtime.rs",
+      "needle": "\"post_buy_shadow_compare_total\""
+    },
+    {
+      "name": "post_buy_shadow_compare_diff_bps",
+      "path": "ghost-launcher/src/components/post_buy_runtime.rs",
+      "needle": "\"post_buy_shadow_compare_diff_bps\""
+    },
+    {
+      "name": "shadow_ledger_runtime_unexpected_reconciliation_action_total",
+      "path": "ghost-core/src/shadow_ledger/reconciliation_runtime.rs",
+      "needle": "\"shadow_ledger_runtime_unexpected_reconciliation_action_total\""
+    },
+    {
+      "name": "seer_account_updates_before_mapping_total",
+      "path": "off-chain/components/seer/src/lib.rs",
+      "needle": "\"seer.account_updates.before_mapping_total\""
+    },
+    {
+      "name": "seer_account_updates_pending_curve_replay_total",
+      "path": "off-chain/components/seer/src/lib.rs",
+      "needle": "\"seer.account_updates.pending_curve_replay_total\""
+    }
+  ],
+  "required_fallback_sites": [
+    {
+      "site": "resolve_price_context",
+      "category": "degraded_diagnostic",
+      "helper": "shadow_ledger_snapshot"
+    },
+    {
+      "site": "resolve_gatekeeper_initial_reserves",
+      "category": "degraded_diagnostic",
+      "helper": "shadow_ledger_snapshot"
+    },
+    {
+      "site": "tx_curve_enrichment_shadow",
+      "category": "bootstrap_only",
+      "helper": "shadow_ledger_curve"
+    }
+  ],
+  "block_absence_checks": [
+    {
+      "name": "post_buy_live_price_sample_no_shadow_truth_helper",
+      "description": "Live post-buy price sampling must not call ShadowLedger compare as truth.",
+      "path": "ghost-launcher/src/components/post_buy_runtime.rs",
+      "start": "async fn read_live_price_sample(",
+      "end": "// ─── Public API",
+      "needle": "read_shadow_price_for_compare("
+    },
+    {
+      "name": "post_buy_live_price_sample_no_shadow_truth_metric",
+      "description": "Live post-buy price sampling must not emit shadow_truth_fallback_total.",
+      "path": "ghost-launcher/src/components/post_buy_runtime.rs",
+      "start": "async fn read_live_price_sample(",
+      "end": "// ─── Public API",
+      "needle": "\"shadow_truth_fallback_total\""
+    },
+    {
+      "name": "post_buy_runtime_no_shadow_truth_source_label",
+      "description": "Live post-buy source telemetry must not advertise shadow_ledger as truth.",
+      "path": "ghost-launcher/src/components/post_buy_runtime.rs",
+      "start": "fn record_post_buy_price_source(",
+      "end": "// ─── Public API",
+      "needle": "\"source\" => \"shadow_ledger\""
+    },
+    {
+      "name": "reconciliation_runtime_no_record_repair",
+      "description": "Monitoring-only reconciliation runtime must not record repair actions.",
+      "path": "ghost-core/src/shadow_ledger/reconciliation_runtime.rs",
+      "start": "pub fn process_account_update(",
+      "end": "    // ── Scheduled cycle",
+      "needle": "record_repair("
+    }
+  ],
+  "runtime_thresholds": {
+    "min_cov_avg_coverage": 0.95,
+    "require_cov_complete": true,
+    "max_cov_unresolved_count": 0,
+    "max_timeout_without_canonical_updates_windows": 0,
+    "max_truth_windows_without_canonical_updates": 0,
+    "max_hidden_primary_sites": 0,
+    "max_runtime_invariant_breaks": 0,
+    "max_pending_replay_send_failed": 0,
+    "max_pending_replay_parse_failed": 0
+  }
+}

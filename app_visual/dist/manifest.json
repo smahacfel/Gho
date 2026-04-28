@@ -1,0 +1,13 @@
+{
+  "name": "Ghost App",
+  "short_name": "GHOST",
+  "description": "Ghost Trading Bot Dashboard",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0a0a0f",
+  "theme_color": "#00d4ff",
+  "icons": [
+    { "src": "/ghost-icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/ghost-icon-512.png", "sizes": "512x512", "type": "image/png" }
+  ]
+}

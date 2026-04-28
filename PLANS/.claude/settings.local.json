@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -n \"ReplayOrderKey\\\\|replay_order\\\\|decision_order\" /root/Gho/ghost-core/src/shadow_ledger/ledger.rs /root/Gho/ghost-launcher/src/components/*.rs)",
+      "Bash(grep -n \"snapshot_to_disk\\\\|periodic\\\\|scheduler\\\\|interval\" /root/Gho/ghost-launcher/src/*.rs)",
+      "Bash(grep:*)",
+      "Bash(find ~/.cargo/registry/src -path */metrics-0.21*/src/macros.rs)",
+      "Bash(find ~/.cargo -name *.rs)",
+      "Bash(cargo check:*)",
+      "Bash(cargo test:*)"
+    ]
+  }
+}

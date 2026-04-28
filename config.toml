@@ -1,0 +1,333 @@
+# Ghost Launcher - konfiguracja.
+
+# Zdefiniuj tryb pracy Ghosta: "test" dla  devnet/testnet, "production" dla mainnet (produkcja, dry run).
+mode = "production"
+snapshot_inactive_tx_buffer_capacity = 8192
+snapshot_inactive_tx_ttl_margin_ms = 2000
+ghost_brain_config_path = "ghost-brain/ghost_brain_config.toml"
+
+# ===== Globalne ID Programów (Task #37.5 - usunięcie hardcodingu) =====
+pump_program_id = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+raydium_program_id = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
+bonk_program_id = "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj"
+
+# ===== Seer Component =====
+# Komponent do livetime sniffingu danych z Jito Geyser/Yellowston/standard websocket connection pod testy dry.
+[seer]
+enabled = true
+#connection_mode = "pump_portal_ws"  # Opcje: "grpc" lub dla dry run "helius_websocket"
+source_mode = "grpc"
+commitment = "processed"
+stream_mode = "single_global"
+tx_filter_strategy = "per_pool"
+# Tracked default template stays neutral/fail-closed.
+# Authoritative FSC bake lives only in explicit rollout profiles.
+funding_lane_mode = "disabled"
+watched_pools_ttl_ms = 120000
+watched_pools_cap = 32768
+watch_debounce_ms = 0
+
+# [seer.pumpportal]
+
+# ws_url = "wss://pumpportal.fun/api/data"
+max_active_mints = 1000
+subscription_batch_size = 10
+reconnect_base_delay_secs = 5
+reconnect_max_delay_secs = 300
+stats_window_secs = 900
+# Chainstack gRPC Configuration (Wklej dane z panelu Chainstack)
+# Adres BEZ "https://". Format: "nd-xxx-xxx.p2pify.com:443"
+grpc_endpoint = "yellowstone-solana-mainnet.core.chainstack.com:443"
+# Token X (jeśli wymagany, w przeciwnym razie zostaw puste "")
+grpc_x_token = "f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+
+# Szybki RPC (HTTPS) do zapytań Triggera (get_balance, simulate) - Użyj HTTPS z Chainstack Growth
+rpc_endpoint = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+grpc_manual_backfill_enabled = false
+grpc_commitment_fallback_to_websocket = false
+grpc_max_stalls_before_open = 3
+grpc_circuit_breaker_cooldown_ms = 15000
+enable_pumpfun = true
+enable_bonkfun = false     # Możesz zmienić na false na start, żeby oszczędzić przepustowość
+enable_raydium = false     # Dodane dla kompletności
+
+# Port metryk Seera (deprecated — serwer /metrics uruchamiany jest przez sekcję [metrics] launchera)
+metrics_port = 9090
+
+# Ustawienia IPC (Inter-Process Communication). Kiedy w logach widzisz, że IPC buffer osiąga wartości powyżej 80% zwiększ wartość ipc_buffer_size. Stopniowo, bo spalisz kąkuter!
+ipc_buffer_size = 100000
+ipc_backpressure_policy = "block"  # Options: "block", "drop_oldest", "drop_new", "drop_by_priority"
+
+# ===== Prometheus Metrics =====
+# Serwer HTTP eksponujący metryki oracle w formacie Prometheus.
+# Skonfiguruj scraper Prometheusa na ten adres: http://<host>:<port>/metrics
+[metrics]
+enabled = true
+bind = "0.0.0.0"
+port = 9091
+
+# ===== Ghost Brain (Nowa sekcja dla Zadań #40/41) =====
+[ghost_brain]
+enabled = false
+strategy_config_path = "ghost-brain/ghost_brain_config.toml"
+# Profil startowy: "standard" (Wiralowość) lub "reversal" (Phoenix/Odbicia)
+default_profile = "standard"
+
+# ===== Trigger Component =====
+# Spust rewolwera - odpowiedzialny za tx building i wysyłkę, stworzony w architekturze DirectBuilder.
+[trigger]
+enabled = true
+# Tutaj też wklej HTTPS z Chainstacka (dla spójności)
+rpc_url = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+max_position_size_sol = 0.004
+entry_mode = "live"
+
+# ===== The Bulkhead - Capital Preservation =====
+# Kapitał ratunkowy (zamrożony). Wartość dla emergency_floor_sol = ilość SOL, które będzie progiem, poniżej którego Ghost nie może zejść. Przykładowo, wielkość pozycji ustawiono na 0.1 SOL. Nasz łączny kapitał w tym momencie również wynosi 0.1 SOL. Bez Bulkheada, bot przy kolejnej okazji dokonałby zakupu tokena
+# czego skutkiem byłoby wyzerowanie poertfela i brak możliwości sprzedaży tego tokena. W 99,9% przypadków zakończyloby się to utratą wkładu. Wartość ustawiona na 0.05 nie pozwala na zakup poniżej tej kwoty, umożliwiając wyjscie z pozycji.
+emergency_floor_sol = 0.0001
+# Dodatkowy bufor określający dodatkową stawkę wliczoną do progu (na poczet zmiennej wartości fee).
+position_size_buffer_sol = 0.0001
+
+# Ścieżka do lokalizacjik klucza prywatnego (wallet)
+# PAMIETAJ ŁEMKU!: GHOST NIE RUSZY BEZ TEGO PLIKU Z PRAWIDŁOWYM FORMATEM KLUCZA W BASE58! NI UDOSTĘPNIAJ NIKOMU KLUCZA PRYWATNEGO, KOMPILUJ I URUCHAMIAJ Z LOKALKI (PC) FIREWALL EXTERNAL PROVIDERS WŁĄCZONY WSKAZANY!
+# Aby wygenerować nowy wallet wraz z plikiem najpierw zainstaluj pakiet solana-sdk, a następnie wpisz w terminalu: solana-keygen new --outfile ~/.config/solana/ghost-keypair.json
+keypair_path = "/root/Gh/solana/id.json"
+
+
+# Ustawienia maksymalnej ilości mintów (różnych coinów) jaką może jednocześnie przechowywać Ghost. Wskaza wartość startowa i bezpieczna = 3.
+# Ustaw wg preferencji stopniowo zwiększając limit, zbyt wysoki limit SKOŃCZY SIĘ TRAGEDIĄ!
+max_concurrent_positions = 1
+
+# Tryb pracy dry run, to praktyczny test działania całego systemu w środowisku produkcyjnym (mainnecie) z wyłączeniem jednej funkcji - realnej wysyłki tx. W skrócie Ghost: szuka, namierza, ocenia, pociąga za spust, ale strzela ślepakami
+# dry_run = false
+
+# Maksymalna tolerancja slippage dla transakcji buy (np. 0.15 = 15%)
+slippage_tolerance = 0.25
+
+# Live BUY preflight should tolerate brief AccountStateCore lag instead of fail-closing
+# on a 3-slot window.
+live_preflight_max_state_age_slots = 10
+
+# Exit thresholds for the live SELL monitor.
+live_exit_take_profit_pct = 0.580
+live_exit_stop_loss_pct = 0.46
+
+# Konfiguracja Leapfrog sending. Leapfrog obskakuje wielu walidatorów niemalże równolegle uzyskując dostęp do teog, który zareaguje najszybciej. Zwiększa szansę inkluzji.
+enable_leapfrog = false # Wyłączone, bo polegamy na Jito Bundles
+leapfrog_redundancy = 2  # Targets: current, +4, +8 slots (total 3 leaders)
+use_quic = false         # Use QUIC instead of UDP (false = UDP, true = QUIC)
+
+# ===== Execution SSOT =====
+# execution_mode jest jedynym źródłem prawdy runtime.
+[execution]
+execution_mode = "live" # live | paper | shadow | dual
+
+[execution.shadow]
+tx_build_compensation_ms = 250
+max_quote_age_ms = 1500
+# lifecycle_log_path jest opcjonalne; przy execution_mode=shadow launcher wyprowadza
+# shadow_lifecycle.jsonl z entry_log_path, jeśli jawna ścieżka nie została podana.
+entry_log_path = "logs/shadow_run/shadow_entries.jsonl"
+timing_model = "prepared_entry_mirror"
+stale_policy = "emit_warning"
+
+[trigger.shadow_run]
+# Launcher-owned shadow dispatch/simulation adapter. Required for shadow_only /
+# live_and_shadow entry modes even though canonical proof artifacts live under
+# [execution.shadow].*
+enabled = true
+shadow_rpc_url = "https://shadow-rpc.example.invalid/mainnet"
+commitment = "processed"
+sig_verify = false
+replace_recent_blockhash = true
+timeout_ms = 1600
+max_retries = 1
+max_concurrent = 8
+output_path = "logs/shadow_run/buys.jsonl"
+emit_event_bus = true
+
+[execution.paper]
+fill_delay_ms_min = 200
+fill_delay_ms_max = 400
+jitter_ms = 50
+max_quote_age_ms = 1500
+slippage_model = "off"
+slippage_bps_fixed = 0
+fail_prob = 0.0
+stress_injection = "off"
+max_open_positions_paper = 10
+candidate_sampling = 1.0
+rng_seed = 0
+
+[execution.quotes]
+max_quote_age_ms = 1500
+ring_buffer_size = 256
+generation_interval_ms = 500
+stale_warning_threshold_ms = 1000
+
+[execution.events]
+output_dir = "datasets/events"
+rotation_interval_ms = 300000
+flush_interval_ms = 1000
+max_file_size_bytes = 50000000
+enable_aem_ticks = true
+enable_optional_events = false
+
+# Statyczny adres Lookup Table (LUT). Używa wcześniej przygotowanych tablic z wzorcami struktur pools i mintów, jedynie "wypełniając" ją brakującymi, unikalnymi wartościami dla nowotworzonego tokena.
+# Ustawienie to pozwala na znaczącą redukcję rozmiaru tx z ~500 do ~250 bitów.
+# Aby utworzyć LUT użyj komendy: cargo run --example init_static_lut -- --network devnet
+# static_lut_address = "AdresKtoryWygenerujesz"
+
+# ===== Tip guard =====
+[trigger.tip_guard]
+# Absolute maximum tip in SOL - hard cap
+max_tip_absolute_sol = 0.002
+# Fallback tip when the upstream tip source is unavailable
+fallback_tip_sol = 0.002
+
+# Domyślny adres dla interfejsu użytkownika (GUI):
+[gui_backend]
+enabled = true
+bind_address = "127.0.0.1"
+# Ta kopia repo używa osobnego portu, aby mogła działać równolegle z drugą instancją.
+port = 8801
+
+# Konfiguracja logów:
+[logging]
+level = "info"
+
+# Console logging (stdout/stderr) - pokazuje wszystkie logi
+console_enabled = true
+json_format = false
+
+# System logs - network errors, startup/shutdown, component lifecycle
+file_enabled = true
+file_path = "logs/system.log"
+
+# Oracle decision logs - ONLY ghost_brain::oracle targets
+oracle_log_enabled = true
+oracle_log_path = "logs/oracle_decision.log"
+oracle_json_format = false  # Set to true for JSON structured logs
+
+# Definiowanie parametrów zapisu danych z trybu dry run.
+[dataset_recorder]
+enabled = true               # Włączony moduł Dataset Recorder
+output_directory = "datasets/decisions"  # Zmienione na standardową ścieżkę Ghosta
+file_prefix = "dry_run_"     # Prefiks nazw plików (np. dry_run_myfile.json)
+rotation_interval = 60000    # (opcjonalne) Rotacja: co ile milisekund tworzyć nowy plik (np. 1 minuta)
+
+[oracle]
+# Production canonical ingest is derived from [account_state_core].enable.
+# The degraded/test relay compatibility flag is intentionally omitted from the
+# shipped config to avoid treating it as a normal architecture switch.
+
+# 12 TX wystarczy. IWIM zrobi robotę w międzyczasie.
+min_txs_for_analysis = 25
+min_time_window_ms = 1    
+analysis_window_ms = 1      
+
+[account_state_core]
+enable = true
+
+[session]
+max_sessions = 10000
+checkpoint_interval_ms = 20
+max_observation_window_ms = 8000
+
+[tx_intelligence]
+dust_threshold_sol = 0.001
+burst_window_ms = 400
+
+[oracle.sampling_loop]
+sampling_duration_ms = 1
+initial_cycle_delay_ms = 0
+fast_cycle_interval_ms = 1
+# PRÓG WRACA DO NORMY (Override by Gunshot Thresholds)
+sniper_threshold = 95
+min_tx_count_for_scoring = 10
+max_cycles = 6
+max_observation_cycles = 6
+
+[shadow_ledger]
+# SSOT freshness SLA dla launcherowego enrichmentu z ShadowLedger.
+enrichment_freshness_ms = 200
+# stale curve fallback: pending_curve | use_stale_with_warning | reject
+stale_fallback = "pending_curve"
+
+[oracle.reconciliation]
+# Alert threshold dla driftu ShadowLedgera; powyżej emitujemy WARN + counter.
+drift_alert_threshold_lamports = 50000000
+
+# Konfiguracja Guardiana (Bezpieczeństwo i integralność)
+[guardian]
+max_void_duration_ms = 1   # Jeśli Helius/Chainstack milczy przez 2s -> Abort (Hard Truth)
+max_integrity_violations = 5  # 5 błędów Jittera z rzędu -> Abort
+enable_parallel_tasks = true  # Pozwalamy na asynchroniczne sprawdzanie
+min_qass_score = 0.928          # Poniżej tego Guardian nawet nie pyta Oracle o zdanie
+
+# ===== EPIC 3/4: Gatekeeper & LivePipeline Configuration (E Requirement) =====
+[gatekeeper]
+# Observation window before commit (milliseconds)
+observation_window_ms = 1
+# Minimum TX count to trigger commit
+min_tx_to_pass = 5
+# Maximum buffer age before cleanup (milliseconds)
+drop_age_ms = 10000
+# K invariant tolerance (percent drift allowed due to fees)
+# LEGACY/NO-OP: obecnie nieużywane przez runtime (zachowane dla kompatybilności configów)
+k_tolerance_pct = 1.0
+# Commit loop check interval (milliseconds)
+check_interval_ms = 11
+# Maximum TX per mint buffer (to prevent memory exhaustion)
+# LEGACY/NO-OP: obecnie nieegzekwowane przez runtime
+max_tx_per_mint = 10000
+# Maximum total buffers tracked (to prevent memory exhaustion)
+# LEGACY/NO-OP: obecnie nieegzekwowane przez runtime
+max_total_buffers = 10000
+# Backoff configuration for commit failures
+# LEGACY/NO-OP: retry/backoff nie jest zaimplementowany (zachowane dla kompatybilności configów)
+commit_failure_backoff_base_ms = 1
+commit_failure_backoff_max_ms = 1
+commit_failure_max_retries = 3
+
+[live_pipeline]
+# Flush interval for buffered events (milliseconds)
+flush_interval_ms = 50
+# Flush delay for out-of-order buffering (milliseconds)
+flush_delay_ms = 50
+# Maximum buffered TX per mint
+max_buffer_size = 10000
+# Maximum tracked mints (to prevent memory exhaustion)
+# LEGACY/NO-OP: obecnie nieegzekwowane przez runtime
+max_tracked_mints = 10000
+# Seen keys limit for deduplication
+seen_keys_limit = 10000
+# Backoff configuration for flush failures
+# LEGACY/NO-OP: flush_ready() nie ma ścieżki błędu (zachowane dla kompatybilności configów)
+flush_failure_backoff_base_ms = 11
+flush_failure_backoff_max_ms = 1
+flush_failure_max_retries = 5
+
+# ============================================================
+# Z1.1 / Z1.2: WAL + ShadowLedger trwałość (durability)
+# ============================================================
+# Odkomentuj i ustaw ścieżki aby aktywować WAL (Z1.1) i/lub
+# snapshotowanie dyskowe ShadowLedgera (Z1.2).
+# Zmienne środowiskowe GHOST_WAL_DIR i GHOST_SNAPSHOT_DIR
+# mają pierwszeństwo gdy są ustawione.
+[durability]
+# Katalog dla WAL (Write-Ahead Log). Odkomentuj aby aktywować Z1.1.
+wal_dir = "data/wal"
+
+# Katalog dla cyklicznych snapshotów ShadowLedgera.
+snapshot_dir = "data/snapshots"
+
+# Interwał snapshotowania w sekundach (minimum 1, domyślnie 60).
+snapshot_interval_s = 600
+
+# Czas trwania segmentu WAL w milisekundach (domyślnie 300000 = 5 min).
+wal_segment_ms = 3000000
+
+# Retencja WAL w milisekundach (domyślnie 86400000 = 24h).
+wal_retention_ms = 86400000

@@ -1,0 +1,59 @@
+{
+  "case_id": "n500_baseline_none",
+  "n": 500,
+  "seed": 128068,
+  "profile": "baseline",
+  "scenario": "none",
+  "timing_threshold_pct": 10.0,
+  "terminal_delta_pct": 5.0,
+  "terminal_delta_abs_min": 2,
+  "live_events_path": "ghost-brain/artifacts/replay_equivalence/v2_baseline/n500_baseline_none/live/events.jsonl",
+  "dual_events_path": "ghost-brain/artifacts/replay_equivalence/v2_baseline/n500_baseline_none/dual/events.jsonl",
+  "live_report_path": "ghost-brain/artifacts/replay_equivalence/v2_baseline/n500_baseline_none/live/live_only_report.json",
+  "dual_live_report_path": "ghost-brain/artifacts/replay_equivalence/v2_baseline/n500_baseline_none/dual/dual_live_lane_report.json",
+  "case_verdict_path": "ghost-brain/artifacts/replay_equivalence/v2_baseline/n500_baseline_none/replay_equivalence_verdict.txt",
+  "submitted_match_pass": true,
+  "lifecycle_accounting_pass": true,
+  "exactly_once_pass": true,
+  "gaps_pass": true,
+  "timing_pass": true,
+  "terminal_distribution_pass": true,
+  "unknown_policy_pass": true,
+  "inflight_zero_pass": true,
+  "terminal_deltas": [
+    {
+      "class": "filled",
+      "live_only": 400,
+      "dual_live": 400,
+      "delta_abs": 0,
+      "max_allowed": 25,
+      "pass": true
+    },
+    {
+      "class": "failed",
+      "live_only": 100,
+      "dual_live": 100,
+      "delta_abs": 0,
+      "max_allowed": 25,
+      "pass": true
+    },
+    {
+      "class": "timeout",
+      "live_only": 0,
+      "dual_live": 0,
+      "delta_abs": 0,
+      "max_allowed": 25,
+      "pass": true
+    },
+    {
+      "class": "unknown",
+      "live_only": 0,
+      "dual_live": 0,
+      "delta_abs": 0,
+      "max_allowed": 25,
+      "pass": true
+    }
+  ],
+  "verdict": "PASS",
+  "failed_checks": []
+}

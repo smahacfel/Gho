@@ -1,0 +1,25 @@
+[workspace]
+members = [
+	"ghost-core",
+	"off-chain/components/seer",
+	"off-chain/components/trigger",
+	"off-chain/collector",
+	"ghost-brain",
+	"gui-backend",
+	"ghost-launcher"
+]
+resolver = "2"
+
+[profile.release]
+overflow-checks = true
+lto = "fat"
+codegen-units = 1
+
+[profile.test]
+debug = 0
+strip = true
+
+[profile.release.build-override]
+opt-level = 3
+incremental = false
+codegen-units = 1

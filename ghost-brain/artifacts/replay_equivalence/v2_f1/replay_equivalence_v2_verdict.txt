@@ -1,0 +1,5 @@
+Replay Equivalence Proof v2
+Verdict: PASS
+Cases: 2
+- n500_baseline_f1_channel_closed => PASS ([])
+- n500_baseline_f1_channel_full => PASS ([])

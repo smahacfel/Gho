@@ -1,0 +1,88 @@
+[package]
+name = "seer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+# Note: Using v0.20 with rustls-tls-native-roots for proper mainnet TLS handling.
+# Version 0.21 had issues with TLS certificate verification on mainnet WebSocket connections.
+tokio-tungstenite = { version = "0.20", features = ["rustls-tls-native-roots"] }
+futures-util = "0.3"
+async-stream = "0.3"
+
+# Solana SDK
+solana-sdk = "1.18"
+solana-client = "1.18"
+solana-rpc-client = "1.18"
+solana-geyser-plugin-interface = "1.18"
+solana-transaction-status = "1.18"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"
+reqwest = "0.11"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Metrics
+prometheus = "0.13"
+metrics = "0.21"
+
+# Utilities
+base64 = "0.21"
+bytemuck = "1.14"
+bs58 = "0.5"
+parking_lot = "0.12"
+humantime = "2.1"
+arc-swap = "1.7"
+dashmap = "5.5"
+once_cell = "1.19"
+lru = "0.12"
+rand = "0.8"
+tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
+backoff = { version = "0.4", features = ["tokio"] }
+crossbeam-channel = "0.5"
+borsh = "0.10"
+smallvec = "1.11"
+futures = "0.3"
+
+# FFT for Phase Lock Detection
+rustfft = "6.1"
+
+# gRPC and Yellowstone
+yellowstone-grpc-client = "1.14"
+yellowstone-grpc-proto = "1.14"
+tonic = { version = "0.10", features = ["tls", "tls-roots"] }
+prost = "0.12"
+
+# Internal dependencies
+ghost-core = { path = "../../../ghost-core" }
+
+[dev-dependencies]
+trigger = { path = "../trigger" }
+tempfile = "3.8"
+
+[lib]
+name = "seer"
+path = "src/lib.rs"
+
+[[bin]]
+name = "seer"
+path = "src/main.rs"
+
+[[example]]
+name = "seer_trigger_integration"
+path = "examples/seer_trigger_integration.rs"
+
+[[example]]
+name = "paradox_sensor_demo"
+path = "examples/paradox_sensor_demo.rs"

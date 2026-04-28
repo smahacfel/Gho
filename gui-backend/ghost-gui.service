@@ -1,0 +1,23 @@
+[Unit]
+Description=Ghost GUI Control Panel
+After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/Ghost
+ExecStart=/root/Ghost/target/release/ghost-gui
+Environment=GUI_BACKEND_PORT=8800
+Environment=GUI_BACKEND_BIND_ADDRESS=0.0.0.0
+Environment=RUST_LOG=info
+Restart=always
+RestartSec=3
+# Nie ubijaj procesów potomnych (tmux, ghost-launcher) kiedy serwis
+# jest restartowany lub zatrzymywany — to kluczowe dla przeżycia
+# sesji tmux przy rozłączeniu SSH.
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

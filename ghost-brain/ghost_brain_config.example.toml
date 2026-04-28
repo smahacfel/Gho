@@ -1,0 +1,334 @@
+# Ghost Brain Unified Configuration
+#
+# Ten plik zawiera wszystkie parametry konfigurowalne dla komponentów systemu Ghost Brain.
+# Dostosuj te wartości, aby precyzyjnie dostroić zachowanie systemu do różnych warunków rynkowych.
+
+version = 1
+
+# MPCF (Micro-Payload Cognitive Fingerprint) Configuration
+# Steruje aktorsko-behawioralnym fingerprintingiem bajtowym dla klasyfikacji transakcji
+[mpcf]
+# Próg entropii dla wykrywania botów (niska entropia = regularne wzorce)
+bot_entropy_threshold = 3.5
+# Próg entropii dla wykrywania ludzi (wysoka entropia = chaos)
+human_entropy_threshold = 5.5
+# Próg wariancji odstępów instrukcji dla wykrywania botów
+bot_iss_variance_threshold = 0.15
+# Próg wariancji odstępów instrukcji dla wykrywania ludzi
+human_iss_variance_threshold = 0.35
+# Próg entropii dla wykrywania sieci sybil
+sybil_entropy_threshold = 3.5
+# Minimalny rozmiar payloadu w bajtach dla wiarygodnej analizy
+min_payload_size = 32
+# Maksymalny rozmiar payloadu w bajtach do analizy (ochrona przed DoS)
+max_payload_size = 4096
+# Pewność klasyfikacji nieznanej/niejednoznacznej
+unknown_confidence = 0.3
+# Bazowa pewność, gdy payload jest zbyt mały
+low_confidence_small_payload = 0.4
+
+# SSMI (Sub-Slot Microentropy Index) Configuration
+# Steruje analizą jittera w pod-slotach dla klasyfikacji transakcji
+[ssmi]
+# Próg SCR dla wykrywania botów (powyżej oznacza bota)
+bot_scr_threshold = 0.7
+# Próg korelacji AR dla wykrywania botów (wysoki = przewidywalny)
+bot_ar_threshold = 0.8
+# Próg entropii dla wykrywania botów (niska entropia = regularne wzorce)
+bot_entropy_threshold = 1.5
+# Próg entropii dla wykrywania ludzi (wysoka entropia = chaos)
+human_entropy_threshold = 3.0
+# Próg korelacji AR dla wykrywania ludzi (niski = nieprzewidywalny)
+human_ar_threshold = 0.3
+# Próg SCR dla wykrywania ludzi (niski SCR = organiczne)
+human_scr_threshold = 0.4
+# Minimalna liczba transakcji dla wykrycia wiralowego startu
+viral_min_tx_count = 6
+# Minimalna entropia dla wiralowego startu
+viral_entropy_min = 2.5
+# Maksymalna entropia dla wiralowego startu
+viral_entropy_max = 4.0
+# Próg SCR dla wiralowego startu
+viral_scr_threshold = 0.5
+# Waga komponentu entropii w łącznym wyniku
+score_weight_entropy = 0.35
+# Waga komponentu SCR w łącznym wyniku
+score_weight_scr = 0.40
+# Waga komponentu korelacji AR w łącznym wyniku
+score_weight_ar = 0.25
+# Bonus dla źródła o charakterze wiralowym
+viral_score_bonus = 0.15
+# Bonus dla źródła ludzkiego
+human_score_bonus = 0.05
+# Kara dla źródła botowego
+bot_score_penalty = 0.20
+# Liczba binów histogramu dla obliczania entropii
+histogram_bins = 64
+# Maksymalny jitter w milisekundach dla normalizacji histogramu
+max_jitter_ms = 2000
+
+# IWIM (Initial Wallet Intent Mapping) Configuration
+# Steruje analizą zachowania portfela dewelopera dla wykrywania intencji twórcy
+[iwim]
+# Próg IAPP: liczba kont tokenów utworzonych w 1 s powodująca flagę rug
+# ≥2 konta tokenów → 97% prawdopodobieństwa rug
+iapp_rug_threshold = 2
+# Minimalny wynik zagrożenia rug przy spełnieniu progu IAPP
+min_iapp_rug_score = 0.95
+# Okno czasowe zmiany autorytetu w milisekundach
+at_window_ms = 1500
+# Okno cichej aktywności przed mintem w milisekundach
+quiet_window_ms = 5000
+# Maksymalna liczba transakcji do analizy (ochrona przed DoS)
+max_tx_analyze = 50
+# Próg pewności dla wiarygodnej klasyfikacji
+confidence_threshold = 0.6
+# Docelowy czas analizy w mikrosekundach
+target_analysis_time_us = 120
+
+# QASS (Quantum Amplitude Superposition Scoring) Configuration
+# Steruje parametrami agregacji sygnałów inspirowanej mechaniką kwantową
+[qass]
+# Domyślny próg kolapsu funkcji falowej
+collapse_threshold = 0.5
+# Próg wyniku dla klasyfikacji wiralowego startu
+score_threshold_viral = 0.85
+# Próg wyniku dla umiarkowanego trendu wzrostowego
+score_threshold_moderate = 0.70
+# Próg wyniku dla stanu neutralnego
+score_threshold_neutral = 0.50
+# Próg wyniku dla stanu podejrzanego
+score_threshold_suspicious = 0.30
+# Domyślna waga sygnałów (gdy nie określono inaczej)
+default_signal_weight = 1.0
+
+# SOBP (Slot-Over-Slot Buying Pressure) Configuration
+# Steruje analizą presji zakupowej do wykrywania początku pumpa
+[sobp]
+# Mnożnik wagi dla aktorów ludzkich (HumanMobile, HumanDesktop)
+human_weight_multiplier = 2.0
+# Mnożnik wagi dla botów-sniperów
+sniper_weight_multiplier = 0.5
+# Domyślny mnożnik wagi dla innych aktorów
+default_weight_multiplier = 1.0
+# Bazowa waga transakcji
+base_transaction_weight = 1.0
+# Próg SOBP dla hiper-agresywnego napływu zakupowego (wczesny pump)
+hyper_pump_threshold = 3.0
+# Próg SOBP dla stabilnego organicznego wzrostu (byczy)
+growth_threshold = 1.5
+# Próg SOBP dla stagnacji/braku kierunku
+stagnation_threshold = 0.8
+# Próg SOBP dla implozji popytu (panika/dump)
+implosion_threshold = 0.4
+# Waga komponentu historii w obliczeniach pewności
+confidence_weight_history = 0.4
+# Waga komponentu liczby transakcji w obliczeniach pewności
+confidence_weight_tx_count = 0.3
+# Waga komponentu intensywności w obliczeniach pewności
+confidence_weight_intensity = 0.3
+# Domyślna pojemność bufora historii slotów
+slot_capacity = 64
+# Minimalna historia slotów wymagana do wiarygodnej kalkulacji SOBP
+min_slot_history = 2
+
+# QOFSV (Quantum Order-Flow State Vector) Configuration
+# Steruje parametrami mapowania kwantowego wektora stanu order flow
+[qofsv]
+# Liczba cech w wektorze stanu
+state_vector_dim = 6
+# Małe epsilon dla stabilności numerycznej
+epsilon = 0.000001
+# Docelowy czas konstrukcji stanu w mikrosekundach
+target_construction_time_us = 200
+# Docelowy czas normalizacji w mikrosekundach
+target_normalization_time_us = 50
+
+# FRB (Frequency Resonance Bands) Configuration
+# Steruje parametrami analizy sygnałów częstotliwościowych
+[frb]
+# Minimalny próg amplitudy dla wykrywania sygnałów
+min_amplitude_threshold = 0.001
+# Włączenie zaawansowanego filtrowania częstotliwości
+enable_filtering = true
+
+# Resonance Detection Configuration
+# Steruje wykrywaniem botów przez analizę współczynnika zmienności
+[resonance]
+# Próg współczynnika zmienności dla wykrywania botów
+# Niski CV = regularne wzorce czasowe botów
+bot_threshold_cv = 0.3
+# Próg współczynnika zmienności dla wykrywania ludzi
+# Wysoki CV = nieregularne ludzkie wzorce czasowe
+human_threshold_cv = 0.8
+
+# ==============================================================================
+# 🎯 NORMALIZATION (Operation Scale Master)
+# ==============================================================================
+
+# Normalization Configuration
+# Controls data normalization for activation functions (Sigmoid/Tanh)
+# Prevents "flattened graphs" by adjusting scale to match actual market values
+[normalization]
+# Liquidity normalization scale (SOL)
+# Lower values = higher sensitivity for small pools
+# Default: 25000.0 (suitable for mid-size pools)
+liquidity_scale = 25000.0
+
+# Volume normalization scale (SOL)
+# Controls the midpoint for volume sigmoid/tanh functions
+# Default: 10000.0
+volume_scale = 10000.0
+
+# Volatility factor for tanh normalization
+# Higher values = more aggressive volatility response
+# Default: 5.0
+volatility_factor = 5.0
+
+# MCI (Market Coherence Index) Configuration
+# Controls directional and structural coherence analysis
+[mci]
+# Configuration version for API compatibility
+version = 1
+# Weight for Directional Coherence component
+weight_dc = 0.6
+# Weight for Structural Coherence component
+weight_sc = 0.4
+# Coherence abort threshold - if coherence drops below this, trading is vetoed
+coherence_abort_threshold = 0.3
+
+# QEDD (Quantum Entropy-Driven Decay) Configuration
+# Controls survival probability analysis across time horizons
+[qedd]
+# Configuration version for API compatibility
+version = 1
+# Base lambda parameter for decay rate calculation
+lambda_base = 0.5
+# Abort threshold - if lambda exceeds this, trading is vetoed
+lambda_abort_threshold = 0.95
+# Coefficient α for SOBP drop contribution to hazard rate
+alpha_sobp_drop = 0.3
+# Coefficient β for outflow contribution to hazard rate
+beta_outflow = 0.25
+# Coefficient γ for resonance risk contribution to hazard rate
+gamma_resonance = 0.15
+# Coefficient δ for deviation risk contribution to hazard rate
+delta_deviation = 0.20
+# Time horizon: 1 second (in milliseconds)
+horizon_1s = 1000
+# Time horizon: 5 seconds (in milliseconds)
+horizon_5s = 5000
+# Time horizon: 30 seconds (in milliseconds)
+horizon_30s = 30000
+# Time horizon: 60 seconds (in milliseconds)
+horizon_60s = 60000
+
+# Confidence Model Configuration
+# Controls confidence calculation weights and decision thresholds
+[confidence]
+# Module weights - determine relative importance of each module's contribution
+weight_sobp = 12.0
+weight_mpcf = 10.0
+weight_iwim = 8.0
+weight_ssmi = 9.0
+weight_qass = 15.0
+weight_qofsv = 11.0
+weight_scr = 13.0
+weight_frb = 7.0
+weight_qman = 14.0
+weight_gene_mapper = 10.0
+weight_chaos_engine = 11.0
+# Decision thresholds - control how confidence scores map to decisions
+threshold_high_confidence = 0.8
+threshold_medium_confidence = 0.5
+threshold_low_confidence = 0.3
+
+# ==============================================================================
+# 🎯 SECTION 9: SURVIVOR SCORE CONFIGURATION
+# ==============================================================================
+# Konfiguracja komponentów SurvivorScore i ich wag.
+# Formuła: S = (survival)^Ws × (momentum)^Wm × (quality)^Wq × (1 - risk_discount)
+
+[survivor_score]
+# Wagi wykładnicze (NIE wagi liniowe - to potęgi w formule)
+weight_survival = 0.35   # Ws (wykładnik, nie waga liniowa)
+weight_momentum = 0.30   # Wm (wykładnik)
+weight_quality = 0.20    # Wq (wykładnik)
+
+# Wagi komponentu survival dla cykli scoringowych (bez IWIM)
+# Podczas cykli S1-S13, IWIM NIE jest uwzględniany. Wagi: QEDD (62.5%) + Cluster (37.5%)
+[survivor_score.survival_cycle]
+qedd = 0.625
+cluster = 0.375
+
+# Wagi komponentu survival dla Final Verdict (z IWIM)
+# W Final Verdict, IWIM jest uwzględniany: QEDD (50%) + IWIM (30%) + Cluster (20%)
+[survivor_score.survival_final_verdict]
+qedd = 0.5
+iwim = 0.3
+cluster = 0.2
+
+# Wagi komponentu quality dla Early Stage (S1-S6, bez SCR)
+# SCR jest wyłączony, ponieważ FFT wymaga ~20+ próbek dla istotności statystycznej
+[survivor_score.quality_early_stage]
+mpcf = 0.44
+mesa = 0.31
+wallet = 0.25
+
+# Wagi komponentu quality dla Full Analysis (S7-S12, z SCR)
+# Wszystkie metryki aktywne, w tym SCR dla wykrywania botów
+[survivor_score.quality_full_analysis]
+mpcf = 0.35
+mesa = 0.25
+scr = 0.20
+wallet = 0.20
+
+# Konfiguracja komponentu momentum
+# Kontroluje wkład SOBP i Chaos Engine do momentum
+[survivor_score.momentum]
+sobp_base = 1.0
+sobp_multiplier = 0.5
+chaos_base = 0.7
+chaos_multiplier = 0.6
+
+# ==============================================================================
+# 🎯 SECTION 10: CYCLE WEIGHTS & GUNSHOT THRESHOLDS
+# ==============================================================================
+# Kontroluje timing pętli scoringowej i natychmiastowe triggery zakupu
+
+[cycle_weights]
+# Wykładnicze wagi dla ważonej średniej geometrycznej
+# Późniejsze cykle mają wykładniczo wyższy wpływ na ostateczną decyzję
+# Rozkład wag: progresja geometryczna z mnożnikiem ~1.3
+# - S1-S6 (Early Stage): Niższe wagi
+# - S7-S12 (Full Analysis): Wyższe wagi
+s1 = 1.3
+s2 = 1.7
+s3 = 2.2
+s4 = 2.8
+s5 = 3.6
+s6 = 4.6
+s7 = 6.0
+s8 = 7.8
+s9 = 10.0
+s10 = 13.0
+s11 = 17.0
+s12 = 22.0
+
+[gunshot_thresholds]
+# Triggery natychmiastowego zakupu (malejące progi)
+# Jeśli surowy wynik spełnia/przekracza próg, kup natychmiast bez czekania na S13
+# Early Stage (S1-S6): Wyższe progi z powodu ograniczonej pewności danych
+# Full Analysis (S7-S12): Niższe progi w miarę wzrostu pewności
+s1 = 100.0  # God Candle - wymaga perfekcji
+s2 = 99.0
+s3 = 98.0
+s4 = 97.0
+s5 = 96.0
+s6 = 95.0
+s7 = 88.0   # Przejście do Full Analysis
+s8 = 87.0
+s9 = 86.0
+s10 = 85.0  # Silne potwierdzenie trendu
+s11 = 83.5
+s12 = 82.0  # Final Stand

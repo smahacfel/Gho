@@ -1,0 +1,89 @@
+{
+  "run_id": "n500_baseline_f2_recovery_sweep_live_only",
+  "mode": "live_only",
+  "lane": "live",
+  "n": 500,
+  "seed": 128148,
+  "profile": "baseline",
+  "scenario": "f2_recovery_sweep",
+  "submitted": 500,
+  "filled": 372,
+  "failed": 93,
+  "timeout": 0,
+  "unknown": 35,
+  "terminal_total": 500,
+  "in_flight": 0,
+  "opened": 372,
+  "closed": 372,
+  "terminal_entry_fail": 128,
+  "duplicates_fill": 0,
+  "duplicates_opened": 0,
+  "duplicates_closed": 0,
+  "missing_terminal_orders": [],
+  "multiple_terminal_orders": [],
+  "candidate_without_opened_or_failed": [],
+  "recovery_unknown_orders": [
+    "order-live-5",
+    "order-live-11",
+    "order-live-16",
+    "order-live-47",
+    "order-live-57",
+    "order-live-79",
+    "order-live-91",
+    "order-live-100",
+    "order-live-120",
+    "order-live-128",
+    "order-live-137",
+    "order-live-149",
+    "order-live-162",
+    "order-live-167",
+    "order-live-182",
+    "order-live-187",
+    "order-live-195",
+    "order-live-216",
+    "order-live-242",
+    "order-live-291",
+    "order-live-298",
+    "order-live-311",
+    "order-live-316",
+    "order-live-340",
+    "order-live-350",
+    "order-live-388",
+    "order-live-399",
+    "order-live-400",
+    "order-live-403",
+    "order-live-404",
+    "order-live-463",
+    "order-live-465",
+    "order-live-484",
+    "order-live-489",
+    "order-live-495"
+  ],
+  "unknown_non_recovery_orders": [],
+  "p50_time_to_fill_ms": 296.0,
+  "p90_time_to_fill_ms": 383.0,
+  "timing_histogram": [
+    {
+      "bucket": "0-199",
+      "count": 0
+    },
+    {
+      "bucket": "200-299",
+      "count": 190
+    },
+    {
+      "bucket": "300-399",
+      "count": 179
+    },
+    {
+      "bucket": "400-599",
+      "count": 3
+    },
+    {
+      "bucket": "600+",
+      "count": 0
+    }
+  ],
+  "verdict": "PASS",
+  "failed_checks": []
+}
