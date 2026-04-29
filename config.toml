@@ -22,7 +22,7 @@ stream_mode = "single_global"
 tx_filter_strategy = "per_pool"
 # Tracked default template stays neutral/fail-closed.
 # Authoritative FSC bake lives only in explicit rollout profiles.
-funding_lane_mode = "disabled"
+funding_lane_mode = "full_chain"
 watched_pools_ttl_ms = 120000
 watched_pools_cap = 32768
 watch_debounce_ms = 0
@@ -80,7 +80,7 @@ enabled = true
 # Tutaj też wklej HTTPS z Chainstacka (dla spójności)
 rpc_url = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
 max_position_size_sol = 0.004
-entry_mode = "live"
+entry_mode = "shadow_only"
 
 # ===== The Bulkhead - Capital Preservation =====
 # Kapitał ratunkowy (zamrożony). Wartość dla emergency_floor_sol = ilość SOL, które będzie progiem, poniżej którego Ghost nie może zejść. Przykładowo, wielkość pozycji ustawiono na 0.1 SOL. Nasz łączny kapitał w tym momencie również wynosi 0.1 SOL. Bez Bulkheada, bot przy kolejnej okazji dokonałby zakupu tokena
@@ -121,7 +121,7 @@ use_quic = false         # Use QUIC instead of UDP (false = UDP, true = QUIC)
 # ===== Execution SSOT =====
 # execution_mode jest jedynym źródłem prawdy runtime.
 [execution]
-execution_mode = "live" # live | paper | shadow | dual
+execution_mode = "shadow" # live | paper | shadow | dual
 
 [execution.shadow]
 tx_build_compensation_ms = 250
@@ -137,7 +137,7 @@ stale_policy = "emit_warning"
 # live_and_shadow entry modes even though canonical proof artifacts live under
 # [execution.shadow].*
 enabled = true
-shadow_rpc_url = "https://shadow-rpc.example.invalid/mainnet"
+shadow_rpc_url = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
 commitment = "processed"
 sig_verify = false
 replace_recent_blockhash = true
