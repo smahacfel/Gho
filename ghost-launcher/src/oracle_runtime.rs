@@ -5831,7 +5831,7 @@ async fn execute_gatekeeper_buy_path(
             .and_then(|pd| Pubkey::try_from(pd.quote_mint.as_str()).ok());
 
         if let (Some(base_mint), Some(quote_mint)) = (base_mint_opt, quote_mint_opt) {
-            let mut px = ctx
+            let px = ctx
                 .oracle_runtime
                 .resolve_price_context(pool_amm_id, base_mint);
             if let Some(current_pool_data) = pool_data.clone() {
@@ -8844,6 +8844,7 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
     let decision_logger = Arc::new(ghost_brain::oracle::DecisionLogger::new_with_health(
         ghost_brain::oracle::DecisionLoggerConfig {
             log_dir: std::path::PathBuf::from(decision_log_path.clone()),
+            gatekeeper_log_dir: std::path::PathBuf::from("logs/decisions.json/rollout/shadow-burnin/decisions"),
             channel_buffer_size: 1000,
             enabled: true,
         },

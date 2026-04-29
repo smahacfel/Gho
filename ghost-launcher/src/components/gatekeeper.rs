@@ -1465,6 +1465,7 @@ impl GatekeeperAssessment {
             max_total_volume_sol: config.max_total_volume_sol,
             sol_buy_ratio: self.phase4_volume.as_ref().map(|p| p.sol_buy_ratio),
             min_sol_buy_ratio: config.min_sol_buy_ratio,
+            max_sol_buy_ratio: config.max_sol_buy_ratio,
             max_consecutive_buys_observed: self
                 .phase4_volume
                 .as_ref()
@@ -1489,6 +1490,7 @@ impl GatekeeperAssessment {
             // Phase 6: Bonding Curve Dynamics
             phase6_passed: self.phase6_passed,
             price_change_ratio: self.phase6_curve.as_ref().map(|p| p.price_change_ratio),
+            min_price_change_ratio: config.min_price_change_ratio,
             max_price_change_ratio: config.max_price_change_ratio,
             max_single_tx_price_impact_pct_observed: self
                 .phase6_curve
@@ -1499,6 +1501,7 @@ impl GatekeeperAssessment {
                 .phase6_curve
                 .as_ref()
                 .map(|p| p.max_single_sell_impact_pct),
+            min_single_sell_impact_pct: config.min_single_sell_impact_pct,
             max_single_sell_impact_pct: config.max_single_sell_impact_pct,
             bonding_progress_pct: self.phase6_curve.as_ref().and_then(|p| {
                 if p.curve_data_known {
