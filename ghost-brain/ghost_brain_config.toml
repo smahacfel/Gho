@@ -63,6 +63,7 @@ max_same_ms_tx_ratio = 1.0
 min_buy_ratio = 0.80
 max_buy_ratio = 1.0
 min_sol_buy_ratio = 0.0
+max_sol_buy_ratio = 1.0
 min_avg_tx_sol = 0.01
 max_avg_tx_sol = 9999.0
 min_volume_cv = 0.01
@@ -86,8 +87,10 @@ reject_on_dev_sell = false
 # SURVIVAL FILTER: Market cap & bonding progress correlate with survival
 # Survivors: 54.9 SOL | Early-death: 43.2 SOL (+27.1% difference)
 # Survivors: 47% bonding | Early-death: 41% bonding (+12.6% difference)
+min_price_change_ratio = 0.0
 max_price_change_ratio = 9999.0
 max_single_tx_price_impact_pct = 9999.0
+min_single_sell_impact_pct = 0.0
 max_single_sell_impact_pct = 9999.0
 max_bonding_progress_pct = 99.0
 min_bonding_progress_pct = 40.0

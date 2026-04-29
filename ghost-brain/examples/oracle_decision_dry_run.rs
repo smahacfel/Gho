@@ -34,6 +34,7 @@ async fn main() {
     // Create decision logger
     let logger_config = DecisionLoggerConfig {
         log_dir: "datasets/decisions".into(),
+        gatekeeper_log_dir: "logs/decisions.json/rollout/shadow-burnin/decisions".into(),
         channel_buffer_size: 1000,
         enabled: true,
     };

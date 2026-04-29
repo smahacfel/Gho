@@ -979,6 +979,13 @@ pub struct GatekeeperV2Config {
     /// Default: 0.50
     pub min_sol_buy_ratio: f64,
 
+    /// Maximum ratio of buy volume (SOL) to total volume (SOL).
+    /// Caps buy dominance to prevent pure green-wall pools where
+    /// 100 % of the volume is buys (often wash-trading or self-fill).
+    /// sol_buy_ratio = sum(buy_volume) / sum(total_volume)
+    /// Default: 1.0 (neutral / no upper bound)
+    pub max_sol_buy_ratio: f64,
+
     /// Minimum longest consecutive buy streak (FOMO indicator).
     /// A high streak means sustained buying pressure without any sells.
     /// Default: 0
@@ -1020,6 +1027,11 @@ pub struct GatekeeperV2Config {
     // ═══════════════════════════════════════════
     // Phase 6: Bonding Curve Dynamics
     // ═══════════════════════════════════════════
+    /// Minimum price change ratio in window.
+    /// Filters pools with zero or negative price movement (dead momentum).
+    /// Default: 0.0 (neutral / no lower bound)
+    pub min_price_change_ratio: f64,
+
     /// Maximum price change ratio in window.
     /// Default: 4.0
     pub max_price_change_ratio: f64,
@@ -1027,6 +1039,12 @@ pub struct GatekeeperV2Config {
     /// Maximum single-TX price impact (%).
     /// Default: 25.0
     pub max_single_tx_price_impact_pct: f64,
+
+    /// Minimum single SELL TX price impact (%).
+    /// Filters pools where no individual sell has meaningful price impact
+    /// (thin liquidity / no organic sell pressure — often ghost-town pools).
+    /// Default: 0.0 (neutral / no lower bound)
+    pub min_single_sell_impact_pct: f64,
 
     /// Maximum single SELL TX price impact (%).
     /// Unlike max_single_tx_price_impact_pct, this only considers sell transactions.
@@ -1513,6 +1531,7 @@ impl Default for GatekeeperV2Config {
             min_total_volume_sol: 0.5,
             max_total_volume_sol: 9999.0,
             min_sol_buy_ratio: 0.50,
+            max_sol_buy_ratio: 1.0,
             min_consecutive_buys: 0,
 
             // Phase 5
@@ -1525,8 +1544,10 @@ impl Default for GatekeeperV2Config {
             reject_on_dev_sell: true,
 
             // Phase 6
+            min_price_change_ratio: 0.0,
             max_price_change_ratio: 4.0,
             max_single_tx_price_impact_pct: 25.0,
+            min_single_sell_impact_pct: 0.0,
             max_single_sell_impact_pct: 30.0,
             min_bonding_progress_pct: 0.0,
             max_bonding_progress_pct: 15.0,

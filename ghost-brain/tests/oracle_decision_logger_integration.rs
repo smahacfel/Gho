@@ -35,6 +35,7 @@ async fn test_oracle_decision_logger_complete_flow() {
     // Setup: Create logger with test config
     let config = DecisionLoggerConfig {
         log_dir: temp_dir.path().to_path_buf(),
+        gatekeeper_log_dir: temp_dir.path().to_path_buf(),
         channel_buffer_size: 100,
         enabled: true,
     };
@@ -280,6 +281,7 @@ async fn test_veto_scenario() {
     let temp_dir = TempDir::new().unwrap();
     let config = DecisionLoggerConfig {
         log_dir: temp_dir.path().to_path_buf(),
+        gatekeeper_log_dir: temp_dir.path().to_path_buf(),
         channel_buffer_size: 100,
         enabled: true,
     };
@@ -363,6 +365,7 @@ async fn test_guardian_abort_scenario() {
     let temp_dir = TempDir::new().unwrap();
     let config = DecisionLoggerConfig {
         log_dir: temp_dir.path().to_path_buf(),
+        gatekeeper_log_dir: temp_dir.path().to_path_buf(),
         channel_buffer_size: 100,
         enabled: true,
     };
@@ -444,6 +447,7 @@ async fn test_multiple_candidates_concurrent() {
     let temp_dir = TempDir::new().unwrap();
     let config = DecisionLoggerConfig {
         log_dir: temp_dir.path().to_path_buf(),
+        gatekeeper_log_dir: temp_dir.path().to_path_buf(),
         channel_buffer_size: 100,
         enabled: true,
     };

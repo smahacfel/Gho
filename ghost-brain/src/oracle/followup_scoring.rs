@@ -565,6 +565,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let logger_config = DecisionLoggerConfig {
             log_dir: temp_dir.path().to_path_buf(),
+            gatekeeper_log_dir: temp_dir.path().to_path_buf(),
             channel_buffer_size: 100,
             enabled: true,
         };
@@ -592,6 +593,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let logger_config = DecisionLoggerConfig {
             log_dir: temp_dir.path().to_path_buf(),
+            gatekeeper_log_dir: temp_dir.path().to_path_buf(),
             channel_buffer_size: 100,
             enabled: true,
         };

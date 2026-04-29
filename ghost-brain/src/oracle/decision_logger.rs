@@ -395,6 +395,8 @@ pub struct GatekeeperBuyLog {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sol_buy_ratio: Option<f64>,
     pub min_sol_buy_ratio: f64,
+    #[serde(default = "default_one_f64")]
+    pub max_sol_buy_ratio: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_consecutive_buys_observed: Option<usize>,
     pub min_consecutive_buys: usize,
@@ -424,12 +426,16 @@ pub struct GatekeeperBuyLog {
     pub phase6_passed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub price_change_ratio: Option<f64>,
+    #[serde(default = "default_zero_f64")]
+    pub min_price_change_ratio: f64,
     pub max_price_change_ratio: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_single_tx_price_impact_pct_observed: Option<f64>,
     pub max_single_tx_price_impact_pct: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_single_sell_impact_pct_observed: Option<f64>,
+    #[serde(default = "default_zero_f64")]
+    pub min_single_sell_impact_pct: f64,
     pub max_single_sell_impact_pct: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bonding_progress_pct: Option<f64>,
@@ -1350,6 +1356,12 @@ impl OracleDecisionLog {
 pub struct DecisionLoggerConfig {
     /// Base directory for decision logs
     pub log_dir: PathBuf,
+    /// Base directory for gatekeeper-specific decision logs.
+    /// Gatekeeper V2 verdicts (decisions + buys) are written here rather
+    /// than to `log_dir`, keeping gatekeeper output in a dedicated rollout
+    /// directory for shadow-burnin analysis.
+    /// Default: "logs/decisions.json/rollout/shadow-burnin/decisions"
+    pub gatekeeper_log_dir: PathBuf,
     /// Channel buffer size
     pub channel_buffer_size: usize,
     /// Enable logging
@@ -1360,6 +1372,7 @@ impl Default for DecisionLoggerConfig {
     fn default() -> Self {
         Self {
             log_dir: PathBuf::from(DEFAULT_DECISION_LOG_DIR),
+            gatekeeper_log_dir: PathBuf::from("logs/decisions.json/rollout/shadow-burnin/decisions"),
             channel_buffer_size: 1000,
             enabled: true,
         }
@@ -1415,8 +1428,24 @@ impl DecisionLogger {
                     return;
                 }
             }
+            // Also create the dedicated gatekeeper log directory.
+            if let Err(e) = create_dir_all(&config.gatekeeper_log_dir).await {
+                if is_no_space_error(std::iter::once(&e as &(dyn std::error::Error + 'static))) {
+                    logging_disabled_due_to_enospc = true;
+                    error!(
+                        "DecisionLogger: disabling file writes after ENOSPC while creating GK dir {:?}",
+                        config.gatekeeper_log_dir
+                    );
+                } else {
+                    error!("Failed to create gatekeeper log directory: {}", e);
+                    return;
+                }
+            }
 
-            info!("DecisionLogger: started writing to {:?}", config.log_dir);
+            info!(
+                "DecisionLogger: started writing decisions → {:?}, gatekeeper → {:?}",
+                config.log_dir, config.gatekeeper_log_dir
+            );
 
             // ── A/B dedup guard: TTL+size-bounded cache ──────────────────────
             let mut dedup_map: HashMap<String, ()> = HashMap::new();
@@ -1500,7 +1529,7 @@ impl DecisionLogger {
                             dedup_map.insert(record_id.clone(), ());
                             dedup_queue.push_back((now, record_id.clone()));
                         }
-                        if let Err(e) = write_gatekeeper_buy_log(&config.log_dir, &log).await {
+                        if let Err(e) = write_gatekeeper_buy_log(&config.gatekeeper_log_dir, &log).await {
                             if is_no_space_error(e.chain()) {
                                 logging_disabled_due_to_enospc = true;
                                 error!(
@@ -1859,6 +1888,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let config = DecisionLoggerConfig {
             log_dir: temp_dir.path().to_path_buf(),
+            gatekeeper_log_dir: temp_dir.path().to_path_buf(),
             channel_buffer_size: 10,
             enabled: true,
         };
@@ -2051,6 +2081,7 @@ mod tests {
             max_total_volume_sol: 9999.0,
             sol_buy_ratio: Some(0.65),
             min_sol_buy_ratio: 0.50,
+            max_sol_buy_ratio: 1.0,
             max_consecutive_buys_observed: Some(3),
             min_consecutive_buys: 0,
             phase5_passed: true,
@@ -2068,6 +2099,7 @@ mod tests {
             reject_on_dev_sell: true,
             phase6_passed: true,
             price_change_ratio: Some(2.0),
+            min_price_change_ratio: 0.0,
             max_price_change_ratio: 4.0,
             max_single_tx_price_impact_pct_observed: Some(5.0),
             max_single_tx_price_impact_pct: 25.0,
@@ -2079,6 +2111,7 @@ mod tests {
             curve_finality_is_finalized: Some(false),
             bonding_progress_check_skipped: Some(false),
             max_single_sell_impact_pct_observed: Some(10.0),
+            min_single_sell_impact_pct: 0.0,
             max_single_sell_impact_pct: 30.0,
             current_market_cap_sol: Some(30.0),
             min_market_cap_sol: 20.0,
@@ -2256,6 +2289,7 @@ mod tests {
         // Initialize the logger
         let config = DecisionLoggerConfig {
             log_dir: log_dir.clone(),
+            gatekeeper_log_dir: log_dir.clone(),
             channel_buffer_size: 10,
             enabled: true,
         };
@@ -2397,6 +2431,7 @@ mod tests {
             max_total_volume_sol: 9999.0,
             sol_buy_ratio: Some(0.65),
             min_sol_buy_ratio: 0.50,
+            max_sol_buy_ratio: 1.0,
             max_consecutive_buys_observed: Some(3),
             min_consecutive_buys: 0,
             phase5_passed: true,
@@ -2414,6 +2449,7 @@ mod tests {
             reject_on_dev_sell: true,
             phase6_passed: true,
             price_change_ratio: Some(2.0),
+            min_price_change_ratio: 0.0,
             max_price_change_ratio: 4.0,
             max_single_tx_price_impact_pct_observed: Some(5.0),
             max_single_tx_price_impact_pct: 25.0,
@@ -2425,6 +2461,7 @@ mod tests {
             curve_finality_is_finalized: Some(false),
             bonding_progress_check_skipped: Some(false),
             max_single_sell_impact_pct_observed: Some(10.0),
+            min_single_sell_impact_pct: 0.0,
             max_single_sell_impact_pct: 30.0,
             current_market_cap_sol: Some(30.0),
             min_market_cap_sol: 20.0,
@@ -2599,6 +2636,7 @@ mod tests {
 
         let config = DecisionLoggerConfig {
             log_dir: log_dir.clone(),
+            gatekeeper_log_dir: log_dir.clone(),
             channel_buffer_size: 10,
             enabled: true,
         };
@@ -2658,6 +2696,7 @@ mod tests {
 
         let config = DecisionLoggerConfig {
             log_dir: log_dir.clone(),
+            gatekeeper_log_dir: log_dir.clone(),
             channel_buffer_size: 10,
             enabled: true,
         };
@@ -2790,6 +2829,7 @@ mod tests {
         let log_dir = temp_dir.path().to_path_buf();
         let config = DecisionLoggerConfig {
             log_dir: log_dir.clone(),
+            gatekeeper_log_dir: log_dir.clone(),
             channel_buffer_size: 10,
             enabled: true,
         };
