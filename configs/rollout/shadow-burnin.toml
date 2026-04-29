@@ -42,8 +42,9 @@ enable_raydium = false
 [trigger]
 enabled = true
 rpc_url = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
-# REQUIRED in production: override via GHOST_TRIGGER_KEYPAIR_PATH.
-keypair_path = "replace-me"
+# REQUIRED in production (live/dual): override via GHOST_TRIGGER_KEYPAIR_PATH.
+# Shadow-only mode does not require a keypair — no real transactions are sent.
+# keypair_path = "/root/Gh/solana/id.json"
 entry_mode = "shadow_only"
 # Even without live send, canonical shadow burn-in keeps the same production
 # bulkhead contract: these values are still the primary wallet/risk guardrails.
