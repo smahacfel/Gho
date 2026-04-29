@@ -49,7 +49,7 @@ Pipeline decyzyjny systemu Ghost składa się z trzech głównych warstw:
 │  TIMEOUT                                                     │
 ├─────────────────────────────────────────────────────────────┤
 │                    WARSTWA POST-DECYZYJNA                    │
-│  HyperPrediction Oracle (SurvivorScore, cykle S1-S13)       │
+│  HyperPrediction Oracle (SurvivorScore, cykle S1-S13) // legacy!!!!      │
 │  Post-Buy Guardian (monitoring pozycji)                     │
 │  Execution Layer (Trigger, Live/Shadow/Paper)               │
 └─────────────────────────────────────────────────────────────┘
