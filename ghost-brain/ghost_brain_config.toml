@@ -24,13 +24,13 @@ min_sol_threshold = 0.001
 # ── Phase 1: Quantity Gate ─────────────────────────────────────────────────────
 # Dead strict 14/8/7 okazał się zbyt suchy na bieżący flow, ale pełne wyjęcie
 # gate'u było tylko sondą. Wracamy do umiarkowanego 12/8/6.
-min_tx_count = 40
-min_unique_signers = 32
-min_buy_count = 32
+min_tx_count = 10
+min_unique_signers = 8
+min_buy_count = 6
 
 
 # Finalna ewaluacja nadal zbiera wczesne okno; nie wydłużamy go agresywnie.
-max_wait_time_ms = 8001
+max_wait_time_ms = 12000
 
 # ── Phase 2: Velocity Profile ──────────────────────────────────────────────────
 # SURVIVAL FILTER: avg_interval_ms ≤ 400 is the PRIMARY momentum detector
@@ -39,7 +39,7 @@ max_wait_time_ms = 8001
 min_interval_cv = 0.0
 max_burst_ratio = 1.0
 min_avg_interval_ms = 1.0
-max_avg_interval_ms = 950.0
+max_avg_interval_ms = 600.0
 min_timing_entropy = 0.01
 min_dust_filtered_count = 0
 max_interval_cv = 9.3
@@ -94,7 +94,7 @@ min_single_sell_impact_pct = 0.0
 max_single_sell_impact_pct = 9999.0
 max_bonding_progress_pct = 62.0
 min_bonding_progress_pct = 4.0
-min_market_cap_sol = 2.0
+min_market_cap_sol = 35.0
 
 # ── Decision ────────────────────────────────────────────────────────────────────
 # 3-layer decision ON: tokeny nie giną od razu przy lekkim przekroczeniu progów —
@@ -111,12 +111,12 @@ hard_fail_top3_volume_pct = 1.0
 
 # Soft signals ── AKTYWNE (3L scoring) ──────────────────────────────────────────
 # manipulation (3) >> diversity (2) > timing (1) > ecosystem (1) 
-max_soft_points = 255  # ❄ FROZEN (soft scoring neutralized)
+max_soft_points = 8
 soft_weight_timing = 1
 soft_weight_manipulation = 3
 soft_weight_diversity = 2
 soft_weight_ecosystem = 1
-max_soft_score = 255  # ⭐ FROM LOG (was 1)
+max_soft_score = 8  # ⭐ FROM LOG (was 1)
 
 # ── Alpha Gate (positive selector after sybil) ───────────────────────────────
 enable_alpha_gate = true
@@ -200,7 +200,7 @@ soft_penalty_high_dbia_low_ftdi_combo = 2
 soft_penalty_low_des_low_sfd_combo = 2
 soft_penalty_high_cpv_low_des_combo = 0
 soft_penalty_high_fsc_high_cpv_combo = 0
-max_sybil_soft_points = 6
+max_sybil_soft_points = 4
 dev_unknown_max_sybil_soft_points = 5
 enable_sybil_interference_layer = true
 enable_sybil_combo_veto = false
