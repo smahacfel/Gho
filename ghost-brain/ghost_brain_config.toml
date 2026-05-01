@@ -24,9 +24,9 @@ min_sol_threshold = 0.001
 # ── Phase 1: Quantity Gate ─────────────────────────────────────────────────────
 # Dead strict 14/8/7 okazał się zbyt suchy na bieżący flow, ale pełne wyjęcie
 # gate'u było tylko sondą. Wracamy do umiarkowanego 12/8/6.
-min_tx_count = 12
-min_unique_signers = 8
-min_buy_count = 6
+min_tx_count = 40
+min_unique_signers = 32
+min_buy_count = 32
 
 
 # Finalna ewaluacja nadal zbiera wczesne okno; nie wydłużamy go agresywnie.
@@ -39,28 +39,28 @@ max_wait_time_ms = 8001
 min_interval_cv = 0.0
 max_burst_ratio = 1.0
 min_avg_interval_ms = 1.0
-max_avg_interval_ms = 450.0
+max_avg_interval_ms = 950.0
 min_timing_entropy = 0.01
 min_dust_filtered_count = 0
-max_interval_cv = 2.3
+max_interval_cv = 9.3
 max_timing_entropy = 9999.0
 
 # ── Phase 3: Signer Diversity ──────────────────────────────────────────────────
 # SURVIVAL FILTER: HHI ≤ 0.155 predicts survival (p=1.9e-13)
 # Survivors: 0.155 | Early-death: 0.200 → Lower concentration = better
-min_unique_ratio = 0.1
+min_unique_ratio = 0.653
 max_unique_ratio = 1.0
-max_hhi = 0.155
+max_hhi = 9.90
 max_tx_per_signer = 999999
-min_volume_gini = 0.53
+min_volume_gini = 0.646
 max_volume_gini = 11.0
-max_top3_volume_pct = 0.70
+max_top3_volume_pct = 0.65
 max_same_ms_tx_ratio = 1.0
 
 # ── Phase 4: Volume Sanity ─────────────────────────────────────────────────────
 # SURVIVAL FILTER: buy_ratio nadal jest ważny, ale 0.83/0.84 zjadało zbyt dużo
 # flow razem z innymi gate'ami. 0.80 zostawia sentiment-positive bias.
-min_buy_ratio = 0.80
+min_buy_ratio = 0.65
 max_buy_ratio = 1.0
 min_sol_buy_ratio = 0.0
 max_sol_buy_ratio = 1.0
@@ -70,15 +70,15 @@ min_volume_cv = 0.01
 min_total_volume_sol = 1.0
 max_volume_cv = 9999.0
 max_total_volume_sol = 9999.0
-min_consecutive_buys = 3
+min_consecutive_buys = 2
 
 # ── Phase 5: Dev Behavior ──────────────────────────────────────────────────────
 # Sekcja pozostaje permissive: nie wracamy tu do hardego dev-side filtra ani do
 # `reject_on_dev_sell`, bo to bylo juz wczesniej falszywie negatywne dla A-like pools.
 min_dev_buy_sol = 0.0
-max_dev_buy_sol = 2.0
+max_dev_buy_sol = 25.0
 max_dev_tx_ratio = 0.99  # ⭐ FROM LOG
-max_dev_volume_ratio = 0.23
+max_dev_volume_ratio = 0.99
 min_dev_volume_ratio = 0.0  # ⭐ FROM LOG (was 0.0)
 min_dev_tx_ratio = 0.0
 reject_on_dev_sell = false
@@ -92,9 +92,9 @@ max_price_change_ratio = 9999.0
 max_single_tx_price_impact_pct = 9999.0
 min_single_sell_impact_pct = 0.0
 max_single_sell_impact_pct = 9999.0
-max_bonding_progress_pct = 99.0
-min_bonding_progress_pct = 40.0
-min_market_cap_sol = 60.0
+max_bonding_progress_pct = 62.0
+min_bonding_progress_pct = 4.0
+min_market_cap_sol = 2.0
 
 # ── Decision ────────────────────────────────────────────────────────────────────
 # 3-layer decision ON: tokeny nie giną od razu przy lekkim przekroczeniu progów —
@@ -105,7 +105,7 @@ use_three_layer_decision = true
 
 # Hard Fails ────────────────────────────────────────────────────────────────────
 # Tylko skrajna koncentracja ma prawo ubić BUY na hard-fail.
-hard_fail_hhi = 3.90
+hard_fail_hhi = 9.90
 hard_fail_same_ms_tx_ratio = 9999
 hard_fail_top3_volume_pct = 1.0
 
@@ -129,14 +129,14 @@ min_alpha_sample = 10
 # Wchodzi dopiero po hard/core/sybil/alpha i ma odsiać BUY-e, które nie
 # przypominają historycznie zyskownych branchy ze shadow outcome set.
 enable_prosperity_filter = true
-prosperity_min_market_cap_sol = 45.0
-prosperity_max_signer_cross_pool_velocity = 0.5  # ⭐ FROM CORRECT LOG (was 0.2)
-prosperity_branch1_min_block0_sniped_supply_pct = 0.28
-prosperity_branch1_max_sell_buy_ratio = 0.16
-prosperity_branch2_min_market_cap_sol = 55.0
-prosperity_branch2_min_early_slot_volume_dominance_buy = 0.90
-prosperity_branch3_max_hhi = 0.0416
-prosperity_branch3_min_fee_topology_diversity_index = 0.0909
+prosperity_min_market_cap_sol = 1.0
+prosperity_max_signer_cross_pool_velocity = 0.99  # ⭐ FROM CORRECT LOG (was 0.2)
+prosperity_branch1_min_block0_sniped_supply_pct = 0.01
+prosperity_branch1_max_sell_buy_ratio = 0.01
+prosperity_branch2_min_market_cap_sol = 2.0
+prosperity_branch2_min_early_slot_volume_dominance_buy = 0.01
+prosperity_branch3_max_hhi = 6.99
+prosperity_branch3_min_fee_topology_diversity_index = 0.01
 # Overlay wyłączamy na ten rerun. Martwe okno pokazało, że zanim dojdziemy do
 # overlayu, sam core już wysusza flow; najpierw odzyskujemy sensowne BUY cadence.
 enable_prosperity_overlay = false
@@ -147,7 +147,7 @@ prosperity_overlay_branch23_max_sell_buy_ratio = 0.18
 prosperity_overlay_branch2_max_price_change_ratio = 2.0
 
 # Dev Unknown ── AKTYWNE (dev nieznany = podejrzane) ────────────────────────────
-dev_unknown_min_market_cap_sol = 60.0
+dev_unknown_min_market_cap_sol = 2.0
 dev_unknown_min_sol_buy_ratio = 0.0       # ❄ FROZEN
 dev_unknown_max_soft_points = 255         # ❄ FROZEN
 dev_unknown_max_single_tx_price_impact_pct = 9999.0  # ❄ FROZEN
@@ -155,7 +155,7 @@ dev_unknown_max_single_tx_price_impact_pct = 9999.0  # ❄ FROZEN
 # ── Hybrid gRPC / Yellowstone fingerprint thresholds ──────────────────────────
 # Lekki upstream choke zsynchronizowany z Balanced: odcinamy ewidentny churn i
 # flipper-heavy flow, ale nie duplikujemy agresywnych branchy prosperity w core.
-max_sell_buy_ratio = 0.4
+max_sell_buy_ratio = 0.99
 max_compute_unit_cluster_dominance = 0.99
 max_static_fee_profile_ratio = 0.99
 min_avg_inner_ix_count_50tx = 0.01
@@ -165,7 +165,7 @@ max_fixed_size_buy_ratio_1e4 = 0.99
 max_flipper_presence_ratio = 0.99
 max_jito_tip_intensity = 1.0
 max_early_slot_volume_dominance_buy = 0.99
-max_early_top3_buy_volume_pct_3s = 0.71
+max_early_top3_buy_volume_pct_3s = 0.75
 max_whale_reversal_ratio_top3 = 0.99
 max_whale_reversal_ratio_top1 = 0.99
 min_sell_buy_ratio = 0.0
