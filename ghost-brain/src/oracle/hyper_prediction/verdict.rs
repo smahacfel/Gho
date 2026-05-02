@@ -1,18 +1,26 @@
-//! Verdict Types - Decision-related types for HyperPrediction Oracle
+//! **DEPRECATED – Legacy HyperPrediction Oracle verdict types**
 //!
-//! This module contains all types related to scoring verdicts and risk assessment.
-//! Extracted from `hyper_prediction.rs` for better modularity and testability.
+//! This module used to provide the decision, risk and final‑verdict types for
+//! the old cycle‑based (S1‑S13) HyperPrediction engine.  The new pipeline
+//! replaces that engine with a simpler post‑Gatekeeper flow:
 //!
-//! ## Design Philosophy
+//! ```text
+//! Hard Fails → Core Checks → Soft Signals → Sybil Interference →
+//! Alpha Gate → Prosperity Filter → IWIM Veto
+//! ```
 //!
-//! These types represent the **output** of the prediction system:
-//! - What decision was made? (`OracleDecision`)
-//! - What is the risk level? (`RiskLevel`)
-//! - What are the risk thresholds? (`RiskThresholds`)
-//! - What is the final verdict? (`FinalVerdict`)
+//! The types defined below (`OracleDecision`, `RiskLevel`, `FinalVerdict`) are
+//! therefore **not used** in the current pipeline.  They are retained only for
+//! backward compatibility with older test code that may still import them.
+//! All new or refactored logic should avoid these types entirely.
 //!
-//! By centralizing these types here, we make the decision-making process
-//! more transparent and easier to test.
+//! # Removal timeline
+//!
+//! Once all import sites have been cleaned up this file can be deleted.
+//! If you are reading this notice, please do not add new dependencies on
+//! the public items in this module.
+
+#![allow(deprecated)] // the file itself still needs to compile
 
 use seer::types::CandidatePool;
 use serde::{Deserialize, Serialize};
@@ -21,9 +29,15 @@ use serde::{Deserialize, Serialize};
 // Oracle Decision
 // =============================================================================
 
-/// Oracle decision outcome for a token evaluation
+/// **Deprecated** – Legacy Oracle decision outcome for a token evaluation.
 ///
-/// Represents the final action recommendation from the HyperPrediction Oracle.
+/// This enum was part of the old HyperPrediction engine.  In the current
+/// pipeline the decision is determined by the Gatekeeper verdict chain;
+/// there is no separate "OracleDecision" type.
+#[deprecated(
+    since = "6.0.0",
+    note = "Replaced by GatekeeperVerdictType and the post-Gatekeeper policy matrix"
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OracleDecision {
     /// Buy signal - token passed all checks
@@ -47,26 +61,15 @@ impl Default for OracleDecision {
 // Risk Level
 // =============================================================================
 
-/// Risk level classification for token evaluation
+/// **Deprecated** – Legacy risk level classification for token evaluation.
 ///
-/// Determines the confidence level in a token's safety and potential.
-/// Higher risk levels indicate lower confidence and higher potential for loss.
-///
-/// ## Risk Categories
-///
-/// - **Low**: High confidence, minimal risk indicators
-/// - **Medium**: Moderate confidence, some risk factors present
-/// - **High**: Low confidence, multiple risk factors
-/// - **VeryHigh**: Very low confidence, critical risk factors present
-///
-/// ## Usage in Scoring
-///
-/// Risk levels are determined primarily by:
-/// 1. **SurvivorScore confidence**: Lower confidence → higher risk
-/// 2. **SurvivorScore value**: Lower score → higher risk
-/// 3. **Additional modifiers**: SSMI, MPCF, MESA, etc. can escalate risk
-///
-/// See [`RiskThresholds`] for configurable decision boundaries.
+/// Risk assessment in the new pipeline is captured by
+/// [`GatekeeperStrength`](super::super::components::gatekeeper::GatekeeperStrength)
+/// and the IWIM veto quality classification; this enum is no longer needed.
+#[deprecated(
+    since = "6.0.0",
+    note = "Replaced by GatekeeperStrength / IWIM quality; no longer used in the scoring pipeline"
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RiskLevel {
     /// Low risk - high confidence in token quality
@@ -161,66 +164,29 @@ impl RiskLevel {
 // Risk Thresholds
 // =============================================================================
 
-/// Configurable risk assessment thresholds
+/// **Deprecated** – Legacy configurable risk thresholds.
 ///
-/// These thresholds replace hardcoded magic numbers in the scoring logic.
-/// They determine how SurvivorScore confidence and final score map to risk levels.
-///
-/// ## Historical Context
-///
-/// The default values (0.5, 0.7, 60) were derived from empirical testing
-/// during the Phase 4.5 SurvivorScore integration. They represent:
-///
-/// - **very_high_confidence (0.5)**: Below this, data quality is too poor
-///   to make confident decisions (e.g., missing critical signals like IWIM)
-///
-/// - **high_confidence (0.7)**: Below this, confidence is low but not critical.
-///   Represents scenarios where some key signals are missing or weak.
-///
-/// - **medium_score (60)**: Below this score, even with good confidence,
-///   the token's fundamentals are too weak to justify a buy signal.
-///   60 points is the empirical "survival threshold" from backtesting.
-///
-/// ## Calibration Notes
-///
-/// These thresholds are intentionally conservative (high bar for Low risk).
-/// In the aggressive Ghost strategy, we prefer false negatives (missed opportunities)
-/// over false positives (bad entries).
-///
-/// ## Future Work
-///
-/// TODO: Load from config.toml once ConfigModule refactor is complete.
-/// For now, these are hardcoded defaults that can be overridden programmatically.
+/// The new pipeline does not use these thresholds; soft‑point limits and the
+/// prosperity filter serve similar purposes.
+#[deprecated(
+    since = "6.0.0",
+    note = "Superseded by the Gatekeeper soft‑point limits and ProsperityFilter thresholds"
+)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RiskThresholds {
     /// SurvivorScore confidence below this = VeryHigh risk
     ///
     /// Default: 0.5
-    ///
-    /// **Rationale**: With confidence below 50%, we have insufficient data
-    /// to make a reliable decision. This typically occurs when:
-    /// - IWIM (dev wallet history) is unavailable
-    /// - Multiple key signals are missing
-    /// - Fallback confidence penalties accumulate beyond acceptable levels
     pub very_high_confidence: f32,
 
     /// SurvivorScore confidence below this = High risk
     ///
     /// Default: 0.7
-    ///
-    /// **Rationale**: Confidence between 50-70% indicates some data quality
-    /// issues but not critical. We can still make decisions but with reduced
-    /// confidence. This is common in early-stage analysis (S1-S7 cycles).
     pub high_confidence: f32,
 
     /// Final score below this = Medium risk (if confidence is OK)
     ///
     /// Default: 60
-    ///
-    /// **Rationale**: Score of 60 is the empirical "survival threshold".
-    /// Tokens scoring below 60 have historically shown poor survival rates
-    /// even when data quality is good. This represents fundamental weakness
-    /// in the token's characteristics (low liquidity, no dev buy, etc.).
     pub medium_score: u8,
 }
 
@@ -245,32 +211,6 @@ impl RiskThresholds {
     }
 
     /// Determine risk level from SurvivorScore confidence and final score
-    ///
-    /// This is the core risk assessment logic that was previously hardcoded.
-    ///
-    /// ## Decision Logic
-    ///
-    /// 1. Check confidence against thresholds (most critical)
-    /// 2. If confidence is acceptable, check score threshold
-    /// 3. Default to Low risk if all checks pass
-    ///
-    /// ## Examples
-    ///
-    /// ```ignore
-    /// let thresholds = RiskThresholds::default();
-    ///
-    /// // Low confidence → VeryHigh risk
-    /// assert_eq!(thresholds.determine_risk(0.3, 80), RiskLevel::VeryHigh);
-    ///
-    /// // Medium confidence → High risk
-    /// assert_eq!(thresholds.determine_risk(0.6, 80), RiskLevel::High);
-    ///
-    /// // Good confidence but low score → Medium risk
-    /// assert_eq!(thresholds.determine_risk(0.8, 50), RiskLevel::Medium);
-    ///
-    /// // Good confidence and good score → Low risk
-    /// assert_eq!(thresholds.determine_risk(0.8, 70), RiskLevel::Low);
-    /// ```
     pub fn determine_risk(&self, survivor_confidence: f32, final_score: u8) -> RiskLevel {
         if survivor_confidence < self.very_high_confidence {
             RiskLevel::VeryHigh
@@ -288,10 +228,14 @@ impl RiskThresholds {
 // Final Verdict
 // =============================================================================
 
-/// Final verdict from the HyperPrediction Oracle
+/// **Deprecated** – Legacy final verdict from the HyperPrediction Oracle.
 ///
-/// Wraps the final score, decision, and risk level into a single coherent result.
-/// This provides a high-level summary of the evaluation outcome.
+/// The new pipeline produces a `GatekeeperDecision` which already contains the
+/// final verdict, risk/strength classification, and reason chain.
+#[deprecated(
+    since = "6.0.0",
+    note = "Replaced by GatekeeperDecision; avoid this struct in new code"
+)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FinalVerdict {
     /// Final score (0-100)
