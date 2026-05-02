@@ -30,7 +30,7 @@ min_buy_count = 6
 
 
 # Finalna ewaluacja nadal zbiera wczesne okno; nie wydłużamy go agresywnie.
-max_wait_time_ms = 12000
+max_wait_time_ms = 10000
 
 # ── Phase 2: Velocity Profile ──────────────────────────────────────────────────
 # SURVIVAL FILTER: avg_interval_ms ≤ 400 is the PRIMARY momentum detector
@@ -39,8 +39,8 @@ max_wait_time_ms = 12000
 min_interval_cv = 0.0
 max_burst_ratio = 1.0
 min_avg_interval_ms = 1.0
-max_avg_interval_ms = 600.0
-min_timing_entropy = 0.01
+max_avg_interval_ms = 400.0
+min_timing_entropy = 0.2
 min_dust_filtered_count = 0
 max_interval_cv = 9.3
 max_timing_entropy = 9999.0
@@ -50,11 +50,11 @@ max_timing_entropy = 9999.0
 # Survivors: 0.155 | Early-death: 0.200 → Lower concentration = better
 min_unique_ratio = 0.653
 max_unique_ratio = 1.0
-max_hhi = 9.90
+max_hhi = 0.155
 max_tx_per_signer = 999999
-min_volume_gini = 0.646
+min_volume_gini = 0.64
 max_volume_gini = 11.0
-max_top3_volume_pct = 0.65
+max_top3_volume_pct = 0.70
 max_same_ms_tx_ratio = 1.0
 
 # ── Phase 4: Volume Sanity ─────────────────────────────────────────────────────
@@ -74,7 +74,7 @@ min_consecutive_buys = 2
 
 # ── Phase 5: Dev Behavior ──────────────────────────────────────────────────────
 # Sekcja pozostaje permissive: nie wracamy tu do hardego dev-side filtra ani do
-# `reject_on_dev_sell`, bo to bylo juz wczesniej falszywie negatywne dla A-like pools.
+# `reject_on_dev_sell`, bo to było juz wczesniej falszywie negatywne dla A-like pools.
 min_dev_buy_sol = 0.0
 max_dev_buy_sol = 25.0
 max_dev_tx_ratio = 0.99  # ⭐ FROM LOG
@@ -94,7 +94,7 @@ min_single_sell_impact_pct = 0.0
 max_single_sell_impact_pct = 9999.0
 max_bonding_progress_pct = 62.0
 min_bonding_progress_pct = 4.0
-min_market_cap_sol = 35.0
+min_market_cap_sol = 45.0
 
 # ── Decision ────────────────────────────────────────────────────────────────────
 # 3-layer decision ON: tokeny nie giną od razu przy lekkim przekroczeniu progów —
@@ -120,26 +120,25 @@ max_soft_score = 8  # ⭐ FROM LOG (was 1)
 
 # ── Alpha Gate (positive selector after sybil) ───────────────────────────────
 enable_alpha_gate = true
-min_momentum = 0.2  # ⭐ FROM LOG (was 0.1)
-min_demand = 0.2  # ⭐ FROM LOG (was 0.1)
-min_alpha_joint = 0.2  # ⭐ FROM LOG (was 0.1)
-min_alpha_sample = 10
+min_momentum = 0.30
+min_demand = 0.30
+min_alpha_joint = 0.25
+min_alpha_sample = 12
 
 # ── Prosperity filter (Balanced v1 final selector) ──────────────────────────
 # Wchodzi dopiero po hard/core/sybil/alpha i ma odsiać BUY-e, które nie
 # przypominają historycznie zyskownych branchy ze shadow outcome set.
 enable_prosperity_filter = true
-prosperity_min_market_cap_sol = 1.0
-prosperity_max_signer_cross_pool_velocity = 0.99  # ⭐ FROM CORRECT LOG (was 0.2)
-prosperity_branch1_min_block0_sniped_supply_pct = 0.01
-prosperity_branch1_max_sell_buy_ratio = 0.01
-prosperity_branch2_min_market_cap_sol = 2.0
-prosperity_branch2_min_early_slot_volume_dominance_buy = 0.01
-prosperity_branch3_max_hhi = 6.99
-prosperity_branch3_min_fee_topology_diversity_index = 0.01
-# Overlay wyłączamy na ten rerun. Martwe okno pokazało, że zanim dojdziemy do
-# overlayu, sam core już wysusza flow; najpierw odzyskujemy sensowne BUY cadence.
-enable_prosperity_overlay = false
+prosperity_min_market_cap_sol = 45.0
+prosperity_max_signer_cross_pool_velocity = 0.50
+prosperity_branch1_min_block0_sniped_supply_pct = 0.28
+prosperity_branch1_max_sell_buy_ratio = 0.16
+prosperity_branch2_min_market_cap_sol = 55.0
+prosperity_branch2_min_early_slot_volume_dominance_buy = 0.90
+prosperity_branch3_max_hhi = 0.0416
+prosperity_branch3_min_fee_topology_diversity_index = 0.0909
+# Overlay wyłączyliśmy na ten rerun, ale teraz go aktywujemy.
+enable_prosperity_overlay = true
 prosperity_overlay_max_price_change_ratio = 2.2
 prosperity_overlay_max_bonding_progress_pct = 85.0
 prosperity_overlay_min_fee_topology_diversity_index = 0.10
@@ -200,10 +199,10 @@ soft_penalty_high_dbia_low_ftdi_combo = 2
 soft_penalty_low_des_low_sfd_combo = 2
 soft_penalty_high_cpv_low_des_combo = 0
 soft_penalty_high_fsc_high_cpv_combo = 0
-max_sybil_soft_points = 4
-dev_unknown_max_sybil_soft_points = 5
+max_sybil_soft_points = 3
+dev_unknown_max_sybil_soft_points = 4
 enable_sybil_interference_layer = true
-enable_sybil_combo_veto = false
+enable_sybil_combo_veto = true
 emit_sybil_meta_score = false
 require_ready_fsc_for_combo_veto = true
 funding_lookback_window_s = 180
@@ -294,16 +293,16 @@ confidence_threshold = 0.8
 # Policy matrix: (dev_known × iwim_quality × fetch_status × gk_strength) → verdict.
 # Thresholds lowered for initial data collection phase.
 [iwim_veto_gate]
-enabled = false
+enabled = true
 mode = "pp"
-max_wait_ms = 1
+max_wait_ms = 500
 primary_rpc_url = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
 fallback_rpc_url = ""
 min_confidence = 0.75
-min_tx_pp = 15
-min_tx_grpc = 15
-rug_threat_threshold = 0.7
-sybil_threshold = 0.7
+min_tx_pp = 10
+min_tx_grpc = 20
+rug_threat_threshold = 0.75
+sybil_threshold = 0.75
 organic_floor = 0.15
 strong_margin = 3
 strong_max_manipulation_flags = 0
