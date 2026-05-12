@@ -615,6 +615,10 @@ def scan_shadow_lifecycle_log(
             "exit_filled": 0,
             "exit_blocked": 0,
             "closed": 0,
+            "dispatch_records": 0,
+            "terminal_dispatch_records": 0,
+            "dispatch_status_counts": defaultdict(int),
+            "idempotency_keys": [],
             "net_pnl_sol": None,
             "gross_pnl_sol": None,
             "estimated_costs_sol": None,
@@ -677,6 +681,18 @@ def scan_shadow_lifecycle_log(
                 candidate["exit_value_sol"] = row.get("exit_value_sol")
                 candidate["close_reason"] = row.get("close_reason")
                 candidate["truth_status"] = row.get("truth_status")
+            elif record_type == "shadow_dispatch":
+                status = row.get("dispatch_status")
+                if isinstance(status, str) and status:
+                    candidate["dispatch_records"] += 1
+                    candidate["dispatch_status_counts"][status] += 1
+                    if status in {"failed", "abandoned", "closed"}:
+                        candidate["terminal_dispatch_records"] += 1
+                idempotency_key = row.get("idempotency_key")
+                if isinstance(idempotency_key, str) and idempotency_key:
+                    candidate["idempotency_keys"].append(idempotency_key)
+    for candidate in candidates.values():
+        candidate["dispatch_status_counts"] = dict(candidate["dispatch_status_counts"])
     return dict(candidates), parsed_rows, bad_rows
 
 
@@ -861,6 +877,22 @@ def build_report(inputs: Inputs) -> dict[str, Any]:
         if row["opened"] > 0 and row["closed"] > 0
     }
     runtime_inflight_ids = sorted(runtime_admitted_ids - runtime_completed_ids)
+    dispatched_candidate_ids = set(shadow_candidate_ids)
+    lifecycle_dispatch_ids = {
+        candidate_id
+        for candidate_id, row in lifecycle_candidates.items()
+        if row.get("dispatch_records", 0) > 0
+    }
+    lifecycle_terminal_dispatch_ids = {
+        candidate_id
+        for candidate_id, row in lifecycle_candidates.items()
+        if row.get("terminal_dispatch_records", 0) > 0 or row.get("closed", 0) > 0
+    }
+    dispatch_without_lifecycle = sorted(dispatched_candidate_ids - lifecycle_dispatch_ids)
+    dispatch_without_terminal_lifecycle = sorted(
+        dispatched_candidate_ids - lifecycle_terminal_dispatch_ids
+    )
+    no_dispatch_decision_ids = sorted(set(decision_candidate_ids) - dispatched_candidate_ids)
     economics_candidates = lifecycle_candidates if inputs.runtime_lane == "shadow" else runtime_candidates
     runtime_closed_rows = [row for row in economics_candidates.values() if row["closed"] > 0]
 
@@ -937,10 +969,25 @@ def build_report(inputs: Inputs) -> dict[str, Any]:
             f"shadow_without_{inputs.runtime_lane}={len(missing_runtime_for_shadow)}"
         ),
     )
+    dispatch_gate = GateResult(
+        passed=True,
+        details=(
+            f"decisions={len(decision_candidate_ids)} "
+            f"dispatched={len(dispatched_candidate_ids)} "
+            f"no_dispatch={len(no_dispatch_decision_ids)}"
+        ),
+    )
     lifecycle_gate = GateResult(
-        passed=bool(runtime_completed_ids) and not runtime_inflight_ids,
+        passed=not dispatched_candidate_ids
+        or (not dispatch_without_lifecycle and not dispatch_without_terminal_lifecycle),
         details=(
             f"shadow_success={len(shadow_success_ids)} "
+            f"dispatched={len(dispatched_candidate_ids)} "
+            f"dispatch_lifecycle={len(lifecycle_dispatch_ids)} "
+            f"terminal_dispatch_lifecycle={len(lifecycle_terminal_dispatch_ids)} "
+            f"dispatch_without_lifecycle={len(dispatch_without_lifecycle)} "
+            f"dispatch_without_terminal_lifecycle={len(dispatch_without_terminal_lifecycle)} "
+            f"no_dispatch={len(no_dispatch_decision_ids)} "
             f"{inputs.runtime_lane}_seen={len(runtime_event_ids)} "
             f"{inputs.runtime_lane}_admitted={len(runtime_admitted_ids)} "
             f"{inputs.runtime_lane}_completed={len(runtime_completed_ids)} "
@@ -980,6 +1027,7 @@ def build_report(inputs: Inputs) -> dict[str, Any]:
         "safety_violations": asdict(safety_gate),
         "no_eventbus_lag": asdict(eventbus_gate),
         "trace_correlation": asdict(trace_gate),
+        "dispatch_attempt_classification": asdict(dispatch_gate),
         "runtime_lifecycle_complete": asdict(lifecycle_gate),
         "no_duplicate_fire": asdict(duplicate_gate),
         "no_live_side_effects": asdict(side_effect_gate),
@@ -1031,6 +1079,10 @@ def build_report(inputs: Inputs) -> dict[str, Any]:
             "runtime_completed": len(runtime_completed_ids),
             "runtime_closed": len(runtime_closed_rows),
             "runtime_inflight": runtime_inflight_ids,
+            "shadow_dispatched": len(dispatched_candidate_ids),
+            "shadow_no_dispatch": no_dispatch_decision_ids,
+            "dispatch_without_lifecycle": dispatch_without_lifecycle,
+            "dispatch_without_terminal_lifecycle": dispatch_without_terminal_lifecycle,
             "total_net_pnl_sol": total_net_pnl_sol,
             "total_gross_pnl_sol": total_gross_pnl_sol,
             "total_estimated_costs_sol": total_estimated_costs_sol,

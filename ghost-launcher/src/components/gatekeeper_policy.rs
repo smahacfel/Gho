@@ -571,15 +571,18 @@ pub fn build_assessment_from_features(
         if let Some(ref mut pdd) = assessment.pdd_assessment {
             let (spike, spike_reason) =
                 crate::components::gatekeeper_pdd_sequence::detect_spike_from_segments(
-                    seq, &config.pdd,
+                    seq,
+                    &config.pdd,
                 );
             let (ramping, ramping_reason) =
                 crate::components::gatekeeper_pdd_sequence::detect_ramping_from_segments(
-                    seq, &config.pdd,
+                    seq,
+                    &config.pdd,
                 );
             let (flash, flash_reason) =
                 crate::components::gatekeeper_pdd_sequence::detect_flash_crash_from_segments(
-                    seq, &config.pdd,
+                    seq,
+                    &config.pdd,
                 );
 
             pdd.spike_detected = spike;
@@ -604,8 +607,9 @@ pub fn build_assessment_from_features(
             // Soft penalties for non-hard-fail signals
             if pdd.hard_fail.is_none() {
                 if spike && !config.pdd.spike_hard_veto {
-                    pdd.soft_penalty_points =
-                        pdd.soft_penalty_points.saturating_add(config.pdd.spike_soft_penalty);
+                    pdd.soft_penalty_points = pdd
+                        .soft_penalty_points
+                        .saturating_add(config.pdd.spike_soft_penalty);
                 }
                 // Ramping and flash crash are hard-veto only in this design;
                 // their soft-penalty equivalents are not yet plumbed.
@@ -640,7 +644,8 @@ pub fn build_assessment_from_features(
     // to regime_high_vol_entry_drift_max_pct (3%) instead of the normal 5%.
     // This gives the V2.5 shadow plane regime-aware PDD without touching legacy.
     if let Some(ref aps) = assessment.aps_diagnostics {
-        if aps.regime == crate::components::gatekeeper_adaptive_prosperity::MarketRegime::HighVolatility
+        if aps.regime
+            == crate::components::gatekeeper_adaptive_prosperity::MarketRegime::HighVolatility
             && config.aps.adaptive_enabled
             && !config.v25.live_execution_enabled
         {
@@ -2391,7 +2396,9 @@ mod tests {
         assert_eq!(buy_log.v25_confidence_available, Some(false));
         // P1: reason is now specific (tas_unavailable, pdd_sequence_unavailable, etc.)
         // rather than the legacy generic aggregate.
-        let v25_reason = buy_log.v25_confidence_unavailable_reason.as_deref()
+        let v25_reason = buy_log
+            .v25_confidence_unavailable_reason
+            .as_deref()
             .expect("v25_confidence_unavailable_reason must be populated");
         assert!(
             !v25_reason.contains("partial_v25_inputs"),
@@ -2399,8 +2406,10 @@ mod tests {
             v25_reason
         );
         assert!(
-            v25_reason.contains("insufficient") || v25_reason.contains("missing")
-                || v25_reason.contains("unavailable") || v25_reason.contains("segment"),
+            v25_reason.contains("insufficient")
+                || v25_reason.contains("missing")
+                || v25_reason.contains("unavailable")
+                || v25_reason.contains("segment"),
             "reason must be from specific taxonomy, got: {}",
             v25_reason
         );

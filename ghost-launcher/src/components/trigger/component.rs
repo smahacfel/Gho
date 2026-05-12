@@ -4445,13 +4445,14 @@ async fn append_shadow_buy_report_record(
     entry_mode: TriggerEntryMode,
     record: &crate::events::ShadowBuySimulationEvent,
 ) -> Result<()> {
-    let id_key = super::shadow_run::make_shadow_idempotency_key(
+    let join_key = super::shadow_run::make_shadow_join_key(
         &record.pool_amm_id,
         &record.base_mint,
-        "",
+        record.decision_ts_ms,
     );
+    let rollout_profile = super::shadow_run::derive_shadow_rollout_profile_from_path(log_path);
     let jsonl_record = super::shadow_run::ShadowBuySimulationRecord::from_event(entry_mode, record)
-        .with_idempotency_key(id_key);
+        .with_lifecycle_identity(join_key, rollout_profile);
     super::shadow_run::record_shadow_buy_metrics(&jsonl_record);
     crate::oracle_metrics::record_shadow_lifecycle_status(if jsonl_record.err.is_some() {
         "failed_reconciliation"
@@ -4478,10 +4479,13 @@ async fn persist_shadow_failure_record(
     failed_context: Option<&TriggerDispatchFailureContext>,
     err: &anyhow::Error,
 ) -> Result<()> {
-    let id_key = super::shadow_run::make_shadow_idempotency_key(
-        pool_amm_id,
-        base_mint,
-        "",
+    let decision_ts_ms = failed_request
+        .map(|request| request.decision_ts_ms)
+        .or_else(|| failed_context.map(|context| context.decision_ts_ms))
+        .unwrap_or_default();
+    let join_key = super::shadow_run::make_shadow_join_key(pool_amm_id, base_mint, decision_ts_ms);
+    let rollout_profile = super::shadow_run::derive_shadow_rollout_profile_from_path(
+        std::path::Path::new(output_path),
     );
     let record = if let Some(request) = failed_request {
         super::shadow_run::ShadowBuySimulationRecord::from_failure(
@@ -4492,7 +4496,7 @@ async fn persist_shadow_failure_record(
             None,
             err,
         )
-        .with_idempotency_key(id_key)
+        .with_lifecycle_identity(join_key.clone(), rollout_profile.clone())
     } else if let Some(context) = failed_context {
         super::shadow_run::ShadowBuySimulationRecord::from_failure_context(
             entry_mode,
@@ -4502,7 +4506,7 @@ async fn persist_shadow_failure_record(
             None,
             err,
         )
-        .with_idempotency_key(id_key)
+        .with_lifecycle_identity(join_key, rollout_profile)
     } else {
         return Ok(());
     };
@@ -4565,11 +4569,16 @@ fn spawn_background_shadow_event(
                     live_signature,
                     &e,
                 )
-                .with_idempotency_key(super::shadow_run::make_shadow_idempotency_key(
-                    &pool_amm_id,
-                    &base_mint,
-                    "",
-                ));
+                .with_lifecycle_identity(
+                    super::shadow_run::make_shadow_join_key(
+                        &pool_amm_id,
+                        &base_mint,
+                        request.decision_ts_ms,
+                    ),
+                    super::shadow_run::derive_shadow_rollout_profile_from_path(
+                        std::path::Path::new(&output_path),
+                    ),
+                );
                 super::shadow_run::record_shadow_buy_metrics(&record);
                 if let Err(write_err) = super::shadow_run::append_shadow_buy_record(
                     std::path::Path::new(&output_path),
@@ -4596,6 +4605,16 @@ fn spawn_background_shadow_event(
                     &request,
                     live_signature,
                     &join_error,
+                )
+                .with_lifecycle_identity(
+                    super::shadow_run::make_shadow_join_key(
+                        &pool_amm_id,
+                        &base_mint,
+                        request.decision_ts_ms,
+                    ),
+                    super::shadow_run::derive_shadow_rollout_profile_from_path(
+                        std::path::Path::new(&output_path),
+                    ),
                 );
                 super::shadow_run::record_shadow_buy_metrics(&record);
                 if let Err(write_err) = super::shadow_run::append_shadow_buy_record(
@@ -7105,6 +7124,22 @@ mod tests {
         config.keypair_path = Some("/definitely/missing/trigger-payer.json".to_string());
 
         let _ = TriggerComponent::new(config);
+    }
+
+    #[test]
+    fn shadow_only_ephemeral_payer_does_not_require_live_keypair() {
+        let mut config = create_test_config();
+        config.entry_mode = TriggerEntryMode::ShadowOnly;
+        config.keypair_path = Some("/definitely/missing/trigger-payer.json".to_string());
+        config.shadow_run.enabled = true;
+        config.shadow_run.payer_strategy = TriggerShadowPayerStrategy::Ephemeral;
+
+        let trigger = TriggerComponent::new(config);
+        let payer = trigger
+            .load_payer()
+            .expect("shadow_only ephemeral payer should be initialized");
+
+        assert_eq!(payer.provenance, "ephemeral");
     }
 
     #[tokio::test]

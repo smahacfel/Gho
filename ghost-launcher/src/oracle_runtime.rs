@@ -5002,6 +5002,7 @@ struct PoolObservationContext {
     execution_mode: ExecutionMode,
     shadow_entry_log_path: std::path::PathBuf,
     shadow_lifecycle_log_path: Option<std::path::PathBuf>,
+    gatekeeper_rollout_profile: String,
     dry_run: bool,
     ab_window_ms: u64,
 }
@@ -6126,6 +6127,8 @@ async fn execute_gatekeeper_buy_path(
                         &ctx.post_buy_epoch,
                         ctx.execution_mode,
                         &ctx.shadow_entry_log_path,
+                        ctx.shadow_lifecycle_log_path.as_deref(),
+                        &ctx.gatekeeper_rollout_profile,
                         pool_amm_id,
                         pd,
                         trade_value_sol,
@@ -6330,6 +6333,9 @@ fn spawn_shadow_buy_observer(
     base_mint: String,
     emit_event_bus: bool,
     shadow_log_path: std::path::PathBuf,
+    shadow_lifecycle_log_path: Option<std::path::PathBuf>,
+    join_key: String,
+    rollout_profile: String,
     live_signature: Option<String>,
     shadow_task: crate::components::trigger::PendingShadowSimulation,
 ) {
@@ -6357,8 +6363,12 @@ fn spawn_shadow_buy_observer(
                 }
                 if let Err(e) = append_shadow_buy_report_record(
                     &shadow_log_path,
+                    shadow_lifecycle_log_path.as_deref(),
                     crate::config::TriggerEntryMode::LiveAndShadow,
                     &shadow_event,
+                    &join_key,
+                    &rollout_profile,
+                    crate::components::trigger::shadow_run::ShadowDispatchStatus::Closed,
                 )
                 .await
                 {
@@ -6391,8 +6401,12 @@ fn spawn_shadow_buy_observer(
                 }
                 if let Err(write_err) = append_shadow_buy_report_record(
                     &shadow_log_path,
+                    shadow_lifecycle_log_path.as_deref(),
                     crate::config::TriggerEntryMode::LiveAndShadow,
                     &shadow_event,
+                    &join_key,
+                    &rollout_profile,
+                    crate::components::trigger::shadow_run::ShadowDispatchStatus::Failed,
                 )
                 .await
                 {
@@ -6431,8 +6445,12 @@ fn spawn_shadow_buy_observer(
                 }
                 if let Err(write_err) = append_shadow_buy_report_record(
                     &shadow_log_path,
+                    shadow_lifecycle_log_path.as_deref(),
                     crate::config::TriggerEntryMode::LiveAndShadow,
                     &shadow_event,
+                    &join_key,
+                    &rollout_profile,
+                    crate::components::trigger::shadow_run::ShadowDispatchStatus::Abandoned,
                 )
                 .await
                 {
@@ -6563,26 +6581,41 @@ async fn maybe_append_canonical_shadow_entry_record(
 
 async fn append_shadow_buy_report_record(
     log_path: &std::path::Path,
+    lifecycle_log_path: Option<&std::path::Path>,
     entry_mode: crate::config::TriggerEntryMode,
     record: &crate::events::ShadowBuySimulationEvent,
+    join_key: &str,
+    rollout_profile: &str,
+    dispatch_status: crate::components::trigger::shadow_run::ShadowDispatchStatus,
 ) -> anyhow::Result<()> {
-    let id_key = crate::components::trigger::shadow_run::make_shadow_idempotency_key(
-        &record.pool_amm_id,
-        &record.base_mint,
-        "", // rollout_profile unavailable at record level; pool+mint is unique
-    );
     let jsonl_record =
         crate::components::trigger::shadow_run::ShadowBuySimulationRecord::from_event(
             entry_mode, record,
         )
-        .with_idempotency_key(id_key);
+        .with_lifecycle_identity(join_key.to_string(), rollout_profile.to_string());
     crate::components::trigger::shadow_run::record_shadow_buy_metrics(&jsonl_record);
     crate::oracle_metrics::record_shadow_lifecycle_status(if jsonl_record.err.is_some() {
         "failed_reconciliation"
     } else {
         "dispatched"
     });
-    crate::components::trigger::shadow_run::append_shadow_buy_record(log_path, &jsonl_record).await
+    crate::components::trigger::shadow_run::append_shadow_buy_record(log_path, &jsonl_record)
+        .await?;
+    if let Some(lifecycle_log_path) = lifecycle_log_path {
+        let lifecycle_record =
+            crate::components::trigger::shadow_run::ShadowDispatchLifecycleRecord::from_shadow_buy_record(
+                &jsonl_record,
+                join_key.to_string(),
+                rollout_profile.to_string(),
+                dispatch_status,
+            );
+        crate::components::trigger::shadow_run::append_shadow_dispatch_lifecycle_record(
+            lifecycle_log_path,
+            &lifecycle_record,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 fn shadow_execution_outcome_from_dispatch_error(
@@ -7043,6 +7076,9 @@ async fn apply_trigger_buy_outcome(
     post_buy_epoch: &std::sync::atomic::AtomicU64,
     execution_mode: ExecutionMode,
     canonical_shadow_entry_log_path: &std::path::Path,
+    shadow_lifecycle_log_path: Option<&std::path::Path>,
+    shadow_join_key: &str,
+    rollout_profile: &str,
     pool_amm_id: Pubkey,
     pool_data: &DetectedPool,
     trade_value_sol: f64,
@@ -7258,11 +7294,19 @@ async fn apply_trigger_buy_outcome(
                 &shadow_event,
                 &shadow_execution_outcome,
             );
+            let shadow_lifecycle_log_path =
+                shadow_lifecycle_log_path.map(std::path::Path::to_path_buf);
+            let shadow_join_key = shadow_join_key.to_string();
+            let rollout_profile = rollout_profile.to_string();
             tokio::spawn(async move {
                 if let Err(e) = append_shadow_buy_report_record(
                     &shadow_log_path,
+                    shadow_lifecycle_log_path.as_deref(),
                     crate::config::TriggerEntryMode::ShadowOnly,
                     &shadow_event,
+                    &shadow_join_key,
+                    &rollout_profile,
+                    crate::components::trigger::shadow_run::ShadowDispatchStatus::Closed,
                 )
                 .await
                 {
@@ -7293,6 +7337,8 @@ async fn apply_trigger_dispatch_receipt(
     post_buy_epoch: &std::sync::atomic::AtomicU64,
     execution_mode: ExecutionMode,
     canonical_shadow_entry_log_path: &std::path::Path,
+    shadow_lifecycle_log_path: Option<&std::path::Path>,
+    rollout_profile: &str,
     pool_amm_id: Pubkey,
     pool_data: &DetectedPool,
     trade_value_sol: f64,
@@ -7312,6 +7358,11 @@ async fn apply_trigger_dispatch_receipt(
         .as_ref()
         .map(|request| request.min_tokens_out);
     let mut active_position_lease = active_position_lease;
+    let shadow_join_key = crate::components::trigger::shadow_run::make_shadow_join_key(
+        &pool_amm_id.to_string(),
+        &pool_data.base_mint,
+        pool_data.timestamp_ms,
+    );
 
     match primary_outcome {
         Ok(outcome) => {
@@ -7331,6 +7382,9 @@ async fn apply_trigger_dispatch_receipt(
                 post_buy_epoch,
                 execution_mode,
                 canonical_shadow_entry_log_path,
+                shadow_lifecycle_log_path,
+                &shadow_join_key,
+                rollout_profile,
                 pool_amm_id,
                 pool_data,
                 trade_value_sol,
@@ -7348,6 +7402,9 @@ async fn apply_trigger_dispatch_receipt(
                     pool_data.base_mint.clone(),
                     trigger_component.shadow_run_emit_event_bus(),
                     std::path::PathBuf::from(trigger_component.shadow_run_output_path()),
+                    shadow_lifecycle_log_path.map(std::path::Path::to_path_buf),
+                    shadow_join_key.clone(),
+                    rollout_profile.to_string(),
                     live_signature,
                     shadow_task,
                 );
@@ -7375,6 +7432,9 @@ async fn apply_trigger_dispatch_receipt(
                     pool_data.base_mint.clone(),
                     trigger_component.shadow_run_emit_event_bus(),
                     std::path::PathBuf::from(trigger_component.shadow_run_output_path()),
+                    shadow_lifecycle_log_path.map(std::path::Path::to_path_buf),
+                    shadow_join_key.clone(),
+                    rollout_profile.to_string(),
                     None,
                     shadow_task,
                 );
@@ -7403,8 +7463,12 @@ async fn apply_trigger_dispatch_receipt(
                     }
                     if let Err(write_err) = append_shadow_buy_report_record(
                         &shadow_log_path,
+                        shadow_lifecycle_log_path,
                         trigger_component.entry_mode(),
                         &shadow_event,
+                        &shadow_join_key,
+                        rollout_profile,
+                        crate::components::trigger::shadow_run::ShadowDispatchStatus::Failed,
                     )
                     .await
                     {
@@ -7452,8 +7516,12 @@ async fn apply_trigger_dispatch_receipt(
                     }
                     if let Err(write_err) = append_shadow_buy_report_record(
                         &shadow_log_path,
+                        shadow_lifecycle_log_path,
                         trigger_component.entry_mode(),
                         &shadow_event,
+                        &shadow_join_key,
+                        rollout_profile,
+                        crate::components::trigger::shadow_run::ShadowDispatchStatus::Failed,
                     )
                     .await
                     {
@@ -9005,6 +9073,7 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
     );
     let decision_logger_config =
         build_decision_logger_config(&normalized_decision_log_path, &gatekeeper_config);
+    let gatekeeper_rollout_profile = decision_logger_config.gatekeeper_rollout_profile.clone();
 
     // Initialize Decision Logger for cyclic engine telemetry
     let decision_logger = Arc::new(ghost_brain::oracle::DecisionLogger::new_with_health(
@@ -9200,6 +9269,7 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
         execution_mode,
         shadow_entry_log_path: std::path::PathBuf::from(shadow_entry_log_path),
         shadow_lifecycle_log_path: shadow_lifecycle_log_path.map(std::path::PathBuf::from),
+        gatekeeper_rollout_profile,
         dry_run,
         ab_window_ms: analysis_window_ms,
     });
@@ -11363,6 +11433,7 @@ mod tests {
             execution_mode: ExecutionMode::Paper,
             shadow_entry_log_path: std::path::PathBuf::from("/tmp/ghost-shadow-entry-test.jsonl"),
             shadow_lifecycle_log_path: None,
+            gatekeeper_rollout_profile: "test-rollout".to_string(),
             dry_run: true,
             ab_window_ms: 10_000,
         })
@@ -12019,6 +12090,9 @@ mod tests {
             &ctx.post_buy_epoch,
             ctx.execution_mode,
             &ctx.shadow_entry_log_path,
+            ctx.shadow_lifecycle_log_path.as_deref(),
+            "test-join",
+            &ctx.gatekeeper_rollout_profile,
             pool_id,
             resolved_pool,
             0.1,
@@ -12314,6 +12388,7 @@ mod tests {
             execution_mode: ExecutionMode::Paper,
             shadow_entry_log_path: std::path::PathBuf::from("/tmp/ghost-shadow-entry-test.jsonl"),
             shadow_lifecycle_log_path: None,
+            gatekeeper_rollout_profile: "test-rollout".to_string(),
             dry_run: true,
             ab_window_ms: 10_000,
         });
@@ -12425,6 +12500,7 @@ mod tests {
             execution_mode: ExecutionMode::Paper,
             shadow_entry_log_path: std::path::PathBuf::from("/tmp/ghost-shadow-entry-test.jsonl"),
             shadow_lifecycle_log_path: None,
+            gatekeeper_rollout_profile: "test-rollout".to_string(),
             dry_run: true,
             ab_window_ms: 10_000,
         });
@@ -13835,6 +13911,9 @@ mod tests {
             &post_buy_epoch,
             ExecutionMode::Paper,
             std::path::Path::new("/tmp/ghost-shadow-entry-test.jsonl"),
+            None,
+            "test-join",
+            "test-rollout",
             pool_id,
             &pool,
             0.1,
@@ -13944,6 +14023,9 @@ mod tests {
             &post_buy_epoch,
             ExecutionMode::Paper,
             std::path::Path::new("/tmp/ghost-shadow-entry-test.jsonl"),
+            None,
+            "test-join",
+            "test-rollout",
             pool_id,
             &pool,
             0.1,
@@ -14055,6 +14137,9 @@ mod tests {
             &post_buy_epoch,
             ExecutionMode::Paper,
             std::path::Path::new("/tmp/ghost-shadow-entry-test.jsonl"),
+            None,
+            "test-join",
+            "test-rollout",
             pool_id,
             &pool,
             0.1,
@@ -14190,6 +14275,9 @@ mod tests {
             &post_buy_epoch,
             ExecutionMode::Shadow,
             std::path::Path::new("/tmp/ghost-shadow-entry-test.jsonl"),
+            None,
+            "test-join",
+            "test-rollout",
             pool_id,
             &pool,
             0.1,
@@ -14289,6 +14377,9 @@ mod tests {
             &post_buy_epoch,
             ExecutionMode::Paper,
             std::path::Path::new("/tmp/ghost-shadow-entry-test.jsonl"),
+            None,
+            "test-join",
+            "test-rollout",
             pool_id,
             &pool,
             0.1,
@@ -14467,6 +14558,9 @@ mod tests {
             &post_buy_epoch,
             ExecutionMode::Paper,
             std::path::Path::new("/tmp/ghost-shadow-entry-test.jsonl"),
+            None,
+            "test-join",
+            "test-rollout",
             pool_id,
             &pool,
             0.1,
@@ -14615,6 +14709,8 @@ mod tests {
             &post_buy_epoch,
             ExecutionMode::Paper,
             std::path::Path::new("/tmp/ghost-shadow-entry-test.jsonl"),
+            None,
+            "test-rollout",
             pool_id,
             &pool,
             0.1,
@@ -14737,6 +14833,8 @@ mod tests {
             &post_buy_epoch,
             ExecutionMode::Paper,
             std::path::Path::new("/tmp/ghost-shadow-entry-test.jsonl"),
+            None,
+            "test-rollout",
             pool_id,
             &pool,
             0.1,
@@ -14861,6 +14959,8 @@ mod tests {
             &post_buy_epoch,
             ExecutionMode::Paper,
             std::path::Path::new("/tmp/ghost-shadow-entry-test.jsonl"),
+            None,
+            "test-rollout",
             pool_id,
             &pool,
             0.1,
@@ -14964,6 +15064,8 @@ mod tests {
             &post_buy_epoch,
             ExecutionMode::Paper,
             std::path::Path::new("/tmp/ghost-shadow-entry-test.jsonl"),
+            None,
+            "test-rollout",
             pool_id,
             &pool,
             0.1,
@@ -15062,6 +15164,8 @@ mod tests {
             &post_buy_epoch,
             ExecutionMode::Paper,
             std::path::Path::new("/tmp/ghost-shadow-entry-test.jsonl"),
+            None,
+            "test-rollout",
             pool_id,
             &pool,
             0.1,
@@ -15157,6 +15261,8 @@ mod tests {
             &post_buy_epoch,
             ExecutionMode::Paper,
             std::path::Path::new("/tmp/ghost-shadow-entry-test.jsonl"),
+            None,
+            "test-rollout",
             pool_id,
             &pool,
             0.1,
@@ -15280,6 +15386,8 @@ mod tests {
             &post_buy_epoch,
             ExecutionMode::Paper,
             std::path::Path::new("/tmp/ghost-shadow-entry-test.jsonl"),
+            None,
+            "test-rollout",
             pool_id,
             &pool,
             0.1,
@@ -16306,6 +16414,8 @@ mod tests {
             &post_buy_epoch,
             ExecutionMode::Paper,
             std::path::Path::new("/tmp/ghost-shadow-entry-test.jsonl"),
+            None,
+            "test-rollout",
             pool_id,
             &pool,
             0.1,
@@ -16409,6 +16519,8 @@ mod tests {
             &post_buy_epoch,
             ExecutionMode::Paper,
             std::path::Path::new("/tmp/ghost-shadow-entry-test.jsonl"),
+            None,
+            "test-rollout",
             pool_id,
             &pool,
             0.1,
@@ -16444,6 +16556,7 @@ mod tests {
     async fn shadow_mode_writes_canonical_shadow_entry_record_after_accepted_direct_handoff() {
         let temp = tempfile::tempdir().unwrap();
         let output_path = temp.path().join("shadow-canonical-entry.jsonl");
+        let lifecycle_path = temp.path().join("shadow_lifecycle.jsonl");
         let mut trigger_config = crate::config::TriggerComponentConfig {
             enabled: true,
             entry_mode: crate::config::TriggerEntryMode::ShadowOnly,
@@ -16554,6 +16667,8 @@ mod tests {
             &post_buy_epoch,
             ExecutionMode::Shadow,
             &output_path,
+            Some(&lifecycle_path),
+            "test-rollout",
             pool_id,
             &pool,
             0.1,
@@ -16584,6 +16699,39 @@ mod tests {
         assert_eq!(
             record.entry_price,
             0.1 / (entry_token_amount_raw as f64 / PUMP_TOKEN_DECIMAL_FACTOR)
+        );
+        let lifecycle_written = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(contents) = tokio::fs::read_to_string(&lifecycle_path).await {
+                    if !contents.trim().is_empty() {
+                        break contents;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("lifecycle record should be written");
+        let lifecycle_row: serde_json::Value = serde_json::from_str(
+            lifecycle_written
+                .lines()
+                .next()
+                .expect("one lifecycle record"),
+        )
+        .expect("deserialize lifecycle record");
+        assert_eq!(lifecycle_row["record_type"], "shadow_dispatch");
+        assert_eq!(lifecycle_row["dispatch_status"], "closed");
+        assert_eq!(
+            lifecycle_row["join_key"],
+            format!("{pool_id}:{}:1000", pool.base_mint)
+        );
+        assert_eq!(lifecycle_row["rollout_profile"], "test-rollout");
+        assert!(
+            lifecycle_row["idempotency_key"]
+                .as_str()
+                .unwrap_or_default()
+                .len()
+                > 10
         );
         assert!(tracker.release(slot_id));
     }
@@ -16700,6 +16848,8 @@ mod tests {
             &post_buy_epoch,
             ExecutionMode::Shadow,
             &output_path,
+            None,
+            "test-rollout",
             pool_id,
             &pool,
             0.1,

@@ -130,8 +130,7 @@ pub fn evaluate_aps(
     // adaptive_thresholds_applied: only true when adaptive_enabled is on,
     // regime is not Normal, and live_execution is still false (shadow-first).
     // This allows V2.5 shadow plane to react to regime without touching legacy.
-    let thresholds_applied = config.adaptive_enabled
-        && regime != MarketRegime::Normal;
+    let thresholds_applied = config.adaptive_enabled && regime != MarketRegime::Normal;
 
     // Telemetry: record regime distribution (provisional).
     crate::oracle_metrics::record_aps_regime(regime.as_str());

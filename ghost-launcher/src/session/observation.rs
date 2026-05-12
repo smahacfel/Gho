@@ -388,8 +388,9 @@ impl PoolObservationSession {
             .max(curve_dynamics.max_single_sell_impact_pct);
         materialized.checkpoint_features.trajectory_assessment =
             self.gatekeeper_buffer.current_materialized_trajectory();
-        materialized.tx_segment_sequence =
-            self.gatekeeper_buffer.current_segment_sequence_from_config();
+        materialized.tx_segment_sequence = self
+            .gatekeeper_buffer
+            .current_segment_sequence_from_config();
         materialized.curve_readiness = self.current_curve_readiness();
 
         if materialized

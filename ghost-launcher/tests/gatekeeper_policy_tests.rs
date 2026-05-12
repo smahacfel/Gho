@@ -1121,8 +1121,12 @@ fn timeout_decision_does_not_claim_phase1_timeout_after_phase1_passed() {
     );
     assert!(!decision.verdict_buy);
     assert!(decision.core1_passed);
-    assert!(decision.reason_chain.starts_with("TIMEOUT_DEADLINE_LOW_PHASES:"));
-    assert!(!decision.reason_chain.contains("TIMEOUT_PHASE1_INSUFFICIENT:"));
+    assert!(decision
+        .reason_chain
+        .starts_with("TIMEOUT_DEADLINE_LOW_PHASES:"));
+    assert!(!decision
+        .reason_chain
+        .contains("TIMEOUT_PHASE1_INSUFFICIENT:"));
 }
 
 #[test]

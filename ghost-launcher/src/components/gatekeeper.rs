@@ -1334,12 +1334,18 @@ impl GatekeeperAssessment {
         // P4 availability guard: return None when required inputs are missing
         if config.tas.enabled {
             let (tas_ok, _) = self.tas_availability(config);
-            if !tas_ok.unwrap_or(false) { return None; }
+            if !tas_ok.unwrap_or(false) {
+                return None;
+            }
         }
         if config.pdd.enabled {
             let pdd_seq_ok = self.pdd_sequence_signals_available(config);
-            let needs_sequence = config.pdd.spike_detection_enabled || config.pdd.ramping_detection_enabled || config.pdd.flash_crash_protection_enabled;
-            if needs_sequence && !pdd_seq_ok.unwrap_or(true) { return None; }
+            let needs_sequence = config.pdd.spike_detection_enabled
+                || config.pdd.ramping_detection_enabled
+                || config.pdd.flash_crash_protection_enabled;
+            if needs_sequence && !pdd_seq_ok.unwrap_or(true) {
+                return None;
+            }
         }
 
         // 1. base_quality: fraction of phases passed
@@ -1440,7 +1446,10 @@ impl GatekeeperAssessment {
                     "partial_inputs"
                 }
             } else {
-                let obs_dur = self.feature_snapshot.session_metadata.observation_duration_ms;
+                let obs_dur = self
+                    .feature_snapshot
+                    .session_metadata
+                    .observation_duration_ms;
                 let tx_count = self.feature_snapshot.tx_intel_features.tx_count as usize;
                 if obs_dur < config.tas.tas_min_total_duration_ms {
                     "insufficient_duration"
@@ -1461,7 +1470,9 @@ impl GatekeeperAssessment {
     }
 
     pub fn pdd_sequence_signals_available(&self, config: &GatekeeperV2Config) -> Option<bool> {
-        if !config.pdd.enabled { return None; }
+        if !config.pdd.enabled {
+            return None;
+        }
         if let Some(ref seq) = self.feature_snapshot.tx_segment_sequence {
             Some(seq.min_tx_per_segment_satisfied)
         } else if self.uses_materialized_feature_path() {
@@ -1471,21 +1482,39 @@ impl GatekeeperAssessment {
         }
     }
 
-    pub fn pdd_sequence_signals_availability(&self, config: &GatekeeperV2Config) -> (Option<bool>, Option<String>) {
+    pub fn pdd_sequence_signals_availability(
+        &self,
+        config: &GatekeeperV2Config,
+    ) -> (Option<bool>, Option<String>) {
         let available = self.pdd_sequence_signals_available(config);
         let reason = if !available.unwrap_or(true) {
             if let Some(ref seq) = self.feature_snapshot.tx_segment_sequence {
-                if seq.total_duration_ms < config.tas.tas_min_total_duration_ms { Some("insufficient_duration".to_string()) }
-                else if !seq.min_tx_per_segment_satisfied { Some("insufficient_tx_per_segment".to_string()) }
-                else { Some("partial_inputs".to_string()) }
+                if seq.total_duration_ms < config.tas.tas_min_total_duration_ms {
+                    Some("insufficient_duration".to_string())
+                } else if !seq.min_tx_per_segment_satisfied {
+                    Some("insufficient_tx_per_segment".to_string())
+                } else {
+                    Some("partial_inputs".to_string())
+                }
             } else if self.uses_materialized_feature_path() {
-                let obs_dur = self.feature_snapshot.session_metadata.observation_duration_ms;
+                let obs_dur = self
+                    .feature_snapshot
+                    .session_metadata
+                    .observation_duration_ms;
                 let tx_count = self.feature_snapshot.tx_intel_features.tx_count as usize;
-                if obs_dur < config.tas.tas_min_total_duration_ms { Some("insufficient_duration".to_string()) }
-                else if tx_count < config.tas.tas_min_tx_per_segment.saturating_mul(3) { Some("insufficient_tx_per_segment".to_string()) }
-                else { Some("missing_sequence".to_string()) }
-            } else { Some("pdd_sequence_unavailable".to_string()) }
-        } else { None };
+                if obs_dur < config.tas.tas_min_total_duration_ms {
+                    Some("insufficient_duration".to_string())
+                } else if tx_count < config.tas.tas_min_tx_per_segment.saturating_mul(3) {
+                    Some("insufficient_tx_per_segment".to_string())
+                } else {
+                    Some("missing_sequence".to_string())
+                }
+            } else {
+                Some("pdd_sequence_unavailable".to_string())
+            }
+        } else {
+            None
+        };
         (available, reason)
     }
 
@@ -1515,7 +1544,9 @@ impl GatekeeperAssessment {
             if config.tas.enabled && self.trajectory.is_none() {
                 let (_, tas_reason) = self.tas_availability(config);
                 tas_reason.unwrap_or_else(|| "tas_unavailable".to_string())
-            } else if config.pdd.enabled && !self.pdd_sequence_signals_available(config).unwrap_or(true) {
+            } else if config.pdd.enabled
+                && !self.pdd_sequence_signals_available(config).unwrap_or(true)
+            {
                 let (_, pdd_reason) = self.pdd_sequence_signals_availability(config);
                 pdd_reason.unwrap_or_else(|| "pdd_sequence_unavailable".to_string())
             } else {
@@ -1526,9 +1557,13 @@ impl GatekeeperAssessment {
                 }
                 if config.pdd.enabled {
                     let (pdd_ok, _) = self.pdd_sequence_signals_availability(config);
-                    if !pdd_ok.unwrap_or(true) { missing.push("pdd_sequence"); }
+                    if !pdd_ok.unwrap_or(true) {
+                        missing.push("pdd_sequence");
+                    }
                     let anchor_ok = self.pdd_price_anchor_available(config).unwrap_or(true);
-                    if !anchor_ok { missing.push("pdd_price_anchor"); }
+                    if !anchor_ok {
+                        missing.push("pdd_price_anchor");
+                    }
                 }
                 if missing.is_empty() {
                     "partial_inputs".to_string()
@@ -1642,42 +1677,102 @@ impl GatekeeperAssessment {
         _config: &GatekeeperV2Config,
     ) -> Option<ghost_brain::oracle::reason_code::GatekeeperReasonCode> {
         use ghost_brain::oracle::reason_code::GatekeeperReasonCode as Rc;
-        if self.decision.is_none() && self.total_tx_evaluated == 0 { return Some(Rc::TimeoutPhase1NoData); }
-        if self.decision.is_none() && self.phases_passed == 0 { return Some(Rc::TimeoutPhase1Insufficient); }
+        if self.decision.is_none() && self.total_tx_evaluated == 0 {
+            return Some(Rc::TimeoutPhase1NoData);
+        }
+        if self.decision.is_none() && self.phases_passed == 0 {
+            return Some(Rc::TimeoutPhase1Insufficient);
+        }
         // Hard fails take priority over timeout when assessment detected a hard fail
         // but no three-layer decision was computed (e.g. build_assessment_from_features).
         if self.decision.is_none() && self.hard_reject_reason.is_some() {
             let reason = self.hard_reject_reason.as_ref().unwrap();
-            if reason.contains("dev_has_sold") { return Some(Rc::HardFailDevSold); }
-            if reason.contains("market_cap") { return Some(Rc::HardFailMarketCap); }
-            if reason.contains("hhi") { return Some(Rc::HardFailExtremeHhi); }
-            if reason.contains("same_ms") || reason.contains("bundl") { return Some(Rc::HardFailExtremeBundling); }
-            if reason.contains("top3") { return Some(Rc::HardFailExtremeTop3); }
-            if reason.contains("bot") || reason.contains("bot_timing") { return Some(Rc::HardFailExtremeBotTiming); }
-            if reason.contains("failed_tx") || reason.contains("failed TX") { return Some(Rc::HardFailFailedTxRatio); }
-            if reason.contains("slow_pool") || reason.contains("avg_interval") { return Some(Rc::HardFailSlowPool); }
-            if reason.contains("sell_impact") { return Some(Rc::HardFailSellImpact); }
-            if reason.contains("tx_price_impact") { return Some(Rc::HardFailTxPriceImpact); }
-            if reason.contains("price_change_ratio") || reason.contains("price_change") { return Some(Rc::HardFailPriceChange); }
-            if reason.contains("HARD_FAIL") { return Some(Rc::RejectCoreFail); }
+            if reason.contains("dev_has_sold") {
+                return Some(Rc::HardFailDevSold);
+            }
+            if reason.contains("market_cap") {
+                return Some(Rc::HardFailMarketCap);
+            }
+            if reason.contains("hhi") {
+                return Some(Rc::HardFailExtremeHhi);
+            }
+            if reason.contains("same_ms") || reason.contains("bundl") {
+                return Some(Rc::HardFailExtremeBundling);
+            }
+            if reason.contains("top3") {
+                return Some(Rc::HardFailExtremeTop3);
+            }
+            if reason.contains("bot") || reason.contains("bot_timing") {
+                return Some(Rc::HardFailExtremeBotTiming);
+            }
+            if reason.contains("failed_tx") || reason.contains("failed TX") {
+                return Some(Rc::HardFailFailedTxRatio);
+            }
+            if reason.contains("slow_pool") || reason.contains("avg_interval") {
+                return Some(Rc::HardFailSlowPool);
+            }
+            if reason.contains("sell_impact") {
+                return Some(Rc::HardFailSellImpact);
+            }
+            if reason.contains("tx_price_impact") {
+                return Some(Rc::HardFailTxPriceImpact);
+            }
+            if reason.contains("price_change_ratio") || reason.contains("price_change") {
+                return Some(Rc::HardFailPriceChange);
+            }
+            if reason.contains("HARD_FAIL") {
+                return Some(Rc::RejectCoreFail);
+            }
         }
-        if self.decision.is_none() && self.phase1_passed { return Some(Rc::TimeoutDeadlineLowPhases); }
-        if self.decision.is_none() { return Some(Rc::InvariantTimeoutNoVerdict); }
+        if self.decision.is_none() && self.phase1_passed {
+            return Some(Rc::TimeoutDeadlineLowPhases);
+        }
+        if self.decision.is_none() {
+            return Some(Rc::InvariantTimeoutNoVerdict);
+        }
         if let Some(ref reason) = self.hard_reject_reason {
-            if reason.contains("dev_has_sold") { return Some(Rc::HardFailDevSold); }
-            if reason.contains("market_cap") { return Some(Rc::HardFailMarketCap); }
-            if reason.contains("hhi") { return Some(Rc::HardFailExtremeHhi); }
-            if reason.contains("same_ms") || reason.contains("bundl") { return Some(Rc::HardFailExtremeBundling); }
-            if reason.contains("top3") { return Some(Rc::HardFailExtremeTop3); }
-            if reason.contains("bot") || reason.contains("bot_timing") { return Some(Rc::HardFailExtremeBotTiming); }
-            if reason.contains("failed_tx") || reason.contains("failed TX") { return Some(Rc::HardFailFailedTxRatio); }
-            if reason.contains("slow_pool") || reason.contains("avg_interval") { return Some(Rc::HardFailSlowPool); }
-            if reason.contains("sell_impact") { return Some(Rc::HardFailSellImpact); }
-            if reason.contains("tx_price_impact") { return Some(Rc::HardFailTxPriceImpact); }
-            if reason.contains("price_change_ratio") || reason.contains("price_change") { return Some(Rc::HardFailPriceChange); }
-            if reason.contains("HARD_FAIL") { return Some(Rc::RejectCoreFail); }
+            if reason.contains("dev_has_sold") {
+                return Some(Rc::HardFailDevSold);
+            }
+            if reason.contains("market_cap") {
+                return Some(Rc::HardFailMarketCap);
+            }
+            if reason.contains("hhi") {
+                return Some(Rc::HardFailExtremeHhi);
+            }
+            if reason.contains("same_ms") || reason.contains("bundl") {
+                return Some(Rc::HardFailExtremeBundling);
+            }
+            if reason.contains("top3") {
+                return Some(Rc::HardFailExtremeTop3);
+            }
+            if reason.contains("bot") || reason.contains("bot_timing") {
+                return Some(Rc::HardFailExtremeBotTiming);
+            }
+            if reason.contains("failed_tx") || reason.contains("failed TX") {
+                return Some(Rc::HardFailFailedTxRatio);
+            }
+            if reason.contains("slow_pool") || reason.contains("avg_interval") {
+                return Some(Rc::HardFailSlowPool);
+            }
+            if reason.contains("sell_impact") {
+                return Some(Rc::HardFailSellImpact);
+            }
+            if reason.contains("tx_price_impact") {
+                return Some(Rc::HardFailTxPriceImpact);
+            }
+            if reason.contains("price_change_ratio") || reason.contains("price_change") {
+                return Some(Rc::HardFailPriceChange);
+            }
+            if reason.contains("HARD_FAIL") {
+                return Some(Rc::RejectCoreFail);
+            }
         }
-        if let Some(ref pdd) = self.pdd_assessment { if let Some(ref fail) = pdd.hard_fail { return Rc::from_pdd_hard_fail(fail.as_str()); } }
+        if let Some(ref pdd) = self.pdd_assessment {
+            if let Some(ref fail) = pdd.hard_fail {
+                return Rc::from_pdd_hard_fail(fail.as_str());
+            }
+        }
         let decision = self.decision.as_ref()?;
         if decision.verdict_buy {
             return match self.observation_stage {
@@ -1686,23 +1781,31 @@ impl GatekeeperAssessment {
                 _ => Some(Rc::BuyNormal),
             };
         }
-        if decision.reason_chain.contains("REJECT_LOW_TRAJECTORY") { return Some(Rc::RejectLowTrajectory); }
+        if decision.reason_chain.contains("REJECT_LOW_TRAJECTORY") {
+            return Some(Rc::RejectLowTrajectory);
+        }
         let tag = decision.verdict_type.tag();
-        if let Some(rc) = Rc::from_iwim_verdict(tag) { return Some(rc); }
+        if let Some(rc) = Rc::from_iwim_verdict(tag) {
+            return Some(rc);
+        }
         match tag {
             "TIMEOUT_PHASE1_NO_DATA" | "TIMEOUT_NO_DATA" => Some(Rc::TimeoutPhase1NoData),
             "TIMEOUT_PHASE1_INSUFFICIENT" | "TIMEOUT_PHASE1" => Some(Rc::TimeoutPhase1Insufficient),
             "TIMEOUT_DEADLINE_LOW_PHASES" => Some(Rc::TimeoutDeadlineLowPhases),
             "REJECT_HARD_FAIL" => Some(Rc::RejectCoreFail),
-            "REJECT_CORE_FAIL" => Some(Rc::RejectCoreFail), "REJECT_SYBIL_COMBO" => Some(Rc::RejectSybilCombo),
+            "REJECT_CORE_FAIL" => Some(Rc::RejectCoreFail),
+            "REJECT_SYBIL_COMBO" => Some(Rc::RejectSybilCombo),
             "REJECT_SYBIL_INTERFERENCE" => Some(Rc::RejectSybilInterference),
-            "REJECT_SYBIL_SOFT_EXCESS" => Some(Rc::RejectSybilSoftExcess), "REJECT_SOFT_EXCESS" => Some(Rc::RejectLegacySoftExcess),
-            "REJECT_LOW_ALPHA" => Some(Rc::RejectLowAlpha), "REJECT_LOW_PROSPERITY" => Some(Rc::RejectLowProsperity),
+            "REJECT_SYBIL_SOFT_EXCESS" => Some(Rc::RejectSybilSoftExcess),
+            "REJECT_SOFT_EXCESS" => Some(Rc::RejectLegacySoftExcess),
+            "REJECT_LOW_ALPHA" => Some(Rc::RejectLowAlpha),
+            "REJECT_LOW_PROSPERITY" => Some(Rc::RejectLowProsperity),
             "REJECT_ENTRY_DRIFT" => Some(Rc::RejectPddEntryDrift),
             "REJECT_FLASH_CRASH" => Some(Rc::RejectPddFlashCrash),
             "REJECT_RAMPING" => Some(Rc::RejectPddRamping),
             "REJECT_LOW_TRAJECTORY" => Some(Rc::RejectLowTrajectory),
-            "REJECT_INSUFFICIENT_CONFIDENCE" => Some(Rc::RejectInsufficientConfidence), "BUY" => Some(Rc::BuyNormal),
+            "REJECT_INSUFFICIENT_CONFIDENCE" => Some(Rc::RejectInsufficientConfidence),
+            "BUY" => Some(Rc::BuyNormal),
             "EARLY_BUY" => Some(Rc::BuyEarly),
             _ => None,
         }
@@ -1758,16 +1861,32 @@ impl GatekeeperAssessment {
             let reason = if self.total_tx_evaluated == 0 {
                 "TIMEOUT: Phase 1 never met — zero transactions ingested".to_string()
             } else if !self.phase1_passed {
-                format!("TIMEOUT: Phase 1 insufficient — tx={}/{} signers={}/{} buys={}/{}",
-                    self.total_tx_evaluated, config.min_tx_count, self.unique_signers_evaluated, config.min_unique_signers, self.buy_count, config.min_buy_count)
+                format!(
+                    "TIMEOUT: Phase 1 insufficient — tx={}/{} signers={}/{} buys={}/{}",
+                    self.total_tx_evaluated,
+                    config.min_tx_count,
+                    self.unique_signers_evaluated,
+                    config.min_unique_signers,
+                    self.buy_count,
+                    config.min_buy_count
+                )
             } else {
-                format!("TIMEOUT: deadline reached, phases={}/{}", self.phases_passed, config.min_phases_to_pass)
+                format!(
+                    "TIMEOUT: deadline reached, phases={}/{}",
+                    self.phases_passed, config.min_phases_to_pass
+                )
             };
-            let vtype = if self.total_tx_evaluated == 0 { "TIMEOUT_PHASE1_NO_DATA" }
-            else if !self.phase1_passed { "TIMEOUT_PHASE1_INSUFFICIENT" }
-            else { "TIMEOUT_DEADLINE_LOW_PHASES" };
+            let vtype = if self.total_tx_evaluated == 0 {
+                "TIMEOUT_PHASE1_NO_DATA"
+            } else if !self.phase1_passed {
+                "TIMEOUT_PHASE1_INSUFFICIENT"
+            } else {
+                "TIMEOUT_DEADLINE_LOW_PHASES"
+            };
             (Some(reason), Some(vtype.to_string()))
-        } else { (None, None) };
+        } else {
+            (None, None)
+        };
         let v25_terminal_shadow = self.v25_shadow_decisions.last();
         let v25_confidence_breakdown = self.v25_confidence_breakdown(config);
         let v25_model_confidence = self
@@ -2208,9 +2327,13 @@ impl GatekeeperAssessment {
             prosperity_overlay_branch2_max_price_change_ratio: (config.enable_prosperity_filter
                 && config.enable_prosperity_overlay)
                 .then_some(config.prosperity_overlay_branch2_max_price_change_ratio),
-            decision_reason: legacy_live_reason_chain.clone().or_else(|| decision_reason_fallback.clone()),
+            decision_reason: legacy_live_reason_chain
+                .clone()
+                .or_else(|| decision_reason_fallback.clone()),
             decision_verdict_buy: legacy_live_verdict_buy,
-            verdict_type: legacy_live_verdict_type.clone().or_else(|| verdict_type_fallback.clone()),
+            verdict_type: legacy_live_verdict_type
+                .clone()
+                .or_else(|| verdict_type_fallback.clone()),
             legacy_live_reason_chain,
             legacy_live_verdict_buy,
             legacy_live_verdict_type,
@@ -2526,7 +2649,12 @@ impl GatekeeperAssessment {
                     Some(flags.join(","))
                 }
             }),
-            reason_code: self.derive_reason_code(config).map(|rc| serde_json::to_string(&rc).unwrap_or_else(|_| "SERIALIZATION_ERROR".to_string()).trim_matches('"').to_string()),
+            reason_code: self.derive_reason_code(config).map(|rc| {
+                serde_json::to_string(&rc)
+                    .unwrap_or_else(|_| "SERIALIZATION_ERROR".to_string())
+                    .trim_matches('"')
+                    .to_string()
+            }),
             reason_code_version: ghost_brain::oracle::reason_code::GatekeeperReasonCode::version(),
             shadow_pdd_reject_reason: self
                 .v25_shadow_decisions
@@ -3673,8 +3801,10 @@ impl GatekeeperBuffer {
         }
 
         if !assessment.phase1_passed {
-            let timeout_decision =
-                super::gatekeeper_policy::build_timeout_decision_from_assessment(&assessment, config);
+            let timeout_decision = super::gatekeeper_policy::build_timeout_decision_from_assessment(
+                &assessment,
+                config,
+            );
             assessment.hard_reject_reason = timeout_decision.hard_fail_reason.clone();
             assessment.decision = Some(timeout_decision);
             assessment.cache_v25_confidence(config);
@@ -5614,7 +5744,8 @@ impl GatekeeperBuffer {
                         compute_tas_modulator, evaluate_trajectory,
                     };
                     let tas_score = evaluate_trajectory(traj);
-                    (base_confidence * compute_tas_modulator(tas_score, &self.config.tas)).clamp(0.0, 1.0)
+                    (base_confidence * compute_tas_modulator(tas_score, &self.config.tas))
+                        .clamp(0.0, 1.0)
                 } else {
                     base_confidence
                 }
@@ -5894,7 +6025,9 @@ impl GatekeeperBuffer {
     /// Invariant enforced at config load: extended_window_ms <= max_wait_time_ms.
     /// Returns `true` if at least one checkpoint was fired.
     pub fn maybe_fire_shadow_checkpoint(&mut self, now_wall_ms: u64) -> bool {
-        if self.config.dow.enabled && self.config.dow.extended_window_ms > self.config.max_wait_time_ms {
+        if self.config.dow.enabled
+            && self.config.dow.extended_window_ms > self.config.max_wait_time_ms
+        {
             panic!(
                 "P0 invariant violated: dow.extended_window_ms ({}) > max_wait_time_ms ({})",
                 self.config.dow.extended_window_ms, self.config.max_wait_time_ms
@@ -6017,7 +6150,9 @@ impl GatekeeperBuffer {
     /// Build segment sequence using TAS thresholds but independently of tas.enabled.
     /// PDD sequence signals (spike/ramping/flash) also depend on this data, so the
     /// sequence must be materialized even when TAS scoring is disabled.
-    pub fn current_segment_sequence_from_config(&self) -> Option<ghost_core::checkpoint::TxSegmentSequence> {
+    pub fn current_segment_sequence_from_config(
+        &self,
+    ) -> Option<ghost_core::checkpoint::TxSegmentSequence> {
         // Use TAS config for segment division thresholds (min TX per segment, min duration)
         // but do NOT gate on tas.enabled — PDD sequence also needs this data.
         let min_tx_per_seg = self.config.tas.tas_min_tx_per_segment;
@@ -6036,9 +6171,13 @@ impl GatekeeperBuffer {
         let first_ts = self.first_tx_ts_ms()?;
         let last_ts = self.highest_seen_ts_ms();
         let duration_ms = last_ts.saturating_sub(first_ts);
-        if duration_ms < min_total_duration_ms { return None; }
+        if duration_ms < min_total_duration_ms {
+            return None;
+        }
         let min_total_tx = min_tx_per_segment.saturating_mul(3);
-        if self.total_tx_count < min_total_tx { return None; }
+        if self.total_tx_count < min_total_tx {
+            return None;
+        }
         let seg_dur = duration_ms as f64 / 3.0;
         let t0_end = first_ts.saturating_add(seg_dur as u64);
         let t1_end = first_ts.saturating_add((2.0 * seg_dur) as u64);
@@ -6047,29 +6186,68 @@ impl GatekeeperBuffer {
         let mut seg2: Vec<&PoolTransaction> = Vec::new();
         for btx in &self.buffered_txs {
             let ts = btx.tx.timestamp_ms;
-            if ts <= t0_end { seg0.push(&btx.tx); }
-            else if ts <= t1_end { seg1.push(&btx.tx); }
-            else { seg2.push(&btx.tx); }
+            if ts <= t0_end {
+                seg0.push(&btx.tx);
+            } else if ts <= t1_end {
+                seg1.push(&btx.tx);
+            } else {
+                seg2.push(&btx.tx);
+            }
         }
-        let min_satisfied = seg0.len() >= min_tx_per_segment && seg1.len() >= min_tx_per_segment && seg2.len() >= min_tx_per_segment;
+        let min_satisfied = seg0.len() >= min_tx_per_segment
+            && seg1.len() >= min_tx_per_segment
+            && seg2.len() >= min_tx_per_segment;
         fn snapshot(seg: &[&PoolTransaction]) -> TrajectorySegmentSnapshot {
             let built = build_segment(seg);
-            let max_pip = seg.iter().map(|tx| tx.sol_amount_lamports.unwrap_or(0) as f64).fold(0.0_f64, |a, b| a.max(b));
-            let buys: Vec<u64> = seg.iter().filter(|tx| tx.is_buy).filter_map(|tx| tx.sol_amount_lamports).collect();
+            let max_pip = seg
+                .iter()
+                .map(|tx| tx.sol_amount_lamports.unwrap_or(0) as f64)
+                .fold(0.0_f64, |a, b| a.max(b));
+            let buys: Vec<u64> = seg
+                .iter()
+                .filter(|tx| tx.is_buy)
+                .filter_map(|tx| tx.sol_amount_lamports)
+                .collect();
             let mut max_streak: u32 = 0;
             for i in 0..buys.len() {
                 let mut streak: u32 = 1;
                 let anchor = buys[i];
                 for j in (i + 1)..buys.len() {
-                    let diff = if anchor > buys[j] { anchor - buys[j] } else { buys[j] - anchor };
-                    let pct = if anchor > 0 { diff as f64 / anchor as f64 } else { 1.0 };
-                    if pct <= 0.15 { streak += 1; } else { break; }
+                    let diff = if anchor > buys[j] {
+                        anchor - buys[j]
+                    } else {
+                        buys[j] - anchor
+                    };
+                    let pct = if anchor > 0 {
+                        diff as f64 / anchor as f64
+                    } else {
+                        1.0
+                    };
+                    if pct <= 0.15 {
+                        streak += 1;
+                    } else {
+                        break;
+                    }
                 }
                 max_streak = max_streak.max(streak);
             }
-            TrajectorySegmentSnapshot { tx_count: built.tx_count as u64, buy_ratio: built.buy_ratio, avg_interval_ms: built.avg_interval_ms, total_volume_sol: built.total_volume_sol, hhi: built.hhi, max_single_tx_sol: max_pip / 1e9, same_size_streak: max_streak }
+            TrajectorySegmentSnapshot {
+                tx_count: built.tx_count as u64,
+                buy_ratio: built.buy_ratio,
+                avg_interval_ms: built.avg_interval_ms,
+                total_volume_sol: built.total_volume_sol,
+                hhi: built.hhi,
+                max_single_tx_sol: max_pip / 1e9,
+                same_size_streak: max_streak,
+            }
         }
-        Some(ghost_core::checkpoint::TxSegmentSequence { t0_segment: snapshot(&seg0), t1_segment: snapshot(&seg1), t2_segment: snapshot(&seg2), total_duration_ms: duration_ms, min_tx_per_segment_satisfied: min_satisfied })
+        Some(ghost_core::checkpoint::TxSegmentSequence {
+            t0_segment: snapshot(&seg0),
+            t1_segment: snapshot(&seg1),
+            t2_segment: snapshot(&seg2),
+            total_duration_ms: duration_ms,
+            min_tx_per_segment_satisfied: min_satisfied,
+        })
     }
 
     pub fn current_materialized_trajectory(
@@ -6080,16 +6258,25 @@ impl GatekeeperBuffer {
     }
 
     #[must_use]
-    pub fn current_segment_sequence(&self, config: &TrajectoryAwareScoringConfig) -> Option<ghost_core::checkpoint::TxSegmentSequence> {
+    pub fn current_segment_sequence(
+        &self,
+        config: &TrajectoryAwareScoringConfig,
+    ) -> Option<ghost_core::checkpoint::TxSegmentSequence> {
         use crate::components::gatekeeper_trajectory::build_segment;
         use ghost_core::checkpoint::TrajectorySegmentSnapshot;
-        if !config.enabled { return None; }
+        if !config.enabled {
+            return None;
+        }
         let first_ts = self.first_tx_ts_ms()?;
         let last_ts = self.highest_seen_ts_ms();
         let duration_ms = last_ts.saturating_sub(first_ts);
-        if duration_ms < config.tas_min_total_duration_ms { return None; }
+        if duration_ms < config.tas_min_total_duration_ms {
+            return None;
+        }
         let min_total_tx = config.tas_min_tx_per_segment.saturating_mul(3);
-        if self.total_tx_count < min_total_tx { return None; }
+        if self.total_tx_count < min_total_tx {
+            return None;
+        }
         let seg_dur = duration_ms as f64 / 3.0;
         let t0_end = first_ts.saturating_add(seg_dur as u64);
         let t1_end = first_ts.saturating_add((2.0 * seg_dur) as u64);
@@ -6098,30 +6285,68 @@ impl GatekeeperBuffer {
         let mut seg2: Vec<&PoolTransaction> = Vec::new();
         for btx in &self.buffered_txs {
             let ts = btx.tx.timestamp_ms;
-            if ts <= t0_end { seg0.push(&btx.tx); }
-            else if ts <= t1_end { seg1.push(&btx.tx); }
-            else { seg2.push(&btx.tx); }
+            if ts <= t0_end {
+                seg0.push(&btx.tx);
+            } else if ts <= t1_end {
+                seg1.push(&btx.tx);
+            } else {
+                seg2.push(&btx.tx);
+            }
         }
         let min_per_seg = config.tas_min_tx_per_segment;
-        let min_satisfied = seg0.len() >= min_per_seg && seg1.len() >= min_per_seg && seg2.len() >= min_per_seg;
+        let min_satisfied =
+            seg0.len() >= min_per_seg && seg1.len() >= min_per_seg && seg2.len() >= min_per_seg;
         fn snapshot(seg: &[&PoolTransaction]) -> TrajectorySegmentSnapshot {
             let built = build_segment(seg);
-            let max_pip = seg.iter().map(|tx| tx.sol_amount_lamports.unwrap_or(0) as f64).fold(0.0_f64, |a, b| a.max(b));
-            let buys: Vec<u64> = seg.iter().filter(|tx| tx.is_buy).filter_map(|tx| tx.sol_amount_lamports).collect();
+            let max_pip = seg
+                .iter()
+                .map(|tx| tx.sol_amount_lamports.unwrap_or(0) as f64)
+                .fold(0.0_f64, |a, b| a.max(b));
+            let buys: Vec<u64> = seg
+                .iter()
+                .filter(|tx| tx.is_buy)
+                .filter_map(|tx| tx.sol_amount_lamports)
+                .collect();
             let mut max_streak: u32 = 0;
             for i in 0..buys.len() {
                 let mut streak: u32 = 1;
                 let anchor = buys[i];
                 for j in (i + 1)..buys.len() {
-                    let diff = if anchor > buys[j] { anchor - buys[j] } else { buys[j] - anchor };
-                    let pct = if anchor > 0 { diff as f64 / anchor as f64 } else { 1.0 };
-                    if pct <= 0.15 { streak += 1; } else { break; }
+                    let diff = if anchor > buys[j] {
+                        anchor - buys[j]
+                    } else {
+                        buys[j] - anchor
+                    };
+                    let pct = if anchor > 0 {
+                        diff as f64 / anchor as f64
+                    } else {
+                        1.0
+                    };
+                    if pct <= 0.15 {
+                        streak += 1;
+                    } else {
+                        break;
+                    }
                 }
                 max_streak = max_streak.max(streak);
             }
-            TrajectorySegmentSnapshot { tx_count: built.tx_count as u64, buy_ratio: built.buy_ratio, avg_interval_ms: built.avg_interval_ms, total_volume_sol: built.total_volume_sol, hhi: built.hhi, max_single_tx_sol: max_pip / 1e9, same_size_streak: max_streak }
+            TrajectorySegmentSnapshot {
+                tx_count: built.tx_count as u64,
+                buy_ratio: built.buy_ratio,
+                avg_interval_ms: built.avg_interval_ms,
+                total_volume_sol: built.total_volume_sol,
+                hhi: built.hhi,
+                max_single_tx_sol: max_pip / 1e9,
+                same_size_streak: max_streak,
+            }
         }
-        Some(ghost_core::checkpoint::TxSegmentSequence { t0_segment: snapshot(&seg0), t1_segment: snapshot(&seg1), t2_segment: snapshot(&seg2), total_duration_ms: duration_ms, min_tx_per_segment_satisfied: min_satisfied })
+        Some(ghost_core::checkpoint::TxSegmentSequence {
+            t0_segment: snapshot(&seg0),
+            t1_segment: snapshot(&seg1),
+            t2_segment: snapshot(&seg2),
+            total_duration_ms: duration_ms,
+            min_tx_per_segment_satisfied: min_satisfied,
+        })
     }
 
     /// No sliding-window cleanup is performed so the assessment covers the
@@ -12552,7 +12777,10 @@ mod tests {
         let extended = buf
             .v25_shadow_decisions
             .iter()
-            .filter(|d| d.window == ObservationStage::Extended && d.kind != ShadowDecisionKind::InsufficientData)
+            .filter(|d| {
+                d.window == ObservationStage::Extended
+                    && d.kind != ShadowDecisionKind::InsufficientData
+            })
             .last()
             .expect("expected meaningful extended shadow decision");
 
@@ -12564,7 +12792,9 @@ mod tests {
         // - Deadline fallback (check_long_deadline): "EXTENDED_SHADOW_DEADLINE_FALLBACK_REJECT_PDD_{FAIL_TAG}: ..."
         let reason_valid = extended.reason.contains("PDD_ENTRY_DRIFT")
             || extended.reason.contains("EXTENDED_REJECT_PDD_")
-            || extended.reason.contains("EXTENDED_SHADOW_DEADLINE_FALLBACK_REJECT_PDD_");
+            || extended
+                .reason
+                .contains("EXTENDED_SHADOW_DEADLINE_FALLBACK_REJECT_PDD_");
         assert!(
             reason_valid,
             "expected explicit extended PDD reject reason, got {}",

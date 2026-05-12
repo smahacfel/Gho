@@ -42,11 +42,7 @@ impl Default for ShadowPayerStrategy {
 
 /// Generate an idempotency key for a shadow dispatch.
 /// Uses blake3(pool_id || join_key || rollout_profile) for dedup.
-pub fn make_shadow_idempotency_key(
-    pool_id: &str,
-    join_key: &str,
-    rollout_profile: &str,
-) -> String {
+pub fn make_shadow_idempotency_key(pool_id: &str, join_key: &str, rollout_profile: &str) -> String {
     let mut hasher = Hasher::new();
     hasher.update(pool_id.as_bytes());
     hasher.update(b":");
@@ -54,6 +50,114 @@ pub fn make_shadow_idempotency_key(
     hasher.update(b":");
     hasher.update(rollout_profile.as_bytes());
     hasher.finalize().to_hex().to_string()
+}
+
+pub fn make_shadow_join_key(pool_id: &str, base_mint: &str, first_seen_ts_ms: u64) -> String {
+    format!("{pool_id}:{base_mint}:{first_seen_ts_ms}")
+}
+
+pub fn derive_shadow_rollout_profile_from_path(path: &Path) -> String {
+    let mut previous = None::<String>;
+    for component in path.components() {
+        let current = component.as_os_str().to_string_lossy();
+        if previous.as_deref() == Some("rollout") && !current.is_empty() {
+            return current.into_owned();
+        }
+        previous = Some(current.into_owned());
+    }
+    "unknown_rollout".to_string()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShadowDispatchStatus {
+    Submitted,
+    Failed,
+    Abandoned,
+    Closed,
+}
+
+impl ShadowDispatchStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ShadowDispatchStatus::Submitted => "submitted",
+            ShadowDispatchStatus::Failed => "failed",
+            ShadowDispatchStatus::Abandoned => "abandoned",
+            ShadowDispatchStatus::Closed => "closed",
+        }
+    }
+
+    fn default_classification(self, record: &ShadowBuySimulationRecord) -> String {
+        match self {
+            ShadowDispatchStatus::Submitted => "dispatch_submitted".to_string(),
+            ShadowDispatchStatus::Closed => "simulation_completed".to_string(),
+            ShadowDispatchStatus::Failed | ShadowDispatchStatus::Abandoned => record
+                .error_class
+                .clone()
+                .unwrap_or_else(|| "unclassified".to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ShadowDispatchLifecycleRecord {
+    pub record_type: String,
+    pub dispatch_id: String,
+    pub idempotency_key: String,
+    pub dispatch_status: ShadowDispatchStatus,
+    pub classification: String,
+    pub simulation_outcome: String,
+    pub candidate_id: String,
+    pub pool_id: String,
+    pub mint_id: String,
+    pub join_key: String,
+    pub rollout_profile: String,
+    pub entry_mode: String,
+    pub decision_ts_ms: u64,
+    pub timestamp_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_detail_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub err: Option<String>,
+}
+
+impl ShadowDispatchLifecycleRecord {
+    pub fn from_shadow_buy_record(
+        record: &ShadowBuySimulationRecord,
+        join_key: impl Into<String>,
+        rollout_profile: impl Into<String>,
+        status: ShadowDispatchStatus,
+    ) -> ShadowDispatchLifecycleRecord {
+        let join_key = join_key.into();
+        let rollout_profile = rollout_profile.into();
+        let idempotency_key = record.idempotency_key.clone().unwrap_or_else(|| {
+            make_shadow_idempotency_key(&record.pool_amm_id, &join_key, &rollout_profile)
+        });
+        ShadowDispatchLifecycleRecord {
+            record_type: "shadow_dispatch".to_string(),
+            dispatch_id: format!("shadow-dispatch:{idempotency_key}"),
+            idempotency_key,
+            dispatch_status: status,
+            classification: status.default_classification(record),
+            simulation_outcome: status.as_str().to_string(),
+            candidate_id: record.candidate_id.clone(),
+            pool_id: record.pool_amm_id.clone(),
+            mint_id: record.base_mint.clone(),
+            join_key,
+            rollout_profile,
+            entry_mode: record.entry_mode.clone(),
+            decision_ts_ms: record.decision_ts_ms,
+            timestamp_ms: record.sim_finished_ts_ms.max(record.decision_ts_ms),
+            error_class: record.error_class.clone(),
+            error_code: record.error_code.clone(),
+            error_detail_class: record.error_detail_class.clone(),
+            err: record.err.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -159,6 +263,21 @@ impl ShadowBuySimulationRecord {
     /// P5: Attach an idempotency key for shadow lifecycle dedup.
     pub fn with_idempotency_key(mut self, key: String) -> Self {
         self.idempotency_key = Some(key);
+        self
+    }
+
+    pub fn with_lifecycle_identity(
+        mut self,
+        join_key: impl Into<String>,
+        rollout_profile: impl Into<String>,
+    ) -> Self {
+        let join_key = join_key.into();
+        let rollout_profile = rollout_profile.into();
+        self.idempotency_key = Some(make_shadow_idempotency_key(
+            &self.pool_amm_id,
+            &join_key,
+            &rollout_profile,
+        ));
         self
     }
 
@@ -734,6 +853,25 @@ pub async fn append_shadow_buy_record(
     Ok(())
 }
 
+pub async fn append_shadow_dispatch_lifecycle_record(
+    log_path: &Path,
+    record: &ShadowDispatchLifecycleRecord,
+) -> Result<()> {
+    if let Some(parent) = log_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .await?;
+    let json = serde_json::to_string(record)?;
+    tokio::io::AsyncWriteExt::write_all(&mut file, json.as_bytes()).await?;
+    tokio::io::AsyncWriteExt::write_all(&mut file, b"\n").await?;
+    tokio::io::AsyncWriteExt::flush(&mut file).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 fn test_metrics_state() -> &'static Mutex<HashMap<&'static str, u64>> {
     static METRICS: OnceLock<Mutex<HashMap<&'static str, u64>>> = OnceLock::new();
@@ -1119,6 +1257,52 @@ mod tests {
             .await
             .expect("read shadow jsonl");
         assert!(contents.contains("\"entry_mode\":\"shadow_only\""));
+    }
+
+    #[test]
+    fn p5_idempotency_key_uses_join_key_and_rollout_profile() {
+        let first = make_shadow_idempotency_key("pool", "pool:mint:1000", "shadow-burnin");
+        let same = make_shadow_idempotency_key("pool", "pool:mint:1000", "shadow-burnin");
+        let different_join = make_shadow_idempotency_key("pool", "pool:mint:1001", "shadow-burnin");
+        let different_rollout = make_shadow_idempotency_key("pool", "pool:mint:1000", "canary");
+
+        assert_eq!(first, same);
+        assert_ne!(first, different_join);
+        assert_ne!(first, different_rollout);
+    }
+
+    #[tokio::test]
+    async fn p5_failed_dispatch_writes_terminal_lifecycle_record() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let lifecycle_path = temp.path().join("shadow_lifecycle.jsonl");
+        let join_key = make_shadow_join_key("pool", "mint", 1000);
+        let record = ShadowBuySimulationRecord::from_event(
+            TriggerEntryMode::ShadowOnly,
+            &sample_event(None, Some("custom program error: 0x1")),
+        )
+        .with_lifecycle_identity(join_key.clone(), "shadow-burnin");
+        let lifecycle_record = ShadowDispatchLifecycleRecord::from_shadow_buy_record(
+            &record,
+            join_key,
+            "shadow-burnin",
+            ShadowDispatchStatus::Failed,
+        );
+
+        append_shadow_dispatch_lifecycle_record(&lifecycle_path, &lifecycle_record)
+            .await
+            .expect("write lifecycle record");
+
+        let contents = tokio::fs::read_to_string(&lifecycle_path)
+            .await
+            .expect("read lifecycle jsonl");
+        let row: serde_json::Value =
+            serde_json::from_str(contents.trim()).expect("parse lifecycle json");
+        assert_eq!(row["record_type"], "shadow_dispatch");
+        assert_eq!(row["dispatch_status"], "failed");
+        assert_eq!(row["idempotency_key"], record.idempotency_key.unwrap());
+        assert_eq!(row["join_key"], "pool:mint:1000");
+        assert_eq!(row["rollout_profile"], "shadow-burnin");
+        assert_eq!(row["classification"], "simulation_mismatch");
     }
 
     #[test]

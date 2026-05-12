@@ -212,10 +212,17 @@ def gate_artifacts_present(inputs: Inputs) -> GateResult:
 def gate_runtime_report(shadow_report: dict[str, Any] | None, err: str | None) -> GateResult:
     if shadow_report is None:
         return GateResult(False, err or "shadow_run_report unavailable")
+    gates = shadow_report.get("gates") or {}
+    lifecycle_gate = gates.get("runtime_lifecycle_complete") or {}
+    dispatch_gate = gates.get("dispatch_attempt_classification") or {}
     return GateResult(
         passed=shadow_report.get("verdict") == "GO",
-        details=f"verdict={shadow_report.get('verdict', 'UNKNOWN')}",
-        observed=shadow_report.get("gates"),
+        details=(
+            f"verdict={shadow_report.get('verdict', 'UNKNOWN')} "
+            f"dispatch=({dispatch_gate.get('details', 'unavailable')}) "
+            f"lifecycle=({lifecycle_gate.get('details', 'unavailable')})"
+        ),
+        observed=gates,
     )
 
 
