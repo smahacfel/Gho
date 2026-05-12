@@ -1009,6 +1009,8 @@ Wszystkie poniższe moduły istnieją w `ghost-brain`, ale **żaden nie jest imp
 
 ---
 
+## Rozszerzenie opisu warstwy decyzyjnej znajduje się w dokumencie AUDYT_PIPELINE_GATEKEEPER_V2.md
+
 ## Akronimy i słownik
 
 Poniższy słownik zawiera wyłącznie terminy używane w aktywnym runtime. Moduły ghost-brain nieimportowane przez ghost-launcher (SSMI, MPCF, SOBP, BVA, MCI, MESA, SCR, ULVF, QMAN, FRB, Resonance, CIR, ECTO, FRE, PRAECOG, TCR-Phi, Signer Entropy) zostały pominięte.
