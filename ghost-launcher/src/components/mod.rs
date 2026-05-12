@@ -2,8 +2,13 @@
 
 pub mod fallback_contract;
 pub mod gatekeeper;
+pub mod gatekeeper_adaptive_prosperity;
 pub mod gatekeeper_commit_loop;
+pub mod gatekeeper_dow_timer;
+pub mod gatekeeper_pdd;
+pub mod gatekeeper_pdd_sequence;
 pub mod gatekeeper_policy;
+pub mod gatekeeper_trajectory;
 pub mod gui_backend;
 pub mod iwim_veto;
 pub mod live_pipeline_flush_loop;

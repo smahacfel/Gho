@@ -172,6 +172,7 @@ fn policy_test_config() -> GatekeeperV2Config {
         prosperity_overlay_min_fee_topology_diversity_index: 0.10,
         prosperity_overlay_branch23_max_sell_buy_ratio: 0.18,
         prosperity_overlay_branch2_max_price_change_ratio: 2.0,
+        ..Default::default()
     }
 }
 
@@ -289,6 +290,7 @@ fn base_feature_set() -> MaterializedFeatureSet {
             single_tx_max_price_impact_pct: 18.0,
             max_single_sell_impact_pct: 12.0,
             bonding_progress: 0.22,
+            trajectory_assessment: None,
         },
         risk_flags: vec![],
         session_metadata: SessionMetadata {
@@ -2147,7 +2149,15 @@ fn session_features_drive_policy_buy() {
                 features.tx_intel_features.tx_count
             );
             assert_eq!(assessment.checkpoint_count, guard.checkpoints.len() as u32);
-            assert!(assessment.trajectory_available);
+            assert_eq!(
+                assessment.trajectory_available,
+                features.checkpoint_features.trajectory_assessment.is_some()
+            );
+            assert_eq!(
+                assessment.trajectory.is_some(),
+                features.checkpoint_features.trajectory_assessment.is_some()
+            );
+            assert!(assessment.v25_confidence.is_some());
         }
         _ => panic!("expected Buy verdict"),
     }

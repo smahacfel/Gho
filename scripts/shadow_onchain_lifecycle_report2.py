@@ -21,7 +21,9 @@ from shadow_run_report import (
     detect_latest_run_scope,
     derive_shadow_lifecycle_log_path,
     load_toml,
+    preferred_gatekeeper_decision_plane,
     resolve_config_path,
+    resolve_gatekeeper_log_path,
     resolve_runtime_path,
 )
 
@@ -255,6 +257,7 @@ def resolve_inputs(args: argparse.Namespace) -> Inputs:
         config_path,
         config.get("oracle", {}).get("decision_log_path", "logs/decisions"),
     )
+    preferred_plane = preferred_gatekeeper_decision_plane("shadow")
     shadow_entry_log = resolve_runtime_path(
         config_path,
         shadow_cfg.get("entry_log_path", "logs/shadow_run/shadow_entries.jsonl"),
@@ -288,7 +291,11 @@ def resolve_inputs(args: argparse.Namespace) -> Inputs:
         output_path = resolve_runtime_path(config_path, str(args.output))
     return Inputs(
         config_path=config_path,
-        gatekeeper_buys_log=decision_dir / BUY_LOG_NAME,
+        gatekeeper_buys_log=resolve_gatekeeper_log_path(
+            decision_dir,
+            BUY_LOG_NAME,
+            preferred_plane=preferred_plane,
+        ),
         shadow_transport_log=shadow_transport_log,
         shadow_entry_log=shadow_entry_log,
         shadow_lifecycle_log=shadow_lifecycle_log,

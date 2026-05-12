@@ -306,6 +306,32 @@ pub static FSC_PRUNE_DURATION_MS: Lazy<Histogram> = Lazy::new(|| {
     .expect("Failed to create fsc_prune_duration_ms metric")
 });
 
+/// Counter for APS regime distribution (provisional until post-V2.5 outcome tracker).
+/// Labels: regime ("Normal", "HighVolatility", "LowVolatility")
+pub static GATEKEEPER_APS_REGIME_DISTRIBUTION: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        prometheus::opts!(
+            "gatekeeper_aps_regime_distribution_total",
+            "Distribution of detected market regimes (provisional, pool-local heuristic)"
+        ),
+        &["regime"],
+    )
+    .expect("Failed to create gatekeeper_aps_regime_distribution_total metric")
+});
+
+/// Counter for DOW timer-fired shadow checkpoint evaluations.
+/// Labels: stage ("Early", "Normal", "Extended")
+pub static GATEKEEPER_DOW_TIMER_FIRED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        prometheus::opts!(
+            "gatekeeper_dow_timer_fired_total",
+            "Total DOW timer-fired shadow checkpoints by stage"
+        ),
+        &["stage"],
+    )
+    .expect("Failed to create gatekeeper_dow_timer_fired_total metric")
+});
+
 static FSC_LOOKUP_HITS_ACCUM: AtomicU64 = AtomicU64::new(0);
 static FSC_LOOKUP_MISSES_ACCUM: AtomicU64 = AtomicU64::new(0);
 
@@ -324,6 +350,9 @@ pub fn register_oracle_metrics(registry: &Registry) -> Result<(), Box<dyn std::e
     registry.register(Box::new(GATEKEEPER_DROP_RATIO.clone()))?;
     registry.register(Box::new(EVENTBUS_LAG_TOTAL.clone()))?;
     registry.register(Box::new(EVENTBUS_ACTIVE_RECEIVERS.clone()))?;
+    registry.register(Box::new(GATEKEEPER_DOW_TIMER_FIRED_TOTAL.clone()))?;
+    registry.register(Box::new(GATEKEEPER_APS_REGIME_DISTRIBUTION.clone()))?;
+    registry.register(Box::new(GATEKEEPER_SHADOW_LIFECYCLE_STATUS_TOTAL.clone()))?;
     registry.register(Box::new(CPV_INDEX_ENTRIES.clone()))?;
     registry.register(Box::new(CPV_INDEX_EVICTIONS_TOTAL.clone()))?;
     registry.register(Box::new(CPV_LOOKUP_HITS_TOTAL.clone()))?;
@@ -395,6 +424,40 @@ pub fn record_gather_events(pool_amm_id: &str, real_count: usize, synthetic_coun
     ORACLE_GATHER_LAST_REAL_COUNT
         .with_label_values(&[pool_amm_id])
         .set(real_count as i64);
+}
+
+/// P5: Counter for shadow lifecycle dispatch outcomes.
+/// Labels: status ("no_dispatch_eligible", "no_dispatch_rejected", "dispatched", "failed_reconciliation")
+pub static GATEKEEPER_SHADOW_LIFECYCLE_STATUS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        prometheus::opts!(
+            "gatekeeper_shadow_lifecycle_status_total",
+            "Shadow lifecycle dispatch outcomes — distinguishes no_dispatch from failed_reconciliation"
+        ),
+        &["status"],
+    )
+    .expect("Failed to create gatekeeper_shadow_lifecycle_status_total metric")
+});
+
+/// Record a shadow lifecycle dispatch outcome.
+pub fn record_shadow_lifecycle_status(status: &str) {
+    GATEKEEPER_SHADOW_LIFECYCLE_STATUS_TOTAL
+        .with_label_values(&[status])
+        .inc();
+}
+
+/// Record an APS regime observation (provisional, pool-local heuristic).
+pub fn record_aps_regime(regime: &str) {
+    GATEKEEPER_APS_REGIME_DISTRIBUTION
+        .with_label_values(&[regime])
+        .inc();
+}
+
+/// Record a DOW timer-fired shadow checkpoint evaluation for the given stage.
+pub fn record_dow_timer_fired(stage: &str) {
+    GATEKEEPER_DOW_TIMER_FIRED_TOTAL
+        .with_label_values(&[stage])
+        .inc();
 }
 
 pub fn record_eventbus_lag(consumer: &str, skipped: u64) {

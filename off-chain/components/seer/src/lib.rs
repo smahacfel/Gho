@@ -650,12 +650,75 @@ fn summarize_coverage(
 }
 
 #[derive(Clone)]
-struct PendingCurveUpdate {
+struct PendingCurveUpdateSnapshot {
     slot: u64,
+    event_time: ghost_core::EventTimeMetadata,
     write_version: Option<u64>,
     owner: Pubkey,
     data: Vec<u8>,
     queued_at: Instant,
+}
+
+impl PendingCurveUpdateSnapshot {
+    fn new(
+        slot: u64,
+        event_time: ghost_core::EventTimeMetadata,
+        write_version: Option<u64>,
+        owner: Pubkey,
+        data: &[u8],
+        queued_at: Instant,
+    ) -> Self {
+        Self {
+            slot,
+            event_time,
+            write_version,
+            owner,
+            data: data.to_vec(),
+            queued_at,
+        }
+    }
+
+    fn ordering_key(&self) -> (u64, u64) {
+        (
+            self.slot,
+            account_update_write_version_key(self.write_version),
+        )
+    }
+}
+
+#[derive(Clone)]
+struct PendingCurveUpdate {
+    earliest: PendingCurveUpdateSnapshot,
+    latest: PendingCurveUpdateSnapshot,
+}
+
+impl PendingCurveUpdate {
+    fn new(snapshot: PendingCurveUpdateSnapshot) -> Self {
+        Self {
+            earliest: snapshot.clone(),
+            latest: snapshot,
+        }
+    }
+
+    fn store(&mut self, snapshot: PendingCurveUpdateSnapshot) -> PendingCurveUpdateStoreOutcome {
+        let snapshot_key = snapshot.ordering_key();
+        if snapshot_key < self.earliest.ordering_key() {
+            return PendingCurveUpdateStoreOutcome::IgnoredOlder;
+        }
+        if snapshot_key < self.latest.ordering_key() {
+            return PendingCurveUpdateStoreOutcome::IgnoredOlder;
+        }
+        self.latest = snapshot;
+        PendingCurveUpdateStoreOutcome::ReplacedNewer
+    }
+
+    fn replay_snapshots(self) -> Vec<PendingCurveUpdateSnapshot> {
+        if self.earliest.ordering_key() == self.latest.ordering_key() {
+            vec![self.latest]
+        } else {
+            vec![self.earliest, self.latest]
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1044,7 +1107,7 @@ pub struct Seer {
     /// Optional reverse mapping for fast mint -> curve lookups.
     mint_to_curve: Arc<RwLock<HashMap<[u8; 32], [u8; 32]>>>,
 
-    /// Last parsable account update per curve kept until mapping is resolved.
+    /// Bounded earliest+latest parsable account updates kept until mapping is resolved.
     pending_curve_updates: Arc<RwLock<HashMap<[u8; 32], PendingCurveUpdate>>>,
 
     /// Trades buffered until curve->mint mapping becomes known.
@@ -1954,22 +2017,44 @@ impl Seer {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
+        self.register_watch_from_mapping(
+            candidate.bonding_curve,
+            candidate.base_mint,
+            AmmProgram::PumpSwap,
+            watch_started_at_ms,
+            "pumpswap_continuity",
+        );
+    }
 
+    fn sync_curve_mapping_to_parser_from_state(
+        parser: Option<&BinaryParser>,
+        curve: Pubkey,
+        mint: Pubkey,
+    ) {
+        if let Some(parser) = parser {
+            parser.set_curve_mapping(&curve.to_string(), &mint.to_string());
+        }
+    }
+
+    fn register_watch_from_mapping(
+        &self,
+        curve: Pubkey,
+        mint: Pubkey,
+        amm_program: AmmProgram,
+        watch_started_at_ms: u64,
+        source: &'static str,
+    ) {
         if let Some(grpc_connection) = &self.grpc_connection {
-            grpc_connection.add_watched_mint(candidate.base_mint);
-            grpc_connection.watch_pool(
-                candidate.bonding_curve,
-                AmmProgram::PumpSwap,
-                watch_started_at_ms,
-            );
+            grpc_connection.add_watched_mint(mint);
+            grpc_connection.watch_pool(curve, amm_program, watch_started_at_ms);
             let registry = grpc_connection.account_registry();
             let lanes = registry.snapshot_by_lane();
             let transport = grpc_connection.transport_stats();
             coverage_audit().record_watch_registration(
-                &candidate.bonding_curve.to_string(),
+                &curve.to_string(),
                 CoverageAuditWatchRegistration {
                     wall_ms: watch_started_at_ms,
-                    source: "pumpswap_continuity".to_string(),
+                    source: source.to_string(),
                     registry_version: registry.version(),
                     exact_curve_accounts: lanes.curve_accounts.len() as u64,
                     exact_pool_accounts: lanes.pool_accounts.len() as u64,
@@ -1984,13 +2069,11 @@ impl Seer {
         }
     }
 
-    fn sync_curve_mapping_to_parser_from_state(
-        parser: Option<&BinaryParser>,
-        curve: Pubkey,
-        mint: Pubkey,
-    ) {
-        if let Some(parser) = parser {
-            parser.set_curve_mapping(&curve.to_string(), &mint.to_string());
+    fn authoritative_mapping_watch_program(source: &str) -> Option<AmmProgram> {
+        match source {
+            "create" | "entry_cpi" => Some(AmmProgram::PumpFun),
+            "pumpswap_continuity" => Some(AmmProgram::PumpSwap),
+            _ => None,
         }
     }
 
@@ -2048,6 +2131,17 @@ impl Seer {
     ) {
         self.set_curve_mapping(curve, mint, source, authoritative);
         self.sync_curve_mapping_to_parser(curve, mint);
+        if authoritative {
+            if let Some(amm_program) = Self::authoritative_mapping_watch_program(source) {
+                self.register_watch_from_mapping(
+                    curve,
+                    mint,
+                    amm_program,
+                    types::arrival_time_ms(),
+                    source,
+                );
+            }
+        }
         // [RC-6] Drain any AccountUpdate buffered before this mapping was known.
         // `pending_curve_updates` is the sole owner of AccountUpdate replay.
         // `replay_pending_curve_update` drains it exactly once — HashMap::remove
@@ -2409,20 +2503,6 @@ impl Seer {
 
         let Some(pending) = pending else { return };
 
-        ::metrics::increment_counter!("seer_pending_curve_replayed_on_mapping_total");
-        ::metrics::increment_counter!("seer.account_updates.pending_curve_replay_total");
-        let dwell_ms = pending.queued_at.elapsed().as_secs_f64() * 1000.0;
-        ::metrics::histogram!(
-            "seer.account_updates.pending_curve_replay_dwell_ms",
-            dwell_ms
-        );
-        coverage_audit().record_seer_account_update_pending_replay(
-            &curve.to_string(),
-            Some(dwell_ms.max(0.0).round() as u64),
-            false,
-            false,
-        );
-
         if !canonical_account_update_relay_enabled {
             ::metrics::increment_counter!(
                 "seer.account_updates.pending_curve_replay_skipped_total",
@@ -2431,20 +2511,42 @@ impl Seer {
             return;
         }
 
-        if let Ok(update_payload) = decode_canonical_account_update(pending.owner, &pending.data) {
-            if let Some(ipc) = ipc_sender {
-                let semantic = normalize_account_update_semantics("grpc_global_stream", true);
+        let Some(ipc) = ipc_sender else { return };
+
+        for replay in pending.replay_snapshots() {
+            ::metrics::increment_counter!("seer_pending_curve_replayed_on_mapping_total");
+            ::metrics::increment_counter!("seer.account_updates.pending_curve_replay_total");
+            let dwell_ms = replay.queued_at.elapsed().as_secs_f64() * 1000.0;
+            ::metrics::histogram!(
+                "seer.account_updates.pending_curve_replay_dwell_ms",
+                dwell_ms
+            );
+            coverage_audit().record_seer_account_update_pending_replay(
+                &curve.to_string(),
+                Some(dwell_ms.max(0.0).round() as u64),
+                false,
+                false,
+            );
+
+            if let Ok(update_payload) = decode_canonical_account_update(replay.owner, &replay.data)
+            {
+                let semantic = normalize_account_update_semantics(
+                    "grpc_global_stream",
+                    replay.event_time,
+                    true,
+                );
                 if ipc
                     .send_account_update(
                         semantic,
+                        replay.event_time,
                         mint,
                         curve,
                         ghost_core::CurveFinality::Provisional,
                         update_payload.sol_reserves,
                         update_payload.token_reserves,
                         update_payload.complete,
-                        pending.slot,
-                        pending.write_version,
+                        replay.slot,
+                        replay.write_version,
                         AccountUpdateReplayOrigin::PendingReplay,
                         Some(dwell_ms.max(0.0).round() as u64),
                     )
@@ -2459,7 +2561,7 @@ impl Seer {
                     );
                     ::metrics::histogram!(
                         "seer.account_updates.latency_us",
-                        pending.queued_at.elapsed().as_micros() as f64
+                        replay.queued_at.elapsed().as_micros() as f64
                     );
                     ::metrics::histogram!(
                         "seer.account_updates.end_to_end_latency_ms",
@@ -2481,19 +2583,21 @@ impl Seer {
                         false,
                     );
                 }
+            } else {
+                ::metrics::increment_counter!(
+                    "seer.account_updates.pending_curve_parse_failed_total"
+                );
+                coverage_audit().record_seer_account_update_pending_replay(
+                    &curve.to_string(),
+                    Some(dwell_ms.max(0.0).round() as u64),
+                    false,
+                    true,
+                );
+                warn!(
+                    "CURVE_REPLAY_PARSE_FAIL curve={} slot={} source=on_mapping",
+                    curve, replay.slot
+                );
             }
-        } else {
-            ::metrics::increment_counter!("seer.account_updates.pending_curve_parse_failed_total");
-            coverage_audit().record_seer_account_update_pending_replay(
-                &curve.to_string(),
-                Some(dwell_ms.max(0.0).round() as u64),
-                false,
-                true,
-            );
-            warn!(
-                "CURVE_REPLAY_PARSE_FAIL curve={} slot={} source=on_mapping",
-                curve, pending.slot
-            );
         }
     }
 
@@ -2509,40 +2613,26 @@ impl Seer {
         &self,
         curve: Pubkey,
         slot: u64,
+        event_time: ghost_core::EventTimeMetadata,
         write_version: Option<u64>,
         owner: Pubkey,
         data: &[u8],
     ) -> PendingCurveUpdateStoreOutcome {
         let key = curve.to_bytes();
         let mut pending = self.pending_curve_updates.write();
+        let queued_at = Instant::now();
+        let snapshot = PendingCurveUpdateSnapshot::new(
+            slot,
+            event_time,
+            write_version,
+            owner,
+            data,
+            queued_at,
+        );
         let outcome = match pending.get_mut(&key) {
-            Some(existing)
-                if (slot, account_update_write_version_key(write_version))
-                    >= (
-                        existing.slot,
-                        account_update_write_version_key(existing.write_version),
-                    ) =>
-            {
-                existing.slot = slot;
-                existing.write_version = write_version;
-                existing.owner = owner;
-                existing.data.clear();
-                existing.data.extend_from_slice(data);
-                existing.queued_at = Instant::now();
-                PendingCurveUpdateStoreOutcome::ReplacedNewer
-            }
-            Some(_) => PendingCurveUpdateStoreOutcome::IgnoredOlder,
+            Some(existing) => existing.store(snapshot),
             None => {
-                pending.insert(
-                    key,
-                    PendingCurveUpdate {
-                        slot,
-                        write_version,
-                        owner,
-                        data: data.to_vec(),
-                        queued_at: Instant::now(),
-                    },
-                );
+                pending.insert(key, PendingCurveUpdate::new(snapshot));
                 PendingCurveUpdateStoreOutcome::Inserted
             }
         };
@@ -2582,14 +2672,15 @@ impl Seer {
         }
 
         let recv_started_at = Instant::now();
-        let (slot, write_version, pubkey, data, owner) = match event {
+        let (slot, event_time, write_version, pubkey, data, owner) = match event {
             types::GeyserEvent::AccountUpdate {
                 slot,
+                event_time,
                 write_version,
                 pubkey,
                 data,
                 owner,
-            } => (*slot, *write_version, *pubkey, data, *owner),
+            } => (*slot, *event_time, *write_version, *pubkey, data, *owner),
             _ => return Ok(false),
         };
         ::metrics::increment_counter!("seer.account_updates.received_total");
@@ -2606,7 +2697,11 @@ impl Seer {
         let wal_ingress_wall_ts_ms = types::ingress_epoch_ms();
         self.append_parsed_event_to_wal(
             wal_ingress_wall_ts_ms,
-            ghost_core::EventTimeMetadata::new(None, Some(wal_ingress_wall_ts_ms), None),
+            event_time.with_missing_from(ghost_core::EventTimeMetadata::new(
+                None,
+                Some(wal_ingress_wall_ts_ms),
+                None,
+            )),
             Some(slot),
             Some(pubkey),
             WalParsedEventKind::AccountUpdate,
@@ -2642,8 +2737,14 @@ impl Seer {
                     // `pending_curve_updates` is the sole owner of AccountUpdate recovery.
                     // It buffers the parsed event and is drained deterministically in
                     // `register_curve_mapping` → `replay_pending_curve_update`.
-                    let store_outcome =
-                        self.queue_pending_curve_update(pubkey, slot, write_version, owner, data);
+                    let store_outcome = self.queue_pending_curve_update(
+                        pubkey,
+                        slot,
+                        event_time,
+                        write_version,
+                        owner,
+                        data,
+                    );
                     ::metrics::increment_counter!(
                         "seer.account_updates.before_mapping_total",
                         "store_outcome" => match store_outcome {
@@ -2661,31 +2762,14 @@ impl Seer {
             }
         };
 
-        if let Some(grpc_connection) = &self.grpc_connection {
-            grpc_connection.add_watched_mint(base_mint);
-            if let Some(amm_program) = AmmProgram::from_pubkey(&owner) {
-                let watch_started_at_ms = types::arrival_time_ms();
-                grpc_connection.watch_pool(pubkey, amm_program, watch_started_at_ms);
-                let registry = grpc_connection.account_registry();
-                let lanes = registry.snapshot_by_lane();
-                let transport = grpc_connection.transport_stats();
-                coverage_audit().record_watch_registration(
-                    &pubkey.to_string(),
-                    CoverageAuditWatchRegistration {
-                        wall_ms: watch_started_at_ms,
-                        source: "account_update".to_string(),
-                        registry_version: registry.version(),
-                        exact_curve_accounts: lanes.curve_accounts.len() as u64,
-                        exact_pool_accounts: lanes.pool_accounts.len() as u64,
-                        watched_mints: lanes.mint_accounts.len() as u64,
-                        transport_resubs_sent: transport.resubs_sent.load(Relaxed),
-                        transport_msgs_spilled: transport.msgs_spilled.load(Relaxed),
-                        transport_overflow_dropped: transport.msgs_overflow_dropped.load(Relaxed),
-                        transport_slot_gaps: transport.slot_gaps_total.load(Relaxed),
-                        transport_last_msg_gap_ms: transport.ms_since_last_msg(),
-                    },
-                );
-            }
+        if let Some(amm_program) = AmmProgram::from_pubkey(&owner) {
+            self.register_watch_from_mapping(
+                pubkey,
+                base_mint,
+                amm_program,
+                types::arrival_time_ms(),
+                "account_update",
+            );
         }
 
         let _ = &self.shadow_ledger;
@@ -2695,10 +2779,12 @@ impl Seer {
         // from tx remain bootstrap hints only; canonical live truth flows solely
         // through this IPC event.
         if let Some(ipc) = &self.ipc_sender {
-            let semantic = normalize_account_update_semantics("grpc_global_stream", true);
+            let semantic =
+                normalize_account_update_semantics("grpc_global_stream", event_time, true);
             match ipc
                 .send_account_update(
                     semantic,
+                    event_time,
                     base_mint,
                     pubkey,
                     self.config.commitment.curve_finality(),
@@ -3304,6 +3390,18 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                 // Every buffer miss (CREATE arrives >30ms late or out of order)
                 // = permanently lost trade.
                 self.set_curve_mapping(*pool_id, *mint, "trade_optimistic", false);
+                let amm_program = if trade.is_pumpswap {
+                    AmmProgram::PumpSwap
+                } else {
+                    AmmProgram::PumpFun
+                };
+                self.register_watch_from_mapping(
+                    *pool_id,
+                    *mint,
+                    amm_program,
+                    types::arrival_time_ms(),
+                    "trade_optimistic",
+                );
                 ::metrics::increment_counter!("seer_trade_optimistic_mapping_total");
                 info!(
                     "TRADE_OPTIMISTIC_FORWARD pool={} mint={} source={} action=self_register_and_forward",
@@ -3949,40 +4047,6 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                             true,
                         )
                         .await;
-                        let watch_started_at_ms = detection_received_at
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as u64;
-
-                        if let Some(grpc_connection) = &self.grpc_connection {
-                            grpc_connection.add_watched_mint(candidate.base_mint);
-                            grpc_connection.watch_pool(
-                                candidate.bonding_curve,
-                                amm_program,
-                                watch_started_at_ms,
-                            );
-                            let registry = grpc_connection.account_registry();
-                            let lanes = registry.snapshot_by_lane();
-                            let transport = grpc_connection.transport_stats();
-                            coverage_audit().record_watch_registration(
-                                &candidate.bonding_curve.to_string(),
-                                CoverageAuditWatchRegistration {
-                                    wall_ms: watch_started_at_ms,
-                                    source: "create".to_string(),
-                                    registry_version: registry.version(),
-                                    exact_curve_accounts: lanes.curve_accounts.len() as u64,
-                                    exact_pool_accounts: lanes.pool_accounts.len() as u64,
-                                    watched_mints: lanes.mint_accounts.len() as u64,
-                                    transport_resubs_sent: transport.resubs_sent.load(Relaxed),
-                                    transport_msgs_spilled: transport.msgs_spilled.load(Relaxed),
-                                    transport_overflow_dropped: transport
-                                        .msgs_overflow_dropped
-                                        .load(Relaxed),
-                                    transport_slot_gaps: transport.slot_gaps_total.load(Relaxed),
-                                    transport_last_msg_gap_ms: transport.ms_since_last_msg(),
-                                },
-                            );
-                        }
                     }
                     PoolInitCandidateMode::ContinuityOnly { observation_pool } => {
                         ::metrics::increment_counter!(
@@ -4976,6 +5040,86 @@ mod tests {
                 .load(Relaxed),
             1,
             "event-level fallback counter must track grpc_backfill trade emissions"
+        );
+    }
+
+    async fn assert_authoritative_mapping_source_starts_grpc_watch(source: &'static str) {
+        let mut ipc_config = IpcChannelConfig::default();
+        ipc_config.buffer_size = 8;
+        let (ipc_sender, _ipc_receiver, _metrics) = create_ipc_channel(ipc_config);
+        let seer = Seer::new_with_ipc(SeerConfig::default(), ipc_sender);
+
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        seer.register_curve_mapping(pool, mint, source, true).await;
+
+        let connection = seer
+            .grpc_connection
+            .as_ref()
+            .expect("grpc connection should exist for watch registration");
+        assert!(
+            connection.is_pool_watched(&pool),
+            "authoritative {source} mapping must start pool watch immediately"
+        );
+        assert!(
+            connection.is_mint_watched(&mint),
+            "authoritative {source} mapping must also register mint watch"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_register_curve_mapping_create_starts_grpc_watch() {
+        assert_authoritative_mapping_source_starts_grpc_watch("create").await;
+    }
+
+    #[tokio::test]
+    async fn test_register_curve_mapping_entry_cpi_starts_grpc_watch() {
+        assert_authoritative_mapping_source_starts_grpc_watch("entry_cpi").await;
+    }
+
+    #[tokio::test]
+    async fn test_seed_pumpswap_continuity_starts_grpc_watch() {
+        let mut ipc_config = IpcChannelConfig::default();
+        ipc_config.buffer_size = 8;
+        let (ipc_sender, _ipc_receiver, _metrics) = create_ipc_channel(ipc_config);
+        let seer = Seer::new_with_ipc(SeerConfig::default(), ipc_sender);
+
+        let candidate = CandidatePool {
+            semantic: ghost_core::EventSemanticEnvelope::default(),
+            slot: Some(1),
+            event_ts_ms: Some(1_000),
+            event_time: ghost_core::EventTimeMetadata::default(),
+            signature: Signature::new_unique().to_string(),
+            amm_program_id: AmmProgram::PumpSwap.program_id(),
+            pool_amm_id: Pubkey::new_unique(),
+            base_mint: Pubkey::new_unique(),
+            quote_mint: Pubkey::new_unique(),
+            bonding_curve: Pubkey::new_unique(),
+            creator: Pubkey::new_unique(),
+            timestamp: 1_000,
+            bonding_curve_progress: Some(0.0),
+            initial_liquidity_sol: Some(30.0),
+            token_total_supply: Some(1_000_000_000_000_000),
+            block_time: Some(1),
+        };
+
+        seer.seed_pumpswap_continuity(
+            &candidate,
+            Pubkey::new_unique(),
+            std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_000),
+        );
+
+        let connection = seer
+            .grpc_connection
+            .as_ref()
+            .expect("grpc connection should exist for watch registration");
+        assert!(
+            connection.is_pool_watched(&candidate.bonding_curve),
+            "PumpSwap continuity seed must start pool watch immediately"
+        );
+        assert!(
+            connection.is_mint_watched(&candidate.base_mint),
+            "PumpSwap continuity seed must also register mint watch"
         );
     }
 
@@ -6060,6 +6204,7 @@ mod tests {
             .expect("valid pumpfun id");
         seer.process_event(types::GeyserEvent::AccountUpdate {
             slot: 42,
+            event_time: ghost_core::EventTimeMetadata::default(),
             write_version: None,
             pubkey: bonding_curve,
             data,
@@ -6099,6 +6244,7 @@ mod tests {
 
         seer.process_event(types::GeyserEvent::AccountUpdate {
             slot: 55,
+            event_time: ghost_core::EventTimeMetadata::new(None, Some(1_055), Some(55)),
             write_version: None,
             pubkey: curve,
             data,
@@ -6112,6 +6258,7 @@ mod tests {
         newer[8..16].copy_from_slice(&901u64.to_le_bytes());
         seer.process_event(types::GeyserEvent::AccountUpdate {
             slot: 56,
+            event_time: ghost_core::EventTimeMetadata::new(None, Some(1_056), Some(56)),
             write_version: None,
             pubkey: curve,
             data: newer,
@@ -6128,8 +6275,97 @@ mod tests {
             seer.pending_curve_updates
                 .read()
                 .get(&curve.to_bytes())
-                .map(|p| p.slot),
-            Some(56)
+                .map(|p| (p.earliest.slot, p.latest.slot)),
+            Some((55, 56))
+        );
+        assert!(ledger.get_curve_info(&curve).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_account_update_replay_preserves_earliest_and_latest_snapshot() {
+        let config = SeerConfig::default();
+        let ipc_config = IpcChannelConfig::default();
+        let (tx, mut rx, _metrics) = create_ipc_channel(ipc_config);
+        let ledger = Arc::new(ShadowLedger::new());
+        let seer = Seer::new_with_ipc_and_shadow_ledger(config, tx, Arc::clone(&ledger));
+
+        let curve = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let owner = Pubkey::from_str("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
+            .expect("valid pumpfun id");
+
+        let mut first = vec![0u8; 56];
+        first[0..8].copy_from_slice(&700u64.to_le_bytes());
+        first[8..16].copy_from_slice(&900u64.to_le_bytes());
+        seer.process_event(types::GeyserEvent::AccountUpdate {
+            slot: 55,
+            event_time: ghost_core::EventTimeMetadata::new(None, Some(2_055), Some(55)),
+            write_version: Some(1),
+            pubkey: curve,
+            data: first,
+            owner,
+        })
+        .await
+        .unwrap();
+
+        let mut second = vec![0u8; 56];
+        second[0..8].copy_from_slice(&701u64.to_le_bytes());
+        second[8..16].copy_from_slice(&901u64.to_le_bytes());
+        seer.process_event(types::GeyserEvent::AccountUpdate {
+            slot: 56,
+            event_time: ghost_core::EventTimeMetadata::new(None, Some(2_056), Some(56)),
+            write_version: Some(2),
+            pubkey: curve,
+            data: second,
+            owner,
+        })
+        .await
+        .unwrap();
+
+        seer.register_curve_mapping(curve, mint, "test", true).await;
+
+        let Some(SeerEvent::AccountUpdate(first_replay)) = rx.recv().await else {
+            panic!("expected first replayed AccountUpdate over IPC");
+        };
+        let Some(SeerEvent::AccountUpdate(second_replay)) = rx.recv().await else {
+            panic!("expected second replayed AccountUpdate over IPC");
+        };
+
+        assert_eq!(
+            (
+                first_replay.slot,
+                first_replay.write_version,
+                first_replay.event_time.ingress_wall_ts_ms,
+                first_replay.token_reserves,
+                first_replay.sol_reserves,
+                first_replay.replay_origin
+            ),
+            (
+                55,
+                Some(1),
+                Some(2_055),
+                700,
+                900,
+                AccountUpdateReplayOrigin::PendingReplay
+            )
+        );
+        assert_eq!(
+            (
+                second_replay.slot,
+                second_replay.write_version,
+                second_replay.event_time.ingress_wall_ts_ms,
+                second_replay.token_reserves,
+                second_replay.sol_reserves,
+                second_replay.replay_origin
+            ),
+            (
+                56,
+                Some(2),
+                Some(2_056),
+                701,
+                901,
+                AccountUpdateReplayOrigin::PendingReplay
+            )
         );
         assert!(ledger.get_curve_info(&curve).is_none());
     }
@@ -6174,6 +6410,7 @@ mod tests {
 
         seer.process_event(types::GeyserEvent::AccountUpdate {
             slot: 55,
+            event_time: ghost_core::EventTimeMetadata::default(),
             write_version: Some(2),
             pubkey: pool,
             data,
@@ -6243,6 +6480,7 @@ mod tests {
 
         seer.process_event(types::GeyserEvent::AccountUpdate {
             slot: 55,
+            event_time: ghost_core::EventTimeMetadata::default(),
             write_version: Some(2),
             pubkey: pool,
             data,
@@ -6300,6 +6538,7 @@ mod tests {
 
         seer.process_event(types::GeyserEvent::AccountUpdate {
             slot: 42,
+            event_time: ghost_core::EventTimeMetadata::default(),
             write_version: None,
             pubkey: bonding_curve,
             data,
@@ -6362,6 +6601,7 @@ mod tests {
 
         seer.process_event(types::GeyserEvent::AccountUpdate {
             slot: 43,
+            event_time: ghost_core::EventTimeMetadata::default(),
             write_version: Some(1),
             pubkey: pool,
             data,
@@ -6425,6 +6665,7 @@ mod tests {
 
         seer.process_event(types::GeyserEvent::AccountUpdate {
             slot: 55,
+            event_time: ghost_core::EventTimeMetadata::default(),
             write_version: Some(2),
             pubkey: curve_pubkey,
             data,
@@ -6496,6 +6737,7 @@ mod tests {
 
         seer.process_event(types::GeyserEvent::AccountUpdate {
             slot: 99,
+            event_time: ghost_core::EventTimeMetadata::default(),
             write_version: None,
             pubkey: bonding_curve,
             data,
@@ -6585,6 +6827,7 @@ mod tests {
         let short_data = vec![0u8; 20];
         seer.process_event(types::GeyserEvent::AccountUpdate {
             slot: 42,
+            event_time: ghost_core::EventTimeMetadata::default(),
             write_version: None,
             pubkey: bonding_curve,
             data: short_data,
@@ -6620,6 +6863,7 @@ mod tests {
 
         seer.process_event(types::GeyserEvent::AccountUpdate {
             slot: 42,
+            event_time: ghost_core::EventTimeMetadata::default(),
             write_version: None,
             pubkey: bonding_curve,
             data,
@@ -6667,6 +6911,7 @@ mod tests {
 
         seer.process_event(types::GeyserEvent::AccountUpdate {
             slot: 42,
+            event_time: ghost_core::EventTimeMetadata::default(),
             write_version: None,
             pubkey: bonding_curve,
             data,
@@ -6711,6 +6956,7 @@ mod tests {
 
         seer.process_event(types::GeyserEvent::AccountUpdate {
             slot: 42,
+            event_time: ghost_core::EventTimeMetadata::default(),
             write_version: None,
             pubkey: unknown_pubkey,
             data,
@@ -8364,6 +8610,7 @@ mod tests {
         // AccountUpdate arrives before mapping is known — must buffer, not apply.
         seer.process_event(types::GeyserEvent::AccountUpdate {
             slot: UPDATE_SLOT,
+            event_time: ghost_core::EventTimeMetadata::default(),
             write_version: None,
             pubkey: curve,
             data: data.clone(),
@@ -8453,9 +8700,30 @@ mod tests {
         let older = vec![1u8; 56];
         let newer = vec![2u8; 56];
 
-        let first = seer.queue_pending_curve_update(curve, 10, Some(1), owner, &older);
-        let second = seer.queue_pending_curve_update(curve, 11, Some(2), owner, &newer);
-        let third = seer.queue_pending_curve_update(curve, 9, Some(0), owner, &older);
+        let first = seer.queue_pending_curve_update(
+            curve,
+            10,
+            ghost_core::EventTimeMetadata::default(),
+            Some(1),
+            owner,
+            &older,
+        );
+        let second = seer.queue_pending_curve_update(
+            curve,
+            11,
+            ghost_core::EventTimeMetadata::default(),
+            Some(2),
+            owner,
+            &newer,
+        );
+        let third = seer.queue_pending_curve_update(
+            curve,
+            9,
+            ghost_core::EventTimeMetadata::default(),
+            Some(0),
+            owner,
+            &older,
+        );
 
         assert_eq!(first, PendingCurveUpdateStoreOutcome::Inserted);
         assert_eq!(second, PendingCurveUpdateStoreOutcome::ReplacedNewer);
@@ -8467,9 +8735,11 @@ mod tests {
             .get(&curve.to_bytes())
             .cloned()
             .expect("pending curve update must remain stored");
-        assert_eq!(pending.slot, 11);
-        assert_eq!(pending.write_version, Some(2));
-        assert_eq!(pending.data, newer);
+        assert_eq!(pending.earliest.slot, 10);
+        assert_eq!(pending.earliest.write_version, Some(1));
+        assert_eq!(pending.latest.slot, 11);
+        assert_eq!(pending.latest.write_version, Some(2));
+        assert_eq!(pending.latest.data, newer);
     }
 
     /// PR-2 §3 — `mint == Pubkey::default()` (the 111…1 sentinel) must NEVER

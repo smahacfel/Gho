@@ -422,6 +422,28 @@ impl TriggerEntryMode {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TriggerShadowPayerStrategy {
+    Configured,
+    Ephemeral,
+}
+
+impl Default for TriggerShadowPayerStrategy {
+    fn default() -> Self {
+        Self::Configured
+    }
+}
+
+impl TriggerShadowPayerStrategy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Configured => "configured",
+            Self::Ephemeral => "ephemeral",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ShadowRunCommitment {
     Processed,
@@ -562,7 +584,7 @@ impl LauncherConfig {
     /// working directory and all of its ancestors first. If that fails, repeat
     /// the search from the launcher executable directory upward. This makes the
     /// launcher robust when started from nested subdirectories such as
-    /// `logs/decisions.jsonl/`.
+    /// `logs/decisions/`.
     pub fn resolve_config_path<P: AsRef<Path>>(path: P) -> Option<PathBuf> {
         let path = path.as_ref();
 
@@ -641,6 +663,7 @@ impl LauncherConfig {
             self.trigger.entry_mode,
             false,
         )?;
+        validate_trigger_payer_contract(self)?;
         validate_shadow_transport(self)?;
         validate_live_sender_transport(self)?;
         validate_rollout_safety_profile(self)
@@ -887,6 +910,36 @@ fn validate_live_sender_transport(config: &LauncherConfig) -> Result<(), String>
     config
         .validate_grpc_config()
         .map_err(|err| format!("live execution requires Yellowstone gRPC readiness: {err}"))
+}
+
+fn validate_trigger_payer_contract(config: &LauncherConfig) -> Result<(), String> {
+    let keypair_path = config.trigger.keypair_path.as_deref().map(str::trim);
+    let missing_or_placeholder = should_override_secret_value(keypair_path);
+
+    if matches!(
+        config.trigger.entry_mode,
+        TriggerEntryMode::Live | TriggerEntryMode::LiveAndShadow
+    ) {
+        if missing_or_placeholder {
+            return Err(
+                "live-capable entry modes require non-placeholder [trigger].keypair_path (or GHOST_TRIGGER_KEYPAIR_PATH) so signer authority stays fail-closed"
+                    .to_string(),
+            );
+        }
+        return Ok(());
+    }
+
+    if config.trigger.entry_mode == TriggerEntryMode::ShadowOnly
+        && config.trigger.shadow_run.payer_strategy == TriggerShadowPayerStrategy::Configured
+        && missing_or_placeholder
+    {
+        return Err(
+            "shadow_only with [trigger.shadow_run].payer_strategy=\"configured\" requires non-placeholder [trigger].keypair_path (or GHOST_TRIGGER_KEYPAIR_PATH)"
+                .to_string(),
+        );
+    }
+
+    Ok(())
 }
 
 fn validate_shadow_transport(config: &LauncherConfig) -> Result<(), String> {
@@ -1458,8 +1511,10 @@ pub struct TriggerComponentConfig {
     #[serde(default = "default_rpc_endpoint")]
     pub rpc_url: String,
 
-    /// Path to the keypair JSON file (solana-keygen format)
-    /// REQUIRED: Bot will not start without a valid keypair file
+    /// Path to the keypair JSON file (solana-keygen format).
+    ///
+    /// Required for live-capable entry modes. Shadow-only may omit it when
+    /// `[trigger.shadow_run].payer_strategy = "ephemeral"`.
     pub keypair_path: Option<String>,
 
     /// BUY tip guard configuration used when Sender is unavailable and the local
@@ -1526,6 +1581,14 @@ pub struct TriggerShadowRunConfig {
     #[serde(default)]
     pub sig_verify: bool,
 
+    /// Local payer/signing strategy for `entry_mode = "shadow_only"`.
+    ///
+    /// `configured` preserves the existing payer-backed shadow simulation path.
+    /// `ephemeral` makes shadow-only stop depending on the live keypair contract
+    /// and surfaces fee/compute failures explicitly in shadow reconciliation.
+    #[serde(default)]
+    pub payer_strategy: TriggerShadowPayerStrategy,
+
     /// Whether recent blockhash should be replaced during shadow simulation.
     #[serde(default = "default_true")]
     pub replace_recent_blockhash: bool,
@@ -1557,6 +1620,7 @@ impl Default for TriggerShadowRunConfig {
             shadow_rpc_url: default_shadow_run_rpc_url(),
             commitment: ShadowRunCommitment::default(),
             sig_verify: false,
+            payer_strategy: TriggerShadowPayerStrategy::default(),
             replace_recent_blockhash: true,
             timeout_ms: default_shadow_run_timeout_ms(),
             max_retries: default_shadow_run_max_retries(),
@@ -1734,8 +1798,8 @@ pub struct OracleConfig {
     #[serde(default)]
     pub dry_run: bool,
 
-    /// Decision log path for telemetry (default: "logs/decisions.jsonl")
-    /// Path where cyclic engine decisions are logged in JSONL format
+    /// Decision log directory for telemetry (default: "logs/decisions")
+    /// Root directory where cyclic engine and routed Gatekeeper decisions are logged.
     #[serde(default = "default_decision_log_path")]
     pub decision_log_path: String,
 
@@ -2280,9 +2344,61 @@ fn default_ghost_brain_config_path() -> String {
     "ghost-brain/ghost_brain_config.toml".to_string()
 }
 
-/// Default decision log path for cyclic engine telemetry
+fn normalize_runtime_path_lexically(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if normalized
+                    .components()
+                    .next_back()
+                    .is_some_and(|tail| matches!(tail, Component::Normal(_)))
+                {
+                    normalized.pop();
+                } else if !normalized.has_root() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    normalized
+}
+
+pub(crate) fn normalize_decision_log_path(path: &str) -> String {
+    let path = PathBuf::from(path);
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return normalize_runtime_path_lexically(&path)
+            .to_string_lossy()
+            .into_owned();
+    };
+    if !file_name.ends_with(".jsonl") {
+        return normalize_runtime_path_lexically(&path)
+            .to_string_lossy()
+            .into_owned();
+    }
+    let Some(stem) = Path::new(file_name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+    else {
+        return normalize_runtime_path_lexically(&path)
+            .to_string_lossy()
+            .into_owned();
+    };
+    normalize_runtime_path_lexically(&path.with_file_name(stem))
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Default decision log directory for cyclic engine telemetry
 fn default_decision_log_path() -> String {
-    "logs/decisions.jsonl".to_string()
+    "logs/decisions".to_string()
 }
 
 // Oracle configuration default functions
@@ -2673,8 +2789,10 @@ impl LauncherConfig {
         if let Some(lifecycle_log_path) = self.execution.shadow.lifecycle_log_path.as_mut() {
             *lifecycle_log_path = resolve_runtime_path(config_dir, lifecycle_log_path);
         }
-        self.oracle.decision_log_path =
-            resolve_runtime_path(config_dir, &self.oracle.decision_log_path);
+        self.oracle.decision_log_path = normalize_decision_log_path(&resolve_runtime_path(
+            config_dir,
+            &self.oracle.decision_log_path,
+        ));
         self.trigger.shadow_run.output_path =
             resolve_runtime_path(config_dir, &self.trigger.shadow_run.output_path);
         if let Some(wal_dir) = self.durability.wal_dir.as_mut() {
@@ -2827,9 +2945,13 @@ fn resolve_runtime_path(config_dir: &Path, raw: &str) -> String {
 
     let path = Path::new(raw);
     if path.is_absolute() {
-        raw.to_string()
+        normalize_runtime_path_lexically(path)
+            .to_string_lossy()
+            .into_owned()
     } else {
-        config_dir.join(path).to_string_lossy().into_owned()
+        normalize_runtime_path_lexically(&config_dir.join(path))
+            .to_string_lossy()
+            .into_owned()
     }
 }
 
@@ -3668,10 +3790,51 @@ enabled = true
         config.trigger.max_position_size_sol = 0.25;
         config.trigger.shadow_run.enabled = true;
         config.trigger.shadow_run.shadow_rpc_url = "https://shadow.example.com/api-key".to_string();
+        config.trigger.shadow_run.payer_strategy = TriggerShadowPayerStrategy::Ephemeral;
         config.seer.source_mode = Some("pump_portal_ws".to_string());
         config.seer.helius_endpoint = None;
 
         assert!(config.validate_execution_profile().is_ok());
+    }
+
+    #[test]
+    fn test_validate_execution_profile_rejects_live_mode_without_keypair() {
+        let mut config = LauncherConfig::default();
+        config.execution.execution_mode = ExecutionMode::Live;
+        config.trigger.entry_mode = TriggerEntryMode::Live;
+        config.trigger.keypair_path = None;
+        config.seer.source_mode = Some("grpc".to_string());
+        config.seer.grpc_endpoint = "https://yellowstone.example.test:443".to_string();
+        config.seer.grpc_x_token = Some("yellowstone-token".to_string());
+        config.seer.helius_endpoint =
+            Some("https://mainnet.helius-rpc.com/?api-key=test".to_string());
+
+        let err = config
+            .validate_execution_profile()
+            .expect_err("live mode must fail closed without trigger keypair");
+
+        assert!(err.contains("keypair_path"));
+        assert!(err.contains("fail-closed"));
+    }
+
+    #[test]
+    fn test_validate_execution_profile_rejects_shadow_configured_payer_without_keypair() {
+        let mut config = LauncherConfig::default();
+        config.execution.execution_mode = ExecutionMode::Shadow;
+        config.trigger.entry_mode = TriggerEntryMode::ShadowOnly;
+        config.trigger.max_concurrent_positions = 2;
+        config.trigger.max_position_size_sol = 0.2;
+        config.trigger.shadow_run.enabled = true;
+        config.trigger.shadow_run.shadow_rpc_url = "https://shadow.example.com/api-key".to_string();
+        config.trigger.shadow_run.payer_strategy = TriggerShadowPayerStrategy::Configured;
+        config.trigger.keypair_path = None;
+
+        let err = config
+            .validate_execution_profile()
+            .expect_err("configured shadow payer must fail closed without trigger keypair");
+
+        assert!(err.contains("payer_strategy"));
+        assert!(err.contains("keypair_path"));
     }
 
     #[test]
@@ -3724,6 +3887,7 @@ enabled = true
         let mut config = LauncherConfig::default();
         config.execution.execution_mode = ExecutionMode::Shadow;
         config.trigger.entry_mode = TriggerEntryMode::ShadowOnly;
+        config.trigger.shadow_run.payer_strategy = TriggerShadowPayerStrategy::Ephemeral;
         config.trigger.max_concurrent_positions = 1;
         config.trigger.shadow_run.enabled = false;
 
@@ -3740,6 +3904,7 @@ enabled = true
         config.mode = AppMode::Production;
         config.execution.execution_mode = ExecutionMode::Shadow;
         config.trigger.entry_mode = TriggerEntryMode::ShadowOnly;
+        config.trigger.shadow_run.payer_strategy = TriggerShadowPayerStrategy::Ephemeral;
         config.trigger.max_concurrent_positions = 1;
         config.trigger.shadow_run.enabled = true;
         config.trigger.shadow_run.shadow_rpc_url = "replace-me".to_string();
@@ -3854,7 +4019,7 @@ oracle_log_path = "logs/oracle.log"
 output_dir = "datasets/events"
 
 [oracle]
-decision_log_path = "logs/decisions.jsonl"
+decision_log_path = "logs/decisions"
 "#;
         fs::write(&config_path, config_body).unwrap();
 
@@ -3879,7 +4044,7 @@ decision_log_path = "logs/decisions.jsonl"
         );
         assert_eq!(
             config.oracle.decision_log_path,
-            base.join("logs/decisions.jsonl").to_string_lossy()
+            base.join("logs/decisions").to_string_lossy()
         );
         assert_eq!(
             config.trigger.shadow_run.output_path,
@@ -3893,6 +4058,40 @@ decision_log_path = "logs/decisions.jsonl"
         assert_eq!(
             config.trigger.keypair_path.as_deref(),
             Some(base.join("keys/id.json").to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn test_normalize_decision_log_path_migrates_legacy_jsonl_to_directory() {
+        assert_eq!(
+            normalize_decision_log_path("logs/decisions.jsonl"),
+            "logs/decisions"
+        );
+        assert_eq!(
+            normalize_decision_log_path("/tmp/rollout/decisions.jsonl"),
+            "/tmp/rollout/decisions"
+        );
+        assert_eq!(
+            normalize_decision_log_path("logs/rollout/shadow-burnin/decisions"),
+            "logs/rollout/shadow-burnin/decisions"
+        );
+        assert_eq!(
+            normalize_decision_log_path(
+                "configs/rollout/../../logs/rollout/shadow-burnin-v25-repair/decisions"
+            ),
+            "logs/rollout/shadow-burnin-v25-repair/decisions"
+        );
+    }
+
+    #[test]
+    fn test_resolve_runtime_path_collapses_parent_segments() {
+        let config_dir = Path::new("/tmp/ghost/configs/rollout");
+        assert_eq!(
+            resolve_runtime_path(
+                config_dir,
+                "../../logs/rollout/shadow-burnin-v25-repair/decisions"
+            ),
+            "/tmp/ghost/logs/rollout/shadow-burnin-v25-repair/decisions"
         );
     }
 

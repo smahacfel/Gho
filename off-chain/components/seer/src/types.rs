@@ -244,6 +244,9 @@ pub enum GeyserEvent {
     AccountUpdate {
         /// Slot number
         slot: u64,
+        /// Explicit provenance for event/ingest time axes.
+        #[serde(default)]
+        event_time: EventTimeMetadata,
         /// Optional Solana account write-version used for same-slot ordering.
         #[serde(default)]
         write_version: Option<u64>,

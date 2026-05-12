@@ -38,7 +38,7 @@ Loader launchera i GUI najpierw sprawdza procesowe env, potem lokalny `.env`, a 
 
 | Profil | Plik | Semantyka | Status użycia |
 | --- | --- | --- | --- |
-| `shadow-burnin` | `configs/rollout/shadow-burnin.toml` | `execution_mode=shadow`, `entry_mode=shadow_only`, `funding_lane_mode=full_chain` | canonical aktywny po PR-6 |
+| `shadow-burnin` | `configs/rollout/shadow-burnin.toml` | `execution_mode=shadow`, `entry_mode=shadow_only`, `funding_lane_mode=full_chain`, `trigger.shadow_run.payer_strategy=ephemeral` | canonical clean rerun po repair stream |
 | `paper-burnin` | `configs/rollout/paper-burnin.toml` | `execution_mode=paper`, `entry_mode=shadow_only`, `funding_lane_mode=full_chain` | legacy compare-only / kompatybilność |
 | `dual-micro-live` | `configs/rollout/dual-micro-live.toml` | `execution_mode=dual`, `entry_mode=live_and_shadow`, `funding_lane_mode=disabled` | przygotowany, nie uruchamiać przed formalnym GO po shadow-burnin |
 | `future-live` | `configs/rollout/future-live.toml` | `execution_mode=live`, `entry_mode=live` | przygotowany, nie używać przed PR-7 |
@@ -50,6 +50,8 @@ Loader launchera i GUI najpierw sprawdza procesowe env, potem lokalny `.env`, a 
 3. Wybierz konkretny profil rolloutowy z `configs/rollout/`.
 4. Uruchom preflight dla wybranego profilu.
 5. Jeżeli preflight wypisze placeholder lub brak sekretu, traktuj to jako blokadę startu.
+6. Dla repaired `shadow-burnin` oczekuj czystych artefaktów pod `logs/rollout/shadow-burnin-v25-repair/`, `logs/shadow_run/shadow-burnin-v25-repair/` i `datasets/events/shadow-burnin-v25-repair/`; stare dumpy nie są źródłem prawdy dla tego rerunu.
+7. Po zakończeniu sesji uruchom `python3 scripts/gatekeeper_v25_repair_validation.py --config configs/rollout/shadow-burnin.toml --json`; brak artefaktów, mixed-plane drift, coverage bez `schema_version >= 5` albo odblokowany promotion lock mają kończyć się `NO-GO`.
 
 ## Czego nie robić
 

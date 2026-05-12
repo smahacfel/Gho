@@ -24,12 +24,13 @@ min_sol_threshold = 0.001
 # ── Phase 1: Quantity Gate ─────────────────────────────────────────────────────
 # Dead strict 14/8/7 okazał się zbyt suchy na bieżący flow, ale pełne wyjęcie
 # gate'u było tylko sondą. Wracamy do umiarkowanego 12/8/6.
-min_tx_count = 10
+min_tx_count = 12
 min_unique_signers = 8
 min_buy_count = 6
 
 
 # Finalna ewaluacja nadal zbiera wczesne okno; nie wydłużamy go agresywnie.
+# P0: Extended window needs 10s; invariant extended_window_ms <= max_wait_time_ms.
 max_wait_time_ms = 10000
 
 # ── Phase 2: Velocity Profile ──────────────────────────────────────────────────
@@ -37,77 +38,79 @@ max_wait_time_ms = 10000
 # (p=1.2e-90 separation between survived vs early-death tokens)
 # Survivors: 309ms avg | Early-death: 606ms avg → Strong predictive signal
 min_interval_cv = 0.0
-max_burst_ratio = 1.0
-min_avg_interval_ms = 1.0
-max_avg_interval_ms = 400.0
-min_timing_entropy = 0.2
+max_burst_ratio = 9999.0
+min_avg_interval_ms = 0.0
+max_avg_interval_ms = 450.0
+min_timing_entropy = 0.0
 min_dust_filtered_count = 0
-max_interval_cv = 9.3
+max_interval_cv = 2.3
 max_timing_entropy = 9999.0
 
 # ── Phase 3: Signer Diversity ──────────────────────────────────────────────────
 # SURVIVAL FILTER: HHI ≤ 0.155 predicts survival (p=1.9e-13)
 # Survivors: 0.155 | Early-death: 0.200 → Lower concentration = better
-min_unique_ratio = 0.653
+min_unique_ratio = 0.0
 max_unique_ratio = 1.0
 max_hhi = 0.155
 max_tx_per_signer = 999999
-min_volume_gini = 0.64
-max_volume_gini = 11.0
+min_volume_gini = 0.53
+max_volume_gini = 9999.0
 max_top3_volume_pct = 0.70
-max_same_ms_tx_ratio = 1.0
+max_same_ms_tx_ratio = 0.99
 
 # ── Phase 4: Volume Sanity ─────────────────────────────────────────────────────
 # SURVIVAL FILTER: buy_ratio nadal jest ważny, ale 0.83/0.84 zjadało zbyt dużo
 # flow razem z innymi gate'ami. 0.80 zostawia sentiment-positive bias.
-min_buy_ratio = 0.65
+min_buy_ratio = 0.80
 max_buy_ratio = 1.0
 min_sol_buy_ratio = 0.0
-max_sol_buy_ratio = 1.0
+max_sol_buy_ratio = 0.96
 min_avg_tx_sol = 0.01
 max_avg_tx_sol = 9999.0
 min_volume_cv = 0.01
 min_total_volume_sol = 1.0
 max_volume_cv = 9999.0
-max_total_volume_sol = 9999.0
-min_consecutive_buys = 2
+max_total_volume_sol = 999999.0
+min_consecutive_buys = 3
 
 # ── Phase 5: Dev Behavior ──────────────────────────────────────────────────────
 # Sekcja pozostaje permissive: nie wracamy tu do hardego dev-side filtra ani do
 # `reject_on_dev_sell`, bo to było juz wczesniej falszywie negatywne dla A-like pools.
 min_dev_buy_sol = 0.0
-max_dev_buy_sol = 25.0
-max_dev_tx_ratio = 0.99  # ⭐ FROM LOG
-max_dev_volume_ratio = 0.99
-min_dev_volume_ratio = 0.0  # ⭐ FROM LOG (was 0.0)
+max_dev_buy_sol = 2.0
+max_dev_tx_ratio = 0.99
+max_dev_volume_ratio = 0.23
+min_dev_volume_ratio = 0.0
 min_dev_tx_ratio = 0.0
 reject_on_dev_sell = false
 
 # ── Phase 6: Bonding Curve Dynamics ────────────────────────────────────────────
-# SURVIVAL FILTER: Market cap & bonding progress correlate with survival
-# Survivors: 54.9 SOL | Early-death: 43.2 SOL (+27.1% difference)
-# Survivors: 47% bonding | Early-death: 41% bonding (+12.6% difference)
-min_price_change_ratio = 0.0
-max_price_change_ratio = 9999.0
+# Shadow-burnin A/B: A-like pools miały nizszy price_change, nizszy bonding
+# oraz czesciej miescily sie pod capem wolumenu / market cap.
+min_price_change_ratio = 0.01
+# Tymczasowy legacy safety cap — zamyka blind spot 9999.0.
+# To NIE jest pełny PDD alignment (1.05), tylko pierwszy krok de-riskingu.
+# Docelowe zaostrzanie: 1.20 → 1.10 → 1.05 (osobne ADR-y po validation).
+max_price_change_ratio = 1.50
 max_single_tx_price_impact_pct = 9999.0
 min_single_sell_impact_pct = 0.0
 max_single_sell_impact_pct = 9999.0
-max_bonding_progress_pct = 62.0
-min_bonding_progress_pct = 4.0
-min_market_cap_sol = 45.0
+max_bonding_progress_pct = 99.0
+min_bonding_progress_pct = 40.0
+min_market_cap_sol = 60.0
 
 # ── Decision ────────────────────────────────────────────────────────────────────
 # 3-layer decision ON: tokeny nie giną od razu przy lekkim przekroczeniu progów —
 # dostają flagę soft_score i mogą nadrobić w innych metrykach
-min_phases_to_pass = 1  # ⭐ FROM LOG (was 0)
-re_eval_tx_interval = 1
+min_phases_to_pass = 3
+re_eval_tx_interval = 3
 use_three_layer_decision = true
 
 # Hard Fails ────────────────────────────────────────────────────────────────────
 # Tylko skrajna koncentracja ma prawo ubić BUY na hard-fail.
-hard_fail_hhi = 9.90
-hard_fail_same_ms_tx_ratio = 9999
-hard_fail_top3_volume_pct = 1.0
+hard_fail_hhi = 0.10
+hard_fail_same_ms_tx_ratio = 0.60
+hard_fail_top3_volume_pct = 0.70
 
 # Soft signals ── AKTYWNE (3L scoring) ──────────────────────────────────────────
 # manipulation (3) >> diversity (2) > timing (1) > ecosystem (1) 
@@ -116,14 +119,14 @@ soft_weight_timing = 1
 soft_weight_manipulation = 3
 soft_weight_diversity = 2
 soft_weight_ecosystem = 1
-max_soft_score = 8  # ⭐ FROM LOG (was 1)
+max_soft_score = 6
 
 # ── Alpha Gate (positive selector after sybil) ───────────────────────────────
 enable_alpha_gate = true
-min_momentum = 0.30
-min_demand = 0.30
-min_alpha_joint = 0.25
-min_alpha_sample = 12
+min_momentum = 0.55
+min_demand = 0.55
+min_alpha_joint = 0.35
+min_alpha_sample = 15
 
 # ── Prosperity filter (Balanced v1 final selector) ──────────────────────────
 # Wchodzi dopiero po hard/core/sybil/alpha i ma odsiać BUY-e, które nie
@@ -137,72 +140,69 @@ prosperity_branch2_min_market_cap_sol = 55.0
 prosperity_branch2_min_early_slot_volume_dominance_buy = 0.90
 prosperity_branch3_max_hhi = 0.0416
 prosperity_branch3_min_fee_topology_diversity_index = 0.0909
-# Overlay wyłączyliśmy na ten rerun, ale teraz go aktywujemy.
-enable_prosperity_overlay = true
-prosperity_overlay_max_price_change_ratio = 2.2
-prosperity_overlay_max_bonding_progress_pct = 85.0
-prosperity_overlay_min_fee_topology_diversity_index = 0.10
-prosperity_overlay_branch23_max_sell_buy_ratio = 0.18
-prosperity_overlay_branch2_max_price_change_ratio = 2.0
+enable_prosperity_overlay = false
+# Aligned with P3 legacy safety cap 1.50 (was 9999.0 blind spot).
+prosperity_overlay_max_price_change_ratio = 1.50
+prosperity_overlay_max_bonding_progress_pct = 100.0
+prosperity_overlay_min_fee_topology_diversity_index = 0.0
+prosperity_overlay_branch23_max_sell_buy_ratio = 9999.0
+# Aligned with P3 legacy safety cap 1.50 (was 9999.0 blind spot).
+prosperity_overlay_branch2_max_price_change_ratio = 1.50
 
 # Dev Unknown ── AKTYWNE (dev nieznany = podejrzane) ────────────────────────────
-dev_unknown_min_market_cap_sol = 2.0
-dev_unknown_min_sol_buy_ratio = 0.0       # ❄ FROZEN
-dev_unknown_max_soft_points = 255         # ❄ FROZEN
-dev_unknown_max_single_tx_price_impact_pct = 9999.0  # ❄ FROZEN
+dev_unknown_min_market_cap_sol = 65.0
+dev_unknown_min_sol_buy_ratio = 0.65
+dev_unknown_max_soft_points = 5
+dev_unknown_max_single_tx_price_impact_pct = 28.0
 
 # ── Hybrid gRPC / Yellowstone fingerprint thresholds ──────────────────────────
 # Lekki upstream choke zsynchronizowany z Balanced: odcinamy ewidentny churn i
 # flipper-heavy flow, ale nie duplikujemy agresywnych branchy prosperity w core.
-max_sell_buy_ratio = 0.99
-max_compute_unit_cluster_dominance = 0.99
-max_static_fee_profile_ratio = 0.99
-min_avg_inner_ix_count_50tx = 0.01
-min_fixed_size_buy_ratio = 0.0001
-max_fixed_size_buy_ratio = 1.0
-max_fixed_size_buy_ratio_1e4 = 0.99
-max_flipper_presence_ratio = 0.99
-max_jito_tip_intensity = 1.0
-max_early_slot_volume_dominance_buy = 0.99
-max_early_top3_buy_volume_pct_3s = 0.75
-max_whale_reversal_ratio_top3 = 0.99
-max_whale_reversal_ratio_top1 = 0.99
+max_sell_buy_ratio = 9999.0
+max_compute_unit_cluster_dominance = 9999.0
+max_static_fee_profile_ratio = 9999.0
+min_avg_inner_ix_count_50tx = 0.0
+min_fixed_size_buy_ratio = 0.0
+max_fixed_size_buy_ratio = 9999.0
+max_fixed_size_buy_ratio_1e4 = 9999.0
+max_flipper_presence_ratio = 9999.0
+max_jito_tip_intensity = 9999.0
+max_early_slot_volume_dominance_buy = 9999.0
+max_early_top3_buy_volume_pct_3s = 0.71
+max_whale_reversal_ratio_top3 = 9999.0
+max_whale_reversal_ratio_top1 = 9999.0
 min_sell_buy_ratio = 0.0
 min_compute_unit_cluster_dominance = 0.0
 min_static_fee_profile_ratio = 0.0
 max_avg_inner_ix_count_50tx = 9999.0
 min_jito_tip_intensity = 0.0
-min_dev_paperhand_latency_ms = 2000
+min_dev_paperhand_latency_ms = 3983  # shadow-burnin A-like cutoff (Youden J)
 
-# ── Sybil Interference (post fresh-run recalibration, FSC still telemetry-only) ─
-# Wracamy do aktywnego bucketu Stage B/C dla DES/SFD/FTDI/DBIA/CPV:
-# - DES pozostaje lead signalem,
-# - SFD pozostaje corroboratorem,
-# - FTDI i DBIA wracaja jako lekki structural bucket + combo,
-# - CPV zostaje helperem,
-# - FSC nadal pozostaje poza verdict path do osobnego bake.
-min_fee_topology_diversity_index = 0.06
-max_dev_buyer_infrastructure_affinity = 0.6  # ⭐ FROM CORRECT LOG (was 0.90)
-min_spend_fraction_divergence = 0.06
-min_demand_elasticity_score = 0.05
-max_signer_cross_pool_velocity = 0.5  # ⭐ FROM CORRECT LOG (was 0.90)
-max_funding_source_concentration = 0.6  # ⭐ FROM CORRECT LOG (was 0.90)
-soft_penalty_low_ftdi = 1
-soft_penalty_high_dbia = 1
-soft_penalty_low_sfd = 2
-soft_penalty_inelastic_demand = 3
-soft_penalty_high_cpv = 1
-# PR-4 FSC bake guardrail: authoritative lane can be baked, but penalties and
-# combo veto stay frozen at zero/off until a separate post-bake policy follow-up.
+# ── Sybil Interference (shadow-burnin recalibration, FSC still telemetry-only) ─
+# FTDI/SFD/DES zostawiamy relatywnie lagodne: w A/B separacja byla za slaba,
+# a legacy progi generowaly zbyt duzo naruszen po stronie A-like.
+# DBIA oraz CPV dostaja ostrzejsze cut-offy z A/B, bo to jedyne sybil-progi,
+# ktore dalo sie przeniesc 1:1 do obecnego kierunku logiki configu.
+min_fee_topology_diversity_index = 0.0
+max_dev_buyer_infrastructure_affinity = 9999.0
+min_spend_fraction_divergence = 0.0
+min_demand_elasticity_score = 0.0
+max_signer_cross_pool_velocity = 9999.0
+max_funding_source_concentration = 0.99
+soft_penalty_low_ftdi = 0
+soft_penalty_high_dbia = 0
+soft_penalty_low_sfd = 0
+soft_penalty_inelastic_demand = 0
+soft_penalty_high_cpv = 0
 soft_penalty_high_fsc = 0
-soft_penalty_high_dbia_low_ftdi_combo = 2
-soft_penalty_low_des_low_sfd_combo = 2
+soft_penalty_high_dbia_low_ftdi_combo = 0
+soft_penalty_low_des_low_sfd_combo = 0
 soft_penalty_high_cpv_low_des_combo = 0
 soft_penalty_high_fsc_high_cpv_combo = 0
-max_sybil_soft_points = 3
-dev_unknown_max_sybil_soft_points = 4
-enable_sybil_interference_layer = true
-enable_sybil_combo_veto = true
+max_sybil_soft_points = 255
+dev_unknown_max_sybil_soft_points = 255
+enable_sybil_interference_layer = false
+enable_sybil_combo_veto = false
 emit_sybil_meta_score = false
 require_ready_fsc_for_combo_veto = true
 funding_lookback_window_s = 180
@@ -217,6 +217,111 @@ hard_fail_bot_min_observation_ms = 1500
 # ── Yellowstone-only (opcjonalne) ───────────────────────────────────────────────
 # use_slot_ordering = false
 # min_failed_tx_ratio_for_bot_flag = 0.5
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GATEKEEPER V2.5: Rollout guardrails
+# ══════════════════════════════════════════════════════════════════════════════
+[gatekeeper_v2.v25]
+shadow_enabled = true
+live_execution_enabled = false
+require_promotion_adr = true
+emit_shadow_decisions = true
+emit_ablation_fields = true
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GATEKEEPER V2.5: Dynamic Observation Window (dow)
+# ══════════════════════════════════════════════════════════════════════════════
+[gatekeeper_v2.dow]
+enabled = true
+early_entry_enabled = true
+early_entry_min_ms = 2000
+early_entry_max_ms = 5000
+early_entry_min_confidence = 0.85
+early_entry_min_tx_count = 15
+early_entry_min_phases_passed = 6
+early_entry_min_momentum = 0.40
+early_entry_max_sybil_points = 1
+early_entry_max_entry_drift_pct = 3.0
+normal_window_ms = 7000
+normal_window_min_confidence = 0.65
+extended_window_ms = 10000
+extended_window_min_confidence = 0.55
+extended_require_pdd_clean = true
+tick_interval_ms = 250
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GATEKEEPER V2.5: Trajectory Aware Scoring (tas)
+# ══════════════════════════════════════════════════════════════════════════════
+[gatekeeper_v2.tas]
+enabled = true
+tas_hard_reject_threshold = 0.30
+tas_confidence_modulator_min = 0.75
+tas_confidence_modulator_max = 1.25
+tas_min_tx_per_segment = 3
+tas_min_total_duration_ms = 3000
+momentum_trajectory_weight = 0.25
+momentum_accel_min_ratio = 1.15
+momentum_decel_max_ratio = 0.85
+hhi_trajectory_weight = 0.20
+hhi_decline_min_ratio = 0.85
+volume_trajectory_weight = 0.20
+volume_cv_max = 0.60
+interval_trajectory_weight = 0.15
+interval_shortening_min_ratio = 0.80
+buy_ratio_trajectory_weight = 0.20
+buy_ratio_stability_min = 0.55
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GATEKEEPER V2.5: Pump & Dump Detector (pdd)
+# ══════════════════════════════════════════════════════════════════════════════
+[gatekeeper_v2.pdd]
+enabled = true
+entry_drift_max_pct = 5.0
+entry_drift_soft_max_pct = 3.0
+entry_drift_soft_weight = 2
+spike_detection_enabled = true
+spike_observation_window_ms = 3000
+spike_ratio_threshold = 2.0
+spike_hard_veto = true
+spike_soft_penalty = 3
+reserve_min_sol = 30.0
+reserve_min_ratio = 0.15
+whale_top3_max_pct = 60.0
+whale_top3_size_max_sol = 15.0
+whale_single_max_pct = 35.0
+ramping_detection_enabled = true
+ramping_min_consecutive_buys = 4
+ramping_size_tolerance_pct = 15.0
+ramping_hard_veto = true
+flash_crash_protection_enabled = true
+flash_crash_max_price_impact_pct = 15.0
+flash_crash_sell_cluster_max_ms = 500
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GATEKEEPER V2.5: Adaptive Prosperity (aps)
+# ══════════════════════════════════════════════════════════════════════════════
+[gatekeeper_v2.aps]
+enabled = true
+adaptive_enabled = false
+shadow_suggestions_enabled = true
+adaptation_interval_buys = 50
+calibration_lookback_buys = 100
+min_calibration_samples = 30
+branch_weight_adaptation = true
+branch_weight_learning_rate = 0.05
+branch_min_weight = 0.15
+regime_detection_enabled = true
+regime_lookback_hours = 4
+regime_high_volatility_threshold = 0.6
+regime_high_vol_entry_drift_max_pct = 3.0
+regime_high_vol_confidence_min = 0.70
+regime_normal_entry_drift_max_pct = 5.0
+regime_normal_confidence_min = 0.60
+# Włączone dla shadow-burnin V2.5 repair — provisional regime labels.
+regime_local_heuristic_enabled = true
+cross_pool_outcome_tracker_available = false
 
 
 

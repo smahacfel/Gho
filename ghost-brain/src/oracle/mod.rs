@@ -25,6 +25,7 @@ pub mod outcome_tracker;
 pub mod predator_strategy;
 pub mod profiler;
 pub mod qman;
+pub mod reason_code;
 pub mod score_history;
 pub mod scoring;
 pub mod scoring_phase;

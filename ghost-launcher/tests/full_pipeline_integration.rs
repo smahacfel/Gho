@@ -3,7 +3,9 @@ use ghost_brain::fast_pipeline::EnhancedCandidate;
 use ghost_core::account_state_core::types::{AccountStateUpdate, StatePhase, UpdateSource};
 use ghost_core::session::types::SessionStatus;
 use ghost_core::{CurveFinality, CurveFreshnessState, EventSemanticEnvelope};
-use ghost_launcher::components::gatekeeper::{GatekeeperVerdict, GatekeeperVerdictType};
+use ghost_launcher::components::gatekeeper::{
+    GatekeeperBuffer, GatekeeperVerdict, GatekeeperVerdictType,
+};
 use ghost_launcher::components::gatekeeper_policy::{
     build_assessment_from_features, build_timeout_decision_from_assessment, PolicyEvaluationContext,
 };
@@ -154,6 +156,7 @@ fn pipeline_config() -> GatekeeperV2Config {
         prosperity_overlay_min_fee_topology_diversity_index: 0.10,
         prosperity_overlay_branch23_max_sell_buy_ratio: 0.18,
         prosperity_overlay_branch2_max_price_change_ratio: 2.0,
+        ..Default::default()
     }
 }
 
@@ -619,6 +622,43 @@ fn full_pipeline_timeout_replay_matches_feature_timeout_builder() {
             .state_phase,
         features.account_features.state_phase
     );
+}
+
+#[test]
+fn full_pipeline_feature_verdict_caches_v25_confidence_for_terminal_assessment() {
+    let config = pipeline_config();
+    let verdict = canonical_ready_terminal_verdict(config.clone());
+
+    match verdict {
+        GatekeeperVerdict::Buy { assessment, .. }
+        | GatekeeperVerdict::Reject { assessment, .. } => {
+            assert!(
+                assessment.v25_confidence.is_some(),
+                "feature-driven terminal verdict must cache v25 confidence"
+            );
+        }
+        _ => panic!("expected terminal buy/reject verdict"),
+    }
+}
+
+#[test]
+fn full_pipeline_phase1_incomplete_feature_verdict_caches_v25_confidence() {
+    let config = pipeline_config();
+    let mut buffer = GatekeeperBuffer::new(Pubkey::new_unique(), &config);
+    buffer.set_registered_wall_t0(1_000);
+    let features = phase1_incomplete_feature_snapshot(&config);
+
+    let verdict = buffer.evaluate_from_features(features, &config);
+    match verdict {
+        GatekeeperVerdict::Timeout { assessment }
+        | GatekeeperVerdict::Reject { assessment, .. } => {
+            assert!(
+                assessment.v25_confidence.is_some(),
+                "phase1-incomplete terminal verdict must cache v25 confidence"
+            );
+        }
+        _ => panic!("expected terminal reject/timeout verdict"),
+    }
 }
 
 #[test]

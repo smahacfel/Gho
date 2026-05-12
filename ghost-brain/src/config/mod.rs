@@ -2,6 +2,7 @@
 
 pub mod e2e_config;
 pub mod fallback_config;
+pub mod gatekeeper_v25_config;
 pub mod ghost_brain_config;
 pub mod mci_config;
 pub mod qedd_config;
@@ -53,6 +54,12 @@ pub use ghost_brain_config::{
     TcrPhiConfig,
     WeightProfile,
     WeightProfiles,
+};
+
+// Re-export Gatekeeper V2.5 config types
+pub use gatekeeper_v25_config::{
+    AdaptiveProsperityConfig, DynamicObservationWindowConfig, EntryDriftAnchorQuality,
+    GatekeeperV25RolloutConfig, PumpAndDumpDetectorConfig, TrajectoryAwareScoringConfig,
 };
 
 // Re-export PostBuy Guardian config

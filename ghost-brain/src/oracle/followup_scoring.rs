@@ -566,6 +566,8 @@ mod tests {
         let logger_config = DecisionLoggerConfig {
             log_dir: temp_dir.path().to_path_buf(),
             gatekeeper_log_dir: temp_dir.path().to_path_buf(),
+            gatekeeper_rollout_profile: "test-rollout".to_string(),
+            gatekeeper_config_hash: "test-config-hash".to_string(),
             channel_buffer_size: 100,
             enabled: true,
         };
@@ -594,6 +596,8 @@ mod tests {
         let logger_config = DecisionLoggerConfig {
             log_dir: temp_dir.path().to_path_buf(),
             gatekeeper_log_dir: temp_dir.path().to_path_buf(),
+            gatekeeper_rollout_profile: "test-rollout".to_string(),
+            gatekeeper_config_hash: "test-config-hash".to_string(),
             channel_buffer_size: 100,
             enabled: true,
         };

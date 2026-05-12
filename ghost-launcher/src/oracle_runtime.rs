@@ -125,7 +125,7 @@ const TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 const WRAPPED_SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const PUMPFUN_GLOBAL_STATE: &str = "TSLvdd1pWpHVjahSpsvCXUbgwsL3JAcvokwaKt1eokM";
-const KNOWN_BAD_LEGACY_FEE_RECIPIENT: &str = "CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM";
+const KNOWN_BAD_LEGACY_FEE_RECIPIENT: &str = "CebN5WGQ4jvEPvsVU4EoHEpgznyQQNDGNesDwrFs8YWj";
 const COMPUTE_BUDGET_PROGRAM_ID: &str = "ComputeBudget111111111111111111111111111111";
 const ASSOCIATED_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
@@ -2226,6 +2226,9 @@ impl OracleRuntime {
     }
 
     fn account_update_event_latency_ms(&self, event: &AccountUpdateEvent) -> Option<u64> {
+        if let Some(effective_event_ts_ms) = event.event_time.effective_event_ts_ms() {
+            return Some(current_time_ms().saturating_sub(effective_event_ts_ms));
+        }
         match event.replay_origin {
             seer::ipc::AccountUpdateReplayOrigin::PendingReplay => event.replay_buffer_dwell_ms,
             seer::ipc::AccountUpdateReplayOrigin::Live => {
@@ -2331,6 +2334,15 @@ impl OracleRuntime {
             ghost_core::account_state_core::types::AccountUpdateResult::Applied
                 | ghost_core::account_state_core::types::AccountUpdateResult::PromotedFromBootstrap
         );
+        if let Some(event) = event {
+            let runtime_time_source = runtime_account_update_time_source_info(event);
+            coverage_audit().record_account_update_runtime_seen(
+                &update.pool_amm_id.to_string(),
+                runtime_time_source.effective_source,
+                runtime_time_source.fallback_class,
+                update_accepted,
+            );
+        }
         if update_accepted {
             let latency_ms = event.and_then(|event| self.account_update_event_latency_ms(event));
             coverage_audit()
@@ -4398,6 +4410,8 @@ fn enforce_buy_log_buy_routing(
 ) {
     log.decision_verdict_buy = Some(true);
     log.verdict_type = Some("BUY".to_string());
+    log.legacy_live_verdict_buy = Some(true);
+    log.legacy_live_verdict_type = Some("BUY".to_string());
 
     if log.decision_reason.is_none() {
         log.decision_reason = assessment
@@ -4406,12 +4420,76 @@ fn enforce_buy_log_buy_routing(
             .map(|decision| decision.reason_chain.clone())
             .or_else(|| Some("gatekeeper_buy".to_string()));
     }
+    if log.legacy_live_reason_chain.is_none() {
+        log.legacy_live_reason_chain = log.decision_reason.clone();
+    }
 
     if log.ab_record_id.is_none() {
         if let (Some(t0), Some(t_end)) = (log.ab_t0_event_ts_ms, log.ab_t_end_event_ts_ms) {
             log.ab_record_id = Some(format!("{}:{}:{}:BUY", log.pool_id, t0, t_end));
         }
     }
+}
+
+fn canonical_gatekeeper_config_hash(
+    config: &ghost_brain::config::GatekeeperV2Config,
+) -> Result<String, serde_json::Error> {
+    let canonical_bytes = serde_json::to_vec(config)?;
+    Ok(blake3::hash(&canonical_bytes).to_hex().to_string())
+}
+
+fn derive_gatekeeper_rollout_profile(log_dir: &std::path::Path) -> String {
+    let components: Vec<String> = log_dir
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect();
+
+    components
+        .windows(2)
+        .find_map(|window| {
+            if window[0] == "rollout" {
+                Some(window[1].clone())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "unknown_rollout".to_string())
+}
+
+fn build_decision_logger_config(
+    decision_log_path: &str,
+    gatekeeper_config: &ghost_brain::config::GatekeeperV2Config,
+) -> ghost_brain::oracle::DecisionLoggerConfig {
+    let log_dir = std::path::PathBuf::from(crate::config::normalize_decision_log_path(
+        decision_log_path,
+    ));
+    let gatekeeper_rollout_profile = derive_gatekeeper_rollout_profile(&log_dir);
+    let gatekeeper_config_hash = match canonical_gatekeeper_config_hash(gatekeeper_config) {
+        Ok(hash) => hash,
+        Err(err) => {
+            error!(
+                "GATEKEEPER_LOG_HASH_FAILED: failed to serialize gatekeeper config for routing hash: {}",
+                err
+            );
+            "config_hash_unavailable".to_string()
+        }
+    };
+
+    ghost_brain::oracle::DecisionLoggerConfig {
+        log_dir: log_dir.clone(),
+        gatekeeper_log_dir: log_dir,
+        gatekeeper_rollout_profile,
+        gatekeeper_config_hash,
+        channel_buffer_size: 1000,
+        enabled: true,
+    }
+}
+
+fn build_coverage_audit_log_path(decision_log_path: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(crate::config::normalize_decision_log_path(
+        decision_log_path,
+    ))
+    .join("seer_runtime_coverage_audit.jsonl")
 }
 
 /// Default max vector length for JSONL v3 window vectors.
@@ -4711,13 +4789,14 @@ fn evaluate_feature_driven_terminal_verdict(
                     .record_timeout_without_canonical_updates(&session.pool_amm_id.to_string());
             }
             let buffer = session.gatekeeper_buffer();
-            let assessment = build_timeout_assessment_from_policy_context(
+            let mut assessment = build_timeout_assessment_from_policy_context(
                 features,
                 gatekeeper_config,
                 buffer.policy_evaluation_context(),
                 buffer.curve_t0_event_ts_ms(),
                 buffer.curve_wait_elapsed_ms(),
             );
+            assessment.cache_v25_confidence(gatekeeper_config);
             return GatekeeperVerdict::Timeout { assessment };
         }
     }
@@ -6259,7 +6338,12 @@ fn spawn_shadow_buy_observer(
         match handle.await {
             Ok(Ok(mut report)) => {
                 report.live_signature = live_signature;
-                let shadow_event = shadow_buy_event_from_report(&pool_amm_id, &base_mint, report);
+                let shadow_event =
+                    crate::components::trigger::shadow_run::shadow_buy_event_from_report(
+                        &pool_amm_id.to_string(),
+                        &base_mint,
+                        report,
+                    );
                 if emit_event_bus {
                     if let Err(e) =
                         event_tx.send(GhostEvent::shadow_buy_simulated(shadow_event.clone()))
@@ -6286,22 +6370,31 @@ fn spawn_shadow_buy_observer(
                 }
             }
             Ok(Err(e)) => {
-                let record =
-                    crate::components::trigger::shadow_run::ShadowBuySimulationRecord::from_failure(
-                        crate::config::TriggerEntryMode::LiveAndShadow,
+                let shadow_event =
+                    crate::components::trigger::shadow_run::shadow_failure_event_from_request(
                         &pool_amm_id.to_string(),
                         &base_mint,
                         &request,
                         live_signature,
                         &e,
                     );
-                crate::components::trigger::shadow_run::record_shadow_buy_metrics(&record);
-                if let Err(write_err) =
-                    crate::components::trigger::shadow_run::append_shadow_buy_record(
-                        &shadow_log_path,
-                        &record,
-                    )
-                    .await
+                if emit_event_bus {
+                    if let Err(send_err) =
+                        event_tx.send(GhostEvent::shadow_buy_simulated(shadow_event.clone()))
+                    {
+                        warn!(
+                            pool = %pool_amm_id,
+                            "Failed to emit failed ShadowBuySimulated event from live_and_shadow: {}",
+                            send_err
+                        );
+                    }
+                }
+                if let Err(write_err) = append_shadow_buy_report_record(
+                    &shadow_log_path,
+                    crate::config::TriggerEntryMode::LiveAndShadow,
+                    &shadow_event,
+                )
+                .await
                 {
                     error!(
                         pool = %pool_amm_id,
@@ -6317,22 +6410,31 @@ fn spawn_shadow_buy_observer(
             }
             Err(e) => {
                 let join_error = anyhow::Error::new(e);
-                let record =
-                    crate::components::trigger::shadow_run::ShadowBuySimulationRecord::from_failure(
-                        crate::config::TriggerEntryMode::LiveAndShadow,
+                let shadow_event =
+                    crate::components::trigger::shadow_run::shadow_failure_event_from_request(
                         &pool_amm_id.to_string(),
                         &base_mint,
                         &request,
                         live_signature,
                         &join_error,
                     );
-                crate::components::trigger::shadow_run::record_shadow_buy_metrics(&record);
-                if let Err(write_err) =
-                    crate::components::trigger::shadow_run::append_shadow_buy_record(
-                        &shadow_log_path,
-                        &record,
-                    )
-                    .await
+                if emit_event_bus {
+                    if let Err(send_err) =
+                        event_tx.send(GhostEvent::shadow_buy_simulated(shadow_event.clone()))
+                    {
+                        warn!(
+                            pool = %pool_amm_id,
+                            "Failed to emit join-failure ShadowBuySimulated event from live_and_shadow: {}",
+                            send_err
+                        );
+                    }
+                }
+                if let Err(write_err) = append_shadow_buy_report_record(
+                    &shadow_log_path,
+                    crate::config::TriggerEntryMode::LiveAndShadow,
+                    &shadow_event,
+                )
+                .await
                 {
                     error!(
                         pool = %pool_amm_id,
@@ -6348,51 +6450,6 @@ fn spawn_shadow_buy_observer(
             }
         }
     });
-}
-
-fn shadow_buy_event_from_report(
-    pool_amm_id: &Pubkey,
-    base_mint: &str,
-    report: crate::components::trigger::ShadowBuySimulationReport,
-) -> crate::events::ShadowBuySimulationEvent {
-    let trace_ref = shadow_trace_ref_from_shadow_report(&report);
-    crate::events::ShadowBuySimulationEvent {
-        candidate_id: crate::events::build_execution_candidate_id(
-            base_mint,
-            pool_amm_id.to_string(),
-            trace_ref,
-        ),
-        pool_amm_id: pool_amm_id.to_string(),
-        base_mint: base_mint.to_string(),
-        mint: report.mint,
-        live_signature: report.live_signature,
-        payer_pubkey: report.payer_pubkey,
-        amount_lamports: report.amount_lamports,
-        entry_token_amount_raw: report.entry_token_amount_raw,
-        tip_lamports: report.tip_lamports,
-        decision_ts_ms: report.decision_ts_ms,
-        simulation_started_ts_ms: report.simulation_started_ts_ms,
-        simulation_finished_ts_ms: report.simulation_finished_ts_ms,
-        latency_ms: report.latency_ms,
-        shadow_duration_ms: report.shadow_duration_ms,
-        rpc_slot: report.rpc_slot,
-        retry_count: report.retry_count,
-        used_sig_verify: report.used_sig_verify,
-        used_replace_recent_blockhash: report.used_replace_recent_blockhash,
-        units_consumed: report.units_consumed,
-        logs: report.logs,
-        return_data: report.return_data,
-        err: report.err,
-    }
-}
-
-fn shadow_trace_ref_from_shadow_report(
-    report: &crate::components::trigger::ShadowBuySimulationReport,
-) -> String {
-    report
-        .live_signature
-        .clone()
-        .unwrap_or_else(|| report.decision_ts_ms.to_string())
 }
 
 fn shadow_entry_price(trade_value_sol: f64, entry_token_amount_raw: Option<u64>) -> Option<f64> {
@@ -6509,11 +6566,22 @@ async fn append_shadow_buy_report_record(
     entry_mode: crate::config::TriggerEntryMode,
     record: &crate::events::ShadowBuySimulationEvent,
 ) -> anyhow::Result<()> {
+    let id_key = crate::components::trigger::shadow_run::make_shadow_idempotency_key(
+        &record.pool_amm_id,
+        &record.base_mint,
+        "", // rollout_profile unavailable at record level; pool+mint is unique
+    );
     let jsonl_record =
         crate::components::trigger::shadow_run::ShadowBuySimulationRecord::from_event(
             entry_mode, record,
-        );
+        )
+        .with_idempotency_key(id_key);
     crate::components::trigger::shadow_run::record_shadow_buy_metrics(&jsonl_record);
+    crate::oracle_metrics::record_shadow_lifecycle_status(if jsonl_record.err.is_some() {
+        "failed_reconciliation"
+    } else {
+        "dispatched"
+    });
     crate::components::trigger::shadow_run::append_shadow_buy_record(log_path, &jsonl_record).await
 }
 
@@ -6570,16 +6638,28 @@ fn shadow_execution_outcome_from_dispatch_error(
     }
 
     match crate::components::trigger::shadow_run::classify_shadow_error(&message) {
-        "transport" => "shadow_transport_error".to_string(),
-        "semantic" => "shadow_simulation_error".to_string(),
+        "network_provider_problem" | "timing_blockhash_problem" => {
+            "shadow_transport_error".to_string()
+        }
+        "authority_problem" => "shadow_authority_error".to_string(),
+        "fee_compute_problem" => "shadow_fee_compute_error".to_string(),
+        "data_problem" => "shadow_data_problem".to_string(),
+        "simulation_mismatch" => "shadow_simulation_error".to_string(),
+        "logic_invariant_problem" => "shadow_invariant_error".to_string(),
         _ => "shadow_unknown_error".to_string(),
     }
 }
 
 fn shadow_execution_outcome_from_report_err(err: &str) -> String {
     match crate::components::trigger::shadow_run::classify_shadow_error(err) {
-        "transport" => "shadow_transport_error".to_string(),
-        "semantic" => "shadow_simulation_error".to_string(),
+        "network_provider_problem" | "timing_blockhash_problem" => {
+            "shadow_transport_error".to_string()
+        }
+        "authority_problem" => "shadow_authority_error".to_string(),
+        "fee_compute_problem" => "shadow_fee_compute_error".to_string(),
+        "data_problem" => "shadow_data_problem".to_string(),
+        "simulation_mismatch" => "shadow_simulation_error".to_string(),
+        "logic_invariant_problem" => "shadow_invariant_error".to_string(),
         _ => "shadow_unknown_error".to_string(),
     }
 }
@@ -6596,8 +6676,7 @@ fn shadow_execution_outcome_from_handoff_ack(ack: DirectPostBuyHandoffAck) -> Op
 fn derive_buy_account_overrides(
     buffered_txs: &[crate::components::gatekeeper::GatekeeperBufferedTx],
 ) -> crate::components::trigger::BuyAccountOverrides {
-    let known_bad_fee_recipient =
-        Pubkey::from_str(KNOWN_BAD_LEGACY_FEE_RECIPIENT).expect("valid bad fee recipient");
+    let canonical_global_config = trigger::DirectBuyBuilder::canonical_global_config();
     let mut overrides = crate::components::trigger::BuyAccountOverrides::default();
     for buffered in buffered_txs.iter().rev() {
         let tx = buffered.tx.as_ref();
@@ -6609,13 +6688,16 @@ fn derive_buy_account_overrides(
                 .global_config
                 .as_deref()
                 .and_then(|value| Pubkey::try_from(value).ok());
+            overrides.global_config = overrides
+                .global_config
+                .filter(|value| *value == canonical_global_config);
         }
         if overrides.fee_recipient.is_none() {
             overrides.fee_recipient = tx
                 .fee_recipient
                 .as_deref()
                 .and_then(|value| Pubkey::try_from(value).ok())
-                .filter(|value| *value != known_bad_fee_recipient);
+                .filter(trigger::DirectBuyBuilder::is_authorized_fee_recipient);
         }
         if overrides.token_program.is_none() {
             overrides.token_program = tx
@@ -6625,7 +6707,6 @@ fn derive_buy_account_overrides(
         }
         if overrides.buy_variant.is_none() {
             overrides.buy_variant = tx.buy_variant.as_deref().and_then(|value| match value {
-                "legacy_buy" => Some(trigger::PumpfunBuyVariant::LegacyBuy),
                 "routed_exact_sol_in" => Some(trigger::PumpfunBuyVariant::RoutedExactSolIn),
                 _ => None,
             });
@@ -7071,8 +7152,11 @@ async fn apply_trigger_buy_outcome(
                 .as_deref()
                 .map(shadow_execution_outcome_from_report_err)
                 .unwrap_or_else(|| "shadow_simulated".to_string());
-            let shadow_event =
-                shadow_buy_event_from_report(&pool_amm_id, &pool_data.base_mint, report);
+            let shadow_event = crate::components::trigger::shadow_run::shadow_buy_event_from_report(
+                &pool_amm_id.to_string(),
+                &pool_data.base_mint,
+                report,
+            );
             if trigger_component.shadow_run_emit_event_bus() {
                 if let Err(e) =
                     event_tx.send(GhostEvent::shadow_buy_simulated(shadow_event.clone()))
@@ -7298,21 +7382,31 @@ async fn apply_trigger_dispatch_receipt(
                 if trigger_component.supports_shadow_run() {
                     let shadow_log_path =
                         std::path::PathBuf::from(trigger_component.shadow_run_output_path());
-                    let record = crate::components::trigger::shadow_run::ShadowBuySimulationRecord::from_failure(
+                    let shadow_event =
+                        crate::components::trigger::shadow_run::shadow_failure_event_from_request(
+                            &pool_amm_id.to_string(),
+                            &pool_data.base_mint,
+                            &request,
+                            None,
+                            &e,
+                        );
+                    if trigger_component.shadow_run_emit_event_bus() {
+                        if let Err(send_err) =
+                            event_tx.send(GhostEvent::shadow_buy_simulated(shadow_event.clone()))
+                        {
+                            warn!(
+                                pool = %pool_amm_id,
+                                "Failed to emit shadow dispatch failure event: {}",
+                                send_err
+                            );
+                        }
+                    }
+                    if let Err(write_err) = append_shadow_buy_report_record(
+                        &shadow_log_path,
                         trigger_component.entry_mode(),
-                        &pool_amm_id.to_string(),
-                        &pool_data.base_mint,
-                        &request,
-                        None,
-                        &e,
-                    );
-                    crate::components::trigger::shadow_run::record_shadow_buy_metrics(&record);
-                    if let Err(write_err) =
-                        crate::components::trigger::shadow_run::append_shadow_buy_record(
-                            &shadow_log_path,
-                            &record,
-                        )
-                        .await
+                        &shadow_event,
+                    )
+                    .await
                     {
                         error!(
                             pool = %pool_amm_id,
@@ -7336,21 +7430,32 @@ async fn apply_trigger_dispatch_receipt(
                 if trigger_component.supports_shadow_run() {
                     let shadow_log_path =
                         std::path::PathBuf::from(trigger_component.shadow_run_output_path());
-                    let record = crate::components::trigger::shadow_run::ShadowBuySimulationRecord::from_failure_context(
+                    let shadow_event =
+                        crate::components::trigger::shadow_run::shadow_failure_event_from_context(
+                            &pool_amm_id.to_string(),
+                            &pool_data.base_mint,
+                            &context,
+                            pool_data.base_mint.clone(),
+                            None,
+                            &e,
+                        );
+                    if trigger_component.shadow_run_emit_event_bus() {
+                        if let Err(send_err) =
+                            event_tx.send(GhostEvent::shadow_buy_simulated(shadow_event.clone()))
+                        {
+                            warn!(
+                                pool = %pool_amm_id,
+                                "Failed to emit shadow preflight failure event: {}",
+                                send_err
+                            );
+                        }
+                    }
+                    if let Err(write_err) = append_shadow_buy_report_record(
+                        &shadow_log_path,
                         trigger_component.entry_mode(),
-                        &pool_amm_id.to_string(),
-                        &pool_data.base_mint,
-                        &context,
-                        None,
-                        &e,
-                    );
-                    crate::components::trigger::shadow_run::record_shadow_buy_metrics(&record);
-                    if let Err(write_err) =
-                        crate::components::trigger::shadow_run::append_shadow_buy_record(
-                            &shadow_log_path,
-                            &record,
-                        )
-                        .await
+                        &shadow_event,
+                    )
+                    .await
                     {
                         error!(
                             pool = %pool_amm_id,
@@ -7503,6 +7608,33 @@ fn runtime_tx_time_source_info(tx: &PoolTransaction) -> RuntimeTxTimeSourceInfo 
         RuntimeTxTimeSourceInfo {
             effective_source: "wall_clock_fallback",
             fallback_class: Some("legacy_compat_rejected"),
+        }
+    } else {
+        RuntimeTxTimeSourceInfo {
+            effective_source: "wall_clock_fallback",
+            fallback_class: Some("missing_explicit_time"),
+        }
+    }
+}
+
+fn runtime_account_update_time_source_info(event: &AccountUpdateEvent) -> RuntimeTxTimeSourceInfo {
+    if event.event_time.chain_event_ts_ms.is_some() {
+        RuntimeTxTimeSourceInfo {
+            effective_source: "chain_event",
+            fallback_class: None,
+        }
+    } else if event.event_time.ingress_wall_ts_ms.is_some() {
+        RuntimeTxTimeSourceInfo {
+            effective_source: "ingress_wall",
+            fallback_class: None,
+        }
+    } else if matches!(
+        event.replay_origin,
+        seer::ipc::AccountUpdateReplayOrigin::PendingReplay
+    ) {
+        RuntimeTxTimeSourceInfo {
+            effective_source: "wall_clock_fallback",
+            fallback_class: Some("replay_missing_explicit_time"),
         }
     } else {
         RuntimeTxTimeSourceInfo {
@@ -7851,6 +7983,16 @@ async fn pool_observation_task(
     ));
     tokio::pin!(deadline);
 
+    // ── DOW timer: per-pool interval for time-guaranteed shadow checkpoints ──
+    // Fires Early/Normal/Extended independently of TX traffic.
+    // Interval ticks are consumed as a tokio::select! branch — same task,
+    // same serialized buffer access, no duplicate checkpoints.
+    let mut dow_tick = crate::components::gatekeeper_dow_timer::dow_timer_interval(
+        ctx.gatekeeper_config.dow.tick_interval_ms,
+    );
+    // Skip the immediate tick (0ms burst after interval creation).
+    dow_tick.tick().await;
+
     loop {
         let verdict = tokio::select! {
             msg = rx.recv() => {
@@ -8037,6 +8179,22 @@ async fn pool_observation_task(
                     }
                 }
             }
+            _ = dow_tick.tick() => {
+                // ── DOW timer: time-guaranteed shadow checkpoint firing ──
+                // Fires Early (2-5s), Normal (5-7s), Extended (7-10s)
+                // independently of TX traffic. The *_shadow_fired flags
+                // inside GatekeeperBuffer ensure one-shot per stage.
+                if ctx.gatekeeper_config.v25.shadow_enabled
+                    && ctx.gatekeeper_config.dow.enabled
+                {
+                    let mut session = session.write();
+                    let now_wall = current_time_ms();
+                    session
+                        .gatekeeper_buffer_mut()
+                        .maybe_fire_shadow_checkpoint(now_wall);
+                }
+                GatekeeperVerdict::Wait
+            }
             _ = &mut deadline => {
                 let now_ms = current_time_ms();
                 if let Some(window_state) = window_state.as_mut() {
@@ -8127,6 +8285,8 @@ async fn pool_observation_task(
                 mut assessment,
                 reason,
             } => {
+                // P5: pool was evaluated and actively rejected → no dispatch.
+                crate::oracle_metrics::record_shadow_lifecycle_status("no_dispatch_rejected");
                 ctx.oracle_runtime.append_decision_to_wal(
                     pool_id,
                     pool_data.as_ref().and_then(|pd| pd.slot),
@@ -8208,6 +8368,8 @@ async fn pool_observation_task(
             }
 
             GatekeeperVerdict::Timeout { mut assessment } => {
+                // P5: pool timed out without meeting Phase 1 → no dispatch eligible.
+                crate::oracle_metrics::record_shadow_lifecycle_status("no_dispatch_eligible");
                 ctx.oracle_runtime.append_decision_to_wal(
                     pool_id,
                     pool_data.as_ref().and_then(|pd| pd.slot),
@@ -8835,19 +8997,18 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
             "OFF"
         }
     );
+    let normalized_decision_log_path =
+        crate::config::normalize_decision_log_path(&decision_log_path);
     info!(
         "   📝 Decision Logger: AKTYWNY (path: {})",
-        decision_log_path
+        normalized_decision_log_path
     );
+    let decision_logger_config =
+        build_decision_logger_config(&normalized_decision_log_path, &gatekeeper_config);
 
     // Initialize Decision Logger for cyclic engine telemetry
     let decision_logger = Arc::new(ghost_brain::oracle::DecisionLogger::new_with_health(
-        ghost_brain::oracle::DecisionLoggerConfig {
-            log_dir: std::path::PathBuf::from(decision_log_path.clone()),
-            gatekeeper_log_dir: std::path::PathBuf::from("logs/decisions.json/rollout/shadow-burnin/decisions"),
-            channel_buffer_size: 1000,
-            enabled: true,
-        },
+        decision_logger_config,
         health.clone(),
     ));
 
@@ -9022,8 +9183,7 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
         event_tx: event_tx.clone(),
         post_buy_tx,
         decision_logger: decision_logger.clone(),
-        coverage_audit_log_path: std::path::PathBuf::from(&decision_log_path)
-            .join("seer_runtime_coverage_audit.jsonl"),
+        coverage_audit_log_path: build_coverage_audit_log_path(&normalized_decision_log_path),
         trigger: trigger.clone(),
         iwim_veto_config: iwim_veto_config.clone(),
         gatekeeper_config: gatekeeper_config.clone(),
@@ -9583,6 +9743,7 @@ mod tests {
                 mint: request.mint.to_string(),
                 live_signature: None,
                 payer_pubkey: request.payer_pubkey.to_string(),
+                payer_provenance: request.payer_provenance.to_string(),
                 amount_lamports: request.amount_lamports,
                 entry_token_amount_raw: request.entry_token_amount_raw,
                 tip_lamports: request.tip_lamports,
@@ -9725,6 +9886,7 @@ mod tests {
             request: crate::components::trigger::PreparedBuyRequest {
                 mint: Pubkey::new_unique(),
                 payer_pubkey: payer.pubkey(),
+                payer_provenance: "configured",
                 user_ata: Pubkey::new_unique(),
                 token_program: Pubkey::new_unique(),
                 attach_idempotent_ata_create: true,
@@ -9787,6 +9949,7 @@ mod tests {
         crate::components::trigger::PreparedBuyRequest {
             mint: Pubkey::new_unique(),
             payer_pubkey: payer.pubkey(),
+            payer_provenance: "configured",
             user_ata: Pubkey::new_unique(),
             token_program: Pubkey::new_unique(),
             attach_idempotent_ata_create: true,
@@ -10096,6 +10259,15 @@ mod tests {
             feature_snapshot: ghost_core::checkpoint::MaterializedFeatureSet::default(),
             checkpoint_count: 0,
             trajectory_available: false,
+            v25_shadow_decisions: Vec::new(),
+            trajectory: None,
+            pdd_assessment: None,
+            aps_diagnostics: None,
+            observation_stage: None,
+            entry_drift_pct: None,
+            entry_drift_anchor_quality: None,
+            adaptive_thresholds_applied: false,
+            v25_confidence: None,
         }
     }
 
@@ -10284,7 +10456,8 @@ mod tests {
         );
 
         assert_eq!(assessment.checkpoint_count, 2);
-        assert!(assessment.trajectory_available);
+        assert!(!assessment.trajectory_available);
+        assert!(assessment.trajectory.is_none());
         assert_eq!(
             assessment
                 .feature_snapshot
@@ -10294,6 +10467,9 @@ mod tests {
         );
         assert_eq!(assessment.curve_t0_event_ts_ms, Some(1_000));
         assert_eq!(assessment.curve_wait_elapsed_ms, Some(250));
+        assert_eq!(assessment.entry_drift_pct, Some(25.0));
+        assert!(assessment.pdd_assessment.is_some());
+        assert!(assessment.v25_confidence.is_none());
         assert!(assessment.decision.is_some());
         assert_eq!(
             assessment
@@ -10865,6 +11041,10 @@ mod tests {
         match verdict {
             GatekeeperVerdict::Timeout { assessment } => {
                 assert!(assessment.decision.is_some());
+                assert!(
+                    assessment.v25_confidence.is_some(),
+                    "oracle timeout branch must cache v25 confidence"
+                );
                 assert_eq!(assessment.feature_snapshot.tx_intel_features.tx_count, 1);
                 assert_eq!(
                     assessment
@@ -11244,7 +11424,7 @@ mod tests {
         register_test_detected_pool(runtime.as_ref(), detected_pool.as_ref());
         runtime.remember_detected_pool(pool_id, detected_pool.clone());
 
-        let (event_tx, _event_rx) = crate::events::create_event_bus();
+        let (event_tx, mut event_rx) = crate::events::create_event_bus();
         let ctx = test_pool_observation_context(runtime.clone(), snapshot_engine, event_tx, None);
         let (_tx, mut rx) = tokio::sync::mpsc::channel(4);
         let buffered_txs: Vec<crate::components::gatekeeper::GatekeeperBufferedTx> = Vec::new();
@@ -11297,7 +11477,7 @@ mod tests {
         let detected_pool = test_detected_pool(pool_id);
         register_test_detected_pool(runtime.as_ref(), detected_pool.as_ref());
 
-        let (event_tx, _event_rx) = crate::events::create_event_bus();
+        let (event_tx, mut event_rx) = crate::events::create_event_bus();
         let ctx = test_pool_observation_context(runtime, snapshot_engine, event_tx, None);
         let (_tx, mut rx) = tokio::sync::mpsc::channel(4);
         let mut identity = build_unknown_observation_identity(pool_id, ctx.ab_window_ms);
@@ -11337,7 +11517,7 @@ mod tests {
         let pool_id = Pubkey::new_unique();
         let detected_pool = test_detected_pool(pool_id);
 
-        let (event_tx, _event_rx) = crate::events::create_event_bus();
+        let (event_tx, mut event_rx) = crate::events::create_event_bus();
         let ctx = test_pool_observation_context(runtime.clone(), snapshot_engine, event_tx, None);
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         let buffered_txs: Vec<crate::components::gatekeeper::GatekeeperBufferedTx> = Vec::new();
@@ -11420,7 +11600,7 @@ mod tests {
             },
         ));
 
-        let (event_tx, _event_rx) = crate::events::create_event_bus();
+        let (event_tx, mut event_rx) = crate::events::create_event_bus();
         let ctx = test_pool_observation_context(
             runtime,
             snapshot_engine,
@@ -11851,6 +12031,7 @@ mod tests {
                     mint: resolved_pool.base_mint.clone(),
                     live_signature: None,
                     payer_pubkey: Pubkey::new_unique().to_string(),
+                    payer_provenance: "configured".to_string(),
                     amount_lamports: 100,
                     entry_token_amount_raw: Some(250_000),
                     tip_lamports: 10,
@@ -13627,6 +13808,7 @@ mod tests {
                 mint: pool.base_mint.clone(),
                 live_signature: None,
                 payer_pubkey: Pubkey::new_unique().to_string(),
+                payer_provenance: "configured".to_string(),
                 amount_lamports: 100,
                 entry_token_amount_raw: Some(250_000),
                 tip_lamports: 10,
@@ -13735,6 +13917,7 @@ mod tests {
                 mint: pool.base_mint.clone(),
                 live_signature: None,
                 payer_pubkey: Pubkey::new_unique().to_string(),
+                payer_provenance: "configured".to_string(),
                 amount_lamports: 100,
                 entry_token_amount_raw: Some(250_000),
                 tip_lamports: 10,
@@ -13845,6 +14028,7 @@ mod tests {
                 mint: pool.base_mint.clone(),
                 live_signature: None,
                 payer_pubkey: Pubkey::new_unique().to_string(),
+                payer_provenance: "configured".to_string(),
                 amount_lamports: 100,
                 entry_token_amount_raw: Some(250_000),
                 tip_lamports: 10,
@@ -13979,6 +14163,7 @@ mod tests {
                 mint: pool.base_mint.clone(),
                 live_signature: None,
                 payer_pubkey: Pubkey::new_unique().to_string(),
+                payer_provenance: "configured".to_string(),
                 amount_lamports: 100,
                 entry_token_amount_raw: Some(250_000),
                 tip_lamports: 10,
@@ -14116,6 +14301,7 @@ mod tests {
                     mint: pool.base_mint.clone(),
                     live_signature: None,
                     payer_pubkey: Pubkey::new_unique().to_string(),
+                    payer_provenance: "configured".to_string(),
                     amount_lamports: 100,
                     entry_token_amount_raw: Some(250_000),
                     tip_lamports: 10,
@@ -14151,7 +14337,8 @@ mod tests {
             let path = path.clone();
             tasks.push(tokio::spawn(async move {
                 let record = CoverageAuditRecord {
-                    schema_version: 4,
+                    schema_version: 5,
+                    recorded_at_ms: 0,
                     audit_type: "seer_runtime_coverage_audit".to_string(),
                     audit_status: "ok".to_string(),
                     chain_truth_unavailable: false,
@@ -14181,10 +14368,15 @@ mod tests {
                     seer_rx_by_source: std::collections::BTreeMap::new(),
                     seer_emitted_by_source: std::collections::BTreeMap::new(),
                     runtime_filtered_by_reason: std::collections::BTreeMap::new(),
+                    filtered_reason_keys: Vec::new(),
+                    duplicate_suppression_by_reason: std::collections::BTreeMap::new(),
                     chain_truth_by_time_source: std::collections::BTreeMap::new(),
                     runtime_seen_by_time_source: std::collections::BTreeMap::new(),
                     runtime_seen_by_effective_time_source: std::collections::BTreeMap::new(),
+                    dominant_runtime_effective_time_source: None,
                     runtime_seen_by_fallback_class: std::collections::BTreeMap::new(),
+                    timeout_primary_cause: None,
+                    timeout_flags: Vec::new(),
                     missing_signatures: Vec::new(),
                     invariants: ghost_core::coverage_audit::CoverageAuditInvariantSummary {
                         emitted_without_rx: 0,
@@ -14248,7 +14440,7 @@ mod tests {
             trigger_config,
             Arc::new(MockShadowSimulator),
         );
-        let (event_tx, _event_rx) = crate::events::create_event_bus();
+        let (event_tx, mut event_rx) = crate::events::create_event_bus();
         let mut rx = event_tx.subscribe();
         let post_buy_epoch = std::sync::atomic::AtomicU64::new(1);
         let pool_id = Pubkey::new_unique();
@@ -14287,6 +14479,7 @@ mod tests {
                     mint: pool.base_mint.clone(),
                     live_signature: None,
                     payer_pubkey: Pubkey::new_unique().to_string(),
+                    payer_provenance: "configured".to_string(),
                     amount_lamports: 100,
                     entry_token_amount_raw: Some(250_000),
                     tip_lamports: 10,
@@ -14310,7 +14503,7 @@ mod tests {
         .expect("shadow-only apply should succeed");
 
         assert_eq!(applied.close_reason, WindowCloseReason::PoolShadowedEarly);
-        assert_eq!(applied.shadow_execution_outcome, "shadow_simulation_error");
+        assert_eq!(applied.shadow_execution_outcome, "shadow_authority_error");
         let first = tokio::time::timeout(Duration::from_secs(1), rx.recv())
             .await
             .expect("shadow event timeout")
@@ -14388,6 +14581,7 @@ mod tests {
                         mint: base_mint,
                         live_signature: None,
                         payer_pubkey: Pubkey::new_unique().to_string(),
+                        payer_provenance: "configured".to_string(),
                         amount_lamports: 100,
                         entry_token_amount_raw: Some(250_000),
                         tip_lamports: 10,
@@ -15053,6 +15247,7 @@ mod tests {
                         mint: base_mint,
                         live_signature: None,
                         payer_pubkey: Pubkey::new_unique().to_string(),
+                        payer_provenance: "configured".to_string(),
                         amount_lamports: 100,
                         entry_token_amount_raw: Some(250_000),
                         tip_lamports: 10,
@@ -15311,10 +15506,10 @@ mod tests {
     }
 
     #[test]
-    fn shadow_report_error_classifies_semantic_and_transport_outcomes() {
+    fn shadow_report_error_classifies_authority_and_transport_outcomes() {
         assert_eq!(
             shadow_execution_outcome_from_report_err("InvalidAccountForFee"),
-            "shadow_simulation_error"
+            "shadow_authority_error"
         );
         assert_eq!(
             shadow_execution_outcome_from_report_err("shadow RPC simulate timed out after 100ms"),
@@ -15477,8 +15672,8 @@ mod tests {
             curve_data_known: false,
         };
 
-        let expected_global = Pubkey::new_unique();
-        let expected_fee = Pubkey::new_unique();
+        let expected_global = trigger::DirectBuyBuilder::canonical_global_config();
+        let expected_fee = trigger::DirectBuyBuilder::canonical_fee_recipient();
         let expected_token = Pubkey::new_unique();
         let expected_assoc_curve = Pubkey::new_unique();
         let successful_buy = PoolTransaction {
@@ -15632,6 +15827,419 @@ mod tests {
         assert!(overrides.fee_recipient.is_none());
     }
 
+    #[test]
+    fn build_decision_logger_config_uses_configured_decision_root() {
+        let decision_log_path = "logs/rollout/shadow-burnin-v25-repair/decisions";
+        let config =
+            build_decision_logger_config(decision_log_path, &GatekeeperV2Config::default());
+
+        assert_eq!(config.log_dir, std::path::PathBuf::from(decision_log_path));
+        assert_eq!(
+            config.gatekeeper_log_dir,
+            std::path::PathBuf::from(decision_log_path)
+        );
+        assert_eq!(
+            config.gatekeeper_rollout_profile,
+            "shadow-burnin-v25-repair"
+        );
+        assert_ne!(
+            config.gatekeeper_log_dir,
+            std::path::PathBuf::from("logs/decisions.json/rollout/shadow-burnin/decisions")
+        );
+    }
+
+    #[test]
+    fn build_decision_logger_config_normalizes_parent_segments_before_rollout_derivation() {
+        let config = build_decision_logger_config(
+            "configs/rollout/../../logs/rollout/shadow-burnin-v25-repair/decisions",
+            &GatekeeperV2Config::default(),
+        );
+
+        assert_eq!(
+            config.gatekeeper_log_dir,
+            std::path::PathBuf::from("logs/rollout/shadow-burnin-v25-repair/decisions")
+        );
+        assert_eq!(
+            config.gatekeeper_rollout_profile,
+            "shadow-burnin-v25-repair"
+        );
+    }
+
+    #[test]
+    fn build_coverage_audit_log_path_uses_normalized_decision_root() {
+        assert_eq!(
+            build_coverage_audit_log_path(
+                "configs/rollout/../../logs/rollout/shadow-burnin-v25-repair/decisions"
+            ),
+            std::path::PathBuf::from(
+                "logs/rollout/shadow-burnin-v25-repair/decisions/seer_runtime_coverage_audit.jsonl"
+            )
+        );
+        assert_eq!(
+            build_coverage_audit_log_path("logs/decisions.jsonl"),
+            std::path::PathBuf::from("logs/decisions/seer_runtime_coverage_audit.jsonl")
+        );
+    }
+
+    #[test]
+    fn build_decision_logger_config_uses_unknown_rollout_outside_rollout_roots() {
+        let config =
+            build_decision_logger_config("logs/decisions.jsonl", &GatekeeperV2Config::default());
+
+        assert_eq!(config.gatekeeper_rollout_profile, "unknown_rollout");
+        assert_eq!(config.gatekeeper_log_dir, config.log_dir);
+        assert_eq!(config.log_dir, std::path::PathBuf::from("logs/decisions"));
+    }
+
+    #[test]
+    fn derive_buy_account_overrides_keeps_primary_global_fee_recipient() {
+        use ghost_brain::oracle::snapshot_engine::PoolMetrics;
+        use ghost_core::shadow_ledger::TxKey;
+        use seer::types::RawBytesMissingReason;
+        use std::sync::Arc;
+
+        let current_fee = Pubkey::from_str("62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV")
+            .expect("primary global fee recipient");
+        let successful_buy = PoolTransaction {
+            semantic: Default::default(),
+            curve_finality: CurveFinality::Speculative,
+            pool_amm_id: "pool".to_string(),
+            slot: Some(1),
+            event_ordinal: None,
+            outer_instruction_index: None,
+            inner_group_index: None,
+            outer_program_id: None,
+            cpi_stack_height: None,
+            timestamp_ms: 1,
+            event_time: ghost_core::EventTimeMetadata::default(),
+            arrival_ts_ms: 1,
+            signer: "signer".to_string(),
+            is_buy: true,
+            volume_sol: 1.0,
+            sol_amount_lamports: None,
+            token_amount_units: None,
+            reserve_base: None,
+            reserve_quote: None,
+            price_quote: None,
+            is_dev_buy: false,
+            dev_buy_lamports: 0,
+            signature: "success_sig".to_string(),
+            success: true,
+            error_code: None,
+            compute_units_consumed: None,
+            owner_token_deltas: vec![],
+            mpcf_payload: vec![],
+            mpcf_payload_missing_reason: RawBytesMissingReason::FilteredByConfig,
+            token_mint: None,
+            v_tokens_in_bonding_curve: None,
+            v_sol_in_bonding_curve: None,
+            market_cap_sol: None,
+            global_config: None,
+            fee_recipient: Some(current_fee.to_string()),
+            token_program: None,
+            buy_variant: None,
+            associated_bonding_curve: None,
+            is_mayhem_mode: None,
+            cu_price_micro_lamports: None,
+            compute_unit_limit: None,
+            inner_ix_count: None,
+            cpi_depth: None,
+            ata_create_count: None,
+            signer_pre_balance_lamports: None,
+            signer_post_balance_lamports: None,
+            jito_tip_detected: None,
+            toolchain_fingerprint: seer::types::ToolchainFingerprintInput::default(),
+            curve_data_known: false,
+        };
+
+        let buffered_txs = vec![GatekeeperBufferedTx {
+            tx: Arc::new(successful_buy),
+            metrics: PoolMetrics::default(),
+            tx_key: TxKey::new(1, Some(1), None, None, 0).unwrap(),
+        }];
+
+        let overrides = derive_buy_account_overrides(&buffered_txs);
+        assert_eq!(overrides.fee_recipient, Some(current_fee));
+    }
+
+    #[test]
+    fn derive_buy_account_overrides_keeps_reserved_fee_recipient() {
+        use ghost_brain::oracle::snapshot_engine::PoolMetrics;
+        use ghost_core::shadow_ledger::TxKey;
+        use seer::types::RawBytesMissingReason;
+        use std::sync::Arc;
+
+        let reserved_fee = Pubkey::from_str("GesfTA3X2arioaHp8bbKdjG9vJtskViWACZoYvxp4twS")
+            .expect("reserved fee recipient");
+        let successful_buy = PoolTransaction {
+            semantic: Default::default(),
+            curve_finality: CurveFinality::Speculative,
+            pool_amm_id: "pool".to_string(),
+            slot: Some(1),
+            event_ordinal: None,
+            outer_instruction_index: None,
+            inner_group_index: None,
+            outer_program_id: None,
+            cpi_stack_height: None,
+            timestamp_ms: 1,
+            event_time: ghost_core::EventTimeMetadata::default(),
+            arrival_ts_ms: 1,
+            signer: "signer".to_string(),
+            is_buy: true,
+            volume_sol: 1.0,
+            sol_amount_lamports: None,
+            token_amount_units: None,
+            reserve_base: None,
+            reserve_quote: None,
+            price_quote: None,
+            is_dev_buy: false,
+            dev_buy_lamports: 0,
+            signature: "success_sig".to_string(),
+            success: true,
+            error_code: None,
+            compute_units_consumed: None,
+            owner_token_deltas: vec![],
+            mpcf_payload: vec![],
+            mpcf_payload_missing_reason: RawBytesMissingReason::FilteredByConfig,
+            token_mint: None,
+            v_tokens_in_bonding_curve: None,
+            v_sol_in_bonding_curve: None,
+            market_cap_sol: None,
+            global_config: None,
+            fee_recipient: Some(reserved_fee.to_string()),
+            token_program: None,
+            buy_variant: None,
+            associated_bonding_curve: None,
+            is_mayhem_mode: None,
+            cu_price_micro_lamports: None,
+            compute_unit_limit: None,
+            inner_ix_count: None,
+            cpi_depth: None,
+            ata_create_count: None,
+            signer_pre_balance_lamports: None,
+            signer_post_balance_lamports: None,
+            jito_tip_detected: None,
+            toolchain_fingerprint: seer::types::ToolchainFingerprintInput::default(),
+            curve_data_known: false,
+        };
+
+        let buffered_txs = vec![GatekeeperBufferedTx {
+            tx: Arc::new(successful_buy),
+            metrics: PoolMetrics::default(),
+            tx_key: TxKey::new(1, Some(1), None, None, 0).unwrap(),
+        }];
+
+        let overrides = derive_buy_account_overrides(&buffered_txs);
+        assert_eq!(overrides.fee_recipient, Some(reserved_fee));
+    }
+
+    #[test]
+    fn derive_buy_account_overrides_drops_noncanonical_fee_recipient() {
+        use ghost_brain::oracle::snapshot_engine::PoolMetrics;
+        use ghost_core::shadow_ledger::TxKey;
+        use seer::types::RawBytesMissingReason;
+        use std::sync::Arc;
+
+        let successful_buy = PoolTransaction {
+            semantic: Default::default(),
+            curve_finality: CurveFinality::Speculative,
+            pool_amm_id: "pool".to_string(),
+            slot: Some(1),
+            event_ordinal: None,
+            outer_instruction_index: None,
+            inner_group_index: None,
+            outer_program_id: None,
+            cpi_stack_height: None,
+            timestamp_ms: 1,
+            event_time: ghost_core::EventTimeMetadata::default(),
+            arrival_ts_ms: 1,
+            signer: "signer".to_string(),
+            is_buy: true,
+            volume_sol: 1.0,
+            sol_amount_lamports: None,
+            token_amount_units: None,
+            reserve_base: None,
+            reserve_quote: None,
+            price_quote: None,
+            is_dev_buy: false,
+            dev_buy_lamports: 0,
+            signature: "success_sig".to_string(),
+            success: true,
+            error_code: None,
+            compute_units_consumed: None,
+            owner_token_deltas: vec![],
+            mpcf_payload: vec![],
+            mpcf_payload_missing_reason: RawBytesMissingReason::FilteredByConfig,
+            token_mint: None,
+            v_tokens_in_bonding_curve: None,
+            v_sol_in_bonding_curve: None,
+            market_cap_sol: None,
+            global_config: None,
+            fee_recipient: Some(Pubkey::new_unique().to_string()),
+            token_program: None,
+            buy_variant: None,
+            associated_bonding_curve: None,
+            is_mayhem_mode: None,
+            cu_price_micro_lamports: None,
+            compute_unit_limit: None,
+            inner_ix_count: None,
+            cpi_depth: None,
+            ata_create_count: None,
+            signer_pre_balance_lamports: None,
+            signer_post_balance_lamports: None,
+            jito_tip_detected: None,
+            toolchain_fingerprint: seer::types::ToolchainFingerprintInput::default(),
+            curve_data_known: false,
+        };
+
+        let buffered_txs = vec![GatekeeperBufferedTx {
+            tx: Arc::new(successful_buy),
+            metrics: PoolMetrics::default(),
+            tx_key: TxKey::new(1, Some(1), None, None, 0).unwrap(),
+        }];
+
+        let overrides = derive_buy_account_overrides(&buffered_txs);
+        assert!(overrides.fee_recipient.is_none());
+    }
+
+    #[test]
+    fn derive_buy_account_overrides_drops_noncanonical_global_config() {
+        use ghost_brain::oracle::snapshot_engine::PoolMetrics;
+        use ghost_core::shadow_ledger::TxKey;
+        use seer::types::RawBytesMissingReason;
+        use std::sync::Arc;
+
+        let successful_buy = PoolTransaction {
+            semantic: Default::default(),
+            curve_finality: CurveFinality::Speculative,
+            pool_amm_id: "pool".to_string(),
+            slot: Some(1),
+            event_ordinal: None,
+            outer_instruction_index: None,
+            inner_group_index: None,
+            outer_program_id: None,
+            cpi_stack_height: None,
+            timestamp_ms: 1,
+            event_time: ghost_core::EventTimeMetadata::default(),
+            arrival_ts_ms: 1,
+            signer: "signer".to_string(),
+            is_buy: true,
+            volume_sol: 1.0,
+            sol_amount_lamports: None,
+            token_amount_units: None,
+            reserve_base: None,
+            reserve_quote: None,
+            price_quote: None,
+            is_dev_buy: false,
+            dev_buy_lamports: 0,
+            signature: "success_sig".to_string(),
+            success: true,
+            error_code: None,
+            compute_units_consumed: None,
+            owner_token_deltas: vec![],
+            mpcf_payload: vec![],
+            mpcf_payload_missing_reason: RawBytesMissingReason::FilteredByConfig,
+            token_mint: None,
+            v_tokens_in_bonding_curve: None,
+            v_sol_in_bonding_curve: None,
+            market_cap_sol: None,
+            global_config: Some(Pubkey::new_unique().to_string()),
+            fee_recipient: None,
+            token_program: None,
+            buy_variant: None,
+            associated_bonding_curve: None,
+            is_mayhem_mode: None,
+            cu_price_micro_lamports: None,
+            compute_unit_limit: None,
+            inner_ix_count: None,
+            cpi_depth: None,
+            ata_create_count: None,
+            signer_pre_balance_lamports: None,
+            signer_post_balance_lamports: None,
+            jito_tip_detected: None,
+            toolchain_fingerprint: seer::types::ToolchainFingerprintInput::default(),
+            curve_data_known: false,
+        };
+
+        let buffered_txs = vec![GatekeeperBufferedTx {
+            tx: Arc::new(successful_buy),
+            metrics: PoolMetrics::default(),
+            tx_key: TxKey::new(1, Some(1), None, None, 0).unwrap(),
+        }];
+
+        let overrides = derive_buy_account_overrides(&buffered_txs);
+        assert!(overrides.global_config.is_none());
+    }
+
+    #[test]
+    fn derive_buy_account_overrides_drops_legacy_buy_variant() {
+        use ghost_brain::oracle::snapshot_engine::PoolMetrics;
+        use ghost_core::shadow_ledger::TxKey;
+        use seer::types::RawBytesMissingReason;
+        use std::sync::Arc;
+
+        let successful_buy = PoolTransaction {
+            semantic: Default::default(),
+            curve_finality: CurveFinality::Speculative,
+            pool_amm_id: "pool".to_string(),
+            slot: Some(1),
+            event_ordinal: None,
+            outer_instruction_index: None,
+            inner_group_index: None,
+            outer_program_id: None,
+            cpi_stack_height: None,
+            timestamp_ms: 1,
+            event_time: ghost_core::EventTimeMetadata::default(),
+            arrival_ts_ms: 1,
+            signer: "signer".to_string(),
+            is_buy: true,
+            volume_sol: 1.0,
+            sol_amount_lamports: None,
+            token_amount_units: None,
+            reserve_base: None,
+            reserve_quote: None,
+            price_quote: None,
+            is_dev_buy: false,
+            dev_buy_lamports: 0,
+            signature: "success_sig".to_string(),
+            success: true,
+            error_code: None,
+            compute_units_consumed: None,
+            owner_token_deltas: vec![],
+            mpcf_payload: vec![],
+            mpcf_payload_missing_reason: RawBytesMissingReason::FilteredByConfig,
+            token_mint: None,
+            v_tokens_in_bonding_curve: None,
+            v_sol_in_bonding_curve: None,
+            market_cap_sol: None,
+            global_config: None,
+            fee_recipient: None,
+            token_program: None,
+            buy_variant: Some("legacy_buy".to_string()),
+            associated_bonding_curve: None,
+            is_mayhem_mode: None,
+            cu_price_micro_lamports: None,
+            compute_unit_limit: None,
+            inner_ix_count: None,
+            cpi_depth: None,
+            ata_create_count: None,
+            signer_pre_balance_lamports: None,
+            signer_post_balance_lamports: None,
+            jito_tip_detected: None,
+            toolchain_fingerprint: seer::types::ToolchainFingerprintInput::default(),
+            curve_data_known: false,
+        };
+
+        let buffered_txs = vec![GatekeeperBufferedTx {
+            tx: Arc::new(successful_buy),
+            metrics: PoolMetrics::default(),
+            tx_key: TxKey::new(1, Some(1), None, None, 0).unwrap(),
+        }];
+
+        let overrides = derive_buy_account_overrides(&buffered_txs);
+        assert!(overrides.buy_variant.is_none());
+    }
+
     #[tokio::test]
     async fn shadow_only_dispatch_failure_writes_shadow_failure_record() {
         let temp = tempfile::tempdir().unwrap();
@@ -15661,7 +16269,7 @@ mod tests {
                 Arc::new(MockShadowSimulator),
             ),
         );
-        let (event_tx, _event_rx) = crate::events::create_event_bus();
+        let (event_tx, mut event_rx) = crate::events::create_event_bus();
         let post_buy_epoch = std::sync::atomic::AtomicU64::new(1);
         let pool_id = Pubkey::new_unique();
         let pool = crate::events::DetectedPool {
@@ -15714,8 +16322,19 @@ mod tests {
             .expect("shadow failure record should be written");
         assert!(written.contains("\"pool_amm_id\":\""));
         assert!(written.contains(&pool_id.to_string()));
-        assert!(written.contains("\"error_class\":\"transport\""));
+        assert!(written.contains("\"error_class\":\"network_provider_problem\""));
         assert!(written.contains("Connection refused"));
+        let event = event_rx.recv().await.expect("shadow failure event");
+        match event {
+            GhostEvent::ShadowBuySimulated(event) => {
+                assert_eq!(
+                    event.error_class.as_deref(),
+                    Some("network_provider_problem")
+                );
+                assert_eq!(event.payer_provenance, "configured");
+            }
+            other => panic!("expected ShadowBuySimulated, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -15747,7 +16366,7 @@ mod tests {
                 Arc::new(MockShadowSimulator),
             ),
         );
-        let (event_tx, _event_rx) = crate::events::create_event_bus();
+        let (event_tx, mut event_rx) = crate::events::create_event_bus();
         let post_buy_epoch = std::sync::atomic::AtomicU64::new(1);
         let pool_id = Pubkey::new_unique();
         let pool = crate::events::DetectedPool {
@@ -15778,6 +16397,8 @@ mod tests {
                 amount_lamports: 100_000_000,
                 tip_lamports: 3_000_000,
                 decision_ts_ms: 10,
+                payer_provenance: "configured",
+                payer_pubkey: Some("payer-configured".to_string()),
             }),
         };
 
@@ -15805,6 +16426,18 @@ mod tests {
         assert!(written.contains(&pool_id.to_string()));
         assert!(written.contains("\"amount_lamports\":100000000"));
         assert!(written.contains("Insufficient payer balance"));
+        assert!(written.contains("\"payer_provenance\":\"configured\""));
+        let event = event_rx
+            .recv()
+            .await
+            .expect("shadow preflight failure event");
+        match event {
+            GhostEvent::ShadowBuySimulated(event) => {
+                assert_eq!(event.error_class.as_deref(), Some("fee_compute_problem"));
+                assert_eq!(event.payer_provenance, "configured");
+            }
+            other => panic!("expected ShadowBuySimulated, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -15887,6 +16520,7 @@ mod tests {
                         mint: pool.base_mint.clone(),
                         live_signature: None,
                         payer_pubkey: Pubkey::new_unique().to_string(),
+                        payer_provenance: request.payer_provenance.to_string(),
                         amount_lamports: request.amount_lamports,
                         entry_token_amount_raw: request.entry_token_amount_raw,
                         tip_lamports: request.tip_lamports,
@@ -16032,6 +16666,7 @@ mod tests {
                         mint: pool.base_mint.clone(),
                         live_signature: None,
                         payer_pubkey: Pubkey::new_unique().to_string(),
+                        payer_provenance: request.payer_provenance.to_string(),
                         amount_lamports: request.amount_lamports,
                         entry_token_amount_raw: request.entry_token_amount_raw,
                         tip_lamports: request.tip_lamports,
@@ -18336,6 +18971,7 @@ mod tests {
             UpdateSource::GeyserAccountUpdate,
             Some(&AccountUpdateEvent {
                 semantic: Default::default(),
+                event_time: ghost_core::EventTimeMetadata::default(),
                 base_mint,
                 bonding_curve,
                 curve_finality: CurveFinality::Speculative,
@@ -18413,6 +19049,7 @@ mod tests {
 
         runtime.enqueue_pre_identity_account_update(&AccountUpdateEvent {
             semantic: Default::default(),
+            event_time: ghost_core::EventTimeMetadata::default(),
             base_mint,
             bonding_curve,
             curve_finality: CurveFinality::Speculative,
@@ -18732,6 +19369,15 @@ mod tests {
             feature_snapshot: ghost_core::checkpoint::MaterializedFeatureSet::default(),
             checkpoint_count: 0,
             trajectory_available: false,
+            v25_shadow_decisions: Vec::new(),
+            trajectory: None,
+            pdd_assessment: None,
+            aps_diagnostics: None,
+            observation_stage: None,
+            entry_drift_pct: None,
+            entry_drift_anchor_quality: None,
+            adaptive_thresholds_applied: false,
+            v25_confidence: None,
         };
         let mut log = assessment.to_buy_log(&pool_id, &config);
 
@@ -19593,6 +20239,62 @@ mod tests {
             RuntimeTxTimeSourceInfo {
                 effective_source: "chain_event",
                 fallback_class: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_runtime_account_update_time_source_info_prefers_event_time_axes() {
+        let mut event = AccountUpdateEvent {
+            semantic: Default::default(),
+            event_time: ghost_core::EventTimeMetadata::default(),
+            base_mint: Pubkey::new_unique(),
+            bonding_curve: Pubkey::new_unique(),
+            curve_finality: CurveFinality::Provisional,
+            sol_reserves: 10,
+            token_reserves: 20,
+            complete: 0,
+            slot: 42,
+            write_version: Some(7),
+            replay_origin: seer::ipc::AccountUpdateReplayOrigin::Live,
+            replay_buffer_dwell_ms: None,
+            detected_at: std::time::SystemTime::now(),
+            sequence_number: 1,
+        };
+
+        assert_eq!(
+            runtime_account_update_time_source_info(&event),
+            RuntimeTxTimeSourceInfo {
+                effective_source: "wall_clock_fallback",
+                fallback_class: Some("missing_explicit_time"),
+            }
+        );
+
+        event.event_time.ingress_wall_ts_ms = Some(321);
+        assert_eq!(
+            runtime_account_update_time_source_info(&event),
+            RuntimeTxTimeSourceInfo {
+                effective_source: "ingress_wall",
+                fallback_class: None,
+            }
+        );
+
+        event.event_time.chain_event_ts_ms = Some(654);
+        assert_eq!(
+            runtime_account_update_time_source_info(&event),
+            RuntimeTxTimeSourceInfo {
+                effective_source: "chain_event",
+                fallback_class: None,
+            }
+        );
+
+        event.event_time = ghost_core::EventTimeMetadata::default();
+        event.replay_origin = seer::ipc::AccountUpdateReplayOrigin::PendingReplay;
+        assert_eq!(
+            runtime_account_update_time_source_info(&event),
+            RuntimeTxTimeSourceInfo {
+                effective_source: "wall_clock_fallback",
+                fallback_class: Some("replay_missing_explicit_time"),
             }
         );
     }
@@ -21238,6 +21940,7 @@ mod tests {
         // GhostEvent::AccountUpdate from the event bus.
         let event = GhostEvent::AccountUpdate(crate::events::AccountUpdateEvent {
             semantic: Default::default(),
+            event_time: ghost_core::EventTimeMetadata::default(),
             base_mint,
             bonding_curve: Pubkey::new_unique(),
             curve_finality: CurveFinality::Speculative,
@@ -22128,6 +22831,7 @@ mod tests {
     ) -> AccountUpdateEvent {
         AccountUpdateEvent {
             semantic: Default::default(),
+            event_time: ghost_core::EventTimeMetadata::default(),
             base_mint,
             bonding_curve: Pubkey::new_unique(),
             curve_finality: CurveFinality::Provisional,
@@ -22303,6 +23007,7 @@ mod tests {
             .send(GhostEvent::AccountUpdate(
                 crate::events::AccountUpdateEvent {
                     semantic: Default::default(),
+                    event_time: ghost_core::EventTimeMetadata::default(),
                     base_mint,
                     bonding_curve: Pubkey::new_unique(),
                     curve_finality: CurveFinality::Speculative,

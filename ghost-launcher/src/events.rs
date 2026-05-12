@@ -402,6 +402,9 @@ pub struct AccountUpdateEvent {
     /// Cross-source semantic envelope carried through canonical ingest.
     #[serde(default)]
     pub semantic: EventSemanticEnvelope,
+    /// Explicit provenance for event/ingest time axes.
+    #[serde(default)]
+    pub event_time: EventTimeMetadata,
     /// Resolved base mint — the key used by ReconciliationRuntime.
     pub base_mint: solana_sdk::pubkey::Pubkey,
     /// Bonding-curve account pubkey this update originated from.
@@ -460,6 +463,7 @@ pub struct ShadowBuySimulationEvent {
     pub mint: String,
     pub live_signature: Option<String>,
     pub payer_pubkey: String,
+    pub payer_provenance: String,
     pub amount_lamports: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry_token_amount_raw: Option<u64>,
@@ -477,6 +481,12 @@ pub struct ShadowBuySimulationEvent {
     pub logs: Vec<String>,
     pub return_data: Option<String>,
     pub err: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_detail_class: Option<String>,
 }
 
 pub fn build_execution_candidate_id(
@@ -845,8 +855,19 @@ pub fn record_event_bus_receivers(sender: &EventBusSender) {
     crate::oracle_metrics::record_eventbus_active_receivers(sender.receiver_count());
 }
 
+/// P5: Eventbus backpressure with per-consumer alert threshold.
+/// When skipped exceeds the threshold, emit a warning for on-call visibility.
+const EVENTBUS_DROP_WARN_THRESHOLD: u64 = 100;
+
 pub fn record_event_bus_lag(consumer: &str, skipped: u64) {
     crate::oracle_metrics::record_eventbus_lag(consumer, skipped);
+    if skipped > EVENTBUS_DROP_WARN_THRESHOLD {
+        tracing::warn!(
+            consumer = consumer,
+            skipped = skipped,
+            "eventbus_lag_threshold_exceeded"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1162,6 +1183,7 @@ mod tests {
             mint: "mint".to_string(),
             live_signature: None,
             payer_pubkey: "payer".to_string(),
+            payer_provenance: "configured".to_string(),
             amount_lamports: 1,
             entry_token_amount_raw: Some(1_000_000),
             tip_lamports: 1,
@@ -1178,6 +1200,9 @@ mod tests {
             logs: vec![],
             return_data: None,
             err: None,
+            error_class: None,
+            error_code: None,
+            error_detail_class: None,
         });
         assert_eq!(shadow.runtime_plane(), Some(RuntimePlane::ShadowSimulation));
     }
@@ -1214,6 +1239,7 @@ mod tests {
             mint: "mint".to_string(),
             live_signature: Some("sig".to_string()),
             payer_pubkey: "payer".to_string(),
+            payer_provenance: "configured".to_string(),
             amount_lamports: 1,
             entry_token_amount_raw: Some(1_000_000),
             tip_lamports: 1,
@@ -1230,6 +1256,9 @@ mod tests {
             logs: vec![],
             return_data: None,
             err: None,
+            error_class: None,
+            error_code: None,
+            error_detail_class: None,
         };
         let shadow_record =
             crate::components::trigger::shadow_run::ShadowBuySimulationRecord::from_event(

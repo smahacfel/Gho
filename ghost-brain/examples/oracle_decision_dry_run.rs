@@ -32,9 +32,12 @@ async fn main() {
     println!();
 
     // Create decision logger
+    let log_dir = std::path::PathBuf::from("datasets/decisions");
     let logger_config = DecisionLoggerConfig {
-        log_dir: "datasets/decisions".into(),
-        gatekeeper_log_dir: "logs/decisions.json/rollout/shadow-burnin/decisions".into(),
+        log_dir: log_dir.clone(),
+        gatekeeper_log_dir: log_dir,
+        gatekeeper_rollout_profile: "dry-run".to_string(),
+        gatekeeper_config_hash: "example-config-hash".to_string(),
         channel_buffer_size: 1000,
         enabled: true,
     };

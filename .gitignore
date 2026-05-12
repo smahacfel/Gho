@@ -20,3 +20,11 @@ _archiwum/
 dashboard.py
 .ghost/*
 !.ghost/.gitkeep
+.aider*
+
+# Globalna blokada logów i ciężkich zrzutów danych
+*.log
+*.jsonl
+*.json
+# Wyjątek dla plików Cargo (jeśli jednak chciałbyś je śledzić - patrz niżej)
+!Cargo.toml

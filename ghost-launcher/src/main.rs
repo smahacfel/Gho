@@ -3445,7 +3445,7 @@ min_consecutive_buys = 1.0
             .to_string_lossy()
             .into_owned();
         config.oracle.decision_log_path = base_dir
-            .join("logs/decisions.jsonl")
+            .join("logs/decisions")
             .to_string_lossy()
             .into_owned();
         config.trigger.shadow_run.output_path = base_dir

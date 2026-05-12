@@ -2,6 +2,7 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_GLOBAL_SIGNATURE_CAPACITY: usize = 500_000;
 
@@ -61,6 +62,14 @@ pub struct CoverageAuditWindowDiagnostics {
     pub live_account_update_count: u64,
     #[serde(default)]
     pub live_first_account_update_latency_ms: Option<u64>,
+    #[serde(default)]
+    pub account_update_runtime_seen_total: u64,
+    #[serde(default)]
+    pub account_update_runtime_accepted_total: u64,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub account_update_runtime_seen_by_effective_time_source: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub account_update_runtime_seen_by_fallback_class: BTreeMap<String, u64>,
     pub timed_out_without_canonical_updates: bool,
     pub seer_account_updates_before_mapping_total: u64,
     pub seer_account_updates_pending_replay_total: u64,
@@ -163,6 +172,18 @@ impl CoverageAuditReason {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Ord, PartialOrd)]
+#[serde(rename_all = "snake_case")]
+pub enum CoverageAuditTimeoutClass {
+    GenuineNoInterest,
+    IngestMiss,
+    FilterDrop,
+    StaleOrLateArrival,
+    WindowCloseTooEarly,
+    InvariantBrokenBookkeeping,
+    Unclassified,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CoverageAuditMissingSignature {
     pub signature: String,
@@ -206,6 +227,8 @@ pub struct CoverageAuditTruthSignatureState {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CoverageAuditRecord {
     pub schema_version: u32,
+    #[serde(default)]
+    pub recorded_at_ms: u64,
     pub audit_type: String,
     pub audit_status: String,
     pub chain_truth_unavailable: bool,
@@ -236,13 +259,23 @@ pub struct CoverageAuditRecord {
     pub seer_emitted_by_source: BTreeMap<String, u64>,
     pub runtime_filtered_by_reason: BTreeMap<String, u64>,
     #[serde(default)]
+    pub filtered_reason_keys: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub duplicate_suppression_by_reason: BTreeMap<String, u64>,
+    #[serde(default)]
     pub chain_truth_by_time_source: BTreeMap<String, u64>,
     #[serde(default)]
     pub runtime_seen_by_time_source: BTreeMap<String, u64>,
     #[serde(default)]
     pub runtime_seen_by_effective_time_source: BTreeMap<String, u64>,
     #[serde(default)]
+    pub dominant_runtime_effective_time_source: Option<String>,
+    #[serde(default)]
     pub runtime_seen_by_fallback_class: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub timeout_primary_cause: Option<CoverageAuditTimeoutClass>,
+    #[serde(default)]
+    pub timeout_flags: Vec<CoverageAuditTimeoutClass>,
     pub missing_signatures: Vec<CoverageAuditMissingSignature>,
     pub invariants: CoverageAuditInvariantSummary,
     pub diagnostics: CoverageAuditWindowDiagnostics,
@@ -556,6 +589,33 @@ impl CoverageAuditRecorder {
         });
     }
 
+    pub fn record_account_update_runtime_seen(
+        &self,
+        pool_id: &str,
+        effective_source: &str,
+        fallback_class: Option<&str>,
+        accepted: bool,
+    ) {
+        self.update_pool_diagnostics(pool_id, |diag| {
+            diag.account_update_runtime_seen_total =
+                diag.account_update_runtime_seen_total.saturating_add(1);
+            *diag
+                .account_update_runtime_seen_by_effective_time_source
+                .entry(effective_source.to_string())
+                .or_default() += 1;
+            if let Some(fallback_class) = fallback_class {
+                *diag
+                    .account_update_runtime_seen_by_fallback_class
+                    .entry(fallback_class.to_string())
+                    .or_default() += 1;
+            }
+            if accepted {
+                diag.account_update_runtime_accepted_total =
+                    diag.account_update_runtime_accepted_total.saturating_add(1);
+            }
+        });
+    }
+
     pub fn record_timeout_without_canonical_updates(&self, pool_id: &str) {
         self.update_pool_diagnostics(pool_id, |diag| {
             diag.timed_out_without_canonical_updates = true;
@@ -719,10 +779,13 @@ impl CoverageAuditRecorder {
             if pool_state.runtime_accepted {
                 continue;
             }
-            if let Some(reason) = pool_state.runtime_filter_reason.clone() {
-                *runtime_filtered_by_reason.entry(reason).or_insert(0) += 1;
-            }
             let reason = determine_missing_reason(&global_state, &pool_state, truth_state.failed);
+            let runtime_filter_reason = normalized_runtime_filter_reason(&pool_state, reason);
+            if reason == CoverageAuditReason::RuntimeFiltered {
+                if let Some(reason) = runtime_filter_reason.clone() {
+                    *runtime_filtered_by_reason.entry(reason).or_insert(0) += 1;
+                }
+            }
             let mapping_missing_reason = pool_state
                 .mapping_missing_reason
                 .clone()
@@ -747,7 +810,7 @@ impl CoverageAuditRecorder {
                 chain_truth_failed: truth_state.failed,
                 chain_truth_time_source: truth_state.time_source.clone(),
                 mapping_missing_reason,
-                runtime_filter_reason: pool_state.runtime_filter_reason.clone(),
+                runtime_filter_reason,
                 runtime_time_source: pool_state.runtime_time_source.clone(),
                 runtime_effective_time_source: pool_state
                     .runtime_effective_time_source
@@ -759,8 +822,36 @@ impl CoverageAuditRecorder {
         missing_signatures.sort_by(|a, b| a.signature.cmp(&b.signature));
 
         let window_ms = window.t_end_ms.saturating_sub(window.t0_ms);
+        let invariants = CoverageAuditInvariantSummary {
+            emitted_without_rx,
+            runtime_accepted_without_emitted,
+            missing_reason_fallbacks,
+        };
+        let filtered_reason_keys = sorted_map_keys(&runtime_filtered_by_reason);
+        let duplicate_suppression_by_reason =
+            duplicate_suppression_breakdown(&runtime_filtered_by_reason);
+        let dominant_runtime_effective_time_source =
+            dominant_key(&runtime_seen_by_effective_time_source);
+        let (timeout_primary_cause, timeout_flags) = classify_timeout_window(
+            window.verdict.as_deref(),
+            window.window_close_reason.as_deref(),
+            window.window_complete,
+            window_ms,
+            chain_truth_count,
+            seer_rx_count,
+            seer_emitted_count,
+            runtime_seen_count,
+            runtime_accepted_count,
+            &counts_by_reason,
+            &runtime_filtered_by_reason,
+            &runtime_seen_by_effective_time_source,
+            &runtime_seen_by_fallback_class,
+            &invariants,
+            &window.diagnostics,
+        );
         CoverageAuditRecord {
-            schema_version: 4,
+            schema_version: 5,
+            recorded_at_ms: wall_clock_epoch_ms(),
             audit_type: "seer_runtime_coverage_audit".to_string(),
             audit_status: if rpc_error.is_some() {
                 "rpc_error".to_string()
@@ -794,16 +885,17 @@ impl CoverageAuditRecorder {
             seer_rx_by_source,
             seer_emitted_by_source,
             runtime_filtered_by_reason,
+            filtered_reason_keys,
+            duplicate_suppression_by_reason,
             chain_truth_by_time_source,
             runtime_seen_by_time_source,
             runtime_seen_by_effective_time_source,
+            dominant_runtime_effective_time_source,
             runtime_seen_by_fallback_class,
+            timeout_primary_cause,
+            timeout_flags,
             missing_signatures,
-            invariants: CoverageAuditInvariantSummary {
-                emitted_without_rx,
-                runtime_accepted_without_emitted,
-                missing_reason_fallbacks,
-            },
+            invariants,
             diagnostics: window.diagnostics,
         }
     }
@@ -968,6 +1060,14 @@ impl CoverageAuditRecorder {
             }
         }
     }
+}
+
+fn wall_clock_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
 }
 
 fn merge_pool_signature_state(
@@ -1147,6 +1247,150 @@ fn determine_missing_reason(
         return CoverageAuditReason::InvariantBroken;
     }
     CoverageAuditReason::NotReceived
+}
+
+fn normalized_runtime_filter_reason(
+    pool: &CoverageAuditPoolSignatureState,
+    missing_reason: CoverageAuditReason,
+) -> Option<String> {
+    if missing_reason != CoverageAuditReason::RuntimeFiltered {
+        return pool.runtime_filter_reason.clone();
+    }
+    pool.runtime_filter_reason.clone().or_else(|| {
+        Some(if pool.runtime_seen {
+            "runtime_filter_reason_missing".to_string()
+        } else {
+            "runtime_filter_reason_missing_before_runtime_seen".to_string()
+        })
+    })
+}
+
+fn sorted_map_keys(map: &BTreeMap<String, u64>) -> Vec<String> {
+    map.keys().cloned().collect()
+}
+
+fn dominant_key(map: &BTreeMap<String, u64>) -> Option<String> {
+    map.iter()
+        .max_by(|(left_key, left_count), (right_key, right_count)| {
+            left_count
+                .cmp(right_count)
+                .then_with(|| right_key.cmp(left_key))
+        })
+        .map(|(key, _)| key.clone())
+}
+
+fn duplicate_suppression_breakdown(
+    runtime_filtered_by_reason: &BTreeMap<String, u64>,
+) -> BTreeMap<String, u64> {
+    runtime_filtered_by_reason
+        .iter()
+        .filter(|(reason, _)| reason.contains("duplicate") || reason.contains("dedup"))
+        .map(|(reason, count)| (reason.clone(), *count))
+        .collect()
+}
+
+fn is_timeout_verdict(verdict: Option<&str>, window_close_reason: Option<&str>) -> bool {
+    verdict.is_some_and(|value| value.contains("TIMEOUT"))
+        || window_close_reason == Some("GATEKEEPER_TIMEOUT")
+}
+
+fn is_fallback_effective_time_source(source: &str) -> bool {
+    matches!(source, "wall_clock_fallback")
+}
+
+fn contains_fallback_effective_time_source(sources: &BTreeMap<String, u64>) -> bool {
+    sources
+        .keys()
+        .any(|source| is_fallback_effective_time_source(source))
+}
+
+fn classify_timeout_window(
+    verdict: Option<&str>,
+    window_close_reason: Option<&str>,
+    window_complete: bool,
+    window_ms: u64,
+    chain_truth_count: u64,
+    seer_rx_count: u64,
+    seer_emitted_count: u64,
+    runtime_seen_count: u64,
+    runtime_accepted_count: u64,
+    counts_by_reason: &BTreeMap<String, u64>,
+    runtime_filtered_by_reason: &BTreeMap<String, u64>,
+    runtime_seen_by_effective_time_source: &BTreeMap<String, u64>,
+    runtime_seen_by_fallback_class: &BTreeMap<String, u64>,
+    invariants: &CoverageAuditInvariantSummary,
+    diagnostics: &CoverageAuditWindowDiagnostics,
+) -> (
+    Option<CoverageAuditTimeoutClass>,
+    Vec<CoverageAuditTimeoutClass>,
+) {
+    if !is_timeout_verdict(verdict, window_close_reason) {
+        return (None, Vec::new());
+    }
+
+    let mut flags = Vec::new();
+    if counts_by_reason
+        .get(CoverageAuditReason::InvariantBroken.as_str())
+        .copied()
+        .unwrap_or(0)
+        > 0
+        || invariants.emitted_without_rx > 0
+        || invariants.runtime_accepted_without_emitted > 0
+        || invariants.missing_reason_fallbacks > 0
+    {
+        flags.push(CoverageAuditTimeoutClass::InvariantBrokenBookkeeping);
+    }
+    if !window_complete || window_close_reason == Some("GATEKEEPER_TIMEOUT") {
+        flags.push(CoverageAuditTimeoutClass::WindowCloseTooEarly);
+    }
+    if chain_truth_count > 0 && seer_rx_count == 0 {
+        flags.push(CoverageAuditTimeoutClass::IngestMiss);
+    }
+    if counts_by_reason
+        .get(CoverageAuditReason::RuntimeFiltered.as_str())
+        .copied()
+        .unwrap_or(0)
+        > 0
+        || !runtime_filtered_by_reason.is_empty()
+        || (seer_emitted_count > 0 && runtime_accepted_count < seer_emitted_count)
+    {
+        flags.push(CoverageAuditTimeoutClass::FilterDrop);
+    }
+
+    let has_stale_or_late_signal =
+        contains_fallback_effective_time_source(runtime_seen_by_effective_time_source)
+            || !runtime_seen_by_fallback_class.is_empty()
+            || contains_fallback_effective_time_source(
+                &diagnostics.account_update_runtime_seen_by_effective_time_source,
+            )
+            || !diagnostics
+                .account_update_runtime_seen_by_fallback_class
+                .is_empty()
+            || diagnostics
+                .canonical_first_update_latency_ms
+                .is_some_and(|latency| latency > window_ms)
+            || diagnostics
+                .live_first_account_update_latency_ms
+                .is_some_and(|latency| latency > window_ms)
+            || (window_close_reason == Some("END_REACHED_BY_SWEEP")
+                && chain_truth_count > seer_rx_count
+                && seer_rx_count > 0);
+    if has_stale_or_late_signal {
+        flags.push(CoverageAuditTimeoutClass::StaleOrLateArrival);
+    }
+    if chain_truth_count == 0
+        && seer_rx_count == 0
+        && seer_emitted_count == 0
+        && runtime_seen_count == 0
+        && runtime_accepted_count == 0
+    {
+        flags.push(CoverageAuditTimeoutClass::GenuineNoInterest);
+    }
+    if flags.is_empty() {
+        flags.push(CoverageAuditTimeoutClass::Unclassified);
+    }
+
+    (flags.first().copied(), flags)
 }
 
 fn ratio(denominator: u64, numerator: u64) -> f64 {
@@ -1365,6 +1609,7 @@ mod tests {
             ("sig-f".to_string(), truth_state(false)),
         ]);
         let record = recorder.build_record(closed, truth, None);
+        assert_eq!(record.schema_version, 5);
         assert_eq!(record.chain_truth_count, 6);
         assert_eq!(record.chain_truth_failed_count, 1);
         assert_eq!(record.missing_count, 6);
@@ -1382,6 +1627,16 @@ mod tests {
         assert_eq!(record.counts_by_reason.get("not_received"), Some(&1));
         assert_eq!(
             record.runtime_filtered_by_reason.get("duplicate_tx_key"),
+            Some(&1)
+        );
+        assert_eq!(
+            record.filtered_reason_keys,
+            vec!["duplicate_tx_key".to_string()]
+        );
+        assert_eq!(
+            record
+                .duplicate_suppression_by_reason
+                .get("duplicate_tx_key"),
             Some(&1)
         );
         assert_eq!(
@@ -1497,6 +1752,7 @@ mod tests {
     fn recorder_keeps_phase3_canonical_ingest_diagnostics() {
         let recorder = CoverageAuditRecorder::new();
         recorder.record_canonical_update_observed("pool-1", Some(321));
+        recorder.record_account_update_runtime_seen("pool-1", "ingress_wall", None, true);
         recorder.record_seer_account_update_before_mapping("pool-1", false);
         recorder.record_seer_account_update_before_mapping("pool-1", true);
         recorder.record_seer_account_update_pending_replay("pool-1", Some(77), false, false);
@@ -1509,13 +1765,22 @@ mod tests {
             .expect("window must close");
         let record = recorder.build_record(closed, HashMap::new(), None);
 
-        assert_eq!(record.schema_version, 4);
+        assert_eq!(record.schema_version, 5);
         assert_eq!(record.diagnostics.canonical_update_count, 1);
         assert_eq!(
             record.diagnostics.canonical_first_update_latency_ms,
             Some(321)
         );
         assert_eq!(record.diagnostics.live_account_update_count, 0);
+        assert_eq!(record.diagnostics.account_update_runtime_seen_total, 1);
+        assert_eq!(record.diagnostics.account_update_runtime_accepted_total, 1);
+        assert_eq!(
+            record
+                .diagnostics
+                .account_update_runtime_seen_by_effective_time_source
+                .get("ingress_wall"),
+            Some(&1)
+        );
         assert!(record.diagnostics.timed_out_without_canonical_updates);
         assert_eq!(
             record.diagnostics.seer_account_updates_before_mapping_total,
@@ -1548,6 +1813,72 @@ mod tests {
                 .diagnostics
                 .seer_account_updates_pending_replay_max_dwell_ms,
             Some(91)
+        );
+        assert_eq!(
+            record.timeout_primary_cause,
+            Some(CoverageAuditTimeoutClass::StaleOrLateArrival)
+        );
+        assert_eq!(
+            record.timeout_flags,
+            vec![
+                CoverageAuditTimeoutClass::StaleOrLateArrival,
+                CoverageAuditTimeoutClass::GenuineNoInterest,
+            ]
+        );
+    }
+
+    #[test]
+    fn recorder_does_not_mark_timeout_stale_for_fresh_replay_alone() {
+        let recorder = CoverageAuditRecorder::new();
+        recorder.record_account_update_runtime_seen("pool-1", "ingress_wall", None, true);
+        recorder.record_seer_account_update_pending_replay("pool-1", Some(77), false, false);
+        recorder.open_window("pool-1", Some("mint-1".to_string()), 100, 200);
+        let closed = recorder
+            .close_window("pool-1", Some("TIMEOUT".to_string()), true, None)
+            .expect("window must close");
+        let record = recorder.build_record(closed, HashMap::new(), None);
+
+        assert_eq!(
+            record.timeout_primary_cause,
+            Some(CoverageAuditTimeoutClass::GenuineNoInterest)
+        );
+        assert_eq!(
+            record.timeout_flags,
+            vec![CoverageAuditTimeoutClass::GenuineNoInterest]
+        );
+    }
+
+    #[test]
+    fn recorder_does_not_treat_arbitrary_fallback_substrings_as_fallback_sources() {
+        let (timeout_primary_cause, timeout_flags) = classify_timeout_window(
+            Some("TIMEOUT"),
+            None,
+            true,
+            100,
+            0,
+            0,
+            0,
+            0,
+            0,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::from([("not_a_real_fallback_source".to_string(), 1)]),
+            &BTreeMap::new(),
+            &CoverageAuditInvariantSummary {
+                emitted_without_rx: 0,
+                runtime_accepted_without_emitted: 0,
+                missing_reason_fallbacks: 0,
+            },
+            &CoverageAuditWindowDiagnostics::default(),
+        );
+
+        assert_eq!(
+            timeout_primary_cause,
+            Some(CoverageAuditTimeoutClass::GenuineNoInterest)
+        );
+        assert_eq!(
+            timeout_flags,
+            vec![CoverageAuditTimeoutClass::GenuineNoInterest]
         );
     }
 
@@ -1590,6 +1921,10 @@ mod tests {
                 .runtime_seen_by_effective_time_source
                 .get("wall_clock_fallback"),
             Some(&1)
+        );
+        assert_eq!(
+            record.dominant_runtime_effective_time_source.as_deref(),
+            Some("chain_event")
         );
         assert_eq!(
             record
@@ -1689,5 +2024,141 @@ mod tests {
         assert_eq!(record.truth_to_runtime_accept_pct, 100.0);
         assert_eq!(record.invariants.emitted_without_rx, 0);
         assert_eq!(record.invariants.runtime_accepted_without_emitted, 0);
+    }
+
+    #[test]
+    fn runtime_filtered_without_explicit_reason_gets_fail_closed_bucket() {
+        let recorder = CoverageAuditRecorder::new();
+        recorder.open_window("pool-1", Some("mint-1".to_string()), 100, 200);
+        recorder.record_seer_rx("pool-1", "sig-filtered", "grpc_pool_stream");
+        recorder.record_seer_emitted("pool-1", "sig-filtered", "grpc_pool_stream");
+        recorder.record_runtime_seen("pool-1", "sig-filtered");
+
+        let closed = recorder
+            .close_window(
+                "pool-1",
+                Some("TIMEOUT".to_string()),
+                true,
+                Some("END_REACHED".to_string()),
+            )
+            .expect("window must close");
+        let record = recorder.build_record(
+            closed,
+            HashMap::from([("sig-filtered".to_string(), truth_state(false))]),
+            None,
+        );
+
+        assert_eq!(record.counts_by_reason.get("runtime_filtered"), Some(&1));
+        assert_eq!(
+            record
+                .runtime_filtered_by_reason
+                .get("runtime_filter_reason_missing"),
+            Some(&1)
+        );
+        assert_eq!(
+            record.filtered_reason_keys,
+            vec!["runtime_filter_reason_missing".to_string()]
+        );
+        assert_eq!(
+            record.missing_signatures[0]
+                .runtime_filter_reason
+                .as_deref(),
+            Some("runtime_filter_reason_missing")
+        );
+        assert_eq!(
+            record.timeout_primary_cause,
+            Some(CoverageAuditTimeoutClass::FilterDrop)
+        );
+    }
+
+    #[test]
+    fn timeout_taxonomy_marks_genuine_no_interest_windows() {
+        let recorder = CoverageAuditRecorder::new();
+        recorder.open_window("pool-1", Some("mint-1".to_string()), 100, 200);
+        let closed = recorder
+            .close_window(
+                "pool-1",
+                Some("TIMEOUT".to_string()),
+                true,
+                Some("END_REACHED".to_string()),
+            )
+            .expect("window must close");
+        let record = recorder.build_record(closed, HashMap::new(), None);
+
+        assert_eq!(
+            record.timeout_primary_cause,
+            Some(CoverageAuditTimeoutClass::GenuineNoInterest)
+        );
+        assert_eq!(
+            record.timeout_flags,
+            vec![CoverageAuditTimeoutClass::GenuineNoInterest]
+        );
+    }
+
+    #[test]
+    fn serialized_record_always_emits_required_coverage_contract_fields() {
+        let recorder = CoverageAuditRecorder::new();
+        recorder.open_window("pool-1", Some("mint-1".to_string()), 100, 200);
+        let closed = recorder
+            .close_window(
+                "pool-1",
+                Some("REJECT".to_string()),
+                true,
+                Some("POOL_REJECTED_EARLY".to_string()),
+            )
+            .expect("window must close");
+        let record = recorder.build_record(closed, HashMap::new(), None);
+        let json = serde_json::to_value(&record).expect("record should serialize");
+        let object = json
+            .as_object()
+            .expect("coverage record should serialize to object");
+
+        assert!(object.contains_key("timeout_primary_cause"));
+        assert!(object.contains_key("timeout_flags"));
+        assert!(object.contains_key("filtered_reason_keys"));
+        assert!(object.contains_key("dominant_runtime_effective_time_source"));
+        assert_eq!(
+            object.get("timeout_primary_cause"),
+            Some(&serde_json::Value::Null)
+        );
+        assert_eq!(
+            object.get("timeout_flags"),
+            Some(&serde_json::Value::Array(Vec::new()))
+        );
+        assert_eq!(
+            object.get("filtered_reason_keys"),
+            Some(&serde_json::Value::Array(Vec::new()))
+        );
+        assert_eq!(
+            object.get("dominant_runtime_effective_time_source"),
+            Some(&serde_json::Value::Null)
+        );
+    }
+
+    #[test]
+    fn timeout_taxonomy_marks_ingest_miss_windows() {
+        let recorder = CoverageAuditRecorder::new();
+        recorder.open_window("pool-1", Some("mint-1".to_string()), 100, 200);
+        let closed = recorder
+            .close_window(
+                "pool-1",
+                Some("TIMEOUT".to_string()),
+                true,
+                Some("END_REACHED_BY_SWEEP".to_string()),
+            )
+            .expect("window must close");
+        let record = recorder.build_record(
+            closed,
+            HashMap::from([("sig-missed".to_string(), truth_state(false))]),
+            None,
+        );
+
+        assert_eq!(
+            record.timeout_primary_cause,
+            Some(CoverageAuditTimeoutClass::IngestMiss)
+        );
+        assert!(record
+            .timeout_flags
+            .contains(&CoverageAuditTimeoutClass::IngestMiss));
     }
 }

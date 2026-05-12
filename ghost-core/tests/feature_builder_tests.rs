@@ -250,6 +250,7 @@ fn feature_builder_returns_insufficient_trends_without_checkpoint_history() {
             single_tx_max_price_impact_pct: 0.0,
             max_single_sell_impact_pct: 0.0,
             bonding_progress: 0.15,
+            trajectory_assessment: None,
         }
     );
 }

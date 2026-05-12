@@ -986,6 +986,7 @@ fn emit_account_update_to_event_bus(
     );
     let ghost_event = GhostEvent::AccountUpdate(AccountUpdateEvent {
         semantic: update.semantic,
+        event_time: update.event_time,
         base_mint: update.base_mint,
         bonding_curve: update.bonding_curve,
         curve_finality: update.curve_finality,
@@ -1930,6 +1931,7 @@ mod tests {
     fn make_account_update(base_mint: Pubkey, bonding_curve: Pubkey) -> DetectedAccountUpdateEvent {
         DetectedAccountUpdateEvent {
             semantic: ghost_core::EventSemanticEnvelope::default(),
+            event_time: ghost_core::EventTimeMetadata::default(),
             base_mint,
             bonding_curve,
             curve_finality: CurveFinality::Provisional,

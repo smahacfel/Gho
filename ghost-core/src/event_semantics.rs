@@ -1,3 +1,4 @@
+use crate::EventTimeMetadata;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -186,6 +187,7 @@ pub const fn normalize_transaction_semantics(
 
 pub const fn normalize_account_update_semantics(
     source: &str,
+    event_time: EventTimeMetadata,
     slot_present: bool,
 ) -> EventSemanticEnvelope {
     let source_kind = source_kind_from_label(source);
@@ -198,9 +200,23 @@ pub const fn normalize_account_update_semantics(
         source_kind,
         EventTruthKind::RawChain,
         slot_quality,
-        TimestampQuality::WallClock,
-        EventCompleteness::Partial,
+        account_update_timestamp_quality(event_time),
+        derive_completeness(
+            EventTruthKind::RawChain,
+            slot_quality,
+            account_update_timestamp_quality(event_time),
+        ),
     )
+}
+
+const fn account_update_timestamp_quality(event_time: EventTimeMetadata) -> TimestampQuality {
+    if event_time.chain_event_ts_ms.is_some() {
+        TimestampQuality::Chain
+    } else if event_time.ingress_wall_ts_ms.is_some() {
+        TimestampQuality::Adapter
+    } else {
+        TimestampQuality::WallClock
+    }
 }
 
 pub fn record_event_semantic_metric(semantic: EventSemanticEnvelope) {
@@ -263,6 +279,8 @@ const fn str_eq(left: &str, right: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::EventTimeMetadata;
+
     use super::{
         normalize_account_update_semantics, normalize_transaction_semantics, EventCompleteness,
         EventTruthKind, SlotQuality, SourceKind, TimestampQuality,
@@ -312,9 +330,37 @@ mod tests {
 
     #[test]
     fn account_update_is_partial_without_chain_timestamp() {
-        let semantic = normalize_account_update_semantics("grpc_global_stream", true);
+        let semantic = normalize_account_update_semantics(
+            "grpc_global_stream",
+            EventTimeMetadata::default(),
+            true,
+        );
         assert_eq!(semantic.event_truth_kind, EventTruthKind::RawChain);
         assert_eq!(semantic.timestamp_quality, TimestampQuality::WallClock);
         assert_eq!(semantic.completeness, EventCompleteness::Partial);
+    }
+
+    #[test]
+    fn account_update_uses_adapter_timestamp_quality_when_ingress_time_exists() {
+        let semantic = normalize_account_update_semantics(
+            "grpc_global_stream",
+            EventTimeMetadata::new(None, Some(123), Some(456)),
+            true,
+        );
+        assert_eq!(semantic.event_truth_kind, EventTruthKind::RawChain);
+        assert_eq!(semantic.slot_quality, SlotQuality::Present);
+        assert_eq!(semantic.timestamp_quality, TimestampQuality::Adapter);
+        assert_eq!(semantic.completeness, EventCompleteness::Full);
+    }
+
+    #[test]
+    fn account_update_uses_chain_timestamp_quality_when_chain_time_exists() {
+        let semantic = normalize_account_update_semantics(
+            "grpc_global_stream",
+            EventTimeMetadata::new(Some(321), Some(654), Some(987)),
+            true,
+        );
+        assert_eq!(semantic.timestamp_quality, TimestampQuality::Chain);
+        assert_eq!(semantic.completeness, EventCompleteness::Full);
     }
 }

@@ -74,6 +74,7 @@ impl ObservationFeatureBuilder {
                 &reserve_samples,
             ),
             bonding_progress: account_features.bonding_progress,
+            trajectory_assessment: None,
         }
     }
 }
@@ -101,6 +102,7 @@ impl FeatureMaterializer for ObservationFeatureBuilder {
             curve_readiness: Default::default(),
             sybil_resistance: Default::default(),
             alpha_fingerprint: Default::default(),
+            tx_segment_sequence: None,
         }
     }
 }

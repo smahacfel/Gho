@@ -72,9 +72,21 @@ pub const CYCLIC_LOG_SCHEMA_VERSION: u32 = 1;
 /// BUY/decision JSONL telemetry.
 /// v14 adds strict prosperity-overlay diagnostics and thresholds.
 /// v15 adds 3-second early top-3 buy concentration telemetry and thresholding.
-pub const GATEKEEPER_BUY_LOG_SCHEMA_VERSION: u32 = 15;
-/// Gatekeeper version string embedded in every BUY log for traceability.
-pub const GATEKEEPER_VERSION: &str = "v2.2";
+/// v16 adds V2.5 shadow decision fields (early/normal window shadow verdicts,
+/// observation stage, confidence proxy).
+/// v17 separates legacy_live and v25_shadow decision planes and routes records by
+/// rollout_profile / gatekeeper_version / decision_plane / config_hash.
+/// v18 adds V2.5 confidence breakdown fields so calibration can separate raw
+/// model quality from terminal PDD/TAS veto zeroing.
+/// v19 adds typed `reason_code` (GatekeeperReasonCode enum, version 2)
+/// for all verdict types including TIMEOUT subtypes.
+pub const GATEKEEPER_BUY_LOG_SCHEMA_VERSION: u32 = 19;
+/// Gatekeeper version string embedded in every V2.5 shadow BUY log for traceability.
+pub const GATEKEEPER_VERSION: &str = "v2.5";
+/// Legacy Gatekeeper version string for pre-V2.5 live-plane semantics.
+pub const LEGACY_GATEKEEPER_VERSION: &str = "v2.2";
+const DECISION_PLANE_LEGACY_LIVE: &str = "legacy_live";
+const DECISION_PLANE_V25_SHADOW: &str = "v25_shadow";
 
 fn is_no_space_error<'a>(
     errors: impl IntoIterator<Item = &'a (dyn std::error::Error + 'static)>,
@@ -251,6 +263,14 @@ pub struct GatekeeperBuyLog {
     /// Gatekeeper version string (e.g. "v2.2").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gatekeeper_version: Option<String>,
+
+    /// Rollout profile that produced this record (e.g. "shadow-burnin").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollout_profile: Option<String>,
+
+    /// Explicit semantic plane carried by this record (`legacy_live`, `v25_shadow`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_plane: Option<String>,
 
     /// Blake3 hash of key config thresholds — reproducible across restarts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -580,6 +600,16 @@ pub struct GatekeeperBuyLog {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decision_reason: Option<String>,
 
+    /// Typed reason code (GatekeeperReasonCode taxonomy, version 2).
+    /// Always populated for every verdict type (BUY, REJECT, TIMEOUT).
+    /// Replaces the legacy free-form `decision_reason` for machine auditability.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+
+    /// Reason code taxonomy version (2 = all verdict types, 1 = NoEmit-only).
+    #[serde(default)]
+    pub reason_code_version: u32,
+
     /// Final verdict from three-layer system (true=BUY, false=REJECT)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decision_verdict_buy: Option<bool>,
@@ -589,6 +619,42 @@ pub struct GatekeeperBuyLog {
     /// REJECT_LOW_ALPHA, REJECT_LOW_PROSPERITY, TIMEOUT_PHASE1, TIMEOUT_NO_DATA
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verdict_type: Option<String>,
+
+    /// Explicit legacy live-plane reason chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_live_reason_chain: Option<String>,
+
+    /// Explicit legacy live-plane verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_live_verdict_buy: Option<bool>,
+
+    /// Explicit legacy live-plane verdict type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_live_verdict_type: Option<String>,
+
+    /// Explicit V2.5 shadow-plane verdict type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v25_shadow_verdict_type: Option<String>,
+
+    /// Explicit V2.5 shadow-plane reason chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v25_shadow_reason_chain: Option<String>,
+
+    /// Explicit V2.5 shadow-plane confidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v25_shadow_confidence: Option<f64>,
+
+    /// Provenance of `v25_shadow_confidence` (`shadow_window_terminal` or `assessment_cached`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v25_shadow_confidence_source: Option<String>,
+
+    /// Explicit V2.5 shadow-plane terminal observation stage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v25_shadow_observation_stage: Option<String>,
+
+    /// Promotion state for the V2.5 plane (`shadow_only`, `live_enabled`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v25_promotion_state: Option<String>,
 
     /// Whether alpha gate was enabled in config for this decision.
     #[serde(default)]
@@ -1092,6 +1158,192 @@ pub struct GatekeeperBuyLog {
     /// Price change between consecutive tx (diff of prices); length = N−1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vectors_d_price: Option<Vec<f64>>,
+
+    // ═══════════════════════════════════════════
+    // V2.5 Shadow Decision Fields (v16)
+    // ═══════════════════════════════════════════
+    /// Shadow verdict at early window (2-5s): "BUY" / "REJECT" / "INSUFFICIENT_DATA"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_early_verdict: Option<String>,
+    /// Shadow verdict at normal window (5-7s)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_normal_verdict: Option<String>,
+    /// Elapsed wall-clock ms at early shadow evaluation
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_early_elapsed_ms: Option<u64>,
+    /// Shadow verdict at extended window (7-10s): "BUY" / "REJECT" — the terminal shadow decision
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_extended_verdict: Option<String>,
+    /// Elapsed wall-clock ms at extended shadow evaluation
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_extended_elapsed_ms: Option<u64>,
+    /// Elapsed wall-clock ms at normal shadow evaluation
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_normal_elapsed_ms: Option<u64>,
+    /// Phases passed at early shadow evaluation (0-6)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_early_phases_passed: Option<u8>,
+    /// Phases passed at normal shadow evaluation (0-6)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_normal_phases_passed: Option<u8>,
+    /// Terminal observation stage (always "Extended" for current live path)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_stage: Option<String>,
+    /// V2.5 confidence score proxy at terminal decision
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v25_confidence: Option<f64>,
+    /// V2.5 confidence before hard PDD/TAS zeroing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v25_confidence_pre_veto: Option<f64>,
+    /// Base-quality component (`phases_passed / 6`) of the V2.5 confidence model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v25_confidence_base_quality: Option<f64>,
+    /// Alpha-quality component of the V2.5 confidence model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v25_confidence_alpha_quality: Option<f64>,
+    /// PDD cleanliness modulator of the V2.5 confidence model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v25_confidence_pdd_modulator: Option<f64>,
+    /// TAS modulator of the V2.5 confidence model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v25_confidence_tas_modulator: Option<f64>,
+    /// Sybil modulator of the V2.5 confidence model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v25_confidence_sybil_modulator: Option<f64>,
+    /// Whether the final V2.5 confidence was zeroed by a PDD hard fail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v25_confidence_zeroed_by_pdd_hard_fail: Option<bool>,
+    /// Whether the final V2.5 confidence was zeroed by a TAS hard reject.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v25_confidence_zeroed_by_tas_hard_reject: Option<bool>,
+    /// Whether TAS inputs were fully available for this assessment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tas_available: Option<bool>,
+    /// Why TAS could not be materialized when disabled/partial.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tas_unavailable_reason: Option<String>,
+    /// Whether sequence-dependent PDD checks were available from the underlying source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdd_sequence_signals_available: Option<bool>,
+    /// P1: Specific reason when PDD sequence signals are unavailable.
+    /// Mirrors the taxonomy from `pdd_sequence_signals_availability()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdd_sequence_signals_unavailable_reason: Option<String>,
+    /// Whether a valid price anchor was available for entry-drift evaluation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdd_price_anchor_available: Option<bool>,
+    /// Whether V2.5 confidence is fully interpretable for this record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v25_confidence_available: Option<bool>,
+    /// Why V2.5 confidence is unavailable when partial inputs prevented computation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v25_confidence_unavailable_reason: Option<String>,
+
+    /// Reason for TAS-based shadow reject (populated when RejectLowTrajectory)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_tas_reject_reason: Option<String>,
+
+    // ═══════════════════════════════════════════
+    // V2.5 Trajectory Aware Scoring (TAS) fields
+    // ═══════════════════════════════════════════
+    /// Overall TAS trajectory score (weighted 5-dimension)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tas_overall_score: Option<f64>,
+    /// Momentum dimension score: T2/T0 tx count ratio
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tas_momentum_score: Option<f64>,
+    /// HHI trajectory score: T2/T0 HHI ratio
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tas_hhi_score: Option<f64>,
+    /// Volume consistency score: CV across segments
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tas_volume_score: Option<f64>,
+    /// Interval trajectory score: T2/T0 interval ratio
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tas_interval_score: Option<f64>,
+    /// Buy ratio stability score
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tas_buy_ratio_score: Option<f64>,
+
+    // ═══════════════════════════════════════════
+    // V2.5 Pump & Dump Detector (PDD) fields
+    // ═══════════════════════════════════════════
+    /// PDD hard fail reason tag (ENTRY_DRIFT/SPIKE/RAMPING/WHALE/RESERVE/FLASH_CRASH)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdd_hard_fail: Option<String>,
+    /// Entry drift percentage from initial price
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdd_entry_drift_pct: Option<f64>,
+    /// Entry drift anchor source provenance
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdd_entry_drift_anchor_source: Option<String>,
+    /// Entry drift anchor quality: "strong" / "weak"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdd_entry_drift_anchor_quality: Option<String>,
+    /// Volume spike pattern detected
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdd_spike_detected: Option<bool>,
+    /// Consecutive same-size buy ramping detected
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdd_ramping_detected: Option<bool>,
+    /// Top-3 whale volume concentration percentage
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdd_whale_top3_pct: Option<f64>,
+    /// Flash crash sell cluster risk detected
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdd_flash_crash_risk: Option<bool>,
+    /// Overall PDD cleanliness score (1.0 = clean, 0.0 = hard fail)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdd_score: Option<f64>,
+
+    // ═══════════════════════════════════════════
+    // V2.5 Adaptive Prosperity (APS) fields
+    // ═══════════════════════════════════════════
+    /// Detected market regime: "Normal" / "HighVolatility"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aps_regime: Option<String>,
+    /// Shadow-suggested entry drift max for this regime
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aps_shadow_entry_drift_max: Option<f64>,
+    /// Shadow-suggested confidence minimum for this regime
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aps_shadow_confidence_min: Option<f64>,
+    /// Shadow-suggested prosperity market cap floor
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aps_shadow_prosperity_mcap: Option<f64>,
+    /// Shadow-suggested branch1 sniped supply threshold
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aps_shadow_branch1_sniped: Option<f64>,
+    /// Shadow-suggested branch3 HHI max threshold
+    /// Contrafactual: would prosperity filter have passed with APS shadow thresholds?
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aps_shadow_prosperity_would_pass: Option<bool>,
+    pub aps_shadow_branch3_hhi: Option<f64>,
+    /// Serialized APS shadow thresholds as JSON string for ablation tooling
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aps_shadow_thresholds: Option<String>,
+
+    // ═══════════════════════════════════════════
+    // V2.5 top-level telemetry (Plan Section 6.3 — cross-module fields)
+    // ═══════════════════════════════════════════
+    /// Entry drift percentage (from PDD, exposed as top-level for ablation)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_drift_pct: Option<f64>,
+    /// Entry drift anchor source provenance
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_drift_anchor_source: Option<String>,
+    /// Entry drift anchor quality: "strong" / "weak"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_drift_anchor_quality: Option<String>,
+    /// Market regime detected by APS (top-level alias for aps_regime)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub market_regime: Option<String>,
+    /// PDD soft flags fired (comma-separated)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdd_soft_flags: Option<String>,
+    /// PDD-based shadow reject reason chain
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_pdd_reject_reason: Option<String>,
 }
 
 /// Decision made by Oracle Brain (initial or follow-up)
@@ -1357,11 +1609,15 @@ pub struct DecisionLoggerConfig {
     /// Base directory for decision logs
     pub log_dir: PathBuf,
     /// Base directory for gatekeeper-specific decision logs.
-    /// Gatekeeper V2 verdicts (decisions + buys) are written here rather
-    /// than to `log_dir`, keeping gatekeeper output in a dedicated rollout
-    /// directory for shadow-burnin analysis.
-    /// Default: "logs/decisions.json/rollout/shadow-burnin/decisions"
+    /// Gatekeeper V2 verdicts (decisions + buys) are written here. By default
+    /// this stays aligned with `log_dir` so runtime config remains the SSOT
+    /// for artifact rooting and library defaults cannot inject rollout-specific
+    /// paths.
     pub gatekeeper_log_dir: PathBuf,
+    /// Stable rollout-profile tag stamped onto routed gatekeeper records.
+    pub gatekeeper_rollout_profile: String,
+    /// Deterministic gatekeeper config hash stamped onto routed gatekeeper records.
+    pub gatekeeper_config_hash: String,
     /// Channel buffer size
     pub channel_buffer_size: usize,
     /// Enable logging
@@ -1372,7 +1628,9 @@ impl Default for DecisionLoggerConfig {
     fn default() -> Self {
         Self {
             log_dir: PathBuf::from(DEFAULT_DECISION_LOG_DIR),
-            gatekeeper_log_dir: PathBuf::from("logs/decisions.json/rollout/shadow-burnin/decisions"),
+            gatekeeper_log_dir: PathBuf::from(DEFAULT_DECISION_LOG_DIR),
+            gatekeeper_rollout_profile: "unknown_rollout".to_string(),
+            gatekeeper_config_hash: "unknown_config_hash".to_string(),
             channel_buffer_size: 1000,
             enabled: true,
         }
@@ -1493,64 +1751,72 @@ impl DecisionLogger {
                     }
                     LogCommand::WriteGatekeeperBuy(log) => {
                         if logging_disabled_due_to_enospc {
-                            mark_gatekeeper_log_progress(
-                                health.as_ref(),
-                                log.decision_verdict_buy == Some(true),
-                            );
                             continue;
                         }
-                        // ── A/B dedup: skip duplicate ab_record_id writes ──
-                        if let Some(ref record_id) = log.ab_record_id {
-                            let now = Instant::now();
-                            // 1. Evict TTL-expired entries from the front.
-                            while let Some((ts, _)) = dedup_queue.front() {
-                                if now.duration_since(*ts) >= DEDUP_TTL {
+                        for mut plane_log in expand_gatekeeper_plane_logs(log) {
+                            hydrate_gatekeeper_routing_fields(&mut plane_log, &config);
+
+                            // ── A/B dedup: skip duplicate ab_record_id writes per plane ──
+                            if let Some(ref record_id) = plane_log.ab_record_id {
+                                let plane =
+                                    plane_log.decision_plane.as_deref().unwrap_or("unscoped");
+                                let dedup_key = format!("{record_id}:{plane}");
+                                let now = Instant::now();
+
+                                while let Some((ts, _)) = dedup_queue.front() {
+                                    if now.duration_since(*ts) >= DEDUP_TTL {
+                                        if let Some((_, key)) = dedup_queue.pop_front() {
+                                            dedup_map.remove(&key);
+                                        }
+                                    } else {
+                                        break;
+                                    }
+                                }
+
+                                if dedup_map.len() >= DEDUP_MAX_CAPACITY {
                                     if let Some((_, key)) = dedup_queue.pop_front() {
                                         dedup_map.remove(&key);
                                     }
-                                } else {
-                                    break;
                                 }
-                            }
-                            // 2. Evict oldest if at capacity.
-                            if dedup_map.len() >= DEDUP_MAX_CAPACITY {
-                                if let Some((_, key)) = dedup_queue.pop_front() {
-                                    dedup_map.remove(&key);
+
+                                if dedup_map.contains_key(&dedup_key) {
+                                    warn!(
+                                        "DEDUP_GUARD: skipping duplicate JSONL write for ab_record_id={} plane={} pool={}",
+                                        record_id, plane, plane_log.pool_id
+                                    );
+                                    continue;
                                 }
+                                dedup_map.insert(dedup_key.clone(), ());
+                                dedup_queue.push_back((now, dedup_key));
                             }
-                            // 3. Insert or skip.
-                            if dedup_map.contains_key(record_id) {
-                                warn!(
-                                    "DEDUP_GUARD: skipping duplicate JSONL write for ab_record_id={} pool={}",
-                                    record_id, log.pool_id
-                                );
-                                continue;
-                            }
-                            dedup_map.insert(record_id.clone(), ());
-                            dedup_queue.push_back((now, record_id.clone()));
-                        }
-                        if let Err(e) = write_gatekeeper_buy_log(&config.gatekeeper_log_dir, &log).await {
-                            if is_no_space_error(e.chain()) {
-                                logging_disabled_due_to_enospc = true;
+
+                            let buy_eligible = plane_log.decision_verdict_buy == Some(true);
+                            if let Err(e) =
+                                write_gatekeeper_buy_log(&config.gatekeeper_log_dir, &plane_log)
+                                    .await
+                            {
+                                if is_no_space_error(e.chain()) {
+                                    logging_disabled_due_to_enospc = true;
+                                    error!(
+                                        "DecisionLogger: disabling file writes after ENOSPC on gatekeeper log for {} plane={}",
+                                        plane_log.pool_id,
+                                        plane_log
+                                            .decision_plane
+                                            .as_deref()
+                                            .unwrap_or("unknown")
+                                    );
+                                    mark_gatekeeper_log_progress(health.as_ref(), buy_eligible);
+                                    continue;
+                                }
                                 error!(
-                                    "DecisionLogger: disabling file writes after ENOSPC on gatekeeper log for {}",
-                                    log.pool_id
+                                    "Failed to write gatekeeper buy log for {} plane={}: {}",
+                                    plane_log.pool_id,
+                                    plane_log.decision_plane.as_deref().unwrap_or("unknown"),
+                                    e
                                 );
-                                mark_gatekeeper_log_progress(
-                                    health.as_ref(),
-                                    log.decision_verdict_buy == Some(true),
-                                );
-                                continue;
+                            } else {
+                                mark_gatekeeper_log_progress(health.as_ref(), buy_eligible);
                             }
-                            error!(
-                                "Failed to write gatekeeper buy log for {}: {}",
-                                log.pool_id, e
-                            );
-                        } else {
-                            mark_gatekeeper_log_progress(
-                                health.as_ref(),
-                                log.decision_verdict_buy == Some(true),
-                            );
                         }
                     }
                     LogCommand::Shutdown => {
@@ -1631,6 +1897,115 @@ impl DecisionLogger {
     }
 }
 
+fn hydrate_gatekeeper_routing_fields(log: &mut GatekeeperBuyLog, config: &DecisionLoggerConfig) {
+    if log.rollout_profile.is_none() {
+        log.rollout_profile = Some(config.gatekeeper_rollout_profile.clone());
+    }
+    if log.config_hash.is_none() {
+        log.config_hash = Some(config.gatekeeper_config_hash.clone());
+    }
+}
+
+fn gatekeeper_buy_alias_from_verdict(verdict_type: Option<&str>) -> Option<bool> {
+    verdict_type.map(|verdict| matches!(verdict, "BUY" | "EARLY_BUY"))
+}
+
+fn expand_gatekeeper_plane_logs(log: GatekeeperBuyLog) -> Vec<GatekeeperBuyLog> {
+    if log.decision_plane.is_some() {
+        return vec![log];
+    }
+
+    let legacy_reason = log
+        .legacy_live_reason_chain
+        .clone()
+        .or_else(|| log.decision_reason.clone());
+    let legacy_verdict_buy = log.legacy_live_verdict_buy.or(log.decision_verdict_buy);
+    let legacy_verdict_type = log
+        .legacy_live_verdict_type
+        .clone()
+        .or_else(|| log.verdict_type.clone());
+    let has_legacy_plane =
+        legacy_reason.is_some() || legacy_verdict_buy.is_some() || legacy_verdict_type.is_some();
+
+    let has_shadow_plane = log.v25_shadow_verdict_type.is_some()
+        || log.v25_shadow_reason_chain.is_some()
+        || log.v25_shadow_confidence.is_some()
+        || log.v25_shadow_observation_stage.is_some();
+
+    let mut expanded = Vec::with_capacity(if has_shadow_plane && has_legacy_plane {
+        2
+    } else {
+        1
+    });
+
+    if has_legacy_plane {
+        let mut legacy = log.clone();
+        legacy.gatekeeper_version = Some(LEGACY_GATEKEEPER_VERSION.to_string());
+        legacy.decision_plane = Some(DECISION_PLANE_LEGACY_LIVE.to_string());
+        legacy.legacy_live_reason_chain = legacy_reason.clone();
+        legacy.legacy_live_verdict_buy = legacy_verdict_buy;
+        legacy.legacy_live_verdict_type = legacy_verdict_type.clone();
+        legacy.decision_reason = legacy_reason;
+        legacy.decision_verdict_buy = legacy_verdict_buy;
+        // P4: per-plane reason_code — recompute from legacy verdict type
+        // when a 1:1 mapping exists. For generic/aggregate tags, keep the
+        // unified reason_code from the primary assessment (100% completeness).
+        let legacy_rc = legacy_verdict_type.as_ref().and_then(|vt| {
+            crate::oracle::reason_code::GatekeeperReasonCode::derive_from_verdict_type_str(vt)
+        });
+        legacy.verdict_type = legacy_verdict_type;
+        legacy.reason_code = legacy_rc.or_else(|| log.reason_code.clone());
+        expanded.push(legacy);
+    }
+
+    if has_shadow_plane {
+        let mut shadow = log.clone();
+        let shadow_verdict_type = shadow.v25_shadow_verdict_type.clone();
+        shadow.gatekeeper_version = Some(GATEKEEPER_VERSION.to_string());
+        shadow.decision_plane = Some(DECISION_PLANE_V25_SHADOW.to_string());
+        shadow.decision_reason = shadow.v25_shadow_reason_chain.clone();
+        shadow.decision_verdict_buy =
+            gatekeeper_buy_alias_from_verdict(shadow_verdict_type.as_deref());
+        // P4: per-plane reason_code — recompute from shadow verdict type
+        // when a 1:1 mapping exists. For generic/aggregate tags, keep the
+        // unified reason_code from the primary assessment (100% completeness).
+        let shadow_rc = shadow_verdict_type.as_ref().and_then(|vt| {
+            crate::oracle::reason_code::GatekeeperReasonCode::derive_from_verdict_type_str(vt)
+        });
+        shadow.verdict_type = shadow_verdict_type;
+        shadow.reason_code = shadow_rc.or_else(|| log.reason_code.clone());
+        expanded.push(shadow);
+    }
+
+    if expanded.is_empty() {
+        let mut fallback = log;
+        fallback.gatekeeper_version = Some(LEGACY_GATEKEEPER_VERSION.to_string());
+        fallback.decision_plane = Some(DECISION_PLANE_LEGACY_LIVE.to_string());
+        expanded.push(fallback);
+    }
+
+    expanded
+}
+
+fn gatekeeper_route_dir(base_dir: &Path, log: &GatekeeperBuyLog) -> PathBuf {
+    let rollout_profile = log.rollout_profile.as_deref().unwrap_or("unknown_rollout");
+    let gatekeeper_version = log
+        .gatekeeper_version
+        .as_deref()
+        .unwrap_or("unknown_gatekeeper_version");
+    let decision_plane = log
+        .decision_plane
+        .as_deref()
+        .unwrap_or("unknown_decision_plane");
+    let config_hash = log.config_hash.as_deref().unwrap_or("unknown_config_hash");
+
+    base_dir
+        .join(rollout_profile)
+        .join(gatekeeper_version)
+        .join(decision_plane)
+        .join(config_hash)
+}
+
 /// Write a decision log to JSONL file
 async fn write_log(base_dir: &Path, log: &OracleDecisionLog) -> Result<()> {
     // Create candidate-specific directory
@@ -1703,12 +2078,16 @@ async fn write_cyclic_log(base_dir: &Path, log: &CyclicEngineLog) -> Result<()> 
 
 /// Write a gatekeeper V2 decision log with routing.
 ///
-/// Every decision is ALWAYS appended to `gatekeeper_v2_decisions.jsonl`.
-/// Decisions where `decision_verdict_buy == Some(true)` are ADDITIONALLY
-/// appended to `gatekeeper_v2_buys.jsonl` (passed / buy-eligible only).
+/// Every plane-specific decision is appended to:
+/// `{base_dir}/{rollout_profile}/{gatekeeper_version}/{decision_plane}/{config_hash}/`.
+/// Inside that routed directory, every decision is ALWAYS appended to
+/// `gatekeeper_v2_decisions.jsonl`. Decisions where `decision_verdict_buy ==
+/// Some(true)` are ADDITIONALLY appended to `gatekeeper_v2_buys.jsonl`.
 async fn write_gatekeeper_buy_log(base_dir: &Path, log: &GatekeeperBuyLog) -> Result<()> {
+    let routed_dir = gatekeeper_route_dir(base_dir, log);
+
     // Create log directory if it doesn't exist
-    create_dir_all(base_dir)
+    create_dir_all(&routed_dir)
         .await
         .context("Failed to create gatekeeper buy log directory")?;
 
@@ -1747,7 +2126,7 @@ async fn write_gatekeeper_buy_log(base_dir: &Path, log: &GatekeeperBuyLog) -> Re
     let json = serde_json::to_string(log).context("Failed to serialize gatekeeper buy log")?;
 
     // 1. ALWAYS write to decisions file (all verdicts)
-    let decisions_path = base_dir.join(GATEKEEPER_DECISIONS_JSONL);
+    let decisions_path = routed_dir.join(GATEKEEPER_DECISIONS_JSONL);
     {
         let mut file = OpenOptions::new()
             .create(true)
@@ -1763,7 +2142,7 @@ async fn write_gatekeeper_buy_log(base_dir: &Path, log: &GatekeeperBuyLog) -> Re
     // 2. ADDITIONALLY write to passed/buys file only if verdict is BUY
     let is_passed = log.decision_verdict_buy == Some(true);
     if is_passed {
-        let passed_path = base_dir.join(GATEKEEPER_PASSED_JSONL);
+        let passed_path = routed_dir.join(GATEKEEPER_PASSED_JSONL);
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -1889,6 +2268,8 @@ mod tests {
         let config = DecisionLoggerConfig {
             log_dir: temp_dir.path().to_path_buf(),
             gatekeeper_log_dir: temp_dir.path().to_path_buf(),
+            gatekeeper_rollout_profile: "test-rollout".to_string(),
+            gatekeeper_config_hash: "test-config-hash".to_string(),
             channel_buffer_size: 10,
             enabled: true,
         };
@@ -1916,6 +2297,14 @@ mod tests {
         let content = fs::read_to_string(log_path).await.unwrap();
         assert!(content.contains("test_pool_456"));
         assert!(content.contains("\"initialScore\":75"));
+    }
+
+    #[test]
+    fn test_default_config_keeps_gatekeeper_root_aligned_with_log_root() {
+        let config = DecisionLoggerConfig::default();
+
+        assert_eq!(config.gatekeeper_log_dir, config.log_dir);
+        assert_eq!(config.gatekeeper_rollout_profile, "unknown_rollout");
     }
 
     #[tokio::test]
@@ -2011,7 +2400,9 @@ mod tests {
             end_10s_ts_ms: None,
             core_pass: None,
             gatekeeper_version: None,
-            config_hash: None,
+            rollout_profile: Some("test-rollout".to_string()),
+            decision_plane: None,
+            config_hash: Some("test-config-hash".to_string()),
             dev_pubkey: None,
             shadow_ready: None,
             shadow_missing_fields: None,
@@ -2151,6 +2542,15 @@ mod tests {
             decision_reason: None,
             decision_verdict_buy: None,
             verdict_type: None,
+            legacy_live_reason_chain: None,
+            legacy_live_verdict_buy: None,
+            legacy_live_verdict_type: None,
+            v25_shadow_verdict_type: None,
+            v25_shadow_reason_chain: None,
+            v25_shadow_confidence: None,
+            v25_shadow_confidence_source: None,
+            v25_shadow_observation_stage: None,
+            v25_promotion_state: Some("shadow_only".to_string()),
             alpha_gate_enabled: false,
             alpha_pass: None,
             alpha_actionable: None,
@@ -2284,12 +2684,72 @@ mod tests {
             vectors_prices: None,
             vectors_interval_ms: None,
             vectors_d_price: None,
+            // V2.5 Shadow fields (not used in this test)
+            shadow_extended_verdict: None,
+            shadow_extended_elapsed_ms: None,
+            shadow_early_verdict: None,
+            shadow_normal_verdict: None,
+            shadow_early_elapsed_ms: None,
+            shadow_normal_elapsed_ms: None,
+            shadow_early_phases_passed: None,
+            shadow_normal_phases_passed: None,
+            observation_stage: None,
+            v25_confidence: None,
+            v25_confidence_pre_veto: None,
+            v25_confidence_base_quality: None,
+            v25_confidence_alpha_quality: None,
+            v25_confidence_pdd_modulator: None,
+            v25_confidence_tas_modulator: None,
+            v25_confidence_sybil_modulator: None,
+            v25_confidence_zeroed_by_pdd_hard_fail: None,
+            v25_confidence_zeroed_by_tas_hard_reject: None,
+            tas_available: None,
+            tas_unavailable_reason: None,
+            pdd_sequence_signals_available: None,
+            pdd_price_anchor_available: None,
+            v25_confidence_available: None,
+            v25_confidence_unavailable_reason: None,
+            shadow_tas_reject_reason: None,
+            tas_overall_score: None,
+            tas_momentum_score: None,
+            tas_hhi_score: None,
+            tas_volume_score: None,
+            tas_interval_score: None,
+            tas_buy_ratio_score: None,
+            pdd_hard_fail: None,
+            pdd_entry_drift_pct: None,
+            pdd_entry_drift_anchor_source: None,
+            pdd_entry_drift_anchor_quality: None,
+            pdd_spike_detected: None,
+            pdd_ramping_detected: None,
+            pdd_whale_top3_pct: None,
+            pdd_flash_crash_risk: None,
+            pdd_score: None,
+            aps_regime: None,
+            aps_shadow_entry_drift_max: None,
+            aps_shadow_confidence_min: None,
+            aps_shadow_prosperity_mcap: None,
+            aps_shadow_branch1_sniped: None,
+            aps_shadow_branch3_hhi: None,
+            aps_shadow_prosperity_would_pass: None,
+            aps_shadow_thresholds: None,
+            entry_drift_pct: None,
+            entry_drift_anchor_source: None,
+            entry_drift_anchor_quality: None,
+            market_regime: None,
+            pdd_soft_flags: None,
+            shadow_pdd_reject_reason: None,
+            reason_code: None,
+            reason_code_version: 0,
+            pdd_sequence_signals_unavailable_reason: None,
         };
 
         // Initialize the logger
         let config = DecisionLoggerConfig {
             log_dir: log_dir.clone(),
             gatekeeper_log_dir: log_dir.clone(),
+            gatekeeper_rollout_profile: "test-rollout".to_string(),
+            gatekeeper_config_hash: "test-config-hash".to_string(),
             channel_buffer_size: 10,
             enabled: true,
         };
@@ -2302,7 +2762,12 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Verify the decisions file was created (all verdicts go here)
-        let decisions_file = log_dir.join(GATEKEEPER_DECISIONS_JSONL);
+        let decisions_file = test_gatekeeper_route_dir(
+            &log_dir,
+            LEGACY_GATEKEEPER_VERSION,
+            DECISION_PLANE_LEGACY_LIVE,
+        )
+        .join(GATEKEEPER_DECISIONS_JSONL);
         assert!(
             decisions_file.exists(),
             "Decisions log file should be created"
@@ -2361,7 +2826,9 @@ mod tests {
             end_10s_ts_ms: None,
             core_pass: None,
             gatekeeper_version: None,
-            config_hash: None,
+            rollout_profile: Some("test-rollout".to_string()),
+            decision_plane: None,
+            config_hash: Some("test-config-hash".to_string()),
             dev_pubkey: None,
             shadow_ready: None,
             shadow_missing_fields: None,
@@ -2497,6 +2964,15 @@ mod tests {
             decision_reason: None,
             decision_verdict_buy: None,
             verdict_type: None,
+            legacy_live_reason_chain: None,
+            legacy_live_verdict_buy: None,
+            legacy_live_verdict_type: None,
+            v25_shadow_verdict_type: None,
+            v25_shadow_reason_chain: None,
+            v25_shadow_confidence: None,
+            v25_shadow_confidence_source: None,
+            v25_shadow_observation_stage: None,
+            v25_promotion_state: Some("shadow_only".to_string()),
             alpha_gate_enabled: false,
             alpha_pass: None,
             alpha_actionable: None,
@@ -2626,7 +3102,76 @@ mod tests {
             vectors_prices: None,
             vectors_interval_ms: None,
             vectors_d_price: None,
+            // V2.5 Shadow fields (not used in this test)
+            shadow_extended_verdict: None,
+            shadow_extended_elapsed_ms: None,
+            shadow_early_verdict: None,
+            shadow_normal_verdict: None,
+            shadow_early_elapsed_ms: None,
+            shadow_normal_elapsed_ms: None,
+            shadow_early_phases_passed: None,
+            shadow_normal_phases_passed: None,
+            observation_stage: None,
+            v25_confidence: None,
+            v25_confidence_pre_veto: None,
+            v25_confidence_base_quality: None,
+            v25_confidence_alpha_quality: None,
+            v25_confidence_pdd_modulator: None,
+            v25_confidence_tas_modulator: None,
+            v25_confidence_sybil_modulator: None,
+            v25_confidence_zeroed_by_pdd_hard_fail: None,
+            v25_confidence_zeroed_by_tas_hard_reject: None,
+            tas_available: None,
+            tas_unavailable_reason: None,
+            pdd_sequence_signals_available: None,
+            pdd_price_anchor_available: None,
+            v25_confidence_available: None,
+            v25_confidence_unavailable_reason: None,
+            shadow_tas_reject_reason: None,
+            tas_overall_score: None,
+            tas_momentum_score: None,
+            tas_hhi_score: None,
+            tas_volume_score: None,
+            tas_interval_score: None,
+            tas_buy_ratio_score: None,
+            pdd_hard_fail: None,
+            pdd_entry_drift_pct: None,
+            pdd_entry_drift_anchor_source: None,
+            pdd_entry_drift_anchor_quality: None,
+            pdd_spike_detected: None,
+            pdd_ramping_detected: None,
+            pdd_whale_top3_pct: None,
+            pdd_flash_crash_risk: None,
+            pdd_score: None,
+            aps_regime: None,
+            aps_shadow_entry_drift_max: None,
+            aps_shadow_confidence_min: None,
+            aps_shadow_prosperity_mcap: None,
+            aps_shadow_branch1_sniped: None,
+            aps_shadow_branch3_hhi: None,
+            aps_shadow_prosperity_would_pass: None,
+            aps_shadow_thresholds: None,
+            entry_drift_pct: None,
+            entry_drift_anchor_source: None,
+            entry_drift_anchor_quality: None,
+            market_regime: None,
+            pdd_soft_flags: None,
+            shadow_pdd_reject_reason: None,
+            reason_code: None,
+            reason_code_version: 0,
+            pdd_sequence_signals_unavailable_reason: None,
         }
+    }
+
+    fn test_gatekeeper_route_dir(
+        base: &Path,
+        gatekeeper_version: &str,
+        decision_plane: &str,
+    ) -> PathBuf {
+        base.join("test-rollout")
+            .join(gatekeeper_version)
+            .join(decision_plane)
+            .join("test-config-hash")
     }
 
     #[tokio::test]
@@ -2637,6 +3182,8 @@ mod tests {
         let config = DecisionLoggerConfig {
             log_dir: log_dir.clone(),
             gatekeeper_log_dir: log_dir.clone(),
+            gatekeeper_rollout_profile: "test-rollout".to_string(),
+            gatekeeper_config_hash: "test-config-hash".to_string(),
             channel_buffer_size: 10,
             enabled: true,
         };
@@ -2653,7 +3200,12 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
         // Read the JSONL file — should contain exactly 1 line, not 3
-        let log_file = log_dir.join(GATEKEEPER_DECISIONS_JSONL);
+        let log_file = test_gatekeeper_route_dir(
+            &log_dir,
+            LEGACY_GATEKEEPER_VERSION,
+            DECISION_PLANE_LEGACY_LIVE,
+        )
+        .join(GATEKEEPER_DECISIONS_JSONL);
         assert!(log_file.exists(), "Log file should be created");
         let content = fs::read_to_string(&log_file).await.unwrap();
         let lines: Vec<&str> = content.trim().lines().collect();
@@ -2697,6 +3249,8 @@ mod tests {
         let config = DecisionLoggerConfig {
             log_dir: log_dir.clone(),
             gatekeeper_log_dir: log_dir.clone(),
+            gatekeeper_rollout_profile: "test-rollout".to_string(),
+            gatekeeper_config_hash: "test-config-hash".to_string(),
             channel_buffer_size: 10,
             enabled: true,
         };
@@ -2745,7 +3299,12 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
         // decisions file should have ALL 3 records
-        let decisions_file = log_dir.join(GATEKEEPER_DECISIONS_JSONL);
+        let decisions_file = test_gatekeeper_route_dir(
+            &log_dir,
+            LEGACY_GATEKEEPER_VERSION,
+            DECISION_PLANE_LEGACY_LIVE,
+        )
+        .join(GATEKEEPER_DECISIONS_JSONL);
         assert!(decisions_file.exists(), "Decisions file should exist");
         let decisions_content = fs::read_to_string(&decisions_file).await.unwrap();
         let decisions_lines: Vec<&str> = decisions_content.trim().lines().collect();
@@ -2757,7 +3316,12 @@ mod tests {
         );
 
         // passed/buys file should have only 1 record (the PASS)
-        let passed_file = log_dir.join(GATEKEEPER_PASSED_JSONL);
+        let passed_file = test_gatekeeper_route_dir(
+            &log_dir,
+            LEGACY_GATEKEEPER_VERSION,
+            DECISION_PLANE_LEGACY_LIVE,
+        )
+        .join(GATEKEEPER_PASSED_JSONL);
         assert!(passed_file.exists(), "Passed/buys file should exist");
         let passed_content = fs::read_to_string(&passed_file).await.unwrap();
         let passed_lines: Vec<&str> = passed_content.trim().lines().collect();
@@ -2819,6 +3383,96 @@ mod tests {
         logger.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn test_logger_splits_legacy_and_shadow_planes() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().to_path_buf();
+        let config = DecisionLoggerConfig {
+            log_dir: log_dir.clone(),
+            gatekeeper_log_dir: log_dir.clone(),
+            gatekeeper_rollout_profile: "test-rollout".to_string(),
+            gatekeeper_config_hash: "test-config-hash".to_string(),
+            channel_buffer_size: 10,
+            enabled: true,
+        };
+        let logger = DecisionLogger::new(config);
+
+        let mut mixed_log = create_test_buy_log();
+        mixed_log.pool_id = "pool_mixed".to_string();
+        mixed_log.decision_reason = Some("legacy_buy".to_string());
+        mixed_log.decision_verdict_buy = Some(true);
+        mixed_log.verdict_type = Some("BUY".to_string());
+        mixed_log.legacy_live_reason_chain = Some("legacy_buy".to_string());
+        mixed_log.legacy_live_verdict_buy = Some(true);
+        mixed_log.legacy_live_verdict_type = Some("BUY".to_string());
+        mixed_log.v25_shadow_reason_chain = Some("shadow reject due to PDD".to_string());
+        mixed_log.v25_shadow_verdict_type = Some("REJECT_PUMP_AND_DUMP".to_string());
+        mixed_log.v25_shadow_confidence = Some(0.0);
+        mixed_log.v25_shadow_observation_stage = Some("Normal".to_string());
+        mixed_log.ab_record_id = Some("pool_mixed:1000:11000:MIXED".to_string());
+
+        logger.log_gatekeeper_buy_decision(mixed_log).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        let legacy_dir = test_gatekeeper_route_dir(
+            &log_dir,
+            LEGACY_GATEKEEPER_VERSION,
+            DECISION_PLANE_LEGACY_LIVE,
+        );
+        let shadow_dir =
+            test_gatekeeper_route_dir(&log_dir, GATEKEEPER_VERSION, DECISION_PLANE_V25_SHADOW);
+
+        let legacy_decisions = legacy_dir.join(GATEKEEPER_DECISIONS_JSONL);
+        let shadow_decisions = shadow_dir.join(GATEKEEPER_DECISIONS_JSONL);
+        let legacy_buys = legacy_dir.join(GATEKEEPER_PASSED_JSONL);
+        let shadow_buys = shadow_dir.join(GATEKEEPER_PASSED_JSONL);
+
+        assert!(
+            legacy_decisions.exists(),
+            "legacy plane decisions file should exist"
+        );
+        assert!(
+            shadow_decisions.exists(),
+            "shadow plane decisions file should exist"
+        );
+        assert!(legacy_buys.exists(), "legacy BUY file should exist");
+        assert!(
+            !shadow_buys.exists(),
+            "shadow BUY file should not exist for a shadow reject"
+        );
+
+        let legacy_lines = fs::read_to_string(&legacy_decisions).await.unwrap();
+        let shadow_lines = fs::read_to_string(&shadow_decisions).await.unwrap();
+        assert_eq!(legacy_lines.trim().lines().count(), 1);
+        assert_eq!(shadow_lines.trim().lines().count(), 1);
+
+        let legacy_record: serde_json::Value =
+            serde_json::from_str(legacy_lines.trim().lines().next().unwrap()).unwrap();
+        let shadow_record: serde_json::Value =
+            serde_json::from_str(shadow_lines.trim().lines().next().unwrap()).unwrap();
+
+        assert_eq!(legacy_record["decision_plane"], DECISION_PLANE_LEGACY_LIVE);
+        assert_eq!(
+            legacy_record["gatekeeper_version"],
+            LEGACY_GATEKEEPER_VERSION
+        );
+        assert_eq!(legacy_record["decision_verdict_buy"], true);
+        assert_eq!(legacy_record["verdict_type"], "BUY");
+        assert_eq!(
+            legacy_record["v25_shadow_verdict_type"],
+            "REJECT_PUMP_AND_DUMP"
+        );
+
+        assert_eq!(shadow_record["decision_plane"], DECISION_PLANE_V25_SHADOW);
+        assert_eq!(shadow_record["gatekeeper_version"], GATEKEEPER_VERSION);
+        assert_eq!(shadow_record["decision_verdict_buy"], false);
+        assert_eq!(shadow_record["verdict_type"], "REJECT_PUMP_AND_DUMP");
+        assert_eq!(shadow_record["decision_reason"], "shadow reject due to PDD");
+        assert_eq!(shadow_record["legacy_live_verdict_type"], "BUY");
+
+        logger.shutdown().await;
+    }
+
     /// Every JSONL record must include verdict_type — even when upstream
     /// fixtures omit it. Runtime BUY/REJECT/TIMEOUT assessments now attach
     /// decision metadata, so `verdict_type = None` should only appear on
@@ -2830,6 +3484,8 @@ mod tests {
         let config = DecisionLoggerConfig {
             log_dir: log_dir.clone(),
             gatekeeper_log_dir: log_dir.clone(),
+            gatekeeper_rollout_profile: "test-rollout".to_string(),
+            gatekeeper_config_hash: "test-config-hash".to_string(),
             channel_buffer_size: 10,
             enabled: true,
         };
@@ -2862,7 +3518,12 @@ mod tests {
 
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
-        let decisions_file = log_dir.join(GATEKEEPER_DECISIONS_JSONL);
+        let decisions_file = test_gatekeeper_route_dir(
+            &log_dir,
+            LEGACY_GATEKEEPER_VERSION,
+            DECISION_PLANE_LEGACY_LIVE,
+        )
+        .join(GATEKEEPER_DECISIONS_JSONL);
         let content = fs::read_to_string(&decisions_file).await.unwrap();
         let lines: Vec<&str> = content.trim().lines().collect();
         assert_eq!(lines.len(), 3, "Expected 3 records in decisions file");

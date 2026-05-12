@@ -1,4 +1,4 @@
-# PR-6 rollout profile: canonical shadow burn-in
+# PR-6 rollout profile: canonical shadow burn-in (clean V2.5 repair rerun)
 # First-class standalone shadow runtime. Live sender remains disabled; the
 # trigger.shadow_run block is only the launcher shadow transport adapter.
 # Guardian/AEM thresholds live in ../../ghost-brain/ghost_brain_config.toml.
@@ -43,8 +43,8 @@ enable_raydium = false
 enabled = true
 rpc_url = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
 # REQUIRED in production (live/dual): override via GHOST_TRIGGER_KEYPAIR_PATH.
-# Shadow-only mode does not require a keypair — no real transactions are sent.
-# keypair_path = "/root/Gh/solana/id.json"
+# This repaired shadow-only rerun uses a launcher-local ephemeral payer so the
+# clean validation lane no longer depends on the live keypair contract.
 entry_mode = "shadow_only"
 # Even without live send, canonical shadow burn-in keeps the same production
 # bulkhead contract: these values are still the primary wallet/risk guardrails.
@@ -64,13 +64,18 @@ live_exit_stop_loss_pct = 0.50  # Updated: hard stop at -12%
 enabled = true
 # REQUIRED in production: override via GHOST_TRIGGER_SHADOW_RPC_URL.
 shadow_rpc_url = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+# Read the rollout wallet from [trigger].keypair_path / GHOST_TRIGGER_KEYPAIR_PATH
+# so shadow simulation uses a funded, chain-visible payer account.
+# P5: Ephemeral payer for shadow_only — no live payer dependency (B6).
+# Launcher-local keypair generated at startup.
+payer_strategy = "ephemeral"
 commitment = "processed"
 sig_verify = false
 replace_recent_blockhash = true
 timeout_ms = 1600
 max_retries = 1
 max_concurrent = 8
-output_path = "../../logs/shadow_run/shadow-burnin-buys.jsonl"
+output_path = "../../logs/shadow_run/shadow-burnin-v25-repair-buys.jsonl"
 emit_event_bus = true
 
 [execution]
@@ -80,13 +85,13 @@ execution_mode = "shadow"
 tx_build_compensation_ms = 200
 max_quote_age_ms = 1500
 # Canonical shadow proof artifacts.
-entry_log_path = "../../logs/shadow_run/shadow-burnin/shadow_entries.jsonl"
-lifecycle_log_path = "../../logs/shadow_run/shadow-burnin/shadow_lifecycle.jsonl"
+entry_log_path = "../../logs/shadow_run/shadow-burnin-v25-repair/shadow_entries.jsonl"
+lifecycle_log_path = "../../logs/shadow_run/shadow-burnin-v25-repair/shadow_lifecycle.jsonl"
 timing_model = "prepared_entry_mirror"
 stale_policy = "emit_warning"
 
 [execution.events]
-output_dir = "../../datasets/events/shadow-burnin"
+output_dir = "../../datasets/events/shadow-burnin-v25-repair"
 rotation_interval_ms = 300000
 flush_interval_ms = 1000
 max_file_size_bytes = 50000000
@@ -94,13 +99,13 @@ enable_aem_ticks = true
 enable_optional_events = false
 
 [oracle]
-# Dedicated Gatekeeper decision artifacts for canonical shadow burn-in.
-decision_log_path = "../../logs/rollout/shadow-burnin/decisions"
+# Dedicated Gatekeeper decision artifacts for the clean V2.5 repair rerun.
+decision_log_path = "../../logs/rollout/shadow-burnin-v25-repair/decisions"
 
 [durability]
 wal_enabled = false
-wal_dir = "../../data/rollout/shadow-burnin/wal"
-snapshot_dir = "../../data/rollout/shadow-burnin/snapshots"
+wal_dir = "../../data/rollout/shadow-burnin-v25-repair/wal"
+snapshot_dir = "../../data/rollout/shadow-burnin-v25-repair/snapshots"
 
 [metrics]
 enabled = true
@@ -117,7 +122,7 @@ level = "info"
 console_enabled = true
 json_format = false
 file_enabled = true
-file_path = "../../logs/rollout/shadow-burnin/system.log"
+file_path = "../../logs/rollout/shadow-burnin-v25-repair/system.log"
 oracle_log_enabled = true
-oracle_log_path = "../../logs/rollout/shadow-burnin/oracle.log"
+oracle_log_path = "../../logs/rollout/shadow-burnin-v25-repair/oracle.log"
 oracle_json_format = false

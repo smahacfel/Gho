@@ -10,8 +10,11 @@
 //!
 //! No network calls.
 
+use ghost_core::account_state_core::reducer::AccountStateReducer;
+use ghost_core::shadow_ledger::ShadowLedger;
 use ghost_launcher::components::post_buy_runtime::PostBuyRuntimeConfig;
 use ghost_launcher::events::{create_event_bus, GhostEvent, PostBuySource};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
 
@@ -81,6 +84,9 @@ async fn test_post_buy_runtime_paper_lifecycle() {
         slippage_tolerance: 0.20,
         live_exit_take_profit_pct: 0.02,
         live_exit_stop_loss_pct: 0.02,
+        shadow_lifecycle_log_path: None,
+        account_state_core: Some(Arc::new(AccountStateReducer::new())),
+        shadow_ledger: Some(Arc::new(ShadowLedger::new())),
     };
 
     // Spawn PostBuyRuntime
@@ -109,6 +115,7 @@ async fn test_post_buy_runtime_paper_lifecycle() {
             1,
             None,
             PostBuySource::LiveBuy,
+            None,
             None,
             None,
             None,
@@ -295,6 +302,9 @@ async fn test_post_buy_runtime_no_event_loss_with_early_subscribe() {
         slippage_tolerance: 0.20,
         live_exit_take_profit_pct: 0.02,
         live_exit_stop_loss_pct: 0.02,
+        shadow_lifecycle_log_path: None,
+        account_state_core: Some(Arc::new(AccountStateReducer::new())),
+        shadow_ledger: Some(Arc::new(ShadowLedger::new())),
     };
 
     let runtime_handle = tokio::spawn(async move {
@@ -322,6 +332,7 @@ async fn test_post_buy_runtime_no_event_loss_with_early_subscribe() {
                 i as u64,
                 None,
                 PostBuySource::LiveBuy,
+                None,
                 None,
                 None,
                 None,
@@ -418,6 +429,9 @@ async fn test_live_lane_routes_to_sender_not_paper_lifecycle() {
         slippage_tolerance: 0.20,
         live_exit_take_profit_pct: 0.02,
         live_exit_stop_loss_pct: 0.02,
+        shadow_lifecycle_log_path: None,
+        account_state_core: Some(Arc::new(AccountStateReducer::new())),
+        shadow_ledger: Some(Arc::new(ShadowLedger::new())),
     };
 
     let runtime_handle = tokio::spawn(ghost_launcher::components::post_buy_runtime::run(
@@ -443,6 +457,7 @@ async fn test_live_lane_routes_to_sender_not_paper_lifecycle() {
             Some(slot_id),
             PostBuySource::LiveBuy,
             None, // min_tokens_out unused for live lane routing (AccountStateCore path)
+            None,
             None,
             None,
         ))
@@ -526,6 +541,9 @@ async fn test_live_lane_without_handle_fails_closed_instead_of_paper_fallback() 
         slippage_tolerance: 0.20,
         live_exit_take_profit_pct: 0.02,
         live_exit_stop_loss_pct: 0.02,
+        shadow_lifecycle_log_path: None,
+        account_state_core: Some(Arc::new(AccountStateReducer::new())),
+        shadow_ledger: Some(Arc::new(ShadowLedger::new())),
     };
 
     let runtime_handle = tokio::spawn(ghost_launcher::components::post_buy_runtime::run(
@@ -550,6 +568,7 @@ async fn test_live_lane_without_handle_fails_closed_instead_of_paper_fallback() 
             1,
             Some(slot_id),
             PostBuySource::LiveBuy,
+            None,
             None,
             None,
             None,

@@ -126,6 +126,9 @@ Jeżeli `--min-net-pnl-sol` **nie** jest podany jawnie, raport domyślnie wyprow
 
 Raport musi spiąć:
 
+Artefakty Gatekeeper verdict są pochodną `[oracle].decision_log_path`; nie wolno ich szukać ani
+walidować pod historycznym `logs/decisions.json/...`, jeśli aktywny rollout wskazuje inny root.
+
 - `logs/rollout/shadow-burnin/decisions/gatekeeper_v2_buys.jsonl`,
 - `logs/rollout/shadow-burnin/decisions/gatekeeper_v2_decisions.jsonl`,
 - `logs/shadow_run/shadow-burnin*` oraz `logs/shadow_run/shadow-burnin/*`,

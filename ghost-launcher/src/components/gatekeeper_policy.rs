@@ -1,10 +1,11 @@
 use super::gatekeeper::{
     AlphaGateDiagnostics, AlphaRejectTrigger, BondingCurveDynamics, DevBehaviorProfile,
     GatekeeperAssessment, GatekeeperDecision, GatekeeperStrength, GatekeeperVerdictType,
-    ProsperityFilterDiagnostics, ProsperityRejectTrigger, SignerDiversityProfile, SoftSignals,
-    SybilInterferencePattern, SybilLeadSignal, SybilPolicyDiagnostics, SybilSoftSignals,
-    VelocityProfile, VolumeSanityProfile,
+    ObservationStage, ProsperityFilterDiagnostics, ProsperityRejectTrigger, SignerDiversityProfile,
+    SoftSignals, SybilInterferencePattern, SybilLeadSignal, SybilPolicyDiagnostics,
+    SybilSoftSignals, VelocityProfile, VolumeSanityProfile,
 };
+use super::gatekeeper_pdd::{PddDiagnostics, PddHardFail};
 use ghost_brain::config::GatekeeperV2Config;
 use ghost_core::checkpoint::{MaterializedFeatureSet, SybilResistanceFeatures, TrendDirection};
 use ghost_core::tx_intelligence::types::{
@@ -449,8 +450,6 @@ pub fn build_assessment_from_features(
         .unwrap_or(false);
 
     let checkpoint_count = features.checkpoint_features.trajectory_checkpoint_count;
-    let trajectory_available =
-        checkpoint_count > 0 || features.curve_readiness.price_sample_count > 1;
     let phases_passed = [
         phase1_passed,
         phase2_passed,
@@ -462,6 +461,53 @@ pub fn build_assessment_from_features(
     .into_iter()
     .filter(|passed| *passed)
     .count() as u8;
+
+    // ── TAS from materialized trajectory (Path A checkpoint-sourced) ──
+    let trajectory = features
+        .checkpoint_features
+        .trajectory_assessment
+        .as_ref()
+        .map(crate::components::gatekeeper_trajectory::TrajectoryAssessment::from_materialized);
+
+    // ── TAS from segment sequence (Path B buffer-sourced) ──
+    // If Path A didn't carry a trajectory assessment, try to compute TAS
+    // from the segment sequence attached to the MaterializedFeatureSet.
+    // This gives Path B parity with Path A for trajectory scoring.
+    let trajectory_from_sequence = features
+        .tx_segment_sequence
+        .as_ref()
+        .filter(|seq| seq.min_tx_per_segment_satisfied)
+        .and_then(|seq| {
+            use crate::components::gatekeeper_trajectory::TrajectoryAssessment;
+            use crate::components::gatekeeper_trajectory::{build_segment, score_trajectory};
+
+            // Reconstruct TrajectorySegments from snapshots
+            let t0 = crate::components::gatekeeper_trajectory::TrajectorySegment {
+                tx_count: seq.t0_segment.tx_count as usize,
+                buy_ratio: seq.t0_segment.buy_ratio,
+                avg_interval_ms: seq.t0_segment.avg_interval_ms,
+                total_volume_sol: seq.t0_segment.total_volume_sol,
+                hhi: seq.t0_segment.hhi,
+            };
+            let t1 = crate::components::gatekeeper_trajectory::TrajectorySegment {
+                tx_count: seq.t1_segment.tx_count as usize,
+                buy_ratio: seq.t1_segment.buy_ratio,
+                avg_interval_ms: seq.t1_segment.avg_interval_ms,
+                total_volume_sol: seq.t1_segment.total_volume_sol,
+                hhi: seq.t1_segment.hhi,
+            };
+            let t2 = crate::components::gatekeeper_trajectory::TrajectorySegment {
+                tx_count: seq.t2_segment.tx_count as usize,
+                buy_ratio: seq.t2_segment.buy_ratio,
+                avg_interval_ms: seq.t2_segment.avg_interval_ms,
+                total_volume_sol: seq.t2_segment.total_volume_sol,
+                hhi: seq.t2_segment.hhi,
+            };
+            Some(score_trajectory(&t0, &t1, &t2, &config.tas))
+        });
+
+    // Prefer Path A trajectory if available, otherwise use Path B sequence-sourced.
+    let trajectory = trajectory.or(trajectory_from_sequence);
 
     let mut assessment = GatekeeperAssessment {
         phase1_passed,
@@ -492,11 +538,249 @@ pub fn build_assessment_from_features(
         curve_wait_elapsed_ms: features.curve_readiness.wait_elapsed_ms,
         feature_snapshot: features,
         checkpoint_count,
-        trajectory_available,
+        trajectory_available: trajectory.is_some(),
+        v25_shadow_decisions: Vec::new(),
+        trajectory,
+        pdd_assessment: None,
+        aps_diagnostics: None,
+        observation_stage: None,
+        entry_drift_pct: None,
+        entry_drift_anchor_quality: None,
+        adaptive_thresholds_applied: false,
+        v25_confidence: None,
     };
+    assessment.observation_stage =
+        derive_observation_stage_from_features(&assessment.feature_snapshot, config);
+    assessment.pdd_assessment = Some(materialize_pdd_diagnostics_from_features(
+        &assessment.feature_snapshot,
+        &config.pdd,
+    ));
+    if let Some(ref pdd) = assessment.pdd_assessment {
+        assessment.entry_drift_pct = pdd.entry_drift_pct;
+        assessment.entry_drift_anchor_quality =
+            pdd.entry_drift_anchor_quality.map(|quality| match quality {
+                "strong" => ghost_brain::config::EntryDriftAnchorQuality::Strong,
+                _ => ghost_brain::config::EntryDriftAnchorQuality::Weak,
+            });
+    }
+
+    // ── PDD sequence signals from segment_sequence (Path B) ──
+    // The feature-driven PDD diagnostics from `materialize_pdd_diagnostics_from_features`
+    // only cover drift, whale, and reserve (3/6 signals). When the segment sequence
+    // is available, supplement with spike, ramping, and flash crash signals.
+    if let Some(ref seq) = assessment.feature_snapshot.tx_segment_sequence {
+        if let Some(ref mut pdd) = assessment.pdd_assessment {
+            let (spike, spike_reason) =
+                crate::components::gatekeeper_pdd_sequence::detect_spike_from_segments(
+                    seq, &config.pdd,
+                );
+            let (ramping, ramping_reason) =
+                crate::components::gatekeeper_pdd_sequence::detect_ramping_from_segments(
+                    seq, &config.pdd,
+                );
+            let (flash, flash_reason) =
+                crate::components::gatekeeper_pdd_sequence::detect_flash_crash_from_segments(
+                    seq, &config.pdd,
+                );
+
+            pdd.spike_detected = spike;
+            pdd.ramping_detected = ramping;
+            pdd.flash_crash_risk = flash;
+
+            // Only override hard_fail if no earlier signal already vetoed
+            // (drift/whale/reserve run first and take priority).
+            if pdd.hard_fail.is_none() {
+                if spike && config.pdd.spike_hard_veto {
+                    pdd.hard_fail = Some(PddHardFail::Spike);
+                    pdd.pdd_score = 0.0;
+                } else if ramping && config.pdd.ramping_hard_veto {
+                    pdd.hard_fail = Some(PddHardFail::Ramping);
+                    pdd.pdd_score = 0.0;
+                } else if flash {
+                    pdd.hard_fail = Some(PddHardFail::FlashCrash);
+                    pdd.pdd_score = 0.0;
+                }
+            }
+
+            // Soft penalties for non-hard-fail signals
+            if pdd.hard_fail.is_none() {
+                if spike && !config.pdd.spike_hard_veto {
+                    pdd.soft_penalty_points =
+                        pdd.soft_penalty_points.saturating_add(config.pdd.spike_soft_penalty);
+                }
+                // Ramping and flash crash are hard-veto only in this design;
+                // their soft-penalty equivalents are not yet plumbed.
+            }
+
+            // Recompute pdd_score after soft penalties
+            if pdd.hard_fail.is_none() && (spike || ramping || flash) {
+                let penalty = (pdd.soft_penalty_points as f64 * 0.05).min(0.3);
+                pdd.pdd_score = 1.0 - penalty;
+            }
+        }
+    }
+    assessment.aps_diagnostics = Some(
+        crate::components::gatekeeper_adaptive_prosperity::evaluate_aps(
+            &assessment,
+            &config.aps,
+            assessment
+                .pdd_assessment
+                .as_ref()
+                .is_some_and(|pdd| pdd.spike_detected),
+        ),
+    );
+    assessment.adaptive_thresholds_applied = assessment
+        .aps_diagnostics
+        .as_ref()
+        .is_some_and(|aps| aps.adaptive_thresholds_applied)
+        && !config.v25.live_execution_enabled; // P2 shadow-only contract
+
+    // ── HighVolatility drift override (Path B) ──
+    // When APS detects HighVol regime AND adaptive thresholds are enabled
+    // AND live execution is off (shadow-first), tighten the entry drift cap
+    // to regime_high_vol_entry_drift_max_pct (3%) instead of the normal 5%.
+    // This gives the V2.5 shadow plane regime-aware PDD without touching legacy.
+    if let Some(ref aps) = assessment.aps_diagnostics {
+        if aps.regime == crate::components::gatekeeper_adaptive_prosperity::MarketRegime::HighVolatility
+            && config.aps.adaptive_enabled
+            && !config.v25.live_execution_enabled
+        {
+            if let Some(ref mut pdd) = assessment.pdd_assessment {
+                if let Some(drift) = pdd.entry_drift_pct {
+                    let hv_max = config.aps.regime_high_vol_entry_drift_max_pct;
+                    if drift > hv_max && pdd.hard_fail.is_none() {
+                        pdd.hard_fail = Some(PddHardFail::EntryDrift);
+                        pdd.pdd_score = 0.0;
+                    }
+                }
+            }
+        }
+    }
     assessment.hard_reject_reason = evaluate_hard_filters_from_assessment(&assessment, config)
         .map(|(_reason, reason_chain)| reason_chain);
     assessment
+}
+
+fn derive_observation_stage_from_features(
+    features: &MaterializedFeatureSet,
+    config: &GatekeeperV2Config,
+) -> Option<ObservationStage> {
+    if !(config.v25.shadow_enabled && config.dow.enabled) {
+        return None;
+    }
+
+    let elapsed_ms = features
+        .curve_readiness
+        .wait_elapsed_ms
+        .unwrap_or(features.session_metadata.observation_duration_ms);
+    if elapsed_ms < config.dow.early_entry_min_ms {
+        return None;
+    }
+    if elapsed_ms <= config.dow.early_entry_max_ms {
+        return Some(ObservationStage::Early);
+    }
+    if elapsed_ms <= config.dow.normal_window_ms {
+        return Some(ObservationStage::Normal);
+    }
+    Some(ObservationStage::Extended)
+}
+
+fn derive_entry_drift_from_features(
+    features: &MaterializedFeatureSet,
+) -> (Option<f64>, Option<&'static str>, Option<&'static str>) {
+    let checkpoint_drift = features
+        .checkpoint_features
+        .price_change_from_first_checkpoint_pct;
+    if checkpoint_drift > f64::EPSILON {
+        let quality = if features.curve_readiness.curve_data_known {
+            "strong"
+        } else {
+            "weak"
+        };
+        let source = if features.curve_readiness.curve_data_known {
+            "materialized_checkpoint_curve"
+        } else {
+            "materialized_checkpoint_fallback"
+        };
+        return (Some(checkpoint_drift), Some(source), Some(quality));
+    }
+
+    let account_drift = features.account_features.price_change_since_t0_pct;
+    if account_drift > f64::EPSILON {
+        let quality = if features.curve_readiness.curve_data_known {
+            "strong"
+        } else {
+            "weak"
+        };
+        let source = if features.curve_readiness.curve_data_known {
+            "materialized_account_curve"
+        } else {
+            "materialized_account_fallback"
+        };
+        return (Some(account_drift), Some(source), Some(quality));
+    }
+
+    (None, None, None)
+}
+
+fn materialize_pdd_diagnostics_from_features(
+    features: &MaterializedFeatureSet,
+    config: &ghost_brain::config::gatekeeper_v25_config::PumpAndDumpDetectorConfig,
+) -> PddDiagnostics {
+    if !config.enabled {
+        return PddDiagnostics::not_run();
+    }
+
+    let mut diag = PddDiagnostics {
+        enabled: true,
+        ..PddDiagnostics::not_run()
+    };
+
+    let (entry_drift_pct, anchor_source, anchor_quality) =
+        derive_entry_drift_from_features(features);
+    diag.entry_drift_pct = entry_drift_pct;
+    diag.entry_drift_anchor_source = anchor_source;
+    diag.entry_drift_anchor_quality = anchor_quality;
+
+    if let Some(drift_pct) = entry_drift_pct {
+        if drift_pct > config.entry_drift_max_pct {
+            diag.hard_fail = Some(PddHardFail::EntryDrift);
+            diag.pdd_score = 0.0;
+            return diag;
+        }
+        if drift_pct > config.entry_drift_soft_max_pct {
+            diag.soft_penalty_points = diag
+                .soft_penalty_points
+                .saturating_add(config.entry_drift_soft_weight);
+        }
+    }
+
+    if features.tx_intel_features.tx_count > 0 {
+        let whale_top3_pct = features.tx_intel_features.top3_volume_pct * 100.0;
+        diag.whale_top3_pct = Some(whale_top3_pct);
+        if whale_top3_pct > config.whale_top3_max_pct {
+            diag.hard_fail = Some(PddHardFail::Whale);
+            diag.pdd_score = 0.0;
+            return diag;
+        }
+    }
+
+    let reserve_sol = features.account_features.current_reserves.0 as f64 / 1_000_000_000.0;
+    if reserve_sol > 0.0 {
+        let market_cap_sol = features.account_features.market_cap_sol;
+        let reserve_ratio_pass =
+            market_cap_sol <= 0.0 || (reserve_sol / market_cap_sol) >= config.reserve_min_ratio;
+        diag.reserve_health_pass = reserve_sol >= config.reserve_min_sol && reserve_ratio_pass;
+        if !diag.reserve_health_pass {
+            diag.hard_fail = Some(PddHardFail::Reserve);
+            diag.pdd_score = 0.0;
+            return diag;
+        }
+    }
+
+    let penalty = (diag.soft_penalty_points as f64 * 0.05).min(0.3);
+    diag.pdd_score = 1.0 - penalty;
+    diag
 }
 
 pub fn refresh_assessment_thresholds(
@@ -736,6 +1020,64 @@ pub fn evaluate_policy_from_assessment(
         };
     }
 
+    // ═══════════════════════════════════════════
+    // V2.5 PDD: Pump & Dump Detector — PIERWSZA WARSTWA po Hard Fails
+    // ═══════════════════════════════════════════
+    if config.pdd.enabled && config.v25.live_execution_enabled {
+        if let Some(ref pdd) = assessment.pdd_assessment {
+            if let Some(ref fail) = pdd.hard_fail {
+                // Per-threshold promotion gate
+                let promoted = match fail {
+                    PddHardFail::EntryDrift => config.pdd.entry_drift_promoted_to_live,
+                    PddHardFail::Spike => config.pdd.spike_promoted_to_live,
+                    PddHardFail::Ramping => config.pdd.ramping_promoted_to_live,
+                    PddHardFail::Whale => config.pdd.whale_promoted_to_live,
+                    PddHardFail::Reserve => config.pdd.reserve_promoted_to_live,
+                    PddHardFail::FlashCrash => config.pdd.flash_crash_promoted_to_live,
+                };
+                if !promoted {
+                    // Not promoted — skip PDD in live path, continue to Core check
+                    // (shadow still records the veto via try_shadow_evaluate)
+                } else {
+                    return GatekeeperDecision {
+                        hard_fail_reason: Some(format!("PDD_{}", fail.as_str())),
+                        core1_passed: diagnostics.core1_passed,
+                        core2_passed: diagnostics.core2_passed,
+                        core3_passed: diagnostics.core3_passed,
+                        soft_signals: diagnostics.soft_signals,
+                        soft_points: diagnostics.soft_points,
+                        max_soft_points_possible: diagnostics.max_soft_points_possible,
+                        effective_max_soft_points: diagnostics.effective_max_soft_points,
+                        dev_unknown: diagnostics.dev_unknown,
+                        sybil_policy: diagnostics.sybil_policy.clone(),
+                        alpha_gate: AlphaGateDiagnostics::not_run(config.enable_alpha_gate),
+                        prosperity_filter: ProsperityFilterDiagnostics::not_run(
+                            config.enable_prosperity_filter,
+                        ),
+                        total_soft_points: u16::from(diagnostics.soft_points)
+                            + diagnostics.sybil_policy.soft_points,
+                        verdict_type: match fail {
+                            PddHardFail::EntryDrift => GatekeeperVerdictType::RejectEntryDrift,
+                            PddHardFail::FlashCrash => GatekeeperVerdictType::RejectFlashCrash,
+                            PddHardFail::Ramping => GatekeeperVerdictType::RejectRamping,
+                            _ => GatekeeperVerdictType::RejectPumpAndDump,
+                        },
+                        verdict_buy: false,
+                        reason_chain: format!(
+                            "PDD_HARD_FAIL: {} drift={:?} spike={} ramping={} whale={:?}",
+                            fail.as_str(),
+                            pdd.entry_drift_pct,
+                            pdd.spike_detected,
+                            pdd.ramping_detected,
+                            pdd.whale_top3_pct,
+                        ),
+                        gatekeeper_strength: None,
+                    };
+                } // end else (not promoted — skip PDD in live path)
+            }
+        }
+    }
+
     let (verdict_type, verdict_buy, reason_chain, alpha_gate, prosperity_filter) = if !diagnostics
         .core1_passed
         || !diagnostics.core2_passed
@@ -867,6 +1209,15 @@ pub fn evaluate_policy_from_assessment(
         }
     };
 
+    // ═══════════════════════════════════════════
+    // V2.5 TAS: Trajectory Aware Scoring — soft modulator in policy path
+    // ═══════════════════════════════════════════
+    let tas_score = if config.tas.enabled {
+        assessment.trajectory.as_ref().map(|t| t.overall_tas_score)
+    } else {
+        None
+    };
+
     let gatekeeper_strength = verdict_buy.then(|| {
         let manipulation_flag_count = [
             diagnostics.soft_signals.bundle_suspicion,
@@ -877,12 +1228,22 @@ pub fn evaluate_policy_from_assessment(
         .filter(|flag| *flag)
         .count() as u8;
 
-        if diagnostics.soft_points
+        let mut is_strong = diagnostics.soft_points
             <= diagnostics
                 .effective_max_soft_points
                 .saturating_sub(config.iwim_veto_strong_margin)
-            && manipulation_flag_count <= config.iwim_veto_strong_max_manip_flags
-        {
+            && manipulation_flag_count <= config.iwim_veto_strong_max_manip_flags;
+
+        // TAS demotion: if trajectory score is borderline-low (< 0.45), demote Strong → Borderline
+        if is_strong {
+            if let Some(score) = tas_score {
+                if score < 0.45 {
+                    is_strong = false;
+                }
+            }
+        }
+
+        if is_strong {
             GatekeeperStrength::Strong
         } else {
             GatekeeperStrength::Borderline
@@ -1783,6 +2144,7 @@ mod tests {
     use ghost_core::tx_intelligence::types::{
         SFD_PARTIAL_BALANCE_COVERAGE_REASON, SFD_ZERO_PREBALANCE_SKIPPED_REASON,
     };
+    use solana_sdk::pubkey::Pubkey;
 
     fn assessment_with_sybil(sybil: SybilResistanceFeatures) -> GatekeeperAssessment {
         let mut feature_snapshot = MaterializedFeatureSet::default();
@@ -1818,6 +2180,15 @@ mod tests {
             feature_snapshot,
             checkpoint_count: 0,
             trajectory_available: false,
+            v25_shadow_decisions: Vec::new(),
+            trajectory: None,
+            pdd_assessment: None,
+            aps_diagnostics: None,
+            observation_stage: None,
+            entry_drift_pct: None,
+            entry_drift_anchor_quality: None,
+            adaptive_thresholds_applied: false,
+            v25_confidence: None,
         }
     }
 
@@ -1929,7 +2300,179 @@ mod tests {
             feature_snapshot,
             checkpoint_count: 0,
             trajectory_available: false,
+            v25_shadow_decisions: Vec::new(),
+            trajectory: None,
+            pdd_assessment: None,
+            aps_diagnostics: None,
+            observation_stage: None,
+            entry_drift_pct: None,
+            entry_drift_anchor_quality: None,
+            adaptive_thresholds_applied: false,
+            v25_confidence: None,
         }
+    }
+
+    #[test]
+    fn build_assessment_from_features_keeps_v25_payload_availability_aware() {
+        let mut config = GatekeeperV2Config::default();
+        config.v25.shadow_enabled = true;
+        config.dow.enabled = true;
+        config.pdd.enabled = true;
+        config.tas.enabled = true;
+        config.aps.enabled = true;
+        config.use_three_layer_decision = true;
+
+        let mut features = MaterializedFeatureSet::default();
+        features.account_features.current_reserves = (40_000_000_000, 900_000_000);
+        features.account_features.market_cap_sol = 120.0;
+        features.account_features.price_sol = 1.25;
+        features.account_features.bonding_progress = 0.08;
+        features.account_features.price_change_since_t0_pct = 4.0;
+        features.tx_intel_features.tx_count = 12;
+        features.tx_intel_features.buy_count = 9;
+        features.tx_intel_features.sell_count = 3;
+        features.tx_intel_features.unique_signers = 8;
+        features.tx_intel_features.buy_ratio = 0.75;
+        features.tx_intel_features.sol_buy_ratio = 0.76;
+        features.tx_intel_features.avg_tx_sol = 0.8;
+        features.tx_intel_features.total_volume_sol = 9.6;
+        features.tx_intel_features.top3_volume_pct = 0.42;
+        features.tx_intel_features.avg_interval_ms = 180.0;
+        features.tx_intel_features.interval_cv = 0.35;
+        features.tx_intel_features.timing_entropy = 2.0;
+        features.tx_intel_features.burst_ratio = 0.24;
+        features.tx_intel_features.volume_cv = 0.20;
+        features.tx_intel_features.max_tx_per_signer = 2;
+        features.tx_intel_features.volume_gini = 0.30;
+        features.tx_intel_features.same_ms_tx_ratio = 0.04;
+        features.tx_intel_features.min_tx_sol = 0.1;
+        features.tx_intel_features.max_tx_sol = 1.4;
+        features.tx_intel_features.max_consecutive_buys = 3;
+        features.session_metadata.observation_duration_ms = 6_000;
+        features.checkpoint_features.trajectory_checkpoint_count = 2;
+        features.checkpoint_features.price_trajectory = vec![1.0, 1.1];
+        features
+            .checkpoint_features
+            .price_change_from_first_checkpoint_pct = 4.0;
+        features.curve_readiness.curve_data_known = true;
+        features.curve_readiness.price_sample_count = 3;
+        features.curve_readiness.wait_elapsed_ms = Some(6_000);
+        features.curve_readiness.freshness = ghost_core::CurveFreshnessState::Fresh;
+
+        let mut assessment =
+            build_assessment_from_features(features, &config, PolicyEvaluationContext::default());
+
+        assert_eq!(assessment.observation_stage, Some(ObservationStage::Normal));
+        assert!(!assessment.trajectory_available);
+        assert!(assessment.trajectory.is_none());
+        assert_eq!(assessment.entry_drift_pct, Some(4.0));
+
+        let pdd = assessment.pdd_assessment.as_ref().expect("pdd diagnostics");
+        assert_eq!(pdd.entry_drift_pct, Some(4.0));
+        assert_eq!(pdd.entry_drift_anchor_quality, Some("strong"));
+        assert!(!pdd.spike_detected);
+        assert!(!pdd.ramping_detected);
+        assert!(!pdd.flash_crash_risk);
+        assert!(pdd.reserve_health_pass);
+
+        assert!(assessment.aps_diagnostics.is_some());
+
+        let decision = evaluate_policy_from_assessment(&assessment, &config);
+        assessment.decision = Some(decision);
+        let buy_log = assessment.to_buy_log(&Pubkey::new_unique(), &config);
+        assert_eq!(buy_log.tas_available, Some(false));
+        assert_eq!(
+            buy_log.tas_unavailable_reason.as_deref(),
+            Some("materialized_features_missing_segment_sequence")
+        );
+        assert_eq!(buy_log.pdd_sequence_signals_available, Some(false));
+        assert_eq!(buy_log.pdd_price_anchor_available, Some(true));
+        assert_eq!(buy_log.v25_confidence, None);
+        assert_eq!(buy_log.v25_confidence_available, Some(false));
+        // P1: reason is now specific (tas_unavailable, pdd_sequence_unavailable, etc.)
+        // rather than the legacy generic aggregate.
+        let v25_reason = buy_log.v25_confidence_unavailable_reason.as_deref()
+            .expect("v25_confidence_unavailable_reason must be populated");
+        assert!(
+            !v25_reason.contains("partial_v25_inputs"),
+            "reason must be specific, not legacy aggregate, got: {}",
+            v25_reason
+        );
+        assert!(
+            v25_reason.contains("insufficient") || v25_reason.contains("missing")
+                || v25_reason.contains("unavailable") || v25_reason.contains("segment"),
+            "reason must be from specific taxonomy, got: {}",
+            v25_reason
+        );
+    }
+
+    #[test]
+    fn build_assessment_from_features_uses_materialized_trajectory_when_present() {
+        let mut config = GatekeeperV2Config::default();
+        config.v25.shadow_enabled = true;
+        config.tas.enabled = true;
+
+        let mut features = MaterializedFeatureSet::default();
+        features.account_features.current_reserves = (40_000_000_000, 900_000_000);
+        features.account_features.market_cap_sol = 120.0;
+        features.account_features.price_sol = 1.25;
+        features.account_features.bonding_progress = 0.08;
+        features.tx_intel_features.tx_count = 18;
+        features.tx_intel_features.buy_count = 14;
+        features.tx_intel_features.sell_count = 4;
+        features.tx_intel_features.unique_signers = 12;
+        features.tx_intel_features.buy_ratio = 0.78;
+        features.tx_intel_features.sol_buy_ratio = 0.79;
+        features.tx_intel_features.avg_tx_sol = 0.8;
+        features.tx_intel_features.total_volume_sol = 12.0;
+        features.tx_intel_features.top3_volume_pct = 0.42;
+        features.tx_intel_features.avg_interval_ms = 180.0;
+        features.tx_intel_features.interval_cv = 0.35;
+        features.tx_intel_features.timing_entropy = 2.0;
+        features.tx_intel_features.burst_ratio = 0.24;
+        features.tx_intel_features.volume_cv = 0.20;
+        features.tx_intel_features.max_tx_per_signer = 2;
+        features.tx_intel_features.volume_gini = 0.30;
+        features.tx_intel_features.same_ms_tx_ratio = 0.04;
+        features.tx_intel_features.min_tx_sol = 0.1;
+        features.tx_intel_features.max_tx_sol = 1.4;
+        features.tx_intel_features.max_consecutive_buys = 3;
+        features.session_metadata.observation_duration_ms = 6_000;
+        features.checkpoint_features.trajectory_checkpoint_count = 3;
+        features.checkpoint_features.price_trajectory = vec![1.0, 1.1, 1.2];
+        features.checkpoint_features.trajectory_assessment =
+            Some(ghost_core::checkpoint::MaterializedTrajectoryAssessment {
+                overall_tas_score: 0.72,
+                momentum_score: 1.0,
+                hhi_score: 0.7,
+                volume_score: 0.65,
+                interval_score: 0.6,
+                buy_ratio_score: 0.8,
+                segment_count: 3,
+                t0_tx_count: 5,
+                t1_tx_count: 6,
+                t2_tx_count: 7,
+            });
+
+        let mut assessment =
+            build_assessment_from_features(features, &config, PolicyEvaluationContext::default());
+
+        assert!(assessment.trajectory_available);
+        assert_eq!(
+            assessment
+                .trajectory
+                .as_ref()
+                .map(|trajectory| trajectory.overall_tas_score),
+            Some(0.72)
+        );
+
+        let decision = evaluate_policy_from_assessment(&assessment, &config);
+        assessment.decision = Some(decision);
+        assessment.cache_v25_confidence(&config);
+        let buy_log = assessment.to_buy_log(&Pubkey::new_unique(), &config);
+        assert_eq!(buy_log.tas_available, Some(true));
+        assert_eq!(buy_log.tas_unavailable_reason, None);
+        assert_eq!(buy_log.v25_confidence_available, Some(true));
     }
 
     #[test]

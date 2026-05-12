@@ -278,6 +278,10 @@ pub struct DetectedAccountUpdateEvent {
     #[serde(default)]
     pub semantic: EventSemanticEnvelope,
 
+    /// Explicit provenance for event/ingest time axes.
+    #[serde(default)]
+    pub event_time: EventTimeMetadata,
+
     /// Resolved base mint (the key used by ReconciliationRuntime).
     pub base_mint: Pubkey,
 
@@ -726,6 +730,7 @@ impl IpcSender {
     pub async fn send_account_update(
         &self,
         semantic: EventSemanticEnvelope,
+        event_time: EventTimeMetadata,
         base_mint: Pubkey,
         bonding_curve: Pubkey,
         curve_finality: CurveFinality,
@@ -743,6 +748,7 @@ impl IpcSender {
 
         let event = SeerEvent::AccountUpdate(DetectedAccountUpdateEvent {
             semantic,
+            event_time,
             base_mint,
             bonding_curve,
             curve_finality,

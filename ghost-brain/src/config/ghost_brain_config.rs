@@ -43,6 +43,10 @@ use std::fs;
 use std::path::Path;
 use tracing::warn;
 
+use crate::config::gatekeeper_v25_config::{
+    AdaptiveProsperityConfig, DynamicObservationWindowConfig, GatekeeperV25RolloutConfig,
+    PumpAndDumpDetectorConfig, TrajectoryAwareScoringConfig,
+};
 use crate::config::mci_config::MciConfig;
 use crate::config::qedd_config::QeddConfig;
 use crate::guardian::post_buy::PostBuyGuardianConfig;
@@ -1484,6 +1488,29 @@ pub struct GatekeeperV2Config {
     /// Default: pending_curve
     #[serde(default)]
     pub stale_fallback: ShadowLedgerStaleFallback,
+
+    // ═══════════════════════════════════════════
+    // Gatekeeper V2.5 — PRECISION STRIKE modules
+    // ═══════════════════════════════════════════
+    /// Rollout guardrails for V2.5 modules. Controls shadow/live execution gating.
+    #[serde(default)]
+    pub v25: GatekeeperV25RolloutConfig,
+
+    /// Dynamic Observation Window (dow) — multi-deadline decision points.
+    #[serde(default)]
+    pub dow: DynamicObservationWindowConfig,
+
+    /// Trajectory Aware Scoring (tas) — momentum-trajectory confidence modulator.
+    #[serde(default)]
+    pub tas: TrajectoryAwareScoringConfig,
+
+    /// Pump & Dump Detector (pdd) — synthetic pump pattern detection.
+    #[serde(default)]
+    pub pdd: PumpAndDumpDetectorConfig,
+
+    /// Adaptive Prosperity (aps) — regime-aware prosperity branch adaptation.
+    #[serde(default)]
+    pub aps: AdaptiveProsperityConfig,
 }
 
 impl Default for GatekeeperV2Config {
@@ -1670,6 +1697,13 @@ impl Default for GatekeeperV2Config {
             curve_wait_ms: 800,
             curve_require_for_buy: true,
             stale_fallback: ShadowLedgerStaleFallback::PendingCurve,
+
+            // Gatekeeper V2.5 modules
+            v25: GatekeeperV25RolloutConfig::default(),
+            dow: DynamicObservationWindowConfig::default(),
+            tas: TrajectoryAwareScoringConfig::default(),
+            pdd: PumpAndDumpDetectorConfig::default(),
+            aps: AdaptiveProsperityConfig::default(),
         }
     }
 }
@@ -4164,6 +4198,14 @@ impl GhostBrainConfig {
         };
 
         let config: GatekeeperV2Config = gatekeeper_v2.clone().try_into()?;
+        // P0 invariant: Extended window deadline must fit within the hard deadline.
+        if config.dow.enabled && config.dow.extended_window_ms > config.max_wait_time_ms {
+            anyhow::bail!(
+                "P0 invariant violated: [gatekeeper_v2.dow].extended_window_ms ({}) > [gatekeeper_v2].max_wait_time_ms ({})",
+                config.dow.extended_window_ms,
+                config.max_wait_time_ms,
+            );
+        }
         Ok(Some(config))
     }
 
@@ -4921,5 +4963,102 @@ min_dev_paperhand_latency_ms = 2500
             cfg.max_whale_reversal_ratio_top3,
             GatekeeperV2Config::default().max_whale_reversal_ratio_top3
         );
+    }
+
+    #[test]
+    fn parse_gatekeeper_v25_config() {
+        let contents = include_str!("../../ghost_brain_config.toml");
+        let doc: toml::Value =
+            toml::from_str(contents).expect("ghost_brain_config.toml should parse as valid TOML");
+        let gatekeeper_v2 = doc
+            .get("gatekeeper_v2")
+            .expect("TOML should have [gatekeeper_v2] section");
+        let config: GatekeeperV2Config = gatekeeper_v2
+            .clone()
+            .try_into()
+            .expect("Should deserialize gatekeeper_v2 with v25 sub-sections");
+        // V2.5 rollout
+        assert!(config.v25.shadow_enabled);
+        assert!(!config.v25.live_execution_enabled);
+        assert!(config.v25.require_promotion_adr);
+        assert!(config.v25.emit_shadow_decisions);
+        // DOW
+        assert!(config.dow.enabled);
+        assert_eq!(config.dow.early_entry_min_ms, 2000);
+        assert_eq!(config.dow.normal_window_ms, 7000);
+        assert_eq!(config.dow.extended_window_ms, 10000);
+        // P0 invariant
+        assert!(config.dow.extended_window_ms <= config.max_wait_time_ms);
+        assert!((config.dow.early_entry_min_confidence - 0.85).abs() < f64::EPSILON);
+        // TAS
+        assert!(config.tas.enabled);
+        assert!((config.tas.tas_hard_reject_threshold - 0.30).abs() < f64::EPSILON);
+        assert!((config.tas.momentum_trajectory_weight - 0.25).abs() < f64::EPSILON);
+        // PDD
+        assert!(config.pdd.enabled);
+        assert!((config.pdd.entry_drift_max_pct - 5.0).abs() < f64::EPSILON);
+        assert!(config.pdd.spike_detection_enabled);
+        assert!(config.pdd.ramping_detection_enabled);
+        // APS
+        assert!(config.aps.enabled);
+        assert!(!config.aps.adaptive_enabled);
+        assert_eq!(config.aps.adaptation_interval_buys, 50);
+        // Legacy fields must still deserialize
+        assert!(config.use_three_layer_decision);
+        assert_eq!(config.mode, GatekeeperMode::Long);
+        // P3: Legacy drift cap — must be 1.50, not 9999.0 (closed blind spot)
+        assert!(
+            (config.max_price_change_ratio - 1.50).abs() < f64::EPSILON,
+            "max_price_change_ratio must be 1.50 (temporary legacy safety cap, not 9999.0 blind spot), got {}",
+            config.max_price_change_ratio,
+        );
+    }
+
+    #[test]
+    fn gatekeeper_v25_default_backward_compat() {
+        // When TOML has NO v25 sub-sections, everything defaults to disabled
+        let toml_without_v25 = r#"
+mode = "standard"
+min_tx_count = 30
+"#;
+        let config: GatekeeperV2Config =
+            toml::from_str(toml_without_v25).expect("Should deserialize without v25 sections");
+        assert_eq!(config.min_tx_count, 30);
+        // V2.5 fields default to disabled
+        assert!(!config.v25.shadow_enabled);
+        assert!(!config.dow.enabled);
+        assert!(!config.tas.enabled);
+        assert!(!config.pdd.enabled);
+        assert!(!config.aps.enabled);
+    }
+
+    #[test]
+    fn gatekeeper_v2_from_toml_file_picks_up_v25() {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("ghost_gk2_v25_{ts}.toml"));
+        let toml = r#"
+[gatekeeper_v2]
+min_tx_count = 10
+[gatekeeper_v2.pdd]
+enabled = true
+entry_drift_max_pct = 7.5
+"#;
+        std::fs::write(&path, toml).unwrap();
+        let parsed = GhostBrainConfig::gatekeeper_v2_from_toml_file(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert!(parsed.is_some());
+        let cfg = parsed.unwrap();
+        assert_eq!(cfg.min_tx_count, 10);
+        assert!(cfg.pdd.enabled);
+        assert!((cfg.pdd.entry_drift_max_pct - 7.5).abs() < f64::EPSILON);
+        // Other V2.5 modules not in TOML -> defaults (disabled)
+        assert!(!cfg.dow.enabled);
+        assert!(!cfg.tas.enabled);
+        assert!(!cfg.aps.enabled);
+        // v25 rollout default
+        assert!(!cfg.v25.shadow_enabled);
     }
 }

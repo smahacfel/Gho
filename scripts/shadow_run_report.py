@@ -170,6 +170,7 @@ def resolve_inputs(args: argparse.Namespace) -> Inputs:
     decisions_dir = resolve_runtime_path(
         config_path, config.get("oracle", {}).get("decision_log_path", "logs/decisions.jsonl")
     )
+    preferred_plane = preferred_gatekeeper_decision_plane(runtime_lane)
     shadow_log = resolve_runtime_path(
         config_path,
         config.get("trigger", {}).get("shadow_run", {}).get("output_path", "logs/shadow_run/buys.jsonl"),
@@ -210,8 +211,16 @@ def resolve_inputs(args: argparse.Namespace) -> Inputs:
         entry_mode=entry_mode,
         runtime_lane=runtime_lane,
         decisions_dir=decisions_dir,
-        buys_log=decisions_dir / BUY_LOG_NAME,
-        decisions_log=decisions_dir / DECISIONS_LOG_NAME,
+        buys_log=resolve_gatekeeper_log_path(
+            decisions_dir,
+            BUY_LOG_NAME,
+            preferred_plane=preferred_plane,
+        ),
+        decisions_log=resolve_gatekeeper_log_path(
+            decisions_dir,
+            DECISIONS_LOG_NAME,
+            preferred_plane=preferred_plane,
+        ),
         shadow_log=shadow_log,
         shadow_lifecycle_log=shadow_lifecycle_log,
         events_dir=events_dir,
@@ -240,6 +249,38 @@ def resolve_runtime_path(config_path: Path, raw: str) -> Path:
     if path.is_absolute():
         return path
     return (config_path.parent / path).resolve()
+
+
+def preferred_gatekeeper_decision_plane(runtime_lane: str) -> str:
+    return "v25_shadow" if runtime_lane == "shadow" else "legacy_live"
+
+
+def resolve_gatekeeper_log_path(
+    decisions_dir: Path,
+    file_name: str,
+    *,
+    preferred_plane: str | None = None,
+) -> Path:
+    direct = decisions_dir / file_name
+    if direct.exists():
+        return direct
+    if not decisions_dir.exists():
+        return direct
+
+    candidates = [candidate for candidate in decisions_dir.rglob(file_name) if candidate.is_file()]
+    if preferred_plane is not None:
+        plane_candidates = [
+            candidate for candidate in candidates if preferred_plane in candidate.parts
+        ]
+        if plane_candidates:
+            candidates = plane_candidates
+    if not candidates:
+        return direct
+    candidates.sort(
+        key=lambda candidate: (candidate.stat().st_mtime, len(candidate.parts), str(candidate)),
+        reverse=True,
+    )
+    return candidates[0]
 
 
 def derive_shadow_lifecycle_log_path(entry_log_path: Path) -> str:

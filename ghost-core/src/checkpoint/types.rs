@@ -52,6 +52,22 @@ pub struct CheckpointDerivedFeatures {
     pub max_single_sell_impact_pct: f64,
     #[serde(default)]
     pub bonding_progress: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trajectory_assessment: Option<MaterializedTrajectoryAssessment>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MaterializedTrajectoryAssessment {
+    pub overall_tas_score: f64,
+    pub momentum_score: f64,
+    pub hhi_score: f64,
+    pub volume_score: f64,
+    pub interval_score: f64,
+    pub buy_ratio_score: f64,
+    pub segment_count: usize,
+    pub t0_tx_count: usize,
+    pub t1_tx_count: usize,
+    pub t2_tx_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -109,4 +125,38 @@ pub struct MaterializedFeatureSet {
     pub sybil_resistance: SybilResistanceFeatures,
     #[serde(default)]
     pub alpha_fingerprint: AlphaFingerprintFeatures,
+    /// V2.5: Per-segment trajectory snapshots (T0/T1/T2) for Path B TAS and
+    /// PDD sequence signal computation. `None` when the buffer hasn't
+    /// accumulated enough data for segment division (min TX per segment,
+    /// min total duration).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_segment_sequence: Option<TxSegmentSequence>,
+}
+
+/// Per-segment trajectory snapshot used by Path B to compute TAS and PDD
+/// sequence signals (spike, ramping, flash crash) without access to the
+/// raw buffered transaction stream.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TxSegmentSequence {
+    pub t0_segment: TrajectorySegmentSnapshot,
+    pub t1_segment: TrajectorySegmentSnapshot,
+    pub t2_segment: TrajectorySegmentSnapshot,
+    /// Total observation duration across all segments.
+    pub total_duration_ms: u64,
+    /// Whether every segment met `tas_min_tx_per_segment`.
+    pub min_tx_per_segment_satisfied: bool,
+}
+
+/// Metrics for a single time segment within the trajectory window.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TrajectorySegmentSnapshot {
+    pub tx_count: u64,
+    pub buy_ratio: f64,
+    pub avg_interval_ms: f64,
+    pub total_volume_sol: f64,
+    pub hhi: f64,
+    /// Largest single-TX SOL amount in this segment (NOT a price impact %).
+    /// For actual price impact, use `CheckpointDerivedFeatures::single_tx_max_price_impact_pct`.
+    pub max_single_tx_sol: f64,
+    pub same_size_streak: u32,
 }

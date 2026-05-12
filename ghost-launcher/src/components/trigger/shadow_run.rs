@@ -23,11 +23,45 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tracing::warn;
 
+/// P5: Shadow payer strategy for shadow_only mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShadowPayerStrategy {
+    /// Use the configured payer (requires GHOST_TRIGGER_KEYPAIR_PATH).
+    Configured,
+    /// Generate a local ephemeral keypair — no shared payer loader.
+    /// Enables shadow_only to run without live payer configuration (B6).
+    Ephemeral,
+}
+
+impl Default for ShadowPayerStrategy {
+    fn default() -> Self {
+        Self::Configured
+    }
+}
+
+/// Generate an idempotency key for a shadow dispatch.
+/// Uses blake3(pool_id || join_key || rollout_profile) for dedup.
+pub fn make_shadow_idempotency_key(
+    pool_id: &str,
+    join_key: &str,
+    rollout_profile: &str,
+) -> String {
+    let mut hasher = Hasher::new();
+    hasher.update(pool_id.as_bytes());
+    hasher.update(b":");
+    hasher.update(join_key.as_bytes());
+    hasher.update(b":");
+    hasher.update(rollout_profile.as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ShadowBuySimulationReport {
     pub mint: String,
     pub live_signature: Option<String>,
     pub payer_pubkey: String,
+    pub payer_provenance: String,
     pub amount_lamports: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry_token_amount_raw: Option<u64>,
@@ -62,13 +96,23 @@ pub struct ShadowBuySimulationRecord {
     pub tip_lamports: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry_token_amount_raw: Option<u64>,
+    pub payer_provenance: String,
     pub err: Option<String>,
     pub error_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_detail_class: Option<String>,
     pub units_consumed: Option<u64>,
     pub rpc_slot: Option<u64>,
     pub retry_count: usize,
     pub live_signature: Option<String>,
     pub logs_digest: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub logs_excerpt: Vec<String>,
+    /// P5: Idempotency key for deduplication in shadow lifecycle reconciliation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -112,10 +156,17 @@ impl ShadowPreparationError {
 }
 
 impl ShadowBuySimulationRecord {
+    /// P5: Attach an idempotency key for shadow lifecycle dedup.
+    pub fn with_idempotency_key(mut self, key: String) -> Self {
+        self.idempotency_key = Some(key);
+        self
+    }
+
     pub fn from_event(
         entry_mode: TriggerEntryMode,
         event: &ShadowBuySimulationEvent,
     ) -> ShadowBuySimulationRecord {
+        let diagnostics = shadow_error_diagnostics(event.err.as_deref());
         ShadowBuySimulationRecord {
             candidate_id: event.candidate_id.clone(),
             pool_amm_id: event.pool_amm_id.clone(),
@@ -131,17 +182,21 @@ impl ShadowBuySimulationRecord {
             amount_lamports: event.amount_lamports,
             tip_lamports: event.tip_lamports,
             entry_token_amount_raw: event.entry_token_amount_raw,
+            payer_provenance: event.payer_provenance.clone(),
             err: event.err.clone(),
-            error_class: event
-                .err
-                .as_deref()
-                .map(classify_shadow_error)
-                .map(str::to_string),
+            error_class: event.error_class.clone().or(diagnostics.error_class),
+            error_code: event.error_code.clone().or(diagnostics.error_code),
+            error_detail_class: event
+                .error_detail_class
+                .clone()
+                .or(diagnostics.error_detail_class),
             units_consumed: event.units_consumed,
             rpc_slot: Some(event.rpc_slot),
             retry_count: event.retry_count,
             live_signature: event.live_signature.clone(),
             logs_digest: logs_digest(&event.logs),
+            logs_excerpt: summarize_logs(&event.logs),
+            idempotency_key: None,
         }
     }
 
@@ -155,6 +210,7 @@ impl ShadowBuySimulationRecord {
     ) -> ShadowBuySimulationRecord {
         let finished_ts_ms = current_time_ms();
         let err_string = err.to_string();
+        let diagnostics = shadow_error_diagnostics(Some(&err_string));
         ShadowBuySimulationRecord {
             candidate_id: build_execution_candidate_id(
                 base_mint,
@@ -172,13 +228,18 @@ impl ShadowBuySimulationRecord {
             amount_lamports: request.amount_lamports,
             tip_lamports: request.tip_lamports,
             entry_token_amount_raw: request.entry_token_amount_raw,
+            payer_provenance: request.payer_provenance.to_string(),
             err: Some(err_string.clone()),
-            error_class: Some(classify_shadow_error(&err_string).to_string()),
+            error_class: diagnostics.error_class,
+            error_code: diagnostics.error_code,
+            error_detail_class: diagnostics.error_detail_class,
             units_consumed: None,
             rpc_slot: None,
             retry_count: shadow_error_retry_count(err),
             live_signature,
             logs_digest: logs_digest(&[]),
+            logs_excerpt: Vec::new(),
+            idempotency_key: None,
         }
     }
 
@@ -192,6 +253,7 @@ impl ShadowBuySimulationRecord {
     ) -> ShadowBuySimulationRecord {
         let finished_ts_ms = current_time_ms();
         let err_string = err.to_string();
+        let diagnostics = shadow_error_diagnostics(Some(&err_string));
         ShadowBuySimulationRecord {
             candidate_id: build_execution_candidate_id(
                 base_mint,
@@ -209,14 +271,189 @@ impl ShadowBuySimulationRecord {
             amount_lamports: context.amount_lamports,
             tip_lamports: context.tip_lamports,
             entry_token_amount_raw: None,
+            payer_provenance: context.payer_provenance.to_string(),
             err: Some(err_string.clone()),
-            error_class: Some(classify_shadow_error(&err_string).to_string()),
+            error_class: diagnostics.error_class,
+            error_code: diagnostics.error_code,
+            error_detail_class: diagnostics.error_detail_class,
             units_consumed: None,
             rpc_slot: None,
             retry_count: shadow_error_retry_count(err),
             live_signature,
             logs_digest: logs_digest(&[]),
+            logs_excerpt: Vec::new(),
+            idempotency_key: None,
         }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ShadowErrorDiagnostics {
+    pub error_class: Option<String>,
+    pub error_code: Option<String>,
+    pub error_detail_class: Option<String>,
+}
+
+pub(crate) fn shadow_error_diagnostics(err: Option<&str>) -> ShadowErrorDiagnostics {
+    ShadowErrorDiagnostics {
+        error_class: err.map(classify_shadow_error).map(str::to_string),
+        error_code: err.and_then(extract_shadow_error_code).map(str::to_string),
+        error_detail_class: err
+            .and_then(classify_shadow_error_detail)
+            .map(str::to_string),
+    }
+}
+
+pub fn shadow_failure_event_from_request(
+    pool_amm_id: &str,
+    base_mint: &str,
+    request: &PreparedBuyRequest,
+    live_signature: Option<String>,
+    err: &anyhow::Error,
+) -> ShadowBuySimulationEvent {
+    let finished_ts_ms = current_time_ms();
+    let err_string = err.to_string();
+    let diagnostics = shadow_error_diagnostics(Some(&err_string));
+    ShadowBuySimulationEvent {
+        candidate_id: build_execution_candidate_id(
+            base_mint,
+            pool_amm_id,
+            request.decision_ts_ms.to_string(),
+        ),
+        pool_amm_id: pool_amm_id.to_string(),
+        base_mint: base_mint.to_string(),
+        mint: request.mint.to_string(),
+        live_signature,
+        payer_pubkey: request.payer_pubkey.to_string(),
+        payer_provenance: request.payer_provenance.to_string(),
+        amount_lamports: request.amount_lamports,
+        entry_token_amount_raw: request.entry_token_amount_raw,
+        tip_lamports: request.tip_lamports,
+        decision_ts_ms: request.decision_ts_ms,
+        simulation_started_ts_ms: request.decision_ts_ms,
+        simulation_finished_ts_ms: finished_ts_ms,
+        latency_ms: finished_ts_ms.saturating_sub(request.decision_ts_ms),
+        shadow_duration_ms: finished_ts_ms.saturating_sub(request.decision_ts_ms),
+        rpc_slot: 0,
+        retry_count: shadow_error_retry_count(err),
+        used_sig_verify: false,
+        used_replace_recent_blockhash: false,
+        units_consumed: None,
+        logs: Vec::new(),
+        return_data: None,
+        err: Some(err_string.clone()),
+        error_class: diagnostics.error_class,
+        error_code: diagnostics.error_code,
+        error_detail_class: diagnostics.error_detail_class,
+    }
+}
+
+pub fn shadow_failure_event_from_context(
+    pool_amm_id: &str,
+    base_mint: &str,
+    context: &TriggerDispatchFailureContext,
+    mint: impl Into<String>,
+    live_signature: Option<String>,
+    err: &anyhow::Error,
+) -> ShadowBuySimulationEvent {
+    let finished_ts_ms = current_time_ms();
+    let err_string = err.to_string();
+    let diagnostics = shadow_error_diagnostics(Some(&err_string));
+    ShadowBuySimulationEvent {
+        candidate_id: build_execution_candidate_id(
+            base_mint,
+            pool_amm_id,
+            context.decision_ts_ms.to_string(),
+        ),
+        pool_amm_id: pool_amm_id.to_string(),
+        base_mint: base_mint.to_string(),
+        mint: mint.into(),
+        live_signature,
+        payer_pubkey: context
+            .payer_pubkey
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
+        payer_provenance: context.payer_provenance.to_string(),
+        amount_lamports: context.amount_lamports,
+        entry_token_amount_raw: None,
+        tip_lamports: context.tip_lamports,
+        decision_ts_ms: context.decision_ts_ms,
+        simulation_started_ts_ms: context.decision_ts_ms,
+        simulation_finished_ts_ms: finished_ts_ms,
+        latency_ms: finished_ts_ms.saturating_sub(context.decision_ts_ms),
+        shadow_duration_ms: finished_ts_ms.saturating_sub(context.decision_ts_ms),
+        rpc_slot: 0,
+        retry_count: shadow_error_retry_count(err),
+        used_sig_verify: false,
+        used_replace_recent_blockhash: false,
+        units_consumed: None,
+        logs: Vec::new(),
+        return_data: None,
+        err: Some(err_string.clone()),
+        error_class: diagnostics.error_class,
+        error_code: diagnostics.error_code,
+        error_detail_class: diagnostics.error_detail_class,
+    }
+}
+
+pub(crate) fn shadow_buy_event_from_report(
+    pool_amm_id: &str,
+    base_mint: &str,
+    report: ShadowBuySimulationReport,
+) -> ShadowBuySimulationEvent {
+    let ShadowBuySimulationReport {
+        mint,
+        live_signature,
+        payer_pubkey,
+        payer_provenance,
+        amount_lamports,
+        entry_token_amount_raw,
+        tip_lamports,
+        decision_ts_ms,
+        simulation_started_ts_ms,
+        simulation_finished_ts_ms,
+        latency_ms,
+        shadow_duration_ms,
+        rpc_slot,
+        retry_count,
+        used_sig_verify,
+        used_replace_recent_blockhash,
+        units_consumed,
+        logs,
+        return_data,
+        err,
+    } = report;
+    let trace_ref = live_signature
+        .clone()
+        .unwrap_or_else(|| decision_ts_ms.to_string());
+    let diagnostics = shadow_error_diagnostics(err.as_deref());
+    ShadowBuySimulationEvent {
+        candidate_id: build_execution_candidate_id(base_mint, pool_amm_id, trace_ref),
+        pool_amm_id: pool_amm_id.to_string(),
+        base_mint: base_mint.to_string(),
+        mint,
+        live_signature,
+        payer_pubkey,
+        payer_provenance,
+        amount_lamports,
+        entry_token_amount_raw,
+        tip_lamports,
+        decision_ts_ms,
+        simulation_started_ts_ms,
+        simulation_finished_ts_ms,
+        latency_ms,
+        shadow_duration_ms,
+        rpc_slot,
+        retry_count,
+        used_sig_verify,
+        used_replace_recent_blockhash,
+        units_consumed,
+        logs,
+        return_data,
+        err,
+        error_class: diagnostics.error_class,
+        error_code: diagnostics.error_code,
+        error_detail_class: diagnostics.error_detail_class,
     }
 }
 
@@ -298,34 +535,115 @@ pub fn logs_digest(logs: &[String]) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
+fn summarize_logs(logs: &[String]) -> Vec<String> {
+    const LOGS_EXCERPT_HEAD: usize = 6;
+    const LOGS_EXCERPT_TAIL: usize = 6;
+    if logs.len() <= LOGS_EXCERPT_HEAD + LOGS_EXCERPT_TAIL {
+        return logs.to_vec();
+    }
+
+    let omitted = logs
+        .len()
+        .saturating_sub(LOGS_EXCERPT_HEAD + LOGS_EXCERPT_TAIL);
+    let mut excerpt = Vec::with_capacity(LOGS_EXCERPT_HEAD + LOGS_EXCERPT_TAIL + 1);
+    excerpt.extend(logs.iter().take(LOGS_EXCERPT_HEAD).cloned());
+    excerpt.push(format!("... {} log lines omitted ...", omitted));
+    excerpt.extend(
+        logs.iter()
+            .skip(logs.len().saturating_sub(LOGS_EXCERPT_TAIL))
+            .cloned(),
+    );
+    excerpt
+}
+
+fn extract_shadow_error_code(err: &str) -> Option<&'static str> {
+    let lower = err.to_lowercase();
+    if lower.contains("custom(2006)") || lower.contains("constraintseeds") {
+        Some("2006")
+    } else if lower.contains("custom(6000)") || lower.contains("notauthorized") {
+        Some("6000")
+    } else if lower.contains("custom(6062)") {
+        Some("6062")
+    } else {
+        None
+    }
+}
+
+fn classify_shadow_error_detail(err: &str) -> Option<&'static str> {
+    let lower = err.to_lowercase();
+    if lower.contains("custom(2006)") || lower.contains("constraintseeds") {
+        Some("seed_mismatch_constraint_seeds")
+    } else if lower.contains("custom(6000)") || lower.contains("notauthorized") {
+        Some("protocol_not_authorized")
+    } else if lower.contains("custom(6062)") {
+        Some("protocol_constraint_6062")
+    } else {
+        None
+    }
+}
+
 pub fn classify_shadow_error(err: &str) -> &'static str {
     let lower = err.to_lowercase();
     if RpcShadowSimulator::is_retryable(&lower)
         || lower.contains("rpc")
+        || lower.contains("too many requests")
+        || lower.contains("connection reset")
+        || lower.contains("connection refused")
+        || lower.contains("transport")
+    {
+        "network_provider_problem"
+    } else if lower.contains("blockhash")
+        || lower.contains("last valid block height")
+        || lower.contains("expired")
         || lower.contains("timed out")
         || lower.contains("timeout")
-        || lower.contains("accountnotfound")
-        || lower.contains("failed to fetch mint account")
-        || lower.contains("too many requests")
-        || lower.contains("join error")
-        || lower.contains("semaphore")
     {
-        "transport"
-    } else if lower.contains("custom program error")
-        || lower.contains("insufficient funds")
+        "timing_blockhash_problem"
+    } else if lower.contains("invalidaccountforfee")
+        || lower.contains("invalid account for fee")
+        || lower.contains("fee payer")
+        || lower.contains("owner")
+        || lower.contains("authority")
+        || lower.contains("signature")
+    {
+        "authority_problem"
+    } else if lower.contains("insufficient funds")
         || lower.contains("insufficientfundsforrent")
         || lower.contains("insufficient payer balance")
         || lower.contains("balance critical")
         || lower.contains("no safe trade capacity")
         || lower.contains("insufficient safe balance")
-        || lower.contains("invalidaccountforfee")
-        || lower.contains("invalid account for fee")
-        || lower.contains("instructionerror")
-        || lower.contains("simulation error")
+        || lower.contains("priority fee")
+        || lower.contains("compute")
+        || lower.contains("rent")
+        || lower.contains("budget")
     {
-        "semantic"
+        "fee_compute_problem"
+    } else if lower.contains("accountnotfound")
+        || lower.contains("failed to fetch mint account")
+        || lower.contains("missing canonical")
+        || lower.contains("metadata missing")
+        || lower.contains("account not visible")
+        || lower.contains("invalid associated_bonding_curve")
+    {
+        "data_problem"
+    } else if lower.contains("unsupported token account encoding")
+        || lower.contains("token balance regressed")
+        || lower.contains("zero token delta")
+        || lower.contains("simulation error")
+        || lower.contains("custom program error")
+        || lower.contains("instructionerror")
+    {
+        "simulation_mismatch"
+    } else if lower.contains("join error")
+        || lower.contains("semaphore")
+        || lower.contains("panic")
+        || lower.contains("invariant")
+        || lower.contains("not initialized")
+    {
+        "logic_invariant_problem"
     } else {
-        "unknown"
+        "unclassified"
     }
 }
 
@@ -582,6 +900,7 @@ impl ShadowSimulator for RpcShadowSimulator {
                         mint: request.mint.to_string(),
                         live_signature: None,
                         payer_pubkey: request.payer_pubkey.to_string(),
+                        payer_provenance: request.payer_provenance.to_string(),
                         amount_lamports: request.amount_lamports,
                         entry_token_amount_raw,
                         tip_lamports: request.tip_lamports,
@@ -651,6 +970,7 @@ mod tests {
             mint: "mint".to_string(),
             live_signature: live_signature.map(str::to_string),
             payer_pubkey: "payer".to_string(),
+            payer_provenance: "configured".to_string(),
             amount_lamports: 100,
             entry_token_amount_raw: Some(250_000),
             tip_lamports: 10,
@@ -667,6 +987,9 @@ mod tests {
             logs: vec!["a".to_string(), "b".to_string()],
             return_data: None,
             err: err.map(str::to_string),
+            error_class: None,
+            error_code: None,
+            error_detail_class: None,
         }
     }
 
@@ -684,6 +1007,7 @@ mod tests {
         PreparedBuyRequest {
             mint: solana_sdk::pubkey::Pubkey::new_unique(),
             payer_pubkey: payer.pubkey(),
+            payer_provenance: "configured",
             user_ata: solana_sdk::pubkey::Pubkey::new_unique(),
             token_program: solana_sdk::pubkey::Pubkey::new_unique(),
             attach_idempotent_ata_create: true,
@@ -774,6 +1098,8 @@ mod tests {
         assert_eq!(value["shadow_duration_ms"], 25);
         assert_eq!(value["retry_count"], 2);
         assert!(value["logs_digest"].as_str().unwrap_or_default().len() > 10);
+        assert_eq!(value["logs_excerpt"][0], "a");
+        assert_eq!(value["logs_excerpt"][1], "b");
     }
 
     #[tokio::test]
@@ -874,6 +1200,7 @@ mod tests {
         let request = PreparedBuyRequest {
             mint: solana_sdk::pubkey::Pubkey::new_unique(),
             payer_pubkey: payer.pubkey(),
+            payer_provenance: "configured",
             user_ata: solana_sdk::pubkey::Pubkey::new_unique(),
             token_program: solana_sdk::pubkey::Pubkey::new_unique(),
             attach_idempotent_ata_create: true,
@@ -937,31 +1264,70 @@ mod tests {
     }
 
     #[test]
-    fn classify_shadow_error_marks_invalid_account_for_fee_as_semantic() {
-        assert_eq!(classify_shadow_error("InvalidAccountForFee"), "semantic");
+    fn classify_shadow_error_detail_extracts_known_custom_codes() {
+        let err_2006 = "InstructionError(3, Custom(2006))";
+        let err_6000 = "AnchorError occurred. Error Code: NotAuthorized. Error Number: 6000.";
+        let err_6062 = "InstructionError(3, Custom(6062))";
+
+        assert_eq!(extract_shadow_error_code(err_2006), Some("2006"));
         assert_eq!(
-            classify_shadow_error("transaction simulation failed: Invalid account for fee"),
-            "semantic"
+            classify_shadow_error_detail(err_2006),
+            Some("seed_mismatch_constraint_seeds")
+        );
+        assert_eq!(extract_shadow_error_code(err_6000), Some("6000"));
+        assert_eq!(
+            classify_shadow_error_detail(err_6000),
+            Some("protocol_not_authorized")
+        );
+        assert_eq!(extract_shadow_error_code(err_6062), Some("6062"));
+        assert_eq!(
+            classify_shadow_error_detail(err_6062),
+            Some("protocol_constraint_6062")
         );
     }
 
     #[test]
-    fn classify_shadow_error_marks_bulkhead_balance_rejections_as_semantic() {
+    fn summarize_logs_keeps_head_and_tail_for_large_log_sets() {
+        let logs = (0..20).map(|idx| format!("log-{idx}")).collect::<Vec<_>>();
+        let excerpt = summarize_logs(&logs);
+
+        assert_eq!(excerpt.len(), 13);
+        assert_eq!(excerpt[0], "log-0");
+        assert_eq!(excerpt[5], "log-5");
+        assert_eq!(excerpt[6], "... 8 log lines omitted ...");
+        assert_eq!(excerpt[7], "log-14");
+        assert_eq!(excerpt[12], "log-19");
+    }
+
+    #[test]
+    fn classify_shadow_error_marks_invalid_account_for_fee_as_authority_problem() {
+        assert_eq!(
+            classify_shadow_error("InvalidAccountForFee"),
+            "authority_problem"
+        );
+        assert_eq!(
+            classify_shadow_error("transaction simulation failed: Invalid account for fee"),
+            "authority_problem"
+        );
+    }
+
+    #[test]
+    fn classify_shadow_error_marks_bulkhead_balance_rejections_as_fee_compute_problem() {
         assert_eq!(
             classify_shadow_error("Balance critical: 0.007327349 SOL < 0.008 SOL emergency floor"),
-            "semantic"
+            "fee_compute_problem"
         );
         assert_eq!(
             classify_shadow_error(
                 "No safe trade capacity: balance=0.05 SOL, required_reserve=0.07 SOL"
             ),
-            "semantic"
+            "fee_compute_problem"
         );
         assert_eq!(
             classify_shadow_error(
                 "Insufficient safe balance: available=0.06 SOL, required=0.07 SOL"
             ),
-            "semantic"
+            "fee_compute_problem"
         );
     }
 
@@ -972,6 +1338,8 @@ mod tests {
             amount_lamports: 100,
             tip_lamports: 10,
             decision_ts_ms: 10,
+            payer_provenance: "configured",
+            payer_pubkey: Some("payer-configured".to_string()),
         };
 
         let record = ShadowBuySimulationRecord::from_failure_context(
@@ -985,6 +1353,8 @@ mod tests {
 
         assert_eq!(record.candidate_id, "mint_pool_10");
         assert_eq!(record.retry_count, 4);
+        assert_eq!(record.error_class.as_deref(), Some("data_problem"));
+        assert_eq!(record.payer_provenance, "configured");
     }
 
     #[test]
@@ -994,6 +1364,8 @@ mod tests {
             amount_lamports: 100,
             tip_lamports: 10,
             decision_ts_ms: 10,
+            payer_provenance: "ephemeral",
+            payer_pubkey: Some("payer-ephemeral".to_string()),
         };
 
         let record = ShadowBuySimulationRecord::from_failure_context(
@@ -1009,6 +1381,39 @@ mod tests {
         assert_eq!(record.amount_lamports, 100);
         assert_eq!(record.tip_lamports, 10);
         assert_eq!(record.decision_ts_ms, 10);
-        assert_eq!(record.error_class.as_deref(), Some("unknown"));
+        assert_eq!(record.error_class.as_deref(), Some("unclassified"));
+        assert_eq!(record.payer_provenance, "ephemeral");
+    }
+
+    #[test]
+    fn shadow_failure_event_carries_full_diagnostics_and_payer_pubkey() {
+        let err = anyhow!("InstructionError(3, Custom(2006))");
+        let context = TriggerDispatchFailureContext {
+            amount_lamports: 100,
+            tip_lamports: 10,
+            decision_ts_ms: 10,
+            payer_provenance: "configured",
+            payer_pubkey: Some("payer-configured".to_string()),
+        };
+
+        let event = shadow_failure_event_from_context(
+            "pool",
+            "mint",
+            &context,
+            "mint".to_string(),
+            None,
+            &err,
+        );
+
+        assert_eq!(event.payer_pubkey, "payer-configured");
+        assert_eq!(
+            event.error_class.as_deref(),
+            Some(classify_shadow_error("InstructionError(3, Custom(2006))"))
+        );
+        assert_eq!(event.error_code.as_deref(), Some("2006"));
+        assert_eq!(
+            event.error_detail_class.as_deref(),
+            Some("seed_mismatch_constraint_seeds")
+        );
     }
 }

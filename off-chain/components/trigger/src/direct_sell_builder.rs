@@ -31,7 +31,7 @@ use std::str::FromStr;
 const PUMP_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const GLOBAL_SEED: &[u8] = b"global";
 const BONDING_CURVE_SEED: &[u8] = b"bonding-curve";
-const FEE_RECIPIENT: &str = "CebN5WGQ4jvEPvsVU4EoHEpgznyQQNDGNesDwrFs8YWj";
+const FEE_RECIPIENT: &str = "CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM";
 const TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const ASSOC_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 
@@ -342,6 +342,10 @@ mod tests {
         assert_eq!(ix.accounts[7].pubkey, system_program::id());
         assert!(!ix.accounts[7].is_signer);
         assert!(!ix.accounts[7].is_writable);
+        assert_eq!(
+            ix.accounts[1].pubkey.to_string(),
+            "CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM"
+        );
     }
 
     #[test]

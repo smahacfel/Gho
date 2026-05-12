@@ -66,7 +66,7 @@ use yellowstone_grpc_proto::prelude::{
 
 pub const PUMP_FUN_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 pub const PUMP_SWAP_PROGRAM_ID: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
-pub const PUMP_FUN_FEE_ACCOUNT: &str = "CebN5WGQ4jvEPvsVU4EoHEpgznyQQNDGNesDwrFs8YWj";
+pub const PUMP_FUN_FEE_ACCOUNT: &str = "CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM";
 pub const GRPC_GLOBAL_STREAM_SOURCE_LABEL: &str = "grpc_global_stream";
 pub const GRPC_FUNDING_LANE_PUMP_FILTERED_SOURCE_LABEL: &str = "grpc_funding_lane_pump_filtered";
 pub const GRPC_FUNDING_LANE_FULL_CHAIN_SOURCE_LABEL: &str = "grpc_funding_lane_full_chain";
@@ -3898,6 +3898,11 @@ fn account_update_to_geyser_event(
 
     Ok(GeyserEvent::AccountUpdate {
         slot,
+        event_time: ghost_core::EventTimeMetadata::new(
+            None,
+            Some(crate::types::ingress_epoch_ms()),
+            Some(crate::types::arrival_time_ms()),
+        ),
         write_version: Some(acc.write_version),
         pubkey,
         data: acc.data.clone(),
@@ -5534,6 +5539,11 @@ mod tests {
     ) -> crate::types::GeyserEvent {
         crate::types::GeyserEvent::AccountUpdate {
             slot,
+            event_time: ghost_core::EventTimeMetadata::new(
+                None,
+                Some(crate::types::ingress_epoch_ms()),
+                Some(crate::types::arrival_time_ms()),
+            ),
             write_version: None,
             pubkey,
             data: vec![0u8; 56],

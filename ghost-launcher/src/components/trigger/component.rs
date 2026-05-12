@@ -29,7 +29,9 @@ use crate::components::live_tx_sender::{
     HELIUS_SENDER_MIN_TIP_LAMPORTS,
 };
 use crate::components::oracle_pipeline::OraclePipeline;
-use crate::config::{OracleConfig, TriggerComponentConfig, TriggerEntryMode};
+use crate::config::{
+    OracleConfig, TriggerComponentConfig, TriggerEntryMode, TriggerShadowPayerStrategy,
+};
 use crate::events::{
     EventBusReceiver, EventBusSender, GhostEvent, LegacyPathClassification, LegacyPathDescriptor,
     RuntimePlane,
@@ -84,7 +86,7 @@ const BUY_RETRY_RESEND_CONFIRM_WAIT_MS: u64 = 300;
 const BUY_RETRY_MAX_ATTEMPTS: usize = 3;
 const BUY_RETRY_PRIORITY_FEE_INCREMENT_MICRO_LAMPORTS: u64 = 10_000;
 const BUY_RETRY_TIP_INCREMENT_LAMPORTS: u64 = 300_000;
-const KNOWN_BAD_LEGACY_FEE_RECIPIENT: &str = "CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM";
+const KNOWN_BAD_LEGACY_FEE_RECIPIENT: &str = "CebN5WGQ4jvEPvsVU4EoHEpgznyQQNDGNesDwrFs8YWj";
 const TRIGGER_POOL_SCORED_OBSERVER_PATH: LegacyPathDescriptor = LegacyPathDescriptor::new(
     "trigger_pool_scored_observer",
     LegacyPathClassification::ObservabilityOnly,
@@ -339,6 +341,7 @@ impl PreparedBuyRequestBuildMetadata {
 pub struct PreparedBuyRequest {
     pub mint: Pubkey,
     pub payer_pubkey: Pubkey,
+    pub payer_provenance: &'static str,
     pub user_ata: Pubkey,
     pub token_program: Pubkey,
     pub attach_idempotent_ata_create: bool,
@@ -398,6 +401,15 @@ pub struct TriggerDispatchFailureContext {
     pub amount_lamports: u64,
     pub tip_lamports: u64,
     pub decision_ts_ms: u64,
+    pub payer_provenance: &'static str,
+    pub payer_pubkey: Option<String>,
+}
+
+#[derive(Clone)]
+struct ResolvedTriggerPayer {
+    payer: Arc<Keypair>,
+    provenance: &'static str,
+    requires_balance_preflight: bool,
 }
 
 #[derive(Debug)]
@@ -511,6 +523,7 @@ pub struct TriggerComponent {
     /// Configuration for the trigger component
     config: TriggerComponentConfig,
     cached_payer: Option<Arc<Keypair>>,
+    cached_shadow_ephemeral_payer: Option<Arc<Keypair>>,
     ata_rent_cache: Arc<RwLock<HashMap<Pubkey, u64>>>,
     primary_rpc_client: Arc<solana_client::nonblocking::rpc_client::RpcClient>,
     shadow_rpc_client: Option<Arc<solana_client::nonblocking::rpc_client::RpcClient>>,
@@ -602,6 +615,25 @@ impl TriggerComponent {
         let payer = read_keypair_file(path)
             .map_err(|e| anyhow::anyhow!("Failed to read keypair from {}: {}", path, e))?;
         Ok(Some(Arc::new(payer)))
+    }
+
+    fn shadow_payer_strategy(config: &TriggerComponentConfig) -> TriggerShadowPayerStrategy {
+        if matches!(config.entry_mode, TriggerEntryMode::ShadowOnly) {
+            config.shadow_run.payer_strategy
+        } else {
+            TriggerShadowPayerStrategy::Configured
+        }
+    }
+
+    fn payer_provenance_label(strategy: TriggerShadowPayerStrategy) -> &'static str {
+        strategy.as_str()
+    }
+
+    fn requires_configured_payer(config: &TriggerComponentConfig) -> bool {
+        !matches!(
+            Self::shadow_payer_strategy(config),
+            TriggerShadowPayerStrategy::Ephemeral
+        )
     }
 
     fn should_prepare_on_shadow_rpc(&self) -> bool {
@@ -1631,11 +1663,27 @@ impl TriggerComponent {
             shadow_rpc_client.clone(),
             Arc::clone(&live_blockhash_cache),
         );
-        let cached_payer = Self::load_configured_payer(&config)
-            .unwrap_or_else(|err| panic!("TriggerComponent startup failed: {err}"));
+        let cached_payer = match Self::load_configured_payer(&config) {
+            Ok(payer) => payer,
+            Err(err) if Self::requires_configured_payer(&config) => {
+                panic!("TriggerComponent startup failed: {err}")
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    payer_strategy = Self::shadow_payer_strategy(&config).as_str(),
+                    "Trigger: ignoring configured payer load failure because shadow_only uses local ephemeral payer"
+                );
+                None
+            }
+        };
+        let cached_shadow_ephemeral_payer = (Self::shadow_payer_strategy(&config)
+            == TriggerShadowPayerStrategy::Ephemeral)
+            .then(|| Arc::new(Keypair::new()));
         Self {
             config,
             cached_payer,
+            cached_shadow_ephemeral_payer,
             ata_rent_cache: Arc::new(RwLock::new(HashMap::new())),
             primary_rpc_client,
             shadow_rpc_client,
@@ -2016,7 +2064,7 @@ impl TriggerComponent {
                     .as_ref()
                     .cloned()
                     .expect("prewarm sender checked before advisory launch");
-                let payer = match self.load_payer() {
+                let ResolvedTriggerPayer { payer, .. } = match self.load_payer() {
                     Ok(payer) => payer,
                     Err(error) => {
                         warn!(
@@ -2059,8 +2107,12 @@ impl TriggerComponent {
                     }
                 };
                 let mut sanitized_overrides = account_overrides.clone();
+                sanitized_overrides.global_config =
+                    Self::sanitize_global_config_override(sanitized_overrides.global_config);
                 sanitized_overrides.fee_recipient =
                     Self::sanitize_fee_recipient_override(sanitized_overrides.fee_recipient);
+                sanitized_overrides.buy_variant =
+                    Self::sanitize_buy_variant_override(sanitized_overrides.buy_variant);
                 let Some(token_program) = sanitized_overrides.token_program else {
                     warn!(
                         mint = %mint,
@@ -2129,7 +2181,7 @@ impl TriggerComponent {
                 let tip_seed = format!("{mint}:{recent_blockhash}");
                 let tip_account = sender.select_tip_account(tip_seed.as_bytes());
                 let (_, representative_buy_tx) = match self.build_buy_transaction_from_profile(
-                    &payer,
+                    payer.as_ref(),
                     &build_profile,
                     HELIUS_PRIORITY_FEE_FALLBACK_MICRO_LAMPORTS,
                     &tip_account,
@@ -2211,11 +2263,33 @@ impl TriggerComponent {
         );
     }
 
-    fn load_payer(&self) -> Result<Arc<Keypair>> {
-        self.cached_payer
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Trigger keypair_path is not configured"))
+    fn load_payer(&self) -> Result<ResolvedTriggerPayer> {
+        match Self::shadow_payer_strategy(&self.config) {
+            TriggerShadowPayerStrategy::Configured => self
+                .cached_payer
+                .as_ref()
+                .cloned()
+                .map(|payer| ResolvedTriggerPayer {
+                    payer,
+                    provenance: Self::payer_provenance_label(
+                        TriggerShadowPayerStrategy::Configured,
+                    ),
+                    requires_balance_preflight: true,
+                })
+                .ok_or_else(|| anyhow::anyhow!("Trigger keypair_path is not configured")),
+            TriggerShadowPayerStrategy::Ephemeral => self
+                .cached_shadow_ephemeral_payer
+                .as_ref()
+                .cloned()
+                .map(|payer| ResolvedTriggerPayer {
+                    payer,
+                    provenance: Self::payer_provenance_label(TriggerShadowPayerStrategy::Ephemeral),
+                    requires_balance_preflight: false,
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Trigger ephemeral shadow payer is not initialized")
+                }),
+        }
     }
 
     fn configured_trade_amount_lamports(&self) -> Result<u64> {
@@ -2350,10 +2424,23 @@ impl TriggerComponent {
         tip_lamports: u64,
     ) -> Option<TriggerDispatchFailureContext> {
         let amount_lamports = self.configured_trade_amount_lamports().ok()?;
+        let payer_strategy = Self::shadow_payer_strategy(&self.config);
+        let payer_pubkey = match payer_strategy {
+            TriggerShadowPayerStrategy::Configured => self
+                .cached_payer
+                .as_ref()
+                .map(|payer| payer.pubkey().to_string()),
+            TriggerShadowPayerStrategy::Ephemeral => self
+                .cached_shadow_ephemeral_payer
+                .as_ref()
+                .map(|payer| payer.pubkey().to_string()),
+        };
         Some(TriggerDispatchFailureContext {
             amount_lamports,
             tip_lamports,
             decision_ts_ms: Self::now_ms(),
+            payer_provenance: Self::payer_provenance_label(payer_strategy),
+            payer_pubkey,
         })
     }
 
@@ -2394,9 +2481,23 @@ impl TriggerComponent {
     }
 
     fn sanitize_fee_recipient_override(fee_recipient: Option<Pubkey>) -> Option<Pubkey> {
-        let known_bad =
-            Pubkey::from_str(KNOWN_BAD_LEGACY_FEE_RECIPIENT).expect("valid bad fee recipient");
-        fee_recipient.filter(|pubkey| *pubkey != known_bad)
+        fee_recipient.filter(DirectBuyBuilder::is_authorized_fee_recipient)
+    }
+
+    fn sanitize_global_config_override(global_config: Option<Pubkey>) -> Option<Pubkey> {
+        let canonical = DirectBuyBuilder::canonical_global_config();
+        global_config.filter(|pubkey| *pubkey == canonical)
+    }
+
+    fn sanitize_buy_variant_override(
+        buy_variant: Option<trigger::PumpfunBuyVariant>,
+    ) -> Option<trigger::PumpfunBuyVariant> {
+        match buy_variant {
+            Some(trigger::PumpfunBuyVariant::RoutedExactSolIn) => {
+                Some(trigger::PumpfunBuyVariant::RoutedExactSolIn)
+            }
+            _ => None,
+        }
     }
 
     fn sanitize_associated_bonding_curve_override(
@@ -2672,6 +2773,7 @@ impl TriggerComponent {
         )?;
         self.build_prepared_buy_request_from_profile(
             payer,
+            Self::payer_provenance_label(TriggerShadowPayerStrategy::Configured),
             &build_profile,
             tip_lamports,
             HELIUS_PRIORITY_FEE_FALLBACK_MICRO_LAMPORTS,
@@ -2683,6 +2785,7 @@ impl TriggerComponent {
     fn build_prepared_buy_request_from_profile(
         &self,
         payer: &Keypair,
+        payer_provenance: &'static str,
         build_profile: &BuyBuildProfile,
         tip_lamports: u64,
         priority_fee_micro_lamports: u64,
@@ -2699,6 +2802,7 @@ impl TriggerComponent {
         )?;
 
         Ok(self.assemble_prepared_buy_request_from_profile(
+            payer_provenance,
             build_profile,
             tip_lamports,
             priority_fee_micro_lamports,
@@ -2710,6 +2814,7 @@ impl TriggerComponent {
 
     fn assemble_prepared_buy_request_from_profile(
         &self,
+        payer_provenance: &'static str,
         build_profile: &BuyBuildProfile,
         tip_lamports: u64,
         priority_fee_micro_lamports: u64,
@@ -2720,6 +2825,7 @@ impl TriggerComponent {
         PreparedBuyRequest {
             mint: build_profile.mint,
             payer_pubkey: build_profile.payer_pubkey,
+            payer_provenance,
             user_ata: build_profile.user_ata,
             token_program: build_profile.token_program,
             attach_idempotent_ata_create: build_profile.attach_idempotent_ata_create,
@@ -2754,6 +2860,7 @@ impl TriggerComponent {
     fn build_prepared_buy_request_with_transport(
         &self,
         payer: &Keypair,
+        payer_provenance: &'static str,
         mint: &Pubkey,
         token_program: &Pubkey,
         attach_idempotent_ata_create: bool,
@@ -2779,6 +2886,7 @@ impl TriggerComponent {
         )?;
         self.build_prepared_buy_request_from_profile(
             payer,
+            payer_provenance,
             &build_profile,
             tip_lamports,
             priority_fee_micro_lamports,
@@ -2792,7 +2900,11 @@ impl TriggerComponent {
         request: &PreparedBuyRequest,
     ) -> Result<PreparedBuyRequest> {
         let payer_load_started_at = Instant::now();
-        let payer = self.load_payer()?;
+        let ResolvedTriggerPayer {
+            payer,
+            provenance: payer_provenance,
+            ..
+        } = self.load_payer()?;
         let payer_load_ms = saturating_elapsed_ms(payer_load_started_at);
         let rpc = self.preparation_rpc();
         let blockhash_fetch_started_at = Instant::now();
@@ -2848,6 +2960,7 @@ impl TriggerComponent {
             )
         };
         let mut rebuilt = self.assemble_prepared_buy_request_from_profile(
+            payer_provenance,
             &build_profile,
             next_tip_lamports,
             next_priority_fee_micro_lamports,
@@ -3578,7 +3691,11 @@ impl TriggerComponent {
         }
 
         let payer_load_started_at = Instant::now();
-        let payer = self.load_payer()?;
+        let ResolvedTriggerPayer {
+            payer,
+            provenance: payer_provenance,
+            requires_balance_preflight,
+        } = self.load_payer()?;
         preparation_telemetry.payer_load_ms = saturating_elapsed_ms(payer_load_started_at);
         let payer_pubkey = payer.pubkey();
         let rpc = self.preparation_rpc();
@@ -3591,6 +3708,9 @@ impl TriggerComponent {
         let original_fee_recipient = sanitized_overrides.fee_recipient;
         sanitized_overrides.fee_recipient =
             Self::sanitize_fee_recipient_override(sanitized_overrides.fee_recipient);
+        let original_buy_variant = sanitized_overrides.buy_variant;
+        sanitized_overrides.buy_variant =
+            Self::sanitize_buy_variant_override(sanitized_overrides.buy_variant);
         let speculative_ata_probe =
             sanitized_overrides
                 .token_program
@@ -3633,53 +3753,115 @@ impl TriggerComponent {
                 .map_err(|e| anyhow::anyhow!("Failed to fetch mint account: {}", e))
         };
         let (
-            (payer_balance_lamports, payer_balance_fetch_ms),
-            (payer_account, payer_account_fetch_ms),
-            (mint_account, mint_account_fetch_ms),
+            amount_lamports,
+            effective_tip_lamports,
+            payer_balance_lamports,
+            mint_account,
+            mint_account_fetch_ms,
             speculative_ata_probe_result,
-        ) = if let Some(speculative_ata_probe) = speculative_ata_probe {
-            let (payer_balance, payer_account, mint_account, speculative_probe) = tokio::try_join!(
-                payer_balance_fetch,
-                payer_account_fetch,
-                mint_account_fetch,
-                speculative_ata_probe,
+        ) = if requires_balance_preflight {
+            let (
+                (payer_balance_lamports, payer_balance_fetch_ms),
+                (payer_account, payer_account_fetch_ms),
+                (mint_account, mint_account_fetch_ms),
+                speculative_ata_probe_result,
+            ) = if let Some(speculative_ata_probe) = speculative_ata_probe {
+                let (payer_balance, payer_account, mint_account, speculative_probe) = tokio::try_join!(
+                    payer_balance_fetch,
+                    payer_account_fetch,
+                    mint_account_fetch,
+                    speculative_ata_probe,
+                )?;
+                (
+                    payer_balance,
+                    payer_account,
+                    mint_account,
+                    Some(speculative_probe),
+                )
+            } else {
+                let (payer_balance, payer_account, mint_account) =
+                    tokio::try_join!(payer_balance_fetch, payer_account_fetch, mint_account_fetch)?;
+                (payer_balance, payer_account, mint_account, None)
+            };
+            preparation_telemetry.payer_balance_fetch_ms = payer_balance_fetch_ms;
+            preparation_telemetry.payer_account_fetch_ms = payer_account_fetch_ms;
+            let (amount_lamports, effective_tip_lamports) = self
+                .resolve_safe_trade_budget(payer_balance_lamports, tip_lamports)
+                .map_err(|err| {
+                    if let Some(violation) = err.downcast_ref::<SafetyViolation>() {
+                        self.record_safety_rejection(violation);
+                    }
+                    err
+                })?;
+            Self::validate_payer_balance_for_buy(
+                &payer_pubkey,
+                payer_balance_lamports,
+                amount_lamports,
+                effective_tip_lamports,
             )?;
+            Self::validate_payer_account_for_fee(&payer_pubkey, &payer_account)?;
             (
-                payer_balance,
-                payer_account,
+                amount_lamports,
+                effective_tip_lamports,
+                Some(payer_balance_lamports),
                 mint_account,
+                mint_account_fetch_ms,
+                speculative_ata_probe_result,
+            )
+        } else if let Some(speculative_ata_probe) = speculative_ata_probe {
+            let ((mint_account, mint_account_fetch_ms), speculative_probe) =
+                tokio::try_join!(mint_account_fetch, speculative_ata_probe)?;
+            (
+                self.configured_trade_amount_lamports()?,
+                tip_lamports,
+                None,
+                mint_account,
+                mint_account_fetch_ms,
                 Some(speculative_probe),
             )
         } else {
-            let (payer_balance, payer_account, mint_account) =
-                tokio::try_join!(payer_balance_fetch, payer_account_fetch, mint_account_fetch)?;
-            (payer_balance, payer_account, mint_account, None)
+            let (mint_account, mint_account_fetch_ms) = mint_account_fetch.await?;
+            (
+                self.configured_trade_amount_lamports()?,
+                tip_lamports,
+                None,
+                mint_account,
+                mint_account_fetch_ms,
+                None,
+            )
         };
-        preparation_telemetry.payer_balance_fetch_ms = payer_balance_fetch_ms;
-        preparation_telemetry.payer_account_fetch_ms = payer_account_fetch_ms;
         preparation_telemetry.mint_account_fetch_ms = mint_account_fetch_ms;
-        let (amount_lamports, effective_tip_lamports) = self
-            .resolve_safe_trade_budget(payer_balance_lamports, tip_lamports)
-            .map_err(|err| {
-                if let Some(violation) = err.downcast_ref::<SafetyViolation>() {
-                    self.record_safety_rejection(violation);
-                }
-                err
-            })?;
-        Self::validate_payer_balance_for_buy(
-            &payer_pubkey,
-            payer_balance_lamports,
-            amount_lamports,
-            effective_tip_lamports,
-        )?;
-        Self::validate_payer_account_for_fee(&payer_pubkey, &payer_account)?;
+        let original_global_config = sanitized_overrides.global_config;
+        sanitized_overrides.global_config =
+            Self::sanitize_global_config_override(sanitized_overrides.global_config);
+        if original_global_config.is_some() && sanitized_overrides.global_config.is_none() {
+            warn!(
+                mint = %mint,
+                global_config = %original_global_config
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                canonical_global_config = %DirectBuyBuilder::canonical_global_config(),
+                "Trigger: dropping noncanonical global_config override"
+            );
+        }
         if original_fee_recipient.is_some() && sanitized_overrides.fee_recipient.is_none() {
             warn!(
                 mint = %mint,
                 fee_recipient = %original_fee_recipient
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "none".to_string()),
-                "Trigger: dropping known-bad fee_recipient override"
+                canonical_fee_recipient = %DirectBuyBuilder::canonical_fee_recipient(),
+                "Trigger: dropping unauthorized fee_recipient override"
+            );
+        }
+        if matches!(
+            original_buy_variant,
+            Some(trigger::PumpfunBuyVariant::LegacyBuy)
+        ) && sanitized_overrides.buy_variant.is_none()
+        {
+            warn!(
+                mint = %mint,
+                "Trigger: dropping unverified legacy_buy override and falling back to routed_exact_sol_in"
             );
         }
         preparation_telemetry.token_program_override_present =
@@ -3762,7 +3944,11 @@ impl TriggerComponent {
         preparation_telemetry.token_balance_probe_ms = ata_probe.elapsed_ms;
         preparation_telemetry.ata_rent_fetch_ms = ata_probe.ata_rent_fetch_ms;
         let user_ata_rent_lamports = ata_probe.expected_ata_rent_lamports;
-        if ata_missing_pre_submit {
+        if let (true, true, Some(payer_balance_lamports)) = (
+            requires_balance_preflight,
+            ata_missing_pre_submit,
+            payer_balance_lamports,
+        ) {
             Self::validate_payer_balance_for_buy(
                 &payer_pubkey,
                 payer_balance_lamports,
@@ -3773,6 +3959,7 @@ impl TriggerComponent {
         info!(
             mint = %mint,
             payer = %payer_pubkey,
+            payer_provenance,
             attach_idempotent_ata_create,
             ata_missing_pre_submit,
             user_ata = %user_ata,
@@ -3914,6 +4101,7 @@ impl TriggerComponent {
                 )
             };
             request = self.assemble_prepared_buy_request_from_profile(
+                payer_provenance,
                 &build_profile,
                 effective_tip_lamports,
                 priority_fee_estimate.micro_lamports,
@@ -3942,6 +4130,7 @@ impl TriggerComponent {
                 )
             };
             request = self.assemble_prepared_buy_request_from_profile(
+                payer_provenance,
                 &build_profile,
                 effective_tip_lamports,
                 initial_priority_fee_micro_lamports,
@@ -4256,8 +4445,19 @@ async fn append_shadow_buy_report_record(
     entry_mode: TriggerEntryMode,
     record: &crate::events::ShadowBuySimulationEvent,
 ) -> Result<()> {
-    let jsonl_record = super::shadow_run::ShadowBuySimulationRecord::from_event(entry_mode, record);
+    let id_key = super::shadow_run::make_shadow_idempotency_key(
+        &record.pool_amm_id,
+        &record.base_mint,
+        "",
+    );
+    let jsonl_record = super::shadow_run::ShadowBuySimulationRecord::from_event(entry_mode, record)
+        .with_idempotency_key(id_key);
     super::shadow_run::record_shadow_buy_metrics(&jsonl_record);
+    crate::oracle_metrics::record_shadow_lifecycle_status(if jsonl_record.err.is_some() {
+        "failed_reconciliation"
+    } else {
+        "dispatched"
+    });
     super::shadow_run::append_shadow_buy_record(log_path, &jsonl_record).await
 }
 
@@ -4278,6 +4478,11 @@ async fn persist_shadow_failure_record(
     failed_context: Option<&TriggerDispatchFailureContext>,
     err: &anyhow::Error,
 ) -> Result<()> {
+    let id_key = super::shadow_run::make_shadow_idempotency_key(
+        pool_amm_id,
+        base_mint,
+        "",
+    );
     let record = if let Some(request) = failed_request {
         super::shadow_run::ShadowBuySimulationRecord::from_failure(
             entry_mode,
@@ -4287,6 +4492,7 @@ async fn persist_shadow_failure_record(
             None,
             err,
         )
+        .with_idempotency_key(id_key)
     } else if let Some(context) = failed_context {
         super::shadow_run::ShadowBuySimulationRecord::from_failure_context(
             entry_mode,
@@ -4296,11 +4502,13 @@ async fn persist_shadow_failure_record(
             None,
             err,
         )
+        .with_idempotency_key(id_key)
     } else {
         return Ok(());
     };
 
     super::shadow_run::record_shadow_buy_metrics(&record);
+    crate::oracle_metrics::record_shadow_lifecycle_status("failed_reconciliation");
     super::shadow_run::append_shadow_buy_record(std::path::Path::new(output_path), &record).await
 }
 
@@ -4318,39 +4526,11 @@ fn spawn_background_shadow_event(
         match handle.await {
             Ok(Ok(mut report)) => {
                 report.live_signature = live_signature;
-                let trace_ref = report
-                    .live_signature
-                    .clone()
-                    .unwrap_or_else(|| report.decision_ts_ms.to_string());
-                let candidate_id = crate::events::build_execution_candidate_id(
-                    &base_mint,
+                let event = super::shadow_run::shadow_buy_event_from_report(
                     &pool_amm_id,
-                    &trace_ref,
+                    &base_mint,
+                    report,
                 );
-                let event = crate::events::ShadowBuySimulationEvent {
-                    candidate_id,
-                    pool_amm_id: pool_amm_id.clone(),
-                    base_mint,
-                    mint: report.mint,
-                    live_signature: report.live_signature,
-                    payer_pubkey: report.payer_pubkey,
-                    amount_lamports: report.amount_lamports,
-                    entry_token_amount_raw: report.entry_token_amount_raw,
-                    tip_lamports: report.tip_lamports,
-                    decision_ts_ms: report.decision_ts_ms,
-                    simulation_started_ts_ms: report.simulation_started_ts_ms,
-                    simulation_finished_ts_ms: report.simulation_finished_ts_ms,
-                    latency_ms: report.latency_ms,
-                    shadow_duration_ms: report.shadow_duration_ms,
-                    rpc_slot: report.rpc_slot,
-                    retry_count: report.retry_count,
-                    used_sig_verify: report.used_sig_verify,
-                    used_replace_recent_blockhash: report.used_replace_recent_blockhash,
-                    units_consumed: report.units_consumed,
-                    logs: report.logs,
-                    return_data: report.return_data,
-                    err: report.err,
-                };
                 if emit_event_bus {
                     if let Some(event_bus_tx) = event_bus_tx.as_ref() {
                         if let Err(e) =
@@ -4384,7 +4564,12 @@ fn spawn_background_shadow_event(
                     &request,
                     live_signature,
                     &e,
-                );
+                )
+                .with_idempotency_key(super::shadow_run::make_shadow_idempotency_key(
+                    &pool_amm_id,
+                    &base_mint,
+                    "",
+                ));
                 super::shadow_run::record_shadow_buy_metrics(&record);
                 if let Err(write_err) = super::shadow_run::append_shadow_buy_record(
                     std::path::Path::new(&output_path),
@@ -5603,6 +5788,7 @@ mod tests {
         trigger
             .build_prepared_buy_request_with_transport(
                 payer,
+                "configured",
                 mint,
                 token_program,
                 true,
@@ -5632,6 +5818,7 @@ mod tests {
                     mint: request.mint.to_string(),
                     live_signature: None,
                     payer_pubkey: request.payer_pubkey.to_string(),
+                    payer_provenance: request.payer_provenance.to_string(),
                     amount_lamports: request.amount_lamports,
                     entry_token_amount_raw: request.entry_token_amount_raw,
                     tip_lamports: request.tip_lamports,
@@ -5681,6 +5868,7 @@ mod tests {
                     mint: request.mint.to_string(),
                     live_signature: None,
                     payer_pubkey: request.payer_pubkey.to_string(),
+                    payer_provenance: request.payer_provenance.to_string(),
                     amount_lamports: request.amount_lamports,
                     entry_token_amount_raw: request.entry_token_amount_raw,
                     tip_lamports: request.tip_lamports,
@@ -5813,6 +6001,72 @@ mod tests {
             Pubkey::from_str(KNOWN_BAD_LEGACY_FEE_RECIPIENT).expect("known bad fee recipient");
         assert_eq!(
             TriggerComponent::sanitize_fee_recipient_override(Some(known_bad)),
+            None
+        );
+    }
+
+    #[test]
+    fn test_sanitize_fee_recipient_override_keeps_primary_global_fee_address() {
+        let current = Pubkey::from_str("62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV")
+            .expect("primary global fee recipient");
+        assert_eq!(
+            TriggerComponent::sanitize_fee_recipient_override(Some(current)),
+            Some(current)
+        );
+    }
+
+    #[test]
+    fn test_sanitize_fee_recipient_override_keeps_reserved_fee_address() {
+        let reserved = Pubkey::from_str("GesfTA3X2arioaHp8bbKdjG9vJtskViWACZoYvxp4twS")
+            .expect("reserved fee recipient");
+        assert_eq!(
+            TriggerComponent::sanitize_fee_recipient_override(Some(reserved)),
+            Some(reserved)
+        );
+    }
+
+    #[test]
+    fn test_sanitize_fee_recipient_override_drops_unauthorized_observed_address() {
+        let observed = Pubkey::new_unique();
+        assert_eq!(
+            TriggerComponent::sanitize_fee_recipient_override(Some(observed)),
+            None
+        );
+    }
+
+    #[test]
+    fn test_sanitize_global_config_override_keeps_canonical_value() {
+        let canonical = DirectBuyBuilder::canonical_global_config();
+        assert_eq!(
+            TriggerComponent::sanitize_global_config_override(Some(canonical)),
+            Some(canonical)
+        );
+    }
+
+    #[test]
+    fn test_sanitize_global_config_override_drops_noncanonical_value() {
+        assert_eq!(
+            TriggerComponent::sanitize_global_config_override(Some(Pubkey::new_unique())),
+            None
+        );
+    }
+
+    #[test]
+    fn test_sanitize_buy_variant_override_keeps_routed() {
+        assert_eq!(
+            TriggerComponent::sanitize_buy_variant_override(Some(
+                trigger::PumpfunBuyVariant::RoutedExactSolIn,
+            )),
+            Some(trigger::PumpfunBuyVariant::RoutedExactSolIn)
+        );
+    }
+
+    #[test]
+    fn test_sanitize_buy_variant_override_drops_legacy() {
+        assert_eq!(
+            TriggerComponent::sanitize_buy_variant_override(Some(
+                trigger::PumpfunBuyVariant::LegacyBuy,
+            )),
             None
         );
     }
@@ -7609,6 +7863,7 @@ mod tests {
             mint: "mint".to_string(),
             live_signature: None,
             payer_pubkey: Pubkey::new_unique().to_string(),
+            payer_provenance: "configured".to_string(),
             amount_lamports: 100,
             entry_token_amount_raw: Some(250_000),
             tip_lamports: 10,
@@ -7625,6 +7880,9 @@ mod tests {
             logs: vec!["shadow".to_string()],
             return_data: None,
             err: None,
+            error_class: None,
+            error_code: None,
+            error_detail_class: None,
         };
 
         persist_shadow_event_record(
@@ -7650,6 +7908,8 @@ mod tests {
             amount_lamports: 100,
             tip_lamports: 10,
             decision_ts_ms: 10,
+            payer_provenance: "ephemeral",
+            payer_pubkey: Some("payer-ephemeral".to_string()),
         };
         let err = anyhow::Error::new(ShadowPreparationError::new(
             "transport connection reset by peer",
@@ -7673,7 +7933,7 @@ mod tests {
             .expect("read jsonl");
         assert!(contents.contains("\"pool_amm_id\":\"pool\""));
         assert!(contents.contains("\"retry_count\":3"));
-        assert!(contents.contains("\"error_class\":\"transport\""));
+        assert!(contents.contains("\"error_class\":\"network_provider_problem\""));
     }
 
     #[tokio::test]

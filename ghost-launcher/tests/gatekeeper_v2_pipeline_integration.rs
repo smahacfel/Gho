@@ -191,6 +191,7 @@ fn test_gk_v2_config() -> GatekeeperV2Config {
         prosperity_overlay_min_fee_topology_diversity_index: 0.10,
         prosperity_overlay_branch23_max_sell_buy_ratio: 0.18,
         prosperity_overlay_branch2_max_price_change_ratio: 2.0,
+        ..Default::default()
     }
 }
 

@@ -363,10 +363,10 @@ impl LutConfig {
             pump_fun: AmmAddresses {
                 program_id: Pubkey::from_str("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
                     .expect("Valid Pump.fun program ID"),
-                fee_recipient: Pubkey::from_str("CebN5WGQ4jvEPvsVU4EoHEpgznyQQNDGNesDwrFs8YWj")
+                fee_recipient: Pubkey::from_str("CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM")
                     .expect("Valid Pump.fun fee recipient"),
-                global_config: Pubkey::from_str("4wTV1YmiEkJvAtNtsSGPtUrE4UkmEwAkNKv6KOBi2tF1")
-                    .unwrap_or_else(|_| Pubkey::new_unique()), // Fallback if invalid
+                global_config: Pubkey::from_str("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf")
+                    .expect("Valid Pump.fun global config"),
             },
             bonk_fun: AmmAddresses {
                 program_id: Pubkey::from_str("LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj")
@@ -430,7 +430,7 @@ impl LutConfig {
             Pubkey::from_str("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
                 .expect("Valid Pump.fun Program ID"),
             // Pump.fun Fee Recipient
-            Pubkey::from_str("CebN5WGQ4jvEPvsVU4EoHEpgznyQQNDGNesDwrFs8YWj")
+            Pubkey::from_str("CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM")
                 .expect("Valid Pump.fun Fee Recipient"),
             // Pump.fun Global PDA (derived from seeds ["global"])
             Self::derive_pump_global_pda(),
@@ -506,10 +506,12 @@ mod tests {
         );
         assert_eq!(
             config.pump_fun.fee_recipient.to_string(),
-            "CebN5WGQ4jvEPvsVU4EoHEpgznyQQNDGNesDwrFs8YWj"
+            "CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM"
         );
-        // Note: global_config may be a fallback if the address in docs is invalid
-        assert!(!config.pump_fun.global_config.to_string().is_empty());
+        assert_eq!(
+            config.pump_fun.global_config.to_string(),
+            "4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf"
+        );
 
         // Verify Bonk.fun addresses
         assert_eq!(

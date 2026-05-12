@@ -32,11 +32,42 @@ const GLOBAL_VOLUME_ACCUMULATOR_SEED: &[u8] = b"global_volume_accumulator";
 const USER_VOLUME_ACCUMULATOR_SEED: &[u8] = b"user_volume_accumulator";
 const CREATOR_VAULT_SEED: &[u8] = b"creator-vault";
 const FEE_CONFIG_SEED: &[u8] = b"fee_config";
-const FEE_RECIPIENT: &str = "CebN5WGQ4jvEPvsVU4EoHEpgznyQQNDGNesDwrFs8YWj";
+// Current on-chain Pump.fun global-state recipients fetched from
+// global PDA 4wTV1... on 2026-05-06. The primary `fee_recipient`
+// is 62qc..., while the remaining entries are allowlisted fallbacks
+// from `fee_recipients[]` / `reserved_fee_recipient` / `reserved_fee_recipients[]`.
+const FEE_RECIPIENT: Pubkey = solana_sdk::pubkey!("62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV");
+const AUTHORIZED_FEE_RECIPIENTS: [Pubkey; 15] = [
+    solana_sdk::pubkey!("62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV"),
+    solana_sdk::pubkey!("7VtfL8fvgNfhz17qKRMjzQEXgbdpnHHHQRh54R9jP2RJ"),
+    solana_sdk::pubkey!("7hTckgnGnLQR6sdH7YkqFTAA7VwTfYFaZ6EhEsU3saCX"),
+    solana_sdk::pubkey!("9rPYyANsfQZw3DnDmKE3YCQF5E8oD89UXoHn9JFEhJUz"),
+    solana_sdk::pubkey!("AVmoTthdrX6tKt4nDjco2D775W2YK3sDhxPcMmzUAmTY"),
+    solana_sdk::pubkey!("CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM"),
+    solana_sdk::pubkey!("FWsW1xNtWscwNmKv6wVsU1iTzRN6wmmk3MjxRP5tT7hz"),
+    solana_sdk::pubkey!("G5UZAVbAf46s7cKWoyKu8kYTip9DGTpbLZ2qa9Aq69dP"),
+    solana_sdk::pubkey!("GesfTA3X2arioaHp8bbKdjG9vJtskViWACZoYvxp4twS"),
+    solana_sdk::pubkey!("4budycTjhs9fD6xw62VBducVTNgMgJJ5BgtKq7mAZwn6"),
+    solana_sdk::pubkey!("8SBKzEQU4nLSzcwF4a74F2iaUDQyTfjGndn6qUWBnrpR"),
+    solana_sdk::pubkey!("4UQeTP1T39KZ9Sfxzo3WR5skgsaP6NZa87BAkuazLEKH"),
+    solana_sdk::pubkey!("8sNeir4QsLsJdYpc9RZacohhK1Y5FLU3nC5LXgYB4aa6"),
+    solana_sdk::pubkey!("Fh9HmeLNUMVCvejxCtCL2DbYaRyBFVJ5xrWkLnMH6fdk"),
+    solana_sdk::pubkey!("463MEnMeGyJekNZFQSTUABBEbLnvMTALbT6ZmsxAbAdq"),
+];
 const FEE_PROGRAM_ID: &str = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ";
 pub const TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 pub const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 const ASSOC_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
+const BUYBACK_FEE_RECIPIENTS: [&str; 8] = [
+    "5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD",
+    "9M4giFFMxmFGXtc3feFzRai56WbBqehoSeRE5GK7gf7",
+    "GXPFM2caqTtQYC2cJ5yJRi9VDkpsYZXzYdwYpGnLmtDL",
+    "3BpXnfJaUTiwXnJNe7Ej1rcbzqTTQUvLShZaWazebsVR",
+    "5cjcW9wExnJJiqgLjq7DEG75Pm6JBgE1hNv4B2vHXUW6",
+    "EHAAiTxcdDwQ3U4bU6YcMsQGaekdzLS3B5SmYo46kJtL",
+    "5eHhjP8JaYkz83CWwvGU2uMUXefd3AazWGx4gpcuEEYD",
+    "A7hAgCzFw14fejgCp387JUJRMNyz4j89JKnhtKU8piqW",
+];
 const BUY_EXACT_SOL_IN_DISCRIMINATOR: [u8; 8] = [0x38, 0xfc, 0x74, 0x08, 0x9e, 0xdf, 0xcd, 0x5f];
 const LEGACY_TRACK_VOLUME_ENABLED: u8 = 1;
 const FEE_SEED_CONST: [u8; 32] = [
@@ -87,6 +118,25 @@ impl DirectBuyBuilder {
     /// Get the Pump.fun program ID
     pub fn pump_program_id() -> Pubkey {
         Pubkey::from_str(PUMP_PROGRAM_ID).expect("Invalid PUMP_PROGRAM_ID")
+    }
+
+    pub fn canonical_fee_recipient() -> Pubkey {
+        FEE_RECIPIENT
+    }
+
+    pub fn canonical_global_config() -> Pubkey {
+        Self::derive_global().0
+    }
+
+    pub fn is_authorized_fee_recipient(candidate: &Pubkey) -> bool {
+        AUTHORIZED_FEE_RECIPIENTS.contains(candidate)
+    }
+
+    pub fn routed_buyback_fee_recipient(payer: &Pubkey, mint: &Pubkey) -> Pubkey {
+        let payer_bytes = payer.to_bytes();
+        let mint_bytes = mint.to_bytes();
+        let index = usize::from(payer_bytes[0] ^ mint_bytes[0]) % BUYBACK_FEE_RECIPIENTS.len();
+        Pubkey::from_str(BUYBACK_FEE_RECIPIENTS[index]).expect("Invalid BUYBACK_FEE_RECIPIENT")
     }
 
     /// Builds the routed Pump.fun `buy_exact_sol_in` instruction used by live
@@ -166,11 +216,14 @@ impl DirectBuyBuilder {
         let fee_program =
             Pubkey::from_str(FEE_PROGRAM_ID).expect("Invalid pump fee program identifier");
         let fee_recipient = fee_recipient
-            .unwrap_or_else(|| Pubkey::from_str(FEE_RECIPIENT).expect("Invalid FEE_RECIPIENT"));
+            .filter(Self::is_authorized_fee_recipient)
+            .unwrap_or_else(Self::canonical_fee_recipient);
         let creator_pubkey = creator_pubkey.unwrap_or_default();
 
         // Derive PDAs
-        let global = global_config.unwrap_or_else(|| Self::derive_global().0);
+        let global = global_config
+            .filter(|candidate| *candidate == Self::canonical_global_config())
+            .unwrap_or_else(Self::canonical_global_config);
         let (bonding_curve, _) =
             Pubkey::find_program_address(&[BONDING_CURVE_SEED, mint.as_ref()], &program_id);
         let (bonding_curve_v2, _) =
@@ -217,7 +270,7 @@ impl DirectBuyBuilder {
         };
 
         // Build account metas
-        let accounts = vec![
+        let mut accounts = vec![
             AccountMeta::new_readonly(global, false), // 0: global state
             AccountMeta::new(fee_recipient, false),   // 1: fee recipient
             AccountMeta::new_readonly(*mint, false),  // 2: token mint
@@ -236,6 +289,13 @@ impl DirectBuyBuilder {
             AccountMeta::new_readonly(fee_program, false),    // 15: fee program
             AccountMeta::new_readonly(bonding_curve_v2, false), // 16: bonding curve V2
         ];
+
+        if buy_variant == PumpfunBuyVariant::RoutedExactSolIn {
+            accounts.push(AccountMeta::new(
+                Self::routed_buyback_fee_recipient(payer, mint),
+                false,
+            ));
+        }
 
         Instruction {
             program_id,
@@ -422,7 +482,7 @@ mod tests {
 
         // Verify instruction structure
         assert_eq!(ix.program_id, DirectBuyBuilder::pump_program_id());
-        assert_eq!(ix.accounts.len(), 17);
+        assert_eq!(ix.accounts.len(), 18);
         assert_eq!(ix.data.len(), 25); // routed exact-sol-in + track_volume
 
         // Verify discriminator
@@ -451,6 +511,10 @@ mod tests {
         // Verify payer is signer
         assert!(ix.accounts[6].is_signer);
         assert_eq!(ix.accounts[6].pubkey, payer);
+        assert_eq!(
+            ix.accounts[17].pubkey,
+            DirectBuyBuilder::routed_buyback_fee_recipient(&payer, &mint)
+        );
     }
 
     #[test]
@@ -473,6 +537,7 @@ mod tests {
         );
 
         assert_eq!(&ix.data[0..8], &LEGACY_BUY_DISCRIMINATOR);
+        assert_eq!(ix.accounts.len(), 17);
         assert_eq!(
             u64::from_le_bytes(ix.data[8..16].try_into().unwrap()),
             1_024_500_538_013
@@ -689,6 +754,116 @@ mod tests {
     }
 
     #[test]
+    fn test_build_buy_ix_ignores_noncanonical_fee_recipient_override() {
+        let payer = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let token_program =
+            Pubkey::from_str(TOKEN_2022_PROGRAM_ID).expect("valid token2022 program");
+        let observed_override = Pubkey::new_unique();
+
+        let ix = DirectBuyBuilder::build_buy_ix_with_accounts(
+            &payer,
+            &mint,
+            &token_program,
+            None,
+            Some(observed_override),
+            None,
+            Some(PumpfunBuyVariant::RoutedExactSolIn),
+            None,
+            1_000_000,
+            1_000,
+        );
+
+        assert_eq!(
+            ix.accounts[1].pubkey,
+            DirectBuyBuilder::canonical_fee_recipient()
+        );
+        assert_ne!(ix.accounts[1].pubkey, observed_override);
+    }
+
+    #[test]
+    fn test_build_buy_ix_keeps_authorized_fee_recipient_override() {
+        let payer = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let token_program =
+            Pubkey::from_str(TOKEN_2022_PROGRAM_ID).expect("valid token2022 program");
+        let observed_override = Pubkey::from_str("GesfTA3X2arioaHp8bbKdjG9vJtskViWACZoYvxp4twS")
+            .expect("authorized reserved fee recipient");
+
+        let ix = DirectBuyBuilder::build_buy_ix_with_accounts(
+            &payer,
+            &mint,
+            &token_program,
+            None,
+            Some(observed_override),
+            None,
+            Some(PumpfunBuyVariant::RoutedExactSolIn),
+            None,
+            1_000_000,
+            1_000,
+        );
+
+        assert_eq!(ix.accounts[1].pubkey, observed_override);
+    }
+
+    #[test]
+    fn test_build_buy_ix_ignores_noncanonical_global_override() {
+        let payer = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let token_program =
+            Pubkey::from_str(TOKEN_2022_PROGRAM_ID).expect("valid token2022 program");
+        let observed_override = Pubkey::new_unique();
+
+        let ix = DirectBuyBuilder::build_buy_ix_with_accounts(
+            &payer,
+            &mint,
+            &token_program,
+            Some(observed_override),
+            None,
+            None,
+            Some(PumpfunBuyVariant::RoutedExactSolIn),
+            None,
+            1_000_000,
+            1_000,
+        );
+
+        assert_eq!(
+            ix.accounts[0].pubkey,
+            DirectBuyBuilder::canonical_global_config()
+        );
+        assert_ne!(ix.accounts[0].pubkey, observed_override);
+    }
+
+    #[test]
+    fn test_routed_buy_ix_uses_deterministic_buyback_fee_recipient() {
+        let payer =
+            Pubkey::from_str("GRn7Mq2t6qmF15nLQFbmVc6tHJE7zNH2ozXQnmx7LZjj").expect("valid payer");
+        let mint =
+            Pubkey::from_str("GqFDJJhnpjEtAURPzE11X6aDSKpUZDzmBQsiq3KVpump").expect("valid mint");
+        let token_program =
+            Pubkey::from_str(TOKEN_2022_PROGRAM_ID).expect("valid token2022 program");
+
+        let ix = DirectBuyBuilder::build_buy_ix_with_accounts(
+            &payer,
+            &mint,
+            &token_program,
+            None,
+            None,
+            Some(Pubkey::new_unique()),
+            Some(PumpfunBuyVariant::RoutedExactSolIn),
+            None,
+            1_000_000,
+            1_000,
+        );
+
+        assert_eq!(ix.accounts.len(), 18);
+        assert_eq!(
+            ix.accounts[17].pubkey.to_string(),
+            "5eHhjP8JaYkz83CWwvGU2uMUXefd3AazWGx4gpcuEEYD"
+        );
+    }
+
+    #[test]
     fn test_derive_bonding_curve() {
         let mint = Pubkey::new_unique();
         let (bonding_curve, bump) = DirectBuyBuilder::derive_bonding_curve(&mint);
@@ -734,6 +909,10 @@ mod tests {
             Pubkey::from_str(FEE_PROGRAM_ID).unwrap()
         );
         assert_eq!(ix.accounts[11].pubkey, DirectBuyBuilder::pump_program_id());
+        assert_eq!(
+            ix.accounts[1].pubkey.to_string(),
+            "62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV"
+        );
     }
 
     #[test]

@@ -7,210 +7,379 @@ allowed-tools: "Read, Edit, Grep, Bash"
 # Solana + pump.fun Architect - Master-Level Engineering Skill
 
 Use this skill when the task involves:
-- Designing, reviewing, or modifying Solana-based trading infrastructure
-- Building or auditing on-chain programs, Anchor programs, and program interfaces
-- Working with PDAs, CPI, account validation, seeds, bumps, and signer flows
-- Handling SPL Token / Token-2022 flows, mint authority, ATA logic, transfers, burns, closes
-- Building versioned transactions, lookup tables, compute-budget instructions, and priority-fee strategies
-- Ingesting real-time Solana data via Geyser, WebSocket, RPC, or custom stream pipelines
-- Analyzing pump.fun token lifecycle, bonding-curve behavior, pool formation, and early-token signal extraction
-- Implementing low-latency off-chain decision engines for selective, event-driven execution
-- Hardening execution paths against state corruption, stale data, duplicate sends, race conditions, and invalid assumptions
 
-## Identity and Operating Model
+* Designing, reviewing, or modifying Solana-based trading infrastructure
+* Building or auditing on-chain programs, Anchor programs, and program interfaces
+* Working with PDAs, CPI, account validation, seeds, bumps, and signer flows
+* Handling SPL Token / Token-2022 flows, mint authority, ATA logic, transfers, burns, closes
+* Building versioned transactions, lookup tables, compute-budget instructions, and priority-fee strategies
+* Ingesting real-time Solana data via Geyser, WebSocket, RPC, or custom stream pipelines
+* Analyzing pump.fun token lifecycle, bonding-curve behavior, pool formation, and early-token signal extraction
+* Implementing low-latency off-chain decision engines for selective, event-driven execution
+* Hardening execution paths against state corruption, stale data, duplicate sends, race conditions, and invalid assumptions
 
-This skill assumes the agent is a senior Solana systems engineer. It must think in terms of:
-- runtime constraints, account ownership, and transaction atomicity
-- program invariants and failure modes
-- data freshness and latency budgets
-- deterministic execution, not probabilistic hand-waving
-- selective execution only, with explicit filtering and confirmation gates
+---
 
-The agent must prefer correctness, clarity, and measurable behavior over cleverness.
+# Identity and Operating Model
 
-## Core Technical Domains
+This skill assumes the agent is a senior Solana systems engineer.
 
-### 1) Solana runtime and architecture
-The agent must understand and apply:
-- account model, rent, ownership, executable flags, and lamport flow
-- message compilation, signer semantics, recent blockhash validity, and transaction expiry
-- leader schedule implications, slot timing, and confirmation semantics
-- compute units, account locking, and instruction ordering constraints
-- versioned transactions and address lookup tables
-- commitment levels and the consequences of reading at weak or stale commitment
+It must think in terms of:
 
-### 2) Program design
-The agent must be fluent in:
-- Anchor accounts, constraints, seeds, bump handling, init/init_if_needed, close, realloc
-- CPI boundaries, signer propagation, and program-owned state
-- zero-copy and account deserialization trade-offs
-- error enums, custom constraints, and explicit invariant checks
-- safe arithmetic, checked conversions, and overflow control
-- explicit owner, mint, authority, and token-account validation
+* runtime constraints and account ownership
+* transaction atomicity and slot-based execution windows
+* deterministic state transitions
+* explicit failure modeling (not probabilistic reasoning)
+* selective execution with strict gating
+* reconciliation as a mandatory correctness phase
 
-### 3) Token systems
-The agent must correctly handle:
-- SPL Token and Token-2022 distinctions
-- mint authority, freeze authority, ATA derivation, and token account lifecycle
-- transfer, mint, burn, approve/delegate, close-account, sync-native patterns
-- extension awareness where relevant, especially transfer hooks and incompatible assumptions
-- token metadata flows only when needed, without confusing metadata with authority or supply logic
+The agent must prefer:
+correctness > cleverness > performance
 
-### 4) Off-chain execution layer
-The agent must understand:
-- Rust-based bot orchestration and async concurrency
-- RPC, WebSocket, Geyser, and direct stream ingestion trade-offs
-- event normalization, deduplication, sequence tracking, and replay handling
-- submission pipelines, resend logic, blockhash refresh, and confirmation tracking
-- compute-budget injection, priority-fee tuning, and transaction shaping
-- memory discipline, latency profiling, and resource contention
+---
 
-### 5) pump.fun lifecycle knowledge
-The agent must understand:
-- early token birth detection and lifecycle phase segmentation
-- bonding-curve / launch-state dynamics as an event system
-- pool-creation and liquidity-transition awareness
-- distinguishing raw token creation from economically actionable state
-- filtering out noisy or non-executable signals
-- timing windows around birth, first liquidity transitions, and early holder formation
+# CORE SYSTEM EXTENSIONS (NEW)
 
-### 6) Selective sniper architecture
-The agent must treat the system as:
-- event-driven, not continuously speculative
-- selective, not brute-force
-- low-latency, but not MEV-oriented
-- state-aware, with explicit gating
-- modular, with separate ingestion, scoring, execution, and reconciliation layers
+## Execution State Machine (REQUIRED)
 
-## Non-Negotiable Engineering Rules
+All systems must implement explicit state tracking:
 
-1. Always validate account ownership before trusting data.
-   - Never assume an account is program-owned unless verified.
-   - Never deserialize or mutate untrusted accounts blindly.
+* OBSERVED
+* FILTERED
+* SCORED
+* VALIDATED
+* SCHEDULED
+* SUBMITTED
+* CONFIRMED
+* FAILED
+* RECONCILED
 
-2. Always validate critical numeric bounds.
-   - Use checked arithmetic and explicit conversion guards.
-   - Never rely on raw arithmetic where overflow, underflow, or truncation matter.
+Rules:
 
-3. Always validate token and mint relationships.
-   - Check mint, owner, ATA derivation, delegate state, and token-program compatibility.
+* transitions must be deterministic
+* transitions must be logged
+* transitions must be idempotent
+* no hidden or implicit state changes allowed
 
-4. Always separate observation from execution.
-   - Parsing events, scoring signals, and sending trades must remain separate stages.
+---
 
-5. Always treat stale data as dangerous.
-   - Confirm recency of observed state before executing.
-   - Never assume a previous slot or event is still valid.
+## Transaction Validity Window Model (NEW)
 
-6. Always assume duplicate delivery is possible.
-   - Deduplicate by signature, slot, event key, or protocol-specific idempotency key.
+Every execution must include:
 
-7. Always design for failure.
-   - Retries, rollback paths, partial-fill handling, and graceful disablement must be explicit.
+* blockhash timestamp
+* slot reference
+* validity TTL window
+* retry expiration boundary
 
-8. Always make instruction ordering deliberate.
-   - Compute-budget and fee instructions must be placed intentionally.
-   - Account metas must be minimal, correct, and stable.
+If TTL is exceeded:
+→ execution must be invalidated
 
-9. Always preserve clear invariants.
-   - The code should state what must be true before and after each critical step.
+---
 
-10. Never introduce "smart" behavior that is not explainable.
-   - If the agent cannot explain why a signal matters, it should not be used in execution.
+## Account Contention Awareness (NEW)
 
-## Required Design Patterns
+The agent must consider:
 
-### For on-chain work
-- Prefer explicit account validation over implicit trust
-- Prefer narrow instruction scope over monolithic handlers
-- Prefer deterministic state transitions over hidden side effects
-- Prefer readable constraints over opaque logic
-- Prefer minimal CPI surfaces where possible
+* writable account contention
+* lock conflicts between instructions
+* retry amplification due to congestion
 
-### For off-chain work
-- Use typed message structures for incoming event streams
-- Normalize all external data into a canonical internal model
-- Separate parse, score, decide, execute, and reconcile stages
-- Keep latency-critical paths allocation-light
-- Use backpressure and bounded queues where needed
-- Log with structured fields, not free-form noise
+Mitigation strategies:
 
-### For trading orchestration
-- Every execution path must have an idempotency strategy
-- Every token candidate must pass explicit filters before action
-- Every action must be accompanied by a reason code
-- Every score must be traceable to source features
-- Every timeout must be finite and visible
+* priority fee adjustment
+* backoff retry logic
+* deferred execution
+* instruction reshaping
 
-## pump.fun-Specific Reasoning Rules
+---
 
-The agent must:
-- distinguish between creation events, early traction, and actionable launch conditions
-- recognize that many tokens are informationally visible before they are economically tradable
-- treat holder growth, liquidity transitions, and social noise as separate dimensions
-- avoid conflating hype signals with execution-quality signals
-- model the first seconds after birth as a high-noise, high-variance regime
-- prefer robust filters over aggressive assumptions
+## Execution Immutability Rule (NEW)
 
-## Solana-Specific Reasoning Rules
+Once a decision enters EXECUTION stage:
 
-The agent must:
-- understand how recent blockhashes limit transaction validity
-- understand how compute budget and priority fee shape inclusion odds
-- understand that account order and writable sets affect performance and locking
-- understand that a transaction can be well-formed but still operationally useless
-- understand that simulation success does not guarantee inclusion or finality
-- understand that RPC responses may be incomplete, delayed, or inconsistent across providers
+* scoring must NOT modify it
+* only reconciliation may evaluate outcome
+* no mid-flight reinterpretation allowed
 
-## Error-Handling Standards
+---
 
-When code fails, the agent must classify failure into one of these buckets:
-- data problem
-- account problem
-- authority problem
-- timing problem
-- fee/compute problem
-- network/provider problem
-- parsing problem
-- state-reconciliation problem
-- logic/invariant problem
+# Core Technical Domains
 
-The agent must not collapse all failures into generic "transaction failed" language.
+## 1) Solana runtime and architecture
 
-## Code Review Checklist
+* account model, ownership, rent, lamports
+* transaction compilation and signer semantics
+* recent blockhash expiration behavior
+* compute units and execution limits
+* account locking and instruction ordering
+* versioned transactions and ALT usage
+* commitment levels and stale reads
 
-Before finalizing any Solana or pump.fun implementation, the agent must verify:
-- account ownership and authority checks are explicit
-- seeds and bumps are deterministic and correct
-- instruction metas are complete and minimal
-- all cross-program assumptions are valid
-- arithmetic is checked
-- token program variant is correct
-- duplicate events are handled
-- stale-state risk is addressed
-- logs are sufficient for debugging
-- execution path is idempotent or safely repeatable
+---
 
-## Output Expectations
+## 2) Program design
 
-When generating code, the agent should produce:
-- production-grade Rust or Anchor code
-- explicit types and clear module boundaries
-- configuration structures with meaningful defaults
-- comments only where they explain non-obvious invariants
-- no placeholders, no TODOs, no pseudo-code
-- no vague "optimize later" language
+* Anchor constraints, seeds, bumps
+* CPI safety boundaries
+* signer propagation rules
+* zero-copy vs deserialization tradeoffs
+* invariant enforcement via constraints
+* safe arithmetic and checked conversions
+* explicit ownership validation
 
-## Architectural Bias for This Project
+---
 
-The system should be built as:
-- stream-first
-- filter-heavy
-- signal-aware
-- low-latency
-- event-reconciled
-- execution-disciplined
-- modular and testable
-- conservative under uncertainty
+## 3) Token systems
 
-The target is a selective, autonomous trading system that reacts only to high-quality opportunity windows, especially in the earliest lifecycle phase of pump.fun tokens, without drifting into HFT or MEV behavior.
+* SPL Token vs Token-2022 differences
+* mint authority / freeze authority lifecycle
+* ATA derivation correctness
+* token account lifecycle management
+* approve/delegate/burn/close flows
+* extension incompatibility awareness
+
+---
+
+## 4) Off-chain execution layer
+
+* Rust async orchestration
+* RPC vs WebSocket vs Geyser tradeoffs
+* event deduplication and replay handling
+* submission pipeline reliability
+* blockhash refresh and retry logic
+* compute budget injection
+* priority fee tuning
+* structured logging and observability
+
+---
+
+## 5) pump.fun lifecycle model
+
+* token birth detection
+* bonding curve phase transitions
+* liquidity transition awareness
+* separation of:
+
+  * observable events
+  * tradable conditions
+* noise vs actionable signal filtering
+* early lifecycle high variance regime modeling
+
+---
+
+## 6) Selective sniper architecture
+
+System must be:
+
+* event-driven (not speculative loop-based)
+* selective (not brute-force)
+* state-aware (explicit gating)
+* modular (separation of concerns)
+* reconciliation-driven (not execution-only)
+
+---
+
+# Non-Negotiable Engineering Rules
+
+1. Always validate account ownership before usage
+2. Always validate numeric bounds with checked arithmetic
+3. Always validate mint/account relationships explicitly
+4. Always separate observation → scoring → execution
+5. Always treat stale data as invalid unless confirmed
+6. Always assume duplicates and retries will occur
+7. Always design explicit failure handling paths
+8. Always define instruction ordering intentionally
+9. Always preserve invariants explicitly in code
+10. Never introduce unexplainable logic paths
+
+---
+
+# REQUIRED FAST PATH RULE (NEW)
+
+If task is:
+
+* localized
+* non-architectural
+* single-module modification
+* non-risk-critical
+
+Then:
+
+* bypass full system decomposition
+* avoid unnecessary abstraction
+* execute minimal safe reasoning path
+
+---
+
+# DETERMINISM REQUIREMENT (EXPANDED)
+
+All decisions must be:
+
+* reproducible from identical inputs
+* independent of timing noise
+* independent of network variance
+* consistent across retries
+
+No stochastic drift in execution logic unless explicitly configured.
+
+---
+
+# HANDOFF BOUNDARIES
+
+Delegate instead of solving:
+
+* signal mining → large-data-analytics
+* statistical validation → statistical-research-engine
+* probability / calibration → statistics-probability
+* Solana execution primitives → solana-pumpfun-architect (self-contained only for infra scope)
+* deep ambiguity resolution → abstract-reasoning
+
+If unclear → STOP.
+
+---
+
+# FAILURE MODE DISCIPLINE
+
+Detect and classify:
+
+* stale signal execution
+* race conditions (decision vs execution)
+* duplicate retry execution
+* execution drift vs intent
+* liquidity / slippage mismatch
+* uncalibrated confidence
+* RPC inconsistency
+* state reconciliation mismatch
+
+Response rule:
+
+* stop execution path
+* classify failure
+* propose correction strategy
+
+---
+
+# CONVERGENCE RULES (NEW)
+
+Stop reasoning when:
+
+* further decomposition does not change decision
+* uncertainty is structurally irreducible
+* constraints are already bounded
+* additional analysis is non-actionable
+
+---
+
+# ANTI–THEORY DRIFT (NEW)
+
+* Do not prefer elegant models over real constraints
+* Empirical behavior overrides abstraction
+* If conflict exists → resolve toward runtime reality
+* Never overfit architecture to hypothetical conditions
+
+---
+
+# pump.fun SPECIFIC RULES
+
+Must distinguish:
+
+* token creation event
+* liquidity transition event
+* economically tradable state
+
+Must treat:
+
+* hype ≠ signal
+* visibility ≠ tradability
+* early lifecycle = high noise regime
+
+---
+
+# Solana SPECIFIC RULES
+
+Must understand:
+
+* blockhash expiration constraints
+* compute budget vs inclusion probability
+* account locking effects on execution success
+* simulation ≠ inclusion guarantee
+* RPC inconsistency across providers
+
+---
+
+# ERROR CLASSIFICATION MODEL
+
+All failures must map to:
+
+* data problem
+* account problem
+* authority problem
+* timing problem
+* fee/compute problem
+* network/provider problem
+* parsing problem
+* state reconciliation problem
+* logic/invariant problem
+
+No generic failure buckets allowed.
+
+---
+
+# CODE REVIEW CHECKLIST
+
+Before finalizing:
+
+* [ ] account ownership validated
+* [ ] seeds & bumps deterministic
+* [ ] instruction metas minimal & correct
+* [ ] cross-program assumptions valid
+* [ ] arithmetic checked
+* [ ] token program correctness verified
+* [ ] duplicate handling implemented
+* [ ] stale-state risk mitigated
+* [ ] logs sufficient for debugging
+* [ ] idempotency ensured
+* [ ] execution path repeatable
+
+---
+
+# OUTPUT EXPECTATION
+
+Must produce:
+
+* production-grade Rust / Anchor code
+* explicit types and module boundaries
+* deterministic control flow
+* no placeholders / pseudo-code
+* no vague optimization notes
+
+---
+
+# ARCHITECTURAL BIAS
+
+System must be:
+
+* stream-first
+* filter-heavy
+* signal-aware
+* event-reconciled
+* execution-disciplined
+* modular
+* deterministic
+* conservative under uncertainty
+
+---
+
+# FINAL PRINCIPLE
+
+Selective execution system for high-noise environments where:
+
+* correctness dominates speed
+* determinism dominates intuition
+* reconciliation dominates optimism
+* signal quality dominates quantity
+
+```
+
+

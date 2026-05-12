@@ -204,6 +204,7 @@ fn materialized_feature_set_contains_complete_inputs() {
             single_tx_max_price_impact_pct: 4.5,
             max_single_sell_impact_pct: 2.0,
             bonding_progress: 0.64,
+            trajectory_assessment: None,
         },
         risk_flags: vec![RiskFlag {
             flag_id: Cow::Borrowed("bundle_suspected"),
