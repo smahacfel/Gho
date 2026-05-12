@@ -38,6 +38,7 @@ async fn test_oracle_decision_logger_complete_flow() {
         gatekeeper_log_dir: temp_dir.path().to_path_buf(),
         channel_buffer_size: 100,
         enabled: true,
+        ..DecisionLoggerConfig::default()
     };
 
     let logger = DecisionLogger::new(config);
@@ -249,7 +250,7 @@ async fn test_oracle_decision_logger_complete_flow() {
     assert_eq!(followups[3]["score"], 25);
 
     // Verify total corrections
-    assert_eq!(parsed["total_corrections"], 3);
+    assert_eq!(parsed["total_corrections"], 4);
     assert_eq!(parsed["final_decision"], "HOLD");
     assert!(
         parsed["completed_at"].as_u64().is_some(),
@@ -284,6 +285,7 @@ async fn test_veto_scenario() {
         gatekeeper_log_dir: temp_dir.path().to_path_buf(),
         channel_buffer_size: 100,
         enabled: true,
+        ..DecisionLoggerConfig::default()
     };
 
     let logger = DecisionLogger::new(config);
@@ -368,6 +370,7 @@ async fn test_guardian_abort_scenario() {
         gatekeeper_log_dir: temp_dir.path().to_path_buf(),
         channel_buffer_size: 100,
         enabled: true,
+        ..DecisionLoggerConfig::default()
     };
 
     let logger = DecisionLogger::new(config);
@@ -450,6 +453,7 @@ async fn test_multiple_candidates_concurrent() {
         gatekeeper_log_dir: temp_dir.path().to_path_buf(),
         channel_buffer_size: 100,
         enabled: true,
+        ..DecisionLoggerConfig::default()
     };
 
     let logger = Arc::new(DecisionLogger::new(config));

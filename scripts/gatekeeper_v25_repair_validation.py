@@ -396,19 +396,18 @@ def gate_timeout_taxonomy(rows: list[dict[str, Any]]) -> GateResult:
     """P4: All TIMEOUT rows must have a specific subtype in both verdict_type and reason_code."""
     timeout_rows = [r for r in rows if r.get("verdict_type") is not None
                     and "TIMEOUT" in str(r.get("verdict_type", ""))]
+    valid_timeout_pairs = {
+        "TIMEOUT_PHASE1_NO_DATA": "TIMEOUT_PHASE1_NO_DATA",
+        "TIMEOUT_PHASE1_INSUFFICIENT": "TIMEOUT_PHASE1_INSUFFICIENT",
+        "TIMEOUT_DEADLINE_LOW_PHASES": "TIMEOUT_DEADLINE_LOW_PHASES",
+    }
     unclassified = [
         row_id(r) for r in timeout_rows
-        if r.get("verdict_type") == "TIMEOUT"  # generic, not a subtype
+        if r.get("verdict_type") not in valid_timeout_pairs
     ]
-    # P4: reason_code must match one of the three exact TIMEOUT subtypes.
-    VALID_TIMEOUT_REASON_CODES = {
-        "TIMEOUT_PHASE1_NO_DATA",
-        "TIMEOUT_PHASE1_INSUFFICIENT",
-        "TIMEOUT_DEADLINE_LOW_PHASES",
-    }
     reason_code_mismatch = [
         row_id(r) for r in timeout_rows
-        if r.get("reason_code") not in VALID_TIMEOUT_REASON_CODES
+        if valid_timeout_pairs.get(str(r.get("verdict_type"))) != r.get("reason_code")
     ]
     return GateResult(
         passed=len(unclassified) == 0 and len(reason_code_mismatch) == 0 and len(timeout_rows) > 0,
@@ -421,6 +420,54 @@ def gate_timeout_taxonomy(rows: list[dict[str, Any]]) -> GateResult:
             "unclassified_timeouts": unclassified[:20],
             "reason_code_mismatch": reason_code_mismatch[:20],
         },
+    )
+
+
+def gate_reason_code_verdict_consistency(rows: list[dict[str, Any]]) -> GateResult:
+    """P4: verdict_type and reason_code must describe the same terminal cause."""
+    expected_exact = {
+        "TIMEOUT_PHASE1_NO_DATA": {"TIMEOUT_PHASE1_NO_DATA"},
+        "TIMEOUT_PHASE1_INSUFFICIENT": {"TIMEOUT_PHASE1_INSUFFICIENT"},
+        "TIMEOUT_DEADLINE_LOW_PHASES": {"TIMEOUT_DEADLINE_LOW_PHASES"},
+        "REJECT_CORE_FAIL": {"REJECT_CORE_FAIL"},
+        "REJECT_SOFT_EXCESS": {"REJECT_LEGACY_SOFT_EXCESS"},
+        "REJECT_SYBIL_SOFT_EXCESS": {"REJECT_SYBIL_SOFT_EXCESS"},
+        "REJECT_SYBIL_INTERFERENCE": {"REJECT_SYBIL_INTERFERENCE"},
+        "REJECT_LOW_ALPHA": {"REJECT_LOW_ALPHA"},
+        "REJECT_LOW_PROSPERITY": {"REJECT_LOW_PROSPERITY"},
+        "REJECT_IWIM_VETO": {"REJECT_IWIM_VETO"},
+        "REJECT_IWIM_LOW_CONF": {"REJECT_IWIM_LOW_CONF"},
+        "REJECT_IWIM_UNKNOWN_STRICT": {"REJECT_IWIM_UNKNOWN_STRICT"},
+        "REJECT_ENTRY_DRIFT": {"REJECT_PDD_ENTRY_DRIFT"},
+        "REJECT_FLASH_CRASH": {"REJECT_PDD_FLASH_CRASH"},
+        "REJECT_RAMPING": {"REJECT_PDD_RAMPING"},
+        "REJECT_LOW_TRAJECTORY": {"REJECT_LOW_TRAJECTORY"},
+        "BUY": {"BUY_NORMAL", "BUY_EARLY", "BUY_EXTENDED"},
+        "EARLY_BUY": {"BUY_EARLY"},
+    }
+    mismatches: list[str] = []
+    for row in rows:
+        verdict_type = row.get("verdict_type")
+        reason_code = row.get("reason_code")
+        if verdict_type is None or reason_code is None:
+            continue
+        verdict_type = str(verdict_type)
+        reason_code = str(reason_code)
+        if verdict_type == "REJECT_HARD_FAIL":
+            if not reason_code.startswith("HARD_FAIL_"):
+                mismatches.append(row_id(row))
+            continue
+        if verdict_type == "REJECT_PUMP_AND_DUMP":
+            if not reason_code.startswith("REJECT_PDD_"):
+                mismatches.append(row_id(row))
+            continue
+        expected = expected_exact.get(verdict_type)
+        if expected is not None and reason_code not in expected:
+            mismatches.append(row_id(row))
+    return GateResult(
+        passed=len(mismatches) == 0,
+        details=f"reason_code_verdict_mismatch={len(mismatches)}",
+        observed={"mismatches": mismatches[:20]},
     )
 
 
@@ -497,6 +544,7 @@ def build_report(inputs: Inputs) -> dict[str, Any]:
         "decision_reason_completeness": asdict(gate_decision_reason_completeness(combined_rows)),
         "reason_code_completeness": asdict(gate_reason_code_completeness(combined_rows)),
         "timeout_taxonomy": asdict(gate_timeout_taxonomy(combined_rows)),
+        "reason_code_verdict_consistency": asdict(gate_reason_code_verdict_consistency(combined_rows)),
         "dispatch_classification": asdict(gate_dispatch_classification(combined_rows)),
         # P1/P6: Path B confidence availability after segment_sequence enrichment
         "path_b_confidence_availability": asdict(gate_path_b_confidence_availability(combined_rows)),

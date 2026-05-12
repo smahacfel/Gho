@@ -62,18 +62,6 @@ pub enum GatekeeperReasonCode {
     TimeoutPhase1Insufficient,
     TimeoutDeadlineLowPhases,
 
-    // ── TIMEOUT (root-cause taxonomy, Workstream 5) ──
-    /// Pool never showed meaningful interest (genuine no-interest).
-    TimeoutGenuineNoInterest,
-    /// Events never reached the ingest path for this pool.
-    TimeoutIngestMiss,
-    /// Pool was filtered out before reaching the gatekeeper.
-    TimeoutFilterDrop,
-    /// Data arrived too late (after deadline/window close).
-    TimeoutStaleArrival,
-    /// Window closed before sufficient data accumulated.
-    TimeoutWindowCloseTooEarly,
-
     // ── INVARIANT ──
     /// Verdict was never produced (invariant break).
     InvariantTimeoutNoVerdict,

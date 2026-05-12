@@ -233,6 +233,7 @@ fn materialized_feature_set_contains_complete_inputs() {
             signer_sample_count: 5,
         },
         alpha_fingerprint: Default::default(),
+        ..Default::default()
     };
 
     let checkpoint = SessionCheckpoint {

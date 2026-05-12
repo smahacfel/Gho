@@ -1,7 +1,7 @@
 use super::gatekeeper_policy::{
-    build_assessment_from_features, build_sybil_policy_diagnostics,
-    build_timeout_decision_from_assessment, evaluate_curve_gate, evaluate_policy_from_assessment,
-    sybil_combo_veto_reason, CurveGateOutcome, PolicyEvaluationContext,
+    build_assessment_from_features, build_sybil_policy_diagnostics, evaluate_curve_gate,
+    evaluate_policy_from_assessment, sybil_combo_veto_reason, CurveGateOutcome,
+    PolicyEvaluationContext,
 };
 use crate::components::gatekeeper_adaptive_prosperity::ApsDiagnostics;
 use crate::components::gatekeeper_pdd::{PddDiagnostics, PddHardFail};
@@ -897,6 +897,8 @@ pub enum GatekeeperVerdictType {
     TimeoutPhase1,
     /// No non-dust data arrived within deadline
     TimeoutNoData,
+    /// Phase 1 passed, but the deadline closed before enough core phases passed
+    TimeoutDeadlineLowPhases,
     /// IWIM veto: dev history analysis detected rug/sybil/scam pattern
     RejectIwimVeto,
     /// IWIM low confidence + BORDERLINE gatekeeper → reject
@@ -929,8 +931,9 @@ impl GatekeeperVerdictType {
             Self::RejectSybilInterference => "REJECT_SYBIL_INTERFERENCE",
             Self::RejectLowAlpha => "REJECT_LOW_ALPHA",
             Self::RejectLowProsperity => "REJECT_LOW_PROSPERITY",
-            Self::TimeoutPhase1 => "TIMEOUT_PHASE1",
-            Self::TimeoutNoData => "TIMEOUT_NO_DATA",
+            Self::TimeoutPhase1 => "TIMEOUT_PHASE1_INSUFFICIENT",
+            Self::TimeoutNoData => "TIMEOUT_PHASE1_NO_DATA",
+            Self::TimeoutDeadlineLowPhases => "TIMEOUT_DEADLINE_LOW_PHASES",
             Self::RejectIwimVeto => "REJECT_IWIM_VETO",
             Self::RejectIwimLowConf => "REJECT_IWIM_LOW_CONF",
             Self::RejectIwimUnknownStrict => "REJECT_IWIM_UNKNOWN_STRICT",
@@ -940,7 +943,6 @@ impl GatekeeperVerdictType {
             Self::RejectRamping => "REJECT_RAMPING",
             Self::RejectLowTrajectory => "REJECT_LOW_TRAJECTORY",
             Self::EarlyBuy => "EARLY_BUY",
-            _ => "REJECT_UNKNOWN",
         }
     }
 }
@@ -1429,13 +1431,31 @@ impl GatekeeperAssessment {
         }
 
         let reason = if self.uses_materialized_feature_path() {
-            "materialized_features_missing_segment_sequence"
+            if let Some(seq) = self.feature_snapshot.tx_segment_sequence.as_ref() {
+                if seq.total_duration_ms < config.tas.tas_min_total_duration_ms {
+                    "insufficient_duration"
+                } else if !seq.min_tx_per_segment_satisfied {
+                    "insufficient_tx_per_segment"
+                } else {
+                    "partial_inputs"
+                }
+            } else {
+                let obs_dur = self.feature_snapshot.session_metadata.observation_duration_ms;
+                let tx_count = self.feature_snapshot.tx_intel_features.tx_count as usize;
+                if obs_dur < config.tas.tas_min_total_duration_ms {
+                    "insufficient_duration"
+                } else if tx_count < config.tas.tas_min_tx_per_segment.saturating_mul(3) {
+                    "insufficient_tx_per_segment"
+                } else {
+                    "missing_sequence"
+                }
+            }
         } else if self.observation_duration_ms < config.tas.tas_min_total_duration_ms {
             "insufficient_duration"
         } else if self.total_tx_evaluated < config.tas.tas_min_tx_per_segment.saturating_mul(3) {
-            "insufficient_total_tx"
+            "insufficient_tx_per_segment"
         } else {
-            "insufficient_segment_coverage"
+            "partial_inputs"
         };
         (Some(false), Some(reason.to_string()))
     }
@@ -1455,15 +1475,15 @@ impl GatekeeperAssessment {
         let available = self.pdd_sequence_signals_available(config);
         let reason = if !available.unwrap_or(true) {
             if let Some(ref seq) = self.feature_snapshot.tx_segment_sequence {
-                if !seq.min_tx_per_segment_satisfied { Some("insufficient_tx_per_segment_for_sequence_signals".to_string()) }
-                else if seq.total_duration_ms < config.tas.tas_min_total_duration_ms { Some("insufficient_duration_for_sequence_signals".to_string()) }
-                else { Some("sequence_signals_unavailable".to_string()) }
+                if seq.total_duration_ms < config.tas.tas_min_total_duration_ms { Some("insufficient_duration".to_string()) }
+                else if !seq.min_tx_per_segment_satisfied { Some("insufficient_tx_per_segment".to_string()) }
+                else { Some("partial_inputs".to_string()) }
             } else if self.uses_materialized_feature_path() {
                 let obs_dur = self.feature_snapshot.session_metadata.observation_duration_ms;
                 let tx_count = self.feature_snapshot.tx_intel_features.tx_count as usize;
                 if obs_dur < config.tas.tas_min_total_duration_ms { Some("insufficient_duration".to_string()) }
-                else if tx_count < config.tas.tas_min_tx_per_segment.saturating_mul(3) { Some("insufficient_total_tx".to_string()) }
-                else { Some("materialized_features_missing_segment_sequence".to_string()) }
+                else if tx_count < config.tas.tas_min_tx_per_segment.saturating_mul(3) { Some("insufficient_tx_per_segment".to_string()) }
+                else { Some("missing_sequence".to_string()) }
             } else { Some("pdd_sequence_unavailable".to_string()) }
         } else { None };
         (available, reason)
@@ -1511,13 +1531,13 @@ impl GatekeeperAssessment {
                     if !anchor_ok { missing.push("pdd_price_anchor"); }
                 }
                 if missing.is_empty() {
-                    "v25_confidence_inputs_incomplete".to_string()
+                    "partial_inputs".to_string()
                 } else {
-                    format!("v25_inputs_missing: {}", missing.join(","))
+                    format!("partial_inputs: {}", missing.join(","))
                 }
             }
         } else {
-            "v25_inputs_unavailable".to_string()
+            "partial_inputs".to_string()
         };
         (Some(false), Some(reason.to_string()))
     }
@@ -1617,7 +1637,10 @@ impl GatekeeperAssessment {
     }
 
     /// Convert assessment to a buy log record with config thresholds
-    fn derive_reason_code(&self, config: &GatekeeperV2Config) -> Option<ghost_brain::oracle::reason_code::GatekeeperReasonCode> {
+    fn derive_reason_code(
+        &self,
+        _config: &GatekeeperV2Config,
+    ) -> Option<ghost_brain::oracle::reason_code::GatekeeperReasonCode> {
         use ghost_brain::oracle::reason_code::GatekeeperReasonCode as Rc;
         if self.decision.is_none() && self.total_tx_evaluated == 0 { return Some(Rc::TimeoutPhase1NoData); }
         if self.decision.is_none() && self.phases_passed == 0 { return Some(Rc::TimeoutPhase1Insufficient); }
@@ -1667,10 +1690,20 @@ impl GatekeeperAssessment {
         let tag = decision.verdict_type.tag();
         if let Some(rc) = Rc::from_iwim_verdict(tag) { return Some(rc); }
         match tag {
+            "TIMEOUT_PHASE1_NO_DATA" | "TIMEOUT_NO_DATA" => Some(Rc::TimeoutPhase1NoData),
+            "TIMEOUT_PHASE1_INSUFFICIENT" | "TIMEOUT_PHASE1" => Some(Rc::TimeoutPhase1Insufficient),
+            "TIMEOUT_DEADLINE_LOW_PHASES" => Some(Rc::TimeoutDeadlineLowPhases),
+            "REJECT_HARD_FAIL" => Some(Rc::RejectCoreFail),
             "REJECT_CORE_FAIL" => Some(Rc::RejectCoreFail), "REJECT_SYBIL_COMBO" => Some(Rc::RejectSybilCombo),
+            "REJECT_SYBIL_INTERFERENCE" => Some(Rc::RejectSybilInterference),
             "REJECT_SYBIL_SOFT_EXCESS" => Some(Rc::RejectSybilSoftExcess), "REJECT_SOFT_EXCESS" => Some(Rc::RejectLegacySoftExcess),
             "REJECT_LOW_ALPHA" => Some(Rc::RejectLowAlpha), "REJECT_LOW_PROSPERITY" => Some(Rc::RejectLowProsperity),
+            "REJECT_ENTRY_DRIFT" => Some(Rc::RejectPddEntryDrift),
+            "REJECT_FLASH_CRASH" => Some(Rc::RejectPddFlashCrash),
+            "REJECT_RAMPING" => Some(Rc::RejectPddRamping),
+            "REJECT_LOW_TRAJECTORY" => Some(Rc::RejectLowTrajectory),
             "REJECT_INSUFFICIENT_CONFIDENCE" => Some(Rc::RejectInsufficientConfidence), "BUY" => Some(Rc::BuyNormal),
+            "EARLY_BUY" => Some(Rc::BuyEarly),
             _ => None,
         }
     }
@@ -2917,6 +2950,13 @@ impl GatekeeperBuffer {
     }
 
     pub fn new(pool_id: Pubkey, cfg: &GatekeeperV2Config) -> Self {
+        if cfg.dow.enabled && cfg.dow.extended_window_ms > cfg.max_wait_time_ms {
+            panic!(
+                "P0 invariant violated: dow.extended_window_ms ({}) > max_wait_time_ms ({})",
+                cfg.dow.extended_window_ms, cfg.max_wait_time_ms
+            );
+        }
+
         let capacity_hint = cfg.min_tx_count.saturating_mul(2).max(32);
         let now_wall = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -3633,7 +3673,8 @@ impl GatekeeperBuffer {
         }
 
         if !assessment.phase1_passed {
-            let timeout_decision = build_timeout_decision_from_assessment(&assessment, config);
+            let timeout_decision =
+                super::gatekeeper_policy::build_timeout_decision_from_assessment(&assessment, config);
             assessment.hard_reject_reason = timeout_decision.hard_fail_reason.clone();
             assessment.decision = Some(timeout_decision);
             assessment.cache_v25_confidence(config);
@@ -5495,6 +5536,7 @@ impl GatekeeperBuffer {
         // Run assessment + three-layer decision
         let mut assessment = self.run_assessment();
         let decision = self.compute_decision(&assessment);
+        assessment.decision = Some(decision.clone());
 
         // ── V2.5 APS: Adaptive Prosperity diagnostics ──
         let spike_flag = assessment
@@ -5528,7 +5570,6 @@ impl GatekeeperBuffer {
             use crate::components::gatekeeper_adaptive_prosperity::MarketRegime;
             if aps.regime == MarketRegime::HighVolatility
                 && !self.config.v25.live_execution_enabled
-                && !self.config.v25.live_execution_enabled
                 && assessment
                     .pdd_assessment
                     .as_ref()
@@ -5550,32 +5591,36 @@ impl GatekeeperBuffer {
         // Restore phase1_passed
         self.phase1_passed = prev_phase1;
 
-        // ── Confidence proxy ──
-        let confidence = if decision.max_soft_points_possible > 0 {
-            let ratio = decision.soft_points as f64 / decision.max_soft_points_possible as f64;
-            (1.0 - ratio).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-
-        // V2.5 TAS modulation: adjust confidence by trajectory quality
-        // Skip TAS for Early stage — trajectory too noisy at 2-5s (plan: "Trajektoria nie ma sensu")
+        // V2.5 TAS modulation for Early/Normal legacy shadow confidence.
+        // Extended uses the canonical V2.5 confidence model below so timer and
+        // deadline fallback evaluate the same snapshot the same way.
         let apply_tas = self.config.tas.enabled && stage != ObservationStage::Early;
         let tas_reject = apply_tas && assessment.v25_tas_hard_reject(&self.config);
-        let mut confidence = if apply_tas {
-            if tas_reject {
-                0.0
-            } else if let Some(ref traj) = assessment.trajectory {
-                use crate::components::gatekeeper_trajectory::{
-                    compute_tas_modulator, evaluate_trajectory,
-                };
-                let tas_score = evaluate_trajectory(traj);
-                (confidence * compute_tas_modulator(tas_score, &self.config.tas)).clamp(0.0, 1.0)
-            } else {
-                confidence
-            }
+        let mut confidence = if stage == ObservationStage::Extended {
+            assessment.cache_v25_confidence(&self.config);
+            assessment.v25_confidence.unwrap_or(0.0)
         } else {
-            confidence
+            let base_confidence = if decision.max_soft_points_possible > 0 {
+                let ratio = decision.soft_points as f64 / decision.max_soft_points_possible as f64;
+                (1.0 - ratio).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            if apply_tas {
+                if tas_reject {
+                    0.0
+                } else if let Some(ref traj) = assessment.trajectory {
+                    use crate::components::gatekeeper_trajectory::{
+                        compute_tas_modulator, evaluate_trajectory,
+                    };
+                    let tas_score = evaluate_trajectory(traj);
+                    (base_confidence * compute_tas_modulator(tas_score, &self.config.tas)).clamp(0.0, 1.0)
+                } else {
+                    base_confidence
+                }
+            } else {
+                base_confidence
+            }
         };
 
         let phases_passed = assessment.phases_passed.min(6);
@@ -5606,8 +5651,10 @@ impl GatekeeperBuffer {
                 self.v25_shadow_decisions.push(shadow);
                 return true;
             }
-            // Soft penalty: reduce confidence proportionally to pdd_score
-            confidence *= pdd.pdd_score;
+            if stage != ObservationStage::Extended {
+                // Soft penalty: reduce legacy Early/Normal confidence proportionally to pdd_score.
+                confidence *= pdd.pdd_score;
+            }
         }
 
         // Cache final confidence on assessment for JSONL telemetry
@@ -5847,15 +5894,10 @@ impl GatekeeperBuffer {
     /// Invariant enforced at config load: extended_window_ms <= max_wait_time_ms.
     /// Returns `true` if at least one checkpoint was fired.
     pub fn maybe_fire_shadow_checkpoint(&mut self, now_wall_ms: u64) -> bool {
-        // P0 invariant: extended window must fit within the hard deadline.
-        // Downgraded from debug_assert! to tracing::warn! to avoid breaking
-        // tests with custom configs. Production config values are verified
-        // at config parse time (ghost_brain_config.toml: max_wait_time_ms >= extended_window_ms).
-        if self.config.dow.extended_window_ms > self.config.max_wait_time_ms {
-            tracing::warn!(
-                extended_window_ms = self.config.dow.extended_window_ms,
-                max_wait_time_ms = self.config.max_wait_time_ms,
-                "P0 invariant: extended_window_ms > max_wait_time_ms; Extended window truncated to deadline"
+        if self.config.dow.enabled && self.config.dow.extended_window_ms > self.config.max_wait_time_ms {
+            panic!(
+                "P0 invariant violated: dow.extended_window_ms ({}) > max_wait_time_ms ({})",
+                self.config.dow.extended_window_ms, self.config.max_wait_time_ms
             );
         }
         if !self.config.v25.shadow_enabled || !self.config.dow.enabled {
@@ -5971,7 +6013,6 @@ impl GatekeeperBuffer {
         Some(score_trajectory(&s0, &s1, &s2, config))
     }
 
-    #[must_use]
     #[must_use]
     /// Build segment sequence using TAS thresholds but independently of tas.enabled.
     /// PDD sequence signals (spike/ramping/flash) also depend on this data, so the

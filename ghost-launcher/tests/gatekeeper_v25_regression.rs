@@ -1,9 +1,11 @@
 use ghost_brain::config::{GatekeeperMode, GatekeeperV2Config};
 use ghost_core::EventSemanticEnvelope;
 use ghost_launcher::components::gatekeeper::{
-    GatekeeperAssessment, GatekeeperBuffer, GatekeeperVerdict, ObservationStage, ShadowDecisionKind,
+    AlphaGateDiagnostics, GatekeeperAssessment, GatekeeperBuffer, GatekeeperDecision,
+    GatekeeperVerdict, GatekeeperVerdictType, ObservationStage, ProsperityFilterDiagnostics,
+    ShadowDecisionKind, SoftSignals, SybilPolicyDiagnostics,
 };
-use ghost_launcher::components::gatekeeper_pdd::{evaluate_pdd, PddHardFail};
+use ghost_launcher::components::gatekeeper_pdd::evaluate_pdd;
 use ghost_launcher::events::PoolTransaction;
 use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
@@ -122,7 +124,7 @@ fn final_assessment(verdict: GatekeeperVerdict) -> GatekeeperAssessment {
         GatekeeperVerdict::Buy { assessment, .. }
         | GatekeeperVerdict::Reject { assessment, .. }
         | GatekeeperVerdict::Timeout { assessment } => assessment,
-        other => panic!("expected terminal verdict, got non-terminal variant"),
+        _other => panic!("expected terminal verdict, got non-terminal variant"),
     }
 }
 
@@ -601,6 +603,18 @@ fn p0_dow_timer_fires_all_three_stages_without_tx_pressure() {
     }
 }
 
+/// P0: runtime configs with Extended after hard deadline fail fast.
+#[test]
+#[should_panic(expected = "P0 invariant violated")]
+fn p0_dow_runtime_rejects_extended_window_beyond_deadline() {
+    let mut cfg = v25_enabled_config();
+    cfg.max_wait_time_ms = 5_000;
+    cfg.dow.enabled = true;
+    cfg.dow.extended_window_ms = 10_000;
+
+    let _ = GatekeeperBuffer::new(Pubkey::new_unique(), &cfg);
+}
+
 /// P0: Extended stage has a typed verdict — not unreachable!().
 ///
 /// When a pool accumulates enough TX data (Phase 1 met) and enters the
@@ -663,6 +677,63 @@ fn p0_extended_stage_has_typed_verdict_not_unreachable() {
         extended.reason.as_str(),
         "",
         "Extended must have a non-empty reason"
+    );
+}
+
+/// P0: Extended timer and deadline fallback use the same V2.5 confidence model.
+#[test]
+fn p0_extended_timer_and_deadline_fallback_confidence_match() {
+    let mut cfg = v25_enabled_config();
+    cfg.max_wait_time_ms = 10_000;
+    cfg.use_three_layer_decision = true;
+    cfg.dow.extended_window_ms = 10_000;
+    cfg.dow.extended_window_min_confidence = 0.0;
+    cfg.min_tx_count = 6;
+    cfg.min_unique_signers = 4;
+    cfg.min_buy_count = 4;
+    cfg.pdd.enabled = true;
+
+    fn seed(buf: &mut GatekeeperBuffer) {
+        for i in 0..10 {
+            ingest(
+                buf,
+                tx(
+                    &format!("conf_signer_{}", i),
+                    1_200 + i as u64 * 650,
+                    true,
+                    0.35 + i as f64 * 0.03,
+                ),
+            );
+        }
+    }
+
+    let mut timer_buf = GatekeeperBuffer::new(Pubkey::new_unique(), &cfg);
+    timer_buf.set_registered_wall_t0(1_000);
+    seed(&mut timer_buf);
+    assert!(timer_buf.maybe_fire_shadow_checkpoint(9_000));
+    let timer_confidence = timer_buf
+        .v25_shadow_decisions()
+        .iter()
+        .filter(|d| d.window == ObservationStage::Extended && d.kind != ShadowDecisionKind::InsufficientData)
+        .last()
+        .expect("timer path must emit Extended")
+        .confidence;
+
+    let mut deadline_buf = GatekeeperBuffer::new(Pubkey::new_unique(), &cfg);
+    deadline_buf.set_registered_wall_t0(1_000);
+    seed(&mut deadline_buf);
+    let assessment = final_assessment(deadline_buf.force_check_deadline(11_100));
+    let deadline_confidence = assessment
+        .v25_shadow_decisions
+        .iter()
+        .filter(|d| d.window == ObservationStage::Extended && d.kind != ShadowDecisionKind::InsufficientData)
+        .last()
+        .expect("deadline fallback must emit Extended")
+        .confidence;
+
+    assert!(
+        (timer_confidence - deadline_confidence).abs() < f64::EPSILON,
+        "Extended confidence must match timer vs deadline fallback: timer={timer_confidence:.6} deadline={deadline_confidence:.6}"
     );
 }
 
@@ -885,19 +956,7 @@ fn p1_path_b_marks_unavailable_instead_of_guessing_sequence_features() {
     assert!(tas_reason.is_some(), "must provide explicit unavailable reason");
     let reason = tas_reason.unwrap();
     // P1 taxonomy: reason must be from the specific taxonomy, not generic.
-    let valid_reasons = [
-        "insufficient_duration",
-        "insufficient_total_tx",
-        "insufficient_tx_per_segment",
-        "insufficient_segment_coverage",
-        "materialized_features_missing_segment_sequence",
-        "materialized_sequence_present_but_trajectory_not_computed",
-    ];
-    assert!(
-        valid_reasons.iter().any(|r| reason == *r),
-        "reason must be from P1 taxonomy, got: {}",
-        reason
-    );
+    assert_eq!(reason, "missing_sequence");
 
     let pdd_seq = assessment.pdd_sequence_signals_available(&config);
     assert_eq!(pdd_seq, Some(false));
@@ -910,15 +969,51 @@ fn p1_path_b_marks_unavailable_instead_of_guessing_sequence_features() {
         "pdd_sequence_signals_unavailable_reason must be logged when unavailable"
     );
     let pdd_reason = buy_log.pdd_sequence_signals_unavailable_reason.as_ref().unwrap();
-    let valid_pdd_reasons = [
-        "insufficient_duration",
-        "insufficient_total_tx",
-        "materialized_features_missing_segment_sequence",
-    ];
-    assert!(
-        valid_pdd_reasons.iter().any(|r| pdd_reason == *r),
-        "pdd_sequence unavailable reason must be from P1 taxonomy, got: {}",
-        pdd_reason
+    assert_eq!(pdd_reason, "missing_sequence");
+}
+
+/// P1: unavailable reasons are stable, specific taxonomy values.
+#[test]
+fn p1_availability_reasons_are_specific() {
+    use ghost_launcher::components::gatekeeper_policy::{
+        build_assessment_from_features, PolicyEvaluationContext,
+    };
+
+    let mut config = v25_enabled_config();
+    config.tas.enabled = true;
+    config.pdd.enabled = true;
+    config.tas.tas_min_total_duration_ms = 2_000;
+    config.tas.tas_min_tx_per_segment = 3;
+
+    let mut insufficient_duration = ghost_core::checkpoint::MaterializedFeatureSet::default();
+    insufficient_duration.tx_intel_features.tx_count = 12;
+    insufficient_duration.session_metadata.observation_duration_ms = 1_000;
+    let assessment = build_assessment_from_features(
+        insufficient_duration,
+        &config,
+        PolicyEvaluationContext::default(),
+    );
+    assert_eq!(
+        assessment.tas_availability(&config).1.as_deref(),
+        Some("insufficient_duration")
+    );
+    assert_eq!(
+        assessment.pdd_sequence_signals_availability(&config).1.as_deref(),
+        Some("insufficient_duration")
+    );
+
+    let mut insufficient_tx = ghost_core::checkpoint::MaterializedFeatureSet::default();
+    insufficient_tx.tx_intel_features.tx_count = 5;
+    insufficient_tx.session_metadata.observation_duration_ms = 7_000;
+    let assessment =
+        build_assessment_from_features(insufficient_tx, &config, PolicyEvaluationContext::default());
+    assert_eq!(
+        assessment.tas_availability(&config).1.as_deref(),
+        Some("insufficient_tx_per_segment")
+    );
+    assert_eq!(
+        assessment.pdd_sequence_signals_availability(&config).1.as_deref(),
+        Some("insufficient_tx_per_segment")
     );
 }
 
@@ -1003,7 +1098,7 @@ fn p1_path_a_and_path_b_compute_same_tas_when_segment_sequence_present() {
 /// produce the same TAS score for identical underlying data.
 #[test]
 fn p1_hard_parity_path_a_vs_path_b_same_tas_score() {
-    use ghost_launcher::components::gatekeeper_trajectory::{build_segment, score_trajectory};
+    use ghost_launcher::components::gatekeeper_trajectory::score_trajectory;
 
     let mut cfg = v25_enabled_config();
     cfg.tas.enabled = true;
@@ -1124,6 +1219,57 @@ fn p2_aps_runs_in_path_b_when_enabled() {
     assert!(!aps.adaptive_thresholds_applied);
 }
 
+/// P2: strong HighVol input below min_calibration_samples must still be Normal.
+#[test]
+fn p2_aps_high_vol_signal_below_min_samples_stays_normal() {
+    use ghost_launcher::components::gatekeeper_adaptive_prosperity::MarketRegime;
+    use ghost_launcher::components::gatekeeper_policy::{
+        build_assessment_from_features, PolicyEvaluationContext,
+    };
+
+    let mut config = v25_enabled_config();
+    config.aps.enabled = true;
+    config.aps.shadow_suggestions_enabled = true;
+    config.aps.regime_detection_enabled = true;
+    config.aps.regime_local_heuristic_enabled = true;
+    config.aps.adaptive_enabled = true;
+    config.aps.min_calibration_samples = 30;
+    config.v25.live_execution_enabled = false;
+
+    let mut features = ghost_core::checkpoint::MaterializedFeatureSet::default();
+    features.tx_intel_features.tx_count = 29;
+    features.tx_intel_features.buy_count = 24;
+    features.tx_intel_features.unique_signers = 12;
+    features.tx_intel_features.buy_ratio = 0.82;
+    features.tx_intel_features.total_volume_sol = 12.0;
+    features.tx_intel_features.avg_interval_ms = 250.0;
+    features.tx_intel_features.interval_cv = 0.4;
+    features.tx_intel_features.timing_entropy = 2.0;
+    features.account_features.market_cap_sol = 55.0;
+    features.account_features.bonding_progress = 0.25;
+    features.account_features.price_sol = 5.0;
+    features.account_features.current_reserves = (50_000_000_000, 900_000_000);
+    features.session_metadata.observation_duration_ms = 7_000;
+    features.checkpoint_features.price_change_from_first_checkpoint_pct = 400.0;
+    features.checkpoint_features.price_trajectory = vec![1.0, 3.0, 5.0];
+    features.checkpoint_features.trajectory_checkpoint_count = 3;
+    features.curve_readiness.curve_data_known = true;
+    features.curve_readiness.price_sample_count = 3;
+
+    let assessment =
+        build_assessment_from_features(features, &config, PolicyEvaluationContext::default());
+    let aps = assessment
+        .aps_diagnostics
+        .as_ref()
+        .expect("APS diagnostics must be present");
+
+    assert_eq!(aps.regime, MarketRegime::Normal);
+    assert!(
+        !assessment.adaptive_thresholds_applied,
+        "adaptive thresholds must not apply when sample_count < min_calibration_samples"
+    );
+}
+
 /// P2: APS drift override only applies in shadow plane (not live).
 ///
 /// When `live_execution_enabled = false` and `adaptive_enabled = true` and
@@ -1135,7 +1281,6 @@ fn p2_aps_drift_override_only_in_shadow_plane() {
     use ghost_launcher::components::gatekeeper_policy::{
         build_assessment_from_features, PolicyEvaluationContext,
     };
-    use ghost_launcher::components::gatekeeper_pdd::PddHardFail;
 
     let mut config = v25_enabled_config();
     config.mode = GatekeeperMode::Long;
@@ -1362,6 +1507,123 @@ fn p4_every_verdict_emits_typed_reason_code() {
     let empty_log = empty_assessment.to_buy_log(&Pubkey::new_unique(), &config);
     assert!(empty_log.reason_code.is_some(), "even empty verdict must emit reason_code");
     assert_eq!(empty_log.reason_code_version, 2);
+}
+
+/// P4: REJECT_SYBIL_INTERFERENCE maps deterministically in runtime buy logs.
+#[test]
+fn p4_reject_sybil_interference_has_reason_code() {
+    let config = v25_enabled_config();
+    let mut assessment = GatekeeperAssessment {
+        phase1_passed: true,
+        phase2_velocity: None,
+        phase2_passed: true,
+        phase3_diversity: None,
+        phase3_passed: true,
+        phase4_volume: None,
+        phase4_passed: true,
+        phase5_dev: None,
+        phase5_passed: true,
+        phase6_curve: None,
+        phase6_passed: true,
+        phases_passed: 6,
+        hard_reject_reason: None,
+        total_tx_evaluated: 30,
+        unique_tx_evaluated: 30,
+        unique_signers_evaluated: 20,
+        observation_duration_ms: 7_000,
+        finalize_lag_ms: 0,
+        dust_filtered_count: 0,
+        eval_count: 1,
+        buy_count: 20,
+        decision: None,
+        early_fingerprint: None,
+        curve_t0_event_ts_ms: None,
+        curve_t0_clock_source: None,
+        curve_wait_elapsed_ms: None,
+        feature_snapshot: ghost_core::checkpoint::MaterializedFeatureSet::default(),
+        checkpoint_count: 0,
+        trajectory_available: false,
+        v25_shadow_decisions: Vec::new(),
+        trajectory: None,
+        pdd_assessment: None,
+        aps_diagnostics: None,
+        observation_stage: None,
+        entry_drift_pct: None,
+        entry_drift_anchor_quality: None,
+        adaptive_thresholds_applied: false,
+        v25_confidence: None,
+    };
+    assessment.decision = Some(GatekeeperDecision {
+        hard_fail_reason: None,
+        core1_passed: true,
+        core2_passed: true,
+        core3_passed: true,
+        soft_signals: SoftSignals::default(),
+        soft_points: 0,
+        max_soft_points_possible: 0,
+        effective_max_soft_points: 0,
+        dev_unknown: false,
+        sybil_policy: SybilPolicyDiagnostics::default(),
+        alpha_gate: AlphaGateDiagnostics::not_run(false),
+        prosperity_filter: ProsperityFilterDiagnostics::not_run(false),
+        total_soft_points: 0,
+        verdict_type: GatekeeperVerdictType::RejectSybilInterference,
+        verdict_buy: false,
+        reason_chain: "SYBIL_COMBO: test".to_string(),
+        gatekeeper_strength: None,
+    });
+
+    let log = assessment.to_buy_log(&Pubkey::new_unique(), &config);
+    assert_eq!(
+        log.verdict_type.as_deref(),
+        Some("REJECT_SYBIL_INTERFERENCE")
+    );
+    assert_eq!(
+        log.reason_code.as_deref(),
+        Some("REJECT_SYBIL_INTERFERENCE")
+    );
+}
+
+/// P4: feature-driven timeout builder uses the concrete low-phases timeout subtype.
+#[test]
+fn p4_timeout_builder_phase1_passed_uses_deadline_low_phases() {
+    use ghost_launcher::components::gatekeeper_policy::{
+        build_assessment_from_features, build_timeout_decision_from_assessment,
+        PolicyEvaluationContext,
+    };
+
+    let mut config = v25_enabled_config();
+    config.min_tx_count = 3;
+    config.min_unique_signers = 3;
+    config.min_buy_count = 3;
+    config.min_phases_to_pass = 6;
+
+    let mut features = ghost_core::checkpoint::MaterializedFeatureSet::default();
+    features.tx_intel_features.tx_count = 5;
+    features.tx_intel_features.buy_count = 5;
+    features.tx_intel_features.unique_signers = 5;
+    features.tx_intel_features.buy_ratio = 1.0;
+    features.tx_intel_features.total_volume_sol = 2.0;
+    features.session_metadata.observation_duration_ms = 7_000;
+
+    let mut assessment =
+        build_assessment_from_features(features, &config, PolicyEvaluationContext::default());
+    assert!(assessment.phase1_passed);
+
+    let decision = build_timeout_decision_from_assessment(&assessment, &config);
+    assert_eq!(
+        decision.verdict_type,
+        GatekeeperVerdictType::TimeoutDeadlineLowPhases
+    );
+    assert!(decision.reason_chain.starts_with("TIMEOUT_DEADLINE_LOW_PHASES:"));
+
+    assessment.decision = Some(decision);
+    let log = assessment.to_buy_log(&Pubkey::new_unique(), &config);
+    assert_eq!(log.verdict_type.as_deref(), Some("TIMEOUT_DEADLINE_LOW_PHASES"));
+    assert_eq!(
+        log.reason_code.as_deref(),
+        Some("TIMEOUT_DEADLINE_LOW_PHASES")
+    );
 }
 
 /// P4: TIMEOUT decision_reason is never null.

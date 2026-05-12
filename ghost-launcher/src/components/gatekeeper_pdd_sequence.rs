@@ -188,4 +188,12 @@ mod tests {
         let (detected, _) = detect_spike_from_segments(&seq, &cfg);
         assert!(!detected);
     }
+
+    #[test]
+    fn test_flash_crash_without_price_impact_is_unavailable_not_proxy() {
+        let seq = test_seq(1.0, 1.0, 1.0, 5, 5, 5, 0, 0, 100.0);
+        let (detected, reason) = detect_flash_crash_from_segments(&seq, &pdd_config());
+        assert!(!detected);
+        assert_eq!(reason, None);
+    }
 }

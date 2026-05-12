@@ -5015,6 +5015,36 @@ min_dev_paperhand_latency_ms = 2500
     }
 
     #[test]
+    fn gatekeeper_v25_dow_rejects_extended_window_beyond_deadline() {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("ghost_gk2_bad_dow_{ts}.toml"));
+
+        let toml = r#"
+version = 10
+
+[gatekeeper_v2]
+max_wait_time_ms = 5000
+
+[gatekeeper_v2.dow]
+enabled = true
+extended_window_ms = 10000
+"#;
+
+        std::fs::write(&path, toml).unwrap();
+        let err = GhostBrainConfig::gatekeeper_v2_from_toml_file(&path)
+            .expect_err("extended window beyond hard deadline must fail fast");
+        std::fs::remove_file(&path).ok();
+
+        assert!(
+            err.to_string().contains("P0 invariant violated"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn gatekeeper_v25_default_backward_compat() {
         // When TOML has NO v25 sub-sections, everything defaults to disabled
         let toml_without_v25 = r#"

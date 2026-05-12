@@ -311,6 +311,7 @@ fn base_feature_set() -> MaterializedFeatureSet {
         },
         sybil_resistance: SybilResistanceFeatures::default(),
         alpha_fingerprint: Default::default(),
+        ..Default::default()
     }
 }
 
@@ -1114,11 +1115,14 @@ fn timeout_decision_does_not_claim_phase1_timeout_after_phase1_passed() {
 
     let decision = build_timeout_decision_from_assessment(&assessment, &config);
 
-    assert_eq!(decision.verdict_type, GatekeeperVerdictType::RejectCoreFail);
+    assert_eq!(
+        decision.verdict_type,
+        GatekeeperVerdictType::TimeoutDeadlineLowPhases
+    );
     assert!(!decision.verdict_buy);
     assert!(decision.core1_passed);
-    assert!(decision.reason_chain.starts_with("TIMEOUT_AFTER_PHASE1:"));
-    assert!(!decision.reason_chain.contains("TIMEOUT_PHASE1:"));
+    assert!(decision.reason_chain.starts_with("TIMEOUT_DEADLINE_LOW_PHASES:"));
+    assert!(!decision.reason_chain.contains("TIMEOUT_PHASE1_INSUFFICIENT:"));
 }
 
 #[test]

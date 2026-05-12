@@ -478,8 +478,7 @@ pub fn build_assessment_from_features(
         .as_ref()
         .filter(|seq| seq.min_tx_per_segment_satisfied)
         .and_then(|seq| {
-            use crate::components::gatekeeper_trajectory::TrajectoryAssessment;
-            use crate::components::gatekeeper_trajectory::{build_segment, score_trajectory};
+            use crate::components::gatekeeper_trajectory::score_trajectory;
 
             // Reconstruct TrajectorySegments from snapshots
             let t0 = crate::components::gatekeeper_trajectory::TrajectorySegment {
@@ -1309,9 +1308,10 @@ pub fn build_timeout_decision_from_assessment(
         )
     } else {
         (
-            GatekeeperVerdictType::RejectCoreFail,
+            GatekeeperVerdictType::TimeoutDeadlineLowPhases,
             format!(
-                "TIMEOUT_AFTER_PHASE1: core1={} core2={} core3={} tx={}/{} signers={}/{} buys={}/{}",
+                "{}: core1={} core2={} core3={} tx={}/{} signers={}/{} buys={}/{}",
+                GatekeeperVerdictType::TimeoutDeadlineLowPhases.tag(),
                 diagnostics.core1_passed,
                 diagnostics.core2_passed,
                 diagnostics.core3_passed,
@@ -2383,7 +2383,7 @@ mod tests {
         assert_eq!(buy_log.tas_available, Some(false));
         assert_eq!(
             buy_log.tas_unavailable_reason.as_deref(),
-            Some("materialized_features_missing_segment_sequence")
+            Some("missing_sequence")
         );
         assert_eq!(buy_log.pdd_sequence_signals_available, Some(false));
         assert_eq!(buy_log.pdd_price_anchor_available, Some(true));
