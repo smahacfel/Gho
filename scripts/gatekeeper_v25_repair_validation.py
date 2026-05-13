@@ -196,16 +196,20 @@ def row_id(row: dict[str, Any]) -> str:
     return "<unknown>"
 
 
-def gate_artifacts_present(inputs: Inputs) -> GateResult:
+def gate_artifacts_present(inputs: Inputs, rows: list[dict[str, Any]]) -> GateResult:
+    buy_log_required = any(row.get("decision_verdict_buy") is True for row in rows)
     present = {
-        "buys_log": inputs.buys_log.exists(),
+        "buys_log": inputs.buys_log.exists() or not buy_log_required,
         "decisions_log": inputs.decisions_log.exists(),
         "coverage_audit_log": inputs.coverage_audit_log.exists(),
     }
     return GateResult(
         passed=all(present.values()),
-        details=" ".join(f"{key}={value}" for key, value in present.items()),
-        observed=present,
+        details=(
+            " ".join(f"{key}={value}" for key, value in present.items())
+            + f" buy_log_required={buy_log_required}"
+        ),
+        observed={**present, "buy_log_required": buy_log_required},
     )
 
 
@@ -534,7 +538,7 @@ def build_report(inputs: Inputs) -> dict[str, Any]:
     combined_rows = decision_rows + buy_rows
 
     gates = {
-        "artifacts_present": asdict(gate_artifacts_present(inputs)),
+        "artifacts_present": asdict(gate_artifacts_present(inputs, combined_rows)),
         "runtime_reconciliation": asdict(gate_runtime_report(shadow_report, shadow_report_err)),
         "plane_contract": asdict(
             gate_plane_contract(

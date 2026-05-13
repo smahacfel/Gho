@@ -223,8 +223,7 @@ mod tests {
 
     #[test]
     fn test_invariant_timeout_no_verdict_format() {
-        let json =
-            serde_json::to_string(&GatekeeperReasonCode::InvariantTimeoutNoVerdict).unwrap();
+        let json = serde_json::to_string(&GatekeeperReasonCode::InvariantTimeoutNoVerdict).unwrap();
         assert_eq!(json, "\"INVARIANT_TIMEOUT_NO_VERDICT\"");
     }
 }

@@ -2862,6 +2862,31 @@ impl ObservationStage {
     }
 }
 
+/// Source that requested a V2.5 DOW shadow checkpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShadowCheckpointSource {
+    Timer,
+    Tx,
+    DeadlineFallback,
+}
+
+impl ShadowCheckpointSource {
+    fn insufficient_reason_prefix(self) -> &'static str {
+        match self {
+            Self::Timer => "TIMER_FIRED_INSUFFICIENT_DATA",
+            Self::Tx => "TX_FIRED_INSUFFICIENT_DATA",
+            Self::DeadlineFallback => "DEADLINE_FALLBACK_INSUFFICIENT_DATA",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShadowCheckpointOutcome {
+    Skipped,
+    ProvisionalInsufficientData,
+    Finalized,
+}
+
 /// Kind of shadow decision produced by a V2.5 observation window checkpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShadowDecisionKind {
@@ -3083,6 +3108,9 @@ impl GatekeeperBuffer {
                 "P0 invariant violated: dow.extended_window_ms ({}) > max_wait_time_ms ({})",
                 cfg.dow.extended_window_ms, cfg.max_wait_time_ms
             );
+        }
+        if cfg.dow.enabled && cfg.dow.tick_interval_ms == 0 {
+            panic!("P0 invariant violated: dow.tick_interval_ms must be > 0 when DOW is enabled");
         }
 
         let capacity_hint = cfg.min_tx_count.saturating_mul(2).max(32);
@@ -3900,7 +3928,7 @@ impl GatekeeperBuffer {
         // Single-owner entry: maybe_fire_shadow_checkpoint serializes all
         // checkpoint firing through *_shadow_fired flags (timer + TX path).
         // ═══════════════════════════════════════════
-        self.maybe_fire_shadow_checkpoint(now_ms);
+        self.maybe_fire_shadow_checkpoint_from(now_ms, ShadowCheckpointSource::Tx);
 
         if self.deadline_elapsed(now_ms) {
             GatekeeperIngressOutcome::DeadlineElapsed
@@ -5592,6 +5620,66 @@ impl GatekeeperBuffer {
     ///   - Phase 1 met but not enough phases → **Reject**
     ///   - Phase 1 never met → **Timeout**
     ///
+    fn is_stage_finalized(&self, stage: ObservationStage) -> bool {
+        match stage {
+            ObservationStage::Early => self.early_shadow_fired,
+            ObservationStage::Normal => self.normal_shadow_fired,
+            ObservationStage::Extended => self.extended_shadow_fired,
+        }
+    }
+
+    fn mark_stage_finalized(&mut self, stage: ObservationStage) {
+        match stage {
+            ObservationStage::Early => self.early_shadow_fired = true,
+            ObservationStage::Normal => self.normal_shadow_fired = true,
+            ObservationStage::Extended => self.extended_shadow_fired = true,
+        }
+    }
+
+    fn upsert_shadow_decision(&mut self, shadow: ShadowV25Decision) {
+        if let Some(existing) = self
+            .v25_shadow_decisions
+            .iter_mut()
+            .find(|decision| decision.window == shadow.window)
+        {
+            *existing = shadow;
+        } else {
+            self.v25_shadow_decisions.push(shadow);
+        }
+    }
+
+    fn stage_has_provisional_insufficient_data(&self, stage: ObservationStage) -> bool {
+        self.v25_shadow_decisions.iter().any(|decision| {
+            decision.window == stage && decision.kind == ShadowDecisionKind::InsufficientData
+        })
+    }
+
+    fn finalize_stage_if_provisional(
+        &mut self,
+        stage: ObservationStage,
+    ) -> ShadowCheckpointOutcome {
+        if self.is_stage_finalized(stage) {
+            return ShadowCheckpointOutcome::Skipped;
+        }
+        if self.stage_has_provisional_insufficient_data(stage) {
+            self.mark_stage_finalized(stage);
+            return ShadowCheckpointOutcome::Finalized;
+        }
+        ShadowCheckpointOutcome::Skipped
+    }
+
+    fn record_timer_checkpoint_if_final(
+        &self,
+        source: ShadowCheckpointSource,
+        stage: ObservationStage,
+        outcome: ShadowCheckpointOutcome,
+    ) {
+        if source == ShadowCheckpointSource::Timer && outcome == ShadowCheckpointOutcome::Finalized
+        {
+            crate::oracle_metrics::record_dow_timer_fired(stage.as_str());
+        }
+    }
+
     /// Attempt a shadow evaluation at the given observation stage.
     ///
     /// Runs the full assessment + three-layer decision pipeline on the current
@@ -5599,11 +5687,16 @@ impl GatekeeperBuffer {
     /// verdict, buffer state, or any tracking fields (except `phase1_passed`
     /// which is saved and restored).
     ///
-    /// Returns `true` if a shadow evaluation was produced, `false` if skipped
-    /// (feature-gated or insufficient data).
-    fn try_shadow_evaluate(&mut self, watch_now_wall_ms: u64, stage: ObservationStage) -> bool {
+    /// Returns whether the checkpoint was skipped, updated a provisional
+    /// insufficient-data record, or finalized the stage.
+    fn try_shadow_evaluate(
+        &mut self,
+        watch_now_wall_ms: u64,
+        stage: ObservationStage,
+        source: ShadowCheckpointSource,
+    ) -> ShadowCheckpointOutcome {
         if !self.config.v25.shadow_enabled || !self.config.dow.enabled {
-            return false;
+            return ShadowCheckpointOutcome::Skipped;
         }
 
         let elapsed_ms = watch_now_wall_ms.saturating_sub(self.registered_wall_ts_ms);
@@ -5622,15 +5715,16 @@ impl GatekeeperBuffer {
                 confidence: 0.0,
                 phases_passed: 0,
                 reason: format!(
-                    "INSUFFICIENT_DATA: tx={}/{} buf={} elapsed_ms={}",
+                    "{}: tx={}/{} elapsed_ms={} buf={}",
+                    source.insufficient_reason_prefix(),
                     self.total_tx_count,
                     min_data_tx,
-                    self.buffered_txs.len(),
                     elapsed_ms,
+                    self.buffered_txs.len(),
                 ),
             };
-            self.v25_shadow_decisions.push(shadow);
-            return true;
+            self.upsert_shadow_decision(shadow);
+            return ShadowCheckpointOutcome::ProvisionalInsufficientData;
         }
 
         // ── Phase 1 guard ──
@@ -5646,17 +5740,19 @@ impl GatekeeperBuffer {
                 confidence: 0.0,
                 phases_passed: 0,
                 reason: format!(
-                    "INSUFFICIENT_DATA: phase1 tx={}/{} sig={}/{} buy={}/{}",
+                    "{}: tx={}/{} elapsed_ms={} phase1_sig={}/{} buy={}/{}",
+                    source.insufficient_reason_prefix(),
                     self.total_tx_count,
                     self.config.min_tx_count,
+                    elapsed_ms,
                     self.unique_signers.len(),
                     self.config.min_unique_signers,
                     self.buy_count,
                     self.config.min_buy_count,
                 ),
             };
-            self.v25_shadow_decisions.push(shadow);
-            return true;
+            self.upsert_shadow_decision(shadow);
+            return ShadowCheckpointOutcome::ProvisionalInsufficientData;
         }
 
         // ── Save/restore phase1_passed ──
@@ -5779,8 +5875,8 @@ impl GatekeeperBuffer {
                         pdd.flash_crash_risk
                     ),
                 };
-                self.v25_shadow_decisions.push(shadow);
-                return true;
+                self.upsert_shadow_decision(shadow);
+                return ShadowCheckpointOutcome::Finalized;
             }
             if stage != ObservationStage::Extended {
                 // Soft penalty: reduce legacy Early/Normal confidence proportionally to pdd_score.
@@ -6006,16 +6102,25 @@ impl GatekeeperBuffer {
             phases_passed,
             reason,
         };
-        self.v25_shadow_decisions.push(shadow);
-        true
+        self.upsert_shadow_decision(shadow);
+        ShadowCheckpointOutcome::Finalized
     }
 
-    /// Unified checkpoint entry point called by both the DOW timer and TX ingestion path.
+    /// Unified checkpoint entry point called by the DOW timer.
+    pub fn maybe_fire_shadow_checkpoint(&mut self, now_wall_ms: u64) -> bool {
+        self.maybe_fire_shadow_checkpoint_from(now_wall_ms, ShadowCheckpointSource::Timer)
+    }
+
+    /// Unified checkpoint entry point called by the DOW timer, TX ingestion path,
+    /// and deadline fallback.
     ///
     /// Fires shadow evaluations for Early/Normal/Extended stages when their respective
-    /// time windows are open and the stage hasn't been fired yet. The `*_shadow_fired`
-    /// flags provide single-owner serialization — **exactly one** checkpoint per stage,
-    /// including `InsufficientData`. There are no duplicate checkpoints.
+    /// time windows are open. `InsufficientData` while the window is still open is
+    /// recorded as a provisional per-stage shadow record and does not set the
+    /// `*_shadow_fired` finalization flags. If data arrives before the window closes,
+    /// a real typed verdict replaces the provisional record and finalizes the stage.
+    /// If the window closes without enough data, the last insufficient-data record is
+    /// finalized as that stage's single checkpoint.
     ///
     /// Window semantics (plan §3.2: 2–5s / 5–7s / 7–10s):
     /// - Early:    [early_entry_min_ms,     early_entry_max_ms]     = [2s, 5s]
@@ -6023,8 +6128,12 @@ impl GatekeeperBuffer {
     /// - Extended: [normal_window_ms,       extended_window_ms]     = [7s, 10s]
     ///
     /// Invariant enforced at config load: extended_window_ms <= max_wait_time_ms.
-    /// Returns `true` if at least one checkpoint was fired.
-    pub fn maybe_fire_shadow_checkpoint(&mut self, now_wall_ms: u64) -> bool {
+    /// Returns `true` if a stage was updated or finalized.
+    pub fn maybe_fire_shadow_checkpoint_from(
+        &mut self,
+        now_wall_ms: u64,
+        source: ShadowCheckpointSource,
+    ) -> bool {
         if self.config.dow.enabled
             && self.config.dow.extended_window_ms > self.config.max_wait_time_ms
         {
@@ -6032,6 +6141,9 @@ impl GatekeeperBuffer {
                 "P0 invariant violated: dow.extended_window_ms ({}) > max_wait_time_ms ({})",
                 self.config.dow.extended_window_ms, self.config.max_wait_time_ms
             );
+        }
+        if self.config.dow.enabled && self.config.dow.tick_interval_ms == 0 {
+            panic!("P0 invariant violated: dow.tick_interval_ms must be > 0 when DOW is enabled");
         }
         if !self.config.v25.shadow_enabled || !self.config.dow.enabled {
             return false;
@@ -6046,17 +6158,40 @@ impl GatekeeperBuffer {
         let elapsed = now_wall_ms.saturating_sub(self.registered_wall_ts_ms);
         let mut fired = false;
 
+        if self.config.dow.early_entry_enabled
+            && !self.early_shadow_fired
+            && elapsed > self.config.dow.early_entry_max_ms
+        {
+            let outcome = self.finalize_stage_if_provisional(ObservationStage::Early);
+            self.record_timer_checkpoint_if_final(source, ObservationStage::Early, outcome);
+            fired |= outcome != ShadowCheckpointOutcome::Skipped;
+        }
+
+        if !self.normal_shadow_fired && elapsed >= self.config.dow.normal_window_ms {
+            let outcome = self.finalize_stage_if_provisional(ObservationStage::Normal);
+            self.record_timer_checkpoint_if_final(source, ObservationStage::Normal, outcome);
+            fired |= outcome != ShadowCheckpointOutcome::Skipped;
+        }
+
+        if !self.extended_shadow_fired && elapsed > self.config.dow.extended_window_ms {
+            let outcome = self.finalize_stage_if_provisional(ObservationStage::Extended);
+            self.record_timer_checkpoint_if_final(source, ObservationStage::Extended, outcome);
+            fired |= outcome != ShadowCheckpointOutcome::Skipped;
+        }
+
         // Early: [2s, 5s]
         if self.config.dow.early_entry_enabled
             && !self.early_shadow_fired
             && elapsed >= self.config.dow.early_entry_min_ms
             && elapsed <= self.config.dow.early_entry_max_ms
         {
-            self.early_shadow_fired = true;
             self.window_stage = ObservationStage::Early;
-            self.try_shadow_evaluate(now_wall_ms, ObservationStage::Early);
-            crate::oracle_metrics::record_dow_timer_fired("Early");
-            fired = true;
+            let outcome = self.try_shadow_evaluate(now_wall_ms, ObservationStage::Early, source);
+            if outcome == ShadowCheckpointOutcome::Finalized {
+                self.mark_stage_finalized(ObservationStage::Early);
+            }
+            self.record_timer_checkpoint_if_final(source, ObservationStage::Early, outcome);
+            fired |= outcome != ShadowCheckpointOutcome::Skipped;
         }
 
         // Normal: (5s, 7s) — after Early ends, before Extended begins.
@@ -6064,11 +6199,13 @@ impl GatekeeperBuffer {
             && elapsed > self.config.dow.early_entry_max_ms
             && elapsed < self.config.dow.normal_window_ms
         {
-            self.normal_shadow_fired = true;
             self.window_stage = ObservationStage::Normal;
-            self.try_shadow_evaluate(now_wall_ms, ObservationStage::Normal);
-            crate::oracle_metrics::record_dow_timer_fired("Normal");
-            fired = true;
+            let outcome = self.try_shadow_evaluate(now_wall_ms, ObservationStage::Normal, source);
+            if outcome == ShadowCheckpointOutcome::Finalized {
+                self.mark_stage_finalized(ObservationStage::Normal);
+            }
+            self.record_timer_checkpoint_if_final(source, ObservationStage::Normal, outcome);
+            fired |= outcome != ShadowCheckpointOutcome::Skipped;
         }
 
         // Extended: [7s, 10s] — bounded by extended_window_ms (= max deadline).
@@ -6076,11 +6213,13 @@ impl GatekeeperBuffer {
             && elapsed >= self.config.dow.normal_window_ms
             && elapsed <= self.config.dow.extended_window_ms
         {
-            self.extended_shadow_fired = true;
             self.window_stage = ObservationStage::Extended;
-            self.try_shadow_evaluate(now_wall_ms, ObservationStage::Extended);
-            crate::oracle_metrics::record_dow_timer_fired("Extended");
-            fired = true;
+            let outcome = self.try_shadow_evaluate(now_wall_ms, ObservationStage::Extended, source);
+            if outcome == ShadowCheckpointOutcome::Finalized {
+                self.mark_stage_finalized(ObservationStage::Extended);
+            }
+            self.record_timer_checkpoint_if_final(source, ObservationStage::Extended, outcome);
+            fired |= outcome != ShadowCheckpointOutcome::Skipped;
         }
 
         fired
@@ -6411,7 +6550,7 @@ impl GatekeeperBuffer {
         // Single-owner entry: maybe_fire_shadow_checkpoint serializes all
         // checkpoint firing through *_shadow_fired flags (timer + TX path).
         // ═══════════════════════════════════════════
-        self.maybe_fire_shadow_checkpoint(now_ms);
+        self.maybe_fire_shadow_checkpoint_from(now_ms, ShadowCheckpointSource::Tx);
 
         // ═══════════════════════════════════════════
         // DEADLINE CHECK (single final evaluation)
@@ -6666,6 +6805,26 @@ impl GatekeeperBuffer {
         }
 
         // ─── Deadline reached ───────────────────────
+        // Finalize any still-provisional DOW checkpoints and produce the
+        // Extended fallback only if the timer/TX path did not already finalize it.
+        if self.config.v25.shadow_enabled && self.config.dow.enabled {
+            self.maybe_fire_shadow_checkpoint_from(
+                now_ms,
+                ShadowCheckpointSource::DeadlineFallback,
+            );
+            if !self.extended_shadow_fired {
+                self.window_stage = ObservationStage::Extended;
+                let outcome = self.try_shadow_evaluate(
+                    now_ms,
+                    ObservationStage::Extended,
+                    ShadowCheckpointSource::DeadlineFallback,
+                );
+                if outcome != ShadowCheckpointOutcome::Skipped {
+                    self.mark_stage_finalized(ObservationStage::Extended);
+                }
+            }
+        }
+
         // Phase 1 check (quantity gate)
         let has_enough_tx = self.total_tx_count >= self.config.min_tx_count;
         let has_enough_signers = self.unique_signers.len() >= self.config.min_unique_signers;
@@ -6673,7 +6832,8 @@ impl GatekeeperBuffer {
 
         if !(has_enough_tx && has_enough_signers && has_enough_buys) {
             // Phase 1 never met → Timeout
-            let assessment = self.build_minimal_assessment();
+            let mut assessment = self.build_minimal_assessment();
+            assessment.v25_shadow_decisions = self.v25_shadow_decisions.clone();
             self.rejected = true;
             let breakdown = Self::format_phase_breakdown(&assessment);
             tracing::info!(
@@ -12376,8 +12536,12 @@ mod tests {
 
         // With zero TX, early shadow should fire InsufficientData
         let wall_now = 1000 + 3000; // elapsed = 3000ms (within early window 2-5s)
-        let result = buf.try_shadow_evaluate(wall_now, ObservationStage::Early);
-        assert!(result);
+        let result = buf.try_shadow_evaluate(
+            wall_now,
+            ObservationStage::Early,
+            ShadowCheckpointSource::Timer,
+        );
+        assert_eq!(result, ShadowCheckpointOutcome::ProvisionalInsufficientData);
         assert_eq!(buf.v25_shadow_decisions.len(), 1);
         assert_eq!(
             buf.v25_shadow_decisions[0].kind.verdict_str(),
@@ -12398,7 +12562,11 @@ mod tests {
         // Actually we need buffered_txs non-empty
         // For this test we just verify InsufficientData since no buffered TXs
         let wall_now = 1000 + 4000;
-        buf.try_shadow_evaluate(wall_now, ObservationStage::Early);
+        buf.try_shadow_evaluate(
+            wall_now,
+            ObservationStage::Early,
+            ShadowCheckpointSource::Timer,
+        );
         assert!(!buf.v25_shadow_decisions.is_empty());
         // With empty buffered_txs, still InsufficientData
         assert_eq!(
@@ -12414,19 +12582,31 @@ mod tests {
 
         // First call at early window
         let wall_1 = 1000 + 3000;
-        buf.try_shadow_evaluate(wall_1, ObservationStage::Early);
+        buf.try_shadow_evaluate(
+            wall_1,
+            ObservationStage::Early,
+            ShadowCheckpointSource::Timer,
+        );
         assert_eq!(buf.v25_shadow_decisions.len(), 1);
 
-        // Second call at same window — still records (guard is in on_transaction_long, not here)
+        // Second insufficient-data call updates the same provisional record.
         let wall_2 = 1000 + 4000;
-        buf.try_shadow_evaluate(wall_2, ObservationStage::Early);
-        assert_eq!(buf.v25_shadow_decisions.len(), 2);
+        buf.try_shadow_evaluate(
+            wall_2,
+            ObservationStage::Early,
+            ShadowCheckpointSource::Timer,
+        );
+        assert_eq!(buf.v25_shadow_decisions.len(), 1);
 
         // Normal window
         let wall_3 = 1000 + 8000;
-        buf.try_shadow_evaluate(wall_3, ObservationStage::Normal);
-        assert_eq!(buf.v25_shadow_decisions.len(), 3);
-        assert_eq!(buf.v25_shadow_decisions[2].window, ObservationStage::Normal);
+        buf.try_shadow_evaluate(
+            wall_3,
+            ObservationStage::Normal,
+            ShadowCheckpointSource::Timer,
+        );
+        assert_eq!(buf.v25_shadow_decisions.len(), 2);
+        assert_eq!(buf.v25_shadow_decisions[1].window, ObservationStage::Normal);
     }
 
     #[test]

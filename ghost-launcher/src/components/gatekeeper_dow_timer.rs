@@ -26,6 +26,10 @@ use tokio::time::{Interval, MissedTickBehavior};
 /// The first tick is skipped (0ms burst avoidance) by the caller
 /// via `interval.tick().await` before entering the select loop.
 pub fn dow_timer_interval(tick_interval_ms: u64) -> Interval {
+    assert!(
+        tick_interval_ms > 0,
+        "P0 invariant violated: dow.tick_interval_ms must be > 0 when creating DOW timer interval"
+    );
     let mut interval = tokio::time::interval(Duration::from_millis(tick_interval_ms));
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     interval
@@ -62,5 +66,11 @@ tick_interval_ms = 100
         assert_eq!(dow.tick_interval_ms, 100);
         // Unchanged fields use defaults
         assert_eq!(dow.normal_window_ms, 7000);
+    }
+
+    #[test]
+    #[should_panic(expected = "dow.tick_interval_ms must be > 0")]
+    fn test_dow_timer_interval_rejects_zero_tick() {
+        let _ = dow_timer_interval(0);
     }
 }

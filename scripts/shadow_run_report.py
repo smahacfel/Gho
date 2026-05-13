@@ -443,6 +443,47 @@ def scan_buy_log(
     return candidate_ids, count, bad
 
 
+def decision_candidate_id(row: dict[str, Any]) -> str | None:
+    for key in ("execution_candidate_id", "candidate_id", "ab_record_id", "pool_id"):
+        value = row.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def scan_decision_log_dispatch_candidates(
+    path: Path, session_start_ms: int | None, session_end_ms: int | None
+) -> tuple[list[str], int, int]:
+    candidate_ids: list[str] = []
+    count = 0
+    bad = 0
+    if not path.exists():
+        return candidate_ids, count, bad
+    with path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                bad += 1
+                continue
+            if not isinstance(row, dict):
+                bad += 1
+                continue
+            candidate_id = decision_candidate_id(row)
+            candidate_ts = extract_candidate_ts_ms(candidate_id)
+            if session_start_ms is not None and candidate_ts is not None and candidate_ts < session_start_ms:
+                continue
+            if session_end_ms is not None and candidate_ts is not None and candidate_ts > session_end_ms:
+                continue
+            count += 1
+            if row.get("decision_verdict_buy") is True and candidate_id:
+                candidate_ids.append(candidate_id)
+    return candidate_ids, count, bad
+
+
 def scan_shadow_log(
     path: Path, session_start_ms: int | None, session_end_ms: int | None
 ) -> tuple[list[str], set[str], int, int, int]:
@@ -829,7 +870,9 @@ def duplicate_count(values: list[str]) -> int:
 
 
 def build_report(inputs: Inputs) -> dict[str, Any]:
-    decision_rows, decision_bad = count_jsonl_rows(inputs.decisions_log)
+    decision_dispatch_candidate_ids, decision_rows, decision_bad = scan_decision_log_dispatch_candidates(
+        inputs.decisions_log, inputs.session_start_ms, inputs.session_end_ms
+    )
     decision_candidate_ids, buy_rows, buy_bad = scan_buy_log(
         inputs.buys_log, inputs.session_start_ms, inputs.session_end_ms
     )
@@ -877,6 +920,7 @@ def build_report(inputs: Inputs) -> dict[str, Any]:
         if row["opened"] > 0 and row["closed"] > 0
     }
     runtime_inflight_ids = sorted(runtime_admitted_ids - runtime_completed_ids)
+    expected_dispatch_candidate_ids = set(decision_candidate_ids) | set(decision_dispatch_candidate_ids)
     dispatched_candidate_ids = set(shadow_candidate_ids)
     lifecycle_dispatch_ids = {
         candidate_id
@@ -892,7 +936,7 @@ def build_report(inputs: Inputs) -> dict[str, Any]:
     dispatch_without_terminal_lifecycle = sorted(
         dispatched_candidate_ids - lifecycle_terminal_dispatch_ids
     )
-    no_dispatch_decision_ids = sorted(set(decision_candidate_ids) - dispatched_candidate_ids)
+    no_dispatch_decision_ids = sorted(expected_dispatch_candidate_ids - dispatched_candidate_ids)
     economics_candidates = lifecycle_candidates if inputs.runtime_lane == "shadow" else runtime_candidates
     runtime_closed_rows = [row for row in economics_candidates.values() if row["closed"] > 0]
 
@@ -911,7 +955,7 @@ def build_report(inputs: Inputs) -> dict[str, Any]:
         for row in runtime_closed_rows
         if isinstance(row.get("estimated_costs_sol"), (int, float))
     )
-    missing_shadow_for_decisions = sorted(set(decision_candidate_ids) - set(shadow_candidate_ids))
+    missing_shadow_for_decisions = sorted(expected_dispatch_candidate_ids - set(shadow_candidate_ids))
     missing_runtime_for_shadow = sorted(shadow_success_ids - runtime_event_ids)
     eventbus_lag_total = metrics.get("eventbus_lag_total", 0.0)
     provider_stall_total = metrics.get("provider_stall_total", 0.0)
@@ -922,13 +966,15 @@ def build_report(inputs: Inputs) -> dict[str, Any]:
     safety_markers = log_indicators["safety"]
     safety_rejections_total = metrics.get("trigger_buy_safety_rejections_total", 0.0)
 
+    dispatch_artifacts_required = bool(expected_dispatch_candidate_ids or dispatched_candidate_ids)
+    lifecycle_artifact_required = inputs.runtime_lane == "shadow" and bool(dispatched_candidate_ids)
     artifacts_gate = GateResult(
         passed=all(
             [
-                inputs.buys_log.exists(),
                 inputs.decisions_log.exists(),
-                inputs.shadow_log.exists(),
-                inputs.shadow_lifecycle_log.exists() if inputs.runtime_lane == "shadow" else True,
+                inputs.buys_log.exists() or not dispatch_artifacts_required,
+                inputs.shadow_log.exists() or not dispatch_artifacts_required,
+                inputs.shadow_lifecycle_log.exists() or not lifecycle_artifact_required,
                 inputs.events_dir.exists(),
                 inputs.system_log.exists(),
                 metrics_present,
@@ -938,6 +984,8 @@ def build_report(inputs: Inputs) -> dict[str, Any]:
             f"buys_log={inputs.buys_log.exists()} decisions_log={inputs.decisions_log.exists()} "
             f"shadow_log={inputs.shadow_log.exists()} "
             f"shadow_lifecycle_log={inputs.shadow_lifecycle_log.exists()} "
+            f"dispatch_artifacts_required={dispatch_artifacts_required} "
+            f"lifecycle_artifact_required={lifecycle_artifact_required} "
             f"events_dir={inputs.events_dir.exists()} system_log={inputs.system_log.exists()} "
             f"metrics={metrics_present}"
         ),
@@ -1008,18 +1056,27 @@ def build_report(inputs: Inputs) -> dict[str, Any]:
             f"log_markers={live_side_effect_markers or ['<none>']}"
         ),
     )
-    economics_gate = GateResult(
-        passed=bool(runtime_closed_rows)
-        and all(row.get("net_pnl_sol") is not None for row in runtime_closed_rows)
-        and total_net_pnl_sol >= effective_min_net_pnl_sol,
-        details=(
-            f"runtime_lane={inputs.runtime_lane} "
-            f"closed_positions={len(runtime_closed_rows)} total_net_pnl_sol={total_net_pnl_sol:.9f} "
-            f"total_costs_sol={total_estimated_costs_sol:.9f} "
-            f"min_net_pnl_sol={effective_min_net_pnl_sol:.9f} "
-            f"economics_floor_source={economics_floor_source}"
-        ),
-    )
+    if not dispatched_candidate_ids:
+        economics_gate = GateResult(
+            passed=True,
+            details=(
+                f"runtime_lane={inputs.runtime_lane} dispatched=0 "
+                "no_dispatch_no_economics_required"
+            ),
+        )
+    else:
+        economics_gate = GateResult(
+            passed=bool(runtime_closed_rows)
+            and all(row.get("net_pnl_sol") is not None for row in runtime_closed_rows)
+            and total_net_pnl_sol >= effective_min_net_pnl_sol,
+            details=(
+                f"runtime_lane={inputs.runtime_lane} "
+                f"closed_positions={len(runtime_closed_rows)} total_net_pnl_sol={total_net_pnl_sol:.9f} "
+                f"total_costs_sol={total_estimated_costs_sol:.9f} "
+                f"min_net_pnl_sol={effective_min_net_pnl_sol:.9f} "
+                f"economics_floor_source={economics_floor_source}"
+            ),
+        )
 
     gates = {
         "mandatory_artifacts": asdict(artifacts_gate),

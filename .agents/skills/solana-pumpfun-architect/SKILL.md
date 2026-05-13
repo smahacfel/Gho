@@ -1,6 +1,6 @@
 ---
 name: solana-pumpfun-architect
-description: "Low-latency Solana selective runtime engineering for event-driven pump.fun trading systems: deterministic execution orchestration, transaction lifecycle management, Yellowstone/Geyser ingestion, replay-safe runtime state handling, and production-grade selective sniper infrastructure."
+description: "Use when tasks involve low-latency Solana runtime architecture, Yellowstone/Geyser ingest pipelines, pump.fun selective sniper execution, transaction lifecycle management, replay-safe state orchestration, blockhash/retry/confirmation handling, or deterministic event-driven execution systems."
 allowed-tools: "Read, Edit, Grep, Bash"
 ---
 

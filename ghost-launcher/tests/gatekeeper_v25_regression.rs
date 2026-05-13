@@ -3,12 +3,13 @@ use ghost_core::EventSemanticEnvelope;
 use ghost_launcher::components::gatekeeper::{
     AlphaGateDiagnostics, GatekeeperAssessment, GatekeeperBuffer, GatekeeperDecision,
     GatekeeperVerdict, GatekeeperVerdictType, ObservationStage, ProsperityFilterDiagnostics,
-    ShadowDecisionKind, SoftSignals, SybilPolicyDiagnostics,
+    ShadowCheckpointSource, ShadowDecisionKind, SoftSignals, SybilPolicyDiagnostics,
 };
 use ghost_launcher::components::gatekeeper_pdd::evaluate_pdd;
 use ghost_launcher::events::PoolTransaction;
 use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
+use std::time::Duration;
 
 fn v25_enabled_config() -> GatekeeperV2Config {
     let mut cfg = GatekeeperV2Config::default();
@@ -126,6 +127,16 @@ fn final_assessment(verdict: GatekeeperVerdict) -> GatekeeperAssessment {
         | GatekeeperVerdict::Timeout { assessment } => assessment,
         _other => panic!("expected terminal verdict, got non-terminal variant"),
     }
+}
+
+fn stage_decision<'a>(
+    buf: &'a GatekeeperBuffer,
+    stage: ObservationStage,
+) -> &'a ghost_launcher::components::gatekeeper::ShadowV25Decision {
+    buf.v25_shadow_decisions()
+        .iter()
+        .find(|decision| decision.window == stage)
+        .unwrap_or_else(|| panic!("expected {stage:?} shadow decision"))
 }
 
 // ───────────────────────────────────────────────────────────────────
@@ -556,13 +567,27 @@ fn p0_dow_timer_fires_all_three_stages_without_tx_pressure() {
 
     // t=6100ms (elapsed=5100): Normal (5-7s)
     let fired = buf.maybe_fire_shadow_checkpoint(1000 + 6100);
-    assert!(fired, "Normal checkpoint should fire at 6.1s (in 5-7s window)");
+    assert!(
+        fired,
+        "Normal checkpoint should fire at 6.1s (in 5-7s window)"
+    );
 
     // t=8000ms (elapsed=7000): Extended [7-10s]
     let fired = buf.maybe_fire_shadow_checkpoint(1000 + 8000);
-    assert!(fired, "Extended checkpoint should fire at 8s (in 7-10s window)");
+    assert!(
+        fired,
+        "Extended checkpoint should fire at 8s (in 7-10s window)"
+    );
 
-    // Verify each stage produced exactly one decision.
+    // t=11001ms (elapsed=10001): Extended window has closed; its provisional
+    // insufficient-data record is now final.
+    let fired = buf.maybe_fire_shadow_checkpoint(1000 + 11001);
+    assert!(
+        fired,
+        "Extended insufficient-data checkpoint should finalize after the window closes"
+    );
+
+    // Verify each stage produced exactly one final decision record.
     let early_count = buf
         .v25_shadow_decisions()
         .iter()
@@ -596,11 +621,150 @@ fn p0_dow_timer_fires_all_three_stages_without_tx_pressure() {
             d.window,
         );
         assert!(
-            d.reason.contains("INSUFFICIENT_DATA"),
-            "insufficient-data reason should explain the gap: {}",
+            d.reason.starts_with("TIMER_FIRED_INSUFFICIENT_DATA: tx=0/"),
+            "timer insufficient-data reason should preserve timer source: {}",
             d.reason
         );
     }
+}
+
+/// P0: programmatic configs must fail closed when DOW is enabled with a zero tick interval.
+#[test]
+#[should_panic(expected = "dow.tick_interval_ms must be > 0")]
+fn p0_dow_runtime_rejects_zero_tick_interval() {
+    let mut cfg = v25_enabled_config();
+    cfg.dow.enabled = true;
+    cfg.dow.tick_interval_ms = 0;
+
+    let _ = GatekeeperBuffer::new(Pubkey::new_unique(), &cfg);
+}
+
+/// P0: an empty Early timer tick is provisional; TXs arriving inside the
+/// same Early window replace it with one final typed verdict for the stage.
+#[tokio::test(start_paused = true)]
+async fn p0_dow_runtime_early_empty_tick_then_tx_finalizes_real_verdict() {
+    let mut cfg = v25_enabled_config();
+    cfg.max_wait_time_ms = 12_000;
+    cfg.dow.early_entry_enabled = true;
+    cfg.dow.early_entry_min_ms = 2_000;
+    cfg.dow.early_entry_max_ms = 5_000;
+    cfg.dow.normal_window_ms = 7_000;
+    cfg.dow.extended_window_ms = 10_000;
+    cfg.dow.tick_interval_ms = 250;
+    cfg.dow.early_entry_min_tx_count = 3;
+    cfg.min_tx_count = 3;
+    cfg.min_unique_signers = 3;
+    cfg.min_buy_count = 3;
+
+    let mut buf = GatekeeperBuffer::new(Pubkey::new_unique(), &cfg);
+    buf.set_registered_wall_t0(1_000);
+
+    let mut dow_tick = ghost_launcher::components::gatekeeper_dow_timer::dow_timer_interval(
+        cfg.dow.tick_interval_ms,
+    );
+    dow_tick.tick().await;
+    tokio::time::advance(Duration::from_millis(2_000)).await;
+    dow_tick.tick().await;
+
+    assert!(buf.maybe_fire_shadow_checkpoint_from(3_000, ShadowCheckpointSource::Timer));
+    let provisional = stage_decision(&buf, ObservationStage::Early);
+    assert_eq!(provisional.kind, ShadowDecisionKind::InsufficientData);
+    assert!(provisional
+        .reason
+        .starts_with("TIMER_FIRED_INSUFFICIENT_DATA: tx=0/3 elapsed_ms=2000"));
+
+    ingest(&mut buf, tx("early_runtime_signer_0", 5_400, true, 0.5));
+    let tx_provisional = stage_decision(&buf, ObservationStage::Early);
+    assert!(tx_provisional
+        .reason
+        .starts_with("TX_FIRED_INSUFFICIENT_DATA: tx=1/3 elapsed_ms=4400"));
+    assert!(!tx_provisional
+        .reason
+        .starts_with("TIMER_FIRED_INSUFFICIENT_DATA"));
+
+    for i in 1..3 {
+        ingest(
+            &mut buf,
+            tx(
+                &format!("early_runtime_signer_{i}"),
+                5_400 + i as u64 * 50,
+                true,
+                0.5,
+            ),
+        );
+    }
+
+    let early = stage_decision(&buf, ObservationStage::Early);
+    assert_ne!(early.kind, ShadowDecisionKind::InsufficientData);
+    assert!(!early.reason.contains("TIMER_FIRED_INSUFFICIENT_DATA"));
+    assert_eq!(
+        buf.v25_shadow_decisions()
+            .iter()
+            .filter(|decision| decision.window == ObservationStage::Early)
+            .count(),
+        1,
+        "Early must have one final record, not provisional plus final duplicate"
+    );
+}
+
+/// P0: Normal has the same provisional semantics as Early.
+#[tokio::test(start_paused = true)]
+async fn p0_dow_runtime_normal_empty_tick_then_tx_finalizes_real_verdict() {
+    let mut cfg = v25_enabled_config();
+    cfg.max_wait_time_ms = 12_000;
+    cfg.dow.early_entry_enabled = true;
+    cfg.dow.early_entry_min_ms = 2_000;
+    cfg.dow.early_entry_max_ms = 5_000;
+    cfg.dow.normal_window_ms = 7_000;
+    cfg.dow.extended_window_ms = 10_000;
+    cfg.dow.tick_interval_ms = 250;
+    cfg.min_tx_count = 3;
+    cfg.min_unique_signers = 3;
+    cfg.min_buy_count = 3;
+
+    let mut buf = GatekeeperBuffer::new(Pubkey::new_unique(), &cfg);
+    buf.set_registered_wall_t0(1_000);
+
+    let mut dow_tick = ghost_launcher::components::gatekeeper_dow_timer::dow_timer_interval(
+        cfg.dow.tick_interval_ms,
+    );
+    dow_tick.tick().await;
+    tokio::time::advance(Duration::from_millis(5_100)).await;
+    dow_tick.tick().await;
+
+    assert!(buf.maybe_fire_shadow_checkpoint_from(6_100, ShadowCheckpointSource::Timer));
+    let normal_provisional = stage_decision(&buf, ObservationStage::Normal);
+    assert_eq!(
+        normal_provisional.kind,
+        ShadowDecisionKind::InsufficientData
+    );
+    assert!(normal_provisional
+        .reason
+        .starts_with("TIMER_FIRED_INSUFFICIENT_DATA: tx=0/3 elapsed_ms=5100"));
+
+    for i in 0..3 {
+        ingest(
+            &mut buf,
+            tx(
+                &format!("normal_runtime_signer_{i}"),
+                7_450 + i as u64 * 50,
+                true,
+                0.5,
+            ),
+        );
+    }
+
+    let normal = stage_decision(&buf, ObservationStage::Normal);
+    assert_ne!(normal.kind, ShadowDecisionKind::InsufficientData);
+    assert!(!normal.reason.contains("TIMER_FIRED_INSUFFICIENT_DATA"));
+    assert_eq!(
+        buf.v25_shadow_decisions()
+            .iter()
+            .filter(|decision| decision.window == ObservationStage::Normal)
+            .count(),
+        1,
+        "Normal must have one final record, not provisional plus final duplicate"
+    );
 }
 
 /// P0: runtime configs with Extended after hard deadline fail fast.
@@ -649,7 +813,9 @@ fn p0_extended_stage_has_typed_verdict_not_unreachable() {
     let extended = buf
         .v25_shadow_decisions()
         .iter()
-        .filter(|d| d.window == ObservationStage::Extended && d.kind != ShadowDecisionKind::InsufficientData)
+        .filter(|d| {
+            d.window == ObservationStage::Extended && d.kind != ShadowDecisionKind::InsufficientData
+        })
         .last()
         .expect("expected a meaningful Extended shadow decision (not InsufficientData)");
 
@@ -714,7 +880,9 @@ fn p0_extended_timer_and_deadline_fallback_confidence_match() {
     let timer_confidence = timer_buf
         .v25_shadow_decisions()
         .iter()
-        .filter(|d| d.window == ObservationStage::Extended && d.kind != ShadowDecisionKind::InsufficientData)
+        .filter(|d| {
+            d.window == ObservationStage::Extended && d.kind != ShadowDecisionKind::InsufficientData
+        })
         .last()
         .expect("timer path must emit Extended")
         .confidence;
@@ -726,7 +894,9 @@ fn p0_extended_timer_and_deadline_fallback_confidence_match() {
     let deadline_confidence = assessment
         .v25_shadow_decisions
         .iter()
-        .filter(|d| d.window == ObservationStage::Extended && d.kind != ShadowDecisionKind::InsufficientData)
+        .filter(|d| {
+            d.window == ObservationStage::Extended && d.kind != ShadowDecisionKind::InsufficientData
+        })
         .last()
         .expect("deadline fallback must emit Extended")
         .confidence;
@@ -795,8 +965,11 @@ fn p0_dow_checkpoint_owner_is_serialized_per_pool() {
     assert_eq!(extended_count, 1, "Extended fires exactly once");
     assert_eq!(buf.v25_shadow_decisions().len(), 3);
 
-    let real_any = buf.v25_shadow_decisions().iter()
-        .filter(|d| d.kind != ShadowDecisionKind::InsufficientData).count();
+    let real_any = buf
+        .v25_shadow_decisions()
+        .iter()
+        .filter(|d| d.kind != ShadowDecisionKind::InsufficientData)
+        .count();
     assert_eq!(real_any, 0, "no real decisions with 0 TX");
 }
 
@@ -853,19 +1026,27 @@ fn p0_dow_single_owner_with_sufficient_data() {
     let early_real = buf
         .v25_shadow_decisions()
         .iter()
-        .filter(|d| d.window == ObservationStage::Early && d.kind != ShadowDecisionKind::InsufficientData)
+        .filter(|d| {
+            d.window == ObservationStage::Early && d.kind != ShadowDecisionKind::InsufficientData
+        })
         .count();
     // Early has stricter criteria (confidence ≥0.85, 6/6 phases, drift <3%,
     // momentum >0.40). With synthetic test TXs these may not be met, so
     // Early's real decision count is ≤1. Each stage still fires exactly 1
     // TOTAL checkpoint (InsufficientData or real) per the single-owner invariant.
-    assert!(early_real <= 1, "Early real decisions must be ≤1, got {}", early_real);
+    assert!(
+        early_real <= 1,
+        "Early real decisions must be ≤1, got {}",
+        early_real
+    );
 
     // Normal: exactly 1 non-InsufficientData
     let normal_real = buf
         .v25_shadow_decisions()
         .iter()
-        .filter(|d| d.window == ObservationStage::Normal && d.kind != ShadowDecisionKind::InsufficientData)
+        .filter(|d| {
+            d.window == ObservationStage::Normal && d.kind != ShadowDecisionKind::InsufficientData
+        })
         .count();
     assert_eq!(normal_real, 1, "Normal must have exactly 1 real decision");
 
@@ -873,12 +1054,21 @@ fn p0_dow_single_owner_with_sufficient_data() {
     let extended_real = buf
         .v25_shadow_decisions()
         .iter()
-        .filter(|d| d.window == ObservationStage::Extended && d.kind != ShadowDecisionKind::InsufficientData)
+        .filter(|d| {
+            d.window == ObservationStage::Extended && d.kind != ShadowDecisionKind::InsufficientData
+        })
         .count();
-    assert_eq!(extended_real, 1, "Extended must have exactly 1 real decision");
+    assert_eq!(
+        extended_real, 1,
+        "Extended must have exactly 1 real decision"
+    );
 
     // No duplicate real decisions across any stage.
-    for stage in [ObservationStage::Early, ObservationStage::Normal, ObservationStage::Extended] {
+    for stage in [
+        ObservationStage::Early,
+        ObservationStage::Normal,
+        ObservationStage::Extended,
+    ] {
         let real_count = buf
             .v25_shadow_decisions()
             .iter()
@@ -953,7 +1143,10 @@ fn p1_path_b_marks_unavailable_instead_of_guessing_sequence_features() {
 
     let (tas_available, tas_reason) = assessment.tas_availability(&config);
     assert_eq!(tas_available, Some(false));
-    assert!(tas_reason.is_some(), "must provide explicit unavailable reason");
+    assert!(
+        tas_reason.is_some(),
+        "must provide explicit unavailable reason"
+    );
     let reason = tas_reason.unwrap();
     // P1 taxonomy: reason must be from the specific taxonomy, not generic.
     assert_eq!(reason, "missing_sequence");
@@ -968,7 +1161,10 @@ fn p1_path_b_marks_unavailable_instead_of_guessing_sequence_features() {
         buy_log.pdd_sequence_signals_unavailable_reason.is_some(),
         "pdd_sequence_signals_unavailable_reason must be logged when unavailable"
     );
-    let pdd_reason = buy_log.pdd_sequence_signals_unavailable_reason.as_ref().unwrap();
+    let pdd_reason = buy_log
+        .pdd_sequence_signals_unavailable_reason
+        .as_ref()
+        .unwrap();
     assert_eq!(pdd_reason, "missing_sequence");
 }
 
@@ -987,7 +1183,9 @@ fn p1_availability_reasons_are_specific() {
 
     let mut insufficient_duration = ghost_core::checkpoint::MaterializedFeatureSet::default();
     insufficient_duration.tx_intel_features.tx_count = 12;
-    insufficient_duration.session_metadata.observation_duration_ms = 1_000;
+    insufficient_duration
+        .session_metadata
+        .observation_duration_ms = 1_000;
     let assessment = build_assessment_from_features(
         insufficient_duration,
         &config,
@@ -998,21 +1196,30 @@ fn p1_availability_reasons_are_specific() {
         Some("insufficient_duration")
     );
     assert_eq!(
-        assessment.pdd_sequence_signals_availability(&config).1.as_deref(),
+        assessment
+            .pdd_sequence_signals_availability(&config)
+            .1
+            .as_deref(),
         Some("insufficient_duration")
     );
 
     let mut insufficient_tx = ghost_core::checkpoint::MaterializedFeatureSet::default();
     insufficient_tx.tx_intel_features.tx_count = 5;
     insufficient_tx.session_metadata.observation_duration_ms = 7_000;
-    let assessment =
-        build_assessment_from_features(insufficient_tx, &config, PolicyEvaluationContext::default());
+    let assessment = build_assessment_from_features(
+        insufficient_tx,
+        &config,
+        PolicyEvaluationContext::default(),
+    );
     assert_eq!(
         assessment.tas_availability(&config).1.as_deref(),
         Some("insufficient_tx_per_segment")
     );
     assert_eq!(
-        assessment.pdd_sequence_signals_availability(&config).1.as_deref(),
+        assessment
+            .pdd_sequence_signals_availability(&config)
+            .1
+            .as_deref(),
         Some("insufficient_tx_per_segment")
     );
 }
@@ -1086,9 +1293,18 @@ fn p1_path_a_and_path_b_compute_same_tas_when_segment_sequence_present() {
     // Path B TAS from segment_sequence: accelerating volume (2.0→2.5→3.5 SOL),
     // improving HHI (0.25→0.22→0.20), shortening intervals (400→350→300ms).
     // The weighted score must reflect a positive trajectory.
-    assert!(traj.overall_tas_score > 0.50, "accelerating trajectory must score >0.50");
-    assert!(traj.momentum_score > 0.0, "momentum must be positive (T2 > T0)");
-    assert!(traj.hhi_score > 0.0, "HHI must improve (declining concentration)");
+    assert!(
+        traj.overall_tas_score > 0.50,
+        "accelerating trajectory must score >0.50"
+    );
+    assert!(
+        traj.momentum_score > 0.0,
+        "momentum must be positive (T2 > T0)"
+    );
+    assert!(
+        traj.hhi_score > 0.0,
+        "HHI must improve (declining concentration)"
+    );
     assert_eq!(traj.t0_tx_count, 5);
     assert_eq!(traj.t1_tx_count, 5);
     assert_eq!(traj.t2_tx_count, 5);
@@ -1113,25 +1329,44 @@ fn p1_hard_parity_path_a_vs_path_b_same_tas_score() {
     // Build TXs that produce a clear 3-segment trajectory.
     // T0 (1000-2333ms): 4 small TXs
     for i in 0..4 {
-        let t = tx(&format!("t0_{}", i), 1200 + i as u64 * 300, true, 0.3 + i as f64 * 0.1);
+        let t = tx(
+            &format!("t0_{}", i),
+            1200 + i as u64 * 300,
+            true,
+            0.3 + i as f64 * 0.1,
+        );
         let _ = buf.ingest_transaction_tracking_only(std::sync::Arc::new(t));
     }
     // T1 (2333-3666ms): 4 medium TXs
     for i in 0..4 {
-        let t = tx(&format!("t1_{}", i), 2500 + i as u64 * 280, true, 0.5 + i as f64 * 0.15);
+        let t = tx(
+            &format!("t1_{}", i),
+            2500 + i as u64 * 280,
+            true,
+            0.5 + i as f64 * 0.15,
+        );
         let _ = buf.ingest_transaction_tracking_only(std::sync::Arc::new(t));
     }
     // T2 (3666-5000ms): 4 large TXs
     for i in 0..4 {
-        let t = tx(&format!("t2_{}", i), 3800 + i as u64 * 280, true, 0.8 + i as f64 * 0.2);
+        let t = tx(
+            &format!("t2_{}", i),
+            3800 + i as u64 * 280,
+            true,
+            0.8 + i as f64 * 0.2,
+        );
         let _ = buf.ingest_transaction_tracking_only(std::sync::Arc::new(t));
     }
 
     // Path A: buffer's native materialize_trajectory
-    let traj_a = buf.materialize_trajectory(&cfg.tas).expect("Path A trajectory");
+    let traj_a = buf
+        .materialize_trajectory(&cfg.tas)
+        .expect("Path A trajectory");
 
     // Path B: current_segment_sequence → reconstruct segments → score_trajectory
-    let seq = buf.current_segment_sequence(&cfg.tas).expect("segment sequence");
+    let seq = buf
+        .current_segment_sequence(&cfg.tas)
+        .expect("segment sequence");
     assert!(seq.min_tx_per_segment_satisfied);
 
     let t0 = ghost_launcher::components::gatekeeper_trajectory::TrajectorySegment {
@@ -1159,9 +1394,12 @@ fn p1_hard_parity_path_a_vs_path_b_same_tas_score() {
 
     // Hard parity: Path A and Path B must produce the same scores.
     let eps = 1e-6;
-    assert!((traj_a.overall_tas_score - traj_b.overall_tas_score).abs() < eps,
+    assert!(
+        (traj_a.overall_tas_score - traj_b.overall_tas_score).abs() < eps,
         "Path A TAS={:.6} Path B TAS={:.6} — must be identical",
-        traj_a.overall_tas_score, traj_b.overall_tas_score);
+        traj_a.overall_tas_score,
+        traj_b.overall_tas_score
+    );
     assert!((traj_a.momentum_score - traj_b.momentum_score).abs() < eps);
     assert!((traj_a.hhi_score - traj_b.hhi_score).abs() < eps);
     assert!((traj_a.volume_score - traj_b.volume_score).abs() < eps);
@@ -1208,7 +1446,10 @@ fn p2_aps_runs_in_path_b_when_enabled() {
     let assessment =
         build_assessment_from_features(features, &config, PolicyEvaluationContext::default());
 
-    assert!(assessment.aps_diagnostics.is_some(), "APS must run in Path B");
+    assert!(
+        assessment.aps_diagnostics.is_some(),
+        "APS must run in Path B"
+    );
     let aps = assessment.aps_diagnostics.unwrap();
     assert!(aps.enabled, "APS must be enabled");
     // Default regime_local_heuristic_enabled = false → regime always Normal
@@ -1250,7 +1491,9 @@ fn p2_aps_high_vol_signal_below_min_samples_stays_normal() {
     features.account_features.price_sol = 5.0;
     features.account_features.current_reserves = (50_000_000_000, 900_000_000);
     features.session_metadata.observation_duration_ms = 7_000;
-    features.checkpoint_features.price_change_from_first_checkpoint_pct = 400.0;
+    features
+        .checkpoint_features
+        .price_change_from_first_checkpoint_pct = 400.0;
     features.checkpoint_features.price_trajectory = vec![1.0, 3.0, 5.0];
     features.checkpoint_features.trajectory_checkpoint_count = 3;
     features.curve_readiness.curve_data_known = true;
@@ -1314,14 +1557,19 @@ fn p2_aps_drift_override_only_in_shadow_plane() {
     features.session_metadata.observation_duration_ms = 7_000;
 
     // Guaranteed HighVol trigger: price_change_ratio=5.0 (>3.0 threshold).
-    features.checkpoint_features.price_change_from_first_checkpoint_pct = 400.0;
+    features
+        .checkpoint_features
+        .price_change_from_first_checkpoint_pct = 400.0;
     features.checkpoint_features.price_trajectory = vec![1.0, 3.0, 5.0];
     features.checkpoint_features.trajectory_checkpoint_count = 3;
     features.curve_readiness.curve_data_known = true;
     features.curve_readiness.price_sample_count = 3;
 
-    let assessment =
-        build_assessment_from_features(features.clone(), &config, PolicyEvaluationContext::default());
+    let assessment = build_assessment_from_features(
+        features.clone(),
+        &config,
+        PolicyEvaluationContext::default(),
+    );
 
     assert!(assessment.aps_diagnostics.is_some());
     let aps = assessment.aps_diagnostics.as_ref().unwrap();
@@ -1397,7 +1645,9 @@ fn p3_legacy_drift_cap_blocks_extreme_pump() {
     // bonding_curve_from_features → price_change_from_first_checkpoint_pct.
     // With price_change_from_first_checkpoint_pct = 100.0% and initial/current
     // prices set, price_change_ratio will exceed 1.50.
-    features.checkpoint_features.price_change_from_first_checkpoint_pct = 150.0;
+    features
+        .checkpoint_features
+        .price_change_from_first_checkpoint_pct = 150.0;
     features.checkpoint_features.price_trajectory = vec![1.0, 1.5, 2.0];
     // Must have enough price_data_points for HF-4 to fire.
     features.checkpoint_features.trajectory_checkpoint_count = 3;
@@ -1472,7 +1722,9 @@ fn p4_every_verdict_emits_typed_reason_code() {
     features.account_features.market_cap_sol = 50.0;
     features.account_features.bonding_progress = 0.20;
     features.account_features.current_reserves = (50_000_000_000, 900_000_000);
-    features.checkpoint_features.price_change_from_first_checkpoint_pct = 150.0;
+    features
+        .checkpoint_features
+        .price_change_from_first_checkpoint_pct = 150.0;
     features.checkpoint_features.price_trajectory = vec![1.0, 2.0];
     features.checkpoint_features.trajectory_checkpoint_count = 2;
     features.checkpoint_features.single_tx_max_price_impact_pct = 10.0;
@@ -1484,7 +1736,10 @@ fn p4_every_verdict_emits_typed_reason_code() {
         build_assessment_from_features(features, &config, PolicyEvaluationContext::default());
     let buy_log = assessment.to_buy_log(&Pubkey::new_unique(), &config);
 
-    assert!(buy_log.reason_code.is_some(), "reason_code must be populated for HF-4 reject");
+    assert!(
+        buy_log.reason_code.is_some(),
+        "reason_code must be populated for HF-4 reject"
+    );
     assert_eq!(buy_log.reason_code_version, 2);
     let code_str = buy_log.reason_code.as_ref().unwrap();
     assert!(
@@ -1505,7 +1760,10 @@ fn p4_every_verdict_emits_typed_reason_code() {
         PolicyEvaluationContext::default(),
     );
     let empty_log = empty_assessment.to_buy_log(&Pubkey::new_unique(), &config);
-    assert!(empty_log.reason_code.is_some(), "even empty verdict must emit reason_code");
+    assert!(
+        empty_log.reason_code.is_some(),
+        "even empty verdict must emit reason_code"
+    );
     assert_eq!(empty_log.reason_code_version, 2);
 }
 
@@ -1615,11 +1873,16 @@ fn p4_timeout_builder_phase1_passed_uses_deadline_low_phases() {
         decision.verdict_type,
         GatekeeperVerdictType::TimeoutDeadlineLowPhases
     );
-    assert!(decision.reason_chain.starts_with("TIMEOUT_DEADLINE_LOW_PHASES:"));
+    assert!(decision
+        .reason_chain
+        .starts_with("TIMEOUT_DEADLINE_LOW_PHASES:"));
 
     assessment.decision = Some(decision);
     let log = assessment.to_buy_log(&Pubkey::new_unique(), &config);
-    assert_eq!(log.verdict_type.as_deref(), Some("TIMEOUT_DEADLINE_LOW_PHASES"));
+    assert_eq!(
+        log.verdict_type.as_deref(),
+        Some("TIMEOUT_DEADLINE_LOW_PHASES")
+    );
     assert_eq!(
         log.reason_code.as_deref(),
         Some("TIMEOUT_DEADLINE_LOW_PHASES")
@@ -1661,7 +1924,10 @@ fn p4_timeout_decision_reason_is_never_null() {
                 code
             );
             // verdict_type must be a specific TIMEOUT subtype, not generic.
-            let vtype = log.verdict_type.as_ref().expect("verdict_type must be populated");
+            let vtype = log
+                .verdict_type
+                .as_ref()
+                .expect("verdict_type must be populated");
             assert!(
                 vtype.contains("TIMEOUT_PHASE1_NO_DATA"),
                 "expected TIMEOUT_PHASE1_NO_DATA, got: {}",
@@ -1672,7 +1938,10 @@ fn p4_timeout_decision_reason_is_never_null() {
                 "decision_reason must explain timeout cause"
             );
         }
-        other => panic!("expected Timeout verdict, got {:?}", std::mem::discriminant(&other)),
+        other => panic!(
+            "expected Timeout verdict, got {:?}",
+            std::mem::discriminant(&other)
+        ),
     }
 
     // Add some TXs but not enough for Phase 1 → TimeoutPhase1Insufficient.
@@ -1692,16 +1961,25 @@ fn p4_timeout_decision_reason_is_never_null() {
         GatekeeperVerdict::Timeout { assessment } => {
             let log = assessment.to_buy_log(&Pubkey::new_unique(), &cfg);
             assert!(log.reason_code.is_some());
-            assert!(log.decision_reason.is_some(), "TIMEOUT with insufficient TX must have decision_reason");
+            assert!(
+                log.decision_reason.is_some(),
+                "TIMEOUT with insufficient TX must have decision_reason"
+            );
             assert_eq!(log.reason_code_version, 2);
-            let vtype = log.verdict_type.as_ref().expect("verdict_type must be populated");
+            let vtype = log
+                .verdict_type
+                .as_ref()
+                .expect("verdict_type must be populated");
             assert!(
                 vtype.contains("TIMEOUT_PHASE1_INSUFFICIENT"),
                 "expected TIMEOUT_PHASE1_INSUFFICIENT, got: {}",
                 vtype
             );
         }
-        other => panic!("expected Timeout verdict, got {:?}", std::mem::discriminant(&other)),
+        other => panic!(
+            "expected Timeout verdict, got {:?}",
+            std::mem::discriminant(&other)
+        ),
     }
 }
 
@@ -1729,7 +2007,10 @@ fn p4_timeout_deadline_low_phases_subtype() {
     match verdict {
         GatekeeperVerdict::Timeout { assessment } => {
             let log = assessment.to_buy_log(&Pubkey::new_unique(), &cfg);
-            assert!(log.decision_reason.is_some(), "Timeout must have decision_reason");
+            assert!(
+                log.decision_reason.is_some(),
+                "Timeout must have decision_reason"
+            );
             assert!(log.reason_code.is_some(), "Timeout must have reason_code");
             let vtype = log.verdict_type.as_ref().unwrap();
             assert!(
@@ -1761,7 +2042,10 @@ fn p5_shadow_payer_strategy_ephemeral_exists() {
     let configured = ShadowPayerStrategy::Configured;
     let ephemeral = ShadowPayerStrategy::Ephemeral;
     assert_ne!(configured, ephemeral);
-    assert_eq!(ShadowPayerStrategy::default(), ShadowPayerStrategy::Configured);
+    assert_eq!(
+        ShadowPayerStrategy::default(),
+        ShadowPayerStrategy::Configured
+    );
 }
 
 /// P5: Idempotency key generation is deterministic.
@@ -1838,7 +2122,12 @@ fn p1_sequence_materializes_for_pdd_when_tas_disabled() {
 
     // Feed enough TXs for segment division.
     for i in 0..12 {
-        let t = tx(&format!("s{}", i), 1200 + i as u64 * 300, true, 0.3 + i as f64 * 0.1);
+        let t = tx(
+            &format!("s{}", i),
+            1200 + i as u64 * 300,
+            true,
+            0.3 + i as f64 * 0.1,
+        );
         let _ = buf.ingest_transaction_tracking_only(std::sync::Arc::new(t));
     }
 

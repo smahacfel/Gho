@@ -8259,7 +8259,10 @@ async fn pool_observation_task(
                     let now_wall = current_time_ms();
                     session
                         .gatekeeper_buffer_mut()
-                        .maybe_fire_shadow_checkpoint(now_wall);
+                        .maybe_fire_shadow_checkpoint_from(
+                            now_wall,
+                            crate::components::gatekeeper::ShadowCheckpointSource::Timer,
+                        );
                 }
                 GatekeeperVerdict::Wait
             }
@@ -16553,7 +16556,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shadow_mode_writes_canonical_shadow_entry_record_after_accepted_direct_handoff() {
+    async fn p5_shadow_dispatch_lifecycle_writes_closed_with_idempotency_join_key_rollout_profile()
+    {
         let temp = tempfile::tempdir().unwrap();
         let output_path = temp.path().join("shadow-canonical-entry.jsonl");
         let lifecycle_path = temp.path().join("shadow_lifecycle.jsonl");
@@ -16726,13 +16730,13 @@ mod tests {
             format!("{pool_id}:{}:1000", pool.base_mint)
         );
         assert_eq!(lifecycle_row["rollout_profile"], "test-rollout");
-        assert!(
-            lifecycle_row["idempotency_key"]
-                .as_str()
-                .unwrap_or_default()
-                .len()
-                > 10
-        );
+        let expected_idempotency_key =
+            crate::components::trigger::shadow_run::make_shadow_idempotency_key(
+                &pool_id.to_string(),
+                &format!("{pool_id}:{}:1000", pool.base_mint),
+                "test-rollout",
+            );
+        assert_eq!(lifecycle_row["idempotency_key"], expected_idempotency_key);
         assert!(tracker.release(slot_id));
     }
 

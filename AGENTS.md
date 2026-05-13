@@ -600,7 +600,57 @@ Do not present stale assumptions as current truth.
 
 ---
 
-# 12. Final Principle
+# 12. Delegation Trace Requirement
+
+For every non-trivial task, the agent must leave an explicit delegation trace in the final response.
+
+The goal is not to force specialist usage.
+The goal is to make routing decisions auditable.
+
+The agent must report:
+- whether routing was performed,
+- which primary specialist was selected,
+- which supporting specialists were considered,
+- which specialist documents were loaded,
+- which specialist documents were intentionally not loaded and why,
+- whether fast path was used,
+- which repository contracts were checked.
+
+Specialist documents should only be loaded when the task is non-local, risky, ambiguous, or touches that specialist’s contract.
+Do not load specialist documents mechanically for trivial or clearly localized tasks.
+For fast-path tasks, the agent must still state why no specialist delegation was needed.
+
+## Required Delegation Trace Format
+
+For non-trivial tasks, include:
+
+delegation_trace:
+  task_classification: string
+  routing_performed: true
+  primary_specialist: string
+  supporting_specialists_considered: list
+  specialist_docs_loaded: list
+  specialist_docs_not_loaded:
+    - name: string
+    - reason: string
+  skills_used: list
+  fast_path_used: true | false
+  contracts_checked: list
+  unresolved_routing_uncertainty: list
+
+For fast-path tasks, include:
+
+delegation_trace:
+  task_classification: "localized"
+  routing_performed: true
+  primary_specialist: "none"
+  fast_path_used: true
+  reason: string
+  contracts_checked: list
+  
+---
+
+# 13. Final Principle
 
 This repository optimizes for selective decision integrity.
 

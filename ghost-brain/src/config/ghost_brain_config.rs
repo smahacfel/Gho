@@ -1708,6 +1708,24 @@ impl Default for GatekeeperV2Config {
     }
 }
 
+impl GatekeeperV2Config {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.dow.enabled && self.dow.extended_window_ms > self.max_wait_time_ms {
+            anyhow::bail!(
+                "P0 invariant violated: [gatekeeper_v2.dow].extended_window_ms ({}) > [gatekeeper_v2].max_wait_time_ms ({})",
+                self.dow.extended_window_ms,
+                self.max_wait_time_ms,
+            );
+        }
+        if self.dow.enabled && self.dow.tick_interval_ms == 0 {
+            anyhow::bail!(
+                "P0 invariant violated: [gatekeeper_v2.dow].tick_interval_ms must be > 0 when DOW is enabled"
+            );
+        }
+        Ok(())
+    }
+}
+
 /// IWIM (Initial Wallet Intent Mapping) Configuration
 ///
 /// Controls dev-wallet behavioral analysis parameters for detecting creator
@@ -4198,14 +4216,7 @@ impl GhostBrainConfig {
         };
 
         let config: GatekeeperV2Config = gatekeeper_v2.clone().try_into()?;
-        // P0 invariant: Extended window deadline must fit within the hard deadline.
-        if config.dow.enabled && config.dow.extended_window_ms > config.max_wait_time_ms {
-            anyhow::bail!(
-                "P0 invariant violated: [gatekeeper_v2.dow].extended_window_ms ({}) > [gatekeeper_v2].max_wait_time_ms ({})",
-                config.dow.extended_window_ms,
-                config.max_wait_time_ms,
-            );
-        }
+        config.validate()?;
         Ok(Some(config))
     }
 
@@ -4290,6 +4301,10 @@ impl GhostBrainConfig {
         }
         if self.iwim.confidence_threshold < 0.0 || self.iwim.confidence_threshold > 1.0 {
             anyhow::bail!("IWIM confidence_threshold must be in range [0.0, 1.0]");
+        }
+
+        if let Some(ref gatekeeper_v2) = self.gatekeeper_v2 {
+            gatekeeper_v2.validate()?;
         }
 
         // Validate QASS
@@ -5040,6 +5055,37 @@ extended_window_ms = 10000
 
         assert!(
             err.to_string().contains("P0 invariant violated"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn gatekeeper_v25_dow_rejects_zero_tick_interval() {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("ghost_gk2_zero_tick_{ts}.toml"));
+
+        let toml = r#"
+version = 10
+
+[gatekeeper_v2]
+max_wait_time_ms = 12000
+
+[gatekeeper_v2.dow]
+enabled = true
+extended_window_ms = 10000
+tick_interval_ms = 0
+"#;
+
+        std::fs::write(&path, toml).unwrap();
+        let err = GhostBrainConfig::gatekeeper_v2_from_toml_file(&path)
+            .expect_err("zero DOW tick interval must fail fast");
+        std::fs::remove_file(&path).ok();
+
+        assert!(
+            err.to_string().contains("tick_interval_ms must be > 0"),
             "unexpected error: {err}"
         );
     }

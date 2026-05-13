@@ -21,6 +21,10 @@ ghost_brain_config_path = "../../ghost-brain/ghost_brain_config.toml"
 # - Phase 6: market_cap_sol >= 60, bonding_pct >= 40
 # - Prosperity floor: market_cap_sol >= 45 before Balanced branch / overlay checks
 # - Alpha gate ON, prosperity ON, prosperity overlay OFF for this rerun
+# - APS rollout-local decision: this launcher overlay intentionally does not
+#   duplicate [gatekeeper_v2.aps]. The referenced ghost_brain_config.toml is the
+#   rollout-local source of truth and sets regime_local_heuristic_enabled = true,
+#   cross_pool_outcome_tracker_available = false, min_calibration_samples = 30.
 # - Exit strategy: TP ladder +12%→+20%→+35%→+50%, SL -12%, max 30min hold
 
 [seer]
