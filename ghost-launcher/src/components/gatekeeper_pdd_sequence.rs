@@ -10,7 +10,59 @@
 //! SSOT contract N14 (no synthetic backfill).
 
 use ghost_brain::config::gatekeeper_v25_config::PumpAndDumpDetectorConfig;
+use ghost_brain::config::GatekeeperV2Config;
 use ghost_core::checkpoint::TxSegmentSequence;
+
+pub const PDD_MISSING_SEQUENCE_REASON: &str = "missing_sequence";
+pub const PDD_INSUFFICIENT_DURATION_REASON: &str = "insufficient_duration";
+pub const PDD_INSUFFICIENT_TX_PER_SEGMENT_REASON: &str = "insufficient_tx_per_segment";
+pub const PDD_FLASH_CRASH_UNAVAILABLE_REASON: &str = "pdd_flash_crash_unavailable";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PddSequenceSignalKind {
+    Spike,
+    Ramping,
+    FlashCrash,
+}
+
+impl PddSequenceSignalKind {
+    pub const ALL: [Self; 3] = [Self::Spike, Self::Ramping, Self::FlashCrash];
+
+    pub fn is_enabled(self, config: &GatekeeperV2Config) -> bool {
+        match self {
+            Self::Spike => config.pdd.spike_detection_enabled,
+            Self::Ramping => config.pdd.ramping_detection_enabled,
+            Self::FlashCrash => config.pdd.flash_crash_protection_enabled,
+        }
+    }
+}
+
+pub fn any_sequence_signal_enabled(config: &GatekeeperV2Config) -> bool {
+    PddSequenceSignalKind::ALL
+        .into_iter()
+        .any(|signal| signal.is_enabled(config))
+}
+
+pub fn sequence_signal_availability(
+    signal: PddSequenceSignalKind,
+    seq: &TxSegmentSequence,
+    config: &GatekeeperV2Config,
+) -> (bool, Option<&'static str>) {
+    if !signal.is_enabled(config) {
+        return (true, None);
+    }
+    if seq.total_duration_ms < config.tas.tas_min_total_duration_ms {
+        return (false, Some(PDD_INSUFFICIENT_DURATION_REASON));
+    }
+    if !seq.min_tx_per_segment_satisfied {
+        return (false, Some(PDD_INSUFFICIENT_TX_PER_SEGMENT_REASON));
+    }
+
+    match signal {
+        PddSequenceSignalKind::Spike | PddSequenceSignalKind::Ramping => (true, None),
+        PddSequenceSignalKind::FlashCrash => (false, Some(PDD_FLASH_CRASH_UNAVAILABLE_REASON)),
+    }
+}
 
 /// Detect a volume spike by comparing T2 volume rate vs (T0+T1)/2 rate.
 ///
@@ -195,5 +247,42 @@ mod tests {
         let (detected, reason) = detect_flash_crash_from_segments(&seq, &pdd_config());
         assert!(!detected);
         assert_eq!(reason, None);
+    }
+
+    fn gatekeeper_config() -> GatekeeperV2Config {
+        let mut config = GatekeeperV2Config::default();
+        config.pdd.enabled = true;
+        config.pdd.spike_detection_enabled = true;
+        config.pdd.ramping_detection_enabled = true;
+        config.pdd.flash_crash_protection_enabled = true;
+        config.tas.tas_min_total_duration_ms = 2_000;
+        config.tas.tas_min_tx_per_segment = 2;
+        config
+    }
+
+    #[test]
+    fn test_sequence_signal_availability_marks_flash_as_honestly_unavailable() {
+        let seq = test_seq(1.0, 1.0, 1.0, 5, 5, 5, 0, 0, 100.0);
+        let (available, reason) = sequence_signal_availability(
+            PddSequenceSignalKind::FlashCrash,
+            &seq,
+            &gatekeeper_config(),
+        );
+        assert!(!available);
+        assert_eq!(reason, Some(PDD_FLASH_CRASH_UNAVAILABLE_REASON));
+    }
+
+    #[test]
+    fn test_sequence_signal_availability_prioritizes_duration_before_flash_gap() {
+        let mut seq = test_seq(1.0, 1.0, 1.0, 5, 5, 5, 0, 0, 100.0);
+        seq.total_duration_ms = 1_000;
+
+        let (available, reason) = sequence_signal_availability(
+            PddSequenceSignalKind::FlashCrash,
+            &seq,
+            &gatekeeper_config(),
+        );
+        assert!(!available);
+        assert_eq!(reason, Some(PDD_INSUFFICIENT_DURATION_REASON));
     }
 }

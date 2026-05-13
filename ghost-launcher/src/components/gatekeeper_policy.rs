@@ -6,6 +6,7 @@ use super::gatekeeper::{
     SybilSoftSignals, VelocityProfile, VolumeSanityProfile,
 };
 use super::gatekeeper_pdd::{PddDiagnostics, PddHardFail};
+use super::gatekeeper_pdd_sequence::{sequence_signal_availability, PddSequenceSignalKind};
 use ghost_brain::config::GatekeeperV2Config;
 use ghost_core::checkpoint::{MaterializedFeatureSet, SybilResistanceFeatures, TrendDirection};
 use ghost_core::tx_intelligence::types::{
@@ -569,21 +570,36 @@ pub fn build_assessment_from_features(
     // is available, supplement with spike, ramping, and flash crash signals.
     if let Some(ref seq) = assessment.feature_snapshot.tx_segment_sequence {
         if let Some(ref mut pdd) = assessment.pdd_assessment {
-            let (spike, spike_reason) =
+            let spike = if sequence_signal_availability(PddSequenceSignalKind::Spike, seq, config).0
+            {
                 crate::components::gatekeeper_pdd_sequence::detect_spike_from_segments(
                     seq,
                     &config.pdd,
-                );
-            let (ramping, ramping_reason) =
-                crate::components::gatekeeper_pdd_sequence::detect_ramping_from_segments(
-                    seq,
-                    &config.pdd,
-                );
-            let (flash, flash_reason) =
-                crate::components::gatekeeper_pdd_sequence::detect_flash_crash_from_segments(
-                    seq,
-                    &config.pdd,
-                );
+                )
+                .0
+            } else {
+                false
+            };
+            let ramping =
+                if sequence_signal_availability(PddSequenceSignalKind::Ramping, seq, config).0 {
+                    crate::components::gatekeeper_pdd_sequence::detect_ramping_from_segments(
+                        seq,
+                        &config.pdd,
+                    )
+                    .0
+                } else {
+                    false
+                };
+            let flash =
+                if sequence_signal_availability(PddSequenceSignalKind::FlashCrash, seq, config).0 {
+                    crate::components::gatekeeper_pdd_sequence::detect_flash_crash_from_segments(
+                        seq,
+                        &config.pdd,
+                    )
+                    .0
+                } else {
+                    false
+                };
 
             pdd.spike_detected = spike;
             pdd.ramping_detected = ramping;

@@ -268,6 +268,26 @@ fn open_session(
     bonding_curve: Pubkey,
     created_at_wall_ms: u64,
 ) -> ghost_launcher::session::SharedSession {
+    open_session_with_deadline_and_gatekeeper_config(
+        manager,
+        pool_id,
+        base_mint,
+        bonding_curve,
+        created_at_wall_ms,
+        created_at_wall_ms + 100,
+        GatekeeperV2Config::default(),
+    )
+}
+
+fn open_session_with_deadline_and_gatekeeper_config(
+    manager: &SessionManager,
+    pool_id: Pubkey,
+    base_mint: Pubkey,
+    bonding_curve: Pubkey,
+    created_at_wall_ms: u64,
+    deadline_wall_ms: u64,
+    gatekeeper_config: GatekeeperV2Config,
+) -> ghost_launcher::session::SharedSession {
     manager
         .open_session(OpenSessionRequest {
             pool_amm_id: pool_id,
@@ -276,8 +296,8 @@ fn open_session(
             dev_wallet: Some(Pubkey::new_unique()),
             candidate_snapshot: test_candidate(pool_id, base_mint, bonding_curve),
             created_at_wall_ms,
-            deadline_wall_ms: Some(created_at_wall_ms + 100),
-            gatekeeper_config: GatekeeperV2Config::default(),
+            deadline_wall_ms: Some(deadline_wall_ms),
+            gatekeeper_config,
             fingerprint_config: EarlyFingerprintConfig::default(),
         })
         .expect("session open should succeed");
@@ -1354,6 +1374,86 @@ fn session_materializes_curve_market_cap_without_account_updates() {
         features.account_features.market_cap_sol > 0.0,
         "expected positive curve-derived market cap, got {}",
         features.account_features.market_cap_sol
+    );
+}
+
+#[test]
+fn session_materializes_segment_sequence_and_path_b_keeps_flash_fail_closed() {
+    use ghost_launcher::components::gatekeeper_policy::{
+        build_assessment_from_features, evaluate_policy_from_assessment, PolicyEvaluationContext,
+    };
+
+    let manager = SessionManager::default();
+    let pool_id = Pubkey::new_unique();
+    let base_mint = Pubkey::new_unique();
+    let bonding_curve = Pubkey::new_unique();
+
+    let mut gatekeeper_config = GatekeeperV2Config::default();
+    gatekeeper_config.v25.shadow_enabled = true;
+    gatekeeper_config.pdd.enabled = true;
+    gatekeeper_config.pdd.spike_detection_enabled = true;
+    gatekeeper_config.pdd.ramping_detection_enabled = true;
+    gatekeeper_config.pdd.flash_crash_protection_enabled = true;
+    gatekeeper_config.tas.enabled = false;
+    gatekeeper_config.tas.tas_min_tx_per_segment = 0;
+    gatekeeper_config.tas.tas_min_total_duration_ms = 2_000;
+
+    let session = open_session_with_deadline_and_gatekeeper_config(
+        &manager,
+        pool_id,
+        base_mint,
+        bonding_curve,
+        10_000,
+        20_000,
+        gatekeeper_config.clone(),
+    );
+
+    let features = {
+        let mut guard = session.write();
+        guard.gatekeeper_buffer_mut().set_registered_wall_t0(10_000);
+        guard
+            .gatekeeper_buffer_mut()
+            .set_deadline_wall_ts_ms(20_000);
+        for i in 0..9 {
+            let _ = guard
+                .gatekeeper_buffer_mut()
+                .ingest_transaction_tracking_only(test_tx(
+                    pool_id,
+                    &format!("sig-seq-{}", i),
+                    10_100 + i as u64 * 500,
+                ));
+        }
+        guard.materialize_features()
+    };
+
+    assert!(
+        features.tx_segment_sequence.is_some(),
+        "session materialization must carry tx_segment_sequence for Path B"
+    );
+    let seq = features
+        .tx_segment_sequence
+        .as_ref()
+        .expect("segment sequence must be present");
+    assert!(seq.total_duration_ms >= gatekeeper_config.tas.tas_min_total_duration_ms);
+
+    let mut assessment = build_assessment_from_features(
+        features,
+        &gatekeeper_config,
+        PolicyEvaluationContext::default(),
+    );
+    assert_eq!(
+        assessment.pdd_sequence_signals_availability(&gatekeeper_config),
+        (Some(false), Some("pdd_flash_crash_unavailable".to_string()))
+    );
+
+    assessment.decision = Some(evaluate_policy_from_assessment(
+        &assessment,
+        &gatekeeper_config,
+    ));
+    assessment.cache_v25_confidence(&gatekeeper_config);
+    assert_eq!(
+        assessment.v25_confidence_availability(&gatekeeper_config),
+        (Some(false), Some("pdd_flash_crash_unavailable".to_string()))
     );
 }
 

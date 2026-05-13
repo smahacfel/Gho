@@ -5,6 +5,11 @@ use super::gatekeeper_policy::{
 };
 use crate::components::gatekeeper_adaptive_prosperity::ApsDiagnostics;
 use crate::components::gatekeeper_pdd::{PddDiagnostics, PddHardFail};
+use crate::components::gatekeeper_pdd_sequence::{
+    any_sequence_signal_enabled, sequence_signal_availability, PddSequenceSignalKind,
+    PDD_INSUFFICIENT_DURATION_REASON, PDD_INSUFFICIENT_TX_PER_SEGMENT_REASON,
+    PDD_MISSING_SEQUENCE_REASON,
+};
 use crate::components::gatekeeper_trajectory::TrajectoryAssessment;
 use crate::events::PoolTransaction;
 pub use crate::tx_intelligence::{
@@ -1470,52 +1475,46 @@ impl GatekeeperAssessment {
     }
 
     pub fn pdd_sequence_signals_available(&self, config: &GatekeeperV2Config) -> Option<bool> {
-        if !config.pdd.enabled {
-            return None;
-        }
-        if let Some(ref seq) = self.feature_snapshot.tx_segment_sequence {
-            Some(seq.min_tx_per_segment_satisfied)
-        } else if self.uses_materialized_feature_path() {
-            Some(false)
-        } else {
-            Some(true)
-        }
+        self.pdd_sequence_signals_availability(config).0
     }
 
     pub fn pdd_sequence_signals_availability(
         &self,
         config: &GatekeeperV2Config,
     ) -> (Option<bool>, Option<String>) {
-        let available = self.pdd_sequence_signals_available(config);
-        let reason = if !available.unwrap_or(true) {
-            if let Some(ref seq) = self.feature_snapshot.tx_segment_sequence {
-                if seq.total_duration_ms < config.tas.tas_min_total_duration_ms {
-                    Some("insufficient_duration".to_string())
-                } else if !seq.min_tx_per_segment_satisfied {
-                    Some("insufficient_tx_per_segment".to_string())
-                } else {
-                    Some("partial_inputs".to_string())
+        if !config.pdd.enabled {
+            return (None, None);
+        }
+        if !any_sequence_signal_enabled(config) {
+            return (Some(true), None);
+        }
+        if !self.uses_materialized_feature_path() {
+            return (Some(true), None);
+        }
+
+        if let Some(ref seq) = self.feature_snapshot.tx_segment_sequence {
+            for signal in PddSequenceSignalKind::ALL {
+                let (available, reason) = sequence_signal_availability(signal, seq, config);
+                if !available {
+                    return (Some(false), reason.map(ToString::to_string));
                 }
-            } else if self.uses_materialized_feature_path() {
-                let obs_dur = self
-                    .feature_snapshot
-                    .session_metadata
-                    .observation_duration_ms;
-                let tx_count = self.feature_snapshot.tx_intel_features.tx_count as usize;
-                if obs_dur < config.tas.tas_min_total_duration_ms {
-                    Some("insufficient_duration".to_string())
-                } else if tx_count < config.tas.tas_min_tx_per_segment.saturating_mul(3) {
-                    Some("insufficient_tx_per_segment".to_string())
-                } else {
-                    Some("missing_sequence".to_string())
-                }
-            } else {
-                Some("pdd_sequence_unavailable".to_string())
             }
+            return (Some(true), None);
+        }
+
+        let obs_dur = self
+            .feature_snapshot
+            .session_metadata
+            .observation_duration_ms;
+        let tx_count = self.feature_snapshot.tx_intel_features.tx_count as usize;
+        let reason = if obs_dur < config.tas.tas_min_total_duration_ms {
+            PDD_INSUFFICIENT_DURATION_REASON
+        } else if tx_count < config.tas.tas_min_tx_per_segment.saturating_mul(3) {
+            PDD_INSUFFICIENT_TX_PER_SEGMENT_REASON
         } else {
-            None
+            PDD_MISSING_SEQUENCE_REASON
         };
-        (available, reason)
+        (Some(false), Some(reason.to_string()))
     }
 
     pub fn pdd_price_anchor_available(&self, config: &GatekeeperV2Config) -> Option<bool> {
@@ -6401,91 +6400,13 @@ impl GatekeeperBuffer {
         &self,
         config: &TrajectoryAwareScoringConfig,
     ) -> Option<ghost_core::checkpoint::TxSegmentSequence> {
-        use crate::components::gatekeeper_trajectory::build_segment;
-        use ghost_core::checkpoint::TrajectorySegmentSnapshot;
         if !config.enabled {
             return None;
         }
-        let first_ts = self.first_tx_ts_ms()?;
-        let last_ts = self.highest_seen_ts_ms();
-        let duration_ms = last_ts.saturating_sub(first_ts);
-        if duration_ms < config.tas_min_total_duration_ms {
-            return None;
-        }
-        let min_total_tx = config.tas_min_tx_per_segment.saturating_mul(3);
-        if self.total_tx_count < min_total_tx {
-            return None;
-        }
-        let seg_dur = duration_ms as f64 / 3.0;
-        let t0_end = first_ts.saturating_add(seg_dur as u64);
-        let t1_end = first_ts.saturating_add((2.0 * seg_dur) as u64);
-        let mut seg0: Vec<&PoolTransaction> = Vec::new();
-        let mut seg1: Vec<&PoolTransaction> = Vec::new();
-        let mut seg2: Vec<&PoolTransaction> = Vec::new();
-        for btx in &self.buffered_txs {
-            let ts = btx.tx.timestamp_ms;
-            if ts <= t0_end {
-                seg0.push(&btx.tx);
-            } else if ts <= t1_end {
-                seg1.push(&btx.tx);
-            } else {
-                seg2.push(&btx.tx);
-            }
-        }
-        let min_per_seg = config.tas_min_tx_per_segment;
-        let min_satisfied =
-            seg0.len() >= min_per_seg && seg1.len() >= min_per_seg && seg2.len() >= min_per_seg;
-        fn snapshot(seg: &[&PoolTransaction]) -> TrajectorySegmentSnapshot {
-            let built = build_segment(seg);
-            let max_pip = seg
-                .iter()
-                .map(|tx| tx.sol_amount_lamports.unwrap_or(0) as f64)
-                .fold(0.0_f64, |a, b| a.max(b));
-            let buys: Vec<u64> = seg
-                .iter()
-                .filter(|tx| tx.is_buy)
-                .filter_map(|tx| tx.sol_amount_lamports)
-                .collect();
-            let mut max_streak: u32 = 0;
-            for i in 0..buys.len() {
-                let mut streak: u32 = 1;
-                let anchor = buys[i];
-                for j in (i + 1)..buys.len() {
-                    let diff = if anchor > buys[j] {
-                        anchor - buys[j]
-                    } else {
-                        buys[j] - anchor
-                    };
-                    let pct = if anchor > 0 {
-                        diff as f64 / anchor as f64
-                    } else {
-                        1.0
-                    };
-                    if pct <= 0.15 {
-                        streak += 1;
-                    } else {
-                        break;
-                    }
-                }
-                max_streak = max_streak.max(streak);
-            }
-            TrajectorySegmentSnapshot {
-                tx_count: built.tx_count as u64,
-                buy_ratio: built.buy_ratio,
-                avg_interval_ms: built.avg_interval_ms,
-                total_volume_sol: built.total_volume_sol,
-                hhi: built.hhi,
-                max_single_tx_sol: max_pip / 1e9,
-                same_size_streak: max_streak,
-            }
-        }
-        Some(ghost_core::checkpoint::TxSegmentSequence {
-            t0_segment: snapshot(&seg0),
-            t1_segment: snapshot(&seg1),
-            t2_segment: snapshot(&seg2),
-            total_duration_ms: duration_ms,
-            min_tx_per_segment_satisfied: min_satisfied,
-        })
+        self.build_segment_sequence(
+            config.tas_min_tx_per_segment,
+            config.tas_min_total_duration_ms,
+        )
     }
 
     /// No sliding-window cleanup is performed so the assessment covers the

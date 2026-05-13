@@ -1224,6 +1224,228 @@ fn p1_availability_reasons_are_specific() {
     );
 }
 
+#[test]
+fn p1_flash_enabled_marks_path_b_sequence_as_unavailable() {
+    use ghost_launcher::components::gatekeeper_policy::{
+        build_assessment_from_features, PolicyEvaluationContext,
+    };
+
+    let mut config = v25_enabled_config();
+    config.tas.enabled = true;
+    config.pdd.enabled = true;
+    config.pdd.flash_crash_protection_enabled = true;
+
+    let mut features = ghost_core::checkpoint::MaterializedFeatureSet::default();
+    features.tx_intel_features.tx_count = 15;
+    features.tx_intel_features.buy_count = 12;
+    features.tx_intel_features.unique_signers = 10;
+    features.tx_intel_features.buy_ratio = 0.80;
+    features.tx_intel_features.total_volume_sol = 8.0;
+    features.tx_intel_features.avg_interval_ms = 300.0;
+    features.tx_intel_features.interval_cv = 0.5;
+    features.tx_intel_features.timing_entropy = 2.0;
+    features.account_features.market_cap_sol = 50.0;
+    features.account_features.bonding_progress = 0.20;
+    features.session_metadata.observation_duration_ms = 7_000;
+    features.tx_segment_sequence = Some(TxSegmentSequence {
+        t0_segment: TrajectorySegmentSnapshot {
+            tx_count: 5,
+            buy_ratio: 0.80,
+            avg_interval_ms: 400.0,
+            total_volume_sol: 2.0,
+            hhi: 0.25,
+            max_single_tx_sol: 0.5,
+            same_size_streak: 1,
+        },
+        t1_segment: TrajectorySegmentSnapshot {
+            tx_count: 5,
+            buy_ratio: 0.82,
+            avg_interval_ms: 350.0,
+            total_volume_sol: 2.5,
+            hhi: 0.22,
+            max_single_tx_sol: 0.6,
+            same_size_streak: 2,
+        },
+        t2_segment: TrajectorySegmentSnapshot {
+            tx_count: 5,
+            buy_ratio: 0.85,
+            avg_interval_ms: 300.0,
+            total_volume_sol: 3.5,
+            hhi: 0.20,
+            max_single_tx_sol: 0.7,
+            same_size_streak: 1,
+        },
+        total_duration_ms: 6000,
+        min_tx_per_segment_satisfied: true,
+    });
+
+    let assessment =
+        build_assessment_from_features(features, &config, PolicyEvaluationContext::default());
+
+    assert_eq!(
+        assessment.pdd_sequence_signals_available(&config),
+        Some(false)
+    );
+    assert_eq!(
+        assessment
+            .pdd_sequence_signals_availability(&config)
+            .1
+            .as_deref(),
+        Some("pdd_flash_crash_unavailable")
+    );
+
+    let buy_log = assessment.to_buy_log(&Pubkey::new_unique(), &config);
+    assert_eq!(buy_log.pdd_sequence_signals_available, Some(false));
+    assert_eq!(
+        buy_log.pdd_sequence_signals_unavailable_reason.as_deref(),
+        Some("pdd_flash_crash_unavailable")
+    );
+}
+
+#[test]
+fn p1_flash_unavailable_blocks_v25_confidence() {
+    use ghost_launcher::components::gatekeeper_policy::{
+        build_assessment_from_features, evaluate_policy_from_assessment, PolicyEvaluationContext,
+    };
+
+    let mut config = v25_enabled_config();
+    config.tas.enabled = true;
+    config.pdd.enabled = true;
+    config.pdd.flash_crash_protection_enabled = true;
+    config.v25.shadow_enabled = true;
+
+    let mut features = ghost_core::checkpoint::MaterializedFeatureSet::default();
+    features.tx_intel_features.tx_count = 15;
+    features.tx_intel_features.buy_count = 12;
+    features.tx_intel_features.unique_signers = 10;
+    features.tx_intel_features.buy_ratio = 0.80;
+    features.tx_intel_features.total_volume_sol = 8.0;
+    features.tx_intel_features.avg_interval_ms = 300.0;
+    features.tx_intel_features.interval_cv = 0.5;
+    features.tx_intel_features.timing_entropy = 2.0;
+    features.account_features.market_cap_sol = 50.0;
+    features.account_features.bonding_progress = 0.20;
+    features.session_metadata.observation_duration_ms = 7_000;
+    features.tx_segment_sequence = Some(TxSegmentSequence {
+        t0_segment: TrajectorySegmentSnapshot {
+            tx_count: 5,
+            buy_ratio: 0.80,
+            avg_interval_ms: 400.0,
+            total_volume_sol: 2.0,
+            hhi: 0.25,
+            max_single_tx_sol: 0.5,
+            same_size_streak: 1,
+        },
+        t1_segment: TrajectorySegmentSnapshot {
+            tx_count: 5,
+            buy_ratio: 0.82,
+            avg_interval_ms: 350.0,
+            total_volume_sol: 2.5,
+            hhi: 0.22,
+            max_single_tx_sol: 0.6,
+            same_size_streak: 2,
+        },
+        t2_segment: TrajectorySegmentSnapshot {
+            tx_count: 5,
+            buy_ratio: 0.85,
+            avg_interval_ms: 300.0,
+            total_volume_sol: 3.5,
+            hhi: 0.20,
+            max_single_tx_sol: 0.7,
+            same_size_streak: 1,
+        },
+        total_duration_ms: 6000,
+        min_tx_per_segment_satisfied: true,
+    });
+
+    let mut assessment =
+        build_assessment_from_features(features, &config, PolicyEvaluationContext::default());
+    assessment.decision = Some(evaluate_policy_from_assessment(&assessment, &config));
+    assessment.cache_v25_confidence(&config);
+
+    assert_eq!(assessment.v25_confidence, None);
+    assert_eq!(
+        assessment.v25_confidence_availability(&config),
+        (Some(false), Some("pdd_flash_crash_unavailable".to_string()))
+    );
+
+    let buy_log = assessment.to_buy_log(&Pubkey::new_unique(), &config);
+    assert_eq!(buy_log.v25_confidence, None);
+    assert_eq!(buy_log.v25_confidence_available, Some(false));
+    assert_eq!(
+        buy_log.v25_confidence_unavailable_reason.as_deref(),
+        Some("pdd_flash_crash_unavailable")
+    );
+}
+
+#[test]
+fn p1_flash_disabled_keeps_complete_sequence_available() {
+    use ghost_launcher::components::gatekeeper_policy::{
+        build_assessment_from_features, PolicyEvaluationContext,
+    };
+
+    let mut config = v25_enabled_config();
+    config.tas.enabled = true;
+    config.pdd.enabled = true;
+    config.pdd.flash_crash_protection_enabled = false;
+
+    let mut features = ghost_core::checkpoint::MaterializedFeatureSet::default();
+    features.tx_intel_features.tx_count = 15;
+    features.tx_intel_features.buy_count = 12;
+    features.tx_intel_features.unique_signers = 10;
+    features.tx_intel_features.buy_ratio = 0.80;
+    features.tx_intel_features.total_volume_sol = 8.0;
+    features.tx_intel_features.avg_interval_ms = 300.0;
+    features.tx_intel_features.interval_cv = 0.5;
+    features.tx_intel_features.timing_entropy = 2.0;
+    features.account_features.market_cap_sol = 50.0;
+    features.account_features.bonding_progress = 0.20;
+    features.session_metadata.observation_duration_ms = 7_000;
+    features.tx_segment_sequence = Some(TxSegmentSequence {
+        t0_segment: TrajectorySegmentSnapshot {
+            tx_count: 5,
+            buy_ratio: 0.80,
+            avg_interval_ms: 400.0,
+            total_volume_sol: 2.0,
+            hhi: 0.25,
+            max_single_tx_sol: 0.5,
+            same_size_streak: 1,
+        },
+        t1_segment: TrajectorySegmentSnapshot {
+            tx_count: 5,
+            buy_ratio: 0.82,
+            avg_interval_ms: 350.0,
+            total_volume_sol: 2.5,
+            hhi: 0.22,
+            max_single_tx_sol: 0.6,
+            same_size_streak: 2,
+        },
+        t2_segment: TrajectorySegmentSnapshot {
+            tx_count: 5,
+            buy_ratio: 0.85,
+            avg_interval_ms: 300.0,
+            total_volume_sol: 3.5,
+            hhi: 0.20,
+            max_single_tx_sol: 0.7,
+            same_size_streak: 1,
+        },
+        total_duration_ms: 6000,
+        min_tx_per_segment_satisfied: true,
+    });
+
+    let assessment =
+        build_assessment_from_features(features, &config, PolicyEvaluationContext::default());
+
+    assert_eq!(
+        assessment.pdd_sequence_signals_available(&config),
+        Some(true)
+    );
+    assert_eq!(
+        assessment.pdd_sequence_signals_availability(&config),
+        (Some(true), None)
+    );
+}
+
 /// P1: Path A and Path B compute the same TAS when segment_sequence present.
 #[test]
 fn p1_path_a_and_path_b_compute_same_tas_when_segment_sequence_present() {
