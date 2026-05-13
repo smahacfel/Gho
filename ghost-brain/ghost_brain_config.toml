@@ -97,7 +97,7 @@ min_single_sell_impact_pct = 0.0
 max_single_sell_impact_pct = 9999.0
 max_bonding_progress_pct = 99.0
 min_bonding_progress_pct = 40.0
-min_market_cap_sol = 60.0
+min_market_cap_sol = 41.0
 
 # ── Decision ────────────────────────────────────────────────────────────────────
 # 3-layer decision ON: tokeny nie giną od razu przy lekkim przekroczeniu progów —

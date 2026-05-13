@@ -1,1098 +1,1497 @@
-# AUDYT PIPELINE'U DECYZYJNEGO — GATEKEEPER V2 / V2.5
-## Architektura SSOT, przepływ danych i kategoryzacja BUY/REJECT
+# AUDYT PIPELINE'U GATEKEEPERA V2.5
 
-> **Data audytu (kodu w repo):** 2026-05-07
-> **Zakres:** `ghost-launcher`, `ghost-launcher/src/session`, `ghost-core`, `ghost-brain` (konfiguracja)
-> **Konfiguracja referencyjna:** `ghost-brain/ghost_brain_config.toml` (version=11, mode=long, max_wait_time_ms=8001)
-> **Metoda:** pełny trace z kodu źródłowego — każda ścieżka, każda funkcja, każda struktura danych
+Pełny opis aktywnego flow Ghost: ingest danych o poolach i tokenach,
+materializacja dowodów decyzyjnych, ewaluacja Gatekeepera V2/V2.5,
+wydanie decyzji, shadow-burnin, logowanie i replay.
 
----
+Data aktualizacji: 2026-05-13
 
-## SPIS TREŚCI
+Repo: `/root/Gho`
 
-1. [Architektura SSOT — źródła prawdy o stanie pooli](#1-architektura-ssot)
-2. [Pełny przepływ danych — od ingestu do werdyktu](#2-przeplyw-danych)
-3. [Struktury danych — co, skąd, w jakiej formie](#3-struktury-danych)
-4. [Ingestia — Seer, gRPC, Yellowstone](#4-ingestia)
-5. [Sesja obserwacji — materializacja cech](#5-sesja-obserwacji)
-6. [GatekeeperBuffer — akumulacja transakcji](#6-gatekeeperbuffer)
-7. [Pipeline decyzyjny — 8 warstw kategoryzacji BUY/REJECT](#7-pipeline-decyzyjny)
-8. [V2.5 Shadow — DOW, TAS, PDD, APS](#8-v25-shadow)
-9. [Krzywa wiązania — curve gate i latch](#9-krzywa-wiazania)
-10. [Commit, LivePipeline, post-Gatekeeper](#10-commit)
-11. [Mapa plików — dokładne ścieżki i zakresy linii](#11-mapa-plikow)
+HEAD użyty do audytu: `78ef5a4d77d5d92d66361ec8f85480908371069b`
 
----
+Główny profil walidacyjny: `configs/rollout/shadow-burnin.toml`
 
-## 1. ARCHITEKTURA SSOT
+Główny config decyzyjny: `ghost-brain/ghost_brain_config.toml`
 
-### 1.1. Co jest SSOT i dlaczego
+Uwaga o stanie roboczym: podczas audytu working tree miał zastaną
+modyfikację w `ghost-brain/ghost_brain_config.toml`: `min_market_cap_sol`
+w `[gatekeeper_v2.phase6_curve]` wynosiło `41.0`, podczas gdy czysty `HEAD`
+miał `60.0`. Opis niżej traktuje roboczy checkout jako stan aktualny, bo to
+on jest źródłem bieżącej konfiguracji w tej sesji.
 
-System ma JEDNO kanoniczne źródło prawdy dla stanu każdego poolu:
+## 0. Zakres i wyłączenia
 
-```
-MaterializedFeatureSet (ghost-core/src/checkpoint/types.rs:100-112)
-```
+Ten dokument opisuje aktywny pipeline Gatekeepera V2.5 od wejścia danych
+łańcuchowych do terminalnej decyzji i shadow execution evidence. Jest napisany
+dla eksperta, który ma oceniać, czy logika biznesowa oceny pooli/tokenów ma
+sens i gdzie należy ją dalej rozwijać.
 
-To jest struktura-agregat, która łączy dane z **pięciu niezależnych źródeł** w jeden snapshot użyty do decyzji:
+W zakresie są:
 
-| Pole | Typ | Źródło danych |
-|------|-----|--------------|
-| `account_features` | `AccountStateFeatures` | Yellowstone gRPC → AccountStateCore reducer |
-| `tx_intel_features` | `TxIntelFeatures` | Bufor transakcji → TxIntelligenceEngine |
-| `checkpoint_features` | `CheckpointDerivedFeatures` | CheckpointEngine (trajektorie, impacty) |
-| `curve_readiness` | `CurveReadinessFeatures` | ShadowLedger + AccountStateCore |
-| `sybil_resistance` | `SybilResistanceFeatures` | CrossPoolVelocityIndex + FundingSourceIndex |
-| `alpha_fingerprint` | `AlphaFingerprintFeatures` | Seer EarlyFingerprintAggregator |
-| `risk_flags` | `Vec<RiskFlag>` | TxIntelligenceEngine |
-| `session_metadata` | `SessionMetadata` | PoolObservationSession |
+- Seer / Yellowstone / gRPC ingest i bridge do `GhostEvent`.
+- `EventBus`, routing w `OracleRuntime`, per-pool observation task.
+- `PoolObservationSession`, `AccountStateCore`, `TxIntelligenceEngine`,
+  `CheckpointEngine`, CPV/FSC i early fingerprinting.
+- `MaterializedFeatureSet` jako kanoniczny snapshot decyzyjny.
+- Gatekeeper V2 core phases, hard filters, soft policies i curve gate.
+- V2.5: DOW, TAS, PDD, APS, typed reason codes, confidence i shadow decisions.
+- IWIM jako post-Gatekeeper BUY veto przed wykonaniem.
+- Shadow-burnin: konfiguracja, shadow-only trigger, symulacja buy,
+  lifecycle JSONL, post-buy shadow monitor i raportowanie.
+- DecisionLogger, schema v19, plane routing, replay/report gates.
 
-**Zasada:** żadna cecha nie jest liczona dwukrotnie z różnych źródeł. `MaterializedFeatureSet` jest budowany raz, w `PoolObservationSession::materialize_features()` (`ghost-launcher/src/session/observation.rs:368`), a następnie przekazywany jako niemutowalny snapshot do wszystkich warstw decyzyjnych.
+Poza zakresem aktywnego runtime są legacy relikty:
 
-### 1.2. Drugie źródło cen — GatekeeperBuffer.price_history
+- HyperOracle / HyperPrediction / Chaos w roli aktywnych źródeł decyzji.
+- `OracleRuntime::score_pool()` w roli produkcyjnego scorera.
+- `GhostEvent::PoolScored` w roli aktualnego toru decyzyjnego.
+- Test-only/compat helpers, np. `evaluate_compat_from_features()` i
+  `PoolObservationSession::legacy_test_verdict_from_transaction()`.
 
-Równolegle do `MaterializedFeatureSet`, bufor Gatekeepera utrzymuje własną historię cen:
+Te elementy mogą istnieć w kodzie, ale nie są źródłem prawdy dla obecnego
+Gatekeepera V2.5.
 
-```rust
-// ghost-launcher/src/components/gatekeeper.rs:433-446
-pub struct PricePoint {
-    pub timestamp_ms: u64,
-    pub price_sol_per_token: f64,
-    pub v_sol_in_curve: f64,        // rezerwy SOL w krzywej (lamports → SOL)
-    pub v_tokens_in_curve: f64,     // rezerwy tokenów
-    pub market_cap_sol: f64,
-    pub is_buy: bool,               // czy punkt pochodzi z buy transakcji
-    pub curve_data_known: bool,     // czy parser potwierdził dane
-    pub curve_finality: CurveFinality,
-}
-```
+## 1. Jednozdaniowy model systemu
 
-`price_history` (`Vec<PricePoint>`) zasila:
-- `compute_bonding_curve_dynamics()` → `BondingCurveDynamics` (Phase 6)
-- `detect_entry_drift()` w `evaluate_pdd()` (PDD)
-- `detect_flash_crash()` w `evaluate_pdd()`
-- `current_curve_dynamics()` → uzupełnienie `MaterializedFeatureSet` w sesji
+Ghost nie jest ogólnym predyktorem. Ghost jest selektywnym runtime, który
+obserwuje świeży pool w krótkim oknie, materializuje jeden kanoniczny zestaw
+dowodów (`MaterializedFeatureSet`), odpala deterministyczną politykę
+Gatekeepera, a następnie w profilu shadow-burnin symuluje, co zrobiłby live
+execution path bez wysyłania transakcji na łańcuch.
 
-### 1.3. Trzecie źródło — AccountStateCore (on-chain state)
+Najważniejszy kontrakt:
 
-```rust
-// ghost-core/src/account_state_core/types.rs:111-135
-pub struct CanonicalPoolState {
-    pub pool_amm_id: Pubkey,
-    pub base_mint: Pubkey,
-    pub bonding_curve: Pubkey,
-    pub virtual_sol_reserves: u64,     // surowe lamporty
-    pub virtual_token_reserves: u64,   // surowe tokeny (1 token = 10^6 unitów w Pump.fun)
-    pub real_sol_reserves: u64,
-    pub real_token_reserves: u64,
-    pub bonding_curve_progress: f64,   // 0.0-1.0
-    pub price_sol: f64,                // SOL/token (znormalizowane)
-    pub market_cap_sol: f64,           // SOL (znormalizowane)
-    pub token_total_supply: u64,
-    pub is_complete: bool,             // bonding curve ukończona?
-    pub last_update_slot: u64,
-    pub last_update_ts_ms: u64,
-    pub curve_finality: CurveFinality,
-    pub state_phase: StatePhase,       // Bootstrap → PendingConfirmation → Canonical → Migrated
-    pub update_count: u64,
-    pub initial_price_sol: f64,
-    pub price_change_since_t0_pct: f64,
-    pub reserve_velocity_sol_per_sec: f64,
-}
+```text
+Seer / Yellowstone
+  -> GhostEvent EventBus
+  -> OracleRuntime
+  -> PoolObservationSession
+  -> MaterializedFeatureSet
+  -> Gatekeeper V2/V2.5 policy
+  -> IWIM veto
+  -> shadow/live trigger handoff
+  -> DecisionLogger / shadow lifecycle / replay reports
 ```
 
-Reducer: `AccountStateReducer` (`ghost-core/src/account_state_core/reducer.rs`) przyjmuje `AccountStateUpdate`, waliduje monotoniczność slotów i `receive_seq`, aktualizuje `CanonicalPoolState`. Maszyna stanów: `Bootstrap → PendingConfirmation → Canonical → Migrated`.
+## 2. Non-negotiable contracts
 
-Z `CanonicalPoolState` wyprowadzany jest `AccountStateFeatures` (lekka wersja do decyzji):
+Te reguły są ważniejsze niż wygoda implementacyjna:
 
-```rust
-// ghost-core/src/account_state_core/types.rs:164-175
-pub struct AccountStateFeatures {
-    pub current_reserves: (u64, u64),  // (sol_reserves, token_reserves) — SUROWE
-    pub price_sol: f64,
-    pub market_cap_sol: f64,
-    pub bonding_progress: f64,         // 0.0-1.0
-    pub price_change_since_t0_pct: f64,
-    pub reserve_velocity_sol_per_sec: f64,
-    pub is_bootstrap: bool,
-    pub curve_finality: CurveFinality,
-    pub state_phase: StatePhase,
-    pub update_count: u64,
-}
+- `MaterializedFeatureSet` jest jedynym kanonicznym snapshotem decyzyjnym.
+- Gatekeeper policy nie może recompute'ować autorytatywnych feature'ów z
+  konkurencyjnych mutable źródeł.
+- Active terminal evaluation idzie przez feature-driven path:
+  `materialize_features()` -> `evaluate_from_features()`.
+- Każdy terminalny verdict musi mieć typ i reason code.
+- Generic `REJECT` nie jest wystarczającym dowodem audytowym, jeśli istnieje
+  bardziej szczegółowy typ.
+- Hard safety filters mają pierwszeństwo przed soft score.
+- Shadow simulation nie jest live inclusion.
+- Submit nie jest confirmation.
+- Unknown execution status nie jest success.
+- `no_dispatch_*` po reject/timeout nie jest błędem shadow lifecycle.
+- Legacy/test-only ścieżki nie mogą być reaktywowane przypadkiem.
+- Config fields wpływające na decyzje muszą być config-driven i kompatybilne
+  wstecznie (`serde(default)` tam, gdzie stare configi mają się ładować).
+
+## 3. Aktualny profil operacyjny
+
+### 3.1 Gatekeeper V2 core
+
+Źródło: `ghost-brain/ghost_brain_config.toml`.
+
+Aktualny tryb Gatekeepera:
+
+- `[gatekeeper_v2].enabled = true`
+- `[gatekeeper_v2].mode = "long"`
+- `max_wait_time_ms = 10000` w `phase1_quantity`
+- `min_phases_to_pass = 4`
+- `curve_require_for_buy = true`
+- `curve_wait_ms = 500`
+- shadow/V2.5 włączony, live execution V2.5 wyłączony.
+
+Core phase thresholds w aktualnym checkoutcie:
+
+| Phase | Nazwa | Główne wartości |
+|---|---|---|
+| Phase 1 | Quantity | `min_tx_count=12`, `min_unique_signers=8`, `min_buy_count=6`, `max_wait_time_ms=10000` |
+| Phase 2 | Velocity | `max_avg_interval_ms=450`, `max_interval_cv=2.3`, `max_burst_ratio=0.72` |
+| Phase 3 | Diversity | `max_hhi=0.155`, `max_volume_gini=0.70`, `max_top3_volume_pct=0.53`, `min_unique_signer_ratio=0.55` |
+| Phase 4 | Volume | `min_buy_ratio=0.80`, `min_sol_buy_ratio=0.55`, `max_avg_tx_sol=0.45`, `max_volume_cv=1.20`, `max_consecutive_buys=3` |
+| Phase 5 | Dev | `max_dev_buy_sol=2.0`, `max_dev_volume_ratio=0.23`, `reject_on_dev_sell=false` |
+| Phase 6 | Curve | `max_price_change_ratio=1.50`, `min_market_cap_sol=41.0` w working tree, `min_bonding_progress_pct=40.0`, `max_bonding_progress_pct=99.0` |
+
+`min_market_cap_sol=41.0` jest stanem roboczym, nie czystym `HEAD`.
+
+### 3.2 V2.5 rollout config
+
+W `[gatekeeper_v2.v25]`:
+
+- `shadow_enabled = true`
+- `live_execution_enabled = false`
+- `require_promotion_adr = true`
+- `emit_shadow_decisions = true`
+- `emit_ablation_fields = true`
+
+Znaczenie: V2.5 działa jako shadow/evidence plane. Nie promuje PDD/APS/DOW do
+live hard veto bez jawnej decyzji/promocji.
+
+### 3.3 DOW - Dynamic Observation Window
+
+Aktualne okna:
+
+- Early: `2000..5000 ms`, `early_min_confidence=0.85`,
+  `early_min_tx=15`, `early_min_phases=6`,
+  `early_min_momentum_score=0.40`, `early_max_sybil_score=1.0`,
+  `early_max_entry_drift_pct=3.0`.
+- Normal: `normal_window_ms=7000`, `normal_min_confidence=0.65`.
+- Extended: `extended_window_ms=10000`,
+  `extended_min_confidence=0.55`, `extended_require_pdd_clean=true`.
+- Timer: `dow_tick_ms=250`.
+
+DOW shadow checkpoints są odpalane przez TX path i timer path, ale nie mutują
+terminalnego live verdictu. Są dowodem, co V2.5 zrobiłby wcześniej/później.
+
+### 3.4 TAS - Trajectory Aware Scoring
+
+Aktualnie:
+
+- `tas.enabled = true`
+- `tas_min_tx_per_segment = 3`
+- `tas_min_total_duration_ms = 3000`
+- `tas_hard_reject_threshold = 0.30`
+- `tas_confidence_modulator_min = 0.75`
+- `tas_confidence_modulator_max = 1.25`
+
+TAS dzieli okno obserwacji na T0/T1/T2 i ocenia momentum, HHI trajectory,
+volume consistency, interval trajectory i buy-ratio stability.
+
+### 3.5 PDD - Pump & Dump Detector
+
+Aktualnie:
+
+- `pdd.enabled = true`
+- `entry_drift_max_pct = 5.0`
+- `entry_drift_soft_max_pct = 3.0`
+- `spike_detection_enabled = true`
+- `spike_ratio_threshold = 2.0`
+- `spike_hard_veto = true`
+- `ramping_detection_enabled = true`
+- `ramping_min_consecutive_buys = 4`
+- `ramping_hard_veto = true`
+- `whale_top3_max_pct = 60.0`
+- `reserve_min_sol = 30.0`
+- `reserve_drop_max_pct = 0.15`
+- `flash_crash_protection_enabled = true`
+- `flash_crash_max_price_impact_pct = 15.0`
+- `flash_crash_window_ms = 500`
+
+PDD jest shadow-first. Live hard veto wymaga `v25.live_execution_enabled=true`
+oraz odpowiedniej promocji progu. Przy aktualnym profilu V2.5 wykrycia PDD są
+evidence/shadow, nie live kill-switch.
+
+### 3.6 APS - Adaptive Prosperity
+
+Aktualnie:
+
+- `aps.enabled = true`
+- `adaptive_enabled = false`
+- `shadow_suggestions_enabled = true`
+- `min_calibration_samples = 30`
+- `regime_local_heuristic_enabled = true`
+- `cross_pool_outcome_tracker_available = false`
+
+APS generuje shadow/offline sugestie progów dla prosperity filter. Nie mutuje
+aktywnych progów live. Overlay `configs/rollout/shadow-burnin.toml` jawnie
+odsyła do brain configu jako SSOT APS.
+
+## 4. Active vs legacy map
+
+| Obszar | Status | Uwagi |
+|---|---|---|
+| `Seer` Yellowstone/gRPC -> IPC | aktywne | Produkcyjny ingest dla shadow-burnin, `source_mode="grpc"` |
+| `GhostEvent::NewPoolDetected` | aktywne | Otwiera session i observation task |
+| `GhostEvent::PoolTransaction` | aktywne | Główny strumień transakcji poola |
+| `GhostEvent::FundingTransferObserved` | aktywne | Dane FSC/sybil/funding provenance |
+| `GhostEvent::AccountUpdate` | aktywne warunkowo | Zależy od canonical account update relay |
+| `OracleRuntime::pool_observation_task` | aktywne | Per-pool orchestration |
+| `PoolObservationSession::materialize_features()` | aktywne SSOT | Główna granica dowodowa |
+| `GatekeeperBuffer::evaluate_from_features()` | aktywne | Terminalny feature-driven evaluation path |
+| `GatekeeperBuffer::try_shadow_evaluate()` | aktywne shadow | DOW checkpoint evidence; nie terminalny live verdict |
+| `DecisionLogger` schema v19 | aktywne | JSONL, plane routing, reason code enforcement |
+| `TriggerEntryMode::ShadowOnly` | aktywne dla burnin | Simulate transaction; no live send |
+| `OracleRuntime::score_pool()` | legacy/deprecated | Nie jest aktywnym scorerem V2.5 |
+| `GhostEvent::PoolScored` | legacy observation | Nie jest źródłem terminalnej decyzji |
+| HyperPrediction/Chaos | legacy | Nie brać do architektury V2.5 |
+
+## 5. Ingest: Seer, Yellowstone, parsery i IPC
+
+### 5.1 Transport
+
+Aktywny shadow-burnin używa Seer w profilu:
+
+- `source_mode = "grpc"`
+- `commitment = "processed"`
+- `stream_mode = "single_global"`
+- `tx_filter_strategy = "per_pool"`
+- `funding_lane_mode = "full_chain"`
+- `enable_pumpfun = true`
+- `enable_pumpswap = true`
+
+Seer obsługuje raw eventy typu:
+
+- `GeyserEvent::Transaction`
+- `GeyserEvent::AccountUpdate`
+- `GeyserEvent::EntryAnchor`
+- slot/backfill variants po stronie gRPC adaptera.
+
+Własność Seer:
+
+- połączenie do źródła danych,
+- filtrowanie programów Pump/PumpSwap,
+- parsowanie transakcji i account updates,
+- normalizacja timestampów i slot metadata,
+- deduplikacja/identity na poziomie źródła,
+- emitowanie IPC eventów do launcher bridge.
+
+Seer nie powinien podejmować decyzji inwestycyjnej. Seer produkuje dane.
+
+### 5.2 Timestamp i provenance
+
+Seer rozróżnia:
+
+- chain event time, gdy dostępny z block time,
+- ingress wall time, gdy chain time nie jest dostępny,
+- arrival monotonic time,
+- slot quality,
+- event semantic envelope.
+
+To jest ważne, bo Gatekeeper używa krótkich okien 2-10 sekund. Nie wolno
+mieszać czasu łańcuchowego, czasu przyjęcia eventu i lokalnego wall-clock bez
+jawnej jakości/provenance.
+
+### 5.3 Parser curve/account data
+
+Bonding curve parser obsługuje realne layouty:
+
+- 56 bajtów bez Anchor discriminatora,
+- 83/151+ bajtów z 8-bajtowym Anchor discriminatorem,
+- zakres 49-82 bajty z heurystyką offsetu.
+
+Parser waliduje sensowność virtual reserves. Dane curve są potem niesione do:
+
+- `PoolTransaction.reserve_base`,
+- `PoolTransaction.reserve_quote`,
+- `PoolTransaction.price_quote`,
+- `PoolTransaction.curve_data_known`,
+- `PoolTransaction.curve_finality`,
+- `AccountUpdateEvent` i `AccountStateCore`.
+
+### 5.4 CandidatePool
+
+`CandidatePool` reprezentuje wykryty nowy pool. Istotne pola:
+
+- `pool_amm_id`
+- `base_mint`
+- `quote_mint`
+- `bonding_curve`
+- `creator`
+- `slot`
+- `event_ts_ms` / `event_time`
+- `signature`
+- initial liquidity / reserves / supply, jeśli dostępne.
+
+Bridge mapuje go do `DetectedPool`, a następnie do
+`GhostEvent::NewPoolDetected`.
+
+### 5.5 TradeEvent -> PoolTransaction
+
+`TradeEvent` z Seer jest kanonicznie mapowany do `PoolTransaction` w launcherze.
+To jest granica:
+
+```text
+Seer TradeEvent
+  -> trade_event_to_pool_transaction()
+  -> GhostEvent::PoolTransaction
 ```
 
----
-
-## 2. PRZEPŁYW DANYCH
-
-### 2.1. Pełen trace: od Yellowstone do werdyktu
-
-```
-KROK 1: Yellowstone gRPC stream
-  Plik: off-chain/components/seer/src/grpc_connection.rs
-  Seer odbiera AccountUpdate + Transaction events przez gRPC
-
-KROK 2: Seer → Event Bus → SnapshotListener
-  Plik: ghost-launcher/src/components/seer.rs
-  Plik: ghost-launcher/src/components/snapshot_listener.rs
-  Normalizacja eventów, deduplikacja, routing do AccountStateReducer
-
-KROK 3: SnapshotListener → AccountStateReducer
-  Plik: ghost-core/src/account_state_core/reducer.rs
-  Aktualizacja CanonicalPoolState, walidacja monotoniczności
-
-KROK 4: OracleRuntime wykrywa nowy pool
-  Plik: ghost-launcher/src/oracle_runtime.rs
-  Tworzy PoolObservationSession per pool
-
-KROK 5: PoolObservationSession.start() → tokio::select! pętla
-  Plik: ghost-launcher/src/session/observation.rs + oracle_runtime.rs
-  Dla każdego TX: session.ingest_transaction(tx)
-
-KROK 6: session.ingest_transaction()
-  Plik: ghost-launcher/src/session/observation.rs:211
-  1. Enrichment TX: AccountStateCore → cena, bonding_progress
-  2. Fingerprint: EarlyFingerprintAggregator → alpha_fingerprint
-  3. gatekeeper_buffer.ingest_transaction_tracking_only(tx)
-     → akumulacja TX, shadow checkpoints (Long mode)
-  4. try_checkpoint() → CheckpointEngine
-
-KROK 7: Przy deadlinie (mode=Long) lub triggerze (mode=Standard):
-  resolve_feature_trigger_outcome()
-    → evaluate_feature_driven_terminal_verdict()
-      → session.materialize_features()
-        → MaterializedFeatureSet (SSOT)
-      → buffer.evaluate_from_features(features)
-        → build_assessment_from_features()  [policy.rs]
-        → evaluate_policy_from_assessment() [policy.rs]
-        → evaluate_curve_gate()             [policy.rs]
-      → GatekeeperVerdict::Buy / Reject / Timeout
-
-KROK 8: Po BUY:
-  → IWIM Veto Gate (opcjonalnie)
-  → LauncherCommitCoordinator → gatekeeper_commit_loop
-  → LivePipeline.init_for_mint()
-  → Trigger / shadow_run / post_buy_runtime
-```
-
-### 2.2. Dwie ścieżki ewaluacji (świadomy dualizm)
-
-Ścieżka kanoniczna (feature-driven, produkcja):
-```
-session.materialize_features()
-  → GatekeeperBuffer::evaluate_from_features()
-    → build_assessment_from_features()     // policy.rs:372
-    → evaluate_policy_from_assessment()    // policy.rs:863
-    → evaluate_curve_gate()                // policy.rs:1239
-```
-
-Ścieżka buforowa (shadow checkpoints, testy):
-```
-GatekeeperBuffer::run_assessment()         // gatekeeper.rs:4829
-  → compute_decision()                     // gatekeeper.rs:4165
-  → try_shadow_evaluate()                  // gatekeeper.rs:5192
-```
-
-Obie ścieżki są utrzymywane równolegle. Feature-driven używa `MaterializedFeatureSet` (SSOT z sesji). Buforowa liczy fazy inline na strukturach bufora.
-
-### 2.3. Jak cena płynie przez system
-
-```
-Yellowstone AccountUpdate
-  → sol_reserves: u64, token_reserves: u64  (surowe lamporty/tokeny)
-  → AccountStateReducer.update_account_state()
-    → price_sol = (virtual_sol_reserves / LAMPORTS_PER_SOL) / virtual_token_reserves
-    → CanonicalPoolState.price_sol
-    → AccountStateFeatures.price_sol
-      → 1. MaterializedFeatureSet.account_features.price_sol
-           → Phase 6: bonding_curve_from_features() → BondingCurveDynamics
-      → 2. GatekeeperBuffer.price_history.push(PricePoint{...})
-           → compute_bonding_curve_dynamics() → BondingCurveDynamics
-           → detect_entry_drift() → entry_drift_pct
-           → current_curve_dynamics() → uzupełnienie MaterializedFeatureSet
-
-Dodatkowo:
-  PoolObservationSession.materialize_features() (observation.rs:368)
-    → curve_dynamics = gatekeeper_buffer.current_curve_dynamics()
-    → materialized.checkpoint_features.single_tx_max_price_impact_pct
-        .max(curve_dynamics.max_single_tx_price_impact_pct)
-    → materialized.checkpoint_features.price_change_from_first_checkpoint_pct
-        = (curve_dynamics.price_change_ratio - 1.0) * 100.0  [jeśli checkpoint pusty]
-```
-
----
-
-## 3. STRUKTURY DANYCH
-
-### 3.1. MaterializedFeatureSet — SSOT decyzji
-
-Lokalizacja: `ghost-core/src/checkpoint/types.rs:100-112`
-
-```rust
-pub struct MaterializedFeatureSet {
-    pub account_features: AccountStateFeatures,        // z AccountStateCore
-    pub tx_intel_features: TxIntelFeatures,            // z TxIntelligenceEngine
-    pub checkpoint_features: CheckpointDerivedFeatures, // z CheckpointEngine
-    pub risk_flags: Vec<RiskFlag>,                     // z TxIntelligenceEngine
-    pub session_metadata: SessionMetadata,              // czas, id sesji
-    pub curve_readiness: CurveReadinessFeatures,        // z ShadowLedger + AccountStateCore
-    pub sybil_resistance: SybilResistanceFeatures,      // CPV + FSC + SFD + DBIA + DES + FTDI
-    pub alpha_fingerprint: AlphaFingerprintFeatures,    // z Seer EarlyFingerprint
-}
-```
-
-### 3.2. TxIntelFeatures — cechy z transakcji
-
-Lokalizacja: `ghost-core/src/tx_intelligence/types.rs:49-96`
-
-```rust
-pub struct TxIntelFeatures {
-    // Quantity (Phase 1)
-    pub tx_count: u64,           pub buy_count: u64,        pub sell_count: u64,
-    pub unique_signers: u64,     pub dust_tx_count: u64,    pub failed_tx_count: u64,
-
-    // Volume (Phase 4)
-    pub buy_ratio: f64,          pub sol_buy_ratio: f64,    pub avg_tx_sol: f64,
-    pub volume_cv: f64,          pub total_volume_sol: f64,
-    pub min_tx_sol: f64,         pub max_tx_sol: f64,
-    pub max_consecutive_buys: u64,
-
-    // Diversity (Phase 3)
-    pub hhi: f64,                pub volume_gini: f64,
-    pub unique_signer_ratio: f64, pub avg_tx_per_signer: f64,
-    pub same_ms_tx_ratio: f64,   pub top3_volume_pct: f64,
-    pub max_tx_per_signer: u64,
-
-    // Velocity (Phase 2)
-    pub interval_cv: f64,        pub timing_entropy: f64,
-    pub avg_interval_ms: f64,    pub burst_ratio: f64,
-
-    // Dev (Phase 5)
-    pub dev_wallet_known: bool,  pub dev_buy_sol: f64,
-    pub dev_volume_ratio: f64,   pub dev_tx_ratio: f64,
-    pub dev_has_sold: bool,      pub dev_is_first_buyer: bool,
-    pub dev_initial_buy_tokens: Option<f64>, pub dev_tx_count: u64,
-}
-```
-
-### 3.3. CheckpointDerivedFeatures — dane z checkpointów
-
-Lokalizacja: `ghost-core/src/checkpoint/types.rs:40-55`
-
-```rust
-pub struct CheckpointDerivedFeatures {
-    pub price_trajectory: Vec<f64>,             // historia cen z checkpointów
-    pub reserve_trajectory: Vec<(u64, u64)>,    // historia rezerw
-    pub buy_pressure_trend: TrendDirection,     // Rising/Falling/Stable/Insufficient
-    pub signer_diversity_trend: TrendDirection,
-    pub risk_flag_count_trend: TrendDirection,
-    pub trajectory_checkpoint_count: u32,
-    pub price_change_from_first_checkpoint_pct: f64,  // zmiana % od pierwszego checkpointu
-    pub single_tx_max_price_impact_pct: f64,          // max % impact pojedynczego TX
-    pub max_single_sell_impact_pct: f64,              // max % impact pojedynczej sprzedaży
-    pub bonding_progress: f64,                        // 0.0-1.0
-}
-```
-
-### 3.4. GatekeeperAssessment — wynik 6-fazowej oceny
-
-Lokalizacja: `ghost-launcher/src/components/gatekeeper.rs:1208-1279`
-
-```rust
-pub struct GatekeeperAssessment {
-    // 6 faz
-    pub phase1_passed: bool,        pub phase2_velocity: Option<VelocityProfile>,
-    pub phase2_passed: bool,        pub phase3_diversity: Option<SignerDiversityProfile>,
-    pub phase3_passed: bool,        pub phase4_volume: Option<VolumeSanityProfile>,
-    pub phase4_passed: bool,        pub phase5_dev: Option<DevBehaviorProfile>,
-    pub phase5_passed: bool,        pub phase6_curve: Option<BondingCurveDynamics>,
-    pub phase6_passed: bool,        pub phases_passed: u8,
-
-    // Decyzja
-    pub hard_reject_reason: Option<String>,
-    pub decision: Option<GatekeeperDecision>,
-
-    // V2.5
-    pub trajectory: Option<TrajectoryAssessment>,
-    pub pdd_assessment: Option<PddDiagnostics>,
-    pub aps_diagnostics: Option<ApsDiagnostics>,
-    pub observation_stage: Option<ObservationStage>,
-    pub entry_drift_pct: Option<f64>,
-    pub v25_confidence: Option<f64>,
-    pub v25_shadow_decisions: Vec<ShadowV25Decision>,
-
-    // Metadane
-    pub total_tx_evaluated: usize,   pub observation_duration_ms: u64,
-    pub buy_count: usize,            pub checkpoint_count: u32,
-
-    // SSOT feature bundle (dla replay/loggera)
-    pub feature_snapshot: MaterializedFeatureSet,
-}
-```
-
-### 3.5. GatekeeperDecision — wynik warstw decyzyjnych
-
-```rust
-pub struct GatekeeperDecision {
-    pub hard_fail_reason: Option<String>,
-    pub core1_passed: bool,         pub core2_passed: bool,     pub core3_passed: bool,
-    pub dev_unknown: bool,
-    pub soft_signals: SoftSignals,  pub soft_points: u8,
-    pub sybil_policy: SybilPolicyDiagnostics,
-    pub alpha_gate: AlphaGateDiagnostics,
-    pub prosperity_filter: ProsperityFilterDiagnostics,
-    pub total_soft_points: u16,
-    pub verdict_type: GatekeeperVerdictType,
-    pub verdict_buy: bool,
-    pub reason_chain: String,       // pełny łańcuch powodów decyzji
-    pub gatekeeper_strength: Option<GatekeeperStrength>,  // Strong/Borderline dla IWIM
-}
-```
-
----
-
-## 4. INGESTIA
-
-### 4.1. Seer — Yellowstone gRPC ingestion
-
-```
-off-chain/components/seer/src/grpc_connection.rs  →  połączenie gRPC
-off-chain/components/seer/src/lib.rs              →  start serwisu, konfiguracja
-off-chain/components/seer/src/ipc.rs              →  IPC między procesami
-off-chain/components/seer/src/types.rs            →  typy eventów
-```
-
-Seer łączy się z Yellowstone gRPC (Chainstack: `yellowstone-solana-mainnet.core.chainstack.com:443`), subskrybuje:
-- `SubscribeUpdate::Account` — aktualizacje kont bonding curve Pump.fun
-- `SubscribeUpdate::Transaction` — transakcje na poolach
-
-Eventy są normalizowane do wewnętrznego formatu i wysyłane przez event bus.
-
-### 4.2. SnapshotListener — jedyny writer do AccountStateCore
-
-Plik: `ghost-launcher/src/components/snapshot_listener.rs`
-
-SnapshotListener odbiera eventy z Seer/event bus i:
-1. Parsuje AccountUpdate → `AccountStateUpdate { sol_reserves, token_reserves, slot, ... }`
-2. Wywołuje `AccountStateReducer::update_account_state(update)`
-3. Reducer waliduje: monotoniczność slotów (`last_update_slot`), monotoniczność `receive_seq`
-4. Aktualizuje `CanonicalPoolState` z nowymi rezerwami, ceną, market capem
-5. Emituje zaktualizowany `AccountStateFeatures`
-
-**Kontrakt:** SnapshotListener jest JEDYNYM kanonicznym writerem do silnika snapshotów. Runtime nie może dublować `handle_tx_event`.
-
-### 4.3. Wzbogacanie TX w sesji
-
-`pool_observation_task` (runtime.rs) → dla każdego TX:
-1. `maybe_materialize_canonical_state_from_observed_tx` — pobiera stan z AccountStateCore
-2. Enrichment z AccountStateCore + fallback ShadowLedger
-3. `fingerprint_aggregator.observe_transaction()` — wczesne metryki (sell_buy_ratio, jito_tip_intensity, itd.)
-4. `session.ingest_transaction(tx)` → GatekeeperBuffer
-
----
-
-## 5. SESJA OBSERWACJI
-
-### 5.1. PoolObservationSession — stan per pool
-
-Lokalizacja: `ghost-launcher/src/session/observation.rs:34-63`
-
-```rust
-pub struct PoolObservationSession {
-    pub session_id: SessionId,
-    pub pool_amm_id: Pubkey,          pub base_mint: Pubkey,
-    pub bonding_curve: Pubkey,        pub dev_wallet: Option<Pubkey>,
-    pub created_at_wall_ms: u64,      pub deadline_wall_ms: u64,
-    pub status: SessionStatus,
-    pub tx_buffer: VecDeque<Arc<PoolTransaction>>,
-    pub tx_keys_seen: HashSet<TxKey>,
-    pub highest_seen_ts_ms: u64,
-    pub account_state_core: Arc<AccountStateReducer>,    // stan on-chain
-    pub account_features: AccountStateFeatures,          // ostatni snapshot
-    pub gatekeeper_buffer: GatekeeperBuffer,             // bufor transakcji
-    pub tx_intelligence: TxIntelligenceEngine,           // cechy TX
-    pub tx_intel_features: TxIntelFeatures,              // ostatni snapshot TX
-    pub cross_pool_velocity_index: Arc<CrossPoolVelocityIndex>,
-    pub funding_source_index: Arc<FundingSourceIndex>,
-    pub checkpoint_engine: CheckpointEngine,             // checkpointy
-    pub feature_builder: ObservationFeatureBuilder,      // materializator
-    pub checkpoints: Vec<SessionCheckpoint>,
-    pub active_risk_flags: Vec<RiskFlag>,
-}
-```
-
-### 5.2. materialize_features() — budowanie SSOT
-
-Lokalizacja: `ghost-launcher/src/session/observation.rs:368-490`
-
-```rust
-pub fn materialize_features(&self) -> MaterializedFeatureSet {
-    // 1. Podstawowa materializacja z feature_buildera
-    let account_features = self.current_account_features();
-    let mut materialized = self.feature_builder.materialize(
-        account_features.clone(),
-        self.tx_intel_features.clone(),     // TxIntelFeatures
-        &self.checkpoints,                  // CheckpointDerivedFeatures
-        self.active_risk_flags.clone(),     // RiskFlag
-        self.session_metadata(),            // SessionMetadata
-    );
-
-    // 2. Uzupełnienie z GatekeeperBuffer (curve dynamics)
-    let curve_dynamics = self.gatekeeper_buffer.current_curve_dynamics();
-    materialized.checkpoint_features.single_tx_max_price_impact_pct
-        = materialized.checkpoint_features.single_tx_max_price_impact_pct
-            .max(curve_dynamics.max_single_tx_price_impact_pct);
-    materialized.checkpoint_features.max_single_sell_impact_pct
-        = materialized.checkpoint_features.max_single_sell_impact_pct
-            .max(curve_dynamics.max_single_sell_impact_pct);
-
-    // 3. CurveReadiness z AccountStateCore
-    materialized.curve_readiness = self.current_curve_readiness();
-
-    // 4. Price change — fallback z gatekeeper_buffer
-    if materialized.checkpoint_features.price_change_from_first_checkpoint_pct.abs() <= f64::EPSILON
-        && curve_dynamics.price_data_points >= 2
-    {
-        materialized.checkpoint_features.price_change_from_first_checkpoint_pct
-            = (curve_dynamics.price_change_ratio - 1.0) * 100.0;
-    }
-
-    // 5. Bonding progress fallback
-    if materialized.account_features.update_count == 0 {
-        let fallback_bonding_progress = self.candidate_snapshot.bonding_curve_progress
-            .or_else(|| self.candidate_snapshot.shadow_bonding_progress.map(|p| p as f64 / 100.0))
-            .unwrap_or_else(|| if curve_dynamics.curve_data_known { curve_dynamics.bonding_progress_pct / 100.0 } else { 0.0 });
-        materialized.account_features.bonding_progress = fallback_bonding_progress;
-    }
-
-    // 6. Alpha fingerprint z EarlyFingerprintAggregator
-    if let Some(fingerprint) = self.fingerprint_metrics() {
-        materialized.alpha_fingerprint = AlphaFingerprintFeatures {
-            avg_inner_ix_count_50tx: fingerprint.avg_inner_ix_count_50tx,
-            sell_buy_ratio: fingerprint.sell_buy_ratio,
-            compute_unit_cluster_dominance: fingerprint.compute_unit_cluster_dominance,
-            static_fee_profile_ratio: fingerprint.static_fee_profile_ratio,
-            jito_tip_intensity: fingerprint.jito_tip_intensity,
-            early_slot_volume_dominance_buy: fingerprint.early_slot_volume_dominance_buy,
-            early_top3_buy_volume_pct_3s: fingerprint.early_top3_buy_volume_pct_3s,
-            fixed_size_buy_ratio: fingerprint.fixed_size_buy_ratio,
-            flipper_presence_ratio: fingerprint.flipper_presence_ratio,
-        };
-    }
-
-    // 7. Sybil resistance
-    let sybil = compute_sybil_resistance(self.tx_buffer.iter().map(AsRef::as_ref), sybil_dev_wallet.as_deref());
-    materialized.sybil_resistance.fee_topology_diversity_index = sybil.fee_topology_diversity_index;
-    materialized.sybil_resistance.dev_buyer_infrastructure_affinity = sybil.dev_buyer_infrastructure_affinity;
-    materialized.sybil_resistance.spend_fraction_divergence = sybil.spend_fraction_divergence;
-    materialized.sybil_resistance.demand_elasticity_score = sybil.demand_elasticity_score;
-    materialized.sybil_resistance.degraded_reasons = sybil.degraded_reasons;
-
-    // 8. Cross-pool velocity
-    let cpv = self.cross_pool_velocity_index.compute_for_transactions(
-        self.pool_amm_id.to_string().as_str(),
-        self.tx_buffer.iter().map(AsRef::as_ref),
-        Some(cpv_anchor_ts_ms),
-        &self.cross_pool_velocity_config,
-    );
-    materialized.sybil_resistance.signer_cross_pool_velocity = cpv.signer_cross_pool_velocity;
-
-    // 9. Funding source (jeśli aktywne)
-    // ... FSC computation ...
-
-    materialized  // ← to jest SSOT dla decyzji
-}
-```
-
----
-
-## 6. GATEKEEPERBUFFER
-
-### 6.1. Struktura bufora
-
-Lokalizacja: `ghost-launcher/src/components/gatekeeper.rs:2302+`
-
-```rust
-pub struct GatekeeperBuffer {
-    pub pool_id: Pubkey,
-    pub config: GatekeeperV2Config,
-    pub state: PoolState,                     // Tracked → Approved → Committed
-
-    // Akumulacja transakcji
-    pub buffered_txs: Vec<GatekeeperBufferedTx>,
-    pub tx_keys_seen: HashSet<TxKey>,
-    pub total_tx_count: usize,
-    pub buy_count: usize,       pub sell_count: usize,
-    pub total_volume_sol: f64,  pub buy_volume_sol: f64,
-    pub max_consecutive_buys: u64,
-    pub unique_signers: HashSet<String>,
-    pub signer_stats: HashMap<String, SignerStats>,
-    pub dust_filtered_count: u64,
-    pub failed_tx_count: u64,
-
-    // Śledzenie czasu
-    pub registered_wall_ts_ms: u64,
-    pub deadline_wall_ts_ms: u64,
-    pub first_tx_ts: Option<u64>,
-    pub highest_seen_ts: u64,
-    pub curve_t0_event_ts_ms: Option<u64>,
-    pub curve_t0_clock_source: Option<&'static str>,
-
-    // Historia cen (dla PDD i Phase 6)
-    pub price_history: Vec<PricePoint>,
-
-    // Dev tracking
-    pub dev_wallet: Option<String>,
-    pub dev_buy_total_sol: f64,
-    pub dev_has_sold: bool,
-    pub dev_tx_count: u64,
-
-    // Stan decyzyjny
-    pub phase1_passed: bool,
-    pub rejected: bool,
-    pub eval_count: usize,
-    pub curve_ready: bool,
-
-    // V2.5 shadow
-    pub v25_shadow_decisions: Vec<ShadowV25Decision>,
-    pub early_shadow_fired: bool,
-    pub normal_shadow_fired: bool,
-    pub window_stage: ObservationStage,
-}
+Zachowywane grupy pól:
+
+- identity: `pool_amm_id`, `mint/token_mint`, `signature`, `event_ordinal`,
+  `slot`,
+- ordering/provenance: `timestamp_ms`, `event_time`, `arrival_ts_ms`,
+  instruction provenance, CPI stack,
+- actor: `signer`, `is_dev_buy`,
+- trade semantics: `is_buy`, `volume_sol`, `sol_amount_lamports`,
+  `token_amount_units`,
+- curve: reserves, price quote, market cap, curve finality,
+- execution fingerprints: CU price, CU limit, CU consumed, inner ix count,
+  CPI depth, ATA count, Jito tip,
+- owner token deltas and MPCF/toolchain fingerprint inputs.
+
+`PoolTransaction` jest głównym eventem transakcyjnym konsumowanym przez
+observation session.
+
+### 5.6 Session gate po stronie Seer bridge
+
+Seer bridge nie spamuje całego runtime wszystkimi trade'ami z chaina. Działa
+session gate:
+
+- `PoolDetected` rejestruje pool jako obserwowany.
+- Trade przed rejestracją może być buforowany krótko.
+- Po `PoolDetected` bridge replayuje gotowe trade'y dla tego poola.
+- Trade bez forwardable identity jest odrzucany przed EventBus.
+- AccountUpdate ma analogiczny bridge/buffer, gdy canonical relay jest włączony.
+
+To chroni Gatekeepera przed ocenianiem pooli, których runtime faktycznie nie
+otworzył.
+
+### 5.7 Funding lane
+
+`FundingTransferObserved` przenosi:
+
+- source wallet,
+- recipient wallet,
+- lamports,
+- slot/event ordinal/provenance,
+- full-chain coverage flag,
+- producer sequence number.
+
+Te dane zasilają funding-source / FSC / sybil resistance, ale same nie są
+terminalnym verdictem.
+
+## 6. EventBus i runtime plane
+
+`GhostEvent` jest busowym modelem zdarzeń. Aktywne dla Gatekeepera V2.5:
+
+- `NewPoolDetected`
+- `PoolTransaction`
+- `FundingTransferObserved`
+- `AccountUpdate`
+- `GatekeeperCommitted`
+- `ShadowBuySimulated`
+- `PostBuySubmitted`
+
+Legacy/observability:
+
+- `PoolScored` jest klasyfikowany jako legacy observation plane.
+- Nie wolno traktować go jako źródła aktualnej decyzji.
+
+EventBus używa broadcast semantics. Konsekwencje:
+
+- event może mieć wielu odbiorców,
+- opóźniony odbiorca może lagować,
+- runtime musi jawnie obsługiwać closed/lagged branches,
+- decyzja Gatekeepera nie może zależeć od ukrytego side-effectu odbiorcy, który
+  nie jest częścią materializacji.
+
+## 7. OracleRuntime: routing i per-pool lifecycle
+
+`OracleRuntime` jest aktywnym koordynatorem:
+
+- rejestruje nowe poole,
+- tworzy per-pool observation task,
+- utrzymuje `SessionManager`,
+- utrzymuje `AccountStateCore`,
+- remapuje identity pool/base_mint,
+- buforuje orphan tx, jeśli TX przyszedł przed rejestracją,
+- obsługuje `AccountUpdate` worker,
+- egzekwuje deadline/DOW timers,
+- loguje verdicty i handoff do triggera.
+
+### 7.1 NewPoolDetected
+
+Po `GhostEvent::NewPoolDetected` runtime:
+
+1. normalizuje identity pool/base_mint,
+2. rejestruje identity w registry,
+3. tworzy/open session przez `SessionManager`,
+4. startuje `pool_observation_task`,
+5. replayuje orphan tx, jeśli były,
+6. zakłada deadline z configu Gatekeepera.
+
+Jeden pool powinien mieć jedną aktywną observation session.
+
+### 7.2 PoolTransaction
+
+Po `GhostEvent::PoolTransaction` runtime:
+
+1. rozwiązuje pool identity,
+2. odrzuca/re-mapuje niespójności base_mint/pool_amm_id,
+3. jeśli pool jest już committed/approved, może kierować TX do post-commit path,
+4. jeśli pool ma aktywny observation task, wysyła TX do tego taska,
+5. jeśli session jeszcze nie istnieje, buforuje orphan tx.
+
+Nie ma tutaj policy decision. To routing danych.
+
+### 7.3 AccountUpdate
+
+`AccountUpdate` może zasilać `AccountStateCore`, gdy canonical relay jest
+aktywny. Aktualizacja ma:
+
+- base mint,
+- bonding curve,
+- reserves,
+- slot,
+- optional write_version,
+- receive sequence,
+- curve finality.
+
+`AccountStateCore` akceptuje tylko monotonicznie nowsze update'y:
+
+1. większy slot,
+2. albo ten sam slot i większy `write_version`,
+3. albo ten sam slot/write_version i większy receive sequence.
+
+Stare/duplikowane update'y są odrzucane jako stale evidence.
+
+### 7.4 Deadline i DOW timer
+
+Per-pool task używa `tokio::select!` dla:
+
+- TX z kanału,
+- DOW timer tick,
+- hard deadline,
+- channel close/shutdown.
+
+DOW timer ma `MissedTickBehavior::Skip`, aby nie nadrabiać zaległych ticków
+hurtem. Terminalny deadline pozostaje single final evaluation. DOW checkpointy
+są shadow evidence.
+
+## 8. PoolObservationSession
+
+`PoolObservationSession` jest lokalnym stanem obserwacji poola. Posiada:
+
+- `GatekeeperBuffer`,
+- `TxIntelligenceEngine`,
+- `AccountStateCore` reference,
+- `CheckpointEngine`,
+- `ObservationFeatureBuilder`,
+- bounded tx buffer,
+- CPV index,
+- FSC index,
+- diagnostics/session metadata.
+
+### 8.1 TX ingest w session
+
+`ingest_transaction()` robi kilka rzeczy, ale nadal nie wydaje terminalnej
+decyzji:
+
+1. podaje TX do `TxIntelligenceEngine`,
+2. podaje TX do `GatekeeperBuffer::ingest_transaction_tracking_only`,
+3. aktualizuje CPV/FSC,
+4. dodaje TX do bounded ring buffer,
+5. aktualizuje diagnostics.
+
+`tracking_only` jest ważne: active terminal evaluation ma iść z
+`MaterializedFeatureSet`, a nie z natychmiastowej decyzji przy każdej transakcji.
+
+### 8.2 Account state w session
+
+Session może:
+
+- przyjąć `AccountStateUpdate`,
+- zsynchronizować się z `AccountStateCore`,
+- użyć fallbacków, jeśli canonical account update nie jest jeszcze dostępny.
+
+Fallback nie może udawać canonical evidence. W materializacji musi być widoczne,
+czy dane curve/account są bootstrap/provisional/canonical.
+
+### 8.3 Checkpoints
+
+`CheckpointEngine` i `ObservationFeatureBuilder` produkują checkpoint-derived
+features, w tym trajectory assessment, jeśli dane są wystarczające. To jest
+Path A dla TAS.
+
+## 9. Właściciele danych i feature'ów
+
+| Obszar dowodów | Główny właściciel | Trafia do |
+|---|---|---|
+| Pool identity | Seer bridge + `PoolIdentityRegistry` | session/runtime/logs |
+| Tx count/buy/sell/signers/volume/timing | `TxIntelligenceEngine` | `tx_intel_features` |
+| Dev behavior | `TxIntelligenceEngine` | `tx_intel_features` |
+| Signer diversity/HHI/Gini/top3 | `TxIntelligenceEngine` | phase 3 |
+| Curve reserves/price/mcap/progress | `AccountStateCore` + parser/fallback | `account_features`, `curve_readiness` |
+| Checkpoint trajectory | `CheckpointEngine` | `checkpoint_features.trajectory_assessment` |
+| Raw T0/T1/T2 segment sequence | `GatekeeperBuffer` | `tx_segment_sequence` |
+| Early fingerprint metrics | `TxIntelligenceEngine` / Seer fingerprint agg | `alpha_fingerprint` |
+| Sybil resistance | tx-intelligence sybil metrics, CPV/FSC | `sybil_resistance` |
+| Funding provenance | Funding lane + FSC index | sybil/funding diagnostics |
+| Session metadata | `PoolObservationSession` | `session_metadata` |
+| Risk flags | `TxIntelligenceEngine` | `risk_flags` |
+
+## 10. MaterializedFeatureSet: główna granica SSOT
+
+`MaterializedFeatureSet` zawiera:
+
+- `account_features`,
+- `tx_intel_features`,
+- `checkpoint_features`,
+- `risk_flags`,
+- `session_metadata`,
+- `curve_readiness`,
+- `sybil_resistance`,
+- `alpha_fingerprint`,
+- `tx_segment_sequence`.
+
+To jest snapshot, który Gatekeeper ma oceniać. Po tej granicy policy nie powinna
+iść do live mutable state po własne, alternatywne feature'y.
+
+### 10.1 Materializacja krok po kroku
+
+`PoolObservationSession::materialize_features()`:
+
+1. pobiera aktualne account features z `AccountStateCore` albo jawnego fallbacku,
+2. pobiera `TxIntelFeatures` z `TxIntelligenceEngine`,
+3. pobiera checkpoint-derived features z `ObservationFeatureBuilder`,
+4. aktualizuje trajectory assessment,
+5. dołącza `tx_segment_sequence` z `GatekeeperBuffer`,
+6. dołącza curve readiness/finality,
+7. dołącza alpha fingerprint metrics,
+8. dołącza sybil resistance/CPV/FSC diagnostics,
+9. dołącza risk flags i session metadata.
+
+### 10.2 Path A i Path B
+
+TAS i część PDD mają dwa źródła dowodowe:
+
+- Path A: `checkpoint_features.trajectory_assessment`.
+- Path B: `tx_segment_sequence` z T0/T1/T2.
+
+Path B nie jest legacy. Jest aktywnym fallbackiem i explicit SSOT extension dla
+feature-driven policy. Jeżeli Path A nie istnieje, policy może zrekonstruować
+TAS z Path B, o ile segmenty spełniają warunki minimalne.
+
+`tx_segment_sequence` jest materializowany niezależnie od `tas.enabled`, bo PDD
+też potrzebuje sekwencji. To zapobiega sytuacji, w której wyłączenie TAS
+przypadkiem pozbawia PDD danych o spike/ramping.
+
+## 11. AccountStateCore
+
+`AccountStateCore` jest canonical reducerem stanu kont poola:
+
+- `CanonicalPoolState`,
+- `AccountStateUpdate`,
+- `AccountStateFeatures`,
+- `StatePhase`.
+
+Liczy:
+
+- virtual SOL/token reserves,
+- real SOL/token reserves,
+- price in SOL,
+- market cap in SOL,
+- bonding progress,
+- price change since T0,
+- reserve velocity,
+- curve finality,
+- update count.
+
+Ważne zasady:
+
+- update'y są monotoniczne po `(slot, write_version, recv_seq)`,
+- `write_version=None` jest normalizowany jako wysoka wartość dla same-slot
+  ordering,
+- old/stale update nie może nadpisać canonical state,
+- bootstrap state może zostać promowany po pierwszym real account update,
+- state phase mówi, czy dane są bootstrap-like, canonical czy migrated.
+
+## 12. TxIntelligenceEngine
+
+`TxIntelligenceEngine` agreguje transakcje w oknie obserwacji. Liczy:
+
+- total tx,
+- buy count,
+- sell count,
+- unique signers,
+- buy ratio,
+- SOL buy ratio,
+- avg/min/max TX SOL,
+- volume CV,
+- HHI,
+- volume Gini,
+- top3 volume pct,
+- unique signer ratio,
+- same-ms tx ratio,
+- bundle suspicion ratio,
+- max tx per signer,
+- max consecutive buys,
+- dust tx,
+- failed tx,
+- dev buy/sell behavior,
+- dev volume ratio,
+- timing entropy,
+- avg interval,
+- burst ratio.
+
+TX dedup używa `TxKey` z:
+
+- event timestamp,
+- slot,
+- event ordinal,
+- signature,
+- fallback counter.
+
+To pozwala odróżnić kilka semantic trade events w jednej transaction signature.
+
+### 12.1 Risk flags
+
+Risk flags mogą oznaczać m.in.:
+
+- developer sold,
+- extreme bot timing,
+- failed tx ratio,
+- dust/excessive burst patterns,
+- inne twarde/miękkie sygnały z tx-intelligence.
+
+Hard risk flag nie powinien być zasłonięty soft score.
+
+### 12.2 Early fingerprint
+
+Early fingerprinting korzysta z realnych pól tx-meta:
+
+- block0 sniped supply,
+- flip ratio,
+- CU price p90,
+- priority fee surge slope,
+- buyer pre-balance CV,
+- avg inner ix count,
+- avg CPI depth,
+- sell/buy ratio,
+- compute-unit cluster dominance,
+- static fee profile ratio,
+- fixed-size buy ratio,
+- flipper presence,
+- Jito tip intensity,
+- early-slot volume dominance,
+- early top3 buy concentration,
+- whale reversal,
+- dev paperhand latency.
+
+Jeżeli dane są niedostępne, fingerprint musi oznaczać degraded reason, a nie
+udawać zero-risk.
+
+### 12.3 Sybil metrics
+
+Sybil resistance opiera się m.in. na:
+
+- CPV - cross-pool velocity,
+- FSC - funding-source correlation,
+- FTDI - fee topology diversity,
+- DBIA - dev-buyer infrastructure affinity,
+- SFD - spend fraction divergence,
+- DES - demand elasticity score.
+
+Te pola mają degraded reasons, np. brak raw fee topology, brak dev buy, brak
+slot ordering, brak postbalance. Dla eksperta biznesowego degraded oznacza
+niepewność, nie pozytywny sygnał.
+
+## 13. GatekeeperBuffer
+
+`GatekeeperBuffer` w V2.5 pełni kilka ról:
+
+- utrzymuje buffered txs,
+- deduplikuje TX keys,
+- śledzi phase counters,
+- śledzi price history,
+- śledzi curve readiness/latch,
+- materializuje T0/T1/T2 sequence,
+- odpala DOW shadow checkpoints,
+- przechowuje `v25_shadow_decisions` do późniejszego logowania.
+
+Nie jest już jedynym źródłem terminalnej decyzji w aktywnej ścieżce. Terminalny
+path bierze snapshot z session i woła `evaluate_from_features()`.
+
+### 13.1 DOW checkpoint state
+
+DOW checkpointy mają stage:
+
+- Early,
+- Normal,
+- Extended.
+
+Źródło checkpointu:
+
+- TX path,
+- Timer path,
+- Deadline fallback.
+
+Każdy stage jest one-shot. Runtime pilnuje flags, żeby TX i timer nie odpaliły
+podwójnego shadow decision dla tego samego stage.
+
+## 14. Gatekeeper policy V2 core
+
+Aktywny terminalny call chain:
+
+```text
+OracleRuntime::evaluate_feature_driven_terminal_verdict()
+  -> PoolObservationSession::materialize_features()
+  -> GatekeeperBuffer::prepare_feature_evaluation()
+  -> GatekeeperBuffer::evaluate_from_features(features, config)
+  -> build_assessment_from_features()
+  -> evaluate_policy_from_assessment()
+  -> evaluate_curve_gate()
+  -> GatekeeperVerdict::{Buy, Reject, Timeout, PendingCurve}
 ```
 
-### 6.2. Ingestia transakcji (Long mode)
+### 14.1 Assessment construction
 
-`ingest_transaction_tracking_only()` (gatekeeper.rs:3508) → `ingest_long_transaction_tracking_only()` (gatekeeper.rs:3412):
+`build_assessment_from_features()` mapuje `MaterializedFeatureSet` na:
 
-1. **Dust filter:** TX z `volume_sol < min_sol_threshold` → dust_filtered_count++
-2. **Dedup:** TxKey w `tx_keys_seen`
-3. **Akumulacja:** update_tracking() → signer_stats, volume, buy/sell count, price_history
-4. **V2.5 shadow checkpoints:** przy `v25.shadow_enabled && dow.enabled`:
-   - Early (2-5s od rejestracji): `try_shadow_evaluate(ObservationStage::Early)`
-   - Normal (5-7s od rejestracji): `try_shadow_evaluate(ObservationStage::Normal)`
-5. **Deadline check:** jeśli `now_ms >= deadline_wall_ts_ms` → `GatekeeperIngressOutcome::DeadlineElapsed`
+- phase 1 quantity,
+- phase 2 velocity,
+- phase 3 diversity,
+- phase 4 volume,
+- phase 5 dev behavior,
+- phase 6 curve,
+- risk flags,
+- sybil diagnostics,
+- alpha diagnostics,
+- prosperity diagnostics,
+- PDD diagnostics,
+- APS diagnostics,
+- TAS assessment,
+- observation stage,
+- V2.5 confidence availability.
 
-### 6.3. run_assessment() — pełna ocena buforowa
+### 14.2 Policy order
 
-Lokalizacja: `gatekeeper.rs:4829-5085`
+Ewaluacja policy idzie w porządku:
 
-1. **Hard Reject (inline):** dev_has_sold, extreme_bot (hardcoded: interval_cv < 0.08 && avg < 30ms), extreme_hhi (hardcoded: > 0.5), extreme_price_manipulation (hardcoded: impact > 50%), failed_tx_ratio
-2. **Phase 2:** `compute_velocity_profile(tx_timestamps_sorted)` → VelocityProfile
-3. **Phase 3:** `compute_signer_diversity(signer_stats)` → SignerDiversityProfile
-4. **Phase 4:** `compute_volume_sanity(...)` → VolumeSanityProfile
-5. **Phase 5:** `compute_dev_behavior(...)` → DevBehaviorProfile
-6. **Phase 6:** `compute_bonding_curve_dynamics(price_history)` → BondingCurveDynamics
-7. **Trajektoria:** `materialize_trajectory(tas_config)` → TrajectoryAssessment
-8. **PDD:** `evaluate_pdd(self, pdd_config, None)` → PddDiagnostics (pełne 6/6 sygnałów)
+1. Hard filters z feature snapshotu i risk flags.
+2. PDD live hard veto tylko gdy V2.5 live execution i próg jest promowany.
+3. Core phase fail.
+4. Sybil combo / sybil interference / sybil soft excess.
+5. Legacy soft excess.
+6. Alpha gate.
+7. Prosperity filter.
+8. TAS modulation / low trajectory handling.
+9. BUY.
 
----
+To jest ważne: soft pozytywny wynik nie może przykryć twardego sygnału ryzyka.
 
-## 7. PIPELINE DECYZYJNY
+### 14.3 Sześć faz
 
-### 7.1. build_assessment_from_features() — mapowanie MaterializedFeatureSet → GatekeeperAssessment
+Phase 1 - Quantity:
 
-Lokalizacja: `ghost-launcher/src/components/gatekeeper_policy.rs:372-536`
+- minimalna liczba transakcji,
+- minimalna liczba unikalnych signerów,
+- minimalna liczba buy,
+- deadline okna.
 
-**Phase 1 — Quantity Gate** (policy.rs:377-379):
-```
-tx_count >= min_tx_count (12)
-&& unique_signers >= min_unique_signers (8)
-&& buy_count >= min_buy_count (6)
-```
+Phase 2 - Velocity:
 
-**Phase 2 — Velocity** (policy.rs:381-394):
-```
-velocity_profile_from_features(&features)
-  → interval_cv in [min_interval_cv, max_interval_cv]
-  → burst_ratio <= max_burst_ratio
-  → avg_interval_ms in [min_avg_interval_ms, max_avg_interval_ms]
-  → timing_entropy in [min_timing_entropy, max_timing_entropy]
-  → dust_tx_count >= min_dust_filtered_count
-```
+- średni interwał,
+- interval CV,
+- burst ratio,
+- timing entropy.
 
-**Phase 3 — Signer Diversity** (policy.rs:396-400):
-```
-signer_diversity_from_features(&features)
-  → unique_ratio in [min_unique_ratio, max_unique_ratio]
-  → hhi <= max_hhi
-  → max_tx_per_signer <= max_tx_per_signer
-  → volume_gini in [min_volume_gini, max_volume_gini]
-  → top3_volume_pct <= max_top3_volume_pct
-  → same_ms_tx_ratio <= max_same_ms_tx_ratio
-```
+Phase 3 - Diversity:
 
-**Phase 4 — Volume Sanity** (policy.rs:402-408):
-```
-volume_sanity_from_features(&features)
-  AND alpha_fingerprint_phase4_passes(&features.alpha_fingerprint)
-    → buy_ratio in [min_buy_ratio, max_buy_ratio]
-    → avg_tx_sol in [min_avg_tx_sol, max_avg_tx_sol]
-    → volume_cv in [min_volume_cv, max_volume_cv]
-    → total_volume_sol in [min_total_volume_sol, max_total_volume_sol]
-    → sol_buy_ratio in [min_sol_buy_ratio, max_sol_buy_ratio]
-    → max_consecutive_buys >= min_consecutive_buys
-    → alpha_fingerprint thresholds passes (8 osobnych progów dla fingerprint metryk)
-```
+- HHI signer/volume concentration,
+- volume Gini,
+- top3 volume,
+- unique signer ratio,
+- max tx per signer.
 
-**Phase 5 — Dev Behavior** (policy.rs:410-431):
-```
-dev_behavior_from_features(&features)
-  → jeśli dev_wallet_known:
-      dev_buy_total_sol in [min_dev_buy_sol, max_dev_buy_sol]
-      dev_tx_ratio in [min_dev_tx_ratio, max_dev_tx_ratio]
-      dev_volume_ratio in [min_dev_volume_ratio, max_dev_volume_ratio]
-      (!dev_has_sold || !reject_on_dev_sell)
-  → jeśli !dev_wallet_known: auto-pass
-```
+Phase 4 - Volume:
 
-**Phase 6 — Bonding Curve Dynamics** (policy.rs:432-451):
-```
-bonding_curve_from_features(&features)
-  → jeśli price_data_points < 2: auto-pass
-  → price_change_ratio <= max_price_change_ratio
-  → max_single_tx_price_impact_pct <= max_single_tx_price_impact_pct
-  → max_single_sell_impact_pct <= max_single_sell_impact_pct
-  → jeśli curve_data_known:
-      bonding_progress_pct in [min_bonding_progress_pct, max_bonding_progress_pct]
-      current_market_cap_sol >= min_market_cap_sol
-```
+- buy ratio,
+- SOL buy ratio,
+- avg tx SOL,
+- volume CV,
+- max consecutive buys,
+- fingerprint/alpha choke inputs.
 
-Następnie (policy.rs:453-535):
-- `phases_passed = count(true)` z 6 faz
-- `hard_reject_reason = evaluate_hard_filters_from_assessment()`
-- `pdd_assessment = materialize_pdd_diagnostics_from_features()` (feature-driven, 3/6 PDD)
-- `aps_diagnostics = evaluate_aps()` (shadow)
-- `observation_stage = derive_observation_stage_from_features()` (Early/Normal/Extended)
+Phase 5 - Developer:
 
-### 7.2. evaluate_policy_from_assessment() — 8-warstwowa decyzja
+- dev buy SOL,
+- dev volume ratio,
+- dev tx ratio,
+- dev sold,
+- dev first buyer / initial tokens.
 
-Lokalizacja: `ghost-launcher/src/components/gatekeeper_policy.rs:863-1140`
+Phase 6 - Curve:
 
-**WARSTWA 0: Hard Fails** (policy.rs:870-893)
-```
-evaluate_hard_filters_from_assessment(assessment, config)
-  → HF-1: DevSold         — reject_on_dev_sell && dev_has_sold
-  → HF-2: SellImpact      — max_single_sell_impact > config
-  → HF-3: TxPriceImpact   — max_single_tx_price_impact > config
-  → HF-4: PriceChange     — price_change_ratio > max_price_change_ratio
-  → HF-5: MarketCapTooLow — market_cap < min_market_cap_sol
-  → HF-6: ExtremeHhi      — hhi > hard_fail_hhi
-  → HF-7: ExtremeBundling — same_ms_tx_ratio > hard_fail_same_ms_tx_ratio
-  → HF-8: ExtremeTop3     — top3_volume_pct > hard_fail_top3_volume_pct
-  → HF-9: ExtremeBotTiming — interval_cv < 0.08 && avg_interval < 30ms && tx >= hard_fail_bot_min_tx
-  → HF-10: FailedTxRatio   — failed_ratio > min_failed_tx_ratio_for_bot_flag
-  → HF-11: SlowPool        — avg_interval_ms > max_avg_interval_ms
-```
+- price change ratio,
+- market cap SOL,
+- bonding progress min/max,
+- curve data known,
+- curve finality.
 
-**WARSTWA 1: PDD Live Veto** (policy.rs:896-947)
-```
-Warunek: pdd.enabled && v25.live_execution_enabled
-Dla każdego PDD hard fail: sprawdź *_promoted_to_live flag
-  → EntryDrift → entry_drift_promoted_to_live → RejectEntryDrift
-  → Spike      → spike_promoted_to_live      → RejectPumpAndDump
-  → Ramping    → ramping_promoted_to_live    → RejectRamping
-  → Whale      → whale_promoted_to_live      → RejectPumpAndDump
-  → Reserve    → reserve_promoted_to_live    → RejectPumpAndDump
-  → FlashCrash → flash_crash_promoted_to_live → RejectFlashCrash
-Nielive (niepromowane) → pomijane w live, nadal widoczne w shadow
-```
+## 15. V2.5 modules
 
-**WARSTWA 2: Core Fail** (policy.rs:949-963)
-```
-Core1 = Phase1 (Quantity Gate)
-Core2 = Phase4 (Volume Sanity)
-Core3 = złożenie Phase5 + Phase6:
-  → dev_unknown: auto-pass Phase5, zaostrzone Phase6
-     (używa dev_unknown_max_single_tx_price_impact_pct,
-      dev_unknown_min_market_cap_sol)
-  → dev_known: Phase5 && Phase6
-```
+### 15.1 DOW - Dynamic Observation Window
 
-**WARSTWA 3: Sybil Combo Veto** (policy.rs:964-971)
-```
-sybil_combo_veto_reason(&diagnostics.sybil_policy, config)
-  → HighDbiaLowFtdiLowSfd
-  → LowDesLowSfd + (HighDbia || LowFtdi)
-  → HighFscHighCpv + (LowDes || LowSfd)
-```
+DOW odpowiada na pytanie: czy Gatekeeper mógłby zdecydować wcześniej albo
+później niż klasyczne 10 sekund, i co to mówi o jakości scoringu?
 
-**WARSTWA 4: Sybil Soft Excess** (policy.rs:972-990)
-```
-sybil_policy.soft_points > effective_max_sybil_soft_points
-```
+Mechanika:
 
-**WARSTWA 5: Legacy Soft Excess** (policy.rs:991-1003)
-```
-diagnostics.soft_points > effective_max_soft_points
-gdzie soft_points = compute_soft_signals().weighted_score(weights)
-```
+- Early checkpoint sprawdza szybki, mocny sygnał.
+- Normal checkpoint reprezentuje standardowe okno.
+- Extended checkpoint reprezentuje cierpliwszą ocenę przy słabszej pewności.
+- Shadow decision jest logowany jako evidence.
+- Terminalny live verdict nie jest mutowany przez shadow checkpoint.
 
-**WARSTWA 6: Alpha Gate** (policy.rs:1005-1022)
-```
-evaluate_alpha_gate(features, config) — selektor pozytywny
-  1. momentum = 0.36*norm(burst) + 0.34*norm(interval) + 0.20*norm(entropy) + 0.10*norm(buys)
-     × jito_boost × dominance_boost
-  2. demand = 0.35*norm(buys) + 0.35*norm(signers) + 0.30*norm(buy_ratio)
-     × fixed_size_penalty × flipper_penalty
-  3. joint = momentum * demand
+`GatekeeperBuffer::new()` fail-fast sprawdza, że `extended_window_ms` nie
+przekracza `max_wait_time_ms`. Przy aktualnym configu oba wynoszą 10000 ms.
 
-Odrzucenie gdy:
-  → momentum < min_momentum       (0.55)
-  → demand < min_demand           (0.55)
-  → joint < min_alpha_joint       (0.35)
-  → buy_count < min_alpha_sample  (15)
-  → missing alpha_inputs (jito_tip, fixed_size, flipper — None)
+### 15.2 TAS - Trajectory Aware Scoring
+
+TAS odpowiada na pytanie: czy aktywność poola wygląda jak zdrowa trajektoria,
+czy tylko jak chwilowy peak?
+
+Dzieli okno na trzy segmenty:
+
+- T0 - początek,
+- T1 - środek,
+- T2 - końcówka.
+
+Liczy:
+
+- momentum score: T2/T0 tx count,
+- HHI trajectory: spadek koncentracji jest dobry,
+- volume consistency: zbyt niestabilny wolumen obniża score,
+- interval trajectory: skracające się interwały mogą być pozytywnym momentum,
+- buy ratio stability.
+
+Wynik `overall_tas_score` mapuje się na confidence modulator
+`0.75..1.25`. Bardzo niski score może tworzyć low trajectory reject/demotion.
+
+### 15.3 PDD - Pump & Dump Detector
+
+PDD odpowiada na pytanie: czy wejście już jest spóźnione albo czy widzimy
+schemat pompy/dumpu?
+
+Path A z buffer/price history:
+
+- entry drift z hierarchią anchorów,
+- spike,
+- ramping,
+- whale concentration,
+- reserve health,
+- flash crash.
+
+Entry drift anchor hierarchy:
+
+1. init-pool authoritative: curve data known i real reserve,
+2. AccountStateCore reserve,
+3. parser-authoritative curve data,
+4. fallback price history.
+
+Path B z `tx_segment_sequence`:
+
+- spike z T2 volume rate vs wcześniejsze segmenty,
+- ramping z same-size streak w T1/T2,
+- flash crash jest jawnie unavailable, bo Path B nie ma price impact data.
+
+To nie jest brak ryzyka. To brak dowodu. Dokumenty/raporty powinny traktować
+unavailable jako osobny stan.
+
+### 15.4 APS - Adaptive Prosperity
+
+APS odpowiada na pytanie: czy progi prosperity powinny zależeć od reżimu rynku?
+
+Aktualnie działa jako shadow/offline suggestions:
+
+- wykrywa `Normal`, `HighVolatility`, `LowVolatility`,
+- ma calibration guard `min_calibration_samples`,
+- w aktualnym profilu `adaptive_enabled=false`,
+- nie mutuje live thresholds.
+
+APS może powiedzieć, czy prosperity filter przeszedłby przy progach
+kontrfaktycznych. To jest materiał do kalibracji, nie bezpośrednia zmiana BUY.
+
+### 15.5 V2.5 confidence
+
+V2.5 confidence jest multiplicative:
+
+```text
+base_quality
+  * alpha_quality
+  * pdd_modulator
+  * tas_modulator
+  * sybil_modulator
 ```
 
-**WARSTWA 7: Prosperity Filter** (policy.rs:1024-1078)
-```
-evaluate_prosperity_filter(assessment, config) — 3 gałęzie:
+PDD hard fail lub TAS hard reject może wyzerować confidence. Brak danych ma być
+raportowany przez availability/degraded fields, a nie ukrywany jako czysty
+wynik.
 
-B1: conviction_clean_sells
-  → block0_sniped_supply_pct >= prosperity_branch1_min_block0_sniped_supply_pct
-  → sell_buy_ratio <= prosperity_branch1_max_sell_buy_ratio
+## 16. Curve gate
 
-B2: large_cap_buy_dominance
-  → market_cap >= prosperity_branch2_min_market_cap_sol
-  → early_slot_volume_dominance_buy >= prosperity_branch2_min_early_slot_volume_dominance_buy
+Curve gate jest osobnym krokiem po policy decision. Nawet jeżeli policy mówi
+BUY, curve gate może:
 
-B3: organic_structure
-  → hhi <= prosperity_branch3_max_hhi
-  → fee_topology_diversity_index >= prosperity_branch3_min_fee_topology_diversity_index
+- przepuścić, gdy curve jest ready/fresh/committed,
+- zwrócić `PendingCurve`, gdy dane są nieznane i jest jeszcze czas,
+- odrzucić, gdy curve timeout/stale policy wymaga reject,
+- dopuścić stale tylko przy jawnej polityce fallback.
 
-Dodatkowo: prosperity overlay (opcjonalny, enable_prosperity_overlay)
-  → price_change, bonding_progress, fee_topology, branch23_sell_buy, branch2_price
+`PendingCurve` nie jest terminalnym verdictem. Runtime rollbackuje feature
+evaluation i czeka dalej, o ile deadline/policy na to pozwala.
 
-Przejście wymaga: market_cap_floor_pass && cpv_pass && minimum 1 base branch
-  oraz (jeśli overlay): wszystkie overlay checks
-```
+Curve policy jest synchronizowana z `[shadow_ledger]` jako SSOT w launcherze.
+Jeżeli Gatekeeper config i shadow ledger config różnią się w `curve_wait_ms`,
+`curve_require_for_buy` albo `stale_fallback`, startup nadpisuje policy
+Gatekeepera wartościami z shadow ledger config.
 
-### 7.3. TAS modulacja (po przejściu wszystkich warstw)
+## 17. Verdicts i reason codes
 
-Lokalizacja: `gatekeeper_policy.rs:1080-1119`
+Terminalne i pomocnicze typy:
 
-Po przejściu wszystkich warstw, dla werdyktu BUY:
-1. Oblicz `tas_score` z `assessment.trajectory` (jeśli dostępne)
-2. Ustal `GatekeeperStrength`:
-   - **Strong:** soft_points <= effective_max - iwim_veto_strong_margin (margines 3)
-     && manipulation_flag_count <= iwim_veto_strong_max_manip_flags (0 flag)
-   - **Borderline:** w przeciwnym razie
-3. TAS demotion: jeśli `is_strong && tas_score < 0.45` → zdegraduj do Borderline
+- `Wait` - wewnętrzne, nieterminalne.
+- `PendingCurve` - nieterminalne oczekiwanie na curve evidence.
+- `Buy` - Gatekeeper approve.
+- `Reject` - terminalne odrzucenie.
+- `Timeout` - terminalny brak wystarczających danych/faz w deadline.
+- `ApprovedTx` - post-approval event type, nie główny feature evaluation verdict.
 
-Ta klasyfikacja jest używana przez IWIM Veto Gate: Strong → IWIM tylko blokuje na HIGH confidence VETO, Borderline → IWIM timeout/unknown = REJECT.
+`GatekeeperVerdictType` obejmuje m.in.:
 
-### 7.4. evaluate_curve_gate() — krzywa wiązania
+- BUY / EARLY_BUY / EXTENDED_BUY,
+- hard fail classes,
+- core fail,
+- sybil rejects,
+- alpha/prosperity rejects,
+- PDD rejects,
+- TAS/low trajectory rejects,
+- IWIM rejects,
+- timeout subtypes.
 
-Lokalizacja: `gatekeeper_policy.rs:1239-1312`
+`GatekeeperReasonCode` v2 zapisuje stabilne `SCREAMING_SNAKE_CASE`, np.:
 
-Decyduje czy krzywa jest gotowa przed wykonaniem BUY:
-```
-curve_readiness.is_ready || freshness == Fresh/Committed
-  → Ready: kontynuuj
-  → Pending: czekaj do curve_wait_ms
-  → Reject:
-      - Unknown + !curve_require_for_buy → odrzuć
-      - Unknown + wait_elapsed > curve_wait_ms → timeout
-      - Stale + Reject fallback → odrzuć
-```
+- `BUY_NORMAL`, `BUY_EARLY`, `BUY_EXTENDED`,
+- `HARD_FAIL_DEV_SOLD`, `HARD_FAIL_MARKET_CAP`,
+- `REJECT_PDD_ENTRY_DRIFT`, `REJECT_PDD_SPIKE`,
+- `REJECT_LOW_ALPHA`, `REJECT_LOW_PROSPERITY`,
+- `REJECT_IWIM_VETO`, `REJECT_IWIM_LOW_CONF`,
+- `REJECT_LOW_TRAJECTORY`,
+- `TIMEOUT_PHASE1_NO_DATA`,
+- `TIMEOUT_PHASE1_INSUFFICIENT`,
+- `TIMEOUT_DEADLINE_LOW_PHASES`,
+- invariant codes.
 
-### 7.5. evaluate_from_features() — finalny werdykt
+W schema v19 brak `reason_code` dla plane row jest traktowany fail-closed:
+logger dropuje taki row zamiast tworzyć słabo audytowalny zapis.
 
-Lokalizacja: `gatekeeper.rs:3221-3305`
+## 18. IWIM: post-Gatekeeper BUY veto
 
-```rust
-pub fn evaluate_from_features(&mut self, features: MaterializedFeatureSet,
-    config: &GatekeeperV2Config) -> GatekeeperVerdict
-{
-    let mut assessment = build_assessment_from_features(features, config, ctx);
-    let decision = evaluate_policy_from_assessment(&assessment, config);
-    assessment.decision = Some(decision);
-    assessment.v25_shadow_decisions = self.v25_shadow_decisions.clone();
+IWIM działa po Gatekeeper BUY, przed trigger execution handoff.
 
-    match evaluate_curve_gate(&assessment.feature_snapshot, config) {
-        Ready => {},
-        Pending => return GatekeeperVerdict::PendingCurve,
-        Reject => return GatekeeperVerdict::Reject { ... },
-    }
+Znaczenie:
 
-    if !verdict_buy {
-        return GatekeeperVerdict::Reject { assessment, reason };
-    }
+- Gatekeeper może wydać BUY.
+- IWIM może zamienić BUY na typed REJECT.
+- Reason code musi wtedy przejść na `RejectIwim*`.
+- Dopiero po przejściu IWIM runtime idzie do buy execution path.
 
-    self.state = PoolState::Approved;
-    GatekeeperVerdict::Buy { buffered_txs, assessment }
-}
-```
+IWIM nie powinien być mylony z fazami Gatekeepera. To jest post-GK safety gate.
 
----
+## 19. Shadow-burnin: co to jest
 
-## 8. V2.5 SHADOW
+Shadow-burnin to tryb, w którym Ghost:
 
-### 8.1. try_shadow_evaluate() — shadow checkpointy
+1. używa realnego ingestu i realnej polityki Gatekeepera,
+2. dopuszcza Gatekeeper BUY do trigger path,
+3. buduje realnie uformowaną transakcję buy,
+4. odpala RPC `simulate_transaction_with_config`,
+5. zapisuje wynik symulacji, lifecycle i post-buy shadow evidence,
+6. nie wysyła live transaction.
 
-Lokalizacja: `gatekeeper.rs:5192-5466`
+Aktualny profil:
 
-Wywoływane z `ingest_long_transaction_tracking_only()` przy:
-- **Early (2-5s):** `elapsed >= early_entry_min_ms && elapsed <= early_entry_max_ms`
-- **Normal (5-7s):** `elapsed >= normal_window_ms`
-- **Extended (7-10s):** obsługiwane w `check_long_deadline`
+- `trigger.entry_mode = "shadow_only"`
+- `execution.execution_mode = "shadow"`
+- `trigger.shadow_run.enabled = true`
+- `trigger.shadow_run.payer_strategy = "ephemeral"`
+- `trigger.shadow_run.sig_verify = false`
+- `trigger.shadow_run.replace_recent_blockhash = true`
+- `trigger.shadow_run.timeout_ms = 1600`
+- `trigger.shadow_run.max_retries = 1`
+- `trigger.shadow_run.max_concurrent = 8`
+- shadow entry log: `data/shadow-burnin/shadow_entries.jsonl`
+- shadow lifecycle log: `data/shadow-burnin/shadow_lifecycle.jsonl`
 
-Flow:
-```
-1. Guard: total_tx_count >= min_data_tx
-   (Early: early_entry_min_tx_count, Normal/Extended: min_tx_count)
+## 20. Shadow-burnin flow
 
-2. Phase 1 guard: tx >= min_tx_count, signers >= min_unique_signers, buys >= min_buy_count
-
-3. run_assessment() → GatekeeperAssessment (pełne 6 faz + trajectory + full PDD)
-
-4. compute_decision() → GatekeeperDecision (hard fail + core + sybil + alpha + prosperity)
-
-5. APS: evaluate_aps() → ApsDiagnostics
-   → HighVolatility regime → re-check PDD drift z 3% threshold
-
-6. Confidence proxy:
-   confidence = 1.0 - soft_points/max_possible
-   → TAS modulation (skip dla Early)
-   → PDD: confidence *= pdd.pdd_score (0.0 jeśli hard_fail)
-
-7. Stage-specific criteria:
-   Early:
-     → all_phases_passed (6/6)
-     → enough_tx (>= early_entry_min_tx_count)
-     → high_conf (>= early_entry_min_confidence)
-     → sybil_clean (<= early_entry_max_sybil_points)
-     → low_drift (<= early_entry_max_entry_drift_pct)
-     → has_momentum (>= early_entry_min_momentum)
-   Normal:
-     → verdict_buy && confidence >= normal_window_min_confidence
-
-8. Zapis ShadowV25Decision → v25_shadow_decisions
+```text
+Gatekeeper BUY
+  -> IWIM pass
+  -> execute_gatekeeper_buy_path()
+  -> hydrate metadata and shadow readiness
+  -> prepare buy request in TriggerComponent
+  -> shadow-only simulate_buy()
+  -> RPC simulate_transaction_with_config()
+  -> TriggerBuyOutcome::ShadowSimulated
+  -> GhostEvent::ShadowBuySimulated
+  -> append shadow buy record
+  -> append shadow dispatch lifecycle record
+  -> optional shadow-backed PostBuySubmitted
+  -> DecisionLogger/shadow reports
 ```
 
-### 8.2. Dynamic Observation Window (DOW)
+### 20.1 Co shadow oddaje dobrze
 
-Trzy okna decyzyjne (shadow-first, live wymaga ADR + promotion):
+Shadow-burnin dobrze oddaje:
 
-| Okno | Czas | Confidence min | Dodatkowe warunki |
-|------|------|---------------|-------------------|
-| Early | 2-5s | 0.85 | 6/6 faz, drift < 3%, momentum > 0.40, sybil <= 1, tx >= 15 |
-| Normal | 5-7s | 0.65 | BUY verdict z compute_decision |
-| Extended | 7-10s | 0.55 | PDD w pełni czyste (pdd_clean) |
+- realne wejście danych Seer/Yellowstone,
+- realny timing observation window,
+- realne Gatekeeper policy i config,
+- realny IWIM handoff,
+- realną ścieżkę przygotowania requestu w triggerze,
+- realny RPC simulation endpoint,
+- realny compute/simulation error surface,
+- przybliżony token delta z symulowanego ATA, jeśli RPC zwróci account state,
+- latency od decyzji do symulacji,
+- units consumed,
+- logs excerpt/digest,
+- retry/timeout behavior,
+- lifecycle terminalność shadow dispatch.
 
-### 8.3. PDD — Pump & Dump Detector
+### 20.2 Czego shadow nie dowodzi
 
-Lokalizacja: `ghost-launcher/src/components/gatekeeper_pdd.rs:80-188`
+Shadow-burnin nie dowodzi:
 
-**Pełny PDD (bufor, `evaluate_pdd`):** 6 sygnałów:
-1. **Entry drift** — 4-poziomowa hierarchia kotwicy ceny:
-   - Level 1: InitPoolEvent proxy (curve_data_known && v_sol_in_curve > 0) → "strong"
-   - Level 2: AccountStateCore proxy (v_sol_in_curve > 0) → "strong"
-   - Level 3: Parser-authoritative (curve_data_known) → "strong"
-   - Level 4: Fallback (pierwszy punkt w historii) → "weak"
-   - Drift = ((current / anchor) - 1.0) * 100
+- że transakcja trafiłaby do bloku,
+- że live sender miałby aktualny blockhash w tym samym momencie,
+- że Jito/tip/priority fee wygrałby contention,
+- że account contention i competing buys wyglądałyby identycznie,
+- że live signature istnieje,
+- że post-buy PnL jest realnym PnL,
+- że submit oznacza confirmation.
 
-2. **Spike** — porównanie recent volume rate (3s okno) vs earlier rate (próg >2×)
+`live_signature` w shadow-only jest `None`. `closed` w lifecycle oznacza
+terminalny wynik symulacji/evidence, nie on-chain inclusion.
 
-3. **Ramping** — 4 consecutive same-size buys (±15% tolerance)
+### 20.3 Shadow lifecycle identity
 
-4. **Whale** — top3 volume pct > 60% (config `whale_top3_max_pct`) lub single > 35%
+Shadow lifecycle używa:
 
-5. **Reserve** — reserve_sol >= 30.0 && reserve/market_cap >= 0.15
+- `join_key = pool_id:base_mint:first_seen_ts_ms`,
+- `idempotency_key = blake3(pool_id:join_key:rollout_profile)`,
+- `dispatch_id = shadow-dispatch:{idempotency_key}`.
 
-6. **Flash crash** — single sell impact > 15% lub 2+ selli w 500ms z cenowym impactem
+`ShadowDispatchStatus`:
 
-**Feature-driven PDD (`materialize_pdd_diagnostics_from_features`, policy.rs:598-656):** 3/6 sygnałów:
-- Entry drift (z checkpoint/account features)
-- Whale (z tx_intel_features.top3_volume_pct)
-- Reserve health (z account_features)
+- `submitted` - dispatch/simulation task przyjęty,
+- `closed` - symulacja zakończona bez `err`,
+- `failed` - symulacja zakończona z błędem lub preparation failure,
+- `abandoned` - task timeout/join error/utracony terminal.
 
-### 8.4. TAS — Trajectory Aware Scoring
+Lifecycle row niesie:
 
-Lokalizacja: `ghost-launcher/src/components/gatekeeper_trajectory.rs`
+- record type,
+- dispatch id,
+- idempotency key,
+- dispatch status,
+- classification,
+- simulation outcome,
+- candidate id,
+- pool id,
+- mint id,
+- join key,
+- rollout profile,
+- entry mode,
+- decision timestamp,
+- terminal timestamp,
+- error class/code/detail.
 
-Segmentacja okna obserwacji na 3 równe segmenty (T0/T1/T2). Dla każdego:
-- `build_segment(txs)` → TrajectorySegment { tx_count, buy_ratio, avg_interval_ms, total_volume_sol, hhi }
-- Wymagane: `min_tx_per_segment >= 3` na segment, `total_duration >= 3000ms`
+### 20.4 no_dispatch semantics
 
-5-wymiarowy scoring:
-```
-momentum_score    = f(T2.tx_count / T0.tx_count)     [accel > 1.15 → 1.0, decel < 0.85 → 0.0]
-hhi_score         = f(T2.hhi / T0.hhi)                [decline < 0.85 → 1.0]
-volume_score      = 1.0 - (vol_cv / volume_cv_max)    [stabilność wolumenu]
-interval_score    = f(T2.avg_interval / T0.avg_interval) [shortening < 0.80 → 1.0]
-buy_ratio_score   = T2.buy_ratio / buy_ratio_stability_min [stabilność buy ratio]
+Reject/timeout bez BUY nie powinien mieć shadow dispatch lifecycle. To nie jest
+błąd.
 
-overall_tas_score = Σ(w_i * score_i), clamped [0.0, 1.0]
-```
+Runtime klasyfikuje:
 
-TAS modulator: `confidence *= [0.75 + tas_score * 0.50]` (zakres 0.75-1.25)
-TAS hard reject: `tas_score < 0.30` → confidence = 0.0 (tylko w shadow path)
+- reject jako `no_dispatch_rejected`,
+- timeout jako `no_dispatch_eligible` lub podobny no-dispatch outcome,
+- report jako `no_dispatch_no_economics_required`, jeśli nie było dispatchu.
 
-### 8.5. APS — Adaptive Prosperity
+Economics/lifecycle proof jest wymagany dla rzeczywistych dispatch candidates,
+nie dla pooli, które Gatekeeper odrzucił.
 
-Lokalizacja: `ghost-launcher/src/components/gatekeeper_adaptive_prosperity.rs`
+### 20.5 Shadow post-buy
 
-Shadow-only. Wykrywa reżim rynkowy i sugeruje progi:
-- **detect_regime():** HHI spike (>0.6), price spike (ratio > 3.0), volume spike (PDD spike) → HighVolatility
-- **has_sufficient_history = false** (hardcodowane) → zawsze zwraca Normal (kalibracja wymaga cross-pool outcome trackera)
-- Shadow thresholds: entry_drift_max, confidence_min, prosperity_mcap, branch1_sniped, branch3_hhi — różne per reżim
+Po `ShadowBuySimulated` runtime może uruchomić shadow-backed post-buy monitor.
+To jest syntetyczne lifecycle/economics proof:
 
----
+- exit filled,
+- exit blocked,
+- position closed,
+- synthetic PnL fields.
 
-## 9. KRZYWA WIĄZANIA
+Nadal jest to lane `shadow`. `PostBuySubmitted` w shadow lane jest handoffem do
+monitoringu, nie dowodem live submitu.
 
-### 9.1. CurveReadiness — skąd wiemy że krzywa jest gotowa
+## 21. Decision logging i replay
 
-```rust
-// ghost-core/src/checkpoint/types.rs:58-70
-pub struct CurveReadinessFeatures {
-    pub is_ready: bool,                  // krzywa gotowa do użycia
-    pub freshness: CurveFreshnessState,  // Fresh | Committed | Unknown | Stale
-    pub finality: CurveFinality,         // Speculative | Provisional | Finalized
-    pub curve_data_known: bool,          // parser potwierdził dane
-    pub price_sample_count: u32,         // liczba punktów cenowych
-    pub t0_event_ts_ms: Option<u64>,     // timestamp pierwszego eventu krzywej
-    pub wait_elapsed_ms: Option<u64>,    // ile ms minęło od t0
-}
-```
+### 21.1 Schema
 
-CurveReadiness jest budowane z:
-- **AccountStateCore:** `curve_finality`, `state_phase` (Canonical/Migrated = final)
-- **ShadowLedger:** `curve_data_known`, `price_sample_count`
-- **GatekeeperBuffer:** `curve_t0_event_ts_ms`, `wait_elapsed_ms`
+Aktualny DecisionLogger używa:
 
-### 9.2. GatekeeperBuffer.current_curve_dynamics()
+- `GATEKEEPER_BUY_LOG_SCHEMA_VERSION = 19`
+- `GATEKEEPER_VERSION = "v2.5"`
+- legacy version marker dla starszych plane rows.
 
-Lokalizacja: `gatekeeper.rs:3195-3211`
+Pliki:
 
-Zwraca `BondingCurveDynamics` używany do uzupełnienia `MaterializedFeatureSet` w sesji:
-```rust
-pub fn current_curve_dynamics(&self) -> BondingCurveDynamics {
-    compute_bonding_curve_dynamics(&self.price_history)
-}
-```
+- `gatekeeper_v2_decisions.jsonl` - wszystkie terminalne decyzje,
+- `gatekeeper_v2_buys.jsonl` - BUY-related rows,
+- shadow entry/lifecycle JSONL - trigger shadow evidence.
 
-### 9.3. compute_bonding_curve_dynamics()
+### 21.2 Plane routing
 
-Lokalizacja: `gatekeeper.rs:2582-2615`
+Logger rozdziela output po:
 
-Z `price_history` (Vec<PricePoint>):
-1. `initial_price` = pierwszy punkt z ceną
-2. `current_price` = ostatni punkt z ceną
-3. `max_price` = maksimum z trajektorii
-4. `price_change_ratio` = current / initial
-5. `max_single_tx_price_impact_pct` = max różnica między sąsiednimi punktami (tylko buy)
-6. `max_single_sell_impact_pct` = max różnica między sąsiednimi punktami (gdy przynajmniej jeden sell)
-7. `current_market_cap_sol` = market_cap ostatniego punktu
-8. `bonding_progress_pct` = bonding_progress ostatniego punktu
-9. `price_data_points` = liczba punktów w historii
-
----
-
-## 10. COMMIT, LIVEPIPELINE, POST-GATEKEEPER
-
-### 10.1. LauncherCommitCoordinator
-
-Lokalizacja: `ghost-launcher/src/components/gatekeeper.rs:193-260`
-
-Po BUY: transakcje przechodzą przez commit pipeline:
-```
-Pending → Committing → PersistedAwaitingRuntime
+```text
+{rollout_profile}/{gatekeeper_version}/{decision_plane}/{config_hash}
 ```
 
-- `LauncherCommitBuffer` per mint: `buffered_history`, `tx_keys_seen`, `pending_live`
-- `add_tx()` → zależnie od fazy: `BufferedHistory` | `PendingLive` | `RouteToLive`
+Kluczowe plane'y:
 
-### 10.2. gatekeeper_commit_loop
+- `legacy_live`,
+- `v25_shadow`.
 
-Lokalizacja: `ghost-launcher/src/components/gatekeeper_commit_loop.rs`
+Nie wolno agregować wyników bez wymiaru `decision_plane`. Dla eksperta
+kalibracyjnego mieszanie live legacy i v25 shadow zniszczy interpretowalność.
 
-Okresowo (`process_ready_commits`):
-1. Bufory w fazie `Pending` → commit do ShadowLedger (`shadow_ledger.commit_history`)
-2. Emisja `GhostEvent::gatekeeper_committed`
-3. `live_pipeline.init_for_mint(base_mint)` — inicjalizacja LivePipeline
-4. Replay `pending_live` TX
+### 21.3 GatekeeperBuyLog
 
-### 10.3. Post-Gatekeeper
+Log niesie:
 
-Po werdykcie BUY, bez sprzężenia zwrotnego:
-- **Trigger:** konstrukcja transakcji, symulacja, wysyłka (lub shadow)
-- **Post-buy runtime / Guardian / AEM:** monitoring pozycji, exit strategy
-- **HyperPrediction Oracle:** scoring post-Gatekeeper (niezależny konsument stanu)
-- **DecisionLogger:** JSONL schema v16, logowanie wszystkich decyzji
+- identity: pool id, mint id, candidate id,
+- rollout profile,
+- config hash,
+- gatekeeper version,
+- decision plane,
+- verdict/outcome,
+- `verdict_type`,
+- `reason_code`,
+- `reason_code_version`,
+- `terminal_reason_code`,
+- V2 phase fields,
+- V2.5 shadow decision fields,
+- DOW stage,
+- PDD diagnostics,
+- TAS diagnostics,
+- APS diagnostics,
+- confidence and availability fields,
+- alpha/prosperity/sybil diagnostics,
+- IWIM fields,
+- shadow readiness/execution outcome,
+- no-dispatch classifications,
+- timestamps/window/join key.
 
----
+### 21.4 Raporty
 
-## 11. MAPA PLIKÓW
+`scripts/shadow_run_report.py`:
 
-### Launcher — Gatekeeper i sesja
+- zbiera decision/buy rows,
+- wybiera właściwy plane,
+- liczy expected dispatch candidates,
+- liczy actual dispatch rows,
+- liczy terminal lifecycle rows,
+- rozróżnia no-dispatch od lifecycle failure,
+- nie wymaga economics, gdy nie było dispatchu.
 
-| Plik | Kluczowe funkcje/struktury | Zakres linii |
-|------|---------------------------|-------------|
-| `ghost-launcher/src/components/gatekeeper.rs` | `GatekeeperBuffer`, `GatekeeperAssessment`, `GatekeeperDecision`, `GatekeeperVerdictType`, `PricePoint`, `BondingCurveDynamics`, `ShadowV25Decision`, `run_assessment()`, `compute_decision()`, `try_shadow_evaluate()`, `evaluate_from_features()`, `check_long_deadline()`, `materialize_trajectory()`, `v25_confidence()`, `LauncherCommitCoordinator`, `ingest_transaction_tracking_only()` | 1-11879 |
-| `ghost-launcher/src/components/gatekeeper_policy.rs` | `build_assessment_from_features()`, `evaluate_policy_from_assessment()`, `evaluate_hard_filters_from_assessment()`, `evaluate_alpha_gate()`, `evaluate_prosperity_filter()`, `evaluate_curve_gate()`, `materialize_pdd_diagnostics_from_features()`, `build_policy_diagnostics()`, `compute_soft_signals()`, `build_sybil_policy_diagnostics()`, `sybil_combo_veto_reason()`, `compute_momentum()`, `compute_demand()`, `compute_core3_pass()` | 1-2473 |
-| `ghost-launcher/src/components/gatekeeper_pdd.rs` | `evaluate_pdd()`, `detect_entry_drift()`, `detect_spike()`, `detect_ramping()`, `detect_whale_concentration()`, `check_reserve_health()`, `detect_flash_crash()`, `PddDiagnostics`, `PddHardFail` | 1-566 |
-| `ghost-launcher/src/components/gatekeeper_trajectory.rs` | `score_trajectory()`, `build_segment()`, `compute_tas_modulator()`, `TrajectoryAssessment`, `TrajectorySegment` | 1-207 |
-| `ghost-launcher/src/components/gatekeeper_adaptive_prosperity.rs` | `evaluate_aps()`, `detect_regime()`, `compute_shadow_prosperity_pass()`, `ApsDiagnostics`, `MarketRegime` | 1-397 |
-| `ghost-launcher/src/components/gatekeeper_commit_loop.rs` | `run()`, `process_ready_commits()` | cały plik |
-| `ghost-launcher/src/components/iwim_veto.rs` | IWIM Veto Gate (poza zakresem tego audytu) | cały plik |
-| `ghost-launcher/src/oracle_runtime.rs` | `pool_observation_task()`, `evaluate_feature_driven_terminal_verdict()`, `resolve_feature_trigger_outcome()`, `OracleRuntime`, `RuntimeContext` | 1-22997 |
-| `ghost-launcher/src/session/observation.rs` | `PoolObservationSession`, `materialize_features()`, `ingest_transaction()`, `try_checkpoint()`, `current_curve_readiness()` | 1-729 |
-| `ghost-launcher/src/components/seer.rs` | Seer komponent, konfiguracja | cały plik |
-| `ghost-launcher/src/components/snapshot_listener.rs` | Jedyny writer do AccountStateCore | cały plik |
+`scripts/gatekeeper_v25_repair_validation.py`:
 
-### ghost-core — struktury danych SSOT
+- sprawdza reason-code completeness,
+- sprawdza timeout taxonomy,
+- sprawdza rollout/plane scope,
+- odpala shadow report,
+- klasyfikuje P5 no-dispatch vs dispatch lifecycle.
 
-| Plik | Kluczowe struktury |
-|------|-------------------|
-| `ghost-core/src/checkpoint/types.rs` | `MaterializedFeatureSet`, `CheckpointDerivedFeatures`, `CurveReadinessFeatures`, `AlphaFingerprintFeatures`, `SessionCheckpoint` |
-| `ghost-core/src/checkpoint/feature_builder.rs` | `ObservationFeatureBuilder::materialize()` |
-| `ghost-core/src/checkpoint/engine.rs` | `CheckpointEngine` |
-| `ghost-core/src/account_state_core/types.rs` | `CanonicalPoolState`, `AccountStateUpdate`, `AccountStateFeatures`, `StatePhase`, `BootstrapHints`, `UpdateSource` |
-| `ghost-core/src/account_state_core/reducer.rs` | `AccountStateReducer::update_account_state()` |
-| `ghost-core/src/tx_intelligence/types.rs` | `TxIntelFeatures`, `SybilResistanceFeatures`, `FundingSourceDiagnostics`, `RiskFlag` |
-| `ghost-core/src/shadow_ledger/types.rs` | `MarketSnapshot`, `PriceState`, `PriceReason`, `BuySimulationResult`, `SnapshotBuffer` |
-| `ghost-core/src/shadow_ledger/ledger.rs` | `ShadowLedger` |
-| `ghost-core/src/shadow_ledger/live_pipeline.rs` | `LivePipeline` |
-| `ghost-core/src/shadow_ledger/commit_types.rs` | `CommitResult`, `CommitHistoryStatus` |
+Replay equivalence nie opiera się na gołych event JSONL jako jedynym źródle
+prawdy. Potrzebny jest decision log plus config/profile/plane/schema/reason
+codes oraz shadow lifecycle dla dispatch candidates.
 
-### ghost-brain — konfiguracja
+## 22. Co ekspert biznesowy powinien czytać jako sygnał
 
-| Plik | Kluczowe struktury |
-|------|-------------------|
-| `ghost-brain/src/config/ghost_brain_config.rs` | `GatekeeperV2Config` (wszystkie progi faz 1-6, hard fails, soft signals, alpha, prosperity, sybil, V2.5 sub-structs), `GatekeeperMode` (Standard/Long) |
-| `ghost-brain/src/config/gatekeeper_v25_config.rs` | `GatekeeperV25RolloutConfig`, `DynamicObservationWindowConfig`, `TrajectoryAwareScoringConfig`, `PumpAndDumpDetectorConfig`, `AdaptiveProsperityConfig` |
-| `ghost-brain/ghost_brain_config.toml` | Kalibracja produkcyjna v11 — wszystkie wartości progowe |
+### 22.1 BUY nie znaczy "zarobimy"
 
-### off-chain — Seer
+BUY znaczy: według aktualnych progów i dostępnego evidence pool przeszedł
+Gatekeepera oraz IWIM. W shadow-only nie ma live inclusion. BUY jest hipotezą
+handlową do walidacji przez shadow lifecycle i post-buy outcome.
 
-| Plik | Funkcja |
-|------|---------|
-| `off-chain/components/seer/src/grpc_connection.rs` | Połączenie Yellowstone gRPC |
-| `off-chain/components/seer/src/ipc.rs` | IPC między procesami |
-| `off-chain/components/seer/src/types.rs` | Typy eventów Seer |
-| `off-chain/components/seer/src/lib.rs` | Start serwisu Seer |
+### 22.2 REJECT powinien być konkretny
 
----
+Dobry reject ma:
 
-## Podsumowanie dla operatora
+- `verdict_type`,
+- `reason_code`,
+- fazy,
+- konkretne diagnostics,
+- availability/degraded reasons, jeśli brakuje danych.
 
-1. **SSOT:** `MaterializedFeatureSet` budowany w `PoolObservationSession::materialize_features()` (observation.rs:368) z 5+ źródeł: AccountStateCore, TxIntelligenceEngine, CheckpointEngine, EarlyFingerprint, CrossPoolVelocityIndex. Żadna cecha nie jest liczona dwukrotnie.
+Generic reject jest słabym materiałem do kalibracji.
 
-2. **Cena płynie trzema ścieżkami:** (a) Yellowstone → AccountStateReducer → AccountStateFeatures.price_sol → MaterializedFeatureSet, (b) GatekeeperBuffer.price_history → BondingCurveDynamics, (c) ShadowLedger → MarketSnapshot.price_sol_per_token (dla scoringu post-Gatekeeper).
+### 22.3 Timeout jest informacją
 
-3. **Produkcyjna ścieżka terminacji:** `evaluate_feature_driven_terminal_verdict()` → `session.materialize_features()` → `buffer.evaluate_from_features()` → `build_assessment_from_features()` → `evaluate_policy_from_assessment()`.
+Timeout może znaczyć:
 
-4. **Decyzja to 8 warstw:** Hard Fails → PDD Live Veto → Core Fail → Sybil Combo Veto → Sybil Soft Excess → Legacy Soft Excess → Alpha Gate → Prosperity Filter. Po przejściu: TAS modulacja GatekeeperStrength.
+- brak danych,
+- za mało tx/signers/buys,
+- zbyt mało faz przed deadline,
+- curve not ready,
+- stale/unknown evidence.
 
-5. **V2.5 shadow-first:** `live_execution_enabled = false` — DOW, TAS, PDD, APS działają w shadow checkpointach (try_shadow_evaluate, check_long_deadline). Live wymaga ADR + promotion.
+Timeout nie powinien być traktowany jako neutralny discard. To jest sygnał o
+coverage, timing albo jakości ingestu.
 
-6. **Dwie ścieżki ewaluacji są świadomym dualizmem:** feature-driven (kanoniczna, używa MaterializedFeatureSet) i buforowa (shadow, używa run_assessment). Testy regresji pilnują synchronizacji.
+### 22.4 Shadow no-dispatch jest poprawne dla reject/timeout
 
-7. **PDD feature-driven obsługuje 3/6 sygnałów** (drift, whale, reserve) — spike, ramping, flash crash wymagają bufora (pełne PDD w `evaluate_pdd`). Świadome ograniczenie przy obecnym `live_execution_enabled=false`.
+Jeśli Gatekeeper odrzucił pool, brak dispatchu jest oczekiwany. Shadow
+lifecycle ma rozliczać tylko kandydatów, którzy dotarli do dispatch/simulation.
 
----
+### 22.5 Degraded fields są krytyczne
 
-*Koniec dokumentu — pełny trace z kodu źródłowego, każda funkcja, każda struktura, każda ścieżka.*
+Sygnały sybil/fingerprint/PDD/TAS mogą być unavailable. Brak danych nie jest
+automatycznie pozytywny. W kalibracji trzeba rozdzielić:
+
+- signal clean,
+- signal bad,
+- signal unavailable,
+- signal degraded with reason.
+
+## 23. Najważniejsze pliki
+
+Ingest:
+
+- `off-chain/components/seer/src/lib.rs`
+- `off-chain/components/seer/src/config.rs`
+- `off-chain/components/seer/src/grpc_connection.rs`
+- `off-chain/components/seer/src/types.rs`
+- `off-chain/components/seer/src/curve_parser.rs`
+- `off-chain/components/seer/src/early_fingerprint.rs`
+- `ghost-launcher/src/components/seer.rs`
+- `ghost-launcher/src/events.rs`
+
+Runtime/session:
+
+- `ghost-launcher/src/oracle_runtime.rs`
+- `ghost-launcher/src/session/manager.rs`
+- `ghost-launcher/src/session/observation.rs`
+- `ghost-launcher/src/components/gatekeeper_dow_timer.rs`
+
+SSOT/state:
+
+- `ghost-core/src/checkpoint/types.rs`
+- `ghost-core/src/checkpoint/feature_builder.rs`
+- `ghost-core/src/account_state_core/types.rs`
+- `ghost-core/src/account_state_core/reducer.rs`
+- `ghost-core/src/account_state_core/monotonic_guard.rs`
+- `ghost-core/src/tx_intelligence/types.rs`
+
+Gatekeeper:
+
+- `ghost-launcher/src/components/gatekeeper.rs`
+- `ghost-launcher/src/components/gatekeeper_policy.rs`
+- `ghost-launcher/src/components/gatekeeper_pdd.rs`
+- `ghost-launcher/src/components/gatekeeper_pdd_sequence.rs`
+- `ghost-launcher/src/components/gatekeeper_trajectory.rs`
+- `ghost-launcher/src/components/gatekeeper_adaptive_prosperity.rs`
+
+Shadow execution:
+
+- `ghost-launcher/src/components/trigger/component.rs`
+- `ghost-launcher/src/components/trigger/shadow_run.rs`
+- `ghost-brain/src/guardian/post_buy/engine.rs`
+
+Config/logging/report:
+
+- `ghost-brain/ghost_brain_config.toml`
+- `configs/rollout/shadow-burnin.toml`
+- `ghost-brain/src/config/gatekeeper_v25_config.rs`
+- `ghost-brain/src/oracle/decision_logger.rs`
+- `ghost-brain/src/oracle/reason_code.rs`
+- `scripts/shadow_run_report.py`
+- `scripts/gatekeeper_v25_repair_validation.py`
+
+## 24. Testy regresyjne, które chronią kontrakty
+
+Najważniejsze anchors:
+
+- `ghost-launcher/tests/gatekeeper_v25_regression.rs`
+  - shadow nie mutuje live verdict,
+  - DOW odpala stage bez TX pressure,
+  - `MaterializedFeatureSet` niesie `tx_segment_sequence`,
+  - Path A/Path B TAS parity,
+  - APS działa w Path B,
+  - IWIM BUY -> REJECT mutuje reason code.
+- `ghost-launcher/tests/gatekeeper_policy_tests.rs`
+  - feature API matchuje assessment snapshot,
+  - session features drive policy BUY.
+- `ghost-launcher/tests/gatekeeper_pdd_tests.rs`
+  - PDD entry drift hard reject.
+- `ghost-launcher/tests/gatekeeper_tas_tests.rs`
+  - TAS momentum/trajectory behavior.
+- `ghost-launcher/src/oracle_runtime.rs` tests
+  - shadow-only emituje simulated buy,
+  - shadow-only nie emituje live `TransactionSent`.
+- `ghost-brain/src/config/gatekeeper_v25_config.rs` tests
+  - serde/default compatibility.
+- `scripts/test_shadow_run_report.py`
+  - no-dispatch nie powoduje fałszywego failure.
+
+## 25. Aktualne ryzyka i caveaty
+
+1. `ghost-brain/ghost_brain_config.toml` był dirty w czasie audytu.
+   Dokument opisuje stan roboczy, ale przy czystym `HEAD` próg market cap może
+   być inny.
+2. Komentarz w `configs/rollout/shadow-burnin.toml` wspomina stare
+   `max_wait_time_ms=8001`; aktualny brain config ma `10000`.
+3. Shadow-burnin jest bardzo dobrym dowodem simulation/execution-shape, ale nie
+   dowodzi live inclusion.
+4. APS adaptive thresholds są obecnie shadow/offline. Nie wolno zakładać, że
+   realnie zmieniają progi live.
+5. PDD Path B nie potrafi uczciwie wykryć flash crash bez price impact data.
+   To jest unavailable, nie pass.
+6. Plane routing jest obowiązkowy w analizie. `legacy_live` i `v25_shadow` nie
+   mogą być mieszane.
+7. Event JSONL sam w sobie nie jest wystarczającym dowodem audytowym decyzji.
+   Potrzebny jest config, reason-code taxonomy, decision plane i lifecycle.
+
+## 26. Najkrótszy przewodnik dla Mr. Guru
+
+Jeżeli celem jest poprawa realnej rentowności oceny tokenów, zacząć od tych
+warstw:
+
+1. Jakość danych wejściowych:
+   - coverage Seer,
+   - timestamp quality,
+   - AccountUpdate availability,
+   - degraded reasons w fingerprint/sybil.
+2. Jakość negative filters:
+   - PDD entry drift,
+   - spike/ramping,
+   - whale concentration,
+   - dev behavior,
+   - sybil/infra similarity.
+3. Jakość positive selection:
+   - TAS trajectory,
+   - alpha fingerprint,
+   - prosperity filter,
+   - curve readiness/finality.
+4. Jakość temporalna:
+   - czy Early/Normal/Extended DOW daje lepszy tradeoff,
+   - czy 10s deadline jest optymalny dla observed opportunity decay.
+5. Jakość execution realism:
+   - shadow simulation success vs failure,
+   - latency decision-to-sim,
+   - units consumed,
+   - post-buy synthetic lifecycle,
+   - no-dispatch separation.
+6. Jakość audytu:
+   - typed reason codes,
+   - plane routing,
+   - config hash,
+   - lifecycle terminalność,
+   - replay equivalence.
+
+Najważniejsza zasada interpretacyjna:
+
+```text
+Nie optymalizować wyłącznie liczby BUY.
+Optymalizować selektywność BUY przy pełnym rozumieniu:
+  - dlaczego pool przeszedł,
+  - jakie dane były niedostępne,
+  - czy shadow execution byłby wykonalny,
+  - czy post-buy lifecycle wyglądałby ekonomicznie sensownie.
+```
+
+## 27. Finalny status architektoniczny
+
+Aktualny Gatekeeper V2.5 jest feature-driven i shadow-first:
+
+- aktywny path decyzyjny jest oparty o `MaterializedFeatureSet`,
+- V2.5 rozszerza V2 o DOW/TAS/PDD/APS/reason-code evidence,
+- shadow-burnin symuluje execution shape bez live send,
+- DecisionLogger v19 wymusza typed reason code i plane separation,
+- legacy HyperPrediction/Chaos/`score_pool()` nie są częścią obecnego runtime.
+
+To oznacza, że dalsze prace nad logiką biznesową powinny zaczynać się od
+kalibracji feature'ów i progów w tym właśnie pipeline, a nie od reaktywacji
+starych scoring engines.
+
+## 28. Checklist pokrycia wymagań z promptu
+
+Ta sekcja jest jawny indeksem, gdzie w dokumencie znajduje się minimalny zakres
+oczekiwany dla eksperta przeglądającego Gatekeepera V2.5.
+
+| Wymagany obszar | Gdzie jest opisany | Status |
+|---|---|---|
+| Aktualny flow decyzji BUY/REJECT/TIMEOUT | Sekcje 1, 14, 16, 17, 18, 21, 22 | Pokryte |
+| Lista komponentów i ich odpowiedzialności | Sekcje 4, 5, 6, 7, 8, 9, 23 | Pokryte |
+| `MaterializedFeatureSet` i feature ownership | Sekcje 2, 9, 10 | Pokryte |
+| Rola `TxIntelligence`, `AccountStateCore`, Checkpoints, `GatekeeperBuffer` | Sekcje 8, 9, 11, 12, 13 | Pokryte |
+| Gatekeeper V2/V2.5 i aktywne gate'y | Sekcje 3, 14, 15, 16, 18 | Pokryte |
+| Obecne progi/configi i ich znaczenie | Sekcja 3 oraz caveaty w 25 | Pokryte |
+| Active/shadow-only/diagnostic-only/legacy | Sekcje 0, 2, 4, 15, 19, 20, 27 | Pokryte |
+| DecisionLogger / JSONL format | Sekcje 21.1-21.4 | Pokryte |
+| Shadow-burnin | Sekcje 19, 20, 21, 22, 25 | Pokryte |
+| Metryki i sygnały już zbierane | Sekcje 12.2, 12.3, 15.5, 20.1, 21.3, 26 oraz lista niżej | Pokryte |
+| Znane problemy, false BUY/false REJECT, timeouty, degraded states | Sekcje 22, 25, 26 oraz lista niżej | Pokryte |
+| Ograniczenia latency i observation window | Sekcje 3.3, 7.4, 15.1, 20.1, 20.2, 26 oraz lista niżej | Pokryte |
+
+### 28.1 Metryki i sygnały już zbierane
+
+Dokument opisuje obecnie zbierane sygnały w grupach, nie jako pełny katalog
+Prometheus metric names. Zakres sygnałów obejmuje:
+
+- Gatekeeper phase metrics: tx count, buy count, unique signers, phases passed,
+  hard/soft reason chain, `verdict_type`, `reason_code`.
+- Tx-intelligence metrics: buy/sell count, buy ratio, SOL buy ratio, volume CV,
+  HHI, volume Gini, top3 volume, signer ratios, interval CV, timing entropy,
+  burst ratio, failed tx count, dust tx count.
+- Dev metrics: dev buy SOL, dev volume ratio, dev tx ratio, dev sold,
+  dev-first-buyer and dev paperhand signals.
+- Early fingerprint metrics: block0 sniped supply, flip ratio, CU price p90,
+  priority fee surge slope, buyer pre-balance CV, inner ix average, CPI depth,
+  sell/buy ratio, CU cluster dominance, static fee profile, fixed-size buys,
+  flipper presence, Jito tip intensity, early-slot dominance, whale reversal.
+- Sybil metrics: CPV, FSC, FTDI, DBIA, SFD, DES oraz degraded reasons.
+- V2.5 metrics: DOW stage decisions, TAS score and sub-scores, PDD diagnostics,
+  APS regime/suggestions, V2.5 confidence and availability.
+- Shadow execution metrics: decision-to-sim latency, shadow duration, retry
+  count, units consumed, RPC slot, simulated token delta fallback, error class,
+  lifecycle `submitted/closed/failed/abandoned`, no-dispatch classifications.
+- Logging/replay metrics: decision plane, rollout profile, config hash,
+  schema version, terminal reason code completeness, shadow lifecycle
+  reconciliation and report gates.
+
+### 28.2 False BUY, false REJECT, timeout i degraded states
+
+Dokument rozróżnia te przypadki jako kategorie analityczne:
+
+- Potencjalny false BUY: BUY przeszedł Gatekeeper/IWIM, ale shadow simulation
+  failuje, lifecycle nie zamyka się, post-buy synthetic outcome jest słaby,
+  albo późniejsza analiza pokazuje PDD/TAS/sybil degraded evidence.
+- Potencjalny false REJECT: reject wynika z brakującego albo zdegradowanego
+  evidence, zbyt agresywnego progu, stale curve/account update, zbyt krótkiego
+  okna albo konfiguracji shadow/live, która nie odpowiada realnemu reżimowi.
+- Timeout: osobny terminalny stan, nie neutralny discard; może oznaczać
+  `TIMEOUT_PHASE1_NO_DATA`, `TIMEOUT_PHASE1_INSUFFICIENT` albo
+  `TIMEOUT_DEADLINE_LOW_PHASES`.
+- Degraded state: brak danych fingerprint/sybil/PDD/TAS/curve jest oddzielnym
+  stanem audytowym i nie powinien być liczony jako czysty pass.
+
+### 28.3 Latency i observation window
+
+Najważniejsze ograniczenia czasowe:
+
+- Gatekeeper long-mode ma 10-sekundowe okno terminalne w aktualnym configu.
+- DOW dzieli ocenę na Early 2-5 s, Normal 7 s i Extended 10 s.
+- Krótkie okno oznacza, że jakość timestampów, slot quality, account update
+  relay, session buffering i orphan tx replay mają bezpośredni wpływ na
+  false BUY/false REJECT.
+- `dow_tick_ms=250` daje regularne checkpointy, ale ticki są skipowane przy
+  opóźnieniach, żeby nie spiętrzać zaległych ocen.
+- Shadow-burnin mierzy decision-to-sim latency i shadow duration, ale nie
+  dowodzi live inclusion ani realnego priority-fee contention.
+- Jeśli AccountUpdate/curve readiness przychodzi za późno, BUY może przejść w
+  `PendingCurve`, timeout albo reject zależnie od `curve_wait_ms` i
+  `stale_fallback`.
