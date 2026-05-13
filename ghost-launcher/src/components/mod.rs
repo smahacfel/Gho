@@ -9,6 +9,7 @@ pub mod gatekeeper_pdd;
 pub mod gatekeeper_pdd_sequence;
 pub mod gatekeeper_policy;
 pub mod gatekeeper_trajectory;
+pub mod gatekeeper_v3;
 pub mod gui_backend;
 pub mod iwim_veto;
 pub mod live_pipeline_flush_loop;
