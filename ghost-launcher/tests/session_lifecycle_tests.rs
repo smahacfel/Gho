@@ -1,7 +1,9 @@
 use ghost_brain::config::GatekeeperV2Config;
 use ghost_brain::fast_pipeline::EnhancedCandidate;
 use ghost_core::account_state_core::types::{AccountStateUpdate, StatePhase, UpdateSource};
-use ghost_core::checkpoint::EventCheckpointTrigger;
+use ghost_core::checkpoint::{
+    EventCheckpointTrigger, EvidenceDegradedReason, EvidenceStatus, EvidenceUnavailableReason,
+};
 use ghost_core::session::types::{SessionStatus, VerdictOutcome};
 use ghost_core::EventSemanticEnvelope;
 use ghost_core::{CurveFinality, CurveFreshnessState};
@@ -361,6 +363,14 @@ fn materialize_features_populates_ftdi_from_session_tx_buffer() {
             ghost_core::tx_intelligence::types::DES_INSUFFICIENT_BUYS_REASON.to_string(),
             ghost_core::tx_intelligence::types::FSC_FUNDING_STREAM_UNAVAILABLE_REASON.to_string(),
         ]
+    );
+    assert_eq!(
+        features.evidence_status.sybil.status,
+        EvidenceStatus::Degraded
+    );
+    assert_eq!(
+        features.evidence_status.sybil.degraded_reasons,
+        vec![EvidenceDegradedReason::SybilEvidencePartial]
     );
 }
 
@@ -1454,6 +1464,85 @@ fn session_materializes_segment_sequence_and_path_b_keeps_flash_fail_closed() {
     assert_eq!(
         assessment.v25_confidence_availability(&gatekeeper_config),
         (Some(false), Some("pdd_flash_crash_unavailable".to_string()))
+    );
+}
+
+#[test]
+fn session_materializes_v3_organic_broadening_from_segment_sequence() {
+    let manager = SessionManager::default();
+    let pool_id = Pubkey::new_unique();
+    let base_mint = Pubkey::new_unique();
+    let bonding_curve = Pubkey::new_unique();
+
+    let mut gatekeeper_config = GatekeeperV2Config::default();
+    gatekeeper_config.mode = ghost_brain::config::GatekeeperMode::Long;
+    gatekeeper_config.tas.tas_min_tx_per_segment = 3;
+    gatekeeper_config.tas.tas_min_total_duration_ms = 2_000;
+
+    let session = open_session_with_deadline_and_gatekeeper_config(
+        &manager,
+        pool_id,
+        base_mint,
+        bonding_curve,
+        10_000,
+        20_000,
+        gatekeeper_config,
+    );
+
+    let features = {
+        let mut guard = session.write();
+        for i in 0..9 {
+            let _ = guard.ingest_transaction(test_tx(
+                pool_id,
+                &format!("sig-v3-organic-{}", i),
+                10_100 + i as u64 * 500,
+            ));
+        }
+        guard.materialize_features()
+    };
+
+    assert!(features.organic_broadening.sequence_available);
+    assert_eq!(features.organic_broadening.t0_tx_count, 3);
+    assert_eq!(features.organic_broadening.t1_tx_count, 3);
+    assert_eq!(features.organic_broadening.t2_tx_count, 3);
+    assert_eq!(features.organic_broadening.t0_unique_signers, 3);
+    assert_eq!(features.organic_broadening.t1_unique_signers, 3);
+    assert_eq!(features.organic_broadening.t2_unique_signers, 3);
+    assert_eq!(
+        features.evidence_status.tx_segments.status,
+        EvidenceStatus::Clean
+    );
+}
+
+#[test]
+fn session_materializes_v3_missing_inputs_as_non_clean_evidence() {
+    let manager = SessionManager::default();
+    let pool_id = Pubkey::new_unique();
+    let base_mint = Pubkey::new_unique();
+    let bonding_curve = Pubkey::new_unique();
+    let session = open_session(&manager, pool_id, base_mint, bonding_curve, 11_000);
+
+    let features = session.read().materialize_features();
+
+    assert_eq!(
+        features.evidence_status.tx_segments.status,
+        EvidenceStatus::Unavailable
+    );
+    assert_eq!(
+        features.evidence_status.tx_segments.unavailable_reasons,
+        vec![EvidenceUnavailableReason::SegmentSequenceMissing]
+    );
+    assert_eq!(
+        features.evidence_status.alpha.status,
+        EvidenceStatus::Unavailable
+    );
+    assert_eq!(
+        features.evidence_status.alpha.unavailable_reasons,
+        vec![EvidenceUnavailableReason::AlphaFingerprintMissing]
+    );
+    assert_eq!(
+        features.evidence_status.execution.unavailable_reasons,
+        vec![EvidenceUnavailableReason::ExecutionNotRun]
     );
 }
 

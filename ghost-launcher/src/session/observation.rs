@@ -14,7 +14,9 @@ use ghost_core::account_state_core::types::{AccountStateFeatures, AccountStateUp
 use ghost_core::checkpoint::FeatureMaterializer;
 use ghost_core::checkpoint::{
     AlphaFingerprintFeatures, CheckpointEngine, CheckpointProducer, CurveReadinessFeatures,
-    MaterializedFeatureSet, ObservationFeatureBuilder, SessionCheckpoint,
+    EvidenceDegradedReason, EvidenceStatus, EvidenceUnavailableReason, FeatureEvidenceStatus,
+    ManipulationContradictionFeatures, MaterializedEvidenceStatus, MaterializedFeatureSet,
+    ObservationFeatureBuilder, OrganicBroadeningFeatures, SessionCheckpoint, TxSegmentSequence,
 };
 use ghost_core::session::types::{
     SessionDiagnostics, SessionId, SessionMetadata, SessionStatus, VerdictOutcome,
@@ -364,6 +366,247 @@ impl PoolObservationSession {
         }
     }
 
+    fn materialize_v3_organic_broadening(
+        &self,
+        materialized: &MaterializedFeatureSet,
+    ) -> OrganicBroadeningFeatures {
+        let mut features = OrganicBroadeningFeatures {
+            total_tx_count: materialized.tx_intel_features.tx_count,
+            total_unique_signers: materialized.tx_intel_features.unique_signers,
+            ..OrganicBroadeningFeatures::default()
+        };
+
+        let Some(sequence) = materialized.tx_segment_sequence.as_ref() else {
+            return features;
+        };
+
+        let segment_signers = self.materialize_v3_segment_unique_signers(sequence);
+        let t0_unique = segment_signers.map_or(0, |counts| counts.0);
+        let t1_unique = segment_signers.map_or(0, |counts| counts.1);
+        let t2_unique = segment_signers.map_or(0, |counts| counts.2);
+        let buy_ratios = [
+            sequence.t0_segment.buy_ratio,
+            sequence.t1_segment.buy_ratio,
+            sequence.t2_segment.buy_ratio,
+        ];
+        let hhis = [
+            sequence.t0_segment.hhi,
+            sequence.t1_segment.hhi,
+            sequence.t2_segment.hhi,
+        ];
+
+        features.sequence_available = true;
+        features.t0_tx_count = sequence.t0_segment.tx_count;
+        features.t1_tx_count = sequence.t1_segment.tx_count;
+        features.t2_tx_count = sequence.t2_segment.tx_count;
+        features.t0_unique_signers = t0_unique;
+        features.t1_unique_signers = t1_unique;
+        features.t2_unique_signers = t2_unique;
+        features.t1_vs_t0_unique_signer_delta = t1_unique as i64 - t0_unique as i64;
+        features.t2_vs_t1_unique_signer_delta = t2_unique as i64 - t1_unique as i64;
+        features.tx_count_growth_ratio =
+            growth_ratio(sequence.t2_segment.tx_count, sequence.t0_segment.tx_count);
+        features.unique_signer_growth_ratio = growth_ratio(t2_unique, t0_unique);
+        features.buy_ratio_mean = buy_ratios.iter().sum::<f64>() / buy_ratios.len() as f64;
+        features.buy_ratio_min = buy_ratios.iter().copied().fold(f64::INFINITY, f64::min);
+        features.buy_ratio_max = buy_ratios.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        features.max_segment_hhi = hhis.iter().copied().fold(0.0_f64, f64::max);
+        features.min_segment_hhi = hhis.iter().copied().fold(f64::INFINITY, f64::min);
+
+        if !features.buy_ratio_min.is_finite() {
+            features.buy_ratio_min = 0.0;
+        }
+        if !features.buy_ratio_max.is_finite() {
+            features.buy_ratio_max = 0.0;
+        }
+        if !features.min_segment_hhi.is_finite() {
+            features.min_segment_hhi = 0.0;
+        }
+
+        features
+    }
+
+    fn materialize_v3_segment_unique_signers(
+        &self,
+        sequence: &TxSegmentSequence,
+    ) -> Option<(u64, u64, u64)> {
+        if self.tx_buffer.is_empty() || sequence.total_duration_ms == 0 {
+            return None;
+        }
+
+        let first_ts = self.tx_buffer.iter().map(|tx| tx.timestamp_ms).min()?;
+        let segment_duration = sequence.total_duration_ms as f64 / 3.0;
+        let t0_end = first_ts.saturating_add(segment_duration as u64);
+        let t1_end = first_ts.saturating_add((2.0 * segment_duration) as u64);
+        let mut t0 = HashSet::new();
+        let mut t1 = HashSet::new();
+        let mut t2 = HashSet::new();
+
+        for tx in &self.tx_buffer {
+            if tx.timestamp_ms <= t0_end {
+                t0.insert(tx.signer.clone());
+            } else if tx.timestamp_ms <= t1_end {
+                t1.insert(tx.signer.clone());
+            } else {
+                t2.insert(tx.signer.clone());
+            }
+        }
+
+        Some((t0.len() as u64, t1.len() as u64, t2.len() as u64))
+    }
+
+    fn materialize_v3_manipulation_contradictions(
+        &self,
+        materialized: &MaterializedFeatureSet,
+    ) -> ManipulationContradictionFeatures {
+        let tx = &materialized.tx_intel_features;
+        let sybil = &materialized.sybil_resistance;
+
+        ManipulationContradictionFeatures {
+            same_ms_tx_ratio: tx.same_ms_tx_ratio,
+            bundle_suspicion_ratio: tx.bundle_suspicion_ratio,
+            top3_volume_pct: tx.top3_volume_pct,
+            hhi: tx.hhi,
+            max_tx_per_signer: tx.max_tx_per_signer,
+            dev_volume_ratio: tx.dev_volume_ratio,
+            dev_has_sold: tx.dev_has_sold,
+            fee_topology_diversity_index: sybil.fee_topology_diversity_index,
+            spend_fraction_divergence: sybil.spend_fraction_divergence,
+            signer_cross_pool_velocity: sybil.signer_cross_pool_velocity,
+            funding_source_concentration: sybil.funding_source_concentration,
+            sybil_evidence_degraded: !sybil.degraded_reasons.is_empty(),
+            ..ManipulationContradictionFeatures::default()
+        }
+    }
+
+    fn materialize_v3_evidence_status(
+        &self,
+        materialized: &MaterializedFeatureSet,
+    ) -> MaterializedEvidenceStatus {
+        let account_state = if materialized.account_features.update_count > 0 {
+            evidence_clean()
+        } else {
+            evidence_degraded(vec![EvidenceDegradedReason::AccountStateFallback])
+        };
+        let tx_intel = if materialized.tx_intel_features.tx_count > 0 {
+            evidence_clean()
+        } else {
+            evidence_unavailable(vec![EvidenceUnavailableReason::TxIntelMissing])
+        };
+        let tx_segments = match materialized.tx_segment_sequence.as_ref() {
+            None => evidence_unavailable(vec![EvidenceUnavailableReason::SegmentSequenceMissing]),
+            Some(sequence) if !sequence.min_tx_per_segment_satisfied => {
+                evidence_degraded(vec![EvidenceDegradedReason::SegmentSequencePartial])
+            }
+            Some(_) if self.tx_buffer.is_empty() => {
+                evidence_degraded(vec![EvidenceDegradedReason::SegmentSignerCoveragePartial])
+            }
+            Some(_) => evidence_clean(),
+        };
+        let checkpoints = match materialized.checkpoint_features.trajectory_checkpoint_count {
+            0 => evidence_unavailable(vec![EvidenceUnavailableReason::CheckpointHistoryMissing]),
+            1 => evidence_degraded(vec![EvidenceDegradedReason::CheckpointHistorySparse]),
+            _ => evidence_clean(),
+        };
+        let curve = if materialized.curve_readiness.curve_data_known {
+            evidence_clean()
+        } else if materialized.curve_readiness.price_sample_count > 0 {
+            evidence_degraded(vec![EvidenceDegradedReason::CurveEvidencePartial])
+        } else {
+            evidence_unavailable(vec![EvidenceUnavailableReason::CurveDataMissing])
+        };
+
+        let sybil_metric_available = materialized
+            .sybil_resistance
+            .fee_topology_diversity_index
+            .is_some()
+            || materialized
+                .sybil_resistance
+                .dev_buyer_infrastructure_affinity
+                .is_some()
+            || materialized
+                .sybil_resistance
+                .spend_fraction_divergence
+                .is_some()
+            || materialized
+                .sybil_resistance
+                .demand_elasticity_score
+                .is_some()
+            || materialized
+                .sybil_resistance
+                .signer_cross_pool_velocity
+                .is_some()
+            || materialized
+                .sybil_resistance
+                .funding_source_concentration
+                .is_some();
+        let sybil = if !materialized.sybil_resistance.degraded_reasons.is_empty() {
+            evidence_degraded(vec![EvidenceDegradedReason::SybilEvidencePartial])
+        } else if sybil_metric_available {
+            evidence_clean()
+        } else {
+            evidence_unavailable(vec![EvidenceUnavailableReason::SybilMetricsMissing])
+        };
+
+        let alpha_available = materialized
+            .alpha_fingerprint
+            .avg_inner_ix_count_50tx
+            .is_some()
+            || materialized.alpha_fingerprint.sell_buy_ratio.is_some()
+            || materialized
+                .alpha_fingerprint
+                .compute_unit_cluster_dominance
+                .is_some()
+            || materialized
+                .alpha_fingerprint
+                .static_fee_profile_ratio
+                .is_some()
+            || materialized.alpha_fingerprint.jito_tip_intensity.is_some()
+            || materialized
+                .alpha_fingerprint
+                .early_slot_volume_dominance_buy
+                .is_some()
+            || materialized
+                .alpha_fingerprint
+                .early_top3_buy_volume_pct_3s
+                .is_some()
+            || materialized
+                .alpha_fingerprint
+                .fixed_size_buy_ratio
+                .is_some()
+            || materialized
+                .alpha_fingerprint
+                .flipper_presence_ratio
+                .is_some();
+        let alpha = if alpha_available {
+            evidence_clean()
+        } else {
+            evidence_unavailable(vec![EvidenceUnavailableReason::AlphaFingerprintMissing])
+        };
+
+        let manipulation = if materialized.tx_intel_features.tx_count > 0 {
+            evidence_clean()
+        } else {
+            evidence_unavailable(vec![EvidenceUnavailableReason::TxIntelMissing])
+        };
+
+        MaterializedEvidenceStatus {
+            account_state,
+            tx_intel,
+            tx_segments,
+            checkpoints,
+            curve,
+            sybil,
+            alpha,
+            manipulation,
+            execution: FeatureEvidenceStatus {
+                status: EvidenceStatus::Unavailable,
+                degraded_reasons: Vec::new(),
+                unavailable_reasons: vec![EvidenceUnavailableReason::ExecutionNotRun],
+            },
+        }
+    }
+
     #[must_use]
     pub fn materialize_features(&self) -> MaterializedFeatureSet {
         let account_features = self.current_account_features();
@@ -509,6 +752,11 @@ impl PoolObservationSession {
                 materialized.sybil_resistance.degraded_reasons.push(reason);
             }
         }
+
+        materialized.organic_broadening = self.materialize_v3_organic_broadening(&materialized);
+        materialized.manipulation_contradictions =
+            self.materialize_v3_manipulation_contradictions(&materialized);
+        materialized.evidence_status = self.materialize_v3_evidence_status(&materialized);
 
         materialized
     }
@@ -731,4 +979,35 @@ impl PoolObservationSession {
         self.tx_intel_features = features;
         self.active_risk_flags = risk_flags;
     }
+}
+
+fn evidence_clean() -> FeatureEvidenceStatus {
+    FeatureEvidenceStatus {
+        status: EvidenceStatus::Clean,
+        degraded_reasons: Vec::new(),
+        unavailable_reasons: Vec::new(),
+    }
+}
+
+fn evidence_degraded(reasons: Vec<EvidenceDegradedReason>) -> FeatureEvidenceStatus {
+    FeatureEvidenceStatus {
+        status: EvidenceStatus::Degraded,
+        degraded_reasons: reasons,
+        unavailable_reasons: Vec::new(),
+    }
+}
+
+fn evidence_unavailable(reasons: Vec<EvidenceUnavailableReason>) -> FeatureEvidenceStatus {
+    FeatureEvidenceStatus {
+        status: EvidenceStatus::Unavailable,
+        degraded_reasons: Vec::new(),
+        unavailable_reasons: reasons,
+    }
+}
+
+fn growth_ratio(later: u64, earlier: u64) -> f64 {
+    if earlier == 0 {
+        return 0.0;
+    }
+    (later as f64 - earlier as f64) / earlier as f64
 }
