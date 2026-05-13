@@ -9,6 +9,8 @@ pub use feature_builder::ObservationFeatureBuilder;
 pub use traits::{CheckpointProducer, FeatureMaterializer};
 pub use types::{
     AlphaFingerprintFeatures, CheckpointDerivedFeatures, CheckpointTrigger, CurveReadinessFeatures,
-    MaterializedFeatureSet, MaterializedTrajectoryAssessment, SessionCheckpoint,
+    EvidenceDegradedReason, EvidenceStatus, EvidenceUnavailableReason, FeatureEvidenceStatus,
+    ManipulationContradictionFeatures, MaterializedEvidenceStatus, MaterializedFeatureSet,
+    MaterializedTrajectoryAssessment, OrganicBroadeningFeatures, SessionCheckpoint,
     TrajectorySegmentSnapshot, TrendDirection, TxSegmentSequence,
 };

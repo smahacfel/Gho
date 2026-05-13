@@ -3,8 +3,8 @@ use ghost_core::account_state_core::types::{
     AccountStateFeatures, AccountStateUpdate, CanonicalPoolState, StatePhase, UpdateSource,
 };
 use ghost_core::checkpoint::types::{
-    CheckpointDerivedFeatures, CheckpointTrigger, MaterializedFeatureSet, SessionCheckpoint,
-    TrendDirection,
+    CheckpointDerivedFeatures, CheckpointTrigger, EvidenceStatus, MaterializedFeatureSet,
+    SessionCheckpoint, TrendDirection,
 };
 use ghost_core::session::types::{
     SessionDiagnostics, SessionId, SessionMetadata, SessionStatus, VerdictOutcome,
@@ -261,6 +261,16 @@ fn materialized_feature_set_contains_complete_inputs() {
     assert_eq!(
         feature_set.sybil_resistance.degraded_reasons,
         vec!["DBIA_NO_DEV_BUY".to_string()]
+    );
+    assert_eq!(
+        feature_set.evidence_status.account_state.status,
+        EvidenceStatus::Unavailable
+    );
+    assert!(!feature_set.organic_broadening.sequence_available);
+    assert!(
+        !feature_set
+            .manipulation_contradictions
+            .sybil_evidence_degraded
     );
 
     let diagnostics = SessionDiagnostics {

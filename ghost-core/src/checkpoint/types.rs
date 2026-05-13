@@ -112,6 +112,190 @@ pub struct AlphaFingerprintFeatures {
     pub flipper_presence_ratio: Option<f64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceStatus {
+    Clean,
+    Degraded,
+    Unavailable,
+}
+
+impl Default for EvidenceStatus {
+    fn default() -> Self {
+        Self::Unavailable
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceDegradedReason {
+    SegmentSequencePartial,
+    SegmentSignerCoveragePartial,
+    TxIntelLowSample,
+    AccountStateFallback,
+    CheckpointHistorySparse,
+    CurveEvidencePartial,
+    SybilEvidencePartial,
+    AlphaEvidencePartial,
+    ManipulationEvidencePartial,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceUnavailableReason {
+    NotMaterialized,
+    SegmentSequenceMissing,
+    SegmentSignerDataMissing,
+    TxIntelMissing,
+    AccountStateMissing,
+    CheckpointHistoryMissing,
+    CurveDataMissing,
+    SybilMetricsMissing,
+    AlphaFingerprintMissing,
+    ExecutionNotRun,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeatureEvidenceStatus {
+    pub status: EvidenceStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub degraded_reasons: Vec<EvidenceDegradedReason>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unavailable_reasons: Vec<EvidenceUnavailableReason>,
+}
+
+impl Default for FeatureEvidenceStatus {
+    fn default() -> Self {
+        Self {
+            status: EvidenceStatus::Unavailable,
+            degraded_reasons: Vec::new(),
+            unavailable_reasons: vec![EvidenceUnavailableReason::NotMaterialized],
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaterializedEvidenceStatus {
+    #[serde(default)]
+    pub account_state: FeatureEvidenceStatus,
+    #[serde(default)]
+    pub tx_intel: FeatureEvidenceStatus,
+    #[serde(default)]
+    pub tx_segments: FeatureEvidenceStatus,
+    #[serde(default)]
+    pub checkpoints: FeatureEvidenceStatus,
+    #[serde(default)]
+    pub curve: FeatureEvidenceStatus,
+    #[serde(default)]
+    pub sybil: FeatureEvidenceStatus,
+    #[serde(default)]
+    pub alpha: FeatureEvidenceStatus,
+    #[serde(default)]
+    pub manipulation: FeatureEvidenceStatus,
+    #[serde(default)]
+    pub execution: FeatureEvidenceStatus,
+}
+
+impl Default for MaterializedEvidenceStatus {
+    fn default() -> Self {
+        Self {
+            account_state: FeatureEvidenceStatus::default(),
+            tx_intel: FeatureEvidenceStatus::default(),
+            tx_segments: FeatureEvidenceStatus::default(),
+            checkpoints: FeatureEvidenceStatus::default(),
+            curve: FeatureEvidenceStatus::default(),
+            sybil: FeatureEvidenceStatus::default(),
+            alpha: FeatureEvidenceStatus::default(),
+            manipulation: FeatureEvidenceStatus::default(),
+            execution: FeatureEvidenceStatus {
+                status: EvidenceStatus::Unavailable,
+                degraded_reasons: Vec::new(),
+                unavailable_reasons: vec![EvidenceUnavailableReason::ExecutionNotRun],
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct OrganicBroadeningFeatures {
+    #[serde(default)]
+    pub sequence_available: bool,
+    #[serde(default)]
+    pub total_tx_count: u64,
+    #[serde(default)]
+    pub total_unique_signers: u64,
+    #[serde(default)]
+    pub t0_tx_count: u64,
+    #[serde(default)]
+    pub t1_tx_count: u64,
+    #[serde(default)]
+    pub t2_tx_count: u64,
+    #[serde(default)]
+    pub t0_unique_signers: u64,
+    #[serde(default)]
+    pub t1_unique_signers: u64,
+    #[serde(default)]
+    pub t2_unique_signers: u64,
+    #[serde(default)]
+    pub t1_vs_t0_unique_signer_delta: i64,
+    #[serde(default)]
+    pub t2_vs_t1_unique_signer_delta: i64,
+    #[serde(default)]
+    pub tx_count_growth_ratio: f64,
+    #[serde(default)]
+    pub unique_signer_growth_ratio: f64,
+    #[serde(default)]
+    pub buy_ratio_mean: f64,
+    #[serde(default)]
+    pub buy_ratio_min: f64,
+    #[serde(default)]
+    pub buy_ratio_max: f64,
+    #[serde(default)]
+    pub max_segment_hhi: f64,
+    #[serde(default)]
+    pub min_segment_hhi: f64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ManipulationContradictionFeatures {
+    #[serde(default)]
+    pub same_ms_tx_ratio: f64,
+    #[serde(default)]
+    pub bundle_suspicion_ratio: f64,
+    #[serde(default)]
+    pub top3_volume_pct: f64,
+    #[serde(default)]
+    pub hhi: f64,
+    #[serde(default)]
+    pub max_tx_per_signer: u64,
+    #[serde(default)]
+    pub dev_volume_ratio: f64,
+    #[serde(default)]
+    pub dev_has_sold: bool,
+    #[serde(default)]
+    pub fee_topology_diversity_index: Option<f64>,
+    #[serde(default)]
+    pub spend_fraction_divergence: Option<f64>,
+    #[serde(default)]
+    pub signer_cross_pool_velocity: Option<f64>,
+    #[serde(default)]
+    pub funding_source_concentration: Option<f64>,
+    #[serde(default)]
+    pub high_same_ms_tx_ratio: bool,
+    #[serde(default)]
+    pub high_bundle_suspicion_ratio: bool,
+    #[serde(default)]
+    pub high_top3_volume_pct: bool,
+    #[serde(default)]
+    pub high_hhi: bool,
+    #[serde(default)]
+    pub high_signer_concentration: bool,
+    #[serde(default)]
+    pub high_dev_concentration: bool,
+    #[serde(default)]
+    pub sybil_evidence_degraded: bool,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MaterializedFeatureSet {
     pub account_features: AccountStateFeatures,
@@ -131,6 +315,17 @@ pub struct MaterializedFeatureSet {
     /// min total duration).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tx_segment_sequence: Option<TxSegmentSequence>,
+    /// V3 P0: conservative evidence-plane status. Missing evidence defaults to
+    /// unavailable and is never interpreted as clean.
+    #[serde(default)]
+    pub evidence_status: MaterializedEvidenceStatus,
+    /// V3 P0: materialized organic broadening signals for shadow evaluation.
+    #[serde(default)]
+    pub organic_broadening: OrganicBroadeningFeatures,
+    /// V3 P0: materialized manipulation/risk contradictions for shadow
+    /// evaluation.
+    #[serde(default)]
+    pub manipulation_contradictions: ManipulationContradictionFeatures,
 }
 
 /// Per-segment trajectory snapshot used by Path B to compute TAS and PDD

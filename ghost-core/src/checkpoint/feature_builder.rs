@@ -103,6 +103,9 @@ impl FeatureMaterializer for ObservationFeatureBuilder {
             sybil_resistance: Default::default(),
             alpha_fingerprint: Default::default(),
             tx_segment_sequence: None,
+            evidence_status: Default::default(),
+            organic_broadening: Default::default(),
+            manipulation_contradictions: Default::default(),
         }
     }
 }

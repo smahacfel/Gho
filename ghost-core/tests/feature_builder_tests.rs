@@ -1,7 +1,8 @@
 use ghost_core::account_state_core::types::{AccountStateFeatures, StatePhase};
 use ghost_core::checkpoint::{
-    CheckpointDerivedFeatures, CheckpointTrigger, FeatureMaterializer, ObservationFeatureBuilder,
-    SessionCheckpoint, TrendDirection,
+    CheckpointDerivedFeatures, CheckpointTrigger, EvidenceStatus, EvidenceUnavailableReason,
+    FeatureMaterializer, MaterializedFeatureSet, ObservationFeatureBuilder, SessionCheckpoint,
+    TrendDirection,
 };
 use ghost_core::session::types::{SessionId, SessionMetadata};
 use ghost_core::tx_intelligence::types::{RiskFlag, RiskSeverity, TxIntelFeatures};
@@ -175,6 +176,62 @@ fn feature_builder_materializes_complete_feature_set() {
         0.0
     );
     assert!((feature_set.checkpoint_features.bonding_progress - 0.30).abs() < 1e-9);
+    assert_eq!(
+        feature_set.evidence_status.tx_segments.status,
+        EvidenceStatus::Unavailable
+    );
+    assert_eq!(
+        feature_set.evidence_status.execution.unavailable_reasons,
+        vec![EvidenceUnavailableReason::ExecutionNotRun]
+    );
+    assert!(!feature_set.organic_broadening.sequence_available);
+    assert!(
+        !feature_set
+            .manipulation_contradictions
+            .sybil_evidence_degraded
+    );
+}
+
+#[test]
+fn materialized_feature_set_deserializes_without_v3_fields_as_unavailable() {
+    let builder = ObservationFeatureBuilder;
+    let feature_set = builder.materialize(
+        account_features(1.0, (100, 900), 0.15),
+        tx_features(1, 1.0, 1.0),
+        &[],
+        vec![],
+        SessionMetadata {
+            session_id: SessionId(9),
+            pool_amm_id: Pubkey::new_unique(),
+            base_mint: Pubkey::new_unique(),
+            observation_duration_ms: 0,
+            is_dev_known: false,
+        },
+    );
+
+    let mut value = serde_json::to_value(&feature_set).expect("serialize feature set");
+    let object = value.as_object_mut().expect("feature set should be object");
+    object.remove("evidence_status");
+    object.remove("organic_broadening");
+    object.remove("manipulation_contradictions");
+
+    let decoded: MaterializedFeatureSet =
+        serde_json::from_value(value).expect("deserialize old feature set json");
+
+    assert_eq!(
+        decoded.evidence_status.account_state.status,
+        EvidenceStatus::Unavailable
+    );
+    assert_eq!(
+        decoded.evidence_status.account_state.unavailable_reasons,
+        vec![EvidenceUnavailableReason::NotMaterialized]
+    );
+    assert_eq!(
+        decoded.evidence_status.execution.unavailable_reasons,
+        vec![EvidenceUnavailableReason::ExecutionNotRun]
+    );
+    assert!(!decoded.organic_broadening.sequence_available);
+    assert_eq!(decoded.manipulation_contradictions.max_tx_per_signer, 0);
 }
 
 #[test]
