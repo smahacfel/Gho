@@ -1756,6 +1756,20 @@ impl DecisionLogger {
                         for mut plane_log in expand_gatekeeper_plane_logs(log) {
                             hydrate_gatekeeper_routing_fields(&mut plane_log, &config);
 
+                            if plane_log.log_schema_version >= 19 && plane_log.reason_code.is_none()
+                            {
+                                warn!(
+                                    "GK_REASON_CODE_MISSING: dropping plane row pool={} plane={} verdict_type={}",
+                                    plane_log.pool_id,
+                                    plane_log
+                                        .decision_plane
+                                        .as_deref()
+                                        .unwrap_or("unknown"),
+                                    plane_log.verdict_type.as_deref().unwrap_or("unknown"),
+                                );
+                                continue;
+                            }
+
                             // ── A/B dedup: skip duplicate ab_record_id writes per plane ──
                             if let Some(ref record_id) = plane_log.ab_record_id {
                                 let plane =
@@ -1907,7 +1921,12 @@ fn hydrate_gatekeeper_routing_fields(log: &mut GatekeeperBuyLog, config: &Decisi
 }
 
 fn gatekeeper_buy_alias_from_verdict(verdict_type: Option<&str>) -> Option<bool> {
-    verdict_type.map(|verdict| matches!(verdict, "BUY" | "EARLY_BUY"))
+    verdict_type.map(|verdict| {
+        matches!(
+            verdict,
+            "BUY" | "EARLY_BUY" | "BUY_NORMAL" | "BUY_EARLY" | "BUY_EXTENDED"
+        )
+    })
 }
 
 fn expand_gatekeeper_plane_logs(log: GatekeeperBuyLog) -> Vec<GatekeeperBuyLog> {
@@ -1947,14 +1966,8 @@ fn expand_gatekeeper_plane_logs(log: GatekeeperBuyLog) -> Vec<GatekeeperBuyLog> 
         legacy.legacy_live_verdict_type = legacy_verdict_type.clone();
         legacy.decision_reason = legacy_reason;
         legacy.decision_verdict_buy = legacy_verdict_buy;
-        // P4: per-plane reason_code — recompute from legacy verdict type
-        // when a 1:1 mapping exists. For generic/aggregate tags, keep the
-        // unified reason_code from the primary assessment (100% completeness).
-        let legacy_rc = legacy_verdict_type.as_ref().and_then(|vt| {
-            crate::oracle::reason_code::GatekeeperReasonCode::derive_from_verdict_type_str(vt)
-        });
         legacy.verdict_type = legacy_verdict_type;
-        legacy.reason_code = legacy_rc.or_else(|| log.reason_code.clone());
+        legacy.reason_code = log.reason_code.clone();
         expanded.push(legacy);
     }
 
@@ -1966,14 +1979,12 @@ fn expand_gatekeeper_plane_logs(log: GatekeeperBuyLog) -> Vec<GatekeeperBuyLog> 
         shadow.decision_reason = shadow.v25_shadow_reason_chain.clone();
         shadow.decision_verdict_buy =
             gatekeeper_buy_alias_from_verdict(shadow_verdict_type.as_deref());
-        // P4: per-plane reason_code — recompute from shadow verdict type
-        // when a 1:1 mapping exists. For generic/aggregate tags, keep the
-        // unified reason_code from the primary assessment (100% completeness).
-        let shadow_rc = shadow_verdict_type.as_ref().and_then(|vt| {
-            crate::oracle::reason_code::GatekeeperReasonCode::derive_from_verdict_type_str(vt)
-        });
         shadow.verdict_type = shadow_verdict_type;
-        shadow.reason_code = shadow_rc.or_else(|| log.reason_code.clone());
+        shadow.reason_code = shadow
+            .verdict_type
+            .as_deref()
+            .and_then(crate::oracle::reason_code::GatekeeperReasonCode::from_log_str)
+            .map(crate::oracle::reason_code::GatekeeperReasonCode::as_log_str);
         expanded.push(shadow);
     }
 
@@ -2165,6 +2176,7 @@ async fn write_gatekeeper_buy_log(base_dir: &Path, log: &GatekeeperBuyLog) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::oracle::reason_code::GatekeeperReasonCode;
     use std::collections::HashMap;
     use tempfile::TempDir;
     use tokio::fs;
@@ -3402,11 +3414,14 @@ mod tests {
         mixed_log.decision_reason = Some("legacy_buy".to_string());
         mixed_log.decision_verdict_buy = Some(true);
         mixed_log.verdict_type = Some("BUY".to_string());
+        mixed_log.reason_code = Some(GatekeeperReasonCode::BuyNormal.as_log_str());
+        mixed_log.reason_code_version = GatekeeperReasonCode::version();
         mixed_log.legacy_live_reason_chain = Some("legacy_buy".to_string());
         mixed_log.legacy_live_verdict_buy = Some(true);
         mixed_log.legacy_live_verdict_type = Some("BUY".to_string());
-        mixed_log.v25_shadow_reason_chain = Some("shadow reject due to PDD".to_string());
-        mixed_log.v25_shadow_verdict_type = Some("REJECT_PUMP_AND_DUMP".to_string());
+        mixed_log.v25_shadow_reason_chain = Some("shadow reject due to TAS".to_string());
+        mixed_log.v25_shadow_verdict_type =
+            Some(GatekeeperReasonCode::RejectLowTrajectory.as_log_str());
         mixed_log.v25_shadow_confidence = Some(0.0);
         mixed_log.v25_shadow_observation_stage = Some("Normal".to_string());
         mixed_log.ab_record_id = Some("pool_mixed:1000:11000:MIXED".to_string());
@@ -3459,16 +3474,197 @@ mod tests {
         assert_eq!(legacy_record["decision_verdict_buy"], true);
         assert_eq!(legacy_record["verdict_type"], "BUY");
         assert_eq!(
+            legacy_record["reason_code"],
+            GatekeeperReasonCode::BuyNormal.as_log_str()
+        );
+        assert_eq!(
             legacy_record["v25_shadow_verdict_type"],
-            "REJECT_PUMP_AND_DUMP"
+            GatekeeperReasonCode::RejectLowTrajectory.as_log_str()
         );
 
         assert_eq!(shadow_record["decision_plane"], DECISION_PLANE_V25_SHADOW);
         assert_eq!(shadow_record["gatekeeper_version"], GATEKEEPER_VERSION);
         assert_eq!(shadow_record["decision_verdict_buy"], false);
-        assert_eq!(shadow_record["verdict_type"], "REJECT_PUMP_AND_DUMP");
-        assert_eq!(shadow_record["decision_reason"], "shadow reject due to PDD");
+        assert_eq!(
+            shadow_record["verdict_type"],
+            GatekeeperReasonCode::RejectLowTrajectory.as_log_str()
+        );
+        assert_eq!(shadow_record["decision_reason"], "shadow reject due to TAS");
+        assert_eq!(
+            shadow_record["reason_code"],
+            GatekeeperReasonCode::RejectLowTrajectory.as_log_str()
+        );
         assert_eq!(shadow_record["legacy_live_verdict_type"], "BUY");
+
+        logger.shutdown().await;
+    }
+
+    #[test]
+    fn test_expand_shadow_plane_does_not_fallback_to_main_reason_code() {
+        let mut mixed_log = create_test_buy_log();
+        mixed_log.pool_id = "pool_shadow_no_fallback".to_string();
+        mixed_log.decision_reason = Some("legacy reject".to_string());
+        mixed_log.decision_verdict_buy = Some(false);
+        mixed_log.verdict_type = Some("REJECT_HARD_FAIL".to_string());
+        mixed_log.reason_code = Some(GatekeeperReasonCode::HardFailPriceChange.as_log_str());
+        mixed_log.reason_code_version = GatekeeperReasonCode::version();
+        mixed_log.legacy_live_reason_chain = mixed_log.decision_reason.clone();
+        mixed_log.legacy_live_verdict_buy = mixed_log.decision_verdict_buy;
+        mixed_log.legacy_live_verdict_type = mixed_log.verdict_type.clone();
+        mixed_log.v25_shadow_reason_chain = Some("shadow generic reject".to_string());
+        mixed_log.v25_shadow_verdict_type = Some("REJECT_PUMP_AND_DUMP".to_string());
+        mixed_log.v25_shadow_confidence = Some(0.0);
+        mixed_log.v25_shadow_observation_stage = Some("Normal".to_string());
+
+        let expanded = expand_gatekeeper_plane_logs(mixed_log);
+        assert_eq!(expanded.len(), 2, "expected legacy and shadow plane rows");
+
+        let legacy = expanded
+            .iter()
+            .find(|log| log.decision_plane.as_deref() == Some(DECISION_PLANE_LEGACY_LIVE))
+            .expect("legacy plane row");
+        assert_eq!(
+            legacy.reason_code.as_deref(),
+            Some(
+                GatekeeperReasonCode::HardFailPriceChange
+                    .as_log_str()
+                    .as_str()
+            )
+        );
+
+        let shadow = expanded
+            .iter()
+            .find(|log| log.decision_plane.as_deref() == Some(DECISION_PLANE_V25_SHADOW))
+            .expect("shadow plane row");
+        assert_eq!(shadow.verdict_type.as_deref(), Some("REJECT_PUMP_AND_DUMP"));
+        assert_eq!(
+            shadow.reason_code, None,
+            "shadow plane must not inherit main reason_code"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_logger_persists_legacy_plane_with_reason_code() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().to_path_buf();
+        let config = DecisionLoggerConfig {
+            log_dir: log_dir.clone(),
+            gatekeeper_log_dir: log_dir.clone(),
+            gatekeeper_rollout_profile: "test-rollout".to_string(),
+            gatekeeper_config_hash: "test-config-hash".to_string(),
+            channel_buffer_size: 10,
+            enabled: true,
+        };
+        let logger = DecisionLogger::new(config);
+
+        let mut legacy_log = create_test_buy_log();
+        legacy_log.pool_id = "pool_reason_code_ok".to_string();
+        legacy_log.decision_reason = Some("legacy buy".to_string());
+        legacy_log.decision_verdict_buy = Some(true);
+        legacy_log.verdict_type = Some("BUY".to_string());
+        legacy_log.legacy_live_reason_chain = legacy_log.decision_reason.clone();
+        legacy_log.legacy_live_verdict_buy = legacy_log.decision_verdict_buy;
+        legacy_log.legacy_live_verdict_type = legacy_log.verdict_type.clone();
+        legacy_log.reason_code = Some(GatekeeperReasonCode::BuyNormal.as_log_str());
+        legacy_log.reason_code_version = GatekeeperReasonCode::version();
+        legacy_log.ab_record_id = Some("pool_reason_code_ok:1000:11000:BUY".to_string());
+
+        logger.log_gatekeeper_buy_decision(legacy_log).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        let decisions_file = test_gatekeeper_route_dir(
+            &log_dir,
+            LEGACY_GATEKEEPER_VERSION,
+            DECISION_PLANE_LEGACY_LIVE,
+        )
+        .join(GATEKEEPER_DECISIONS_JSONL);
+        assert!(
+            decisions_file.exists(),
+            "legacy decisions file should exist"
+        );
+
+        let content = fs::read_to_string(&decisions_file).await.unwrap();
+        let records: Vec<serde_json::Value> = content
+            .trim()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["pool_id"], "pool_reason_code_ok");
+        assert_eq!(
+            records[0]["reason_code"],
+            GatekeeperReasonCode::BuyNormal.as_log_str()
+        );
+
+        logger.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_logger_drops_only_plane_rows_missing_reason_code() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().to_path_buf();
+        let config = DecisionLoggerConfig {
+            log_dir: log_dir.clone(),
+            gatekeeper_log_dir: log_dir.clone(),
+            gatekeeper_rollout_profile: "test-rollout".to_string(),
+            gatekeeper_config_hash: "test-config-hash".to_string(),
+            channel_buffer_size: 10,
+            enabled: true,
+        };
+        let logger = DecisionLogger::new(config);
+
+        let mut mixed_log = create_test_buy_log();
+        mixed_log.pool_id = "pool_partial_drop".to_string();
+        mixed_log.decision_reason = Some("legacy buy".to_string());
+        mixed_log.decision_verdict_buy = Some(true);
+        mixed_log.verdict_type = Some("BUY".to_string());
+        mixed_log.legacy_live_reason_chain = mixed_log.decision_reason.clone();
+        mixed_log.legacy_live_verdict_buy = mixed_log.decision_verdict_buy;
+        mixed_log.legacy_live_verdict_type = mixed_log.verdict_type.clone();
+        mixed_log.reason_code = Some(GatekeeperReasonCode::BuyNormal.as_log_str());
+        mixed_log.reason_code_version = GatekeeperReasonCode::version();
+        mixed_log.v25_shadow_reason_chain = Some("shadow generic reject".to_string());
+        mixed_log.v25_shadow_verdict_type = Some("REJECT_PUMP_AND_DUMP".to_string());
+        mixed_log.v25_shadow_confidence = Some(0.0);
+        mixed_log.v25_shadow_observation_stage = Some("Normal".to_string());
+        mixed_log.ab_record_id = Some("pool_partial_drop:1000:11000:MIXED".to_string());
+
+        logger.log_gatekeeper_buy_decision(mixed_log).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        let legacy_dir = test_gatekeeper_route_dir(
+            &log_dir,
+            LEGACY_GATEKEEPER_VERSION,
+            DECISION_PLANE_LEGACY_LIVE,
+        );
+        let shadow_dir =
+            test_gatekeeper_route_dir(&log_dir, GATEKEEPER_VERSION, DECISION_PLANE_V25_SHADOW);
+
+        let legacy_decisions = legacy_dir.join(GATEKEEPER_DECISIONS_JSONL);
+        let shadow_decisions = shadow_dir.join(GATEKEEPER_DECISIONS_JSONL);
+
+        assert!(
+            legacy_decisions.exists(),
+            "valid legacy plane row should be persisted"
+        );
+        assert!(
+            !shadow_decisions.exists(),
+            "shadow plane row without typed reason_code must be dropped"
+        );
+
+        let legacy_content = fs::read_to_string(&legacy_decisions).await.unwrap();
+        let records: Vec<serde_json::Value> = legacy_content
+            .trim()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["pool_id"], "pool_partial_drop");
+        assert_eq!(records[0]["decision_plane"], DECISION_PLANE_LEGACY_LIVE);
+        assert_eq!(
+            records[0]["reason_code"],
+            GatekeeperReasonCode::BuyNormal.as_log_str()
+        );
 
         logger.shutdown().await;
     }

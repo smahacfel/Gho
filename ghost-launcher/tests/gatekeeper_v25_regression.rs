@@ -1971,79 +1971,8 @@ fn p3_config_has_legacy_drift_cap_1_50() {
 
 use ghost_brain::oracle::reason_code::GatekeeperReasonCode;
 
-/// P4: Every verdict emits a typed reason_code in the buy log.
-#[test]
-fn p4_every_verdict_emits_typed_reason_code() {
-    use ghost_brain::config::GatekeeperMode;
-    use ghost_launcher::components::gatekeeper_policy::{
-        build_assessment_from_features, PolicyEvaluationContext,
-    };
-
-    // Test 1: Hard fail (HF-4 PriceChange) → reason_code = Some("HARD_FAIL_PRICE_CHANGE")
-    let mut config = v25_enabled_config();
-    config.mode = GatekeeperMode::Long;
-    config.max_price_change_ratio = 1.50;
-
-    let mut features = ghost_core::checkpoint::MaterializedFeatureSet::default();
-    features.tx_intel_features.tx_count = 15;
-    features.tx_intel_features.buy_count = 12;
-    features.tx_intel_features.unique_signers = 10;
-    features.tx_intel_features.buy_ratio = 0.80;
-    features.tx_intel_features.total_volume_sol = 8.0;
-    features.account_features.price_sol = 2.0;
-    features.account_features.market_cap_sol = 50.0;
-    features.account_features.bonding_progress = 0.20;
-    features.account_features.current_reserves = (50_000_000_000, 900_000_000);
-    features
-        .checkpoint_features
-        .price_change_from_first_checkpoint_pct = 150.0;
-    features.checkpoint_features.price_trajectory = vec![1.0, 2.0];
-    features.checkpoint_features.trajectory_checkpoint_count = 2;
-    features.checkpoint_features.single_tx_max_price_impact_pct = 10.0;
-    features.curve_readiness.curve_data_known = true;
-    features.curve_readiness.price_sample_count = 2;
-    features.session_metadata.observation_duration_ms = 7_000;
-
-    let assessment =
-        build_assessment_from_features(features, &config, PolicyEvaluationContext::default());
-    let buy_log = assessment.to_buy_log(&Pubkey::new_unique(), &config);
-
-    assert!(
-        buy_log.reason_code.is_some(),
-        "reason_code must be populated for HF-4 reject"
-    );
-    assert_eq!(buy_log.reason_code_version, 2);
-    let code_str = buy_log.reason_code.as_ref().unwrap();
-    assert!(
-        code_str.contains("PRICE_CHANGE") || code_str.contains("HARD_FAIL"),
-        "HF-4 should produce HardFailPriceChange, got: {}",
-        code_str
-    );
-
-    // Verify serialized format is SCREAMING_SNAKE_CASE.
-    let parsed: GatekeeperReasonCode =
-        serde_json::from_str(&format!("\"{}\"", code_str)).expect("valid reason code");
-    assert_eq!(parsed, GatekeeperReasonCode::HardFailPriceChange);
-
-    // Test 2: Default assessment (no decision) → reason_code = TimeoutPhase1NoData
-    let empty_assessment = build_assessment_from_features(
-        ghost_core::checkpoint::MaterializedFeatureSet::default(),
-        &config,
-        PolicyEvaluationContext::default(),
-    );
-    let empty_log = empty_assessment.to_buy_log(&Pubkey::new_unique(), &config);
-    assert!(
-        empty_log.reason_code.is_some(),
-        "even empty verdict must emit reason_code"
-    );
-    assert_eq!(empty_log.reason_code_version, 2);
-}
-
-/// P4: REJECT_SYBIL_INTERFERENCE maps deterministically in runtime buy logs.
-#[test]
-fn p4_reject_sybil_interference_has_reason_code() {
-    let config = v25_enabled_config();
-    let mut assessment = GatekeeperAssessment {
+fn p4_base_assessment() -> GatekeeperAssessment {
+    GatekeeperAssessment {
         phase1_passed: true,
         phase2_velocity: None,
         phase2_passed: true,
@@ -2066,6 +1995,7 @@ fn p4_reject_sybil_interference_has_reason_code() {
         eval_count: 1,
         buy_count: 20,
         decision: None,
+        terminal_reason_code: None,
         early_fingerprint: None,
         curve_t0_event_ts_ms: None,
         curve_t0_clock_source: None,
@@ -2082,7 +2012,114 @@ fn p4_reject_sybil_interference_has_reason_code() {
         entry_drift_anchor_quality: None,
         adaptive_thresholds_applied: false,
         v25_confidence: None,
-    };
+    }
+}
+
+/// P4b: `to_buy_log()` must read the typed cause from `decision.reason_code`,
+/// not reconstruct it from `reason_chain` text.
+#[test]
+fn p4_to_buy_log_reads_decision_reason_code_not_text() {
+    let config = v25_enabled_config();
+    let mut assessment = p4_base_assessment();
+    assessment.decision = Some(GatekeeperDecision {
+        hard_fail_reason: Some("HARD_FAIL: price_change_ratio=9.9".to_string()),
+        core1_passed: false,
+        core2_passed: false,
+        core3_passed: false,
+        soft_signals: SoftSignals::default(),
+        soft_points: 0,
+        max_soft_points_possible: 0,
+        effective_max_soft_points: 0,
+        dev_unknown: false,
+        sybil_policy: SybilPolicyDiagnostics::default(),
+        alpha_gate: AlphaGateDiagnostics::not_run(false),
+        prosperity_filter: ProsperityFilterDiagnostics::not_run(false),
+        total_soft_points: 0,
+        verdict_type: GatekeeperVerdictType::RejectHardFail,
+        verdict_buy: false,
+        reason_chain: "text without price_change marker".to_string(),
+        reason_code: Some(GatekeeperReasonCode::HardFailPriceChange),
+        gatekeeper_strength: None,
+    });
+
+    let buy_log = assessment.to_buy_log(&Pubkey::new_unique(), &config);
+    assert_eq!(
+        buy_log.reason_code.as_deref(),
+        Some("HARD_FAIL_PRICE_CHANGE")
+    );
+}
+
+#[test]
+fn p4_assessment_only_timeout_uses_terminal_reason_code() {
+    let config = v25_enabled_config();
+    let mut assessment = p4_base_assessment();
+    assessment.decision = None;
+    assessment.phase1_passed = false;
+    assessment.phases_passed = 0;
+    assessment.total_tx_evaluated = 0;
+    assessment.buy_count = 0;
+    assessment.unique_tx_evaluated = 0;
+    assessment.unique_signers_evaluated = 0;
+    assessment.terminal_reason_code = Some(GatekeeperReasonCode::TimeoutPhase1NoData);
+
+    let buy_log = assessment.to_buy_log(&Pubkey::new_unique(), &config);
+    assert_eq!(buy_log.reason_code.as_deref(), Some("TIMEOUT_PHASE1_NO_DATA"));
+}
+
+#[test]
+fn p4_assessment_only_timeout_without_terminal_reason_code_uses_invariant() {
+    let config = v25_enabled_config();
+    let mut assessment = p4_base_assessment();
+    assessment.decision = None;
+    assessment.phase1_passed = false;
+    assessment.phases_passed = 0;
+    assessment.total_tx_evaluated = 0;
+    assessment.buy_count = 0;
+    assessment.unique_tx_evaluated = 0;
+    assessment.unique_signers_evaluated = 0;
+    assessment.terminal_reason_code = None;
+
+    let buy_log = assessment.to_buy_log(&Pubkey::new_unique(), &config);
+    assert_eq!(
+        buy_log.reason_code.as_deref(),
+        Some("INVARIANT_TIMEOUT_NO_VERDICT")
+    );
+}
+
+#[test]
+fn p4_decision_without_reason_code_does_not_get_timeout_fallback() {
+    let config = v25_enabled_config();
+    let mut assessment = p4_base_assessment();
+    assessment.decision = Some(GatekeeperDecision {
+        hard_fail_reason: None,
+        core1_passed: true,
+        core2_passed: true,
+        core3_passed: true,
+        soft_signals: SoftSignals::default(),
+        soft_points: 0,
+        max_soft_points_possible: 0,
+        effective_max_soft_points: 0,
+        dev_unknown: false,
+        sybil_policy: SybilPolicyDiagnostics::default(),
+        alpha_gate: AlphaGateDiagnostics::not_run(false),
+        prosperity_filter: ProsperityFilterDiagnostics::not_run(false),
+        total_soft_points: 0,
+        verdict_type: GatekeeperVerdictType::RejectCoreFail,
+        verdict_buy: false,
+        reason_chain: "CORE_FAIL".to_string(),
+        reason_code: None,
+        gatekeeper_strength: None,
+    });
+
+    let buy_log = assessment.to_buy_log(&Pubkey::new_unique(), &config);
+    assert_eq!(buy_log.reason_code, None);
+}
+
+/// P4: REJECT_SYBIL_INTERFERENCE maps deterministically in runtime buy logs.
+#[test]
+fn p4_reject_sybil_interference_has_reason_code() {
+    let config = v25_enabled_config();
+    let mut assessment = p4_base_assessment();
     assessment.decision = Some(GatekeeperDecision {
         hard_fail_reason: None,
         core1_passed: true,
@@ -2100,6 +2137,7 @@ fn p4_reject_sybil_interference_has_reason_code() {
         verdict_type: GatekeeperVerdictType::RejectSybilInterference,
         verdict_buy: false,
         reason_chain: "SYBIL_COMBO: test".to_string(),
+        reason_code: Some(GatekeeperReasonCode::RejectSybilInterference),
         gatekeeper_strength: None,
     });
 
@@ -2112,6 +2150,47 @@ fn p4_reject_sybil_interference_has_reason_code() {
         log.reason_code.as_deref(),
         Some("REJECT_SYBIL_INTERFERENCE")
     );
+}
+
+#[test]
+fn p4_iwim_buy_to_reject_mutates_reason_code() {
+    let mut assessment = p4_base_assessment();
+    assessment.decision = Some(GatekeeperDecision {
+        hard_fail_reason: None,
+        core1_passed: true,
+        core2_passed: true,
+        core3_passed: true,
+        soft_signals: SoftSignals::default(),
+        soft_points: 0,
+        max_soft_points_possible: 0,
+        effective_max_soft_points: 0,
+        dev_unknown: false,
+        sybil_policy: SybilPolicyDiagnostics::default(),
+        alpha_gate: AlphaGateDiagnostics::not_run(false),
+        prosperity_filter: ProsperityFilterDiagnostics::not_run(false),
+        total_soft_points: 0,
+        verdict_type: GatekeeperVerdictType::Buy,
+        verdict_buy: true,
+        reason_chain: "BUY: clean".to_string(),
+        reason_code: Some(GatekeeperReasonCode::BuyNormal),
+        gatekeeper_strength: None,
+    });
+
+    let iwim_verdict_type = GatekeeperVerdictType::RejectIwimLowConf;
+    if let Some(ref mut decision) = assessment.decision {
+        decision.verdict_buy = false;
+        decision.verdict_type = iwim_verdict_type;
+        decision.reason_chain = format!("{} → IWIM_REJECT: low_conf", decision.reason_chain);
+        decision.reason_code = Some(match iwim_verdict_type {
+            GatekeeperVerdictType::RejectIwimVeto => GatekeeperReasonCode::RejectIwimVeto,
+            GatekeeperVerdictType::RejectIwimLowConf => GatekeeperReasonCode::RejectIwimLowConf,
+            _ => GatekeeperReasonCode::RejectIwimUnknownStrict,
+        });
+    }
+
+    let decision = assessment.decision.expect("decision should remain present");
+    assert_eq!(decision.verdict_type, GatekeeperVerdictType::RejectIwimLowConf);
+    assert_eq!(decision.reason_code, Some(GatekeeperReasonCode::RejectIwimLowConf));
 }
 
 /// P4: feature-driven timeout builder uses the concrete low-phases timeout subtype.

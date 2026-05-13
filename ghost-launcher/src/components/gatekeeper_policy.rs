@@ -8,6 +8,7 @@ use super::gatekeeper::{
 use super::gatekeeper_pdd::{PddDiagnostics, PddHardFail};
 use super::gatekeeper_pdd_sequence::{sequence_signal_availability, PddSequenceSignalKind};
 use ghost_brain::config::GatekeeperV2Config;
+use ghost_brain::oracle::reason_code::GatekeeperReasonCode;
 use ghost_core::checkpoint::{MaterializedFeatureSet, SybilResistanceFeatures, TrendDirection};
 use ghost_core::tx_intelligence::types::{
     CPV_INSUFFICIENT_SIGNERS_REASON, CPV_ROLLING_STATE_UNAVAILABLE_REASON,
@@ -53,6 +54,51 @@ pub enum CurveGateOutcome {
 pub struct PolicyEvaluationContext {
     pub finalize_lag_ms: u64,
     pub eval_count: usize,
+}
+
+fn buy_reason_code_for_stage(stage: Option<ObservationStage>) -> GatekeeperReasonCode {
+    match stage {
+        Some(ObservationStage::Early) => GatekeeperReasonCode::BuyEarly,
+        Some(ObservationStage::Extended) => GatekeeperReasonCode::BuyExtended,
+        _ => GatekeeperReasonCode::BuyNormal,
+    }
+}
+
+fn hard_fail_reason_code(reason: HardFailReason) -> GatekeeperReasonCode {
+    match reason {
+        HardFailReason::DevSold => GatekeeperReasonCode::HardFailDevSold,
+        HardFailReason::SellImpact => GatekeeperReasonCode::HardFailSellImpact,
+        HardFailReason::TxPriceImpact => GatekeeperReasonCode::HardFailTxPriceImpact,
+        HardFailReason::PriceChange => GatekeeperReasonCode::HardFailPriceChange,
+        HardFailReason::MarketCapTooLow => GatekeeperReasonCode::HardFailMarketCap,
+        HardFailReason::ExtremeHhi => GatekeeperReasonCode::HardFailExtremeHhi,
+        HardFailReason::ExtremeBundling => GatekeeperReasonCode::HardFailExtremeBundling,
+        HardFailReason::ExtremeTop3Dominance => GatekeeperReasonCode::HardFailExtremeTop3,
+        HardFailReason::ExtremeBotTiming => GatekeeperReasonCode::HardFailExtremeBotTiming,
+        HardFailReason::FailedTxRatio => GatekeeperReasonCode::HardFailFailedTxRatio,
+        HardFailReason::SlowPool => GatekeeperReasonCode::HardFailSlowPool,
+    }
+}
+
+fn pdd_reason_code(fail: &PddHardFail) -> GatekeeperReasonCode {
+    match fail {
+        PddHardFail::EntryDrift => GatekeeperReasonCode::RejectPddEntryDrift,
+        PddHardFail::Spike => GatekeeperReasonCode::RejectPddSpike,
+        PddHardFail::Ramping => GatekeeperReasonCode::RejectPddRamping,
+        PddHardFail::Whale => GatekeeperReasonCode::RejectPddWhale,
+        PddHardFail::Reserve => GatekeeperReasonCode::RejectPddReserve,
+        PddHardFail::FlashCrash => GatekeeperReasonCode::RejectPddFlashCrash,
+    }
+}
+
+fn timeout_reason_code_for_assessment(assessment: &GatekeeperAssessment) -> GatekeeperReasonCode {
+    if assessment.total_tx_evaluated == 0 {
+        GatekeeperReasonCode::TimeoutPhase1NoData
+    } else if !assessment.phase1_passed {
+        GatekeeperReasonCode::TimeoutPhase1Insufficient
+    } else {
+        GatekeeperReasonCode::TimeoutDeadlineLowPhases
+    }
 }
 
 fn clamp01(value: f64) -> f64 {
@@ -532,6 +578,7 @@ pub fn build_assessment_from_features(
         eval_count: context.eval_count,
         buy_count: features.tx_intel_features.buy_count as usize,
         decision: None,
+        terminal_reason_code: None,
         early_fingerprint: None,
         curve_t0_event_ts_ms: features.curve_readiness.t0_event_ts_ms,
         curve_t0_clock_source: None,
@@ -1015,8 +1062,7 @@ pub fn evaluate_policy_from_assessment(
     let diagnostics = build_policy_diagnostics(assessment, config);
     let total_soft_points = diagnostics.soft_points as u16 + diagnostics.sybil_policy.soft_points;
 
-    if let Some((_reason, reason_chain)) = evaluate_hard_filters_from_assessment(assessment, config)
-    {
+    if let Some((reason, reason_chain)) = evaluate_hard_filters_from_assessment(assessment, config) {
         return GatekeeperDecision {
             hard_fail_reason: Some(reason_chain.clone()),
             core1_passed: diagnostics.core1_passed,
@@ -1036,6 +1082,7 @@ pub fn evaluate_policy_from_assessment(
             verdict_type: GatekeeperVerdictType::RejectHardFail,
             verdict_buy: false,
             reason_chain,
+            reason_code: Some(hard_fail_reason_code(reason)),
             gatekeeper_strength: None,
         };
     }
@@ -1091,6 +1138,7 @@ pub fn evaluate_policy_from_assessment(
                             pdd.ramping_detected,
                             pdd.whale_top3_pct,
                         ),
+                        reason_code: Some(pdd_reason_code(fail)),
                         gatekeeper_strength: None,
                     };
                 } // end else (not promoted — skip PDD in live path)
@@ -1270,6 +1318,29 @@ pub fn evaluate_policy_from_assessment(
         }
     });
 
+    let reason_code = if verdict_buy {
+        buy_reason_code_for_stage(assessment.observation_stage)
+    } else {
+        match verdict_type {
+            GatekeeperVerdictType::RejectCoreFail => GatekeeperReasonCode::RejectCoreFail,
+            GatekeeperVerdictType::RejectSybilInterference => {
+                GatekeeperReasonCode::RejectSybilInterference
+            }
+            GatekeeperVerdictType::RejectSybilSoftExcess => {
+                GatekeeperReasonCode::RejectSybilSoftExcess
+            }
+            GatekeeperVerdictType::RejectSoftExcess => GatekeeperReasonCode::RejectLegacySoftExcess,
+            GatekeeperVerdictType::RejectLowAlpha => GatekeeperReasonCode::RejectLowAlpha,
+            GatekeeperVerdictType::RejectLowProsperity => {
+                GatekeeperReasonCode::RejectLowProsperity
+            }
+            GatekeeperVerdictType::RejectEntryDrift => GatekeeperReasonCode::RejectPddEntryDrift,
+            GatekeeperVerdictType::RejectFlashCrash => GatekeeperReasonCode::RejectPddFlashCrash,
+            GatekeeperVerdictType::RejectRamping => GatekeeperReasonCode::RejectPddRamping,
+            _ => GatekeeperReasonCode::RejectCoreFail,
+        }
+    };
+
     GatekeeperDecision {
         hard_fail_reason: None,
         core1_passed: diagnostics.core1_passed,
@@ -1287,6 +1358,7 @@ pub fn evaluate_policy_from_assessment(
         verdict_type,
         verdict_buy,
         reason_chain,
+        reason_code: Some(reason_code),
         gatekeeper_strength,
     }
 }
@@ -1375,6 +1447,7 @@ pub fn build_timeout_decision_from_assessment(
         verdict_type,
         verdict_buy: false,
         reason_chain,
+        reason_code: Some(timeout_reason_code_for_assessment(assessment)),
         gatekeeper_strength: None,
     }
 }

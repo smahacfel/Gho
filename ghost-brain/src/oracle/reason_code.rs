@@ -81,6 +81,19 @@ impl GatekeeperReasonCode {
         2
     }
 
+    /// Serialize the enum into the stable JSONL string form.
+    pub fn as_log_str(self) -> String {
+        serde_json::to_string(&self)
+            .unwrap_or_else(|_| "\"SERIALIZATION_ERROR\"".to_string())
+            .trim_matches('"')
+            .to_string()
+    }
+
+    /// Parse the stable JSONL string form back into a typed reason code.
+    pub fn from_log_str(tag: &str) -> Option<Self> {
+        serde_json::from_str(&format!("\"{tag}\"")).ok()
+    }
+
     /// Map a `HardFailReason` variant to the corresponding reason code.
     pub fn from_hard_fail_reason(reason: &str) -> Option<Self> {
         match reason {
@@ -103,7 +116,7 @@ impl GatekeeperReasonCode {
     /// Only 1:1 unambiguous mappings are included. Generic/aggregate tags
     /// (REJECT_HARD_FAIL, REJECT_PUMP_AND_DUMP) return None because they
     /// cannot be resolved to a single reason_code subtype.
-    /// Used by `expand_gatekeeper_plane_logs` for per-plane recomputation.
+    /// Transitional helper only; not the source of truth for `to_buy_log()`.
     pub fn derive_from_verdict_type_str(tag: &str) -> Option<String> {
         let code = match tag {
             "BUY" => Self::BuyNormal,
@@ -129,9 +142,7 @@ impl GatekeeperReasonCode {
             // Generic tags (REJECT_HARD_FAIL, REJECT_PUMP_AND_DUMP) → None
             _ => return None,
         };
-        serde_json::to_string(&code)
-            .ok()
-            .map(|s| s.trim_matches('"').to_string())
+        Some(code.as_log_str())
     }
 
     /// Map an IWIM veto variant tag to the corresponding reason code.

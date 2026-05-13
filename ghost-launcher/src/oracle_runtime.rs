@@ -8611,6 +8611,17 @@ async fn pool_observation_task(
                                 decision.reason_chain,
                                 iwim_res.summary()
                             );
+                            decision.reason_code = Some(match iwim_verdict_type {
+                                crate::components::gatekeeper::GatekeeperVerdictType::RejectIwimVeto => {
+                                    ghost_brain::oracle::reason_code::GatekeeperReasonCode::RejectIwimVeto
+                                }
+                                crate::components::gatekeeper::GatekeeperVerdictType::RejectIwimLowConf => {
+                                    ghost_brain::oracle::reason_code::GatekeeperReasonCode::RejectIwimLowConf
+                                }
+                                _ => {
+                                    ghost_brain::oracle::reason_code::GatekeeperReasonCode::RejectIwimUnknownStrict
+                                }
+                            });
                         }
 
                         let reason =
