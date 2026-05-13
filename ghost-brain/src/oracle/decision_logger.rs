@@ -80,7 +80,8 @@ pub const CYCLIC_LOG_SCHEMA_VERSION: u32 = 1;
 /// model quality from terminal PDD/TAS veto zeroing.
 /// v19 adds typed `reason_code` (GatekeeperReasonCode enum, version 2)
 /// for all verdict types including TIMEOUT subtypes.
-pub const GATEKEEPER_BUY_LOG_SCHEMA_VERSION: u32 = 19;
+/// v20 adds additive V3 P0 shadow/evidence sidecar fields on existing decision rows.
+pub const GATEKEEPER_BUY_LOG_SCHEMA_VERSION: u32 = 20;
 /// Gatekeeper version string embedded in every V2.5 shadow BUY log for traceability.
 pub const GATEKEEPER_VERSION: &str = "v2.5";
 /// Legacy Gatekeeper version string for pre-V2.5 live-plane semantics.
@@ -600,13 +601,13 @@ pub struct GatekeeperBuyLog {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decision_reason: Option<String>,
 
-    /// Typed reason code (GatekeeperReasonCode taxonomy, version 2).
+    /// Typed reason code (GatekeeperReasonCode taxonomy).
     /// Always populated for every verdict type (BUY, REJECT, TIMEOUT).
     /// Replaces the legacy free-form `decision_reason` for machine auditability.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason_code: Option<String>,
 
-    /// Reason code taxonomy version (2 = all verdict types, 1 = NoEmit-only).
+    /// Reason code taxonomy version (3 = V3 P0 shadow/evidence codes).
     #[serde(default)]
     pub reason_code_version: u32,
 
@@ -655,6 +656,30 @@ pub struct GatekeeperBuyLog {
     /// Promotion state for the V2.5 plane (`shadow_only`, `live_enabled`, ...).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub v25_promotion_state: Option<String>,
+
+    // ═══════════════════════════════════════════
+    // V3 P0 shadow/evidence sidecar fields (schema v20)
+    // These are additive fields on the existing decision rows, not a separate
+    // routed decision plane.
+    // ═══════════════════════════════════════════
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v3_shadow_schema_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v3_shadow_verdict: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v3_shadow_reason_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v3_shadow_reason_chain: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v3_shadow_confidence: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v3_shadow_evidence_status: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v3_shadow_organic_broadening: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v3_shadow_manipulation_contradictions: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v3_shadow_notes: Option<serde_json::Value>,
 
     /// Whether alpha gate was enabled in config for this decision.
     #[serde(default)]
@@ -2551,18 +2576,27 @@ mod tests {
             sybil_meta_score: None,
             sybil_interference_layer_enabled: false,
             sybil_combo_veto_enabled: false,
-            decision_reason: None,
-            decision_verdict_buy: None,
-            verdict_type: None,
-            legacy_live_reason_chain: None,
-            legacy_live_verdict_buy: None,
-            legacy_live_verdict_type: None,
+            decision_reason: Some("test buy".to_string()),
+            decision_verdict_buy: Some(true),
+            verdict_type: Some("BUY".to_string()),
+            legacy_live_reason_chain: Some("test buy".to_string()),
+            legacy_live_verdict_buy: Some(true),
+            legacy_live_verdict_type: Some("BUY".to_string()),
             v25_shadow_verdict_type: None,
             v25_shadow_reason_chain: None,
             v25_shadow_confidence: None,
             v25_shadow_confidence_source: None,
             v25_shadow_observation_stage: None,
             v25_promotion_state: Some("shadow_only".to_string()),
+            v3_shadow_schema_version: None,
+            v3_shadow_verdict: None,
+            v3_shadow_reason_code: None,
+            v3_shadow_reason_chain: None,
+            v3_shadow_confidence: None,
+            v3_shadow_evidence_status: None,
+            v3_shadow_organic_broadening: None,
+            v3_shadow_manipulation_contradictions: None,
+            v3_shadow_notes: None,
             alpha_gate_enabled: false,
             alpha_pass: None,
             alpha_actionable: None,
@@ -2751,8 +2785,8 @@ mod tests {
             market_regime: None,
             pdd_soft_flags: None,
             shadow_pdd_reject_reason: None,
-            reason_code: None,
-            reason_code_version: 0,
+            reason_code: Some(GatekeeperReasonCode::BuyNormal.as_log_str()),
+            reason_code_version: GatekeeperReasonCode::version(),
             pdd_sequence_signals_unavailable_reason: None,
         };
 
@@ -2973,9 +3007,9 @@ mod tests {
             sybil_meta_score: None,
             sybil_interference_layer_enabled: false,
             sybil_combo_veto_enabled: false,
-            decision_reason: None,
-            decision_verdict_buy: None,
-            verdict_type: None,
+            decision_reason: Some("test reject".to_string()),
+            decision_verdict_buy: Some(false),
+            verdict_type: Some("REJECT_CORE_FAIL".to_string()),
             legacy_live_reason_chain: None,
             legacy_live_verdict_buy: None,
             legacy_live_verdict_type: None,
@@ -2985,6 +3019,15 @@ mod tests {
             v25_shadow_confidence_source: None,
             v25_shadow_observation_stage: None,
             v25_promotion_state: Some("shadow_only".to_string()),
+            v3_shadow_schema_version: None,
+            v3_shadow_verdict: None,
+            v3_shadow_reason_code: None,
+            v3_shadow_reason_chain: None,
+            v3_shadow_confidence: None,
+            v3_shadow_evidence_status: None,
+            v3_shadow_organic_broadening: None,
+            v3_shadow_manipulation_contradictions: None,
+            v3_shadow_notes: None,
             alpha_gate_enabled: false,
             alpha_pass: None,
             alpha_actionable: None,
@@ -3169,10 +3212,87 @@ mod tests {
             market_regime: None,
             pdd_soft_flags: None,
             shadow_pdd_reject_reason: None,
-            reason_code: None,
-            reason_code_version: 0,
+            reason_code: Some(GatekeeperReasonCode::RejectCoreFail.as_log_str()),
+            reason_code_version: GatekeeperReasonCode::version(),
             pdd_sequence_signals_unavailable_reason: None,
         }
+    }
+
+    #[test]
+    fn test_gatekeeper_buy_log_v19_without_v3_fields_deserializes() {
+        let mut legacy_value = serde_json::to_value(create_test_buy_log()).unwrap();
+        legacy_value["log_schema_version"] = serde_json::json!(19);
+
+        let parsed: GatekeeperBuyLog = serde_json::from_value(legacy_value).unwrap();
+        assert_eq!(parsed.log_schema_version, 19);
+        assert!(parsed.v3_shadow_schema_version.is_none());
+        assert!(parsed.v3_shadow_verdict.is_none());
+        assert!(parsed.v3_shadow_reason_code.is_none());
+        assert!(parsed.v3_shadow_reason_chain.is_none());
+        assert!(parsed.v3_shadow_confidence.is_none());
+        assert!(parsed.v3_shadow_evidence_status.is_none());
+        assert!(parsed.v3_shadow_organic_broadening.is_none());
+        assert!(parsed.v3_shadow_manipulation_contradictions.is_none());
+        assert!(parsed.v3_shadow_notes.is_none());
+    }
+
+    #[test]
+    fn test_v3_shadow_fields_are_additive_not_routed_plane() {
+        let mut log = create_test_buy_log();
+        log.pool_id = "pool_v3_shadow_sidecar".to_string();
+        log.decision_reason = Some("legacy reject".to_string());
+        log.decision_verdict_buy = Some(false);
+        log.verdict_type = Some("REJECT_CORE_FAIL".to_string());
+        log.reason_code = Some(GatekeeperReasonCode::RejectCoreFail.as_log_str());
+        log.reason_code_version = GatekeeperReasonCode::version();
+        log.v3_shadow_schema_version = Some(1);
+        log.v3_shadow_verdict = Some("PENDING".to_string());
+        log.v3_shadow_reason_code =
+            Some(GatekeeperReasonCode::V3ShadowPendingInsufficientEvidence.as_log_str());
+        log.v3_shadow_reason_chain = Some(vec![
+            GatekeeperReasonCode::V3EvidenceDegraded.as_log_str(),
+            GatekeeperReasonCode::V3ShadowPendingInsufficientEvidence.as_log_str(),
+        ]);
+        log.v3_shadow_confidence = Some(0.0);
+        log.v3_shadow_evidence_status = Some(serde_json::json!({
+            "tx_intel": { "status": "DEGRADED", "reasons": ["SEGMENT_SEQUENCE_PARTIAL"] }
+        }));
+        log.v3_shadow_organic_broadening = Some(serde_json::json!({
+            "sequence_available": false
+        }));
+        log.v3_shadow_manipulation_contradictions = Some(serde_json::json!({
+            "dev_sold": false
+        }));
+        log.v3_shadow_notes = Some(serde_json::json!({
+            "p0": "shadow_only"
+        }));
+
+        let expanded = expand_gatekeeper_plane_logs(log);
+        assert_eq!(expanded.len(), 1);
+        assert!(
+            expanded
+                .iter()
+                .all(|row| row.decision_plane.as_deref() != Some("v3_shadow")),
+            "V3 P0 must not create a routed v3_shadow decision plane"
+        );
+
+        let record = serde_json::to_value(&expanded[0]).unwrap();
+        assert_eq!(record["decision_plane"], DECISION_PLANE_LEGACY_LIVE);
+        assert_eq!(record["v3_shadow_schema_version"], 1);
+        assert_eq!(record["v3_shadow_verdict"], "PENDING");
+        assert_eq!(
+            record["v3_shadow_reason_code"],
+            GatekeeperReasonCode::V3ShadowPendingInsufficientEvidence.as_log_str()
+        );
+        assert_eq!(
+            record["v3_shadow_reason_chain"][0],
+            GatekeeperReasonCode::V3EvidenceDegraded.as_log_str()
+        );
+        assert_eq!(record["v3_shadow_confidence"], 0.0);
+        assert_eq!(
+            record["v3_shadow_notes"]["p0"],
+            serde_json::json!("shadow_only")
+        );
     }
 
     fn test_gatekeeper_route_dir(
@@ -3273,6 +3393,8 @@ mod tests {
         pass_log.pool_id = "pool_pass".to_string();
         pass_log.decision_verdict_buy = Some(true);
         pass_log.verdict_type = Some("BUY".to_string());
+        pass_log.reason_code = Some(GatekeeperReasonCode::BuyNormal.as_log_str());
+        pass_log.reason_code_version = GatekeeperReasonCode::version();
         pass_log.ab_record_id = Some("pool_pass:1000:11000:BUY".to_string());
         pass_log.sell_buy_ratio = Some(0.40);
         pass_log.compute_unit_cluster_dominance = Some(0.78);
@@ -3294,6 +3416,8 @@ mod tests {
         reject_log.pool_id = "pool_reject".to_string();
         reject_log.decision_verdict_buy = Some(false);
         reject_log.verdict_type = Some("REJECT_CORE_FAIL".to_string());
+        reject_log.reason_code = Some(GatekeeperReasonCode::RejectCoreFail.as_log_str());
+        reject_log.reason_code_version = GatekeeperReasonCode::version();
         reject_log.ab_record_id = Some("pool_reject:1000:11000:REJECT".to_string());
 
         // 1× TIMEOUT (decision_verdict_buy = None)
@@ -3301,6 +3425,9 @@ mod tests {
         timeout_log.pool_id = "pool_timeout".to_string();
         timeout_log.decision_verdict_buy = None;
         timeout_log.verdict_type = Some("TIMEOUT_PHASE1".to_string());
+        timeout_log.reason_code =
+            Some(GatekeeperReasonCode::TimeoutPhase1Insufficient.as_log_str());
+        timeout_log.reason_code_version = GatekeeperReasonCode::version();
         timeout_log.ab_record_id = Some("pool_timeout:1000:11000:TIMEOUT".to_string());
 
         logger.log_gatekeeper_buy_decision(pass_log).await;
@@ -3692,6 +3819,8 @@ mod tests {
         timeout_log.pool_id = "pool_vt_timeout".to_string();
         timeout_log.decision_verdict_buy = None;
         timeout_log.verdict_type = None;
+        timeout_log.reason_code = Some(GatekeeperReasonCode::TimeoutDeadlineLowPhases.as_log_str());
+        timeout_log.reason_code_version = GatekeeperReasonCode::version();
         timeout_log.ab_record_id = Some("pool_vt_timeout:1:2:A".to_string());
 
         // Case 2: verdict_type = None, decision_verdict_buy = Some(false) → REJECT_UNKNOWN
@@ -3699,6 +3828,8 @@ mod tests {
         reject_log.pool_id = "pool_vt_reject".to_string();
         reject_log.decision_verdict_buy = Some(false);
         reject_log.verdict_type = None;
+        reject_log.reason_code = Some(GatekeeperReasonCode::RejectCoreFail.as_log_str());
+        reject_log.reason_code_version = GatekeeperReasonCode::version();
         reject_log.ab_record_id = Some("pool_vt_reject:1:2:B".to_string());
 
         // Case 3: verdict_type = None, decision_verdict_buy = Some(true) → BUY
@@ -3706,6 +3837,8 @@ mod tests {
         buy_log.pool_id = "pool_vt_buy".to_string();
         buy_log.decision_verdict_buy = Some(true);
         buy_log.verdict_type = None;
+        buy_log.reason_code = Some(GatekeeperReasonCode::BuyNormal.as_log_str());
+        buy_log.reason_code_version = GatekeeperReasonCode::version();
         buy_log.ab_record_id = Some("pool_vt_buy:1:2:C".to_string());
 
         logger.log_gatekeeper_buy_decision(timeout_log).await;

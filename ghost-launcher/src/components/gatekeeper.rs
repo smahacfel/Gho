@@ -2248,6 +2248,15 @@ impl GatekeeperAssessment {
                 }
                 .to_string(),
             ),
+            v3_shadow_schema_version: None,
+            v3_shadow_verdict: None,
+            v3_shadow_reason_code: None,
+            v3_shadow_reason_chain: None,
+            v3_shadow_confidence: None,
+            v3_shadow_evidence_status: None,
+            v3_shadow_organic_broadening: None,
+            v3_shadow_manipulation_contradictions: None,
+            v3_shadow_notes: None,
             // IWIM veto gate fields – defaults; enriched later by oracle_runtime
             iwim_enabled: false,
             iwim_mode: None,

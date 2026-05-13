@@ -7,6 +7,7 @@
 //! Version history:
 //! - v1: NoEmit-only (legacy)
 //! - v2: All verdict types (P4 workstream)
+//! - v3: V3 P0 shadow/evidence reason codes
 
 use serde::{Deserialize, Serialize};
 
@@ -73,12 +74,22 @@ pub enum GatekeeperReasonCode {
     // ── SHADOW ──
     ShadowInsufficientData,
     ShadowEvalSkipped,
+
+    // ── V3 P0 SHADOW / EVIDENCE ──
+    V3EvidenceUnavailable,
+    V3EvidenceDegraded,
+    V3OrganicBroadeningInsufficient,
+    V3ManipulationContradiction,
+    V3HardRiskReject,
+    V3ShadowBuyCandidate,
+    V3ShadowPendingInsufficientEvidence,
+    V3ShadowTimeoutEvidence,
 }
 
 impl GatekeeperReasonCode {
     /// Current reason code taxonomy version.
     pub fn version() -> u32 {
-        2
+        3
     }
 
     /// Serialize the enum into the stable JSONL string form.
@@ -198,8 +209,28 @@ mod tests {
     }
 
     #[test]
-    fn test_version_is_2() {
-        assert_eq!(GatekeeperReasonCode::version(), 2);
+    fn test_version_is_3() {
+        assert_eq!(GatekeeperReasonCode::version(), 3);
+    }
+
+    #[test]
+    fn test_v3_reason_codes_roundtrip() {
+        let codes = [
+            GatekeeperReasonCode::V3EvidenceUnavailable,
+            GatekeeperReasonCode::V3EvidenceDegraded,
+            GatekeeperReasonCode::V3OrganicBroadeningInsufficient,
+            GatekeeperReasonCode::V3ManipulationContradiction,
+            GatekeeperReasonCode::V3HardRiskReject,
+            GatekeeperReasonCode::V3ShadowBuyCandidate,
+            GatekeeperReasonCode::V3ShadowPendingInsufficientEvidence,
+            GatekeeperReasonCode::V3ShadowTimeoutEvidence,
+        ];
+
+        for code in codes {
+            let tag = code.as_log_str();
+            assert_eq!(GatekeeperReasonCode::from_log_str(&tag), Some(code));
+            assert!(tag.starts_with("V3_"));
+        }
     }
 
     #[test]
