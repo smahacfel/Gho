@@ -333,6 +333,7 @@ mod tests {
             eval_count: 0,
             buy_count: 0,
             decision: None,
+            terminal_reason_code: None,
             early_fingerprint: None,
             curve_t0_event_ts_ms: None,
             curve_t0_clock_source: None,

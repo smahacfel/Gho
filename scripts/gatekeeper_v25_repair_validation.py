@@ -22,6 +22,7 @@ from shadow_run_report import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_EXPECTED_ROLLOUT_PROFILE = "shadow-burnin-v25-repair-r2"
 
 
 @dataclass
@@ -39,7 +40,14 @@ class Inputs:
     buys_log: Path
     decisions_log: Path
     coverage_audit_log: Path
+    shadow_log: Path
+    shadow_entry_log: Path
+    shadow_lifecycle_log: Path
     events_dir: Path
+    wal_dir: Path
+    snapshot_dir: Path
+    system_log_path: Path
+    oracle_log_path: Path
     session_start_ms: int | None
     expected_rollout_profile: str
     expected_plane: str
@@ -54,6 +62,14 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=DEFAULT_CONFIG,
         help=f"Launcher config used for the clean repaired shadow rerun (default: {DEFAULT_CONFIG})",
+    )
+    parser.add_argument(
+        "--expected-rollout-profile",
+        default=DEFAULT_EXPECTED_ROLLOUT_PROFILE,
+        help=(
+            "Fail-closed rollout profile required by P6 clean validation "
+            f"(default: {DEFAULT_EXPECTED_ROLLOUT_PROFILE})"
+        ),
     )
     parser.add_argument("--json", action="store_true", help="Print JSON report")
     return parser.parse_args()
@@ -81,7 +97,7 @@ def iter_json_objects(path: Path) -> Iterable[dict[str, Any]]:
                     idx += 1
 
 
-def resolve_inputs(config_arg: Path) -> Inputs:
+def resolve_inputs(config_arg: Path, expected_rollout_profile: str) -> Inputs:
     config_path = resolve_config_path(config_arg)
     config = load_toml(config_path)
     execution_mode = str(config.get("execution", {}).get("execution_mode", "paper")).lower()
@@ -102,16 +118,38 @@ def resolve_inputs(config_arg: Path) -> Inputs:
         preferred_plane=expected_plane,
     )
     coverage_audit_log = decisions_dir / "seer_runtime_coverage_audit.jsonl"
+    shadow_log = resolve_runtime_path(
+        config_path,
+        config.get("trigger", {}).get("shadow_run", {}).get("output_path", "logs/shadow_run/buys.jsonl"),
+    )
+    shadow_entry_log = resolve_runtime_path(
+        config_path,
+        config.get("execution", {}).get("shadow", {}).get("entry_log_path", "logs/shadow_run/shadow_entries.jsonl"),
+    )
+    shadow_lifecycle_log = resolve_runtime_path(
+        config_path,
+        config.get("execution", {}).get("shadow", {}).get("lifecycle_log_path")
+        or shadow_entry_log.with_name("shadow_lifecycle.jsonl"),
+    )
     events_dir = resolve_runtime_path(
         config_path, config.get("execution", {}).get("events", {}).get("output_dir", "datasets/events")
+    )
+    wal_dir = resolve_runtime_path(
+        config_path, config.get("durability", {}).get("wal_dir", "data/rollout/wal")
+    )
+    snapshot_dir = resolve_runtime_path(
+        config_path, config.get("durability", {}).get("snapshot_dir", "data/rollout/snapshots")
+    )
+    system_log_path = resolve_runtime_path(
+        config_path, config.get("logging", {}).get("file_path", "logs/system.log")
+    )
+    oracle_log_path = resolve_runtime_path(
+        config_path, config.get("logging", {}).get("oracle_log_path", "logs/oracle.log")
     )
     _, session_start_ms = detect_latest_run_scope(events_dir)
     ghost_brain_config_path = resolve_runtime_path(
         config_path,
         config.get("ghost_brain_config_path", "../../ghost-brain/ghost_brain_config.toml"),
-    )
-    expected_rollout_profile = (
-        decisions_dir.parent.name if decisions_dir.name == "decisions" else decisions_dir.name
     )
     return Inputs(
         config_path=config_path,
@@ -120,7 +158,14 @@ def resolve_inputs(config_arg: Path) -> Inputs:
         buys_log=buys_log,
         decisions_log=decisions_log,
         coverage_audit_log=coverage_audit_log,
+        shadow_log=shadow_log,
+        shadow_entry_log=shadow_entry_log,
+        shadow_lifecycle_log=shadow_lifecycle_log,
         events_dir=events_dir,
+        wal_dir=wal_dir,
+        snapshot_dir=snapshot_dir,
+        system_log_path=system_log_path,
+        oracle_log_path=oracle_log_path,
         session_start_ms=session_start_ms,
         expected_rollout_profile=expected_rollout_profile,
         expected_plane=expected_plane,
@@ -268,6 +313,45 @@ def gate_plane_contract(
             "wrong_rollout": wrong_rollout[:20],
             "unknown_hash": unknown_hash[:20],
         },
+    )
+
+
+def gate_rollout_scope_contract(inputs: Inputs) -> GateResult:
+    observed = {
+        "decisions_dir": str(inputs.decisions_dir),
+        "buys_log": str(inputs.buys_log),
+        "decisions_log": str(inputs.decisions_log),
+        "coverage_audit_log": str(inputs.coverage_audit_log),
+        "shadow_log": str(inputs.shadow_log),
+        "shadow_entry_log": str(inputs.shadow_entry_log),
+        "shadow_lifecycle_log": str(inputs.shadow_lifecycle_log),
+        "events_dir": str(inputs.events_dir),
+        "wal_dir": str(inputs.wal_dir),
+        "snapshot_dir": str(inputs.snapshot_dir),
+        "system_log_path": str(inputs.system_log_path),
+        "oracle_log_path": str(inputs.oracle_log_path),
+    }
+
+    def matches_expected_scope(label: str, raw_path: str) -> bool:
+        path = Path(raw_path)
+        if inputs.expected_rollout_profile in path.parts:
+            return True
+        if label == "shadow_log":
+            return path.name == f"{inputs.expected_rollout_profile}-buys.jsonl"
+        return False
+
+    mismatched = {
+        name: value
+        for name, value in observed.items()
+        if not matches_expected_scope(name, value)
+    }
+    return GateResult(
+        passed=not mismatched,
+        details=(
+            f"expected_rollout_profile={inputs.expected_rollout_profile} "
+            f"mismatched_paths={len(mismatched)}"
+        ),
+        observed={"mismatched_paths": mismatched, "configured_paths": observed},
     )
 
 
@@ -526,6 +610,69 @@ def gate_path_b_confidence_availability(rows: list[dict[str, Any]]) -> GateResul
     )
 
 
+def decision_bucket(row: dict[str, Any]) -> str | None:
+    verdict_type = str(row.get("verdict_type") or "")
+    if row.get("decision_verdict_buy") is True or verdict_type in {"BUY", "EARLY_BUY"}:
+        return "BUY"
+    if "TIMEOUT" in verdict_type or row.get("decision_verdict_buy") is None:
+        return "TIMEOUT"
+    if row.get("decision_verdict_buy") is False or verdict_type.startswith("REJECT"):
+        return "REJECT"
+    return None
+
+
+def canonical_breakdown_key(row: dict[str, Any]) -> str:
+    identifier = row_id(row)
+    if identifier != "<unknown>":
+        return identifier
+    return json.dumps(row, sort_keys=True, default=str)
+
+
+def build_canonical_breakdown_rows(
+    decision_rows: list[dict[str, Any]],
+    buy_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    canonical: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in decision_rows:
+        key = canonical_breakdown_key(row)
+        if key in seen:
+            continue
+        seen.add(key)
+        canonical.append(row)
+    for row in buy_rows:
+        key = canonical_breakdown_key(row)
+        if key in seen:
+            continue
+        seen.add(key)
+        canonical.append(row)
+    return canonical
+
+
+def build_decision_breakdowns(rows: list[dict[str, Any]]) -> dict[str, dict[str, dict[str, int]]]:
+    dimensions = {
+        "by_decision_plane": "decision_plane",
+        "by_aps_regime": "aps_regime",
+        "by_observation_stage": "observation_stage",
+    }
+    breakdowns: dict[str, dict[str, dict[str, int]]] = {
+        name: {} for name in dimensions
+    }
+    for row in rows:
+        bucket = decision_bucket(row)
+        if bucket is None:
+            continue
+        for output_name, field_name in dimensions.items():
+            raw_key = row.get(field_name)
+            key = str(raw_key) if isinstance(raw_key, str) and raw_key else "<missing>"
+            field_counts = breakdowns[output_name].setdefault(
+                key,
+                {"BUY": 0, "REJECT": 0, "TIMEOUT": 0},
+            )
+            field_counts[bucket] += 1
+    return breakdowns
+
+
 def build_report(inputs: Inputs) -> dict[str, Any]:
     shadow_report, shadow_report_err = run_shadow_report(inputs.config_path)
     buy_rows = filter_rows_for_session(list(iter_json_objects(inputs.buys_log)), inputs.session_start_ms)
@@ -536,10 +683,12 @@ def build_report(inputs: Inputs) -> dict[str, Any]:
         list(iter_json_objects(inputs.coverage_audit_log)), inputs.session_start_ms
     )
     combined_rows = decision_rows + buy_rows
+    canonical_breakdown_rows = build_canonical_breakdown_rows(decision_rows, buy_rows)
 
     gates = {
         "artifacts_present": asdict(gate_artifacts_present(inputs, combined_rows)),
         "runtime_reconciliation": asdict(gate_runtime_report(shadow_report, shadow_report_err)),
+        "rollout_scope_contract": asdict(gate_rollout_scope_contract(inputs)),
         "plane_contract": asdict(
             gate_plane_contract(
                 combined_rows,
@@ -569,7 +718,14 @@ def build_report(inputs: Inputs) -> dict[str, Any]:
             "buys_log": str(inputs.buys_log),
             "decisions_log": str(inputs.decisions_log),
             "coverage_audit_log": str(inputs.coverage_audit_log),
+            "shadow_log": str(inputs.shadow_log),
+            "shadow_entry_log": str(inputs.shadow_entry_log),
+            "shadow_lifecycle_log": str(inputs.shadow_lifecycle_log),
             "events_dir": str(inputs.events_dir),
+            "wal_dir": str(inputs.wal_dir),
+            "snapshot_dir": str(inputs.snapshot_dir),
+            "system_log_path": str(inputs.system_log_path),
+            "oracle_log_path": str(inputs.oracle_log_path),
             "session_start_ms": inputs.session_start_ms,
             "expected_rollout_profile": inputs.expected_rollout_profile,
             "expected_plane": inputs.expected_plane,
@@ -578,6 +734,7 @@ def build_report(inputs: Inputs) -> dict[str, Any]:
             "buy_rows": len(buy_rows),
             "decision_rows": len(decision_rows),
             "coverage_rows": len(coverage_rows),
+            "decision_breakdowns": build_decision_breakdowns(canonical_breakdown_rows),
         },
         "shadow_run_report_error": shadow_report_err,
         "shadow_run_report_verdict": None if shadow_report is None else shadow_report.get("verdict"),
@@ -604,12 +761,12 @@ def format_text_report(report: dict[str, Any]) -> str:
 
 def main() -> int:
     args = parse_args()
-    report = build_report(resolve_inputs(args.config))
+    report = build_report(resolve_inputs(args.config, args.expected_rollout_profile))
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:
         print(format_text_report(report))
-    return 0 if report["verdict"] == "GO" else 1
+    return 0 if report["verdict"] == "GO" else 2
 
 
 if __name__ == "__main__":

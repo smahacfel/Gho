@@ -23,22 +23,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tracing::warn;
 
-/// P5: Shadow payer strategy for shadow_only mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ShadowPayerStrategy {
-    /// Use the configured payer (requires GHOST_TRIGGER_KEYPAIR_PATH).
-    Configured,
-    /// Generate a local ephemeral keypair — no shared payer loader.
-    /// Enables shadow_only to run without live payer configuration (B6).
-    Ephemeral,
-}
-
-impl Default for ShadowPayerStrategy {
-    fn default() -> Self {
-        Self::Configured
-    }
-}
+/// Compatibility alias: config owns the payer-strategy contract.
+pub use crate::config::TriggerShadowPayerStrategy as ShadowPayerStrategy;
 
 /// Generate an idempotency key for a shadow dispatch.
 /// Uses blake3(pool_id || join_key || rollout_profile) for dedup.
@@ -87,16 +73,6 @@ impl ShadowDispatchStatus {
         }
     }
 
-    fn default_classification(self, record: &ShadowBuySimulationRecord) -> String {
-        match self {
-            ShadowDispatchStatus::Submitted => "dispatch_submitted".to_string(),
-            ShadowDispatchStatus::Closed => "simulation_completed".to_string(),
-            ShadowDispatchStatus::Failed | ShadowDispatchStatus::Abandoned => record
-                .error_class
-                .clone()
-                .unwrap_or_else(|| "unclassified".to_string()),
-        }
-    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -126,7 +102,22 @@ pub struct ShadowDispatchLifecycleRecord {
 }
 
 impl ShadowDispatchLifecycleRecord {
-    pub fn from_shadow_buy_record(
+    fn failure_classification(record: &ShadowBuySimulationRecord) -> String {
+        record
+            .error_detail_class
+            .clone()
+            .or_else(|| record.error_class.clone())
+            .or_else(|| {
+                record
+                    .err
+                    .as_deref()
+                    .map(classify_shadow_error)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "unclassified".to_string())
+    }
+
+    fn from_shadow_buy_record_with_status(
         record: &ShadowBuySimulationRecord,
         join_key: impl Into<String>,
         rollout_profile: impl Into<String>,
@@ -142,7 +133,13 @@ impl ShadowDispatchLifecycleRecord {
             dispatch_id: format!("shadow-dispatch:{idempotency_key}"),
             idempotency_key,
             dispatch_status: status,
-            classification: status.default_classification(record),
+            classification: match status {
+                ShadowDispatchStatus::Submitted => "dispatch_submitted".to_string(),
+                ShadowDispatchStatus::Closed => "simulation_completed".to_string(),
+                ShadowDispatchStatus::Failed | ShadowDispatchStatus::Abandoned => {
+                    Self::failure_classification(record)
+                }
+            },
             simulation_outcome: status.as_str().to_string(),
             candidate_id: record.candidate_id.clone(),
             pool_id: record.pool_amm_id.clone(),
@@ -157,6 +154,83 @@ impl ShadowDispatchLifecycleRecord {
             error_detail_class: record.error_detail_class.clone(),
             err: record.err.clone(),
         }
+    }
+
+    pub fn submitted_from_request(
+        entry_mode: TriggerEntryMode,
+        pool_amm_id: &str,
+        base_mint: &str,
+        request: &PreparedBuyRequest,
+        join_key: impl Into<String>,
+        rollout_profile: impl Into<String>,
+    ) -> ShadowDispatchLifecycleRecord {
+        let join_key = join_key.into();
+        let rollout_profile = rollout_profile.into();
+        let idempotency_key =
+            make_shadow_idempotency_key(pool_amm_id, &join_key, &rollout_profile);
+        ShadowDispatchLifecycleRecord {
+            record_type: "shadow_dispatch".to_string(),
+            dispatch_id: format!("shadow-dispatch:{idempotency_key}"),
+            idempotency_key,
+            dispatch_status: ShadowDispatchStatus::Submitted,
+            classification: "dispatch_submitted".to_string(),
+            simulation_outcome: ShadowDispatchStatus::Submitted.as_str().to_string(),
+            candidate_id: build_execution_candidate_id(
+                base_mint,
+                pool_amm_id,
+                request.decision_ts_ms.to_string(),
+            ),
+            pool_id: pool_amm_id.to_string(),
+            mint_id: base_mint.to_string(),
+            join_key,
+            rollout_profile,
+            entry_mode: entry_mode.as_str().to_string(),
+            decision_ts_ms: request.decision_ts_ms,
+            timestamp_ms: current_time_ms().max(request.decision_ts_ms),
+            error_class: None,
+            error_code: None,
+            error_detail_class: None,
+            err: None,
+        }
+    }
+
+    pub fn terminal_from_shadow_buy_record(
+        record: &ShadowBuySimulationRecord,
+        join_key: impl Into<String>,
+        rollout_profile: impl Into<String>,
+    ) -> ShadowDispatchLifecycleRecord {
+        let status = if record.err.is_some() {
+            ShadowDispatchStatus::Failed
+        } else {
+            ShadowDispatchStatus::Closed
+        };
+        Self::from_shadow_buy_record_with_status(record, join_key, rollout_profile, status)
+    }
+
+    pub fn failed_from_shadow_buy_record(
+        record: &ShadowBuySimulationRecord,
+        join_key: impl Into<String>,
+        rollout_profile: impl Into<String>,
+    ) -> ShadowDispatchLifecycleRecord {
+        Self::from_shadow_buy_record_with_status(
+            record,
+            join_key,
+            rollout_profile,
+            ShadowDispatchStatus::Failed,
+        )
+    }
+
+    pub fn abandoned_from_shadow_buy_record(
+        record: &ShadowBuySimulationRecord,
+        join_key: impl Into<String>,
+        rollout_profile: impl Into<String>,
+    ) -> ShadowDispatchLifecycleRecord {
+        Self::from_shadow_buy_record_with_status(
+            record,
+            join_key,
+            rollout_profile,
+            ShadowDispatchStatus::Abandoned,
+        )
     }
 }
 
@@ -1281,11 +1355,10 @@ mod tests {
             &sample_event(None, Some("custom program error: 0x1")),
         )
         .with_lifecycle_identity(join_key.clone(), "shadow-burnin");
-        let lifecycle_record = ShadowDispatchLifecycleRecord::from_shadow_buy_record(
+        let lifecycle_record = ShadowDispatchLifecycleRecord::failed_from_shadow_buy_record(
             &record,
             join_key,
             "shadow-burnin",
-            ShadowDispatchStatus::Failed,
         );
 
         append_shadow_dispatch_lifecycle_record(&lifecycle_path, &lifecycle_record)
@@ -1303,6 +1376,47 @@ mod tests {
         assert_eq!(row["join_key"], "pool:mint:1000");
         assert_eq!(row["rollout_profile"], "shadow-burnin");
         assert_eq!(row["classification"], "simulation_mismatch");
+    }
+
+    #[test]
+    fn p5_terminal_lifecycle_marks_report_errors_as_failed() {
+        let join_key = make_shadow_join_key("pool", "mint", 1000);
+        let record = ShadowBuySimulationRecord::from_event(
+            TriggerEntryMode::ShadowOnly,
+            &sample_event(None, Some("ConstraintSeeds: InstructionError(3, Custom(2006))")),
+        )
+        .with_lifecycle_identity(join_key.clone(), "shadow-burnin");
+
+        let lifecycle_record = ShadowDispatchLifecycleRecord::terminal_from_shadow_buy_record(
+            &record,
+            join_key,
+            "shadow-burnin",
+        );
+
+        assert_eq!(lifecycle_record.dispatch_status, ShadowDispatchStatus::Failed);
+        assert_eq!(
+            lifecycle_record.classification,
+            "seed_mismatch_constraint_seeds"
+        );
+    }
+
+    #[test]
+    fn p5_terminal_lifecycle_marks_success_reports_as_closed() {
+        let join_key = make_shadow_join_key("pool", "mint", 1000);
+        let record = ShadowBuySimulationRecord::from_event(
+            TriggerEntryMode::ShadowOnly,
+            &sample_event(None, None),
+        )
+        .with_lifecycle_identity(join_key.clone(), "shadow-burnin");
+
+        let lifecycle_record = ShadowDispatchLifecycleRecord::terminal_from_shadow_buy_record(
+            &record,
+            join_key,
+            "shadow-burnin",
+        );
+
+        assert_eq!(lifecycle_record.dispatch_status, ShadowDispatchStatus::Closed);
+        assert_eq!(lifecycle_record.classification, "simulation_completed");
     }
 
     #[test]

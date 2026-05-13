@@ -6327,7 +6327,7 @@ async fn execute_gatekeeper_buy_via_trigger_with_fsc_gate(
     }
 }
 
-fn spawn_shadow_buy_observer(
+async fn spawn_shadow_buy_observer(
     event_tx: crate::events::EventBusSender,
     pool_amm_id: Pubkey,
     base_mint: String,
@@ -6336,13 +6336,40 @@ fn spawn_shadow_buy_observer(
     shadow_lifecycle_log_path: Option<std::path::PathBuf>,
     join_key: String,
     rollout_profile: String,
+    entry_mode: crate::config::TriggerEntryMode,
+    shadow_timeout_ms: u64,
     live_signature: Option<String>,
     shadow_task: crate::components::trigger::PendingShadowSimulation,
 ) {
+    let crate::components::trigger::PendingShadowSimulation { request, handle } = shadow_task;
+    if let Some(lifecycle_log_path) = shadow_lifecycle_log_path.as_deref() {
+        // Only async companion shadow dispatches have a distinct submitted phase.
+        // Inline shadow_only execution resolves directly to a terminal report row.
+        let submitted_record = crate::components::trigger::shadow_run::ShadowDispatchLifecycleRecord::submitted_from_request(
+            entry_mode,
+            &pool_amm_id.to_string(),
+            &base_mint,
+            &request,
+            &join_key,
+            &rollout_profile,
+        );
+        if let Err(err) = crate::components::trigger::shadow_run::append_shadow_dispatch_lifecycle_record(
+            lifecycle_log_path,
+            &submitted_record,
+        )
+        .await
+        {
+            error!(
+                pool = %pool_amm_id,
+                "Failed to append submitted shadow lifecycle record: {}",
+                err
+            );
+        }
+    }
     tokio::spawn(async move {
-        let crate::components::trigger::PendingShadowSimulation { request, handle } = shadow_task;
-        match handle.await {
-            Ok(Ok(mut report)) => {
+        let mut handle = handle;
+        match tokio::time::timeout(Duration::from_millis(shadow_timeout_ms), &mut handle).await {
+            Ok(Ok(Ok(mut report))) => {
                 report.live_signature = live_signature;
                 let shadow_event =
                     crate::components::trigger::shadow_run::shadow_buy_event_from_report(
@@ -6364,7 +6391,7 @@ fn spawn_shadow_buy_observer(
                 if let Err(e) = append_shadow_buy_report_record(
                     &shadow_log_path,
                     shadow_lifecycle_log_path.as_deref(),
-                    crate::config::TriggerEntryMode::LiveAndShadow,
+                    entry_mode,
                     &shadow_event,
                     &join_key,
                     &rollout_profile,
@@ -6379,7 +6406,7 @@ fn spawn_shadow_buy_observer(
                     );
                 }
             }
-            Ok(Err(e)) => {
+            Ok(Ok(Err(e))) => {
                 let shadow_event =
                     crate::components::trigger::shadow_run::shadow_failure_event_from_request(
                         &pool_amm_id.to_string(),
@@ -6402,7 +6429,7 @@ fn spawn_shadow_buy_observer(
                 if let Err(write_err) = append_shadow_buy_report_record(
                     &shadow_log_path,
                     shadow_lifecycle_log_path.as_deref(),
-                    crate::config::TriggerEntryMode::LiveAndShadow,
+                    entry_mode,
                     &shadow_event,
                     &join_key,
                     &rollout_profile,
@@ -6422,8 +6449,8 @@ fn spawn_shadow_buy_observer(
                     e
                 );
             }
-            Err(e) => {
-                let join_error = anyhow::Error::new(e);
+            Ok(Err(e)) => {
+                let join_error = anyhow::anyhow!("shadow observer join error: {}", e);
                 let shadow_event =
                     crate::components::trigger::shadow_run::shadow_failure_event_from_request(
                         &pool_amm_id.to_string(),
@@ -6446,7 +6473,7 @@ fn spawn_shadow_buy_observer(
                 if let Err(write_err) = append_shadow_buy_report_record(
                     &shadow_log_path,
                     shadow_lifecycle_log_path.as_deref(),
-                    crate::config::TriggerEntryMode::LiveAndShadow,
+                    entry_mode,
                     &shadow_event,
                     &join_key,
                     &rollout_profile,
@@ -6464,6 +6491,54 @@ fn spawn_shadow_buy_observer(
                     pool = %pool_amm_id,
                     "Background live_and_shadow task join failed: {}",
                     join_error
+                );
+            }
+            Err(_) => {
+                handle.abort();
+                let timeout_error = anyhow::anyhow!(
+                    "shadow observer expired after {}ms without terminal report",
+                    shadow_timeout_ms
+                );
+                let shadow_event =
+                    crate::components::trigger::shadow_run::shadow_failure_event_from_request(
+                        &pool_amm_id.to_string(),
+                        &base_mint,
+                        &request,
+                        live_signature,
+                        &timeout_error,
+                    );
+                if emit_event_bus {
+                    if let Err(send_err) =
+                        event_tx.send(GhostEvent::shadow_buy_simulated(shadow_event.clone()))
+                    {
+                        warn!(
+                            pool = %pool_amm_id,
+                            "Failed to emit timeout ShadowBuySimulated event from observer: {}",
+                            send_err
+                        );
+                    }
+                }
+                if let Err(write_err) = append_shadow_buy_report_record(
+                    &shadow_log_path,
+                    shadow_lifecycle_log_path.as_deref(),
+                    entry_mode,
+                    &shadow_event,
+                    &join_key,
+                    &rollout_profile,
+                    crate::components::trigger::shadow_run::ShadowDispatchStatus::Abandoned,
+                )
+                .await
+                {
+                    error!(
+                        pool = %pool_amm_id,
+                        "Failed to append timed-out shadow lifecycle record: {}",
+                        write_err
+                    );
+                }
+                warn!(
+                    pool = %pool_amm_id,
+                    timeout_ms = shadow_timeout_ms,
+                    "Background shadow observer timed out before terminal report"
                 );
             }
         }
@@ -6602,13 +6677,32 @@ async fn append_shadow_buy_report_record(
     crate::components::trigger::shadow_run::append_shadow_buy_record(log_path, &jsonl_record)
         .await?;
     if let Some(lifecycle_log_path) = lifecycle_log_path {
-        let lifecycle_record =
-            crate::components::trigger::shadow_run::ShadowDispatchLifecycleRecord::from_shadow_buy_record(
-                &jsonl_record,
-                join_key.to_string(),
-                rollout_profile.to_string(),
-                dispatch_status,
-            );
+        let lifecycle_record = match dispatch_status {
+            crate::components::trigger::shadow_run::ShadowDispatchStatus::Submitted => {
+                anyhow::bail!("submitted lifecycle rows require request identity, not a report row")
+            }
+            crate::components::trigger::shadow_run::ShadowDispatchStatus::Closed => {
+                crate::components::trigger::shadow_run::ShadowDispatchLifecycleRecord::terminal_from_shadow_buy_record(
+                    &jsonl_record,
+                    join_key.to_string(),
+                    rollout_profile.to_string(),
+                )
+            }
+            crate::components::trigger::shadow_run::ShadowDispatchStatus::Failed => {
+                crate::components::trigger::shadow_run::ShadowDispatchLifecycleRecord::failed_from_shadow_buy_record(
+                    &jsonl_record,
+                    join_key.to_string(),
+                    rollout_profile.to_string(),
+                )
+            }
+            crate::components::trigger::shadow_run::ShadowDispatchStatus::Abandoned => {
+                crate::components::trigger::shadow_run::ShadowDispatchLifecycleRecord::abandoned_from_shadow_buy_record(
+                    &jsonl_record,
+                    join_key.to_string(),
+                    rollout_profile.to_string(),
+                )
+            }
+        };
         crate::components::trigger::shadow_run::append_shadow_dispatch_lifecycle_record(
             lifecycle_log_path,
             &lifecycle_record,
@@ -7405,9 +7499,12 @@ async fn apply_trigger_dispatch_receipt(
                     shadow_lifecycle_log_path.map(std::path::Path::to_path_buf),
                     shadow_join_key.clone(),
                     rollout_profile.to_string(),
+                    trigger_component.entry_mode(),
+                    trigger_component.shadow_run_timeout_ms(),
                     live_signature,
                     shadow_task,
-                );
+                )
+                .await;
             }
             applied
         }
@@ -7435,9 +7532,12 @@ async fn apply_trigger_dispatch_receipt(
                     shadow_lifecycle_log_path.map(std::path::Path::to_path_buf),
                     shadow_join_key.clone(),
                     rollout_profile.to_string(),
+                    trigger_component.entry_mode(),
+                    trigger_component.shadow_run_timeout_ms(),
                     None,
                     shadow_task,
-                );
+                )
+                .await;
             } else if let Some(request) = failed_request {
                 if trigger_component.supports_shadow_run() {
                     let shadow_log_path =
@@ -10336,6 +10436,7 @@ mod tests {
             eval_count: 0,
             buy_count: 0,
             decision: None,
+            terminal_reason_code: None,
             early_fingerprint: None,
             curve_t0_event_ts_ms: None,
             curve_t0_clock_source: None,
@@ -16752,6 +16853,384 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn p5_pending_shadow_dispatch_writes_submitted_then_failed_for_report_error() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let lifecycle_path = temp.path().join("shadow_lifecycle.jsonl");
+        let mut trigger_config = crate::config::TriggerComponentConfig {
+            enabled: true,
+            entry_mode: crate::config::TriggerEntryMode::LiveAndShadow,
+            rpc_url: "https://api.devnet.solana.com".to_string(),
+            keypair_path: None,
+            tip_guard: crate::config::TriggerTipGuardConfig::default(),
+            metrics_port: 9091,
+            max_concurrent_positions: 3,
+            max_position_size_sol: 0.1,
+            emergency_floor_sol: 0.05,
+            position_size_buffer_sol: 0.02,
+            slippage_tolerance: 0.20,
+            live_preflight_max_state_age_slots: 10,
+            live_exit_take_profit_pct: 0.02,
+            live_exit_stop_loss_pct: 0.02,
+            shadow_run: crate::config::TriggerShadowRunConfig::default(),
+        };
+        trigger_config.shadow_run.enabled = true;
+        trigger_config.shadow_run.output_path = temp
+            .path()
+            .join("shadow-report-error.jsonl")
+            .to_string_lossy()
+            .into_owned();
+        let trigger = Arc::new(
+            crate::components::trigger::TriggerComponent::new_with_shadow_simulator(
+                trigger_config,
+                Arc::new(MockShadowSimulator),
+            ),
+        );
+        let (event_tx, _event_rx) = crate::events::create_event_bus();
+        let pool_id = Pubkey::new_unique();
+        let pool = crate::events::DetectedPool {
+            semantic: Default::default(),
+            pool_amm_id: pool_id.to_string(),
+            base_mint: Pubkey::new_unique().to_string(),
+            quote_mint: "SOL".to_string(),
+            amm_program: "pumpfun".to_string(),
+            bonding_curve: "curve".to_string(),
+            creator: "creator".to_string(),
+            slot: Some(1),
+            timestamp_ms: 1_000,
+            event_time: ghost_core::EventTimeMetadata::default(),
+            detected_wall_ts_ms: Some(1_001),
+            initial_liquidity_sol: Some(1.0),
+            signature: "sig".to_string(),
+        };
+        let receipt = crate::components::trigger::TriggerDispatchReceipt {
+            primary_outcome: Err(anyhow::anyhow!("live submit failed")),
+            shadow_task: Some(test_pending_shadow_simulation(tokio::spawn({
+                let base_mint = pool.base_mint.clone();
+                async move {
+                    Ok(crate::components::trigger::ShadowBuySimulationReport {
+                        mint: base_mint,
+                        live_signature: None,
+                        payer_pubkey: Pubkey::new_unique().to_string(),
+                        payer_provenance: "configured".to_string(),
+                        amount_lamports: 100,
+                        entry_token_amount_raw: Some(250_000),
+                        tip_lamports: 10,
+                        decision_ts_ms: 10,
+                        simulation_started_ts_ms: 11,
+                        simulation_finished_ts_ms: 16,
+                        latency_ms: 5,
+                        shadow_duration_ms: 5,
+                        rpc_slot: 777,
+                        retry_count: 0,
+                        used_sig_verify: false,
+                        used_replace_recent_blockhash: true,
+                        units_consumed: Some(42_000),
+                        logs: vec!["ConstraintSeeds".to_string()],
+                        return_data: None,
+                        err: Some("InstructionError(3, Custom(2006))".to_string()),
+                    })
+                }
+            }))),
+            active_position_lease: None,
+            retain_position_slot_on_error: false,
+            failed_request: None,
+            failed_context: None,
+        };
+
+        let err = apply_trigger_dispatch_receipt(
+            &event_tx,
+            None,
+            &trigger,
+            &std::sync::atomic::AtomicU64::new(1),
+            ExecutionMode::Paper,
+            std::path::Path::new("/tmp/ghost-shadow-entry-test.jsonl"),
+            Some(&lifecycle_path),
+            "test-rollout",
+            pool_id,
+            &pool,
+            0.1,
+            10,
+            "paper",
+            receipt,
+        )
+        .await
+        .expect_err("live failure should still surface");
+        assert!(err.to_string().contains("live submit failed"));
+
+        let lifecycle_written = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(contents) = tokio::fs::read_to_string(&lifecycle_path).await {
+                    if contents.lines().count() >= 2 {
+                        break contents;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("lifecycle rows should be written");
+        let lifecycle_rows: Vec<serde_json::Value> = lifecycle_written
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("deserialize lifecycle row"))
+            .collect();
+        assert_eq!(lifecycle_rows.len(), 2);
+        assert_eq!(lifecycle_rows[0]["dispatch_status"], "submitted");
+        assert_eq!(lifecycle_rows[1]["dispatch_status"], "failed");
+        assert_eq!(
+            lifecycle_rows[1]["classification"],
+            "seed_mismatch_constraint_seeds"
+        );
+    }
+
+    #[tokio::test]
+    async fn p5_pending_shadow_dispatch_timeout_writes_abandoned_terminal_record() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let lifecycle_path = temp.path().join("shadow_lifecycle.jsonl");
+        let mut trigger_config = crate::config::TriggerComponentConfig {
+            enabled: true,
+            entry_mode: crate::config::TriggerEntryMode::LiveAndShadow,
+            rpc_url: "https://api.devnet.solana.com".to_string(),
+            keypair_path: None,
+            tip_guard: crate::config::TriggerTipGuardConfig::default(),
+            metrics_port: 9091,
+            max_concurrent_positions: 3,
+            max_position_size_sol: 0.1,
+            emergency_floor_sol: 0.05,
+            position_size_buffer_sol: 0.02,
+            slippage_tolerance: 0.20,
+            live_preflight_max_state_age_slots: 10,
+            live_exit_take_profit_pct: 0.02,
+            live_exit_stop_loss_pct: 0.02,
+            shadow_run: crate::config::TriggerShadowRunConfig::default(),
+        };
+        trigger_config.shadow_run.enabled = true;
+        trigger_config.shadow_run.timeout_ms = 5;
+        trigger_config.shadow_run.output_path = temp
+            .path()
+            .join("shadow-timeout-report.jsonl")
+            .to_string_lossy()
+            .into_owned();
+        let trigger = Arc::new(
+            crate::components::trigger::TriggerComponent::new_with_shadow_simulator(
+                trigger_config,
+                Arc::new(MockShadowSimulator),
+            ),
+        );
+        let (event_tx, _event_rx) = crate::events::create_event_bus();
+        let pool_id = Pubkey::new_unique();
+        let pool = crate::events::DetectedPool {
+            semantic: Default::default(),
+            pool_amm_id: pool_id.to_string(),
+            base_mint: Pubkey::new_unique().to_string(),
+            quote_mint: "SOL".to_string(),
+            amm_program: "pumpfun".to_string(),
+            bonding_curve: "curve".to_string(),
+            creator: "creator".to_string(),
+            slot: Some(1),
+            timestamp_ms: 1_000,
+            event_time: ghost_core::EventTimeMetadata::default(),
+            detected_wall_ts_ms: Some(1_001),
+            initial_liquidity_sol: Some(1.0),
+            signature: "sig".to_string(),
+        };
+        let receipt = crate::components::trigger::TriggerDispatchReceipt {
+            primary_outcome: Err(anyhow::anyhow!("live submit failed")),
+            shadow_task: Some(test_pending_shadow_simulation(tokio::spawn(async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Ok(crate::components::trigger::ShadowBuySimulationReport {
+                    mint: Pubkey::new_unique().to_string(),
+                    live_signature: None,
+                    payer_pubkey: Pubkey::new_unique().to_string(),
+                    payer_provenance: "configured".to_string(),
+                    amount_lamports: 100,
+                    entry_token_amount_raw: Some(250_000),
+                    tip_lamports: 10,
+                    decision_ts_ms: 10,
+                    simulation_started_ts_ms: 11,
+                    simulation_finished_ts_ms: 16,
+                    latency_ms: 5,
+                    shadow_duration_ms: 5,
+                    rpc_slot: 777,
+                    retry_count: 0,
+                    used_sig_verify: false,
+                    used_replace_recent_blockhash: true,
+                    units_consumed: Some(42_000),
+                    logs: vec!["shadow".to_string()],
+                    return_data: None,
+                    err: None,
+                })
+            }))),
+            active_position_lease: None,
+            retain_position_slot_on_error: false,
+            failed_request: None,
+            failed_context: None,
+        };
+
+        let _ = apply_trigger_dispatch_receipt(
+            &event_tx,
+            None,
+            &trigger,
+            &std::sync::atomic::AtomicU64::new(1),
+            ExecutionMode::Paper,
+            std::path::Path::new("/tmp/ghost-shadow-entry-test.jsonl"),
+            Some(&lifecycle_path),
+            "test-rollout",
+            pool_id,
+            &pool,
+            0.1,
+            10,
+            "paper",
+            receipt,
+        )
+        .await
+        .expect_err("live failure should still surface");
+
+        let lifecycle_written = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(contents) = tokio::fs::read_to_string(&lifecycle_path).await {
+                    if contents.lines().count() >= 2 {
+                        break contents;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("timeout lifecycle rows should be written");
+        let lifecycle_rows: Vec<serde_json::Value> = lifecycle_written
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("deserialize lifecycle row"))
+            .collect();
+        assert_eq!(lifecycle_rows[0]["dispatch_status"], "submitted");
+        assert_eq!(lifecycle_rows[1]["dispatch_status"], "abandoned");
+        assert_eq!(lifecycle_rows[1]["classification"], "timing_blockhash_problem");
+    }
+
+    #[tokio::test]
+    async fn p5_pending_shadow_dispatch_join_failure_writes_abandoned_terminal_record() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let lifecycle_path = temp.path().join("shadow_lifecycle.jsonl");
+        let mut trigger_config = crate::config::TriggerComponentConfig {
+            enabled: true,
+            entry_mode: crate::config::TriggerEntryMode::LiveAndShadow,
+            rpc_url: "https://api.devnet.solana.com".to_string(),
+            keypair_path: None,
+            tip_guard: crate::config::TriggerTipGuardConfig::default(),
+            metrics_port: 9091,
+            max_concurrent_positions: 3,
+            max_position_size_sol: 0.1,
+            emergency_floor_sol: 0.05,
+            position_size_buffer_sol: 0.02,
+            slippage_tolerance: 0.20,
+            live_preflight_max_state_age_slots: 10,
+            live_exit_take_profit_pct: 0.02,
+            live_exit_stop_loss_pct: 0.02,
+            shadow_run: crate::config::TriggerShadowRunConfig::default(),
+        };
+        trigger_config.shadow_run.enabled = true;
+        trigger_config.shadow_run.output_path = temp
+            .path()
+            .join("shadow-join-report.jsonl")
+            .to_string_lossy()
+            .into_owned();
+        let trigger = Arc::new(
+            crate::components::trigger::TriggerComponent::new_with_shadow_simulator(
+                trigger_config,
+                Arc::new(MockShadowSimulator),
+            ),
+        );
+        let (event_tx, _event_rx) = crate::events::create_event_bus();
+        let pool_id = Pubkey::new_unique();
+        let pool = crate::events::DetectedPool {
+            semantic: Default::default(),
+            pool_amm_id: pool_id.to_string(),
+            base_mint: Pubkey::new_unique().to_string(),
+            quote_mint: "SOL".to_string(),
+            amm_program: "pumpfun".to_string(),
+            bonding_curve: "curve".to_string(),
+            creator: "creator".to_string(),
+            slot: Some(1),
+            timestamp_ms: 1_000,
+            event_time: ghost_core::EventTimeMetadata::default(),
+            detected_wall_ts_ms: Some(1_001),
+            initial_liquidity_sol: Some(1.0),
+            signature: "sig".to_string(),
+        };
+        let receipt = crate::components::trigger::TriggerDispatchReceipt {
+            primary_outcome: Err(anyhow::anyhow!("live submit failed")),
+            shadow_task: Some(test_pending_shadow_simulation(tokio::spawn(async {
+                panic!("boom");
+                #[allow(unreachable_code)]
+                Ok(crate::components::trigger::ShadowBuySimulationReport {
+                    mint: Pubkey::new_unique().to_string(),
+                    live_signature: None,
+                    payer_pubkey: Pubkey::new_unique().to_string(),
+                    payer_provenance: "configured".to_string(),
+                    amount_lamports: 100,
+                    entry_token_amount_raw: Some(250_000),
+                    tip_lamports: 10,
+                    decision_ts_ms: 10,
+                    simulation_started_ts_ms: 11,
+                    simulation_finished_ts_ms: 16,
+                    latency_ms: 5,
+                    shadow_duration_ms: 5,
+                    rpc_slot: 777,
+                    retry_count: 0,
+                    used_sig_verify: false,
+                    used_replace_recent_blockhash: true,
+                    units_consumed: Some(42_000),
+                    logs: vec!["shadow".to_string()],
+                    return_data: None,
+                    err: None,
+                })
+            }))),
+            active_position_lease: None,
+            retain_position_slot_on_error: false,
+            failed_request: None,
+            failed_context: None,
+        };
+
+        let _ = apply_trigger_dispatch_receipt(
+            &event_tx,
+            None,
+            &trigger,
+            &std::sync::atomic::AtomicU64::new(1),
+            ExecutionMode::Paper,
+            std::path::Path::new("/tmp/ghost-shadow-entry-test.jsonl"),
+            Some(&lifecycle_path),
+            "test-rollout",
+            pool_id,
+            &pool,
+            0.1,
+            10,
+            "paper",
+            receipt,
+        )
+        .await
+        .expect_err("live failure should still surface");
+
+        let lifecycle_written = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(contents) = tokio::fs::read_to_string(&lifecycle_path).await {
+                    if contents.lines().count() >= 2 {
+                        break contents;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("join-failure lifecycle rows should be written");
+        let lifecycle_rows: Vec<serde_json::Value> = lifecycle_written
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("deserialize lifecycle row"))
+            .collect();
+        assert_eq!(lifecycle_rows[0]["dispatch_status"], "submitted");
+        assert_eq!(lifecycle_rows[1]["dispatch_status"], "abandoned");
+        assert_eq!(lifecycle_rows[1]["classification"], "logic_invariant_problem");
+    }
+
+    #[tokio::test]
     async fn shadow_mode_marks_canonical_entry_record_when_direct_handoff_is_rejected() {
         let temp = tempfile::tempdir().unwrap();
         let output_path = temp.path().join("shadow-canonical-entry-rejected.jsonl");
@@ -19527,6 +20006,7 @@ mod tests {
             eval_count: 0,
             buy_count: 0,
             decision: None,
+            terminal_reason_code: None,
             early_fingerprint: None,
             curve_t0_event_ts_ms: None,
             curve_t0_clock_source: None,

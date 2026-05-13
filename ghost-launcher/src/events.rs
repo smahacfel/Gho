@@ -34,7 +34,10 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::components::trigger::safety::PositionSlotId;
 use tokio::sync::broadcast;
@@ -858,13 +861,54 @@ pub fn record_event_bus_receivers(sender: &EventBusSender) {
 /// P5: Eventbus backpressure with per-consumer alert threshold.
 /// When skipped exceeds the threshold, emit a warning for on-call visibility.
 const EVENTBUS_DROP_WARN_THRESHOLD: u64 = 100;
+const EVENTBUS_DROP_WARN_WINDOW: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Default)]
+struct EventBusLagWindowState {
+    events: VecDeque<(Instant, u64)>,
+    total_skipped: u64,
+    threshold_exceeded: bool,
+}
+
+fn event_bus_lag_windows() -> &'static Mutex<HashMap<String, EventBusLagWindowState>> {
+    static WINDOWS: OnceLock<Mutex<HashMap<String, EventBusLagWindowState>>> = OnceLock::new();
+    WINDOWS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn update_event_bus_lag_window(consumer: &str, skipped: u64, now: Instant) -> Option<u64> {
+    let mut windows = event_bus_lag_windows()
+        .lock()
+        .expect("event bus lag window mutex poisoned");
+    let state = windows.entry(consumer.to_string()).or_default();
+
+    while let Some((ts, skipped_count)) = state.events.front().copied() {
+        if now.duration_since(ts) > EVENTBUS_DROP_WARN_WINDOW {
+            state.events.pop_front();
+            state.total_skipped = state.total_skipped.saturating_sub(skipped_count);
+        } else {
+            break;
+        }
+    }
+
+    if skipped > 0 {
+        state.events.push_back((now, skipped));
+        state.total_skipped = state.total_skipped.saturating_add(skipped);
+    }
+
+    let threshold_exceeded = state.total_skipped > EVENTBUS_DROP_WARN_THRESHOLD;
+    let should_warn = threshold_exceeded && !state.threshold_exceeded;
+    state.threshold_exceeded = threshold_exceeded;
+
+    should_warn.then_some(state.total_skipped)
+}
 
 pub fn record_event_bus_lag(consumer: &str, skipped: u64) {
     crate::oracle_metrics::record_eventbus_lag(consumer, skipped);
-    if skipped > EVENTBUS_DROP_WARN_THRESHOLD {
+    if let Some(window_skipped) = update_event_bus_lag_window(consumer, skipped, Instant::now()) {
         tracing::warn!(
             consumer = consumer,
             skipped = skipped,
+            skipped_last_60s = window_skipped,
             "eventbus_lag_threshold_exceeded"
         );
     }
@@ -1333,6 +1377,28 @@ mod tests {
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("signature"));
         assert!(json.contains("pnl_sol"));
+    }
+
+    #[test]
+    fn test_event_bus_lag_uses_rolling_60s_window() {
+        let base = Instant::now();
+        assert_eq!(update_event_bus_lag_window("oracle", 60, base), None);
+        assert_eq!(
+            update_event_bus_lag_window("oracle", 41, base + Duration::from_secs(10)),
+            Some(101)
+        );
+        assert_eq!(
+            update_event_bus_lag_window("oracle", 1, base + Duration::from_secs(20)),
+            None
+        );
+        assert_eq!(
+            update_event_bus_lag_window("oracle", 50, base + Duration::from_secs(71)),
+            None
+        );
+        assert_eq!(
+            update_event_bus_lag_window("oracle", 60, base + Duration::from_secs(72)),
+            Some(111)
+        );
     }
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

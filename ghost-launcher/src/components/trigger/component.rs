@@ -1712,6 +1712,10 @@ impl TriggerComponent {
         self.config.shadow_run.emit_event_bus
     }
 
+    pub fn shadow_run_timeout_ms(&self) -> u64 {
+        self.config.shadow_run.timeout_ms
+    }
+
     pub fn shadow_run_enabled(&self) -> bool {
         self.config.shadow_run.enabled
     }
