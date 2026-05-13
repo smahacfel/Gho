@@ -4364,6 +4364,42 @@ fn enrich_buy_log_with_iwim(
     log.iwim_organic_score = iwim.raw_result.as_ref().map(|r| r.organic_score as f32);
 }
 
+fn enrich_buy_log_with_v3_shadow(
+    log: &mut ghost_brain::oracle::GatekeeperBuyLog,
+    assessment: &GatekeeperAssessment,
+    config: &GatekeeperV2Config,
+    deadline_elapsed: bool,
+) {
+    let decision = crate::components::gatekeeper_v3::evaluate_v3_from_features(
+        &assessment.feature_snapshot,
+        config,
+        deadline_elapsed,
+    );
+
+    log.v3_shadow_schema_version = Some(decision.schema_version);
+    log.v3_shadow_verdict = Some(decision.verdict.as_log_str().to_string());
+    log.v3_shadow_reason_code = Some(decision.reason_code.as_log_str());
+    log.v3_shadow_reason_chain = Some(
+        decision
+            .reason_chain
+            .iter()
+            .map(|reason| reason.as_log_str())
+            .collect(),
+    );
+    log.v3_shadow_confidence = Some(decision.confidence);
+    log.v3_shadow_evidence_status =
+        serde_json::to_value(&assessment.feature_snapshot.evidence_status).ok();
+    log.v3_shadow_organic_broadening =
+        serde_json::to_value(&assessment.feature_snapshot.organic_broadening).ok();
+    log.v3_shadow_manipulation_contradictions =
+        serde_json::to_value(&assessment.feature_snapshot.manipulation_contradictions).ok();
+    log.v3_shadow_notes = Some(serde_json::json!({
+        "p0": "shadow_only",
+        "source": "MaterializedFeatureSet",
+        "deadline_elapsed": deadline_elapsed,
+    }));
+}
+
 /// Enrich a `GatekeeperBuyLog` with A/B window boundary fields from `WindowState`.
 ///
 /// `pool_id` and `verdict_tag` are used to build the deterministic `ab_record_id`
@@ -8486,6 +8522,12 @@ async fn pool_observation_task(
                 );
                 let mut buy_log = assessment.to_buy_log(&pool_id, &ctx.gatekeeper_config);
                 enrich_buy_log_with_observation_identity(&mut buy_log, &identity);
+                enrich_buy_log_with_v3_shadow(
+                    &mut buy_log,
+                    &assessment,
+                    &ctx.gatekeeper_config,
+                    false,
+                );
                 enrich_buy_log_with_window(
                     &mut buy_log,
                     &window_state,
@@ -8582,6 +8624,12 @@ async fn pool_observation_task(
                 );
                 let mut buy_log = assessment.to_buy_log(&pool_id, &ctx.gatekeeper_config);
                 enrich_buy_log_with_observation_identity(&mut buy_log, &identity);
+                enrich_buy_log_with_v3_shadow(
+                    &mut buy_log,
+                    &assessment,
+                    &ctx.gatekeeper_config,
+                    true,
+                );
                 enrich_buy_log_with_window(
                     &mut buy_log,
                     &window_state,
@@ -8756,6 +8804,12 @@ async fn pool_observation_task(
                         let mut buy_log = assessment.to_buy_log(&pool_id, &ctx.gatekeeper_config);
                         enrich_buy_log_with_observation_identity(&mut buy_log, &identity);
                         enrich_buy_log_with_iwim(&mut buy_log, &iwim_res);
+                        enrich_buy_log_with_v3_shadow(
+                            &mut buy_log,
+                            &assessment,
+                            &ctx.gatekeeper_config,
+                            false,
+                        );
                         enrich_buy_log_with_window(
                             &mut buy_log,
                             &window_state,
@@ -8951,6 +9005,7 @@ async fn pool_observation_task(
                 if let Some(ref ir) = iwim_veto_result {
                     enrich_buy_log_with_iwim(&mut buy_log, ir);
                 }
+                enrich_buy_log_with_v3_shadow(&mut buy_log, &assessment, &gk_cfg, false);
                 enrich_buy_log_with_window(
                     &mut buy_log,
                     &window_state,
@@ -9905,7 +9960,13 @@ mod tests {
     use crate::events::RawBytesMissingReason;
     use async_trait::async_trait;
     use ghost_brain::oracle::hyper_prediction::HyperPredictionOracle;
+    use ghost_brain::oracle::reason_code::GatekeeperReasonCode;
     use ghost_brain::oracle::snapshot_engine::{ApprovedPools, PoolMetrics};
+    use ghost_core::checkpoint::{
+        EvidenceStatus, EvidenceUnavailableReason, FeatureEvidenceStatus,
+        ManipulationContradictionFeatures, MaterializedEvidenceStatus, MaterializedFeatureSet,
+        OrganicBroadeningFeatures,
+    };
     use ghost_core::shadow_ledger::LivePipelineConfig;
     use ghost_core::{GatekeeperDecision as WalGatekeeperDecision, Wal, WalRecord};
     use solana_sdk::signature::Keypair;
@@ -10454,6 +10515,90 @@ mod tests {
             adaptive_thresholds_applied: false,
             v25_confidence: None,
         }
+    }
+
+    fn review_clean_evidence_status() -> FeatureEvidenceStatus {
+        FeatureEvidenceStatus {
+            status: EvidenceStatus::Clean,
+            degraded_reasons: Vec::new(),
+            unavailable_reasons: Vec::new(),
+        }
+    }
+
+    fn review_unavailable_evidence_status(
+        reason: EvidenceUnavailableReason,
+    ) -> FeatureEvidenceStatus {
+        FeatureEvidenceStatus {
+            status: EvidenceStatus::Unavailable,
+            degraded_reasons: Vec::new(),
+            unavailable_reasons: vec![reason],
+        }
+    }
+
+    fn review_v3_clean_evidence() -> MaterializedEvidenceStatus {
+        MaterializedEvidenceStatus {
+            account_state: review_clean_evidence_status(),
+            tx_intel: review_clean_evidence_status(),
+            tx_segments: review_clean_evidence_status(),
+            checkpoints: review_clean_evidence_status(),
+            curve: review_clean_evidence_status(),
+            sybil: review_clean_evidence_status(),
+            alpha: review_clean_evidence_status(),
+            manipulation: review_clean_evidence_status(),
+            execution: review_unavailable_evidence_status(
+                EvidenceUnavailableReason::ExecutionNotRun,
+            ),
+        }
+    }
+
+    fn review_v3_buy_candidate_features() -> MaterializedFeatureSet {
+        let mut features = MaterializedFeatureSet::default();
+        features.evidence_status = review_v3_clean_evidence();
+        features.tx_intel_features.tx_count = 12;
+        features.tx_intel_features.buy_count = 8;
+        features.tx_intel_features.unique_signers = 8;
+        features.tx_intel_features.buy_ratio = 0.67;
+        features.tx_intel_features.hhi = 0.05;
+        features.tx_intel_features.top3_volume_pct = 0.30;
+        features.tx_intel_features.same_ms_tx_ratio = 0.05;
+        features.tx_intel_features.max_tx_per_signer = 2;
+        features.tx_intel_features.dev_has_sold = false;
+        features.sybil_resistance.signer_cross_pool_velocity = Some(0.05);
+        features.sybil_resistance.funding_source_concentration = Some(0.10);
+        features.alpha_fingerprint.jito_tip_intensity = Some(0.10);
+        features.organic_broadening = OrganicBroadeningFeatures {
+            sequence_available: true,
+            total_tx_count: 12,
+            total_unique_signers: 8,
+            t0_tx_count: 3,
+            t1_tx_count: 4,
+            t2_tx_count: 5,
+            t0_unique_signers: 2,
+            t1_unique_signers: 3,
+            t2_unique_signers: 4,
+            t1_vs_t0_unique_signer_delta: 1,
+            t2_vs_t1_unique_signer_delta: 1,
+            tx_count_growth_ratio: 1.25,
+            unique_signer_growth_ratio: 1.33,
+            buy_ratio_mean: 0.67,
+            buy_ratio_min: 0.60,
+            buy_ratio_max: 0.75,
+            max_segment_hhi: 0.08,
+            min_segment_hhi: 0.03,
+        };
+        features.manipulation_contradictions = ManipulationContradictionFeatures {
+            same_ms_tx_ratio: 0.05,
+            bundle_suspicion_ratio: 0.05,
+            top3_volume_pct: 0.30,
+            hhi: 0.05,
+            max_tx_per_signer: 2,
+            dev_volume_ratio: 0.05,
+            dev_has_sold: false,
+            signer_cross_pool_velocity: Some(0.05),
+            funding_source_concentration: Some(0.10),
+            ..ManipulationContradictionFeatures::default()
+        };
+        features
     }
 
     fn review_test_gatekeeper_config() -> GatekeeperV2Config {
@@ -20072,6 +20217,84 @@ mod tests {
         assert!(json.contains("\"base_mint\":\"MintABC111111111111111111111111111111111111\""));
         assert!(json.contains("\"first_seen_ts_ms\":1700000000000"));
         assert!(json.contains("\"observation_window_ms\":10000"));
+    }
+
+    #[test]
+    fn test_enrich_buy_log_with_v3_shadow_preserves_active_reject_fields() {
+        let config = review_test_gatekeeper_config();
+        let pool_id = Pubkey::new_unique();
+        let mut assessment = test_gatekeeper_buy_assessment(0);
+        assessment.feature_snapshot = review_v3_buy_candidate_features();
+        let mut log = assessment.to_buy_log(&pool_id, &config);
+        log.decision_verdict_buy = Some(false);
+        log.verdict_type = Some("REJECT_CORE_FAIL".to_string());
+        log.reason_code = Some(GatekeeperReasonCode::RejectCoreFail.as_log_str());
+        log.reason_code_version = GatekeeperReasonCode::version();
+
+        enrich_buy_log_with_v3_shadow(&mut log, &assessment, &config, false);
+
+        assert_eq!(log.decision_verdict_buy, Some(false));
+        assert_eq!(log.verdict_type.as_deref(), Some("REJECT_CORE_FAIL"));
+        assert_eq!(log.reason_code.as_deref(), Some("REJECT_CORE_FAIL"));
+        assert_eq!(log.v3_shadow_verdict.as_deref(), Some("BUY_CANDIDATE"));
+        assert_eq!(
+            log.v3_shadow_reason_code.as_deref(),
+            Some("V3_SHADOW_BUY_CANDIDATE")
+        );
+    }
+
+    #[test]
+    fn test_enrich_buy_log_with_v3_shadow_timeout_uses_deadline_context() {
+        let config = review_test_gatekeeper_config();
+        let pool_id = Pubkey::new_unique();
+        let mut assessment = test_gatekeeper_buy_assessment(0);
+        assessment.feature_snapshot.evidence_status.tx_intel =
+            review_unavailable_evidence_status(EvidenceUnavailableReason::TxIntelMissing);
+        let mut log = assessment.to_buy_log(&pool_id, &config);
+        log.decision_verdict_buy = None;
+        log.verdict_type = Some("TIMEOUT_PHASE1".to_string());
+        log.reason_code = Some(GatekeeperReasonCode::TimeoutPhase1Insufficient.as_log_str());
+        log.reason_code_version = GatekeeperReasonCode::version();
+
+        enrich_buy_log_with_v3_shadow(&mut log, &assessment, &config, true);
+
+        assert_eq!(log.decision_verdict_buy, None);
+        assert_eq!(log.verdict_type.as_deref(), Some("TIMEOUT_PHASE1"));
+        assert_eq!(
+            log.reason_code.as_deref(),
+            Some("TIMEOUT_PHASE1_INSUFFICIENT")
+        );
+        assert_eq!(log.v3_shadow_verdict.as_deref(), Some("TIMEOUT"));
+        assert_eq!(
+            log.v3_shadow_reason_code.as_deref(),
+            Some("V3_SHADOW_TIMEOUT_EVIDENCE")
+        );
+    }
+
+    #[test]
+    fn test_enrich_buy_log_with_v3_shadow_preserves_iwim_fields() {
+        let config = review_test_gatekeeper_config();
+        let pool_id = Pubkey::new_unique();
+        let mut assessment = test_gatekeeper_buy_assessment(6);
+        assessment.feature_snapshot = review_v3_buy_candidate_features();
+        let mut log = assessment.to_buy_log(&pool_id, &config);
+        log.decision_verdict_buy = Some(false);
+        log.verdict_type = Some("REJECT_IWIM_VETO".to_string());
+        log.reason_code = Some(GatekeeperReasonCode::RejectIwimVeto.as_log_str());
+        log.reason_code_version = GatekeeperReasonCode::version();
+        log.iwim_enabled = true;
+        log.iwim_status = Some("VETO".to_string());
+        log.iwim_veto_reason = Some("LOW_CONFIDENCE".to_string());
+
+        enrich_buy_log_with_v3_shadow(&mut log, &assessment, &config, false);
+
+        assert_eq!(log.decision_verdict_buy, Some(false));
+        assert_eq!(log.verdict_type.as_deref(), Some("REJECT_IWIM_VETO"));
+        assert_eq!(log.reason_code.as_deref(), Some("REJECT_IWIM_VETO"));
+        assert!(log.iwim_enabled);
+        assert_eq!(log.iwim_status.as_deref(), Some("VETO"));
+        assert_eq!(log.iwim_veto_reason.as_deref(), Some("LOW_CONFIDENCE"));
+        assert_eq!(log.v3_shadow_verdict.as_deref(), Some("BUY_CANDIDATE"));
     }
 
     #[test]
