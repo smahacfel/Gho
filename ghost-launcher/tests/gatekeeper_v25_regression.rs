@@ -1743,22 +1743,23 @@ fn p2_aps_high_vol_signal_below_min_samples_stays_normal() {
 #[test]
 fn p2_aps_drift_override_only_in_shadow_plane() {
     use ghost_brain::config::GatekeeperMode;
+    use ghost_core::checkpoint::{TrajectorySegmentSnapshot, TxSegmentSequence};
     use ghost_launcher::components::gatekeeper_policy::{
         build_assessment_from_features, PolicyEvaluationContext,
     };
 
-    let mut config = v25_enabled_config();
-    config.mode = GatekeeperMode::Long;
-    config.aps.enabled = true;
-    config.aps.shadow_suggestions_enabled = true;
-    config.aps.regime_detection_enabled = true;
-    config.aps.adaptive_enabled = true;
-    config.aps.regime_local_heuristic_enabled = true;
-    // live_execution_enabled = false (default) → override should apply
-    config.v25.live_execution_enabled = false;
+    let mut base_config = v25_enabled_config();
+    base_config.mode = GatekeeperMode::Long;
+    base_config.aps.enabled = true;
+    base_config.aps.shadow_suggestions_enabled = true;
+    base_config.aps.regime_detection_enabled = true;
+    base_config.aps.regime_local_heuristic_enabled = true;
+    base_config.pdd.spike_hard_veto = false;
+    base_config.v25.live_execution_enabled = false;
 
-    // Set up a MaterializedFeatureSet with HHI spike to trigger HighVol regime
-    // AND entry drift above 3% (the HV cap) but below 5% (normal cap).
+    // Set up a MaterializedFeatureSet with entry drift in the 3%-5% window.
+    // HighVol is forced via PDD spike materialized in tx_segment_sequence,
+    // not via the drift itself, so the test proves the adaptive override path.
     let mut features = ghost_core::checkpoint::MaterializedFeatureSet::default();
     features.tx_intel_features.tx_count = 30;
     features.tx_intel_features.buy_count = 25;
@@ -1770,6 +1771,7 @@ fn p2_aps_drift_override_only_in_shadow_plane() {
     features.tx_intel_features.timing_entropy = 2.0;
     features.tx_intel_features.top3_volume_pct = 0.30;
     features.tx_intel_features.volume_gini = 0.40;
+    features.tx_intel_features.hhi = 0.08;
     features.tx_intel_features.same_ms_tx_ratio = 0.1;
     features.tx_intel_features.max_tx_per_signer = 5;
     features.account_features.market_cap_sol = 50.0;
@@ -1777,51 +1779,99 @@ fn p2_aps_drift_override_only_in_shadow_plane() {
     features.account_features.price_sol = 1.0;
     features.account_features.current_reserves = (50_000_000_000, 900_000_000);
     features.session_metadata.observation_duration_ms = 7_000;
-
-    // Guaranteed HighVol trigger: price_change_ratio=5.0 (>3.0 threshold).
-    features
-        .checkpoint_features
-        .price_change_from_first_checkpoint_pct = 400.0;
-    features.checkpoint_features.price_trajectory = vec![1.0, 3.0, 5.0];
+    features.checkpoint_features.price_change_from_first_checkpoint_pct = 4.0;
+    features.checkpoint_features.price_trajectory = vec![0.97, 1.0, 1.04];
     features.checkpoint_features.trajectory_checkpoint_count = 3;
     features.curve_readiness.curve_data_known = true;
     features.curve_readiness.price_sample_count = 3;
+    features.curve_readiness.wait_elapsed_ms = Some(7_000);
+    features.curve_readiness.freshness = ghost_core::CurveFreshnessState::Fresh;
+    features.tx_segment_sequence = Some(TxSegmentSequence {
+        t0_segment: TrajectorySegmentSnapshot {
+            tx_count: 5,
+            buy_ratio: 0.80,
+            avg_interval_ms: 400.0,
+            total_volume_sol: 1.0,
+            hhi: 0.08,
+            max_single_tx_sol: 0.4,
+            same_size_streak: 1,
+        },
+        t1_segment: TrajectorySegmentSnapshot {
+            tx_count: 5,
+            buy_ratio: 0.82,
+            avg_interval_ms: 350.0,
+            total_volume_sol: 1.0,
+            hhi: 0.08,
+            max_single_tx_sol: 0.5,
+            same_size_streak: 2,
+        },
+        t2_segment: TrajectorySegmentSnapshot {
+            tx_count: 5,
+            buy_ratio: 0.85,
+            avg_interval_ms: 300.0,
+            total_volume_sol: 5.0,
+            hhi: 0.08,
+            max_single_tx_sol: 1.4,
+            same_size_streak: 1,
+        },
+        total_duration_ms: 6_000,
+        min_tx_per_segment_satisfied: true,
+    });
 
-    let assessment = build_assessment_from_features(
+    let mut shadow_config = base_config.clone();
+    shadow_config.aps.adaptive_enabled = true;
+    let shadow_assessment = build_assessment_from_features(
         features.clone(),
-        &config,
+        &shadow_config,
         PolicyEvaluationContext::default(),
     );
+    let shadow_aps = shadow_assessment
+        .aps_diagnostics
+        .as_ref()
+        .expect("shadow aps diagnostics");
+    let shadow_pdd = shadow_assessment
+        .pdd_assessment
+        .as_ref()
+        .expect("shadow pdd diagnostics");
 
-    assert!(assessment.aps_diagnostics.is_some());
-    let aps = assessment.aps_diagnostics.as_ref().unwrap();
-
-    // With price spike >3.0, regime MUST be HighVolatility.
+    assert_eq!(shadow_assessment.entry_drift_pct, Some(4.0));
     assert_eq!(
-        aps.regime,
+        shadow_aps.regime,
         ghost_launcher::components::gatekeeper_adaptive_prosperity::MarketRegime::HighVolatility,
-        "price_change_ratio=5.0 must trigger HighVol regime"
+        "spike-driven sequence must trigger HighVol regime for 4% drift case"
     );
-    // P2 contract: adaptive_thresholds_applied on the ASSESSMENT carries the
-    // live_execution_enabled guard (applied in build_assessment_from_features).
-    // The raw APS field (aps.adaptive_thresholds_applied) is the unguarded value.
-    assert!(
-        assessment.adaptive_thresholds_applied,
-        "shadow plane (live_execution_enabled=false): assessment must have adaptive_thresholds_applied=true"
+    assert!(shadow_assessment.adaptive_thresholds_applied);
+    assert_eq!(
+        shadow_pdd.hard_fail,
+        Some(ghost_launcher::components::gatekeeper_pdd::PddHardFail::EntryDrift)
     );
 
-    // Now test with live_execution_enabled = true → assessment.adaptive_thresholds_applied must be false.
-    let mut live_config = config.clone();
+    let mut shadow_no_adaptive_config = base_config.clone();
+    shadow_no_adaptive_config.aps.adaptive_enabled = false;
+    let shadow_no_adaptive_assessment = build_assessment_from_features(
+        features.clone(),
+        &shadow_no_adaptive_config,
+        PolicyEvaluationContext::default(),
+    );
+    let shadow_no_adaptive_pdd = shadow_no_adaptive_assessment
+        .pdd_assessment
+        .as_ref()
+        .expect("shadow no adaptive pdd diagnostics");
+
+    assert!(!shadow_no_adaptive_assessment.adaptive_thresholds_applied);
+    assert_eq!(shadow_no_adaptive_pdd.hard_fail, None);
+
+    let mut live_config = shadow_config.clone();
     live_config.v25.live_execution_enabled = true;
-
     let live_assessment =
         build_assessment_from_features(features, &live_config, PolicyEvaluationContext::default());
+    let live_pdd = live_assessment
+        .pdd_assessment
+        .as_ref()
+        .expect("live pdd diagnostics");
 
-    // P2 invariant: even in HighVol regime, live plane must never apply adaptive thresholds.
-    assert!(
-        !live_assessment.adaptive_thresholds_applied,
-        "live plane must never apply adaptive thresholds (shadow-only contract, P2)"
-    );
+    assert!(!live_assessment.adaptive_thresholds_applied);
+    assert_eq!(live_pdd.hard_fail, None);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════

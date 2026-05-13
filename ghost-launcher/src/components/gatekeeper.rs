@@ -5794,6 +5794,7 @@ impl GatekeeperBuffer {
             // Shadow-only: only apply regime-aware drift when live_execution is off.
             use crate::components::gatekeeper_adaptive_prosperity::MarketRegime;
             if aps.regime == MarketRegime::HighVolatility
+                && self.config.aps.adaptive_enabled
                 && !self.config.v25.live_execution_enabled
                 && assessment
                     .pdd_assessment

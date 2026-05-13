@@ -39,7 +39,8 @@ impl Default for MarketRegime {
 pub struct ApsDiagnostics {
     pub enabled: bool,
     pub adaptive_enabled: bool,
-    /// Whether adaptive thresholds were applied to the live prosperity evaluation
+    /// Raw APS outcome: whether the regime logic would apply adaptive thresholds
+    /// before any Gatekeeper shadow/live guard is enforced.
     pub adaptive_thresholds_applied: bool,
     /// Detected market regime (Normal if insufficient calibration samples)
     pub regime: MarketRegime,
@@ -73,8 +74,10 @@ impl ApsDiagnostics {
 /// Evaluate APS: detect market regime and produce shadow threshold suggestions
 /// plus a contrafactual prosperity verdict ("would the filter have passed with APS thresholds?").
 ///
-/// Does NOT mutate live prosperity thresholds — `adaptive_thresholds_applied` is
-/// always false unless `config.adaptive_enabled` (requires ADR promotion).
+/// Does NOT mutate live prosperity thresholds. The returned
+/// `ApsDiagnostics::adaptive_thresholds_applied` is the raw APS signal only;
+/// the authoritative shadow-only application guard is enforced later when
+/// populating `GatekeeperAssessment::adaptive_thresholds_applied`.
 ///
 /// **Calibration guard:** Falls back to `Normal` regime when the system has
 /// insufficient historical samples to support regime detection (tracked by
@@ -127,9 +130,8 @@ pub fn evaluate_aps(
     // Contrafactual: would prosperity filter have passed with APS shadow thresholds?
     let shadow_would_pass = compute_shadow_prosperity_pass(assessment, mcap, branch1, branch3_hhi);
 
-    // adaptive_thresholds_applied: only true when adaptive_enabled is on,
-    // regime is not Normal, and live_execution is still false (shadow-first).
-    // This allows V2.5 shadow plane to react to regime without touching legacy.
+    // Raw APS result only. Shadow/live enforcement happens later when
+    // GatekeeperAssessment is populated from APS diagnostics.
     let thresholds_applied = config.adaptive_enabled && regime != MarketRegime::Normal;
 
     // Telemetry: record regime distribution (provisional).
