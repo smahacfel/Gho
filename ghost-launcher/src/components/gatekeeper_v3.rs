@@ -1,9 +1,14 @@
-use ghost_brain::config::GatekeeperV2Config;
+use ghost_brain::config::{GatekeeperV3Config, GatekeeperV3Thresholds};
 use ghost_brain::oracle::reason_code::GatekeeperReasonCode;
-use ghost_core::checkpoint::{EvidenceStatus, MaterializedFeatureSet, OrganicBroadeningFeatures};
+use ghost_core::checkpoint::{
+    EvidenceStatus, FeatureEvidenceStatus, MaterializedFeatureSet, OrganicBroadeningFeatures,
+    TrajectorySegmentSnapshot,
+};
+use ghost_core::tx_intelligence::types::FundingSourceDiagnostics;
+use serde::Serialize;
+use serde_json::{json, Value};
 
 pub const V3_SHADOW_SCHEMA_VERSION: u32 = 1;
-const V3_P0_EXECUTION_NOT_RUN_CAP: f64 = 0.80;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum V3ShadowVerdict {
@@ -155,15 +160,330 @@ impl V3ShadowDecision {
     }
 }
 
+pub fn v3_actionability_payload(
+    features: &MaterializedFeatureSet,
+    config: &GatekeeperV3Config,
+) -> serde_json::Value {
+    let evidence = &features.evidence_status;
+    let groups = [
+        ("identity", &evidence.identity),
+        ("account_state", &evidence.account_state),
+        ("tx_intel", &evidence.tx_intel),
+        ("tx_segments", &evidence.tx_segments),
+        ("checkpoints", &evidence.checkpoints),
+        ("trajectory", &evidence.trajectory),
+        ("pdd_sequence", &evidence.pdd_sequence),
+        ("curve", &evidence.curve),
+        ("sybil", &evidence.sybil),
+        ("cpv", &evidence.cpv),
+        ("fsc", &evidence.fsc),
+        ("alpha", &evidence.alpha),
+        ("manipulation", &evidence.manipulation),
+        ("organic_broadening", &evidence.organic_broadening),
+        (
+            "manipulation_contradiction",
+            &evidence.manipulation_contradiction,
+        ),
+        ("execution", &evidence.execution),
+    ];
+
+    let group_statuses: serde_json::Map<String, serde_json::Value> = groups
+        .iter()
+        .map(|(name, status)| {
+            (
+                (*name).to_string(),
+                json!({
+                    "status": format!("{:?}", status.status),
+                    "actionability": evidence_group_actionability(status.status),
+                }),
+            )
+        })
+        .collect();
+
+    let evidence_actionable = non_clean_evidence_issue(features).is_none();
+    let risk_actionable = !matches!(
+        evidence.manipulation_contradiction.status,
+        EvidenceStatus::Unavailable | EvidenceStatus::InsufficientSample
+    );
+    let opportunity_actionable = features.organic_broadening.sequence_available
+        && has_sufficient_sample(features, &config.thresholds);
+    let confidence_actionable = evidence_actionable && opportunity_actionable;
+
+    json!({
+        "stages": {
+            "evidence": stage_actionability(evidence_actionable),
+            "risk": stage_actionability(risk_actionable),
+            "opportunity": stage_actionability(opportunity_actionable),
+            "confidence": stage_actionability(confidence_actionable)
+        },
+        "groups": group_statuses
+    })
+}
+
+pub fn v3_component_scores_payload(decision: &V3ShadowDecision) -> serde_json::Value {
+    json!({
+        "risk": {
+            "status": decision.risk_status.as_log_str(),
+            "penalty": decision.risk_penalty
+        },
+        "opportunity": {
+            "status": decision.opportunity_status.as_log_str(),
+            "score": decision.opportunity_score
+        },
+        "confidence": {
+            "raw": decision.confidence_breakdown.raw,
+            "after_risk": decision.confidence_breakdown.after_risk,
+            "after_stage": decision.confidence_breakdown.after_stage,
+            "cap": decision.confidence_breakdown.cap,
+            "cap_reasons": decision.confidence_breakdown.cap_reasons.clone(),
+            "final": decision.confidence_breakdown.final_confidence
+        },
+        "final_confidence": decision.confidence
+    })
+}
+
+pub fn v3_feature_snapshot_hash(features: &MaterializedFeatureSet) -> String {
+    let account = &features.account_features;
+    let tx = &features.tx_intel_features;
+    let checkpoints = &features.checkpoint_features;
+    let session = &features.session_metadata;
+    let curve = &features.curve_readiness;
+    let sybil = &features.sybil_resistance;
+    let alpha = &features.alpha_fingerprint;
+    let organic = &features.organic_broadening;
+    let manipulation = &features.manipulation_contradictions;
+
+    let payload = json!({
+        "account_features": {
+            "bonding_progress_bits": f64_bits(account.bonding_progress),
+            "current_reserves": [account.current_reserves.0, account.current_reserves.1],
+            "curve_finality": account.curve_finality.as_str(),
+            "is_bootstrap": account.is_bootstrap,
+            "market_cap_sol_bits": f64_bits(account.market_cap_sol),
+            "price_change_since_t0_pct_bits": f64_bits(account.price_change_since_t0_pct),
+            "price_sol_bits": f64_bits(account.price_sol),
+            "reserve_velocity_sol_per_sec_bits": f64_bits(account.reserve_velocity_sol_per_sec),
+            "state_phase": serde_value(&account.state_phase),
+            "update_count": account.update_count
+        },
+        "tx_intel_features": {
+            "avg_interval_ms_bits": f64_bits(tx.avg_interval_ms),
+            "avg_tx_per_signer_bits": f64_bits(tx.avg_tx_per_signer),
+            "avg_tx_sol_bits": f64_bits(tx.avg_tx_sol),
+            "bundle_suspicion_ratio_bits": f64_bits(tx.bundle_suspicion_ratio),
+            "burst_ratio_bits": f64_bits(tx.burst_ratio),
+            "buy_count": tx.buy_count,
+            "buy_ratio_bits": f64_bits(tx.buy_ratio),
+            "dev_buy_sol_bits": f64_bits(tx.dev_buy_sol),
+            "dev_has_sold": tx.dev_has_sold,
+            "dev_initial_buy_tokens_bits": opt_f64_bits(tx.dev_initial_buy_tokens),
+            "dev_is_first_buyer": tx.dev_is_first_buyer,
+            "dev_tx_count": tx.dev_tx_count,
+            "dev_tx_ratio_bits": f64_bits(tx.dev_tx_ratio),
+            "dev_volume_ratio_bits": f64_bits(tx.dev_volume_ratio),
+            "dev_wallet_known": tx.dev_wallet_known,
+            "dust_ratio_bits": f64_bits(tx.dust_ratio),
+            "dust_tx_count": tx.dust_tx_count,
+            "failed_tx_count": tx.failed_tx_count,
+            "hhi_bits": f64_bits(tx.hhi),
+            "interval_cv_bits": f64_bits(tx.interval_cv),
+            "max_consecutive_buys": tx.max_consecutive_buys,
+            "max_tx_per_signer": tx.max_tx_per_signer,
+            "max_tx_sol_bits": f64_bits(tx.max_tx_sol),
+            "min_tx_sol_bits": f64_bits(tx.min_tx_sol),
+            "same_ms_tx_ratio_bits": f64_bits(tx.same_ms_tx_ratio),
+            "sell_count": tx.sell_count,
+            "sol_buy_ratio_bits": f64_bits(tx.sol_buy_ratio),
+            "timing_entropy_bits": f64_bits(tx.timing_entropy),
+            "top3_volume_pct_bits": f64_bits(tx.top3_volume_pct),
+            "total_volume_sol_bits": f64_bits(tx.total_volume_sol),
+            "tx_count": tx.tx_count,
+            "unique_signer_ratio_bits": f64_bits(tx.unique_signer_ratio),
+            "unique_signers": tx.unique_signers,
+            "volume_cv_bits": f64_bits(tx.volume_cv),
+            "volume_gini_bits": f64_bits(tx.volume_gini)
+        },
+        "checkpoint_features": {
+            "bonding_progress_bits": f64_bits(checkpoints.bonding_progress),
+            "buy_pressure_trend": serde_value(&checkpoints.buy_pressure_trend),
+            "price_change_from_first_checkpoint_pct_bits": f64_bits(checkpoints.price_change_from_first_checkpoint_pct),
+            "price_trajectory_bits": checkpoints.price_trajectory
+                .iter()
+                .map(|value| f64_bits(*value))
+                .collect::<Vec<_>>(),
+            "reserve_trajectory": checkpoints.reserve_trajectory
+                .iter()
+                .map(|(sol, token)| json!([*sol, *token]))
+                .collect::<Vec<_>>(),
+            "risk_flag_count_trend": serde_value(&checkpoints.risk_flag_count_trend),
+            "signer_diversity_trend": serde_value(&checkpoints.signer_diversity_trend),
+            "single_tx_max_price_impact_pct_bits": f64_bits(checkpoints.single_tx_max_price_impact_pct),
+            "max_single_sell_impact_pct_bits": f64_bits(checkpoints.max_single_sell_impact_pct),
+            "trajectory_assessment": checkpoints.trajectory_assessment.as_ref().map_or(Value::Null, |assessment| json!({
+                "buy_ratio_score_bits": f64_bits(assessment.buy_ratio_score),
+                "hhi_score_bits": f64_bits(assessment.hhi_score),
+                "interval_score_bits": f64_bits(assessment.interval_score),
+                "momentum_score_bits": f64_bits(assessment.momentum_score),
+                "overall_tas_score_bits": f64_bits(assessment.overall_tas_score),
+                "segment_count": assessment.segment_count,
+                "t0_tx_count": assessment.t0_tx_count,
+                "t1_tx_count": assessment.t1_tx_count,
+                "t2_tx_count": assessment.t2_tx_count,
+                "volume_score_bits": f64_bits(assessment.volume_score)
+            })),
+            "trajectory_checkpoint_count": checkpoints.trajectory_checkpoint_count
+        },
+        "risk_flags": features.risk_flags
+            .iter()
+            .map(|flag| json!({
+                "detected_at_ms": flag.detected_at_ms,
+                "detail": flag.detail.as_str(),
+                "flag_id": flag.flag_id.as_ref(),
+                "severity": serde_value(&flag.severity)
+            }))
+            .collect::<Vec<_>>(),
+        "session_metadata": {
+            "base_mint": session.base_mint.to_string(),
+            "is_dev_known": session.is_dev_known,
+            "observation_duration_ms": session.observation_duration_ms,
+            "pool_amm_id": session.pool_amm_id.to_string(),
+            "session_id": session.session_id.get()
+        },
+        "curve_readiness": {
+            "curve_data_known": curve.curve_data_known,
+            "finality": curve.finality.as_str(),
+            "freshness": curve.freshness.as_str(),
+            "is_ready": curve.is_ready,
+            "price_sample_count": curve.price_sample_count,
+            "t0_event_ts_ms": opt_u64_value(curve.t0_event_ts_ms),
+            "wait_elapsed_ms": opt_u64_value(curve.wait_elapsed_ms)
+        },
+        "sybil_resistance": {
+            "buy_sample_count": sybil.buy_sample_count,
+            "degraded_reasons": sybil.degraded_reasons.clone(),
+            "demand_elasticity_score_bits": opt_f64_bits(sybil.demand_elasticity_score),
+            "dev_buyer_infrastructure_affinity_bits": opt_f64_bits(sybil.dev_buyer_infrastructure_affinity),
+            "fee_topology_diversity_index_bits": opt_f64_bits(sybil.fee_topology_diversity_index),
+            "funding_source_concentration_bits": opt_f64_bits(sybil.funding_source_concentration),
+            "funding_source_diagnostics": sybil
+                .funding_source_diagnostics
+                .as_ref()
+                .map_or(Value::Null, funding_source_diagnostics_payload),
+            "signer_cross_pool_velocity_bits": opt_f64_bits(sybil.signer_cross_pool_velocity),
+            "signer_sample_count": sybil.signer_sample_count,
+            "spend_fraction_divergence_bits": opt_f64_bits(sybil.spend_fraction_divergence)
+        },
+        "alpha_fingerprint": {
+            "avg_inner_ix_count_50tx_bits": opt_f64_bits(alpha.avg_inner_ix_count_50tx),
+            "compute_unit_cluster_dominance_bits": opt_f64_bits(alpha.compute_unit_cluster_dominance),
+            "early_slot_volume_dominance_buy_bits": opt_f64_bits(alpha.early_slot_volume_dominance_buy),
+            "early_top3_buy_volume_pct_3s_bits": opt_f64_bits(alpha.early_top3_buy_volume_pct_3s),
+            "fixed_size_buy_ratio_bits": opt_f64_bits(alpha.fixed_size_buy_ratio),
+            "flipper_presence_ratio_bits": opt_f64_bits(alpha.flipper_presence_ratio),
+            "jito_tip_intensity_bits": opt_f64_bits(alpha.jito_tip_intensity),
+            "sell_buy_ratio_bits": opt_f64_bits(alpha.sell_buy_ratio),
+            "static_fee_profile_ratio_bits": opt_f64_bits(alpha.static_fee_profile_ratio)
+        },
+        "tx_segment_sequence": features.tx_segment_sequence.as_ref().map_or(Value::Null, |sequence| json!({
+            "min_tx_per_segment_satisfied": sequence.min_tx_per_segment_satisfied,
+            "t0_segment": trajectory_segment_payload(&sequence.t0_segment),
+            "t1_segment": trajectory_segment_payload(&sequence.t1_segment),
+            "t2_segment": trajectory_segment_payload(&sequence.t2_segment),
+            "total_duration_ms": sequence.total_duration_ms
+        })),
+        "evidence_status": {
+            "account_state": evidence_status_payload(&features.evidence_status.account_state),
+            "alpha": evidence_status_payload(&features.evidence_status.alpha),
+            "checkpoints": evidence_status_payload(&features.evidence_status.checkpoints),
+            "cpv": evidence_status_payload(&features.evidence_status.cpv),
+            "curve": evidence_status_payload(&features.evidence_status.curve),
+            "execution": evidence_status_payload(&features.evidence_status.execution),
+            "fsc": evidence_status_payload(&features.evidence_status.fsc),
+            "identity": evidence_status_payload(&features.evidence_status.identity),
+            "manipulation": evidence_status_payload(&features.evidence_status.manipulation),
+            "manipulation_contradiction": evidence_status_payload(&features.evidence_status.manipulation_contradiction),
+            "organic_broadening": evidence_status_payload(&features.evidence_status.organic_broadening),
+            "pdd_sequence": evidence_status_payload(&features.evidence_status.pdd_sequence),
+            "sybil": evidence_status_payload(&features.evidence_status.sybil),
+            "trajectory": evidence_status_payload(&features.evidence_status.trajectory),
+            "tx_intel": evidence_status_payload(&features.evidence_status.tx_intel),
+            "tx_segments": evidence_status_payload(&features.evidence_status.tx_segments)
+        },
+        "organic_broadening": {
+            "broadening_score_bits": f64_bits(organic.broadening_score),
+            "buy_ratio_max_bits": f64_bits(organic.buy_ratio_max),
+            "buy_ratio_mean_bits": f64_bits(organic.buy_ratio_mean),
+            "buy_ratio_min_bits": f64_bits(organic.buy_ratio_min),
+            "degraded_reasons": organic.degraded_reasons
+                .iter()
+                .map(serde_value)
+                .collect::<Vec<_>>(),
+            "hhi_delta_t2_t0_bits": f64_bits(organic.hhi_delta_t2_t0),
+            "max_segment_hhi_bits": f64_bits(organic.max_segment_hhi),
+            "min_segment_hhi_bits": f64_bits(organic.min_segment_hhi),
+            "new_signer_ratio_t2_bits": f64_bits(organic.new_signer_ratio_t2),
+            "sequence_available": organic.sequence_available,
+            "signer_growth_t2_t0": organic.signer_growth_t2_t0,
+            "status": serde_value(&organic.status),
+            "t0_tx_count": organic.t0_tx_count,
+            "t0_unique_signers": organic.t0_unique_signers,
+            "t1_tx_count": organic.t1_tx_count,
+            "t1_unique_signers": organic.t1_unique_signers,
+            "t1_vs_t0_unique_signer_delta": organic.t1_vs_t0_unique_signer_delta,
+            "t2_tx_count": organic.t2_tx_count,
+            "t2_unique_signers": organic.t2_unique_signers,
+            "t2_vs_t1_unique_signer_delta": organic.t2_vs_t1_unique_signer_delta,
+            "total_tx_count": organic.total_tx_count,
+            "total_unique_signers": organic.total_unique_signers,
+            "tx_count_growth_ratio_bits": f64_bits(organic.tx_count_growth_ratio),
+            "tx_count_growth_vs_signer_growth_bits": f64_bits(organic.tx_count_growth_vs_signer_growth),
+            "unique_signer_growth_ratio_bits": f64_bits(organic.unique_signer_growth_ratio)
+        },
+        "manipulation_contradictions": {
+            "bundle_suspicion_ratio_bits": f64_bits(manipulation.bundle_suspicion_ratio),
+            "contradiction_score_bits": f64_bits(manipulation.contradiction_score),
+            "dev_has_sold": manipulation.dev_has_sold,
+            "dev_volume_ratio_bits": f64_bits(manipulation.dev_volume_ratio),
+            "early_top3_concentration": manipulation.early_top3_concentration,
+            "fee_topology_diversity_index_bits": opt_f64_bits(manipulation.fee_topology_diversity_index),
+            "fixed_size_or_ramping_pattern": manipulation.fixed_size_or_ramping_pattern,
+            "funding_source_concentration_bits": opt_f64_bits(manipulation.funding_source_concentration),
+            "hhi_bits": f64_bits(manipulation.hhi),
+            "high_bundle_suspicion_ratio": manipulation.high_bundle_suspicion_ratio,
+            "high_buy_pressure_with_high_top3": manipulation.high_buy_pressure_with_high_top3,
+            "high_dev_concentration": manipulation.high_dev_concentration,
+            "high_hhi": manipulation.high_hhi,
+            "high_same_ms_tx_ratio": manipulation.high_same_ms_tx_ratio,
+            "high_signer_concentration": manipulation.high_signer_concentration,
+            "high_top3_volume_pct": manipulation.high_top3_volume_pct,
+            "max_tx_per_signer": manipulation.max_tx_per_signer,
+            "momentum_without_broadening": manipulation.momentum_without_broadening,
+            "reasons": manipulation.reasons.clone(),
+            "same_ms_tx_ratio_bits": f64_bits(manipulation.same_ms_tx_ratio),
+            "signer_cross_pool_velocity_bits": opt_f64_bits(manipulation.signer_cross_pool_velocity),
+            "spend_fraction_divergence_bits": opt_f64_bits(manipulation.spend_fraction_divergence),
+            "status": serde_value(&manipulation.status),
+            "sybil_evidence_degraded": manipulation.sybil_evidence_degraded,
+            "timing_bundle_concentration": manipulation.timing_bundle_concentration,
+            "top3_volume_pct_bits": f64_bits(manipulation.top3_volume_pct),
+            "volume_spike_without_new_signers": manipulation.volume_spike_without_new_signers
+        }
+    });
+
+    let bytes = serde_json::to_vec(&payload).expect("canonical V3 feature snapshot serializes");
+    blake3::hash(&bytes).to_hex().to_string()
+}
+
 pub fn evaluate_v3_from_features(
     features: &MaterializedFeatureSet,
-    config: &GatekeeperV2Config,
+    config: &GatekeeperV3Config,
     deadline_elapsed: bool,
 ) -> V3ShadowDecision {
-    let opportunity_score = organic_confidence(&features.organic_broadening, features, config);
-    let risk_penalty = v3_risk_penalty(features, config);
+    let thresholds = &config.thresholds;
+    let opportunity_score = organic_confidence(&features.organic_broadening, features, thresholds);
+    let risk_penalty = v3_risk_penalty(features, thresholds);
 
-    if has_hard_risk_contradiction(features, config) {
+    if has_hard_risk_contradiction(features, thresholds) {
         return V3ShadowDecision::new(
             V3ShadowVerdict::Reject,
             DecisionStage::Risk,
@@ -185,12 +505,12 @@ pub fn evaluate_v3_from_features(
         return insufficient_evidence_decision(deadline_elapsed, issue, risk_penalty);
     }
 
-    if organic_broadening_passes(&features.organic_broadening, features, config) {
+    if organic_broadening_passes(&features.organic_broadening, features, thresholds) {
         let confidence = ConfidenceBreakdown::capped(
             opportunity_score,
             risk_penalty,
             1.0,
-            V3_P0_EXECUTION_NOT_RUN_CAP,
+            thresholds.execution_not_run_confidence_cap,
             "execution_not_run",
         );
         return V3ShadowDecision::new(
@@ -207,7 +527,7 @@ pub fn evaluate_v3_from_features(
         );
     }
 
-    let reason = if has_sufficient_sample(features, config) {
+    let reason = if has_sufficient_sample(features, thresholds) {
         GatekeeperReasonCode::RejectV3LowOrganicBroadening
     } else if deadline_elapsed {
         GatekeeperReasonCode::TimeoutV3UnresolvedConfidence
@@ -363,7 +683,7 @@ fn non_clean_evidence_issue(features: &MaterializedFeatureSet) -> Option<Evidenc
 
 fn has_hard_risk_contradiction(
     features: &MaterializedFeatureSet,
-    config: &GatekeeperV2Config,
+    config: &GatekeeperV3Thresholds,
 ) -> bool {
     let risk = &features.manipulation_contradictions;
     let tx = &features.tx_intel_features;
@@ -379,7 +699,7 @@ fn has_hard_risk_contradiction(
         || risk.bundle_suspicion_ratio > config.hard_fail_same_ms_tx_ratio
         || risk.top3_volume_pct > config.hard_fail_top3_volume_pct
         || risk.hhi > config.hard_fail_hhi
-        || risk.max_tx_per_signer as usize > config.max_tx_per_signer
+        || risk.max_tx_per_signer > config.max_tx_per_signer
         || risk.dev_volume_ratio > config.max_dev_volume_ratio
         || risk
             .signer_cross_pool_velocity
@@ -389,7 +709,7 @@ fn has_hard_risk_contradiction(
             .is_some_and(|value| value > config.max_funding_source_concentration)
 }
 
-fn v3_risk_penalty(features: &MaterializedFeatureSet, config: &GatekeeperV2Config) -> f64 {
+fn v3_risk_penalty(features: &MaterializedFeatureSet, config: &GatekeeperV3Thresholds) -> f64 {
     if has_hard_risk_contradiction(features, config) {
         return 1.0;
     }
@@ -414,35 +734,38 @@ fn v3_risk_penalty(features: &MaterializedFeatureSet, config: &GatekeeperV2Confi
         .clamp(0.0, 0.85)
 }
 
-fn has_sufficient_sample(features: &MaterializedFeatureSet, config: &GatekeeperV2Config) -> bool {
+fn has_sufficient_sample(
+    features: &MaterializedFeatureSet,
+    config: &GatekeeperV3Thresholds,
+) -> bool {
     features.organic_broadening.sequence_available
-        && features.tx_intel_features.tx_count >= config.min_tx_count as u64
-        && features.tx_intel_features.unique_signers >= config.min_unique_signers as u64
-        && features.tx_intel_features.buy_count >= config.min_buy_count as u64
+        && features.tx_intel_features.tx_count >= config.min_tx_count
+        && features.tx_intel_features.unique_signers >= config.min_unique_signers
+        && features.tx_intel_features.buy_count >= config.min_buy_count
 }
 
 fn organic_broadening_passes(
     organic: &OrganicBroadeningFeatures,
     features: &MaterializedFeatureSet,
-    config: &GatekeeperV2Config,
+    config: &GatekeeperV3Thresholds,
 ) -> bool {
     organic.sequence_available
-        && organic.total_tx_count >= config.min_tx_count as u64
-        && organic.total_unique_signers >= config.min_unique_signers as u64
-        && features.tx_intel_features.buy_count >= config.min_buy_count as u64
+        && organic.total_tx_count >= config.min_tx_count
+        && organic.total_unique_signers >= config.min_unique_signers
+        && features.tx_intel_features.buy_count >= config.min_buy_count
         && organic.buy_ratio_min >= config.min_buy_ratio
         && organic.buy_ratio_max <= config.max_buy_ratio
         && organic.t1_vs_t0_unique_signer_delta >= 0
         && organic.t2_vs_t1_unique_signer_delta >= 0
-        && organic.tx_count_growth_ratio >= 1.0
-        && organic.unique_signer_growth_ratio >= 1.0
+        && organic.tx_count_growth_ratio >= config.organic_min_tx_count_growth_ratio
+        && organic.unique_signer_growth_ratio >= config.organic_min_unique_signer_growth_ratio
         && organic.max_segment_hhi <= config.max_hhi
 }
 
 fn organic_confidence(
     organic: &OrganicBroadeningFeatures,
     features: &MaterializedFeatureSet,
-    config: &GatekeeperV2Config,
+    config: &GatekeeperV3Thresholds,
 ) -> f64 {
     let tx_score = ratio_score(organic.total_tx_count as f64, config.min_tx_count as f64);
     let signer_score = ratio_score(
@@ -482,4 +805,87 @@ fn ratio_score(value: f64, required: f64) -> f64 {
 
 fn clamp01(value: f64) -> f64 {
     value.clamp(0.0, 1.0)
+}
+
+fn f64_bits(value: f64) -> String {
+    let bits = if value == 0.0 { 0 } else { value.to_bits() };
+    format!("{bits:016x}")
+}
+
+fn opt_f64_bits(value: Option<f64>) -> Value {
+    value.map_or(Value::Null, |value| json!(f64_bits(value)))
+}
+
+fn opt_u64_value(value: Option<u64>) -> Value {
+    value.map_or(Value::Null, |value| json!(value))
+}
+
+fn serde_value<T: Serialize>(value: &T) -> Value {
+    serde_json::to_value(value).unwrap_or_else(|_| Value::String("serialization_error".to_string()))
+}
+
+fn funding_source_diagnostics_payload(diagnostics: &FundingSourceDiagnostics) -> Value {
+    json!({
+        "buyer_sample_count": diagnostics.buyer_sample_count,
+        "indeterminate_unknown_buyer_count": diagnostics.indeterminate_unknown_buyer_count,
+        "known_source_count": diagnostics.known_source_count,
+        "miss_reason_counts": diagnostics.miss_reason_counts
+            .iter()
+            .map(|count| json!({
+                "class": count.class.as_str(),
+                "count": count.count,
+                "reason": count.reason.as_str()
+            }))
+            .collect::<Vec<_>>(),
+        "operational_unknown_buyer_count": diagnostics.operational_unknown_buyer_count,
+        "structural_unknown_buyer_count": diagnostics.structural_unknown_buyer_count,
+        "unknown_buyer_count": diagnostics.unknown_buyer_count
+    })
+}
+
+fn trajectory_segment_payload(segment: &TrajectorySegmentSnapshot) -> Value {
+    json!({
+        "avg_interval_ms_bits": f64_bits(segment.avg_interval_ms),
+        "buy_ratio_bits": f64_bits(segment.buy_ratio),
+        "hhi_bits": f64_bits(segment.hhi),
+        "max_single_tx_sol_bits": f64_bits(segment.max_single_tx_sol),
+        "same_size_streak": segment.same_size_streak,
+        "total_volume_sol_bits": f64_bits(segment.total_volume_sol),
+        "tx_count": segment.tx_count
+    })
+}
+
+fn evidence_status_payload(status: &FeatureEvidenceStatus) -> Value {
+    json!({
+        "degraded_reasons": status.degraded_reasons
+            .iter()
+            .map(serde_value)
+            .collect::<Vec<_>>(),
+        "status": serde_value(&status.status),
+        "unavailable_reasons": status.unavailable_reasons
+            .iter()
+            .map(serde_value)
+            .collect::<Vec<_>>()
+    })
+}
+
+fn evidence_group_actionability(status: EvidenceStatus) -> &'static str {
+    match status {
+        EvidenceStatus::Clean => "actionable",
+        EvidenceStatus::InsufficientSample => "wait_sample",
+        EvidenceStatus::Unavailable => "unavailable",
+        EvidenceStatus::Degraded
+        | EvidenceStatus::Stale
+        | EvidenceStatus::Fallback
+        | EvidenceStatus::ShadowOnly
+        | EvidenceStatus::NotConfigured => "degraded",
+    }
+}
+
+fn stage_actionability(actionable: bool) -> &'static str {
+    if actionable {
+        "actionable"
+    } else {
+        "not_actionable"
+    }
 }

@@ -712,6 +712,20 @@ pub struct GatekeeperBuyLog {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub v3_manipulation_contradictions: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v3_policy_config_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v3_feature_snapshot_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v3_materialization_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v3_policy_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v3_stage_thresholds: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v3_component_scores: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v3_actionability: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub v3_shadow_notes: Option<serde_json::Value>,
 
     /// Whether alpha gate was enabled in config for this decision.
@@ -2645,6 +2659,13 @@ mod tests {
             v3_evidence_status: None,
             v3_organic_broadening: None,
             v3_manipulation_contradictions: None,
+            v3_policy_config_hash: None,
+            v3_feature_snapshot_hash: None,
+            v3_materialization_version: None,
+            v3_policy_version: None,
+            v3_stage_thresholds: None,
+            v3_component_scores: None,
+            v3_actionability: None,
             v3_shadow_notes: None,
             alpha_gate_enabled: false,
             alpha_pass: None,
@@ -3092,6 +3113,13 @@ mod tests {
             v3_evidence_status: None,
             v3_organic_broadening: None,
             v3_manipulation_contradictions: None,
+            v3_policy_config_hash: None,
+            v3_feature_snapshot_hash: None,
+            v3_materialization_version: None,
+            v3_policy_version: None,
+            v3_stage_thresholds: None,
+            v3_component_scores: None,
+            v3_actionability: None,
             v3_shadow_notes: None,
             alpha_gate_enabled: false,
             alpha_pass: None,
@@ -3314,6 +3342,13 @@ mod tests {
         assert!(parsed.v3_evidence_status.is_none());
         assert!(parsed.v3_organic_broadening.is_none());
         assert!(parsed.v3_manipulation_contradictions.is_none());
+        assert!(parsed.v3_policy_config_hash.is_none());
+        assert!(parsed.v3_feature_snapshot_hash.is_none());
+        assert!(parsed.v3_materialization_version.is_none());
+        assert!(parsed.v3_policy_version.is_none());
+        assert!(parsed.v3_stage_thresholds.is_none());
+        assert!(parsed.v3_component_scores.is_none());
+        assert!(parsed.v3_actionability.is_none());
         assert!(parsed.v3_shadow_notes.is_none());
     }
 
@@ -3361,8 +3396,21 @@ mod tests {
         log.v3_evidence_status = log.v3_shadow_evidence_status.clone();
         log.v3_organic_broadening = log.v3_shadow_organic_broadening.clone();
         log.v3_manipulation_contradictions = log.v3_shadow_manipulation_contradictions.clone();
+        log.v3_policy_config_hash = Some("v3-policy-hash".to_string());
+        log.v3_feature_snapshot_hash = Some("v3-feature-hash".to_string());
+        log.v3_materialization_version = Some(1);
+        log.v3_policy_version = Some(1);
+        log.v3_stage_thresholds = Some(serde_json::json!({
+            "evidence": {"min_tx_count": 12}
+        }));
+        log.v3_component_scores = Some(serde_json::json!({
+            "opportunity": {"score": 0.0}
+        }));
+        log.v3_actionability = Some(serde_json::json!({
+            "stages": {"evidence": "not_actionable"}
+        }));
         log.v3_shadow_notes = Some(serde_json::json!({
-            "p0": "shadow_only"
+            "p1": "calibrated_shadow_funnel"
         }));
 
         let expanded = expand_gatekeeper_plane_logs(log);
@@ -3395,13 +3443,26 @@ mod tests {
         assert_eq!(record["v3_shadow_opportunity_status"], "DEGRADED");
         assert_eq!(record["v3_shadow_confidence_final"], 0.0);
         assert_eq!(record["v3_shadow_confidence"], 0.0);
+        assert_eq!(record["v3_policy_config_hash"], "v3-policy-hash");
+        assert_eq!(record["v3_feature_snapshot_hash"], "v3-feature-hash");
+        assert_eq!(record["v3_materialization_version"], 1);
+        assert_eq!(record["v3_policy_version"], 1);
+        assert_eq!(
+            record["v3_stage_thresholds"]["evidence"]["min_tx_count"],
+            12
+        );
+        assert_eq!(record["v3_component_scores"]["opportunity"]["score"], 0.0);
+        assert_eq!(
+            record["v3_actionability"]["stages"]["evidence"],
+            "not_actionable"
+        );
         assert_eq!(
             record["v3_evidence_status"]["tx_intel"]["status"],
             "DEGRADED"
         );
         assert_eq!(
-            record["v3_shadow_notes"]["p0"],
-            serde_json::json!("shadow_only")
+            record["v3_shadow_notes"]["p1"],
+            serde_json::json!("calibrated_shadow_funnel")
         );
     }
 

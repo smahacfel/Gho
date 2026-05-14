@@ -81,7 +81,7 @@ use crate::oracle_metrics::{
 };
 use chrono::{SecondsFormat, TimeZone, Utc};
 use dashmap::DashMap;
-use ghost_brain::config::{GatekeeperMode, GatekeeperV2Config};
+use ghost_brain::config::{GatekeeperMode, GatekeeperV2Config, GatekeeperV3Config};
 use ghost_brain::oracle::window_spec::{ensure_epoch_ms, WindowCloseReason, WindowState};
 use ghost_core::account_state_core::reducer::AccountStateReducer;
 use ghost_core::account_state_core::types::{
@@ -4367,9 +4367,13 @@ fn enrich_buy_log_with_iwim(
 fn enrich_buy_log_with_v3_shadow(
     log: &mut ghost_brain::oracle::GatekeeperBuyLog,
     assessment: &GatekeeperAssessment,
-    config: &GatekeeperV2Config,
+    config: &GatekeeperV3Config,
     deadline_elapsed: bool,
 ) {
+    if !config.shadow_emit_enabled {
+        return;
+    }
+
     let decision = crate::components::gatekeeper_v3::evaluate_v3_from_features(
         &assessment.feature_snapshot,
         config,
@@ -4409,6 +4413,19 @@ fn enrich_buy_log_with_v3_shadow(
     log.v3_shadow_confidence_cap_reasons = Some(decision.confidence_breakdown.cap_reasons.clone());
     log.v3_shadow_confidence_final = Some(decision.confidence_breakdown.final_confidence);
     log.v3_shadow_confidence = Some(decision.confidence);
+    log.v3_policy_config_hash = Some(config.v3_policy_config_hash());
+    log.v3_feature_snapshot_hash = Some(
+        crate::components::gatekeeper_v3::v3_feature_snapshot_hash(&assessment.feature_snapshot),
+    );
+    log.v3_materialization_version = Some(config.materialization_version);
+    log.v3_policy_version = Some(config.policy_version);
+    log.v3_stage_thresholds = Some(config.stage_thresholds_payload());
+    log.v3_component_scores =
+        Some(crate::components::gatekeeper_v3::v3_component_scores_payload(&decision));
+    log.v3_actionability = Some(crate::components::gatekeeper_v3::v3_actionability_payload(
+        &assessment.feature_snapshot,
+        config,
+    ));
 
     let evidence_status = serde_json::to_value(&assessment.feature_snapshot.evidence_status).ok();
     let organic_broadening =
@@ -4422,7 +4439,7 @@ fn enrich_buy_log_with_v3_shadow(
     log.v3_organic_broadening = organic_broadening;
     log.v3_manipulation_contradictions = manipulation_contradictions;
     log.v3_shadow_notes = Some(serde_json::json!({
-        "p0": "shadow_only",
+        "p1": "calibrated_shadow_funnel",
         "source": "MaterializedFeatureSet",
         "deadline_elapsed": deadline_elapsed,
         "execution": "execution_not_run",
@@ -5056,6 +5073,7 @@ struct PoolObservationContext {
     trigger: Option<Arc<crate::components::trigger::TriggerComponent>>,
     iwim_veto_config: ghost_brain::config::IwimVetoGateConfig,
     gatekeeper_config: GatekeeperV2Config,
+    gatekeeper_v3_config: GatekeeperV3Config,
     cross_pool_velocity_config: CrossPoolVelocityConfig,
     funding_source_config: FundingSourceConfig,
     authoritative_funding_coverage_gate_enabled: bool,
@@ -8555,7 +8573,7 @@ async fn pool_observation_task(
                 enrich_buy_log_with_v3_shadow(
                     &mut buy_log,
                     &assessment,
-                    &ctx.gatekeeper_config,
+                    &ctx.gatekeeper_v3_config,
                     false,
                 );
                 enrich_buy_log_with_window(
@@ -8657,7 +8675,7 @@ async fn pool_observation_task(
                 enrich_buy_log_with_v3_shadow(
                     &mut buy_log,
                     &assessment,
-                    &ctx.gatekeeper_config,
+                    &ctx.gatekeeper_v3_config,
                     true,
                 );
                 enrich_buy_log_with_window(
@@ -8837,7 +8855,7 @@ async fn pool_observation_task(
                         enrich_buy_log_with_v3_shadow(
                             &mut buy_log,
                             &assessment,
-                            &ctx.gatekeeper_config,
+                            &ctx.gatekeeper_v3_config,
                             false,
                         );
                         enrich_buy_log_with_window(
@@ -9030,12 +9048,13 @@ async fn pool_observation_task(
                     format_gatekeeper_v2_config(&ctx.gatekeeper_config),
                 );
                 let gk_cfg = ctx.gatekeeper_config.clone();
+                let gk_v3_cfg = ctx.gatekeeper_v3_config.clone();
                 let mut buy_log = assessment.to_buy_log(&pool_id, &gk_cfg);
                 enrich_buy_log_with_observation_identity(&mut buy_log, &identity);
                 if let Some(ref ir) = iwim_veto_result {
                     enrich_buy_log_with_iwim(&mut buy_log, ir);
                 }
-                enrich_buy_log_with_v3_shadow(&mut buy_log, &assessment, &gk_cfg, false);
+                enrich_buy_log_with_v3_shadow(&mut buy_log, &assessment, &gk_v3_cfg, false);
                 enrich_buy_log_with_window(
                     &mut buy_log,
                     &window_state,
@@ -9210,6 +9229,7 @@ pub async fn start_oracle_runtime_task(
         post_buy_tx,
         analysis_window_ms,
         gatekeeper_config,
+        GatekeeperV3Config::default(),
         iwim_veto_config,
         if dry_run {
             ExecutionMode::Paper
@@ -9239,6 +9259,7 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
     post_buy_tx: Option<DirectPostBuySender>,
     analysis_window_ms: u64,
     gatekeeper_config: GatekeeperV2Config,
+    gatekeeper_v3_config: GatekeeperV3Config,
     iwim_veto_config: ghost_brain::config::IwimVetoGateConfig,
     execution_mode: ExecutionMode,
     dry_run: bool,
@@ -9455,6 +9476,7 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
         trigger: trigger.clone(),
         iwim_veto_config: iwim_veto_config.clone(),
         gatekeeper_config: gatekeeper_config.clone(),
+        gatekeeper_v3_config,
         cross_pool_velocity_config: CrossPoolVelocityConfig::from_gatekeeper_config(
             &gatekeeper_config,
         ),
@@ -10696,6 +10718,26 @@ mod tests {
         config
     }
 
+    fn review_test_gatekeeper_v3_config() -> GatekeeperV3Config {
+        let mut config = GatekeeperV3Config::default();
+        config.shadow_emit_enabled = true;
+        config.thresholds.min_tx_count = 2;
+        config.thresholds.min_unique_signers = 2;
+        config.thresholds.min_buy_count = 2;
+        config.thresholds.min_buy_ratio = 0.0;
+        config.thresholds.max_buy_ratio = 1.0;
+        config.thresholds.max_hhi = 1.0;
+        config.thresholds.hard_fail_hhi = 1.0;
+        config.thresholds.hard_fail_same_ms_tx_ratio = 1.0;
+        config.thresholds.hard_fail_top3_volume_pct = 1.0;
+        config.thresholds.max_tx_per_signer = 64;
+        config.thresholds.max_dev_volume_ratio = 1.0;
+        config.thresholds.reject_on_dev_sell = true;
+        config.thresholds.max_signer_cross_pool_velocity = 1.0;
+        config.thresholds.max_funding_source_concentration = 1.0;
+        config
+    }
+
     fn review_test_buffered_tx(
         pool_id: Pubkey,
         signature: &str,
@@ -11722,6 +11764,7 @@ mod tests {
             trigger,
             iwim_veto_config: ghost_brain::config::IwimVetoGateConfig::default(),
             gatekeeper_config: GatekeeperV2Config::default(),
+            gatekeeper_v3_config: GatekeeperV3Config::default(),
             cross_pool_velocity_config: CrossPoolVelocityConfig::from_gatekeeper_config(
                 &GatekeeperV2Config::default(),
             ),
@@ -12684,6 +12727,7 @@ mod tests {
             funding_source_config: FundingSourceConfig::from_gatekeeper_config(&gatekeeper_config),
             authoritative_funding_coverage_gate_enabled: false,
             gatekeeper_config,
+            gatekeeper_v3_config: GatekeeperV3Config::default(),
             fingerprint_config: EarlyFingerprintConfig::default(),
             event_emitter: None,
             health: None,
@@ -12796,6 +12840,7 @@ mod tests {
             funding_source_config: FundingSourceConfig::from_gatekeeper_config(&gatekeeper_config),
             authoritative_funding_coverage_gate_enabled: false,
             gatekeeper_config,
+            gatekeeper_v3_config: GatekeeperV3Config::default(),
             fingerprint_config: EarlyFingerprintConfig::default(),
             event_emitter: None,
             health: None,
@@ -20272,6 +20317,7 @@ mod tests {
     #[test]
     fn test_enrich_buy_log_with_v3_shadow_preserves_active_reject_fields() {
         let config = review_test_gatekeeper_config();
+        let v3_config = review_test_gatekeeper_v3_config();
         let pool_id = Pubkey::new_unique();
         let mut assessment = test_gatekeeper_buy_assessment(0);
         assessment.feature_snapshot = review_v3_buy_candidate_features();
@@ -20281,7 +20327,7 @@ mod tests {
         log.reason_code = Some(GatekeeperReasonCode::RejectCoreFail.as_log_str());
         log.reason_code_version = GatekeeperReasonCode::version();
 
-        enrich_buy_log_with_v3_shadow(&mut log, &assessment, &config, false);
+        enrich_buy_log_with_v3_shadow(&mut log, &assessment, &v3_config, false);
 
         assert_eq!(log.decision_verdict_buy, Some(false));
         assert_eq!(log.verdict_type.as_deref(), Some("REJECT_CORE_FAIL"));
@@ -20291,11 +20337,18 @@ mod tests {
             log.v3_shadow_reason_code.as_deref(),
             Some("BUY_V3_NORMAL_CONFIRMED_OPPORTUNITY")
         );
+        assert!(log.v3_policy_config_hash.is_some());
+        assert_eq!(log.v3_policy_version, Some(1));
+        assert_eq!(log.v3_materialization_version, Some(1));
+        assert!(log.v3_stage_thresholds.is_some());
+        assert!(log.v3_component_scores.is_some());
+        assert!(log.v3_actionability.is_some());
     }
 
     #[test]
     fn test_enrich_buy_log_with_v3_shadow_timeout_uses_deadline_context() {
         let config = review_test_gatekeeper_config();
+        let v3_config = review_test_gatekeeper_v3_config();
         let pool_id = Pubkey::new_unique();
         let mut assessment = test_gatekeeper_buy_assessment(0);
         assessment.feature_snapshot.evidence_status.tx_intel =
@@ -20306,7 +20359,7 @@ mod tests {
         log.reason_code = Some(GatekeeperReasonCode::TimeoutPhase1Insufficient.as_log_str());
         log.reason_code_version = GatekeeperReasonCode::version();
 
-        enrich_buy_log_with_v3_shadow(&mut log, &assessment, &config, true);
+        enrich_buy_log_with_v3_shadow(&mut log, &assessment, &v3_config, true);
 
         assert_eq!(log.decision_verdict_buy, None);
         assert_eq!(log.verdict_type.as_deref(), Some("TIMEOUT_PHASE1"));
@@ -20324,6 +20377,7 @@ mod tests {
     #[test]
     fn test_enrich_buy_log_with_v3_shadow_preserves_iwim_fields() {
         let config = review_test_gatekeeper_config();
+        let v3_config = review_test_gatekeeper_v3_config();
         let pool_id = Pubkey::new_unique();
         let mut assessment = test_gatekeeper_buy_assessment(6);
         assessment.feature_snapshot = review_v3_buy_candidate_features();
@@ -20336,7 +20390,7 @@ mod tests {
         log.iwim_status = Some("VETO".to_string());
         log.iwim_veto_reason = Some("LOW_CONFIDENCE".to_string());
 
-        enrich_buy_log_with_v3_shadow(&mut log, &assessment, &config, false);
+        enrich_buy_log_with_v3_shadow(&mut log, &assessment, &v3_config, false);
 
         assert_eq!(log.decision_verdict_buy, Some(false));
         assert_eq!(log.verdict_type.as_deref(), Some("REJECT_IWIM_VETO"));
@@ -20345,6 +20399,22 @@ mod tests {
         assert_eq!(log.iwim_status.as_deref(), Some("VETO"));
         assert_eq!(log.iwim_veto_reason.as_deref(), Some("LOW_CONFIDENCE"));
         assert_eq!(log.v3_shadow_verdict.as_deref(), Some("BUY_CANDIDATE"));
+    }
+
+    #[test]
+    fn test_enrich_buy_log_with_v3_shadow_respects_shadow_emit_flag() {
+        let active_config = review_test_gatekeeper_config();
+        let v3_config = GatekeeperV3Config::default();
+        let pool_id = Pubkey::new_unique();
+        let mut assessment = test_gatekeeper_buy_assessment(6);
+        assessment.feature_snapshot = review_v3_buy_candidate_features();
+        let mut log = assessment.to_buy_log(&pool_id, &active_config);
+
+        enrich_buy_log_with_v3_shadow(&mut log, &assessment, &v3_config, false);
+
+        assert!(log.v3_shadow_verdict.is_none());
+        assert!(log.v3_policy_config_hash.is_none());
+        assert!(log.v3_component_scores.is_none());
     }
 
     #[test]

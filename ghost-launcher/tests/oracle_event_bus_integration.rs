@@ -8,7 +8,7 @@
 //!
 //! This simulates the production flow without requiring actual blockchain connections.
 
-use ghost_brain::config::{GatekeeperV2Config, IwimVetoGateConfig};
+use ghost_brain::config::{GatekeeperV2Config, GatekeeperV3Config, IwimVetoGateConfig};
 use ghost_brain::oracle::hyper_prediction::HyperPredictionOracle;
 use ghost_brain::oracle::SnapshotEngine;
 use ghost_core::shadow_ledger::ShadowLedger;
@@ -218,6 +218,7 @@ async fn spawn_runtime_for_fsc_with_optional_signal(
                 None,
                 5_000,
                 gatekeeper_config,
+                GatekeeperV3Config::default(),
                 IwimVetoGateConfig::default(),
                 ExecutionMode::Paper,
                 true,

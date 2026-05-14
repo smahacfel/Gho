@@ -1,4 +1,4 @@
-use ghost_brain::config::GatekeeperV2Config;
+use ghost_brain::config::GatekeeperV3Config;
 use ghost_brain::oracle::reason_code::GatekeeperReasonCode;
 use ghost_core::checkpoint::{
     EvidenceStatus, EvidenceUnavailableReason, FeatureEvidenceStatus,
@@ -6,23 +6,25 @@ use ghost_core::checkpoint::{
     OrganicBroadeningFeatures,
 };
 use ghost_launcher::components::gatekeeper_v3::{
-    evaluate_v3_from_features, V3ShadowVerdict, V3_SHADOW_SCHEMA_VERSION,
+    evaluate_v3_from_features, v3_actionability_payload, v3_feature_snapshot_hash, V3ShadowVerdict,
+    V3_SHADOW_SCHEMA_VERSION,
 };
 
-fn test_config() -> GatekeeperV2Config {
-    let mut config = GatekeeperV2Config::default();
-    config.min_tx_count = 9;
-    config.min_unique_signers = 6;
-    config.min_buy_count = 5;
-    config.min_buy_ratio = 0.50;
-    config.max_buy_ratio = 0.95;
-    config.max_hhi = 0.25;
-    config.hard_fail_hhi = 0.10;
-    config.hard_fail_same_ms_tx_ratio = 0.60;
-    config.hard_fail_top3_volume_pct = 0.70;
-    config.max_tx_per_signer = 4;
-    config.max_dev_volume_ratio = 0.40;
-    config.reject_on_dev_sell = true;
+fn test_config() -> GatekeeperV3Config {
+    let mut config = GatekeeperV3Config::default();
+    config.shadow_emit_enabled = true;
+    config.thresholds.min_tx_count = 9;
+    config.thresholds.min_unique_signers = 6;
+    config.thresholds.min_buy_count = 5;
+    config.thresholds.min_buy_ratio = 0.50;
+    config.thresholds.max_buy_ratio = 0.95;
+    config.thresholds.max_hhi = 0.25;
+    config.thresholds.hard_fail_hhi = 0.10;
+    config.thresholds.hard_fail_same_ms_tx_ratio = 0.60;
+    config.thresholds.hard_fail_top3_volume_pct = 0.70;
+    config.thresholds.max_tx_per_signer = 4;
+    config.thresholds.max_dev_volume_ratio = 0.40;
+    config.thresholds.reject_on_dev_sell = true;
     config
 }
 
@@ -204,6 +206,20 @@ fn gatekeeper_v3_is_deterministic_for_same_snapshot() {
 }
 
 #[test]
+fn gatekeeper_v3_feature_snapshot_hash_is_stable_and_feature_sensitive() {
+    let features = strong_organic_features();
+    let mut changed = features.clone();
+    changed.tx_intel_features.tx_count += 1;
+
+    let first = v3_feature_snapshot_hash(&features);
+    let second = v3_feature_snapshot_hash(&features);
+    let changed_hash = v3_feature_snapshot_hash(&changed);
+
+    assert_eq!(first, second);
+    assert_ne!(first, changed_hash);
+}
+
+#[test]
 fn gatekeeper_v3_evaluator_only_needs_snapshot_config_and_deadline() {
     let features = MaterializedFeatureSet::default();
     let config = test_config();
@@ -215,4 +231,16 @@ fn gatekeeper_v3_evaluator_only_needs_snapshot_config_and_deadline() {
         decision.reason_code,
         GatekeeperReasonCode::PendingV3WaitEvidence
     );
+}
+
+#[test]
+fn gatekeeper_v3_actionability_is_local_to_v3_sidecar() {
+    let features = strong_organic_features();
+    let config = test_config();
+
+    let payload = v3_actionability_payload(&features, &config);
+
+    assert_eq!(payload["stages"]["evidence"], "actionable");
+    assert_eq!(payload["stages"]["opportunity"], "actionable");
+    assert_eq!(payload["groups"]["tx_intel"]["actionability"], "actionable");
 }

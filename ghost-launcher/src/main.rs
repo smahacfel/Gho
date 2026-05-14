@@ -1474,6 +1474,18 @@ async fn main() -> Result<()> {
         error!("CONFIG VALIDATION FAILED: {} — exiting with code 1", reason);
         std::process::exit(1);
     }
+    let gatekeeper_v3_config = ghost_brain_config
+        .as_ref()
+        .map(|cfg| cfg.gatekeeper_v3.clone())
+        .unwrap_or_default();
+    info!(
+        "🧪 Gatekeeper V3 sidecar config: enabled={} shadow_emit={} policy_version={} materialization_version={} hash={}",
+        gatekeeper_v3_config.enabled,
+        gatekeeper_v3_config.shadow_emit_enabled,
+        gatekeeper_v3_config.policy_version,
+        gatekeeper_v3_config.materialization_version,
+        gatekeeper_v3_config.v3_policy_config_hash(),
+    );
 
     // Link Ghost Brain decision thresholds into Launcher pipeline config
     if let Some(ref cfg) = ghost_brain_config {
@@ -2016,6 +2028,7 @@ async fn main() -> Result<()> {
             Some(post_buy_direct_tx),
             analysis_window_ms,
             gatekeeper_v2_config,
+            gatekeeper_v3_config,
             iwim_veto_config,
             config.execution.execution_mode,
             oracle_dry_run,

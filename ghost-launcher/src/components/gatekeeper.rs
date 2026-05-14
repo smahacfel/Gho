@@ -2275,6 +2275,13 @@ impl GatekeeperAssessment {
             v3_evidence_status: None,
             v3_organic_broadening: None,
             v3_manipulation_contradictions: None,
+            v3_policy_config_hash: None,
+            v3_feature_snapshot_hash: None,
+            v3_materialization_version: None,
+            v3_policy_version: None,
+            v3_stage_thresholds: None,
+            v3_component_scores: None,
+            v3_actionability: None,
             v3_shadow_notes: None,
             // IWIM veto gate fields – defaults; enriched later by oracle_runtime
             iwim_enabled: false,
