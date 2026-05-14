@@ -2,6 +2,7 @@
 
 pub mod e2e_config;
 pub mod fallback_config;
+pub mod gatekeeper_v3_config;
 pub mod gatekeeper_v25_config;
 pub mod ghost_brain_config;
 pub mod mci_config;
@@ -16,6 +17,11 @@ pub use e2e_config::*;
 
 // Re-export fallback configuration
 pub use fallback_config::{FallbackConfig, FallbackTracker, FallbackType};
+
+// Re-export Gatekeeper V3 shadow sidecar config types
+pub use gatekeeper_v3_config::{
+    GatekeeperV3Config, GatekeeperV3PromotionConfig, GatekeeperV3Thresholds,
+};
 
 // Re-export unified Ghost Brain config
 pub use ghost_brain_config::{

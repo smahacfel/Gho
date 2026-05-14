@@ -47,6 +47,7 @@ use crate::config::gatekeeper_v25_config::{
     AdaptiveProsperityConfig, DynamicObservationWindowConfig, GatekeeperV25RolloutConfig,
     PumpAndDumpDetectorConfig, TrajectoryAwareScoringConfig,
 };
+use crate::config::gatekeeper_v3_config::GatekeeperV3Config;
 use crate::config::mci_config::MciConfig;
 use crate::config::qedd_config::QeddConfig;
 use crate::guardian::post_buy::PostBuyGuardianConfig;
@@ -70,6 +71,10 @@ pub struct GhostBrainConfig {
     /// If present in TOML, overrides hardcoded defaults.
     #[serde(default)]
     pub gatekeeper_v2: Option<GatekeeperV2Config>,
+
+    /// Gatekeeper V3 calibrated shadow sidecar configuration.
+    #[serde(default)]
+    pub gatekeeper_v3: GatekeeperV3Config,
 
     /// MPCF (Micro-Payload Cognitive Fingerprint) configuration
     pub mpcf: MpcfConfig,
@@ -3826,6 +3831,7 @@ impl Default for GhostBrainConfig {
             engine: EngineConfig::default(),
             gatekeeper: GatekeeperConfig::default(),
             gatekeeper_v2: None,
+            gatekeeper_v3: GatekeeperV3Config::default(),
             mpcf: MpcfConfig::default(),
             ssmi: SsmiConfig::default(),
             iwim: IwimConfig::default(),
@@ -4306,6 +4312,7 @@ impl GhostBrainConfig {
         if let Some(ref gatekeeper_v2) = self.gatekeeper_v2 {
             gatekeeper_v2.validate()?;
         }
+        self.gatekeeper_v3.validate()?;
 
         // Validate QASS
         if self.qass.collapse_threshold < 0.0 || self.qass.collapse_threshold > 1.0 {
