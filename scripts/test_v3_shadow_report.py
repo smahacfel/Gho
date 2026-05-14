@@ -17,7 +17,7 @@ def v3_row(
     active_buy: bool | None = False,
     active_type: str = "REJECT_CORE_FAIL",
     v3_verdict: str = "PENDING",
-    reason: str = "V3_SHADOW_PENDING_INSUFFICIENT_EVIDENCE",
+    reason: str = "PENDING_V3_WAIT_EVIDENCE",
     confidence: float = 0.0,
     execution_outcome: str | None = None,
 ) -> dict:
@@ -31,8 +31,20 @@ def v3_row(
         "verdict_type": active_type,
         "v3_shadow_schema_version": 1,
         "v3_shadow_verdict": v3_verdict,
+        "v3_shadow_stage": "EVIDENCE",
         "v3_shadow_reason_code": reason,
         "v3_shadow_reason_chain": [reason],
+        "v3_shadow_secondary_reason_codes": [],
+        "v3_shadow_risk_status": "DEGRADED",
+        "v3_shadow_risk_penalty": 0.0,
+        "v3_shadow_opportunity_status": "DEGRADED",
+        "v3_shadow_opportunity_score": 0.0,
+        "v3_shadow_confidence_raw": confidence,
+        "v3_shadow_confidence_after_risk": confidence,
+        "v3_shadow_confidence_after_stage": confidence,
+        "v3_shadow_confidence_cap": confidence,
+        "v3_shadow_confidence_cap_reasons": ["insufficient_evidence"],
+        "v3_shadow_confidence_final": confidence,
         "v3_shadow_confidence": confidence,
         "v3_shadow_evidence_status": {
             "tx_intel": {"status": "clean"},
@@ -114,6 +126,10 @@ class V3ShadowReportTests(unittest.TestCase):
         report = v3_shadow_report.build_report_from_rows(rows)
 
         self.assertEqual(report["confidence_buckets"]["0_75_to_1_00"], 1)
+        self.assertEqual(report["v3_stages"]["EVIDENCE"], 1)
+        self.assertEqual(report["v3_risk_statuses"]["DEGRADED"], 1)
+        self.assertEqual(report["v3_opportunity_statuses"]["DEGRADED"], 1)
+        self.assertEqual(report["confidence_cap_reasons"]["insufficient_evidence"], 1)
         self.assertEqual(report["evidence_status_by_feature"]["tx_intel"]["clean"], 1)
         self.assertEqual(report["evidence_status_by_feature"]["tx_segments"]["unavailable"], 1)
         self.assertEqual(report["evidence_status_by_feature"]["curve"]["degraded"], 1)
@@ -137,6 +153,14 @@ class V3ShadowReportTests(unittest.TestCase):
         self.assertEqual(report["execution"]["success_count"], 0)
         self.assertEqual(report["execution"]["outcomes"]["no_dispatch_rejected"], 1)
         self.assertEqual(report["execution"]["outcomes"]["missing"], 1)
+
+    def test_submitted_execution_is_not_success(self) -> None:
+        rows = [v3_row(execution_outcome="submitted")]
+
+        report = v3_shadow_report.build_report_from_rows(rows)
+
+        self.assertEqual(report["execution"]["success_count"], 0)
+        self.assertEqual(report["execution"]["outcomes"]["submitted"], 1)
 
 
 if __name__ == "__main__":

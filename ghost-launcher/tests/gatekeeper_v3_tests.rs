@@ -44,14 +44,21 @@ fn unavailable_status(reason: EvidenceUnavailableReason) -> FeatureEvidenceStatu
 
 fn clean_materialized_evidence() -> MaterializedEvidenceStatus {
     MaterializedEvidenceStatus {
+        identity: clean_status(),
         account_state: clean_status(),
         tx_intel: clean_status(),
         tx_segments: clean_status(),
         checkpoints: clean_status(),
+        trajectory: clean_status(),
+        pdd_sequence: clean_status(),
         curve: clean_status(),
         sybil: clean_status(),
+        cpv: clean_status(),
+        fsc: clean_status(),
         alpha: clean_status(),
         manipulation: clean_status(),
+        organic_broadening: clean_status(),
+        manipulation_contradiction: clean_status(),
         execution: unavailable_status(EvidenceUnavailableReason::ExecutionNotRun),
     }
 }
@@ -90,6 +97,13 @@ fn strong_organic_features() -> MaterializedFeatureSet {
         buy_ratio_max: 0.75,
         max_segment_hhi: 0.08,
         min_segment_hhi: 0.03,
+        signer_growth_t2_t0: 2,
+        hhi_delta_t2_t0: -0.02,
+        tx_count_growth_vs_signer_growth: -0.08,
+        new_signer_ratio_t2: 0.50,
+        broadening_score: 0.72,
+        status: EvidenceStatus::Clean,
+        degraded_reasons: Vec::new(),
     };
     features.manipulation_contradictions = ManipulationContradictionFeatures {
         same_ms_tx_ratio: 0.05,
@@ -115,7 +129,10 @@ fn gatekeeper_v3_hard_risk_wins_over_organic_opportunity() {
 
     assert_eq!(decision.schema_version, V3_SHADOW_SCHEMA_VERSION);
     assert_eq!(decision.verdict, V3ShadowVerdict::Reject);
-    assert_eq!(decision.reason_code, GatekeeperReasonCode::V3HardRiskReject);
+    assert_eq!(
+        decision.reason_code,
+        GatekeeperReasonCode::RejectV3ManipulationContradiction
+    );
     assert_eq!(
         decision.reason_chain[0],
         GatekeeperReasonCode::V3ManipulationContradiction
@@ -133,7 +150,7 @@ fn gatekeeper_v3_missing_critical_evidence_produces_pending_not_buy() {
     assert_eq!(decision.verdict, V3ShadowVerdict::Pending);
     assert_eq!(
         decision.reason_code,
-        GatekeeperReasonCode::V3ShadowPendingInsufficientEvidence
+        GatekeeperReasonCode::PendingV3WaitEvidence
     );
     assert_eq!(
         decision.reason_chain[0],
@@ -153,7 +170,7 @@ fn gatekeeper_v3_deadline_elapsed_maps_insufficient_evidence_to_timeout() {
     assert_eq!(decision.verdict, V3ShadowVerdict::Timeout);
     assert_eq!(
         decision.reason_code,
-        GatekeeperReasonCode::V3ShadowTimeoutEvidence
+        GatekeeperReasonCode::TimeoutV3DegradedEvidence
     );
     assert_eq!(
         decision.reason_chain[0],
@@ -170,7 +187,7 @@ fn gatekeeper_v3_strong_organic_broadening_can_produce_buy_candidate() {
     assert_eq!(decision.verdict, V3ShadowVerdict::BuyCandidate);
     assert_eq!(
         decision.reason_code,
-        GatekeeperReasonCode::V3ShadowBuyCandidate
+        GatekeeperReasonCode::BuyV3NormalConfirmedOpportunity
     );
     assert!(decision.confidence > 0.0);
 }
@@ -196,6 +213,6 @@ fn gatekeeper_v3_evaluator_only_needs_snapshot_config_and_deadline() {
     assert_eq!(decision.verdict, V3ShadowVerdict::Pending);
     assert_eq!(
         decision.reason_code,
-        GatekeeperReasonCode::V3ShadowPendingInsufficientEvidence
+        GatekeeperReasonCode::PendingV3WaitEvidence
     );
 }

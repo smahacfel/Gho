@@ -1512,6 +1512,16 @@ fn session_materializes_v3_organic_broadening_from_segment_sequence() {
         features.evidence_status.tx_segments.status,
         EvidenceStatus::Clean
     );
+    assert_eq!(
+        features.evidence_status.pdd_sequence.status,
+        EvidenceStatus::Clean
+    );
+    assert_eq!(
+        features.evidence_status.organic_broadening.status,
+        EvidenceStatus::Clean
+    );
+    assert_eq!(features.organic_broadening.status, EvidenceStatus::Clean);
+    assert!(features.organic_broadening.broadening_score > 0.0);
 }
 
 #[test]
@@ -1531,6 +1541,18 @@ fn session_materializes_v3_missing_inputs_as_non_clean_evidence() {
     assert_eq!(
         features.evidence_status.tx_segments.unavailable_reasons,
         vec![EvidenceUnavailableReason::SegmentSequenceMissing]
+    );
+    assert_eq!(
+        features.evidence_status.pdd_sequence.unavailable_reasons,
+        vec![EvidenceUnavailableReason::PddSequenceMissing]
+    );
+    assert_eq!(
+        features.evidence_status.organic_broadening.status,
+        EvidenceStatus::Unavailable
+    );
+    assert_eq!(
+        features.evidence_status.execution.status,
+        EvidenceStatus::ShadowOnly
     );
     assert_eq!(
         features.evidence_status.alpha.status,

@@ -384,6 +384,7 @@ impl PoolObservationSession {
         let t0_unique = segment_signers.map_or(0, |counts| counts.0);
         let t1_unique = segment_signers.map_or(0, |counts| counts.1);
         let t2_unique = segment_signers.map_or(0, |counts| counts.2);
+        let t2_new_signers = segment_signers.map_or(0, |counts| counts.3);
         let buy_ratios = [
             sequence.t0_segment.buy_ratio,
             sequence.t1_segment.buy_ratio,
@@ -404,14 +405,23 @@ impl PoolObservationSession {
         features.t2_unique_signers = t2_unique;
         features.t1_vs_t0_unique_signer_delta = t1_unique as i64 - t0_unique as i64;
         features.t2_vs_t1_unique_signer_delta = t2_unique as i64 - t1_unique as i64;
+        features.signer_growth_t2_t0 = t2_unique as i64 - t0_unique as i64;
         features.tx_count_growth_ratio =
             growth_ratio(sequence.t2_segment.tx_count, sequence.t0_segment.tx_count);
         features.unique_signer_growth_ratio = growth_ratio(t2_unique, t0_unique);
+        features.tx_count_growth_vs_signer_growth =
+            features.tx_count_growth_ratio - features.unique_signer_growth_ratio;
         features.buy_ratio_mean = buy_ratios.iter().sum::<f64>() / buy_ratios.len() as f64;
         features.buy_ratio_min = buy_ratios.iter().copied().fold(f64::INFINITY, f64::min);
         features.buy_ratio_max = buy_ratios.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         features.max_segment_hhi = hhis.iter().copied().fold(0.0_f64, f64::max);
         features.min_segment_hhi = hhis.iter().copied().fold(f64::INFINITY, f64::min);
+        features.hhi_delta_t2_t0 = sequence.t2_segment.hhi - sequence.t0_segment.hhi;
+        features.new_signer_ratio_t2 = if t2_unique == 0 {
+            0.0
+        } else {
+            t2_new_signers as f64 / t2_unique as f64
+        };
 
         if !features.buy_ratio_min.is_finite() {
             features.buy_ratio_min = 0.0;
@@ -422,6 +432,20 @@ impl PoolObservationSession {
         if !features.min_segment_hhi.is_finite() {
             features.min_segment_hhi = 0.0;
         }
+        features.broadening_score = v3_broadening_score(&features);
+        features.status = if !sequence.min_tx_per_segment_satisfied {
+            features
+                .degraded_reasons
+                .push(EvidenceDegradedReason::SegmentSequencePartial);
+            EvidenceStatus::InsufficientSample
+        } else if segment_signers.is_none() {
+            features
+                .degraded_reasons
+                .push(EvidenceDegradedReason::SegmentSignerCoveragePartial);
+            EvidenceStatus::Degraded
+        } else {
+            EvidenceStatus::Clean
+        };
 
         features
     }
@@ -429,7 +453,7 @@ impl PoolObservationSession {
     fn materialize_v3_segment_unique_signers(
         &self,
         sequence: &TxSegmentSequence,
-    ) -> Option<(u64, u64, u64)> {
+    ) -> Option<(u64, u64, u64, u64)> {
         if self.tx_buffer.is_empty() || sequence.total_duration_ms == 0 {
             return None;
         }
@@ -452,7 +476,12 @@ impl PoolObservationSession {
             }
         }
 
-        Some((t0.len() as u64, t1.len() as u64, t2.len() as u64))
+        let t2_new = t2
+            .iter()
+            .filter(|signer| !t0.contains(*signer) && !t1.contains(*signer))
+            .count() as u64;
+
+        Some((t0.len() as u64, t1.len() as u64, t2.len() as u64, t2_new))
     }
 
     fn materialize_v3_manipulation_contradictions(
@@ -461,6 +490,72 @@ impl PoolObservationSession {
     ) -> ManipulationContradictionFeatures {
         let tx = &materialized.tx_intel_features;
         let sybil = &materialized.sybil_resistance;
+        let organic = &materialized.organic_broadening;
+        let alpha = &materialized.alpha_fingerprint;
+
+        let momentum_without_broadening = organic.sequence_available
+            && organic.tx_count_growth_ratio > 0.0
+            && organic.unique_signer_growth_ratio <= 0.0;
+        let volume_spike_without_new_signers = materialized
+            .tx_segment_sequence
+            .as_ref()
+            .is_some_and(|sequence| {
+                sequence.t2_segment.total_volume_sol
+                    > sequence.t0_segment.total_volume_sol.max(0.000_001) * 1.5
+                    && organic.new_signer_ratio_t2 <= 0.10
+            });
+        let high_buy_pressure_with_high_top3 = tx.buy_ratio >= 0.80 && tx.top3_volume_pct >= 0.50;
+        let fixed_size_or_ramping_pattern = alpha
+            .fixed_size_buy_ratio
+            .is_some_and(|ratio| ratio >= 0.50)
+            || materialized
+                .tx_segment_sequence
+                .as_ref()
+                .is_some_and(|sequence| {
+                    sequence.t2_segment.same_size_streak >= 3
+                        || (sequence.t2_segment.tx_count > sequence.t1_segment.tx_count
+                            && sequence.t1_segment.tx_count > sequence.t0_segment.tx_count)
+                });
+        let timing_bundle_concentration =
+            tx.same_ms_tx_ratio >= 0.20 || tx.bundle_suspicion_ratio >= 0.20;
+        let early_top3_concentration = alpha
+            .early_top3_buy_volume_pct_3s
+            .is_some_and(|pct| pct >= 0.50);
+
+        let mut reasons = Vec::new();
+        for (flag, reason) in [
+            (momentum_without_broadening, "momentum_without_broadening"),
+            (
+                volume_spike_without_new_signers,
+                "volume_spike_without_new_signers",
+            ),
+            (
+                high_buy_pressure_with_high_top3,
+                "high_buy_pressure_with_high_top3",
+            ),
+            (
+                fixed_size_or_ramping_pattern,
+                "fixed_size_or_ramping_pattern",
+            ),
+            (timing_bundle_concentration, "timing_bundle_concentration"),
+            (early_top3_concentration, "early_top3_concentration"),
+        ] {
+            if flag {
+                reasons.push(reason.to_string());
+            }
+        }
+        let contradiction_score = reasons.len() as f64 / 6.0;
+        let status = if tx.tx_count == 0 {
+            EvidenceStatus::Unavailable
+        } else if organic.status != EvidenceStatus::Clean
+            || !sybil.degraded_reasons.is_empty()
+            || alpha.fixed_size_buy_ratio.is_none()
+            || alpha.early_top3_buy_volume_pct_3s.is_none()
+        {
+            EvidenceStatus::Degraded
+        } else {
+            EvidenceStatus::Clean
+        };
 
         ManipulationContradictionFeatures {
             same_ms_tx_ratio: tx.same_ms_tx_ratio,
@@ -475,6 +570,15 @@ impl PoolObservationSession {
             signer_cross_pool_velocity: sybil.signer_cross_pool_velocity,
             funding_source_concentration: sybil.funding_source_concentration,
             sybil_evidence_degraded: !sybil.degraded_reasons.is_empty(),
+            momentum_without_broadening,
+            volume_spike_without_new_signers,
+            high_buy_pressure_with_high_top3,
+            fixed_size_or_ramping_pattern,
+            timing_bundle_concentration,
+            early_top3_concentration,
+            contradiction_score,
+            status,
+            reasons,
             ..ManipulationContradictionFeatures::default()
         }
     }
@@ -483,10 +587,18 @@ impl PoolObservationSession {
         &self,
         materialized: &MaterializedFeatureSet,
     ) -> MaterializedEvidenceStatus {
+        let identity = if materialized.session_metadata.is_dev_known
+            || materialized.tx_intel_features.dev_wallet_known
+            || materialized.tx_intel_features.dev_tx_count > 0
+        {
+            evidence_clean()
+        } else {
+            evidence_fallback(vec![EvidenceDegradedReason::IdentityEvidenceFallback])
+        };
         let account_state = if materialized.account_features.update_count > 0 {
             evidence_clean()
         } else {
-            evidence_degraded(vec![EvidenceDegradedReason::AccountStateFallback])
+            evidence_fallback(vec![EvidenceDegradedReason::AccountStateFallback])
         };
         let tx_intel = if materialized.tx_intel_features.tx_count > 0 {
             evidence_clean()
@@ -496,17 +608,27 @@ impl PoolObservationSession {
         let tx_segments = match materialized.tx_segment_sequence.as_ref() {
             None => evidence_unavailable(vec![EvidenceUnavailableReason::SegmentSequenceMissing]),
             Some(sequence) if !sequence.min_tx_per_segment_satisfied => {
-                evidence_degraded(vec![EvidenceDegradedReason::SegmentSequencePartial])
+                evidence_insufficient_sample(vec![EvidenceDegradedReason::SegmentSequencePartial])
             }
             Some(_) if self.tx_buffer.is_empty() => {
                 evidence_degraded(vec![EvidenceDegradedReason::SegmentSignerCoveragePartial])
             }
             Some(_) => evidence_clean(),
         };
-        let checkpoints = match materialized.checkpoint_features.trajectory_checkpoint_count {
-            0 => evidence_unavailable(vec![EvidenceUnavailableReason::CheckpointHistoryMissing]),
-            1 => evidence_degraded(vec![EvidenceDegradedReason::CheckpointHistorySparse]),
+        let trajectory = match materialized.checkpoint_features.trajectory_checkpoint_count {
+            0 => evidence_unavailable(vec![EvidenceUnavailableReason::TrajectoryMissing]),
+            1 => {
+                evidence_insufficient_sample(vec![EvidenceDegradedReason::TrajectoryEvidenceSparse])
+            }
             _ => evidence_clean(),
+        };
+        let checkpoints = trajectory.clone();
+        let pdd_sequence = match materialized.tx_segment_sequence.as_ref() {
+            None => evidence_unavailable(vec![EvidenceUnavailableReason::PddSequenceMissing]),
+            Some(sequence) if !sequence.min_tx_per_segment_satisfied => {
+                evidence_insufficient_sample(vec![EvidenceDegradedReason::PddSequencePartial])
+            }
+            Some(_) => evidence_clean(),
         };
         let curve = if materialized.curve_readiness.curve_data_known {
             evidence_clean()
@@ -540,46 +662,120 @@ impl PoolObservationSession {
                 .sybil_resistance
                 .funding_source_concentration
                 .is_some();
+        let sybil_available_count = [
+            materialized
+                .sybil_resistance
+                .fee_topology_diversity_index
+                .is_some(),
+            materialized
+                .sybil_resistance
+                .dev_buyer_infrastructure_affinity
+                .is_some(),
+            materialized
+                .sybil_resistance
+                .spend_fraction_divergence
+                .is_some(),
+            materialized
+                .sybil_resistance
+                .demand_elasticity_score
+                .is_some(),
+            materialized
+                .sybil_resistance
+                .signer_cross_pool_velocity
+                .is_some(),
+            materialized
+                .sybil_resistance
+                .funding_source_concentration
+                .is_some(),
+        ]
+        .into_iter()
+        .filter(|available| *available)
+        .count();
         let sybil = if !materialized.sybil_resistance.degraded_reasons.is_empty() {
+            evidence_degraded(vec![EvidenceDegradedReason::SybilEvidencePartial])
+        } else if sybil_available_count > 0 && sybil_available_count < 6 {
             evidence_degraded(vec![EvidenceDegradedReason::SybilEvidencePartial])
         } else if sybil_metric_available {
             evidence_clean()
         } else {
             evidence_unavailable(vec![EvidenceUnavailableReason::SybilMetricsMissing])
         };
-
-        let alpha_available = materialized
-            .alpha_fingerprint
-            .avg_inner_ix_count_50tx
+        let cpv = if materialized
+            .sybil_resistance
+            .signer_cross_pool_velocity
             .is_some()
-            || materialized.alpha_fingerprint.sell_buy_ratio.is_some()
+        {
+            evidence_clean()
+        } else if materialized
+            .sybil_resistance
+            .degraded_reasons
+            .iter()
+            .any(|reason| reason.starts_with("CPV_"))
+        {
+            evidence_degraded(vec![EvidenceDegradedReason::CpvEvidencePartial])
+        } else {
+            evidence_unavailable(vec![EvidenceUnavailableReason::CpvMetricsMissing])
+        };
+        let fsc = if materialized
+            .sybil_resistance
+            .funding_source_concentration
+            .is_some()
+        {
+            evidence_clean()
+        } else if materialized
+            .sybil_resistance
+            .funding_source_diagnostics
+            .is_some()
             || materialized
+                .sybil_resistance
+                .degraded_reasons
+                .iter()
+                .any(|reason| reason.starts_with("FSC_"))
+        {
+            evidence_degraded(vec![EvidenceDegradedReason::FscEvidencePartial])
+        } else {
+            evidence_unavailable(vec![EvidenceUnavailableReason::FscMetricsMissing])
+        };
+
+        let alpha_available_count = [
+            materialized
+                .alpha_fingerprint
+                .avg_inner_ix_count_50tx
+                .is_some(),
+            materialized.alpha_fingerprint.sell_buy_ratio.is_some(),
+            materialized
                 .alpha_fingerprint
                 .compute_unit_cluster_dominance
-                .is_some()
-            || materialized
+                .is_some(),
+            materialized
                 .alpha_fingerprint
                 .static_fee_profile_ratio
-                .is_some()
-            || materialized.alpha_fingerprint.jito_tip_intensity.is_some()
-            || materialized
+                .is_some(),
+            materialized.alpha_fingerprint.jito_tip_intensity.is_some(),
+            materialized
                 .alpha_fingerprint
                 .early_slot_volume_dominance_buy
-                .is_some()
-            || materialized
+                .is_some(),
+            materialized
                 .alpha_fingerprint
                 .early_top3_buy_volume_pct_3s
-                .is_some()
-            || materialized
+                .is_some(),
+            materialized
                 .alpha_fingerprint
                 .fixed_size_buy_ratio
-                .is_some()
-            || materialized
+                .is_some(),
+            materialized
                 .alpha_fingerprint
                 .flipper_presence_ratio
-                .is_some();
-        let alpha = if alpha_available {
+                .is_some(),
+        ]
+        .into_iter()
+        .filter(|available| *available)
+        .count();
+        let alpha = if alpha_available_count == 9 {
             evidence_clean()
+        } else if alpha_available_count > 0 {
+            evidence_degraded(vec![EvidenceDegradedReason::AlphaEvidencePartial])
         } else {
             evidence_unavailable(vec![EvidenceUnavailableReason::AlphaFingerprintMissing])
         };
@@ -589,18 +785,44 @@ impl PoolObservationSession {
         } else {
             evidence_unavailable(vec![EvidenceUnavailableReason::TxIntelMissing])
         };
+        let organic_broadening = match materialized.organic_broadening.status {
+            EvidenceStatus::Clean => evidence_clean(),
+            EvidenceStatus::InsufficientSample => evidence_insufficient_sample(
+                materialized.organic_broadening.degraded_reasons.clone(),
+            ),
+            EvidenceStatus::Unavailable => {
+                evidence_unavailable(vec![EvidenceUnavailableReason::OrganicBroadeningMissing])
+            }
+            _ => evidence_degraded(materialized.organic_broadening.degraded_reasons.clone()),
+        };
+        let manipulation_contradiction = match materialized.manipulation_contradictions.status {
+            EvidenceStatus::Clean => evidence_clean(),
+            EvidenceStatus::Unavailable => evidence_unavailable(vec![
+                EvidenceUnavailableReason::ManipulationContradictionMissing,
+            ]),
+            _ => evidence_degraded(vec![
+                EvidenceDegradedReason::ManipulationContradictionPartial,
+            ]),
+        };
 
         MaterializedEvidenceStatus {
+            identity,
             account_state,
             tx_intel,
             tx_segments,
             checkpoints,
+            trajectory,
+            pdd_sequence,
             curve,
             sybil,
+            cpv,
+            fsc,
             alpha,
             manipulation,
+            organic_broadening,
+            manipulation_contradiction,
             execution: FeatureEvidenceStatus {
-                status: EvidenceStatus::Unavailable,
+                status: EvidenceStatus::ShadowOnly,
                 degraded_reasons: Vec::new(),
                 unavailable_reasons: vec![EvidenceUnavailableReason::ExecutionNotRun],
             },
@@ -997,6 +1219,22 @@ fn evidence_degraded(reasons: Vec<EvidenceDegradedReason>) -> FeatureEvidenceSta
     }
 }
 
+fn evidence_insufficient_sample(reasons: Vec<EvidenceDegradedReason>) -> FeatureEvidenceStatus {
+    FeatureEvidenceStatus {
+        status: EvidenceStatus::InsufficientSample,
+        degraded_reasons: reasons,
+        unavailable_reasons: Vec::new(),
+    }
+}
+
+fn evidence_fallback(reasons: Vec<EvidenceDegradedReason>) -> FeatureEvidenceStatus {
+    FeatureEvidenceStatus {
+        status: EvidenceStatus::Fallback,
+        degraded_reasons: reasons,
+        unavailable_reasons: Vec::new(),
+    }
+}
+
 fn evidence_unavailable(reasons: Vec<EvidenceUnavailableReason>) -> FeatureEvidenceStatus {
     FeatureEvidenceStatus {
         status: EvidenceStatus::Unavailable,
@@ -1010,4 +1248,18 @@ fn growth_ratio(later: u64, earlier: u64) -> f64 {
         return 0.0;
     }
     (later as f64 - earlier as f64) / earlier as f64
+}
+
+fn v3_broadening_score(features: &OrganicBroadeningFeatures) -> f64 {
+    if !features.sequence_available {
+        return 0.0;
+    }
+
+    let signer_growth = features.unique_signer_growth_ratio.max(0.0).min(1.0);
+    let tx_growth = features.tx_count_growth_ratio.max(0.0).min(1.0);
+    let new_signers = features.new_signer_ratio_t2.clamp(0.0, 1.0);
+    let hhi_score = (1.0 - features.max_segment_hhi).clamp(0.0, 1.0);
+
+    (0.30 * signer_growth + 0.25 * tx_growth + 0.25 * new_signers + 0.20 * hhi_score)
+        .clamp(0.0, 1.0)
 }

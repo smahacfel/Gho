@@ -18,7 +18,7 @@ DEFAULT_CONFIG = REPO_ROOT / "configs" / "rollout" / "shadow-burnin.toml"
 DECISIONS_LOG_NAME = "gatekeeper_v2_decisions.jsonl"
 PREFERRED_PLANE = "v25_shadow"
 FALLBACK_PLANE = "legacy_live"
-EXECUTION_SUCCESS_STATUSES = {"submitted", "confirmed", "landed", "success", "executed"}
+EXECUTION_SUCCESS_STATUSES = {"confirmed", "landed", "success", "executed"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -277,7 +277,11 @@ def build_report_from_rows(rows: list[dict[str, Any]], bad_rows: int = 0) -> dic
 
     active_vs_v3: dict[str, Counter[str]] = defaultdict(Counter)
     reason_codes = Counter()
+    stages = Counter()
+    risk_statuses = Counter()
+    opportunity_statuses = Counter()
     confidence_buckets = Counter()
+    confidence_cap_reasons = Counter()
     manipulation = Counter()
     organic = Counter()
     evidence_by_feature: dict[str, Counter[str]] = defaultdict(Counter)
@@ -290,7 +294,12 @@ def build_report_from_rows(rows: list[dict[str, Any]], bad_rows: int = 0) -> dic
         v3_verdict = str(row.get("v3_shadow_verdict") or "missing")
         active_vs_v3[active][v3_verdict] += 1
         reason_codes[str(row.get("v3_shadow_reason_code") or "missing")] += 1
+        stages[str(row.get("v3_shadow_stage") or "missing")] += 1
+        risk_statuses[str(row.get("v3_shadow_risk_status") or "missing")] += 1
+        opportunity_statuses[str(row.get("v3_shadow_opportunity_status") or "missing")] += 1
         confidence_buckets[confidence_bucket(row.get("v3_shadow_confidence"))] += 1
+        for reason in row.get("v3_shadow_confidence_cap_reasons", []) or []:
+            confidence_cap_reasons[str(reason)] += 1
         manipulation[manipulation_bucket(row.get("v3_shadow_manipulation_contradictions"))] += 1
         organic[organic_bucket(row.get("v3_shadow_organic_broadening"))] += 1
         feature_counts, reason_counts = evidence_summary(row.get("v3_shadow_evidence_status"))
@@ -313,7 +322,11 @@ def build_report_from_rows(rows: list[dict[str, Any]], bad_rows: int = 0) -> dic
         },
         "active_vs_v3_verdict": counters_to_dict(active_vs_v3),
         "v3_reason_codes": dict(sorted(reason_codes.items())),
+        "v3_stages": dict(sorted(stages.items())),
+        "v3_risk_statuses": dict(sorted(risk_statuses.items())),
+        "v3_opportunity_statuses": dict(sorted(opportunity_statuses.items())),
         "confidence_buckets": dict(sorted(confidence_buckets.items())),
+        "confidence_cap_reasons": dict(sorted(confidence_cap_reasons.items())),
         "evidence_status_by_feature": counters_to_dict(evidence_by_feature),
         "missing_degraded_evidence": dict(sorted(missing_degraded.items())),
         "manipulation_contradictions": dict(sorted(manipulation.items())),
@@ -321,7 +334,7 @@ def build_report_from_rows(rows: list[dict[str, Any]], bad_rows: int = 0) -> dic
         "execution": {
             "outcomes": dict(sorted(execution_outcomes.items())),
             "success_count": execution_success_count,
-            "note": "no_dispatch/no_execution/missing are not success",
+            "note": "submitted/no_dispatch/no_execution/missing are not success",
         },
     }
 
@@ -353,7 +366,11 @@ def print_text(report: dict[str, Any]) -> None:
     for active, breakdown in report["active_vs_v3_verdict"].items():
         print(f"  {active}: {breakdown}")
     print(f"V3 reason codes: {report['v3_reason_codes']}")
+    print(f"V3 stages: {report['v3_stages']}")
+    print(f"V3 risk statuses: {report['v3_risk_statuses']}")
+    print(f"V3 opportunity statuses: {report['v3_opportunity_statuses']}")
     print(f"Confidence buckets: {report['confidence_buckets']}")
+    print(f"Confidence cap reasons: {report['confidence_cap_reasons']}")
     print(f"Evidence by feature: {report['evidence_status_by_feature']}")
     print(f"Missing/degraded evidence: {report['missing_degraded_evidence']}")
     print(f"Manipulation contradictions: {report['manipulation_contradictions']}")

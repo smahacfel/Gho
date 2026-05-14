@@ -1685,7 +1685,10 @@ impl GatekeeperAssessment {
     /// Convert assessment to a buy log record with config thresholds
     fn derive_reason_code(&self) -> Option<GatekeeperReasonCode> {
         if self.decision.is_some() {
-            return self.decision.as_ref().and_then(|decision| decision.reason_code);
+            return self
+                .decision
+                .as_ref()
+                .and_then(|decision| decision.reason_code);
         }
 
         self.terminal_reason_code
@@ -2250,12 +2253,28 @@ impl GatekeeperAssessment {
             ),
             v3_shadow_schema_version: None,
             v3_shadow_verdict: None,
+            v3_shadow_stage: None,
             v3_shadow_reason_code: None,
             v3_shadow_reason_chain: None,
+            v3_shadow_secondary_reason_codes: None,
+            v3_shadow_risk_status: None,
+            v3_shadow_risk_primary_reason: None,
+            v3_shadow_risk_penalty: None,
+            v3_shadow_opportunity_status: None,
+            v3_shadow_opportunity_score: None,
+            v3_shadow_confidence_raw: None,
+            v3_shadow_confidence_after_risk: None,
+            v3_shadow_confidence_after_stage: None,
+            v3_shadow_confidence_cap: None,
+            v3_shadow_confidence_cap_reasons: None,
+            v3_shadow_confidence_final: None,
             v3_shadow_confidence: None,
             v3_shadow_evidence_status: None,
             v3_shadow_organic_broadening: None,
             v3_shadow_manipulation_contradictions: None,
+            v3_evidence_status: None,
+            v3_organic_broadening: None,
+            v3_manipulation_contradictions: None,
             v3_shadow_notes: None,
             // IWIM veto gate fields – defaults; enriched later by oracle_runtime
             iwim_enabled: false,
@@ -2543,7 +2562,8 @@ impl GatekeeperAssessment {
                 }
             }),
             reason_code: if self.decision.is_some() {
-                self.derive_reason_code().map(GatekeeperReasonCode::as_log_str)
+                self.derive_reason_code()
+                    .map(GatekeeperReasonCode::as_log_str)
             } else {
                 self.terminal_reason_code
                     .map(GatekeeperReasonCode::as_log_str)
@@ -4765,7 +4785,9 @@ impl GatekeeperBuffer {
         // ═══════════════════════════════════════
         // FINAL VERDICT
         // ═══════════════════════════════════════
-        let (verdict_buy, verdict_type, reason_chain, reason_code) = if let Some(ref hf) = hard_fail_reason {
+        let (verdict_buy, verdict_type, reason_chain, reason_code) = if let Some(ref hf) =
+            hard_fail_reason
+        {
             (
                 false,
                 GatekeeperVerdictType::RejectHardFail,
@@ -4935,9 +4957,7 @@ impl GatekeeperBuffer {
                         ),
                         match assessment.observation_stage {
                             Some(ObservationStage::Early) => GatekeeperReasonCode::BuyEarly,
-                            Some(ObservationStage::Extended) => {
-                                GatekeeperReasonCode::BuyExtended
-                            }
+                            Some(ObservationStage::Extended) => GatekeeperReasonCode::BuyExtended,
                             _ => GatekeeperReasonCode::BuyNormal,
                         },
                     )

@@ -607,7 +607,8 @@ pub struct GatekeeperBuyLog {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason_code: Option<String>,
 
-    /// Reason code taxonomy version (3 = V3 P0 shadow/evidence codes).
+    /// Active reason code taxonomy version (2 = V2.5 active verdict contract).
+    /// V3 P0 sidecar codes are versioned by `v3_shadow_schema_version`.
     #[serde(default)]
     pub reason_code_version: u32,
 
@@ -667,9 +668,35 @@ pub struct GatekeeperBuyLog {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub v3_shadow_verdict: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v3_shadow_stage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub v3_shadow_reason_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub v3_shadow_reason_chain: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v3_shadow_secondary_reason_codes: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v3_shadow_risk_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v3_shadow_risk_primary_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v3_shadow_risk_penalty: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v3_shadow_opportunity_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v3_shadow_opportunity_score: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v3_shadow_confidence_raw: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v3_shadow_confidence_after_risk: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v3_shadow_confidence_after_stage: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v3_shadow_confidence_cap: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v3_shadow_confidence_cap_reasons: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v3_shadow_confidence_final: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub v3_shadow_confidence: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -678,6 +705,12 @@ pub struct GatekeeperBuyLog {
     pub v3_shadow_organic_broadening: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub v3_shadow_manipulation_contradictions: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v3_evidence_status: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v3_organic_broadening: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v3_manipulation_contradictions: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub v3_shadow_notes: Option<serde_json::Value>,
 
@@ -2590,12 +2623,28 @@ mod tests {
             v25_promotion_state: Some("shadow_only".to_string()),
             v3_shadow_schema_version: None,
             v3_shadow_verdict: None,
+            v3_shadow_stage: None,
             v3_shadow_reason_code: None,
             v3_shadow_reason_chain: None,
+            v3_shadow_secondary_reason_codes: None,
+            v3_shadow_risk_status: None,
+            v3_shadow_risk_primary_reason: None,
+            v3_shadow_risk_penalty: None,
+            v3_shadow_opportunity_status: None,
+            v3_shadow_opportunity_score: None,
+            v3_shadow_confidence_raw: None,
+            v3_shadow_confidence_after_risk: None,
+            v3_shadow_confidence_after_stage: None,
+            v3_shadow_confidence_cap: None,
+            v3_shadow_confidence_cap_reasons: None,
+            v3_shadow_confidence_final: None,
             v3_shadow_confidence: None,
             v3_shadow_evidence_status: None,
             v3_shadow_organic_broadening: None,
             v3_shadow_manipulation_contradictions: None,
+            v3_evidence_status: None,
+            v3_organic_broadening: None,
+            v3_manipulation_contradictions: None,
             v3_shadow_notes: None,
             alpha_gate_enabled: false,
             alpha_pass: None,
@@ -3021,12 +3070,28 @@ mod tests {
             v25_promotion_state: Some("shadow_only".to_string()),
             v3_shadow_schema_version: None,
             v3_shadow_verdict: None,
+            v3_shadow_stage: None,
             v3_shadow_reason_code: None,
             v3_shadow_reason_chain: None,
+            v3_shadow_secondary_reason_codes: None,
+            v3_shadow_risk_status: None,
+            v3_shadow_risk_primary_reason: None,
+            v3_shadow_risk_penalty: None,
+            v3_shadow_opportunity_status: None,
+            v3_shadow_opportunity_score: None,
+            v3_shadow_confidence_raw: None,
+            v3_shadow_confidence_after_risk: None,
+            v3_shadow_confidence_after_stage: None,
+            v3_shadow_confidence_cap: None,
+            v3_shadow_confidence_cap_reasons: None,
+            v3_shadow_confidence_final: None,
             v3_shadow_confidence: None,
             v3_shadow_evidence_status: None,
             v3_shadow_organic_broadening: None,
             v3_shadow_manipulation_contradictions: None,
+            v3_evidence_status: None,
+            v3_organic_broadening: None,
+            v3_manipulation_contradictions: None,
             v3_shadow_notes: None,
             alpha_gate_enabled: false,
             alpha_pass: None,
@@ -3227,12 +3292,28 @@ mod tests {
         assert_eq!(parsed.log_schema_version, 19);
         assert!(parsed.v3_shadow_schema_version.is_none());
         assert!(parsed.v3_shadow_verdict.is_none());
+        assert!(parsed.v3_shadow_stage.is_none());
         assert!(parsed.v3_shadow_reason_code.is_none());
         assert!(parsed.v3_shadow_reason_chain.is_none());
+        assert!(parsed.v3_shadow_secondary_reason_codes.is_none());
+        assert!(parsed.v3_shadow_risk_status.is_none());
+        assert!(parsed.v3_shadow_risk_primary_reason.is_none());
+        assert!(parsed.v3_shadow_risk_penalty.is_none());
+        assert!(parsed.v3_shadow_opportunity_status.is_none());
+        assert!(parsed.v3_shadow_opportunity_score.is_none());
+        assert!(parsed.v3_shadow_confidence_raw.is_none());
+        assert!(parsed.v3_shadow_confidence_after_risk.is_none());
+        assert!(parsed.v3_shadow_confidence_after_stage.is_none());
+        assert!(parsed.v3_shadow_confidence_cap.is_none());
+        assert!(parsed.v3_shadow_confidence_cap_reasons.is_none());
+        assert!(parsed.v3_shadow_confidence_final.is_none());
         assert!(parsed.v3_shadow_confidence.is_none());
         assert!(parsed.v3_shadow_evidence_status.is_none());
         assert!(parsed.v3_shadow_organic_broadening.is_none());
         assert!(parsed.v3_shadow_manipulation_contradictions.is_none());
+        assert!(parsed.v3_evidence_status.is_none());
+        assert!(parsed.v3_organic_broadening.is_none());
+        assert!(parsed.v3_manipulation_contradictions.is_none());
         assert!(parsed.v3_shadow_notes.is_none());
     }
 
@@ -3247,12 +3328,26 @@ mod tests {
         log.reason_code_version = GatekeeperReasonCode::version();
         log.v3_shadow_schema_version = Some(1);
         log.v3_shadow_verdict = Some("PENDING".to_string());
-        log.v3_shadow_reason_code =
-            Some(GatekeeperReasonCode::V3ShadowPendingInsufficientEvidence.as_log_str());
+        log.v3_shadow_stage = Some("EVIDENCE".to_string());
+        log.v3_shadow_reason_code = Some(GatekeeperReasonCode::PendingV3WaitEvidence.as_log_str());
         log.v3_shadow_reason_chain = Some(vec![
             GatekeeperReasonCode::V3EvidenceDegraded.as_log_str(),
-            GatekeeperReasonCode::V3ShadowPendingInsufficientEvidence.as_log_str(),
+            GatekeeperReasonCode::PendingV3WaitEvidence.as_log_str(),
         ]);
+        log.v3_shadow_secondary_reason_codes = Some(vec![
+            GatekeeperReasonCode::PendingV3WaitEvidence.as_log_str(),
+        ]);
+        log.v3_shadow_risk_status = Some("DEGRADED".to_string());
+        log.v3_shadow_risk_primary_reason = None;
+        log.v3_shadow_risk_penalty = Some(0.0);
+        log.v3_shadow_opportunity_status = Some("DEGRADED".to_string());
+        log.v3_shadow_opportunity_score = Some(0.0);
+        log.v3_shadow_confidence_raw = Some(0.0);
+        log.v3_shadow_confidence_after_risk = Some(0.0);
+        log.v3_shadow_confidence_after_stage = Some(0.0);
+        log.v3_shadow_confidence_cap = Some(0.0);
+        log.v3_shadow_confidence_cap_reasons = Some(vec!["insufficient_evidence".to_string()]);
+        log.v3_shadow_confidence_final = Some(0.0);
         log.v3_shadow_confidence = Some(0.0);
         log.v3_shadow_evidence_status = Some(serde_json::json!({
             "tx_intel": { "status": "DEGRADED", "reasons": ["SEGMENT_SEQUENCE_PARTIAL"] }
@@ -3263,6 +3358,9 @@ mod tests {
         log.v3_shadow_manipulation_contradictions = Some(serde_json::json!({
             "dev_sold": false
         }));
+        log.v3_evidence_status = log.v3_shadow_evidence_status.clone();
+        log.v3_organic_broadening = log.v3_shadow_organic_broadening.clone();
+        log.v3_manipulation_contradictions = log.v3_shadow_manipulation_contradictions.clone();
         log.v3_shadow_notes = Some(serde_json::json!({
             "p0": "shadow_only"
         }));
@@ -3280,15 +3378,27 @@ mod tests {
         assert_eq!(record["decision_plane"], DECISION_PLANE_LEGACY_LIVE);
         assert_eq!(record["v3_shadow_schema_version"], 1);
         assert_eq!(record["v3_shadow_verdict"], "PENDING");
+        assert_eq!(record["v3_shadow_stage"], "EVIDENCE");
         assert_eq!(
             record["v3_shadow_reason_code"],
-            GatekeeperReasonCode::V3ShadowPendingInsufficientEvidence.as_log_str()
+            GatekeeperReasonCode::PendingV3WaitEvidence.as_log_str()
         );
         assert_eq!(
             record["v3_shadow_reason_chain"][0],
             GatekeeperReasonCode::V3EvidenceDegraded.as_log_str()
         );
+        assert_eq!(
+            record["v3_shadow_secondary_reason_codes"][0],
+            GatekeeperReasonCode::PendingV3WaitEvidence.as_log_str()
+        );
+        assert_eq!(record["v3_shadow_risk_status"], "DEGRADED");
+        assert_eq!(record["v3_shadow_opportunity_status"], "DEGRADED");
+        assert_eq!(record["v3_shadow_confidence_final"], 0.0);
         assert_eq!(record["v3_shadow_confidence"], 0.0);
+        assert_eq!(
+            record["v3_evidence_status"]["tx_intel"]["status"],
+            "DEGRADED"
+        );
         assert_eq!(
             record["v3_shadow_notes"]["p0"],
             serde_json::json!("shadow_only")

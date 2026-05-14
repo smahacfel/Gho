@@ -4378,6 +4378,7 @@ fn enrich_buy_log_with_v3_shadow(
 
     log.v3_shadow_schema_version = Some(decision.schema_version);
     log.v3_shadow_verdict = Some(decision.verdict.as_log_str().to_string());
+    log.v3_shadow_stage = Some(decision.stage.as_log_str().to_string());
     log.v3_shadow_reason_code = Some(decision.reason_code.as_log_str());
     log.v3_shadow_reason_chain = Some(
         decision
@@ -4386,17 +4387,45 @@ fn enrich_buy_log_with_v3_shadow(
             .map(|reason| reason.as_log_str())
             .collect(),
     );
+    log.v3_shadow_secondary_reason_codes = Some(
+        decision
+            .reason_chain
+            .iter()
+            .skip(1)
+            .map(|reason| reason.as_log_str())
+            .collect(),
+    );
+    log.v3_shadow_risk_status = Some(decision.risk_status.as_log_str().to_string());
+    log.v3_shadow_risk_primary_reason = decision
+        .risk_primary_reason
+        .map(|reason| reason.as_log_str());
+    log.v3_shadow_risk_penalty = Some(decision.risk_penalty);
+    log.v3_shadow_opportunity_status = Some(decision.opportunity_status.as_log_str().to_string());
+    log.v3_shadow_opportunity_score = Some(decision.opportunity_score);
+    log.v3_shadow_confidence_raw = Some(decision.confidence_breakdown.raw);
+    log.v3_shadow_confidence_after_risk = Some(decision.confidence_breakdown.after_risk);
+    log.v3_shadow_confidence_after_stage = Some(decision.confidence_breakdown.after_stage);
+    log.v3_shadow_confidence_cap = Some(decision.confidence_breakdown.cap);
+    log.v3_shadow_confidence_cap_reasons = Some(decision.confidence_breakdown.cap_reasons.clone());
+    log.v3_shadow_confidence_final = Some(decision.confidence_breakdown.final_confidence);
     log.v3_shadow_confidence = Some(decision.confidence);
-    log.v3_shadow_evidence_status =
-        serde_json::to_value(&assessment.feature_snapshot.evidence_status).ok();
-    log.v3_shadow_organic_broadening =
+
+    let evidence_status = serde_json::to_value(&assessment.feature_snapshot.evidence_status).ok();
+    let organic_broadening =
         serde_json::to_value(&assessment.feature_snapshot.organic_broadening).ok();
-    log.v3_shadow_manipulation_contradictions =
+    let manipulation_contradictions =
         serde_json::to_value(&assessment.feature_snapshot.manipulation_contradictions).ok();
+    log.v3_shadow_evidence_status = evidence_status.clone();
+    log.v3_shadow_organic_broadening = organic_broadening.clone();
+    log.v3_shadow_manipulation_contradictions = manipulation_contradictions.clone();
+    log.v3_evidence_status = evidence_status;
+    log.v3_organic_broadening = organic_broadening;
+    log.v3_manipulation_contradictions = manipulation_contradictions;
     log.v3_shadow_notes = Some(serde_json::json!({
         "p0": "shadow_only",
         "source": "MaterializedFeatureSet",
         "deadline_elapsed": deadline_elapsed,
+        "execution": "execution_not_run",
     }));
 }
 
@@ -6389,11 +6418,12 @@ async fn spawn_shadow_buy_observer(
             &join_key,
             &rollout_profile,
         );
-        if let Err(err) = crate::components::trigger::shadow_run::append_shadow_dispatch_lifecycle_record(
-            lifecycle_log_path,
-            &submitted_record,
-        )
-        .await
+        if let Err(err) =
+            crate::components::trigger::shadow_run::append_shadow_dispatch_lifecycle_record(
+                lifecycle_log_path,
+                &submitted_record,
+            )
+            .await
         {
             error!(
                 pool = %pool_amm_id,
@@ -10537,14 +10567,21 @@ mod tests {
 
     fn review_v3_clean_evidence() -> MaterializedEvidenceStatus {
         MaterializedEvidenceStatus {
+            identity: review_clean_evidence_status(),
             account_state: review_clean_evidence_status(),
             tx_intel: review_clean_evidence_status(),
             tx_segments: review_clean_evidence_status(),
             checkpoints: review_clean_evidence_status(),
+            trajectory: review_clean_evidence_status(),
+            pdd_sequence: review_clean_evidence_status(),
             curve: review_clean_evidence_status(),
             sybil: review_clean_evidence_status(),
+            cpv: review_clean_evidence_status(),
+            fsc: review_clean_evidence_status(),
             alpha: review_clean_evidence_status(),
             manipulation: review_clean_evidence_status(),
+            organic_broadening: review_clean_evidence_status(),
+            manipulation_contradiction: review_clean_evidence_status(),
             execution: review_unavailable_evidence_status(
                 EvidenceUnavailableReason::ExecutionNotRun,
             ),
@@ -10585,6 +10622,13 @@ mod tests {
             buy_ratio_max: 0.75,
             max_segment_hhi: 0.08,
             min_segment_hhi: 0.03,
+            signer_growth_t2_t0: 2,
+            hhi_delta_t2_t0: -0.02,
+            tx_count_growth_vs_signer_growth: -0.08,
+            new_signer_ratio_t2: 0.50,
+            broadening_score: 0.72,
+            status: EvidenceStatus::Clean,
+            degraded_reasons: Vec::new(),
         };
         features.manipulation_contradictions = ManipulationContradictionFeatures {
             same_ms_tx_ratio: 0.05,
@@ -17248,7 +17292,10 @@ mod tests {
             .collect();
         assert_eq!(lifecycle_rows[0]["dispatch_status"], "submitted");
         assert_eq!(lifecycle_rows[1]["dispatch_status"], "abandoned");
-        assert_eq!(lifecycle_rows[1]["classification"], "timing_blockhash_problem");
+        assert_eq!(
+            lifecycle_rows[1]["classification"],
+            "timing_blockhash_problem"
+        );
     }
 
     #[tokio::test]
@@ -17372,7 +17419,10 @@ mod tests {
             .collect();
         assert_eq!(lifecycle_rows[0]["dispatch_status"], "submitted");
         assert_eq!(lifecycle_rows[1]["dispatch_status"], "abandoned");
-        assert_eq!(lifecycle_rows[1]["classification"], "logic_invariant_problem");
+        assert_eq!(
+            lifecycle_rows[1]["classification"],
+            "logic_invariant_problem"
+        );
     }
 
     #[tokio::test]
@@ -20239,7 +20289,7 @@ mod tests {
         assert_eq!(log.v3_shadow_verdict.as_deref(), Some("BUY_CANDIDATE"));
         assert_eq!(
             log.v3_shadow_reason_code.as_deref(),
-            Some("V3_SHADOW_BUY_CANDIDATE")
+            Some("BUY_V3_NORMAL_CONFIRMED_OPPORTUNITY")
         );
     }
 
@@ -20267,7 +20317,7 @@ mod tests {
         assert_eq!(log.v3_shadow_verdict.as_deref(), Some("TIMEOUT"));
         assert_eq!(
             log.v3_shadow_reason_code.as_deref(),
-            Some("V3_SHADOW_TIMEOUT_EVIDENCE")
+            Some("TIMEOUT_V3_DEGRADED_EVIDENCE")
         );
     }
 

@@ -118,6 +118,11 @@ pub enum EvidenceStatus {
     Clean,
     Degraded,
     Unavailable,
+    InsufficientSample,
+    Stale,
+    Fallback,
+    ShadowOnly,
+    NotConfigured,
 }
 
 impl Default for EvidenceStatus {
@@ -138,21 +143,37 @@ pub enum EvidenceDegradedReason {
     SybilEvidencePartial,
     AlphaEvidencePartial,
     ManipulationEvidencePartial,
+    IdentityEvidenceFallback,
+    TrajectoryEvidenceSparse,
+    PddSequencePartial,
+    CpvEvidencePartial,
+    FscEvidencePartial,
+    OrganicBroadeningInsufficient,
+    ManipulationContradictionPartial,
+    EvidenceStale,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceUnavailableReason {
     NotMaterialized,
+    IdentityMissing,
     SegmentSequenceMissing,
     SegmentSignerDataMissing,
     TxIntelMissing,
     AccountStateMissing,
     CheckpointHistoryMissing,
     CurveDataMissing,
+    TrajectoryMissing,
+    PddSequenceMissing,
     SybilMetricsMissing,
     AlphaFingerprintMissing,
+    CpvMetricsMissing,
+    FscMetricsMissing,
+    OrganicBroadeningMissing,
+    ManipulationContradictionMissing,
     ExecutionNotRun,
+    NotConfigured,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,6 +198,8 @@ impl Default for FeatureEvidenceStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MaterializedEvidenceStatus {
     #[serde(default)]
+    pub identity: FeatureEvidenceStatus,
+    #[serde(default)]
     pub account_state: FeatureEvidenceStatus,
     #[serde(default)]
     pub tx_intel: FeatureEvidenceStatus,
@@ -185,13 +208,25 @@ pub struct MaterializedEvidenceStatus {
     #[serde(default)]
     pub checkpoints: FeatureEvidenceStatus,
     #[serde(default)]
+    pub trajectory: FeatureEvidenceStatus,
+    #[serde(default)]
+    pub pdd_sequence: FeatureEvidenceStatus,
+    #[serde(default)]
     pub curve: FeatureEvidenceStatus,
     #[serde(default)]
     pub sybil: FeatureEvidenceStatus,
     #[serde(default)]
+    pub cpv: FeatureEvidenceStatus,
+    #[serde(default)]
+    pub fsc: FeatureEvidenceStatus,
+    #[serde(default)]
     pub alpha: FeatureEvidenceStatus,
     #[serde(default)]
     pub manipulation: FeatureEvidenceStatus,
+    #[serde(default)]
+    pub organic_broadening: FeatureEvidenceStatus,
+    #[serde(default)]
+    pub manipulation_contradiction: FeatureEvidenceStatus,
     #[serde(default)]
     pub execution: FeatureEvidenceStatus,
 }
@@ -199,14 +234,21 @@ pub struct MaterializedEvidenceStatus {
 impl Default for MaterializedEvidenceStatus {
     fn default() -> Self {
         Self {
+            identity: FeatureEvidenceStatus::default(),
             account_state: FeatureEvidenceStatus::default(),
             tx_intel: FeatureEvidenceStatus::default(),
             tx_segments: FeatureEvidenceStatus::default(),
             checkpoints: FeatureEvidenceStatus::default(),
+            trajectory: FeatureEvidenceStatus::default(),
+            pdd_sequence: FeatureEvidenceStatus::default(),
             curve: FeatureEvidenceStatus::default(),
             sybil: FeatureEvidenceStatus::default(),
+            cpv: FeatureEvidenceStatus::default(),
+            fsc: FeatureEvidenceStatus::default(),
             alpha: FeatureEvidenceStatus::default(),
             manipulation: FeatureEvidenceStatus::default(),
+            organic_broadening: FeatureEvidenceStatus::default(),
+            manipulation_contradiction: FeatureEvidenceStatus::default(),
             execution: FeatureEvidenceStatus {
                 status: EvidenceStatus::Unavailable,
                 degraded_reasons: Vec::new(),
@@ -254,6 +296,20 @@ pub struct OrganicBroadeningFeatures {
     pub max_segment_hhi: f64,
     #[serde(default)]
     pub min_segment_hhi: f64,
+    #[serde(default)]
+    pub signer_growth_t2_t0: i64,
+    #[serde(default)]
+    pub hhi_delta_t2_t0: f64,
+    #[serde(default)]
+    pub tx_count_growth_vs_signer_growth: f64,
+    #[serde(default)]
+    pub new_signer_ratio_t2: f64,
+    #[serde(default)]
+    pub broadening_score: f64,
+    #[serde(default)]
+    pub status: EvidenceStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub degraded_reasons: Vec<EvidenceDegradedReason>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -294,6 +350,24 @@ pub struct ManipulationContradictionFeatures {
     pub high_dev_concentration: bool,
     #[serde(default)]
     pub sybil_evidence_degraded: bool,
+    #[serde(default)]
+    pub momentum_without_broadening: bool,
+    #[serde(default)]
+    pub volume_spike_without_new_signers: bool,
+    #[serde(default)]
+    pub high_buy_pressure_with_high_top3: bool,
+    #[serde(default)]
+    pub fixed_size_or_ramping_pattern: bool,
+    #[serde(default)]
+    pub timing_bundle_concentration: bool,
+    #[serde(default)]
+    pub early_top3_concentration: bool,
+    #[serde(default)]
+    pub contradiction_score: f64,
+    #[serde(default)]
+    pub status: EvidenceStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

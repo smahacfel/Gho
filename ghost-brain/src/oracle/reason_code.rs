@@ -7,7 +7,9 @@
 //! Version history:
 //! - v1: NoEmit-only (legacy)
 //! - v2: All verdict types (P4 workstream)
-//! - v3: V3 P0 shadow/evidence reason codes
+//!
+//! V3 P0 shadow/evidence codes are additive sidecar codes. They do not bump
+//! the active V2.5 `reason_code_version` contract.
 
 use serde::{Deserialize, Serialize};
 
@@ -84,12 +86,22 @@ pub enum GatekeeperReasonCode {
     V3ShadowBuyCandidate,
     V3ShadowPendingInsufficientEvidence,
     V3ShadowTimeoutEvidence,
+    BuyV3NormalConfirmedOpportunity,
+    BuyV3EarlyCleanMomentum,
+    BuyV3ExtendedRecoveredEvidence,
+    RejectV3ManipulationContradiction,
+    RejectV3LowOrganicBroadening,
+    RejectV3LowOpportunity,
+    TimeoutV3DegradedEvidence,
+    TimeoutV3UnresolvedConfidence,
+    PendingV3WaitEvidence,
+    PendingV3WaitSample,
 }
 
 impl GatekeeperReasonCode {
     /// Current reason code taxonomy version.
     pub fn version() -> u32 {
-        3
+        2
     }
 
     /// Serialize the enum into the stable JSONL string form.
@@ -209,8 +221,8 @@ mod tests {
     }
 
     #[test]
-    fn test_version_is_3() {
-        assert_eq!(GatekeeperReasonCode::version(), 3);
+    fn test_version_remains_2_for_active_v25_contract() {
+        assert_eq!(GatekeeperReasonCode::version(), 2);
     }
 
     #[test]
@@ -224,12 +236,22 @@ mod tests {
             GatekeeperReasonCode::V3ShadowBuyCandidate,
             GatekeeperReasonCode::V3ShadowPendingInsufficientEvidence,
             GatekeeperReasonCode::V3ShadowTimeoutEvidence,
+            GatekeeperReasonCode::BuyV3NormalConfirmedOpportunity,
+            GatekeeperReasonCode::BuyV3EarlyCleanMomentum,
+            GatekeeperReasonCode::BuyV3ExtendedRecoveredEvidence,
+            GatekeeperReasonCode::RejectV3ManipulationContradiction,
+            GatekeeperReasonCode::RejectV3LowOrganicBroadening,
+            GatekeeperReasonCode::RejectV3LowOpportunity,
+            GatekeeperReasonCode::TimeoutV3DegradedEvidence,
+            GatekeeperReasonCode::TimeoutV3UnresolvedConfidence,
+            GatekeeperReasonCode::PendingV3WaitEvidence,
+            GatekeeperReasonCode::PendingV3WaitSample,
         ];
 
         for code in codes {
             let tag = code.as_log_str();
             assert_eq!(GatekeeperReasonCode::from_log_str(&tag), Some(code));
-            assert!(tag.starts_with("V3_"));
+            assert!(tag.contains("_V3_") || tag.starts_with("V3_"));
         }
     }
 
