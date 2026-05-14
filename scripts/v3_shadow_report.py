@@ -23,7 +23,7 @@ EXECUTION_SUCCESS_STATUSES = {"confirmed", "landed", "success", "executed"}
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Summarize Ghost Decision Stack V3 P0 shadow sidecar fields."
+        description="Summarize Ghost Decision Stack V3 P1 calibrated shadow sidecar fields."
     )
     parser.add_argument(
         "--config",
@@ -212,6 +212,20 @@ def confidence_bucket(value: Any) -> str:
     return "0_75_to_1_00"
 
 
+def hash_present(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def hash_value(value: Any) -> str:
+    return value.strip() if hash_present(value) else "missing"
+
+
+def coverage_ratio(present: int, total: int) -> float:
+    if total == 0:
+        return 0.0
+    return round(present / total, 6)
+
+
 def evidence_summary(value: Any) -> tuple[dict[str, Counter[str]], Counter[str]]:
     by_feature: dict[str, Counter[str]] = defaultdict(Counter)
     missing_degraded = Counter()
@@ -270,6 +284,37 @@ def execution_success(row: dict[str, Any]) -> bool:
     return str(raw).strip().lower() in EXECUTION_SUCCESS_STATUSES
 
 
+def component_score_value(row: dict[str, Any], *path: str, fallback: str | None = None) -> Any:
+    value: Any = row.get("v3_component_scores")
+    for part in path:
+        if not isinstance(value, dict):
+            value = None
+            break
+        value = value.get(part)
+    if value is None and fallback is not None:
+        return row.get(fallback)
+    return value
+
+
+def actionability_value(value: Any) -> str:
+    if isinstance(value, dict):
+        return str(value.get("actionability") or value.get("status") or "missing")
+    if value is None:
+        return "missing"
+    return str(value)
+
+
+def has_full_replay_payload(row: dict[str, Any]) -> bool:
+    return any(
+        isinstance(row.get(key), dict)
+        for key in (
+            "v3_feature_snapshot",
+            "v3_feature_snapshot_payload",
+            "v3_materialized_feature_snapshot",
+        )
+    )
+
+
 def build_report_from_rows(rows: list[dict[str, Any]], bad_rows: int = 0) -> dict[str, Any]:
     deduped = deduplicate_rows(rows)
     v3_rows = [row for row in deduped if has_v3_fields(row)]
@@ -288,20 +333,93 @@ def build_report_from_rows(rows: list[dict[str, Any]], bad_rows: int = 0) -> dic
     missing_degraded = Counter()
     execution_outcomes = Counter()
     execution_success_count = 0
+    policy_hashes = Counter()
+    snapshot_hashes = Counter()
+    v2_to_v3_config_hashes: dict[str, Counter[str]] = defaultdict(Counter)
+    component_score_buckets: dict[str, Counter[str]] = defaultdict(Counter)
+    actionability_stages: dict[str, Counter[str]] = defaultdict(Counter)
+    actionability_groups: dict[str, Counter[str]] = defaultdict(Counter)
+    full_replay_payload_rows = 0
 
     for row in v3_rows:
         active = active_verdict(row)
         v3_verdict = str(row.get("v3_shadow_verdict") or "missing")
         active_vs_v3[active][v3_verdict] += 1
+        policy_hash = hash_value(row.get("v3_policy_config_hash"))
+        snapshot_hash = hash_value(row.get("v3_feature_snapshot_hash"))
+        policy_hashes[policy_hash] += 1
+        snapshot_hashes[snapshot_hash] += 1
+        v2_to_v3_config_hashes[hash_value(row.get("config_hash"))][policy_hash] += 1
         reason_codes[str(row.get("v3_shadow_reason_code") or "missing")] += 1
         stages[str(row.get("v3_shadow_stage") or "missing")] += 1
         risk_statuses[str(row.get("v3_shadow_risk_status") or "missing")] += 1
         opportunity_statuses[str(row.get("v3_shadow_opportunity_status") or "missing")] += 1
         confidence_buckets[confidence_bucket(row.get("v3_shadow_confidence"))] += 1
+        component_score_buckets["risk_penalty"][
+            confidence_bucket(
+                component_score_value(row, "risk", "penalty", fallback="v3_shadow_risk_penalty")
+            )
+        ] += 1
+        component_score_buckets["opportunity_score"][
+            confidence_bucket(
+                component_score_value(
+                    row, "opportunity", "score", fallback="v3_shadow_opportunity_score"
+                )
+            )
+        ] += 1
+        component_score_buckets["confidence_raw"][
+            confidence_bucket(
+                component_score_value(
+                    row, "confidence", "raw", fallback="v3_shadow_confidence_raw"
+                )
+            )
+        ] += 1
+        component_score_buckets["confidence_after_risk"][
+            confidence_bucket(
+                component_score_value(
+                    row,
+                    "confidence",
+                    "after_risk",
+                    fallback="v3_shadow_confidence_after_risk",
+                )
+            )
+        ] += 1
+        component_score_buckets["confidence_after_stage"][
+            confidence_bucket(
+                component_score_value(
+                    row,
+                    "confidence",
+                    "after_stage",
+                    fallback="v3_shadow_confidence_after_stage",
+                )
+            )
+        ] += 1
+        component_score_buckets["confidence_final"][
+            confidence_bucket(
+                component_score_value(row, "confidence", "final", fallback="v3_shadow_confidence")
+            )
+        ] += 1
         for reason in row.get("v3_shadow_confidence_cap_reasons", []) or []:
             confidence_cap_reasons[str(reason)] += 1
         manipulation[manipulation_bucket(row.get("v3_shadow_manipulation_contradictions"))] += 1
         organic[organic_bucket(row.get("v3_shadow_organic_broadening"))] += 1
+        actionability = row.get("v3_actionability")
+        if isinstance(actionability, dict):
+            stages_payload = actionability.get("stages")
+            if isinstance(stages_payload, dict):
+                for stage_name, stage_value in stages_payload.items():
+                    actionability_stages[str(stage_name)][actionability_value(stage_value)] += 1
+            else:
+                actionability_stages["missing"]["missing"] += 1
+            groups_payload = actionability.get("groups")
+            if isinstance(groups_payload, dict):
+                for group_name, group_value in groups_payload.items():
+                    actionability_groups[str(group_name)][actionability_value(group_value)] += 1
+            else:
+                actionability_groups["missing"]["missing"] += 1
+        else:
+            actionability_stages["missing"]["missing"] += 1
+            actionability_groups["missing"]["missing"] += 1
         feature_counts, reason_counts = evidence_summary(row.get("v3_shadow_evidence_status"))
         for feature, counts in feature_counts.items():
             evidence_by_feature[feature].update(counts)
@@ -309,9 +427,30 @@ def build_report_from_rows(rows: list[dict[str, Any]], bad_rows: int = 0) -> dic
         execution_outcomes[str(row.get("shadow_execution_outcome") or "missing")] += 1
         if execution_success(row):
             execution_success_count += 1
+        if has_full_replay_payload(row):
+            full_replay_payload_rows += 1
+
+    policy_hash_present = sum(count for key, count in policy_hashes.items() if key != "missing")
+    snapshot_hash_present = sum(count for key, count in snapshot_hashes.items() if key != "missing")
+    duplicate_snapshot_hashes = {
+        key: count
+        for key, count in sorted(snapshot_hashes.items())
+        if key != "missing" and count > 1
+    }
+    replay_status = "unavailable"
+    if v3_rows:
+        if full_replay_payload_rows == len(v3_rows):
+            replay_status = "full"
+        elif full_replay_payload_rows > 0:
+            replay_status = "partial"
+        elif snapshot_hash_present > 0:
+            replay_status = "hash_only"
+        else:
+            replay_status = "missing_snapshot_hash"
 
     return {
         "status": status,
+        "replay_status": replay_status,
         "counts": {
             "raw_rows": len(rows),
             "bad_rows": bad_rows,
@@ -327,6 +466,52 @@ def build_report_from_rows(rows: list[dict[str, Any]], bad_rows: int = 0) -> dic
         "v3_opportunity_statuses": dict(sorted(opportunity_statuses.items())),
         "confidence_buckets": dict(sorted(confidence_buckets.items())),
         "confidence_cap_reasons": dict(sorted(confidence_cap_reasons.items())),
+        "hash_coverage": {
+            "v3_policy_config_hash": {
+                "present": policy_hash_present,
+                "missing": len(v3_rows) - policy_hash_present,
+                "coverage": coverage_ratio(policy_hash_present, len(v3_rows)),
+            },
+            "v3_feature_snapshot_hash": {
+                "present": snapshot_hash_present,
+                "missing": len(v3_rows) - snapshot_hash_present,
+                "coverage": coverage_ratio(snapshot_hash_present, len(v3_rows)),
+            },
+            "both_present": {
+                "present": sum(
+                    1
+                    for row in v3_rows
+                    if hash_present(row.get("v3_policy_config_hash"))
+                    and hash_present(row.get("v3_feature_snapshot_hash"))
+                ),
+                "total": len(v3_rows),
+            },
+        },
+        "hash_consistency": {
+            "policy_hash_counts": dict(sorted(policy_hashes.items())),
+            "snapshot_hash_counts": dict(sorted(snapshot_hashes.items())),
+            "policy_hash_unique_count": len([key for key in policy_hashes if key != "missing"]),
+            "snapshot_hash_unique_count": len([key for key in snapshot_hashes if key != "missing"]),
+            "rows_missing_policy_hash": policy_hashes.get("missing", 0),
+            "rows_missing_snapshot_hash": snapshot_hashes.get("missing", 0),
+        },
+        "snapshot_uniqueness": {
+            "unique_count": len([key for key in snapshot_hashes if key != "missing"]),
+            "duplicate_row_count": sum(count - 1 for count in duplicate_snapshot_hashes.values()),
+            "duplicates": duplicate_snapshot_hashes,
+        },
+        "component_score_buckets": counters_to_dict(component_score_buckets),
+        "actionability_summary": {
+            "stages": counters_to_dict(actionability_stages),
+            "groups": counters_to_dict(actionability_groups),
+        },
+        "config_hash_matrix": counters_to_dict(v2_to_v3_config_hashes),
+        "replay": {
+            "status": replay_status,
+            "full_snapshot_payload_rows": full_replay_payload_rows,
+            "hash_only_rows": max(0, snapshot_hash_present - full_replay_payload_rows),
+            "note": "hash_only means the report can compare stable snapshot hashes but cannot replay a full MaterializedFeatureSet payload",
+        },
         "evidence_status_by_feature": counters_to_dict(evidence_by_feature),
         "missing_degraded_evidence": dict(sorted(missing_degraded.items())),
         "manipulation_contradictions": dict(sorted(manipulation.items())),
@@ -357,6 +542,7 @@ def build_report(config_path: Path, decisions_log: Path | None = None) -> dict[s
 def print_text(report: dict[str, Any]) -> None:
     counts = report["counts"]
     print(f"V3 shadow report status: {report['status']}")
+    print(f"Replay status: {report['replay_status']}")
     print(
         "Rows: raw={raw_rows} deduped={deduped_rows} v3={v3_rows} no_v3={no_v3_rows} bad={bad_rows}".format(
             **counts
@@ -371,6 +557,12 @@ def print_text(report: dict[str, Any]) -> None:
     print(f"V3 opportunity statuses: {report['v3_opportunity_statuses']}")
     print(f"Confidence buckets: {report['confidence_buckets']}")
     print(f"Confidence cap reasons: {report['confidence_cap_reasons']}")
+    print(f"Hash coverage: {report['hash_coverage']}")
+    print(f"Hash consistency: {report['hash_consistency']}")
+    print(f"Snapshot uniqueness: {report['snapshot_uniqueness']}")
+    print(f"Component score buckets: {report['component_score_buckets']}")
+    print(f"Actionability summary: {report['actionability_summary']}")
+    print(f"Config hash matrix: {report['config_hash_matrix']}")
     print(f"Evidence by feature: {report['evidence_status_by_feature']}")
     print(f"Missing/degraded evidence: {report['missing_degraded_evidence']}")
     print(f"Manipulation contradictions: {report['manipulation_contradictions']}")

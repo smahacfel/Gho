@@ -20,6 +20,9 @@ def v3_row(
     reason: str = "PENDING_V3_WAIT_EVIDENCE",
     confidence: float = 0.0,
     execution_outcome: str | None = None,
+    config_hash: str = "v2-hash-a",
+    policy_hash: str = "v3-policy-a",
+    snapshot_hash: str = "v3-snapshot-a",
 ) -> dict:
     row = {
         "pool_id": "pool",
@@ -29,6 +32,7 @@ def v3_row(
         "decision_plane": plane,
         "decision_verdict_buy": active_buy,
         "verdict_type": active_type,
+        "config_hash": config_hash,
         "v3_shadow_schema_version": 1,
         "v3_shadow_verdict": v3_verdict,
         "v3_shadow_stage": "EVIDENCE",
@@ -46,6 +50,42 @@ def v3_row(
         "v3_shadow_confidence_cap_reasons": ["insufficient_evidence"],
         "v3_shadow_confidence_final": confidence,
         "v3_shadow_confidence": confidence,
+        "v3_policy_config_hash": policy_hash,
+        "v3_feature_snapshot_hash": snapshot_hash,
+        "v3_materialization_version": 1,
+        "v3_policy_version": 1,
+        "v3_stage_thresholds": {
+            "evidence": {"min_tx_count": 12},
+            "risk": {"hard_fail_hhi": 0.1},
+            "opportunity": {"min_buy_ratio": 0.8},
+            "confidence": {"execution_not_run_confidence_cap": 0.8},
+        },
+        "v3_component_scores": {
+            "risk": {"status": "DEGRADED", "penalty": 0.0},
+            "opportunity": {"status": "DEGRADED", "score": 0.0},
+            "confidence": {
+                "raw": confidence,
+                "after_risk": confidence,
+                "after_stage": confidence,
+                "cap": confidence,
+                "cap_reasons": ["insufficient_evidence"],
+                "final": confidence,
+            },
+            "final_confidence": confidence,
+        },
+        "v3_actionability": {
+            "stages": {
+                "evidence": "blocked",
+                "risk": "actionable",
+                "opportunity": "blocked",
+                "confidence": "blocked",
+            },
+            "groups": {
+                "tx_intel": {"status": "Clean", "actionability": "actionable"},
+                "tx_segments": {"status": "Unavailable", "actionability": "blocked"},
+                "curve": {"status": "Degraded", "actionability": "degraded"},
+            },
+        },
         "v3_shadow_evidence_status": {
             "tx_intel": {"status": "clean"},
             "tx_segments": {
@@ -103,6 +143,7 @@ class V3ShadowReportTests(unittest.TestCase):
         self.assertEqual(report["counts"]["deduped_rows"], 1)
         self.assertEqual(report["counts"]["duplicate_rows_removed"], 1)
         self.assertEqual(report["active_vs_v3_verdict"]["REJECT"]["PENDING"], 1)
+        self.assertEqual(report["hash_coverage"]["v3_policy_config_hash"]["coverage"], 1.0)
 
     def test_v3_verdict_matrix_aggregation(self) -> None:
         rows = [
@@ -126,6 +167,7 @@ class V3ShadowReportTests(unittest.TestCase):
         report = v3_shadow_report.build_report_from_rows(rows)
 
         self.assertEqual(report["confidence_buckets"]["0_75_to_1_00"], 1)
+        self.assertEqual(report["component_score_buckets"]["confidence_final"]["0_75_to_1_00"], 1)
         self.assertEqual(report["v3_stages"]["EVIDENCE"], 1)
         self.assertEqual(report["v3_risk_statuses"]["DEGRADED"], 1)
         self.assertEqual(report["v3_opportunity_statuses"]["DEGRADED"], 1)
@@ -161,6 +203,38 @@ class V3ShadowReportTests(unittest.TestCase):
 
         self.assertEqual(report["execution"]["success_count"], 0)
         self.assertEqual(report["execution"]["outcomes"]["submitted"], 1)
+
+    def test_hash_actionability_and_replay_status_are_reported(self) -> None:
+        rows = [
+            v3_row(snapshot_hash="snapshot-a"),
+            v3_row(
+                ab_record_id="pool2:1000:11000:REJECT",
+                config_hash="v2-hash-b",
+                policy_hash="v3-policy-b",
+                snapshot_hash="snapshot-a",
+            ),
+            v3_row(
+                ab_record_id="pool3:1000:11000:REJECT",
+                policy_hash="",
+                snapshot_hash="",
+            ),
+        ]
+
+        report = v3_shadow_report.build_report_from_rows(rows)
+
+        self.assertEqual(report["replay_status"], "hash_only")
+        self.assertEqual(report["hash_coverage"]["v3_policy_config_hash"]["present"], 2)
+        self.assertEqual(report["hash_coverage"]["v3_feature_snapshot_hash"]["present"], 2)
+        self.assertEqual(report["snapshot_uniqueness"]["duplicates"]["snapshot-a"], 2)
+        self.assertEqual(
+            report["config_hash_matrix"]["v2-hash-b"]["v3-policy-b"],
+            1,
+        )
+        self.assertEqual(report["actionability_summary"]["stages"]["evidence"]["blocked"], 3)
+        self.assertEqual(
+            report["actionability_summary"]["groups"]["tx_segments"]["blocked"],
+            3,
+        )
 
 
 if __name__ == "__main__":
