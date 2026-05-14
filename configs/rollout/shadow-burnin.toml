@@ -1,4 +1,4 @@
-# PR-6 rollout profile: canonical shadow burn-in (clean V2.5 repair rerun)
+# PR-6 rollout profile: canonical shadow burn-in (V3 P1 calibrated shadow rerun)
 # First-class standalone shadow runtime. Live sender remains disabled; the
 # trigger.shadow_run block is only the launcher shadow transport adapter.
 # Guardian/AEM thresholds live in ../../ghost-brain/ghost_brain_config.toml.
@@ -79,7 +79,7 @@ replace_recent_blockhash = true
 timeout_ms = 1600
 max_retries = 1
 max_concurrent = 8
-output_path = "../../logs/shadow_run/shadow-burnin-v25-repair-r2-buys.jsonl"
+output_path = "../../logs/shadow_run/shadow-burnin-v3-p1-buys.jsonl"
 emit_event_bus = true
 
 [execution]
@@ -89,13 +89,13 @@ execution_mode = "shadow"
 tx_build_compensation_ms = 200
 max_quote_age_ms = 1500
 # Canonical shadow proof artifacts.
-entry_log_path = "../../logs/shadow_run/shadow-burnin-v25-repair-r2/shadow_entries.jsonl"
-lifecycle_log_path = "../../logs/shadow_run/shadow-burnin-v25-repair-r2/shadow_lifecycle.jsonl"
+entry_log_path = "../../logs/shadow_run/shadow-burnin-v3-p1/shadow_entries.jsonl"
+lifecycle_log_path = "../../logs/shadow_run/shadow-burnin-v3-p1/shadow_lifecycle.jsonl"
 timing_model = "prepared_entry_mirror"
 stale_policy = "emit_warning"
 
 [execution.events]
-output_dir = "../../datasets/events/shadow-burnin-v25-repair-r2"
+output_dir = "../../datasets/events/shadow-burnin-v3-p1"
 rotation_interval_ms = 300000
 flush_interval_ms = 1000
 max_file_size_bytes = 50000000
@@ -103,13 +103,13 @@ enable_aem_ticks = true
 enable_optional_events = false
 
 [oracle]
-# Dedicated Gatekeeper decision artifacts for the clean V2.5 repair rerun.
-decision_log_path = "../../logs/rollout/shadow-burnin-v25-repair-r2/decisions"
+# Dedicated Gatekeeper decision artifacts for the V3 P1 calibrated shadow rerun.
+decision_log_path = "../../logs/rollout/shadow-burnin-v3-p1/decisions"
 
 [durability]
 wal_enabled = false
-wal_dir = "../../data/rollout/shadow-burnin-v25-repair-r2/wal"
-snapshot_dir = "../../data/rollout/shadow-burnin-v25-repair-r2/snapshots"
+wal_dir = "../../data/rollout/shadow-burnin-v3-p1/wal"
+snapshot_dir = "../../data/rollout/shadow-burnin-v3-p1/snapshots"
 
 [metrics]
 enabled = true
@@ -126,7 +126,7 @@ level = "info"
 console_enabled = true
 json_format = false
 file_enabled = true
-file_path = "../../logs/rollout/shadow-burnin-v25-repair-r2/system.log"
+file_path = "../../logs/rollout/shadow-burnin-v3-p1/system.log"
 oracle_log_enabled = true
-oracle_log_path = "../../logs/rollout/shadow-burnin-v25-repair-r2/oracle.log"
+oracle_log_path = "../../logs/rollout/shadow-burnin-v3-p1/oracle.log"
 oracle_json_format = false
