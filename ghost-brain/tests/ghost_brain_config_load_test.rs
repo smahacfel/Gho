@@ -34,3 +34,15 @@ fn gatekeeper_v3_config_loads_from_production_toml() {
         0.85
     );
 }
+
+#[test]
+fn gatekeeper_v3_replay_payload_enabled_in_p32_replay_config() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../configs/rollout/ghost_brain_v3_p32_replay.toml");
+    let config = GhostBrainConfig::from_toml_file(&path).expect("P3.2 replay config should load");
+
+    assert!(!config.gatekeeper_v3.enabled);
+    assert!(config.gatekeeper_v3.shadow_emit_enabled);
+    assert!(config.gatekeeper_v3.replay_payload_enabled);
+    assert!(!config.gatekeeper_v3.promotion.enabled);
+}
