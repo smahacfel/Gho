@@ -28,22 +28,54 @@ Remediacja wykonana w working tree:
 - raport zwraca `stale_artifacts`, gdy znaleziony decision log jest starszy niz
   rollout config albo wskazany `ghost_brain_config.toml`.
 
-Aktualny status: core remediation jest zaimplementowana i przeszla targeted
-testy. Formalne domkniecie runtime P1 evidence jest nadal pending, bo clean rerun
-po remediacji zakonczyl sie naturalnym `timeout 30m`, ale nie wyprodukowal nowych
-decision rows z powodu zewnetrznego limitu Yellowstone:
-`ResourceExhausted: Concurrent Yellowstone Geyser stream limit reached`.
+Aktualny status po rerunie 2026-05-15: `APPROVED` dla formalnego domkniecia
+runtime evidence P1. Clean rerun po remediacji wyprodukowal swieze decision rows:
+`status=ok`, `v3_rows=86`, `artifact_freshness.stale_against_config=false`,
+`replay_status=hash_only`, hash coverage `1.0`.
 
 Raport `status=ok`, `v3_rows=29`, hash coverage `1.0` i
 `replay_status=hash_only` opisany nizej jest historycznym evidence sprzed tej
 remediacji. Nie nalezy go traktowac jako dowodu, ze zremediowane actionability i
 nowy snapshot hash zostaly juz potwierdzone na swiezych runtime decyzjach.
 
-Po follow-up remediacji 2026-05-15 skrypt raportujacy oznacza ten sam
-historyczny plik jako `status=stale_artifacts`, poniewaz selected decision log
-jest starszy niz referencyjny `ghost_brain_config.toml`. To jest oczekiwane i
-chroni przed falszywym traktowaniem starych 29 rows jako swiezej walidacji po
-zmianach kodu/configu.
+Po follow-up remediacji 2026-05-15 skrypt raportujacy oznacza historyczny plik
+29 rows jako `status=stale_artifacts`, poniewaz selected decision log jest
+starszy niz referencyjny `ghost_brain_config.toml`. Swiezy run 86 rows jest
+obecnym baseline P1.
+
+## P1 Closure Note - 2026-05-15
+
+P1 zostaje zamrozony jako audytowalny baseline na commit:
+
+- `0f3639c Close V3 P1 remediation and runtime evidence`
+
+Kanoniczny raport operacyjny:
+
+- `PLANS/AUDYT/RAPORT_OPERACYJNY_P1_V3_SHADOW_RERUN_20260515.md`
+
+Wynik runtime:
+
+- `status=ok`
+- `v3_rows=86`
+- `artifact_freshness.stale_against_config=false`
+- `replay_status=hash_only`
+- `v3_policy_config_hash.coverage=1.0`
+- `v3_feature_snapshot_hash.coverage=1.0`
+- `pre_dedupe_conflicts.conflict_groups=0`
+
+Residual:
+
+- `funding_lane_full_chain` nadal lapal Yellowstone
+  `ResourceExhausted: Concurrent Yellowstone Geyser stream limit reached`.
+- Residual jest infrastrukturalnym follow-upem lane pomocniczego i nie blokuje
+  domkniecia P1, poniewaz primary `v25_shadow` path wygenerowal swieze decision
+  rows oraz coverage audit.
+
+Nastepny etap:
+
+- przejsc do P3 Calibration Gate,
+- nie rozpoczynac P2 promotion,
+- traktowac `hash_only` jako ograniczenie replay, nie jako full replay OK.
 
 ## Zakres
 
@@ -161,9 +193,9 @@ Glowne artefakty:
 - `/root/Gho/logs/rollout/shadow-burnin-v3-p1/system.log.2026-05-14`
 - `/root/Gho/logs/rollout/shadow-burnin-v3-p1/oracle.log.2026-05-14`
 
-## Clean P1 Rerun po remediacji
+## Clean P1 Reruny po remediacji
 
-Uruchomiono ponownie:
+Pierwsze podejscie po remediacji uruchomiono komenda:
 
 ```bash
 timeout 30m env RUST_LOG=info \
@@ -171,7 +203,7 @@ cargo run --release -p ghost-launcher --bin ghost-launcher -- \
   --config /root/Gho/configs/rollout/shadow-burnin.toml
 ```
 
-Wynik:
+Wynik pierwszego podejscia:
 
 - proces zakonczyl sie kodem `124`, czyli naturalnym `timeout 30m`,
 - start runtime potwierdzil `execution_mode=Shadow` i `entry_mode=shadow_only`,
@@ -184,9 +216,27 @@ Wynik:
 - GatekeeperCommitLoop raportowal `commits=0, active_buffers=0`,
 - po zakonczeniu procesu nie pozostal dzialajacy `ghost-launcher`.
 
-Ten rerun potwierdza shadow-only start i naturalny timeout, ale nie domyka
-evidence decyzji po remediacji. Brak nowych decision rows jest zewnetrznym
-blokerm infrastruktury, nie pozytywnym dowodem semantyki P1.
+To pierwsze podejscie potwierdzilo shadow-only start i naturalny timeout, ale
+nie domykalo evidence decyzji po remediacji. Brak nowych decision rows byl
+zewnetrznym blokerem infrastruktury, nie pozytywnym dowodem semantyki P1.
+
+Finalny clean rerun po zwolnieniu slotu Yellowstone zostal wykonany 2026-05-15
+i opisany w:
+
+- `PLANS/AUDYT/RAPORT_OPERACYJNY_P1_V3_SHADOW_RERUN_20260515.md`
+
+Wynik finalnego rerunu:
+
+- proces zakonczyl sie naturalnie po `timeout 30m`,
+- swiezy `v25_shadow` decision log zawiera `86` V3 rows,
+- `status=ok`,
+- `artifact_freshness.stale_against_config=false`,
+- `replay_status=hash_only`,
+- `v3_policy_config_hash.coverage=1.0`,
+- `v3_feature_snapshot_hash.coverage=1.0`,
+- `pre_dedupe_conflicts.conflict_groups=0`,
+- residual `funding_lane_full_chain` / Yellowstone `ResourceExhausted` pozostal
+  jako infra follow-up, ale nie zablokowal primary P1 evidence.
 
 ## Finalny Raport P1 z pierwotnego evidence
 
@@ -276,23 +326,24 @@ Wniosek: P1 daje uzyteczna interpretacje PENDING/REJECT dla shadow funnel, ale n
 - V3 calibrated funnel: progi, evidence requirements, confidence caps i
   component weights sa w `GatekeeperV3Config`.
 - Snapshot hash: obejmuje `materialization_version` i nie obejmuje `session_id`.
-- P1 report: historyczne rows nadal maja `v3_rows=29`, hash coverage `1.0`,
-  `replay_status=hash_only`, ale obecny skrypt zwraca dla nich
-  `status=stale_artifacts`; swieze runtime evidence po remediacji jest pending.
+- P1 report: swiezy baseline ma `v3_rows=86`, hash coverage `1.0`,
+  `replay_status=hash_only`, `status=ok`, `stale_against_config=false`.
+  Historyczne 29 rows pozostaja oznaczone jako `status=stale_artifacts`.
 
 ## Residual Risk
 
 - Historyczny rerun nie zakonczyl sie naturalnym 30-minutowym timeoutem; zostal
   zatrzymany po uzyskaniu wystarczajacego P1 evidence.
-- Rerun po remediacji zakonczyl sie naturalnym timeoutem, ale nie wytworzyl
-  nowych decyzji przez limit Yellowstone `ResourceExhausted`.
+- Rerun po remediacji zakonczyl sie naturalnym timeoutem i wytworzyl 86 swiezych
+  `v25_shadow` rows.
+- `funding_lane_full_chain` nadal raportowal Yellowstone `ResourceExhausted`,
+  ale nie zablokowal glownego shadow evidence.
 - `hash_only` nie pozwala odtworzyc pelnego `MaterializedFeatureSet`; potwierdza deterministyczne porownanie snapshot hash, nie full replay.
 - Brak execution success jest oczekiwany w shadow-only, ale oznacza, ze P1 waliduje interpretacje decyzji, nie lifecycle wykonania.
 
 ## Werdykt po remediacji
 
-Kodowa remediacja krytycznych uwag jest gotowa do ponownej runtime walidacji.
-Nie zatwierdzam jeszcze formalnie P1 jako domknietego evidence package, bo
-swiezy rerun po poprawkach nie wyprodukowal decision rows. Następny krok to
-powtorzenie clean P1 shadow rerun po zwolnieniu limitu Yellowstone i
-wygenerowanie raportu z nowych artefaktow `shadow-burnin-v3-p1`.
+`APPROVED` dla formalnego domkniecia P1 runtime evidence package.
+
+P1 jest zamrozony jako baseline do P3 Calibration Gate. Dalsze prace nie powinny
+promowac V3 do active path bez osobnego P2 ADR i pozytywnego P3 certification.
