@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import json
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -235,6 +238,42 @@ class V3ShadowReportTests(unittest.TestCase):
             report["actionability_summary"]["groups"]["tx_segments"]["blocked"],
             3,
         )
+
+    def test_pre_dedupe_conflicting_duplicates_are_reported(self) -> None:
+        rows = [
+            v3_row(v3_verdict="PENDING", reason="PENDING_V3_WAIT_EVIDENCE", snapshot_hash="a"),
+            v3_row(v3_verdict="REJECT", reason="REJECT_V3_MANIPULATION_CONTRADICTION", snapshot_hash="b"),
+        ]
+
+        report = v3_shadow_report.build_report_from_rows(rows)
+
+        self.assertEqual(report["counts"]["deduped_rows"], 1)
+        self.assertEqual(report["pre_dedupe_conflicts"]["duplicate_groups"], 1)
+        self.assertEqual(report["pre_dedupe_conflicts"]["conflict_groups"], 1)
+        self.assertEqual(report["pre_dedupe_conflicts"]["conflict_rows"], 2)
+        conflict = next(iter(report["pre_dedupe_conflicts"]["conflicts"].values()))
+        self.assertEqual(conflict["snapshot_hashes"], ["a", "b"])
+
+    def test_build_report_marks_old_decision_log_as_stale_against_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            decisions_dir = root / "decisions"
+            decisions_dir.mkdir()
+            decisions_log = decisions_dir / v3_shadow_report.DECISIONS_LOG_NAME
+            decisions_log.write_text(json.dumps(v3_row()) + "\n", encoding="utf-8")
+            config_path = root / "shadow-burnin.toml"
+            config_path.write_text(
+                '[oracle]\ndecision_log_path = "decisions"\n',
+                encoding="utf-8",
+            )
+
+            os.utime(decisions_log, (100.0, 100.0))
+            os.utime(config_path, (200.0, 200.0))
+
+            report = v3_shadow_report.build_report(config_path)
+
+            self.assertEqual(report["status"], "stale_artifacts")
+            self.assertTrue(report["artifact_freshness"]["stale_against_config"])
 
 
 if __name__ == "__main__":

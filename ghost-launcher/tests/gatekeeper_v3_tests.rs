@@ -13,18 +13,20 @@ use ghost_launcher::components::gatekeeper_v3::{
 fn test_config() -> GatekeeperV3Config {
     let mut config = GatekeeperV3Config::default();
     config.shadow_emit_enabled = true;
-    config.thresholds.min_tx_count = 9;
-    config.thresholds.min_unique_signers = 6;
-    config.thresholds.min_buy_count = 5;
-    config.thresholds.min_buy_ratio = 0.50;
-    config.thresholds.max_buy_ratio = 0.95;
-    config.thresholds.max_hhi = 0.25;
-    config.thresholds.hard_fail_hhi = 0.10;
-    config.thresholds.hard_fail_same_ms_tx_ratio = 0.60;
-    config.thresholds.hard_fail_top3_volume_pct = 0.70;
-    config.thresholds.max_tx_per_signer = 4;
-    config.thresholds.max_dev_volume_ratio = 0.40;
-    config.thresholds.reject_on_dev_sell = true;
+    for profile in [&mut config.early, &mut config.normal, &mut config.extended] {
+        profile.min_tx_count = 9;
+        profile.min_unique_signers = 6;
+        profile.min_buy_count = 5;
+        profile.min_buy_ratio = 0.50;
+        profile.max_buy_ratio = 0.95;
+        profile.max_hhi = 0.25;
+        profile.hard_fail_hhi = 0.10;
+        profile.hard_fail_same_ms_tx_ratio = 0.60;
+        profile.hard_fail_top3_volume_pct = 0.70;
+        profile.max_tx_per_signer = 4;
+        profile.max_dev_volume_ratio = 0.40;
+        profile.reject_on_dev_sell = true;
+    }
     config
 }
 
@@ -195,6 +197,33 @@ fn gatekeeper_v3_strong_organic_broadening_can_produce_buy_candidate() {
 }
 
 #[test]
+fn gatekeeper_v3_uses_early_profile_before_early_window() {
+    let mut config = test_config();
+    config.early_window_ms = 2_000;
+    config.normal.min_tx_count = 99;
+
+    let mut early_features = strong_organic_features();
+    early_features.session_metadata.observation_duration_ms = 1_999;
+    let early_decision = evaluate_v3_from_features(&early_features, &config, false);
+    let early_actionability = v3_actionability_payload(&early_features, &config, false);
+
+    let mut normal_features = early_features.clone();
+    normal_features.session_metadata.observation_duration_ms = 2_000;
+    let normal_decision = evaluate_v3_from_features(&normal_features, &config, false);
+    let normal_actionability = v3_actionability_payload(&normal_features, &config, false);
+
+    assert_eq!(early_decision.verdict, V3ShadowVerdict::BuyCandidate);
+    assert_eq!(early_actionability["profile"], "early");
+    assert_eq!(early_actionability["stages"]["opportunity"], "actionable");
+    assert_eq!(normal_decision.verdict, V3ShadowVerdict::Pending);
+    assert_eq!(normal_actionability["profile"], "normal");
+    assert_eq!(
+        normal_actionability["stages"]["opportunity"],
+        "not_actionable"
+    );
+}
+
+#[test]
 fn gatekeeper_v3_is_deterministic_for_same_snapshot() {
     let features = strong_organic_features();
     let config = test_config();
@@ -211,9 +240,9 @@ fn gatekeeper_v3_feature_snapshot_hash_is_stable_and_feature_sensitive() {
     let mut changed = features.clone();
     changed.tx_intel_features.tx_count += 1;
 
-    let first = v3_feature_snapshot_hash(&features);
-    let second = v3_feature_snapshot_hash(&features);
-    let changed_hash = v3_feature_snapshot_hash(&changed);
+    let first = v3_feature_snapshot_hash(&features, 1);
+    let second = v3_feature_snapshot_hash(&features, 1);
+    let changed_hash = v3_feature_snapshot_hash(&changed, 1);
 
     assert_eq!(first, second);
     assert_ne!(first, changed_hash);
@@ -238,7 +267,7 @@ fn gatekeeper_v3_actionability_is_local_to_v3_sidecar() {
     let features = strong_organic_features();
     let config = test_config();
 
-    let payload = v3_actionability_payload(&features, &config);
+    let payload = v3_actionability_payload(&features, &config, false);
 
     assert_eq!(payload["stages"]["evidence"], "actionable");
     assert_eq!(payload["stages"]["opportunity"], "actionable");

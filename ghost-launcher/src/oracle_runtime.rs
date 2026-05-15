@@ -4414,9 +4414,11 @@ fn enrich_buy_log_with_v3_shadow(
     log.v3_shadow_confidence_final = Some(decision.confidence_breakdown.final_confidence);
     log.v3_shadow_confidence = Some(decision.confidence);
     log.v3_policy_config_hash = Some(config.v3_policy_config_hash());
-    log.v3_feature_snapshot_hash = Some(
-        crate::components::gatekeeper_v3::v3_feature_snapshot_hash(&assessment.feature_snapshot),
-    );
+    log.v3_feature_snapshot_hash =
+        Some(crate::components::gatekeeper_v3::v3_feature_snapshot_hash(
+            &assessment.feature_snapshot,
+            config.materialization_version,
+        ));
     log.v3_materialization_version = Some(config.materialization_version);
     log.v3_policy_version = Some(config.policy_version);
     log.v3_stage_thresholds = Some(config.stage_thresholds_payload());
@@ -4425,6 +4427,7 @@ fn enrich_buy_log_with_v3_shadow(
     log.v3_actionability = Some(crate::components::gatekeeper_v3::v3_actionability_payload(
         &assessment.feature_snapshot,
         config,
+        deadline_elapsed,
     ));
 
     let evidence_status = serde_json::to_value(&assessment.feature_snapshot.evidence_status).ok();
@@ -10721,20 +10724,22 @@ mod tests {
     fn review_test_gatekeeper_v3_config() -> GatekeeperV3Config {
         let mut config = GatekeeperV3Config::default();
         config.shadow_emit_enabled = true;
-        config.thresholds.min_tx_count = 2;
-        config.thresholds.min_unique_signers = 2;
-        config.thresholds.min_buy_count = 2;
-        config.thresholds.min_buy_ratio = 0.0;
-        config.thresholds.max_buy_ratio = 1.0;
-        config.thresholds.max_hhi = 1.0;
-        config.thresholds.hard_fail_hhi = 1.0;
-        config.thresholds.hard_fail_same_ms_tx_ratio = 1.0;
-        config.thresholds.hard_fail_top3_volume_pct = 1.0;
-        config.thresholds.max_tx_per_signer = 64;
-        config.thresholds.max_dev_volume_ratio = 1.0;
-        config.thresholds.reject_on_dev_sell = true;
-        config.thresholds.max_signer_cross_pool_velocity = 1.0;
-        config.thresholds.max_funding_source_concentration = 1.0;
+        for profile in [&mut config.early, &mut config.normal, &mut config.extended] {
+            profile.min_tx_count = 2;
+            profile.min_unique_signers = 2;
+            profile.min_buy_count = 2;
+            profile.min_buy_ratio = 0.0;
+            profile.max_buy_ratio = 1.0;
+            profile.max_hhi = 1.0;
+            profile.hard_fail_hhi = 1.0;
+            profile.hard_fail_same_ms_tx_ratio = 1.0;
+            profile.hard_fail_top3_volume_pct = 1.0;
+            profile.max_tx_per_signer = 64;
+            profile.max_dev_volume_ratio = 1.0;
+            profile.reject_on_dev_sell = true;
+            profile.max_signer_cross_pool_velocity = 1.0;
+            profile.max_funding_source_concentration = 1.0;
+        }
         config
     }
 

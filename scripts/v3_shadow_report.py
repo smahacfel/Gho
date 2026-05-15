@@ -181,6 +181,59 @@ def deduplicate_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return list(selected.values())
 
 
+def row_conflict_signature(row: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        active_verdict(row),
+        row.get("v3_shadow_verdict"),
+        row.get("v3_shadow_reason_code"),
+        row.get("v3_policy_config_hash"),
+        row.get("v3_feature_snapshot_hash"),
+    )
+
+
+def pre_dedupe_conflict_diagnostics(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    groups: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        groups[row_key(row)].append(row)
+
+    conflicts: dict[str, dict[str, Any]] = {}
+    duplicate_groups = 0
+    duplicate_rows = 0
+    conflict_rows = 0
+    for key, grouped_rows in sorted(groups.items(), key=lambda item: str(item[0])):
+        if len(grouped_rows) <= 1:
+            continue
+        duplicate_groups += 1
+        duplicate_rows += len(grouped_rows)
+        signatures = {row_conflict_signature(row) for row in grouped_rows}
+        if len(signatures) <= 1:
+            continue
+        conflict_rows += len(grouped_rows)
+        conflicts[str(key)] = {
+            "rows": len(grouped_rows),
+            "planes": sorted({str(row.get("decision_plane") or "missing") for row in grouped_rows}),
+            "active_verdicts": sorted({active_verdict(row) for row in grouped_rows}),
+            "v3_verdicts": sorted(
+                {str(row.get("v3_shadow_verdict") or "missing") for row in grouped_rows}
+            ),
+            "v3_reason_codes": sorted(
+                {str(row.get("v3_shadow_reason_code") or "missing") for row in grouped_rows}
+            ),
+            "policy_hashes": sorted({hash_value(row.get("v3_policy_config_hash")) for row in grouped_rows}),
+            "snapshot_hashes": sorted(
+                {hash_value(row.get("v3_feature_snapshot_hash")) for row in grouped_rows}
+            ),
+        }
+
+    return {
+        "duplicate_groups": duplicate_groups,
+        "duplicate_rows": duplicate_rows,
+        "conflict_groups": len(conflicts),
+        "conflict_rows": conflict_rows,
+        "conflicts": conflicts,
+    }
+
+
 def has_v3_fields(row: dict[str, Any]) -> bool:
     return any(key.startswith("v3_shadow_") for key in row)
 
@@ -316,6 +369,7 @@ def has_full_replay_payload(row: dict[str, Any]) -> bool:
 
 
 def build_report_from_rows(rows: list[dict[str, Any]], bad_rows: int = 0) -> dict[str, Any]:
+    pre_dedupe_conflicts = pre_dedupe_conflict_diagnostics(rows)
     deduped = deduplicate_rows(rows)
     v3_rows = [row for row in deduped if has_v3_fields(row)]
     status = "ok" if v3_rows else ("no_v3_fields" if deduped else "no_rows")
@@ -459,6 +513,7 @@ def build_report_from_rows(rows: list[dict[str, Any]], bad_rows: int = 0) -> dic
             "v3_rows": len(v3_rows),
             "no_v3_rows": len(deduped) - len(v3_rows),
         },
+        "pre_dedupe_conflicts": pre_dedupe_conflicts,
         "active_vs_v3_verdict": counters_to_dict(active_vs_v3),
         "v3_reason_codes": dict(sorted(reason_codes.items())),
         "v3_stages": dict(sorted(stages.items())),
@@ -532,17 +587,68 @@ def build_report(config_path: Path, decisions_log: Path | None = None) -> dict[s
     resolved_log = resolve_decisions_log(config_path, decisions_log)
     rows, bad_rows = load_jsonl(resolved_log)
     report = build_report_from_rows(rows, bad_rows)
+    freshness = artifact_freshness(config_path, resolved_log)
+    if report["status"] == "ok" and freshness["stale_against_config"]:
+        report["status"] = "stale_artifacts"
     report["inputs"] = {
         "config_path": str(config_path),
         "decisions_log": str(resolved_log),
     }
+    report["artifact_freshness"] = freshness
     return report
+
+
+def artifact_freshness(config_path: Path, decisions_log: Path) -> dict[str, Any]:
+    config = config_path if config_path.is_absolute() else (REPO_ROOT / config_path).resolve()
+    log = decisions_log if decisions_log.is_absolute() else (REPO_ROOT / decisions_log).resolve()
+    ghost_brain_config = resolve_ghost_brain_config(config)
+    config_mtimes = {
+        "rollout": file_mtime(config),
+        "ghost_brain": file_mtime(ghost_brain_config) if ghost_brain_config is not None else None,
+    }
+    newest_config_mtime = max((mtime for mtime in config_mtimes.values() if mtime is not None), default=None)
+    log_mtime = file_mtime(log)
+    stale = (
+        newest_config_mtime is not None
+        and log_mtime is not None
+        and log_mtime < newest_config_mtime
+    )
+    return {
+        "config_mtimes": config_mtimes,
+        "newest_config_mtime": newest_config_mtime,
+        "decisions_log_mtime": log_mtime,
+        "stale_against_config": stale,
+        "note": "stale_against_config means the selected decision log is older than the rollout or referenced Ghost Brain config and must not be treated as fresh post-change evidence",
+    }
+
+
+def file_mtime(path: Path) -> float | None:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
+
+def resolve_ghost_brain_config(config_path: Path) -> Path | None:
+    config = config_path if config_path.is_absolute() else (REPO_ROOT / config_path).resolve()
+    if not config.exists():
+        return None
+    try:
+        data = load_toml(config)
+    except OSError:
+        return None
+    raw = data.get("ghost_brain_config_path")
+    if not raw:
+        return None
+    return resolve_path(config, raw)
 
 
 def print_text(report: dict[str, Any]) -> None:
     counts = report["counts"]
     print(f"V3 shadow report status: {report['status']}")
     print(f"Replay status: {report['replay_status']}")
+    if "artifact_freshness" in report:
+        print(f"Artifact freshness: {report['artifact_freshness']}")
     print(
         "Rows: raw={raw_rows} deduped={deduped_rows} v3={v3_rows} no_v3={no_v3_rows} bad={bad_rows}".format(
             **counts

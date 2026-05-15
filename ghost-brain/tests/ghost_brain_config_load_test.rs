@@ -17,11 +17,19 @@ fn gatekeeper_v3_config_loads_from_production_toml() {
     assert_eq!(config.gatekeeper_v3.policy_version, 1);
     assert_eq!(config.gatekeeper_v3.materialization_version, 1);
     assert!(!config.gatekeeper_v3.promotion.enabled);
-    assert_eq!(config.gatekeeper_v3.thresholds.min_tx_count, 12);
-    assert_eq!(config.gatekeeper_v3.thresholds.min_unique_signers, 8);
-    assert_eq!(config.gatekeeper_v3.thresholds.min_buy_count, 6);
+    let gatekeeper_v2 = config
+        .gatekeeper_v2
+        .as_ref()
+        .expect("production config should include gatekeeper_v2");
+    assert_eq!(gatekeeper_v2.min_market_cap_sol, 41.0);
+    assert_eq!(config.gatekeeper_v3.normal.min_tx_count, 12);
+    assert_eq!(config.gatekeeper_v3.normal.min_unique_signers, 8);
+    assert_eq!(config.gatekeeper_v3.normal.min_buy_count, 6);
+    assert_eq!(config.gatekeeper_v3.extended.min_tx_count, 12);
+    assert!(!config.gatekeeper_v3.evidence_requirements.execution);
+    assert_eq!(config.gatekeeper_v3.confidence_caps.execution_not_run, 0.80);
     assert_eq!(
-        config.gatekeeper_v3.thresholds.execution_not_run_confidence_cap,
-        0.80
+        config.gatekeeper_v3.component_weights.max_risk_penalty,
+        0.85
     );
 }

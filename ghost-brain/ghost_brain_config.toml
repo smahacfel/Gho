@@ -97,7 +97,7 @@ min_single_sell_impact_pct = 0.0
 max_single_sell_impact_pct = 9999.0
 max_bonding_progress_pct = 99.0
 min_bonding_progress_pct = 40.0
-min_market_cap_sol = 30.0
+min_market_cap_sol = 41.0
 
 # ── Decision ────────────────────────────────────────────────────────────────────
 # 3-layer decision ON: tokeny nie giną od razu przy lekkim przekroczeniu progów —
@@ -332,11 +332,12 @@ enabled = false
 shadow_emit_enabled = true
 policy_version = 1
 materialization_version = 1
+early_window_ms = 2000
 
 [gatekeeper_v3.promotion]
 enabled = false
 
-[gatekeeper_v3.thresholds]
+[gatekeeper_v3.early]
 min_tx_count = 12
 min_unique_signers = 8
 min_buy_count = 6
@@ -353,7 +354,79 @@ max_signer_cross_pool_velocity = 9999.0
 max_funding_source_concentration = 0.99
 organic_min_tx_count_growth_ratio = 1.0
 organic_min_unique_signer_growth_ratio = 1.0
-execution_not_run_confidence_cap = 0.80
+
+[gatekeeper_v3.normal]
+min_tx_count = 12
+min_unique_signers = 8
+min_buy_count = 6
+min_buy_ratio = 0.80
+max_buy_ratio = 1.0
+max_hhi = 0.155
+hard_fail_hhi = 0.10
+hard_fail_same_ms_tx_ratio = 0.60
+hard_fail_top3_volume_pct = 0.70
+max_tx_per_signer = 999999
+max_dev_volume_ratio = 0.23
+reject_on_dev_sell = false
+max_signer_cross_pool_velocity = 9999.0
+max_funding_source_concentration = 0.99
+organic_min_tx_count_growth_ratio = 1.0
+organic_min_unique_signer_growth_ratio = 1.0
+
+[gatekeeper_v3.extended]
+min_tx_count = 12
+min_unique_signers = 8
+min_buy_count = 6
+min_buy_ratio = 0.80
+max_buy_ratio = 1.0
+max_hhi = 0.155
+hard_fail_hhi = 0.10
+hard_fail_same_ms_tx_ratio = 0.60
+hard_fail_top3_volume_pct = 0.70
+max_tx_per_signer = 999999
+max_dev_volume_ratio = 0.23
+reject_on_dev_sell = false
+max_signer_cross_pool_velocity = 9999.0
+max_funding_source_concentration = 0.99
+organic_min_tx_count_growth_ratio = 1.0
+organic_min_unique_signer_growth_ratio = 1.0
+
+[gatekeeper_v3.evidence_requirements]
+identity = true
+account_state = true
+tx_intel = true
+tx_segments = true
+checkpoints = true
+trajectory = true
+pdd_sequence = true
+curve = true
+sybil = true
+cpv = true
+fsc = true
+alpha = true
+manipulation = true
+organic_broadening = true
+manipulation_contradiction = true
+execution = false
+
+[gatekeeper_v3.confidence_caps]
+unavailable = 0.0
+degraded = 0.0
+insufficient_sample = 0.0
+stale = 0.0
+fallback = 0.0
+not_configured = 0.0
+execution_not_run = 0.80
+organic_broadening_insufficient = 0.0
+hard_risk = 0.0
+
+[gatekeeper_v3.component_weights]
+tx_count = 0.25
+unique_signers = 0.25
+buy_count = 0.20
+buy_ratio = 0.15
+growth = 0.15
+max_risk_penalty = 0.85
 
 
 # ==============================================================================

@@ -1,4 +1,6 @@
-use ghost_brain::config::{GatekeeperV3Config, GatekeeperV3Thresholds};
+use ghost_brain::config::{
+    GatekeeperV3ComponentWeights, GatekeeperV3Config, GatekeeperV3StageProfile,
+};
 use ghost_brain::oracle::reason_code::GatekeeperReasonCode;
 use ghost_core::checkpoint::{
     EvidenceStatus, FeatureEvidenceStatus, MaterializedFeatureSet, OrganicBroadeningFeatures,
@@ -163,8 +165,17 @@ impl V3ShadowDecision {
 pub fn v3_actionability_payload(
     features: &MaterializedFeatureSet,
     config: &GatekeeperV3Config,
+    deadline_elapsed: bool,
 ) -> serde_json::Value {
     let evidence = &features.evidence_status;
+    let profile = config.profile_for_context(
+        deadline_elapsed,
+        features.session_metadata.observation_duration_ms,
+    );
+    let profile_name = config.profile_name_for_context(
+        deadline_elapsed,
+        features.session_metadata.observation_duration_ms,
+    );
     let groups = [
         ("identity", &evidence.identity),
         ("account_state", &evidence.account_state),
@@ -190,26 +201,36 @@ pub fn v3_actionability_payload(
     let group_statuses: serde_json::Map<String, serde_json::Value> = groups
         .iter()
         .map(|(name, status)| {
+            let stage = default_stage_for_evidence_group(name);
             (
                 (*name).to_string(),
                 json!({
                     "status": format!("{:?}", status.status),
-                    "actionability": evidence_group_actionability(status.status),
+                    "stage": format!("{:?}", stage),
+                    "actionability": evaluate_feature_actionability(
+                        name,
+                        status.status,
+                        stage,
+                        config,
+                    ),
                 }),
             )
         })
         .collect();
 
-    let evidence_actionable = non_clean_evidence_issue(features).is_none();
-    let risk_actionable = !matches!(
+    let evidence_actionable = non_clean_evidence_issue(features, config).is_none();
+    let risk_actionable = evaluate_feature_actionability(
+        "manipulation_contradiction",
         evidence.manipulation_contradiction.status,
-        EvidenceStatus::Unavailable | EvidenceStatus::InsufficientSample
-    );
-    let opportunity_actionable = features.organic_broadening.sequence_available
-        && has_sufficient_sample(features, &config.thresholds);
+        DecisionStage::Risk,
+        config,
+    ) == "actionable";
+    let opportunity_actionable =
+        features.organic_broadening.sequence_available && has_sufficient_sample(features, profile);
     let confidence_actionable = evidence_actionable && opportunity_actionable;
 
     json!({
+        "profile": profile_name,
         "stages": {
             "evidence": stage_actionability(evidence_actionable),
             "risk": stage_actionability(risk_actionable),
@@ -242,7 +263,10 @@ pub fn v3_component_scores_payload(decision: &V3ShadowDecision) -> serde_json::V
     })
 }
 
-pub fn v3_feature_snapshot_hash(features: &MaterializedFeatureSet) -> String {
+pub fn v3_feature_snapshot_hash(
+    features: &MaterializedFeatureSet,
+    materialization_version: u32,
+) -> String {
     let account = &features.account_features;
     let tx = &features.tx_intel_features;
     let checkpoints = &features.checkpoint_features;
@@ -254,6 +278,7 @@ pub fn v3_feature_snapshot_hash(features: &MaterializedFeatureSet) -> String {
     let manipulation = &features.manipulation_contradictions;
 
     let payload = json!({
+        "materialization_version": materialization_version,
         "account_features": {
             "bonding_progress_bits": f64_bits(account.bonding_progress),
             "current_reserves": [account.current_reserves.0, account.current_reserves.1],
@@ -346,8 +371,7 @@ pub fn v3_feature_snapshot_hash(features: &MaterializedFeatureSet) -> String {
             "base_mint": session.base_mint.to_string(),
             "is_dev_known": session.is_dev_known,
             "observation_duration_ms": session.observation_duration_ms,
-            "pool_amm_id": session.pool_amm_id.to_string(),
-            "session_id": session.session_id.get()
+            "pool_amm_id": session.pool_amm_id.to_string()
         },
         "curve_readiness": {
             "curve_data_known": curve.curve_data_known,
@@ -479,11 +503,19 @@ pub fn evaluate_v3_from_features(
     config: &GatekeeperV3Config,
     deadline_elapsed: bool,
 ) -> V3ShadowDecision {
-    let thresholds = &config.thresholds;
-    let opportunity_score = organic_confidence(&features.organic_broadening, features, thresholds);
-    let risk_penalty = v3_risk_penalty(features, thresholds);
+    let profile = config.profile_for_context(
+        deadline_elapsed,
+        features.session_metadata.observation_duration_ms,
+    );
+    let opportunity_score = organic_confidence(
+        &features.organic_broadening,
+        features,
+        profile,
+        &config.component_weights,
+    );
+    let risk_penalty = v3_risk_penalty(features, profile, &config.component_weights);
 
-    if has_hard_risk_contradiction(features, thresholds) {
+    if has_hard_risk_contradiction(features, profile) {
         return V3ShadowDecision::new(
             V3ShadowVerdict::Reject,
             DecisionStage::Risk,
@@ -497,20 +529,26 @@ pub fn evaluate_v3_from_features(
             1.0,
             OpportunityVerdictStatus::Unavailable,
             opportunity_score,
-            ConfidenceBreakdown::capped(opportunity_score, 1.0, 0.0, 0.0, "hard_risk"),
+            ConfidenceBreakdown::capped(
+                opportunity_score,
+                1.0,
+                0.0,
+                config.confidence_caps.hard_risk,
+                "hard_risk",
+            ),
         );
     }
 
-    if let Some(issue) = non_clean_evidence_issue(features) {
-        return insufficient_evidence_decision(deadline_elapsed, issue, risk_penalty);
+    if let Some(issue) = non_clean_evidence_issue(features, config) {
+        return insufficient_evidence_decision(deadline_elapsed, issue, risk_penalty, config);
     }
 
-    if organic_broadening_passes(&features.organic_broadening, features, thresholds) {
+    if organic_broadening_passes(&features.organic_broadening, features, profile) {
         let confidence = ConfidenceBreakdown::capped(
             opportunity_score,
             risk_penalty,
             1.0,
-            thresholds.execution_not_run_confidence_cap,
+            config.confidence_caps.execution_not_run,
             "execution_not_run",
         );
         return V3ShadowDecision::new(
@@ -527,7 +565,7 @@ pub fn evaluate_v3_from_features(
         );
     }
 
-    let reason = if has_sufficient_sample(features, thresholds) {
+    let reason = if has_sufficient_sample(features, profile) {
         GatekeeperReasonCode::RejectV3LowOrganicBroadening
     } else if deadline_elapsed {
         GatekeeperReasonCode::TimeoutV3UnresolvedConfidence
@@ -568,7 +606,7 @@ pub fn evaluate_v3_from_features(
             } else {
                 0.0
             },
-            0.0,
+            config.confidence_caps.organic_broadening_insufficient,
             "organic_broadening_insufficient",
         ),
     )
@@ -578,6 +616,7 @@ fn insufficient_evidence_decision(
     deadline_elapsed: bool,
     issue: EvidenceIssue,
     risk_penalty: f64,
+    config: &GatekeeperV3Config,
 ) -> V3ShadowDecision {
     let terminal_reason = match (deadline_elapsed, issue) {
         (true, EvidenceIssue::Unavailable | EvidenceIssue::Degraded) => {
@@ -620,7 +659,13 @@ fn insufficient_evidence_decision(
             OpportunityVerdictStatus::Degraded
         },
         0.0,
-        ConfidenceBreakdown::capped(0.0, risk_penalty, 0.0, 0.0, "insufficient_evidence"),
+        ConfidenceBreakdown::capped(
+            0.0,
+            risk_penalty,
+            0.0,
+            evidence_issue_confidence_cap(issue, config),
+            "insufficient_evidence",
+        ),
     )
 }
 
@@ -631,50 +676,62 @@ enum EvidenceIssue {
     Degraded,
 }
 
-fn non_clean_evidence_issue(features: &MaterializedFeatureSet) -> Option<EvidenceIssue> {
+fn non_clean_evidence_issue(
+    features: &MaterializedFeatureSet,
+    config: &GatekeeperV3Config,
+) -> Option<EvidenceIssue> {
     let evidence = &features.evidence_status;
     let relevant = [
-        &evidence.identity,
-        &evidence.account_state,
-        &evidence.tx_intel,
-        &evidence.tx_segments,
-        &evidence.checkpoints,
-        &evidence.trajectory,
-        &evidence.pdd_sequence,
-        &evidence.curve,
-        &evidence.sybil,
-        &evidence.cpv,
-        &evidence.fsc,
-        &evidence.alpha,
-        &evidence.manipulation,
-        &evidence.organic_broadening,
-        &evidence.manipulation_contradiction,
+        ("identity", &evidence.identity),
+        ("account_state", &evidence.account_state),
+        ("tx_intel", &evidence.tx_intel),
+        ("tx_segments", &evidence.tx_segments),
+        ("checkpoints", &evidence.checkpoints),
+        ("trajectory", &evidence.trajectory),
+        ("pdd_sequence", &evidence.pdd_sequence),
+        ("curve", &evidence.curve),
+        ("sybil", &evidence.sybil),
+        ("cpv", &evidence.cpv),
+        ("fsc", &evidence.fsc),
+        ("alpha", &evidence.alpha),
+        ("manipulation", &evidence.manipulation),
+        ("organic_broadening", &evidence.organic_broadening),
+        (
+            "manipulation_contradiction",
+            &evidence.manipulation_contradiction,
+        ),
     ];
 
     if relevant
         .iter()
-        .any(|status| matches!(status.status, EvidenceStatus::Unavailable))
+        .filter(|(group, _)| config.evidence_requirements.required(group))
+        .any(|(_, status)| matches!(status.status, EvidenceStatus::Unavailable))
     {
         return Some(EvidenceIssue::Unavailable);
     }
 
     if relevant
         .iter()
-        .any(|status| matches!(status.status, EvidenceStatus::InsufficientSample))
+        .filter(|(group, _)| config.evidence_requirements.required(group))
+        .any(|(_, status)| matches!(status.status, EvidenceStatus::InsufficientSample))
     {
         return Some(EvidenceIssue::InsufficientSample);
     }
 
-    if relevant.iter().any(|status| {
-        matches!(
-            status.status,
-            EvidenceStatus::Degraded
-                | EvidenceStatus::Stale
-                | EvidenceStatus::Fallback
-                | EvidenceStatus::ShadowOnly
-                | EvidenceStatus::NotConfigured
-        )
-    }) {
+    if relevant
+        .iter()
+        .filter(|(group, _)| config.evidence_requirements.required(group))
+        .any(|(_, status)| {
+            matches!(
+                status.status,
+                EvidenceStatus::Degraded
+                    | EvidenceStatus::Stale
+                    | EvidenceStatus::Fallback
+                    | EvidenceStatus::ShadowOnly
+                    | EvidenceStatus::NotConfigured
+            )
+        })
+    {
         return Some(EvidenceIssue::Degraded);
     }
 
@@ -683,7 +740,7 @@ fn non_clean_evidence_issue(features: &MaterializedFeatureSet) -> Option<Evidenc
 
 fn has_hard_risk_contradiction(
     features: &MaterializedFeatureSet,
-    config: &GatekeeperV3Thresholds,
+    config: &GatekeeperV3StageProfile,
 ) -> bool {
     let risk = &features.manipulation_contradictions;
     let tx = &features.tx_intel_features;
@@ -709,7 +766,11 @@ fn has_hard_risk_contradiction(
             .is_some_and(|value| value > config.max_funding_source_concentration)
 }
 
-fn v3_risk_penalty(features: &MaterializedFeatureSet, config: &GatekeeperV3Thresholds) -> f64 {
+fn v3_risk_penalty(
+    features: &MaterializedFeatureSet,
+    config: &GatekeeperV3StageProfile,
+    weights: &GatekeeperV3ComponentWeights,
+) -> f64 {
     if has_hard_risk_contradiction(features, config) {
         return 1.0;
     }
@@ -731,12 +792,12 @@ fn v3_risk_penalty(features: &MaterializedFeatureSet, config: &GatekeeperV3Thres
 
     risk.contradiction_score
         .max(boolean_penalty)
-        .clamp(0.0, 0.85)
+        .clamp(0.0, weights.max_risk_penalty)
 }
 
 fn has_sufficient_sample(
     features: &MaterializedFeatureSet,
-    config: &GatekeeperV3Thresholds,
+    config: &GatekeeperV3StageProfile,
 ) -> bool {
     features.organic_broadening.sequence_available
         && features.tx_intel_features.tx_count >= config.min_tx_count
@@ -747,7 +808,7 @@ fn has_sufficient_sample(
 fn organic_broadening_passes(
     organic: &OrganicBroadeningFeatures,
     features: &MaterializedFeatureSet,
-    config: &GatekeeperV3Thresholds,
+    config: &GatekeeperV3StageProfile,
 ) -> bool {
     organic.sequence_available
         && organic.total_tx_count >= config.min_tx_count
@@ -765,7 +826,8 @@ fn organic_broadening_passes(
 fn organic_confidence(
     organic: &OrganicBroadeningFeatures,
     features: &MaterializedFeatureSet,
-    config: &GatekeeperV3Thresholds,
+    config: &GatekeeperV3StageProfile,
+    weights: &GatekeeperV3ComponentWeights,
 ) -> f64 {
     let tx_score = ratio_score(organic.total_tx_count as f64, config.min_tx_count as f64);
     let signer_score = ratio_score(
@@ -787,12 +849,14 @@ fn organic_confidence(
         + (organic.unique_signer_growth_ratio.min(2.0) - 1.0))
         / 2.0;
 
+    let total_weight = weights.total_opportunity_weight();
     clamp01(
-        0.25 * tx_score
-            + 0.25 * signer_score
-            + 0.20 * buy_count_score
-            + 0.15 * buy_ratio_score
-            + 0.15 * growth_score,
+        (weights.tx_count * tx_score
+            + weights.unique_signers * signer_score
+            + weights.buy_count * buy_count_score
+            + weights.buy_ratio * buy_ratio_score
+            + weights.growth * growth_score)
+            / total_weight,
     )
 }
 
@@ -869,16 +933,52 @@ fn evidence_status_payload(status: &FeatureEvidenceStatus) -> Value {
     })
 }
 
-fn evidence_group_actionability(status: EvidenceStatus) -> &'static str {
-    match status {
-        EvidenceStatus::Clean => "actionable",
-        EvidenceStatus::InsufficientSample => "wait_sample",
-        EvidenceStatus::Unavailable => "unavailable",
-        EvidenceStatus::Degraded
-        | EvidenceStatus::Stale
-        | EvidenceStatus::Fallback
-        | EvidenceStatus::ShadowOnly
-        | EvidenceStatus::NotConfigured => "degraded",
+fn evidence_issue_confidence_cap(issue: EvidenceIssue, config: &GatekeeperV3Config) -> f64 {
+    match issue {
+        EvidenceIssue::Unavailable => config.confidence_caps.unavailable,
+        EvidenceIssue::InsufficientSample => config.confidence_caps.insufficient_sample,
+        EvidenceIssue::Degraded => config.confidence_caps.degraded,
+    }
+}
+
+fn default_stage_for_evidence_group(group: &str) -> DecisionStage {
+    match group {
+        "manipulation" | "manipulation_contradiction" => DecisionStage::Risk,
+        "organic_broadening" => DecisionStage::Opportunity,
+        "execution" => DecisionStage::Confidence,
+        _ => DecisionStage::Evidence,
+    }
+}
+
+fn evaluate_feature_actionability(
+    group: &str,
+    status: EvidenceStatus,
+    stage: DecisionStage,
+    config: &GatekeeperV3Config,
+) -> &'static str {
+    if !config.evidence_requirements.required(group) {
+        return match status {
+            EvidenceStatus::Clean => "optional_clean",
+            EvidenceStatus::InsufficientSample => "optional_wait_sample",
+            EvidenceStatus::Unavailable => "optional_unavailable",
+            EvidenceStatus::Degraded
+            | EvidenceStatus::Stale
+            | EvidenceStatus::Fallback
+            | EvidenceStatus::ShadowOnly
+            | EvidenceStatus::NotConfigured => "optional_degraded",
+        };
+    }
+
+    match (stage, status) {
+        (_, EvidenceStatus::Clean) => "actionable",
+        (_, EvidenceStatus::InsufficientSample) => "wait_sample",
+        (DecisionStage::Risk, EvidenceStatus::Degraded | EvidenceStatus::Stale) => "not_actionable",
+        (DecisionStage::Risk, EvidenceStatus::Fallback | EvidenceStatus::ShadowOnly) => {
+            "not_actionable"
+        }
+        (_, EvidenceStatus::Degraded | EvidenceStatus::Stale) => "degraded",
+        (_, EvidenceStatus::Fallback | EvidenceStatus::ShadowOnly) => "degraded",
+        (_, EvidenceStatus::Unavailable | EvidenceStatus::NotConfigured) => "not_actionable",
     }
 }
 
@@ -887,5 +987,79 @@ fn stage_actionability(actionable: bool) -> &'static str {
         "actionable"
     } else {
         "not_actionable"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ghost_core::session::types::SessionId;
+
+    #[test]
+    fn feature_snapshot_hash_includes_materialization_version_not_session_id() {
+        let mut features = MaterializedFeatureSet::default();
+        features.session_metadata.session_id = SessionId(1);
+
+        let original = v3_feature_snapshot_hash(&features, 1);
+        assert_ne!(original, v3_feature_snapshot_hash(&features, 2));
+
+        features.session_metadata.session_id = SessionId(99);
+        assert_eq!(original, v3_feature_snapshot_hash(&features, 1));
+    }
+
+    #[test]
+    fn component_weights_change_opportunity_score_without_code_changes() {
+        let mut features = MaterializedFeatureSet::default();
+        features.tx_intel_features.buy_count = 5;
+        features.organic_broadening.total_tx_count = 10;
+        features.organic_broadening.total_unique_signers = 10;
+        features.organic_broadening.buy_ratio_min = 0.80;
+        features.organic_broadening.buy_ratio_mean = 0.90;
+        features.organic_broadening.buy_ratio_max = 1.0;
+        features.organic_broadening.tx_count_growth_ratio = 1.20;
+        features.organic_broadening.unique_signer_growth_ratio = 1.20;
+
+        let mut profile = GatekeeperV3StageProfile::default();
+        profile.min_tx_count = 10;
+        profile.min_unique_signers = 10;
+        profile.min_buy_count = 10;
+        profile.min_buy_ratio = 0.80;
+        profile.max_buy_ratio = 1.0;
+
+        let default_score = organic_confidence(
+            &features.organic_broadening,
+            &features,
+            &profile,
+            &GatekeeperV3ComponentWeights::default(),
+        );
+
+        let weights = GatekeeperV3ComponentWeights {
+            tx_count: 0.0,
+            unique_signers: 0.0,
+            buy_count: 1.0,
+            buy_ratio: 0.0,
+            growth: 0.0,
+            max_risk_penalty: 0.85,
+        };
+        let buy_count_only_score =
+            organic_confidence(&features.organic_broadening, &features, &profile, &weights);
+
+        assert_ne!(default_score, buy_count_only_score);
+        assert_eq!(buy_count_only_score, 0.5);
+    }
+
+    #[test]
+    fn degraded_manipulation_contradiction_blocks_risk_actionability() {
+        let mut features = MaterializedFeatureSet::default();
+        features.evidence_status.manipulation_contradiction.status = EvidenceStatus::Degraded;
+        let config = GatekeeperV3Config::default();
+
+        let payload = v3_actionability_payload(&features, &config, false);
+
+        assert_eq!(
+            payload["groups"]["manipulation_contradiction"]["actionability"],
+            json!("not_actionable")
+        );
+        assert_eq!(payload["stages"]["risk"], json!("not_actionable"));
     }
 }
