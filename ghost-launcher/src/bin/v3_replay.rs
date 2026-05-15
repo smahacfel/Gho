@@ -1,5 +1,8 @@
 use anyhow::{anyhow, Context, Result};
-use ghost_brain::config::GatekeeperV3Config;
+use ghost_brain::config::{
+    GatekeeperV3ComponentWeights, GatekeeperV3ConfidenceCaps, GatekeeperV3Config,
+    GatekeeperV3PromotionConfig, GatekeeperV3StageProfile,
+};
 use ghost_core::checkpoint::MaterializedFeatureSet;
 use ghost_launcher::components::gatekeeper_v3::{
     evaluate_v3_from_features, v3_feature_snapshot_hash,
@@ -331,13 +334,12 @@ fn validate_v3_row_status(
         ));
     }
 
-    let config: GatekeeperV3Config =
-        serde_json::from_value(policy_payload.clone()).map_err(|err| {
-            (
-                RowReplayStatus::PolicyDeserializeFailed,
-                format!("GatekeeperV3Config deserialize failed: {err}"),
-            )
-        })?;
+    let config = gatekeeper_v3_config_from_policy_payload(policy_payload).map_err(|err| {
+        (
+            RowReplayStatus::PolicyDeserializeFailed,
+            format!("GatekeeperV3Config policy payload decode failed: {err}"),
+        )
+    })?;
 
     let deadline_elapsed = row
         .get("v3_shadow_notes")
@@ -418,6 +420,151 @@ fn compare_f64(
     Ok(())
 }
 
+fn gatekeeper_v3_config_from_policy_payload(payload: &Value) -> Result<GatekeeperV3Config> {
+    let profiles = payload
+        .get("profiles")
+        .context("missing profiles payload")?;
+    let promotion = payload
+        .get("promotion")
+        .context("missing promotion payload")?;
+
+    let config = GatekeeperV3Config {
+        enabled: required_bool(payload, "enabled")?,
+        shadow_emit_enabled: required_bool(payload, "shadow_emit_enabled")?,
+        replay_payload_enabled: false,
+        policy_version: required_u32(payload, "policy_version")?,
+        materialization_version: required_u32(payload, "materialization_version")?,
+        early_window_ms: required_u64(payload, "early_window_ms")?,
+        promotion: GatekeeperV3PromotionConfig {
+            enabled: required_bool(promotion, "enabled")?,
+        },
+        early: stage_profile_from_policy_payload(required_object(profiles, "early")?)?,
+        normal: stage_profile_from_policy_payload(required_object(profiles, "normal")?)?,
+        extended: stage_profile_from_policy_payload(required_object(profiles, "extended")?)?,
+        evidence_requirements: serde_json::from_value(
+            payload
+                .get("evidence_requirements")
+                .context("missing evidence_requirements payload")?
+                .clone(),
+        )
+        .context("evidence_requirements payload deserialize failed")?,
+        confidence_caps: confidence_caps_from_policy_payload(
+            payload
+                .get("confidence_caps")
+                .context("missing confidence_caps payload")?,
+        )?,
+        component_weights: component_weights_from_policy_payload(
+            payload
+                .get("component_weights")
+                .context("missing component_weights payload")?,
+        )?,
+    };
+    config.validate()?;
+    if config.v3_policy_config_payload() != *payload {
+        anyhow::bail!("decoded config does not round-trip to canonical policy payload");
+    }
+    Ok(config)
+}
+
+fn stage_profile_from_policy_payload(payload: &Value) -> Result<GatekeeperV3StageProfile> {
+    Ok(GatekeeperV3StageProfile {
+        min_tx_count: required_u64(payload, "min_tx_count")?,
+        min_unique_signers: required_u64(payload, "min_unique_signers")?,
+        min_buy_count: required_u64(payload, "min_buy_count")?,
+        min_buy_ratio: required_f64_bits(payload, "min_buy_ratio_bits")?,
+        max_buy_ratio: required_f64_bits(payload, "max_buy_ratio_bits")?,
+        max_hhi: required_f64_bits(payload, "max_hhi_bits")?,
+        hard_fail_hhi: required_f64_bits(payload, "hard_fail_hhi_bits")?,
+        hard_fail_same_ms_tx_ratio: required_f64_bits(payload, "hard_fail_same_ms_tx_ratio_bits")?,
+        hard_fail_top3_volume_pct: required_f64_bits(payload, "hard_fail_top3_volume_pct_bits")?,
+        max_tx_per_signer: required_u64(payload, "max_tx_per_signer")?,
+        max_dev_volume_ratio: required_f64_bits(payload, "max_dev_volume_ratio_bits")?,
+        reject_on_dev_sell: required_bool(payload, "reject_on_dev_sell")?,
+        max_signer_cross_pool_velocity: required_f64_bits(
+            payload,
+            "max_signer_cross_pool_velocity_bits",
+        )?,
+        max_funding_source_concentration: required_f64_bits(
+            payload,
+            "max_funding_source_concentration_bits",
+        )?,
+        organic_min_tx_count_growth_ratio: required_f64_bits(
+            payload,
+            "organic_min_tx_count_growth_ratio_bits",
+        )?,
+        organic_min_unique_signer_growth_ratio: required_f64_bits(
+            payload,
+            "organic_min_unique_signer_growth_ratio_bits",
+        )?,
+    })
+}
+
+fn confidence_caps_from_policy_payload(payload: &Value) -> Result<GatekeeperV3ConfidenceCaps> {
+    Ok(GatekeeperV3ConfidenceCaps {
+        unavailable: required_f64_bits(payload, "unavailable_bits")?,
+        degraded: required_f64_bits(payload, "degraded_bits")?,
+        insufficient_sample: required_f64_bits(payload, "insufficient_sample_bits")?,
+        stale: required_f64_bits(payload, "stale_bits")?,
+        fallback: required_f64_bits(payload, "fallback_bits")?,
+        not_configured: required_f64_bits(payload, "not_configured_bits")?,
+        execution_not_run: required_f64_bits(payload, "execution_not_run_bits")?,
+        organic_broadening_insufficient: required_f64_bits(
+            payload,
+            "organic_broadening_insufficient_bits",
+        )?,
+        hard_risk: required_f64_bits(payload, "hard_risk_bits")?,
+    })
+}
+
+fn component_weights_from_policy_payload(payload: &Value) -> Result<GatekeeperV3ComponentWeights> {
+    Ok(GatekeeperV3ComponentWeights {
+        tx_count: required_f64_bits(payload, "tx_count_bits")?,
+        unique_signers: required_f64_bits(payload, "unique_signers_bits")?,
+        buy_count: required_f64_bits(payload, "buy_count_bits")?,
+        buy_ratio: required_f64_bits(payload, "buy_ratio_bits")?,
+        growth: required_f64_bits(payload, "growth_bits")?,
+        max_risk_penalty: required_f64_bits(payload, "max_risk_penalty_bits")?,
+    })
+}
+
+fn required_object<'a>(payload: &'a Value, field: &str) -> Result<&'a Value> {
+    let value = payload
+        .get(field)
+        .with_context(|| format!("missing {field}"))?;
+    if !value.is_object() {
+        anyhow::bail!("{field} must be an object");
+    }
+    Ok(value)
+}
+
+fn required_bool(payload: &Value, field: &str) -> Result<bool> {
+    payload
+        .get(field)
+        .and_then(Value::as_bool)
+        .with_context(|| format!("missing or non-bool {field}"))
+}
+
+fn required_u64(payload: &Value, field: &str) -> Result<u64> {
+    payload
+        .get(field)
+        .and_then(Value::as_u64)
+        .with_context(|| format!("missing or non-u64 {field}"))
+}
+
+fn required_u32(payload: &Value, field: &str) -> Result<u32> {
+    let value = required_u64(payload, field)?;
+    u32::try_from(value).with_context(|| format!("{field} does not fit u32"))
+}
+
+fn required_f64_bits(payload: &Value, field: &str) -> Result<f64> {
+    let raw = payload
+        .get(field)
+        .and_then(Value::as_str)
+        .with_context(|| format!("missing or non-string {field}"))?;
+    let bits = u64::from_str_radix(raw, 16).with_context(|| format!("{field} is not hex bits"))?;
+    Ok(f64::from_bits(bits))
+}
+
 fn has_v3_fields(row: &Value) -> bool {
     row.get("v3_shadow_schema_version").is_some()
         || row.get("v3_shadow_verdict").is_some()
@@ -445,20 +592,52 @@ mod tests {
     use ghost_launcher::components::gatekeeper_v3::v3_feature_snapshot_hash;
     use serde_json::json;
 
-    fn policy_payload_and_hash() -> (Value, String) {
-        let mut config = GatekeeperV3Config::default();
-        config.shadow_emit_enabled = true;
+    fn policy_payload_and_hash(config: &GatekeeperV3Config) -> (Value, String) {
         let payload = config.v3_policy_config_payload();
         let bytes = serde_json::to_vec(&payload).unwrap();
         let hash = blake3::hash(&bytes).to_hex().to_string();
         (payload, hash)
     }
 
+    fn replay_payload_config() -> GatekeeperV3Config {
+        let mut config = GatekeeperV3Config::default();
+        config.shadow_emit_enabled = true;
+        config
+    }
+
+    fn production_like_replay_payload_config() -> GatekeeperV3Config {
+        let mut config = replay_payload_config();
+        for profile in [&mut config.early, &mut config.normal, &mut config.extended] {
+            profile.min_tx_count = 12;
+            profile.min_unique_signers = 8;
+            profile.min_buy_count = 6;
+            profile.min_buy_ratio = 0.80;
+            profile.max_hhi = 0.155;
+            profile.hard_fail_hhi = 0.10;
+            profile.hard_fail_same_ms_tx_ratio = 0.60;
+            profile.hard_fail_top3_volume_pct = 0.70;
+            profile.max_tx_per_signer = 999_999;
+            profile.max_dev_volume_ratio = 0.23;
+            profile.max_signer_cross_pool_velocity = 9_999.0;
+            profile.max_funding_source_concentration = 0.99;
+        }
+        config.component_weights.tx_count = 0.25;
+        config.component_weights.unique_signers = 0.25;
+        config.component_weights.buy_count = 0.20;
+        config.component_weights.buy_ratio = 0.15;
+        config.component_weights.growth = 0.15;
+        config.component_weights.max_risk_penalty = 0.85;
+        config
+    }
+
     fn full_row() -> Value {
+        full_row_with_config(&replay_payload_config())
+    }
+
+    fn full_row_with_config(config: &GatekeeperV3Config) -> Value {
         let features = MaterializedFeatureSet::default();
         let materialization_version = 1;
-        let (policy_payload, policy_hash) = policy_payload_and_hash();
-        let config: GatekeeperV3Config = serde_json::from_value(policy_payload.clone()).unwrap();
+        let (policy_payload, policy_hash) = policy_payload_and_hash(config);
         let decision = evaluate_v3_from_features(&features, &config, false);
         json!({
             "ab_record_id": "ab-1",
@@ -483,6 +662,33 @@ mod tests {
     fn validates_full_replay_ok() {
         assert_eq!(
             validate_v3_row_status(&full_row()).unwrap(),
+            RowReplayStatus::FullReplayOk
+        );
+    }
+
+    #[test]
+    fn decodes_canonical_policy_payload_with_non_default_profiles() {
+        let config = production_like_replay_payload_config();
+        let payload = config.v3_policy_config_payload();
+
+        let decoded = gatekeeper_v3_config_from_policy_payload(&payload).unwrap();
+
+        assert_eq!(decoded.v3_policy_config_payload(), payload);
+        assert_eq!(decoded.normal.min_tx_count, 12);
+        assert_eq!(decoded.normal.min_unique_signers, 8);
+        assert_eq!(decoded.normal.min_buy_ratio, 0.80);
+        assert_eq!(decoded.normal.max_tx_per_signer, 999_999);
+        assert_eq!(decoded.component_weights.max_risk_penalty, 0.85);
+        assert!(!decoded.replay_payload_enabled);
+    }
+
+    #[test]
+    fn validates_full_replay_with_non_default_policy_payload() {
+        assert_eq!(
+            validate_v3_row_status(&full_row_with_config(
+                &production_like_replay_payload_config()
+            ))
+            .unwrap(),
             RowReplayStatus::FullReplayOk
         );
     }

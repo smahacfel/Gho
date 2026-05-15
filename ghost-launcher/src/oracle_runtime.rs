@@ -4423,6 +4423,19 @@ fn enrich_buy_log_with_v3_shadow(
     if config.replay_payload_enabled {
         match serde_json::to_value(&assessment.feature_snapshot) {
             Ok(snapshot_payload) => {
+                match serde_json::from_value::<MaterializedFeatureSet>(snapshot_payload.clone()) {
+                    Ok(replay_features) => {
+                        log.v3_feature_snapshot_hash =
+                            Some(crate::components::gatekeeper_v3::v3_feature_snapshot_hash(
+                                &replay_features,
+                                config.materialization_version,
+                            ));
+                    }
+                    Err(err) => warn!(
+                        error = %err,
+                        "failed to round-trip V3 replay payload before hashing; keeping runtime snapshot hash"
+                    ),
+                }
                 log.v3_replay_payload_schema_version = Some(V3_REPLAY_PAYLOAD_SCHEMA_VERSION);
                 log.v3_materialized_feature_snapshot = Some(snapshot_payload);
                 log.v3_policy_config_payload = Some(config.v3_policy_config_payload());
