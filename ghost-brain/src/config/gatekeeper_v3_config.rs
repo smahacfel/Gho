@@ -22,6 +22,8 @@ pub struct GatekeeperV3Config {
     pub enabled: bool,
     #[serde(default)]
     pub shadow_emit_enabled: bool,
+    #[serde(default)]
+    pub replay_payload_enabled: bool,
     #[serde(default = "default_v3_policy_version")]
     pub policy_version: u32,
     #[serde(default = "default_v3_materialization_version")]
@@ -49,6 +51,7 @@ impl Default for GatekeeperV3Config {
         Self {
             enabled: false,
             shadow_emit_enabled: false,
+            replay_payload_enabled: false,
             policy_version: DEFAULT_V3_POLICY_VERSION,
             materialization_version: DEFAULT_V3_MATERIALIZATION_VERSION,
             early_window_ms: default_early_window_ms(),
@@ -711,6 +714,7 @@ mod tests {
         let config = GatekeeperV3Config::default();
         assert!(!config.enabled);
         assert!(!config.shadow_emit_enabled);
+        assert!(!config.replay_payload_enabled);
         assert_eq!(config.policy_version, 1);
         assert_eq!(config.materialization_version, 1);
         assert_eq!(config.early_window_ms, 2_000);
@@ -745,6 +749,36 @@ mod tests {
         let mut changed = config.clone();
         changed.component_weights.tx_count += 0.01;
         assert_ne!(
+            config.v3_policy_config_hash(),
+            changed.v3_policy_config_hash()
+        );
+    }
+
+    #[test]
+    fn gatekeeper_v3_config_loads_without_replay_payload_field() {
+        let config: GatekeeperV3Config = toml::from_str(
+            r#"
+enabled = false
+shadow_emit_enabled = true
+policy_version = 1
+materialization_version = 1
+"#,
+        )
+        .unwrap();
+
+        assert!(config.shadow_emit_enabled);
+        assert!(!config.replay_payload_enabled);
+        assert_eq!(config.policy_version, 1);
+        assert_eq!(config.materialization_version, 1);
+    }
+
+    #[test]
+    fn replay_payload_flag_does_not_change_policy_hash() {
+        let config = GatekeeperV3Config::default();
+        let mut changed = config.clone();
+        changed.replay_payload_enabled = true;
+
+        assert_eq!(
             config.v3_policy_config_hash(),
             changed.v3_policy_config_hash()
         );

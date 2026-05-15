@@ -716,6 +716,12 @@ pub struct GatekeeperBuyLog {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub v3_feature_snapshot_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v3_replay_payload_schema_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v3_materialized_feature_snapshot: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v3_policy_config_payload: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub v3_materialization_version: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub v3_policy_version: Option<u32>,
@@ -2661,6 +2667,9 @@ mod tests {
             v3_manipulation_contradictions: None,
             v3_policy_config_hash: None,
             v3_feature_snapshot_hash: None,
+            v3_replay_payload_schema_version: None,
+            v3_materialized_feature_snapshot: None,
+            v3_policy_config_payload: None,
             v3_materialization_version: None,
             v3_policy_version: None,
             v3_stage_thresholds: None,
@@ -3115,6 +3124,9 @@ mod tests {
             v3_manipulation_contradictions: None,
             v3_policy_config_hash: None,
             v3_feature_snapshot_hash: None,
+            v3_replay_payload_schema_version: None,
+            v3_materialized_feature_snapshot: None,
+            v3_policy_config_payload: None,
             v3_materialization_version: None,
             v3_policy_version: None,
             v3_stage_thresholds: None,
@@ -3312,6 +3324,32 @@ mod tests {
     }
 
     #[test]
+    fn test_v3_replay_payload_fields_serialize_only_when_some() {
+        let mut log = create_test_buy_log();
+        let record = serde_json::to_value(&log).unwrap();
+        assert!(record.get("v3_replay_payload_schema_version").is_none());
+        assert!(record.get("v3_materialized_feature_snapshot").is_none());
+        assert!(record.get("v3_policy_config_payload").is_none());
+
+        log.v3_replay_payload_schema_version = Some(1);
+        log.v3_materialized_feature_snapshot = Some(serde_json::json!({
+            "materialization_version": 1,
+            "pool_id": "pool_payload"
+        }));
+        log.v3_policy_config_payload = Some(serde_json::json!({
+            "policy_version": 1
+        }));
+
+        let record = serde_json::to_value(&log).unwrap();
+        assert_eq!(record["v3_replay_payload_schema_version"], 1);
+        assert_eq!(
+            record["v3_materialized_feature_snapshot"]["pool_id"],
+            "pool_payload"
+        );
+        assert_eq!(record["v3_policy_config_payload"]["policy_version"], 1);
+    }
+
+    #[test]
     fn test_gatekeeper_buy_log_v19_without_v3_fields_deserializes() {
         let mut legacy_value = serde_json::to_value(create_test_buy_log()).unwrap();
         legacy_value["log_schema_version"] = serde_json::json!(19);
@@ -3344,6 +3382,9 @@ mod tests {
         assert!(parsed.v3_manipulation_contradictions.is_none());
         assert!(parsed.v3_policy_config_hash.is_none());
         assert!(parsed.v3_feature_snapshot_hash.is_none());
+        assert!(parsed.v3_replay_payload_schema_version.is_none());
+        assert!(parsed.v3_materialized_feature_snapshot.is_none());
+        assert!(parsed.v3_policy_config_payload.is_none());
         assert!(parsed.v3_materialization_version.is_none());
         assert!(parsed.v3_policy_version.is_none());
         assert!(parsed.v3_stage_thresholds.is_none());
@@ -3398,6 +3439,15 @@ mod tests {
         log.v3_manipulation_contradictions = log.v3_shadow_manipulation_contradictions.clone();
         log.v3_policy_config_hash = Some("v3-policy-hash".to_string());
         log.v3_feature_snapshot_hash = Some("v3-feature-hash".to_string());
+        log.v3_replay_payload_schema_version = Some(1);
+        log.v3_materialized_feature_snapshot = Some(serde_json::json!({
+            "materialization_version": 1,
+            "token_mint": "mint_v3_replay"
+        }));
+        log.v3_policy_config_payload = Some(serde_json::json!({
+            "policy_version": 1,
+            "profiles": {"normal": {"min_tx_count": 12}}
+        }));
         log.v3_materialization_version = Some(1);
         log.v3_policy_version = Some(1);
         log.v3_stage_thresholds = Some(serde_json::json!({
@@ -3445,6 +3495,15 @@ mod tests {
         assert_eq!(record["v3_shadow_confidence"], 0.0);
         assert_eq!(record["v3_policy_config_hash"], "v3-policy-hash");
         assert_eq!(record["v3_feature_snapshot_hash"], "v3-feature-hash");
+        assert_eq!(record["v3_replay_payload_schema_version"], 1);
+        assert_eq!(
+            record["v3_materialized_feature_snapshot"]["token_mint"],
+            "mint_v3_replay"
+        );
+        assert_eq!(
+            record["v3_policy_config_payload"]["profiles"]["normal"]["min_tx_count"],
+            12
+        );
         assert_eq!(record["v3_materialization_version"], 1);
         assert_eq!(record["v3_policy_version"], 1);
         assert_eq!(

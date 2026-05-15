@@ -14,6 +14,7 @@ fn gatekeeper_v3_config_loads_from_production_toml() {
 
     assert!(!config.gatekeeper_v3.enabled);
     assert!(config.gatekeeper_v3.shadow_emit_enabled);
+    assert!(!config.gatekeeper_v3.replay_payload_enabled);
     assert_eq!(config.gatekeeper_v3.policy_version, 1);
     assert_eq!(config.gatekeeper_v3.materialization_version, 1);
     assert!(!config.gatekeeper_v3.promotion.enabled);
