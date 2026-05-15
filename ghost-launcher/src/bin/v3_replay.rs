@@ -29,6 +29,7 @@ enum RowReplayStatus {
     PolicyDeserializeFailed,
     PolicyHashMismatch,
     VerdictMismatch,
+    StageMismatch,
     ReasonMismatch,
     ScoreMismatch,
 }
@@ -47,6 +48,7 @@ impl RowReplayStatus {
             Self::PolicyDeserializeFailed => "policy_deserialize_failed",
             Self::PolicyHashMismatch => "policy_hash_mismatch",
             Self::VerdictMismatch => "verdict_mismatch",
+            Self::StageMismatch => "stage_mismatch",
             Self::ReasonMismatch => "reason_mismatch",
             Self::ScoreMismatch => "score_mismatch",
         }
@@ -354,6 +356,16 @@ fn validate_v3_row_status(
             ),
         ));
     }
+    if string_field(row, "v3_shadow_stage").as_deref() != Some(decision.stage.as_log_str()) {
+        return Err((
+            RowReplayStatus::StageMismatch,
+            format!(
+                "expected {:?}, replayed {}",
+                string_field(row, "v3_shadow_stage"),
+                decision.stage.as_log_str()
+            ),
+        ));
+    }
     let replayed_reason_code = decision.reason_code.as_log_str();
     if string_field(row, "v3_shadow_reason_code").as_deref() != Some(replayed_reason_code.as_str())
     {
@@ -452,6 +464,7 @@ mod tests {
             "ab_record_id": "ab-1",
             "v3_shadow_schema_version": 1,
             "v3_shadow_verdict": decision.verdict.as_log_str(),
+            "v3_shadow_stage": decision.stage.as_log_str(),
             "v3_shadow_reason_code": decision.reason_code.as_log_str(),
             "v3_shadow_risk_penalty": decision.risk_penalty,
             "v3_shadow_opportunity_score": decision.opportunity_score,
@@ -500,6 +513,14 @@ mod tests {
         row["v3_feature_snapshot_hash"] = json!("wrong");
         let err = validate_v3_row_status(&row).unwrap_err();
         assert_eq!(err.0, RowReplayStatus::PayloadHashMismatch);
+    }
+
+    #[test]
+    fn rejects_stage_mismatch() {
+        let mut row = full_row();
+        row["v3_shadow_stage"] = json!("wrong_stage");
+        let err = validate_v3_row_status(&row).unwrap_err();
+        assert_eq!(err.0, RowReplayStatus::StageMismatch);
     }
 
     #[test]
