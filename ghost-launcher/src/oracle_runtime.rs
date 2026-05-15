@@ -130,6 +130,7 @@ const COMPUTE_BUDGET_PROGRAM_ID: &str = "ComputeBudget11111111111111111111111111
 const ASSOCIATED_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
 const LIVE_TRIGGER_READINESS_TIMEOUT_MS: u64 = 75;
+const V3_REPLAY_PAYLOAD_SCHEMA_VERSION: u32 = 1;
 /// Pump.fun token decimal factor (6 decimals → 10^6).
 /// Used to convert raw on-chain token reserves to PumpPortal-compatible display units.
 const PUMP_TOKEN_DECIMAL_FACTOR: f64 = 1_000_000.0;
@@ -4419,6 +4420,19 @@ fn enrich_buy_log_with_v3_shadow(
             &assessment.feature_snapshot,
             config.materialization_version,
         ));
+    if config.replay_payload_enabled {
+        match serde_json::to_value(&assessment.feature_snapshot) {
+            Ok(snapshot_payload) => {
+                log.v3_replay_payload_schema_version = Some(V3_REPLAY_PAYLOAD_SCHEMA_VERSION);
+                log.v3_materialized_feature_snapshot = Some(snapshot_payload);
+                log.v3_policy_config_payload = Some(config.v3_policy_config_payload());
+            }
+            Err(err) => warn!(
+                error = %err,
+                "failed to serialize V3 replay payload; continuing without full replay payload"
+            ),
+        }
+    }
     log.v3_materialization_version = Some(config.materialization_version);
     log.v3_policy_version = Some(config.policy_version);
     log.v3_stage_thresholds = Some(config.stage_thresholds_payload());
@@ -20348,6 +20362,9 @@ mod tests {
         assert!(log.v3_stage_thresholds.is_some());
         assert!(log.v3_component_scores.is_some());
         assert!(log.v3_actionability.is_some());
+        assert!(log.v3_replay_payload_schema_version.is_none());
+        assert!(log.v3_materialized_feature_snapshot.is_none());
+        assert!(log.v3_policy_config_payload.is_none());
     }
 
     #[test]
@@ -20409,7 +20426,8 @@ mod tests {
     #[test]
     fn test_enrich_buy_log_with_v3_shadow_respects_shadow_emit_flag() {
         let active_config = review_test_gatekeeper_config();
-        let v3_config = GatekeeperV3Config::default();
+        let mut v3_config = GatekeeperV3Config::default();
+        v3_config.replay_payload_enabled = true;
         let pool_id = Pubkey::new_unique();
         let mut assessment = test_gatekeeper_buy_assessment(6);
         assessment.feature_snapshot = review_v3_buy_candidate_features();
@@ -20420,6 +20438,62 @@ mod tests {
         assert!(log.v3_shadow_verdict.is_none());
         assert!(log.v3_policy_config_hash.is_none());
         assert!(log.v3_component_scores.is_none());
+        assert!(log.v3_replay_payload_schema_version.is_none());
+        assert!(log.v3_materialized_feature_snapshot.is_none());
+        assert!(log.v3_policy_config_payload.is_none());
+    }
+
+    #[test]
+    fn test_enrich_buy_log_with_v3_replay_payload_requires_both_gates() {
+        let active_config = review_test_gatekeeper_config();
+        let pool_id = Pubkey::new_unique();
+        let mut assessment = test_gatekeeper_buy_assessment(6);
+        assessment.feature_snapshot = review_v3_buy_candidate_features();
+
+        let mut shadow_only_config = review_test_gatekeeper_v3_config();
+        shadow_only_config.replay_payload_enabled = false;
+        let mut log = assessment.to_buy_log(&pool_id, &active_config);
+        enrich_buy_log_with_v3_shadow(&mut log, &assessment, &shadow_only_config, false);
+        assert!(log.v3_shadow_verdict.is_some());
+        assert!(log.v3_replay_payload_schema_version.is_none());
+        assert!(log.v3_materialized_feature_snapshot.is_none());
+        assert!(log.v3_policy_config_payload.is_none());
+
+        let mut payload_config = review_test_gatekeeper_v3_config();
+        payload_config.replay_payload_enabled = true;
+        let mut log = assessment.to_buy_log(&pool_id, &active_config);
+        enrich_buy_log_with_v3_shadow(&mut log, &assessment, &payload_config, false);
+
+        assert_eq!(
+            log.v3_replay_payload_schema_version,
+            Some(V3_REPLAY_PAYLOAD_SCHEMA_VERSION)
+        );
+        let snapshot_payload = log
+            .v3_materialized_feature_snapshot
+            .clone()
+            .expect("payload enabled should emit MaterializedFeatureSet snapshot");
+        let replay_features: MaterializedFeatureSet =
+            serde_json::from_value(snapshot_payload).expect("snapshot payload should replay");
+        let replay_hash = crate::components::gatekeeper_v3::v3_feature_snapshot_hash(
+            &replay_features,
+            payload_config.materialization_version,
+        );
+        assert_eq!(
+            log.v3_feature_snapshot_hash.as_deref(),
+            Some(replay_hash.as_str())
+        );
+
+        let policy_payload = log
+            .v3_policy_config_payload
+            .as_ref()
+            .expect("payload enabled should emit policy config payload");
+        assert!(policy_payload.get("replay_payload_enabled").is_none());
+        let policy_bytes = serde_json::to_vec(policy_payload).unwrap();
+        let policy_hash = blake3::hash(&policy_bytes).to_hex().to_string();
+        assert_eq!(
+            log.v3_policy_config_hash.as_deref(),
+            Some(policy_hash.as_str())
+        );
     }
 
     #[test]

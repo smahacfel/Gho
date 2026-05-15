@@ -83,11 +83,15 @@ impl GatekeeperV3Config {
     }
 
     pub fn v3_policy_config_hash(&self) -> String {
-        let payload = self.canonical_policy_payload();
+        let payload = self.v3_policy_config_payload();
         // `serde_json::Value` serialization cannot fail for this in-memory
         // payload; this panic would indicate a serde_json invariant violation.
         let bytes = serde_json::to_vec(&payload).expect("canonical V3 policy payload serializes");
         blake3::hash(&bytes).to_hex().to_string()
+    }
+
+    pub fn v3_policy_config_payload(&self) -> serde_json::Value {
+        self.canonical_policy_payload()
     }
 
     pub fn stage_thresholds_payload(&self) -> serde_json::Value {
@@ -781,6 +785,26 @@ materialization_version = 1
         assert_eq!(
             config.v3_policy_config_hash(),
             changed.v3_policy_config_hash()
+        );
+        assert_eq!(
+            config.v3_policy_config_payload(),
+            changed.v3_policy_config_payload()
+        );
+        assert!(config
+            .v3_policy_config_payload()
+            .get("replay_payload_enabled")
+            .is_none());
+    }
+
+    #[test]
+    fn policy_config_payload_matches_policy_hash() {
+        let config = GatekeeperV3Config::default();
+        let payload = config.v3_policy_config_payload();
+        let bytes = serde_json::to_vec(&payload).unwrap();
+
+        assert_eq!(
+            config.v3_policy_config_hash(),
+            blake3::hash(&bytes).to_hex().to_string()
         );
     }
 
