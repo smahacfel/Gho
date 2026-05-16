@@ -33,8 +33,9 @@ source_mode = "grpc"
 commitment = "processed"
 stream_mode = "single_global"
 tx_filter_strategy = "per_pool"
-# Canonical PR-6 shadow burn-in profile keeps the authoritative funding lane on,
-# so the standard operator command exercises standalone shadow + real FSC coverage.
+# Legacy PR-6 shadow burn-in profile keeps the authoritative funding lane on.
+# For current V3 validation under the single-stream provider constraint, ADR-0130
+# pauses FSC/full-chain bake; use primary-only profiles with funding lane disabled.
 funding_lane_mode = "full_chain"
 grpc_endpoint = "yellowstone-solana-mainnet.core.chainstack.com:443"
 grpc_x_token = "f2993325e24cc4aaa8f2d5fdd2b4c6fa"

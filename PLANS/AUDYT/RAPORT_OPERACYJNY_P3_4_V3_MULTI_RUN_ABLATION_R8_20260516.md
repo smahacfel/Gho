@@ -108,8 +108,13 @@ dostępnego primary Yellowstone global stream. P3.4 nie może być walidowany be
 
 ## Następny krok
 
-Uruchomić kolejny namespace P3.4 po zwolnieniu limitu Yellowstone albo po zapewnieniu oddzielnej
-pojemności streamu dla primary global stream. Warunek zaliczenia pozostaje ten sam:
+Aktualizacja po decyzji `ADR-0130`: przy obecnym providerze nie będzie oddzielnej pojemności streamu
+dla dedicated funding lane, więc nie należy planować kolejnych full-chain retry jako warunku V3.
+R8 pozostaje dowodem, że full-chain FSC lane konkuruje z primary streamem i blokuje decision rows.
+
+Dalsza walidacja V3 przechodzi na primary-only full replay, zgodnie z
+`PLANS/PLAN_P3_5_V3_PRIMARY_ONLY_OUTCOME_VALIDATION_20260516.md`. Warunek zaliczenia dla tego toru
+pozostaje:
 
 - świeże V3 rows,
 - `v3_full_replay_report.py --strict` z `replay_status=full_replay_ok`,

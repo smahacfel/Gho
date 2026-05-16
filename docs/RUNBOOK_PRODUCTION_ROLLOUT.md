@@ -147,6 +147,12 @@ Nie wolno przejść do `dual-micro-live`, jeżeli raport kończy się `NO-GO`.
 
 ### FSC authoritative-lane bake package
 
+**Status 2026-05-16:** ten bake jest wstrzymany dla obecnego providera przez
+`docs/ADR/ADR-0130-v3-fsc-scope-decision-single-stream.md`. Obecny endpoint pozwala tylko na jeden
+stream, więc dedicated `full_chain` lane konkuruje z primary streamem i może uniemożliwić zebranie
+decision rows. Poniższa procedura pozostaje historycznym runbookiem / future-only, a nie aktywnym
+krokiem V3.
+
 Ten bake pozostaje **data-plane only**. Nie zmieniaj:
 
 - `soft_penalty_high_fsc`,
@@ -259,5 +265,8 @@ Natychmiastowe wyłączenie jest wymagane przy:
 - `configs/rollout/future-live.toml` pozostaje przygotowany, ale nie może być uruchamiany przed domknięciem PR-7.
 - Trackowany `config.toml` jest tylko bezpiecznym szablonem referencyjnym, nie nośnikiem sekretów produkcyjnych.
 - `configs/rollout/shadow-burnin.toml` i `configs/rollout/paper-burnin.toml` uruchamiają `seer.funding_lane_mode = "full_chain"`.
+- Pod obecnym single-stream provider constraint profile `full_chain` są paused/future-only dla FSC.
+  Dla bieżącej walidacji V3 używaj primary-only profili z `funding_lane_mode = "disabled"` zgodnie
+  z `ADR-0130`.
 - `config.toml`, `configs/rollout/dual-micro-live.toml` i `configs/rollout/future-live.toml` pozostają na `funding_lane_mode = "disabled"`.
 - Jeśli potrzebujesz lane-disabled control artifact albo rollbacku bake, wyprowadź lokalną kopię `shadow-burnin.toml` z pojedynczym flipem `seer.funding_lane_mode = "disabled"`; nie cofaj PR1–PR3, nie ruszaj persisted state i nie „naprawiaj” bake przez włączanie FSC penalty.

@@ -13,6 +13,11 @@ pełnym dowodem FSC/funding completeness. Profil świadomie ustawia `funding_lan
 żeby ominąć limit jednoczesnych streamów Yellowstone po tym, jak r8 został zablokowany przez
 `ResourceExhausted` na primary global stream.
 
+Aktualizacja po decyzji `ADR-0130`: przy obecnym providerze nie będzie dedykowanego drugiego
+streamu dla FSC. R9 primary-only staje się właściwym kształtem dalszej walidacji V3, a nie
+tymczasowym obejściem przed kolejnym full-chain retry. FSC pozostaje zdegradowane/diagnostyczne i
+nie jest warunkiem P3.5 ani P2.
+
 ## Zakres
 
 - P3.4 multi-run real ablation diagnostic.
@@ -186,5 +191,8 @@ P3.4 r9 primary-only:
 Nie przechodzić do P2.
 
 Następny użyteczny krok to P3.5: outcome-label join / shadow lifecycle economics dla r7+r9 oraz
-kolejny canonical full-chain run, gdy provider stream capacity pozwoli uruchomić primary global i
-dedicated funding lane jednocześnie.
+kolejnych primary-only full-replay runów.
+
+Nie planować kolejnego canonical full-chain retry pod obecnym providerem. Decyzja jest zapisana w
+`docs/ADR/ADR-0130-v3-fsc-scope-decision-single-stream.md`, a zrewidowany plan w
+`PLANS/PLAN_P3_5_V3_PRIMARY_ONLY_OUTCOME_VALIDATION_20260516.md`.

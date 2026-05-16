@@ -38,10 +38,14 @@ Loader launchera i GUI najpierw sprawdza procesowe env, potem lokalny `.env`, a 
 
 | Profil | Plik | Semantyka | Status użycia |
 | --- | --- | --- | --- |
-| `shadow-burnin` | `configs/rollout/shadow-burnin.toml` | `execution_mode=shadow`, `entry_mode=shadow_only`, `funding_lane_mode=full_chain`, `trigger.shadow_run.payer_strategy=ephemeral` | canonical clean rerun po repair stream |
-| `paper-burnin` | `configs/rollout/paper-burnin.toml` | `execution_mode=paper`, `entry_mode=shadow_only`, `funding_lane_mode=full_chain` | legacy compare-only / kompatybilność |
+| `shadow-burnin` | `configs/rollout/shadow-burnin.toml` | `execution_mode=shadow`, `entry_mode=shadow_only`, `funding_lane_mode=full_chain`, `trigger.shadow_run.payer_strategy=ephemeral` | legacy FSC/full-chain bake profile; paused dla V3 przez `ADR-0130` |
+| `paper-burnin` | `configs/rollout/paper-burnin.toml` | `execution_mode=paper`, `entry_mode=shadow_only`, `funding_lane_mode=full_chain` | legacy compare-only / kompatybilność; full-chain paused przez `ADR-0130` |
 | `dual-micro-live` | `configs/rollout/dual-micro-live.toml` | `execution_mode=dual`, `entry_mode=live_and_shadow`, `funding_lane_mode=disabled` | przygotowany, nie uruchamiać przed formalnym GO po shadow-burnin |
 | `future-live` | `configs/rollout/future-live.toml` | `execution_mode=live`, `entry_mode=live` | przygotowany, nie używać przed PR-7 |
+
+Decyzja `ADR-0130` zmienia bieżącą interpretację V3: przy obecnym jednym streamie providerowym nie
+czekamy na FSC/full-chain bake i nie traktujemy `full_chain` jako wymogu P3.5. Dla V3 validation
+używać primary-only profili z `funding_lane_mode=disabled`.
 
 ## Procedura operatora
 

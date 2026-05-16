@@ -44,6 +44,11 @@ Procedura operatorska start/stop/restart/abort jest w [`docs/RUNBOOK_PRODUCTION_
 
 ## FSC authoritative funding lane
 
+**Status 2026-05-16:** authoritative FSC lane jest wstrzymany dla bieżącej walidacji V3 przez
+`docs/ADR/ADR-0130-v3-fsc-scope-decision-single-stream.md`. Metryki poniżej pozostają ważne dla
+diagnostyki future-only FSC bake, ale nie są wymaganym gate'em P3.5 pod obecnym single-stream
+provider constraint.
+
 - `ghost.pump.reconnects{source_label=...}`
   Lane-scoped licznik reconnectów gRPC.
   Dla FSC bake patrz osobno na `source_label=grpc_funding_lane_full_chain`, a nie tylko na zagregowany stan primary lane.
