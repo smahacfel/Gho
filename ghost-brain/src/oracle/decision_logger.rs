@@ -2147,6 +2147,46 @@ fn v3_post_serialize_replay_payload_hash_mismatch(
     }
 }
 
+fn v3_replay_stable_gatekeeper_buy_log_json(log: &GatekeeperBuyLog) -> Result<String> {
+    let json = serde_json::to_string(log).context("Failed to serialize gatekeeper buy log")?;
+    let Some((logged_hash, post_serialize_hash)) =
+        v3_post_serialize_replay_payload_hash_mismatch(log, &json)
+    else {
+        return Ok(json);
+    };
+
+    let mut patched = log.clone();
+    patched.v3_feature_snapshot_hash = Some(post_serialize_hash.clone());
+    let patched_json =
+        serde_json::to_string(&patched).context("Failed to serialize gatekeeper buy log")?;
+
+    if let Some((patched_hash, patched_post_serialize_hash)) =
+        v3_post_serialize_replay_payload_hash_mismatch(&patched, &patched_json)
+    {
+        warn!(
+            logged_hash = %patched_hash,
+            post_serialize_hash = %patched_post_serialize_hash,
+            materialization_version = ?patched.v3_materialization_version,
+            replay_payload_schema_version = ?patched.v3_replay_payload_schema_version,
+            pool = %patched.pool_id,
+            plane = ?patched.decision_plane,
+            "V3 replay payload hash post-serialize mismatch"
+        );
+    } else {
+        debug!(
+            previous_hash = %logged_hash,
+            canonical_hash = %post_serialize_hash,
+            materialization_version = ?patched.v3_materialization_version,
+            replay_payload_schema_version = ?patched.v3_replay_payload_schema_version,
+            pool = %patched.pool_id,
+            plane = ?patched.decision_plane,
+            "V3 replay payload hash canonicalized at post-serialize boundary"
+        );
+    }
+
+    Ok(patched_json)
+}
+
 /// Write a decision log to JSONL file
 async fn write_log(base_dir: &Path, log: &OracleDecisionLog) -> Result<()> {
     // Create candidate-specific directory
@@ -2277,21 +2317,8 @@ async fn write_gatekeeper_buy_log(base_dir: &Path, log: &GatekeeperBuyLog) -> Re
         );
     }
 
-    // Serialize to JSON once (reused for both files)
-    let json = serde_json::to_string(log).context("Failed to serialize gatekeeper buy log")?;
-    if let Some((logged_hash, post_serialize_hash)) =
-        v3_post_serialize_replay_payload_hash_mismatch(log, &json)
-    {
-        warn!(
-            logged_hash = %logged_hash,
-            post_serialize_hash = %post_serialize_hash,
-            materialization_version = ?log.v3_materialization_version,
-            replay_payload_schema_version = ?log.v3_replay_payload_schema_version,
-            pool = %log.pool_id,
-            plane = ?log.decision_plane,
-            "V3 replay payload hash post-serialize mismatch"
-        );
-    }
+    // Serialize to JSON once (reused for both files).
+    let json = v3_replay_stable_gatekeeper_buy_log_json(log)?;
 
     // 1. ALWAYS write to decisions file (all verdicts)
     let decisions_path = routed_dir.join(GATEKEEPER_DECISIONS_JSONL);
@@ -3488,6 +3515,31 @@ mod tests {
             .expect("tampered post-serialize replay hash should be detected");
         assert_eq!(mismatch.0, "not-the-post-serialize-payload-hash");
         assert_eq!(mismatch.1, expected_hash);
+    }
+
+    #[test]
+    fn test_v3_replay_stable_gatekeeper_buy_log_json_canonicalizes_hash() {
+        let mut log = create_test_buy_log();
+        log.v3_materialization_version = Some(1);
+        log.v3_replay_payload_schema_version = Some(1);
+        log.v3_materialized_feature_snapshot = Some(serde_json::json!({
+            "pool_id": "pool_payload",
+            "session_metadata": {
+                "session_id": 42,
+                "observation_duration_ms": 2000
+            }
+        }));
+        log.v3_feature_snapshot_hash = Some("pre-serialize-payload-hash".to_string());
+
+        let json = v3_replay_stable_gatekeeper_buy_log_json(&log).unwrap();
+        let json_value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let expected_hash = v3_serialized_replay_payload_hash(&json_value, 1).unwrap();
+
+        assert_eq!(
+            json_value["v3_feature_snapshot_hash"].as_str(),
+            Some(expected_hash.as_str())
+        );
+        assert!(v3_post_serialize_replay_payload_hash_mismatch(&log, &json).is_some());
     }
 
     #[test]
