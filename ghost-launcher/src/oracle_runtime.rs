@@ -4475,6 +4475,39 @@ fn enrich_buy_log_with_v3_shadow(
         "deadline_elapsed": deadline_elapsed,
         "execution": "execution_not_run",
     }));
+
+    if config.replay_payload_enabled {
+        if let Some((logged_hash, recomputed_hash)) =
+            v3_replay_payload_hash_mismatch(log, config.materialization_version)
+        {
+            warn!(
+                logged_hash = %logged_hash,
+                recomputed_hash = %recomputed_hash,
+                materialization_version = config.materialization_version,
+                replay_payload_schema_version = ?log.v3_replay_payload_schema_version,
+                "V3 replay payload hash self-check mismatch"
+            );
+        }
+    }
+}
+
+fn v3_replay_payload_hash_mismatch(
+    log: &ghost_brain::oracle::GatekeeperBuyLog,
+    materialization_version: u32,
+) -> Option<(String, String)> {
+    let logged_hash = log.v3_feature_snapshot_hash.as_ref()?;
+    let snapshot_payload = log.v3_materialized_feature_snapshot.as_ref()?;
+    let recomputed_hash =
+        crate::components::gatekeeper_v3::v3_feature_snapshot_hash_from_payload(
+            snapshot_payload,
+            materialization_version,
+        );
+
+    if logged_hash == &recomputed_hash {
+        None
+    } else {
+        Some((logged_hash.clone(), recomputed_hash))
+    }
 }
 
 /// Enrich a `GatekeeperBuyLog` with A/B window boundary fields from `WindowState`.
@@ -20508,6 +20541,28 @@ mod tests {
             log.v3_policy_config_hash.as_deref(),
             Some(policy_hash.as_str())
         );
+        assert!(v3_replay_payload_hash_mismatch(&log, payload_config.materialization_version)
+            .is_none());
+    }
+
+    #[test]
+    fn test_v3_replay_payload_hash_self_check_detects_mismatch() {
+        let active_config = review_test_gatekeeper_config();
+        let pool_id = Pubkey::new_unique();
+        let mut assessment = test_gatekeeper_buy_assessment(6);
+        assessment.feature_snapshot = review_v3_buy_candidate_features();
+        let mut payload_config = review_test_gatekeeper_v3_config();
+        payload_config.replay_payload_enabled = true;
+        let mut log = assessment.to_buy_log(&pool_id, &active_config);
+
+        enrich_buy_log_with_v3_shadow(&mut log, &assessment, &payload_config, false);
+        log.v3_feature_snapshot_hash = Some("not-the-payload-hash".to_string());
+
+        let mismatch =
+            v3_replay_payload_hash_mismatch(&log, payload_config.materialization_version)
+                .expect("tampered replay hash should be detected");
+        assert_eq!(mismatch.0, "not-the-payload-hash");
+        assert_ne!(mismatch.0, mismatch.1);
     }
 
     #[test]
