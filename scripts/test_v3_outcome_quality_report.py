@@ -56,6 +56,18 @@ def label(pool_id: str, *, good: bool) -> dict:
     }
 
 
+def neutral_label(pool_id: str) -> dict:
+    return {
+        "pool_id": pool_id,
+        "base_mint": f"{pool_id}_mint",
+        "join_key": f"{pool_id}:mint:1000",
+        "first_seen_ts_ms": 1000,
+        "label_valid": True,
+        "hit_40_before_stop": False,
+        "rug_or_early_death": False,
+    }
+
+
 class V3OutcomeQualityReportTests(unittest.TestCase):
     def test_quality_summary_classifies_v3_help_and_harm_from_labels(self) -> None:
         decisions = [
@@ -93,6 +105,35 @@ class V3OutcomeQualityReportTests(unittest.TestCase):
         self.assertEqual(quality["sponsor_summary"]["blocked_good_entries"], 1)
         self.assertEqual(quality["sponsor_summary"]["selected_good_entries"], 1)
         self.assertEqual(quality["sponsor_summary"]["selected_bad_entries"], 1)
+
+    def test_valid_non_target_label_is_neutral_not_unknown(self) -> None:
+        decisions = [decision(pool_id="neutral", active_buy=False, v3_verdict="REJECT")]
+        labels = [neutral_label("neutral")]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            decisions_path = tmp / "decisions.jsonl"
+            labels_path = tmp / "labels.jsonl"
+            config_path = tmp / "config.toml"
+            write_jsonl(decisions_path, decisions)
+            write_jsonl(labels_path, labels)
+            config_path.write_text("", encoding="utf-8")
+
+            report = v3_outcome_quality_report.build_report(
+                config_path,
+                decisions_path,
+                labels_path,
+                None,
+            )
+
+        quality = report["quality"]
+        self.assertEqual(quality["p3_5_status"], "outcome_quality_ready")
+        self.assertEqual(quality["known_outcome_rows"], 1)
+        self.assertEqual(quality["outcome_label_counts"], {"neutral_entry": 1})
+        self.assertEqual(quality["sponsor_summary"]["neutral_entries"], 1)
+
+    def test_relative_outcome_label_path_resolves_from_repo_root(self) -> None:
+        path = v3_outcome_quality_report.resolve_cli_path(Path("logs/example.jsonl"))
+        self.assertEqual(path, v3_outcome_quality_report.REPO_ROOT / "logs" / "example.jsonl")
 
     def test_missing_labels_are_insufficient_not_success(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

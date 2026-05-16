@@ -69,12 +69,12 @@ def float_or_none(value: Any) -> float | None:
     return float(value) if isinstance(value, (int, float)) else None
 
 
-def resolve_path(config_path: Path, path: Path | None) -> Path | None:
+def resolve_cli_path(path: Path | None) -> Path | None:
     if path is None:
         return None
     if path.is_absolute():
         return path
-    return (config_path.parent / path).resolve()
+    return (REPO_ROOT / path).resolve()
 
 
 def resolve_config_path(config_path: Path) -> Path:
@@ -90,7 +90,7 @@ def resolve_primary_log(config_path: Path, decisions_log: Path | None) -> Path:
 
 def resolve_lifecycle_log(config_path: Path, shadow_lifecycle: Path | None) -> Path | None:
     config_path = resolve_config_path(config_path)
-    explicit = resolve_path(config_path, shadow_lifecycle)
+    explicit = resolve_cli_path(shadow_lifecycle)
     if explicit is not None:
         return explicit
     if not config_path.exists():
@@ -173,7 +173,7 @@ def label_from_outcome_row(row: dict[str, Any] | None) -> dict[str, Any]:
         return {"outcome_label": "good_entry", "label_source": "outcome_labels"}
     if row.get("rug_or_early_death") is True:
         return {"outcome_label": "bad_entry", "label_source": "outcome_labels"}
-    return {"outcome_label": "unknown", "label_source": "outcome_labels"}
+    return {"outcome_label": "neutral_entry", "label_source": "outcome_labels"}
 
 
 def label_from_lifecycle_row(row: dict[str, Any] | None, success_pnl_pct: float) -> dict[str, Any]:
@@ -241,6 +241,8 @@ def classify_v3_effect(row: dict[str, Any], label: str) -> str:
     verdict = v3_verdict(row)
     if label == "unknown":
         return "inconclusive"
+    if label == "neutral_entry":
+        return "v3_neutral_no_target"
     if verdict in BLOCKING_V3_VERDICTS:
         return "v3_helped_avoided_bad_entry" if label == "bad_entry" else "v3_hurt_blocked_good_entry"
     if verdict in ENTRY_V3_VERDICTS:
@@ -320,6 +322,7 @@ def summarize_quality(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "blocked_good_entries": effect_counts.get("v3_hurt_blocked_good_entry", 0),
             "selected_good_entries": effect_counts.get("v3_helped_selected_good_entry", 0),
             "selected_bad_entries": effect_counts.get("v3_hurt_selected_bad_entry", 0),
+            "neutral_entries": effect_counts.get("v3_neutral_no_target", 0),
             "inconclusive": effect_counts.get("inconclusive", 0),
         },
     }
@@ -336,7 +339,7 @@ def build_report(
     primary_log = resolve_primary_log(config_path, decisions_log)
     decision_rows, bad_rows = v3_shadow_report.load_jsonl(primary_log)
     v3_rows = [row for row in decision_rows if v3_shadow_report.has_v3_fields(row)]
-    label_path = resolve_path(config_path, outcome_labels)
+    label_path = resolve_cli_path(outcome_labels)
     lifecycle_path = resolve_lifecycle_log(config_path, shadow_lifecycle)
     label_rows = list(iter_jsonl(label_path))
     label_index = index_by_join_key(label_rows)
@@ -381,6 +384,7 @@ def print_text(report: dict[str, Any]) -> None:
     print(f"outcome_label_coverage={quality['outcome_label_coverage']}")
     print(f"avoided_bad_entries={sponsor['avoided_bad_entries']}")
     print(f"blocked_good_entries={sponsor['blocked_good_entries']}")
+    print(f"neutral_entries={sponsor['neutral_entries']}")
     print(f"inconclusive={sponsor['inconclusive']}")
 
 
