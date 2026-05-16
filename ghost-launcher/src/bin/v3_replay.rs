@@ -722,6 +722,24 @@ mod tests {
     }
 
     #[test]
+    fn reproduces_p32_r2_payload_hash_mismatch_from_runtime_row() {
+        let row: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/v3_p32_r2_payload_hash_mismatch_row.json"
+        ))
+        .expect("P3.2 r2 fixture should parse");
+
+        let err = validate_v3_row_status(&row).unwrap_err();
+
+        assert_eq!(err.0, RowReplayStatus::PayloadHashMismatch);
+        assert!(err.1.contains(
+            "expected b13e0a214533aa5e65a8f6c326086bb21f15a34ae3e550092caf9036b61eb57b"
+        ));
+        assert!(err.1.contains(
+            "recomputed e30f7cff159041722d534959d7c07194ccfa679f456cd87b1ae6d13540757490"
+        ));
+    }
+
+    #[test]
     fn rejects_stage_mismatch() {
         let mut row = full_row();
         row["v3_shadow_stage"] = json!("wrong_stage");
