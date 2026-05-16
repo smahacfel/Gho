@@ -5,7 +5,7 @@ use ghost_brain::config::{
 };
 use ghost_core::checkpoint::MaterializedFeatureSet;
 use ghost_launcher::components::gatekeeper_v3::{
-    evaluate_v3_from_features, v3_feature_snapshot_hash_from_payload,
+    evaluate_v3_from_features, v3_feature_snapshot_hash, v3_feature_snapshot_hash_from_payload,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -746,6 +746,59 @@ mod tests {
             validate_v3_row_status(&row).unwrap(),
             RowReplayStatus::FullReplayOk
         );
+    }
+
+    #[test]
+    fn probes_p32_r3_payload_hash_provenance_from_runtime_row() {
+        let row: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/v3_p32_r3_payload_hash_provenance_row.json"
+        ))
+        .expect("P3.2 r3 fixture should parse");
+        let logged_hash = string_field(&row, "v3_feature_snapshot_hash")
+            .expect("P3.2 r3 fixture should include logged snapshot hash");
+        let materialization_version = row
+            .get("v3_materialization_version")
+            .and_then(Value::as_u64)
+            .expect("P3.2 r3 fixture should include materialization version")
+            as u32;
+        let raw_payload = row
+            .get("v3_materialized_feature_snapshot")
+            .expect("P3.2 r3 fixture should include replay payload")
+            .clone();
+
+        let raw_payload_hash =
+            v3_feature_snapshot_hash_from_payload(&raw_payload, materialization_version);
+        let features: MaterializedFeatureSet =
+            serde_json::from_value(raw_payload.clone()).expect("P3.2 r3 payload should replay");
+        let roundtrip_payload =
+            serde_json::to_value(&features).expect("P3.2 r3 features should serialize");
+        let roundtrip_payload_hash =
+            v3_feature_snapshot_hash_from_payload(&roundtrip_payload, materialization_version);
+        let legacy_hash = v3_feature_snapshot_hash(&features, materialization_version);
+
+        eprintln!(
+            "p3_2_r3_hash_probe logged={logged_hash} raw_payload={raw_payload_hash} roundtrip_payload={roundtrip_payload_hash} legacy={legacy_hash}"
+        );
+
+        assert_eq!(
+            logged_hash,
+            "454de56dd48938fdfc36ac7ccdc6324512b0dbc7025756f7ee3e70eb844c72a6"
+        );
+        assert_eq!(
+            raw_payload_hash,
+            "5fcb00f84c83aa13ffc1fe1e10a144ef4ae566997cec89bda0dbd585a97bf207"
+        );
+        assert_eq!(
+            roundtrip_payload_hash,
+            "5fcb00f84c83aa13ffc1fe1e10a144ef4ae566997cec89bda0dbd585a97bf207"
+        );
+        assert_eq!(
+            legacy_hash,
+            "c191ad810aedaa6169cd9200eb8c90d6d66cd90ac00c94f926eb1c0f1cf36aef"
+        );
+        assert_ne!(logged_hash, raw_payload_hash);
+        assert_ne!(logged_hash, roundtrip_payload_hash);
+        assert_ne!(logged_hash, legacy_hash);
     }
 
     #[test]
