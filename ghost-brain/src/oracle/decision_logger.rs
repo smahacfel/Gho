@@ -2095,6 +2095,43 @@ fn gatekeeper_route_dir(base_dir: &Path, log: &GatekeeperBuyLog) -> PathBuf {
         .join(config_hash)
 }
 
+fn v3_serialized_replay_payload_hash(
+    log_value: &serde_json::Value,
+    materialization_version: u32,
+) -> Option<String> {
+    let mut canonical_snapshot = log_value.get("v3_materialized_feature_snapshot")?.clone();
+    if let Some(session_metadata) = canonical_snapshot
+        .get_mut("session_metadata")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        // Session id is run-local identity, not replay evidence.
+        session_metadata.remove("session_id");
+    }
+
+    let payload = serde_json::json!({
+        "materialization_version": materialization_version,
+        "v3_materialized_feature_snapshot": canonical_snapshot
+    });
+    let bytes = serde_json::to_vec(&payload).ok()?;
+    Some(blake3::hash(&bytes).to_hex().to_string())
+}
+
+fn v3_serialized_replay_payload_hash_mismatch(
+    log: &GatekeeperBuyLog,
+) -> Option<(String, String)> {
+    let logged_hash = log.v3_feature_snapshot_hash.as_ref()?;
+    let materialization_version = log.v3_materialization_version?;
+    let log_value = serde_json::to_value(log).ok()?;
+    let serialized_payload_hash =
+        v3_serialized_replay_payload_hash(&log_value, materialization_version)?;
+
+    if logged_hash == &serialized_payload_hash {
+        None
+    } else {
+        Some((logged_hash.clone(), serialized_payload_hash))
+    }
+}
+
 /// Write a decision log to JSONL file
 async fn write_log(base_dir: &Path, log: &OracleDecisionLog) -> Result<()> {
     // Create candidate-specific directory
@@ -2210,6 +2247,20 @@ async fn write_gatekeeper_buy_log(base_dir: &Path, log: &GatekeeperBuyLog) -> Re
     } else {
         log
     };
+
+    if let Some((logged_hash, serialized_payload_hash)) =
+        v3_serialized_replay_payload_hash_mismatch(log)
+    {
+        warn!(
+            logged_hash = %logged_hash,
+            serialized_payload_hash = %serialized_payload_hash,
+            materialization_version = ?log.v3_materialization_version,
+            replay_payload_schema_version = ?log.v3_replay_payload_schema_version,
+            pool = %log.pool_id,
+            plane = ?log.decision_plane,
+            "V3 replay payload hash logger-boundary mismatch"
+        );
+    }
 
     // Serialize to JSON once (reused for both files)
     let json = serde_json::to_string(log).context("Failed to serialize gatekeeper buy log")?;
@@ -3347,6 +3398,40 @@ mod tests {
             "pool_payload"
         );
         assert_eq!(record["v3_policy_config_payload"]["policy_version"], 1);
+    }
+
+    #[test]
+    fn test_v3_serialized_replay_payload_hash_probe_detects_mismatch() {
+        let mut log = create_test_buy_log();
+        log.v3_materialization_version = Some(1);
+        log.v3_replay_payload_schema_version = Some(1);
+        log.v3_materialized_feature_snapshot = Some(serde_json::json!({
+            "pool_id": "pool_payload",
+            "session_metadata": {
+                "session_id": 42,
+                "observation_duration_ms": 2000
+            }
+        }));
+
+        let log_value = serde_json::to_value(&log).unwrap();
+        let expected_hash = v3_serialized_replay_payload_hash(&log_value, 1).unwrap();
+        log.v3_feature_snapshot_hash = Some(expected_hash.clone());
+        assert!(v3_serialized_replay_payload_hash_mismatch(&log).is_none());
+
+        let mut same_payload_different_session = log.clone();
+        same_payload_different_session
+            .v3_materialized_feature_snapshot
+            .as_mut()
+            .unwrap()["session_metadata"]["session_id"] = serde_json::json!(99);
+        assert!(
+            v3_serialized_replay_payload_hash_mismatch(&same_payload_different_session).is_none()
+        );
+
+        log.v3_feature_snapshot_hash = Some("not-the-serialized-payload-hash".to_string());
+        let mismatch = v3_serialized_replay_payload_hash_mismatch(&log)
+            .expect("tampered serialized replay hash should be detected");
+        assert_eq!(mismatch.0, "not-the-serialized-payload-hash");
+        assert_eq!(mismatch.1, expected_hash);
     }
 
     #[test]
