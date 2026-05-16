@@ -115,6 +115,35 @@ class V3ReplayAblationReportTests(unittest.TestCase):
         with self.assertRaisesRegex(NotImplementedError, "--events-dir"):
             v3_replay_ablation_report.validate_unimplemented_inputs(None, Path("events"))
 
+    def test_full_replay_without_counterfactual_ablation_fails_closed(self) -> None:
+        rows = [row()]
+        replay = {
+            "status": "full",
+            "policy_hash_missing": 0,
+            "snapshot_hash_missing": 0,
+        }
+        calibration = v3_replay_ablation_report.calibration_buckets(rows)
+        ablation = {"mode": "reason_group_proxy", "reason_group_counts": {}}
+
+        cert = v3_replay_ablation_report.certification(rows, replay, calibration, ablation)
+
+        self.assertEqual(cert["p3_status"], "fail")
+        self.assertIn("full_replay_ablation_unavailable", cert["blocked_gates"])
+
+    def test_full_replay_counterfactual_ablation_does_not_block_certification(self) -> None:
+        rows = [row(reason="PENDING_V3_WAIT_EVIDENCE", v3_verdict="PENDING")]
+        replay = {
+            "status": "full",
+            "policy_hash_missing": 0,
+            "snapshot_hash_missing": 0,
+        }
+        calibration = v3_replay_ablation_report.calibration_buckets(rows)
+        ablation = {"mode": "full_replay_counterfactual", "variants": {}}
+
+        cert = v3_replay_ablation_report.certification(rows, replay, calibration, ablation)
+
+        self.assertNotIn("full_replay_ablation_unavailable", cert["blocked_gates"])
+
 
 if __name__ == "__main__":
     unittest.main()

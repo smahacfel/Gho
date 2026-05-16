@@ -3,9 +3,9 @@ use ghost_brain::config::{
     GatekeeperV3ComponentWeights, GatekeeperV3ConfidenceCaps, GatekeeperV3Config,
     GatekeeperV3PromotionConfig, GatekeeperV3StageProfile,
 };
-use ghost_core::checkpoint::MaterializedFeatureSet;
+use ghost_core::checkpoint::{EvidenceStatus, MaterializedFeatureSet};
 use ghost_launcher::components::gatekeeper_v3::{
-    evaluate_v3_from_features, v3_feature_snapshot_hash, v3_feature_snapshot_hash_from_payload,
+    evaluate_v3_from_features, v3_feature_snapshot_hash_from_payload, V3ShadowDecision,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -78,17 +78,87 @@ struct ReplayReport {
     row_results: Vec<RowReplayResult>,
 }
 
+#[derive(Debug, Serialize)]
+struct AblationReport {
+    status: String,
+    replay_status: String,
+    input: String,
+    total_rows: usize,
+    bad_rows: usize,
+    v3_rows: usize,
+    baseline_status_counts: BTreeMap<String, usize>,
+    variants: BTreeMap<String, AblationVariantReport>,
+    row_results: Vec<RowReplayResult>,
+}
+
+#[derive(Debug, Serialize)]
+struct AblationVariantReport {
+    rows: usize,
+    changed_verdict_rows: usize,
+    changed_stage_rows: usize,
+    changed_reason_rows: usize,
+    confidence_changed_rows: usize,
+    confidence_delta_sum: f64,
+    confidence_delta_avg: f64,
+    verdict_distribution: BTreeMap<String, usize>,
+    reason_distribution: BTreeMap<String, usize>,
+    examples: Vec<AblationExample>,
+}
+
+#[derive(Debug, Serialize)]
+struct AblationExample {
+    line_number: usize,
+    ab_record_id: Option<String>,
+    baseline_verdict: String,
+    variant_verdict: String,
+    baseline_reason: String,
+    variant_reason: String,
+    baseline_confidence: f64,
+    variant_confidence: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AblationVariant {
+    NoManipulationContradiction,
+    NoOrganicBroadening,
+    NoSybilFscCpvCaps,
+    NoAlphaCap,
+    NoExecutionCap,
+}
+
+impl AblationVariant {
+    const ALL: [Self; 5] = [
+        Self::NoManipulationContradiction,
+        Self::NoOrganicBroadening,
+        Self::NoSybilFscCpvCaps,
+        Self::NoAlphaCap,
+        Self::NoExecutionCap,
+    ];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NoManipulationContradiction => "no_manipulation_contradiction",
+            Self::NoOrganicBroadening => "no_organic_broadening",
+            Self::NoSybilFscCpvCaps => "no_sybil_fsc_cpv_caps",
+            Self::NoAlphaCap => "no_alpha_cap",
+            Self::NoExecutionCap => "no_execution_cap",
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Args {
     input: PathBuf,
     json: bool,
     strict: bool,
+    ablation_json: bool,
 }
 
 fn parse_args() -> Result<Args> {
     let mut input = None;
     let mut json = false;
     let mut strict = false;
+    let mut ablation_json = false;
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -100,10 +170,12 @@ fn parse_args() -> Result<Args> {
             }
             "--json" => json = true,
             "--strict" => strict = true,
+            "--ablation-json" => ablation_json = true,
             "--help" | "-h" => {
                 println!(
-                    "Usage: v3_replay --input <decisions.jsonl> [--json] [--strict]\n\
-                     Validates V3 full replay payloads fail-closed."
+                    "Usage: v3_replay --input <decisions.jsonl> [--json] [--strict] [--ablation-json]\n\
+                     Validates V3 full replay payloads fail-closed and optionally emits\n\
+                     offline counterfactual ablation diagnostics."
                 );
                 std::process::exit(0);
             }
@@ -115,23 +187,32 @@ fn parse_args() -> Result<Args> {
         input: input.ok_or_else(|| anyhow!("--input is required"))?,
         json,
         strict,
+        ablation_json,
     })
 }
 
 fn main() -> Result<()> {
     let args = parse_args()?;
-    let report = build_report(&args.input)?;
-    if args.json {
+    if args.ablation_json {
+        let report = build_ablation_report(&args.input)?;
         println!("{}", serde_json::to_string_pretty(&report)?);
+        if args.strict && (report.status != "ok" || report.replay_status != "full_replay_ok") {
+            std::process::exit(2);
+        }
     } else {
-        println!("status={}", report.status);
-        println!("replay_status={}", report.replay_status);
-        println!("v3_rows={}", report.v3_rows);
-        println!("status_counts={:?}", report.status_counts);
-    }
+        let report = build_report(&args.input)?;
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            println!("status={}", report.status);
+            println!("replay_status={}", report.replay_status);
+            println!("v3_rows={}", report.v3_rows);
+            println!("status_counts={:?}", report.status_counts);
+        }
 
-    if args.strict && (report.status != "ok" || report.replay_status != "full_replay_ok") {
-        std::process::exit(2);
+        if args.strict && (report.status != "ok" || report.replay_status != "full_replay_ok") {
+            std::process::exit(2);
+        }
     }
     Ok(())
 }
@@ -198,6 +279,231 @@ fn build_report(input: &PathBuf) -> Result<ReplayReport> {
     })
 }
 
+fn build_ablation_report(input: &PathBuf) -> Result<AblationReport> {
+    let file = File::open(input).with_context(|| format!("failed to open {}", input.display()))?;
+    let reader = BufReader::new(file);
+    let mut total_rows = 0;
+    let mut bad_rows = 0;
+    let mut row_results = Vec::new();
+    let mut valid_rows = Vec::new();
+
+    for (idx, line) in reader.lines().enumerate() {
+        let line_number = idx + 1;
+        let line = line.with_context(|| format!("failed to read line {line_number}"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        total_rows += 1;
+        let row: Value = match serde_json::from_str(&line) {
+            Ok(row) => row,
+            Err(err) => {
+                bad_rows += 1;
+                row_results.push(RowReplayResult {
+                    line_number,
+                    ab_record_id: None,
+                    status: RowReplayStatus::PayloadDeserializeFailed,
+                    detail: Some(format!("invalid json row: {err}")),
+                });
+                continue;
+            }
+        };
+        if !has_v3_fields(&row) {
+            continue;
+        }
+
+        let ab_record_id = string_field(&row, "ab_record_id");
+        match replay_components_from_row(&row).and_then(|components| {
+            compare_replayed_decision(&row, &components.decision)?;
+            Ok(components)
+        }) {
+            Ok(components) => {
+                row_results.push(RowReplayResult {
+                    line_number,
+                    ab_record_id: ab_record_id.clone(),
+                    status: RowReplayStatus::FullReplayOk,
+                    detail: None,
+                });
+                valid_rows.push((line_number, ab_record_id, components));
+            }
+            Err((status, detail)) => {
+                row_results.push(RowReplayResult {
+                    line_number,
+                    ab_record_id,
+                    status,
+                    detail: Some(detail),
+                });
+            }
+        }
+    }
+
+    let mut baseline_status_counts = BTreeMap::new();
+    for result in &row_results {
+        *baseline_status_counts
+            .entry(result.status.as_str().to_string())
+            .or_insert(0) += 1;
+    }
+    let replay_status = replay_status(&row_results);
+    let status = if row_results
+        .iter()
+        .any(|result| is_invalid_status(result.status))
+        || bad_rows > 0
+    {
+        "fail_closed"
+    } else {
+        "ok"
+    };
+
+    let mut variants = BTreeMap::new();
+    if status == "ok" && replay_status == "full_replay_ok" {
+        for variant in AblationVariant::ALL {
+            variants.insert(
+                variant.as_str().to_string(),
+                evaluate_ablation_variant(variant, &valid_rows),
+            );
+        }
+    }
+
+    Ok(AblationReport {
+        status: status.to_string(),
+        replay_status,
+        input: input.display().to_string(),
+        total_rows,
+        bad_rows,
+        v3_rows: row_results.len(),
+        baseline_status_counts,
+        variants,
+        row_results,
+    })
+}
+
+fn evaluate_ablation_variant(
+    variant: AblationVariant,
+    rows: &[(usize, Option<String>, ReplayComponents)],
+) -> AblationVariantReport {
+    let mut changed_verdict_rows = 0;
+    let mut changed_stage_rows = 0;
+    let mut changed_reason_rows = 0;
+    let mut confidence_changed_rows = 0;
+    let mut confidence_delta_sum = 0.0;
+    let mut verdict_distribution: BTreeMap<String, usize> = BTreeMap::new();
+    let mut reason_distribution: BTreeMap<String, usize> = BTreeMap::new();
+    let mut examples = Vec::new();
+
+    for (line_number, ab_record_id, components) in rows {
+        let (features, config) = apply_ablation_variant(
+            variant,
+            components.features.clone(),
+            components.config.clone(),
+        );
+        let decision = evaluate_v3_from_features(&features, &config, components.deadline_elapsed);
+        let baseline = &components.decision;
+
+        *verdict_distribution
+            .entry(decision.verdict.as_log_str().to_string())
+            .or_insert(0) += 1;
+        *reason_distribution
+            .entry(decision.reason_code.as_log_str().to_string())
+            .or_insert(0) += 1;
+
+        let verdict_changed = decision.verdict != baseline.verdict;
+        let stage_changed = decision.stage != baseline.stage;
+        let reason_changed = decision.reason_code != baseline.reason_code;
+        let confidence_delta = decision.confidence - baseline.confidence;
+        if verdict_changed {
+            changed_verdict_rows += 1;
+        }
+        if stage_changed {
+            changed_stage_rows += 1;
+        }
+        if reason_changed {
+            changed_reason_rows += 1;
+        }
+        if confidence_delta.abs() > FLOAT_TOLERANCE {
+            confidence_changed_rows += 1;
+            confidence_delta_sum += confidence_delta;
+        }
+        if examples.len() < 5 && (verdict_changed || stage_changed || reason_changed) {
+            examples.push(AblationExample {
+                line_number: *line_number,
+                ab_record_id: ab_record_id.clone(),
+                baseline_verdict: baseline.verdict.as_log_str().to_string(),
+                variant_verdict: decision.verdict.as_log_str().to_string(),
+                baseline_reason: baseline.reason_code.as_log_str().to_string(),
+                variant_reason: decision.reason_code.as_log_str().to_string(),
+                baseline_confidence: baseline.confidence,
+                variant_confidence: decision.confidence,
+            });
+        }
+    }
+
+    let rows_len = rows.len();
+    AblationVariantReport {
+        rows: rows_len,
+        changed_verdict_rows,
+        changed_stage_rows,
+        changed_reason_rows,
+        confidence_changed_rows,
+        confidence_delta_sum,
+        confidence_delta_avg: if rows_len == 0 {
+            0.0
+        } else {
+            confidence_delta_sum / rows_len as f64
+        },
+        verdict_distribution,
+        reason_distribution,
+        examples,
+    }
+}
+
+fn apply_ablation_variant(
+    variant: AblationVariant,
+    mut features: MaterializedFeatureSet,
+    mut config: GatekeeperV3Config,
+) -> (MaterializedFeatureSet, GatekeeperV3Config) {
+    match variant {
+        AblationVariant::NoManipulationContradiction => {
+            features.manipulation_contradictions = Default::default();
+            features.evidence_status.manipulation_contradiction.status = EvidenceStatus::Clean;
+            features
+                .evidence_status
+                .manipulation_contradiction
+                .degraded_reasons
+                .clear();
+            features
+                .evidence_status
+                .manipulation_contradiction
+                .unavailable_reasons
+                .clear();
+        }
+        AblationVariant::NoOrganicBroadening => {
+            features.organic_broadening = Default::default();
+            features.evidence_status.organic_broadening.status = EvidenceStatus::Clean;
+            features
+                .evidence_status
+                .organic_broadening
+                .degraded_reasons
+                .clear();
+            features
+                .evidence_status
+                .organic_broadening
+                .unavailable_reasons
+                .clear();
+        }
+        AblationVariant::NoSybilFscCpvCaps => {
+            config.evidence_requirements.sybil = false;
+            config.evidence_requirements.fsc = false;
+            config.evidence_requirements.cpv = false;
+        }
+        AblationVariant::NoAlphaCap => {
+            config.evidence_requirements.alpha = false;
+        }
+        AblationVariant::NoExecutionCap => {
+            config.confidence_caps.execution_not_run = 1.0;
+        }
+    }
+    (features, config)
+}
+
 fn replay_status(results: &[RowReplayResult]) -> String {
     if results.is_empty() {
         return "no_v3_rows".to_string();
@@ -251,12 +557,34 @@ fn validate_v3_row(line_number: usize, row: &Value) -> RowReplayResult {
 fn validate_v3_row_status(
     row: &Value,
 ) -> std::result::Result<RowReplayStatus, (RowReplayStatus, String)> {
-    let snapshot_payload = row.get("v3_materialized_feature_snapshot");
-    if snapshot_payload.is_none() {
+    if row.get("v3_materialized_feature_snapshot").is_none() {
         if string_field(row, "v3_feature_snapshot_hash").is_some() {
             return Ok(RowReplayStatus::HashOnly);
         }
         return Ok(RowReplayStatus::PayloadAbsent);
+    }
+    let components = replay_components_from_row(row)?;
+    compare_replayed_decision(row, &components.decision)?;
+    Ok(RowReplayStatus::FullReplayOk)
+}
+
+#[derive(Debug)]
+struct ReplayComponents {
+    features: MaterializedFeatureSet,
+    config: GatekeeperV3Config,
+    deadline_elapsed: bool,
+    decision: V3ShadowDecision,
+}
+
+fn replay_components_from_row(
+    row: &Value,
+) -> std::result::Result<ReplayComponents, (RowReplayStatus, String)> {
+    let snapshot_payload = row.get("v3_materialized_feature_snapshot");
+    if snapshot_payload.is_none() {
+        if string_field(row, "v3_feature_snapshot_hash").is_some() {
+            return Err((RowReplayStatus::HashOnly, "hash-only row".to_string()));
+        }
+        return Err((RowReplayStatus::PayloadAbsent, "payload absent".to_string()));
     }
 
     let schema = row
@@ -349,6 +677,18 @@ fn validate_v3_row_status(
         .unwrap_or(false);
     let decision = evaluate_v3_from_features(&features, &config, deadline_elapsed);
 
+    Ok(ReplayComponents {
+        features,
+        config,
+        deadline_elapsed,
+        decision,
+    })
+}
+
+fn compare_replayed_decision(
+    row: &Value,
+    decision: &V3ShadowDecision,
+) -> std::result::Result<(), (RowReplayStatus, String)> {
     if string_field(row, "v3_shadow_verdict").as_deref() != Some(decision.verdict.as_log_str()) {
         return Err((
             RowReplayStatus::VerdictMismatch,
@@ -400,7 +740,7 @@ fn validate_v3_row_status(
         RowReplayStatus::ScoreMismatch,
     )?;
 
-    Ok(RowReplayStatus::FullReplayOk)
+    Ok(())
 }
 
 fn compare_f64(
@@ -590,6 +930,7 @@ fn is_invalid_status(status: RowReplayStatus) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ghost_launcher::components::gatekeeper_v3::v3_feature_snapshot_hash;
     use serde_json::json;
 
     fn policy_payload_and_hash(config: &GatekeeperV3Config) -> (Value, String) {
@@ -694,6 +1035,52 @@ mod tests {
             .unwrap(),
             RowReplayStatus::FullReplayOk
         );
+    }
+
+    #[test]
+    fn counterfactual_ablation_removes_manipulation_reject() {
+        let row = full_row_with_hard_manipulation_risk();
+        let components = replay_components_from_row(&row).unwrap();
+        assert_eq!(
+            components.decision.reason_code.as_log_str(),
+            "REJECT_V3_MANIPULATION_CONTRADICTION"
+        );
+        let rows = vec![(1, Some("ab-1".to_string()), components)];
+
+        let report = evaluate_ablation_variant(AblationVariant::NoManipulationContradiction, &rows);
+
+        assert_eq!(report.changed_verdict_rows, 1);
+        assert_eq!(report.changed_reason_rows, 1);
+        assert_eq!(report.verdict_distribution.get("PENDING"), Some(&1));
+    }
+
+    fn full_row_with_hard_manipulation_risk() -> Value {
+        let config = replay_payload_config();
+        let mut features = MaterializedFeatureSet::default();
+        features.manipulation_contradictions.high_hhi = true;
+        let materialization_version = 1;
+        let snapshot_payload = serde_json::to_value(&features).unwrap();
+        let snapshot_hash =
+            v3_feature_snapshot_hash_from_payload(&snapshot_payload, materialization_version);
+        let (policy_payload, policy_hash) = policy_payload_and_hash(&config);
+        let decision = evaluate_v3_from_features(&features, &config, false);
+        json!({
+            "ab_record_id": "ab-1",
+            "v3_shadow_schema_version": 1,
+            "v3_shadow_verdict": decision.verdict.as_log_str(),
+            "v3_shadow_stage": decision.stage.as_log_str(),
+            "v3_shadow_reason_code": decision.reason_code.as_log_str(),
+            "v3_shadow_risk_penalty": decision.risk_penalty,
+            "v3_shadow_opportunity_score": decision.opportunity_score,
+            "v3_shadow_confidence": decision.confidence,
+            "v3_replay_payload_schema_version": 1,
+            "v3_materialized_feature_snapshot": snapshot_payload,
+            "v3_materialization_version": materialization_version,
+            "v3_feature_snapshot_hash": snapshot_hash,
+            "v3_policy_config_payload": policy_payload,
+            "v3_policy_config_hash": policy_hash,
+            "v3_shadow_notes": {"deadline_elapsed": false}
+        })
     }
 
     #[test]

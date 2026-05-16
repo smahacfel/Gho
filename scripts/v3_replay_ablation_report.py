@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
@@ -189,12 +190,64 @@ def ablation_proxy(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "changed_rows_proxy": impacted,
             "affected_reason_group": group,
             "mode": "reason_group_proxy",
-            "note": "Hash-only P3 cannot recompute V3 without full MaterializedFeatureSet payload.",
+            "note": "Proxy mode cannot recompute V3; full replay counterfactual mode requires replay-stable payload rows.",
         }
     return {
         "mode": "reason_group_proxy",
         "reason_group_counts": counter_dict(groups),
         "variants": variants,
+    }
+
+
+def full_replay_ablation(path: Path) -> dict[str, Any]:
+    command = [
+        "cargo",
+        "run",
+        "-q",
+        "-p",
+        "ghost-launcher",
+        "--bin",
+        "v3_replay",
+        "--",
+        "--input",
+        str(path),
+        "--ablation-json",
+        "--strict",
+    ]
+    completed = subprocess.run(
+        command,
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        return {
+            "mode": "full_replay_counterfactual_failed",
+            "engine": "ghost-launcher::v3_replay --ablation-json --strict",
+            "exit_code": completed.returncode,
+            "stdout_tail": completed.stdout[-2000:],
+            "stderr_tail": completed.stderr[-2000:],
+            "variants": {},
+        }
+    try:
+        report = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        return {
+            "mode": "full_replay_counterfactual_failed",
+            "engine": "ghost-launcher::v3_replay --ablation-json --strict",
+            "exit_code": completed.returncode,
+            "error": f"invalid json from rust ablation engine: {exc}",
+            "stdout_tail": completed.stdout[-2000:],
+            "stderr_tail": completed.stderr[-2000:],
+            "variants": {},
+        }
+    return {
+        "mode": "full_replay_counterfactual",
+        "engine": "ghost-launcher::v3_replay --ablation-json --strict",
+        "replay_status": report.get("replay_status"),
+        "baseline_status_counts": report.get("baseline_status_counts", {}),
+        "variants": report.get("variants", {}),
     }
 
 
@@ -235,6 +288,12 @@ def replay_parity(rows: list[dict[str, Any]], bad_rows: int) -> dict[str, Any]:
     else:
         status = "missing_snapshot_hash"
 
+    note = (
+        "full means JSONL carries replay payload rows; strict counterfactual ablation still requires the Rust replay engine."
+        if status == "full"
+        else "hash_only means P3 can compare stable snapshot hashes but cannot recompute counterfactual V3."
+    )
+
     return {
         "status": status,
         "rows": len(v3_rows),
@@ -244,7 +303,7 @@ def replay_parity(rows: list[dict[str, Any]], bad_rows: int) -> dict[str, Any]:
         "full_snapshot_payload_rows": full_payload_rows,
         "duplicate_ab_record_conflicts": conflicts,
         "duplicate_ab_record_conflict_count": len(conflicts),
-        "note": "hash_only is expected until JSONL carries full MaterializedFeatureSet replay payloads.",
+        "note": note,
     }
 
 
@@ -314,6 +373,8 @@ def certification(
         blockers.append("no_v3_rows")
     if replay["status"] != "full":
         insufficient.append(f"replay_{replay['status']}")
+    elif ablation.get("mode") != "full_replay_counterfactual":
+        blockers.append("full_replay_ablation_unavailable")
     if replay["policy_hash_missing"] or replay["snapshot_hash_missing"]:
         blockers.append("missing_v3_hashes")
     label_counts = [bucket["count"] for bucket in calibration.values()]
@@ -324,7 +385,10 @@ def certification(
     label_coverage = round(known_coverage / total, 6) if total else 0.0
     if label_coverage < 0.5:
         insufficient.append("low_outcome_label_coverage")
-    manipulation_count = ablation["reason_group_counts"].get("manipulation_contradiction", 0)
+    manipulation_count = ablation.get("reason_group_counts", {}).get(
+        "manipulation_contradiction",
+        Counter(reason_group(row) for row in v3_rows).get("manipulation_contradiction", 0),
+    )
     if v3_rows and manipulation_count / len(v3_rows) >= 0.5:
         insufficient.append("dominant_manipulation_contradiction_requires_more_evidence")
 
@@ -359,7 +423,10 @@ def build_report(
     v3_rows = [row for row in primary_rows if has_v3(row)]
     replay = replay_parity(primary_rows, primary_bad)
     calibration = calibration_buckets(v3_rows)
-    ablation = ablation_proxy(v3_rows)
+    if replay["status"] == "full":
+        ablation = full_replay_ablation(primary_path)
+    else:
+        ablation = ablation_proxy(v3_rows)
 
     datasets = [dataset_summary("primary", primary_path, primary_rows, primary_bad)]
     for index, compare_path in enumerate(compare_logs or [], start=1):
