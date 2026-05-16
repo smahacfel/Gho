@@ -1,0 +1,94 @@
+# P3.4 multi-run full replay ablation validation profile (r8).
+# This profile keeps shadow-only execution and isolates artifacts from prior
+# P3.2/P3.3 runs under the shadow-burnin-v3-p32-replay-r8 namespace.
+
+mode = "production"
+ghost_brain_config_path = "../../configs/rollout/ghost_brain_v3_p32_replay.toml"
+# Active Gatekeeper profile is still enforced by the referenced
+# ghost_brain_config.toml. P3.4 changes only runtime evidence namespace.
+
+[seer]
+enabled = true
+source_mode = "grpc"
+commitment = "processed"
+stream_mode = "single_global"
+tx_filter_strategy = "per_pool"
+funding_lane_mode = "full_chain"
+grpc_endpoint = "yellowstone-solana-mainnet.core.chainstack.com:443"
+grpc_x_token = "f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+rpc_endpoint = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+enable_pumpfun = true
+enable_bonkfun = false
+enable_raydium = false
+
+[trigger]
+enabled = true
+rpc_url = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+entry_mode = "shadow_only"
+max_concurrent_positions = 5
+max_position_size_sol = 0.007
+emergency_floor_sol = 0.0001
+position_size_buffer_sol = 0.0001
+slippage_tolerance = 0.20
+live_exit_take_profit_pct = 0.50
+live_exit_stop_loss_pct = 0.50
+
+[trigger.shadow_run]
+enabled = true
+shadow_rpc_url = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+payer_strategy = "ephemeral"
+commitment = "processed"
+sig_verify = false
+replace_recent_blockhash = true
+timeout_ms = 1600
+max_retries = 1
+max_concurrent = 8
+output_path = "../../logs/shadow_run/shadow-burnin-v3-p32-replay-r8-buys.jsonl"
+emit_event_bus = true
+
+[execution]
+execution_mode = "shadow"
+
+[execution.shadow]
+tx_build_compensation_ms = 200
+max_quote_age_ms = 1500
+entry_log_path = "../../logs/shadow_run/shadow-burnin-v3-p32-replay-r8/shadow_entries.jsonl"
+lifecycle_log_path = "../../logs/shadow_run/shadow-burnin-v3-p32-replay-r8/shadow_lifecycle.jsonl"
+timing_model = "prepared_entry_mirror"
+stale_policy = "emit_warning"
+
+[execution.events]
+output_dir = "../../datasets/events/shadow-burnin-v3-p32-replay-r8"
+rotation_interval_ms = 300000
+flush_interval_ms = 1000
+max_file_size_bytes = 50000000
+enable_aem_ticks = true
+enable_optional_events = false
+
+[oracle]
+decision_log_path = "../../logs/rollout/shadow-burnin-v3-p32-replay-r8/decisions"
+
+[durability]
+wal_enabled = false
+wal_dir = "../../data/rollout/shadow-burnin-v3-p32-replay-r8/wal"
+snapshot_dir = "../../data/rollout/shadow-burnin-v3-p32-replay-r8/snapshots"
+
+[metrics]
+enabled = true
+bind = "0.0.0.0"
+port = 9090
+
+[gui_backend]
+enabled = true
+bind_address = "127.0.0.1"
+port = 8801
+
+[logging]
+level = "info"
+console_enabled = true
+json_format = false
+file_enabled = true
+file_path = "../../logs/rollout/shadow-burnin-v3-p32-replay-r8/system.log"
+oracle_log_enabled = true
+oracle_log_path = "../../logs/rollout/shadow-burnin-v3-p32-replay-r8/oracle.log"
+oracle_json_format = false
