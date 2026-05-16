@@ -4423,19 +4423,20 @@ fn enrich_buy_log_with_v3_shadow(
     if config.replay_payload_enabled {
         match serde_json::to_value(&assessment.feature_snapshot) {
             Ok(snapshot_payload) => {
-                match serde_json::from_value::<MaterializedFeatureSet>(snapshot_payload.clone()) {
-                    Ok(replay_features) => {
-                        log.v3_feature_snapshot_hash =
-                            Some(crate::components::gatekeeper_v3::v3_feature_snapshot_hash(
-                                &replay_features,
-                                config.materialization_version,
-                            ));
-                    }
-                    Err(err) => warn!(
+                if let Err(err) =
+                    serde_json::from_value::<MaterializedFeatureSet>(snapshot_payload.clone())
+                {
+                    warn!(
                         error = %err,
-                        "failed to round-trip V3 replay payload before hashing; keeping runtime snapshot hash"
-                    ),
+                        "failed to round-trip V3 replay payload before logging"
+                    );
                 }
+                log.v3_feature_snapshot_hash = Some(
+                    crate::components::gatekeeper_v3::v3_feature_snapshot_hash_from_payload(
+                        &snapshot_payload,
+                        config.materialization_version,
+                    ),
+                );
                 log.v3_replay_payload_schema_version = Some(V3_REPLAY_PAYLOAD_SCHEMA_VERSION);
                 log.v3_materialized_feature_snapshot = Some(snapshot_payload);
                 log.v3_policy_config_payload = Some(config.v3_policy_config_payload());
@@ -20485,10 +20486,10 @@ mod tests {
             .v3_materialized_feature_snapshot
             .clone()
             .expect("payload enabled should emit MaterializedFeatureSet snapshot");
-        let replay_features: MaterializedFeatureSet =
-            serde_json::from_value(snapshot_payload).expect("snapshot payload should replay");
-        let replay_hash = crate::components::gatekeeper_v3::v3_feature_snapshot_hash(
-            &replay_features,
+        let _: MaterializedFeatureSet = serde_json::from_value(snapshot_payload.clone())
+            .expect("snapshot payload should replay");
+        let replay_hash = crate::components::gatekeeper_v3::v3_feature_snapshot_hash_from_payload(
+            &snapshot_payload,
             payload_config.materialization_version,
         );
         assert_eq!(

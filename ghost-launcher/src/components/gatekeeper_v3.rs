@@ -263,6 +263,27 @@ pub fn v3_component_scores_payload(decision: &V3ShadowDecision) -> serde_json::V
     })
 }
 
+pub fn v3_feature_snapshot_hash_from_payload(
+    snapshot_payload: &Value,
+    materialization_version: u32,
+) -> String {
+    let mut canonical_snapshot = snapshot_payload.clone();
+    if let Some(session_metadata) = canonical_snapshot
+        .get_mut("session_metadata")
+        .and_then(Value::as_object_mut)
+    {
+        // Session id is run-local identity, not decision evidence for replay.
+        session_metadata.remove("session_id");
+    }
+
+    let payload = json!({
+        "materialization_version": materialization_version,
+        "v3_materialized_feature_snapshot": canonical_snapshot
+    });
+    let bytes = serde_json::to_vec(&payload).expect("canonical V3 replay snapshot serializes");
+    blake3::hash(&bytes).to_hex().to_string()
+}
+
 pub fn v3_feature_snapshot_hash(
     features: &MaterializedFeatureSet,
     materialization_version: u32,
@@ -1005,6 +1026,18 @@ mod tests {
 
         features.session_metadata.session_id = SessionId(99);
         assert_eq!(original, v3_feature_snapshot_hash(&features, 1));
+    }
+
+    #[test]
+    fn replay_payload_hash_includes_materialization_version_not_session_id() {
+        let mut payload = serde_json::to_value(MaterializedFeatureSet::default()).unwrap();
+        payload["session_metadata"]["session_id"] = json!(1);
+
+        let original = v3_feature_snapshot_hash_from_payload(&payload, 1);
+        assert_ne!(original, v3_feature_snapshot_hash_from_payload(&payload, 2));
+
+        payload["session_metadata"]["session_id"] = json!(99);
+        assert_eq!(original, v3_feature_snapshot_hash_from_payload(&payload, 1));
     }
 
     #[test]
