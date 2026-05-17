@@ -9210,13 +9210,20 @@ fn spawn_account_update_worker(
                 process_runtime_account_update_event(runtime.as_ref(), &event);
             })
             .await;
-            let remaining = queue_depth
-                .fetch_sub(1, Ordering::Relaxed)
-                .saturating_sub(1);
+            let (remaining, underflow_prevented) =
+                decrement_account_update_queue_depth(queue_depth.as_ref());
             ::metrics::gauge!(
                 "oracle_runtime_account_update_queue_depth",
                 remaining as f64
             );
+            if underflow_prevented {
+                warn!(
+                    base_mint = %base_mint,
+                    slot,
+                    write_version = ?write_version,
+                    "OracleRuntime AccountUpdate queue depth underflow prevented"
+                );
+            }
 
             if let Err(err) = join_result {
                 error!(
@@ -9235,6 +9242,30 @@ fn spawn_account_update_worker(
     })
 }
 
+fn increment_account_update_queue_depth(queue_depth: &AtomicUsize) -> Option<usize> {
+    match queue_depth.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        current.checked_add(1)
+    }) {
+        Ok(previous) => Some(previous + 1),
+        Err(current_depth) => {
+            error!(
+                current_depth,
+                "OracleRuntime AccountUpdate queue depth saturated; dropping update before enqueue"
+            );
+            None
+        }
+    }
+}
+
+fn decrement_account_update_queue_depth(queue_depth: &AtomicUsize) -> (usize, bool) {
+    let previous = queue_depth
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_sub(1))
+        })
+        .unwrap_or_else(|current| current);
+    (previous.saturating_sub(1), previous == 0)
+}
+
 fn dispatch_account_update_to_worker(
     worker_tx: &tokio::sync::mpsc::UnboundedSender<AccountUpdateEvent>,
     queue_depth: &Arc<AtomicUsize>,
@@ -9243,9 +9274,22 @@ fn dispatch_account_update_to_worker(
     let base_mint = event.base_mint;
     let slot = event.slot;
     let write_version = event.write_version;
+    let Some(depth) = increment_account_update_queue_depth(queue_depth.as_ref()) else {
+        increment_counter!(
+            "oracle_runtime_account_update_dispatch_total",
+            "outcome" => "queue_depth_saturated"
+        );
+        warn!(
+            base_mint = %base_mint,
+            slot,
+            write_version = ?write_version,
+            "OracleRuntime AccountUpdate worker queue depth saturated; dropping canonical update"
+        );
+        return;
+    };
+
     match worker_tx.send(event) {
         Ok(()) => {
-            let depth = queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
             ::metrics::gauge!("oracle_runtime_account_update_queue_depth", depth as f64);
             increment_counter!(
                 "oracle_runtime_account_update_dispatch_total",
@@ -9253,6 +9297,12 @@ fn dispatch_account_update_to_worker(
             );
         }
         Err(_) => {
+            let (rolled_back_depth, rollback_underflow) =
+                decrement_account_update_queue_depth(queue_depth.as_ref());
+            ::metrics::gauge!(
+                "oracle_runtime_account_update_queue_depth",
+                rolled_back_depth as f64
+            );
             increment_counter!(
                 "oracle_runtime_account_update_dispatch_total",
                 "outcome" => "queue_closed"
@@ -9261,6 +9311,7 @@ fn dispatch_account_update_to_worker(
                 base_mint = %base_mint,
                 slot,
                 write_version = ?write_version,
+                rollback_underflow,
                 "OracleRuntime AccountUpdate worker queue closed; dropping canonical update"
             );
         }
@@ -10131,6 +10182,36 @@ mod tests {
         std::fs::write(path, serde_json::to_vec(&bytes).expect("serialize keypair"))
             .expect("write keypair");
         keypair
+    }
+
+    #[test]
+    fn test_account_update_queue_depth_does_not_underflow() {
+        let depth = AtomicUsize::new(0);
+
+        let (remaining, underflow_prevented) =
+            decrement_account_update_queue_depth(&depth);
+        assert_eq!(remaining, 0);
+        assert!(underflow_prevented);
+        assert_eq!(depth.load(Ordering::Relaxed), 0);
+
+        let incremented = increment_account_update_queue_depth(&depth)
+            .expect("increment from zero should succeed");
+        assert_eq!(incremented, 1);
+        assert_eq!(depth.load(Ordering::Relaxed), 1);
+
+        let (remaining, underflow_prevented) =
+            decrement_account_update_queue_depth(&depth);
+        assert_eq!(remaining, 0);
+        assert!(!underflow_prevented);
+        assert_eq!(depth.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_account_update_queue_depth_saturation_is_fail_closed() {
+        let depth = AtomicUsize::new(usize::MAX);
+
+        assert_eq!(increment_account_update_queue_depth(&depth), None);
+        assert_eq!(depth.load(Ordering::Relaxed), usize::MAX);
     }
 
     fn mock_account_info_body(owner: &str, lamports: u64) -> String {

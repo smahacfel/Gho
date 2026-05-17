@@ -74,6 +74,8 @@ const CONFIG_FILE: &str = "config.toml";
 const GRPC_SUBSCRIBE_TIMEOUT_SECS: u64 = 5;
 /// Exit code when gRPC subscribe is not sent within the timeout.
 const EXIT_GRPC_SUBSCRIBE_TIMEOUT: i32 = 5;
+/// Exit code when the OracleRuntime task exits before shutdown is requested.
+const EXIT_ORACLE_RUNTIME_STOPPED: i32 = 6;
 const STARTUP_HYDRATION_TIMEOUT_SECS: u64 = 15;
 const STARTUP_HYDRATION_IGNORE_MINTS_ENV: &str = "GHOST_STARTUP_HYDRATION_IGNORE_MINTS";
 
@@ -2008,7 +2010,7 @@ async fn main() -> Result<()> {
     let oracle_authoritative_funding_coverage_gate_enabled =
         config.seer.enabled && matches!(config.seer.funding_lane_mode.as_str(), "full_chain");
 
-    let oracle_handle = tokio::spawn(async move {
+    let mut oracle_handle = tokio::spawn(async move {
         info!("📡 Oracle Runtime initializing...");
 
         // CRITICAL: Signal readiness BEFORE entering main event loop
@@ -2045,7 +2047,6 @@ async fn main() -> Result<()> {
         )
         .await;
     });
-    handles.push(("Oracle Runtime", oracle_handle));
 
     // ========================================
     // SYNCHRONIZATION BARRIER (Issue #156: Wait for Oracle readiness)
@@ -2287,13 +2288,35 @@ async fn main() -> Result<()> {
     info!("All components started successfully");
     info!("Press Ctrl+C to shutdown...");
 
-    // Wait for shutdown signal
-    match signal::ctrl_c().await {
-        Ok(()) => {
-            info!("Shutdown signal received, stopping all components...");
+    // Wait for shutdown signal or fail fast if OracleRuntime stops unexpectedly.
+    tokio::select! {
+        signal_result = signal::ctrl_c() => {
+            match signal_result {
+                Ok(()) => {
+                    info!("Shutdown signal received, stopping all components...");
+                }
+                Err(err) => {
+                    error!("Error listening for shutdown signal: {}", err);
+                }
+            }
         }
-        Err(err) => {
-            error!("Error listening for shutdown signal: {}", err);
+        oracle_result = &mut oracle_handle => {
+            match oracle_result {
+                Ok(()) => {
+                    error!(
+                        "Oracle Runtime task stopped before shutdown signal; exiting with code {} to avoid silent decision stall",
+                        EXIT_ORACLE_RUNTIME_STOPPED
+                    );
+                }
+                Err(err) => {
+                    error!(
+                        error = %err,
+                        "Oracle Runtime task failed before shutdown signal; exiting with code {} to avoid silent decision stall",
+                        EXIT_ORACLE_RUNTIME_STOPPED
+                    );
+                }
+            }
+            std::process::exit(EXIT_ORACLE_RUNTIME_STOPPED);
         }
     }
 
@@ -2305,6 +2328,13 @@ async fn main() -> Result<()> {
     // Send shutdown signal to all components
     if let Err(e) = shutdown_tx.send(()) {
         warn!("Error sending shutdown signal: {}", e);
+    }
+
+    info!("Waiting for Oracle Runtime to shut down...");
+    if let Err(e) = oracle_handle.await {
+        error!("Oracle Runtime shutdown error: {}", e);
+    } else {
+        info!("Oracle Runtime shut down successfully");
     }
 
     // Wait for all components to shut down
