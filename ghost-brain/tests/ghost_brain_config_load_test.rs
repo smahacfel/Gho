@@ -46,3 +46,16 @@ fn gatekeeper_v3_replay_payload_enabled_in_p32_replay_config() {
     assert!(config.gatekeeper_v3.replay_payload_enabled);
     assert!(!config.gatekeeper_v3.promotion.enabled);
 }
+
+#[test]
+fn gatekeeper_v3_p36_primary_only_descopes_fsc_forward_only() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../configs/rollout/ghost_brain_v3_p36_primary_only.toml");
+    let config = GhostBrainConfig::from_toml_file(&path).expect("P3.6 config should load");
+
+    assert!(!config.gatekeeper_v3.enabled);
+    assert!(config.gatekeeper_v3.shadow_emit_enabled);
+    assert!(config.gatekeeper_v3.replay_payload_enabled);
+    assert!(!config.gatekeeper_v3.promotion.enabled);
+    assert!(!config.gatekeeper_v3.evidence_requirements.fsc);
+}

@@ -178,11 +178,16 @@ def ablation_proxy(rows: list[dict[str, Any]]) -> dict[str, Any]:
         }
     }
     mapping = {
-        "no_organic_broadening": "organic_broadening",
+        "fsc_not_required": "sybil_fsc_cpv_caps",
+        "no_pending_wait_evidence_for_noncritical_degraded": "evidence_wait",
         "no_manipulation_contradiction": "manipulation_contradiction",
-        "no_sybil_fsc_cpv_caps": "sybil_fsc_cpv_caps",
-        "no_alpha_cap": "alpha_cap",
-        "no_execution_cap": "execution_cap",
+        "manip_split_dev_top3_hhi": "manipulation_contradiction",
+        "p36_evidence_soft_manip_split": "evidence_wait",
+        "p36_candidate_no_organic_hhi": "organic_broadening",
+        "p36_candidate_no_organic_growth": "organic_broadening",
+        "p36_candidate_no_buy_ratio_min": "organic_broadening",
+        "p36_candidate_organic_relaxed": "organic_broadening",
+        "relaxed_sample_gate": "organic_broadening",
     }
     for variant, group in mapping.items():
         impacted = groups.get(group, 0)

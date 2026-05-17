@@ -3,7 +3,9 @@ use ghost_brain::config::{
     GatekeeperV3ComponentWeights, GatekeeperV3ConfidenceCaps, GatekeeperV3Config,
     GatekeeperV3PromotionConfig, GatekeeperV3StageProfile,
 };
-use ghost_core::checkpoint::{EvidenceStatus, MaterializedFeatureSet};
+use ghost_core::checkpoint::{
+    EvidenceDegradedReason, EvidenceStatus, EvidenceUnavailableReason, MaterializedFeatureSet,
+};
 use ghost_launcher::components::gatekeeper_v3::{
     evaluate_v3_from_features, v3_feature_snapshot_hash_from_payload, V3ShadowDecision,
 };
@@ -93,6 +95,7 @@ struct AblationReport {
 
 #[derive(Debug, Serialize)]
 struct AblationVariantReport {
+    variant_policy_config_hash: String,
     rows: usize,
     changed_verdict_rows: usize,
     changed_stage_rows: usize,
@@ -102,7 +105,23 @@ struct AblationVariantReport {
     confidence_delta_avg: f64,
     verdict_distribution: BTreeMap<String, usize>,
     reason_distribution: BTreeMap<String, usize>,
+    row_deltas: Vec<AblationRowDelta>,
     examples: Vec<AblationExample>,
+}
+
+#[derive(Debug, Serialize)]
+struct AblationRowDelta {
+    line_number: usize,
+    ab_record_id: Option<String>,
+    variant_policy_config_hash: String,
+    baseline_verdict: String,
+    variant_verdict: String,
+    baseline_stage: String,
+    variant_stage: String,
+    baseline_reason: String,
+    variant_reason: String,
+    baseline_confidence: f64,
+    variant_confidence: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -119,29 +138,46 @@ struct AblationExample {
 
 #[derive(Debug, Clone, Copy)]
 enum AblationVariant {
+    FscNotRequired,
+    NoPendingWaitEvidenceForNoncriticalDegraded,
     NoManipulationContradiction,
-    NoOrganicBroadening,
-    NoSybilFscCpvCaps,
-    NoAlphaCap,
-    NoExecutionCap,
+    ManipSplitDevTop3Hhi,
+    P36EvidenceSoftManipSplit,
+    P36CandidateNoOrganicHhi,
+    P36CandidateNoOrganicGrowth,
+    P36CandidateNoBuyRatioMin,
+    P36CandidateOrganicRelaxed,
+    RelaxedSampleGate,
 }
 
 impl AblationVariant {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 10] = [
+        Self::FscNotRequired,
+        Self::NoPendingWaitEvidenceForNoncriticalDegraded,
         Self::NoManipulationContradiction,
-        Self::NoOrganicBroadening,
-        Self::NoSybilFscCpvCaps,
-        Self::NoAlphaCap,
-        Self::NoExecutionCap,
+        Self::ManipSplitDevTop3Hhi,
+        Self::P36EvidenceSoftManipSplit,
+        Self::P36CandidateNoOrganicHhi,
+        Self::P36CandidateNoOrganicGrowth,
+        Self::P36CandidateNoBuyRatioMin,
+        Self::P36CandidateOrganicRelaxed,
+        Self::RelaxedSampleGate,
     ];
 
     fn as_str(self) -> &'static str {
         match self {
+            Self::FscNotRequired => "fsc_not_required",
+            Self::NoPendingWaitEvidenceForNoncriticalDegraded => {
+                "no_pending_wait_evidence_for_noncritical_degraded"
+            }
             Self::NoManipulationContradiction => "no_manipulation_contradiction",
-            Self::NoOrganicBroadening => "no_organic_broadening",
-            Self::NoSybilFscCpvCaps => "no_sybil_fsc_cpv_caps",
-            Self::NoAlphaCap => "no_alpha_cap",
-            Self::NoExecutionCap => "no_execution_cap",
+            Self::ManipSplitDevTop3Hhi => "manip_split_dev_top3_hhi",
+            Self::P36EvidenceSoftManipSplit => "p36_evidence_soft_manip_split",
+            Self::P36CandidateNoOrganicHhi => "p36_candidate_no_organic_hhi",
+            Self::P36CandidateNoOrganicGrowth => "p36_candidate_no_organic_growth",
+            Self::P36CandidateNoBuyRatioMin => "p36_candidate_no_buy_ratio_min",
+            Self::P36CandidateOrganicRelaxed => "p36_candidate_organic_relaxed",
+            Self::RelaxedSampleGate => "relaxed_sample_gate",
         }
     }
 }
@@ -387,14 +423,19 @@ fn evaluate_ablation_variant(
     let mut confidence_delta_sum = 0.0;
     let mut verdict_distribution: BTreeMap<String, usize> = BTreeMap::new();
     let mut reason_distribution: BTreeMap<String, usize> = BTreeMap::new();
+    let mut row_deltas = Vec::new();
     let mut examples = Vec::new();
+    let mut variant_policy_config_hash: Option<String> = None;
 
     for (line_number, ab_record_id, components) in rows {
         let (features, config) = apply_ablation_variant(
             variant,
             components.features.clone(),
             components.config.clone(),
+            components.deadline_elapsed,
         );
+        let policy_hash = policy_config_hash(&config);
+        variant_policy_config_hash.get_or_insert_with(|| policy_hash.clone());
         let decision = evaluate_v3_from_features(&features, &config, components.deadline_elapsed);
         let baseline = &components.decision;
 
@@ -422,6 +463,19 @@ fn evaluate_ablation_variant(
             confidence_changed_rows += 1;
             confidence_delta_sum += confidence_delta;
         }
+        row_deltas.push(AblationRowDelta {
+            line_number: *line_number,
+            ab_record_id: ab_record_id.clone(),
+            variant_policy_config_hash: policy_hash,
+            baseline_verdict: baseline.verdict.as_log_str().to_string(),
+            variant_verdict: decision.verdict.as_log_str().to_string(),
+            baseline_stage: baseline.stage.as_log_str().to_string(),
+            variant_stage: decision.stage.as_log_str().to_string(),
+            baseline_reason: baseline.reason_code.as_log_str().to_string(),
+            variant_reason: decision.reason_code.as_log_str().to_string(),
+            baseline_confidence: baseline.confidence,
+            variant_confidence: decision.confidence,
+        });
         if examples.len() < 5 && (verdict_changed || stage_changed || reason_changed) {
             examples.push(AblationExample {
                 line_number: *line_number,
@@ -438,6 +492,8 @@ fn evaluate_ablation_variant(
 
     let rows_len = rows.len();
     AblationVariantReport {
+        variant_policy_config_hash: variant_policy_config_hash
+            .unwrap_or_else(|| "no_rows".to_string()),
         rows: rows_len,
         changed_verdict_rows,
         changed_stage_rows,
@@ -451,6 +507,7 @@ fn evaluate_ablation_variant(
         },
         verdict_distribution,
         reason_distribution,
+        row_deltas,
         examples,
     }
 }
@@ -459,8 +516,16 @@ fn apply_ablation_variant(
     variant: AblationVariant,
     mut features: MaterializedFeatureSet,
     mut config: GatekeeperV3Config,
+    deadline_elapsed: bool,
 ) -> (MaterializedFeatureSet, GatekeeperV3Config) {
     match variant {
+        AblationVariant::FscNotRequired => {
+            config.evidence_requirements.fsc = false;
+        }
+        AblationVariant::NoPendingWaitEvidenceForNoncriticalDegraded => {
+            config.evidence_requirements.fsc = false;
+            clean_funding_only_sybil_degradation(&mut features);
+        }
         AblationVariant::NoManipulationContradiction => {
             features.manipulation_contradictions = Default::default();
             features.evidence_status.manipulation_contradiction.status = EvidenceStatus::Clean;
@@ -475,33 +540,156 @@ fn apply_ablation_variant(
                 .unavailable_reasons
                 .clear();
         }
-        AblationVariant::NoOrganicBroadening => {
-            features.organic_broadening = Default::default();
-            features.evidence_status.organic_broadening.status = EvidenceStatus::Clean;
-            features
-                .evidence_status
-                .organic_broadening
-                .degraded_reasons
-                .clear();
-            features
-                .evidence_status
-                .organic_broadening
-                .unavailable_reasons
-                .clear();
+        AblationVariant::ManipSplitDevTop3Hhi => {
+            apply_manip_split_dev_top3_hhi(&mut features, &config, deadline_elapsed);
         }
-        AblationVariant::NoSybilFscCpvCaps => {
-            config.evidence_requirements.sybil = false;
-            config.evidence_requirements.fsc = false;
-            config.evidence_requirements.cpv = false;
+        AblationVariant::P36EvidenceSoftManipSplit => {
+            apply_p36_evidence_soft_manip_split(&mut features, &mut config, deadline_elapsed);
         }
-        AblationVariant::NoAlphaCap => {
-            config.evidence_requirements.alpha = false;
+        AblationVariant::P36CandidateNoOrganicHhi => {
+            apply_p36_evidence_soft_manip_split(&mut features, &mut config, deadline_elapsed);
+            relax_organic_hhi(&mut config);
         }
-        AblationVariant::NoExecutionCap => {
-            config.confidence_caps.execution_not_run = 1.0;
+        AblationVariant::P36CandidateNoOrganicGrowth => {
+            apply_p36_evidence_soft_manip_split(&mut features, &mut config, deadline_elapsed);
+            relax_organic_growth(&mut config);
+        }
+        AblationVariant::P36CandidateNoBuyRatioMin => {
+            apply_p36_evidence_soft_manip_split(&mut features, &mut config, deadline_elapsed);
+            relax_buy_ratio_min(&mut config);
+        }
+        AblationVariant::P36CandidateOrganicRelaxed => {
+            apply_p36_evidence_soft_manip_split(&mut features, &mut config, deadline_elapsed);
+            relax_organic_hhi(&mut config);
+            relax_organic_growth(&mut config);
+            relax_buy_ratio_min(&mut config);
+        }
+        AblationVariant::RelaxedSampleGate => {
+            for profile in [&mut config.early, &mut config.normal, &mut config.extended] {
+                profile.min_tx_count = 10;
+                profile.min_unique_signers = 6;
+                profile.min_buy_count = 5;
+            }
         }
     }
     (features, config)
+}
+
+fn policy_config_hash(config: &GatekeeperV3Config) -> String {
+    let payload = config.v3_policy_config_payload();
+    let bytes = serde_json::to_vec(&payload).expect("canonical V3 policy payload serializes");
+    blake3::hash(&bytes).to_hex().to_string()
+}
+
+fn clean_funding_only_sybil_degradation(features: &mut MaterializedFeatureSet) {
+    let sybil_reasons_funding_only = !features.sybil_resistance.degraded_reasons.is_empty()
+        && features
+            .sybil_resistance
+            .degraded_reasons
+            .iter()
+            .all(|reason| is_funding_derived_reason(reason));
+    let evidence_reasons_funding_only =
+        evidence_reasons_are_funding_only(&features.evidence_status.sybil.degraded_reasons)
+            && unavailable_reasons_are_funding_only(
+                &features.evidence_status.sybil.unavailable_reasons,
+            );
+
+    if sybil_reasons_funding_only && evidence_reasons_funding_only {
+        features.sybil_resistance.degraded_reasons.clear();
+        features.evidence_status.sybil.status = EvidenceStatus::Clean;
+        features.evidence_status.sybil.degraded_reasons.clear();
+        features.evidence_status.sybil.unavailable_reasons.clear();
+        features.manipulation_contradictions.sybil_evidence_degraded = false;
+    }
+}
+
+fn evidence_reasons_are_funding_only(reasons: &[EvidenceDegradedReason]) -> bool {
+    reasons.is_empty()
+        || reasons
+            .iter()
+            .all(|reason| matches!(reason, EvidenceDegradedReason::FscEvidencePartial))
+}
+
+fn unavailable_reasons_are_funding_only(reasons: &[EvidenceUnavailableReason]) -> bool {
+    reasons.is_empty()
+        || reasons
+            .iter()
+            .all(|reason| matches!(reason, EvidenceUnavailableReason::FscMetricsMissing))
+}
+
+fn is_funding_derived_reason(reason: &str) -> bool {
+    reason.starts_with("FSC_")
+        || reason.starts_with("funding_source_")
+        || reason.starts_with("funding_lane_")
+        || reason == "full_chain_coverage_missing"
+}
+
+fn apply_p36_evidence_soft_manip_split(
+    features: &mut MaterializedFeatureSet,
+    config: &mut GatekeeperV3Config,
+    deadline_elapsed: bool,
+) {
+    config.evidence_requirements.fsc = false;
+    config.evidence_requirements.sybil = false;
+    config.evidence_requirements.manipulation_contradiction = false;
+    apply_manip_split_dev_top3_hhi(features, config, deadline_elapsed);
+}
+
+fn relax_organic_hhi(config: &mut GatekeeperV3Config) {
+    for profile in [&mut config.early, &mut config.normal, &mut config.extended] {
+        profile.max_hhi = 1.0;
+    }
+}
+
+fn relax_organic_growth(config: &mut GatekeeperV3Config) {
+    for profile in [&mut config.early, &mut config.normal, &mut config.extended] {
+        profile.organic_min_tx_count_growth_ratio = 0.0;
+        profile.organic_min_unique_signer_growth_ratio = 0.0;
+    }
+}
+
+fn relax_buy_ratio_min(config: &mut GatekeeperV3Config) {
+    for profile in [&mut config.early, &mut config.normal, &mut config.extended] {
+        profile.min_buy_ratio = 0.0;
+    }
+}
+
+fn apply_manip_split_dev_top3_hhi(
+    features: &mut MaterializedFeatureSet,
+    config: &GatekeeperV3Config,
+    deadline_elapsed: bool,
+) {
+    let profile = config.profile_for_context(
+        deadline_elapsed,
+        features.session_metadata.observation_duration_ms,
+    );
+    let risk = &features.manipulation_contradictions;
+    let dev_trigger =
+        risk.high_dev_concentration || risk.dev_volume_ratio > profile.max_dev_volume_ratio;
+    let top3_trigger =
+        risk.high_top3_volume_pct || risk.top3_volume_pct > profile.hard_fail_top3_volume_pct;
+    let hhi_trigger = risk.high_hhi || risk.hhi > profile.hard_fail_hhi;
+    let split_trigger_count = [dev_trigger, top3_trigger, hhi_trigger]
+        .into_iter()
+        .filter(|trigger| *trigger)
+        .count();
+
+    let timing_or_bundle_hard = risk.high_same_ms_tx_ratio
+        || risk.high_bundle_suspicion_ratio
+        || risk.same_ms_tx_ratio > profile.hard_fail_same_ms_tx_ratio
+        || risk.bundle_suspicion_ratio > profile.hard_fail_same_ms_tx_ratio
+        || risk.timing_bundle_concentration;
+
+    if split_trigger_count == 1 && !timing_or_bundle_hard {
+        let risk = &mut features.manipulation_contradictions;
+        risk.high_dev_concentration = false;
+        risk.high_top3_volume_pct = false;
+        risk.high_hhi = false;
+        risk.dev_volume_ratio = risk.dev_volume_ratio.min(profile.max_dev_volume_ratio);
+        risk.top3_volume_pct = risk.top3_volume_pct.min(profile.hard_fail_top3_volume_pct);
+        risk.hhi = risk.hhi.min(profile.hard_fail_hhi);
+        risk.contradiction_score = risk.contradiction_score.min(0.50);
+    }
 }
 
 fn replay_status(results: &[RowReplayResult]) -> String {
@@ -1052,6 +1240,158 @@ mod tests {
         assert_eq!(report.changed_verdict_rows, 1);
         assert_eq!(report.changed_reason_rows, 1);
         assert_eq!(report.verdict_distribution.get("PENDING"), Some(&1));
+        assert_eq!(report.row_deltas.len(), 1);
+        assert_eq!(report.row_deltas[0].baseline_verdict, "REJECT");
+        assert_eq!(report.row_deltas[0].variant_verdict, "PENDING");
+    }
+
+    #[test]
+    fn fsc_not_required_changes_policy_hash_without_claiming_row_parity() {
+        let components = replay_components_from_row(&full_row()).unwrap();
+        let baseline_hash = policy_config_hash(&components.config);
+        let rows = vec![(1, Some("ab-1".to_string()), components)];
+
+        let report = evaluate_ablation_variant(AblationVariant::FscNotRequired, &rows);
+
+        assert_ne!(report.variant_policy_config_hash, baseline_hash);
+        assert_eq!(
+            report.row_deltas[0].variant_policy_config_hash,
+            report.variant_policy_config_hash
+        );
+    }
+
+    #[test]
+    fn degraded_reason_classifier_is_exact_and_fail_closed() {
+        assert!(is_funding_derived_reason("FSC_INSUFFICIENT_KNOWN_SOURCES"));
+        assert!(is_funding_derived_reason("funding_source_index_cold"));
+        assert!(is_funding_derived_reason("funding_lane_disabled"));
+        assert!(is_funding_derived_reason("full_chain_coverage_missing"));
+        assert!(!is_funding_derived_reason("SFD_PARTIAL_BALANCE_COVERAGE"));
+        assert!(!is_funding_derived_reason("FSCISH_UNKNOWN"));
+        assert!(!is_funding_derived_reason("unknown"));
+    }
+
+    #[test]
+    fn funding_only_sybil_degradation_can_be_cleaned_for_wait_evidence_variant() {
+        let mut features = MaterializedFeatureSet::default();
+        features.sybil_resistance.degraded_reasons =
+            vec!["FSC_INSUFFICIENT_KNOWN_SOURCES".to_string()];
+        features.evidence_status.sybil.status = EvidenceStatus::Degraded;
+        features.evidence_status.sybil.degraded_reasons =
+            vec![EvidenceDegradedReason::FscEvidencePartial];
+        features.evidence_status.sybil.unavailable_reasons.clear();
+        features.evidence_status.manipulation_contradiction.status = EvidenceStatus::Degraded;
+        features
+            .evidence_status
+            .manipulation_contradiction
+            .degraded_reasons = vec![EvidenceDegradedReason::ManipulationContradictionPartial];
+        features.manipulation_contradictions.status = EvidenceStatus::Degraded;
+        features.manipulation_contradictions.sybil_evidence_degraded = true;
+
+        clean_funding_only_sybil_degradation(&mut features);
+
+        assert_eq!(features.evidence_status.sybil.status, EvidenceStatus::Clean);
+        assert_eq!(
+            features.evidence_status.manipulation_contradiction.status,
+            EvidenceStatus::Degraded
+        );
+        assert!(features.sybil_resistance.degraded_reasons.is_empty());
+        assert!(!features.manipulation_contradictions.sybil_evidence_degraded);
+    }
+
+    #[test]
+    fn non_funding_sybil_degradation_stays_fail_closed() {
+        let mut features = MaterializedFeatureSet::default();
+        features.sybil_resistance.degraded_reasons =
+            vec!["SFD_PARTIAL_BALANCE_COVERAGE".to_string()];
+        features.evidence_status.sybil.status = EvidenceStatus::Degraded;
+
+        clean_funding_only_sybil_degradation(&mut features);
+
+        assert_eq!(
+            features.evidence_status.sybil.status,
+            EvidenceStatus::Degraded
+        );
+        assert_eq!(
+            features.sybil_resistance.degraded_reasons,
+            vec!["SFD_PARTIAL_BALANCE_COVERAGE".to_string()]
+        );
+    }
+
+    #[test]
+    fn manip_split_relaxes_single_hhi_but_preserves_timing_bundle_hard_risk() {
+        let mut config = replay_payload_config();
+        for profile in [&mut config.early, &mut config.normal, &mut config.extended] {
+            profile.hard_fail_hhi = 0.10;
+            profile.hard_fail_same_ms_tx_ratio = 0.60;
+        }
+        let mut single_hhi = MaterializedFeatureSet::default();
+        single_hhi.manipulation_contradictions.high_hhi = true;
+        single_hhi.manipulation_contradictions.hhi = 0.20;
+        apply_manip_split_dev_top3_hhi(&mut single_hhi, &config, false);
+        assert!(!single_hhi.manipulation_contradictions.high_hhi);
+        assert_eq!(single_hhi.manipulation_contradictions.hhi, 0.10);
+
+        let mut bundle = MaterializedFeatureSet::default();
+        bundle.manipulation_contradictions.high_hhi = true;
+        bundle.manipulation_contradictions.hhi = 0.20;
+        bundle.manipulation_contradictions.high_same_ms_tx_ratio = true;
+        apply_manip_split_dev_top3_hhi(&mut bundle, &config, false);
+        assert!(bundle.manipulation_contradictions.high_hhi);
+        assert!(bundle.manipulation_contradictions.high_same_ms_tx_ratio);
+    }
+
+    #[test]
+    fn relaxed_sample_gate_uses_diagnostic_thresholds() {
+        let (_, config) = apply_ablation_variant(
+            AblationVariant::RelaxedSampleGate,
+            MaterializedFeatureSet::default(),
+            replay_payload_config(),
+            false,
+        );
+
+        assert_eq!(config.normal.min_tx_count, 10);
+        assert_eq!(config.normal.min_unique_signers, 6);
+        assert_eq!(config.normal.min_buy_count, 5);
+    }
+
+    #[test]
+    fn p36_evidence_soft_manip_split_descopes_only_targeted_evidence_groups() {
+        let (_, config) = apply_ablation_variant(
+            AblationVariant::P36EvidenceSoftManipSplit,
+            MaterializedFeatureSet::default(),
+            replay_payload_config(),
+            false,
+        );
+
+        assert!(!config.evidence_requirements.fsc);
+        assert!(!config.evidence_requirements.sybil);
+        assert!(!config.evidence_requirements.manipulation_contradiction);
+        assert!(config.evidence_requirements.alpha);
+        assert!(config.evidence_requirements.organic_broadening);
+        assert!(config.evidence_requirements.tx_intel);
+    }
+
+    #[test]
+    fn p36_organic_relaxed_candidate_only_relaxes_targeted_organic_predicates() {
+        let (_, config) = apply_ablation_variant(
+            AblationVariant::P36CandidateOrganicRelaxed,
+            MaterializedFeatureSet::default(),
+            replay_payload_config(),
+            false,
+        );
+
+        assert!(!config.evidence_requirements.fsc);
+        assert!(!config.evidence_requirements.sybil);
+        assert!(!config.evidence_requirements.manipulation_contradiction);
+        assert_eq!(config.normal.max_hhi, 1.0);
+        assert_eq!(config.normal.organic_min_tx_count_growth_ratio, 0.0);
+        assert_eq!(config.normal.organic_min_unique_signer_growth_ratio, 0.0);
+        assert_eq!(config.normal.min_buy_ratio, 0.0);
+        assert!(config.evidence_requirements.organic_broadening);
+        assert!(config.normal.min_tx_count > 0);
+        assert!(config.normal.min_unique_signers > 0);
+        assert!(config.normal.min_buy_count > 0);
     }
 
     fn full_row_with_hard_manipulation_risk() -> Value {
