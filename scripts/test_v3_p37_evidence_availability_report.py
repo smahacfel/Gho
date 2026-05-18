@@ -89,6 +89,47 @@ class P37EvidenceAvailabilityReportTest(unittest.TestCase):
         self.assertEqual(built["p3_7_evidence_status"], "evidence_ready_for_temporal_target")
         self.assertEqual(built["gate"]["blockers"], [])
 
+    def test_market_good_without_execution_proof_blocks_phase_b(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            decision = root / "decisions.jsonl"
+            threshold = root / "threshold.jsonl"
+            labels = root / "labels.jsonl"
+            feasibility = root / "feasibility.jsonl"
+            write_jsonl(decision, [{"ab_record_id": "a"}])
+            write_jsonl(
+                threshold,
+                [{"ab_record_id": "a", "price_path_samples": [{"ts_ms": 1, "return_pct": 1.0}]}],
+            )
+            write_jsonl(labels, [{"ab_record_id": "a", "market_outcome_class": "good_clean", "mfe_pct_10s": 45.0}])
+            write_jsonl(
+                feasibility,
+                [
+                    {
+                        "ab_record_id": "a",
+                        "decision_quality_class": "good_not_executable",
+                        "execution_quality_class": "no_dispatch_expected",
+                        "execution_evidence_source": "proxy_not_available",
+                    }
+                ],
+            )
+
+            built = report.build_report(
+                [
+                    ("r11", decision, threshold, labels, feasibility, None),
+                    ("r13", decision, threshold, labels, feasibility, None),
+                ]
+            )
+
+        self.assertEqual(built["p3_7_evidence_status"], "blocked")
+        self.assertIn("no_execution_proof_for_market_good_rows", built["gate"]["blockers"])
+        self.assertIn("no_good_executable_rows", built["gate"]["blockers"])
+        self.assertNotIn("no_post_decision_price_path_rows", built["gate"]["blockers"])
+        self.assertEqual(
+            built["gate"]["required_next_step"],
+            "resolve_execution_feasibility_before_feature_prototype",
+        )
+
     def test_event_schema_sample_marks_candidate_events_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

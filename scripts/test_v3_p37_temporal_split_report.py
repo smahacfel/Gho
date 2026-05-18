@@ -131,6 +131,27 @@ class P37TemporalSplitReportTests(unittest.TestCase):
         self.assertIn("Combined all jest secondary", text)
         self.assertIn("nie autoryzuje P2", text)
 
+    def test_markdown_separates_good_clean_from_good_executable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            specs = []
+            for name in ("r11", "r13"):
+                labels = tmp / f"{name}_labels.jsonl"
+                feas = tmp / f"{name}_feas.jsonl"
+                write_jsonl(labels, [label("a", "good_clean", mfe=45.0)])
+                write_jsonl(
+                    feas,
+                    [feasibility("a", "no_dispatch_expected", "good_not_executable")],
+                )
+                specs.append((name, labels, feas))
+
+            built = report.build_report(specs)
+            text = report.render_markdown(built)
+
+        self.assertIn("price path i `good_clean` sa juz dostepne", text)
+        self.assertIn("ale `good_executable=0`", text)
+        self.assertIn("P3.7.6 Execution Feasibility Resolution", text)
+
 
 if __name__ == "__main__":
     unittest.main()

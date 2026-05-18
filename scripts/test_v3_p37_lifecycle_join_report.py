@@ -82,9 +82,11 @@ class P37LifecycleJoinReportTests(unittest.TestCase):
 
         self.assertEqual(rows[0]["execution_quality_class"], "no_dispatch_expected")
         self.assertEqual(rows[0]["decision_quality_class"], "good_not_executable")
+        self.assertEqual(rows[0]["execution_evidence_source"], "proxy_not_available")
         self.assertEqual(summary["dispatch_expected_rows"], 0)
         self.assertEqual(summary["shadow_dispatch_observed_rows"], 0)
         self.assertEqual(summary["execution_quality_class_counts"], {"no_dispatch_expected": 1})
+        self.assertEqual(summary["execution_evidence_source_counts"], {"proxy_not_available": 1})
 
     def test_buy_without_shadow_artifacts_is_execution_unknown(self) -> None:
         summary, rows = run_report(
@@ -94,6 +96,8 @@ class P37LifecycleJoinReportTests(unittest.TestCase):
 
         self.assertEqual(rows[0]["execution_quality_class"], "execution_unknown")
         self.assertEqual(rows[0]["no_dispatch_reason"], "dispatch_expected_but_no_shadow_artifacts")
+        self.assertEqual(rows[0]["decision_quality_class"], "good_not_executable")
+        self.assertEqual(rows[0]["execution_evidence_source"], "missing")
         self.assertTrue(rows[0]["unknown_execution_status"])
         self.assertEqual(summary["dispatch_expected_rows"], 1)
         self.assertEqual(summary["dispatch_expected_without_observed_rows"], 1)
@@ -122,6 +126,7 @@ class P37LifecycleJoinReportTests(unittest.TestCase):
 
         self.assertEqual(rows[0]["execution_quality_class"], "execution_feasible_clean")
         self.assertEqual(rows[0]["decision_quality_class"], "good_executable")
+        self.assertEqual(rows[0]["execution_evidence_source"], "shadow_lifecycle")
         self.assertEqual(rows[0]["decision_to_entry_materialization_ms"], 50)
         self.assertEqual(rows[0]["decision_to_sim_ms"], 75)
 
@@ -143,7 +148,39 @@ class P37LifecycleJoinReportTests(unittest.TestCase):
 
         self.assertEqual(rows[0]["execution_quality_class"], "execution_infeasible")
         self.assertEqual(rows[0]["simulation_error_class"], "data_problem")
+        self.assertEqual(rows[0]["execution_evidence_source"], "shadow_lifecycle")
         self.assertEqual(rows[0]["decision_quality_class"], "good_not_executable")
+
+    def test_account_not_found_without_expected_dispatch_is_infeasible(self) -> None:
+        entry = {
+            "candidate_id": "candidate-a",
+            "ab_record_id": "a",
+            "execution_outcome": "shadow_data_problem",
+            "timestamp_ms": 2_050,
+        }
+        lifecycle = {
+            "candidate_id": "candidate-a",
+            "ab_record_id": "a",
+            "record_type": "shadow_dispatch",
+            "dispatch_status": "failed",
+            "simulation_outcome": "failed",
+            "classification": "data_problem",
+            "err": "AccountNotFound",
+            "timestamp_ms": 2_075,
+        }
+        summary, rows = run_report(
+            decisions=[decision("a", buy=False)],
+            labels=[label("a", "good_clean")],
+            entries=[entry],
+            lifecycle=[lifecycle],
+        )
+
+        self.assertEqual(rows[0]["execution_quality_class"], "execution_infeasible")
+        self.assertEqual(rows[0]["decision_quality_class"], "good_not_executable")
+        self.assertEqual(rows[0]["simulation_error_class"], "data_problem")
+        self.assertEqual(rows[0]["execution_evidence_source"], "shadow_lifecycle")
+        self.assertEqual(summary["dispatch_observed_without_expected_rows"], 1)
+        self.assertEqual(summary["execution_quality_class_counts"], {"execution_infeasible": 1})
 
     def test_missing_decision_row_is_explicit_unknown(self) -> None:
         summary, rows = run_report(decisions=[], labels=[label("a", "neutral_clean")])
@@ -151,6 +188,7 @@ class P37LifecycleJoinReportTests(unittest.TestCase):
         self.assertEqual(summary["unmatched_label_rows"], 1)
         self.assertEqual(rows[0]["execution_quality_class"], "execution_unknown")
         self.assertEqual(rows[0]["no_dispatch_reason"], "missing_decision_row")
+        self.assertEqual(rows[0]["execution_evidence_source"], "missing")
         self.assertEqual(rows[0]["decision_quality_class"], "neutral")
 
     def test_unmatched_shadow_artifacts_are_reported(self) -> None:
@@ -179,6 +217,8 @@ class P37LifecycleJoinReportTests(unittest.TestCase):
 
         self.assertEqual(rows[0]["execution_quality_class"], "no_dispatch_expected")
         self.assertTrue(rows[0]["shadow_dispatch_observed"])
+        self.assertEqual(rows[0]["no_dispatch_reason"], "dispatch_observed_without_expected")
+        self.assertEqual(rows[0]["execution_evidence_source"], "shadow_entry")
         self.assertEqual(summary["shadow_dispatch_observed_rows"], 1)
         self.assertEqual(summary["dispatch_observed_without_expected_rows"], 1)
 

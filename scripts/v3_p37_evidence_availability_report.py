@@ -57,6 +57,22 @@ def rate(count: int, total: int) -> float:
     return round(count / total, 6) if total else 0.0
 
 
+def execution_feasible_rows(execution: Counter[str]) -> int:
+    return execution.get("execution_feasible_clean", 0) + execution.get("execution_feasible_degraded", 0)
+
+
+def execution_evidence_source_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
+    counts = Counter(str(row.get("execution_evidence_source") or "unknown") for row in rows)
+    return counter_dict(counts)
+
+
+def required_next_step(blockers: list[str]) -> str:
+    blocker_set = set(blockers)
+    if blocker_set and blocker_set <= {"no_good_executable_rows", "no_execution_proof_for_market_good_rows"}:
+        return "resolve_execution_feasibility_before_feature_prototype"
+    return "obtain_or_derive_post_decision_price_path_or_lifecycle_evidence"
+
+
 def has_nonempty_list(row: dict[str, Any], field: str) -> bool:
     value = row.get(field)
     return isinstance(value, list) and len(value) > 0
@@ -185,6 +201,7 @@ def summarize_run(
     checkpoint_trajectory_rows = sum(1 for row in decisions if materialized_checkpoint_trajectory(row))
     dispatch_expected = sum(1 for row in feasibility if row.get("dispatch_expected") is True)
     shadow_observed = sum(1 for row in feasibility if row.get("shadow_dispatch_observed") is True)
+    market_good = market.get("good_clean", 0) + market.get("good_dirty", 0)
 
     rows = len(labels)
     blockers: list[str] = []
@@ -192,6 +209,8 @@ def summarize_run(
         blockers.append("no_good_clean_rows")
     if decision_quality.get("good_executable", 0) == 0:
         blockers.append("no_good_executable_rows")
+    if market_good > 0 and execution_feasible_rows(execution) == 0:
+        blockers.append("no_execution_proof_for_market_good_rows")
     if post_decision_path_rows == 0:
         blockers.append("no_post_decision_price_path_rows")
     if labels_with_numeric_outcome == 0:
@@ -235,6 +254,8 @@ def summarize_run(
         "execution_evidence": {
             "dispatch_expected_rows": dispatch_expected,
             "shadow_dispatch_observed_rows": shadow_observed,
+            "execution_feasible_rows": execution_feasible_rows(execution),
+            "execution_evidence_source_counts": execution_evidence_source_counts(feasibility),
             "dispatch_observed_without_expected_rows": sum(
                 1
                 for row in feasibility
@@ -266,12 +287,20 @@ def aggregate(name: str, runs: list[dict[str, Any]]) -> dict[str, Any]:
     decision_vectors = sum_path(["decision_time_inputs", "decision_vector_rows"])
     checkpoint_vectors = sum_path(["decision_time_inputs", "checkpoint_price_trajectory_rows"])
     good_clean = sum(run["market_outcome_class_counts"].get("good_clean", 0) for run in runs)
+    market_good = sum(
+        run["market_outcome_class_counts"].get("good_clean", 0)
+        + run["market_outcome_class_counts"].get("good_dirty", 0)
+        for run in runs
+    )
     good_executable = sum(run["decision_quality_class_counts"].get("good_executable", 0) for run in runs)
+    execution_feasible = sum(run["execution_evidence"]["execution_feasible_rows"] for run in runs)
     blockers: list[str] = []
     if good_clean == 0:
         blockers.append("no_good_clean_rows")
     if good_executable == 0:
         blockers.append("no_good_executable_rows")
+    if market_good > 0 and execution_feasible == 0:
+        blockers.append("no_execution_proof_for_market_good_rows")
     if post_path == 0:
         blockers.append("no_post_decision_price_path_rows")
     if numeric_rows == 0:
@@ -288,6 +317,9 @@ def aggregate(name: str, runs: list[dict[str, Any]]) -> dict[str, Any]:
             "post_decision_price_path_share": rate(post_path, threshold_rows),
             "label_v2_mfe_mae_rows": numeric_rows,
             "label_v2_mfe_mae_share": rate(numeric_rows, label_rows),
+        },
+        "execution_evidence": {
+            "execution_feasible_rows": execution_feasible,
         },
         "decision_time_inputs": {
             "decision_vector_rows": decision_vectors,
@@ -348,17 +380,34 @@ def build_report(run_specs: list[tuple[str, Path, Path, Path, Path, Path | None]
         "gate": {
             "status": "blocked" if blockers else "ready_for_phase_b_truth_target",
             "blockers": blockers,
-            "required_next_step": (
-                "obtain_or_derive_post_decision_price_path_or_lifecycle_evidence"
-                if blockers
-                else "feature_prototype_may_start_with_temporal_split_controls"
-            ),
+            "required_next_step": required_next_step(blockers)
+            if blockers
+            else "feature_prototype_may_start_with_temporal_split_controls",
         },
     }
 
 
 def render_markdown(report: dict[str, Any]) -> str:
     blocked = report["gate"]["status"] == "blocked"
+    combined = report.get("combined_all_secondary", {})
+    combined_truth = combined.get("outcome_truth_evidence", {})
+    combined_good_clean = combined_truth.get("post_decision_price_path_rows", 0) > 0
+    combined_market_good = any(
+        run["market_outcome_class_counts"].get("good_clean", 0)
+        + run["market_outcome_class_counts"].get("good_dirty", 0)
+        for run in report["runs"]
+    )
+    execution_blocked = "no_good_executable_rows" in report["gate"]["blockers"]
+    strongest_for = (
+        "Najmocniejsze evidence za V3: mamy Chainstack post-decision price path, niezerowe `good_clean` w R10/R11/R13 oraz stabilne label-v2/feasibility artefakty do dalszej diagnostyki."
+        if combined_good_clean
+        else "Najmocniejsze evidence za V3: mamy pelny replay, stabilne label-v2/feasibility artefakty i decision-time vectors, ktore moga posluzyc do przyszlej diagnostyki feature families."
+    )
+    unresolved = (
+        "Nierozstrzygniete niepewnosci: czy historyczne market-good rows byly realnie egzekwowalne przez Ghost, czy tylko wygladaja dobrze na post-decision price path."
+        if combined_market_good and execution_blocked
+        else "Nierozstrzygniete niepewnosci: czy post-decision price path da sie odzyskac z RPC/threshold fetchera, czy wymaga nowego artefaktu labelera/lifecycle."
+    )
     lines = [
         "# Raport P3.7 Evidence Availability R10/R11/R13",
         "",
@@ -410,22 +459,22 @@ def render_markdown(report: dict[str, Any]) -> str:
             "",
             "- Decision logs maja decision-time vectors i checkpoint price trajectory. To moze byc future input do feature prototype, ale nie jest outcome truth dla MFE/MAE po decyzji.",
             "- Threshold summaries maja `threshold_window_max_return_pct` / `threshold_window_min_return_pct`, ale to nie jest pelna sciezka price/lifecycle. Nie wolno z tego promowac v1 `+40` do `good_clean`.",
-            "- Obecne R10/R11/R13 nie maja post-decision price path rows w formacie wymaganym przez Outcome Label v2.",
-            "- Brak `good_clean` i `good_executable` oznacza, ze Phase B candidate feature work pozostaje zablokowane.",
+            "- Post-decision price path jest rozwiazany dla R10/R11/R13." if combined_good_clean else "- Obecne R10/R11/R13 nie maja post-decision price path rows w formacie wymaganym przez Outcome Label v2.",
+            "- Aktualny blocker to `no_execution_proof_for_market_good_rows` / `no_good_executable_rows`, a nie brak market-good price path." if combined_market_good and execution_blocked else "- Brak `good_clean` i `good_executable` oznacza, ze Phase B candidate feature work pozostaje zablokowane.",
             "",
             "## Evidence Checkpoint",
             "",
-            "Najmocniejsze evidence za V3: mamy pelny replay, stabilne label-v2/feasibility artefakty i decision-time vectors, ktore moga posluzyc do przyszlej diagnostyki feature families.",
+            strongest_for,
             "",
             "Najmocniejsze evidence przeciw V3 jako selector: obecne artefakty nie dowodza ani jednego clean executable good target, wiec nie ma celu BUY-quality do walidacji candidate.",
             "",
-            "Nierozstrzygniete niepewnosci: czy post-decision price path da sie odzyskac z RPC/threshold fetchera, czy wymaga nowego artefaktu labelera/lifecycle.",
+            unresolved,
             "",
             "Mozliwe zrodla self-deception: potraktowanie decision-time vectors jako outcome path, potraktowanie threshold summary jako MFE/MAE path, przejscie do feature mining bez `good_clean` targetu.",
             "",
             "## Next Step",
             "",
-            "Nie przechodzic do P3.7 Phase B. Nastepny ruch to P3.7 truth-source acquisition: zaprojektowac lub uruchomic pozyskanie post-decision price path/lifecycle dla R10/R11/R13 albo formalnie oznaczyc obecny dataset jako niewystarczajacy do selector feature redesign.",
+            "Nie przechodzic do P3.7 Phase B. Nastepny ruch to P3.7.6 Execution Feasibility Resolution: rozstrzygnac, czy market-good rows maja realny shadow entry/lifecycle/simulation proof, czy pozostaja `good_not_executable`.",
         ]
     )
     return "\n".join(lines) + "\n"

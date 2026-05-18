@@ -245,8 +245,56 @@ def build_report(run_specs: list[tuple[str, Path, Path]]) -> dict[str, Any]:
 
 
 def render_markdown(report: dict[str, Any]) -> str:
+    combined = report["combined_all_secondary"]
+    price_path_available = combined["rates"].get("price_path_available", 0.0) > 0.0
+    good_clean_available = combined["market_outcome_class_counts"].get("good_clean", 0) > 0
+    good_executable_available = combined["decision_quality_class_counts"].get("good_executable", 0) > 0
+    if price_path_available and good_clean_available and not good_executable_available:
+        gate_interpretation = (
+            "- Obecny truth-layer blokuje feature prototype, bo price path i `good_clean` sa juz dostepne, "
+            "ale `good_executable=0` i brakuje execution proof dla market-good rows."
+        )
+        strongest_for = (
+            "Najmocniejsze evidence za V3: Chainstack price path daje niezerowe `good_clean` w R11/R13 "
+            "oraz stabilny, audytowalny temporal split dla market-quality targetu."
+        )
+        strongest_against = (
+            "Najmocniejsze evidence przeciw V3 jako selector: `good_clean` nie jest `good_executable`; "
+            "nie ma ani jednego BUY-quality targetu z realnym shadow entry/lifecycle/simulation proof."
+        )
+        unresolved = (
+            "Nierozstrzygniete niepewnosci: czy historyczne market-good rows byly realnie egzekwowalne, "
+            "czy tylko wygladaja dobrze na post-decision price path; R13 ma pojedynczy dispatch fail-closed."
+        )
+        next_step = (
+            "Nie przechodzic do Phase B feature prototype jako candidate work. Nastepny sensowny krok to "
+            "P3.7.6 Execution Feasibility Resolution: rozstrzygnac `good_clean` vs `good_executable` "
+            "na podstawie shadow entry/lifecycle/simulation evidence."
+        )
+    else:
+        gate_interpretation = (
+            "- Obecny truth-layer blokuje feature prototype, bo `good_clean=0`, `good_executable=0` "
+            "i MFE/MAE sa niedostepne na wszystkich wymaganych widokach."
+        )
+        strongest_for = (
+            "Najmocniejsze evidence za V3: replay/outcome pipeline zachowuje stabilna, audytowalna "
+            "semantyke across R11/R13 i nie promuje grubego labela v1 do `good_clean`."
+        )
+        strongest_against = (
+            "Najmocniejsze evidence przeciw V3 jako selector: nie ma ani jednego `good_clean` ani "
+            "`good_executable` w R11/R13, wiec nie istnieje temporalnie walidowalny BUY-quality target."
+        )
+        unresolved = (
+            "Nierozstrzygniete niepewnosci: czy brak price path/lifecycle jest tylko brakiem artefaktu, "
+            "czy realnie oznacza niewykonalnosc; czy pelniejszy outcome v2 po danych sciezkowych zmieni rozklad."
+        )
+        next_step = (
+            "Nie przechodzic do Phase B feature prototype jako candidate work. Nastepny sensowny krok w "
+            "Phase A to uzupelnienie price path/lifecycle evidence albo jawne udokumentowanie, ze obecne "
+            "artefakty nie pozwalaja zbudowac `good_clean` / `good_executable` targetu dla P3.7."
+        )
     lines = [
-        "# Raport P3.7 Temporal Split Baseline",
+        "# Raport P3.7 Temporal Split Baseline R10/R11/R13",
         "",
         "Status: **TEMPORAL SPLIT COMPLETE / FEATURE PROTOTYPE BLOCKED**"
         if report["p3_7_5_status"] == "blocked"
@@ -305,21 +353,21 @@ def render_markdown(report: dict[str, Any]) -> str:
             "- Candidate fails if effect exists only in combined.",
             "- Candidate fails if R13 standalone does not support it.",
             "- Candidate fails if confidence interval crosses zero in either required split.",
-            "- Obecny truth-layer blokuje feature prototype, bo `good_clean=0`, `good_executable=0` i MFE/MAE sa niedostepne na wszystkich wymaganych widokach.",
+            gate_interpretation,
             "",
             "## Evidence Checkpoint",
             "",
-            "Najmocniejsze evidence za V3: replay/outcome pipeline zachowuje stabilna, audytowalna semantyke across R11/R13 i nie promuje grubego labela v1 do `good_clean`.",
+            strongest_for,
             "",
-            "Najmocniejsze evidence przeciw V3 jako selector: nie ma ani jednego `good_clean` ani `good_executable` w R11/R13, wiec nie istnieje temporalnie walidowalny BUY-quality target.",
+            strongest_against,
             "",
-            "Nierozstrzygniete niepewnosci: czy brak price path/lifecycle jest tylko brakiem artefaktu, czy realnie oznacza niewykonalnosc; czy pelniejszy outcome v2 po danych sciezkowych zmieni rozklad.",
+            unresolved,
             "",
             "Mozliwe zrodla self-deception: uznanie v1 `+40` za clean good, traktowanie combined jako walidacji, ignorowanie CI crossing zero, ignorowanie braku dispatch proof, oraz przejscie do feature mining bez executable target.",
             "",
             "## Next step",
             "",
-            "Nie przechodzic do Phase B feature prototype jako candidate work. Nastepny sensowny krok w Phase A to uzupelnienie price path/lifecycle evidence albo jawne udokumentowanie, ze obecne artefakty nie pozwalaja zbudowac `good_clean` / `good_executable` targetu dla P3.7.",
+            next_step,
         ]
     )
     return "\n".join(lines) + "\n"

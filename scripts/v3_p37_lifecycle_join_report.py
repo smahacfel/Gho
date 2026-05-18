@@ -133,37 +133,78 @@ def classify_success(value: Any) -> bool | None:
     return None
 
 
+def execution_evidence_source(
+    shadow_entry: dict[str, Any] | None,
+    lifecycle: dict[str, Any] | None,
+    *,
+    expected: bool,
+    decision_missing: bool,
+) -> str:
+    if lifecycle is not None:
+        return "shadow_lifecycle"
+    if shadow_entry is not None:
+        return "shadow_entry"
+    if decision_missing or expected:
+        return "missing"
+    return "proxy_not_available"
+
+
 def classify_execution(
     *,
     expected: bool,
     decision_missing: bool,
     shadow_entry: dict[str, Any] | None,
     lifecycle: dict[str, Any] | None,
-) -> tuple[str, str | None, bool, bool, bool | None]:
+) -> tuple[str, str | None, bool, bool, bool | None, str]:
+    source = execution_evidence_source(
+        shadow_entry,
+        lifecycle,
+        expected=expected,
+        decision_missing=decision_missing,
+    )
     if decision_missing:
-        return EXECUTION_UNKNOWN, "missing_decision_row", False, False, None
-    if not expected:
-        return NO_DISPATCH_EXPECTED, None, False, False, None
-    if shadow_entry is None and lifecycle is None:
-        return EXECUTION_UNKNOWN, "dispatch_expected_but_no_shadow_artifacts", False, False, None
+        return EXECUTION_UNKNOWN, "missing_decision_row", False, False, None, source
 
     entry_outcome = classify_success(shadow_entry.get("execution_outcome") if shadow_entry else None)
     dispatch_status = classify_success(lifecycle.get("dispatch_status") if lifecycle else None)
     sim_status = classify_success(lifecycle.get("simulation_outcome") if lifecycle else None)
     record_type = str_or_none(lifecycle.get("record_type") if lifecycle else None)
-    error_class = str_or_none(lifecycle.get("error_class") if lifecycle else None)
+    error_class = (
+        str_or_none(lifecycle.get("error_class") if lifecycle else None)
+        or str_or_none(lifecycle.get("classification") if lifecycle else None)
+    )
     err = str_or_none(lifecycle.get("err") if lifecycle else None)
 
     if entry_outcome is False or dispatch_status is False or sim_status is False or error_class or err:
-        return EXECUTION_INFEASIBLE, error_class or err or "shadow_execution_failed", bool(shadow_entry), False, False
+        return (
+            EXECUTION_INFEASIBLE,
+            error_class or err or "shadow_execution_failed",
+            bool(shadow_entry),
+            False,
+            False,
+            source,
+        )
+
+    if not expected:
+        reason = "dispatch_observed_without_expected" if shadow_entry is not None or lifecycle is not None else None
+        return NO_DISPATCH_EXPECTED, reason, False, False, None, source
+    if shadow_entry is None and lifecycle is None:
+        return (
+            EXECUTION_UNKNOWN,
+            "dispatch_expected_but_no_shadow_artifacts",
+            False,
+            False,
+            None,
+            source,
+        )
 
     shadow_entry_possible = bool(shadow_entry) and entry_outcome is not False
     shadow_exit_possible = record_type == "position_closed"
     if shadow_entry_possible and shadow_exit_possible:
-        return EXECUTION_FEASIBLE_CLEAN, None, True, True, True
+        return EXECUTION_FEASIBLE_CLEAN, None, True, True, True, source
     if shadow_entry_possible or sim_status is True or dispatch_status is True:
-        return EXECUTION_FEASIBLE_DEGRADED, "missing_exit_proof", shadow_entry_possible, False, True
-    return EXECUTION_UNKNOWN, "shadow_artifacts_without_terminal_status", bool(shadow_entry), False, None
+        return EXECUTION_FEASIBLE_DEGRADED, "missing_exit_proof", shadow_entry_possible, False, True, source
+    return EXECUTION_UNKNOWN, "shadow_artifacts_without_terminal_status", bool(shadow_entry), False, None, source
 
 
 def decision_quality_class(market: str, execution: str) -> str:
@@ -190,7 +231,14 @@ def join_row(
     lifecycle_ts = int_or_none(lifecycle.get("timestamp_ms") if lifecycle else None)
     decision_to_sim = lifecycle_ts - ts if lifecycle_ts is not None and ts is not None else None
     decision_to_entry = entry_ts - ts if entry_ts is not None and ts is not None else None
-    execution_class, no_dispatch_reason, entry_possible, exit_possible, simulation_success = classify_execution(
+    (
+        execution_class,
+        no_dispatch_reason,
+        entry_possible,
+        exit_possible,
+        simulation_success,
+        evidence_source,
+    ) = classify_execution(
         expected=expected,
         decision_missing=decision is None,
         shadow_entry=shadow_entry,
@@ -203,6 +251,7 @@ def join_row(
     )
     error_class = (
         str_or_none(lifecycle.get("error_class") if lifecycle else None)
+        or str_or_none(lifecycle.get("classification") if lifecycle else None)
         or str_or_none(lifecycle.get("err") if lifecycle else None)
         or (str_or_none(shadow_entry.get("execution_outcome") if shadow_entry else None) if execution_class == EXECUTION_INFEASIBLE else None)
     )
@@ -230,6 +279,7 @@ def join_row(
         "shadow_exit_possible": exit_possible,
         "no_dispatch_reason": no_dispatch_reason,
         "unknown_execution_status": execution_class == EXECUTION_UNKNOWN,
+        "execution_evidence_source": evidence_source,
         "execution_quality_class": execution_class,
         "decision_quality_class": decision_quality_class(market_class, execution_class),
     }
@@ -256,6 +306,7 @@ def build_report(
     decision_quality_counts: Counter[str] = Counter()
     market_counts: Counter[str] = Counter()
     no_dispatch_reasons: Counter[str] = Counter()
+    evidence_sources: Counter[str] = Counter()
     unmatched_labels = 0
     dispatch_expected_rows = 0
     shadow_dispatch_observed_rows = 0
@@ -282,6 +333,7 @@ def build_report(
         market_counts[row["market_outcome_class"]] += 1
         if row["no_dispatch_reason"]:
             no_dispatch_reasons[row["no_dispatch_reason"]] += 1
+        evidence_sources[row["execution_evidence_source"]] += 1
 
     write_jsonl(joined_output_path, joined)
     return {
@@ -302,6 +354,7 @@ def build_report(
         "decision_quality_class_counts": dict(sorted(decision_quality_counts.items())),
         "market_outcome_class_counts": dict(sorted(market_counts.items())),
         "no_dispatch_reason_counts": dict(sorted(no_dispatch_reasons.items())),
+        "execution_evidence_source_counts": dict(sorted(evidence_sources.items())),
         "unknown_execution_status_rows": execution_counts.get(EXECUTION_UNKNOWN, 0),
         "output": str(joined_output_path),
     }
@@ -337,12 +390,15 @@ def render_markdown(summary: dict[str, Any]) -> str:
     lines.extend(["", "## Decision Quality", ""])
     for key, value in summary["decision_quality_class_counts"].items():
         lines.append(f"- `{key}`: `{value}`")
-    lines.extend(["", "## No Dispatch / Unknown Reasons", ""])
+    lines.extend(["", "## No Dispatch / Unknown / Failure Reasons", ""])
     if summary["no_dispatch_reason_counts"]:
         for key, value in summary["no_dispatch_reason_counts"].items():
             lines.append(f"- `{key}`: `{value}`")
     else:
         lines.append("- none")
+    lines.extend(["", "## Execution Evidence Sources", ""])
+    for key, value in summary["execution_evidence_source_counts"].items():
+        lines.append(f"- `{key}`: `{value}`")
     lines.extend(
         [
             "",
@@ -350,6 +406,8 @@ def render_markdown(summary: dict[str, Any]) -> str:
             "",
             "- Unknown execution status is not success.",
             "- REJECT/PENDING no-dispatch is `no_dispatch_expected`, not execution failure.",
+            "- Market-good rows are not `good_executable` without real shadow entry/lifecycle or simulation evidence.",
+            "- `AccountNotFound`, simulation failure, and data-problem lifecycle rows are `execution_infeasible`.",
             "- This report does not mutate decision logs, labels, runtime behavior, Gatekeeper policy, P2, or live execution.",
         ]
     )

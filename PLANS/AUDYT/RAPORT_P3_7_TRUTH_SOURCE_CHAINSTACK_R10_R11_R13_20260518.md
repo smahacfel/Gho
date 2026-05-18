@@ -64,7 +64,9 @@ transakcje w oknie daly sie wycenic. Nie jest to brak sciezki.
 Execution feasibility join pozostaje fail-closed:
 
 - dispatch expected rows: 0,
-- shadow dispatch observed rows: 0,
+- shadow dispatch observed rows: 1 (R13),
+- R13 observed dispatch: `execution_infeasible` / `data_problem` /
+  `AccountNotFound`,
 - `good_executable`: 0 dla R10/R11/R13.
 
 To oznacza, ze P3.7 moze teraz analizowac market-quality target
@@ -111,7 +113,8 @@ P3.7 Phase A zrobila istotny krok do przodu: mamy post-decision price-path
 truth-source i niezerowe `good_clean` w obu wymaganych splitach R11/R13.
 
 P3.7 Phase B feature prototype nadal pozostaje zablokowane jako candidate work,
-bo brakuje executable-quality targetu. Najblizszy sensowny krok to decyzja, czy
-P3.7 ma najpierw zbudowac execution-feasibility proxy/join dla historycznych
-blocked opportunities, czy ograniczyc kolejny etap do market-quality feature
-audit z bardzo wyraznym zastrzezeniem, ze nie jest to BUY-executable evidence.
+bo brakuje executable-quality targetu. Najblizszy sensowny krok to
+P3.7.6 Execution Feasibility Resolution: rozstrzygnac, czy market-good rows sa
+realnie egzekwowalne na podstawie shadow entry/lifecycle/simulation evidence,
+albo ograniczyc kolejny etap do market-quality feature audit z bardzo wyraznym
+zastrzezeniem, ze nie jest to BUY-executable evidence.
