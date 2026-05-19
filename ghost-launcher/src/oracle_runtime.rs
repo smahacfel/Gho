@@ -20,7 +20,8 @@ use crate::components::post_buy_runtime::{
 };
 use crate::components::trigger::safety::{PositionSlotId, SafetyViolation};
 use crate::config::{
-    ExecutionMode, SessionRuntimeConfig, ShadowLedgerConfig, TxIntelligenceRuntimeConfig,
+    ExecutionMode, P37ShadowProbeConfig, SessionRuntimeConfig, ShadowLedgerConfig,
+    TxIntelligenceRuntimeConfig,
 };
 use crate::events::{
     AccountUpdateEvent, DetectedPool, EventBusSender, ExecutionJoinMetadata,
@@ -1391,6 +1392,7 @@ pub struct OracleRuntimeConfig {
     pub shadow_ledger_enrichment_freshness_ms: u64,
     pub session: SessionRuntimeConfig,
     pub tx_intelligence: TxIntelligenceRuntimeConfig,
+    pub p37_shadow_probe: P37ShadowProbeConfig,
 }
 
 impl OracleRuntimeConfig {
@@ -1430,6 +1432,7 @@ impl OracleRuntimeConfig {
             shadow_ledger_enrichment_freshness_ms,
             session: SessionRuntimeConfig::default(),
             tx_intelligence: TxIntelligenceRuntimeConfig::default(),
+            p37_shadow_probe: P37ShadowProbeConfig::default(),
         }
     }
 
@@ -1440,6 +1443,7 @@ impl OracleRuntimeConfig {
             shadow_ledger_enrichment_freshness_ms: config.enrichment_freshness_ms,
             session: SessionRuntimeConfig::default(),
             tx_intelligence: TxIntelligenceRuntimeConfig::default(),
+            p37_shadow_probe: P37ShadowProbeConfig::default(),
         }
     }
 
@@ -1491,6 +1495,7 @@ impl Default for OracleRuntimeConfig {
             shadow_ledger_enrichment_freshness_ms: DEFAULT_SHADOW_LEDGER_ENRICHMENT_FRESHNESS_MS,
             session: SessionRuntimeConfig::default(),
             tx_intelligence: TxIntelligenceRuntimeConfig::default(),
+            p37_shadow_probe: P37ShadowProbeConfig::default(),
         }
     }
 }
@@ -4628,6 +4633,437 @@ fn enforce_buy_log_buy_routing(
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct P37ShadowProbeCandidate {
+    ab_record_id: Option<String>,
+    candidate_id: Option<String>,
+    pool_id: String,
+    base_mint: Option<String>,
+    decision_ts_ms: Option<u64>,
+    observation_start_ts_ms: Option<u64>,
+    observation_end_ts_ms: Option<u64>,
+    v3_feature_snapshot_hash: Option<String>,
+    v3_policy_config_hash: Option<String>,
+    v3_materialized_feature_snapshot_present: bool,
+    v3_policy_config_payload_present: bool,
+    active_verdict_type: Option<String>,
+    active_verdict_buy: Option<bool>,
+    active_reason_code: Option<String>,
+    active_reason_chain: Option<String>,
+    v3_shadow_verdict: Option<String>,
+    v3_shadow_reason_code: Option<String>,
+    v3_shadow_confidence: Option<f64>,
+    curve_data_known: Option<bool>,
+    rollout_namespace: String,
+    source_decision_plane: Option<String>,
+}
+
+impl P37ShadowProbeCandidate {
+    fn from_gatekeeper_log(
+        log: &ghost_brain::oracle::GatekeeperBuyLog,
+        rollout_namespace: &str,
+    ) -> Self {
+        Self {
+            ab_record_id: log.ab_record_id.clone(),
+            candidate_id: log.join_key.clone().or_else(|| log.ab_record_id.clone()),
+            pool_id: log.pool_id.clone(),
+            base_mint: log.base_mint.clone(),
+            decision_ts_ms: log
+                .ab_t_end_event_ts_ms
+                .or(log.observation_end_ts_ms)
+                .or(log.first_seen_ts_ms),
+            observation_start_ts_ms: log.observation_start_ts_ms.or(log.ab_t0_event_ts_ms),
+            observation_end_ts_ms: log.observation_end_ts_ms.or(log.ab_t_end_event_ts_ms),
+            v3_feature_snapshot_hash: log.v3_feature_snapshot_hash.clone(),
+            v3_policy_config_hash: log.v3_policy_config_hash.clone(),
+            v3_materialized_feature_snapshot_present: log
+                .v3_materialized_feature_snapshot
+                .is_some(),
+            v3_policy_config_payload_present: log.v3_policy_config_payload.is_some(),
+            active_verdict_type: log.verdict_type.clone(),
+            active_verdict_buy: log.decision_verdict_buy,
+            active_reason_code: log.reason_code.clone(),
+            active_reason_chain: log.decision_reason.clone(),
+            v3_shadow_verdict: log.v3_shadow_verdict.clone(),
+            v3_shadow_reason_code: log.v3_shadow_reason_code.clone(),
+            v3_shadow_confidence: log.v3_shadow_confidence,
+            curve_data_known: log.curve_data_known,
+            rollout_namespace: rollout_namespace.to_string(),
+            source_decision_plane: log.decision_plane.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq)]
+struct P37ShadowProbeSelectionRecord {
+    schema_version: u32,
+    event_type: String,
+    collection_plane: String,
+    probe_plane: String,
+    dispatch_source: String,
+    source_decision_plane: Option<String>,
+    rollout_namespace: String,
+    probe_id: Option<String>,
+    source_ab_record_id: Option<String>,
+    ab_record_id: Option<String>,
+    candidate_id: Option<String>,
+    pool_id: String,
+    base_mint: Option<String>,
+    mint_id: Option<String>,
+    decision_ts_ms: Option<u64>,
+    observation_start_ts_ms: Option<u64>,
+    observation_end_ts_ms: Option<u64>,
+    probe_selected_ts_ms: u64,
+    probe_bucket: String,
+    probe_bucket_reason: String,
+    probe_bucket_version: String,
+    probe_sample_reason: Option<String>,
+    probe_skip_reason: Option<String>,
+    sample_mode: String,
+    sample_source: String,
+    sample_hash: Option<u64>,
+    sample_modulus: u64,
+    sample_threshold: u64,
+    sampling_version: String,
+    v3_feature_snapshot_hash: Option<String>,
+    v3_policy_config_hash: Option<String>,
+    v3_materialized_feature_snapshot_present: bool,
+    v3_policy_config_payload_present: bool,
+    active_verdict_type: Option<String>,
+    active_verdict_buy: Option<bool>,
+    active_reason_code: Option<String>,
+    active_reason_chain: Option<String>,
+    v3_shadow_verdict: Option<String>,
+    v3_shadow_reason_code: Option<String>,
+    v3_shadow_confidence: Option<f64>,
+    probe_amount_source: String,
+    probe_amount_lamports: u64,
+    probe_slippage_bps: u64,
+    probe_quote_age_max_ms: u64,
+    probe_curve_age_max_ms: u64,
+}
+
+fn p37_shadow_probe_verdict_family(candidate: &P37ShadowProbeCandidate) -> String {
+    if let Some(v3_verdict) = candidate.v3_shadow_verdict.as_deref() {
+        let upper = v3_verdict.trim().to_ascii_uppercase();
+        if matches!(upper.as_str(), "BUY" | "REJECT" | "PENDING") {
+            return upper;
+        }
+    }
+    let active = candidate
+        .active_verdict_type
+        .as_deref()
+        .unwrap_or("UNKNOWN")
+        .trim()
+        .to_ascii_uppercase();
+    if active == "BUY" {
+        "BUY".to_string()
+    } else if active.starts_with("REJECT") {
+        "REJECT".to_string()
+    } else if active.starts_with("TIMEOUT") {
+        "TIMEOUT".to_string()
+    } else {
+        active
+    }
+}
+
+fn p37_shadow_probe_bucket(candidate: &P37ShadowProbeCandidate) -> (String, String) {
+    let v3_verdict = candidate
+        .v3_shadow_verdict
+        .as_deref()
+        .unwrap_or("UNKNOWN")
+        .trim()
+        .to_ascii_uppercase();
+    let v3_reason = candidate
+        .v3_shadow_reason_code
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let active_family = candidate
+        .active_verdict_type
+        .as_deref()
+        .unwrap_or("UNKNOWN")
+        .trim()
+        .to_ascii_uppercase();
+
+    if v3_verdict == "REJECT"
+        && (v3_reason.contains("manipulation") || v3_reason.contains("contradiction"))
+    {
+        return (
+            "v3_reject_manipulation_contradiction".to_string(),
+            "v3_reject_reason_contains_manipulation_or_contradiction".to_string(),
+        );
+    }
+    if v3_verdict == "REJECT" && active_family.starts_with("REJECT") {
+        return (
+            "active_reject_v3_reject".to_string(),
+            "active_and_v3_reject".to_string(),
+        );
+    }
+    if v3_verdict == "PENDING" && active_family.starts_with("REJECT") {
+        return (
+            "active_reject_v3_pending".to_string(),
+            "active_reject_with_v3_pending".to_string(),
+        );
+    }
+    if v3_verdict == "PENDING" {
+        return (
+            "v3_pending_wait_sample".to_string(),
+            "v3_pending_sample".to_string(),
+        );
+    }
+    if v3_verdict == "REJECT" {
+        return (
+            "v3_reject_low_opportunity".to_string(),
+            "v3_reject".to_string(),
+        );
+    }
+    (
+        "random_eligible_control".to_string(),
+        "eligible_control_bucket".to_string(),
+    )
+}
+
+fn p37_shadow_probe_id(
+    source_ab_record_id: &str,
+    sampling_version: &str,
+    probe_bucket: &str,
+    probe_amount_lamports: u64,
+) -> String {
+    let hash_input = format!(
+        "{source_ab_record_id}:probe:{sampling_version}:{probe_bucket}:{probe_amount_lamports}"
+    );
+    blake3::hash(hash_input.as_bytes()).to_hex().to_string()
+}
+
+fn p37_shadow_probe_sample_hash(
+    source_ab_record_id: &str,
+    v3_policy_config_hash: &str,
+    namespace: &str,
+    sampling_version: &str,
+    probe_bucket: &str,
+    probe_amount_lamports: u64,
+) -> u64 {
+    let input = format!(
+        "{source_ab_record_id}:{v3_policy_config_hash}:{namespace}:{sampling_version}:{probe_bucket}:{probe_amount_lamports}"
+    );
+    let hash = blake3::hash(input.as_bytes());
+    let bytes = hash.as_bytes();
+    u64::from_be_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ])
+}
+
+fn p37_shadow_probe_skip_reason(
+    config: &P37ShadowProbeConfig,
+    candidate: &P37ShadowProbeCandidate,
+    verdict_family: &str,
+) -> Option<String> {
+    if config.exclude_active_buy_rows && candidate.active_verdict_buy.unwrap_or(false) {
+        return Some("active_buy_excluded".to_string());
+    }
+    if !config
+        .include_verdict_types
+        .iter()
+        .any(|verdict| verdict.eq_ignore_ascii_case(verdict_family))
+    {
+        return Some("verdict_type_not_in_sample_scope".to_string());
+    }
+    if !config.enable_eligibility_precheck {
+        return None;
+    }
+    if config.require_ab_record_id && candidate.ab_record_id.as_deref().unwrap_or("").is_empty() {
+        return Some("missing_ab_record_id".to_string());
+    }
+    if candidate.pool_id.trim().is_empty() {
+        return Some("invalid_pool_identity".to_string());
+    }
+    if config.require_execution_route_identity
+        && candidate
+            .base_mint
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+    {
+        return Some("invalid_mint_identity".to_string());
+    }
+    if config.require_materialized_feature_set
+        && !candidate.v3_materialized_feature_snapshot_present
+    {
+        return Some("missing_materialized_feature_set".to_string());
+    }
+    if config.require_v3_replay_payload && !candidate.v3_policy_config_payload_present {
+        return Some("missing_v3_replay_payload".to_string());
+    }
+    if config.require_v3_feature_snapshot_hash
+        && candidate
+            .v3_feature_snapshot_hash
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+    {
+        return Some("missing_v3_feature_snapshot_hash".to_string());
+    }
+    if config.require_v3_policy_config_hash
+        && candidate
+            .v3_policy_config_hash
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+    {
+        return Some("missing_v3_policy_config_hash".to_string());
+    }
+    if config.require_curve_account_state && !candidate.curve_data_known.unwrap_or(false) {
+        return Some("critical_curve_unavailable".to_string());
+    }
+    None
+}
+
+fn p37_shadow_probe_selection_record(
+    config: &P37ShadowProbeConfig,
+    candidate: &P37ShadowProbeCandidate,
+    now_ms: u64,
+) -> P37ShadowProbeSelectionRecord {
+    let verdict_family = p37_shadow_probe_verdict_family(candidate);
+    let (probe_bucket, probe_bucket_reason) = p37_shadow_probe_bucket(candidate);
+    let skip_reason = p37_shadow_probe_skip_reason(config, candidate, &verdict_family);
+    let source_ab_record_id = candidate.ab_record_id.clone();
+    let probe_id = source_ab_record_id.as_deref().map(|ab_record_id| {
+        p37_shadow_probe_id(
+            ab_record_id,
+            &config.sampling_version,
+            &probe_bucket,
+            config.probe_amount_lamports,
+        )
+    });
+    let sample_hash = source_ab_record_id
+        .as_deref()
+        .zip(candidate.v3_policy_config_hash.as_deref())
+        .map(|(ab_record_id, policy_hash)| {
+            p37_shadow_probe_sample_hash(
+                ab_record_id,
+                policy_hash,
+                &config.namespace,
+                &config.sampling_version,
+                &probe_bucket,
+                config.probe_amount_lamports,
+            )
+        });
+    let sample_skip_reason = if skip_reason.is_none() {
+        match sample_hash {
+            Some(hash) if hash % config.sample_modulus < config.sample_threshold => None,
+            Some(_) => Some("deterministic_sample_not_selected".to_string()),
+            None => Some("missing_sampling_key".to_string()),
+        }
+    } else {
+        skip_reason
+    };
+    let selected = sample_skip_reason.is_none();
+
+    P37ShadowProbeSelectionRecord {
+        schema_version: 1,
+        event_type: if selected {
+            "probe_selected".to_string()
+        } else {
+            "probe_skipped".to_string()
+        },
+        collection_plane: "counterfactual_shadow_probe".to_string(),
+        probe_plane: "p37_shadow_probe".to_string(),
+        dispatch_source: config.dispatch_source.clone(),
+        source_decision_plane: candidate.source_decision_plane.clone(),
+        rollout_namespace: candidate.rollout_namespace.clone(),
+        probe_id,
+        source_ab_record_id: source_ab_record_id.clone(),
+        ab_record_id: source_ab_record_id,
+        candidate_id: candidate.candidate_id.clone(),
+        pool_id: candidate.pool_id.clone(),
+        base_mint: candidate.base_mint.clone(),
+        mint_id: candidate.base_mint.clone(),
+        decision_ts_ms: candidate.decision_ts_ms,
+        observation_start_ts_ms: candidate.observation_start_ts_ms,
+        observation_end_ts_ms: candidate.observation_end_ts_ms,
+        probe_selected_ts_ms: now_ms,
+        probe_bucket,
+        probe_bucket_reason,
+        probe_bucket_version: config.sampling_version.clone(),
+        probe_sample_reason: selected.then(|| "deterministic_hash_mod_selected".to_string()),
+        probe_skip_reason: sample_skip_reason,
+        sample_mode: config.sample_mode.clone(),
+        sample_source: config.sample_source.clone(),
+        sample_hash,
+        sample_modulus: config.sample_modulus,
+        sample_threshold: config.sample_threshold,
+        sampling_version: config.sampling_version.clone(),
+        v3_feature_snapshot_hash: candidate.v3_feature_snapshot_hash.clone(),
+        v3_policy_config_hash: candidate.v3_policy_config_hash.clone(),
+        v3_materialized_feature_snapshot_present: candidate
+            .v3_materialized_feature_snapshot_present,
+        v3_policy_config_payload_present: candidate.v3_policy_config_payload_present,
+        active_verdict_type: candidate.active_verdict_type.clone(),
+        active_verdict_buy: candidate.active_verdict_buy,
+        active_reason_code: candidate.active_reason_code.clone(),
+        active_reason_chain: candidate.active_reason_chain.clone(),
+        v3_shadow_verdict: candidate.v3_shadow_verdict.clone(),
+        v3_shadow_reason_code: candidate.v3_shadow_reason_code.clone(),
+        v3_shadow_confidence: candidate.v3_shadow_confidence,
+        probe_amount_source: config.probe_amount_source.clone(),
+        probe_amount_lamports: config.probe_amount_lamports,
+        probe_slippage_bps: config.probe_slippage_bps,
+        probe_quote_age_max_ms: config.probe_quote_age_max_ms,
+        probe_curve_age_max_ms: config.probe_curve_age_max_ms,
+    }
+}
+
+async fn append_p37_shadow_probe_selection_record(
+    log_path: &std::path::Path,
+    record: &P37ShadowProbeSelectionRecord,
+) -> anyhow::Result<()> {
+    if let Some(parent) = log_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .await?;
+    let json = serde_json::to_string(record)?;
+    tokio::io::AsyncWriteExt::write_all(&mut file, json.as_bytes()).await?;
+    tokio::io::AsyncWriteExt::write_all(&mut file, b"\n").await?;
+    tokio::io::AsyncWriteExt::flush(&mut file).await?;
+    Ok(())
+}
+
+fn maybe_spawn_p37_shadow_probe_selection_log(
+    ctx: &PoolObservationContext,
+    log: &ghost_brain::oracle::GatekeeperBuyLog,
+) {
+    let config = &ctx.p37_shadow_probe_config;
+    if !config.enabled {
+        return;
+    }
+    let candidate =
+        P37ShadowProbeCandidate::from_gatekeeper_log(log, &ctx.gatekeeper_rollout_profile);
+    let record = p37_shadow_probe_selection_record(config, &candidate, current_time_ms());
+    let log_path = if record.event_type == "probe_selected" {
+        std::path::PathBuf::from(&config.selection_log_path)
+    } else {
+        std::path::PathBuf::from(&config.skip_log_path)
+    };
+    tokio::spawn(async move {
+        if let Err(err) = append_p37_shadow_probe_selection_record(&log_path, &record).await {
+            warn!(
+                path = %log_path.display(),
+                error = %err,
+                "P37_SHADOW_PROBE_SELECTION_LOG_WRITE_FAILED"
+            );
+        }
+    });
+}
+
 fn canonical_gatekeeper_config_hash(
     config: &ghost_brain::config::GatekeeperV2Config,
 ) -> Result<String, serde_json::Error> {
@@ -5191,6 +5627,7 @@ struct PoolObservationContext {
     gatekeeper_v3_config: GatekeeperV3Config,
     cross_pool_velocity_config: CrossPoolVelocityConfig,
     funding_source_config: FundingSourceConfig,
+    p37_shadow_probe_config: P37ShadowProbeConfig,
     authoritative_funding_coverage_gate_enabled: bool,
     fingerprint_config: EarlyFingerprintConfig,
     event_emitter: Option<Arc<EventEmitter>>,
@@ -8740,6 +9177,7 @@ async fn pool_observation_task(
                         &window_state,
                     );
                 }
+                maybe_spawn_p37_shadow_probe_selection_log(ctx.as_ref(), &buy_log);
                 let dl = ctx.decision_logger.clone();
                 tokio::spawn(async move {
                     dl.log_gatekeeper_buy_decision(buy_log).await;
@@ -8842,6 +9280,7 @@ async fn pool_observation_task(
                         &window_state,
                     );
                 }
+                maybe_spawn_p37_shadow_probe_selection_log(ctx.as_ref(), &buy_log);
                 let dl = ctx.decision_logger.clone();
                 tokio::spawn(async move {
                     dl.log_gatekeeper_buy_decision(buy_log).await;
@@ -9025,6 +9464,7 @@ async fn pool_observation_task(
                                 &window_state,
                             );
                         }
+                        maybe_spawn_p37_shadow_probe_selection_log(ctx.as_ref(), &buy_log);
                         let dl = ctx.decision_logger.clone();
                         tokio::spawn(async move {
                             dl.log_gatekeeper_buy_decision(buy_log).await;
@@ -9230,6 +9670,7 @@ async fn pool_observation_task(
                         &window_state,
                     );
                 }
+                maybe_spawn_p37_shadow_probe_selection_log(ctx.as_ref(), &buy_log);
                 let dl = ctx.decision_logger.clone();
                 tokio::spawn(async move {
                     dl.log_gatekeeper_buy_decision(buy_log).await;
@@ -9683,6 +10124,7 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
             &gatekeeper_config,
         ),
         funding_source_config,
+        p37_shadow_probe_config: oracle_runtime.config.p37_shadow_probe.clone(),
         authoritative_funding_coverage_gate_enabled,
         fingerprint_config: EarlyFingerprintConfig::default(),
         event_emitter: event_emitter.clone(),
@@ -10270,6 +10712,137 @@ mod tests {
         std::fs::write(path, serde_json::to_vec(&bytes).expect("serialize keypair"))
             .expect("write keypair");
         keypair
+    }
+
+    fn p37_shadow_probe_test_candidate() -> P37ShadowProbeCandidate {
+        P37ShadowProbeCandidate {
+            ab_record_id: Some("pool:1000:2000:REJECT".to_string()),
+            candidate_id: Some("pool:mint:1000".to_string()),
+            pool_id: "pool".to_string(),
+            base_mint: Some("mint".to_string()),
+            decision_ts_ms: Some(2_000),
+            observation_start_ts_ms: Some(1_000),
+            observation_end_ts_ms: Some(2_000),
+            v3_feature_snapshot_hash: Some("feature-hash".to_string()),
+            v3_policy_config_hash: Some("policy-hash".to_string()),
+            v3_materialized_feature_snapshot_present: true,
+            v3_policy_config_payload_present: true,
+            active_verdict_type: Some("REJECT_CORE_FAIL".to_string()),
+            active_verdict_buy: Some(false),
+            active_reason_code: Some("core_fail".to_string()),
+            active_reason_chain: Some("core_fail".to_string()),
+            v3_shadow_verdict: Some("REJECT".to_string()),
+            v3_shadow_reason_code: Some("manipulation_contradiction".to_string()),
+            v3_shadow_confidence: Some(0.25),
+            curve_data_known: Some(true),
+            rollout_namespace: "p37-j3-test".to_string(),
+            source_decision_plane: Some("legacy_live".to_string()),
+        }
+    }
+
+    #[test]
+    fn p37_shadow_probe_sampler_is_deterministic() {
+        let first = p37_shadow_probe_sample_hash(
+            "pool:1000:2000:REJECT",
+            "policy-hash",
+            "p37-j3-test",
+            "p37-j3-v1",
+            "active_reject_v3_reject",
+            0,
+        );
+        let second = p37_shadow_probe_sample_hash(
+            "pool:1000:2000:REJECT",
+            "policy-hash",
+            "p37-j3-test",
+            "p37-j3-v1",
+            "active_reject_v3_reject",
+            0,
+        );
+        let different_bucket = p37_shadow_probe_sample_hash(
+            "pool:1000:2000:REJECT",
+            "policy-hash",
+            "p37-j3-test",
+            "p37-j3-v1",
+            "random_eligible_control",
+            0,
+        );
+
+        assert_eq!(first, second);
+        assert_ne!(first, different_bucket);
+    }
+
+    #[test]
+    fn p37_shadow_probe_selection_record_selects_complete_candidate() {
+        let config = P37ShadowProbeConfig {
+            enabled: true,
+            sample_threshold: 100,
+            ..Default::default()
+        };
+        let candidate = p37_shadow_probe_test_candidate();
+
+        let record = p37_shadow_probe_selection_record(&config, &candidate, 3_000);
+
+        assert_eq!(record.event_type, "probe_selected");
+        assert_eq!(record.dispatch_source, "counterfactual_shadow_probe");
+        assert_eq!(record.probe_bucket, "v3_reject_manipulation_contradiction");
+        assert_eq!(
+            record.ab_record_id.as_deref(),
+            Some("pool:1000:2000:REJECT")
+        );
+        assert!(record.probe_id.is_some());
+        assert_eq!(record.probe_skip_reason, None);
+        assert_eq!(
+            record.probe_sample_reason.as_deref(),
+            Some("deterministic_hash_mod_selected")
+        );
+    }
+
+    #[test]
+    fn p37_shadow_probe_selection_record_skips_missing_ab_record_id() {
+        let config = P37ShadowProbeConfig {
+            enabled: true,
+            sample_threshold: 100,
+            ..Default::default()
+        };
+        let mut candidate = p37_shadow_probe_test_candidate();
+        candidate.ab_record_id = None;
+
+        let record = p37_shadow_probe_selection_record(&config, &candidate, 3_000);
+
+        assert_eq!(record.event_type, "probe_skipped");
+        assert_eq!(
+            record.probe_skip_reason.as_deref(),
+            Some("missing_ab_record_id")
+        );
+        assert!(record.probe_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn p37_shadow_probe_selection_record_appends_jsonl() {
+        let temp = tempdir().expect("tempdir");
+        let path = temp.path().join("probe_selection.jsonl");
+        let config = P37ShadowProbeConfig {
+            enabled: true,
+            sample_threshold: 100,
+            ..Default::default()
+        };
+        let candidate = p37_shadow_probe_test_candidate();
+        let record = p37_shadow_probe_selection_record(&config, &candidate, 3_000);
+
+        append_p37_shadow_probe_selection_record(&path, &record)
+            .await
+            .expect("append selection record");
+
+        let mut file = tokio::fs::File::open(&path).await.expect("open record");
+        let mut content = String::new();
+        file.read_to_string(&mut content)
+            .await
+            .expect("read record");
+        let parsed: serde_json::Value =
+            serde_json::from_str(content.trim()).expect("parse selection json");
+        assert_eq!(parsed["event_type"], "probe_selected");
+        assert_eq!(parsed["dispatch_source"], "counterfactual_shadow_probe");
+        assert_eq!(parsed["ab_record_id"], "pool:1000:2000:REJECT");
     }
 
     #[test]
@@ -12006,6 +12579,7 @@ mod tests {
             funding_source_config: FundingSourceConfig::from_gatekeeper_config(
                 &GatekeeperV2Config::default(),
             ),
+            p37_shadow_probe_config: P37ShadowProbeConfig::default(),
             authoritative_funding_coverage_gate_enabled: false,
             fingerprint_config: EarlyFingerprintConfig::default(),
             event_emitter: None,
@@ -12969,6 +13543,7 @@ mod tests {
                 &gatekeeper_config,
             ),
             funding_source_config: FundingSourceConfig::from_gatekeeper_config(&gatekeeper_config),
+            p37_shadow_probe_config: P37ShadowProbeConfig::default(),
             authoritative_funding_coverage_gate_enabled: false,
             gatekeeper_config,
             gatekeeper_v3_config: GatekeeperV3Config::default(),
@@ -13082,6 +13657,7 @@ mod tests {
                 &gatekeeper_config,
             ),
             funding_source_config: FundingSourceConfig::from_gatekeeper_config(&gatekeeper_config),
+            p37_shadow_probe_config: P37ShadowProbeConfig::default(),
             authoritative_funding_coverage_gate_enabled: false,
             gatekeeper_config,
             gatekeeper_v3_config: GatekeeperV3Config::default(),

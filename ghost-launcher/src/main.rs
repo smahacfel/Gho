@@ -1669,6 +1669,7 @@ async fn main() -> Result<()> {
         oracle_runtime::OracleRuntimeConfig::from_shadow_ledger_config(&config.shadow_ledger);
     oracle_runtime_config.session = config.session.clone();
     oracle_runtime_config.tx_intelligence = config.tx_intelligence.clone();
+    oracle_runtime_config.p37_shadow_probe = config.p37_shadow_probe.clone();
     let mut oracle_runtime_builder = OracleRuntime::new_with_config(
         hyper_prediction_oracle.clone(),
         config.seer.pump_program_id.clone(),
