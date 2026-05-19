@@ -59,3 +59,17 @@ fn gatekeeper_v3_p36_primary_only_descopes_fsc_forward_only() {
     assert!(!config.gatekeeper_v3.promotion.enabled);
     assert!(!config.gatekeeper_v3.evidence_requirements.fsc);
 }
+
+#[test]
+fn gatekeeper_v3_p37_mfs_lifecycle_collection_descopes_fsc_forward_only() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../configs/rollout/ghost_brain_v3_p37_mfs_lifecycle.toml");
+    let config = GhostBrainConfig::from_toml_file(&path).expect("P3.7-J config should load");
+
+    assert!(!config.gatekeeper_v3.enabled);
+    assert!(config.gatekeeper_v3.shadow_emit_enabled);
+    assert!(config.gatekeeper_v3.replay_payload_enabled);
+    assert!(!config.gatekeeper_v3.promotion.enabled);
+    assert!(!config.gatekeeper_v3.evidence_requirements.fsc);
+    assert!(!config.gatekeeper_v3.evidence_requirements.execution);
+}

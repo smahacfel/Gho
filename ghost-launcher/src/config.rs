@@ -3899,6 +3899,47 @@ enabled = true
     }
 
     #[test]
+    fn test_p37_mfs_lifecycle_rollout_profiles_load_shadow_only_primary_only() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        for file_name in [
+            "shadow-burnin-v3-p37-mfs-lifecycle-r14-primary-only.toml",
+            "shadow-burnin-v3-p37-mfs-lifecycle-r14-smoke.toml",
+        ] {
+            let path = manifest_dir.join("../configs/rollout").join(file_name);
+            let config = LauncherConfig::from_file(&path)
+                .unwrap_or_else(|err| panic!("failed to load {}: {err}", path.display()));
+
+            assert_eq!(config.seer.funding_lane_mode, "disabled");
+            assert_eq!(config.trigger.entry_mode, TriggerEntryMode::ShadowOnly);
+            assert_eq!(config.execution.execution_mode, ExecutionMode::Shadow);
+            assert!(config.trigger.shadow_run.enabled);
+            assert_eq!(
+                config.trigger.shadow_run.payer_strategy,
+                TriggerShadowPayerStrategy::Ephemeral
+            );
+            assert!(config
+                .ghost_brain_config_path
+                .ends_with("configs/rollout/ghost_brain_v3_p37_mfs_lifecycle.toml"));
+            assert!(config
+                .oracle
+                .decision_log_path
+                .contains("shadow-burnin-v3-p37-mfs-lifecycle-r14"));
+            assert!(config
+                .execution
+                .shadow
+                .entry_log_path
+                .contains("shadow-burnin-v3-p37-mfs-lifecycle-r14"));
+            assert!(config
+                .execution
+                .shadow
+                .lifecycle_log_path
+                .as_deref()
+                .unwrap_or_default()
+                .contains("shadow-burnin-v3-p37-mfs-lifecycle-r14"));
+        }
+    }
+
+    #[test]
     fn test_validate_execution_profile_rejects_placeholder_shadow_rpc_in_production() {
         let mut config = LauncherConfig::default();
         config.mode = AppMode::Production;
