@@ -4744,6 +4744,48 @@ struct P37ShadowProbeSelectionRecord {
     probe_curve_age_max_ms: u64,
 }
 
+#[derive(Debug, Clone, serde::Serialize, PartialEq)]
+struct P37ShadowProbeTransportRecord {
+    #[serde(flatten)]
+    join_metadata: ExecutionJoinMetadata,
+    schema_version: u32,
+    event_type: String,
+    collection_plane: String,
+    probe_plane: String,
+    dispatch_source: String,
+    candidate_id: String,
+    pool_amm_id: String,
+    pool_id: String,
+    base_mint: String,
+    mint_id: String,
+    decision_ts_ms: u64,
+    probe_selected_ts_ms: u64,
+    transport_ts_ms: u64,
+    sim_started_ts_ms: u64,
+    sim_finished_ts_ms: u64,
+    decision_to_sim_start_ms: u64,
+    shadow_duration_ms: u64,
+    amount_lamports: u64,
+    probe_amount_source: String,
+    probe_slippage_bps: u64,
+    probe_quote_age_max_ms: u64,
+    probe_curve_age_max_ms: u64,
+    tip_lamports: u64,
+    payer_provenance: String,
+    err: Option<String>,
+    error_class: Option<String>,
+    live_signature: Option<String>,
+    execution_outcome: String,
+    probe_bucket: String,
+    probe_bucket_reason: String,
+    probe_bucket_version: String,
+    active_verdict_type: Option<String>,
+    active_verdict_buy: Option<bool>,
+    active_reason_code: Option<String>,
+    v3_shadow_verdict: Option<String>,
+    v3_shadow_reason_code: Option<String>,
+}
+
 fn p37_shadow_probe_verdict_family(candidate: &P37ShadowProbeCandidate) -> String {
     if let Some(v3_verdict) = candidate.v3_shadow_verdict.as_deref() {
         let upper = v3_verdict.trim().to_ascii_uppercase();
@@ -5019,6 +5061,146 @@ fn p37_shadow_probe_selection_record(
     }
 }
 
+fn p37_shadow_probe_candidate_id(record: &P37ShadowProbeSelectionRecord) -> Option<String> {
+    record.candidate_id.clone().or_else(|| {
+        let base_mint = record.base_mint.as_deref()?;
+        let decision_ts_ms = record.decision_ts_ms?;
+        Some(crate::events::build_execution_candidate_id(
+            base_mint,
+            &record.pool_id,
+            decision_ts_ms.to_string(),
+        ))
+    })
+}
+
+fn p37_shadow_probe_join_metadata(
+    record: &P37ShadowProbeSelectionRecord,
+) -> Option<ExecutionJoinMetadata> {
+    Some(ExecutionJoinMetadata {
+        ab_record_id: record.ab_record_id.clone(),
+        source_ab_record_id: record.source_ab_record_id.clone(),
+        probe_id: record.probe_id.clone(),
+        dispatch_source: Some(record.dispatch_source.clone()),
+        collection_plane: Some(record.collection_plane.clone()),
+        probe_plane: Some(record.probe_plane.clone()),
+        v3_feature_snapshot_hash: record.v3_feature_snapshot_hash.clone(),
+        v3_policy_config_hash: record.v3_policy_config_hash.clone(),
+        decision_plane: record.source_decision_plane.clone(),
+        rollout_namespace: Some(record.rollout_namespace.clone()),
+    })
+}
+
+fn p37_shadow_probe_artifact_records(
+    record: &P37ShadowProbeSelectionRecord,
+    now_ms: u64,
+) -> Option<(P37ShadowProbeTransportRecord, ShadowEntryRecord)> {
+    if record.event_type != "probe_selected" || record.probe_skip_reason.is_some() {
+        return None;
+    }
+    let join_metadata = p37_shadow_probe_join_metadata(record)?;
+    if join_metadata.ab_record_id.is_none() || join_metadata.probe_id.is_none() {
+        return None;
+    }
+    let candidate_id = p37_shadow_probe_candidate_id(record)?;
+    let base_mint = record.base_mint.clone()?;
+    let decision_ts_ms = record.decision_ts_ms?;
+    let decision_to_sim_start_ms = now_ms.saturating_sub(decision_ts_ms);
+    let execution_outcome = "counterfactual_probe_recorded_no_simulation".to_string();
+
+    let transport = P37ShadowProbeTransportRecord {
+        join_metadata: join_metadata.clone(),
+        schema_version: 1,
+        event_type: "counterfactual_shadow_probe_transport".to_string(),
+        collection_plane: record.collection_plane.clone(),
+        probe_plane: record.probe_plane.clone(),
+        dispatch_source: record.dispatch_source.clone(),
+        candidate_id: candidate_id.clone(),
+        pool_amm_id: record.pool_id.clone(),
+        pool_id: record.pool_id.clone(),
+        base_mint: base_mint.clone(),
+        mint_id: base_mint.clone(),
+        decision_ts_ms,
+        probe_selected_ts_ms: record.probe_selected_ts_ms,
+        transport_ts_ms: now_ms,
+        sim_started_ts_ms: now_ms,
+        sim_finished_ts_ms: now_ms,
+        decision_to_sim_start_ms,
+        shadow_duration_ms: 0,
+        amount_lamports: record.probe_amount_lamports,
+        probe_amount_source: record.probe_amount_source.clone(),
+        probe_slippage_bps: record.probe_slippage_bps,
+        probe_quote_age_max_ms: record.probe_quote_age_max_ms,
+        probe_curve_age_max_ms: record.probe_curve_age_max_ms,
+        tip_lamports: 0,
+        payer_provenance: "counterfactual_shadow_probe".to_string(),
+        err: None,
+        error_class: None,
+        live_signature: None,
+        execution_outcome: execution_outcome.clone(),
+        probe_bucket: record.probe_bucket.clone(),
+        probe_bucket_reason: record.probe_bucket_reason.clone(),
+        probe_bucket_version: record.probe_bucket_version.clone(),
+        active_verdict_type: record.active_verdict_type.clone(),
+        active_verdict_buy: record.active_verdict_buy,
+        active_reason_code: record.active_reason_code.clone(),
+        v3_shadow_verdict: record.v3_shadow_verdict.clone(),
+        v3_shadow_reason_code: record.v3_shadow_reason_code.clone(),
+    };
+
+    let entry = ShadowEntryRecord {
+        join_metadata,
+        timestamp: format_shadow_entry_timestamp(now_ms),
+        pool_id: record.pool_id.clone(),
+        mint_id: base_mint,
+        entry_price: 0.0,
+        slot: None,
+        timestamp_ms: now_ms,
+        candidate_id: Some(candidate_id),
+        order_id: None,
+        quote_id: None,
+        timing_source: Some("p37_shadow_probe_p0_transport_entry_harness".to_string()),
+        execution_outcome,
+    };
+
+    Some((transport, entry))
+}
+
+async fn append_p37_shadow_probe_transport_record(
+    log_path: &std::path::Path,
+    record: &P37ShadowProbeTransportRecord,
+) -> anyhow::Result<()> {
+    if let Some(parent) = log_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .await?;
+    let json = serde_json::to_string(record)?;
+    tokio::io::AsyncWriteExt::write_all(&mut file, json.as_bytes()).await?;
+    tokio::io::AsyncWriteExt::write_all(&mut file, b"\n").await?;
+    tokio::io::AsyncWriteExt::flush(&mut file).await?;
+    Ok(())
+}
+
+async fn append_p37_shadow_probe_p0_artifacts(
+    config: &P37ShadowProbeConfig,
+    record: &P37ShadowProbeSelectionRecord,
+    now_ms: u64,
+) -> anyhow::Result<bool> {
+    let Some((transport, entry)) = p37_shadow_probe_artifact_records(record, now_ms) else {
+        return Ok(false);
+    };
+    append_p37_shadow_probe_transport_record(
+        std::path::Path::new(&config.transport_log_path),
+        &transport,
+    )
+    .await?;
+    append_shadow_entry_record(std::path::Path::new(&config.entry_log_path), &entry).await?;
+    Ok(true)
+}
+
 async fn append_p37_shadow_probe_selection_record(
     log_path: &std::path::Path,
     record: &P37ShadowProbeSelectionRecord,
@@ -5054,6 +5236,7 @@ fn maybe_spawn_p37_shadow_probe_selection_log(
     } else {
         std::path::PathBuf::from(&config.skip_log_path)
     };
+    let config = config.clone();
     tokio::spawn(async move {
         if let Err(err) = append_p37_shadow_probe_selection_record(&log_path, &record).await {
             warn!(
@@ -5061,6 +5244,26 @@ fn maybe_spawn_p37_shadow_probe_selection_log(
                 error = %err,
                 "P37_SHADOW_PROBE_SELECTION_LOG_WRITE_FAILED"
             );
+        }
+        if record.event_type == "probe_selected" {
+            match append_p37_shadow_probe_p0_artifacts(&config, &record, current_time_ms()).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    warn!(
+                        probe_id = ?record.probe_id,
+                        source_ab_record_id = ?record.source_ab_record_id,
+                        "P37_SHADOW_PROBE_ARTIFACT_SKIPPED_AFTER_SELECTION"
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        probe_id = ?record.probe_id,
+                        source_ab_record_id = ?record.source_ab_record_id,
+                        error = %err,
+                        "P37_SHADOW_PROBE_ARTIFACT_WRITE_FAILED"
+                    );
+                }
+            }
         }
     });
 }
@@ -10844,6 +11047,142 @@ mod tests {
         assert_eq!(parsed["event_type"], "probe_selected");
         assert_eq!(parsed["dispatch_source"], "counterfactual_shadow_probe");
         assert_eq!(parsed["ab_record_id"], "pool:1000:2000:REJECT");
+    }
+
+    #[test]
+    fn p37_shadow_probe_artifact_records_preserve_probe_join_keys() {
+        let config = P37ShadowProbeConfig {
+            enabled: true,
+            sample_threshold: 100,
+            probe_amount_lamports: 123_456,
+            ..Default::default()
+        };
+        let candidate = p37_shadow_probe_test_candidate();
+        let record = p37_shadow_probe_selection_record(&config, &candidate, 3_000);
+
+        let (transport, entry) =
+            p37_shadow_probe_artifact_records(&record, 3_100).expect("probe artifacts");
+
+        assert_eq!(transport.dispatch_source, "counterfactual_shadow_probe");
+        assert_eq!(transport.collection_plane, "counterfactual_shadow_probe");
+        assert_eq!(transport.probe_plane, "p37_shadow_probe");
+        assert_eq!(
+            transport.join_metadata.ab_record_id.as_deref(),
+            Some("pool:1000:2000:REJECT")
+        );
+        assert_eq!(
+            transport.join_metadata.source_ab_record_id.as_deref(),
+            Some("pool:1000:2000:REJECT")
+        );
+        assert_eq!(transport.join_metadata.probe_id, record.probe_id);
+        assert_eq!(
+            transport.join_metadata.dispatch_source.as_deref(),
+            Some("counterfactual_shadow_probe")
+        );
+        assert_eq!(
+            transport.join_metadata.v3_feature_snapshot_hash.as_deref(),
+            Some("feature-hash")
+        );
+        assert_eq!(
+            transport.join_metadata.v3_policy_config_hash.as_deref(),
+            Some("policy-hash")
+        );
+        assert_eq!(transport.amount_lamports, 123_456);
+        assert_eq!(transport.live_signature, None);
+        assert_eq!(transport.active_verdict_buy, Some(false));
+        assert_eq!(entry.join_metadata, transport.join_metadata);
+        assert_eq!(entry.candidate_id.as_deref(), Some("pool:mint:1000"));
+        assert_eq!(
+            entry.timing_source.as_deref(),
+            Some("p37_shadow_probe_p0_transport_entry_harness")
+        );
+        assert_eq!(
+            entry.execution_outcome,
+            "counterfactual_probe_recorded_no_simulation"
+        );
+    }
+
+    #[tokio::test]
+    async fn p37_shadow_probe_selected_record_appends_transport_and_entry_jsonl() {
+        let temp = tempdir().expect("tempdir");
+        let transport_path = temp.path().join("probe_transport.jsonl");
+        let entry_path = temp.path().join("probe_entries.jsonl");
+        let config = P37ShadowProbeConfig {
+            enabled: true,
+            sample_threshold: 100,
+            transport_log_path: transport_path.to_string_lossy().into_owned(),
+            entry_log_path: entry_path.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let candidate = p37_shadow_probe_test_candidate();
+        let record = p37_shadow_probe_selection_record(&config, &candidate, 3_000);
+
+        let wrote = append_p37_shadow_probe_p0_artifacts(&config, &record, 3_100)
+            .await
+            .expect("append probe artifacts");
+
+        assert!(wrote);
+        let transport_content = tokio::fs::read_to_string(&transport_path)
+            .await
+            .expect("read transport");
+        let transport: serde_json::Value =
+            serde_json::from_str(transport_content.lines().next().expect("one transport row"))
+                .expect("parse transport");
+        let entry_content = tokio::fs::read_to_string(&entry_path)
+            .await
+            .expect("read entry");
+        let entry: serde_json::Value =
+            serde_json::from_str(entry_content.lines().next().expect("one entry row"))
+                .expect("parse entry");
+
+        assert_eq!(
+            transport["event_type"],
+            "counterfactual_shadow_probe_transport"
+        );
+        assert_eq!(transport["dispatch_source"], "counterfactual_shadow_probe");
+        assert_eq!(transport["ab_record_id"], "pool:1000:2000:REJECT");
+        assert_eq!(transport["source_ab_record_id"], "pool:1000:2000:REJECT");
+        assert_eq!(transport["probe_id"], entry["probe_id"]);
+        assert_eq!(transport["ab_record_id"], entry["ab_record_id"]);
+        assert_eq!(
+            transport["v3_feature_snapshot_hash"],
+            entry["v3_feature_snapshot_hash"]
+        );
+        assert_eq!(
+            transport["v3_policy_config_hash"],
+            entry["v3_policy_config_hash"]
+        );
+        assert_eq!(entry["dispatch_source"], "counterfactual_shadow_probe");
+        assert_eq!(
+            entry["execution_outcome"],
+            "counterfactual_probe_recorded_no_simulation"
+        );
+        assert!(transport["live_signature"].is_null());
+    }
+
+    #[tokio::test]
+    async fn p37_shadow_probe_skipped_record_does_not_write_transport_or_entry() {
+        let temp = tempdir().expect("tempdir");
+        let transport_path = temp.path().join("probe_transport.jsonl");
+        let entry_path = temp.path().join("probe_entries.jsonl");
+        let config = P37ShadowProbeConfig {
+            enabled: true,
+            sample_threshold: 100,
+            transport_log_path: transport_path.to_string_lossy().into_owned(),
+            entry_log_path: entry_path.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let mut candidate = p37_shadow_probe_test_candidate();
+        candidate.ab_record_id = None;
+        let record = p37_shadow_probe_selection_record(&config, &candidate, 3_000);
+
+        let wrote = append_p37_shadow_probe_p0_artifacts(&config, &record, 3_100)
+            .await
+            .expect("skipped record should be no-op");
+
+        assert!(!wrote);
+        assert!(!transport_path.exists());
+        assert!(!entry_path.exists());
     }
 
     #[test]
