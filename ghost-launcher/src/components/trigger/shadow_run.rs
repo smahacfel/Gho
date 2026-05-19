@@ -1759,6 +1759,7 @@ mod tests {
             v3_policy_config_hash: Some("policy-hash-j2b".to_string()),
             decision_plane: Some("legacy_live".to_string()),
             rollout_namespace: Some("r14-j2b-harness".to_string()),
+            ..Default::default()
         };
         let request =
             sample_prepared_buy_request(Some(0), true).with_join_metadata(metadata.clone());

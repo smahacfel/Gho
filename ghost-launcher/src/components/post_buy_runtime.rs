@@ -2170,6 +2170,11 @@ async fn handle_post_buy_event(
             epoch,
             PositionJoinMetadata {
                 ab_record_id: join_metadata.ab_record_id.clone(),
+                source_ab_record_id: join_metadata.source_ab_record_id.clone(),
+                probe_id: join_metadata.probe_id.clone(),
+                dispatch_source: join_metadata.dispatch_source.clone(),
+                collection_plane: join_metadata.collection_plane.clone(),
+                probe_plane: join_metadata.probe_plane.clone(),
                 v3_feature_snapshot_hash: join_metadata.v3_feature_snapshot_hash.clone(),
                 v3_policy_config_hash: join_metadata.v3_policy_config_hash.clone(),
                 decision_plane: join_metadata.decision_plane.clone(),

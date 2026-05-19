@@ -424,6 +424,11 @@ pub struct PositionEventContext {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PositionJoinMetadata {
     pub ab_record_id: Option<String>,
+    pub source_ab_record_id: Option<String>,
+    pub probe_id: Option<String>,
+    pub dispatch_source: Option<String>,
+    pub collection_plane: Option<String>,
+    pub probe_plane: Option<String>,
     pub v3_feature_snapshot_hash: Option<String>,
     pub v3_policy_config_hash: Option<String>,
     pub decision_plane: Option<String>,
@@ -450,6 +455,16 @@ enum ShadowLifecycleRecordType {
 struct ShadowLifecycleRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     ab_record_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_ab_record_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    probe_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dispatch_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    collection_plane: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    probe_plane: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     v3_feature_snapshot_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1082,6 +1097,11 @@ impl MonitoringEngine {
     ) -> ShadowLifecycleRecord {
         ShadowLifecycleRecord {
             ab_record_id: pos.join_metadata.ab_record_id.clone(),
+            source_ab_record_id: pos.join_metadata.source_ab_record_id.clone(),
+            probe_id: pos.join_metadata.probe_id.clone(),
+            dispatch_source: pos.join_metadata.dispatch_source.clone(),
+            collection_plane: pos.join_metadata.collection_plane.clone(),
+            probe_plane: pos.join_metadata.probe_plane.clone(),
             v3_feature_snapshot_hash: pos.join_metadata.v3_feature_snapshot_hash.clone(),
             v3_policy_config_hash: pos.join_metadata.v3_policy_config_hash.clone(),
             decision_plane: pos.join_metadata.decision_plane.clone(),
@@ -4132,10 +4152,16 @@ mod tests {
         let mint = Pubkey::new_unique();
         let join_metadata = PositionJoinMetadata {
             ab_record_id: Some("pool:1000:11000:BUY".to_string()),
+            source_ab_record_id: Some("pool:1000:11000:REJECT".to_string()),
+            probe_id: Some("probe-id".to_string()),
+            dispatch_source: Some("counterfactual_shadow_probe".to_string()),
+            collection_plane: Some("counterfactual_shadow_probe".to_string()),
+            probe_plane: Some("p37_shadow_probe".to_string()),
             v3_feature_snapshot_hash: Some("feature-hash".to_string()),
             v3_policy_config_hash: Some("policy-hash".to_string()),
             decision_plane: Some("legacy_live".to_string()),
             rollout_namespace: Some("r14-smoke".to_string()),
+            ..Default::default()
         };
         let registered = engine.register_position_with_context(
             Pubkey::new_unique(),
@@ -4163,6 +4189,11 @@ mod tests {
         assert_eq!(lifecycle_rows.len(), 1);
         let row = &lifecycle_rows[0];
         assert_eq!(row["ab_record_id"], "pool:1000:11000:BUY");
+        assert_eq!(row["source_ab_record_id"], "pool:1000:11000:REJECT");
+        assert_eq!(row["probe_id"], "probe-id");
+        assert_eq!(row["dispatch_source"], "counterfactual_shadow_probe");
+        assert_eq!(row["collection_plane"], "counterfactual_shadow_probe");
+        assert_eq!(row["probe_plane"], "p37_shadow_probe");
         assert_eq!(row["v3_feature_snapshot_hash"], "feature-hash");
         assert_eq!(row["v3_policy_config_hash"], "policy-hash");
         assert_eq!(row["decision_plane"], "legacy_live");

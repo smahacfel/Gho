@@ -463,6 +463,16 @@ pub struct ExecutionJoinMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ab_record_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_ab_record_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collection_plane: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_plane: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub v3_feature_snapshot_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub v3_policy_config_hash: Option<String>,
@@ -475,6 +485,11 @@ pub struct ExecutionJoinMetadata {
 impl ExecutionJoinMetadata {
     pub fn is_empty(&self) -> bool {
         self.ab_record_id.is_none()
+            && self.source_ab_record_id.is_none()
+            && self.probe_id.is_none()
+            && self.dispatch_source.is_none()
+            && self.collection_plane.is_none()
+            && self.probe_plane.is_none()
             && self.v3_feature_snapshot_hash.is_none()
             && self.v3_policy_config_hash.is_none()
             && self.decision_plane.is_none()
@@ -953,6 +968,34 @@ pub fn record_event_bus_lag(consumer: &str, skipped: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn execution_join_metadata_legacy_rows_still_parse() {
+        let parsed: ExecutionJoinMetadata = serde_json::from_str("{}").unwrap();
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn execution_join_metadata_probe_fields_roundtrip() {
+        let metadata = ExecutionJoinMetadata {
+            ab_record_id: Some("probe-ab".to_string()),
+            source_ab_record_id: Some("source-ab".to_string()),
+            probe_id: Some("probe-id".to_string()),
+            dispatch_source: Some("counterfactual_shadow_probe".to_string()),
+            collection_plane: Some("counterfactual_shadow_probe".to_string()),
+            probe_plane: Some("p37_shadow_probe".to_string()),
+            v3_feature_snapshot_hash: Some("feature-hash".to_string()),
+            v3_policy_config_hash: Some("policy-hash".to_string()),
+            decision_plane: Some("legacy_live".to_string()),
+            rollout_namespace: Some("r15-smoke".to_string()),
+        };
+
+        let json = serde_json::to_string(&metadata).unwrap();
+        let parsed: ExecutionJoinMetadata = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed, metadata);
+        assert!(!parsed.is_empty());
+    }
 
     #[tokio::test]
     async fn test_event_bus_creation() {

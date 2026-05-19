@@ -4419,6 +4419,7 @@ fn build_buy_execution_join_metadata(
             .then(|| config.v3_policy_config_hash()),
         decision_plane: Some("legacy_live".to_string()),
         rollout_namespace: Some(rollout_profile.to_string()),
+        ..Default::default()
     }
 }
 
@@ -17793,6 +17794,7 @@ mod tests {
             v3_policy_config_hash: Some("policy-hash-j2b".to_string()),
             decision_plane: Some("legacy_live".to_string()),
             rollout_namespace: Some("r14-j2b-harness".to_string()),
+            ..Default::default()
         };
         let request = test_prepared_buy_request().with_join_metadata(join_metadata.clone());
         let entry_token_amount_raw = request.entry_token_amount_raw.expect("shadow qty");
