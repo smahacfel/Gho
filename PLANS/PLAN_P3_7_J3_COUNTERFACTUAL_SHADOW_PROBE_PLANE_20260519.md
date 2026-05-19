@@ -2,7 +2,7 @@
 
 Date: 2026-05-19
 
-Status: Draft implementation plan
+Status: Accepted P0 plan after safety amendments
 
 ## Decision
 
@@ -109,12 +109,24 @@ max_probes_per_minute = 10
 max_concurrent = 2
 include_verdict_types = ["REJECT", "PENDING"]
 exclude_active_buy_rows = true
+enable_eligibility_precheck = true
 require_ab_record_id = true
+require_materialized_feature_set = true
 require_v3_replay_payload = true
 require_v3_feature_snapshot_hash = true
 require_v3_policy_config_hash = true
+require_execution_route_identity = true
+require_curve_account_state = true
 dedupe_by_probe_id = true
-emit_event_bus = true
+emit_event_bus = false
+event_bus_mode = "disabled"
+probe_amount_source = "trigger_max_position_size"
+probe_amount_lamports = 0
+probe_slippage_bps = 2000
+probe_quote_age_max_ms = 1500
+probe_curve_age_max_ms = 1500
+append = false
+require_unique_namespace = true
 
 selection_log_path = "../../logs/shadow_run/shadow-burnin-v3-p37-counterfactual-probe-r15-smoke/probe_selection.jsonl"
 skip_log_path = "../../logs/shadow_run/shadow-burnin-v3-p37-counterfactual-probe-r15-smoke/probe_skips.jsonl"
@@ -138,6 +150,171 @@ Fail-closed validation when enabled:
 - Probe paths must not equal active `buys.jsonl`, `shadow_entries.jsonl`, or
   `shadow_lifecycle.jsonl` paths.
 - Live/P2 promotion must remain disabled.
+- If `append=false`, existing output files fail closed.
+- If `append=true`, `run_id` and `session_id` are required in every row.
+
+## Required Safety Amendments Before P0
+
+The following amendments are mandatory before runtime implementation:
+
+1. Probe eligibility precheck before sampling.
+2. `probe_bucket` / stratified sampling metadata.
+3. EventBus isolation: disabled in P0 or dedicated probe event types only.
+4. Probe ledger / position state isolation.
+5. Explicit probe amount, quote age, and slippage config.
+6. Fail-open backpressure for active decisions.
+7. Unique namespace and path collision protection.
+8. Strict active BUY non-mutation tests.
+9. P0/P1 split: selection/transport/entry first, lifecycle labels after close.
+10. Collision-safe `probe_id`.
+
+## Probe Eligibility Precheck
+
+Eligibility precheck is a technical guard, not active policy.
+
+Minimum requirements:
+
+- valid `pool_id`,
+- valid `base_mint` / `mint_id`,
+- valid bonding curve or execution route identity,
+- `MaterializedFeatureSet` present,
+- `v3_feature_snapshot_hash` present,
+- `v3_policy_config_hash` present,
+- transaction/account identity available,
+- curve/account state not critically unavailable,
+- protocol state supported by the shadow simulator,
+- no duplicate `probe_id`.
+
+Eligibility skip reasons:
+
+- `invalid_pool_identity`
+- `invalid_mint_identity`
+- `unsupported_protocol_state`
+- `missing_bonding_curve`
+- `missing_execution_route_identity`
+- `missing_materialized_feature_set`
+- `critical_curve_unavailable`
+- `critical_account_unavailable`
+- `duplicate_probe_id`
+
+## Probe Buckets And Stratified Sampling
+
+Every selected or skipped row must carry:
+
+```text
+probe_bucket
+probe_bucket_reason
+probe_bucket_version
+```
+
+Initial P0 buckets:
+
+- `v3_reject_manipulation_contradiction`
+- `v3_reject_low_opportunity`
+- `v3_pending_wait_evidence`
+- `v3_pending_wait_sample`
+- `active_reject_v3_pending`
+- `active_reject_v3_reject`
+- `random_eligible_control`
+
+P0 may still sample only `REJECT` and `PENDING` verdict families, but reports
+must segment by bucket. Bucketless probe labels are not sufficient for P3.7
+feature interpretation.
+
+## EventBus Isolation
+
+P0 default:
+
+```text
+emit_event_bus = false
+event_bus_mode = "disabled"
+```
+
+If EventBus emission is implemented later, it must use distinct probe-only event
+types:
+
+```text
+CounterfactualShadowProbeRequested
+CounterfactualShadowProbeCompleted
+CounterfactualShadowProbeSkipped
+```
+
+Forbidden event reuse:
+
+- active BUY event,
+- trigger BUY event,
+- position-opened event,
+- live BUY event,
+- any event consumed by active execution subscribers.
+
+## Probe Ledger / Position State Isolation
+
+Probe positions must be isolated from active shadow/live position state.
+
+Requirements:
+
+- `probe_position_id` must be distinct from active `position_id`.
+- probe lifecycle must be written to the probe lifecycle path.
+- probe dispatch must not increment active open position count.
+- probe dispatch must not affect `max_concurrent_positions`.
+- probe dispatch must not mutate active shadow/live ledger state unless the
+  state is explicitly namespaced as a probe ledger.
+
+If the existing post-buy monitor cannot isolate probe position state safely,
+P0 stops at selection, transport, and entry. Lifecycle monitoring moves to P1.
+
+## Probe Amount / Quote / Slippage Contract
+
+Probe lifecycle PnL and price impact depend on amount and quote parameters.
+They must be explicit.
+
+Required config:
+
+```text
+probe_amount_source = "trigger_max_position_size" | "fixed_lamports"
+probe_amount_lamports
+probe_slippage_bps
+probe_quote_age_max_ms
+probe_curve_age_max_ms
+```
+
+Required log fields:
+
+```text
+probe_amount_lamports
+probe_amount_source
+probe_slippage_bps
+quote_age_ms
+curve_age_ms
+```
+
+## Fail-Open Backpressure
+
+Probe queue, rate, or concurrency pressure must skip the probe and must not
+block the active decision pipeline.
+
+Required skip reasons:
+
+- `probe_queue_full`
+- `probe_backpressure`
+- `probe_rate_limit_exceeded`
+- `probe_concurrency_limit_exceeded`
+
+Acceptance:
+
+- active decision latency is not blocked by the probe queue,
+- probe enqueue failure does not alter active verdict,
+- probe backpressure writes `probe_skipped`, not active failure.
+
+## Namespace And Output Path Protection
+
+Required behavior:
+
+- probe namespace must be unique per run,
+- probe paths must not collide with active decision, active BUY, shadow entry,
+  shadow lifecycle, or historical report paths,
+- if `append=false` and output files already exist, fail closed,
+- if `append=true`, every row must include `run_id` and `session_id`.
 
 ## Minimal P0 Runtime Plan
 
@@ -173,6 +350,8 @@ Work:
 
 - Hook after the row has a `MaterializedFeatureSet`, V3 replay payload, and
   `ab_record_id`.
+- Run probe eligibility precheck before sampling.
+- Assign `probe_bucket`, `probe_bucket_reason`, and `probe_bucket_version`.
 - Evaluate deterministic sampler.
 - Write exactly one selection/skip record per eligible decision row.
 - Never mutate active verdict or active reason chain.
@@ -184,10 +363,18 @@ Preferred deterministic sample key:
 hash(ab_record_id + v3_policy_config_hash + namespace + sampling_version)
 ```
 
+Collision-safe probe id:
+
+```text
+probe_id = hash(source_ab_record_id + sampling_version + probe_bucket + probe_amount_lamports)
+```
+
 Acceptance:
 
 - Same input row and config produces the same selection decision.
 - Missing metadata produces explicit `probe_skipped`.
+- Ineligible technical rows produce explicit precheck skip reasons.
+- Bucket assignment is logged for selected and skipped rows.
 - Active verdict fields remain byte-for-byte unchanged in decision logs.
 
 ### P0.3 Probe Join Metadata
@@ -208,6 +395,9 @@ Work:
   - `collection_plane`
   - `probe_plane`
   - `probe_id`
+  - `probe_bucket`
+  - `probe_bucket_reason`
+  - `probe_bucket_version`
   - `probe_sampling_version`
   - `probe_sample_reason`
   - `source_decision_plane`
@@ -235,8 +425,11 @@ Work:
 - Use only the shadow transport path.
 - Write probe transport to `p37_shadow_probe.transport_log_path`.
 - Write probe entries to `p37_shadow_probe.entry_log_path`.
-- Hand post-buy monitoring the same join metadata so lifecycle rows inherit it.
+- In P0, do not require lifecycle close.
+- Hand post-buy monitoring the same join metadata only if probe ledger/state
+  isolation is already implemented.
 - Bound concurrency and rate.
+- Treat queue/rate/concurrency pressure as `probe_skipped`, not active failure.
 
 Important boundary:
 
@@ -246,10 +439,13 @@ Gatekeeper BUY rows.
 Acceptance:
 
 - Synthetic probe dispatch produces transport and entry rows.
+- Probe dispatch writes `probe_amount_lamports`, `probe_amount_source`,
+  `probe_slippage_bps`, `quote_age_ms`, and `curve_age_ms`.
 - No active BUY counter increments because of probe rows.
+- No active open position counter increments because of probe rows.
 - No live transaction send path is reachable from probe dispatch.
 
-### P0.5 Lifecycle / On-Chain / Labels Propagation
+### P1 Lifecycle / On-Chain / Labels Propagation
 
 Files:
 
@@ -260,6 +456,7 @@ Files:
 
 Work:
 
+- Implement only after P0 transport/entry join-key smoke passes.
 - Preserve probe join metadata in lifecycle records.
 - Propagate probe fields through shadow-onchain lifecycle reports.
 - Mark labels with:
@@ -274,7 +471,7 @@ Acceptance:
 - Labeler does not classify probe rows as active BUY rows.
 - Feature availability can join labels to V3/MFS rows by exact AB/probe keys.
 
-### P0.6 Join-Key Audit
+### P0.5 Join-Key Audit
 
 Files:
 
@@ -293,6 +490,9 @@ Work:
   - `probe_lifecycle_rows`
   - `probe_rows_with_ab_record_id`
   - `probe_rows_with_probe_id`
+  - `probe_bucket` counts
+  - `probe_skip_reason` counts
+  - `probe_amount_source` counts
   - `exact_ab_record_id` coverage
   - `exact_probe_id` continuity
   - fallback join counts
@@ -303,6 +503,7 @@ Acceptance:
 
 - Fixture with source decision row and probe artifacts returns `PASS`.
 - Fixture without `ab_record_id` parses and returns degraded/not-ready.
+- Probe fixture with active BUY-like artifacts but missing dispatch source fails.
 
 ## Required Log Fields
 
@@ -315,9 +516,17 @@ dispatch_source
 probe_plane
 probe_id
 probe_sampling_version
+probe_bucket
+probe_bucket_reason
+probe_bucket_version
 probe_sample_reason
 probe_selected_ts_ms
 probe_skip_reason
+probe_amount_lamports
+probe_amount_source
+probe_slippage_bps
+quote_age_ms
+curve_age_ms
 ab_record_id
 source_ab_record_id
 candidate_id
@@ -348,6 +557,7 @@ collection_plane
 dispatch_source
 probe_plane
 probe_id
+probe_bucket
 ab_record_id
 source_ab_record_id
 candidate_id
@@ -356,6 +566,11 @@ base_mint
 mint_id
 decision_ts_ms
 probe_dispatch_ts_ms
+probe_amount_lamports
+probe_amount_source
+probe_slippage_bps
+quote_age_ms
+curve_age_ms
 v3_feature_snapshot_hash
 v3_policy_config_hash
 source_decision_plane
@@ -373,9 +588,10 @@ collection_plane
 dispatch_source
 probe_plane
 probe_id
+probe_bucket
 ab_record_id
 candidate_id
-position_id
+probe_position_id
 pool_id
 base_mint
 mint_id
@@ -383,6 +599,11 @@ decision_ts_ms
 entry_execution_ts_ms
 entry_price
 entry_slot
+probe_amount_lamports
+probe_amount_source
+probe_slippage_bps
+quote_age_ms
+curve_age_ms
 v3_feature_snapshot_hash
 v3_policy_config_hash
 source_decision_plane
@@ -397,9 +618,10 @@ collection_plane
 dispatch_source
 probe_plane
 probe_id
+probe_bucket
 ab_record_id
 candidate_id
-position_id
+probe_position_id
 pool_id
 base_mint
 mint_id
@@ -427,6 +649,10 @@ Primary probe continuity key:
 probe_id
 ```
 
+`probe_id` must include source AB, sampling version, bucket, and amount either
+directly or through a deterministic hash. This avoids collisions if future probe
+variants use different buckets or amounts for the same source row.
+
 Required continuity:
 
 ```text
@@ -434,10 +660,11 @@ decision row
   -> probe selection
   -> probe transport
   -> probe entry
-  -> probe lifecycle
-  -> shadow-onchain lifecycle report
-  -> lifecycle labels
-  -> feature availability audit
+  -> P0 join-key audit
+  -> P1 probe lifecycle
+  -> P1 shadow-onchain lifecycle report
+  -> P1 lifecycle labels
+  -> P1 feature availability audit
 ```
 
 Fallback keys such as `pool_id + mint + time window` may be reported but must
@@ -459,6 +686,7 @@ Smoke goals:
 - preserve AB/probe join metadata,
 - avoid active BUY mutation,
 - avoid live/P2.
+- not require closed lifecycle positions for P0 PASS.
 
 Suggested smoke limits:
 
@@ -480,6 +708,9 @@ Smoke PASS:
 - `probe_entry_rows_with_ab_record_id == probe_entry_rows`
 - `join_key_audit = PASS`
 - active BUY count remains unchanged by probe rows
+- active open position count remains unchanged by probe rows
+- probe rows do not appear in `gatekeeper_v2_buys.jsonl`
+- probe rows do not set `decision_verdict_buy=true`
 - no live/P2 path is enabled
 
 Smoke INCONCLUSIVE:
@@ -493,6 +724,7 @@ Smoke FAIL:
 - probe row lacks `ab_record_id`,
 - probe row lacks `probe_id`,
 - active BUY count changes because of probe rows,
+- active open position count changes because of probe rows,
 - live sender path is touched,
 - audit relies primarily on `pool_mint_time_window`.
 
@@ -523,6 +755,9 @@ cargo test -p ghost-launcher p37_shadow_probe_config_defaults_disabled -- --noca
 cargo test -p ghost-launcher p37_shadow_probe_enabled_requires_shadow_profile -- --nocapture
 cargo test -p ghost-launcher p37_shadow_probe_deterministic_sampler_is_replayable -- --nocapture
 cargo test -p ghost-launcher p37_shadow_probe_does_not_mutate_active_verdict -- --nocapture
+cargo test -p ghost-launcher p37_shadow_probe_does_not_emit_active_buy_events -- --nocapture
+cargo test -p ghost-launcher p37_shadow_probe_backpressure_skips_not_blocks -- --nocapture
+cargo test -p ghost-launcher p37_shadow_probe_output_path_collision_fails_closed -- --nocapture
 cargo test -p ghost-launcher p37_shadow_probe_transport_entry_join_metadata -- --nocapture
 cargo test -p ghost-brain shadow_lifecycle_join_metadata_is_inherited_from_probe_context -- --nocapture
 ```
@@ -541,17 +776,28 @@ P3.7-J3 P0 is accepted when:
 - Config defaults are backward-compatible and disabled.
 - Enabled probe config fails closed outside shadow-only execution.
 - Deterministic sampler is replayable.
+- Eligibility precheck logs explicit skip reasons.
+- Every selected/skipped row has `probe_bucket`.
+- EventBus is disabled in P0 or emits only dedicated probe events.
 - Probe transport rows are generated with `ab_record_id`.
 - Probe entry rows are generated with the same `ab_record_id`.
-- Probe lifecycle rows inherit the same `ab_record_id` when lifecycle rows
-  exist.
+- P0 does not require closed lifecycle positions.
+- P1 lifecycle rows inherit the same `ab_record_id` and `probe_id` when
+  lifecycle rows exist.
 - Probe artifacts include `dispatch_source=counterfactual_shadow_probe`.
+- Probe artifacts include amount, quote age, and slippage fields.
 - V3/MFS payload is present for probed rows.
 - Join-key audit returns PASS for exact AB/probe continuity.
 - Legacy rows without probe fields still parse.
 - Active verdicts and active BUY counts are not mutated by probe rows.
+- Probe rows do not appear in `gatekeeper_v2_buys.jsonl`.
+- Probe rows do not set `decision_verdict_buy=true`.
+- Probe rows do not alter active `reason_code` / `verdict_type`.
+- Probe rows do not increment active BUY metrics.
+- Probe rows do not increment active open position count.
+- Probe backpressure skips probes instead of blocking active decisions.
 - No live/P2/IWIM/threshold path is changed.
-- Labels can be generated after lifecycle close.
+- Labels can be generated after lifecycle close in P1.
 
 ## Post-P0 Governance
 
