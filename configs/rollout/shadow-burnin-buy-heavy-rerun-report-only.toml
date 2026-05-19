@@ -1,0 +1,32 @@
+# REPORT ONLY - do not use for runtime.
+# Purpose: recover P3.7 shadow-onchain lifecycle truth from existing
+# shadow-burnin-buy-heavy-rerun artifacts.
+#
+# This file intentionally points oracle.decision_log_path at the historical
+# rollout root because the recovered gatekeeper_v2_buys.jsonl files are stored
+# under v2.2/legacy_live and v2.5/v25_shadow directly below that root, not under
+# the original config's decisions/ subdirectory.
+
+[trigger]
+entry_mode = "shadow_only"
+
+[trigger.shadow_run]
+enabled = true
+output_path = "../../logs/shadow_run/shadow-burnin-buy-heavy-rerun-buys.jsonl"
+emit_event_bus = true
+
+[execution]
+execution_mode = "shadow"
+
+[execution.shadow]
+entry_log_path = "../../logs/shadow_run/shadow-burnin-buy-heavy-rerun/shadow_entries.jsonl"
+lifecycle_log_path = "../../logs/shadow_run/shadow-burnin-buy-heavy-rerun/shadow_lifecycle.jsonl"
+
+[execution.events]
+output_dir = "../../datasets/events/shadow-burnin-buy-heavy-rerun"
+
+[oracle]
+decision_log_path = "../../logs/rollout/shadow-burnin-buy-heavy-rerun"
+
+[logging]
+file_path = "../../logs/rollout/shadow-burnin-buy-heavy-rerun/system.log"
