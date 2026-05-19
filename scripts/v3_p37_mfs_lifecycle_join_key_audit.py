@@ -252,9 +252,16 @@ def readiness(report: dict[str, Any]) -> dict[str, Any]:
     if candidate_common <= 0 and exact_ab_common <= 0:
         status = "degraded" if status != "not_ready" else status
         reasons.append("no_common_candidate_id_across_nonempty_artifacts")
+    if status == "ready_for_lifecycle_feature_join" and quality == "exact_ab_record_id":
+        join_key_acceptance = "pass"
+    elif status == "not_ready":
+        join_key_acceptance = "fail"
+    else:
+        join_key_acceptance = "degraded"
     return {
         "status": status,
         "reasons": reasons,
+        "join_key_acceptance": join_key_acceptance,
         "join_quality": quality,
         "decision_rows": decision_rows,
         "v3_payload_rows": v3_payload_rows,
@@ -291,6 +298,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         "",
         f"- config: `{report['config_path']}`",
         f"- readiness: `{report['readiness']['status']}`",
+        f"- join_key_acceptance: `{report['readiness']['join_key_acceptance']}`",
         f"- join_quality: `{report['join_key_coverage']['join_quality']}`",
         f"- full_chain_ab_record_id_coverage: `{report['join_key_coverage']['full_chain_ab_record_id_coverage']}`",
         f"- readiness_reasons: `{json.dumps(report['readiness']['reasons'], ensure_ascii=False)}`",

@@ -1748,28 +1748,96 @@ mod tests {
 
     #[test]
     fn shadow_join_metadata_flows_from_request_to_transport_and_dispatch_records() {
+        let pool_id = "pool";
+        let base_mint = "mint";
+        let decision_ts_ms = 10;
+        let candidate_id =
+            build_execution_candidate_id(base_mint, pool_id, decision_ts_ms.to_string());
         let metadata = ExecutionJoinMetadata {
             ab_record_id: Some("pool:1000:11000:BUY".to_string()),
-            v3_feature_snapshot_hash: Some("feature-hash".to_string()),
-            v3_policy_config_hash: Some("policy-hash".to_string()),
+            v3_feature_snapshot_hash: Some("feature-hash-j2b".to_string()),
+            v3_policy_config_hash: Some("policy-hash-j2b".to_string()),
             decision_plane: Some("legacy_live".to_string()),
-            rollout_namespace: Some("r14-smoke".to_string()),
+            rollout_namespace: Some("r14-j2b-harness".to_string()),
         };
         let request =
             sample_prepared_buy_request(Some(0), true).with_join_metadata(metadata.clone());
         let err = anyhow!("preflight failed");
 
-        let event = shadow_failure_event_from_request("pool", "mint", &request, None, &err);
+        let event = shadow_failure_event_from_request(pool_id, base_mint, &request, None, &err);
         assert_eq!(event.join_metadata, metadata);
+        assert_eq!(event.candidate_id, candidate_id);
+        assert_eq!(event.pool_amm_id, pool_id);
+        assert_eq!(event.base_mint, base_mint);
+        assert_eq!(event.decision_ts_ms, decision_ts_ms);
 
         let record = ShadowBuySimulationRecord::from_event(TriggerEntryMode::ShadowOnly, &event);
         assert_eq!(record.join_metadata, metadata);
+        assert_eq!(record.candidate_id, candidate_id);
+        assert_eq!(record.pool_amm_id, pool_id);
+        assert_eq!(record.base_mint, base_mint);
+        assert_eq!(record.decision_ts_ms, decision_ts_ms);
+        let transport_row = serde_json::to_value(&record).expect("serialize shadow transport row");
+        assert_eq!(transport_row["ab_record_id"], "pool:1000:11000:BUY");
+        assert_eq!(transport_row["candidate_id"], candidate_id);
+        assert_eq!(transport_row["pool_amm_id"], pool_id);
+        assert_eq!(transport_row["base_mint"], base_mint);
+        assert_eq!(transport_row["decision_ts_ms"], decision_ts_ms);
+        assert_eq!(
+            transport_row["v3_feature_snapshot_hash"],
+            "feature-hash-j2b"
+        );
+        assert_eq!(transport_row["v3_policy_config_hash"], "policy-hash-j2b");
+        assert_eq!(transport_row["decision_plane"], "legacy_live");
+        assert_eq!(transport_row["rollout_namespace"], "r14-j2b-harness");
 
         let dispatch = ShadowDispatchLifecycleRecord::failed_from_shadow_buy_record(
             &record,
             "join-key",
-            "r14-smoke",
+            "r14-j2b-harness",
         );
         assert_eq!(dispatch.join_metadata, metadata);
+        let dispatch_row =
+            serde_json::to_value(&dispatch).expect("serialize shadow dispatch lifecycle row");
+        assert_eq!(dispatch_row["ab_record_id"], "pool:1000:11000:BUY");
+        assert_eq!(dispatch_row["candidate_id"], candidate_id);
+        assert_eq!(dispatch_row["pool_id"], pool_id);
+        assert_eq!(dispatch_row["mint_id"], base_mint);
+        assert_eq!(dispatch_row["decision_ts_ms"], decision_ts_ms);
+        assert_eq!(dispatch_row["v3_feature_snapshot_hash"], "feature-hash-j2b");
+        assert_eq!(dispatch_row["v3_policy_config_hash"], "policy-hash-j2b");
+        assert_eq!(dispatch_row["decision_plane"], "legacy_live");
+        assert_eq!(dispatch_row["rollout_namespace"], "r14-j2b-harness");
+    }
+
+    #[test]
+    fn legacy_shadow_transport_without_join_metadata_still_parses() {
+        let row = r#"{
+            "candidate_id":"mint_pool_10",
+            "pool_amm_id":"pool",
+            "base_mint":"mint",
+            "entry_mode":"shadow_only",
+            "decision_ts_ms":10,
+            "sim_started_ts_ms":10,
+            "sim_finished_ts_ms":12,
+            "decision_to_sim_start_ms":0,
+            "shadow_duration_ms":2,
+            "amount_lamports":100,
+            "tip_lamports":10,
+            "payer_provenance":"configured",
+            "err":null,
+            "error_class":null,
+            "units_consumed":null,
+            "rpc_slot":null,
+            "retry_count":0,
+            "live_signature":null,
+            "logs_digest":"legacy",
+            "logs_excerpt":[]
+        }"#;
+
+        let record: ShadowBuySimulationRecord =
+            serde_json::from_str(row).expect("legacy shadow transport parses");
+        assert_eq!(record.join_metadata, ExecutionJoinMetadata::default());
+        assert_eq!(record.candidate_id, "mint_pool_10");
     }
 }

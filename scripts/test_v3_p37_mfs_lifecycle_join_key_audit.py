@@ -42,6 +42,11 @@ lifecycle_log_path = "../../logs/shadow_run/r14/shadow_lifecycle.jsonl"
                 "ab_record_id": "ab1",
                 "pool_id": "pool",
                 "base_mint": "mint",
+                "decision_ts_ms": 1000,
+                "v3_feature_snapshot_hash": "feature-hash",
+                "v3_policy_config_hash": "policy-hash",
+                "decision_plane": "legacy_live",
+                "rollout_namespace": "r14-j2b-harness",
             }
             write_jsonl(
                 root / "logs/rollout/r14/decisions/gatekeeper_v2_decisions.jsonl",
@@ -49,8 +54,6 @@ lifecycle_log_path = "../../logs/shadow_run/r14/shadow_lifecycle.jsonl"
                     {
                         **common,
                         "v3_replay_payload": {"schema_version": 1},
-                        "v3_feature_snapshot_hash": "hash",
-                        "decision_plane": "v25_shadow",
                     }
                 ],
             )
@@ -61,9 +64,11 @@ lifecycle_log_path = "../../logs/shadow_run/r14/shadow_lifecycle.jsonl"
             report = audit.build_report(config)
 
         self.assertEqual(report["readiness"]["status"], "ready_for_lifecycle_feature_join")
+        self.assertEqual(report["readiness"]["join_key_acceptance"], "pass")
         self.assertEqual(report["readiness"]["join_quality"], "exact_ab_record_id")
         self.assertEqual(report["readiness"]["v3_payload_rows"], 1)
         self.assertEqual(report["cross_artifact_intersections"]["candidate_id"]["common_values"], 1)
+        self.assertEqual(report["join_key_coverage"]["full_chain_ab_record_id_coverage"], 1.0)
         self.assertEqual(report["join_key_coverage"]["shadow_entry_rows_with_ab_record_id"], 1)
 
     def test_candidate_id_only_join_is_degraded(self) -> None:

@@ -17211,7 +17211,14 @@ mod tests {
             initial_liquidity_sol: Some(1.0),
             signature: "sig".to_string(),
         };
-        let request = test_prepared_buy_request();
+        let join_metadata = ExecutionJoinMetadata {
+            ab_record_id: Some("pool:1000:11000:BUY".to_string()),
+            v3_feature_snapshot_hash: Some("feature-hash-j2b".to_string()),
+            v3_policy_config_hash: Some("policy-hash-j2b".to_string()),
+            decision_plane: Some("legacy_live".to_string()),
+            rollout_namespace: Some("r14-j2b-harness".to_string()),
+        };
+        let request = test_prepared_buy_request().with_join_metadata(join_metadata.clone());
         let entry_token_amount_raw = request.entry_token_amount_raw.expect("shadow qty");
         let decision_ts_ms = request.decision_ts_ms;
         let tracker = crate::components::trigger::safety::PositionLimitTracker::new(1);
@@ -17235,7 +17242,7 @@ mod tests {
             primary_outcome: Ok(
                 crate::components::trigger::TriggerBuyOutcome::ShadowSimulated {
                     report: crate::components::trigger::ShadowBuySimulationReport {
-                        join_metadata: ExecutionJoinMetadata::default(),
+                        join_metadata: join_metadata.clone(),
                         mint: pool.base_mint.clone(),
                         live_signature: None,
                         payer_pubkey: Pubkey::new_unique().to_string(),
@@ -17294,14 +17301,22 @@ mod tests {
         let written = tokio::fs::read_to_string(&output_path)
             .await
             .expect("canonical shadow entry record should be written");
+        let record_line = written.lines().next().expect("one shadow entry record");
         let record: ShadowEntryRecord =
-            serde_json::from_str(written.lines().next().expect("one shadow entry record"))
-                .expect("deserialize canonical shadow entry");
+            serde_json::from_str(record_line).expect("deserialize canonical shadow entry");
+        let entry_row: serde_json::Value =
+            serde_json::from_str(record_line).expect("deserialize entry row as json");
+        assert_eq!(record.join_metadata, join_metadata);
         assert_eq!(record.pool_id, pool_id.to_string());
         assert_eq!(record.mint_id, pool.base_mint);
         assert_eq!(record.slot, Some(777));
         assert_eq!(record.timestamp_ms, decision_ts_ms.saturating_add(6));
         assert_eq!(record.execution_outcome, "shadow_simulated");
+        assert_eq!(entry_row["ab_record_id"], "pool:1000:11000:BUY");
+        assert_eq!(entry_row["v3_feature_snapshot_hash"], "feature-hash-j2b");
+        assert_eq!(entry_row["v3_policy_config_hash"], "policy-hash-j2b");
+        assert_eq!(entry_row["decision_plane"], "legacy_live");
+        assert_eq!(entry_row["rollout_namespace"], "r14-j2b-harness");
         assert_eq!(
             record.entry_price,
             0.1 / (entry_token_amount_raw as f64 / PUMP_TOKEN_DECIMAL_FACTOR)
@@ -17327,6 +17342,14 @@ mod tests {
         .expect("deserialize lifecycle record");
         assert_eq!(lifecycle_row["record_type"], "shadow_dispatch");
         assert_eq!(lifecycle_row["dispatch_status"], "closed");
+        assert_eq!(lifecycle_row["ab_record_id"], "pool:1000:11000:BUY");
+        assert_eq!(
+            lifecycle_row["v3_feature_snapshot_hash"],
+            "feature-hash-j2b"
+        );
+        assert_eq!(lifecycle_row["v3_policy_config_hash"], "policy-hash-j2b");
+        assert_eq!(lifecycle_row["decision_plane"], "legacy_live");
+        assert_eq!(lifecycle_row["rollout_namespace"], "r14-j2b-harness");
         assert_eq!(
             lifecycle_row["join_key"],
             format!("{pool_id}:{}:1000", pool.base_mint)
