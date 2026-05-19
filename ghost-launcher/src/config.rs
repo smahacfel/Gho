@@ -4494,6 +4494,49 @@ enabled = true
     }
 
     #[test]
+    fn test_p37_counterfactual_probe_smoke_profile_loads_shadow_only_isolated() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let path = manifest_dir
+            .join("../configs/rollout")
+            .join("shadow-burnin-v3-p37-counterfactual-probe-r15-smoke.toml");
+        let config = LauncherConfig::from_file(&path)
+            .unwrap_or_else(|err| panic!("failed to load {}: {err}", path.display()));
+
+        assert_eq!(config.seer.funding_lane_mode, "disabled");
+        assert_eq!(config.trigger.entry_mode, TriggerEntryMode::ShadowOnly);
+        assert_eq!(config.execution.execution_mode, ExecutionMode::Shadow);
+        assert!(config.trigger.shadow_run.enabled);
+        assert!(config.p37_shadow_probe.enabled);
+        assert_eq!(
+            config.p37_shadow_probe.dispatch_source,
+            "counterfactual_shadow_probe"
+        );
+        assert!(!config.p37_shadow_probe.emit_event_bus);
+        assert_eq!(config.p37_shadow_probe.event_bus_mode, "disabled");
+        assert_eq!(
+            config.p37_shadow_probe.probe_amount_source,
+            "fixed_lamports"
+        );
+        assert!(config.p37_shadow_probe.probe_amount_lamports > 0);
+        assert!(config
+            .p37_shadow_probe
+            .transport_log_path
+            .contains("shadow-burnin-v3-p37-counterfactual-probe-r15-smoke"));
+        assert!(config
+            .p37_shadow_probe
+            .entry_log_path
+            .contains("probe_shadow_entries.jsonl"));
+        assert_ne!(
+            config.p37_shadow_probe.transport_log_path,
+            config.trigger.shadow_run.output_path
+        );
+        assert_ne!(
+            config.p37_shadow_probe.entry_log_path,
+            config.execution.shadow.entry_log_path
+        );
+    }
+
+    #[test]
     fn test_validate_execution_profile_rejects_placeholder_shadow_rpc_in_production() {
         let mut config = LauncherConfig::default();
         config.mode = AppMode::Production;
