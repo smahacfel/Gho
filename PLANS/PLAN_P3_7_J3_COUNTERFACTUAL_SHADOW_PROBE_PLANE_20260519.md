@@ -1,0 +1,628 @@
+# P3.7-J3 Counterfactual Shadow Probe Plane
+
+Date: 2026-05-19
+
+Status: Draft implementation plan
+
+## Decision
+
+Prepare P3.7-J3 as a separate counterfactual shadow-only probe plane.
+
+Full R14 remains HOLD until P3.7 has rows with:
+
+- V3/MFS payload,
+- shadow transport / entry / lifecycle evidence,
+- stable `ab_record_id` / probe join keys,
+- no active policy mutation.
+
+The probe plane is a collection mechanism. It is not a selector prototype and
+not a BUY path.
+
+## Context
+
+P3.7-J2 confirmed that the R14 profile can emit V3/MFS replay rows, and strict
+full replay passed. It did not observe natural Gatekeeper BUYs:
+
+- V3/V2.5 rows: `505`
+- strict full replay: `PASS`
+- decision-side `ab_record_id` and V3 hash coverage: `100%`
+- shadow transport rows: `0`
+- shadow entry rows: `0`
+- shadow lifecycle rows: `0`
+
+P3.7-J2b validated the shadow dispatch join-key path at code/test harness
+level, but not with runtime shadow rows.
+
+The active BUY path is still Gatekeeper V2/V2.5 long-mode plus IWIM. V3 remains
+a telemetry/replay sidecar with promotion disabled.
+
+Waiting for natural BUYs is impractical for P3.7 dataset collection. Threshold
+tuning and IWIM changes are forbidden. Therefore the next safe option is a
+separate counterfactual shadow-only probe plane.
+
+## Goal
+
+Collect a forward-only research dataset where sampled V3/MFS decision rows get
+shadow simulation/lifecycle probes without changing active verdicts.
+
+Target dataset shape:
+
+```text
+V3/MFS decision snapshot
++ V3 replay payload hashes
++ active V2/V2.5 verdict context
++ counterfactual shadow probe transport
++ counterfactual shadow entry/lifecycle
++ shadow-onchain lifecycle truth
++ lifecycle labels
++ stable join keys
+```
+
+## Non-Goals
+
+J3 does not authorize:
+
+- P2,
+- live execution,
+- active Gatekeeper changes,
+- IWIM changes,
+- live sender changes,
+- threshold tuning,
+- V3 promotion,
+- MFS extension as policy,
+- treating probe dispatch as BUY,
+- treating lifecycle outcomes as decision-time features,
+- treating shadow simulation as live inclusion,
+- treating speculative finality as finalized proof.
+
+## Required Semantics
+
+The implementation must preserve these semantics:
+
+- Active verdict remains unchanged.
+- `no dispatch after reject` remains normal active behavior.
+- Probe dispatch is separate and must carry
+  `dispatch_source=counterfactual_shadow_probe`.
+- Probe rows are research artifacts, not active BUY rows.
+- Source `ab_record_id` joins the probe back to the V3/MFS decision row.
+- `probe_id` identifies a specific counterfactual probe attempt.
+- Lifecycle outcome is a post-decision label.
+- Unknown execution status is not success.
+- Speculative finality remains dirty/degraded.
+
+## Config Design
+
+Add a disabled-by-default launcher config section:
+
+```toml
+[p37_shadow_probe]
+enabled = false
+namespace = "shadow-burnin-v3-p37-counterfactual-probe-r15-smoke"
+dispatch_source = "counterfactual_shadow_probe"
+sample_source = "v3_mfs_decision_rows"
+sample_mode = "deterministic_hash_mod"
+sample_modulus = 100
+sample_threshold = 5
+sampling_version = "p37-j3-v1"
+max_probes_per_run = 25
+max_probes_per_minute = 10
+max_concurrent = 2
+include_verdict_types = ["REJECT", "PENDING"]
+exclude_active_buy_rows = true
+require_ab_record_id = true
+require_v3_replay_payload = true
+require_v3_feature_snapshot_hash = true
+require_v3_policy_config_hash = true
+dedupe_by_probe_id = true
+emit_event_bus = true
+
+selection_log_path = "../../logs/shadow_run/shadow-burnin-v3-p37-counterfactual-probe-r15-smoke/probe_selection.jsonl"
+skip_log_path = "../../logs/shadow_run/shadow-burnin-v3-p37-counterfactual-probe-r15-smoke/probe_skips.jsonl"
+transport_log_path = "../../logs/shadow_run/shadow-burnin-v3-p37-counterfactual-probe-r15-smoke/probe_transport.jsonl"
+entry_log_path = "../../logs/shadow_run/shadow-burnin-v3-p37-counterfactual-probe-r15-smoke/probe_shadow_entries.jsonl"
+lifecycle_log_path = "../../logs/shadow_run/shadow-burnin-v3-p37-counterfactual-probe-r15-smoke/probe_shadow_lifecycle.jsonl"
+```
+
+Backward compatibility:
+
+- All new fields must use serde defaults.
+- Old configs must load with `p37_shadow_probe.enabled=false`.
+- Legacy shadow artifacts without probe fields must still parse.
+
+Fail-closed validation when enabled:
+
+- `[execution].execution_mode` must be `shadow`.
+- `[trigger].entry_mode` must be `shadow_only`.
+- `[trigger.shadow_run].enabled` must be `true`.
+- V3 replay payload emission must be enabled.
+- Probe paths must not equal active `buys.jsonl`, `shadow_entries.jsonl`, or
+  `shadow_lifecycle.jsonl` paths.
+- Live/P2 promotion must remain disabled.
+
+## Minimal P0 Runtime Plan
+
+### P0.1 Config Surface
+
+Files:
+
+- `ghost-launcher/src/config.rs`
+- config load tests under existing launcher config tests
+
+Work:
+
+- Add `P37ShadowProbeConfig` with `#[serde(default)]`.
+- Add path resolution for probe paths.
+- Add validation that fails closed when enabled outside shadow-only execution.
+- Add config summary logging that prints `p37_shadow_probe.enabled` and
+  namespace.
+
+Acceptance:
+
+- Existing rollout configs still load.
+- New probe config loads.
+- Enabling probe in non-shadow profile fails closed.
+
+### P0.2 Probe Candidate Selection
+
+Files:
+
+- `ghost-launcher/src/oracle_runtime.rs`
+- existing decision logging / V3 replay payload boundary
+
+Work:
+
+- Hook after the row has a `MaterializedFeatureSet`, V3 replay payload, and
+  `ab_record_id`.
+- Evaluate deterministic sampler.
+- Write exactly one selection/skip record per eligible decision row.
+- Never mutate active verdict or active reason chain.
+- Never enqueue active BUY.
+
+Preferred deterministic sample key:
+
+```text
+hash(ab_record_id + v3_policy_config_hash + namespace + sampling_version)
+```
+
+Acceptance:
+
+- Same input row and config produces the same selection decision.
+- Missing metadata produces explicit `probe_skipped`.
+- Active verdict fields remain byte-for-byte unchanged in decision logs.
+
+### P0.3 Probe Join Metadata
+
+Files:
+
+- `ghost-launcher/src/events.rs`
+- `ghost-launcher/src/oracle_runtime.rs`
+- `ghost-launcher/src/components/trigger/component.rs`
+- `ghost-launcher/src/components/trigger/shadow_run.rs`
+
+Work:
+
+- Reuse or extend `ExecutionJoinMetadata` additively.
+- Preserve source `ab_record_id`.
+- Add probe-specific fields:
+  - `dispatch_source`
+  - `collection_plane`
+  - `probe_plane`
+  - `probe_id`
+  - `probe_sampling_version`
+  - `probe_sample_reason`
+  - `source_decision_plane`
+  - `active_verdict_type`
+  - `active_reason_code`
+
+Acceptance:
+
+- Probe transport JSON includes source `ab_record_id`.
+- Probe transport JSON includes `probe_id`.
+- Probe rows carry `dispatch_source=counterfactual_shadow_probe`.
+- Legacy transport rows without probe fields still parse.
+
+### P0.4 Shadow-Only Probe Dispatch
+
+Files:
+
+- `ghost-launcher/src/oracle_runtime.rs`
+- `ghost-launcher/src/components/trigger/component.rs`
+- `ghost-launcher/src/components/trigger/shadow_run.rs`
+
+Work:
+
+- Build a shadow-only simulation request from a selected decision row.
+- Use only the shadow transport path.
+- Write probe transport to `p37_shadow_probe.transport_log_path`.
+- Write probe entries to `p37_shadow_probe.entry_log_path`.
+- Hand post-buy monitoring the same join metadata so lifecycle rows inherit it.
+- Bound concurrency and rate.
+
+Important boundary:
+
+The probe dispatcher must not call live dispatch and must not write active
+Gatekeeper BUY rows.
+
+Acceptance:
+
+- Synthetic probe dispatch produces transport and entry rows.
+- No active BUY counter increments because of probe rows.
+- No live transaction send path is reachable from probe dispatch.
+
+### P0.5 Lifecycle / On-Chain / Labels Propagation
+
+Files:
+
+- `ghost-brain/src/guardian/post_buy/engine.rs`
+- `scripts/shadow_onchain_lifecycle_report.py`
+- `scripts/v3_p37_shadow_lifecycle_labeler.py`
+- `scripts/v3_p37_shadow_lifecycle_feature_availability.py`
+
+Work:
+
+- Preserve probe join metadata in lifecycle records.
+- Propagate probe fields through shadow-onchain lifecycle reports.
+- Mark labels with:
+  - `collection_plane=counterfactual_shadow_probe`
+  - `dispatch_source=counterfactual_shadow_probe`
+  - `label_source=counterfactual_shadow_probe_lifecycle`
+- Keep speculative finality as dirty/degraded.
+
+Acceptance:
+
+- Lifecycle rows inherit `ab_record_id` and `probe_id`.
+- Labeler does not classify probe rows as active BUY rows.
+- Feature availability can join labels to V3/MFS rows by exact AB/probe keys.
+
+### P0.6 Join-Key Audit
+
+Files:
+
+- `scripts/v3_p37_mfs_lifecycle_join_key_audit.py`
+- `scripts/test_v3_p37_mfs_lifecycle_join_key_audit.py`
+- optional new `scripts/test_v3_p37_counterfactual_shadow_probe_audit.py`
+
+Work:
+
+- Add probe artifact inputs or auto-discovery of probe paths from config.
+- Report:
+  - `probe_selected_rows`
+  - `probe_skipped_rows`
+  - `probe_transport_rows`
+  - `probe_entry_rows`
+  - `probe_lifecycle_rows`
+  - `probe_rows_with_ab_record_id`
+  - `probe_rows_with_probe_id`
+  - `exact_ab_record_id` coverage
+  - `exact_probe_id` continuity
+  - fallback join counts
+  - unmatched rows
+- Keep legacy rows degraded, not parser failures.
+
+Acceptance:
+
+- Fixture with source decision row and probe artifacts returns `PASS`.
+- Fixture without `ab_record_id` parses and returns degraded/not-ready.
+
+## Required Log Fields
+
+### Probe Selection / Skip
+
+```text
+schema_version
+collection_plane
+dispatch_source
+probe_plane
+probe_id
+probe_sampling_version
+probe_sample_reason
+probe_selected_ts_ms
+probe_skip_reason
+ab_record_id
+source_ab_record_id
+candidate_id
+pool_id
+base_mint
+mint_id
+decision_ts_ms
+observation_start_ts_ms
+observation_end_ts_ms
+v3_feature_snapshot_hash
+v3_policy_config_hash
+source_decision_plane
+active_verdict_type
+active_verdict_buy
+active_reason_code
+active_reason_chain
+v3_shadow_verdict
+v3_shadow_reason_code
+v3_shadow_confidence
+rollout_namespace
+```
+
+### Probe Transport
+
+```text
+schema_version
+collection_plane
+dispatch_source
+probe_plane
+probe_id
+ab_record_id
+source_ab_record_id
+candidate_id
+pool_id
+base_mint
+mint_id
+decision_ts_ms
+probe_dispatch_ts_ms
+v3_feature_snapshot_hash
+v3_policy_config_hash
+source_decision_plane
+decision_plane
+rollout_namespace
+simulation_status
+execution_outcome
+```
+
+### Probe Entry
+
+```text
+schema_version
+collection_plane
+dispatch_source
+probe_plane
+probe_id
+ab_record_id
+candidate_id
+position_id
+pool_id
+base_mint
+mint_id
+decision_ts_ms
+entry_execution_ts_ms
+entry_price
+entry_slot
+v3_feature_snapshot_hash
+v3_policy_config_hash
+source_decision_plane
+rollout_namespace
+```
+
+### Probe Lifecycle
+
+```text
+schema_version
+collection_plane
+dispatch_source
+probe_plane
+probe_id
+ab_record_id
+candidate_id
+position_id
+pool_id
+base_mint
+mint_id
+decision_ts_ms
+entry_execution_ts_ms
+close_ts_ms
+close_reason
+v3_feature_snapshot_hash
+v3_policy_config_hash
+source_decision_plane
+rollout_namespace
+```
+
+## Join-Key Contract
+
+Primary feature-to-probe key:
+
+```text
+source_ab_record_id == ab_record_id
+```
+
+Primary probe continuity key:
+
+```text
+probe_id
+```
+
+Required continuity:
+
+```text
+decision row
+  -> probe selection
+  -> probe transport
+  -> probe entry
+  -> probe lifecycle
+  -> shadow-onchain lifecycle report
+  -> lifecycle labels
+  -> feature availability audit
+```
+
+Fallback keys such as `pool_id + mint + time window` may be reported but must
+not be the primary success condition for J3.
+
+## Smoke Plan
+
+After P0 implementation, create a small isolated smoke profile:
+
+```text
+configs/rollout/shadow-burnin-v3-p37-counterfactual-probe-r15-smoke.toml
+```
+
+Smoke goals:
+
+- produce V3/MFS rows,
+- select a bounded number of counterfactual probes,
+- emit probe transport and entry rows,
+- preserve AB/probe join metadata,
+- avoid active BUY mutation,
+- avoid live/P2.
+
+Suggested smoke limits:
+
+```text
+max_probes_per_run = 5
+max_probes_per_minute = 5
+max_concurrent = 1
+```
+
+Smoke PASS:
+
+- `v3_rows > 0`
+- `full_snapshot_payload_rows == v3_rows`
+- `hash_only_rows = 0`
+- `probe_selected_rows > 0`
+- `probe_transport_rows > 0`
+- `probe_entry_rows > 0`
+- `probe_transport_rows_with_ab_record_id == probe_transport_rows`
+- `probe_entry_rows_with_ab_record_id == probe_entry_rows`
+- `join_key_audit = PASS`
+- active BUY count remains unchanged by probe rows
+- no live/P2 path is enabled
+
+Smoke INCONCLUSIVE:
+
+- no V3/MFS rows,
+- no probe-selected rows because deterministic sampler did not select within
+  the budget.
+
+Smoke FAIL:
+
+- probe row lacks `ab_record_id`,
+- probe row lacks `probe_id`,
+- active BUY count changes because of probe rows,
+- live sender path is touched,
+- audit relies primarily on `pool_mint_time_window`.
+
+## Test Plan
+
+Python checks:
+
+```bash
+python3 -m py_compile \
+  scripts/shadow_onchain_lifecycle_report.py \
+  scripts/v3_p37_shadow_lifecycle_labeler.py \
+  scripts/v3_p37_shadow_lifecycle_feature_availability.py \
+  scripts/v3_p37_mfs_lifecycle_join_key_audit.py
+
+python3 -m unittest scripts/test_v3_p37_mfs_lifecycle_join_key_audit.py -v
+```
+
+Expected new or expanded Python tests:
+
+```bash
+python3 -m unittest scripts/test_v3_p37_counterfactual_shadow_probe_audit.py -v
+```
+
+Targeted Rust tests to add:
+
+```bash
+cargo test -p ghost-launcher p37_shadow_probe_config_defaults_disabled -- --nocapture
+cargo test -p ghost-launcher p37_shadow_probe_enabled_requires_shadow_profile -- --nocapture
+cargo test -p ghost-launcher p37_shadow_probe_deterministic_sampler_is_replayable -- --nocapture
+cargo test -p ghost-launcher p37_shadow_probe_does_not_mutate_active_verdict -- --nocapture
+cargo test -p ghost-launcher p37_shadow_probe_transport_entry_join_metadata -- --nocapture
+cargo test -p ghost-brain shadow_lifecycle_join_metadata_is_inherited_from_probe_context -- --nocapture
+```
+
+Formatting / whitespace:
+
+```bash
+rustfmt --edition 2021 --check <touched-rust-files>
+git diff --check
+```
+
+## Acceptance Criteria
+
+P3.7-J3 P0 is accepted when:
+
+- Config defaults are backward-compatible and disabled.
+- Enabled probe config fails closed outside shadow-only execution.
+- Deterministic sampler is replayable.
+- Probe transport rows are generated with `ab_record_id`.
+- Probe entry rows are generated with the same `ab_record_id`.
+- Probe lifecycle rows inherit the same `ab_record_id` when lifecycle rows
+  exist.
+- Probe artifacts include `dispatch_source=counterfactual_shadow_probe`.
+- V3/MFS payload is present for probed rows.
+- Join-key audit returns PASS for exact AB/probe continuity.
+- Legacy rows without probe fields still parse.
+- Active verdicts and active BUY counts are not mutated by probe rows.
+- No live/P2/IWIM/threshold path is changed.
+- Labels can be generated after lifecycle close.
+
+## Post-P0 Governance
+
+If P0 code/tests pass, run a bounded J3 smoke before any collection run.
+
+If J3 smoke passes, prepare:
+
+```text
+PLANS/AUDYT/RAPORT_P3_7_J3_COUNTERFACTUAL_SHADOW_PROBE_SMOKE_202605XX.md
+PLANS/AUDYT/RAPORT_P3_7_J3_COUNTERFACTUAL_SHADOW_PROBE_JOIN_KEY_AUDIT_202605XX.md
+```
+
+Only after a successful smoke may P3.7 consider a bounded counterfactual probe
+collection run.
+
+Even after successful J3 collection, the next step is only:
+
+```text
+diagnostic V3/MFS lifecycle feature prototype
+```
+
+It is still not:
+
+```text
+P2
+live
+runtime thresholds
+selector promotion
+```
+
+## Risks
+
+### Counterfactual Selection Bias
+
+Probe labels describe sampled rows, not the active BUY distribution. Reports
+must include the sampling frame and selected/skipped counts.
+
+### Misclassification As Active BUY
+
+Every probe artifact must carry `dispatch_source=counterfactual_shadow_probe`.
+Reports must segment probe rows from active BUY rows.
+
+### Metadata Gaps
+
+Rows missing AB/V3 hash metadata must be skipped with explicit reasons. They
+must not silently fall back to weak joins.
+
+### Runtime Load
+
+Probe dispatch must be bounded by rate, concurrency, and max-probes limits.
+Probe backpressure must not block the active decision hot path.
+
+### Label Leakage
+
+Lifecycle and PnL outcomes are labels only. They must never be consumed as
+decision-time features.
+
+## Final Gate
+
+P3.7-J3 can unblock dataset collection only after:
+
+- J3 smoke generates probe transport/entry rows with exact AB/probe join keys,
+- V3/MFS replay remains strict-clean,
+- no active policy mutation is observed,
+- join-key audit reports PASS,
+- lifecycle labels can be generated after close.
+
+Until then:
+
+```text
+Full R14: HOLD
+Phase B V3 selector prototype: HOLD
+P2/live: NO-GO
+```
