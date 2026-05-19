@@ -42,6 +42,10 @@ pub struct LauncherConfig {
     /// Trigger configuration
     pub trigger: TriggerComponentConfig,
 
+    /// P3.7-J3 counterfactual shadow-only probe plane.
+    #[serde(default)]
+    pub p37_shadow_probe: P37ShadowProbeConfig,
+
     /// Execution SSOT configuration (mode + paper/quotes/events).
     #[serde(default)]
     pub execution: ExecutionConfig,
@@ -665,6 +669,7 @@ impl LauncherConfig {
         )?;
         validate_trigger_payer_contract(self)?;
         validate_shadow_transport(self)?;
+        validate_p37_shadow_probe_contract(self)?;
         validate_live_sender_transport(self)?;
         validate_rollout_safety_profile(self)
     }
@@ -788,7 +793,7 @@ impl LauncherConfig {
         let shadow_timing_model = self.execution.shadow.timing_model.as_str();
 
         tracing::info!(
-            "CONFIG | mode={} grpc_endpoint={} x_token={} rpc={} execution_mode={:?} entry_mode={} events_dir={} shadow_entry_log={} shadow_timing_model={}",
+            "CONFIG | mode={} grpc_endpoint={} x_token={} rpc={} execution_mode={:?} entry_mode={} events_dir={} shadow_entry_log={} shadow_timing_model={} p37_shadow_probe_enabled={} p37_shadow_probe_namespace={}",
             mode,
             ep,
             token_present,
@@ -798,6 +803,8 @@ impl LauncherConfig {
             events_dir,
             shadow_entry_log,
             shadow_timing_model,
+            self.p37_shadow_probe.enabled,
+            self.p37_shadow_probe.namespace,
         );
     }
 }
@@ -975,6 +982,147 @@ fn validate_shadow_transport(config: &LauncherConfig) -> Result<(), String> {
     Ok(())
 }
 
+fn paths_equal(lhs: &str, rhs: &str) -> bool {
+    let lhs = Path::new(lhs);
+    let rhs = Path::new(rhs);
+    lhs == rhs
+}
+
+fn validate_p37_shadow_probe_contract(config: &LauncherConfig) -> Result<(), String> {
+    let probe = &config.p37_shadow_probe;
+    if !probe.enabled {
+        return Ok(());
+    }
+
+    if config.execution.execution_mode != ExecutionMode::Shadow
+        || config.trigger.entry_mode != TriggerEntryMode::ShadowOnly
+        || !config.trigger.shadow_run.enabled
+    {
+        return Err(
+            "[p37_shadow_probe].enabled=true requires [execution].execution_mode=\"shadow\", [trigger].entry_mode=\"shadow_only\", and [trigger.shadow_run].enabled=true"
+                .to_string(),
+        );
+    }
+
+    if probe.dispatch_source != default_p37_shadow_probe_dispatch_source() {
+        return Err(
+            "[p37_shadow_probe].dispatch_source must remain \"counterfactual_shadow_probe\" so probe artifacts cannot be confused with active BUY dispatch"
+                .to_string(),
+        );
+    }
+
+    if probe.sample_mode != default_p37_shadow_probe_sample_mode() {
+        return Err(
+            "[p37_shadow_probe].sample_mode currently supports only \"deterministic_hash_mod\""
+                .to_string(),
+        );
+    }
+    if probe.sample_modulus == 0 || probe.sample_threshold > probe.sample_modulus {
+        return Err(
+            "[p37_shadow_probe] requires sample_modulus > 0 and sample_threshold <= sample_modulus"
+                .to_string(),
+        );
+    }
+    if probe.max_probes_per_run == 0
+        || probe.max_probes_per_minute == 0
+        || probe.max_concurrent == 0
+    {
+        return Err(
+            "[p37_shadow_probe] max_probes_per_run, max_probes_per_minute, and max_concurrent must be positive"
+                .to_string(),
+        );
+    }
+
+    if probe.emit_event_bus || probe.event_bus_mode != default_p37_shadow_probe_event_bus_mode() {
+        return Err(
+            "[p37_shadow_probe] P0 requires emit_event_bus=false and event_bus_mode=\"disabled\"; probe events must not reuse active BUY/position events"
+                .to_string(),
+        );
+    }
+
+    match probe.probe_amount_source.as_str() {
+        "trigger_max_position_size" => {}
+        "fixed_lamports" if probe.probe_amount_lamports > 0 => {}
+        "fixed_lamports" => {
+            return Err(
+                "[p37_shadow_probe] probe_amount_source=\"fixed_lamports\" requires positive probe_amount_lamports"
+                    .to_string(),
+            );
+        }
+        _ => {
+            return Err(
+                "[p37_shadow_probe].probe_amount_source must be \"trigger_max_position_size\" or \"fixed_lamports\""
+                    .to_string(),
+            );
+        }
+    }
+    if probe.probe_slippage_bps == 0
+        || probe.probe_quote_age_max_ms == 0
+        || probe.probe_curve_age_max_ms == 0
+    {
+        return Err(
+            "[p37_shadow_probe] slippage and quote/curve age limits must be positive".to_string(),
+        );
+    }
+
+    for (name, path) in [
+        ("selection_log_path", probe.selection_log_path.as_str()),
+        ("skip_log_path", probe.skip_log_path.as_str()),
+        ("transport_log_path", probe.transport_log_path.as_str()),
+        ("entry_log_path", probe.entry_log_path.as_str()),
+        ("lifecycle_log_path", probe.lifecycle_log_path.as_str()),
+    ] {
+        if path.trim().is_empty() {
+            return Err(format!("[p37_shadow_probe].{name} must be non-empty"));
+        }
+    }
+
+    let probe_paths = [
+        probe.selection_log_path.as_str(),
+        probe.skip_log_path.as_str(),
+        probe.transport_log_path.as_str(),
+        probe.entry_log_path.as_str(),
+        probe.lifecycle_log_path.as_str(),
+    ];
+    for (idx, lhs) in probe_paths.iter().enumerate() {
+        for rhs in probe_paths.iter().skip(idx + 1) {
+            if paths_equal(lhs, rhs) {
+                return Err(
+                    "[p37_shadow_probe] output paths must be distinct within the probe namespace"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    let active_lifecycle = config.execution.shadow.lifecycle_log_path.as_deref();
+    let active_paths = [
+        config.trigger.shadow_run.output_path.as_str(),
+        config.execution.shadow.entry_log_path.as_str(),
+    ];
+    for probe_path in probe_paths {
+        for active_path in active_paths {
+            if paths_equal(probe_path, active_path) {
+                return Err(
+                    "[p37_shadow_probe] output paths must not collide with active shadow transport or entry paths"
+                        .to_string(),
+                );
+            }
+        }
+        if active_lifecycle
+            .map(|active_path| paths_equal(probe_path, active_path))
+            .unwrap_or(false)
+        {
+            return Err(
+                "[p37_shadow_probe] output paths must not collide with active shadow lifecycle path"
+                    .to_string(),
+            );
+        }
+    }
+
+    Ok(())
+}
+
 fn validate_loaded_execution_profile(
     config: &LauncherConfig,
     has_explicit_execution_mode: bool,
@@ -1016,6 +1164,7 @@ fn validate_loaded_execution_profile(
     if config.mode == AppMode::Production {
         validate_shadow_transport(config).map_err(|err| anyhow!(err))?;
     }
+    validate_p37_shadow_probe_contract(config).map_err(|err| anyhow!(err))?;
     validate_live_sender_transport(config).map_err(|err| anyhow!(err))?;
 
     if config.mode == AppMode::Production {
@@ -1627,6 +1776,165 @@ impl Default for TriggerShadowRunConfig {
             max_concurrent: default_shadow_run_max_concurrent(),
             output_path: default_shadow_run_output_path(),
             emit_event_bus: true,
+        }
+    }
+}
+
+/// P3.7-J3 counterfactual shadow-only probe plane configuration.
+///
+/// This plane is disabled by default and must remain isolated from active BUY
+/// semantics. Enabling it only authorizes counterfactual shadow probes in a
+/// canonical shadow-only runtime profile.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct P37ShadowProbeConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    #[serde(default = "default_p37_shadow_probe_namespace")]
+    pub namespace: String,
+
+    #[serde(default = "default_p37_shadow_probe_dispatch_source")]
+    pub dispatch_source: String,
+
+    #[serde(default = "default_p37_shadow_probe_sample_source")]
+    pub sample_source: String,
+
+    #[serde(default = "default_p37_shadow_probe_sample_mode")]
+    pub sample_mode: String,
+
+    #[serde(default = "default_p37_shadow_probe_sample_modulus")]
+    pub sample_modulus: u64,
+
+    #[serde(default = "default_p37_shadow_probe_sample_threshold")]
+    pub sample_threshold: u64,
+
+    #[serde(default = "default_p37_shadow_probe_sampling_version")]
+    pub sampling_version: String,
+
+    #[serde(default = "default_p37_shadow_probe_max_probes_per_run")]
+    pub max_probes_per_run: usize,
+
+    #[serde(default = "default_p37_shadow_probe_max_probes_per_minute")]
+    pub max_probes_per_minute: usize,
+
+    #[serde(default = "default_p37_shadow_probe_max_concurrent")]
+    pub max_concurrent: usize,
+
+    #[serde(default = "default_p37_shadow_probe_include_verdict_types")]
+    pub include_verdict_types: Vec<String>,
+
+    #[serde(default = "default_true")]
+    pub exclude_active_buy_rows: bool,
+
+    #[serde(default = "default_true")]
+    pub enable_eligibility_precheck: bool,
+
+    #[serde(default = "default_true")]
+    pub require_ab_record_id: bool,
+
+    #[serde(default = "default_true")]
+    pub require_materialized_feature_set: bool,
+
+    #[serde(default = "default_true")]
+    pub require_v3_replay_payload: bool,
+
+    #[serde(default = "default_true")]
+    pub require_v3_feature_snapshot_hash: bool,
+
+    #[serde(default = "default_true")]
+    pub require_v3_policy_config_hash: bool,
+
+    #[serde(default = "default_true")]
+    pub require_execution_route_identity: bool,
+
+    #[serde(default = "default_true")]
+    pub require_curve_account_state: bool,
+
+    #[serde(default = "default_true")]
+    pub dedupe_by_probe_id: bool,
+
+    #[serde(default)]
+    pub emit_event_bus: bool,
+
+    #[serde(default = "default_p37_shadow_probe_event_bus_mode")]
+    pub event_bus_mode: String,
+
+    #[serde(default = "default_p37_shadow_probe_amount_source")]
+    pub probe_amount_source: String,
+
+    #[serde(default)]
+    pub probe_amount_lamports: u64,
+
+    #[serde(default = "default_p37_shadow_probe_slippage_bps")]
+    pub probe_slippage_bps: u64,
+
+    #[serde(default = "default_p37_shadow_probe_quote_age_max_ms")]
+    pub probe_quote_age_max_ms: u64,
+
+    #[serde(default = "default_p37_shadow_probe_curve_age_max_ms")]
+    pub probe_curve_age_max_ms: u64,
+
+    #[serde(default)]
+    pub append: bool,
+
+    #[serde(default = "default_true")]
+    pub require_unique_namespace: bool,
+
+    #[serde(default = "default_p37_shadow_probe_selection_log_path")]
+    pub selection_log_path: String,
+
+    #[serde(default = "default_p37_shadow_probe_skip_log_path")]
+    pub skip_log_path: String,
+
+    #[serde(default = "default_p37_shadow_probe_transport_log_path")]
+    pub transport_log_path: String,
+
+    #[serde(default = "default_p37_shadow_probe_entry_log_path")]
+    pub entry_log_path: String,
+
+    #[serde(default = "default_p37_shadow_probe_lifecycle_log_path")]
+    pub lifecycle_log_path: String,
+}
+
+impl Default for P37ShadowProbeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            namespace: default_p37_shadow_probe_namespace(),
+            dispatch_source: default_p37_shadow_probe_dispatch_source(),
+            sample_source: default_p37_shadow_probe_sample_source(),
+            sample_mode: default_p37_shadow_probe_sample_mode(),
+            sample_modulus: default_p37_shadow_probe_sample_modulus(),
+            sample_threshold: default_p37_shadow_probe_sample_threshold(),
+            sampling_version: default_p37_shadow_probe_sampling_version(),
+            max_probes_per_run: default_p37_shadow_probe_max_probes_per_run(),
+            max_probes_per_minute: default_p37_shadow_probe_max_probes_per_minute(),
+            max_concurrent: default_p37_shadow_probe_max_concurrent(),
+            include_verdict_types: default_p37_shadow_probe_include_verdict_types(),
+            exclude_active_buy_rows: true,
+            enable_eligibility_precheck: true,
+            require_ab_record_id: true,
+            require_materialized_feature_set: true,
+            require_v3_replay_payload: true,
+            require_v3_feature_snapshot_hash: true,
+            require_v3_policy_config_hash: true,
+            require_execution_route_identity: true,
+            require_curve_account_state: true,
+            dedupe_by_probe_id: true,
+            emit_event_bus: false,
+            event_bus_mode: default_p37_shadow_probe_event_bus_mode(),
+            probe_amount_source: default_p37_shadow_probe_amount_source(),
+            probe_amount_lamports: 0,
+            probe_slippage_bps: default_p37_shadow_probe_slippage_bps(),
+            probe_quote_age_max_ms: default_p37_shadow_probe_quote_age_max_ms(),
+            probe_curve_age_max_ms: default_p37_shadow_probe_curve_age_max_ms(),
+            append: false,
+            require_unique_namespace: true,
+            selection_log_path: default_p37_shadow_probe_selection_log_path(),
+            skip_log_path: default_p37_shadow_probe_skip_log_path(),
+            transport_log_path: default_p37_shadow_probe_transport_log_path(),
+            entry_log_path: default_p37_shadow_probe_entry_log_path(),
+            lifecycle_log_path: default_p37_shadow_probe_lifecycle_log_path(),
         }
     }
 }
@@ -2701,6 +3009,105 @@ fn default_shadow_run_output_path() -> String {
     "logs/shadow_run/buys.jsonl".to_string()
 }
 
+fn default_p37_shadow_probe_namespace() -> String {
+    "shadow-burnin-v3-p37-counterfactual-probe-r15-smoke".to_string()
+}
+
+fn default_p37_shadow_probe_dispatch_source() -> String {
+    "counterfactual_shadow_probe".to_string()
+}
+
+fn default_p37_shadow_probe_sample_source() -> String {
+    "v3_mfs_decision_rows".to_string()
+}
+
+fn default_p37_shadow_probe_sample_mode() -> String {
+    "deterministic_hash_mod".to_string()
+}
+
+fn default_p37_shadow_probe_sample_modulus() -> u64 {
+    100
+}
+
+fn default_p37_shadow_probe_sample_threshold() -> u64 {
+    5
+}
+
+fn default_p37_shadow_probe_sampling_version() -> String {
+    "p37-j3-v1".to_string()
+}
+
+fn default_p37_shadow_probe_max_probes_per_run() -> usize {
+    25
+}
+
+fn default_p37_shadow_probe_max_probes_per_minute() -> usize {
+    10
+}
+
+fn default_p37_shadow_probe_max_concurrent() -> usize {
+    2
+}
+
+fn default_p37_shadow_probe_include_verdict_types() -> Vec<String> {
+    vec!["REJECT".to_string(), "PENDING".to_string()]
+}
+
+fn default_p37_shadow_probe_event_bus_mode() -> String {
+    "disabled".to_string()
+}
+
+fn default_p37_shadow_probe_amount_source() -> String {
+    "trigger_max_position_size".to_string()
+}
+
+fn default_p37_shadow_probe_slippage_bps() -> u64 {
+    2000
+}
+
+fn default_p37_shadow_probe_quote_age_max_ms() -> u64 {
+    1500
+}
+
+fn default_p37_shadow_probe_curve_age_max_ms() -> u64 {
+    1500
+}
+
+fn default_p37_shadow_probe_selection_log_path() -> String {
+    format!(
+        "logs/shadow_run/{}/probe_selection.jsonl",
+        default_p37_shadow_probe_namespace()
+    )
+}
+
+fn default_p37_shadow_probe_skip_log_path() -> String {
+    format!(
+        "logs/shadow_run/{}/probe_skips.jsonl",
+        default_p37_shadow_probe_namespace()
+    )
+}
+
+fn default_p37_shadow_probe_transport_log_path() -> String {
+    format!(
+        "logs/shadow_run/{}/probe_transport.jsonl",
+        default_p37_shadow_probe_namespace()
+    )
+}
+
+fn default_p37_shadow_probe_entry_log_path() -> String {
+    format!(
+        "logs/shadow_run/{}/probe_shadow_entries.jsonl",
+        default_p37_shadow_probe_namespace()
+    )
+}
+
+fn default_p37_shadow_probe_lifecycle_log_path() -> String {
+    format!(
+        "logs/shadow_run/{}/probe_shadow_lifecycle.jsonl",
+        default_p37_shadow_probe_namespace()
+    )
+}
+
 impl LauncherConfig {
     /// Load configuration from a TOML file
     pub fn from_file<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
@@ -2795,6 +3202,16 @@ impl LauncherConfig {
         ));
         self.trigger.shadow_run.output_path =
             resolve_runtime_path(config_dir, &self.trigger.shadow_run.output_path);
+        self.p37_shadow_probe.selection_log_path =
+            resolve_runtime_path(config_dir, &self.p37_shadow_probe.selection_log_path);
+        self.p37_shadow_probe.skip_log_path =
+            resolve_runtime_path(config_dir, &self.p37_shadow_probe.skip_log_path);
+        self.p37_shadow_probe.transport_log_path =
+            resolve_runtime_path(config_dir, &self.p37_shadow_probe.transport_log_path);
+        self.p37_shadow_probe.entry_log_path =
+            resolve_runtime_path(config_dir, &self.p37_shadow_probe.entry_log_path);
+        self.p37_shadow_probe.lifecycle_log_path =
+            resolve_runtime_path(config_dir, &self.p37_shadow_probe.lifecycle_log_path);
         if let Some(wal_dir) = self.durability.wal_dir.as_mut() {
             *wal_dir = PathBuf::from(resolve_runtime_path(config_dir, &wal_dir.to_string_lossy()));
         }
@@ -2868,6 +3285,7 @@ impl LauncherConfig {
                 live_exit_stop_loss_pct: default_live_exit_stop_loss_pct(),
                 shadow_run: TriggerShadowRunConfig::default(),
             },
+            p37_shadow_probe: P37ShadowProbeConfig::default(),
             execution: ExecutionConfig::default(),
             gui_backend: GuiBackendComponentConfig {
                 enabled: true,
@@ -3795,6 +4213,142 @@ enabled = true
         config.seer.helius_endpoint = None;
 
         assert!(config.validate_execution_profile().is_ok());
+    }
+
+    #[test]
+    fn p37_shadow_probe_config_defaults_disabled() {
+        let config = LauncherConfig::default();
+
+        assert!(!config.p37_shadow_probe.enabled);
+        assert!(!config.p37_shadow_probe.emit_event_bus);
+        assert_eq!(config.p37_shadow_probe.event_bus_mode, "disabled");
+        assert_eq!(
+            config.p37_shadow_probe.dispatch_source,
+            "counterfactual_shadow_probe"
+        );
+        assert_eq!(
+            config.p37_shadow_probe.probe_amount_source,
+            "trigger_max_position_size"
+        );
+    }
+
+    #[test]
+    fn p37_shadow_probe_enabled_requires_shadow_profile() {
+        let mut config = LauncherConfig::default();
+        config.execution.execution_mode = ExecutionMode::Live;
+        config.trigger.entry_mode = TriggerEntryMode::Live;
+        config.trigger.keypair_path = Some("/tmp/test-keypair.json".to_string());
+        config.p37_shadow_probe.enabled = true;
+
+        let err = config
+            .validate_execution_profile()
+            .expect_err("probe plane must fail closed outside shadow-only profile");
+
+        assert!(err.contains("p37_shadow_probe"));
+        assert!(err.contains("execution_mode=\"shadow\""));
+        assert!(err.contains("entry_mode=\"shadow_only\""));
+    }
+
+    #[test]
+    fn p37_shadow_probe_config_loads_in_shadow_profile() {
+        let base = unique_temp_dir("p37_shadow_probe_config_loads");
+        let config_path = base.join("config.toml");
+        let config_body = r#"
+[seer]
+enabled = true
+source_mode = "pump_portal_ws"
+
+[gui_backend]
+enabled = true
+
+[trigger]
+entry_mode = "shadow_only"
+max_concurrent_positions = 2
+max_position_size_sol = 0.1
+emergency_floor_sol = 0.01
+position_size_buffer_sol = 0.001
+
+[trigger.shadow_run]
+enabled = true
+shadow_rpc_url = "https://shadow.example.com/api-key"
+payer_strategy = "ephemeral"
+output_path = "logs/active/buys.jsonl"
+
+[execution]
+execution_mode = "shadow"
+
+[execution.shadow]
+entry_log_path = "logs/active/shadow_entries.jsonl"
+lifecycle_log_path = "logs/active/shadow_lifecycle.jsonl"
+
+[p37_shadow_probe]
+enabled = true
+namespace = "probe-test"
+selection_log_path = "logs/probe/probe_selection.jsonl"
+skip_log_path = "logs/probe/probe_skips.jsonl"
+transport_log_path = "logs/probe/probe_transport.jsonl"
+entry_log_path = "logs/probe/probe_shadow_entries.jsonl"
+lifecycle_log_path = "logs/probe/probe_shadow_lifecycle.jsonl"
+"#;
+        fs::write(&config_path, config_body).unwrap();
+
+        let config =
+            LauncherConfig::from_file(&config_path).expect("probe config should load safely");
+
+        assert!(config.p37_shadow_probe.enabled);
+        assert_eq!(config.p37_shadow_probe.namespace, "probe-test");
+        assert!(!config.p37_shadow_probe.emit_event_bus);
+        assert!(config
+            .p37_shadow_probe
+            .transport_log_path
+            .ends_with("logs/probe/probe_transport.jsonl"));
+        assert!(config.validate_execution_profile().is_ok());
+    }
+
+    #[test]
+    fn p37_shadow_probe_output_path_collision_fails_closed() {
+        let mut config = LauncherConfig::default();
+        config.execution.execution_mode = ExecutionMode::Shadow;
+        config.trigger.entry_mode = TriggerEntryMode::ShadowOnly;
+        config.trigger.max_concurrent_positions = 2;
+        config.trigger.max_position_size_sol = 0.1;
+        config.trigger.emergency_floor_sol = 0.01;
+        config.trigger.position_size_buffer_sol = 0.001;
+        config.trigger.shadow_run.enabled = true;
+        config.trigger.shadow_run.shadow_rpc_url = "https://shadow.example.com/api-key".to_string();
+        config.trigger.shadow_run.payer_strategy = TriggerShadowPayerStrategy::Ephemeral;
+        config.trigger.shadow_run.output_path = "logs/shared/buys.jsonl".to_string();
+        config.p37_shadow_probe.enabled = true;
+        config.p37_shadow_probe.transport_log_path = "logs/shared/buys.jsonl".to_string();
+
+        let err = config
+            .validate_execution_profile()
+            .expect_err("probe transport must not collide with active shadow transport");
+
+        assert!(err.contains("p37_shadow_probe"));
+        assert!(err.contains("collide"));
+    }
+
+    #[test]
+    fn p37_shadow_probe_event_bus_p0_fails_closed() {
+        let mut config = LauncherConfig::default();
+        config.execution.execution_mode = ExecutionMode::Shadow;
+        config.trigger.entry_mode = TriggerEntryMode::ShadowOnly;
+        config.trigger.max_concurrent_positions = 2;
+        config.trigger.max_position_size_sol = 0.1;
+        config.trigger.emergency_floor_sol = 0.01;
+        config.trigger.position_size_buffer_sol = 0.001;
+        config.trigger.shadow_run.enabled = true;
+        config.trigger.shadow_run.shadow_rpc_url = "https://shadow.example.com/api-key".to_string();
+        config.trigger.shadow_run.payer_strategy = TriggerShadowPayerStrategy::Ephemeral;
+        config.p37_shadow_probe.enabled = true;
+        config.p37_shadow_probe.emit_event_bus = true;
+
+        let err = config
+            .validate_execution_profile()
+            .expect_err("P0 probe EventBus emission must fail closed");
+
+        assert!(err.contains("emit_event_bus=false"));
     }
 
     #[test]
