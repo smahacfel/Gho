@@ -149,6 +149,63 @@ lifecycle_log_path = "../../logs/shadow_run/r14/shadow_lifecycle.jsonl"
         self.assertEqual(report["readiness"]["status"], "not_ready")
         self.assertIn("missing_shadow_lifecycle_rows", report["readiness"]["reasons"])
 
+    def test_probe_transport_entry_join_can_pass_without_lifecycle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "configs/rollout/r15-probe.toml"
+            config.parent.mkdir(parents=True)
+            config.write_text(
+                """
+[oracle]
+decision_log_path = "../../logs/rollout/r15-probe/decisions"
+
+[p37_shadow_probe]
+selection_log_path = "../../logs/shadow_run/r15-probe/probe_selected.jsonl"
+skip_log_path = "../../logs/shadow_run/r15-probe/probe_skipped.jsonl"
+transport_log_path = "../../logs/shadow_run/r15-probe/probe_transport.jsonl"
+entry_log_path = "../../logs/shadow_run/r15-probe/probe_entries.jsonl"
+lifecycle_log_path = "../../logs/shadow_run/r15-probe/probe_lifecycle.jsonl"
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            decision = {
+                "candidate_id": "pool_mint_1000",
+                "ab_record_id": "source-ab",
+                "pool_id": "pool",
+                "base_mint": "mint",
+                "v3_replay_payload_schema_version": 1,
+                "v3_feature_snapshot_hash": "feature-hash",
+                "v3_policy_config_hash": "policy-hash",
+            }
+            probe_common = {
+                **decision,
+                "source_ab_record_id": "source-ab",
+                "probe_id": "probe-id",
+                "dispatch_source": "counterfactual_shadow_probe",
+                "collection_plane": "counterfactual_shadow_probe",
+                "probe_plane": "p37_shadow_probe",
+            }
+            write_jsonl(
+                root / "logs/rollout/r15-probe/decisions/gatekeeper_v2_decisions.jsonl",
+                [decision],
+            )
+            write_jsonl(root / "logs/shadow_run/r15-probe/probe_selected.jsonl", [probe_common])
+            write_jsonl(root / "logs/shadow_run/r15-probe/probe_transport.jsonl", [probe_common])
+            write_jsonl(root / "logs/shadow_run/r15-probe/probe_entries.jsonl", [probe_common])
+
+            report = audit.build_report(config)
+
+        self.assertEqual(report["probe_readiness"]["status"], "ready_for_probe_transport_entry_join")
+        self.assertEqual(report["probe_readiness"]["join_key_acceptance"], "pass")
+        self.assertEqual(report["probe_readiness"]["join_quality"], "exact_probe_id_and_ab_record_id")
+        self.assertEqual(report["probe_join_key_coverage"]["probe_transport_rows"], 1)
+        self.assertEqual(report["probe_join_key_coverage"]["probe_entry_rows"], 1)
+        self.assertEqual(report["probe_join_key_coverage"]["probe_lifecycle_rows"], 0)
+        self.assertEqual(report["probe_join_key_coverage"]["probe_chain_ab_record_id_coverage"], 1.0)
+        self.assertEqual(report["probe_join_key_coverage"]["probe_chain_probe_id_coverage"], 1.0)
+        self.assertEqual(report["readiness"]["status"], "not_ready")
+
 
 if __name__ == "__main__":
     unittest.main()

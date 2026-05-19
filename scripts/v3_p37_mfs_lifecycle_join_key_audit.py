@@ -16,6 +16,11 @@ SCHEMA_VERSION = 2
 DECISION_FILE_NAMES = ("gatekeeper_v2_decisions.jsonl", "gatekeeper_v2_buys.jsonl")
 FIELD_GROUPS = {
     "ab_record_id": ("ab_record_id",),
+    "source_ab_record_id": ("source_ab_record_id",),
+    "probe_id": ("probe_id",),
+    "dispatch_source": ("dispatch_source",),
+    "collection_plane": ("collection_plane",),
+    "probe_plane": ("probe_plane",),
     "candidate_id": ("candidate_id", "execution_candidate_id"),
     "position_id": ("position_id",),
     "pool_id": ("pool_id",),
@@ -29,6 +34,19 @@ FIELD_GROUPS = {
     "rollout_namespace": ("rollout_namespace", "rollout_profile"),
     "v3_replay_payload": ("v3_replay_payload_schema_version", "v3_replay_payload"),
 }
+CANONICAL_JOIN_ARTIFACTS = (
+    "decision",
+    "shadow_transport",
+    "shadow_entry",
+    "shadow_lifecycle",
+    "shadow_onchain_lifecycle",
+)
+PROBE_JOIN_ARTIFACTS = (
+    "probe_selection",
+    "probe_transport",
+    "probe_entry",
+    "probe_lifecycle",
+)
 
 
 def iter_jsonl(path: Path) -> Iterable[dict[str, Any]]:
@@ -128,12 +146,25 @@ def resolve_paths(config_path: Path) -> dict[str, list[Path]]:
         onchain_report = resolved_lifecycle.parent / "shadow_onchain_lifecycle_report.jsonl"
         if onchain_report.exists():
             paths["shadow_onchain_lifecycle"].append(onchain_report)
+
+    probe = config.get("p37_shadow_probe", {})
+    probe_path_fields = {
+        "probe_selection": "selection_log_path",
+        "probe_skip": "skip_log_path",
+        "probe_transport": "transport_log_path",
+        "probe_entry": "entry_log_path",
+        "probe_lifecycle": "lifecycle_log_path",
+    }
+    for artifact_type, field in probe_path_fields.items():
+        raw_path = probe.get(field)
+        if raw_path:
+            paths[artifact_type].append(Path(resolve_runtime_path(resolved, raw_path)))
     return {key: sorted(set(value)) for key, value in paths.items()}
 
 
 def intersection_counts(summaries: list[dict[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
-    for group in ("ab_record_id", "candidate_id", "pool_id", "mint"):
+    for group in ("ab_record_id", "probe_id", "candidate_id", "pool_id", "mint"):
         sets = [
             summary.get("_identifiers", {}).get(group, set())
             for summary in summaries
@@ -220,6 +251,106 @@ def join_key_coverage(report: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def probe_join_quality(report: dict[str, Any]) -> str:
+    intersections = report.get("probe_artifact_intersections", {})
+    probe = intersections.get("probe_id", {})
+    ab = intersections.get("ab_record_id", {})
+    candidate = intersections.get("candidate_id", {})
+    pool = intersections.get("pool_id", {})
+    mint = intersections.get("mint", {})
+    nonempty_artifact_count = sum(
+        1
+        for artifact_type in PROBE_JOIN_ARTIFACTS
+        for item in report["artifacts"].get(artifact_type, [])
+        if item.get("rows", 0) > 0
+    )
+    if (
+        nonempty_artifact_count > 1
+        and probe.get("artifacts_with_rows", 0) == nonempty_artifact_count
+        and ab.get("artifacts_with_rows", 0) == nonempty_artifact_count
+        and probe.get("common_values", 0) > 0
+        and ab.get("common_values", 0) > 0
+    ):
+        return "exact_probe_id_and_ab_record_id"
+    if (
+        nonempty_artifact_count > 1
+        and ab.get("artifacts_with_rows", 0) == nonempty_artifact_count
+        and ab.get("common_values", 0) > 0
+    ):
+        return "exact_ab_record_id"
+    if probe.get("common_values", 0) > 0:
+        return "exact_probe_id"
+    if candidate.get("common_values", 0) > 0:
+        return "exact_candidate_id"
+    if pool.get("common_values", 0) > 0 and mint.get("common_values", 0) > 0:
+        return "pool_mint_time_window"
+    if mint.get("common_values", 0) > 0:
+        return "mint_only"
+    return "unmatched"
+
+
+def probe_join_key_coverage(report: dict[str, Any]) -> dict[str, Any]:
+    artifact_rows = {
+        "probe_selection": artifact_totals(report, "probe_selection"),
+        "probe_skip": artifact_totals(report, "probe_skip"),
+        "probe_transport": artifact_totals(report, "probe_transport"),
+        "probe_entry": artifact_totals(report, "probe_entry"),
+        "probe_lifecycle": artifact_totals(report, "probe_lifecycle"),
+    }
+    field_rows = {
+        key: {
+            "ab_record_id": artifact_totals(report, key, "ab_record_id"),
+            "source_ab_record_id": artifact_totals(report, key, "source_ab_record_id"),
+            "probe_id": artifact_totals(report, key, "probe_id"),
+            "feature_snapshot_hash": artifact_totals(report, key, "feature_snapshot_hash"),
+            "v3_policy_config_hash": artifact_totals(report, key, "v3_policy_config_hash"),
+            "dispatch_source": artifact_totals(report, key, "dispatch_source"),
+        }
+        for key in artifact_rows
+    }
+    join_artifact_rows = {
+        key: rows for key, rows in artifact_rows.items() if key != "probe_skip"
+    }
+    nonempty_ab_coverages = [
+        field_rows[key]["ab_record_id"] / rows
+        for key, rows in join_artifact_rows.items()
+        if rows > 0
+    ]
+    nonempty_probe_coverages = [
+        field_rows[key]["probe_id"] / rows
+        for key, rows in join_artifact_rows.items()
+        if rows > 0
+    ]
+    return {
+        "probe_selection_rows": artifact_rows["probe_selection"],
+        "probe_skipped_rows": artifact_rows["probe_skip"],
+        "probe_transport_rows": artifact_rows["probe_transport"],
+        "probe_entry_rows": artifact_rows["probe_entry"],
+        "probe_lifecycle_rows": artifact_rows["probe_lifecycle"],
+        "probe_selection_rows_with_ab_record_id": field_rows["probe_selection"]["ab_record_id"],
+        "probe_transport_rows_with_ab_record_id": field_rows["probe_transport"]["ab_record_id"],
+        "probe_entry_rows_with_ab_record_id": field_rows["probe_entry"]["ab_record_id"],
+        "probe_lifecycle_rows_with_ab_record_id": field_rows["probe_lifecycle"]["ab_record_id"],
+        "probe_selection_rows_with_probe_id": field_rows["probe_selection"]["probe_id"],
+        "probe_transport_rows_with_probe_id": field_rows["probe_transport"]["probe_id"],
+        "probe_entry_rows_with_probe_id": field_rows["probe_entry"]["probe_id"],
+        "probe_lifecycle_rows_with_probe_id": field_rows["probe_lifecycle"]["probe_id"],
+        "probe_transport_rows_with_dispatch_source": field_rows["probe_transport"]["dispatch_source"],
+        "probe_entry_rows_with_dispatch_source": field_rows["probe_entry"]["dispatch_source"],
+        "probe_transport_rows_with_feature_hash": field_rows["probe_transport"]["feature_snapshot_hash"],
+        "probe_entry_rows_with_feature_hash": field_rows["probe_entry"]["feature_snapshot_hash"],
+        "probe_transport_rows_with_policy_hash": field_rows["probe_transport"]["v3_policy_config_hash"],
+        "probe_entry_rows_with_policy_hash": field_rows["probe_entry"]["v3_policy_config_hash"],
+        "probe_chain_ab_record_id_coverage": round(min(nonempty_ab_coverages), 6)
+        if nonempty_ab_coverages
+        else 0.0,
+        "probe_chain_probe_id_coverage": round(min(nonempty_probe_coverages), 6)
+        if nonempty_probe_coverages
+        else 0.0,
+        "probe_join_quality": probe_join_quality(report),
+    }
+
+
 def readiness(report: dict[str, Any]) -> dict[str, Any]:
     decision_rows = artifact_totals(report, "decision")
     v3_payload_rows = artifact_totals(report, "decision", "v3_replay_payload")
@@ -271,6 +402,52 @@ def readiness(report: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def probe_readiness(report: dict[str, Any]) -> dict[str, Any]:
+    coverage = report.get("probe_join_key_coverage", {})
+    selection_rows = coverage.get("probe_selection_rows", 0)
+    transport_rows = coverage.get("probe_transport_rows", 0)
+    entry_rows = coverage.get("probe_entry_rows", 0)
+    quality = coverage.get("probe_join_quality") or probe_join_quality(report)
+    exact_ab_common = report.get("probe_artifact_intersections", {}).get("ab_record_id", {}).get("common_values", 0)
+    exact_probe_common = report.get("probe_artifact_intersections", {}).get("probe_id", {}).get("common_values", 0)
+    status = "ready_for_probe_transport_entry_join"
+    reasons: list[str] = []
+    if selection_rows <= 0:
+        status = "not_ready"
+        reasons.append("missing_probe_selection_rows")
+    if transport_rows <= 0:
+        status = "not_ready"
+        reasons.append("missing_probe_transport_rows")
+    if entry_rows <= 0:
+        status = "not_ready"
+        reasons.append("missing_probe_entry_rows")
+    if exact_ab_common <= 0:
+        status = "degraded" if status != "not_ready" else status
+        reasons.append("no_common_probe_ab_record_id")
+    if exact_probe_common <= 0:
+        status = "degraded" if status != "not_ready" else status
+        reasons.append("no_common_probe_id")
+    if status == "ready_for_probe_transport_entry_join" and quality in {
+        "exact_probe_id_and_ab_record_id",
+        "exact_ab_record_id",
+    }:
+        join_key_acceptance = "pass"
+    elif status == "not_ready":
+        join_key_acceptance = "fail"
+    else:
+        join_key_acceptance = "degraded"
+    return {
+        "status": status,
+        "reasons": reasons,
+        "join_key_acceptance": join_key_acceptance,
+        "join_quality": quality,
+        "probe_selection_rows": selection_rows,
+        "probe_transport_rows": transport_rows,
+        "probe_entry_rows": entry_rows,
+        "probe_lifecycle_rows": coverage.get("probe_lifecycle_rows", 0),
+    }
+
+
 def build_report(config_path: Path) -> dict[str, Any]:
     resolved = resolve_config_path(config_path)
     paths = resolve_paths(resolved)
@@ -280,15 +457,29 @@ def build_report(config_path: Path) -> dict[str, Any]:
         for path in artifact_paths:
             summary = artifact_summary(artifact_type, path)
             artifacts[artifact_type].append(clean_summary(summary))
-    with_ids = [artifact_summary(path_type, path) for path_type, values in sorted(paths.items()) for path in values]
+    with_ids = [
+        artifact_summary(path_type, path)
+        for path_type, values in sorted(paths.items())
+        for path in values
+        if path_type in CANONICAL_JOIN_ARTIFACTS
+    ]
+    probe_with_ids = [
+        artifact_summary(path_type, path)
+        for path_type, values in sorted(paths.items())
+        for path in values
+        if path_type in PROBE_JOIN_ARTIFACTS
+    ]
     report = {
         "schema_version": SCHEMA_VERSION,
         "config_path": str(resolved),
         "artifacts": artifacts,
         "cross_artifact_intersections": intersection_counts(with_ids),
+        "probe_artifact_intersections": intersection_counts(probe_with_ids),
     }
     report["join_key_coverage"] = join_key_coverage(report)
     report["readiness"] = readiness(report)
+    report["probe_join_key_coverage"] = probe_join_key_coverage(report)
+    report["probe_readiness"] = probe_readiness(report)
     return report
 
 
@@ -300,30 +491,44 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- readiness: `{report['readiness']['status']}`",
         f"- join_key_acceptance: `{report['readiness']['join_key_acceptance']}`",
         f"- join_quality: `{report['join_key_coverage']['join_quality']}`",
+        f"- probe_readiness: `{report['probe_readiness']['status']}`",
+        f"- probe_join_key_acceptance: `{report['probe_readiness']['join_key_acceptance']}`",
+        f"- probe_join_quality: `{report['probe_join_key_coverage']['probe_join_quality']}`",
         f"- full_chain_ab_record_id_coverage: `{report['join_key_coverage']['full_chain_ab_record_id_coverage']}`",
+        f"- probe_chain_ab_record_id_coverage: `{report['probe_join_key_coverage']['probe_chain_ab_record_id_coverage']}`",
+        f"- probe_chain_probe_id_coverage: `{report['probe_join_key_coverage']['probe_chain_probe_id_coverage']}`",
         f"- readiness_reasons: `{json.dumps(report['readiness']['reasons'], ensure_ascii=False)}`",
+        f"- probe_readiness_reasons: `{json.dumps(report['probe_readiness']['reasons'], ensure_ascii=False)}`",
         f"- decision_rows_with_ab_record_id: `{report['join_key_coverage']['decision_rows_with_ab_record_id']}`",
         f"- shadow_transport_rows_with_ab_record_id: `{report['join_key_coverage']['shadow_transport_rows_with_ab_record_id']}`",
         f"- shadow_entry_rows_with_ab_record_id: `{report['join_key_coverage']['shadow_entry_rows_with_ab_record_id']}`",
         f"- shadow_lifecycle_rows_with_ab_record_id: `{report['join_key_coverage']['shadow_lifecycle_rows_with_ab_record_id']}`",
         f"- onchain_lifecycle_rows_with_ab_record_id: `{report['join_key_coverage']['onchain_lifecycle_rows_with_ab_record_id']}`",
+        f"- probe_transport_rows_with_ab_record_id: `{report['probe_join_key_coverage']['probe_transport_rows_with_ab_record_id']}`",
+        f"- probe_entry_rows_with_ab_record_id: `{report['probe_join_key_coverage']['probe_entry_rows_with_ab_record_id']}`",
+        f"- probe_transport_rows_with_probe_id: `{report['probe_join_key_coverage']['probe_transport_rows_with_probe_id']}`",
+        f"- probe_entry_rows_with_probe_id: `{report['probe_join_key_coverage']['probe_entry_rows_with_probe_id']}`",
         "",
         "## Artifact Coverage",
         "",
-        "| artifact | rows | candidate_id | ab_record_id | pool_id | mint | v3_payload | feature_hash |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| artifact | rows | candidate_id | ab_record_id | probe_id | pool_id | mint | v3_payload | feature_hash |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for artifact_type, items in report["artifacts"].items():
         for item in items:
             counts = item["field_counts"]
             lines.append(
                 f"| `{artifact_type}` | {item['rows']} | {counts.get('candidate_id', 0)} | "
-                f"{counts.get('ab_record_id', 0)} | {counts.get('pool_id', 0)} | "
-                f"{counts.get('mint', 0)} | {counts.get('v3_replay_payload', 0)} | "
+                f"{counts.get('ab_record_id', 0)} | {counts.get('probe_id', 0)} | "
+                f"{counts.get('pool_id', 0)} | {counts.get('mint', 0)} | "
+                f"{counts.get('v3_replay_payload', 0)} | "
                 f"{counts.get('feature_snapshot_hash', 0)} |"
             )
     lines.extend(["", "## Cross-Artifact Intersections", ""])
     for key, value in report["cross_artifact_intersections"].items():
+        lines.append(f"- `{key}`: `{json.dumps(value, ensure_ascii=False, sort_keys=True)}`")
+    lines.extend(["", "## Probe Artifact Intersections", ""])
+    for key, value in report["probe_artifact_intersections"].items():
         lines.append(f"- `{key}`: `{json.dumps(value, ensure_ascii=False, sort_keys=True)}`")
     lines.extend(
         [
