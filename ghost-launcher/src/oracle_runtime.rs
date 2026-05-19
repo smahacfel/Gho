@@ -23,8 +23,8 @@ use crate::config::{
     ExecutionMode, SessionRuntimeConfig, ShadowLedgerConfig, TxIntelligenceRuntimeConfig,
 };
 use crate::events::{
-    AccountUpdateEvent, DetectedPool, EventBusSender, FundingTransferObserved, GhostEvent,
-    PoolTransaction, PostBuySource,
+    AccountUpdateEvent, DetectedPool, EventBusSender, ExecutionJoinMetadata,
+    FundingTransferObserved, GhostEvent, PoolTransaction, PostBuySource,
 };
 use crate::session::{
     OpenSessionRequest, PoolObservationSession, SessionConfig, SessionManager, SharedSession,
@@ -4365,6 +4365,58 @@ fn enrich_buy_log_with_iwim(
     log.iwim_organic_score = iwim.raw_result.as_ref().map(|r| r.organic_score as f32);
 }
 
+fn v3_feature_snapshot_hash_for_join(
+    assessment: &GatekeeperAssessment,
+    config: &GatekeeperV3Config,
+) -> Option<String> {
+    if !config.shadow_emit_enabled {
+        return None;
+    }
+    if config.replay_payload_enabled {
+        return serde_json::to_value(&assessment.feature_snapshot)
+            .ok()
+            .map(|snapshot_payload| {
+                crate::components::gatekeeper_v3::v3_feature_snapshot_hash_from_payload(
+                    &snapshot_payload,
+                    config.materialization_version,
+                )
+            });
+    }
+    Some(crate::components::gatekeeper_v3::v3_feature_snapshot_hash(
+        &assessment.feature_snapshot,
+        config.materialization_version,
+    ))
+}
+
+fn build_buy_execution_join_metadata(
+    pool_id: Pubkey,
+    window_state: &WindowState,
+    assessment: &GatekeeperAssessment,
+    config: &GatekeeperV3Config,
+    rollout_profile: &str,
+) -> ExecutionJoinMetadata {
+    let pool_id_string = pool_id.to_string();
+    let t0 = ensure_epoch_ms(
+        window_state.t0_event_ts_ms,
+        "ab_t0_event_ts_ms",
+        &pool_id_string,
+    );
+    let t_end = ensure_epoch_ms(
+        window_state.t_end_event_ts_ms,
+        "ab_t_end_event_ts_ms",
+        &pool_id_string,
+    );
+    ExecutionJoinMetadata {
+        ab_record_id: Some(format!("{pool_id_string}:{t0}:{t_end}:BUY")),
+        v3_feature_snapshot_hash: v3_feature_snapshot_hash_for_join(assessment, config),
+        v3_policy_config_hash: config
+            .shadow_emit_enabled
+            .then(|| config.v3_policy_config_hash()),
+        decision_plane: Some("legacy_live".to_string()),
+        rollout_namespace: Some(rollout_profile.to_string()),
+    }
+}
+
 fn enrich_buy_log_with_v3_shadow(
     log: &mut ghost_brain::oracle::GatekeeperBuyLog,
     assessment: &GatekeeperAssessment,
@@ -4497,11 +4549,10 @@ fn v3_replay_payload_hash_mismatch(
 ) -> Option<(String, String)> {
     let logged_hash = log.v3_feature_snapshot_hash.as_ref()?;
     let snapshot_payload = log.v3_materialized_feature_snapshot.as_ref()?;
-    let recomputed_hash =
-        crate::components::gatekeeper_v3::v3_feature_snapshot_hash_from_payload(
-            snapshot_payload,
-            materialization_version,
-        );
+    let recomputed_hash = crate::components::gatekeeper_v3::v3_feature_snapshot_hash_from_payload(
+        snapshot_payload,
+        materialization_version,
+    );
 
     if logged_hash == &recomputed_hash {
         None
@@ -5982,6 +6033,7 @@ async fn wait_for_live_trigger_readiness(
 async fn execute_gatekeeper_buy_path(
     pool_id: Pubkey,
     registered_wall_ts_ms: u64,
+    window_state: &WindowState,
     buffered_txs: &[crate::components::gatekeeper::GatekeeperBufferedTx],
     assessment: &GatekeeperAssessment,
     post_buy_lane: &str,
@@ -6258,6 +6310,13 @@ async fn execute_gatekeeper_buy_path(
                                 true,
                             )
                         });
+                    let join_metadata = build_buy_execution_join_metadata(
+                        pool_amm_id,
+                        window_state,
+                        &assessment,
+                        &ctx.gatekeeper_v3_config,
+                        &ctx.gatekeeper_rollout_profile,
+                    );
                     let receipt = execute_gatekeeper_buy_via_trigger_with_fsc_gate(
                         trigger_component,
                         fsc_gate_status,
@@ -6265,6 +6324,7 @@ async fn execute_gatekeeper_buy_path(
                         &account_overrides,
                         tip_lamports,
                         Some(resolved_tip.telemetry.clone()),
+                        Some(join_metadata),
                     )
                     .await;
                     match apply_trigger_dispatch_receipt(
@@ -6344,6 +6404,7 @@ async fn execute_gatekeeper_buy_via_trigger(
         account_overrides,
         tip_lamports,
         tip_floor_telemetry,
+        None,
     )
     .await
 }
@@ -6355,6 +6416,7 @@ async fn execute_gatekeeper_buy_via_trigger_with_fsc_gate(
     account_overrides: &crate::components::trigger::BuyAccountOverrides,
     tip_lamports: u64,
     tip_floor_telemetry: Option<crate::components::live_tx_sender::TipFloorResolutionTelemetry>,
+    join_metadata: Option<ExecutionJoinMetadata>,
 ) -> crate::components::trigger::TriggerDispatchReceipt {
     if let Some(gate_status) = fsc_gate_status {
         match trigger_component.entry_mode() {
@@ -6386,6 +6448,11 @@ async fn execute_gatekeeper_buy_via_trigger_with_fsc_gate(
                     .await
                 {
                     Ok(prepared_buy) => {
+                        let prepared_buy = if let Some(metadata) = join_metadata.clone() {
+                            prepared_buy.with_join_metadata(metadata)
+                        } else {
+                            prepared_buy
+                        };
                         trigger_component
                             .dispatch_prepared_buy_shadow_only(prepared_buy)
                             .await
@@ -6458,6 +6525,11 @@ async fn execute_gatekeeper_buy_via_trigger_with_fsc_gate(
             .await
         {
             Ok(prepared_buy) => {
+                let prepared_buy = if let Some(metadata) = join_metadata {
+                    prepared_buy.with_join_metadata(metadata)
+                } else {
+                    prepared_buy
+                };
                 trigger_component
                     .dispatch_prepared_buy_with_shadow(prepared_buy)
                     .await
@@ -6722,6 +6794,7 @@ fn shadow_entry_record_from_event(
         event.decision_ts_ms
     };
     Some(ShadowEntryRecord {
+        join_metadata: event.join_metadata.clone(),
         timestamp: format_shadow_entry_timestamp(entry_execution_ts_ms),
         pool_id: pool_amm_id.to_string(),
         mint_id: base_mint.to_string(),
@@ -6743,6 +6816,7 @@ fn shadow_entry_record_from_request(
     execution_outcome: &str,
 ) -> Option<ShadowEntryRecord> {
     Some(ShadowEntryRecord {
+        join_metadata: request.join_metadata.clone(),
         timestamp: format_shadow_entry_timestamp(request.decision_ts_ms),
         pool_id: pool_amm_id.to_string(),
         mint_id: base_mint.to_string(),
@@ -7014,6 +7088,8 @@ struct TriggerBuyOutcomeApplied {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 struct ShadowEntryRecord {
+    #[serde(flatten)]
+    join_metadata: ExecutionJoinMetadata,
     timestamp: String,
     pool_id: String,
     mint_id: String,
@@ -7048,6 +7124,7 @@ fn build_post_buy_handoff_event(
     min_tokens_out: Option<u64>,
     entry_token_amount_raw: Option<u64>,
     buy_landed_slot: Option<u64>,
+    join_metadata: ExecutionJoinMetadata,
 ) -> GhostEvent {
     let creator_pubkey = Pubkey::from_str(&pool_data.creator)
         .ok()
@@ -7067,6 +7144,7 @@ fn build_post_buy_handoff_event(
         buy_landed_slot,
         creator_pubkey,
     )
+    .with_execution_join_metadata(join_metadata)
 }
 
 fn send_direct_post_buy_handoff(
@@ -7239,6 +7317,7 @@ async fn send_post_buy_handoff(
     position_slot_id: Option<PositionSlotId>,
     min_tokens_out: Option<u64>,
     buy_landed_slot: Option<u64>,
+    join_metadata: ExecutionJoinMetadata,
 ) -> anyhow::Result<()> {
     let handoff_event = build_post_buy_handoff_event(
         pool_amm_id,
@@ -7252,6 +7331,7 @@ async fn send_post_buy_handoff(
         min_tokens_out,
         None,
         buy_landed_slot,
+        join_metadata,
     );
     send_direct_post_buy_handoff(post_buy_tx, &handoff_event, pool_amm_id, post_buy_lane)?;
     send_broadcast_post_buy_handoff(
@@ -7278,6 +7358,7 @@ async fn send_shadow_post_buy_handoff(
     position_slot_id: Option<PositionSlotId>,
     min_tokens_out: Option<u64>,
     entry_token_amount_raw: Option<u64>,
+    join_metadata: ExecutionJoinMetadata,
 ) -> anyhow::Result<Option<DirectPostBuyHandoffAck>> {
     let handoff_event = build_post_buy_handoff_event(
         pool_amm_id,
@@ -7291,6 +7372,7 @@ async fn send_shadow_post_buy_handoff(
         min_tokens_out,
         entry_token_amount_raw,
         None,
+        join_metadata,
     );
     let ack = send_direct_shadow_post_buy_handoff(
         post_buy_tx,
@@ -7391,6 +7473,7 @@ async fn apply_trigger_buy_outcome(
                 position_slot_id,
                 min_tokens_out,
                 buy_landed_slot,
+                ExecutionJoinMetadata::default(),
             )
             .await
             {
@@ -7468,6 +7551,7 @@ async fn apply_trigger_buy_outcome(
                         position_slot_id,
                         min_tokens_out,
                         shadow_entry_token_amount_raw,
+                        shadow_event.join_metadata.clone(),
                     )
                     .await
                     {
@@ -7510,6 +7594,7 @@ async fn apply_trigger_buy_outcome(
                     position_slot_id,
                     min_tokens_out,
                     None,
+                    shadow_event.join_metadata.clone(),
                 )
                 .await
                 {
@@ -9023,9 +9108,11 @@ async fn pool_observation_task(
                     Some(window_state),
                     &mut coverage_window_opened,
                 );
+                let buy_window_state = window_state.clone();
                 let buy_execution = execute_gatekeeper_buy_path(
                     pool_id,
                     registered_wall_ts_ms,
+                    &buy_window_state,
                     &buffered_txs,
                     &assessment,
                     post_buy_lane,
@@ -10152,6 +10239,7 @@ mod tests {
             config: &crate::config::TriggerShadowRunConfig,
         ) -> anyhow::Result<crate::components::trigger::ShadowBuySimulationReport> {
             Ok(crate::components::trigger::ShadowBuySimulationReport {
+                join_metadata: ExecutionJoinMetadata::default(),
                 mint: request.mint.to_string(),
                 live_signature: None,
                 payer_pubkey: request.payer_pubkey.to_string(),
@@ -10188,8 +10276,7 @@ mod tests {
     fn test_account_update_queue_depth_does_not_underflow() {
         let depth = AtomicUsize::new(0);
 
-        let (remaining, underflow_prevented) =
-            decrement_account_update_queue_depth(&depth);
+        let (remaining, underflow_prevented) = decrement_account_update_queue_depth(&depth);
         assert_eq!(remaining, 0);
         assert!(underflow_prevented);
         assert_eq!(depth.load(Ordering::Relaxed), 0);
@@ -10199,8 +10286,7 @@ mod tests {
         assert_eq!(incremented, 1);
         assert_eq!(depth.load(Ordering::Relaxed), 1);
 
-        let (remaining, underflow_prevented) =
-            decrement_account_update_queue_depth(&depth);
+        let (remaining, underflow_prevented) = decrement_account_update_queue_depth(&depth);
         assert_eq!(remaining, 0);
         assert!(!underflow_prevented);
         assert_eq!(depth.load(Ordering::Relaxed), 0);
@@ -10326,6 +10412,7 @@ mod tests {
 
         crate::components::trigger::PendingShadowSimulation {
             request: crate::components::trigger::PreparedBuyRequest {
+                join_metadata: ExecutionJoinMetadata::default(),
                 mint: Pubkey::new_unique(),
                 payer_pubkey: payer.pubkey(),
                 payer_provenance: "configured",
@@ -10389,6 +10476,7 @@ mod tests {
         .expect("test request versioned tx");
 
         crate::components::trigger::PreparedBuyRequest {
+            join_metadata: ExecutionJoinMetadata::default(),
             mint: Pubkey::new_unique(),
             payer_pubkey: payer.pubkey(),
             payer_provenance: "configured",
@@ -12000,6 +12088,7 @@ mod tests {
         let outcome = execute_gatekeeper_buy_path(
             pool_id,
             2_000,
+            &WindowState::from_first_tx(2_000, 10_000),
             &buffered_txs,
             &test_gatekeeper_buy_assessment(6),
             "paper",
@@ -12096,6 +12185,7 @@ mod tests {
             let outcome = execute_gatekeeper_buy_path(
                 pool_id,
                 2_000,
+                &WindowState::from_first_tx(2_000, 10_000),
                 &buffered_txs,
                 &test_gatekeeper_buy_assessment(6),
                 "paper",
@@ -12180,6 +12270,7 @@ mod tests {
         let outcome = execute_gatekeeper_buy_path(
             pool_id,
             2_000,
+            &WindowState::from_first_tx(2_000, 10_000),
             &[],
             &test_gatekeeper_buy_assessment(6),
             "paper",
@@ -12257,6 +12348,7 @@ mod tests {
             execute_gatekeeper_buy_path(
                 pool_id,
                 2_000,
+                &WindowState::from_first_tx(2_000, 10_000),
                 &[],
                 &test_gatekeeper_buy_assessment(6),
                 "paper",
@@ -12323,6 +12415,7 @@ mod tests {
             let outcome = execute_gatekeeper_buy_path(
                 pool_id,
                 2_000,
+                &WindowState::from_first_tx(2_000, 10_000),
                 &buffered_txs,
                 &test_gatekeeper_buy_assessment(6),
                 "paper",
@@ -12385,6 +12478,7 @@ mod tests {
         let outcome = execute_gatekeeper_buy_path(
             pool_id,
             2_000,
+            &WindowState::from_first_tx(2_000, 10_000),
             &buffered_txs,
             &test_gatekeeper_buy_assessment(6),
             "paper",
@@ -12596,6 +12690,7 @@ mod tests {
             None,
             crate::components::trigger::TriggerBuyOutcome::ShadowSimulated {
                 report: crate::components::trigger::ShadowBuySimulationReport {
+                    join_metadata: ExecutionJoinMetadata::default(),
                     mint: resolved_pool.base_mint.clone(),
                     live_signature: None,
                     payer_pubkey: Pubkey::new_unique().to_string(),
@@ -12697,6 +12792,7 @@ mod tests {
         let outcome = execute_gatekeeper_buy_path(
             pool_id,
             2_000,
+            &WindowState::from_first_tx(2_000, 10_000),
             &[],
             &test_gatekeeper_buy_assessment(6),
             "paper",
@@ -12812,6 +12908,7 @@ mod tests {
         let outcome = execute_gatekeeper_buy_path(
             pool_id,
             2_000,
+            &WindowState::from_first_tx(2_000, 10_000),
             &[],
             &test_gatekeeper_buy_assessment(6),
             "paper",
@@ -14256,6 +14353,7 @@ mod tests {
             &crate::components::trigger::BuyAccountOverrides::default(),
             1_000_000,
             None,
+            None,
         )
         .await;
         let err = receipt
@@ -14310,6 +14408,7 @@ mod tests {
             Pubkey::new_unique(),
             &crate::components::trigger::BuyAccountOverrides::default(),
             1_000_000,
+            None,
             None,
         )
         .await;
@@ -14377,6 +14476,7 @@ mod tests {
         };
         let outcome = crate::components::trigger::TriggerBuyOutcome::ShadowSimulated {
             report: crate::components::trigger::ShadowBuySimulationReport {
+                join_metadata: ExecutionJoinMetadata::default(),
                 mint: pool.base_mint.clone(),
                 live_signature: None,
                 payer_pubkey: Pubkey::new_unique().to_string(),
@@ -14489,6 +14589,7 @@ mod tests {
 
         let outcome = crate::components::trigger::TriggerBuyOutcome::ShadowSimulated {
             report: crate::components::trigger::ShadowBuySimulationReport {
+                join_metadata: ExecutionJoinMetadata::default(),
                 mint: pool.base_mint.clone(),
                 live_signature: None,
                 payer_pubkey: Pubkey::new_unique().to_string(),
@@ -14603,6 +14704,7 @@ mod tests {
 
         let outcome = crate::components::trigger::TriggerBuyOutcome::ShadowSimulated {
             report: crate::components::trigger::ShadowBuySimulationReport {
+                join_metadata: ExecutionJoinMetadata::default(),
                 mint: pool.base_mint.clone(),
                 live_signature: None,
                 payer_pubkey: Pubkey::new_unique().to_string(),
@@ -14741,6 +14843,7 @@ mod tests {
 
         let outcome = crate::components::trigger::TriggerBuyOutcome::ShadowSimulated {
             report: crate::components::trigger::ShadowBuySimulationReport {
+                join_metadata: ExecutionJoinMetadata::default(),
                 mint: pool.base_mint.clone(),
                 live_signature: None,
                 payer_pubkey: Pubkey::new_unique().to_string(),
@@ -14885,6 +14988,7 @@ mod tests {
             None,
             crate::components::trigger::TriggerBuyOutcome::ShadowSimulated {
                 report: crate::components::trigger::ShadowBuySimulationReport {
+                    join_metadata: ExecutionJoinMetadata::default(),
                     mint: pool.base_mint.clone(),
                     live_signature: None,
                     payer_pubkey: Pubkey::new_unique().to_string(),
@@ -15066,6 +15170,7 @@ mod tests {
             None,
             crate::components::trigger::TriggerBuyOutcome::ShadowSimulated {
                 report: crate::components::trigger::ShadowBuySimulationReport {
+                    join_metadata: ExecutionJoinMetadata::default(),
                     mint: pool.base_mint.clone(),
                     live_signature: None,
                     payer_pubkey: Pubkey::new_unique().to_string(),
@@ -15168,6 +15273,7 @@ mod tests {
                 async move {
                     tokio::time::sleep(Duration::from_millis(250)).await;
                     Ok(crate::components::trigger::ShadowBuySimulationReport {
+                        join_metadata: ExecutionJoinMetadata::default(),
                         mint: base_mint,
                         live_signature: None,
                         payer_pubkey: Pubkey::new_unique().to_string(),
@@ -15846,6 +15952,7 @@ mod tests {
                 let base_mint = pool.base_mint.clone();
                 async move {
                     Ok(crate::components::trigger::ShadowBuySimulationReport {
+                        join_metadata: ExecutionJoinMetadata::default(),
                         mint: base_mint,
                         live_signature: None,
                         payer_pubkey: Pubkey::new_unique().to_string(),
@@ -17000,6 +17107,7 @@ mod tests {
             retain_position_slot_on_error: false,
             failed_request: None,
             failed_context: Some(crate::components::trigger::TriggerDispatchFailureContext {
+                join_metadata: ExecutionJoinMetadata::default(),
                 amount_lamports: 100_000_000,
                 tip_lamports: 3_000_000,
                 decision_ts_ms: 10,
@@ -17127,6 +17235,7 @@ mod tests {
             primary_outcome: Ok(
                 crate::components::trigger::TriggerBuyOutcome::ShadowSimulated {
                     report: crate::components::trigger::ShadowBuySimulationReport {
+                        join_metadata: ExecutionJoinMetadata::default(),
                         mint: pool.base_mint.clone(),
                         live_signature: None,
                         payer_pubkey: Pubkey::new_unique().to_string(),
@@ -17289,6 +17398,7 @@ mod tests {
                 let base_mint = pool.base_mint.clone();
                 async move {
                     Ok(crate::components::trigger::ShadowBuySimulationReport {
+                        join_metadata: ExecutionJoinMetadata::default(),
                         mint: base_mint,
                         live_signature: None,
                         payer_pubkey: Pubkey::new_unique().to_string(),
@@ -17419,6 +17529,7 @@ mod tests {
             shadow_task: Some(test_pending_shadow_simulation(tokio::spawn(async {
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 Ok(crate::components::trigger::ShadowBuySimulationReport {
+                    join_metadata: ExecutionJoinMetadata::default(),
                     mint: Pubkey::new_unique().to_string(),
                     live_signature: None,
                     payer_pubkey: Pubkey::new_unique().to_string(),
@@ -17546,6 +17657,7 @@ mod tests {
                 panic!("boom");
                 #[allow(unreachable_code)]
                 Ok(crate::components::trigger::ShadowBuySimulationReport {
+                    join_metadata: ExecutionJoinMetadata::default(),
                     mint: Pubkey::new_unique().to_string(),
                     live_signature: None,
                     payer_pubkey: Pubkey::new_unique().to_string(),
@@ -17692,6 +17804,7 @@ mod tests {
             primary_outcome: Ok(
                 crate::components::trigger::TriggerBuyOutcome::ShadowSimulated {
                     report: crate::components::trigger::ShadowBuySimulationReport {
+                        join_metadata: ExecutionJoinMetadata::default(),
                         mint: pool.base_mint.clone(),
                         live_signature: None,
                         payer_pubkey: Pubkey::new_unique().to_string(),
@@ -20622,8 +20735,9 @@ mod tests {
             log.v3_policy_config_hash.as_deref(),
             Some(policy_hash.as_str())
         );
-        assert!(v3_replay_payload_hash_mismatch(&log, payload_config.materialization_version)
-            .is_none());
+        assert!(
+            v3_replay_payload_hash_mismatch(&log, payload_config.materialization_version).is_none()
+        );
     }
 
     #[test]

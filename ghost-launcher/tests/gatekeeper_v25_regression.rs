@@ -1779,7 +1779,9 @@ fn p2_aps_drift_override_only_in_shadow_plane() {
     features.account_features.price_sol = 1.0;
     features.account_features.current_reserves = (50_000_000_000, 900_000_000);
     features.session_metadata.observation_duration_ms = 7_000;
-    features.checkpoint_features.price_change_from_first_checkpoint_pct = 4.0;
+    features
+        .checkpoint_features
+        .price_change_from_first_checkpoint_pct = 4.0;
     features.checkpoint_features.price_trajectory = vec![0.97, 1.0, 1.04];
     features.checkpoint_features.trajectory_checkpoint_count = 3;
     features.curve_readiness.curve_data_known = true;
@@ -2063,7 +2065,10 @@ fn p4_assessment_only_timeout_uses_terminal_reason_code() {
     assessment.terminal_reason_code = Some(GatekeeperReasonCode::TimeoutPhase1NoData);
 
     let buy_log = assessment.to_buy_log(&Pubkey::new_unique(), &config);
-    assert_eq!(buy_log.reason_code.as_deref(), Some("TIMEOUT_PHASE1_NO_DATA"));
+    assert_eq!(
+        buy_log.reason_code.as_deref(),
+        Some("TIMEOUT_PHASE1_NO_DATA")
+    );
 }
 
 #[test]
@@ -2189,8 +2194,14 @@ fn p4_iwim_buy_to_reject_mutates_reason_code() {
     }
 
     let decision = assessment.decision.expect("decision should remain present");
-    assert_eq!(decision.verdict_type, GatekeeperVerdictType::RejectIwimLowConf);
-    assert_eq!(decision.reason_code, Some(GatekeeperReasonCode::RejectIwimLowConf));
+    assert_eq!(
+        decision.verdict_type,
+        GatekeeperVerdictType::RejectIwimLowConf
+    );
+    assert_eq!(
+        decision.reason_code,
+        Some(GatekeeperReasonCode::RejectIwimLowConf)
+    );
 }
 
 /// P4: feature-driven timeout builder uses the concrete low-phases timeout subtype.
@@ -2421,9 +2432,11 @@ fn p5_shadow_idempotency_key_deterministic() {
 fn p5_shadow_record_has_idempotency_key_field() {
     use ghost_launcher::components::trigger::shadow_run::make_shadow_idempotency_key;
     use ghost_launcher::components::trigger::shadow_run::ShadowBuySimulationRecord;
+    use ghost_launcher::events::ExecutionJoinMetadata;
 
     // Verify the field exists and can be set.
     let record = ShadowBuySimulationRecord {
+        join_metadata: ExecutionJoinMetadata::default(),
         candidate_id: "test".to_string(),
         pool_amm_id: "pool1".to_string(),
         base_mint: "mint1".to_string(),

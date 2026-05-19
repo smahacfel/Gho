@@ -458,8 +458,34 @@ pub struct PoolScoredEvent {
     pub component_scores: serde_json::Value,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionJoinMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ab_record_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v3_feature_snapshot_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v3_policy_config_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_plane: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollout_namespace: Option<String>,
+}
+
+impl ExecutionJoinMetadata {
+    pub fn is_empty(&self) -> bool {
+        self.ab_record_id.is_none()
+            && self.v3_feature_snapshot_hash.is_none()
+            && self.v3_policy_config_hash.is_none()
+            && self.decision_plane.is_none()
+            && self.rollout_namespace.is_none()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShadowBuySimulationEvent {
+    #[serde(default, flatten)]
+    pub join_metadata: ExecutionJoinMetadata,
     pub candidate_id: String,
     pub pool_amm_id: String,
     pub base_mint: String,
@@ -663,6 +689,8 @@ pub enum GhostEvent {
         buy_landed_slot: Option<u64>,
         /// Canonical creator pubkey string used to derive Pump.fun creator_vault for live SELL.
         creator_pubkey: Option<String>,
+        /// Optional decision/shadow join metadata for audit-only correlation.
+        join_metadata: ExecutionJoinMetadata,
     },
 
     /// A compare-only shadow buy simulation finished without sending a real TX.
@@ -781,7 +809,15 @@ impl GhostEvent {
             entry_token_amount_raw,
             buy_landed_slot,
             creator_pubkey,
+            join_metadata: ExecutionJoinMetadata::default(),
         }
+    }
+
+    pub fn with_execution_join_metadata(mut self, metadata: ExecutionJoinMetadata) -> Self {
+        if let GhostEvent::PostBuySubmitted { join_metadata, .. } = &mut self {
+            *join_metadata = metadata;
+        }
+        self
     }
 
     pub fn shadow_buy_simulated(event: ShadowBuySimulationEvent) -> Self {
@@ -1221,6 +1257,7 @@ mod tests {
         }
 
         let shadow = GhostEvent::shadow_buy_simulated(ShadowBuySimulationEvent {
+            join_metadata: ExecutionJoinMetadata::default(),
             candidate_id: build_execution_candidate_id("mint", "pool", "1000"),
             pool_amm_id: "pool".to_string(),
             base_mint: "mint".to_string(),
@@ -1277,6 +1314,7 @@ mod tests {
             None,
         );
         let shadow_event = ShadowBuySimulationEvent {
+            join_metadata: ExecutionJoinMetadata::default(),
             candidate_id: build_execution_candidate_id("mint", "pool", "sig"),
             pool_amm_id: "pool".to_string(),
             base_mint: "mint".to_string(),

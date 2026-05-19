@@ -33,7 +33,7 @@ use crate::execution::backend::{
 use crate::execution::live::LiveBackend;
 use crate::execution::paper::{PaperBackend, PaperBroker};
 use crate::execution::shadow::ShadowBackend;
-use crate::guardian::post_buy::engine::PositionEventContext;
+use crate::guardian::post_buy::engine::{PositionEventContext, PositionJoinMetadata};
 use crate::oracle::MarketSnapshot;
 use crate::quotes::provider::{ExecutableQuoteProvider, QuoteSource};
 
@@ -931,6 +931,7 @@ impl E2EPipeline {
                                 ),
                                 Some(fill.fill_qty),
                                 Some(PositionEventContext {
+                                    join_metadata: PositionJoinMetadata::default(),
                                     candidate_id: prepared_attempt
                                         .attempt
                                         .prepared
@@ -1143,6 +1144,7 @@ impl E2EPipeline {
                             Some(swap_plan.amount_in),
                             Some(fill.fill_qty),
                             Some(PositionEventContext {
+                                join_metadata: PositionJoinMetadata::default(),
                                 candidate_id: candidate_id.clone(),
                                 entry_order_id: order_id.clone(),
                                 quote_id: fill.quote_id_used.clone(),

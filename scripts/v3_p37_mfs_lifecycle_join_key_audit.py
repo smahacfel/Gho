@@ -12,7 +12,7 @@ from typing import Any, Iterable
 from shadow_run_report import load_toml, resolve_config_path, resolve_runtime_path
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DECISION_FILE_NAMES = ("gatekeeper_v2_decisions.jsonl", "gatekeeper_v2_buys.jsonl")
 FIELD_GROUPS = {
     "ab_record_id": ("ab_record_id",),
@@ -123,7 +123,11 @@ def resolve_paths(config_path: Path) -> dict[str, list[Path]]:
         paths["shadow_entry"].append(Path(resolve_runtime_path(resolved, entry_path)))
     lifecycle_path = shadow.get("lifecycle_log_path")
     if lifecycle_path:
-        paths["shadow_lifecycle"].append(Path(resolve_runtime_path(resolved, lifecycle_path)))
+        resolved_lifecycle = Path(resolve_runtime_path(resolved, lifecycle_path))
+        paths["shadow_lifecycle"].append(resolved_lifecycle)
+        onchain_report = resolved_lifecycle.parent / "shadow_onchain_lifecycle_report.jsonl"
+        if onchain_report.exists():
+            paths["shadow_onchain_lifecycle"].append(onchain_report)
     return {key: sorted(set(value)) for key, value in paths.items()}
 
 
@@ -151,16 +155,80 @@ def clean_summary(summary: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in summary.items() if key != "_identifiers"}
 
 
-def readiness(report: dict[str, Any]) -> dict[str, Any]:
-    decision_rows = sum(item["rows"] for item in report["artifacts"].get("decision", []))
-    v3_payload_rows = sum(
-        item["field_counts"].get("v3_replay_payload", 0)
-        for item in report["artifacts"].get("decision", [])
+def artifact_totals(report: dict[str, Any], artifact_type: str, field_group: str | None = None) -> int:
+    if field_group is None:
+        return sum(item["rows"] for item in report["artifacts"].get(artifact_type, []))
+    return sum(
+        item["field_counts"].get(field_group, 0)
+        for item in report["artifacts"].get(artifact_type, [])
     )
-    shadow_entry_rows = sum(item["rows"] for item in report["artifacts"].get("shadow_entry", []))
-    lifecycle_rows = sum(item["rows"] for item in report["artifacts"].get("shadow_lifecycle", []))
-    transport_rows = sum(item["rows"] for item in report["artifacts"].get("shadow_transport", []))
+
+
+def join_quality(report: dict[str, Any]) -> str:
+    intersections = report["cross_artifact_intersections"]
+    ab = intersections.get("ab_record_id", {})
+    candidate = intersections.get("candidate_id", {})
+    pool = intersections.get("pool_id", {})
+    mint = intersections.get("mint", {})
+    nonempty_artifact_count = sum(
+        1 for items in report["artifacts"].values() for item in items if item.get("rows", 0) > 0
+    )
+    if (
+        nonempty_artifact_count > 1
+        and ab.get("artifacts_with_rows", 0) == nonempty_artifact_count
+        and ab.get("common_values", 0) > 0
+    ):
+        return "exact_ab_record_id"
+    if candidate.get("common_values", 0) > 0:
+        return "exact_candidate_id"
+    if pool.get("common_values", 0) > 0 and mint.get("common_values", 0) > 0:
+        return "pool_mint_time_window"
+    if mint.get("common_values", 0) > 0:
+        return "mint_only"
+    return "unmatched"
+
+
+def join_key_coverage(report: dict[str, Any]) -> dict[str, Any]:
+    decision_rows = artifact_totals(report, "decision")
+    transport_rows = artifact_totals(report, "shadow_transport")
+    entry_rows = artifact_totals(report, "shadow_entry")
+    lifecycle_rows = artifact_totals(report, "shadow_lifecycle")
+    onchain_rows = artifact_totals(report, "shadow_onchain_lifecycle")
+    artifact_rows = {
+        "decision": decision_rows,
+        "shadow_transport": transport_rows,
+        "shadow_entry": entry_rows,
+        "shadow_lifecycle": lifecycle_rows,
+        "shadow_onchain_lifecycle": onchain_rows,
+    }
+    artifact_ab_rows = {
+        key: artifact_totals(report, key, "ab_record_id") for key in artifact_rows
+    }
+    nonempty_ab_coverages = [
+        artifact_ab_rows[key] / rows for key, rows in artifact_rows.items() if rows > 0
+    ]
+    return {
+        "decision_rows_with_ab_record_id": artifact_ab_rows["decision"],
+        "shadow_transport_rows_with_ab_record_id": artifact_ab_rows["shadow_transport"],
+        "shadow_entry_rows_with_ab_record_id": artifact_ab_rows["shadow_entry"],
+        "shadow_lifecycle_rows_with_ab_record_id": artifact_ab_rows["shadow_lifecycle"],
+        "onchain_lifecycle_rows_with_ab_record_id": artifact_ab_rows["shadow_onchain_lifecycle"],
+        "full_chain_ab_record_id_coverage": round(min(nonempty_ab_coverages), 6)
+        if nonempty_ab_coverages
+        else 0.0,
+        "join_quality": join_quality(report),
+    }
+
+
+def readiness(report: dict[str, Any]) -> dict[str, Any]:
+    decision_rows = artifact_totals(report, "decision")
+    v3_payload_rows = artifact_totals(report, "decision", "v3_replay_payload")
+    shadow_entry_rows = artifact_totals(report, "shadow_entry")
+    lifecycle_rows = artifact_totals(report, "shadow_lifecycle")
+    transport_rows = artifact_totals(report, "shadow_transport")
     candidate_common = report["cross_artifact_intersections"].get("candidate_id", {}).get("common_values", 0)
+    exact_ab_common = report["cross_artifact_intersections"].get("ab_record_id", {}).get("common_values", 0)
+    quality = report.get("join_key_coverage", {}).get("join_quality") or join_quality(report)
     status = "ready_for_lifecycle_feature_join"
     reasons: list[str] = []
     if decision_rows <= 0:
@@ -178,12 +246,16 @@ def readiness(report: dict[str, Any]) -> dict[str, Any]:
     if lifecycle_rows <= 0:
         status = "not_ready"
         reasons.append("missing_shadow_lifecycle_rows")
-    if candidate_common <= 0:
+    if exact_ab_common <= 0:
+        status = "degraded" if status != "not_ready" else status
+        reasons.append("no_common_ab_record_id_across_nonempty_artifacts")
+    if candidate_common <= 0 and exact_ab_common <= 0:
         status = "degraded" if status != "not_ready" else status
         reasons.append("no_common_candidate_id_across_nonempty_artifacts")
     return {
         "status": status,
         "reasons": reasons,
+        "join_quality": quality,
         "decision_rows": decision_rows,
         "v3_payload_rows": v3_payload_rows,
         "shadow_transport_rows": transport_rows,
@@ -208,6 +280,7 @@ def build_report(config_path: Path) -> dict[str, Any]:
         "artifacts": artifacts,
         "cross_artifact_intersections": intersection_counts(with_ids),
     }
+    report["join_key_coverage"] = join_key_coverage(report)
     report["readiness"] = readiness(report)
     return report
 
@@ -218,7 +291,14 @@ def render_markdown(report: dict[str, Any]) -> str:
         "",
         f"- config: `{report['config_path']}`",
         f"- readiness: `{report['readiness']['status']}`",
+        f"- join_quality: `{report['join_key_coverage']['join_quality']}`",
+        f"- full_chain_ab_record_id_coverage: `{report['join_key_coverage']['full_chain_ab_record_id_coverage']}`",
         f"- readiness_reasons: `{json.dumps(report['readiness']['reasons'], ensure_ascii=False)}`",
+        f"- decision_rows_with_ab_record_id: `{report['join_key_coverage']['decision_rows_with_ab_record_id']}`",
+        f"- shadow_transport_rows_with_ab_record_id: `{report['join_key_coverage']['shadow_transport_rows_with_ab_record_id']}`",
+        f"- shadow_entry_rows_with_ab_record_id: `{report['join_key_coverage']['shadow_entry_rows_with_ab_record_id']}`",
+        f"- shadow_lifecycle_rows_with_ab_record_id: `{report['join_key_coverage']['shadow_lifecycle_rows_with_ab_record_id']}`",
+        f"- onchain_lifecycle_rows_with_ab_record_id: `{report['join_key_coverage']['onchain_lifecycle_rows_with_ab_record_id']}`",
         "",
         "## Artifact Coverage",
         "",

@@ -32,6 +32,13 @@ PUMP_TOKEN_DECIMAL_FACTOR = 1_000_000
 PUMP_TOKEN_DECIMAL_FACTOR_F64 = float(PUMP_TOKEN_DECIMAL_FACTOR)
 LEGACY_PRICE_SCALE = PUMP_TOKEN_DECIMAL_FACTOR_F64
 DEFAULT_MAX_BUY_MATCH_DRIFT_MS = 60_000
+JOIN_METADATA_FIELDS = (
+    "ab_record_id",
+    "v3_feature_snapshot_hash",
+    "v3_policy_config_hash",
+    "decision_plane",
+    "rollout_namespace",
+)
 ISO_TS_RE = re.compile(
     r"^(?P<head>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?P<fraction>\.\d+)?(?P<tz>Z|[+-]\d{2}:\d{2})$"
 )
@@ -62,6 +69,7 @@ class Inputs:
 
 @dataclass(slots=True)
 class ShadowTransportRecord:
+    join_metadata: dict[str, str | None]
     candidate_id: str
     base_mint: str
     pool_id: str
@@ -75,6 +83,7 @@ class ShadowTransportRecord:
 
 @dataclass(slots=True)
 class ShadowEntryRecord:
+    join_metadata: dict[str, str | None]
     candidate_id: str
     pool_id: str
     mint_id: str
@@ -86,6 +95,7 @@ class ShadowEntryRecord:
 
 @dataclass(slots=True)
 class ExitFillRow:
+    join_metadata: dict[str, str | None]
     ordinal: int
     candidate_id: str
     position_id: str | None
@@ -108,6 +118,7 @@ class ExitFillRow:
 
 @dataclass(slots=True)
 class PositionClosedRow:
+    join_metadata: dict[str, str | None]
     candidate_id: str
     position_id: str | None
     pool_id: str
@@ -151,6 +162,7 @@ class ScopeStats:
 
 @dataclass(slots=True)
 class GatekeeperBuyRow:
+    join_metadata: dict[str, str | None]
     pool_id: str
     base_mint: str
     first_seen_ts_ms: int | None
@@ -401,6 +413,27 @@ def int_or_none(value: Any) -> int | None:
     return int(value) if isinstance(value, (int, float)) else None
 
 
+def str_or_none(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def join_metadata_from_row(row: dict[str, Any]) -> dict[str, str | None]:
+    return {field: str_or_none(row.get(field)) for field in JOIN_METADATA_FIELDS}
+
+
+def coalesce_join_metadata(
+    *metadata_sources: dict[str, str | None] | None,
+) -> dict[str, str | None]:
+    merged: dict[str, str | None] = {field: None for field in JOIN_METADATA_FIELDS}
+    for metadata in metadata_sources:
+        if not metadata:
+            continue
+        for field in JOIN_METADATA_FIELDS:
+            if merged[field] is None:
+                merged[field] = str_or_none(metadata.get(field))
+    return merged
+
+
 def lamports_to_sol(value: int | float) -> float:
     return float(value) / LAMPORTS_PER_SOL
 
@@ -497,6 +530,7 @@ def load_shadow_transport_records(inputs: Inputs) -> dict[str, ShadowTransportRe
         if not in_window(candidate_id, decision_ts_ms, inputs.session_start_ms, inputs.session_end_ms):
             continue
         records[candidate_id] = ShadowTransportRecord(
+            join_metadata=join_metadata_from_row(row),
             candidate_id=candidate_id,
             base_mint=str(row.get("base_mint", "")),
             pool_id=str(row.get("pool_amm_id", "")),
@@ -522,6 +556,7 @@ def load_shadow_entries(inputs: Inputs) -> dict[str, ShadowEntryRecord]:
         if not in_window(candidate_id, timestamp_ms, inputs.session_start_ms, inputs.session_end_ms):
             continue
         records[candidate_id] = ShadowEntryRecord(
+            join_metadata=join_metadata_from_row(row),
             candidate_id=candidate_id,
             pool_id=str(row.get("pool_id", "")),
             mint_id=str(row.get("mint_id", "")),
@@ -552,6 +587,7 @@ def load_lifecycle(inputs: Inputs) -> dict[str, LifecycleBundle]:
         if record_type == "exit_filled":
             bundle.exit_fills.append(
                 ExitFillRow(
+                    join_metadata=join_metadata_from_row(row),
                     ordinal=exit_ordinal,
                     candidate_id=candidate_id,
                     position_id=row.get("position_id")
@@ -583,6 +619,7 @@ def load_lifecycle(inputs: Inputs) -> dict[str, LifecycleBundle]:
             exit_ordinal += 1
         elif record_type == "position_closed":
             bundle.position_closed = PositionClosedRow(
+                join_metadata=join_metadata_from_row(row),
                 candidate_id=candidate_id,
                 position_id=row.get("position_id") if isinstance(row.get("position_id"), str) else None,
                 pool_id=str(row.get("pool_id", "")),
@@ -689,6 +726,7 @@ def load_gatekeeper_buys(inputs: Inputs) -> dict[tuple[str, str], list[Gatekeepe
             continue
         rows_by_key[(base_mint, pool_id)].append(
             GatekeeperBuyRow(
+                join_metadata=join_metadata_from_row(row),
                 pool_id=pool_id,
                 base_mint=base_mint,
                 first_seen_ts_ms=first_seen_ts_ms,
@@ -1283,6 +1321,15 @@ def analyze_positions(
             },
             "exit_fills": exit_fill_rows,
         }
+        row.update(
+            coalesce_join_metadata(
+                transport.join_metadata,
+                entry.join_metadata if entry is not None else None,
+                closed.join_metadata,
+                gatekeeper_buy.join_metadata if gatekeeper_buy is not None else None,
+                *(fill.join_metadata for fill in lifecycle.exit_fills),
+            )
+        )
         rows.append(row)
     return rows, skipped
 

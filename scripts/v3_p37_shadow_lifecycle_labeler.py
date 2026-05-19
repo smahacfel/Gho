@@ -18,6 +18,13 @@ from typing import Any, Iterable
 
 
 SCHEMA_VERSION = 1
+JOIN_METADATA_FIELDS = (
+    "ab_record_id",
+    "v3_feature_snapshot_hash",
+    "v3_policy_config_hash",
+    "decision_plane",
+    "rollout_namespace",
+)
 GOOD_EXECUTION_CLASSES = {
     "shadow_onchain_finalized_verified",
     "shadow_onchain_confirmed_verified",
@@ -319,7 +326,7 @@ def build_label(row: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]
     else:
         label_quality = "clean"
 
-    return {
+    label = {
         "schema_version": SCHEMA_VERSION,
         "candidate_id": row.get("candidate_id"),
         "position_id": row.get("position_id"),
@@ -363,6 +370,9 @@ def build_label(row: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]
         "unknown_reason": ";".join(sorted(set(unknown_reasons))) if unknown_reasons else None,
         "degraded_reasons": sorted(set(degraded_reasons)),
     }
+    for field in JOIN_METADATA_FIELDS:
+        label[field] = row.get(field) if isinstance(row.get(field), str) else None
+    return label
 
 
 def build_labels(rows: list[dict[str, Any]], args: argparse.Namespace) -> list[dict[str, Any]]:

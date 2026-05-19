@@ -1,7 +1,9 @@
 use crate::components::trigger::component::PreparedBuyRequest;
 use crate::components::trigger::component::TriggerDispatchFailureContext;
 use crate::config::{ShadowRunCommitment, TriggerEntryMode, TriggerShadowRunConfig};
-use crate::events::{build_execution_candidate_id, ShadowBuySimulationEvent};
+use crate::events::{
+    build_execution_candidate_id, ExecutionJoinMetadata, ShadowBuySimulationEvent,
+};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use blake3::Hasher;
@@ -72,11 +74,12 @@ impl ShadowDispatchStatus {
             ShadowDispatchStatus::Closed => "closed",
         }
     }
-
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct ShadowDispatchLifecycleRecord {
+    #[serde(default, flatten)]
+    pub join_metadata: ExecutionJoinMetadata,
     pub record_type: String,
     pub dispatch_id: String,
     pub idempotency_key: String,
@@ -129,6 +132,7 @@ impl ShadowDispatchLifecycleRecord {
             make_shadow_idempotency_key(&record.pool_amm_id, &join_key, &rollout_profile)
         });
         ShadowDispatchLifecycleRecord {
+            join_metadata: record.join_metadata.clone(),
             record_type: "shadow_dispatch".to_string(),
             dispatch_id: format!("shadow-dispatch:{idempotency_key}"),
             idempotency_key,
@@ -166,9 +170,9 @@ impl ShadowDispatchLifecycleRecord {
     ) -> ShadowDispatchLifecycleRecord {
         let join_key = join_key.into();
         let rollout_profile = rollout_profile.into();
-        let idempotency_key =
-            make_shadow_idempotency_key(pool_amm_id, &join_key, &rollout_profile);
+        let idempotency_key = make_shadow_idempotency_key(pool_amm_id, &join_key, &rollout_profile);
         ShadowDispatchLifecycleRecord {
+            join_metadata: request.join_metadata.clone(),
             record_type: "shadow_dispatch".to_string(),
             dispatch_id: format!("shadow-dispatch:{idempotency_key}"),
             idempotency_key,
@@ -236,6 +240,8 @@ impl ShadowDispatchLifecycleRecord {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ShadowBuySimulationReport {
+    #[serde(default, flatten)]
+    pub join_metadata: ExecutionJoinMetadata,
     pub mint: String,
     pub live_signature: Option<String>,
     pub payer_pubkey: String,
@@ -261,6 +267,8 @@ pub struct ShadowBuySimulationReport {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct ShadowBuySimulationRecord {
+    #[serde(default, flatten)]
+    pub join_metadata: ExecutionJoinMetadata,
     pub candidate_id: String,
     pub pool_amm_id: String,
     pub base_mint: String,
@@ -361,6 +369,7 @@ impl ShadowBuySimulationRecord {
     ) -> ShadowBuySimulationRecord {
         let diagnostics = shadow_error_diagnostics(event.err.as_deref());
         ShadowBuySimulationRecord {
+            join_metadata: event.join_metadata.clone(),
             candidate_id: event.candidate_id.clone(),
             pool_amm_id: event.pool_amm_id.clone(),
             base_mint: event.base_mint.clone(),
@@ -405,6 +414,7 @@ impl ShadowBuySimulationRecord {
         let err_string = err.to_string();
         let diagnostics = shadow_error_diagnostics(Some(&err_string));
         ShadowBuySimulationRecord {
+            join_metadata: request.join_metadata.clone(),
             candidate_id: build_execution_candidate_id(
                 base_mint,
                 pool_amm_id,
@@ -448,6 +458,7 @@ impl ShadowBuySimulationRecord {
         let err_string = err.to_string();
         let diagnostics = shadow_error_diagnostics(Some(&err_string));
         ShadowBuySimulationRecord {
+            join_metadata: context.join_metadata.clone(),
             candidate_id: build_execution_candidate_id(
                 base_mint,
                 pool_amm_id,
@@ -508,6 +519,7 @@ pub fn shadow_failure_event_from_request(
     let err_string = err.to_string();
     let diagnostics = shadow_error_diagnostics(Some(&err_string));
     ShadowBuySimulationEvent {
+        join_metadata: request.join_metadata.clone(),
         candidate_id: build_execution_candidate_id(
             base_mint,
             pool_amm_id,
@@ -553,6 +565,7 @@ pub fn shadow_failure_event_from_context(
     let err_string = err.to_string();
     let diagnostics = shadow_error_diagnostics(Some(&err_string));
     ShadowBuySimulationEvent {
+        join_metadata: context.join_metadata.clone(),
         candidate_id: build_execution_candidate_id(
             base_mint,
             pool_amm_id,
@@ -595,6 +608,7 @@ pub(crate) fn shadow_buy_event_from_report(
     report: ShadowBuySimulationReport,
 ) -> ShadowBuySimulationEvent {
     let ShadowBuySimulationReport {
+        join_metadata,
         mint,
         live_signature,
         payer_pubkey,
@@ -621,6 +635,7 @@ pub(crate) fn shadow_buy_event_from_report(
         .unwrap_or_else(|| decision_ts_ms.to_string());
     let diagnostics = shadow_error_diagnostics(err.as_deref());
     ShadowBuySimulationEvent {
+        join_metadata,
         candidate_id: build_execution_candidate_id(base_mint, pool_amm_id, trace_ref),
         pool_amm_id: pool_amm_id.to_string(),
         base_mint: base_mint.to_string(),
@@ -1109,6 +1124,7 @@ impl ShadowSimulator for RpcShadowSimulator {
                         }
                     };
                     return Ok(ShadowBuySimulationReport {
+                        join_metadata: request.join_metadata.clone(),
                         mint: request.mint.to_string(),
                         live_signature: None,
                         payer_pubkey: request.payer_pubkey.to_string(),
@@ -1172,6 +1188,7 @@ mod tests {
 
     fn sample_event(live_signature: Option<&str>, err: Option<&str>) -> ShadowBuySimulationEvent {
         ShadowBuySimulationEvent {
+            join_metadata: ExecutionJoinMetadata::default(),
             candidate_id: build_execution_candidate_id(
                 "mint",
                 "pool",
@@ -1217,6 +1234,7 @@ mod tests {
             1,
         );
         PreparedBuyRequest {
+            join_metadata: ExecutionJoinMetadata::default(),
             mint: solana_sdk::pubkey::Pubkey::new_unique(),
             payer_pubkey: payer.pubkey(),
             payer_provenance: "configured",
@@ -1383,7 +1401,10 @@ mod tests {
         let join_key = make_shadow_join_key("pool", "mint", 1000);
         let record = ShadowBuySimulationRecord::from_event(
             TriggerEntryMode::ShadowOnly,
-            &sample_event(None, Some("ConstraintSeeds: InstructionError(3, Custom(2006))")),
+            &sample_event(
+                None,
+                Some("ConstraintSeeds: InstructionError(3, Custom(2006))"),
+            ),
         )
         .with_lifecycle_identity(join_key.clone(), "shadow-burnin");
 
@@ -1393,7 +1414,10 @@ mod tests {
             "shadow-burnin",
         );
 
-        assert_eq!(lifecycle_record.dispatch_status, ShadowDispatchStatus::Failed);
+        assert_eq!(
+            lifecycle_record.dispatch_status,
+            ShadowDispatchStatus::Failed
+        );
         assert_eq!(
             lifecycle_record.classification,
             "seed_mismatch_constraint_seeds"
@@ -1415,7 +1439,10 @@ mod tests {
             "shadow-burnin",
         );
 
-        assert_eq!(lifecycle_record.dispatch_status, ShadowDispatchStatus::Closed);
+        assert_eq!(
+            lifecycle_record.dispatch_status,
+            ShadowDispatchStatus::Closed
+        );
         assert_eq!(lifecycle_record.classification, "simulation_completed");
     }
 
@@ -1496,6 +1523,7 @@ mod tests {
             1,
         );
         let request = PreparedBuyRequest {
+            join_metadata: ExecutionJoinMetadata::default(),
             mint: solana_sdk::pubkey::Pubkey::new_unique(),
             payer_pubkey: payer.pubkey(),
             payer_provenance: "configured",
@@ -1633,6 +1661,7 @@ mod tests {
     fn shadow_failure_preserves_prepare_retry_count_in_record() {
         let err = anyhow!(ShadowPreparationError::new("mint fetch failed", 4));
         let context = TriggerDispatchFailureContext {
+            join_metadata: ExecutionJoinMetadata::default(),
             amount_lamports: 100,
             tip_lamports: 10,
             decision_ts_ms: 10,
@@ -1659,6 +1688,7 @@ mod tests {
     fn shadow_failure_context_builds_record() {
         let err = anyhow!("preflight failed");
         let context = TriggerDispatchFailureContext {
+            join_metadata: ExecutionJoinMetadata::default(),
             amount_lamports: 100,
             tip_lamports: 10,
             decision_ts_ms: 10,
@@ -1687,6 +1717,7 @@ mod tests {
     fn shadow_failure_event_carries_full_diagnostics_and_payer_pubkey() {
         let err = anyhow!("InstructionError(3, Custom(2006))");
         let context = TriggerDispatchFailureContext {
+            join_metadata: ExecutionJoinMetadata::default(),
             amount_lamports: 100,
             tip_lamports: 10,
             decision_ts_ms: 10,
@@ -1713,5 +1744,32 @@ mod tests {
             event.error_detail_class.as_deref(),
             Some("seed_mismatch_constraint_seeds")
         );
+    }
+
+    #[test]
+    fn shadow_join_metadata_flows_from_request_to_transport_and_dispatch_records() {
+        let metadata = ExecutionJoinMetadata {
+            ab_record_id: Some("pool:1000:11000:BUY".to_string()),
+            v3_feature_snapshot_hash: Some("feature-hash".to_string()),
+            v3_policy_config_hash: Some("policy-hash".to_string()),
+            decision_plane: Some("legacy_live".to_string()),
+            rollout_namespace: Some("r14-smoke".to_string()),
+        };
+        let request =
+            sample_prepared_buy_request(Some(0), true).with_join_metadata(metadata.clone());
+        let err = anyhow!("preflight failed");
+
+        let event = shadow_failure_event_from_request("pool", "mint", &request, None, &err);
+        assert_eq!(event.join_metadata, metadata);
+
+        let record = ShadowBuySimulationRecord::from_event(TriggerEntryMode::ShadowOnly, &event);
+        assert_eq!(record.join_metadata, metadata);
+
+        let dispatch = ShadowDispatchLifecycleRecord::failed_from_shadow_buy_record(
+            &record,
+            "join-key",
+            "r14-smoke",
+        );
+        assert_eq!(dispatch.join_metadata, metadata);
     }
 }

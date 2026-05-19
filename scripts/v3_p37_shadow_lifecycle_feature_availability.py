@@ -328,14 +328,22 @@ def load_decision_rows(paths: list[Path]) -> list[DecisionRow]:
     return rows
 
 
-def index_decisions(rows: list[DecisionRow]) -> dict[tuple[str, str], list[DecisionRow]]:
-    indexed: dict[tuple[str, str], list[DecisionRow]] = defaultdict(list)
+def index_decisions(rows: list[DecisionRow]) -> dict[str, dict[Any, list[DecisionRow]]]:
+    by_pool: dict[tuple[str, str], list[DecisionRow]] = defaultdict(list)
+    by_ab: dict[str, list[DecisionRow]] = defaultdict(list)
+    by_candidate: dict[str, list[DecisionRow]] = defaultdict(list)
     for decision in rows:
         base_mint = decision.row.get("base_mint")
         pool_id = decision.row.get("pool_id")
         if isinstance(base_mint, str) and isinstance(pool_id, str):
-            indexed[(base_mint, pool_id)].append(decision)
-    return indexed
+            by_pool[(base_mint, pool_id)].append(decision)
+        ab_record_id = decision.row.get("ab_record_id")
+        if isinstance(ab_record_id, str) and ab_record_id:
+            by_ab[ab_record_id].append(decision)
+        candidate_id = decision.row.get("candidate_id") or decision.row.get("execution_candidate_id")
+        if isinstance(candidate_id, str) and candidate_id:
+            by_candidate[candidate_id].append(decision)
+    return {"by_pool": by_pool, "by_ab": by_ab, "by_candidate": by_candidate}
 
 
 def decision_anchors(decision: DecisionRow) -> list[int]:
@@ -361,16 +369,28 @@ def plane_priority(decision: DecisionRow) -> int:
 
 def match_label(
     label: dict[str, Any],
-    indexed: dict[tuple[str, str], list[DecisionRow]],
+    indexed: dict[str, dict[Any, list[DecisionRow]]],
     *,
     max_match_drift_ms: int,
 ) -> MatchResult:
+    ab_record_id = label.get("ab_record_id")
+    if isinstance(ab_record_id, str) and ab_record_id:
+        matches = indexed["by_ab"].get(ab_record_id, [])
+        if matches:
+            matches = sorted(matches, key=lambda decision: (plane_priority(decision), str(decision.path)))
+            return MatchResult(matches[0], "matched_by_ab_record_id", len(matches) > 1, 0)
+    candidate_id = label.get("candidate_id")
+    if isinstance(candidate_id, str) and candidate_id:
+        matches = indexed["by_candidate"].get(candidate_id, [])
+        if matches:
+            matches = sorted(matches, key=lambda decision: (plane_priority(decision), str(decision.path)))
+            return MatchResult(matches[0], "matched_by_candidate_id", len(matches) > 1, 0)
     base_mint = label.get("base_mint")
     pool_id = label.get("pool_id")
     anchor_ts = finite_int(label.get("decision_ts_ms")) or finite_int(label.get("entry_execution_ts_ms"))
     if not isinstance(base_mint, str) or not isinstance(pool_id, str) or anchor_ts is None:
         return MatchResult(None, "unmatched", False, None)
-    candidates = indexed.get((base_mint, pool_id), [])
+    candidates = indexed["by_pool"].get((base_mint, pool_id), [])
     if not candidates:
         return MatchResult(None, "unmatched", False, None)
     scored: list[tuple[tuple[int, int, int, int, int], DecisionRow]] = []
@@ -619,7 +639,8 @@ def build_report(
         "gatekeeper_context_split": counter_dict(context_counts),
         "close_reason_counts": counter_dict(close_reason_counts),
         "join_quality_counts": {
-            "matched_by_candidate_id": 0,
+            "matched_by_ab_record_id": join_quality.get("matched_by_ab_record_id", 0),
+            "matched_by_candidate_id": join_quality.get("matched_by_candidate_id", 0),
             "matched_by_position_id": 0,
             "matched_by_pool_mint": 0,
             "matched_by_time_window": join_quality.get("matched_by_pool_mint_time_window", 0),

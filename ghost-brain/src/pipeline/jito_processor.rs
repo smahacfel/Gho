@@ -17,7 +17,10 @@ use crate::execution::backend::{
     FillStatus as ExecFillStatus, Lane, MIN_SHADOW_TX_BUILD_COMPENSATION_MS,
 };
 use crate::execution::live::LiveBackend;
-use crate::guardian::post_buy::{engine::PositionEventContext, MonitoringEngine};
+use crate::guardian::post_buy::{
+    engine::{PositionEventContext, PositionJoinMetadata},
+    MonitoringEngine,
+};
 use crate::jito_bundle::{JitoBundleExecutor, SwapIntent};
 use crate::leader_predictor::LeaderPredictor;
 use crate::metrics::E2EMetrics;
@@ -463,6 +466,7 @@ impl E2EPipeline {
                             prepared_attempts
                                 .get(idx)
                                 .map(|attempt| PositionEventContext {
+                                    join_metadata: PositionJoinMetadata::default(),
                                     candidate_id: attempt.prepared.candidate_id().to_string(),
                                     entry_order_id: attempt.prepared.order_id.clone(),
                                     quote_id: attempt.prepared.quote.quote_id.clone(),

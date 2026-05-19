@@ -364,6 +364,7 @@ struct MonitoredPosition {
     remaining_token_amount_raw: u64,
     position_id: String,
     position_epoch: u64,
+    join_metadata: PositionJoinMetadata,
     entry_order_id: String,
     quote_id: String,
     slot: Option<u64>,
@@ -410,6 +411,7 @@ struct TimestampedSignal {
 /// Registration context passed from the execution lane to keep IDs consistent.
 #[derive(Debug, Clone)]
 pub struct PositionEventContext {
+    pub join_metadata: PositionJoinMetadata,
     pub candidate_id: String,
     pub entry_order_id: String,
     pub quote_id: String,
@@ -417,6 +419,15 @@ pub struct PositionEventContext {
     pub lane: Lane,
     pub position_id: Option<String>,
     pub position_epoch: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PositionJoinMetadata {
+    pub ab_record_id: Option<String>,
+    pub v3_feature_snapshot_hash: Option<String>,
+    pub v3_policy_config_hash: Option<String>,
+    pub decision_plane: Option<String>,
+    pub rollout_namespace: Option<String>,
 }
 
 /// Minimal position identity returned after successful registration.
@@ -437,6 +448,16 @@ enum ShadowLifecycleRecordType {
 
 #[derive(Debug, Serialize)]
 struct ShadowLifecycleRecord {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ab_record_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    v3_feature_snapshot_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    v3_policy_config_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decision_plane: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rollout_namespace: Option<String>,
     record_type: ShadowLifecycleRecordType,
     timestamp: String,
     timestamp_ms: u64,
@@ -1060,6 +1081,11 @@ impl MonitoringEngine {
         evidence: &PriceTruthEvidence,
     ) -> ShadowLifecycleRecord {
         ShadowLifecycleRecord {
+            ab_record_id: pos.join_metadata.ab_record_id.clone(),
+            v3_feature_snapshot_hash: pos.join_metadata.v3_feature_snapshot_hash.clone(),
+            v3_policy_config_hash: pos.join_metadata.v3_policy_config_hash.clone(),
+            decision_plane: pos.join_metadata.decision_plane.clone(),
+            rollout_namespace: pos.join_metadata.rollout_namespace.clone(),
             record_type,
             timestamp: chrono::Utc::now().to_rfc3339(),
             timestamp_ms: now_ms,
@@ -1239,6 +1265,7 @@ impl MonitoringEngine {
         let now_ms = current_time_ms();
         let fallback_candidate_id = Self::default_candidate_id(pool_amm_id, base_mint, now_ms);
         let event_context = context.unwrap_or(PositionEventContext {
+            join_metadata: PositionJoinMetadata::default(),
             candidate_id: fallback_candidate_id,
             entry_order_id: format!("entry-open-{}", now_ms),
             quote_id: format!("quote-open-{}", now_ms),
@@ -1272,6 +1299,7 @@ impl MonitoringEngine {
             remaining_token_amount_raw: entry_token_amount_raw.unwrap_or(0),
             position_id: position_id.clone(),
             position_epoch,
+            join_metadata: event_context.join_metadata.clone(),
             entry_order_id: event_context.entry_order_id.clone(),
             quote_id: event_context.quote_id.clone(),
             slot: event_context.slot,
@@ -4009,6 +4037,7 @@ mod tests {
             Some(1_000_000),
             Some(1_000),
             Some(PositionEventContext {
+                join_metadata: PositionJoinMetadata::default(),
                 candidate_id: "cand-shadow-lazy".to_string(),
                 entry_order_id: "shadow-entry-1".to_string(),
                 quote_id: "shadow-quote-1".to_string(),
@@ -4063,6 +4092,7 @@ mod tests {
             Some(1_000_000_000),
             Some(1_000_000),
             Some(PositionEventContext {
+                join_metadata: PositionJoinMetadata::default(),
                 candidate_id: "cand-shadow-gap".to_string(),
                 entry_order_id: "shadow-entry-gap".to_string(),
                 quote_id: "shadow-quote-gap".to_string(),
@@ -4085,6 +4115,58 @@ mod tests {
             lifecycle_rows.is_empty(),
             "unexpected lifecycle rows before first shadow snapshot: {lifecycle_rows:?}"
         );
+    }
+
+    #[test]
+    fn shadow_lifecycle_join_metadata_is_inherited_from_position_context() {
+        let tmp = TempDir::new().expect("tempdir");
+        let lifecycle_log = tmp.path().join("shadow_lifecycle.jsonl");
+
+        let config = PostBuyGuardianConfig::default();
+        let shadow_ledger = Arc::new(ShadowLedger::new());
+        let (tx, _rx) = mpsc::channel(16);
+        let mut engine = MonitoringEngine::new(config, Arc::clone(&shadow_ledger), tx);
+        engine.set_shadow_lifecycle_log_path(Some(lifecycle_log.clone()));
+        let engine = Arc::new(engine);
+
+        let mint = Pubkey::new_unique();
+        let join_metadata = PositionJoinMetadata {
+            ab_record_id: Some("pool:1000:11000:BUY".to_string()),
+            v3_feature_snapshot_hash: Some("feature-hash".to_string()),
+            v3_policy_config_hash: Some("policy-hash".to_string()),
+            decision_plane: Some("legacy_live".to_string()),
+            rollout_namespace: Some("r14-smoke".to_string()),
+        };
+        let registered = engine.register_position_with_context(
+            Pubkey::new_unique(),
+            mint,
+            Pubkey::new_unique(),
+            Some(1.0),
+            Some(1_000_000_000),
+            Some(1_000_000),
+            Some(PositionEventContext {
+                join_metadata,
+                candidate_id: "cand-shadow-join".to_string(),
+                entry_order_id: "shadow-entry-join".to_string(),
+                quote_id: "shadow-quote-join".to_string(),
+                slot: Some(88),
+                lane: Lane::Shadow,
+                position_id: Some("shadow:test:join".to_string()),
+                position_epoch: Some(5),
+            }),
+        );
+        assert!(registered.is_some());
+
+        engine.unregister_position(&mint);
+
+        let lifecycle_rows = read_jsonl_rows(&lifecycle_log);
+        assert_eq!(lifecycle_rows.len(), 1);
+        let row = &lifecycle_rows[0];
+        assert_eq!(row["ab_record_id"], "pool:1000:11000:BUY");
+        assert_eq!(row["v3_feature_snapshot_hash"], "feature-hash");
+        assert_eq!(row["v3_policy_config_hash"], "policy-hash");
+        assert_eq!(row["decision_plane"], "legacy_live");
+        assert_eq!(row["rollout_namespace"], "r14-smoke");
     }
 
     #[tokio::test]
@@ -4115,6 +4197,7 @@ mod tests {
             Some(1_000_000_000),
             Some(1_000_000),
             Some(PositionEventContext {
+                join_metadata: PositionJoinMetadata::default(),
                 candidate_id: "cand-shadow-close".to_string(),
                 entry_order_id: "shadow-entry-close".to_string(),
                 quote_id: "shadow-quote-close".to_string(),
@@ -4253,6 +4336,7 @@ mod tests {
             Some(1_000_000_000),
             Some(1_000_000),
             Some(PositionEventContext {
+                join_metadata: PositionJoinMetadata::default(),
                 candidate_id: "cand-shadow-simple-tp".to_string(),
                 entry_order_id: "shadow-entry-simple-tp".to_string(),
                 quote_id: "shadow-quote-simple-tp".to_string(),
@@ -4328,6 +4412,7 @@ mod tests {
             Some(1_000_000_000),
             Some(1_000_000),
             Some(PositionEventContext {
+                join_metadata: PositionJoinMetadata::default(),
                 candidate_id: "cand-shadow-simple-sl".to_string(),
                 entry_order_id: "shadow-entry-simple-sl".to_string(),
                 quote_id: "shadow-quote-simple-sl".to_string(),
@@ -4402,6 +4487,7 @@ mod tests {
             Some(1_000_000_000),
             Some(1_000_000),
             Some(PositionEventContext {
+                join_metadata: PositionJoinMetadata::default(),
                 candidate_id: "cand-shadow-time-stop".to_string(),
                 entry_order_id: "shadow-entry-time-stop".to_string(),
                 quote_id: "shadow-quote-time-stop".to_string(),
@@ -4495,6 +4581,7 @@ mod tests {
             Some(1_000_000_000),
             Some(1_000_000),
             Some(PositionEventContext {
+                join_metadata: PositionJoinMetadata::default(),
                 candidate_id: candidate_id.clone(),
                 entry_order_id: "shadow-entry-expired-time-stop".to_string(),
                 quote_id: "shadow-quote-expired-time-stop".to_string(),
@@ -4604,6 +4691,7 @@ mod tests {
                 Some(1_000_000_000),
                 Some(1_000_000),
                 Some(PositionEventContext {
+                    join_metadata: PositionJoinMetadata::default(),
                     candidate_id: "cand-shadow-inactivity-guard".to_string(),
                     entry_order_id: "shadow-entry-inactivity-guard".to_string(),
                     quote_id: "shadow-quote-inactivity-guard".to_string(),
@@ -4678,6 +4766,7 @@ mod tests {
             Some(1_000_000_000),
             Some(1_000_000),
             Some(PositionEventContext {
+                join_metadata: PositionJoinMetadata::default(),
                 candidate_id: "cand-shadow-time-stop-cached".to_string(),
                 entry_order_id: "shadow-entry-time-stop-cached".to_string(),
                 quote_id: "shadow-quote-time-stop-cached".to_string(),
@@ -4794,6 +4883,7 @@ mod tests {
                 Some(1_000_000_000),
                 Some(1_000_000),
                 Some(PositionEventContext {
+                    join_metadata: PositionJoinMetadata::default(),
                     candidate_id: "cand-shadow-current-curve".to_string(),
                     entry_order_id: "shadow-entry-current-curve".to_string(),
                     quote_id: "shadow-quote-current-curve".to_string(),
@@ -4918,6 +5008,7 @@ mod tests {
                 Some(1_000_000_000),
                 Some(1_000_000),
                 Some(PositionEventContext {
+                    join_metadata: PositionJoinMetadata::default(),
                     candidate_id: "cand-shadow-account-state-core".to_string(),
                     entry_order_id: "shadow-entry-account-state-core".to_string(),
                     quote_id: "shadow-quote-account-state-core".to_string(),
@@ -5046,6 +5137,7 @@ mod tests {
                 Some(1_000_000_000),
                 Some(1_000_000),
                 Some(PositionEventContext {
+                    join_metadata: PositionJoinMetadata::default(),
                     candidate_id: "cand-shadow-current-canonical-runtime".to_string(),
                     entry_order_id: "shadow-entry-current-canonical-runtime".to_string(),
                     quote_id: "shadow-quote-current-canonical-runtime".to_string(),
@@ -5167,6 +5259,7 @@ mod tests {
                 Some(1_000_000_000),
                 Some(1_000_000),
                 Some(PositionEventContext {
+                    join_metadata: PositionJoinMetadata::default(),
                     candidate_id: "cand-shadow-current-canonical-guard".to_string(),
                     entry_order_id: "shadow-entry-current-canonical-guard".to_string(),
                     quote_id: "shadow-quote-current-canonical-guard".to_string(),
@@ -5211,6 +5304,7 @@ mod tests {
                 Some(1_000_000_000),
                 Some(1_000_000),
                 Some(PositionEventContext {
+                    join_metadata: PositionJoinMetadata::default(),
                     candidate_id: "cand-outcome-timeline".to_string(),
                     entry_order_id: "shadow-entry-outcome-timeline".to_string(),
                     quote_id: "shadow-quote-outcome-timeline".to_string(),
@@ -5294,6 +5388,7 @@ mod tests {
             Some(7_000_000),
             Some(120_080_136_032),
             Some(PositionEventContext {
+                join_metadata: PositionJoinMetadata::default(),
                 candidate_id: "cand-shadow-stale-time-stop".to_string(),
                 entry_order_id: "shadow-entry-stale-time-stop".to_string(),
                 quote_id: "shadow-quote-stale-time-stop".to_string(),
@@ -5382,6 +5477,7 @@ mod tests {
             Some(1_000_000_000),
             Some(1_000_000),
             Some(PositionEventContext {
+                join_metadata: PositionJoinMetadata::default(),
                 candidate_id: "cand-shadow-stale".to_string(),
                 entry_order_id: "shadow-entry-stale".to_string(),
                 quote_id: "shadow-quote-stale".to_string(),

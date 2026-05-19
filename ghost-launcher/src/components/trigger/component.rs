@@ -33,8 +33,8 @@ use crate::config::{
     OracleConfig, TriggerComponentConfig, TriggerEntryMode, TriggerShadowPayerStrategy,
 };
 use crate::events::{
-    EventBusReceiver, EventBusSender, GhostEvent, LegacyPathClassification, LegacyPathDescriptor,
-    RuntimePlane,
+    EventBusReceiver, EventBusSender, ExecutionJoinMetadata, GhostEvent, LegacyPathClassification,
+    LegacyPathDescriptor, RuntimePlane,
 };
 use anyhow::{bail, Result};
 use ghost_core::{
@@ -339,6 +339,7 @@ impl PreparedBuyRequestBuildMetadata {
 
 #[derive(Debug, Clone)]
 pub struct PreparedBuyRequest {
+    pub join_metadata: ExecutionJoinMetadata,
     pub mint: Pubkey,
     pub payer_pubkey: Pubkey,
     pub payer_provenance: &'static str,
@@ -372,6 +373,13 @@ pub struct PreparedBuyRequest {
     pub decision_ts_ms: u64,
 }
 
+impl PreparedBuyRequest {
+    pub fn with_join_metadata(mut self, join_metadata: ExecutionJoinMetadata) -> Self {
+        self.join_metadata = join_metadata;
+        self
+    }
+}
+
 pub struct PendingShadowSimulation {
     pub request: PreparedBuyRequest,
     pub handle: tokio::task::JoinHandle<Result<super::shadow_run::ShadowBuySimulationReport>>,
@@ -398,6 +406,7 @@ pub struct TriggerDispatchReceipt {
 
 #[derive(Debug, Clone)]
 pub struct TriggerDispatchFailureContext {
+    pub join_metadata: ExecutionJoinMetadata,
     pub amount_lamports: u64,
     pub tip_lamports: u64,
     pub decision_ts_ms: u64,
@@ -2440,6 +2449,7 @@ impl TriggerComponent {
                 .map(|payer| payer.pubkey().to_string()),
         };
         Some(TriggerDispatchFailureContext {
+            join_metadata: ExecutionJoinMetadata::default(),
             amount_lamports,
             tip_lamports,
             decision_ts_ms: Self::now_ms(),
@@ -2827,6 +2837,7 @@ impl TriggerComponent {
         buy_tx: VersionedTransaction,
     ) -> PreparedBuyRequest {
         PreparedBuyRequest {
+            join_metadata: ExecutionJoinMetadata::default(),
             mint: build_profile.mint,
             payer_pubkey: build_profile.payer_pubkey,
             payer_provenance,
@@ -5838,6 +5849,7 @@ mod tests {
         ) -> Result<crate::components::trigger::shadow_run::ShadowBuySimulationReport> {
             Ok(
                 crate::components::trigger::shadow_run::ShadowBuySimulationReport {
+                    join_metadata: request.join_metadata.clone(),
                     mint: request.mint.to_string(),
                     live_signature: None,
                     payer_pubkey: request.payer_pubkey.to_string(),
@@ -5888,6 +5900,7 @@ mod tests {
             self.completed.fetch_add(1, Ordering::SeqCst);
             Ok(
                 crate::components::trigger::shadow_run::ShadowBuySimulationReport {
+                    join_metadata: request.join_metadata.clone(),
                     mint: request.mint.to_string(),
                     live_signature: None,
                     payer_pubkey: request.payer_pubkey.to_string(),
@@ -7896,6 +7909,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let output_path = temp.path().join("shadow").join("buys.jsonl");
         let event = crate::events::ShadowBuySimulationEvent {
+            join_metadata: ExecutionJoinMetadata::default(),
             candidate_id: crate::events::build_execution_candidate_id("mint", "pool", "10"),
             pool_amm_id: "pool".to_string(),
             base_mint: "mint".to_string(),
@@ -7944,6 +7958,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let output_path = temp.path().join("shadow").join("failures.jsonl");
         let context = TriggerDispatchFailureContext {
+            join_metadata: ExecutionJoinMetadata::default(),
             amount_lamports: 100,
             tip_lamports: 10,
             decision_ts_ms: 10,

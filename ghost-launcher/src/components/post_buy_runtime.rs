@@ -32,7 +32,7 @@ use crate::events::{EventBusReceiver, GhostEvent, PostBuySource, RuntimePlane};
 use ghost_brain::events::{EventEmitter, EventWriterConfig};
 use ghost_brain::execution::paper_lifecycle::{PaperLifecycleConfig, PaperPositionLifecycle};
 use ghost_brain::execution::{CandidateRef, Lane};
-use ghost_brain::guardian::post_buy::engine::PositionEventContext;
+use ghost_brain::guardian::post_buy::engine::{PositionEventContext, PositionJoinMetadata};
 use ghost_brain::guardian::post_buy::{
     MonitoringEngine, PositionRuntimeRouter, PostBuyGuardianConfig, ShadowPositionBook,
     SignalRouter,
@@ -1970,6 +1970,7 @@ async fn handle_post_buy_event(
         entry_token_amount_raw,
         buy_landed_slot,
         creator_pubkey,
+        join_metadata,
     } = event
     else {
         return DirectPostBuyHandoffAck::Accepted;
@@ -2167,6 +2168,13 @@ async fn handle_post_buy_event(
             entry_token_amount_raw,
             buy_landed_slot,
             epoch,
+            PositionJoinMetadata {
+                ab_record_id: join_metadata.ab_record_id.clone(),
+                v3_feature_snapshot_hash: join_metadata.v3_feature_snapshot_hash.clone(),
+                v3_policy_config_hash: join_metadata.v3_policy_config_hash.clone(),
+                decision_plane: join_metadata.decision_plane.clone(),
+                rollout_namespace: join_metadata.rollout_namespace.clone(),
+            },
         )
         .await;
         if matches!(handoff.ack, DirectPostBuyHandoffAck::Accepted) {
@@ -2250,6 +2258,7 @@ async fn handle_shadow_post_buy_handoff(
     entry_token_amount_raw: Option<u64>,
     buy_landed_slot: Option<u64>,
     epoch: u64,
+    join_metadata: PositionJoinMetadata,
 ) -> ShadowPostBuyHandoffResult {
     let Some(shadow_monitor) = shadow_monitor else {
         warn!(
@@ -2333,6 +2342,7 @@ async fn handle_shadow_post_buy_handoff(
         );
     }
     let context = PositionEventContext {
+        join_metadata,
         candidate_id: candidate_id.to_string(),
         entry_order_id: format!("shadow-entry-{candidate_id}"),
         quote_id: format!("shadow-quote-{candidate_id}"),
@@ -5110,6 +5120,7 @@ mod tests {
             Some(250_000),
             Some(777),
             9,
+            PositionJoinMetadata::default(),
         )
         .await;
 
@@ -5179,6 +5190,7 @@ mod tests {
             Some(250_000),
             Some(111),
             1,
+            PositionJoinMetadata::default(),
         )
         .await;
         assert_eq!(first.ack, DirectPostBuyHandoffAck::Accepted);
@@ -5195,6 +5207,7 @@ mod tests {
             Some(500_000),
             Some(222),
             2,
+            PositionJoinMetadata::default(),
         )
         .await;
         assert_eq!(
@@ -5241,6 +5254,7 @@ mod tests {
             Some(250_000),
             Some(777),
             9,
+            PositionJoinMetadata::default(),
         )
         .await;
         assert_eq!(handoff.ack, DirectPostBuyHandoffAck::Accepted);
@@ -5329,6 +5343,7 @@ mod tests {
             Some(250_000),
             Some(landed_slot),
             9,
+            PositionJoinMetadata::default(),
         )
         .await;
 
