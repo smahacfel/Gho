@@ -1493,3 +1493,74 @@ Acceptance:
 
 Collection, Phase B, P2, live, active policy changes, IWIM changes and threshold
 tuning remain out of scope.
+
+## P3.7-J3I2 Probe Scan-Plane Throughput Repair
+
+### Trigger
+
+R15-r7 was manually stopped before natural timeout after producing a useful
+final diagnostic snapshot:
+
+```text
+v3_rows = 199
+strict_replay = full_replay_ok
+probe_selection_rows = 548
+probe_transport_rows = 0
+probe_entry_rows = 0
+execution_account_not_ready = 543
+probe_scan_concurrency_limit_exceeded = 283
+```
+
+J3I successfully separated not-ready rows from dispatch quota, but the scan
+plane itself remained too narrow. `probe_scan_concurrency_limit_exceeded` means
+the run did not prove absence of execution-ready rows in the candidate universe;
+it only proved that rows reaching strict readiness were not ready.
+
+### Decision
+
+J3I2 separates scan throughput from dispatch concurrency:
+
+- `max_scan_concurrent` controls candidate readiness scans;
+- `max_concurrent` remains the dispatch-only concurrency limit;
+- `max_probe_candidates_scanned_per_run` provides an optional finite scan budget
+  for smoke runs;
+- exceeding scan concurrency or scan-count budget logs a skip and does not
+  consume dispatch quota;
+- dispatch quota is still consumed only after
+  `execution_account_readiness_status = ready`.
+
+This is not a precheck bypass and not a collection gate. `bonding_curve_v2`
+remains strict, `creator_vault` remains route-aware, and missing execution
+accounts remain `execution_account_not_ready`.
+
+### R15-r8 Gate
+
+R15-r8 must use a clean bounded smoke namespace:
+
+```text
+shadow-burnin-v3-p37-counterfactual-probe-r15-smoke-r8
+```
+
+Smoke profile:
+
+```text
+max_probes_per_run = 5
+max_probes_per_minute = 5
+max_concurrent = 1
+max_scan_concurrent = 8
+max_probe_candidates_scanned_per_run = 1000
+```
+
+Acceptance:
+
+- V3/MFS strict replay remains OK.
+- Probe selection exact decision/V3 join remains 100%.
+- `probe_scan_concurrency_limit_exceeded` is no longer the dominant reason that
+  prevents readiness evaluation.
+- Not-ready rows still do not consume dispatch quota.
+- If execution-ready rows exist, dispatch can reach probe transport/entry.
+- If no execution-ready rows exist after the finite scan budget, the run is
+  `NOT_READY_DIAGNOSED`, not a scan-throughput artifact.
+
+Collection, Phase B, P2, live, active policy changes, IWIM changes and threshold
+tuning remain out of scope.

@@ -1672,6 +1672,7 @@ impl OracleRuntime {
             Arc::clone(&account_state_core),
         ));
         let p37_shadow_probe_state = Arc::new(P37ShadowProbeRuntimeState::new(
+            config.p37_shadow_probe.max_scan_concurrent,
             config.p37_shadow_probe.max_concurrent,
         ));
         let runtime = Self {
@@ -4673,6 +4674,7 @@ static P37_SHADOW_PROBE_JSONL_WRITE_LOCK: OnceLock<tokio::sync::Mutex<()>> = Onc
 
 #[derive(Debug)]
 struct P37ShadowProbeRuntimeState {
+    scan_count: AtomicUsize,
     dispatch_count: AtomicUsize,
     dispatch_per_minute_window: Mutex<VecDeque<u64>>,
     seen_probe_ids: Mutex<HashSet<String>>,
@@ -4681,14 +4683,16 @@ struct P37ShadowProbeRuntimeState {
 }
 
 impl P37ShadowProbeRuntimeState {
-    fn new(max_concurrent: usize) -> Self {
-        let max_concurrent = max_concurrent.max(1);
+    fn new(max_scan_concurrent: usize, max_dispatch_concurrent: usize) -> Self {
+        let max_scan_concurrent = max_scan_concurrent.max(1);
+        let max_dispatch_concurrent = max_dispatch_concurrent.max(1);
         Self {
+            scan_count: AtomicUsize::new(0),
             dispatch_count: AtomicUsize::new(0),
             dispatch_per_minute_window: Mutex::new(VecDeque::new()),
             seen_probe_ids: Mutex::new(HashSet::new()),
-            scan_semaphore: Arc::new(Semaphore::new(max_concurrent)),
-            dispatch_semaphore: Arc::new(Semaphore::new(max_concurrent)),
+            scan_semaphore: Arc::new(Semaphore::new(max_scan_concurrent)),
+            dispatch_semaphore: Arc::new(Semaphore::new(max_dispatch_concurrent)),
         }
     }
 
@@ -4711,6 +4715,18 @@ impl P37ShadowProbeRuntimeState {
                     return Err("duplicate_probe_id".to_string());
                 }
             }
+        }
+
+        if config.max_probe_candidates_scanned_per_run > 0
+            && self
+                .scan_count
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    (current < config.max_probe_candidates_scanned_per_run).then_some(current + 1)
+                })
+                .is_err()
+        {
+            drop(permit);
+            return Err("max_probe_candidates_scanned_per_run_exceeded".to_string());
         }
 
         Ok(permit)
@@ -12397,7 +12413,8 @@ mod tests {
             dedupe_by_probe_id: false,
             ..Default::default()
         };
-        let state = P37ShadowProbeRuntimeState::new(config.max_concurrent);
+        let state =
+            P37ShadowProbeRuntimeState::new(config.max_scan_concurrent, config.max_concurrent);
 
         let first = state
             .try_reserve_dispatch(&config, 10_000)
@@ -12419,7 +12436,8 @@ mod tests {
             dedupe_by_probe_id: false,
             ..Default::default()
         };
-        let state = P37ShadowProbeRuntimeState::new(config.max_concurrent);
+        let state =
+            P37ShadowProbeRuntimeState::new(config.max_scan_concurrent, config.max_concurrent);
 
         let first = state
             .try_reserve_dispatch(&config, 10_000)
@@ -12438,10 +12456,12 @@ mod tests {
             max_probes_per_run: 10,
             max_probes_per_minute: 10,
             max_concurrent: 1,
+            max_scan_concurrent: 1,
             dedupe_by_probe_id: false,
             ..Default::default()
         };
-        let state = P37ShadowProbeRuntimeState::new(config.max_concurrent);
+        let state =
+            P37ShadowProbeRuntimeState::new(config.max_scan_concurrent, config.max_concurrent);
 
         let _first = state
             .try_reserve_dispatch(&config, 10_000)
@@ -12467,7 +12487,8 @@ mod tests {
         };
         let candidate = p37_shadow_probe_test_candidate();
         let record = p37_shadow_probe_selection_record(&config, &candidate, 3_000);
-        let state = P37ShadowProbeRuntimeState::new(config.max_concurrent);
+        let state =
+            P37ShadowProbeRuntimeState::new(config.max_scan_concurrent, config.max_concurrent);
 
         let first = state
             .try_reserve_scan(&config, &record)
@@ -12491,7 +12512,8 @@ mod tests {
         };
         let candidate = p37_shadow_probe_test_candidate();
         let record = p37_shadow_probe_selection_record(&config, &candidate, 3_000);
-        let state = P37ShadowProbeRuntimeState::new(config.max_concurrent);
+        let state =
+            P37ShadowProbeRuntimeState::new(config.max_scan_concurrent, config.max_concurrent);
 
         for _ in 0..3 {
             let scan = state
@@ -12520,12 +12542,14 @@ mod tests {
             max_probes_per_run: 10,
             max_probes_per_minute: 10,
             max_concurrent: 1,
+            max_scan_concurrent: 1,
             dedupe_by_probe_id: false,
             ..Default::default()
         };
         let candidate = p37_shadow_probe_test_candidate();
         let record = p37_shadow_probe_selection_record(&config, &candidate, 3_000);
-        let state = P37ShadowProbeRuntimeState::new(config.max_concurrent);
+        let state =
+            P37ShadowProbeRuntimeState::new(config.max_scan_concurrent, config.max_concurrent);
 
         let _first = state
             .try_reserve_scan(&config, &record)
@@ -12536,6 +12560,79 @@ mod tests {
             second.err().as_deref(),
             Some("probe_scan_concurrency_limit_exceeded")
         );
+    }
+
+    #[test]
+    fn p37_shadow_probe_scan_concurrency_is_independent_from_dispatch_concurrency() {
+        let config = P37ShadowProbeConfig {
+            enabled: true,
+            sample_threshold: 100,
+            max_probes_per_run: 10,
+            max_probes_per_minute: 10,
+            max_concurrent: 1,
+            max_scan_concurrent: 2,
+            dedupe_by_probe_id: false,
+            ..Default::default()
+        };
+        let candidate = p37_shadow_probe_test_candidate();
+        let record = p37_shadow_probe_selection_record(&config, &candidate, 3_000);
+        let state =
+            P37ShadowProbeRuntimeState::new(config.max_scan_concurrent, config.max_concurrent);
+
+        let _first_scan = state
+            .try_reserve_scan(&config, &record)
+            .expect("first scan should reserve");
+        let second_scan = state
+            .try_reserve_scan(&config, &record)
+            .expect("second scan should use max_scan_concurrent, not dispatch max_concurrent");
+        drop(second_scan);
+
+        let _first_dispatch = state
+            .try_reserve_dispatch(&config, 10_000)
+            .expect("first dispatch should reserve");
+        let second_dispatch = state.try_reserve_dispatch(&config, 10_100);
+
+        assert_eq!(
+            second_dispatch.err().as_deref(),
+            Some("probe_concurrency_limit_exceeded")
+        );
+    }
+
+    #[test]
+    fn p37_shadow_probe_runtime_state_enforces_scan_count_limit_without_dispatch_quota() {
+        let config = P37ShadowProbeConfig {
+            enabled: true,
+            sample_threshold: 100,
+            max_probes_per_run: 1,
+            max_probes_per_minute: 10,
+            max_concurrent: 1,
+            max_scan_concurrent: 2,
+            max_probe_candidates_scanned_per_run: 2,
+            dedupe_by_probe_id: false,
+            ..Default::default()
+        };
+        let candidate = p37_shadow_probe_test_candidate();
+        let record = p37_shadow_probe_selection_record(&config, &candidate, 3_000);
+        let state =
+            P37ShadowProbeRuntimeState::new(config.max_scan_concurrent, config.max_concurrent);
+
+        for _ in 0..2 {
+            let scan = state
+                .try_reserve_scan(&config, &record)
+                .expect("scan should reserve until scan count limit");
+            drop(scan);
+        }
+
+        let third_scan = state.try_reserve_scan(&config, &record);
+        assert_eq!(
+            third_scan.err().as_deref(),
+            Some("max_probe_candidates_scanned_per_run_exceeded")
+        );
+
+        let dispatch = state
+            .try_reserve_dispatch(&config, 10_000)
+            .expect("scan count limit must not consume dispatch quota");
+        drop(dispatch);
     }
 
     #[test]
@@ -14273,7 +14370,7 @@ mod tests {
                 &GatekeeperV2Config::default(),
             ),
             p37_shadow_probe_config: P37ShadowProbeConfig::default(),
-            p37_shadow_probe_state: Arc::new(P37ShadowProbeRuntimeState::new(1)),
+            p37_shadow_probe_state: Arc::new(P37ShadowProbeRuntimeState::new(1, 1)),
             authoritative_funding_coverage_gate_enabled: false,
             fingerprint_config: EarlyFingerprintConfig::default(),
             event_emitter: None,
@@ -15238,7 +15335,7 @@ mod tests {
             ),
             funding_source_config: FundingSourceConfig::from_gatekeeper_config(&gatekeeper_config),
             p37_shadow_probe_config: P37ShadowProbeConfig::default(),
-            p37_shadow_probe_state: Arc::new(P37ShadowProbeRuntimeState::new(1)),
+            p37_shadow_probe_state: Arc::new(P37ShadowProbeRuntimeState::new(1, 1)),
             authoritative_funding_coverage_gate_enabled: false,
             gatekeeper_config,
             gatekeeper_v3_config: GatekeeperV3Config::default(),
@@ -15353,7 +15450,7 @@ mod tests {
             ),
             funding_source_config: FundingSourceConfig::from_gatekeeper_config(&gatekeeper_config),
             p37_shadow_probe_config: P37ShadowProbeConfig::default(),
-            p37_shadow_probe_state: Arc::new(P37ShadowProbeRuntimeState::new(1)),
+            p37_shadow_probe_state: Arc::new(P37ShadowProbeRuntimeState::new(1, 1)),
             authoritative_funding_coverage_gate_enabled: false,
             gatekeeper_config,
             gatekeeper_v3_config: GatekeeperV3Config::default(),

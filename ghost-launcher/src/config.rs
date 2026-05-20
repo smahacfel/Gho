@@ -1060,9 +1060,10 @@ fn validate_p37_shadow_probe_contract(config: &LauncherConfig) -> Result<(), Str
     if probe.max_probes_per_run == 0
         || probe.max_probes_per_minute == 0
         || probe.max_concurrent == 0
+        || probe.max_scan_concurrent == 0
     {
         return Err(
-            "[p37_shadow_probe] max_probes_per_run, max_probes_per_minute, and max_concurrent must be positive"
+            "[p37_shadow_probe] max_probes_per_run, max_probes_per_minute, max_concurrent, and max_scan_concurrent must be positive"
                 .to_string(),
         );
     }
@@ -1872,6 +1873,21 @@ pub struct P37ShadowProbeConfig {
     #[serde(default = "default_p37_shadow_probe_max_concurrent")]
     pub max_concurrent: usize,
 
+    /// Maximum concurrent candidate readiness scans.
+    ///
+    /// This is intentionally separate from `max_concurrent`, which limits
+    /// execution-ready probe dispatch. Scan concurrency may be higher so
+    /// account-not-ready rows do not mask the eligible candidate universe.
+    #[serde(default = "default_p37_shadow_probe_max_scan_concurrent")]
+    pub max_scan_concurrent: usize,
+
+    /// Maximum candidate rows to run through readiness scan in one runtime.
+    ///
+    /// `0` preserves legacy/unbounded scan-count behavior. Smoke profiles that
+    /// need a finite proof window should set this explicitly.
+    #[serde(default)]
+    pub max_probe_candidates_scanned_per_run: usize,
+
     #[serde(default = "default_p37_shadow_probe_include_verdict_types")]
     pub include_verdict_types: Vec<String>,
 
@@ -1964,6 +1980,8 @@ impl Default for P37ShadowProbeConfig {
             max_probes_per_run: default_p37_shadow_probe_max_probes_per_run(),
             max_probes_per_minute: default_p37_shadow_probe_max_probes_per_minute(),
             max_concurrent: default_p37_shadow_probe_max_concurrent(),
+            max_scan_concurrent: default_p37_shadow_probe_max_scan_concurrent(),
+            max_probe_candidates_scanned_per_run: 0,
             include_verdict_types: default_p37_shadow_probe_include_verdict_types(),
             exclude_active_buy_rows: true,
             enable_eligibility_precheck: true,
@@ -3101,6 +3119,10 @@ fn default_p37_shadow_probe_max_probes_per_minute() -> usize {
 
 fn default_p37_shadow_probe_max_concurrent() -> usize {
     2
+}
+
+fn default_p37_shadow_probe_max_scan_concurrent() -> usize {
+    default_p37_shadow_probe_max_concurrent()
 }
 
 fn default_p37_shadow_probe_include_verdict_types() -> Vec<String> {
@@ -4693,11 +4715,11 @@ enabled = true
         )
         .unwrap();
         let path =
-            temp_rollout_dir.join("shadow-burnin-v3-p37-counterfactual-probe-r15-smoke-r2.toml");
+            temp_rollout_dir.join("shadow-burnin-v3-p37-counterfactual-probe-r15-smoke-r8.toml");
         fs::copy(
             manifest_dir
                 .join("../configs/rollout")
-                .join("shadow-burnin-v3-p37-counterfactual-probe-r15-smoke-r2.toml"),
+                .join("shadow-burnin-v3-p37-counterfactual-probe-r15-smoke-r8.toml"),
             &path,
         )
         .unwrap();
@@ -4720,10 +4742,16 @@ enabled = true
             "fixed_lamports"
         );
         assert!(config.p37_shadow_probe.probe_amount_lamports > 0);
+        assert_eq!(config.p37_shadow_probe.max_concurrent, 1);
+        assert_eq!(config.p37_shadow_probe.max_scan_concurrent, 8);
+        assert_eq!(
+            config.p37_shadow_probe.max_probe_candidates_scanned_per_run,
+            1000
+        );
         assert!(config
             .p37_shadow_probe
             .transport_log_path
-            .contains("shadow-burnin-v3-p37-counterfactual-probe-r15-smoke-r2"));
+            .contains("shadow-burnin-v3-p37-counterfactual-probe-r15-smoke-r8"));
         assert!(config
             .p37_shadow_probe
             .entry_log_path
