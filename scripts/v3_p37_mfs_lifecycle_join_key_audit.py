@@ -12,7 +12,7 @@ from typing import Any, Iterable
 from shadow_run_report import load_toml, resolve_config_path, resolve_runtime_path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DECISION_FILE_NAMES = ("gatekeeper_v2_decisions.jsonl", "gatekeeper_v2_buys.jsonl")
 FIELD_GROUPS = {
     "ab_record_id": ("ab_record_id",),
@@ -33,7 +33,18 @@ FIELD_GROUPS = {
     "decision_plane": ("decision_plane",),
     "rollout_namespace": ("rollout_namespace", "rollout_profile"),
     "v3_replay_payload": ("v3_replay_payload_schema_version", "v3_replay_payload"),
+    "probe_bucket": ("probe_bucket",),
+    "probe_skip_reason": ("probe_skip_reason", "skip_reason"),
+    "probe_amount_source": ("probe_amount_source",),
+    "run_id": ("run_id",),
+    "session_id": ("session_id",),
 }
+COUNTER_FIELD_GROUPS = (
+    "probe_bucket",
+    "probe_skip_reason",
+    "probe_amount_source",
+    "dispatch_source",
+)
 CANONICAL_JOIN_ARTIFACTS = (
     "decision",
     "shadow_transport",
@@ -92,6 +103,7 @@ def artifact_summary(name: str, path: Path) -> dict[str, Any]:
     rows = list(iter_jsonl(path))
     field_counts: dict[str, int] = {}
     identifiers: dict[str, set[str]] = defaultdict(set)
+    value_counts: dict[str, Counter[str]] = {field: Counter() for field in COUNTER_FIELD_GROUPS}
     for group, fields in FIELD_GROUPS.items():
         count = 0
         for row in rows:
@@ -99,6 +111,10 @@ def artifact_summary(name: str, path: Path) -> dict[str, Any]:
             if values:
                 count += 1
                 identifiers[group].update(values)
+            if group in value_counts:
+                value = first_present(row, fields)
+                if value is not None:
+                    value_counts[group][str(value)] += 1
         field_counts[group] = count
     return {
         "name": name,
@@ -109,6 +125,11 @@ def artifact_summary(name: str, path: Path) -> dict[str, Any]:
         "field_coverage_pct": {
             field: round((count / len(rows) * 100.0), 3) if rows else 0.0
             for field, count in field_counts.items()
+        },
+        "value_counts": {
+            field: dict(sorted(counter.items()))
+            for field, counter in value_counts.items()
+            if counter
         },
         "_identifiers": {key: values for key, values in identifiers.items()},
     }
@@ -351,6 +372,127 @@ def probe_join_key_coverage(report: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def artifact_rows(paths: dict[str, list[Path]], artifact_type: str) -> list[dict[str, Any]]:
+    return [row for path in paths.get(artifact_type, []) for row in iter_jsonl(path)]
+
+
+def row_ab_record_id(row: dict[str, Any]) -> str | None:
+    value = first_present(row, FIELD_GROUPS["ab_record_id"])
+    if value is None:
+        value = first_present(row, FIELD_GROUPS["source_ab_record_id"])
+    return str(value) if value is not None else None
+
+
+def row_feature_hash(row: dict[str, Any]) -> str | None:
+    value = first_present(row, FIELD_GROUPS["feature_snapshot_hash"])
+    return str(value) if value is not None else None
+
+
+def row_policy_hash(row: dict[str, Any]) -> str | None:
+    value = first_present(row, FIELD_GROUPS["v3_policy_config_hash"])
+    return str(value) if value is not None else None
+
+
+def row_has_v3_payload(row: dict[str, Any]) -> bool:
+    return first_present(row, FIELD_GROUPS["v3_replay_payload"]) is not None
+
+
+def probe_decision_join(paths: dict[str, list[Path]]) -> dict[str, Any]:
+    decisions = artifact_rows(paths, "decision")
+    decision_by_ab: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for decision in decisions:
+        ab_record_id = row_ab_record_id(decision)
+        if ab_record_id:
+            decision_by_ab[ab_record_id].append(decision)
+
+    required_artifacts = ("probe_selection", "probe_transport", "probe_entry")
+    artifact_reports: dict[str, dict[str, Any]] = {}
+    for artifact_type in (*required_artifacts, "probe_lifecycle"):
+        rows = artifact_rows(paths, artifact_type)
+        rows_with_ab = 0
+        joined_to_decision = 0
+        joined_to_decision_with_v3_payload = 0
+        feature_hash_match = 0
+        policy_hash_match = 0
+        exact_decision_v3_join = 0
+        unmatched_rows = 0
+        feature_hash_mismatch = 0
+        policy_hash_mismatch = 0
+        for row in rows:
+            ab_record_id = row_ab_record_id(row)
+            if not ab_record_id:
+                unmatched_rows += 1
+                continue
+            rows_with_ab += 1
+            matching_decisions = decision_by_ab.get(ab_record_id, [])
+            if not matching_decisions:
+                unmatched_rows += 1
+                continue
+            joined_to_decision += 1
+            if any(row_has_v3_payload(decision) for decision in matching_decisions):
+                joined_to_decision_with_v3_payload += 1
+
+            feature_hash = row_feature_hash(row)
+            policy_hash = row_policy_hash(row)
+            feature_match = feature_hash is not None and any(
+                row_feature_hash(decision) == feature_hash for decision in matching_decisions
+            )
+            policy_match = policy_hash is not None and any(
+                row_policy_hash(decision) == policy_hash for decision in matching_decisions
+            )
+            if feature_match:
+                feature_hash_match += 1
+            elif feature_hash is not None:
+                feature_hash_mismatch += 1
+            if policy_match:
+                policy_hash_match += 1
+            elif policy_hash is not None:
+                policy_hash_mismatch += 1
+            if (
+                feature_match
+                and policy_match
+                and any(row_has_v3_payload(decision) for decision in matching_decisions)
+            ):
+                exact_decision_v3_join += 1
+
+        artifact_reports[artifact_type] = {
+            "rows": len(rows),
+            "rows_with_ab_record_id": rows_with_ab,
+            "joined_to_decision_by_ab_record_id": joined_to_decision,
+            "joined_to_decision_with_v3_payload": joined_to_decision_with_v3_payload,
+            "feature_hash_match": feature_hash_match,
+            "policy_hash_match": policy_hash_match,
+            "exact_decision_v3_join": exact_decision_v3_join,
+            "unmatched_rows": unmatched_rows,
+            "feature_hash_mismatch": feature_hash_mismatch,
+            "policy_hash_mismatch": policy_hash_mismatch,
+            "exact_decision_v3_join_coverage": round(exact_decision_v3_join / len(rows), 6)
+            if rows
+            else 0.0,
+        }
+
+    required_coverages = [
+        artifact_reports[artifact_type]["exact_decision_v3_join_coverage"]
+        for artifact_type in required_artifacts
+        if artifact_reports[artifact_type]["rows"] > 0
+    ]
+    required_rows_present = all(
+        artifact_reports[artifact_type]["rows"] > 0 for artifact_type in required_artifacts
+    )
+    required_exact_coverage = min(required_coverages) if required_coverages else 0.0
+    acceptance = "pass" if required_rows_present and required_exact_coverage >= 1.0 else "fail"
+    return {
+        "decision_rows": len(decisions),
+        "decision_rows_with_ab_record_id": sum(1 for row in decisions if row_ab_record_id(row)),
+        "decision_rows_with_v3_payload": sum(1 for row in decisions if row_has_v3_payload(row)),
+        "required_probe_artifacts": list(required_artifacts),
+        "required_probe_artifacts_present": required_rows_present,
+        "required_exact_decision_v3_join_coverage": round(required_exact_coverage, 6),
+        "decision_join_acceptance": acceptance,
+        "artifacts": artifact_reports,
+    }
+
+
 def readiness(report: dict[str, Any]) -> dict[str, Any]:
     decision_rows = artifact_totals(report, "decision")
     v3_payload_rows = artifact_totals(report, "decision", "v3_replay_payload")
@@ -408,6 +550,12 @@ def probe_readiness(report: dict[str, Any]) -> dict[str, Any]:
     transport_rows = coverage.get("probe_transport_rows", 0)
     entry_rows = coverage.get("probe_entry_rows", 0)
     quality = coverage.get("probe_join_quality") or probe_join_quality(report)
+    decision_join = report.get("probe_decision_join", {})
+    decision_join_acceptance = decision_join.get("decision_join_acceptance", "fail")
+    required_decision_join_coverage = decision_join.get(
+        "required_exact_decision_v3_join_coverage",
+        0.0,
+    )
     exact_ab_common = report.get("probe_artifact_intersections", {}).get("ab_record_id", {}).get("common_values", 0)
     exact_probe_common = report.get("probe_artifact_intersections", {}).get("probe_id", {}).get("common_values", 0)
     status = "ready_for_probe_transport_entry_join"
@@ -427,10 +575,13 @@ def probe_readiness(report: dict[str, Any]) -> dict[str, Any]:
     if exact_probe_common <= 0:
         status = "degraded" if status != "not_ready" else status
         reasons.append("no_common_probe_id")
+    if decision_join_acceptance != "pass":
+        status = "not_ready"
+        reasons.append("probe_rows_missing_exact_decision_v3_join")
     if status == "ready_for_probe_transport_entry_join" and quality in {
         "exact_probe_id_and_ab_record_id",
         "exact_ab_record_id",
-    }:
+    } and decision_join_acceptance == "pass":
         join_key_acceptance = "pass"
     elif status == "not_ready":
         join_key_acceptance = "fail"
@@ -445,6 +596,8 @@ def probe_readiness(report: dict[str, Any]) -> dict[str, Any]:
         "probe_transport_rows": transport_rows,
         "probe_entry_rows": entry_rows,
         "probe_lifecycle_rows": coverage.get("probe_lifecycle_rows", 0),
+        "decision_join_acceptance": decision_join_acceptance,
+        "required_exact_decision_v3_join_coverage": required_decision_join_coverage,
     }
 
 
@@ -479,6 +632,7 @@ def build_report(config_path: Path) -> dict[str, Any]:
     report["join_key_coverage"] = join_key_coverage(report)
     report["readiness"] = readiness(report)
     report["probe_join_key_coverage"] = probe_join_key_coverage(report)
+    report["probe_decision_join"] = probe_decision_join(paths)
     report["probe_readiness"] = probe_readiness(report)
     return report
 
@@ -494,6 +648,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- probe_readiness: `{report['probe_readiness']['status']}`",
         f"- probe_join_key_acceptance: `{report['probe_readiness']['join_key_acceptance']}`",
         f"- probe_join_quality: `{report['probe_join_key_coverage']['probe_join_quality']}`",
+        f"- probe_decision_join_acceptance: `{report['probe_decision_join']['decision_join_acceptance']}`",
+        f"- probe_required_exact_decision_v3_join_coverage: `{report['probe_decision_join']['required_exact_decision_v3_join_coverage']}`",
         f"- full_chain_ab_record_id_coverage: `{report['join_key_coverage']['full_chain_ab_record_id_coverage']}`",
         f"- probe_chain_ab_record_id_coverage: `{report['probe_join_key_coverage']['probe_chain_ab_record_id_coverage']}`",
         f"- probe_chain_probe_id_coverage: `{report['probe_join_key_coverage']['probe_chain_probe_id_coverage']}`",
@@ -529,6 +685,15 @@ def render_markdown(report: dict[str, Any]) -> str:
         lines.append(f"- `{key}`: `{json.dumps(value, ensure_ascii=False, sort_keys=True)}`")
     lines.extend(["", "## Probe Artifact Intersections", ""])
     for key, value in report["probe_artifact_intersections"].items():
+        lines.append(f"- `{key}`: `{json.dumps(value, ensure_ascii=False, sort_keys=True)}`")
+    lines.extend(["", "## Probe Decision Join", ""])
+    lines.append(
+        f"- decision_join_acceptance: `{report['probe_decision_join']['decision_join_acceptance']}`"
+    )
+    lines.append(
+        f"- required_exact_decision_v3_join_coverage: `{report['probe_decision_join']['required_exact_decision_v3_join_coverage']}`"
+    )
+    for key, value in report["probe_decision_join"]["artifacts"].items():
         lines.append(f"- `{key}`: `{json.dumps(value, ensure_ascii=False, sort_keys=True)}`")
     lines.extend(
         [

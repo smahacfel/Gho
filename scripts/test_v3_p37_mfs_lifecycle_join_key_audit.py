@@ -185,6 +185,8 @@ lifecycle_log_path = "../../logs/shadow_run/r15-probe/probe_lifecycle.jsonl"
                 "dispatch_source": "counterfactual_shadow_probe",
                 "collection_plane": "counterfactual_shadow_probe",
                 "probe_plane": "p37_shadow_probe",
+                "probe_bucket": "v3_pending_wait_sample",
+                "probe_amount_source": "fixed_lamports",
             }
             write_jsonl(
                 root / "logs/rollout/r15-probe/decisions/gatekeeper_v2_decisions.jsonl",
@@ -199,12 +201,93 @@ lifecycle_log_path = "../../logs/shadow_run/r15-probe/probe_lifecycle.jsonl"
         self.assertEqual(report["probe_readiness"]["status"], "ready_for_probe_transport_entry_join")
         self.assertEqual(report["probe_readiness"]["join_key_acceptance"], "pass")
         self.assertEqual(report["probe_readiness"]["join_quality"], "exact_probe_id_and_ab_record_id")
+        self.assertEqual(report["probe_readiness"]["decision_join_acceptance"], "pass")
+        self.assertEqual(report["probe_readiness"]["required_exact_decision_v3_join_coverage"], 1.0)
         self.assertEqual(report["probe_join_key_coverage"]["probe_transport_rows"], 1)
         self.assertEqual(report["probe_join_key_coverage"]["probe_entry_rows"], 1)
         self.assertEqual(report["probe_join_key_coverage"]["probe_lifecycle_rows"], 0)
         self.assertEqual(report["probe_join_key_coverage"]["probe_chain_ab_record_id_coverage"], 1.0)
         self.assertEqual(report["probe_join_key_coverage"]["probe_chain_probe_id_coverage"], 1.0)
+        self.assertEqual(
+            report["probe_decision_join"]["artifacts"]["probe_transport"]["exact_decision_v3_join"],
+            1,
+        )
+        self.assertEqual(
+            report["artifacts"]["probe_transport"][0]["value_counts"]["probe_bucket"],
+            {"v3_pending_wait_sample": 1},
+        )
+        self.assertEqual(
+            report["artifacts"]["probe_transport"][0]["value_counts"]["probe_amount_source"],
+            {"fixed_lamports": 1},
+        )
         self.assertEqual(report["readiness"]["status"], "not_ready")
+
+    def test_probe_transport_entry_without_decision_v3_join_is_not_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "configs/rollout/r15-probe.toml"
+            config.parent.mkdir(parents=True)
+            config.write_text(
+                """
+[oracle]
+decision_log_path = "../../logs/rollout/r15-probe/decisions"
+
+[p37_shadow_probe]
+selection_log_path = "../../logs/shadow_run/r15-probe/probe_selected.jsonl"
+skip_log_path = "../../logs/shadow_run/r15-probe/probe_skipped.jsonl"
+transport_log_path = "../../logs/shadow_run/r15-probe/probe_transport.jsonl"
+entry_log_path = "../../logs/shadow_run/r15-probe/probe_entries.jsonl"
+lifecycle_log_path = "../../logs/shadow_run/r15-probe/probe_lifecycle.jsonl"
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            write_jsonl(
+                root / "logs/rollout/r15-probe/decisions/gatekeeper_v2_decisions.jsonl",
+                [
+                    {
+                        "candidate_id": "pool_mint_1000",
+                        "ab_record_id": "different-ab",
+                        "pool_id": "pool",
+                        "base_mint": "mint",
+                        "v3_replay_payload_schema_version": 1,
+                        "v3_feature_snapshot_hash": "feature-hash",
+                        "v3_policy_config_hash": "policy-hash",
+                    }
+                ],
+            )
+            probe_common = {
+                "candidate_id": "pool_mint_1000",
+                "ab_record_id": "source-ab",
+                "source_ab_record_id": "source-ab",
+                "pool_id": "pool",
+                "base_mint": "mint",
+                "probe_id": "probe-id",
+                "dispatch_source": "counterfactual_shadow_probe",
+                "collection_plane": "counterfactual_shadow_probe",
+                "probe_plane": "p37_shadow_probe",
+                "probe_bucket": "v3_pending_wait_sample",
+                "probe_amount_source": "fixed_lamports",
+                "v3_feature_snapshot_hash": "feature-hash",
+                "v3_policy_config_hash": "policy-hash",
+            }
+            write_jsonl(root / "logs/shadow_run/r15-probe/probe_selected.jsonl", [probe_common])
+            write_jsonl(root / "logs/shadow_run/r15-probe/probe_transport.jsonl", [probe_common])
+            write_jsonl(root / "logs/shadow_run/r15-probe/probe_entries.jsonl", [probe_common])
+
+            report = audit.build_report(config)
+
+        self.assertEqual(report["probe_readiness"]["status"], "not_ready")
+        self.assertEqual(report["probe_readiness"]["join_key_acceptance"], "fail")
+        self.assertEqual(report["probe_readiness"]["decision_join_acceptance"], "fail")
+        self.assertIn(
+            "probe_rows_missing_exact_decision_v3_join",
+            report["probe_readiness"]["reasons"],
+        )
+        self.assertEqual(
+            report["probe_decision_join"]["required_exact_decision_v3_join_coverage"],
+            0.0,
+        )
 
 
 if __name__ == "__main__":

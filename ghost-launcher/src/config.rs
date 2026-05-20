@@ -988,6 +988,34 @@ fn paths_equal(lhs: &str, rhs: &str) -> bool {
     lhs == rhs
 }
 
+fn validate_p37_shadow_probe_replay_payload_enabled(config: &LauncherConfig) -> Result<(), String> {
+    let path = Path::new(&config.ghost_brain_config_path);
+    let content = std::fs::read_to_string(path).map_err(|err| {
+        format!(
+            "[p37_shadow_probe] requires readable ghost_brain_config_path with [gatekeeper_v3].replay_payload_enabled=true: {} ({err})",
+            path.display()
+        )
+    })?;
+    let value = toml::from_str::<toml::Value>(&content).map_err(|err| {
+        format!(
+            "[p37_shadow_probe] failed to parse ghost brain config {}: {err}",
+            path.display()
+        )
+    })?;
+    let replay_payload_enabled = value
+        .get("gatekeeper_v3")
+        .and_then(|section| section.get("replay_payload_enabled"))
+        .and_then(|enabled| enabled.as_bool())
+        .unwrap_or(false);
+    if !replay_payload_enabled {
+        return Err(format!(
+            "[p37_shadow_probe] requires [gatekeeper_v3].replay_payload_enabled=true in ghost brain config: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 fn validate_p37_shadow_probe_contract(config: &LauncherConfig) -> Result<(), String> {
     let probe = &config.p37_shadow_probe;
     if !probe.enabled {
@@ -1020,6 +1048,12 @@ fn validate_p37_shadow_probe_contract(config: &LauncherConfig) -> Result<(), Str
     if probe.sample_modulus == 0 || probe.sample_threshold > probe.sample_modulus {
         return Err(
             "[p37_shadow_probe] requires sample_modulus > 0 and sample_threshold <= sample_modulus"
+                .to_string(),
+        );
+    }
+    if probe.append && (probe.run_id.trim().is_empty() || probe.session_id.trim().is_empty()) {
+        return Err(
+            "[p37_shadow_probe] append=true requires non-empty run_id and session_id on every probe row"
                 .to_string(),
         );
     }
@@ -1119,6 +1153,18 @@ fn validate_p37_shadow_probe_contract(config: &LauncherConfig) -> Result<(), Str
             );
         }
     }
+
+    if probe.require_unique_namespace && !probe.append {
+        for path in probe_paths {
+            if Path::new(path).exists() {
+                return Err(format!(
+                    "[p37_shadow_probe] append=false requires a clean probe namespace; output already exists: {path}"
+                ));
+            }
+        }
+    }
+
+    validate_p37_shadow_probe_replay_payload_enabled(config)?;
 
     Ok(())
 }
@@ -1811,6 +1857,12 @@ pub struct P37ShadowProbeConfig {
     #[serde(default = "default_p37_shadow_probe_sampling_version")]
     pub sampling_version: String,
 
+    #[serde(default)]
+    pub run_id: String,
+
+    #[serde(default)]
+    pub session_id: String,
+
     #[serde(default = "default_p37_shadow_probe_max_probes_per_run")]
     pub max_probes_per_run: usize,
 
@@ -1907,6 +1959,8 @@ impl Default for P37ShadowProbeConfig {
             sample_modulus: default_p37_shadow_probe_sample_modulus(),
             sample_threshold: default_p37_shadow_probe_sample_threshold(),
             sampling_version: default_p37_shadow_probe_sampling_version(),
+            run_id: String::new(),
+            session_id: String::new(),
             max_probes_per_run: default_p37_shadow_probe_max_probes_per_run(),
             max_probes_per_minute: default_p37_shadow_probe_max_probes_per_minute(),
             max_concurrent: default_p37_shadow_probe_max_concurrent(),
@@ -4253,7 +4307,15 @@ enabled = true
     fn p37_shadow_probe_config_loads_in_shadow_profile() {
         let base = unique_temp_dir("p37_shadow_probe_config_loads");
         let config_path = base.join("config.toml");
+        let brain_config_path = base.join("ghost_brain.toml");
+        fs::write(
+            &brain_config_path,
+            "[gatekeeper_v3]\nreplay_payload_enabled = true\n",
+        )
+        .unwrap();
         let config_body = r#"
+ghost_brain_config_path = "ghost_brain.toml"
+
 [seer]
 enabled = true
 source_mode = "pump_portal_ws"
@@ -4306,6 +4368,63 @@ lifecycle_log_path = "logs/probe/probe_shadow_lifecycle.jsonl"
     }
 
     #[test]
+    fn p37_shadow_probe_requires_v3_replay_payload_enabled() {
+        let base = unique_temp_dir("p37_shadow_probe_requires_replay_payload");
+        let config_path = base.join("config.toml");
+        fs::write(
+            base.join("ghost_brain.toml"),
+            "[gatekeeper_v3]\nreplay_payload_enabled = false\n",
+        )
+        .unwrap();
+        let config_body = r#"
+ghost_brain_config_path = "ghost_brain.toml"
+
+[seer]
+enabled = true
+source_mode = "pump_portal_ws"
+
+[gui_backend]
+enabled = true
+
+[trigger]
+entry_mode = "shadow_only"
+max_concurrent_positions = 2
+max_position_size_sol = 0.1
+emergency_floor_sol = 0.01
+position_size_buffer_sol = 0.001
+
+[trigger.shadow_run]
+enabled = true
+shadow_rpc_url = "https://shadow.example.com/api-key"
+payer_strategy = "ephemeral"
+output_path = "logs/active/buys.jsonl"
+
+[execution]
+execution_mode = "shadow"
+
+[execution.shadow]
+entry_log_path = "logs/active/shadow_entries.jsonl"
+lifecycle_log_path = "logs/active/shadow_lifecycle.jsonl"
+
+[p37_shadow_probe]
+enabled = true
+namespace = "probe-test"
+selection_log_path = "logs/probe/probe_selection.jsonl"
+skip_log_path = "logs/probe/probe_skips.jsonl"
+transport_log_path = "logs/probe/probe_transport.jsonl"
+entry_log_path = "logs/probe/probe_shadow_entries.jsonl"
+lifecycle_log_path = "logs/probe/probe_shadow_lifecycle.jsonl"
+"#;
+        fs::write(&config_path, config_body).unwrap();
+
+        let err = LauncherConfig::from_file(&config_path)
+            .expect_err("probe config must fail closed when V3 replay payload is disabled");
+
+        assert!(err.to_string().contains("p37_shadow_probe"));
+        assert!(err.to_string().contains("replay_payload_enabled=true"));
+    }
+
+    #[test]
     fn p37_shadow_probe_output_path_collision_fails_closed() {
         let mut config = LauncherConfig::default();
         config.execution.execution_mode = ExecutionMode::Shadow;
@@ -4349,6 +4468,73 @@ lifecycle_log_path = "logs/probe/probe_shadow_lifecycle.jsonl"
             .expect_err("P0 probe EventBus emission must fail closed");
 
         assert!(err.contains("emit_event_bus=false"));
+    }
+
+    #[test]
+    fn p37_shadow_probe_append_true_requires_run_and_session_id() {
+        let mut config = LauncherConfig::default();
+        config.execution.execution_mode = ExecutionMode::Shadow;
+        config.trigger.entry_mode = TriggerEntryMode::ShadowOnly;
+        config.trigger.max_concurrent_positions = 2;
+        config.trigger.max_position_size_sol = 0.1;
+        config.trigger.emergency_floor_sol = 0.01;
+        config.trigger.position_size_buffer_sol = 0.001;
+        config.trigger.shadow_run.enabled = true;
+        config.trigger.shadow_run.shadow_rpc_url = "https://shadow.example.com/api-key".to_string();
+        config.trigger.shadow_run.payer_strategy = TriggerShadowPayerStrategy::Ephemeral;
+        config.p37_shadow_probe.enabled = true;
+        config.p37_shadow_probe.append = true;
+
+        let err = config
+            .validate_execution_profile()
+            .expect_err("append=true must require row-level run/session identity");
+
+        assert!(err.contains("run_id"));
+        assert!(err.contains("session_id"));
+    }
+
+    #[test]
+    fn p37_shadow_probe_append_false_existing_output_fails_closed() {
+        let base = unique_temp_dir("p37_shadow_probe_existing_output");
+        let existing = base.join("probe_transport.jsonl");
+        fs::write(&existing, "{}\n").unwrap();
+
+        let mut config = LauncherConfig::default();
+        config.execution.execution_mode = ExecutionMode::Shadow;
+        config.trigger.entry_mode = TriggerEntryMode::ShadowOnly;
+        config.trigger.max_concurrent_positions = 2;
+        config.trigger.max_position_size_sol = 0.1;
+        config.trigger.emergency_floor_sol = 0.01;
+        config.trigger.position_size_buffer_sol = 0.001;
+        config.trigger.shadow_run.enabled = true;
+        config.trigger.shadow_run.shadow_rpc_url = "https://shadow.example.com/api-key".to_string();
+        config.trigger.shadow_run.payer_strategy = TriggerShadowPayerStrategy::Ephemeral;
+        config.p37_shadow_probe.enabled = true;
+        config.p37_shadow_probe.append = false;
+        config.p37_shadow_probe.selection_log_path = base
+            .join("probe_selection.jsonl")
+            .to_string_lossy()
+            .into_owned();
+        config.p37_shadow_probe.skip_log_path = base
+            .join("probe_skips.jsonl")
+            .to_string_lossy()
+            .into_owned();
+        config.p37_shadow_probe.transport_log_path = existing.to_string_lossy().into_owned();
+        config.p37_shadow_probe.entry_log_path = base
+            .join("probe_entries.jsonl")
+            .to_string_lossy()
+            .into_owned();
+        config.p37_shadow_probe.lifecycle_log_path = base
+            .join("probe_lifecycle.jsonl")
+            .to_string_lossy()
+            .into_owned();
+
+        let err = config
+            .validate_execution_profile()
+            .expect_err("append=false must require a clean output namespace");
+
+        assert!(err.contains("append=false"));
+        assert!(err.contains("already exists"));
     }
 
     #[test]

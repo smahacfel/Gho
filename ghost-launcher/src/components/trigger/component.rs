@@ -3667,6 +3667,24 @@ impl TriggerComponent {
         tip_lamports: u64,
         tip_floor_telemetry: Option<TipFloorResolutionTelemetry>,
     ) -> Result<PreparedBuyRequest> {
+        self.prepare_buy_request_with_tip_telemetry_and_amount_lamports(
+            mint,
+            account_overrides,
+            tip_lamports,
+            tip_floor_telemetry,
+            None,
+        )
+        .await
+    }
+
+    async fn prepare_buy_request_with_tip_telemetry_and_amount_lamports(
+        &self,
+        mint: &Pubkey,
+        account_overrides: &BuyAccountOverrides,
+        tip_lamports: u64,
+        tip_floor_telemetry: Option<TipFloorResolutionTelemetry>,
+        amount_lamports_override: Option<u64>,
+    ) -> Result<PreparedBuyRequest> {
         #[cfg(test)]
         self.prepared_request_invocations
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3800,14 +3818,43 @@ impl TriggerComponent {
             };
             preparation_telemetry.payer_balance_fetch_ms = payer_balance_fetch_ms;
             preparation_telemetry.payer_account_fetch_ms = payer_account_fetch_ms;
-            let (amount_lamports, effective_tip_lamports) = self
-                .resolve_safe_trade_budget(payer_balance_lamports, tip_lamports)
-                .map_err(|err| {
-                    if let Some(violation) = err.downcast_ref::<SafetyViolation>() {
-                        self.record_safety_rejection(violation);
+            let (amount_lamports, effective_tip_lamports) =
+                if let Some(override_lamports) = amount_lamports_override {
+                    if override_lamports == 0 {
+                        bail!("amount_lamports_override must be positive");
                     }
-                    err
-                })?;
+                    let (max_safe_lamports, _) = self
+                        .resolve_safe_trade_budget(payer_balance_lamports, tip_lamports)
+                        .map_err(|err| {
+                            if let Some(violation) = err.downcast_ref::<SafetyViolation>() {
+                                self.record_safety_rejection(violation);
+                            }
+                            err
+                        })?;
+                    if override_lamports > max_safe_lamports {
+                        let violation = SafetyViolation::TradeAmountExceedsMax {
+                            trade_amount: override_lamports as f64 / LAMPORTS_PER_SOL,
+                            max_safe: max_safe_lamports as f64 / LAMPORTS_PER_SOL,
+                        };
+                        self.record_safety_rejection(&violation);
+                        bail!(violation);
+                    }
+                    (
+                        override_lamports,
+                        self.effective_tip_lamports(
+                            tip_lamports,
+                            override_lamports as f64 / LAMPORTS_PER_SOL,
+                        ),
+                    )
+                } else {
+                    self.resolve_safe_trade_budget(payer_balance_lamports, tip_lamports)
+                        .map_err(|err| {
+                            if let Some(violation) = err.downcast_ref::<SafetyViolation>() {
+                                self.record_safety_rejection(violation);
+                            }
+                            err
+                        })?
+                };
             Self::validate_payer_balance_for_buy(
                 &payer_pubkey,
                 payer_balance_lamports,
@@ -3827,7 +3874,14 @@ impl TriggerComponent {
             let ((mint_account, mint_account_fetch_ms), speculative_probe) =
                 tokio::try_join!(mint_account_fetch, speculative_ata_probe)?;
             (
-                self.configured_trade_amount_lamports()?,
+                amount_lamports_override
+                    .map(|amount| {
+                        if amount == 0 {
+                            bail!("amount_lamports_override must be positive");
+                        }
+                        Ok(amount)
+                    })
+                    .unwrap_or_else(|| self.configured_trade_amount_lamports())?,
                 tip_lamports,
                 None,
                 mint_account,
@@ -3837,7 +3891,14 @@ impl TriggerComponent {
         } else {
             let (mint_account, mint_account_fetch_ms) = mint_account_fetch.await?;
             (
-                self.configured_trade_amount_lamports()?,
+                amount_lamports_override
+                    .map(|amount| {
+                        if amount == 0 {
+                            bail!("amount_lamports_override must be positive");
+                        }
+                        Ok(amount)
+                    })
+                    .unwrap_or_else(|| self.configured_trade_amount_lamports())?,
                 tip_lamports,
                 None,
                 mint_account,
@@ -4168,8 +4229,32 @@ impl TriggerComponent {
         tip_lamports: u64,
         decision_ts_ms: Option<u64>,
     ) -> Result<PreparedBuyRequest> {
+        self.prepare_buy_request_with_decision_ts_and_amount_lamports(
+            mint,
+            account_overrides,
+            tip_lamports,
+            decision_ts_ms,
+            None,
+        )
+        .await
+    }
+
+    pub async fn prepare_buy_request_with_decision_ts_and_amount_lamports(
+        &self,
+        mint: &Pubkey,
+        account_overrides: &BuyAccountOverrides,
+        tip_lamports: u64,
+        decision_ts_ms: Option<u64>,
+        amount_lamports_override: Option<u64>,
+    ) -> Result<PreparedBuyRequest> {
         let mut request = self
-            .prepare_buy_request(mint, account_overrides, tip_lamports)
+            .prepare_buy_request_with_tip_telemetry_and_amount_lamports(
+                mint,
+                account_overrides,
+                tip_lamports,
+                None,
+                amount_lamports_override,
+            )
             .await?;
         if let Some(decision_ts_ms) = decision_ts_ms {
             request.decision_ts_ms = decision_ts_ms;
@@ -4227,6 +4312,15 @@ impl TriggerComponent {
             failed_request: Some(request_for_error),
             failed_context: None,
         }
+    }
+
+    pub async fn simulate_counterfactual_shadow_probe(
+        &self,
+        request: &PreparedBuyRequest,
+    ) -> Result<super::shadow_run::ShadowBuySimulationReport> {
+        self.shadow_simulator
+            .simulate_buy(request, &self.config.shadow_run)
+            .await
     }
 
     pub fn spawn_shadow_simulation(&self, request: PreparedBuyRequest) -> PendingShadowSimulation {
@@ -7814,6 +7908,93 @@ mod tests {
         }
 
         drop(active_position_lease);
+        assert_eq!(trigger.active_positions(), 0);
+    }
+
+    #[tokio::test]
+    async fn p37_counterfactual_probe_simulates_without_active_position_slot() {
+        let mut config = create_test_config();
+        config.entry_mode = crate::config::TriggerEntryMode::ShadowOnly;
+        config.shadow_run.enabled = true;
+        config.max_concurrent_positions = 1;
+
+        let trigger =
+            TriggerComponent::new_with_shadow_simulator(config, Arc::new(MockShadowSimulator));
+        let payer = Keypair::new();
+        let mint = Pubkey::new_unique();
+        let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).expect("valid token program");
+        let overrides = valid_buy_account_overrides();
+        let amount_lamports = trigger
+            .configured_trade_amount_lamports()
+            .expect("configured amount");
+        let request = trigger
+            .build_prepared_buy_request(
+                &payer,
+                &mint,
+                &token_program,
+                false,
+                &overrides,
+                amount_lamports,
+                1_000_000,
+                Hash::new_unique(),
+            )
+            .expect("prepared request");
+
+        let report = trigger
+            .simulate_counterfactual_shadow_probe(&request)
+            .await
+            .expect("counterfactual probe simulation");
+
+        assert_eq!(report.mint, mint.to_string());
+        assert_eq!(report.units_consumed, Some(42_000));
+        assert_eq!(trigger.active_positions(), 0);
+    }
+
+    #[tokio::test]
+    async fn p37_counterfactual_probe_fixed_lamports_override_sets_request_amount() {
+        let payer = Keypair::new();
+        let mint = Pubkey::new_unique();
+        let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).expect("valid token program");
+        let user_ata =
+            get_associated_token_address_with_program_id(&payer.pubkey(), &mint, &token_program);
+        let rpc_url =
+            spawn_prepare_buy_rpc_server(payer.pubkey(), mint, user_ata, token_program).await;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let keypair_path = temp.path().join("payer.json");
+        solana_sdk::signature::write_keypair_file(&payer, &keypair_path)
+            .expect("write payer keypair");
+
+        let mut config = create_test_config_with_rpc_url(rpc_url);
+        config.keypair_path = Some(keypair_path.to_string_lossy().to_string());
+        config.max_position_size_sol = 0.02;
+        let trigger =
+            TriggerComponent::new_with_shadow_simulator(config, Arc::new(MockShadowSimulator));
+        let fixed_lamports = 7_000_000;
+
+        let request = trigger
+            .prepare_buy_request_with_decision_ts_and_amount_lamports(
+                &mint,
+                &valid_buy_account_overrides(),
+                1_000_000,
+                Some(1_234),
+                Some(fixed_lamports),
+            )
+            .await
+            .expect("fixed-lamports probe request");
+
+        assert_eq!(request.amount_lamports, fixed_lamports);
+        assert_ne!(
+            request.amount_lamports,
+            trigger
+                .configured_trade_amount_lamports()
+                .expect("configured amount")
+        );
+
+        let report = trigger
+            .simulate_counterfactual_shadow_probe(&request)
+            .await
+            .expect("counterfactual probe simulation");
+        assert_eq!(report.amount_lamports, fixed_lamports);
         assert_eq!(trigger.active_positions(), 0);
     }
 

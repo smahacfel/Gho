@@ -113,7 +113,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::watch;
+use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, info, trace, warn};
 
 // =============================================================================
@@ -1558,6 +1558,7 @@ pub struct OracleRuntime {
 
     /// Rollback reeval seeds recovered during WAL replay at startup.
     recovered_rollback_seeds: Mutex<Vec<ghost_core::wal::RollbackReevalSeedRecord>>,
+    p37_shadow_probe_state: Arc<P37ShadowProbeRuntimeState>,
 }
 
 impl OracleRuntime {
@@ -1670,6 +1671,9 @@ impl OracleRuntime {
             config.session_manager_config(),
             Arc::clone(&account_state_core),
         ));
+        let p37_shadow_probe_state = Arc::new(P37ShadowProbeRuntimeState::new(
+            config.p37_shadow_probe.max_concurrent,
+        ));
         let runtime = Self {
             config,
             hyper_oracle,
@@ -1703,6 +1707,7 @@ impl OracleRuntime {
             wal: None,
             wal_disabled_due_to_enospc: AtomicBool::new(false),
             recovered_rollback_seeds: Mutex::new(Vec::new()),
+            p37_shadow_probe_state,
         };
 
         runtime
@@ -4659,6 +4664,76 @@ struct P37ShadowProbeCandidate {
     source_decision_plane: Option<String>,
 }
 
+#[derive(Debug)]
+struct P37ShadowProbeRuntimeState {
+    run_count: AtomicUsize,
+    per_minute_window: Mutex<VecDeque<u64>>,
+    seen_probe_ids: Mutex<HashSet<String>>,
+    semaphore: Arc<Semaphore>,
+}
+
+impl P37ShadowProbeRuntimeState {
+    fn new(max_concurrent: usize) -> Self {
+        Self {
+            run_count: AtomicUsize::new(0),
+            per_minute_window: Mutex::new(VecDeque::new()),
+            seen_probe_ids: Mutex::new(HashSet::new()),
+            semaphore: Arc::new(Semaphore::new(max_concurrent.max(1))),
+        }
+    }
+
+    fn try_reserve(
+        &self,
+        config: &P37ShadowProbeConfig,
+        record: &P37ShadowProbeSelectionRecord,
+        now_ms: u64,
+    ) -> Result<OwnedSemaphorePermit, String> {
+        {
+            let mut window = self.per_minute_window.lock();
+            while window
+                .front()
+                .is_some_and(|oldest| now_ms.saturating_sub(*oldest) >= 60_000)
+            {
+                window.pop_front();
+            }
+            if window.len() >= config.max_probes_per_minute {
+                return Err("probe_rate_limit_exceeded".to_string());
+            }
+            window.push_back(now_ms);
+        }
+
+        let permit = self
+            .semaphore
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| "probe_concurrency_limit_exceeded".to_string())?;
+
+        if self
+            .run_count
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                (current < config.max_probes_per_run).then_some(current + 1)
+            })
+            .is_err()
+        {
+            drop(permit);
+            return Err("max_probes_per_run_exceeded".to_string());
+        }
+
+        if config.dedupe_by_probe_id {
+            if let Some(probe_id) = record.probe_id.as_deref() {
+                let mut seen = self.seen_probe_ids.lock();
+                if !seen.insert(probe_id.to_string()) {
+                    self.run_count.fetch_sub(1, Ordering::Relaxed);
+                    drop(permit);
+                    return Err("duplicate_probe_id".to_string());
+                }
+            }
+        }
+
+        Ok(permit)
+    }
+}
+
 impl P37ShadowProbeCandidate {
     fn from_gatekeeper_log(
         log: &ghost_brain::oracle::GatekeeperBuyLog,
@@ -4704,6 +4779,8 @@ struct P37ShadowProbeSelectionRecord {
     dispatch_source: String,
     source_decision_plane: Option<String>,
     rollout_namespace: String,
+    run_id: Option<String>,
+    session_id: Option<String>,
     probe_id: Option<String>,
     source_ab_record_id: Option<String>,
     ab_record_id: Option<String>,
@@ -4753,6 +4830,8 @@ struct P37ShadowProbeTransportRecord {
     collection_plane: String,
     probe_plane: String,
     dispatch_source: String,
+    run_id: Option<String>,
+    session_id: Option<String>,
     candidate_id: String,
     pool_amm_id: String,
     pool_id: String,
@@ -4760,6 +4839,7 @@ struct P37ShadowProbeTransportRecord {
     mint_id: String,
     decision_ts_ms: u64,
     probe_selected_ts_ms: u64,
+    probe_dispatch_ts_ms: u64,
     transport_ts_ms: u64,
     sim_started_ts_ms: u64,
     sim_finished_ts_ms: u64,
@@ -4770,6 +4850,9 @@ struct P37ShadowProbeTransportRecord {
     probe_slippage_bps: u64,
     probe_quote_age_max_ms: u64,
     probe_curve_age_max_ms: u64,
+    quote_age_ms: Option<u64>,
+    curve_age_ms: Option<u64>,
+    probe_age_status: Option<String>,
     tip_lamports: u64,
     payer_provenance: String,
     err: Option<String>,
@@ -5019,6 +5102,8 @@ fn p37_shadow_probe_selection_record(
         dispatch_source: config.dispatch_source.clone(),
         source_decision_plane: candidate.source_decision_plane.clone(),
         rollout_namespace: candidate.rollout_namespace.clone(),
+        run_id: (!config.run_id.trim().is_empty()).then(|| config.run_id.clone()),
+        session_id: (!config.session_id.trim().is_empty()).then(|| config.session_id.clone()),
         probe_id,
         source_ab_record_id: source_ab_record_id.clone(),
         ab_record_id: source_ab_record_id,
@@ -5114,6 +5199,8 @@ fn p37_shadow_probe_artifact_records(
         collection_plane: record.collection_plane.clone(),
         probe_plane: record.probe_plane.clone(),
         dispatch_source: record.dispatch_source.clone(),
+        run_id: record.run_id.clone(),
+        session_id: record.session_id.clone(),
         candidate_id: candidate_id.clone(),
         pool_amm_id: record.pool_id.clone(),
         pool_id: record.pool_id.clone(),
@@ -5121,6 +5208,7 @@ fn p37_shadow_probe_artifact_records(
         mint_id: base_mint.clone(),
         decision_ts_ms,
         probe_selected_ts_ms: record.probe_selected_ts_ms,
+        probe_dispatch_ts_ms: now_ms,
         transport_ts_ms: now_ms,
         sim_started_ts_ms: now_ms,
         sim_finished_ts_ms: now_ms,
@@ -5131,6 +5219,9 @@ fn p37_shadow_probe_artifact_records(
         probe_slippage_bps: record.probe_slippage_bps,
         probe_quote_age_max_ms: record.probe_quote_age_max_ms,
         probe_curve_age_max_ms: record.probe_curve_age_max_ms,
+        quote_age_ms: None,
+        curve_age_ms: None,
+        probe_age_status: Some("harness_no_simulation_age_unavailable".to_string()),
         tip_lamports: 0,
         payer_provenance: "counterfactual_shadow_probe".to_string(),
         err: None,
@@ -5149,6 +5240,22 @@ fn p37_shadow_probe_artifact_records(
 
     let entry = ShadowEntryRecord {
         join_metadata,
+        schema_version: 1,
+        collection_plane: Some(record.collection_plane.clone()),
+        dispatch_source: Some(record.dispatch_source.clone()),
+        probe_plane: Some(record.probe_plane.clone()),
+        probe_bucket: Some(record.probe_bucket.clone()),
+        run_id: record.run_id.clone(),
+        session_id: record.session_id.clone(),
+        probe_position_id: None,
+        decision_ts_ms: Some(decision_ts_ms),
+        probe_dispatch_ts_ms: Some(now_ms),
+        probe_amount_lamports: Some(record.probe_amount_lamports),
+        probe_amount_source: Some(record.probe_amount_source.clone()),
+        probe_slippage_bps: Some(record.probe_slippage_bps),
+        quote_age_ms: None,
+        curve_age_ms: None,
+        probe_age_status: Some("harness_no_simulation_age_unavailable".to_string()),
         timestamp: format_shadow_entry_timestamp(now_ms),
         pool_id: record.pool_id.clone(),
         mint_id: base_mint,
@@ -5220,9 +5327,300 @@ async fn append_p37_shadow_probe_selection_record(
     Ok(())
 }
 
-fn maybe_spawn_p37_shadow_probe_selection_log(
+fn p37_shadow_probe_as_skip(
+    mut record: P37ShadowProbeSelectionRecord,
+    reason: impl Into<String>,
+) -> P37ShadowProbeSelectionRecord {
+    record.event_type = "probe_skipped".to_string();
+    record.probe_skip_reason = Some(reason.into());
+    record.probe_sample_reason = None;
+    record
+}
+
+async fn append_p37_shadow_probe_record(
+    config: &P37ShadowProbeConfig,
+    record: &P37ShadowProbeSelectionRecord,
+) -> anyhow::Result<()> {
+    let log_path = if record.event_type == "probe_selected" {
+        std::path::Path::new(&config.selection_log_path)
+    } else {
+        std::path::Path::new(&config.skip_log_path)
+    };
+    append_p37_shadow_probe_selection_record(log_path, record).await
+}
+
+fn p37_shadow_probe_transport_from_event(
+    record: &P37ShadowProbeSelectionRecord,
+    event: &crate::events::ShadowBuySimulationEvent,
+    dispatch_ts_ms: u64,
+) -> P37ShadowProbeTransportRecord {
+    P37ShadowProbeTransportRecord {
+        join_metadata: event.join_metadata.clone(),
+        schema_version: 1,
+        event_type: "counterfactual_shadow_probe_transport".to_string(),
+        collection_plane: record.collection_plane.clone(),
+        probe_plane: record.probe_plane.clone(),
+        dispatch_source: record.dispatch_source.clone(),
+        run_id: record.run_id.clone(),
+        session_id: record.session_id.clone(),
+        candidate_id: event.candidate_id.clone(),
+        pool_amm_id: event.pool_amm_id.clone(),
+        pool_id: event.pool_amm_id.clone(),
+        base_mint: event.base_mint.clone(),
+        mint_id: event.base_mint.clone(),
+        decision_ts_ms: event.decision_ts_ms,
+        probe_selected_ts_ms: record.probe_selected_ts_ms,
+        probe_dispatch_ts_ms: dispatch_ts_ms,
+        transport_ts_ms: current_time_ms(),
+        sim_started_ts_ms: event.simulation_started_ts_ms,
+        sim_finished_ts_ms: event.simulation_finished_ts_ms,
+        decision_to_sim_start_ms: event
+            .simulation_started_ts_ms
+            .saturating_sub(event.decision_ts_ms),
+        shadow_duration_ms: event.shadow_duration_ms,
+        amount_lamports: event.amount_lamports,
+        probe_amount_source: record.probe_amount_source.clone(),
+        probe_slippage_bps: record.probe_slippage_bps,
+        probe_quote_age_max_ms: record.probe_quote_age_max_ms,
+        probe_curve_age_max_ms: record.probe_curve_age_max_ms,
+        quote_age_ms: None,
+        curve_age_ms: None,
+        probe_age_status: Some("age_not_available_from_shadow_sim_report".to_string()),
+        tip_lamports: event.tip_lamports,
+        payer_provenance: event.payer_provenance.clone(),
+        err: event.err.clone(),
+        error_class: event.error_class.clone(),
+        live_signature: event.live_signature.clone(),
+        execution_outcome: if event.err.is_some() {
+            "counterfactual_shadow_probe_simulation_error".to_string()
+        } else {
+            "counterfactual_shadow_probe_simulated".to_string()
+        },
+        probe_bucket: record.probe_bucket.clone(),
+        probe_bucket_reason: record.probe_bucket_reason.clone(),
+        probe_bucket_version: record.probe_bucket_version.clone(),
+        active_verdict_type: record.active_verdict_type.clone(),
+        active_verdict_buy: record.active_verdict_buy,
+        active_reason_code: record.active_reason_code.clone(),
+        v3_shadow_verdict: record.v3_shadow_verdict.clone(),
+        v3_shadow_reason_code: record.v3_shadow_reason_code.clone(),
+    }
+}
+
+fn p37_shadow_probe_transport_from_error(
+    record: &P37ShadowProbeSelectionRecord,
+    request: &crate::components::trigger::PreparedBuyRequest,
+    err: &anyhow::Error,
+    dispatch_ts_ms: u64,
+) -> P37ShadowProbeTransportRecord {
+    let now_ms = current_time_ms();
+    let base_mint = record.base_mint.clone().unwrap_or_default();
+    P37ShadowProbeTransportRecord {
+        join_metadata: request.join_metadata.clone(),
+        schema_version: 1,
+        event_type: "counterfactual_shadow_probe_transport".to_string(),
+        collection_plane: record.collection_plane.clone(),
+        probe_plane: record.probe_plane.clone(),
+        dispatch_source: record.dispatch_source.clone(),
+        run_id: record.run_id.clone(),
+        session_id: record.session_id.clone(),
+        candidate_id: p37_shadow_probe_candidate_id(record).unwrap_or_default(),
+        pool_amm_id: record.pool_id.clone(),
+        pool_id: record.pool_id.clone(),
+        base_mint: base_mint.clone(),
+        mint_id: base_mint,
+        decision_ts_ms: request.decision_ts_ms,
+        probe_selected_ts_ms: record.probe_selected_ts_ms,
+        probe_dispatch_ts_ms: dispatch_ts_ms,
+        transport_ts_ms: now_ms,
+        sim_started_ts_ms: dispatch_ts_ms,
+        sim_finished_ts_ms: now_ms,
+        decision_to_sim_start_ms: dispatch_ts_ms.saturating_sub(request.decision_ts_ms),
+        shadow_duration_ms: now_ms.saturating_sub(dispatch_ts_ms),
+        amount_lamports: request.amount_lamports,
+        probe_amount_source: record.probe_amount_source.clone(),
+        probe_slippage_bps: record.probe_slippage_bps,
+        probe_quote_age_max_ms: record.probe_quote_age_max_ms,
+        probe_curve_age_max_ms: record.probe_curve_age_max_ms,
+        quote_age_ms: None,
+        curve_age_ms: None,
+        probe_age_status: Some("age_not_available_simulation_failed".to_string()),
+        tip_lamports: request.tip_lamports,
+        payer_provenance: request.payer_provenance.to_string(),
+        err: Some(err.to_string()),
+        error_class: Some("simulation_failure".to_string()),
+        live_signature: None,
+        execution_outcome: "counterfactual_shadow_probe_simulation_failed".to_string(),
+        probe_bucket: record.probe_bucket.clone(),
+        probe_bucket_reason: record.probe_bucket_reason.clone(),
+        probe_bucket_version: record.probe_bucket_version.clone(),
+        active_verdict_type: record.active_verdict_type.clone(),
+        active_verdict_buy: record.active_verdict_buy,
+        active_reason_code: record.active_reason_code.clone(),
+        v3_shadow_verdict: record.v3_shadow_verdict.clone(),
+        v3_shadow_reason_code: record.v3_shadow_reason_code.clone(),
+    }
+}
+
+fn enrich_probe_shadow_entry(
+    entry: &mut ShadowEntryRecord,
+    record: &P37ShadowProbeSelectionRecord,
+    request: &crate::components::trigger::PreparedBuyRequest,
+    dispatch_ts_ms: u64,
+) {
+    entry.collection_plane = Some(record.collection_plane.clone());
+    entry.dispatch_source = Some(record.dispatch_source.clone());
+    entry.probe_plane = Some(record.probe_plane.clone());
+    entry.probe_bucket = Some(record.probe_bucket.clone());
+    entry.run_id = record.run_id.clone();
+    entry.session_id = record.session_id.clone();
+    entry.probe_position_id = record
+        .probe_id
+        .as_ref()
+        .map(|probe_id| format!("probe-position:{probe_id}"));
+    entry.decision_ts_ms = Some(request.decision_ts_ms);
+    entry.probe_dispatch_ts_ms = Some(dispatch_ts_ms);
+    entry.probe_amount_lamports = Some(request.amount_lamports);
+    entry.probe_amount_source = Some(record.probe_amount_source.clone());
+    entry.probe_slippage_bps = Some(record.probe_slippage_bps);
+    entry.quote_age_ms = None;
+    entry.curve_age_ms = None;
+    entry.probe_age_status = Some("age_not_available_from_shadow_sim_report".to_string());
+}
+
+async fn run_p37_shadow_probe_dispatch(
+    config: P37ShadowProbeConfig,
+    trigger_component: Arc<crate::components::trigger::TriggerComponent>,
+    oracle_runtime: Arc<OracleRuntime>,
+    record: P37ShadowProbeSelectionRecord,
+    pool_data: Arc<DetectedPool>,
+    buffered_txs: Vec<crate::components::gatekeeper::GatekeeperBufferedTx>,
+    buy_mint: Pubkey,
+    _permit: OwnedSemaphorePermit,
+) {
+    let decision_ts_ms = record.decision_ts_ms.unwrap_or_else(current_time_ms);
+    let mut account_overrides = derive_buy_account_overrides(&buffered_txs);
+    if account_overrides.creator_pubkey.is_none() {
+        account_overrides.creator_pubkey = Pubkey::try_from(pool_data.creator.as_str()).ok();
+    }
+    if matches!(
+        account_overrides.buy_variant,
+        Some(trigger::PumpfunBuyVariant::LegacyBuy)
+    ) {
+        account_overrides.legacy_buy_curve =
+            oracle_runtime.resolve_trigger_buy_curve(buy_mint, &buffered_txs);
+    }
+
+    let amount_lamports_override = match config.probe_amount_source.as_str() {
+        "fixed_lamports" => Some(config.probe_amount_lamports),
+        _ => None,
+    };
+    let prepare_result = trigger_component
+        .prepare_buy_request_with_decision_ts_and_amount_lamports(
+            &buy_mint,
+            &account_overrides,
+            0,
+            Some(decision_ts_ms),
+            amount_lamports_override,
+        )
+        .await
+        .map(|request| {
+            if let Some(join_metadata) = p37_shadow_probe_join_metadata(&record) {
+                request.with_join_metadata(join_metadata)
+            } else {
+                request
+            }
+        });
+
+    let request = match prepare_result {
+        Ok(request) => request,
+        Err(err) => {
+            warn!(
+                probe_id = ?record.probe_id,
+                source_ab_record_id = ?record.source_ab_record_id,
+                error = %err,
+                "P37_SHADOW_PROBE_PREPARE_FAILED"
+            );
+            return;
+        }
+    };
+
+    let dispatch_ts_ms = current_time_ms();
+    match trigger_component
+        .simulate_counterfactual_shadow_probe(&request)
+        .await
+    {
+        Ok(report) => {
+            let event = crate::components::trigger::shadow_run::shadow_buy_event_from_report(
+                &record.pool_id,
+                record.base_mint.as_deref().unwrap_or(&pool_data.base_mint),
+                report,
+            );
+            let transport = p37_shadow_probe_transport_from_event(&record, &event, dispatch_ts_ms);
+            if let Err(err) = append_p37_shadow_probe_transport_record(
+                std::path::Path::new(&config.transport_log_path),
+                &transport,
+            )
+            .await
+            {
+                warn!(
+                    probe_id = ?record.probe_id,
+                    error = %err,
+                    "P37_SHADOW_PROBE_TRANSPORT_WRITE_FAILED"
+                );
+            }
+
+            if let Some(mut entry) = shadow_entry_record_from_event(
+                Pubkey::try_from(record.pool_id.as_str()).unwrap_or(buy_mint),
+                record.base_mint.as_deref().unwrap_or(&pool_data.base_mint),
+                request.trade_value_sol,
+                &event,
+                &transport.execution_outcome,
+            ) {
+                enrich_probe_shadow_entry(&mut entry, &record, &request, dispatch_ts_ms);
+                if let Err(err) =
+                    append_shadow_entry_record(std::path::Path::new(&config.entry_log_path), &entry)
+                        .await
+                {
+                    warn!(
+                        probe_id = ?record.probe_id,
+                        error = %err,
+                        "P37_SHADOW_PROBE_ENTRY_WRITE_FAILED"
+                    );
+                }
+            } else {
+                warn!(
+                    probe_id = ?record.probe_id,
+                    source_ab_record_id = ?record.source_ab_record_id,
+                    "P37_SHADOW_PROBE_ENTRY_NOT_WRITTEN_NO_EXECUTABLE_ENTRY_PRICE"
+                );
+            }
+        }
+        Err(err) => {
+            let transport =
+                p37_shadow_probe_transport_from_error(&record, &request, &err, dispatch_ts_ms);
+            if let Err(write_err) = append_p37_shadow_probe_transport_record(
+                std::path::Path::new(&config.transport_log_path),
+                &transport,
+            )
+            .await
+            {
+                warn!(
+                    probe_id = ?record.probe_id,
+                    error = %write_err,
+                    "P37_SHADOW_PROBE_FAILURE_TRANSPORT_WRITE_FAILED"
+                );
+            }
+        }
+    }
+}
+
+async fn maybe_handle_p37_shadow_probe_decision(
     ctx: &PoolObservationContext,
     log: &ghost_brain::oracle::GatekeeperBuyLog,
+    pool_data: Option<Arc<DetectedPool>>,
+    buffered_txs: &[crate::components::gatekeeper::GatekeeperBufferedTx],
+    base_mint_pubkey: Option<Pubkey>,
 ) {
     let config = &ctx.p37_shadow_probe_config;
     if !config.enabled {
@@ -5230,42 +5628,53 @@ fn maybe_spawn_p37_shadow_probe_selection_log(
     }
     let candidate =
         P37ShadowProbeCandidate::from_gatekeeper_log(log, &ctx.gatekeeper_rollout_profile);
-    let record = p37_shadow_probe_selection_record(config, &candidate, current_time_ms());
-    let log_path = if record.event_type == "probe_selected" {
-        std::path::PathBuf::from(&config.selection_log_path)
-    } else {
-        std::path::PathBuf::from(&config.skip_log_path)
-    };
-    let config = config.clone();
-    tokio::spawn(async move {
-        if let Err(err) = append_p37_shadow_probe_selection_record(&log_path, &record).await {
-            warn!(
-                path = %log_path.display(),
-                error = %err,
-                "P37_SHADOW_PROBE_SELECTION_LOG_WRITE_FAILED"
-            );
-        }
-        if record.event_type == "probe_selected" {
-            match append_p37_shadow_probe_p0_artifacts(&config, &record, current_time_ms()).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    warn!(
-                        probe_id = ?record.probe_id,
-                        source_ab_record_id = ?record.source_ab_record_id,
-                        "P37_SHADOW_PROBE_ARTIFACT_SKIPPED_AFTER_SELECTION"
-                    );
+    let mut record = p37_shadow_probe_selection_record(config, &candidate, current_time_ms());
+
+    if record.event_type == "probe_selected" {
+        if ctx.trigger.is_none() {
+            record = p37_shadow_probe_as_skip(record, "probe_trigger_unavailable");
+        } else if pool_data.is_none() {
+            record = p37_shadow_probe_as_skip(record, "probe_pool_metadata_unavailable");
+        } else if base_mint_pubkey.is_none() {
+            record = p37_shadow_probe_as_skip(record, "invalid_mint_identity");
+        } else if let Err(reason) = ctx
+            .p37_shadow_probe_state
+            .try_reserve(config, &record, current_time_ms())
+            .map(|permit| {
+                let trigger_component = ctx.trigger.as_ref().map(Arc::clone);
+                let pool_data = pool_data.clone();
+                let buffered_txs = buffered_txs.to_vec();
+                let buy_mint = base_mint_pubkey;
+                let config = config.clone();
+                let oracle_runtime = Arc::clone(&ctx.oracle_runtime);
+                if let (Some(trigger_component), Some(pool_data), Some(buy_mint)) =
+                    (trigger_component, pool_data, buy_mint)
+                {
+                    tokio::spawn(run_p37_shadow_probe_dispatch(
+                        config,
+                        trigger_component,
+                        oracle_runtime,
+                        record.clone(),
+                        pool_data,
+                        buffered_txs,
+                        buy_mint,
+                        permit,
+                    ));
                 }
-                Err(err) => {
-                    warn!(
-                        probe_id = ?record.probe_id,
-                        source_ab_record_id = ?record.source_ab_record_id,
-                        error = %err,
-                        "P37_SHADOW_PROBE_ARTIFACT_WRITE_FAILED"
-                    );
-                }
-            }
+            })
+        {
+            record = p37_shadow_probe_as_skip(record, reason);
         }
-    });
+    }
+
+    if let Err(err) = append_p37_shadow_probe_record(config, &record).await {
+        warn!(
+            probe_id = ?record.probe_id,
+            source_ab_record_id = ?record.source_ab_record_id,
+            error = %err,
+            "P37_SHADOW_PROBE_SELECTION_LOG_WRITE_FAILED"
+        );
+    }
 }
 
 fn canonical_gatekeeper_config_hash(
@@ -5832,6 +6241,7 @@ struct PoolObservationContext {
     cross_pool_velocity_config: CrossPoolVelocityConfig,
     funding_source_config: FundingSourceConfig,
     p37_shadow_probe_config: P37ShadowProbeConfig,
+    p37_shadow_probe_state: Arc<P37ShadowProbeRuntimeState>,
     authoritative_funding_coverage_gate_enabled: bool,
     fingerprint_config: EarlyFingerprintConfig,
     event_emitter: Option<Arc<EventEmitter>>,
@@ -7436,6 +7846,22 @@ fn shadow_entry_record_from_event(
     };
     Some(ShadowEntryRecord {
         join_metadata: event.join_metadata.clone(),
+        schema_version: 1,
+        collection_plane: None,
+        dispatch_source: None,
+        probe_plane: None,
+        probe_bucket: None,
+        run_id: None,
+        session_id: None,
+        probe_position_id: None,
+        decision_ts_ms: Some(event.decision_ts_ms),
+        probe_dispatch_ts_ms: None,
+        probe_amount_lamports: None,
+        probe_amount_source: None,
+        probe_slippage_bps: None,
+        quote_age_ms: None,
+        curve_age_ms: None,
+        probe_age_status: None,
         timestamp: format_shadow_entry_timestamp(entry_execution_ts_ms),
         pool_id: pool_amm_id.to_string(),
         mint_id: base_mint.to_string(),
@@ -7458,6 +7884,22 @@ fn shadow_entry_record_from_request(
 ) -> Option<ShadowEntryRecord> {
     Some(ShadowEntryRecord {
         join_metadata: request.join_metadata.clone(),
+        schema_version: 1,
+        collection_plane: None,
+        dispatch_source: None,
+        probe_plane: None,
+        probe_bucket: None,
+        run_id: None,
+        session_id: None,
+        probe_position_id: None,
+        decision_ts_ms: Some(request.decision_ts_ms),
+        probe_dispatch_ts_ms: None,
+        probe_amount_lamports: None,
+        probe_amount_source: None,
+        probe_slippage_bps: None,
+        quote_age_ms: None,
+        curve_age_ms: None,
+        probe_age_status: None,
         timestamp: format_shadow_entry_timestamp(request.decision_ts_ms),
         pool_id: pool_amm_id.to_string(),
         mint_id: base_mint.to_string(),
@@ -7731,6 +8173,38 @@ struct TriggerBuyOutcomeApplied {
 struct ShadowEntryRecord {
     #[serde(flatten)]
     join_metadata: ExecutionJoinMetadata,
+    #[serde(default = "default_shadow_entry_schema_version")]
+    schema_version: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    collection_plane: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dispatch_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    probe_plane: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    probe_bucket: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    probe_position_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decision_ts_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    probe_dispatch_ts_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    probe_amount_lamports: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    probe_amount_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    probe_slippage_bps: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quote_age_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    curve_age_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    probe_age_status: Option<String>,
     timestamp: String,
     pool_id: String,
     mint_id: String,
@@ -7747,6 +8221,10 @@ struct ShadowEntryRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     timing_source: Option<String>,
     execution_outcome: String,
+}
+
+fn default_shadow_entry_schema_version() -> u32 {
+    1
 }
 
 const LIVE_POST_BUY_HANDOFF_RETRY_ATTEMPTS: u32 = 3;
@@ -9381,7 +9859,18 @@ async fn pool_observation_task(
                         &window_state,
                     );
                 }
-                maybe_spawn_p37_shadow_probe_selection_log(ctx.as_ref(), &buy_log);
+                let probe_buffered_txs = {
+                    let session = session.read();
+                    session.gatekeeper_buffer().buffered_txs_slice().to_vec()
+                };
+                maybe_handle_p37_shadow_probe_decision(
+                    ctx.as_ref(),
+                    &buy_log,
+                    pool_data.clone(),
+                    &probe_buffered_txs,
+                    base_mint_pubkey,
+                )
+                .await;
                 let dl = ctx.decision_logger.clone();
                 tokio::spawn(async move {
                     dl.log_gatekeeper_buy_decision(buy_log).await;
@@ -9484,7 +9973,18 @@ async fn pool_observation_task(
                         &window_state,
                     );
                 }
-                maybe_spawn_p37_shadow_probe_selection_log(ctx.as_ref(), &buy_log);
+                let probe_buffered_txs = {
+                    let session = session.read();
+                    session.gatekeeper_buffer().buffered_txs_slice().to_vec()
+                };
+                maybe_handle_p37_shadow_probe_decision(
+                    ctx.as_ref(),
+                    &buy_log,
+                    pool_data.clone(),
+                    &probe_buffered_txs,
+                    base_mint_pubkey,
+                )
+                .await;
                 let dl = ctx.decision_logger.clone();
                 tokio::spawn(async move {
                     dl.log_gatekeeper_buy_decision(buy_log).await;
@@ -9668,7 +10168,14 @@ async fn pool_observation_task(
                                 &window_state,
                             );
                         }
-                        maybe_spawn_p37_shadow_probe_selection_log(ctx.as_ref(), &buy_log);
+                        maybe_handle_p37_shadow_probe_decision(
+                            ctx.as_ref(),
+                            &buy_log,
+                            pool_data.clone(),
+                            &buffered_txs,
+                            base_mint_pubkey,
+                        )
+                        .await;
                         let dl = ctx.decision_logger.clone();
                         tokio::spawn(async move {
                             dl.log_gatekeeper_buy_decision(buy_log).await;
@@ -9874,7 +10381,14 @@ async fn pool_observation_task(
                         &window_state,
                     );
                 }
-                maybe_spawn_p37_shadow_probe_selection_log(ctx.as_ref(), &buy_log);
+                maybe_handle_p37_shadow_probe_decision(
+                    ctx.as_ref(),
+                    &buy_log,
+                    pool_data.clone(),
+                    &buffered_txs,
+                    base_mint_pubkey,
+                )
+                .await;
                 let dl = ctx.decision_logger.clone();
                 tokio::spawn(async move {
                     dl.log_gatekeeper_buy_decision(buy_log).await;
@@ -10329,6 +10843,7 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
         ),
         funding_source_config,
         p37_shadow_probe_config: oracle_runtime.config.p37_shadow_probe.clone(),
+        p37_shadow_probe_state: Arc::clone(&oracle_runtime.p37_shadow_probe_state),
         authoritative_funding_coverage_gate_enabled,
         fingerprint_config: EarlyFingerprintConfig::default(),
         event_emitter: event_emitter.clone(),
@@ -11183,6 +11698,104 @@ mod tests {
         assert!(!wrote);
         assert!(!transport_path.exists());
         assert!(!entry_path.exists());
+    }
+
+    #[test]
+    fn p37_shadow_probe_runtime_state_enforces_max_per_run() {
+        let config = P37ShadowProbeConfig {
+            enabled: true,
+            sample_threshold: 100,
+            max_probes_per_run: 1,
+            max_probes_per_minute: 10,
+            max_concurrent: 1,
+            dedupe_by_probe_id: false,
+            ..Default::default()
+        };
+        let candidate = p37_shadow_probe_test_candidate();
+        let record = p37_shadow_probe_selection_record(&config, &candidate, 3_000);
+        let state = P37ShadowProbeRuntimeState::new(config.max_concurrent);
+
+        let first = state
+            .try_reserve(&config, &record, 10_000)
+            .expect("first probe should reserve");
+        drop(first);
+        let second = state.try_reserve(&config, &record, 10_100);
+
+        assert_eq!(second.err().as_deref(), Some("max_probes_per_run_exceeded"));
+    }
+
+    #[test]
+    fn p37_shadow_probe_runtime_state_enforces_rate_limit() {
+        let config = P37ShadowProbeConfig {
+            enabled: true,
+            sample_threshold: 100,
+            max_probes_per_run: 10,
+            max_probes_per_minute: 1,
+            max_concurrent: 1,
+            dedupe_by_probe_id: false,
+            ..Default::default()
+        };
+        let candidate = p37_shadow_probe_test_candidate();
+        let record = p37_shadow_probe_selection_record(&config, &candidate, 3_000);
+        let state = P37ShadowProbeRuntimeState::new(config.max_concurrent);
+
+        let first = state
+            .try_reserve(&config, &record, 10_000)
+            .expect("first probe should reserve");
+        drop(first);
+        let second = state.try_reserve(&config, &record, 10_100);
+
+        assert_eq!(second.err().as_deref(), Some("probe_rate_limit_exceeded"));
+    }
+
+    #[test]
+    fn p37_shadow_probe_runtime_state_enforces_concurrency_limit() {
+        let config = P37ShadowProbeConfig {
+            enabled: true,
+            sample_threshold: 100,
+            max_probes_per_run: 10,
+            max_probes_per_minute: 10,
+            max_concurrent: 1,
+            dedupe_by_probe_id: false,
+            ..Default::default()
+        };
+        let candidate = p37_shadow_probe_test_candidate();
+        let record = p37_shadow_probe_selection_record(&config, &candidate, 3_000);
+        let state = P37ShadowProbeRuntimeState::new(config.max_concurrent);
+
+        let _first = state
+            .try_reserve(&config, &record, 10_000)
+            .expect("first probe should reserve");
+        let second = state.try_reserve(&config, &record, 10_100);
+
+        assert_eq!(
+            second.err().as_deref(),
+            Some("probe_concurrency_limit_exceeded")
+        );
+    }
+
+    #[test]
+    fn p37_shadow_probe_runtime_state_enforces_probe_id_dedupe() {
+        let config = P37ShadowProbeConfig {
+            enabled: true,
+            sample_threshold: 100,
+            max_probes_per_run: 10,
+            max_probes_per_minute: 10,
+            max_concurrent: 1,
+            dedupe_by_probe_id: true,
+            ..Default::default()
+        };
+        let candidate = p37_shadow_probe_test_candidate();
+        let record = p37_shadow_probe_selection_record(&config, &candidate, 3_000);
+        let state = P37ShadowProbeRuntimeState::new(config.max_concurrent);
+
+        let first = state
+            .try_reserve(&config, &record, 10_000)
+            .expect("first probe should reserve");
+        drop(first);
+        let second = state.try_reserve(&config, &record, 10_100);
+
+        assert_eq!(second.err().as_deref(), Some("duplicate_probe_id"));
     }
 
     #[test]
@@ -12920,6 +13533,7 @@ mod tests {
                 &GatekeeperV2Config::default(),
             ),
             p37_shadow_probe_config: P37ShadowProbeConfig::default(),
+            p37_shadow_probe_state: Arc::new(P37ShadowProbeRuntimeState::new(1)),
             authoritative_funding_coverage_gate_enabled: false,
             fingerprint_config: EarlyFingerprintConfig::default(),
             event_emitter: None,
@@ -13884,6 +14498,7 @@ mod tests {
             ),
             funding_source_config: FundingSourceConfig::from_gatekeeper_config(&gatekeeper_config),
             p37_shadow_probe_config: P37ShadowProbeConfig::default(),
+            p37_shadow_probe_state: Arc::new(P37ShadowProbeRuntimeState::new(1)),
             authoritative_funding_coverage_gate_enabled: false,
             gatekeeper_config,
             gatekeeper_v3_config: GatekeeperV3Config::default(),
@@ -13998,6 +14613,7 @@ mod tests {
             ),
             funding_source_config: FundingSourceConfig::from_gatekeeper_config(&gatekeeper_config),
             p37_shadow_probe_config: P37ShadowProbeConfig::default(),
+            p37_shadow_probe_state: Arc::new(P37ShadowProbeRuntimeState::new(1)),
             authoritative_funding_coverage_gate_enabled: false,
             gatekeeper_config,
             gatekeeper_v3_config: GatekeeperV3Config::default(),

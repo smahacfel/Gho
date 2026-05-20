@@ -2,7 +2,7 @@
 
 Date: 2026-05-19
 
-Status: Accepted P0 plan after safety amendments
+Status: Accepted plan with P0R corrective repair
 
 ## Decision
 
@@ -39,6 +39,56 @@ a telemetry/replay sidecar with promotion disabled.
 Waiting for natural BUYs is impractical for P3.7 dataset collection. Threshold
 tuning and IWIM changes are forbidden. Therefore the next safe option is a
 separate counterfactual shadow-only probe plane.
+
+## P0R Corrective Repair
+
+P0R is a corrective sub-stage after the P3.7-J3 P0 audit. The audit found that
+the original P0 implementation proved only a narrow harness path:
+
+- synthetic `counterfactual_probe_recorded_no_simulation` rows were treated too
+  strongly in reporting,
+- runtime probe dispatch was not yet routed through the real shadow simulator,
+- probe runtime bounds were config-only rather than enforced,
+- append/namespace semantics were not fully fail-closed,
+- the join-key audit could pass selection/transport/entry continuity without an
+  exact join back to the decision/V3 row.
+
+P0R changes the status model:
+
+```text
+Original J3 P0: PARTIAL harness PASS / superseded by P0R
+J3 P0R code-level repair: target PASS
+R15 runtime smoke: next gate, not claimed complete by P0R
+Full R14 / Phase B / P2 / live: HOLD / NO-GO
+```
+
+P0R implementation scope:
+
+- add `run_id` and `session_id` to `[p37_shadow_probe]`;
+- fail closed on existing probe outputs when `append=false`;
+- require `run_id` and `session_id` when `append=true`;
+- enforce `max_probes_per_run`, `max_probes_per_minute`, `max_concurrent`, and
+  `dedupe_by_probe_id` in shared runtime state;
+- log bounded-runtime skips as probe skip rows, not active decision failures;
+- route selected probes through a probe-only `TriggerComponent` helper that
+  calls `shadow_simulator.simulate_buy(...)`;
+- enforce `probe_amount_source="fixed_lamports"` by passing
+  `probe_amount_lamports` into the prepared shadow request, rather than only
+  logging the configured amount;
+- avoid `dispatch_prepared_buy_shadow_only`, active position reservation, live
+  sender paths, and active BUY logs;
+- keep the synthetic no-simulation row builder only as a harness fixture, not as
+  P0 success evidence;
+- fail closed at startup when `[p37_shadow_probe].enabled=true` but the
+  configured Ghost Brain file does not have
+  `[gatekeeper_v3].replay_payload_enabled=true`;
+- add probe dispatch/amount/source/bucket/run/session fields to transport and
+  entry rows;
+- require probe artifacts to exact-join to decision/V3 rows by `ab_record_id`
+  and V3 hashes before the audit can return PASS;
+- reduce the R15 smoke profile to bounded probe limits.
+
+P0R does not run or claim the R15 runtime smoke. R15 remains the next gate.
 
 ## Goal
 
@@ -104,6 +154,8 @@ sample_mode = "deterministic_hash_mod"
 sample_modulus = 100
 sample_threshold = 5
 sampling_version = "p37-j3-v1"
+run_id = ""
+session_id = ""
 max_probes_per_run = 25
 max_probes_per_minute = 10
 max_concurrent = 2
