@@ -1494,6 +1494,97 @@ Acceptance:
 Collection, Phase B, P2, live, active policy changes, IWIM changes and threshold
 tuning remain out of scope.
 
+## P3.7-J3Q4 Probe Simulation Instruction Error Classification
+
+### Trigger
+
+R15-r8m produced the first runtime-validated counterfactual probe transport and
+entry rows:
+
+```text
+probe_transport_rows = 4
+probe_shadow_entries_rows = 4
+join_key_audit = PASS
+active buys.jsonl = missing
+```
+
+One of the four probe rows had a simulation mismatch:
+
+```text
+err = InstructionError(3, Custom(2006))
+probe_bucket = v3_reject_manipulation_contradiction
+```
+
+The R15-r8m transport row predates Q4 diagnostics, so it preserved the error
+string but not the simulation logs, failing program id, instruction account
+roles or route kind. Scaling collection with that class still unclassified
+would risk producing ambiguous probe error rows.
+
+### Decision
+
+J3Q4 adds probe-specific simulation instruction diagnostics:
+
+- parse `InstructionError(<index>, Custom(<code>))`;
+- persist `simulation_error_instruction_index`;
+- persist `simulation_error_custom_code`;
+- persist failing instruction program id/name when the prepared transaction is
+  available;
+- persist best-effort custom error mapping;
+- persist simulation log digest/tail;
+- persist failing instruction account pubkeys and probe account roles;
+- persist route kind and required account role set;
+- add a report script for current and future probe transport rows.
+
+For `Custom(2006)`, the diagnostic mapping is deliberately best-effort unless a
+program id/log tail is present. With Pump.fun program id it is classified as:
+
+```text
+program_error_name = anchor_constraint_seeds
+program_error_family = anchor_account_constraint
+simulation_error_category = simulation_account_layout_mismatch
+```
+
+Without program/log/account-role fields, current pre-Q4 rows remain:
+
+```text
+simulation_account_layout_mismatch_unclassified_missing_q4_fields
+```
+
+### Current R15-r8m Classification
+
+The current R15-r8m error is parsed but not fully attributable:
+
+```text
+instruction_index = 3
+custom_code = 2006
+program_id = unknown
+category = simulation_account_layout_mismatch_unclassified_missing_q4_fields
+```
+
+This is enough to block scaling and require either a small follow-up smoke with
+Q4 diagnostics enabled or direct classification from a reproduced simulation
+row.
+
+### Gate After Q4
+
+Next runtime evidence must not wait blindly for timeout. Stop as soon as:
+
+- a simulation error appears with Q4 diagnostic fields; or
+- probe transport/entry rows appear with zero simulation mismatch; or
+- a new structural blocker dominates.
+
+Small bounded collection can proceed only if:
+
+- V3/MFS strict replay remains OK;
+- probe transport/entry rows exist;
+- join-key audit remains PASS;
+- active BUY remains unchanged;
+- simulation error class is either absent or classified well enough to avoid
+  poisoning labels.
+
+Collection, Phase B, P2, live, active policy changes, IWIM changes and threshold
+tuning remain out of scope.
+
 ## P3.7-J3Q3 Optional `bonding_curve_v2` Probe Precheck Repair
 
 ### Trigger
@@ -2165,6 +2256,104 @@ Acceptance:
 - Routed probe candidates still require route-specific execution accounts.
 - If no probe transport/entry rows appear, the blocker must be a newly precise
   readiness class, not the legacy/routed account-layout mismatch.
+
+Collection, Phase B, P2, live, active policy changes, IWIM changes and threshold
+tuning remain out of scope.
+
+## P3.7-J3Q4 Simulation Instruction Error Classification
+
+### Trigger
+
+R15-r8m was the first smoke that produced useful counterfactual probe
+transport and entry rows. One probe entry surfaced a raw simulation mismatch:
+
+```text
+InstructionError(3, Custom(2006))
+```
+
+At that point the transport record did not preserve enough simulation context
+to classify the error. The row lacked program id, instruction account roles and
+simulation log tail, so the result could only be treated as
+diagnostic-limited.
+
+### Decision
+
+J3Q4 extends probe simulation diagnostics without changing active decision
+behavior:
+
+- propagate simulation instruction index and custom error code;
+- propagate simulation program id and best-effort program name;
+- propagate instruction account pubkeys and probe account-role labels;
+- propagate route kind and required account roles;
+- preserve a bounded simulation log tail;
+- classify known Pump.fun/Anchor custom errors as explicit diagnostic classes.
+
+Rows that predate these fields remain parsable but are explicitly
+`diagnostic-limited`.
+
+### R15-r8n Result
+
+R15-r8n used a clean namespace:
+
+```text
+shadow-burnin-v3-p37-counterfactual-probe-r15-smoke-r8n
+```
+
+Observed result:
+
+```text
+probe_selection_rows = 17
+probe_transport_rows = 5
+probe_shadow_entry_rows = 5
+probe_lifecycle_rows = 0
+probe_join_key_acceptance = pass
+probe_decision_join_acceptance = pass
+probe_required_exact_decision_v3_join_coverage = 1.0
+active_buys_jsonl = missing
+```
+
+The counterfactual probe transport/entry path is therefore runtime-validated
+for a bounded smoke namespace. Lifecycle/on-chain labels are not validated yet
+because no probe lifecycle close was observed.
+
+One transport/entry row produced:
+
+```text
+InstructionError(3, Custom(6002))
+program = pumpfun
+program_error_name = too_much_sol_required
+category = simulation_slippage_or_price_mismatch
+Left = 7000000
+Right = 11425995
+```
+
+This is not an `AccountNotFound` class and not a join-key/hash-continuity class.
+It is an amount/slippage mismatch in the probe buy request.
+
+### Next Gate
+
+Do not start a larger collection from J3Q4 alone. The next narrow step is:
+
+```text
+P3.7-J3Q5 Probe Amount / Slippage Semantics
+```
+
+J3Q5 must decide whether `TooMuchSolRequired` should remain a classified probe
+error row, whether the probe request amount/quote construction is wrong, or
+whether the smoke profile amount/slippage needs a probe-only adjustment.
+
+To make that decision auditable, future probe transport rows now carry the
+request-side buy parameter context:
+
+```text
+buy_variant
+token_param_role
+entry_token_amount_raw
+min_tokens_out
+amount_lamports
+probe_amount_source
+probe_slippage_bps
+```
 
 Collection, Phase B, P2, live, active policy changes, IWIM changes and threshold
 tuning remain out of scope.

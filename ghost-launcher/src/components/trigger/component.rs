@@ -4406,7 +4406,7 @@ impl TriggerComponent {
                 .unwrap_or(false)
     }
 
-    fn counterfactual_probe_buy_instruction_account_role_for(
+    pub(crate) fn counterfactual_probe_buy_instruction_account_role_for(
         request: &PreparedBuyRequest,
         pubkey: &Pubkey,
     ) -> Option<&'static str> {
@@ -4442,7 +4442,7 @@ impl TriggerComponent {
         })
     }
 
-    fn counterfactual_probe_account_role_for(
+    pub(crate) fn counterfactual_probe_account_role_for(
         request: &PreparedBuyRequest,
         pubkey: &Pubkey,
     ) -> String {
@@ -4520,7 +4520,7 @@ impl TriggerComponent {
         "transaction_account".to_string()
     }
 
-    fn counterfactual_probe_required_account_roles(
+    pub(crate) fn counterfactual_probe_required_account_roles(
         request: &PreparedBuyRequest,
     ) -> Vec<(Pubkey, String)> {
         let mut seen = HashSet::new();

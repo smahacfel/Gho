@@ -4921,6 +4921,10 @@ struct P37ShadowProbeTransportRecord {
     amount_lamports: u64,
     probe_amount_source: String,
     probe_slippage_bps: u64,
+    buy_variant: Option<String>,
+    token_param_role: Option<String>,
+    entry_token_amount_raw: Option<u64>,
+    min_tokens_out: Option<u64>,
     probe_quote_age_max_ms: u64,
     probe_curve_age_max_ms: u64,
     probe_execution_account_wait_ms: Option<u64>,
@@ -4940,6 +4944,19 @@ struct P37ShadowProbeTransportRecord {
     simulation_error_message: Option<String>,
     simulation_error_account_pubkey: Option<String>,
     simulation_error_account_role: Option<String>,
+    simulation_error_instruction_index: Option<u64>,
+    simulation_error_custom_code: Option<u64>,
+    simulation_error_program_id: Option<String>,
+    simulation_error_program_name: Option<String>,
+    simulation_error_program_error_name: Option<String>,
+    simulation_error_program_error_family: Option<String>,
+    simulation_error_category: Option<String>,
+    simulation_error_logs_digest: Option<String>,
+    simulation_error_log_tail: Vec<String>,
+    simulation_error_instruction_accounts: Vec<String>,
+    simulation_error_instruction_account_roles: Vec<String>,
+    route_kind: Option<String>,
+    required_account_roles: Vec<String>,
     prepared_buy_account_set_present: bool,
     account_overrides_present: bool,
     bonding_curve: Option<String>,
@@ -5341,6 +5358,10 @@ fn p37_shadow_probe_artifact_records(
         amount_lamports: record.probe_amount_lamports,
         probe_amount_source: record.probe_amount_source.clone(),
         probe_slippage_bps: record.probe_slippage_bps,
+        buy_variant: None,
+        token_param_role: None,
+        entry_token_amount_raw: None,
+        min_tokens_out: None,
         probe_quote_age_max_ms: record.probe_quote_age_max_ms,
         probe_curve_age_max_ms: record.probe_curve_age_max_ms,
         probe_execution_account_wait_ms: record.probe_execution_account_wait_ms,
@@ -5364,6 +5385,19 @@ fn p37_shadow_probe_artifact_records(
         simulation_error_message: None,
         simulation_error_account_pubkey: None,
         simulation_error_account_role: None,
+        simulation_error_instruction_index: None,
+        simulation_error_custom_code: None,
+        simulation_error_program_id: None,
+        simulation_error_program_name: None,
+        simulation_error_program_error_name: None,
+        simulation_error_program_error_family: None,
+        simulation_error_category: None,
+        simulation_error_logs_digest: None,
+        simulation_error_log_tail: Vec::new(),
+        simulation_error_instruction_accounts: Vec::new(),
+        simulation_error_instruction_account_roles: Vec::new(),
+        route_kind: None,
+        required_account_roles: Vec::new(),
         prepared_buy_account_set_present: false,
         account_overrides_present: false,
         bonding_curve: None,
@@ -5608,6 +5642,19 @@ struct P37ShadowProbeExecutionDiagnostics {
     simulation_error_message: Option<String>,
     simulation_error_account_pubkey: Option<String>,
     simulation_error_account_role: Option<String>,
+    simulation_error_instruction_index: Option<u64>,
+    simulation_error_custom_code: Option<u64>,
+    simulation_error_program_id: Option<String>,
+    simulation_error_program_name: Option<String>,
+    simulation_error_program_error_name: Option<String>,
+    simulation_error_program_error_family: Option<String>,
+    simulation_error_category: Option<String>,
+    simulation_error_logs_digest: Option<String>,
+    simulation_error_log_tail: Vec<String>,
+    simulation_error_instruction_accounts: Vec<String>,
+    simulation_error_instruction_account_roles: Vec<String>,
+    route_kind: Option<String>,
+    required_account_roles: Vec<String>,
     prepared_buy_account_set_present: bool,
     account_overrides_present: bool,
     bonding_curve: Option<String>,
@@ -5805,16 +5852,179 @@ fn p37_shadow_probe_error_kind(message: Option<&str>) -> Option<String> {
     }
 }
 
+fn p37_shadow_probe_parse_instruction_error(message: &str) -> (Option<u64>, Option<u64>) {
+    let instruction_index = message
+        .split_once("InstructionError(")
+        .and_then(|(_, tail)| tail.split_once(','))
+        .and_then(|(value, _)| value.trim().parse::<u64>().ok());
+    let custom_code = message
+        .split_once("Custom(")
+        .and_then(|(_, tail)| tail.split_once(')'))
+        .and_then(|(value, _)| value.trim().parse::<u64>().ok());
+    (instruction_index, custom_code)
+}
+
+fn p37_shadow_probe_program_name(program_id: &str) -> &'static str {
+    match program_id {
+        PUMPFUN_PROGRAM_ID => "pumpfun",
+        SYSTEM_PROGRAM_ID => "system_program",
+        TOKEN_PROGRAM_ID => "spl_token",
+        TOKEN_2022_PROGRAM_ID => "spl_token_2022",
+        ASSOCIATED_TOKEN_PROGRAM_ID => "associated_token_program",
+        COMPUTE_BUDGET_PROGRAM_ID => "compute_budget",
+        _ => "unknown",
+    }
+}
+
+fn p37_shadow_probe_program_error_mapping(
+    program_id: Option<&str>,
+    custom_code: Option<u64>,
+) -> (Option<String>, Option<String>, Option<String>) {
+    match (program_id, custom_code) {
+        (Some(PUMPFUN_PROGRAM_ID), Some(2006)) => (
+            Some("anchor_constraint_seeds".to_string()),
+            Some("anchor_account_constraint".to_string()),
+            Some("simulation_account_layout_mismatch".to_string()),
+        ),
+        (Some(PUMPFUN_PROGRAM_ID), Some(6002)) => (
+            Some("too_much_sol_required".to_string()),
+            Some("slippage_or_amount_constraint".to_string()),
+            Some("simulation_slippage_or_price_mismatch".to_string()),
+        ),
+        (_, Some(2006)) => (
+            Some("anchor_constraint_seeds_best_effort".to_string()),
+            Some("anchor_account_constraint".to_string()),
+            Some("simulation_account_layout_mismatch".to_string()),
+        ),
+        (_, Some(6002)) => (
+            Some("too_much_sol_required_best_effort".to_string()),
+            Some("slippage_or_amount_constraint".to_string()),
+            Some("simulation_slippage_or_price_mismatch".to_string()),
+        ),
+        (_, Some(_)) => (
+            Some("unknown_custom_program_error".to_string()),
+            Some("custom_program_error".to_string()),
+            Some("simulation_instruction_error".to_string()),
+        ),
+        _ => (None, None, None),
+    }
+}
+
+fn p37_shadow_probe_log_tail(logs: &[String]) -> Vec<String> {
+    const MAX_TAIL: usize = 12;
+    logs.iter()
+        .skip(logs.len().saturating_sub(MAX_TAIL))
+        .cloned()
+        .collect()
+}
+
+#[derive(Debug, Clone, Default)]
+struct P37ShadowProbeSimulationInstructionDiagnostics {
+    instruction_index: Option<u64>,
+    custom_code: Option<u64>,
+    program_id: Option<String>,
+    program_name: Option<String>,
+    program_error_name: Option<String>,
+    program_error_family: Option<String>,
+    category: Option<String>,
+    logs_digest: Option<String>,
+    log_tail: Vec<String>,
+    instruction_accounts: Vec<String>,
+    instruction_account_roles: Vec<String>,
+}
+
+fn p37_shadow_probe_simulation_instruction_diagnostics(
+    error_message: Option<&str>,
+    logs: &[String],
+    request: Option<&crate::components::trigger::PreparedBuyRequest>,
+) -> P37ShadowProbeSimulationInstructionDiagnostics {
+    let Some(message) = error_message else {
+        return P37ShadowProbeSimulationInstructionDiagnostics::default();
+    };
+    let (instruction_index, custom_code) = p37_shadow_probe_parse_instruction_error(message);
+    let mut program_id = None;
+    let mut instruction_accounts = Vec::new();
+    let mut instruction_account_roles = Vec::new();
+
+    if let (Some(request), Some(index)) = (request, instruction_index) {
+        if let Some(instruction) = request.rpc_buy_tx.message.instructions.get(index as usize) {
+            let account_keys = &request.rpc_buy_tx.message.account_keys;
+            program_id = account_keys
+                .get(instruction.program_id_index as usize)
+                .map(|pubkey| pubkey.to_string());
+            for (position, account_index) in instruction.accounts.iter().enumerate() {
+                if let Some(pubkey) = account_keys.get(*account_index as usize) {
+                    let role = crate::components::trigger::TriggerComponent::counterfactual_probe_account_role_for(
+                        request,
+                        pubkey,
+                    );
+                    instruction_accounts.push(format!("{position}:{pubkey}"));
+                    instruction_account_roles.push(format!("{position}:{role}:{pubkey}"));
+                }
+            }
+        }
+    }
+
+    let program_name = program_id
+        .as_deref()
+        .map(p37_shadow_probe_program_name)
+        .map(str::to_string);
+    let (program_error_name, program_error_family, category) =
+        p37_shadow_probe_program_error_mapping(program_id.as_deref(), custom_code);
+    P37ShadowProbeSimulationInstructionDiagnostics {
+        instruction_index,
+        custom_code,
+        program_id,
+        program_name,
+        program_error_name,
+        program_error_family,
+        category: category.or_else(|| Some("simulation_instruction_error".to_string())),
+        logs_digest: (!logs.is_empty())
+            .then(|| crate::components::trigger::shadow_run::logs_digest(logs)),
+        log_tail: p37_shadow_probe_log_tail(logs),
+        instruction_accounts,
+        instruction_account_roles,
+    }
+}
+
+fn p37_shadow_probe_route_kind(
+    request: Option<&crate::components::trigger::PreparedBuyRequest>,
+) -> Option<String> {
+    request
+        .and_then(|request| request.build_profile.as_ref())
+        .map(|profile| match profile.buy_variant {
+            trigger::PumpfunBuyVariant::LegacyBuy => "legacy_buy".to_string(),
+            trigger::PumpfunBuyVariant::RoutedExactSolIn => "routed_exact_sol_in".to_string(),
+        })
+}
+
+fn p37_shadow_probe_required_account_roles_for_request(
+    request: Option<&crate::components::trigger::PreparedBuyRequest>,
+) -> Vec<String> {
+    request
+        .map(crate::components::trigger::TriggerComponent::counterfactual_probe_required_account_roles)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(pubkey, role)| format!("{role}:{pubkey}"))
+        .collect()
+}
+
 fn p37_shadow_probe_execution_diagnostics(
     record: &P37ShadowProbeSelectionRecord,
     request: Option<&crate::components::trigger::PreparedBuyRequest>,
     precheck_failure_reason: Option<String>,
     error_message: Option<String>,
+    simulation_logs: &[String],
 ) -> P37ShadowProbeExecutionDiagnostics {
     let account_pubkey = error_message
         .as_deref()
         .and_then(p37_shadow_probe_error_pubkey);
     let account_role = p37_shadow_probe_account_role(account_pubkey.as_deref(), request);
+    let instruction_diagnostics = p37_shadow_probe_simulation_instruction_diagnostics(
+        error_message.as_deref(),
+        simulation_logs,
+        request,
+    );
     let request_overrides = request.map(|request| &request.account_overrides);
     let associated_bonding_curve = request_overrides
         .and_then(|overrides| overrides.associated_bonding_curve)
@@ -5842,6 +6052,20 @@ fn p37_shadow_probe_execution_diagnostics(
         simulation_error_message: error_message,
         simulation_error_account_pubkey: account_pubkey,
         simulation_error_account_role: account_role,
+        simulation_error_instruction_index: instruction_diagnostics.instruction_index,
+        simulation_error_custom_code: instruction_diagnostics.custom_code,
+        simulation_error_program_id: instruction_diagnostics.program_id,
+        simulation_error_program_name: instruction_diagnostics.program_name,
+        simulation_error_program_error_name: instruction_diagnostics.program_error_name,
+        simulation_error_program_error_family: instruction_diagnostics.program_error_family,
+        simulation_error_category: instruction_diagnostics.category,
+        simulation_error_logs_digest: instruction_diagnostics.logs_digest,
+        simulation_error_log_tail: instruction_diagnostics.log_tail,
+        simulation_error_instruction_accounts: instruction_diagnostics.instruction_accounts,
+        simulation_error_instruction_account_roles: instruction_diagnostics
+            .instruction_account_roles,
+        route_kind: p37_shadow_probe_route_kind(request),
+        required_account_roles: p37_shadow_probe_required_account_roles_for_request(request),
         prepared_buy_account_set_present: request.is_some(),
         account_overrides_present: request_overrides
             .map(p37_shadow_probe_account_overrides_present)
@@ -5858,6 +6082,48 @@ fn p37_shadow_probe_execution_diagnostics(
         account_features_update_count: None,
         curve_data_known: record.curve_data_known,
         curve_readiness_status,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct P37ShadowProbeRequestTokenParams {
+    buy_variant: Option<String>,
+    token_param_role: Option<String>,
+    entry_token_amount_raw: Option<u64>,
+    min_tokens_out: Option<u64>,
+}
+
+fn p37_shadow_probe_request_token_params(
+    request: &crate::components::trigger::PreparedBuyRequest,
+) -> P37ShadowProbeRequestTokenParams {
+    let buy_variant = request
+        .build_profile
+        .as_ref()
+        .map(|profile| profile.buy_variant.as_str().to_string())
+        .or_else(|| {
+            request
+                .account_overrides
+                .buy_variant
+                .map(|variant| variant.as_str().to_string())
+        });
+    let token_param_role = request
+        .build_profile
+        .as_ref()
+        .map(|profile| profile.token_param_role.to_string())
+        .or_else(|| {
+            request
+                .account_overrides
+                .buy_variant
+                .map(|variant| match variant {
+                    trigger::PumpfunBuyVariant::LegacyBuy => "token_amount".to_string(),
+                    trigger::PumpfunBuyVariant::RoutedExactSolIn => "min_tokens_out".to_string(),
+                })
+        });
+    P37ShadowProbeRequestTokenParams {
+        buy_variant,
+        token_param_role,
+        entry_token_amount_raw: request.entry_token_amount_raw,
+        min_tokens_out: Some(request.min_tokens_out),
     }
 }
 
@@ -5882,7 +6148,9 @@ fn p37_shadow_probe_transport_from_event(
         Some(request),
         record.precheck_failure_reason.clone(),
         event.err.clone(),
+        &event.logs,
     );
+    let request_token_params = p37_shadow_probe_request_token_params(request);
     P37ShadowProbeTransportRecord {
         join_metadata,
         schema_version: 1,
@@ -5910,6 +6178,10 @@ fn p37_shadow_probe_transport_from_event(
         amount_lamports: event.amount_lamports,
         probe_amount_source: record.probe_amount_source.clone(),
         probe_slippage_bps: record.probe_slippage_bps,
+        buy_variant: request_token_params.buy_variant,
+        token_param_role: request_token_params.token_param_role,
+        entry_token_amount_raw: request_token_params.entry_token_amount_raw,
+        min_tokens_out: request_token_params.min_tokens_out,
         probe_quote_age_max_ms: record.probe_quote_age_max_ms,
         probe_curve_age_max_ms: record.probe_curve_age_max_ms,
         probe_execution_account_wait_ms: record.probe_execution_account_wait_ms,
@@ -5929,6 +6201,20 @@ fn p37_shadow_probe_transport_from_event(
         simulation_error_message: diagnostics.simulation_error_message,
         simulation_error_account_pubkey: diagnostics.simulation_error_account_pubkey,
         simulation_error_account_role: diagnostics.simulation_error_account_role,
+        simulation_error_instruction_index: diagnostics.simulation_error_instruction_index,
+        simulation_error_custom_code: diagnostics.simulation_error_custom_code,
+        simulation_error_program_id: diagnostics.simulation_error_program_id,
+        simulation_error_program_name: diagnostics.simulation_error_program_name,
+        simulation_error_program_error_name: diagnostics.simulation_error_program_error_name,
+        simulation_error_program_error_family: diagnostics.simulation_error_program_error_family,
+        simulation_error_category: diagnostics.simulation_error_category,
+        simulation_error_logs_digest: diagnostics.simulation_error_logs_digest,
+        simulation_error_log_tail: diagnostics.simulation_error_log_tail,
+        simulation_error_instruction_accounts: diagnostics.simulation_error_instruction_accounts,
+        simulation_error_instruction_account_roles: diagnostics
+            .simulation_error_instruction_account_roles,
+        route_kind: diagnostics.route_kind,
+        required_account_roles: diagnostics.required_account_roles,
         prepared_buy_account_set_present: diagnostics.prepared_buy_account_set_present,
         account_overrides_present: diagnostics.account_overrides_present,
         bonding_curve: diagnostics.bonding_curve,
@@ -5981,7 +6267,9 @@ fn p37_shadow_probe_transport_from_error(
         Some(request),
         record.precheck_failure_reason.clone(),
         Some(err.to_string()),
+        &[],
     );
+    let request_token_params = p37_shadow_probe_request_token_params(request);
     P37ShadowProbeTransportRecord {
         join_metadata: request.join_metadata.clone(),
         schema_version: 1,
@@ -6007,6 +6295,10 @@ fn p37_shadow_probe_transport_from_error(
         amount_lamports: request.amount_lamports,
         probe_amount_source: record.probe_amount_source.clone(),
         probe_slippage_bps: record.probe_slippage_bps,
+        buy_variant: request_token_params.buy_variant,
+        token_param_role: request_token_params.token_param_role,
+        entry_token_amount_raw: request_token_params.entry_token_amount_raw,
+        min_tokens_out: request_token_params.min_tokens_out,
         probe_quote_age_max_ms: record.probe_quote_age_max_ms,
         probe_curve_age_max_ms: record.probe_curve_age_max_ms,
         probe_execution_account_wait_ms: record.probe_execution_account_wait_ms,
@@ -6026,6 +6318,20 @@ fn p37_shadow_probe_transport_from_error(
         simulation_error_message: diagnostics.simulation_error_message,
         simulation_error_account_pubkey: diagnostics.simulation_error_account_pubkey,
         simulation_error_account_role: diagnostics.simulation_error_account_role,
+        simulation_error_instruction_index: diagnostics.simulation_error_instruction_index,
+        simulation_error_custom_code: diagnostics.simulation_error_custom_code,
+        simulation_error_program_id: diagnostics.simulation_error_program_id,
+        simulation_error_program_name: diagnostics.simulation_error_program_name,
+        simulation_error_program_error_name: diagnostics.simulation_error_program_error_name,
+        simulation_error_program_error_family: diagnostics.simulation_error_program_error_family,
+        simulation_error_category: diagnostics.simulation_error_category,
+        simulation_error_logs_digest: diagnostics.simulation_error_logs_digest,
+        simulation_error_log_tail: diagnostics.simulation_error_log_tail,
+        simulation_error_instruction_accounts: diagnostics.simulation_error_instruction_accounts,
+        simulation_error_instruction_account_roles: diagnostics
+            .simulation_error_instruction_account_roles,
+        route_kind: diagnostics.route_kind,
+        required_account_roles: diagnostics.required_account_roles,
         prepared_buy_account_set_present: diagnostics.prepared_buy_account_set_present,
         account_overrides_present: diagnostics.account_overrides_present,
         bonding_curve: diagnostics.bonding_curve,
@@ -12350,6 +12656,41 @@ mod tests {
         );
         assert!(skipped.execution_account_readiness_role.is_none());
         assert!(skipped.execution_account_readiness_pubkey.is_none());
+    }
+
+    #[test]
+    fn p37_shadow_probe_parses_instruction_custom_error() {
+        let (instruction_index, custom_code) =
+            p37_shadow_probe_parse_instruction_error("InstructionError(3, Custom(2006))");
+
+        assert_eq!(instruction_index, Some(3));
+        assert_eq!(custom_code, Some(2006));
+    }
+
+    #[test]
+    fn p37_shadow_probe_maps_pumpfun_custom_2006_as_layout_mismatch() {
+        let (error_name, family, category) =
+            p37_shadow_probe_program_error_mapping(Some(PUMPFUN_PROGRAM_ID), Some(2006));
+
+        assert_eq!(error_name.as_deref(), Some("anchor_constraint_seeds"));
+        assert_eq!(family.as_deref(), Some("anchor_account_constraint"));
+        assert_eq!(
+            category.as_deref(),
+            Some("simulation_account_layout_mismatch")
+        );
+    }
+
+    #[test]
+    fn p37_shadow_probe_maps_pumpfun_custom_6002_as_slippage_mismatch() {
+        let (error_name, family, category) =
+            p37_shadow_probe_program_error_mapping(Some(PUMPFUN_PROGRAM_ID), Some(6002));
+
+        assert_eq!(error_name.as_deref(), Some("too_much_sol_required"));
+        assert_eq!(family.as_deref(), Some("slippage_or_amount_constraint"));
+        assert_eq!(
+            category.as_deref(),
+            Some("simulation_slippage_or_price_mismatch")
+        );
     }
 
     fn p37_shadow_probe_precheck_record_and_pool() -> (
