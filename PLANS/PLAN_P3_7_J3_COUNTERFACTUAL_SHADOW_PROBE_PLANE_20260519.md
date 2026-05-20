@@ -1333,3 +1333,77 @@ J3H must choose a concrete decision-time-safe fix before R15-r6:
 
 J3H must not weaken strict precheck, use post-hoc account guessing, increase
 probe limits, or treat missing core execution accounts as success.
+
+## P3.7-J3H Probe Execution-Account Eligibility
+
+### Trigger
+
+J3G established that the remaining R15-r5 blockers are true routed execution
+accounts, not payer, user-volume, generic transaction-account, or hash-join
+issues:
+
+```text
+bonding_curve_v2 = 4
+creator_vault = 1
+classification = override_present_but_account_missing_on_rpc
+```
+
+The selected decision rows had exact V3/MFS joins, but the required account
+identities/readiness were not explicit in the materialized decision snapshot.
+
+### Implementation
+
+J3H keeps strict required-account precheck intact and changes only probe-plane
+classification:
+
+- strict execution account roles are enumerated explicitly;
+- `bonding_curve_v2` is treated as a core strict execution account;
+- `creator_vault` is treated as route-aware because the role is assigned from
+  the routed buy instruction account layout;
+- if a strict execution account is missing at processed precheck, the selected
+  probe is skipped with:
+
+```text
+probe_skip_reason = execution_account_not_ready
+precheck_failure_reason = execution_account_not_ready:<role>:<pubkey>
+execution_account_readiness_status = not_ready
+execution_account_readiness_role = <role>
+execution_account_readiness_pubkey = <pubkey>
+```
+
+This is not a bypass. The probe still does not dispatch when a strict execution
+account is unavailable. The difference is that R15-r6 and later audits can
+distinguish execution-account readiness from generic precheck failures.
+
+### R15-r6 Gate
+
+R15-r6 must use a clean bounded smoke namespace:
+
+```text
+shadow-burnin-v3-p37-counterfactual-probe-r15-smoke-r6
+```
+
+Acceptance:
+
+- V3/MFS strict replay remains OK.
+- Probe selection exact decision/V3 join remains 100%.
+- Selected probes have explicit `execution_account_readiness_status`.
+- Missing `bonding_curve_v2` or route-specific `creator_vault` is reported as
+  `execution_account_not_ready`, not as an ambiguous missing account.
+- If all selected probes are skipped, the run is `NOT_READY_DIAGNOSED`, not a
+  collection-ready PASS.
+- Collection, Phase B, P2, live, active policy changes, IWIM changes and
+  threshold tuning remain out of scope.
+
+### Next Decision After R15-r6
+
+If R15-r6 reaches probe entries, proceed only to a small bounded probe
+collection gate. If R15-r6 produces `execution_account_not_ready` skips, the
+next repair must be one of:
+
+- additive decision-time materialization/readiness for routed strict accounts,
+- route-aware eligibility requiring strict execution-account readiness,
+- or a bounded decision-time-safe wait for account readiness.
+
+Do not weaken strict precheck and do not infer missing account readiness from
+post-hoc data.

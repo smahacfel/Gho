@@ -4855,6 +4855,10 @@ struct P37ShadowProbeSelectionRecord {
     probe_quote_age_max_ms: u64,
     probe_curve_age_max_ms: u64,
     precheck_failure_reason: Option<String>,
+    execution_account_readiness_status: Option<String>,
+    execution_account_readiness_role: Option<String>,
+    execution_account_readiness_pubkey: Option<String>,
+    execution_account_readiness_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq)]
@@ -4929,6 +4933,10 @@ struct P37ShadowProbeTransportRecord {
     active_reason_code: Option<String>,
     v3_shadow_verdict: Option<String>,
     v3_shadow_reason_code: Option<String>,
+    execution_account_readiness_status: Option<String>,
+    execution_account_readiness_role: Option<String>,
+    execution_account_readiness_pubkey: Option<String>,
+    execution_account_readiness_reason: Option<String>,
 }
 
 fn p37_shadow_probe_verdict_family(candidate: &P37ShadowProbeCandidate) -> String {
@@ -5212,6 +5220,11 @@ fn p37_shadow_probe_selection_record(
         probe_quote_age_max_ms: config.probe_quote_age_max_ms,
         probe_curve_age_max_ms: config.probe_curve_age_max_ms,
         precheck_failure_reason: None,
+        execution_account_readiness_status: selected
+            .then(|| "pending_runtime_precheck".to_string()),
+        execution_account_readiness_role: None,
+        execution_account_readiness_pubkey: None,
+        execution_account_readiness_reason: None,
     }
 }
 
@@ -5304,6 +5317,10 @@ fn p37_shadow_probe_artifact_records(
         source_decision_row_offset: record.source_decision_row_offset,
         source_decision_row_sha256: record.source_decision_row_sha256.clone(),
         precheck_failure_reason: record.precheck_failure_reason.clone(),
+        execution_account_readiness_status: record.execution_account_readiness_status.clone(),
+        execution_account_readiness_role: record.execution_account_readiness_role.clone(),
+        execution_account_readiness_pubkey: record.execution_account_readiness_pubkey.clone(),
+        execution_account_readiness_reason: record.execution_account_readiness_reason.clone(),
         simulation_error_kind: None,
         simulation_error_message: None,
         simulation_error_account_pubkey: None,
@@ -5446,11 +5463,56 @@ fn p37_shadow_probe_as_precheck_skip(
     mut record: P37ShadowProbeSelectionRecord,
     reason: impl Into<String>,
 ) -> P37ShadowProbeSelectionRecord {
+    let reason = reason.into();
     record.event_type = "probe_skipped".to_string();
-    record.probe_skip_reason = Some("probe_execution_precheck_failed".to_string());
-    record.precheck_failure_reason = Some(reason.into());
+    record.probe_skip_reason = Some(if reason.starts_with("execution_account_not_ready:") {
+        "execution_account_not_ready".to_string()
+    } else {
+        "probe_execution_precheck_failed".to_string()
+    });
+    if let Some((role, pubkey)) = p37_shadow_probe_parse_execution_account_not_ready(&reason) {
+        record.execution_account_readiness_status = Some("not_ready".to_string());
+        record.execution_account_readiness_role = Some(role);
+        record.execution_account_readiness_pubkey = Some(pubkey);
+        record.execution_account_readiness_reason = Some(reason.clone());
+    } else {
+        record.execution_account_readiness_status = Some("precheck_failed".to_string());
+        record.execution_account_readiness_reason = Some(reason.clone());
+    }
+    record.precheck_failure_reason = Some(reason);
     record.probe_sample_reason = None;
     record
+}
+
+fn p37_shadow_probe_is_strict_execution_account_role(role: &str) -> bool {
+    matches!(
+        role,
+        "bonding_curve_v2"
+            | "creator_vault"
+            | "bonding_curve"
+            | "associated_bonding_curve"
+            | "global_config"
+            | "fee_recipient"
+            | "global_volume_accumulator"
+            | "fee_config"
+            | "fee_program"
+            | "buyback_fee_recipient"
+            | "mint"
+            | "token_program"
+    )
+}
+
+fn p37_shadow_probe_execution_account_not_ready_reason(role: &str, pubkey: &Pubkey) -> String {
+    format!("execution_account_not_ready:{role}:{pubkey}")
+}
+
+fn p37_shadow_probe_parse_execution_account_not_ready(reason: &str) -> Option<(String, String)> {
+    let tail = reason.strip_prefix("execution_account_not_ready:")?;
+    let (role, pubkey) = tail.split_once(':')?;
+    if role.trim().is_empty() || pubkey.trim().is_empty() {
+        return None;
+    }
+    Some((role.to_string(), pubkey.to_string()))
 }
 
 async fn append_p37_shadow_probe_record(
@@ -5747,6 +5809,10 @@ fn p37_shadow_probe_transport_from_event(
         active_reason_code: record.active_reason_code.clone(),
         v3_shadow_verdict: record.v3_shadow_verdict.clone(),
         v3_shadow_reason_code: record.v3_shadow_reason_code.clone(),
+        execution_account_readiness_status: record.execution_account_readiness_status.clone(),
+        execution_account_readiness_role: record.execution_account_readiness_role.clone(),
+        execution_account_readiness_pubkey: record.execution_account_readiness_pubkey.clone(),
+        execution_account_readiness_reason: record.execution_account_readiness_reason.clone(),
     }
 }
 
@@ -5834,6 +5900,10 @@ fn p37_shadow_probe_transport_from_error(
         active_reason_code: record.active_reason_code.clone(),
         v3_shadow_verdict: record.v3_shadow_verdict.clone(),
         v3_shadow_reason_code: record.v3_shadow_reason_code.clone(),
+        execution_account_readiness_status: record.execution_account_readiness_status.clone(),
+        execution_account_readiness_role: record.execution_account_readiness_role.clone(),
+        execution_account_readiness_pubkey: record.execution_account_readiness_pubkey.clone(),
+        execution_account_readiness_reason: record.execution_account_readiness_reason.clone(),
     }
 }
 
@@ -5867,7 +5937,7 @@ async fn run_p37_shadow_probe_dispatch(
     config: P37ShadowProbeConfig,
     trigger_component: Arc<crate::components::trigger::TriggerComponent>,
     oracle_runtime: Arc<OracleRuntime>,
-    record: P37ShadowProbeSelectionRecord,
+    mut record: P37ShadowProbeSelectionRecord,
     pool_data: Arc<DetectedPool>,
     buffered_txs: Vec<crate::components::gatekeeper::GatekeeperBufferedTx>,
     buy_mint: Pubkey,
@@ -5939,13 +6009,15 @@ async fn run_p37_shadow_probe_dispatch(
         .await
     {
         Ok(Some(missing)) => {
-            let skip_record = p37_shadow_probe_as_precheck_skip(
-                record.clone(),
+            let reason = if p37_shadow_probe_is_strict_execution_account_role(&missing.role) {
+                p37_shadow_probe_execution_account_not_ready_reason(&missing.role, &missing.pubkey)
+            } else {
                 format!(
                     "missing_required_account:{}:{}",
                     missing.role, missing.pubkey
-                ),
-            );
+                )
+            };
+            let skip_record = p37_shadow_probe_as_precheck_skip(record.clone(), reason);
             if let Err(err) = append_p37_shadow_probe_record(&config, &skip_record).await {
                 warn!(
                     probe_id = ?skip_record.probe_id,
@@ -5968,6 +6040,11 @@ async fn run_p37_shadow_probe_dispatch(
             );
         }
     }
+
+    record.execution_account_readiness_status = Some("ready".to_string());
+    record.execution_account_readiness_role = None;
+    record.execution_account_readiness_pubkey = None;
+    record.execution_account_readiness_reason = None;
 
     let dispatch_ts_ms = current_time_ms();
     match trigger_component
@@ -12005,6 +12082,70 @@ mod tests {
             Some("missing_ab_record_id")
         );
         assert!(record.probe_id.is_none());
+    }
+
+    #[test]
+    fn p37_shadow_probe_precheck_skip_marks_execution_account_not_ready() {
+        let config = P37ShadowProbeConfig {
+            enabled: true,
+            sample_threshold: 100,
+            ..Default::default()
+        };
+        let candidate = p37_shadow_probe_test_candidate();
+        let record = p37_shadow_probe_selection_record(&config, &candidate, 3_000);
+        let missing_pubkey = Pubkey::new_unique();
+        let reason = p37_shadow_probe_execution_account_not_ready_reason(
+            "bonding_curve_v2",
+            &missing_pubkey,
+        );
+
+        let skipped = p37_shadow_probe_as_precheck_skip(record, reason.clone());
+
+        assert_eq!(skipped.event_type, "probe_skipped");
+        assert_eq!(
+            skipped.probe_skip_reason.as_deref(),
+            Some("execution_account_not_ready")
+        );
+        assert_eq!(
+            skipped.precheck_failure_reason.as_deref(),
+            Some(reason.as_str())
+        );
+        assert_eq!(
+            skipped.execution_account_readiness_status.as_deref(),
+            Some("not_ready")
+        );
+        assert_eq!(
+            skipped.execution_account_readiness_role.as_deref(),
+            Some("bonding_curve_v2")
+        );
+        assert_eq!(
+            skipped.execution_account_readiness_pubkey.as_deref(),
+            Some(missing_pubkey.to_string().as_str())
+        );
+    }
+
+    #[test]
+    fn p37_shadow_probe_precheck_skip_preserves_generic_precheck_failures() {
+        let config = P37ShadowProbeConfig {
+            enabled: true,
+            sample_threshold: 100,
+            ..Default::default()
+        };
+        let candidate = p37_shadow_probe_test_candidate();
+        let record = p37_shadow_probe_selection_record(&config, &candidate, 3_000);
+
+        let skipped = p37_shadow_probe_as_precheck_skip(record, "invalid_mint_identity");
+
+        assert_eq!(
+            skipped.probe_skip_reason.as_deref(),
+            Some("probe_execution_precheck_failed")
+        );
+        assert_eq!(
+            skipped.execution_account_readiness_status.as_deref(),
+            Some("precheck_failed")
+        );
+        assert!(skipped.execution_account_readiness_role.is_none());
+        assert!(skipped.execution_account_readiness_pubkey.is_none());
     }
 
     #[tokio::test]

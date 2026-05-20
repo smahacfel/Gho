@@ -19,6 +19,12 @@ class ProbeExecutionAccountReadinessReportTests(unittest.TestCase):
             ),
             ("bonding_curve_v2", "abc"),
         )
+        self.assertEqual(
+            parse_missing_required_account(
+                "execution_account_not_ready:creator_vault:def"
+            ),
+            ("creator_vault", "def"),
+        )
         self.assertEqual(parse_missing_required_account(None), (None, None))
         self.assertEqual(parse_missing_required_account("other"), (None, None))
 
@@ -44,6 +50,18 @@ class ProbeExecutionAccountReadinessReportTests(unittest.TestCase):
         self.assertEqual(classification, "override_present_but_account_missing_on_rpc")
         self.assertIn("not_materialized_in_v3_mfs:bonding_curve_v2", reasons)
         self.assertIn("precheck/RPC", basis)
+
+    def test_execution_account_not_ready_reason_classifies_as_not_ready(self):
+        classification, reasons, basis = classify_missing_account(
+            "creator_vault",
+            "missing_pubkey",
+            {"v3_materialized_feature_snapshot": {"account_features": {"update_count": 1}}},
+            {"diag_account_update_occurrences": 0},
+            "execution_account_not_ready:creator_vault:missing_pubkey",
+        )
+        self.assertEqual(classification, "execution_account_not_ready")
+        self.assertIn("not_materialized_in_v3_mfs:creator_vault", reasons)
+        self.assertIn("unavailable before probe dispatch", basis)
 
 
 if __name__ == "__main__":

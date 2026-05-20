@@ -78,8 +78,9 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
 def parse_missing_required_account(reason: str | None) -> tuple[str | None, str | None]:
     if not reason:
         return None, None
-    prefix = "missing_required_account:"
-    if not reason.startswith(prefix):
+    prefixes = ("missing_required_account:", "execution_account_not_ready:")
+    prefix = next((candidate for candidate in prefixes if reason.startswith(candidate)), None)
+    if prefix is None:
         return None, None
     tail = reason[len(prefix) :]
     parts = tail.split(":", 1)
@@ -199,6 +200,7 @@ def classify_missing_account(
     missing_pubkey: str | None,
     decision_row: dict[str, Any] | None,
     log_scan: dict[str, Any],
+    reason: str | None = None,
 ) -> tuple[str, list[str], str]:
     if not role or not missing_pubkey:
         return "unknown", ["missing_required_account_reason_absent"], "No missing account reason"
@@ -229,6 +231,12 @@ def classify_missing_account(
     if log_scan.get("diag_account_update_occurrences", 0) == 0:
         reasons.append("no_diag_account_update_for_required_pubkey")
 
+    if reason and reason.startswith("execution_account_not_ready:"):
+        return (
+            "execution_account_not_ready",
+            reasons,
+            "Runtime classified the strict execution account as unavailable before probe dispatch",
+        )
     if role in BUILDER_DERIVED_ROLES and log_scan.get("diag_account_update_occurrences", 0) == 0:
         return (
             "override_present_but_account_missing_on_rpc",
@@ -290,11 +298,13 @@ def selected_probe_report(
     role, missing_pubkey = parse_missing_required_account(skip.get("precheck_failure_reason"))
     decision_path, decision_index, decision_row, join_diag = decision_lookup(decisions, selection)
     log_scan = scan_logs(log_paths, missing_pubkey)
+    precheck_failure_reason = skip.get("precheck_failure_reason")
     classification, reasons, recommendation_basis = classify_missing_account(
         role,
         missing_pubkey,
         decision_row,
         log_scan,
+        precheck_failure_reason,
     )
     snapshot = (decision_row or {}).get("v3_materialized_feature_snapshot") or {}
     return {
@@ -311,7 +321,11 @@ def selected_probe_report(
         "v3_policy_config_hash": selection.get("source_v3_policy_config_hash")
         or selection.get("v3_policy_config_hash"),
         "probe_skip_reason": skip.get("probe_skip_reason"),
-        "precheck_failure_reason": skip.get("precheck_failure_reason"),
+        "precheck_failure_reason": precheck_failure_reason,
+        "execution_account_readiness_status": skip.get("execution_account_readiness_status"),
+        "execution_account_readiness_role": skip.get("execution_account_readiness_role"),
+        "execution_account_readiness_pubkey": skip.get("execution_account_readiness_pubkey"),
+        "execution_account_readiness_reason": skip.get("execution_account_readiness_reason"),
         "missing_account_role": role,
         "missing_account_pubkey": missing_pubkey,
         "missing_account_source": role_source(role),
@@ -342,15 +356,15 @@ def selected_probe_report(
 def render_markdown(payload: dict[str, Any]) -> str:
     summary = payload["summary"]
     lines = [
-        "# RAPORT P3.7-J3G Probe Strict Execution Account Readiness",
+        "# RAPORT P3.7-J3H Probe Execution-Account Eligibility",
         "",
         f"Date: {payload['date']}",
         "",
         "Status:",
         "",
         "```text",
-        f"P3.7-J3G account readiness audit: {summary['status']}",
-        "R15-r5 runtime smoke: NOT_READY_DIAGNOSED",
+        f"P3.7-J3H account readiness audit: {summary['status']}",
+        "R15-r6 runtime smoke: NOT_READY_DIAGNOSED if no probe entries were generated",
         "Full / bounded collection: HOLD",
         "Phase B / P2 / live / tuning: NO-GO",
         "```",
@@ -393,7 +407,7 @@ def render_markdown(payload: dict[str, Any]) -> str:
             "",
             "## Interpretation",
             "",
-            "The R15-r5 selected probes no longer fail on payer, user-volume, or generic",
+            "The R15-r6 selected probes no longer fail on payer, user-volume, or generic",
             "`transaction_account` handling. They fail on strict routed execution accounts.",
             "",
             "For all selected probes, the missing pubkey was present in the prepared",
@@ -417,14 +431,15 @@ def render_markdown(payload: dict[str, Any]) -> str:
             "Recommended next repair path:",
             "",
             "```text",
-            "P3.7-J3H Probe Execution-Account Eligibility",
+            "P3.7-J3I Probe Execution-Account Materialization Or Eligibility Narrowing",
             "```",
             "",
-            "J3H should add a decision-time-safe execution-account readiness criterion for",
-            "`bonding_curve_v2` and route-specific `creator_vault`, or add explicit",
-            "additive materialization of these account identities/readiness states. If the",
-            "accounts are known but absent on RPC at processed commitment, the row should be",
-            "classified as `probe_execution_accounts_not_ready` rather than dispatched.",
+            "J3I should decide whether to add explicit decision-time-safe materialization",
+            "for `bonding_curve_v2` and route-specific `creator_vault`, or narrow probe",
+            "eligibility to rows where these strict execution accounts are already known",
+            "and ready. If the accounts are known but absent on RPC at processed",
+            "commitment, the row should remain classified as",
+            "`execution_account_not_ready` rather than dispatched.",
             "",
             "R15-r6 should only run after a concrete eligibility/materialization fix. It",
             "should not increase probe limits and should not weaken strict precheck.",
@@ -507,7 +522,7 @@ def main() -> None:
             "decision_logs_scanned": len({str(path) for path, _, _ in decisions}),
             "decision_rows_scanned": len(decisions),
             "log_files_scanned": [str(path) for path in log_paths],
-            "recommended_next_stage": "P3.7-J3H Probe Execution-Account Eligibility",
+            "recommended_next_stage": "P3.7-J3I Probe Execution-Account Materialization Or Eligibility Narrowing",
             "collection_gate": "HOLD",
         },
         "selected_probe_diagnostics": diagnostics,
