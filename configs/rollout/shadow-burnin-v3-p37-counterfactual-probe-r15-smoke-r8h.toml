@@ -1,0 +1,135 @@
+# P3.7-J3N smoke profile for configured simulation payer validation.
+# Probe rows are counterfactual shadow-only rows, not active BUY rows.
+
+mode = "production"
+ghost_brain_config_path = "../../configs/rollout/ghost_brain_v3_p37_mfs_lifecycle.toml"
+
+[seer]
+enabled = true
+source_mode = "grpc"
+commitment = "processed"
+stream_mode = "single_global"
+tx_filter_strategy = "per_pool"
+funding_lane_mode = "disabled"
+grpc_endpoint = "yellowstone-solana-mainnet.core.chainstack.com:443"
+grpc_x_token = "f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+rpc_endpoint = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+enable_pumpfun = true
+enable_bonkfun = false
+enable_raydium = false
+
+[trigger]
+enabled = true
+rpc_url = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+entry_mode = "shadow_only"
+keypair_path = "../../wallets/shadow-burnin-test.json"
+max_concurrent_positions = 5
+max_position_size_sol = 0.007
+emergency_floor_sol = 0.0001
+position_size_buffer_sol = 0.0001
+slippage_tolerance = 0.20
+live_exit_take_profit_pct = 0.50
+live_exit_stop_loss_pct = 0.50
+
+[trigger.shadow_run]
+enabled = true
+shadow_rpc_url = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+payer_strategy = "configured"
+commitment = "processed"
+sig_verify = false
+replace_recent_blockhash = true
+timeout_ms = 1600
+max_retries = 1
+max_concurrent = 8
+output_path = "../../logs/shadow_run/shadow-burnin-v3-p37-counterfactual-probe-r15-smoke-r8h/buys.jsonl"
+emit_event_bus = true
+
+[execution]
+execution_mode = "shadow"
+
+[execution.shadow]
+tx_build_compensation_ms = 200
+max_quote_age_ms = 1500
+entry_log_path = "../../logs/shadow_run/shadow-burnin-v3-p37-counterfactual-probe-r15-smoke-r8h/shadow_entries.jsonl"
+lifecycle_log_path = "../../logs/shadow_run/shadow-burnin-v3-p37-counterfactual-probe-r15-smoke-r8h/shadow_lifecycle.jsonl"
+timing_model = "prepared_entry_mirror"
+stale_policy = "emit_warning"
+
+[execution.events]
+output_dir = "../../datasets/events/shadow-burnin-v3-p37-counterfactual-probe-r15-smoke-r8h"
+rotation_interval_ms = 300000
+flush_interval_ms = 1000
+max_file_size_bytes = 50000000
+enable_aem_ticks = true
+enable_optional_events = false
+
+[p37_shadow_probe]
+enabled = true
+namespace = "shadow-burnin-v3-p37-counterfactual-probe-r15-smoke-r8h"
+dispatch_source = "counterfactual_shadow_probe"
+sample_source = "v3_mfs_decision_rows"
+sample_mode = "deterministic_hash_mod"
+sample_modulus = 100
+sample_threshold = 100
+sampling_version = "p37-j3-v1"
+run_id = "shadow-burnin-v3-p37-counterfactual-probe-r15-smoke-r8h"
+session_id = "r15-smoke-r8h-j3n"
+max_probes_per_run = 5
+max_probes_per_minute = 5
+max_concurrent = 1
+max_scan_concurrent = 8
+max_probe_candidates_scanned_per_run = 1000
+include_verdict_types = ["REJECT", "PENDING"]
+exclude_active_buy_rows = true
+enable_eligibility_precheck = true
+require_ab_record_id = true
+require_materialized_feature_set = true
+require_v3_replay_payload = true
+require_v3_feature_snapshot_hash = true
+require_v3_policy_config_hash = true
+require_execution_route_identity = true
+require_curve_account_state = true
+dedupe_by_probe_id = true
+emit_event_bus = false
+event_bus_mode = "disabled"
+probe_amount_source = "fixed_lamports"
+probe_amount_lamports = 7000000
+probe_slippage_bps = 2000
+probe_quote_age_max_ms = 1500
+probe_curve_age_max_ms = 1500
+probe_wait_for_execution_accounts_ms = 1500
+append = false
+require_unique_namespace = true
+selection_log_path = "../../logs/shadow_run/shadow-burnin-v3-p37-counterfactual-probe-r15-smoke-r8h/probe_selection.jsonl"
+skip_log_path = "../../logs/shadow_run/shadow-burnin-v3-p37-counterfactual-probe-r15-smoke-r8h/probe_skips.jsonl"
+transport_log_path = "../../logs/shadow_run/shadow-burnin-v3-p37-counterfactual-probe-r15-smoke-r8h/probe_transport.jsonl"
+entry_log_path = "../../logs/shadow_run/shadow-burnin-v3-p37-counterfactual-probe-r15-smoke-r8h/probe_shadow_entries.jsonl"
+lifecycle_log_path = "../../logs/shadow_run/shadow-burnin-v3-p37-counterfactual-probe-r15-smoke-r8h/probe_shadow_lifecycle.jsonl"
+
+[oracle]
+decision_log_path = "../../logs/rollout/shadow-burnin-v3-p37-counterfactual-probe-r15-smoke-r8h/decisions"
+
+[durability]
+wal_enabled = false
+wal_dir = "../../data/rollout/shadow-burnin-v3-p37-counterfactual-probe-r15-smoke-r8h/wal"
+snapshot_dir = "../../data/rollout/shadow-burnin-v3-p37-counterfactual-probe-r15-smoke-r8h/snapshots"
+
+[metrics]
+enabled = true
+bind = "0.0.0.0"
+port = 9090
+
+[gui_backend]
+enabled = true
+bind_address = "127.0.0.1"
+port = 8801
+
+[logging]
+level = "info"
+console_enabled = true
+json_format = false
+file_enabled = true
+file_path = "../../logs/rollout/shadow-burnin-v3-p37-counterfactual-probe-r15-smoke-r8h/system.log"
+oracle_log_enabled = true
+oracle_log_path = "../../logs/rollout/shadow-burnin-v3-p37-counterfactual-probe-r15-smoke-r8h/oracle.log"
+oracle_json_format = false

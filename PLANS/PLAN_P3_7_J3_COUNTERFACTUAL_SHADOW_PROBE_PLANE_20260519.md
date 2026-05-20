@@ -1494,6 +1494,547 @@ Acceptance:
 Collection, Phase B, P2, live, active policy changes, IWIM changes and threshold
 tuning remain out of scope.
 
+## P3.7-J3Q3 Optional `bonding_curve_v2` Probe Precheck Repair
+
+### Trigger
+
+R15-r8l was stopped early after the first structural signal. It produced exact
+decision/V3 joins, but no probe transport or entry rows:
+
+```text
+probe_selection_rows = 20
+probe_transport_rows = 0
+probe_entry_rows = 0
+missing roles = bonding_curve_v2:18, creator_vault:1
+```
+
+Manual inspection of one selected pool showed that a real successful on-chain
+buy for the same pool used the same `bonding_curve_v2` pubkey as account index
+16 of the extended Pump.fun buy instruction, while that account had zero
+pre/post lamports and `getAccountInfo` returned no current account data. That
+means the probe precheck was treating an optional/zero-lamport remaining
+account as a strict account-existence requirement.
+
+### Decision
+
+J3Q3 narrows the counterfactual probe precheck only for this observed optional
+role:
+
+- `bonding_curve_v2` is not required to pass RPC existence precheck when it is
+  exactly account index 16 of the prepared extended buy instruction;
+- the account remains serialized in the prepared instruction and may still be
+  used by the simulator;
+- `creator_vault`, payer, bonding curve, associated bonding curve and other true
+  execution accounts remain strict;
+- active BUY, IWIM, live sender, thresholds and V2/V2.5 policy are unchanged.
+
+This is not a collection gate. It is a probe-only correction to avoid rejecting
+rows before simulation solely because an observed optional remaining account is
+absent on RPC.
+
+### R15-r8m Gate
+
+R15-r8m must prove that the optional `bonding_curve_v2` repair reaches real
+counterfactual probe transport and entry rows without mutating active BUY:
+
+```text
+shadow-burnin-v3-p37-counterfactual-probe-r15-smoke-r8m
+```
+
+Minimal pass:
+
+- V3/MFS strict replay remains OK.
+- Probe selection exact decision/V3 join remains 100%.
+- Probe transport rows are produced.
+- Probe shadow entry rows are produced.
+- Probe rows carry `dispatch_source = counterfactual_shadow_probe`.
+- `buys.jsonl` remains absent or empty.
+- Lifecycle close is not required for this gate.
+
+Collection, Phase B, P2, live, active policy changes, IWIM changes and threshold
+tuning remain out of scope.
+
+## P3.7-J3P Probe Legacy Route Preservation Through Preparation
+
+### Trigger
+
+R15-r8i confirmed that the configured shadow payer is no longer the active
+blocker. The run used `payer_strategy="configured"` with the historical
+shadow-burnin test keypair and preflight accepted the payer account. Probe
+selection and decision/V3 hash continuity also remained healthy.
+
+However, selected probes still stopped before transport/entry:
+
+```text
+probe_selection_rows = 11
+probe_transport_rows = 0
+probe_entry_rows = 0
+execution_account_not_ready:bonding_curve_v2 = 8
+execution_account_not_ready:creator_vault = 2
+```
+
+Inspection of the trigger preparation path showed that `LegacyBuy` evidence
+could be recovered by the P3.7 probe resolver, but
+`prepare_buy_request_with_tip_telemetry_and_amount_lamports` sanitized
+`LegacyBuy` back to `None`. The later build step defaulted `None` to
+`RoutedExactSolIn`, reintroducing routed-only required accounts
+`bonding_curve_v2` and `creator_vault`.
+
+### Decision
+
+J3P keeps the generic active sanitizer conservative, but adds a prepared-request
+sanitizer that preserves `LegacyBuy` only when the request carries
+`legacy_buy_curve` proof. Without that curve proof, `LegacyBuy` still fails
+closed and falls back to the existing behavior.
+
+This is a narrow preparation-boundary repair:
+
+- no active policy change,
+- no IWIM change,
+- no threshold change,
+- no live sender change,
+- no global precheck disable,
+- no treatment of missing execution accounts as success.
+
+### R15-r8j Gate
+
+The next smoke must use a clean namespace:
+
+```text
+shadow-burnin-v3-p37-counterfactual-probe-r15-smoke-r8j
+```
+
+Acceptance:
+
+- V3/MFS strict replay remains OK.
+- Selection exact decision/V3 join remains 100%.
+- Configured shadow payer remains in use.
+- Legacy probe candidates that carry `legacy_buy_curve` remain `LegacyBuy`
+  through prepared-request construction.
+- Legacy probe candidates do not require routed-only accounts
+  `bonding_curve_v2` / `creator_vault`.
+- If no probe transport/entry rows appear, the blocker must be a newly precise
+  readiness/simulation class, not loss of `LegacyBuy` at the preparation
+  boundary.
+
+Collection, Phase B, P2, live, active policy changes, IWIM changes and threshold
+tuning remain out of scope.
+
+## P3.7-J3N Simulation Payer Account Contract Repair
+
+### Trigger
+
+R15-r8f was stopped early after the first useful blocker appeared. The run
+showed that the counterfactual probe plane still did not reach probe
+transport/entry rows, while the ordinary shadow transport path produced one
+active shadow BUY simulation row:
+
+```text
+active_buy_rows = 1
+active_shadow_execution_outcome = counterfactual/ordinary shadow simulation error
+active_shadow_error = AccountNotFound
+active_shadow_payer_provenance = ephemeral
+```
+
+The failed prepared-buy log identified the active shadow payer as a
+launcher-local ephemeral key. Direct RPC checks showed that this ephemeral fee
+payer did not exist on-chain. The configured local rollout wallet from `.env`
+and `wallets/shadow-burnin-test.json` resolves to a chain-visible account with
+lamports available for simulation.
+
+### Decision
+
+J3N restores the simulation payer contract for the R15 smoke lane:
+
+- use a configured, chain-visible simulation payer for R15-r8h;
+- keep `entry_mode = "shadow_only"` and `execution_mode = "shadow"`;
+- keep `funding_lane_mode = "disabled"`;
+- do not enable live sender, P2, active policy changes, IWIM changes or
+  threshold tuning;
+- treat the configured payer as simulation infrastructure only, not live
+  inclusion;
+- add `payer_pubkey` to shadow transport records additively so future
+  `AccountNotFound` rows identify the payer directly in JSONL.
+
+### R15-r8h Gate
+
+R15-r8h must use a clean bounded smoke namespace:
+
+```text
+shadow-burnin-v3-p37-counterfactual-probe-r15-smoke-r8h
+```
+
+Smoke profile differences from R15-r8g:
+
+```text
+[trigger]
+keypair_path = "../../wallets/shadow-burnin-test.json"
+
+[trigger.shadow_run]
+payer_strategy = "configured"
+```
+
+Acceptance:
+
+- V3/MFS strict replay remains OK.
+- Probe selection exact decision/V3 join remains 100%.
+- Active shadow `AccountNotFound` must no longer be attributable to a missing
+  ephemeral fee payer.
+- If `AccountNotFound` remains, `buys.jsonl` must carry `payer_pubkey` and
+  `payer_provenance` for immediate diagnosis.
+- Probe transport/entry remains the target gate; if no rows appear, the run must
+  be stopped early and classified by the first concrete blocker.
+
+Collection, Phase B, P2, live, active policy changes, IWIM changes and threshold
+tuning remain out of scope.
+
+## P3.7-J3M Probe/Shadow Route-Source Compatibility Repair
+
+### Trigger
+
+R15-r8f was stopped early once the blocker was visible:
+
+```text
+v3_rows = 15
+strict_replay = full_replay_ok
+probe_selection_rows = 30
+probe_skips = 76
+probe_transport_rows = 0
+probe_entry_rows = 0
+active_shadow_buy_rows = 1
+active_shadow_execution_outcome = shadow_data_problem / AccountNotFound
+```
+
+J3L correctly moved missing route identity out of the expensive scan path, but
+the smoke still showed two route/account compatibility failures:
+
+- counterfactual probe candidates either had no execution route identity or
+  failed strict execution-account readiness on `bonding_curve_v2` /
+  route-specific `creator_vault`;
+- a non-probe active shadow BUY in the same namespace also failed with
+  `AccountNotFound`.
+
+This means the remaining blocker is not only probe-plane throttling. The runtime
+route/account metadata reaching shadow simulation can be incompatible with the
+actual source transaction route.
+
+### Decision
+
+J3M repairs route-source compatibility at the parser/enrichment boundary before
+running another smoke:
+
+- do not bypass `bonding_curve_v2`, `creator_vault`, or any strict required
+  execution account;
+- do not reinterpret `AccountNotFound` as success;
+- do not widen probe dispatch limits;
+- preserve shadow/live separation and active verdict semantics;
+- prefer a true routed pump.fun buy instruction over a legacy-like buy
+  instruction when both are present in the same source transaction and both
+  match the same trade;
+- keep top-level source instructions preferred over inner CPI instructions once
+  the top-level match is complete.
+
+The purpose is to stop handing inconsistent route metadata to the trigger
+builder. It is not a policy change and it does not enable P2/live.
+
+### Acceptance
+
+- Existing legacy-only and routed-only enrichment tests still pass.
+- A transaction containing both top-level legacy-like and routed pump.fun buy
+  instructions enriches `buy_variant = routed_exact_sol_in` and carries the
+  routed account fields.
+- Top-level pump.fun instructions still take priority over inner CPI fallback
+  when top-level enrichment is complete.
+- R15-r8f is documented as `NOT_READY_DIAGNOSED`; no collection is started.
+- Next runtime smoke must again be treated as an early-failure detector.
+
+Collection, Phase B, P2, live, active policy changes, IWIM changes and threshold
+tuning remain out of scope.
+
+## P3.7-J3L Probe Route-Identity Pre-Scan Gate
+
+### Trigger
+
+R15-r8e was stopped early once the structural blocker was clear:
+
+```text
+probe_selection_rows = 58
+probe_transport_rows = 0
+probe_entry_rows = 0
+probe_execution_precheck_failed = 25
+execution_account_not_ready = 31
+missing_execution_route_identity = 25
+execution_account_not_ready:bonding_curve_v2 = 28
+execution_account_not_ready:creator_vault = 3
+```
+
+J3K correctly made missing route identity fail closed, but the check still ran
+inside the background scan path. That meant rows with no usable execution route
+identity consumed scan-plane capacity before being classified.
+
+### Decision
+
+J3L moves the cheap route-identity precheck before scan admission:
+
+- derive account overrides from the current buffered transaction evidence and
+  pool metadata before `try_reserve_scan_slot`;
+- if route identity is missing, write a structured `probe_skipped` row
+  immediately;
+- do not reserve scan budget, spawn the background probe task, wait for account
+  readiness, or touch dispatch quota for route-unready rows;
+- keep the same fail-closed route reasons:
+  `missing_execution_route_identity`,
+  `missing_routed_associated_bonding_curve`, and `missing_creator_pubkey`;
+- preserve strict execution-account readiness after route identity passes.
+
+This is not a policy change and does not loosen any execution account precheck.
+It only prevents route-unready rows from occupying the scan plane.
+
+The readiness audit is also updated to include pre-scan precheck skips that do
+not have a paired `probe_selected` row. Those rows are classified explicitly as
+route-identity failures instead of disappearing from the readiness report or
+being folded into `unknown`.
+
+### R15 Post-J3L Gate
+
+The next smoke must use a fresh namespace and must again be treated as an
+early-failure detector:
+
+```text
+shadow-burnin-v3-p37-counterfactual-probe-r15-smoke-r8f
+```
+
+Acceptance:
+
+- V3/MFS strict replay remains OK.
+- Probe selection exact decision/V3 join remains 100%.
+- Route-unready rows are visible in `probe_skips.jsonl` but do not consume scan
+  budget.
+- If complete route identity exists but strict execution accounts are missing,
+  the blocker remains `execution_account_not_ready` with role/pubkey.
+- If probe transport/entry appears, stop after a short grace period and produce
+  reports immediately.
+- If route/precheck skips dominate and no transport/entry appears, stop early
+  and repair the next structural blocker; do not wait for timeout.
+
+Collection, Phase B, P2, live, active policy changes, IWIM changes and threshold
+tuning remain out of scope.
+
+## P3.7-J3K Execution Route Identity Gate
+
+### Trigger
+
+R15-r8d after J3J proved that a short bounded wait does not make the currently
+selected probe rows execution-ready:
+
+```text
+probe_selection_rows = 25
+probe_transport_rows = 0
+probe_entry_rows = 0
+wait_timeout = 21
+missing_roles = bonding_curve_v2:19, creator_vault:2
+```
+
+At that point the blocker is no longer scan throughput, dispatch quota, payer
+semantics, or short-lived account readiness. The remaining risk is that the
+probe build path can construct a routed shadow simulation request from
+incomplete decision-time execution route identity, then fail later on derived
+route accounts such as `bonding_curve_v2` or `creator_vault`.
+
+### Decision
+
+J3K makes execution route identity an explicit fail-closed eligibility
+condition before the probe request is built:
+
+- `buy_variant` must be present in the derived account overrides;
+- routed exact-SOL-in probes must carry `associated_bonding_curve`;
+- `creator_pubkey` must be present before creator-vault-dependent routed
+  requests are allowed;
+- missing route identity is logged as a structured precheck skip, not as a
+  late `AccountNotFound` or `execution_account_not_ready` after request build.
+
+This is intentionally conservative. It does not infer route accounts
+post-factum and does not treat missing route identity as success. It converts a
+late simulation/build blocker into a decision-time-safe eligibility result.
+
+New skip reasons:
+
+```text
+missing_execution_route_identity
+missing_routed_associated_bonding_curve
+missing_creator_pubkey
+```
+
+Strict execution accounts remain strict. `bonding_curve_v2` and
+route-specific `creator_vault` are still not bypassed if the route identity is
+complete and the account is actually missing.
+
+### R15 Post-J3K Gate
+
+The next runtime smoke must use a fresh namespace:
+
+```text
+shadow-burnin-v3-p37-counterfactual-probe-r15-smoke-r8e
+```
+
+It must be treated as an early-failure detector:
+
+- stop early if route-identity skips dominate and no transport/entry rows
+  appear;
+- stop early if probe transport/entry rows appear;
+- generate reports immediately at the stopping point.
+
+Acceptance:
+
+- V3/MFS strict replay remains OK.
+- Probe selection exact decision/V3 join remains 100%.
+- Route identity failures become explicit precheck skips.
+- No probe collection is allowed while probe transport/entry remain absent.
+- If complete route identity is present but strict execution accounts are still
+  missing, the blocker remains execution-account readiness and must be reported
+  precisely.
+
+Collection, Phase B, P2, live, active policy changes, IWIM changes and threshold
+tuning remain out of scope.
+
+## P3.7-J3J Execution Account Wait Strategy
+
+### Trigger
+
+R15-r8c after J3I3 proved that scan-plane concurrency was no longer the active
+blocker:
+
+```text
+probe_selection_rows = 33
+probe_scan_concurrency_limit_exceeded = 0
+probe_transport_rows = 0
+probe_entry_rows = 0
+dominant blocker = execution_account_not_ready
+```
+
+The dominant missing roles remained strict execution accounts, primarily
+`bonding_curve_v2`. That means the probe plane is reaching decision rows with
+valid V3/MFS metadata and exact join keys, but the execution account set is not
+ready at immediate probe-dispatch time.
+
+### Decision
+
+J3J adds a bounded, decision-time-safe wait for required execution accounts in
+the isolated counterfactual probe background path:
+
+- new config field: `probe_wait_for_execution_accounts_ms`;
+- default is `0`, preserving fail-fast behavior for legacy and non-probe
+  configs;
+- the wait runs only after probe selection and scan admission, and before
+  dispatch quota is consumed;
+- the decision hot path remains non-blocking;
+- active Gatekeeper verdicts, IWIM, live sender and thresholds are unchanged;
+- strict execution accounts remain strict and are not bypassed;
+- wait diagnostics are written on probe selection/skip/transport rows as
+  `probe_execution_account_wait_ms` and
+  `probe_execution_account_wait_result`.
+
+Valid wait results:
+
+```text
+ready_without_wait
+wait_disabled
+ready_after_wait
+wait_timeout
+```
+
+Rows that still lack a strict required account after the wait remain
+`execution_account_not_ready:<role>:<pubkey>`. This is a diagnostic narrowing
+step, not a success condition.
+
+### R15 Post-J3J Gate
+
+The next smoke must use a fresh namespace because previous `append=false`
+namespaces already contain probe artifacts:
+
+```text
+shadow-burnin-v3-p37-counterfactual-probe-r15-smoke-r8d
+```
+
+Smoke must be monitored as an early-failure detector. Stop early once one of
+the following is clear:
+
+- probe transport/entry rows appear;
+- `wait_timeout` plus `execution_account_not_ready` dominates;
+- a new structural blocker appears.
+
+Acceptance:
+
+- V3/MFS strict replay remains OK.
+- Probe selection exact decision/V3 join remains 100%.
+- If account readiness arrives within the wait window, probe transport/entry
+  can be produced.
+- If no account readiness arrives, the report must classify the run as
+  `NOT_READY_DIAGNOSED` with wait diagnostics, not as timeout noise.
+- Full/bounded collection remains `HOLD` until probe transport/entry pass.
+
+Collection, Phase B, P2, live, active policy changes, IWIM changes and threshold
+tuning remain out of scope.
+
+## P3.7-J3I3 Probe Scan Backlog Admission Repair
+
+### Trigger
+
+R15-r8 and the immediately aborted R15-r8b smoke attempt showed that the J3I2
+contract still had one practical flaw: `probe_scan_concurrency_limit_exceeded`
+could dominate early even when `max_probe_candidates_scanned_per_run` had not
+been reached.
+
+That means scan concurrency was acting as candidate admission control instead
+of as a bound on active readiness work. In that mode a useful probe candidate
+could be discarded simply because another readiness check was in flight.
+
+### Decision
+
+J3I3 changes scan-plane semantics:
+
+- candidate admission is bounded by `max_probe_candidates_scanned_per_run` and
+  `dedupe_by_probe_id`;
+- scan concurrency is enforced by awaiting a scan semaphore inside the
+  background probe task;
+- the decision hot path remains non-blocking;
+- `probe_scan_concurrency_limit_exceeded` is no longer a normal skip reason;
+- dispatch quota is still consumed only after execution-account readiness has
+  passed;
+- the finite scan backlog is bounded by the configured candidate scan limit.
+
+If the scan semaphore is closed, the probe is written as
+`probe_scan_semaphore_closed`. That is an internal runtime shutdown/error
+condition, not a data-readiness conclusion.
+
+This repair does not relax `bonding_curve_v2`, `creator_vault`, payer, or any
+other execution-account precheck. It only prevents premature candidate loss
+before the strict readiness check has run.
+
+### R15 Post-J3I3 Gate
+
+The next runtime smoke must be treated as an early-failure detector, not as a
+blind timeout wait:
+
+- stop immediately if a new structural blocker dominates early;
+- generate the current reports at the stopping point;
+- repair the blocker before running a larger collection;
+- do not proceed to collection while probe transport/entry remain absent.
+
+Acceptance:
+
+- V3/MFS strict replay remains OK.
+- Probe selection exact decision/V3 join remains 100%.
+- `probe_scan_concurrency_limit_exceeded` is absent or replaced by bounded
+  waiting.
+- If no probe transport/entry rows appear, the dominant blocker must be a real
+  readiness class such as `execution_account_not_ready`, not scan-plane
+  throttling.
+- Full/bounded collection remains `HOLD` until probe transport/entry pass.
+
+Collection, Phase B, P2, live, active policy changes, IWIM changes and threshold
+tuning remain out of scope.
+
 ## P3.7-J3I2 Probe Scan-Plane Throughput Repair
 
 ### Trigger
@@ -1561,6 +2102,69 @@ Acceptance:
 - If execution-ready rows exist, dispatch can reach probe transport/entry.
 - If no execution-ready rows exist after the finite scan budget, the run is
   `NOT_READY_DIAGNOSED`, not a scan-throughput artifact.
+
+Collection, Phase B, P2, live, active policy changes, IWIM changes and threshold
+tuning remain out of scope.
+
+## P3.7-J3O Probe Variant-Aware Buy Route / Required Account Contract
+
+### Trigger
+
+R15-r8h validated the configured shadow simulation payer path, but the next
+early blocker was no longer the wallet. The run used the historical configured
+shadow-burnin payer and still stopped before probe transport/entry because
+strict execution-account readiness saw missing builder-derived accounts:
+
+```text
+execution_account_not_ready:bonding_curve_v2:<pubkey>
+execution_account_not_ready:creator_vault:<pubkey>
+missing_execution_route_identity
+```
+
+Manual inspection of the same selected pool showed observed `legacy_buy` and
+`routed_exact_sol_in` events in the buffered transaction set. The direct
+builder, however, treated legacy and routed buys as if they shared the newer
+extended account layout. That made probe precheck demand routed-only execution
+accounts for rows that could be simulated with the compact legacy buy layout.
+
+### Decision
+
+J3O separates the probe account contract by buy variant:
+
+- `LegacyBuy` uses the compact Pump.fun account layout observed on-chain:
+  global, fee recipient, mint, bonding curve, associated bonding curve,
+  user ATA, payer, system program, token program, rent, event authority and
+  Pump program.
+- `RoutedExactSolIn` keeps the extended route with creator vault, volume
+  accumulator, fee config/program, bonding curve v2 and buyback fee recipient.
+- `creator_pubkey` remains route metadata used to derive route-specific accounts;
+  it is not itself a transaction account and must not be required as an RPC
+  account.
+- The P3.7 probe plane may preserve a trusted observed `legacy_buy` route from
+  buffered transaction evidence before falling back to the generic active
+  override resolver.
+- The active generic override resolver still drops unverified legacy route
+  overrides; J3O is a probe-only compatibility path for counterfactual shadow
+  simulation evidence.
+
+### R15-r8i Gate
+
+The next smoke must use a clean namespace:
+
+```text
+shadow-burnin-v3-p37-counterfactual-probe-r15-smoke-r8i
+```
+
+Acceptance:
+
+- V3/MFS strict replay remains OK.
+- Selection exact decision/V3 join remains 100%.
+- Configured shadow payer remains in use.
+- Legacy probe candidates no longer require `bonding_curve_v2` or
+  `creator_vault`.
+- Routed probe candidates still require route-specific execution accounts.
+- If no probe transport/entry rows appear, the blocker must be a newly precise
+  readiness class, not the legacy/routed account-layout mismatch.
 
 Collection, Phase B, P2, live, active policy changes, IWIM changes and threshold
 tuning remain out of scope.

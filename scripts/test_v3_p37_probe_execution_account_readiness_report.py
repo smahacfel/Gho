@@ -63,6 +63,32 @@ class ProbeExecutionAccountReadinessReportTests(unittest.TestCase):
         self.assertIn("not_materialized_in_v3_mfs:creator_vault", reasons)
         self.assertIn("unavailable before probe dispatch", basis)
 
+    def test_route_identity_precheck_reasons_are_classified(self):
+        classification, reasons, basis = classify_missing_account(
+            None,
+            None,
+            {},
+            {"diag_account_update_occurrences": 0},
+            "missing_execution_route_identity",
+        )
+
+        self.assertEqual(classification, "missing_execution_route_identity")
+        self.assertEqual(reasons, ["missing_execution_route_identity"])
+        self.assertIn("buy route identity", basis)
+
+    def test_routed_associated_curve_precheck_reason_is_classified(self):
+        classification, reasons, basis = classify_missing_account(
+            None,
+            None,
+            {},
+            {"diag_account_update_occurrences": 0},
+            "missing_routed_associated_bonding_curve",
+        )
+
+        self.assertEqual(classification, "missing_routed_associated_bonding_curve")
+        self.assertEqual(reasons, ["missing_routed_associated_bonding_curve"])
+        self.assertIn("associated bonding curve", basis)
+
 
 if __name__ == "__main__":
     unittest.main()

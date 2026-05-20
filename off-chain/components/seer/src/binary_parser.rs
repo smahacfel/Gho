@@ -5409,6 +5409,18 @@ fn trade_enrich_complete(trade: &TradeEvent) -> bool {
             || (trade.buy_variant.is_some() && trade.associated_bonding_curve.is_some()))
 }
 
+fn pump_buy_enrichment_priority(ix_data: &[u8]) -> u8 {
+    if ix_data.starts_with(&DISC_PUMP_BUY_ROUTED)
+        || ix_data.starts_with(&DISC_SWAP_BUY_EXACT_QUOTE_IN)
+    {
+        2
+    } else if ix_data.starts_with(&DISC_BUY) {
+        1
+    } else {
+        0
+    }
+}
+
 /// Fill optional enrichment fields on `trade` from the resolved instruction
 /// accounts and data.  Returns `true` when all fields are now populated.
 ///
@@ -5477,14 +5489,27 @@ fn enrich_trade_optional_accounts_from_source_ix(event: &GeyserEvent, trade: &mu
     let all_keys: Vec<String> = accounts.iter().map(ToString::to_string).collect();
 
     // ── Phase 1: top-level instructions ──────────────────────────────────────
+    let mut best_top_level_ix: Option<(SmallVec<[String; 14]>, Vec<u8>, u8)> = None;
     for ix in instructions {
         let ix_accounts = resolve_accounts(&ix.account_indices, &all_keys);
         if !trade_matches_pump_instruction(trade, &ix.program_id, &ix.data, &ix_accounts) {
             continue;
         }
-        if fill_trade_from_ix_accounts(trade, &ix_accounts, &ix.data) {
-            break;
+        let priority = if trade.is_buy {
+            pump_buy_enrichment_priority(&ix.data)
+        } else {
+            1
+        };
+        let replace = best_top_level_ix
+            .as_ref()
+            .map(|(_, _, best_priority)| priority > *best_priority)
+            .unwrap_or(true);
+        if replace {
+            best_top_level_ix = Some((ix_accounts, ix.data.clone(), priority));
         }
+    }
+    if let Some((ix_accounts, ix_data, _)) = best_top_level_ix {
+        fill_trade_from_ix_accounts(trade, &ix_accounts, &ix_data);
     }
 
     // ── Phase 2: inner instructions (CPI) ────────────────────────────────────
@@ -5493,7 +5518,8 @@ fn enrich_trade_optional_accounts_from_source_ix(event: &GeyserEvent, trade: &mu
     // this pass, buy_variant / fee / token_program / assoc_bc stay None
     // for ~96% of observed BUY transactions.
     if !trade_enrich_complete(trade) {
-        'outer: for group in inner_instructions {
+        let mut best_inner_ix: Option<(SmallVec<[String; 14]>, Vec<u8>, u8)> = None;
+        for group in inner_instructions {
             for ix in &group.instructions {
                 let prog_str = key_at(&all_keys, ix.program_id_index as usize);
                 let Ok(prog_pk) = Pubkey::from_str(&prog_str) else {
@@ -5503,10 +5529,22 @@ fn enrich_trade_optional_accounts_from_source_ix(event: &GeyserEvent, trade: &mu
                 if !trade_matches_pump_instruction(trade, &prog_pk, &ix.data, &ix_accounts) {
                     continue;
                 }
-                if fill_trade_from_ix_accounts(trade, &ix_accounts, &ix.data) {
-                    break 'outer;
+                let priority = if trade.is_buy {
+                    pump_buy_enrichment_priority(&ix.data)
+                } else {
+                    1
+                };
+                let replace = best_inner_ix
+                    .as_ref()
+                    .map(|(_, _, best_priority)| priority > *best_priority)
+                    .unwrap_or(true);
+                if replace {
+                    best_inner_ix = Some((ix_accounts, ix.data.clone(), priority));
                 }
             }
+        }
+        if let Some((ix_accounts, ix_data, _)) = best_inner_ix {
+            fill_trade_from_ix_accounts(trade, &ix_accounts, &ix_data);
         }
     }
 
@@ -9574,6 +9612,105 @@ mod tests {
 
         assert_eq!(trade.buy_variant.as_deref(), Some("routed_exact_sol_in"));
         assert!(trade.associated_bonding_curve.is_some());
+    }
+
+    #[test]
+    fn enrich_trade_prefers_top_level_routed_over_top_level_legacy_when_both_match() {
+        let mint = Pubkey::new_unique();
+        let curve = Pubkey::new_unique();
+        let user = Pubkey::new_unique();
+        let global_config = Pubkey::new_unique();
+        let legacy_fee = Pubkey::new_unique();
+        let routed_fee = Pubkey::new_unique();
+        let token_program = Pubkey::new_unique();
+        let legacy_assoc_bc = Pubkey::new_unique();
+        let routed_assoc_bc = Pubkey::new_unique();
+
+        let mut accounts = vec![Pubkey::new_unique(); 24];
+        accounts[PUMP_IDX_GLOBAL_CONFIG] = global_config;
+        accounts[PUMP_IDX_FEE_RECIPIENT] = legacy_fee;
+        accounts[PUMP_IDX_MINT] = mint;
+        accounts[PUMP_IDX_BONDING_CURVE] = curve;
+        accounts[PUMP_IDX_ASSOCIATED_BONDING_CURVE] = legacy_assoc_bc;
+        accounts[PUMP_IDX_USER] = user;
+        accounts[PUMP_IDX_TOKEN_PROGRAM] = token_program;
+
+        let routed_base = 12usize;
+        accounts[routed_base + PUMP_IDX_GLOBAL_CONFIG] = global_config;
+        accounts[routed_base + PUMP_IDX_FEE_RECIPIENT] = routed_fee;
+        accounts[routed_base + PUMP_IDX_MINT] = mint;
+        accounts[routed_base + PUMP_IDX_BONDING_CURVE] = curve;
+        accounts[routed_base + PUMP_IDX_ASSOCIATED_BONDING_CURVE] = routed_assoc_bc;
+        accounts[routed_base + PUMP_IDX_USER] = user;
+        accounts[routed_base + PUMP_IDX_TOKEN_PROGRAM] = token_program;
+
+        let event = make_decoded_tx_event(
+            accounts,
+            vec![
+                crate::types::RawInstruction {
+                    program_id: Pubkey::from_str(PUMP_FUN_PROGRAM_ID).unwrap(),
+                    account_indices: (0u8..12u8).collect(),
+                    data: trade_data(DISC_BUY, 1_000_000, 50_000_000),
+                },
+                crate::types::RawInstruction {
+                    program_id: Pubkey::from_str(PUMP_FUN_PROGRAM_ID).unwrap(),
+                    account_indices: (12u8..24u8).collect(),
+                    data: trade_data(DISC_PUMP_BUY_ROUTED, 1_000_000, 50_000_000),
+                },
+            ],
+        );
+
+        let mut trade = TradeEvent {
+            semantic: ghost_core::EventSemanticEnvelope::default(),
+            slot: Some(1),
+            signature: solana_sdk::signature::Signature::new_unique(),
+            event_ordinal: Some(0),
+            provenance: None,
+            timestamp_ms: 1,
+            arrival_ts_ms: 1,
+            event_time: ghost_core::EventTimeMetadata::default(),
+            pool_amm_id: curve,
+            mint,
+            signer: user,
+            is_buy: true,
+            is_dev_buy: false,
+            amount: 1_000_000,
+            max_sol_cost: 50_000_000,
+            min_sol_output: 0,
+            success: true,
+            error_code: None,
+            compute_units_consumed: None,
+            owner_token_deltas: vec![],
+            mpcf_payload: vec![],
+            mpcf_payload_missing_reason: RawBytesMissingReason::ProviderDoesNotSupport,
+            v_tokens_in_bonding_curve: None,
+            v_sol_in_bonding_curve: None,
+            market_cap_sol: None,
+            global_config: None,
+            fee_recipient: None,
+            token_program: None,
+            buy_variant: None,
+            associated_bonding_curve: None,
+            is_mayhem_mode: None,
+            cu_price_micro_lamports: None,
+            compute_unit_limit: None,
+            inner_ix_count: None,
+            cpi_depth: None,
+            ata_create_count: None,
+            signer_pre_balance_lamports: None,
+            signer_post_balance_lamports: None,
+            jito_tip_detected: None,
+            toolchain_fingerprint: ToolchainFingerprintInput::default(),
+            curve_data_known: true,
+            curve_finality: ghost_core::CurveFinality::Provisional,
+            is_pumpswap: false,
+        };
+
+        enrich_trade_optional_accounts_from_source_ix(&event, &mut trade);
+
+        assert_eq!(trade.buy_variant.as_deref(), Some("routed_exact_sol_in"));
+        assert_eq!(trade.fee_recipient, Some(routed_fee));
+        assert_eq!(trade.associated_bonding_curve, Some(routed_assoc_bc));
     }
 
     // ── CPI inner-instruction enrichment tests ───────────────────────────────

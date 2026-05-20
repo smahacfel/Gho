@@ -49,6 +49,24 @@ MFS_ROLE_PATHS = {
     "bonding_curve": (),
     "associated_bonding_curve": (),
 }
+ROUTE_PRECHECK_REASONS = {
+    "missing_execution_route_identity": (
+        "missing_execution_route_identity",
+        "Derived account overrides do not carry a decision-time buy route identity",
+    ),
+    "missing_routed_associated_bonding_curve": (
+        "missing_routed_associated_bonding_curve",
+        "Routed exact-SOL-in probe lacks the associated bonding curve identity",
+    ),
+    "missing_creator_pubkey": (
+        "missing_creator_pubkey",
+        "Probe cannot derive creator-vault-dependent routed accounts without creator_pubkey",
+    ),
+    "missing_bonding_curve": (
+        "missing_legacy_bonding_curve",
+        "Legacy buy route lacks the legacy buy curve identity",
+    ),
+}
 
 
 def iter_jsonl(path: Path) -> Iterable[dict[str, Any]]:
@@ -202,6 +220,13 @@ def classify_missing_account(
     log_scan: dict[str, Any],
     reason: str | None = None,
 ) -> tuple[str, list[str], str]:
+    if reason in ROUTE_PRECHECK_REASONS:
+        classification, basis = ROUTE_PRECHECK_REASONS[reason]
+        return (
+            classification,
+            [reason],
+            basis,
+        )
     if not role or not missing_pubkey:
         return "unknown", ["missing_required_account_reason_absent"], "No missing account reason"
     if role not in STRICT_EXECUTION_ROLES:
@@ -295,6 +320,8 @@ def selected_probe_report(
 ) -> dict[str, Any]:
     probe_id = selection.get("probe_id")
     skip = skip_by_probe_id.get(str(probe_id), {})
+    if not skip and selection.get("event_type") == "probe_skipped":
+        skip = selection
     role, missing_pubkey = parse_missing_required_account(skip.get("precheck_failure_reason"))
     decision_path, decision_index, decision_row, join_diag = decision_lookup(decisions, selection)
     log_scan = scan_logs(log_paths, missing_pubkey)
@@ -321,6 +348,7 @@ def selected_probe_report(
         "v3_policy_config_hash": selection.get("source_v3_policy_config_hash")
         or selection.get("v3_policy_config_hash"),
         "probe_skip_reason": skip.get("probe_skip_reason"),
+        "source_probe_event_type": selection.get("event_type"),
         "precheck_failure_reason": precheck_failure_reason,
         "execution_account_readiness_status": skip.get("execution_account_readiness_status"),
         "execution_account_readiness_role": skip.get("execution_account_readiness_role"),
@@ -380,6 +408,8 @@ def render_markdown(payload: dict[str, Any]) -> str:
         "",
         "```text",
         f"selected_probe_rows = {summary['selected_probe_rows']}",
+        f"pre_scan_precheck_skip_rows = {summary['pre_scan_precheck_skip_rows']}",
+        f"audited_probe_rows = {summary['audited_probe_rows']}",
         f"diagnosed_selected_probe_rows = {summary['diagnosed_selected_probe_rows']}",
         f"exact_decision_v3_join_rows = {summary['exact_decision_v3_join_rows']}",
         f"missing_account_roles = {summary['missing_account_roles']}",
@@ -485,6 +515,14 @@ def main() -> None:
         for row in skips
         if row.get("probe_id") is not None
     }
+    selection_probe_ids = {str(row.get("probe_id")) for row in selections if row.get("probe_id")}
+    pre_scan_precheck_skips = [
+        row
+        for row in skips
+        if row.get("probe_id") is not None
+        and str(row.get("probe_id")) not in selection_probe_ids
+        and row.get("probe_skip_reason") == "probe_execution_precheck_failed"
+    ]
 
     log_paths = []
     for key in ("file_path", "oracle_log_path"):
@@ -493,9 +531,10 @@ def main() -> None:
             base = resolve_runtime_path(config_path, raw)
             log_paths.extend(sorted(base.parent.glob(base.name + "*")))
 
+    audited_rows = selections + pre_scan_precheck_skips
     diagnostics = [
         selected_probe_report(selection, skip_by_probe_id, decisions, log_paths)
-        for selection in selections
+        for selection in audited_rows
     ]
     classifications = Counter(row["missing_account_classification"] for row in diagnostics)
     roles = Counter(row.get("missing_account_role") or "none" for row in diagnostics)
@@ -515,6 +554,8 @@ def main() -> None:
         "summary": {
             "status": "PASS",
             "selected_probe_rows": len(selections),
+            "pre_scan_precheck_skip_rows": len(pre_scan_precheck_skips),
+            "audited_probe_rows": len(audited_rows),
             "diagnosed_selected_probe_rows": diagnosed_rows,
             "exact_decision_v3_join_rows": exact_join_rows,
             "missing_account_roles": dict(roles),

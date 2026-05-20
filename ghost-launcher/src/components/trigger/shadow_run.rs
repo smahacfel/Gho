@@ -283,6 +283,8 @@ pub struct ShadowBuySimulationRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry_token_amount_raw: Option<u64>,
     pub payer_provenance: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payer_pubkey: Option<String>,
     pub err: Option<String>,
     pub error_class: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -385,6 +387,7 @@ impl ShadowBuySimulationRecord {
             tip_lamports: event.tip_lamports,
             entry_token_amount_raw: event.entry_token_amount_raw,
             payer_provenance: event.payer_provenance.clone(),
+            payer_pubkey: Some(event.payer_pubkey.clone()),
             err: event.err.clone(),
             error_class: event.error_class.clone().or(diagnostics.error_class),
             error_code: event.error_code.clone().or(diagnostics.error_code),
@@ -432,6 +435,7 @@ impl ShadowBuySimulationRecord {
             tip_lamports: request.tip_lamports,
             entry_token_amount_raw: request.entry_token_amount_raw,
             payer_provenance: request.payer_provenance.to_string(),
+            payer_pubkey: Some(request.payer_pubkey.to_string()),
             err: Some(err_string.clone()),
             error_class: diagnostics.error_class,
             error_code: diagnostics.error_code,
@@ -476,6 +480,7 @@ impl ShadowBuySimulationRecord {
             tip_lamports: context.tip_lamports,
             entry_token_amount_raw: None,
             payer_provenance: context.payer_provenance.to_string(),
+            payer_pubkey: context.payer_pubkey.clone(),
             err: Some(err_string.clone()),
             error_class: diagnostics.error_class,
             error_code: diagnostics.error_code,
@@ -1682,6 +1687,7 @@ mod tests {
         assert_eq!(record.retry_count, 4);
         assert_eq!(record.error_class.as_deref(), Some("data_problem"));
         assert_eq!(record.payer_provenance, "configured");
+        assert_eq!(record.payer_pubkey.as_deref(), Some("payer-configured"));
     }
 
     #[test]
@@ -1711,6 +1717,7 @@ mod tests {
         assert_eq!(record.decision_ts_ms, 10);
         assert_eq!(record.error_class.as_deref(), Some("unclassified"));
         assert_eq!(record.payer_provenance, "ephemeral");
+        assert_eq!(record.payer_pubkey.as_deref(), Some("payer-ephemeral"));
     }
 
     #[test]

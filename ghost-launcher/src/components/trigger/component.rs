@@ -2520,6 +2520,21 @@ impl TriggerComponent {
         }
     }
 
+    fn sanitize_buy_variant_override_for_prepared_request(
+        buy_variant: Option<trigger::PumpfunBuyVariant>,
+        has_legacy_buy_curve: bool,
+    ) -> Option<trigger::PumpfunBuyVariant> {
+        match buy_variant {
+            Some(trigger::PumpfunBuyVariant::RoutedExactSolIn) => {
+                Some(trigger::PumpfunBuyVariant::RoutedExactSolIn)
+            }
+            Some(trigger::PumpfunBuyVariant::LegacyBuy) if has_legacy_buy_curve => {
+                Some(trigger::PumpfunBuyVariant::LegacyBuy)
+            }
+            _ => None,
+        }
+    }
+
     fn sanitize_associated_bonding_curve_override(
         mint: &Pubkey,
         token_program: &Pubkey,
@@ -2641,10 +2656,12 @@ impl TriggerComponent {
         ata_missing_pre_submit: bool,
         pre_submit_token_balance: Option<u64>,
     ) -> Result<BuyBuildProfile> {
-        Self::validate_creator_pubkey_for_buy(mint, account_overrides.creator_pubkey)?;
         let buy_variant = account_overrides
             .buy_variant
             .unwrap_or(trigger::PumpfunBuyVariant::RoutedExactSolIn);
+        if matches!(buy_variant, trigger::PumpfunBuyVariant::RoutedExactSolIn) {
+            Self::validate_creator_pubkey_for_buy(mint, account_overrides.creator_pubkey)?;
+        }
         let token_param_role = match buy_variant {
             trigger::PumpfunBuyVariant::LegacyBuy => "token_amount",
             trigger::PumpfunBuyVariant::RoutedExactSolIn => "min_tokens_out",
@@ -3748,8 +3765,10 @@ impl TriggerComponent {
         sanitized_overrides.fee_recipient =
             Self::sanitize_fee_recipient_override(sanitized_overrides.fee_recipient);
         let original_buy_variant = sanitized_overrides.buy_variant;
-        sanitized_overrides.buy_variant =
-            Self::sanitize_buy_variant_override(sanitized_overrides.buy_variant);
+        sanitized_overrides.buy_variant = Self::sanitize_buy_variant_override_for_prepared_request(
+            sanitized_overrides.buy_variant,
+            sanitized_overrides.legacy_buy_curve.is_some(),
+        );
         let speculative_ata_probe =
             sanitized_overrides
                 .token_program
@@ -4356,8 +4375,23 @@ impl TriggerComponent {
             && request
                 .build_profile
                 .as_ref()
-                .map(|profile| profile.buy_variant == trigger::PumpfunBuyVariant::RoutedExactSolIn)
+                .map(|profile| {
+                    profile
+                        .buy_instruction
+                        .accounts
+                        .get(13)
+                        .map(|account| account.pubkey == *pubkey)
+                        .unwrap_or(false)
+                })
                 .unwrap_or(false)
+    }
+
+    fn counterfactual_probe_can_use_missing_bonding_curve_v2(
+        request: &PreparedBuyRequest,
+        pubkey: &Pubkey,
+        role: &str,
+    ) -> bool {
+        role == "bonding_curve_v2"
             && request
                 .build_profile
                 .as_ref()
@@ -4365,7 +4399,7 @@ impl TriggerComponent {
                     profile
                         .buy_instruction
                         .accounts
-                        .get(13)
+                        .get(16)
                         .map(|account| account.pubkey == *pubkey)
                         .unwrap_or(false)
                 })
@@ -4401,7 +4435,10 @@ impl TriggerComponent {
             15 => "fee_program",
             16 => "bonding_curve_v2",
             17 => "buyback_fee_recipient",
-            _ => "buy_instruction_account",
+            _ => match profile.buy_variant {
+                trigger::PumpfunBuyVariant::LegacyBuy => "legacy_buy_instruction_account",
+                trigger::PumpfunBuyVariant::RoutedExactSolIn => "routed_buy_instruction_account",
+            },
         })
     }
 
@@ -4500,6 +4537,10 @@ impl TriggerComponent {
             ) {
                 return;
             }
+            if Self::counterfactual_probe_can_use_missing_bonding_curve_v2(request, &pubkey, &role)
+            {
+                return;
+            }
             if seen.insert(pubkey) {
                 accounts.push((pubkey, role));
             }
@@ -4514,9 +4555,6 @@ impl TriggerComponent {
         }
         if let Some(value) = request.account_overrides.fee_recipient {
             push_account(value, "fee_recipient".to_string());
-        }
-        if let Some(value) = request.account_overrides.creator_pubkey {
-            push_account(value, "creator_pubkey".to_string());
         }
         if let Some(value) = request.account_overrides.associated_bonding_curve {
             push_account(value, "associated_bonding_curve".to_string());
@@ -6436,6 +6474,24 @@ mod tests {
             TriggerComponent::sanitize_buy_variant_override(Some(
                 trigger::PumpfunBuyVariant::LegacyBuy,
             )),
+            None
+        );
+    }
+
+    #[test]
+    fn test_prepared_request_buy_variant_sanitizer_keeps_legacy_with_curve_proof() {
+        assert_eq!(
+            TriggerComponent::sanitize_buy_variant_override_for_prepared_request(
+                Some(trigger::PumpfunBuyVariant::LegacyBuy),
+                true,
+            ),
+            Some(trigger::PumpfunBuyVariant::LegacyBuy)
+        );
+        assert_eq!(
+            TriggerComponent::sanitize_buy_variant_override_for_prepared_request(
+                Some(trigger::PumpfunBuyVariant::LegacyBuy),
+                false,
+            ),
             None
         );
     }
@@ -8409,6 +8465,81 @@ mod tests {
         assert!(roles
             .iter()
             .any(|(pubkey, role)| *pubkey == request.user_ata && role == "user_ata"));
+    }
+
+    #[test]
+    fn p37_counterfactual_probe_required_accounts_use_legacy_extended_layout() {
+        let config = create_test_config();
+        let trigger =
+            TriggerComponent::new_with_shadow_simulator(config, Arc::new(MockShadowSimulator));
+        let payer = Keypair::new();
+        let mint = Pubkey::new_unique();
+        let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).expect("valid token program");
+        let amount_lamports = trigger
+            .configured_trade_amount_lamports()
+            .expect("configured amount");
+        let curve = BondingCurve {
+            discriminator: 0,
+            virtual_token_reserves: 1_000_000_000_000,
+            virtual_sol_reserves: 30_000_000_000,
+            real_token_reserves: 1_000_000_000_000,
+            real_sol_reserves: 30_000_000_000,
+            token_total_supply: 0,
+            complete: 0,
+            _padding: [0; 7],
+        };
+        let request = trigger
+            .build_prepared_buy_request(
+                &payer,
+                &mint,
+                &token_program,
+                false,
+                &BuyAccountOverrides {
+                    buy_variant: Some(trigger::PumpfunBuyVariant::LegacyBuy),
+                    legacy_buy_curve: Some(curve),
+                    associated_bonding_curve: Some(
+                        DirectBuyBuilder::canonical_associated_bonding_curve(&mint, &token_program),
+                    ),
+                    ..BuyAccountOverrides::default()
+                },
+                amount_lamports,
+                1_000_000,
+                Hash::new_unique(),
+            )
+            .expect("legacy probe request");
+        let buy_accounts = &request
+            .build_profile
+            .as_ref()
+            .expect("build profile")
+            .buy_instruction
+            .accounts;
+
+        assert_eq!(buy_accounts.len(), 18);
+        assert_eq!(
+            TriggerComponent::counterfactual_probe_account_role_for(
+                &request,
+                &buy_accounts[9].pubkey,
+            ),
+            "creator_vault"
+        );
+        assert_eq!(
+            TriggerComponent::counterfactual_probe_account_role_for(
+                &request,
+                &buy_accounts[16].pubkey,
+            ),
+            "bonding_curve_v2"
+        );
+
+        let roles = TriggerComponent::counterfactual_probe_required_account_roles(&request);
+
+        assert!(roles.iter().any(|(_, role)| role == "bonding_curve"));
+        assert!(roles.iter().any(|(_, role)| role == "creator_vault"));
+        assert!(!roles.iter().any(|(_, role)| role == "bonding_curve_v2"));
+        assert!(roles
+            .iter()
+            .any(|(_, role)| role == "global_volume_accumulator"));
+        assert!(roles.iter().any(|(_, role)| role == "fee_config"));
+        assert!(!roles.iter().any(|(_, role)| role == "creator_pubkey"));
     }
 
     #[test]

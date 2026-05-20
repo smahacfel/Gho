@@ -4696,22 +4696,15 @@ impl P37ShadowProbeRuntimeState {
         }
     }
 
-    fn try_reserve_scan(
+    fn try_reserve_scan_slot(
         &self,
         config: &P37ShadowProbeConfig,
         record: &P37ShadowProbeSelectionRecord,
-    ) -> Result<OwnedSemaphorePermit, String> {
-        let permit = self
-            .scan_semaphore
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| "probe_scan_concurrency_limit_exceeded".to_string())?;
-
+    ) -> Result<(), String> {
         if config.dedupe_by_probe_id {
             if let Some(probe_id) = record.probe_id.as_deref() {
                 let mut seen = self.seen_probe_ids.lock();
                 if !seen.insert(probe_id.to_string()) {
-                    drop(permit);
                     return Err("duplicate_probe_id".to_string());
                 }
             }
@@ -4725,11 +4718,18 @@ impl P37ShadowProbeRuntimeState {
                 })
                 .is_err()
         {
-            drop(permit);
             return Err("max_probe_candidates_scanned_per_run_exceeded".to_string());
         }
 
-        Ok(permit)
+        Ok(())
+    }
+
+    async fn acquire_scan_permit(&self) -> Result<OwnedSemaphorePermit, String> {
+        self.scan_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| "probe_scan_semaphore_closed".to_string())
     }
 
     fn try_reserve_dispatch(
@@ -4885,6 +4885,8 @@ struct P37ShadowProbeSelectionRecord {
     probe_slippage_bps: u64,
     probe_quote_age_max_ms: u64,
     probe_curve_age_max_ms: u64,
+    probe_execution_account_wait_ms: Option<u64>,
+    probe_execution_account_wait_result: Option<String>,
     precheck_failure_reason: Option<String>,
     execution_account_readiness_status: Option<String>,
     execution_account_readiness_role: Option<String>,
@@ -4921,6 +4923,8 @@ struct P37ShadowProbeTransportRecord {
     probe_slippage_bps: u64,
     probe_quote_age_max_ms: u64,
     probe_curve_age_max_ms: u64,
+    probe_execution_account_wait_ms: Option<u64>,
+    probe_execution_account_wait_result: Option<String>,
     quote_age_ms: Option<u64>,
     curve_age_ms: Option<u64>,
     probe_age_status: Option<String>,
@@ -5250,6 +5254,8 @@ fn p37_shadow_probe_selection_record(
         probe_slippage_bps: config.probe_slippage_bps,
         probe_quote_age_max_ms: config.probe_quote_age_max_ms,
         probe_curve_age_max_ms: config.probe_curve_age_max_ms,
+        probe_execution_account_wait_ms: None,
+        probe_execution_account_wait_result: None,
         precheck_failure_reason: None,
         execution_account_readiness_status: selected
             .then(|| "pending_runtime_precheck".to_string()),
@@ -5337,6 +5343,8 @@ fn p37_shadow_probe_artifact_records(
         probe_slippage_bps: record.probe_slippage_bps,
         probe_quote_age_max_ms: record.probe_quote_age_max_ms,
         probe_curve_age_max_ms: record.probe_curve_age_max_ms,
+        probe_execution_account_wait_ms: record.probe_execution_account_wait_ms,
+        probe_execution_account_wait_result: record.probe_execution_account_wait_result.clone(),
         quote_age_ms: None,
         curve_age_ms: None,
         probe_age_status: Some("harness_no_simulation_age_unavailable".to_string()),
@@ -5546,6 +5554,41 @@ fn p37_shadow_probe_parse_execution_account_not_ready(reason: &str) -> Option<(S
     Some((role.to_string(), pubkey.to_string()))
 }
 
+async fn p37_shadow_probe_wait_for_required_account_readiness(
+    trigger_component: &crate::components::trigger::TriggerComponent,
+    request: &crate::components::trigger::PreparedBuyRequest,
+    max_wait_ms: u64,
+) -> anyhow::Result<(Option<(Pubkey, String)>, u64, String)> {
+    let started_at = Instant::now();
+    let mut missing = trigger_component
+        .counterfactual_probe_missing_required_account(request)
+        .await?
+        .map(|missing| (missing.pubkey, missing.role));
+    if missing.is_none() {
+        return Ok((None, 0, "ready_without_wait".to_string()));
+    }
+    if max_wait_ms == 0 {
+        return Ok((missing, 0, "wait_disabled".to_string()));
+    }
+
+    loop {
+        let elapsed_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        if elapsed_ms >= max_wait_ms {
+            return Ok((missing, elapsed_ms, "wait_timeout".to_string()));
+        }
+        let remaining_ms = max_wait_ms.saturating_sub(elapsed_ms);
+        tokio::time::sleep(Duration::from_millis(remaining_ms.min(100))).await;
+        missing = trigger_component
+            .counterfactual_probe_missing_required_account(request)
+            .await?
+            .map(|missing| (missing.pubkey, missing.role));
+        if missing.is_none() {
+            let waited_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+            return Ok((None, waited_ms, "ready_after_wait".to_string()));
+        }
+    }
+}
+
 async fn append_p37_shadow_probe_record(
     config: &P37ShadowProbeConfig,
     record: &P37ShadowProbeSelectionRecord,
@@ -5593,6 +5636,65 @@ fn p37_shadow_probe_account_overrides_present(
         || overrides.legacy_buy_curve.is_some()
 }
 
+fn p37_shadow_probe_derive_legacy_buy_account_overrides(
+    buffered_txs: &[crate::components::gatekeeper::GatekeeperBufferedTx],
+) -> Option<crate::components::trigger::BuyAccountOverrides> {
+    let canonical_global_config = trigger::DirectBuyBuilder::canonical_global_config();
+    for buffered in buffered_txs.iter().rev() {
+        let tx = buffered.tx.as_ref();
+        if !tx.success || !tx.is_buy || tx.buy_variant.as_deref() != Some("legacy_buy") {
+            continue;
+        }
+
+        let associated_bonding_curve = tx
+            .associated_bonding_curve
+            .as_deref()
+            .and_then(|value| Pubkey::try_from(value).ok())?;
+
+        return Some(crate::components::trigger::BuyAccountOverrides {
+            global_config: tx
+                .global_config
+                .as_deref()
+                .and_then(|value| Pubkey::try_from(value).ok())
+                .filter(|value| *value == canonical_global_config),
+            fee_recipient: tx
+                .fee_recipient
+                .as_deref()
+                .and_then(|value| Pubkey::try_from(value).ok())
+                .filter(trigger::DirectBuyBuilder::is_authorized_fee_recipient),
+            token_program: tx
+                .token_program
+                .as_deref()
+                .and_then(|value| Pubkey::try_from(value).ok()),
+            buy_variant: Some(trigger::PumpfunBuyVariant::LegacyBuy),
+            associated_bonding_curve: Some(associated_bonding_curve),
+            ..Default::default()
+        });
+    }
+    None
+}
+
+fn p37_shadow_probe_derive_account_overrides_for_pool(
+    oracle_runtime: &OracleRuntime,
+    pool_data: &DetectedPool,
+    buffered_txs: &[crate::components::gatekeeper::GatekeeperBufferedTx],
+    buy_mint: Pubkey,
+) -> crate::components::trigger::BuyAccountOverrides {
+    let mut account_overrides = p37_shadow_probe_derive_legacy_buy_account_overrides(buffered_txs)
+        .unwrap_or_else(|| derive_buy_account_overrides(buffered_txs));
+    if account_overrides.creator_pubkey.is_none() {
+        account_overrides.creator_pubkey = Pubkey::try_from(pool_data.creator.as_str()).ok();
+    }
+    if matches!(
+        account_overrides.buy_variant,
+        Some(trigger::PumpfunBuyVariant::LegacyBuy)
+    ) {
+        account_overrides.legacy_buy_curve =
+            oracle_runtime.resolve_trigger_buy_curve(buy_mint, buffered_txs);
+    }
+    account_overrides
+}
+
 fn p37_shadow_probe_execution_precheck(
     record: &P37ShadowProbeSelectionRecord,
     account_overrides: &crate::components::trigger::BuyAccountOverrides,
@@ -5615,6 +5717,23 @@ fn p37_shadow_probe_execution_precheck(
     ) && account_overrides.legacy_buy_curve.is_none()
     {
         return Some("missing_bonding_curve".to_string());
+    }
+    if account_overrides.buy_variant.is_none() {
+        return Some("missing_execution_route_identity".to_string());
+    }
+    if matches!(
+        account_overrides.buy_variant,
+        Some(trigger::PumpfunBuyVariant::RoutedExactSolIn)
+    ) && account_overrides.associated_bonding_curve.is_none()
+    {
+        return Some("missing_routed_associated_bonding_curve".to_string());
+    }
+    if matches!(
+        account_overrides.buy_variant,
+        Some(trigger::PumpfunBuyVariant::RoutedExactSolIn)
+    ) && account_overrides.creator_pubkey.is_none()
+    {
+        return Some("missing_creator_pubkey".to_string());
     }
     None
 }
@@ -5793,6 +5912,8 @@ fn p37_shadow_probe_transport_from_event(
         probe_slippage_bps: record.probe_slippage_bps,
         probe_quote_age_max_ms: record.probe_quote_age_max_ms,
         probe_curve_age_max_ms: record.probe_curve_age_max_ms,
+        probe_execution_account_wait_ms: record.probe_execution_account_wait_ms,
+        probe_execution_account_wait_result: record.probe_execution_account_wait_result.clone(),
         quote_age_ms: None,
         curve_age_ms: None,
         probe_age_status: Some("age_not_available_from_shadow_sim_report".to_string()),
@@ -5888,6 +6009,8 @@ fn p37_shadow_probe_transport_from_error(
         probe_slippage_bps: record.probe_slippage_bps,
         probe_quote_age_max_ms: record.probe_quote_age_max_ms,
         probe_curve_age_max_ms: record.probe_curve_age_max_ms,
+        probe_execution_account_wait_ms: record.probe_execution_account_wait_ms,
+        probe_execution_account_wait_result: record.probe_execution_account_wait_result.clone(),
         quote_age_ms: None,
         curve_age_ms: None,
         probe_age_status: Some("age_not_available_simulation_failed".to_string()),
@@ -5973,20 +6096,29 @@ async fn run_p37_shadow_probe_dispatch(
     pool_data: Arc<DetectedPool>,
     buffered_txs: Vec<crate::components::gatekeeper::GatekeeperBufferedTx>,
     buy_mint: Pubkey,
-    _scan_permit: OwnedSemaphorePermit,
 ) {
+    let _scan_permit = match runtime_state.acquire_scan_permit().await {
+        Ok(permit) => permit,
+        Err(reason) => {
+            let skip_record = p37_shadow_probe_as_skip(record.clone(), reason);
+            if let Err(err) = append_p37_shadow_probe_record(&config, &skip_record).await {
+                warn!(
+                    probe_id = ?skip_record.probe_id,
+                    source_ab_record_id = ?skip_record.source_ab_record_id,
+                    error = %err,
+                    "P37_SHADOW_PROBE_SCAN_PERMIT_SKIP_WRITE_FAILED"
+                );
+            }
+            return;
+        }
+    };
     let decision_ts_ms = record.decision_ts_ms.unwrap_or_else(current_time_ms);
-    let mut account_overrides = derive_buy_account_overrides(&buffered_txs);
-    if account_overrides.creator_pubkey.is_none() {
-        account_overrides.creator_pubkey = Pubkey::try_from(pool_data.creator.as_str()).ok();
-    }
-    if matches!(
-        account_overrides.buy_variant,
-        Some(trigger::PumpfunBuyVariant::LegacyBuy)
-    ) {
-        account_overrides.legacy_buy_curve =
-            oracle_runtime.resolve_trigger_buy_curve(buy_mint, &buffered_txs);
-    }
+    let account_overrides = p37_shadow_probe_derive_account_overrides_for_pool(
+        &oracle_runtime,
+        pool_data.as_ref(),
+        &buffered_txs,
+        buy_mint,
+    );
     if let Some(reason) =
         p37_shadow_probe_execution_precheck(&record, &account_overrides, &buy_mint, &pool_data)
     {
@@ -6036,17 +6168,22 @@ async fn run_p37_shadow_probe_dispatch(
         }
     };
 
-    match trigger_component
-        .counterfactual_probe_missing_required_account(&request)
-        .await
+    match p37_shadow_probe_wait_for_required_account_readiness(
+        &trigger_component,
+        &request,
+        config.probe_wait_for_execution_accounts_ms,
+    )
+    .await
     {
-        Ok(Some(missing)) => {
-            let reason = if p37_shadow_probe_is_strict_execution_account_role(&missing.role) {
-                p37_shadow_probe_execution_account_not_ready_reason(&missing.role, &missing.pubkey)
+        Ok((Some((missing_pubkey, missing_role)), wait_ms, wait_result)) => {
+            record.probe_execution_account_wait_ms = Some(wait_ms);
+            record.probe_execution_account_wait_result = Some(wait_result);
+            let reason = if p37_shadow_probe_is_strict_execution_account_role(&missing_role) {
+                p37_shadow_probe_execution_account_not_ready_reason(&missing_role, &missing_pubkey)
             } else {
                 format!(
                     "missing_required_account:{}:{}",
-                    missing.role, missing.pubkey
+                    missing_role, missing_pubkey
                 )
             };
             let skip_record = p37_shadow_probe_as_precheck_skip(record.clone(), reason);
@@ -6054,15 +6191,18 @@ async fn run_p37_shadow_probe_dispatch(
                 warn!(
                     probe_id = ?skip_record.probe_id,
                     source_ab_record_id = ?skip_record.source_ab_record_id,
-                    missing_account_pubkey = %missing.pubkey,
-                    missing_account_role = %missing.role,
+                    missing_account_pubkey = %missing_pubkey,
+                    missing_account_role = %missing_role,
                     error = %err,
                     "P37_SHADOW_PROBE_REQUIRED_ACCOUNT_SKIP_WRITE_FAILED"
                 );
             }
             return;
         }
-        Ok(None) => {}
+        Ok((None, wait_ms, wait_result)) => {
+            record.probe_execution_account_wait_ms = Some(wait_ms);
+            record.probe_execution_account_wait_result = Some(wait_result);
+        }
         Err(err) => {
             warn!(
                 probe_id = ?record.probe_id,
@@ -6189,35 +6329,49 @@ async fn maybe_handle_p37_shadow_probe_decision(
             record = p37_shadow_probe_as_skip(record, "probe_pool_metadata_unavailable");
         } else if base_mint_pubkey.is_none() {
             record = p37_shadow_probe_as_skip(record, "invalid_mint_identity");
-        } else if let Err(reason) = ctx
-            .p37_shadow_probe_state
-            .try_reserve_scan(config, &record)
-            .map(|permit| {
-                let trigger_component = ctx.trigger.as_ref().map(Arc::clone);
-                let pool_data = pool_data.clone();
-                let buffered_txs = buffered_txs.to_vec();
-                let buy_mint = base_mint_pubkey;
-                let config = config.clone();
-                let oracle_runtime = Arc::clone(&ctx.oracle_runtime);
-                let runtime_state = Arc::clone(&ctx.p37_shadow_probe_state);
-                if let (Some(trigger_component), Some(pool_data), Some(buy_mint)) =
-                    (trigger_component, pool_data, buy_mint)
-                {
-                    tokio::spawn(run_p37_shadow_probe_dispatch(
-                        config,
-                        trigger_component,
-                        oracle_runtime,
-                        runtime_state,
-                        record.clone(),
-                        pool_data,
-                        buffered_txs,
-                        buy_mint,
-                        permit,
-                    ));
-                }
-            })
-        {
-            record = p37_shadow_probe_as_skip(record, reason);
+        } else if let (Some(pool_data), Some(buy_mint)) = (pool_data.as_ref(), base_mint_pubkey) {
+            let account_overrides = p37_shadow_probe_derive_account_overrides_for_pool(
+                ctx.oracle_runtime.as_ref(),
+                pool_data.as_ref(),
+                buffered_txs,
+                buy_mint,
+            );
+            if let Some(reason) = p37_shadow_probe_execution_precheck(
+                &record,
+                &account_overrides,
+                &buy_mint,
+                pool_data,
+            ) {
+                record = p37_shadow_probe_as_precheck_skip(record, reason);
+            } else if let Err(reason) = ctx
+                .p37_shadow_probe_state
+                .try_reserve_scan_slot(config, &record)
+                .map(|()| {
+                    let trigger_component = ctx.trigger.as_ref().map(Arc::clone);
+                    let pool_data = Some(Arc::clone(pool_data));
+                    let buffered_txs = buffered_txs.to_vec();
+                    let buy_mint = Some(buy_mint);
+                    let config = config.clone();
+                    let oracle_runtime = Arc::clone(&ctx.oracle_runtime);
+                    let runtime_state = Arc::clone(&ctx.p37_shadow_probe_state);
+                    if let (Some(trigger_component), Some(pool_data), Some(buy_mint)) =
+                        (trigger_component, pool_data, buy_mint)
+                    {
+                        tokio::spawn(run_p37_shadow_probe_dispatch(
+                            config,
+                            trigger_component,
+                            oracle_runtime,
+                            runtime_state,
+                            record.clone(),
+                            pool_data,
+                            buffered_txs,
+                            buy_mint,
+                        ));
+                    }
+                })
+            {
+                record = p37_shadow_probe_as_skip(record, reason);
+            }
         }
     }
 
@@ -12198,6 +12352,116 @@ mod tests {
         assert!(skipped.execution_account_readiness_pubkey.is_none());
     }
 
+    fn p37_shadow_probe_precheck_record_and_pool() -> (
+        P37ShadowProbeSelectionRecord,
+        crate::events::DetectedPool,
+        Pubkey,
+    ) {
+        let buy_mint = Pubkey::new_unique();
+        let pool_id = Pubkey::new_unique();
+        let mut candidate = p37_shadow_probe_test_candidate();
+        candidate.base_mint = Some(buy_mint.to_string());
+        candidate.pool_id = pool_id.to_string();
+        candidate.candidate_id = Some(format!("{}:{}:{}", pool_id, buy_mint, 2_000));
+        let config = P37ShadowProbeConfig {
+            enabled: true,
+            sample_threshold: 100,
+            ..Default::default()
+        };
+        let record = p37_shadow_probe_selection_record(&config, &candidate, 3_000);
+        let pool = crate::events::DetectedPool {
+            semantic: Default::default(),
+            pool_amm_id: pool_id.to_string(),
+            base_mint: buy_mint.to_string(),
+            quote_mint: Pubkey::new_unique().to_string(),
+            amm_program: "pumpfun".to_string(),
+            bonding_curve: Pubkey::new_unique().to_string(),
+            creator: Pubkey::new_unique().to_string(),
+            slot: Some(1),
+            timestamp_ms: 1_000,
+            event_time: ghost_core::EventTimeMetadata::default(),
+            detected_wall_ts_ms: Some(1_001),
+            initial_liquidity_sol: Some(1.0),
+            signature: Signature::new_unique().to_string(),
+        };
+        (record, pool, buy_mint)
+    }
+
+    #[test]
+    fn p37_shadow_probe_execution_precheck_requires_route_identity() {
+        let (record, pool, buy_mint) = p37_shadow_probe_precheck_record_and_pool();
+        let overrides = crate::components::trigger::BuyAccountOverrides::default();
+
+        assert_eq!(
+            p37_shadow_probe_execution_precheck(&record, &overrides, &buy_mint, &pool).as_deref(),
+            Some("missing_execution_route_identity")
+        );
+    }
+
+    #[test]
+    fn p37_shadow_probe_execution_precheck_requires_routed_account_identity() {
+        let (record, pool, buy_mint) = p37_shadow_probe_precheck_record_and_pool();
+        let overrides = crate::components::trigger::BuyAccountOverrides {
+            buy_variant: Some(trigger::PumpfunBuyVariant::RoutedExactSolIn),
+            creator_pubkey: Some(Pubkey::new_unique()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            p37_shadow_probe_execution_precheck(&record, &overrides, &buy_mint, &pool).as_deref(),
+            Some("missing_routed_associated_bonding_curve")
+        );
+    }
+
+    #[test]
+    fn p37_shadow_probe_execution_precheck_accepts_complete_routed_identity() {
+        let (record, pool, buy_mint) = p37_shadow_probe_precheck_record_and_pool();
+        let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).expect("valid token program");
+        let associated_bonding_curve =
+            trigger::DirectBuyBuilder::canonical_associated_bonding_curve(
+                &buy_mint,
+                &token_program,
+            );
+        let overrides = crate::components::trigger::BuyAccountOverrides {
+            buy_variant: Some(trigger::PumpfunBuyVariant::RoutedExactSolIn),
+            token_program: Some(token_program),
+            creator_pubkey: Some(Pubkey::new_unique()),
+            associated_bonding_curve: Some(associated_bonding_curve),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            p37_shadow_probe_execution_precheck(&record, &overrides, &buy_mint, &pool),
+            None
+        );
+    }
+
+    #[test]
+    fn p37_shadow_probe_execution_precheck_accepts_legacy_without_creator_pubkey() {
+        let (record, pool, buy_mint) = p37_shadow_probe_precheck_record_and_pool();
+        let curve = BondingCurve {
+            discriminator: 0,
+            virtual_token_reserves: 1_000_000_000_000,
+            virtual_sol_reserves: 30_000_000_000,
+            real_token_reserves: 1_000_000_000_000,
+            real_sol_reserves: 30_000_000_000,
+            token_total_supply: 0,
+            complete: 0,
+            _padding: [0; 7],
+        };
+        let overrides = crate::components::trigger::BuyAccountOverrides {
+            buy_variant: Some(trigger::PumpfunBuyVariant::LegacyBuy),
+            legacy_buy_curve: Some(curve),
+            creator_pubkey: None,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            p37_shadow_probe_execution_precheck(&record, &overrides, &buy_mint, &pool),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn p37_shadow_probe_selection_record_appends_jsonl() {
         let temp = tempdir().expect("tempdir");
@@ -12490,11 +12754,10 @@ mod tests {
         let state =
             P37ShadowProbeRuntimeState::new(config.max_scan_concurrent, config.max_concurrent);
 
-        let first = state
-            .try_reserve_scan(&config, &record)
-            .expect("first selected probe should reserve scan");
-        drop(first);
-        let second = state.try_reserve_scan(&config, &record);
+        state
+            .try_reserve_scan_slot(&config, &record)
+            .expect("first selected probe should reserve scan slot");
+        let second = state.try_reserve_scan_slot(&config, &record);
 
         assert_eq!(second.err().as_deref(), Some("duplicate_probe_id"));
     }
@@ -12516,10 +12779,9 @@ mod tests {
             P37ShadowProbeRuntimeState::new(config.max_scan_concurrent, config.max_concurrent);
 
         for _ in 0..3 {
-            let scan = state
-                .try_reserve_scan(&config, &record)
+            state
+                .try_reserve_scan_slot(&config, &record)
                 .expect("not-ready candidate scan should reserve without dispatch quota");
-            drop(scan);
         }
 
         let ready_dispatch = state
@@ -12534,8 +12796,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn p37_shadow_probe_runtime_state_enforces_scan_concurrency_limit() {
+    #[tokio::test]
+    async fn p37_shadow_probe_scan_concurrency_waits_in_background_instead_of_skipping() {
         let config = P37ShadowProbeConfig {
             enabled: true,
             sample_threshold: 100,
@@ -12546,24 +12808,35 @@ mod tests {
             dedupe_by_probe_id: false,
             ..Default::default()
         };
-        let candidate = p37_shadow_probe_test_candidate();
-        let record = p37_shadow_probe_selection_record(&config, &candidate, 3_000);
-        let state =
-            P37ShadowProbeRuntimeState::new(config.max_scan_concurrent, config.max_concurrent);
+        let state = Arc::new(P37ShadowProbeRuntimeState::new(
+            config.max_scan_concurrent,
+            config.max_concurrent,
+        ));
 
-        let _first = state
-            .try_reserve_scan(&config, &record)
-            .expect("first selected probe should reserve scan");
-        let second = state.try_reserve_scan(&config, &record);
+        let first = state
+            .acquire_scan_permit()
+            .await
+            .expect("first scan should acquire immediately");
+        let waiting_state = Arc::clone(&state);
+        let waiting_scan = tokio::spawn(async move { waiting_state.acquire_scan_permit().await });
+        tokio::task::yield_now().await;
 
-        assert_eq!(
-            second.err().as_deref(),
-            Some("probe_scan_concurrency_limit_exceeded")
+        assert!(
+            !waiting_scan.is_finished(),
+            "second scan should wait instead of being skipped by concurrency"
         );
+
+        drop(first);
+        let second = tokio::time::timeout(std::time::Duration::from_secs(1), waiting_scan)
+            .await
+            .expect("waiting scan should acquire after first permit drops")
+            .expect("join should succeed")
+            .expect("scan semaphore should not be closed");
+        drop(second);
     }
 
-    #[test]
-    fn p37_shadow_probe_scan_concurrency_is_independent_from_dispatch_concurrency() {
+    #[tokio::test]
+    async fn p37_shadow_probe_scan_concurrency_is_independent_from_dispatch_concurrency() {
         let config = P37ShadowProbeConfig {
             enabled: true,
             sample_threshold: 100,
@@ -12574,18 +12847,19 @@ mod tests {
             dedupe_by_probe_id: false,
             ..Default::default()
         };
-        let candidate = p37_shadow_probe_test_candidate();
-        let record = p37_shadow_probe_selection_record(&config, &candidate, 3_000);
-        let state =
-            P37ShadowProbeRuntimeState::new(config.max_scan_concurrent, config.max_concurrent);
+        let state = Arc::new(P37ShadowProbeRuntimeState::new(
+            config.max_scan_concurrent,
+            config.max_concurrent,
+        ));
 
-        let _first_scan = state
-            .try_reserve_scan(&config, &record)
-            .expect("first scan should reserve");
+        let first_scan = state
+            .acquire_scan_permit()
+            .await
+            .expect("first scan should acquire");
         let second_scan = state
-            .try_reserve_scan(&config, &record)
+            .acquire_scan_permit()
+            .await
             .expect("second scan should use max_scan_concurrent, not dispatch max_concurrent");
-        drop(second_scan);
 
         let _first_dispatch = state
             .try_reserve_dispatch(&config, 10_000)
@@ -12596,6 +12870,8 @@ mod tests {
             second_dispatch.err().as_deref(),
             Some("probe_concurrency_limit_exceeded")
         );
+        drop(first_scan);
+        drop(second_scan);
     }
 
     #[test]
@@ -12617,13 +12893,12 @@ mod tests {
             P37ShadowProbeRuntimeState::new(config.max_scan_concurrent, config.max_concurrent);
 
         for _ in 0..2 {
-            let scan = state
-                .try_reserve_scan(&config, &record)
+            state
+                .try_reserve_scan_slot(&config, &record)
                 .expect("scan should reserve until scan count limit");
-            drop(scan);
         }
 
-        let third_scan = state.try_reserve_scan(&config, &record);
+        let third_scan = state.try_reserve_scan_slot(&config, &record);
         assert_eq!(
             third_scan.err().as_deref(),
             Some("max_probe_candidates_scanned_per_run_exceeded")
@@ -19318,6 +19593,42 @@ mod tests {
 
         let overrides = derive_buy_account_overrides(&buffered_txs);
         assert!(overrides.buy_variant.is_none());
+    }
+
+    #[test]
+    fn p37_shadow_probe_preserves_legacy_buy_overrides_for_probe_only() {
+        use ghost_brain::oracle::snapshot_engine::PoolMetrics;
+        use ghost_core::shadow_ledger::TxKey;
+        use std::sync::Arc;
+
+        let assoc_curve = Pubkey::new_unique();
+        let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).expect("valid token program");
+        let mut tx = (*test_pool_observation_tx("legacy-probe-route")).clone();
+        tx.buy_variant = Some("legacy_buy".to_string());
+        tx.associated_bonding_curve = Some(assoc_curve.to_string());
+        tx.token_program = Some(token_program.to_string());
+        tx.success = true;
+        tx.is_buy = true;
+        let buffered_txs = vec![crate::components::gatekeeper::GatekeeperBufferedTx {
+            tx: Arc::new(tx),
+            metrics: PoolMetrics::default(),
+            tx_key: TxKey::new(1_000, Some(1), Some(0), None, 0).expect("tx key"),
+        }];
+
+        let active_overrides = derive_buy_account_overrides(&buffered_txs);
+        assert!(
+            active_overrides.buy_variant.is_none(),
+            "active override derivation still drops legacy buy"
+        );
+
+        let probe_overrides = p37_shadow_probe_derive_legacy_buy_account_overrides(&buffered_txs)
+            .expect("probe legacy overrides");
+        assert_eq!(
+            probe_overrides.buy_variant,
+            Some(trigger::PumpfunBuyVariant::LegacyBuy)
+        );
+        assert_eq!(probe_overrides.associated_bonding_curve, Some(assoc_curve));
+        assert_eq!(probe_overrides.token_program, Some(token_program));
     }
 
     #[tokio::test]

@@ -1942,6 +1942,14 @@ pub struct P37ShadowProbeConfig {
     #[serde(default = "default_p37_shadow_probe_curve_age_max_ms")]
     pub probe_curve_age_max_ms: u64,
 
+    /// Optional decision-time-safe wait for required execution accounts.
+    ///
+    /// This wait happens only in the isolated counterfactual probe background
+    /// path, before dispatch quota is consumed. `0` preserves fail-fast
+    /// behavior.
+    #[serde(default)]
+    pub probe_wait_for_execution_accounts_ms: u64,
+
     #[serde(default)]
     pub append: bool,
 
@@ -2000,6 +2008,7 @@ impl Default for P37ShadowProbeConfig {
             probe_slippage_bps: default_p37_shadow_probe_slippage_bps(),
             probe_quote_age_max_ms: default_p37_shadow_probe_quote_age_max_ms(),
             probe_curve_age_max_ms: default_p37_shadow_probe_curve_age_max_ms(),
+            probe_wait_for_execution_accounts_ms: 0,
             append: false,
             require_unique_namespace: true,
             selection_log_path: default_p37_shadow_probe_selection_log_path(),
