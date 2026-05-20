@@ -4788,21 +4788,15 @@ fn p37_shadow_probe_serialized_replay_payload_hash(
     log: &ghost_brain::oracle::GatekeeperBuyLog,
 ) -> Option<String> {
     let materialization_version = log.v3_materialization_version?;
-    let log_value = serde_json::to_value(log).ok()?;
-    let mut canonical_snapshot = log_value.get("v3_materialized_feature_snapshot")?.clone();
-    if let Some(session_metadata) = canonical_snapshot
-        .get_mut("session_metadata")
-        .and_then(serde_json::Value::as_object_mut)
-    {
-        session_metadata.remove("session_id");
-    }
-    let payload = serde_json::json!({
-        "materialization_version": materialization_version,
-        "v3_materialized_feature_snapshot": canonical_snapshot,
-    });
-    serde_json::to_vec(&payload)
-        .ok()
-        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+    let json = serde_json::to_string(log).ok()?;
+    let log_value = serde_json::from_str::<serde_json::Value>(&json).ok()?;
+    let snapshot_payload = log_value.get("v3_materialized_feature_snapshot")?;
+    Some(
+        crate::components::gatekeeper_v3::v3_feature_snapshot_hash_from_payload(
+            snapshot_payload,
+            materialization_version,
+        ),
+    )
 }
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq)]
@@ -5939,6 +5933,41 @@ async fn run_p37_shadow_probe_dispatch(
             return;
         }
     };
+
+    match trigger_component
+        .counterfactual_probe_missing_required_account(&request)
+        .await
+    {
+        Ok(Some(missing)) => {
+            let skip_record = p37_shadow_probe_as_precheck_skip(
+                record.clone(),
+                format!(
+                    "missing_required_account:{}:{}",
+                    missing.role, missing.pubkey
+                ),
+            );
+            if let Err(err) = append_p37_shadow_probe_record(&config, &skip_record).await {
+                warn!(
+                    probe_id = ?skip_record.probe_id,
+                    source_ab_record_id = ?skip_record.source_ab_record_id,
+                    missing_account_pubkey = %missing.pubkey,
+                    missing_account_role = %missing.role,
+                    error = %err,
+                    "P37_SHADOW_PROBE_REQUIRED_ACCOUNT_SKIP_WRITE_FAILED"
+                );
+            }
+            return;
+        }
+        Ok(None) => {}
+        Err(err) => {
+            warn!(
+                probe_id = ?record.probe_id,
+                source_ab_record_id = ?record.source_ab_record_id,
+                error = %err,
+                "P37_SHADOW_PROBE_ACCOUNT_PRECHECK_FAILED_CONTINUING_TO_SIMULATION"
+            );
+        }
+    }
 
     let dispatch_ts_ms = current_time_ms();
     match trigger_component
@@ -11931,6 +11960,18 @@ mod tests {
         enrich_buy_log_with_v3_shadow(&mut log, &assessment, &v3_config, false);
         let serialized_hash =
             p37_shadow_probe_serialized_replay_payload_hash(&log).expect("serialized hash");
+        let post_serialize_hash = {
+            let json = serde_json::to_string(&log).expect("serialize log");
+            let value: serde_json::Value = serde_json::from_str(&json).expect("parse log");
+            crate::components::gatekeeper_v3::v3_feature_snapshot_hash_from_payload(
+                value
+                    .get("v3_materialized_feature_snapshot")
+                    .expect("snapshot payload"),
+                log.v3_materialization_version
+                    .expect("materialization version"),
+            )
+        };
+        assert_eq!(serialized_hash, post_serialize_hash);
         log.v3_feature_snapshot_hash = Some("pre-serialize-hash".to_string());
         log.v3_policy_config_hash = Some("policy-hash".to_string());
 

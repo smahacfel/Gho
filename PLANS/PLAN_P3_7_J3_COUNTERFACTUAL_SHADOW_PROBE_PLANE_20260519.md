@@ -147,6 +147,54 @@ repair only authorizes a bounded R15-r2 smoke. It does not authorize broad
 collection, Phase B, P2, live execution, active policy changes, IWIM changes, or
 threshold tuning.
 
+## J3R2 Counterfactual Probe Simulation and Hash Continuity Repair
+
+J3R2 is a second narrow corrective stage opened after the R15-r2 bounded smoke.
+The R15-r2 smoke confirmed that V3/MFS replay and probe selection/transport
+logging work, but it did not reach minimal runtime PASS:
+
+- `v3_rows=79`, strict replay OK, `bad_rows=0`;
+- `probe_selection_rows=5`;
+- `probe_transport_rows=5`;
+- `probe_entry_rows=0`;
+- all probe simulations ended with `AccountNotFound` / `data_problem`;
+- exact decision/V3 hash continuity was only `1/5`.
+
+J3R2 changes the status model:
+
+```text
+R15-r2 runtime smoke: NOT_READY
+J3R2 code-level repair: target PASS
+R15-r3 runtime smoke: next gate, not claimed complete by J3R2
+Full collection / Phase B / P2 / live: HOLD / NO-GO
+```
+
+J3R2 implementation scope:
+
+- compute probe candidate `v3_feature_snapshot_hash` from the same
+  post-serialize JSON boundary used by persisted decision rows;
+- keep active DecisionLogger hashing unchanged;
+- add a probe-only required-account precheck after `PreparedBuyRequest` is built
+  and before `shadow_simulator.simulate_buy(...)`;
+- inspect the prepared transaction account set plus explicit request identities
+  and classify a known missing account as a `probe_skipped` row with
+  `skip_reason=probe_execution_precheck_failed` and
+  `precheck_failure_reason=missing_required_account:<role>:<pubkey>`;
+- do not treat `AccountNotFound` as success and do not write probe entry rows
+  for failed simulations;
+- preserve idempotent ATA creation semantics by not classifying a missing user
+  ATA as fatal when the prepared transaction creates it;
+- leave probe precheck RPC errors fail-open for active decisions: log the
+  precheck failure and continue to simulation instead of mutating the active
+  verdict path;
+- add targeted tests for post-serialize hash use and required-account role
+  classification.
+
+J3R2 does not run or claim R15-r3. A successful J3R2 code-level repair only
+authorizes a fresh bounded smoke namespace. It does not authorize broad
+collection, Phase B, P2, live execution, active policy changes, IWIM changes, or
+threshold tuning.
+
 ## Goal
 
 Collect a forward-only research dataset where sampled V3/MFS decision rows get

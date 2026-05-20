@@ -65,7 +65,7 @@ use spl_associated_token_account::{
 };
 use spl_token_2022::extension::ExtensionType;
 use spl_token_2022::state::Account as SplTokenAccount;
-use std::collections::HashMap; // ✅ ADDED: Required for caching pools
+use std::collections::{HashMap, HashSet}; // ✅ ADDED: Required for caching pools
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -378,6 +378,12 @@ impl PreparedBuyRequest {
         self.join_metadata = join_metadata;
         self
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CounterfactualProbeMissingAccount {
+    pub pubkey: Pubkey,
+    pub role: String,
 }
 
 pub struct PendingShadowSimulation {
@@ -4323,6 +4329,159 @@ impl TriggerComponent {
             .await
     }
 
+    fn counterfactual_probe_can_create_missing_user_ata(
+        request: &PreparedBuyRequest,
+        pubkey: &Pubkey,
+    ) -> bool {
+        request.attach_idempotent_ata_create
+            && request.ata_missing_pre_submit
+            && *pubkey == request.user_ata
+    }
+
+    fn counterfactual_probe_account_role_for(
+        request: &PreparedBuyRequest,
+        pubkey: &Pubkey,
+    ) -> String {
+        if *pubkey == request.payer_pubkey {
+            return "payer_pubkey".to_string();
+        }
+        if *pubkey == request.user_ata {
+            return "user_ata".to_string();
+        }
+        if *pubkey == request.mint {
+            return "mint".to_string();
+        }
+        if *pubkey == request.token_program {
+            return "token_program".to_string();
+        }
+        if let Some(value) = request.account_overrides.global_config {
+            if *pubkey == value {
+                return "global_config".to_string();
+            }
+        }
+        if let Some(value) = request.account_overrides.fee_recipient {
+            if *pubkey == value {
+                return "fee_recipient".to_string();
+            }
+        }
+        if let Some(value) = request.account_overrides.creator_pubkey {
+            if *pubkey == value {
+                return "creator_pubkey".to_string();
+            }
+        }
+        if let Some(value) = request.account_overrides.associated_bonding_curve {
+            if *pubkey == value {
+                return "associated_bonding_curve".to_string();
+            }
+        }
+        if let Some(profile) = request.build_profile.as_ref() {
+            if *pubkey == profile.payer_pubkey {
+                return "payer_pubkey".to_string();
+            }
+            if *pubkey == profile.user_ata {
+                return "user_ata".to_string();
+            }
+            if *pubkey == profile.mint {
+                return "mint".to_string();
+            }
+            if *pubkey == profile.token_program {
+                return "token_program".to_string();
+            }
+            if let Some(value) = profile.account_overrides.global_config {
+                if *pubkey == value {
+                    return "global_config".to_string();
+                }
+            }
+            if let Some(value) = profile.account_overrides.fee_recipient {
+                if *pubkey == value {
+                    return "fee_recipient".to_string();
+                }
+            }
+            if let Some(value) = profile.account_overrides.creator_pubkey {
+                if *pubkey == value {
+                    return "creator_pubkey".to_string();
+                }
+            }
+            if let Some(value) = profile.account_overrides.associated_bonding_curve {
+                if *pubkey == value {
+                    return "associated_bonding_curve".to_string();
+                }
+            }
+        }
+        "transaction_account".to_string()
+    }
+
+    fn counterfactual_probe_required_account_roles(
+        request: &PreparedBuyRequest,
+    ) -> Vec<(Pubkey, String)> {
+        let mut seen = HashSet::new();
+        let mut accounts = Vec::new();
+        let mut push_account = |pubkey: Pubkey, role: String| {
+            if Self::counterfactual_probe_can_create_missing_user_ata(request, &pubkey) {
+                return;
+            }
+            if seen.insert(pubkey) {
+                accounts.push((pubkey, role));
+            }
+        };
+
+        push_account(request.payer_pubkey, "payer_pubkey".to_string());
+        push_account(request.mint, "mint".to_string());
+        push_account(request.token_program, "token_program".to_string());
+        push_account(request.user_ata, "user_ata".to_string());
+        if let Some(value) = request.account_overrides.global_config {
+            push_account(value, "global_config".to_string());
+        }
+        if let Some(value) = request.account_overrides.fee_recipient {
+            push_account(value, "fee_recipient".to_string());
+        }
+        if let Some(value) = request.account_overrides.creator_pubkey {
+            push_account(value, "creator_pubkey".to_string());
+        }
+        if let Some(value) = request.account_overrides.associated_bonding_curve {
+            push_account(value, "associated_bonding_curve".to_string());
+        }
+
+        for pubkey in request.rpc_buy_tx.message.account_keys.iter().copied() {
+            push_account(
+                pubkey,
+                Self::counterfactual_probe_account_role_for(request, &pubkey),
+            );
+        }
+
+        accounts
+    }
+
+    pub(crate) async fn counterfactual_probe_missing_required_account(
+        &self,
+        request: &PreparedBuyRequest,
+    ) -> Result<Option<CounterfactualProbeMissingAccount>> {
+        let rpc = self.preparation_rpc();
+        for (pubkey, role) in Self::counterfactual_probe_required_account_roles(request) {
+            match rpc
+                .get_account_with_commitment(&pubkey, CommitmentConfig::processed())
+                .await
+            {
+                Ok(response) if response.value.is_some() => {}
+                Ok(_) => {
+                    return Ok(Some(CounterfactualProbeMissingAccount { pubkey, role }));
+                }
+                Err(err) if Self::is_account_not_found_error(&err) => {
+                    return Ok(Some(CounterfactualProbeMissingAccount { pubkey, role }));
+                }
+                Err(err) => {
+                    return Err(anyhow::anyhow!(
+                        "counterfactual probe account precheck failed: role={} pubkey={} error={}",
+                        role,
+                        pubkey,
+                        err
+                    ));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     pub fn spawn_shadow_simulation(&self, request: PreparedBuyRequest) -> PendingShadowSimulation {
         let shadow_simulator = Arc::clone(&self.shadow_simulator);
         let shadow_config = self.config.shadow_run.clone();
@@ -7996,6 +8155,77 @@ mod tests {
             .expect("counterfactual probe simulation");
         assert_eq!(report.amount_lamports, fixed_lamports);
         assert_eq!(trigger.active_positions(), 0);
+    }
+
+    #[test]
+    fn p37_counterfactual_probe_required_accounts_skip_creatable_user_ata() {
+        let config = create_test_config();
+        let trigger =
+            TriggerComponent::new_with_shadow_simulator(config, Arc::new(MockShadowSimulator));
+        let payer = Keypair::new();
+        let mint = Pubkey::new_unique();
+        let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).expect("valid token program");
+        let amount_lamports = trigger
+            .configured_trade_amount_lamports()
+            .expect("configured amount");
+        let request = trigger
+            .build_prepared_buy_request(
+                &payer,
+                &mint,
+                &token_program,
+                true,
+                &valid_buy_account_overrides(),
+                amount_lamports,
+                1_000_000,
+                Hash::new_unique(),
+            )
+            .expect("prepared request");
+
+        let roles = TriggerComponent::counterfactual_probe_required_account_roles(&request);
+
+        assert!(roles
+            .iter()
+            .any(|(pubkey, role)| *pubkey == request.payer_pubkey && role == "payer_pubkey"));
+        assert!(roles
+            .iter()
+            .any(|(pubkey, role)| *pubkey == request.mint && role == "mint"));
+        assert!(roles
+            .iter()
+            .any(|(pubkey, role)| *pubkey == request.token_program && role == "token_program"));
+        assert!(!roles
+            .iter()
+            .any(|(pubkey, role)| *pubkey == request.user_ata && role == "user_ata"));
+    }
+
+    #[test]
+    fn p37_counterfactual_probe_required_accounts_include_existing_user_ata() {
+        let config = create_test_config();
+        let trigger =
+            TriggerComponent::new_with_shadow_simulator(config, Arc::new(MockShadowSimulator));
+        let payer = Keypair::new();
+        let mint = Pubkey::new_unique();
+        let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).expect("valid token program");
+        let amount_lamports = trigger
+            .configured_trade_amount_lamports()
+            .expect("configured amount");
+        let request = trigger
+            .build_prepared_buy_request(
+                &payer,
+                &mint,
+                &token_program,
+                false,
+                &valid_buy_account_overrides(),
+                amount_lamports,
+                1_000_000,
+                Hash::new_unique(),
+            )
+            .expect("prepared request");
+
+        let roles = TriggerComponent::counterfactual_probe_required_account_roles(&request);
+
+        assert!(roles
+            .iter()
+            .any(|(pubkey, role)| *pubkey == request.user_ata && role == "user_ata"));
     }
 
     #[test]
