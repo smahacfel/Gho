@@ -4650,6 +4650,8 @@ struct P37ShadowProbeCandidate {
     observation_end_ts_ms: Option<u64>,
     v3_feature_snapshot_hash: Option<String>,
     v3_policy_config_hash: Option<String>,
+    source_v3_feature_snapshot_hash: Option<String>,
+    source_v3_policy_config_hash: Option<String>,
     v3_materialized_feature_snapshot_present: bool,
     v3_policy_config_payload_present: bool,
     active_verdict_type: Option<String>,
@@ -4662,7 +4664,12 @@ struct P37ShadowProbeCandidate {
     curve_data_known: Option<bool>,
     rollout_namespace: String,
     source_decision_plane: Option<String>,
+    source_decision_log_path: Option<String>,
+    source_decision_row_offset: Option<u64>,
+    source_decision_row_sha256: Option<String>,
 }
+
+static P37_SHADOW_PROBE_JSONL_WRITE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 #[derive(Debug)]
 struct P37ShadowProbeRuntimeState {
@@ -4739,6 +4746,8 @@ impl P37ShadowProbeCandidate {
         log: &ghost_brain::oracle::GatekeeperBuyLog,
         rollout_namespace: &str,
     ) -> Self {
+        let canonical_feature_hash = p37_shadow_probe_serialized_replay_payload_hash(log)
+            .or_else(|| log.v3_feature_snapshot_hash.clone());
         Self {
             ab_record_id: log.ab_record_id.clone(),
             candidate_id: log.join_key.clone().or_else(|| log.ab_record_id.clone()),
@@ -4750,8 +4759,10 @@ impl P37ShadowProbeCandidate {
                 .or(log.first_seen_ts_ms),
             observation_start_ts_ms: log.observation_start_ts_ms.or(log.ab_t0_event_ts_ms),
             observation_end_ts_ms: log.observation_end_ts_ms.or(log.ab_t_end_event_ts_ms),
-            v3_feature_snapshot_hash: log.v3_feature_snapshot_hash.clone(),
+            v3_feature_snapshot_hash: canonical_feature_hash.clone(),
             v3_policy_config_hash: log.v3_policy_config_hash.clone(),
+            source_v3_feature_snapshot_hash: canonical_feature_hash,
+            source_v3_policy_config_hash: log.v3_policy_config_hash.clone(),
             v3_materialized_feature_snapshot_present: log
                 .v3_materialized_feature_snapshot
                 .is_some(),
@@ -4766,8 +4777,32 @@ impl P37ShadowProbeCandidate {
             curve_data_known: log.curve_data_known,
             rollout_namespace: rollout_namespace.to_string(),
             source_decision_plane: log.decision_plane.clone(),
+            source_decision_log_path: None,
+            source_decision_row_offset: None,
+            source_decision_row_sha256: None,
         }
     }
+}
+
+fn p37_shadow_probe_serialized_replay_payload_hash(
+    log: &ghost_brain::oracle::GatekeeperBuyLog,
+) -> Option<String> {
+    let materialization_version = log.v3_materialization_version?;
+    let log_value = serde_json::to_value(log).ok()?;
+    let mut canonical_snapshot = log_value.get("v3_materialized_feature_snapshot")?.clone();
+    if let Some(session_metadata) = canonical_snapshot
+        .get_mut("session_metadata")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        session_metadata.remove("session_id");
+    }
+    let payload = serde_json::json!({
+        "materialization_version": materialization_version,
+        "v3_materialized_feature_snapshot": canonical_snapshot,
+    });
+    serde_json::to_vec(&payload)
+        .ok()
+        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
 }
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq)]
@@ -4778,6 +4813,9 @@ struct P37ShadowProbeSelectionRecord {
     probe_plane: String,
     dispatch_source: String,
     source_decision_plane: Option<String>,
+    source_decision_log_path: Option<String>,
+    source_decision_row_offset: Option<u64>,
+    source_decision_row_sha256: Option<String>,
     rollout_namespace: String,
     run_id: Option<String>,
     session_id: Option<String>,
@@ -4805,6 +4843,8 @@ struct P37ShadowProbeSelectionRecord {
     sampling_version: String,
     v3_feature_snapshot_hash: Option<String>,
     v3_policy_config_hash: Option<String>,
+    source_v3_feature_snapshot_hash: Option<String>,
+    source_v3_policy_config_hash: Option<String>,
     v3_materialized_feature_snapshot_present: bool,
     v3_policy_config_payload_present: bool,
     active_verdict_type: Option<String>,
@@ -4814,11 +4854,13 @@ struct P37ShadowProbeSelectionRecord {
     v3_shadow_verdict: Option<String>,
     v3_shadow_reason_code: Option<String>,
     v3_shadow_confidence: Option<f64>,
+    curve_data_known: Option<bool>,
     probe_amount_source: String,
     probe_amount_lamports: u64,
     probe_slippage_bps: u64,
     probe_quote_age_max_ms: u64,
     probe_curve_age_max_ms: u64,
+    precheck_failure_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq)]
@@ -4853,6 +4895,32 @@ struct P37ShadowProbeTransportRecord {
     quote_age_ms: Option<u64>,
     curve_age_ms: Option<u64>,
     probe_age_status: Option<String>,
+    source_v3_feature_snapshot_hash: Option<String>,
+    source_v3_policy_config_hash: Option<String>,
+    transport_v3_feature_snapshot_hash: Option<String>,
+    transport_v3_policy_config_hash: Option<String>,
+    source_decision_log_path: Option<String>,
+    source_decision_row_offset: Option<u64>,
+    source_decision_row_sha256: Option<String>,
+    precheck_failure_reason: Option<String>,
+    simulation_error_kind: Option<String>,
+    simulation_error_message: Option<String>,
+    simulation_error_account_pubkey: Option<String>,
+    simulation_error_account_role: Option<String>,
+    prepared_buy_account_set_present: bool,
+    account_overrides_present: bool,
+    bonding_curve: Option<String>,
+    payer_pubkey: Option<String>,
+    token_program: Option<String>,
+    user_ata: Option<String>,
+    curve_account_available: Option<bool>,
+    mint_account_available: Option<bool>,
+    payer_account_available: Option<bool>,
+    quote_age_diagnostic_ms: Option<u64>,
+    curve_age_diagnostic_ms: Option<u64>,
+    account_features_update_count: Option<u64>,
+    curve_data_known: Option<bool>,
+    curve_readiness_status: Option<String>,
     tip_lamports: u64,
     payer_provenance: String,
     err: Option<String>,
@@ -5101,6 +5169,9 @@ fn p37_shadow_probe_selection_record(
         probe_plane: "p37_shadow_probe".to_string(),
         dispatch_source: config.dispatch_source.clone(),
         source_decision_plane: candidate.source_decision_plane.clone(),
+        source_decision_log_path: candidate.source_decision_log_path.clone(),
+        source_decision_row_offset: candidate.source_decision_row_offset,
+        source_decision_row_sha256: candidate.source_decision_row_sha256.clone(),
         rollout_namespace: candidate.rollout_namespace.clone(),
         run_id: (!config.run_id.trim().is_empty()).then(|| config.run_id.clone()),
         session_id: (!config.session_id.trim().is_empty()).then(|| config.session_id.clone()),
@@ -5128,6 +5199,8 @@ fn p37_shadow_probe_selection_record(
         sampling_version: config.sampling_version.clone(),
         v3_feature_snapshot_hash: candidate.v3_feature_snapshot_hash.clone(),
         v3_policy_config_hash: candidate.v3_policy_config_hash.clone(),
+        source_v3_feature_snapshot_hash: candidate.source_v3_feature_snapshot_hash.clone(),
+        source_v3_policy_config_hash: candidate.source_v3_policy_config_hash.clone(),
         v3_materialized_feature_snapshot_present: candidate
             .v3_materialized_feature_snapshot_present,
         v3_policy_config_payload_present: candidate.v3_policy_config_payload_present,
@@ -5138,11 +5211,13 @@ fn p37_shadow_probe_selection_record(
         v3_shadow_verdict: candidate.v3_shadow_verdict.clone(),
         v3_shadow_reason_code: candidate.v3_shadow_reason_code.clone(),
         v3_shadow_confidence: candidate.v3_shadow_confidence,
+        curve_data_known: candidate.curve_data_known,
         probe_amount_source: config.probe_amount_source.clone(),
         probe_amount_lamports: config.probe_amount_lamports,
         probe_slippage_bps: config.probe_slippage_bps,
         probe_quote_age_max_ms: config.probe_quote_age_max_ms,
         probe_curve_age_max_ms: config.probe_curve_age_max_ms,
+        precheck_failure_reason: None,
     }
 }
 
@@ -5172,6 +5247,11 @@ fn p37_shadow_probe_join_metadata(
         v3_policy_config_hash: record.v3_policy_config_hash.clone(),
         decision_plane: record.source_decision_plane.clone(),
         rollout_namespace: Some(record.rollout_namespace.clone()),
+        source_decision_log_path: record.source_decision_log_path.clone(),
+        source_decision_row_offset: record.source_decision_row_offset,
+        source_decision_row_sha256: record.source_decision_row_sha256.clone(),
+        source_v3_feature_snapshot_hash: record.source_v3_feature_snapshot_hash.clone(),
+        source_v3_policy_config_hash: record.source_v3_policy_config_hash.clone(),
     })
 }
 
@@ -5222,6 +5302,32 @@ fn p37_shadow_probe_artifact_records(
         quote_age_ms: None,
         curve_age_ms: None,
         probe_age_status: Some("harness_no_simulation_age_unavailable".to_string()),
+        source_v3_feature_snapshot_hash: record.source_v3_feature_snapshot_hash.clone(),
+        source_v3_policy_config_hash: record.source_v3_policy_config_hash.clone(),
+        transport_v3_feature_snapshot_hash: record.v3_feature_snapshot_hash.clone(),
+        transport_v3_policy_config_hash: record.v3_policy_config_hash.clone(),
+        source_decision_log_path: record.source_decision_log_path.clone(),
+        source_decision_row_offset: record.source_decision_row_offset,
+        source_decision_row_sha256: record.source_decision_row_sha256.clone(),
+        precheck_failure_reason: record.precheck_failure_reason.clone(),
+        simulation_error_kind: None,
+        simulation_error_message: None,
+        simulation_error_account_pubkey: None,
+        simulation_error_account_role: None,
+        prepared_buy_account_set_present: false,
+        account_overrides_present: false,
+        bonding_curve: None,
+        payer_pubkey: None,
+        token_program: None,
+        user_ata: None,
+        curve_account_available: None,
+        mint_account_available: None,
+        payer_account_available: None,
+        quote_age_diagnostic_ms: None,
+        curve_age_diagnostic_ms: None,
+        account_features_update_count: None,
+        curve_data_known: None,
+        curve_readiness_status: Some("harness_no_simulation".to_string()),
         tip_lamports: 0,
         payer_provenance: "counterfactual_shadow_probe".to_string(),
         err: None,
@@ -5276,6 +5382,22 @@ async fn append_p37_shadow_probe_transport_record(
     log_path: &std::path::Path,
     record: &P37ShadowProbeTransportRecord,
 ) -> anyhow::Result<()> {
+    append_p37_shadow_probe_jsonl_record(log_path, record).await
+}
+
+async fn append_p37_shadow_probe_entry_record(
+    log_path: &std::path::Path,
+    record: &ShadowEntryRecord,
+) -> anyhow::Result<()> {
+    append_p37_shadow_probe_jsonl_record(log_path, record).await
+}
+
+async fn append_p37_shadow_probe_jsonl_record<T: serde::Serialize>(
+    log_path: &std::path::Path,
+    record: &T,
+) -> anyhow::Result<()> {
+    let lock = P37_SHADOW_PROBE_JSONL_WRITE_LOCK.get_or_init(|| tokio::sync::Mutex::new(()));
+    let _guard = lock.lock().await;
     if let Some(parent) = log_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -5284,9 +5406,9 @@ async fn append_p37_shadow_probe_transport_record(
         .append(true)
         .open(log_path)
         .await?;
-    let json = serde_json::to_string(record)?;
-    tokio::io::AsyncWriteExt::write_all(&mut file, json.as_bytes()).await?;
-    tokio::io::AsyncWriteExt::write_all(&mut file, b"\n").await?;
+    let mut json = serde_json::to_vec(record)?;
+    json.push(b'\n');
+    tokio::io::AsyncWriteExt::write_all(&mut file, &json).await?;
     tokio::io::AsyncWriteExt::flush(&mut file).await?;
     Ok(())
 }
@@ -5304,7 +5426,8 @@ async fn append_p37_shadow_probe_p0_artifacts(
         &transport,
     )
     .await?;
-    append_shadow_entry_record(std::path::Path::new(&config.entry_log_path), &entry).await?;
+    append_p37_shadow_probe_entry_record(std::path::Path::new(&config.entry_log_path), &entry)
+        .await?;
     Ok(true)
 }
 
@@ -5312,19 +5435,7 @@ async fn append_p37_shadow_probe_selection_record(
     log_path: &std::path::Path,
     record: &P37ShadowProbeSelectionRecord,
 ) -> anyhow::Result<()> {
-    if let Some(parent) = log_path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)
-        .await?;
-    let json = serde_json::to_string(record)?;
-    tokio::io::AsyncWriteExt::write_all(&mut file, json.as_bytes()).await?;
-    tokio::io::AsyncWriteExt::write_all(&mut file, b"\n").await?;
-    tokio::io::AsyncWriteExt::flush(&mut file).await?;
-    Ok(())
+    append_p37_shadow_probe_jsonl_record(log_path, record).await
 }
 
 fn p37_shadow_probe_as_skip(
@@ -5333,6 +5444,17 @@ fn p37_shadow_probe_as_skip(
 ) -> P37ShadowProbeSelectionRecord {
     record.event_type = "probe_skipped".to_string();
     record.probe_skip_reason = Some(reason.into());
+    record.probe_sample_reason = None;
+    record
+}
+
+fn p37_shadow_probe_as_precheck_skip(
+    mut record: P37ShadowProbeSelectionRecord,
+    reason: impl Into<String>,
+) -> P37ShadowProbeSelectionRecord {
+    record.event_type = "probe_skipped".to_string();
+    record.probe_skip_reason = Some("probe_execution_precheck_failed".to_string());
+    record.precheck_failure_reason = Some(reason.into());
     record.probe_sample_reason = None;
     record
 }
@@ -5349,13 +5471,214 @@ async fn append_p37_shadow_probe_record(
     append_p37_shadow_probe_selection_record(log_path, record).await
 }
 
+#[derive(Debug, Clone, Default)]
+struct P37ShadowProbeExecutionDiagnostics {
+    precheck_failure_reason: Option<String>,
+    simulation_error_kind: Option<String>,
+    simulation_error_message: Option<String>,
+    simulation_error_account_pubkey: Option<String>,
+    simulation_error_account_role: Option<String>,
+    prepared_buy_account_set_present: bool,
+    account_overrides_present: bool,
+    bonding_curve: Option<String>,
+    payer_pubkey: Option<String>,
+    token_program: Option<String>,
+    user_ata: Option<String>,
+    curve_account_available: Option<bool>,
+    mint_account_available: Option<bool>,
+    payer_account_available: Option<bool>,
+    quote_age_ms: Option<u64>,
+    curve_age_ms: Option<u64>,
+    account_features_update_count: Option<u64>,
+    curve_data_known: Option<bool>,
+    curve_readiness_status: Option<String>,
+}
+
+fn p37_shadow_probe_account_overrides_present(
+    overrides: &crate::components::trigger::BuyAccountOverrides,
+) -> bool {
+    overrides.global_config.is_some()
+        || overrides.fee_recipient.is_some()
+        || overrides.token_program.is_some()
+        || overrides.creator_pubkey.is_some()
+        || overrides.buy_variant.is_some()
+        || overrides.associated_bonding_curve.is_some()
+        || overrides.legacy_buy_curve.is_some()
+}
+
+fn p37_shadow_probe_execution_precheck(
+    record: &P37ShadowProbeSelectionRecord,
+    account_overrides: &crate::components::trigger::BuyAccountOverrides,
+    buy_mint: &Pubkey,
+    pool_data: &DetectedPool,
+) -> Option<String> {
+    let base_mint = record.base_mint.as_deref().unwrap_or("").trim();
+    if base_mint.is_empty() {
+        return Some("invalid_mint_identity".to_string());
+    }
+    if base_mint != buy_mint.to_string() {
+        return Some("mint_identity_mismatch".to_string());
+    }
+    if !pool_data.base_mint.trim().is_empty() && pool_data.base_mint != base_mint {
+        return Some("pool_base_mint_mismatch".to_string());
+    }
+    if matches!(
+        account_overrides.buy_variant,
+        Some(trigger::PumpfunBuyVariant::LegacyBuy)
+    ) && account_overrides.legacy_buy_curve.is_none()
+    {
+        return Some("missing_bonding_curve".to_string());
+    }
+    None
+}
+
+fn p37_shadow_probe_error_pubkey(message: &str) -> Option<String> {
+    for marker in ["pubkey=", "account=", "AccountNotFound:"] {
+        if let Some((_, tail)) = message.split_once(marker) {
+            let candidate = tail
+                .trim()
+                .trim_matches(|ch: char| {
+                    ch == '"' || ch == '\'' || ch == ',' || ch == ':' || ch == ';'
+                })
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_matches(|ch: char| {
+                    ch == '"' || ch == '\'' || ch == ',' || ch == ':' || ch == ';'
+                })
+                .to_string();
+            if !candidate.is_empty() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn p37_shadow_probe_account_role(
+    pubkey: Option<&str>,
+    request: Option<&crate::components::trigger::PreparedBuyRequest>,
+) -> Option<String> {
+    let pubkey = pubkey?;
+    let request = request?;
+    if pubkey == request.payer_pubkey.to_string() {
+        return Some("payer_pubkey".to_string());
+    }
+    if pubkey == request.user_ata.to_string() {
+        return Some("user_ata".to_string());
+    }
+    if pubkey == request.mint.to_string() {
+        return Some("mint".to_string());
+    }
+    if pubkey == request.token_program.to_string() {
+        return Some("token_program".to_string());
+    }
+    if let Some(value) = request.account_overrides.associated_bonding_curve {
+        if pubkey == value.to_string() {
+            return Some("associated_bonding_curve".to_string());
+        }
+    }
+    if let Some(value) = request.account_overrides.creator_pubkey {
+        if pubkey == value.to_string() {
+            return Some("creator_pubkey".to_string());
+        }
+    }
+    None
+}
+
+fn p37_shadow_probe_error_kind(message: Option<&str>) -> Option<String> {
+    let message = message?;
+    if message.contains("AccountNotFound") {
+        Some("AccountNotFound".to_string())
+    } else if message.contains("BlockhashNotFound") {
+        Some("BlockhashNotFound".to_string())
+    } else if message.contains("InsufficientFunds") {
+        Some("InsufficientFunds".to_string())
+    } else {
+        Some("simulation_error".to_string())
+    }
+}
+
+fn p37_shadow_probe_execution_diagnostics(
+    record: &P37ShadowProbeSelectionRecord,
+    request: Option<&crate::components::trigger::PreparedBuyRequest>,
+    precheck_failure_reason: Option<String>,
+    error_message: Option<String>,
+) -> P37ShadowProbeExecutionDiagnostics {
+    let account_pubkey = error_message
+        .as_deref()
+        .and_then(p37_shadow_probe_error_pubkey);
+    let account_role = p37_shadow_probe_account_role(account_pubkey.as_deref(), request);
+    let request_overrides = request.map(|request| &request.account_overrides);
+    let associated_bonding_curve = request_overrides
+        .and_then(|overrides| overrides.associated_bonding_curve)
+        .map(|value| value.to_string());
+    let legacy_curve_present = request_overrides
+        .map(|overrides| overrides.legacy_buy_curve.is_some())
+        .unwrap_or(false);
+    let curve_account_available =
+        request.map(|_| associated_bonding_curve.is_some() || legacy_curve_present);
+    let curve_readiness_status = match (
+        precheck_failure_reason.as_deref(),
+        record.curve_data_known,
+        curve_account_available,
+    ) {
+        (Some(reason), _, _) => Some(format!("precheck_failed:{reason}")),
+        (None, Some(true), Some(true)) => Some("curve_data_known_and_account_present".to_string()),
+        (None, Some(true), Some(false)) => Some("curve_data_known_but_account_missing".to_string()),
+        (None, Some(true), None) => Some("curve_data_known_account_unreported".to_string()),
+        (None, Some(false), _) => Some("curve_data_unknown".to_string()),
+        (None, None, _) => Some("curve_data_unreported".to_string()),
+    };
+    P37ShadowProbeExecutionDiagnostics {
+        precheck_failure_reason,
+        simulation_error_kind: p37_shadow_probe_error_kind(error_message.as_deref()),
+        simulation_error_message: error_message,
+        simulation_error_account_pubkey: account_pubkey,
+        simulation_error_account_role: account_role,
+        prepared_buy_account_set_present: request.is_some(),
+        account_overrides_present: request_overrides
+            .map(p37_shadow_probe_account_overrides_present)
+            .unwrap_or(false),
+        bonding_curve: associated_bonding_curve,
+        payer_pubkey: request.map(|request| request.payer_pubkey.to_string()),
+        token_program: request.map(|request| request.token_program.to_string()),
+        user_ata: request.map(|request| request.user_ata.to_string()),
+        curve_account_available,
+        mint_account_available: request.map(|_| true),
+        payer_account_available: request.map(|_| true),
+        quote_age_ms: None,
+        curve_age_ms: None,
+        account_features_update_count: None,
+        curve_data_known: record.curve_data_known,
+        curve_readiness_status,
+    }
+}
+
 fn p37_shadow_probe_transport_from_event(
     record: &P37ShadowProbeSelectionRecord,
     event: &crate::events::ShadowBuySimulationEvent,
+    request: &crate::components::trigger::PreparedBuyRequest,
     dispatch_ts_ms: u64,
 ) -> P37ShadowProbeTransportRecord {
+    let mut join_metadata = p37_shadow_probe_join_metadata(record).unwrap_or_default();
+    join_metadata.ab_record_id = join_metadata
+        .ab_record_id
+        .or(event.join_metadata.ab_record_id.clone());
+    join_metadata.source_ab_record_id = join_metadata
+        .source_ab_record_id
+        .or(event.join_metadata.source_ab_record_id.clone());
+    join_metadata.probe_id = join_metadata
+        .probe_id
+        .or(event.join_metadata.probe_id.clone());
+    let diagnostics = p37_shadow_probe_execution_diagnostics(
+        record,
+        Some(request),
+        record.precheck_failure_reason.clone(),
+        event.err.clone(),
+    );
     P37ShadowProbeTransportRecord {
-        join_metadata: event.join_metadata.clone(),
+        join_metadata,
         schema_version: 1,
         event_type: "counterfactual_shadow_probe_transport".to_string(),
         collection_plane: record.collection_plane.clone(),
@@ -5386,6 +5709,32 @@ fn p37_shadow_probe_transport_from_event(
         quote_age_ms: None,
         curve_age_ms: None,
         probe_age_status: Some("age_not_available_from_shadow_sim_report".to_string()),
+        source_v3_feature_snapshot_hash: record.source_v3_feature_snapshot_hash.clone(),
+        source_v3_policy_config_hash: record.source_v3_policy_config_hash.clone(),
+        transport_v3_feature_snapshot_hash: record.v3_feature_snapshot_hash.clone(),
+        transport_v3_policy_config_hash: record.v3_policy_config_hash.clone(),
+        source_decision_log_path: record.source_decision_log_path.clone(),
+        source_decision_row_offset: record.source_decision_row_offset,
+        source_decision_row_sha256: record.source_decision_row_sha256.clone(),
+        precheck_failure_reason: diagnostics.precheck_failure_reason,
+        simulation_error_kind: diagnostics.simulation_error_kind,
+        simulation_error_message: diagnostics.simulation_error_message,
+        simulation_error_account_pubkey: diagnostics.simulation_error_account_pubkey,
+        simulation_error_account_role: diagnostics.simulation_error_account_role,
+        prepared_buy_account_set_present: diagnostics.prepared_buy_account_set_present,
+        account_overrides_present: diagnostics.account_overrides_present,
+        bonding_curve: diagnostics.bonding_curve,
+        payer_pubkey: diagnostics.payer_pubkey,
+        token_program: diagnostics.token_program,
+        user_ata: diagnostics.user_ata,
+        curve_account_available: diagnostics.curve_account_available,
+        mint_account_available: diagnostics.mint_account_available,
+        payer_account_available: diagnostics.payer_account_available,
+        quote_age_diagnostic_ms: diagnostics.quote_age_ms,
+        curve_age_diagnostic_ms: diagnostics.curve_age_ms,
+        account_features_update_count: diagnostics.account_features_update_count,
+        curve_data_known: diagnostics.curve_data_known,
+        curve_readiness_status: diagnostics.curve_readiness_status,
         tip_lamports: event.tip_lamports,
         payer_provenance: event.payer_provenance.clone(),
         err: event.err.clone(),
@@ -5415,6 +5764,12 @@ fn p37_shadow_probe_transport_from_error(
 ) -> P37ShadowProbeTransportRecord {
     let now_ms = current_time_ms();
     let base_mint = record.base_mint.clone().unwrap_or_default();
+    let diagnostics = p37_shadow_probe_execution_diagnostics(
+        record,
+        Some(request),
+        record.precheck_failure_reason.clone(),
+        Some(err.to_string()),
+    );
     P37ShadowProbeTransportRecord {
         join_metadata: request.join_metadata.clone(),
         schema_version: 1,
@@ -5445,6 +5800,32 @@ fn p37_shadow_probe_transport_from_error(
         quote_age_ms: None,
         curve_age_ms: None,
         probe_age_status: Some("age_not_available_simulation_failed".to_string()),
+        source_v3_feature_snapshot_hash: record.source_v3_feature_snapshot_hash.clone(),
+        source_v3_policy_config_hash: record.source_v3_policy_config_hash.clone(),
+        transport_v3_feature_snapshot_hash: record.v3_feature_snapshot_hash.clone(),
+        transport_v3_policy_config_hash: record.v3_policy_config_hash.clone(),
+        source_decision_log_path: record.source_decision_log_path.clone(),
+        source_decision_row_offset: record.source_decision_row_offset,
+        source_decision_row_sha256: record.source_decision_row_sha256.clone(),
+        precheck_failure_reason: diagnostics.precheck_failure_reason,
+        simulation_error_kind: diagnostics.simulation_error_kind,
+        simulation_error_message: diagnostics.simulation_error_message,
+        simulation_error_account_pubkey: diagnostics.simulation_error_account_pubkey,
+        simulation_error_account_role: diagnostics.simulation_error_account_role,
+        prepared_buy_account_set_present: diagnostics.prepared_buy_account_set_present,
+        account_overrides_present: diagnostics.account_overrides_present,
+        bonding_curve: diagnostics.bonding_curve,
+        payer_pubkey: diagnostics.payer_pubkey,
+        token_program: diagnostics.token_program,
+        user_ata: diagnostics.user_ata,
+        curve_account_available: diagnostics.curve_account_available,
+        mint_account_available: diagnostics.mint_account_available,
+        payer_account_available: diagnostics.payer_account_available,
+        quote_age_diagnostic_ms: diagnostics.quote_age_ms,
+        curve_age_diagnostic_ms: diagnostics.curve_age_ms,
+        account_features_update_count: diagnostics.account_features_update_count,
+        curve_data_known: diagnostics.curve_data_known,
+        curve_readiness_status: diagnostics.curve_readiness_status,
         tip_lamports: request.tip_lamports,
         payer_provenance: request.payer_provenance.to_string(),
         err: Some(err.to_string()),
@@ -5510,6 +5891,20 @@ async fn run_p37_shadow_probe_dispatch(
         account_overrides.legacy_buy_curve =
             oracle_runtime.resolve_trigger_buy_curve(buy_mint, &buffered_txs);
     }
+    if let Some(reason) =
+        p37_shadow_probe_execution_precheck(&record, &account_overrides, &buy_mint, &pool_data)
+    {
+        let skip_record = p37_shadow_probe_as_precheck_skip(record.clone(), reason);
+        if let Err(err) = append_p37_shadow_probe_record(&config, &skip_record).await {
+            warn!(
+                probe_id = ?skip_record.probe_id,
+                source_ab_record_id = ?skip_record.source_ab_record_id,
+                error = %err,
+                "P37_SHADOW_PROBE_PRECHECK_SKIP_WRITE_FAILED"
+            );
+        }
+        return;
+    }
 
     let amount_lamports_override = match config.probe_amount_source.as_str() {
         "fixed_lamports" => Some(config.probe_amount_lamports),
@@ -5556,7 +5951,8 @@ async fn run_p37_shadow_probe_dispatch(
                 record.base_mint.as_deref().unwrap_or(&pool_data.base_mint),
                 report,
             );
-            let transport = p37_shadow_probe_transport_from_event(&record, &event, dispatch_ts_ms);
+            let transport =
+                p37_shadow_probe_transport_from_event(&record, &event, &request, dispatch_ts_ms);
             if let Err(err) = append_p37_shadow_probe_transport_record(
                 std::path::Path::new(&config.transport_log_path),
                 &transport,
@@ -5578,9 +5974,11 @@ async fn run_p37_shadow_probe_dispatch(
                 &transport.execution_outcome,
             ) {
                 enrich_probe_shadow_entry(&mut entry, &record, &request, dispatch_ts_ms);
-                if let Err(err) =
-                    append_shadow_entry_record(std::path::Path::new(&config.entry_log_path), &entry)
-                        .await
+                if let Err(err) = append_p37_shadow_probe_entry_record(
+                    std::path::Path::new(&config.entry_log_path),
+                    &entry,
+                )
+                .await
                 {
                     warn!(
                         probe_id = ?record.probe_id,
@@ -11444,6 +11842,8 @@ mod tests {
             observation_end_ts_ms: Some(2_000),
             v3_feature_snapshot_hash: Some("feature-hash".to_string()),
             v3_policy_config_hash: Some("policy-hash".to_string()),
+            source_v3_feature_snapshot_hash: Some("feature-hash".to_string()),
+            source_v3_policy_config_hash: Some("policy-hash".to_string()),
             v3_materialized_feature_snapshot_present: true,
             v3_policy_config_payload_present: true,
             active_verdict_type: Some("REJECT_CORE_FAIL".to_string()),
@@ -11456,6 +11856,9 @@ mod tests {
             curve_data_known: Some(true),
             rollout_namespace: "p37-j3-test".to_string(),
             source_decision_plane: Some("legacy_live".to_string()),
+            source_decision_log_path: None,
+            source_decision_row_offset: None,
+            source_decision_row_sha256: None,
         }
     }
 
@@ -11517,6 +11920,33 @@ mod tests {
     }
 
     #[test]
+    fn p37_shadow_probe_candidate_uses_serialized_replay_payload_hash() {
+        let active_config = review_test_gatekeeper_config();
+        let pool_id = Pubkey::new_unique();
+        let mut assessment = test_gatekeeper_buy_assessment(6);
+        assessment.feature_snapshot = review_v3_buy_candidate_features();
+        let mut v3_config = review_test_gatekeeper_v3_config();
+        v3_config.replay_payload_enabled = true;
+        let mut log = assessment.to_buy_log(&pool_id, &active_config);
+        enrich_buy_log_with_v3_shadow(&mut log, &assessment, &v3_config, false);
+        let serialized_hash =
+            p37_shadow_probe_serialized_replay_payload_hash(&log).expect("serialized hash");
+        log.v3_feature_snapshot_hash = Some("pre-serialize-hash".to_string());
+        log.v3_policy_config_hash = Some("policy-hash".to_string());
+
+        let candidate = P37ShadowProbeCandidate::from_gatekeeper_log(&log, "r15-smoke");
+
+        assert_eq!(
+            candidate.v3_feature_snapshot_hash.as_deref(),
+            Some(serialized_hash.as_str())
+        );
+        assert_eq!(
+            candidate.source_v3_feature_snapshot_hash.as_deref(),
+            Some(serialized_hash.as_str())
+        );
+    }
+
+    #[test]
     fn p37_shadow_probe_selection_record_skips_missing_ab_record_id() {
         let config = P37ShadowProbeConfig {
             enabled: true,
@@ -11562,6 +11992,46 @@ mod tests {
         assert_eq!(parsed["event_type"], "probe_selected");
         assert_eq!(parsed["dispatch_source"], "counterfactual_shadow_probe");
         assert_eq!(parsed["ab_record_id"], "pool:1000:2000:REJECT");
+    }
+
+    #[tokio::test]
+    async fn p37_shadow_probe_concurrent_skip_writer_produces_valid_jsonl() {
+        let temp = tempdir().expect("tempdir");
+        let path = temp.path().join("probe_skips.jsonl");
+        let config = P37ShadowProbeConfig {
+            enabled: true,
+            sample_threshold: 100,
+            ..Default::default()
+        };
+        let candidate = p37_shadow_probe_test_candidate();
+        let base_record = p37_shadow_probe_selection_record(&config, &candidate, 3_000);
+        let mut handles = Vec::new();
+        for idx in 0..50 {
+            let path = path.clone();
+            let mut record = p37_shadow_probe_as_skip(
+                base_record.clone(),
+                format!("concurrent_probe_skip_{idx}"),
+            );
+            record.probe_selected_ts_ms = 3_000 + idx;
+            handles.push(tokio::spawn(async move {
+                append_p37_shadow_probe_selection_record(&path, &record)
+                    .await
+                    .expect("append concurrent skip")
+            }));
+        }
+        for handle in handles {
+            handle.await.expect("join writer");
+        }
+
+        let content = tokio::fs::read_to_string(&path)
+            .await
+            .expect("read skip log");
+        let rows: Vec<&str> = content.lines().collect();
+        assert_eq!(rows.len(), 50);
+        for line in rows {
+            let row: serde_json::Value = serde_json::from_str(line).expect("valid jsonl row");
+            assert_eq!(row["event_type"], "probe_skipped");
+        }
     }
 
     #[test]

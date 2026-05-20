@@ -4682,9 +4682,25 @@ enabled = true
     #[test]
     fn test_p37_counterfactual_probe_smoke_profile_loads_shadow_only_isolated() {
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let path = manifest_dir
-            .join("../configs/rollout")
-            .join("shadow-burnin-v3-p37-counterfactual-probe-r15-smoke.toml");
+        let temp_root = unique_temp_dir("p37_counterfactual_probe_smoke_profile");
+        let temp_rollout_dir = temp_root.join("configs/rollout");
+        fs::create_dir_all(&temp_rollout_dir).unwrap();
+        fs::copy(
+            manifest_dir
+                .join("../configs/rollout")
+                .join("ghost_brain_v3_p37_mfs_lifecycle.toml"),
+            temp_rollout_dir.join("ghost_brain_v3_p37_mfs_lifecycle.toml"),
+        )
+        .unwrap();
+        let path =
+            temp_rollout_dir.join("shadow-burnin-v3-p37-counterfactual-probe-r15-smoke-r2.toml");
+        fs::copy(
+            manifest_dir
+                .join("../configs/rollout")
+                .join("shadow-burnin-v3-p37-counterfactual-probe-r15-smoke-r2.toml"),
+            &path,
+        )
+        .unwrap();
         let config = LauncherConfig::from_file(&path)
             .unwrap_or_else(|err| panic!("failed to load {}: {err}", path.display()));
 
@@ -4707,7 +4723,7 @@ enabled = true
         assert!(config
             .p37_shadow_probe
             .transport_log_path
-            .contains("shadow-burnin-v3-p37-counterfactual-probe-r15-smoke"));
+            .contains("shadow-burnin-v3-p37-counterfactual-probe-r15-smoke-r2"));
         assert!(config
             .p37_shadow_probe
             .entry_log_path

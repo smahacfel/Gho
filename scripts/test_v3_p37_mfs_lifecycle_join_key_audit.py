@@ -288,6 +288,77 @@ lifecycle_log_path = "../../logs/shadow_run/r15-probe/probe_lifecycle.jsonl"
             report["probe_decision_join"]["required_exact_decision_v3_join_coverage"],
             0.0,
         )
+        reasons = report["probe_decision_join"]["artifacts"]["probe_transport"]["mismatch_reasons"]
+        self.assertEqual(reasons, {"decision_row_not_found": 1})
+
+    def test_concatenated_probe_jsonl_is_parsed_and_mismatch_is_explained(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "configs/rollout/r15-probe.toml"
+            config.parent.mkdir(parents=True)
+            config.write_text(
+                """
+[oracle]
+decision_log_path = "../../logs/rollout/r15-probe/decisions"
+
+[p37_shadow_probe]
+selection_log_path = "../../logs/shadow_run/r15-probe/probe_selected.jsonl"
+skip_log_path = "../../logs/shadow_run/r15-probe/probe_skipped.jsonl"
+transport_log_path = "../../logs/shadow_run/r15-probe/probe_transport.jsonl"
+entry_log_path = "../../logs/shadow_run/r15-probe/probe_entries.jsonl"
+lifecycle_log_path = "../../logs/shadow_run/r15-probe/probe_lifecycle.jsonl"
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            decision = {
+                "candidate_id": "pool_mint_1000",
+                "ab_record_id": "source-ab",
+                "pool_id": "pool",
+                "base_mint": "mint",
+                "decision_plane": "legacy_live",
+                "v3_replay_payload_schema_version": 1,
+                "v3_feature_snapshot_hash": "decision-feature-hash",
+                "v3_policy_config_hash": "policy-hash",
+            }
+            probe_common = {
+                "candidate_id": "pool_mint_1000",
+                "ab_record_id": "source-ab",
+                "source_ab_record_id": "source-ab",
+                "pool_id": "pool",
+                "base_mint": "mint",
+                "source_decision_plane": "legacy_live",
+                "probe_id": "probe-id",
+                "dispatch_source": "counterfactual_shadow_probe",
+                "collection_plane": "counterfactual_shadow_probe",
+                "probe_plane": "p37_shadow_probe",
+                "probe_bucket": "v3_pending_wait_sample",
+                "probe_amount_source": "fixed_lamports",
+                "v3_feature_snapshot_hash": "probe-feature-hash",
+                "v3_policy_config_hash": "policy-hash",
+            }
+            write_jsonl(
+                root / "logs/rollout/r15-probe/decisions/gatekeeper_v2_decisions.jsonl",
+                [decision],
+            )
+            # Simulate the previous concurrent append corruption class: two JSON
+            # objects on one physical line must still be counted as two rows.
+            selected_path = root / "logs/shadow_run/r15-probe/probe_selected.jsonl"
+            selected_path.parent.mkdir(parents=True, exist_ok=True)
+            selected_path.write_text(
+                json.dumps(probe_common) + json.dumps({**probe_common, "probe_id": "probe-id-2"}) + "\n",
+                encoding="utf-8",
+            )
+            write_jsonl(root / "logs/shadow_run/r15-probe/probe_transport.jsonl", [probe_common])
+            write_jsonl(root / "logs/shadow_run/r15-probe/probe_entries.jsonl", [probe_common])
+
+            report = audit.build_report(config)
+
+        self.assertEqual(report["probe_join_key_coverage"]["probe_selection_rows"], 2)
+        self.assertEqual(report["probe_readiness"]["status"], "not_ready")
+        transport = report["probe_decision_join"]["artifacts"]["probe_transport"]
+        self.assertEqual(transport["feature_hash_mismatch"], 1)
+        self.assertEqual(transport["mismatch_reasons"], {"feature_hash_mismatch": 1})
 
 
 if __name__ == "__main__":

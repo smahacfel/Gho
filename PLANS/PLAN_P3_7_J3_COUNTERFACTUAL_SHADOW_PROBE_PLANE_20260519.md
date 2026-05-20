@@ -2,7 +2,7 @@
 
 Date: 2026-05-19
 
-Status: Accepted plan with P0R corrective repair
+Status: Accepted plan with P0R and J3R corrective repairs
 
 ## Decision
 
@@ -89,6 +89,63 @@ P0R implementation scope:
 - reduce the R15 smoke profile to bounded probe limits.
 
 P0R does not run or claim the R15 runtime smoke. R15 remains the next gate.
+
+## J3R Counterfactual Probe Runtime Repair
+
+J3R is a narrow corrective stage opened after the first R15 counterfactual
+probe smoke. The smoke was useful but did not reach minimal PASS:
+
+- V3/MFS replay path passed with strict replay OK.
+- Probe selection and probe transport rows were emitted.
+- Active BUY rows remained unchanged.
+- No probe entry/lifecycle rows were emitted because all probe simulations
+  ended in `AccountNotFound` / `data_problem`.
+- Probe transport exact decision/V3 continuity was only partial.
+- `probe_skips.jsonl` showed a concurrent append robustness issue.
+
+J3R changes the status model:
+
+```text
+J3 P0R code-level repair: PASS with runtime smoke findings
+J3R code-level repair: target PASS
+R15-r2 runtime smoke: next gate, not claimed complete by J3R
+Full collection / Phase B / P2 / live: HOLD / NO-GO
+```
+
+J3R implementation scope:
+
+- compute the probe candidate feature hash using the same serialized V3 replay
+  payload boundary used by persisted decision rows, instead of trusting a
+  pre-serialization hash field;
+- propagate source decision metadata through selection, transport, and entry:
+  source decision plane, source V3 feature hash, source V3 policy hash, and
+  optional source log path/row metadata when available;
+- prefer source metadata from the probe selection record when writing transport
+  rows, so transport does not silently recompute or substitute a different V3
+  hash;
+- extend transport error rows with simulation diagnostics: error kind/message,
+  missing account pubkey/role when available, account override presence,
+  bonding curve, payer, token program, ATA, curve/mint/payer availability,
+  curve/account diagnostics, and explicit precheck failure reason;
+- add a lightweight probe execution precheck that converts known incomplete
+  execution state into `probe_skipped` with
+  `skip_reason=probe_execution_precheck_failed`, instead of attempting a
+  shadow simulation that can only fail as an opaque data problem;
+- serialize probe selection/skip/transport/entry JSONL writes through a shared
+  writer lock so concurrent probe tasks cannot concatenate JSON objects into a
+  single physical line;
+- harden the join-key audit so a PASS requires exact join to persisted
+  decision/V3 rows by `ab_record_id`, source decision plane, policy hash, and
+  feature hash, with explicit mismatch reason counts;
+- keep legacy/degraded parsing for old probe rows without `ab_record_id`,
+  `probe_id`, or source metadata;
+- introduce a fresh bounded R15-r2 smoke namespace:
+  `shadow-burnin-v3-p37-counterfactual-probe-r15-smoke-r2`.
+
+J3R does not run or claim the R15-r2 runtime smoke. A successful J3R code-level
+repair only authorizes a bounded R15-r2 smoke. It does not authorize broad
+collection, Phase B, P2, live execution, active policy changes, IWIM changes, or
+threshold tuning.
 
 ## Goal
 

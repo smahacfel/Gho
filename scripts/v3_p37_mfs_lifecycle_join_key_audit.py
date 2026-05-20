@@ -30,7 +30,14 @@ FIELD_GROUPS = {
     "observation_end_ts_ms": ("observation_end_ts_ms", "ab_t_end_event_ts_ms"),
     "feature_snapshot_hash": ("v3_feature_snapshot_hash", "feature_snapshot_hash"),
     "v3_policy_config_hash": ("v3_policy_config_hash", "config_hash"),
-    "decision_plane": ("decision_plane",),
+    "source_v3_feature_snapshot_hash": ("source_v3_feature_snapshot_hash",),
+    "source_v3_policy_config_hash": ("source_v3_policy_config_hash",),
+    "transport_v3_feature_snapshot_hash": ("transport_v3_feature_snapshot_hash",),
+    "transport_v3_policy_config_hash": ("transport_v3_policy_config_hash",),
+    "source_decision_log_path": ("source_decision_log_path",),
+    "source_decision_row_offset": ("source_decision_row_offset",),
+    "source_decision_row_sha256": ("source_decision_row_sha256",),
+    "decision_plane": ("decision_plane", "source_decision_plane"),
     "rollout_namespace": ("rollout_namespace", "rollout_profile"),
     "v3_replay_payload": ("v3_replay_payload_schema_version", "v3_replay_payload"),
     "probe_bucket": ("probe_bucket",),
@@ -63,17 +70,23 @@ PROBE_JOIN_ARTIFACTS = (
 def iter_jsonl(path: Path) -> Iterable[dict[str, Any]]:
     if not path.exists():
         return
+    decoder = json.JSONDecoder()
     with path.open("r", encoding="utf-8", errors="ignore") as fh:
         for line in fh:
             raw = line.strip()
             if not raw:
                 continue
-            try:
-                obj = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(obj, dict):
-                yield obj
+            idx = 0
+            while idx < len(raw):
+                try:
+                    obj, end = decoder.raw_decode(raw, idx)
+                except json.JSONDecodeError:
+                    break
+                if isinstance(obj, dict):
+                    yield obj
+                idx = end
+                while idx < len(raw) and raw[idx].isspace():
+                    idx += 1
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -393,6 +406,11 @@ def row_policy_hash(row: dict[str, Any]) -> str | None:
     return str(value) if value is not None else None
 
 
+def row_decision_plane(row: dict[str, Any]) -> str | None:
+    value = first_present(row, FIELD_GROUPS["decision_plane"])
+    return str(value) if value is not None else None
+
+
 def row_has_v3_payload(row: dict[str, Any]) -> bool:
     return first_present(row, FIELD_GROUPS["v3_replay_payload"]) is not None
 
@@ -418,39 +436,59 @@ def probe_decision_join(paths: dict[str, list[Path]]) -> dict[str, Any]:
         unmatched_rows = 0
         feature_hash_mismatch = 0
         policy_hash_mismatch = 0
+        mismatch_reasons: Counter[str] = Counter()
         for row in rows:
             ab_record_id = row_ab_record_id(row)
             if not ab_record_id:
                 unmatched_rows += 1
+                mismatch_reasons["missing_ab_record_id"] += 1
                 continue
             rows_with_ab += 1
             matching_decisions = decision_by_ab.get(ab_record_id, [])
             if not matching_decisions:
                 unmatched_rows += 1
+                mismatch_reasons["decision_row_not_found"] += 1
                 continue
+            if len(matching_decisions) > 1:
+                mismatch_reasons["multiple_decision_rows_for_ab_record_id"] += 1
             joined_to_decision += 1
             if any(row_has_v3_payload(decision) for decision in matching_decisions):
                 joined_to_decision_with_v3_payload += 1
+            else:
+                mismatch_reasons["decision_row_missing_v3_payload"] += 1
 
             feature_hash = row_feature_hash(row)
             policy_hash = row_policy_hash(row)
+            source_plane = row_decision_plane(row)
             feature_match = feature_hash is not None and any(
                 row_feature_hash(decision) == feature_hash for decision in matching_decisions
             )
             policy_match = policy_hash is not None and any(
                 row_policy_hash(decision) == policy_hash for decision in matching_decisions
             )
+            source_plane_match = source_plane is None or any(
+                row_decision_plane(decision) == source_plane for decision in matching_decisions
+            )
             if feature_match:
                 feature_hash_match += 1
-            elif feature_hash is not None:
+            elif feature_hash is None:
+                mismatch_reasons["feature_hash_missing"] += 1
+            else:
                 feature_hash_mismatch += 1
+                mismatch_reasons["feature_hash_mismatch"] += 1
             if policy_match:
                 policy_hash_match += 1
-            elif policy_hash is not None:
+            elif policy_hash is None:
+                mismatch_reasons["policy_hash_missing"] += 1
+            else:
                 policy_hash_mismatch += 1
+                mismatch_reasons["policy_hash_mismatch"] += 1
+            if not source_plane_match:
+                mismatch_reasons["source_plane_mismatch"] += 1
             if (
                 feature_match
                 and policy_match
+                and source_plane_match
                 and any(row_has_v3_payload(decision) for decision in matching_decisions)
             ):
                 exact_decision_v3_join += 1
@@ -466,6 +504,7 @@ def probe_decision_join(paths: dict[str, list[Path]]) -> dict[str, Any]:
             "unmatched_rows": unmatched_rows,
             "feature_hash_mismatch": feature_hash_mismatch,
             "policy_hash_mismatch": policy_hash_mismatch,
+            "mismatch_reasons": dict(sorted(mismatch_reasons.items())),
             "exact_decision_v3_join_coverage": round(exact_decision_v3_join / len(rows), 6)
             if rows
             else 0.0,
