@@ -1407,3 +1407,89 @@ next repair must be one of:
 
 Do not weaken strict precheck and do not infer missing account readiness from
 post-hoc data.
+
+## P3.7-J3I Probe Execution-Account Eligibility Narrowing
+
+### Trigger
+
+R15-r6 produced V3/MFS rows and strict replay OK, and selected probe rows still
+exact-joined to persisted V3 decision rows. All selected probes were stopped by:
+
+```text
+execution_account_not_ready:bonding_curve_v2:<pubkey>
+```
+
+This confirmed that J3H semantics are correct, but it also exposed a quota
+semantics bug: selected but execution-account-not-ready rows consumed the
+`max_probes_per_run` dispatch budget before the probe plane knew whether the row
+was execution-ready.
+
+### Decision
+
+J3I separates candidate scan/diagnosis from dispatch quota:
+
+- selected probe candidates may reserve a bounded scan slot and run eligibility
+  diagnostics;
+- `execution_account_not_ready` rows are logged and counted as skips;
+- not-ready rows do not increment `max_probes_per_run`;
+- `max_probes_per_run`, `max_probes_per_minute`, and dispatch concurrency are
+  consumed only after required execution-account readiness is proven;
+- `bonding_curve_v2` remains a strict core execution account;
+- `creator_vault` remains route-aware and strict only when required by the
+  routed request layout.
+
+This is not a precheck bypass. Strict required-account readiness remains the
+gate before shadow simulation. J3I only prevents non-dispatchable rows from
+exhausting the dispatch probe budget.
+
+### Runtime Shape
+
+The probe runtime state is split into:
+
+```text
+scan reservation:
+  dedupe probe_id
+  bounded scan concurrency
+  no dispatch quota consumption
+
+dispatch reservation:
+  max_probes_per_run
+  max_probes_per_minute
+  dispatch concurrency
+  only after execution-account readiness = ready
+```
+
+If a selected row is not execution-ready, it is written as:
+
+```text
+event_type = probe_skipped
+probe_skip_reason = execution_account_not_ready
+precheck_failure_reason = execution_account_not_ready:<role>:<pubkey>
+execution_account_readiness_status = not_ready
+```
+
+If a row becomes execution-ready but dispatch budget is exhausted, it is written
+as a normal probe skip with `max_probes_per_run_exceeded`,
+`probe_rate_limit_exceeded`, or `probe_concurrency_limit_exceeded`.
+
+### R15-r7 Gate
+
+R15-r7 must use a clean bounded smoke namespace:
+
+```text
+shadow-burnin-v3-p37-counterfactual-probe-r15-smoke-r7
+```
+
+Acceptance:
+
+- V3/MFS strict replay remains OK.
+- Probe selection exact decision/V3 join remains 100%.
+- Not-ready rows do not consume dispatch quota.
+- Dispatch quota is consumed only by execution-ready rows.
+- If execution-ready rows exist, the smoke reaches probe transport/entry or
+  reports a precise simulation/build failure.
+- If no execution-ready rows exist in the scanned candidate universe, the run is
+  `NOT_READY_DIAGNOSED`, not a dispatch-quota failure.
+
+Collection, Phase B, P2, live, active policy changes, IWIM changes and threshold
+tuning remain out of scope.
