@@ -4338,6 +4338,73 @@ impl TriggerComponent {
             && *pubkey == request.user_ata
     }
 
+    fn counterfactual_probe_can_use_missing_ephemeral_payer(
+        request: &PreparedBuyRequest,
+        pubkey: &Pubkey,
+    ) -> bool {
+        request.payer_provenance
+            == Self::payer_provenance_label(TriggerShadowPayerStrategy::Ephemeral)
+            && *pubkey == request.payer_pubkey
+    }
+
+    fn counterfactual_probe_can_use_missing_user_volume_accumulator(
+        request: &PreparedBuyRequest,
+        pubkey: &Pubkey,
+        role: &str,
+    ) -> bool {
+        role == "user_volume_accumulator"
+            && request
+                .build_profile
+                .as_ref()
+                .map(|profile| profile.buy_variant == trigger::PumpfunBuyVariant::RoutedExactSolIn)
+                .unwrap_or(false)
+            && request
+                .build_profile
+                .as_ref()
+                .map(|profile| {
+                    profile
+                        .buy_instruction
+                        .accounts
+                        .get(13)
+                        .map(|account| account.pubkey == *pubkey)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false)
+    }
+
+    fn counterfactual_probe_buy_instruction_account_role_for(
+        request: &PreparedBuyRequest,
+        pubkey: &Pubkey,
+    ) -> Option<&'static str> {
+        let profile = request.build_profile.as_ref()?;
+        let index = profile
+            .buy_instruction
+            .accounts
+            .iter()
+            .position(|account| account.pubkey == *pubkey)?;
+        Some(match index {
+            0 => "global_config",
+            1 => "fee_recipient",
+            2 => "mint",
+            3 => "bonding_curve",
+            4 => "associated_bonding_curve",
+            5 => "user_ata",
+            6 => "payer_pubkey",
+            7 => "system_program",
+            8 => "token_program",
+            9 => "creator_vault",
+            10 => "event_authority",
+            11 => "pump_program",
+            12 => "global_volume_accumulator",
+            13 => "user_volume_accumulator",
+            14 => "fee_config",
+            15 => "fee_program",
+            16 => "bonding_curve_v2",
+            17 => "buyback_fee_recipient",
+            _ => "buy_instruction_account",
+        })
+    }
+
     fn counterfactual_probe_account_role_for(
         request: &PreparedBuyRequest,
         pubkey: &Pubkey,
@@ -4408,6 +4475,11 @@ impl TriggerComponent {
                 }
             }
         }
+        if let Some(role) =
+            Self::counterfactual_probe_buy_instruction_account_role_for(request, pubkey)
+        {
+            return role.to_string();
+        }
         "transaction_account".to_string()
     }
 
@@ -4418,6 +4490,14 @@ impl TriggerComponent {
         let mut accounts = Vec::new();
         let mut push_account = |pubkey: Pubkey, role: String| {
             if Self::counterfactual_probe_can_create_missing_user_ata(request, &pubkey) {
+                return;
+            }
+            if Self::counterfactual_probe_can_use_missing_ephemeral_payer(request, &pubkey) {
+                return;
+            }
+            if Self::counterfactual_probe_can_use_missing_user_volume_accumulator(
+                request, &pubkey, &role,
+            ) {
                 return;
             }
             if seen.insert(pubkey) {
@@ -8195,6 +8275,109 @@ mod tests {
         assert!(!roles
             .iter()
             .any(|(pubkey, role)| *pubkey == request.user_ata && role == "user_ata"));
+    }
+
+    #[test]
+    fn p37_counterfactual_probe_required_accounts_skip_ephemeral_payer() {
+        let config = create_test_config();
+        let trigger =
+            TriggerComponent::new_with_shadow_simulator(config, Arc::new(MockShadowSimulator));
+        let payer = Keypair::new();
+        let mint = Pubkey::new_unique();
+        let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).expect("valid token program");
+        let amount_lamports = trigger
+            .configured_trade_amount_lamports()
+            .expect("configured amount");
+        let mut request = trigger
+            .build_prepared_buy_request(
+                &payer,
+                &mint,
+                &token_program,
+                false,
+                &valid_buy_account_overrides(),
+                amount_lamports,
+                1_000_000,
+                Hash::new_unique(),
+            )
+            .expect("prepared request");
+        request.payer_provenance =
+            TriggerComponent::payer_provenance_label(TriggerShadowPayerStrategy::Ephemeral);
+
+        let roles = TriggerComponent::counterfactual_probe_required_account_roles(&request);
+
+        assert!(!roles
+            .iter()
+            .any(|(pubkey, role)| *pubkey == request.payer_pubkey && role == "payer_pubkey"));
+        assert!(roles
+            .iter()
+            .any(|(pubkey, role)| *pubkey == request.mint && role == "mint"));
+        assert!(roles
+            .iter()
+            .any(|(pubkey, role)| *pubkey == request.token_program && role == "token_program"));
+        assert!(roles
+            .iter()
+            .any(|(pubkey, role)| *pubkey == request.user_ata && role == "user_ata"));
+    }
+
+    #[test]
+    fn p37_counterfactual_probe_required_accounts_skip_routed_user_volume_accumulator() {
+        let config = create_test_config();
+        let trigger =
+            TriggerComponent::new_with_shadow_simulator(config, Arc::new(MockShadowSimulator));
+        let payer = Keypair::new();
+        let mint = Pubkey::new_unique();
+        let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).expect("valid token program");
+        let amount_lamports = trigger
+            .configured_trade_amount_lamports()
+            .expect("configured amount");
+        let request = trigger
+            .build_prepared_buy_request(
+                &payer,
+                &mint,
+                &token_program,
+                false,
+                &valid_buy_account_overrides(),
+                amount_lamports,
+                1_000_000,
+                Hash::new_unique(),
+            )
+            .expect("prepared request");
+        let user_volume_accumulator = request
+            .build_profile
+            .as_ref()
+            .expect("build profile")
+            .buy_instruction
+            .accounts
+            .get(13)
+            .expect("routed user volume accumulator")
+            .pubkey;
+
+        assert_eq!(
+            TriggerComponent::counterfactual_probe_account_role_for(
+                &request,
+                &user_volume_accumulator,
+            ),
+            "user_volume_accumulator"
+        );
+
+        let roles = TriggerComponent::counterfactual_probe_required_account_roles(&request);
+
+        assert!(!roles
+            .iter()
+            .any(|(pubkey, role)| *pubkey == user_volume_accumulator
+                && role == "user_volume_accumulator"));
+        assert!(roles
+            .iter()
+            .any(|(pubkey, role)| *pubkey == request.mint && role == "mint"));
+        assert!(roles.iter().any(|(_, role)| role == "bonding_curve"));
+        assert!(roles.iter().any(|(pubkey, role)| {
+            let fee_config_pubkey = request
+                .build_profile
+                .as_ref()
+                .and_then(|profile| profile.buy_instruction.accounts.get(14))
+                .map(|account| account.pubkey);
+            fee_config_pubkey == Some(*pubkey) && role == "fee_config"
+        }));
     }
 
     #[test]

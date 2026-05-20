@@ -1029,3 +1029,307 @@ Full R14: HOLD
 Phase B V3 selector prototype: HOLD
 P2/live: NO-GO
 ```
+
+## P3.7-J3E Probe Payer / Account Resolution
+
+### Trigger
+
+R15-r3 after J3R2 produced strict-clean V3/MFS replay evidence and exact
+selection-to-decision hash continuity, but every selected probe was stopped by
+the required-account precheck:
+
+```text
+missing_required_account:payer_pubkey:HvLVQMA4...
+```
+
+No probe transport or entry rows were generated, so collection remains blocked.
+
+### Diagnosis
+
+The payer is not a live or configured wallet in the R15 counterfactual probe
+profile. It is the launcher-local shadow payer created by:
+
+```toml
+[trigger.shadow_run]
+payer_strategy = "ephemeral"
+sig_verify = false
+replace_recent_blockhash = true
+```
+
+The runtime source is `TriggerComponent::load_payer()` and the cached
+`cached_shadow_ephemeral_payer`. This payer is intentionally local to the
+shadow-only simulation lane and is not expected to be chain-visible. It must not
+be treated as live inclusion proof, funded wallet evidence, or active BUY
+authorization.
+
+### Precheck Semantics
+
+For counterfactual probe precheck:
+
+- `payer_provenance="ephemeral"` is not a required on-chain execution account.
+- Missing ephemeral payer must not stop probe eligibility before simulation.
+- `payer_provenance="configured"` remains strict-required.
+- True execution accounts remain strict-required: mint, token program, global
+  config, fee recipient, creator, associated bonding curve, and user ATA unless
+  the prepared request includes an idempotent ATA create.
+- If RPC simulation later returns `AccountNotFound`, that remains a real
+  simulation/data problem and must be reported. It is not success.
+
+This keeps the probe plane aligned with the existing shadow-only
+`payer_strategy="ephemeral"` contract without disabling the account precheck
+globally.
+
+### Implementation Scope
+
+P3.7-J3E only changes the counterfactual probe required-account precheck:
+
+- add an explicit allowance for missing `ephemeral` payer,
+- preserve strict handling for configured payer,
+- preserve strict handling for real execution accounts,
+- add targeted tests for both paths,
+- create a fresh R15-r4 smoke profile.
+
+### R15-r4 Gate
+
+R15-r4 must use a clean namespace:
+
+```text
+shadow-burnin-v3-p37-counterfactual-probe-r15-smoke-r4
+```
+
+Acceptance:
+
+- V3/MFS strict replay remains OK.
+- Probe selection exact decision/V3 join remains 100%.
+- Selected probes no longer all stop on `missing_required_account:payer_pubkey`.
+- Any remaining missing account is reported with a precise role/pubkey.
+- Probe transport/entry rows are evaluated as runtime evidence only if they
+  are actually produced.
+
+Collection, Phase B, P2, live, active policy changes, IWIM changes, and
+threshold tuning remain out of scope.
+
+## P3.7-J3F Probe Required Transaction Account Resolution
+
+### Trigger
+
+R15-r4 confirmed that the J3E payer repair worked:
+
+```text
+missing_required_account:payer_pubkey no longer blocks selected probes
+```
+
+The next blocker was:
+
+```text
+missing_required_account:transaction_account:4NpkpkjPC9DYD2nSLsmLWKBsLXEPgZSkXySpwUoMgiLL
+```
+
+for all selected probes. No probe transport or entry rows were generated.
+
+### Diagnosis
+
+The missing account is not a generic unknown account from the V3 row. It is
+introduced by the routed `DirectBuyBuilder::build_buy_ix_with_accounts(...)`
+instruction. The account has the same pubkey across selected probes because it
+is derived from the stable ephemeral shadow payer, not from the mint.
+
+The routed pump.fun `buy_exact_sol_in` account layout includes:
+
+```text
+account[12] = global_volume_accumulator
+account[13] = user_volume_accumulator
+account[14] = fee_config
+account[15] = fee_program
+account[16] = bonding_curve_v2
+account[17] = buyback_fee_recipient
+```
+
+J3F resolves the generic `transaction_account` role by mapping routed buy
+instruction account positions into explicit roles. The missing account from
+R15-r4 maps to `user_volume_accumulator`.
+
+### Precheck Semantics
+
+For counterfactual probe precheck:
+
+- `user_volume_accumulator` is a per-payer routed pump.fun volume PDA.
+- Missing `user_volume_accumulator` should not stop probe eligibility before
+  simulation, because the probe purpose is to learn whether the exact prepared
+  transaction can simulate under current runtime conditions.
+- Missing `user_volume_accumulator` is not success. If simulation still returns
+  AccountNotFound, it remains a simulation/data problem and must be reported.
+- Other routed buy accounts remain strict unless separately justified: mint,
+  token program, global config, fee recipient, bonding curve, associated bonding
+  curve, creator vault, event authority, pump program, global volume
+  accumulator, fee config, fee program, bonding_curve_v2 and buyback fee
+  recipient.
+
+### Implementation Scope
+
+P3.7-J3F only changes counterfactual probe account role resolution:
+
+- map known `DirectBuyBuilder` routed buy account indices to explicit roles;
+- allow missing `user_volume_accumulator` through precheck for routed probe
+  requests only;
+- keep strict handling for true required execution accounts;
+- add targeted tests for the role mapping and strict-account preservation;
+- create a fresh R15-r5 smoke profile.
+
+### R15-r5 Gate
+
+R15-r5 must use a clean namespace:
+
+```text
+shadow-burnin-v3-p37-counterfactual-probe-r15-smoke-r5
+```
+
+Acceptance:
+
+- V3/MFS strict replay remains OK.
+- Probe selection exact decision/V3 join remains 100%.
+- Selected probes no longer all stop on
+  `missing_required_account:user_volume_accumulator` or generic
+  `transaction_account` for the known routed user-volume PDA.
+- Any remaining missing account is reported with a precise role/pubkey.
+- Probe transport/entry rows are evaluated as runtime evidence only if they
+  are actually produced.
+
+Collection, Phase B, P2, live, active policy changes, IWIM changes, and
+threshold tuning remain out of scope.
+
+### R15-r5 Result
+
+R15-r5 was run as a bounded smoke after J3F.
+
+Observed result:
+
+```text
+v3_rows = 169
+strict replay status = full_replay_ok
+strict replay bad_rows = 0
+probe_selection_rows = 5
+probe_transport_rows = 0
+probe_entry_rows = 0
+active_shadow_transport_rows = 0
+active_shadow_entry_rows = 0
+```
+
+J3F fixed the R15-r4 blocker: no selected probe was stopped by the routed
+`user_volume_accumulator` account and no selected probe reported a generic
+`transaction_account` blocker for the known user-volume PDA.
+
+The runtime gate remains not ready. The five selected probes were stopped by
+strict precheck failures on true routed execution accounts:
+
+```text
+missing_required_account:bonding_curve_v2 = 4
+missing_required_account:creator_vault = 1
+```
+
+Decision/V3 hash continuity for probe selection remained clean:
+
+```text
+probe_selection exact decision/V3 join = 5/5
+feature_hash_mismatch = 0
+policy_hash_mismatch = 0
+```
+
+Decision:
+
+```text
+P3.7-J3F code-level repair: PASS
+R15-r5 runtime smoke: NOT_READY_DIAGNOSED
+Full / bounded collection: HOLD
+Phase B / P2 / live / tuning: NO-GO
+```
+
+The next implementation stage should not weaken required-account precheck.
+It should decide how counterfactual probes obtain or wait for strict routed
+execution accounts such as `bonding_curve_v2` and `creator_vault`, while
+preserving decision-time safety and exact join-key continuity.
+
+## P3.7-J3G Probe Strict Execution Account Readiness
+
+### Trigger
+
+R15-r5 confirmed that J3F removed the payer, routed user-volume, and generic
+`transaction_account` blockers. The remaining selected-probe blockers were
+strict execution accounts:
+
+```text
+missing_required_account:bonding_curve_v2 = 4
+missing_required_account:creator_vault = 1
+```
+
+No probe transport or entry rows were generated, so collection remained
+blocked.
+
+### Audit Scope
+
+J3G adds an offline readiness audit:
+
+```text
+scripts/v3_p37_probe_execution_account_readiness_report.py
+```
+
+The audit correlates:
+
+- `probe_selection.jsonl`,
+- `probe_skips.jsonl`,
+- persisted Gatekeeper/V3 decision rows,
+- V3/MFS snapshots,
+- system/oracle logs for required-account update evidence.
+
+The audit is read-only. It does not dispatch probes, bypass precheck, change
+sampling, or touch active policy.
+
+### R15-r5 Account Readiness Result
+
+J3G diagnosed all five selected R15-r5 probes:
+
+```text
+selected_probe_rows = 5
+diagnosed_selected_probe_rows = 5
+exact_decision_v3_join_rows = 5
+missing_account_roles = {"bonding_curve_v2": 4, "creator_vault": 1}
+classification = override_present_but_account_missing_on_rpc for 5/5
+```
+
+Interpretation:
+
+- the required pubkeys were present in the prepared transaction account set;
+- processed RPC/precheck did not find those accounts;
+- no `DIAG_ACCOUNT_UPDATE_RELAY` evidence was found for the required pubkeys;
+- the source decision rows had V3/MFS snapshots with curve/account evidence
+  marked clean/ready;
+- the MFS snapshots do not explicitly materialize `bonding_curve_v2` or
+  `creator_vault` account identities/readiness.
+
+This is a diagnosed execution-account readiness gap, not a join-key or payer
+problem.
+
+### Decision
+
+```text
+P3.7-J3G account readiness audit: PASS
+R15-r5 runtime smoke: NOT_READY_DIAGNOSED
+Full / bounded collection: HOLD
+Phase B / P2 / live / tuning: NO-GO
+```
+
+Next stage:
+
+```text
+P3.7-J3H Probe Execution-Account Eligibility
+```
+
+J3H must choose a concrete decision-time-safe fix before R15-r6:
+
+- add explicit additive materialization/readiness for strict execution accounts,
+- or restrict probe eligibility to rows with known execution-account readiness,
+- or add a bounded decision-time-safe wait for those accounts,
+- or repair a proven account override/build path mismatch.
+
+J3H must not weaken strict precheck, use post-hoc account guessing, increase
+probe limits, or treat missing core execution accounts as success.
