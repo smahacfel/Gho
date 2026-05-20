@@ -1494,6 +1494,75 @@ Acceptance:
 Collection, Phase B, P2, live, active policy changes, IWIM changes and threshold
 tuning remain out of scope.
 
+## P3.7-J3Q5 Probe Amount / Slippage Diagnostic
+
+### Trigger
+
+R15-r8n produced five counterfactual probe transport rows and five probe
+shadow-entry rows. Four were simulated and one reached the Pump.fun program but
+failed with:
+
+```text
+InstructionError(3, Custom(6002))
+TooMuchSolRequired
+Left = 7000000
+Right = 11425995
+```
+
+The join-key, V3 replay and active BUY mutation gates were clean. The remaining
+question is whether this error is an isolated classified probe error or a
+systematic amount/slippage/token-param construction problem.
+
+### Finding
+
+All five R15-r8n probes had the same high-level setup:
+
+```text
+probe_bucket = v3_reject_manipulation_contradiction
+route_kind = legacy_buy
+amount_lamports = 7000000
+probe_slippage_bps = 2000
+```
+
+The error row required `1.632285x` the configured max SOL:
+
+```text
+max_sol = 7_000_000 lamports
+program_required_sol = 11_425_995 lamports
+```
+
+Because R15-r8n predates the new token-param transport fields, Q5 can classify
+the family as `simulation_slippage_or_price_mismatch`, but cannot yet
+definitively split it into amount-too-large, stale quote, token-param mismatch
+or buy-variant mismatch.
+
+### Decision
+
+Do not go directly to the first 25+ probe collection from R15-r8n alone. Run one
+tiny token-param-aware smoke first:
+
+```text
+P3.7-J3Q5b token-param-aware smoke
+```
+
+Acceptance for Q5b:
+
+- probe transport and entry rows exist;
+- exact decision/V3 join remains 100%;
+- transport rows carry `buy_variant`, `token_param_role`,
+  `entry_token_amount_raw`, and `min_tokens_out`;
+- `TooMuchSolRequired`, if present, is sub-classified;
+- active BUY remains absent;
+- no live/P2 path is touched.
+
+If Q5b shows isolated and well-classified amount/slippage errors, a small
+bounded collection can start with explicit error-class reporting. If Q5b shows
+systematic `TooMuchSolRequired`, repair probe amount/quote construction or run a
+tiny amount-variant smoke before collection.
+
+Collection, Phase B, P2, live, active policy changes, IWIM changes and threshold
+tuning remain out of scope.
+
 ## P3.7-J3Q4 Probe Simulation Instruction Error Classification
 
 ### Trigger
