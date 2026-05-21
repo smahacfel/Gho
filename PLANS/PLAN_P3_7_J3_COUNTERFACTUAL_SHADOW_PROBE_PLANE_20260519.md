@@ -1494,6 +1494,157 @@ Acceptance:
 Collection, Phase B, P2, live, active policy changes, IWIM changes and threshold
 tuning remain out of scope.
 
+## P3.7-J4B Probe Lifecycle Truth Resolution / Runtime Retention
+
+### Trigger
+
+J4 validated the counterfactual probe lifecycle handoff:
+
+```text
+probe_shadow_entry -> PostBuySubmitted(lane=probe) -> probe monitor -> probe_shadow_lifecycle
+```
+
+The J4 bounded run produced probe lifecycle rows with exact `ab_record_id`,
+`probe_id`, and V3 hash continuity, but every probe lifecycle row closed as:
+
+```text
+truth_status = failure
+truth_detail = shadow time-stop expired before any canonical snapshot reached guardian
+```
+
+The handoff was therefore fixed, but economic truth resolution was not yet
+validated.
+
+### Diagnosis
+
+The failure is not a Gatekeeper decision-rate problem and not a probe
+transport/entry problem. Runtime logs showed the following sequence for probe
+rows:
+
+1. `DIAG_ACCOUNT_UPDATE_RELAY` and `DIAG_ACCOUNT_UPDATE_APPLIED` existed before
+   the decision.
+2. The pool reached a terminal REJECT/TIMEOUT decision.
+3. `pool_task_done_cleanup` removed `AccountStateCore`, `ShadowLedger`
+   snapshots, curve aliases, live-pipeline mint state, and pending account
+   updates for the base mint.
+4. Counterfactual probe dispatch and `PostBuySubmitted(lane=probe)` happened
+   asynchronously after that cleanup.
+5. The probe monitor accepted the position but timed out without any canonical
+   snapshot reaching the guardian.
+
+That means the probe monitor was correctly registered, but the runtime truth
+state it depends on was removed before the probe lifecycle could use it.
+
+### Repair
+
+J4B makes counterfactual probe dispatch request runtime retention for the pool.
+When a probe row passes selection/precheck and reserves a scan slot for
+background dispatch, `maybe_handle_p37_shadow_probe_decision` returns a
+retention flag to the pool observation result. The pool router then treats the
+terminal decision as:
+
+```text
+retain_runtime_pool = true
+```
+
+for that pool, preventing `pool_task_done_cleanup` from deleting canonical
+runtime truth while the probe lifecycle monitor is active.
+
+The repair is intentionally narrow:
+
+- no active verdict changes;
+- no Gatekeeper threshold changes;
+- no IWIM changes;
+- no P2/live changes;
+- no lifecycle fallback to synthetic or stale shadow prices;
+- no bypass of canonical snapshot requirements.
+
+### Validation Gate
+
+The next bounded smoke must use a fresh namespace:
+
+```text
+shadow-burnin-v3-p37-counterfactual-probe-r15-bounded-j4b-r1
+```
+
+Acceptance:
+
+- V3/MFS strict replay remains OK.
+- Probe selection/transport/entry/lifecycle exact decision/V3 join remains
+  100%.
+- Probe lifecycle rows are still emitted only under
+  `dispatch_source=counterfactual_shadow_probe`.
+- Probe positions no longer close only because no canonical snapshot ever
+  reached the guardian.
+- If lifecycle truth remains `failure`, the report must distinguish
+  no-snapshot, stale snapshot, unnormalizable price, and exit-truth failures.
+
+Collection, Phase B, P2, live, active policy changes, IWIM changes and threshold
+tuning remain out of scope until J4B runtime evidence is reviewed.
+
+## P3.7-J4C Probe On-Chain Lifecycle Report / Label Repair
+
+### Trigger
+
+J4B validated probe runtime retention and produced resolved lifecycle truth:
+
+```text
+probe_transport_rows = 25
+probe_shadow_entry_rows = 25
+probe_shadow_lifecycle_rows = 48
+truth_status = resolved
+truth_source = canonical_account_state_snapshot
+```
+
+However the post-run reporting gate failed before labels could be generated:
+
+```text
+NameError: name 'lifecycle' is not defined
+```
+
+The failure was in `scripts/shadow_onchain_lifecycle_report.py`, not in the
+runtime probe lifecycle. The report also only knew the active shadow artifact
+paths by default, while P3.7 probe rows live under `[p37_shadow_probe]`.
+
+### Repair
+
+J4C makes the reporting path probe-compatible while preserving the existing
+shadow default:
+
+- add `--artifact-plane {shadow,probe}` and `--probe`;
+- when `--probe` is used, read `[p37_shadow_probe]` transport, entry and
+  lifecycle paths;
+- preserve `probe_id`, `dispatch_source`, `source_ab_record_id`, `run_id` and
+  `session_id` in report rows additively;
+- fix the undefined lifecycle variable by coalescing join metadata from the
+  current lifecycle bundle;
+- allow the P3.7 lifecycle labeler to classify
+  `counterfactual_shadow_probe_simulated` as a valid shadow/probe simulated
+  execution outcome without treating it as an active BUY.
+
+### J4B Artifact Revalidation
+
+J4C reuses the already collected J4B namespace:
+
+```text
+shadow-burnin-v3-p37-counterfactual-probe-r15-bounded-j4b-r1
+```
+
+Acceptance:
+
+- probe on-chain lifecycle report writes rows successfully;
+- report rows carry exact `ab_record_id`, `probe_id`, dispatch source and V3
+  hashes;
+- lifecycle labels are generated from probe rows;
+- feature availability joins lifecycle labels to V3/MFS decision rows by exact
+  `ab_record_id`;
+- Phase B remains blocked unless sample size and class balance meet explicit
+  selector-readiness minimums.
+
+Collection, Phase B, P2, live, active policy changes, IWIM changes and threshold
+tuning remain out of scope until J4C reporting and feature availability results
+are reviewed.
+
 ## P3.7-J4 Probe Lifecycle Handoff / Post-Buy Monitor Validation
 
 ### Trigger

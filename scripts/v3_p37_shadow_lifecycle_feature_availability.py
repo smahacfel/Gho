@@ -674,7 +674,7 @@ def build_report(
 
 def render_markdown(report: dict[str, Any]) -> str:
     lines: list[str] = []
-    lines.append("# P3.7 Shadow Lifecycle Feature Availability - Buy Heavy Rerun")
+    lines.append("# P3.7 Shadow Lifecycle Feature Availability")
     lines.append("")
     lines.append(f"Feature availability status: `{report['feature_availability_status']}`")
     lines.append(f"Phase B possible: `{str(report['phase_b_possible']).lower()}`")

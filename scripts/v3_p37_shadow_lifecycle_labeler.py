@@ -20,11 +20,20 @@ from typing import Any, Iterable
 SCHEMA_VERSION = 1
 JOIN_METADATA_FIELDS = (
     "ab_record_id",
+    "source_ab_record_id",
+    "probe_id",
+    "dispatch_source",
     "v3_feature_snapshot_hash",
     "v3_policy_config_hash",
     "decision_plane",
     "rollout_namespace",
+    "run_id",
+    "session_id",
 )
+SHADOW_SIMULATED_OUTCOMES = {
+    "shadow_simulated",
+    "counterfactual_shadow_probe_simulated",
+}
 GOOD_EXECUTION_CLASSES = {
     "shadow_onchain_finalized_verified",
     "shadow_onchain_confirmed_verified",
@@ -169,7 +178,7 @@ def classify_execution(row: dict[str, Any]) -> tuple[str, str | None]:
     if row.get("truth_source") not in {"canonical_account_state_snapshot", "diag_account_update_relay"}:
         return "shadow_onchain_degraded", "truth_source_noncanonical_or_unknown"
     execution_outcome = nested(row, "shadow", "execution_outcome")
-    if execution_outcome != "shadow_simulated":
+    if execution_outcome not in SHADOW_SIMULATED_OUTCOMES:
         if isinstance(execution_outcome, str) and "error" in execution_outcome.lower():
             return "shadow_execution_infeasible", "shadow_execution_error"
         return "shadow_execution_unknown", "shadow_execution_outcome_not_simulated"
@@ -464,7 +473,7 @@ def phase_f_acceptance(labels: list[dict[str, Any]]) -> bool:
 
 def render_markdown(summary: dict[str, Any]) -> str:
     lines: list[str] = []
-    lines.append("# P3.7 Shadow Lifecycle Labels - Buy Heavy Rerun")
+    lines.append("# P3.7 Shadow Lifecycle Labels")
     lines.append("")
     lines.append(f"Source: `{summary['source']}`")
     lines.append(f"Output: `{summary['output']}`")

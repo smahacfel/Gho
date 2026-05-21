@@ -34,10 +34,15 @@ LEGACY_PRICE_SCALE = PUMP_TOKEN_DECIMAL_FACTOR_F64
 DEFAULT_MAX_BUY_MATCH_DRIFT_MS = 60_000
 JOIN_METADATA_FIELDS = (
     "ab_record_id",
+    "source_ab_record_id",
+    "probe_id",
+    "dispatch_source",
     "v3_feature_snapshot_hash",
     "v3_policy_config_hash",
     "decision_plane",
     "rollout_namespace",
+    "run_id",
+    "session_id",
 )
 ISO_TS_RE = re.compile(
     r"^(?P<head>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?P<fraction>\.\d+)?(?P<tz>Z|[+-]\d{2}:\d{2})$"
@@ -54,6 +59,7 @@ DIAG_ACCOUNT_UPDATE_RELAY_RE = re.compile(
 @dataclass(slots=True)
 class Inputs:
     config_path: Path
+    artifact_plane: str
     gatekeeper_buys_log: Path
     shadow_transport_log: Path
     shadow_entry_log: Path
@@ -248,6 +254,20 @@ def parse_args() -> argparse.Namespace:
         help="Analyze all available sessions instead of defaulting to the latest run.",
     )
     parser.add_argument(
+        "--artifact-plane",
+        choices=("shadow", "probe"),
+        default="shadow",
+        help=(
+            "Artifact plane to analyze. Use probe for [p37_shadow_probe] "
+            "transport/entry/lifecycle paths."
+        ),
+    )
+    parser.add_argument(
+        "--probe",
+        action="store_true",
+        help="Shortcut for --artifact-plane probe.",
+    )
+    parser.add_argument(
         "--max-truth-gap-ms",
         type=int,
         help=(
@@ -261,25 +281,42 @@ def parse_args() -> argparse.Namespace:
 def resolve_inputs(args: argparse.Namespace) -> Inputs:
     config_path = resolve_config_path(args.config)
     config = load_toml(config_path)
+    artifact_plane = "probe" if args.probe else args.artifact_plane
     shadow_cfg = config.get("execution", {}).get("shadow", {})
     trigger_shadow_cfg = config.get("trigger", {}).get("shadow_run", {})
+    probe_cfg = config.get("p37_shadow_probe", {})
     decision_dir = resolve_runtime_path(
         config_path,
         config.get("oracle", {}).get("decision_log_path", "logs/decisions"),
     )
     preferred_plane = preferred_gatekeeper_decision_plane("shadow")
-    shadow_entry_log = resolve_runtime_path(
-        config_path,
-        shadow_cfg.get("entry_log_path", "logs/shadow_run/shadow_entries.jsonl"),
-    )
-    shadow_lifecycle_log = resolve_runtime_path(
-        config_path,
-        shadow_cfg.get("lifecycle_log_path") or derive_shadow_lifecycle_log_path(shadow_entry_log),
-    )
-    shadow_transport_log = resolve_runtime_path(
-        config_path,
-        trigger_shadow_cfg.get("output_path", "logs/shadow_run/buys.jsonl"),
-    )
+    if artifact_plane == "probe":
+        missing_probe_paths = [
+            field
+            for field in ("transport_log_path", "entry_log_path", "lifecycle_log_path")
+            if not isinstance(probe_cfg.get(field), str) or not probe_cfg.get(field)
+        ]
+        if missing_probe_paths:
+            raise SystemExit(
+                "[p37_shadow_probe] is missing required report path(s): "
+                + ", ".join(missing_probe_paths)
+            )
+        shadow_transport_log = resolve_runtime_path(config_path, probe_cfg["transport_log_path"])
+        shadow_entry_log = resolve_runtime_path(config_path, probe_cfg["entry_log_path"])
+        shadow_lifecycle_log = resolve_runtime_path(config_path, probe_cfg["lifecycle_log_path"])
+    else:
+        shadow_entry_log = resolve_runtime_path(
+            config_path,
+            shadow_cfg.get("entry_log_path", "logs/shadow_run/shadow_entries.jsonl"),
+        )
+        shadow_lifecycle_log = resolve_runtime_path(
+            config_path,
+            shadow_cfg.get("lifecycle_log_path") or derive_shadow_lifecycle_log_path(shadow_entry_log),
+        )
+        shadow_transport_log = resolve_runtime_path(
+            config_path,
+            trigger_shadow_cfg.get("output_path", "logs/shadow_run/buys.jsonl"),
+        )
     events_dir = resolve_runtime_path(
         config_path,
         config.get("execution", {}).get("events", {}).get("output_dir", "datasets/events"),
@@ -296,11 +333,13 @@ def resolve_inputs(args: argparse.Namespace) -> Inputs:
         raise SystemExit("--session-end-ms must be >= --session-start-ms")
     if args.output is None:
         scope = str(session_start_ms) if session_start_ms is not None else "all"
-        output_path = shadow_entry_log.parent / f"shadow_onchain_lifecycle_report_{scope}.jsonl"
+        prefix = "probe_shadow_onchain_lifecycle_report" if artifact_plane == "probe" else "shadow_onchain_lifecycle_report"
+        output_path = shadow_entry_log.parent / f"{prefix}_{scope}.jsonl"
     else:
         output_path = resolve_runtime_path(config_path, str(args.output))
     return Inputs(
         config_path=config_path,
+        artifact_plane=artifact_plane,
         gatekeeper_buys_log=resolve_gatekeeper_log_path(
             decision_dir,
             BUY_LOG_NAME,
@@ -533,7 +572,7 @@ def load_shadow_transport_records(inputs: Inputs) -> dict[str, ShadowTransportRe
             join_metadata=join_metadata_from_row(row),
             candidate_id=candidate_id,
             base_mint=str(row.get("base_mint", "")),
-            pool_id=str(row.get("pool_amm_id", "")),
+            pool_id=str(row.get("pool_amm_id") or row.get("pool_id") or ""),
             decision_ts_ms=decision_ts_ms,
             sim_started_ts_ms=int_or_none(row.get("sim_started_ts_ms")),
             sim_finished_ts_ms=int_or_none(row.get("sim_finished_ts_ms")),
@@ -1327,7 +1366,7 @@ def analyze_positions(
                 entry.join_metadata if entry is not None else None,
                 closed.join_metadata,
                 gatekeeper_buy.join_metadata if gatekeeper_buy is not None else None,
-                *(fill.join_metadata for fill in lifecycle.exit_fills),
+                *(fill.join_metadata for fill in bundle.exit_fills),
             )
         )
         rows.append(row)
@@ -1355,6 +1394,7 @@ def summarize(
     )
     lines = [
         "Shadow lifecycle on-chain report",
+        f"artifact_plane={inputs.artifact_plane}",
         f"scope_start_ms={inputs.session_start_ms} scope_end_ms={inputs.session_end_ms}",
         f"session_run_id={inputs.session_run_id}",
         f"rows_written={len(rows)} output={inputs.output_path}",

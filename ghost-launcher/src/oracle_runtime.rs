@@ -7183,14 +7183,15 @@ async fn maybe_handle_p37_shadow_probe_decision(
     pool_data: Option<Arc<DetectedPool>>,
     buffered_txs: &[crate::components::gatekeeper::GatekeeperBufferedTx],
     base_mint_pubkey: Option<Pubkey>,
-) {
+) -> bool {
     let config = &ctx.p37_shadow_probe_config;
     if !config.enabled {
-        return;
+        return false;
     }
     let candidate =
         P37ShadowProbeCandidate::from_gatekeeper_log(log, &ctx.gatekeeper_rollout_profile);
     let mut record = p37_shadow_probe_selection_record(config, &candidate, current_time_ms());
+    let mut retain_runtime_pool_for_probe_lifecycle = false;
 
     if record.event_type == "probe_selected" {
         if ctx.trigger.is_none() {
@@ -7218,38 +7219,50 @@ async fn maybe_handle_p37_shadow_probe_decision(
                 pool_data,
             ) {
                 record = p37_shadow_probe_as_precheck_skip(record, reason);
-            } else if let Err(reason) = ctx
-                .p37_shadow_probe_state
-                .try_reserve_scan_slot(config, &record)
-                .map(|()| {
-                    let trigger_component = ctx.trigger.as_ref().map(Arc::clone);
-                    let pool_data = Some(Arc::clone(pool_data));
-                    let buffered_txs = buffered_txs.to_vec();
-                    let buy_mint = Some(buy_mint);
-                    let config = config.clone();
-                    let oracle_runtime = Arc::clone(&ctx.oracle_runtime);
-                    let runtime_state = Arc::clone(&ctx.p37_shadow_probe_state);
-                    let post_buy_tx = ctx.post_buy_tx.clone();
-                    let post_buy_epoch = Arc::clone(&ctx.post_buy_epoch);
-                    if let (Some(trigger_component), Some(pool_data), Some(buy_mint)) =
-                        (trigger_component, pool_data, buy_mint)
-                    {
-                        tokio::spawn(run_p37_shadow_probe_dispatch(
-                            config,
-                            trigger_component,
-                            oracle_runtime,
-                            runtime_state,
-                            post_buy_tx,
-                            post_buy_epoch,
-                            record.clone(),
-                            pool_data,
-                            buffered_txs,
-                            buy_mint,
-                        ));
+            } else {
+                match ctx
+                    .p37_shadow_probe_state
+                    .try_reserve_scan_slot(config, &record)
+                {
+                    Ok(()) => {
+                        retain_runtime_pool_for_probe_lifecycle = true;
+                        info!(
+                            pool = %record.pool_id,
+                            base_mint = ?record.base_mint,
+                            probe_id = ?record.probe_id,
+                            source_ab_record_id = ?record.source_ab_record_id,
+                            "P37_SHADOW_PROBE_RUNTIME_RETENTION_REQUESTED"
+                        );
+                        let trigger_component = ctx.trigger.as_ref().map(Arc::clone);
+                        let pool_data = Some(Arc::clone(pool_data));
+                        let buffered_txs = buffered_txs.to_vec();
+                        let buy_mint = Some(buy_mint);
+                        let config = config.clone();
+                        let oracle_runtime = Arc::clone(&ctx.oracle_runtime);
+                        let runtime_state = Arc::clone(&ctx.p37_shadow_probe_state);
+                        let post_buy_tx = ctx.post_buy_tx.clone();
+                        let post_buy_epoch = Arc::clone(&ctx.post_buy_epoch);
+                        if let (Some(trigger_component), Some(pool_data), Some(buy_mint)) =
+                            (trigger_component, pool_data, buy_mint)
+                        {
+                            tokio::spawn(run_p37_shadow_probe_dispatch(
+                                config,
+                                trigger_component,
+                                oracle_runtime,
+                                runtime_state,
+                                post_buy_tx,
+                                post_buy_epoch,
+                                record.clone(),
+                                pool_data,
+                                buffered_txs,
+                                buy_mint,
+                            ));
+                        }
                     }
-                })
-            {
-                record = p37_shadow_probe_as_skip(record, reason);
+                    Err(reason) => {
+                        record = p37_shadow_probe_as_skip(record, reason);
+                    }
+                }
             }
         }
     }
@@ -7262,6 +7275,7 @@ async fn maybe_handle_p37_shadow_probe_decision(
             "P37_SHADOW_PROBE_SELECTION_LOG_WRITE_FAILED"
         );
     }
+    retain_runtime_pool_for_probe_lifecycle
 }
 
 fn canonical_gatekeeper_config_hash(
@@ -11489,14 +11503,15 @@ async fn pool_observation_task(
                     let session = session.read();
                     session.gatekeeper_buffer().buffered_txs_slice().to_vec()
                 };
-                maybe_handle_p37_shadow_probe_decision(
-                    ctx.as_ref(),
-                    &buy_log,
-                    pool_data.clone(),
-                    &probe_buffered_txs,
-                    base_mint_pubkey,
-                )
-                .await;
+                let retain_runtime_pool_for_probe_lifecycle =
+                    maybe_handle_p37_shadow_probe_decision(
+                        ctx.as_ref(),
+                        &buy_log,
+                        pool_data.clone(),
+                        &probe_buffered_txs,
+                        base_mint_pubkey,
+                    )
+                    .await;
                 let dl = ctx.decision_logger.clone();
                 tokio::spawn(async move {
                     dl.log_gatekeeper_buy_decision(buy_log).await;
@@ -11529,7 +11544,7 @@ async fn pool_observation_task(
                     pool_id,
                     base_mint: base_mint_pubkey,
                     bought: false,
-                    retain_runtime_pool: false,
+                    retain_runtime_pool: retain_runtime_pool_for_probe_lifecycle,
                 });
                 return;
             }
@@ -11603,14 +11618,15 @@ async fn pool_observation_task(
                     let session = session.read();
                     session.gatekeeper_buffer().buffered_txs_slice().to_vec()
                 };
-                maybe_handle_p37_shadow_probe_decision(
-                    ctx.as_ref(),
-                    &buy_log,
-                    pool_data.clone(),
-                    &probe_buffered_txs,
-                    base_mint_pubkey,
-                )
-                .await;
+                let retain_runtime_pool_for_probe_lifecycle =
+                    maybe_handle_p37_shadow_probe_decision(
+                        ctx.as_ref(),
+                        &buy_log,
+                        pool_data.clone(),
+                        &probe_buffered_txs,
+                        base_mint_pubkey,
+                    )
+                    .await;
                 let dl = ctx.decision_logger.clone();
                 tokio::spawn(async move {
                     dl.log_gatekeeper_buy_decision(buy_log).await;
@@ -11643,7 +11659,7 @@ async fn pool_observation_task(
                     pool_id,
                     base_mint: base_mint_pubkey,
                     bought: false,
-                    retain_runtime_pool: false,
+                    retain_runtime_pool: retain_runtime_pool_for_probe_lifecycle,
                 });
                 return;
             }
@@ -11794,14 +11810,15 @@ async fn pool_observation_task(
                                 &window_state,
                             );
                         }
-                        maybe_handle_p37_shadow_probe_decision(
-                            ctx.as_ref(),
-                            &buy_log,
-                            pool_data.clone(),
-                            &buffered_txs,
-                            base_mint_pubkey,
-                        )
-                        .await;
+                        let retain_runtime_pool_for_probe_lifecycle =
+                            maybe_handle_p37_shadow_probe_decision(
+                                ctx.as_ref(),
+                                &buy_log,
+                                pool_data.clone(),
+                                &buffered_txs,
+                                base_mint_pubkey,
+                            )
+                            .await;
                         let dl = ctx.decision_logger.clone();
                         tokio::spawn(async move {
                             dl.log_gatekeeper_buy_decision(buy_log).await;
@@ -11839,7 +11856,7 @@ async fn pool_observation_task(
                             pool_id,
                             base_mint: base_mint_pubkey,
                             bought: false,
-                            retain_runtime_pool: false,
+                            retain_runtime_pool: retain_runtime_pool_for_probe_lifecycle,
                         });
                         return;
                     }
@@ -12007,14 +12024,15 @@ async fn pool_observation_task(
                         &window_state,
                     );
                 }
-                maybe_handle_p37_shadow_probe_decision(
-                    ctx.as_ref(),
-                    &buy_log,
-                    pool_data.clone(),
-                    &buffered_txs,
-                    base_mint_pubkey,
-                )
-                .await;
+                let retain_runtime_pool_for_probe_lifecycle =
+                    maybe_handle_p37_shadow_probe_decision(
+                        ctx.as_ref(),
+                        &buy_log,
+                        pool_data.clone(),
+                        &buffered_txs,
+                        base_mint_pubkey,
+                    )
+                    .await;
                 let dl = ctx.decision_logger.clone();
                 tokio::spawn(async move {
                     dl.log_gatekeeper_buy_decision(buy_log).await;
@@ -12039,7 +12057,8 @@ async fn pool_observation_task(
                     pool_id,
                     base_mint: base_mint_pubkey,
                     bought,
-                    retain_runtime_pool,
+                    retain_runtime_pool: retain_runtime_pool
+                        || retain_runtime_pool_for_probe_lifecycle,
                 });
                 return;
             }
