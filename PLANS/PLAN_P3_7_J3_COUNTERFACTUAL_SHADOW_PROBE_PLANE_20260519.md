@@ -1494,6 +1494,197 @@ Acceptance:
 Collection, Phase B, P2, live, active policy changes, IWIM changes and threshold
 tuning remain out of scope.
 
+## P3.7-J3K7 Routed Exact-SOL-In Entry Materialization / Dispatch Eligibility
+
+### Trigger
+
+R15 J3K6-r1 proved that the creator-vault authority guard works: rows with
+non-authoritative creator-vault identity are now written as
+`probe_skipped` before simulation instead of reaching Pump.fun as known-bad
+`custom_2006` candidates.
+
+The same smoke exposed the next narrower blocker:
+
+```text
+probe_transport_rows = 10
+probe_entry_rows = 0
+buy_variant = routed_exact_sol_in
+token_param_role = min_tokens_out
+entry_token_amount_raw = null
+probe_entry_materialization_status = transport_only_missing_token_quantity
+```
+
+This means the probe path was still able to consume dispatch quota and produce
+transport rows without enough token-quantity evidence to materialize an entry.
+That is not a collection-ready state.
+
+### Decision
+
+J3K7 tightens the probe-only routed exact-SOL-in path:
+
+- populate `legacy_buy_curve` for `RoutedExactSolIn` from decision-time-safe
+  route/account evidence when it is available;
+- let routed exact-SOL-in request preparation compute
+  `entry_token_amount_raw` from that curve snapshot;
+- copy the simulation-derived `entry_token_amount_raw` into probe transport
+  rows when the request did not already carry a request-time quantity;
+- fail closed with `missing_routed_entry_quote_curve` before dispatch when the
+  routed row has no decision-time-safe curve snapshot for entry quantity
+  derivation.
+
+The repair is counterfactual-only. It does not change active verdicts, active
+BUY behavior, IWIM, live sender behavior, thresholds, P2, or selector logic.
+
+### Required Behavior
+
+For `RoutedExactSolIn` probe candidates:
+
+```text
+if decision-time-safe curve snapshot exists:
+  prepare request with routed exact-SOL-in token quantity evidence
+  simulate counterfactual shadow probe
+  materialize entry when simulation returns token quantity
+
+if no curve snapshot exists:
+  write probe_skipped
+  probe_skip_reason = probe_execution_precheck_failed
+  precheck_failure_reason = missing_routed_entry_quote_curve
+  do not consume dispatch quota
+  do not emit transport-only rows
+```
+
+Probe transport must prefer the simulation report token quantity over a missing
+request token quantity:
+
+```text
+entry_token_amount_raw = event.entry_token_amount_raw
+  or request.entry_token_amount_raw
+```
+
+This keeps transport rows aligned with the actual simulation result.
+
+### R15 J3K7 Gate
+
+Use a clean bounded namespace:
+
+```text
+shadow-burnin-v3-p37-counterfactual-probe-r15-bounded-j3k7-r1
+```
+
+Minimal PASS:
+
+- strict V3 replay OK;
+- probe selection/transport/entry exact decision/V3 join remains 100%;
+- creator-vault non-authoritative rows remain precheck skips;
+- routed exact-SOL-in rows either have `entry_token_amount_raw` and entry rows,
+  or are skipped before dispatch as `missing_routed_entry_quote_curve`;
+- `transport_only_missing_token_quantity` does not dominate dispatched rows;
+- active BUY rows remain zero;
+- live/P2 paths remain untouched.
+
+If J3K7 still produces mostly transport-only rows with missing token quantity,
+collection remains blocked and the next repair must be in routed token-amount
+derivation or route identity. Do not increase dispatch scale to hide this.
+
+## P3.7-J3K6 Creator Vault Authority / Route Identity Repair
+
+### Trigger
+
+R15 J3K5-r2 validated the counterfactual probe transport/entry path, but two
+probe rows failed simulation with:
+
+```text
+simulation_account_layout_mismatch:custom_2006
+creator_vault_authority_status = creator_vault_source_not_authoritative
+creator_identity_authoritative = false
+```
+
+Those rows proved that `custom_2006` is no longer a hash, payer, bonding-curve
+or token-parameter plumbing issue. It is a route/account identity issue: the
+request reached Pump.fun, but the creator vault passed in the prepared buy did
+not satisfy the program's creator-vault seed constraint.
+
+### Decision
+
+J3K6 changes the probe-only path from "simulate and classify this known bad
+creator-vault source" to "skip before simulation when the route requires a
+creator vault and the creator identity source is not authoritative".
+
+The repair is additive and counterfactual-only:
+
+- selection/skip rows now carry creator-vault authority fields;
+- route-aware precheck runs before probe dispatch/reservation;
+- non-authoritative creator identity produces
+  `probe_skip_reason = creator_vault_source_not_authoritative`;
+- strict execution-account precheck remains in place for true required accounts;
+- active verdicts, active BUY logs, IWIM, live sender and thresholds are not
+  changed.
+
+The first J3K6 conservative rule is:
+
+```text
+LegacyBuy:
+  detected_pool.creator is not authoritative for creator_vault derivation.
+
+RoutedExactSolIn:
+  detected_pool.creator can be used as route-scoped creator identity when
+  routed account identity is otherwise complete.
+```
+
+This avoids sending the known non-authoritative LegacyBuy creator-vault class
+into `simulate_buy`. It may reduce probe entry yield until a stronger
+authoritative LegacyBuy creator source is materialized; that is an intentional
+fail-closed tradeoff for this stage.
+
+### Required Fields
+
+New skip rows may include:
+
+```text
+route_requires_creator_vault
+creator_vault_requirement_source
+creator_vault_authority_status
+creator_vault_mismatch_reason
+creator_identity_source
+creator_identity_authoritative
+```
+
+The join-key audit reports creator-vault authority counts for both transport
+simulation-error rows and skip rows, so a J3K6 smoke can distinguish:
+
+```text
+custom_2006 still reached simulation
+vs.
+creator_vault_source_not_authoritative skipped before simulation
+```
+
+### R15 J3K6 Gate
+
+Use a clean bounded namespace:
+
+```text
+shadow-burnin-v3-p37-counterfactual-probe-r15-bounded-j3k6-r1
+```
+
+Minimal PASS:
+
+- strict V3 replay OK;
+- probe exact decision/V3 join remains 100%;
+- probe transport/entry rows exist for authoritative/ready routes;
+- `custom_2006 = 0` or every remaining `custom_2006` has a new explicit
+  creator-vault authority reason not covered by J3K6;
+- non-authoritative creator-vault rows appear as `probe_skipped`, not
+  simulation-success rows;
+- active BUY rows remain zero;
+- live/P2 paths remain untouched.
+
+If `creator_vault_source_not_authoritative` dominates skips and entry yield
+collapses, the next step is not collection. It is to add or identify an
+authoritative LegacyBuy creator source, not to bypass the precheck.
+
+Collection, Phase B, P2, live, active policy changes, IWIM changes and threshold
+tuning remain out of scope.
+
 ## P3.7-J3K5 Creator-Vault Source Authority / Amount Guard
 
 ### Trigger

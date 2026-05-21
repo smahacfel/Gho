@@ -579,10 +579,22 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
         )
 
     skip_reason_counts: Counter[str] = Counter()
+    skip_creator_vault_authority_status_counts: Counter[str] = Counter()
+    skip_creator_vault_mismatch_reason_counts: Counter[str] = Counter()
+    skip_creator_identity_source_counts: Counter[str] = Counter()
     for row in skip_rows:
         reason = row_string(row, "probe_skip_reason") or row_string(row, "skip_reason")
         if reason:
             skip_reason_counts[reason] += 1
+        creator_vault_authority_status = row_string(row, "creator_vault_authority_status")
+        creator_vault_mismatch_reason = row_string(row, "creator_vault_mismatch_reason")
+        creator_identity_source = row_string(row, "creator_identity_source")
+        if creator_vault_authority_status:
+            skip_creator_vault_authority_status_counts[creator_vault_authority_status] += 1
+        if creator_vault_mismatch_reason:
+            skip_creator_vault_mismatch_reason_counts[creator_vault_mismatch_reason] += 1
+        if creator_identity_source:
+            skip_creator_identity_source_counts[creator_identity_source] += 1
 
     transport_rows_total = len(transport_rows)
     entry_rows_total = len(entry_rows)
@@ -606,6 +618,15 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
             sorted(simulation_error_custom_code_counts.items())
         ),
         "skip_reason_counts": dict(sorted(skip_reason_counts.items())),
+        "skip_creator_vault_authority_status_counts": dict(
+            sorted(skip_creator_vault_authority_status_counts.items())
+        ),
+        "skip_creator_vault_mismatch_reason_counts": dict(
+            sorted(skip_creator_vault_mismatch_reason_counts.items())
+        ),
+        "skip_creator_identity_source_counts": dict(
+            sorted(skip_creator_identity_source_counts.items())
+        ),
         "entry_materialized_rows": status_counts.get("entry_materialized", 0),
         "transport_only_missing_token_quantity_rows": status_counts.get(
             "transport_only_missing_token_quantity",
@@ -957,6 +978,9 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- amount_guard_status_counts: `{json.dumps(materialization['amount_guard_status_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- simulation_error_custom_code_counts: `{json.dumps(materialization['simulation_error_custom_code_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- skip_reason_counts: `{json.dumps(materialization['skip_reason_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- skip_creator_vault_authority_status_counts: `{json.dumps(materialization['skip_creator_vault_authority_status_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- skip_creator_vault_mismatch_reason_counts: `{json.dumps(materialization['skip_creator_vault_mismatch_reason_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- skip_creator_identity_source_counts: `{json.dumps(materialization['skip_creator_identity_source_counts'], ensure_ascii=False, sort_keys=True)}`",
         ]
     )
     if materialization["rows"]:

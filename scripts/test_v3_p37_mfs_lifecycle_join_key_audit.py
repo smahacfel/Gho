@@ -455,11 +455,34 @@ lifecycle_log_path = "../../logs/shadow_run/r15-probe/probe_lifecycle.jsonl"
                 "amount_required_lamports_if_available": 7_739_140,
                 "amount_shortfall_lamports_if_available": 739_140,
             }
+            creator_vault_skip = {
+                **decision,
+                "source_ab_record_id": "source-ab",
+                "probe_id": "probe-skip-creator",
+                "dispatch_source": "counterfactual_shadow_probe",
+                "collection_plane": "counterfactual_shadow_probe",
+                "probe_plane": "p37_shadow_probe",
+                "event_type": "probe_skipped",
+                "probe_skip_reason": "creator_vault_source_not_authoritative",
+                "precheck_failure_reason": (
+                    "creator_vault_source_not_authoritative:"
+                    "pumpfun_legacy_extended_buy_accounts:"
+                    "detected_pool.creator:creator"
+                ),
+                "creator_vault_authority_status": "creator_vault_source_not_authoritative",
+                "creator_vault_mismatch_reason": "creator_identity_source_not_authoritative",
+                "creator_identity_source": "detected_pool.creator",
+                "creator_identity_authoritative": False,
+            }
             write_jsonl(
                 root / "logs/rollout/r15-probe/decisions/gatekeeper_v2_decisions.jsonl",
                 [decision],
             )
             write_jsonl(root / "logs/shadow_run/r15-probe/probe_selected.jsonl", [decision])
+            write_jsonl(
+                root / "logs/shadow_run/r15-probe/probe_skipped.jsonl",
+                [creator_vault_skip],
+            )
             write_jsonl(
                 root / "logs/shadow_run/r15-probe/probe_transport.jsonl",
                 [creator_vault_error, amount_error],
@@ -498,6 +521,26 @@ lifecycle_log_path = "../../logs/shadow_run/r15-probe/probe_lifecycle.jsonl"
         )
         self.assertEqual(
             materialization["simulation_error_custom_code_counts"]["custom_6002"],
+            1,
+        )
+        self.assertEqual(
+            materialization["skip_reason_counts"]["creator_vault_source_not_authoritative"],
+            1,
+        )
+        self.assertEqual(
+            materialization["skip_creator_vault_authority_status_counts"][
+                "creator_vault_source_not_authoritative"
+            ],
+            1,
+        )
+        self.assertEqual(
+            materialization["skip_creator_vault_mismatch_reason_counts"][
+                "creator_identity_source_not_authoritative"
+            ],
+            1,
+        )
+        self.assertEqual(
+            materialization["skip_creator_identity_source_counts"]["detected_pool.creator"],
             1,
         )
 

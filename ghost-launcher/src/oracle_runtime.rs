@@ -4939,6 +4939,12 @@ struct P37ShadowProbeSelectionRecord {
     execution_account_readiness_role: Option<String>,
     execution_account_readiness_pubkey: Option<String>,
     execution_account_readiness_reason: Option<String>,
+    route_requires_creator_vault: Option<bool>,
+    creator_vault_requirement_source: Option<String>,
+    creator_vault_authority_status: Option<String>,
+    creator_vault_mismatch_reason: Option<String>,
+    creator_identity_source: Option<String>,
+    creator_identity_authoritative: Option<bool>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq)]
@@ -5339,6 +5345,12 @@ fn p37_shadow_probe_selection_record(
         execution_account_readiness_role: None,
         execution_account_readiness_pubkey: None,
         execution_account_readiness_reason: None,
+        route_requires_creator_vault: None,
+        creator_vault_requirement_source: None,
+        creator_vault_authority_status: None,
+        creator_vault_mismatch_reason: None,
+        creator_identity_source: None,
+        creator_identity_authoritative: None,
     }
 }
 
@@ -5612,6 +5624,8 @@ fn p37_shadow_probe_as_precheck_skip(
     record.event_type = "probe_skipped".to_string();
     record.probe_skip_reason = Some(if reason.starts_with("execution_account_not_ready:") {
         "execution_account_not_ready".to_string()
+    } else if reason.starts_with("creator_vault_source_not_authoritative") {
+        "creator_vault_source_not_authoritative".to_string()
     } else {
         "probe_execution_precheck_failed".to_string()
     });
@@ -5619,6 +5633,10 @@ fn p37_shadow_probe_as_precheck_skip(
         record.execution_account_readiness_status = Some("not_ready".to_string());
         record.execution_account_readiness_role = Some(role);
         record.execution_account_readiness_pubkey = Some(pubkey);
+        record.execution_account_readiness_reason = Some(reason.clone());
+    } else if reason.starts_with("creator_vault_source_not_authoritative") {
+        record.execution_account_readiness_status = Some("not_ready".to_string());
+        record.execution_account_readiness_role = Some("creator_vault".to_string());
         record.execution_account_readiness_reason = Some(reason.clone());
     } else {
         record.execution_account_readiness_status = Some("precheck_failed".to_string());
@@ -5767,6 +5785,13 @@ fn p37_shadow_probe_account_overrides_present(
         || overrides.legacy_buy_curve.is_some()
 }
 
+#[derive(Debug, Clone)]
+struct P37ShadowProbeAccountOverrideContext {
+    account_overrides: crate::components::trigger::BuyAccountOverrides,
+    creator_identity_source: Option<String>,
+    creator_identity_authoritative: Option<bool>,
+}
+
 fn p37_shadow_probe_derive_legacy_buy_account_overrides(
     buffered_txs: &[crate::components::gatekeeper::GatekeeperBufferedTx],
 ) -> Option<crate::components::trigger::BuyAccountOverrides> {
@@ -5805,21 +5830,33 @@ fn p37_shadow_probe_derive_legacy_buy_account_overrides(
     None
 }
 
-fn p37_shadow_probe_derive_account_overrides_for_pool(
+fn p37_shadow_probe_derive_account_override_context_for_pool(
     oracle_runtime: &OracleRuntime,
     pool_data: &DetectedPool,
     buffered_txs: &[crate::components::gatekeeper::GatekeeperBufferedTx],
     buy_mint: Pubkey,
     record: &P37ShadowProbeSelectionRecord,
-) -> crate::components::trigger::BuyAccountOverrides {
+) -> P37ShadowProbeAccountOverrideContext {
     let mut account_overrides = p37_shadow_probe_derive_legacy_buy_account_overrides(buffered_txs)
         .unwrap_or_else(|| derive_buy_account_overrides(buffered_txs));
+    let mut creator_identity_source = account_overrides
+        .creator_pubkey
+        .map(|_| "derived_buy_account_overrides.creator_pubkey".to_string());
+    let mut creator_identity_authoritative = account_overrides.creator_pubkey.map(|_| true);
     if account_overrides.creator_pubkey.is_none() {
-        account_overrides.creator_pubkey = Pubkey::try_from(pool_data.creator.as_str()).ok();
+        if let Ok(pool_creator) = Pubkey::try_from(pool_data.creator.as_str()) {
+            account_overrides.creator_pubkey = Some(pool_creator);
+            creator_identity_source = Some("detected_pool.creator".to_string());
+            creator_identity_authoritative = Some(matches!(
+                account_overrides.buy_variant,
+                Some(trigger::PumpfunBuyVariant::RoutedExactSolIn)
+            ));
+        }
     }
     if matches!(
         account_overrides.buy_variant,
         Some(trigger::PumpfunBuyVariant::LegacyBuy)
+            | Some(trigger::PumpfunBuyVariant::RoutedExactSolIn)
     ) {
         account_overrides.legacy_buy_curve = oracle_runtime
             .resolve_trigger_buy_curve(buy_mint, buffered_txs)
@@ -5827,7 +5864,28 @@ fn p37_shadow_probe_derive_account_overrides_for_pool(
                 p37_shadow_probe_legacy_curve_snapshot_for_pool(record, pool_data, buy_mint)
             });
     }
-    account_overrides
+    P37ShadowProbeAccountOverrideContext {
+        account_overrides,
+        creator_identity_source,
+        creator_identity_authoritative,
+    }
+}
+
+fn p37_shadow_probe_derive_account_overrides_for_pool(
+    oracle_runtime: &OracleRuntime,
+    pool_data: &DetectedPool,
+    buffered_txs: &[crate::components::gatekeeper::GatekeeperBufferedTx],
+    buy_mint: Pubkey,
+    record: &P37ShadowProbeSelectionRecord,
+) -> crate::components::trigger::BuyAccountOverrides {
+    p37_shadow_probe_derive_account_override_context_for_pool(
+        oracle_runtime,
+        pool_data,
+        buffered_txs,
+        buy_mint,
+        record,
+    )
+    .account_overrides
 }
 
 fn p37_shadow_probe_legacy_curve_snapshot_for_pool(
@@ -5884,7 +5942,101 @@ fn p37_shadow_probe_execution_precheck(
     {
         return Some("missing_creator_pubkey".to_string());
     }
+    if matches!(
+        account_overrides.buy_variant,
+        Some(trigger::PumpfunBuyVariant::RoutedExactSolIn)
+    ) && account_overrides.legacy_buy_curve.is_none()
+    {
+        return Some("missing_routed_entry_quote_curve".to_string());
+    }
     None
+}
+
+#[derive(Debug, Clone)]
+struct P37ShadowProbeCreatorVaultPrecheckFailure {
+    reason: String,
+    route_requires_creator_vault: bool,
+    requirement_source: String,
+    authority_status: String,
+    mismatch_reason: String,
+    identity_source: Option<String>,
+    identity_authoritative: Option<bool>,
+}
+
+fn p37_shadow_probe_route_requires_creator_vault(
+    account_overrides: &crate::components::trigger::BuyAccountOverrides,
+) -> bool {
+    matches!(
+        account_overrides.buy_variant,
+        Some(trigger::PumpfunBuyVariant::LegacyBuy)
+            | Some(trigger::PumpfunBuyVariant::RoutedExactSolIn)
+    )
+}
+
+fn p37_shadow_probe_creator_vault_requirement_source(
+    account_overrides: &crate::components::trigger::BuyAccountOverrides,
+) -> Option<String> {
+    match account_overrides.buy_variant {
+        Some(trigger::PumpfunBuyVariant::LegacyBuy) => {
+            Some("pumpfun_legacy_extended_buy_accounts".to_string())
+        }
+        Some(trigger::PumpfunBuyVariant::RoutedExactSolIn) => {
+            Some("pumpfun_routed_exact_sol_in_accounts".to_string())
+        }
+        None => None,
+    }
+}
+
+fn p37_shadow_probe_creator_vault_precheck_failure(
+    context: &P37ShadowProbeAccountOverrideContext,
+) -> Option<P37ShadowProbeCreatorVaultPrecheckFailure> {
+    if !p37_shadow_probe_route_requires_creator_vault(&context.account_overrides) {
+        return None;
+    }
+    if context.creator_identity_authoritative == Some(true)
+        && context.account_overrides.creator_pubkey.is_some()
+    {
+        return None;
+    }
+
+    let requirement_source =
+        p37_shadow_probe_creator_vault_requirement_source(&context.account_overrides)
+            .unwrap_or_else(|| "pumpfun_buy_accounts".to_string());
+    let identity_source = context
+        .creator_identity_source
+        .clone()
+        .unwrap_or_else(|| "creator_pubkey_unavailable".to_string());
+    let identity_pubkey = context
+        .account_overrides
+        .creator_pubkey
+        .map(|pubkey| pubkey.to_string())
+        .unwrap_or_else(|| "missing_creator_pubkey".to_string());
+    let reason = format!(
+        "creator_vault_source_not_authoritative:{requirement_source}:{identity_source}:{identity_pubkey}"
+    );
+
+    Some(P37ShadowProbeCreatorVaultPrecheckFailure {
+        reason,
+        route_requires_creator_vault: true,
+        requirement_source,
+        authority_status: "creator_vault_source_not_authoritative".to_string(),
+        mismatch_reason: "creator_identity_source_not_authoritative".to_string(),
+        identity_source: context.creator_identity_source.clone(),
+        identity_authoritative: context.creator_identity_authoritative,
+    })
+}
+
+fn p37_shadow_probe_as_creator_vault_precheck_skip(
+    mut record: P37ShadowProbeSelectionRecord,
+    failure: P37ShadowProbeCreatorVaultPrecheckFailure,
+) -> P37ShadowProbeSelectionRecord {
+    record.route_requires_creator_vault = Some(failure.route_requires_creator_vault);
+    record.creator_vault_requirement_source = Some(failure.requirement_source);
+    record.creator_vault_authority_status = Some(failure.authority_status);
+    record.creator_vault_mismatch_reason = Some(failure.mismatch_reason);
+    record.creator_identity_source = failure.identity_source;
+    record.creator_identity_authoritative = failure.identity_authoritative;
+    p37_shadow_probe_as_precheck_skip(record, failure.reason)
 }
 
 fn p37_shadow_probe_error_pubkey(message: &str) -> Option<String> {
@@ -6474,6 +6626,9 @@ fn p37_shadow_probe_transport_from_event(
         &event.logs,
     );
     let request_token_params = p37_shadow_probe_request_token_params(request);
+    let entry_token_amount_raw = event
+        .entry_token_amount_raw
+        .or(request_token_params.entry_token_amount_raw);
     P37ShadowProbeTransportRecord {
         join_metadata,
         schema_version: 1,
@@ -6503,7 +6658,7 @@ fn p37_shadow_probe_transport_from_event(
         probe_slippage_bps: record.probe_slippage_bps,
         buy_variant: request_token_params.buy_variant,
         token_param_role: request_token_params.token_param_role,
-        entry_token_amount_raw: request_token_params.entry_token_amount_raw,
+        entry_token_amount_raw,
         min_tokens_out: request_token_params.min_tokens_out,
         probe_quote_age_max_ms: record.probe_quote_age_max_ms,
         probe_curve_age_max_ms: record.probe_curve_age_max_ms,
@@ -6768,13 +6923,26 @@ async fn run_p37_shadow_probe_dispatch(
         }
     };
     let decision_ts_ms = record.decision_ts_ms.unwrap_or_else(current_time_ms);
-    let account_overrides = p37_shadow_probe_derive_account_overrides_for_pool(
+    let override_context = p37_shadow_probe_derive_account_override_context_for_pool(
         &oracle_runtime,
         pool_data.as_ref(),
         &buffered_txs,
         buy_mint,
         &record,
     );
+    let account_overrides = override_context.account_overrides.clone();
+    if let Some(failure) = p37_shadow_probe_creator_vault_precheck_failure(&override_context) {
+        let skip_record = p37_shadow_probe_as_creator_vault_precheck_skip(record.clone(), failure);
+        if let Err(err) = append_p37_shadow_probe_record(&config, &skip_record).await {
+            warn!(
+                probe_id = ?skip_record.probe_id,
+                source_ab_record_id = ?skip_record.source_ab_record_id,
+                error = %err,
+                "P37_SHADOW_PROBE_CREATOR_VAULT_PRECHECK_SKIP_WRITE_FAILED"
+            );
+        }
+        return;
+    }
     if let Some(reason) =
         p37_shadow_probe_execution_precheck(&record, &account_overrides, &buy_mint, &pool_data)
     {
@@ -6986,16 +7154,20 @@ async fn maybe_handle_p37_shadow_probe_decision(
         } else if base_mint_pubkey.is_none() {
             record = p37_shadow_probe_as_skip(record, "invalid_mint_identity");
         } else if let (Some(pool_data), Some(buy_mint)) = (pool_data.as_ref(), base_mint_pubkey) {
-            let account_overrides = p37_shadow_probe_derive_account_overrides_for_pool(
+            let override_context = p37_shadow_probe_derive_account_override_context_for_pool(
                 ctx.oracle_runtime.as_ref(),
                 pool_data.as_ref(),
                 buffered_txs,
                 buy_mint,
                 &record,
             );
-            if let Some(reason) = p37_shadow_probe_execution_precheck(
+            if let Some(failure) =
+                p37_shadow_probe_creator_vault_precheck_failure(&override_context)
+            {
+                record = p37_shadow_probe_as_creator_vault_precheck_skip(record, failure);
+            } else if let Some(reason) = p37_shadow_probe_execution_precheck(
                 &record,
-                &account_overrides,
+                &override_context.account_overrides,
                 &buy_mint,
                 pool_data,
             ) {
@@ -13222,6 +13394,29 @@ mod tests {
     }
 
     #[test]
+    fn p37_shadow_probe_execution_precheck_requires_routed_entry_quote_curve() {
+        let (record, pool, buy_mint) = p37_shadow_probe_precheck_record_and_pool();
+        let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).expect("valid token program");
+        let associated_bonding_curve =
+            trigger::DirectBuyBuilder::canonical_associated_bonding_curve(
+                &buy_mint,
+                &token_program,
+            );
+        let overrides = crate::components::trigger::BuyAccountOverrides {
+            buy_variant: Some(trigger::PumpfunBuyVariant::RoutedExactSolIn),
+            token_program: Some(token_program),
+            creator_pubkey: Some(Pubkey::new_unique()),
+            associated_bonding_curve: Some(associated_bonding_curve),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            p37_shadow_probe_execution_precheck(&record, &overrides, &buy_mint, &pool).as_deref(),
+            Some("missing_routed_entry_quote_curve")
+        );
+    }
+
+    #[test]
     fn p37_shadow_probe_execution_precheck_accepts_complete_routed_identity() {
         let (record, pool, buy_mint) = p37_shadow_probe_precheck_record_and_pool();
         let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).expect("valid token program");
@@ -13235,6 +13430,16 @@ mod tests {
             token_program: Some(token_program),
             creator_pubkey: Some(Pubkey::new_unique()),
             associated_bonding_curve: Some(associated_bonding_curve),
+            legacy_buy_curve: Some(BondingCurve {
+                discriminator: 0,
+                virtual_token_reserves: 1_000_000_000_000,
+                virtual_sol_reserves: 30_000_000_000,
+                real_token_reserves: 1_000_000_000_000,
+                real_sol_reserves: 30_000_000_000,
+                token_total_supply: 0,
+                complete: 0,
+                _padding: [0; 7],
+            }),
             ..Default::default()
         };
 
@@ -13264,6 +13469,175 @@ mod tests {
             ..Default::default()
         };
 
+        assert_eq!(
+            p37_shadow_probe_execution_precheck(&record, &overrides, &buy_mint, &pool),
+            None
+        );
+    }
+
+    #[test]
+    fn p37_shadow_probe_creator_vault_precheck_skips_legacy_non_authoritative_creator() {
+        let creator = Pubkey::new_unique();
+        let context = P37ShadowProbeAccountOverrideContext {
+            account_overrides: crate::components::trigger::BuyAccountOverrides {
+                buy_variant: Some(trigger::PumpfunBuyVariant::LegacyBuy),
+                creator_pubkey: Some(creator),
+                legacy_buy_curve: Some(BondingCurve {
+                    discriminator: 0,
+                    virtual_token_reserves: 1_000_000_000_000,
+                    virtual_sol_reserves: 30_000_000_000,
+                    real_token_reserves: 1_000_000_000_000,
+                    real_sol_reserves: 30_000_000_000,
+                    token_total_supply: 0,
+                    complete: 0,
+                    _padding: [0; 7],
+                }),
+                ..Default::default()
+            },
+            creator_identity_source: Some("detected_pool.creator".to_string()),
+            creator_identity_authoritative: Some(false),
+        };
+
+        let failure = p37_shadow_probe_creator_vault_precheck_failure(&context)
+            .expect("legacy creator source should be rejected when not authoritative");
+
+        assert!(failure
+            .reason
+            .starts_with("creator_vault_source_not_authoritative:"));
+        assert_eq!(
+            failure.requirement_source,
+            "pumpfun_legacy_extended_buy_accounts"
+        );
+        assert_eq!(
+            failure.identity_source.as_deref(),
+            Some("detected_pool.creator")
+        );
+        assert_eq!(failure.identity_authoritative, Some(false));
+    }
+
+    #[test]
+    fn p37_shadow_probe_creator_vault_precheck_accepts_authoritative_routed_creator() {
+        let context = P37ShadowProbeAccountOverrideContext {
+            account_overrides: crate::components::trigger::BuyAccountOverrides {
+                buy_variant: Some(trigger::PumpfunBuyVariant::RoutedExactSolIn),
+                creator_pubkey: Some(Pubkey::new_unique()),
+                associated_bonding_curve: Some(Pubkey::new_unique()),
+                ..Default::default()
+            },
+            creator_identity_source: Some("detected_pool.creator".to_string()),
+            creator_identity_authoritative: Some(true),
+        };
+
+        assert!(p37_shadow_probe_creator_vault_precheck_failure(&context).is_none());
+    }
+
+    #[test]
+    fn p37_shadow_probe_creator_vault_skip_records_specific_reason() {
+        let (record, _pool, _buy_mint) = p37_shadow_probe_precheck_record_and_pool();
+        let failure = P37ShadowProbeCreatorVaultPrecheckFailure {
+            reason: "creator_vault_source_not_authoritative:pumpfun_legacy_extended_buy_accounts:detected_pool.creator:Creator1111111111111111111111111111".to_string(),
+            route_requires_creator_vault: true,
+            requirement_source: "pumpfun_legacy_extended_buy_accounts".to_string(),
+            authority_status: "creator_vault_source_not_authoritative".to_string(),
+            mismatch_reason: "creator_identity_source_not_authoritative".to_string(),
+            identity_source: Some("detected_pool.creator".to_string()),
+            identity_authoritative: Some(false),
+        };
+
+        let skipped = p37_shadow_probe_as_creator_vault_precheck_skip(record, failure);
+
+        assert_eq!(skipped.event_type, "probe_skipped");
+        assert_eq!(
+            skipped.probe_skip_reason.as_deref(),
+            Some("creator_vault_source_not_authoritative")
+        );
+        assert_eq!(
+            skipped.precheck_failure_reason.as_deref(),
+            Some("creator_vault_source_not_authoritative:pumpfun_legacy_extended_buy_accounts:detected_pool.creator:Creator1111111111111111111111111111")
+        );
+        assert_eq!(skipped.route_requires_creator_vault, Some(true));
+        assert_eq!(
+            skipped.creator_vault_requirement_source.as_deref(),
+            Some("pumpfun_legacy_extended_buy_accounts")
+        );
+        assert_eq!(
+            skipped.creator_vault_authority_status.as_deref(),
+            Some("creator_vault_source_not_authoritative")
+        );
+        assert_eq!(
+            skipped.creator_vault_mismatch_reason.as_deref(),
+            Some("creator_identity_source_not_authoritative")
+        );
+        assert_eq!(
+            skipped.creator_identity_source.as_deref(),
+            Some("detected_pool.creator")
+        );
+        assert_eq!(skipped.creator_identity_authoritative, Some(false));
+        assert_eq!(
+            skipped.execution_account_readiness_status.as_deref(),
+            Some("not_ready")
+        );
+        assert_eq!(
+            skipped.execution_account_readiness_role.as_deref(),
+            Some("creator_vault")
+        );
+    }
+
+    #[test]
+    fn p37_shadow_probe_uses_selection_curve_snapshot_for_routed_entry_quote_after_runtime_cleanup()
+    {
+        use ghost_brain::oracle::snapshot_engine::PoolMetrics;
+        use ghost_core::shadow_ledger::TxKey;
+        use std::sync::Arc;
+
+        let (mut record, pool, buy_mint) = p37_shadow_probe_precheck_record_and_pool();
+        let curve = BondingCurve {
+            discriminator: 0,
+            virtual_token_reserves: 1_000_000_000_000,
+            virtual_sol_reserves: 30_000_000_000,
+            real_token_reserves: 1_000_000_000_000,
+            real_sol_reserves: 30_000_000_000,
+            token_total_supply: ghost_core::PROTOCOL_GENESIS_TOKEN_TOTAL_SUPPLY,
+            complete: 0,
+            _padding: [0; 7],
+        };
+        record.legacy_bonding_curve_snapshot = Some(curve);
+        let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).expect("valid token program");
+        let assoc_curve = trigger::DirectBuyBuilder::canonical_associated_bonding_curve(
+            &buy_mint,
+            &token_program,
+        );
+        let mut tx = (*test_pool_observation_tx("routed-probe-cleanup")).clone();
+        tx.buy_variant = Some("routed_exact_sol_in".to_string());
+        tx.associated_bonding_curve = Some(assoc_curve.to_string());
+        tx.token_program = Some(TOKEN_PROGRAM_ID.to_string());
+        tx.success = true;
+        tx.is_buy = true;
+        let buffered_txs = vec![crate::components::gatekeeper::GatekeeperBufferedTx {
+            tx: Arc::new(tx),
+            metrics: PoolMetrics::default(),
+            tx_key: TxKey::new(1_000, Some(1), Some(0), None, 0).expect("tx key"),
+        }];
+        let runtime = OracleRuntime::new(
+            Arc::new(HyperPredictionOracle::default()),
+            "pump_program".to_string(),
+            "bonk_program".to_string(),
+            Arc::new(ShadowLedger::new()),
+        );
+
+        let overrides = p37_shadow_probe_derive_account_overrides_for_pool(
+            &runtime,
+            &pool,
+            &buffered_txs,
+            buy_mint,
+            &record,
+        );
+
+        assert_eq!(
+            overrides.buy_variant,
+            Some(trigger::PumpfunBuyVariant::RoutedExactSolIn)
+        );
+        assert_eq!(overrides.legacy_buy_curve, Some(curve));
         assert_eq!(
             p37_shadow_probe_execution_precheck(&record, &overrides, &buy_mint, &pool),
             None
@@ -13326,6 +13700,57 @@ mod tests {
         assert_eq!(
             p37_shadow_probe_execution_precheck(&record, &overrides, &buy_mint, &pool),
             None
+        );
+    }
+
+    #[test]
+    fn p37_shadow_probe_transport_uses_simulated_token_quantity_when_request_quote_missing() {
+        let config = P37ShadowProbeConfig {
+            enabled: true,
+            sample_threshold: 100,
+            ..Default::default()
+        };
+        let candidate = p37_shadow_probe_test_candidate();
+        let record = p37_shadow_probe_selection_record(&config, &candidate, 3_000);
+        let mut request = test_prepared_buy_request()
+            .with_join_metadata(p37_shadow_probe_join_metadata(&record).expect("join metadata"));
+        request.entry_token_amount_raw = None;
+        request.account_overrides.buy_variant = Some(trigger::PumpfunBuyVariant::RoutedExactSolIn);
+        let report = crate::components::trigger::ShadowBuySimulationReport {
+            join_metadata: request.join_metadata.clone(),
+            mint: record.base_mint.clone().expect("base mint"),
+            live_signature: None,
+            payer_pubkey: request.payer_pubkey.to_string(),
+            payer_provenance: request.payer_provenance.to_string(),
+            amount_lamports: request.amount_lamports,
+            entry_token_amount_raw: Some(777_000),
+            tip_lamports: request.tip_lamports,
+            decision_ts_ms: request.decision_ts_ms,
+            simulation_started_ts_ms: request.decision_ts_ms.saturating_add(1),
+            simulation_finished_ts_ms: request.decision_ts_ms.saturating_add(5),
+            latency_ms: 4,
+            shadow_duration_ms: 4,
+            rpc_slot: 42,
+            retry_count: 0,
+            used_sig_verify: false,
+            used_replace_recent_blockhash: true,
+            units_consumed: Some(30_000),
+            logs: Vec::new(),
+            return_data: None,
+            err: None,
+        };
+        let event = crate::components::trigger::shadow_run::shadow_buy_event_from_report(
+            &record.pool_id,
+            record.base_mint.as_deref().expect("base mint"),
+            report,
+        );
+
+        let transport = p37_shadow_probe_transport_from_event(&record, &event, &request, 3_100);
+
+        assert_eq!(transport.entry_token_amount_raw, Some(777_000));
+        assert_eq!(
+            transport.token_param_role.as_deref(),
+            Some("min_tokens_out")
         );
     }
 
