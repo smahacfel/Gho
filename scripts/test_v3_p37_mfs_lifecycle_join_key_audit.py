@@ -380,6 +380,126 @@ lifecycle_log_path = "../../logs/shadow_run/r15-probe/probe_lifecycle.jsonl"
             materialization["reason_counts"]["simulation_slippage_or_price_mismatch:custom_6002"],
             1,
         )
+        self.assertEqual(
+            materialization["simulation_error_custom_code_counts"]["custom_6002"],
+            1,
+        )
+
+    def test_probe_transport_creator_vault_and_amount_guard_counts_are_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "configs/rollout/r15-probe.toml"
+            config.parent.mkdir(parents=True)
+            config.write_text(
+                """
+[oracle]
+decision_log_path = "../../logs/rollout/r15-probe/decisions"
+
+[p37_shadow_probe]
+selection_log_path = "../../logs/shadow_run/r15-probe/probe_selected.jsonl"
+skip_log_path = "../../logs/shadow_run/r15-probe/probe_skipped.jsonl"
+transport_log_path = "../../logs/shadow_run/r15-probe/probe_transport.jsonl"
+entry_log_path = "../../logs/shadow_run/r15-probe/probe_entries.jsonl"
+lifecycle_log_path = "../../logs/shadow_run/r15-probe/probe_lifecycle.jsonl"
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            decision = {
+                "candidate_id": "pool_mint_1000",
+                "ab_record_id": "source-ab",
+                "pool_id": "pool",
+                "base_mint": "mint",
+                "v3_replay_payload_schema_version": 1,
+                "v3_feature_snapshot_hash": "feature-hash",
+                "v3_policy_config_hash": "policy-hash",
+            }
+            creator_vault_error = {
+                **decision,
+                "source_ab_record_id": "source-ab",
+                "probe_id": "probe-creator",
+                "dispatch_source": "counterfactual_shadow_probe",
+                "collection_plane": "counterfactual_shadow_probe",
+                "probe_plane": "p37_shadow_probe",
+                "probe_bucket": "v3_pending_wait_sample",
+                "probe_amount_source": "fixed_lamports",
+                "execution_outcome": "counterfactual_shadow_probe_simulation_error",
+                "error_class": "simulation_mismatch",
+                "simulation_error_category": "simulation_account_layout_mismatch",
+                "simulation_error_custom_code": 2006,
+                "simulation_error_account_role": "creator_vault",
+                "simulation_error_actual_account_pubkey": "actual-vault",
+                "simulation_error_expected_account_pubkey": "expected-vault",
+                "creator_vault_authority_status": "creator_vault_source_not_authoritative",
+                "creator_vault_actual_pubkey": "actual-vault",
+                "creator_vault_expected_pubkey": "expected-vault",
+                "creator_vault_mismatch_reason": "actual_expected_mismatch",
+                "creator_identity_source": "account_overrides.creator_pubkey",
+                "creator_identity_authoritative": False,
+            }
+            amount_error = {
+                **decision,
+                "source_ab_record_id": "source-ab",
+                "probe_id": "probe-amount",
+                "dispatch_source": "counterfactual_shadow_probe",
+                "collection_plane": "counterfactual_shadow_probe",
+                "probe_plane": "p37_shadow_probe",
+                "probe_bucket": "v3_pending_wait_sample",
+                "probe_amount_source": "fixed_lamports",
+                "execution_outcome": "counterfactual_shadow_probe_simulation_error",
+                "error_class": "simulation_mismatch",
+                "simulation_error_category": "simulation_slippage_or_price_mismatch",
+                "simulation_error_custom_code": 6002,
+                "amount_guard_status": "amount_required_exceeds_probe_amount",
+                "amount_provided_lamports_if_available": 7_000_000,
+                "amount_required_lamports_if_available": 7_739_140,
+                "amount_shortfall_lamports_if_available": 739_140,
+            }
+            write_jsonl(
+                root / "logs/rollout/r15-probe/decisions/gatekeeper_v2_decisions.jsonl",
+                [decision],
+            )
+            write_jsonl(root / "logs/shadow_run/r15-probe/probe_selected.jsonl", [decision])
+            write_jsonl(
+                root / "logs/shadow_run/r15-probe/probe_transport.jsonl",
+                [creator_vault_error, amount_error],
+            )
+
+            report = audit.build_report(config)
+
+        materialization = report["probe_entry_materialization"]
+        self.assertEqual(
+            materialization["creator_vault_authority_status_counts"][
+                "creator_vault_source_not_authoritative"
+            ],
+            1,
+        )
+        self.assertEqual(
+            materialization["creator_vault_mismatch_reason_counts"][
+                "actual_expected_mismatch"
+            ],
+            1,
+        )
+        self.assertEqual(
+            materialization["creator_identity_source_counts"][
+                "account_overrides.creator_pubkey"
+            ],
+            1,
+        )
+        self.assertEqual(
+            materialization["amount_guard_status_counts"][
+                "amount_required_exceeds_probe_amount"
+            ],
+            1,
+        )
+        self.assertEqual(
+            materialization["simulation_error_custom_code_counts"]["custom_2006"],
+            1,
+        )
+        self.assertEqual(
+            materialization["simulation_error_custom_code_counts"]["custom_6002"],
+            1,
+        )
 
     def test_probe_transport_simulation_error_with_entry_is_not_clean_materialized(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

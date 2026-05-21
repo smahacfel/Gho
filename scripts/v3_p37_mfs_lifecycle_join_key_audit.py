@@ -498,6 +498,11 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
     reason_counts: Counter[str] = Counter()
     buy_variant_counts: Counter[str] = Counter()
     token_param_role_counts: Counter[str] = Counter()
+    creator_vault_authority_status_counts: Counter[str] = Counter()
+    creator_vault_mismatch_reason_counts: Counter[str] = Counter()
+    creator_identity_source_counts: Counter[str] = Counter()
+    amount_guard_status_counts: Counter[str] = Counter()
+    simulation_error_custom_code_counts: Counter[str] = Counter()
     rows: list[dict[str, Any]] = []
     for row in transport_rows:
         status, reason = classify_probe_transport_materialization(row, entry_probe_ids)
@@ -509,6 +514,21 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
             buy_variant_counts[buy_variant] += 1
         if token_param_role:
             token_param_role_counts[token_param_role] += 1
+        creator_vault_authority_status = row_string(row, "creator_vault_authority_status")
+        creator_vault_mismatch_reason = row_string(row, "creator_vault_mismatch_reason")
+        creator_identity_source = row_string(row, "creator_identity_source")
+        amount_guard_status = row_string(row, "amount_guard_status")
+        simulation_error_custom_code = row_string(row, "simulation_error_custom_code")
+        if creator_vault_authority_status:
+            creator_vault_authority_status_counts[creator_vault_authority_status] += 1
+        if creator_vault_mismatch_reason:
+            creator_vault_mismatch_reason_counts[creator_vault_mismatch_reason] += 1
+        if creator_identity_source:
+            creator_identity_source_counts[creator_identity_source] += 1
+        if amount_guard_status:
+            amount_guard_status_counts[amount_guard_status] += 1
+        if simulation_error_custom_code:
+            simulation_error_custom_code_counts[f"custom_{simulation_error_custom_code}"] += 1
         rows.append(
             {
                 "probe_id": row_probe_id(row),
@@ -523,6 +543,32 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
                 "execution_outcome": row_string(row, "execution_outcome"),
                 "error_class": row_string(row, "error_class"),
                 "simulation_error_category": row_string(row, "simulation_error_category"),
+                "simulation_error_custom_code": simulation_error_custom_code,
+                "simulation_error_account_role": row_string(row, "simulation_error_account_role"),
+                "simulation_error_actual_account_pubkey": row_string(
+                    row,
+                    "simulation_error_actual_account_pubkey",
+                ),
+                "simulation_error_expected_account_pubkey": row_string(
+                    row,
+                    "simulation_error_expected_account_pubkey",
+                ),
+                "creator_vault_authority_status": creator_vault_authority_status,
+                "creator_vault_actual_pubkey": row_string(row, "creator_vault_actual_pubkey"),
+                "creator_vault_expected_pubkey": row_string(row, "creator_vault_expected_pubkey"),
+                "creator_vault_mismatch_reason": creator_vault_mismatch_reason,
+                "creator_identity_source": creator_identity_source,
+                "creator_identity_authoritative": row.get("creator_identity_authoritative"),
+                "amount_guard_status": amount_guard_status,
+                "amount_provided_lamports_if_available": row.get(
+                    "amount_provided_lamports_if_available"
+                ),
+                "amount_required_lamports_if_available": row.get(
+                    "amount_required_lamports_if_available"
+                ),
+                "amount_shortfall_lamports_if_available": row.get(
+                    "amount_shortfall_lamports_if_available"
+                ),
                 "execution_account_readiness_status": row_string(
                     row,
                     "execution_account_readiness_status",
@@ -548,6 +594,17 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
         "reason_counts": dict(sorted(reason_counts.items())),
         "buy_variant_counts": dict(sorted(buy_variant_counts.items())),
         "token_param_role_counts": dict(sorted(token_param_role_counts.items())),
+        "creator_vault_authority_status_counts": dict(
+            sorted(creator_vault_authority_status_counts.items())
+        ),
+        "creator_vault_mismatch_reason_counts": dict(
+            sorted(creator_vault_mismatch_reason_counts.items())
+        ),
+        "creator_identity_source_counts": dict(sorted(creator_identity_source_counts.items())),
+        "amount_guard_status_counts": dict(sorted(amount_guard_status_counts.items())),
+        "simulation_error_custom_code_counts": dict(
+            sorted(simulation_error_custom_code_counts.items())
+        ),
         "skip_reason_counts": dict(sorted(skip_reason_counts.items())),
         "entry_materialized_rows": status_counts.get("entry_materialized", 0),
         "transport_only_missing_token_quantity_rows": status_counts.get(
@@ -894,6 +951,11 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- reason_counts: `{json.dumps(materialization['reason_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- buy_variant_counts: `{json.dumps(materialization['buy_variant_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- token_param_role_counts: `{json.dumps(materialization['token_param_role_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- creator_vault_authority_status_counts: `{json.dumps(materialization['creator_vault_authority_status_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- creator_vault_mismatch_reason_counts: `{json.dumps(materialization['creator_vault_mismatch_reason_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- creator_identity_source_counts: `{json.dumps(materialization['creator_identity_source_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- amount_guard_status_counts: `{json.dumps(materialization['amount_guard_status_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- simulation_error_custom_code_counts: `{json.dumps(materialization['simulation_error_custom_code_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- skip_reason_counts: `{json.dumps(materialization['skip_reason_counts'], ensure_ascii=False, sort_keys=True)}`",
         ]
     )

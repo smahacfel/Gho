@@ -4663,6 +4663,7 @@ struct P37ShadowProbeCandidate {
     v3_shadow_reason_code: Option<String>,
     v3_shadow_confidence: Option<f64>,
     curve_data_known: Option<bool>,
+    legacy_bonding_curve_snapshot: Option<BondingCurve>,
     rollout_namespace: String,
     source_decision_plane: Option<String>,
     source_decision_log_path: Option<String>,
@@ -4806,6 +4807,7 @@ impl P37ShadowProbeCandidate {
             v3_shadow_reason_code: log.v3_shadow_reason_code.clone(),
             v3_shadow_confidence: log.v3_shadow_confidence,
             curve_data_known: log.curve_data_known,
+            legacy_bonding_curve_snapshot: p37_shadow_probe_legacy_curve_snapshot_from_log(log),
             rollout_namespace: rollout_namespace.to_string(),
             source_decision_plane: log.decision_plane.clone(),
             source_decision_log_path: None,
@@ -4813,6 +4815,50 @@ impl P37ShadowProbeCandidate {
             source_decision_row_sha256: None,
         }
     }
+}
+
+fn p37_shadow_probe_json_u64(value: &serde_json::Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_i64().and_then(|raw| u64::try_from(raw).ok()))
+        .or_else(|| {
+            value.as_f64().and_then(|raw| {
+                (raw.is_finite() && raw >= 0.0 && raw.fract() == 0.0).then_some(raw as u64)
+            })
+        })
+}
+
+fn p37_shadow_probe_reserve_pair(value: &serde_json::Value) -> Option<(u64, u64)> {
+    let values = value.as_array()?;
+    let sol_reserves = p37_shadow_probe_json_u64(values.first()?)?;
+    let token_reserves = p37_shadow_probe_json_u64(values.get(1)?)?;
+    if sol_reserves == 0 || token_reserves == 0 {
+        return None;
+    }
+    Some((sol_reserves, token_reserves))
+}
+
+fn p37_shadow_probe_legacy_curve_snapshot_from_log(
+    log: &ghost_brain::oracle::GatekeeperBuyLog,
+) -> Option<BondingCurve> {
+    if log.curve_data_known != Some(true) {
+        return None;
+    }
+    let snapshot = log.v3_materialized_feature_snapshot.as_ref()?;
+    let account_features = snapshot.get("account_features")?;
+    let (virtual_sol_reserves, virtual_token_reserves) =
+        p37_shadow_probe_reserve_pair(account_features.get("current_reserves")?)?;
+    Some(BondingCurve {
+        discriminator: 0,
+        virtual_token_reserves,
+        virtual_sol_reserves,
+        real_token_reserves: virtual_token_reserves
+            .min(ghost_core::PROTOCOL_GENESIS_TOKEN_TOTAL_SUPPLY),
+        real_sol_reserves: virtual_sol_reserves,
+        token_total_supply: ghost_core::PROTOCOL_GENESIS_TOKEN_TOTAL_SUPPLY,
+        complete: 0,
+        _padding: [0; 7],
+    })
 }
 
 fn p37_shadow_probe_serialized_replay_payload_hash(
@@ -4880,6 +4926,7 @@ struct P37ShadowProbeSelectionRecord {
     v3_shadow_reason_code: Option<String>,
     v3_shadow_confidence: Option<f64>,
     curve_data_known: Option<bool>,
+    legacy_bonding_curve_snapshot: Option<BondingCurve>,
     probe_amount_source: String,
     probe_amount_lamports: u64,
     probe_slippage_bps: u64,
@@ -4944,6 +4991,18 @@ struct P37ShadowProbeTransportRecord {
     simulation_error_message: Option<String>,
     simulation_error_account_pubkey: Option<String>,
     simulation_error_account_role: Option<String>,
+    simulation_error_actual_account_pubkey: Option<String>,
+    simulation_error_expected_account_pubkey: Option<String>,
+    creator_vault_authority_status: Option<String>,
+    creator_vault_actual_pubkey: Option<String>,
+    creator_vault_expected_pubkey: Option<String>,
+    creator_vault_mismatch_reason: Option<String>,
+    creator_identity_source: Option<String>,
+    creator_identity_authoritative: Option<bool>,
+    amount_provided_lamports_if_available: Option<u64>,
+    amount_required_lamports_if_available: Option<u64>,
+    amount_shortfall_lamports_if_available: Option<u64>,
+    amount_guard_status: Option<String>,
     simulation_error_instruction_index: Option<u64>,
     simulation_error_custom_code: Option<u64>,
     simulation_error_program_id: Option<String>,
@@ -5266,6 +5325,7 @@ fn p37_shadow_probe_selection_record(
         v3_shadow_reason_code: candidate.v3_shadow_reason_code.clone(),
         v3_shadow_confidence: candidate.v3_shadow_confidence,
         curve_data_known: candidate.curve_data_known,
+        legacy_bonding_curve_snapshot: candidate.legacy_bonding_curve_snapshot,
         probe_amount_source: config.probe_amount_source.clone(),
         probe_amount_lamports: config.probe_amount_lamports,
         probe_slippage_bps: config.probe_slippage_bps,
@@ -5385,6 +5445,18 @@ fn p37_shadow_probe_artifact_records(
         simulation_error_message: None,
         simulation_error_account_pubkey: None,
         simulation_error_account_role: None,
+        simulation_error_actual_account_pubkey: None,
+        simulation_error_expected_account_pubkey: None,
+        creator_vault_authority_status: None,
+        creator_vault_actual_pubkey: None,
+        creator_vault_expected_pubkey: None,
+        creator_vault_mismatch_reason: None,
+        creator_identity_source: None,
+        creator_identity_authoritative: None,
+        amount_provided_lamports_if_available: None,
+        amount_required_lamports_if_available: None,
+        amount_shortfall_lamports_if_available: None,
+        amount_guard_status: None,
         simulation_error_instruction_index: None,
         simulation_error_custom_code: None,
         simulation_error_program_id: None,
@@ -5642,6 +5714,18 @@ struct P37ShadowProbeExecutionDiagnostics {
     simulation_error_message: Option<String>,
     simulation_error_account_pubkey: Option<String>,
     simulation_error_account_role: Option<String>,
+    simulation_error_actual_account_pubkey: Option<String>,
+    simulation_error_expected_account_pubkey: Option<String>,
+    creator_vault_authority_status: Option<String>,
+    creator_vault_actual_pubkey: Option<String>,
+    creator_vault_expected_pubkey: Option<String>,
+    creator_vault_mismatch_reason: Option<String>,
+    creator_identity_source: Option<String>,
+    creator_identity_authoritative: Option<bool>,
+    amount_provided_lamports_if_available: Option<u64>,
+    amount_required_lamports_if_available: Option<u64>,
+    amount_shortfall_lamports_if_available: Option<u64>,
+    amount_guard_status: Option<String>,
     simulation_error_instruction_index: Option<u64>,
     simulation_error_custom_code: Option<u64>,
     simulation_error_program_id: Option<String>,
@@ -5726,6 +5810,7 @@ fn p37_shadow_probe_derive_account_overrides_for_pool(
     pool_data: &DetectedPool,
     buffered_txs: &[crate::components::gatekeeper::GatekeeperBufferedTx],
     buy_mint: Pubkey,
+    record: &P37ShadowProbeSelectionRecord,
 ) -> crate::components::trigger::BuyAccountOverrides {
     let mut account_overrides = p37_shadow_probe_derive_legacy_buy_account_overrides(buffered_txs)
         .unwrap_or_else(|| derive_buy_account_overrides(buffered_txs));
@@ -5736,10 +5821,27 @@ fn p37_shadow_probe_derive_account_overrides_for_pool(
         account_overrides.buy_variant,
         Some(trigger::PumpfunBuyVariant::LegacyBuy)
     ) {
-        account_overrides.legacy_buy_curve =
-            oracle_runtime.resolve_trigger_buy_curve(buy_mint, buffered_txs);
+        account_overrides.legacy_buy_curve = oracle_runtime
+            .resolve_trigger_buy_curve(buy_mint, buffered_txs)
+            .or_else(|| {
+                p37_shadow_probe_legacy_curve_snapshot_for_pool(record, pool_data, buy_mint)
+            });
     }
     account_overrides
+}
+
+fn p37_shadow_probe_legacy_curve_snapshot_for_pool(
+    record: &P37ShadowProbeSelectionRecord,
+    pool_data: &DetectedPool,
+    buy_mint: Pubkey,
+) -> Option<BondingCurve> {
+    if record.base_mint.as_deref()? != buy_mint.to_string() {
+        return None;
+    }
+    if record.pool_id != pool_data.pool_amm_id {
+        return None;
+    }
+    record.legacy_bonding_curve_snapshot
 }
 
 fn p37_shadow_probe_execution_precheck(
@@ -5918,6 +6020,187 @@ fn p37_shadow_probe_log_tail(logs: &[String]) -> Vec<String> {
         .collect()
 }
 
+fn p37_shadow_probe_clean_program_log_value(value: &str) -> String {
+    value
+        .trim()
+        .strip_prefix("Program log:")
+        .unwrap_or(value.trim())
+        .trim()
+        .trim_matches(|ch: char| ch == '"' || ch == '\'' || ch == ',' || ch == ';')
+        .to_string()
+}
+
+fn p37_shadow_probe_anchor_error_account_role(logs: &[String]) -> Option<String> {
+    const MARKER: &str = "AnchorError caused by account:";
+    logs.iter().find_map(|line| {
+        let (_, tail) = line.split_once(MARKER)?;
+        let role = tail
+            .trim()
+            .split(|ch: char| ch == '.' || ch.is_whitespace())
+            .next()
+            .unwrap_or("")
+            .trim();
+        (!role.is_empty()).then(|| role.to_string())
+    })
+}
+
+fn p37_shadow_probe_anchor_left_right_accounts(
+    logs: &[String],
+) -> (Option<String>, Option<String>) {
+    let mut left = None;
+    let mut right = None;
+    for (idx, line) in logs.iter().enumerate() {
+        let cleaned = p37_shadow_probe_clean_program_log_value(line);
+        if cleaned == "Left:" {
+            left = logs
+                .get(idx + 1)
+                .map(|value| p37_shadow_probe_clean_program_log_value(value))
+                .filter(|value| !value.is_empty());
+        } else if let Some((_, value)) = cleaned.split_once("Left:") {
+            let value = value.trim();
+            if !value.is_empty() {
+                left = Some(value.to_string());
+            }
+        } else if cleaned == "Right:" {
+            right = logs
+                .get(idx + 1)
+                .map(|value| p37_shadow_probe_clean_program_log_value(value))
+                .filter(|value| !value.is_empty());
+        } else if let Some((_, value)) = cleaned.split_once("Right:") {
+            let value = value.trim();
+            if !value.is_empty() {
+                right = Some(value.to_string());
+            }
+        }
+    }
+    (left, right)
+}
+
+fn p37_shadow_probe_parse_u64_log_value(value: Option<&str>) -> Option<u64> {
+    let mut digits = String::new();
+    for ch in value?.chars() {
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+        } else if matches!(ch, '_' | ',' | ' ') && !digits.is_empty() {
+            continue;
+        } else if !digits.is_empty() {
+            break;
+        }
+    }
+    (!digits.is_empty())
+        .then(|| digits.parse::<u64>().ok())
+        .flatten()
+}
+
+#[derive(Debug, Clone, Default)]
+struct P37ShadowProbeAmountGuardDiagnostics {
+    provided_lamports: Option<u64>,
+    required_lamports: Option<u64>,
+    shortfall_lamports: Option<u64>,
+    status: Option<String>,
+}
+
+fn p37_shadow_probe_amount_guard_diagnostics(
+    custom_code: Option<u64>,
+    left: Option<&str>,
+    right: Option<&str>,
+) -> P37ShadowProbeAmountGuardDiagnostics {
+    if custom_code != Some(6002) {
+        return P37ShadowProbeAmountGuardDiagnostics::default();
+    }
+    let provided = p37_shadow_probe_parse_u64_log_value(left);
+    let required = p37_shadow_probe_parse_u64_log_value(right);
+    let shortfall = provided
+        .zip(required)
+        .and_then(|(provided, required)| required.checked_sub(provided));
+    let status = match (provided, required, shortfall) {
+        (Some(_), Some(_), Some(value)) if value > 0 => {
+            Some("amount_required_exceeds_probe_amount".to_string())
+        }
+        (Some(_), Some(_), _) => Some("amount_guard_no_shortfall".to_string()),
+        _ => Some("amount_guard_values_unavailable".to_string()),
+    };
+    P37ShadowProbeAmountGuardDiagnostics {
+        provided_lamports: provided,
+        required_lamports: required,
+        shortfall_lamports: shortfall,
+        status,
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct P37ShadowProbeCreatorVaultAuthorityDiagnostics {
+    status: Option<String>,
+    actual_pubkey: Option<String>,
+    expected_pubkey: Option<String>,
+    mismatch_reason: Option<String>,
+    identity_source: Option<String>,
+    identity_authoritative: Option<bool>,
+}
+
+fn p37_shadow_probe_creator_vault_authority_diagnostics(
+    request: Option<&crate::components::trigger::PreparedBuyRequest>,
+    account_role: Option<&str>,
+    actual: Option<&str>,
+    expected: Option<&str>,
+) -> P37ShadowProbeCreatorVaultAuthorityDiagnostics {
+    if account_role != Some("creator_vault") {
+        return P37ShadowProbeCreatorVaultAuthorityDiagnostics::default();
+    }
+
+    let identity_source = request
+        .and_then(|request| request.account_overrides.creator_pubkey)
+        .map(|_| "account_overrides.creator_pubkey".to_string())
+        .or_else(|| Some("creator_pubkey_unavailable".to_string()));
+    let actual_pubkey = actual.map(str::to_string);
+    let expected_pubkey = expected.map(str::to_string);
+
+    match (actual, expected) {
+        (Some(actual), Some(expected)) if actual == expected => {
+            P37ShadowProbeCreatorVaultAuthorityDiagnostics {
+                status: Some("creator_vault_authority_matched".to_string()),
+                actual_pubkey,
+                expected_pubkey,
+                mismatch_reason: None,
+                identity_source,
+                identity_authoritative: Some(true),
+            }
+        }
+        (Some(_), Some(_)) => P37ShadowProbeCreatorVaultAuthorityDiagnostics {
+            status: Some("creator_vault_source_not_authoritative".to_string()),
+            actual_pubkey,
+            expected_pubkey,
+            mismatch_reason: Some("actual_expected_mismatch".to_string()),
+            identity_source,
+            identity_authoritative: Some(false),
+        },
+        (Some(_), None) => P37ShadowProbeCreatorVaultAuthorityDiagnostics {
+            status: Some("creator_vault_authority_unverified".to_string()),
+            actual_pubkey,
+            expected_pubkey,
+            mismatch_reason: Some("expected_creator_vault_unavailable".to_string()),
+            identity_source,
+            identity_authoritative: None,
+        },
+        (None, Some(_)) => P37ShadowProbeCreatorVaultAuthorityDiagnostics {
+            status: Some("creator_vault_authority_unverified".to_string()),
+            actual_pubkey,
+            expected_pubkey,
+            mismatch_reason: Some("actual_creator_vault_unavailable".to_string()),
+            identity_source,
+            identity_authoritative: None,
+        },
+        (None, None) => P37ShadowProbeCreatorVaultAuthorityDiagnostics {
+            status: Some("creator_vault_authority_unverified".to_string()),
+            actual_pubkey,
+            expected_pubkey,
+            mismatch_reason: Some("creator_vault_left_right_unavailable".to_string()),
+            identity_source,
+            identity_authoritative: None,
+        },
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct P37ShadowProbeSimulationInstructionDiagnostics {
     instruction_index: Option<u64>,
@@ -5931,6 +6214,9 @@ struct P37ShadowProbeSimulationInstructionDiagnostics {
     log_tail: Vec<String>,
     instruction_accounts: Vec<String>,
     instruction_account_roles: Vec<String>,
+    anchor_error_account_role: Option<String>,
+    anchor_error_actual_account_pubkey: Option<String>,
+    anchor_error_expected_account_pubkey: Option<String>,
 }
 
 fn p37_shadow_probe_simulation_instruction_diagnostics(
@@ -5971,6 +6257,8 @@ fn p37_shadow_probe_simulation_instruction_diagnostics(
         .map(str::to_string);
     let (program_error_name, program_error_family, category) =
         p37_shadow_probe_program_error_mapping(program_id.as_deref(), custom_code);
+    let (anchor_error_actual_account_pubkey, anchor_error_expected_account_pubkey) =
+        p37_shadow_probe_anchor_left_right_accounts(logs);
     P37ShadowProbeSimulationInstructionDiagnostics {
         instruction_index,
         custom_code,
@@ -5984,6 +6272,9 @@ fn p37_shadow_probe_simulation_instruction_diagnostics(
         log_tail: p37_shadow_probe_log_tail(logs),
         instruction_accounts,
         instruction_account_roles,
+        anchor_error_account_role: p37_shadow_probe_anchor_error_account_role(logs),
+        anchor_error_actual_account_pubkey,
+        anchor_error_expected_account_pubkey,
     }
 }
 
@@ -6025,6 +6316,26 @@ fn p37_shadow_probe_execution_diagnostics(
         simulation_logs,
         request,
     );
+    let anchor_error_actual_account_pubkey = instruction_diagnostics
+        .anchor_error_actual_account_pubkey
+        .clone();
+    let anchor_error_expected_account_pubkey = instruction_diagnostics
+        .anchor_error_expected_account_pubkey
+        .clone();
+    let account_pubkey = account_pubkey.or_else(|| anchor_error_actual_account_pubkey.clone());
+    let account_role =
+        account_role.or_else(|| instruction_diagnostics.anchor_error_account_role.clone());
+    let creator_vault_authority = p37_shadow_probe_creator_vault_authority_diagnostics(
+        request,
+        account_role.as_deref(),
+        anchor_error_actual_account_pubkey.as_deref(),
+        anchor_error_expected_account_pubkey.as_deref(),
+    );
+    let amount_guard = p37_shadow_probe_amount_guard_diagnostics(
+        instruction_diagnostics.custom_code,
+        anchor_error_actual_account_pubkey.as_deref(),
+        anchor_error_expected_account_pubkey.as_deref(),
+    );
     let request_overrides = request.map(|request| &request.account_overrides);
     let associated_bonding_curve = request_overrides
         .and_then(|overrides| overrides.associated_bonding_curve)
@@ -6052,6 +6363,18 @@ fn p37_shadow_probe_execution_diagnostics(
         simulation_error_message: error_message,
         simulation_error_account_pubkey: account_pubkey,
         simulation_error_account_role: account_role,
+        simulation_error_actual_account_pubkey: anchor_error_actual_account_pubkey,
+        simulation_error_expected_account_pubkey: anchor_error_expected_account_pubkey,
+        creator_vault_authority_status: creator_vault_authority.status,
+        creator_vault_actual_pubkey: creator_vault_authority.actual_pubkey,
+        creator_vault_expected_pubkey: creator_vault_authority.expected_pubkey,
+        creator_vault_mismatch_reason: creator_vault_authority.mismatch_reason,
+        creator_identity_source: creator_vault_authority.identity_source,
+        creator_identity_authoritative: creator_vault_authority.identity_authoritative,
+        amount_provided_lamports_if_available: amount_guard.provided_lamports,
+        amount_required_lamports_if_available: amount_guard.required_lamports,
+        amount_shortfall_lamports_if_available: amount_guard.shortfall_lamports,
+        amount_guard_status: amount_guard.status,
         simulation_error_instruction_index: instruction_diagnostics.instruction_index,
         simulation_error_custom_code: instruction_diagnostics.custom_code,
         simulation_error_program_id: instruction_diagnostics.program_id,
@@ -6201,6 +6524,19 @@ fn p37_shadow_probe_transport_from_event(
         simulation_error_message: diagnostics.simulation_error_message,
         simulation_error_account_pubkey: diagnostics.simulation_error_account_pubkey,
         simulation_error_account_role: diagnostics.simulation_error_account_role,
+        simulation_error_actual_account_pubkey: diagnostics.simulation_error_actual_account_pubkey,
+        simulation_error_expected_account_pubkey: diagnostics
+            .simulation_error_expected_account_pubkey,
+        creator_vault_authority_status: diagnostics.creator_vault_authority_status,
+        creator_vault_actual_pubkey: diagnostics.creator_vault_actual_pubkey,
+        creator_vault_expected_pubkey: diagnostics.creator_vault_expected_pubkey,
+        creator_vault_mismatch_reason: diagnostics.creator_vault_mismatch_reason,
+        creator_identity_source: diagnostics.creator_identity_source,
+        creator_identity_authoritative: diagnostics.creator_identity_authoritative,
+        amount_provided_lamports_if_available: diagnostics.amount_provided_lamports_if_available,
+        amount_required_lamports_if_available: diagnostics.amount_required_lamports_if_available,
+        amount_shortfall_lamports_if_available: diagnostics.amount_shortfall_lamports_if_available,
+        amount_guard_status: diagnostics.amount_guard_status,
         simulation_error_instruction_index: diagnostics.simulation_error_instruction_index,
         simulation_error_custom_code: diagnostics.simulation_error_custom_code,
         simulation_error_program_id: diagnostics.simulation_error_program_id,
@@ -6318,6 +6654,19 @@ fn p37_shadow_probe_transport_from_error(
         simulation_error_message: diagnostics.simulation_error_message,
         simulation_error_account_pubkey: diagnostics.simulation_error_account_pubkey,
         simulation_error_account_role: diagnostics.simulation_error_account_role,
+        simulation_error_actual_account_pubkey: diagnostics.simulation_error_actual_account_pubkey,
+        simulation_error_expected_account_pubkey: diagnostics
+            .simulation_error_expected_account_pubkey,
+        creator_vault_authority_status: diagnostics.creator_vault_authority_status,
+        creator_vault_actual_pubkey: diagnostics.creator_vault_actual_pubkey,
+        creator_vault_expected_pubkey: diagnostics.creator_vault_expected_pubkey,
+        creator_vault_mismatch_reason: diagnostics.creator_vault_mismatch_reason,
+        creator_identity_source: diagnostics.creator_identity_source,
+        creator_identity_authoritative: diagnostics.creator_identity_authoritative,
+        amount_provided_lamports_if_available: diagnostics.amount_provided_lamports_if_available,
+        amount_required_lamports_if_available: diagnostics.amount_required_lamports_if_available,
+        amount_shortfall_lamports_if_available: diagnostics.amount_shortfall_lamports_if_available,
+        amount_guard_status: diagnostics.amount_guard_status,
         simulation_error_instruction_index: diagnostics.simulation_error_instruction_index,
         simulation_error_custom_code: diagnostics.simulation_error_custom_code,
         simulation_error_program_id: diagnostics.simulation_error_program_id,
@@ -6424,6 +6773,7 @@ async fn run_p37_shadow_probe_dispatch(
         pool_data.as_ref(),
         &buffered_txs,
         buy_mint,
+        &record,
     );
     if let Some(reason) =
         p37_shadow_probe_execution_precheck(&record, &account_overrides, &buy_mint, &pool_data)
@@ -6641,6 +6991,7 @@ async fn maybe_handle_p37_shadow_probe_decision(
                 pool_data.as_ref(),
                 buffered_txs,
                 buy_mint,
+                &record,
             );
             if let Some(reason) = p37_shadow_probe_execution_precheck(
                 &record,
@@ -12470,6 +12821,7 @@ mod tests {
             v3_shadow_reason_code: Some("manipulation_contradiction".to_string()),
             v3_shadow_confidence: Some(0.25),
             curve_data_known: Some(true),
+            legacy_bonding_curve_snapshot: None,
             rollout_namespace: "p37-j3-test".to_string(),
             source_decision_plane: Some("legacy_live".to_string()),
             source_decision_log_path: None,
@@ -12575,6 +12927,32 @@ mod tests {
     }
 
     #[test]
+    fn p37_shadow_probe_candidate_materializes_legacy_curve_snapshot_from_v3_mfs() {
+        let active_config = review_test_gatekeeper_config();
+        let pool_id = Pubkey::new_unique();
+        let assessment = test_gatekeeper_buy_assessment(6);
+        let mut log = assessment.to_buy_log(&pool_id, &active_config);
+        log.curve_data_known = Some(true);
+        log.v3_materialized_feature_snapshot = Some(serde_json::json!({
+            "account_features": {
+                "current_reserves": [30_000_000_000_u64, 1_073_000_000_000_000_u64]
+            }
+        }));
+
+        let candidate = P37ShadowProbeCandidate::from_gatekeeper_log(&log, "r15-smoke");
+        let curve = candidate
+            .legacy_bonding_curve_snapshot
+            .expect("curve snapshot should materialize from decision-time MFS reserves");
+
+        assert_eq!(curve.virtual_sol_reserves, 30_000_000_000);
+        assert_eq!(curve.virtual_token_reserves, 1_073_000_000_000_000);
+        assert_eq!(
+            curve.token_total_supply,
+            ghost_core::PROTOCOL_GENESIS_TOKEN_TOTAL_SUPPLY
+        );
+    }
+
+    #[test]
     fn p37_shadow_probe_selection_record_skips_missing_ab_record_id() {
         let config = P37ShadowProbeConfig {
             enabled: true,
@@ -12665,6 +13043,95 @@ mod tests {
 
         assert_eq!(instruction_index, Some(3));
         assert_eq!(custom_code, Some(2006));
+    }
+
+    #[test]
+    fn p37_shadow_probe_parses_anchor_constraint_account_and_left_right() {
+        let logs = vec![
+            "Program log: Instruction: Buy".to_string(),
+            "Program log: AnchorError caused by account: creator_vault. Error Code: ConstraintSeeds. Error Number: 2006. Error Message: A seeds constraint was violated.".to_string(),
+            "Program log: Left:".to_string(),
+            "Program log: ActualCreatorVault1111111111111111111111111".to_string(),
+            "Program log: Right:".to_string(),
+            "Program log: ExpectedCreatorVault11111111111111111111111".to_string(),
+        ];
+
+        let (actual, expected) = p37_shadow_probe_anchor_left_right_accounts(&logs);
+
+        assert_eq!(
+            p37_shadow_probe_anchor_error_account_role(&logs).as_deref(),
+            Some("creator_vault")
+        );
+        assert_eq!(
+            actual.as_deref(),
+            Some("ActualCreatorVault1111111111111111111111111")
+        );
+        assert_eq!(
+            expected.as_deref(),
+            Some("ExpectedCreatorVault11111111111111111111111")
+        );
+    }
+
+    #[test]
+    fn p37_shadow_probe_marks_creator_vault_source_not_authoritative() {
+        let actual = "ActualCreatorVault1111111111111111111111111";
+        let expected = "ExpectedCreatorVault11111111111111111111111";
+        let diagnostics = p37_shadow_probe_creator_vault_authority_diagnostics(
+            None,
+            Some("creator_vault"),
+            Some(actual),
+            Some(expected),
+        );
+
+        assert_eq!(
+            diagnostics.status.as_deref(),
+            Some("creator_vault_source_not_authoritative")
+        );
+        assert_eq!(diagnostics.actual_pubkey.as_deref(), Some(actual));
+        assert_eq!(diagnostics.expected_pubkey.as_deref(), Some(expected));
+        assert_eq!(
+            diagnostics.mismatch_reason.as_deref(),
+            Some("actual_expected_mismatch")
+        );
+        assert_eq!(diagnostics.identity_authoritative, Some(false));
+    }
+
+    #[test]
+    fn p37_shadow_probe_extracts_amount_shortfall_from_left_right_logs() {
+        let diagnostics = p37_shadow_probe_amount_guard_diagnostics(
+            Some(6002),
+            Some("7_000_000"),
+            Some("7739140"),
+        );
+
+        assert_eq!(diagnostics.provided_lamports, Some(7_000_000));
+        assert_eq!(diagnostics.required_lamports, Some(7_739_140));
+        assert_eq!(diagnostics.shortfall_lamports, Some(739_140));
+        assert_eq!(
+            diagnostics.status.as_deref(),
+            Some("amount_required_exceeds_probe_amount")
+        );
+    }
+
+    #[test]
+    fn p37_shadow_probe_parses_inline_anchor_left_right_values() {
+        let logs = vec![
+            "Program log: Left: 7000000".to_string(),
+            "Program log: Right: 7011730".to_string(),
+        ];
+
+        let (left, right) = p37_shadow_probe_anchor_left_right_accounts(&logs);
+        let diagnostics = p37_shadow_probe_amount_guard_diagnostics(
+            Some(6002),
+            left.as_deref(),
+            right.as_deref(),
+        );
+
+        assert_eq!(left.as_deref(), Some("7000000"));
+        assert_eq!(right.as_deref(), Some("7011730"));
+        assert_eq!(diagnostics.provided_lamports, Some(7_000_000));
+        assert_eq!(diagnostics.required_lamports, Some(7_011_730));
+        assert_eq!(diagnostics.shortfall_lamports, Some(11_730));
     }
 
     #[test]
@@ -12797,6 +13264,65 @@ mod tests {
             ..Default::default()
         };
 
+        assert_eq!(
+            p37_shadow_probe_execution_precheck(&record, &overrides, &buy_mint, &pool),
+            None
+        );
+    }
+
+    #[test]
+    fn p37_shadow_probe_uses_selection_curve_snapshot_for_legacy_override_after_runtime_cleanup() {
+        use ghost_brain::oracle::snapshot_engine::PoolMetrics;
+        use ghost_core::shadow_ledger::TxKey;
+        use std::sync::Arc;
+
+        let (mut record, pool, buy_mint) = p37_shadow_probe_precheck_record_and_pool();
+        let curve = BondingCurve {
+            discriminator: 0,
+            virtual_token_reserves: 1_000_000_000_000,
+            virtual_sol_reserves: 30_000_000_000,
+            real_token_reserves: 1_000_000_000_000,
+            real_sol_reserves: 30_000_000_000,
+            token_total_supply: ghost_core::PROTOCOL_GENESIS_TOKEN_TOTAL_SUPPLY,
+            complete: 0,
+            _padding: [0; 7],
+        };
+        record.legacy_bonding_curve_snapshot = Some(curve);
+        let assoc_curve = trigger::DirectBuyBuilder::canonical_associated_bonding_curve(
+            &buy_mint,
+            &Pubkey::from_str(TOKEN_PROGRAM_ID).expect("valid token program"),
+        );
+        let mut tx = (*test_pool_observation_tx("legacy-probe-cleanup")).clone();
+        tx.buy_variant = Some("legacy_buy".to_string());
+        tx.associated_bonding_curve = Some(assoc_curve.to_string());
+        tx.token_program = Some(TOKEN_PROGRAM_ID.to_string());
+        tx.success = true;
+        tx.is_buy = true;
+        let buffered_txs = vec![crate::components::gatekeeper::GatekeeperBufferedTx {
+            tx: Arc::new(tx),
+            metrics: PoolMetrics::default(),
+            tx_key: TxKey::new(1_000, Some(1), Some(0), None, 0).expect("tx key"),
+        }];
+        let runtime = OracleRuntime::new(
+            Arc::new(HyperPredictionOracle::default()),
+            "pump_program".to_string(),
+            "bonk_program".to_string(),
+            Arc::new(ShadowLedger::new()),
+        );
+
+        let overrides = p37_shadow_probe_derive_account_overrides_for_pool(
+            &runtime,
+            &pool,
+            &buffered_txs,
+            buy_mint,
+            &record,
+        );
+
+        assert_eq!(
+            overrides.buy_variant,
+            Some(trigger::PumpfunBuyVariant::LegacyBuy)
+        );
+        assert_eq!(overrides.legacy_buy_curve, Some(curve));
         assert_eq!(
             p37_shadow_probe_execution_precheck(&record, &overrides, &buy_mint, &pool),
             None

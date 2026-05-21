@@ -1494,6 +1494,279 @@ Acceptance:
 Collection, Phase B, P2, live, active policy changes, IWIM changes and threshold
 tuning remain out of scope.
 
+## P3.7-J3K5 Creator-Vault Source Authority / Amount Guard
+
+### Trigger
+
+J3K4 bounded R1 produced counterfactual probe transport/entry rows with exact
+V3 decision join, but left two simulation classes that must be understood before
+scaling:
+
+```text
+simulation_account_layout_mismatch:custom_2006 = creator_vault actual/expected mismatch
+simulation_slippage_or_price_mismatch:custom_6002 = TooMuchSolRequired
+```
+
+The creator-vault case is especially sensitive because the expected vault
+appears only in Anchor error diagnostics. That value is post-simulation
+evidence and must not be used to silently rebuild or correct probe requests.
+
+### Decision
+
+J3K5 keeps request construction unchanged and makes both classes auditable:
+
+- creator-vault mismatch rows carry `creator_vault_authority_status`,
+  `creator_vault_actual_pubkey`, `creator_vault_expected_pubkey`,
+  `creator_vault_mismatch_reason`, `creator_identity_source` and
+  `creator_identity_authoritative`;
+- `creator_vault_source_not_authoritative` means the probe request's creator
+  source derived a vault that does not match the program-expected vault;
+- expected creator-vault values parsed from logs are diagnostic-only and must
+  not be fed back into request construction;
+- Pump.fun `TooMuchSolRequired` rows carry
+  `amount_provided_lamports_if_available`,
+  `amount_required_lamports_if_available`,
+  `amount_shortfall_lamports_if_available` and `amount_guard_status`;
+- join-key audit reports creator-vault authority, mismatch reason, identity
+  source, custom error code and amount guard counts.
+
+### R15 J3K5 Gate
+
+The next bounded run, if executed, uses:
+
+```text
+configs/rollout/shadow-burnin-v3-p37-counterfactual-probe-r15-bounded-j3k5-r1.toml
+```
+
+Acceptance:
+
+- strict V3/MFS replay remains OK;
+- probe selection/transport/entry exact decision join remains 100%;
+- active BUY remains untouched;
+- creator-vault custom 2006 rows are classified as source-authority mismatch
+  or explicitly unverified;
+- amount custom 6002 rows expose provided/required/shortfall if logs contain
+  parseable values;
+- no expected creator-vault value from simulation logs is used as a runtime
+  repair source.
+
+Collection, Phase B, P2, live, active policy changes, IWIM changes and threshold
+tuning remain out of scope.
+
+### R15 J3K5 Runtime Result
+
+`r15-bounded-j3k5-r1` was stopped early after reaching the bounded transport
+target:
+
+```text
+probe_selection_rows = 13
+probe_skips_rows = 3
+probe_transport_rows = 10
+probe_shadow_entry_rows = 9
+probe_required_exact_decision_v3_join_coverage = 1.0
+active_buys_rows = 0
+```
+
+Observed materialization classes:
+
+```text
+entry_materialized = 8
+transport_only_missing_token_quantity = 1
+simulation_slippage_or_price_mismatch:custom_6002 = 1
+```
+
+No `custom_2006` row appeared in this run, so creator-vault authority fields are
+code/test validated but not runtime-observed here. `custom_6002` was observed,
+but this row did not include parseable Anchor `Left/Right` amount values, so the
+amount guard status is `amount_guard_values_unavailable`.
+
+Decision: J3K5 is a bounded smoke MINIMAL PASS / DIAGNOSED. Collection remains
+HOLD until amount-error diagnostics are sufficient for scaling.
+
+### R15 J3K5 R2 Runtime Result
+
+After the R1 smoke, the amount guard parser was extended to handle inline Anchor
+logs:
+
+```text
+Program log: Left: <value>
+Program log: Right: <value>
+```
+
+`r15-bounded-j3k5-r2` was then stopped after the bounded transport target:
+
+```text
+probe_selection_rows = 19
+probe_skips_rows = 7
+probe_transport_rows = 10
+probe_shadow_entry_rows = 9
+probe_required_exact_decision_v3_join_coverage = 1.0
+active_buys_rows = 0
+```
+
+Observed materialization classes:
+
+```text
+entry_materialized = 7
+transport_only_missing_token_quantity = 1
+simulation_account_layout_mismatch:custom_2006 = 2
+```
+
+Creator-vault source-authority diagnostics were runtime observed:
+
+```text
+creator_vault_authority_status_counts = {"creator_vault_source_not_authoritative": 2}
+creator_vault_mismatch_reason_counts = {"actual_expected_mismatch": 2}
+creator_identity_source_counts = {"account_overrides.creator_pubkey": 2}
+```
+
+No `custom_6002` row appeared in R2, so amount guard parsing is code/test
+validated but not re-observed at runtime after the inline parser fix.
+
+Decision: J3K5 remains MINIMAL PASS / DIAGNOSED. Collection remains HOLD.
+The next repair path is creator-vault source authority / route identity, not
+amount sizing.
+
+## P3.7-J3K3 Bounded R1 Early Stop and J3K4 Simulation Error Diagnostics
+
+### Trigger
+
+J3K3 fixed the dominant `missing_bonding_curve` handoff class by allowing the
+probe plane to use the decision-time V3/MFS legacy curve snapshot as a
+probe-only fallback for legacy buy account overrides. The R15-r10-j3k3 smoke
+validated probe transport/entry with exact decision/V3 joins.
+
+A first small bounded run was then started:
+
+```text
+shadow-burnin-v3-p37-counterfactual-probe-r15-bounded-j3k3-r1
+```
+
+The run was stopped early instead of waiting for timeout because the initial
+artifact snapshot showed simulation errors. This follows the operational rule
+for J3 work: do not let a bounded run continue blindly when a new failure class
+is visible early.
+
+### Bounded R1 Result
+
+Final bounded-r1 snapshot after early stop:
+
+```text
+v3_rows = 5
+strict_full_replay = full_replay_ok
+probe_selection_rows = 26
+probe_transport_rows = 17
+probe_shadow_entry_rows = 16
+probe_lifecycle_rows = 0
+probe_required_exact_decision_v3_join_coverage = 1.0
+probe_entry_materialized = 13
+simulation_error_rows = 3
+transport_only_missing_token_quantity = 1
+active_buy_rows = 0
+```
+
+The probe transport/entry path remains valid for execution-ready rows, but the
+run is not clean enough to scale.
+
+Simulation-error classes:
+
+```text
+simulation_account_layout_mismatch:custom_2006 = 2
+simulation_slippage_or_price_mismatch:custom_6002 = 1
+```
+
+The `custom_2006` rows are Pump.fun Anchor `ConstraintSeeds` failures on
+`creator_vault`: the transaction used a creator-vault PDA derived from the
+local `creator_pubkey`, while the program log exposed a different expected
+creator-vault PDA.
+
+### J3K4 Diagnostic Repair
+
+J3K4 adds additive simulation diagnostics to the probe transport schema:
+
+```text
+simulation_error_account_role
+simulation_error_account_pubkey
+simulation_error_actual_account_pubkey
+simulation_error_expected_account_pubkey
+```
+
+For Anchor constraint failures, the runtime now parses:
+
+```text
+AnchorError caused by account: <role>
+Program log: Left:
+Program log: <actual_pubkey>
+Program log: Right:
+Program log: <expected_pubkey>
+```
+
+This does not change active decisions, live behavior, IWIM, thresholds, P2, or
+probe dispatch semantics. It only turns `custom_2006` from a generic layout
+mismatch into an auditable `creator_vault` actual-vs-expected mismatch.
+
+### Next Gate
+
+Do not continue broader collection from bounded-r1 alone. The next decision must
+use the bounded-r1 report:
+
+- if `creator_vault` mismatch remains rare and fully classified, allow another
+  small bounded run with stop-loss gates;
+- if it grows, open a creator-vault materialization/route repair;
+- if `custom_6002` grows, open an amount/slippage calibration guard;
+- if lifecycle remains absent after clean entry rows, open lifecycle-specific
+  validation rather than modifying probe selection.
+
+Collection, Phase B, P2, live, active policy changes, IWIM changes and threshold
+tuning remain out of scope.
+
+### J3K4 Runtime Validation Update
+
+The follow-up diagnostic namespace was executed:
+
+```text
+shadow-burnin-v3-p37-counterfactual-probe-r15-bounded-j3k4-r1
+```
+
+Result:
+
+```text
+probe_selection_rows = 12
+probe_transport_rows = 10
+probe_shadow_entry_rows = 10
+probe_required_exact_decision_v3_join_coverage = 1.0
+entry_materialized = 8
+simulation_error_rows = 2
+active_buy_rows = 0
+```
+
+J3K4 successfully populated structured Anchor constraint diagnostics for
+`custom_2006`:
+
+```text
+simulation_error_account_role = creator_vault
+simulation_error_actual_account_pubkey = 4D8hkwjsgvn5hrQgJULqxuh5hSX3UEUEe2U9nWpTiyTP
+simulation_error_expected_account_pubkey = GdZspP3tLaQQ5jrFixZ2xPmWjshMWEX6K9ynkx2BiXLM
+```
+
+This proves the `custom_2006` class is a route/account identity mismatch for
+`creator_vault`, not an anonymous `AccountNotFound` or join-key failure.
+
+The next decision is intentionally narrow:
+
+```text
+P3.7-J3K5 Creator-Vault Source Authority / Amount Guard Decision
+```
+
+J3K5 must decide whether to:
+
+- narrow eligibility when creator identity is not route-authoritative;
+- add decision-time-safe creator-vault/source materialization;
+- keep `custom_2006` as a diagnosed simulation-error class under stop-loss gates;
+- add an amount/slippage guard if `custom_6002` grows.
+
+Do not run broad collection until this decision is explicit.
+
 ## P3.7-J3J Readiness Coverage Follow-up After Q6-r2
 
 ### Trigger
@@ -1604,6 +1877,167 @@ no threshold tuning
 no post-hoc account guessing
 no bypassing strict precheck
 ```
+
+## P3.7-J3K2 Account Coverage / Route Identity Reconciliation
+
+### Trigger
+
+J3J showed that a bounded wait is not the primary fix for Q6-r2
+`missing_bonding_curve` rows:
+
+```text
+audited_missing_account_rows = 386
+missing_bonding_curve_rows = 385
+observed_before_decision = 385
+observed_after_probe_selected = 0
+wait_would_help_within_1500_ms = 0
+```
+
+That result means the counterfactual probe should not keep waiting blindly for
+account updates that are already present in local diagnostic truth before the
+decision. The remaining question is where the handoff breaks between local
+account truth, route identity, materialized decision evidence, account
+overrides, prepared request construction and RPC simulation readiness.
+
+### J3K2 Report Result
+
+J3K2 adds a read-only reconciliation report:
+
+```text
+scripts/v3_p37_probe_account_reconciliation_report.py
+```
+
+The report compares each account-readiness skip against:
+
+- the expected account identity inferred from the skip/precheck reason;
+- the exact V3 decision row joined by `ab_record_id` and replay hashes;
+- V3/MFS route/account materialization hints;
+- `DIAG_ACCOUNT_UPDATE_RELAY` local account truth;
+- probe transport/prepared-request evidence if the row reached transport.
+
+Q6-r2 reconciliation found:
+
+```text
+audited_missing_account_rows = 396
+exact_decision_v3_join_rows = 396
+classifications = {
+  route_mismatch: 10,
+  mfs_has_account_but_overrides_missing: 385,
+  builder_required_account_not_in_mfs: 1
+}
+recommended_fix_paths = {
+  route_identity_propagation: 10,
+  route_override_propagation: 385,
+  execution_account_readiness_materialization: 1
+}
+diag_seen_before_decision_rows = 385
+prepared_request_not_built_rows = 396
+recommended_next_fix_path = route_override_propagation
+```
+
+### Interpretation
+
+The dominant `missing_bonding_curve` class is not a short-lived account-latency
+problem and not a post-transport RPC simulation failure. The account is visible
+in DIAG before decision, but the probe path stops before request construction
+because the legacy bonding-curve identity is not materialized or handed into
+the route/account override path used by the counterfactual probe precheck.
+
+The next fix must therefore be narrow route/override propagation for the probe
+plane, with active Gatekeeper policy, IWIM, live sender and thresholds left
+unchanged.
+
+### Next Gate
+
+Do not run another blind R15 smoke and do not scale collection from J3K2 alone.
+The next implementation step is:
+
+```text
+P3.7-J3K3 Route / Override Propagation for Legacy Bonding Curve
+```
+
+Acceptance for J3K3:
+
+- preserve exact decision/V3 join;
+- preserve strict precheck for true missing execution accounts;
+- use decision-time-safe local route/account evidence only;
+- do not guess missing accounts post-hoc;
+- do not mutate active BUY/live/IWIM/threshold behavior;
+- repeat a bounded smoke only after the route/override fix is implemented.
+
+## P3.7-J3K3 Route / Override Propagation for Legacy Bonding Curve
+
+### Trigger
+
+J3K2 classified the dominant Q6-r2 blocker as:
+
+```text
+mfs_has_account_but_overrides_missing = 385
+recommended_next_fix_path = route_override_propagation
+prepared_request_not_built_rows = 396
+```
+
+The affected rows stopped before `PreparedBuyRequest` construction because the
+counterfactual probe precheck did not have a usable `legacy_buy_curve`, even
+though decision-time V3/MFS evidence contained curve reserve information and the
+account had been observed in local DIAG before the decision.
+
+### Decision
+
+J3K3 adds a probe-only fallback for legacy bonding-curve route overrides:
+
+- materialize a legacy `BondingCurve` snapshot from decision-time
+  `v3_materialized_feature_snapshot.account_features.current_reserves`;
+- carry that snapshot through the P37 probe candidate and selection record;
+- use it only as a fallback for `legacy_buy_curve` in the P37
+  counterfactual probe override path when the normal runtime
+  `AccountStateCore` lookup is unavailable after cleanup;
+- keep active `derive_buy_account_overrides(...)`, Gatekeeper policy, IWIM,
+  live sender and threshold behavior unchanged.
+
+This is not a new policy feature and not a post-hoc account guess. The fallback
+is limited to the decision-time V3/MFS snapshot already persisted with the
+source decision row and is scoped to the counterfactual shadow probe plane.
+
+### Runtime Contract
+
+The probe path remains fail-closed:
+
+- if the V3/MFS reserve snapshot is absent or invalid, the fallback is absent;
+- if pool/mint identity does not match the selected probe row, the fallback is
+  rejected;
+- strict precheck still blocks true missing execution accounts;
+- exact `ab_record_id` / `probe_id` / V3 hash continuity remains required by
+  audit before any collection decision.
+
+### Validation
+
+J3K3 is a code-level repair. The required validation set is:
+
+```bash
+cargo test -p ghost-launcher --lib p37_shadow_probe -- --nocapture
+cargo test -p ghost-launcher --lib p37_counterfactual_probe -- --nocapture
+python3 -m py_compile \
+  scripts/v3_p37_probe_account_reconciliation_report.py \
+  scripts/v3_p37_probe_execution_account_readiness_report.py \
+  scripts/v3_p37_mfs_lifecycle_join_key_audit.py
+python3 -m unittest \
+  scripts/test_v3_p37_probe_account_reconciliation_report.py \
+  scripts/test_v3_p37_probe_execution_account_readiness_report.py \
+  scripts/test_v3_p37_mfs_lifecycle_join_key_audit.py \
+  -v
+rustfmt --edition 2021 --check ghost-launcher/src/oracle_runtime.rs
+git diff --check
+```
+
+### Next Gate
+
+J3K3 does not claim runtime PASS by itself. The next runtime gate is a fresh
+bounded smoke in a clean namespace after this route/override propagation repair.
+
+Collection, Phase B, P2, live sender and runtime threshold tuning remain
+blocked until that smoke proves transport/entry yield with exact decision/V3
+continuity and no active BUY mutation.
 
 ## P3.7-J3Q5 Probe Amount / Slippage Diagnostic
 
