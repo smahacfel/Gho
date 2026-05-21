@@ -1494,6 +1494,117 @@ Acceptance:
 Collection, Phase B, P2, live, active policy changes, IWIM changes and threshold
 tuning remain out of scope.
 
+## P3.7-J3J Readiness Coverage Follow-up After Q6-r2
+
+### Trigger
+
+R15 bounded `q6-r2` validated the counterfactual probe transport/entry path for
+execution-ready rows:
+
+```text
+v3_rows = 90
+strict_replay_status = full_replay_ok
+probe_selection_rows = 514
+probe_transport_rows = 4
+probe_shadow_entry_rows = 4
+probe_lifecycle_rows = 0
+active_buys_rows = 0
+probe exact decision/V3 join = 100%
+simulation_error_rows = 0
+```
+
+The remaining blocker is coverage/yield:
+
+```text
+probe_execution_precheck_failed = 396
+missing_bonding_curve = 385
+missing_execution_route_identity = 10
+missing_payer = 1
+```
+
+The effective entry yield is therefore too low for bounded collection. Q6-r2
+proved that the probe plane works for ready rows, but not that enough rows are
+ready to scale collection.
+
+### J3J-A Readiness Latency Audit
+
+J3J-A extends the existing probe execution-account readiness report with an
+offline latency audit. For `missing_bonding_curve` rows, the legacy route can
+derive the expected bonding curve identity from `pool_id`, then correlate it
+against `DIAG_ACCOUNT_UPDATE_RELAY base_mint=... bonding_curve=...` records in
+runtime logs.
+
+Required outputs:
+
+```text
+expected_account_role
+expected_account_pubkey
+expected_account_source
+first_account_update_ts_ms
+first_account_update_after_decision_ts_ms
+first_account_update_after_probe_selected_ts_ms
+ready_before_decision
+ready_before_probe_selected
+ready_after_probe_selected_ms
+ready_within_500_ms
+ready_within_1000_ms
+ready_within_1500_ms
+ready_within_3000_ms
+wait_would_help_within_500_ms
+wait_would_help_within_1000_ms
+wait_would_help_within_1500_ms
+wait_would_help_within_3000_ms
+```
+
+### Q6-r2 Result
+
+The Q6-r2 readiness latency report found:
+
+```text
+audited_missing_account_rows = 386
+missing_bonding_curve_rows = 385
+observed_before_decision = 385
+observed_after_probe_selected = 0
+never_observed_in_run = 1
+wait_would_help_within_1500_ms = 0
+bounded_wait_recommendation = not_primary_fix_route_or_materialization_gap
+recommended_next_stage = account_coverage_or_route_identity_investigation
+```
+
+Interpretation:
+
+- a larger wait window is not justified by Q6-r2 evidence;
+- for `missing_bonding_curve`, the expected account was already visible in
+  diagnostic account updates before the decision/probe selection;
+- the blocker is route/materialization/coverage handoff, not short-lived account
+  latency;
+- collection remains `HOLD` because the current yield is too low.
+
+### Next Gate
+
+Do not run another blind timeout or scale collection from Q6-r2. The next narrow
+stage is account coverage / route identity investigation:
+
+```text
+P3.7-J3K2 Probe Account Coverage / Route Identity Handoff
+```
+
+It must answer why a row can have `DIAG_ACCOUNT_UPDATE_RELAY` evidence for the
+legacy bonding curve before decision time while the probe precheck still emits
+`missing_bonding_curve`.
+
+Non-goals remain unchanged:
+
+```text
+no P2
+no live
+no active policy changes
+no IWIM changes
+no threshold tuning
+no post-hoc account guessing
+no bypassing strict precheck
+```
+
 ## P3.7-J3Q5 Probe Amount / Slippage Diagnostic
 
 ### Trigger

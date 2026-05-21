@@ -5,9 +5,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from v3_p37_probe_execution_account_readiness_report import (
     classify_missing_account,
+    infer_expected_account,
     parse_missing_required_account,
     recursive_contains_key,
     recursive_contains_value,
+    readiness_latency,
+    summarize_readiness_latency,
 )
 
 
@@ -88,6 +91,60 @@ class ProbeExecutionAccountReadinessReportTests(unittest.TestCase):
         self.assertEqual(classification, "missing_routed_associated_bonding_curve")
         self.assertEqual(reasons, ["missing_routed_associated_bonding_curve"])
         self.assertIn("associated bonding curve", basis)
+
+    def test_missing_bonding_curve_derives_legacy_pool_identity(self):
+        role, pubkey, source = infer_expected_account(
+            {"pool_id": "pool-as-curve"},
+            "missing_bonding_curve",
+            None,
+            None,
+        )
+
+        self.assertEqual(role, "bonding_curve")
+        self.assertEqual(pubkey, "pool-as-curve")
+        self.assertEqual(source, "legacy_pool_id_as_bonding_curve")
+
+    def test_readiness_latency_flags_wait_help_only_after_selection(self):
+        latency = readiness_latency(
+            [{"ts_ms": 1_800, "context": "ctx"}],
+            decision_ts_ms=1_000,
+            probe_selected_ts_ms=1_500,
+        )
+
+        self.assertEqual(latency["readiness_latency_class"], "observed_after_probe_selected")
+        self.assertEqual(latency["ready_after_probe_selected_ms"], 300)
+        self.assertTrue(latency["wait_would_help_within_500_ms"])
+        self.assertTrue(latency["ready_within_500_ms"])
+
+    def test_readiness_latency_seen_before_selection_is_not_wait_help(self):
+        latency = readiness_latency(
+            [{"ts_ms": 900, "context": "ctx"}],
+            decision_ts_ms=1_000,
+            probe_selected_ts_ms=1_500,
+        )
+
+        self.assertEqual(latency["readiness_latency_class"], "observed_before_decision")
+        self.assertTrue(latency["ready_within_500_ms"])
+        self.assertFalse(latency["wait_would_help_within_500_ms"])
+
+    def test_latency_summary_recommends_route_fix_when_seen_before_selection(self):
+        summary = summarize_readiness_latency(
+            [
+                {
+                    "missing_account_role": "bonding_curve",
+                    "readiness_latency": readiness_latency(
+                        [{"ts_ms": 900, "context": "ctx"}],
+                        decision_ts_ms=1_000,
+                        probe_selected_ts_ms=1_500,
+                    ),
+                }
+            ]
+        )
+
+        self.assertEqual(
+            summary["bounded_wait_recommendation"],
+            "not_primary_fix_route_or_materialization_gap",
+        )
 
 
 if __name__ == "__main__":

@@ -12,14 +12,22 @@ import argparse
 import json
 import re
 from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
 from shadow_run_report import load_toml, resolve_runtime_path
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DECISION_FILE_NAMES = ("gatekeeper_v2_decisions.jsonl", "gatekeeper_v2_buys.jsonl")
+READINESS_BUCKETS_MS = (500, 1000, 1500, 3000)
+DIAG_ACCOUNT_UPDATE_RE = re.compile(
+    r"^(?P<ts>\S+) .*DIAG_ACCOUNT_UPDATE_RELAY "
+    r"base_mint=(?P<base_mint>\S+) "
+    r"bonding_curve=(?P<bonding_curve>\S+) "
+    r"slot=(?P<slot>\d+)"
+)
 STRICT_EXECUTION_ROLES = {
     "bonding_curve_v2",
     "creator_vault",
@@ -108,6 +116,36 @@ def parse_missing_required_account(reason: str | None) -> tuple[str | None, str 
     return role or None, pubkey or None
 
 
+def infer_expected_account(
+    row: dict[str, Any],
+    reason: str | None,
+    parsed_role: str | None,
+    parsed_pubkey: str | None,
+) -> tuple[str | None, str | None, str]:
+    """Infer a concrete account identity for route-level precheck failures.
+
+    `missing_bonding_curve` is emitted before the runtime can build a strict
+    `missing_required_account:<role>:<pubkey>` reason. For legacy pump routes
+    the pool id is the bonding curve identity, so we can still run an offline
+    readiness latency audit without weakening runtime precheck semantics.
+    """
+    if parsed_role and parsed_pubkey:
+        return parsed_role, parsed_pubkey, "explicit_precheck_reason"
+    if reason == "missing_bonding_curve":
+        pool_id = row.get("pool_id")
+        if pool_id:
+            return "bonding_curve", str(pool_id), "legacy_pool_id_as_bonding_curve"
+    return parsed_role, parsed_pubkey, "unresolved"
+
+
+def parse_log_timestamp_ms(value: str) -> int | None:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return int(parsed.astimezone(timezone.utc).timestamp() * 1000)
+
+
 def recursive_contains_value(value: Any, needle: str) -> bool:
     if value is None:
         return False
@@ -139,6 +177,43 @@ def flatten_decision_logs(decision_root: Path, explicit_logs: list[Path]) -> lis
         for index, row in enumerate(iter_jsonl(path)):
             rows.append((path, index, row))
     return rows
+
+
+def build_account_update_index(log_paths: list[Path]) -> dict[str, Any]:
+    by_pair: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    by_bonding_curve: dict[str, list[dict[str, Any]]] = {}
+    total = 0
+    for path in log_paths:
+        if not path.exists() or not path.is_file():
+            continue
+        with path.open("r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                match = DIAG_ACCOUNT_UPDATE_RE.search(line)
+                if not match:
+                    continue
+                ts_ms = parse_log_timestamp_ms(match.group("ts"))
+                if ts_ms is None:
+                    continue
+                total += 1
+                base_mint = match.group("base_mint")
+                bonding_curve = match.group("bonding_curve")
+                record = {
+                    "ts_ms": ts_ms,
+                    "base_mint": base_mint,
+                    "bonding_curve": bonding_curve,
+                    "slot": int(match.group("slot")),
+                    "log_path": str(path),
+                    "context": line.strip()[:360],
+                }
+                by_pair.setdefault((base_mint, bonding_curve), []).append(record)
+                by_bonding_curve.setdefault(bonding_curve, []).append(record)
+    for records in list(by_pair.values()) + list(by_bonding_curve.values()):
+        records.sort(key=lambda row: row["ts_ms"])
+    return {
+        "by_pair": by_pair,
+        "by_bonding_curve": by_bonding_curve,
+        "diag_account_update_total": total,
+    }
 
 
 def decision_lookup(
@@ -200,6 +275,99 @@ def scan_logs(log_paths: list[Path], pubkey: str | None) -> dict[str, Any]:
         "raw_log_occurrences": raw_count,
         "diag_account_update_occurrences": diag_count,
         "first_raw_log_context": first_context,
+    }
+
+
+def lookup_diag_account_updates(
+    account_update_index: dict[str, Any],
+    base_mint: str | None,
+    pubkey: str | None,
+) -> list[dict[str, Any]]:
+    if not pubkey:
+        return []
+    by_pair = account_update_index.get("by_pair", {})
+    by_bonding_curve = account_update_index.get("by_bonding_curve", {})
+    if base_mint:
+        pair_records = by_pair.get((base_mint, pubkey), [])
+        if pair_records:
+            return pair_records
+    return by_bonding_curve.get(pubkey, [])
+
+
+def readiness_latency(
+    records: list[dict[str, Any]],
+    decision_ts_ms: int | None,
+    probe_selected_ts_ms: int | None,
+) -> dict[str, Any]:
+    timestamps = [int(row["ts_ms"]) for row in records if row.get("ts_ms") is not None]
+    first_ts = min(timestamps) if timestamps else None
+    last_ts = max(timestamps) if timestamps else None
+    first_after_decision = (
+        min((ts for ts in timestamps if decision_ts_ms is not None and ts >= decision_ts_ms), default=None)
+        if timestamps
+        else None
+    )
+    first_after_selected = (
+        min(
+            (ts for ts in timestamps if probe_selected_ts_ms is not None and ts >= probe_selected_ts_ms),
+            default=None,
+        )
+        if timestamps
+        else None
+    )
+    ready_before_decision = (
+        any(ts <= decision_ts_ms for ts in timestamps) if decision_ts_ms is not None else False
+    )
+    ready_before_selected = (
+        any(ts <= probe_selected_ts_ms for ts in timestamps)
+        if probe_selected_ts_ms is not None
+        else False
+    )
+    ready_after_probe_selected_ms = (
+        first_after_selected - probe_selected_ts_ms
+        if first_after_selected is not None and probe_selected_ts_ms is not None
+        else None
+    )
+    if not timestamps:
+        latency_class = "never_observed_in_run"
+    elif ready_before_decision:
+        latency_class = "observed_before_decision"
+    elif ready_before_selected:
+        latency_class = "observed_between_decision_and_probe_selected"
+    else:
+        latency_class = "observed_after_probe_selected"
+    within = {
+        f"ready_within_{bucket}_ms": bool(
+            ready_before_selected
+            or (
+                ready_after_probe_selected_ms is not None
+                and 0 <= ready_after_probe_selected_ms <= bucket
+            )
+        )
+        for bucket in READINESS_BUCKETS_MS
+    }
+    wait_help = {
+        f"wait_would_help_within_{bucket}_ms": bool(
+            not ready_before_selected
+            and ready_after_probe_selected_ms is not None
+            and 0 <= ready_after_probe_selected_ms <= bucket
+        )
+        for bucket in READINESS_BUCKETS_MS
+    }
+    return {
+        "diag_account_update_occurrences": len(timestamps),
+        "first_account_update_ts_ms": first_ts,
+        "last_account_update_ts_ms": last_ts,
+        "first_account_update_after_decision_ts_ms": first_after_decision,
+        "first_account_update_after_probe_selected_ts_ms": first_after_selected,
+        "ready_before_decision": ready_before_decision,
+        "ready_before_probe_selected": ready_before_selected,
+        "ready_after_probe_selected_ms": ready_after_probe_selected_ms,
+        "never_ready_in_run": not bool(timestamps),
+        "readiness_latency_class": latency_class,
+        **within,
+        **wait_help,
+        "first_account_update_context": records[0].get("context") if records else None,
     }
 
 
@@ -317,15 +485,39 @@ def selected_probe_report(
     skip_by_probe_id: dict[str, dict[str, Any]],
     decisions: list[tuple[Path, int, dict[str, Any]]],
     log_paths: list[Path],
+    account_update_index: dict[str, Any],
 ) -> dict[str, Any]:
     probe_id = selection.get("probe_id")
     skip = skip_by_probe_id.get(str(probe_id), {})
     if not skip and selection.get("event_type") == "probe_skipped":
         skip = selection
-    role, missing_pubkey = parse_missing_required_account(skip.get("precheck_failure_reason"))
-    decision_path, decision_index, decision_row, join_diag = decision_lookup(decisions, selection)
-    log_scan = scan_logs(log_paths, missing_pubkey)
     precheck_failure_reason = skip.get("precheck_failure_reason")
+    parsed_role, parsed_pubkey = parse_missing_required_account(precheck_failure_reason)
+    role, missing_pubkey, expected_account_source = infer_expected_account(
+        skip if skip else selection,
+        precheck_failure_reason,
+        parsed_role,
+        parsed_pubkey,
+    )
+    decision_path, decision_index, decision_row, join_diag = decision_lookup(decisions, selection)
+    diag_records = lookup_diag_account_updates(
+        account_update_index,
+        selection.get("base_mint") or selection.get("mint_id"),
+        missing_pubkey,
+    )
+    latency = readiness_latency(
+        diag_records,
+        selection.get("decision_ts_ms"),
+        selection.get("probe_selected_ts_ms"),
+    )
+    if diag_records:
+        log_scan = {
+            "raw_log_occurrences": latency["diag_account_update_occurrences"],
+            "diag_account_update_occurrences": latency["diag_account_update_occurrences"],
+            "first_raw_log_context": latency["first_account_update_context"],
+        }
+    else:
+        log_scan = scan_logs(log_paths, missing_pubkey)
     classification, reasons, recommendation_basis = classify_missing_account(
         role,
         missing_pubkey,
@@ -356,6 +548,7 @@ def selected_probe_report(
         "execution_account_readiness_reason": skip.get("execution_account_readiness_reason"),
         "missing_account_role": role,
         "missing_account_pubkey": missing_pubkey,
+        "expected_account_source": expected_account_source,
         "missing_account_source": role_source(role),
         "missing_account_classification": classification,
         "classification_reasons": reasons,
@@ -374,6 +567,7 @@ def selected_probe_report(
             "diag_account_update_occurrences", 0
         ),
         "first_raw_log_context": log_scan.get("first_raw_log_context"),
+        "readiness_latency": latency,
         "decision_log_path": str(decision_path) if decision_path else None,
         "decision_row_index": decision_index,
         "decision_join": join_diag,
@@ -383,9 +577,10 @@ def selected_probe_report(
 
 def render_markdown(payload: dict[str, Any]) -> str:
     summary = payload["summary"]
+    latency = payload["readiness_latency_summary"]
     namespace = payload.get("probe_namespace") or "unknown"
     lines = [
-        "# RAPORT P3.7-J3 Probe Execution-Account Readiness",
+        "# RAPORT P3.7-J3J Probe Execution-Account Readiness Coverage",
         "",
         f"Date: {payload['date']}",
         f"Namespace: `{namespace}`",
@@ -394,6 +589,8 @@ def render_markdown(payload: dict[str, Any]) -> str:
         "",
         "```text",
         f"P3.7-J3 execution-account readiness audit: {summary['status']}",
+        f"bounded_wait_recommendation: {latency['bounded_wait_recommendation']}",
+        f"recommended_next_stage: {summary['recommended_next_stage']}",
         "runtime smoke status must be read from the paired smoke/join-key report",
         "Full / bounded collection: HOLD",
         "Phase B / P2 / live / tuning: NO-GO",
@@ -416,12 +613,29 @@ def render_markdown(payload: dict[str, Any]) -> str:
         f"exact_decision_v3_join_rows = {summary['exact_decision_v3_join_rows']}",
         f"missing_account_roles = {summary['missing_account_roles']}",
         f"classifications = {summary['classifications']}",
+        f"readiness_latency_classes = {latency['classes']}",
+        f"wait_would_help_within_1500_ms = {latency['wait_would_help_within_1500_ms']}",
+        f"recommended_next_stage = {summary['recommended_next_stage']}",
+        "```",
+        "",
+        "## Readiness Latency",
+        "",
+        "```text",
+        f"audited_missing_account_rows = {latency['audited_missing_account_rows']}",
+        f"observed_before_decision = {latency['observed_before_decision']}",
+        f"observed_between_decision_and_probe_selected = {latency['observed_between_decision_and_probe_selected']}",
+        f"observed_after_probe_selected = {latency['observed_after_probe_selected']}",
+        f"never_observed_in_run = {latency['never_observed_in_run']}",
+        f"ready_within_500_ms = {latency['ready_within_500_ms']}",
+        f"ready_within_1000_ms = {latency['ready_within_1000_ms']}",
+        f"ready_within_1500_ms = {latency['ready_within_1500_ms']}",
+        f"ready_within_3000_ms = {latency['ready_within_3000_ms']}",
         "```",
         "",
         "## Per-Probe Diagnosis",
         "",
-        "| probe | role | classification | pubkey | decision join | account updates | reason |",
-        "| --- | --- | --- | --- | --- | ---: | --- |",
+        "| probe | role | classification | latency class | ready after selected ms | pubkey | decision join | account updates | reason |",
+        "| --- | --- | --- | --- | ---: | --- | --- | ---: | --- |",
     ]
     for row in payload["selected_probe_diagnostics"]:
         join_status = row["decision_join"].get("decision_lookup_status")
@@ -430,9 +644,14 @@ def render_markdown(payload: dict[str, Any]) -> str:
         probe = str(row.get("probe_id") or "")[:10]
         updates = row.get("required_pubkey_diag_account_update_occurrences", 0)
         reason = row.get("precheck_failure_reason") or "none"
+        row_latency = row.get("readiness_latency") or {}
+        latency_class = row_latency.get("readiness_latency_class", "none")
+        ready_after = row_latency.get("ready_after_probe_selected_ms")
+        ready_after_text = "" if ready_after is None else str(ready_after)
         lines.append(
             f"| `{probe}` | `{role}` | `{row['missing_account_classification']}` | "
-            f"`{pubkey}` | `{join_status}` | {updates} | `{reason}` |"
+            f"`{latency_class}` | {ready_after_text} | `{pubkey}` | `{join_status}` | "
+            f"{updates} | `{reason}` |"
         )
     lines.extend(
         [
@@ -455,9 +674,51 @@ def render_markdown(payload: dict[str, Any]) -> str:
             "If `execution_account_not_ready` dominates and no probe transport/entry rows",
             "exist, the next step is account-readiness/materialization work. If transport",
             "and entry rows exist, classify any simulation errors before scaling.",
+            "",
+            "For J3J, bounded wait is justified only when missing execution accounts",
+            "are usually first observed after probe selection within the configured",
+            "wait window. If accounts are already observed before selection, the",
+            "problem is route/materialization coverage rather than runtime latency.",
         ]
     )
     return "\n".join(lines) + "\n"
+
+
+def summarize_readiness_latency(diagnostics: list[dict[str, Any]]) -> dict[str, Any]:
+    missing_rows = [row for row in diagnostics if row.get("missing_account_role")]
+    class_counts = Counter(
+        (row.get("readiness_latency") or {}).get("readiness_latency_class", "none")
+        for row in missing_rows
+    )
+    summary: dict[str, Any] = {
+        "audited_missing_account_rows": len(missing_rows),
+        "classes": dict(class_counts),
+    }
+    for class_name in (
+        "observed_before_decision",
+        "observed_between_decision_and_probe_selected",
+        "observed_after_probe_selected",
+        "never_observed_in_run",
+    ):
+        summary[class_name] = class_counts.get(class_name, 0)
+    for bucket in READINESS_BUCKETS_MS:
+        ready_key = f"ready_within_{bucket}_ms"
+        help_key = f"wait_would_help_within_{bucket}_ms"
+        summary[ready_key] = sum(
+            1 for row in missing_rows if (row.get("readiness_latency") or {}).get(ready_key)
+        )
+        summary[help_key] = sum(
+            1 for row in missing_rows if (row.get("readiness_latency") or {}).get(help_key)
+        )
+    if summary.get("wait_would_help_within_1500_ms", 0) > 0:
+        summary["bounded_wait_recommendation"] = "consider_bounded_wait_smoke"
+    elif summary.get("observed_before_decision", 0) or summary.get(
+        "observed_between_decision_and_probe_selected", 0
+    ):
+        summary["bounded_wait_recommendation"] = "not_primary_fix_route_or_materialization_gap"
+    else:
+        summary["bounded_wait_recommendation"] = "not_justified_account_never_observed"
+    return summary
 
 
 def main() -> None:
@@ -512,10 +773,17 @@ def main() -> None:
         if raw:
             base = resolve_runtime_path(config_path, raw)
             log_paths.extend(sorted(base.parent.glob(base.name + "*")))
+    account_update_index = build_account_update_index(log_paths)
 
     audited_rows = selections + pre_scan_precheck_skips
     diagnostics = [
-        selected_probe_report(selection, skip_by_probe_id, decisions, log_paths)
+        selected_probe_report(
+            selection,
+            skip_by_probe_id,
+            decisions,
+            log_paths,
+            account_update_index,
+        )
         for selection in audited_rows
     ]
     classifications = Counter(row["missing_account_classification"] for row in diagnostics)
@@ -526,9 +794,18 @@ def main() -> None:
         if row["decision_join"].get("decision_lookup_status") == "exact"
     )
     diagnosed_rows = sum(1 for row in diagnostics if row.get("missing_account_role"))
+    latency_summary = summarize_readiness_latency(diagnostics)
+    recommended_next_stage = {
+        "consider_bounded_wait_smoke": "bounded_wait_smoke",
+        "not_primary_fix_route_or_materialization_gap": "account_coverage_or_route_identity_investigation",
+        "not_justified_account_never_observed": "account_coverage_or_route_identity_investigation",
+    }.get(
+        latency_summary.get("bounded_wait_recommendation"),
+        "read paired smoke and simulation-error report",
+    )
     payload = {
         "schema_version": SCHEMA_VERSION,
-        "date": "2026-05-20",
+        "date": "2026-05-21",
         "config_path": str(config_path),
         "probe_namespace": probe_cfg.get("namespace"),
         "probe_selection_path": str(selection_path),
@@ -546,9 +823,14 @@ def main() -> None:
             "decision_logs_scanned": len({str(path) for path, _, _ in decisions}),
             "decision_rows_scanned": len(decisions),
             "log_files_scanned": [str(path) for path in log_paths],
-            "recommended_next_stage": "read paired smoke and simulation-error report",
+            "diag_account_update_total": account_update_index.get(
+                "diag_account_update_total",
+                0,
+            ),
+            "recommended_next_stage": recommended_next_stage,
             "collection_gate": "HOLD",
         },
+        "readiness_latency_summary": latency_summary,
         "selected_probe_diagnostics": diagnostics,
     }
     output_json = Path(args.output_json)
