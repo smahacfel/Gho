@@ -222,6 +222,223 @@ lifecycle_log_path = "../../logs/shadow_run/r15-probe/probe_lifecycle.jsonl"
         )
         self.assertEqual(report["readiness"]["status"], "not_ready")
 
+    def test_probe_transport_without_entry_is_classified_as_missing_token_quantity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "configs/rollout/r15-probe.toml"
+            config.parent.mkdir(parents=True)
+            config.write_text(
+                """
+[oracle]
+decision_log_path = "../../logs/rollout/r15-probe/decisions"
+
+[p37_shadow_probe]
+selection_log_path = "../../logs/shadow_run/r15-probe/probe_selected.jsonl"
+skip_log_path = "../../logs/shadow_run/r15-probe/probe_skipped.jsonl"
+transport_log_path = "../../logs/shadow_run/r15-probe/probe_transport.jsonl"
+entry_log_path = "../../logs/shadow_run/r15-probe/probe_entries.jsonl"
+lifecycle_log_path = "../../logs/shadow_run/r15-probe/probe_lifecycle.jsonl"
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            decision_base = {
+                "candidate_id": "pool_mint_1000",
+                "pool_id": "pool",
+                "base_mint": "mint",
+                "v3_replay_payload_schema_version": 1,
+                "v3_policy_config_hash": "policy-hash",
+            }
+            decisions = [
+                {
+                    **decision_base,
+                    "ab_record_id": "source-ab-1",
+                    "v3_feature_snapshot_hash": "feature-hash-1",
+                },
+                {
+                    **decision_base,
+                    "ab_record_id": "source-ab-2",
+                    "v3_feature_snapshot_hash": "feature-hash-2",
+                },
+            ]
+            probe_base = {
+                "candidate_id": "pool_mint_1000",
+                "pool_id": "pool",
+                "base_mint": "mint",
+                "dispatch_source": "counterfactual_shadow_probe",
+                "collection_plane": "counterfactual_shadow_probe",
+                "probe_plane": "p37_shadow_probe",
+                "probe_bucket": "v3_pending_wait_sample",
+                "probe_amount_source": "fixed_lamports",
+                "v3_policy_config_hash": "policy-hash",
+            }
+            materialized = {
+                **probe_base,
+                "ab_record_id": "source-ab-1",
+                "source_ab_record_id": "source-ab-1",
+                "probe_id": "probe-id-1",
+                "v3_feature_snapshot_hash": "feature-hash-1",
+                "buy_variant": "legacy_buy",
+                "token_param_role": "token_amount",
+                "entry_token_amount_raw": 123,
+                "min_tokens_out": 100,
+                "execution_outcome": "counterfactual_shadow_probe_simulated",
+            }
+            transport_only = {
+                **probe_base,
+                "ab_record_id": "source-ab-2",
+                "source_ab_record_id": "source-ab-2",
+                "probe_id": "probe-id-2",
+                "v3_feature_snapshot_hash": "feature-hash-2",
+                "buy_variant": "routed_exact_sol_in",
+                "token_param_role": "min_tokens_out",
+                "entry_token_amount_raw": None,
+                "min_tokens_out": 1,
+                "execution_outcome": "counterfactual_shadow_probe_simulated",
+            }
+            write_jsonl(
+                root / "logs/rollout/r15-probe/decisions/gatekeeper_v2_decisions.jsonl",
+                decisions,
+            )
+            write_jsonl(
+                root / "logs/shadow_run/r15-probe/probe_selected.jsonl",
+                [materialized, transport_only],
+            )
+            write_jsonl(
+                root / "logs/shadow_run/r15-probe/probe_transport.jsonl",
+                [materialized, transport_only],
+            )
+            write_jsonl(root / "logs/shadow_run/r15-probe/probe_entries.jsonl", [materialized])
+
+            report = audit.build_report(config)
+
+        materialization = report["probe_entry_materialization"]
+        self.assertEqual(report["probe_readiness"]["status"], "ready_for_probe_transport_entry_join")
+        self.assertEqual(materialization["status_counts"]["entry_materialized"], 1)
+        self.assertEqual(materialization["status_counts"]["transport_only_missing_token_quantity"], 1)
+        self.assertEqual(
+            materialization["reason_counts"]["routed_exact_sol_in_entry_token_amount_raw_null"],
+            1,
+        )
+
+    def test_probe_transport_simulation_error_without_entry_is_classified(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "configs/rollout/r15-probe.toml"
+            config.parent.mkdir(parents=True)
+            config.write_text(
+                """
+[oracle]
+decision_log_path = "../../logs/rollout/r15-probe/decisions"
+
+[p37_shadow_probe]
+selection_log_path = "../../logs/shadow_run/r15-probe/probe_selected.jsonl"
+skip_log_path = "../../logs/shadow_run/r15-probe/probe_skipped.jsonl"
+transport_log_path = "../../logs/shadow_run/r15-probe/probe_transport.jsonl"
+entry_log_path = "../../logs/shadow_run/r15-probe/probe_entries.jsonl"
+lifecycle_log_path = "../../logs/shadow_run/r15-probe/probe_lifecycle.jsonl"
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            decision = {
+                "candidate_id": "pool_mint_1000",
+                "ab_record_id": "source-ab",
+                "pool_id": "pool",
+                "base_mint": "mint",
+                "v3_replay_payload_schema_version": 1,
+                "v3_feature_snapshot_hash": "feature-hash",
+                "v3_policy_config_hash": "policy-hash",
+            }
+            probe_error = {
+                **decision,
+                "source_ab_record_id": "source-ab",
+                "probe_id": "probe-id",
+                "dispatch_source": "counterfactual_shadow_probe",
+                "collection_plane": "counterfactual_shadow_probe",
+                "probe_plane": "p37_shadow_probe",
+                "probe_bucket": "v3_pending_wait_sample",
+                "probe_amount_source": "fixed_lamports",
+                "execution_outcome": "counterfactual_shadow_probe_simulation_error",
+                "error_class": "simulation_mismatch",
+                "simulation_error_category": "simulation_slippage_or_price_mismatch",
+                "simulation_error_custom_code": 6002,
+            }
+            write_jsonl(
+                root / "logs/rollout/r15-probe/decisions/gatekeeper_v2_decisions.jsonl",
+                [decision],
+            )
+            write_jsonl(root / "logs/shadow_run/r15-probe/probe_selected.jsonl", [probe_error])
+            write_jsonl(root / "logs/shadow_run/r15-probe/probe_transport.jsonl", [probe_error])
+
+            report = audit.build_report(config)
+
+        materialization = report["probe_entry_materialization"]
+        self.assertEqual(report["probe_readiness"]["status"], "not_ready")
+        self.assertEqual(materialization["status_counts"]["simulation_error"], 1)
+        self.assertEqual(
+            materialization["reason_counts"]["simulation_slippage_or_price_mismatch:custom_6002"],
+            1,
+        )
+
+    def test_probe_transport_simulation_error_with_entry_is_not_clean_materialized(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "configs/rollout/r15-probe.toml"
+            config.parent.mkdir(parents=True)
+            config.write_text(
+                """
+[oracle]
+decision_log_path = "../../logs/rollout/r15-probe/decisions"
+
+[p37_shadow_probe]
+selection_log_path = "../../logs/shadow_run/r15-probe/probe_selected.jsonl"
+skip_log_path = "../../logs/shadow_run/r15-probe/probe_skipped.jsonl"
+transport_log_path = "../../logs/shadow_run/r15-probe/probe_transport.jsonl"
+entry_log_path = "../../logs/shadow_run/r15-probe/probe_entries.jsonl"
+lifecycle_log_path = "../../logs/shadow_run/r15-probe/probe_lifecycle.jsonl"
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            decision = {
+                "candidate_id": "pool_mint_1000",
+                "ab_record_id": "source-ab",
+                "pool_id": "pool",
+                "base_mint": "mint",
+                "v3_replay_payload_schema_version": 1,
+                "v3_feature_snapshot_hash": "feature-hash",
+                "v3_policy_config_hash": "policy-hash",
+            }
+            probe_error = {
+                **decision,
+                "source_ab_record_id": "source-ab",
+                "probe_id": "probe-id",
+                "dispatch_source": "counterfactual_shadow_probe",
+                "collection_plane": "counterfactual_shadow_probe",
+                "probe_plane": "p37_shadow_probe",
+                "probe_bucket": "v3_pending_wait_sample",
+                "probe_amount_source": "fixed_lamports",
+                "execution_outcome": "counterfactual_shadow_probe_simulation_error",
+                "error_class": "simulation_mismatch",
+                "simulation_error_kind": "simulation_error",
+            }
+            write_jsonl(
+                root / "logs/rollout/r15-probe/decisions/gatekeeper_v2_decisions.jsonl",
+                [decision],
+            )
+            write_jsonl(root / "logs/shadow_run/r15-probe/probe_selected.jsonl", [probe_error])
+            write_jsonl(root / "logs/shadow_run/r15-probe/probe_transport.jsonl", [probe_error])
+            write_jsonl(root / "logs/shadow_run/r15-probe/probe_entries.jsonl", [probe_error])
+
+            report = audit.build_report(config)
+
+        materialization = report["probe_entry_materialization"]
+        self.assertEqual(report["probe_readiness"]["status"], "ready_for_probe_transport_entry_join")
+        self.assertEqual(materialization["status_counts"]["simulation_error"], 1)
+        self.assertNotIn("entry_materialized", materialization["status_counts"])
+        self.assertEqual(materialization["reason_counts"]["simulation_mismatch"], 1)
+
     def test_probe_transport_entry_without_decision_v3_join_is_not_ready(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

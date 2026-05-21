@@ -12,7 +12,7 @@ from typing import Any, Iterable
 from shadow_run_report import load_toml, resolve_config_path, resolve_runtime_path
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DECISION_FILE_NAMES = ("gatekeeper_v2_decisions.jsonl", "gatekeeper_v2_buys.jsonl")
 FIELD_GROUPS = {
     "ab_record_id": ("ab_record_id",),
@@ -43,6 +43,16 @@ FIELD_GROUPS = {
     "probe_bucket": ("probe_bucket",),
     "probe_skip_reason": ("probe_skip_reason", "skip_reason"),
     "probe_amount_source": ("probe_amount_source",),
+    "buy_variant": ("buy_variant",),
+    "token_param_role": ("token_param_role",),
+    "entry_token_amount_raw": ("entry_token_amount_raw",),
+    "min_tokens_out": ("min_tokens_out",),
+    "execution_outcome": ("execution_outcome",),
+    "error_class": ("error_class",),
+    "simulation_error_category": ("simulation_error_category",),
+    "simulation_error_kind": ("simulation_error_kind",),
+    "simulation_error_custom_code": ("simulation_error_custom_code",),
+    "execution_account_readiness_status": ("execution_account_readiness_status",),
     "run_id": ("run_id",),
     "session_id": ("session_id",),
 }
@@ -51,6 +61,12 @@ COUNTER_FIELD_GROUPS = (
     "probe_skip_reason",
     "probe_amount_source",
     "dispatch_source",
+    "buy_variant",
+    "token_param_role",
+    "execution_outcome",
+    "error_class",
+    "simulation_error_category",
+    "execution_account_readiness_status",
 )
 CANONICAL_JOIN_ARTIFACTS = (
     "decision",
@@ -415,6 +431,136 @@ def row_has_v3_payload(row: dict[str, Any]) -> bool:
     return first_present(row, FIELD_GROUPS["v3_replay_payload"]) is not None
 
 
+def row_probe_id(row: dict[str, Any]) -> str | None:
+    value = first_present(row, FIELD_GROUPS["probe_id"])
+    return str(value) if value is not None else None
+
+
+def row_string(row: dict[str, Any], field: str) -> str | None:
+    value = row.get(field)
+    if value is None:
+        return None
+    if isinstance(value, str) and value == "":
+        return None
+    return str(value)
+
+
+def classify_probe_transport_materialization(row: dict[str, Any], entry_probe_ids: set[str]) -> tuple[str, str]:
+    probe_id = row_probe_id(row)
+    execution_outcome = row_string(row, "execution_outcome")
+    error_class = row_string(row, "error_class")
+    simulation_error_category = row_string(row, "simulation_error_category")
+    simulation_error_kind = row_string(row, "simulation_error_kind")
+    simulation_error_custom_code = row_string(row, "simulation_error_custom_code")
+    if (
+        error_class
+        or simulation_error_category
+        or simulation_error_kind
+        or simulation_error_custom_code
+        or execution_outcome == "counterfactual_shadow_probe_simulation_error"
+    ):
+        reason = simulation_error_category or error_class or simulation_error_kind or "simulation_error"
+        if simulation_error_custom_code:
+            reason = f"{reason}:custom_{simulation_error_custom_code}"
+        return "simulation_error", reason
+
+    if probe_id and probe_id in entry_probe_ids:
+        return "entry_materialized", "entry_row_present"
+
+    readiness_status = row_string(row, "execution_account_readiness_status")
+    precheck_failure_reason = row_string(row, "precheck_failure_reason")
+    if readiness_status == "not_ready" or (
+        precheck_failure_reason and "execution_account_not_ready" in precheck_failure_reason
+    ):
+        return "execution_account_not_ready", precheck_failure_reason or "execution_account_not_ready"
+
+    buy_variant = row_string(row, "buy_variant")
+    token_param_role = row_string(row, "token_param_role")
+    entry_token_amount_raw = row.get("entry_token_amount_raw")
+    if entry_token_amount_raw is None:
+        if buy_variant == "routed_exact_sol_in" and token_param_role == "min_tokens_out":
+            return (
+                "transport_only_missing_token_quantity",
+                "routed_exact_sol_in_entry_token_amount_raw_null",
+            )
+        return "transport_only_missing_token_quantity", "entry_token_amount_raw_null"
+
+    return "unknown", "entry_missing_unclassified"
+
+
+def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
+    transport_rows = artifact_rows(paths, "probe_transport")
+    entry_rows = artifact_rows(paths, "probe_entry")
+    skip_rows = artifact_rows(paths, "probe_skip")
+    entry_probe_ids = {probe_id for row in entry_rows if (probe_id := row_probe_id(row))}
+
+    status_counts: Counter[str] = Counter()
+    reason_counts: Counter[str] = Counter()
+    buy_variant_counts: Counter[str] = Counter()
+    token_param_role_counts: Counter[str] = Counter()
+    rows: list[dict[str, Any]] = []
+    for row in transport_rows:
+        status, reason = classify_probe_transport_materialization(row, entry_probe_ids)
+        status_counts[status] += 1
+        reason_counts[reason] += 1
+        buy_variant = row_string(row, "buy_variant")
+        token_param_role = row_string(row, "token_param_role")
+        if buy_variant:
+            buy_variant_counts[buy_variant] += 1
+        if token_param_role:
+            token_param_role_counts[token_param_role] += 1
+        rows.append(
+            {
+                "probe_id": row_probe_id(row),
+                "ab_record_id": row_ab_record_id(row),
+                "candidate_id": row_string(row, "candidate_id"),
+                "pool_id": row_string(row, "pool_id"),
+                "base_mint": row_string(row, "base_mint") or row_string(row, "mint_id"),
+                "buy_variant": buy_variant,
+                "token_param_role": token_param_role,
+                "entry_token_amount_raw": row.get("entry_token_amount_raw"),
+                "min_tokens_out": row.get("min_tokens_out"),
+                "execution_outcome": row_string(row, "execution_outcome"),
+                "error_class": row_string(row, "error_class"),
+                "simulation_error_category": row_string(row, "simulation_error_category"),
+                "execution_account_readiness_status": row_string(
+                    row,
+                    "execution_account_readiness_status",
+                ),
+                "probe_entry_materialization_status": status,
+                "probe_entry_materialization_reason": reason,
+            }
+        )
+
+    skip_reason_counts: Counter[str] = Counter()
+    for row in skip_rows:
+        reason = row_string(row, "probe_skip_reason") or row_string(row, "skip_reason")
+        if reason:
+            skip_reason_counts[reason] += 1
+
+    transport_rows_total = len(transport_rows)
+    entry_rows_total = len(entry_rows)
+    return {
+        "transport_rows": transport_rows_total,
+        "entry_rows": entry_rows_total,
+        "transport_without_entry_rows": max(transport_rows_total - entry_rows_total, 0),
+        "status_counts": dict(sorted(status_counts.items())),
+        "reason_counts": dict(sorted(reason_counts.items())),
+        "buy_variant_counts": dict(sorted(buy_variant_counts.items())),
+        "token_param_role_counts": dict(sorted(token_param_role_counts.items())),
+        "skip_reason_counts": dict(sorted(skip_reason_counts.items())),
+        "entry_materialized_rows": status_counts.get("entry_materialized", 0),
+        "transport_only_missing_token_quantity_rows": status_counts.get(
+            "transport_only_missing_token_quantity",
+            0,
+        ),
+        "simulation_error_rows": status_counts.get("simulation_error", 0),
+        "execution_account_not_ready_rows": status_counts.get("execution_account_not_ready", 0),
+        "unknown_rows": status_counts.get("unknown", 0),
+        "rows": rows,
+    }
+
+
 def probe_decision_join(paths: dict[str, list[Path]]) -> dict[str, Any]:
     decisions = artifact_rows(paths, "decision")
     decision_by_ab: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -672,6 +818,7 @@ def build_report(config_path: Path) -> dict[str, Any]:
     report["readiness"] = readiness(report)
     report["probe_join_key_coverage"] = probe_join_key_coverage(report)
     report["probe_decision_join"] = probe_decision_join(paths)
+    report["probe_entry_materialization"] = probe_entry_materialization(paths)
     report["probe_readiness"] = probe_readiness(report)
     return report
 
@@ -689,6 +836,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- probe_join_quality: `{report['probe_join_key_coverage']['probe_join_quality']}`",
         f"- probe_decision_join_acceptance: `{report['probe_decision_join']['decision_join_acceptance']}`",
         f"- probe_required_exact_decision_v3_join_coverage: `{report['probe_decision_join']['required_exact_decision_v3_join_coverage']}`",
+        f"- probe_entry_materialization_status_counts: `{json.dumps(report['probe_entry_materialization']['status_counts'], ensure_ascii=False, sort_keys=True)}`",
+        f"- probe_entry_materialization_reason_counts: `{json.dumps(report['probe_entry_materialization']['reason_counts'], ensure_ascii=False, sort_keys=True)}`",
         f"- full_chain_ab_record_id_coverage: `{report['join_key_coverage']['full_chain_ab_record_id_coverage']}`",
         f"- probe_chain_ab_record_id_coverage: `{report['probe_join_key_coverage']['probe_chain_ab_record_id_coverage']}`",
         f"- probe_chain_probe_id_coverage: `{report['probe_join_key_coverage']['probe_chain_probe_id_coverage']}`",
@@ -734,6 +883,35 @@ def render_markdown(report: dict[str, Any]) -> str:
     )
     for key, value in report["probe_decision_join"]["artifacts"].items():
         lines.append(f"- `{key}`: `{json.dumps(value, ensure_ascii=False, sort_keys=True)}`")
+    lines.extend(["", "## Probe Entry Materialization", ""])
+    materialization = report["probe_entry_materialization"]
+    lines.extend(
+        [
+            f"- transport_rows: `{materialization['transport_rows']}`",
+            f"- entry_rows: `{materialization['entry_rows']}`",
+            f"- transport_without_entry_rows: `{materialization['transport_without_entry_rows']}`",
+            f"- status_counts: `{json.dumps(materialization['status_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- reason_counts: `{json.dumps(materialization['reason_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- buy_variant_counts: `{json.dumps(materialization['buy_variant_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- token_param_role_counts: `{json.dumps(materialization['token_param_role_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- skip_reason_counts: `{json.dumps(materialization['skip_reason_counts'], ensure_ascii=False, sort_keys=True)}`",
+        ]
+    )
+    if materialization["rows"]:
+        lines.extend(
+            [
+                "",
+                "| probe_id | status | reason | buy_variant | token_param_role | entry_token_amount_raw | min_tokens_out |",
+                "| --- | --- | --- | --- | --- | ---: | ---: |",
+            ]
+        )
+        for row in materialization["rows"]:
+            lines.append(
+                f"| `{row.get('probe_id')}` | `{row.get('probe_entry_materialization_status')}` | "
+                f"`{row.get('probe_entry_materialization_reason')}` | `{row.get('buy_variant')}` | "
+                f"`{row.get('token_param_role')}` | `{row.get('entry_token_amount_raw')}` | "
+                f"`{row.get('min_tokens_out')}` |"
+            )
     lines.extend(
         [
             "",
