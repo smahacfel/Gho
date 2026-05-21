@@ -1509,4 +1509,5 @@ mod tests {
 pub enum PostBuySource {
     LiveBuy,
     Recovery,
+    CounterfactualShadowProbe,
 }

@@ -1494,6 +1494,146 @@ Acceptance:
 Collection, Phase B, P2, live, active policy changes, IWIM changes and threshold
 tuning remain out of scope.
 
+## P3.7-J4 Probe Lifecycle Handoff / Post-Buy Monitor Validation
+
+### Trigger
+
+J3L-r1 validated bounded counterfactual probe transport and entry generation:
+
+```text
+probe_transport_rows = 25
+probe_shadow_entry_rows = 25
+exact decision/V3 join = 100%
+active_buys_rows = 0
+probe_lifecycle_rows = 0
+```
+
+The blocker moved from selection/dispatch/entry to the next boundary:
+
+```text
+probe entry -> lifecycle handoff -> post-buy monitor
+```
+
+Decision thresholds, active V2/V2.5 policy, IWIM, live/P2 and ghost brain
+thresholds are not implicated by this failure class and must remain unchanged.
+
+### Root Cause
+
+The J3 counterfactual probe dispatch path wrote `probe_transport.jsonl` and
+`probe_shadow_entries.jsonl`, but did not send a `PostBuySubmitted` handoff to
+`PostBuyRuntime`. The canonical shadow lifecycle path only starts when
+`PostBuyRuntime` receives a handoff and registers the position in
+`MonitoringEngine`.
+
+The `probe_position_id` on the entry row was only serialized metadata. It did
+not create a monitored position.
+
+### Repair Contract
+
+J4 adds a probe-only lifecycle handoff:
+
+- successful probe simulation + entry materialization sends a direct-only
+  `PostBuySubmitted` event with `lane="probe"`;
+- `PostBuyRuntime` owns a separate probe `MonitoringEngine`;
+- the probe monitor uses an isolated `ShadowPositionBook`;
+- probe lifecycle proof writes to `p37_shadow_probe.lifecycle_log_path`;
+- canonical shadow lifecycle path remains separate;
+- no active position slot is reserved;
+- no live sender path is reachable;
+- active BUY counters/logs remain untouched;
+- join metadata (`ab_record_id`, `probe_id`, V3 hashes) is inherited by the
+  probe monitored position.
+
+### Acceptance
+
+J4 code-level repair is accepted when:
+
+- probe lane handoff registers a position in the probe monitor;
+- the canonical shadow monitor remains untouched for probe handoffs;
+- probe lifecycle rows inherit `ab_record_id` / `probe_id` / V3 hashes when a
+  probe position closes;
+- probe lifecycle writes to the probe lifecycle path, not active shadow path;
+- existing P3.7 probe tests still pass;
+- no active policy, IWIM, thresholds, P2 or live configuration changes are made.
+
+### Next Runtime Gate
+
+Run a fresh bounded J4 namespace before claiming runtime lifecycle validation.
+The next smoke must prove:
+
+```text
+probe_transport_rows > 0
+probe_shadow_entry_rows > 0
+probe_lifecycle_monitor_started > 0
+active_buys_rows = 0
+exact decision/V3 join = 100%
+no live/P2 path touched
+```
+
+Lifecycle close / on-chain labels remain a later gate unless the bounded run
+naturally produces closed probe positions.
+
+### R15 Bounded J4-r1 Result
+
+Fresh namespace:
+
+```text
+shadow-burnin-v3-p37-counterfactual-probe-r15-bounded-j4-r1
+```
+
+Observed result:
+
+```text
+v3_rows = 236
+strict replay = full_replay_ok 236/236
+probe_selection_rows = 92
+probe_transport_rows = 25
+probe_shadow_entry_rows = 25
+probe_shadow_lifecycle_rows = 50
+probe_lifecycle_exit_blocked_rows = 25
+probe_lifecycle_position_closed_rows = 25
+probe_lifecycle_truth_status_failure_rows = 50
+probe_lifecycle_time_stop_rows = 25
+probe exact decision/V3 join = 100%
+probe transport/entry/lifecycle ab_record_id coverage = 100%
+probe transport/entry/lifecycle probe_id coverage = 100%
+```
+
+The J4 lifecycle handoff boundary is runtime-validated:
+
+```text
+probe_shadow_entry -> PostBuySubmitted(lane=probe) -> probe monitor -> probe_shadow_lifecycle
+```
+
+The run also produced natural non-probe shadow artifacts:
+
+```text
+buys.jsonl rows = 2
+shadow_lifecycle.jsonl rows = 6
+```
+
+Those rows do not carry `probe_id` and are separate from
+`dispatch_source=counterfactual_shadow_probe` probe artifacts. They do not
+indicate probe mutation of active BUY semantics.
+
+Remaining blocker:
+
+```text
+probe lifecycle rows are all truth_status=failure
+truth_detail = shadow time-stop expired before any canonical snapshot reached guardian
+```
+
+Decision:
+
+```text
+J4 probe lifecycle handoff = PASS
+probe lifecycle economic labels = NOT_READY
+full collection / Phase B / P2 / live / threshold tuning = HOLD / NO-GO
+```
+
+The next narrow gate is probe lifecycle truth resolution / canonical snapshot
+coverage, not decision threshold tuning or larger collection.
+
 ## P3.7-J3K7 Routed Exact-SOL-In Entry Materialization / Dispatch Eligibility
 
 ### Trigger

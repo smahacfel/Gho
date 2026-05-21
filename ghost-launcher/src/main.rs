@@ -1843,6 +1843,10 @@ async fn main() -> Result<()> {
         PathBuf::from(&config.execution.events.output_dir).join("live_positions.jsonl"),
     );
     let shadow_lifecycle_log_path = effective_shadow_lifecycle_log_path(&config);
+    let probe_lifecycle_log_path = config
+        .p37_shadow_probe
+        .enabled
+        .then(|| PathBuf::from(&config.p37_shadow_probe.lifecycle_log_path));
 
     let post_buy_config = ghost_launcher::components::post_buy_runtime::PostBuyRuntimeConfig {
         events_output_path: PathBuf::from(&config.execution.events.output_dir),
@@ -1862,6 +1866,7 @@ async fn main() -> Result<()> {
         shadow_ledger: Some(Arc::clone(&shadow_ledger)),
         account_state_core: Some(Arc::clone(oracle_runtime.account_state_core())),
         shadow_lifecycle_log_path,
+        probe_lifecycle_log_path,
     };
     let hydration_live_sell_handle = post_buy_config.live_sell.clone();
     let post_buy_handle = tokio::spawn(async move {

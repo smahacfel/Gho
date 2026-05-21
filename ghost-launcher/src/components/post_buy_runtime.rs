@@ -8,6 +8,10 @@
 //! - **lane == "shadow"**: registers the position in ghost-brain `MonitoringEngine` backed by the
 //!   lane-aware `ShadowPositionBook`, so canonical shadow lifecycle proof lands in
 //!   `shadow_lifecycle.jsonl`.
+//! - **lane == "probe"**: registers counterfactual shadow-probe positions in a separate
+//!   `MonitoringEngine` backed by an isolated `ShadowPositionBook`, so probe lifecycle proof lands
+//!   in the configured `p37_shadow_probe.lifecycle_log_path` without consuming active position
+//!   slots or canonical shadow position state.
 //! - **lane == "paper"**: delegates the entire lifecycle to
 //!   `ghost_brain::PaperPositionLifecycle` (legacy compatibility path).
 //!
@@ -171,6 +175,8 @@ pub struct PostBuyRuntimeConfig {
     pub account_state_core: Option<Arc<AccountStateReducer>>,
     /// Canonical shadow lifecycle/PnL proof log path derived from execution.shadow.*.
     pub shadow_lifecycle_log_path: Option<PathBuf>,
+    /// Counterfactual probe lifecycle proof log path derived from p37_shadow_probe.*.
+    pub probe_lifecycle_log_path: Option<PathBuf>,
 }
 
 impl Default for PostBuyRuntimeConfig {
@@ -193,6 +199,7 @@ impl Default for PostBuyRuntimeConfig {
             shadow_ledger: None,
             account_state_core: None,
             shadow_lifecycle_log_path: None,
+            probe_lifecycle_log_path: None,
         }
     }
 }
@@ -1757,14 +1764,59 @@ pub async fn run(
     } else {
         None
     };
+    let mut probe_runtime_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let mut probe_signal_router_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let probe_monitor = if config.execution_mode == "shadow" {
+        match (
+            config.shadow_ledger.clone(),
+            config.probe_lifecycle_log_path.clone(),
+        ) {
+            (Some(shadow_ledger), Some(probe_lifecycle_log_path)) => {
+                let guardian_config = build_shadow_guardian_config(&config);
+                let (signal_tx, signal_rx) =
+                    mpsc::channel(guardian_config.signal_channel_buffer.max(1));
+                let runtime_router = Arc::new(PositionRuntimeRouter::with_shadow_book(Arc::new(
+                    RwLock::new(ShadowPositionBook::new()),
+                )));
+                let mut monitoring_engine =
+                    MonitoringEngine::new(guardian_config, shadow_ledger, signal_tx);
+                monitoring_engine.set_shadow_simple_exit_thresholds(
+                    config.live_exit_take_profit_pct,
+                    config.live_exit_stop_loss_pct,
+                );
+                if let Some(account_state_core) = config.account_state_core.clone() {
+                    monitoring_engine.set_account_state_core(account_state_core);
+                }
+                monitoring_engine.set_position_router(Arc::clone(&runtime_router));
+                monitoring_engine.set_shadow_lifecycle_log_path(Some(probe_lifecycle_log_path));
+                let monitoring_engine = Arc::new(monitoring_engine);
+                probe_signal_router_handle = Some(tokio::spawn(
+                    SignalRouter::new(signal_rx, runtime_router).run(),
+                ));
+                probe_runtime_handle = Some(Arc::clone(&monitoring_engine).start());
+                Some(monitoring_engine)
+            }
+            (None, Some(_)) => {
+                warn!(
+                    runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+                    "PostBuyRuntime: p37 probe lifecycle path configured but no ShadowLedger is available; probe lifecycle handoff disabled"
+                );
+                None
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
 
     info!(
         runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
-        "PostBuyRuntime adapter started (mode={}, run_id={}, live_sell={}, shadow_guardian={})",
+        "PostBuyRuntime adapter started (mode={}, run_id={}, live_sell={}, shadow_guardian={}, probe_guardian={})",
         config.execution_mode,
         run_id,
         config.live_sell.is_some(),
         shadow_monitor.is_some(),
+        probe_monitor.is_some(),
     );
 
     let mut epoch_counter: u64 = 1;
@@ -1779,10 +1831,17 @@ pub async fn run(
             if shadow_monitor
                 .as_ref()
                 .is_some_and(|monitor| monitor.active_position_count() > 0)
+                || probe_monitor
+                    .as_ref()
+                    .is_some_and(|monitor| monitor.active_position_count() > 0)
             {
                 debug!(
                     runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
                     active_shadow_positions = shadow_monitor
+                        .as_ref()
+                        .map(|monitor| monitor.active_position_count())
+                        .unwrap_or(0),
+                    active_probe_positions = probe_monitor
                         .as_ref()
                         .map(|monitor| monitor.active_position_count())
                         .unwrap_or(0),
@@ -1824,6 +1883,7 @@ pub async fn run(
                             &config,
                             &lifecycle,
                             shadow_monitor.as_ref(),
+                            probe_monitor.as_ref(),
                             &mut epoch_counter,
                             &mut lifecycle_handles,
                             &mut recent_handoffs,
@@ -1863,6 +1923,7 @@ pub async fn run(
                             &config,
                             &lifecycle,
                             shadow_monitor.as_ref(),
+                            probe_monitor.as_ref(),
                             &mut epoch_counter,
                             &mut lifecycle_handles,
                             &mut recent_handoffs,
@@ -1890,7 +1951,11 @@ pub async fn run(
                         .as_ref()
                         .map(|monitor| monitor.active_position_count())
                         .unwrap_or(0);
-                    if active_shadow_positions == 0 {
+                    let active_probe_positions = probe_monitor
+                        .as_ref()
+                        .map(|monitor| monitor.active_position_count())
+                        .unwrap_or(0);
+                    if active_shadow_positions == 0 && active_probe_positions == 0 {
                         info!(
                             runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
                             "PostBuyRuntime shutdown drain elapsed; stopping subscriber"
@@ -1900,6 +1965,7 @@ pub async fn run(
                     debug!(
                         runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
                         active_shadow_positions,
+                        active_probe_positions,
                         "PostBuyRuntime shutdown drain elapsed but canonical shadow closeout is still active; waiting for shadow lifecycle completion"
                     );
                 }
@@ -1932,6 +1998,14 @@ pub async fn run(
         handle.abort();
         let _ = handle.await;
     }
+    if let Some(handle) = probe_runtime_handle.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
+    if let Some(handle) = probe_signal_router_handle.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
 
     if let Err(e) = emitter.flush() {
         warn!(
@@ -1951,6 +2025,7 @@ async fn handle_post_buy_event(
     config: &PostBuyRuntimeConfig,
     lifecycle: &Arc<PaperPositionLifecycle>,
     shadow_monitor: Option<&Arc<MonitoringEngine>>,
+    probe_monitor: Option<&Arc<MonitoringEngine>>,
     epoch_counter: &mut u64,
     lifecycle_handles: &mut Vec<tokio::task::JoinHandle<()>>,
     recent_handoffs: &mut RecentPostBuyCache,
@@ -2202,6 +2277,58 @@ async fn handle_post_buy_event(
         return finish_direct_handoff(recent_handoffs, &candidate_id, handoff.ack);
     }
 
+    if lane == "probe" {
+        info!(
+            runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+            candidate_id = %candidate_id,
+            probe_id = ?join_metadata.probe_id,
+            "PostBuyRuntime: probe lifecycle monitor requested"
+        );
+        let handoff = handle_shadow_post_buy_handoff(
+            probe_monitor,
+            &candidate_id,
+            &pool_amm_id,
+            &base_mint,
+            amount_sol,
+            entry_token_amount_raw,
+            buy_landed_slot,
+            epoch,
+            PositionJoinMetadata {
+                ab_record_id: join_metadata.ab_record_id.clone(),
+                source_ab_record_id: join_metadata.source_ab_record_id.clone(),
+                probe_id: join_metadata.probe_id.clone(),
+                dispatch_source: join_metadata.dispatch_source.clone(),
+                collection_plane: join_metadata.collection_plane.clone(),
+                probe_plane: join_metadata.probe_plane.clone(),
+                v3_feature_snapshot_hash: join_metadata.v3_feature_snapshot_hash.clone(),
+                v3_policy_config_hash: join_metadata.v3_policy_config_hash.clone(),
+                decision_plane: join_metadata.decision_plane.clone(),
+                rollout_namespace: join_metadata.rollout_namespace.clone(),
+            },
+        )
+        .await;
+        match handoff.ack {
+            DirectPostBuyHandoffAck::Accepted => {
+                info!(
+                    runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+                    candidate_id = %candidate_id,
+                    probe_id = ?join_metadata.probe_id,
+                    "PostBuyRuntime: probe lifecycle monitor started"
+                );
+            }
+            DirectPostBuyHandoffAck::Rejected(reason) => {
+                warn!(
+                    runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+                    candidate_id = %candidate_id,
+                    probe_id = ?join_metadata.probe_id,
+                    probe_lifecycle_skip_reason = reason,
+                    "PostBuyRuntime: probe lifecycle monitor skipped"
+                );
+            }
+        }
+        return finish_direct_handoff(recent_handoffs, &candidate_id, handoff.ack);
+    }
+
     let pool_pubkey = Pubkey::from_str(&pool_amm_id).unwrap_or_else(|_| {
         debug!(
             "PostBuyRuntime: pool_amm_id '{}' is not a valid Pubkey, using fallback",
@@ -2328,6 +2455,21 @@ async fn handle_shadow_post_buy_handoff(
     } else {
         0
     };
+    let probe_position_id = join_metadata
+        .probe_id
+        .as_ref()
+        .filter(|_| join_metadata.dispatch_source.as_deref() == Some("counterfactual_shadow_probe"))
+        .map(|probe_id| format!("probe-position:{probe_id}"));
+    let entry_order_id = if probe_position_id.is_some() {
+        format!("probe-entry-{candidate_id}")
+    } else {
+        format!("shadow-entry-{candidate_id}")
+    };
+    let quote_id = if probe_position_id.is_some() {
+        format!("probe-quote-{candidate_id}")
+    } else {
+        format!("shadow-quote-{candidate_id}")
+    };
     let canonical_ready = shadow_monitor
         .wait_for_canonical_snapshot(
             &mint_pubkey,
@@ -2349,11 +2491,11 @@ async fn handle_shadow_post_buy_handoff(
     let context = PositionEventContext {
         join_metadata,
         candidate_id: candidate_id.to_string(),
-        entry_order_id: format!("shadow-entry-{candidate_id}"),
-        quote_id: format!("shadow-quote-{candidate_id}"),
+        entry_order_id,
+        quote_id,
         slot: buy_landed_slot,
         lane: Lane::Shadow,
-        position_id: None,
+        position_id: probe_position_id,
         position_epoch: Some(epoch),
     };
     let registered = shadow_monitor.register_position_with_context(
@@ -4797,6 +4939,7 @@ mod tests {
             shadow_ledger: None,
             account_state_core: None,
             shadow_lifecycle_log_path: None,
+            probe_lifecycle_log_path: None,
         };
 
         let runtime_handle = tokio::spawn(run(event_rx, shutdown_rx, None, config));
@@ -4894,6 +5037,7 @@ mod tests {
             shadow_ledger: None,
             account_state_core: None,
             shadow_lifecycle_log_path: None,
+            probe_lifecycle_log_path: None,
         };
 
         event_tx
@@ -5002,6 +5146,7 @@ mod tests {
             shadow_ledger: None,
             account_state_core: None,
             shadow_lifecycle_log_path: None,
+            probe_lifecycle_log_path: None,
         };
 
         drop(event_tx);
@@ -5156,6 +5301,154 @@ mod tests {
         assert!(
             saw_position_opened,
             "shadow handoff must emit canonical shadow PositionOpened instrumentation"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_handoff_uses_isolated_probe_monitor_and_lifecycle_path() {
+        let tmp_dir = tempfile::tempdir().expect("temp dir");
+        let events_dir = tmp_dir.path().join("events");
+        let shadow_lifecycle_log_path = tmp_dir.path().join("shadow_lifecycle.jsonl");
+        let probe_lifecycle_log_path = tmp_dir.path().join("probe_shadow_lifecycle.jsonl");
+        std::fs::create_dir_all(&events_dir).expect("create events dir");
+
+        let writer_config = EventWriterConfig {
+            output_dir: events_dir.to_string_lossy().into_owned(),
+            enable_optional_events: true,
+            flush_interval_ms: 10,
+            ..EventWriterConfig::default()
+        };
+        let emitter = Arc::new(
+            EventEmitter::new(writer_config, "test-probe-run".to_string(), Lane::Paper)
+                .expect("paper emitter"),
+        );
+        let quote_provider = Arc::new(RwLock::new(ExecutableQuoteProvider::new(
+            QuoteProviderConfig {
+                max_quote_age_ms: 5_000,
+                ring_buffer_size: 16,
+                generation_interval_ms: 100,
+                stale_warning_threshold_ms: 3_000,
+            },
+        )));
+        let lifecycle = Arc::new(PaperPositionLifecycle::new(
+            PaperLifecycleConfig {
+                fill_delay_min_ms: 10,
+                fill_delay_max_ms: 20,
+                tick_interval_ms: 10,
+                max_ticks: 2,
+                aem_t_s: 1,
+                max_open_positions: 1,
+            },
+            emitter,
+            quote_provider,
+        ));
+
+        let shadow_ledger = Arc::new(ShadowLedger::new());
+        let config = PostBuyRuntimeConfig {
+            execution_mode: "shadow".to_string(),
+            shadow_ledger: Some(Arc::clone(&shadow_ledger)),
+            shadow_lifecycle_log_path: Some(shadow_lifecycle_log_path.clone()),
+            probe_lifecycle_log_path: Some(probe_lifecycle_log_path.clone()),
+            ..PostBuyRuntimeConfig::default()
+        };
+        let guardian_config = build_shadow_guardian_config(&config);
+        let (shadow_signal_tx, _shadow_signal_rx) =
+            mpsc::channel(guardian_config.signal_channel_buffer.max(1));
+        let mut shadow_monitor = MonitoringEngine::new(
+            guardian_config.clone(),
+            Arc::clone(&shadow_ledger),
+            shadow_signal_tx,
+        );
+        shadow_monitor.set_position_router(Arc::new(PositionRuntimeRouter::with_shadow_book(
+            Arc::new(RwLock::new(ShadowPositionBook::new())),
+        )));
+        shadow_monitor.set_shadow_lifecycle_log_path(Some(shadow_lifecycle_log_path.clone()));
+        let shadow_monitor = Arc::new(shadow_monitor);
+
+        let (probe_signal_tx, _probe_signal_rx) =
+            mpsc::channel(guardian_config.signal_channel_buffer.max(1));
+        let mut probe_monitor =
+            MonitoringEngine::new(guardian_config, Arc::clone(&shadow_ledger), probe_signal_tx);
+        probe_monitor.set_position_router(Arc::new(PositionRuntimeRouter::with_shadow_book(
+            Arc::new(RwLock::new(ShadowPositionBook::new())),
+        )));
+        probe_monitor.set_shadow_lifecycle_log_path(Some(probe_lifecycle_log_path.clone()));
+        let probe_monitor = Arc::new(probe_monitor);
+
+        let pool_amm_id = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let probe_id = "probe-lifecycle-handoff";
+        let join_metadata = crate::events::ExecutionJoinMetadata {
+            ab_record_id: Some("pool:1000:1200:REJECT".to_string()),
+            source_ab_record_id: Some("pool:1000:1200:REJECT".to_string()),
+            probe_id: Some(probe_id.to_string()),
+            dispatch_source: Some("counterfactual_shadow_probe".to_string()),
+            collection_plane: Some("counterfactual_shadow_probe".to_string()),
+            probe_plane: Some("p37_shadow_probe".to_string()),
+            v3_feature_snapshot_hash: Some("feature-hash".to_string()),
+            v3_policy_config_hash: Some("policy-hash".to_string()),
+            decision_plane: Some("v3_mfs_replay".to_string()),
+            rollout_namespace: Some("j4-test".to_string()),
+            ..Default::default()
+        };
+        let event = GhostEvent::post_buy_submitted(
+            pool_amm_id.to_string(),
+            base_mint.to_string(),
+            "probe-sig",
+            0.007,
+            0,
+            "probe",
+            1,
+            None,
+            PostBuySource::CounterfactualShadowProbe,
+            Some(1),
+            Some(250_000),
+            Some(777),
+            None,
+        )
+        .with_execution_join_metadata(join_metadata);
+
+        let mut epoch_counter = 1;
+        let mut lifecycle_handles = Vec::new();
+        let mut recent_handoffs = RecentPostBuyCache::default();
+        let ack = handle_post_buy_event(
+            event,
+            &config,
+            &lifecycle,
+            Some(&shadow_monitor),
+            Some(&probe_monitor),
+            &mut epoch_counter,
+            &mut lifecycle_handles,
+            &mut recent_handoffs,
+        )
+        .await;
+
+        assert_eq!(ack, DirectPostBuyHandoffAck::Accepted);
+        assert_eq!(shadow_monitor.active_position_count(), 0);
+        assert_eq!(probe_monitor.active_position_count(), 1);
+        assert!(lifecycle_handles.is_empty());
+
+        probe_monitor.unregister_position(&base_mint);
+        assert_eq!(probe_monitor.active_position_count(), 0);
+
+        let probe_rows =
+            std::fs::read_to_string(&probe_lifecycle_log_path).expect("probe lifecycle row");
+        let first_row: serde_json::Value =
+            serde_json::from_str(probe_rows.lines().next().expect("first row"))
+                .expect("valid probe lifecycle json");
+        assert_eq!(first_row["probe_id"], probe_id);
+        assert_eq!(first_row["dispatch_source"], "counterfactual_shadow_probe");
+        assert_eq!(
+            first_row["position_id"],
+            format!("probe-position:{probe_id}")
+        );
+        assert!(
+            !shadow_lifecycle_log_path.exists()
+                || std::fs::read_to_string(&shadow_lifecycle_log_path)
+                    .unwrap_or_default()
+                    .trim()
+                    .is_empty(),
+            "probe lifecycle must not write into canonical shadow lifecycle path"
         );
     }
 

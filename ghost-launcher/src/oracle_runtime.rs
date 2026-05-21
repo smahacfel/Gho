@@ -6902,6 +6902,8 @@ async fn run_p37_shadow_probe_dispatch(
     trigger_component: Arc<crate::components::trigger::TriggerComponent>,
     oracle_runtime: Arc<OracleRuntime>,
     runtime_state: Arc<P37ShadowProbeRuntimeState>,
+    post_buy_tx: Option<DirectPostBuySender>,
+    post_buy_epoch: Arc<AtomicU64>,
     mut record: P37ShadowProbeSelectionRecord,
     pool_data: Arc<DetectedPool>,
     buffered_txs: Vec<crate::components::gatekeeper::GatekeeperBufferedTx>,
@@ -7092,17 +7094,61 @@ async fn run_p37_shadow_probe_dispatch(
                 &transport.execution_outcome,
             ) {
                 enrich_probe_shadow_entry(&mut entry, &record, &request, dispatch_ts_ms);
-                if let Err(err) = append_p37_shadow_probe_entry_record(
+                let entry_write_result = append_p37_shadow_probe_entry_record(
                     std::path::Path::new(&config.entry_log_path),
                     &entry,
                 )
-                .await
-                {
+                .await;
+                if let Err(err) = entry_write_result {
                     warn!(
                         probe_id = ?record.probe_id,
                         error = %err,
                         "P37_SHADOW_PROBE_ENTRY_WRITE_FAILED"
                     );
+                } else if event.err.is_none() {
+                    let epoch = post_buy_epoch.fetch_add(1, Ordering::Relaxed);
+                    match send_probe_post_buy_handoff(
+                        post_buy_tx.as_ref(),
+                        Pubkey::try_from(record.pool_id.as_str()).unwrap_or(buy_mint),
+                        pool_data.as_ref(),
+                        &event,
+                        &request,
+                        epoch,
+                        p37_shadow_probe_join_metadata(&record).unwrap_or_default(),
+                    )
+                    .await
+                    {
+                        Ok(Some(DirectPostBuyHandoffAck::Accepted)) => {
+                            info!(
+                                probe_id = ?record.probe_id,
+                                source_ab_record_id = ?record.source_ab_record_id,
+                                "P37_SHADOW_PROBE_LIFECYCLE_HANDOFF_ACCEPTED"
+                            );
+                        }
+                        Ok(Some(DirectPostBuyHandoffAck::Rejected(reason))) => {
+                            warn!(
+                                probe_id = ?record.probe_id,
+                                source_ab_record_id = ?record.source_ab_record_id,
+                                probe_lifecycle_skip_reason = reason,
+                                "P37_SHADOW_PROBE_LIFECYCLE_HANDOFF_REJECTED"
+                            );
+                        }
+                        Ok(None) => {
+                            warn!(
+                                probe_id = ?record.probe_id,
+                                source_ab_record_id = ?record.source_ab_record_id,
+                                "P37_SHADOW_PROBE_LIFECYCLE_HANDOFF_SKIPPED_NO_DIRECT_POST_BUY_RUNTIME"
+                            );
+                        }
+                        Err(err) => {
+                            warn!(
+                                probe_id = ?record.probe_id,
+                                source_ab_record_id = ?record.source_ab_record_id,
+                                error = %err,
+                                "P37_SHADOW_PROBE_LIFECYCLE_HANDOFF_FAILED"
+                            );
+                        }
+                    }
                 }
             } else {
                 warn!(
@@ -7183,6 +7229,8 @@ async fn maybe_handle_p37_shadow_probe_decision(
                     let config = config.clone();
                     let oracle_runtime = Arc::clone(&ctx.oracle_runtime);
                     let runtime_state = Arc::clone(&ctx.p37_shadow_probe_state);
+                    let post_buy_tx = ctx.post_buy_tx.clone();
+                    let post_buy_epoch = Arc::clone(&ctx.post_buy_epoch);
                     if let (Some(trigger_component), Some(pool_data), Some(buy_mint)) =
                         (trigger_component, pool_data, buy_mint)
                     {
@@ -7191,6 +7239,8 @@ async fn maybe_handle_p37_shadow_probe_decision(
                             trigger_component,
                             oracle_runtime,
                             runtime_state,
+                            post_buy_tx,
+                            post_buy_epoch,
                             record.clone(),
                             pool_data,
                             buffered_txs,
@@ -10047,6 +10097,45 @@ async fn send_shadow_post_buy_handoff(
     )
     .await?;
     Ok(ack)
+}
+
+async fn send_probe_post_buy_handoff(
+    post_buy_tx: Option<&DirectPostBuySender>,
+    pool_amm_id: Pubkey,
+    pool_data: &DetectedPool,
+    shadow_event: &crate::events::ShadowBuySimulationEvent,
+    request: &crate::components::trigger::PreparedBuyRequest,
+    epoch: u64,
+    join_metadata: ExecutionJoinMetadata,
+) -> anyhow::Result<Option<DirectPostBuyHandoffAck>> {
+    let creator_pubkey = Pubkey::from_str(&pool_data.creator)
+        .ok()
+        .map(|pubkey| pubkey.to_string());
+    let probe_signature = join_metadata
+        .probe_id
+        .clone()
+        .or_else(|| shadow_event.live_signature.clone())
+        .unwrap_or_else(|| shadow_event.decision_ts_ms.to_string());
+    let handoff_event = GhostEvent::PostBuySubmitted {
+        candidate_id: shadow_event.candidate_id.clone(),
+        pool_amm_id: pool_amm_id.to_string(),
+        base_mint: pool_data.base_mint.clone(),
+        signature: probe_signature,
+        amount_sol: request.trade_value_sol,
+        tip_lamports: request.tip_lamports,
+        lane: "probe".to_string(),
+        epoch_id: epoch,
+        position_slot_id: None,
+        source: PostBuySource::CounterfactualShadowProbe,
+        min_tokens_out: Some(request.min_tokens_out),
+        entry_token_amount_raw: shadow_event
+            .entry_token_amount_raw
+            .or(request.entry_token_amount_raw),
+        buy_landed_slot: Some(shadow_event.rpc_slot),
+        creator_pubkey,
+        join_metadata,
+    };
+    send_direct_shadow_post_buy_handoff(post_buy_tx, &handoff_event, pool_amm_id, "probe").await
 }
 
 async fn apply_trigger_buy_outcome(
