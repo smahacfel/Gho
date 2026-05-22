@@ -51,12 +51,16 @@ class L1RejectDiagnosticsTests(unittest.TestCase):
                         "[execution.shadow]",
                         'entry_log_path = "shadow_entries.jsonl"',
                         'lifecycle_log_path = "shadow_lifecycle.jsonl"',
+                        "[trigger.shadow_run]",
+                        'payer_strategy = "configured"',
+                        'output_path = "buys.jsonl"',
                     ]
                 )
                 + "\n",
                 encoding="utf-8",
             )
             paths = {
+                "active_shadow_buys": root / "buys.jsonl",
                 "probe_selection": root / "probe_selection.jsonl",
                 "probe_transport": root / "probe_transport.jsonl",
                 "probe_entries": root / "probe_entries.jsonl",
@@ -123,6 +127,7 @@ class L1RejectDiagnosticsTests(unittest.TestCase):
             "brain_config_path": "brain.toml",
             "brain_config_hash": "brain-hash",
             "pdd_entry_drift_threshold_source": "elapsed_scaled",
+            "pdd_entry_drift_pct": 10.0,
             "pdd_entry_drift_elapsed_ms": 3000,
             "pdd_entry_drift_anchor_price": 1.0,
             "pdd_entry_drift_current_price": 1.1,
@@ -130,6 +135,74 @@ class L1RejectDiagnosticsTests(unittest.TestCase):
         summary = self.build_temp_summary([base])
         self.assertEqual(summary["pdd_drift_rows"], 1)
         self.assertEqual(summary["pdd_drift_anchor_rows"], 1)
+        self.assertEqual(summary["pdd_drift_evaluated_rows"], 1)
+        self.assertEqual(summary["pdd_drift_anchor_hydrated_rows"], 1)
+
+    def test_pdd_drift_denominator_excludes_threshold_source_only_rows(self) -> None:
+        base = {
+            "verdict_type": "REJECT",
+            "rollout_profile": "r16-test",
+            "run_id": "run-r16",
+            "session_id": "session-r16",
+            "v3_policy_config_hash": "policy-hash",
+            "brain_config_path": "brain.toml",
+            "brain_config_hash": "brain-hash",
+            "gatekeeper_terminal_gate": "pdd",
+            "pdd_spike_ratio_quality": "unavailable",
+            "pdd_whale_single_max_pct": 12.0,
+        }
+        summary = self.build_temp_summary(
+            [
+                {
+                    **base,
+                    "pdd_entry_drift_threshold_source": "elapsed_scaled",
+                    "pdd_entry_drift_pct": 10.0,
+                    "pdd_entry_drift_elapsed_ms": 3000,
+                    "pdd_entry_drift_anchor_price": 1.0,
+                    "pdd_entry_drift_current_price": 1.1,
+                },
+                {
+                    **base,
+                    "pdd_entry_drift_threshold_source": "elapsed_scaled",
+                },
+            ]
+        )
+        self.assertEqual(summary["pdd_drift_evaluated_rows"], 1)
+        self.assertEqual(summary["pdd_drift_anchor_hydrated_rows"], 1)
+        self.assertEqual(summary["pdd_drift_anchor_coverage_pct_among_evaluated"], 100.0)
+        self.assertEqual(summary["pdd_drift_threshold_source_rows"], 2)
+        self.assertEqual(summary["pdd_drift_threshold_source_only_rows"], 1)
+        self.assertEqual(
+            summary["diagnostic_quality"]["pdd_entry_drift_anchor_coverage_pct"],
+            100.0,
+        )
+
+    def test_shadow_payer_account_not_found_is_reported(self) -> None:
+        base = {
+            "verdict_type": "BUY",
+            "rollout_profile": "r16-test",
+            "run_id": "run-r16",
+            "session_id": "session-r16",
+            "v3_policy_config_hash": "policy-hash",
+            "brain_config_path": "brain.toml",
+            "brain_config_hash": "brain-hash",
+            "ab_record_id": "ab-buy",
+        }
+        summary = self.build_temp_summary(
+            [base],
+            {
+                "active_shadow_buys": [
+                    {
+                        **base,
+                        "payer_pubkey": "9MCkR8iiQLRxS242CbQijfaKT5AGNr2bWoSsXbQqvbaw",
+                        "err": "Failed to fetch payer account: AccountNotFound: pubkey=9MCkR8iiQLRxS242CbQijfaKT5AGNr2bWoSsXbQqvbaw: timeout",
+                    }
+                ],
+            },
+        )
+        self.assertEqual(summary["shadow_payer_strategy"], "configured")
+        self.assertEqual(summary["shadow_payer_account_status"], "rpc_missing")
+        self.assertEqual(summary["shadow_payer_account_not_found_rows"], 1)
 
 
 if __name__ == "__main__":

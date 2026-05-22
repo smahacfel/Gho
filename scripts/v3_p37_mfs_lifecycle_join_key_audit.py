@@ -52,6 +52,17 @@ FIELD_GROUPS = {
     "simulation_error_category": ("simulation_error_category",),
     "simulation_error_kind": ("simulation_error_kind",),
     "simulation_error_custom_code": ("simulation_error_custom_code",),
+    "simulation_error_account_pubkey": ("simulation_error_account_pubkey",),
+    "simulation_error_account_role": ("simulation_error_account_role",),
+    "simulation_error_account_source": ("simulation_error_account_source",),
+    "simulation_error_account_candidates": ("simulation_error_account_candidates",),
+    "precheck_account_set_hash": ("precheck_account_set_hash",),
+    "prepared_request_account_set_hash": ("prepared_request_account_set_hash",),
+    "simulation_account_set_hash": ("simulation_account_set_hash",),
+    "account_set_match": ("account_set_match",),
+    "account_set_mismatch_reason": ("account_set_mismatch_reason",),
+    "probe_entry_materialization_status": ("probe_entry_materialization_status",),
+    "probe_lifecycle_eligibility_status": ("probe_lifecycle_eligibility_status",),
     "execution_account_readiness_status": ("execution_account_readiness_status",),
     "run_id": ("run_id",),
     "session_id": ("session_id",),
@@ -66,6 +77,12 @@ COUNTER_FIELD_GROUPS = (
     "execution_outcome",
     "error_class",
     "simulation_error_category",
+    "simulation_error_kind",
+    "simulation_error_account_role",
+    "simulation_error_account_source",
+    "account_set_match",
+    "probe_entry_materialization_status",
+    "probe_lifecycle_eligibility_status",
     "execution_account_readiness_status",
 )
 CANONICAL_JOIN_ARTIFACTS = (
@@ -445,7 +462,57 @@ def row_string(row: dict[str, Any], field: str) -> str | None:
     return str(value)
 
 
+def row_bool_string(row: dict[str, Any], field: str) -> str | None:
+    value = row.get(field)
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str) and value == "":
+        return None
+    return str(value).lower()
+
+
+def is_account_not_found_row(row: dict[str, Any]) -> bool:
+    kind = row_string(row, "simulation_error_kind")
+    category = row_string(row, "simulation_error_category")
+    message = row_string(row, "simulation_error_message") or row_string(row, "err")
+    return (
+        kind == "AccountNotFound"
+        or (category is not None and "account_not_found" in category)
+        or (message is not None and "AccountNotFound" in message)
+    )
+
+
+def is_simulation_error_entry(row: dict[str, Any]) -> bool:
+    status = row_string(row, "probe_entry_materialization_status")
+    execution_outcome = row_string(row, "execution_outcome")
+    return (
+        status == "simulation_error"
+        or execution_outcome == "counterfactual_shadow_probe_simulation_error"
+        or bool(row_string(row, "simulation_error_kind"))
+        or bool(row_string(row, "simulation_error_category"))
+        or bool(row_string(row, "error_class"))
+    )
+
+
 def classify_probe_transport_materialization(row: dict[str, Any], entry_probe_ids: set[str]) -> tuple[str, str]:
+    explicit_status = row_string(row, "probe_entry_materialization_status")
+    if explicit_status == "simulation_error":
+        reason = (
+            row_string(row, "simulation_error_category")
+            or row_string(row, "error_class")
+            or row_string(row, "simulation_error_kind")
+            or "simulation_error"
+        )
+        custom_code = row_string(row, "simulation_error_custom_code")
+        if custom_code:
+            reason = f"{reason}:custom_{custom_code}"
+        return "simulation_error", reason
+    if explicit_status in {"entry_materialized", "transport_only", "lifecycle_eligible"}:
+        reason = row_string(row, "probe_lifecycle_eligibility_status") or "explicit_entry_status"
+        return explicit_status, reason
+
     probe_id = row_probe_id(row)
     execution_outcome = row_string(row, "execution_outcome")
     error_class = row_string(row, "error_class")
@@ -503,6 +570,12 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
     creator_identity_source_counts: Counter[str] = Counter()
     amount_guard_status_counts: Counter[str] = Counter()
     simulation_error_custom_code_counts: Counter[str] = Counter()
+    simulation_error_kind_counts: Counter[str] = Counter()
+    simulation_error_account_role_counts: Counter[str] = Counter()
+    simulation_error_account_source_counts: Counter[str] = Counter()
+    simulation_error_category_counts: Counter[str] = Counter()
+    account_set_match_counts: Counter[str] = Counter()
+    account_set_mismatch_reason_counts: Counter[str] = Counter()
     rows: list[dict[str, Any]] = []
     for row in transport_rows:
         status, reason = classify_probe_transport_materialization(row, entry_probe_ids)
@@ -518,7 +591,13 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
         creator_vault_mismatch_reason = row_string(row, "creator_vault_mismatch_reason")
         creator_identity_source = row_string(row, "creator_identity_source")
         amount_guard_status = row_string(row, "amount_guard_status")
+        simulation_error_category = row_string(row, "simulation_error_category")
+        simulation_error_kind = row_string(row, "simulation_error_kind")
+        simulation_error_account_role = row_string(row, "simulation_error_account_role")
+        simulation_error_account_source = row_string(row, "simulation_error_account_source")
         simulation_error_custom_code = row_string(row, "simulation_error_custom_code")
+        account_set_match = row_bool_string(row, "account_set_match")
+        account_set_mismatch_reason = row_string(row, "account_set_mismatch_reason")
         if creator_vault_authority_status:
             creator_vault_authority_status_counts[creator_vault_authority_status] += 1
         if creator_vault_mismatch_reason:
@@ -527,8 +606,20 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
             creator_identity_source_counts[creator_identity_source] += 1
         if amount_guard_status:
             amount_guard_status_counts[amount_guard_status] += 1
+        if simulation_error_category:
+            simulation_error_category_counts[simulation_error_category] += 1
+        if simulation_error_kind:
+            simulation_error_kind_counts[simulation_error_kind] += 1
+        if simulation_error_account_role:
+            simulation_error_account_role_counts[simulation_error_account_role] += 1
+        if simulation_error_account_source:
+            simulation_error_account_source_counts[simulation_error_account_source] += 1
         if simulation_error_custom_code:
             simulation_error_custom_code_counts[f"custom_{simulation_error_custom_code}"] += 1
+        if account_set_match:
+            account_set_match_counts[account_set_match] += 1
+        if account_set_mismatch_reason:
+            account_set_mismatch_reason_counts[account_set_mismatch_reason] += 1
         rows.append(
             {
                 "probe_id": row_probe_id(row),
@@ -542,9 +633,13 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
                 "min_tokens_out": row.get("min_tokens_out"),
                 "execution_outcome": row_string(row, "execution_outcome"),
                 "error_class": row_string(row, "error_class"),
-                "simulation_error_category": row_string(row, "simulation_error_category"),
+                "simulation_error_category": simulation_error_category,
+                "simulation_error_kind": simulation_error_kind,
                 "simulation_error_custom_code": simulation_error_custom_code,
-                "simulation_error_account_role": row_string(row, "simulation_error_account_role"),
+                "simulation_error_account_pubkey": row_string(row, "simulation_error_account_pubkey"),
+                "simulation_error_account_role": simulation_error_account_role,
+                "simulation_error_account_source": simulation_error_account_source,
+                "simulation_error_account_candidates": row.get("simulation_error_account_candidates"),
                 "simulation_error_actual_account_pubkey": row_string(
                     row,
                     "simulation_error_actual_account_pubkey",
@@ -573,6 +668,14 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
                     row,
                     "execution_account_readiness_status",
                 ),
+                "precheck_account_set_hash": row_string(row, "precheck_account_set_hash"),
+                "prepared_request_account_set_hash": row_string(
+                    row,
+                    "prepared_request_account_set_hash",
+                ),
+                "simulation_account_set_hash": row_string(row, "simulation_account_set_hash"),
+                "account_set_match": account_set_match,
+                "account_set_mismatch_reason": account_set_mismatch_reason,
                 "probe_entry_materialization_status": status,
                 "probe_entry_materialization_reason": reason,
             }
@@ -598,6 +701,58 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
 
     transport_rows_total = len(transport_rows)
     entry_rows_total = len(entry_rows)
+    account_not_found_rows = [row for row in transport_rows if is_account_not_found_row(row)]
+    account_not_found_attributed_rows = [
+        row
+        for row in account_not_found_rows
+        if row_string(row, "simulation_error_category") == "simulation_account_not_found_attributed"
+        or (
+            row_string(row, "simulation_error_account_pubkey")
+            and row_string(row, "simulation_error_account_role")
+        )
+    ]
+    account_not_found_multi_candidate_rows = [
+        row
+        for row in account_not_found_rows
+        if row_string(row, "simulation_error_category")
+        == "simulation_account_not_found_multi_candidate"
+    ]
+    account_not_found_unattributed_rows = [
+        row
+        for row in account_not_found_rows
+        if row_string(row, "simulation_error_category")
+        == "simulation_account_not_found_unattributed"
+    ]
+    simulation_rpc_visibility_gap_rows = [
+        row
+        for row in account_not_found_rows
+        if row_string(row, "simulation_error_category") == "simulation_rpc_visibility_gap"
+    ]
+    precheck_simulation_account_set_mismatch_rows = [
+        row
+        for row in transport_rows
+        if row_bool_string(row, "account_set_match") == "false"
+    ]
+    unexplained_account_set_mismatch_rows = [
+        row
+        for row in precheck_simulation_account_set_mismatch_rows
+        if not row_string(row, "account_set_mismatch_reason")
+    ]
+    simulation_error_entry_rows = [row for row in entry_rows if is_simulation_error_entry(row)]
+    lifecycle_eligible_entry_rows = [
+        row
+        for row in entry_rows
+        if row_string(row, "probe_lifecycle_eligibility_status") == "lifecycle_eligible"
+    ]
+    successful_probe_entry_rows = [
+        row
+        for row in entry_rows
+        if not is_simulation_error_entry(row)
+        and (
+            row_string(row, "probe_entry_materialization_status") in {None, "entry_materialized"}
+            or row_string(row, "probe_lifecycle_eligibility_status") == "lifecycle_eligible"
+        )
+    ]
     return {
         "transport_rows": transport_rows_total,
         "entry_rows": entry_rows_total,
@@ -614,8 +769,20 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
         ),
         "creator_identity_source_counts": dict(sorted(creator_identity_source_counts.items())),
         "amount_guard_status_counts": dict(sorted(amount_guard_status_counts.items())),
+        "simulation_error_category_counts": dict(sorted(simulation_error_category_counts.items())),
+        "simulation_error_kind_counts": dict(sorted(simulation_error_kind_counts.items())),
+        "simulation_error_account_role_counts": dict(
+            sorted(simulation_error_account_role_counts.items())
+        ),
+        "simulation_error_account_source_counts": dict(
+            sorted(simulation_error_account_source_counts.items())
+        ),
         "simulation_error_custom_code_counts": dict(
             sorted(simulation_error_custom_code_counts.items())
+        ),
+        "account_set_match_counts": dict(sorted(account_set_match_counts.items())),
+        "account_set_mismatch_reason_counts": dict(
+            sorted(account_set_mismatch_reason_counts.items())
         ),
         "skip_reason_counts": dict(sorted(skip_reason_counts.items())),
         "skip_creator_vault_authority_status_counts": dict(
@@ -635,6 +802,18 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
         "simulation_error_rows": status_counts.get("simulation_error", 0),
         "execution_account_not_ready_rows": status_counts.get("execution_account_not_ready", 0),
         "unknown_rows": status_counts.get("unknown", 0),
+        "account_not_found_rows": len(account_not_found_rows),
+        "account_not_found_attributed_rows": len(account_not_found_attributed_rows),
+        "account_not_found_multi_candidate_rows": len(account_not_found_multi_candidate_rows),
+        "account_not_found_unattributed_rows": len(account_not_found_unattributed_rows),
+        "simulation_rpc_visibility_gap_rows": len(simulation_rpc_visibility_gap_rows),
+        "precheck_simulation_account_set_mismatch_rows": len(
+            precheck_simulation_account_set_mismatch_rows
+        ),
+        "unexplained_account_set_mismatch_rows": len(unexplained_account_set_mismatch_rows),
+        "successful_probe_entry_rows": len(successful_probe_entry_rows),
+        "simulation_error_entry_rows": len(simulation_error_entry_rows),
+        "lifecycle_eligible_entry_rows": len(lifecycle_eligible_entry_rows),
         "rows": rows,
     }
 
@@ -809,6 +988,7 @@ def readiness(report: dict[str, Any]) -> dict[str, Any]:
 
 def probe_readiness(report: dict[str, Any]) -> dict[str, Any]:
     coverage = report.get("probe_join_key_coverage", {})
+    materialization = report.get("probe_entry_materialization", {})
     selection_rows = coverage.get("probe_selection_rows", 0)
     transport_rows = coverage.get("probe_transport_rows", 0)
     entry_rows = coverage.get("probe_entry_rows", 0)
@@ -841,6 +1021,12 @@ def probe_readiness(report: dict[str, Any]) -> dict[str, Any]:
     if decision_join_acceptance != "pass":
         status = "not_ready"
         reasons.append("probe_rows_missing_exact_decision_v3_join")
+    if materialization.get("account_not_found_unattributed_rows", 0) > 0:
+        status = "not_ready"
+        reasons.append("unattributed_account_not_found_blocks_collection")
+    if materialization.get("unexplained_account_set_mismatch_rows", 0) > 0:
+        status = "not_ready"
+        reasons.append("unexplained_precheck_simulation_account_set_mismatch")
     if status == "ready_for_probe_transport_entry_join" and quality in {
         "exact_probe_id_and_ab_record_id",
         "exact_ab_record_id",
@@ -861,6 +1047,33 @@ def probe_readiness(report: dict[str, Any]) -> dict[str, Any]:
         "probe_lifecycle_rows": coverage.get("probe_lifecycle_rows", 0),
         "decision_join_acceptance": decision_join_acceptance,
         "required_exact_decision_v3_join_coverage": required_decision_join_coverage,
+        "account_not_found_rows": materialization.get("account_not_found_rows", 0),
+        "account_not_found_attributed_rows": materialization.get(
+            "account_not_found_attributed_rows",
+            0,
+        ),
+        "account_not_found_multi_candidate_rows": materialization.get(
+            "account_not_found_multi_candidate_rows",
+            0,
+        ),
+        "account_not_found_unattributed_rows": materialization.get(
+            "account_not_found_unattributed_rows",
+            0,
+        ),
+        "simulation_rpc_visibility_gap_rows": materialization.get(
+            "simulation_rpc_visibility_gap_rows",
+            0,
+        ),
+        "precheck_simulation_account_set_mismatch_rows": materialization.get(
+            "precheck_simulation_account_set_mismatch_rows",
+            0,
+        ),
+        "successful_probe_entry_rows": materialization.get("successful_probe_entry_rows", 0),
+        "simulation_error_entry_rows": materialization.get("simulation_error_entry_rows", 0),
+        "lifecycle_eligible_entry_rows": materialization.get(
+            "lifecycle_eligible_entry_rows",
+            0,
+        ),
     }
 
 
@@ -976,7 +1189,22 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- creator_vault_mismatch_reason_counts: `{json.dumps(materialization['creator_vault_mismatch_reason_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- creator_identity_source_counts: `{json.dumps(materialization['creator_identity_source_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- amount_guard_status_counts: `{json.dumps(materialization['amount_guard_status_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- simulation_error_category_counts: `{json.dumps(materialization['simulation_error_category_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- simulation_error_kind_counts: `{json.dumps(materialization['simulation_error_kind_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- simulation_error_account_role_counts: `{json.dumps(materialization['simulation_error_account_role_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- simulation_error_account_source_counts: `{json.dumps(materialization['simulation_error_account_source_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- simulation_error_custom_code_counts: `{json.dumps(materialization['simulation_error_custom_code_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- account_set_match_counts: `{json.dumps(materialization['account_set_match_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- account_set_mismatch_reason_counts: `{json.dumps(materialization['account_set_mismatch_reason_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- account_not_found_rows: `{materialization['account_not_found_rows']}`",
+            f"- account_not_found_attributed_rows: `{materialization['account_not_found_attributed_rows']}`",
+            f"- account_not_found_multi_candidate_rows: `{materialization['account_not_found_multi_candidate_rows']}`",
+            f"- account_not_found_unattributed_rows: `{materialization['account_not_found_unattributed_rows']}`",
+            f"- simulation_rpc_visibility_gap_rows: `{materialization['simulation_rpc_visibility_gap_rows']}`",
+            f"- precheck_simulation_account_set_mismatch_rows: `{materialization['precheck_simulation_account_set_mismatch_rows']}`",
+            f"- successful_probe_entry_rows: `{materialization['successful_probe_entry_rows']}`",
+            f"- simulation_error_entry_rows: `{materialization['simulation_error_entry_rows']}`",
+            f"- lifecycle_eligible_entry_rows: `{materialization['lifecycle_eligible_entry_rows']}`",
             f"- skip_reason_counts: `{json.dumps(materialization['skip_reason_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- skip_creator_vault_authority_status_counts: `{json.dumps(materialization['skip_creator_vault_authority_status_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- skip_creator_vault_mismatch_reason_counts: `{json.dumps(materialization['skip_creator_vault_mismatch_reason_counts'], ensure_ascii=False, sort_keys=True)}`",

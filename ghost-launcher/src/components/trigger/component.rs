@@ -4600,6 +4600,45 @@ impl TriggerComponent {
         Ok(None)
     }
 
+    pub(crate) async fn counterfactual_probe_missing_manifest_accounts(
+        &self,
+        accounts: &[(Pubkey, String)],
+    ) -> Result<Vec<CounterfactualProbeMissingAccount>> {
+        let rpc = self.preparation_rpc();
+        let mut missing = Vec::new();
+        let mut seen = HashSet::new();
+        for (pubkey, role) in accounts {
+            if !seen.insert(*pubkey) {
+                continue;
+            }
+            match rpc
+                .get_account_with_commitment(pubkey, CommitmentConfig::processed())
+                .await
+            {
+                Ok(response) if response.value.is_some() => {}
+                Ok(_) => missing.push(CounterfactualProbeMissingAccount {
+                    pubkey: *pubkey,
+                    role: role.clone(),
+                }),
+                Err(err) if Self::is_account_not_found_error(&err) => {
+                    missing.push(CounterfactualProbeMissingAccount {
+                        pubkey: *pubkey,
+                        role: role.clone(),
+                    });
+                }
+                Err(err) => {
+                    return Err(anyhow::anyhow!(
+                        "counterfactual probe manifest account check failed: role={} pubkey={} error={}",
+                        role,
+                        pubkey,
+                        err
+                    ));
+                }
+            }
+        }
+        Ok(missing)
+    }
+
     pub fn spawn_shadow_simulation(&self, request: PreparedBuyRequest) -> PendingShadowSimulation {
         let shadow_simulator = Arc::clone(&self.shadow_simulator);
         let shadow_config = self.config.shadow_run.clone();

@@ -1494,6 +1494,118 @@ Acceptance:
 Collection, Phase B, P2, live, active policy changes, IWIM changes and threshold
 tuning remain out of scope.
 
+## P3.7-L1R3 / J3M Probe Simulation AccountNotFound Attribution Repair
+
+### Trigger
+
+R16-r3 closed the L1R2 reporting and active-shadow payer gaps, but it exposed a
+new probe-runtime blocker:
+
+```text
+probe_transport_rows = 15
+probe_shadow_entries_rows = 15
+execution_outcome = counterfactual_shadow_probe_simulation_error
+simulation_error_kind = AccountNotFound
+simulation_error_account_role = null
+simulation_error_account_pubkey = null
+probe_lifecycle_rows = 0
+```
+
+The row-level reporting was now trustworthy enough to show that this was not a
+join-key, PDD denominator, active payer, or identity/hash problem. The blocker
+was blind simulation attribution: `simulate_buy` returned `AccountNotFound`, but
+the probe transport row could not identify the missing role/pubkey.
+
+### Decision
+
+L1R3/J3M is a diagnostic/runtime attribution repair only. It does not change:
+
+- active Gatekeeper policy;
+- PDD or Gatekeeper thresholds;
+- IWIM;
+- live sender or P2 behavior;
+- Phase B state;
+- probe sampling, amount, slippage, or baseline configs.
+
+Every counterfactual probe simulation attempt must build a prepared-request
+account manifest and comparable account-set hashes. If simulation returns
+`AccountNotFound`, the row must carry either:
+
+- exact missing account attribution (`role`, `pubkey`, `source`, instruction
+  context);
+- a bounded candidate set;
+- or an explicit `simulation_account_not_found_unattributed` /
+  `simulation_rpc_visibility_gap` category.
+
+Unattributed `AccountNotFound` rows block collection and policy ablation.
+
+### Runtime Contract
+
+Probe transport and probe entry rows add optional/backward-compatible fields:
+
+```text
+simulation_error_account_pubkey
+simulation_error_account_role
+simulation_error_account_source
+simulation_error_instruction_index
+simulation_error_account_index
+simulation_error_account_candidates
+simulation_error_category
+precheck_account_set_hash
+prepared_request_account_set_hash
+simulation_account_set_hash
+precheck_account_set_count
+prepared_request_account_set_count
+simulation_account_set_count
+account_set_match
+account_set_mismatch_reason
+probe_entry_materialization_status
+probe_lifecycle_eligibility_status
+```
+
+The prepared account manifest is generated from the transaction account set and
+annotated with role/source/instruction metadata where available. For error rows,
+the manifest can be emitted in full; for all rows, comparable hashes and counts
+must be emitted.
+
+Simulation-error entry artifacts are not lifecycle-eligible. Reports must
+separate:
+
+```text
+probe_entry_artifact_rows
+successful_probe_entry_rows
+simulation_error_entry_rows
+lifecycle_eligible_entry_rows
+```
+
+### R16-r4 Attribution Smoke
+
+The next runtime gate is a small attribution smoke, not another policy run:
+
+```text
+configs/rollout/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r4-account-attribution.toml
+namespace = shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r4-account-attribution
+max_probes_per_run = 15
+max_concurrent = 1
+```
+
+Acceptance:
+
+- strict replay remains `full_replay_ok`;
+- exact decision/V3 join remains 100%;
+- identity/hash contract remains PASS;
+- active BUY/live/P2 remain untouched;
+- every `AccountNotFound` row has exact attribution or candidate set;
+- `account_not_found_unattributed_rows = 0`;
+- simulation-error entry rows are not lifecycle-eligible;
+- precheck/simulation account-set relationship is reported.
+
+If no `AccountNotFound` appears, the smoke is clean but not proof of attribution;
+the code-level tests remain the proof for attribution behavior.
+
+No L2 ablation, collection, Phase B, P2/live, or threshold tuning is allowed
+while any probe simulation `AccountNotFound` remains blind.
+
 ## P3.7-L1 Diagnostic Standard / Soft-PDD Policy Probe
 
 ### Context
@@ -1840,6 +1952,119 @@ no ablation
 no Phase B
 no P2/live
 no threshold tuning
+no root ghost_brain_config.toml edit
+no baseline J4C config edit
+```
+
+## P3.7-L1R2 Reject Diagnostics Denominator + Active Shadow Payer Repair
+
+### Trigger
+
+R16-r2 fulfilled its diagnostic purpose and was stopped as a partial run. It
+showed that L1R fixed the materialized PDD hydration for rows where entry drift
+was actually evaluated, but it exposed two narrower blockers:
+
+```text
+raw decision rows = 813
+rows with pdd_entry_drift_pct = 434
+anchor/current/elapsed hydrated = 434/434
+pdd_entry_drift_threshold_source = elapsed_scaled on 434 evaluated rows
+
+BUY verdict rows = 7
+active shadow lifecycle rows = 7
+active shadow dispatch_status = failed
+active shadow failure = Failed to fetch payer account: AccountNotFound
+```
+
+The remaining diagnostic failure was not a runtime PDD hydration failure. It was
+a reporting-denominator bug: rows with default
+`pdd_entry_drift_threshold_source` were counted as PDD drift rows even when
+`pdd_entry_drift_pct` was absent and entry drift had not been evaluated.
+
+The active-shadow BUY failure is a separate shadow-payer contract issue. R16-r2
+used configured-payer semantics, but the configured payer account was not
+visible to RPC and every active shadow BUY dispatch failed before entry.
+
+### Reporting Repair
+
+`scripts/v3_p37_l1_reject_diagnostics.py` must use this denominator:
+
+```text
+pdd_drift_evaluated_rows = rows where pdd_entry_drift_pct is present
+```
+
+PDD anchor hydration coverage is measured only among
+`pdd_drift_evaluated_rows`.
+
+The report must also expose:
+
+```text
+pdd_drift_evaluated_rows
+pdd_drift_anchor_hydrated_rows
+pdd_drift_anchor_coverage_pct_among_evaluated
+pdd_drift_threshold_source_rows
+pdd_drift_threshold_source_only_rows
+```
+
+This keeps threshold-source defaults visible without allowing them to inflate
+or poison the PDD drift hydration denominator.
+
+### Active Shadow Payer Contract
+
+The R16 diagnostic report must expose active-shadow payer state:
+
+```text
+shadow_payer_strategy
+shadow_payer_pubkey
+shadow_payer_account_status
+shadow_payer_account_error
+```
+
+For configured payer mode, `AccountNotFound` is a runtime/config blocker and
+must be reported explicitly. For the next R16 diagnostic run, use a fresh
+namespace with ephemeral shadow-payer semantics:
+
+```text
+configs/rollout/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r3.toml
+[trigger.shadow_run]
+payer_strategy = "ephemeral"
+```
+
+R16-r3 must keep the same standard/soft-PDD policy thresholds as R16-r2. The
+only rollout contract changes are the reporting denominator and active-shadow
+payer semantics.
+
+### R16-r3 Gate
+
+R16-r3 acceptance:
+
+```text
+strict replay = full_replay_ok
+diagnostic_quality.status = PASS
+pdd_drift_evaluated_rows > 0
+pdd_drift_anchor_coverage_pct_among_evaluated >= 95%
+pdd_spike_ratio_quality_coverage_pct >= 95% on spike diagnostic rows
+whale_single_max_pct_coverage_pct >= 95% on whale diagnostic rows
+gatekeeper_first_or_terminal_gate_coverage_pct >= 95%
+r16_artifact_identity_status = PASS
+single_active_hash_status = PASS
+active shadow BUY path does not fail on configured-payer AccountNotFound
+active BUY/probe lifecycle labels reported separately
+custom_2006 classified, not unknown
+```
+
+Only after R16-r3 has diagnostic PASS and still produces `good` or
+`dirty_good` rows can `P3.7-L2 Policy Axis Ablation` start.
+
+Non-goals remain:
+
+```text
+no ablation
+no Phase B
+no P2/live
+no threshold tuning
+no probe amount change
+no IWIM change
 no root ghost_brain_config.toml edit
 no baseline J4C config edit
 ```

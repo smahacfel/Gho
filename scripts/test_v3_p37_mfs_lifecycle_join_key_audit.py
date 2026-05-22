@@ -602,6 +602,152 @@ lifecycle_log_path = "../../logs/shadow_run/r15-probe/probe_lifecycle.jsonl"
         self.assertNotIn("entry_materialized", materialization["status_counts"])
         self.assertEqual(materialization["reason_counts"]["simulation_mismatch"], 1)
 
+    def test_probe_account_not_found_attribution_and_entry_eligibility_are_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "configs/rollout/r15-probe.toml"
+            config.parent.mkdir(parents=True)
+            config.write_text(
+                """
+[oracle]
+decision_log_path = "../../logs/rollout/r15-probe/decisions"
+
+[p37_shadow_probe]
+selection_log_path = "../../logs/shadow_run/r15-probe/probe_selected.jsonl"
+skip_log_path = "../../logs/shadow_run/r15-probe/probe_skipped.jsonl"
+transport_log_path = "../../logs/shadow_run/r15-probe/probe_transport.jsonl"
+entry_log_path = "../../logs/shadow_run/r15-probe/probe_entries.jsonl"
+lifecycle_log_path = "../../logs/shadow_run/r15-probe/probe_lifecycle.jsonl"
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            decision_base = {
+                "candidate_id": "pool_mint_1000",
+                "pool_id": "pool",
+                "base_mint": "mint",
+                "v3_replay_payload_schema_version": 1,
+                "v3_policy_config_hash": "policy-hash",
+            }
+            decisions = [
+                {**decision_base, "ab_record_id": f"source-ab-{idx}", "v3_feature_snapshot_hash": f"feature-hash-{idx}"}
+                for idx in range(1, 5)
+            ]
+            probe_base = {
+                "candidate_id": "pool_mint_1000",
+                "pool_id": "pool",
+                "base_mint": "mint",
+                "dispatch_source": "counterfactual_shadow_probe",
+                "collection_plane": "counterfactual_shadow_probe",
+                "probe_plane": "p37_shadow_probe",
+                "probe_bucket": "v3_pending_wait_sample",
+                "probe_amount_source": "fixed_lamports",
+                "v3_policy_config_hash": "policy-hash",
+            }
+            attributed = {
+                **probe_base,
+                "ab_record_id": "source-ab-1",
+                "source_ab_record_id": "source-ab-1",
+                "probe_id": "probe-attributed",
+                "v3_feature_snapshot_hash": "feature-hash-1",
+                "execution_outcome": "counterfactual_shadow_probe_simulation_error",
+                "simulation_error_kind": "AccountNotFound",
+                "simulation_error_category": "simulation_account_not_found_attributed",
+                "simulation_error_account_pubkey": "missing-pubkey",
+                "simulation_error_account_role": "creator_vault",
+                "simulation_error_account_source": "route_builder",
+                "account_set_match": True,
+                "precheck_account_set_hash": "precheck-hash",
+                "simulation_account_set_hash": "simulation-hash",
+            }
+            multi_candidate = {
+                **probe_base,
+                "ab_record_id": "source-ab-2",
+                "source_ab_record_id": "source-ab-2",
+                "probe_id": "probe-multi",
+                "v3_feature_snapshot_hash": "feature-hash-2",
+                "execution_outcome": "counterfactual_shadow_probe_simulation_error",
+                "simulation_error_kind": "AccountNotFound",
+                "simulation_error_category": "simulation_account_not_found_multi_candidate",
+                "simulation_error_account_candidates": [
+                    {"pubkey": "a", "role": "bonding_curve", "source": "route_builder"},
+                    {"pubkey": "b", "role": "creator_vault", "source": "route_builder"},
+                ],
+                "account_set_match": False,
+                "account_set_mismatch_reason": "simulation_required_accounts_missing_from_precheck",
+            }
+            unattributed = {
+                **probe_base,
+                "ab_record_id": "source-ab-3",
+                "source_ab_record_id": "source-ab-3",
+                "probe_id": "probe-unattributed",
+                "v3_feature_snapshot_hash": "feature-hash-3",
+                "execution_outcome": "counterfactual_shadow_probe_simulation_error",
+                "simulation_error_kind": "AccountNotFound",
+                "simulation_error_category": "simulation_account_not_found_unattributed",
+                "account_set_match": False,
+            }
+            successful = {
+                **probe_base,
+                "ab_record_id": "source-ab-4",
+                "source_ab_record_id": "source-ab-4",
+                "probe_id": "probe-success",
+                "v3_feature_snapshot_hash": "feature-hash-4",
+                "execution_outcome": "counterfactual_shadow_probe_simulated",
+                "probe_entry_materialization_status": "entry_materialized",
+                "probe_lifecycle_eligibility_status": "lifecycle_eligible",
+                "account_set_match": True,
+            }
+            write_jsonl(
+                root / "logs/rollout/r15-probe/decisions/gatekeeper_v2_decisions.jsonl",
+                decisions,
+            )
+            write_jsonl(
+                root / "logs/shadow_run/r15-probe/probe_selected.jsonl",
+                [attributed, multi_candidate, unattributed, successful],
+            )
+            write_jsonl(
+                root / "logs/shadow_run/r15-probe/probe_transport.jsonl",
+                [attributed, multi_candidate, unattributed, successful],
+            )
+            write_jsonl(
+                root / "logs/shadow_run/r15-probe/probe_entries.jsonl",
+                [
+                    {**attributed, "probe_entry_materialization_status": "simulation_error", "probe_lifecycle_eligibility_status": "not_lifecycle_eligible"},
+                    {**successful, "probe_entry_materialization_status": "entry_materialized", "probe_lifecycle_eligibility_status": "lifecycle_eligible"},
+                ],
+            )
+
+            report = audit.build_report(config)
+
+        materialization = report["probe_entry_materialization"]
+        self.assertEqual(materialization["account_not_found_rows"], 3)
+        self.assertEqual(materialization["account_not_found_attributed_rows"], 1)
+        self.assertEqual(materialization["account_not_found_multi_candidate_rows"], 1)
+        self.assertEqual(materialization["account_not_found_unattributed_rows"], 1)
+        self.assertEqual(materialization["precheck_simulation_account_set_mismatch_rows"], 2)
+        self.assertEqual(materialization["unexplained_account_set_mismatch_rows"], 1)
+        self.assertEqual(materialization["simulation_error_entry_rows"], 1)
+        self.assertEqual(materialization["successful_probe_entry_rows"], 1)
+        self.assertEqual(materialization["lifecycle_eligible_entry_rows"], 1)
+        self.assertEqual(
+            materialization["simulation_error_account_role_counts"]["creator_vault"],
+            1,
+        )
+        self.assertEqual(
+            materialization["simulation_error_account_source_counts"]["route_builder"],
+            1,
+        )
+        self.assertEqual(report["probe_readiness"]["status"], "not_ready")
+        self.assertIn(
+            "unattributed_account_not_found_blocks_collection",
+            report["probe_readiness"]["reasons"],
+        )
+        self.assertIn(
+            "unexplained_precheck_simulation_account_set_mismatch",
+            report["probe_readiness"]["reasons"],
+        )
+
     def test_probe_transport_entry_without_decision_v3_join_is_not_ready(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

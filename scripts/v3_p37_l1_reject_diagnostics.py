@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 from collections import Counter
@@ -51,6 +52,9 @@ BASELINE_LEFT_GATE_FIELDS = (
     "min_tx_count",
     "min_unique_signers",
     "alpha",
+)
+PAYER_ACCOUNT_NOT_FOUND_RE = re.compile(
+    r"Failed to fetch payer account:\s*AccountNotFound:\s*pubkey=([1-9A-HJ-NP-Za-km-z]+)"
 )
 
 
@@ -190,6 +194,11 @@ def r16_artifact_paths(config_path: Path, config: dict[str, Any]) -> dict[str, P
         return resolve_path(config_path, raw) if raw else default_dir / fallback
 
     return {
+        "active_shadow_buys": cfg_path(
+            config.get("trigger", {}).get("shadow_run", {}),
+            "output_path",
+            "buys.jsonl",
+        ),
         "probe_selection": cfg_path(probe, "selection_log_path", "probe_selection.jsonl"),
         "probe_skips": cfg_path(probe, "skip_log_path", "probe_skips.jsonl"),
         "probe_transport": cfg_path(probe, "transport_log_path", "probe_transport.jsonl"),
@@ -297,6 +306,13 @@ def gate_trace_summary(row: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def row_has_pdd_drift_context(row: dict[str, Any]) -> bool:
+    """Return true for rows with any drift-adjacent metadata.
+
+    This is broader than the diagnostic acceptance denominator. Threshold
+    source defaults can be present on rows where entry drift was not actually
+    evaluated; `row_has_pdd_drift_evaluation` is the authoritative denominator
+    for PDD drift hydration coverage.
+    """
     if row.get("pdd_entry_drift_threshold_source") is not None:
         return True
     for entry in gate_trace_summary(row):
@@ -317,6 +333,10 @@ def row_has_pdd_drift_context(row: dict[str, Any]) -> bool:
         )
     ).upper()
     return "ENTRY_DRIFT" in reason or "PDD_ENTRY_DRIFT" in reason
+
+
+def row_has_pdd_drift_evaluation(row: dict[str, Any]) -> bool:
+    return row.get("pdd_entry_drift_pct") is not None
 
 
 def top3_pct(row: dict[str, Any]) -> Any:
@@ -555,6 +575,62 @@ def artifact_malformed_counts(paths: dict[str, Path]) -> tuple[dict[str, list[di
     return rows_by_name, malformed_by_name
 
 
+def shadow_payer_diagnostics(
+    config: dict[str, Any],
+    artifact_rows: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any]:
+    shadow_run = config.get("trigger", {}).get("shadow_run", {})
+    strategy = str(shadow_run.get("payer_strategy") or "configured")
+    candidate_rows = (
+        artifact_rows.get("active_shadow_buys", [])
+        + artifact_rows.get("active_shadow_entries", [])
+        + artifact_rows.get("active_shadow_lifecycle", [])
+    )
+    payer_pubkeys: Counter[str] = Counter()
+    payer_errors: Counter[str] = Counter()
+    first_error: str | None = None
+    account_not_found_rows = 0
+    account_not_found_pubkeys: Counter[str] = Counter()
+
+    for row in candidate_rows:
+        payer_value = first_present(row, "payer_pubkey", "shadow_payer_pubkey")
+        if payer_value is not None:
+            payer_pubkeys[str(payer_value)] += 1
+        error_value = first_present(row, "err", "error", "simulation_error_message")
+        if error_value is None:
+            continue
+        error_text = str(error_value)
+        payer_errors[error_text] += 1
+        if first_error is None:
+            first_error = error_text
+        match = PAYER_ACCOUNT_NOT_FOUND_RE.search(error_text)
+        if match:
+            account_not_found_rows += 1
+            account_not_found_pubkeys[match.group(1)] += 1
+
+    if strategy == "ephemeral":
+        status = "ephemeral_not_rpc_required"
+    elif account_not_found_rows > 0:
+        status = "rpc_missing"
+    elif candidate_rows:
+        status = "no_payer_account_error_observed"
+    else:
+        status = "not_observed"
+
+    return {
+        "shadow_payer_strategy": strategy,
+        "shadow_payer_pubkey": next(iter(payer_pubkeys), None),
+        "shadow_payer_pubkey_counts": dict(sorted(payer_pubkeys.items())),
+        "shadow_payer_account_status": status,
+        "shadow_payer_account_error": first_error,
+        "shadow_payer_account_error_counts": dict(sorted(payer_errors.items())),
+        "shadow_payer_account_not_found_rows": account_not_found_rows,
+        "shadow_payer_account_not_found_pubkey_counts": dict(
+            sorted(account_not_found_pubkeys.items())
+        ),
+    }
+
+
 def build_summary(
     config_path: Path,
     config: dict[str, Any],
@@ -573,7 +649,14 @@ def build_summary(
     expected_run_id = str(probe_config.get("run_id") or "") or None
     expected_session_id = str(probe_config.get("session_id") or "") or None
 
-    pdd_drift_rows = [row for row in rows if row_has_pdd_drift_context(row)]
+    pdd_drift_evaluated_rows = [row for row in rows if row_has_pdd_drift_evaluation(row)]
+    pdd_drift_context_rows = [row for row in rows if row_has_pdd_drift_context(row)]
+    pdd_drift_threshold_source_rows = [
+        row for row in rows if row.get("pdd_entry_drift_threshold_source") is not None
+    ]
+    pdd_drift_threshold_source_only_rows = [
+        row for row in pdd_drift_threshold_source_rows if not row_has_pdd_drift_evaluation(row)
+    ]
     spike_rows = [
         row
         for row in rows
@@ -592,7 +675,7 @@ def build_summary(
     ]
 
     pdd_anchor_rows = count_populated(
-        pdd_drift_rows,
+        pdd_drift_evaluated_rows,
         (
             "pdd_entry_drift_elapsed_ms",
             "pdd_entry_drift_anchor_price",
@@ -600,7 +683,7 @@ def build_summary(
         ),
     )
     gate_coverage = pct(len(terminal_with_gate), len(rejects))
-    pdd_coverage = pct(pdd_anchor_rows, len(pdd_drift_rows))
+    pdd_coverage = pct(pdd_anchor_rows, len(pdd_drift_evaluated_rows))
     spike_quality_rows = sum(
         1
         for row in spike_rows
@@ -675,6 +758,7 @@ def build_summary(
     all_artifacts_for_hash = list(rows)
     rows_by_identity_scope: dict[str, list[dict[str, Any]]] = {"decisions": rows}
     for name in (
+        "active_shadow_buys",
         "probe_selection",
         "probe_transport",
         "probe_entries",
@@ -718,6 +802,7 @@ def build_summary(
         name: namespace_coverage(rows_for_name, namespace)
         for name, rows_for_name in artifact_rows.items()
     }
+    payer_diagnostics = shadow_payer_diagnostics(config, artifact_rows)
 
     return {
         "schema_version": 1,
@@ -751,6 +836,7 @@ def build_summary(
         "r16_artifact_identity_status": identity_status,
         "r16_artifact_identity_coverage_by_scope": identity_coverage_by_scope,
         "single_active_hash_status": active_hash_status,
+        **payer_diagnostics,
         "namespace_coverage_by_artifact": namespace_coverage_by_artifact,
         "lifecycle_label_quality_counts": dict(sorted(label_counts.items())),
         "good_or_dirty_good_label_rows": good_or_dirty_good,
@@ -760,8 +846,14 @@ def build_summary(
         "first_kill_gate_counts": dict(sorted(first_kill_counts.items())),
         "terminal_gate_counts": dict(sorted(terminal_gate_counts.items())),
         "reason_code_counts": dict(sorted(reason_code_counts.items())),
-        "pdd_drift_rows": len(pdd_drift_rows),
+        "pdd_drift_rows": len(pdd_drift_evaluated_rows),
         "pdd_drift_anchor_rows": pdd_anchor_rows,
+        "pdd_drift_evaluated_rows": len(pdd_drift_evaluated_rows),
+        "pdd_drift_context_rows": len(pdd_drift_context_rows),
+        "pdd_drift_anchor_hydrated_rows": pdd_anchor_rows,
+        "pdd_drift_anchor_coverage_pct_among_evaluated": pdd_coverage,
+        "pdd_drift_threshold_source_rows": len(pdd_drift_threshold_source_rows),
+        "pdd_drift_threshold_source_only_rows": len(pdd_drift_threshold_source_only_rows),
         "spike_detected_rows": len(spike_rows),
         "whale_diagnostic_rows": len(whale_rows),
         "diagnostic_quality": {
@@ -826,7 +918,16 @@ def write_md(path: Path, summary: dict[str, Any]) -> None:
         f"- r16_reject_pending_probe_lifecycle_count: {summary['r16_reject_pending_probe_lifecycle_count']}",
         f"- r16_artifact_identity_status: {summary['r16_artifact_identity_status']}",
         f"- single_active_hash_status: {summary['single_active_hash_status']}",
+        f"- shadow_payer_strategy: {summary['shadow_payer_strategy']}",
+        f"- shadow_payer_pubkey: {summary['shadow_payer_pubkey']}",
+        f"- shadow_payer_account_status: {summary['shadow_payer_account_status']}",
+        f"- shadow_payer_account_error: {summary['shadow_payer_account_error']}",
         f"- diagnostic_quality_status: {quality['status']}",
+        f"- pdd_drift_evaluated_rows: {summary['pdd_drift_evaluated_rows']}",
+        f"- pdd_drift_anchor_hydrated_rows: {summary['pdd_drift_anchor_hydrated_rows']}",
+        f"- pdd_drift_anchor_coverage_pct_among_evaluated: {summary['pdd_drift_anchor_coverage_pct_among_evaluated']}",
+        f"- pdd_drift_threshold_source_rows: {summary['pdd_drift_threshold_source_rows']}",
+        f"- pdd_drift_threshold_source_only_rows: {summary['pdd_drift_threshold_source_only_rows']}",
         f"- pdd_entry_drift_anchor_coverage_pct: {quality['pdd_entry_drift_anchor_coverage_pct']}",
         f"- spike_ratio_coverage_pct: {quality['spike_ratio_coverage_pct']}",
         f"- spike_ratio_quality_coverage_pct: {quality['spike_ratio_quality_coverage_pct']}",
@@ -867,6 +968,14 @@ def write_md(path: Path, summary: dict[str, Any]) -> None:
     for key, value in summary["artifact_rows"].items():
         malformed = summary["artifact_malformed_rows"].get(key, 0)
         lines.append(f"- {key}: {value} rows, malformed={malformed}")
+    lines.extend(["", "## Active Shadow Payer", ""])
+    lines.append(f"- strategy: {summary['shadow_payer_strategy']}")
+    lines.append(f"- status: {summary['shadow_payer_account_status']}")
+    lines.append(f"- first_pubkey: {summary['shadow_payer_pubkey']}")
+    lines.append(f"- first_error: {summary['shadow_payer_account_error']}")
+    lines.append(f"- account_not_found_rows: {summary['shadow_payer_account_not_found_rows']}")
+    for key, value in summary["shadow_payer_account_not_found_pubkey_counts"].items():
+        lines.append(f"- account_not_found_pubkey `{key}`: {value}")
     lines.extend([
         "",
         "## Lifecycle Labels",
