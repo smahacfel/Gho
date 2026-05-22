@@ -4978,6 +4978,18 @@ struct P37ShadowProbeSelectionRecord {
     creator_vault_mismatch_reason: Option<String>,
     creator_identity_source: Option<String>,
     creator_identity_authoritative: Option<bool>,
+    bonding_curve_v2_pubkey: Option<String>,
+    bonding_curve_v2_source: Option<String>,
+    bonding_curve_v2_authority_status: Option<String>,
+    bonding_curve_v2_mismatch_reason: Option<String>,
+    bonding_curve_pubkey_from_diag: Option<String>,
+    bonding_curve_pubkey_from_mfs: Option<String>,
+    bonding_curve_v2_seen_in_diag: Option<bool>,
+    bonding_curve_v2_seen_in_mfs: Option<bool>,
+    bonding_curve_v2_seen_in_account_state: Option<bool>,
+    bonding_curve_ready: Option<bool>,
+    bonding_curve_v2_ready: Option<bool>,
+    builder_required_curve_account_ready: Option<bool>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq)]
@@ -5044,6 +5056,18 @@ struct P37ShadowProbeTransportRecord {
     creator_vault_mismatch_reason: Option<String>,
     creator_identity_source: Option<String>,
     creator_identity_authoritative: Option<bool>,
+    bonding_curve_v2_pubkey: Option<String>,
+    bonding_curve_v2_source: Option<String>,
+    bonding_curve_v2_authority_status: Option<String>,
+    bonding_curve_v2_mismatch_reason: Option<String>,
+    bonding_curve_pubkey_from_diag: Option<String>,
+    bonding_curve_pubkey_from_mfs: Option<String>,
+    bonding_curve_v2_seen_in_diag: Option<bool>,
+    bonding_curve_v2_seen_in_mfs: Option<bool>,
+    bonding_curve_v2_seen_in_account_state: Option<bool>,
+    bonding_curve_ready: Option<bool>,
+    bonding_curve_v2_ready: Option<bool>,
+    builder_required_curve_account_ready: Option<bool>,
     amount_provided_lamports_if_available: Option<u64>,
     amount_required_lamports_if_available: Option<u64>,
     amount_shortfall_lamports_if_available: Option<u64>,
@@ -5405,6 +5429,18 @@ fn p37_shadow_probe_selection_record(
         creator_vault_mismatch_reason: None,
         creator_identity_source: None,
         creator_identity_authoritative: None,
+        bonding_curve_v2_pubkey: None,
+        bonding_curve_v2_source: None,
+        bonding_curve_v2_authority_status: None,
+        bonding_curve_v2_mismatch_reason: None,
+        bonding_curve_pubkey_from_diag: None,
+        bonding_curve_pubkey_from_mfs: None,
+        bonding_curve_v2_seen_in_diag: None,
+        bonding_curve_v2_seen_in_mfs: None,
+        bonding_curve_v2_seen_in_account_state: None,
+        bonding_curve_ready: None,
+        bonding_curve_v2_ready: None,
+        builder_required_curve_account_ready: None,
     }
 }
 
@@ -5529,6 +5565,18 @@ fn p37_shadow_probe_artifact_records(
         creator_vault_mismatch_reason: None,
         creator_identity_source: None,
         creator_identity_authoritative: None,
+        bonding_curve_v2_pubkey: None,
+        bonding_curve_v2_source: None,
+        bonding_curve_v2_authority_status: None,
+        bonding_curve_v2_mismatch_reason: None,
+        bonding_curve_pubkey_from_diag: None,
+        bonding_curve_pubkey_from_mfs: None,
+        bonding_curve_v2_seen_in_diag: None,
+        bonding_curve_v2_seen_in_mfs: None,
+        bonding_curve_v2_seen_in_account_state: None,
+        bonding_curve_ready: None,
+        bonding_curve_v2_ready: None,
+        builder_required_curve_account_ready: None,
         amount_provided_lamports_if_available: None,
         amount_required_lamports_if_available: None,
         amount_shortfall_lamports_if_available: None,
@@ -5617,6 +5665,18 @@ fn p37_shadow_probe_artifact_records(
         simulation_error_account_narrowing_status: None,
         simulation_error_account_narrowing_reason: None,
         simulation_error_category: None,
+        bonding_curve_v2_pubkey: None,
+        bonding_curve_v2_source: None,
+        bonding_curve_v2_authority_status: None,
+        bonding_curve_v2_mismatch_reason: None,
+        bonding_curve_pubkey_from_diag: None,
+        bonding_curve_pubkey_from_mfs: None,
+        bonding_curve_v2_seen_in_diag: None,
+        bonding_curve_v2_seen_in_mfs: None,
+        bonding_curve_v2_seen_in_account_state: None,
+        bonding_curve_ready: None,
+        bonding_curve_v2_ready: None,
+        builder_required_curve_account_ready: None,
         precheck_account_set_hash: None,
         prepared_request_account_set_hash: None,
         simulation_account_set_hash: None,
@@ -5726,6 +5786,8 @@ fn p37_shadow_probe_as_precheck_skip(
         "execution_account_not_ready".to_string()
     } else if reason.starts_with("creator_vault_source_not_authoritative") {
         "creator_vault_source_not_authoritative".to_string()
+    } else if reason.starts_with("bonding_curve_v2_source_not_authoritative") {
+        "bonding_curve_v2_source_not_authoritative".to_string()
     } else {
         "probe_execution_precheck_failed".to_string()
     });
@@ -5737,6 +5799,13 @@ fn p37_shadow_probe_as_precheck_skip(
     } else if reason.starts_with("creator_vault_source_not_authoritative") {
         record.execution_account_readiness_status = Some("not_ready".to_string());
         record.execution_account_readiness_role = Some("creator_vault".to_string());
+        record.execution_account_readiness_reason = Some(reason.clone());
+    } else if let Some(pubkey) =
+        p37_shadow_probe_parse_bonding_curve_v2_source_not_authoritative(&reason)
+    {
+        record.execution_account_readiness_status = Some("not_ready".to_string());
+        record.execution_account_readiness_role = Some("bonding_curve_v2".to_string());
+        record.execution_account_readiness_pubkey = Some(pubkey);
         record.execution_account_readiness_reason = Some(reason.clone());
     } else {
         record.execution_account_readiness_status = Some("precheck_failed".to_string());
@@ -5776,6 +5845,20 @@ fn p37_shadow_probe_parse_execution_account_not_ready(reason: &str) -> Option<(S
         return None;
     }
     Some((role.to_string(), pubkey.to_string()))
+}
+
+fn p37_shadow_probe_parse_bonding_curve_v2_source_not_authoritative(
+    reason: &str,
+) -> Option<String> {
+    let tail = reason.strip_prefix("bonding_curve_v2_source_not_authoritative:")?;
+    let mut parts = tail.split(':');
+    let _status = parts.next()?;
+    let _source = parts.next()?;
+    let pubkey = parts.next()?;
+    if pubkey.trim().is_empty() {
+        return None;
+    }
+    Some(pubkey.to_string())
 }
 
 async fn p37_shadow_probe_wait_for_required_account_readiness(
@@ -5847,6 +5930,10 @@ struct P37ShadowProbeAccountManifestEntry {
     pubkey: String,
     role: String,
     source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_authority_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_mismatch_reason: Option<String>,
     instruction_index: Option<u64>,
     account_index: Option<u64>,
     is_signer: Option<bool>,
@@ -5912,6 +5999,18 @@ struct P37ShadowProbeExecutionDiagnostics {
     creator_vault_mismatch_reason: Option<String>,
     creator_identity_source: Option<String>,
     creator_identity_authoritative: Option<bool>,
+    bonding_curve_v2_pubkey: Option<String>,
+    bonding_curve_v2_source: Option<String>,
+    bonding_curve_v2_authority_status: Option<String>,
+    bonding_curve_v2_mismatch_reason: Option<String>,
+    bonding_curve_pubkey_from_diag: Option<String>,
+    bonding_curve_pubkey_from_mfs: Option<String>,
+    bonding_curve_v2_seen_in_diag: Option<bool>,
+    bonding_curve_v2_seen_in_mfs: Option<bool>,
+    bonding_curve_v2_seen_in_account_state: Option<bool>,
+    bonding_curve_ready: Option<bool>,
+    bonding_curve_v2_ready: Option<bool>,
+    builder_required_curve_account_ready: Option<bool>,
     amount_provided_lamports_if_available: Option<u64>,
     amount_required_lamports_if_available: Option<u64>,
     amount_shortfall_lamports_if_available: Option<u64>,
@@ -6224,6 +6323,28 @@ fn p37_shadow_probe_as_creator_vault_precheck_skip(
     p37_shadow_probe_as_precheck_skip(record, failure.reason)
 }
 
+fn p37_shadow_probe_as_bonding_curve_v2_source_precheck_skip(
+    mut record: P37ShadowProbeSelectionRecord,
+    diagnostics: P37ShadowProbeBondingCurveV2AuthorityDiagnostics,
+) -> P37ShadowProbeSelectionRecord {
+    let reason = diagnostics.non_authoritative_reason().unwrap_or_else(|| {
+        "bonding_curve_v2_source_not_authoritative:unknown:unknown:missing_pubkey".to_string()
+    });
+    record.bonding_curve_v2_pubkey = diagnostics.pubkey;
+    record.bonding_curve_v2_source = diagnostics.source;
+    record.bonding_curve_v2_authority_status = diagnostics.authority_status;
+    record.bonding_curve_v2_mismatch_reason = diagnostics.mismatch_reason;
+    record.bonding_curve_pubkey_from_diag = diagnostics.bonding_curve_pubkey_from_diag;
+    record.bonding_curve_pubkey_from_mfs = diagnostics.bonding_curve_pubkey_from_mfs;
+    record.bonding_curve_v2_seen_in_diag = diagnostics.seen_in_diag;
+    record.bonding_curve_v2_seen_in_mfs = diagnostics.seen_in_mfs;
+    record.bonding_curve_v2_seen_in_account_state = diagnostics.seen_in_account_state;
+    record.bonding_curve_ready = diagnostics.bonding_curve_ready;
+    record.bonding_curve_v2_ready = diagnostics.bonding_curve_v2_ready;
+    record.builder_required_curve_account_ready = diagnostics.builder_required_curve_account_ready;
+    p37_shadow_probe_as_precheck_skip(record, reason)
+}
+
 fn p37_shadow_probe_error_pubkey(message: &str) -> Option<String> {
     for marker in ["pubkey=", "account=", "AccountNotFound:"] {
         if let Some((_, tail)) = message.split_once(marker) {
@@ -6358,10 +6479,36 @@ fn p37_shadow_probe_account_manifest(
                 );
             let (instruction_index, account_index) =
                 p37_shadow_probe_instruction_account_position(request, account_key_index);
+            let source = p37_shadow_probe_account_source(&role).to_string();
+            let (source_authority_status, source_mismatch_reason) = if role == "bonding_curve_v2" {
+                match source.as_str() {
+                    "diag_account_update_relay" => {
+                        (Some("authoritative_exact_diag".to_string()), None)
+                    }
+                    "materialized_feature_set" => (Some("authoritative_mfs".to_string()), None),
+                    "account_state_core" => (Some("authoritative_account_state".to_string()), None),
+                    "route_builder" => (
+                        Some("builder_only".to_string()),
+                        Some("builder_pubkey_not_materialized".to_string()),
+                    ),
+                    "derived_pda" => (
+                        Some("derived_unverified".to_string()),
+                        Some("derived_pubkey_without_materialized_authority".to_string()),
+                    ),
+                    _ => (
+                        Some("unknown".to_string()),
+                        Some("unknown_bonding_curve_v2_source".to_string()),
+                    ),
+                }
+            } else {
+                (None, None)
+            };
             P37ShadowProbeAccountManifestEntry {
                 pubkey: pubkey.to_string(),
                 role: role.clone(),
-                source: p37_shadow_probe_account_source(&role).to_string(),
+                source,
+                source_authority_status,
+                source_mismatch_reason,
                 instruction_index,
                 account_index,
                 is_signer: Some(p37_shadow_probe_message_is_signer(
@@ -6816,6 +6963,8 @@ fn p37_shadow_probe_manifest_entry_to_event(
         pubkey: entry.pubkey.clone(),
         role: entry.role.clone(),
         source: entry.source.clone(),
+        source_authority_status: entry.source_authority_status.clone(),
+        source_mismatch_reason: entry.source_mismatch_reason.clone(),
         instruction_index: entry.instruction_index,
         account_index: entry.account_index,
         is_signer: entry.is_signer,
@@ -6853,6 +7002,7 @@ fn active_shadow_account_diagnostics_from_account_set(
     let precheck_failure_reason = error_message.as_deref().and_then(|message| {
         if message.starts_with("execution_account_not_ready:")
             || message.starts_with("active_shadow_precheck_failed:")
+            || message.starts_with("bonding_curve_v2_source_not_authoritative:")
         {
             Some(message.to_string())
         } else {
@@ -6863,6 +7013,9 @@ fn active_shadow_account_diagnostics_from_account_set(
     let execution_account_not_ready = precheck_failure_reason
         .as_deref()
         .and_then(p37_shadow_probe_parse_execution_account_not_ready);
+    let bcv2_source_not_authoritative = precheck_failure_reason
+        .as_deref()
+        .and_then(p37_shadow_probe_parse_bonding_curve_v2_source_not_authoritative);
     let account_pubkey = error_message
         .as_deref()
         .and_then(p37_shadow_probe_error_pubkey);
@@ -6880,11 +7033,17 @@ fn active_shadow_account_diagnostics_from_account_set(
     let account_pubkey = execution_account_not_ready
         .as_ref()
         .map(|(_, pubkey)| pubkey.clone())
+        .or_else(|| bcv2_source_not_authoritative.clone())
         .or_else(|| attribution.account_pubkey.clone())
         .or(account_pubkey);
     let account_role = execution_account_not_ready
         .as_ref()
         .map(|(role, _)| role.clone())
+        .or_else(|| {
+            bcv2_source_not_authoritative
+                .as_ref()
+                .map(|_| "bonding_curve_v2".to_string())
+        })
         .or_else(|| attribution.account_role.clone())
         .or_else(|| p37_shadow_probe_account_role(account_pubkey.as_deref(), request));
     let account_source = attribution.account_source.clone().or_else(|| {
@@ -6893,6 +7052,8 @@ fn active_shadow_account_diagnostics_from_account_set(
             .map(p37_shadow_probe_account_source)
             .map(str::to_string)
     });
+    let bonding_curve_v2_authority =
+        p37_shadow_probe_bonding_curve_v2_authority_diagnostics(request, account_set_diagnostics);
     let precheck_candidate = account_set_diagnostics.and_then(|diagnostics| {
         account_pubkey.as_ref().and_then(|pubkey| {
             diagnostics
@@ -7000,6 +7161,19 @@ fn active_shadow_account_diagnostics_from_account_set(
         simulation_error_account_narrowing_status: narrowing_status,
         simulation_error_account_narrowing_reason: narrowing_reason,
         simulation_error_category: category,
+        bonding_curve_v2_pubkey: bonding_curve_v2_authority.pubkey,
+        bonding_curve_v2_source: bonding_curve_v2_authority.source,
+        bonding_curve_v2_authority_status: bonding_curve_v2_authority.authority_status,
+        bonding_curve_v2_mismatch_reason: bonding_curve_v2_authority.mismatch_reason,
+        bonding_curve_pubkey_from_diag: bonding_curve_v2_authority.bonding_curve_pubkey_from_diag,
+        bonding_curve_pubkey_from_mfs: bonding_curve_v2_authority.bonding_curve_pubkey_from_mfs,
+        bonding_curve_v2_seen_in_diag: bonding_curve_v2_authority.seen_in_diag,
+        bonding_curve_v2_seen_in_mfs: bonding_curve_v2_authority.seen_in_mfs,
+        bonding_curve_v2_seen_in_account_state: bonding_curve_v2_authority.seen_in_account_state,
+        bonding_curve_ready: bonding_curve_v2_authority.bonding_curve_ready,
+        bonding_curve_v2_ready: bonding_curve_v2_authority.bonding_curve_v2_ready,
+        builder_required_curve_account_ready: bonding_curve_v2_authority
+            .builder_required_curve_account_ready,
         precheck_account_set_hash: account_set_diagnostics
             .and_then(|diagnostics| diagnostics.precheck_account_set_hash.clone()),
         prepared_request_account_set_hash: account_set_diagnostics
@@ -7355,6 +7529,166 @@ fn p37_shadow_probe_creator_vault_authority_diagnostics(
 }
 
 #[derive(Debug, Clone, Default)]
+struct P37ShadowProbeBondingCurveV2AuthorityDiagnostics {
+    pubkey: Option<String>,
+    source: Option<String>,
+    authority_status: Option<String>,
+    mismatch_reason: Option<String>,
+    bonding_curve_pubkey_from_diag: Option<String>,
+    bonding_curve_pubkey_from_mfs: Option<String>,
+    seen_in_diag: Option<bool>,
+    seen_in_mfs: Option<bool>,
+    seen_in_account_state: Option<bool>,
+    bonding_curve_ready: Option<bool>,
+    bonding_curve_v2_ready: Option<bool>,
+    builder_required_curve_account_ready: Option<bool>,
+}
+
+impl P37ShadowProbeBondingCurveV2AuthorityDiagnostics {
+    fn is_authoritative(&self) -> bool {
+        matches!(
+            self.authority_status.as_deref(),
+            Some("authoritative_exact_diag")
+                | Some("authoritative_mfs")
+                | Some("authoritative_account_state")
+        )
+    }
+
+    fn non_authoritative_reason(&self) -> Option<String> {
+        let pubkey = self.pubkey.as_deref()?;
+        if self.is_authoritative() {
+            return None;
+        }
+        Some(format!(
+            "bonding_curve_v2_source_not_authoritative:{}:{}:{}",
+            self.authority_status.as_deref().unwrap_or("unknown"),
+            self.source.as_deref().unwrap_or("unknown"),
+            pubkey
+        ))
+    }
+}
+
+fn p37_shadow_probe_bonding_curve_v2_authority_from_entry(
+    entry: Option<&P37ShadowProbeAccountManifestEntry>,
+    request: Option<&crate::components::trigger::PreparedBuyRequest>,
+) -> P37ShadowProbeBondingCurveV2AuthorityDiagnostics {
+    let Some(entry) = entry else {
+        return P37ShadowProbeBondingCurveV2AuthorityDiagnostics::default();
+    };
+    let source = entry.source.as_str();
+    let (
+        authority_status,
+        mismatch_reason,
+        ready,
+        seen_in_diag,
+        seen_in_mfs,
+        seen_in_account_state,
+    ) = match source {
+        "diag_account_update_relay" => (
+            "authoritative_exact_diag",
+            None,
+            true,
+            Some(true),
+            Some(false),
+            Some(false),
+        ),
+        "materialized_feature_set" => (
+            "authoritative_mfs",
+            None,
+            true,
+            Some(false),
+            Some(true),
+            Some(false),
+        ),
+        "account_state_core" => (
+            "authoritative_account_state",
+            None,
+            true,
+            Some(false),
+            Some(false),
+            Some(true),
+        ),
+        "route_builder" => (
+            "builder_only",
+            Some("builder_pubkey_not_materialized"),
+            false,
+            None,
+            None,
+            None,
+        ),
+        "derived_pda" => (
+            "derived_unverified",
+            Some("derived_pubkey_without_materialized_authority"),
+            false,
+            None,
+            None,
+            None,
+        ),
+        _ => (
+            "unknown",
+            Some("unknown_bonding_curve_v2_source"),
+            false,
+            None,
+            None,
+            None,
+        ),
+    };
+    let bonding_curve_ready = request.map(|request| {
+        request.account_overrides.legacy_buy_curve.is_some()
+            || request.account_overrides.associated_bonding_curve.is_some()
+    });
+
+    P37ShadowProbeBondingCurveV2AuthorityDiagnostics {
+        pubkey: Some(entry.pubkey.clone()),
+        source: Some(entry.source.clone()),
+        authority_status: Some(authority_status.to_string()),
+        mismatch_reason: mismatch_reason.map(str::to_string),
+        bonding_curve_pubkey_from_diag: seen_in_diag
+            .filter(|seen| *seen)
+            .map(|_| entry.pubkey.clone()),
+        bonding_curve_pubkey_from_mfs: seen_in_mfs
+            .filter(|seen| *seen)
+            .map(|_| entry.pubkey.clone()),
+        seen_in_diag,
+        seen_in_mfs,
+        seen_in_account_state,
+        bonding_curve_ready,
+        bonding_curve_v2_ready: Some(ready),
+        builder_required_curve_account_ready: Some(ready),
+    }
+}
+
+fn p37_shadow_probe_bonding_curve_v2_authority_diagnostics(
+    request: Option<&crate::components::trigger::PreparedBuyRequest>,
+    account_set_diagnostics: Option<&P37ShadowProbeAccountSetDiagnostics>,
+) -> P37ShadowProbeBondingCurveV2AuthorityDiagnostics {
+    if let Some(entry) = account_set_diagnostics.and_then(|diagnostics| {
+        diagnostics
+            .manifest
+            .iter()
+            .find(|entry| entry.role == "bonding_curve_v2")
+    }) {
+        return p37_shadow_probe_bonding_curve_v2_authority_from_entry(Some(entry), request);
+    }
+
+    let Some(request) = request else {
+        return P37ShadowProbeBondingCurveV2AuthorityDiagnostics::default();
+    };
+    let manifest = p37_shadow_probe_account_manifest(request);
+    let entry = manifest
+        .iter()
+        .find(|entry| entry.role == "bonding_curve_v2");
+    p37_shadow_probe_bonding_curve_v2_authority_from_entry(entry, Some(request))
+}
+
+fn p37_shadow_probe_bonding_curve_v2_source_precheck_reason(
+    request: &crate::components::trigger::PreparedBuyRequest,
+) -> Option<String> {
+    p37_shadow_probe_bonding_curve_v2_authority_diagnostics(Some(request), None)
+        .non_authoritative_reason()
+}
+
+#[derive(Debug, Clone, Default)]
 struct P37ShadowProbeSimulationInstructionDiagnostics {
     instruction_index: Option<u64>,
     custom_code: Option<u64>,
@@ -7499,6 +7833,8 @@ fn p37_shadow_probe_execution_diagnostics(
         anchor_error_actual_account_pubkey.as_deref(),
         anchor_error_expected_account_pubkey.as_deref(),
     );
+    let bonding_curve_v2_authority =
+        p37_shadow_probe_bonding_curve_v2_authority_diagnostics(request, account_set_diagnostics);
     let amount_guard = p37_shadow_probe_amount_guard_diagnostics(
         instruction_diagnostics.custom_code,
         anchor_error_actual_account_pubkey.as_deref(),
@@ -7549,6 +7885,19 @@ fn p37_shadow_probe_execution_diagnostics(
         creator_vault_mismatch_reason: creator_vault_authority.mismatch_reason,
         creator_identity_source: creator_vault_authority.identity_source,
         creator_identity_authoritative: creator_vault_authority.identity_authoritative,
+        bonding_curve_v2_pubkey: bonding_curve_v2_authority.pubkey,
+        bonding_curve_v2_source: bonding_curve_v2_authority.source,
+        bonding_curve_v2_authority_status: bonding_curve_v2_authority.authority_status,
+        bonding_curve_v2_mismatch_reason: bonding_curve_v2_authority.mismatch_reason,
+        bonding_curve_pubkey_from_diag: bonding_curve_v2_authority.bonding_curve_pubkey_from_diag,
+        bonding_curve_pubkey_from_mfs: bonding_curve_v2_authority.bonding_curve_pubkey_from_mfs,
+        bonding_curve_v2_seen_in_diag: bonding_curve_v2_authority.seen_in_diag,
+        bonding_curve_v2_seen_in_mfs: bonding_curve_v2_authority.seen_in_mfs,
+        bonding_curve_v2_seen_in_account_state: bonding_curve_v2_authority.seen_in_account_state,
+        bonding_curve_ready: bonding_curve_v2_authority.bonding_curve_ready,
+        bonding_curve_v2_ready: bonding_curve_v2_authority.bonding_curve_v2_ready,
+        builder_required_curve_account_ready: bonding_curve_v2_authority
+            .builder_required_curve_account_ready,
         amount_provided_lamports_if_available: amount_guard.provided_lamports,
         amount_required_lamports_if_available: amount_guard.required_lamports,
         amount_shortfall_lamports_if_available: amount_guard.shortfall_lamports,
@@ -7758,6 +8107,18 @@ fn p37_shadow_probe_transport_from_event(
         creator_vault_mismatch_reason: diagnostics.creator_vault_mismatch_reason,
         creator_identity_source: diagnostics.creator_identity_source,
         creator_identity_authoritative: diagnostics.creator_identity_authoritative,
+        bonding_curve_v2_pubkey: diagnostics.bonding_curve_v2_pubkey,
+        bonding_curve_v2_source: diagnostics.bonding_curve_v2_source,
+        bonding_curve_v2_authority_status: diagnostics.bonding_curve_v2_authority_status,
+        bonding_curve_v2_mismatch_reason: diagnostics.bonding_curve_v2_mismatch_reason,
+        bonding_curve_pubkey_from_diag: diagnostics.bonding_curve_pubkey_from_diag,
+        bonding_curve_pubkey_from_mfs: diagnostics.bonding_curve_pubkey_from_mfs,
+        bonding_curve_v2_seen_in_diag: diagnostics.bonding_curve_v2_seen_in_diag,
+        bonding_curve_v2_seen_in_mfs: diagnostics.bonding_curve_v2_seen_in_mfs,
+        bonding_curve_v2_seen_in_account_state: diagnostics.bonding_curve_v2_seen_in_account_state,
+        bonding_curve_ready: diagnostics.bonding_curve_ready,
+        bonding_curve_v2_ready: diagnostics.bonding_curve_v2_ready,
+        builder_required_curve_account_ready: diagnostics.builder_required_curve_account_ready,
         amount_provided_lamports_if_available: diagnostics.amount_provided_lamports_if_available,
         amount_required_lamports_if_available: diagnostics.amount_required_lamports_if_available,
         amount_shortfall_lamports_if_available: diagnostics.amount_shortfall_lamports_if_available,
@@ -7918,6 +8279,18 @@ fn p37_shadow_probe_transport_from_error(
         creator_vault_mismatch_reason: diagnostics.creator_vault_mismatch_reason,
         creator_identity_source: diagnostics.creator_identity_source,
         creator_identity_authoritative: diagnostics.creator_identity_authoritative,
+        bonding_curve_v2_pubkey: diagnostics.bonding_curve_v2_pubkey,
+        bonding_curve_v2_source: diagnostics.bonding_curve_v2_source,
+        bonding_curve_v2_authority_status: diagnostics.bonding_curve_v2_authority_status,
+        bonding_curve_v2_mismatch_reason: diagnostics.bonding_curve_v2_mismatch_reason,
+        bonding_curve_pubkey_from_diag: diagnostics.bonding_curve_pubkey_from_diag,
+        bonding_curve_pubkey_from_mfs: diagnostics.bonding_curve_pubkey_from_mfs,
+        bonding_curve_v2_seen_in_diag: diagnostics.bonding_curve_v2_seen_in_diag,
+        bonding_curve_v2_seen_in_mfs: diagnostics.bonding_curve_v2_seen_in_mfs,
+        bonding_curve_v2_seen_in_account_state: diagnostics.bonding_curve_v2_seen_in_account_state,
+        bonding_curve_ready: diagnostics.bonding_curve_ready,
+        bonding_curve_v2_ready: diagnostics.bonding_curve_v2_ready,
+        builder_required_curve_account_ready: diagnostics.builder_required_curve_account_ready,
         amount_provided_lamports_if_available: diagnostics.amount_provided_lamports_if_available,
         amount_required_lamports_if_available: diagnostics.amount_required_lamports_if_available,
         amount_shortfall_lamports_if_available: diagnostics.amount_shortfall_lamports_if_available,
@@ -8039,6 +8412,18 @@ fn enrich_probe_shadow_entry(
     entry.simulation_error_account_narrowing_reason =
         transport.simulation_error_account_narrowing_reason.clone();
     entry.simulation_error_category = transport.simulation_error_category.clone();
+    entry.bonding_curve_v2_pubkey = transport.bonding_curve_v2_pubkey.clone();
+    entry.bonding_curve_v2_source = transport.bonding_curve_v2_source.clone();
+    entry.bonding_curve_v2_authority_status = transport.bonding_curve_v2_authority_status.clone();
+    entry.bonding_curve_v2_mismatch_reason = transport.bonding_curve_v2_mismatch_reason.clone();
+    entry.bonding_curve_pubkey_from_diag = transport.bonding_curve_pubkey_from_diag.clone();
+    entry.bonding_curve_pubkey_from_mfs = transport.bonding_curve_pubkey_from_mfs.clone();
+    entry.bonding_curve_v2_seen_in_diag = transport.bonding_curve_v2_seen_in_diag;
+    entry.bonding_curve_v2_seen_in_mfs = transport.bonding_curve_v2_seen_in_mfs;
+    entry.bonding_curve_v2_seen_in_account_state = transport.bonding_curve_v2_seen_in_account_state;
+    entry.bonding_curve_ready = transport.bonding_curve_ready;
+    entry.bonding_curve_v2_ready = transport.bonding_curve_v2_ready;
+    entry.builder_required_curve_account_ready = transport.builder_required_curve_account_ready;
     entry.precheck_account_set_hash = transport.precheck_account_set_hash.clone();
     entry.prepared_request_account_set_hash = transport.prepared_request_account_set_hash.clone();
     entry.simulation_account_set_hash = transport.simulation_account_set_hash.clone();
@@ -8155,6 +8540,27 @@ async fn run_p37_shadow_probe_dispatch(
             return;
         }
     };
+
+    let bonding_curve_v2_authority =
+        p37_shadow_probe_bonding_curve_v2_authority_diagnostics(Some(&request), None);
+    if bonding_curve_v2_authority
+        .non_authoritative_reason()
+        .is_some()
+    {
+        let skip_record = p37_shadow_probe_as_bonding_curve_v2_source_precheck_skip(
+            record.clone(),
+            bonding_curve_v2_authority,
+        );
+        if let Err(err) = append_p37_shadow_probe_record(&config, &skip_record).await {
+            warn!(
+                probe_id = ?skip_record.probe_id,
+                source_ab_record_id = ?skip_record.source_ab_record_id,
+                error = %err,
+                "P37_SHADOW_PROBE_BONDING_CURVE_V2_SOURCE_PRECHECK_SKIP_WRITE_FAILED"
+            );
+        }
+        return;
+    }
 
     match p37_shadow_probe_wait_for_required_account_readiness(
         &trigger_component,
@@ -10292,6 +10698,17 @@ async fn active_shadow_simulation_load_precheck_receipt(
         return None;
     }
 
+    if let Some(reason) = p37_shadow_probe_bonding_curve_v2_source_precheck_reason(request) {
+        return Some(crate::components::trigger::TriggerDispatchReceipt {
+            primary_outcome: Err(anyhow::anyhow!("{reason}")),
+            shadow_task: None,
+            active_position_lease: None,
+            retain_position_slot_on_error: false,
+            failed_request: Some(request.clone()),
+            failed_context: None,
+        });
+    }
+
     let precheck_result = trigger_component
         .counterfactual_probe_missing_required_account(request)
         .await;
@@ -10758,6 +11175,18 @@ fn shadow_entry_record_from_event(
         simulation_error_account_narrowing_status: None,
         simulation_error_account_narrowing_reason: None,
         simulation_error_category: None,
+        bonding_curve_v2_pubkey: None,
+        bonding_curve_v2_source: None,
+        bonding_curve_v2_authority_status: None,
+        bonding_curve_v2_mismatch_reason: None,
+        bonding_curve_pubkey_from_diag: None,
+        bonding_curve_pubkey_from_mfs: None,
+        bonding_curve_v2_seen_in_diag: None,
+        bonding_curve_v2_seen_in_mfs: None,
+        bonding_curve_v2_seen_in_account_state: None,
+        bonding_curve_ready: None,
+        bonding_curve_v2_ready: None,
+        builder_required_curve_account_ready: None,
         precheck_account_set_hash: None,
         prepared_request_account_set_hash: None,
         simulation_account_set_hash: None,
@@ -10827,6 +11256,18 @@ fn shadow_entry_record_from_request(
         simulation_error_account_narrowing_status: None,
         simulation_error_account_narrowing_reason: None,
         simulation_error_category: None,
+        bonding_curve_v2_pubkey: None,
+        bonding_curve_v2_source: None,
+        bonding_curve_v2_authority_status: None,
+        bonding_curve_v2_mismatch_reason: None,
+        bonding_curve_pubkey_from_diag: None,
+        bonding_curve_pubkey_from_mfs: None,
+        bonding_curve_v2_seen_in_diag: None,
+        bonding_curve_v2_seen_in_mfs: None,
+        bonding_curve_v2_seen_in_account_state: None,
+        bonding_curve_ready: None,
+        bonding_curve_v2_ready: None,
+        builder_required_curve_account_ready: None,
         precheck_account_set_hash: None,
         prepared_request_account_set_hash: None,
         simulation_account_set_hash: None,
@@ -10915,6 +11356,19 @@ fn enrich_active_shadow_entry_with_account_diagnostics(
         .simulation_error_account_narrowing_reason
         .clone();
     entry.simulation_error_category = diagnostics.simulation_error_category.clone();
+    entry.bonding_curve_v2_pubkey = diagnostics.bonding_curve_v2_pubkey.clone();
+    entry.bonding_curve_v2_source = diagnostics.bonding_curve_v2_source.clone();
+    entry.bonding_curve_v2_authority_status = diagnostics.bonding_curve_v2_authority_status.clone();
+    entry.bonding_curve_v2_mismatch_reason = diagnostics.bonding_curve_v2_mismatch_reason.clone();
+    entry.bonding_curve_pubkey_from_diag = diagnostics.bonding_curve_pubkey_from_diag.clone();
+    entry.bonding_curve_pubkey_from_mfs = diagnostics.bonding_curve_pubkey_from_mfs.clone();
+    entry.bonding_curve_v2_seen_in_diag = diagnostics.bonding_curve_v2_seen_in_diag;
+    entry.bonding_curve_v2_seen_in_mfs = diagnostics.bonding_curve_v2_seen_in_mfs;
+    entry.bonding_curve_v2_seen_in_account_state =
+        diagnostics.bonding_curve_v2_seen_in_account_state;
+    entry.bonding_curve_ready = diagnostics.bonding_curve_ready;
+    entry.bonding_curve_v2_ready = diagnostics.bonding_curve_v2_ready;
+    entry.builder_required_curve_account_ready = diagnostics.builder_required_curve_account_ready;
     entry.precheck_account_set_hash = diagnostics.precheck_account_set_hash.clone();
     entry.prepared_request_account_set_hash = diagnostics.prepared_request_account_set_hash.clone();
     entry.simulation_account_set_hash = diagnostics.simulation_account_set_hash.clone();
@@ -11232,6 +11686,30 @@ struct ShadowEntryRecord {
     simulation_error_account_narrowing_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     simulation_error_category: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bonding_curve_v2_pubkey: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bonding_curve_v2_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bonding_curve_v2_authority_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bonding_curve_v2_mismatch_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bonding_curve_pubkey_from_diag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bonding_curve_pubkey_from_mfs: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bonding_curve_v2_seen_in_diag: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bonding_curve_v2_seen_in_mfs: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bonding_curve_v2_seen_in_account_state: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bonding_curve_ready: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bonding_curve_v2_ready: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    builder_required_curve_account_ready: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     precheck_account_set_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -15430,6 +15908,124 @@ mod tests {
         assert!(diagnostics.prepared_request_account_set_hash.is_some());
     }
 
+    fn p37_shadow_probe_test_bcv2_manifest_entry(
+        pubkey: String,
+        source: &str,
+    ) -> P37ShadowProbeAccountManifestEntry {
+        P37ShadowProbeAccountManifestEntry {
+            pubkey,
+            role: "bonding_curve_v2".to_string(),
+            source: source.to_string(),
+            source_authority_status: None,
+            source_mismatch_reason: None,
+            instruction_index: Some(0),
+            account_index: Some(16),
+            is_signer: Some(false),
+            is_writable: Some(false),
+            required: true,
+            owner_expected: None,
+            route_kind: Some("routed_exact_sol_in".to_string()),
+            buy_variant: Some("routed_exact_sol_in".to_string()),
+            token_param_role: Some("min_tokens_out".to_string()),
+        }
+    }
+
+    #[test]
+    fn p37_shadow_probe_bonding_curve_v2_route_builder_is_not_authoritative() {
+        let bcv2 = Pubkey::new_unique().to_string();
+        let diagnostics = P37ShadowProbeAccountSetDiagnostics {
+            manifest: vec![p37_shadow_probe_test_bcv2_manifest_entry(
+                bcv2.clone(),
+                "route_builder",
+            )],
+            ..Default::default()
+        };
+
+        let authority =
+            p37_shadow_probe_bonding_curve_v2_authority_diagnostics(None, Some(&diagnostics));
+
+        assert_eq!(authority.pubkey.as_deref(), Some(bcv2.as_str()));
+        assert_eq!(authority.source.as_deref(), Some("route_builder"));
+        assert_eq!(authority.authority_status.as_deref(), Some("builder_only"));
+        assert_eq!(
+            authority.mismatch_reason.as_deref(),
+            Some("builder_pubkey_not_materialized")
+        );
+        assert_eq!(authority.builder_required_curve_account_ready, Some(false));
+        assert!(authority.non_authoritative_reason().is_some());
+    }
+
+    #[test]
+    fn p37_shadow_probe_bonding_curve_v2_diag_source_is_authoritative() {
+        let bcv2 = Pubkey::new_unique().to_string();
+        let diagnostics = P37ShadowProbeAccountSetDiagnostics {
+            manifest: vec![p37_shadow_probe_test_bcv2_manifest_entry(
+                bcv2.clone(),
+                "diag_account_update_relay",
+            )],
+            ..Default::default()
+        };
+
+        let authority =
+            p37_shadow_probe_bonding_curve_v2_authority_diagnostics(None, Some(&diagnostics));
+
+        assert_eq!(
+            authority.authority_status.as_deref(),
+            Some("authoritative_exact_diag")
+        );
+        assert_eq!(
+            authority.bonding_curve_pubkey_from_diag.as_deref(),
+            Some(bcv2.as_str())
+        );
+        assert_eq!(authority.seen_in_diag, Some(true));
+        assert_eq!(authority.bonding_curve_v2_ready, Some(true));
+        assert_eq!(authority.builder_required_curve_account_ready, Some(true));
+        assert!(authority.non_authoritative_reason().is_none());
+    }
+
+    #[test]
+    fn p37_shadow_probe_bcv2_source_precheck_skip_records_specific_reason() {
+        let (record, _pool, _buy_mint) = p37_shadow_probe_precheck_record_and_pool();
+        let bcv2 = Pubkey::new_unique().to_string();
+        let diagnostics = p37_shadow_probe_bonding_curve_v2_authority_from_entry(
+            Some(&p37_shadow_probe_test_bcv2_manifest_entry(
+                bcv2.clone(),
+                "route_builder",
+            )),
+            None,
+        );
+
+        let skipped =
+            p37_shadow_probe_as_bonding_curve_v2_source_precheck_skip(record, diagnostics);
+
+        assert_eq!(skipped.event_type, "probe_skipped");
+        assert_eq!(
+            skipped.probe_skip_reason.as_deref(),
+            Some("bonding_curve_v2_source_not_authoritative")
+        );
+        assert_eq!(
+            skipped.execution_account_readiness_status.as_deref(),
+            Some("not_ready")
+        );
+        assert_eq!(
+            skipped.execution_account_readiness_role.as_deref(),
+            Some("bonding_curve_v2")
+        );
+        assert_eq!(
+            skipped.execution_account_readiness_pubkey.as_deref(),
+            Some(bcv2.as_str())
+        );
+        assert_eq!(
+            skipped.bonding_curve_v2_authority_status.as_deref(),
+            Some("builder_only")
+        );
+        assert_eq!(
+            skipped.bonding_curve_v2_mismatch_reason.as_deref(),
+            Some("builder_pubkey_not_materialized")
+        );
+        assert_eq!(skipped.builder_required_curve_account_ready, Some(false));
+    }
+
     #[test]
     fn p37_shadow_probe_account_not_found_exact_attribution_from_candidate() {
         let request = test_prepared_buy_request();
@@ -15536,6 +16132,8 @@ mod tests {
                 pubkey: bonding_curve_v2_string.clone(),
                 role: "bonding_curve_v2".to_string(),
                 source: "route_builder".to_string(),
+                source_authority_status: Some("builder_only".to_string()),
+                source_mismatch_reason: Some("builder_pubkey_not_materialized".to_string()),
                 instruction_index: Some(0),
                 account_index: Some(16),
                 is_signer: Some(false),
@@ -15580,6 +16178,64 @@ mod tests {
             Some("exact_after_narrowing")
         );
         assert_eq!(active.simulation_error_account_candidates_narrowed.len(), 1);
+        assert_eq!(
+            active.active_shadow_lifecycle_eligibility_status.as_deref(),
+            Some("not_lifecycle_eligible")
+        );
+    }
+
+    #[test]
+    fn active_shadow_bcv2_source_precheck_failure_carries_authority_status() {
+        let request = test_prepared_buy_request();
+        let bonding_curve_v2 = Pubkey::new_unique().to_string();
+        let reason = format!(
+            "bonding_curve_v2_source_not_authoritative:builder_only:route_builder:{bonding_curve_v2}"
+        );
+        let diagnostics = P37ShadowProbeAccountSetDiagnostics {
+            manifest: vec![p37_shadow_probe_test_bcv2_manifest_entry(
+                bonding_curve_v2.clone(),
+                "route_builder",
+            )],
+            ..Default::default()
+        };
+
+        let active = active_shadow_account_diagnostics_from_account_set(
+            Some(reason.clone()),
+            Some(&request),
+            Some(&diagnostics),
+            "not_run_post_simulation_attribution",
+        );
+
+        assert_eq!(
+            active.active_shadow_precheck_status.as_deref(),
+            Some("precheck_failed")
+        );
+        assert_eq!(
+            active.precheck_failure_reason.as_deref(),
+            Some(reason.as_str())
+        );
+        assert_eq!(active.simulation_error_kind, None);
+        assert_eq!(
+            active.simulation_error_category.as_deref(),
+            Some("active_shadow_precheck_failed")
+        );
+        assert_eq!(
+            active.simulation_error_account_role.as_deref(),
+            Some("bonding_curve_v2")
+        );
+        assert_eq!(
+            active.simulation_error_account_pubkey.as_deref(),
+            Some(bonding_curve_v2.as_str())
+        );
+        assert_eq!(
+            active.bonding_curve_v2_authority_status.as_deref(),
+            Some("builder_only")
+        );
+        assert_eq!(
+            active.bonding_curve_v2_mismatch_reason.as_deref(),
+            Some("builder_pubkey_not_materialized")
+        );
+        assert_eq!(active.builder_required_curve_account_ready, Some(false));
         assert_eq!(
             active.active_shadow_lifecycle_eligibility_status.as_deref(),
             Some("not_lifecycle_eligible")

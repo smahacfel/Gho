@@ -589,6 +589,10 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
     creator_vault_authority_status_counts: Counter[str] = Counter()
     creator_vault_mismatch_reason_counts: Counter[str] = Counter()
     creator_identity_source_counts: Counter[str] = Counter()
+    bonding_curve_v2_authority_status_counts: Counter[str] = Counter()
+    bonding_curve_v2_mismatch_reason_counts: Counter[str] = Counter()
+    bonding_curve_v2_source_counts: Counter[str] = Counter()
+    builder_required_curve_account_ready_counts: Counter[str] = Counter()
     amount_guard_status_counts: Counter[str] = Counter()
     simulation_error_custom_code_counts: Counter[str] = Counter()
     simulation_error_kind_counts: Counter[str] = Counter()
@@ -616,6 +620,13 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
         creator_vault_authority_status = row_string(row, "creator_vault_authority_status")
         creator_vault_mismatch_reason = row_string(row, "creator_vault_mismatch_reason")
         creator_identity_source = row_string(row, "creator_identity_source")
+        bonding_curve_v2_authority_status = row_string(row, "bonding_curve_v2_authority_status")
+        bonding_curve_v2_mismatch_reason = row_string(row, "bonding_curve_v2_mismatch_reason")
+        bonding_curve_v2_source = row_string(row, "bonding_curve_v2_source")
+        builder_required_curve_account_ready = row_bool_string(
+            row,
+            "builder_required_curve_account_ready",
+        )
         amount_guard_status = row_string(row, "amount_guard_status")
         simulation_error_category = row_string(row, "simulation_error_category")
         simulation_error_kind = row_string(row, "simulation_error_kind")
@@ -634,6 +645,14 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
             creator_vault_mismatch_reason_counts[creator_vault_mismatch_reason] += 1
         if creator_identity_source:
             creator_identity_source_counts[creator_identity_source] += 1
+        if bonding_curve_v2_authority_status:
+            bonding_curve_v2_authority_status_counts[bonding_curve_v2_authority_status] += 1
+        if bonding_curve_v2_mismatch_reason:
+            bonding_curve_v2_mismatch_reason_counts[bonding_curve_v2_mismatch_reason] += 1
+        if bonding_curve_v2_source:
+            bonding_curve_v2_source_counts[bonding_curve_v2_source] += 1
+        if builder_required_curve_account_ready:
+            builder_required_curve_account_ready_counts[builder_required_curve_account_ready] += 1
         if amount_guard_status:
             amount_guard_status_counts[amount_guard_status] += 1
         if simulation_error_category:
@@ -733,6 +752,22 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
                 "creator_vault_mismatch_reason": creator_vault_mismatch_reason,
                 "creator_identity_source": creator_identity_source,
                 "creator_identity_authoritative": row.get("creator_identity_authoritative"),
+                "bonding_curve_v2_pubkey": row_string(row, "bonding_curve_v2_pubkey"),
+                "bonding_curve_v2_source": bonding_curve_v2_source,
+                "bonding_curve_v2_authority_status": bonding_curve_v2_authority_status,
+                "bonding_curve_v2_mismatch_reason": bonding_curve_v2_mismatch_reason,
+                "bonding_curve_pubkey_from_diag": row_string(row, "bonding_curve_pubkey_from_diag"),
+                "bonding_curve_pubkey_from_mfs": row_string(row, "bonding_curve_pubkey_from_mfs"),
+                "bonding_curve_v2_seen_in_diag": row.get("bonding_curve_v2_seen_in_diag"),
+                "bonding_curve_v2_seen_in_mfs": row.get("bonding_curve_v2_seen_in_mfs"),
+                "bonding_curve_v2_seen_in_account_state": row.get(
+                    "bonding_curve_v2_seen_in_account_state"
+                ),
+                "bonding_curve_ready": row.get("bonding_curve_ready"),
+                "bonding_curve_v2_ready": row.get("bonding_curve_v2_ready"),
+                "builder_required_curve_account_ready": row.get(
+                    "builder_required_curve_account_ready"
+                ),
                 "amount_guard_status": amount_guard_status,
                 "amount_provided_lamports_if_available": row.get(
                     "amount_provided_lamports_if_available"
@@ -766,6 +801,9 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
     skip_creator_vault_authority_status_counts: Counter[str] = Counter()
     skip_creator_vault_mismatch_reason_counts: Counter[str] = Counter()
     skip_creator_identity_source_counts: Counter[str] = Counter()
+    skip_bonding_curve_v2_authority_status_counts: Counter[str] = Counter()
+    skip_bonding_curve_v2_mismatch_reason_counts: Counter[str] = Counter()
+    skip_bonding_curve_v2_source_counts: Counter[str] = Counter()
     for row in skip_rows:
         reason = row_string(row, "probe_skip_reason") or row_string(row, "skip_reason")
         if reason:
@@ -779,12 +817,21 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
         creator_vault_authority_status = row_string(row, "creator_vault_authority_status")
         creator_vault_mismatch_reason = row_string(row, "creator_vault_mismatch_reason")
         creator_identity_source = row_string(row, "creator_identity_source")
+        bonding_curve_v2_authority_status = row_string(row, "bonding_curve_v2_authority_status")
+        bonding_curve_v2_mismatch_reason = row_string(row, "bonding_curve_v2_mismatch_reason")
+        bonding_curve_v2_source = row_string(row, "bonding_curve_v2_source")
         if creator_vault_authority_status:
             skip_creator_vault_authority_status_counts[creator_vault_authority_status] += 1
         if creator_vault_mismatch_reason:
             skip_creator_vault_mismatch_reason_counts[creator_vault_mismatch_reason] += 1
         if creator_identity_source:
             skip_creator_identity_source_counts[creator_identity_source] += 1
+        if bonding_curve_v2_authority_status:
+            skip_bonding_curve_v2_authority_status_counts[bonding_curve_v2_authority_status] += 1
+        if bonding_curve_v2_mismatch_reason:
+            skip_bonding_curve_v2_mismatch_reason_counts[bonding_curve_v2_mismatch_reason] += 1
+        if bonding_curve_v2_source:
+            skip_bonding_curve_v2_source_counts[bonding_curve_v2_source] += 1
 
     transport_rows_total = len(transport_rows)
     entry_rows_total = len(entry_rows)
@@ -918,6 +965,16 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
             sorted(creator_vault_mismatch_reason_counts.items())
         ),
         "creator_identity_source_counts": dict(sorted(creator_identity_source_counts.items())),
+        "bonding_curve_v2_authority_status_counts": dict(
+            sorted(bonding_curve_v2_authority_status_counts.items())
+        ),
+        "bonding_curve_v2_mismatch_reason_counts": dict(
+            sorted(bonding_curve_v2_mismatch_reason_counts.items())
+        ),
+        "bonding_curve_v2_source_counts": dict(sorted(bonding_curve_v2_source_counts.items())),
+        "builder_required_curve_account_ready_counts": dict(
+            sorted(builder_required_curve_account_ready_counts.items())
+        ),
         "amount_guard_status_counts": dict(sorted(amount_guard_status_counts.items())),
         "simulation_error_category_counts": dict(sorted(simulation_error_category_counts.items())),
         "simulation_error_kind_counts": dict(sorted(simulation_error_kind_counts.items())),
@@ -962,6 +1019,15 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
         ),
         "skip_creator_identity_source_counts": dict(
             sorted(skip_creator_identity_source_counts.items())
+        ),
+        "skip_bonding_curve_v2_authority_status_counts": dict(
+            sorted(skip_bonding_curve_v2_authority_status_counts.items())
+        ),
+        "skip_bonding_curve_v2_mismatch_reason_counts": dict(
+            sorted(skip_bonding_curve_v2_mismatch_reason_counts.items())
+        ),
+        "skip_bonding_curve_v2_source_counts": dict(
+            sorted(skip_bonding_curve_v2_source_counts.items())
         ),
         "entry_materialized_rows": status_counts.get("entry_materialized", 0),
         "transport_only_missing_token_quantity_rows": status_counts.get(
@@ -1128,6 +1194,10 @@ def active_shadow_dispatch_diagnostics(paths: dict[str, list[Path]]) -> dict[str
     narrowing_status_counts: Counter[str] = Counter()
     candidate_raw_counts: Counter[str] = Counter()
     candidate_narrowed_counts: Counter[str] = Counter()
+    bonding_curve_v2_authority_status_counts: Counter[str] = Counter()
+    bonding_curve_v2_mismatch_reason_counts: Counter[str] = Counter()
+    bonding_curve_v2_source_counts: Counter[str] = Counter()
+    builder_required_curve_account_ready_counts: Counter[str] = Counter()
     for row in failure_rows:
         if role := row_string(row, "simulation_error_account_role"):
             role_counts[role] += 1
@@ -1141,6 +1211,14 @@ def active_shadow_dispatch_diagnostics(paths: dict[str, list[Path]]) -> dict[str
             account_set_match_counts[match_value] += 1
         if narrowing := row_string(row, "simulation_error_account_narrowing_status"):
             narrowing_status_counts[narrowing] += 1
+        if status := row_string(row, "bonding_curve_v2_authority_status"):
+            bonding_curve_v2_authority_status_counts[status] += 1
+        if reason := row_string(row, "bonding_curve_v2_mismatch_reason"):
+            bonding_curve_v2_mismatch_reason_counts[reason] += 1
+        if source := row_string(row, "bonding_curve_v2_source"):
+            bonding_curve_v2_source_counts[source] += 1
+        if ready := row_bool_string(row, "builder_required_curve_account_ready"):
+            builder_required_curve_account_ready_counts[ready] += 1
         for candidate in iter_account_candidates(row, "simulation_error_account_candidates_raw"):
             role = candidate.get("role")
             if role:
@@ -1189,6 +1267,18 @@ def active_shadow_dispatch_diagnostics(paths: dict[str, list[Path]]) -> dict[str
         "active_shadow_account_candidate_raw_counts": dict(sorted(candidate_raw_counts.items())),
         "active_shadow_account_candidate_narrowed_counts": dict(
             sorted(candidate_narrowed_counts.items())
+        ),
+        "active_shadow_bonding_curve_v2_authority_status_counts": dict(
+            sorted(bonding_curve_v2_authority_status_counts.items())
+        ),
+        "active_shadow_bonding_curve_v2_mismatch_reason_counts": dict(
+            sorted(bonding_curve_v2_mismatch_reason_counts.items())
+        ),
+        "active_shadow_bonding_curve_v2_source_counts": dict(
+            sorted(bonding_curve_v2_source_counts.items())
+        ),
+        "active_shadow_builder_required_curve_account_ready_counts": dict(
+            sorted(builder_required_curve_account_ready_counts.items())
         ),
     }
 
@@ -1351,6 +1441,12 @@ def readiness(report: dict[str, Any]) -> dict[str, Any]:
     ):
         status = "not_ready"
         reasons.append("active_shadow_bonding_curve_v2_account_not_found_after_simulation")
+    if active_shadow.get("active_shadow_bonding_curve_v2_authority_status_counts", {}).get(
+        "builder_only",
+        0,
+    ) > 0:
+        status = "not_ready"
+        reasons.append("active_shadow_bonding_curve_v2_source_not_authoritative")
     if exact_ab_common <= 0:
         status = "degraded" if status != "not_ready" else status
         reasons.append("no_common_ab_record_id_across_nonempty_artifacts")
@@ -1404,6 +1500,10 @@ def readiness(report: dict[str, Any]) -> dict[str, Any]:
         "active_shadow_bonding_curve_v2_account_not_found_after_simulation_rows": active_shadow.get(
             "active_shadow_bonding_curve_v2_account_not_found_after_simulation_rows",
             0,
+        ),
+        "active_shadow_bonding_curve_v2_authority_status_counts": active_shadow.get(
+            "active_shadow_bonding_curve_v2_authority_status_counts",
+            {},
         ),
         "active_shadow_lifecycle_eligible_failure_rows": active_shadow.get(
             "active_shadow_lifecycle_eligible_failure_rows",
@@ -1465,6 +1565,15 @@ def probe_readiness(report: dict[str, Any]) -> dict[str, Any]:
     if materialization.get("bonding_curve_v2_account_not_found_after_simulation_rows", 0) > 0:
         status = "not_ready"
         reasons.append("bonding_curve_v2_account_not_found_after_simulation")
+    if materialization.get("bonding_curve_v2_authority_status_counts", {}).get("builder_only", 0) > 0:
+        status = "not_ready"
+        reasons.append("bonding_curve_v2_source_not_authoritative")
+    if materialization.get("skip_bonding_curve_v2_authority_status_counts", {}).get(
+        "builder_only",
+        0,
+    ) > 0:
+        status = "not_ready"
+        reasons.append("bonding_curve_v2_source_not_authoritative_skip")
     if status == "ready_for_probe_transport_entry_join" and quality in {
         "exact_probe_id_and_ab_record_id",
         "exact_ab_record_id",
@@ -1530,6 +1639,14 @@ def probe_readiness(report: dict[str, Any]) -> dict[str, Any]:
         "bonding_curve_v2_account_not_found_after_simulation_rows": materialization.get(
             "bonding_curve_v2_account_not_found_after_simulation_rows",
             0,
+        ),
+        "bonding_curve_v2_authority_status_counts": materialization.get(
+            "bonding_curve_v2_authority_status_counts",
+            {},
+        ),
+        "skip_bonding_curve_v2_authority_status_counts": materialization.get(
+            "skip_bonding_curve_v2_authority_status_counts",
+            {},
         ),
         "precheck_simulation_account_set_mismatch_rows": materialization.get(
             "precheck_simulation_account_set_mismatch_rows",
@@ -1673,6 +1790,10 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- active_shadow_account_narrowing_status_counts: `{json.dumps(active_shadow['active_shadow_account_narrowing_status_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- active_shadow_account_candidate_raw_counts: `{json.dumps(active_shadow['active_shadow_account_candidate_raw_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- active_shadow_account_candidate_narrowed_counts: `{json.dumps(active_shadow['active_shadow_account_candidate_narrowed_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_bonding_curve_v2_authority_status_counts: `{json.dumps(active_shadow['active_shadow_bonding_curve_v2_authority_status_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_bonding_curve_v2_mismatch_reason_counts: `{json.dumps(active_shadow['active_shadow_bonding_curve_v2_mismatch_reason_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_bonding_curve_v2_source_counts: `{json.dumps(active_shadow['active_shadow_bonding_curve_v2_source_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_builder_required_curve_account_ready_counts: `{json.dumps(active_shadow['active_shadow_builder_required_curve_account_ready_counts'], ensure_ascii=False, sort_keys=True)}`",
         ]
     )
     lines.extend(["", "## Probe Entry Materialization", ""])
@@ -1689,6 +1810,10 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- creator_vault_authority_status_counts: `{json.dumps(materialization['creator_vault_authority_status_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- creator_vault_mismatch_reason_counts: `{json.dumps(materialization['creator_vault_mismatch_reason_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- creator_identity_source_counts: `{json.dumps(materialization['creator_identity_source_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- bonding_curve_v2_authority_status_counts: `{json.dumps(materialization['bonding_curve_v2_authority_status_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- bonding_curve_v2_mismatch_reason_counts: `{json.dumps(materialization['bonding_curve_v2_mismatch_reason_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- bonding_curve_v2_source_counts: `{json.dumps(materialization['bonding_curve_v2_source_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- builder_required_curve_account_ready_counts: `{json.dumps(materialization['builder_required_curve_account_ready_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- amount_guard_status_counts: `{json.dumps(materialization['amount_guard_status_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- simulation_error_category_counts: `{json.dumps(materialization['simulation_error_category_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- simulation_error_kind_counts: `{json.dumps(materialization['simulation_error_kind_counts'], ensure_ascii=False, sort_keys=True)}`",
@@ -1715,6 +1840,9 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- skip_creator_vault_authority_status_counts: `{json.dumps(materialization['skip_creator_vault_authority_status_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- skip_creator_vault_mismatch_reason_counts: `{json.dumps(materialization['skip_creator_vault_mismatch_reason_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- skip_creator_identity_source_counts: `{json.dumps(materialization['skip_creator_identity_source_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- skip_bonding_curve_v2_authority_status_counts: `{json.dumps(materialization['skip_bonding_curve_v2_authority_status_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- skip_bonding_curve_v2_mismatch_reason_counts: `{json.dumps(materialization['skip_bonding_curve_v2_mismatch_reason_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- skip_bonding_curve_v2_source_counts: `{json.dumps(materialization['skip_bonding_curve_v2_source_counts'], ensure_ascii=False, sort_keys=True)}`",
         ]
     )
     if materialization["rows"]:

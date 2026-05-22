@@ -1246,6 +1246,11 @@ lifecycle_log_path = "../../logs/shadow_run/r16/shadow_lifecycle.jsonl"
                         "required": True,
                     }
                 ],
+                "bonding_curve_v2_pubkey": "bc-v2",
+                "bonding_curve_v2_source": "route_builder",
+                "bonding_curve_v2_authority_status": "builder_only",
+                "bonding_curve_v2_mismatch_reason": "builder_pubkey_not_materialized",
+                "builder_required_curve_account_ready": False,
                 "account_set_match": True,
             }
             write_jsonl(
@@ -1269,8 +1274,120 @@ lifecycle_log_path = "../../logs/shadow_run/r16/shadow_lifecycle.jsonl"
             active["active_shadow_bonding_curve_v2_account_not_found_after_simulation_rows"],
             0,
         )
+        self.assertEqual(
+            active["active_shadow_bonding_curve_v2_authority_status_counts"]["builder_only"],
+            3,
+        )
+        self.assertEqual(
+            active["active_shadow_bonding_curve_v2_mismatch_reason_counts"][
+                "builder_pubkey_not_materialized"
+            ],
+            3,
+        )
+        self.assertEqual(
+            active["active_shadow_builder_required_curve_account_ready_counts"]["false"],
+            3,
+        )
         self.assertEqual(active["active_shadow_account_not_found_rows"], 0)
         self.assertEqual(active["active_shadow_lifecycle_eligible_failure_rows"], 0)
+        self.assertIn(
+            "active_shadow_bonding_curve_v2_source_not_authoritative",
+            report["readiness"]["reasons"],
+        )
+
+    def test_bonding_curve_v2_source_authority_counts_are_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "configs/rollout/r16-source.toml"
+            config.parent.mkdir(parents=True)
+            config.write_text(
+                """
+[oracle]
+decision_log_path = "../../logs/rollout/r16-source/decisions"
+
+[p37_shadow_probe]
+selection_log_path = "../../logs/shadow_run/r16-source/probe_selected.jsonl"
+skip_log_path = "../../logs/shadow_run/r16-source/probe_skipped.jsonl"
+transport_log_path = "../../logs/shadow_run/r16-source/probe_transport.jsonl"
+entry_log_path = "../../logs/shadow_run/r16-source/probe_entries.jsonl"
+lifecycle_log_path = "../../logs/shadow_run/r16-source/probe_lifecycle.jsonl"
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            decision = {
+                "candidate_id": "pool_mint_1000",
+                "ab_record_id": "source-ab",
+                "pool_id": "pool",
+                "base_mint": "mint",
+                "v3_replay_payload_schema_version": 1,
+                "v3_feature_snapshot_hash": "feature-hash",
+                "v3_policy_config_hash": "policy-hash",
+            }
+            probe_common = {
+                **decision,
+                "source_ab_record_id": "source-ab",
+                "probe_id": "probe-bcv2-source",
+                "dispatch_source": "counterfactual_shadow_probe",
+                "collection_plane": "counterfactual_shadow_probe",
+                "probe_plane": "p37_shadow_probe",
+                "probe_bucket": "v3_pending_wait_sample",
+                "probe_amount_source": "fixed_lamports",
+                "bonding_curve_v2_pubkey": "bc-v2",
+                "bonding_curve_v2_source": "route_builder",
+                "bonding_curve_v2_authority_status": "builder_only",
+                "bonding_curve_v2_mismatch_reason": "builder_pubkey_not_materialized",
+                "builder_required_curve_account_ready": False,
+            }
+            source_skip = {
+                **probe_common,
+                "event_type": "probe_skipped",
+                "probe_skip_reason": "bonding_curve_v2_source_not_authoritative",
+                "precheck_failure_reason": (
+                    "bonding_curve_v2_source_not_authoritative:"
+                    "builder_only:route_builder:bc-v2"
+                ),
+                "execution_account_readiness_status": "not_ready",
+                "execution_account_readiness_role": "bonding_curve_v2",
+                "execution_account_readiness_pubkey": "bc-v2",
+            }
+            write_jsonl(
+                root / "logs/rollout/r16-source/decisions/gatekeeper_v2_decisions.jsonl",
+                [decision],
+            )
+            write_jsonl(root / "logs/shadow_run/r16-source/probe_selected.jsonl", [probe_common])
+            write_jsonl(root / "logs/shadow_run/r16-source/probe_skipped.jsonl", [source_skip])
+            write_jsonl(root / "logs/shadow_run/r16-source/probe_transport.jsonl", [probe_common])
+
+            report = audit.build_report(config)
+
+        materialization = report["probe_entry_materialization"]
+        self.assertEqual(
+            materialization["bonding_curve_v2_authority_status_counts"]["builder_only"],
+            1,
+        )
+        self.assertEqual(
+            materialization["bonding_curve_v2_mismatch_reason_counts"][
+                "builder_pubkey_not_materialized"
+            ],
+            1,
+        )
+        self.assertEqual(
+            materialization["builder_required_curve_account_ready_counts"]["false"],
+            1,
+        )
+        self.assertEqual(
+            materialization["skip_bonding_curve_v2_authority_status_counts"]["builder_only"],
+            1,
+        )
+        self.assertIn(
+            "bonding_curve_v2_source_not_authoritative",
+            report["probe_readiness"]["reasons"],
+        )
+        self.assertIn(
+            "bonding_curve_v2_source_not_authoritative_skip",
+            report["probe_readiness"]["reasons"],
+        )
 
     def test_active_shadow_data_problem_entry_is_not_successful(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
