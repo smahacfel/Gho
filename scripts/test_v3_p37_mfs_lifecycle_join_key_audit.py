@@ -1191,6 +1191,61 @@ lifecycle_log_path = "../../logs/shadow_run/r16/shadow_lifecycle.jsonl"
             report["readiness"]["reasons"],
         )
 
+    def test_active_shadow_data_problem_entry_is_not_successful(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "configs/rollout/r16.toml"
+            config.parent.mkdir(parents=True)
+            config.write_text(
+                """
+[oracle]
+decision_log_path = "../../logs/rollout/r16/decisions"
+
+[trigger.shadow_run]
+output_path = "../../logs/shadow_run/r16/buys.jsonl"
+
+[execution.shadow]
+entry_log_path = "../../logs/shadow_run/r16/shadow_entries.jsonl"
+lifecycle_log_path = "../../logs/shadow_run/r16/shadow_lifecycle.jsonl"
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            common = {
+                "candidate_id": "pool_mint_1000",
+                "ab_record_id": "ab-buy",
+                "pool_id": "pool",
+                "base_mint": "mint",
+                "decision_ts_ms": 1000,
+                "v3_replay_payload_schema_version": 1,
+                "v3_feature_snapshot_hash": "feature-hash",
+                "v3_policy_config_hash": "policy-hash",
+            }
+            entry_failure = {
+                **common,
+                "execution_outcome": "shadow_data_problem",
+                "active_shadow_lifecycle_eligibility_status": "not_lifecycle_eligible",
+                "simulation_error_kind": "AccountNotFound",
+                "simulation_error_category": "simulation_account_not_found_attributed",
+                "simulation_error_account_pubkey": "missing-account",
+                "simulation_error_account_role": "bonding_curve_v2",
+                "account_set_match": True,
+            }
+            write_jsonl(
+                root / "logs/rollout/r16/decisions/gatekeeper_v2_decisions.jsonl",
+                [common],
+            )
+            write_jsonl(root / "logs/shadow_run/r16/shadow_entries.jsonl", [entry_failure])
+
+            report = audit.build_report(config)
+
+        active = report["active_shadow_dispatch_diagnostics"]
+        self.assertEqual(active["active_shadow_entry_rows"], 1)
+        self.assertEqual(active["active_shadow_dispatch_failure_rows"], 1)
+        self.assertEqual(active["active_shadow_successful_entry_rows"], 0)
+        self.assertEqual(active["active_shadow_lifecycle_eligible_rows"], 0)
+        self.assertEqual(active["active_shadow_account_not_found_attributed_rows"], 1)
+
     def test_active_shadow_unattributed_account_not_found_blocks_readiness(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

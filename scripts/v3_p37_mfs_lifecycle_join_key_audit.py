@@ -1014,10 +1014,18 @@ def active_shadow_dispatch_diagnostics(paths: dict[str, list[Path]]) -> dict[str
     def is_failure(row: dict[str, Any]) -> bool:
         status = row_string(row, "dispatch_status")
         outcome = row_string(row, "simulation_outcome") or row_string(row, "execution_outcome")
+        failure_outcomes = {
+            "failed",
+            "shadow_data_problem",
+            "shadow_simulation_failed",
+            "shadow_simulation_error",
+        }
         return (
             bool(row_string(row, "err"))
             or status == "failed"
-            or outcome in {"failed", "shadow_simulation_failed", "shadow_simulation_error"}
+            or outcome in failure_outcomes
+            or bool(row_string(row, "simulation_error_kind"))
+            or bool(row_string(row, "simulation_error_category"))
         )
 
     failure_rows = [row for row in all_rows if is_failure(row)]
@@ -1069,8 +1077,6 @@ def active_shadow_dispatch_diagnostics(paths: dict[str, list[Path]]) -> dict[str
         row
         for row in entry_rows
         if not is_failure(row)
-        and row_string(row, "execution_outcome")
-        not in {"shadow_simulation_failed", "shadow_simulation_error"}
     ]
     lifecycle_eligible_rows = [
         row

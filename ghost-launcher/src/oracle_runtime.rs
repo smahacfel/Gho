@@ -10595,7 +10595,7 @@ fn shadow_entry_record_from_event(
     } else {
         event.decision_ts_ms
     };
-    Some(ShadowEntryRecord {
+    let mut entry = ShadowEntryRecord {
         join_metadata: event.join_metadata.clone(),
         schema_version: 1,
         collection_plane: None,
@@ -10652,7 +10652,9 @@ fn shadow_entry_record_from_event(
         quote_id: None,
         timing_source: None,
         execution_outcome: execution_outcome.to_string(),
-    })
+    };
+    enrich_active_shadow_entry_with_account_diagnostics(&mut entry, &event.account_diagnostics);
+    Some(entry)
 }
 
 fn shadow_entry_record_from_request(
@@ -11479,6 +11481,9 @@ async fn apply_trigger_buy_outcome(
     post_buy_lane: &str,
     active_position_lease: Option<crate::components::trigger::safety::ActivePositionLease>,
     min_tokens_out: Option<u64>,
+    active_shadow_report_error_diagnostics: Option<
+        crate::events::ShadowSimulationAccountDiagnostics,
+    >,
     outcome: crate::components::trigger::TriggerBuyOutcome,
 ) -> anyhow::Result<TriggerBuyOutcomeApplied> {
     match outcome {
@@ -11576,17 +11581,26 @@ async fn apply_trigger_buy_outcome(
         crate::components::trigger::TriggerBuyOutcome::ShadowSimulated { report } => {
             let mut active_position_lease = active_position_lease;
             let shadow_entry_token_amount_raw = report.entry_token_amount_raw;
+            let report_err = report.err.clone();
             let mut retain_runtime_pool = false;
             let mut shadow_execution_outcome = report
                 .err
                 .as_deref()
                 .map(shadow_execution_outcome_from_report_err)
                 .unwrap_or_else(|| "shadow_simulated".to_string());
-            let shadow_event = crate::components::trigger::shadow_run::shadow_buy_event_from_report(
-                &pool_amm_id.to_string(),
-                &pool_data.base_mint,
-                report,
-            );
+            let mut shadow_event =
+                crate::components::trigger::shadow_run::shadow_buy_event_from_report(
+                    &pool_amm_id.to_string(),
+                    &pool_data.base_mint,
+                    report,
+                );
+            if let Some(error_message) = report_err {
+                shadow_event.account_diagnostics = active_shadow_report_error_diagnostics
+                    .unwrap_or_else(|| {
+                        let err = anyhow::anyhow!(error_message);
+                        active_shadow_account_diagnostics_without_request(&err)
+                    });
+            }
             if trigger_component.shadow_run_emit_event_bus() {
                 if let Err(e) =
                     event_tx.send(GhostEvent::shadow_buy_simulated(shadow_event.clone()))
@@ -11768,6 +11782,38 @@ async fn apply_trigger_dispatch_receipt(
                 } => Some(signature.to_string()),
                 _ => None,
             };
+            let active_shadow_report_error_diagnostics = match (&outcome, failed_request.as_ref()) {
+                (
+                    crate::components::trigger::TriggerBuyOutcome::ShadowSimulated { report },
+                    Some(request),
+                ) => report
+                    .err
+                    .as_ref()
+                    .map(|error_message| (request, error_message)),
+                _ => None,
+            };
+            let active_shadow_report_error_diagnostics =
+                if let Some((request, error_message)) = active_shadow_report_error_diagnostics {
+                    let err = anyhow::anyhow!(error_message.clone());
+                    Some(
+                        active_shadow_account_diagnostics_from_request(
+                            trigger_component,
+                            request,
+                            &err,
+                        )
+                        .await,
+                    )
+                } else if let crate::components::trigger::TriggerBuyOutcome::ShadowSimulated {
+                    report,
+                } = &outcome
+                {
+                    report.err.as_ref().map(|error_message| {
+                        let err = anyhow::anyhow!(error_message.clone());
+                        active_shadow_account_diagnostics_without_request(&err)
+                    })
+                } else {
+                    None
+                };
             if live_signature.is_some() && shadow_task.is_some() {
                 increment_counter!("trigger_live_success_with_shadow_companion_total");
             }
@@ -11788,6 +11834,7 @@ async fn apply_trigger_dispatch_receipt(
                 post_buy_lane,
                 active_position_lease.take(),
                 min_tokens_out,
+                active_shadow_report_error_diagnostics,
                 outcome,
             )
             .await;
@@ -15408,6 +15455,150 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn active_shadow_report_error_outcome_carries_account_diagnostics() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut trigger_config = crate::config::TriggerComponentConfig {
+            enabled: true,
+            entry_mode: crate::config::TriggerEntryMode::ShadowOnly,
+            rpc_url: "https://api.devnet.solana.com".to_string(),
+            keypair_path: None,
+            tip_guard: crate::config::TriggerTipGuardConfig::default(),
+            metrics_port: 9091,
+            max_concurrent_positions: 3,
+            max_position_size_sol: 0.1,
+            emergency_floor_sol: 0.05,
+            position_size_buffer_sol: 0.02,
+            slippage_tolerance: 0.20,
+            live_preflight_max_state_age_slots: 10,
+            live_exit_take_profit_pct: 0.02,
+            live_exit_stop_loss_pct: 0.02,
+            shadow_run: crate::config::TriggerShadowRunConfig::default(),
+        };
+        trigger_config.shadow_run.output_path = temp
+            .path()
+            .join("shadow.jsonl")
+            .to_string_lossy()
+            .into_owned();
+        let trigger = crate::components::trigger::TriggerComponent::new_with_shadow_simulator(
+            trigger_config,
+            Arc::new(MockShadowSimulator),
+        );
+        let (event_tx, _event_rx) = crate::events::create_event_bus();
+        let mut rx = event_tx.subscribe();
+        let post_buy_epoch = std::sync::atomic::AtomicU64::new(1);
+        let pool_id = Pubkey::new_unique();
+        let pool = crate::events::DetectedPool {
+            semantic: Default::default(),
+            pool_amm_id: pool_id.to_string(),
+            base_mint: Pubkey::new_unique().to_string(),
+            quote_mint: "SOL".to_string(),
+            amm_program: "pumpfun".to_string(),
+            bonding_curve: "curve".to_string(),
+            creator: "creator".to_string(),
+            slot: Some(1),
+            timestamp_ms: 1_000,
+            event_time: ghost_core::EventTimeMetadata::default(),
+            detected_wall_ts_ms: Some(1_001),
+            initial_liquidity_sol: Some(1.0),
+            signature: "sig".to_string(),
+        };
+        let shadow_entry_path = temp.path().join("shadow_entries.jsonl");
+        let diagnostics = crate::events::ShadowSimulationAccountDiagnostics {
+            active_shadow_precheck_status: Some("not_run_post_simulation_attribution".to_string()),
+            active_shadow_lifecycle_eligibility_status: Some("not_lifecycle_eligible".to_string()),
+            simulation_error_kind: Some("AccountNotFound".to_string()),
+            simulation_error_category: Some("simulation_account_not_found_attributed".to_string()),
+            simulation_error_account_pubkey: Some("missing-pubkey".to_string()),
+            simulation_error_account_role: Some("bonding_curve_v2".to_string()),
+            prepared_request_account_set_hash: Some("prepared-hash".to_string()),
+            simulation_account_set_hash: Some("simulation-hash".to_string()),
+            account_manifest_available: Some(true),
+            ..Default::default()
+        };
+
+        apply_trigger_buy_outcome(
+            &event_tx,
+            None,
+            &trigger,
+            &post_buy_epoch,
+            ExecutionMode::Shadow,
+            &shadow_entry_path,
+            None,
+            "test-join",
+            "test-rollout",
+            pool_id,
+            &pool,
+            0.1,
+            10,
+            "paper",
+            None,
+            None,
+            Some(diagnostics),
+            crate::components::trigger::TriggerBuyOutcome::ShadowSimulated {
+                report: crate::components::trigger::ShadowBuySimulationReport {
+                    join_metadata: ExecutionJoinMetadata::default(),
+                    mint: pool.base_mint.clone(),
+                    live_signature: None,
+                    payer_pubkey: Pubkey::new_unique().to_string(),
+                    payer_provenance: "ephemeral".to_string(),
+                    amount_lamports: 100,
+                    entry_token_amount_raw: Some(250_000),
+                    tip_lamports: 10,
+                    decision_ts_ms: 10,
+                    simulation_started_ts_ms: 11,
+                    simulation_finished_ts_ms: 16,
+                    latency_ms: 5,
+                    shadow_duration_ms: 5,
+                    rpc_slot: 777,
+                    retry_count: 0,
+                    used_sig_verify: false,
+                    used_replace_recent_blockhash: true,
+                    units_consumed: None,
+                    logs: Vec::new(),
+                    return_data: None,
+                    err: Some("AccountNotFound".to_string()),
+                },
+            },
+        )
+        .await
+        .expect("shadow report error apply should succeed");
+
+        let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("shadow event timeout")
+            .expect("shadow event receive");
+        let event = match event {
+            GhostEvent::ShadowBuySimulated(event) => event,
+            other => panic!("expected ShadowBuySimulated, got {other:?}"),
+        };
+        assert_eq!(
+            event
+                .account_diagnostics
+                .simulation_error_account_role
+                .as_deref(),
+            Some("bonding_curve_v2")
+        );
+        assert_eq!(
+            event
+                .account_diagnostics
+                .active_shadow_lifecycle_eligibility_status
+                .as_deref(),
+            Some("not_lifecycle_eligible")
+        );
+
+        let entry = tokio::fs::read_to_string(&shadow_entry_path)
+            .await
+            .expect("shadow entry row");
+        let entry: serde_json::Value =
+            serde_json::from_str(entry.lines().next().expect("entry line")).expect("entry json");
+        assert_eq!(entry["simulation_error_account_role"], "bonding_curve_v2");
+        assert_eq!(
+            entry["active_shadow_lifecycle_eligibility_status"],
+            "not_lifecycle_eligible"
+        );
+    }
+
     #[test]
     fn p37_shadow_probe_account_not_found_multi_candidate_and_unattributed_are_explicit() {
         let request = test_prepared_buy_request();
@@ -18559,6 +18750,7 @@ mod tests {
             "paper",
             None,
             None,
+            None,
             crate::components::trigger::TriggerBuyOutcome::ShadowSimulated {
                 report: crate::components::trigger::ShadowBuySimulationReport {
                     join_metadata: ExecutionJoinMetadata::default(),
@@ -20392,6 +20584,7 @@ mod tests {
             "paper",
             None,
             None,
+            None,
             outcome,
         )
         .await
@@ -20503,6 +20696,7 @@ mod tests {
             0.1,
             10,
             "paper",
+            None,
             None,
             None,
             outcome,
@@ -20618,6 +20812,7 @@ mod tests {
             0.1,
             10,
             "paper",
+            None,
             None,
             None,
             outcome,
@@ -20759,6 +20954,7 @@ mod tests {
             "shadow",
             None,
             None,
+            None,
             outcome,
         )
         .await
@@ -20859,6 +21055,7 @@ mod tests {
             0.1,
             10,
             "paper",
+            None,
             None,
             None,
             crate::components::trigger::TriggerBuyOutcome::ShadowSimulated {
@@ -21041,6 +21238,7 @@ mod tests {
             0.1,
             10,
             "paper",
+            None,
             None,
             None,
             crate::components::trigger::TriggerBuyOutcome::ShadowSimulated {
