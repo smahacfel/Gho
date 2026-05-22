@@ -497,7 +497,14 @@ def identity_coverage(
 def label_quality_counts(label_rows: list[dict[str, Any]]) -> Counter[str]:
     counts: Counter[str] = Counter()
     for row in label_rows:
-        value = first_present(row, "buy_quality", "label", "quality_class", "outcome_label")
+        value = first_present(
+            row,
+            "buy_quality_class",
+            "buy_quality",
+            "label",
+            "quality_class",
+            "outcome_label",
+        )
         counts[str(value or "missing")] += 1
     return counts
 

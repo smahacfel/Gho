@@ -1,0 +1,425 @@
+{
+  "buy_quality_class_counts": {
+    "buy_quality_bad": 37,
+    "buy_quality_dirty_good": 2
+  },
+  "close_reason_counts": {
+    "StopLoss": 2,
+    "Target": 2,
+    "TimeStop": 35
+  },
+  "config_path": "configs/rollout/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1.toml",
+  "decision_log_row_counts": {
+    "/root/Gho/logs/rollout/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1/decisions/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1/v2.2/legacy_live/00b3d576e6ddfaefe5f738ef016d91e644fe3c67269a7cb058b29e4c75a2087d/gatekeeper_v2_buys.jsonl": 6,
+    "/root/Gho/logs/rollout/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1/decisions/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1/v2.2/legacy_live/00b3d576e6ddfaefe5f738ef016d91e644fe3c67269a7cb058b29e4c75a2087d/gatekeeper_v2_decisions.jsonl": 1972
+  },
+  "decision_logs": [
+    "/root/Gho/logs/rollout/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1/decisions/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1/v2.2/legacy_live/00b3d576e6ddfaefe5f738ef016d91e644fe3c67269a7cb058b29e4c75a2087d/gatekeeper_v2_buys.jsonl",
+    "/root/Gho/logs/rollout/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1/decisions/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1/v2.2/legacy_live/00b3d576e6ddfaefe5f738ef016d91e644fe3c67269a7cb058b29e4c75a2087d/gatekeeper_v2_decisions.jsonl"
+  ],
+  "decision_rows_total": 1978,
+  "diagnostic_minimums": {
+    "bad_with_features": 37,
+    "dirty_good_with_features": 2,
+    "gatekeeper_context_bad_with_features": 1,
+    "gatekeeper_context_dirty_good_with_features": 0,
+    "lifecycle_leakage_fields_in_decision_logs": 0,
+    "min_feature_label_rows": 100,
+    "min_temporal_split_class_rows": 20,
+    "temporal_split_possible": false
+  },
+  "feature_availability_status": "insufficient_for_selector",
+  "feature_group_counts_all_rows": {
+    "account_features": 39,
+    "alpha_fingerprint": 39,
+    "checkpoint_features": 39,
+    "curve_readiness": 39,
+    "dow_stage_fields": 39,
+    "gatekeeper_v2_v25_phase_fields": 39,
+    "legacy_decision_fields": 39,
+    "pdd_fields": 39,
+    "sybil_resistance": 39,
+    "tas_fields": 39,
+    "tx_intel_fields": 39,
+    "v25_shadow_fields": 39,
+    "v3_component_scores": 39,
+    "v3_evidence_status": 39,
+    "v3_manipulation_contradictions": 39,
+    "v3_materialized_feature_snapshot": 39,
+    "v3_organic_broadening": 39,
+    "v3_shadow_reason_code": 39,
+    "v3_shadow_verdict": 39
+  },
+  "feature_group_matrix": {
+    "account_features": {
+      "all_rows": 39,
+      "bad": 37,
+      "dirty_good": 2,
+      "gatekeeper_context_bad": 1,
+      "gatekeeper_context_dirty_good": 0
+    },
+    "alpha_fingerprint": {
+      "all_rows": 39,
+      "bad": 37,
+      "dirty_good": 2,
+      "gatekeeper_context_bad": 1,
+      "gatekeeper_context_dirty_good": 0
+    },
+    "checkpoint_features": {
+      "all_rows": 39,
+      "bad": 37,
+      "dirty_good": 2,
+      "gatekeeper_context_bad": 1,
+      "gatekeeper_context_dirty_good": 0
+    },
+    "curve_readiness": {
+      "all_rows": 39,
+      "bad": 37,
+      "dirty_good": 2,
+      "gatekeeper_context_bad": 1,
+      "gatekeeper_context_dirty_good": 0
+    },
+    "dow_stage_fields": {
+      "all_rows": 39,
+      "bad": 37,
+      "dirty_good": 2,
+      "gatekeeper_context_bad": 1,
+      "gatekeeper_context_dirty_good": 0
+    },
+    "gatekeeper_v2_v25_phase_fields": {
+      "all_rows": 39,
+      "bad": 37,
+      "dirty_good": 2,
+      "gatekeeper_context_bad": 1,
+      "gatekeeper_context_dirty_good": 0
+    },
+    "legacy_decision_fields": {
+      "all_rows": 39,
+      "bad": 37,
+      "dirty_good": 2,
+      "gatekeeper_context_bad": 1,
+      "gatekeeper_context_dirty_good": 0
+    },
+    "pdd_fields": {
+      "all_rows": 39,
+      "bad": 37,
+      "dirty_good": 2,
+      "gatekeeper_context_bad": 1,
+      "gatekeeper_context_dirty_good": 0
+    },
+    "sybil_resistance": {
+      "all_rows": 39,
+      "bad": 37,
+      "dirty_good": 2,
+      "gatekeeper_context_bad": 1,
+      "gatekeeper_context_dirty_good": 0
+    },
+    "tas_fields": {
+      "all_rows": 39,
+      "bad": 37,
+      "dirty_good": 2,
+      "gatekeeper_context_bad": 1,
+      "gatekeeper_context_dirty_good": 0
+    },
+    "tx_intel_fields": {
+      "all_rows": 39,
+      "bad": 37,
+      "dirty_good": 2,
+      "gatekeeper_context_bad": 1,
+      "gatekeeper_context_dirty_good": 0
+    },
+    "v25_shadow_fields": {
+      "all_rows": 39,
+      "bad": 37,
+      "dirty_good": 2,
+      "gatekeeper_context_bad": 1,
+      "gatekeeper_context_dirty_good": 0
+    },
+    "v3_component_scores": {
+      "all_rows": 39,
+      "bad": 37,
+      "dirty_good": 2,
+      "gatekeeper_context_bad": 1,
+      "gatekeeper_context_dirty_good": 0
+    },
+    "v3_evidence_status": {
+      "all_rows": 39,
+      "bad": 37,
+      "dirty_good": 2,
+      "gatekeeper_context_bad": 1,
+      "gatekeeper_context_dirty_good": 0
+    },
+    "v3_manipulation_contradictions": {
+      "all_rows": 39,
+      "bad": 37,
+      "dirty_good": 2,
+      "gatekeeper_context_bad": 1,
+      "gatekeeper_context_dirty_good": 0
+    },
+    "v3_materialized_feature_snapshot": {
+      "all_rows": 39,
+      "bad": 37,
+      "dirty_good": 2,
+      "gatekeeper_context_bad": 1,
+      "gatekeeper_context_dirty_good": 0
+    },
+    "v3_organic_broadening": {
+      "all_rows": 39,
+      "bad": 37,
+      "dirty_good": 2,
+      "gatekeeper_context_bad": 1,
+      "gatekeeper_context_dirty_good": 0
+    },
+    "v3_shadow_reason_code": {
+      "all_rows": 39,
+      "bad": 37,
+      "dirty_good": 2,
+      "gatekeeper_context_bad": 1,
+      "gatekeeper_context_dirty_good": 0
+    },
+    "v3_shadow_verdict": {
+      "all_rows": 39,
+      "bad": 37,
+      "dirty_good": 2,
+      "gatekeeper_context_bad": 1,
+      "gatekeeper_context_dirty_good": 0
+    }
+  },
+  "gatekeeper_context_split": {
+    "gatekeeper_context_rows": 1,
+    "no_gatekeeper_context_rows": 38
+  },
+  "join_quality_counts": {
+    "ambiguous_matches": 1,
+    "matched_by_ab_record_id": 39,
+    "matched_by_candidate_id": 0,
+    "matched_by_pool_mint": 0,
+    "matched_by_pool_mint_time_window": 0,
+    "matched_by_position_id": 0,
+    "matched_by_time_window": 0,
+    "unmatched": 0
+  },
+  "market_outcome_class_counts": {
+    "market_bad_clean": 37,
+    "market_good_clean": 2
+  },
+  "match_time_delta_ms": {
+    "count": 39,
+    "max": 0.0,
+    "mean": 0.0,
+    "min": 0.0,
+    "p50": 0.0,
+    "p90": 0.0,
+    "p99": 0.0
+  },
+  "matched_config_hash_counts": {
+    "00b3d576e6ddfaefe5f738ef016d91e644fe3c67269a7cb058b29e4c75a2087d": 39
+  },
+  "matched_decision_identifier_presence": {
+    "ab_record_id": 39,
+    "config_hash": 39,
+    "join_key": 39
+  },
+  "matched_decision_plane_counts": {
+    "legacy_live": 39
+  },
+  "matched_gatekeeper_version_counts": {
+    "v2.2": 39
+  },
+  "matched_log_kind_counts": {
+    "buy": 1,
+    "decision": 38
+  },
+  "matched_row_examples": {
+    "33RNiNz4Li5PzLWeKSvaTypfQQjX7wqJpmSHizJWpump_2UpW7tedK7h6dKkWBevQdPLabLRgbxmpUuZmowNqxoGv_1779413707816": {
+      "config_hash": "00b3d576e6ddfaefe5f738ef016d91e644fe3c67269a7cb058b29e4c75a2087d",
+      "decision_plane": "legacy_live",
+      "feature_groups": [
+        "account_features",
+        "alpha_fingerprint",
+        "checkpoint_features",
+        "curve_readiness",
+        "dow_stage_fields",
+        "gatekeeper_v2_v25_phase_fields",
+        "legacy_decision_fields",
+        "pdd_fields",
+        "sybil_resistance",
+        "tas_fields",
+        "tx_intel_fields",
+        "v25_shadow_fields",
+        "v3_component_scores",
+        "v3_evidence_status",
+        "v3_manipulation_contradictions",
+        "v3_materialized_feature_snapshot",
+        "v3_organic_broadening",
+        "v3_shadow_reason_code",
+        "v3_shadow_verdict"
+      ],
+      "gatekeeper_version": "v2.2",
+      "log_kind": "decision",
+      "match_time_delta_ms": 0,
+      "path": "/root/Gho/logs/rollout/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1/decisions/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1/v2.2/legacy_live/00b3d576e6ddfaefe5f738ef016d91e644fe3c67269a7cb058b29e4c75a2087d/gatekeeper_v2_decisions.jsonl"
+    },
+    "6qiikU5geLToRRnoahF3FSgV9YPCcs14znC1eTf3pump_4v7A3abJekLLeZQaiERgFgNh9o6tMvnvcwiweohhUYK3_1779413497068": {
+      "config_hash": "00b3d576e6ddfaefe5f738ef016d91e644fe3c67269a7cb058b29e4c75a2087d",
+      "decision_plane": "legacy_live",
+      "feature_groups": [
+        "account_features",
+        "alpha_fingerprint",
+        "checkpoint_features",
+        "curve_readiness",
+        "dow_stage_fields",
+        "gatekeeper_v2_v25_phase_fields",
+        "legacy_decision_fields",
+        "pdd_fields",
+        "sybil_resistance",
+        "tas_fields",
+        "tx_intel_fields",
+        "v25_shadow_fields",
+        "v3_component_scores",
+        "v3_evidence_status",
+        "v3_manipulation_contradictions",
+        "v3_materialized_feature_snapshot",
+        "v3_organic_broadening",
+        "v3_shadow_reason_code",
+        "v3_shadow_verdict"
+      ],
+      "gatekeeper_version": "v2.2",
+      "log_kind": "decision",
+      "match_time_delta_ms": 0,
+      "path": "/root/Gho/logs/rollout/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1/decisions/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1/v2.2/legacy_live/00b3d576e6ddfaefe5f738ef016d91e644fe3c67269a7cb058b29e4c75a2087d/gatekeeper_v2_decisions.jsonl"
+    },
+    "DdUDK47fWJ7oKvhRVCUf862iY2BH5xPh9DSCrZK3pump_CnnadmFAqYNoTcGrreKgAE8ctt1QKFhioetaaufk5r7P_1779413382363": {
+      "config_hash": "00b3d576e6ddfaefe5f738ef016d91e644fe3c67269a7cb058b29e4c75a2087d",
+      "decision_plane": "legacy_live",
+      "feature_groups": [
+        "account_features",
+        "alpha_fingerprint",
+        "checkpoint_features",
+        "curve_readiness",
+        "dow_stage_fields",
+        "gatekeeper_v2_v25_phase_fields",
+        "legacy_decision_fields",
+        "pdd_fields",
+        "sybil_resistance",
+        "tas_fields",
+        "tx_intel_fields",
+        "v25_shadow_fields",
+        "v3_component_scores",
+        "v3_evidence_status",
+        "v3_manipulation_contradictions",
+        "v3_materialized_feature_snapshot",
+        "v3_organic_broadening",
+        "v3_shadow_reason_code",
+        "v3_shadow_verdict"
+      ],
+      "gatekeeper_version": "v2.2",
+      "log_kind": "decision",
+      "match_time_delta_ms": 0,
+      "path": "/root/Gho/logs/rollout/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1/decisions/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1/v2.2/legacy_live/00b3d576e6ddfaefe5f738ef016d91e644fe3c67269a7cb058b29e4c75a2087d/gatekeeper_v2_decisions.jsonl"
+    },
+    "Gt4jt4keQRXZGwvL4hceQYB2NfbGp21UhMLZiZxxpump_gNF5wEuP4Lbb7652Tejg8kgBBEQKyZgZ7nzcSwv8c6F_1779413340727": {
+      "config_hash": "00b3d576e6ddfaefe5f738ef016d91e644fe3c67269a7cb058b29e4c75a2087d",
+      "decision_plane": "legacy_live",
+      "feature_groups": [
+        "account_features",
+        "alpha_fingerprint",
+        "checkpoint_features",
+        "curve_readiness",
+        "dow_stage_fields",
+        "gatekeeper_v2_v25_phase_fields",
+        "legacy_decision_fields",
+        "pdd_fields",
+        "sybil_resistance",
+        "tas_fields",
+        "tx_intel_fields",
+        "v25_shadow_fields",
+        "v3_component_scores",
+        "v3_evidence_status",
+        "v3_manipulation_contradictions",
+        "v3_materialized_feature_snapshot",
+        "v3_organic_broadening",
+        "v3_shadow_reason_code",
+        "v3_shadow_verdict"
+      ],
+      "gatekeeper_version": "v2.2",
+      "log_kind": "decision",
+      "match_time_delta_ms": 0,
+      "path": "/root/Gho/logs/rollout/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1/decisions/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1/v2.2/legacy_live/00b3d576e6ddfaefe5f738ef016d91e644fe3c67269a7cb058b29e4c75a2087d/gatekeeper_v2_decisions.jsonl"
+    },
+    "HFr7diM5tM7gyvBPknAYvhiTUYSPcVA41cke9eNdpump_5HBGBwxsPBehZ5SscKWRPa2rvUP5388xqZE4h7LtZxmE_1779413719262": {
+      "config_hash": "00b3d576e6ddfaefe5f738ef016d91e644fe3c67269a7cb058b29e4c75a2087d",
+      "decision_plane": "legacy_live",
+      "feature_groups": [
+        "account_features",
+        "alpha_fingerprint",
+        "checkpoint_features",
+        "curve_readiness",
+        "dow_stage_fields",
+        "gatekeeper_v2_v25_phase_fields",
+        "legacy_decision_fields",
+        "pdd_fields",
+        "sybil_resistance",
+        "tas_fields",
+        "tx_intel_fields",
+        "v25_shadow_fields",
+        "v3_component_scores",
+        "v3_evidence_status",
+        "v3_manipulation_contradictions",
+        "v3_materialized_feature_snapshot",
+        "v3_organic_broadening",
+        "v3_shadow_reason_code",
+        "v3_shadow_verdict"
+      ],
+      "gatekeeper_version": "v2.2",
+      "log_kind": "decision",
+      "match_time_delta_ms": 0,
+      "path": "/root/Gho/logs/rollout/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1/decisions/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1/v2.2/legacy_live/00b3d576e6ddfaefe5f738ef016d91e644fe3c67269a7cb058b29e4c75a2087d/gatekeeper_v2_decisions.jsonl"
+    }
+  },
+  "phase_b_possible": false,
+  "phase_b_scope": "none",
+  "raw_shadow_onchain_rows_total": 39,
+  "reason": "feature coverage or class balance is below configured minimums",
+  "rows_total": 39,
+  "rows_with_any_decision_time_features": {
+    "all_rows": 39,
+    "buy_quality_bad": 37,
+    "buy_quality_dirty_good": 2,
+    "close_reason_StopLoss": 2,
+    "close_reason_Target": 2,
+    "close_reason_TimeStop": 35,
+    "gatekeeper_context_buy_quality_bad": 1,
+    "gatekeeper_context_rows": 1,
+    "no_gatekeeper_context_rows": 38,
+    "truth_gap_clean": 3,
+    "truth_gap_degraded_acceptable": 36
+  },
+  "schema_version": 1,
+  "source_labels": "/root/Gho/logs/shadow_run/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1/p3_7_shadow_lifecycle_labels.jsonl",
+  "source_shadow_onchain_lifecycle": "/root/Gho/logs/shadow_run/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1/probe_shadow_onchain_lifecycle_report.jsonl",
+  "temporal_split": {
+    "possible": false,
+    "reason": "insufficient_good_or_bad_in_temporal_half",
+    "splits": {
+      "early": {
+        "buy_quality_class_counts": {
+          "buy_quality_bad": 17,
+          "buy_quality_dirty_good": 2
+        },
+        "first_decision_ts_ms": 1779413340727,
+        "last_decision_ts_ms": 1779415381334,
+        "rows": 19
+      },
+      "late": {
+        "buy_quality_class_counts": {
+          "buy_quality_bad": 20
+        },
+        "first_decision_ts_ms": 1779415404433,
+        "last_decision_ts_ms": 1779416906516,
+        "rows": 20
+      }
+    }
+  },
+  "v3_selector_prototype_possible": false
+}
