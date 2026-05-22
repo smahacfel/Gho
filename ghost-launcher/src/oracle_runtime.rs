@@ -5033,6 +5033,11 @@ struct P37ShadowProbeTransportRecord {
     simulation_error_expected_account_pubkey: Option<String>,
     simulation_error_account_index: Option<u64>,
     simulation_error_account_candidates: Vec<P37ShadowProbeAccountNotFoundCandidate>,
+    simulation_error_account_candidates_raw: Vec<P37ShadowProbeAccountNotFoundCandidate>,
+    simulation_error_account_candidates_narrowed: Vec<P37ShadowProbeAccountNotFoundCandidate>,
+    simulation_error_account_candidates_excluded: Vec<P37ShadowProbeAccountNotFoundCandidate>,
+    simulation_error_account_narrowing_status: Option<String>,
+    simulation_error_account_narrowing_reason: Option<String>,
     creator_vault_authority_status: Option<String>,
     creator_vault_actual_pubkey: Option<String>,
     creator_vault_expected_pubkey: Option<String>,
@@ -5513,6 +5518,11 @@ fn p37_shadow_probe_artifact_records(
         simulation_error_expected_account_pubkey: None,
         simulation_error_account_index: None,
         simulation_error_account_candidates: Vec::new(),
+        simulation_error_account_candidates_raw: Vec::new(),
+        simulation_error_account_candidates_narrowed: Vec::new(),
+        simulation_error_account_candidates_excluded: Vec::new(),
+        simulation_error_account_narrowing_status: None,
+        simulation_error_account_narrowing_reason: None,
         creator_vault_authority_status: None,
         creator_vault_actual_pubkey: None,
         creator_vault_expected_pubkey: None,
@@ -5601,6 +5611,11 @@ fn p37_shadow_probe_artifact_records(
         simulation_error_instruction_index: None,
         simulation_error_account_index: None,
         simulation_error_account_candidates: Vec::new(),
+        simulation_error_account_candidates_raw: Vec::new(),
+        simulation_error_account_candidates_narrowed: Vec::new(),
+        simulation_error_account_candidates_excluded: Vec::new(),
+        simulation_error_account_narrowing_status: None,
+        simulation_error_account_narrowing_reason: None,
         simulation_error_category: None,
         precheck_account_set_hash: None,
         prepared_request_account_set_hash: None,
@@ -5848,6 +5863,27 @@ struct P37ShadowProbeAccountNotFoundCandidate {
     instruction_index: Option<u64>,
     account_index: Option<u64>,
     required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    candidate_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    candidate_fatality: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    candidate_exclusion_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct P37ShadowProbeAccountNotFoundAttribution {
+    account_pubkey: Option<String>,
+    account_role: Option<String>,
+    account_source: Option<String>,
+    account_index: Option<u64>,
+    candidates: Vec<P37ShadowProbeAccountNotFoundCandidate>,
+    category: Option<String>,
+    raw_candidates: Vec<P37ShadowProbeAccountNotFoundCandidate>,
+    narrowed_candidates: Vec<P37ShadowProbeAccountNotFoundCandidate>,
+    excluded_candidates: Vec<P37ShadowProbeAccountNotFoundCandidate>,
+    narrowing_status: Option<String>,
+    narrowing_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -5862,6 +5898,11 @@ struct P37ShadowProbeExecutionDiagnostics {
     simulation_error_expected_account_pubkey: Option<String>,
     simulation_error_account_index: Option<u64>,
     simulation_error_account_candidates: Vec<P37ShadowProbeAccountNotFoundCandidate>,
+    simulation_error_account_candidates_raw: Vec<P37ShadowProbeAccountNotFoundCandidate>,
+    simulation_error_account_candidates_narrowed: Vec<P37ShadowProbeAccountNotFoundCandidate>,
+    simulation_error_account_candidates_excluded: Vec<P37ShadowProbeAccountNotFoundCandidate>,
+    simulation_error_account_narrowing_status: Option<String>,
+    simulation_error_account_narrowing_reason: Option<String>,
     creator_vault_authority_status: Option<String>,
     creator_vault_actual_pubkey: Option<String>,
     creator_vault_expected_pubkey: Option<String>,
@@ -6348,6 +6389,7 @@ fn p37_shadow_probe_account_not_found_candidate_from_entry(
         instruction_index: entry.instruction_index,
         account_index: entry.account_index,
         required: entry.required,
+        ..Default::default()
     }
 }
 
@@ -6476,23 +6518,174 @@ fn p37_shadow_probe_account_manifest_summary(
     ))
 }
 
+fn p37_shadow_probe_classified_account_not_found_candidate(
+    candidate: &P37ShadowProbeAccountNotFoundCandidate,
+    request: Option<&crate::components::trigger::PreparedBuyRequest>,
+) -> P37ShadowProbeAccountNotFoundCandidate {
+    let mut candidate = candidate.clone();
+    let parsed_pubkey = Pubkey::from_str(&candidate.pubkey).ok();
+    let matches_request_pubkey = |value: Option<Pubkey>| {
+        parsed_pubkey
+            .zip(value)
+            .map(|(left, right)| left == right)
+            .unwrap_or(false)
+    };
+    let role = candidate.role.as_str();
+
+    let (candidate_class, candidate_fatality, candidate_exclusion_reason) = match role {
+        "payer_pubkey" => {
+            let nonfatal_ephemeral = request
+                .map(|request| {
+                    request.payer_provenance == "ephemeral"
+                        && matches_request_pubkey(Some(request.payer_pubkey))
+                })
+                .unwrap_or(false);
+            if nonfatal_ephemeral {
+                (
+                    "ephemeral_payer_nonfatal",
+                    "non_fatal",
+                    Some("ephemeral_payer_not_rpc_required"),
+                )
+            } else {
+                ("strict_execution_account", "fatal", None)
+            }
+        }
+        "user_ata" => {
+            let idempotent_creatable = request
+                .map(|request| {
+                    request.attach_idempotent_ata_create
+                        && request.ata_missing_pre_submit
+                        && matches_request_pubkey(Some(request.user_ata))
+                })
+                .unwrap_or(false);
+            if idempotent_creatable {
+                (
+                    "idempotent_creatable_user_ata",
+                    "non_fatal",
+                    Some("idempotent_ata_create_attached"),
+                )
+            } else {
+                ("route_specific_required_account", "conditional", None)
+            }
+        }
+        "user_volume_accumulator" => {
+            let route_pda = candidate.source == "route_builder"
+                || candidate
+                    .account_index
+                    .map(|index| index == 13)
+                    .unwrap_or(false);
+            if route_pda {
+                (
+                    "creatable_or_optional_route_pda",
+                    "non_fatal",
+                    Some("route_user_volume_accumulator_not_precheck_required"),
+                )
+            } else {
+                ("route_specific_required_account", "conditional", None)
+            }
+        }
+        "bonding_curve_v2"
+        | "bonding_curve"
+        | "associated_bonding_curve"
+        | "creator_vault"
+        | "mint"
+        | "global_config"
+        | "fee_recipient" => ("strict_execution_account", "fatal", None),
+        "system_program"
+        | "token_program"
+        | "event_authority"
+        | "pump_program"
+        | "fee_program"
+        | "global_volume_accumulator"
+        | "fee_config"
+        | "buyback_fee_recipient" => ("program_or_sysvar", "fatal", None),
+        "legacy_buy_instruction_account" | "routed_buy_instruction_account" => {
+            ("route_specific_required_account", "conditional", None)
+        }
+        _ => ("unknown", "unknown", None),
+    };
+
+    candidate.candidate_class = Some(candidate_class.to_string());
+    candidate.candidate_fatality = Some(candidate_fatality.to_string());
+    candidate.candidate_exclusion_reason = candidate_exclusion_reason.map(str::to_string);
+    candidate
+}
+
+fn p37_shadow_probe_narrow_account_not_found_candidates(
+    candidates: Vec<P37ShadowProbeAccountNotFoundCandidate>,
+    request: Option<&crate::components::trigger::PreparedBuyRequest>,
+) -> (
+    Vec<P37ShadowProbeAccountNotFoundCandidate>,
+    Vec<P37ShadowProbeAccountNotFoundCandidate>,
+    Vec<P37ShadowProbeAccountNotFoundCandidate>,
+    Option<String>,
+    Option<String>,
+) {
+    let raw_candidates: Vec<P37ShadowProbeAccountNotFoundCandidate> = candidates
+        .iter()
+        .map(|candidate| {
+            p37_shadow_probe_classified_account_not_found_candidate(candidate, request)
+        })
+        .collect();
+    let mut narrowed_candidates = Vec::new();
+    let mut excluded_candidates = Vec::new();
+    for candidate in raw_candidates.iter().cloned() {
+        if candidate.candidate_fatality.as_deref() == Some("non_fatal") {
+            excluded_candidates.push(candidate);
+        } else {
+            narrowed_candidates.push(candidate);
+        }
+    }
+    let status = if raw_candidates.is_empty() {
+        None
+    } else if narrowed_candidates.len() == 1 {
+        Some("exact_after_narrowing".to_string())
+    } else if narrowed_candidates.len() > 1 {
+        Some("multi_candidate_narrowed".to_string())
+    } else {
+        Some("all_candidates_nonfatal_but_sim_failed".to_string())
+    };
+    let reason = match status.as_deref() {
+        Some("exact_after_narrowing") => narrowed_candidates
+            .first()
+            .map(|candidate| format!("single_fatal_candidate_after_exclusions:{}", candidate.role)),
+        Some("multi_candidate_narrowed") => Some(format!(
+            "fatal_or_conditional_candidates_after_exclusions:{}",
+            narrowed_candidates
+                .iter()
+                .map(|candidate| candidate.role.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        )),
+        Some("all_candidates_nonfatal_but_sim_failed") => Some(format!(
+            "all_raw_candidates_excluded_as_nonfatal:{}",
+            excluded_candidates
+                .iter()
+                .map(|candidate| candidate.role.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        )),
+        _ => None,
+    };
+    (
+        raw_candidates,
+        narrowed_candidates,
+        excluded_candidates,
+        status,
+        reason,
+    )
+}
+
 fn p37_shadow_probe_account_not_found_attribution(
     error_message: Option<&str>,
     account_pubkey_from_message: Option<&str>,
     request: Option<&crate::components::trigger::PreparedBuyRequest>,
     account_set_diagnostics: Option<&P37ShadowProbeAccountSetDiagnostics>,
-) -> (
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<u64>,
-    Vec<P37ShadowProbeAccountNotFoundCandidate>,
-    Option<String>,
-) {
+) -> P37ShadowProbeAccountNotFoundAttribution {
     let is_account_not_found =
         p37_shadow_probe_error_kind(error_message) == Some("AccountNotFound".to_string());
     if !is_account_not_found {
-        return (None, None, None, None, Vec::new(), None);
+        return P37ShadowProbeAccountNotFoundAttribution::default();
     }
 
     if let Some(pubkey) = account_pubkey_from_message {
@@ -6512,45 +6705,103 @@ fn p37_shadow_probe_account_not_found_attribution(
                     .map(p37_shadow_probe_account_source)
                     .map(str::to_string)
             });
-        return (
-            Some(pubkey.to_string()),
-            role,
-            source,
-            manifest_entry.and_then(|entry| entry.account_index),
-            Vec::new(),
-            Some("simulation_account_not_found_attributed".to_string()),
-        );
+        let exact_candidate =
+            manifest_entry.map(p37_shadow_probe_account_not_found_candidate_from_entry);
+        let raw_candidates = exact_candidate
+            .as_ref()
+            .map(|candidate| {
+                vec![p37_shadow_probe_classified_account_not_found_candidate(
+                    candidate, request,
+                )]
+            })
+            .unwrap_or_default();
+        return P37ShadowProbeAccountNotFoundAttribution {
+            account_pubkey: Some(pubkey.to_string()),
+            account_role: role,
+            account_source: source,
+            account_index: manifest_entry.and_then(|entry| entry.account_index),
+            candidates: Vec::new(),
+            category: Some("simulation_account_not_found_attributed".to_string()),
+            narrowed_candidates: raw_candidates.clone(),
+            raw_candidates,
+            excluded_candidates: Vec::new(),
+            narrowing_status: Some("exact_after_narrowing".to_string()),
+            narrowing_reason: Some("simulator_error_exposed_pubkey".to_string()),
+        };
     }
 
     let candidates = account_set_diagnostics
         .map(|diagnostics| diagnostics.missing_candidates.clone())
         .unwrap_or_default();
-    match candidates.len() {
+    let (
+        raw_candidates,
+        narrowed_candidates,
+        excluded_candidates,
+        narrowing_status,
+        narrowing_reason,
+    ) = p37_shadow_probe_narrow_account_not_found_candidates(candidates, request);
+    match narrowed_candidates.len() {
         1 => {
-            let candidate = candidates[0].clone();
-            (
-                Some(candidate.pubkey),
-                Some(candidate.role),
-                Some(candidate.source),
-                candidate.account_index,
-                Vec::new(),
-                Some("simulation_account_not_found_attributed".to_string()),
-            )
+            let candidate = narrowed_candidates[0].clone();
+            P37ShadowProbeAccountNotFoundAttribution {
+                account_pubkey: Some(candidate.pubkey),
+                account_role: Some(candidate.role),
+                account_source: Some(candidate.source),
+                account_index: candidate.account_index,
+                candidates: Vec::new(),
+                category: Some("simulation_account_not_found_attributed".to_string()),
+                raw_candidates,
+                narrowed_candidates,
+                excluded_candidates,
+                narrowing_status,
+                narrowing_reason,
+            }
         }
-        count if count > 1 => (
-            None,
-            None,
-            None,
-            None,
-            candidates,
-            Some("simulation_account_not_found_multi_candidate".to_string()),
-        ),
+        count if count > 1 => P37ShadowProbeAccountNotFoundAttribution {
+            candidates: narrowed_candidates.clone(),
+            category: Some("simulation_account_not_found_multi_candidate_narrow".to_string()),
+            raw_candidates,
+            narrowed_candidates,
+            excluded_candidates,
+            narrowing_status,
+            narrowing_reason,
+            ..Default::default()
+        },
         _ => {
-            let category = account_set_diagnostics
-                .and_then(|diagnostics| diagnostics.manifest_lookup_error.as_ref())
-                .map(|_| "simulation_account_not_found_unattributed".to_string())
-                .unwrap_or_else(|| "simulation_rpc_visibility_gap".to_string());
-            (None, None, None, None, Vec::new(), Some(category))
+            if !raw_candidates.is_empty() {
+                P37ShadowProbeAccountNotFoundAttribution {
+                    category: Some("all_candidates_nonfatal_but_sim_failed".to_string()),
+                    raw_candidates,
+                    narrowed_candidates,
+                    excluded_candidates,
+                    narrowing_status,
+                    narrowing_reason,
+                    ..Default::default()
+                }
+            } else {
+                let (category, status, reason) = account_set_diagnostics
+                    .and_then(|diagnostics| diagnostics.manifest_lookup_error.as_ref())
+                    .map(|error| {
+                        (
+                            "simulation_account_not_found_unattributed".to_string(),
+                            "unattributed_after_narrowing".to_string(),
+                            format!("manifest_lookup_error:{error}"),
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        (
+                            "simulation_rpc_visibility_gap".to_string(),
+                            "all_manifest_accounts_visible".to_string(),
+                            "manifest_lookup_found_no_missing_accounts".to_string(),
+                        )
+                    });
+                P37ShadowProbeAccountNotFoundAttribution {
+                    category: Some(category),
+                    narrowing_status: Some(status),
+                    narrowing_reason: Some(reason),
+                    ..Default::default()
+                }
+            }
         }
     }
 }
@@ -6971,21 +7222,20 @@ fn p37_shadow_probe_execution_diagnostics(
     let account_pubkey = account_pubkey.or_else(|| anchor_error_actual_account_pubkey.clone());
     let account_role =
         account_role.or_else(|| instruction_diagnostics.anchor_error_account_role.clone());
-    let (
-        attributed_account_pubkey,
-        attributed_account_role,
-        attributed_account_source,
-        attributed_account_index,
-        attributed_candidates,
-        account_not_found_category,
-    ) = p37_shadow_probe_account_not_found_attribution(
+    let account_not_found_attribution = p37_shadow_probe_account_not_found_attribution(
         error_message.as_deref(),
         account_pubkey.as_deref(),
         request,
         account_set_diagnostics,
     );
-    let account_pubkey = attributed_account_pubkey.or(account_pubkey);
-    let account_role = attributed_account_role.or(account_role);
+    let account_pubkey = account_not_found_attribution
+        .account_pubkey
+        .clone()
+        .or(account_pubkey);
+    let account_role = account_not_found_attribution
+        .account_role
+        .clone()
+        .or(account_role);
     let creator_vault_authority = p37_shadow_probe_creator_vault_authority_diagnostics(
         request,
         account_role.as_deref(),
@@ -7024,11 +7274,18 @@ fn p37_shadow_probe_execution_diagnostics(
         simulation_error_message: error_message,
         simulation_error_account_pubkey: account_pubkey,
         simulation_error_account_role: account_role,
-        simulation_error_account_source: attributed_account_source,
+        simulation_error_account_source: account_not_found_attribution.account_source,
         simulation_error_actual_account_pubkey: anchor_error_actual_account_pubkey,
         simulation_error_expected_account_pubkey: anchor_error_expected_account_pubkey,
-        simulation_error_account_index: attributed_account_index,
-        simulation_error_account_candidates: attributed_candidates,
+        simulation_error_account_index: account_not_found_attribution.account_index,
+        simulation_error_account_candidates: account_not_found_attribution.candidates,
+        simulation_error_account_candidates_raw: account_not_found_attribution.raw_candidates,
+        simulation_error_account_candidates_narrowed: account_not_found_attribution
+            .narrowed_candidates,
+        simulation_error_account_candidates_excluded: account_not_found_attribution
+            .excluded_candidates,
+        simulation_error_account_narrowing_status: account_not_found_attribution.narrowing_status,
+        simulation_error_account_narrowing_reason: account_not_found_attribution.narrowing_reason,
         creator_vault_authority_status: creator_vault_authority.status,
         creator_vault_actual_pubkey: creator_vault_authority.actual_pubkey,
         creator_vault_expected_pubkey: creator_vault_authority.expected_pubkey,
@@ -7045,7 +7302,9 @@ fn p37_shadow_probe_execution_diagnostics(
         simulation_error_program_name: instruction_diagnostics.program_name,
         simulation_error_program_error_name: instruction_diagnostics.program_error_name,
         simulation_error_program_error_family: instruction_diagnostics.program_error_family,
-        simulation_error_category: account_not_found_category.or(instruction_diagnostics.category),
+        simulation_error_category: account_not_found_attribution
+            .category
+            .or(instruction_diagnostics.category),
         simulation_error_logs_digest: instruction_diagnostics.logs_digest,
         simulation_error_log_tail: instruction_diagnostics.log_tail,
         simulation_error_instruction_accounts: instruction_diagnostics.instruction_accounts,
@@ -7226,6 +7485,16 @@ fn p37_shadow_probe_transport_from_event(
             .simulation_error_expected_account_pubkey,
         simulation_error_account_index: diagnostics.simulation_error_account_index,
         simulation_error_account_candidates: diagnostics.simulation_error_account_candidates,
+        simulation_error_account_candidates_raw: diagnostics
+            .simulation_error_account_candidates_raw,
+        simulation_error_account_candidates_narrowed: diagnostics
+            .simulation_error_account_candidates_narrowed,
+        simulation_error_account_candidates_excluded: diagnostics
+            .simulation_error_account_candidates_excluded,
+        simulation_error_account_narrowing_status: diagnostics
+            .simulation_error_account_narrowing_status,
+        simulation_error_account_narrowing_reason: diagnostics
+            .simulation_error_account_narrowing_reason,
         creator_vault_authority_status: diagnostics.creator_vault_authority_status,
         creator_vault_actual_pubkey: diagnostics.creator_vault_actual_pubkey,
         creator_vault_expected_pubkey: diagnostics.creator_vault_expected_pubkey,
@@ -7376,6 +7645,16 @@ fn p37_shadow_probe_transport_from_error(
             .simulation_error_expected_account_pubkey,
         simulation_error_account_index: diagnostics.simulation_error_account_index,
         simulation_error_account_candidates: diagnostics.simulation_error_account_candidates,
+        simulation_error_account_candidates_raw: diagnostics
+            .simulation_error_account_candidates_raw,
+        simulation_error_account_candidates_narrowed: diagnostics
+            .simulation_error_account_candidates_narrowed,
+        simulation_error_account_candidates_excluded: diagnostics
+            .simulation_error_account_candidates_excluded,
+        simulation_error_account_narrowing_status: diagnostics
+            .simulation_error_account_narrowing_status,
+        simulation_error_account_narrowing_reason: diagnostics
+            .simulation_error_account_narrowing_reason,
         creator_vault_authority_status: diagnostics.creator_vault_authority_status,
         creator_vault_actual_pubkey: diagnostics.creator_vault_actual_pubkey,
         creator_vault_expected_pubkey: diagnostics.creator_vault_expected_pubkey,
@@ -7490,6 +7769,18 @@ fn enrich_probe_shadow_entry(
     entry.simulation_error_account_index = transport.simulation_error_account_index;
     entry.simulation_error_account_candidates =
         transport.simulation_error_account_candidates.clone();
+    entry.simulation_error_account_candidates_raw =
+        transport.simulation_error_account_candidates_raw.clone();
+    entry.simulation_error_account_candidates_narrowed = transport
+        .simulation_error_account_candidates_narrowed
+        .clone();
+    entry.simulation_error_account_candidates_excluded = transport
+        .simulation_error_account_candidates_excluded
+        .clone();
+    entry.simulation_error_account_narrowing_status =
+        transport.simulation_error_account_narrowing_status.clone();
+    entry.simulation_error_account_narrowing_reason =
+        transport.simulation_error_account_narrowing_reason.clone();
     entry.simulation_error_category = transport.simulation_error_category.clone();
     entry.precheck_account_set_hash = transport.precheck_account_set_hash.clone();
     entry.prepared_request_account_set_hash = transport.prepared_request_account_set_hash.clone();
@@ -10152,6 +10443,11 @@ fn shadow_entry_record_from_event(
         simulation_error_instruction_index: None,
         simulation_error_account_index: None,
         simulation_error_account_candidates: Vec::new(),
+        simulation_error_account_candidates_raw: Vec::new(),
+        simulation_error_account_candidates_narrowed: Vec::new(),
+        simulation_error_account_candidates_excluded: Vec::new(),
+        simulation_error_account_narrowing_status: None,
+        simulation_error_account_narrowing_reason: None,
         simulation_error_category: None,
         precheck_account_set_hash: None,
         prepared_request_account_set_hash: None,
@@ -10205,6 +10501,11 @@ fn shadow_entry_record_from_request(
         simulation_error_instruction_index: None,
         simulation_error_account_index: None,
         simulation_error_account_candidates: Vec::new(),
+        simulation_error_account_candidates_raw: Vec::new(),
+        simulation_error_account_candidates_narrowed: Vec::new(),
+        simulation_error_account_candidates_excluded: Vec::new(),
+        simulation_error_account_narrowing_status: None,
+        simulation_error_account_narrowing_reason: None,
         simulation_error_category: None,
         precheck_account_set_hash: None,
         prepared_request_account_set_hash: None,
@@ -10529,6 +10830,16 @@ struct ShadowEntryRecord {
     simulation_error_account_index: Option<u64>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     simulation_error_account_candidates: Vec<P37ShadowProbeAccountNotFoundCandidate>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    simulation_error_account_candidates_raw: Vec<P37ShadowProbeAccountNotFoundCandidate>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    simulation_error_account_candidates_narrowed: Vec<P37ShadowProbeAccountNotFoundCandidate>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    simulation_error_account_candidates_excluded: Vec<P37ShadowProbeAccountNotFoundCandidate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    simulation_error_account_narrowing_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    simulation_error_account_narrowing_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     simulation_error_category: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -14675,28 +14986,35 @@ mod tests {
             instruction_index: Some(0),
             account_index: Some(1),
             required: true,
+            ..Default::default()
         };
         let diagnostics = P37ShadowProbeAccountSetDiagnostics {
             missing_candidates: vec![missing],
             ..p37_shadow_probe_account_set_diagnostics_from_request(&request)
         };
 
-        let (pubkey, role, source, account_index, candidates, category) =
-            p37_shadow_probe_account_not_found_attribution(
-                Some("AccountNotFound"),
-                None,
-                Some(&request),
-                Some(&diagnostics),
-            );
+        let attribution = p37_shadow_probe_account_not_found_attribution(
+            Some("AccountNotFound"),
+            None,
+            Some(&request),
+            Some(&diagnostics),
+        );
 
-        assert_eq!(pubkey, Some(request.user_ata.to_string()));
-        assert_eq!(role.as_deref(), Some("user_ata"));
-        assert_eq!(source.as_deref(), Some("user_ata"));
-        assert_eq!(account_index, Some(1));
-        assert!(candidates.is_empty());
         assert_eq!(
-            category.as_deref(),
+            attribution.account_pubkey,
+            Some(request.user_ata.to_string())
+        );
+        assert_eq!(attribution.account_role.as_deref(), Some("user_ata"));
+        assert_eq!(attribution.account_source.as_deref(), Some("user_ata"));
+        assert_eq!(attribution.account_index, Some(1));
+        assert!(attribution.candidates.is_empty());
+        assert_eq!(
+            attribution.category.as_deref(),
             Some("simulation_account_not_found_attributed")
+        );
+        assert_eq!(
+            attribution.narrowing_status.as_deref(),
+            Some("exact_after_narrowing")
         );
     }
 
@@ -14710,6 +15028,7 @@ mod tests {
             instruction_index: Some(0),
             account_index: Some(1),
             required: true,
+            ..Default::default()
         };
         let candidate_b = P37ShadowProbeAccountNotFoundCandidate {
             pubkey: request.payer_pubkey.to_string(),
@@ -14718,40 +15037,184 @@ mod tests {
             instruction_index: Some(0),
             account_index: Some(0),
             required: true,
+            ..Default::default()
         };
         let diagnostics = P37ShadowProbeAccountSetDiagnostics {
             missing_candidates: vec![candidate_a, candidate_b],
             ..p37_shadow_probe_account_set_diagnostics_from_request(&request)
         };
 
-        let (_, _, _, _, candidates, category) = p37_shadow_probe_account_not_found_attribution(
+        let attribution = p37_shadow_probe_account_not_found_attribution(
             Some("AccountNotFound"),
             None,
             Some(&request),
             Some(&diagnostics),
         );
 
-        assert_eq!(candidates.len(), 2);
+        assert_eq!(attribution.candidates.len(), 2);
         assert_eq!(
-            category.as_deref(),
-            Some("simulation_account_not_found_multi_candidate")
+            attribution.category.as_deref(),
+            Some("simulation_account_not_found_multi_candidate_narrow")
+        );
+        assert_eq!(
+            attribution.narrowing_status.as_deref(),
+            Some("multi_candidate_narrowed")
         );
 
         let diagnostics = P37ShadowProbeAccountSetDiagnostics {
             manifest_lookup_error: Some("rpc failure".to_string()),
             ..p37_shadow_probe_account_set_diagnostics_from_request(&request)
         };
-        let (_, _, _, _, candidates, category) = p37_shadow_probe_account_not_found_attribution(
+        let attribution = p37_shadow_probe_account_not_found_attribution(
             Some("AccountNotFound"),
             None,
             Some(&request),
             Some(&diagnostics),
         );
-        assert!(candidates.is_empty());
+        assert!(attribution.candidates.is_empty());
         assert_eq!(
-            category.as_deref(),
+            attribution.category.as_deref(),
             Some("simulation_account_not_found_unattributed")
         );
+        assert_eq!(
+            attribution.narrowing_status.as_deref(),
+            Some("unattributed_after_narrowing")
+        );
+    }
+
+    #[test]
+    fn p37_shadow_probe_account_not_found_narrowing_excludes_probe_mode_nonfatal_accounts() {
+        let mut request = test_prepared_buy_request();
+        request.payer_provenance = "ephemeral";
+        request.ata_missing_pre_submit = true;
+        let bonding_curve_v2 = Pubkey::new_unique();
+        let user_volume_accumulator = Pubkey::new_unique();
+        let missing = vec![
+            P37ShadowProbeAccountNotFoundCandidate {
+                pubkey: request.payer_pubkey.to_string(),
+                role: "payer_pubkey".to_string(),
+                source: "payer".to_string(),
+                instruction_index: Some(0),
+                account_index: Some(0),
+                required: true,
+                ..Default::default()
+            },
+            P37ShadowProbeAccountNotFoundCandidate {
+                pubkey: request.user_ata.to_string(),
+                role: "user_ata".to_string(),
+                source: "user_ata".to_string(),
+                instruction_index: Some(0),
+                account_index: Some(1),
+                required: true,
+                ..Default::default()
+            },
+            P37ShadowProbeAccountNotFoundCandidate {
+                pubkey: user_volume_accumulator.to_string(),
+                role: "user_volume_accumulator".to_string(),
+                source: "route_builder".to_string(),
+                instruction_index: Some(3),
+                account_index: Some(13),
+                required: true,
+                ..Default::default()
+            },
+            P37ShadowProbeAccountNotFoundCandidate {
+                pubkey: bonding_curve_v2.to_string(),
+                role: "bonding_curve_v2".to_string(),
+                source: "route_builder".to_string(),
+                instruction_index: Some(3),
+                account_index: Some(16),
+                required: true,
+                ..Default::default()
+            },
+        ];
+        let diagnostics = P37ShadowProbeAccountSetDiagnostics {
+            missing_candidates: missing,
+            ..p37_shadow_probe_account_set_diagnostics_from_request(&request)
+        };
+
+        let attribution = p37_shadow_probe_account_not_found_attribution(
+            Some("AccountNotFound"),
+            None,
+            Some(&request),
+            Some(&diagnostics),
+        );
+
+        assert_eq!(
+            attribution.category.as_deref(),
+            Some("simulation_account_not_found_attributed")
+        );
+        assert_eq!(
+            attribution.narrowing_status.as_deref(),
+            Some("exact_after_narrowing")
+        );
+        assert_eq!(
+            attribution.account_role.as_deref(),
+            Some("bonding_curve_v2")
+        );
+        assert_eq!(attribution.raw_candidates.len(), 4);
+        assert_eq!(attribution.narrowed_candidates.len(), 1);
+        assert_eq!(attribution.excluded_candidates.len(), 3);
+        let exclusion_reasons: HashSet<&str> = attribution
+            .excluded_candidates
+            .iter()
+            .filter_map(|candidate| candidate.candidate_exclusion_reason.as_deref())
+            .collect();
+        assert!(exclusion_reasons.contains("ephemeral_payer_not_rpc_required"));
+        assert!(exclusion_reasons.contains("idempotent_ata_create_attached"));
+        assert!(exclusion_reasons.contains("route_user_volume_accumulator_not_precheck_required"));
+    }
+
+    #[test]
+    fn p37_shadow_probe_account_not_found_all_nonfatal_candidates_remains_diagnostic_blocker() {
+        let mut request = test_prepared_buy_request();
+        request.payer_provenance = "ephemeral";
+        request.ata_missing_pre_submit = true;
+        let missing = vec![
+            P37ShadowProbeAccountNotFoundCandidate {
+                pubkey: request.payer_pubkey.to_string(),
+                role: "payer_pubkey".to_string(),
+                source: "payer".to_string(),
+                required: true,
+                ..Default::default()
+            },
+            P37ShadowProbeAccountNotFoundCandidate {
+                pubkey: request.user_ata.to_string(),
+                role: "user_ata".to_string(),
+                source: "user_ata".to_string(),
+                required: true,
+                ..Default::default()
+            },
+            P37ShadowProbeAccountNotFoundCandidate {
+                pubkey: Pubkey::new_unique().to_string(),
+                role: "user_volume_accumulator".to_string(),
+                source: "route_builder".to_string(),
+                account_index: Some(13),
+                required: true,
+                ..Default::default()
+            },
+        ];
+        let diagnostics = P37ShadowProbeAccountSetDiagnostics {
+            missing_candidates: missing,
+            ..p37_shadow_probe_account_set_diagnostics_from_request(&request)
+        };
+
+        let attribution = p37_shadow_probe_account_not_found_attribution(
+            Some("AccountNotFound"),
+            None,
+            Some(&request),
+            Some(&diagnostics),
+        );
+
+        assert_eq!(
+            attribution.category.as_deref(),
+            Some("all_candidates_nonfatal_but_sim_failed")
+        );
+        assert_eq!(
+            attribution.narrowing_status.as_deref(),
+            Some("all_candidates_nonfatal_but_sim_failed")
+        );
+        assert!(attribution.narrowed_candidates.is_empty());
+        assert_eq!(attribution.excluded_candidates.len(), 3);
     }
 
     #[test]
@@ -14773,6 +15236,7 @@ mod tests {
                 instruction_index: Some(0),
                 account_index: Some(1),
                 required: true,
+                ..Default::default()
             }],
             ..p37_shadow_probe_account_set_diagnostics_from_request(&request)
         };

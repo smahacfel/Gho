@@ -748,6 +748,199 @@ lifecycle_log_path = "../../logs/shadow_run/r15-probe/probe_lifecycle.jsonl"
             report["probe_readiness"]["reasons"],
         )
 
+    def test_probe_account_not_found_narrowing_counts_are_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "configs/rollout/r16-r5.toml"
+            config.parent.mkdir(parents=True)
+            config.write_text(
+                """
+[oracle]
+decision_log_path = "../../logs/rollout/r16-r5/decisions"
+
+[p37_shadow_probe]
+selection_log_path = "../../logs/shadow_run/r16-r5/probe_selected.jsonl"
+skip_log_path = "../../logs/shadow_run/r16-r5/probe_skipped.jsonl"
+transport_log_path = "../../logs/shadow_run/r16-r5/probe_transport.jsonl"
+entry_log_path = "../../logs/shadow_run/r16-r5/probe_entries.jsonl"
+lifecycle_log_path = "../../logs/shadow_run/r16-r5/probe_lifecycle.jsonl"
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            decision_base = {
+                "candidate_id": "pool_mint_1000",
+                "pool_id": "pool",
+                "base_mint": "mint",
+                "v3_replay_payload_schema_version": 1,
+                "v3_policy_config_hash": "policy-hash",
+            }
+            decisions = [
+                {
+                    **decision_base,
+                    "ab_record_id": f"source-ab-{idx}",
+                    "v3_feature_snapshot_hash": f"feature-hash-{idx}",
+                }
+                for idx in range(1, 4)
+            ]
+            probe_base = {
+                "candidate_id": "pool_mint_1000",
+                "pool_id": "pool",
+                "base_mint": "mint",
+                "dispatch_source": "counterfactual_shadow_probe",
+                "collection_plane": "counterfactual_shadow_probe",
+                "probe_plane": "p37_shadow_probe",
+                "probe_bucket": "v3_pending_wait_sample",
+                "probe_amount_source": "fixed_lamports",
+                "v3_policy_config_hash": "policy-hash",
+                "execution_outcome": "counterfactual_shadow_probe_simulation_error",
+                "simulation_error_kind": "AccountNotFound",
+                "account_set_match": True,
+            }
+            exact = {
+                **probe_base,
+                "ab_record_id": "source-ab-1",
+                "source_ab_record_id": "source-ab-1",
+                "probe_id": "probe-exact",
+                "v3_feature_snapshot_hash": "feature-hash-1",
+                "simulation_error_category": "simulation_account_not_found_attributed",
+                "simulation_error_account_role": "bonding_curve_v2",
+                "simulation_error_account_pubkey": "bc-v2",
+                "simulation_error_account_narrowing_status": "exact_after_narrowing",
+                "simulation_error_account_candidates_raw": [
+                    {
+                        "pubkey": "payer",
+                        "role": "payer_pubkey",
+                        "source": "payer",
+                        "candidate_class": "ephemeral_payer_nonfatal",
+                        "candidate_fatality": "non_fatal",
+                        "candidate_exclusion_reason": "ephemeral_payer_not_rpc_required",
+                    },
+                    {
+                        "pubkey": "ata",
+                        "role": "user_ata",
+                        "source": "user_ata",
+                        "candidate_class": "idempotent_creatable_user_ata",
+                        "candidate_fatality": "non_fatal",
+                        "candidate_exclusion_reason": "idempotent_ata_create_attached",
+                    },
+                    {
+                        "pubkey": "bc-v2",
+                        "role": "bonding_curve_v2",
+                        "source": "route_builder",
+                        "candidate_class": "strict_execution_account",
+                        "candidate_fatality": "fatal",
+                    },
+                ],
+                "simulation_error_account_candidates_narrowed": [
+                    {
+                        "pubkey": "bc-v2",
+                        "role": "bonding_curve_v2",
+                        "source": "route_builder",
+                        "candidate_class": "strict_execution_account",
+                        "candidate_fatality": "fatal",
+                    }
+                ],
+                "simulation_error_account_candidates_excluded": [
+                    {
+                        "pubkey": "payer",
+                        "role": "payer_pubkey",
+                        "source": "payer",
+                        "candidate_class": "ephemeral_payer_nonfatal",
+                        "candidate_fatality": "non_fatal",
+                        "candidate_exclusion_reason": "ephemeral_payer_not_rpc_required",
+                    },
+                    {
+                        "pubkey": "ata",
+                        "role": "user_ata",
+                        "source": "user_ata",
+                        "candidate_class": "idempotent_creatable_user_ata",
+                        "candidate_fatality": "non_fatal",
+                        "candidate_exclusion_reason": "idempotent_ata_create_attached",
+                    },
+                ],
+            }
+            multi = {
+                **probe_base,
+                "ab_record_id": "source-ab-2",
+                "source_ab_record_id": "source-ab-2",
+                "probe_id": "probe-multi",
+                "v3_feature_snapshot_hash": "feature-hash-2",
+                "simulation_error_category": "simulation_account_not_found_multi_candidate_narrow",
+                "simulation_error_account_narrowing_status": "multi_candidate_narrowed",
+                "simulation_error_account_candidates_narrowed": [
+                    {"pubkey": "bc-v2", "role": "bonding_curve_v2", "candidate_class": "strict_execution_account"},
+                    {"pubkey": "uva", "role": "user_volume_accumulator", "candidate_class": "route_specific_required_account"},
+                ],
+            }
+            all_nonfatal = {
+                **probe_base,
+                "ab_record_id": "source-ab-3",
+                "source_ab_record_id": "source-ab-3",
+                "probe_id": "probe-nonfatal",
+                "v3_feature_snapshot_hash": "feature-hash-3",
+                "simulation_error_category": "all_candidates_nonfatal_but_sim_failed",
+                "simulation_error_account_narrowing_status": "all_candidates_nonfatal_but_sim_failed",
+                "simulation_error_account_candidates_excluded": [
+                    {
+                        "pubkey": "uva",
+                        "role": "user_volume_accumulator",
+                        "candidate_class": "creatable_or_optional_route_pda",
+                        "candidate_exclusion_reason": "route_user_volume_accumulator_not_precheck_required",
+                    }
+                ],
+            }
+            write_jsonl(
+                root / "logs/rollout/r16-r5/decisions/gatekeeper_v2_decisions.jsonl",
+                decisions,
+            )
+            rows = [exact, multi, all_nonfatal]
+            write_jsonl(root / "logs/shadow_run/r16-r5/probe_selected.jsonl", rows)
+            write_jsonl(root / "logs/shadow_run/r16-r5/probe_transport.jsonl", rows)
+            write_jsonl(root / "logs/shadow_run/r16-r5/probe_entries.jsonl", rows)
+
+            report = audit.build_report(config)
+
+        materialization = report["probe_entry_materialization"]
+        self.assertEqual(materialization["account_not_found_rows"], 3)
+        self.assertEqual(materialization["exact_after_narrowing_rows"], 1)
+        self.assertEqual(materialization["multi_candidate_narrowed_rows"], 1)
+        self.assertEqual(materialization["all_candidates_nonfatal_but_sim_failed_rows"], 1)
+        self.assertEqual(
+            materialization["account_not_found_candidate_raw_counts"]["payer_pubkey"],
+            1,
+        )
+        self.assertEqual(
+            materialization["account_not_found_candidate_narrowed_counts"]["bonding_curve_v2"],
+            2,
+        )
+        self.assertEqual(
+            materialization["candidate_exclusion_reason_counts"][
+                "ephemeral_payer_not_rpc_required"
+            ],
+            1,
+        )
+        self.assertEqual(
+            materialization["candidate_exclusion_reason_counts"][
+                "idempotent_ata_create_attached"
+            ],
+            1,
+        )
+        self.assertEqual(
+            materialization["simulation_error_account_narrowing_status_counts"][
+                "multi_candidate_narrowed"
+            ],
+            1,
+        )
+        self.assertIn(
+            "multi_candidate_narrowed_requires_explicit_acceptance",
+            report["probe_readiness"]["reasons"],
+        )
+        self.assertIn(
+            "all_candidates_nonfatal_but_sim_failed_requires_rpc_visibility_review",
+            report["probe_readiness"]["reasons"],
+        )
+
     def test_probe_transport_entry_without_decision_v3_join_is_not_ready(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

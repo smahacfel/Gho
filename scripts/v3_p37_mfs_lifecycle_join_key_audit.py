@@ -56,6 +56,11 @@ FIELD_GROUPS = {
     "simulation_error_account_role": ("simulation_error_account_role",),
     "simulation_error_account_source": ("simulation_error_account_source",),
     "simulation_error_account_candidates": ("simulation_error_account_candidates",),
+    "simulation_error_account_candidates_raw": ("simulation_error_account_candidates_raw",),
+    "simulation_error_account_candidates_narrowed": ("simulation_error_account_candidates_narrowed",),
+    "simulation_error_account_candidates_excluded": ("simulation_error_account_candidates_excluded",),
+    "simulation_error_account_narrowing_status": ("simulation_error_account_narrowing_status",),
+    "simulation_error_account_narrowing_reason": ("simulation_error_account_narrowing_reason",),
     "precheck_account_set_hash": ("precheck_account_set_hash",),
     "prepared_request_account_set_hash": ("prepared_request_account_set_hash",),
     "simulation_account_set_hash": ("simulation_account_set_hash",),
@@ -80,6 +85,7 @@ COUNTER_FIELD_GROUPS = (
     "simulation_error_kind",
     "simulation_error_account_role",
     "simulation_error_account_source",
+    "simulation_error_account_narrowing_status",
     "account_set_match",
     "probe_entry_materialization_status",
     "probe_lifecycle_eligibility_status",
@@ -484,6 +490,14 @@ def is_account_not_found_row(row: dict[str, Any]) -> bool:
     )
 
 
+def iter_account_candidates(row: dict[str, Any], field: str) -> Iterable[dict[str, Any]]:
+    value = row.get(field)
+    if isinstance(value, list):
+        for item in value:
+            if isinstance(item, dict):
+                yield item
+
+
 def is_simulation_error_entry(row: dict[str, Any]) -> bool:
     status = row_string(row, "probe_entry_materialization_status")
     execution_outcome = row_string(row, "execution_outcome")
@@ -574,6 +588,11 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
     simulation_error_account_role_counts: Counter[str] = Counter()
     simulation_error_account_source_counts: Counter[str] = Counter()
     simulation_error_category_counts: Counter[str] = Counter()
+    simulation_error_account_narrowing_status_counts: Counter[str] = Counter()
+    account_not_found_candidate_raw_counts: Counter[str] = Counter()
+    account_not_found_candidate_narrowed_counts: Counter[str] = Counter()
+    candidate_class_counts: Counter[str] = Counter()
+    candidate_exclusion_reason_counts: Counter[str] = Counter()
     account_set_match_counts: Counter[str] = Counter()
     account_set_mismatch_reason_counts: Counter[str] = Counter()
     rows: list[dict[str, Any]] = []
@@ -596,6 +615,10 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
         simulation_error_account_role = row_string(row, "simulation_error_account_role")
         simulation_error_account_source = row_string(row, "simulation_error_account_source")
         simulation_error_custom_code = row_string(row, "simulation_error_custom_code")
+        simulation_error_account_narrowing_status = row_string(
+            row,
+            "simulation_error_account_narrowing_status",
+        )
         account_set_match = row_bool_string(row, "account_set_match")
         account_set_mismatch_reason = row_string(row, "account_set_mismatch_reason")
         if creator_vault_authority_status:
@@ -616,6 +639,39 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
             simulation_error_account_source_counts[simulation_error_account_source] += 1
         if simulation_error_custom_code:
             simulation_error_custom_code_counts[f"custom_{simulation_error_custom_code}"] += 1
+        if simulation_error_account_narrowing_status:
+            simulation_error_account_narrowing_status_counts[
+                simulation_error_account_narrowing_status
+            ] += 1
+        raw_candidates = iter_account_candidates(row, "simulation_error_account_candidates_raw")
+        narrowed_candidates = iter_account_candidates(
+            row,
+            "simulation_error_account_candidates_narrowed",
+        )
+        excluded_candidates = iter_account_candidates(
+            row,
+            "simulation_error_account_candidates_excluded",
+        )
+        for candidate in raw_candidates:
+            role = candidate.get("role")
+            if role:
+                account_not_found_candidate_raw_counts[str(role)] += 1
+            candidate_class = candidate.get("candidate_class")
+            if candidate_class:
+                candidate_class_counts[str(candidate_class)] += 1
+        if not raw_candidates:
+            for candidate in narrowed_candidates + excluded_candidates:
+                candidate_class = candidate.get("candidate_class")
+                if candidate_class:
+                    candidate_class_counts[str(candidate_class)] += 1
+        for candidate in narrowed_candidates:
+            role = candidate.get("role")
+            if role:
+                account_not_found_candidate_narrowed_counts[str(role)] += 1
+        for candidate in excluded_candidates:
+            exclusion_reason = candidate.get("candidate_exclusion_reason")
+            if exclusion_reason:
+                candidate_exclusion_reason_counts[str(exclusion_reason)] += 1
         if account_set_match:
             account_set_match_counts[account_set_match] += 1
         if account_set_mismatch_reason:
@@ -640,6 +696,22 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
                 "simulation_error_account_role": simulation_error_account_role,
                 "simulation_error_account_source": simulation_error_account_source,
                 "simulation_error_account_candidates": row.get("simulation_error_account_candidates"),
+                "simulation_error_account_candidates_raw": row.get(
+                    "simulation_error_account_candidates_raw"
+                ),
+                "simulation_error_account_candidates_narrowed": row.get(
+                    "simulation_error_account_candidates_narrowed"
+                ),
+                "simulation_error_account_candidates_excluded": row.get(
+                    "simulation_error_account_candidates_excluded"
+                ),
+                "simulation_error_account_narrowing_status": (
+                    simulation_error_account_narrowing_status
+                ),
+                "simulation_error_account_narrowing_reason": row_string(
+                    row,
+                    "simulation_error_account_narrowing_reason",
+                ),
                 "simulation_error_actual_account_pubkey": row_string(
                     row,
                     "simulation_error_actual_account_pubkey",
@@ -715,13 +787,44 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
         row
         for row in account_not_found_rows
         if row_string(row, "simulation_error_category")
-        == "simulation_account_not_found_multi_candidate"
+        in {
+            "simulation_account_not_found_multi_candidate",
+            "simulation_account_not_found_multi_candidate_narrow",
+        }
+    ]
+    exact_after_narrowing_rows = [
+        row
+        for row in account_not_found_rows
+        if row_string(row, "simulation_error_account_narrowing_status")
+        == "exact_after_narrowing"
+    ]
+    multi_candidate_narrowed_rows = [
+        row
+        for row in account_not_found_rows
+        if row_string(row, "simulation_error_account_narrowing_status")
+        == "multi_candidate_narrowed"
+        or row_string(row, "simulation_error_category")
+        == "simulation_account_not_found_multi_candidate_narrow"
+    ]
+    unattributed_after_narrowing_rows = [
+        row
+        for row in account_not_found_rows
+        if row_string(row, "simulation_error_account_narrowing_status")
+        == "unattributed_after_narrowing"
+    ]
+    all_candidates_nonfatal_but_sim_failed_rows = [
+        row
+        for row in account_not_found_rows
+        if row_string(row, "simulation_error_account_narrowing_status")
+        == "all_candidates_nonfatal_but_sim_failed"
+        or row_string(row, "simulation_error_category") == "all_candidates_nonfatal_but_sim_failed"
     ]
     account_not_found_unattributed_rows = [
         row
         for row in account_not_found_rows
-        if row_string(row, "simulation_error_category")
-        == "simulation_account_not_found_unattributed"
+        if row_string(row, "simulation_error_category") == "simulation_account_not_found_unattributed"
+        or row_string(row, "simulation_error_account_narrowing_status")
+        == "unattributed_after_narrowing"
     ]
     simulation_rpc_visibility_gap_rows = [
         row
@@ -777,6 +880,19 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
         "simulation_error_account_source_counts": dict(
             sorted(simulation_error_account_source_counts.items())
         ),
+        "simulation_error_account_narrowing_status_counts": dict(
+            sorted(simulation_error_account_narrowing_status_counts.items())
+        ),
+        "account_not_found_candidate_raw_counts": dict(
+            sorted(account_not_found_candidate_raw_counts.items())
+        ),
+        "account_not_found_candidate_narrowed_counts": dict(
+            sorted(account_not_found_candidate_narrowed_counts.items())
+        ),
+        "candidate_class_counts": dict(sorted(candidate_class_counts.items())),
+        "candidate_exclusion_reason_counts": dict(
+            sorted(candidate_exclusion_reason_counts.items())
+        ),
         "simulation_error_custom_code_counts": dict(
             sorted(simulation_error_custom_code_counts.items())
         ),
@@ -806,6 +922,12 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
         "account_not_found_attributed_rows": len(account_not_found_attributed_rows),
         "account_not_found_multi_candidate_rows": len(account_not_found_multi_candidate_rows),
         "account_not_found_unattributed_rows": len(account_not_found_unattributed_rows),
+        "exact_after_narrowing_rows": len(exact_after_narrowing_rows),
+        "multi_candidate_narrowed_rows": len(multi_candidate_narrowed_rows),
+        "unattributed_after_narrowing_rows": len(unattributed_after_narrowing_rows),
+        "all_candidates_nonfatal_but_sim_failed_rows": len(
+            all_candidates_nonfatal_but_sim_failed_rows
+        ),
         "simulation_rpc_visibility_gap_rows": len(simulation_rpc_visibility_gap_rows),
         "precheck_simulation_account_set_mismatch_rows": len(
             precheck_simulation_account_set_mismatch_rows
@@ -1024,6 +1146,15 @@ def probe_readiness(report: dict[str, Any]) -> dict[str, Any]:
     if materialization.get("account_not_found_unattributed_rows", 0) > 0:
         status = "not_ready"
         reasons.append("unattributed_account_not_found_blocks_collection")
+    if materialization.get("unattributed_after_narrowing_rows", 0) > 0:
+        status = "not_ready"
+        reasons.append("unattributed_after_narrowing_blocks_collection")
+    if materialization.get("multi_candidate_narrowed_rows", 0) > 0:
+        status = "not_ready"
+        reasons.append("multi_candidate_narrowed_requires_explicit_acceptance")
+    if materialization.get("all_candidates_nonfatal_but_sim_failed_rows", 0) > 0:
+        status = "not_ready"
+        reasons.append("all_candidates_nonfatal_but_sim_failed_requires_rpc_visibility_review")
     if materialization.get("unexplained_account_set_mismatch_rows", 0) > 0:
         status = "not_ready"
         reasons.append("unexplained_precheck_simulation_account_set_mismatch")
@@ -1058,6 +1189,19 @@ def probe_readiness(report: dict[str, Any]) -> dict[str, Any]:
         ),
         "account_not_found_unattributed_rows": materialization.get(
             "account_not_found_unattributed_rows",
+            0,
+        ),
+        "exact_after_narrowing_rows": materialization.get("exact_after_narrowing_rows", 0),
+        "multi_candidate_narrowed_rows": materialization.get(
+            "multi_candidate_narrowed_rows",
+            0,
+        ),
+        "unattributed_after_narrowing_rows": materialization.get(
+            "unattributed_after_narrowing_rows",
+            0,
+        ),
+        "all_candidates_nonfatal_but_sim_failed_rows": materialization.get(
+            "all_candidates_nonfatal_but_sim_failed_rows",
             0,
         ),
         "simulation_rpc_visibility_gap_rows": materialization.get(

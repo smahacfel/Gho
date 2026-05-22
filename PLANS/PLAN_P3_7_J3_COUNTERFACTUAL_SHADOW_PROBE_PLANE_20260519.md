@@ -1494,6 +1494,106 @@ Acceptance:
 Collection, Phase B, P2, live, active policy changes, IWIM changes and threshold
 tuning remain out of scope.
 
+## P3.7-L1R4 / J3N AccountNotFound Candidate Narrowing
+
+### Trigger
+
+R16-r4 proved that AccountNotFound was no longer a blind error:
+
+```text
+account_not_found_unattributed_rows = 0
+account_not_found_multi_candidate_rows = 15
+account_set_match = true for 15/15 probe rows
+```
+
+However, probe execution remained blocked because every probe entry artifact
+was a simulation-error artifact:
+
+```text
+probe_transport_rows = 15
+probe_shadow_entries_rows = 15
+successful_probe_entry_rows = 0
+lifecycle_eligible_entry_rows = 0
+```
+
+The typical raw missing-account candidate set was still too broad:
+
+```text
+payer_pubkey
+user_ata
+user_volume_accumulator
+bonding_curve_v2
+```
+
+### Decision
+
+J3N adds a narrow classification layer on top of the L1R3 manifest lookup. It
+does not change active policy, thresholds, probe amount, slippage, sampling, P2
+or live behavior.
+
+Every AccountNotFound candidate now carries:
+
+```text
+candidate_class
+candidate_fatality
+candidate_exclusion_reason
+```
+
+The transport and entry rows preserve three sets:
+
+```text
+simulation_error_account_candidates_raw
+simulation_error_account_candidates_narrowed
+simulation_error_account_candidates_excluded
+```
+
+and the row-level narrowing verdict:
+
+```text
+simulation_error_account_narrowing_status
+simulation_error_account_narrowing_reason
+```
+
+### Candidate Semantics
+
+The default semantics are fail-closed:
+
+- `bonding_curve_v2` remains `strict_execution_account` / `fatal`.
+- configured `payer_pubkey` remains fatal.
+- `payer_pubkey` in ephemeral payer mode is `ephemeral_payer_nonfatal` and is
+  excluded from the fatal narrowed set.
+- `user_ata` with idempotent ATA create attached is
+  `idempotent_creatable_user_ata` and excluded from the fatal narrowed set.
+- `user_volume_accumulator` is route-aware. A route-builder user-volume PDA is
+  classified as `creatable_or_optional_route_pda`; unknown variants remain in
+  the narrowed set as conditional/unknown.
+
+### Runtime Gate
+
+The next runtime gate is:
+
+```text
+R16-r5 AccountNotFound Candidate Narrowing Smoke
+```
+
+Acceptance:
+
+- strict replay remains OK;
+- exact decision/V3 join remains 100%;
+- identity/hash contract remains PASS;
+- raw, narrowed and excluded candidate sets are populated on AccountNotFound
+  rows;
+- `unattributed_after_narrowing_rows = 0`;
+- payer/user ATA exclusions are explicitly explained;
+- successful probe entries appear, or AccountNotFound narrows to true strict
+  execution blockers;
+- active BUY/live/P2 remain untouched.
+
+If the narrowed set is only `bonding_curve_v2`, the next task is no longer
+attribution. It becomes route/account readiness or RPC visibility for that
+strict account. If the narrowed set still contains `user_volume_accumulator`,
+the next task is route-specific user-volume account semantics.
+
 ## P3.7-L1R3 / J3M Probe Simulation AccountNotFound Attribution Repair
 
 ### Trigger
