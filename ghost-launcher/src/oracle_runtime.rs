@@ -5629,6 +5629,7 @@ fn p37_shadow_probe_artifact_records(
         probe_lifecycle_eligibility_status: Some("not_lifecycle_eligible".to_string()),
         active_shadow_precheck_status: None,
         active_shadow_lifecycle_eligibility_status: None,
+        precheck_failure_reason: None,
         timestamp: format_shadow_entry_timestamp(now_ms),
         pool_id: record.pool_id.clone(),
         mint_id: base_mint,
@@ -6849,6 +6850,19 @@ fn active_shadow_account_diagnostics_from_account_set(
     account_set_diagnostics: Option<&P37ShadowProbeAccountSetDiagnostics>,
     precheck_status: &str,
 ) -> crate::events::ShadowSimulationAccountDiagnostics {
+    let precheck_failure_reason = error_message.as_deref().and_then(|message| {
+        if message.starts_with("execution_account_not_ready:")
+            || message.starts_with("active_shadow_precheck_failed:")
+        {
+            Some(message.to_string())
+        } else {
+            None
+        }
+    });
+    let is_precheck_failure = precheck_failure_reason.is_some();
+    let execution_account_not_ready = precheck_failure_reason
+        .as_deref()
+        .and_then(p37_shadow_probe_parse_execution_account_not_ready);
     let account_pubkey = error_message
         .as_deref()
         .and_then(p37_shadow_probe_error_pubkey);
@@ -6858,11 +6872,20 @@ fn active_shadow_account_diagnostics_from_account_set(
         request,
         account_set_diagnostics,
     );
-    let kind = p37_shadow_probe_error_kind(error_message.as_deref());
-    let account_pubkey = attribution.account_pubkey.clone().or(account_pubkey);
-    let account_role = attribution
-        .account_role
-        .clone()
+    let kind = if is_precheck_failure {
+        None
+    } else {
+        p37_shadow_probe_error_kind(error_message.as_deref())
+    };
+    let account_pubkey = execution_account_not_ready
+        .as_ref()
+        .map(|(_, pubkey)| pubkey.clone())
+        .or_else(|| attribution.account_pubkey.clone())
+        .or(account_pubkey);
+    let account_role = execution_account_not_ready
+        .as_ref()
+        .map(|(role, _)| role.clone())
+        .or_else(|| attribution.account_role.clone())
         .or_else(|| p37_shadow_probe_account_role(account_pubkey.as_deref(), request));
     let account_source = attribution.account_source.clone().or_else(|| {
         account_role
@@ -6870,7 +6893,29 @@ fn active_shadow_account_diagnostics_from_account_set(
             .map(p37_shadow_probe_account_source)
             .map(str::to_string)
     });
-    let category = if kind.as_deref() == Some("AccountNotFound")
+    let precheck_candidate = account_set_diagnostics.and_then(|diagnostics| {
+        account_pubkey.as_ref().and_then(|pubkey| {
+            diagnostics
+                .manifest
+                .iter()
+                .find(|entry| entry.pubkey == *pubkey)
+                .map(p37_shadow_probe_account_not_found_candidate_from_entry)
+        })
+    });
+    let precheck_candidate = precheck_candidate.as_ref().map(|candidate| {
+        p37_shadow_probe_classified_account_not_found_candidate(candidate, request)
+    });
+    let precheck_candidates = precheck_candidate
+        .as_ref()
+        .map(|candidate| vec![candidate.clone()])
+        .unwrap_or_default();
+    let account_index = precheck_candidate
+        .as_ref()
+        .and_then(|candidate| candidate.account_index)
+        .or(attribution.account_index);
+    let category = if is_precheck_failure {
+        Some("active_shadow_precheck_failed".to_string())
+    } else if kind.as_deref() == Some("AccountNotFound")
         && (request.is_none() || account_set_diagnostics.is_none())
     {
         Some("simulation_account_not_found_unattributed".to_string())
@@ -6883,39 +6928,77 @@ fn active_shadow_account_diagnostics_from_account_set(
             }
         })
     };
+    let narrowing_status = if is_precheck_failure && !precheck_candidates.is_empty() {
+        Some("exact_after_narrowing".to_string())
+    } else {
+        attribution.narrowing_status
+    };
+    let narrowing_reason = if let Some(reason) = precheck_failure_reason.as_ref() {
+        Some(format!("active_shadow_precheck_failure:{reason}"))
+    } else {
+        attribution.narrowing_reason
+    };
+    let precheck_status = if is_precheck_failure {
+        "precheck_failed"
+    } else {
+        precheck_status
+    };
 
     crate::events::ShadowSimulationAccountDiagnostics {
         active_shadow_precheck_status: Some(precheck_status.to_string()),
         active_shadow_lifecycle_eligibility_status: Some("not_lifecycle_eligible".to_string()),
+        precheck_failure_reason,
         simulation_error_kind: kind,
         simulation_error_message: error_message,
         simulation_error_account_pubkey: account_pubkey,
         simulation_error_account_role: account_role,
         simulation_error_account_source: account_source,
         simulation_error_instruction_index: None,
-        simulation_error_account_index: attribution.account_index,
-        simulation_error_account_candidates: attribution
-            .candidates
-            .iter()
-            .map(p37_shadow_probe_account_candidate_to_event)
-            .collect(),
-        simulation_error_account_candidates_raw: attribution
-            .raw_candidates
-            .iter()
-            .map(p37_shadow_probe_account_candidate_to_event)
-            .collect(),
-        simulation_error_account_candidates_narrowed: attribution
-            .narrowed_candidates
-            .iter()
-            .map(p37_shadow_probe_account_candidate_to_event)
-            .collect(),
-        simulation_error_account_candidates_excluded: attribution
-            .excluded_candidates
-            .iter()
-            .map(p37_shadow_probe_account_candidate_to_event)
-            .collect(),
-        simulation_error_account_narrowing_status: attribution.narrowing_status,
-        simulation_error_account_narrowing_reason: attribution.narrowing_reason,
+        simulation_error_account_index: account_index,
+        simulation_error_account_candidates: if is_precheck_failure {
+            Vec::new()
+        } else {
+            attribution
+                .candidates
+                .iter()
+                .map(p37_shadow_probe_account_candidate_to_event)
+                .collect()
+        },
+        simulation_error_account_candidates_raw: if is_precheck_failure {
+            precheck_candidates
+                .iter()
+                .map(p37_shadow_probe_account_candidate_to_event)
+                .collect()
+        } else {
+            attribution
+                .raw_candidates
+                .iter()
+                .map(p37_shadow_probe_account_candidate_to_event)
+                .collect()
+        },
+        simulation_error_account_candidates_narrowed: if is_precheck_failure {
+            precheck_candidates
+                .iter()
+                .map(p37_shadow_probe_account_candidate_to_event)
+                .collect()
+        } else {
+            attribution
+                .narrowed_candidates
+                .iter()
+                .map(p37_shadow_probe_account_candidate_to_event)
+                .collect()
+        },
+        simulation_error_account_candidates_excluded: if is_precheck_failure {
+            Vec::new()
+        } else {
+            attribution
+                .excluded_candidates
+                .iter()
+                .map(p37_shadow_probe_account_candidate_to_event)
+                .collect()
+        },
+        simulation_error_account_narrowing_status: narrowing_status,
+        simulation_error_account_narrowing_reason: narrowing_reason,
         simulation_error_category: category,
         precheck_account_set_hash: account_set_diagnostics
             .and_then(|diagnostics| diagnostics.precheck_account_set_hash.clone()),
@@ -10200,6 +10283,37 @@ fn trigger_dispatch_failure_context_with_join_metadata(
     Some(context)
 }
 
+async fn active_shadow_simulation_load_precheck_receipt(
+    trigger_component: &crate::components::trigger::TriggerComponent,
+    request: &crate::components::trigger::PreparedBuyRequest,
+    shadow_only_dispatch: bool,
+) -> Option<crate::components::trigger::TriggerDispatchReceipt> {
+    if !shadow_only_dispatch {
+        return None;
+    }
+
+    let precheck_result = trigger_component
+        .counterfactual_probe_missing_required_account(request)
+        .await;
+    let error = match precheck_result {
+        Ok(Some(missing)) => anyhow::anyhow!(
+            "{}",
+            p37_shadow_probe_execution_account_not_ready_reason(&missing.role, &missing.pubkey)
+        ),
+        Ok(None) => return None,
+        Err(err) => anyhow::anyhow!("active_shadow_precheck_failed:{}", err),
+    };
+
+    Some(crate::components::trigger::TriggerDispatchReceipt {
+        primary_outcome: Err(error),
+        shadow_task: None,
+        active_position_lease: None,
+        retain_position_slot_on_error: false,
+        failed_request: Some(request.clone()),
+        failed_context: None,
+    })
+}
+
 async fn execute_gatekeeper_buy_via_trigger_with_fsc_gate(
     trigger_component: &crate::components::trigger::TriggerComponent,
     fsc_gate_status: Option<FscAuthoritativeBuyGateStatus>,
@@ -10244,6 +10358,15 @@ async fn execute_gatekeeper_buy_via_trigger_with_fsc_gate(
                         } else {
                             prepared_buy
                         };
+                        if let Some(receipt) = active_shadow_simulation_load_precheck_receipt(
+                            trigger_component,
+                            &prepared_buy,
+                            true,
+                        )
+                        .await
+                        {
+                            return receipt;
+                        }
                         trigger_component
                             .dispatch_prepared_buy_shadow_only(prepared_buy)
                             .await
@@ -10328,6 +10451,18 @@ async fn execute_gatekeeper_buy_via_trigger_with_fsc_gate(
                 } else {
                     prepared_buy
                 };
+                if let Some(receipt) = active_shadow_simulation_load_precheck_receipt(
+                    trigger_component,
+                    &prepared_buy,
+                    matches!(
+                        trigger_component.entry_mode(),
+                        crate::config::TriggerEntryMode::ShadowOnly
+                    ),
+                )
+                .await
+                {
+                    return receipt;
+                }
                 trigger_component
                     .dispatch_prepared_buy_with_shadow(prepared_buy)
                     .await
@@ -10641,6 +10776,7 @@ fn shadow_entry_record_from_event(
             .account_diagnostics
             .active_shadow_lifecycle_eligibility_status
             .clone(),
+        precheck_failure_reason: event.account_diagnostics.precheck_failure_reason.clone(),
         timestamp: format_shadow_entry_timestamp(entry_execution_ts_ms),
         pool_id: pool_amm_id.to_string(),
         mint_id: base_mint.to_string(),
@@ -10703,6 +10839,7 @@ fn shadow_entry_record_from_request(
         probe_lifecycle_eligibility_status: None,
         active_shadow_precheck_status: None,
         active_shadow_lifecycle_eligibility_status: None,
+        precheck_failure_reason: None,
         timestamp: format_shadow_entry_timestamp(request.decision_ts_ms),
         pool_id: pool_amm_id.to_string(),
         mint_id: base_mint.to_string(),
@@ -10745,6 +10882,7 @@ fn enrich_active_shadow_entry_with_account_diagnostics(
     entry.active_shadow_lifecycle_eligibility_status = diagnostics
         .active_shadow_lifecycle_eligibility_status
         .clone();
+    entry.precheck_failure_reason = diagnostics.precheck_failure_reason.clone();
     entry.simulation_error_account_pubkey = diagnostics.simulation_error_account_pubkey.clone();
     entry.simulation_error_account_role = diagnostics.simulation_error_account_role.clone();
     entry.simulation_error_account_source = diagnostics.simulation_error_account_source.clone();
@@ -11118,6 +11256,8 @@ struct ShadowEntryRecord {
     active_shadow_precheck_status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     active_shadow_lifecycle_eligibility_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    precheck_failure_reason: Option<String>,
     timestamp: String,
     pool_id: String,
     mint_id: String,
@@ -15378,6 +15518,72 @@ mod tests {
         );
         assert!(active.prepared_request_account_set_hash.is_some());
         assert_eq!(active.account_manifest_available, Some(true));
+    }
+
+    #[test]
+    fn active_shadow_precheck_failure_is_not_runtime_account_not_found() {
+        let request = test_prepared_buy_request();
+        let bonding_curve_v2 = Pubkey::new_unique();
+        let reason = p37_shadow_probe_execution_account_not_ready_reason(
+            "bonding_curve_v2",
+            &bonding_curve_v2,
+        );
+        let bonding_curve_v2_string = bonding_curve_v2.to_string();
+        let mut diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        diagnostics
+            .manifest
+            .push(P37ShadowProbeAccountManifestEntry {
+                pubkey: bonding_curve_v2_string.clone(),
+                role: "bonding_curve_v2".to_string(),
+                source: "route_builder".to_string(),
+                instruction_index: Some(0),
+                account_index: Some(16),
+                is_signer: Some(false),
+                is_writable: Some(false),
+                required: true,
+                owner_expected: None,
+                route_kind: Some("routed_exact_sol_in".to_string()),
+                buy_variant: Some("routed_exact_sol_in".to_string()),
+                token_param_role: Some("min_tokens_out".to_string()),
+            });
+
+        let active = active_shadow_account_diagnostics_from_account_set(
+            Some(reason.clone()),
+            Some(&request),
+            Some(&diagnostics),
+            "not_run_post_simulation_attribution",
+        );
+
+        assert_eq!(
+            active.active_shadow_precheck_status.as_deref(),
+            Some("precheck_failed")
+        );
+        assert_eq!(
+            active.precheck_failure_reason.as_deref(),
+            Some(reason.as_str())
+        );
+        assert_eq!(active.simulation_error_kind, None);
+        assert_eq!(
+            active.simulation_error_category.as_deref(),
+            Some("active_shadow_precheck_failed")
+        );
+        assert_eq!(
+            active.simulation_error_account_role.as_deref(),
+            Some("bonding_curve_v2")
+        );
+        assert_eq!(
+            active.simulation_error_account_pubkey.as_deref(),
+            Some(bonding_curve_v2_string.as_str())
+        );
+        assert_eq!(
+            active.simulation_error_account_narrowing_status.as_deref(),
+            Some("exact_after_narrowing")
+        );
+        assert_eq!(active.simulation_error_account_candidates_narrowed.len(), 1);
+        assert_eq!(
+            active.active_shadow_lifecycle_eligibility_status.as_deref(),
+            Some("not_lifecycle_eligible")
+        );
     }
 
     #[test]

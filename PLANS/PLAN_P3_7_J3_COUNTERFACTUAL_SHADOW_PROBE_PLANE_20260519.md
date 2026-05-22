@@ -1494,6 +1494,64 @@ Acceptance:
 Collection, Phase B, P2, live, active policy changes, IWIM changes and threshold
 tuning remain out of scope.
 
+## P3.7-L1R9 Active Shadow BondingCurveV2 Precheck Contract
+
+### Trigger
+
+P3.7-L1R6 attributed active shadow `AccountNotFound` failures to
+`bonding_curve_v2`. The failure was no longer blind, but active shadow execution
+still reached `simulate_buy` with a transaction account meta that RPC could not
+load.
+
+That is the active-shadow equivalent of the earlier probe-side L1R5 contract
+bug:
+
+```text
+simulation transaction account metas include bonding_curve_v2
+precheck does not fail closed before simulate_buy
+RPC simulation returns AccountNotFound
+```
+
+### Contract
+
+If `bonding_curve_v2` is present in the active shadow prepared transaction
+account metas, it is simulation-load required. A missing
+`bonding_curve_v2` account must therefore become a pre-simulation shadow
+dispatch failure:
+
+```text
+precheck_failure_reason = execution_account_not_ready:bonding_curve_v2:<pubkey>
+active_shadow_lifecycle_eligibility_status = not_lifecycle_eligible
+simulation_error_category = active_shadow_precheck_failed
+```
+
+It must not reach runtime simulation as a post-`simulate_buy`
+`AccountNotFound`.
+
+### R16-r9 Gate
+
+The validation smoke uses a dedicated namespace:
+
+```text
+shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r9-active-shadow-bcv2-precheck
+```
+
+Acceptance:
+
+- strict replay remains `full_replay_ok`;
+- R16 diagnostic quality remains PASS;
+- active shadow `AccountNotFound` unattributed rows remain zero;
+- active shadow `bonding_curve_v2` post-simulation `AccountNotFound` rows are
+  zero;
+- missing `bonding_curve_v2` rows fail closed before simulation;
+- dispatch failures remain `not_lifecycle_eligible`;
+- no active policy, threshold, IWIM, P2/live or Phase B behavior is changed.
+
+If R16-r9 produces only precheck failures and no successful active shadow
+entries, L1R9 is still a valid contract PASS. It means the runtime no longer
+misclassifies missing simulation-load accounts as lifecycle-eligible execution,
+but active shadow execution remains blocked by account readiness/coverage.
+
 ## P3.7-L1R6 — Active Shadow Dispatch AccountNotFound Attribution / Precheck Contract
 
 ### Context

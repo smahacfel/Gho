@@ -1073,6 +1073,43 @@ def active_shadow_dispatch_diagnostics(paths: dict[str, list[Path]]) -> dict[str
         for row in failure_rows
         if row_string(row, "active_shadow_lifecycle_eligibility_status") == "lifecycle_eligible"
     ]
+    precheck_failed_rows = [
+        row
+        for row in failure_rows
+        if row_string(row, "active_shadow_precheck_status") == "precheck_failed"
+        or bool(row_string(row, "precheck_failure_reason"))
+    ]
+    precheck_failed_row_ids = {id(row) for row in precheck_failed_rows}
+    runtime_simulation_error_rows = [
+        row
+        for row in failure_rows
+        if id(row) not in precheck_failed_row_ids
+        and (
+            bool(row_string(row, "simulation_error_kind"))
+            or bool(row_string(row, "simulation_error_category"))
+            or bool(row_string(row, "err"))
+        )
+    ]
+    simulation_required_account_not_in_precheck_rows = [
+        row
+        for row in all_rows
+        if row_string(row, "account_set_mismatch_reason")
+        == "simulation_required_accounts_missing_from_precheck"
+    ]
+    bonding_curve_v2_precheck_skipped_rows = [
+        row
+        for row in precheck_failed_rows
+        if row_string(row, "simulation_error_account_role") == "bonding_curve_v2"
+        or (
+            row_string(row, "precheck_failure_reason") or ""
+        ).startswith("execution_account_not_ready:bonding_curve_v2:")
+    ]
+    bonding_curve_v2_account_not_found_after_simulation_rows = [
+        row
+        for row in account_not_found_rows
+        if id(row) not in precheck_failed_row_ids
+        and row_string(row, "simulation_error_account_role") == "bonding_curve_v2"
+    ]
     successful_entry_rows = [
         row
         for row in entry_rows
@@ -1118,10 +1155,21 @@ def active_shadow_dispatch_diagnostics(paths: dict[str, list[Path]]) -> dict[str
         "active_shadow_entry_rows": len(entry_rows),
         "active_shadow_lifecycle_rows": len(lifecycle_rows),
         "active_shadow_dispatch_failure_rows": len(failure_rows),
+        "active_shadow_precheck_failed_rows": len(precheck_failed_rows),
+        "active_shadow_runtime_simulation_error_rows": len(runtime_simulation_error_rows),
         "active_shadow_successful_entry_rows": len(successful_entry_rows),
         "active_shadow_lifecycle_eligible_rows": len(lifecycle_eligible_rows),
         "active_shadow_lifecycle_eligible_failure_rows": len(
             lifecycle_eligible_failure_rows
+        ),
+        "active_shadow_simulation_required_account_not_in_precheck_count": len(
+            simulation_required_account_not_in_precheck_rows
+        ),
+        "active_shadow_bonding_curve_v2_precheck_skipped_before_simulation_rows": len(
+            bonding_curve_v2_precheck_skipped_rows
+        ),
+        "active_shadow_bonding_curve_v2_account_not_found_after_simulation_rows": len(
+            bonding_curve_v2_account_not_found_after_simulation_rows
         ),
         "active_shadow_account_not_found_rows": len(account_not_found_rows),
         "active_shadow_account_not_found_attributed_rows": len(attributed_rows),
@@ -1295,6 +1343,14 @@ def readiness(report: dict[str, Any]) -> dict[str, Any]:
     if active_shadow.get("active_shadow_lifecycle_eligible_failure_rows", 0) > 0:
         status = "not_ready"
         reasons.append("active_shadow_dispatch_failure_marked_lifecycle_eligible")
+    if (
+        active_shadow.get(
+            "active_shadow_bonding_curve_v2_account_not_found_after_simulation_rows", 0
+        )
+        > 0
+    ):
+        status = "not_ready"
+        reasons.append("active_shadow_bonding_curve_v2_account_not_found_after_simulation")
     if exact_ab_common <= 0:
         status = "degraded" if status != "not_ready" else status
         reasons.append("no_common_ab_record_id_across_nonempty_artifacts")
@@ -1331,6 +1387,22 @@ def readiness(report: dict[str, Any]) -> dict[str, Any]:
         ),
         "active_shadow_dispatch_failure_rows": active_shadow.get(
             "active_shadow_dispatch_failure_rows",
+            0,
+        ),
+        "active_shadow_precheck_failed_rows": active_shadow.get(
+            "active_shadow_precheck_failed_rows",
+            0,
+        ),
+        "active_shadow_runtime_simulation_error_rows": active_shadow.get(
+            "active_shadow_runtime_simulation_error_rows",
+            0,
+        ),
+        "active_shadow_bonding_curve_v2_precheck_skipped_before_simulation_rows": active_shadow.get(
+            "active_shadow_bonding_curve_v2_precheck_skipped_before_simulation_rows",
+            0,
+        ),
+        "active_shadow_bonding_curve_v2_account_not_found_after_simulation_rows": active_shadow.get(
+            "active_shadow_bonding_curve_v2_account_not_found_after_simulation_rows",
             0,
         ),
         "active_shadow_lifecycle_eligible_failure_rows": active_shadow.get(
@@ -1580,9 +1652,14 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- active_shadow_entry_rows: `{active_shadow['active_shadow_entry_rows']}`",
             f"- active_shadow_lifecycle_rows: `{active_shadow['active_shadow_lifecycle_rows']}`",
             f"- active_shadow_dispatch_failure_rows: `{active_shadow['active_shadow_dispatch_failure_rows']}`",
+            f"- active_shadow_precheck_failed_rows: `{active_shadow['active_shadow_precheck_failed_rows']}`",
+            f"- active_shadow_runtime_simulation_error_rows: `{active_shadow['active_shadow_runtime_simulation_error_rows']}`",
             f"- active_shadow_successful_entry_rows: `{active_shadow['active_shadow_successful_entry_rows']}`",
             f"- active_shadow_lifecycle_eligible_rows: `{active_shadow['active_shadow_lifecycle_eligible_rows']}`",
             f"- active_shadow_lifecycle_eligible_failure_rows: `{active_shadow['active_shadow_lifecycle_eligible_failure_rows']}`",
+            f"- active_shadow_simulation_required_account_not_in_precheck_count: `{active_shadow['active_shadow_simulation_required_account_not_in_precheck_count']}`",
+            f"- active_shadow_bonding_curve_v2_precheck_skipped_before_simulation_rows: `{active_shadow['active_shadow_bonding_curve_v2_precheck_skipped_before_simulation_rows']}`",
+            f"- active_shadow_bonding_curve_v2_account_not_found_after_simulation_rows: `{active_shadow['active_shadow_bonding_curve_v2_account_not_found_after_simulation_rows']}`",
             f"- active_shadow_account_not_found_rows: `{active_shadow['active_shadow_account_not_found_rows']}`",
             f"- active_shadow_account_not_found_attributed_rows: `{active_shadow['active_shadow_account_not_found_attributed_rows']}`",
             f"- active_shadow_account_not_found_multi_candidate_rows: `{active_shadow['active_shadow_account_not_found_multi_candidate_rows']}`",
