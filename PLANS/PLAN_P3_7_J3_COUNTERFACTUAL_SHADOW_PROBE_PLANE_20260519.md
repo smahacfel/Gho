@@ -1494,6 +1494,81 @@ Acceptance:
 Collection, Phase B, P2, live, active policy changes, IWIM changes and threshold
 tuning remain out of scope.
 
+## P3.7-L1R5 — BondingCurveV2 Simulation Account Contract Repair
+
+### Context
+
+R16-r5 proved that `AccountNotFound` attribution is no longer blind. All
+counterfactual probe simulation failures narrowed to a single role:
+
+```text
+simulation_error_account_role = bonding_curve_v2
+simulation_error_account_source = route_builder
+simulation_error_instruction_index = 3
+simulation_error_account_index = 16
+```
+
+The runtime contract was inconsistent: `DirectBuyBuilder` kept
+`bonding_curve_v2` in the prepared transaction account metas, while
+`counterfactual_probe_required_account_roles()` excluded the same account from
+required precheck. RPC simulation still has to load account metas, so the
+probe could report `execution_account_readiness_status=ready` and then fail
+with `AccountNotFound`.
+
+### Code-Level Decision
+
+If `bonding_curve_v2` is present in the prepared/simulation transaction account
+metas, it is simulation-load required for counterfactual probe execution.
+
+L1R5 removes the probe-only missing `bonding_curve_v2` precheck bypass. Missing
+`bonding_curve_v2` should now be reported before `simulate_buy` as:
+
+```text
+probe_skipped
+probe_skip_reason = execution_account_not_ready
+precheck_failure_reason = execution_account_not_ready:bonding_curve_v2:<pubkey>
+```
+
+The fix does not change active Gatekeeper policy, thresholds, IWIM, live/P2
+behavior, probe amount, probe slippage, or baseline configs.
+
+### Audit Additions
+
+The join-key audit now reports the transition explicitly:
+
+```text
+simulation_required_account_not_in_precheck_rows
+simulation_account_meta_missing_on_rpc_rows
+bonding_curve_v2_precheck_skipped_before_simulation_rows
+bonding_curve_v2_account_not_found_after_simulation_rows
+skip_execution_account_readiness_role_counts
+```
+
+Collection remains blocked if `bonding_curve_v2` still reaches simulation as an
+`AccountNotFound` row. It is acceptable, and expected, for the next smoke to
+produce mostly `execution_account_not_ready:bonding_curve_v2:<pubkey>` skips if
+the route/account universe is not simulation-ready.
+
+### Runtime Gate
+
+Next gate:
+
+```text
+shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r6-bcv2-contract
+```
+
+Acceptance:
+
+```text
+strict replay = full_replay_ok
+exact decision/V3 join = 100%
+AccountNotFound unattributed = 0
+AccountNotFound narrowed to bonding_curve_v2 = 0
+or bonding_curve_v2 rows are precheck-skipped before simulate_buy
+simulation_error_entry_rows are not lifecycle-eligible
+active BUY / live / P2 untouched
+```
+
 ## P3.7-L1R4 / J3N AccountNotFound Candidate Narrowing
 
 ### Trigger

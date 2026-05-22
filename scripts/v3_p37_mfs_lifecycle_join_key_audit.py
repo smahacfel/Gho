@@ -69,6 +69,8 @@ FIELD_GROUPS = {
     "probe_entry_materialization_status": ("probe_entry_materialization_status",),
     "probe_lifecycle_eligibility_status": ("probe_lifecycle_eligibility_status",),
     "execution_account_readiness_status": ("execution_account_readiness_status",),
+    "execution_account_readiness_role": ("execution_account_readiness_role",),
+    "execution_account_readiness_reason": ("execution_account_readiness_reason",),
     "run_id": ("run_id",),
     "session_id": ("session_id",),
 }
@@ -90,6 +92,7 @@ COUNTER_FIELD_GROUPS = (
     "probe_entry_materialization_status",
     "probe_lifecycle_eligibility_status",
     "execution_account_readiness_status",
+    "execution_account_readiness_role",
 )
 CANONICAL_JOIN_ARTIFACTS = (
     "decision",
@@ -754,6 +757,8 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
         )
 
     skip_reason_counts: Counter[str] = Counter()
+    skip_execution_account_readiness_role_counts: Counter[str] = Counter()
+    skip_execution_account_readiness_reason_counts: Counter[str] = Counter()
     skip_creator_vault_authority_status_counts: Counter[str] = Counter()
     skip_creator_vault_mismatch_reason_counts: Counter[str] = Counter()
     skip_creator_identity_source_counts: Counter[str] = Counter()
@@ -761,6 +766,12 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
         reason = row_string(row, "probe_skip_reason") or row_string(row, "skip_reason")
         if reason:
             skip_reason_counts[reason] += 1
+        execution_account_readiness_role = row_string(row, "execution_account_readiness_role")
+        execution_account_readiness_reason = row_string(row, "execution_account_readiness_reason")
+        if execution_account_readiness_role:
+            skip_execution_account_readiness_role_counts[execution_account_readiness_role] += 1
+        if execution_account_readiness_reason:
+            skip_execution_account_readiness_reason_counts[execution_account_readiness_reason] += 1
         creator_vault_authority_status = row_string(row, "creator_vault_authority_status")
         creator_vault_mismatch_reason = row_string(row, "creator_vault_mismatch_reason")
         creator_identity_source = row_string(row, "creator_identity_source")
@@ -830,6 +841,38 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
         row
         for row in account_not_found_rows
         if row_string(row, "simulation_error_category") == "simulation_rpc_visibility_gap"
+    ]
+    bonding_curve_v2_account_not_found_after_simulation_rows = [
+        row
+        for row in account_not_found_rows
+        if row_string(row, "simulation_error_account_role") == "bonding_curve_v2"
+    ]
+    simulation_required_account_not_in_precheck_rows = [
+        row
+        for row in account_not_found_rows
+        if row_string(row, "simulation_error_category")
+        == "simulation_required_account_not_in_precheck"
+        or (
+            row_string(row, "simulation_error_account_role") == "bonding_curve_v2"
+            and row_bool_string(row, "account_set_match") == "true"
+        )
+    ]
+    simulation_account_meta_missing_on_rpc_rows = [
+        row
+        for row in account_not_found_rows
+        if row_string(row, "simulation_error_category") == "simulation_account_meta_missing_on_rpc"
+        or row_string(row, "simulation_error_account_role") == "bonding_curve_v2"
+    ]
+    bonding_curve_v2_precheck_skipped_before_simulation_rows = [
+        row
+        for row in skip_rows
+        if (
+            row_string(row, "probe_skip_reason") == "execution_account_not_ready"
+            and row_string(row, "execution_account_readiness_role") == "bonding_curve_v2"
+        )
+        or (
+            row_string(row, "precheck_failure_reason") or ""
+        ).startswith("execution_account_not_ready:bonding_curve_v2:")
     ]
     precheck_simulation_account_set_mismatch_rows = [
         row
@@ -901,6 +944,12 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
             sorted(account_set_mismatch_reason_counts.items())
         ),
         "skip_reason_counts": dict(sorted(skip_reason_counts.items())),
+        "skip_execution_account_readiness_role_counts": dict(
+            sorted(skip_execution_account_readiness_role_counts.items())
+        ),
+        "skip_execution_account_readiness_reason_counts": dict(
+            sorted(skip_execution_account_readiness_reason_counts.items())
+        ),
         "skip_creator_vault_authority_status_counts": dict(
             sorted(skip_creator_vault_authority_status_counts.items())
         ),
@@ -929,6 +978,18 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
             all_candidates_nonfatal_but_sim_failed_rows
         ),
         "simulation_rpc_visibility_gap_rows": len(simulation_rpc_visibility_gap_rows),
+        "simulation_required_account_not_in_precheck_rows": len(
+            simulation_required_account_not_in_precheck_rows
+        ),
+        "simulation_account_meta_missing_on_rpc_rows": len(
+            simulation_account_meta_missing_on_rpc_rows
+        ),
+        "bonding_curve_v2_precheck_skipped_before_simulation_rows": len(
+            bonding_curve_v2_precheck_skipped_before_simulation_rows
+        ),
+        "bonding_curve_v2_account_not_found_after_simulation_rows": len(
+            bonding_curve_v2_account_not_found_after_simulation_rows
+        ),
         "precheck_simulation_account_set_mismatch_rows": len(
             precheck_simulation_account_set_mismatch_rows
         ),
@@ -1158,6 +1219,9 @@ def probe_readiness(report: dict[str, Any]) -> dict[str, Any]:
     if materialization.get("unexplained_account_set_mismatch_rows", 0) > 0:
         status = "not_ready"
         reasons.append("unexplained_precheck_simulation_account_set_mismatch")
+    if materialization.get("bonding_curve_v2_account_not_found_after_simulation_rows", 0) > 0:
+        status = "not_ready"
+        reasons.append("bonding_curve_v2_account_not_found_after_simulation")
     if status == "ready_for_probe_transport_entry_join" and quality in {
         "exact_probe_id_and_ab_record_id",
         "exact_ab_record_id",
@@ -1206,6 +1270,22 @@ def probe_readiness(report: dict[str, Any]) -> dict[str, Any]:
         ),
         "simulation_rpc_visibility_gap_rows": materialization.get(
             "simulation_rpc_visibility_gap_rows",
+            0,
+        ),
+        "simulation_required_account_not_in_precheck_rows": materialization.get(
+            "simulation_required_account_not_in_precheck_rows",
+            0,
+        ),
+        "simulation_account_meta_missing_on_rpc_rows": materialization.get(
+            "simulation_account_meta_missing_on_rpc_rows",
+            0,
+        ),
+        "bonding_curve_v2_precheck_skipped_before_simulation_rows": materialization.get(
+            "bonding_curve_v2_precheck_skipped_before_simulation_rows",
+            0,
+        ),
+        "bonding_curve_v2_account_not_found_after_simulation_rows": materialization.get(
+            "bonding_curve_v2_account_not_found_after_simulation_rows",
             0,
         ),
         "precheck_simulation_account_set_mismatch_rows": materialization.get(
@@ -1345,11 +1425,16 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- account_not_found_multi_candidate_rows: `{materialization['account_not_found_multi_candidate_rows']}`",
             f"- account_not_found_unattributed_rows: `{materialization['account_not_found_unattributed_rows']}`",
             f"- simulation_rpc_visibility_gap_rows: `{materialization['simulation_rpc_visibility_gap_rows']}`",
+            f"- simulation_required_account_not_in_precheck_rows: `{materialization['simulation_required_account_not_in_precheck_rows']}`",
+            f"- simulation_account_meta_missing_on_rpc_rows: `{materialization['simulation_account_meta_missing_on_rpc_rows']}`",
+            f"- bonding_curve_v2_precheck_skipped_before_simulation_rows: `{materialization['bonding_curve_v2_precheck_skipped_before_simulation_rows']}`",
+            f"- bonding_curve_v2_account_not_found_after_simulation_rows: `{materialization['bonding_curve_v2_account_not_found_after_simulation_rows']}`",
             f"- precheck_simulation_account_set_mismatch_rows: `{materialization['precheck_simulation_account_set_mismatch_rows']}`",
             f"- successful_probe_entry_rows: `{materialization['successful_probe_entry_rows']}`",
             f"- simulation_error_entry_rows: `{materialization['simulation_error_entry_rows']}`",
             f"- lifecycle_eligible_entry_rows: `{materialization['lifecycle_eligible_entry_rows']}`",
             f"- skip_reason_counts: `{json.dumps(materialization['skip_reason_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- skip_execution_account_readiness_role_counts: `{json.dumps(materialization['skip_execution_account_readiness_role_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- skip_creator_vault_authority_status_counts: `{json.dumps(materialization['skip_creator_vault_authority_status_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- skip_creator_vault_mismatch_reason_counts: `{json.dumps(materialization['skip_creator_vault_mismatch_reason_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- skip_creator_identity_source_counts: `{json.dumps(materialization['skip_creator_identity_source_counts'], ensure_ascii=False, sort_keys=True)}`",

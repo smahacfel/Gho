@@ -4386,26 +4386,6 @@ impl TriggerComponent {
                 .unwrap_or(false)
     }
 
-    fn counterfactual_probe_can_use_missing_bonding_curve_v2(
-        request: &PreparedBuyRequest,
-        pubkey: &Pubkey,
-        role: &str,
-    ) -> bool {
-        role == "bonding_curve_v2"
-            && request
-                .build_profile
-                .as_ref()
-                .map(|profile| {
-                    profile
-                        .buy_instruction
-                        .accounts
-                        .get(16)
-                        .map(|account| account.pubkey == *pubkey)
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false)
-    }
-
     pub(crate) fn counterfactual_probe_buy_instruction_account_role_for(
         request: &PreparedBuyRequest,
         pubkey: &Pubkey,
@@ -4535,10 +4515,6 @@ impl TriggerComponent {
             if Self::counterfactual_probe_can_use_missing_user_volume_accumulator(
                 request, &pubkey, &role,
             ) {
-                return;
-            }
-            if Self::counterfactual_probe_can_use_missing_bonding_curve_v2(request, &pubkey, &role)
-            {
                 return;
             }
             if seen.insert(pubkey) {
@@ -8473,6 +8449,14 @@ mod tests {
                 .map(|account| account.pubkey);
             fee_config_pubkey == Some(*pubkey) && role == "fee_config"
         }));
+        assert!(roles.iter().any(|(pubkey, role)| {
+            let bonding_curve_v2_pubkey = request
+                .build_profile
+                .as_ref()
+                .and_then(|profile| profile.buy_instruction.accounts.get(16))
+                .map(|account| account.pubkey);
+            bonding_curve_v2_pubkey == Some(*pubkey) && role == "bonding_curve_v2"
+        }));
     }
 
     #[test]
@@ -8507,7 +8491,7 @@ mod tests {
     }
 
     #[test]
-    fn p37_counterfactual_probe_required_accounts_use_legacy_extended_layout() {
+    fn p37_counterfactual_probe_required_accounts_include_simulation_loaded_bonding_curve_v2() {
         let config = create_test_config();
         let trigger =
             TriggerComponent::new_with_shadow_simulator(config, Arc::new(MockShadowSimulator));
@@ -8573,7 +8557,7 @@ mod tests {
 
         assert!(roles.iter().any(|(_, role)| role == "bonding_curve"));
         assert!(roles.iter().any(|(_, role)| role == "creator_vault"));
-        assert!(!roles.iter().any(|(_, role)| role == "bonding_curve_v2"));
+        assert!(roles.iter().any(|(_, role)| role == "bonding_curve_v2"));
         assert!(roles
             .iter()
             .any(|(_, role)| role == "global_volume_accumulator"));

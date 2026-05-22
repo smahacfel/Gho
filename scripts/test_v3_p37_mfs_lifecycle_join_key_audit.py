@@ -890,12 +890,30 @@ lifecycle_log_path = "../../logs/shadow_run/r16-r5/probe_lifecycle.jsonl"
                     }
                 ],
             }
+            bonding_curve_v2_skip = {
+                **probe_base,
+                "ab_record_id": "source-ab-4",
+                "source_ab_record_id": "source-ab-4",
+                "probe_id": "probe-bcv2-skip",
+                "v3_feature_snapshot_hash": "feature-hash-4",
+                "event_type": "probe_skipped",
+                "probe_skip_reason": "execution_account_not_ready",
+                "precheck_failure_reason": "execution_account_not_ready:bonding_curve_v2:bc-v2",
+                "execution_account_readiness_status": "not_ready",
+                "execution_account_readiness_role": "bonding_curve_v2",
+                "execution_account_readiness_pubkey": "bc-v2",
+                "execution_account_readiness_reason": "execution_account_not_ready:bonding_curve_v2:bc-v2",
+            }
             write_jsonl(
                 root / "logs/rollout/r16-r5/decisions/gatekeeper_v2_decisions.jsonl",
                 decisions,
             )
             rows = [exact, multi, all_nonfatal]
             write_jsonl(root / "logs/shadow_run/r16-r5/probe_selected.jsonl", rows)
+            write_jsonl(
+                root / "logs/shadow_run/r16-r5/probe_skipped.jsonl",
+                [bonding_curve_v2_skip],
+            )
             write_jsonl(root / "logs/shadow_run/r16-r5/probe_transport.jsonl", rows)
             write_jsonl(root / "logs/shadow_run/r16-r5/probe_entries.jsonl", rows)
 
@@ -906,6 +924,20 @@ lifecycle_log_path = "../../logs/shadow_run/r16-r5/probe_lifecycle.jsonl"
         self.assertEqual(materialization["exact_after_narrowing_rows"], 1)
         self.assertEqual(materialization["multi_candidate_narrowed_rows"], 1)
         self.assertEqual(materialization["all_candidates_nonfatal_but_sim_failed_rows"], 1)
+        self.assertEqual(materialization["simulation_required_account_not_in_precheck_rows"], 1)
+        self.assertEqual(materialization["simulation_account_meta_missing_on_rpc_rows"], 1)
+        self.assertEqual(
+            materialization["bonding_curve_v2_account_not_found_after_simulation_rows"],
+            1,
+        )
+        self.assertEqual(
+            materialization["bonding_curve_v2_precheck_skipped_before_simulation_rows"],
+            1,
+        )
+        self.assertEqual(
+            materialization["skip_execution_account_readiness_role_counts"]["bonding_curve_v2"],
+            1,
+        )
         self.assertEqual(
             materialization["account_not_found_candidate_raw_counts"]["payer_pubkey"],
             1,
@@ -938,6 +970,10 @@ lifecycle_log_path = "../../logs/shadow_run/r16-r5/probe_lifecycle.jsonl"
         )
         self.assertIn(
             "all_candidates_nonfatal_but_sim_failed_requires_rpc_visibility_review",
+            report["probe_readiness"]["reasons"],
+        )
+        self.assertIn(
+            "bonding_curve_v2_account_not_found_after_simulation",
             report["probe_readiness"]["reasons"],
         )
 
