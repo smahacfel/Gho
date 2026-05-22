@@ -212,6 +212,34 @@ impl DirectBuyBuilder {
         amount_sol_in: u64,
         min_tokens_out: u64,
     ) -> Instruction {
+        Self::build_buy_ix_with_accounts_and_bonding_curve_v2(
+            payer,
+            mint,
+            token_program,
+            global_config,
+            fee_recipient,
+            creator_pubkey,
+            buy_variant,
+            associated_bonding_curve,
+            None,
+            amount_sol_in,
+            min_tokens_out,
+        )
+    }
+
+    pub fn build_buy_ix_with_accounts_and_bonding_curve_v2(
+        payer: &Pubkey,
+        mint: &Pubkey,
+        token_program: &Pubkey,
+        global_config: Option<Pubkey>,
+        fee_recipient: Option<Pubkey>,
+        creator_pubkey: Option<Pubkey>,
+        buy_variant: Option<PumpfunBuyVariant>,
+        associated_bonding_curve: Option<Pubkey>,
+        bonding_curve_v2_override: Option<Pubkey>,
+        amount_sol_in: u64,
+        min_tokens_out: u64,
+    ) -> Instruction {
         let program_id = Self::pump_program_id();
         let buy_variant = buy_variant.unwrap_or(PumpfunBuyVariant::RoutedExactSolIn);
         let fee_program =
@@ -227,8 +255,8 @@ impl DirectBuyBuilder {
             .unwrap_or_else(Self::canonical_global_config);
         let (bonding_curve, _) =
             Pubkey::find_program_address(&[BONDING_CURVE_SEED, mint.as_ref()], &program_id);
-        let (bonding_curve_v2, _) =
-            Pubkey::find_program_address(&[BONDING_CURVE_V2_SEED, mint.as_ref()], &program_id);
+        let bonding_curve_v2 =
+            bonding_curve_v2_override.unwrap_or_else(|| Self::derive_bonding_curve_v2(mint).0);
         let (event_authority, _) =
             Pubkey::find_program_address(&[EVENT_AUTHORITY_SEED], &program_id);
         let (global_volume_accumulator, _) =
@@ -606,6 +634,35 @@ mod tests {
             47_958_222
         );
         assert_eq!(ix.data.len(), 24);
+    }
+
+    #[test]
+    fn test_build_buy_ix_uses_observed_bonding_curve_v2_override() {
+        let payer = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).expect("valid token program");
+        let observed_bonding_curve_v2 = Pubkey::new_unique();
+
+        let ix = DirectBuyBuilder::build_buy_ix_with_accounts_and_bonding_curve_v2(
+            &payer,
+            &mint,
+            &token_program,
+            None,
+            None,
+            None,
+            Some(PumpfunBuyVariant::RoutedExactSolIn),
+            None,
+            Some(observed_bonding_curve_v2),
+            7_000_000,
+            1,
+        );
+
+        assert_eq!(ix.accounts.len(), 18);
+        assert_eq!(ix.accounts[16].pubkey, observed_bonding_curve_v2);
+        assert_ne!(
+            ix.accounts[16].pubkey,
+            DirectBuyBuilder::derive_bonding_curve_v2(&mint).0
+        );
     }
 
     #[test]

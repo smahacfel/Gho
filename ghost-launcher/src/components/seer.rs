@@ -1798,6 +1798,7 @@ pub fn trade_event_to_pool_transaction(
         associated_bonding_curve: trade
             .associated_bonding_curve
             .map(|value| value.to_string()),
+        bonding_curve_v2: trade.bonding_curve_v2.map(|value| value.to_string()),
         is_mayhem_mode: trade.is_mayhem_mode,
         cu_price_micro_lamports: trade.cu_price_micro_lamports,
         compute_unit_limit: trade.compute_unit_limit,
@@ -1893,6 +1894,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,

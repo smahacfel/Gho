@@ -1288,6 +1288,10 @@ lifecycle_log_path = "../../logs/shadow_run/r16/shadow_lifecycle.jsonl"
             active["active_shadow_builder_required_curve_account_ready_counts"]["false"],
             3,
         )
+        self.assertEqual(active["active_shadow_builder_bcv2_derived_unverified_rows"], 3)
+        self.assertEqual(active["active_shadow_route_excluded_bcv2_missing_rows"], 3)
+        self.assertEqual(active["active_shadow_route_fallback_attempted_rows"], 0)
+        self.assertEqual(active["active_shadow_route_fallback_success_rows"], 0)
         self.assertEqual(active["active_shadow_account_not_found_rows"], 0)
         self.assertEqual(active["active_shadow_lifecycle_eligible_failure_rows"], 0)
         self.assertIn(
@@ -1380,6 +1384,10 @@ lifecycle_log_path = "../../logs/shadow_run/r16-source/probe_lifecycle.jsonl"
             materialization["skip_bonding_curve_v2_authority_status_counts"]["builder_only"],
             1,
         )
+        self.assertEqual(materialization["builder_bcv2_derived_unverified_rows"], 2)
+        self.assertEqual(materialization["route_excluded_bcv2_missing_rows"], 2)
+        self.assertEqual(materialization["route_fallback_attempted_rows"], 0)
+        self.assertEqual(materialization["route_fallback_success_rows"], 0)
         self.assertIn(
             "bonding_curve_v2_source_not_authoritative",
             report["probe_readiness"]["reasons"],
@@ -1388,6 +1396,79 @@ lifecycle_log_path = "../../logs/shadow_run/r16-source/probe_lifecycle.jsonl"
             "bonding_curve_v2_source_not_authoritative_skip",
             report["probe_readiness"]["reasons"],
         )
+
+    def test_l1r13_observed_tx_bonding_curve_v2_counts_as_authoritative(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "configs/rollout/r16-observed.toml"
+            config.parent.mkdir(parents=True)
+            config.write_text(
+                """
+[oracle]
+decision_log_path = "../../logs/rollout/r16-observed/decisions"
+
+[p37_shadow_probe]
+selection_log_path = "../../logs/shadow_run/r16-observed/probe_selected.jsonl"
+transport_log_path = "../../logs/shadow_run/r16-observed/probe_transport.jsonl"
+entry_log_path = "../../logs/shadow_run/r16-observed/probe_entries.jsonl"
+lifecycle_log_path = "../../logs/shadow_run/r16-observed/probe_lifecycle.jsonl"
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            decision = {
+                "candidate_id": "pool_mint_1000",
+                "ab_record_id": "observed-ab",
+                "pool_id": "pool",
+                "base_mint": "mint",
+                "v3_replay_payload_schema_version": 1,
+                "v3_feature_snapshot_hash": "feature-hash",
+                "v3_policy_config_hash": "policy-hash",
+            }
+            transport = {
+                **decision,
+                "source_ab_record_id": "observed-ab",
+                "probe_id": "probe-observed-bcv2",
+                "dispatch_source": "counterfactual_shadow_probe",
+                "collection_plane": "counterfactual_shadow_probe",
+                "probe_plane": "p37_shadow_probe",
+                "probe_bucket": "v3_pending_wait_sample",
+                "probe_amount_source": "fixed_lamports",
+                "execution_outcome": "counterfactual_shadow_probe_dispatched",
+                "bonding_curve_v2_pubkey": "observed-bc-v2",
+                "bonding_curve_v2_source": "observed_tx_account_meta",
+                "bonding_curve_v2_authority_status": "authoritative_observed_tx",
+                "builder_required_curve_account_ready": True,
+            }
+            entry = {
+                **transport,
+                "probe_entry_materialization_status": "entry_materialized",
+                "probe_lifecycle_eligibility_status": "lifecycle_eligible",
+            }
+            write_jsonl(
+                root / "logs/rollout/r16-observed/decisions/gatekeeper_v2_decisions.jsonl",
+                [decision],
+            )
+            write_jsonl(
+                root / "logs/shadow_run/r16-observed/probe_selected.jsonl",
+                [transport],
+            )
+            write_jsonl(
+                root / "logs/shadow_run/r16-observed/probe_transport.jsonl",
+                [transport],
+            )
+            write_jsonl(root / "logs/shadow_run/r16-observed/probe_entries.jsonl", [entry])
+
+            report = audit.build_report(config)
+
+        materialization = report["probe_entry_materialization"]
+        self.assertEqual(
+            materialization["builder_bcv2_authoritative_observed_tx_rows"],
+            1,
+        )
+        self.assertEqual(materialization["builder_bcv2_derived_unverified_rows"], 0)
+        self.assertEqual(materialization["route_excluded_bcv2_missing_rows"], 0)
+        self.assertEqual(materialization["successful_probe_entry_rows"], 1)
 
     def test_active_shadow_data_problem_entry_is_not_successful(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

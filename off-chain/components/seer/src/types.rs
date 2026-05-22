@@ -571,6 +571,13 @@ pub struct TradeEvent {
     #[serde(default)]
     pub associated_bonding_curve: Option<Pubkey>,
 
+    /// Observed route-specific bonding_curve_v2 account from the source instruction.
+    ///
+    /// This is an execution-load account for routed Pump.fun buy builders, not the
+    /// canonical bonding_curve account carried by `pool_amm_id`.
+    #[serde(default)]
+    pub bonding_curve_v2: Option<Pubkey>,
+
     /// PumpPortal internal flag indicating unusual market conditions.
     /// Passed through for future analysis.
     #[serde(default)]

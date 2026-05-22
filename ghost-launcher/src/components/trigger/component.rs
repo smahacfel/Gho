@@ -499,6 +499,7 @@ pub struct BuyAccountOverrides {
     pub creator_pubkey: Option<Pubkey>,
     pub buy_variant: Option<trigger::PumpfunBuyVariant>,
     pub associated_bonding_curve: Option<Pubkey>,
+    pub bonding_curve_v2: Option<Pubkey>,
     pub legacy_buy_curve: Option<BondingCurve>,
 }
 
@@ -2683,7 +2684,7 @@ impl TriggerComponent {
             configured_slippage_bps = self.configured_buy_slippage_bps(),
             "Trigger: resolved buy instruction parameters"
         );
-        let buy_instruction = DirectBuyBuilder::build_buy_ix_with_accounts(
+        let buy_instruction = DirectBuyBuilder::build_buy_ix_with_accounts_and_bonding_curve_v2(
             payer_pubkey,
             mint,
             token_program,
@@ -2692,6 +2693,7 @@ impl TriggerComponent {
             account_overrides.creator_pubkey,
             account_overrides.buy_variant,
             account_overrides.associated_bonding_curve,
+            account_overrides.bonding_curve_v2,
             amount_lamports,
             min_tokens_out,
         );
@@ -4458,6 +4460,11 @@ impl TriggerComponent {
                 return "associated_bonding_curve".to_string();
             }
         }
+        if let Some(value) = request.account_overrides.bonding_curve_v2 {
+            if *pubkey == value {
+                return "bonding_curve_v2".to_string();
+            }
+        }
         if let Some(profile) = request.build_profile.as_ref() {
             if *pubkey == profile.payer_pubkey {
                 return "payer_pubkey".to_string();
@@ -4489,6 +4496,11 @@ impl TriggerComponent {
             if let Some(value) = profile.account_overrides.associated_bonding_curve {
                 if *pubkey == value {
                     return "associated_bonding_curve".to_string();
+                }
+            }
+            if let Some(value) = profile.account_overrides.bonding_curve_v2 {
+                if *pubkey == value {
+                    return "bonding_curve_v2".to_string();
                 }
             }
         }
@@ -4534,6 +4546,9 @@ impl TriggerComponent {
         }
         if let Some(value) = request.account_overrides.associated_bonding_curve {
             push_account(value, "associated_bonding_curve".to_string());
+        }
+        if let Some(value) = request.account_overrides.bonding_curve_v2 {
+            push_account(value, "bonding_curve_v2".to_string());
         }
 
         for pubkey in request.rpc_buy_tx.message.account_keys.iter().copied() {
@@ -6767,6 +6782,56 @@ mod tests {
         assert_eq!(
             u64::from_le_bytes(buy_ix.data[16..24].try_into().unwrap()),
             expected_min_tokens_out
+        );
+    }
+
+    #[test]
+    fn test_build_prepared_buy_request_uses_observed_bonding_curve_v2_override() {
+        let mint = Pubkey::new_unique();
+        let account_state_core = Arc::new(AccountStateReducer::new());
+        seed_canonical_buy_state(&account_state_core, mint);
+        let trigger = TriggerComponent::new_with_position_limit_tracker_and_runtime_state(
+            create_test_config(),
+            PositionLimitTracker::new(1),
+            Arc::new(ShadowLedger::new()),
+            Arc::clone(&account_state_core),
+        );
+        let payer = Keypair::new();
+        let recent_blockhash = Hash::new_unique();
+        let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).expect("valid token program");
+        let observed_bonding_curve_v2 = Pubkey::new_unique();
+        let overrides = BuyAccountOverrides {
+            bonding_curve_v2: Some(observed_bonding_curve_v2),
+            ..valid_buy_account_overrides()
+        };
+        let amount_lamports = trigger
+            .configured_trade_amount_lamports()
+            .expect("configured amount");
+
+        let request = trigger
+            .build_prepared_buy_request(
+                &payer,
+                &mint,
+                &token_program,
+                false,
+                &overrides,
+                amount_lamports,
+                0,
+                recent_blockhash,
+            )
+            .expect("prepared buy request should build with observed bcv2");
+
+        let profile = request
+            .build_profile
+            .as_ref()
+            .expect("prepared request should retain build profile");
+        assert_eq!(
+            profile.buy_instruction.accounts[16].pubkey,
+            observed_bonding_curve_v2
+        );
+        assert_eq!(
+            request.account_overrides.bonding_curve_v2,
+            Some(observed_bonding_curve_v2)
         );
     }
 

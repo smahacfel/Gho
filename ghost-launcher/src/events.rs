@@ -370,6 +370,14 @@ pub struct PoolTransaction {
     #[serde(default)]
     pub associated_bonding_curve: Option<String>,
 
+    /// Observed route-specific bonding_curve_v2 account from the source instruction.
+    ///
+    /// This account is separate from the canonical bonding_curve/pool id and
+    /// must come from transaction account metas or another authoritative route
+    /// source before routed simulation treats it as execution-ready.
+    #[serde(default)]
+    pub bonding_curve_v2: Option<String>,
+
     /// PumpPortal internal flag indicating unusual market conditions.
     /// Passed through for future analysis.
     #[serde(default)]

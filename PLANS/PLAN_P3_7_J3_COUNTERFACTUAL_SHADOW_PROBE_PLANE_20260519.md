@@ -1729,6 +1729,102 @@ L1R12 does not authorize:
 - treating missing `bonding_curve_v2` as success;
 - relying on AccountUpdate absence alone as proof of account non-existence.
 
+## P3.7-L1R13 / J3P Route Builder BCV2 Source Repair / Route Fallback
+
+### Trigger
+
+L1R12 resolved the immediate BCV2 coverage question for the analyzed R16-r9
+sample:
+
+```text
+matrix_rows = 5
+rpc_get_account_status_counts = {"missing": 5}
+matrix_classifications = {"builder_bcv2_missing_on_rpc": 5}
+diag_seen_exact_builder_bcv2_rows = 0
+diag_seen_other_curve_for_mint_rows = 5
+mfs_contains_builder_bcv2_pubkey_rows = 0
+recommended_next_path = route_builder_source_repair_or_route_fallback
+```
+
+The builder-provided `bonding_curve_v2` was not merely absent from DIAG/MFS; it
+was missing from current RPC preflight. Therefore a route builder must not treat
+a locally-derived, builder-only BCV2 PDA as executable evidence for
+`routed_exact_sol_in`.
+
+### Contract
+
+L1R13 introduces an authoritative route-account source path for
+`bonding_curve_v2`:
+
+- Seer captures `bonding_curve_v2` from observed Pump.fun buy transaction account
+  metas at the route-specific account index.
+- `PoolTransaction` carries that observed account identity additively.
+- `BuyAccountOverrides` can pass the observed BCV2 into prepared buy request
+  construction.
+- `DirectBuyBuilder` uses an optional observed BCV2 override at account meta
+  index 16; if absent, legacy behavior remains unchanged.
+- Probe/active diagnostics classify `observed_tx_account_meta` as
+  `authoritative_observed_tx`.
+- Builder-only or derived-unverified BCV2 remains non-authoritative and must
+  fail closed before simulation under the L1R11/L1R12 source-readiness contract.
+
+This is not a threshold or policy change. It is a route-account identity repair:
+when a real observed route account set exists, the builder can use it instead of
+guessing a missing PDA.
+
+### Audit Surface
+
+The join-key audit now reports L1R13-specific route-source counters:
+
+```text
+builder_bcv2_authoritative_observed_tx_rows
+builder_bcv2_authoritative_mfs_rows
+builder_bcv2_derived_unverified_rows
+route_excluded_bcv2_missing_rows
+route_fallback_attempted_rows
+route_fallback_success_rows
+no_executable_route_account_set_rows
+account_not_found_after_simulation_rows
+```
+
+Active-shadow equivalents are emitted under the
+`active_shadow_*` prefix. Runtime rows predating these fields remain parsable.
+
+### Non-Goals
+
+L1R13 does not:
+
+- change Gatekeeper policy;
+- change PDD/prosperity/HHI thresholds;
+- change IWIM;
+- promote V3 to active policy;
+- enable Phase B, P2, collection, or live execution;
+- remove `bonding_curve_v2` from transaction metas without route proof;
+- treat a missing builder-only BCV2 as success.
+
+### Next Gate
+
+After code-level validation, the next runtime gate is a small R16 route-source
+smoke only if fresh runtime evidence is needed:
+
+```text
+R16-r10 Route Builder BCV2 Source Smoke
+```
+
+Accepted outcomes:
+
+- `PASS-A`: observed `bonding_curve_v2` is carried from tx metas into the buy
+  builder and produces successful probe/active-shadow entries.
+- `PASS-B`: missing/non-authoritative BCV2 rows fail closed as
+  `bonding_curve_v2_source_not_authoritative` or
+  `no_executable_route_account_set`, with no post-simulation AccountNotFound.
+- `PASS-C`: no observed authoritative BCV2 appears, but audit counters prove
+  fail-closed route exclusion instead of builder-only simulation.
+
+If L1R13 does not produce executable entries, the next engineering decision is
+route fallback/exclusion for this route class, not L2 ablation or threshold
+tuning.
+
 ## P3.7-L1R9 Active Shadow BondingCurveV2 Precheck Contract
 
 ### Trigger

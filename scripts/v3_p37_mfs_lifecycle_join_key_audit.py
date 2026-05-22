@@ -593,6 +593,7 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
     bonding_curve_v2_mismatch_reason_counts: Counter[str] = Counter()
     bonding_curve_v2_source_counts: Counter[str] = Counter()
     builder_required_curve_account_ready_counts: Counter[str] = Counter()
+    route_fallback_status_counts: Counter[str] = Counter()
     amount_guard_status_counts: Counter[str] = Counter()
     simulation_error_custom_code_counts: Counter[str] = Counter()
     simulation_error_kind_counts: Counter[str] = Counter()
@@ -627,6 +628,11 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
             row,
             "builder_required_curve_account_ready",
         )
+        route_fallback_status = (
+            row_string(row, "route_fallback_status")
+            or row_string(row, "fallback_route_status")
+            or row_bool_string(row, "route_fallback_attempted")
+        )
         amount_guard_status = row_string(row, "amount_guard_status")
         simulation_error_category = row_string(row, "simulation_error_category")
         simulation_error_kind = row_string(row, "simulation_error_kind")
@@ -653,6 +659,8 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
             bonding_curve_v2_source_counts[bonding_curve_v2_source] += 1
         if builder_required_curve_account_ready:
             builder_required_curve_account_ready_counts[builder_required_curve_account_ready] += 1
+        if route_fallback_status:
+            route_fallback_status_counts[route_fallback_status] += 1
         if amount_guard_status:
             amount_guard_status_counts[amount_guard_status] += 1
         if simulation_error_category:
@@ -804,6 +812,7 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
     skip_bonding_curve_v2_authority_status_counts: Counter[str] = Counter()
     skip_bonding_curve_v2_mismatch_reason_counts: Counter[str] = Counter()
     skip_bonding_curve_v2_source_counts: Counter[str] = Counter()
+    skip_route_fallback_status_counts: Counter[str] = Counter()
     for row in skip_rows:
         reason = row_string(row, "probe_skip_reason") or row_string(row, "skip_reason")
         if reason:
@@ -820,6 +829,11 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
         bonding_curve_v2_authority_status = row_string(row, "bonding_curve_v2_authority_status")
         bonding_curve_v2_mismatch_reason = row_string(row, "bonding_curve_v2_mismatch_reason")
         bonding_curve_v2_source = row_string(row, "bonding_curve_v2_source")
+        route_fallback_status = (
+            row_string(row, "route_fallback_status")
+            or row_string(row, "fallback_route_status")
+            or row_bool_string(row, "route_fallback_attempted")
+        )
         if creator_vault_authority_status:
             skip_creator_vault_authority_status_counts[creator_vault_authority_status] += 1
         if creator_vault_mismatch_reason:
@@ -832,6 +846,8 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
             skip_bonding_curve_v2_mismatch_reason_counts[bonding_curve_v2_mismatch_reason] += 1
         if bonding_curve_v2_source:
             skip_bonding_curve_v2_source_counts[bonding_curve_v2_source] += 1
+        if route_fallback_status:
+            skip_route_fallback_status_counts[route_fallback_status] += 1
 
     transport_rows_total = len(transport_rows)
     entry_rows_total = len(entry_rows)
@@ -925,6 +941,44 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
             row_string(row, "precheck_failure_reason") or ""
         ).startswith("execution_account_not_ready:bonding_curve_v2:")
     ]
+    route_excluded_bcv2_missing_rows = [
+        row
+        for row in skip_rows + transport_rows
+        if (
+            row_string(row, "probe_skip_reason")
+            in {
+                "bonding_curve_v2_source_not_authoritative",
+                "route_account_source_not_authoritative",
+                "no_executable_route_account_set",
+            }
+        )
+        or "bonding_curve_v2_source_not_authoritative"
+        in (row_string(row, "precheck_failure_reason") or "")
+        or row_string(row, "bonding_curve_v2_authority_status")
+        in {"builder_only", "derived_unverified"}
+    ]
+    route_fallback_attempted_rows = [
+        row
+        for row in skip_rows + transport_rows
+        if row_bool_string(row, "route_fallback_attempted") == "true"
+        or bool(row_string(row, "route_fallback_status"))
+        or bool(row_string(row, "fallback_route_status"))
+    ]
+    route_fallback_success_rows = [
+        row
+        for row in route_fallback_attempted_rows
+        if row_string(row, "route_fallback_status") in {"success", "fallback_success"}
+        or row_string(row, "fallback_route_status") in {"success", "fallback_success"}
+        or row_string(row, "fallback_route") in {"legacy_buy", "LegacyBuy"}
+    ]
+    no_executable_route_account_set_rows = [
+        row
+        for row in skip_rows + transport_rows
+        if row_string(row, "probe_skip_reason") == "no_executable_route_account_set"
+        or row_string(row, "execution_outcome") == "no_executable_route_account_set"
+        or "no_executable_route_account_set"
+        in (row_string(row, "precheck_failure_reason") or "")
+    ]
     precheck_simulation_account_set_mismatch_rows = [
         row
         for row in transport_rows
@@ -972,9 +1026,27 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
             sorted(bonding_curve_v2_mismatch_reason_counts.items())
         ),
         "bonding_curve_v2_source_counts": dict(sorted(bonding_curve_v2_source_counts.items())),
+        "builder_bcv2_authoritative_observed_tx_rows": (
+            bonding_curve_v2_authority_status_counts.get("authoritative_observed_tx", 0)
+            + skip_bonding_curve_v2_authority_status_counts.get(
+                "authoritative_observed_tx",
+                0,
+            )
+        ),
+        "builder_bcv2_authoritative_mfs_rows": (
+            bonding_curve_v2_authority_status_counts.get("authoritative_mfs", 0)
+            + skip_bonding_curve_v2_authority_status_counts.get("authoritative_mfs", 0)
+        ),
+        "builder_bcv2_derived_unverified_rows": (
+            bonding_curve_v2_authority_status_counts.get("derived_unverified", 0)
+            + bonding_curve_v2_authority_status_counts.get("builder_only", 0)
+            + skip_bonding_curve_v2_authority_status_counts.get("derived_unverified", 0)
+            + skip_bonding_curve_v2_authority_status_counts.get("builder_only", 0)
+        ),
         "builder_required_curve_account_ready_counts": dict(
             sorted(builder_required_curve_account_ready_counts.items())
         ),
+        "route_fallback_status_counts": dict(sorted(route_fallback_status_counts.items())),
         "amount_guard_status_counts": dict(sorted(amount_guard_status_counts.items())),
         "simulation_error_category_counts": dict(sorted(simulation_error_category_counts.items())),
         "simulation_error_kind_counts": dict(sorted(simulation_error_kind_counts.items())),
@@ -1029,6 +1101,9 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
         "skip_bonding_curve_v2_source_counts": dict(
             sorted(skip_bonding_curve_v2_source_counts.items())
         ),
+        "skip_route_fallback_status_counts": dict(
+            sorted(skip_route_fallback_status_counts.items())
+        ),
         "entry_materialized_rows": status_counts.get("entry_materialized", 0),
         "transport_only_missing_token_quantity_rows": status_counts.get(
             "transport_only_missing_token_quantity",
@@ -1054,6 +1129,11 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
         "simulation_account_meta_missing_on_rpc_rows": len(
             simulation_account_meta_missing_on_rpc_rows
         ),
+        "account_not_found_after_simulation_rows": len(account_not_found_rows),
+        "route_excluded_bcv2_missing_rows": len(route_excluded_bcv2_missing_rows),
+        "route_fallback_attempted_rows": len(route_fallback_attempted_rows),
+        "route_fallback_success_rows": len(route_fallback_success_rows),
+        "no_executable_route_account_set_rows": len(no_executable_route_account_set_rows),
         "bonding_curve_v2_precheck_skipped_before_simulation_rows": len(
             bonding_curve_v2_precheck_skipped_before_simulation_rows
         ),
@@ -1198,6 +1278,7 @@ def active_shadow_dispatch_diagnostics(paths: dict[str, list[Path]]) -> dict[str
     bonding_curve_v2_mismatch_reason_counts: Counter[str] = Counter()
     bonding_curve_v2_source_counts: Counter[str] = Counter()
     builder_required_curve_account_ready_counts: Counter[str] = Counter()
+    route_fallback_status_counts: Counter[str] = Counter()
     for row in failure_rows:
         if role := row_string(row, "simulation_error_account_role"):
             role_counts[role] += 1
@@ -1219,6 +1300,13 @@ def active_shadow_dispatch_diagnostics(paths: dict[str, list[Path]]) -> dict[str
             bonding_curve_v2_source_counts[source] += 1
         if ready := row_bool_string(row, "builder_required_curve_account_ready"):
             builder_required_curve_account_ready_counts[ready] += 1
+        route_fallback_status = (
+            row_string(row, "route_fallback_status")
+            or row_string(row, "fallback_route_status")
+            or row_bool_string(row, "route_fallback_attempted")
+        )
+        if route_fallback_status:
+            route_fallback_status_counts[route_fallback_status] += 1
         for candidate in iter_account_candidates(row, "simulation_error_account_candidates_raw"):
             role = candidate.get("role")
             if role:
@@ -1227,6 +1315,42 @@ def active_shadow_dispatch_diagnostics(paths: dict[str, list[Path]]) -> dict[str
             role = candidate.get("role")
             if role:
                 candidate_narrowed_counts[str(role)] += 1
+
+    route_excluded_bcv2_missing_rows = [
+        row
+        for row in failure_rows
+        if row_string(row, "active_shadow_precheck_status") == "precheck_failed"
+        and (
+            row_string(row, "simulation_error_account_role") == "bonding_curve_v2"
+            or row_string(row, "bonding_curve_v2_authority_status")
+            in {"builder_only", "derived_unverified"}
+            or "bonding_curve_v2_source_not_authoritative"
+            in (row_string(row, "precheck_failure_reason") or "")
+            or "no_executable_route_account_set"
+            in (row_string(row, "precheck_failure_reason") or "")
+        )
+    ]
+    route_fallback_attempted_rows = [
+        row
+        for row in failure_rows
+        if row_bool_string(row, "route_fallback_attempted") == "true"
+        or bool(row_string(row, "route_fallback_status"))
+        or bool(row_string(row, "fallback_route_status"))
+    ]
+    route_fallback_success_rows = [
+        row
+        for row in route_fallback_attempted_rows
+        if row_string(row, "route_fallback_status") in {"success", "fallback_success"}
+        or row_string(row, "fallback_route_status") in {"success", "fallback_success"}
+        or row_string(row, "fallback_route") in {"legacy_buy", "LegacyBuy"}
+    ]
+    no_executable_route_account_set_rows = [
+        row
+        for row in failure_rows
+        if row_string(row, "execution_outcome") == "no_executable_route_account_set"
+        or "no_executable_route_account_set"
+        in (row_string(row, "precheck_failure_reason") or "")
+    ]
 
     return {
         "active_shadow_transport_rows": len(transport_rows),
@@ -1277,9 +1401,31 @@ def active_shadow_dispatch_diagnostics(paths: dict[str, list[Path]]) -> dict[str
         "active_shadow_bonding_curve_v2_source_counts": dict(
             sorted(bonding_curve_v2_source_counts.items())
         ),
+        "active_shadow_builder_bcv2_authoritative_observed_tx_rows": (
+            bonding_curve_v2_authority_status_counts.get("authoritative_observed_tx", 0)
+        ),
+        "active_shadow_builder_bcv2_authoritative_mfs_rows": (
+            bonding_curve_v2_authority_status_counts.get("authoritative_mfs", 0)
+        ),
+        "active_shadow_builder_bcv2_derived_unverified_rows": (
+            bonding_curve_v2_authority_status_counts.get("derived_unverified", 0)
+            + bonding_curve_v2_authority_status_counts.get("builder_only", 0)
+        ),
         "active_shadow_builder_required_curve_account_ready_counts": dict(
             sorted(builder_required_curve_account_ready_counts.items())
         ),
+        "active_shadow_route_fallback_status_counts": dict(
+            sorted(route_fallback_status_counts.items())
+        ),
+        "active_shadow_route_excluded_bcv2_missing_rows": len(
+            route_excluded_bcv2_missing_rows
+        ),
+        "active_shadow_route_fallback_attempted_rows": len(route_fallback_attempted_rows),
+        "active_shadow_route_fallback_success_rows": len(route_fallback_success_rows),
+        "active_shadow_no_executable_route_account_set_rows": len(
+            no_executable_route_account_set_rows
+        ),
+        "active_shadow_account_not_found_after_simulation_rows": len(account_not_found_rows),
     }
 
 

@@ -6066,6 +6066,7 @@ fn p37_shadow_probe_account_overrides_present(
         || overrides.creator_pubkey.is_some()
         || overrides.buy_variant.is_some()
         || overrides.associated_bonding_curve.is_some()
+        || overrides.bonding_curve_v2.is_some()
         || overrides.legacy_buy_curve.is_some()
 }
 
@@ -6108,6 +6109,10 @@ fn p37_shadow_probe_derive_legacy_buy_account_overrides(
                 .and_then(|value| Pubkey::try_from(value).ok()),
             buy_variant: Some(trigger::PumpfunBuyVariant::LegacyBuy),
             associated_bonding_curve: Some(associated_bonding_curve),
+            bonding_curve_v2: tx
+                .bonding_curve_v2
+                .as_deref()
+                .and_then(|value| Pubkey::try_from(value).ok()),
             ..Default::default()
         });
     }
@@ -6479,9 +6484,21 @@ fn p37_shadow_probe_account_manifest(
                 );
             let (instruction_index, account_index) =
                 p37_shadow_probe_instruction_account_position(request, account_key_index);
-            let source = p37_shadow_probe_account_source(&role).to_string();
+            let source = if role == "bonding_curve_v2"
+                && request
+                    .account_overrides
+                    .bonding_curve_v2
+                    .is_some_and(|value| value == *pubkey)
+            {
+                "observed_tx_account_meta".to_string()
+            } else {
+                p37_shadow_probe_account_source(&role).to_string()
+            };
             let (source_authority_status, source_mismatch_reason) = if role == "bonding_curve_v2" {
                 match source.as_str() {
+                    "observed_tx_account_meta" => {
+                        (Some("authoritative_observed_tx".to_string()), None)
+                    }
                     "diag_account_update_relay" => {
                         (Some("authoritative_exact_diag".to_string()), None)
                     }
@@ -7551,6 +7568,7 @@ impl P37ShadowProbeBondingCurveV2AuthorityDiagnostics {
             Some("authoritative_exact_diag")
                 | Some("authoritative_mfs")
                 | Some("authoritative_account_state")
+                | Some("authoritative_observed_tx")
         )
     }
 
@@ -7607,6 +7625,14 @@ fn p37_shadow_probe_bonding_curve_v2_authority_from_entry(
             Some(false),
             Some(false),
             Some(true),
+        ),
+        "observed_tx_account_meta" => (
+            "authoritative_observed_tx",
+            None,
+            true,
+            Some(false),
+            Some(false),
+            Some(false),
         ),
         "route_builder" => (
             "builder_only",
@@ -11610,11 +11636,18 @@ fn derive_buy_account_overrides(
                 .as_deref()
                 .and_then(|value| Pubkey::try_from(value).ok());
         }
+        if overrides.bonding_curve_v2.is_none() {
+            overrides.bonding_curve_v2 = tx
+                .bonding_curve_v2
+                .as_deref()
+                .and_then(|value| Pubkey::try_from(value).ok());
+        }
         if overrides.global_config.is_some()
             && overrides.fee_recipient.is_some()
             && overrides.token_program.is_some()
             && overrides.buy_variant.is_some()
             && overrides.associated_bonding_curve.is_some()
+            && overrides.bonding_curve_v2.is_some()
         {
             break;
         }
@@ -15984,6 +16017,30 @@ mod tests {
     }
 
     #[test]
+    fn p37_shadow_probe_bonding_curve_v2_observed_tx_source_is_authoritative() {
+        let bcv2 = Pubkey::new_unique().to_string();
+        let diagnostics = P37ShadowProbeAccountSetDiagnostics {
+            manifest: vec![p37_shadow_probe_test_bcv2_manifest_entry(
+                bcv2.clone(),
+                "observed_tx_account_meta",
+            )],
+            ..Default::default()
+        };
+
+        let authority =
+            p37_shadow_probe_bonding_curve_v2_authority_diagnostics(None, Some(&diagnostics));
+
+        assert_eq!(authority.pubkey.as_deref(), Some(bcv2.as_str()));
+        assert_eq!(
+            authority.authority_status.as_deref(),
+            Some("authoritative_observed_tx")
+        );
+        assert_eq!(authority.bonding_curve_v2_ready, Some(true));
+        assert_eq!(authority.builder_required_curve_account_ready, Some(true));
+        assert!(authority.non_authoritative_reason().is_none());
+    }
+
+    #[test]
     fn p37_shadow_probe_bcv2_source_precheck_skip_records_specific_reason() {
         let (record, _pool, _buy_mint) = p37_shadow_probe_precheck_record_and_pool();
         let bcv2 = Pubkey::new_unique().to_string();
@@ -17477,6 +17534,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -23210,6 +23268,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -23305,6 +23364,7 @@ mod tests {
             token_program: Some(Pubkey::new_unique().to_string()),
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -23361,6 +23421,7 @@ mod tests {
             token_program: Some(expected_token.to_string()),
             buy_variant: Some("routed_exact_sol_in".to_string()),
             associated_bonding_curve: Some(expected_assoc_curve.to_string()),
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -23450,6 +23511,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -23585,6 +23647,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -23656,6 +23719,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -23725,6 +23789,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -23794,6 +23859,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -23863,6 +23929,7 @@ mod tests {
             token_program: None,
             buy_variant: Some("legacy_buy".to_string()),
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -25154,6 +25221,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -25286,6 +25354,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -25509,6 +25578,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -25612,6 +25682,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -25689,6 +25760,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -25780,6 +25852,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -25899,6 +25972,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -25994,6 +26068,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -28090,6 +28165,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -28152,6 +28228,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -28290,6 +28367,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -28367,6 +28445,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -28442,6 +28521,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -28501,6 +28581,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -28566,6 +28647,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -28712,6 +28794,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -28771,6 +28854,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -28976,6 +29060,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -29360,6 +29445,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -30647,6 +30733,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -30763,6 +30850,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -30906,6 +30994,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -31062,6 +31151,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -31144,6 +31234,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,

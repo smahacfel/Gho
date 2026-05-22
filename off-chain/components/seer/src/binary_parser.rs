@@ -111,6 +111,7 @@ const PUMP_IDX_GLOBAL_CONFIG: usize = 0;
 const PUMP_IDX_FEE_RECIPIENT: usize = 1;
 const PUMP_IDX_ASSOCIATED_BONDING_CURVE: usize = 4;
 const PUMP_IDX_TOKEN_PROGRAM: usize = 8;
+const PUMP_IDX_BONDING_CURVE_V2: usize = 16;
 
 // Pump.fun CREATE instruction layout (different from Buy/Sell!):
 //   0=Mint, 1=MintAuthority, 2=BondingCurve, 3=AssocBondingCurve, 4=Global,
@@ -3633,6 +3634,7 @@ impl BinaryParser {
                         token_program,
                         buy_variant: None,
                         associated_bonding_curve: None,
+                        bonding_curve_v2: None,
                         is_mayhem_mode: None,
                         cu_price_micro_lamports: runtime_ctx.cu_price_micro_lamports,
                         compute_unit_limit: runtime_ctx.compute_unit_limit,
@@ -3694,6 +3696,7 @@ impl BinaryParser {
                         token_program: None,
                         buy_variant: None,
                         associated_bonding_curve: None,
+                        bonding_curve_v2: None,
                         is_mayhem_mode: None,
                         cu_price_micro_lamports: runtime_ctx.cu_price_micro_lamports,
                         compute_unit_limit: runtime_ctx.compute_unit_limit,
@@ -3778,6 +3781,7 @@ impl BinaryParser {
                         token_program: None,
                         buy_variant: None,
                         associated_bonding_curve: None,
+                        bonding_curve_v2: None,
                         is_mayhem_mode: None,
                         cu_price_micro_lamports: runtime_ctx.cu_price_micro_lamports,
                         compute_unit_limit: runtime_ctx.compute_unit_limit,
@@ -3853,6 +3857,7 @@ impl BinaryParser {
                         token_program: None,
                         buy_variant: None,
                         associated_bonding_curve: None,
+                        bonding_curve_v2: None,
                         is_mayhem_mode: None,
                         cu_price_micro_lamports: runtime_ctx.cu_price_micro_lamports,
                         compute_unit_limit: runtime_ctx.compute_unit_limit,
@@ -3961,6 +3966,7 @@ impl BinaryParser {
                         token_program: None,
                         buy_variant: None,
                         associated_bonding_curve: None,
+                        bonding_curve_v2: None,
                         is_mayhem_mode: None,
                         cu_price_micro_lamports: runtime_ctx.cu_price_micro_lamports,
                         compute_unit_limit: runtime_ctx.compute_unit_limit,
@@ -4069,6 +4075,7 @@ impl BinaryParser {
                         token_program: None,
                         buy_variant: None,
                         associated_bonding_curve: None,
+                        bonding_curve_v2: None,
                         is_mayhem_mode: None,
                         cu_price_micro_lamports: runtime_ctx.cu_price_micro_lamports,
                         compute_unit_limit: runtime_ctx.compute_unit_limit,
@@ -4207,6 +4214,7 @@ impl BinaryParser {
                 token_program: None,
                 buy_variant: None,
                 associated_bonding_curve: None,
+                bonding_curve_v2: None,
                 is_mayhem_mode: None,
                 cu_price_micro_lamports: runtime_ctx.cu_price_micro_lamports,
                 compute_unit_limit: runtime_ctx.compute_unit_limit,
@@ -5178,6 +5186,9 @@ fn trade_candidate_score(cm_reg: &CurveMintRegistry, trade: &TradeEvent) -> u32 
     if trade.associated_bonding_curve.is_some() {
         score += 10;
     }
+    if trade.bonding_curve_v2.is_some() {
+        score += 10;
+    }
     if trade.mint != Pubkey::default()
         && cm_reg.mint_for_curve_pk(&trade.pool_amm_id) == Some(trade.mint)
     {
@@ -5215,6 +5226,9 @@ fn merge_trade_optional_accounts(target: &mut TradeEvent, source: &TradeEvent) {
     }
     if target.associated_bonding_curve.is_none() {
         target.associated_bonding_curve = source.associated_bonding_curve;
+    }
+    if target.bonding_curve_v2.is_none() {
+        target.bonding_curve_v2 = source.bonding_curve_v2;
     }
     if target.is_mayhem_mode.is_none() {
         target.is_mayhem_mode = source.is_mayhem_mode;
@@ -5458,6 +5472,11 @@ fn fill_trade_from_ix_accounts(
                 .ok()
                 .filter(|value| *value != Pubkey::default());
     }
+    if trade.is_buy && trade.bonding_curve_v2.is_none() {
+        trade.bonding_curve_v2 = Pubkey::from_str(&acs(ix_accounts, PUMP_IDX_BONDING_CURVE_V2))
+            .ok()
+            .filter(|value| *value != Pubkey::default());
+    }
     trade_enrich_complete(trade)
 }
 
@@ -5549,11 +5568,12 @@ fn enrich_trade_optional_accounts_from_source_ix(event: &GeyserEvent, trade: &mu
     }
 
     info!(
-        "ENRICH_RESULT sig={} is_buy={} buy_variant={:?} assoc_bc={:?} fee={:?} token_prog={:?}",
+        "ENRICH_RESULT sig={} is_buy={} buy_variant={:?} assoc_bc={:?} bcv2={:?} fee={:?} token_prog={:?}",
         trade.signature,
         trade.is_buy,
         trade.buy_variant,
         trade.associated_bonding_curve,
+        trade.bonding_curve_v2,
         trade.fee_recipient,
         trade.token_program
     );
@@ -6092,6 +6112,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -9090,6 +9111,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -9136,6 +9158,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -9199,6 +9222,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -9346,6 +9370,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -9465,8 +9490,9 @@ mod tests {
         let fee_recipient = Pubkey::new_unique();
         let token_program = Pubkey::new_unique();
         let associated_bonding_curve = Pubkey::new_unique();
+        let bonding_curve_v2 = Pubkey::new_unique();
 
-        let mut accounts = vec![Pubkey::new_unique(); 12];
+        let mut accounts = vec![Pubkey::new_unique(); 18];
         accounts[PUMP_IDX_GLOBAL_CONFIG] = global_config;
         accounts[PUMP_IDX_FEE_RECIPIENT] = fee_recipient;
         accounts[PUMP_IDX_MINT] = mint;
@@ -9474,12 +9500,13 @@ mod tests {
         accounts[PUMP_IDX_ASSOCIATED_BONDING_CURVE] = associated_bonding_curve;
         accounts[PUMP_IDX_USER] = user;
         accounts[PUMP_IDX_TOKEN_PROGRAM] = token_program;
+        accounts[PUMP_IDX_BONDING_CURVE_V2] = bonding_curve_v2;
 
         let event = make_decoded_tx_event(
             accounts,
             vec![crate::types::RawInstruction {
                 program_id: Pubkey::from_str(PUMP_FUN_PROGRAM_ID).unwrap(),
-                account_indices: (0u8..12u8).collect(),
+                account_indices: (0u8..18u8).collect(),
                 data: trade_data(DISC_BUY, 1_000_000, 50_000_000),
             }],
         );
@@ -9515,6 +9542,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -9540,6 +9568,7 @@ mod tests {
             trade.associated_bonding_curve,
             Some(associated_bonding_curve)
         );
+        assert_eq!(trade.bonding_curve_v2, Some(bonding_curve_v2));
     }
 
     #[test]
@@ -9593,6 +9622,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -9691,6 +9721,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -9799,6 +9830,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -9890,6 +9922,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -9995,6 +10028,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            bonding_curve_v2: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
