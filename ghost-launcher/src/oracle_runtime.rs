@@ -9130,6 +9130,18 @@ async fn execute_gatekeeper_buy_via_trigger(
     .await
 }
 
+fn trigger_dispatch_failure_context_with_join_metadata(
+    trigger_component: &crate::components::trigger::TriggerComponent,
+    tip_lamports: u64,
+    join_metadata: Option<&ExecutionJoinMetadata>,
+) -> Option<crate::components::trigger::TriggerDispatchFailureContext> {
+    let mut context = trigger_component.build_dispatch_failure_context(tip_lamports)?;
+    if let Some(join_metadata) = join_metadata {
+        context.join_metadata = join_metadata.clone();
+    }
+    Some(context)
+}
+
 async fn execute_gatekeeper_buy_via_trigger_with_fsc_gate(
     trigger_component: &crate::components::trigger::TriggerComponent,
     fsc_gate_status: Option<FscAuthoritativeBuyGateStatus>,
@@ -9184,8 +9196,11 @@ async fn execute_gatekeeper_buy_via_trigger_with_fsc_gate(
                         active_position_lease: None,
                         retain_position_slot_on_error: false,
                         failed_request: None,
-                        failed_context: trigger_component
-                            .build_dispatch_failure_context(tip_lamports),
+                        failed_context: trigger_dispatch_failure_context_with_join_metadata(
+                            trigger_component,
+                            tip_lamports,
+                            join_metadata.as_ref(),
+                        ),
                     },
                 };
             }
@@ -9216,7 +9231,11 @@ async fn execute_gatekeeper_buy_via_trigger_with_fsc_gate(
                     active_position_lease: None,
                     retain_position_slot_on_error: false,
                     failed_request: None,
-                    failed_context: trigger_component.build_dispatch_failure_context(tip_lamports),
+                    failed_context: trigger_dispatch_failure_context_with_join_metadata(
+                        trigger_component,
+                        tip_lamports,
+                        join_metadata.as_ref(),
+                    ),
                 };
             }
             _ => {}
@@ -9261,7 +9280,11 @@ async fn execute_gatekeeper_buy_via_trigger_with_fsc_gate(
                 active_position_lease: None,
                 retain_position_slot_on_error: false,
                 failed_request: None,
-                failed_context: trigger_component.build_dispatch_failure_context(tip_lamports),
+                failed_context: trigger_dispatch_failure_context_with_join_metadata(
+                    trigger_component,
+                    tip_lamports,
+                    join_metadata.as_ref(),
+                ),
             },
         },
     }
@@ -21322,6 +21345,52 @@ mod tests {
             }
             other => panic!("expected ShadowBuySimulated, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn shadow_dispatch_failure_context_inherits_execution_join_metadata() {
+        let mut trigger_config = crate::config::TriggerComponentConfig {
+            enabled: true,
+            entry_mode: crate::config::TriggerEntryMode::ShadowOnly,
+            rpc_url: "https://api.devnet.solana.com".to_string(),
+            keypair_path: None,
+            tip_guard: crate::config::TriggerTipGuardConfig::default(),
+            metrics_port: 9091,
+            max_concurrent_positions: 3,
+            max_position_size_sol: 0.1,
+            emergency_floor_sol: 0.05,
+            position_size_buffer_sol: 0.02,
+            slippage_tolerance: 0.20,
+            live_preflight_max_state_age_slots: 10,
+            live_exit_take_profit_pct: 0.02,
+            live_exit_stop_loss_pct: 0.02,
+            shadow_run: crate::config::TriggerShadowRunConfig::default(),
+        };
+        trigger_config.shadow_run.enabled = true;
+        let trigger = crate::components::trigger::TriggerComponent::new_with_shadow_simulator(
+            trigger_config,
+            Arc::new(MockShadowSimulator),
+        );
+        let join_metadata = ExecutionJoinMetadata {
+            ab_record_id: Some("pool:1000:11000:BUY".to_string()),
+            v3_feature_snapshot_hash: Some("feature-hash-r16".to_string()),
+            v3_policy_config_hash: Some("policy-hash-r16".to_string()),
+            decision_plane: Some("legacy_live".to_string()),
+            rollout_namespace: Some(
+                "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r2".to_string(),
+            ),
+            run_id: Some("r16-l1r-r2".to_string()),
+            session_id: Some("session-r16-l1r-r2".to_string()),
+            brain_config_hash: Some("brain-hash-r16".to_string()),
+            ..Default::default()
+        };
+
+        let context =
+            trigger_dispatch_failure_context_with_join_metadata(&trigger, 10, Some(&join_metadata))
+                .expect("failure context");
+
+        assert_eq!(context.join_metadata, join_metadata);
+        assert_eq!(context.tip_lamports, 10);
     }
 
     #[tokio::test]

@@ -1710,6 +1710,140 @@ no root ghost_brain_config.toml edit
 no baseline J4C config edit
 ```
 
+## P3.7-L1R Diagnostic Hydration Repair
+
+### Trigger
+
+R16 standard/soft-PDD r1 produced useful runtime evidence:
+
+```text
+strict replay PASS
+probe lifecycle labels included dirty_good rows
+active shadow BUY lifecycle labels included dirty_good rows
+```
+
+But it was not a valid policy diagnostic PASS because the fields intended to
+explain the reject universe were not hydrated:
+
+```text
+pdd_entry_drift_anchor_coverage_pct = 0.0
+pdd_spike_ratio_quality_coverage_pct = 0.0
+whale_single_max_pct_coverage_pct = 0.0
+r16_artifact_identity_status = FAIL
+single_active_hash_status = FAIL
+```
+
+L1R repairs diagnostic hydration and artifact identity only. It does not change
+policy thresholds and does not start ablation.
+
+### Scope
+
+L1R hydrates materialized PDD diagnostics in the same policy/evaluation path
+used by R16 decision rows:
+
+```text
+pdd_entry_drift_elapsed_ms
+pdd_entry_drift_anchor_price
+pdd_entry_drift_current_price
+pdd_entry_drift_anchor_ts_ms
+pdd_entry_drift_current_ts_ms
+pdd_entry_drift_elapsed_max_pct
+pdd_entry_drift_effective_max_pct
+pdd_entry_drift_threshold_source
+pdd_spike_ratio
+pdd_spike_ratio_quality
+pdd_spike_recent_rate
+pdd_spike_earlier_rate
+pdd_whale_single_max_pct
+```
+
+The materialized path must preserve the same source hierarchy used for PDD
+decisions. It may derive diagnostic anchor price from the materialized current
+price and drift percentage only when both values are finite and positive. If
+anchor/current timestamps or prices are missing, invalid, or unordered, the row
+must be explicitly degraded with a threshold source such as
+`fallback_no_anchor` or `invalid_timestamp_order`; it must not emit NaN, inf, or
+synthetic confidence.
+
+For spike diagnostics, `pdd_spike_ratio_quality` remains explicit:
+
+```text
+ok
+earlier_rate_zero
+insufficient_earlier_window
+insufficient_recent_window
+unavailable
+```
+
+When `earlier_rate = 0`, the ratio is `null` and quality is
+`earlier_rate_zero`; infinite ratios are not serialized.
+
+For whale diagnostics, Path B materialized features do not carry full signer
+volume attribution. L1R therefore emits a decision-time-safe
+`pdd_whale_single_max_pct` from the materialized maximum transaction share of
+total volume. This is a diagnostic proxy for R16 reporting, not a replacement
+for richer signer-level whale attribution.
+
+### Identity Repair
+
+Shadow dispatch failure rows must inherit the same `ExecutionJoinMetadata` as
+the decision/entry path. Even failed active-shadow lifecycle rows must carry:
+
+```text
+run_id
+session_id
+rollout_namespace
+brain_config_hash
+v3_policy_config_hash
+ab_record_id, when available
+```
+
+Success-only stamping is not sufficient; failure rows participate in the R16
+artifact identity contract and must not break single-hash accounting.
+
+### R16-r2 Gate
+
+After code-level L1R repair, rerun the same R16 policy bundle in a fresh
+namespace:
+
+```text
+configs/rollout/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r2.toml
+```
+
+The R16-r2 policy thresholds must match R16-r1. The run validates only
+diagnostic hydration and artifact identity.
+
+L1R runtime acceptance:
+
+```text
+strict replay = full_replay_ok
+diagnostic_quality.status = PASS
+pdd_entry_drift_anchor_coverage_pct >= 95%
+pdd_spike_ratio_quality_coverage_pct >= 95% on spike diagnostic rows
+whale_single_max_pct_coverage_pct >= 95% on whale diagnostic rows
+gatekeeper_first_or_terminal_gate_coverage_pct = 100%
+r16_artifact_identity_status = PASS
+single_active_hash_status = PASS
+custom_2006 classified, not unknown
+active BUY/probe lifecycle labels reported separately
+```
+
+If R16-r2 has diagnostic PASS and still produces `good` or `dirty_good` rows,
+the next step is `P3.7-L2 Policy Axis Ablation`. If diagnostics still fail,
+repair logger/PDD propagation again. If dirty-good disappears, repeat the same
+bounded R16 config once before drawing policy conclusions.
+
+Non-goals remain:
+
+```text
+no ablation
+no Phase B
+no P2/live
+no threshold tuning
+no root ghost_brain_config.toml edit
+no baseline J4C config edit
+```
+
 ## P3.7-J4B Probe Lifecycle Truth Resolution / Runtime Retention
 
 ### Trigger

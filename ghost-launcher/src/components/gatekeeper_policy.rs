@@ -9,7 +9,9 @@ use super::gatekeeper_pdd::{PddDiagnostics, PddHardFail};
 use super::gatekeeper_pdd_sequence::{sequence_signal_availability, PddSequenceSignalKind};
 use ghost_brain::config::GatekeeperV2Config;
 use ghost_brain::oracle::reason_code::GatekeeperReasonCode;
-use ghost_core::checkpoint::{MaterializedFeatureSet, SybilResistanceFeatures, TrendDirection};
+use ghost_core::checkpoint::{
+    MaterializedFeatureSet, SybilResistanceFeatures, TrendDirection, TxSegmentSequence,
+};
 use ghost_core::tx_intelligence::types::{
     CPV_INSUFFICIENT_SIGNERS_REASON, CPV_ROLLING_STATE_UNAVAILABLE_REASON,
     DBIA_INSUFFICIENT_BUYERS_REASON, DBIA_NO_DEV_BUY_REASON,
@@ -617,16 +619,11 @@ pub fn build_assessment_from_features(
     // is available, supplement with spike, ramping, and flash crash signals.
     if let Some(ref seq) = assessment.feature_snapshot.tx_segment_sequence {
         if let Some(ref mut pdd) = assessment.pdd_assessment {
-            let spike = if sequence_signal_availability(PddSequenceSignalKind::Spike, seq, config).0
-            {
-                crate::components::gatekeeper_pdd_sequence::detect_spike_from_segments(
-                    seq,
-                    &config.pdd,
-                )
-                .0
-            } else {
-                false
-            };
+            let spike_available =
+                sequence_signal_availability(PddSequenceSignalKind::Spike, seq, config).0;
+            let spike_diagnostics =
+                materialized_spike_from_segments(seq, &config.pdd, spike_available);
+            let spike = spike_diagnostics.detected;
             let ramping =
                 if sequence_signal_availability(PddSequenceSignalKind::Ramping, seq, config).0 {
                     crate::components::gatekeeper_pdd_sequence::detect_ramping_from_segments(
@@ -649,6 +646,10 @@ pub fn build_assessment_from_features(
                 };
 
             pdd.spike_detected = spike;
+            pdd.spike_ratio = spike_diagnostics.ratio;
+            pdd.spike_ratio_quality = spike_diagnostics.ratio_quality;
+            pdd.spike_recent_rate = spike_diagnostics.recent_rate;
+            pdd.spike_earlier_rate = spike_diagnostics.earlier_rate;
             pdd.ramping_detected = ramping;
             pdd.flash_crash_risk = flash;
 
@@ -752,9 +753,65 @@ fn derive_observation_stage_from_features(
     Some(ObservationStage::Extended)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct MaterializedEntryDriftDiagnostics {
+    drift_pct: Option<f64>,
+    anchor_source: Option<&'static str>,
+    anchor_quality: Option<&'static str>,
+    anchor_price: Option<f64>,
+    current_price: Option<f64>,
+    anchor_ts_ms: Option<u64>,
+    current_ts_ms: Option<u64>,
+    elapsed_ms: Option<u64>,
+    elapsed_max_pct: Option<f64>,
+    effective_max_pct: f64,
+    threshold_source: &'static str,
+}
+
+fn finite_positive(value: f64) -> Option<f64> {
+    (value.is_finite() && value > 0.0).then_some(value)
+}
+
+fn derive_anchor_price_from_current_and_drift(current_price: f64, drift_pct: f64) -> Option<f64> {
+    let denominator = 1.0 + drift_pct / 100.0;
+    if !denominator.is_finite() || denominator <= f64::EPSILON {
+        return None;
+    }
+    finite_positive(current_price / denominator)
+}
+
+fn materialized_current_ts_ms(features: &MaterializedFeatureSet) -> Option<u64> {
+    let anchor_ts_ms = features.curve_readiness.t0_event_ts_ms?;
+    let elapsed_ms = features
+        .curve_readiness
+        .wait_elapsed_ms
+        .filter(|elapsed| *elapsed > 0)
+        .or_else(|| {
+            (features.session_metadata.observation_duration_ms > 0)
+                .then_some(features.session_metadata.observation_duration_ms)
+        })?;
+    Some(anchor_ts_ms.saturating_add(elapsed_ms))
+}
+
 fn derive_entry_drift_from_features(
     features: &MaterializedFeatureSet,
-) -> (Option<f64>, Option<&'static str>, Option<&'static str>) {
+    config: &ghost_brain::config::gatekeeper_v25_config::PumpAndDumpDetectorConfig,
+) -> MaterializedEntryDriftDiagnostics {
+    let static_max_pct = config.entry_drift_max_pct;
+    let mut diagnostics = MaterializedEntryDriftDiagnostics {
+        drift_pct: None,
+        anchor_source: None,
+        anchor_quality: None,
+        anchor_price: None,
+        current_price: finite_positive(features.account_features.price_sol),
+        anchor_ts_ms: features.curve_readiness.t0_event_ts_ms,
+        current_ts_ms: materialized_current_ts_ms(features),
+        elapsed_ms: None,
+        elapsed_max_pct: None,
+        effective_max_pct: static_max_pct,
+        threshold_source: "materialized_static",
+    };
+
     let checkpoint_drift = features
         .checkpoint_features
         .price_change_from_first_checkpoint_pct;
@@ -769,25 +826,160 @@ fn derive_entry_drift_from_features(
         } else {
             "materialized_checkpoint_fallback"
         };
-        return (Some(checkpoint_drift), Some(source), Some(quality));
+        diagnostics.drift_pct = Some(checkpoint_drift);
+        diagnostics.anchor_source = Some(source);
+        diagnostics.anchor_quality = Some(quality);
+    } else {
+        let account_drift = features.account_features.price_change_since_t0_pct;
+        if account_drift > f64::EPSILON {
+            let quality = if features.curve_readiness.curve_data_known {
+                "strong"
+            } else {
+                "weak"
+            };
+            let source = if features.curve_readiness.curve_data_known {
+                "materialized_account_curve"
+            } else {
+                "materialized_account_fallback"
+            };
+            diagnostics.drift_pct = Some(account_drift);
+            diagnostics.anchor_source = Some(source);
+            diagnostics.anchor_quality = Some(quality);
+        }
     }
 
-    let account_drift = features.account_features.price_change_since_t0_pct;
-    if account_drift > f64::EPSILON {
-        let quality = if features.curve_readiness.curve_data_known {
-            "strong"
-        } else {
-            "weak"
-        };
-        let source = if features.curve_readiness.curve_data_known {
-            "materialized_account_curve"
-        } else {
-            "materialized_account_fallback"
-        };
-        return (Some(account_drift), Some(source), Some(quality));
+    if let (Some(current_price), Some(drift_pct)) =
+        (diagnostics.current_price, diagnostics.drift_pct)
+    {
+        diagnostics.anchor_price =
+            derive_anchor_price_from_current_and_drift(current_price, drift_pct);
     }
 
-    (None, None, None)
+    if diagnostics.anchor_price.is_none() || diagnostics.current_price.is_none() {
+        diagnostics.threshold_source = "fallback_no_anchor";
+        return diagnostics;
+    }
+
+    if let (Some(anchor_ts_ms), Some(current_ts_ms)) =
+        (diagnostics.anchor_ts_ms, diagnostics.current_ts_ms)
+    {
+        if current_ts_ms < anchor_ts_ms {
+            diagnostics.threshold_source = "invalid_timestamp_order";
+            return diagnostics;
+        }
+        let elapsed_ms = current_ts_ms - anchor_ts_ms;
+        diagnostics.elapsed_ms = Some(elapsed_ms);
+        if config.entry_drift_elapsed_scaling_enabled {
+            let elapsed_seconds = elapsed_ms as f64 / 1000.0;
+            let elapsed_max_pct = (config.entry_drift_elapsed_base_pct
+                + config.entry_drift_elapsed_slope_pct_per_second * elapsed_seconds)
+                .min(config.entry_drift_elapsed_cap_pct);
+            diagnostics.elapsed_max_pct = Some(elapsed_max_pct);
+            diagnostics.effective_max_pct = elapsed_max_pct;
+            diagnostics.threshold_source = "elapsed_scaled";
+        }
+    } else {
+        diagnostics.threshold_source = "fallback_no_anchor";
+    }
+
+    diagnostics
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MaterializedSpikeDiagnostics {
+    detected: bool,
+    ratio: Option<f64>,
+    ratio_quality: Option<&'static str>,
+    recent_rate: Option<f64>,
+    earlier_rate: Option<f64>,
+}
+
+fn materialized_spike_from_segments(
+    seq: &TxSegmentSequence,
+    config: &ghost_brain::config::gatekeeper_v25_config::PumpAndDumpDetectorConfig,
+    available: bool,
+) -> MaterializedSpikeDiagnostics {
+    if !config.spike_detection_enabled {
+        return MaterializedSpikeDiagnostics {
+            detected: false,
+            ratio: None,
+            ratio_quality: None,
+            recent_rate: None,
+            earlier_rate: None,
+        };
+    }
+
+    if !available {
+        let quality = if seq.t2_segment.tx_count == 0 {
+            "insufficient_recent_window"
+        } else if seq.t0_segment.tx_count == 0 || seq.t1_segment.tx_count == 0 {
+            "insufficient_earlier_window"
+        } else {
+            "unavailable"
+        };
+        return MaterializedSpikeDiagnostics {
+            detected: false,
+            ratio: None,
+            ratio_quality: Some(quality),
+            recent_rate: None,
+            earlier_rate: None,
+        };
+    }
+
+    if seq.t2_segment.tx_count == 0 {
+        return MaterializedSpikeDiagnostics {
+            detected: false,
+            ratio: None,
+            ratio_quality: Some("insufficient_recent_window"),
+            recent_rate: None,
+            earlier_rate: None,
+        };
+    }
+    if seq.t0_segment.tx_count == 0 || seq.t1_segment.tx_count == 0 {
+        return MaterializedSpikeDiagnostics {
+            detected: false,
+            ratio: None,
+            ratio_quality: Some("insufficient_earlier_window"),
+            recent_rate: None,
+            earlier_rate: None,
+        };
+    }
+
+    let t0_rate = seq.t0_segment.total_volume_sol / seq.t0_segment.tx_count as f64;
+    let t1_rate = seq.t1_segment.total_volume_sol / seq.t1_segment.tx_count as f64;
+    let recent_rate = seq.t2_segment.total_volume_sol / seq.t2_segment.tx_count as f64;
+    let earlier_rate = (t0_rate + t1_rate) / 2.0;
+
+    if !recent_rate.is_finite() || !earlier_rate.is_finite() {
+        return MaterializedSpikeDiagnostics {
+            detected: false,
+            ratio: None,
+            ratio_quality: Some("unavailable"),
+            recent_rate: None,
+            earlier_rate: None,
+        };
+    }
+    if earlier_rate <= f64::EPSILON {
+        return MaterializedSpikeDiagnostics {
+            detected: false,
+            ratio: None,
+            ratio_quality: Some("earlier_rate_zero"),
+            recent_rate: Some(recent_rate),
+            earlier_rate: Some(earlier_rate),
+        };
+    }
+
+    let ratio = recent_rate / earlier_rate;
+    let ratio = ratio.is_finite().then_some(ratio);
+    MaterializedSpikeDiagnostics {
+        detected: ratio
+            .map(|ratio| ratio > config.spike_ratio_threshold)
+            .unwrap_or(false),
+        ratio,
+        ratio_quality: Some(if ratio.is_some() { "ok" } else { "unavailable" }),
+        recent_rate: Some(recent_rate),
+        earlier_rate: Some(earlier_rate),
+    }
 }
 
 fn materialize_pdd_diagnostics_from_features(
@@ -803,17 +995,22 @@ fn materialize_pdd_diagnostics_from_features(
         ..PddDiagnostics::not_run()
     };
 
-    let (entry_drift_pct, anchor_source, anchor_quality) =
-        derive_entry_drift_from_features(features);
-    diag.entry_drift_pct = entry_drift_pct;
-    diag.entry_drift_anchor_source = anchor_source;
-    diag.entry_drift_anchor_quality = anchor_quality;
+    let entry_drift = derive_entry_drift_from_features(features, config);
+    diag.entry_drift_pct = entry_drift.drift_pct;
+    diag.entry_drift_anchor_source = entry_drift.anchor_source;
+    diag.entry_drift_anchor_quality = entry_drift.anchor_quality;
+    diag.entry_drift_anchor_price = entry_drift.anchor_price;
+    diag.entry_drift_current_price = entry_drift.current_price;
+    diag.entry_drift_anchor_ts_ms = entry_drift.anchor_ts_ms;
+    diag.entry_drift_current_ts_ms = entry_drift.current_ts_ms;
+    diag.entry_drift_elapsed_ms = entry_drift.elapsed_ms;
     diag.entry_drift_static_max_pct = Some(config.entry_drift_max_pct);
-    diag.entry_drift_effective_max_pct = Some(config.entry_drift_max_pct);
-    diag.entry_drift_threshold_source = Some("materialized_static");
+    diag.entry_drift_elapsed_max_pct = entry_drift.elapsed_max_pct;
+    diag.entry_drift_effective_max_pct = Some(entry_drift.effective_max_pct);
+    diag.entry_drift_threshold_source = Some(entry_drift.threshold_source);
 
-    if let Some(drift_pct) = entry_drift_pct {
-        if drift_pct > config.entry_drift_max_pct {
+    if let Some(drift_pct) = entry_drift.drift_pct {
+        if drift_pct > entry_drift.effective_max_pct {
             diag.hard_fail = Some(PddHardFail::EntryDrift);
             diag.pdd_score = 0.0;
             return diag;
@@ -828,10 +1025,30 @@ fn materialize_pdd_diagnostics_from_features(
     if features.tx_intel_features.tx_count > 0 {
         let whale_top3_pct = features.tx_intel_features.top3_volume_pct * 100.0;
         diag.whale_top3_pct = Some(whale_top3_pct);
+        if features.tx_intel_features.total_volume_sol.is_finite()
+            && features.tx_intel_features.total_volume_sol > f64::EPSILON
+            && features.tx_intel_features.max_tx_sol.is_finite()
+            && features.tx_intel_features.max_tx_sol >= 0.0
+        {
+            // Path B lacks raw signer-volume attribution, so this is the
+            // decision-time-safe materialized single-transaction share proxy.
+            diag.whale_single_max_pct = Some(
+                (features.tx_intel_features.max_tx_sol
+                    / features.tx_intel_features.total_volume_sol)
+                    * 100.0,
+            );
+        }
         if whale_top3_pct > config.whale_top3_max_pct {
             diag.hard_fail = Some(PddHardFail::Whale);
             diag.pdd_score = 0.0;
             return diag;
+        }
+        if let Some(single_max_pct) = diag.whale_single_max_pct {
+            if single_max_pct > config.whale_single_max_pct {
+                diag.hard_fail = Some(PddHardFail::Whale);
+                diag.pdd_score = 0.0;
+                return diag;
+            }
         }
     }
 
@@ -2236,7 +2453,9 @@ fn build_policy_diagnostics(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ghost_core::checkpoint::AlphaFingerprintFeatures;
+    use ghost_core::checkpoint::{
+        AlphaFingerprintFeatures, TrajectorySegmentSnapshot, TxSegmentSequence,
+    };
     use ghost_core::tx_intelligence::types::{
         SFD_PARTIAL_BALANCE_COVERAGE_REASON, SFD_ZERO_PREBALANCE_SKIPPED_REASON,
     };
@@ -2506,6 +2725,122 @@ mod tests {
             "reason must be from specific taxonomy, got: {}",
             v25_reason
         );
+    }
+
+    #[test]
+    fn materialized_pdd_hydrates_entry_drift_spike_and_whale_diagnostics() {
+        let mut config = GatekeeperV2Config::default();
+        config.pdd.enabled = true;
+        config.pdd.entry_drift_elapsed_scaling_enabled = true;
+        config.pdd.entry_drift_elapsed_base_pct = 6.0;
+        config.pdd.entry_drift_elapsed_slope_pct_per_second = 1.8;
+        config.pdd.entry_drift_elapsed_cap_pct = 15.0;
+        config.pdd.entry_drift_max_pct = 15.0;
+        config.pdd.entry_drift_soft_max_pct = 8.0;
+        config.pdd.spike_detection_enabled = true;
+        config.pdd.spike_hard_veto = false;
+        config.pdd.spike_ratio_threshold = 2.0;
+        config.pdd.whale_top3_max_pct = 95.0;
+        config.pdd.whale_single_max_pct = 95.0;
+
+        let mut features = MaterializedFeatureSet::default();
+        features.account_features.price_sol = 1.10;
+        features.account_features.price_change_since_t0_pct = 10.0;
+        features.account_features.current_reserves = (40_000_000_000, 900_000_000);
+        features.account_features.market_cap_sol = 120.0;
+        features.tx_intel_features.tx_count = 12;
+        features.tx_intel_features.total_volume_sol = 20.0;
+        features.tx_intel_features.max_tx_sol = 3.0;
+        features.tx_intel_features.top3_volume_pct = 0.42;
+        features.session_metadata.observation_duration_ms = 3_000;
+        features.curve_readiness.curve_data_known = true;
+        features.curve_readiness.t0_event_ts_ms = Some(10_000);
+        features.curve_readiness.wait_elapsed_ms = Some(3_000);
+        features.tx_segment_sequence = Some(TxSegmentSequence {
+            t0_segment: TrajectorySegmentSnapshot {
+                tx_count: 4,
+                total_volume_sol: 1.0,
+                ..Default::default()
+            },
+            t1_segment: TrajectorySegmentSnapshot {
+                tx_count: 4,
+                total_volume_sol: 1.0,
+                ..Default::default()
+            },
+            t2_segment: TrajectorySegmentSnapshot {
+                tx_count: 4,
+                total_volume_sol: 4.0,
+                ..Default::default()
+            },
+            total_duration_ms: 3_000,
+            min_tx_per_segment_satisfied: true,
+        });
+
+        let assessment =
+            build_assessment_from_features(features, &config, PolicyEvaluationContext::default());
+        let pdd = assessment.pdd_assessment.expect("pdd diagnostics");
+
+        assert_eq!(pdd.entry_drift_pct, Some(10.0));
+        assert_eq!(pdd.entry_drift_anchor_ts_ms, Some(10_000));
+        assert_eq!(pdd.entry_drift_current_ts_ms, Some(13_000));
+        assert_eq!(pdd.entry_drift_elapsed_ms, Some(3_000));
+        assert_eq!(pdd.entry_drift_threshold_source, Some("elapsed_scaled"));
+        assert_eq!(pdd.entry_drift_elapsed_max_pct, Some(11.4));
+        assert_eq!(pdd.entry_drift_effective_max_pct, Some(11.4));
+        assert_eq!(pdd.entry_drift_current_price, Some(1.10));
+        let anchor_price = pdd.entry_drift_anchor_price.expect("anchor price");
+        assert!((anchor_price - 1.0).abs() < 1e-12);
+        assert_eq!(pdd.spike_ratio_quality, Some("ok"));
+        assert_eq!(pdd.spike_recent_rate, Some(1.0));
+        assert_eq!(pdd.spike_earlier_rate, Some(0.25));
+        assert_eq!(pdd.spike_ratio, Some(4.0));
+        assert!(pdd.spike_detected);
+        assert_eq!(pdd.whale_single_max_pct, Some(15.0));
+    }
+
+    #[test]
+    fn materialized_pdd_handles_degraded_anchor_and_spike_inputs_explicitly() {
+        let mut config = GatekeeperV2Config::default();
+        config.pdd.enabled = true;
+        config.pdd.spike_detection_enabled = true;
+
+        let mut features = MaterializedFeatureSet::default();
+        features.account_features.price_sol = f64::NAN;
+        features.account_features.price_change_since_t0_pct = 8.0;
+        features.tx_intel_features.tx_count = 3;
+        features.tx_intel_features.total_volume_sol = 0.0;
+        features.tx_intel_features.max_tx_sol = f64::INFINITY;
+        features.tx_segment_sequence = Some(TxSegmentSequence {
+            t0_segment: TrajectorySegmentSnapshot {
+                tx_count: 0,
+                total_volume_sol: 0.0,
+                ..Default::default()
+            },
+            t1_segment: TrajectorySegmentSnapshot {
+                tx_count: 0,
+                total_volume_sol: 0.0,
+                ..Default::default()
+            },
+            t2_segment: TrajectorySegmentSnapshot {
+                tx_count: 2,
+                total_volume_sol: 1.0,
+                ..Default::default()
+            },
+            total_duration_ms: 3_000,
+            min_tx_per_segment_satisfied: true,
+        });
+
+        let assessment =
+            build_assessment_from_features(features, &config, PolicyEvaluationContext::default());
+        let pdd = assessment.pdd_assessment.expect("pdd diagnostics");
+
+        assert_eq!(pdd.entry_drift_pct, Some(8.0));
+        assert_eq!(pdd.entry_drift_anchor_price, None);
+        assert_eq!(pdd.entry_drift_current_price, None);
+        assert_eq!(pdd.entry_drift_threshold_source, Some("fallback_no_anchor"));
+        assert_eq!(pdd.spike_ratio_quality, Some("insufficient_earlier_window"));
+        assert_eq!(pdd.spike_ratio, None);
+        assert_eq!(pdd.whale_single_max_pct, None);
     }
 
     #[test]
