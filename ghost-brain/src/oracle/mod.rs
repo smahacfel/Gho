@@ -122,8 +122,8 @@ pub use tx_metrics::TransactionMetrics;
 // Re-export Decision Logger types
 pub use decision_logger::{
     CorrectionReason, DecisionLogger, DecisionLoggerConfig, DecisionType, FollowupScore,
-    GatekeeperBuyLog, InitialComponents, OracleDecisionLog, VetoType, DEFAULT_DECISION_LOG_DIR,
-    GATEKEEPER_BUY_LOG_SCHEMA_VERSION, GATEKEEPER_VERSION,
+    GatekeeperBuyLog, GatekeeperGateTraceEntry, InitialComponents, OracleDecisionLog, VetoType,
+    DEFAULT_DECISION_LOG_DIR, GATEKEEPER_BUY_LOG_SCHEMA_VERSION, GATEKEEPER_VERSION,
 };
 
 // Re-export WindowSpec types (A/B Boundary Equalization)

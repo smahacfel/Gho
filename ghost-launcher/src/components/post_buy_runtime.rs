@@ -2254,6 +2254,10 @@ async fn handle_post_buy_event(
                 v3_policy_config_hash: join_metadata.v3_policy_config_hash.clone(),
                 decision_plane: join_metadata.decision_plane.clone(),
                 rollout_namespace: join_metadata.rollout_namespace.clone(),
+                run_id: join_metadata.run_id.clone(),
+                session_id: join_metadata.session_id.clone(),
+                brain_config_path: join_metadata.brain_config_path.clone(),
+                brain_config_hash: join_metadata.brain_config_hash.clone(),
             },
         )
         .await;
@@ -2304,6 +2308,10 @@ async fn handle_post_buy_event(
                 v3_policy_config_hash: join_metadata.v3_policy_config_hash.clone(),
                 decision_plane: join_metadata.decision_plane.clone(),
                 rollout_namespace: join_metadata.rollout_namespace.clone(),
+                run_id: join_metadata.run_id.clone(),
+                session_id: join_metadata.session_id.clone(),
+                brain_config_path: join_metadata.brain_config_path.clone(),
+                brain_config_hash: join_metadata.brain_config_hash.clone(),
             },
         )
         .await;

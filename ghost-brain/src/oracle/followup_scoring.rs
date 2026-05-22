@@ -568,6 +568,10 @@ mod tests {
             gatekeeper_log_dir: temp_dir.path().to_path_buf(),
             gatekeeper_rollout_profile: "test-rollout".to_string(),
             gatekeeper_config_hash: "test-config-hash".to_string(),
+            gatekeeper_run_id: None,
+            gatekeeper_session_id: None,
+            brain_config_path: None,
+            brain_config_hash: None,
             channel_buffer_size: 100,
             enabled: true,
         };
@@ -598,6 +602,10 @@ mod tests {
             gatekeeper_log_dir: temp_dir.path().to_path_buf(),
             gatekeeper_rollout_profile: "test-rollout".to_string(),
             gatekeeper_config_hash: "test-config-hash".to_string(),
+            gatekeeper_run_id: None,
+            gatekeeper_session_id: None,
+            brain_config_path: None,
+            brain_config_hash: None,
             channel_buffer_size: 100,
             enabled: true,
         };

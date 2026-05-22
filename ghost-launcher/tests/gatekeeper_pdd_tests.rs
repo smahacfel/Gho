@@ -174,6 +174,197 @@ fn test_entry_drift_shadow_hard_reject() {
         "Hard fail → score=0"
     );
     assert!(r.entry_drift_pct.unwrap() > 5.0, "Drift must exceed 5%");
+    assert_eq!(r.entry_drift_anchor_ts_ms, Some(1100));
+    assert_eq!(r.entry_drift_current_ts_ms, Some(1700));
+    assert_eq!(r.entry_drift_elapsed_ms, Some(600));
+    assert_eq!(r.entry_drift_threshold_source, Some("static"));
+    assert_eq!(r.entry_drift_effective_max_pct, Some(5.0));
+}
+
+#[test]
+fn test_entry_drift_elapsed_scaled_threshold_uses_same_anchor() {
+    let mut cfg = pdd_test_config();
+    cfg.pdd.entry_drift_elapsed_scaling_enabled = true;
+    cfg.pdd.entry_drift_elapsed_base_pct = 6.0;
+    cfg.pdd.entry_drift_elapsed_slope_pct_per_second = 1.8;
+    cfg.pdd.entry_drift_elapsed_cap_pct = 15.0;
+    let mut buf = GatekeeperBuffer::new(Pubkey::new_unique(), &cfg);
+    buf.set_registered_wall_t0(1000);
+
+    ingest(
+        &mut buf,
+        tx_with_curve("a", 1000, true, 0.5, 1_000_000.0, 1.0, 10.0, true),
+    );
+    ingest(
+        &mut buf,
+        tx_with_curve("b", 6000, true, 0.5, 1_000_000.0, 1.14, 12.0, true),
+    );
+
+    let r = evaluate_pdd(&buf, &cfg.pdd, None);
+    assert_eq!(r.entry_drift_anchor_ts_ms, Some(1000));
+    assert_eq!(r.entry_drift_current_ts_ms, Some(6000));
+    assert_eq!(r.entry_drift_elapsed_ms, Some(5000));
+    assert_eq!(r.entry_drift_threshold_source, Some("elapsed_scaled"));
+    assert_eq!(r.entry_drift_static_max_pct, Some(5.0));
+    assert_eq!(r.entry_drift_elapsed_max_pct, Some(15.0));
+    assert_eq!(r.entry_drift_effective_max_pct, Some(15.0));
+    assert!(
+        r.hard_fail != Some(PddHardFail::EntryDrift),
+        "14% drift should pass elapsed-scaled 15% hard cap"
+    );
+}
+
+#[test]
+fn test_entry_drift_missing_anchor_and_current_are_unavailable() {
+    let cfg = pdd_test_config();
+    let buf = GatekeeperBuffer::new(Pubkey::new_unique(), &cfg);
+
+    let r = evaluate_pdd(&buf, &cfg.pdd, None);
+    assert_eq!(r.entry_drift_anchor_ts_ms, None);
+    assert_eq!(r.entry_drift_current_ts_ms, None);
+    assert_eq!(r.entry_drift_anchor_price, None);
+    assert_eq!(r.entry_drift_current_price, None);
+    assert_eq!(r.entry_drift_elapsed_ms, None);
+    assert_eq!(r.entry_drift_threshold_source, Some("fallback_no_anchor"));
+    assert_ne!(r.hard_fail, Some(PddHardFail::EntryDrift));
+}
+
+#[test]
+fn test_entry_drift_rejects_inverted_timestamps_without_drift() {
+    let cfg = pdd_test_config();
+    let mut buf = GatekeeperBuffer::new(Pubkey::new_unique(), &cfg);
+    buf.set_registered_wall_t0(1000);
+
+    ingest(
+        &mut buf,
+        tx_with_curve("anchor", 3000, true, 0.5, 1_000_000.0, 1.0, 10.0, true),
+    );
+    ingest(
+        &mut buf,
+        tx_with_curve("current", 2000, true, 0.5, 1_000_000.0, 1.2, 12.0, true),
+    );
+
+    let r = evaluate_pdd(&buf, &cfg.pdd, None);
+    assert_eq!(r.entry_drift_anchor_ts_ms, Some(3000));
+    assert_eq!(r.entry_drift_current_ts_ms, Some(2000));
+    assert_eq!(r.entry_drift_elapsed_ms, None);
+    assert_eq!(r.entry_drift_pct, None);
+    assert_eq!(
+        r.entry_drift_threshold_source,
+        Some("invalid_timestamp_order")
+    );
+    assert_ne!(r.hard_fail, Some(PddHardFail::EntryDrift));
+}
+
+#[test]
+fn test_entry_drift_rejects_nonpositive_and_nonfinite_prices() {
+    let mut cfg = pdd_test_config();
+    cfg.pdd.ramping_detection_enabled = false;
+    cfg.pdd.spike_detection_enabled = false;
+    let mut buf = GatekeeperBuffer::new(Pubkey::new_unique(), &cfg);
+    buf.set_registered_wall_t0(1000);
+
+    ingest(
+        &mut buf,
+        tx_with_curve("zero_anchor", 1000, true, 0.5, 1_000_000.0, 0.0, 10.0, true),
+    );
+    ingest(
+        &mut buf,
+        tx_with_curve("nan_anchor", 1100, true, 0.5, f64::NAN, 1.0, 10.0, true),
+    );
+    ingest(
+        &mut buf,
+        tx_with_curve(
+            "inf_anchor",
+            1200,
+            true,
+            0.5,
+            1.0,
+            f64::INFINITY,
+            10.0,
+            true,
+        ),
+    );
+    ingest(
+        &mut buf,
+        tx_with_curve(
+            "valid_anchor",
+            1300,
+            true,
+            0.5,
+            1_000_000.0,
+            1.0,
+            10.0,
+            true,
+        ),
+    );
+    ingest(
+        &mut buf,
+        tx_with_curve(
+            "zero_current",
+            1400,
+            true,
+            0.5,
+            1_000_000.0,
+            0.0,
+            10.0,
+            true,
+        ),
+    );
+
+    let r = evaluate_pdd(&buf, &cfg.pdd, None);
+    assert_eq!(r.entry_drift_current_price, None);
+    assert_eq!(r.entry_drift_current_ts_ms, None);
+    assert_eq!(r.entry_drift_pct, None);
+    assert_eq!(r.entry_drift_threshold_source, Some("fallback_no_anchor"));
+    assert_ne!(r.hard_fail, Some(PddHardFail::EntryDrift));
+}
+
+#[test]
+fn test_entry_drift_skips_invalid_anchor_prices() {
+    let mut cfg = pdd_test_config();
+    cfg.pdd.ramping_detection_enabled = false;
+    cfg.pdd.spike_detection_enabled = false;
+    let mut buf = GatekeeperBuffer::new(Pubkey::new_unique(), &cfg);
+    buf.set_registered_wall_t0(1000);
+
+    ingest(
+        &mut buf,
+        tx_with_curve("zero_anchor", 1000, true, 0.5, 1_000_000.0, 0.0, 10.0, true),
+    );
+    ingest(
+        &mut buf,
+        tx_with_curve(
+            "valid_anchor",
+            1100,
+            true,
+            0.5,
+            1_000_000.0,
+            1.0,
+            10.0,
+            true,
+        ),
+    );
+    ingest(
+        &mut buf,
+        tx_with_curve(
+            "valid_current",
+            1500,
+            true,
+            0.5,
+            1_000_000.0,
+            1.1,
+            11.0,
+            true,
+        ),
+    );
+
+    let r = evaluate_pdd(&buf, &cfg.pdd, None);
+    assert_eq!(r.entry_drift_anchor_ts_ms, Some(1100));
+    assert_eq!(r.entry_drift_current_ts_ms, Some(1500));
+    assert!(r.entry_drift_anchor_price.unwrap_or(0.0) > 0.0);
+    assert!(r.entry_drift_current_price.unwrap_or(0.0) > 0.0);
+    assert!(r.entry_drift_pct.unwrap_or(0.0) > 0.0);
 }
 
 // ───────────────────────────────────────────────────────────────────
@@ -284,10 +475,34 @@ fn test_spike_pattern_detection() {
         r.spike_detected,
         "Volume spike MUST be detected (recent rate >> earlier rate)"
     );
+    assert!(r.spike_ratio.unwrap_or(0.0) > cfg.pdd.spike_ratio_threshold);
+    assert_eq!(r.spike_ratio_quality, Some("ok"));
+    assert!(r.spike_recent_rate.unwrap_or(0.0) > r.spike_earlier_rate.unwrap_or(0.0));
     assert!(
         r.hard_fail.is_some(),
         "Spike with hard_veto=true must hard-fail"
     );
+}
+
+#[test]
+fn test_spike_ratio_quality_handles_zero_earlier_rate() {
+    let cfg = pdd_test_config();
+    let mut buf = GatekeeperBuffer::new(Pubkey::new_unique(), &cfg);
+    buf.set_registered_wall_t0(1000);
+
+    for i in 0..4 {
+        ingest(
+            &mut buf,
+            tx(&format!("recent{}", i), 7000 + i * 300, true, 2.0),
+        );
+    }
+
+    let r = evaluate_pdd(&buf, &cfg.pdd, None);
+    assert_eq!(r.spike_ratio, None);
+    assert_eq!(r.spike_ratio_quality, Some("earlier_rate_zero"));
+    assert_eq!(r.spike_earlier_rate, Some(0.0));
+    assert!(r.spike_recent_rate.unwrap_or(0.0) > 0.0);
+    assert!(!r.spike_detected);
 }
 
 // ───────────────────────────────────────────────────────────────────
@@ -337,6 +552,10 @@ fn test_whale_concentration_shadow_veto() {
 
     let r = evaluate_pdd(&buf, &cfg.pdd, None);
     assert!(r.whale_top3_pct.is_some(), "Whale top3 must be computed");
+    assert!(
+        r.whale_single_max_pct.is_some(),
+        "Whale single max must be computed"
+    );
     let top3 = r.whale_top3_pct.unwrap();
     assert!(
         top3 > cfg.pdd.whale_top3_max_pct,

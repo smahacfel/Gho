@@ -481,6 +481,14 @@ pub struct ExecutionJoinMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollout_namespace: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brain_config_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brain_config_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_decision_log_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_decision_row_offset: Option<u64>,
@@ -504,6 +512,10 @@ impl ExecutionJoinMetadata {
             && self.v3_policy_config_hash.is_none()
             && self.decision_plane.is_none()
             && self.rollout_namespace.is_none()
+            && self.run_id.is_none()
+            && self.session_id.is_none()
+            && self.brain_config_path.is_none()
+            && self.brain_config_hash.is_none()
             && self.source_decision_log_path.is_none()
             && self.source_decision_row_offset.is_none()
             && self.source_decision_row_sha256.is_none()
@@ -1003,6 +1015,10 @@ mod tests {
             v3_policy_config_hash: Some("policy-hash".to_string()),
             decision_plane: Some("legacy_live".to_string()),
             rollout_namespace: Some("r15-smoke".to_string()),
+            run_id: Some("r16-run".to_string()),
+            session_id: Some("r16-session".to_string()),
+            brain_config_path: Some("configs/rollout/brain-r16.toml".to_string()),
+            brain_config_hash: Some("brain-hash".to_string()),
             source_decision_log_path: Some(
                 "logs/decisions/gatekeeper_v2_decisions.jsonl".to_string(),
             ),

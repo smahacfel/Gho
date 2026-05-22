@@ -1727,6 +1727,31 @@ impl GatekeeperV2Config {
                 "P0 invariant violated: [gatekeeper_v2.dow].tick_interval_ms must be > 0 when DOW is enabled"
             );
         }
+        if self.pdd.entry_drift_elapsed_scaling_enabled {
+            for (name, value) in [
+                (
+                    "entry_drift_elapsed_base_pct",
+                    self.pdd.entry_drift_elapsed_base_pct,
+                ),
+                (
+                    "entry_drift_elapsed_slope_pct_per_second",
+                    self.pdd.entry_drift_elapsed_slope_pct_per_second,
+                ),
+                (
+                    "entry_drift_elapsed_cap_pct",
+                    self.pdd.entry_drift_elapsed_cap_pct,
+                ),
+            ] {
+                if !value.is_finite() || value < 0.0 {
+                    anyhow::bail!("gatekeeper_v2.pdd.{name} must be finite and non-negative");
+                }
+            }
+            if self.pdd.entry_drift_elapsed_cap_pct < self.pdd.entry_drift_elapsed_base_pct {
+                anyhow::bail!(
+                    "gatekeeper_v2.pdd.entry_drift_elapsed_cap_pct must be >= entry_drift_elapsed_base_pct"
+                );
+            }
+        }
         Ok(())
     }
 }

@@ -4776,6 +4776,99 @@ enabled = true
     }
 
     #[test]
+    fn test_p37_l1_r16_standard_softpdd_profile_loads_isolated_diagnostic_bundle() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let temp_root = unique_temp_dir("p37_l1_r16_standard_softpdd_profile");
+        let temp_rollout_dir = temp_root.join("configs/rollout");
+        fs::create_dir_all(&temp_rollout_dir).unwrap();
+        for file_name in [
+            "ghost_brain_v3_p37_l1_standard_softpdd.toml",
+            "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1.toml",
+        ] {
+            fs::copy(
+                manifest_dir.join("../configs/rollout").join(file_name),
+                temp_rollout_dir.join(file_name),
+            )
+            .unwrap();
+        }
+        let path = temp_rollout_dir
+            .join("shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1.toml");
+        let config = LauncherConfig::from_file(&path)
+            .unwrap_or_else(|err| panic!("failed to load {}: {err}", path.display()));
+
+        assert_eq!(config.trigger.entry_mode, TriggerEntryMode::ShadowOnly);
+        assert_eq!(config.execution.execution_mode, ExecutionMode::Shadow);
+        assert!(config.trigger.shadow_run.enabled);
+        assert!(config.p37_shadow_probe.enabled);
+        assert_eq!(
+            config.p37_shadow_probe.namespace,
+            "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1"
+        );
+        assert_eq!(
+            config.p37_shadow_probe.run_id,
+            "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1"
+        );
+        assert_eq!(
+            config.p37_shadow_probe.session_id,
+            "r16-standard-softpdd-r1"
+        );
+        assert_eq!(
+            config.p37_shadow_probe.include_verdict_types,
+            vec![
+                "BUY".to_string(),
+                "REJECT".to_string(),
+                "PENDING".to_string()
+            ]
+        );
+        assert!(!config.p37_shadow_probe.exclude_active_buy_rows);
+        assert_eq!(config.p37_shadow_probe.max_probes_per_run, 50);
+        assert_eq!(
+            config.p37_shadow_probe.max_probe_candidates_scanned_per_run,
+            20_000
+        );
+        assert_eq!(config.p37_shadow_probe.max_concurrent, 1);
+        assert!(config
+            .p37_shadow_probe
+            .transport_log_path
+            .contains("r16-standard-softpdd-r1"));
+        assert!(config
+            .oracle
+            .decision_log_path
+            .contains("r16-standard-softpdd-r1"));
+        assert_ne!(
+            config.p37_shadow_probe.entry_log_path,
+            config.execution.shadow.entry_log_path
+        );
+
+        let gatekeeper_v2 = ghost_brain::config::GhostBrainConfig::gatekeeper_v2_from_toml_file(
+            &config.ghost_brain_config_path,
+        )
+        .expect("R16 brain config should parse")
+        .expect("R16 brain config must define [gatekeeper_v2]");
+        assert_eq!(
+            gatekeeper_v2.mode,
+            ghost_brain::config::GatekeeperMode::Standard
+        );
+        assert_eq!(gatekeeper_v2.max_wait_time_ms, 5000);
+        assert!(!gatekeeper_v2.pdd.spike_hard_veto);
+        assert!(!gatekeeper_v2.pdd.ramping_hard_veto);
+        assert!(gatekeeper_v2.pdd.entry_drift_elapsed_scaling_enabled);
+        assert_eq!(gatekeeper_v2.pdd.entry_drift_elapsed_base_pct, 6.0);
+        assert_eq!(
+            gatekeeper_v2.pdd.entry_drift_elapsed_slope_pct_per_second,
+            1.8
+        );
+        assert_eq!(gatekeeper_v2.pdd.entry_drift_elapsed_cap_pct, 15.0);
+        assert_eq!(gatekeeper_v2.pdd.entry_drift_max_pct, 15.0);
+        assert_eq!(gatekeeper_v2.pdd.entry_drift_soft_max_pct, 8.0);
+        assert_eq!(gatekeeper_v2.hard_fail_hhi, 0.20);
+        assert_eq!(gatekeeper_v2.max_hhi, 0.155);
+        assert!(!gatekeeper_v2.enable_prosperity_filter);
+        assert_eq!(gatekeeper_v2.min_bonding_progress_pct, 40.0);
+        assert_eq!(gatekeeper_v2.min_market_cap_sol, 41.0);
+    }
+
+    #[test]
     fn test_validate_execution_profile_rejects_placeholder_shadow_rpc_in_production() {
         let mut config = LauncherConfig::default();
         config.mode = AppMode::Production;

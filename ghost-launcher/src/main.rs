@@ -1670,6 +1670,22 @@ async fn main() -> Result<()> {
     oracle_runtime_config.session = config.session.clone();
     oracle_runtime_config.tx_intelligence = config.tx_intelligence.clone();
     oracle_runtime_config.p37_shadow_probe = config.p37_shadow_probe.clone();
+    oracle_runtime_config.run_id = (!config.p37_shadow_probe.run_id.trim().is_empty())
+        .then(|| config.p37_shadow_probe.run_id.clone());
+    oracle_runtime_config.session_id = (!config.p37_shadow_probe.session_id.trim().is_empty())
+        .then(|| config.p37_shadow_probe.session_id.clone());
+    oracle_runtime_config.brain_config_path = Some(config.ghost_brain_config_path.clone());
+    oracle_runtime_config.brain_config_hash = match std::fs::read(&config.ghost_brain_config_path) {
+        Ok(bytes) => Some(blake3::hash(&bytes).to_hex().to_string()),
+        Err(err) => {
+            warn!(
+                path = %config.ghost_brain_config_path,
+                error = %err,
+                "GHOST_BRAIN_CONFIG_FILE_HASH_UNAVAILABLE"
+            );
+            None
+        }
+    };
     let mut oracle_runtime_builder = OracleRuntime::new_with_config(
         hyper_prediction_oracle.clone(),
         config.seer.pump_program_id.clone(),

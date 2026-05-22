@@ -1307,6 +1307,353 @@ pub struct V25ConfidenceBreakdown {
 }
 
 impl GatekeeperAssessment {
+    fn gate_trace_entry(
+        order_idx: u32,
+        gate: &str,
+        status: &str,
+        hard_or_soft: &str,
+        metric_name: Option<&str>,
+        observed_value: Option<f64>,
+        threshold_value: Option<f64>,
+        threshold_source: Option<&str>,
+        reason_code: Option<GatekeeperReasonCode>,
+    ) -> ghost_brain::oracle::GatekeeperGateTraceEntry {
+        ghost_brain::oracle::GatekeeperGateTraceEntry {
+            order_idx,
+            gate: gate.to_string(),
+            status: status.to_string(),
+            hard_or_soft: hard_or_soft.to_string(),
+            metric_name: metric_name.map(str::to_string),
+            observed_value,
+            threshold_value,
+            threshold_source: threshold_source.map(str::to_string),
+            reason_code: reason_code.map(GatekeeperReasonCode::as_log_str),
+        }
+    }
+
+    fn gatekeeper_gate_trace(
+        &self,
+        config: &GatekeeperV2Config,
+    ) -> Vec<ghost_brain::oracle::GatekeeperGateTraceEntry> {
+        let mut trace = Vec::new();
+        trace.push(Self::gate_trace_entry(
+            0,
+            "phase1_quantity",
+            if self.phase1_passed { "pass" } else { "fail" },
+            "hard",
+            Some("total_tx_evaluated"),
+            Some(self.total_tx_evaluated as f64),
+            Some(config.min_tx_count as f64),
+            Some("gatekeeper_v2.min_tx_count"),
+            (!self.phase1_passed).then_some(GatekeeperReasonCode::TimeoutPhase1Insufficient),
+        ));
+
+        if let Some(diversity) = &self.phase3_diversity {
+            trace.push(Self::gate_trace_entry(
+                10,
+                "diversity_hhi_hard_fail",
+                if diversity.hhi > config.hard_fail_hhi {
+                    "fail"
+                } else {
+                    "pass"
+                },
+                "hard",
+                Some("hhi"),
+                Some(diversity.hhi),
+                Some(config.hard_fail_hhi),
+                Some("gatekeeper_v2.hard_fail_hhi"),
+                (diversity.hhi > config.hard_fail_hhi)
+                    .then_some(GatekeeperReasonCode::HardFailExtremeHhi),
+            ));
+            trace.push(Self::gate_trace_entry(
+                11,
+                "diversity_top3_hard_fail",
+                if diversity.top3_volume_pct > config.hard_fail_top3_volume_pct {
+                    "fail"
+                } else {
+                    "pass"
+                },
+                "hard",
+                Some("top3_volume_pct"),
+                Some(diversity.top3_volume_pct),
+                Some(config.hard_fail_top3_volume_pct),
+                Some("gatekeeper_v2.hard_fail_top3_volume_pct"),
+                (diversity.top3_volume_pct > config.hard_fail_top3_volume_pct)
+                    .then_some(GatekeeperReasonCode::HardFailExtremeTop3),
+            ));
+        }
+
+        if let Some(pdd) = &self.pdd_assessment {
+            let (metric_name, observed_value, threshold_value, threshold_source) =
+                if matches!(pdd.hard_fail, Some(PddHardFail::EntryDrift)) {
+                    (
+                        Some("pdd_entry_drift_pct"),
+                        pdd.entry_drift_pct,
+                        pdd.entry_drift_effective_max_pct,
+                        pdd.entry_drift_threshold_source,
+                    )
+                } else {
+                    (
+                        Some("pdd_score"),
+                        Some(pdd.pdd_score),
+                        Some(0.7),
+                        Some("v25_pdd_clean"),
+                    )
+                };
+            let reason_code = pdd.hard_fail.as_ref().map(|fail| match fail {
+                PddHardFail::EntryDrift => GatekeeperReasonCode::RejectPddEntryDrift,
+                PddHardFail::Spike => GatekeeperReasonCode::RejectPddSpike,
+                PddHardFail::Ramping => GatekeeperReasonCode::RejectPddRamping,
+                PddHardFail::Whale => GatekeeperReasonCode::RejectPddWhale,
+                PddHardFail::Reserve => GatekeeperReasonCode::RejectPddReserve,
+                PddHardFail::FlashCrash => GatekeeperReasonCode::RejectPddFlashCrash,
+            });
+            trace.push(Self::gate_trace_entry(
+                20,
+                "pdd",
+                if pdd.hard_fail.is_some() {
+                    "fail"
+                } else {
+                    "pass"
+                },
+                if pdd.hard_fail.is_some() {
+                    "hard"
+                } else {
+                    "soft"
+                },
+                metric_name,
+                observed_value,
+                threshold_value,
+                threshold_source,
+                reason_code,
+            ));
+        }
+
+        if let Some(decision) = &self.decision {
+            trace.push(Self::gate_trace_entry(
+                30,
+                "core1",
+                if decision.core1_passed {
+                    "pass"
+                } else {
+                    "fail"
+                },
+                "hard",
+                None,
+                None,
+                None,
+                Some("three_layer.core1"),
+                (!decision.core1_passed).then_some(GatekeeperReasonCode::RejectCoreFail),
+            ));
+            trace.push(Self::gate_trace_entry(
+                31,
+                "core2",
+                if decision.core2_passed {
+                    "pass"
+                } else {
+                    "fail"
+                },
+                "hard",
+                None,
+                None,
+                None,
+                Some("three_layer.core2"),
+                (!decision.core2_passed).then_some(GatekeeperReasonCode::RejectCoreFail),
+            ));
+            trace.push(Self::gate_trace_entry(
+                32,
+                "core3",
+                if decision.core3_passed {
+                    "pass"
+                } else {
+                    "fail"
+                },
+                "hard",
+                None,
+                None,
+                None,
+                Some("three_layer.core3"),
+                (!decision.core3_passed).then_some(GatekeeperReasonCode::RejectCoreFail),
+            ));
+            trace.push(Self::gate_trace_entry(
+                40,
+                "soft_budget",
+                if decision.soft_points > decision.effective_max_soft_points {
+                    "fail"
+                } else {
+                    "pass"
+                },
+                "soft",
+                Some("soft_points"),
+                Some(decision.soft_points as f64),
+                Some(decision.effective_max_soft_points as f64),
+                Some("three_layer.effective_max_soft_points"),
+                (decision.soft_points > decision.effective_max_soft_points)
+                    .then_some(GatekeeperReasonCode::RejectLegacySoftExcess),
+            ));
+            trace.push(Self::gate_trace_entry(
+                50,
+                "alpha",
+                if matches!(decision.verdict_type, GatekeeperVerdictType::RejectLowAlpha) {
+                    "fail"
+                } else {
+                    "pass"
+                },
+                "hard",
+                Some("alpha_joint"),
+                decision.alpha_gate.joint,
+                Some(config.min_alpha_joint),
+                Some("gatekeeper_v2.min_alpha_joint"),
+                matches!(decision.verdict_type, GatekeeperVerdictType::RejectLowAlpha)
+                    .then_some(GatekeeperReasonCode::RejectLowAlpha),
+            ));
+            trace.push(Self::gate_trace_entry(
+                60,
+                "prosperity",
+                if matches!(
+                    decision.verdict_type,
+                    GatekeeperVerdictType::RejectLowProsperity
+                ) {
+                    "fail"
+                } else if config.enable_prosperity_filter {
+                    "pass"
+                } else {
+                    "skipped"
+                },
+                "hard",
+                None,
+                None,
+                None,
+                Some("gatekeeper_v2.enable_prosperity_filter"),
+                matches!(
+                    decision.verdict_type,
+                    GatekeeperVerdictType::RejectLowProsperity
+                )
+                .then_some(GatekeeperReasonCode::RejectLowProsperity),
+            ));
+        }
+
+        trace
+    }
+
+    fn gatekeeper_terminal_gate(&self) -> Option<String> {
+        let Some(decision) = self.decision.as_ref() else {
+            return self
+                .terminal_reason_code
+                .is_some()
+                .then(|| "timeout".to_string());
+        };
+        let gate = match decision.verdict_type {
+            GatekeeperVerdictType::Buy | GatekeeperVerdictType::EarlyBuy => "buy",
+            GatekeeperVerdictType::RejectHardFail => "hard_fail",
+            GatekeeperVerdictType::RejectCoreFail => "core",
+            GatekeeperVerdictType::RejectSoftExcess
+            | GatekeeperVerdictType::RejectSybilSoftExcess
+            | GatekeeperVerdictType::RejectSybilInterference => "soft_budget",
+            GatekeeperVerdictType::RejectLowAlpha => "alpha",
+            GatekeeperVerdictType::RejectLowProsperity => "prosperity",
+            GatekeeperVerdictType::RejectIwimVeto
+            | GatekeeperVerdictType::RejectIwimLowConf
+            | GatekeeperVerdictType::RejectIwimUnknownStrict => "iwim",
+            GatekeeperVerdictType::RejectPumpAndDump
+            | GatekeeperVerdictType::RejectEntryDrift
+            | GatekeeperVerdictType::RejectFlashCrash
+            | GatekeeperVerdictType::RejectRamping => "pdd",
+            GatekeeperVerdictType::RejectLowTrajectory => "trajectory",
+            GatekeeperVerdictType::TimeoutPhase1
+            | GatekeeperVerdictType::TimeoutNoData
+            | GatekeeperVerdictType::TimeoutDeadlineLowPhases => "timeout",
+        };
+        Some(gate.to_string())
+    }
+
+    fn gatekeeper_first_kill(&self) -> (Option<String>, Option<String>) {
+        if let Some(pdd) = &self.pdd_assessment {
+            if let Some(fail) = &pdd.hard_fail {
+                return (
+                    Some("pdd".to_string()),
+                    Some(format!("PDD_{}", fail.as_str())),
+                );
+            }
+        }
+
+        let Some(decision) = &self.decision else {
+            return (
+                None,
+                self.terminal_reason_code
+                    .map(GatekeeperReasonCode::as_log_str),
+            );
+        };
+
+        match decision.verdict_type {
+            GatekeeperVerdictType::RejectHardFail => {
+                let reason = decision.hard_fail_reason.clone();
+                let reason_lc = reason.clone().unwrap_or_default().to_lowercase();
+                let gate = if reason_lc.contains("hhi") {
+                    "diversity_hhi"
+                } else if reason_lc.contains("top3") {
+                    "diversity_top3"
+                } else if reason_lc.contains("market_cap") || reason_lc.contains("market cap") {
+                    "market_cap"
+                } else if reason_lc.contains("price") {
+                    "price_change"
+                } else if reason_lc.contains("slow") {
+                    "velocity"
+                } else {
+                    "hard_fail"
+                };
+                (Some(gate.to_string()), reason)
+            }
+            GatekeeperVerdictType::RejectCoreFail => {
+                if !decision.core1_passed {
+                    (
+                        Some("core1".to_string()),
+                        Some(decision.reason_chain.clone()),
+                    )
+                } else if !decision.core2_passed {
+                    (
+                        Some("core2".to_string()),
+                        Some(decision.reason_chain.clone()),
+                    )
+                } else if !decision.core3_passed {
+                    (
+                        Some("core3".to_string()),
+                        Some(decision.reason_chain.clone()),
+                    )
+                } else {
+                    (
+                        Some("core".to_string()),
+                        Some(decision.reason_chain.clone()),
+                    )
+                }
+            }
+            GatekeeperVerdictType::RejectLowAlpha => (
+                Some("alpha".to_string()),
+                Some(decision.reason_chain.clone()),
+            ),
+            GatekeeperVerdictType::RejectLowProsperity => (
+                Some("prosperity".to_string()),
+                Some(decision.reason_chain.clone()),
+            ),
+            GatekeeperVerdictType::RejectLowTrajectory => (
+                Some("trajectory".to_string()),
+                Some(decision.reason_chain.clone()),
+            ),
+            GatekeeperVerdictType::RejectIwimVeto
+            | GatekeeperVerdictType::RejectIwimLowConf
+            | GatekeeperVerdictType::RejectIwimUnknownStrict => (
+                Some("iwim".to_string()),
+                Some(decision.reason_chain.clone()),
+            ),
+            GatekeeperVerdictType::RejectSoftExcess
+            | GatekeeperVerdictType::RejectSybilSoftExcess
+            | GatekeeperVerdictType::RejectSybilInterference => {
+                (None, Some(decision.reason_chain.clone()))
+            }
+            _ => (None, None),
+        }
+    }
+
     pub fn v25_pdd_clean(&self) -> bool {
         self.pdd_assessment
             .as_ref()
@@ -1781,6 +2128,10 @@ impl GatekeeperAssessment {
             self.v25_confidence_availability(config);
         let (pdd_seq_available, pdd_seq_unavailable_reason) =
             self.pdd_sequence_signals_availability(config);
+        let gatekeeper_gate_trace = self.gatekeeper_gate_trace(config);
+        let (gatekeeper_first_kill_gate, gatekeeper_first_kill_reason) =
+            self.gatekeeper_first_kill();
+        let gatekeeper_terminal_gate = self.gatekeeper_terminal_gate();
 
         GatekeeperBuyLog {
             log_schema_version: GATEKEEPER_BUY_LOG_SCHEMA_VERSION,
@@ -1804,6 +2155,10 @@ impl GatekeeperAssessment {
             rollout_profile: None,
             decision_plane: None,
             config_hash: None,
+            run_id: None,
+            session_id: None,
+            brain_config_path: None,
+            brain_config_hash: None,
             dev_pubkey: None,
             shadow_ready: None,
             shadow_missing_fields: None,
@@ -2484,6 +2839,42 @@ impl GatekeeperAssessment {
                 .as_ref()
                 .and_then(|p| p.hard_fail.as_ref().map(|f| f.as_str().to_string())),
             pdd_entry_drift_pct: self.pdd_assessment.as_ref().and_then(|p| p.entry_drift_pct),
+            pdd_entry_drift_elapsed_ms: self
+                .pdd_assessment
+                .as_ref()
+                .and_then(|p| p.entry_drift_elapsed_ms),
+            pdd_entry_drift_anchor_price: self
+                .pdd_assessment
+                .as_ref()
+                .and_then(|p| p.entry_drift_anchor_price),
+            pdd_entry_drift_current_price: self
+                .pdd_assessment
+                .as_ref()
+                .and_then(|p| p.entry_drift_current_price),
+            pdd_entry_drift_anchor_ts_ms: self
+                .pdd_assessment
+                .as_ref()
+                .and_then(|p| p.entry_drift_anchor_ts_ms),
+            pdd_entry_drift_current_ts_ms: self
+                .pdd_assessment
+                .as_ref()
+                .and_then(|p| p.entry_drift_current_ts_ms),
+            pdd_entry_drift_static_max_pct: self
+                .pdd_assessment
+                .as_ref()
+                .and_then(|p| p.entry_drift_static_max_pct),
+            pdd_entry_drift_elapsed_max_pct: self
+                .pdd_assessment
+                .as_ref()
+                .and_then(|p| p.entry_drift_elapsed_max_pct),
+            pdd_entry_drift_effective_max_pct: self
+                .pdd_assessment
+                .as_ref()
+                .and_then(|p| p.entry_drift_effective_max_pct),
+            pdd_entry_drift_threshold_source: self
+                .pdd_assessment
+                .as_ref()
+                .and_then(|p| p.entry_drift_threshold_source.map(|s| s.to_string())),
             pdd_entry_drift_anchor_source: self
                 .pdd_assessment
                 .as_ref()
@@ -2493,10 +2884,31 @@ impl GatekeeperAssessment {
                 .as_ref()
                 .and_then(|p| p.entry_drift_anchor_quality.map(|s| s.to_string())),
             pdd_spike_detected: self.pdd_assessment.as_ref().map(|p| p.spike_detected),
+            pdd_spike_ratio: self.pdd_assessment.as_ref().and_then(|p| p.spike_ratio),
+            pdd_spike_ratio_quality: self
+                .pdd_assessment
+                .as_ref()
+                .and_then(|p| p.spike_ratio_quality.map(|s| s.to_string())),
+            pdd_spike_recent_rate: self
+                .pdd_assessment
+                .as_ref()
+                .and_then(|p| p.spike_recent_rate),
+            pdd_spike_earlier_rate: self
+                .pdd_assessment
+                .as_ref()
+                .and_then(|p| p.spike_earlier_rate),
             pdd_ramping_detected: self.pdd_assessment.as_ref().map(|p| p.ramping_detected),
             pdd_whale_top3_pct: self.pdd_assessment.as_ref().and_then(|p| p.whale_top3_pct),
+            pdd_whale_single_max_pct: self
+                .pdd_assessment
+                .as_ref()
+                .and_then(|p| p.whale_single_max_pct),
             pdd_flash_crash_risk: self.pdd_assessment.as_ref().map(|p| p.flash_crash_risk),
             pdd_score: self.pdd_assessment.as_ref().map(|p| p.pdd_score),
+            gatekeeper_first_kill_gate,
+            gatekeeper_first_kill_reason,
+            gatekeeper_terminal_gate,
+            gatekeeper_gate_trace,
             aps_regime: self
                 .aps_diagnostics
                 .as_ref()

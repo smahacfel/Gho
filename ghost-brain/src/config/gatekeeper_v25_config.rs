@@ -177,6 +177,12 @@ pub struct PumpAndDumpDetectorConfig {
     pub entry_drift_max_pct: f64,
     pub entry_drift_soft_max_pct: f64,
     pub entry_drift_soft_weight: u8,
+    /// Diagnostic-only elapsed-aware drift cap. Disabled by default so legacy
+    /// configs keep the historical static `entry_drift_max_pct` behavior.
+    pub entry_drift_elapsed_scaling_enabled: bool,
+    pub entry_drift_elapsed_base_pct: f64,
+    pub entry_drift_elapsed_slope_pct_per_second: f64,
+    pub entry_drift_elapsed_cap_pct: f64,
 
     // Spike pattern detection
     pub spike_detection_enabled: bool,
@@ -220,6 +226,10 @@ impl Default for PumpAndDumpDetectorConfig {
             entry_drift_max_pct: 5.0,
             entry_drift_soft_max_pct: 3.0,
             entry_drift_soft_weight: 2,
+            entry_drift_elapsed_scaling_enabled: false,
+            entry_drift_elapsed_base_pct: 5.0,
+            entry_drift_elapsed_slope_pct_per_second: 0.0,
+            entry_drift_elapsed_cap_pct: 5.0,
             spike_detection_enabled: true,
             spike_observation_window_ms: 3000,
             spike_ratio_threshold: 2.0,

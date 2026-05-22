@@ -1494,6 +1494,222 @@ Acceptance:
 Collection, Phase B, P2, live, active policy changes, IWIM changes and threshold
 tuning remain out of scope.
 
+## P3.7-L1 Diagnostic Standard / Soft-PDD Policy Probe
+
+### Context
+
+J4C proved the counterfactual evidence chain end to end:
+
+```text
+V3/MFS decision artifact
+-> counterfactual probe selection/transport
+-> shadow entry
+-> probe lifecycle close
+-> on-chain lifecycle report
+-> lifecycle labeler
+-> feature availability join
+```
+
+The J4C dataset was technically usable but selection-useless: all lifecycle
+labels were `buy_quality_bad` / `market_bad_clean`, with no `good` or
+`dirty_good` rows. The active J4C brain config was the defensive rollout config
+`ghost_brain_v3_p37_mfs_lifecycle.toml`, combining long-mode final evaluation,
+static/tight PDD drift, hard spike/ramping vetoes, tight HHI hard fail, and the
+Prosperity filter.
+
+L1 is therefore a diagnostic policy probe, not a candidate live policy.
+
+### Scope
+
+L1 keeps the J4C baseline immutable and adds a separate R16 namespace/config
+family:
+
+```text
+configs/rollout/ghost_brain_v3_p37_l1_standard_softpdd.toml
+configs/rollout/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1.toml
+```
+
+R16 is a bundle-relaxation screening run, not a clean ablation. It changes the
+policy bundle only inside the diagnostic rollout:
+
+```text
+gatekeeper_v2.mode = "standard"
+gatekeeper_v2.max_wait_time_ms = 5000
+gatekeeper_v2.dow.extended_window_ms = 5000
+gatekeeper_v2.dow.extended_require_pdd_clean = false
+gatekeeper_v2.pdd.spike_hard_veto = false
+gatekeeper_v2.pdd.ramping_hard_veto = false
+gatekeeper_v2.pdd.entry_drift_soft_max_pct = 8.0
+gatekeeper_v2.pdd.entry_drift_max_pct = 15.0
+gatekeeper_v2.pdd.entry_drift_elapsed_scaling_enabled = true
+gatekeeper_v2.pdd.entry_drift_elapsed_base_pct = 6.0
+gatekeeper_v2.pdd.entry_drift_elapsed_slope_pct_per_second = 1.8
+gatekeeper_v2.pdd.entry_drift_elapsed_cap_pct = 15.0
+gatekeeper_v2.hard_fail_hhi = 0.20
+gatekeeper_v2.hard_fail_top3_volume_pct = 0.95
+gatekeeper_v2.enable_prosperity_filter = false
+```
+
+R16 deliberately leaves these baseline gates unchanged for first-pass
+diagnostics:
+
+```text
+gatekeeper_v2.max_hhi = 0.155
+gatekeeper_v2.min_bonding_progress_pct = 40.0
+gatekeeper_v2.min_market_cap_sol = 41.0
+gatekeeper_v2.min_tx_count
+gatekeeper_v2.min_unique_signers
+gatekeeper_v2.alpha gate
+```
+
+If R16 produces any `good` / `dirty_good` labels, later work must ablate one
+axis at a time. R16 alone may show that the J4C baseline is too defensive, but
+it does not identify the single responsible threshold.
+
+### Diagnostics Added
+
+Decision rows gain additive schema-v21 diagnostics:
+
+```text
+pdd_entry_drift_elapsed_ms
+pdd_entry_drift_anchor_price
+pdd_entry_drift_current_price
+pdd_entry_drift_anchor_ts_ms
+pdd_entry_drift_current_ts_ms
+pdd_entry_drift_static_max_pct
+pdd_entry_drift_elapsed_max_pct
+pdd_entry_drift_effective_max_pct
+pdd_entry_drift_threshold_source
+pdd_spike_ratio
+pdd_spike_ratio_quality
+pdd_spike_recent_rate
+pdd_spike_earlier_rate
+pdd_whale_single_max_pct
+gatekeeper_first_kill_gate
+gatekeeper_first_kill_reason
+gatekeeper_terminal_gate
+gatekeeper_gate_trace
+```
+
+PDD diagnostics must come from the same PDD evaluation/anchor choice used by
+the policy decision. DecisionLogger only persists these fields; it must not
+recompute first-kill gate or PDD anchor metrics after the fact.
+
+`pdd_spike_ratio_quality` is explicit:
+
+```text
+ok
+earlier_rate_zero
+insufficient_earlier_window
+insufficient_recent_window
+unavailable
+```
+
+When `earlier_rate = 0`, `pdd_spike_ratio` is not emitted as infinity. The
+ratio is `null` and quality is `earlier_rate_zero`.
+
+Every drift decision logs both static and elapsed-aware thresholds plus the
+effective threshold actually used. `PDD drift rows` means rows where the PDD
+entry-drift gate was evaluated, regardless of whether drift was the terminal
+reason.
+
+### R16 Identity Contract
+
+Every R16 decision/probe/lifecycle row must carry:
+
+```text
+R16 namespace
+run_id
+session_id
+brain_config_path
+brain_config_hash
+v3_policy_config_hash
+```
+
+R16 artifacts must not mix J4C decision rows with R16 probe/lifecycle rows. The
+L1 diagnostics report must show `v3_policy_config_hash` and `brain_config_hash`
+distributions and confirm one active hash for R16.
+
+R16 also validates BUY lifecycle coverage explicitly:
+
+```text
+R16 BUY verdict count
+R16 BUY shadow entry count
+R16 BUY lifecycle close count
+R16 REJECT/PENDING probe lifecycle count
+```
+
+The normal shadow execution path is the preferred lifecycle source for R16 BUY
+verdicts. Because this is diagnostic-only, R16 also includes BUY rows in the
+counterfactual probe plane as a fallback to ensure BUY outcomes are lifecycle
+labelable without changing live or active policy semantics.
+
+### Reporting
+
+The L1 report script is:
+
+```text
+scripts/v3_p37_l1_reject_diagnostics.py
+```
+
+It writes:
+
+```text
+logs/shadow_run/<r16-namespace>/p3_7_l1_per_reject_diagnostics.jsonl
+logs/shadow_run/<r16-namespace>/p3_7_l1_reject_diagnostics_summary.json
+logs/shadow_run/<r16-namespace>/p3_7_l1_reject_diagnostics_summary.md
+```
+
+If R16 still has `0 good` and `0 dirty_good`, the report must show distributions
+for the gates deliberately left at baseline:
+
+```text
+max_hhi
+min_bonding_progress_pct
+min_market_cap_sol
+min_tx_count
+min_unique_signers
+alpha gate
+```
+
+The report is invalid for policy conclusions unless diagnostic coverage passes:
+
+```text
+pdd_entry_drift_elapsed_ms/anchor/current price coverage >= 95% on PDD drift rows
+pdd_spike_ratio_quality populated on >= 95% spike-diagnostic rows
+pdd_spike_ratio populated on >= 95% rows where ratio quality is ok
+pdd_whale_single_max_pct populated on >= 95% whale-diagnostic rows
+gatekeeper_first_kill_gate or gatekeeper_terminal_gate populated on >= 95% terminal rejects/timeouts
+```
+
+### Entry Wait Check
+
+`entry_wait_ms` appears in rollout configs as post-BOUGHT stabilization
+configuration. The L1 implementation must verify read-only that it does not
+delay pre-entry/probe dispatch. If later code proves it affects pre-entry or
+probe dispatch, R16 must not start without explicit `entry_wait_applied_ms` and
+a blocker classification.
+
+### R16 Gate
+
+R16 uses a small bounded lifecycle-label probe run:
+
+```text
+max_probes_per_run = 50
+max_concurrent = 1
+max_probe_candidates_scanned_per_run = 20000
+```
+
+Non-goals remain:
+
+```text
+no Phase B
+no P2/live
+no active policy promotion
+no root ghost_brain_config.toml edit
+no baseline J4C config edit
+```
+
 ## P3.7-J4B Probe Lifecycle Truth Resolution / Runtime Retention
 
 ### Trigger

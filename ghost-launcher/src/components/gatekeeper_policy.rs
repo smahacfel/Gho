@@ -808,6 +808,9 @@ fn materialize_pdd_diagnostics_from_features(
     diag.entry_drift_pct = entry_drift_pct;
     diag.entry_drift_anchor_source = anchor_source;
     diag.entry_drift_anchor_quality = anchor_quality;
+    diag.entry_drift_static_max_pct = Some(config.entry_drift_max_pct);
+    diag.entry_drift_effective_max_pct = Some(config.entry_drift_max_pct);
+    diag.entry_drift_threshold_source = Some("materialized_static");
 
     if let Some(drift_pct) = entry_drift_pct {
         if drift_pct > config.entry_drift_max_pct {
@@ -1062,7 +1065,8 @@ pub fn evaluate_policy_from_assessment(
     let diagnostics = build_policy_diagnostics(assessment, config);
     let total_soft_points = diagnostics.soft_points as u16 + diagnostics.sybil_policy.soft_points;
 
-    if let Some((reason, reason_chain)) = evaluate_hard_filters_from_assessment(assessment, config) {
+    if let Some((reason, reason_chain)) = evaluate_hard_filters_from_assessment(assessment, config)
+    {
         return GatekeeperDecision {
             hard_fail_reason: Some(reason_chain.clone()),
             core1_passed: diagnostics.core1_passed,
@@ -1331,9 +1335,7 @@ pub fn evaluate_policy_from_assessment(
             }
             GatekeeperVerdictType::RejectSoftExcess => GatekeeperReasonCode::RejectLegacySoftExcess,
             GatekeeperVerdictType::RejectLowAlpha => GatekeeperReasonCode::RejectLowAlpha,
-            GatekeeperVerdictType::RejectLowProsperity => {
-                GatekeeperReasonCode::RejectLowProsperity
-            }
+            GatekeeperVerdictType::RejectLowProsperity => GatekeeperReasonCode::RejectLowProsperity,
             GatekeeperVerdictType::RejectEntryDrift => GatekeeperReasonCode::RejectPddEntryDrift,
             GatekeeperVerdictType::RejectFlashCrash => GatekeeperReasonCode::RejectPddFlashCrash,
             GatekeeperVerdictType::RejectRamping => GatekeeperReasonCode::RejectPddRamping,

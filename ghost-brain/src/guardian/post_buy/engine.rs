@@ -433,6 +433,10 @@ pub struct PositionJoinMetadata {
     pub v3_policy_config_hash: Option<String>,
     pub decision_plane: Option<String>,
     pub rollout_namespace: Option<String>,
+    pub run_id: Option<String>,
+    pub session_id: Option<String>,
+    pub brain_config_path: Option<String>,
+    pub brain_config_hash: Option<String>,
 }
 
 /// Minimal position identity returned after successful registration.
@@ -473,6 +477,14 @@ struct ShadowLifecycleRecord {
     decision_plane: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     rollout_namespace: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    brain_config_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    brain_config_hash: Option<String>,
     record_type: ShadowLifecycleRecordType,
     timestamp: String,
     timestamp_ms: u64,
@@ -1106,6 +1118,10 @@ impl MonitoringEngine {
             v3_policy_config_hash: pos.join_metadata.v3_policy_config_hash.clone(),
             decision_plane: pos.join_metadata.decision_plane.clone(),
             rollout_namespace: pos.join_metadata.rollout_namespace.clone(),
+            run_id: pos.join_metadata.run_id.clone(),
+            session_id: pos.join_metadata.session_id.clone(),
+            brain_config_path: pos.join_metadata.brain_config_path.clone(),
+            brain_config_hash: pos.join_metadata.brain_config_hash.clone(),
             record_type,
             timestamp: chrono::Utc::now().to_rfc3339(),
             timestamp_ms: now_ms,
@@ -4161,6 +4177,10 @@ mod tests {
             v3_policy_config_hash: Some("policy-hash".to_string()),
             decision_plane: Some("legacy_live".to_string()),
             rollout_namespace: Some("r14-smoke".to_string()),
+            run_id: Some("r16-run".to_string()),
+            session_id: Some("r16-session".to_string()),
+            brain_config_path: Some("configs/rollout/ghost_brain_r16.toml".to_string()),
+            brain_config_hash: Some("brain-hash".to_string()),
             ..Default::default()
         };
         let registered = engine.register_position_with_context(
@@ -4198,6 +4218,13 @@ mod tests {
         assert_eq!(row["v3_policy_config_hash"], "policy-hash");
         assert_eq!(row["decision_plane"], "legacy_live");
         assert_eq!(row["rollout_namespace"], "r14-smoke");
+        assert_eq!(row["run_id"], "r16-run");
+        assert_eq!(row["session_id"], "r16-session");
+        assert_eq!(
+            row["brain_config_path"],
+            "configs/rollout/ghost_brain_r16.toml"
+        );
+        assert_eq!(row["brain_config_hash"], "brain-hash");
     }
 
     #[tokio::test]

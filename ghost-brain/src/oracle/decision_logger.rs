@@ -81,7 +81,7 @@ pub const CYCLIC_LOG_SCHEMA_VERSION: u32 = 1;
 /// v19 adds typed `reason_code` (GatekeeperReasonCode enum, version 2)
 /// for all verdict types including TIMEOUT subtypes.
 /// v20 adds additive V3 P0 shadow/evidence sidecar fields on existing decision rows.
-pub const GATEKEEPER_BUY_LOG_SCHEMA_VERSION: u32 = 20;
+pub const GATEKEEPER_BUY_LOG_SCHEMA_VERSION: u32 = 21;
 /// Gatekeeper version string embedded in every V2.5 shadow BUY log for traceability.
 pub const GATEKEEPER_VERSION: &str = "v2.5";
 /// Legacy Gatekeeper version string for pre-V2.5 live-plane semantics.
@@ -205,6 +205,25 @@ pub struct CyclicEngineLog {
 // Gatekeeper V2 Buy Decision Logging
 // =============================================================================
 
+/// Ordered policy-gate trace entry emitted by Gatekeeper evaluation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatekeeperGateTraceEntry {
+    pub order_idx: u32,
+    pub gate: String,
+    pub status: String,
+    pub hard_or_soft: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metric_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_value: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold_value: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+}
+
 /// Gatekeeper V2 Buy decision log with full phase breakdown
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GatekeeperBuyLog {
@@ -276,6 +295,23 @@ pub struct GatekeeperBuyLog {
     /// Blake3 hash of key config thresholds — reproducible across restarts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_hash: Option<String>,
+
+    /// Rollout/runtime run identifier. R16 uses this to prove that decision,
+    /// probe, and lifecycle artifacts come from one namespace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+
+    /// Rollout/runtime session identifier. Additive for legacy row parsing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+
+    /// Ghost Brain config path used by the launcher for this decision row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brain_config_path: Option<String>,
+
+    /// Blake3 hash of the Ghost Brain config file bytes used by this run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brain_config_hash: Option<String>,
 
     /// Developer wallet pubkey, if identified.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1352,6 +1388,33 @@ pub struct GatekeeperBuyLog {
     /// Entry drift percentage from initial price
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pdd_entry_drift_pct: Option<f64>,
+    /// Elapsed ms between the exact PDD drift anchor and current price point.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdd_entry_drift_elapsed_ms: Option<u64>,
+    /// Exact anchor price used by PDD drift detection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdd_entry_drift_anchor_price: Option<f64>,
+    /// Exact current price used by PDD drift detection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdd_entry_drift_current_price: Option<f64>,
+    /// Exact anchor timestamp used by PDD drift detection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdd_entry_drift_anchor_ts_ms: Option<u64>,
+    /// Exact current timestamp used by PDD drift detection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdd_entry_drift_current_ts_ms: Option<u64>,
+    /// Static configured PDD drift max.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdd_entry_drift_static_max_pct: Option<f64>,
+    /// Elapsed-scaled PDD drift max when enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdd_entry_drift_elapsed_max_pct: Option<f64>,
+    /// Effective drift threshold used for this PDD decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdd_entry_drift_effective_max_pct: Option<f64>,
+    /// Threshold source: static, regime_static, elapsed_scaled, fallback_no_anchor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdd_entry_drift_threshold_source: Option<String>,
     /// Entry drift anchor source provenance
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pdd_entry_drift_anchor_source: Option<String>,
@@ -1361,18 +1424,44 @@ pub struct GatekeeperBuyLog {
     /// Volume spike pattern detected
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pdd_spike_detected: Option<bool>,
+    /// Recent-vs-earlier volume-rate ratio used for spike detection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdd_spike_ratio: Option<f64>,
+    /// Quality/status for pdd_spike_ratio: ok, earlier_rate_zero,
+    /// insufficient_earlier_window, insufficient_recent_window, unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdd_spike_ratio_quality: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdd_spike_recent_rate: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdd_spike_earlier_rate: Option<f64>,
     /// Consecutive same-size buy ramping detected
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pdd_ramping_detected: Option<bool>,
     /// Top-3 whale volume concentration percentage
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pdd_whale_top3_pct: Option<f64>,
+    /// Single largest signer volume concentration percentage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdd_whale_single_max_pct: Option<f64>,
     /// Flash crash sell cluster risk detected
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pdd_flash_crash_risk: Option<bool>,
     /// Overall PDD cleanliness score (1.0 = clean, 0.0 = hard fail)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pdd_score: Option<f64>,
+
+    // ═══════════════════════════════════════════
+    // Gate trace diagnostics (v21)
+    // ═══════════════════════════════════════════
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gatekeeper_first_kill_gate: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gatekeeper_first_kill_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gatekeeper_terminal_gate: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gatekeeper_gate_trace: Vec<GatekeeperGateTraceEntry>,
 
     // ═══════════════════════════════════════════
     // V2.5 Adaptive Prosperity (APS) fields
@@ -1696,6 +1785,14 @@ pub struct DecisionLoggerConfig {
     pub gatekeeper_rollout_profile: String,
     /// Deterministic gatekeeper config hash stamped onto routed gatekeeper records.
     pub gatekeeper_config_hash: String,
+    /// Optional run identifier stamped onto gatekeeper decision records.
+    pub gatekeeper_run_id: Option<String>,
+    /// Optional session identifier stamped onto gatekeeper decision records.
+    pub gatekeeper_session_id: Option<String>,
+    /// Optional Ghost Brain config path stamped onto gatekeeper decision records.
+    pub brain_config_path: Option<String>,
+    /// Optional Ghost Brain config file hash stamped onto gatekeeper decision records.
+    pub brain_config_hash: Option<String>,
     /// Channel buffer size
     pub channel_buffer_size: usize,
     /// Enable logging
@@ -1709,6 +1806,10 @@ impl Default for DecisionLoggerConfig {
             gatekeeper_log_dir: PathBuf::from(DEFAULT_DECISION_LOG_DIR),
             gatekeeper_rollout_profile: "unknown_rollout".to_string(),
             gatekeeper_config_hash: "unknown_config_hash".to_string(),
+            gatekeeper_run_id: None,
+            gatekeeper_session_id: None,
+            brain_config_path: None,
+            brain_config_hash: None,
             channel_buffer_size: 1000,
             enabled: true,
         }
@@ -1995,6 +2096,18 @@ fn hydrate_gatekeeper_routing_fields(log: &mut GatekeeperBuyLog, config: &Decisi
     }
     if log.config_hash.is_none() {
         log.config_hash = Some(config.gatekeeper_config_hash.clone());
+    }
+    if log.run_id.is_none() {
+        log.run_id = config.gatekeeper_run_id.clone();
+    }
+    if log.session_id.is_none() {
+        log.session_id = config.gatekeeper_session_id.clone();
+    }
+    if log.brain_config_path.is_none() {
+        log.brain_config_path = config.brain_config_path.clone();
+    }
+    if log.brain_config_hash.is_none() {
+        log.brain_config_hash = config.brain_config_hash.clone();
     }
 }
 
@@ -2466,6 +2579,10 @@ mod tests {
             gatekeeper_log_dir: temp_dir.path().to_path_buf(),
             gatekeeper_rollout_profile: "test-rollout".to_string(),
             gatekeeper_config_hash: "test-config-hash".to_string(),
+            gatekeeper_run_id: None,
+            gatekeeper_session_id: None,
+            brain_config_path: None,
+            brain_config_hash: None,
             channel_buffer_size: 10,
             enabled: true,
         };
@@ -2599,6 +2716,10 @@ mod tests {
             rollout_profile: Some("test-rollout".to_string()),
             decision_plane: None,
             config_hash: Some("test-config-hash".to_string()),
+            run_id: None,
+            session_id: None,
+            brain_config_path: None,
+            brain_config_hash: None,
             dev_pubkey: None,
             shadow_ready: None,
             shadow_missing_fields: None,
@@ -2949,13 +3070,31 @@ mod tests {
             tas_buy_ratio_score: None,
             pdd_hard_fail: None,
             pdd_entry_drift_pct: None,
+            pdd_entry_drift_elapsed_ms: None,
+            pdd_entry_drift_anchor_price: None,
+            pdd_entry_drift_current_price: None,
+            pdd_entry_drift_anchor_ts_ms: None,
+            pdd_entry_drift_current_ts_ms: None,
+            pdd_entry_drift_static_max_pct: None,
+            pdd_entry_drift_elapsed_max_pct: None,
+            pdd_entry_drift_effective_max_pct: None,
+            pdd_entry_drift_threshold_source: None,
             pdd_entry_drift_anchor_source: None,
             pdd_entry_drift_anchor_quality: None,
             pdd_spike_detected: None,
+            pdd_spike_ratio: None,
+            pdd_spike_ratio_quality: None,
+            pdd_spike_recent_rate: None,
+            pdd_spike_earlier_rate: None,
             pdd_ramping_detected: None,
             pdd_whale_top3_pct: None,
+            pdd_whale_single_max_pct: None,
             pdd_flash_crash_risk: None,
             pdd_score: None,
+            gatekeeper_first_kill_gate: None,
+            gatekeeper_first_kill_reason: None,
+            gatekeeper_terminal_gate: None,
+            gatekeeper_gate_trace: vec![],
             aps_regime: None,
             aps_shadow_entry_drift_max: None,
             aps_shadow_confidence_min: None,
@@ -2981,6 +3120,10 @@ mod tests {
             gatekeeper_log_dir: log_dir.clone(),
             gatekeeper_rollout_profile: "test-rollout".to_string(),
             gatekeeper_config_hash: "test-config-hash".to_string(),
+            gatekeeper_run_id: None,
+            gatekeeper_session_id: None,
+            brain_config_path: None,
+            brain_config_hash: None,
             channel_buffer_size: 10,
             enabled: true,
         };
@@ -3060,6 +3203,10 @@ mod tests {
             rollout_profile: Some("test-rollout".to_string()),
             decision_plane: None,
             config_hash: Some("test-config-hash".to_string()),
+            run_id: None,
+            session_id: None,
+            brain_config_path: None,
+            brain_config_hash: None,
             dev_pubkey: None,
             shadow_ready: None,
             shadow_missing_fields: None,
@@ -3402,13 +3549,31 @@ mod tests {
             tas_buy_ratio_score: None,
             pdd_hard_fail: None,
             pdd_entry_drift_pct: None,
+            pdd_entry_drift_elapsed_ms: None,
+            pdd_entry_drift_anchor_price: None,
+            pdd_entry_drift_current_price: None,
+            pdd_entry_drift_anchor_ts_ms: None,
+            pdd_entry_drift_current_ts_ms: None,
+            pdd_entry_drift_static_max_pct: None,
+            pdd_entry_drift_elapsed_max_pct: None,
+            pdd_entry_drift_effective_max_pct: None,
+            pdd_entry_drift_threshold_source: None,
             pdd_entry_drift_anchor_source: None,
             pdd_entry_drift_anchor_quality: None,
             pdd_spike_detected: None,
+            pdd_spike_ratio: None,
+            pdd_spike_ratio_quality: None,
+            pdd_spike_recent_rate: None,
+            pdd_spike_earlier_rate: None,
             pdd_ramping_detected: None,
             pdd_whale_top3_pct: None,
+            pdd_whale_single_max_pct: None,
             pdd_flash_crash_risk: None,
             pdd_score: None,
+            gatekeeper_first_kill_gate: None,
+            gatekeeper_first_kill_reason: None,
+            gatekeeper_terminal_gate: None,
+            gatekeeper_gate_trace: vec![],
             aps_regime: None,
             aps_shadow_entry_drift_max: None,
             aps_shadow_confidence_min: None,
@@ -3739,6 +3904,10 @@ mod tests {
             gatekeeper_log_dir: log_dir.clone(),
             gatekeeper_rollout_profile: "test-rollout".to_string(),
             gatekeeper_config_hash: "test-config-hash".to_string(),
+            gatekeeper_run_id: None,
+            gatekeeper_session_id: None,
+            brain_config_path: None,
+            brain_config_hash: None,
             channel_buffer_size: 10,
             enabled: true,
         };
@@ -3806,6 +3975,10 @@ mod tests {
             gatekeeper_log_dir: log_dir.clone(),
             gatekeeper_rollout_profile: "test-rollout".to_string(),
             gatekeeper_config_hash: "test-config-hash".to_string(),
+            gatekeeper_run_id: None,
+            gatekeeper_session_id: None,
+            brain_config_path: None,
+            brain_config_hash: None,
             channel_buffer_size: 10,
             enabled: true,
         };
@@ -3954,6 +4127,10 @@ mod tests {
             gatekeeper_log_dir: log_dir.clone(),
             gatekeeper_rollout_profile: "test-rollout".to_string(),
             gatekeeper_config_hash: "test-config-hash".to_string(),
+            gatekeeper_run_id: None,
+            gatekeeper_session_id: None,
+            brain_config_path: None,
+            brain_config_hash: None,
             channel_buffer_size: 10,
             enabled: true,
         };
@@ -4102,6 +4279,10 @@ mod tests {
             gatekeeper_log_dir: log_dir.clone(),
             gatekeeper_rollout_profile: "test-rollout".to_string(),
             gatekeeper_config_hash: "test-config-hash".to_string(),
+            gatekeeper_run_id: None,
+            gatekeeper_session_id: None,
+            brain_config_path: None,
+            brain_config_hash: None,
             channel_buffer_size: 10,
             enabled: true,
         };
@@ -4158,6 +4339,10 @@ mod tests {
             gatekeeper_log_dir: log_dir.clone(),
             gatekeeper_rollout_profile: "test-rollout".to_string(),
             gatekeeper_config_hash: "test-config-hash".to_string(),
+            gatekeeper_run_id: None,
+            gatekeeper_session_id: None,
+            brain_config_path: None,
+            brain_config_hash: None,
             channel_buffer_size: 10,
             enabled: true,
         };
@@ -4232,6 +4417,10 @@ mod tests {
             gatekeeper_log_dir: log_dir.clone(),
             gatekeeper_rollout_profile: "test-rollout".to_string(),
             gatekeeper_config_hash: "test-config-hash".to_string(),
+            gatekeeper_run_id: None,
+            gatekeeper_session_id: None,
+            brain_config_path: None,
+            brain_config_hash: None,
             channel_buffer_size: 10,
             enabled: true,
         };

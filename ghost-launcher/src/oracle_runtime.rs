@@ -1393,6 +1393,10 @@ pub struct OracleRuntimeConfig {
     pub session: SessionRuntimeConfig,
     pub tx_intelligence: TxIntelligenceRuntimeConfig,
     pub p37_shadow_probe: P37ShadowProbeConfig,
+    pub run_id: Option<String>,
+    pub session_id: Option<String>,
+    pub brain_config_path: Option<String>,
+    pub brain_config_hash: Option<String>,
 }
 
 impl OracleRuntimeConfig {
@@ -1433,6 +1437,10 @@ impl OracleRuntimeConfig {
             session: SessionRuntimeConfig::default(),
             tx_intelligence: TxIntelligenceRuntimeConfig::default(),
             p37_shadow_probe: P37ShadowProbeConfig::default(),
+            run_id: None,
+            session_id: None,
+            brain_config_path: None,
+            brain_config_hash: None,
         }
     }
 
@@ -1444,6 +1452,10 @@ impl OracleRuntimeConfig {
             session: SessionRuntimeConfig::default(),
             tx_intelligence: TxIntelligenceRuntimeConfig::default(),
             p37_shadow_probe: P37ShadowProbeConfig::default(),
+            run_id: None,
+            session_id: None,
+            brain_config_path: None,
+            brain_config_hash: None,
         }
     }
 
@@ -1496,6 +1508,10 @@ impl Default for OracleRuntimeConfig {
             session: SessionRuntimeConfig::default(),
             tx_intelligence: TxIntelligenceRuntimeConfig::default(),
             p37_shadow_probe: P37ShadowProbeConfig::default(),
+            run_id: None,
+            session_id: None,
+            brain_config_path: None,
+            brain_config_hash: None,
         }
     }
 }
@@ -4405,6 +4421,7 @@ fn build_buy_execution_join_metadata(
     assessment: &GatekeeperAssessment,
     config: &GatekeeperV3Config,
     rollout_profile: &str,
+    runtime_config: &OracleRuntimeConfig,
 ) -> ExecutionJoinMetadata {
     let pool_id_string = pool_id.to_string();
     let t0 = ensure_epoch_ms(
@@ -4425,6 +4442,16 @@ fn build_buy_execution_join_metadata(
             .then(|| config.v3_policy_config_hash()),
         decision_plane: Some("legacy_live".to_string()),
         rollout_namespace: Some(rollout_profile.to_string()),
+        run_id: runtime_config.run_id.clone().or_else(|| {
+            (!runtime_config.p37_shadow_probe.run_id.trim().is_empty())
+                .then(|| runtime_config.p37_shadow_probe.run_id.clone())
+        }),
+        session_id: runtime_config.session_id.clone().or_else(|| {
+            (!runtime_config.p37_shadow_probe.session_id.trim().is_empty())
+                .then(|| runtime_config.p37_shadow_probe.session_id.clone())
+        }),
+        brain_config_path: runtime_config.brain_config_path.clone(),
+        brain_config_hash: runtime_config.brain_config_hash.clone(),
         ..Default::default()
     }
 }
@@ -4665,6 +4692,8 @@ struct P37ShadowProbeCandidate {
     curve_data_known: Option<bool>,
     legacy_bonding_curve_snapshot: Option<BondingCurve>,
     rollout_namespace: String,
+    brain_config_path: Option<String>,
+    brain_config_hash: Option<String>,
     source_decision_plane: Option<String>,
     source_decision_log_path: Option<String>,
     source_decision_row_offset: Option<u64>,
@@ -4809,6 +4838,8 @@ impl P37ShadowProbeCandidate {
             curve_data_known: log.curve_data_known,
             legacy_bonding_curve_snapshot: p37_shadow_probe_legacy_curve_snapshot_from_log(log),
             rollout_namespace: rollout_namespace.to_string(),
+            brain_config_path: log.brain_config_path.clone(),
+            brain_config_hash: log.brain_config_hash.clone(),
             source_decision_plane: log.decision_plane.clone(),
             source_decision_log_path: None,
             source_decision_row_offset: None,
@@ -4890,6 +4921,8 @@ struct P37ShadowProbeSelectionRecord {
     rollout_namespace: String,
     run_id: Option<String>,
     session_id: Option<String>,
+    brain_config_path: Option<String>,
+    brain_config_hash: Option<String>,
     probe_id: Option<String>,
     source_ab_record_id: Option<String>,
     ab_record_id: Option<String>,
@@ -4956,8 +4989,6 @@ struct P37ShadowProbeTransportRecord {
     collection_plane: String,
     probe_plane: String,
     dispatch_source: String,
-    run_id: Option<String>,
-    session_id: Option<String>,
     candidate_id: String,
     pool_amm_id: String,
     pool_id: String,
@@ -5294,6 +5325,8 @@ fn p37_shadow_probe_selection_record(
         rollout_namespace: candidate.rollout_namespace.clone(),
         run_id: (!config.run_id.trim().is_empty()).then(|| config.run_id.clone()),
         session_id: (!config.session_id.trim().is_empty()).then(|| config.session_id.clone()),
+        brain_config_path: candidate.brain_config_path.clone(),
+        brain_config_hash: candidate.brain_config_hash.clone(),
         probe_id,
         source_ab_record_id: source_ab_record_id.clone(),
         ab_record_id: source_ab_record_id,
@@ -5380,6 +5413,10 @@ fn p37_shadow_probe_join_metadata(
         v3_policy_config_hash: record.v3_policy_config_hash.clone(),
         decision_plane: record.source_decision_plane.clone(),
         rollout_namespace: Some(record.rollout_namespace.clone()),
+        run_id: record.run_id.clone(),
+        session_id: record.session_id.clone(),
+        brain_config_path: record.brain_config_path.clone(),
+        brain_config_hash: record.brain_config_hash.clone(),
         source_decision_log_path: record.source_decision_log_path.clone(),
         source_decision_row_offset: record.source_decision_row_offset,
         source_decision_row_sha256: record.source_decision_row_sha256.clone(),
@@ -5412,8 +5449,6 @@ fn p37_shadow_probe_artifact_records(
         collection_plane: record.collection_plane.clone(),
         probe_plane: record.probe_plane.clone(),
         dispatch_source: record.dispatch_source.clone(),
-        run_id: record.run_id.clone(),
-        session_id: record.session_id.clone(),
         candidate_id: candidate_id.clone(),
         pool_amm_id: record.pool_id.clone(),
         pool_id: record.pool_id.clone(),
@@ -5519,8 +5554,6 @@ fn p37_shadow_probe_artifact_records(
         dispatch_source: Some(record.dispatch_source.clone()),
         probe_plane: Some(record.probe_plane.clone()),
         probe_bucket: Some(record.probe_bucket.clone()),
-        run_id: record.run_id.clone(),
-        session_id: record.session_id.clone(),
         probe_position_id: None,
         decision_ts_ms: Some(decision_ts_ms),
         probe_dispatch_ts_ms: Some(now_ms),
@@ -6636,8 +6669,6 @@ fn p37_shadow_probe_transport_from_event(
         collection_plane: record.collection_plane.clone(),
         probe_plane: record.probe_plane.clone(),
         dispatch_source: record.dispatch_source.clone(),
-        run_id: record.run_id.clone(),
-        session_id: record.session_id.clone(),
         candidate_id: event.candidate_id.clone(),
         pool_amm_id: event.pool_amm_id.clone(),
         pool_id: event.pool_amm_id.clone(),
@@ -6768,8 +6799,6 @@ fn p37_shadow_probe_transport_from_error(
         collection_plane: record.collection_plane.clone(),
         probe_plane: record.probe_plane.clone(),
         dispatch_source: record.dispatch_source.clone(),
-        run_id: record.run_id.clone(),
-        session_id: record.session_id.clone(),
         candidate_id: p37_shadow_probe_candidate_id(record).unwrap_or_default(),
         pool_amm_id: record.pool_id.clone(),
         pool_id: record.pool_id.clone(),
@@ -6881,8 +6910,18 @@ fn enrich_probe_shadow_entry(
     entry.dispatch_source = Some(record.dispatch_source.clone());
     entry.probe_plane = Some(record.probe_plane.clone());
     entry.probe_bucket = Some(record.probe_bucket.clone());
-    entry.run_id = record.run_id.clone();
-    entry.session_id = record.session_id.clone();
+    if entry.join_metadata.run_id.is_none() {
+        entry.join_metadata.run_id = record.run_id.clone();
+    }
+    if entry.join_metadata.session_id.is_none() {
+        entry.join_metadata.session_id = record.session_id.clone();
+    }
+    if entry.join_metadata.brain_config_path.is_none() {
+        entry.join_metadata.brain_config_path = record.brain_config_path.clone();
+    }
+    if entry.join_metadata.brain_config_hash.is_none() {
+        entry.join_metadata.brain_config_hash = record.brain_config_hash.clone();
+    }
     entry.probe_position_id = record
         .probe_id
         .as_ref()
@@ -7327,6 +7366,10 @@ fn build_decision_logger_config(
         gatekeeper_log_dir: log_dir,
         gatekeeper_rollout_profile,
         gatekeeper_config_hash,
+        gatekeeper_run_id: None,
+        gatekeeper_session_id: None,
+        brain_config_path: None,
+        brain_config_hash: None,
         channel_buffer_size: 1000,
         enabled: true,
     }
@@ -7375,6 +7418,31 @@ fn enrich_buy_log_with_vectors(
     log.vectors_prices = none_if_empty(vecs.prices);
     log.vectors_interval_ms = none_if_empty(vecs.interval_ms);
     log.vectors_d_price = none_if_empty(vecs.d_price);
+}
+
+fn enrich_buy_log_with_runtime_identity(
+    log: &mut ghost_brain::oracle::GatekeeperBuyLog,
+    ctx: &PoolObservationContext,
+) {
+    let runtime_config = &ctx.oracle_runtime.config;
+    if log.run_id.is_none() {
+        log.run_id = runtime_config.run_id.clone().or_else(|| {
+            (!runtime_config.p37_shadow_probe.run_id.trim().is_empty())
+                .then(|| runtime_config.p37_shadow_probe.run_id.clone())
+        });
+    }
+    if log.session_id.is_none() {
+        log.session_id = runtime_config.session_id.clone().or_else(|| {
+            (!runtime_config.p37_shadow_probe.session_id.trim().is_empty())
+                .then(|| runtime_config.p37_shadow_probe.session_id.clone())
+        });
+    }
+    if log.brain_config_path.is_none() {
+        log.brain_config_path = runtime_config.brain_config_path.clone();
+    }
+    if log.brain_config_hash.is_none() {
+        log.brain_config_hash = runtime_config.brain_config_hash.clone();
+    }
 }
 
 // =============================================================================
@@ -8968,6 +9036,7 @@ async fn execute_gatekeeper_buy_path(
                         &assessment,
                         &ctx.gatekeeper_v3_config,
                         &ctx.gatekeeper_rollout_profile,
+                        &ctx.oracle_runtime.config,
                     );
                     let receipt = execute_gatekeeper_buy_via_trigger_with_fsc_gate(
                         trigger_component,
@@ -9452,8 +9521,6 @@ fn shadow_entry_record_from_event(
         dispatch_source: None,
         probe_plane: None,
         probe_bucket: None,
-        run_id: None,
-        session_id: None,
         probe_position_id: None,
         decision_ts_ms: Some(event.decision_ts_ms),
         probe_dispatch_ts_ms: None,
@@ -9490,8 +9557,6 @@ fn shadow_entry_record_from_request(
         dispatch_source: None,
         probe_plane: None,
         probe_bucket: None,
-        run_id: None,
-        session_id: None,
         probe_position_id: None,
         decision_ts_ms: Some(request.decision_ts_ms),
         probe_dispatch_ts_ms: None,
@@ -9784,10 +9849,6 @@ struct ShadowEntryRecord {
     probe_plane: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     probe_bucket: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    run_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     probe_position_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -11499,6 +11560,7 @@ async fn pool_observation_task(
                         &window_state,
                     );
                 }
+                enrich_buy_log_with_runtime_identity(&mut buy_log, ctx.as_ref());
                 let probe_buffered_txs = {
                     let session = session.read();
                     session.gatekeeper_buffer().buffered_txs_slice().to_vec()
@@ -11614,6 +11676,7 @@ async fn pool_observation_task(
                         &window_state,
                     );
                 }
+                enrich_buy_log_with_runtime_identity(&mut buy_log, ctx.as_ref());
                 let probe_buffered_txs = {
                     let session = session.read();
                     session.gatekeeper_buffer().buffered_txs_slice().to_vec()
@@ -11810,6 +11873,7 @@ async fn pool_observation_task(
                                 &window_state,
                             );
                         }
+                        enrich_buy_log_with_runtime_identity(&mut buy_log, ctx.as_ref());
                         let retain_runtime_pool_for_probe_lifecycle =
                             maybe_handle_p37_shadow_probe_decision(
                                 ctx.as_ref(),
@@ -12024,6 +12088,7 @@ async fn pool_observation_task(
                         &window_state,
                     );
                 }
+                enrich_buy_log_with_runtime_identity(&mut buy_log, ctx.as_ref());
                 let retain_runtime_pool_for_probe_lifecycle =
                     maybe_handle_p37_shadow_probe_decision(
                         ctx.as_ref(),
@@ -12297,8 +12362,29 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
         "   📝 Decision Logger: AKTYWNY (path: {})",
         normalized_decision_log_path
     );
-    let decision_logger_config =
+    let mut decision_logger_config =
         build_decision_logger_config(&normalized_decision_log_path, &gatekeeper_config);
+    decision_logger_config.gatekeeper_run_id = oracle_runtime.config.run_id.clone().or_else(|| {
+        (!oracle_runtime
+            .config
+            .p37_shadow_probe
+            .run_id
+            .trim()
+            .is_empty())
+        .then(|| oracle_runtime.config.p37_shadow_probe.run_id.clone())
+    });
+    decision_logger_config.gatekeeper_session_id =
+        oracle_runtime.config.session_id.clone().or_else(|| {
+            (!oracle_runtime
+                .config
+                .p37_shadow_probe
+                .session_id
+                .trim()
+                .is_empty())
+            .then(|| oracle_runtime.config.p37_shadow_probe.session_id.clone())
+        });
+    decision_logger_config.brain_config_path = oracle_runtime.config.brain_config_path.clone();
+    decision_logger_config.brain_config_hash = oracle_runtime.config.brain_config_hash.clone();
     let gatekeeper_rollout_profile = decision_logger_config.gatekeeper_rollout_profile.clone();
 
     // Initialize Decision Logger for cyclic engine telemetry
@@ -13103,6 +13189,8 @@ mod tests {
             curve_data_known: Some(true),
             legacy_bonding_curve_snapshot: None,
             rollout_namespace: "p37-j3-test".to_string(),
+            brain_config_path: Some("configs/rollout/brain-r16.toml".to_string()),
+            brain_config_hash: Some("brain-hash".to_string()),
             source_decision_plane: Some("legacy_live".to_string()),
             source_decision_log_path: None,
             source_decision_row_offset: None,

@@ -41,7 +41,20 @@ pub struct PddDiagnostics {
     pub entry_drift_pct: Option<f64>,
     pub entry_drift_anchor_source: Option<&'static str>,
     pub entry_drift_anchor_quality: Option<&'static str>,
+    pub entry_drift_anchor_price: Option<f64>,
+    pub entry_drift_current_price: Option<f64>,
+    pub entry_drift_anchor_ts_ms: Option<u64>,
+    pub entry_drift_current_ts_ms: Option<u64>,
+    pub entry_drift_elapsed_ms: Option<u64>,
+    pub entry_drift_static_max_pct: Option<f64>,
+    pub entry_drift_elapsed_max_pct: Option<f64>,
+    pub entry_drift_effective_max_pct: Option<f64>,
+    pub entry_drift_threshold_source: Option<&'static str>,
     pub spike_detected: bool,
+    pub spike_ratio: Option<f64>,
+    pub spike_ratio_quality: Option<&'static str>,
+    pub spike_recent_rate: Option<f64>,
+    pub spike_earlier_rate: Option<f64>,
     pub ramping_detected: bool,
     pub whale_top3_pct: Option<f64>,
     pub whale_single_max_pct: Option<f64>,
@@ -60,7 +73,20 @@ impl PddDiagnostics {
             entry_drift_pct: None,
             entry_drift_anchor_source: None,
             entry_drift_anchor_quality: None,
+            entry_drift_anchor_price: None,
+            entry_drift_current_price: None,
+            entry_drift_anchor_ts_ms: None,
+            entry_drift_current_ts_ms: None,
+            entry_drift_elapsed_ms: None,
+            entry_drift_static_max_pct: None,
+            entry_drift_elapsed_max_pct: None,
+            entry_drift_effective_max_pct: None,
+            entry_drift_threshold_source: None,
             spike_detected: false,
+            spike_ratio: None,
+            spike_ratio_quality: None,
+            spike_recent_rate: None,
+            spike_earlier_rate: None,
             ramping_detected: false,
             whale_top3_pct: None,
             whale_single_max_pct: None,
@@ -92,13 +118,21 @@ pub fn evaluate_pdd(
     };
 
     // 1. Entry drift detection
-    let (drift, anchor_src, anchor_qual) = detect_entry_drift(buffer, config);
-    diag.entry_drift_pct = drift;
-    diag.entry_drift_anchor_source = anchor_src;
-    diag.entry_drift_anchor_quality = anchor_qual;
-    let drift_hard_max = regime_drift_max_pct.unwrap_or(config.entry_drift_max_pct);
-    if let Some(d) = drift {
-        if d > drift_hard_max {
+    let drift = detect_entry_drift(buffer, config, regime_drift_max_pct);
+    diag.entry_drift_pct = drift.drift_pct;
+    diag.entry_drift_anchor_source = drift.anchor_source;
+    diag.entry_drift_anchor_quality = drift.anchor_quality;
+    diag.entry_drift_anchor_price = drift.anchor_price;
+    diag.entry_drift_current_price = drift.current_price;
+    diag.entry_drift_anchor_ts_ms = drift.anchor_ts_ms;
+    diag.entry_drift_current_ts_ms = drift.current_ts_ms;
+    diag.entry_drift_elapsed_ms = drift.elapsed_ms;
+    diag.entry_drift_static_max_pct = Some(drift.static_max_pct);
+    diag.entry_drift_elapsed_max_pct = drift.elapsed_max_pct;
+    diag.entry_drift_effective_max_pct = Some(drift.effective_max_pct);
+    diag.entry_drift_threshold_source = Some(drift.threshold_source);
+    if let Some(d) = drift.drift_pct {
+        if d > drift.effective_max_pct {
             diag.hard_fail = Some(PddHardFail::EntryDrift);
             diag.pdd_score = 0.0;
             return diag;
@@ -113,13 +147,17 @@ pub fn evaluate_pdd(
     // 2. Spike pattern detection
     if config.spike_detection_enabled {
         let spike = detect_spike(buffer, config);
-        diag.spike_detected = spike;
-        if spike && config.spike_hard_veto {
+        diag.spike_detected = spike.detected;
+        diag.spike_ratio = spike.ratio;
+        diag.spike_ratio_quality = Some(spike.ratio_quality);
+        diag.spike_recent_rate = spike.recent_rate;
+        diag.spike_earlier_rate = spike.earlier_rate;
+        if spike.detected && config.spike_hard_veto {
             diag.hard_fail = Some(PddHardFail::Spike);
             diag.pdd_score = 0.0;
             return diag;
         }
-        if spike {
+        if spike.detected {
             diag.soft_penalty_points = diag
                 .soft_penalty_points
                 .saturating_add(config.spike_soft_penalty);
@@ -213,74 +251,146 @@ pub struct PddAnchorInfo {
 ///
 /// Drift is DIRECTIONAL: ((current / anchor) - 1.0) * 100.
 /// Positive drift = price pumped up from baseline = red flag.
+#[derive(Debug, Clone, Copy)]
+struct EntryDriftDetection {
+    drift_pct: Option<f64>,
+    anchor_source: Option<&'static str>,
+    anchor_quality: Option<&'static str>,
+    anchor_price: Option<f64>,
+    current_price: Option<f64>,
+    anchor_ts_ms: Option<u64>,
+    current_ts_ms: Option<u64>,
+    elapsed_ms: Option<u64>,
+    static_max_pct: f64,
+    elapsed_max_pct: Option<f64>,
+    effective_max_pct: f64,
+    threshold_source: &'static str,
+}
+
 fn detect_entry_drift(
     buffer: &GatekeeperBuffer,
-    _config: &PumpAndDumpDetectorConfig,
-) -> (Option<f64>, Option<&'static str>, Option<&'static str>) {
+    config: &PumpAndDumpDetectorConfig,
+    regime_drift_max_pct: Option<f64>,
+) -> EntryDriftDetection {
     let history = buffer.price_history();
+    let static_max_pct = regime_drift_max_pct.unwrap_or(config.entry_drift_max_pct);
+    let mut detection = EntryDriftDetection {
+        drift_pct: None,
+        anchor_source: None,
+        anchor_quality: None,
+        anchor_price: None,
+        current_price: None,
+        anchor_ts_ms: None,
+        current_ts_ms: None,
+        elapsed_ms: None,
+        static_max_pct,
+        elapsed_max_pct: None,
+        effective_max_pct: static_max_pct,
+        threshold_source: if regime_drift_max_pct.is_some() {
+            "regime_static"
+        } else {
+            "static"
+        },
+    };
     if history.is_empty() {
-        return (None, None, None);
+        detection.threshold_source = "fallback_no_anchor";
+        return detection;
     }
 
-    let current_price = match buffer.current_price() {
-        Some(p) if p > 0.0 => p,
-        _ => return (None, None, None),
+    let current = match buffer.last_price_point() {
+        Some(p) if p.price_sol_per_token.is_finite() && p.price_sol_per_token > 0.0 => p,
+        _ => {
+            detection.threshold_source = "fallback_no_anchor";
+            return detection;
+        }
+    };
+    detection.current_price = Some(current.price_sol_per_token);
+    detection.current_ts_ms = Some(current.timestamp_ms);
+
+    let anchor = history
+        .iter()
+        .find(|p| {
+            p.curve_data_known
+                && p.price_sol_per_token.is_finite()
+                && p.price_sol_per_token > 0.0
+                && p.v_sol_in_curve.is_finite()
+                && p.v_sol_in_curve > 0.0
+        })
+        .map(|p| (*p, "init_pool_authoritative", "strong"))
+        .or_else(|| {
+            history
+                .iter()
+                .find(|p| {
+                    p.price_sol_per_token.is_finite()
+                        && p.price_sol_per_token > 0.0
+                        && p.v_sol_in_curve.is_finite()
+                        && p.v_sol_in_curve > 0.0
+                })
+                .map(|p| (*p, "account_state_reserve", "strong"))
+        })
+        .or_else(|| {
+            history
+                .iter()
+                .find(|p| {
+                    p.curve_data_known
+                        && p.price_sol_per_token.is_finite()
+                        && p.price_sol_per_token > 0.0
+                })
+                .map(|p| (*p, "curve_known_parser", "strong"))
+        })
+        .or_else(|| {
+            history
+                .first()
+                .filter(|p| p.price_sol_per_token.is_finite() && p.price_sol_per_token > 0.0)
+                .map(|p| (*p, "first_price_point_fallback", "weak"))
+        });
+
+    let Some((anchor, source, quality)) = anchor else {
+        detection.threshold_source = "fallback_no_anchor";
+        return detection;
     };
 
-    // Level 1: curve_data_known=true AND v_sol_in_curve > 0 — parser + real reserve
-    if let Some(l1) = history
-        .iter()
-        .find(|p| p.curve_data_known && p.price_sol_per_token > 0.0 && p.v_sol_in_curve > 0.0)
-    {
-        let drift = ((current_price / l1.price_sol_per_token) - 1.0) * 100.0;
-        if drift > 0.0 {
-            return (Some(drift), Some("init_pool_authoritative"), Some("strong"));
-        }
-        return (None, None, None);
+    detection.anchor_source = Some(source);
+    detection.anchor_quality = Some(quality);
+    detection.anchor_price = Some(anchor.price_sol_per_token);
+    detection.anchor_ts_ms = Some(anchor.timestamp_ms);
+    if current.timestamp_ms < anchor.timestamp_ms {
+        detection.threshold_source = "invalid_timestamp_order";
+        return detection;
     }
 
-    // Level 2: v_sol_in_curve > 0 — real on-chain reserve (AccountStateCore), regardless of curve_data_known
-    if let Some(l2) = history
-        .iter()
-        .find(|p| p.price_sol_per_token > 0.0 && p.v_sol_in_curve > 0.0)
-    {
-        let drift = ((current_price / l2.price_sol_per_token) - 1.0) * 100.0;
-        if drift > 0.0 {
-            return (Some(drift), Some("account_state_reserve"), Some("strong"));
-        }
-        return (None, None, None);
+    let elapsed_ms = current.timestamp_ms - anchor.timestamp_ms;
+    detection.elapsed_ms = Some(elapsed_ms);
+
+    if config.entry_drift_elapsed_scaling_enabled {
+        let elapsed_seconds = elapsed_ms as f64 / 1000.0;
+        let elapsed_max = (config.entry_drift_elapsed_base_pct
+            + config.entry_drift_elapsed_slope_pct_per_second * elapsed_seconds)
+            .min(config.entry_drift_elapsed_cap_pct);
+        detection.elapsed_max_pct = Some(elapsed_max);
+        detection.effective_max_pct = elapsed_max;
+        detection.threshold_source = "elapsed_scaled";
     }
 
-    // Level 3: curve_data_known=true — parser-authoritative, reserve may not be populated
-    if let Some(l3) = history
-        .iter()
-        .find(|p| p.curve_data_known && p.price_sol_per_token > 0.0)
-    {
-        let drift = ((current_price / l3.price_sol_per_token) - 1.0) * 100.0;
-        if drift > 0.0 {
-            return (Some(drift), Some("curve_known_parser"), Some("strong"));
-        }
-        return (None, None, None);
+    let drift = ((current.price_sol_per_token / anchor.price_sol_per_token) - 1.0) * 100.0;
+    if drift > 0.0 {
+        detection.drift_pct = Some(drift);
     }
 
-    // Level 4: fallback — first price history point of any quality
-    let first = &history[0];
-    if first.price_sol_per_token > 0.0 {
-        let drift = ((current_price / first.price_sol_per_token) - 1.0) * 100.0;
-        if drift > 0.0 {
-            return (
-                Some(drift),
-                Some("first_price_point_fallback"),
-                Some("weak"),
-            );
-        }
-    }
-
-    (None, None, None)
+    detection
 }
 
 /// Detect volume spike: compare recent volume rate vs earlier period.
-fn detect_spike(buffer: &GatekeeperBuffer, config: &PumpAndDumpDetectorConfig) -> bool {
+#[derive(Debug, Clone, Copy, Default)]
+struct SpikeDetection {
+    detected: bool,
+    ratio: Option<f64>,
+    ratio_quality: &'static str,
+    recent_rate: Option<f64>,
+    earlier_rate: Option<f64>,
+}
+
+fn detect_spike(buffer: &GatekeeperBuffer, config: &PumpAndDumpDetectorConfig) -> SpikeDetection {
     let last_ts = buffer.highest_seen_ts_ms();
     let spike_start = last_ts.saturating_sub(config.spike_observation_window_ms);
 
@@ -296,8 +406,17 @@ fn detect_spike(buffer: &GatekeeperBuffer, config: &PumpAndDumpDetectorConfig) -
         }
     }
 
-    if earlier_vol <= 0.0 || recent_vol <= 0.0 {
-        return false;
+    if buffer.buffered_txs_slice().is_empty() {
+        return SpikeDetection {
+            ratio_quality: "unavailable",
+            ..SpikeDetection::default()
+        };
+    }
+    if recent_vol <= 0.0 {
+        return SpikeDetection {
+            ratio_quality: "insufficient_recent_window",
+            ..SpikeDetection::default()
+        };
     }
 
     let recent_dur = config.spike_observation_window_ms as f64;
@@ -308,12 +427,38 @@ fn detect_spike(buffer: &GatekeeperBuffer, config: &PumpAndDumpDetectorConfig) -
     .saturating_sub(config.spike_observation_window_ms) as f64;
 
     if earlier_dur <= 0.0 {
-        return false;
+        return SpikeDetection {
+            ratio_quality: "insufficient_earlier_window",
+            ..SpikeDetection::default()
+        };
     }
 
     let recent_rate = recent_vol / recent_dur;
+    if earlier_vol <= 0.0 {
+        return SpikeDetection {
+            ratio_quality: "earlier_rate_zero",
+            recent_rate: Some(recent_rate),
+            earlier_rate: Some(0.0),
+            ..SpikeDetection::default()
+        };
+    }
     let earlier_rate = earlier_vol / earlier_dur;
-    recent_rate > earlier_rate * config.spike_ratio_threshold
+    if !earlier_rate.is_finite() || earlier_rate <= 0.0 {
+        return SpikeDetection {
+            ratio_quality: "earlier_rate_zero",
+            recent_rate: Some(recent_rate),
+            earlier_rate: Some(earlier_rate),
+            ..SpikeDetection::default()
+        };
+    }
+    let ratio = recent_rate / earlier_rate;
+    SpikeDetection {
+        detected: ratio > config.spike_ratio_threshold,
+        ratio: Some(ratio),
+        ratio_quality: "ok",
+        recent_rate: Some(recent_rate),
+        earlier_rate: Some(earlier_rate),
+    }
 }
 
 /// Detect ramping: N consecutive buys of similar size.
