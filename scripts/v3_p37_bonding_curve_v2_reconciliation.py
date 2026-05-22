@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import base64
 import re
 import sys
 from collections import Counter
@@ -109,6 +110,19 @@ def recursive_contains_value(value: Any, needle: str | None) -> bool:
     if isinstance(value, list):
         return any(recursive_contains_value(v, needle) for v in value)
     return False
+
+
+def recursive_string_values_for_keys(value: Any, keys: set[str]) -> list[str]:
+    found: list[str] = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key in keys and isinstance(child, str):
+                found.append(child)
+            found.extend(recursive_string_values_for_keys(child, keys))
+    elif isinstance(value, list):
+        for child in value:
+            found.extend(recursive_string_values_for_keys(child, keys))
+    return sorted(set(found))
 
 
 def flatten_decision_logs(decision_root: Path) -> list[tuple[Path, int, dict[str, Any]]]:
@@ -346,6 +360,24 @@ def account_fields_from_decision(row: dict[str, Any] | None, pubkey: str | None)
         }
     snapshot = row.get("v3_materialized_feature_snapshot") or {}
     account_features = snapshot.get("account_features") or {}
+    mfs_bonding_curve_pubkeys = recursive_string_values_for_keys(
+        snapshot,
+        {
+            "bonding_curve",
+            "bonding_curve_pubkey",
+            "bondingCurve",
+            "bondingCurvePubkey",
+        },
+    )
+    mfs_bonding_curve_v2_pubkeys = recursive_string_values_for_keys(
+        snapshot,
+        {
+            "bonding_curve_v2",
+            "bonding_curve_v2_pubkey",
+            "bondingCurveV2",
+            "bondingCurveV2Pubkey",
+        },
+    )
     return {
         "decision_row_present": True,
         "verdict_type": row.get("verdict_type"),
@@ -357,6 +389,8 @@ def account_fields_from_decision(row: dict[str, Any] | None, pubkey: str | None)
         "mfs_present": bool(snapshot),
         "mfs_contains_bonding_curve_v2_key": recursive_contains_key(snapshot, "bonding_curve_v2"),
         "mfs_contains_builder_bcv2_pubkey": recursive_contains_value(snapshot, pubkey),
+        "mfs_bonding_curve_pubkeys": mfs_bonding_curve_pubkeys,
+        "mfs_bonding_curve_v2_pubkeys": mfs_bonding_curve_v2_pubkeys,
         "mfs_contains_pool_id": recursive_contains_value(snapshot, row.get("pool_id")),
         "account_features_update_count": account_features.get("update_count"),
         "account_features_state_phase": account_features.get("state_phase"),
@@ -434,7 +468,10 @@ def rpc_get_multiple_accounts(rpc_url: str, pubkeys: list[str]) -> dict[str, Any
         req = urllib_request.Request(
             rpc_url,
             data=data,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "curl/8.0 ghost-p37-bcv2-reconciliation",
+            },
             method="POST",
         )
         with urllib_request.urlopen(req, timeout=20) as response:
@@ -449,14 +486,17 @@ def rpc_get_multiple_accounts(rpc_url: str, pubkeys: list[str]) -> dict[str, Any
                 data_field = account.get("data")
                 data_len = None
                 if isinstance(data_field, list) and data_field:
-                    data_len = len(data_field[0])
+                    try:
+                        data_len = len(base64.b64decode(data_field[0], validate=False))
+                    except Exception:
+                        data_len = len(data_field[0])
                 results[pubkey] = {
                     "rpc_current_status": "present",
                     "rpc_current_owner": account.get("owner"),
                     "rpc_current_lamports": account.get("lamports"),
                     "rpc_current_executable": account.get("executable"),
                     "rpc_current_rent_epoch": account.get("rentEpoch"),
-                    "rpc_current_data_base64_len": data_len,
+                    "rpc_current_data_len": data_len,
                 }
     return results
 

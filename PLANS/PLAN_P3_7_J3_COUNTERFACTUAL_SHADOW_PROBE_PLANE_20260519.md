@@ -1596,7 +1596,14 @@ belongs in the builder account-meta set, not in a precheck exception.
 
 ### Next Gate
 
-After code-level validation, the next runtime gate is a small R16-r10 smoke:
+After code-level validation, the smoke gate is intentionally deferred until the
+source/coverage question is resolved. The immediate next gate is L1R12 coverage
+matrix, because `bonding_curve_v2` may be absent from AccountUpdate coverage
+for legitimate read-only-meta reasons while still being required by RPC
+simulation.
+
+A small R16-r10 smoke is only appropriate after L1R12 chooses a concrete repair
+path:
 
 ```text
 shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r10-bcv2-source-authority
@@ -1615,6 +1622,112 @@ Failure conditions:
 - `AccountNotFound` reappears after simulation for `bonding_curve_v2`;
 - authority status is missing on rows that carry builder-required
   `bonding_curve_v2`.
+
+## P3.7-L1R12 / J3P BondingCurveV2 Coverage Matrix / Route Decision
+
+### Trigger
+
+L1R11 made `bonding_curve_v2` source authority fail closed, but it did not by
+itself decide whether the missing exact `bonding_curve_v2` was:
+
+- a read-only transaction meta that simply does not appear in
+  `DIAG_ACCOUNT_UPDATE_RELAY`;
+- an existing RPC account that is not materialized by V3/MFS;
+- a wrong route-builder account derivation;
+- a prepared-request/account-manifest handoff mismatch.
+
+That distinction matters because `AccountUpdate` coverage and simulation-load
+readiness are different contracts. A read-only account meta can be absent from
+account updates while still being a valid account that RPC simulation must load.
+L1R12 therefore adds an offline/current-preflight coverage matrix before any
+new smoke, L2 ablation, collection, or threshold work.
+
+### Matrix Inputs
+
+For each active-shadow or probe row blocked by builder-required
+`bonding_curve_v2`, L1R12 records:
+
+```text
+pool_id
+mint
+buy_variant
+route_kind
+instruction_index
+account_index
+builder_bonding_curve_v2_pubkey
+tx_meta_account_16_pubkey
+diag_bonding_curve_pubkey
+mfs_bonding_curve_pubkeys
+mfs_bonding_curve_v2_pubkeys
+rpc_get_account(builder_bcv2).status
+rpc_get_account(builder_bcv2).owner
+rpc_get_account(builder_bcv2).data_len
+diag_seen_exact_builder_bcv2
+diag_seen_other_curve_for_mint
+```
+
+The RPC check is explicitly current preflight evidence. It is not decision-time
+Gatekeeper evidence and must not be used to change policy scores.
+
+### R16-r9 Matrix Result
+
+The L1R12 matrix over the R16-r9 artifacts produced:
+
+```text
+matrix_rows = 5
+active_shadow_rows = 2
+probe_rows = 3
+rpc_current_checked = true
+rpc_get_account_status_counts = {"missing": 5}
+matrix_classifications = {"builder_bcv2_missing_on_rpc": 5}
+diag_seen_exact_builder_bcv2_rows = 0
+diag_seen_other_curve_for_mint_rows = 5
+mfs_contains_builder_bcv2_pubkey_rows = 0
+tx_meta_account_16_matches_builder_bcv2_rows = 2
+```
+
+Interpretation:
+
+- DIAG saw another same-mint `bonding_curve`, not the exact builder
+  `bonding_curve_v2`.
+- V3/MFS did not materialize the exact builder `bonding_curve_v2`.
+- Current RPC preflight reports all analyzed builder `bonding_curve_v2` pubkeys
+  as missing.
+- For active-shadow rows with account meta index evidence, tx account index 16
+  matches the builder `bonding_curve_v2`, so the active prepared-request
+  manifest is internally consistent.
+
+### Decision
+
+The next repair path is:
+
+```text
+route_builder_source_repair_or_route_fallback
+```
+
+L1R12 rules out the immediate `rpc_readiness_source_only` fix for the analyzed
+sample, because the builder `bonding_curve_v2` accounts were not merely missing
+from DIAG/MFS; they were also missing from current RPC.
+
+The next implementation step should inspect the routed-exact-SOL-in
+`bonding_curve_v2` derivation/source and choose one of:
+
+- derive/select an existing route-valid simulation-load account;
+- use a route fallback that does not place invalid `bonding_curve_v2` metas in
+  the transaction;
+- exclude this route/account class from execution-label collection until a
+  valid account identity exists.
+
+### Non-Goals
+
+L1R12 does not authorize:
+
+- L2 ablation;
+- collection;
+- Phase B, P2, or live execution;
+- Gatekeeper threshold tuning;
+- treating missing `bonding_curve_v2` as success;
+- relying on AccountUpdate absence alone as proof of account non-existence.
 
 ## P3.7-L1R9 Active Shadow BondingCurveV2 Precheck Contract
 
