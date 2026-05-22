@@ -1552,6 +1552,68 @@ entries, L1R9 is still a valid contract PASS. It means the runtime no longer
 misclassifies missing simulation-load accounts as lifecycle-eligible execution,
 but active shadow execution remains blocked by account readiness/coverage.
 
+## P3.7-L1R10 BondingCurveV2 Readiness / Route Source Reconciliation
+
+### Trigger
+
+L1R9 proved the active shadow `bonding_curve_v2` precheck contract, but it also
+made the real blocker explicit:
+
+```text
+active/probe builder requires bonding_curve_v2
+bonding_curve_v2 is missing for simulation-load readiness
+execution fails closed before simulate_buy
+```
+
+The remaining question is not attribution or policy tuning. It is source
+reconciliation: why does the builder require a `bonding_curve_v2` account that
+the account-update truth source and V3/MFS snapshot do not prove as
+simulation-load-ready?
+
+### Diagnostic Contract
+
+For every `execution_account_not_ready:bonding_curve_v2:<pubkey>` row, L1R10
+must compare:
+
+- builder/prepared-request `bonding_curve_v2` pubkey;
+- active/probe artifact source;
+- V3/MFS decision row and feature snapshot;
+- DIAG_ACCOUNT_UPDATE_RELAY evidence for the exact pubkey;
+- DIAG_ACCOUNT_UPDATE_RELAY evidence for another curve pubkey with the same
+  mint;
+- optional current RPC visibility, explicitly labeled as current and not
+  decision-time evidence.
+
+### R16-r9 Reconciliation Result
+
+The initial L1R10 report over R16-r9 classified all reconciled rows as:
+
+```text
+builder_pubkey_not_seen_in_diag
+```
+
+Observed:
+
+```text
+active_shadow_bcv2_not_ready_rows = 2
+probe_bcv2_not_ready_rows = 3
+diag_seen_exact_pubkey_rows = 0
+diag_seen_other_curve_pubkey_rows = 5
+mfs_contains_bonding_curve_v2_key_rows = 0
+mfs_contains_builder_bcv2_pubkey_rows = 0
+```
+
+Interpretation:
+
+- DIAG proves a legacy/same-mint `bonding_curve` identity, not the exact
+  `bonding_curve_v2` pubkey inserted by the builder.
+- V3/MFS does not materialize the exact `bonding_curve_v2` identity.
+- The next fix is a route-source/account-coverage decision, not L2 ablation.
+
+Collection, L2 ablation, Phase B, P2/live, threshold tuning and IWIM changes
+remain out of scope until `bonding_curve_v2` readiness/source is either fixed
+or explicitly classified as a controlled skip universe.
+
 ## P3.7-L1R6 — Active Shadow Dispatch AccountNotFound Attribution / Precheck Contract
 
 ### Context
