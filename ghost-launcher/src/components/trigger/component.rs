@@ -8658,6 +8658,7 @@ mod tests {
         let output_path = temp.path().join("shadow").join("buys.jsonl");
         let event = crate::events::ShadowBuySimulationEvent {
             join_metadata: ExecutionJoinMetadata::default(),
+            account_diagnostics: crate::events::ShadowSimulationAccountDiagnostics::default(),
             candidate_id: crate::events::build_execution_candidate_id("mint", "pool", "10"),
             pool_amm_id: "pool".to_string(),
             base_mint: "mint".to_string(),

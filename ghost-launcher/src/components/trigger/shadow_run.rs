@@ -3,6 +3,7 @@ use crate::components::trigger::component::TriggerDispatchFailureContext;
 use crate::config::{ShadowRunCommitment, TriggerEntryMode, TriggerShadowRunConfig};
 use crate::events::{
     build_execution_candidate_id, ExecutionJoinMetadata, ShadowBuySimulationEvent,
+    ShadowSimulationAccountDiagnostics,
 };
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -80,6 +81,8 @@ impl ShadowDispatchStatus {
 pub struct ShadowDispatchLifecycleRecord {
     #[serde(default, flatten)]
     pub join_metadata: ExecutionJoinMetadata,
+    #[serde(default, flatten)]
+    pub account_diagnostics: ShadowSimulationAccountDiagnostics,
     pub record_type: String,
     pub dispatch_id: String,
     pub idempotency_key: String,
@@ -133,6 +136,7 @@ impl ShadowDispatchLifecycleRecord {
         });
         ShadowDispatchLifecycleRecord {
             join_metadata: record.join_metadata.clone(),
+            account_diagnostics: record.account_diagnostics.clone(),
             record_type: "shadow_dispatch".to_string(),
             dispatch_id: format!("shadow-dispatch:{idempotency_key}"),
             idempotency_key,
@@ -173,6 +177,7 @@ impl ShadowDispatchLifecycleRecord {
         let idempotency_key = make_shadow_idempotency_key(pool_amm_id, &join_key, &rollout_profile);
         ShadowDispatchLifecycleRecord {
             join_metadata: request.join_metadata.clone(),
+            account_diagnostics: ShadowSimulationAccountDiagnostics::default(),
             record_type: "shadow_dispatch".to_string(),
             dispatch_id: format!("shadow-dispatch:{idempotency_key}"),
             idempotency_key,
@@ -269,6 +274,8 @@ pub struct ShadowBuySimulationReport {
 pub struct ShadowBuySimulationRecord {
     #[serde(default, flatten)]
     pub join_metadata: ExecutionJoinMetadata,
+    #[serde(default, flatten)]
+    pub account_diagnostics: ShadowSimulationAccountDiagnostics,
     pub candidate_id: String,
     pub pool_amm_id: String,
     pub base_mint: String,
@@ -372,6 +379,7 @@ impl ShadowBuySimulationRecord {
         let diagnostics = shadow_error_diagnostics(event.err.as_deref());
         ShadowBuySimulationRecord {
             join_metadata: event.join_metadata.clone(),
+            account_diagnostics: event.account_diagnostics.clone(),
             candidate_id: event.candidate_id.clone(),
             pool_amm_id: event.pool_amm_id.clone(),
             base_mint: event.base_mint.clone(),
@@ -418,6 +426,7 @@ impl ShadowBuySimulationRecord {
         let diagnostics = shadow_error_diagnostics(Some(&err_string));
         ShadowBuySimulationRecord {
             join_metadata: request.join_metadata.clone(),
+            account_diagnostics: ShadowSimulationAccountDiagnostics::default(),
             candidate_id: build_execution_candidate_id(
                 base_mint,
                 pool_amm_id,
@@ -463,6 +472,13 @@ impl ShadowBuySimulationRecord {
         let diagnostics = shadow_error_diagnostics(Some(&err_string));
         ShadowBuySimulationRecord {
             join_metadata: context.join_metadata.clone(),
+            account_diagnostics: ShadowSimulationAccountDiagnostics {
+                active_shadow_precheck_status: Some("not_run_no_prepared_request".to_string()),
+                active_shadow_lifecycle_eligibility_status: Some(
+                    "not_lifecycle_eligible".to_string(),
+                ),
+                ..Default::default()
+            },
             candidate_id: build_execution_candidate_id(
                 base_mint,
                 pool_amm_id,
@@ -525,6 +541,7 @@ pub fn shadow_failure_event_from_request(
     let diagnostics = shadow_error_diagnostics(Some(&err_string));
     ShadowBuySimulationEvent {
         join_metadata: request.join_metadata.clone(),
+        account_diagnostics: ShadowSimulationAccountDiagnostics::default(),
         candidate_id: build_execution_candidate_id(
             base_mint,
             pool_amm_id,
@@ -571,6 +588,11 @@ pub fn shadow_failure_event_from_context(
     let diagnostics = shadow_error_diagnostics(Some(&err_string));
     ShadowBuySimulationEvent {
         join_metadata: context.join_metadata.clone(),
+        account_diagnostics: ShadowSimulationAccountDiagnostics {
+            active_shadow_precheck_status: Some("not_run_no_prepared_request".to_string()),
+            active_shadow_lifecycle_eligibility_status: Some("not_lifecycle_eligible".to_string()),
+            ..Default::default()
+        },
         candidate_id: build_execution_candidate_id(
             base_mint,
             pool_amm_id,
@@ -641,6 +663,7 @@ pub(crate) fn shadow_buy_event_from_report(
     let diagnostics = shadow_error_diagnostics(err.as_deref());
     ShadowBuySimulationEvent {
         join_metadata,
+        account_diagnostics: ShadowSimulationAccountDiagnostics::default(),
         candidate_id: build_execution_candidate_id(base_mint, pool_amm_id, trace_ref),
         pool_amm_id: pool_amm_id.to_string(),
         base_mint: base_mint.to_string(),
@@ -1194,6 +1217,7 @@ mod tests {
     fn sample_event(live_signature: Option<&str>, err: Option<&str>) -> ShadowBuySimulationEvent {
         ShadowBuySimulationEvent {
             join_metadata: ExecutionJoinMetadata::default(),
+            account_diagnostics: ShadowSimulationAccountDiagnostics::default(),
             candidate_id: build_execution_candidate_id(
                 "mint",
                 "pool",

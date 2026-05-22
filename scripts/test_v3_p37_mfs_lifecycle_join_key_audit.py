@@ -1115,6 +1115,141 @@ lifecycle_log_path = "../../logs/shadow_run/r15-probe/probe_lifecycle.jsonl"
         self.assertEqual(transport["feature_hash_mismatch"], 1)
         self.assertEqual(transport["mismatch_reasons"], {"feature_hash_mismatch": 1})
 
+    def test_active_shadow_account_not_found_attribution_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "configs/rollout/r16.toml"
+            config.parent.mkdir(parents=True)
+            config.write_text(
+                """
+[oracle]
+decision_log_path = "../../logs/rollout/r16/decisions"
+
+[trigger.shadow_run]
+output_path = "../../logs/shadow_run/r16/buys.jsonl"
+
+[execution.shadow]
+entry_log_path = "../../logs/shadow_run/r16/shadow_entries.jsonl"
+lifecycle_log_path = "../../logs/shadow_run/r16/shadow_lifecycle.jsonl"
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            common = {
+                "candidate_id": "pool_mint_1000",
+                "ab_record_id": "ab-buy",
+                "pool_id": "pool",
+                "base_mint": "mint",
+                "decision_ts_ms": 1000,
+                "v3_replay_payload_schema_version": 1,
+                "v3_feature_snapshot_hash": "feature-hash",
+                "v3_policy_config_hash": "policy-hash",
+            }
+            failure = {
+                **common,
+                "dispatch_status": "failed",
+                "simulation_outcome": "failed",
+                "err": "shadow RPC simulate failed: AccountNotFound",
+                "active_shadow_precheck_status": "not_run_post_simulation_attribution",
+                "active_shadow_lifecycle_eligibility_status": "not_lifecycle_eligible",
+                "simulation_error_kind": "AccountNotFound",
+                "simulation_error_category": "simulation_account_not_found_attributed",
+                "simulation_error_account_pubkey": "missing-account",
+                "simulation_error_account_role": "bonding_curve_v2",
+                "simulation_error_account_candidates_narrowed": [
+                    {
+                        "pubkey": "missing-account",
+                        "role": "bonding_curve_v2",
+                        "source": "route_builder",
+                        "required": True,
+                    }
+                ],
+                "account_set_match": True,
+            }
+            write_jsonl(
+                root / "logs/rollout/r16/decisions/gatekeeper_v2_decisions.jsonl",
+                [common],
+            )
+            write_jsonl(root / "logs/shadow_run/r16/buys.jsonl", [failure])
+            write_jsonl(root / "logs/shadow_run/r16/shadow_entries.jsonl", [failure])
+            write_jsonl(root / "logs/shadow_run/r16/shadow_lifecycle.jsonl", [failure])
+
+            report = audit.build_report(config)
+
+        active = report["active_shadow_dispatch_diagnostics"]
+        self.assertEqual(active["active_shadow_dispatch_failure_rows"], 3)
+        self.assertEqual(active["active_shadow_account_not_found_rows"], 3)
+        self.assertEqual(active["active_shadow_account_not_found_attributed_rows"], 3)
+        self.assertEqual(active["active_shadow_account_not_found_unattributed_rows"], 0)
+        self.assertEqual(active["active_shadow_lifecycle_eligible_failure_rows"], 0)
+        self.assertEqual(
+            active["active_shadow_account_not_found_role_counts"],
+            {"bonding_curve_v2": 3},
+        )
+        self.assertNotIn(
+            "active_shadow_dispatch_failure_marked_lifecycle_eligible",
+            report["readiness"]["reasons"],
+        )
+
+    def test_active_shadow_unattributed_account_not_found_blocks_readiness(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "configs/rollout/r16.toml"
+            config.parent.mkdir(parents=True)
+            config.write_text(
+                """
+[oracle]
+decision_log_path = "../../logs/rollout/r16/decisions"
+
+[trigger.shadow_run]
+output_path = "../../logs/shadow_run/r16/buys.jsonl"
+
+[execution.shadow]
+entry_log_path = "../../logs/shadow_run/r16/shadow_entries.jsonl"
+lifecycle_log_path = "../../logs/shadow_run/r16/shadow_lifecycle.jsonl"
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            common = {
+                "candidate_id": "pool_mint_1000",
+                "ab_record_id": "ab-buy",
+                "pool_id": "pool",
+                "base_mint": "mint",
+                "decision_ts_ms": 1000,
+                "v3_replay_payload_schema_version": 1,
+            }
+            failure = {
+                **common,
+                "dispatch_status": "failed",
+                "simulation_outcome": "failed",
+                "err": "shadow RPC simulate failed: AccountNotFound",
+                "simulation_error_kind": "AccountNotFound",
+                "simulation_error_category": "simulation_account_not_found_unattributed",
+                "active_shadow_lifecycle_eligibility_status": "lifecycle_eligible",
+            }
+            write_jsonl(
+                root / "logs/rollout/r16/decisions/gatekeeper_v2_decisions.jsonl",
+                [common],
+            )
+            write_jsonl(root / "logs/shadow_run/r16/buys.jsonl", [failure])
+            write_jsonl(root / "logs/shadow_run/r16/shadow_entries.jsonl", [failure])
+            write_jsonl(root / "logs/shadow_run/r16/shadow_lifecycle.jsonl", [failure])
+
+            report = audit.build_report(config)
+
+        active = report["active_shadow_dispatch_diagnostics"]
+        self.assertEqual(active["active_shadow_account_not_found_unattributed_rows"], 3)
+        self.assertEqual(active["active_shadow_lifecycle_eligible_failure_rows"], 3)
+        self.assertIn(
+            "active_shadow_unattributed_account_not_found",
+            report["readiness"]["reasons"],
+        )
+        self.assertIn(
+            "active_shadow_dispatch_failure_marked_lifecycle_eligible",
+            report["readiness"]["reasons"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

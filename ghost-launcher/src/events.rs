@@ -39,6 +39,112 @@ use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SimulationAccountManifestEntry {
+    pub pubkey: String,
+    pub role: String,
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruction_index: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_index: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_signer: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_writable: Option<bool>,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_expected: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buy_variant: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_param_role: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SimulationAccountNotFoundCandidate {
+    pub pubkey: String,
+    pub role: String,
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruction_index: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_index: Option<u64>,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_fatality: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_exclusion_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShadowSimulationAccountDiagnostics {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_shadow_precheck_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_shadow_lifecycle_eligibility_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub simulation_error_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub simulation_error_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub simulation_error_account_pubkey: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub simulation_error_account_role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub simulation_error_account_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub simulation_error_instruction_index: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub simulation_error_account_index: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub simulation_error_account_candidates: Vec<SimulationAccountNotFoundCandidate>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub simulation_error_account_candidates_raw: Vec<SimulationAccountNotFoundCandidate>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub simulation_error_account_candidates_narrowed: Vec<SimulationAccountNotFoundCandidate>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub simulation_error_account_candidates_excluded: Vec<SimulationAccountNotFoundCandidate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub simulation_error_account_narrowing_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub simulation_error_account_narrowing_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub simulation_error_category: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub precheck_account_set_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_request_account_set_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub simulation_account_set_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub precheck_account_set_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_request_account_set_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub simulation_account_set_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_set_match: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_set_mismatch_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accounts_only_in_precheck: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accounts_only_in_simulation: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_manifest_available: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_manifest_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub simulation_account_manifest: Vec<SimulationAccountManifestEntry>,
+}
+
 use crate::components::trigger::safety::PositionSlotId;
 use tokio::sync::broadcast;
 
@@ -528,6 +634,8 @@ impl ExecutionJoinMetadata {
 pub struct ShadowBuySimulationEvent {
     #[serde(default, flatten)]
     pub join_metadata: ExecutionJoinMetadata,
+    #[serde(default, flatten)]
+    pub account_diagnostics: ShadowSimulationAccountDiagnostics,
     pub candidate_id: String,
     pub pool_amm_id: String,
     pub base_mint: String,
@@ -1339,6 +1447,7 @@ mod tests {
 
         let shadow = GhostEvent::shadow_buy_simulated(ShadowBuySimulationEvent {
             join_metadata: ExecutionJoinMetadata::default(),
+            account_diagnostics: ShadowSimulationAccountDiagnostics::default(),
             candidate_id: build_execution_candidate_id("mint", "pool", "1000"),
             pool_amm_id: "pool".to_string(),
             base_mint: "mint".to_string(),
@@ -1396,6 +1505,7 @@ mod tests {
         );
         let shadow_event = ShadowBuySimulationEvent {
             join_metadata: ExecutionJoinMetadata::default(),
+            account_diagnostics: ShadowSimulationAccountDiagnostics::default(),
             candidate_id: build_execution_candidate_id("mint", "pool", "sig"),
             pool_amm_id: "pool".to_string(),
             base_mint: "mint".to_string(),

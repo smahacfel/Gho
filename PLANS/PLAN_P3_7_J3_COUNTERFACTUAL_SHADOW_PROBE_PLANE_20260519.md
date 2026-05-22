@@ -1494,6 +1494,85 @@ Acceptance:
 Collection, Phase B, P2, live, active policy changes, IWIM changes and threshold
 tuning remain out of scope.
 
+## P3.7-L1R6 — Active Shadow Dispatch AccountNotFound Attribution / Precheck Contract
+
+### Context
+
+R16-r6 validated the probe-side `bonding_curve_v2` contract: missing
+`bonding_curve_v2` no longer reaches `simulate_buy` as a blind
+`AccountNotFound`; it is skipped before simulation. The remaining blocker is
+the normal active shadow BUY path:
+
+```text
+BUY verdict rows exist
+active shadow dispatch rows exist
+dispatch_status = failed
+simulation_outcome = failed
+err = AccountNotFound
+```
+
+That path previously lacked the probe-grade account manifest, account-set hash,
+candidate narrowing, and lifecycle-eligibility separation. As a result, R16
+policy diagnostics could produce BUY verdicts without usable active shadow
+lifecycle labels.
+
+### Code-Level Decision
+
+Active shadow dispatch failures must carry the same diagnostic contract as
+counterfactual probe failures:
+
+- prepared/simulation account manifest and account-set hashes when a
+  `PreparedBuyRequest` exists,
+- exact or narrowed `AccountNotFound` attribution,
+- explicit `active_shadow_precheck_status`,
+- explicit `active_shadow_lifecycle_eligibility_status`,
+- failure rows must never be treated as lifecycle-eligible entries.
+
+The repair is diagnostic-only. It does not change Gatekeeper policy, thresholds,
+PDD, IWIM, live/P2 behavior, probe amount/slippage, or baseline configs.
+
+### Audit Additions
+
+The join-key and L1 reject diagnostics must report:
+
+```text
+active_shadow_dispatch_failure_rows
+active_shadow_account_not_found_rows
+active_shadow_account_not_found_attributed_rows
+active_shadow_account_not_found_multi_candidate_rows
+active_shadow_account_not_found_unattributed_rows
+active_shadow_rpc_visibility_gap_rows
+active_shadow_lifecycle_eligible_failure_rows
+active_shadow_account_not_found_role_counts
+active_shadow_precheck_status_counts
+active_shadow_lifecycle_eligibility_status_counts
+```
+
+Collection and L2 ablation remain blocked if any active shadow
+`AccountNotFound` row is unattributed or if a dispatch failure is marked
+lifecycle-eligible.
+
+### Runtime Gate
+
+Next gate:
+
+```text
+shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r7-active-shadow-attribution
+```
+
+Acceptance:
+
+```text
+strict replay = full_replay_ok
+diagnostic_quality = PASS
+identity/hash = PASS
+active AccountNotFound unattributed = 0
+active dispatch failures are not lifecycle-eligible
+active failure rows have run/session/brain/policy hash
+exact or narrowed missing account role is reported
+active BUY / live / P2 untouched
+```
+
 ## P3.7-L1R5 — BondingCurveV2 Simulation Account Contract Repair
 
 ### Context

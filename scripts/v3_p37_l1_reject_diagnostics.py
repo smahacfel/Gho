@@ -631,6 +631,97 @@ def shadow_payer_diagnostics(
     }
 
 
+def active_shadow_dispatch_diagnostics(
+    artifact_rows: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any]:
+    active_rows = (
+        artifact_rows.get("active_shadow_buys", [])
+        + artifact_rows.get("active_shadow_entries", [])
+        + artifact_rows.get("active_shadow_lifecycle", [])
+    )
+
+    def is_failure(row: dict[str, Any]) -> bool:
+        status = first_present(row, "dispatch_status")
+        outcome = first_present(row, "simulation_outcome", "execution_outcome")
+        return bool(
+            first_present(row, "err", "error", "simulation_error_message")
+            or status == "failed"
+            or outcome in {"failed", "shadow_simulation_failed", "shadow_simulation_error"}
+        )
+
+    def is_account_not_found(row: dict[str, Any]) -> bool:
+        kind = first_present(row, "simulation_error_kind")
+        category = first_present(row, "simulation_error_category")
+        error_value = first_present(row, "err", "error", "simulation_error_message")
+        return bool(
+            kind == "AccountNotFound"
+            or (category is not None and "account_not_found" in str(category))
+            or (error_value is not None and "AccountNotFound" in str(error_value))
+        )
+
+    failure_rows = [row for row in active_rows if is_failure(row)]
+    account_not_found_rows = [row for row in failure_rows if is_account_not_found(row)]
+    attributed_rows = [
+        row
+        for row in account_not_found_rows
+        if first_present(row, "simulation_error_category")
+        == "simulation_account_not_found_attributed"
+        or (
+            first_present(row, "simulation_error_account_pubkey")
+            and first_present(row, "simulation_error_account_role")
+        )
+    ]
+    unattributed_rows = [
+        row
+        for row in account_not_found_rows
+        if first_present(row, "simulation_error_category")
+        == "simulation_account_not_found_unattributed"
+        or (
+            not first_present(row, "simulation_error_account_pubkey")
+            and not first_present(row, "simulation_error_account_candidates")
+            and not first_present(row, "simulation_error_account_candidates_narrowed")
+            and first_present(row, "simulation_error_category") != "simulation_rpc_visibility_gap"
+        )
+    ]
+    lifecycle_eligible_failure_rows = [
+        row
+        for row in failure_rows
+        if first_present(row, "active_shadow_lifecycle_eligibility_status")
+        == "lifecycle_eligible"
+    ]
+    role_counts = Counter(
+        str(first_present(row, "simulation_error_account_role") or "missing")
+        for row in account_not_found_rows
+    )
+    category_counts = Counter(
+        str(first_present(row, "simulation_error_category") or "missing")
+        for row in account_not_found_rows
+    )
+    precheck_counts = Counter(
+        str(first_present(row, "active_shadow_precheck_status") or "missing")
+        for row in failure_rows
+    )
+    eligibility_counts = Counter(
+        str(first_present(row, "active_shadow_lifecycle_eligibility_status") or "missing")
+        for row in failure_rows
+    )
+    return {
+        "active_shadow_dispatch_failure_rows": len(failure_rows),
+        "active_shadow_account_not_found_rows": len(account_not_found_rows),
+        "active_shadow_account_not_found_attributed_rows": len(attributed_rows),
+        "active_shadow_account_not_found_unattributed_rows": len(unattributed_rows),
+        "active_shadow_lifecycle_eligible_failure_rows": len(
+            lifecycle_eligible_failure_rows
+        ),
+        "active_shadow_account_not_found_role_counts": dict(sorted(role_counts.items())),
+        "active_shadow_simulation_error_category_counts": dict(sorted(category_counts.items())),
+        "active_shadow_precheck_status_counts": dict(sorted(precheck_counts.items())),
+        "active_shadow_lifecycle_eligibility_status_counts": dict(
+            sorted(eligibility_counts.items())
+        ),
+    }
+
+
 def build_summary(
     config_path: Path,
     config: dict[str, Any],
@@ -803,6 +894,7 @@ def build_summary(
         for name, rows_for_name in artifact_rows.items()
     }
     payer_diagnostics = shadow_payer_diagnostics(config, artifact_rows)
+    active_shadow_diagnostics = active_shadow_dispatch_diagnostics(artifact_rows)
 
     return {
         "schema_version": 1,
@@ -837,6 +929,7 @@ def build_summary(
         "r16_artifact_identity_coverage_by_scope": identity_coverage_by_scope,
         "single_active_hash_status": active_hash_status,
         **payer_diagnostics,
+        **active_shadow_diagnostics,
         "namespace_coverage_by_artifact": namespace_coverage_by_artifact,
         "lifecycle_label_quality_counts": dict(sorted(label_counts.items())),
         "good_or_dirty_good_label_rows": good_or_dirty_good,
@@ -976,6 +1069,34 @@ def write_md(path: Path, summary: dict[str, Any]) -> None:
     lines.append(f"- account_not_found_rows: {summary['shadow_payer_account_not_found_rows']}")
     for key, value in summary["shadow_payer_account_not_found_pubkey_counts"].items():
         lines.append(f"- account_not_found_pubkey `{key}`: {value}")
+    lines.extend(["", "## Active Shadow Dispatch", ""])
+    lines.append(
+        f"- dispatch_failure_rows: {summary['active_shadow_dispatch_failure_rows']}"
+    )
+    lines.append(
+        f"- account_not_found_rows: {summary['active_shadow_account_not_found_rows']}"
+    )
+    lines.append(
+        f"- account_not_found_attributed_rows: {summary['active_shadow_account_not_found_attributed_rows']}"
+    )
+    lines.append(
+        f"- account_not_found_unattributed_rows: {summary['active_shadow_account_not_found_unattributed_rows']}"
+    )
+    lines.append(
+        f"- lifecycle_eligible_failure_rows: {summary['active_shadow_lifecycle_eligible_failure_rows']}"
+    )
+    lines.append(
+        f"- account_not_found_role_counts: {json.dumps(summary['active_shadow_account_not_found_role_counts'], ensure_ascii=False, sort_keys=True)}"
+    )
+    lines.append(
+        f"- simulation_error_category_counts: {json.dumps(summary['active_shadow_simulation_error_category_counts'], ensure_ascii=False, sort_keys=True)}"
+    )
+    lines.append(
+        f"- precheck_status_counts: {json.dumps(summary['active_shadow_precheck_status_counts'], ensure_ascii=False, sort_keys=True)}"
+    )
+    lines.append(
+        f"- lifecycle_eligibility_status_counts: {json.dumps(summary['active_shadow_lifecycle_eligibility_status_counts'], ensure_ascii=False, sort_keys=True)}"
+    )
     lines.extend([
         "",
         "## Lifecycle Labels",

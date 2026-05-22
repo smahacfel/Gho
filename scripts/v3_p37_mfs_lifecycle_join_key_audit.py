@@ -68,6 +68,8 @@ FIELD_GROUPS = {
     "account_set_mismatch_reason": ("account_set_mismatch_reason",),
     "probe_entry_materialization_status": ("probe_entry_materialization_status",),
     "probe_lifecycle_eligibility_status": ("probe_lifecycle_eligibility_status",),
+    "active_shadow_precheck_status": ("active_shadow_precheck_status",),
+    "active_shadow_lifecycle_eligibility_status": ("active_shadow_lifecycle_eligibility_status",),
     "execution_account_readiness_status": ("execution_account_readiness_status",),
     "execution_account_readiness_role": ("execution_account_readiness_role",),
     "execution_account_readiness_reason": ("execution_account_readiness_reason",),
@@ -91,6 +93,8 @@ COUNTER_FIELD_GROUPS = (
     "account_set_match",
     "probe_entry_materialization_status",
     "probe_lifecycle_eligibility_status",
+    "active_shadow_precheck_status",
+    "active_shadow_lifecycle_eligibility_status",
     "execution_account_readiness_status",
     "execution_account_readiness_role",
 )
@@ -1001,6 +1005,140 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
     }
 
 
+def active_shadow_dispatch_diagnostics(paths: dict[str, list[Path]]) -> dict[str, Any]:
+    transport_rows = artifact_rows(paths, "shadow_transport")
+    entry_rows = artifact_rows(paths, "shadow_entry")
+    lifecycle_rows = artifact_rows(paths, "shadow_lifecycle")
+    all_rows = transport_rows + entry_rows + lifecycle_rows
+
+    def is_failure(row: dict[str, Any]) -> bool:
+        status = row_string(row, "dispatch_status")
+        outcome = row_string(row, "simulation_outcome") or row_string(row, "execution_outcome")
+        return (
+            bool(row_string(row, "err"))
+            or status == "failed"
+            or outcome in {"failed", "shadow_simulation_failed", "shadow_simulation_error"}
+        )
+
+    failure_rows = [row for row in all_rows if is_failure(row)]
+    account_not_found_rows = [row for row in failure_rows if is_account_not_found_row(row)]
+    attributed_rows = [
+        row
+        for row in account_not_found_rows
+        if row_string(row, "simulation_error_category") == "simulation_account_not_found_attributed"
+        or (
+            row_string(row, "simulation_error_account_pubkey")
+            and row_string(row, "simulation_error_account_role")
+        )
+    ]
+    multi_candidate_rows = [
+        row
+        for row in account_not_found_rows
+        if row_string(row, "simulation_error_category")
+        in {
+            "simulation_account_not_found_multi_candidate",
+            "simulation_account_not_found_multi_candidate_narrow",
+        }
+        or row_string(row, "simulation_error_account_narrowing_status")
+        == "multi_candidate_narrowed"
+    ]
+    rpc_visibility_gap_rows = [
+        row
+        for row in account_not_found_rows
+        if row_string(row, "simulation_error_category") == "simulation_rpc_visibility_gap"
+    ]
+    unattributed_rows = [
+        row
+        for row in account_not_found_rows
+        if row_string(row, "simulation_error_category") == "simulation_account_not_found_unattributed"
+        or row_string(row, "simulation_error_account_narrowing_status")
+        == "unattributed_after_narrowing"
+        or (
+            not row_string(row, "simulation_error_account_pubkey")
+            and not list(iter_account_candidates(row, "simulation_error_account_candidates"))
+            and not list(iter_account_candidates(row, "simulation_error_account_candidates_narrowed"))
+            and row_string(row, "simulation_error_category") != "simulation_rpc_visibility_gap"
+        )
+    ]
+    lifecycle_eligible_failure_rows = [
+        row
+        for row in failure_rows
+        if row_string(row, "active_shadow_lifecycle_eligibility_status") == "lifecycle_eligible"
+    ]
+    successful_entry_rows = [
+        row
+        for row in entry_rows
+        if not is_failure(row)
+        and row_string(row, "execution_outcome")
+        not in {"shadow_simulation_failed", "shadow_simulation_error"}
+    ]
+    lifecycle_eligible_rows = [
+        row
+        for row in entry_rows + lifecycle_rows
+        if row_string(row, "active_shadow_lifecycle_eligibility_status") == "lifecycle_eligible"
+    ]
+    role_counts: Counter[str] = Counter()
+    category_counts: Counter[str] = Counter()
+    precheck_status_counts: Counter[str] = Counter()
+    lifecycle_eligibility_counts: Counter[str] = Counter()
+    account_set_match_counts: Counter[str] = Counter()
+    narrowing_status_counts: Counter[str] = Counter()
+    candidate_raw_counts: Counter[str] = Counter()
+    candidate_narrowed_counts: Counter[str] = Counter()
+    for row in failure_rows:
+        if role := row_string(row, "simulation_error_account_role"):
+            role_counts[role] += 1
+        if category := row_string(row, "simulation_error_category"):
+            category_counts[category] += 1
+        if status := row_string(row, "active_shadow_precheck_status"):
+            precheck_status_counts[status] += 1
+        if status := row_string(row, "active_shadow_lifecycle_eligibility_status"):
+            lifecycle_eligibility_counts[status] += 1
+        if match_value := row_bool_string(row, "account_set_match"):
+            account_set_match_counts[match_value] += 1
+        if narrowing := row_string(row, "simulation_error_account_narrowing_status"):
+            narrowing_status_counts[narrowing] += 1
+        for candidate in iter_account_candidates(row, "simulation_error_account_candidates_raw"):
+            role = candidate.get("role")
+            if role:
+                candidate_raw_counts[str(role)] += 1
+        for candidate in iter_account_candidates(row, "simulation_error_account_candidates_narrowed"):
+            role = candidate.get("role")
+            if role:
+                candidate_narrowed_counts[str(role)] += 1
+
+    return {
+        "active_shadow_transport_rows": len(transport_rows),
+        "active_shadow_entry_rows": len(entry_rows),
+        "active_shadow_lifecycle_rows": len(lifecycle_rows),
+        "active_shadow_dispatch_failure_rows": len(failure_rows),
+        "active_shadow_successful_entry_rows": len(successful_entry_rows),
+        "active_shadow_lifecycle_eligible_rows": len(lifecycle_eligible_rows),
+        "active_shadow_lifecycle_eligible_failure_rows": len(
+            lifecycle_eligible_failure_rows
+        ),
+        "active_shadow_account_not_found_rows": len(account_not_found_rows),
+        "active_shadow_account_not_found_attributed_rows": len(attributed_rows),
+        "active_shadow_account_not_found_multi_candidate_rows": len(multi_candidate_rows),
+        "active_shadow_account_not_found_unattributed_rows": len(unattributed_rows),
+        "active_shadow_rpc_visibility_gap_rows": len(rpc_visibility_gap_rows),
+        "active_shadow_account_not_found_role_counts": dict(sorted(role_counts.items())),
+        "active_shadow_simulation_error_category_counts": dict(sorted(category_counts.items())),
+        "active_shadow_precheck_status_counts": dict(sorted(precheck_status_counts.items())),
+        "active_shadow_lifecycle_eligibility_status_counts": dict(
+            sorted(lifecycle_eligibility_counts.items())
+        ),
+        "active_shadow_account_set_match_counts": dict(sorted(account_set_match_counts.items())),
+        "active_shadow_account_narrowing_status_counts": dict(
+            sorted(narrowing_status_counts.items())
+        ),
+        "active_shadow_account_candidate_raw_counts": dict(sorted(candidate_raw_counts.items())),
+        "active_shadow_account_candidate_narrowed_counts": dict(
+            sorted(candidate_narrowed_counts.items())
+        ),
+    }
+
+
 def probe_decision_join(paths: dict[str, list[Path]]) -> dict[str, Any]:
     decisions = artifact_rows(paths, "decision")
     decision_by_ab: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -1144,6 +1282,13 @@ def readiness(report: dict[str, Any]) -> dict[str, Any]:
     if lifecycle_rows <= 0:
         status = "not_ready"
         reasons.append("missing_shadow_lifecycle_rows")
+    active_shadow = report.get("active_shadow_dispatch_diagnostics", {})
+    if active_shadow.get("active_shadow_account_not_found_unattributed_rows", 0) > 0:
+        status = "not_ready"
+        reasons.append("active_shadow_unattributed_account_not_found")
+    if active_shadow.get("active_shadow_lifecycle_eligible_failure_rows", 0) > 0:
+        status = "not_ready"
+        reasons.append("active_shadow_dispatch_failure_marked_lifecycle_eligible")
     if exact_ab_common <= 0:
         status = "degraded" if status != "not_ready" else status
         reasons.append("no_common_ab_record_id_across_nonempty_artifacts")
@@ -1166,6 +1311,26 @@ def readiness(report: dict[str, Any]) -> dict[str, Any]:
         "shadow_transport_rows": transport_rows,
         "shadow_entry_rows": shadow_entry_rows,
         "shadow_lifecycle_rows": lifecycle_rows,
+        "active_shadow_account_not_found_rows": active_shadow.get(
+            "active_shadow_account_not_found_rows",
+            0,
+        ),
+        "active_shadow_account_not_found_attributed_rows": active_shadow.get(
+            "active_shadow_account_not_found_attributed_rows",
+            0,
+        ),
+        "active_shadow_account_not_found_unattributed_rows": active_shadow.get(
+            "active_shadow_account_not_found_unattributed_rows",
+            0,
+        ),
+        "active_shadow_dispatch_failure_rows": active_shadow.get(
+            "active_shadow_dispatch_failure_rows",
+            0,
+        ),
+        "active_shadow_lifecycle_eligible_failure_rows": active_shadow.get(
+            "active_shadow_lifecycle_eligible_failure_rows",
+            0,
+        ),
     }
 
 
@@ -1329,6 +1494,7 @@ def build_report(config_path: Path) -> dict[str, Any]:
         "cross_artifact_intersections": intersection_counts(with_ids),
         "probe_artifact_intersections": intersection_counts(probe_with_ids),
     }
+    report["active_shadow_dispatch_diagnostics"] = active_shadow_dispatch_diagnostics(paths)
     report["join_key_coverage"] = join_key_coverage(report)
     report["readiness"] = readiness(report)
     report["probe_join_key_coverage"] = probe_join_key_coverage(report)
@@ -1398,6 +1564,34 @@ def render_markdown(report: dict[str, Any]) -> str:
     )
     for key, value in report["probe_decision_join"]["artifacts"].items():
         lines.append(f"- `{key}`: `{json.dumps(value, ensure_ascii=False, sort_keys=True)}`")
+    active_shadow = report["active_shadow_dispatch_diagnostics"]
+    lines.extend(
+        [
+            "",
+            "## Active Shadow Dispatch Diagnostics",
+            "",
+            f"- active_shadow_transport_rows: `{active_shadow['active_shadow_transport_rows']}`",
+            f"- active_shadow_entry_rows: `{active_shadow['active_shadow_entry_rows']}`",
+            f"- active_shadow_lifecycle_rows: `{active_shadow['active_shadow_lifecycle_rows']}`",
+            f"- active_shadow_dispatch_failure_rows: `{active_shadow['active_shadow_dispatch_failure_rows']}`",
+            f"- active_shadow_successful_entry_rows: `{active_shadow['active_shadow_successful_entry_rows']}`",
+            f"- active_shadow_lifecycle_eligible_rows: `{active_shadow['active_shadow_lifecycle_eligible_rows']}`",
+            f"- active_shadow_lifecycle_eligible_failure_rows: `{active_shadow['active_shadow_lifecycle_eligible_failure_rows']}`",
+            f"- active_shadow_account_not_found_rows: `{active_shadow['active_shadow_account_not_found_rows']}`",
+            f"- active_shadow_account_not_found_attributed_rows: `{active_shadow['active_shadow_account_not_found_attributed_rows']}`",
+            f"- active_shadow_account_not_found_multi_candidate_rows: `{active_shadow['active_shadow_account_not_found_multi_candidate_rows']}`",
+            f"- active_shadow_account_not_found_unattributed_rows: `{active_shadow['active_shadow_account_not_found_unattributed_rows']}`",
+            f"- active_shadow_rpc_visibility_gap_rows: `{active_shadow['active_shadow_rpc_visibility_gap_rows']}`",
+            f"- active_shadow_account_not_found_role_counts: `{json.dumps(active_shadow['active_shadow_account_not_found_role_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_simulation_error_category_counts: `{json.dumps(active_shadow['active_shadow_simulation_error_category_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_precheck_status_counts: `{json.dumps(active_shadow['active_shadow_precheck_status_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_lifecycle_eligibility_status_counts: `{json.dumps(active_shadow['active_shadow_lifecycle_eligibility_status_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_account_set_match_counts: `{json.dumps(active_shadow['active_shadow_account_set_match_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_account_narrowing_status_counts: `{json.dumps(active_shadow['active_shadow_account_narrowing_status_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_account_candidate_raw_counts: `{json.dumps(active_shadow['active_shadow_account_candidate_raw_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_account_candidate_narrowed_counts: `{json.dumps(active_shadow['active_shadow_account_candidate_narrowed_counts'], ensure_ascii=False, sort_keys=True)}`",
+        ]
+    )
     lines.extend(["", "## Probe Entry Materialization", ""])
     materialization = report["probe_entry_materialization"]
     lines.extend(
