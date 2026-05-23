@@ -1443,6 +1443,19 @@ lifecycle_log_path = "../../logs/shadow_run/r16-observed/probe_lifecycle.jsonl"
                 "bonding_curve_v2_rpc_load_ready": True,
                 "builder_required_curve_account_ready": True,
                 "builder_required_curve_account_ready_reason": "load_ready:rpc_load_ready",
+                "observed_bcv2_source_tx_signature": "sig",
+                "observed_bcv2_source_slot": 42,
+                "observed_bcv2_source_slot_index": 0,
+                "observed_bcv2_source_instruction_index": 3,
+                "observed_bcv2_source_program_id": "pump",
+                "observed_bcv2_source_discriminator": "disc",
+                "observed_bcv2_source_buy_variant": "routed_exact_sol_in",
+                "observed_bcv2_instruction_account_position": 16,
+                "observed_bcv2_message_account_index": 24,
+                "observed_bcv2_resolved_pubkey": "observed-bc-v2",
+                "observed_bcv2_loaded_address_source": "resolved_transaction_account_keys",
+                "observed_bcv2_tx_success": True,
+                "observed_bcv2_provenance_status": "route_compatible",
             }
             entry = {
                 **transport,
@@ -1488,6 +1501,98 @@ lifecycle_log_path = "../../logs/shadow_run/r16-observed/probe_lifecycle.jsonl"
                 "load_ready:rpc_load_ready"
             ],
             1,
+        )
+        self.assertEqual(materialization["observed_bcv2_route_compatible_rows"], 1)
+        self.assertEqual(
+            materialization["observed_bcv2_authoritative_without_route_compatible_rows"],
+            0,
+        )
+
+    def test_l1r15_observed_tx_authoritative_requires_route_compatible_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "configs/rollout/r16-observed-bad-provenance.toml"
+            config.parent.mkdir(parents=True)
+            config.write_text(
+                """
+[oracle]
+decision_log_path = "../../logs/rollout/r16-observed-bad-provenance/decisions"
+
+[p37_shadow_probe]
+selection_log_path = "../../logs/shadow_run/r16-observed-bad-provenance/probe_selected.jsonl"
+transport_log_path = "../../logs/shadow_run/r16-observed-bad-provenance/probe_transport.jsonl"
+entry_log_path = "../../logs/shadow_run/r16-observed-bad-provenance/probe_entries.jsonl"
+lifecycle_log_path = "../../logs/shadow_run/r16-observed-bad-provenance/probe_lifecycle.jsonl"
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            decision = {
+                "candidate_id": "pool_mint_1000",
+                "ab_record_id": "observed-bad-ab",
+                "pool_id": "pool",
+                "base_mint": "mint",
+                "v3_replay_payload_schema_version": 1,
+                "v3_feature_snapshot_hash": "feature-hash",
+                "v3_policy_config_hash": "policy-hash",
+            }
+            transport = {
+                **decision,
+                "source_ab_record_id": "observed-bad-ab",
+                "probe_id": "probe-observed-bad-bcv2",
+                "dispatch_source": "counterfactual_shadow_probe",
+                "collection_plane": "counterfactual_shadow_probe",
+                "probe_plane": "p37_shadow_probe",
+                "probe_bucket": "v3_pending_wait_sample",
+                "probe_amount_source": "fixed_lamports",
+                "execution_outcome": "counterfactual_shadow_probe_dispatched",
+                "bonding_curve_v2_pubkey": "observed-bc-v2",
+                "bonding_curve_v2_source": "observed_tx_account_meta",
+                "bonding_curve_v2_authority_status": "authoritative_observed_tx",
+                "bonding_curve_v2_identity_authority_status": "authoritative_observed_tx",
+                "bonding_curve_v2_rpc_load_status": "rpc_load_ready",
+                "bonding_curve_v2_rpc_load_ready": True,
+                "builder_required_curve_account_ready": True,
+                "builder_required_curve_account_ready_reason": "load_ready:rpc_load_ready",
+                "observed_bcv2_instruction_account_position": 16,
+                "observed_bcv2_message_account_index": 24,
+                "observed_bcv2_resolved_pubkey": "observed-bc-v2",
+                "observed_bcv2_provenance_status": "program_id_mismatch",
+            }
+            entry = {
+                **transport,
+                "probe_entry_materialization_status": "entry_materialized",
+                "probe_lifecycle_eligibility_status": "lifecycle_eligible",
+            }
+            write_jsonl(
+                root
+                / "logs/rollout/r16-observed-bad-provenance/decisions/gatekeeper_v2_decisions.jsonl",
+                [decision],
+            )
+            write_jsonl(
+                root / "logs/shadow_run/r16-observed-bad-provenance/probe_selected.jsonl",
+                [transport],
+            )
+            write_jsonl(
+                root / "logs/shadow_run/r16-observed-bad-provenance/probe_transport.jsonl",
+                [transport],
+            )
+            write_jsonl(
+                root / "logs/shadow_run/r16-observed-bad-provenance/probe_entries.jsonl",
+                [entry],
+            )
+
+            report = audit.build_report(config)
+
+        materialization = report["probe_entry_materialization"]
+        self.assertEqual(materialization["observed_bcv2_not_route_compatible_rows"], 1)
+        self.assertEqual(
+            materialization["observed_bcv2_authoritative_without_route_compatible_rows"],
+            1,
+        )
+        self.assertIn(
+            "observed_bcv2_authoritative_without_route_compatible",
+            report["probe_readiness"]["reasons"],
         )
 
     def test_active_shadow_data_problem_entry_is_not_successful(self) -> None:
@@ -1544,6 +1649,79 @@ lifecycle_log_path = "../../logs/shadow_run/r16/shadow_lifecycle.jsonl"
         self.assertEqual(active["active_shadow_successful_entry_rows"], 0)
         self.assertEqual(active["active_shadow_lifecycle_eligible_rows"], 0)
         self.assertEqual(active["active_shadow_account_not_found_attributed_rows"], 1)
+
+    def test_active_shadow_observed_tx_authoritative_requires_route_compatible_provenance(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "configs/rollout/r16-active-bad-provenance.toml"
+            config.parent.mkdir(parents=True)
+            config.write_text(
+                """
+[oracle]
+decision_log_path = "../../logs/rollout/r16-active-bad-provenance/decisions"
+
+[trigger.shadow_run]
+output_path = "../../logs/shadow_run/r16-active-bad-provenance/buys.jsonl"
+
+[execution.shadow]
+entry_log_path = "../../logs/shadow_run/r16-active-bad-provenance/shadow_entries.jsonl"
+lifecycle_log_path = "../../logs/shadow_run/r16-active-bad-provenance/shadow_lifecycle.jsonl"
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            common = {
+                "candidate_id": "pool_mint_1000",
+                "ab_record_id": "ab-buy",
+                "pool_id": "pool",
+                "base_mint": "mint",
+                "decision_ts_ms": 1000,
+                "v3_replay_payload_schema_version": 1,
+                "v3_feature_snapshot_hash": "feature-hash",
+                "v3_policy_config_hash": "policy-hash",
+            }
+            failure = {
+                **common,
+                "execution_outcome": "shadow_data_problem",
+                "active_shadow_lifecycle_eligibility_status": "not_lifecycle_eligible",
+                "bonding_curve_v2_pubkey": "observed-bc-v2",
+                "bonding_curve_v2_source": "observed_tx_account_meta",
+                "bonding_curve_v2_identity_authority_status": "authoritative_observed_tx",
+                "bonding_curve_v2_rpc_load_status": "missing_on_rpc_precheck",
+                "bonding_curve_v2_rpc_load_ready": False,
+                "builder_required_curve_account_ready": False,
+                "builder_required_curve_account_ready_reason": (
+                    "bonding_curve_v2_observed_meta_not_route_compatible"
+                ),
+                "observed_bcv2_instruction_account_position": 16,
+                "observed_bcv2_message_account_index": 24,
+                "observed_bcv2_resolved_pubkey": "observed-bc-v2",
+                "observed_bcv2_provenance_status": "program_id_mismatch",
+            }
+            write_jsonl(
+                root
+                / "logs/rollout/r16-active-bad-provenance/decisions/gatekeeper_v2_decisions.jsonl",
+                [common],
+            )
+            write_jsonl(
+                root / "logs/shadow_run/r16-active-bad-provenance/shadow_entries.jsonl",
+                [failure],
+            )
+
+            report = audit.build_report(config)
+
+        active = report["active_shadow_dispatch_diagnostics"]
+        self.assertEqual(active["active_shadow_observed_bcv2_not_route_compatible_rows"], 1)
+        self.assertEqual(
+            active["active_shadow_observed_bcv2_authoritative_without_route_compatible_rows"],
+            1,
+        )
+        self.assertIn(
+            "active_shadow_observed_bcv2_authoritative_without_route_compatible",
+            report["readiness"]["reasons"],
+        )
 
     def test_active_shadow_unattributed_account_not_found_blocks_readiness(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

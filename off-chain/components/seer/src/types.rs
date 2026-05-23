@@ -332,6 +332,45 @@ pub struct InstructionProvenance {
     pub from_cpi: bool,
 }
 
+/// Provenance for a route-specific account meta observed in the source
+/// transaction instruction.
+///
+/// `instruction_account_position` is the position inside the instruction's
+/// account list. `message_account_index` is the resolved index into the
+/// transaction account-key set. Keeping both prevents confusing a route account
+/// position with a global message account index.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservedAccountMetaProvenance {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_tx_signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_slot: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_slot_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_instruction_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_program_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_discriminator: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_buy_variant: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruction_account_position: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_account_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_pubkey: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loaded_address_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_success: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta_err: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance_status: Option<String>,
+}
+
 /// A group of inner instructions belonging to one top-level instruction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InnerInstructionGroup {
@@ -577,6 +616,11 @@ pub struct TradeEvent {
     /// canonical bonding_curve account carried by `pool_amm_id`.
     #[serde(default)]
     pub bonding_curve_v2: Option<Pubkey>,
+
+    /// Parser-side provenance for `bonding_curve_v2` when it was populated from
+    /// a source transaction account meta.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bonding_curve_v2_provenance: Option<ObservedAccountMetaProvenance>,
 
     /// PumpPortal internal flag indicating unusual market conditions.
     /// Passed through for future analysis.

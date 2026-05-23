@@ -597,6 +597,7 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
     bonding_curve_v2_rpc_load_ready_counts: Counter[str] = Counter()
     builder_required_curve_account_ready_counts: Counter[str] = Counter()
     builder_required_curve_account_ready_reason_counts: Counter[str] = Counter()
+    observed_bcv2_provenance_status_counts: Counter[str] = Counter()
     route_fallback_status_counts: Counter[str] = Counter()
     amount_guard_status_counts: Counter[str] = Counter()
     simulation_error_custom_code_counts: Counter[str] = Counter()
@@ -645,6 +646,7 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
             row,
             "builder_required_curve_account_ready_reason",
         )
+        observed_bcv2_provenance_status = row_string(row, "observed_bcv2_provenance_status")
         route_fallback_status = (
             row_string(row, "route_fallback_status")
             or row_string(row, "fallback_route_status")
@@ -688,6 +690,8 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
             builder_required_curve_account_ready_reason_counts[
                 builder_required_curve_account_ready_reason
             ] += 1
+        if observed_bcv2_provenance_status:
+            observed_bcv2_provenance_status_counts[observed_bcv2_provenance_status] += 1
         if route_fallback_status:
             route_fallback_status_counts[route_fallback_status] += 1
         if amount_guard_status:
@@ -813,6 +817,41 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
                 "builder_required_curve_account_ready_reason": (
                     builder_required_curve_account_ready_reason
                 ),
+                "observed_bcv2_source_tx_signature": row_string(
+                    row,
+                    "observed_bcv2_source_tx_signature",
+                ),
+                "observed_bcv2_source_slot": row.get("observed_bcv2_source_slot"),
+                "observed_bcv2_source_slot_index": row.get("observed_bcv2_source_slot_index"),
+                "observed_bcv2_source_instruction_index": row.get(
+                    "observed_bcv2_source_instruction_index"
+                ),
+                "observed_bcv2_source_program_id": row_string(
+                    row,
+                    "observed_bcv2_source_program_id",
+                ),
+                "observed_bcv2_source_discriminator": row_string(
+                    row,
+                    "observed_bcv2_source_discriminator",
+                ),
+                "observed_bcv2_source_buy_variant": row_string(
+                    row,
+                    "observed_bcv2_source_buy_variant",
+                ),
+                "observed_bcv2_instruction_account_position": row.get(
+                    "observed_bcv2_instruction_account_position"
+                ),
+                "observed_bcv2_message_account_index": row.get(
+                    "observed_bcv2_message_account_index"
+                ),
+                "observed_bcv2_resolved_pubkey": row_string(row, "observed_bcv2_resolved_pubkey"),
+                "observed_bcv2_loaded_address_source": row_string(
+                    row,
+                    "observed_bcv2_loaded_address_source",
+                ),
+                "observed_bcv2_tx_success": row.get("observed_bcv2_tx_success"),
+                "observed_bcv2_meta_err": row_string(row, "observed_bcv2_meta_err"),
+                "observed_bcv2_provenance_status": observed_bcv2_provenance_status,
                 "amount_guard_status": amount_guard_status,
                 "amount_provided_lamports_if_available": row.get(
                     "amount_provided_lamports_if_available"
@@ -866,6 +905,7 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
         bonding_curve_v2_authority_status = row_string(row, "bonding_curve_v2_authority_status")
         bonding_curve_v2_mismatch_reason = row_string(row, "bonding_curve_v2_mismatch_reason")
         bonding_curve_v2_source = row_string(row, "bonding_curve_v2_source")
+        observed_bcv2_provenance_status = row_string(row, "observed_bcv2_provenance_status")
         route_fallback_status = (
             row_string(row, "route_fallback_status")
             or row_string(row, "fallback_route_status")
@@ -883,6 +923,8 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
             skip_bonding_curve_v2_mismatch_reason_counts[bonding_curve_v2_mismatch_reason] += 1
         if bonding_curve_v2_source:
             skip_bonding_curve_v2_source_counts[bonding_curve_v2_source] += 1
+        if observed_bcv2_provenance_status:
+            observed_bcv2_provenance_status_counts[observed_bcv2_provenance_status] += 1
         if route_fallback_status:
             skip_route_fallback_status_counts[route_fallback_status] += 1
 
@@ -1041,6 +1083,45 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
             or row_string(row, "probe_lifecycle_eligibility_status") == "lifecycle_eligible"
         )
     ]
+    observed_bcv2_rows = [
+        row
+        for row in transport_rows + skip_rows
+        if row_string(row, "bonding_curve_v2_source") == "observed_tx_account_meta"
+        or row_string(row, "observed_bcv2_resolved_pubkey")
+    ]
+    observed_bcv2_route_compatible_rows = [
+        row
+        for row in observed_bcv2_rows
+        if row_string(row, "observed_bcv2_provenance_status") == "route_compatible"
+    ]
+    observed_bcv2_not_route_compatible_rows = [
+        row
+        for row in observed_bcv2_rows
+        if row_string(row, "observed_bcv2_provenance_status")
+        and row_string(row, "observed_bcv2_provenance_status") != "route_compatible"
+    ]
+    observed_bcv2_missing_provenance_rows = [
+        row
+        for row in observed_bcv2_rows
+        if not row_string(row, "observed_bcv2_provenance_status")
+    ]
+    observed_bcv2_instruction_position_present_rows = [
+        row
+        for row in observed_bcv2_rows
+        if row.get("observed_bcv2_instruction_account_position") is not None
+    ]
+    observed_bcv2_message_index_present_rows = [
+        row
+        for row in observed_bcv2_rows
+        if row.get("observed_bcv2_message_account_index") is not None
+    ]
+    observed_bcv2_authoritative_without_route_compatible_rows = [
+        row
+        for row in observed_bcv2_rows
+        if row_string(row, "bonding_curve_v2_identity_authority_status")
+        == "authoritative_observed_tx"
+        and row_string(row, "observed_bcv2_provenance_status") != "route_compatible"
+    ]
     return {
         "transport_rows": transport_rows_total,
         "entry_rows": entry_rows_total,
@@ -1106,6 +1187,24 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
         ),
         "builder_required_curve_account_ready_reason_counts": dict(
             sorted(builder_required_curve_account_ready_reason_counts.items())
+        ),
+        "observed_bcv2_provenance_status_counts": dict(
+            sorted(observed_bcv2_provenance_status_counts.items())
+        ),
+        "observed_bcv2_rows": len(observed_bcv2_rows),
+        "observed_bcv2_route_compatible_rows": len(observed_bcv2_route_compatible_rows),
+        "observed_bcv2_not_route_compatible_rows": len(
+            observed_bcv2_not_route_compatible_rows
+        ),
+        "observed_bcv2_missing_provenance_rows": len(observed_bcv2_missing_provenance_rows),
+        "observed_bcv2_instruction_account_position_present_rows": len(
+            observed_bcv2_instruction_position_present_rows
+        ),
+        "observed_bcv2_message_account_index_present_rows": len(
+            observed_bcv2_message_index_present_rows
+        ),
+        "observed_bcv2_authoritative_without_route_compatible_rows": len(
+            observed_bcv2_authoritative_without_route_compatible_rows
         ),
         "route_fallback_status_counts": dict(sorted(route_fallback_status_counts.items())),
         "amount_guard_status_counts": dict(sorted(amount_guard_status_counts.items())),
@@ -1343,6 +1442,7 @@ def active_shadow_dispatch_diagnostics(paths: dict[str, list[Path]]) -> dict[str
     bonding_curve_v2_rpc_load_ready_counts: Counter[str] = Counter()
     builder_required_curve_account_ready_counts: Counter[str] = Counter()
     builder_required_curve_account_ready_reason_counts: Counter[str] = Counter()
+    observed_bcv2_provenance_status_counts: Counter[str] = Counter()
     route_fallback_status_counts: Counter[str] = Counter()
     for row in failure_rows:
         if role := row_string(row, "simulation_error_account_role"):
@@ -1373,6 +1473,8 @@ def active_shadow_dispatch_diagnostics(paths: dict[str, list[Path]]) -> dict[str
             builder_required_curve_account_ready_counts[ready] += 1
         if reason := row_string(row, "builder_required_curve_account_ready_reason"):
             builder_required_curve_account_ready_reason_counts[reason] += 1
+        if status := row_string(row, "observed_bcv2_provenance_status"):
+            observed_bcv2_provenance_status_counts[status] += 1
         route_fallback_status = (
             row_string(row, "route_fallback_status")
             or row_string(row, "fallback_route_status")
@@ -1423,6 +1525,35 @@ def active_shadow_dispatch_diagnostics(paths: dict[str, list[Path]]) -> dict[str
         if row_string(row, "execution_outcome") == "no_executable_route_account_set"
         or "no_executable_route_account_set"
         in (row_string(row, "precheck_failure_reason") or "")
+    ]
+    observed_bcv2_rows = [
+        row
+        for row in failure_rows
+        if row_string(row, "bonding_curve_v2_source") == "observed_tx_account_meta"
+        or row_string(row, "observed_bcv2_resolved_pubkey")
+    ]
+    observed_bcv2_route_compatible_rows = [
+        row
+        for row in observed_bcv2_rows
+        if row_string(row, "observed_bcv2_provenance_status") == "route_compatible"
+    ]
+    observed_bcv2_not_route_compatible_rows = [
+        row
+        for row in observed_bcv2_rows
+        if row_string(row, "observed_bcv2_provenance_status")
+        and row_string(row, "observed_bcv2_provenance_status") != "route_compatible"
+    ]
+    observed_bcv2_missing_provenance_rows = [
+        row
+        for row in observed_bcv2_rows
+        if not row_string(row, "observed_bcv2_provenance_status")
+    ]
+    observed_bcv2_authoritative_without_route_compatible_rows = [
+        row
+        for row in observed_bcv2_rows
+        if row_string(row, "bonding_curve_v2_identity_authority_status")
+        == "authoritative_observed_tx"
+        and row_string(row, "observed_bcv2_provenance_status") != "route_compatible"
     ]
 
     return {
@@ -1510,6 +1641,22 @@ def active_shadow_dispatch_diagnostics(paths: dict[str, list[Path]]) -> dict[str
         ),
         "active_shadow_builder_required_curve_account_ready_reason_counts": dict(
             sorted(builder_required_curve_account_ready_reason_counts.items())
+        ),
+        "active_shadow_observed_bcv2_provenance_status_counts": dict(
+            sorted(observed_bcv2_provenance_status_counts.items())
+        ),
+        "active_shadow_observed_bcv2_rows": len(observed_bcv2_rows),
+        "active_shadow_observed_bcv2_route_compatible_rows": len(
+            observed_bcv2_route_compatible_rows
+        ),
+        "active_shadow_observed_bcv2_not_route_compatible_rows": len(
+            observed_bcv2_not_route_compatible_rows
+        ),
+        "active_shadow_observed_bcv2_missing_provenance_rows": len(
+            observed_bcv2_missing_provenance_rows
+        ),
+        "active_shadow_observed_bcv2_authoritative_without_route_compatible_rows": len(
+            observed_bcv2_authoritative_without_route_compatible_rows
         ),
         "active_shadow_route_fallback_status_counts": dict(
             sorted(route_fallback_status_counts.items())
@@ -1690,6 +1837,15 @@ def readiness(report: dict[str, Any]) -> dict[str, Any]:
     ) > 0:
         status = "not_ready"
         reasons.append("active_shadow_bonding_curve_v2_source_not_authoritative")
+    if (
+        active_shadow.get(
+            "active_shadow_observed_bcv2_authoritative_without_route_compatible_rows",
+            0,
+        )
+        > 0
+    ):
+        status = "not_ready"
+        reasons.append("active_shadow_observed_bcv2_authoritative_without_route_compatible")
     if exact_ab_common <= 0:
         status = "degraded" if status != "not_ready" else status
         reasons.append("no_common_ab_record_id_across_nonempty_artifacts")
@@ -1750,6 +1906,10 @@ def readiness(report: dict[str, Any]) -> dict[str, Any]:
         ),
         "active_shadow_lifecycle_eligible_failure_rows": active_shadow.get(
             "active_shadow_lifecycle_eligible_failure_rows",
+            0,
+        ),
+        "active_shadow_observed_bcv2_authoritative_without_route_compatible_rows": active_shadow.get(
+            "active_shadow_observed_bcv2_authoritative_without_route_compatible_rows",
             0,
         ),
     }
@@ -1817,6 +1977,9 @@ def probe_readiness(report: dict[str, Any]) -> dict[str, Any]:
     ) > 0:
         status = "not_ready"
         reasons.append("bonding_curve_v2_source_not_authoritative_skip")
+    if materialization.get("observed_bcv2_authoritative_without_route_compatible_rows", 0) > 0:
+        status = "not_ready"
+        reasons.append("observed_bcv2_authoritative_without_route_compatible")
     if status == "ready_for_probe_transport_entry_join" and quality in {
         "exact_probe_id_and_ab_record_id",
         "exact_ab_record_id",
@@ -1900,6 +2063,14 @@ def probe_readiness(report: dict[str, Any]) -> dict[str, Any]:
         "lifecycle_eligible_entry_rows": materialization.get(
             "lifecycle_eligible_entry_rows",
             0,
+        ),
+        "observed_bcv2_authoritative_without_route_compatible_rows": materialization.get(
+            "observed_bcv2_authoritative_without_route_compatible_rows",
+            0,
+        ),
+        "observed_bcv2_provenance_status_counts": materialization.get(
+            "observed_bcv2_provenance_status_counts",
+            {},
         ),
     }
 
@@ -2041,6 +2212,12 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- active_shadow_bonding_curve_v2_rpc_load_ready_counts: `{json.dumps(active_shadow['active_shadow_bonding_curve_v2_rpc_load_ready_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- active_shadow_builder_required_curve_account_ready_counts: `{json.dumps(active_shadow['active_shadow_builder_required_curve_account_ready_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- active_shadow_builder_required_curve_account_ready_reason_counts: `{json.dumps(active_shadow['active_shadow_builder_required_curve_account_ready_reason_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_observed_bcv2_provenance_status_counts: `{json.dumps(active_shadow['active_shadow_observed_bcv2_provenance_status_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_observed_bcv2_rows: `{active_shadow['active_shadow_observed_bcv2_rows']}`",
+            f"- active_shadow_observed_bcv2_route_compatible_rows: `{active_shadow['active_shadow_observed_bcv2_route_compatible_rows']}`",
+            f"- active_shadow_observed_bcv2_not_route_compatible_rows: `{active_shadow['active_shadow_observed_bcv2_not_route_compatible_rows']}`",
+            f"- active_shadow_observed_bcv2_missing_provenance_rows: `{active_shadow['active_shadow_observed_bcv2_missing_provenance_rows']}`",
+            f"- active_shadow_observed_bcv2_authoritative_without_route_compatible_rows: `{active_shadow['active_shadow_observed_bcv2_authoritative_without_route_compatible_rows']}`",
         ]
     )
     lines.extend(["", "## Probe Entry Materialization", ""])
@@ -2065,6 +2242,14 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- bonding_curve_v2_rpc_load_ready_counts: `{json.dumps(materialization['bonding_curve_v2_rpc_load_ready_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- builder_required_curve_account_ready_counts: `{json.dumps(materialization['builder_required_curve_account_ready_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- builder_required_curve_account_ready_reason_counts: `{json.dumps(materialization['builder_required_curve_account_ready_reason_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- observed_bcv2_provenance_status_counts: `{json.dumps(materialization['observed_bcv2_provenance_status_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- observed_bcv2_rows: `{materialization['observed_bcv2_rows']}`",
+            f"- observed_bcv2_route_compatible_rows: `{materialization['observed_bcv2_route_compatible_rows']}`",
+            f"- observed_bcv2_not_route_compatible_rows: `{materialization['observed_bcv2_not_route_compatible_rows']}`",
+            f"- observed_bcv2_missing_provenance_rows: `{materialization['observed_bcv2_missing_provenance_rows']}`",
+            f"- observed_bcv2_instruction_account_position_present_rows: `{materialization['observed_bcv2_instruction_account_position_present_rows']}`",
+            f"- observed_bcv2_message_account_index_present_rows: `{materialization['observed_bcv2_message_account_index_present_rows']}`",
+            f"- observed_bcv2_authoritative_without_route_compatible_rows: `{materialization['observed_bcv2_authoritative_without_route_compatible_rows']}`",
             f"- amount_guard_status_counts: `{json.dumps(materialization['amount_guard_status_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- simulation_error_category_counts: `{json.dumps(materialization['simulation_error_category_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- simulation_error_kind_counts: `{json.dumps(materialization['simulation_error_kind_counts'], ensure_ascii=False, sort_keys=True)}`",

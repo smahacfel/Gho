@@ -63,6 +63,7 @@ mod stress_tests {
             buy_variant: Some("legacy_buy".into()),
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: Some(100),
             compute_unit_limit: Some(200_000),

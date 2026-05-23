@@ -4994,6 +4994,20 @@ struct P37ShadowProbeSelectionRecord {
     bonding_curve_v2_ready: Option<bool>,
     builder_required_curve_account_ready: Option<bool>,
     builder_required_curve_account_ready_reason: Option<String>,
+    observed_bcv2_source_tx_signature: Option<String>,
+    observed_bcv2_source_slot: Option<u64>,
+    observed_bcv2_source_slot_index: Option<u32>,
+    observed_bcv2_source_instruction_index: Option<u32>,
+    observed_bcv2_source_program_id: Option<String>,
+    observed_bcv2_source_discriminator: Option<String>,
+    observed_bcv2_source_buy_variant: Option<String>,
+    observed_bcv2_instruction_account_position: Option<u32>,
+    observed_bcv2_message_account_index: Option<u32>,
+    observed_bcv2_resolved_pubkey: Option<String>,
+    observed_bcv2_loaded_address_source: Option<String>,
+    observed_bcv2_tx_success: Option<bool>,
+    observed_bcv2_meta_err: Option<String>,
+    observed_bcv2_provenance_status: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq)]
@@ -5076,6 +5090,20 @@ struct P37ShadowProbeTransportRecord {
     bonding_curve_v2_ready: Option<bool>,
     builder_required_curve_account_ready: Option<bool>,
     builder_required_curve_account_ready_reason: Option<String>,
+    observed_bcv2_source_tx_signature: Option<String>,
+    observed_bcv2_source_slot: Option<u64>,
+    observed_bcv2_source_slot_index: Option<u32>,
+    observed_bcv2_source_instruction_index: Option<u32>,
+    observed_bcv2_source_program_id: Option<String>,
+    observed_bcv2_source_discriminator: Option<String>,
+    observed_bcv2_source_buy_variant: Option<String>,
+    observed_bcv2_instruction_account_position: Option<u32>,
+    observed_bcv2_message_account_index: Option<u32>,
+    observed_bcv2_resolved_pubkey: Option<String>,
+    observed_bcv2_loaded_address_source: Option<String>,
+    observed_bcv2_tx_success: Option<bool>,
+    observed_bcv2_meta_err: Option<String>,
+    observed_bcv2_provenance_status: Option<String>,
     amount_provided_lamports_if_available: Option<u64>,
     amount_required_lamports_if_available: Option<u64>,
     amount_shortfall_lamports_if_available: Option<u64>,
@@ -5453,6 +5481,20 @@ fn p37_shadow_probe_selection_record(
         bonding_curve_v2_ready: None,
         builder_required_curve_account_ready: None,
         builder_required_curve_account_ready_reason: None,
+        observed_bcv2_source_tx_signature: None,
+        observed_bcv2_source_slot: None,
+        observed_bcv2_source_slot_index: None,
+        observed_bcv2_source_instruction_index: None,
+        observed_bcv2_source_program_id: None,
+        observed_bcv2_source_discriminator: None,
+        observed_bcv2_source_buy_variant: None,
+        observed_bcv2_instruction_account_position: None,
+        observed_bcv2_message_account_index: None,
+        observed_bcv2_resolved_pubkey: None,
+        observed_bcv2_loaded_address_source: None,
+        observed_bcv2_tx_success: None,
+        observed_bcv2_meta_err: None,
+        observed_bcv2_provenance_status: None,
     }
 }
 
@@ -5593,6 +5635,20 @@ fn p37_shadow_probe_artifact_records(
         bonding_curve_v2_ready: None,
         builder_required_curve_account_ready: None,
         builder_required_curve_account_ready_reason: None,
+        observed_bcv2_source_tx_signature: None,
+        observed_bcv2_source_slot: None,
+        observed_bcv2_source_slot_index: None,
+        observed_bcv2_source_instruction_index: None,
+        observed_bcv2_source_program_id: None,
+        observed_bcv2_source_discriminator: None,
+        observed_bcv2_source_buy_variant: None,
+        observed_bcv2_instruction_account_position: None,
+        observed_bcv2_message_account_index: None,
+        observed_bcv2_resolved_pubkey: None,
+        observed_bcv2_loaded_address_source: None,
+        observed_bcv2_tx_success: None,
+        observed_bcv2_meta_err: None,
+        observed_bcv2_provenance_status: None,
         amount_provided_lamports_if_available: None,
         amount_required_lamports_if_available: None,
         amount_shortfall_lamports_if_available: None,
@@ -5697,6 +5753,20 @@ fn p37_shadow_probe_artifact_records(
         bonding_curve_v2_ready: None,
         builder_required_curve_account_ready: None,
         builder_required_curve_account_ready_reason: None,
+        observed_bcv2_source_tx_signature: None,
+        observed_bcv2_source_slot: None,
+        observed_bcv2_source_slot_index: None,
+        observed_bcv2_source_instruction_index: None,
+        observed_bcv2_source_program_id: None,
+        observed_bcv2_source_discriminator: None,
+        observed_bcv2_source_buy_variant: None,
+        observed_bcv2_instruction_account_position: None,
+        observed_bcv2_message_account_index: None,
+        observed_bcv2_resolved_pubkey: None,
+        observed_bcv2_loaded_address_source: None,
+        observed_bcv2_tx_success: None,
+        observed_bcv2_meta_err: None,
+        observed_bcv2_provenance_status: None,
         precheck_account_set_hash: None,
         prepared_request_account_set_hash: None,
         simulation_account_set_hash: None,
@@ -5964,6 +6034,34 @@ struct P37ShadowProbeAccountManifestEntry {
     route_kind: Option<String>,
     buy_variant: Option<String>,
     token_param_role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observed_bcv2_source_tx_signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observed_bcv2_source_slot: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observed_bcv2_source_slot_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observed_bcv2_source_instruction_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observed_bcv2_source_program_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observed_bcv2_source_discriminator: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observed_bcv2_source_buy_variant: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observed_bcv2_instruction_account_position: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observed_bcv2_message_account_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observed_bcv2_resolved_pubkey: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observed_bcv2_loaded_address_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observed_bcv2_tx_success: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observed_bcv2_meta_err: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observed_bcv2_provenance_status: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Default)]
@@ -6036,6 +6134,20 @@ struct P37ShadowProbeExecutionDiagnostics {
     bonding_curve_v2_ready: Option<bool>,
     builder_required_curve_account_ready: Option<bool>,
     builder_required_curve_account_ready_reason: Option<String>,
+    observed_bcv2_source_tx_signature: Option<String>,
+    observed_bcv2_source_slot: Option<u64>,
+    observed_bcv2_source_slot_index: Option<u32>,
+    observed_bcv2_source_instruction_index: Option<u32>,
+    observed_bcv2_source_program_id: Option<String>,
+    observed_bcv2_source_discriminator: Option<String>,
+    observed_bcv2_source_buy_variant: Option<String>,
+    observed_bcv2_instruction_account_position: Option<u32>,
+    observed_bcv2_message_account_index: Option<u32>,
+    observed_bcv2_resolved_pubkey: Option<String>,
+    observed_bcv2_loaded_address_source: Option<String>,
+    observed_bcv2_tx_success: Option<bool>,
+    observed_bcv2_meta_err: Option<String>,
+    observed_bcv2_provenance_status: Option<String>,
     amount_provided_lamports_if_available: Option<u64>,
     amount_required_lamports_if_available: Option<u64>,
     amount_shortfall_lamports_if_available: Option<u64>,
@@ -6138,6 +6250,7 @@ fn p37_shadow_probe_derive_legacy_buy_account_overrides(
                 .bonding_curve_v2
                 .as_deref()
                 .and_then(|value| Pubkey::try_from(value).ok()),
+            bonding_curve_v2_provenance: tx.bonding_curve_v2_provenance.clone(),
             ..Default::default()
         });
     }
@@ -6377,6 +6490,22 @@ fn p37_shadow_probe_as_bonding_curve_v2_source_precheck_skip(
     record.builder_required_curve_account_ready = diagnostics.builder_required_curve_account_ready;
     record.builder_required_curve_account_ready_reason =
         diagnostics.builder_required_curve_account_ready_reason;
+    record.observed_bcv2_source_tx_signature = diagnostics.observed_bcv2_source_tx_signature;
+    record.observed_bcv2_source_slot = diagnostics.observed_bcv2_source_slot;
+    record.observed_bcv2_source_slot_index = diagnostics.observed_bcv2_source_slot_index;
+    record.observed_bcv2_source_instruction_index =
+        diagnostics.observed_bcv2_source_instruction_index;
+    record.observed_bcv2_source_program_id = diagnostics.observed_bcv2_source_program_id;
+    record.observed_bcv2_source_discriminator = diagnostics.observed_bcv2_source_discriminator;
+    record.observed_bcv2_source_buy_variant = diagnostics.observed_bcv2_source_buy_variant;
+    record.observed_bcv2_instruction_account_position =
+        diagnostics.observed_bcv2_instruction_account_position;
+    record.observed_bcv2_message_account_index = diagnostics.observed_bcv2_message_account_index;
+    record.observed_bcv2_resolved_pubkey = diagnostics.observed_bcv2_resolved_pubkey;
+    record.observed_bcv2_loaded_address_source = diagnostics.observed_bcv2_loaded_address_source;
+    record.observed_bcv2_tx_success = diagnostics.observed_bcv2_tx_success;
+    record.observed_bcv2_meta_err = diagnostics.observed_bcv2_meta_err;
+    record.observed_bcv2_provenance_status = diagnostics.observed_bcv2_provenance_status;
     p37_shadow_probe_as_precheck_skip(record, reason)
 }
 
@@ -6524,11 +6653,32 @@ fn p37_shadow_probe_account_manifest(
             } else {
                 p37_shadow_probe_account_source(&role).to_string()
             };
+            let observed_bcv2_provenance =
+                if role == "bonding_curve_v2" && source == "observed_tx_account_meta" {
+                    request
+                        .account_overrides
+                        .bonding_curve_v2_provenance
+                        .as_ref()
+                } else {
+                    None
+                };
+            let observed_bcv2_provenance_status =
+                observed_bcv2_provenance.and_then(|value| value.provenance_status.as_deref());
             let (source_authority_status, source_mismatch_reason) = if role == "bonding_curve_v2" {
                 match source.as_str() {
-                    "observed_tx_account_meta" => {
-                        (Some("authoritative_observed_tx".to_string()), None)
-                    }
+                    "observed_tx_account_meta" => match observed_bcv2_provenance_status {
+                        Some("route_compatible") => {
+                            (Some("authoritative_observed_tx".to_string()), None)
+                        }
+                        Some(status) => (
+                            Some("observed_meta_not_route_compatible".to_string()),
+                            Some(format!("observed_bcv2_provenance_{status}")),
+                        ),
+                        None => (
+                            Some("observed_tx_unverified".to_string()),
+                            Some("observed_bcv2_provenance_missing".to_string()),
+                        ),
+                    },
                     "diag_account_update_relay" => {
                         (Some("authoritative_exact_diag".to_string()), None)
                     }
@@ -6571,6 +6721,34 @@ fn p37_shadow_probe_account_manifest(
                 route_kind: route_kind.clone(),
                 buy_variant: token_params.buy_variant.clone(),
                 token_param_role: token_params.token_param_role.clone(),
+                observed_bcv2_source_tx_signature: observed_bcv2_provenance
+                    .and_then(|value| value.source_tx_signature.clone()),
+                observed_bcv2_source_slot: observed_bcv2_provenance
+                    .and_then(|value| value.source_slot),
+                observed_bcv2_source_slot_index: observed_bcv2_provenance
+                    .and_then(|value| value.source_slot_index),
+                observed_bcv2_source_instruction_index: observed_bcv2_provenance
+                    .and_then(|value| value.source_instruction_index),
+                observed_bcv2_source_program_id: observed_bcv2_provenance
+                    .and_then(|value| value.source_program_id.clone()),
+                observed_bcv2_source_discriminator: observed_bcv2_provenance
+                    .and_then(|value| value.source_discriminator.clone()),
+                observed_bcv2_source_buy_variant: observed_bcv2_provenance
+                    .and_then(|value| value.source_buy_variant.clone()),
+                observed_bcv2_instruction_account_position: observed_bcv2_provenance
+                    .and_then(|value| value.instruction_account_position),
+                observed_bcv2_message_account_index: observed_bcv2_provenance
+                    .and_then(|value| value.message_account_index),
+                observed_bcv2_resolved_pubkey: observed_bcv2_provenance
+                    .and_then(|value| value.resolved_pubkey.clone()),
+                observed_bcv2_loaded_address_source: observed_bcv2_provenance
+                    .and_then(|value| value.loaded_address_source.clone()),
+                observed_bcv2_tx_success: observed_bcv2_provenance
+                    .and_then(|value| value.tx_success),
+                observed_bcv2_meta_err: observed_bcv2_provenance
+                    .and_then(|value| value.meta_err.clone()),
+                observed_bcv2_provenance_status: observed_bcv2_provenance
+                    .and_then(|value| value.provenance_status.clone()),
             }
         })
         .collect()
@@ -7230,6 +7408,27 @@ fn active_shadow_account_diagnostics_from_account_set(
             .builder_required_curve_account_ready,
         builder_required_curve_account_ready_reason: bonding_curve_v2_authority
             .builder_required_curve_account_ready_reason,
+        observed_bcv2_source_tx_signature: bonding_curve_v2_authority
+            .observed_bcv2_source_tx_signature,
+        observed_bcv2_source_slot: bonding_curve_v2_authority.observed_bcv2_source_slot,
+        observed_bcv2_source_slot_index: bonding_curve_v2_authority.observed_bcv2_source_slot_index,
+        observed_bcv2_source_instruction_index: bonding_curve_v2_authority
+            .observed_bcv2_source_instruction_index,
+        observed_bcv2_source_program_id: bonding_curve_v2_authority.observed_bcv2_source_program_id,
+        observed_bcv2_source_discriminator: bonding_curve_v2_authority
+            .observed_bcv2_source_discriminator,
+        observed_bcv2_source_buy_variant: bonding_curve_v2_authority
+            .observed_bcv2_source_buy_variant,
+        observed_bcv2_instruction_account_position: bonding_curve_v2_authority
+            .observed_bcv2_instruction_account_position,
+        observed_bcv2_message_account_index: bonding_curve_v2_authority
+            .observed_bcv2_message_account_index,
+        observed_bcv2_resolved_pubkey: bonding_curve_v2_authority.observed_bcv2_resolved_pubkey,
+        observed_bcv2_loaded_address_source: bonding_curve_v2_authority
+            .observed_bcv2_loaded_address_source,
+        observed_bcv2_tx_success: bonding_curve_v2_authority.observed_bcv2_tx_success,
+        observed_bcv2_meta_err: bonding_curve_v2_authority.observed_bcv2_meta_err,
+        observed_bcv2_provenance_status: bonding_curve_v2_authority.observed_bcv2_provenance_status,
         precheck_account_set_hash: account_set_diagnostics
             .and_then(|diagnostics| diagnostics.precheck_account_set_hash.clone()),
         prepared_request_account_set_hash: account_set_diagnostics
@@ -7602,6 +7801,20 @@ struct P37ShadowProbeBondingCurveV2AuthorityDiagnostics {
     bonding_curve_v2_ready: Option<bool>,
     builder_required_curve_account_ready: Option<bool>,
     builder_required_curve_account_ready_reason: Option<String>,
+    observed_bcv2_source_tx_signature: Option<String>,
+    observed_bcv2_source_slot: Option<u64>,
+    observed_bcv2_source_slot_index: Option<u32>,
+    observed_bcv2_source_instruction_index: Option<u32>,
+    observed_bcv2_source_program_id: Option<String>,
+    observed_bcv2_source_discriminator: Option<String>,
+    observed_bcv2_source_buy_variant: Option<String>,
+    observed_bcv2_instruction_account_position: Option<u32>,
+    observed_bcv2_message_account_index: Option<u32>,
+    observed_bcv2_resolved_pubkey: Option<String>,
+    observed_bcv2_loaded_address_source: Option<String>,
+    observed_bcv2_tx_success: Option<bool>,
+    observed_bcv2_meta_err: Option<String>,
+    observed_bcv2_provenance_status: Option<String>,
 }
 
 impl P37ShadowProbeBondingCurveV2AuthorityDiagnostics {
@@ -7670,14 +7883,45 @@ fn p37_shadow_probe_bonding_curve_v2_authority_from_entry(
             Some(false),
             Some(true),
         ),
-        "observed_tx_account_meta" => (
-            "authoritative_observed_tx",
-            None,
-            true,
-            Some(false),
-            Some(false),
-            Some(false),
-        ),
+        "observed_tx_account_meta" => match entry.observed_bcv2_provenance_status.as_deref() {
+            Some("route_compatible") => (
+                "authoritative_observed_tx",
+                None,
+                true,
+                Some(false),
+                Some(false),
+                Some(false),
+            ),
+            Some(status) => (
+                "observed_meta_not_route_compatible",
+                Some(match status {
+                    "program_id_mismatch" => "bonding_curve_v2_observed_meta_not_route_compatible",
+                    "discriminator_mismatch" => {
+                        "bonding_curve_v2_observed_meta_not_route_compatible"
+                    }
+                    "account_position_out_of_range" => {
+                        "bonding_curve_v2_observed_meta_index_ambiguous"
+                    }
+                    "message_index_resolution_failed" => {
+                        "bonding_curve_v2_observed_meta_index_ambiguous"
+                    }
+                    "tx_failed" => "bonding_curve_v2_observed_meta_tx_failed",
+                    _ => "bonding_curve_v2_observed_meta_not_route_compatible",
+                }),
+                false,
+                Some(false),
+                Some(false),
+                Some(false),
+            ),
+            None => (
+                "observed_tx_unverified",
+                Some("bonding_curve_v2_observed_meta_index_ambiguous"),
+                false,
+                Some(false),
+                Some(false),
+                Some(false),
+            ),
+        },
         "route_builder" => (
             "builder_only",
             Some("builder_pubkey_not_materialized"),
@@ -7758,6 +8002,21 @@ fn p37_shadow_probe_bonding_curve_v2_authority_from_entry(
         bonding_curve_v2_ready: builder_required_curve_account_ready,
         builder_required_curve_account_ready,
         builder_required_curve_account_ready_reason,
+        observed_bcv2_source_tx_signature: entry.observed_bcv2_source_tx_signature.clone(),
+        observed_bcv2_source_slot: entry.observed_bcv2_source_slot,
+        observed_bcv2_source_slot_index: entry.observed_bcv2_source_slot_index,
+        observed_bcv2_source_instruction_index: entry.observed_bcv2_source_instruction_index,
+        observed_bcv2_source_program_id: entry.observed_bcv2_source_program_id.clone(),
+        observed_bcv2_source_discriminator: entry.observed_bcv2_source_discriminator.clone(),
+        observed_bcv2_source_buy_variant: entry.observed_bcv2_source_buy_variant.clone(),
+        observed_bcv2_instruction_account_position: entry
+            .observed_bcv2_instruction_account_position,
+        observed_bcv2_message_account_index: entry.observed_bcv2_message_account_index,
+        observed_bcv2_resolved_pubkey: entry.observed_bcv2_resolved_pubkey.clone(),
+        observed_bcv2_loaded_address_source: entry.observed_bcv2_loaded_address_source.clone(),
+        observed_bcv2_tx_success: entry.observed_bcv2_tx_success,
+        observed_bcv2_meta_err: entry.observed_bcv2_meta_err.clone(),
+        observed_bcv2_provenance_status: entry.observed_bcv2_provenance_status.clone(),
     }
 }
 
@@ -8077,6 +8336,27 @@ fn p37_shadow_probe_execution_diagnostics(
             .builder_required_curve_account_ready,
         builder_required_curve_account_ready_reason: bonding_curve_v2_authority
             .builder_required_curve_account_ready_reason,
+        observed_bcv2_source_tx_signature: bonding_curve_v2_authority
+            .observed_bcv2_source_tx_signature,
+        observed_bcv2_source_slot: bonding_curve_v2_authority.observed_bcv2_source_slot,
+        observed_bcv2_source_slot_index: bonding_curve_v2_authority.observed_bcv2_source_slot_index,
+        observed_bcv2_source_instruction_index: bonding_curve_v2_authority
+            .observed_bcv2_source_instruction_index,
+        observed_bcv2_source_program_id: bonding_curve_v2_authority.observed_bcv2_source_program_id,
+        observed_bcv2_source_discriminator: bonding_curve_v2_authority
+            .observed_bcv2_source_discriminator,
+        observed_bcv2_source_buy_variant: bonding_curve_v2_authority
+            .observed_bcv2_source_buy_variant,
+        observed_bcv2_instruction_account_position: bonding_curve_v2_authority
+            .observed_bcv2_instruction_account_position,
+        observed_bcv2_message_account_index: bonding_curve_v2_authority
+            .observed_bcv2_message_account_index,
+        observed_bcv2_resolved_pubkey: bonding_curve_v2_authority.observed_bcv2_resolved_pubkey,
+        observed_bcv2_loaded_address_source: bonding_curve_v2_authority
+            .observed_bcv2_loaded_address_source,
+        observed_bcv2_tx_success: bonding_curve_v2_authority.observed_bcv2_tx_success,
+        observed_bcv2_meta_err: bonding_curve_v2_authority.observed_bcv2_meta_err,
+        observed_bcv2_provenance_status: bonding_curve_v2_authority.observed_bcv2_provenance_status,
         amount_provided_lamports_if_available: amount_guard.provided_lamports,
         amount_required_lamports_if_available: amount_guard.required_lamports,
         amount_shortfall_lamports_if_available: amount_guard.shortfall_lamports,
@@ -8304,6 +8584,21 @@ fn p37_shadow_probe_transport_from_event(
         builder_required_curve_account_ready: diagnostics.builder_required_curve_account_ready,
         builder_required_curve_account_ready_reason: diagnostics
             .builder_required_curve_account_ready_reason,
+        observed_bcv2_source_tx_signature: diagnostics.observed_bcv2_source_tx_signature,
+        observed_bcv2_source_slot: diagnostics.observed_bcv2_source_slot,
+        observed_bcv2_source_slot_index: diagnostics.observed_bcv2_source_slot_index,
+        observed_bcv2_source_instruction_index: diagnostics.observed_bcv2_source_instruction_index,
+        observed_bcv2_source_program_id: diagnostics.observed_bcv2_source_program_id,
+        observed_bcv2_source_discriminator: diagnostics.observed_bcv2_source_discriminator,
+        observed_bcv2_source_buy_variant: diagnostics.observed_bcv2_source_buy_variant,
+        observed_bcv2_instruction_account_position: diagnostics
+            .observed_bcv2_instruction_account_position,
+        observed_bcv2_message_account_index: diagnostics.observed_bcv2_message_account_index,
+        observed_bcv2_resolved_pubkey: diagnostics.observed_bcv2_resolved_pubkey,
+        observed_bcv2_loaded_address_source: diagnostics.observed_bcv2_loaded_address_source,
+        observed_bcv2_tx_success: diagnostics.observed_bcv2_tx_success,
+        observed_bcv2_meta_err: diagnostics.observed_bcv2_meta_err,
+        observed_bcv2_provenance_status: diagnostics.observed_bcv2_provenance_status,
         amount_provided_lamports_if_available: diagnostics.amount_provided_lamports_if_available,
         amount_required_lamports_if_available: diagnostics.amount_required_lamports_if_available,
         amount_shortfall_lamports_if_available: diagnostics.amount_shortfall_lamports_if_available,
@@ -8482,6 +8777,21 @@ fn p37_shadow_probe_transport_from_error(
         builder_required_curve_account_ready: diagnostics.builder_required_curve_account_ready,
         builder_required_curve_account_ready_reason: diagnostics
             .builder_required_curve_account_ready_reason,
+        observed_bcv2_source_tx_signature: diagnostics.observed_bcv2_source_tx_signature,
+        observed_bcv2_source_slot: diagnostics.observed_bcv2_source_slot,
+        observed_bcv2_source_slot_index: diagnostics.observed_bcv2_source_slot_index,
+        observed_bcv2_source_instruction_index: diagnostics.observed_bcv2_source_instruction_index,
+        observed_bcv2_source_program_id: diagnostics.observed_bcv2_source_program_id,
+        observed_bcv2_source_discriminator: diagnostics.observed_bcv2_source_discriminator,
+        observed_bcv2_source_buy_variant: diagnostics.observed_bcv2_source_buy_variant,
+        observed_bcv2_instruction_account_position: diagnostics
+            .observed_bcv2_instruction_account_position,
+        observed_bcv2_message_account_index: diagnostics.observed_bcv2_message_account_index,
+        observed_bcv2_resolved_pubkey: diagnostics.observed_bcv2_resolved_pubkey,
+        observed_bcv2_loaded_address_source: diagnostics.observed_bcv2_loaded_address_source,
+        observed_bcv2_tx_success: diagnostics.observed_bcv2_tx_success,
+        observed_bcv2_meta_err: diagnostics.observed_bcv2_meta_err,
+        observed_bcv2_provenance_status: diagnostics.observed_bcv2_provenance_status,
         amount_provided_lamports_if_available: diagnostics.amount_provided_lamports_if_available,
         amount_required_lamports_if_available: diagnostics.amount_required_lamports_if_available,
         amount_shortfall_lamports_if_available: diagnostics.amount_shortfall_lamports_if_available,
@@ -11389,6 +11699,20 @@ fn shadow_entry_record_from_event(
         bonding_curve_v2_ready: None,
         builder_required_curve_account_ready: None,
         builder_required_curve_account_ready_reason: None,
+        observed_bcv2_source_tx_signature: None,
+        observed_bcv2_source_slot: None,
+        observed_bcv2_source_slot_index: None,
+        observed_bcv2_source_instruction_index: None,
+        observed_bcv2_source_program_id: None,
+        observed_bcv2_source_discriminator: None,
+        observed_bcv2_source_buy_variant: None,
+        observed_bcv2_instruction_account_position: None,
+        observed_bcv2_message_account_index: None,
+        observed_bcv2_resolved_pubkey: None,
+        observed_bcv2_loaded_address_source: None,
+        observed_bcv2_tx_success: None,
+        observed_bcv2_meta_err: None,
+        observed_bcv2_provenance_status: None,
         precheck_account_set_hash: None,
         prepared_request_account_set_hash: None,
         simulation_account_set_hash: None,
@@ -11474,6 +11798,20 @@ fn shadow_entry_record_from_request(
         bonding_curve_v2_ready: None,
         builder_required_curve_account_ready: None,
         builder_required_curve_account_ready_reason: None,
+        observed_bcv2_source_tx_signature: None,
+        observed_bcv2_source_slot: None,
+        observed_bcv2_source_slot_index: None,
+        observed_bcv2_source_instruction_index: None,
+        observed_bcv2_source_program_id: None,
+        observed_bcv2_source_discriminator: None,
+        observed_bcv2_source_buy_variant: None,
+        observed_bcv2_instruction_account_position: None,
+        observed_bcv2_message_account_index: None,
+        observed_bcv2_resolved_pubkey: None,
+        observed_bcv2_loaded_address_source: None,
+        observed_bcv2_tx_success: None,
+        observed_bcv2_meta_err: None,
+        observed_bcv2_provenance_status: None,
         precheck_account_set_hash: None,
         prepared_request_account_set_hash: None,
         simulation_account_set_hash: None,
@@ -11583,6 +11921,24 @@ fn enrich_active_shadow_entry_with_account_diagnostics(
     entry.builder_required_curve_account_ready_reason = diagnostics
         .builder_required_curve_account_ready_reason
         .clone();
+    entry.observed_bcv2_source_tx_signature = diagnostics.observed_bcv2_source_tx_signature.clone();
+    entry.observed_bcv2_source_slot = diagnostics.observed_bcv2_source_slot;
+    entry.observed_bcv2_source_slot_index = diagnostics.observed_bcv2_source_slot_index;
+    entry.observed_bcv2_source_instruction_index =
+        diagnostics.observed_bcv2_source_instruction_index;
+    entry.observed_bcv2_source_program_id = diagnostics.observed_bcv2_source_program_id.clone();
+    entry.observed_bcv2_source_discriminator =
+        diagnostics.observed_bcv2_source_discriminator.clone();
+    entry.observed_bcv2_source_buy_variant = diagnostics.observed_bcv2_source_buy_variant.clone();
+    entry.observed_bcv2_instruction_account_position =
+        diagnostics.observed_bcv2_instruction_account_position;
+    entry.observed_bcv2_message_account_index = diagnostics.observed_bcv2_message_account_index;
+    entry.observed_bcv2_resolved_pubkey = diagnostics.observed_bcv2_resolved_pubkey.clone();
+    entry.observed_bcv2_loaded_address_source =
+        diagnostics.observed_bcv2_loaded_address_source.clone();
+    entry.observed_bcv2_tx_success = diagnostics.observed_bcv2_tx_success;
+    entry.observed_bcv2_meta_err = diagnostics.observed_bcv2_meta_err.clone();
+    entry.observed_bcv2_provenance_status = diagnostics.observed_bcv2_provenance_status.clone();
     entry.precheck_account_set_hash = diagnostics.precheck_account_set_hash.clone();
     entry.prepared_request_account_set_hash = diagnostics.prepared_request_account_set_hash.clone();
     entry.simulation_account_set_hash = diagnostics.simulation_account_set_hash.clone();
@@ -11829,6 +12185,9 @@ fn derive_buy_account_overrides(
                 .bonding_curve_v2
                 .as_deref()
                 .and_then(|value| Pubkey::try_from(value).ok());
+            if overrides.bonding_curve_v2.is_some() {
+                overrides.bonding_curve_v2_provenance = tx.bonding_curve_v2_provenance.clone();
+            }
         }
         if overrides.global_config.is_some()
             && overrides.fee_recipient.is_some()
@@ -11939,6 +12298,34 @@ struct ShadowEntryRecord {
     builder_required_curve_account_ready: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     builder_required_curve_account_ready_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed_bcv2_source_tx_signature: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed_bcv2_source_slot: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed_bcv2_source_slot_index: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed_bcv2_source_instruction_index: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed_bcv2_source_program_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed_bcv2_source_discriminator: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed_bcv2_source_buy_variant: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed_bcv2_instruction_account_position: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed_bcv2_message_account_index: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed_bcv2_resolved_pubkey: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed_bcv2_loaded_address_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed_bcv2_tx_success: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed_bcv2_meta_err: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed_bcv2_provenance_status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     precheck_account_set_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -16156,7 +16543,43 @@ mod tests {
             route_kind: Some("routed_exact_sol_in".to_string()),
             buy_variant: Some("routed_exact_sol_in".to_string()),
             token_param_role: Some("min_tokens_out".to_string()),
+            observed_bcv2_source_tx_signature: None,
+            observed_bcv2_source_slot: None,
+            observed_bcv2_source_slot_index: None,
+            observed_bcv2_source_instruction_index: None,
+            observed_bcv2_source_program_id: None,
+            observed_bcv2_source_discriminator: None,
+            observed_bcv2_source_buy_variant: None,
+            observed_bcv2_instruction_account_position: None,
+            observed_bcv2_message_account_index: None,
+            observed_bcv2_resolved_pubkey: None,
+            observed_bcv2_loaded_address_source: None,
+            observed_bcv2_tx_success: None,
+            observed_bcv2_meta_err: None,
+            observed_bcv2_provenance_status: None,
         }
+    }
+
+    fn p37_shadow_probe_route_compatible_bcv2_manifest_entry(
+        pubkey: String,
+    ) -> P37ShadowProbeAccountManifestEntry {
+        let mut entry =
+            p37_shadow_probe_test_bcv2_manifest_entry(pubkey.clone(), "observed_tx_account_meta");
+        entry.observed_bcv2_source_tx_signature = Some("source-signature".to_string());
+        entry.observed_bcv2_source_slot = Some(42);
+        entry.observed_bcv2_source_slot_index = Some(0);
+        entry.observed_bcv2_source_instruction_index = Some(3);
+        entry.observed_bcv2_source_program_id = Some("pumpfun-program".to_string());
+        entry.observed_bcv2_source_discriminator = Some("66063d1201daebea".to_string());
+        entry.observed_bcv2_source_buy_variant = Some("routed_exact_sol_in".to_string());
+        entry.observed_bcv2_instruction_account_position = Some(16);
+        entry.observed_bcv2_message_account_index = Some(24);
+        entry.observed_bcv2_resolved_pubkey = Some(pubkey);
+        entry.observed_bcv2_loaded_address_source =
+            Some("resolved_transaction_account_keys".to_string());
+        entry.observed_bcv2_tx_success = Some(true);
+        entry.observed_bcv2_provenance_status = Some("route_compatible".to_string());
+        entry
     }
 
     #[test]
@@ -16216,9 +16639,8 @@ mod tests {
     fn p37_shadow_probe_bonding_curve_v2_observed_tx_source_is_authoritative() {
         let bcv2 = Pubkey::new_unique().to_string();
         let diagnostics = P37ShadowProbeAccountSetDiagnostics {
-            manifest: vec![p37_shadow_probe_test_bcv2_manifest_entry(
+            manifest: vec![p37_shadow_probe_route_compatible_bcv2_manifest_entry(
                 bcv2.clone(),
-                "observed_tx_account_meta",
             )],
             manifest_lookup_performed: true,
             ..Default::default()
@@ -16246,8 +16668,7 @@ mod tests {
     #[test]
     fn p37_shadow_probe_observed_bcv2_identity_without_rpc_readiness_is_not_ready() {
         let bcv2 = Pubkey::new_unique().to_string();
-        let entry =
-            p37_shadow_probe_test_bcv2_manifest_entry(bcv2.clone(), "observed_tx_account_meta");
+        let entry = p37_shadow_probe_route_compatible_bcv2_manifest_entry(bcv2.clone());
 
         let authority =
             p37_shadow_probe_bonding_curve_v2_authority_from_entry(Some(&entry), None, None);
@@ -16275,8 +16696,7 @@ mod tests {
     #[test]
     fn p37_shadow_probe_observed_bcv2_missing_rpc_precheck_is_classified() {
         let bcv2 = Pubkey::new_unique().to_string();
-        let entry =
-            p37_shadow_probe_test_bcv2_manifest_entry(bcv2.clone(), "observed_tx_account_meta");
+        let entry = p37_shadow_probe_route_compatible_bcv2_manifest_entry(bcv2.clone());
         let diagnostics = P37ShadowProbeAccountSetDiagnostics {
             manifest: vec![entry],
             missing_candidates: vec![P37ShadowProbeAccountNotFoundCandidate {
@@ -16315,6 +16735,60 @@ mod tests {
                 .as_deref(),
             Some("bonding_curve_v2_observed_meta_missing_on_rpc")
         );
+    }
+
+    #[test]
+    fn p37_shadow_probe_observed_bcv2_missing_provenance_is_not_authoritative() {
+        let bcv2 = Pubkey::new_unique().to_string();
+        let entry =
+            p37_shadow_probe_test_bcv2_manifest_entry(bcv2.clone(), "observed_tx_account_meta");
+
+        let authority =
+            p37_shadow_probe_bonding_curve_v2_authority_from_entry(Some(&entry), None, None);
+
+        assert_eq!(
+            authority.authority_status.as_deref(),
+            Some("observed_tx_unverified")
+        );
+        assert_eq!(
+            authority.identity_authority_status.as_deref(),
+            Some("observed_tx_unverified")
+        );
+        assert_eq!(
+            authority.mismatch_reason.as_deref(),
+            Some("bonding_curve_v2_observed_meta_index_ambiguous")
+        );
+        assert_eq!(authority.builder_required_curve_account_ready, Some(false));
+        assert!(authority.non_authoritative_reason().is_some());
+    }
+
+    #[test]
+    fn p37_shadow_probe_observed_bcv2_route_mismatch_is_not_authoritative() {
+        let bcv2 = Pubkey::new_unique().to_string();
+        let mut entry = p37_shadow_probe_route_compatible_bcv2_manifest_entry(bcv2.clone());
+        entry.observed_bcv2_provenance_status = Some("program_id_mismatch".to_string());
+
+        let authority =
+            p37_shadow_probe_bonding_curve_v2_authority_from_entry(Some(&entry), None, None);
+
+        assert_eq!(
+            authority.authority_status.as_deref(),
+            Some("observed_meta_not_route_compatible")
+        );
+        assert_eq!(
+            authority.identity_authority_status.as_deref(),
+            Some("observed_meta_not_route_compatible")
+        );
+        assert_eq!(
+            authority.mismatch_reason.as_deref(),
+            Some("bonding_curve_v2_observed_meta_not_route_compatible")
+        );
+        assert_eq!(
+            authority.observed_bcv2_provenance_status.as_deref(),
+            Some("program_id_mismatch")
+        );
+        assert_eq!(authority.builder_required_curve_account_ready, Some(false));
+        assert!(authority.non_authoritative_reason().is_some());
     }
 
     #[test]
@@ -16478,6 +16952,20 @@ mod tests {
                 route_kind: Some("routed_exact_sol_in".to_string()),
                 buy_variant: Some("routed_exact_sol_in".to_string()),
                 token_param_role: Some("min_tokens_out".to_string()),
+                observed_bcv2_source_tx_signature: None,
+                observed_bcv2_source_slot: None,
+                observed_bcv2_source_slot_index: None,
+                observed_bcv2_source_instruction_index: None,
+                observed_bcv2_source_program_id: None,
+                observed_bcv2_source_discriminator: None,
+                observed_bcv2_source_buy_variant: None,
+                observed_bcv2_instruction_account_position: None,
+                observed_bcv2_message_account_index: None,
+                observed_bcv2_resolved_pubkey: None,
+                observed_bcv2_loaded_address_source: None,
+                observed_bcv2_tx_success: None,
+                observed_bcv2_meta_err: None,
+                observed_bcv2_provenance_status: None,
             });
 
         let active = active_shadow_account_diagnostics_from_account_set(
@@ -17813,6 +18301,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -23547,6 +24036,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -23643,6 +24133,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -23700,6 +24191,7 @@ mod tests {
             buy_variant: Some("routed_exact_sol_in".to_string()),
             associated_bonding_curve: Some(expected_assoc_curve.to_string()),
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -23790,6 +24282,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -23926,6 +24419,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -23998,6 +24492,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -24068,6 +24563,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -24138,6 +24634,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -24208,6 +24705,7 @@ mod tests {
             buy_variant: Some("legacy_buy".to_string()),
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -25500,6 +25998,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -25633,6 +26132,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -25857,6 +26357,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -25961,6 +26462,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -26039,6 +26541,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -26131,6 +26634,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -26251,6 +26755,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -26347,6 +26852,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -28444,6 +28950,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -28507,6 +29014,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -28646,6 +29154,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -28724,6 +29233,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -28800,6 +29310,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -28860,6 +29371,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -28926,6 +29438,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -29073,6 +29586,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -29133,6 +29647,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -29339,6 +29854,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -29724,6 +30240,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -31012,6 +31529,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -31129,6 +31647,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -31273,6 +31792,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -31430,6 +31950,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -31513,6 +32034,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,

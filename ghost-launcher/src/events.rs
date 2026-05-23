@@ -156,6 +156,34 @@ pub struct ShadowSimulationAccountDiagnostics {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub builder_required_curve_account_ready_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_bcv2_source_tx_signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_bcv2_source_slot: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_bcv2_source_slot_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_bcv2_source_instruction_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_bcv2_source_program_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_bcv2_source_discriminator: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_bcv2_source_buy_variant: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_bcv2_instruction_account_position: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_bcv2_message_account_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_bcv2_resolved_pubkey: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_bcv2_loaded_address_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_bcv2_tx_success: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_bcv2_meta_err: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_bcv2_provenance_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub precheck_account_set_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prepared_request_account_set_hash: Option<String>,
@@ -192,6 +220,38 @@ use seer::ipc::{AccountUpdateReplayOrigin, FundingTransferProvenance};
 // Re-export RawBytesMissingReason from seer for use in events
 pub use seer::types::RawBytesMissingReason;
 use seer::types::{TokenDelta, ToolchainFingerprintInput};
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObservedAccountMetaProvenance {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_tx_signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_slot: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_slot_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_instruction_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_program_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_discriminator: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_buy_variant: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruction_account_position: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_account_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_pubkey: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loaded_address_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_success: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta_err: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance_status: Option<String>,
+}
 
 /// Default buffer size for the event bus
 ///
@@ -385,6 +445,11 @@ pub struct PoolTransaction {
     /// source before routed simulation treats it as execution-ready.
     #[serde(default)]
     pub bonding_curve_v2: Option<String>,
+
+    /// Parser-side provenance for `bonding_curve_v2` when it was copied from
+    /// an observed source transaction account meta.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bonding_curve_v2_provenance: Option<ObservedAccountMetaProvenance>,
 
     /// PumpPortal internal flag indicating unusual market conditions.
     /// Passed through for future analysis.

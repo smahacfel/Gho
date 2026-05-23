@@ -500,6 +500,7 @@ pub struct BuyAccountOverrides {
     pub buy_variant: Option<trigger::PumpfunBuyVariant>,
     pub associated_bonding_curve: Option<Pubkey>,
     pub bonding_curve_v2: Option<Pubkey>,
+    pub bonding_curve_v2_provenance: Option<crate::events::ObservedAccountMetaProvenance>,
     pub legacy_buy_curve: Option<BondingCurve>,
 }
 

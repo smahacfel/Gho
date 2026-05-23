@@ -920,6 +920,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,

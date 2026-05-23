@@ -1494,6 +1494,80 @@ Acceptance:
 Collection, Phase B, P2, live, active policy changes, IWIM changes and threshold
 tuning remain out of scope.
 
+## P3.7-L1R15 / J3Q Observed-Meta Provenance Validation
+
+### Trigger
+
+R16-r11 closed L1R14 as a runtime PASS-B: observed transaction account
+metadata may identify a route-specific `bonding_curve_v2`, but missing RPC-load
+readiness correctly keeps `builder_required_curve_account_ready=false` and
+prevents post-simulation `AccountNotFound`.
+
+The remaining ambiguity is provenance. Before route fallback or exclusion can
+be treated as a route decision, the runtime must prove that the observed
+`bonding_curve_v2` came from the correct instruction account position and was
+not accidentally read from a global account-key index or from an incompatible
+route variant.
+
+### Decision
+
+L1R15 separates observed identity provenance from execution readiness:
+
+- `observed_tx_account_meta` is authoritative only when
+  `observed_bcv2_provenance_status=route_compatible`.
+- The parser records both `observed_bcv2_instruction_account_position` and
+  `observed_bcv2_message_account_index`; these are intentionally distinct.
+- The observed pubkey is resolved from the instruction account index through the
+  resolved transaction account-key set, not from `account_keys[16]`.
+- Non-route-compatible provenance statuses keep the row fail-closed as
+  `observed_meta_not_route_compatible` / `observed_tx_unverified`.
+- Observed provenance never implies RPC-load readiness by itself; readiness
+  still depends on the simulation-load account precheck.
+
+### New Diagnostic Fields
+
+Probe and active shadow diagnostics may now carry:
+
+```text
+observed_bcv2_source_tx_signature
+observed_bcv2_source_slot
+observed_bcv2_source_slot_index
+observed_bcv2_source_instruction_index
+observed_bcv2_source_program_id
+observed_bcv2_source_discriminator
+observed_bcv2_source_buy_variant
+observed_bcv2_instruction_account_position
+observed_bcv2_message_account_index
+observed_bcv2_resolved_pubkey
+observed_bcv2_loaded_address_source
+observed_bcv2_tx_success
+observed_bcv2_meta_err
+observed_bcv2_provenance_status
+```
+
+`observed_bcv2_loaded_address_source` is currently emitted as
+`resolved_transaction_account_keys`, because the runtime event already receives
+the resolved key set and does not preserve static-key versus loaded-address
+provenance separately.
+
+### Acceptance
+
+Code-level L1R15 passes if:
+
+- observed BCV2 provenance is serialized through Seer trade events,
+  `PoolTransaction`, probe transport/entry rows and active shadow diagnostics;
+- `authoritative_observed_tx` is impossible without
+  `observed_bcv2_provenance_status=route_compatible`;
+- route-incompatible observed metadata blocks readiness instead of silently
+  authorizing the route account;
+- parser tests prove instruction-account-position resolution is not the same as
+  global `account_keys[16]`;
+- legacy rows without the new fields still parse.
+
+Runtime L1R15 remains a separate gate. It must use a fresh bounded namespace and
+must not change thresholds, PDD, HHI, prosperity, IWIM, P2/live behavior or
+active policy.
+
 ## P3.7-L1R11 / J3O BondingCurveV2 Source Authority & Materialization Contract
 
 ### Trigger

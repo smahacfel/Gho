@@ -1799,6 +1799,24 @@ pub fn trade_event_to_pool_transaction(
             .associated_bonding_curve
             .map(|value| value.to_string()),
         bonding_curve_v2: trade.bonding_curve_v2.map(|value| value.to_string()),
+        bonding_curve_v2_provenance: trade.bonding_curve_v2_provenance.as_ref().map(|value| {
+            crate::events::ObservedAccountMetaProvenance {
+                source_tx_signature: value.source_tx_signature.clone(),
+                source_slot: value.source_slot,
+                source_slot_index: value.source_slot_index,
+                source_instruction_index: value.source_instruction_index,
+                source_program_id: value.source_program_id.clone(),
+                source_discriminator: value.source_discriminator.clone(),
+                source_buy_variant: value.source_buy_variant.clone(),
+                instruction_account_position: value.instruction_account_position,
+                message_account_index: value.message_account_index,
+                resolved_pubkey: value.resolved_pubkey.clone(),
+                loaded_address_source: value.loaded_address_source.clone(),
+                tx_success: value.tx_success,
+                meta_err: value.meta_err.clone(),
+                provenance_status: value.provenance_status.clone(),
+            }
+        }),
         is_mayhem_mode: trade.is_mayhem_mode,
         cu_price_micro_lamports: trade.cu_price_micro_lamports,
         compute_unit_limit: trade.compute_unit_limit,
@@ -1895,6 +1913,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,

@@ -3306,8 +3306,8 @@ fn make_ev(
 
 use crate::errors::SeerResult;
 use crate::types::{
-    GeyserEvent, InitializePoolEvent, RawBytesMissingReason, TokenDelta, ToolchainFingerprintInput,
-    TradeEvent,
+    GeyserEvent, InitializePoolEvent, ObservedAccountMetaProvenance, RawBytesMissingReason,
+    TokenDelta, ToolchainFingerprintInput, TradeEvent,
 };
 use ghost_core::transaction_parser::ProgramIds;
 use solana_sdk::pubkey::Pubkey;
@@ -3635,6 +3635,7 @@ impl BinaryParser {
                         buy_variant: None,
                         associated_bonding_curve: None,
                         bonding_curve_v2: None,
+                        bonding_curve_v2_provenance: None,
                         is_mayhem_mode: None,
                         cu_price_micro_lamports: runtime_ctx.cu_price_micro_lamports,
                         compute_unit_limit: runtime_ctx.compute_unit_limit,
@@ -3697,6 +3698,7 @@ impl BinaryParser {
                         buy_variant: None,
                         associated_bonding_curve: None,
                         bonding_curve_v2: None,
+                        bonding_curve_v2_provenance: None,
                         is_mayhem_mode: None,
                         cu_price_micro_lamports: runtime_ctx.cu_price_micro_lamports,
                         compute_unit_limit: runtime_ctx.compute_unit_limit,
@@ -3782,6 +3784,7 @@ impl BinaryParser {
                         buy_variant: None,
                         associated_bonding_curve: None,
                         bonding_curve_v2: None,
+                        bonding_curve_v2_provenance: None,
                         is_mayhem_mode: None,
                         cu_price_micro_lamports: runtime_ctx.cu_price_micro_lamports,
                         compute_unit_limit: runtime_ctx.compute_unit_limit,
@@ -3858,6 +3861,7 @@ impl BinaryParser {
                         buy_variant: None,
                         associated_bonding_curve: None,
                         bonding_curve_v2: None,
+                        bonding_curve_v2_provenance: None,
                         is_mayhem_mode: None,
                         cu_price_micro_lamports: runtime_ctx.cu_price_micro_lamports,
                         compute_unit_limit: runtime_ctx.compute_unit_limit,
@@ -3967,6 +3971,7 @@ impl BinaryParser {
                         buy_variant: None,
                         associated_bonding_curve: None,
                         bonding_curve_v2: None,
+                        bonding_curve_v2_provenance: None,
                         is_mayhem_mode: None,
                         cu_price_micro_lamports: runtime_ctx.cu_price_micro_lamports,
                         compute_unit_limit: runtime_ctx.compute_unit_limit,
@@ -4076,6 +4081,7 @@ impl BinaryParser {
                         buy_variant: None,
                         associated_bonding_curve: None,
                         bonding_curve_v2: None,
+                        bonding_curve_v2_provenance: None,
                         is_mayhem_mode: None,
                         cu_price_micro_lamports: runtime_ctx.cu_price_micro_lamports,
                         compute_unit_limit: runtime_ctx.compute_unit_limit,
@@ -4215,6 +4221,7 @@ impl BinaryParser {
                 buy_variant: None,
                 associated_bonding_curve: None,
                 bonding_curve_v2: None,
+                bonding_curve_v2_provenance: None,
                 is_mayhem_mode: None,
                 cu_price_micro_lamports: runtime_ctx.cu_price_micro_lamports,
                 compute_unit_limit: runtime_ctx.compute_unit_limit,
@@ -5435,6 +5442,116 @@ fn pump_buy_enrichment_priority(ix_data: &[u8]) -> u8 {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ObservedIxAccountContext {
+    source_tx_signature: Option<String>,
+    source_slot: Option<u64>,
+    source_slot_index: Option<u32>,
+    source_instruction_index: Option<u32>,
+    source_program_id: String,
+    source_discriminator: Option<String>,
+    source_buy_variant: Option<String>,
+    account_indices: Vec<u8>,
+    tx_success: bool,
+    meta_err: Option<String>,
+}
+
+fn pump_buy_variant_from_ix_data(ix_data: &[u8]) -> Option<&'static str> {
+    if ix_data.starts_with(&DISC_PUMP_BUY_ROUTED)
+        || ix_data.starts_with(&DISC_SWAP_BUY_EXACT_QUOTE_IN)
+    {
+        Some("routed_exact_sol_in")
+    } else if ix_data.starts_with(&DISC_BUY) {
+        Some("legacy_buy")
+    } else {
+        None
+    }
+}
+
+fn discriminator_hex(ix_data: &[u8]) -> Option<String> {
+    let disc = ix_data.get(..8)?;
+    let mut out = String::with_capacity(16);
+    for byte in disc {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    Some(out)
+}
+
+fn observed_bcv2_provenance_status(
+    tx_success: bool,
+    source_program_id: &str,
+    source_buy_variant: Option<&str>,
+    instruction_account_position: Option<u32>,
+    message_account_index: Option<u32>,
+    resolved_pubkey: Option<&str>,
+    expected_pubkey: &Pubkey,
+) -> &'static str {
+    if !tx_success {
+        return "tx_failed";
+    }
+    if !is_pump_fun_program(source_program_id) {
+        return "program_id_mismatch";
+    }
+    if source_buy_variant.is_none() {
+        return "discriminator_mismatch";
+    }
+    if instruction_account_position != Some(PUMP_IDX_BONDING_CURVE_V2 as u32) {
+        return "account_position_out_of_range";
+    }
+    let Some(resolved_pubkey) = resolved_pubkey else {
+        return "message_index_resolution_failed";
+    };
+    if message_account_index.is_none() || resolved_pubkey.is_empty() {
+        return "message_index_resolution_failed";
+    }
+    if resolved_pubkey != expected_pubkey.to_string() {
+        return "message_index_resolution_failed";
+    }
+    "route_compatible"
+}
+
+fn bonding_curve_v2_provenance_from_ix(
+    trade: &TradeEvent,
+    ix_accounts: &SmallVec<[String; 14]>,
+    context: &ObservedIxAccountContext,
+    bonding_curve_v2: Pubkey,
+) -> ObservedAccountMetaProvenance {
+    let message_account_index = context
+        .account_indices
+        .get(PUMP_IDX_BONDING_CURVE_V2)
+        .map(|value| u32::from(*value));
+    let resolved_pubkey = ix_accounts.get(PUMP_IDX_BONDING_CURVE_V2).cloned();
+    let instruction_account_position =
+        (ix_accounts.len() > PUMP_IDX_BONDING_CURVE_V2).then_some(PUMP_IDX_BONDING_CURVE_V2 as u32);
+    let status = observed_bcv2_provenance_status(
+        trade.success,
+        &context.source_program_id,
+        context.source_buy_variant.as_deref(),
+        instruction_account_position,
+        message_account_index,
+        resolved_pubkey.as_deref(),
+        &bonding_curve_v2,
+    );
+
+    ObservedAccountMetaProvenance {
+        source_tx_signature: context.source_tx_signature.clone(),
+        source_slot: context.source_slot,
+        source_slot_index: context.source_slot_index,
+        source_instruction_index: context.source_instruction_index,
+        source_program_id: Some(context.source_program_id.clone()),
+        source_discriminator: context.source_discriminator.clone(),
+        source_buy_variant: context.source_buy_variant.clone(),
+        instruction_account_position,
+        message_account_index,
+        resolved_pubkey,
+        loaded_address_source: Some("resolved_transaction_account_keys".to_string()),
+        tx_success: Some(context.tx_success),
+        meta_err: context.meta_err.clone(),
+        provenance_status: Some(status.to_string()),
+    }
+}
+
 /// Fill optional enrichment fields on `trade` from the resolved instruction
 /// accounts and data.  Returns `true` when all fields are now populated.
 ///
@@ -5443,6 +5560,7 @@ fn fill_trade_from_ix_accounts(
     trade: &mut TradeEvent,
     ix_accounts: &SmallVec<[String; 14]>,
     ix_data: &[u8],
+    context: &ObservedIxAccountContext,
 ) -> bool {
     if trade.global_config.is_none() {
         trade.global_config = Pubkey::from_str(&acs(ix_accounts, PUMP_IDX_GLOBAL_CONFIG)).ok();
@@ -5454,17 +5572,7 @@ fn fill_trade_from_ix_accounts(
         trade.token_program = Pubkey::from_str(&acs(ix_accounts, PUMP_IDX_TOKEN_PROGRAM)).ok();
     }
     if trade.is_buy && trade.buy_variant.is_none() {
-        trade.buy_variant = if ix_data.starts_with(&DISC_PUMP_BUY_ROUTED) {
-            Some("routed_exact_sol_in".to_string())
-        } else if ix_data.starts_with(&DISC_SWAP_BUY_EXACT_QUOTE_IN) {
-            // Exact-quote-in buy uses the routed family semantics downstream:
-            // observed chain layouts require the non-legacy buy builder path.
-            Some("routed_exact_sol_in".to_string())
-        } else if ix_data.starts_with(&DISC_BUY) {
-            Some("legacy_buy".to_string())
-        } else {
-            None
-        };
+        trade.buy_variant = pump_buy_variant_from_ix_data(ix_data).map(str::to_string);
     }
     if trade.is_buy && trade.associated_bonding_curve.is_none() {
         trade.associated_bonding_curve =
@@ -5476,6 +5584,16 @@ fn fill_trade_from_ix_accounts(
         trade.bonding_curve_v2 = Pubkey::from_str(&acs(ix_accounts, PUMP_IDX_BONDING_CURVE_V2))
             .ok()
             .filter(|value| *value != Pubkey::default());
+    }
+    if trade.is_buy && trade.bonding_curve_v2_provenance.is_none() {
+        if let Some(bonding_curve_v2) = trade.bonding_curve_v2 {
+            trade.bonding_curve_v2_provenance = Some(bonding_curve_v2_provenance_from_ix(
+                trade,
+                ix_accounts,
+                context,
+                bonding_curve_v2,
+            ));
+        }
     }
     trade_enrich_complete(trade)
 }
@@ -5495,9 +5613,13 @@ fn enrich_trade_optional_accounts_from_source_ix(event: &GeyserEvent, trade: &mu
     }
 
     let GeyserEvent::Transaction {
+        slot,
+        signature,
         accounts,
         instructions,
         inner_instructions,
+        success,
+        error_code,
         ..
     } = event
     else {
@@ -5508,8 +5630,13 @@ fn enrich_trade_optional_accounts_from_source_ix(event: &GeyserEvent, trade: &mu
     let all_keys: Vec<String> = accounts.iter().map(ToString::to_string).collect();
 
     // ── Phase 1: top-level instructions ──────────────────────────────────────
-    let mut best_top_level_ix: Option<(SmallVec<[String; 14]>, Vec<u8>, u8)> = None;
-    for ix in instructions {
+    let mut best_top_level_ix: Option<(
+        SmallVec<[String; 14]>,
+        Vec<u8>,
+        u8,
+        ObservedIxAccountContext,
+    )> = None;
+    for (outer_instruction_index, ix) in instructions.iter().enumerate() {
         let ix_accounts = resolve_accounts(&ix.account_indices, &all_keys);
         if !trade_matches_pump_instruction(trade, &ix.program_id, &ix.data, &ix_accounts) {
             continue;
@@ -5519,16 +5646,28 @@ fn enrich_trade_optional_accounts_from_source_ix(event: &GeyserEvent, trade: &mu
         } else {
             1
         };
+        let context = ObservedIxAccountContext {
+            source_tx_signature: Some(signature.to_string()),
+            source_slot: *slot,
+            source_slot_index: trade.event_ordinal,
+            source_instruction_index: Some(outer_instruction_index as u32),
+            source_program_id: ix.program_id.to_string(),
+            source_discriminator: discriminator_hex(&ix.data),
+            source_buy_variant: pump_buy_variant_from_ix_data(&ix.data).map(str::to_string),
+            account_indices: ix.account_indices.clone(),
+            tx_success: *success,
+            meta_err: error_code.clone(),
+        };
         let replace = best_top_level_ix
             .as_ref()
-            .map(|(_, _, best_priority)| priority > *best_priority)
+            .map(|(_, _, best_priority, _)| priority > *best_priority)
             .unwrap_or(true);
         if replace {
-            best_top_level_ix = Some((ix_accounts, ix.data.clone(), priority));
+            best_top_level_ix = Some((ix_accounts, ix.data.clone(), priority, context));
         }
     }
-    if let Some((ix_accounts, ix_data, _)) = best_top_level_ix {
-        fill_trade_from_ix_accounts(trade, &ix_accounts, &ix_data);
+    if let Some((ix_accounts, ix_data, _, context)) = best_top_level_ix {
+        fill_trade_from_ix_accounts(trade, &ix_accounts, &ix_data, &context);
     }
 
     // ── Phase 2: inner instructions (CPI) ────────────────────────────────────
@@ -5537,7 +5676,12 @@ fn enrich_trade_optional_accounts_from_source_ix(event: &GeyserEvent, trade: &mu
     // this pass, buy_variant / fee / token_program / assoc_bc stay None
     // for ~96% of observed BUY transactions.
     if !trade_enrich_complete(trade) {
-        let mut best_inner_ix: Option<(SmallVec<[String; 14]>, Vec<u8>, u8)> = None;
+        let mut best_inner_ix: Option<(
+            SmallVec<[String; 14]>,
+            Vec<u8>,
+            u8,
+            ObservedIxAccountContext,
+        )> = None;
         for group in inner_instructions {
             for ix in &group.instructions {
                 let prog_str = key_at(&all_keys, ix.program_id_index as usize);
@@ -5553,17 +5697,29 @@ fn enrich_trade_optional_accounts_from_source_ix(event: &GeyserEvent, trade: &mu
                 } else {
                     1
                 };
+                let context = ObservedIxAccountContext {
+                    source_tx_signature: Some(signature.to_string()),
+                    source_slot: *slot,
+                    source_slot_index: trade.event_ordinal,
+                    source_instruction_index: Some(group.index),
+                    source_program_id: prog_str,
+                    source_discriminator: discriminator_hex(&ix.data),
+                    source_buy_variant: pump_buy_variant_from_ix_data(&ix.data).map(str::to_string),
+                    account_indices: ix.accounts.clone(),
+                    tx_success: *success,
+                    meta_err: error_code.clone(),
+                };
                 let replace = best_inner_ix
                     .as_ref()
-                    .map(|(_, _, best_priority)| priority > *best_priority)
+                    .map(|(_, _, best_priority, _)| priority > *best_priority)
                     .unwrap_or(true);
                 if replace {
-                    best_inner_ix = Some((ix_accounts, ix.data.clone(), priority));
+                    best_inner_ix = Some((ix_accounts, ix.data.clone(), priority, context));
                 }
             }
         }
-        if let Some((ix_accounts, ix_data, _)) = best_inner_ix {
-            fill_trade_from_ix_accounts(trade, &ix_accounts, &ix_data);
+        if let Some((ix_accounts, ix_data, _, context)) = best_inner_ix {
+            fill_trade_from_ix_accounts(trade, &ix_accounts, &ix_data, &context);
         }
     }
 
@@ -6113,6 +6269,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -9112,6 +9269,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -9159,6 +9317,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -9223,6 +9382,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -9371,6 +9531,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -9543,6 +9704,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -9569,6 +9731,107 @@ mod tests {
             Some(associated_bonding_curve)
         );
         assert_eq!(trade.bonding_curve_v2, Some(bonding_curve_v2));
+        let provenance = trade
+            .bonding_curve_v2_provenance
+            .as_ref()
+            .expect("observed bcv2 provenance");
+        assert_eq!(provenance.source_slot, Some(42));
+        assert_eq!(provenance.source_slot_index, Some(0));
+        assert_eq!(provenance.source_instruction_index, Some(0));
+        assert_eq!(
+            provenance.source_program_id.as_deref(),
+            Some(PUMP_FUN_PROGRAM_ID)
+        );
+        assert_eq!(provenance.source_buy_variant.as_deref(), Some("legacy_buy"));
+        assert_eq!(
+            provenance.instruction_account_position,
+            Some(PUMP_IDX_BONDING_CURVE_V2 as u32)
+        );
+        assert_eq!(
+            provenance.message_account_index,
+            Some(PUMP_IDX_BONDING_CURVE_V2 as u32)
+        );
+        assert_eq!(
+            provenance.resolved_pubkey.as_deref(),
+            Some(bonding_curve_v2.to_string().as_str())
+        );
+        assert_eq!(
+            provenance.loaded_address_source.as_deref(),
+            Some("resolved_transaction_account_keys")
+        );
+        assert_eq!(provenance.tx_success, Some(true));
+        assert_eq!(
+            provenance.provenance_status.as_deref(),
+            Some("route_compatible")
+        );
+    }
+
+    #[test]
+    fn enrich_trade_optional_accounts_resolves_bcv2_instruction_index_not_global_index() {
+        let mint = Pubkey::new_unique();
+        let curve = Pubkey::new_unique();
+        let user = Pubkey::new_unique();
+        let global_config = Pubkey::new_unique();
+        let fee_recipient = Pubkey::new_unique();
+        let token_program = Pubkey::new_unique();
+        let associated_bonding_curve = Pubkey::new_unique();
+        let bonding_curve_v2 = Pubkey::new_unique();
+
+        let offset = 8usize;
+        let mut accounts = vec![Pubkey::new_unique(); 32];
+        accounts[offset + PUMP_IDX_GLOBAL_CONFIG] = global_config;
+        accounts[offset + PUMP_IDX_FEE_RECIPIENT] = fee_recipient;
+        accounts[offset + PUMP_IDX_MINT] = mint;
+        accounts[offset + PUMP_IDX_BONDING_CURVE] = curve;
+        accounts[offset + PUMP_IDX_ASSOCIATED_BONDING_CURVE] = associated_bonding_curve;
+        accounts[offset + PUMP_IDX_USER] = user;
+        accounts[offset + PUMP_IDX_TOKEN_PROGRAM] = token_program;
+        accounts[offset + PUMP_IDX_BONDING_CURVE_V2] = bonding_curve_v2;
+
+        let event = make_decoded_tx_event(
+            accounts.clone(),
+            vec![crate::types::RawInstruction {
+                program_id: Pubkey::from_str(PUMP_FUN_PROGRAM_ID).unwrap(),
+                account_indices: (offset as u8..(offset + 18) as u8).collect(),
+                data: trade_data(DISC_BUY, 1_000_000, 50_000_000),
+            }],
+        );
+
+        let mut trade = sample_trade_event(
+            solana_sdk::signature::Signature::new_unique(),
+            curve,
+            mint,
+            user,
+            Some(0),
+        );
+
+        enrich_trade_optional_accounts_from_source_ix(&event, &mut trade);
+
+        assert_ne!(
+            accounts[PUMP_IDX_BONDING_CURVE_V2], bonding_curve_v2,
+            "fixture must distinguish global account_keys[16] from instruction position 16"
+        );
+        assert_eq!(trade.bonding_curve_v2, Some(bonding_curve_v2));
+        let provenance = trade
+            .bonding_curve_v2_provenance
+            .as_ref()
+            .expect("observed bcv2 provenance");
+        assert_eq!(
+            provenance.instruction_account_position,
+            Some(PUMP_IDX_BONDING_CURVE_V2 as u32)
+        );
+        assert_eq!(
+            provenance.message_account_index,
+            Some((offset + PUMP_IDX_BONDING_CURVE_V2) as u32)
+        );
+        assert_eq!(
+            provenance.resolved_pubkey.as_deref(),
+            Some(bonding_curve_v2.to_string().as_str())
+        );
+        assert_eq!(
+            provenance.provenance_status.as_deref(),
+            Some("route_compatible")
+        );
     }
 
     #[test]
@@ -9623,6 +9886,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -9722,6 +9986,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -9831,6 +10096,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -9923,6 +10189,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -10029,6 +10296,7 @@ mod tests {
             buy_variant: None,
             associated_bonding_curve: None,
             bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
