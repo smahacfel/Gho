@@ -184,6 +184,28 @@ pub struct ShadowSimulationAccountDiagnostics {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_bcv2_provenance_status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_resolution_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_route_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_route_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_route_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_route_ready: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_route_not_ready_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_route_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_route_attempted: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_route_ready: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_route_not_ready_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_executable_route_account_set_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub precheck_account_set_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prepared_request_account_set_hash: Option<String>,

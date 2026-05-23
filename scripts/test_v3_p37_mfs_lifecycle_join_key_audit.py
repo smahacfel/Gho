@@ -1723,6 +1723,122 @@ lifecycle_log_path = "../../logs/shadow_run/r16-active-bad-provenance/shadow_lif
             report["readiness"]["reasons"],
         )
 
+    def test_l1r16_route_resolver_counters_are_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "configs/rollout/r16-route-resolver.toml"
+            config.parent.mkdir(parents=True)
+            config.write_text(
+                """
+[oracle]
+decision_log_path = "../../logs/rollout/r16-route-resolver/decisions"
+
+[trigger.shadow_run]
+output_path = "../../logs/shadow_run/r16-route-resolver/buys.jsonl"
+
+[execution.shadow]
+entry_log_path = "../../logs/shadow_run/r16-route-resolver/shadow_entries.jsonl"
+lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/shadow_lifecycle.jsonl"
+
+[p37_shadow_probe]
+selection_log_path = "../../logs/shadow_run/r16-route-resolver/probe_selected.jsonl"
+skip_log_path = "../../logs/shadow_run/r16-route-resolver/probe_skipped.jsonl"
+transport_log_path = "../../logs/shadow_run/r16-route-resolver/probe_transport.jsonl"
+entry_log_path = "../../logs/shadow_run/r16-route-resolver/probe_entries.jsonl"
+lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.jsonl"
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            common = {
+                "candidate_id": "pool_mint_1000",
+                "ab_record_id": "ab-route",
+                "pool_id": "pool",
+                "base_mint": "mint",
+                "decision_ts_ms": 1000,
+                "v3_replay_payload_schema_version": 1,
+                "v3_feature_snapshot_hash": "feature-hash",
+                "v3_policy_config_hash": "policy-hash",
+            }
+            route_fields = {
+                "route_resolution_status": "no_executable_route_account_set",
+                "selected_route_reason": "no_route_candidate_passed_simulation_load_readiness",
+                "primary_route_kind": "routed_exact_sol_in",
+                "primary_route_ready": False,
+                "primary_route_not_ready_reason": "bonding_curve_v2_observed_meta_missing_on_rpc",
+                "fallback_route_kind": "legacy_buy",
+                "fallback_route_attempted": True,
+                "fallback_route_ready": False,
+                "fallback_route_not_ready_reason": (
+                    "fallback_route_requires_same_bcv2_simulation_load_account"
+                ),
+                "no_executable_route_account_set_reason": (
+                    "primary_route_bcv2_missing:bonding_curve_v2:bc-v2"
+                ),
+            }
+            no_executable_reason = (
+                "no_executable_route_account_set:"
+                "primary_route_bcv2_missing:bonding_curve_v2:bc-v2"
+            )
+            probe_skip = {
+                **common,
+                **route_fields,
+                "event_type": "probe_skipped",
+                "probe_id": "probe-route",
+                "probe_skip_reason": "no_executable_route_account_set",
+                "precheck_failure_reason": no_executable_reason,
+                "execution_account_readiness_role": "bonding_curve_v2",
+                "execution_account_readiness_pubkey": "bc-v2",
+                "execution_account_readiness_reason": no_executable_reason,
+            }
+            active_failure = {
+                **common,
+                **route_fields,
+                "execution_outcome": "shadow_data_problem",
+                "active_shadow_precheck_status": "precheck_failed",
+                "active_shadow_lifecycle_eligibility_status": "not_lifecycle_eligible",
+                "precheck_failure_reason": no_executable_reason,
+                "simulation_error_category": "active_shadow_precheck_failed",
+                "simulation_error_account_role": "bonding_curve_v2",
+                "simulation_error_account_pubkey": "bc-v2",
+            }
+            write_jsonl(
+                root / "logs/rollout/r16-route-resolver/decisions/gatekeeper_v2_decisions.jsonl",
+                [common],
+            )
+            write_jsonl(
+                root / "logs/shadow_run/r16-route-resolver/probe_skipped.jsonl",
+                [probe_skip],
+            )
+            write_jsonl(
+                root / "logs/shadow_run/r16-route-resolver/shadow_entries.jsonl",
+                [active_failure],
+            )
+
+            report = audit.build_report(config)
+
+        materialization = report["probe_entry_materialization"]
+        self.assertEqual(
+            materialization["route_resolution_status_counts"],
+            {"no_executable_route_account_set": 1},
+        )
+        self.assertEqual(materialization["route_fallback_attempted_rows"], 1)
+        self.assertEqual(materialization["route_fallback_success_rows"], 0)
+        self.assertEqual(materialization["route_fallback_failed_rows"], 1)
+        self.assertEqual(materialization["primary_route_bcv2_missing_rows"], 1)
+        self.assertEqual(materialization["no_executable_route_account_set_rows"], 1)
+
+        active = report["active_shadow_dispatch_diagnostics"]
+        self.assertEqual(
+            active["active_shadow_route_resolution_status_counts"],
+            {"no_executable_route_account_set": 1},
+        )
+        self.assertEqual(active["active_shadow_route_fallback_attempted_rows"], 1)
+        self.assertEqual(active["active_shadow_route_fallback_success_rows"], 0)
+        self.assertEqual(active["active_shadow_route_fallback_failed_rows"], 1)
+        self.assertEqual(active["active_shadow_primary_route_bcv2_missing_rows"], 1)
+        self.assertEqual(active["active_shadow_no_executable_route_account_set_rows"], 1)
+
     def test_active_shadow_unattributed_account_not_found_blocks_readiness(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -1494,6 +1494,97 @@ Acceptance:
 Collection, Phase B, P2, live, active policy changes, IWIM changes and threshold
 tuning remain out of scope.
 
+## P3.7-L1R16 / J3R Executable Route Resolver
+
+### Context
+
+R16-r12 closed the BCV2 provenance/readiness diagnostic as a runtime
+PASS-B:
+
+- observed route account metadata can establish route identity;
+- observed identity no longer implies execution readiness;
+- `bonding_curve_v2` missing on RPC is fail-closed before simulation;
+- post-simulation BCV2 `AccountNotFound` stays at zero.
+
+The remaining blocker is not BCV2 attribution, provenance, PDD, Gatekeeper
+thresholds, or replay parity. It is route execution feasibility: the selected
+route can require a simulation-load account set that is not executable in the
+current shadow runtime.
+
+### Contract
+
+L1R16 introduces an auditable executable-route resolver before probe and active
+shadow simulation:
+
+```text
+primary route ready -> select primary
+primary route not ready -> evaluate fallback route candidate, if available
+no route ready -> fail closed as no_executable_route_account_set
+```
+
+Fallback is not allowed to be silent. Every probe/active row that reaches route
+resolution must expose:
+
+```text
+route_resolution_status
+selected_route_kind
+selected_route_reason
+primary_route_kind
+primary_route_ready
+primary_route_not_ready_reason
+fallback_route_kind
+fallback_route_attempted
+fallback_route_ready
+fallback_route_not_ready_reason
+no_executable_route_account_set_reason
+```
+
+If the primary `routed_exact_sol_in` route has
+`bonding_curve_v2` missing on RPC precheck, it must not reach
+`simulate_buy`. The resolver either selects a ready fallback route or emits:
+
+```text
+probe_skip_reason = no_executable_route_account_set
+precheck_failure_reason =
+  no_executable_route_account_set:primary_route_bcv2_missing:bonding_curve_v2:<pubkey>
+```
+
+Active shadow failures use the same classification and remain
+`not_lifecycle_eligible`.
+
+### Current Fallback Limitation
+
+The current DirectBuyBuilder still builds `LegacyBuy` with the extended current
+Pump.fun account list, including `bonding_curve_v2`. Therefore L1R16 can
+evaluate `legacy_buy` as a fallback candidate, but it must mark it not ready
+when it requires the same missing simulation-load account. This is intentional:
+it avoids pretending that a fallback exists before the builder has a proven
+BCV2-free executable route.
+
+### R16-r13 Gate
+
+R16-r13 is the bounded executable-route-resolver smoke:
+
+```text
+configs/rollout/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r13-executable-route-resolver.toml
+```
+
+Acceptance:
+
+- strict replay `full_replay_ok`;
+- diagnostic quality remains PASS;
+- identity/hash contract remains PASS;
+- BCV2 post-simulation `AccountNotFound` remains zero;
+- route resolution fields are populated;
+- fallback attempts are counted explicitly;
+- no executable route rows are fail-closed before simulation;
+- simulation-error/failure rows are not lifecycle-eligible;
+- active BUY, live, P2, thresholds, IWIM and Phase B remain untouched.
+
+PASS-A means fallback selects an executable route and produces successful
+probe/active shadow entries. PASS-B means no fallback is executable and rows are
+explicitly classified as `no_executable_route_account_set`.
+
 ## P3.7-L1R15 / J3Q Observed-Meta Provenance Validation
 
 ### Trigger

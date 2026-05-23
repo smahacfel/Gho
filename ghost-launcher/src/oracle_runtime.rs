@@ -5008,6 +5008,17 @@ struct P37ShadowProbeSelectionRecord {
     observed_bcv2_tx_success: Option<bool>,
     observed_bcv2_meta_err: Option<String>,
     observed_bcv2_provenance_status: Option<String>,
+    route_resolution_status: Option<String>,
+    selected_route_kind: Option<String>,
+    selected_route_reason: Option<String>,
+    primary_route_kind: Option<String>,
+    primary_route_ready: Option<bool>,
+    primary_route_not_ready_reason: Option<String>,
+    fallback_route_kind: Option<String>,
+    fallback_route_attempted: Option<bool>,
+    fallback_route_ready: Option<bool>,
+    fallback_route_not_ready_reason: Option<String>,
+    no_executable_route_account_set_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq)]
@@ -5104,6 +5115,17 @@ struct P37ShadowProbeTransportRecord {
     observed_bcv2_tx_success: Option<bool>,
     observed_bcv2_meta_err: Option<String>,
     observed_bcv2_provenance_status: Option<String>,
+    route_resolution_status: Option<String>,
+    selected_route_kind: Option<String>,
+    selected_route_reason: Option<String>,
+    primary_route_kind: Option<String>,
+    primary_route_ready: Option<bool>,
+    primary_route_not_ready_reason: Option<String>,
+    fallback_route_kind: Option<String>,
+    fallback_route_attempted: Option<bool>,
+    fallback_route_ready: Option<bool>,
+    fallback_route_not_ready_reason: Option<String>,
+    no_executable_route_account_set_reason: Option<String>,
     amount_provided_lamports_if_available: Option<u64>,
     amount_required_lamports_if_available: Option<u64>,
     amount_shortfall_lamports_if_available: Option<u64>,
@@ -5495,6 +5517,17 @@ fn p37_shadow_probe_selection_record(
         observed_bcv2_tx_success: None,
         observed_bcv2_meta_err: None,
         observed_bcv2_provenance_status: None,
+        route_resolution_status: None,
+        selected_route_kind: None,
+        selected_route_reason: None,
+        primary_route_kind: None,
+        primary_route_ready: None,
+        primary_route_not_ready_reason: None,
+        fallback_route_kind: None,
+        fallback_route_attempted: None,
+        fallback_route_ready: None,
+        fallback_route_not_ready_reason: None,
+        no_executable_route_account_set_reason: None,
     }
 }
 
@@ -5649,6 +5682,19 @@ fn p37_shadow_probe_artifact_records(
         observed_bcv2_tx_success: None,
         observed_bcv2_meta_err: None,
         observed_bcv2_provenance_status: None,
+        route_resolution_status: record.route_resolution_status.clone(),
+        selected_route_kind: record.selected_route_kind.clone(),
+        selected_route_reason: record.selected_route_reason.clone(),
+        primary_route_kind: record.primary_route_kind.clone(),
+        primary_route_ready: record.primary_route_ready,
+        primary_route_not_ready_reason: record.primary_route_not_ready_reason.clone(),
+        fallback_route_kind: record.fallback_route_kind.clone(),
+        fallback_route_attempted: record.fallback_route_attempted,
+        fallback_route_ready: record.fallback_route_ready,
+        fallback_route_not_ready_reason: record.fallback_route_not_ready_reason.clone(),
+        no_executable_route_account_set_reason: record
+            .no_executable_route_account_set_reason
+            .clone(),
         amount_provided_lamports_if_available: None,
         amount_required_lamports_if_available: None,
         amount_shortfall_lamports_if_available: None,
@@ -5767,6 +5813,19 @@ fn p37_shadow_probe_artifact_records(
         observed_bcv2_tx_success: None,
         observed_bcv2_meta_err: None,
         observed_bcv2_provenance_status: None,
+        route_resolution_status: record.route_resolution_status.clone(),
+        selected_route_kind: record.selected_route_kind.clone(),
+        selected_route_reason: record.selected_route_reason.clone(),
+        primary_route_kind: record.primary_route_kind.clone(),
+        primary_route_ready: record.primary_route_ready,
+        primary_route_not_ready_reason: record.primary_route_not_ready_reason.clone(),
+        fallback_route_kind: record.fallback_route_kind.clone(),
+        fallback_route_attempted: record.fallback_route_attempted,
+        fallback_route_ready: record.fallback_route_ready,
+        fallback_route_not_ready_reason: record.fallback_route_not_ready_reason.clone(),
+        no_executable_route_account_set_reason: record
+            .no_executable_route_account_set_reason
+            .clone(),
         precheck_account_set_hash: None,
         prepared_request_account_set_hash: None,
         simulation_account_set_hash: None,
@@ -5878,6 +5937,8 @@ fn p37_shadow_probe_as_precheck_skip(
         "creator_vault_source_not_authoritative".to_string()
     } else if reason.starts_with("bonding_curve_v2_source_not_authoritative") {
         "bonding_curve_v2_source_not_authoritative".to_string()
+    } else if reason.starts_with("no_executable_route_account_set:") {
+        "no_executable_route_account_set".to_string()
     } else {
         "probe_execution_precheck_failed".to_string()
     });
@@ -5893,6 +5954,11 @@ fn p37_shadow_probe_as_precheck_skip(
     } else if let Some(pubkey) =
         p37_shadow_probe_parse_bonding_curve_v2_source_not_authoritative(&reason)
     {
+        record.execution_account_readiness_status = Some("not_ready".to_string());
+        record.execution_account_readiness_role = Some("bonding_curve_v2".to_string());
+        record.execution_account_readiness_pubkey = Some(pubkey);
+        record.execution_account_readiness_reason = Some(reason.clone());
+    } else if let Some(pubkey) = p37_shadow_probe_parse_no_executable_route_bcv2(&reason) {
         record.execution_account_readiness_status = Some("not_ready".to_string());
         record.execution_account_readiness_role = Some("bonding_curve_v2".to_string());
         record.execution_account_readiness_pubkey = Some(pubkey);
@@ -5949,6 +6015,171 @@ fn p37_shadow_probe_parse_bonding_curve_v2_source_not_authoritative(
         return None;
     }
     Some(pubkey.to_string())
+}
+
+fn p37_shadow_probe_parse_no_executable_route_bcv2(reason: &str) -> Option<String> {
+    let tail = reason.strip_prefix("no_executable_route_account_set:")?;
+    let mut parts = tail.split(':');
+    let route_reason = parts.next()?;
+    let role = parts.next()?;
+    let pubkey = parts.next()?;
+    if !matches!(
+        route_reason,
+        "primary_route_bcv2_missing" | "primary_route_identity_not_authoritative"
+    ) || role != "bonding_curve_v2"
+        || pubkey.trim().is_empty()
+    {
+        return None;
+    }
+    Some(pubkey.to_string())
+}
+
+#[derive(Debug, Clone, Default)]
+struct P37ExecutableRouteResolutionDiagnostics {
+    route_resolution_status: Option<String>,
+    selected_route_kind: Option<String>,
+    selected_route_reason: Option<String>,
+    primary_route_kind: Option<String>,
+    primary_route_ready: Option<bool>,
+    primary_route_not_ready_reason: Option<String>,
+    fallback_route_kind: Option<String>,
+    fallback_route_attempted: Option<bool>,
+    fallback_route_ready: Option<bool>,
+    fallback_route_not_ready_reason: Option<String>,
+    no_executable_route_account_set_reason: Option<String>,
+}
+
+impl P37ExecutableRouteResolutionDiagnostics {
+    fn no_executable_reason(&self) -> Option<String> {
+        if self.route_resolution_status.as_deref() != Some("no_executable_route_account_set") {
+            return None;
+        }
+        Some(format!(
+            "no_executable_route_account_set:{}",
+            self.no_executable_route_account_set_reason
+                .as_deref()
+                .unwrap_or("unknown")
+        ))
+    }
+}
+
+fn p37_shadow_probe_route_resolution_diagnostics(
+    request: Option<&crate::components::trigger::PreparedBuyRequest>,
+    account_set_diagnostics: Option<&P37ShadowProbeAccountSetDiagnostics>,
+    precheck_failure_reason: Option<&str>,
+    missing_account: Option<(&str, &str)>,
+) -> P37ExecutableRouteResolutionDiagnostics {
+    let primary_route_kind =
+        p37_shadow_probe_route_kind(request).unwrap_or_else(|| "unknown".to_string());
+    let fallback_route_kind =
+        (primary_route_kind != "legacy_buy").then(|| "legacy_buy".to_string());
+
+    let bcv2_from_failure = precheck_failure_reason
+        .and_then(p37_shadow_probe_parse_no_executable_route_bcv2)
+        .or_else(|| {
+            precheck_failure_reason.and_then(|reason| {
+                p37_shadow_probe_parse_execution_account_not_ready(reason)
+                    .and_then(|(role, pubkey)| (role == "bonding_curve_v2").then_some(pubkey))
+            })
+        })
+        .or_else(|| {
+            precheck_failure_reason
+                .and_then(p37_shadow_probe_parse_bonding_curve_v2_source_not_authoritative)
+        })
+        .or_else(|| {
+            missing_account
+                .and_then(|(role, pubkey)| (role == "bonding_curve_v2").then(|| pubkey.to_string()))
+        });
+
+    let bcv2_from_manifest = account_set_diagnostics.and_then(|diagnostics| {
+        diagnostics
+            .missing_candidates
+            .iter()
+            .find(|candidate| candidate.role == "bonding_curve_v2")
+            .map(|candidate| candidate.pubkey.clone())
+    });
+
+    let bcv2_missing_pubkey = bcv2_from_failure.or(bcv2_from_manifest);
+    let bcv2_authority =
+        p37_shadow_probe_bonding_curve_v2_authority_diagnostics(request, account_set_diagnostics);
+    let bcv2_not_load_ready = bcv2_authority
+        .builder_required_curve_account_ready
+        .is_some_and(|ready| !ready)
+        && bcv2_authority.pubkey.is_some();
+
+    if let Some(pubkey) = bcv2_missing_pubkey.or_else(|| {
+        bcv2_not_load_ready
+            .then(|| bcv2_authority.pubkey.clone())
+            .flatten()
+    }) {
+        let primary_reason = bcv2_authority
+            .builder_required_curve_account_ready_reason
+            .clone()
+            .unwrap_or_else(|| "primary_route_bcv2_missing".to_string());
+        let fallback_attempted = fallback_route_kind.is_some();
+        let fallback_not_ready_reason = if fallback_attempted {
+            request
+                .and_then(|request| request.account_overrides.legacy_buy_curve)
+                .map(|_| "fallback_route_requires_same_bcv2_simulation_load_account".to_string())
+                .or_else(|| Some("fallback_route_missing_legacy_buy_curve".to_string()))
+        } else {
+            Some("fallback_route_not_available_for_primary".to_string())
+        };
+        let no_executable_reason = if primary_reason.contains("source_not_authoritative")
+            || primary_reason.contains("identity_not_authoritative")
+        {
+            format!("primary_route_identity_not_authoritative:bonding_curve_v2:{pubkey}")
+        } else {
+            format!("primary_route_bcv2_missing:bonding_curve_v2:{pubkey}")
+        };
+        return P37ExecutableRouteResolutionDiagnostics {
+            route_resolution_status: Some("no_executable_route_account_set".to_string()),
+            selected_route_kind: None,
+            selected_route_reason: Some(
+                "no_route_candidate_passed_simulation_load_readiness".to_string(),
+            ),
+            primary_route_kind: Some(primary_route_kind),
+            primary_route_ready: Some(false),
+            primary_route_not_ready_reason: Some(primary_reason),
+            fallback_route_kind,
+            fallback_route_attempted: Some(fallback_attempted),
+            fallback_route_ready: Some(false),
+            fallback_route_not_ready_reason: fallback_not_ready_reason,
+            no_executable_route_account_set_reason: Some(no_executable_reason),
+        };
+    }
+
+    P37ExecutableRouteResolutionDiagnostics {
+        route_resolution_status: Some("primary_route_ready".to_string()),
+        selected_route_kind: Some(primary_route_kind.clone()),
+        selected_route_reason: Some("primary_route_passed_simulation_load_readiness".to_string()),
+        primary_route_kind: Some(primary_route_kind),
+        primary_route_ready: Some(true),
+        primary_route_not_ready_reason: None,
+        fallback_route_kind,
+        fallback_route_attempted: Some(false),
+        fallback_route_ready: None,
+        fallback_route_not_ready_reason: None,
+        no_executable_route_account_set_reason: None,
+    }
+}
+
+fn p37_shadow_probe_apply_route_resolution_to_record(
+    record: &mut P37ShadowProbeSelectionRecord,
+    resolution: P37ExecutableRouteResolutionDiagnostics,
+) {
+    record.route_resolution_status = resolution.route_resolution_status;
+    record.selected_route_kind = resolution.selected_route_kind;
+    record.selected_route_reason = resolution.selected_route_reason;
+    record.primary_route_kind = resolution.primary_route_kind;
+    record.primary_route_ready = resolution.primary_route_ready;
+    record.primary_route_not_ready_reason = resolution.primary_route_not_ready_reason;
+    record.fallback_route_kind = resolution.fallback_route_kind;
+    record.fallback_route_attempted = resolution.fallback_route_attempted;
+    record.fallback_route_ready = resolution.fallback_route_ready;
+    record.fallback_route_not_ready_reason = resolution.fallback_route_not_ready_reason;
+    record.no_executable_route_account_set_reason =
+        resolution.no_executable_route_account_set_reason;
 }
 
 async fn p37_shadow_probe_wait_for_required_account_readiness(
@@ -6148,6 +6379,17 @@ struct P37ShadowProbeExecutionDiagnostics {
     observed_bcv2_tx_success: Option<bool>,
     observed_bcv2_meta_err: Option<String>,
     observed_bcv2_provenance_status: Option<String>,
+    route_resolution_status: Option<String>,
+    selected_route_kind: Option<String>,
+    selected_route_reason: Option<String>,
+    primary_route_kind: Option<String>,
+    primary_route_ready: Option<bool>,
+    primary_route_not_ready_reason: Option<String>,
+    fallback_route_kind: Option<String>,
+    fallback_route_attempted: Option<bool>,
+    fallback_route_ready: Option<bool>,
+    fallback_route_not_ready_reason: Option<String>,
+    no_executable_route_account_set_reason: Option<String>,
     amount_provided_lamports_if_available: Option<u64>,
     amount_required_lamports_if_available: Option<u64>,
     amount_shortfall_lamports_if_available: Option<u64>,
@@ -6506,6 +6748,26 @@ fn p37_shadow_probe_as_bonding_curve_v2_source_precheck_skip(
     record.observed_bcv2_tx_success = diagnostics.observed_bcv2_tx_success;
     record.observed_bcv2_meta_err = diagnostics.observed_bcv2_meta_err;
     record.observed_bcv2_provenance_status = diagnostics.observed_bcv2_provenance_status;
+    let route_resolution = P37ExecutableRouteResolutionDiagnostics {
+        route_resolution_status: Some("no_executable_route_account_set".to_string()),
+        selected_route_kind: None,
+        selected_route_reason: Some(
+            "no_route_candidate_passed_simulation_load_readiness".to_string(),
+        ),
+        primary_route_kind: Some("routed_exact_sol_in".to_string()),
+        primary_route_ready: Some(false),
+        primary_route_not_ready_reason: record.bonding_curve_v2_mismatch_reason.clone(),
+        fallback_route_kind: Some("legacy_buy".to_string()),
+        fallback_route_attempted: Some(true),
+        fallback_route_ready: Some(false),
+        fallback_route_not_ready_reason: Some(
+            "fallback_route_requires_authoritative_primary_route_accounts".to_string(),
+        ),
+        no_executable_route_account_set_reason: record.bonding_curve_v2_pubkey.as_ref().map(
+            |pubkey| format!("primary_route_identity_not_authoritative:bonding_curve_v2:{pubkey}"),
+        ),
+    };
+    p37_shadow_probe_apply_route_resolution_to_record(&mut record, route_resolution);
     p37_shadow_probe_as_precheck_skip(record, reason)
 }
 
@@ -7231,6 +7493,7 @@ fn active_shadow_account_diagnostics_from_account_set(
         if message.starts_with("execution_account_not_ready:")
             || message.starts_with("active_shadow_precheck_failed:")
             || message.starts_with("bonding_curve_v2_source_not_authoritative:")
+            || message.starts_with("no_executable_route_account_set:")
         {
             Some(message.to_string())
         } else {
@@ -7244,6 +7507,9 @@ fn active_shadow_account_diagnostics_from_account_set(
     let bcv2_source_not_authoritative = precheck_failure_reason
         .as_deref()
         .and_then(p37_shadow_probe_parse_bonding_curve_v2_source_not_authoritative);
+    let no_executable_route_bcv2 = precheck_failure_reason
+        .as_deref()
+        .and_then(p37_shadow_probe_parse_no_executable_route_bcv2);
     let account_pubkey = error_message
         .as_deref()
         .and_then(p37_shadow_probe_error_pubkey);
@@ -7262,6 +7528,7 @@ fn active_shadow_account_diagnostics_from_account_set(
         .as_ref()
         .map(|(_, pubkey)| pubkey.clone())
         .or_else(|| bcv2_source_not_authoritative.clone())
+        .or_else(|| no_executable_route_bcv2.clone())
         .or_else(|| attribution.account_pubkey.clone())
         .or(account_pubkey);
     let account_role = execution_account_not_ready
@@ -7269,6 +7536,11 @@ fn active_shadow_account_diagnostics_from_account_set(
         .map(|(role, _)| role.clone())
         .or_else(|| {
             bcv2_source_not_authoritative
+                .as_ref()
+                .map(|_| "bonding_curve_v2".to_string())
+        })
+        .or_else(|| {
+            no_executable_route_bcv2
                 .as_ref()
                 .map(|_| "bonding_curve_v2".to_string())
         })
@@ -7282,6 +7554,12 @@ fn active_shadow_account_diagnostics_from_account_set(
     });
     let bonding_curve_v2_authority =
         p37_shadow_probe_bonding_curve_v2_authority_diagnostics(request, account_set_diagnostics);
+    let route_resolution = p37_shadow_probe_route_resolution_diagnostics(
+        request,
+        account_set_diagnostics,
+        precheck_failure_reason.as_deref(),
+        account_role.as_deref().zip(account_pubkey.as_deref()),
+    );
     let precheck_candidate = account_set_diagnostics.and_then(|diagnostics| {
         account_pubkey.as_ref().and_then(|pubkey| {
             diagnostics
@@ -7429,6 +7707,18 @@ fn active_shadow_account_diagnostics_from_account_set(
         observed_bcv2_tx_success: bonding_curve_v2_authority.observed_bcv2_tx_success,
         observed_bcv2_meta_err: bonding_curve_v2_authority.observed_bcv2_meta_err,
         observed_bcv2_provenance_status: bonding_curve_v2_authority.observed_bcv2_provenance_status,
+        route_resolution_status: route_resolution.route_resolution_status,
+        selected_route_kind: route_resolution.selected_route_kind,
+        selected_route_reason: route_resolution.selected_route_reason,
+        primary_route_kind: route_resolution.primary_route_kind,
+        primary_route_ready: route_resolution.primary_route_ready,
+        primary_route_not_ready_reason: route_resolution.primary_route_not_ready_reason,
+        fallback_route_kind: route_resolution.fallback_route_kind,
+        fallback_route_attempted: route_resolution.fallback_route_attempted,
+        fallback_route_ready: route_resolution.fallback_route_ready,
+        fallback_route_not_ready_reason: route_resolution.fallback_route_not_ready_reason,
+        no_executable_route_account_set_reason: route_resolution
+            .no_executable_route_account_set_reason,
         precheck_account_set_hash: account_set_diagnostics
             .and_then(|diagnostics| diagnostics.precheck_account_set_hash.clone()),
         prepared_request_account_set_hash: account_set_diagnostics
@@ -8200,12 +8490,17 @@ fn p37_shadow_probe_simulation_instruction_diagnostics(
 fn p37_shadow_probe_route_kind(
     request: Option<&crate::components::trigger::PreparedBuyRequest>,
 ) -> Option<String> {
-    request
-        .and_then(|request| request.build_profile.as_ref())
-        .map(|profile| match profile.buy_variant {
-            trigger::PumpfunBuyVariant::LegacyBuy => "legacy_buy".to_string(),
-            trigger::PumpfunBuyVariant::RoutedExactSolIn => "routed_exact_sol_in".to_string(),
-        })
+    request.and_then(|request| {
+        request
+            .build_profile
+            .as_ref()
+            .map(|profile| profile.buy_variant)
+            .or(request.account_overrides.buy_variant)
+            .map(|variant| match variant {
+                trigger::PumpfunBuyVariant::LegacyBuy => "legacy_buy".to_string(),
+                trigger::PumpfunBuyVariant::RoutedExactSolIn => "routed_exact_sol_in".to_string(),
+            })
+    })
 }
 
 fn p37_shadow_probe_required_account_roles_for_request(
@@ -8267,6 +8562,12 @@ fn p37_shadow_probe_execution_diagnostics(
     );
     let bonding_curve_v2_authority =
         p37_shadow_probe_bonding_curve_v2_authority_diagnostics(request, account_set_diagnostics);
+    let route_resolution = p37_shadow_probe_route_resolution_diagnostics(
+        request,
+        account_set_diagnostics,
+        precheck_failure_reason.as_deref(),
+        account_role.as_deref().zip(account_pubkey.as_deref()),
+    );
     let amount_guard = p37_shadow_probe_amount_guard_diagnostics(
         instruction_diagnostics.custom_code,
         anchor_error_actual_account_pubkey.as_deref(),
@@ -8357,6 +8658,18 @@ fn p37_shadow_probe_execution_diagnostics(
         observed_bcv2_tx_success: bonding_curve_v2_authority.observed_bcv2_tx_success,
         observed_bcv2_meta_err: bonding_curve_v2_authority.observed_bcv2_meta_err,
         observed_bcv2_provenance_status: bonding_curve_v2_authority.observed_bcv2_provenance_status,
+        route_resolution_status: route_resolution.route_resolution_status,
+        selected_route_kind: route_resolution.selected_route_kind,
+        selected_route_reason: route_resolution.selected_route_reason,
+        primary_route_kind: route_resolution.primary_route_kind,
+        primary_route_ready: route_resolution.primary_route_ready,
+        primary_route_not_ready_reason: route_resolution.primary_route_not_ready_reason,
+        fallback_route_kind: route_resolution.fallback_route_kind,
+        fallback_route_attempted: route_resolution.fallback_route_attempted,
+        fallback_route_ready: route_resolution.fallback_route_ready,
+        fallback_route_not_ready_reason: route_resolution.fallback_route_not_ready_reason,
+        no_executable_route_account_set_reason: route_resolution
+            .no_executable_route_account_set_reason,
         amount_provided_lamports_if_available: amount_guard.provided_lamports,
         amount_required_lamports_if_available: amount_guard.required_lamports,
         amount_shortfall_lamports_if_available: amount_guard.shortfall_lamports,
@@ -8599,6 +8912,17 @@ fn p37_shadow_probe_transport_from_event(
         observed_bcv2_tx_success: diagnostics.observed_bcv2_tx_success,
         observed_bcv2_meta_err: diagnostics.observed_bcv2_meta_err,
         observed_bcv2_provenance_status: diagnostics.observed_bcv2_provenance_status,
+        route_resolution_status: diagnostics.route_resolution_status,
+        selected_route_kind: diagnostics.selected_route_kind,
+        selected_route_reason: diagnostics.selected_route_reason,
+        primary_route_kind: diagnostics.primary_route_kind,
+        primary_route_ready: diagnostics.primary_route_ready,
+        primary_route_not_ready_reason: diagnostics.primary_route_not_ready_reason,
+        fallback_route_kind: diagnostics.fallback_route_kind,
+        fallback_route_attempted: diagnostics.fallback_route_attempted,
+        fallback_route_ready: diagnostics.fallback_route_ready,
+        fallback_route_not_ready_reason: diagnostics.fallback_route_not_ready_reason,
+        no_executable_route_account_set_reason: diagnostics.no_executable_route_account_set_reason,
         amount_provided_lamports_if_available: diagnostics.amount_provided_lamports_if_available,
         amount_required_lamports_if_available: diagnostics.amount_required_lamports_if_available,
         amount_shortfall_lamports_if_available: diagnostics.amount_shortfall_lamports_if_available,
@@ -8792,6 +9116,17 @@ fn p37_shadow_probe_transport_from_error(
         observed_bcv2_tx_success: diagnostics.observed_bcv2_tx_success,
         observed_bcv2_meta_err: diagnostics.observed_bcv2_meta_err,
         observed_bcv2_provenance_status: diagnostics.observed_bcv2_provenance_status,
+        route_resolution_status: diagnostics.route_resolution_status,
+        selected_route_kind: diagnostics.selected_route_kind,
+        selected_route_reason: diagnostics.selected_route_reason,
+        primary_route_kind: diagnostics.primary_route_kind,
+        primary_route_ready: diagnostics.primary_route_ready,
+        primary_route_not_ready_reason: diagnostics.primary_route_not_ready_reason,
+        fallback_route_kind: diagnostics.fallback_route_kind,
+        fallback_route_attempted: diagnostics.fallback_route_attempted,
+        fallback_route_ready: diagnostics.fallback_route_ready,
+        fallback_route_not_ready_reason: diagnostics.fallback_route_not_ready_reason,
+        no_executable_route_account_set_reason: diagnostics.no_executable_route_account_set_reason,
         amount_provided_lamports_if_available: diagnostics.amount_provided_lamports_if_available,
         amount_required_lamports_if_available: diagnostics.amount_required_lamports_if_available,
         amount_shortfall_lamports_if_available: diagnostics.amount_shortfall_lamports_if_available,
@@ -8932,6 +9267,34 @@ fn enrich_probe_shadow_entry(
     entry.builder_required_curve_account_ready_reason = transport
         .builder_required_curve_account_ready_reason
         .clone();
+    entry.observed_bcv2_source_tx_signature = transport.observed_bcv2_source_tx_signature.clone();
+    entry.observed_bcv2_source_slot = transport.observed_bcv2_source_slot;
+    entry.observed_bcv2_source_slot_index = transport.observed_bcv2_source_slot_index;
+    entry.observed_bcv2_source_instruction_index = transport.observed_bcv2_source_instruction_index;
+    entry.observed_bcv2_source_program_id = transport.observed_bcv2_source_program_id.clone();
+    entry.observed_bcv2_source_discriminator = transport.observed_bcv2_source_discriminator.clone();
+    entry.observed_bcv2_source_buy_variant = transport.observed_bcv2_source_buy_variant.clone();
+    entry.observed_bcv2_instruction_account_position =
+        transport.observed_bcv2_instruction_account_position;
+    entry.observed_bcv2_message_account_index = transport.observed_bcv2_message_account_index;
+    entry.observed_bcv2_resolved_pubkey = transport.observed_bcv2_resolved_pubkey.clone();
+    entry.observed_bcv2_loaded_address_source =
+        transport.observed_bcv2_loaded_address_source.clone();
+    entry.observed_bcv2_tx_success = transport.observed_bcv2_tx_success;
+    entry.observed_bcv2_meta_err = transport.observed_bcv2_meta_err.clone();
+    entry.observed_bcv2_provenance_status = transport.observed_bcv2_provenance_status.clone();
+    entry.route_resolution_status = transport.route_resolution_status.clone();
+    entry.selected_route_kind = transport.selected_route_kind.clone();
+    entry.selected_route_reason = transport.selected_route_reason.clone();
+    entry.primary_route_kind = transport.primary_route_kind.clone();
+    entry.primary_route_ready = transport.primary_route_ready;
+    entry.primary_route_not_ready_reason = transport.primary_route_not_ready_reason.clone();
+    entry.fallback_route_kind = transport.fallback_route_kind.clone();
+    entry.fallback_route_attempted = transport.fallback_route_attempted;
+    entry.fallback_route_ready = transport.fallback_route_ready;
+    entry.fallback_route_not_ready_reason = transport.fallback_route_not_ready_reason.clone();
+    entry.no_executable_route_account_set_reason =
+        transport.no_executable_route_account_set_reason.clone();
     entry.precheck_account_set_hash = transport.precheck_account_set_hash.clone();
     entry.prepared_request_account_set_hash = transport.prepared_request_account_set_hash.clone();
     entry.simulation_account_set_hash = transport.simulation_account_set_hash.clone();
@@ -9080,7 +9443,17 @@ async fn run_p37_shadow_probe_dispatch(
         Ok((Some((missing_pubkey, missing_role)), wait_ms, wait_result)) => {
             record.probe_execution_account_wait_ms = Some(wait_ms);
             record.probe_execution_account_wait_result = Some(wait_result);
-            let reason = if p37_shadow_probe_is_strict_execution_account_role(&missing_role) {
+            let route_resolution = p37_shadow_probe_route_resolution_diagnostics(
+                Some(&request),
+                None,
+                None,
+                Some((missing_role.as_str(), &missing_pubkey.to_string())),
+            );
+            let route_no_executable_reason = route_resolution.no_executable_reason();
+            p37_shadow_probe_apply_route_resolution_to_record(&mut record, route_resolution);
+            let reason = if let Some(reason) = route_no_executable_reason {
+                reason
+            } else if p37_shadow_probe_is_strict_execution_account_role(&missing_role) {
                 p37_shadow_probe_execution_account_not_ready_reason(&missing_role, &missing_pubkey)
             } else {
                 format!(
@@ -11207,8 +11580,15 @@ async fn active_shadow_simulation_load_precheck_receipt(
     }
 
     if let Some(reason) = p37_shadow_probe_bonding_curve_v2_source_precheck_reason(request) {
+        let route_resolution = p37_shadow_probe_route_resolution_diagnostics(
+            Some(request),
+            None,
+            Some(reason.as_str()),
+            None,
+        );
+        let error = route_resolution.no_executable_reason().unwrap_or(reason);
         return Some(crate::components::trigger::TriggerDispatchReceipt {
-            primary_outcome: Err(anyhow::anyhow!("{reason}")),
+            primary_outcome: Err(anyhow::anyhow!("{error}")),
             shadow_task: None,
             active_position_lease: None,
             retain_position_slot_on_error: false,
@@ -11221,10 +11601,25 @@ async fn active_shadow_simulation_load_precheck_receipt(
         .counterfactual_probe_missing_required_account(request)
         .await;
     let error = match precheck_result {
-        Ok(Some(missing)) => anyhow::anyhow!(
-            "{}",
-            p37_shadow_probe_execution_account_not_ready_reason(&missing.role, &missing.pubkey)
-        ),
+        Ok(Some(missing)) => {
+            let route_resolution = p37_shadow_probe_route_resolution_diagnostics(
+                Some(request),
+                None,
+                None,
+                Some((missing.role.as_str(), &missing.pubkey.to_string())),
+            );
+            if let Some(reason) = route_resolution.no_executable_reason() {
+                anyhow::anyhow!("{reason}")
+            } else {
+                anyhow::anyhow!(
+                    "{}",
+                    p37_shadow_probe_execution_account_not_ready_reason(
+                        &missing.role,
+                        &missing.pubkey
+                    )
+                )
+            }
+        }
         Ok(None) => return None,
         Err(err) => anyhow::anyhow!("active_shadow_precheck_failed:{}", err),
     };
@@ -11713,6 +12108,17 @@ fn shadow_entry_record_from_event(
         observed_bcv2_tx_success: None,
         observed_bcv2_meta_err: None,
         observed_bcv2_provenance_status: None,
+        route_resolution_status: None,
+        selected_route_kind: None,
+        selected_route_reason: None,
+        primary_route_kind: None,
+        primary_route_ready: None,
+        primary_route_not_ready_reason: None,
+        fallback_route_kind: None,
+        fallback_route_attempted: None,
+        fallback_route_ready: None,
+        fallback_route_not_ready_reason: None,
+        no_executable_route_account_set_reason: None,
         precheck_account_set_hash: None,
         prepared_request_account_set_hash: None,
         simulation_account_set_hash: None,
@@ -11812,6 +12218,17 @@ fn shadow_entry_record_from_request(
         observed_bcv2_tx_success: None,
         observed_bcv2_meta_err: None,
         observed_bcv2_provenance_status: None,
+        route_resolution_status: None,
+        selected_route_kind: None,
+        selected_route_reason: None,
+        primary_route_kind: None,
+        primary_route_ready: None,
+        primary_route_not_ready_reason: None,
+        fallback_route_kind: None,
+        fallback_route_attempted: None,
+        fallback_route_ready: None,
+        fallback_route_not_ready_reason: None,
+        no_executable_route_account_set_reason: None,
         precheck_account_set_hash: None,
         prepared_request_account_set_hash: None,
         simulation_account_set_hash: None,
@@ -11939,6 +12356,18 @@ fn enrich_active_shadow_entry_with_account_diagnostics(
     entry.observed_bcv2_tx_success = diagnostics.observed_bcv2_tx_success;
     entry.observed_bcv2_meta_err = diagnostics.observed_bcv2_meta_err.clone();
     entry.observed_bcv2_provenance_status = diagnostics.observed_bcv2_provenance_status.clone();
+    entry.route_resolution_status = diagnostics.route_resolution_status.clone();
+    entry.selected_route_kind = diagnostics.selected_route_kind.clone();
+    entry.selected_route_reason = diagnostics.selected_route_reason.clone();
+    entry.primary_route_kind = diagnostics.primary_route_kind.clone();
+    entry.primary_route_ready = diagnostics.primary_route_ready;
+    entry.primary_route_not_ready_reason = diagnostics.primary_route_not_ready_reason.clone();
+    entry.fallback_route_kind = diagnostics.fallback_route_kind.clone();
+    entry.fallback_route_attempted = diagnostics.fallback_route_attempted;
+    entry.fallback_route_ready = diagnostics.fallback_route_ready;
+    entry.fallback_route_not_ready_reason = diagnostics.fallback_route_not_ready_reason.clone();
+    entry.no_executable_route_account_set_reason =
+        diagnostics.no_executable_route_account_set_reason.clone();
     entry.precheck_account_set_hash = diagnostics.precheck_account_set_hash.clone();
     entry.prepared_request_account_set_hash = diagnostics.prepared_request_account_set_hash.clone();
     entry.simulation_account_set_hash = diagnostics.simulation_account_set_hash.clone();
@@ -12326,6 +12755,28 @@ struct ShadowEntryRecord {
     observed_bcv2_meta_err: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     observed_bcv2_provenance_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    route_resolution_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected_route_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected_route_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    primary_route_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    primary_route_ready: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    primary_route_not_ready_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fallback_route_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fallback_route_attempted: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fallback_route_ready: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fallback_route_not_ready_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    no_executable_route_account_set_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     precheck_account_set_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -16582,6 +17033,19 @@ mod tests {
         entry
     }
 
+    fn p37_shadow_probe_test_legacy_curve() -> BondingCurve {
+        BondingCurve {
+            discriminator: 0,
+            virtual_token_reserves: 1_000_000_000_000,
+            virtual_sol_reserves: 30_000_000_000,
+            real_token_reserves: 1_000_000_000_000,
+            real_sol_reserves: 30_000_000_000,
+            token_total_supply: 0,
+            complete: 0,
+            _padding: [0; 7],
+        }
+    }
+
     #[test]
     fn p37_shadow_probe_bonding_curve_v2_route_builder_is_not_authoritative() {
         let bcv2 = Pubkey::new_unique().to_string();
@@ -16836,6 +17300,143 @@ mod tests {
     }
 
     #[test]
+    fn p37_route_resolver_primary_route_ready_selects_primary() {
+        let mut request = test_prepared_buy_request();
+        request.account_overrides.buy_variant = Some(trigger::PumpfunBuyVariant::RoutedExactSolIn);
+
+        let resolution =
+            p37_shadow_probe_route_resolution_diagnostics(Some(&request), None, None, None);
+
+        assert_eq!(
+            resolution.route_resolution_status.as_deref(),
+            Some("primary_route_ready")
+        );
+        assert_eq!(
+            resolution.selected_route_kind.as_deref(),
+            Some("routed_exact_sol_in")
+        );
+        assert_eq!(resolution.primary_route_ready, Some(true));
+        assert_eq!(resolution.fallback_route_attempted, Some(false));
+        assert_eq!(resolution.no_executable_route_account_set_reason, None);
+    }
+
+    #[test]
+    fn p37_route_resolver_primary_bcv2_missing_attempts_fallback() {
+        let mut request = test_prepared_buy_request();
+        let bcv2 = Pubkey::new_unique().to_string();
+        request.account_overrides.buy_variant = Some(trigger::PumpfunBuyVariant::RoutedExactSolIn);
+        request.account_overrides.legacy_buy_curve = Some(p37_shadow_probe_test_legacy_curve());
+        let diagnostics = P37ShadowProbeAccountSetDiagnostics {
+            manifest: vec![p37_shadow_probe_route_compatible_bcv2_manifest_entry(
+                bcv2.clone(),
+            )],
+            missing_candidates: vec![P37ShadowProbeAccountNotFoundCandidate {
+                pubkey: bcv2.clone(),
+                role: "bonding_curve_v2".to_string(),
+                source: "observed_tx_account_meta".to_string(),
+                instruction_index: Some(0),
+                account_index: Some(16),
+                required: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let resolution = p37_shadow_probe_route_resolution_diagnostics(
+            Some(&request),
+            Some(&diagnostics),
+            None,
+            Some(("bonding_curve_v2", bcv2.as_str())),
+        );
+
+        assert_eq!(
+            resolution.route_resolution_status.as_deref(),
+            Some("no_executable_route_account_set")
+        );
+        assert_eq!(
+            resolution.primary_route_kind.as_deref(),
+            Some("routed_exact_sol_in")
+        );
+        assert_eq!(resolution.primary_route_ready, Some(false));
+        assert_eq!(
+            resolution.primary_route_not_ready_reason.as_deref(),
+            Some("bonding_curve_v2_observed_meta_missing_on_rpc")
+        );
+        assert_eq!(
+            resolution.fallback_route_kind.as_deref(),
+            Some("legacy_buy")
+        );
+        assert_eq!(resolution.fallback_route_attempted, Some(true));
+        assert_eq!(resolution.fallback_route_ready, Some(false));
+        assert_eq!(
+            resolution.fallback_route_not_ready_reason.as_deref(),
+            Some("fallback_route_requires_same_bcv2_simulation_load_account")
+        );
+        let expected_reason = format!("primary_route_bcv2_missing:bonding_curve_v2:{bcv2}");
+        assert_eq!(
+            resolution.no_executable_route_account_set_reason.as_deref(),
+            Some(expected_reason.as_str())
+        );
+    }
+
+    #[test]
+    fn p37_route_resolver_fallback_missing_accounts_returns_no_executable_route() {
+        let mut request = test_prepared_buy_request();
+        let bcv2 = Pubkey::new_unique().to_string();
+        request.account_overrides.buy_variant = Some(trigger::PumpfunBuyVariant::RoutedExactSolIn);
+
+        let precheck_reason = format!("execution_account_not_ready:bonding_curve_v2:{bcv2}");
+        let resolution = p37_shadow_probe_route_resolution_diagnostics(
+            Some(&request),
+            None,
+            Some(precheck_reason.as_str()),
+            None,
+        );
+
+        assert_eq!(
+            resolution.route_resolution_status.as_deref(),
+            Some("no_executable_route_account_set")
+        );
+        assert_eq!(resolution.fallback_route_attempted, Some(true));
+        assert_eq!(resolution.fallback_route_ready, Some(false));
+        assert_eq!(
+            resolution.fallback_route_not_ready_reason.as_deref(),
+            Some("fallback_route_missing_legacy_buy_curve")
+        );
+        let expected_reason = format!(
+            "no_executable_route_account_set:primary_route_bcv2_missing:bonding_curve_v2:{bcv2}"
+        );
+        assert_eq!(
+            resolution.no_executable_reason().as_deref(),
+            Some(expected_reason.as_str())
+        );
+    }
+
+    #[test]
+    fn p37_no_executable_route_precheck_skip_is_not_lifecycle_eligible() {
+        let (record, _pool, _buy_mint) = p37_shadow_probe_precheck_record_and_pool();
+        let bcv2 = Pubkey::new_unique().to_string();
+        let skipped = p37_shadow_probe_as_precheck_skip(
+            record,
+            format!("no_executable_route_account_set:primary_route_bcv2_missing:bonding_curve_v2:{bcv2}"),
+        );
+
+        assert_eq!(skipped.event_type, "probe_skipped");
+        assert_eq!(
+            skipped.probe_skip_reason.as_deref(),
+            Some("no_executable_route_account_set")
+        );
+        assert_eq!(
+            skipped.execution_account_readiness_role.as_deref(),
+            Some("bonding_curve_v2")
+        );
+        assert_eq!(
+            skipped.execution_account_readiness_pubkey.as_deref(),
+            Some(bcv2.as_str())
+        );
+    }
+
+    #[test]
     fn p37_shadow_probe_account_not_found_exact_attribution_from_candidate() {
         let request = test_prepared_buy_request();
         let missing = P37ShadowProbeAccountNotFoundCandidate {
@@ -17001,6 +17602,81 @@ mod tests {
             Some("exact_after_narrowing")
         );
         assert_eq!(active.simulation_error_account_candidates_narrowed.len(), 1);
+        assert_eq!(
+            active.active_shadow_lifecycle_eligibility_status.as_deref(),
+            Some("not_lifecycle_eligible")
+        );
+    }
+
+    #[test]
+    fn active_shadow_no_executable_route_failure_carries_route_resolution() {
+        let mut request = test_prepared_buy_request();
+        let bonding_curve_v2 = Pubkey::new_unique().to_string();
+        request.account_overrides.buy_variant = Some(trigger::PumpfunBuyVariant::RoutedExactSolIn);
+        let reason = format!(
+            "no_executable_route_account_set:primary_route_bcv2_missing:bonding_curve_v2:{bonding_curve_v2}"
+        );
+        let diagnostics = P37ShadowProbeAccountSetDiagnostics {
+            manifest: vec![p37_shadow_probe_route_compatible_bcv2_manifest_entry(
+                bonding_curve_v2.clone(),
+            )],
+            missing_candidates: vec![P37ShadowProbeAccountNotFoundCandidate {
+                pubkey: bonding_curve_v2.clone(),
+                role: "bonding_curve_v2".to_string(),
+                source: "observed_tx_account_meta".to_string(),
+                instruction_index: Some(0),
+                account_index: Some(16),
+                required: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let active = active_shadow_account_diagnostics_from_account_set(
+            Some(reason.clone()),
+            Some(&request),
+            Some(&diagnostics),
+            "not_run_post_simulation_attribution",
+        );
+
+        assert_eq!(
+            active.active_shadow_precheck_status.as_deref(),
+            Some("precheck_failed")
+        );
+        assert_eq!(
+            active.precheck_failure_reason.as_deref(),
+            Some(reason.as_str())
+        );
+        assert_eq!(active.simulation_error_kind, None);
+        assert_eq!(
+            active.simulation_error_category.as_deref(),
+            Some("active_shadow_precheck_failed")
+        );
+        assert_eq!(
+            active.simulation_error_account_role.as_deref(),
+            Some("bonding_curve_v2")
+        );
+        assert_eq!(
+            active.simulation_error_account_pubkey.as_deref(),
+            Some(bonding_curve_v2.as_str())
+        );
+        assert_eq!(
+            active.route_resolution_status.as_deref(),
+            Some("no_executable_route_account_set")
+        );
+        assert_eq!(
+            active.primary_route_kind.as_deref(),
+            Some("routed_exact_sol_in")
+        );
+        assert_eq!(active.primary_route_ready, Some(false));
+        assert_eq!(active.fallback_route_attempted, Some(true));
+        assert_eq!(active.fallback_route_ready, Some(false));
+        let expected_reason =
+            format!("primary_route_bcv2_missing:bonding_curve_v2:{bonding_curve_v2}");
+        assert_eq!(
+            active.no_executable_route_account_set_reason.as_deref(),
+            Some(expected_reason.as_str())
+        );
         assert_eq!(
             active.active_shadow_lifecycle_eligibility_status.as_deref(),
             Some("not_lifecycle_eligible")

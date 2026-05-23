@@ -598,6 +598,8 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
     builder_required_curve_account_ready_counts: Counter[str] = Counter()
     builder_required_curve_account_ready_reason_counts: Counter[str] = Counter()
     observed_bcv2_provenance_status_counts: Counter[str] = Counter()
+    route_resolution_status_counts: Counter[str] = Counter()
+    selected_route_kind_counts: Counter[str] = Counter()
     route_fallback_status_counts: Counter[str] = Counter()
     amount_guard_status_counts: Counter[str] = Counter()
     simulation_error_custom_code_counts: Counter[str] = Counter()
@@ -647,9 +649,12 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
             "builder_required_curve_account_ready_reason",
         )
         observed_bcv2_provenance_status = row_string(row, "observed_bcv2_provenance_status")
+        route_resolution_status = row_string(row, "route_resolution_status")
+        selected_route_kind = row_string(row, "selected_route_kind")
         route_fallback_status = (
             row_string(row, "route_fallback_status")
             or row_string(row, "fallback_route_status")
+            or row_bool_string(row, "fallback_route_attempted")
             or row_bool_string(row, "route_fallback_attempted")
         )
         amount_guard_status = row_string(row, "amount_guard_status")
@@ -692,6 +697,10 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
             ] += 1
         if observed_bcv2_provenance_status:
             observed_bcv2_provenance_status_counts[observed_bcv2_provenance_status] += 1
+        if route_resolution_status:
+            route_resolution_status_counts[route_resolution_status] += 1
+        if selected_route_kind:
+            selected_route_kind_counts[selected_route_kind] += 1
         if route_fallback_status:
             route_fallback_status_counts[route_fallback_status] += 1
         if amount_guard_status:
@@ -906,9 +915,12 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
         bonding_curve_v2_mismatch_reason = row_string(row, "bonding_curve_v2_mismatch_reason")
         bonding_curve_v2_source = row_string(row, "bonding_curve_v2_source")
         observed_bcv2_provenance_status = row_string(row, "observed_bcv2_provenance_status")
+        route_resolution_status = row_string(row, "route_resolution_status")
+        selected_route_kind = row_string(row, "selected_route_kind")
         route_fallback_status = (
             row_string(row, "route_fallback_status")
             or row_string(row, "fallback_route_status")
+            or row_bool_string(row, "fallback_route_attempted")
             or row_bool_string(row, "route_fallback_attempted")
         )
         if creator_vault_authority_status:
@@ -925,6 +937,10 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
             skip_bonding_curve_v2_source_counts[bonding_curve_v2_source] += 1
         if observed_bcv2_provenance_status:
             observed_bcv2_provenance_status_counts[observed_bcv2_provenance_status] += 1
+        if route_resolution_status:
+            route_resolution_status_counts[route_resolution_status] += 1
+        if selected_route_kind:
+            selected_route_kind_counts[selected_route_kind] += 1
         if route_fallback_status:
             skip_route_fallback_status_counts[route_fallback_status] += 1
 
@@ -1039,16 +1055,43 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
     route_fallback_attempted_rows = [
         row
         for row in skip_rows + transport_rows
-        if row_bool_string(row, "route_fallback_attempted") == "true"
+        if row_bool_string(row, "fallback_route_attempted") == "true"
+        or row_bool_string(row, "route_fallback_attempted") == "true"
         or bool(row_string(row, "route_fallback_status"))
         or bool(row_string(row, "fallback_route_status"))
     ]
     route_fallback_success_rows = [
         row
         for row in route_fallback_attempted_rows
-        if row_string(row, "route_fallback_status") in {"success", "fallback_success"}
+        if row_string(row, "route_resolution_status") == "fallback_route_ready"
+        or row_string(row, "route_fallback_status") in {"success", "fallback_success"}
         or row_string(row, "fallback_route_status") in {"success", "fallback_success"}
+        or (
+            row_string(row, "selected_route_kind") in {"legacy_buy", "LegacyBuy"}
+            and row_bool_string(row, "fallback_route_ready") == "true"
+        )
         or row_string(row, "fallback_route") in {"legacy_buy", "LegacyBuy"}
+    ]
+    route_fallback_failed_rows = [
+        row
+        for row in route_fallback_attempted_rows
+        if row not in route_fallback_success_rows
+    ]
+    primary_route_bcv2_missing_rows = [
+        row
+        for row in skip_rows + transport_rows
+        if "primary_route_bcv2_missing"
+        in (
+            row_string(row, "no_executable_route_account_set_reason")
+            or row_string(row, "precheck_failure_reason")
+            or row_string(row, "execution_account_readiness_reason")
+            or ""
+        )
+        or row_string(row, "primary_route_not_ready_reason")
+        in {
+            "bonding_curve_v2_observed_meta_missing_on_rpc",
+            "bonding_curve_v2_identity_authoritative_but_not_load_ready",
+        }
     ]
     no_executable_route_account_set_rows = [
         row
@@ -1191,6 +1234,8 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
         "observed_bcv2_provenance_status_counts": dict(
             sorted(observed_bcv2_provenance_status_counts.items())
         ),
+        "route_resolution_status_counts": dict(sorted(route_resolution_status_counts.items())),
+        "selected_route_kind_counts": dict(sorted(selected_route_kind_counts.items())),
         "observed_bcv2_rows": len(observed_bcv2_rows),
         "observed_bcv2_route_compatible_rows": len(observed_bcv2_route_compatible_rows),
         "observed_bcv2_not_route_compatible_rows": len(
@@ -1293,6 +1338,8 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
         "route_excluded_bcv2_missing_rows": len(route_excluded_bcv2_missing_rows),
         "route_fallback_attempted_rows": len(route_fallback_attempted_rows),
         "route_fallback_success_rows": len(route_fallback_success_rows),
+        "route_fallback_failed_rows": len(route_fallback_failed_rows),
+        "primary_route_bcv2_missing_rows": len(primary_route_bcv2_missing_rows),
         "no_executable_route_account_set_rows": len(no_executable_route_account_set_rows),
         "bonding_curve_v2_precheck_skipped_before_simulation_rows": len(
             bonding_curve_v2_precheck_skipped_before_simulation_rows
@@ -1443,6 +1490,8 @@ def active_shadow_dispatch_diagnostics(paths: dict[str, list[Path]]) -> dict[str
     builder_required_curve_account_ready_counts: Counter[str] = Counter()
     builder_required_curve_account_ready_reason_counts: Counter[str] = Counter()
     observed_bcv2_provenance_status_counts: Counter[str] = Counter()
+    route_resolution_status_counts: Counter[str] = Counter()
+    selected_route_kind_counts: Counter[str] = Counter()
     route_fallback_status_counts: Counter[str] = Counter()
     for row in failure_rows:
         if role := row_string(row, "simulation_error_account_role"):
@@ -1475,9 +1524,14 @@ def active_shadow_dispatch_diagnostics(paths: dict[str, list[Path]]) -> dict[str
             builder_required_curve_account_ready_reason_counts[reason] += 1
         if status := row_string(row, "observed_bcv2_provenance_status"):
             observed_bcv2_provenance_status_counts[status] += 1
+        if status := row_string(row, "route_resolution_status"):
+            route_resolution_status_counts[status] += 1
+        if route_kind := row_string(row, "selected_route_kind"):
+            selected_route_kind_counts[route_kind] += 1
         route_fallback_status = (
             row_string(row, "route_fallback_status")
             or row_string(row, "fallback_route_status")
+            or row_bool_string(row, "fallback_route_attempted")
             or row_bool_string(row, "route_fallback_attempted")
         )
         if route_fallback_status:
@@ -1508,16 +1562,42 @@ def active_shadow_dispatch_diagnostics(paths: dict[str, list[Path]]) -> dict[str
     route_fallback_attempted_rows = [
         row
         for row in failure_rows
-        if row_bool_string(row, "route_fallback_attempted") == "true"
+        if row_bool_string(row, "fallback_route_attempted") == "true"
+        or row_bool_string(row, "route_fallback_attempted") == "true"
         or bool(row_string(row, "route_fallback_status"))
         or bool(row_string(row, "fallback_route_status"))
     ]
     route_fallback_success_rows = [
         row
         for row in route_fallback_attempted_rows
-        if row_string(row, "route_fallback_status") in {"success", "fallback_success"}
+        if row_string(row, "route_resolution_status") == "fallback_route_ready"
+        or row_string(row, "route_fallback_status") in {"success", "fallback_success"}
         or row_string(row, "fallback_route_status") in {"success", "fallback_success"}
+        or (
+            row_string(row, "selected_route_kind") in {"legacy_buy", "LegacyBuy"}
+            and row_bool_string(row, "fallback_route_ready") == "true"
+        )
         or row_string(row, "fallback_route") in {"legacy_buy", "LegacyBuy"}
+    ]
+    route_fallback_failed_rows = [
+        row
+        for row in route_fallback_attempted_rows
+        if row not in route_fallback_success_rows
+    ]
+    primary_route_bcv2_missing_rows = [
+        row
+        for row in failure_rows
+        if "primary_route_bcv2_missing"
+        in (
+            row_string(row, "no_executable_route_account_set_reason")
+            or row_string(row, "precheck_failure_reason")
+            or ""
+        )
+        or row_string(row, "primary_route_not_ready_reason")
+        in {
+            "bonding_curve_v2_observed_meta_missing_on_rpc",
+            "bonding_curve_v2_identity_authoritative_but_not_load_ready",
+        }
     ]
     no_executable_route_account_set_rows = [
         row
@@ -1645,6 +1725,10 @@ def active_shadow_dispatch_diagnostics(paths: dict[str, list[Path]]) -> dict[str
         "active_shadow_observed_bcv2_provenance_status_counts": dict(
             sorted(observed_bcv2_provenance_status_counts.items())
         ),
+        "active_shadow_route_resolution_status_counts": dict(
+            sorted(route_resolution_status_counts.items())
+        ),
+        "active_shadow_selected_route_kind_counts": dict(sorted(selected_route_kind_counts.items())),
         "active_shadow_observed_bcv2_rows": len(observed_bcv2_rows),
         "active_shadow_observed_bcv2_route_compatible_rows": len(
             observed_bcv2_route_compatible_rows
@@ -1666,6 +1750,8 @@ def active_shadow_dispatch_diagnostics(paths: dict[str, list[Path]]) -> dict[str
         ),
         "active_shadow_route_fallback_attempted_rows": len(route_fallback_attempted_rows),
         "active_shadow_route_fallback_success_rows": len(route_fallback_success_rows),
+        "active_shadow_route_fallback_failed_rows": len(route_fallback_failed_rows),
+        "active_shadow_primary_route_bcv2_missing_rows": len(primary_route_bcv2_missing_rows),
         "active_shadow_no_executable_route_account_set_rows": len(
             no_executable_route_account_set_rows
         ),
