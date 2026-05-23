@@ -1585,6 +1585,94 @@ PASS-A means fallback selects an executable route and produces successful
 probe/active shadow entries. PASS-B means no fallback is executable and rows are
 explicitly classified as `no_executable_route_account_set`.
 
+## P3.7-L1R17 / J3S Executable Route Decision Audit
+
+### Context
+
+R16-r13 validated L1R16 as a PASS-B fail-closed route resolver smoke:
+
+- primary `routed_exact_sol_in` rows with missing `bonding_curve_v2` do not
+  reach simulation;
+- fallback `legacy_buy` is attempted and logged;
+- fallback success is zero in the observed sample;
+- post-simulation `AccountNotFound` stays zero;
+- successful entries/lifecycle labels remain blocked because no executable
+  route account set is available.
+
+L1R17 is the decision audit for that state. It is not a new policy run and does
+not change thresholds, PDD, IWIM, Phase B, P2/live behavior, sampling limits or
+active policy.
+
+### Contract
+
+For every row where:
+
+```text
+route_resolution_status = no_executable_route_account_set
+fallback_route_attempted = true
+fallback_route_success = false
+```
+
+the runtime/audit must expose enough fallback failure evidence to decide whether
+fallback is narrowly repairable or whether the route class should be excluded
+from the execution-label universe:
+
+```text
+primary_route_kind
+primary_route_not_ready_reason
+fallback_route_kind
+fallback_route_not_ready_reason
+fallback_missing_roles
+fallback_missing_pubkeys
+fallback_account_sources
+fallback_simulation_load_account_set
+fallback_creatable_account_set
+fallback_required_precheck_account_set
+fallback_failure_class
+```
+
+Fallback failure classes:
+
+```text
+fallback_missing_core_curve_account
+fallback_missing_associated_bonding_curve
+fallback_missing_creator_vault
+fallback_missing_user_ata_but_creatable
+fallback_missing_payer_but_ephemeral
+fallback_missing_route_identity
+fallback_builder_account_source_unverified
+fallback_no_prepared_route
+fallback_unknown
+```
+
+### Acceptance
+
+The audit is ready only when it emits a binary decision:
+
+```text
+fallback_repairable = true | false | null
+recommended_next_path =
+  fallback_route_account_source_repair
+  OR route_class_exclusion_from_execution_label_universe
+  OR audit_gap
+```
+
+Decision rules:
+
+- if fallback failure is limited to nonfatal/creatable accounts, use
+  `fallback_route_account_source_repair`;
+- if fallback lacks core route identity or uses unverified primary route
+  accounts, use `route_class_exclusion_from_execution_label_universe`;
+- if the failure class is unknown or missing, use `audit_gap` and improve
+  diagnostics before any collection or L2 ablation.
+
+Rows with `no_executable_route_account_set` are execution feasibility rejects,
+not market bad/good labels. L2 can only resume on the executable universe:
+
+```text
+route_resolution_status in ["primary_route_ready", "fallback_route_ready"]
+```
+
 ## P3.7-L1R15 / J3Q Observed-Meta Provenance Validation
 
 ### Trigger

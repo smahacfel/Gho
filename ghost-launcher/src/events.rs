@@ -203,6 +203,20 @@ pub struct ShadowSimulationAccountDiagnostics {
     pub fallback_route_ready: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_route_not_ready_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_missing_roles: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_missing_pubkeys: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_account_sources: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_simulation_load_account_set: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_creatable_account_set: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_required_precheck_account_set: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_failure_class: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_executable_route_account_set_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -1772,6 +1772,17 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
                 "fallback_route_not_ready_reason": (
                     "fallback_route_requires_same_bcv2_simulation_load_account"
                 ),
+                "fallback_missing_roles": ["bonding_curve_v2"],
+                "fallback_missing_pubkeys": ["bc-v2"],
+                "fallback_account_sources": ["primary_route_account_set"],
+                "fallback_simulation_load_account_set": [
+                    "bonding_curve_v2:bc-v2:observed_tx_account_meta"
+                ],
+                "fallback_creatable_account_set": [],
+                "fallback_required_precheck_account_set": [
+                    "bonding_curve_v2:bc-v2:observed_tx_account_meta"
+                ],
+                "fallback_failure_class": "fallback_builder_account_source_unverified",
                 "no_executable_route_account_set_reason": (
                     "primary_route_bcv2_missing:bonding_curve_v2:bc-v2"
                 ),
@@ -1825,6 +1836,24 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
         self.assertEqual(materialization["route_fallback_attempted_rows"], 1)
         self.assertEqual(materialization["route_fallback_success_rows"], 0)
         self.assertEqual(materialization["route_fallback_failed_rows"], 1)
+        self.assertEqual(
+            materialization["fallback_failure_class_counts"],
+            {"fallback_builder_account_source_unverified": 1},
+        )
+        self.assertEqual(
+            materialization["fallback_missing_role_counts"],
+            {"bonding_curve_v2": 1},
+        )
+        self.assertEqual(
+            materialization["fallback_account_source_counts"],
+            {"primary_route_account_set": 1},
+        )
+        self.assertFalse(materialization["fallback_repairable"])
+        self.assertEqual(
+            materialization["recommended_next_path"],
+            "route_class_exclusion_from_execution_label_universe",
+        )
+        self.assertEqual(materialization["executable_route_ready_rows"], 0)
         self.assertEqual(materialization["primary_route_bcv2_missing_rows"], 1)
         self.assertEqual(materialization["no_executable_route_account_set_rows"], 1)
 
@@ -1836,6 +1865,24 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
         self.assertEqual(active["active_shadow_route_fallback_attempted_rows"], 1)
         self.assertEqual(active["active_shadow_route_fallback_success_rows"], 0)
         self.assertEqual(active["active_shadow_route_fallback_failed_rows"], 1)
+        self.assertEqual(
+            active["active_shadow_fallback_failure_class_counts"],
+            {"fallback_builder_account_source_unverified": 1},
+        )
+        self.assertEqual(
+            active["active_shadow_fallback_missing_role_counts"],
+            {"bonding_curve_v2": 1},
+        )
+        self.assertEqual(
+            active["active_shadow_fallback_account_source_counts"],
+            {"primary_route_account_set": 1},
+        )
+        self.assertFalse(active["active_shadow_fallback_repairable"])
+        self.assertEqual(
+            active["active_shadow_recommended_next_path"],
+            "route_class_exclusion_from_execution_label_universe",
+        )
+        self.assertEqual(active["active_shadow_executable_route_ready_rows"], 0)
         self.assertEqual(active["active_shadow_primary_route_bcv2_missing_rows"], 1)
         self.assertEqual(active["active_shadow_no_executable_route_account_set_rows"], 1)
 

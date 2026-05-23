@@ -5018,6 +5018,13 @@ struct P37ShadowProbeSelectionRecord {
     fallback_route_attempted: Option<bool>,
     fallback_route_ready: Option<bool>,
     fallback_route_not_ready_reason: Option<String>,
+    fallback_missing_roles: Vec<String>,
+    fallback_missing_pubkeys: Vec<String>,
+    fallback_account_sources: Vec<String>,
+    fallback_simulation_load_account_set: Vec<String>,
+    fallback_creatable_account_set: Vec<String>,
+    fallback_required_precheck_account_set: Vec<String>,
+    fallback_failure_class: Option<String>,
     no_executable_route_account_set_reason: Option<String>,
 }
 
@@ -5125,6 +5132,13 @@ struct P37ShadowProbeTransportRecord {
     fallback_route_attempted: Option<bool>,
     fallback_route_ready: Option<bool>,
     fallback_route_not_ready_reason: Option<String>,
+    fallback_missing_roles: Vec<String>,
+    fallback_missing_pubkeys: Vec<String>,
+    fallback_account_sources: Vec<String>,
+    fallback_simulation_load_account_set: Vec<String>,
+    fallback_creatable_account_set: Vec<String>,
+    fallback_required_precheck_account_set: Vec<String>,
+    fallback_failure_class: Option<String>,
     no_executable_route_account_set_reason: Option<String>,
     amount_provided_lamports_if_available: Option<u64>,
     amount_required_lamports_if_available: Option<u64>,
@@ -5527,6 +5541,13 @@ fn p37_shadow_probe_selection_record(
         fallback_route_attempted: None,
         fallback_route_ready: None,
         fallback_route_not_ready_reason: None,
+        fallback_missing_roles: Vec::new(),
+        fallback_missing_pubkeys: Vec::new(),
+        fallback_account_sources: Vec::new(),
+        fallback_simulation_load_account_set: Vec::new(),
+        fallback_creatable_account_set: Vec::new(),
+        fallback_required_precheck_account_set: Vec::new(),
+        fallback_failure_class: None,
         no_executable_route_account_set_reason: None,
     }
 }
@@ -5692,6 +5713,15 @@ fn p37_shadow_probe_artifact_records(
         fallback_route_attempted: record.fallback_route_attempted,
         fallback_route_ready: record.fallback_route_ready,
         fallback_route_not_ready_reason: record.fallback_route_not_ready_reason.clone(),
+        fallback_missing_roles: record.fallback_missing_roles.clone(),
+        fallback_missing_pubkeys: record.fallback_missing_pubkeys.clone(),
+        fallback_account_sources: record.fallback_account_sources.clone(),
+        fallback_simulation_load_account_set: record.fallback_simulation_load_account_set.clone(),
+        fallback_creatable_account_set: record.fallback_creatable_account_set.clone(),
+        fallback_required_precheck_account_set: record
+            .fallback_required_precheck_account_set
+            .clone(),
+        fallback_failure_class: record.fallback_failure_class.clone(),
         no_executable_route_account_set_reason: record
             .no_executable_route_account_set_reason
             .clone(),
@@ -5823,6 +5853,15 @@ fn p37_shadow_probe_artifact_records(
         fallback_route_attempted: record.fallback_route_attempted,
         fallback_route_ready: record.fallback_route_ready,
         fallback_route_not_ready_reason: record.fallback_route_not_ready_reason.clone(),
+        fallback_missing_roles: record.fallback_missing_roles.clone(),
+        fallback_missing_pubkeys: record.fallback_missing_pubkeys.clone(),
+        fallback_account_sources: record.fallback_account_sources.clone(),
+        fallback_simulation_load_account_set: record.fallback_simulation_load_account_set.clone(),
+        fallback_creatable_account_set: record.fallback_creatable_account_set.clone(),
+        fallback_required_precheck_account_set: record
+            .fallback_required_precheck_account_set
+            .clone(),
+        fallback_failure_class: record.fallback_failure_class.clone(),
         no_executable_route_account_set_reason: record
             .no_executable_route_account_set_reason
             .clone(),
@@ -6046,6 +6085,13 @@ struct P37ExecutableRouteResolutionDiagnostics {
     fallback_route_attempted: Option<bool>,
     fallback_route_ready: Option<bool>,
     fallback_route_not_ready_reason: Option<String>,
+    fallback_missing_roles: Vec<String>,
+    fallback_missing_pubkeys: Vec<String>,
+    fallback_account_sources: Vec<String>,
+    fallback_simulation_load_account_set: Vec<String>,
+    fallback_creatable_account_set: Vec<String>,
+    fallback_required_precheck_account_set: Vec<String>,
+    fallback_failure_class: Option<String>,
     no_executable_route_account_set_reason: Option<String>,
 }
 
@@ -6061,6 +6107,191 @@ impl P37ExecutableRouteResolutionDiagnostics {
                 .unwrap_or("unknown")
         ))
     }
+}
+
+fn p37_shadow_probe_account_manifest_descriptor(
+    entry: &P37ShadowProbeAccountManifestEntry,
+) -> String {
+    let role = if entry.role.trim().is_empty() {
+        "unknown"
+    } else {
+        entry.role.as_str()
+    };
+    let pubkey = if entry.pubkey.trim().is_empty() {
+        "unknown"
+    } else {
+        entry.pubkey.as_str()
+    };
+    let source = if entry.source.trim().is_empty() {
+        "unknown"
+    } else {
+        entry.source.as_str()
+    };
+    format!("{role}:{pubkey}:{source}")
+}
+
+fn p37_shadow_probe_sorted_unique(values: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut values: Vec<String> = values
+        .into_iter()
+        .filter(|value| !value.trim().is_empty())
+        .collect();
+    values.sort();
+    values.dedup();
+    values
+}
+
+fn p37_shadow_probe_fallback_failure_class_from_reason(
+    fallback_not_ready_reason: Option<&str>,
+    missing_roles: &[String],
+) -> Option<String> {
+    if let Some(reason) = fallback_not_ready_reason {
+        match reason {
+            "fallback_route_missing_legacy_buy_curve" => {
+                return Some("fallback_missing_core_curve_account".to_string());
+            }
+            "fallback_route_requires_same_bcv2_simulation_load_account"
+            | "fallback_route_requires_authoritative_primary_route_accounts" => {
+                return Some("fallback_builder_account_source_unverified".to_string());
+            }
+            "fallback_route_not_available_for_primary" => {
+                return Some("fallback_no_prepared_route".to_string());
+            }
+            _ => {}
+        }
+    }
+
+    if missing_roles.iter().any(|role| role == "bonding_curve") {
+        Some("fallback_missing_core_curve_account".to_string())
+    } else if missing_roles
+        .iter()
+        .any(|role| role == "associated_bonding_curve")
+    {
+        Some("fallback_missing_associated_bonding_curve".to_string())
+    } else if missing_roles.iter().any(|role| role == "creator_vault") {
+        Some("fallback_missing_creator_vault".to_string())
+    } else if missing_roles.iter().any(|role| role == "user_ata") {
+        Some("fallback_missing_user_ata_but_creatable".to_string())
+    } else if missing_roles.iter().any(|role| role == "payer_pubkey") {
+        Some("fallback_missing_payer_but_ephemeral".to_string())
+    } else if missing_roles
+        .iter()
+        .any(|role| role.contains("route") || role == "bonding_curve_v2")
+    {
+        Some("fallback_missing_route_identity".to_string())
+    } else if missing_roles.is_empty() {
+        Some("fallback_unknown".to_string())
+    } else {
+        Some("fallback_unknown".to_string())
+    }
+}
+
+fn p37_shadow_probe_fallback_failure_diagnostics(
+    account_set_diagnostics: Option<&P37ShadowProbeAccountSetDiagnostics>,
+    fallback_not_ready_reason: Option<&str>,
+    bcv2_pubkey: Option<&str>,
+) -> (
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+    Option<String>,
+) {
+    let fallback_simulation_load_account_set = account_set_diagnostics
+        .map(|diagnostics| {
+            p37_shadow_probe_sorted_unique(
+                diagnostics
+                    .manifest
+                    .iter()
+                    .map(p37_shadow_probe_account_manifest_descriptor),
+            )
+        })
+        .unwrap_or_default();
+    let fallback_required_precheck_account_set = account_set_diagnostics
+        .map(|diagnostics| {
+            p37_shadow_probe_sorted_unique(
+                diagnostics
+                    .manifest
+                    .iter()
+                    .filter(|entry| entry.required)
+                    .map(p37_shadow_probe_account_manifest_descriptor),
+            )
+        })
+        .unwrap_or_default();
+    let fallback_creatable_account_set = account_set_diagnostics
+        .map(|diagnostics| {
+            p37_shadow_probe_sorted_unique(diagnostics.manifest.iter().filter_map(|entry| {
+                (entry.role == "user_ata" || entry.role == "user_volume_accumulator")
+                    .then(|| p37_shadow_probe_account_manifest_descriptor(entry))
+            }))
+        })
+        .unwrap_or_default();
+
+    let mut missing_roles: Vec<String> = account_set_diagnostics
+        .map(|diagnostics| {
+            diagnostics
+                .missing_candidates
+                .iter()
+                .map(|candidate| candidate.role.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut missing_pubkeys: Vec<String> = account_set_diagnostics
+        .map(|diagnostics| {
+            diagnostics
+                .missing_candidates
+                .iter()
+                .map(|candidate| candidate.pubkey.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut account_sources: Vec<String> = account_set_diagnostics
+        .map(|diagnostics| {
+            diagnostics
+                .missing_candidates
+                .iter()
+                .map(|candidate| candidate.source.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    match fallback_not_ready_reason {
+        Some("fallback_route_missing_legacy_buy_curve") => {
+            missing_roles.push("bonding_curve".to_string());
+            account_sources.push("legacy_buy_curve".to_string());
+        }
+        Some("fallback_route_requires_same_bcv2_simulation_load_account")
+        | Some("fallback_route_requires_authoritative_primary_route_accounts") => {
+            missing_roles.push("bonding_curve_v2".to_string());
+            if let Some(pubkey) = bcv2_pubkey.filter(|pubkey| !pubkey.trim().is_empty()) {
+                missing_pubkeys.push(pubkey.to_string());
+            }
+            account_sources.push("primary_route_account_set".to_string());
+        }
+        Some("fallback_route_not_available_for_primary") => {
+            account_sources.push("route_builder".to_string());
+        }
+        _ => {}
+    }
+
+    let missing_roles = p37_shadow_probe_sorted_unique(missing_roles);
+    let missing_pubkeys = p37_shadow_probe_sorted_unique(missing_pubkeys);
+    let account_sources = p37_shadow_probe_sorted_unique(account_sources);
+    let failure_class = p37_shadow_probe_fallback_failure_class_from_reason(
+        fallback_not_ready_reason,
+        &missing_roles,
+    );
+
+    (
+        missing_roles,
+        missing_pubkeys,
+        account_sources,
+        fallback_simulation_load_account_set,
+        fallback_creatable_account_set,
+        fallback_required_precheck_account_set,
+        failure_class,
+    )
 }
 
 fn p37_shadow_probe_route_resolution_diagnostics(
@@ -6125,6 +6356,19 @@ fn p37_shadow_probe_route_resolution_diagnostics(
         } else {
             Some("fallback_route_not_available_for_primary".to_string())
         };
+        let (
+            fallback_missing_roles,
+            fallback_missing_pubkeys,
+            fallback_account_sources,
+            fallback_simulation_load_account_set,
+            fallback_creatable_account_set,
+            fallback_required_precheck_account_set,
+            fallback_failure_class,
+        ) = p37_shadow_probe_fallback_failure_diagnostics(
+            account_set_diagnostics,
+            fallback_not_ready_reason.as_deref(),
+            Some(pubkey.as_str()),
+        );
         let no_executable_reason = if primary_reason.contains("source_not_authoritative")
             || primary_reason.contains("identity_not_authoritative")
         {
@@ -6145,6 +6389,13 @@ fn p37_shadow_probe_route_resolution_diagnostics(
             fallback_route_attempted: Some(fallback_attempted),
             fallback_route_ready: Some(false),
             fallback_route_not_ready_reason: fallback_not_ready_reason,
+            fallback_missing_roles,
+            fallback_missing_pubkeys,
+            fallback_account_sources,
+            fallback_simulation_load_account_set,
+            fallback_creatable_account_set,
+            fallback_required_precheck_account_set,
+            fallback_failure_class,
             no_executable_route_account_set_reason: Some(no_executable_reason),
         };
     }
@@ -6160,6 +6411,13 @@ fn p37_shadow_probe_route_resolution_diagnostics(
         fallback_route_attempted: Some(false),
         fallback_route_ready: None,
         fallback_route_not_ready_reason: None,
+        fallback_missing_roles: Vec::new(),
+        fallback_missing_pubkeys: Vec::new(),
+        fallback_account_sources: Vec::new(),
+        fallback_simulation_load_account_set: Vec::new(),
+        fallback_creatable_account_set: Vec::new(),
+        fallback_required_precheck_account_set: Vec::new(),
+        fallback_failure_class: None,
         no_executable_route_account_set_reason: None,
     }
 }
@@ -6178,6 +6436,14 @@ fn p37_shadow_probe_apply_route_resolution_to_record(
     record.fallback_route_attempted = resolution.fallback_route_attempted;
     record.fallback_route_ready = resolution.fallback_route_ready;
     record.fallback_route_not_ready_reason = resolution.fallback_route_not_ready_reason;
+    record.fallback_missing_roles = resolution.fallback_missing_roles;
+    record.fallback_missing_pubkeys = resolution.fallback_missing_pubkeys;
+    record.fallback_account_sources = resolution.fallback_account_sources;
+    record.fallback_simulation_load_account_set = resolution.fallback_simulation_load_account_set;
+    record.fallback_creatable_account_set = resolution.fallback_creatable_account_set;
+    record.fallback_required_precheck_account_set =
+        resolution.fallback_required_precheck_account_set;
+    record.fallback_failure_class = resolution.fallback_failure_class;
     record.no_executable_route_account_set_reason =
         resolution.no_executable_route_account_set_reason;
 }
@@ -6389,6 +6655,13 @@ struct P37ShadowProbeExecutionDiagnostics {
     fallback_route_attempted: Option<bool>,
     fallback_route_ready: Option<bool>,
     fallback_route_not_ready_reason: Option<String>,
+    fallback_missing_roles: Vec<String>,
+    fallback_missing_pubkeys: Vec<String>,
+    fallback_account_sources: Vec<String>,
+    fallback_simulation_load_account_set: Vec<String>,
+    fallback_creatable_account_set: Vec<String>,
+    fallback_required_precheck_account_set: Vec<String>,
+    fallback_failure_class: Option<String>,
     no_executable_route_account_set_reason: Option<String>,
     amount_provided_lamports_if_available: Option<u64>,
     amount_required_lamports_if_available: Option<u64>,
@@ -6763,6 +7036,13 @@ fn p37_shadow_probe_as_bonding_curve_v2_source_precheck_skip(
         fallback_route_not_ready_reason: Some(
             "fallback_route_requires_authoritative_primary_route_accounts".to_string(),
         ),
+        fallback_missing_roles: vec!["bonding_curve_v2".to_string()],
+        fallback_missing_pubkeys: record.bonding_curve_v2_pubkey.iter().cloned().collect(),
+        fallback_account_sources: vec!["primary_route_account_set".to_string()],
+        fallback_simulation_load_account_set: Vec::new(),
+        fallback_creatable_account_set: Vec::new(),
+        fallback_required_precheck_account_set: Vec::new(),
+        fallback_failure_class: Some("fallback_builder_account_source_unverified".to_string()),
         no_executable_route_account_set_reason: record.bonding_curve_v2_pubkey.as_ref().map(
             |pubkey| format!("primary_route_identity_not_authoritative:bonding_curve_v2:{pubkey}"),
         ),
@@ -7717,6 +7997,14 @@ fn active_shadow_account_diagnostics_from_account_set(
         fallback_route_attempted: route_resolution.fallback_route_attempted,
         fallback_route_ready: route_resolution.fallback_route_ready,
         fallback_route_not_ready_reason: route_resolution.fallback_route_not_ready_reason,
+        fallback_missing_roles: route_resolution.fallback_missing_roles,
+        fallback_missing_pubkeys: route_resolution.fallback_missing_pubkeys,
+        fallback_account_sources: route_resolution.fallback_account_sources,
+        fallback_simulation_load_account_set: route_resolution.fallback_simulation_load_account_set,
+        fallback_creatable_account_set: route_resolution.fallback_creatable_account_set,
+        fallback_required_precheck_account_set: route_resolution
+            .fallback_required_precheck_account_set,
+        fallback_failure_class: route_resolution.fallback_failure_class,
         no_executable_route_account_set_reason: route_resolution
             .no_executable_route_account_set_reason,
         precheck_account_set_hash: account_set_diagnostics
@@ -8668,6 +8956,14 @@ fn p37_shadow_probe_execution_diagnostics(
         fallback_route_attempted: route_resolution.fallback_route_attempted,
         fallback_route_ready: route_resolution.fallback_route_ready,
         fallback_route_not_ready_reason: route_resolution.fallback_route_not_ready_reason,
+        fallback_missing_roles: route_resolution.fallback_missing_roles,
+        fallback_missing_pubkeys: route_resolution.fallback_missing_pubkeys,
+        fallback_account_sources: route_resolution.fallback_account_sources,
+        fallback_simulation_load_account_set: route_resolution.fallback_simulation_load_account_set,
+        fallback_creatable_account_set: route_resolution.fallback_creatable_account_set,
+        fallback_required_precheck_account_set: route_resolution
+            .fallback_required_precheck_account_set,
+        fallback_failure_class: route_resolution.fallback_failure_class,
         no_executable_route_account_set_reason: route_resolution
             .no_executable_route_account_set_reason,
         amount_provided_lamports_if_available: amount_guard.provided_lamports,
@@ -8922,6 +9218,13 @@ fn p37_shadow_probe_transport_from_event(
         fallback_route_attempted: diagnostics.fallback_route_attempted,
         fallback_route_ready: diagnostics.fallback_route_ready,
         fallback_route_not_ready_reason: diagnostics.fallback_route_not_ready_reason,
+        fallback_missing_roles: diagnostics.fallback_missing_roles,
+        fallback_missing_pubkeys: diagnostics.fallback_missing_pubkeys,
+        fallback_account_sources: diagnostics.fallback_account_sources,
+        fallback_simulation_load_account_set: diagnostics.fallback_simulation_load_account_set,
+        fallback_creatable_account_set: diagnostics.fallback_creatable_account_set,
+        fallback_required_precheck_account_set: diagnostics.fallback_required_precheck_account_set,
+        fallback_failure_class: diagnostics.fallback_failure_class,
         no_executable_route_account_set_reason: diagnostics.no_executable_route_account_set_reason,
         amount_provided_lamports_if_available: diagnostics.amount_provided_lamports_if_available,
         amount_required_lamports_if_available: diagnostics.amount_required_lamports_if_available,
@@ -9126,6 +9429,13 @@ fn p37_shadow_probe_transport_from_error(
         fallback_route_attempted: diagnostics.fallback_route_attempted,
         fallback_route_ready: diagnostics.fallback_route_ready,
         fallback_route_not_ready_reason: diagnostics.fallback_route_not_ready_reason,
+        fallback_missing_roles: diagnostics.fallback_missing_roles,
+        fallback_missing_pubkeys: diagnostics.fallback_missing_pubkeys,
+        fallback_account_sources: diagnostics.fallback_account_sources,
+        fallback_simulation_load_account_set: diagnostics.fallback_simulation_load_account_set,
+        fallback_creatable_account_set: diagnostics.fallback_creatable_account_set,
+        fallback_required_precheck_account_set: diagnostics.fallback_required_precheck_account_set,
+        fallback_failure_class: diagnostics.fallback_failure_class,
         no_executable_route_account_set_reason: diagnostics.no_executable_route_account_set_reason,
         amount_provided_lamports_if_available: diagnostics.amount_provided_lamports_if_available,
         amount_required_lamports_if_available: diagnostics.amount_required_lamports_if_available,
@@ -9293,6 +9603,15 @@ fn enrich_probe_shadow_entry(
     entry.fallback_route_attempted = transport.fallback_route_attempted;
     entry.fallback_route_ready = transport.fallback_route_ready;
     entry.fallback_route_not_ready_reason = transport.fallback_route_not_ready_reason.clone();
+    entry.fallback_missing_roles = transport.fallback_missing_roles.clone();
+    entry.fallback_missing_pubkeys = transport.fallback_missing_pubkeys.clone();
+    entry.fallback_account_sources = transport.fallback_account_sources.clone();
+    entry.fallback_simulation_load_account_set =
+        transport.fallback_simulation_load_account_set.clone();
+    entry.fallback_creatable_account_set = transport.fallback_creatable_account_set.clone();
+    entry.fallback_required_precheck_account_set =
+        transport.fallback_required_precheck_account_set.clone();
+    entry.fallback_failure_class = transport.fallback_failure_class.clone();
     entry.no_executable_route_account_set_reason =
         transport.no_executable_route_account_set_reason.clone();
     entry.precheck_account_set_hash = transport.precheck_account_set_hash.clone();
@@ -12118,6 +12437,22 @@ fn shadow_entry_record_from_event(
         fallback_route_attempted: None,
         fallback_route_ready: None,
         fallback_route_not_ready_reason: None,
+        fallback_missing_roles: event.account_diagnostics.fallback_missing_roles.clone(),
+        fallback_missing_pubkeys: event.account_diagnostics.fallback_missing_pubkeys.clone(),
+        fallback_account_sources: event.account_diagnostics.fallback_account_sources.clone(),
+        fallback_simulation_load_account_set: event
+            .account_diagnostics
+            .fallback_simulation_load_account_set
+            .clone(),
+        fallback_creatable_account_set: event
+            .account_diagnostics
+            .fallback_creatable_account_set
+            .clone(),
+        fallback_required_precheck_account_set: event
+            .account_diagnostics
+            .fallback_required_precheck_account_set
+            .clone(),
+        fallback_failure_class: event.account_diagnostics.fallback_failure_class.clone(),
         no_executable_route_account_set_reason: None,
         precheck_account_set_hash: None,
         prepared_request_account_set_hash: None,
@@ -12228,6 +12563,13 @@ fn shadow_entry_record_from_request(
         fallback_route_attempted: None,
         fallback_route_ready: None,
         fallback_route_not_ready_reason: None,
+        fallback_missing_roles: Vec::new(),
+        fallback_missing_pubkeys: Vec::new(),
+        fallback_account_sources: Vec::new(),
+        fallback_simulation_load_account_set: Vec::new(),
+        fallback_creatable_account_set: Vec::new(),
+        fallback_required_precheck_account_set: Vec::new(),
+        fallback_failure_class: None,
         no_executable_route_account_set_reason: None,
         precheck_account_set_hash: None,
         prepared_request_account_set_hash: None,
@@ -12366,6 +12708,15 @@ fn enrich_active_shadow_entry_with_account_diagnostics(
     entry.fallback_route_attempted = diagnostics.fallback_route_attempted;
     entry.fallback_route_ready = diagnostics.fallback_route_ready;
     entry.fallback_route_not_ready_reason = diagnostics.fallback_route_not_ready_reason.clone();
+    entry.fallback_missing_roles = diagnostics.fallback_missing_roles.clone();
+    entry.fallback_missing_pubkeys = diagnostics.fallback_missing_pubkeys.clone();
+    entry.fallback_account_sources = diagnostics.fallback_account_sources.clone();
+    entry.fallback_simulation_load_account_set =
+        diagnostics.fallback_simulation_load_account_set.clone();
+    entry.fallback_creatable_account_set = diagnostics.fallback_creatable_account_set.clone();
+    entry.fallback_required_precheck_account_set =
+        diagnostics.fallback_required_precheck_account_set.clone();
+    entry.fallback_failure_class = diagnostics.fallback_failure_class.clone();
     entry.no_executable_route_account_set_reason =
         diagnostics.no_executable_route_account_set_reason.clone();
     entry.precheck_account_set_hash = diagnostics.precheck_account_set_hash.clone();
@@ -12775,6 +13126,20 @@ struct ShadowEntryRecord {
     fallback_route_ready: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     fallback_route_not_ready_reason: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    fallback_missing_roles: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    fallback_missing_pubkeys: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    fallback_account_sources: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    fallback_simulation_load_account_set: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    fallback_creatable_account_set: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    fallback_required_precheck_account_set: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fallback_failure_class: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     no_executable_route_account_set_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -17372,6 +17737,18 @@ mod tests {
             resolution.fallback_route_not_ready_reason.as_deref(),
             Some("fallback_route_requires_same_bcv2_simulation_load_account")
         );
+        assert_eq!(
+            resolution.fallback_failure_class.as_deref(),
+            Some("fallback_builder_account_source_unverified")
+        );
+        assert_eq!(resolution.fallback_missing_roles, vec!["bonding_curve_v2"]);
+        assert_eq!(resolution.fallback_missing_pubkeys, vec![bcv2.clone()]);
+        assert!(resolution
+            .fallback_account_sources
+            .iter()
+            .any(|source| source == "observed_tx_account_meta"));
+        assert!(!resolution.fallback_simulation_load_account_set.is_empty());
+        assert!(!resolution.fallback_required_precheck_account_set.is_empty());
         let expected_reason = format!("primary_route_bcv2_missing:bonding_curve_v2:{bcv2}");
         assert_eq!(
             resolution.no_executable_route_account_set_reason.as_deref(),
@@ -17402,6 +17779,15 @@ mod tests {
         assert_eq!(
             resolution.fallback_route_not_ready_reason.as_deref(),
             Some("fallback_route_missing_legacy_buy_curve")
+        );
+        assert_eq!(
+            resolution.fallback_failure_class.as_deref(),
+            Some("fallback_missing_core_curve_account")
+        );
+        assert_eq!(resolution.fallback_missing_roles, vec!["bonding_curve"]);
+        assert_eq!(
+            resolution.fallback_account_sources,
+            vec!["legacy_buy_curve"]
         );
         let expected_reason = format!(
             "no_executable_route_account_set:primary_route_bcv2_missing:bonding_curve_v2:{bcv2}"
@@ -17671,6 +18057,18 @@ mod tests {
         assert_eq!(active.primary_route_ready, Some(false));
         assert_eq!(active.fallback_route_attempted, Some(true));
         assert_eq!(active.fallback_route_ready, Some(false));
+        assert_eq!(
+            active.fallback_failure_class.as_deref(),
+            Some("fallback_builder_account_source_unverified")
+        );
+        assert!(active
+            .fallback_missing_roles
+            .iter()
+            .any(|role| role == "bonding_curve_v2"));
+        assert!(active
+            .fallback_missing_pubkeys
+            .iter()
+            .any(|pubkey| pubkey == bonding_curve_v2.as_str()));
         let expected_reason =
             format!("primary_route_bcv2_missing:bonding_curve_v2:{bonding_curve_v2}");
         assert_eq!(

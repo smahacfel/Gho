@@ -73,6 +73,9 @@ FIELD_GROUPS = {
     "execution_account_readiness_status": ("execution_account_readiness_status",),
     "execution_account_readiness_role": ("execution_account_readiness_role",),
     "execution_account_readiness_reason": ("execution_account_readiness_reason",),
+    "fallback_failure_class": ("fallback_failure_class",),
+    "fallback_missing_roles": ("fallback_missing_roles",),
+    "fallback_account_sources": ("fallback_account_sources",),
     "run_id": ("run_id",),
     "session_id": ("session_id",),
 }
@@ -97,6 +100,7 @@ COUNTER_FIELD_GROUPS = (
     "active_shadow_lifecycle_eligibility_status",
     "execution_account_readiness_status",
     "execution_account_readiness_role",
+    "fallback_failure_class",
 )
 CANONICAL_JOIN_ARTIFACTS = (
     "decision",
@@ -503,6 +507,151 @@ def iter_account_candidates(row: dict[str, Any], field: str) -> Iterable[dict[st
         for item in value:
             if isinstance(item, dict):
                 yield item
+
+
+def row_string_list(row: dict[str, Any], field: str) -> list[str]:
+    value = row.get(field)
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item).strip()]
+    if isinstance(value, str) and value.strip():
+        return [value]
+    return []
+
+
+def fallback_failure_class_for_row(row: dict[str, Any]) -> str:
+    explicit = row_string(row, "fallback_failure_class")
+    if explicit:
+        return explicit
+    reason = row_string(row, "fallback_route_not_ready_reason")
+    if reason == "fallback_route_missing_legacy_buy_curve":
+        return "fallback_missing_core_curve_account"
+    if reason in {
+        "fallback_route_requires_same_bcv2_simulation_load_account",
+        "fallback_route_requires_authoritative_primary_route_accounts",
+    }:
+        return "fallback_builder_account_source_unverified"
+    if reason == "fallback_route_not_available_for_primary":
+        return "fallback_no_prepared_route"
+    missing_roles = set(row_string_list(row, "fallback_missing_roles"))
+    if "bonding_curve" in missing_roles:
+        return "fallback_missing_core_curve_account"
+    if "associated_bonding_curve" in missing_roles:
+        return "fallback_missing_associated_bonding_curve"
+    if "creator_vault" in missing_roles:
+        return "fallback_missing_creator_vault"
+    if "user_ata" in missing_roles:
+        return "fallback_missing_user_ata_but_creatable"
+    if "payer_pubkey" in missing_roles:
+        return "fallback_missing_payer_but_ephemeral"
+    if "bonding_curve_v2" in missing_roles:
+        return "fallback_missing_route_identity"
+    if row_string(row, "fallback_route_kind") is None:
+        return "fallback_no_prepared_route"
+    return "fallback_unknown"
+
+
+def fallback_missing_roles_for_row(row: dict[str, Any]) -> list[str]:
+    roles = row_string_list(row, "fallback_missing_roles")
+    if roles:
+        return roles
+    failure_class = fallback_failure_class_for_row(row)
+    if failure_class == "fallback_missing_core_curve_account":
+        return ["bonding_curve"]
+    if failure_class == "fallback_missing_associated_bonding_curve":
+        return ["associated_bonding_curve"]
+    if failure_class == "fallback_missing_creator_vault":
+        return ["creator_vault"]
+    if failure_class == "fallback_missing_user_ata_but_creatable":
+        return ["user_ata"]
+    if failure_class == "fallback_missing_payer_but_ephemeral":
+        return ["payer_pubkey"]
+    if failure_class in {
+        "fallback_missing_route_identity",
+        "fallback_builder_account_source_unverified",
+    }:
+        return ["bonding_curve_v2"]
+    return []
+
+
+def fallback_account_sources_for_row(row: dict[str, Any]) -> list[str]:
+    sources = row_string_list(row, "fallback_account_sources")
+    if sources:
+        return sources
+    reason = row_string(row, "fallback_route_not_ready_reason")
+    if reason == "fallback_route_missing_legacy_buy_curve":
+        return ["legacy_buy_curve"]
+    if reason in {
+        "fallback_route_requires_same_bcv2_simulation_load_account",
+        "fallback_route_requires_authoritative_primary_route_accounts",
+    }:
+        return ["primary_route_account_set"]
+    if reason == "fallback_route_not_available_for_primary":
+        return ["route_builder"]
+    return []
+
+
+def fallback_decision_payload(failed_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    class_counts: Counter[str] = Counter()
+    missing_role_counts: Counter[str] = Counter()
+    missing_pubkey_counts: Counter[str] = Counter()
+    account_source_counts: Counter[str] = Counter()
+    simulation_load_account_set_rows = 0
+    creatable_account_set_rows = 0
+    required_precheck_account_set_rows = 0
+
+    for row in failed_rows:
+        failure_class = fallback_failure_class_for_row(row)
+        class_counts[failure_class] += 1
+        for role in fallback_missing_roles_for_row(row):
+            missing_role_counts[role] += 1
+        for pubkey in row_string_list(row, "fallback_missing_pubkeys"):
+            missing_pubkey_counts[pubkey] += 1
+        for source in fallback_account_sources_for_row(row):
+            account_source_counts[source] += 1
+        if row_string_list(row, "fallback_simulation_load_account_set"):
+            simulation_load_account_set_rows += 1
+        if row_string_list(row, "fallback_creatable_account_set"):
+            creatable_account_set_rows += 1
+        if row_string_list(row, "fallback_required_precheck_account_set"):
+            required_precheck_account_set_rows += 1
+
+    repairable_classes = {
+        "fallback_missing_user_ata_but_creatable",
+        "fallback_missing_payer_but_ephemeral",
+    }
+    exclusion_classes = {
+        "fallback_missing_core_curve_account",
+        "fallback_missing_associated_bonding_curve",
+        "fallback_missing_creator_vault",
+        "fallback_missing_route_identity",
+        "fallback_builder_account_source_unverified",
+        "fallback_no_prepared_route",
+    }
+    observed_classes = set(class_counts)
+    if not failed_rows or "fallback_unknown" in observed_classes:
+        fallback_repairable: bool | None = None
+        recommended_next_path = "audit_gap"
+    elif observed_classes and observed_classes.issubset(repairable_classes):
+        fallback_repairable = True
+        recommended_next_path = "fallback_route_account_source_repair"
+    elif observed_classes & exclusion_classes:
+        fallback_repairable = False
+        recommended_next_path = "route_class_exclusion_from_execution_label_universe"
+    else:
+        fallback_repairable = None
+        recommended_next_path = "audit_gap"
+
+    return {
+        "fallback_failure_class_counts": dict(sorted(class_counts.items())),
+        "fallback_missing_role_counts": dict(sorted(missing_role_counts.items())),
+        "fallback_missing_pubkey_counts": dict(sorted(missing_pubkey_counts.items())),
+        "fallback_account_source_counts": dict(sorted(account_source_counts.items())),
+        "fallback_simulation_load_account_set_rows": simulation_load_account_set_rows,
+        "fallback_creatable_account_set_rows": creatable_account_set_rows,
+        "fallback_required_precheck_account_set_rows": required_precheck_account_set_rows,
+        "fallback_repairable": fallback_repairable,
+        "recommended_next_path": recommended_next_path,
+    }
 
 
 def is_simulation_error_entry(row: dict[str, Any]) -> bool:
@@ -1077,6 +1226,7 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
         for row in route_fallback_attempted_rows
         if row not in route_fallback_success_rows
     ]
+    route_fallback_decision = fallback_decision_payload(route_fallback_failed_rows)
     primary_route_bcv2_missing_rows = [
         row
         for row in skip_rows + transport_rows
@@ -1100,6 +1250,12 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
         or row_string(row, "execution_outcome") == "no_executable_route_account_set"
         or "no_executable_route_account_set"
         in (row_string(row, "precheck_failure_reason") or "")
+    ]
+    executable_route_ready_rows = [
+        row
+        for row in skip_rows + transport_rows
+        if row_string(row, "route_resolution_status") in {"primary_route_ready", "fallback_route_ready"}
+        or bool(row_string(row, "selected_route_kind"))
     ]
     precheck_simulation_account_set_mismatch_rows = [
         row
@@ -1339,6 +1495,28 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
         "route_fallback_attempted_rows": len(route_fallback_attempted_rows),
         "route_fallback_success_rows": len(route_fallback_success_rows),
         "route_fallback_failed_rows": len(route_fallback_failed_rows),
+        "fallback_failure_class_counts": route_fallback_decision[
+            "fallback_failure_class_counts"
+        ],
+        "fallback_missing_role_counts": route_fallback_decision["fallback_missing_role_counts"],
+        "fallback_missing_pubkey_counts": route_fallback_decision[
+            "fallback_missing_pubkey_counts"
+        ],
+        "fallback_account_source_counts": route_fallback_decision[
+            "fallback_account_source_counts"
+        ],
+        "fallback_simulation_load_account_set_rows": route_fallback_decision[
+            "fallback_simulation_load_account_set_rows"
+        ],
+        "fallback_creatable_account_set_rows": route_fallback_decision[
+            "fallback_creatable_account_set_rows"
+        ],
+        "fallback_required_precheck_account_set_rows": route_fallback_decision[
+            "fallback_required_precheck_account_set_rows"
+        ],
+        "fallback_repairable": route_fallback_decision["fallback_repairable"],
+        "recommended_next_path": route_fallback_decision["recommended_next_path"],
+        "executable_route_ready_rows": len(executable_route_ready_rows),
         "primary_route_bcv2_missing_rows": len(primary_route_bcv2_missing_rows),
         "no_executable_route_account_set_rows": len(no_executable_route_account_set_rows),
         "bonding_curve_v2_precheck_skipped_before_simulation_rows": len(
@@ -1584,6 +1762,7 @@ def active_shadow_dispatch_diagnostics(paths: dict[str, list[Path]]) -> dict[str
         for row in route_fallback_attempted_rows
         if row not in route_fallback_success_rows
     ]
+    route_fallback_decision = fallback_decision_payload(route_fallback_failed_rows)
     primary_route_bcv2_missing_rows = [
         row
         for row in failure_rows
@@ -1605,6 +1784,12 @@ def active_shadow_dispatch_diagnostics(paths: dict[str, list[Path]]) -> dict[str
         if row_string(row, "execution_outcome") == "no_executable_route_account_set"
         or "no_executable_route_account_set"
         in (row_string(row, "precheck_failure_reason") or "")
+    ]
+    executable_route_ready_rows = [
+        row
+        for row in failure_rows
+        if row_string(row, "route_resolution_status") in {"primary_route_ready", "fallback_route_ready"}
+        or bool(row_string(row, "selected_route_kind"))
     ]
     observed_bcv2_rows = [
         row
@@ -1751,6 +1936,32 @@ def active_shadow_dispatch_diagnostics(paths: dict[str, list[Path]]) -> dict[str
         "active_shadow_route_fallback_attempted_rows": len(route_fallback_attempted_rows),
         "active_shadow_route_fallback_success_rows": len(route_fallback_success_rows),
         "active_shadow_route_fallback_failed_rows": len(route_fallback_failed_rows),
+        "active_shadow_fallback_failure_class_counts": route_fallback_decision[
+            "fallback_failure_class_counts"
+        ],
+        "active_shadow_fallback_missing_role_counts": route_fallback_decision[
+            "fallback_missing_role_counts"
+        ],
+        "active_shadow_fallback_missing_pubkey_counts": route_fallback_decision[
+            "fallback_missing_pubkey_counts"
+        ],
+        "active_shadow_fallback_account_source_counts": route_fallback_decision[
+            "fallback_account_source_counts"
+        ],
+        "active_shadow_fallback_simulation_load_account_set_rows": route_fallback_decision[
+            "fallback_simulation_load_account_set_rows"
+        ],
+        "active_shadow_fallback_creatable_account_set_rows": route_fallback_decision[
+            "fallback_creatable_account_set_rows"
+        ],
+        "active_shadow_fallback_required_precheck_account_set_rows": route_fallback_decision[
+            "fallback_required_precheck_account_set_rows"
+        ],
+        "active_shadow_fallback_repairable": route_fallback_decision["fallback_repairable"],
+        "active_shadow_recommended_next_path": route_fallback_decision[
+            "recommended_next_path"
+        ],
+        "active_shadow_executable_route_ready_rows": len(executable_route_ready_rows),
         "active_shadow_primary_route_bcv2_missing_rows": len(primary_route_bcv2_missing_rows),
         "active_shadow_no_executable_route_account_set_rows": len(
             no_executable_route_account_set_rows
@@ -2304,6 +2515,15 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- active_shadow_observed_bcv2_not_route_compatible_rows: `{active_shadow['active_shadow_observed_bcv2_not_route_compatible_rows']}`",
             f"- active_shadow_observed_bcv2_missing_provenance_rows: `{active_shadow['active_shadow_observed_bcv2_missing_provenance_rows']}`",
             f"- active_shadow_observed_bcv2_authoritative_without_route_compatible_rows: `{active_shadow['active_shadow_observed_bcv2_authoritative_without_route_compatible_rows']}`",
+            f"- active_shadow_route_fallback_attempted_rows: `{active_shadow['active_shadow_route_fallback_attempted_rows']}`",
+            f"- active_shadow_route_fallback_success_rows: `{active_shadow['active_shadow_route_fallback_success_rows']}`",
+            f"- active_shadow_route_fallback_failed_rows: `{active_shadow['active_shadow_route_fallback_failed_rows']}`",
+            f"- active_shadow_fallback_failure_class_counts: `{json.dumps(active_shadow['active_shadow_fallback_failure_class_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_fallback_missing_role_counts: `{json.dumps(active_shadow['active_shadow_fallback_missing_role_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_fallback_account_source_counts: `{json.dumps(active_shadow['active_shadow_fallback_account_source_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_fallback_repairable: `{active_shadow['active_shadow_fallback_repairable']}`",
+            f"- active_shadow_recommended_next_path: `{active_shadow['active_shadow_recommended_next_path']}`",
+            f"- active_shadow_executable_route_ready_rows: `{active_shadow['active_shadow_executable_route_ready_rows']}`",
         ]
     )
     lines.extend(["", "## Probe Entry Materialization", ""])
@@ -2357,6 +2577,15 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- successful_probe_entry_rows: `{materialization['successful_probe_entry_rows']}`",
             f"- simulation_error_entry_rows: `{materialization['simulation_error_entry_rows']}`",
             f"- lifecycle_eligible_entry_rows: `{materialization['lifecycle_eligible_entry_rows']}`",
+            f"- route_fallback_attempted_rows: `{materialization['route_fallback_attempted_rows']}`",
+            f"- route_fallback_success_rows: `{materialization['route_fallback_success_rows']}`",
+            f"- route_fallback_failed_rows: `{materialization['route_fallback_failed_rows']}`",
+            f"- fallback_failure_class_counts: `{json.dumps(materialization['fallback_failure_class_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- fallback_missing_role_counts: `{json.dumps(materialization['fallback_missing_role_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- fallback_account_source_counts: `{json.dumps(materialization['fallback_account_source_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- fallback_repairable: `{materialization['fallback_repairable']}`",
+            f"- recommended_next_path: `{materialization['recommended_next_path']}`",
+            f"- executable_route_ready_rows: `{materialization['executable_route_ready_rows']}`",
             f"- skip_reason_counts: `{json.dumps(materialization['skip_reason_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- skip_execution_account_readiness_role_counts: `{json.dumps(materialization['skip_execution_account_readiness_role_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- skip_creator_vault_authority_status_counts: `{json.dumps(materialization['skip_creator_vault_authority_status_counts'], ensure_ascii=False, sort_keys=True)}`",
