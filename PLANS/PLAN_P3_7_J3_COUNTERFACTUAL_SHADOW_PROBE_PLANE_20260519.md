@@ -1825,6 +1825,106 @@ If L1R13 does not produce executable entries, the next engineering decision is
 route fallback/exclusion for this route class, not L2 ablation or threshold
 tuning.
 
+## P3.7-L1R14 / J3Q BCV2 Identity vs Execution-Readiness Split
+
+### Trigger
+
+R16-r10 showed that the L1R13 observed route-account path did not unlock
+execution. The important finding is not that observed transaction account metas
+are useless. The finding is that the runtime was treating observed account
+identity as execution readiness:
+
+```text
+matrix_rows = 53
+rpc_get_account_status_counts = {"missing": 53}
+matrix_classifications = {"builder_bcv2_missing_on_rpc": 53}
+diag_seen_exact_builder_bcv2_rows = 0
+diag_seen_other_curve_for_mint_rows = 53
+mfs_contains_builder_bcv2_pubkey_rows = 0
+```
+
+Rows could carry `bonding_curve_v2_source = observed_tx_account_meta` and
+`bonding_curve_v2_authority_status = authoritative_observed_tx`, while the same
+pubkey was not RPC-loadable. That must not produce
+`builder_required_curve_account_ready = true`.
+
+### Contract
+
+L1R14 splits BCV2 identity authority from simulation-load readiness:
+
+- `bonding_curve_v2_identity_authority_status` describes whether the identity
+  source is acceptable.
+- `bonding_curve_v2_rpc_load_status` and `bonding_curve_v2_rpc_load_ready`
+  describe whether the route-required account can be loaded for simulation.
+- `builder_required_curve_account_ready` may be `true` only when identity is
+  acceptable and the account is RPC/local-load ready.
+- `observed_tx_account_meta` can establish identity, but never implies readiness
+  by itself.
+- `route_builder` / `derived_pda` identities remain non-authoritative even if a
+  manifest exists.
+
+Current observed-meta parser provenance is still limited to the route account
+identity carried by runtime structures. Full source transaction signature,
+instruction discriminator, message account index, and route compatibility
+provenance remain a follow-up if runtime evidence requires deeper parser
+validation.
+
+### Audit Surface
+
+Probe and active-shadow artifacts now emit additive fields:
+
+```text
+bonding_curve_v2_identity_authority_status
+bonding_curve_v2_rpc_load_status
+bonding_curve_v2_rpc_load_ready
+builder_required_curve_account_ready_reason
+```
+
+The join-key audit reports identity/readiness distributions and flags the L1R14
+classes:
+
+```text
+bonding_curve_v2_observed_meta_missing_on_rpc_rows
+bonding_curve_v2_identity_authoritative_but_not_load_ready_rows
+active_shadow_bonding_curve_v2_observed_meta_missing_on_rpc_rows
+active_shadow_bonding_curve_v2_identity_authoritative_but_not_load_ready_rows
+```
+
+### Non-Goals
+
+L1R14 does not:
+
+- change Gatekeeper policy;
+- change PDD/prosperity/HHI thresholds;
+- implement L2 ablation;
+- start collection;
+- enable Phase B, P2, or live execution;
+- add broad route fallback;
+- treat observed identity as proof that the account exists.
+
+### Next Gate
+
+The next runtime gate is a small R16-style smoke after this split. It must prove
+that rows with missing observed BCV2 no longer claim readiness:
+
+```text
+builder_required_curve_account_ready = false
+bonding_curve_v2_rpc_load_ready = false
+builder_required_curve_account_ready_reason =
+  bonding_curve_v2_observed_meta_missing_on_rpc
+```
+
+Accepted outcomes:
+
+- `PASS-A`: some observed BCV2 rows are RPC-load-ready and produce successful
+  probe or active-shadow entries.
+- `PASS-B`: observed BCV2 identity is present but RPC-missing, and the route
+  fails closed as `no_executable_route_account_set` / not load-ready before
+  simulation.
+- `FAIL`: any row with RPC-missing BCV2 reports
+  `builder_required_curve_account_ready = true`, or BCV2 reaches simulation as
+  post-simulation AccountNotFound.
+
 ## P3.7-L1R9 Active Shadow BondingCurveV2 Precheck Contract
 
 ### Trigger

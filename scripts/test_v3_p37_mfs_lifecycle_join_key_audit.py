@@ -1438,7 +1438,11 @@ lifecycle_log_path = "../../logs/shadow_run/r16-observed/probe_lifecycle.jsonl"
                 "bonding_curve_v2_pubkey": "observed-bc-v2",
                 "bonding_curve_v2_source": "observed_tx_account_meta",
                 "bonding_curve_v2_authority_status": "authoritative_observed_tx",
+                "bonding_curve_v2_identity_authority_status": "authoritative_observed_tx",
+                "bonding_curve_v2_rpc_load_status": "rpc_load_ready",
+                "bonding_curve_v2_rpc_load_ready": True,
                 "builder_required_curve_account_ready": True,
+                "builder_required_curve_account_ready_reason": "load_ready:rpc_load_ready",
             }
             entry = {
                 **transport,
@@ -1469,6 +1473,22 @@ lifecycle_log_path = "../../logs/shadow_run/r16-observed/probe_lifecycle.jsonl"
         self.assertEqual(materialization["builder_bcv2_derived_unverified_rows"], 0)
         self.assertEqual(materialization["route_excluded_bcv2_missing_rows"], 0)
         self.assertEqual(materialization["successful_probe_entry_rows"], 1)
+        self.assertEqual(
+            materialization["bonding_curve_v2_identity_authority_status_counts"][
+                "authoritative_observed_tx"
+            ],
+            1,
+        )
+        self.assertEqual(
+            materialization["bonding_curve_v2_rpc_load_ready_counts"]["true"],
+            1,
+        )
+        self.assertEqual(
+            materialization["builder_required_curve_account_ready_reason_counts"][
+                "load_ready:rpc_load_ready"
+            ],
+            1,
+        )
 
     def test_active_shadow_data_problem_entry_is_not_successful(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

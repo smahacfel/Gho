@@ -590,9 +590,13 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
     creator_vault_mismatch_reason_counts: Counter[str] = Counter()
     creator_identity_source_counts: Counter[str] = Counter()
     bonding_curve_v2_authority_status_counts: Counter[str] = Counter()
+    bonding_curve_v2_identity_authority_status_counts: Counter[str] = Counter()
     bonding_curve_v2_mismatch_reason_counts: Counter[str] = Counter()
     bonding_curve_v2_source_counts: Counter[str] = Counter()
+    bonding_curve_v2_rpc_load_status_counts: Counter[str] = Counter()
+    bonding_curve_v2_rpc_load_ready_counts: Counter[str] = Counter()
     builder_required_curve_account_ready_counts: Counter[str] = Counter()
+    builder_required_curve_account_ready_reason_counts: Counter[str] = Counter()
     route_fallback_status_counts: Counter[str] = Counter()
     amount_guard_status_counts: Counter[str] = Counter()
     simulation_error_custom_code_counts: Counter[str] = Counter()
@@ -622,11 +626,24 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
         creator_vault_mismatch_reason = row_string(row, "creator_vault_mismatch_reason")
         creator_identity_source = row_string(row, "creator_identity_source")
         bonding_curve_v2_authority_status = row_string(row, "bonding_curve_v2_authority_status")
+        bonding_curve_v2_identity_authority_status = row_string(
+            row,
+            "bonding_curve_v2_identity_authority_status",
+        )
         bonding_curve_v2_mismatch_reason = row_string(row, "bonding_curve_v2_mismatch_reason")
         bonding_curve_v2_source = row_string(row, "bonding_curve_v2_source")
+        bonding_curve_v2_rpc_load_status = row_string(row, "bonding_curve_v2_rpc_load_status")
+        bonding_curve_v2_rpc_load_ready = row_bool_string(
+            row,
+            "bonding_curve_v2_rpc_load_ready",
+        )
         builder_required_curve_account_ready = row_bool_string(
             row,
             "builder_required_curve_account_ready",
+        )
+        builder_required_curve_account_ready_reason = row_string(
+            row,
+            "builder_required_curve_account_ready_reason",
         )
         route_fallback_status = (
             row_string(row, "route_fallback_status")
@@ -653,12 +670,24 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
             creator_identity_source_counts[creator_identity_source] += 1
         if bonding_curve_v2_authority_status:
             bonding_curve_v2_authority_status_counts[bonding_curve_v2_authority_status] += 1
+        if bonding_curve_v2_identity_authority_status:
+            bonding_curve_v2_identity_authority_status_counts[
+                bonding_curve_v2_identity_authority_status
+            ] += 1
         if bonding_curve_v2_mismatch_reason:
             bonding_curve_v2_mismatch_reason_counts[bonding_curve_v2_mismatch_reason] += 1
         if bonding_curve_v2_source:
             bonding_curve_v2_source_counts[bonding_curve_v2_source] += 1
+        if bonding_curve_v2_rpc_load_status:
+            bonding_curve_v2_rpc_load_status_counts[bonding_curve_v2_rpc_load_status] += 1
+        if bonding_curve_v2_rpc_load_ready:
+            bonding_curve_v2_rpc_load_ready_counts[bonding_curve_v2_rpc_load_ready] += 1
         if builder_required_curve_account_ready:
             builder_required_curve_account_ready_counts[builder_required_curve_account_ready] += 1
+        if builder_required_curve_account_ready_reason:
+            builder_required_curve_account_ready_reason_counts[
+                builder_required_curve_account_ready_reason
+            ] += 1
         if route_fallback_status:
             route_fallback_status_counts[route_fallback_status] += 1
         if amount_guard_status:
@@ -763,6 +792,9 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
                 "bonding_curve_v2_pubkey": row_string(row, "bonding_curve_v2_pubkey"),
                 "bonding_curve_v2_source": bonding_curve_v2_source,
                 "bonding_curve_v2_authority_status": bonding_curve_v2_authority_status,
+                "bonding_curve_v2_identity_authority_status": (
+                    bonding_curve_v2_identity_authority_status
+                ),
                 "bonding_curve_v2_mismatch_reason": bonding_curve_v2_mismatch_reason,
                 "bonding_curve_pubkey_from_diag": row_string(row, "bonding_curve_pubkey_from_diag"),
                 "bonding_curve_pubkey_from_mfs": row_string(row, "bonding_curve_pubkey_from_mfs"),
@@ -772,9 +804,14 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
                     "bonding_curve_v2_seen_in_account_state"
                 ),
                 "bonding_curve_ready": row.get("bonding_curve_ready"),
+                "bonding_curve_v2_rpc_load_status": bonding_curve_v2_rpc_load_status,
+                "bonding_curve_v2_rpc_load_ready": row.get("bonding_curve_v2_rpc_load_ready"),
                 "bonding_curve_v2_ready": row.get("bonding_curve_v2_ready"),
                 "builder_required_curve_account_ready": row.get(
                     "builder_required_curve_account_ready"
+                ),
+                "builder_required_curve_account_ready_reason": (
+                    builder_required_curve_account_ready_reason
                 ),
                 "amount_guard_status": amount_guard_status,
                 "amount_provided_lamports_if_available": row.get(
@@ -1022,10 +1059,31 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
         "bonding_curve_v2_authority_status_counts": dict(
             sorted(bonding_curve_v2_authority_status_counts.items())
         ),
+        "bonding_curve_v2_identity_authority_status_counts": dict(
+            sorted(bonding_curve_v2_identity_authority_status_counts.items())
+        ),
         "bonding_curve_v2_mismatch_reason_counts": dict(
             sorted(bonding_curve_v2_mismatch_reason_counts.items())
         ),
         "bonding_curve_v2_source_counts": dict(sorted(bonding_curve_v2_source_counts.items())),
+        "bonding_curve_v2_rpc_load_status_counts": dict(
+            sorted(bonding_curve_v2_rpc_load_status_counts.items())
+        ),
+        "bonding_curve_v2_rpc_load_ready_counts": dict(
+            sorted(bonding_curve_v2_rpc_load_ready_counts.items())
+        ),
+        "bonding_curve_v2_observed_meta_missing_on_rpc_rows": (
+            bonding_curve_v2_mismatch_reason_counts.get(
+                "bonding_curve_v2_observed_meta_missing_on_rpc",
+                0,
+            )
+        ),
+        "bonding_curve_v2_identity_authoritative_but_not_load_ready_rows": (
+            bonding_curve_v2_mismatch_reason_counts.get(
+                "bonding_curve_v2_identity_authoritative_but_not_load_ready",
+                0,
+            )
+        ),
         "builder_bcv2_authoritative_observed_tx_rows": (
             bonding_curve_v2_authority_status_counts.get("authoritative_observed_tx", 0)
             + skip_bonding_curve_v2_authority_status_counts.get(
@@ -1045,6 +1103,9 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
         ),
         "builder_required_curve_account_ready_counts": dict(
             sorted(builder_required_curve_account_ready_counts.items())
+        ),
+        "builder_required_curve_account_ready_reason_counts": dict(
+            sorted(builder_required_curve_account_ready_reason_counts.items())
         ),
         "route_fallback_status_counts": dict(sorted(route_fallback_status_counts.items())),
         "amount_guard_status_counts": dict(sorted(amount_guard_status_counts.items())),
@@ -1275,9 +1336,13 @@ def active_shadow_dispatch_diagnostics(paths: dict[str, list[Path]]) -> dict[str
     candidate_raw_counts: Counter[str] = Counter()
     candidate_narrowed_counts: Counter[str] = Counter()
     bonding_curve_v2_authority_status_counts: Counter[str] = Counter()
+    bonding_curve_v2_identity_authority_status_counts: Counter[str] = Counter()
     bonding_curve_v2_mismatch_reason_counts: Counter[str] = Counter()
     bonding_curve_v2_source_counts: Counter[str] = Counter()
+    bonding_curve_v2_rpc_load_status_counts: Counter[str] = Counter()
+    bonding_curve_v2_rpc_load_ready_counts: Counter[str] = Counter()
     builder_required_curve_account_ready_counts: Counter[str] = Counter()
+    builder_required_curve_account_ready_reason_counts: Counter[str] = Counter()
     route_fallback_status_counts: Counter[str] = Counter()
     for row in failure_rows:
         if role := row_string(row, "simulation_error_account_role"):
@@ -1294,12 +1359,20 @@ def active_shadow_dispatch_diagnostics(paths: dict[str, list[Path]]) -> dict[str
             narrowing_status_counts[narrowing] += 1
         if status := row_string(row, "bonding_curve_v2_authority_status"):
             bonding_curve_v2_authority_status_counts[status] += 1
+        if status := row_string(row, "bonding_curve_v2_identity_authority_status"):
+            bonding_curve_v2_identity_authority_status_counts[status] += 1
         if reason := row_string(row, "bonding_curve_v2_mismatch_reason"):
             bonding_curve_v2_mismatch_reason_counts[reason] += 1
         if source := row_string(row, "bonding_curve_v2_source"):
             bonding_curve_v2_source_counts[source] += 1
+        if status := row_string(row, "bonding_curve_v2_rpc_load_status"):
+            bonding_curve_v2_rpc_load_status_counts[status] += 1
+        if ready := row_bool_string(row, "bonding_curve_v2_rpc_load_ready"):
+            bonding_curve_v2_rpc_load_ready_counts[ready] += 1
         if ready := row_bool_string(row, "builder_required_curve_account_ready"):
             builder_required_curve_account_ready_counts[ready] += 1
+        if reason := row_string(row, "builder_required_curve_account_ready_reason"):
+            builder_required_curve_account_ready_reason_counts[reason] += 1
         route_fallback_status = (
             row_string(row, "route_fallback_status")
             or row_string(row, "fallback_route_status")
@@ -1395,11 +1468,32 @@ def active_shadow_dispatch_diagnostics(paths: dict[str, list[Path]]) -> dict[str
         "active_shadow_bonding_curve_v2_authority_status_counts": dict(
             sorted(bonding_curve_v2_authority_status_counts.items())
         ),
+        "active_shadow_bonding_curve_v2_identity_authority_status_counts": dict(
+            sorted(bonding_curve_v2_identity_authority_status_counts.items())
+        ),
         "active_shadow_bonding_curve_v2_mismatch_reason_counts": dict(
             sorted(bonding_curve_v2_mismatch_reason_counts.items())
         ),
         "active_shadow_bonding_curve_v2_source_counts": dict(
             sorted(bonding_curve_v2_source_counts.items())
+        ),
+        "active_shadow_bonding_curve_v2_rpc_load_status_counts": dict(
+            sorted(bonding_curve_v2_rpc_load_status_counts.items())
+        ),
+        "active_shadow_bonding_curve_v2_rpc_load_ready_counts": dict(
+            sorted(bonding_curve_v2_rpc_load_ready_counts.items())
+        ),
+        "active_shadow_bonding_curve_v2_observed_meta_missing_on_rpc_rows": (
+            bonding_curve_v2_mismatch_reason_counts.get(
+                "bonding_curve_v2_observed_meta_missing_on_rpc",
+                0,
+            )
+        ),
+        "active_shadow_bonding_curve_v2_identity_authoritative_but_not_load_ready_rows": (
+            bonding_curve_v2_mismatch_reason_counts.get(
+                "bonding_curve_v2_identity_authoritative_but_not_load_ready",
+                0,
+            )
         ),
         "active_shadow_builder_bcv2_authoritative_observed_tx_rows": (
             bonding_curve_v2_authority_status_counts.get("authoritative_observed_tx", 0)
@@ -1413,6 +1507,9 @@ def active_shadow_dispatch_diagnostics(paths: dict[str, list[Path]]) -> dict[str
         ),
         "active_shadow_builder_required_curve_account_ready_counts": dict(
             sorted(builder_required_curve_account_ready_counts.items())
+        ),
+        "active_shadow_builder_required_curve_account_ready_reason_counts": dict(
+            sorted(builder_required_curve_account_ready_reason_counts.items())
         ),
         "active_shadow_route_fallback_status_counts": dict(
             sorted(route_fallback_status_counts.items())
@@ -1937,9 +2034,13 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- active_shadow_account_candidate_raw_counts: `{json.dumps(active_shadow['active_shadow_account_candidate_raw_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- active_shadow_account_candidate_narrowed_counts: `{json.dumps(active_shadow['active_shadow_account_candidate_narrowed_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- active_shadow_bonding_curve_v2_authority_status_counts: `{json.dumps(active_shadow['active_shadow_bonding_curve_v2_authority_status_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_bonding_curve_v2_identity_authority_status_counts: `{json.dumps(active_shadow['active_shadow_bonding_curve_v2_identity_authority_status_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- active_shadow_bonding_curve_v2_mismatch_reason_counts: `{json.dumps(active_shadow['active_shadow_bonding_curve_v2_mismatch_reason_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- active_shadow_bonding_curve_v2_source_counts: `{json.dumps(active_shadow['active_shadow_bonding_curve_v2_source_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_bonding_curve_v2_rpc_load_status_counts: `{json.dumps(active_shadow['active_shadow_bonding_curve_v2_rpc_load_status_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_bonding_curve_v2_rpc_load_ready_counts: `{json.dumps(active_shadow['active_shadow_bonding_curve_v2_rpc_load_ready_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- active_shadow_builder_required_curve_account_ready_counts: `{json.dumps(active_shadow['active_shadow_builder_required_curve_account_ready_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_builder_required_curve_account_ready_reason_counts: `{json.dumps(active_shadow['active_shadow_builder_required_curve_account_ready_reason_counts'], ensure_ascii=False, sort_keys=True)}`",
         ]
     )
     lines.extend(["", "## Probe Entry Materialization", ""])
@@ -1957,9 +2058,13 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- creator_vault_mismatch_reason_counts: `{json.dumps(materialization['creator_vault_mismatch_reason_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- creator_identity_source_counts: `{json.dumps(materialization['creator_identity_source_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- bonding_curve_v2_authority_status_counts: `{json.dumps(materialization['bonding_curve_v2_authority_status_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- bonding_curve_v2_identity_authority_status_counts: `{json.dumps(materialization['bonding_curve_v2_identity_authority_status_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- bonding_curve_v2_mismatch_reason_counts: `{json.dumps(materialization['bonding_curve_v2_mismatch_reason_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- bonding_curve_v2_source_counts: `{json.dumps(materialization['bonding_curve_v2_source_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- bonding_curve_v2_rpc_load_status_counts: `{json.dumps(materialization['bonding_curve_v2_rpc_load_status_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- bonding_curve_v2_rpc_load_ready_counts: `{json.dumps(materialization['bonding_curve_v2_rpc_load_ready_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- builder_required_curve_account_ready_counts: `{json.dumps(materialization['builder_required_curve_account_ready_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- builder_required_curve_account_ready_reason_counts: `{json.dumps(materialization['builder_required_curve_account_ready_reason_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- amount_guard_status_counts: `{json.dumps(materialization['amount_guard_status_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- simulation_error_category_counts: `{json.dumps(materialization['simulation_error_category_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- simulation_error_kind_counts: `{json.dumps(materialization['simulation_error_kind_counts'], ensure_ascii=False, sort_keys=True)}`",

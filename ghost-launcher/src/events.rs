@@ -130,6 +130,8 @@ pub struct ShadowSimulationAccountDiagnostics {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bonding_curve_v2_authority_status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bonding_curve_v2_identity_authority_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bonding_curve_v2_mismatch_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bonding_curve_pubkey_from_diag: Option<String>,
@@ -144,9 +146,15 @@ pub struct ShadowSimulationAccountDiagnostics {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bonding_curve_ready: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bonding_curve_v2_rpc_load_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bonding_curve_v2_rpc_load_ready: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bonding_curve_v2_ready: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub builder_required_curve_account_ready: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builder_required_curve_account_ready_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub precheck_account_set_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
