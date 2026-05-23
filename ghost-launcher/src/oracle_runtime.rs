@@ -4939,6 +4939,10 @@ struct P37ShadowProbeSelectionRecord {
     probe_bucket_version: String,
     probe_sample_reason: Option<String>,
     probe_skip_reason: Option<String>,
+    execution_feasibility_status: Option<String>,
+    execution_feasibility_reason: Option<String>,
+    route_resolution_terminal_reason: Option<String>,
+    lifecycle_label_eligibility: Option<String>,
     sample_mode: String,
     sample_source: String,
     sample_hash: Option<u64>,
@@ -5140,6 +5144,10 @@ struct P37ShadowProbeTransportRecord {
     fallback_required_precheck_account_set: Vec<String>,
     fallback_failure_class: Option<String>,
     no_executable_route_account_set_reason: Option<String>,
+    execution_feasibility_status: Option<String>,
+    execution_feasibility_reason: Option<String>,
+    route_resolution_terminal_reason: Option<String>,
+    lifecycle_label_eligibility: Option<String>,
     amount_provided_lamports_if_available: Option<u64>,
     amount_required_lamports_if_available: Option<u64>,
     amount_shortfall_lamports_if_available: Option<u64>,
@@ -5549,6 +5557,10 @@ fn p37_shadow_probe_selection_record(
         fallback_required_precheck_account_set: Vec::new(),
         fallback_failure_class: None,
         no_executable_route_account_set_reason: None,
+        execution_feasibility_status: None,
+        execution_feasibility_reason: None,
+        route_resolution_terminal_reason: None,
+        lifecycle_label_eligibility: None,
     }
 }
 
@@ -5725,6 +5737,10 @@ fn p37_shadow_probe_artifact_records(
         no_executable_route_account_set_reason: record
             .no_executable_route_account_set_reason
             .clone(),
+        execution_feasibility_status: record.execution_feasibility_status.clone(),
+        execution_feasibility_reason: record.execution_feasibility_reason.clone(),
+        route_resolution_terminal_reason: record.route_resolution_terminal_reason.clone(),
+        lifecycle_label_eligibility: record.lifecycle_label_eligibility.clone(),
         amount_provided_lamports_if_available: None,
         amount_required_lamports_if_available: None,
         amount_shortfall_lamports_if_available: None,
@@ -5865,6 +5881,10 @@ fn p37_shadow_probe_artifact_records(
         no_executable_route_account_set_reason: record
             .no_executable_route_account_set_reason
             .clone(),
+        execution_feasibility_status: record.execution_feasibility_status.clone(),
+        execution_feasibility_reason: record.execution_feasibility_reason.clone(),
+        route_resolution_terminal_reason: record.route_resolution_terminal_reason.clone(),
+        lifecycle_label_eligibility: record.lifecycle_label_eligibility.clone(),
         precheck_account_set_hash: None,
         prepared_request_account_set_hash: None,
         simulation_account_set_hash: None,
@@ -6106,6 +6126,35 @@ impl P37ExecutableRouteResolutionDiagnostics {
                 .as_deref()
                 .unwrap_or("unknown")
         ))
+    }
+
+    fn terminal_reason(&self) -> Option<String> {
+        self.no_executable_route_account_set_reason
+            .clone()
+            .or_else(|| self.primary_route_not_ready_reason.clone())
+            .or_else(|| self.fallback_route_not_ready_reason.clone())
+            .or_else(|| self.selected_route_reason.clone())
+    }
+
+    fn execution_feasibility(&self) -> (Option<String>, Option<String>, Option<String>) {
+        match self.route_resolution_status.as_deref() {
+            Some("primary_route_ready") | Some("fallback_route_ready") => (
+                Some("executable".to_string()),
+                self.route_resolution_status.clone(),
+                Some("lifecycle_label_candidate".to_string()),
+            ),
+            Some("no_executable_route_account_set") => (
+                Some("not_executable_route".to_string()),
+                Some("no_executable_route_account_set".to_string()),
+                Some("not_lifecycle_label_eligible".to_string()),
+            ),
+            Some(status) => (
+                Some("unknown".to_string()),
+                Some(status.to_string()),
+                Some("not_lifecycle_label_eligible".to_string()),
+            ),
+            None => (None, None, None),
+        }
     }
 }
 
@@ -6426,6 +6475,9 @@ fn p37_shadow_probe_apply_route_resolution_to_record(
     record: &mut P37ShadowProbeSelectionRecord,
     resolution: P37ExecutableRouteResolutionDiagnostics,
 ) {
+    let terminal_reason = resolution.terminal_reason();
+    let (execution_feasibility_status, execution_feasibility_reason, lifecycle_label_eligibility) =
+        resolution.execution_feasibility();
     record.route_resolution_status = resolution.route_resolution_status;
     record.selected_route_kind = resolution.selected_route_kind;
     record.selected_route_reason = resolution.selected_route_reason;
@@ -6446,6 +6498,10 @@ fn p37_shadow_probe_apply_route_resolution_to_record(
     record.fallback_failure_class = resolution.fallback_failure_class;
     record.no_executable_route_account_set_reason =
         resolution.no_executable_route_account_set_reason;
+    record.execution_feasibility_status = execution_feasibility_status;
+    record.execution_feasibility_reason = execution_feasibility_reason;
+    record.route_resolution_terminal_reason = terminal_reason;
+    record.lifecycle_label_eligibility = lifecycle_label_eligibility;
 }
 
 async fn p37_shadow_probe_wait_for_required_account_readiness(
@@ -6663,6 +6719,10 @@ struct P37ShadowProbeExecutionDiagnostics {
     fallback_required_precheck_account_set: Vec<String>,
     fallback_failure_class: Option<String>,
     no_executable_route_account_set_reason: Option<String>,
+    execution_feasibility_status: Option<String>,
+    execution_feasibility_reason: Option<String>,
+    route_resolution_terminal_reason: Option<String>,
+    lifecycle_label_eligibility: Option<String>,
     amount_provided_lamports_if_available: Option<u64>,
     amount_required_lamports_if_available: Option<u64>,
     amount_shortfall_lamports_if_available: Option<u64>,
@@ -7840,6 +7900,9 @@ fn active_shadow_account_diagnostics_from_account_set(
         precheck_failure_reason.as_deref(),
         account_role.as_deref().zip(account_pubkey.as_deref()),
     );
+    let route_resolution_terminal_reason = route_resolution.terminal_reason();
+    let (execution_feasibility_status, execution_feasibility_reason, lifecycle_label_eligibility) =
+        route_resolution.execution_feasibility();
     let precheck_candidate = account_set_diagnostics.and_then(|diagnostics| {
         account_pubkey.as_ref().and_then(|pubkey| {
             diagnostics
@@ -7894,6 +7957,10 @@ fn active_shadow_account_diagnostics_from_account_set(
     crate::events::ShadowSimulationAccountDiagnostics {
         active_shadow_precheck_status: Some(precheck_status.to_string()),
         active_shadow_lifecycle_eligibility_status: Some("not_lifecycle_eligible".to_string()),
+        execution_feasibility_status,
+        execution_feasibility_reason,
+        route_resolution_terminal_reason,
+        lifecycle_label_eligibility,
         precheck_failure_reason,
         simulation_error_kind: kind,
         simulation_error_message: error_message,
@@ -8882,6 +8949,9 @@ fn p37_shadow_probe_execution_diagnostics(
         (None, Some(false), _) => Some("curve_data_unknown".to_string()),
         (None, None, _) => Some("curve_data_unreported".to_string()),
     };
+    let route_resolution_terminal_reason = route_resolution.terminal_reason();
+    let (execution_feasibility_status, execution_feasibility_reason, lifecycle_label_eligibility) =
+        route_resolution.execution_feasibility();
     P37ShadowProbeExecutionDiagnostics {
         precheck_failure_reason,
         simulation_error_kind: p37_shadow_probe_error_kind(error_message.as_deref()),
@@ -8966,6 +9036,10 @@ fn p37_shadow_probe_execution_diagnostics(
         fallback_failure_class: route_resolution.fallback_failure_class,
         no_executable_route_account_set_reason: route_resolution
             .no_executable_route_account_set_reason,
+        execution_feasibility_status,
+        execution_feasibility_reason,
+        route_resolution_terminal_reason,
+        lifecycle_label_eligibility,
         amount_provided_lamports_if_available: amount_guard.provided_lamports,
         amount_required_lamports_if_available: amount_guard.required_lamports,
         amount_shortfall_lamports_if_available: amount_guard.shortfall_lamports,
@@ -9226,6 +9300,10 @@ fn p37_shadow_probe_transport_from_event(
         fallback_required_precheck_account_set: diagnostics.fallback_required_precheck_account_set,
         fallback_failure_class: diagnostics.fallback_failure_class,
         no_executable_route_account_set_reason: diagnostics.no_executable_route_account_set_reason,
+        execution_feasibility_status: diagnostics.execution_feasibility_status,
+        execution_feasibility_reason: diagnostics.execution_feasibility_reason,
+        route_resolution_terminal_reason: diagnostics.route_resolution_terminal_reason,
+        lifecycle_label_eligibility: diagnostics.lifecycle_label_eligibility,
         amount_provided_lamports_if_available: diagnostics.amount_provided_lamports_if_available,
         amount_required_lamports_if_available: diagnostics.amount_required_lamports_if_available,
         amount_shortfall_lamports_if_available: diagnostics.amount_shortfall_lamports_if_available,
@@ -9437,6 +9515,10 @@ fn p37_shadow_probe_transport_from_error(
         fallback_required_precheck_account_set: diagnostics.fallback_required_precheck_account_set,
         fallback_failure_class: diagnostics.fallback_failure_class,
         no_executable_route_account_set_reason: diagnostics.no_executable_route_account_set_reason,
+        execution_feasibility_status: diagnostics.execution_feasibility_status,
+        execution_feasibility_reason: diagnostics.execution_feasibility_reason,
+        route_resolution_terminal_reason: diagnostics.route_resolution_terminal_reason,
+        lifecycle_label_eligibility: diagnostics.lifecycle_label_eligibility,
         amount_provided_lamports_if_available: diagnostics.amount_provided_lamports_if_available,
         amount_required_lamports_if_available: diagnostics.amount_required_lamports_if_available,
         amount_shortfall_lamports_if_available: diagnostics.amount_shortfall_lamports_if_available,
@@ -9614,6 +9696,10 @@ fn enrich_probe_shadow_entry(
     entry.fallback_failure_class = transport.fallback_failure_class.clone();
     entry.no_executable_route_account_set_reason =
         transport.no_executable_route_account_set_reason.clone();
+    entry.execution_feasibility_status = transport.execution_feasibility_status.clone();
+    entry.execution_feasibility_reason = transport.execution_feasibility_reason.clone();
+    entry.route_resolution_terminal_reason = transport.route_resolution_terminal_reason.clone();
+    entry.lifecycle_label_eligibility = transport.lifecycle_label_eligibility.clone();
     entry.precheck_account_set_hash = transport.precheck_account_set_hash.clone();
     entry.prepared_request_account_set_hash = transport.prepared_request_account_set_hash.clone();
     entry.simulation_account_set_hash = transport.simulation_account_set_hash.clone();
@@ -12472,6 +12558,22 @@ fn shadow_entry_record_from_event(
             .account_diagnostics
             .active_shadow_lifecycle_eligibility_status
             .clone(),
+        execution_feasibility_status: event
+            .account_diagnostics
+            .execution_feasibility_status
+            .clone(),
+        execution_feasibility_reason: event
+            .account_diagnostics
+            .execution_feasibility_reason
+            .clone(),
+        route_resolution_terminal_reason: event
+            .account_diagnostics
+            .route_resolution_terminal_reason
+            .clone(),
+        lifecycle_label_eligibility: event
+            .account_diagnostics
+            .lifecycle_label_eligibility
+            .clone(),
         precheck_failure_reason: event.account_diagnostics.precheck_failure_reason.clone(),
         timestamp: format_shadow_entry_timestamp(entry_execution_ts_ms),
         pool_id: pool_amm_id.to_string(),
@@ -12583,6 +12685,10 @@ fn shadow_entry_record_from_request(
         probe_lifecycle_eligibility_status: None,
         active_shadow_precheck_status: None,
         active_shadow_lifecycle_eligibility_status: None,
+        execution_feasibility_status: None,
+        execution_feasibility_reason: None,
+        route_resolution_terminal_reason: None,
+        lifecycle_label_eligibility: None,
         precheck_failure_reason: None,
         timestamp: format_shadow_entry_timestamp(request.decision_ts_ms),
         pool_id: pool_amm_id.to_string(),
@@ -12719,6 +12825,10 @@ fn enrich_active_shadow_entry_with_account_diagnostics(
     entry.fallback_failure_class = diagnostics.fallback_failure_class.clone();
     entry.no_executable_route_account_set_reason =
         diagnostics.no_executable_route_account_set_reason.clone();
+    entry.execution_feasibility_status = diagnostics.execution_feasibility_status.clone();
+    entry.execution_feasibility_reason = diagnostics.execution_feasibility_reason.clone();
+    entry.route_resolution_terminal_reason = diagnostics.route_resolution_terminal_reason.clone();
+    entry.lifecycle_label_eligibility = diagnostics.lifecycle_label_eligibility.clone();
     entry.precheck_account_set_hash = diagnostics.precheck_account_set_hash.clone();
     entry.prepared_request_account_set_hash = diagnostics.prepared_request_account_set_hash.clone();
     entry.simulation_account_set_hash = diagnostics.simulation_account_set_hash.clone();
@@ -13166,6 +13276,14 @@ struct ShadowEntryRecord {
     active_shadow_precheck_status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     active_shadow_lifecycle_eligibility_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution_feasibility_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution_feasibility_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    route_resolution_terminal_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lifecycle_label_eligibility: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     precheck_failure_reason: Option<String>,
     timestamp: String,

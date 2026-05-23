@@ -654,6 +654,112 @@ def fallback_decision_payload(failed_rows: list[dict[str, Any]]) -> dict[str, An
     }
 
 
+EXECUTABLE_ROUTE_STATUSES = {"primary_route_ready", "fallback_route_ready"}
+NON_EXECUTABLE_ROUTE_STATUSES = {"no_executable_route_account_set"}
+
+
+def is_no_executable_route_row(row: dict[str, Any]) -> bool:
+    return (
+        row_string(row, "route_resolution_status") in NON_EXECUTABLE_ROUTE_STATUSES
+        or row_string(row, "probe_skip_reason") == "no_executable_route_account_set"
+        or row_string(row, "execution_outcome") == "no_executable_route_account_set"
+        or "no_executable_route_account_set"
+        in (
+            row_string(row, "precheck_failure_reason")
+            or row_string(row, "execution_account_readiness_reason")
+            or row_string(row, "no_executable_route_account_set_reason")
+            or ""
+        )
+    )
+
+
+def execution_feasibility_status_for_row(row: dict[str, Any]) -> str:
+    explicit = row_string(row, "execution_feasibility_status")
+    if explicit:
+        return explicit
+    route_status = row_string(row, "route_resolution_status")
+    if route_status in EXECUTABLE_ROUTE_STATUSES or row_string(row, "selected_route_kind"):
+        return "executable"
+    if is_no_executable_route_row(row):
+        return "not_executable_route"
+    probe_skip_reason = row_string(row, "probe_skip_reason")
+    if probe_skip_reason in {
+        "creator_vault_source_not_authoritative",
+        "bonding_curve_v2_source_not_authoritative",
+        "route_account_source_not_authoritative",
+        "missing_execution_route_identity",
+    }:
+        return "not_executable_route_identity"
+    precheck_reason = row_string(row, "precheck_failure_reason") or ""
+    if (
+        "creator_vault_source_not_authoritative" in precheck_reason
+        or "source_not_authoritative" in precheck_reason
+    ):
+        return "not_executable_route_identity"
+    if (
+        "execution_account_not_ready" in precheck_reason
+        or row_string(row, "execution_account_readiness_status") == "not_ready"
+    ):
+        return "not_executable_account_readiness"
+    if is_simulation_error_entry(row) or row_string(row, "simulation_error_kind"):
+        return "simulation_error"
+    return "unknown"
+
+
+def execution_feasibility_reason_for_row(row: dict[str, Any]) -> str:
+    explicit = row_string(row, "execution_feasibility_reason")
+    if explicit:
+        return explicit
+    if is_no_executable_route_row(row):
+        return "no_executable_route_account_set"
+    return (
+        row_string(row, "route_resolution_terminal_reason")
+        or row_string(row, "fallback_failure_class")
+        or row_string(row, "probe_skip_reason")
+        or row_string(row, "precheck_failure_reason")
+        or row_string(row, "execution_account_readiness_reason")
+        or row_string(row, "simulation_error_category")
+        or row_string(row, "simulation_error_kind")
+        or "unknown"
+    )
+
+
+def lifecycle_label_eligibility_for_row(row: dict[str, Any]) -> str:
+    explicit = row_string(row, "lifecycle_label_eligibility")
+    if explicit:
+        return explicit
+    if is_no_executable_route_row(row):
+        return "not_lifecycle_label_eligible"
+    if row_string(row, "probe_lifecycle_eligibility_status") == "lifecycle_eligible":
+        return "lifecycle_label_eligible"
+    if row_string(row, "active_shadow_lifecycle_eligibility_status") == "lifecycle_eligible":
+        return "lifecycle_label_eligible"
+    return "unknown"
+
+
+def execution_feasibility_payload(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    status_counts = Counter(execution_feasibility_status_for_row(row) for row in rows)
+    reason_counts = Counter(execution_feasibility_reason_for_row(row) for row in rows)
+    lifecycle_counts = Counter(lifecycle_label_eligibility_for_row(row) for row in rows)
+    route_executable_rows = sum(
+        1 for row in rows if execution_feasibility_status_for_row(row) == "executable"
+    )
+    route_non_executable_rows = sum(
+        1
+        for row in rows
+        if execution_feasibility_status_for_row(row).startswith("not_executable")
+    )
+    execution_feasibility_reject_rows = sum(1 for row in rows if is_no_executable_route_row(row))
+    return {
+        "execution_feasibility_status_counts": dict(sorted(status_counts.items())),
+        "execution_feasibility_reason_counts": dict(sorted(reason_counts.items())),
+        "lifecycle_label_eligibility_counts": dict(sorted(lifecycle_counts.items())),
+        "route_executable_rows": route_executable_rows,
+        "route_non_executable_rows": route_non_executable_rows,
+        "execution_feasibility_reject_rows": execution_feasibility_reject_rows,
+    }
+
+
 def is_simulation_error_entry(row: dict[str, Any]) -> bool:
     status = row_string(row, "probe_entry_materialization_status")
     execution_outcome = row_string(row, "execution_outcome")
@@ -726,9 +832,11 @@ def classify_probe_transport_materialization(row: dict[str, Any], entry_probe_id
 
 
 def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
+    selection_rows = artifact_rows(paths, "probe_selection")
     transport_rows = artifact_rows(paths, "probe_transport")
     entry_rows = artifact_rows(paths, "probe_entry")
     skip_rows = artifact_rows(paths, "probe_skip")
+    lifecycle_rows = artifact_rows(paths, "probe_lifecycle")
     entry_probe_ids = {probe_id for row in entry_rows if (probe_id := row_probe_id(row))}
 
     status_counts: Counter[str] = Counter()
@@ -1257,6 +1365,7 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
         if row_string(row, "route_resolution_status") in {"primary_route_ready", "fallback_route_ready"}
         or bool(row_string(row, "selected_route_kind"))
     ]
+    execution_feasibility = execution_feasibility_payload(skip_rows + transport_rows)
     precheck_simulation_account_set_mismatch_rows = [
         row
         for row in transport_rows
@@ -1323,6 +1432,7 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
     ]
     return {
         "transport_rows": transport_rows_total,
+        "probe_selected_rows": len(selection_rows),
         "entry_rows": entry_rows_total,
         "transport_without_entry_rows": max(transport_rows_total - entry_rows_total, 0),
         "status_counts": dict(sorted(status_counts.items())),
@@ -1517,6 +1627,20 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
         "fallback_repairable": route_fallback_decision["fallback_repairable"],
         "recommended_next_path": route_fallback_decision["recommended_next_path"],
         "executable_route_ready_rows": len(executable_route_ready_rows),
+        "route_executable_rows": execution_feasibility["route_executable_rows"],
+        "route_non_executable_rows": execution_feasibility["route_non_executable_rows"],
+        "execution_feasibility_reject_rows": execution_feasibility[
+            "execution_feasibility_reject_rows"
+        ],
+        "execution_feasibility_status_counts": execution_feasibility[
+            "execution_feasibility_status_counts"
+        ],
+        "execution_feasibility_reason_counts": execution_feasibility[
+            "execution_feasibility_reason_counts"
+        ],
+        "lifecycle_label_eligibility_counts": execution_feasibility[
+            "lifecycle_label_eligibility_counts"
+        ],
         "primary_route_bcv2_missing_rows": len(primary_route_bcv2_missing_rows),
         "no_executable_route_account_set_rows": len(no_executable_route_account_set_rows),
         "bonding_curve_v2_precheck_skipped_before_simulation_rows": len(
@@ -1532,6 +1656,7 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
         "successful_probe_entry_rows": len(successful_probe_entry_rows),
         "simulation_error_entry_rows": len(simulation_error_entry_rows),
         "lifecycle_eligible_entry_rows": len(lifecycle_eligible_entry_rows),
+        "lifecycle_labeled_rows": len(lifecycle_rows),
         "rows": rows,
     }
 
@@ -1791,6 +1916,7 @@ def active_shadow_dispatch_diagnostics(paths: dict[str, list[Path]]) -> dict[str
         if row_string(row, "route_resolution_status") in {"primary_route_ready", "fallback_route_ready"}
         or bool(row_string(row, "selected_route_kind"))
     ]
+    execution_feasibility = execution_feasibility_payload(failure_rows)
     observed_bcv2_rows = [
         row
         for row in failure_rows
@@ -1962,6 +2088,25 @@ def active_shadow_dispatch_diagnostics(paths: dict[str, list[Path]]) -> dict[str
             "recommended_next_path"
         ],
         "active_shadow_executable_route_ready_rows": len(executable_route_ready_rows),
+        "active_shadow_route_executable_rows": execution_feasibility["route_executable_rows"],
+        "active_shadow_route_non_executable_rows": execution_feasibility[
+            "route_non_executable_rows"
+        ],
+        "active_shadow_execution_feasibility_reject_rows": execution_feasibility[
+            "execution_feasibility_reject_rows"
+        ],
+        "active_buy_execution_infeasible_rows": execution_feasibility[
+            "execution_feasibility_reject_rows"
+        ],
+        "active_shadow_execution_feasibility_status_counts": execution_feasibility[
+            "execution_feasibility_status_counts"
+        ],
+        "active_shadow_execution_feasibility_reason_counts": execution_feasibility[
+            "execution_feasibility_reason_counts"
+        ],
+        "active_shadow_lifecycle_label_eligibility_counts": execution_feasibility[
+            "lifecycle_label_eligibility_counts"
+        ],
         "active_shadow_primary_route_bcv2_missing_rows": len(primary_route_bcv2_missing_rows),
         "active_shadow_no_executable_route_account_set_rows": len(
             no_executable_route_account_set_rows
@@ -2372,6 +2517,73 @@ def probe_readiness(report: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def execution_feasibility_summary(report: dict[str, Any]) -> dict[str, Any]:
+    materialization = report.get("probe_entry_materialization", {})
+    active = report.get("active_shadow_dispatch_diagnostics", {})
+    decision_rows_total = artifact_totals(report, "decision")
+    probe_selected_rows = materialization.get("probe_selected_rows", 0)
+    route_executable_rows = materialization.get("route_executable_rows", 0) + active.get(
+        "active_shadow_route_executable_rows",
+        0,
+    )
+    route_non_executable_rows = materialization.get("route_non_executable_rows", 0) + active.get(
+        "active_shadow_route_non_executable_rows",
+        0,
+    )
+    execution_feasibility_reject_rows = materialization.get(
+        "execution_feasibility_reject_rows",
+        0,
+    ) + active.get("active_shadow_execution_feasibility_reject_rows", 0)
+    successful_entry_rows = materialization.get("successful_probe_entry_rows", 0) + active.get(
+        "active_shadow_successful_entry_rows",
+        0,
+    )
+    lifecycle_eligible_rows = materialization.get("lifecycle_eligible_entry_rows", 0) + active.get(
+        "active_shadow_lifecycle_eligible_rows",
+        0,
+    )
+    lifecycle_labeled_rows = materialization.get("lifecycle_labeled_rows", 0) + active.get(
+        "active_shadow_lifecycle_rows",
+        0,
+    )
+    denominator = max(probe_selected_rows, 0)
+    execution_feasibility_rate = (
+        route_executable_rows / denominator if denominator > 0 else None
+    )
+    entry_materialization_rate = (
+        successful_entry_rows / route_executable_rows if route_executable_rows > 0 else None
+    )
+    lifecycle_label_rate = (
+        lifecycle_labeled_rows / successful_entry_rows if successful_entry_rows > 0 else None
+    )
+    return {
+        "decision_rows_total": decision_rows_total,
+        "probe_selected_rows": probe_selected_rows,
+        "route_executable_rows": route_executable_rows,
+        "route_non_executable_rows": route_non_executable_rows,
+        "successful_entry_rows": successful_entry_rows,
+        "lifecycle_eligible_rows": lifecycle_eligible_rows,
+        "lifecycle_labeled_rows": lifecycle_labeled_rows,
+        "buy_quality_labeled_rows": lifecycle_labeled_rows,
+        "execution_feasibility_reject_rows": execution_feasibility_reject_rows,
+        "active_buy_execution_infeasible_rows": active.get(
+            "active_buy_execution_infeasible_rows",
+            0,
+        ),
+        "execution_feasibility_rate": execution_feasibility_rate,
+        "entry_materialization_rate": entry_materialization_rate,
+        "lifecycle_label_rate": lifecycle_label_rate,
+        "probe_execution_feasibility_status_counts": materialization.get(
+            "execution_feasibility_status_counts",
+            {},
+        ),
+        "active_shadow_execution_feasibility_status_counts": active.get(
+            "active_shadow_execution_feasibility_status_counts",
+            {},
+        ),
+    }
+
+
 def build_report(config_path: Path) -> dict[str, Any]:
     resolved = resolve_config_path(config_path)
     paths = resolve_paths(resolved)
@@ -2407,6 +2619,7 @@ def build_report(config_path: Path) -> dict[str, Any]:
     report["probe_decision_join"] = probe_decision_join(paths)
     report["probe_entry_materialization"] = probe_entry_materialization(paths)
     report["probe_readiness"] = probe_readiness(report)
+    report["execution_feasibility"] = execution_feasibility_summary(report)
     return report
 
 
@@ -2470,6 +2683,29 @@ def render_markdown(report: dict[str, Any]) -> str:
     )
     for key, value in report["probe_decision_join"]["artifacts"].items():
         lines.append(f"- `{key}`: `{json.dumps(value, ensure_ascii=False, sort_keys=True)}`")
+    execution_feasibility = report["execution_feasibility"]
+    lines.extend(
+        [
+            "",
+            "## Execution Feasibility",
+            "",
+            f"- decision_rows_total: `{execution_feasibility['decision_rows_total']}`",
+            f"- probe_selected_rows: `{execution_feasibility['probe_selected_rows']}`",
+            f"- route_executable_rows: `{execution_feasibility['route_executable_rows']}`",
+            f"- route_non_executable_rows: `{execution_feasibility['route_non_executable_rows']}`",
+            f"- successful_entry_rows: `{execution_feasibility['successful_entry_rows']}`",
+            f"- lifecycle_eligible_rows: `{execution_feasibility['lifecycle_eligible_rows']}`",
+            f"- lifecycle_labeled_rows: `{execution_feasibility['lifecycle_labeled_rows']}`",
+            f"- buy_quality_labeled_rows: `{execution_feasibility['buy_quality_labeled_rows']}`",
+            f"- execution_feasibility_reject_rows: `{execution_feasibility['execution_feasibility_reject_rows']}`",
+            f"- active_buy_execution_infeasible_rows: `{execution_feasibility['active_buy_execution_infeasible_rows']}`",
+            f"- execution_feasibility_rate: `{execution_feasibility['execution_feasibility_rate']}`",
+            f"- entry_materialization_rate: `{execution_feasibility['entry_materialization_rate']}`",
+            f"- lifecycle_label_rate: `{execution_feasibility['lifecycle_label_rate']}`",
+            f"- probe_execution_feasibility_status_counts: `{json.dumps(execution_feasibility['probe_execution_feasibility_status_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_execution_feasibility_status_counts: `{json.dumps(execution_feasibility['active_shadow_execution_feasibility_status_counts'], ensure_ascii=False, sort_keys=True)}`",
+        ]
+    )
     active_shadow = report["active_shadow_dispatch_diagnostics"]
     lines.extend(
         [
@@ -2524,6 +2760,13 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- active_shadow_fallback_repairable: `{active_shadow['active_shadow_fallback_repairable']}`",
             f"- active_shadow_recommended_next_path: `{active_shadow['active_shadow_recommended_next_path']}`",
             f"- active_shadow_executable_route_ready_rows: `{active_shadow['active_shadow_executable_route_ready_rows']}`",
+            f"- active_shadow_route_executable_rows: `{active_shadow['active_shadow_route_executable_rows']}`",
+            f"- active_shadow_route_non_executable_rows: `{active_shadow['active_shadow_route_non_executable_rows']}`",
+            f"- active_shadow_execution_feasibility_reject_rows: `{active_shadow['active_shadow_execution_feasibility_reject_rows']}`",
+            f"- active_buy_execution_infeasible_rows: `{active_shadow['active_buy_execution_infeasible_rows']}`",
+            f"- active_shadow_execution_feasibility_status_counts: `{json.dumps(active_shadow['active_shadow_execution_feasibility_status_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_execution_feasibility_reason_counts: `{json.dumps(active_shadow['active_shadow_execution_feasibility_reason_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_lifecycle_label_eligibility_counts: `{json.dumps(active_shadow['active_shadow_lifecycle_label_eligibility_counts'], ensure_ascii=False, sort_keys=True)}`",
         ]
     )
     lines.extend(["", "## Probe Entry Materialization", ""])
@@ -2586,6 +2829,14 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- fallback_repairable: `{materialization['fallback_repairable']}`",
             f"- recommended_next_path: `{materialization['recommended_next_path']}`",
             f"- executable_route_ready_rows: `{materialization['executable_route_ready_rows']}`",
+            f"- probe_selected_rows: `{materialization['probe_selected_rows']}`",
+            f"- route_executable_rows: `{materialization['route_executable_rows']}`",
+            f"- route_non_executable_rows: `{materialization['route_non_executable_rows']}`",
+            f"- execution_feasibility_reject_rows: `{materialization['execution_feasibility_reject_rows']}`",
+            f"- execution_feasibility_status_counts: `{json.dumps(materialization['execution_feasibility_status_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- execution_feasibility_reason_counts: `{json.dumps(materialization['execution_feasibility_reason_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- lifecycle_label_eligibility_counts: `{json.dumps(materialization['lifecycle_label_eligibility_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- lifecycle_labeled_rows: `{materialization['lifecycle_labeled_rows']}`",
             f"- skip_reason_counts: `{json.dumps(materialization['skip_reason_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- skip_execution_account_readiness_role_counts: `{json.dumps(materialization['skip_execution_account_readiness_role_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- skip_creator_vault_authority_status_counts: `{json.dumps(materialization['skip_creator_vault_authority_status_counts'], ensure_ascii=False, sort_keys=True)}`",

@@ -44,6 +44,11 @@ USABLE_EXECUTION_CLASSES = GOOD_EXECUTION_CLASSES | {
     "shadow_onchain_speculative_snapshot_verified",
     "shadow_onchain_degraded",
 }
+EXECUTION_FEASIBILITY_REJECT_STATUSES = {
+    "not_executable_route",
+    "not_executable_account_readiness",
+    "not_executable_route_identity",
+}
 
 
 def iter_jsonl(path: Path) -> Iterable[dict[str, Any]]:
@@ -98,6 +103,64 @@ def finite_int(value: Any) -> int | None:
 
 def counter_dict(counter: Counter[str]) -> dict[str, int]:
     return {key: counter[key] for key in sorted(counter)}
+
+
+def row_string(row: dict[str, Any], field: str) -> str | None:
+    value = row.get(field)
+    if value is None and isinstance(row.get("shadow"), dict):
+        value = row["shadow"].get(field)
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
+def execution_feasibility_status(row: dict[str, Any]) -> str | None:
+    explicit = row_string(row, "execution_feasibility_status")
+    if explicit:
+        return explicit
+    route_status = row_string(row, "route_resolution_status")
+    if route_status == "no_executable_route_account_set":
+        return "not_executable_route"
+    outcome = row_string(row, "execution_outcome")
+    if outcome == "no_executable_route_account_set":
+        return "not_executable_route"
+    reason = (
+        row_string(row, "execution_feasibility_reason")
+        or row_string(row, "route_resolution_terminal_reason")
+        or row_string(row, "precheck_failure_reason")
+        or row_string(row, "execution_account_readiness_reason")
+        or ""
+    )
+    if "no_executable_route_account_set" in reason:
+        return "not_executable_route"
+    return None
+
+
+def execution_feasibility_reason(row: dict[str, Any]) -> str | None:
+    explicit = row_string(row, "execution_feasibility_reason")
+    if explicit:
+        return explicit
+    reason = (
+        row_string(row, "route_resolution_terminal_reason")
+        or row_string(row, "precheck_failure_reason")
+        or row_string(row, "execution_account_readiness_reason")
+        or row_string(row, "probe_skip_reason")
+    )
+    if reason and "no_executable_route_account_set" in reason:
+        return "no_executable_route_account_set"
+    if row_string(row, "route_resolution_status") == "no_executable_route_account_set":
+        return "no_executable_route_account_set"
+    if row_string(row, "execution_outcome") == "no_executable_route_account_set":
+        return "no_executable_route_account_set"
+    return reason
+
+
+def is_execution_feasibility_reject(row: dict[str, Any]) -> bool:
+    status = execution_feasibility_status(row)
+    if status in EXECUTION_FEASIBILITY_REJECT_STATUSES:
+        return True
+    reason = execution_feasibility_reason(row) or ""
+    return "no_executable_route_account_set" in reason
 
 
 def percentile(sorted_values: list[float], pct: float) -> float | None:
@@ -171,6 +234,8 @@ def summarize_finality(values: list[str]) -> str | None:
 
 
 def classify_execution(row: dict[str, Any]) -> tuple[str, str | None]:
+    if is_execution_feasibility_reject(row):
+        return "shadow_execution_infeasible", execution_feasibility_reason(row) or "execution_feasibility_reject"
     if row.get("analysis_status") != "ok":
         return "shadow_execution_unknown", "analysis_status_not_ok"
     if row.get("truth_status") != "resolved":
@@ -348,6 +413,11 @@ def build_label(row: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]
         "sample_price_state": row.get("sample_price_state"),
         "market_outcome_class": market_class,
         "execution_verification_class": execution_class,
+        "execution_feasibility_status": execution_feasibility_status(row),
+        "execution_feasibility_reason": execution_feasibility_reason(row),
+        "route_resolution_status": row_string(row, "route_resolution_status"),
+        "route_resolution_terminal_reason": row_string(row, "route_resolution_terminal_reason"),
+        "lifecycle_label_eligibility": row_string(row, "lifecycle_label_eligibility"),
         "truth_gap_class": truth_gap_class,
         "buy_quality_class": buy_quality,
         "gatekeeper_buy_context_found": gatekeeper_context,
@@ -389,6 +459,13 @@ def build_labels(rows: list[dict[str, Any]], args: argparse.Namespace) -> list[d
 
 
 def build_summary(labels: list[dict[str, Any]], *, source_path: Path, output_path: Path, args: argparse.Namespace) -> dict[str, Any]:
+    execution_feasibility_reject_rows = sum(
+        1
+        for row in labels
+        if row.get("buy_quality_class") == "buy_quality_not_executable"
+        or str(row.get("execution_feasibility_status") or "").startswith("not_executable")
+    )
+    buy_quality_denominator_rows = len(labels) - execution_feasibility_reject_rows
     counts = {
         "analysis_status_counts": Counter(str(row.get("analysis_status") or "unknown") for row in labels),
         "truth_status_counts": Counter(str(row.get("truth_status") or "unknown") for row in labels),
@@ -402,6 +479,12 @@ def build_summary(labels: list[dict[str, Any]], *, source_path: Path, output_pat
         "close_reason_counts": Counter(str(row.get("close_reason") or "unknown") for row in labels),
         "curve_finality_entry_counts": Counter(str(row.get("curve_finality_entry") or "unknown") for row in labels),
         "curve_finality_exit_counts": Counter(str(row.get("curve_finality_exit") or "unknown") for row in labels),
+        "execution_feasibility_status_counts": Counter(
+            str(row.get("execution_feasibility_status") or "unknown") for row in labels
+        ),
+        "execution_feasibility_reason_counts": Counter(
+            str(row.get("execution_feasibility_reason") or "unknown") for row in labels
+        ),
     }
     degraded_reasons = Counter(
         reason
@@ -426,6 +509,8 @@ def build_summary(labels: list[dict[str, Any]], *, source_path: Path, output_pat
         "output": str(output_path),
         "rows_total": len(labels),
         "all_lifecycle_rows": len(labels),
+        "buy_quality_denominator_rows": buy_quality_denominator_rows,
+        "execution_feasibility_reject_rows": execution_feasibility_reject_rows,
         "thresholds": {
             "entry_truth_gap_clean_ms": args.entry_truth_gap_clean_ms,
             "entry_truth_gap_degraded_acceptable_ms": args.entry_truth_gap_degraded_acceptable_ms,
@@ -492,6 +577,10 @@ def render_markdown(summary: dict[str, Any]) -> str:
         "entry_truth_gap_class_counts",
         "exit_truth_gap_class_counts",
         "buy_quality_class_counts",
+        "buy_quality_denominator_rows",
+        "execution_feasibility_reject_rows",
+        "execution_feasibility_status_counts",
+        "execution_feasibility_reason_counts",
         "label_quality_counts",
         "close_reason_counts",
         "curve_finality_entry_counts",

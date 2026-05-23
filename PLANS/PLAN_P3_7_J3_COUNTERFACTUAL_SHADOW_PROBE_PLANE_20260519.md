@@ -1494,6 +1494,96 @@ Acceptance:
 Collection, Phase B, P2, live, active policy changes, IWIM changes and threshold
 tuning remain out of scope.
 
+## P3.7-L1R18 / J3T Route-Class Exclusion from Execution-Label Universe
+
+### Trigger
+
+L1R17 closed the executable-route decision audit:
+
+```text
+fallback_repairable = false
+recommended_next_path = route_class_exclusion_from_execution_label_universe
+```
+
+Primary `routed_exact_sol_in` rows were not executable because route-required
+`bonding_curve_v2` was not RPC-load-ready. The attempted `legacy_buy` fallback
+also lacked a complete executable account set:
+
+- active fallback rows failed with `fallback_missing_core_curve_account`;
+- probe fallback rows failed with `fallback_builder_account_source_unverified`;
+- `executable_route_ready_rows = 0`.
+
+These rows are not evidence that the token was bad or that the decision policy
+was bad. They are execution feasibility rejects under the current route/account
+support.
+
+### Contract
+
+Rows with:
+
+```text
+route_resolution_status = no_executable_route_account_set
+```
+
+must be classified separately from buy-quality labels:
+
+```text
+execution_feasibility_status = not_executable_route
+execution_feasibility_reason = no_executable_route_account_set
+lifecycle_label_eligibility = not_lifecycle_label_eligible
+```
+
+They must not enter the `buy_quality_bad`, `market_bad_clean`, false-BUY, or
+selector class-balance denominator.
+
+### Reporting Denominators
+
+Reports must keep separate denominators:
+
+```text
+decision_rows_total
+probe_selected_rows
+route_executable_rows
+route_non_executable_rows
+successful_entry_rows
+lifecycle_eligible_rows
+lifecycle_labeled_rows
+buy_quality_labeled_rows
+execution_feasibility_reject_rows
+```
+
+The intended ratios are:
+
+```text
+execution_feasibility_rate = route_executable_rows / probe_selected_rows
+entry_materialization_rate = successful_entry_rows / route_executable_rows
+lifecycle_label_rate = lifecycle_labeled_rows / successful_entry_rows
+```
+
+If labels are absent because rows are route-non-executable, feature availability
+must report `execution_feasibility_coverage_too_low` rather than a generic class
+balance failure.
+
+### Non-Goals
+
+L1R18 does not implement a new route fallback, change Gatekeeper thresholds,
+change IWIM, change live/P2 behavior, start collection, or start L2 ablation.
+
+### Exit Criteria
+
+L1R18 is accepted when existing R16-r13/L1R17 artifacts show:
+
+- `no_executable_route_account_set` rows excluded from buy-quality denominator;
+- `execution_feasibility_reject_rows > 0`;
+- active BUY execution-infeasible rows counted separately;
+- route-excluded rows remain `lifecycle_label_eligible=false`;
+- feature availability can explain selector insufficiency as execution
+  feasibility coverage when non-executable rows dominate.
+
+After L1R18, L2 ablation may only use an executable lifecycle-labeled universe.
+If that universe is too small, the next strategic choice is route support
+expansion or explicit scope restriction to supported executable routes.
+
 ## P3.7-L1R16 / J3R Executable Route Resolver
 
 ### Context

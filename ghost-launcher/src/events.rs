@@ -94,6 +94,14 @@ pub struct ShadowSimulationAccountDiagnostics {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_shadow_lifecycle_eligibility_status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_feasibility_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_feasibility_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_resolution_terminal_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_label_eligibility: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub precheck_failure_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub simulation_error_kind: Option<String>,

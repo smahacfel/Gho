@@ -108,6 +108,36 @@ class P37ShadowLifecycleLabelerTests(unittest.TestCase):
         self.assertEqual(label["buy_quality_class"], "buy_quality_bad")
         self.assertIn("missing_gatekeeper_buy_context", label["degraded_reasons"])
 
+    def test_no_executable_route_is_not_buy_quality_bad(self) -> None:
+        row = report_row(final_pnl_pct=-12.0, finality="speculative", gatekeeper_context=False)
+        row["route_resolution_status"] = "no_executable_route_account_set"
+        row["execution_feasibility_status"] = "not_executable_route"
+        row["execution_feasibility_reason"] = "no_executable_route_account_set"
+        row["route_resolution_terminal_reason"] = "no_executable_route_account_set"
+        row["lifecycle_label_eligibility"] = "not_lifecycle_label_eligible"
+        row["shadow"]["execution_outcome"] = "no_executable_route_account_set"
+
+        label = labeler.build_label(row, args())
+
+        self.assertEqual(label["market_outcome_class"], "market_bad_clean")
+        self.assertEqual(label["execution_verification_class"], "shadow_execution_infeasible")
+        self.assertEqual(label["buy_quality_class"], "buy_quality_not_executable")
+        self.assertEqual(label["label_quality"], "not_executable")
+        self.assertEqual(label["execution_feasibility_status"], "not_executable_route")
+        self.assertEqual(label["execution_feasibility_reason"], "no_executable_route_account_set")
+        summary = labeler.build_summary(
+            [label],
+            source_path=Path("shadow_onchain.jsonl"),
+            output_path=Path("labels.jsonl"),
+            args=args(),
+        )
+        self.assertEqual(summary["execution_feasibility_reject_rows"], 1)
+        self.assertEqual(summary["buy_quality_denominator_rows"], 0)
+        self.assertEqual(
+            summary["execution_feasibility_status_counts"],
+            {"not_executable_route": 1},
+        )
+
     def test_timestop_exit_gap_can_be_degraded_acceptable(self) -> None:
         row = report_row(
             final_pnl_pct=1.0,

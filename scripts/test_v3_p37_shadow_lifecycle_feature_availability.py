@@ -177,6 +177,37 @@ class P37ShadowLifecycleFeatureAvailabilityTests(unittest.TestCase):
         self.assertEqual(report["rows_with_any_decision_time_features"], {})
         self.assertEqual(report["feature_availability_status"], "lifecycle_only")
 
+    def test_execution_infeasible_labels_do_not_enter_buy_quality_denominator(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "gatekeeper_v2_buys.jsonl"
+            infeasible = label("blocked", "buy_quality_not_executable", 1000)
+            infeasible["execution_feasibility_status"] = "not_executable_route"
+            infeasible["execution_feasibility_reason"] = "no_executable_route_account_set"
+            infeasible["route_resolution_status"] = "no_executable_route_account_set"
+
+            report = availability.build_report(
+                labels=[infeasible],
+                raw_rows=[],
+                decision_rows=[decision(path, 1000, with_v3_mfs=True)],
+                decision_logs=[path],
+                max_match_drift_ms=60_000,
+                min_feature_label_rows=1,
+                min_temporal_split_class_rows=1,
+                source_labels=Path("labels.jsonl"),
+                source_raw=Path("raw.jsonl"),
+                config_path=Path("config.toml"),
+            )
+
+        self.assertEqual(report["feature_availability_status"], "insufficient_for_selector")
+        self.assertEqual(report["reason"], "execution_feasibility_coverage_too_low")
+        self.assertEqual(report["execution_feasibility_reject_rows"], 1)
+        self.assertEqual(report["buy_quality_denominator_rows"], 0)
+        self.assertEqual(report["execution_feasibility_coverage"], 0.0)
+        self.assertEqual(
+            report["execution_feasibility_status_counts"],
+            {"not_executable_route": 1},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

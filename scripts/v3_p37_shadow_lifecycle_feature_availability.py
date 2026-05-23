@@ -441,6 +441,19 @@ def segment_names(label: dict[str, Any]) -> list[str]:
     return names
 
 
+def is_execution_feasibility_reject(label: dict[str, Any]) -> bool:
+    buy_quality = str(label.get("buy_quality_class") or "")
+    status = str(label.get("execution_feasibility_status") or "")
+    reason = str(label.get("execution_feasibility_reason") or "")
+    route_status = str(label.get("route_resolution_status") or "")
+    return (
+        buy_quality == "buy_quality_not_executable"
+        or status.startswith("not_executable")
+        or route_status == "no_executable_route_account_set"
+        or "no_executable_route_account_set" in reason
+    )
+
+
 def build_temporal_split(
     labels: list[dict[str, Any]],
     matched_feature_flags: dict[str, bool],
@@ -561,8 +574,21 @@ def build_report(
     bad_with_features = feature_row_counts.get("buy_quality_bad", 0)
     gatekeeper_dirty_good_with_features = feature_row_counts.get("gatekeeper_context_buy_quality_dirty_good", 0)
     gatekeeper_bad_with_features = feature_row_counts.get("gatekeeper_context_buy_quality_bad", 0)
+    buy_quality_denominator_labels = [
+        label for label in labels if not is_execution_feasibility_reject(label)
+    ]
+    execution_feasibility_reject_rows = len(labels) - len(buy_quality_denominator_labels)
+    execution_feasibility_coverage = (
+        len(buy_quality_denominator_labels) / len(labels) if labels else None
+    )
+    execution_feasibility_status_counts = Counter(
+        str(row.get("execution_feasibility_status") or "unknown") for row in labels
+    )
+    execution_feasibility_reason_counts = Counter(
+        str(row.get("execution_feasibility_reason") or "unknown") for row in labels
+    )
     temporal_split = build_temporal_split(
-        labels,
+        buy_quality_denominator_labels,
         matched_feature_flags,
         min_class_rows=min_temporal_split_class_rows,
     )
@@ -606,7 +632,13 @@ def build_report(
         feature_status = "insufficient_for_selector"
         phase_b_possible = False
         phase_b_scope = "none"
-        reason = "feature coverage or class balance is below configured minimums"
+        if (
+            execution_feasibility_reject_rows > 0
+            and len(buy_quality_denominator_labels) < max(1, min_feature_label_rows * 2)
+        ):
+            reason = "execution_feasibility_coverage_too_low"
+        else:
+            reason = "feature coverage or class balance is below configured minimums"
 
     diagnostic_minimums = {
         "dirty_good_with_features": dirty_good_with_features,
@@ -633,6 +665,11 @@ def build_report(
         "matched_gatekeeper_version_counts": counter_dict(matched_gatekeeper_version),
         "matched_log_kind_counts": counter_dict(matched_log_kind),
         "rows_total": len(labels),
+        "buy_quality_denominator_rows": len(buy_quality_denominator_labels),
+        "execution_feasibility_reject_rows": execution_feasibility_reject_rows,
+        "execution_feasibility_coverage": execution_feasibility_coverage,
+        "execution_feasibility_status_counts": counter_dict(execution_feasibility_status_counts),
+        "execution_feasibility_reason_counts": counter_dict(execution_feasibility_reason_counts),
         "raw_shadow_onchain_rows_total": len(raw_rows),
         "buy_quality_class_counts": counter_dict(label_counts),
         "market_outcome_class_counts": counter_dict(market_counts),
@@ -694,6 +731,11 @@ def render_markdown(report: dict[str, Any]) -> str:
     for key in (
         "rows_total",
         "raw_shadow_onchain_rows_total",
+        "buy_quality_denominator_rows",
+        "execution_feasibility_reject_rows",
+        "execution_feasibility_coverage",
+        "execution_feasibility_status_counts",
+        "execution_feasibility_reason_counts",
         "buy_quality_class_counts",
         "market_outcome_class_counts",
         "gatekeeper_context_split",

@@ -1856,6 +1856,21 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
         self.assertEqual(materialization["executable_route_ready_rows"], 0)
         self.assertEqual(materialization["primary_route_bcv2_missing_rows"], 1)
         self.assertEqual(materialization["no_executable_route_account_set_rows"], 1)
+        self.assertEqual(materialization["route_executable_rows"], 0)
+        self.assertEqual(materialization["route_non_executable_rows"], 1)
+        self.assertEqual(materialization["execution_feasibility_reject_rows"], 1)
+        self.assertEqual(
+            materialization["execution_feasibility_status_counts"],
+            {"not_executable_route": 1},
+        )
+        self.assertEqual(
+            materialization["execution_feasibility_reason_counts"],
+            {"no_executable_route_account_set": 1},
+        )
+        self.assertEqual(
+            materialization["lifecycle_label_eligibility_counts"],
+            {"not_lifecycle_label_eligible": 1},
+        )
 
         active = report["active_shadow_dispatch_diagnostics"]
         self.assertEqual(
@@ -1885,6 +1900,30 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
         self.assertEqual(active["active_shadow_executable_route_ready_rows"], 0)
         self.assertEqual(active["active_shadow_primary_route_bcv2_missing_rows"], 1)
         self.assertEqual(active["active_shadow_no_executable_route_account_set_rows"], 1)
+        self.assertEqual(active["active_shadow_route_executable_rows"], 0)
+        self.assertEqual(active["active_shadow_route_non_executable_rows"], 1)
+        self.assertEqual(active["active_shadow_execution_feasibility_reject_rows"], 1)
+        self.assertEqual(active["active_buy_execution_infeasible_rows"], 1)
+        self.assertEqual(
+            active["active_shadow_execution_feasibility_status_counts"],
+            {"not_executable_route": 1},
+        )
+        self.assertEqual(
+            active["active_shadow_execution_feasibility_reason_counts"],
+            {"no_executable_route_account_set": 1},
+        )
+        self.assertEqual(
+            active["active_shadow_lifecycle_label_eligibility_counts"],
+            {"not_lifecycle_label_eligible": 1},
+        )
+
+        feasibility = report["execution_feasibility"]
+        self.assertEqual(feasibility["route_executable_rows"], 0)
+        self.assertEqual(feasibility["route_non_executable_rows"], 2)
+        self.assertEqual(feasibility["execution_feasibility_reject_rows"], 2)
+        self.assertEqual(feasibility["successful_entry_rows"], 0)
+        self.assertEqual(feasibility["lifecycle_eligible_rows"], 0)
+        self.assertEqual(feasibility["active_buy_execution_infeasible_rows"], 1)
 
     def test_active_shadow_unattributed_account_not_found_blocks_readiness(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
