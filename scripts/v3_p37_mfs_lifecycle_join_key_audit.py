@@ -804,6 +804,62 @@ def legacy_buy_route_payload(
         or "unknown"
         for row in not_ready_rows
     )
+    primary_bcv2_leak_rows = [
+        row
+        for row in attempted_rows
+        if (
+            "primary_route_account_set"
+            in set(row_string_list(row, "fallback_account_sources"))
+            and (
+                "bonding_curve_v2"
+                in set(row_string_list(row, "fallback_missing_roles"))
+                or any(
+                    value.startswith("bonding_curve_v2:")
+                    for value in row_string_list(
+                        row, "fallback_required_precheck_account_set"
+                    )
+                    + row_string_list(row, "fallback_simulation_load_account_set")
+                )
+            )
+        )
+    ]
+    missing_creatable_user_ata_rows = [
+        row
+        for row in attempted_rows
+        if "user_ata" in set(row_string_list(row, "fallback_missing_roles"))
+    ]
+    missing_creatable_uva_rows = [
+        row
+        for row in attempted_rows
+        if "user_volume_accumulator"
+        in set(row_string_list(row, "fallback_missing_roles"))
+    ]
+    missing_ephemeral_payer_rows = [
+        row
+        for row in attempted_rows
+        if "payer_pubkey" in set(row_string_list(row, "fallback_missing_roles"))
+        and row_string(row, "payer_provenance") == "ephemeral"
+    ]
+    non_blocking_creatable_rows = [
+        row
+        for row in attempted_rows
+        if (
+            any(
+                value.startswith("user_ata:")
+                or value.startswith("user_volume_accumulator:")
+                for value in row_string_list(row, "fallback_creatable_account_set")
+            )
+            and "user_ata" not in set(row_string_list(row, "fallback_missing_roles"))
+            and "user_volume_accumulator"
+            not in set(row_string_list(row, "fallback_missing_roles"))
+        )
+    ]
+    non_blocking_ephemeral_payer_rows = [
+        row
+        for row in attempted_rows
+        if row_string(row, "payer_provenance") == "ephemeral"
+        and "payer_pubkey" not in set(row_string_list(row, "fallback_missing_roles"))
+    ]
     return {
         "legacy_buy_route_attempted_rows": len(attempted_rows),
         "legacy_buy_route_ready_rows": len(ready_rows),
@@ -843,6 +899,33 @@ def legacy_buy_route_payload(
         ),
         "legacy_buy_route_not_ready_reason_counts": dict(
             sorted(not_ready_reason_counts.items())
+        ),
+        "legacy_buy_primary_bcv2_leak_rows": len(primary_bcv2_leak_rows),
+        "legacy_buy_missing_creatable_user_ata_rows": len(
+            missing_creatable_user_ata_rows
+        ),
+        "legacy_buy_missing_creatable_user_volume_accumulator_rows": len(
+            missing_creatable_uva_rows
+        ),
+        "legacy_buy_missing_ephemeral_payer_rows": len(
+            missing_ephemeral_payer_rows
+        ),
+        "legacy_buy_blocking_missing_required_rows": len(
+            [
+                row
+                for row in attempted_rows
+                if row_string_list(row, "fallback_missing_roles")
+            ]
+        ),
+        "legacy_buy_non_blocking_missing_creatable_rows": len(
+            non_blocking_creatable_rows
+        ),
+        "legacy_buy_non_blocking_ephemeral_payer_rows": len(
+            non_blocking_ephemeral_payer_rows
+        ),
+        "legacy_buy_fallback_account_set_ready_rows": len(ready_rows),
+        "legacy_buy_route_ready_after_account_set_separation_rows": len(
+            ready_rows
         ),
     }
 
@@ -2978,6 +3061,15 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- active_shadow_legacy_buy_route_ready_after_reconciliation_rows: `{active_shadow['active_shadow_legacy_buy_route_ready_after_reconciliation_rows']}`",
             f"- active_shadow_legacy_buy_route_still_not_ready_after_reconciliation_rows: `{active_shadow['active_shadow_legacy_buy_route_still_not_ready_after_reconciliation_rows']}`",
             f"- active_shadow_legacy_buy_route_not_ready_reason_counts: `{json.dumps(active_shadow['active_shadow_legacy_buy_route_not_ready_reason_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_legacy_buy_primary_bcv2_leak_rows: `{active_shadow['active_shadow_legacy_buy_primary_bcv2_leak_rows']}`",
+            f"- active_shadow_legacy_buy_missing_creatable_user_ata_rows: `{active_shadow['active_shadow_legacy_buy_missing_creatable_user_ata_rows']}`",
+            f"- active_shadow_legacy_buy_missing_creatable_user_volume_accumulator_rows: `{active_shadow['active_shadow_legacy_buy_missing_creatable_user_volume_accumulator_rows']}`",
+            f"- active_shadow_legacy_buy_missing_ephemeral_payer_rows: `{active_shadow['active_shadow_legacy_buy_missing_ephemeral_payer_rows']}`",
+            f"- active_shadow_legacy_buy_blocking_missing_required_rows: `{active_shadow['active_shadow_legacy_buy_blocking_missing_required_rows']}`",
+            f"- active_shadow_legacy_buy_non_blocking_missing_creatable_rows: `{active_shadow['active_shadow_legacy_buy_non_blocking_missing_creatable_rows']}`",
+            f"- active_shadow_legacy_buy_non_blocking_ephemeral_payer_rows: `{active_shadow['active_shadow_legacy_buy_non_blocking_ephemeral_payer_rows']}`",
+            f"- active_shadow_legacy_buy_fallback_account_set_ready_rows: `{active_shadow['active_shadow_legacy_buy_fallback_account_set_ready_rows']}`",
+            f"- active_shadow_legacy_buy_route_ready_after_account_set_separation_rows: `{active_shadow['active_shadow_legacy_buy_route_ready_after_account_set_separation_rows']}`",
             f"- active_shadow_fallback_failure_class_counts: `{json.dumps(active_shadow['active_shadow_fallback_failure_class_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- active_shadow_fallback_missing_role_counts: `{json.dumps(active_shadow['active_shadow_fallback_missing_role_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- active_shadow_fallback_account_source_counts: `{json.dumps(active_shadow['active_shadow_fallback_account_source_counts'], ensure_ascii=False, sort_keys=True)}`",
@@ -3068,6 +3160,15 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- legacy_buy_route_ready_after_reconciliation_rows: `{materialization['legacy_buy_route_ready_after_reconciliation_rows']}`",
             f"- legacy_buy_route_still_not_ready_after_reconciliation_rows: `{materialization['legacy_buy_route_still_not_ready_after_reconciliation_rows']}`",
             f"- legacy_buy_route_not_ready_reason_counts: `{json.dumps(materialization['legacy_buy_route_not_ready_reason_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- legacy_buy_primary_bcv2_leak_rows: `{materialization['legacy_buy_primary_bcv2_leak_rows']}`",
+            f"- legacy_buy_missing_creatable_user_ata_rows: `{materialization['legacy_buy_missing_creatable_user_ata_rows']}`",
+            f"- legacy_buy_missing_creatable_user_volume_accumulator_rows: `{materialization['legacy_buy_missing_creatable_user_volume_accumulator_rows']}`",
+            f"- legacy_buy_missing_ephemeral_payer_rows: `{materialization['legacy_buy_missing_ephemeral_payer_rows']}`",
+            f"- legacy_buy_blocking_missing_required_rows: `{materialization['legacy_buy_blocking_missing_required_rows']}`",
+            f"- legacy_buy_non_blocking_missing_creatable_rows: `{materialization['legacy_buy_non_blocking_missing_creatable_rows']}`",
+            f"- legacy_buy_non_blocking_ephemeral_payer_rows: `{materialization['legacy_buy_non_blocking_ephemeral_payer_rows']}`",
+            f"- legacy_buy_fallback_account_set_ready_rows: `{materialization['legacy_buy_fallback_account_set_ready_rows']}`",
+            f"- legacy_buy_route_ready_after_account_set_separation_rows: `{materialization['legacy_buy_route_ready_after_account_set_separation_rows']}`",
             f"- fallback_failure_class_counts: `{json.dumps(materialization['fallback_failure_class_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- fallback_missing_role_counts: `{json.dumps(materialization['fallback_missing_role_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- fallback_account_source_counts: `{json.dumps(materialization['fallback_account_source_counts'], ensure_ascii=False, sort_keys=True)}`",

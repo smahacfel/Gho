@@ -4561,15 +4561,25 @@ impl TriggerComponent {
         if let Some(value) = request.account_overrides.associated_bonding_curve {
             push_account(value, "associated_bonding_curve".to_string());
         }
-        if let Some(value) = request.account_overrides.bonding_curve_v2 {
-            push_account(value, "bonding_curve_v2".to_string());
+        if !matches!(
+            request.account_overrides.buy_variant,
+            Some(trigger::PumpfunBuyVariant::LegacyBuy)
+        ) {
+            if let Some(value) = request.account_overrides.bonding_curve_v2 {
+                push_account(value, "bonding_curve_v2".to_string());
+            }
         }
 
         for pubkey in request.rpc_buy_tx.message.account_keys.iter().copied() {
-            push_account(
-                pubkey,
-                Self::counterfactual_probe_account_role_for(request, &pubkey),
-            );
+            let role = Self::counterfactual_probe_account_role_for(request, &pubkey);
+            if matches!(
+                request.account_overrides.buy_variant,
+                Some(trigger::PumpfunBuyVariant::LegacyBuy)
+            ) && role == "bonding_curve_v2"
+            {
+                continue;
+            }
+            push_account(pubkey, role);
         }
 
         accounts
@@ -8570,7 +8580,7 @@ mod tests {
     }
 
     #[test]
-    fn p37_counterfactual_probe_required_accounts_include_simulation_loaded_bonding_curve_v2() {
+    fn p37_counterfactual_probe_required_accounts_exclude_legacy_primary_bcv2_leak() {
         let config = create_test_config();
         let trigger =
             TriggerComponent::new_with_shadow_simulator(config, Arc::new(MockShadowSimulator));
@@ -8636,7 +8646,7 @@ mod tests {
 
         assert!(roles.iter().any(|(_, role)| role == "bonding_curve"));
         assert!(roles.iter().any(|(_, role)| role == "creator_vault"));
-        assert!(roles.iter().any(|(_, role)| role == "bonding_curve_v2"));
+        assert!(!roles.iter().any(|(_, role)| role == "bonding_curve_v2"));
         assert!(roles
             .iter()
             .any(|(_, role)| role == "global_volume_accumulator"));

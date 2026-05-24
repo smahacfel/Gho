@@ -6360,10 +6360,40 @@ fn p37_shadow_probe_fallback_failure_class_from_reason(
     }
 }
 
+fn p37_shadow_probe_manifest_entry_belongs_to_fallback_legacy_buy(
+    entry: &P37ShadowProbeAccountManifestEntry,
+) -> bool {
+    if entry.role == "bonding_curve_v2" && entry.source == "primary_route_account_set" {
+        return false;
+    }
+    entry.buy_variant.as_deref() == Some("legacy_buy")
+        || entry.route_kind.as_deref() == Some("legacy_buy")
+        || matches!(
+            entry.role.as_str(),
+            "global_config"
+                | "fee_recipient"
+                | "mint"
+                | "bonding_curve"
+                | "associated_bonding_curve"
+                | "user_ata"
+                | "payer_pubkey"
+                | "system_program"
+                | "token_program"
+                | "creator_vault"
+                | "event_authority"
+                | "pump_program"
+                | "global_volume_accumulator"
+                | "user_volume_accumulator"
+                | "fee_config"
+                | "fee_program"
+                | "buyback_fee_recipient"
+        )
+}
+
 fn p37_shadow_probe_fallback_failure_diagnostics(
     account_set_diagnostics: Option<&P37ShadowProbeAccountSetDiagnostics>,
     fallback_not_ready_reason: Option<&str>,
-    bcv2_pubkey: Option<&str>,
+    _bcv2_pubkey: Option<&str>,
 ) -> (
     Vec<String>,
     Vec<String>,
@@ -6379,6 +6409,9 @@ fn p37_shadow_probe_fallback_failure_diagnostics(
                 diagnostics
                     .manifest
                     .iter()
+                    .filter(|entry| {
+                        p37_shadow_probe_manifest_entry_belongs_to_fallback_legacy_buy(entry)
+                    })
                     .map(p37_shadow_probe_account_manifest_descriptor),
             )
         })
@@ -6390,6 +6423,9 @@ fn p37_shadow_probe_fallback_failure_diagnostics(
                     .manifest
                     .iter()
                     .filter(|entry| entry.required)
+                    .filter(|entry| {
+                        p37_shadow_probe_manifest_entry_belongs_to_fallback_legacy_buy(entry)
+                    })
                     .map(p37_shadow_probe_account_manifest_descriptor),
             )
         })
@@ -6397,7 +6433,8 @@ fn p37_shadow_probe_fallback_failure_diagnostics(
     let fallback_creatable_account_set = account_set_diagnostics
         .map(|diagnostics| {
             p37_shadow_probe_sorted_unique(diagnostics.manifest.iter().filter_map(|entry| {
-                (entry.role == "user_ata" || entry.role == "user_volume_accumulator")
+                (p37_shadow_probe_manifest_entry_belongs_to_fallback_legacy_buy(entry)
+                    && (entry.role == "user_ata" || entry.role == "user_volume_accumulator"))
                     .then(|| p37_shadow_probe_account_manifest_descriptor(entry))
             }))
         })
@@ -6408,15 +6445,17 @@ fn p37_shadow_probe_fallback_failure_diagnostics(
             diagnostics
                 .missing_candidates
                 .iter()
+                .filter(|candidate| candidate.role != "bonding_curve_v2")
                 .map(|candidate| candidate.role.clone())
                 .collect()
         })
         .unwrap_or_default();
-    let mut missing_pubkeys: Vec<String> = account_set_diagnostics
+    let missing_pubkeys: Vec<String> = account_set_diagnostics
         .map(|diagnostics| {
             diagnostics
                 .missing_candidates
                 .iter()
+                .filter(|candidate| candidate.role != "bonding_curve_v2")
                 .map(|candidate| candidate.pubkey.clone())
                 .collect()
         })
@@ -6426,6 +6465,7 @@ fn p37_shadow_probe_fallback_failure_diagnostics(
             diagnostics
                 .missing_candidates
                 .iter()
+                .filter(|candidate| candidate.role != "bonding_curve_v2")
                 .map(|candidate| candidate.source.clone())
                 .collect()
         })
@@ -6437,13 +6477,7 @@ fn p37_shadow_probe_fallback_failure_diagnostics(
             account_sources.push("legacy_buy_curve".to_string());
         }
         Some("fallback_route_requires_same_bcv2_simulation_load_account")
-        | Some("fallback_route_requires_authoritative_primary_route_accounts") => {
-            missing_roles.push("bonding_curve_v2".to_string());
-            if let Some(pubkey) = bcv2_pubkey.filter(|pubkey| !pubkey.trim().is_empty()) {
-                missing_pubkeys.push(pubkey.to_string());
-            }
-            account_sources.push("primary_route_account_set".to_string());
-        }
+        | Some("fallback_route_requires_authoritative_primary_route_accounts") => {}
         Some("fallback_route_not_available_for_primary") => {
             account_sources.push("route_builder".to_string());
         }
@@ -6568,15 +6602,46 @@ fn p37_legacy_buy_curve_authority_readiness_status(
 }
 
 fn p37_legacy_buy_missing_candidate_belongs_to_route(
-    buy_variant: Option<trigger::PumpfunBuyVariant>,
+    _buy_variant: Option<trigger::PumpfunBuyVariant>,
     candidate: &P37ShadowProbeAccountNotFoundCandidate,
 ) -> bool {
-    if buy_variant != Some(trigger::PumpfunBuyVariant::LegacyBuy)
-        && candidate.role == "bonding_curve_v2"
-    {
+    if candidate.role == "bonding_curve_v2" {
         return false;
     }
     true
+}
+
+fn p37_legacy_buy_missing_candidate_is_non_blocking(
+    request: &crate::components::trigger::PreparedBuyRequest,
+    candidate: &P37ShadowProbeAccountNotFoundCandidate,
+) -> bool {
+    let Ok(pubkey) = Pubkey::from_str(&candidate.pubkey) else {
+        return false;
+    };
+    match candidate.role.as_str() {
+        "user_ata" => {
+            request.attach_idempotent_ata_create
+                && request.ata_missing_pre_submit
+                && pubkey == request.user_ata
+        }
+        "user_volume_accumulator" => request
+            .build_profile
+            .as_ref()
+            .and_then(|profile| profile.buy_instruction.accounts.get(13))
+            .is_some_and(|account| account.pubkey == pubkey),
+        "payer_pubkey" => request.payer_provenance == "ephemeral" && pubkey == request.payer_pubkey,
+        _ => false,
+    }
+}
+
+fn p37_legacy_buy_missing_candidate_is_blocking(
+    request: &crate::components::trigger::PreparedBuyRequest,
+    candidate: &P37ShadowProbeAccountNotFoundCandidate,
+) -> bool {
+    p37_legacy_buy_missing_candidate_belongs_to_route(
+        request.account_overrides.buy_variant,
+        candidate,
+    ) && !p37_legacy_buy_missing_candidate_is_non_blocking(request, candidate)
 }
 
 fn p37_shadow_probe_legacy_buy_route_diagnostics(
@@ -6649,10 +6714,7 @@ fn p37_shadow_probe_legacy_buy_route_diagnostics(
                     .manifest
                     .iter()
                     .filter(|entry| entry.required)
-                    .filter(|entry| {
-                        overrides.buy_variant == Some(trigger::PumpfunBuyVariant::LegacyBuy)
-                            || entry.role != "bonding_curve_v2"
-                    })
+                    .filter(|entry| entry.role != "bonding_curve_v2")
                     .map(|entry| entry.role.clone()),
             )
         })
@@ -6672,10 +6734,7 @@ fn p37_shadow_probe_legacy_buy_route_diagnostics(
                 .missing_candidates
                 .iter()
                 .filter(|candidate| {
-                    p37_legacy_buy_missing_candidate_belongs_to_route(
-                        overrides.buy_variant,
-                        candidate,
-                    )
+                    p37_legacy_buy_missing_candidate_is_blocking(request, candidate)
                 })
                 .map(|candidate| candidate.role.clone())
                 .collect::<Vec<_>>()
@@ -6687,10 +6746,7 @@ fn p37_shadow_probe_legacy_buy_route_diagnostics(
                 .missing_candidates
                 .iter()
                 .filter(|candidate| {
-                    p37_legacy_buy_missing_candidate_belongs_to_route(
-                        overrides.buy_variant,
-                        candidate,
-                    )
+                    p37_legacy_buy_missing_candidate_is_blocking(request, candidate)
                 })
                 .map(|candidate| candidate.pubkey.clone())
                 .collect::<Vec<_>>()
@@ -6710,10 +6766,7 @@ fn p37_shadow_probe_legacy_buy_route_diagnostics(
         .map(|diagnostics| {
             diagnostics.manifest_lookup_performed
                 && diagnostics.missing_candidates.iter().all(|candidate| {
-                    !p37_legacy_buy_missing_candidate_belongs_to_route(
-                        overrides.buy_variant,
-                        candidate,
-                    )
+                    !p37_legacy_buy_missing_candidate_is_blocking(request, candidate)
                 })
         })
         .unwrap_or(false);
@@ -6828,6 +6881,62 @@ fn p37_shadow_probe_route_resolution_diagnostics(
             .clone()
             .unwrap_or_else(|| "primary_route_bcv2_missing".to_string());
         let fallback_attempted = fallback_route_kind.is_some();
+        if fallback_attempted && legacy_buy.route_ready == Some(true) {
+            let (
+                _fallback_missing_roles,
+                _fallback_missing_pubkeys,
+                _fallback_account_sources,
+                fallback_simulation_load_account_set,
+                fallback_creatable_account_set,
+                fallback_required_precheck_account_set,
+                _fallback_failure_class,
+            ) = p37_shadow_probe_fallback_failure_diagnostics(
+                account_set_diagnostics,
+                None,
+                Some(pubkey.as_str()),
+            );
+            return P37ExecutableRouteResolutionDiagnostics {
+                route_resolution_status: Some("fallback_route_ready".to_string()),
+                selected_route_kind: fallback_route_kind.clone(),
+                selected_route_reason: Some(
+                    "fallback_route_passed_simulation_load_readiness".to_string(),
+                ),
+                primary_route_kind: Some(primary_route_kind),
+                primary_route_ready: Some(false),
+                primary_route_not_ready_reason: Some(primary_reason),
+                fallback_route_kind,
+                fallback_route_attempted: Some(true),
+                fallback_route_ready: Some(true),
+                fallback_route_not_ready_reason: None,
+                fallback_missing_roles: Vec::new(),
+                fallback_missing_pubkeys: Vec::new(),
+                fallback_account_sources: Vec::new(),
+                fallback_simulation_load_account_set,
+                fallback_creatable_account_set,
+                fallback_required_precheck_account_set,
+                fallback_failure_class: None,
+                no_executable_route_account_set_reason: None,
+                legacy_buy_account_set_status: legacy_buy.account_set_status,
+                legacy_buy_curve_pubkey: legacy_buy.curve_pubkey,
+                legacy_buy_curve_source: legacy_buy.curve_source,
+                legacy_buy_curve_authority_status: legacy_buy.curve_authority_status,
+                legacy_buy_curve_rpc_load_status: legacy_buy.curve_rpc_load_status,
+                legacy_buy_curve_rpc_load_ready: legacy_buy.curve_rpc_load_ready,
+                legacy_buy_curve_authority_readiness_status: legacy_buy
+                    .curve_authority_readiness_status,
+                legacy_buy_associated_bonding_curve_pubkey: legacy_buy
+                    .associated_bonding_curve_pubkey,
+                legacy_buy_associated_bonding_curve_source: legacy_buy
+                    .associated_bonding_curve_source,
+                legacy_buy_associated_bonding_curve_rpc_load_ready: legacy_buy
+                    .associated_bonding_curve_rpc_load_ready,
+                legacy_buy_required_roles: legacy_buy.required_roles,
+                legacy_buy_missing_roles: legacy_buy.missing_roles,
+                legacy_buy_missing_pubkeys: legacy_buy.missing_pubkeys,
+                legacy_buy_route_ready: legacy_buy.route_ready,
+                legacy_buy_route_not_ready_reason: legacy_buy.route_not_ready_reason,
+            };
+        }
         let fallback_not_ready_reason = if fallback_attempted {
             match legacy_buy.route_not_ready_reason.as_deref() {
                 Some("legacy_buy_missing_core_curve_account") => {
@@ -18936,7 +19045,11 @@ mod tests {
 
         assert_eq!(
             resolution.route_resolution_status.as_deref(),
-            Some("no_executable_route_account_set")
+            Some("fallback_route_ready")
+        );
+        assert_eq!(
+            resolution.selected_route_kind.as_deref(),
+            Some("legacy_buy")
         );
         assert_eq!(
             resolution.primary_route_kind.as_deref(),
@@ -18952,11 +19065,8 @@ mod tests {
             Some("legacy_buy")
         );
         assert_eq!(resolution.fallback_route_attempted, Some(true));
-        assert_eq!(resolution.fallback_route_ready, Some(false));
-        assert_eq!(
-            resolution.fallback_route_not_ready_reason.as_deref(),
-            Some("fallback_route_requires_same_bcv2_simulation_load_account")
-        );
+        assert_eq!(resolution.fallback_route_ready, Some(true));
+        assert_eq!(resolution.fallback_route_not_ready_reason, None);
         let legacy_curve_pubkey_string = legacy_curve_pubkey.to_string();
         assert_eq!(
             resolution.legacy_buy_curve_pubkey.as_deref(),
@@ -18983,23 +19093,13 @@ mod tests {
         );
         assert_eq!(resolution.legacy_buy_route_ready, Some(true));
         assert_eq!(resolution.legacy_buy_route_not_ready_reason, None);
-        assert_eq!(
-            resolution.fallback_failure_class.as_deref(),
-            Some("fallback_builder_account_source_unverified")
-        );
-        assert_eq!(resolution.fallback_missing_roles, vec!["bonding_curve_v2"]);
-        assert_eq!(resolution.fallback_missing_pubkeys, vec![bcv2.clone()]);
-        assert!(resolution
-            .fallback_account_sources
-            .iter()
-            .any(|source| source == "observed_tx_account_meta"));
+        assert_eq!(resolution.fallback_failure_class, None);
+        assert!(resolution.fallback_missing_roles.is_empty());
+        assert!(resolution.fallback_missing_pubkeys.is_empty());
+        assert!(resolution.fallback_account_sources.is_empty());
         assert!(!resolution.fallback_simulation_load_account_set.is_empty());
         assert!(!resolution.fallback_required_precheck_account_set.is_empty());
-        let expected_reason = format!("primary_route_bcv2_missing:bonding_curve_v2:{bcv2}");
-        assert_eq!(
-            resolution.no_executable_route_account_set_reason.as_deref(),
-            Some(expected_reason.as_str())
-        );
+        assert_eq!(resolution.no_executable_route_account_set_reason, None);
     }
 
     #[test]
@@ -19110,6 +19210,60 @@ mod tests {
             resolution.no_executable_route_account_set_reason.as_deref(),
             Some(expected_reason.as_str())
         );
+    }
+
+    #[test]
+    fn p37_legacy_buy_creatable_and_ephemeral_missing_accounts_do_not_block_route() {
+        let mut request = test_prepared_buy_request();
+        let legacy_curve_pubkey = Pubkey::new_unique();
+        request.account_overrides.buy_variant = Some(trigger::PumpfunBuyVariant::LegacyBuy);
+        request.account_overrides.legacy_buy_curve = Some(p37_shadow_probe_test_legacy_curve());
+        request.account_overrides.legacy_buy_curve_pubkey = Some(legacy_curve_pubkey);
+        request.account_overrides.legacy_buy_curve_source =
+            Some("materialized_feature_set".to_string());
+        request.account_overrides.legacy_buy_curve_authority_status =
+            Some("authoritative_mfs".to_string());
+        request.payer_provenance = "ephemeral";
+        request.ata_missing_pre_submit = true;
+
+        let diagnostics = P37ShadowProbeAccountSetDiagnostics {
+            manifest: vec![p37_shadow_probe_test_legacy_curve_manifest_entry(
+                legacy_curve_pubkey,
+            )],
+            missing_candidates: vec![
+                P37ShadowProbeAccountNotFoundCandidate {
+                    pubkey: request.payer_pubkey.to_string(),
+                    role: "payer_pubkey".to_string(),
+                    source: "payer".to_string(),
+                    required: true,
+                    ..Default::default()
+                },
+                P37ShadowProbeAccountNotFoundCandidate {
+                    pubkey: request.user_ata.to_string(),
+                    role: "user_ata".to_string(),
+                    source: "user_ata".to_string(),
+                    required: true,
+                    ..Default::default()
+                },
+            ],
+            manifest_lookup_performed: true,
+            ..Default::default()
+        };
+
+        let resolution = p37_shadow_probe_route_resolution_diagnostics(
+            Some(&request),
+            Some(&diagnostics),
+            None,
+            None,
+        );
+
+        assert_eq!(
+            resolution.route_resolution_status.as_deref(),
+            Some("primary_route_ready")
+        );
+        assert_eq!(resolution.legacy_buy_route_ready, Some(true));
+        assert!(resolution.legacy_buy_missing_roles.is_empty());
+        assert!(resolution.legacy_buy_missing_pubkeys.is_empty());
     }
 
     #[test]

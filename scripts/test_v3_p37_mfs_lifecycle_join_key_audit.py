@@ -2028,6 +2028,52 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
             },
         )
 
+    def test_e4_legacy_buy_account_set_separation_counters_are_reported(self) -> None:
+        rows = [
+            {
+                "fallback_route_kind": "legacy_buy",
+                "fallback_account_sources": ["primary_route_account_set"],
+                "fallback_missing_roles": ["bonding_curve_v2"],
+                "fallback_required_precheck_account_set": [
+                    "bonding_curve_v2:bcv2:primary_route_account_set"
+                ],
+                "legacy_buy_route_ready": False,
+            },
+            {
+                "fallback_route_kind": "legacy_buy",
+                "fallback_creatable_account_set": [
+                    "user_ata:ata:user_ata",
+                    "user_volume_accumulator:uva:route_builder",
+                ],
+                "fallback_missing_roles": [],
+                "payer_provenance": "ephemeral",
+                "legacy_buy_route_ready": True,
+            },
+            {
+                "fallback_route_kind": "legacy_buy",
+                "fallback_missing_roles": ["associated_bonding_curve"],
+                "legacy_buy_route_ready": False,
+            },
+        ]
+
+        payload = audit.legacy_buy_route_payload(rows, [])
+
+        self.assertEqual(payload["legacy_buy_primary_bcv2_leak_rows"], 1)
+        self.assertEqual(payload["legacy_buy_missing_creatable_user_ata_rows"], 0)
+        self.assertEqual(
+            payload["legacy_buy_missing_creatable_user_volume_accumulator_rows"],
+            0,
+        )
+        self.assertEqual(payload["legacy_buy_missing_ephemeral_payer_rows"], 0)
+        self.assertEqual(payload["legacy_buy_non_blocking_missing_creatable_rows"], 1)
+        self.assertEqual(payload["legacy_buy_non_blocking_ephemeral_payer_rows"], 1)
+        self.assertEqual(payload["legacy_buy_blocking_missing_required_rows"], 2)
+        self.assertEqual(payload["legacy_buy_fallback_account_set_ready_rows"], 1)
+        self.assertEqual(
+            payload["legacy_buy_route_ready_after_account_set_separation_rows"],
+            1,
+        )
+
     def test_active_shadow_unattributed_account_not_found_blocks_readiness(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
