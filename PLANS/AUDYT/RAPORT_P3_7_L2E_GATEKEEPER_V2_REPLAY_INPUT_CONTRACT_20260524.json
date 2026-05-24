@@ -1,0 +1,121 @@
+{
+  "analysis_status": "pass",
+  "axis_readiness": {
+    "elapsed_aware_entry_drift": {
+      "axis_kind": "non_temporal",
+      "axis_status": "unsupported_v2_replay_input_gap",
+      "blocked_rows": 85,
+      "ready_rows": 0
+    },
+    "hhi_hard_fail_relaxed": {
+      "axis_kind": "non_temporal",
+      "axis_status": "unsupported_v2_replay_input_gap",
+      "blocked_rows": 85,
+      "ready_rows": 0
+    },
+    "prosperity_filter_disabled": {
+      "axis_kind": "non_temporal",
+      "axis_status": "unsupported_v2_replay_input_gap",
+      "blocked_rows": 85,
+      "ready_rows": 0
+    },
+    "soft_pdd_instead_of_hard_pdd": {
+      "axis_kind": "non_temporal",
+      "axis_status": "unsupported_v2_replay_input_gap",
+      "blocked_rows": 85,
+      "ready_rows": 0
+    },
+    "standard_mode_shorter_window": {
+      "axis_kind": "temporal",
+      "axis_status": "unsupported_temporal_snapshots_missing",
+      "blocked_rows": 85,
+      "ready_rows": 0
+    }
+  },
+  "blockers": [],
+  "final_decision": "BLOCK_L2E_HISTORICAL_ROWS_MISSING_V22_REPLAY_CONTRACT",
+  "input_support": {
+    "explicit_missing_field_counts": {},
+    "missing_contract_field_counts": {
+      "gatekeeper_v2_phase_pass_vector": 85,
+      "gatekeeper_v2_replay_input_schema_version": 85,
+      "gatekeeper_v2_replay_missing_fields": 85,
+      "gatekeeper_v2_replay_ready_non_temporal": 85,
+      "gatekeeper_v2_replay_ready_temporal": 85,
+      "observed_mode": 85,
+      "observed_stage": 85,
+      "observed_window_ms": 85
+    },
+    "namespace_non_temporal_ready_counts": {
+      "shadow-burnin-v3-p37-counterfactual-probe-r15-lifecycle-label-j4c-r1|not_ready": 42,
+      "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1|not_ready": 43
+    },
+    "namespace_temporal_ready_counts": {
+      "shadow-burnin-v3-p37-counterfactual-probe-r15-lifecycle-label-j4c-r1|not_ready": 42,
+      "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1|not_ready": 43
+    },
+    "non_temporal_ready_counts": {
+      "not_ready": 85
+    },
+    "schema_status_counts": {
+      "missing_v2_replay_contract": 85
+    },
+    "temporal_ready_counts": {
+      "not_ready": 85
+    }
+  },
+  "interpretation": {
+    "diagnostic_flags_not_used_as_causal_ablation": true,
+    "future_runs_must_emit_contract_at_decision_time": true,
+    "historical_l1r21_rows_precede_l2e_contract": true,
+    "temporal_axis_requires_decision_eval_snapshots": true,
+    "v3_replay_payload_is_not_gatekeeper_v2_axis_replay_input": true
+  },
+  "locked_denominator": {
+    "dirty_good_rate": 0.047058823529411764,
+    "namespace_counts": {
+      "shadow-burnin-v3-p37-counterfactual-probe-r15-lifecycle-label-j4c-r1": 42,
+      "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1": 43
+    },
+    "quality_counts": {
+      "buy_quality_bad": 81,
+      "buy_quality_dirty_good": 4
+    },
+    "rows": 85
+  },
+  "manifest_path": "PLANS/AUDYT/MANIFEST_P3_7_L1R21_L2_INPUT_DATASET_CONTRACT_20260524.json",
+  "non_goals": [
+    "no_runtime_started_by_this_script",
+    "no_threshold_tuning",
+    "no_phase_b",
+    "no_p2_live",
+    "no_new_runs_added_to_manifest",
+    "no_causal_axis_claim"
+  ],
+  "recommended_next_path": "run_r17_replay_ready_diagnostic_after_l2e_instrumentation",
+  "replay_input_contract": {
+    "contract_fields": [
+      "gatekeeper_v2_replay_input_schema_version",
+      "gatekeeper_v2_replay_ready_non_temporal",
+      "gatekeeper_v2_replay_ready_temporal",
+      "gatekeeper_v2_replay_missing_fields",
+      "gatekeeper_v2_phase_pass_vector",
+      "observed_mode",
+      "observed_window_ms",
+      "observed_stage"
+    ],
+    "non_temporal_axes": [
+      "soft_pdd_instead_of_hard_pdd",
+      "prosperity_filter_disabled",
+      "hhi_hard_fail_relaxed",
+      "elapsed_aware_entry_drift"
+    ],
+    "runtime_schema_version": 1,
+    "standard_mode_requires_decision_eval_snapshots": true,
+    "temporal_axes": [
+      "standard_mode_shorter_window"
+    ]
+  },
+  "report_name": "P3.7-L2E Gatekeeper V2 Replay Input Contract",
+  "schema_version": 1
+}

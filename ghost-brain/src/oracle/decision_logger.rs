@@ -81,7 +81,10 @@ pub const CYCLIC_LOG_SCHEMA_VERSION: u32 = 1;
 /// v19 adds typed `reason_code` (GatekeeperReasonCode enum, version 2)
 /// for all verdict types including TIMEOUT subtypes.
 /// v20 adds additive V3 P0 shadow/evidence sidecar fields on existing decision rows.
-pub const GATEKEEPER_BUY_LOG_SCHEMA_VERSION: u32 = 21;
+/// v21 adds ordered Gatekeeper gate trace diagnostics.
+/// v22 adds Gatekeeper V2 replay-input contract fields for manifest-locked
+/// offline axis replay.
+pub const GATEKEEPER_BUY_LOG_SCHEMA_VERSION: u32 = 22;
 /// Gatekeeper version string embedded in every V2.5 shadow BUY log for traceability.
 pub const GATEKEEPER_VERSION: &str = "v2.5";
 /// Legacy Gatekeeper version string for pre-V2.5 live-plane semantics.
@@ -1462,6 +1465,36 @@ pub struct GatekeeperBuyLog {
     pub gatekeeper_terminal_gate: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gatekeeper_gate_trace: Vec<GatekeeperGateTraceEntry>,
+
+    // ═══════════════════════════════════════════
+    // Gatekeeper V2 replay input contract (v22)
+    // ═══════════════════════════════════════════
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gatekeeper_v2_replay_input_schema_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gatekeeper_v2_replay_ready_non_temporal: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gatekeeper_v2_replay_ready_temporal: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gatekeeper_v2_replay_missing_fields: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gatekeeper_v2_phase_pass_vector: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_reject_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdd_soft_penalty_points: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdd_hard_fail_evaluated: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_fail_hhi_threshold: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_window_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_stage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_eval_snapshots: Option<serde_json::Value>,
 
     // ═══════════════════════════════════════════
     // V2.5 Adaptive Prosperity (APS) fields
@@ -3095,6 +3128,19 @@ mod tests {
             gatekeeper_first_kill_reason: None,
             gatekeeper_terminal_gate: None,
             gatekeeper_gate_trace: vec![],
+            gatekeeper_v2_replay_input_schema_version: None,
+            gatekeeper_v2_replay_ready_non_temporal: None,
+            gatekeeper_v2_replay_ready_temporal: None,
+            gatekeeper_v2_replay_missing_fields: vec![],
+            gatekeeper_v2_phase_pass_vector: None,
+            hard_reject_reason: None,
+            pdd_soft_penalty_points: None,
+            pdd_hard_fail_evaluated: None,
+            hard_fail_hhi_threshold: None,
+            observed_mode: None,
+            observed_window_ms: None,
+            observed_stage: None,
+            decision_eval_snapshots: None,
             aps_regime: None,
             aps_shadow_entry_drift_max: None,
             aps_shadow_confidence_min: None,
@@ -3574,6 +3620,19 @@ mod tests {
             gatekeeper_first_kill_reason: None,
             gatekeeper_terminal_gate: None,
             gatekeeper_gate_trace: vec![],
+            gatekeeper_v2_replay_input_schema_version: None,
+            gatekeeper_v2_replay_ready_non_temporal: None,
+            gatekeeper_v2_replay_ready_temporal: None,
+            gatekeeper_v2_replay_missing_fields: vec![],
+            gatekeeper_v2_phase_pass_vector: None,
+            hard_reject_reason: None,
+            pdd_soft_penalty_points: None,
+            pdd_hard_fail_evaluated: None,
+            hard_fail_hhi_threshold: None,
+            observed_mode: None,
+            observed_window_ms: None,
+            observed_stage: None,
+            decision_eval_snapshots: None,
             aps_regime: None,
             aps_shadow_entry_drift_max: None,
             aps_shadow_confidence_min: None,
@@ -3618,6 +3677,59 @@ mod tests {
             "pool_payload"
         );
         assert_eq!(record["v3_policy_config_payload"]["policy_version"], 1);
+    }
+
+    #[test]
+    fn test_gatekeeper_v2_replay_input_fields_serialize_only_when_populated() {
+        let mut log = create_test_buy_log();
+        let record = serde_json::to_value(&log).unwrap();
+        assert!(record
+            .get("gatekeeper_v2_replay_input_schema_version")
+            .is_none());
+        assert!(record
+            .get("gatekeeper_v2_replay_ready_non_temporal")
+            .is_none());
+        assert!(record.get("gatekeeper_v2_phase_pass_vector").is_none());
+        assert!(record.get("decision_eval_snapshots").is_none());
+
+        log.gatekeeper_v2_replay_input_schema_version = Some(1);
+        log.gatekeeper_v2_replay_ready_non_temporal = Some(true);
+        log.gatekeeper_v2_replay_ready_temporal = Some(false);
+        log.gatekeeper_v2_replay_missing_fields =
+            vec!["temporal:decision_eval_snapshots".to_string()];
+        log.gatekeeper_v2_phase_pass_vector = Some(serde_json::json!({
+            "phase1": true,
+            "phase2": true,
+            "phase3": true,
+            "phase4": true,
+            "phase5": true,
+            "phase6": true
+        }));
+        log.hard_reject_reason = Some("REJECT_CORE_FAIL".to_string());
+        log.pdd_soft_penalty_points = Some(3);
+        log.pdd_hard_fail_evaluated = Some(true);
+        log.hard_fail_hhi_threshold = Some(0.20);
+        log.observed_mode = Some("standard".to_string());
+        log.observed_window_ms = Some(5_000);
+        log.observed_stage = Some("terminal".to_string());
+        log.decision_eval_snapshots = Some(serde_json::json!([
+            {"elapsed_ms": 5_000, "stage": "terminal"}
+        ]));
+
+        let record = serde_json::to_value(&log).unwrap();
+        assert_eq!(record["gatekeeper_v2_replay_input_schema_version"], 1);
+        assert_eq!(record["gatekeeper_v2_replay_ready_non_temporal"], true);
+        assert_eq!(record["gatekeeper_v2_replay_ready_temporal"], false);
+        assert_eq!(
+            record["gatekeeper_v2_replay_missing_fields"][0],
+            "temporal:decision_eval_snapshots"
+        );
+        assert_eq!(record["gatekeeper_v2_phase_pass_vector"]["phase1"], true);
+        assert_eq!(record["pdd_soft_penalty_points"], 3);
+        assert_eq!(record["hard_fail_hhi_threshold"], 0.20);
+        assert_eq!(record["observed_mode"], "standard");
+        assert_eq!(record["observed_window_ms"], 5_000);
+        assert_eq!(record["decision_eval_snapshots"][0]["elapsed_ms"], 5_000);
     }
 
     #[test]

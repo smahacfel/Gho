@@ -2132,6 +2132,57 @@ impl GatekeeperAssessment {
         let (gatekeeper_first_kill_gate, gatekeeper_first_kill_reason) =
             self.gatekeeper_first_kill();
         let gatekeeper_terminal_gate = self.gatekeeper_terminal_gate();
+        let observed_stage = self
+            .observation_stage
+            .map(|stage| stage.as_str().to_string());
+        let pdd_soft_penalty_points = Some(
+            self.pdd_assessment
+                .as_ref()
+                .map_or(0, |pdd| pdd.soft_penalty_points),
+        );
+        let pdd_hard_fail_evaluated = Some(self.pdd_assessment.is_some());
+        let gatekeeper_v2_phase_pass_vector = Some(serde_json::json!({
+            "phase1": self.phase1_passed,
+            "phase2": self.phase2_passed,
+            "phase3": self.phase3_passed,
+            "phase4": self.phase4_passed,
+            "phase5": self.phase5_passed,
+            "phase6": self.phase6_passed,
+            "core1": self.decision.as_ref().map(|d| d.core1_passed),
+            "core2": self.decision.as_ref().map(|d| d.core2_passed),
+            "core3": self.decision.as_ref().map(|d| d.core3_passed),
+            "phases_passed": self.phases_passed,
+            "min_phases_to_pass": config.min_phases_to_pass,
+        }));
+        let hard_reject_reason = self.hard_reject_reason.clone().or_else(|| {
+            self.decision
+                .as_ref()
+                .and_then(|d| d.hard_fail_reason.clone())
+        });
+        let mut gatekeeper_v2_replay_missing_fields = Vec::new();
+        if gatekeeper_gate_trace.is_empty() {
+            gatekeeper_v2_replay_missing_fields
+                .push("non_temporal:gatekeeper_gate_trace".to_string());
+        }
+        if gatekeeper_terminal_gate.is_none() {
+            gatekeeper_v2_replay_missing_fields
+                .push("non_temporal:gatekeeper_terminal_gate".to_string());
+        }
+        if self.decision.is_none() {
+            gatekeeper_v2_replay_missing_fields.push("non_temporal:decision".to_string());
+            gatekeeper_v2_replay_missing_fields.push("non_temporal:soft_points".to_string());
+            gatekeeper_v2_replay_missing_fields.push("non_temporal:max_soft_points".to_string());
+        }
+        if self.phase3_diversity.is_none() {
+            gatekeeper_v2_replay_missing_fields.push("non_temporal:phase3_diversity".to_string());
+        }
+        if self.pdd_assessment.is_none() {
+            gatekeeper_v2_replay_missing_fields.push("non_temporal:pdd_assessment".to_string());
+        }
+        let gatekeeper_v2_replay_ready_non_temporal =
+            Some(gatekeeper_v2_replay_missing_fields.is_empty());
+        gatekeeper_v2_replay_missing_fields.push("temporal:decision_eval_snapshots".to_string());
+        let gatekeeper_v2_replay_ready_temporal = Some(false);
 
         GatekeeperBuyLog {
             log_schema_version: GATEKEEPER_BUY_LOG_SCHEMA_VERSION,
@@ -2796,7 +2847,7 @@ impl GatekeeperAssessment {
                 .iter()
                 .find(|s| s.window == ObservationStage::Normal)
                 .map(|s| s.phases_passed),
-            observation_stage: self.observation_stage.map(|s| s.as_str().to_string()),
+            observation_stage: observed_stage.clone(),
             v25_confidence: v25_model_confidence,
             v25_confidence_pre_veto: v25_confidence_breakdown
                 .map(|breakdown| breakdown.pre_veto_confidence),
@@ -2909,6 +2960,19 @@ impl GatekeeperAssessment {
             gatekeeper_first_kill_reason,
             gatekeeper_terminal_gate,
             gatekeeper_gate_trace,
+            gatekeeper_v2_replay_input_schema_version: Some(1),
+            gatekeeper_v2_replay_ready_non_temporal,
+            gatekeeper_v2_replay_ready_temporal,
+            gatekeeper_v2_replay_missing_fields,
+            gatekeeper_v2_phase_pass_vector,
+            hard_reject_reason,
+            pdd_soft_penalty_points,
+            pdd_hard_fail_evaluated,
+            hard_fail_hhi_threshold: Some(config.hard_fail_hhi),
+            observed_mode: Some(config.mode.to_string()),
+            observed_window_ms: Some(config.max_wait_time_ms),
+            observed_stage: observed_stage.clone(),
+            decision_eval_snapshots: None,
             aps_regime: self
                 .aps_diagnostics
                 .as_ref()
@@ -10355,6 +10419,28 @@ mod tests {
         assert_eq!(
             buy_log.soft_flags.as_deref(),
             Some("CURVE_FINALITY_PROVISIONAL")
+        );
+        assert_eq!(buy_log.gatekeeper_v2_replay_input_schema_version, Some(1));
+        assert_eq!(buy_log.gatekeeper_v2_replay_ready_temporal, Some(false));
+        assert!(buy_log
+            .gatekeeper_v2_replay_missing_fields
+            .contains(&"temporal:decision_eval_snapshots".to_string()));
+        assert!(buy_log
+            .gatekeeper_v2_replay_missing_fields
+            .contains(&"non_temporal:pdd_assessment".to_string()));
+        assert_eq!(buy_log.pdd_soft_penalty_points, Some(0));
+        assert_eq!(buy_log.pdd_hard_fail_evaluated, Some(false));
+        assert_eq!(buy_log.hard_fail_hhi_threshold, Some(config.hard_fail_hhi));
+        assert_eq!(buy_log.observed_mode.as_deref(), Some("standard"));
+        assert_eq!(buy_log.observed_window_ms, Some(config.max_wait_time_ms));
+        assert_eq!(buy_log.decision_eval_snapshots, None);
+        assert_eq!(
+            buy_log
+                .gatekeeper_v2_phase_pass_vector
+                .as_ref()
+                .and_then(|value| value.get("phase1"))
+                .and_then(|value| value.as_bool()),
+            Some(true)
         );
     }
 
