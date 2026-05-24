@@ -24,6 +24,7 @@ pub mod enhanced_candidate;
 pub mod errors;
 pub mod event_semantics;
 pub mod event_time;
+pub mod features;
 pub mod health;
 pub mod init_pool_parser;
 pub mod market_state;
