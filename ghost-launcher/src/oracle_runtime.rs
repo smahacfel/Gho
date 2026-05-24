@@ -5037,6 +5037,13 @@ struct P37ShadowProbeSelectionRecord {
     route_resolution_status: Option<String>,
     selected_route_kind: Option<String>,
     selected_route_reason: Option<String>,
+    selected_route_source: Option<String>,
+    selected_route_account_set_hash: Option<String>,
+    selected_route_account_set_roles: Vec<String>,
+    selected_route_precheck_hash: Option<String>,
+    selected_route_simulation_hash: Option<String>,
+    selected_route_handoff_status: Option<String>,
+    selected_route_handoff_reason: Option<String>,
     primary_route_kind: Option<String>,
     primary_route_ready: Option<bool>,
     primary_route_not_ready_reason: Option<String>,
@@ -5166,6 +5173,13 @@ struct P37ShadowProbeTransportRecord {
     route_resolution_status: Option<String>,
     selected_route_kind: Option<String>,
     selected_route_reason: Option<String>,
+    selected_route_source: Option<String>,
+    selected_route_account_set_hash: Option<String>,
+    selected_route_account_set_roles: Vec<String>,
+    selected_route_precheck_hash: Option<String>,
+    selected_route_simulation_hash: Option<String>,
+    selected_route_handoff_status: Option<String>,
+    selected_route_handoff_reason: Option<String>,
     primary_route_kind: Option<String>,
     primary_route_ready: Option<bool>,
     primary_route_not_ready_reason: Option<String>,
@@ -5594,6 +5608,13 @@ fn p37_shadow_probe_selection_record(
         route_resolution_status: None,
         selected_route_kind: None,
         selected_route_reason: None,
+        selected_route_source: None,
+        selected_route_account_set_hash: None,
+        selected_route_account_set_roles: Vec::new(),
+        selected_route_precheck_hash: None,
+        selected_route_simulation_hash: None,
+        selected_route_handoff_status: None,
+        selected_route_handoff_reason: None,
         primary_route_kind: None,
         primary_route_ready: None,
         primary_route_not_ready_reason: None,
@@ -5785,6 +5806,13 @@ fn p37_shadow_probe_artifact_records(
         route_resolution_status: record.route_resolution_status.clone(),
         selected_route_kind: record.selected_route_kind.clone(),
         selected_route_reason: record.selected_route_reason.clone(),
+        selected_route_source: record.selected_route_source.clone(),
+        selected_route_account_set_hash: record.selected_route_account_set_hash.clone(),
+        selected_route_account_set_roles: record.selected_route_account_set_roles.clone(),
+        selected_route_precheck_hash: record.selected_route_precheck_hash.clone(),
+        selected_route_simulation_hash: record.selected_route_simulation_hash.clone(),
+        selected_route_handoff_status: record.selected_route_handoff_status.clone(),
+        selected_route_handoff_reason: record.selected_route_handoff_reason.clone(),
         primary_route_kind: record.primary_route_kind.clone(),
         primary_route_ready: record.primary_route_ready,
         primary_route_not_ready_reason: record.primary_route_not_ready_reason.clone(),
@@ -5951,6 +5979,13 @@ fn p37_shadow_probe_artifact_records(
         route_resolution_status: record.route_resolution_status.clone(),
         selected_route_kind: record.selected_route_kind.clone(),
         selected_route_reason: record.selected_route_reason.clone(),
+        selected_route_source: record.selected_route_source.clone(),
+        selected_route_account_set_hash: record.selected_route_account_set_hash.clone(),
+        selected_route_account_set_roles: record.selected_route_account_set_roles.clone(),
+        selected_route_precheck_hash: record.selected_route_precheck_hash.clone(),
+        selected_route_simulation_hash: record.selected_route_simulation_hash.clone(),
+        selected_route_handoff_status: record.selected_route_handoff_status.clone(),
+        selected_route_handoff_reason: record.selected_route_handoff_reason.clone(),
         primary_route_kind: record.primary_route_kind.clone(),
         primary_route_ready: record.primary_route_ready,
         primary_route_not_ready_reason: record.primary_route_not_ready_reason.clone(),
@@ -7362,6 +7397,13 @@ struct P37ShadowProbeExecutionDiagnostics {
     route_resolution_status: Option<String>,
     selected_route_kind: Option<String>,
     selected_route_reason: Option<String>,
+    selected_route_source: Option<String>,
+    selected_route_account_set_hash: Option<String>,
+    selected_route_account_set_roles: Vec<String>,
+    selected_route_precheck_hash: Option<String>,
+    selected_route_simulation_hash: Option<String>,
+    selected_route_handoff_status: Option<String>,
+    selected_route_handoff_reason: Option<String>,
     primary_route_kind: Option<String>,
     primary_route_ready: Option<bool>,
     primary_route_not_ready_reason: Option<String>,
@@ -8705,10 +8747,21 @@ fn active_shadow_account_diagnostics_from_account_set(
     } else {
         precheck_status
     };
+    let selected_route_handoff =
+        p37_selected_route_handoff_diagnostics(request, account_set_diagnostics);
+    let active_shadow_lifecycle_eligibility_status = if !is_precheck_failure
+        && lifecycle_label_eligibility.as_deref() == Some("lifecycle_label_candidate")
+    {
+        "lifecycle_label_candidate"
+    } else {
+        "not_lifecycle_eligible"
+    };
 
     crate::events::ShadowSimulationAccountDiagnostics {
         active_shadow_precheck_status: Some(precheck_status.to_string()),
-        active_shadow_lifecycle_eligibility_status: Some("not_lifecycle_eligible".to_string()),
+        active_shadow_lifecycle_eligibility_status: Some(
+            active_shadow_lifecycle_eligibility_status.to_string(),
+        ),
         execution_feasibility_status,
         execution_feasibility_reason,
         route_resolution_terminal_reason,
@@ -8809,6 +8862,13 @@ fn active_shadow_account_diagnostics_from_account_set(
         route_resolution_status: route_resolution.route_resolution_status,
         selected_route_kind: route_resolution.selected_route_kind,
         selected_route_reason: route_resolution.selected_route_reason,
+        selected_route_source: selected_route_handoff.source,
+        selected_route_account_set_hash: selected_route_handoff.account_set_hash,
+        selected_route_account_set_roles: selected_route_handoff.account_set_roles,
+        selected_route_precheck_hash: selected_route_handoff.precheck_hash,
+        selected_route_simulation_hash: selected_route_handoff.simulation_hash,
+        selected_route_handoff_status: selected_route_handoff.status,
+        selected_route_handoff_reason: selected_route_handoff.reason,
         primary_route_kind: route_resolution.primary_route_kind,
         primary_route_ready: route_resolution.primary_route_ready,
         primary_route_not_ready_reason: route_resolution.primary_route_not_ready_reason,
@@ -9645,6 +9705,57 @@ fn p37_shadow_probe_required_account_roles_for_request(
         .collect()
 }
 
+#[derive(Debug, Clone, Default)]
+struct P37SelectedRouteHandoffDiagnostics {
+    source: Option<String>,
+    account_set_hash: Option<String>,
+    account_set_roles: Vec<String>,
+    precheck_hash: Option<String>,
+    simulation_hash: Option<String>,
+    status: Option<String>,
+    reason: Option<String>,
+}
+
+fn p37_selected_route_handoff_diagnostics(
+    request: Option<&crate::components::trigger::PreparedBuyRequest>,
+    account_set_diagnostics: Option<&P37ShadowProbeAccountSetDiagnostics>,
+) -> P37SelectedRouteHandoffDiagnostics {
+    let selected_route_is_legacy = request
+        .and_then(|request| request.account_overrides.buy_variant)
+        .is_some_and(|variant| matches!(variant, trigger::PumpfunBuyVariant::LegacyBuy));
+    if !selected_route_is_legacy {
+        return P37SelectedRouteHandoffDiagnostics::default();
+    }
+
+    let account_set_roles = p37_shadow_probe_required_account_roles_for_request(request);
+    let handoff_mismatch = account_set_roles
+        .iter()
+        .any(|role| role.starts_with("bonding_curve_v2:"));
+    let status = if handoff_mismatch {
+        "selected_route_handoff_mismatch"
+    } else {
+        "selected_route_handoff_applied"
+    };
+    let reason = if handoff_mismatch {
+        "selected_legacy_buy_request_still_requires_primary_bcv2"
+    } else {
+        "selected_legacy_buy_request_uses_legacy_account_set"
+    };
+
+    P37SelectedRouteHandoffDiagnostics {
+        source: Some("selected_fallback_route_execution_handoff".to_string()),
+        account_set_hash: account_set_diagnostics
+            .and_then(|diagnostics| diagnostics.prepared_request_account_set_hash.clone()),
+        account_set_roles,
+        precheck_hash: account_set_diagnostics
+            .and_then(|diagnostics| diagnostics.precheck_account_set_hash.clone()),
+        simulation_hash: account_set_diagnostics
+            .and_then(|diagnostics| diagnostics.simulation_account_set_hash.clone()),
+        status: Some(status.to_string()),
+        reason: Some(reason.to_string()),
+    }
+}
+
 fn p37_shadow_probe_execution_diagnostics(
     record: &P37ShadowProbeSelectionRecord,
     request: Option<&crate::components::trigger::PreparedBuyRequest>,
@@ -9728,6 +9839,8 @@ fn p37_shadow_probe_execution_diagnostics(
     let route_resolution_terminal_reason = route_resolution.terminal_reason();
     let (execution_feasibility_status, execution_feasibility_reason, lifecycle_label_eligibility) =
         route_resolution.execution_feasibility();
+    let selected_route_handoff =
+        p37_selected_route_handoff_diagnostics(request, account_set_diagnostics);
     P37ShadowProbeExecutionDiagnostics {
         precheck_failure_reason,
         simulation_error_kind: p37_shadow_probe_error_kind(error_message.as_deref()),
@@ -9795,6 +9908,13 @@ fn p37_shadow_probe_execution_diagnostics(
         route_resolution_status: route_resolution.route_resolution_status,
         selected_route_kind: route_resolution.selected_route_kind,
         selected_route_reason: route_resolution.selected_route_reason,
+        selected_route_source: selected_route_handoff.source,
+        selected_route_account_set_hash: selected_route_handoff.account_set_hash,
+        selected_route_account_set_roles: selected_route_handoff.account_set_roles,
+        selected_route_precheck_hash: selected_route_handoff.precheck_hash,
+        selected_route_simulation_hash: selected_route_handoff.simulation_hash,
+        selected_route_handoff_status: selected_route_handoff.status,
+        selected_route_handoff_reason: selected_route_handoff.reason,
         primary_route_kind: route_resolution.primary_route_kind,
         primary_route_ready: route_resolution.primary_route_ready,
         primary_route_not_ready_reason: route_resolution.primary_route_not_ready_reason,
@@ -10080,6 +10200,13 @@ fn p37_shadow_probe_transport_from_event(
         route_resolution_status: diagnostics.route_resolution_status,
         selected_route_kind: diagnostics.selected_route_kind,
         selected_route_reason: diagnostics.selected_route_reason,
+        selected_route_source: diagnostics.selected_route_source,
+        selected_route_account_set_hash: diagnostics.selected_route_account_set_hash,
+        selected_route_account_set_roles: diagnostics.selected_route_account_set_roles,
+        selected_route_precheck_hash: diagnostics.selected_route_precheck_hash,
+        selected_route_simulation_hash: diagnostics.selected_route_simulation_hash,
+        selected_route_handoff_status: diagnostics.selected_route_handoff_status,
+        selected_route_handoff_reason: diagnostics.selected_route_handoff_reason,
         primary_route_kind: diagnostics.primary_route_kind,
         primary_route_ready: diagnostics.primary_route_ready,
         primary_route_not_ready_reason: diagnostics.primary_route_not_ready_reason,
@@ -10314,6 +10441,13 @@ fn p37_shadow_probe_transport_from_error(
         route_resolution_status: diagnostics.route_resolution_status,
         selected_route_kind: diagnostics.selected_route_kind,
         selected_route_reason: diagnostics.selected_route_reason,
+        selected_route_source: diagnostics.selected_route_source,
+        selected_route_account_set_hash: diagnostics.selected_route_account_set_hash,
+        selected_route_account_set_roles: diagnostics.selected_route_account_set_roles,
+        selected_route_precheck_hash: diagnostics.selected_route_precheck_hash,
+        selected_route_simulation_hash: diagnostics.selected_route_simulation_hash,
+        selected_route_handoff_status: diagnostics.selected_route_handoff_status,
+        selected_route_handoff_reason: diagnostics.selected_route_handoff_reason,
         primary_route_kind: diagnostics.primary_route_kind,
         primary_route_ready: diagnostics.primary_route_ready,
         primary_route_not_ready_reason: diagnostics.primary_route_not_ready_reason,
@@ -10511,6 +10645,13 @@ fn enrich_probe_shadow_entry(
     entry.route_resolution_status = transport.route_resolution_status.clone();
     entry.selected_route_kind = transport.selected_route_kind.clone();
     entry.selected_route_reason = transport.selected_route_reason.clone();
+    entry.selected_route_source = transport.selected_route_source.clone();
+    entry.selected_route_account_set_hash = transport.selected_route_account_set_hash.clone();
+    entry.selected_route_account_set_roles = transport.selected_route_account_set_roles.clone();
+    entry.selected_route_precheck_hash = transport.selected_route_precheck_hash.clone();
+    entry.selected_route_simulation_hash = transport.selected_route_simulation_hash.clone();
+    entry.selected_route_handoff_status = transport.selected_route_handoff_status.clone();
+    entry.selected_route_handoff_reason = transport.selected_route_handoff_reason.clone();
     entry.primary_route_kind = transport.primary_route_kind.clone();
     entry.primary_route_ready = transport.primary_route_ready;
     entry.primary_route_not_ready_reason = transport.primary_route_not_ready_reason.clone();
@@ -10649,26 +10790,49 @@ async fn run_p37_shadow_probe_dispatch(
             return;
         }
     };
-
-    let bonding_curve_v2_authority =
-        p37_shadow_probe_bonding_curve_v2_authority_diagnostics(Some(&request), None);
-    if bonding_curve_v2_authority
-        .non_authoritative_reason()
-        .is_some()
+    let request = match p37_apply_selected_fallback_route_handoff_for_shadow_only(
+        trigger_component.as_ref(),
+        buy_mint,
+        request,
+    )
+    .await
     {
-        let skip_record = p37_shadow_probe_as_bonding_curve_v2_source_precheck_skip(
-            record.clone(),
-            bonding_curve_v2_authority,
-        );
-        if let Err(err) = append_p37_shadow_probe_record(&config, &skip_record).await {
+        Ok(request) => request,
+        Err(err) => {
             warn!(
-                probe_id = ?skip_record.probe_id,
-                source_ab_record_id = ?skip_record.source_ab_record_id,
+                probe_id = ?record.probe_id,
+                source_ab_record_id = ?record.source_ab_record_id,
                 error = %err,
-                "P37_SHADOW_PROBE_BONDING_CURVE_V2_SOURCE_PRECHECK_SKIP_WRITE_FAILED"
+                "P37_SHADOW_PROBE_SELECTED_FALLBACK_HANDOFF_FAILED"
             );
+            return;
         }
-        return;
+    };
+
+    if !matches!(
+        request.account_overrides.buy_variant,
+        Some(trigger::PumpfunBuyVariant::LegacyBuy)
+    ) {
+        let bonding_curve_v2_authority =
+            p37_shadow_probe_bonding_curve_v2_authority_diagnostics(Some(&request), None);
+        if bonding_curve_v2_authority
+            .non_authoritative_reason()
+            .is_some()
+        {
+            let skip_record = p37_shadow_probe_as_bonding_curve_v2_source_precheck_skip(
+                record.clone(),
+                bonding_curve_v2_authority,
+            );
+            if let Err(err) = append_p37_shadow_probe_record(&config, &skip_record).await {
+                warn!(
+                    probe_id = ?skip_record.probe_id,
+                    source_ab_record_id = ?skip_record.source_ab_record_id,
+                    error = %err,
+                    "P37_SHADOW_PROBE_BONDING_CURVE_V2_SOURCE_PRECHECK_SKIP_WRITE_FAILED"
+                );
+            }
+            return;
+        }
     }
 
     match p37_shadow_probe_wait_for_required_account_readiness(
@@ -12822,6 +12986,82 @@ async fn execute_gatekeeper_buy_via_trigger(
     .await
 }
 
+fn p37_selected_legacy_buy_fallback_overrides(
+    primary_request: &crate::components::trigger::PreparedBuyRequest,
+) -> Option<crate::components::trigger::BuyAccountOverrides> {
+    if !matches!(
+        primary_request.account_overrides.buy_variant,
+        Some(trigger::PumpfunBuyVariant::RoutedExactSolIn)
+    ) {
+        return None;
+    }
+    if primary_request.account_overrides.legacy_buy_curve.is_none() {
+        return None;
+    }
+    let mut fallback = primary_request.account_overrides.clone();
+    fallback.buy_variant = Some(trigger::PumpfunBuyVariant::LegacyBuy);
+    fallback.bonding_curve_v2 = None;
+    fallback.bonding_curve_v2_provenance = None;
+    Some(fallback)
+}
+
+async fn p37_apply_selected_fallback_route_handoff_for_shadow_only(
+    trigger_component: &crate::components::trigger::TriggerComponent,
+    buy_mint: Pubkey,
+    primary_request: crate::components::trigger::PreparedBuyRequest,
+) -> anyhow::Result<crate::components::trigger::PreparedBuyRequest> {
+    if !matches!(
+        trigger_component.entry_mode(),
+        crate::config::TriggerEntryMode::ShadowOnly
+    ) {
+        return Ok(primary_request);
+    }
+    let Some(primary_bcv2_reason) =
+        p37_shadow_probe_bonding_curve_v2_source_precheck_reason(&primary_request)
+    else {
+        return Ok(primary_request);
+    };
+    let primary_account_set =
+        p37_shadow_probe_account_set_diagnostics(trigger_component, &primary_request).await;
+    let primary_resolution = p37_shadow_probe_route_resolution_diagnostics(
+        Some(&primary_request),
+        Some(&primary_account_set),
+        Some(primary_bcv2_reason.as_str()),
+        None,
+    );
+    if primary_resolution.route_resolution_status.as_deref() != Some("fallback_route_ready")
+        || primary_resolution.selected_route_kind.as_deref() != Some("legacy_buy")
+        || primary_resolution.fallback_route_ready != Some(true)
+    {
+        return Ok(primary_request);
+    }
+    let Some(fallback_overrides) = p37_selected_legacy_buy_fallback_overrides(&primary_request)
+    else {
+        return Ok(primary_request);
+    };
+    let mut fallback_request = trigger_component
+        .prepare_buy_request_with_decision_ts_and_amount_lamports(
+            &buy_mint,
+            &fallback_overrides,
+            primary_request.tip_lamports,
+            Some(primary_request.decision_ts_ms),
+            Some(primary_request.amount_lamports),
+        )
+        .await?
+        .with_join_metadata(primary_request.join_metadata.clone());
+    info!(
+        mint = %buy_mint,
+        primary_route_not_ready_reason = %primary_bcv2_reason,
+        selected_route_kind = "legacy_buy",
+        "P3.7 selected fallback route handoff applied for shadow-only execution"
+    );
+    fallback_request.account_overrides.bonding_curve_v2 = None;
+    fallback_request
+        .account_overrides
+        .bonding_curve_v2_provenance = None;
+    Ok(fallback_request)
+}
+
 fn trigger_dispatch_failure_context_with_join_metadata(
     trigger_component: &crate::components::trigger::TriggerComponent,
     tip_lamports: u64,
@@ -12843,22 +13083,27 @@ async fn active_shadow_simulation_load_precheck_receipt(
         return None;
     }
 
-    if let Some(reason) = p37_shadow_probe_bonding_curve_v2_source_precheck_reason(request) {
-        let route_resolution = p37_shadow_probe_route_resolution_diagnostics(
-            Some(request),
-            None,
-            Some(reason.as_str()),
-            None,
-        );
-        let error = route_resolution.no_executable_reason().unwrap_or(reason);
-        return Some(crate::components::trigger::TriggerDispatchReceipt {
-            primary_outcome: Err(anyhow::anyhow!("{error}")),
-            shadow_task: None,
-            active_position_lease: None,
-            retain_position_slot_on_error: false,
-            failed_request: Some(request.clone()),
-            failed_context: None,
-        });
+    if !matches!(
+        request.account_overrides.buy_variant,
+        Some(trigger::PumpfunBuyVariant::LegacyBuy)
+    ) {
+        if let Some(reason) = p37_shadow_probe_bonding_curve_v2_source_precheck_reason(request) {
+            let route_resolution = p37_shadow_probe_route_resolution_diagnostics(
+                Some(request),
+                None,
+                Some(reason.as_str()),
+                None,
+            );
+            let error = route_resolution.no_executable_reason().unwrap_or(reason);
+            return Some(crate::components::trigger::TriggerDispatchReceipt {
+                primary_outcome: Err(anyhow::anyhow!("{error}")),
+                shadow_task: None,
+                active_position_lease: None,
+                retain_position_slot_on_error: false,
+                failed_request: Some(request.clone()),
+                failed_context: None,
+            });
+        }
     }
 
     let precheck_result = trigger_component
@@ -12942,6 +13187,31 @@ async fn execute_gatekeeper_buy_via_trigger_with_fsc_gate(
                         } else {
                             prepared_buy
                         };
+                        let prepared_buy =
+                            match p37_apply_selected_fallback_route_handoff_for_shadow_only(
+                                trigger_component,
+                                buy_mint,
+                                prepared_buy,
+                            )
+                            .await
+                            {
+                                Ok(prepared_buy) => prepared_buy,
+                                Err(e) => {
+                                    return crate::components::trigger::TriggerDispatchReceipt {
+                                        primary_outcome: Err(e),
+                                        shadow_task: None,
+                                        active_position_lease: None,
+                                        retain_position_slot_on_error: false,
+                                        failed_request: None,
+                                        failed_context:
+                                            trigger_dispatch_failure_context_with_join_metadata(
+                                                trigger_component,
+                                                tip_lamports,
+                                                join_metadata.as_ref(),
+                                            ),
+                                    };
+                                }
+                            };
                         if let Some(receipt) = active_shadow_simulation_load_precheck_receipt(
                             trigger_component,
                             &prepared_buy,
@@ -13030,10 +13300,33 @@ async fn execute_gatekeeper_buy_via_trigger_with_fsc_gate(
             .await
         {
             Ok(prepared_buy) => {
-                let prepared_buy = if let Some(metadata) = join_metadata {
+                let prepared_buy = if let Some(metadata) = join_metadata.clone() {
                     prepared_buy.with_join_metadata(metadata)
                 } else {
                     prepared_buy
+                };
+                let prepared_buy = match p37_apply_selected_fallback_route_handoff_for_shadow_only(
+                    trigger_component,
+                    buy_mint,
+                    prepared_buy,
+                )
+                .await
+                {
+                    Ok(prepared_buy) => prepared_buy,
+                    Err(e) => {
+                        return crate::components::trigger::TriggerDispatchReceipt {
+                            primary_outcome: Err(e),
+                            shadow_task: None,
+                            active_position_lease: None,
+                            retain_position_slot_on_error: false,
+                            failed_request: None,
+                            failed_context: trigger_dispatch_failure_context_with_join_metadata(
+                                trigger_component,
+                                tip_lamports,
+                                join_metadata.as_ref(),
+                            ),
+                        };
+                    }
                 };
                 if let Some(receipt) = active_shadow_simulation_load_precheck_receipt(
                     trigger_component,
@@ -13375,6 +13668,31 @@ fn shadow_entry_record_from_event(
         route_resolution_status: None,
         selected_route_kind: None,
         selected_route_reason: None,
+        selected_route_source: event.account_diagnostics.selected_route_source.clone(),
+        selected_route_account_set_hash: event
+            .account_diagnostics
+            .selected_route_account_set_hash
+            .clone(),
+        selected_route_account_set_roles: event
+            .account_diagnostics
+            .selected_route_account_set_roles
+            .clone(),
+        selected_route_precheck_hash: event
+            .account_diagnostics
+            .selected_route_precheck_hash
+            .clone(),
+        selected_route_simulation_hash: event
+            .account_diagnostics
+            .selected_route_simulation_hash
+            .clone(),
+        selected_route_handoff_status: event
+            .account_diagnostics
+            .selected_route_handoff_status
+            .clone(),
+        selected_route_handoff_reason: event
+            .account_diagnostics
+            .selected_route_handoff_reason
+            .clone(),
         primary_route_kind: None,
         primary_route_ready: None,
         primary_route_not_ready_reason: None,
@@ -13555,6 +13873,13 @@ fn shadow_entry_record_from_request(
         route_resolution_status: None,
         selected_route_kind: None,
         selected_route_reason: None,
+        selected_route_source: None,
+        selected_route_account_set_hash: None,
+        selected_route_account_set_roles: Vec::new(),
+        selected_route_precheck_hash: None,
+        selected_route_simulation_hash: None,
+        selected_route_handoff_status: None,
+        selected_route_handoff_reason: None,
         primary_route_kind: None,
         primary_route_ready: None,
         primary_route_not_ready_reason: None,
@@ -14156,6 +14481,20 @@ struct ShadowEntryRecord {
     selected_route_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     selected_route_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected_route_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected_route_account_set_hash: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    selected_route_account_set_roles: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected_route_precheck_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected_route_simulation_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected_route_handoff_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected_route_handoff_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     primary_route_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -19100,6 +19439,66 @@ mod tests {
         assert!(!resolution.fallback_simulation_load_account_set.is_empty());
         assert!(!resolution.fallback_required_precheck_account_set.is_empty());
         assert_eq!(resolution.no_executable_route_account_set_reason, None);
+    }
+
+    #[test]
+    fn p37_selected_legacy_buy_fallback_overrides_clear_primary_bcv2() {
+        let mut request = test_prepared_buy_request();
+        request.account_overrides.buy_variant = Some(trigger::PumpfunBuyVariant::RoutedExactSolIn);
+        request.account_overrides.legacy_buy_curve = Some(p37_shadow_probe_test_legacy_curve());
+        request.account_overrides.legacy_buy_curve_pubkey = Some(Pubkey::new_unique());
+        request.account_overrides.bonding_curve_v2 = Some(Pubkey::new_unique());
+
+        let fallback =
+            p37_selected_legacy_buy_fallback_overrides(&request).expect("fallback overrides");
+
+        assert_eq!(
+            fallback.buy_variant,
+            Some(trigger::PumpfunBuyVariant::LegacyBuy)
+        );
+        assert!(fallback.legacy_buy_curve.is_some());
+        assert!(fallback.legacy_buy_curve_pubkey.is_some());
+        assert_eq!(fallback.bonding_curve_v2, None);
+        assert_eq!(fallback.bonding_curve_v2_provenance, None);
+    }
+
+    #[test]
+    fn p37_selected_legacy_buy_fallback_handoff_uses_legacy_account_set() {
+        let mut request = test_prepared_buy_request();
+        request.account_overrides.buy_variant = Some(trigger::PumpfunBuyVariant::LegacyBuy);
+        request.account_overrides.legacy_buy_curve = Some(p37_shadow_probe_test_legacy_curve());
+        request.account_overrides.legacy_buy_curve_pubkey = Some(Pubkey::new_unique());
+        let account_set = P37ShadowProbeAccountSetDiagnostics {
+            precheck_account_set_hash: Some("legacy-precheck".to_string()),
+            prepared_request_account_set_hash: Some("legacy-prepared".to_string()),
+            simulation_account_set_hash: Some("legacy-simulation".to_string()),
+            ..Default::default()
+        };
+
+        let handoff = p37_selected_route_handoff_diagnostics(Some(&request), Some(&account_set));
+
+        assert_eq!(
+            handoff.source.as_deref(),
+            Some("selected_fallback_route_execution_handoff")
+        );
+        assert_eq!(
+            handoff.status.as_deref(),
+            Some("selected_route_handoff_applied")
+        );
+        assert_eq!(
+            handoff.reason.as_deref(),
+            Some("selected_legacy_buy_request_uses_legacy_account_set")
+        );
+        assert_eq!(handoff.precheck_hash.as_deref(), Some("legacy-precheck"));
+        assert_eq!(handoff.account_set_hash.as_deref(), Some("legacy-prepared"));
+        assert_eq!(
+            handoff.simulation_hash.as_deref(),
+            Some("legacy-simulation")
+        );
+        assert!(!handoff
+            .account_set_roles
+            .iter()
+            .any(|role| role.starts_with("bonding_curve_v2:")));
     }
 
     #[test]

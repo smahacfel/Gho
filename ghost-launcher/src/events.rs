@@ -198,6 +198,20 @@ pub struct ShadowSimulationAccountDiagnostics {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_route_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_route_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_route_account_set_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selected_route_account_set_roles: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_route_precheck_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_route_simulation_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_route_handoff_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_route_handoff_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub primary_route_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub primary_route_ready: Option<bool>,

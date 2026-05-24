@@ -686,6 +686,41 @@ def legacy_buy_route_ready(row: dict[str, Any]) -> bool:
     )
 
 
+def selected_legacy_fallback_route_ready(row: dict[str, Any]) -> bool:
+    selected_legacy = row_string(row, "selected_route_kind") in {"legacy_buy", "LegacyBuy"}
+    if not selected_legacy:
+        return False
+    if (
+        row_string(row, "route_resolution_status") == "fallback_route_ready"
+        and row_bool_string(row, "fallback_route_ready") == "true"
+    ):
+        return True
+    return (
+        row_string(row, "selected_route_source")
+        == "selected_fallback_route_execution_handoff"
+        and row_string(row, "selected_route_handoff_status")
+        == "selected_route_handoff_applied"
+    )
+
+
+def row_primary_bcv2_terminal_reason(row: dict[str, Any]) -> bool:
+    joined = ":".join(
+        filter(
+            None,
+            [
+                row_string(row, "no_executable_route_account_set_reason"),
+                row_string(row, "precheck_failure_reason"),
+                row_string(row, "execution_account_readiness_reason"),
+                row_string(row, "primary_route_not_ready_reason"),
+            ],
+        )
+    )
+    return "primary_route_bcv2_missing" in joined or (
+        "bonding_curve_v2_observed_meta_missing_on_rpc" in joined
+        and "no_executable_route_account_set" in joined
+    )
+
+
 def legacy_buy_missing_core_curve(row: dict[str, Any]) -> bool:
     return (
         row_string(row, "legacy_buy_route_not_ready_reason")
@@ -860,6 +895,38 @@ def legacy_buy_route_payload(
         if row_string(row, "payer_provenance") == "ephemeral"
         and "payer_pubkey" not in set(row_string_list(row, "fallback_missing_roles"))
     ]
+    selected_fallback_ready_rows = [
+        row for row in attempted_rows if selected_legacy_fallback_route_ready(row)
+    ]
+    selected_fallback_handoff_applied_rows = [
+        row
+        for row in selected_fallback_ready_rows
+        if row_string(row, "selected_route_handoff_status")
+        == "selected_route_handoff_applied"
+    ]
+    selected_fallback_handoff_mismatch_rows = [
+        row
+        for row in selected_fallback_ready_rows
+        if row_string(row, "selected_route_handoff_status")
+        == "selected_route_handoff_mismatch"
+    ]
+    selected_fallback_blocked_by_primary_reason_rows = [
+        row
+        for row in selected_fallback_ready_rows
+        if row_primary_bcv2_terminal_reason(row)
+    ]
+    selected_precheck_uses_legacy_rows = [
+        row
+        for row in selected_fallback_handoff_applied_rows
+        if row_string(row, "selected_route_precheck_hash")
+        and not row_primary_bcv2_terminal_reason(row)
+    ]
+    selected_simulation_uses_legacy_rows = [
+        row
+        for row in selected_fallback_handoff_applied_rows
+        if row_string(row, "selected_route_simulation_hash")
+        and not row_primary_bcv2_terminal_reason(row)
+    ]
     return {
         "legacy_buy_route_attempted_rows": len(attempted_rows),
         "legacy_buy_route_ready_rows": len(ready_rows),
@@ -926,6 +993,25 @@ def legacy_buy_route_payload(
         "legacy_buy_fallback_account_set_ready_rows": len(ready_rows),
         "legacy_buy_route_ready_after_account_set_separation_rows": len(
             ready_rows
+        ),
+        "selected_fallback_route_ready_rows": len(selected_fallback_ready_rows),
+        "selected_fallback_route_handoff_applied_rows": len(
+            selected_fallback_handoff_applied_rows
+        ),
+        "selected_fallback_route_handoff_mismatch_rows": len(
+            selected_fallback_handoff_mismatch_rows
+        ),
+        "selected_fallback_route_blocked_by_primary_reason_rows": len(
+            selected_fallback_blocked_by_primary_reason_rows
+        ),
+        "legacy_buy_selected_but_primary_bcv2_terminal_rows": len(
+            selected_fallback_blocked_by_primary_reason_rows
+        ),
+        "legacy_buy_selected_and_precheck_uses_legacy_account_set_rows": len(
+            selected_precheck_uses_legacy_rows
+        ),
+        "legacy_buy_selected_and_simulation_uses_legacy_account_set_rows": len(
+            selected_simulation_uses_legacy_rows
         ),
     }
 
@@ -3070,6 +3156,13 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- active_shadow_legacy_buy_non_blocking_ephemeral_payer_rows: `{active_shadow['active_shadow_legacy_buy_non_blocking_ephemeral_payer_rows']}`",
             f"- active_shadow_legacy_buy_fallback_account_set_ready_rows: `{active_shadow['active_shadow_legacy_buy_fallback_account_set_ready_rows']}`",
             f"- active_shadow_legacy_buy_route_ready_after_account_set_separation_rows: `{active_shadow['active_shadow_legacy_buy_route_ready_after_account_set_separation_rows']}`",
+            f"- active_shadow_selected_fallback_route_ready_rows: `{active_shadow['active_shadow_selected_fallback_route_ready_rows']}`",
+            f"- active_shadow_selected_fallback_route_handoff_applied_rows: `{active_shadow['active_shadow_selected_fallback_route_handoff_applied_rows']}`",
+            f"- active_shadow_selected_fallback_route_handoff_mismatch_rows: `{active_shadow['active_shadow_selected_fallback_route_handoff_mismatch_rows']}`",
+            f"- active_shadow_selected_fallback_route_blocked_by_primary_reason_rows: `{active_shadow['active_shadow_selected_fallback_route_blocked_by_primary_reason_rows']}`",
+            f"- active_shadow_legacy_buy_selected_but_primary_bcv2_terminal_rows: `{active_shadow['active_shadow_legacy_buy_selected_but_primary_bcv2_terminal_rows']}`",
+            f"- active_shadow_legacy_buy_selected_and_precheck_uses_legacy_account_set_rows: `{active_shadow['active_shadow_legacy_buy_selected_and_precheck_uses_legacy_account_set_rows']}`",
+            f"- active_shadow_legacy_buy_selected_and_simulation_uses_legacy_account_set_rows: `{active_shadow['active_shadow_legacy_buy_selected_and_simulation_uses_legacy_account_set_rows']}`",
             f"- active_shadow_fallback_failure_class_counts: `{json.dumps(active_shadow['active_shadow_fallback_failure_class_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- active_shadow_fallback_missing_role_counts: `{json.dumps(active_shadow['active_shadow_fallback_missing_role_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- active_shadow_fallback_account_source_counts: `{json.dumps(active_shadow['active_shadow_fallback_account_source_counts'], ensure_ascii=False, sort_keys=True)}`",
@@ -3169,6 +3262,13 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- legacy_buy_non_blocking_ephemeral_payer_rows: `{materialization['legacy_buy_non_blocking_ephemeral_payer_rows']}`",
             f"- legacy_buy_fallback_account_set_ready_rows: `{materialization['legacy_buy_fallback_account_set_ready_rows']}`",
             f"- legacy_buy_route_ready_after_account_set_separation_rows: `{materialization['legacy_buy_route_ready_after_account_set_separation_rows']}`",
+            f"- selected_fallback_route_ready_rows: `{materialization['selected_fallback_route_ready_rows']}`",
+            f"- selected_fallback_route_handoff_applied_rows: `{materialization['selected_fallback_route_handoff_applied_rows']}`",
+            f"- selected_fallback_route_handoff_mismatch_rows: `{materialization['selected_fallback_route_handoff_mismatch_rows']}`",
+            f"- selected_fallback_route_blocked_by_primary_reason_rows: `{materialization['selected_fallback_route_blocked_by_primary_reason_rows']}`",
+            f"- legacy_buy_selected_but_primary_bcv2_terminal_rows: `{materialization['legacy_buy_selected_but_primary_bcv2_terminal_rows']}`",
+            f"- legacy_buy_selected_and_precheck_uses_legacy_account_set_rows: `{materialization['legacy_buy_selected_and_precheck_uses_legacy_account_set_rows']}`",
+            f"- legacy_buy_selected_and_simulation_uses_legacy_account_set_rows: `{materialization['legacy_buy_selected_and_simulation_uses_legacy_account_set_rows']}`",
             f"- fallback_failure_class_counts: `{json.dumps(materialization['fallback_failure_class_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- fallback_missing_role_counts: `{json.dumps(materialization['fallback_missing_role_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- fallback_account_source_counts: `{json.dumps(materialization['fallback_account_source_counts'], ensure_ascii=False, sort_keys=True)}`",
