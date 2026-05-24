@@ -1,0 +1,467 @@
+{
+  "actual_contract": {
+    "allowed_runs": [
+      "shadow-burnin-v3-p37-counterfactual-probe-r15-lifecycle-label-j4c-r1",
+      "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1"
+    ],
+    "blocked_runs": [
+      "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r10-route-bcv2-source",
+      "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r11-bcv2-readiness",
+      "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r12-bcv2-provenance",
+      "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r13-executable-route-resolver",
+      "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r3",
+      "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r4-account-attribution",
+      "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r5-candidate-narrowing",
+      "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r6-bcv2-contract",
+      "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r7-active-shadow-attribution",
+      "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r8-active-shadow-report-attribution",
+      "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r9-active-shadow-bcv2-precheck"
+    ],
+    "buy_quality_denominator_rows": 85,
+    "buy_quality_dirty_good": 4,
+    "dirty_good_rate": 0.047058823529411764,
+    "excluded_non_executable_rows": 3956,
+    "excluded_unsupported_route_rows": 11
+  },
+  "allowed_run_manifests": [
+    {
+      "artifacts": [
+        {
+          "bytes": 5077,
+          "exists": true,
+          "jsonl_rows": null,
+          "path": "/root/Gho/configs/rollout/shadow-burnin-v3-p37-counterfactual-probe-r15-lifecycle-label-j4c-r1.toml",
+          "role": "config",
+          "sha256": "76ea2b6ab49c855d4c00f65f15e96348015c433460aee1fb3f6e02686c30b24b"
+        },
+        {
+          "bytes": 62574,
+          "exists": true,
+          "jsonl_rows": 2,
+          "path": "/root/Gho/logs/rollout/shadow-burnin-v3-p37-counterfactual-probe-r15-lifecycle-label-j4c-r1/decisions/shadow-burnin-v3-p37-counterfactual-probe-r15-lifecycle-label-j4c-r1/v2.2/legacy_live/eb9f928e8c86d717aeac49a118fe3e0fa5cd094c9ecc16ad09d371ad54b0e581/gatekeeper_v2_buys.jsonl",
+          "role": "decision",
+          "sha256": "7dd5c12ddfee037fe77243b83d3943e09c1acbb6e019dc3fb0e57ef72047d9c8"
+        },
+        {
+          "bytes": 59124748,
+          "exists": true,
+          "jsonl_rows": 2075,
+          "path": "/root/Gho/logs/rollout/shadow-burnin-v3-p37-counterfactual-probe-r15-lifecycle-label-j4c-r1/decisions/shadow-burnin-v3-p37-counterfactual-probe-r15-lifecycle-label-j4c-r1/v2.2/legacy_live/eb9f928e8c86d717aeac49a118fe3e0fa5cd094c9ecc16ad09d371ad54b0e581/gatekeeper_v2_decisions.jsonl",
+          "role": "decision",
+          "sha256": "21fc00ab878749235d2880b16ce63475039865a2227ed6f5403f9dbe27545641"
+        },
+        {
+          "bytes": 8285190,
+          "exists": true,
+          "jsonl_rows": 267,
+          "path": "/root/Gho/logs/rollout/shadow-burnin-v3-p37-counterfactual-probe-r15-lifecycle-label-j4c-r1/decisions/shadow-burnin-v3-p37-counterfactual-probe-r15-lifecycle-label-j4c-r1/v2.5/v25_shadow/eb9f928e8c86d717aeac49a118fe3e0fa5cd094c9ecc16ad09d371ad54b0e581/gatekeeper_v2_decisions.jsonl",
+          "role": "decision",
+          "sha256": "421f360718e6db54999c63f5fd0b5d187f5776ee08f7c685d12d684289a5424d"
+        },
+        {
+          "bytes": 97915,
+          "exists": true,
+          "jsonl_rows": 50,
+          "path": "/root/Gho/logs/shadow_run/shadow-burnin-v3-p37-counterfactual-probe-r15-lifecycle-label-j4c-r1/probe_shadow_entries.jsonl",
+          "role": "probe_entry",
+          "sha256": "d1fa4c503e427f7c157b42683717d9ccce2aa6c89dfebf684c36294de21a650d"
+        },
+        {
+          "bytes": 167268,
+          "exists": true,
+          "jsonl_rows": 84,
+          "path": "/root/Gho/logs/shadow_run/shadow-burnin-v3-p37-counterfactual-probe-r15-lifecycle-label-j4c-r1/probe_shadow_lifecycle.jsonl",
+          "role": "probe_lifecycle",
+          "sha256": "fe38b800fb8cda1c0b00b2e33fba6e695817559d90f7b8ac0f81505c9b02414b"
+        },
+        {
+          "bytes": 522984,
+          "exists": true,
+          "jsonl_rows": 151,
+          "path": "/root/Gho/logs/shadow_run/shadow-burnin-v3-p37-counterfactual-probe-r15-lifecycle-label-j4c-r1/probe_selection.jsonl",
+          "role": "probe_selection",
+          "sha256": "5564d86f3b1f3cb7564a8828b68bc7b315fdbb54f69250b16457a47ec14f63c5"
+        },
+        {
+          "bytes": 7461982,
+          "exists": true,
+          "jsonl_rows": 2025,
+          "path": "/root/Gho/logs/shadow_run/shadow-burnin-v3-p37-counterfactual-probe-r15-lifecycle-label-j4c-r1/probe_skips.jsonl",
+          "role": "probe_skip",
+          "sha256": "e21b3a1235df2fd84cfa29cc75778b8ecb7a756c9128f91b83b8b4733f8796a0"
+        },
+        {
+          "bytes": 346968,
+          "exists": true,
+          "jsonl_rows": 50,
+          "path": "/root/Gho/logs/shadow_run/shadow-burnin-v3-p37-counterfactual-probe-r15-lifecycle-label-j4c-r1/probe_transport.jsonl",
+          "role": "probe_transport",
+          "sha256": "4ba6ebce56c1396fc3b4f3de7a1dcf7375218889eeba9381f407c3b385d8ef57"
+        },
+        {
+          "bytes": 1695,
+          "exists": true,
+          "jsonl_rows": 2,
+          "path": "/root/Gho/logs/shadow_run/shadow-burnin-v3-p37-counterfactual-probe-r15-lifecycle-label-j4c-r1/shadow_entries.jsonl",
+          "role": "shadow_entry",
+          "sha256": "a8f449eb04da841976fb2ad2b50f84221f5777c8353fbb7be4eea044229f2fd6"
+        },
+        {
+          "bytes": 9264,
+          "exists": true,
+          "jsonl_rows": 6,
+          "path": "/root/Gho/logs/shadow_run/shadow-burnin-v3-p37-counterfactual-probe-r15-lifecycle-label-j4c-r1/shadow_lifecycle.jsonl",
+          "role": "shadow_lifecycle",
+          "sha256": "c90e5fc43d659207f6c2b659cde8d375d5c4c25f0740248221f42d41e79df027"
+        },
+        {
+          "bytes": 4186,
+          "exists": true,
+          "jsonl_rows": 2,
+          "path": "/root/Gho/logs/shadow_run/shadow-burnin-v3-p37-counterfactual-probe-r15-lifecycle-label-j4c-r1/buys.jsonl",
+          "role": "shadow_transport",
+          "sha256": "76899b50b335d9f9bd10576321fffc782d71677a854920997c8751690189fa64"
+        },
+        {
+          "bytes": 113395,
+          "exists": true,
+          "jsonl_rows": 42,
+          "path": "/root/Gho/logs/shadow_run/shadow-burnin-v3-p37-counterfactual-probe-r15-lifecycle-label-j4c-r1/p3_7_probe_shadow_lifecycle_labels.jsonl",
+          "role": "lifecycle_label_file",
+          "sha256": "f0f985aeee28147ff0df30374bc4e970f619f2e0d13b66295858bde329c1bce1"
+        },
+        {
+          "bytes": 15187,
+          "exists": true,
+          "jsonl_rows": null,
+          "path": "/root/Gho/logs/shadow_run/shadow-burnin-v3-p37-counterfactual-probe-r15-lifecycle-label-j4c-r1/p3_7_probe_shadow_lifecycle_feature_availability.json",
+          "role": "feature_availability_file",
+          "sha256": "1384c2b7030c2821f7f9b7f0176cda47fb909c231c2ea7dbe284ff8b56938033"
+        }
+      ],
+      "buy_quality_bad": 42,
+      "buy_quality_denominator_rows": 42,
+      "buy_quality_dirty_good": 0,
+      "buy_quality_good": 0,
+      "buy_quality_not_executable": 0,
+      "config_path": "/root/Gho/configs/rollout/shadow-burnin-v3-p37-counterfactual-probe-r15-lifecycle-label-j4c-r1.toml",
+      "decision_rows_total": 2344,
+      "feature_join_executable_labeled_rows": 42,
+      "lifecycle_labeled_rows": 42,
+      "namespace": "shadow-burnin-v3-p37-counterfactual-probe-r15-lifecycle-label-j4c-r1",
+      "route_executable_rows": 44,
+      "route_non_executable_rows": 1205,
+      "run_dir": "/root/Gho/logs/shadow_run/shadow-burnin-v3-p37-counterfactual-probe-r15-lifecycle-label-j4c-r1",
+      "successful_entry_rows": 44
+    },
+    {
+      "artifacts": [
+        {
+          "bytes": 5273,
+          "exists": true,
+          "jsonl_rows": null,
+          "path": "/root/Gho/configs/rollout/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1.toml",
+          "role": "config",
+          "sha256": "d02372a2b6c5fb3c1fbcca26fbd2bbc097accece96c2185017ce6e2befc9beb8"
+        },
+        {
+          "bytes": 182728,
+          "exists": true,
+          "jsonl_rows": 6,
+          "path": "/root/Gho/logs/rollout/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1/decisions/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1/v2.2/legacy_live/00b3d576e6ddfaefe5f738ef016d91e644fe3c67269a7cb058b29e4c75a2087d/gatekeeper_v2_buys.jsonl",
+          "role": "decision",
+          "sha256": "87c7caba8cf3f689ac08d987f470843a104c61e3de9564af178a8c4bf18386b6"
+        },
+        {
+          "bytes": 59020650,
+          "exists": true,
+          "jsonl_rows": 1972,
+          "path": "/root/Gho/logs/rollout/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1/decisions/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1/v2.2/legacy_live/00b3d576e6ddfaefe5f738ef016d91e644fe3c67269a7cb058b29e4c75a2087d/gatekeeper_v2_decisions.jsonl",
+          "role": "decision",
+          "sha256": "bbf3a0ee8a06c3d86327c5e35282d5ab09ed12d00e5a9f7d1d4b7bbcbc4f592b"
+        },
+        {
+          "bytes": 106408,
+          "exists": true,
+          "jsonl_rows": 50,
+          "path": "/root/Gho/logs/shadow_run/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1/probe_shadow_entries.jsonl",
+          "role": "probe_entry",
+          "sha256": "354067c6c0052141cea039ead489e0c478fc2b24ee4ca6a26e2520f40a88f955"
+        },
+        {
+          "bytes": 177421,
+          "exists": true,
+          "jsonl_rows": 78,
+          "path": "/root/Gho/logs/shadow_run/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1/probe_shadow_lifecycle.jsonl",
+          "role": "probe_lifecycle",
+          "sha256": "9de435a683fb2409115364b7a6a75c476db20f562f3217988ee64254485a7b98"
+        },
+        {
+          "bytes": 592469,
+          "exists": true,
+          "jsonl_rows": 163,
+          "path": "/root/Gho/logs/shadow_run/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1/probe_selection.jsonl",
+          "role": "probe_selection",
+          "sha256": "a68de911074bcb3bb570b33923c8a3a91465d9af254cddecb0dbe41060f510ac"
+        },
+        {
+          "bytes": 7383464,
+          "exists": true,
+          "jsonl_rows": 1922,
+          "path": "/root/Gho/logs/shadow_run/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1/probe_skips.jsonl",
+          "role": "probe_skip",
+          "sha256": "da5b07eded60eef76bf71be31ce2a6b53aaf996b3d07b2bc145cfcccd984a418"
+        },
+        {
+          "bytes": 365602,
+          "exists": true,
+          "jsonl_rows": 50,
+          "path": "/root/Gho/logs/shadow_run/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1/probe_transport.jsonl",
+          "role": "probe_transport",
+          "sha256": "4a59084ff5b8353c5abdf9bd4b33bd866177bcd2b156b74ea33f78308ffa02e8"
+        },
+        {
+          "bytes": 5704,
+          "exists": true,
+          "jsonl_rows": 5,
+          "path": "/root/Gho/logs/shadow_run/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1/shadow_entries.jsonl",
+          "role": "shadow_entry",
+          "sha256": "af0f5a97b218d7d1c2a9d04de846d37daac8cbcdb1e6dc7a9b9dafb14ddf6663"
+        },
+        {
+          "bytes": 24741,
+          "exists": true,
+          "jsonl_rows": 14,
+          "path": "/root/Gho/logs/shadow_run/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1/shadow_lifecycle.jsonl",
+          "role": "shadow_lifecycle",
+          "sha256": "a25d33af29e015fa3d6eb398ef239b606c55e96417f43e95f57d728f5530e0f4"
+        },
+        {
+          "bytes": 12913,
+          "exists": true,
+          "jsonl_rows": 6,
+          "path": "/root/Gho/logs/shadow_run/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1/buys.jsonl",
+          "role": "shadow_transport",
+          "sha256": "440e73ee7b50946725c1ec55981b1c114da13d6b114bea61dd427dc7e9d36d99"
+        },
+        {
+          "bytes": 104550,
+          "exists": true,
+          "jsonl_rows": 39,
+          "path": "/root/Gho/logs/shadow_run/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1/probe_p3_7_shadow_lifecycle_labels.jsonl",
+          "role": "lifecycle_label_file",
+          "sha256": "751d3c4a291f9890f7b33732412edbfa53a97cdea4239b88770fe16ba4a2b2cb"
+        },
+        {
+          "bytes": 9639,
+          "exists": true,
+          "jsonl_rows": 4,
+          "path": "/root/Gho/logs/shadow_run/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1/active_p3_7_shadow_lifecycle_labels.jsonl",
+          "role": "lifecycle_label_file",
+          "sha256": "807decbb046134387c9e2bc4ce201f95457a8790df5b5d877e8ac9409695e782"
+        },
+        {
+          "bytes": 14908,
+          "exists": true,
+          "jsonl_rows": null,
+          "path": "/root/Gho/logs/shadow_run/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1/p3_7_shadow_lifecycle_feature_availability.json",
+          "role": "feature_availability_file",
+          "sha256": "d8b278fcc89c716d7f682d819fb6e932aa113ef3cbab026e92c3869dfb25f5ea"
+        }
+      ],
+      "buy_quality_bad": 39,
+      "buy_quality_denominator_rows": 43,
+      "buy_quality_dirty_good": 4,
+      "buy_quality_good": 0,
+      "buy_quality_not_executable": 0,
+      "config_path": "/root/Gho/configs/rollout/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1.toml",
+      "decision_rows_total": 1978,
+      "feature_join_executable_labeled_rows": 39,
+      "lifecycle_labeled_rows": 43,
+      "namespace": "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1",
+      "route_executable_rows": 43,
+      "route_non_executable_rows": 1075,
+      "run_dir": "/root/Gho/logs/shadow_run/shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1",
+      "successful_entry_rows": 43
+    }
+  ],
+  "blocked_runs": [
+    {
+      "buy_quality_denominator_rows": 0,
+      "decision_rows_total": 850,
+      "dirty_good_rows": 0,
+      "exclusion_class": "excluded_no_buy_quality_denominator",
+      "execution_feasibility_reject_rows": 0,
+      "namespace": "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r2",
+      "route_non_executable_rows": 554
+    },
+    {
+      "buy_quality_denominator_rows": 0,
+      "decision_rows_total": 451,
+      "dirty_good_rows": 0,
+      "exclusion_class": "hard_blocked_unsupported_route_universe",
+      "execution_feasibility_reject_rows": 0,
+      "namespace": "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r3",
+      "route_non_executable_rows": 275
+    },
+    {
+      "buy_quality_denominator_rows": 0,
+      "decision_rows_total": 427,
+      "dirty_good_rows": 0,
+      "exclusion_class": "hard_blocked_unsupported_route_universe",
+      "execution_feasibility_reject_rows": 0,
+      "namespace": "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r4-account-attribution",
+      "route_non_executable_rows": 300
+    },
+    {
+      "buy_quality_denominator_rows": 0,
+      "decision_rows_total": 641,
+      "dirty_good_rows": 0,
+      "exclusion_class": "hard_blocked_unsupported_route_universe",
+      "execution_feasibility_reject_rows": 0,
+      "namespace": "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r5-candidate-narrowing",
+      "route_non_executable_rows": 452
+    },
+    {
+      "buy_quality_denominator_rows": 0,
+      "decision_rows_total": 934,
+      "dirty_good_rows": 0,
+      "exclusion_class": "hard_blocked_unsupported_route_universe",
+      "execution_feasibility_reject_rows": 0,
+      "namespace": "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r6-bcv2-contract",
+      "route_non_executable_rows": 568
+    },
+    {
+      "buy_quality_denominator_rows": 0,
+      "decision_rows_total": 1159,
+      "dirty_good_rows": 0,
+      "exclusion_class": "hard_blocked_unsupported_route_universe",
+      "execution_feasibility_reject_rows": 0,
+      "namespace": "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r7-active-shadow-attribution",
+      "route_non_executable_rows": 673
+    },
+    {
+      "buy_quality_denominator_rows": 0,
+      "decision_rows_total": 223,
+      "dirty_good_rows": 0,
+      "exclusion_class": "hard_blocked_unsupported_route_universe",
+      "execution_feasibility_reject_rows": 0,
+      "namespace": "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r8-active-shadow-report-attribution",
+      "route_non_executable_rows": 134
+    },
+    {
+      "buy_quality_denominator_rows": 0,
+      "decision_rows_total": 81,
+      "dirty_good_rows": 0,
+      "exclusion_class": "hard_blocked_unsupported_route_universe",
+      "execution_feasibility_reject_rows": 0,
+      "namespace": "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r9-active-shadow-bcv2-precheck",
+      "route_non_executable_rows": 57
+    },
+    {
+      "buy_quality_denominator_rows": 0,
+      "decision_rows_total": 455,
+      "dirty_good_rows": 0,
+      "exclusion_class": "hard_blocked_unsupported_route_universe",
+      "execution_feasibility_reject_rows": 0,
+      "namespace": "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r10-route-bcv2-source",
+      "route_non_executable_rows": 332
+    },
+    {
+      "buy_quality_denominator_rows": 0,
+      "decision_rows_total": 416,
+      "dirty_good_rows": 0,
+      "exclusion_class": "hard_blocked_unsupported_route_universe",
+      "execution_feasibility_reject_rows": 0,
+      "namespace": "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r11-bcv2-readiness",
+      "route_non_executable_rows": 263
+    },
+    {
+      "buy_quality_denominator_rows": 0,
+      "decision_rows_total": 399,
+      "dirty_good_rows": 0,
+      "exclusion_class": "hard_blocked_unsupported_route_universe",
+      "execution_feasibility_reject_rows": 0,
+      "namespace": "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r12-bcv2-provenance",
+      "route_non_executable_rows": 285
+    },
+    {
+      "buy_quality_denominator_rows": 0,
+      "decision_rows_total": 70,
+      "dirty_good_rows": 0,
+      "exclusion_class": "hard_blocked_unsupported_route_universe",
+      "execution_feasibility_reject_rows": 11,
+      "namespace": "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r13-executable-route-resolver",
+      "route_non_executable_rows": 63
+    }
+  ],
+  "contract_failures": [],
+  "denominator_gap": {
+    "buy_quality_denominator_rows": 85,
+    "eligible_not_in_buy_quality_denominator": 2,
+    "executable_eligible_rows": 87,
+    "meaning": "execution eligible does not equal buy-quality label eligible"
+  },
+  "excluded_totals": {
+    "excluded_buy_quality_denominator_rows": 0,
+    "excluded_decision_rows_total": 6106,
+    "excluded_dirty_good_rows": 0,
+    "excluded_non_executable_rows": 3956,
+    "excluded_runs": 12,
+    "excluded_unsupported_route_rows": 11
+  },
+  "expected_contract": {
+    "allowed_runs": [
+      "shadow-burnin-v3-p37-counterfactual-probe-r15-lifecycle-label-j4c-r1",
+      "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1"
+    ],
+    "blocked_runs": [
+      "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r10-route-bcv2-source",
+      "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r11-bcv2-readiness",
+      "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r12-bcv2-provenance",
+      "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r13-executable-route-resolver",
+      "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r3",
+      "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r4-account-attribution",
+      "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r5-candidate-narrowing",
+      "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r6-bcv2-contract",
+      "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r7-active-shadow-attribution",
+      "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r8-active-shadow-report-attribution",
+      "shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r9-active-shadow-bcv2-precheck"
+    ],
+    "buy_quality_denominator_rows": 85,
+    "buy_quality_dirty_good": 4,
+    "dirty_good_rate": 0.047058823529411764,
+    "excluded_non_executable_rows": 3956,
+    "excluded_unsupported_route_rows": 11
+  },
+  "final_decision": "GO_L2_INPUT_MANIFEST_LOCKED",
+  "hard_fail_conditions": [
+    "unknown_or_unlisted_run_in_l2_input",
+    "denominator_mismatch",
+    "dirty_good_count_mismatch",
+    "blocked_namespace_in_l2_input",
+    "non_executable_route_rows_in_buy_quality_denominator"
+  ],
+  "input_totals": {
+    "buy_quality_bad": 81,
+    "buy_quality_denominator_rows": 85,
+    "buy_quality_dirty_good": 4,
+    "buy_quality_good": 0,
+    "buy_quality_not_executable": 0,
+    "dirty_good_rate": 0.047058823529411764,
+    "excluded_non_executable_rows_within_allowed_runs": 2280,
+    "executable_eligible_rows": 87,
+    "feature_join_executable_labeled_rows": 81,
+    "lifecycle_labeled_rows": 85,
+    "total_rows": 4322,
+    "usable_label_rate": 1.0
+  },
+  "manifest_status": "pass",
+  "report_name": "P3.7-L1R21 L2 Input Manifest / Dataset Contract Audit",
+  "schema_version": 1,
+  "source_preflight": {
+    "blockers": [],
+    "final_decision": "GO_L2_EXECUTABLE_SUBSET_LOCKED",
+    "preflight_status": "pass"
+  }
+}
