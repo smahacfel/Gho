@@ -78,6 +78,8 @@
 
 use std::time::Instant;
 
+use metrics::increment_counter;
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -570,7 +572,15 @@ fn analyze_ctp(input: &IwimInput) -> CtpSignal {
         let mut setup_count = 0;
 
         for i in window_start..tx_count {
-            if parsed_txs[i].timestamp_ms - window_start_time > burst_window_ms {
+            let (elapsed_ms, clamped) =
+                ctp_window_elapsed_ms(parsed_txs[i].timestamp_ms, window_start_time);
+            if clamped {
+                increment_counter!(
+                    "iwim_ctp_timestamp_delta_clamped_total",
+                    "reason" => "out_of_order_window_timestamp"
+                );
+            }
+            if elapsed_ms > burst_window_ms {
                 break;
             }
 
@@ -639,6 +649,14 @@ fn analyze_ctp(input: &IwimInput) -> CtpSignal {
     .min(1.0);
 
     signal
+}
+
+#[inline]
+fn ctp_window_elapsed_ms(timestamp_ms: u64, window_start_time_ms: u64) -> (u64, bool) {
+    match timestamp_ms.checked_sub(window_start_time_ms) {
+        Some(elapsed_ms) => (elapsed_ms, false),
+        None => (0, true),
+    }
 }
 
 // =============================================================================
@@ -1510,6 +1528,29 @@ mod tests {
 
         let result = iwim_analyze(&input);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_iwim_ctp_out_of_order_real_timestamps_do_not_overflow() {
+        let input = IwimInput {
+            creator_pubkey: [0u8; 32],
+            init_slot: Some(12345),
+            time_window_ms: 2000,
+            transactions: vec![
+                b"JSON_TX_META_TIMESTAMP_1700000001".to_vec(),
+                b"JSON_TX_META_TIMESTAMP_1700000000".to_vec(),
+            ],
+            init_timestamp_ms: None,
+            synthetic: false,
+            pool_id: None,
+        };
+
+        let result = iwim_analyze(&input).unwrap();
+        assert!(result.confidence >= MIN_CONFIDENCE);
+
+        let (elapsed_ms, clamped) = ctp_window_elapsed_ms(1_700_000_000_000, 1_700_000_001_000);
+        assert_eq!(elapsed_ms, 0);
+        assert!(clamped);
     }
 
     #[test]
