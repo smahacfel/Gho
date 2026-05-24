@@ -502,6 +502,9 @@ pub struct BuyAccountOverrides {
     pub bonding_curve_v2: Option<Pubkey>,
     pub bonding_curve_v2_provenance: Option<crate::events::ObservedAccountMetaProvenance>,
     pub legacy_buy_curve: Option<BondingCurve>,
+    pub legacy_buy_curve_pubkey: Option<Pubkey>,
+    pub legacy_buy_curve_source: Option<String>,
+    pub legacy_buy_curve_authority_status: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -4466,6 +4469,11 @@ impl TriggerComponent {
                 return "bonding_curve_v2".to_string();
             }
         }
+        if let Some(value) = request.account_overrides.legacy_buy_curve_pubkey {
+            if *pubkey == value {
+                return "bonding_curve".to_string();
+            }
+        }
         if let Some(profile) = request.build_profile.as_ref() {
             if *pubkey == profile.payer_pubkey {
                 return "payer_pubkey".to_string();
@@ -4502,6 +4510,11 @@ impl TriggerComponent {
             if let Some(value) = profile.account_overrides.bonding_curve_v2 {
                 if *pubkey == value {
                     return "bonding_curve_v2".to_string();
+                }
+            }
+            if let Some(value) = profile.account_overrides.legacy_buy_curve_pubkey {
+                if *pubkey == value {
+                    return "bonding_curve".to_string();
                 }
             }
         }

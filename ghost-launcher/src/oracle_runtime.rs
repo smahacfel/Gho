@@ -1577,6 +1577,14 @@ pub struct OracleRuntime {
     p37_shadow_probe_state: Arc<P37ShadowProbeRuntimeState>,
 }
 
+#[derive(Debug, Clone)]
+struct P37LegacyBuyCurveMaterialization {
+    curve: BondingCurve,
+    pubkey: Pubkey,
+    source: String,
+    authority_status: String,
+}
+
 impl OracleRuntime {
     /// Create new OracleRuntime with default configuration from environment
     ///
@@ -2511,14 +2519,28 @@ impl OracleRuntime {
         self.setup_shadow_ledger_gating();
     }
 
-    fn resolve_trigger_buy_curve(
+    fn resolve_trigger_buy_curve_materialization(
         &self,
         base_mint: Pubkey,
         _buffered_txs: &[crate::components::gatekeeper::GatekeeperBufferedTx],
-    ) -> Option<BondingCurve> {
+    ) -> Option<P37LegacyBuyCurveMaterialization> {
         self.account_state_core
             .get_canonical_state(&base_mint)
-            .map(|canonical_state| canonical_shadow_curve(&canonical_state))
+            .map(|canonical_state| P37LegacyBuyCurveMaterialization {
+                curve: canonical_shadow_curve(&canonical_state),
+                pubkey: canonical_state.bonding_curve,
+                source: "account_state_core".to_string(),
+                authority_status: "authoritative_account_state".to_string(),
+            })
+    }
+
+    fn resolve_trigger_buy_curve(
+        &self,
+        base_mint: Pubkey,
+        buffered_txs: &[crate::components::gatekeeper::GatekeeperBufferedTx],
+    ) -> Option<BondingCurve> {
+        self.resolve_trigger_buy_curve_materialization(base_mint, buffered_txs)
+            .map(|materialization| materialization.curve)
     }
 
     #[allow(deprecated)]
@@ -5030,6 +5052,20 @@ struct P37ShadowProbeSelectionRecord {
     fallback_required_precheck_account_set: Vec<String>,
     fallback_failure_class: Option<String>,
     no_executable_route_account_set_reason: Option<String>,
+    legacy_buy_account_set_status: Option<String>,
+    legacy_buy_curve_pubkey: Option<String>,
+    legacy_buy_curve_source: Option<String>,
+    legacy_buy_curve_authority_status: Option<String>,
+    legacy_buy_curve_rpc_load_status: Option<String>,
+    legacy_buy_curve_rpc_load_ready: Option<bool>,
+    legacy_buy_associated_bonding_curve_pubkey: Option<String>,
+    legacy_buy_associated_bonding_curve_source: Option<String>,
+    legacy_buy_associated_bonding_curve_rpc_load_ready: Option<bool>,
+    legacy_buy_required_roles: Vec<String>,
+    legacy_buy_missing_roles: Vec<String>,
+    legacy_buy_missing_pubkeys: Vec<String>,
+    legacy_buy_route_ready: Option<bool>,
+    legacy_buy_route_not_ready_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq)]
@@ -5144,6 +5180,20 @@ struct P37ShadowProbeTransportRecord {
     fallback_required_precheck_account_set: Vec<String>,
     fallback_failure_class: Option<String>,
     no_executable_route_account_set_reason: Option<String>,
+    legacy_buy_account_set_status: Option<String>,
+    legacy_buy_curve_pubkey: Option<String>,
+    legacy_buy_curve_source: Option<String>,
+    legacy_buy_curve_authority_status: Option<String>,
+    legacy_buy_curve_rpc_load_status: Option<String>,
+    legacy_buy_curve_rpc_load_ready: Option<bool>,
+    legacy_buy_associated_bonding_curve_pubkey: Option<String>,
+    legacy_buy_associated_bonding_curve_source: Option<String>,
+    legacy_buy_associated_bonding_curve_rpc_load_ready: Option<bool>,
+    legacy_buy_required_roles: Vec<String>,
+    legacy_buy_missing_roles: Vec<String>,
+    legacy_buy_missing_pubkeys: Vec<String>,
+    legacy_buy_route_ready: Option<bool>,
+    legacy_buy_route_not_ready_reason: Option<String>,
     execution_feasibility_status: Option<String>,
     execution_feasibility_reason: Option<String>,
     route_resolution_terminal_reason: Option<String>,
@@ -5557,6 +5607,20 @@ fn p37_shadow_probe_selection_record(
         fallback_required_precheck_account_set: Vec::new(),
         fallback_failure_class: None,
         no_executable_route_account_set_reason: None,
+        legacy_buy_account_set_status: None,
+        legacy_buy_curve_pubkey: None,
+        legacy_buy_curve_source: None,
+        legacy_buy_curve_authority_status: None,
+        legacy_buy_curve_rpc_load_status: None,
+        legacy_buy_curve_rpc_load_ready: None,
+        legacy_buy_associated_bonding_curve_pubkey: None,
+        legacy_buy_associated_bonding_curve_source: None,
+        legacy_buy_associated_bonding_curve_rpc_load_ready: None,
+        legacy_buy_required_roles: Vec::new(),
+        legacy_buy_missing_roles: Vec::new(),
+        legacy_buy_missing_pubkeys: Vec::new(),
+        legacy_buy_route_ready: None,
+        legacy_buy_route_not_ready_reason: None,
         execution_feasibility_status: None,
         execution_feasibility_reason: None,
         route_resolution_terminal_reason: None,
@@ -5737,6 +5801,25 @@ fn p37_shadow_probe_artifact_records(
         no_executable_route_account_set_reason: record
             .no_executable_route_account_set_reason
             .clone(),
+        legacy_buy_account_set_status: record.legacy_buy_account_set_status.clone(),
+        legacy_buy_curve_pubkey: record.legacy_buy_curve_pubkey.clone(),
+        legacy_buy_curve_source: record.legacy_buy_curve_source.clone(),
+        legacy_buy_curve_authority_status: record.legacy_buy_curve_authority_status.clone(),
+        legacy_buy_curve_rpc_load_status: record.legacy_buy_curve_rpc_load_status.clone(),
+        legacy_buy_curve_rpc_load_ready: record.legacy_buy_curve_rpc_load_ready,
+        legacy_buy_associated_bonding_curve_pubkey: record
+            .legacy_buy_associated_bonding_curve_pubkey
+            .clone(),
+        legacy_buy_associated_bonding_curve_source: record
+            .legacy_buy_associated_bonding_curve_source
+            .clone(),
+        legacy_buy_associated_bonding_curve_rpc_load_ready: record
+            .legacy_buy_associated_bonding_curve_rpc_load_ready,
+        legacy_buy_required_roles: record.legacy_buy_required_roles.clone(),
+        legacy_buy_missing_roles: record.legacy_buy_missing_roles.clone(),
+        legacy_buy_missing_pubkeys: record.legacy_buy_missing_pubkeys.clone(),
+        legacy_buy_route_ready: record.legacy_buy_route_ready,
+        legacy_buy_route_not_ready_reason: record.legacy_buy_route_not_ready_reason.clone(),
         execution_feasibility_status: record.execution_feasibility_status.clone(),
         execution_feasibility_reason: record.execution_feasibility_reason.clone(),
         route_resolution_terminal_reason: record.route_resolution_terminal_reason.clone(),
@@ -5881,6 +5964,25 @@ fn p37_shadow_probe_artifact_records(
         no_executable_route_account_set_reason: record
             .no_executable_route_account_set_reason
             .clone(),
+        legacy_buy_account_set_status: record.legacy_buy_account_set_status.clone(),
+        legacy_buy_curve_pubkey: record.legacy_buy_curve_pubkey.clone(),
+        legacy_buy_curve_source: record.legacy_buy_curve_source.clone(),
+        legacy_buy_curve_authority_status: record.legacy_buy_curve_authority_status.clone(),
+        legacy_buy_curve_rpc_load_status: record.legacy_buy_curve_rpc_load_status.clone(),
+        legacy_buy_curve_rpc_load_ready: record.legacy_buy_curve_rpc_load_ready,
+        legacy_buy_associated_bonding_curve_pubkey: record
+            .legacy_buy_associated_bonding_curve_pubkey
+            .clone(),
+        legacy_buy_associated_bonding_curve_source: record
+            .legacy_buy_associated_bonding_curve_source
+            .clone(),
+        legacy_buy_associated_bonding_curve_rpc_load_ready: record
+            .legacy_buy_associated_bonding_curve_rpc_load_ready,
+        legacy_buy_required_roles: record.legacy_buy_required_roles.clone(),
+        legacy_buy_missing_roles: record.legacy_buy_missing_roles.clone(),
+        legacy_buy_missing_pubkeys: record.legacy_buy_missing_pubkeys.clone(),
+        legacy_buy_route_ready: record.legacy_buy_route_ready,
+        legacy_buy_route_not_ready_reason: record.legacy_buy_route_not_ready_reason.clone(),
         execution_feasibility_status: record.execution_feasibility_status.clone(),
         execution_feasibility_reason: record.execution_feasibility_reason.clone(),
         route_resolution_terminal_reason: record.route_resolution_terminal_reason.clone(),
@@ -6113,6 +6215,20 @@ struct P37ExecutableRouteResolutionDiagnostics {
     fallback_required_precheck_account_set: Vec<String>,
     fallback_failure_class: Option<String>,
     no_executable_route_account_set_reason: Option<String>,
+    legacy_buy_account_set_status: Option<String>,
+    legacy_buy_curve_pubkey: Option<String>,
+    legacy_buy_curve_source: Option<String>,
+    legacy_buy_curve_authority_status: Option<String>,
+    legacy_buy_curve_rpc_load_status: Option<String>,
+    legacy_buy_curve_rpc_load_ready: Option<bool>,
+    legacy_buy_associated_bonding_curve_pubkey: Option<String>,
+    legacy_buy_associated_bonding_curve_source: Option<String>,
+    legacy_buy_associated_bonding_curve_rpc_load_ready: Option<bool>,
+    legacy_buy_required_roles: Vec<String>,
+    legacy_buy_missing_roles: Vec<String>,
+    legacy_buy_missing_pubkeys: Vec<String>,
+    legacy_buy_route_ready: Option<bool>,
+    legacy_buy_route_not_ready_reason: Option<String>,
 }
 
 impl P37ExecutableRouteResolutionDiagnostics {
@@ -6343,6 +6459,222 @@ fn p37_shadow_probe_fallback_failure_diagnostics(
     )
 }
 
+#[derive(Debug, Clone, Default)]
+struct P37LegacyBuyRouteDiagnostics {
+    account_set_status: Option<String>,
+    curve_pubkey: Option<String>,
+    curve_source: Option<String>,
+    curve_authority_status: Option<String>,
+    curve_rpc_load_status: Option<String>,
+    curve_rpc_load_ready: Option<bool>,
+    associated_bonding_curve_pubkey: Option<String>,
+    associated_bonding_curve_source: Option<String>,
+    associated_bonding_curve_rpc_load_ready: Option<bool>,
+    required_roles: Vec<String>,
+    missing_roles: Vec<String>,
+    missing_pubkeys: Vec<String>,
+    route_ready: Option<bool>,
+    route_not_ready_reason: Option<String>,
+}
+
+fn p37_shadow_probe_manifest_entry_for_role<'a>(
+    diagnostics: Option<&'a P37ShadowProbeAccountSetDiagnostics>,
+    role: &str,
+) -> Option<&'a P37ShadowProbeAccountManifestEntry> {
+    diagnostics.and_then(|diagnostics| diagnostics.manifest.iter().find(|entry| entry.role == role))
+}
+
+fn p37_shadow_probe_manifest_role_rpc_status(
+    diagnostics: Option<&P37ShadowProbeAccountSetDiagnostics>,
+    role: &str,
+    pubkey: Option<&str>,
+) -> (Option<String>, Option<bool>) {
+    let Some(pubkey) = pubkey.filter(|value| !value.trim().is_empty()) else {
+        return (Some("missing_pubkey".to_string()), Some(false));
+    };
+    let Some(diagnostics) = diagnostics else {
+        return (Some("not_checked".to_string()), None);
+    };
+    if !diagnostics.manifest_lookup_performed {
+        return (Some("not_checked".to_string()), None);
+    }
+    if diagnostics
+        .missing_candidates
+        .iter()
+        .any(|candidate| candidate.role == role && candidate.pubkey == pubkey)
+    {
+        return (Some("missing_on_rpc_precheck".to_string()), Some(false));
+    }
+    if diagnostics
+        .manifest
+        .iter()
+        .any(|entry| entry.role == role && entry.pubkey == pubkey)
+    {
+        (Some("present_on_rpc_precheck".to_string()), Some(true))
+    } else {
+        (Some("not_in_manifest".to_string()), Some(false))
+    }
+}
+
+fn p37_shadow_probe_legacy_buy_route_diagnostics(
+    request: Option<&crate::components::trigger::PreparedBuyRequest>,
+    account_set_diagnostics: Option<&P37ShadowProbeAccountSetDiagnostics>,
+) -> P37LegacyBuyRouteDiagnostics {
+    let Some(request) = request else {
+        return P37LegacyBuyRouteDiagnostics {
+            account_set_status: Some("unavailable".to_string()),
+            route_ready: Some(false),
+            route_not_ready_reason: Some("legacy_buy_no_prepared_request".to_string()),
+            ..Default::default()
+        };
+    };
+    let overrides = &request.account_overrides;
+    let curve_manifest_entry =
+        p37_shadow_probe_manifest_entry_for_role(account_set_diagnostics, "bonding_curve");
+    let associated_manifest_entry = p37_shadow_probe_manifest_entry_for_role(
+        account_set_diagnostics,
+        "associated_bonding_curve",
+    );
+    let curve_pubkey = overrides
+        .legacy_buy_curve_pubkey
+        .map(|pubkey| pubkey.to_string())
+        .or_else(|| curve_manifest_entry.map(|entry| entry.pubkey.clone()));
+    let curve_source = overrides
+        .legacy_buy_curve_source
+        .clone()
+        .or_else(|| curve_manifest_entry.map(|entry| entry.source.clone()));
+    let curve_authority_status = overrides
+        .legacy_buy_curve_authority_status
+        .clone()
+        .or_else(|| {
+            overrides
+                .legacy_buy_curve
+                .is_some()
+                .then(|| "authoritative_curve_state_without_pubkey".to_string())
+        })
+        .or_else(|| {
+            curve_pubkey
+                .as_ref()
+                .map(|_| "derived_unverified".to_string())
+        })
+        .or_else(|| Some("not_materialized".to_string()));
+    let (curve_rpc_load_status, curve_rpc_load_ready) = p37_shadow_probe_manifest_role_rpc_status(
+        account_set_diagnostics,
+        "bonding_curve",
+        curve_pubkey.as_deref(),
+    );
+    let associated_bonding_curve_pubkey = overrides
+        .associated_bonding_curve
+        .map(|pubkey| pubkey.to_string())
+        .or_else(|| associated_manifest_entry.map(|entry| entry.pubkey.clone()));
+    let associated_bonding_curve_source = associated_manifest_entry
+        .map(|entry| entry.source.clone())
+        .or_else(|| {
+            overrides
+                .associated_bonding_curve
+                .map(|_| "account_overrides".to_string())
+        });
+    let (_, associated_bonding_curve_rpc_load_ready) = p37_shadow_probe_manifest_role_rpc_status(
+        account_set_diagnostics,
+        "associated_bonding_curve",
+        associated_bonding_curve_pubkey.as_deref(),
+    );
+    let mut required_roles = account_set_diagnostics
+        .map(|diagnostics| {
+            p37_shadow_probe_sorted_unique(
+                diagnostics
+                    .manifest
+                    .iter()
+                    .filter(|entry| entry.required)
+                    .map(|entry| entry.role.clone()),
+            )
+        })
+        .unwrap_or_default();
+    if matches!(
+        overrides.buy_variant,
+        Some(trigger::PumpfunBuyVariant::LegacyBuy)
+    ) && !required_roles.iter().any(|role| role == "bonding_curve")
+    {
+        required_roles.push("bonding_curve".to_string());
+        required_roles.sort();
+        required_roles.dedup();
+    }
+    let mut missing_roles = account_set_diagnostics
+        .map(|diagnostics| {
+            diagnostics
+                .missing_candidates
+                .iter()
+                .map(|candidate| candidate.role.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut missing_pubkeys = account_set_diagnostics
+        .map(|diagnostics| {
+            diagnostics
+                .missing_candidates
+                .iter()
+                .map(|candidate| candidate.pubkey.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let curve_authoritative = curve_authority_status
+        .as_deref()
+        .is_some_and(|status| status.starts_with("authoritative_"));
+    if overrides.legacy_buy_curve.is_none() || !curve_authoritative {
+        missing_roles.push("bonding_curve".to_string());
+        if let Some(pubkey) = curve_pubkey.as_ref() {
+            missing_pubkeys.push(pubkey.clone());
+        }
+    }
+    let missing_roles = p37_shadow_probe_sorted_unique(missing_roles);
+    let missing_pubkeys = p37_shadow_probe_sorted_unique(missing_pubkeys);
+    let manifest_ready = account_set_diagnostics
+        .map(|diagnostics| {
+            diagnostics.manifest_lookup_performed && diagnostics.missing_candidates.is_empty()
+        })
+        .unwrap_or(false);
+    let route_ready = overrides.legacy_buy_curve.is_some()
+        && curve_authoritative
+        && curve_rpc_load_ready == Some(true)
+        && manifest_ready;
+    let route_not_ready_reason = if route_ready {
+        None
+    } else if overrides.legacy_buy_curve.is_none() {
+        Some("legacy_buy_missing_core_curve_account".to_string())
+    } else if !curve_authoritative {
+        Some("legacy_buy_curve_source_not_authoritative".to_string())
+    } else if curve_rpc_load_ready == Some(false) {
+        Some("legacy_buy_missing_core_curve_account".to_string())
+    } else if missing_roles
+        .iter()
+        .any(|role| role == "associated_bonding_curve")
+    {
+        Some("legacy_buy_missing_associated_bonding_curve".to_string())
+    } else if missing_roles.iter().any(|role| role == "bonding_curve_v2") {
+        Some("legacy_buy_missing_route_identity".to_string())
+    } else if !manifest_ready {
+        Some("legacy_buy_simulation_load_not_ready".to_string())
+    } else {
+        Some("legacy_buy_unknown_not_ready".to_string())
+    };
+    P37LegacyBuyRouteDiagnostics {
+        account_set_status: Some(if route_ready { "ready" } else { "not_ready" }.to_string()),
+        curve_pubkey,
+        curve_source,
+        curve_authority_status,
+        curve_rpc_load_status,
+        curve_rpc_load_ready,
+        associated_bonding_curve_pubkey,
+        associated_bonding_curve_source,
+        associated_bonding_curve_rpc_load_ready,
+        required_roles,
+        missing_roles,
+        missing_pubkeys,
+        route_ready: Some(route_ready),
+        route_not_ready_reason,
+    }
+}
+
 fn p37_shadow_probe_route_resolution_diagnostics(
     request: Option<&crate::components::trigger::PreparedBuyRequest>,
     account_set_diagnostics: Option<&P37ShadowProbeAccountSetDiagnostics>,
@@ -6353,6 +6685,8 @@ fn p37_shadow_probe_route_resolution_diagnostics(
         p37_shadow_probe_route_kind(request).unwrap_or_else(|| "unknown".to_string());
     let fallback_route_kind =
         (primary_route_kind != "legacy_buy").then(|| "legacy_buy".to_string());
+    let legacy_buy =
+        p37_shadow_probe_legacy_buy_route_diagnostics(request, account_set_diagnostics);
 
     let bcv2_from_failure = precheck_failure_reason
         .and_then(p37_shadow_probe_parse_no_executable_route_bcv2)
@@ -6398,10 +6732,22 @@ fn p37_shadow_probe_route_resolution_diagnostics(
             .unwrap_or_else(|| "primary_route_bcv2_missing".to_string());
         let fallback_attempted = fallback_route_kind.is_some();
         let fallback_not_ready_reason = if fallback_attempted {
-            request
-                .and_then(|request| request.account_overrides.legacy_buy_curve)
-                .map(|_| "fallback_route_requires_same_bcv2_simulation_load_account".to_string())
-                .or_else(|| Some("fallback_route_missing_legacy_buy_curve".to_string()))
+            match legacy_buy.route_not_ready_reason.as_deref() {
+                Some("legacy_buy_missing_core_curve_account") => {
+                    Some("fallback_route_missing_legacy_buy_curve".to_string())
+                }
+                Some("legacy_buy_missing_route_identity") => {
+                    Some("fallback_route_requires_same_bcv2_simulation_load_account".to_string())
+                }
+                Some(reason) => Some(reason.to_string()),
+                None if request
+                    .and_then(|request| request.account_overrides.legacy_buy_curve)
+                    .is_some() =>
+                {
+                    Some("fallback_route_requires_same_bcv2_simulation_load_account".to_string())
+                }
+                None => Some("fallback_route_missing_legacy_buy_curve".to_string()),
+            }
         } else {
             Some("fallback_route_not_available_for_primary".to_string())
         };
@@ -6446,6 +6792,73 @@ fn p37_shadow_probe_route_resolution_diagnostics(
             fallback_required_precheck_account_set,
             fallback_failure_class,
             no_executable_route_account_set_reason: Some(no_executable_reason),
+            legacy_buy_account_set_status: legacy_buy.account_set_status,
+            legacy_buy_curve_pubkey: legacy_buy.curve_pubkey,
+            legacy_buy_curve_source: legacy_buy.curve_source,
+            legacy_buy_curve_authority_status: legacy_buy.curve_authority_status,
+            legacy_buy_curve_rpc_load_status: legacy_buy.curve_rpc_load_status,
+            legacy_buy_curve_rpc_load_ready: legacy_buy.curve_rpc_load_ready,
+            legacy_buy_associated_bonding_curve_pubkey: legacy_buy.associated_bonding_curve_pubkey,
+            legacy_buy_associated_bonding_curve_source: legacy_buy.associated_bonding_curve_source,
+            legacy_buy_associated_bonding_curve_rpc_load_ready: legacy_buy
+                .associated_bonding_curve_rpc_load_ready,
+            legacy_buy_required_roles: legacy_buy.required_roles,
+            legacy_buy_missing_roles: legacy_buy.missing_roles,
+            legacy_buy_missing_pubkeys: legacy_buy.missing_pubkeys,
+            legacy_buy_route_ready: legacy_buy.route_ready,
+            legacy_buy_route_not_ready_reason: legacy_buy.route_not_ready_reason,
+        };
+    }
+
+    if primary_route_kind == "legacy_buy" && legacy_buy.route_ready != Some(true) {
+        let primary_reason = legacy_buy
+            .route_not_ready_reason
+            .clone()
+            .unwrap_or_else(|| "legacy_buy_simulation_load_not_ready".to_string());
+        let no_executable_reason = legacy_buy
+            .curve_pubkey
+            .as_ref()
+            .map(|pubkey| format!("{primary_reason}:bonding_curve:{pubkey}"))
+            .unwrap_or(primary_reason.clone());
+        return P37ExecutableRouteResolutionDiagnostics {
+            route_resolution_status: Some("no_executable_route_account_set".to_string()),
+            selected_route_kind: None,
+            selected_route_reason: Some(
+                "no_route_candidate_passed_simulation_load_readiness".to_string(),
+            ),
+            primary_route_kind: Some(primary_route_kind),
+            primary_route_ready: Some(false),
+            primary_route_not_ready_reason: Some(primary_reason),
+            fallback_route_kind,
+            fallback_route_attempted: Some(false),
+            fallback_route_ready: None,
+            fallback_route_not_ready_reason: None,
+            fallback_missing_roles: legacy_buy.missing_roles.clone(),
+            fallback_missing_pubkeys: legacy_buy.missing_pubkeys.clone(),
+            fallback_account_sources: Vec::new(),
+            fallback_simulation_load_account_set: Vec::new(),
+            fallback_creatable_account_set: Vec::new(),
+            fallback_required_precheck_account_set: Vec::new(),
+            fallback_failure_class: p37_shadow_probe_fallback_failure_class_from_reason(
+                legacy_buy.route_not_ready_reason.as_deref(),
+                &legacy_buy.missing_roles,
+            ),
+            no_executable_route_account_set_reason: Some(no_executable_reason),
+            legacy_buy_account_set_status: legacy_buy.account_set_status,
+            legacy_buy_curve_pubkey: legacy_buy.curve_pubkey,
+            legacy_buy_curve_source: legacy_buy.curve_source,
+            legacy_buy_curve_authority_status: legacy_buy.curve_authority_status,
+            legacy_buy_curve_rpc_load_status: legacy_buy.curve_rpc_load_status,
+            legacy_buy_curve_rpc_load_ready: legacy_buy.curve_rpc_load_ready,
+            legacy_buy_associated_bonding_curve_pubkey: legacy_buy.associated_bonding_curve_pubkey,
+            legacy_buy_associated_bonding_curve_source: legacy_buy.associated_bonding_curve_source,
+            legacy_buy_associated_bonding_curve_rpc_load_ready: legacy_buy
+                .associated_bonding_curve_rpc_load_ready,
+            legacy_buy_required_roles: legacy_buy.required_roles,
+            legacy_buy_missing_roles: legacy_buy.missing_roles,
+            legacy_buy_missing_pubkeys: legacy_buy.missing_pubkeys,
+            legacy_buy_route_ready: legacy_buy.route_ready,
+            legacy_buy_route_not_ready_reason: legacy_buy.route_not_ready_reason,
         };
     }
 
@@ -6468,6 +6881,21 @@ fn p37_shadow_probe_route_resolution_diagnostics(
         fallback_required_precheck_account_set: Vec::new(),
         fallback_failure_class: None,
         no_executable_route_account_set_reason: None,
+        legacy_buy_account_set_status: legacy_buy.account_set_status,
+        legacy_buy_curve_pubkey: legacy_buy.curve_pubkey,
+        legacy_buy_curve_source: legacy_buy.curve_source,
+        legacy_buy_curve_authority_status: legacy_buy.curve_authority_status,
+        legacy_buy_curve_rpc_load_status: legacy_buy.curve_rpc_load_status,
+        legacy_buy_curve_rpc_load_ready: legacy_buy.curve_rpc_load_ready,
+        legacy_buy_associated_bonding_curve_pubkey: legacy_buy.associated_bonding_curve_pubkey,
+        legacy_buy_associated_bonding_curve_source: legacy_buy.associated_bonding_curve_source,
+        legacy_buy_associated_bonding_curve_rpc_load_ready: legacy_buy
+            .associated_bonding_curve_rpc_load_ready,
+        legacy_buy_required_roles: legacy_buy.required_roles,
+        legacy_buy_missing_roles: legacy_buy.missing_roles,
+        legacy_buy_missing_pubkeys: legacy_buy.missing_pubkeys,
+        legacy_buy_route_ready: legacy_buy.route_ready,
+        legacy_buy_route_not_ready_reason: legacy_buy.route_not_ready_reason,
     }
 }
 
@@ -6498,6 +6926,23 @@ fn p37_shadow_probe_apply_route_resolution_to_record(
     record.fallback_failure_class = resolution.fallback_failure_class;
     record.no_executable_route_account_set_reason =
         resolution.no_executable_route_account_set_reason;
+    record.legacy_buy_account_set_status = resolution.legacy_buy_account_set_status;
+    record.legacy_buy_curve_pubkey = resolution.legacy_buy_curve_pubkey;
+    record.legacy_buy_curve_source = resolution.legacy_buy_curve_source;
+    record.legacy_buy_curve_authority_status = resolution.legacy_buy_curve_authority_status;
+    record.legacy_buy_curve_rpc_load_status = resolution.legacy_buy_curve_rpc_load_status;
+    record.legacy_buy_curve_rpc_load_ready = resolution.legacy_buy_curve_rpc_load_ready;
+    record.legacy_buy_associated_bonding_curve_pubkey =
+        resolution.legacy_buy_associated_bonding_curve_pubkey;
+    record.legacy_buy_associated_bonding_curve_source =
+        resolution.legacy_buy_associated_bonding_curve_source;
+    record.legacy_buy_associated_bonding_curve_rpc_load_ready =
+        resolution.legacy_buy_associated_bonding_curve_rpc_load_ready;
+    record.legacy_buy_required_roles = resolution.legacy_buy_required_roles;
+    record.legacy_buy_missing_roles = resolution.legacy_buy_missing_roles;
+    record.legacy_buy_missing_pubkeys = resolution.legacy_buy_missing_pubkeys;
+    record.legacy_buy_route_ready = resolution.legacy_buy_route_ready;
+    record.legacy_buy_route_not_ready_reason = resolution.legacy_buy_route_not_ready_reason;
     record.execution_feasibility_status = execution_feasibility_status;
     record.execution_feasibility_reason = execution_feasibility_reason;
     record.route_resolution_terminal_reason = terminal_reason;
@@ -6719,6 +7164,20 @@ struct P37ShadowProbeExecutionDiagnostics {
     fallback_required_precheck_account_set: Vec<String>,
     fallback_failure_class: Option<String>,
     no_executable_route_account_set_reason: Option<String>,
+    legacy_buy_account_set_status: Option<String>,
+    legacy_buy_curve_pubkey: Option<String>,
+    legacy_buy_curve_source: Option<String>,
+    legacy_buy_curve_authority_status: Option<String>,
+    legacy_buy_curve_rpc_load_status: Option<String>,
+    legacy_buy_curve_rpc_load_ready: Option<bool>,
+    legacy_buy_associated_bonding_curve_pubkey: Option<String>,
+    legacy_buy_associated_bonding_curve_source: Option<String>,
+    legacy_buy_associated_bonding_curve_rpc_load_ready: Option<bool>,
+    legacy_buy_required_roles: Vec<String>,
+    legacy_buy_missing_roles: Vec<String>,
+    legacy_buy_missing_pubkeys: Vec<String>,
+    legacy_buy_route_ready: Option<bool>,
+    legacy_buy_route_not_ready_reason: Option<String>,
     execution_feasibility_status: Option<String>,
     execution_feasibility_reason: Option<String>,
     route_resolution_terminal_reason: Option<String>,
@@ -6780,6 +7239,9 @@ fn p37_shadow_probe_account_overrides_present(
         || overrides.associated_bonding_curve.is_some()
         || overrides.bonding_curve_v2.is_some()
         || overrides.legacy_buy_curve.is_some()
+        || overrides.legacy_buy_curve_pubkey.is_some()
+        || overrides.legacy_buy_curve_source.is_some()
+        || overrides.legacy_buy_curve_authority_status.is_some()
 }
 
 #[derive(Debug, Clone)]
@@ -6860,11 +7322,18 @@ fn p37_shadow_probe_derive_account_override_context_for_pool(
         Some(trigger::PumpfunBuyVariant::LegacyBuy)
             | Some(trigger::PumpfunBuyVariant::RoutedExactSolIn)
     ) {
-        account_overrides.legacy_buy_curve = oracle_runtime
-            .resolve_trigger_buy_curve(buy_mint, buffered_txs)
+        if let Some(materialization) = oracle_runtime
+            .resolve_trigger_buy_curve_materialization(buy_mint, buffered_txs)
             .or_else(|| {
-                p37_shadow_probe_legacy_curve_snapshot_for_pool(record, pool_data, buy_mint)
-            });
+                p37_shadow_probe_legacy_curve_materialization_for_pool(record, pool_data, buy_mint)
+            })
+        {
+            account_overrides.legacy_buy_curve = Some(materialization.curve);
+            account_overrides.legacy_buy_curve_pubkey = Some(materialization.pubkey);
+            account_overrides.legacy_buy_curve_source = Some(materialization.source);
+            account_overrides.legacy_buy_curve_authority_status =
+                Some(materialization.authority_status);
+        }
     }
     P37ShadowProbeAccountOverrideContext {
         account_overrides,
@@ -6902,6 +7371,21 @@ fn p37_shadow_probe_legacy_curve_snapshot_for_pool(
         return None;
     }
     record.legacy_bonding_curve_snapshot
+}
+
+fn p37_shadow_probe_legacy_curve_materialization_for_pool(
+    record: &P37ShadowProbeSelectionRecord,
+    pool_data: &DetectedPool,
+    buy_mint: Pubkey,
+) -> Option<P37LegacyBuyCurveMaterialization> {
+    let curve = p37_shadow_probe_legacy_curve_snapshot_for_pool(record, pool_data, buy_mint)?;
+    let pubkey = Pubkey::try_from(pool_data.bonding_curve.as_str()).ok()?;
+    Some(P37LegacyBuyCurveMaterialization {
+        curve,
+        pubkey,
+        source: "materialized_feature_set".to_string(),
+        authority_status: "authoritative_mfs".to_string(),
+    })
 }
 
 fn p37_shadow_probe_execution_precheck(
@@ -7106,6 +7590,7 @@ fn p37_shadow_probe_as_bonding_curve_v2_source_precheck_skip(
         no_executable_route_account_set_reason: record.bonding_curve_v2_pubkey.as_ref().map(
             |pubkey| format!("primary_route_identity_not_authoritative:bonding_curve_v2:{pubkey}"),
         ),
+        ..Default::default()
     };
     p37_shadow_probe_apply_route_resolution_to_record(&mut record, route_resolution);
     p37_shadow_probe_as_precheck_skip(record, reason)
@@ -7252,6 +7737,17 @@ fn p37_shadow_probe_account_manifest(
                     .is_some_and(|value| value == *pubkey)
             {
                 "observed_tx_account_meta".to_string()
+            } else if role == "bonding_curve"
+                && request
+                    .account_overrides
+                    .legacy_buy_curve_pubkey
+                    .is_some_and(|value| value == *pubkey)
+            {
+                request
+                    .account_overrides
+                    .legacy_buy_curve_source
+                    .clone()
+                    .unwrap_or_else(|| "legacy_buy_curve".to_string())
             } else {
                 p37_shadow_probe_account_source(&role).to_string()
             };
@@ -7299,6 +7795,20 @@ fn p37_shadow_probe_account_manifest(
                         Some("unknown_bonding_curve_v2_source".to_string()),
                     ),
                 }
+            } else if role == "bonding_curve" {
+                let status = request
+                    .account_overrides
+                    .legacy_buy_curve_authority_status
+                    .clone()
+                    .unwrap_or_else(|| "derived_unverified".to_string());
+                let mismatch = (!status.starts_with("authoritative_")).then(|| {
+                    if status == "derived_unverified" {
+                        "legacy_buy_curve_source_not_authoritative".to_string()
+                    } else {
+                        format!("legacy_buy_curve_authority_{status}")
+                    }
+                });
+                (Some(status), mismatch)
             } else {
                 (None, None)
             };
@@ -8074,6 +8584,23 @@ fn active_shadow_account_diagnostics_from_account_set(
         fallback_failure_class: route_resolution.fallback_failure_class,
         no_executable_route_account_set_reason: route_resolution
             .no_executable_route_account_set_reason,
+        legacy_buy_account_set_status: route_resolution.legacy_buy_account_set_status,
+        legacy_buy_curve_pubkey: route_resolution.legacy_buy_curve_pubkey,
+        legacy_buy_curve_source: route_resolution.legacy_buy_curve_source,
+        legacy_buy_curve_authority_status: route_resolution.legacy_buy_curve_authority_status,
+        legacy_buy_curve_rpc_load_status: route_resolution.legacy_buy_curve_rpc_load_status,
+        legacy_buy_curve_rpc_load_ready: route_resolution.legacy_buy_curve_rpc_load_ready,
+        legacy_buy_associated_bonding_curve_pubkey: route_resolution
+            .legacy_buy_associated_bonding_curve_pubkey,
+        legacy_buy_associated_bonding_curve_source: route_resolution
+            .legacy_buy_associated_bonding_curve_source,
+        legacy_buy_associated_bonding_curve_rpc_load_ready: route_resolution
+            .legacy_buy_associated_bonding_curve_rpc_load_ready,
+        legacy_buy_required_roles: route_resolution.legacy_buy_required_roles,
+        legacy_buy_missing_roles: route_resolution.legacy_buy_missing_roles,
+        legacy_buy_missing_pubkeys: route_resolution.legacy_buy_missing_pubkeys,
+        legacy_buy_route_ready: route_resolution.legacy_buy_route_ready,
+        legacy_buy_route_not_ready_reason: route_resolution.legacy_buy_route_not_ready_reason,
         precheck_account_set_hash: account_set_diagnostics
             .and_then(|diagnostics| diagnostics.precheck_account_set_hash.clone()),
         prepared_request_account_set_hash: account_set_diagnostics
@@ -8158,6 +8685,11 @@ fn p37_shadow_probe_account_role(
     if let Some(value) = request.account_overrides.associated_bonding_curve {
         if pubkey == value.to_string() {
             return Some("associated_bonding_curve".to_string());
+        }
+    }
+    if let Some(value) = request.account_overrides.legacy_buy_curve_pubkey {
+        if pubkey == value.to_string() {
+            return Some("bonding_curve".to_string());
         }
     }
     if let Some(value) = request.account_overrides.creator_pubkey {
@@ -9036,6 +9568,23 @@ fn p37_shadow_probe_execution_diagnostics(
         fallback_failure_class: route_resolution.fallback_failure_class,
         no_executable_route_account_set_reason: route_resolution
             .no_executable_route_account_set_reason,
+        legacy_buy_account_set_status: route_resolution.legacy_buy_account_set_status,
+        legacy_buy_curve_pubkey: route_resolution.legacy_buy_curve_pubkey,
+        legacy_buy_curve_source: route_resolution.legacy_buy_curve_source,
+        legacy_buy_curve_authority_status: route_resolution.legacy_buy_curve_authority_status,
+        legacy_buy_curve_rpc_load_status: route_resolution.legacy_buy_curve_rpc_load_status,
+        legacy_buy_curve_rpc_load_ready: route_resolution.legacy_buy_curve_rpc_load_ready,
+        legacy_buy_associated_bonding_curve_pubkey: route_resolution
+            .legacy_buy_associated_bonding_curve_pubkey,
+        legacy_buy_associated_bonding_curve_source: route_resolution
+            .legacy_buy_associated_bonding_curve_source,
+        legacy_buy_associated_bonding_curve_rpc_load_ready: route_resolution
+            .legacy_buy_associated_bonding_curve_rpc_load_ready,
+        legacy_buy_required_roles: route_resolution.legacy_buy_required_roles,
+        legacy_buy_missing_roles: route_resolution.legacy_buy_missing_roles,
+        legacy_buy_missing_pubkeys: route_resolution.legacy_buy_missing_pubkeys,
+        legacy_buy_route_ready: route_resolution.legacy_buy_route_ready,
+        legacy_buy_route_not_ready_reason: route_resolution.legacy_buy_route_not_ready_reason,
         execution_feasibility_status,
         execution_feasibility_reason,
         route_resolution_terminal_reason,
@@ -9300,6 +9849,23 @@ fn p37_shadow_probe_transport_from_event(
         fallback_required_precheck_account_set: diagnostics.fallback_required_precheck_account_set,
         fallback_failure_class: diagnostics.fallback_failure_class,
         no_executable_route_account_set_reason: diagnostics.no_executable_route_account_set_reason,
+        legacy_buy_account_set_status: diagnostics.legacy_buy_account_set_status,
+        legacy_buy_curve_pubkey: diagnostics.legacy_buy_curve_pubkey,
+        legacy_buy_curve_source: diagnostics.legacy_buy_curve_source,
+        legacy_buy_curve_authority_status: diagnostics.legacy_buy_curve_authority_status,
+        legacy_buy_curve_rpc_load_status: diagnostics.legacy_buy_curve_rpc_load_status,
+        legacy_buy_curve_rpc_load_ready: diagnostics.legacy_buy_curve_rpc_load_ready,
+        legacy_buy_associated_bonding_curve_pubkey: diagnostics
+            .legacy_buy_associated_bonding_curve_pubkey,
+        legacy_buy_associated_bonding_curve_source: diagnostics
+            .legacy_buy_associated_bonding_curve_source,
+        legacy_buy_associated_bonding_curve_rpc_load_ready: diagnostics
+            .legacy_buy_associated_bonding_curve_rpc_load_ready,
+        legacy_buy_required_roles: diagnostics.legacy_buy_required_roles,
+        legacy_buy_missing_roles: diagnostics.legacy_buy_missing_roles,
+        legacy_buy_missing_pubkeys: diagnostics.legacy_buy_missing_pubkeys,
+        legacy_buy_route_ready: diagnostics.legacy_buy_route_ready,
+        legacy_buy_route_not_ready_reason: diagnostics.legacy_buy_route_not_ready_reason,
         execution_feasibility_status: diagnostics.execution_feasibility_status,
         execution_feasibility_reason: diagnostics.execution_feasibility_reason,
         route_resolution_terminal_reason: diagnostics.route_resolution_terminal_reason,
@@ -9515,6 +10081,23 @@ fn p37_shadow_probe_transport_from_error(
         fallback_required_precheck_account_set: diagnostics.fallback_required_precheck_account_set,
         fallback_failure_class: diagnostics.fallback_failure_class,
         no_executable_route_account_set_reason: diagnostics.no_executable_route_account_set_reason,
+        legacy_buy_account_set_status: diagnostics.legacy_buy_account_set_status,
+        legacy_buy_curve_pubkey: diagnostics.legacy_buy_curve_pubkey,
+        legacy_buy_curve_source: diagnostics.legacy_buy_curve_source,
+        legacy_buy_curve_authority_status: diagnostics.legacy_buy_curve_authority_status,
+        legacy_buy_curve_rpc_load_status: diagnostics.legacy_buy_curve_rpc_load_status,
+        legacy_buy_curve_rpc_load_ready: diagnostics.legacy_buy_curve_rpc_load_ready,
+        legacy_buy_associated_bonding_curve_pubkey: diagnostics
+            .legacy_buy_associated_bonding_curve_pubkey,
+        legacy_buy_associated_bonding_curve_source: diagnostics
+            .legacy_buy_associated_bonding_curve_source,
+        legacy_buy_associated_bonding_curve_rpc_load_ready: diagnostics
+            .legacy_buy_associated_bonding_curve_rpc_load_ready,
+        legacy_buy_required_roles: diagnostics.legacy_buy_required_roles,
+        legacy_buy_missing_roles: diagnostics.legacy_buy_missing_roles,
+        legacy_buy_missing_pubkeys: diagnostics.legacy_buy_missing_pubkeys,
+        legacy_buy_route_ready: diagnostics.legacy_buy_route_ready,
+        legacy_buy_route_not_ready_reason: diagnostics.legacy_buy_route_not_ready_reason,
         execution_feasibility_status: diagnostics.execution_feasibility_status,
         execution_feasibility_reason: diagnostics.execution_feasibility_reason,
         route_resolution_terminal_reason: diagnostics.route_resolution_terminal_reason,
@@ -11824,9 +12407,18 @@ async fn execute_gatekeeper_buy_path(
                         account_overrides.buy_variant,
                         Some(trigger::PumpfunBuyVariant::LegacyBuy)
                     ) {
-                        account_overrides.legacy_buy_curve = ctx
+                        if let Some(materialization) = ctx
                             .oracle_runtime
-                            .resolve_trigger_buy_curve(buy_mint, buffered_txs);
+                            .resolve_trigger_buy_curve_materialization(buy_mint, buffered_txs)
+                        {
+                            account_overrides.legacy_buy_curve = Some(materialization.curve);
+                            account_overrides.legacy_buy_curve_pubkey =
+                                Some(materialization.pubkey);
+                            account_overrides.legacy_buy_curve_source =
+                                Some(materialization.source);
+                            account_overrides.legacy_buy_curve_authority_status =
+                                Some(materialization.authority_status);
+                        }
                         if account_overrides.legacy_buy_curve.is_none() {
                             warn!(
                                 pool = %pool_amm_id,
@@ -12557,6 +13149,40 @@ fn shadow_entry_record_from_event(
             .clone(),
         fallback_failure_class: event.account_diagnostics.fallback_failure_class.clone(),
         no_executable_route_account_set_reason: None,
+        legacy_buy_account_set_status: event
+            .account_diagnostics
+            .legacy_buy_account_set_status
+            .clone(),
+        legacy_buy_curve_pubkey: event.account_diagnostics.legacy_buy_curve_pubkey.clone(),
+        legacy_buy_curve_source: event.account_diagnostics.legacy_buy_curve_source.clone(),
+        legacy_buy_curve_authority_status: event
+            .account_diagnostics
+            .legacy_buy_curve_authority_status
+            .clone(),
+        legacy_buy_curve_rpc_load_status: event
+            .account_diagnostics
+            .legacy_buy_curve_rpc_load_status
+            .clone(),
+        legacy_buy_curve_rpc_load_ready: event.account_diagnostics.legacy_buy_curve_rpc_load_ready,
+        legacy_buy_associated_bonding_curve_pubkey: event
+            .account_diagnostics
+            .legacy_buy_associated_bonding_curve_pubkey
+            .clone(),
+        legacy_buy_associated_bonding_curve_source: event
+            .account_diagnostics
+            .legacy_buy_associated_bonding_curve_source
+            .clone(),
+        legacy_buy_associated_bonding_curve_rpc_load_ready: event
+            .account_diagnostics
+            .legacy_buy_associated_bonding_curve_rpc_load_ready,
+        legacy_buy_required_roles: event.account_diagnostics.legacy_buy_required_roles.clone(),
+        legacy_buy_missing_roles: event.account_diagnostics.legacy_buy_missing_roles.clone(),
+        legacy_buy_missing_pubkeys: event.account_diagnostics.legacy_buy_missing_pubkeys.clone(),
+        legacy_buy_route_ready: event.account_diagnostics.legacy_buy_route_ready,
+        legacy_buy_route_not_ready_reason: event
+            .account_diagnostics
+            .legacy_buy_route_not_ready_reason
+            .clone(),
         precheck_account_set_hash: None,
         prepared_request_account_set_hash: None,
         simulation_account_set_hash: None,
@@ -12690,6 +13316,20 @@ fn shadow_entry_record_from_request(
         fallback_required_precheck_account_set: Vec::new(),
         fallback_failure_class: None,
         no_executable_route_account_set_reason: None,
+        legacy_buy_account_set_status: None,
+        legacy_buy_curve_pubkey: None,
+        legacy_buy_curve_source: None,
+        legacy_buy_curve_authority_status: None,
+        legacy_buy_curve_rpc_load_status: None,
+        legacy_buy_curve_rpc_load_ready: None,
+        legacy_buy_associated_bonding_curve_pubkey: None,
+        legacy_buy_associated_bonding_curve_source: None,
+        legacy_buy_associated_bonding_curve_rpc_load_ready: None,
+        legacy_buy_required_roles: Vec::new(),
+        legacy_buy_missing_roles: Vec::new(),
+        legacy_buy_missing_pubkeys: Vec::new(),
+        legacy_buy_route_ready: None,
+        legacy_buy_route_not_ready_reason: None,
         precheck_account_set_hash: None,
         prepared_request_account_set_hash: None,
         simulation_account_set_hash: None,
@@ -12842,6 +13482,25 @@ fn enrich_active_shadow_entry_with_account_diagnostics(
     entry.fallback_failure_class = diagnostics.fallback_failure_class.clone();
     entry.no_executable_route_account_set_reason =
         diagnostics.no_executable_route_account_set_reason.clone();
+    entry.legacy_buy_account_set_status = diagnostics.legacy_buy_account_set_status.clone();
+    entry.legacy_buy_curve_pubkey = diagnostics.legacy_buy_curve_pubkey.clone();
+    entry.legacy_buy_curve_source = diagnostics.legacy_buy_curve_source.clone();
+    entry.legacy_buy_curve_authority_status = diagnostics.legacy_buy_curve_authority_status.clone();
+    entry.legacy_buy_curve_rpc_load_status = diagnostics.legacy_buy_curve_rpc_load_status.clone();
+    entry.legacy_buy_curve_rpc_load_ready = diagnostics.legacy_buy_curve_rpc_load_ready;
+    entry.legacy_buy_associated_bonding_curve_pubkey = diagnostics
+        .legacy_buy_associated_bonding_curve_pubkey
+        .clone();
+    entry.legacy_buy_associated_bonding_curve_source = diagnostics
+        .legacy_buy_associated_bonding_curve_source
+        .clone();
+    entry.legacy_buy_associated_bonding_curve_rpc_load_ready =
+        diagnostics.legacy_buy_associated_bonding_curve_rpc_load_ready;
+    entry.legacy_buy_required_roles = diagnostics.legacy_buy_required_roles.clone();
+    entry.legacy_buy_missing_roles = diagnostics.legacy_buy_missing_roles.clone();
+    entry.legacy_buy_missing_pubkeys = diagnostics.legacy_buy_missing_pubkeys.clone();
+    entry.legacy_buy_route_ready = diagnostics.legacy_buy_route_ready;
+    entry.legacy_buy_route_not_ready_reason = diagnostics.legacy_buy_route_not_ready_reason.clone();
     entry.execution_feasibility_status = diagnostics.execution_feasibility_status.clone();
     entry.execution_feasibility_reason = diagnostics.execution_feasibility_reason.clone();
     entry.route_resolution_terminal_reason = diagnostics.route_resolution_terminal_reason.clone();
@@ -13269,6 +13928,34 @@ struct ShadowEntryRecord {
     fallback_failure_class: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     no_executable_route_account_set_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    legacy_buy_account_set_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    legacy_buy_curve_pubkey: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    legacy_buy_curve_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    legacy_buy_curve_authority_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    legacy_buy_curve_rpc_load_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    legacy_buy_curve_rpc_load_ready: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    legacy_buy_associated_bonding_curve_pubkey: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    legacy_buy_associated_bonding_curve_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    legacy_buy_associated_bonding_curve_rpc_load_ready: Option<bool>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    legacy_buy_required_roles: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    legacy_buy_missing_roles: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    legacy_buy_missing_pubkeys: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    legacy_buy_route_ready: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    legacy_buy_route_not_ready_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     precheck_account_set_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -17329,6 +18016,21 @@ mod tests {
         );
         assert_eq!(overrides.legacy_buy_curve, Some(curve));
         assert_eq!(
+            overrides
+                .legacy_buy_curve_pubkey
+                .as_ref()
+                .map(|pubkey| pubkey.to_string()),
+            Some(pool.bonding_curve.clone())
+        );
+        assert_eq!(
+            overrides.legacy_buy_curve_source.as_deref(),
+            Some("materialized_feature_set")
+        );
+        assert_eq!(
+            overrides.legacy_buy_curve_authority_status.as_deref(),
+            Some("authoritative_mfs")
+        );
+        assert_eq!(
             p37_shadow_probe_execution_precheck(&record, &overrides, &buy_mint, &pool),
             None
         );
@@ -17387,6 +18089,21 @@ mod tests {
             Some(trigger::PumpfunBuyVariant::LegacyBuy)
         );
         assert_eq!(overrides.legacy_buy_curve, Some(curve));
+        assert_eq!(
+            overrides
+                .legacy_buy_curve_pubkey
+                .as_ref()
+                .map(|pubkey| pubkey.to_string()),
+            Some(pool.bonding_curve.clone())
+        );
+        assert_eq!(
+            overrides.legacy_buy_curve_source.as_deref(),
+            Some("materialized_feature_set")
+        );
+        assert_eq!(
+            overrides.legacy_buy_curve_authority_status.as_deref(),
+            Some("authoritative_mfs")
+        );
         assert_eq!(
             p37_shadow_probe_execution_precheck(&record, &overrides, &buy_mint, &pool),
             None
@@ -17531,6 +18248,26 @@ mod tests {
         entry.observed_bcv2_tx_success = Some(true);
         entry.observed_bcv2_provenance_status = Some("route_compatible".to_string());
         entry
+    }
+
+    fn p37_shadow_probe_test_legacy_curve_manifest_entry(
+        pubkey: Pubkey,
+    ) -> P37ShadowProbeAccountManifestEntry {
+        P37ShadowProbeAccountManifestEntry {
+            pubkey: pubkey.to_string(),
+            role: "bonding_curve".to_string(),
+            source: "materialized_feature_set".to_string(),
+            source_authority_status: Some("authoritative_mfs".to_string()),
+            source_mismatch_reason: None,
+            instruction_index: Some(0),
+            account_index: Some(3),
+            is_signer: Some(false),
+            is_writable: Some(true),
+            required: true,
+            route_kind: Some("legacy_buy".to_string()),
+            buy_variant: Some("legacy_buy".to_string()),
+            ..Default::default()
+        }
     }
 
     fn p37_shadow_probe_test_legacy_curve() -> BondingCurve {
@@ -17824,12 +18561,19 @@ mod tests {
     fn p37_route_resolver_primary_bcv2_missing_attempts_fallback() {
         let mut request = test_prepared_buy_request();
         let bcv2 = Pubkey::new_unique().to_string();
+        let legacy_curve_pubkey = Pubkey::new_unique();
         request.account_overrides.buy_variant = Some(trigger::PumpfunBuyVariant::RoutedExactSolIn);
         request.account_overrides.legacy_buy_curve = Some(p37_shadow_probe_test_legacy_curve());
+        request.account_overrides.legacy_buy_curve_pubkey = Some(legacy_curve_pubkey);
+        request.account_overrides.legacy_buy_curve_source =
+            Some("materialized_feature_set".to_string());
+        request.account_overrides.legacy_buy_curve_authority_status =
+            Some("authoritative_mfs".to_string());
         let diagnostics = P37ShadowProbeAccountSetDiagnostics {
-            manifest: vec![p37_shadow_probe_route_compatible_bcv2_manifest_entry(
-                bcv2.clone(),
-            )],
+            manifest: vec![
+                p37_shadow_probe_test_legacy_curve_manifest_entry(legacy_curve_pubkey),
+                p37_shadow_probe_route_compatible_bcv2_manifest_entry(bcv2.clone()),
+            ],
             missing_candidates: vec![P37ShadowProbeAccountNotFoundCandidate {
                 pubkey: bcv2.clone(),
                 role: "bonding_curve_v2".to_string(),
@@ -17839,6 +18583,7 @@ mod tests {
                 required: true,
                 ..Default::default()
             }],
+            manifest_lookup_performed: true,
             ..Default::default()
         };
 
@@ -17871,6 +18616,28 @@ mod tests {
         assert_eq!(
             resolution.fallback_route_not_ready_reason.as_deref(),
             Some("fallback_route_requires_same_bcv2_simulation_load_account")
+        );
+        let legacy_curve_pubkey_string = legacy_curve_pubkey.to_string();
+        assert_eq!(
+            resolution.legacy_buy_curve_pubkey.as_deref(),
+            Some(legacy_curve_pubkey_string.as_str())
+        );
+        assert_eq!(
+            resolution.legacy_buy_curve_source.as_deref(),
+            Some("materialized_feature_set")
+        );
+        assert_eq!(
+            resolution.legacy_buy_curve_authority_status.as_deref(),
+            Some("authoritative_mfs")
+        );
+        assert_eq!(
+            resolution.legacy_buy_curve_rpc_load_status.as_deref(),
+            Some("present_on_rpc_precheck")
+        );
+        assert_eq!(resolution.legacy_buy_curve_rpc_load_ready, Some(true));
+        assert_eq!(
+            resolution.legacy_buy_route_not_ready_reason.as_deref(),
+            Some("legacy_buy_missing_route_identity")
         );
         assert_eq!(
             resolution.fallback_failure_class.as_deref(),
@@ -17929,6 +18696,74 @@ mod tests {
         );
         assert_eq!(
             resolution.no_executable_reason().as_deref(),
+            Some(expected_reason.as_str())
+        );
+    }
+
+    #[test]
+    fn p37_route_resolver_legacy_buy_missing_required_account_fails_closed() {
+        let mut request = test_prepared_buy_request();
+        let legacy_curve_pubkey = Pubkey::new_unique();
+        let associated_curve_pubkey = Pubkey::new_unique().to_string();
+        request.account_overrides.buy_variant = Some(trigger::PumpfunBuyVariant::LegacyBuy);
+        request.account_overrides.legacy_buy_curve = Some(p37_shadow_probe_test_legacy_curve());
+        request.account_overrides.legacy_buy_curve_pubkey = Some(legacy_curve_pubkey);
+        request.account_overrides.legacy_buy_curve_source =
+            Some("materialized_feature_set".to_string());
+        request.account_overrides.legacy_buy_curve_authority_status =
+            Some("authoritative_mfs".to_string());
+
+        let diagnostics = P37ShadowProbeAccountSetDiagnostics {
+            manifest: vec![p37_shadow_probe_test_legacy_curve_manifest_entry(
+                legacy_curve_pubkey,
+            )],
+            missing_candidates: vec![P37ShadowProbeAccountNotFoundCandidate {
+                pubkey: associated_curve_pubkey.clone(),
+                role: "associated_bonding_curve".to_string(),
+                source: "route_builder".to_string(),
+                instruction_index: Some(0),
+                account_index: Some(4),
+                required: true,
+                ..Default::default()
+            }],
+            manifest_lookup_performed: true,
+            ..Default::default()
+        };
+
+        let resolution = p37_shadow_probe_route_resolution_diagnostics(
+            Some(&request),
+            Some(&diagnostics),
+            None,
+            Some(("associated_bonding_curve", associated_curve_pubkey.as_str())),
+        );
+
+        assert_eq!(
+            resolution.route_resolution_status.as_deref(),
+            Some("no_executable_route_account_set")
+        );
+        assert_eq!(resolution.selected_route_kind, None);
+        assert_eq!(resolution.primary_route_kind.as_deref(), Some("legacy_buy"));
+        assert_eq!(resolution.primary_route_ready, Some(false));
+        assert_eq!(
+            resolution.primary_route_not_ready_reason.as_deref(),
+            Some("legacy_buy_missing_associated_bonding_curve")
+        );
+        assert_eq!(resolution.fallback_route_attempted, Some(false));
+        assert_eq!(resolution.legacy_buy_curve_rpc_load_ready, Some(true));
+        assert_eq!(resolution.legacy_buy_route_ready, Some(false));
+        assert_eq!(
+            resolution.legacy_buy_route_not_ready_reason.as_deref(),
+            Some("legacy_buy_missing_associated_bonding_curve")
+        );
+        assert_eq!(
+            resolution.fallback_failure_class.as_deref(),
+            Some("fallback_missing_associated_bonding_curve")
+        );
+        let expected_reason = format!(
+            "legacy_buy_missing_associated_bonding_curve:bonding_curve:{legacy_curve_pubkey}"
+        );
+        assert_eq!(
+            resolution.no_executable_route_account_set_reason.as_deref(),
             Some(expected_reason.as_str())
         );
     }

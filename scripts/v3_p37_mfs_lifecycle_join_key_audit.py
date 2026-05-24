@@ -654,6 +654,125 @@ def fallback_decision_payload(failed_rows: list[dict[str, Any]]) -> dict[str, An
     }
 
 
+def is_legacy_buy_route_row(row: dict[str, Any]) -> bool:
+    return (
+        row_string(row, "fallback_route_kind") in {"legacy_buy", "LegacyBuy"}
+        or row_string(row, "selected_route_kind") in {"legacy_buy", "LegacyBuy"}
+        or row_string(row, "buy_variant") in {"legacy_buy", "LegacyBuy"}
+    )
+
+
+def legacy_buy_curve_is_authoritative(row: dict[str, Any]) -> bool:
+    authority = row_string(row, "legacy_buy_curve_authority_status")
+    if authority and authority.startswith("authoritative_"):
+        return True
+    source = row_string(row, "legacy_buy_curve_source")
+    return source in {
+        "observed_tx_account_meta",
+        "materialized_feature_set",
+        "mfs",
+        "account_state_core",
+        "diag_account_update",
+        "diag",
+    }
+
+
+def legacy_buy_route_ready(row: dict[str, Any]) -> bool:
+    if row_bool_string(row, "legacy_buy_route_ready") == "true":
+        return True
+    return (
+        row_string(row, "route_resolution_status") == "fallback_route_ready"
+        and row_string(row, "selected_route_kind") in {"legacy_buy", "LegacyBuy"}
+    )
+
+
+def legacy_buy_missing_core_curve(row: dict[str, Any]) -> bool:
+    return (
+        row_string(row, "legacy_buy_route_not_ready_reason")
+        == "legacy_buy_missing_core_curve_account"
+        or row_string(row, "fallback_route_not_ready_reason")
+        == "fallback_route_missing_legacy_buy_curve"
+        or row_string(row, "fallback_failure_class") == "fallback_missing_core_curve_account"
+        or "bonding_curve" in set(row_string_list(row, "legacy_buy_missing_roles"))
+        or "bonding_curve" in set(row_string_list(row, "fallback_missing_roles"))
+    )
+
+
+def legacy_buy_missing_associated_curve(row: dict[str, Any]) -> bool:
+    return (
+        row_string(row, "legacy_buy_route_not_ready_reason")
+        == "legacy_buy_missing_associated_bonding_curve"
+        or row_string(row, "fallback_failure_class")
+        == "fallback_missing_associated_bonding_curve"
+        or "associated_bonding_curve" in set(row_string_list(row, "legacy_buy_missing_roles"))
+        or "associated_bonding_curve" in set(row_string_list(row, "fallback_missing_roles"))
+    )
+
+
+def legacy_buy_route_payload(
+    route_rows: list[dict[str, Any]],
+    successful_entry_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    attempted_rows = [row for row in route_rows if is_legacy_buy_route_row(row)]
+    ready_rows = [row for row in attempted_rows if legacy_buy_route_ready(row)]
+    not_ready_rows = [row for row in attempted_rows if row not in ready_rows]
+    missing_core_rows = [row for row in attempted_rows if legacy_buy_missing_core_curve(row)]
+    missing_associated_rows = [
+        row for row in attempted_rows if legacy_buy_missing_associated_curve(row)
+    ]
+    authoritative_curve_rows = [
+        row for row in attempted_rows if legacy_buy_curve_is_authoritative(row)
+    ]
+    rpc_load_ready_rows = [
+        row
+        for row in attempted_rows
+        if row_bool_string(row, "legacy_buy_curve_rpc_load_ready") == "true"
+    ]
+    success_rows = [row for row in successful_entry_rows if is_legacy_buy_route_row(row)]
+    status_counts = Counter(
+        row_string(row, "legacy_buy_account_set_status") or "unknown"
+        for row in attempted_rows
+    )
+    source_counts = Counter(
+        row_string(row, "legacy_buy_curve_source")
+        for row in attempted_rows
+        if row_string(row, "legacy_buy_curve_source")
+    )
+    authority_counts = Counter(
+        row_string(row, "legacy_buy_curve_authority_status")
+        for row in attempted_rows
+        if row_string(row, "legacy_buy_curve_authority_status")
+    )
+    rpc_status_counts = Counter(
+        row_string(row, "legacy_buy_curve_rpc_load_status")
+        for row in attempted_rows
+        if row_string(row, "legacy_buy_curve_rpc_load_status")
+    )
+    not_ready_reason_counts = Counter(
+        row_string(row, "legacy_buy_route_not_ready_reason")
+        or row_string(row, "fallback_route_not_ready_reason")
+        or "unknown"
+        for row in not_ready_rows
+    )
+    return {
+        "legacy_buy_route_attempted_rows": len(attempted_rows),
+        "legacy_buy_route_ready_rows": len(ready_rows),
+        "legacy_buy_route_not_ready_rows": len(not_ready_rows),
+        "legacy_buy_missing_core_curve_account_rows": len(missing_core_rows),
+        "legacy_buy_missing_associated_bonding_curve_rows": len(missing_associated_rows),
+        "legacy_buy_authoritative_curve_rows": len(authoritative_curve_rows),
+        "legacy_buy_rpc_load_ready_rows": len(rpc_load_ready_rows),
+        "legacy_buy_successful_entry_rows": len(success_rows),
+        "legacy_buy_account_set_status_counts": dict(sorted(status_counts.items())),
+        "legacy_buy_curve_source_counts": dict(sorted(source_counts.items())),
+        "legacy_buy_curve_authority_status_counts": dict(sorted(authority_counts.items())),
+        "legacy_buy_curve_rpc_load_status_counts": dict(sorted(rpc_status_counts.items())),
+        "legacy_buy_route_not_ready_reason_counts": dict(
+            sorted(not_ready_reason_counts.items())
+        ),
+    }
+
+
 EXECUTABLE_ROUTE_STATUSES = {"primary_route_ready", "fallback_route_ready"}
 NON_EXECUTABLE_ROUTE_STATUSES = {"no_executable_route_account_set"}
 
@@ -1430,6 +1549,7 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
         == "authoritative_observed_tx"
         and row_string(row, "observed_bcv2_provenance_status") != "route_compatible"
     ]
+    legacy_buy = legacy_buy_route_payload(skip_rows + transport_rows, successful_probe_entry_rows)
     return {
         "transport_rows": transport_rows_total,
         "probe_selected_rows": len(selection_rows),
@@ -1518,6 +1638,7 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
             observed_bcv2_authoritative_without_route_compatible_rows
         ),
         "route_fallback_status_counts": dict(sorted(route_fallback_status_counts.items())),
+        **legacy_buy,
         "amount_guard_status_counts": dict(sorted(amount_guard_status_counts.items())),
         "simulation_error_category_counts": dict(sorted(simulation_error_category_counts.items())),
         "simulation_error_kind_counts": dict(sorted(simulation_error_kind_counts.items())),
@@ -1946,6 +2067,13 @@ def active_shadow_dispatch_diagnostics(paths: dict[str, list[Path]]) -> dict[str
         == "authoritative_observed_tx"
         and row_string(row, "observed_bcv2_provenance_status") != "route_compatible"
     ]
+    legacy_buy = {
+        f"active_shadow_{key}": value
+        for key, value in legacy_buy_route_payload(
+            failure_rows,
+            successful_entry_rows,
+        ).items()
+    }
 
     return {
         "active_shadow_transport_rows": len(transport_rows),
@@ -2056,6 +2184,7 @@ def active_shadow_dispatch_diagnostics(paths: dict[str, list[Path]]) -> dict[str
         "active_shadow_route_fallback_status_counts": dict(
             sorted(route_fallback_status_counts.items())
         ),
+        **legacy_buy,
         "active_shadow_route_excluded_bcv2_missing_rows": len(
             route_excluded_bcv2_missing_rows
         ),
@@ -2754,6 +2883,19 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- active_shadow_route_fallback_attempted_rows: `{active_shadow['active_shadow_route_fallback_attempted_rows']}`",
             f"- active_shadow_route_fallback_success_rows: `{active_shadow['active_shadow_route_fallback_success_rows']}`",
             f"- active_shadow_route_fallback_failed_rows: `{active_shadow['active_shadow_route_fallback_failed_rows']}`",
+            f"- active_shadow_legacy_buy_route_attempted_rows: `{active_shadow['active_shadow_legacy_buy_route_attempted_rows']}`",
+            f"- active_shadow_legacy_buy_route_ready_rows: `{active_shadow['active_shadow_legacy_buy_route_ready_rows']}`",
+            f"- active_shadow_legacy_buy_route_not_ready_rows: `{active_shadow['active_shadow_legacy_buy_route_not_ready_rows']}`",
+            f"- active_shadow_legacy_buy_missing_core_curve_account_rows: `{active_shadow['active_shadow_legacy_buy_missing_core_curve_account_rows']}`",
+            f"- active_shadow_legacy_buy_missing_associated_bonding_curve_rows: `{active_shadow['active_shadow_legacy_buy_missing_associated_bonding_curve_rows']}`",
+            f"- active_shadow_legacy_buy_authoritative_curve_rows: `{active_shadow['active_shadow_legacy_buy_authoritative_curve_rows']}`",
+            f"- active_shadow_legacy_buy_rpc_load_ready_rows: `{active_shadow['active_shadow_legacy_buy_rpc_load_ready_rows']}`",
+            f"- active_shadow_legacy_buy_successful_entry_rows: `{active_shadow['active_shadow_legacy_buy_successful_entry_rows']}`",
+            f"- active_shadow_legacy_buy_account_set_status_counts: `{json.dumps(active_shadow['active_shadow_legacy_buy_account_set_status_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_legacy_buy_curve_source_counts: `{json.dumps(active_shadow['active_shadow_legacy_buy_curve_source_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_legacy_buy_curve_authority_status_counts: `{json.dumps(active_shadow['active_shadow_legacy_buy_curve_authority_status_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_legacy_buy_curve_rpc_load_status_counts: `{json.dumps(active_shadow['active_shadow_legacy_buy_curve_rpc_load_status_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_legacy_buy_route_not_ready_reason_counts: `{json.dumps(active_shadow['active_shadow_legacy_buy_route_not_ready_reason_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- active_shadow_fallback_failure_class_counts: `{json.dumps(active_shadow['active_shadow_fallback_failure_class_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- active_shadow_fallback_missing_role_counts: `{json.dumps(active_shadow['active_shadow_fallback_missing_role_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- active_shadow_fallback_account_source_counts: `{json.dumps(active_shadow['active_shadow_fallback_account_source_counts'], ensure_ascii=False, sort_keys=True)}`",
@@ -2823,6 +2965,19 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- route_fallback_attempted_rows: `{materialization['route_fallback_attempted_rows']}`",
             f"- route_fallback_success_rows: `{materialization['route_fallback_success_rows']}`",
             f"- route_fallback_failed_rows: `{materialization['route_fallback_failed_rows']}`",
+            f"- legacy_buy_route_attempted_rows: `{materialization['legacy_buy_route_attempted_rows']}`",
+            f"- legacy_buy_route_ready_rows: `{materialization['legacy_buy_route_ready_rows']}`",
+            f"- legacy_buy_route_not_ready_rows: `{materialization['legacy_buy_route_not_ready_rows']}`",
+            f"- legacy_buy_missing_core_curve_account_rows: `{materialization['legacy_buy_missing_core_curve_account_rows']}`",
+            f"- legacy_buy_missing_associated_bonding_curve_rows: `{materialization['legacy_buy_missing_associated_bonding_curve_rows']}`",
+            f"- legacy_buy_authoritative_curve_rows: `{materialization['legacy_buy_authoritative_curve_rows']}`",
+            f"- legacy_buy_rpc_load_ready_rows: `{materialization['legacy_buy_rpc_load_ready_rows']}`",
+            f"- legacy_buy_successful_entry_rows: `{materialization['legacy_buy_successful_entry_rows']}`",
+            f"- legacy_buy_account_set_status_counts: `{json.dumps(materialization['legacy_buy_account_set_status_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- legacy_buy_curve_source_counts: `{json.dumps(materialization['legacy_buy_curve_source_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- legacy_buy_curve_authority_status_counts: `{json.dumps(materialization['legacy_buy_curve_authority_status_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- legacy_buy_curve_rpc_load_status_counts: `{json.dumps(materialization['legacy_buy_curve_rpc_load_status_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- legacy_buy_route_not_ready_reason_counts: `{json.dumps(materialization['legacy_buy_route_not_ready_reason_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- fallback_failure_class_counts: `{json.dumps(materialization['fallback_failure_class_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- fallback_missing_role_counts: `{json.dumps(materialization['fallback_missing_role_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- fallback_account_source_counts: `{json.dumps(materialization['fallback_account_source_counts'], ensure_ascii=False, sort_keys=True)}`",

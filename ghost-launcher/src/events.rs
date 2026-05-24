@@ -228,6 +228,34 @@ pub struct ShadowSimulationAccountDiagnostics {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_executable_route_account_set_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_buy_account_set_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_buy_curve_pubkey: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_buy_curve_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_buy_curve_authority_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_buy_curve_rpc_load_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_buy_curve_rpc_load_ready: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_buy_associated_bonding_curve_pubkey: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_buy_associated_bonding_curve_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_buy_associated_bonding_curve_rpc_load_ready: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub legacy_buy_required_roles: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub legacy_buy_missing_roles: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub legacy_buy_missing_pubkeys: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_buy_route_ready: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_buy_route_not_ready_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub precheck_account_set_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prepared_request_account_set_hash: Option<String>,

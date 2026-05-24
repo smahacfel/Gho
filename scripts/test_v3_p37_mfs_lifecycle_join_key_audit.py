@@ -1786,6 +1786,20 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
                 "no_executable_route_account_set_reason": (
                     "primary_route_bcv2_missing:bonding_curve_v2:bc-v2"
                 ),
+                "legacy_buy_account_set_status": "not_ready",
+                "legacy_buy_curve_pubkey": "legacy-curve",
+                "legacy_buy_curve_source": "materialized_feature_set",
+                "legacy_buy_curve_authority_status": "authoritative_mfs",
+                "legacy_buy_curve_rpc_load_status": "present",
+                "legacy_buy_curve_rpc_load_ready": True,
+                "legacy_buy_associated_bonding_curve_pubkey": "associated-curve",
+                "legacy_buy_associated_bonding_curve_source": "route_builder",
+                "legacy_buy_associated_bonding_curve_rpc_load_ready": True,
+                "legacy_buy_required_roles": ["bonding_curve", "bonding_curve_v2"],
+                "legacy_buy_missing_roles": ["bonding_curve_v2"],
+                "legacy_buy_missing_pubkeys": ["bc-v2"],
+                "legacy_buy_route_ready": False,
+                "legacy_buy_route_not_ready_reason": "legacy_buy_missing_route_identity",
             }
             no_executable_reason = (
                 "no_executable_route_account_set:"
@@ -1836,6 +1850,21 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
         self.assertEqual(materialization["route_fallback_attempted_rows"], 1)
         self.assertEqual(materialization["route_fallback_success_rows"], 0)
         self.assertEqual(materialization["route_fallback_failed_rows"], 1)
+        self.assertEqual(materialization["legacy_buy_route_attempted_rows"], 1)
+        self.assertEqual(materialization["legacy_buy_route_ready_rows"], 0)
+        self.assertEqual(materialization["legacy_buy_route_not_ready_rows"], 1)
+        self.assertEqual(materialization["legacy_buy_missing_core_curve_account_rows"], 0)
+        self.assertEqual(
+            materialization["legacy_buy_missing_associated_bonding_curve_rows"],
+            0,
+        )
+        self.assertEqual(materialization["legacy_buy_authoritative_curve_rows"], 1)
+        self.assertEqual(materialization["legacy_buy_rpc_load_ready_rows"], 1)
+        self.assertEqual(materialization["legacy_buy_successful_entry_rows"], 0)
+        self.assertEqual(
+            materialization["legacy_buy_curve_authority_status_counts"],
+            {"authoritative_mfs": 1},
+        )
         self.assertEqual(
             materialization["fallback_failure_class_counts"],
             {"fallback_builder_account_source_unverified": 1},
@@ -1880,6 +1909,16 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
         self.assertEqual(active["active_shadow_route_fallback_attempted_rows"], 1)
         self.assertEqual(active["active_shadow_route_fallback_success_rows"], 0)
         self.assertEqual(active["active_shadow_route_fallback_failed_rows"], 1)
+        self.assertEqual(active["active_shadow_legacy_buy_route_attempted_rows"], 1)
+        self.assertEqual(active["active_shadow_legacy_buy_route_ready_rows"], 0)
+        self.assertEqual(active["active_shadow_legacy_buy_route_not_ready_rows"], 1)
+        self.assertEqual(
+            active["active_shadow_legacy_buy_missing_core_curve_account_rows"],
+            0,
+        )
+        self.assertEqual(active["active_shadow_legacy_buy_authoritative_curve_rows"], 1)
+        self.assertEqual(active["active_shadow_legacy_buy_rpc_load_ready_rows"], 1)
+        self.assertEqual(active["active_shadow_legacy_buy_successful_entry_rows"], 0)
         self.assertEqual(
             active["active_shadow_fallback_failure_class_counts"],
             {"fallback_builder_account_source_unverified": 1},
