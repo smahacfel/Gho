@@ -89,18 +89,69 @@ def ghost_brain_config_path(config: dict[str, Any], config_path: Path) -> Path:
     return resolve_path(raw, config_path.parent) if raw else Path()
 
 
-def ghost_brain_replay_payload_enabled(config: dict[str, Any], config_path: Path) -> tuple[bool, str]:
+def load_ghost_brain_config(config: dict[str, Any], config_path: Path) -> tuple[dict[str, Any] | None, str]:
     path = ghost_brain_config_path(config, config_path)
     if not path:
-        return False, "missing_ghost_brain_config_path"
+        return None, "missing_ghost_brain_config_path"
     if not path.exists():
-        return False, f"ghost_brain_config_missing:{path}"
+        return None, f"ghost_brain_config_missing:{path}"
     try:
-        brain = load_toml(path)
+        return load_toml(path), "ok"
     except Exception as err:  # pragma: no cover - exact TOML errors vary
-        return False, f"ghost_brain_config_parse_error:{err}"
+        return None, f"ghost_brain_config_parse_error:{err}"
+
+
+def ghost_brain_replay_payload_enabled(config: dict[str, Any], config_path: Path) -> tuple[bool, str]:
+    brain, reason = load_ghost_brain_config(config, config_path)
+    if brain is None:
+        return False, reason
     enabled = bool_path(brain, ["gatekeeper_v3", "replay_payload_enabled"])
     return enabled, "ok" if enabled else "gatekeeper_v3_replay_payload_disabled"
+
+
+def gatekeeper_v2_snapshot_contract(
+    config: dict[str, Any], config_path: Path, snapshot_ms: set[int]
+) -> tuple[list[str], dict[str, Any]]:
+    blockers: list[str] = []
+    brain, reason = load_ghost_brain_config(config, config_path)
+    if brain is None:
+        return [reason], {"ghost_brain_config_reason": reason}
+
+    gatekeeper_v2 = get_path(brain, ["gatekeeper_v2"], {})
+    if not isinstance(gatekeeper_v2, dict):
+        return ["gatekeeper_v2_config_missing"], {"ghost_brain_config_reason": "gatekeeper_v2_config_missing"}
+
+    max_wait_time_ms = int_path(gatekeeper_v2, ["max_wait_time_ms"])
+    dow = get_path(gatekeeper_v2, ["dow"], {})
+    if not isinstance(dow, dict):
+        dow = {}
+    dow_enabled = bool_path(gatekeeper_v2, ["dow", "enabled"])
+    normal_window_ms = int_path(gatekeeper_v2, ["dow", "normal_window_ms"])
+    extended_window_ms = int_path(gatekeeper_v2, ["dow", "extended_window_ms"])
+
+    if max_wait_time_ms <= 0:
+        blockers.append("gatekeeper_v2_max_wait_time_missing")
+    for target_ms in sorted(snapshot_ms):
+        if max_wait_time_ms > 0 and target_ms > max_wait_time_ms:
+            blockers.append(
+                f"temporal_snapshot_target_exceeds_gatekeeper_window:{target_ms}:max:{max_wait_time_ms}"
+            )
+    if dow_enabled and normal_window_ms > 0 and max_wait_time_ms > 0 and normal_window_ms > max_wait_time_ms:
+        blockers.append(
+            f"gatekeeper_dow_normal_window_exceeds_max_wait_time:{normal_window_ms}:max:{max_wait_time_ms}"
+        )
+    if dow_enabled and extended_window_ms > 0 and normal_window_ms > 0 and extended_window_ms < normal_window_ms:
+        blockers.append(
+            f"gatekeeper_dow_extended_window_before_normal_window:{extended_window_ms}:normal:{normal_window_ms}"
+        )
+
+    return blockers, {
+        "gatekeeper_v2_mode": str_path(gatekeeper_v2, ["mode"]),
+        "gatekeeper_v2_max_wait_time_ms": max_wait_time_ms,
+        "gatekeeper_v2_dow_enabled": dow_enabled,
+        "gatekeeper_v2_dow_normal_window_ms": normal_window_ms,
+        "gatekeeper_v2_dow_extended_window_ms": extended_window_ms,
+    }
 
 
 def runtime_source_support(repo_root: Path) -> dict[str, Any]:
@@ -208,6 +259,10 @@ def validate_config(config: dict[str, Any], config_path: Path, repo_root: Path) 
 
     snapshot_ms = set(get_path(config, ["r17_replay_ready_contract", "decision_eval_snapshot_elapsed_ms"], []) or [])
     add_if(blockers, not REQUIRED_TEMPORAL_SNAPSHOT_MS.issubset(snapshot_ms), "temporal_snapshot_checkpoints_incomplete")
+    gatekeeper_snapshot_blockers, gatekeeper_snapshot_contract = gatekeeper_v2_snapshot_contract(
+        config, config_path, snapshot_ms
+    )
+    blockers.extend(gatekeeper_snapshot_blockers)
 
     namespace_path_violations = []
     for value in flatten_strings(config):
@@ -240,6 +295,7 @@ def validate_config(config: dict[str, Any], config_path: Path, repo_root: Path) 
         "include_verdict_types": sorted(include_verdicts),
         "required_temporal_snapshot_ms": sorted(REQUIRED_TEMPORAL_SNAPSHOT_MS),
         "configured_temporal_snapshot_ms": sorted(snapshot_ms),
+        "gatekeeper_snapshot_contract": gatekeeper_snapshot_contract,
         "runtime_support": support,
         "namespace_path_violations": namespace_path_violations,
     }
@@ -308,6 +364,7 @@ def build_preflight_report(config_path: Path, repo_root: Path | None = None) -> 
             "include_verdict_types": validation["include_verdict_types"],
             "required_temporal_snapshot_ms": validation["required_temporal_snapshot_ms"],
             "configured_temporal_snapshot_ms": validation["configured_temporal_snapshot_ms"],
+            "gatekeeper_snapshot_contract": validation["gatekeeper_snapshot_contract"],
         },
         "runtime_support": validation["runtime_support"],
         "namespace_path_violations": validation["namespace_path_violations"],

@@ -10537,14 +10537,31 @@ fn evaluate_feature_driven_terminal_verdict(
                     .record_timeout_without_canonical_updates(&session.pool_amm_id.to_string());
             }
             let buffer = session.gatekeeper_buffer();
+            let context = buffer.policy_evaluation_context();
+            let curve_t0_event_ts_ms = buffer.curve_t0_event_ts_ms();
+            let curve_wait_elapsed_ms = buffer.curve_wait_elapsed_ms();
             let mut assessment = build_timeout_assessment_from_policy_context(
                 features,
                 gatekeeper_config,
-                buffer.policy_evaluation_context(),
-                buffer.curve_t0_event_ts_ms(),
-                buffer.curve_wait_elapsed_ms(),
+                context,
+                curve_t0_event_ts_ms,
+                curve_wait_elapsed_ms,
             );
             assessment.cache_v25_confidence(gatekeeper_config);
+            let deadline_wall_ms = session.deadline_wall_ms;
+            session
+                .gatekeeper_buffer_mut()
+                .attach_policy_terminal_decision_eval_snapshots(
+                    &mut assessment,
+                    deadline_wall_ms,
+                    "deadline",
+                    Some("TIMEOUT".to_string()),
+                    Some(
+                        ghost_brain::oracle::reason_code::GatekeeperReasonCode::TimeoutPhase1Insufficient
+                            .as_log_str(),
+                    ),
+                    Some("feature-driven deadline phase1 timeout".to_string()),
+                );
             return GatekeeperVerdict::Timeout { assessment };
         }
     }

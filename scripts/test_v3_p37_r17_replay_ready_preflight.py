@@ -47,10 +47,33 @@ GatekeeperBuyLog {{
     )
 
 
-def brain_config(root: Path, replay_payload_enabled: bool = True) -> Path:
+def brain_config(
+    root: Path,
+    replay_payload_enabled: bool = True,
+    max_wait_time_ms: int = 10_000,
+    normal_window_ms: int = 7_000,
+    extended_window_ms: int = 10_000,
+) -> Path:
     path = root / "configs/rollout/ghost_brain.toml"
     raw = "true" if replay_payload_enabled else "false"
-    write_file(path, f"[gatekeeper_v3]\nreplay_payload_enabled = {raw}\n")
+    write_file(
+        path,
+        f"""
+[gatekeeper_v2]
+mode = "long"
+max_wait_time_ms = {max_wait_time_ms}
+
+[gatekeeper_v2.dow]
+enabled = true
+early_entry_min_ms = 2000
+early_entry_max_ms = 5000
+normal_window_ms = {normal_window_ms}
+extended_window_ms = {extended_window_ms}
+
+[gatekeeper_v3]
+replay_payload_enabled = {raw}
+""",
+    )
     return path
 
 
@@ -209,6 +232,25 @@ class P37R17ReplayReadyPreflightTests(unittest.TestCase):
 
         self.assertEqual(report["preflight_status"], "fail")
         self.assertIn("decision_eval_snapshots_disabled", report["blockers"])
+
+    def test_blocks_snapshot_target_beyond_gatekeeper_window(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_tree(root, temporal_snapshots=True)
+            brain_config(root, max_wait_time_ms=5_000, normal_window_ms=7_000, extended_window_ms=5_000)
+            config = r17_config(root)
+
+            report = r17.build_preflight_report(config, repo_root=root)
+
+        self.assertEqual(report["preflight_status"], "fail")
+        self.assertIn(
+            "temporal_snapshot_target_exceeds_gatekeeper_window:7000:max:5000",
+            report["blockers"],
+        )
+        self.assertIn(
+            "gatekeeper_dow_normal_window_exceeds_max_wait_time:7000:max:5000",
+            report["blockers"],
+        )
 
 
 if __name__ == "__main__":

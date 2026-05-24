@@ -3712,6 +3712,37 @@ impl GatekeeperBuffer {
         }
     }
 
+    fn snapshot_stage_for_target_ms(&self, target_ms: u64) -> ObservationStage {
+        if target_ms <= self.config.dow.early_entry_min_ms {
+            ObservationStage::Early
+        } else if target_ms <= self.config.dow.early_entry_max_ms {
+            ObservationStage::Normal
+        } else {
+            ObservationStage::Extended
+        }
+    }
+
+    fn temporal_replay_snapshot_targets(&self) -> Vec<u64> {
+        let mut targets = vec![
+            self.config.dow.early_entry_min_ms,
+            self.config.dow.early_entry_max_ms,
+            self.config.dow.normal_window_ms,
+        ];
+        targets.retain(|target| *target > 0);
+        targets.sort_unstable();
+        targets.dedup();
+        targets
+    }
+
+    fn has_decision_eval_snapshot_target(&self, target_ms: u64) -> bool {
+        self.decision_eval_snapshots.iter().any(|snapshot| {
+            snapshot
+                .get("snapshot_target_ms")
+                .and_then(serde_json::Value::as_u64)
+                == Some(target_ms)
+        })
+    }
+
     fn snapshot_source(target_ms: u64, actual_elapsed_ms: u64, terminal: bool) -> &'static str {
         if terminal {
             "terminal"
@@ -3920,6 +3951,130 @@ impl GatekeeperBuffer {
                 object.insert("eval_index".to_string(), serde_json::json!(idx));
             }
         }
+    }
+
+    fn build_snapshot_assessment_for_current_state(&self) -> GatekeeperAssessment {
+        let mut assessment = if self.total_tx_count >= 2 && !self.tx_timestamps_sorted.is_empty() {
+            self.run_assessment()
+        } else {
+            self.build_minimal_assessment()
+        };
+        let decision = self.compute_decision(&assessment);
+        assessment.hard_reject_reason = decision.hard_fail_reason.clone();
+        assessment.decision = Some(decision);
+        assessment.cache_v25_confidence(&self.config);
+        assessment.v25_shadow_decisions = self.v25_shadow_decisions.clone();
+        assessment
+    }
+
+    fn record_policy_decision_eval_snapshot(
+        &mut self,
+        assessment: &mut GatekeeperAssessment,
+        now_wall_ms: u64,
+        trigger_source: &'static str,
+        verdict_if_evaluated: Option<String>,
+        reason_code_if_evaluated: Option<String>,
+        reason_if_evaluated: Option<String>,
+    ) {
+        let elapsed_ms = now_wall_ms.saturating_sub(self.registered_wall_ts_ms);
+        let Some(target_ms) = self
+            .temporal_replay_snapshot_targets()
+            .into_iter()
+            .min_by_key(|target| target.abs_diff(elapsed_ms))
+        else {
+            return;
+        };
+        let snapshot = self.build_decision_eval_snapshot(
+            assessment,
+            self.snapshot_stage_for_target_ms(target_ms),
+            trigger_source,
+            target_ms,
+            elapsed_ms,
+            Self::snapshot_source(target_ms, elapsed_ms, false),
+            verdict_if_evaluated,
+            reason_code_if_evaluated,
+            reason_if_evaluated,
+        );
+        self.upsert_decision_eval_snapshot(snapshot);
+        assessment.decision_eval_snapshots = self.decision_eval_snapshots.clone();
+    }
+
+    fn maybe_record_due_temporal_replay_snapshots_from(
+        &mut self,
+        now_wall_ms: u64,
+        trigger_source: &'static str,
+    ) -> bool {
+        if !self.config.v25.shadow_enabled || !self.config.dow.enabled {
+            return false;
+        }
+        let elapsed_ms = now_wall_ms.saturating_sub(self.registered_wall_ts_ms);
+        let due_targets: Vec<u64> = self
+            .temporal_replay_snapshot_targets()
+            .into_iter()
+            .filter(|target| elapsed_ms >= *target)
+            .filter(|target| !self.has_decision_eval_snapshot_target(*target))
+            .collect();
+        if due_targets.is_empty() {
+            return false;
+        }
+
+        let assessment = self.build_snapshot_assessment_for_current_state();
+        let verdict_if_evaluated = assessment
+            .decision
+            .as_ref()
+            .map(|decision| decision.verdict_type.tag().to_string());
+        let reason_code_if_evaluated = assessment
+            .decision
+            .as_ref()
+            .and_then(|decision| decision.reason_code)
+            .map(|code| code.as_log_str());
+        let reason_if_evaluated = assessment
+            .decision
+            .as_ref()
+            .map(|decision| decision.reason_chain.clone());
+
+        for target_ms in due_targets {
+            let snapshot = self.build_decision_eval_snapshot(
+                &assessment,
+                self.snapshot_stage_for_target_ms(target_ms),
+                trigger_source,
+                target_ms,
+                elapsed_ms,
+                Self::snapshot_source(target_ms, elapsed_ms, false),
+                verdict_if_evaluated.clone(),
+                reason_code_if_evaluated.clone(),
+                reason_if_evaluated.clone(),
+            );
+            self.upsert_decision_eval_snapshot(snapshot);
+        }
+        true
+    }
+
+    pub fn attach_policy_terminal_decision_eval_snapshots(
+        &mut self,
+        assessment: &mut GatekeeperAssessment,
+        now_wall_ms: u64,
+        trigger_source: &'static str,
+        verdict_if_evaluated: Option<String>,
+        reason_code_if_evaluated: Option<String>,
+        reason_if_evaluated: Option<String>,
+    ) {
+        self.record_policy_decision_eval_snapshot(
+            assessment,
+            now_wall_ms,
+            trigger_source,
+            verdict_if_evaluated.clone(),
+            reason_code_if_evaluated.clone(),
+            reason_if_evaluated.clone(),
+        );
+        self.attach_terminal_decision_eval_snapshot(
+            assessment,
+            now_wall_ms,
+            trigger_source,
+            verdict_if_evaluated,
+            reason_code_if_evaluated,
+            reason_if_evaluated,
+        );
     }
 
     fn record_shadow_decision_eval_snapshot(
@@ -4464,6 +4619,7 @@ impl GatekeeperBuffer {
             .decision
             .as_ref()
             .and_then(|decision| decision.hard_fail_reason.clone());
+        let now_wall_ms = Self::now_wall_ms();
         let breakdown = Self::format_phase_breakdown(&assessment);
 
         match evaluate_curve_gate(&assessment.feature_snapshot, config) {
@@ -4505,6 +4661,14 @@ impl GatekeeperBuffer {
                 eval_count = self.eval_count,
                 "🚫 GATEKEEPER POLICY REJECTED {} soft_pts={}/{}", breakdown, soft_pts, max_pts
             );
+            self.attach_policy_terminal_decision_eval_snapshots(
+                &mut assessment,
+                now_wall_ms,
+                "feature_evaluation",
+                Some(verdict_tag.to_string()),
+                None,
+                Some(reason_chain.clone()),
+            );
             return GatekeeperVerdict::Reject {
                 assessment,
                 reason: reason_chain,
@@ -4524,6 +4688,14 @@ impl GatekeeperBuffer {
             "✅ GATEKEEPER POLICY BUY {} soft_pts={}/{}", breakdown, soft_pts, max_pts
         );
         let buffered_txs = std::mem::take(&mut self.buffered_txs);
+        self.attach_policy_terminal_decision_eval_snapshots(
+            &mut assessment,
+            now_wall_ms,
+            "feature_evaluation",
+            Some(verdict_tag.to_string()),
+            None,
+            Some(reason_chain),
+        );
         GatekeeperVerdict::Buy {
             buffered_txs,
             assessment,
@@ -4794,6 +4966,7 @@ impl GatekeeperBuffer {
             tx_key,
         });
         self.refresh_canonical_dev_tracking();
+        self.maybe_record_due_temporal_replay_snapshots_from(now_ms, "tx");
 
         if !self.phase1_passed && self.phase1_requirements_met() {
             self.phase1_passed = true;
@@ -13997,6 +14170,15 @@ mod tests {
         cfg
     }
 
+    fn r17_standard_snapshot_config() -> GatekeeperV2Config {
+        let mut cfg = r17_snapshot_config();
+        cfg.mode = GatekeeperMode::Standard;
+        cfg.max_wait_time_ms = 5_000;
+        cfg.dow.normal_window_ms = 5_000;
+        cfg.dow.extended_window_ms = 5_000;
+        cfg
+    }
+
     fn populate_r17_snapshot_buffer(buf: &mut GatekeeperBuffer) {
         for i in 0..10 {
             let tx = make_tx(
@@ -14095,6 +14277,69 @@ mod tests {
             snapshot
                 .get("snapshot_source")
                 .and_then(|value| value.as_str())
+                == Some("terminal")
+        }));
+    }
+
+    #[test]
+    fn standard_mode_records_due_temporal_snapshot_on_tx_checkpoint() {
+        let cfg = r17_standard_snapshot_config();
+        let mut buf = GatekeeperBuffer::new(Pubkey::new_unique(), &cfg);
+        buf.set_registered_wall_t0(1_000);
+
+        let tx = make_tx(
+            3_100,
+            "standard_r17_snap",
+            "standard_signer",
+            true,
+            0.5,
+            Some(1_073_000_000.0),
+            Some(30.0),
+            Some(30.0),
+        );
+        let _ = buf.ingest_transaction_tracking_only(Arc::new(tx));
+
+        assert!(
+            buf.decision_eval_snapshots().iter().any(|snapshot| {
+                snapshot
+                    .get("snapshot_target_ms")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(2_000)
+                    && snapshot
+                        .get("snapshot_source")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("nearest_eval")
+            }),
+            "standard-mode runtime should record due R17 temporal checkpoint snapshots"
+        );
+    }
+
+    #[test]
+    fn feature_driven_terminal_verdict_attaches_decision_eval_snapshots() {
+        let cfg = r17_standard_snapshot_config();
+        let mut buf = GatekeeperBuffer::new(Pubkey::new_unique(), &cfg);
+        let mut features = MaterializedFeatureSet::default();
+        features.curve_readiness.is_ready = true;
+        features.curve_readiness.freshness = CurveFreshnessState::Fresh;
+        features.curve_readiness.finality = CurveFinality::Finalized;
+        let verdict = buf.evaluate_from_features(features, &cfg);
+        let assessment = match verdict {
+            GatekeeperVerdict::Reject { assessment, .. } => assessment,
+            GatekeeperVerdict::Buy { assessment, .. } => assessment,
+            GatekeeperVerdict::Timeout { assessment } => assessment,
+            _ => panic!("expected terminal feature-driven verdict"),
+        };
+        let log = assessment.to_buy_log(&Pubkey::new_unique(), &cfg);
+        let snapshots = log
+            .decision_eval_snapshots
+            .as_ref()
+            .and_then(|value| value.as_array())
+            .expect("feature-driven terminal verdict must include decision_eval_snapshots");
+
+        assert!(snapshots.iter().any(|snapshot| {
+            snapshot
+                .get("snapshot_source")
+                .and_then(serde_json::Value::as_str)
                 == Some("terminal")
         }));
     }
