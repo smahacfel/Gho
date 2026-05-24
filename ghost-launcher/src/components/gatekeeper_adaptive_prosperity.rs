@@ -342,6 +342,7 @@ mod tests {
             checkpoint_count: 0,
             trajectory_available: false,
             v25_shadow_decisions: Vec::new(),
+            decision_eval_snapshots: Vec::new(),
             trajectory: None,
             pdd_assessment: None,
             aps_diagnostics: None,

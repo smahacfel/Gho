@@ -1273,6 +1273,11 @@ pub struct GatekeeperAssessment {
     /// V2.5 Trajectory Aware Scoring assessment (3-segment analysis).
     pub trajectory: Option<TrajectoryAssessment>,
 
+    /// Ordered runtime evaluation snapshots for deterministic temporal replay.
+    /// These are produced while the observation session still owns the mutable
+    /// buffer state; the DecisionLogger only serializes the captured payload.
+    pub decision_eval_snapshots: Vec<serde_json::Value>,
+
     /// V2.5 Pump & Dump Detector diagnostics.
     pub pdd_assessment: Option<PddDiagnostics>,
 
@@ -2042,6 +2047,56 @@ impl GatekeeperAssessment {
             .or(Some(GatekeeperReasonCode::InvariantTimeoutNoVerdict))
     }
 
+    fn decision_eval_snapshot_targets(&self) -> HashSet<u64> {
+        self.decision_eval_snapshots
+            .iter()
+            .filter_map(|snapshot| {
+                snapshot
+                    .get("snapshot_target_ms")
+                    .and_then(serde_json::Value::as_u64)
+            })
+            .collect()
+    }
+
+    fn decision_eval_snapshots_have_terminal(&self, config: &GatekeeperV2Config) -> bool {
+        self.decision_eval_snapshots.iter().any(|snapshot| {
+            snapshot
+                .get("snapshot_source")
+                .and_then(serde_json::Value::as_str)
+                == Some("terminal")
+                || snapshot
+                    .get("snapshot_target_ms")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(config.max_wait_time_ms)
+        })
+    }
+
+    fn temporal_replay_missing_fields(&self, config: &GatekeeperV2Config) -> Vec<String> {
+        let mut missing = Vec::new();
+        if self.decision_eval_snapshots.is_empty() {
+            missing.push("temporal:decision_eval_snapshots".to_string());
+            return missing;
+        }
+
+        let targets = self.decision_eval_snapshot_targets();
+        for (label, target_ms) in [
+            ("early", config.dow.early_entry_min_ms),
+            ("normal", config.dow.early_entry_max_ms),
+            ("extended", config.dow.normal_window_ms),
+        ] {
+            if !targets.contains(&target_ms) {
+                missing.push(format!(
+                    "temporal:decision_eval_snapshots:{label}:{target_ms}"
+                ));
+            }
+        }
+        if !self.decision_eval_snapshots_have_terminal(config) {
+            missing.push("temporal:decision_eval_snapshots:terminal".to_string());
+        }
+
+        missing
+    }
+
     pub fn to_buy_log(
         &self,
         pool_id: &Pubkey,
@@ -2181,8 +2236,9 @@ impl GatekeeperAssessment {
         }
         let gatekeeper_v2_replay_ready_non_temporal =
             Some(gatekeeper_v2_replay_missing_fields.is_empty());
-        gatekeeper_v2_replay_missing_fields.push("temporal:decision_eval_snapshots".to_string());
-        let gatekeeper_v2_replay_ready_temporal = Some(false);
+        let temporal_missing_fields = self.temporal_replay_missing_fields(config);
+        let gatekeeper_v2_replay_ready_temporal = Some(temporal_missing_fields.is_empty());
+        gatekeeper_v2_replay_missing_fields.extend(temporal_missing_fields);
 
         GatekeeperBuyLog {
             log_schema_version: GATEKEEPER_BUY_LOG_SCHEMA_VERSION,
@@ -2972,7 +3028,14 @@ impl GatekeeperAssessment {
             observed_mode: Some(config.mode.to_string()),
             observed_window_ms: Some(config.max_wait_time_ms),
             observed_stage: observed_stage.clone(),
-            decision_eval_snapshots: None,
+            decision_eval_snapshots: Some(serde_json::Value::Array(
+                self.decision_eval_snapshots.clone(),
+            ))
+            .filter(|value| {
+                value
+                    .as_array()
+                    .is_some_and(|snapshots| !snapshots.is_empty())
+            }),
             aps_regime: self
                 .aps_diagnostics
                 .as_ref()
@@ -3234,6 +3297,8 @@ pub struct GatekeeperBuffer {
     extended_shadow_fired: bool,
     /// Shadow decision records collected during observation
     v25_shadow_decisions: Vec<ShadowV25Decision>,
+    /// Replay-ready temporal decision snapshots collected during observation.
+    decision_eval_snapshots: Vec<serde_json::Value>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -3271,6 +3336,14 @@ pub enum ShadowCheckpointSource {
 }
 
 impl ShadowCheckpointSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Timer => "timer",
+            Self::Tx => "tx",
+            Self::DeadlineFallback => "deadline_fallback",
+        }
+    }
+
     fn insufficient_reason_prefix(self) -> &'static str {
         match self {
             Self::Timer => "TIMER_FIRED_INSUFFICIENT_DATA",
@@ -3601,6 +3674,7 @@ impl GatekeeperBuffer {
             normal_shadow_fired: false,
             extended_shadow_fired: false,
             v25_shadow_decisions: Vec::new(),
+            decision_eval_snapshots: Vec::new(),
         }
     }
 
@@ -3611,6 +3685,296 @@ impl GatekeeperBuffer {
     /// Accessor for V2.5 shadow decisions collected during observation.
     pub fn v25_shadow_decisions(&self) -> &[ShadowV25Decision] {
         &self.v25_shadow_decisions
+    }
+
+    pub fn decision_eval_snapshots(&self) -> &[serde_json::Value] {
+        &self.decision_eval_snapshots
+    }
+
+    fn stable_json_hash(value: &serde_json::Value) -> String {
+        let encoded = serde_json::to_string(value).unwrap_or_else(|_| "null".to_string());
+        let mut hash = 0xcbf29ce484222325_u64;
+        for byte in encoded.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        format!("fnv1a64:{hash:016x}")
+    }
+
+    fn snapshot_target_ms(&self, stage: ObservationStage, terminal: bool) -> u64 {
+        if terminal {
+            return self.config.max_wait_time_ms;
+        }
+        match stage {
+            ObservationStage::Early => self.config.dow.early_entry_min_ms,
+            ObservationStage::Normal => self.config.dow.early_entry_max_ms,
+            ObservationStage::Extended => self.config.dow.normal_window_ms,
+        }
+    }
+
+    fn snapshot_source(target_ms: u64, actual_elapsed_ms: u64, terminal: bool) -> &'static str {
+        if terminal {
+            "terminal"
+        } else if target_ms == actual_elapsed_ms {
+            "exact_tick"
+        } else {
+            "nearest_eval"
+        }
+    }
+
+    fn compact_pdd_snapshot(pdd: Option<&PddDiagnostics>) -> serde_json::Value {
+        serde_json::json!({
+            "enabled": pdd.map(|p| p.enabled),
+            "hard_fail": pdd.and_then(|p| p.hard_fail.as_ref().map(|fail| fail.as_str())),
+            "soft_penalty_points": pdd.map(|p| p.soft_penalty_points),
+            "entry_drift_pct": pdd.and_then(|p| p.entry_drift_pct),
+            "entry_drift_effective_max_pct": pdd.and_then(|p| p.entry_drift_effective_max_pct),
+            "entry_drift_threshold_source": pdd.and_then(|p| p.entry_drift_threshold_source),
+            "entry_drift_anchor_source": pdd.and_then(|p| p.entry_drift_anchor_source),
+            "entry_drift_anchor_quality": pdd.and_then(|p| p.entry_drift_anchor_quality),
+            "spike_detected": pdd.map(|p| p.spike_detected),
+            "ramping_detected": pdd.map(|p| p.ramping_detected),
+            "whale_top3_pct": pdd.and_then(|p| p.whale_top3_pct),
+            "reserve_health_pass": pdd.map(|p| p.reserve_health_pass),
+            "flash_crash_risk": pdd.map(|p| p.flash_crash_risk),
+            "pdd_score": pdd.map(|p| p.pdd_score),
+        })
+    }
+
+    fn compact_prosperity_snapshot(
+        decision: Option<&GatekeeperDecision>,
+        aps: Option<&ApsDiagnostics>,
+    ) -> serde_json::Value {
+        let prosperity = decision.map(|d| &d.prosperity_filter);
+        serde_json::json!({
+            "enabled": prosperity.map(|p| p.enabled),
+            "pass": prosperity.and_then(|p| p.pass),
+            "reject_trigger": prosperity.and_then(|p| p.reject_trigger.map(|trigger| trigger.as_str())),
+            "matched_branches": prosperity.map(|p| p.matched_branches.clone()).unwrap_or_default(),
+            "aps_enabled": aps.map(|a| a.enabled),
+            "aps_adaptive_enabled": aps.map(|a| a.adaptive_enabled),
+            "aps_adaptive_thresholds_applied": aps.map(|a| a.adaptive_thresholds_applied),
+            "aps_regime": aps.map(|a| a.regime.as_str()),
+            "aps_shadow_prosperity_would_pass": aps.and_then(|a| a.shadow_prosperity_would_pass),
+        })
+    }
+
+    fn compact_hhi_snapshot(&self, assessment: &GatekeeperAssessment) -> serde_json::Value {
+        serde_json::json!({
+            "hhi": assessment.phase3_diversity.as_ref().map(|d| d.hhi),
+            "hard_fail_hhi_threshold": self.config.hard_fail_hhi,
+            "max_hhi_threshold": self.config.max_hhi,
+            "phase3_passed": assessment.phase3_passed,
+            "top3_volume_pct": assessment.phase3_diversity.as_ref().map(|d| d.top3_volume_pct),
+            "same_ms_tx_ratio": assessment.phase3_diversity.as_ref().map(|d| d.same_ms_tx_ratio),
+            "unique_ratio": assessment.phase3_diversity.as_ref().map(|d| d.unique_ratio),
+        })
+    }
+
+    fn phase_pass_vector_json(&self, assessment: &GatekeeperAssessment) -> serde_json::Value {
+        serde_json::json!({
+            "phase1": assessment.phase1_passed,
+            "phase2": assessment.phase2_passed,
+            "phase3": assessment.phase3_passed,
+            "phase4": assessment.phase4_passed,
+            "phase5": assessment.phase5_passed,
+            "phase6": assessment.phase6_passed,
+            "core1": assessment.decision.as_ref().map(|d| d.core1_passed),
+            "core2": assessment.decision.as_ref().map(|d| d.core2_passed),
+            "core3": assessment.decision.as_ref().map(|d| d.core3_passed),
+            "phases_passed": assessment.phases_passed,
+            "min_phases_to_pass": self.config.min_phases_to_pass,
+        })
+    }
+
+    fn build_decision_eval_snapshot(
+        &self,
+        assessment: &GatekeeperAssessment,
+        stage: ObservationStage,
+        trigger_source: &'static str,
+        target_ms: u64,
+        actual_elapsed_ms: u64,
+        snapshot_source: &'static str,
+        verdict_if_evaluated: Option<String>,
+        reason_code_if_evaluated: Option<String>,
+        reason_if_evaluated: Option<String>,
+    ) -> serde_json::Value {
+        let phase_pass_vector = self.phase_pass_vector_json(assessment);
+        let pdd_diagnostics = Self::compact_pdd_snapshot(assessment.pdd_assessment.as_ref());
+        let prosperity_diagnostics = Self::compact_prosperity_snapshot(
+            assessment.decision.as_ref(),
+            assessment.aps_diagnostics.as_ref(),
+        );
+        let hhi_diversity_diagnostics = self.compact_hhi_snapshot(assessment);
+        let compact_payload = serde_json::json!({
+            "phase_pass_vector": phase_pass_vector,
+            "pdd_diagnostics": pdd_diagnostics,
+            "prosperity_diagnostics": prosperity_diagnostics,
+            "hhi_diversity_diagnostics": hhi_diversity_diagnostics,
+            "soft_points": assessment.decision.as_ref().map(|d| d.soft_points),
+            "max_soft_points": assessment.decision.as_ref().map(|d| d.effective_max_soft_points),
+            "verdict_if_evaluated": verdict_if_evaluated,
+            "reason_code_if_evaluated": reason_code_if_evaluated,
+        });
+        let materialized_feature_snapshot_hash = Self::stable_json_hash(&compact_payload);
+        let gatekeeper_config_hash = serde_json::to_value(&self.config)
+            .ok()
+            .map(|value| Self::stable_json_hash(&value));
+        let drift_ms = actual_elapsed_ms.abs_diff(target_ms);
+        let snapshot_verdict_if_evaluated = compact_payload
+            .get("verdict_if_evaluated")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let snapshot_reason_code_if_evaluated = compact_payload
+            .get("reason_code_if_evaluated")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+
+        serde_json::json!({
+            "snapshot_schema_version": 1,
+            "eval_index": 0,
+            "eval_ts_ms": self.registered_wall_ts_ms.saturating_add(actual_elapsed_ms),
+            "elapsed_ms": actual_elapsed_ms,
+            "snapshot_target_ms": target_ms,
+            "snapshot_actual_elapsed_ms": actual_elapsed_ms,
+            "snapshot_drift_ms": drift_ms,
+            "snapshot_source": snapshot_source,
+            "observation_stage": stage.as_str(),
+            "trigger_source": trigger_source,
+            "materialized_feature_snapshot_hash": materialized_feature_snapshot_hash,
+            "materialized_feature_snapshot_payload_or_compact_payload": compact_payload,
+            "gatekeeper_mode": self.config.mode.to_string(),
+            "gatekeeper_config_hash": gatekeeper_config_hash,
+            "gatekeeper_gate_trace": assessment.gatekeeper_gate_trace(&self.config),
+            "phase_pass_vector": self.phase_pass_vector_json(assessment),
+            "hard_reject_reason": assessment
+                .hard_reject_reason
+                .clone()
+                .or_else(|| assessment.decision.as_ref().and_then(|d| d.hard_fail_reason.clone())),
+            "soft_points": assessment.decision.as_ref().map(|d| d.soft_points),
+            "max_soft_points": assessment.decision.as_ref().map(|d| d.effective_max_soft_points),
+            "pdd_diagnostics": Self::compact_pdd_snapshot(assessment.pdd_assessment.as_ref()),
+            "prosperity_diagnostics": Self::compact_prosperity_snapshot(
+                assessment.decision.as_ref(),
+                assessment.aps_diagnostics.as_ref(),
+            ),
+            "hhi_diversity_diagnostics": self.compact_hhi_snapshot(assessment),
+            "verdict_if_evaluated": snapshot_verdict_if_evaluated,
+            "reason_code_if_evaluated": snapshot_reason_code_if_evaluated,
+            "reason_if_evaluated": reason_if_evaluated,
+        })
+    }
+
+    fn upsert_decision_eval_snapshot(&mut self, snapshot: serde_json::Value) {
+        let target = snapshot
+            .get("snapshot_target_ms")
+            .and_then(serde_json::Value::as_u64);
+        let stage = snapshot
+            .get("observation_stage")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let source = snapshot
+            .get("snapshot_source")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+
+        if let (Some(target), Some(stage), Some(source)) = (target, stage, source) {
+            if let Some(existing_idx) = self.decision_eval_snapshots.iter().position(|item| {
+                item.get("snapshot_target_ms")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(target)
+                    && item
+                        .get("observation_stage")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(stage.as_str())
+                    && item
+                        .get("snapshot_source")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(source.as_str())
+            }) {
+                self.decision_eval_snapshots[existing_idx] = snapshot;
+                self.normalize_decision_eval_snapshot_order();
+                return;
+            }
+        }
+
+        self.decision_eval_snapshots.push(snapshot);
+        self.normalize_decision_eval_snapshot_order();
+    }
+
+    fn normalize_decision_eval_snapshot_order(&mut self) {
+        self.decision_eval_snapshots.sort_by_key(|snapshot| {
+            (
+                snapshot
+                    .get("snapshot_target_ms")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(u64::MAX),
+                snapshot
+                    .get("snapshot_actual_elapsed_ms")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(u64::MAX),
+            )
+        });
+        for (idx, snapshot) in self.decision_eval_snapshots.iter_mut().enumerate() {
+            if let Some(object) = snapshot.as_object_mut() {
+                object.insert("eval_index".to_string(), serde_json::json!(idx));
+            }
+        }
+    }
+
+    fn record_shadow_decision_eval_snapshot(
+        &mut self,
+        assessment: &GatekeeperAssessment,
+        stage: ObservationStage,
+        source: ShadowCheckpointSource,
+        elapsed_ms: u64,
+        shadow: &ShadowV25Decision,
+    ) {
+        let target_ms = self.snapshot_target_ms(stage, false);
+        let snapshot = self.build_decision_eval_snapshot(
+            assessment,
+            stage,
+            source.as_str(),
+            target_ms,
+            elapsed_ms,
+            Self::snapshot_source(target_ms, elapsed_ms, false),
+            Some(shadow.kind.verdict_str().to_string()),
+            shadow.reason_code.map(|code| code.as_log_str()),
+            Some(shadow.reason.clone()),
+        );
+        self.upsert_decision_eval_snapshot(snapshot);
+    }
+
+    fn attach_terminal_decision_eval_snapshot(
+        &mut self,
+        assessment: &mut GatekeeperAssessment,
+        now_wall_ms: u64,
+        trigger_source: &'static str,
+        verdict_if_evaluated: Option<String>,
+        reason_code_if_evaluated: Option<String>,
+        reason_if_evaluated: Option<String>,
+    ) {
+        let elapsed_ms = now_wall_ms.saturating_sub(self.registered_wall_ts_ms);
+        let target_ms = self.snapshot_target_ms(ObservationStage::Extended, true);
+        let snapshot = self.build_decision_eval_snapshot(
+            assessment,
+            assessment
+                .observation_stage
+                .unwrap_or(ObservationStage::Extended),
+            trigger_source,
+            target_ms,
+            elapsed_ms,
+            "terminal",
+            verdict_if_evaluated,
+            reason_code_if_evaluated.or_else(|| {
+                assessment
+                    .derive_reason_code()
+                    .map(|reason_code| reason_code.as_log_str())
+            }),
+            reason_if_evaluated,
+        );
+        self.upsert_decision_eval_snapshot(snapshot);
+        assessment.decision_eval_snapshots = self.decision_eval_snapshots.clone();
     }
 
     fn normalize_identity_value(value: Option<&str>) -> Option<String> {
@@ -4701,6 +5065,7 @@ impl GatekeeperBuffer {
             checkpoint_count: 0,
             trajectory_available: false,
             v25_shadow_decisions: Vec::new(),
+            decision_eval_snapshots: Vec::new(),
             trajectory: None,
             pdd_assessment: None,
             aps_diagnostics: None,
@@ -4868,6 +5233,7 @@ impl GatekeeperBuffer {
                 checkpoint_count: 0,
                 trajectory_available: v25_trajectory.is_some(),
                 v25_shadow_decisions: Vec::new(),
+                decision_eval_snapshots: self.decision_eval_snapshots.clone(),
                 trajectory: v25_trajectory.clone(),
                 pdd_assessment: v25_pdd.clone(),
                 aps_diagnostics: None,
@@ -4914,6 +5280,7 @@ impl GatekeeperBuffer {
             checkpoint_count: 0,
             trajectory_available: v25_trajectory.is_some(),
             v25_shadow_decisions: Vec::new(),
+            decision_eval_snapshots: self.decision_eval_snapshots.clone(),
             trajectory: v25_trajectory.clone(),
             pdd_assessment: v25_pdd.clone(),
             aps_diagnostics: None,
@@ -5558,6 +5925,14 @@ impl GatekeeperBuffer {
                     eval_count = self.eval_count,
                     "🚫 GATEKEEPER V2 REJECTED {} soft_pts={}/{}", breakdown, soft_pts, max_pts
                 );
+                self.attach_terminal_decision_eval_snapshot(
+                    &mut assessment,
+                    Self::now_wall_ms(),
+                    "terminal_decision",
+                    Some(verdict_tag.to_string()),
+                    None,
+                    Some(reason_chain.clone()),
+                );
                 return GatekeeperVerdict::Reject {
                     assessment,
                     reason: reason_chain,
@@ -5592,6 +5967,14 @@ impl GatekeeperBuffer {
                 "✅ GATEKEEPER V2 BUY {} soft_pts={}/{}", breakdown, soft_pts, max_pts
             );
             let buffered = std::mem::take(&mut self.buffered_txs);
+            self.attach_terminal_decision_eval_snapshot(
+                &mut assessment,
+                Self::now_wall_ms(),
+                "terminal_decision",
+                Some(verdict_tag.to_string()),
+                None,
+                Some(reason_chain),
+            );
             return GatekeeperVerdict::Buy {
                 buffered_txs: buffered,
                 assessment,
@@ -5609,6 +5992,14 @@ impl GatekeeperBuffer {
                 phases = %breakdown,
                 eval_count = self.eval_count,
                 "🚫 GATEKEEPER V2 REJECTED (Hard Reject) {}", breakdown
+            );
+            self.attach_terminal_decision_eval_snapshot(
+                &mut assessment,
+                Self::now_wall_ms(),
+                "terminal_decision",
+                Some("REJECT".to_string()),
+                None,
+                Some(reason.clone()),
             );
             return GatekeeperVerdict::Reject { assessment, reason };
         }
@@ -5639,6 +6030,14 @@ impl GatekeeperBuffer {
                 "✅ GATEKEEPER V2 BUY {}", breakdown
             );
             let buffered = std::mem::take(&mut self.buffered_txs);
+            self.attach_terminal_decision_eval_snapshot(
+                &mut assessment,
+                Self::now_wall_ms(),
+                "terminal_decision",
+                Some("BUY".to_string()),
+                None,
+                Some(format!("BUY: {breakdown}")),
+            );
             return GatekeeperVerdict::Buy {
                 buffered_txs: buffered,
                 assessment,
@@ -5951,6 +6350,7 @@ impl GatekeeperBuffer {
             checkpoint_count: 0,
             trajectory_available: trajectory.is_some(),
             v25_shadow_decisions: self.v25_shadow_decisions.clone(),
+            decision_eval_snapshots: self.decision_eval_snapshots.clone(),
             trajectory,
             pdd_assessment: {
                 let pdd =
@@ -6024,6 +6424,7 @@ impl GatekeeperBuffer {
             checkpoint_count: 0,
             trajectory_available: false,
             v25_shadow_decisions: Vec::new(),
+            decision_eval_snapshots: self.decision_eval_snapshots.clone(),
             trajectory: None,
             pdd_assessment: None,
             aps_diagnostics: None,
@@ -6189,6 +6590,14 @@ impl GatekeeperBuffer {
                     self.buffered_txs.len(),
                 ),
             };
+            let assessment = self.build_minimal_assessment();
+            self.record_shadow_decision_eval_snapshot(
+                &assessment,
+                stage,
+                source,
+                elapsed_ms,
+                &shadow,
+            );
             self.upsert_shadow_decision(shadow);
             return ShadowCheckpointOutcome::ProvisionalInsufficientData;
         }
@@ -6218,6 +6627,14 @@ impl GatekeeperBuffer {
                     self.config.min_buy_count,
                 ),
             };
+            let assessment = self.build_minimal_assessment();
+            self.record_shadow_decision_eval_snapshot(
+                &assessment,
+                stage,
+                source,
+                elapsed_ms,
+                &shadow,
+            );
             self.upsert_shadow_decision(shadow);
             return ShadowCheckpointOutcome::ProvisionalInsufficientData;
         }
@@ -6351,6 +6768,13 @@ impl GatekeeperBuffer {
                         pdd.flash_crash_risk
                     ),
                 };
+                self.record_shadow_decision_eval_snapshot(
+                    &assessment,
+                    stage,
+                    source,
+                    elapsed_ms,
+                    &shadow,
+                );
                 self.upsert_shadow_decision(shadow);
                 return ShadowCheckpointOutcome::Finalized;
             }
@@ -6607,6 +7031,7 @@ impl GatekeeperBuffer {
             reason_code,
             reason,
         };
+        self.record_shadow_decision_eval_snapshot(&assessment, stage, source, elapsed_ms, &shadow);
         self.upsert_shadow_decision(shadow);
         ShadowCheckpointOutcome::Finalized
     }
@@ -7199,6 +7624,14 @@ impl GatekeeperBuffer {
                     );
                     self.record_deadline_finalize_metrics("standard", "reject", now_ms);
                     assessment.cache_v25_confidence(&self.config);
+                    self.attach_terminal_decision_eval_snapshot(
+                        &mut assessment,
+                        now_ms,
+                        "deadline",
+                        Some("REJECT".to_string()),
+                        Some(GatekeeperReasonCode::TimeoutDeadlineLowPhases.as_log_str()),
+                        Some(reason.clone()),
+                    );
                     Some(GatekeeperVerdict::Reject { assessment, reason })
                 }
             };
@@ -7229,6 +7662,14 @@ impl GatekeeperBuffer {
             breakdown
         );
         self.record_deadline_finalize_metrics("standard", "timeout", now_ms);
+        self.attach_terminal_decision_eval_snapshot(
+            &mut assessment,
+            now_ms,
+            "deadline",
+            Some("TIMEOUT".to_string()),
+            None,
+            Some("standard deadline phase1 timeout".to_string()),
+        );
         Some(GatekeeperVerdict::Timeout { assessment })
     }
 
@@ -7290,6 +7731,14 @@ impl GatekeeperBuffer {
                 breakdown
             );
             self.record_deadline_finalize_metrics("long", "timeout", now_ms);
+            self.attach_terminal_decision_eval_snapshot(
+                &mut assessment,
+                now_ms,
+                "deadline",
+                Some("TIMEOUT".to_string()),
+                None,
+                Some("long deadline phase1 timeout".to_string()),
+            );
             return GatekeeperVerdict::Timeout { assessment };
         }
 
@@ -7456,6 +7905,14 @@ impl GatekeeperBuffer {
                     "✅ GATEKEEPER V2 LONG BUY {} soft_pts={}/{}", breakdown, soft_pts, max_pts
                 );
                 let buffered = std::mem::take(&mut self.buffered_txs);
+                self.attach_terminal_decision_eval_snapshot(
+                    &mut assessment,
+                    now_ms,
+                    "deadline",
+                    Some(verdict_tag.to_string()),
+                    None,
+                    Some(reason_chain),
+                );
                 return GatekeeperVerdict::Buy {
                     buffered_txs: buffered,
                     assessment,
@@ -7475,6 +7932,14 @@ impl GatekeeperBuffer {
                 "🚫 GATEKEEPER V2 LONG REJECTED {} soft_pts={}/{}", breakdown, soft_pts, max_pts
             );
             self.record_deadline_finalize_metrics("long", "reject", now_ms);
+            self.attach_terminal_decision_eval_snapshot(
+                &mut assessment,
+                now_ms,
+                "deadline",
+                Some(verdict_tag.to_string()),
+                None,
+                Some(reason.clone()),
+            );
             return GatekeeperVerdict::Reject { assessment, reason };
         }
 
@@ -7502,6 +7967,14 @@ impl GatekeeperBuffer {
                 "✅ GATEKEEPER V2 LONG BUY {}", breakdown
             );
             let buffered = std::mem::take(&mut self.buffered_txs);
+            self.attach_terminal_decision_eval_snapshot(
+                &mut assessment,
+                now_ms,
+                "deadline",
+                Some("BUY".to_string()),
+                None,
+                Some(format!("LONG BUY: {breakdown}")),
+            );
             return GatekeeperVerdict::Buy {
                 buffered_txs: buffered,
                 assessment,
@@ -7523,6 +7996,14 @@ impl GatekeeperBuffer {
         );
         self.record_deadline_finalize_metrics("long", "timeout", now_ms);
         assessment.terminal_reason_code = Some(GatekeeperReasonCode::TimeoutDeadlineLowPhases);
+        self.attach_terminal_decision_eval_snapshot(
+            &mut assessment,
+            now_ms,
+            "deadline",
+            Some("TIMEOUT".to_string()),
+            None,
+            Some(reason),
+        );
         GatekeeperVerdict::Timeout { assessment }
     }
 }
@@ -10349,6 +10830,7 @@ mod tests {
             checkpoint_count: 0,
             trajectory_available: false,
             v25_shadow_decisions: Vec::new(),
+            decision_eval_snapshots: Vec::new(),
             trajectory: None,
             pdd_assessment: None,
             aps_diagnostics: None,
@@ -10494,6 +10976,7 @@ mod tests {
             checkpoint_count: 0,
             trajectory_available: false,
             v25_shadow_decisions: Vec::new(),
+            decision_eval_snapshots: Vec::new(),
             trajectory: None,
             pdd_assessment: None,
             aps_diagnostics: None,
@@ -10548,6 +11031,7 @@ mod tests {
             checkpoint_count: 0,
             trajectory_available: false,
             v25_shadow_decisions: Vec::new(),
+            decision_eval_snapshots: Vec::new(),
             trajectory: None,
             pdd_assessment: None,
             aps_diagnostics: None,
@@ -10683,6 +11167,7 @@ mod tests {
             checkpoint_count: 0,
             trajectory_available: false,
             v25_shadow_decisions: Vec::new(),
+            decision_eval_snapshots: Vec::new(),
             trajectory: None,
             pdd_assessment: None,
             aps_diagnostics: None,
@@ -12016,6 +12501,7 @@ mod tests {
             checkpoint_count: 0,
             trajectory_available: false,
             v25_shadow_decisions: Vec::new(),
+            decision_eval_snapshots: Vec::new(),
             trajectory: None,
             pdd_assessment: None,
             aps_diagnostics: None,
@@ -12661,6 +13147,7 @@ mod tests {
             checkpoint_count: 0,
             trajectory_available: false,
             v25_shadow_decisions: Vec::new(),
+            decision_eval_snapshots: Vec::new(),
             trajectory: None,
             pdd_assessment: None,
             aps_diagnostics: None,
@@ -12732,6 +13219,7 @@ mod tests {
             checkpoint_count: 0,
             trajectory_available: false,
             v25_shadow_decisions: Vec::new(),
+            decision_eval_snapshots: Vec::new(),
             trajectory: None,
             pdd_assessment: None,
             aps_diagnostics: None,
@@ -12850,6 +13338,7 @@ mod tests {
             checkpoint_count: 0,
             trajectory_available: false,
             v25_shadow_decisions: Vec::new(),
+            decision_eval_snapshots: Vec::new(),
             trajectory: None,
             pdd_assessment: None,
             aps_diagnostics: None,
@@ -13129,6 +13618,7 @@ mod tests {
             checkpoint_count: 0,
             trajectory_available: false,
             v25_shadow_decisions: Vec::new(),
+            decision_eval_snapshots: Vec::new(),
             trajectory: None,
             pdd_assessment: None,
             aps_diagnostics: None,
@@ -13352,6 +13842,7 @@ mod tests {
             checkpoint_count: 0,
             trajectory_available: false,
             v25_shadow_decisions: Vec::new(),
+            decision_eval_snapshots: Vec::new(),
             trajectory: None,
             pdd_assessment: Some(pdd),
             aps_diagnostics: None,
@@ -13486,5 +13977,125 @@ mod tests {
             ShadowDecisionKind::InsufficientData.verdict_str(),
             "INSUFFICIENT_DATA"
         );
+    }
+
+    fn r17_snapshot_config() -> GatekeeperV2Config {
+        let mut cfg = organic_flow_config();
+        cfg.mode = GatekeeperMode::Long;
+        cfg.max_wait_time_ms = 10_000;
+        cfg.use_three_layer_decision = true;
+        cfg.v25.shadow_enabled = true;
+        cfg.v25.emit_shadow_decisions = true;
+        cfg.dow.enabled = true;
+        cfg.dow.early_entry_enabled = true;
+        cfg.dow.early_entry_min_ms = 2_000;
+        cfg.dow.early_entry_max_ms = 5_000;
+        cfg.dow.normal_window_ms = 7_000;
+        cfg.dow.extended_window_ms = 10_000;
+        cfg.dow.tick_interval_ms = 1_000;
+        cfg.pdd.enabled = true;
+        cfg
+    }
+
+    fn populate_r17_snapshot_buffer(buf: &mut GatekeeperBuffer) {
+        for i in 0..10 {
+            let tx = make_tx(
+                1_100 + i as u64 * 100,
+                &format!("r17_snap_{}", i),
+                &format!("signer_{}", i),
+                true,
+                0.5 + (i as f64) * 0.05,
+                Some(1_073_000_000.0 - (i as f64) * 1_000_000.0),
+                Some(30.0 + (i as f64) * 0.2),
+                Some(30.0 + (i as f64) * 0.2),
+            );
+            let _ = buf.ingest_transaction_tracking_only(Arc::new(tx));
+        }
+    }
+
+    #[test]
+    fn snapshot_hash_is_stable_for_same_payload() {
+        let payload = serde_json::json!({
+            "phase1": true,
+            "pdd": {"hard_fail": null, "score": 1.0},
+        });
+        assert_eq!(
+            GatekeeperBuffer::stable_json_hash(&payload),
+            GatekeeperBuffer::stable_json_hash(&payload)
+        );
+    }
+
+    #[test]
+    fn decision_eval_snapshots_are_emitted_at_configured_targets() {
+        let cfg = r17_snapshot_config();
+        let mut buf = GatekeeperBuffer::new(Pubkey::new_unique(), &cfg);
+        buf.set_registered_wall_t0(1_000);
+        populate_r17_snapshot_buffer(&mut buf);
+
+        buf.maybe_fire_shadow_checkpoint_from(3_000, ShadowCheckpointSource::Timer);
+        buf.maybe_fire_shadow_checkpoint_from(6_001, ShadowCheckpointSource::Timer);
+        buf.maybe_fire_shadow_checkpoint_from(8_000, ShadowCheckpointSource::Timer);
+        let _ = buf.check_long_deadline(11_000);
+
+        let targets = buf
+            .decision_eval_snapshots()
+            .iter()
+            .filter_map(|snapshot| snapshot.get("snapshot_target_ms").and_then(|v| v.as_u64()))
+            .collect::<std::collections::HashSet<_>>();
+        assert!(targets.contains(&2_000), "missing early snapshot");
+        assert!(targets.contains(&5_000), "missing normal snapshot");
+        assert!(targets.contains(&7_000), "missing extended snapshot");
+        assert!(targets.contains(&10_000), "missing terminal snapshot");
+    }
+
+    #[test]
+    fn snapshot_contains_gatekeeper_v2_replay_fields() {
+        let cfg = r17_snapshot_config();
+        let mut buf = GatekeeperBuffer::new(Pubkey::new_unique(), &cfg);
+        buf.set_registered_wall_t0(1_000);
+        populate_r17_snapshot_buffer(&mut buf);
+
+        buf.maybe_fire_shadow_checkpoint_from(3_000, ShadowCheckpointSource::Timer);
+        let snapshot = buf
+            .decision_eval_snapshots()
+            .first()
+            .expect("expected decision eval snapshot");
+
+        assert!(snapshot.get("materialized_feature_snapshot_hash").is_some());
+        assert!(snapshot.get("gatekeeper_mode").is_some());
+        assert!(snapshot.get("gatekeeper_config_hash").is_some());
+        assert!(snapshot.get("gatekeeper_gate_trace").is_some());
+        assert!(snapshot.get("phase_pass_vector").is_some());
+        assert!(snapshot.get("pdd_diagnostics").is_some());
+        assert!(snapshot.get("prosperity_diagnostics").is_some());
+        assert!(snapshot.get("hhi_diversity_diagnostics").is_some());
+        assert!(snapshot.get("verdict_if_evaluated").is_some());
+        assert!(snapshot.get("reason_code_if_evaluated").is_some());
+    }
+
+    #[test]
+    fn terminal_snapshot_is_always_present() {
+        let cfg = r17_snapshot_config();
+        let mut buf = GatekeeperBuffer::new(Pubkey::new_unique(), &cfg);
+        buf.set_registered_wall_t0(1_000);
+
+        let verdict = buf.check_long_deadline(11_000);
+        let assessment = match verdict {
+            GatekeeperVerdict::Timeout { assessment } => assessment,
+            _ => panic!("expected timeout for empty buffer"),
+        };
+        let log = assessment.to_buy_log(&Pubkey::new_unique(), &cfg);
+        let snapshots = log
+            .decision_eval_snapshots
+            .as_ref()
+            .and_then(|value| value.as_array())
+            .expect("terminal timeout must include decision_eval_snapshots");
+
+        assert!(snapshots.iter().any(|snapshot| {
+            snapshot
+                .get("snapshot_source")
+                .and_then(|value| value.as_str())
+                == Some("terminal")
+        }));
     }
 }
