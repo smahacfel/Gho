@@ -748,6 +748,56 @@ def legacy_buy_route_payload(
         for row in attempted_rows
         if row_string(row, "legacy_buy_curve_rpc_load_status")
     )
+    authority_readiness_counts = Counter(
+        row_string(row, "legacy_buy_curve_authority_readiness_status")
+        for row in attempted_rows
+        if row_string(row, "legacy_buy_curve_authority_readiness_status")
+    )
+    authoritative_and_load_ready_rows = [
+        row
+        for row in attempted_rows
+        if row_string(row, "legacy_buy_curve_authority_readiness_status")
+        == "authoritative_and_load_ready"
+    ]
+    load_ready_but_authority_unverified_rows = [
+        row
+        for row in attempted_rows
+        if row_string(row, "legacy_buy_curve_authority_readiness_status")
+        == "load_ready_but_authority_unverified"
+    ]
+    authoritative_but_not_checked_rows = [
+        row
+        for row in attempted_rows
+        if row_string(row, "legacy_buy_curve_authority_readiness_status")
+        == "authoritative_but_not_load_checked"
+    ]
+    derived_matches_account_state_rows = [
+        row
+        for row in attempted_rows
+        if row_string(row, "legacy_buy_curve_authority_status")
+        == "authoritative_cross_checked"
+        or row_string(row, "legacy_buy_curve_authority_readiness_status")
+        == "derived_matches_authoritative_source"
+    ]
+    derived_mismatch_account_state_rows = [
+        row
+        for row in attempted_rows
+        if row_string(row, "legacy_buy_curve_authority_status")
+        == "derived_mismatch_authoritative_source"
+        or row_string(row, "legacy_buy_curve_authority_readiness_status")
+        == "derived_mismatch_authoritative_source"
+    ]
+    route_ready_after_reconciliation_rows = [
+        row
+        for row in ready_rows
+        if row_string(row, "legacy_buy_curve_authority_readiness_status")
+        == "authoritative_and_load_ready"
+    ]
+    route_still_not_ready_after_reconciliation_rows = [
+        row
+        for row in attempted_rows
+        if row not in route_ready_after_reconciliation_rows
+    ]
     not_ready_reason_counts = Counter(
         row_string(row, "legacy_buy_route_not_ready_reason")
         or row_string(row, "fallback_route_not_ready_reason")
@@ -767,6 +817,30 @@ def legacy_buy_route_payload(
         "legacy_buy_curve_source_counts": dict(sorted(source_counts.items())),
         "legacy_buy_curve_authority_status_counts": dict(sorted(authority_counts.items())),
         "legacy_buy_curve_rpc_load_status_counts": dict(sorted(rpc_status_counts.items())),
+        "legacy_buy_curve_authority_readiness_status_counts": dict(
+            sorted(authority_readiness_counts.items())
+        ),
+        "legacy_buy_curve_authoritative_and_load_ready_rows": len(
+            authoritative_and_load_ready_rows
+        ),
+        "legacy_buy_curve_load_ready_but_authority_unverified_rows": len(
+            load_ready_but_authority_unverified_rows
+        ),
+        "legacy_buy_curve_authoritative_but_not_checked_rows": len(
+            authoritative_but_not_checked_rows
+        ),
+        "legacy_buy_curve_derived_matches_account_state_rows": len(
+            derived_matches_account_state_rows
+        ),
+        "legacy_buy_curve_derived_mismatch_account_state_rows": len(
+            derived_mismatch_account_state_rows
+        ),
+        "legacy_buy_route_ready_after_reconciliation_rows": len(
+            route_ready_after_reconciliation_rows
+        ),
+        "legacy_buy_route_still_not_ready_after_reconciliation_rows": len(
+            route_still_not_ready_after_reconciliation_rows
+        ),
         "legacy_buy_route_not_ready_reason_counts": dict(
             sorted(not_ready_reason_counts.items())
         ),
@@ -2895,6 +2969,14 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- active_shadow_legacy_buy_curve_source_counts: `{json.dumps(active_shadow['active_shadow_legacy_buy_curve_source_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- active_shadow_legacy_buy_curve_authority_status_counts: `{json.dumps(active_shadow['active_shadow_legacy_buy_curve_authority_status_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- active_shadow_legacy_buy_curve_rpc_load_status_counts: `{json.dumps(active_shadow['active_shadow_legacy_buy_curve_rpc_load_status_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_legacy_buy_curve_authority_readiness_status_counts: `{json.dumps(active_shadow['active_shadow_legacy_buy_curve_authority_readiness_status_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_legacy_buy_curve_authoritative_and_load_ready_rows: `{active_shadow['active_shadow_legacy_buy_curve_authoritative_and_load_ready_rows']}`",
+            f"- active_shadow_legacy_buy_curve_load_ready_but_authority_unverified_rows: `{active_shadow['active_shadow_legacy_buy_curve_load_ready_but_authority_unverified_rows']}`",
+            f"- active_shadow_legacy_buy_curve_authoritative_but_not_checked_rows: `{active_shadow['active_shadow_legacy_buy_curve_authoritative_but_not_checked_rows']}`",
+            f"- active_shadow_legacy_buy_curve_derived_matches_account_state_rows: `{active_shadow['active_shadow_legacy_buy_curve_derived_matches_account_state_rows']}`",
+            f"- active_shadow_legacy_buy_curve_derived_mismatch_account_state_rows: `{active_shadow['active_shadow_legacy_buy_curve_derived_mismatch_account_state_rows']}`",
+            f"- active_shadow_legacy_buy_route_ready_after_reconciliation_rows: `{active_shadow['active_shadow_legacy_buy_route_ready_after_reconciliation_rows']}`",
+            f"- active_shadow_legacy_buy_route_still_not_ready_after_reconciliation_rows: `{active_shadow['active_shadow_legacy_buy_route_still_not_ready_after_reconciliation_rows']}`",
             f"- active_shadow_legacy_buy_route_not_ready_reason_counts: `{json.dumps(active_shadow['active_shadow_legacy_buy_route_not_ready_reason_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- active_shadow_fallback_failure_class_counts: `{json.dumps(active_shadow['active_shadow_fallback_failure_class_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- active_shadow_fallback_missing_role_counts: `{json.dumps(active_shadow['active_shadow_fallback_missing_role_counts'], ensure_ascii=False, sort_keys=True)}`",
@@ -2977,6 +3059,14 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- legacy_buy_curve_source_counts: `{json.dumps(materialization['legacy_buy_curve_source_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- legacy_buy_curve_authority_status_counts: `{json.dumps(materialization['legacy_buy_curve_authority_status_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- legacy_buy_curve_rpc_load_status_counts: `{json.dumps(materialization['legacy_buy_curve_rpc_load_status_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- legacy_buy_curve_authority_readiness_status_counts: `{json.dumps(materialization['legacy_buy_curve_authority_readiness_status_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- legacy_buy_curve_authoritative_and_load_ready_rows: `{materialization['legacy_buy_curve_authoritative_and_load_ready_rows']}`",
+            f"- legacy_buy_curve_load_ready_but_authority_unverified_rows: `{materialization['legacy_buy_curve_load_ready_but_authority_unverified_rows']}`",
+            f"- legacy_buy_curve_authoritative_but_not_checked_rows: `{materialization['legacy_buy_curve_authoritative_but_not_checked_rows']}`",
+            f"- legacy_buy_curve_derived_matches_account_state_rows: `{materialization['legacy_buy_curve_derived_matches_account_state_rows']}`",
+            f"- legacy_buy_curve_derived_mismatch_account_state_rows: `{materialization['legacy_buy_curve_derived_mismatch_account_state_rows']}`",
+            f"- legacy_buy_route_ready_after_reconciliation_rows: `{materialization['legacy_buy_route_ready_after_reconciliation_rows']}`",
+            f"- legacy_buy_route_still_not_ready_after_reconciliation_rows: `{materialization['legacy_buy_route_still_not_ready_after_reconciliation_rows']}`",
             f"- legacy_buy_route_not_ready_reason_counts: `{json.dumps(materialization['legacy_buy_route_not_ready_reason_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- fallback_failure_class_counts: `{json.dumps(materialization['fallback_failure_class_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- fallback_missing_role_counts: `{json.dumps(materialization['fallback_missing_role_counts'], ensure_ascii=False, sort_keys=True)}`",

@@ -1964,6 +1964,70 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
         self.assertEqual(feasibility["lifecycle_eligible_rows"], 0)
         self.assertEqual(feasibility["active_buy_execution_infeasible_rows"], 1)
 
+    def test_e3_legacy_buy_authority_readiness_counters_are_reported(self) -> None:
+        rows = [
+            {
+                "selected_route_kind": "legacy_buy",
+                "legacy_buy_curve_authority_status": "authoritative_cross_checked",
+                "legacy_buy_curve_authority_readiness_status": "authoritative_and_load_ready",
+                "legacy_buy_curve_rpc_load_status": "present_on_rpc_precheck",
+                "legacy_buy_curve_rpc_load_ready": True,
+                "legacy_buy_route_ready": True,
+            },
+            {
+                "fallback_route_kind": "legacy_buy",
+                "legacy_buy_curve_authority_status": "derived_unverified",
+                "legacy_buy_curve_authority_readiness_status": (
+                    "load_ready_but_authority_unverified"
+                ),
+                "legacy_buy_curve_rpc_load_status": "present_on_rpc_precheck",
+                "legacy_buy_curve_rpc_load_ready": True,
+                "legacy_buy_route_ready": False,
+            },
+            {
+                "fallback_route_kind": "legacy_buy",
+                "legacy_buy_curve_authority_status": "authoritative_account_state",
+                "legacy_buy_curve_authority_readiness_status": (
+                    "authoritative_but_not_load_checked"
+                ),
+                "legacy_buy_curve_rpc_load_status": "not_checked",
+                "legacy_buy_curve_rpc_load_ready": False,
+                "legacy_buy_route_ready": False,
+            },
+            {
+                "fallback_route_kind": "legacy_buy",
+                "legacy_buy_curve_authority_status": (
+                    "derived_mismatch_authoritative_source"
+                ),
+                "legacy_buy_curve_authority_readiness_status": (
+                    "derived_mismatch_authoritative_source"
+                ),
+                "legacy_buy_route_ready": False,
+            },
+        ]
+
+        payload = audit.legacy_buy_route_payload(rows, [])
+
+        self.assertEqual(payload["legacy_buy_curve_authoritative_and_load_ready_rows"], 1)
+        self.assertEqual(
+            payload["legacy_buy_curve_load_ready_but_authority_unverified_rows"],
+            1,
+        )
+        self.assertEqual(payload["legacy_buy_curve_authoritative_but_not_checked_rows"], 1)
+        self.assertEqual(payload["legacy_buy_curve_derived_matches_account_state_rows"], 1)
+        self.assertEqual(payload["legacy_buy_curve_derived_mismatch_account_state_rows"], 1)
+        self.assertEqual(payload["legacy_buy_route_ready_after_reconciliation_rows"], 1)
+        self.assertEqual(payload["legacy_buy_route_still_not_ready_after_reconciliation_rows"], 3)
+        self.assertEqual(
+            payload["legacy_buy_curve_authority_readiness_status_counts"],
+            {
+                "authoritative_and_load_ready": 1,
+                "authoritative_but_not_load_checked": 1,
+                "derived_mismatch_authoritative_source": 1,
+                "load_ready_but_authority_unverified": 1,
+            },
+        )
+
     def test_active_shadow_unattributed_account_not_found_blocks_readiness(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

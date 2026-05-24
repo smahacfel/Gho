@@ -240,6 +240,8 @@ pub struct ShadowSimulationAccountDiagnostics {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legacy_buy_curve_rpc_load_ready: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_buy_curve_authority_readiness_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legacy_buy_associated_bonding_curve_pubkey: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legacy_buy_associated_bonding_curve_source: Option<String>,
