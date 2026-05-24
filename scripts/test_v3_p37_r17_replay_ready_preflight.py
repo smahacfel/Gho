@@ -84,6 +84,8 @@ def r17_config(root: Path, **overrides: object) -> Path:
     payer = str(overrides.get("payer_strategy", "ephemeral"))
     temporal_enabled = "true" if overrides.get("temporal_enabled", True) else "false"
     allow_p2_live = "true" if overrides.get("allow_p2_live", False) else "false"
+    snapshot_targets = overrides.get("snapshot_targets", [2000, 5000, 7000, 10000])
+    snapshot_targets_toml = ", ".join(str(target) for target in snapshot_targets)
     path = root / "configs/rollout/r17.toml"
     write_file(
         path,
@@ -142,7 +144,7 @@ require_gatekeeper_v2_replay_contract = true
 require_non_temporal_axes = true
 require_temporal_decision_eval_snapshots = true
 decision_eval_snapshots_enabled = {temporal_enabled}
-decision_eval_snapshot_elapsed_ms = [2000, 5000, 7000]
+decision_eval_snapshot_elapsed_ms = [{snapshot_targets_toml}]
 include_terminal_snapshot = true
 require_gatekeeper_v3_payload = true
 require_execution_feasibility_fields = true
@@ -251,6 +253,18 @@ class P37R17ReplayReadyPreflightTests(unittest.TestCase):
             "gatekeeper_dow_normal_window_exceeds_max_wait_time:7000:max:5000",
             report["blockers"],
         )
+
+    def test_blocks_missing_terminal_snapshot_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_tree(root, temporal_snapshots=True)
+            brain_config(root)
+            config = r17_config(root, snapshot_targets=[2000, 5000, 7000])
+
+            report = r17.build_preflight_report(config, repo_root=root)
+
+        self.assertEqual(report["preflight_status"], "fail")
+        self.assertIn("terminal_snapshot_target_missing_from_config:10000", report["blockers"])
 
 
 if __name__ == "__main__":

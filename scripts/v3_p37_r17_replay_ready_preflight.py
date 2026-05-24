@@ -110,7 +110,10 @@ def ghost_brain_replay_payload_enabled(config: dict[str, Any], config_path: Path
 
 
 def gatekeeper_v2_snapshot_contract(
-    config: dict[str, Any], config_path: Path, snapshot_ms: set[int]
+    config: dict[str, Any],
+    config_path: Path,
+    snapshot_ms: set[int],
+    include_terminal_snapshot: bool,
 ) -> tuple[list[str], dict[str, Any]]:
     blockers: list[str] = []
     brain, reason = load_ghost_brain_config(config, config_path)
@@ -131,6 +134,8 @@ def gatekeeper_v2_snapshot_contract(
 
     if max_wait_time_ms <= 0:
         blockers.append("gatekeeper_v2_max_wait_time_missing")
+    elif include_terminal_snapshot and max_wait_time_ms not in snapshot_ms:
+        blockers.append(f"terminal_snapshot_target_missing_from_config:{max_wait_time_ms}")
     for target_ms in sorted(snapshot_ms):
         if max_wait_time_ms > 0 and target_ms > max_wait_time_ms:
             blockers.append(
@@ -151,6 +156,7 @@ def gatekeeper_v2_snapshot_contract(
         "gatekeeper_v2_dow_enabled": dow_enabled,
         "gatekeeper_v2_dow_normal_window_ms": normal_window_ms,
         "gatekeeper_v2_dow_extended_window_ms": extended_window_ms,
+        "terminal_snapshot_target_ms": max_wait_time_ms if include_terminal_snapshot else None,
     }
 
 
@@ -259,8 +265,9 @@ def validate_config(config: dict[str, Any], config_path: Path, repo_root: Path) 
 
     snapshot_ms = set(get_path(config, ["r17_replay_ready_contract", "decision_eval_snapshot_elapsed_ms"], []) or [])
     add_if(blockers, not REQUIRED_TEMPORAL_SNAPSHOT_MS.issubset(snapshot_ms), "temporal_snapshot_checkpoints_incomplete")
+    include_terminal_snapshot = bool_path(config, ["r17_replay_ready_contract", "include_terminal_snapshot"])
     gatekeeper_snapshot_blockers, gatekeeper_snapshot_contract = gatekeeper_v2_snapshot_contract(
-        config, config_path, snapshot_ms
+        config, config_path, snapshot_ms, include_terminal_snapshot
     )
     blockers.extend(gatekeeper_snapshot_blockers)
 

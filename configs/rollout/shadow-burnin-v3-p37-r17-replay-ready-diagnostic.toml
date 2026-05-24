@@ -1,10 +1,12 @@
 # P3.7-R17 replay-ready diagnostic profile.
 # Do not run this profile unless scripts/v3_p37_r17_replay_ready_preflight.py passes.
-# This profile preserves the R16 standard-softPDD policy envelope and adds only
-# a preflight-audited replay-input contract marker for future causal L2.
+# This is a diagnostic temporal data collection profile, not a production
+# candidate policy. It preserves the R16 standard-softPDD gate family while
+# extending the observation window to collect replay-ready 2s/5s/7s/10s
+# snapshots for causal L2 analysis.
 
 mode = "production"
-ghost_brain_config_path = "../../configs/rollout/ghost_brain_v3_p37_l1_standard_softpdd.toml"
+ghost_brain_config_path = "../../configs/rollout/ghost_brain_v3_p37_r17_replay_ready_diagnostic.toml"
 
 [seer]
 enabled = true
@@ -115,7 +117,7 @@ require_gatekeeper_v2_replay_contract = true
 require_non_temporal_axes = true
 require_temporal_decision_eval_snapshots = true
 decision_eval_snapshots_enabled = true
-decision_eval_snapshot_elapsed_ms = [2000, 5000, 7000]
+decision_eval_snapshot_elapsed_ms = [2000, 5000, 7000, 10000]
 include_terminal_snapshot = true
 require_gatekeeper_v3_payload = true
 require_execution_feasibility_fields = true
