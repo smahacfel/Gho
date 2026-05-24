@@ -3,12 +3,9 @@
 ## Verdict
 
 - source_l1r19_decision: `GO_L2_EXECUTABLE_SUBSET`
-- preflight_status: `fail`
-- final_decision: `BLOCK_L2_INPUT_UNIVERSE_CONTRACT`
+- preflight_status: `pass`
+- final_decision: `GO_L2_EXECUTABLE_SUBSET_LOCKED`
 - override_used: `False`
-- blocker: `requested_l2_namespace_is_hard_blocked`
-- blocker: `requested_l2_namespace_has_no_buy_quality_denominator`
-- blocker: `l2_buy_quality_denominator_empty`
 
 ## Scope Lock
 
@@ -23,18 +20,18 @@
 
 ## Input Totals
 
-- total_rows: `70`
-- executable_eligible_rows: `0`
-- excluded_non_executable_rows_within_allowed_runs: `63`
-- buy_quality_denominator_rows: `0`
-- buy_quality_bad: `0`
-- buy_quality_dirty_good: `0`
+- total_rows: `4322`
+- executable_eligible_rows: `87`
+- excluded_non_executable_rows_within_allowed_runs: `2280`
+- buy_quality_denominator_rows: `85`
+- buy_quality_bad: `81`
+- buy_quality_dirty_good: `4`
 - buy_quality_good: `0`
 - buy_quality_not_executable: `0`
-- lifecycle_labeled_rows: `0`
-- feature_join_executable_labeled_rows: `0`
-- dirty_good_rate: `n/a`
-- usable_label_rate: `n/a`
+- lifecycle_labeled_rows: `85`
+- feature_join_executable_labeled_rows: `81`
+- dirty_good_rate: `0.0471`
+- usable_label_rate: `1.0000`
 
 ## Excluded Totals
 
@@ -49,7 +46,8 @@
 
 | namespace | decisions | route_exec | route_non_exec | lifecycle_labels | buy_denominator | bad | dirty_good | good | not_exec |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r13-executable-route-resolver` | 70 | 0 | 63 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `shadow-burnin-v3-p37-counterfactual-probe-r15-lifecycle-label-j4c-r1` | 2344 | 44 | 1205 | 42 | 42 | 42 | 0 | 0 | 0 |
+| `shadow-burnin-v3-p37-counterfactual-probe-r16-standard-softpdd-r1` | 1978 | 43 | 1075 | 43 | 43 | 39 | 4 | 0 | 0 |
 
 ## Excluded Runs
 
