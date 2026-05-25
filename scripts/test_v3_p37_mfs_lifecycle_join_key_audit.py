@@ -2082,6 +2082,9 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
                 "selected_route_handoff_status": "selected_route_handoff_applied",
                 "selected_route_precheck_hash": "legacy-precheck",
                 "selected_route_simulation_hash": "legacy-simulation",
+                "precheck_account_set_hash": "legacy-precheck",
+                "simulation_account_set_hash": "legacy-simulation",
+                "buy_variant": "legacy_buy",
                 "fallback_route_kind": "legacy_buy",
             },
             {
@@ -2089,6 +2092,7 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
                 "route_resolution_status": "fallback_route_ready",
                 "fallback_route_ready": True,
                 "fallback_route_kind": "legacy_buy",
+                "buy_variant": "routed_exact_sol_in",
                 "precheck_failure_reason": (
                     "no_executable_route_account_set:"
                     "primary_route_bcv2_missing:bonding_curve_v2:bcv2"
@@ -2101,6 +2105,7 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
         self.assertEqual(payload["selected_fallback_route_ready_rows"], 2)
         self.assertEqual(payload["selected_fallback_route_handoff_applied_rows"], 1)
         self.assertEqual(payload["selected_fallback_route_handoff_mismatch_rows"], 0)
+        self.assertEqual(payload["selected_fallback_route_handoff_not_applied_rows"], 1)
         self.assertEqual(
             payload["selected_fallback_route_blocked_by_primary_reason_rows"],
             1,
@@ -2110,11 +2115,68 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
             1,
         )
         self.assertEqual(
+            payload["legacy_buy_selected_but_request_variant_not_legacy_rows"],
+            1,
+        )
+        self.assertEqual(
+            payload["legacy_buy_selected_but_primary_bcv2_in_selected_manifest_rows"],
+            0,
+        )
+        self.assertEqual(
+            payload["legacy_buy_selected_but_precheck_hash_mismatch_rows"],
+            0,
+        )
+        self.assertEqual(
+            payload["legacy_buy_selected_but_simulation_hash_mismatch_rows"],
+            0,
+        )
+        self.assertEqual(
             payload["legacy_buy_selected_and_precheck_uses_legacy_account_set_rows"],
             1,
         )
         self.assertEqual(
             payload["legacy_buy_selected_and_simulation_uses_legacy_account_set_rows"],
+            1,
+        )
+
+    def test_e4r2_selected_fallback_handoff_violation_counters_are_reported(
+        self,
+    ) -> None:
+        rows = [
+            {
+                "selected_route_kind": "legacy_buy",
+                "route_resolution_status": "fallback_route_ready",
+                "fallback_route_ready": True,
+                "fallback_route_kind": "legacy_buy",
+                "buy_variant": "routed_exact_sol_in",
+                "selected_route_account_set_roles": [
+                    "bonding_curve_v2:BCV2",
+                    "bonding_curve:CURVE",
+                ],
+                "selected_route_handoff_status": "selected_route_handoff_applied",
+                "selected_route_precheck_hash": "selected-precheck",
+                "precheck_account_set_hash": "actual-precheck",
+                "selected_route_simulation_hash": "selected-simulation",
+                "simulation_account_set_hash": "actual-simulation",
+            }
+        ]
+
+        payload = audit.legacy_buy_route_payload(rows, [])
+
+        self.assertEqual(
+            payload["legacy_buy_selected_but_request_variant_not_legacy_rows"],
+            1,
+        )
+        self.assertEqual(
+            payload["legacy_buy_selected_but_primary_bcv2_in_selected_manifest_rows"],
+            1,
+        )
+        self.assertEqual(
+            payload["legacy_buy_selected_but_precheck_hash_mismatch_rows"],
+            1,
+        )
+        self.assertEqual(
+            payload["legacy_buy_selected_but_simulation_hash_mismatch_rows"],
             1,
         )
 

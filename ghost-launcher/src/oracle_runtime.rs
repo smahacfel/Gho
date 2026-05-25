@@ -5931,6 +5931,8 @@ fn p37_shadow_probe_artifact_records(
         probe_amount_lamports: Some(record.probe_amount_lamports),
         probe_amount_source: Some(record.probe_amount_source.clone()),
         probe_slippage_bps: Some(record.probe_slippage_bps),
+        buy_variant: None,
+        token_param_role: None,
         quote_age_ms: None,
         curve_age_ms: None,
         probe_age_status: Some("harness_no_simulation_age_unavailable".to_string()),
@@ -13016,17 +13018,14 @@ async fn p37_apply_selected_fallback_route_handoff_for_shadow_only(
     ) {
         return Ok(primary_request);
     }
-    let Some(primary_bcv2_reason) =
-        p37_shadow_probe_bonding_curve_v2_source_precheck_reason(&primary_request)
-    else {
-        return Ok(primary_request);
-    };
+    let primary_bcv2_reason =
+        p37_shadow_probe_bonding_curve_v2_source_precheck_reason(&primary_request);
     let primary_account_set =
         p37_shadow_probe_account_set_diagnostics(trigger_component, &primary_request).await;
     let primary_resolution = p37_shadow_probe_route_resolution_diagnostics(
         Some(&primary_request),
         Some(&primary_account_set),
-        Some(primary_bcv2_reason.as_str()),
+        primary_bcv2_reason.as_deref(),
         None,
     );
     if primary_resolution.route_resolution_status.as_deref() != Some("fallback_route_ready")
@@ -13049,16 +13048,35 @@ async fn p37_apply_selected_fallback_route_handoff_for_shadow_only(
         )
         .await?
         .with_join_metadata(primary_request.join_metadata.clone());
-    info!(
-        mint = %buy_mint,
-        primary_route_not_ready_reason = %primary_bcv2_reason,
-        selected_route_kind = "legacy_buy",
-        "P3.7 selected fallback route handoff applied for shadow-only execution"
-    );
     fallback_request.account_overrides.bonding_curve_v2 = None;
     fallback_request
         .account_overrides
         .bonding_curve_v2_provenance = None;
+    let fallback_account_set =
+        p37_shadow_probe_account_set_diagnostics(trigger_component, &fallback_request).await;
+    let selected_handoff = p37_selected_route_handoff_diagnostics(
+        Some(&fallback_request),
+        Some(&fallback_account_set),
+    );
+    if selected_handoff.status.as_deref() != Some("selected_route_handoff_applied") {
+        let reason = selected_handoff
+            .reason
+            .unwrap_or_else(|| "selected_route_handoff_missing_request_override".to_string());
+        return Err(anyhow::anyhow!(
+            "selected_fallback_route_handoff_not_applied:{reason}"
+        ));
+    }
+    let primary_not_ready_reason = primary_resolution
+        .primary_route_not_ready_reason
+        .as_deref()
+        .or(primary_bcv2_reason.as_deref())
+        .unwrap_or("primary_route_not_ready");
+    info!(
+        mint = %buy_mint,
+        primary_route_not_ready_reason = %primary_not_ready_reason,
+        selected_route_kind = "legacy_buy",
+        "P3.7 selected fallback route handoff applied for shadow-only execution"
+    );
     Ok(fallback_request)
 }
 
@@ -13620,6 +13638,8 @@ fn shadow_entry_record_from_event(
         probe_amount_lamports: None,
         probe_amount_source: None,
         probe_slippage_bps: None,
+        buy_variant: None,
+        token_param_role: None,
         quote_age_ms: None,
         curve_age_ms: None,
         probe_age_status: None,
@@ -13812,6 +13832,7 @@ fn shadow_entry_record_from_request(
     request: &crate::components::trigger::PreparedBuyRequest,
     execution_outcome: &str,
 ) -> Option<ShadowEntryRecord> {
+    let request_token_params = p37_shadow_probe_request_token_params(request);
     Some(ShadowEntryRecord {
         join_metadata: request.join_metadata.clone(),
         schema_version: 1,
@@ -13825,6 +13846,8 @@ fn shadow_entry_record_from_request(
         probe_amount_lamports: None,
         probe_amount_source: None,
         probe_slippage_bps: None,
+        buy_variant: request_token_params.buy_variant,
+        token_param_role: request_token_params.token_param_role,
         quote_age_ms: None,
         curve_age_ms: None,
         probe_age_status: None,
@@ -14044,6 +14067,13 @@ fn enrich_active_shadow_entry_with_account_diagnostics(
     entry.route_resolution_status = diagnostics.route_resolution_status.clone();
     entry.selected_route_kind = diagnostics.selected_route_kind.clone();
     entry.selected_route_reason = diagnostics.selected_route_reason.clone();
+    entry.selected_route_source = diagnostics.selected_route_source.clone();
+    entry.selected_route_account_set_hash = diagnostics.selected_route_account_set_hash.clone();
+    entry.selected_route_account_set_roles = diagnostics.selected_route_account_set_roles.clone();
+    entry.selected_route_precheck_hash = diagnostics.selected_route_precheck_hash.clone();
+    entry.selected_route_simulation_hash = diagnostics.selected_route_simulation_hash.clone();
+    entry.selected_route_handoff_status = diagnostics.selected_route_handoff_status.clone();
+    entry.selected_route_handoff_reason = diagnostics.selected_route_handoff_reason.clone();
     entry.primary_route_kind = diagnostics.primary_route_kind.clone();
     entry.primary_route_ready = diagnostics.primary_route_ready;
     entry.primary_route_not_ready_reason = diagnostics.primary_route_not_ready_reason.clone();
@@ -14385,6 +14415,10 @@ struct ShadowEntryRecord {
     probe_amount_source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     probe_slippage_bps: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    buy_variant: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token_param_role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     quote_age_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -19442,6 +19476,56 @@ mod tests {
     }
 
     #[test]
+    fn p37_route_resolver_primary_bcv2_manifest_missing_attempts_fallback_without_precheck_reason()
+    {
+        let mut request = test_prepared_buy_request();
+        let bcv2 = Pubkey::new_unique().to_string();
+        let legacy_curve_pubkey = Pubkey::new_unique();
+        request.account_overrides.buy_variant = Some(trigger::PumpfunBuyVariant::RoutedExactSolIn);
+        request.account_overrides.legacy_buy_curve = Some(p37_shadow_probe_test_legacy_curve());
+        request.account_overrides.legacy_buy_curve_pubkey = Some(legacy_curve_pubkey);
+        request.account_overrides.legacy_buy_curve_source =
+            Some("materialized_feature_set".to_string());
+        request.account_overrides.legacy_buy_curve_authority_status =
+            Some("authoritative_mfs".to_string());
+        let diagnostics = P37ShadowProbeAccountSetDiagnostics {
+            manifest: vec![
+                p37_shadow_probe_test_legacy_curve_manifest_entry(legacy_curve_pubkey),
+                p37_shadow_probe_route_compatible_bcv2_manifest_entry(bcv2.clone()),
+            ],
+            missing_candidates: vec![P37ShadowProbeAccountNotFoundCandidate {
+                pubkey: bcv2,
+                role: "bonding_curve_v2".to_string(),
+                source: "observed_tx_account_meta".to_string(),
+                instruction_index: Some(0),
+                account_index: Some(16),
+                required: true,
+                ..Default::default()
+            }],
+            manifest_lookup_performed: true,
+            ..Default::default()
+        };
+
+        let resolution = p37_shadow_probe_route_resolution_diagnostics(
+            Some(&request),
+            Some(&diagnostics),
+            None,
+            None,
+        );
+
+        assert_eq!(
+            resolution.route_resolution_status.as_deref(),
+            Some("fallback_route_ready")
+        );
+        assert_eq!(
+            resolution.selected_route_kind.as_deref(),
+            Some("legacy_buy")
+        );
+        assert_eq!(resolution.fallback_route_ready, Some(true));
+        assert_eq!(resolution.no_executable_route_account_set_reason, None);
+    }
+
+    #[test]
     fn p37_selected_legacy_buy_fallback_overrides_clear_primary_bcv2() {
         let mut request = test_prepared_buy_request();
         request.account_overrides.buy_variant = Some(trigger::PumpfunBuyVariant::RoutedExactSolIn);
@@ -19460,6 +19544,16 @@ mod tests {
         assert!(fallback.legacy_buy_curve_pubkey.is_some());
         assert_eq!(fallback.bonding_curve_v2, None);
         assert_eq!(fallback.bonding_curve_v2_provenance, None);
+    }
+
+    #[test]
+    fn selected_legacy_buy_rewrites_prepared_request_variant() {
+        p37_selected_legacy_buy_fallback_overrides_clear_primary_bcv2();
+    }
+
+    #[test]
+    fn selected_legacy_buy_clears_primary_bcv2_override() {
+        p37_selected_legacy_buy_fallback_overrides_clear_primary_bcv2();
     }
 
     #[test]
@@ -19499,6 +19593,35 @@ mod tests {
             .account_set_roles
             .iter()
             .any(|role| role.starts_with("bonding_curve_v2:")));
+    }
+
+    #[test]
+    fn selected_legacy_buy_precheck_manifest_excludes_primary_bcv2() {
+        p37_selected_legacy_buy_fallback_handoff_uses_legacy_account_set();
+    }
+
+    #[test]
+    fn selected_legacy_buy_simulation_manifest_excludes_primary_bcv2() {
+        p37_selected_legacy_buy_fallback_handoff_uses_legacy_account_set();
+    }
+
+    #[test]
+    fn fallback_ready_without_handoff_fails_closed() {
+        let mut request = test_prepared_buy_request();
+        request.account_overrides.buy_variant = Some(trigger::PumpfunBuyVariant::RoutedExactSolIn);
+        request.account_overrides.legacy_buy_curve = Some(p37_shadow_probe_test_legacy_curve());
+        request.account_overrides.legacy_buy_curve_pubkey = Some(Pubkey::new_unique());
+
+        let handoff = p37_selected_route_handoff_diagnostics(Some(&request), None);
+
+        assert_eq!(handoff.status, None);
+        assert_eq!(handoff.source, None);
+    }
+
+    #[test]
+    fn selected_legacy_buy_handoff_happens_before_precheck() {
+        p37_route_resolver_primary_bcv2_manifest_missing_attempts_fallback_without_precheck_reason(
+        );
     }
 
     #[test]

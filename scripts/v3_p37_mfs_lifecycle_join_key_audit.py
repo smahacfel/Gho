@@ -721,6 +721,21 @@ def row_primary_bcv2_terminal_reason(row: dict[str, Any]) -> bool:
     )
 
 
+def selected_route_roles_contain_primary_bcv2(row: dict[str, Any]) -> bool:
+    return any(
+        role == "bonding_curve_v2" or role.startswith("bonding_curve_v2:")
+        for role in row_string_list(row, "selected_route_account_set_roles")
+    )
+
+
+def selected_route_hash_mismatch(row: dict[str, Any], selected_field: str, actual_field: str) -> bool:
+    selected_hash = row_string(row, selected_field)
+    actual_hash = row_string(row, actual_field)
+    if not selected_hash or not actual_hash:
+        return True
+    return selected_hash != actual_hash
+
+
 def legacy_buy_missing_core_curve(row: dict[str, Any]) -> bool:
     return (
         row_string(row, "legacy_buy_route_not_ready_reason")
@@ -910,10 +925,45 @@ def legacy_buy_route_payload(
         if row_string(row, "selected_route_handoff_status")
         == "selected_route_handoff_mismatch"
     ]
+    selected_fallback_handoff_not_applied_rows = [
+        row
+        for row in selected_fallback_ready_rows
+        if row_string(row, "selected_route_handoff_status")
+        != "selected_route_handoff_applied"
+    ]
     selected_fallback_blocked_by_primary_reason_rows = [
         row
         for row in selected_fallback_ready_rows
         if row_primary_bcv2_terminal_reason(row)
+    ]
+    selected_but_request_variant_not_legacy_rows = [
+        row
+        for row in selected_fallback_ready_rows
+        if row_string(row, "buy_variant")
+        and row_string(row, "buy_variant") not in {"legacy_buy", "LegacyBuy"}
+    ]
+    selected_but_primary_bcv2_in_manifest_rows = [
+        row
+        for row in selected_fallback_ready_rows
+        if selected_route_roles_contain_primary_bcv2(row)
+    ]
+    selected_but_precheck_hash_mismatch_rows = [
+        row
+        for row in selected_fallback_handoff_applied_rows
+        if selected_route_hash_mismatch(
+            row,
+            "selected_route_precheck_hash",
+            "precheck_account_set_hash",
+        )
+    ]
+    selected_but_simulation_hash_mismatch_rows = [
+        row
+        for row in selected_fallback_handoff_applied_rows
+        if selected_route_hash_mismatch(
+            row,
+            "selected_route_simulation_hash",
+            "simulation_account_set_hash",
+        )
     ]
     selected_precheck_uses_legacy_rows = [
         row
@@ -1001,11 +1051,26 @@ def legacy_buy_route_payload(
         "selected_fallback_route_handoff_mismatch_rows": len(
             selected_fallback_handoff_mismatch_rows
         ),
+        "selected_fallback_route_handoff_not_applied_rows": len(
+            selected_fallback_handoff_not_applied_rows
+        ),
         "selected_fallback_route_blocked_by_primary_reason_rows": len(
             selected_fallback_blocked_by_primary_reason_rows
         ),
         "legacy_buy_selected_but_primary_bcv2_terminal_rows": len(
             selected_fallback_blocked_by_primary_reason_rows
+        ),
+        "legacy_buy_selected_but_request_variant_not_legacy_rows": len(
+            selected_but_request_variant_not_legacy_rows
+        ),
+        "legacy_buy_selected_but_primary_bcv2_in_selected_manifest_rows": len(
+            selected_but_primary_bcv2_in_manifest_rows
+        ),
+        "legacy_buy_selected_but_precheck_hash_mismatch_rows": len(
+            selected_but_precheck_hash_mismatch_rows
+        ),
+        "legacy_buy_selected_but_simulation_hash_mismatch_rows": len(
+            selected_but_simulation_hash_mismatch_rows
         ),
         "legacy_buy_selected_and_precheck_uses_legacy_account_set_rows": len(
             selected_precheck_uses_legacy_rows
@@ -3159,8 +3224,13 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- active_shadow_selected_fallback_route_ready_rows: `{active_shadow['active_shadow_selected_fallback_route_ready_rows']}`",
             f"- active_shadow_selected_fallback_route_handoff_applied_rows: `{active_shadow['active_shadow_selected_fallback_route_handoff_applied_rows']}`",
             f"- active_shadow_selected_fallback_route_handoff_mismatch_rows: `{active_shadow['active_shadow_selected_fallback_route_handoff_mismatch_rows']}`",
+            f"- active_shadow_selected_fallback_route_handoff_not_applied_rows: `{active_shadow['active_shadow_selected_fallback_route_handoff_not_applied_rows']}`",
             f"- active_shadow_selected_fallback_route_blocked_by_primary_reason_rows: `{active_shadow['active_shadow_selected_fallback_route_blocked_by_primary_reason_rows']}`",
             f"- active_shadow_legacy_buy_selected_but_primary_bcv2_terminal_rows: `{active_shadow['active_shadow_legacy_buy_selected_but_primary_bcv2_terminal_rows']}`",
+            f"- active_shadow_legacy_buy_selected_but_request_variant_not_legacy_rows: `{active_shadow['active_shadow_legacy_buy_selected_but_request_variant_not_legacy_rows']}`",
+            f"- active_shadow_legacy_buy_selected_but_primary_bcv2_in_selected_manifest_rows: `{active_shadow['active_shadow_legacy_buy_selected_but_primary_bcv2_in_selected_manifest_rows']}`",
+            f"- active_shadow_legacy_buy_selected_but_precheck_hash_mismatch_rows: `{active_shadow['active_shadow_legacy_buy_selected_but_precheck_hash_mismatch_rows']}`",
+            f"- active_shadow_legacy_buy_selected_but_simulation_hash_mismatch_rows: `{active_shadow['active_shadow_legacy_buy_selected_but_simulation_hash_mismatch_rows']}`",
             f"- active_shadow_legacy_buy_selected_and_precheck_uses_legacy_account_set_rows: `{active_shadow['active_shadow_legacy_buy_selected_and_precheck_uses_legacy_account_set_rows']}`",
             f"- active_shadow_legacy_buy_selected_and_simulation_uses_legacy_account_set_rows: `{active_shadow['active_shadow_legacy_buy_selected_and_simulation_uses_legacy_account_set_rows']}`",
             f"- active_shadow_fallback_failure_class_counts: `{json.dumps(active_shadow['active_shadow_fallback_failure_class_counts'], ensure_ascii=False, sort_keys=True)}`",
@@ -3265,8 +3335,13 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- selected_fallback_route_ready_rows: `{materialization['selected_fallback_route_ready_rows']}`",
             f"- selected_fallback_route_handoff_applied_rows: `{materialization['selected_fallback_route_handoff_applied_rows']}`",
             f"- selected_fallback_route_handoff_mismatch_rows: `{materialization['selected_fallback_route_handoff_mismatch_rows']}`",
+            f"- selected_fallback_route_handoff_not_applied_rows: `{materialization['selected_fallback_route_handoff_not_applied_rows']}`",
             f"- selected_fallback_route_blocked_by_primary_reason_rows: `{materialization['selected_fallback_route_blocked_by_primary_reason_rows']}`",
             f"- legacy_buy_selected_but_primary_bcv2_terminal_rows: `{materialization['legacy_buy_selected_but_primary_bcv2_terminal_rows']}`",
+            f"- legacy_buy_selected_but_request_variant_not_legacy_rows: `{materialization['legacy_buy_selected_but_request_variant_not_legacy_rows']}`",
+            f"- legacy_buy_selected_but_primary_bcv2_in_selected_manifest_rows: `{materialization['legacy_buy_selected_but_primary_bcv2_in_selected_manifest_rows']}`",
+            f"- legacy_buy_selected_but_precheck_hash_mismatch_rows: `{materialization['legacy_buy_selected_but_precheck_hash_mismatch_rows']}`",
+            f"- legacy_buy_selected_but_simulation_hash_mismatch_rows: `{materialization['legacy_buy_selected_but_simulation_hash_mismatch_rows']}`",
             f"- legacy_buy_selected_and_precheck_uses_legacy_account_set_rows: `{materialization['legacy_buy_selected_and_precheck_uses_legacy_account_set_rows']}`",
             f"- legacy_buy_selected_and_simulation_uses_legacy_account_set_rows: `{materialization['legacy_buy_selected_and_simulation_uses_legacy_account_set_rows']}`",
             f"- fallback_failure_class_counts: `{json.dumps(materialization['fallback_failure_class_counts'], ensure_ascii=False, sort_keys=True)}`",
