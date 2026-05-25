@@ -669,6 +669,21 @@ def working_builder_parity_payload(
     rows: list[dict[str, Any]],
     prefix: str = "",
 ) -> dict[str, Any]:
+    ready_rpc_load_statuses = {
+        "rpc_load_ready",
+        "local_diag_ready",
+        "mfs_materialized_ready",
+        "account_state_ready",
+    }
+
+    def source_authority_ready(row: dict[str, Any], field: str) -> bool:
+        status = row_string(row, field)
+        return status is None or status.startswith("authoritative_")
+
+    def rpc_load_ready(row: dict[str, Any], field: str) -> bool:
+        status = row_string(row, field)
+        return status is None or status in ready_rpc_load_statuses
+
     parity_rows = [
         row
         for row in rows
@@ -707,6 +722,10 @@ def working_builder_parity_payload(
         row
         for row in request_built_rows
         if not row_string_list(row, "working_builder_missing_required_accounts")
+        and source_authority_ready(row, "working_builder_bcv2_source_authority")
+        and rpc_load_ready(row, "working_builder_bcv2_rpc_load_status")
+        and source_authority_ready(row, "working_builder_creator_vault_source_authority")
+        and rpc_load_ready(row, "working_builder_creator_vault_rpc_load_status")
         and (
             row_string(row, "working_builder_rpc_manifest_hash")
             or row_string(row, "working_builder_sender_manifest_hash")
@@ -722,6 +741,22 @@ def working_builder_parity_payload(
             + row_string_list(row, "working_builder_sender_manifest_account_roles")
         )
     ]
+    bcv2_source_authority_counts = Counter(
+        row_string(row, "working_builder_bcv2_source_authority") or "missing"
+        for row in parity_rows
+    )
+    bcv2_rpc_load_status_counts = Counter(
+        row_string(row, "working_builder_bcv2_rpc_load_status") or "missing"
+        for row in parity_rows
+    )
+    creator_vault_source_authority_counts = Counter(
+        row_string(row, "working_builder_creator_vault_source_authority") or "missing"
+        for row in parity_rows
+    )
+    creator_vault_rpc_load_status_counts = Counter(
+        row_string(row, "working_builder_creator_vault_rpc_load_status") or "missing"
+        for row in parity_rows
+    )
     return {
         f"{prefix}working_builder_parity_rows": len(parity_rows),
         f"{prefix}working_builder_request_built_rows": len(request_built_rows),
@@ -734,6 +769,18 @@ def working_builder_parity_payload(
         ),
         f"{prefix}working_builder_manifest_ready_rows": len(manifest_ready_rows),
         f"{prefix}working_builder_manifest_contains_bcv2_rows": len(contains_bcv2_rows),
+        f"{prefix}working_builder_bcv2_source_authority_counts": dict(
+            sorted(bcv2_source_authority_counts.items())
+        ),
+        f"{prefix}working_builder_bcv2_rpc_load_status_counts": dict(
+            sorted(bcv2_rpc_load_status_counts.items())
+        ),
+        f"{prefix}working_builder_creator_vault_source_authority_counts": dict(
+            sorted(creator_vault_source_authority_counts.items())
+        ),
+        f"{prefix}working_builder_creator_vault_rpc_load_status_counts": dict(
+            sorted(creator_vault_rpc_load_status_counts.items())
+        ),
     }
 
 
@@ -3429,6 +3476,10 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- active_shadow_working_builder_manifest_missing_required_rows: `{active_shadow['active_shadow_working_builder_manifest_missing_required_rows']}`",
             f"- active_shadow_working_builder_manifest_ready_rows: `{active_shadow['active_shadow_working_builder_manifest_ready_rows']}`",
             f"- active_shadow_working_builder_manifest_contains_bcv2_rows: `{active_shadow['active_shadow_working_builder_manifest_contains_bcv2_rows']}`",
+            f"- active_shadow_working_builder_bcv2_source_authority_counts: `{json.dumps(active_shadow['active_shadow_working_builder_bcv2_source_authority_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_working_builder_bcv2_rpc_load_status_counts: `{json.dumps(active_shadow['active_shadow_working_builder_bcv2_rpc_load_status_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_working_builder_creator_vault_source_authority_counts: `{json.dumps(active_shadow['active_shadow_working_builder_creator_vault_source_authority_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_working_builder_creator_vault_rpc_load_status_counts: `{json.dumps(active_shadow['active_shadow_working_builder_creator_vault_rpc_load_status_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- active_shadow_legacy_buy_route_attempted_rows: `{active_shadow['active_shadow_legacy_buy_route_attempted_rows']}`",
             f"- active_shadow_legacy_buy_route_ready_rows: `{active_shadow['active_shadow_legacy_buy_route_ready_rows']}`",
             f"- active_shadow_legacy_buy_route_not_ready_rows: `{active_shadow['active_shadow_legacy_buy_route_not_ready_rows']}`",
@@ -3559,6 +3610,10 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- working_builder_manifest_missing_required_rows: `{materialization['working_builder_manifest_missing_required_rows']}`",
             f"- working_builder_manifest_ready_rows: `{materialization['working_builder_manifest_ready_rows']}`",
             f"- working_builder_manifest_contains_bcv2_rows: `{materialization['working_builder_manifest_contains_bcv2_rows']}`",
+            f"- working_builder_bcv2_source_authority_counts: `{json.dumps(materialization['working_builder_bcv2_source_authority_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- working_builder_bcv2_rpc_load_status_counts: `{json.dumps(materialization['working_builder_bcv2_rpc_load_status_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- working_builder_creator_vault_source_authority_counts: `{json.dumps(materialization['working_builder_creator_vault_source_authority_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- working_builder_creator_vault_rpc_load_status_counts: `{json.dumps(materialization['working_builder_creator_vault_rpc_load_status_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- legacy_buy_route_attempted_rows: `{materialization['legacy_buy_route_attempted_rows']}`",
             f"- legacy_buy_route_ready_rows: `{materialization['legacy_buy_route_ready_rows']}`",
             f"- legacy_buy_route_not_ready_rows: `{materialization['legacy_buy_route_not_ready_rows']}`",

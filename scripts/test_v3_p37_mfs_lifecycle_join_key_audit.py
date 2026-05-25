@@ -2151,6 +2151,10 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
                     "16:bonding_curve_v2:bcv2:observed_tx_account_meta:required=true"
                 ],
                 "working_builder_missing_required_accounts": [],
+                "working_builder_bcv2_source_authority": "authoritative_observed_tx",
+                "working_builder_bcv2_rpc_load_status": "rpc_load_ready",
+                "working_builder_creator_vault_source_authority": "authoritative_detected_pool_creator",
+                "working_builder_creator_vault_rpc_load_status": "rpc_load_ready",
             },
             {
                 "working_builder_parity_mode": "working_builder_parity",
@@ -2159,6 +2163,10 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
                 "working_builder_missing_required_accounts": [
                     "bonding_curve_v2:bcv2:observed_tx_account_meta"
                 ],
+                "working_builder_bcv2_source_authority": "authoritative_observed_tx",
+                "working_builder_bcv2_rpc_load_status": "missing_on_rpc_precheck",
+                "working_builder_creator_vault_source_authority": "creator_vault_source_not_authoritative",
+                "working_builder_creator_vault_rpc_load_status": "identity_only_rpc_unverified",
             },
             {
                 "fallback_route_kind": "legacy_buy",
@@ -2177,6 +2185,25 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
         self.assertEqual(payload["working_builder_manifest_missing_required_rows"], 1)
         self.assertEqual(payload["working_builder_manifest_ready_rows"], 1)
         self.assertEqual(payload["working_builder_manifest_contains_bcv2_rows"], 1)
+        self.assertEqual(
+            payload["working_builder_bcv2_source_authority_counts"],
+            {"authoritative_observed_tx": 2},
+        )
+        self.assertEqual(
+            payload["working_builder_bcv2_rpc_load_status_counts"],
+            {"missing_on_rpc_precheck": 1, "rpc_load_ready": 1},
+        )
+        self.assertEqual(
+            payload["working_builder_creator_vault_source_authority_counts"],
+            {
+                "authoritative_detected_pool_creator": 1,
+                "creator_vault_source_not_authoritative": 1,
+            },
+        )
+        self.assertEqual(
+            payload["working_builder_creator_vault_rpc_load_status_counts"],
+            {"identity_only_rpc_unverified": 1, "rpc_load_ready": 1},
+        )
         self.assertEqual(active_payload["active_shadow_working_builder_parity_rows"], 2)
         self.assertEqual(active_payload["active_shadow_legacy_fallback_attempted_rows"], 1)
 

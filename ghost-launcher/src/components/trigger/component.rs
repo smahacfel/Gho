@@ -497,6 +497,8 @@ pub struct BuyAccountOverrides {
     pub fee_recipient: Option<Pubkey>,
     pub token_program: Option<Pubkey>,
     pub creator_pubkey: Option<Pubkey>,
+    pub creator_pubkey_source: Option<String>,
+    pub creator_pubkey_authoritative: Option<bool>,
     pub buy_variant: Option<trigger::PumpfunBuyVariant>,
     pub associated_bonding_curve: Option<Pubkey>,
     pub bonding_curve_v2: Option<Pubkey>,
@@ -2501,6 +2503,8 @@ impl TriggerComponent {
 
         BuyAccountOverrides {
             creator_pubkey,
+            creator_pubkey_source: creator_pubkey.map(|_| "detected_pool.creator".to_string()),
+            creator_pubkey_authoritative: creator_pubkey.map(|_| true),
             ..BuyAccountOverrides::default()
         }
     }

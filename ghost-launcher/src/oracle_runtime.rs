@@ -5083,6 +5083,10 @@ struct P37ShadowProbeSelectionRecord {
     working_builder_sender_manifest_account_roles: Vec<String>,
     working_builder_manifest_contains_bcv2: Option<bool>,
     working_builder_manifest_source: Option<String>,
+    working_builder_bcv2_source_authority: Option<String>,
+    working_builder_bcv2_rpc_load_status: Option<String>,
+    working_builder_creator_vault_source_authority: Option<String>,
+    working_builder_creator_vault_rpc_load_status: Option<String>,
     working_builder_required_accounts: Vec<String>,
     working_builder_creatable_accounts: Vec<String>,
     working_builder_ephemeral_accounts: Vec<String>,
@@ -5232,6 +5236,10 @@ struct P37ShadowProbeTransportRecord {
     working_builder_sender_manifest_account_roles: Vec<String>,
     working_builder_manifest_contains_bcv2: Option<bool>,
     working_builder_manifest_source: Option<String>,
+    working_builder_bcv2_source_authority: Option<String>,
+    working_builder_bcv2_rpc_load_status: Option<String>,
+    working_builder_creator_vault_source_authority: Option<String>,
+    working_builder_creator_vault_rpc_load_status: Option<String>,
     working_builder_required_accounts: Vec<String>,
     working_builder_creatable_accounts: Vec<String>,
     working_builder_ephemeral_accounts: Vec<String>,
@@ -5680,6 +5688,10 @@ fn p37_shadow_probe_selection_record(
         working_builder_sender_manifest_account_roles: Vec::new(),
         working_builder_manifest_contains_bcv2: None,
         working_builder_manifest_source: None,
+        working_builder_bcv2_source_authority: None,
+        working_builder_bcv2_rpc_load_status: None,
+        working_builder_creator_vault_source_authority: None,
+        working_builder_creator_vault_rpc_load_status: None,
         working_builder_required_accounts: Vec::new(),
         working_builder_creatable_accounts: Vec::new(),
         working_builder_ephemeral_accounts: Vec::new(),
@@ -5906,6 +5918,14 @@ fn p37_shadow_probe_artifact_records(
             .clone(),
         working_builder_manifest_contains_bcv2: record.working_builder_manifest_contains_bcv2,
         working_builder_manifest_source: record.working_builder_manifest_source.clone(),
+        working_builder_bcv2_source_authority: record.working_builder_bcv2_source_authority.clone(),
+        working_builder_bcv2_rpc_load_status: record.working_builder_bcv2_rpc_load_status.clone(),
+        working_builder_creator_vault_source_authority: record
+            .working_builder_creator_vault_source_authority
+            .clone(),
+        working_builder_creator_vault_rpc_load_status: record
+            .working_builder_creator_vault_rpc_load_status
+            .clone(),
         working_builder_required_accounts: record.working_builder_required_accounts.clone(),
         working_builder_creatable_accounts: record.working_builder_creatable_accounts.clone(),
         working_builder_ephemeral_accounts: record.working_builder_ephemeral_accounts.clone(),
@@ -6100,6 +6120,14 @@ fn p37_shadow_probe_artifact_records(
             .clone(),
         working_builder_manifest_contains_bcv2: record.working_builder_manifest_contains_bcv2,
         working_builder_manifest_source: record.working_builder_manifest_source.clone(),
+        working_builder_bcv2_source_authority: record.working_builder_bcv2_source_authority.clone(),
+        working_builder_bcv2_rpc_load_status: record.working_builder_bcv2_rpc_load_status.clone(),
+        working_builder_creator_vault_source_authority: record
+            .working_builder_creator_vault_source_authority
+            .clone(),
+        working_builder_creator_vault_rpc_load_status: record
+            .working_builder_creator_vault_rpc_load_status
+            .clone(),
         working_builder_required_accounts: record.working_builder_required_accounts.clone(),
         working_builder_creatable_accounts: record.working_builder_creatable_accounts.clone(),
         working_builder_ephemeral_accounts: record.working_builder_ephemeral_accounts.clone(),
@@ -6221,6 +6249,10 @@ fn p37_shadow_probe_as_precheck_skip(
         "creator_vault_source_not_authoritative".to_string()
     } else if reason.starts_with("bonding_curve_v2_source_not_authoritative") {
         "bonding_curve_v2_source_not_authoritative".to_string()
+    } else if reason.starts_with("working_builder_final_manifest_missing_required_account:")
+        || reason.starts_with("working_builder_final_manifest_account_source_not_authoritative:")
+    {
+        "working_builder_final_manifest_not_ready".to_string()
     } else if reason.starts_with("no_executable_route_account_set:") {
         "no_executable_route_account_set".to_string()
     } else {
@@ -6245,6 +6277,13 @@ fn p37_shadow_probe_as_precheck_skip(
     } else if let Some(pubkey) = p37_shadow_probe_parse_no_executable_route_bcv2(&reason) {
         record.execution_account_readiness_status = Some("not_ready".to_string());
         record.execution_account_readiness_role = Some("bonding_curve_v2".to_string());
+        record.execution_account_readiness_pubkey = Some(pubkey);
+        record.execution_account_readiness_reason = Some(reason.clone());
+    } else if let Some((role, pubkey, _source)) =
+        p37_shadow_probe_parse_working_builder_final_manifest_account_reason(&reason)
+    {
+        record.execution_account_readiness_status = Some("not_ready".to_string());
+        record.execution_account_readiness_role = Some(role);
         record.execution_account_readiness_pubkey = Some(pubkey);
         record.execution_account_readiness_reason = Some(reason.clone());
     } else {
@@ -7002,9 +7041,19 @@ fn p37_shadow_probe_route_resolution_diagnostics_with_mode(
                 .and_then(p37_shadow_probe_parse_bonding_curve_v2_source_not_authoritative)
         })
         .or_else(|| {
+            precheck_failure_reason.and_then(|reason| {
+                p37_shadow_probe_parse_working_builder_final_manifest_account_reason(reason)
+                    .and_then(|(role, pubkey, _)| (role == "bonding_curve_v2").then_some(pubkey))
+            })
+        })
+        .or_else(|| {
             missing_account
                 .and_then(|(role, pubkey)| (role == "bonding_curve_v2").then(|| pubkey.to_string()))
         });
+
+    let working_builder_manifest_account = precheck_failure_reason.and_then(|reason| {
+        p37_shadow_probe_parse_working_builder_final_manifest_account_reason(reason)
+    });
 
     let bcv2_from_manifest = account_set_diagnostics.and_then(|diagnostics| {
         diagnostics
@@ -7226,6 +7275,59 @@ fn p37_shadow_probe_route_resolution_diagnostics_with_mode(
             legacy_buy_route_ready: legacy_buy.route_ready,
             legacy_buy_route_not_ready_reason: legacy_buy.route_not_ready_reason,
         };
+    }
+
+    if working_builder_parity_mode {
+        if let Some((role, pubkey, source)) = working_builder_manifest_account.or_else(|| {
+            missing_account
+                .filter(|(role, _)| *role == "creator_vault")
+                .map(|(role, pubkey)| (role.to_string(), pubkey.to_string(), None))
+        }) {
+            let primary_reason = source
+                .clone()
+                .unwrap_or_else(|| "working_builder_final_manifest_not_ready".to_string());
+            return P37ExecutableRouteResolutionDiagnostics {
+                route_resolution_status: Some("no_executable_route_account_set".to_string()),
+                selected_route_kind: None,
+                selected_route_reason: Some("working_builder_final_manifest_not_ready".to_string()),
+                primary_route_kind: Some(primary_route_kind),
+                primary_route_ready: Some(false),
+                primary_route_not_ready_reason: Some(primary_reason),
+                fallback_route_kind: None,
+                fallback_route_attempted: Some(false),
+                fallback_route_ready: Some(false),
+                fallback_route_not_ready_reason: None,
+                fallback_missing_roles: Vec::new(),
+                fallback_missing_pubkeys: Vec::new(),
+                fallback_account_sources: Vec::new(),
+                fallback_simulation_load_account_set: Vec::new(),
+                fallback_creatable_account_set: Vec::new(),
+                fallback_required_precheck_account_set: Vec::new(),
+                fallback_failure_class: None,
+                no_executable_route_account_set_reason: Some(format!(
+                    "working_builder_final_manifest_missing_required_account:{role}:{pubkey}"
+                )),
+                legacy_buy_account_set_status: legacy_buy.account_set_status,
+                legacy_buy_curve_pubkey: legacy_buy.curve_pubkey,
+                legacy_buy_curve_source: legacy_buy.curve_source,
+                legacy_buy_curve_authority_status: legacy_buy.curve_authority_status,
+                legacy_buy_curve_rpc_load_status: legacy_buy.curve_rpc_load_status,
+                legacy_buy_curve_rpc_load_ready: legacy_buy.curve_rpc_load_ready,
+                legacy_buy_curve_authority_readiness_status: legacy_buy
+                    .curve_authority_readiness_status,
+                legacy_buy_associated_bonding_curve_pubkey: legacy_buy
+                    .associated_bonding_curve_pubkey,
+                legacy_buy_associated_bonding_curve_source: legacy_buy
+                    .associated_bonding_curve_source,
+                legacy_buy_associated_bonding_curve_rpc_load_ready: legacy_buy
+                    .associated_bonding_curve_rpc_load_ready,
+                legacy_buy_required_roles: legacy_buy.required_roles,
+                legacy_buy_missing_roles: legacy_buy.missing_roles,
+                legacy_buy_missing_pubkeys: legacy_buy.missing_pubkeys,
+                legacy_buy_route_ready: legacy_buy.route_ready,
+                legacy_buy_route_not_ready_reason: legacy_buy.route_not_ready_reason,
+            };
+        }
     }
 
     if primary_route_kind == "legacy_buy" && legacy_buy.route_ready != Some(true) {
@@ -7622,6 +7724,10 @@ struct P37ShadowProbeExecutionDiagnostics {
     working_builder_sender_manifest_account_roles: Vec<String>,
     working_builder_manifest_contains_bcv2: Option<bool>,
     working_builder_manifest_source: Option<String>,
+    working_builder_bcv2_source_authority: Option<String>,
+    working_builder_bcv2_rpc_load_status: Option<String>,
+    working_builder_creator_vault_source_authority: Option<String>,
+    working_builder_creator_vault_rpc_load_status: Option<String>,
     working_builder_required_accounts: Vec<String>,
     working_builder_creatable_accounts: Vec<String>,
     working_builder_ephemeral_accounts: Vec<String>,
@@ -7797,6 +7903,8 @@ fn p37_shadow_probe_derive_account_override_context_for_pool(
             ));
         }
     }
+    account_overrides.creator_pubkey_source = creator_identity_source.clone();
+    account_overrides.creator_pubkey_authoritative = creator_identity_authoritative;
     if matches!(
         account_overrides.buy_variant,
         Some(trigger::PumpfunBuyVariant::LegacyBuy)
@@ -8312,6 +8420,13 @@ fn p37_shadow_probe_account_manifest(
                     }
                 });
                 (Some(status), mismatch)
+            } else if role == "creator_vault" {
+                let status = p37_working_builder_creator_vault_source_authority(request)
+                    .unwrap_or_else(|| "creator_pubkey_missing".to_string());
+                let mismatch =
+                    (!p37_working_builder_creator_vault_is_authoritative(Some(status.as_str())))
+                        .then(|| "creator_identity_source_not_authoritative".to_string());
+                (Some(status), mismatch)
             } else {
                 (None, None)
             };
@@ -8522,6 +8637,10 @@ struct P37WorkingBuilderParityDiagnostics {
     sender_manifest_account_roles: Vec<String>,
     manifest_contains_bcv2: Option<bool>,
     manifest_source: Option<String>,
+    bcv2_source_authority: Option<String>,
+    bcv2_rpc_load_status: Option<String>,
+    creator_vault_source_authority: Option<String>,
+    creator_vault_rpc_load_status: Option<String>,
     required_accounts: Vec<String>,
     creatable_accounts: Vec<String>,
     ephemeral_accounts: Vec<String>,
@@ -8635,6 +8754,112 @@ fn p37_working_builder_ephemeral_accounts(
     }
 }
 
+fn p37_working_builder_manifest_rpc_load_status(
+    account_set_diagnostics: Option<&P37ShadowProbeAccountSetDiagnostics>,
+    role: &str,
+    pubkey: Option<&str>,
+) -> (Option<String>, Option<bool>) {
+    let Some(pubkey) = pubkey.filter(|value| !value.trim().is_empty()) else {
+        return (Some("missing_pubkey".to_string()), Some(false));
+    };
+    let Some(diagnostics) = account_set_diagnostics else {
+        return (
+            Some("identity_only_rpc_unverified".to_string()),
+            Some(false),
+        );
+    };
+    if diagnostics.manifest_lookup_error.is_some() {
+        return (Some("rpc_lookup_error".to_string()), Some(false));
+    }
+    if diagnostics
+        .missing_candidates
+        .iter()
+        .any(|candidate| candidate.role == role && candidate.pubkey == pubkey)
+    {
+        return (Some("missing_on_rpc_precheck".to_string()), Some(false));
+    }
+    if diagnostics.manifest_lookup_performed
+        && diagnostics
+            .manifest
+            .iter()
+            .any(|entry| entry.role == role && entry.pubkey == pubkey)
+    {
+        return (Some("rpc_load_ready".to_string()), Some(true));
+    }
+    if diagnostics.manifest_lookup_performed {
+        return (Some("not_in_manifest".to_string()), Some(false));
+    }
+    (
+        Some("identity_only_rpc_unverified".to_string()),
+        Some(false),
+    )
+}
+
+fn p37_working_builder_creator_vault_source_authority(
+    request: &crate::components::trigger::PreparedBuyRequest,
+) -> Option<String> {
+    let has_creator = request
+        .account_overrides
+        .creator_pubkey
+        .is_some_and(|pubkey| pubkey != Pubkey::default());
+    if !has_creator {
+        return Some("creator_pubkey_missing".to_string());
+    }
+    match request.account_overrides.creator_pubkey_authoritative {
+        Some(true) => {
+            let source = request
+                .account_overrides
+                .creator_pubkey_source
+                .as_deref()
+                .unwrap_or("account_overrides.creator_pubkey")
+                .replace('.', "_");
+            Some(format!("authoritative_{source}"))
+        }
+        Some(false) => Some("creator_vault_source_not_authoritative".to_string()),
+        None => Some("authoritative_account_overrides_creator_pubkey".to_string()),
+    }
+}
+
+fn p37_working_builder_creator_vault_is_authoritative(status: Option<&str>) -> bool {
+    status.is_some_and(|status| status.starts_with("authoritative_"))
+}
+
+#[derive(Debug, Clone, Default)]
+struct P37WorkingBuilderCreatorVaultReadiness {
+    pubkey: Option<String>,
+    source_authority: Option<String>,
+    rpc_load_status: Option<String>,
+    rpc_load_ready: Option<bool>,
+}
+
+fn p37_working_builder_creator_vault_readiness(
+    request: &crate::components::trigger::PreparedBuyRequest,
+    account_set_diagnostics: Option<&P37ShadowProbeAccountSetDiagnostics>,
+) -> P37WorkingBuilderCreatorVaultReadiness {
+    let manifest_entry =
+        p37_shadow_probe_manifest_entry_for_role(account_set_diagnostics, "creator_vault");
+    let fallback_manifest = manifest_entry
+        .is_none()
+        .then(|| p37_shadow_probe_account_manifest(request));
+    let entry = manifest_entry.or_else(|| {
+        fallback_manifest
+            .as_ref()
+            .and_then(|manifest| manifest.iter().find(|entry| entry.role == "creator_vault"))
+    });
+    let pubkey = entry.map(|entry| entry.pubkey.clone());
+    let (rpc_load_status, rpc_load_ready) = p37_working_builder_manifest_rpc_load_status(
+        account_set_diagnostics,
+        "creator_vault",
+        pubkey.as_deref(),
+    );
+    P37WorkingBuilderCreatorVaultReadiness {
+        pubkey,
+        source_authority: p37_working_builder_creator_vault_source_authority(request),
+        rpc_load_status,
+        rpc_load_ready,
+    }
+}
+
 fn p37_working_builder_parity_diagnostics(
     request: Option<&crate::components::trigger::PreparedBuyRequest>,
     account_set_diagnostics: Option<&P37ShadowProbeAccountSetDiagnostics>,
@@ -8679,6 +8904,12 @@ fn p37_working_builder_parity_diagnostics(
             )
         })
         .unwrap_or_default();
+    let bonding_curve_v2_authority = p37_shadow_probe_bonding_curve_v2_authority_diagnostics(
+        Some(request),
+        account_set_diagnostics,
+    );
+    let creator_vault_readiness =
+        p37_working_builder_creator_vault_readiness(request, account_set_diagnostics);
     P37WorkingBuilderParityDiagnostics {
         mode: Some(P37_EXECUTION_BUILDER_MODE_WORKING_BUILDER_PARITY.to_string()),
         request_built: Some(request_built),
@@ -8691,6 +8922,10 @@ fn p37_working_builder_parity_diagnostics(
         sender_manifest_account_roles,
         manifest_contains_bcv2: Some(manifest_contains_bcv2),
         manifest_source: request_built.then(|| "direct_buy_builder".to_string()),
+        bcv2_source_authority: bonding_curve_v2_authority.authority_status,
+        bcv2_rpc_load_status: bonding_curve_v2_authority.rpc_load_status,
+        creator_vault_source_authority: creator_vault_readiness.source_authority,
+        creator_vault_rpc_load_status: creator_vault_readiness.rpc_load_status,
         required_accounts,
         creatable_accounts,
         ephemeral_accounts: p37_working_builder_ephemeral_accounts(request),
@@ -8712,6 +8947,12 @@ fn p37_apply_working_builder_parity_to_record(
         diagnostics.sender_manifest_account_roles;
     record.working_builder_manifest_contains_bcv2 = diagnostics.manifest_contains_bcv2;
     record.working_builder_manifest_source = diagnostics.manifest_source;
+    record.working_builder_bcv2_source_authority = diagnostics.bcv2_source_authority;
+    record.working_builder_bcv2_rpc_load_status = diagnostics.bcv2_rpc_load_status;
+    record.working_builder_creator_vault_source_authority =
+        diagnostics.creator_vault_source_authority;
+    record.working_builder_creator_vault_rpc_load_status =
+        diagnostics.creator_vault_rpc_load_status;
     record.working_builder_required_accounts = diagnostics.required_accounts;
     record.working_builder_creatable_accounts = diagnostics.creatable_accounts;
     record.working_builder_ephemeral_accounts = diagnostics.ephemeral_accounts;
@@ -8722,12 +8963,68 @@ fn p37_working_builder_final_manifest_failure_reason(
     request: &crate::components::trigger::PreparedBuyRequest,
     diagnostics: &P37ShadowProbeAccountSetDiagnostics,
 ) -> Option<String> {
+    let creator_vault = p37_working_builder_creator_vault_readiness(request, Some(diagnostics));
+    if !p37_working_builder_creator_vault_is_authoritative(
+        creator_vault.source_authority.as_deref(),
+    ) {
+        let pubkey = creator_vault
+            .pubkey
+            .as_deref()
+            .unwrap_or("missing_creator_vault");
+        return Some(format!(
+            "working_builder_final_manifest_account_source_not_authoritative:creator_vault:{pubkey}:{}",
+            creator_vault
+                .source_authority
+                .as_deref()
+                .unwrap_or("creator_vault_source_not_authoritative")
+        ));
+    }
+    if creator_vault.rpc_load_ready == Some(false)
+        && creator_vault.rpc_load_status.as_deref() != Some("missing_on_rpc_precheck")
+    {
+        let pubkey = creator_vault
+            .pubkey
+            .as_deref()
+            .unwrap_or("missing_creator_vault");
+        return Some(format!(
+            "working_builder_final_manifest_missing_required_account:creator_vault:{pubkey}:{}",
+            creator_vault
+                .rpc_load_status
+                .as_deref()
+                .unwrap_or("rpc_not_load_ready")
+        ));
+    }
     p37_working_builder_final_manifest_missing_required_accounts(request, diagnostics)
         .into_iter()
         .next()
         .map(|descriptor| {
             format!("working_builder_final_manifest_missing_required_account:{descriptor}")
         })
+}
+
+fn p37_shadow_probe_parse_working_builder_final_manifest_account_reason(
+    reason: &str,
+) -> Option<(String, String, Option<String>)> {
+    let tail = reason
+        .strip_prefix("working_builder_final_manifest_missing_required_account:")
+        .or_else(|| {
+            reason.strip_prefix("working_builder_final_manifest_account_source_not_authoritative:")
+        })?;
+    let mut parts = tail.split(':');
+    let role = parts.next()?.trim();
+    let pubkey = parts.next()?.trim();
+    let source = parts
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if role.is_empty() || pubkey.is_empty() {
+        return None;
+    }
+    Some((
+        role.to_string(),
+        pubkey.to_string(),
+        source.map(str::to_string),
+    ))
 }
 
 fn p37_shadow_probe_classified_account_not_found_candidate(
@@ -9083,6 +9380,9 @@ fn active_shadow_account_diagnostics_from_account_set_with_mode(
             || message.starts_with("bonding_curve_v2_source_not_authoritative:")
             || message.starts_with("no_executable_route_account_set:")
             || message.starts_with("selected_route_handoff_mismatch:")
+            || message.starts_with("working_builder_final_manifest_missing_required_account:")
+            || message
+                .starts_with("working_builder_final_manifest_account_source_not_authoritative:")
         {
             Some(message.to_string())
         } else {
@@ -9099,6 +9399,9 @@ fn active_shadow_account_diagnostics_from_account_set_with_mode(
     let no_executable_route_bcv2 = precheck_failure_reason
         .as_deref()
         .and_then(p37_shadow_probe_parse_no_executable_route_bcv2);
+    let working_builder_final_manifest_account = precheck_failure_reason
+        .as_deref()
+        .and_then(p37_shadow_probe_parse_working_builder_final_manifest_account_reason);
     let account_pubkey = error_message
         .as_deref()
         .and_then(p37_shadow_probe_error_pubkey);
@@ -9118,6 +9421,11 @@ fn active_shadow_account_diagnostics_from_account_set_with_mode(
         .map(|(_, pubkey)| pubkey.clone())
         .or_else(|| bcv2_source_not_authoritative.clone())
         .or_else(|| no_executable_route_bcv2.clone())
+        .or_else(|| {
+            working_builder_final_manifest_account
+                .as_ref()
+                .map(|(_, pubkey, _)| pubkey.clone())
+        })
         .or_else(|| attribution.account_pubkey.clone())
         .or(account_pubkey);
     let account_role = execution_account_not_ready
@@ -9133,14 +9441,23 @@ fn active_shadow_account_diagnostics_from_account_set_with_mode(
                 .as_ref()
                 .map(|_| "bonding_curve_v2".to_string())
         })
+        .or_else(|| {
+            working_builder_final_manifest_account
+                .as_ref()
+                .map(|(role, _, _)| role.clone())
+        })
         .or_else(|| attribution.account_role.clone())
         .or_else(|| p37_shadow_probe_account_role(account_pubkey.as_deref(), request));
-    let account_source = attribution.account_source.clone().or_else(|| {
-        account_role
-            .as_deref()
-            .map(p37_shadow_probe_account_source)
-            .map(str::to_string)
-    });
+    let account_source = working_builder_final_manifest_account
+        .as_ref()
+        .and_then(|(_, _, source)| source.clone())
+        .or_else(|| attribution.account_source.clone())
+        .or_else(|| {
+            account_role
+                .as_deref()
+                .map(p37_shadow_probe_account_source)
+                .map(str::to_string)
+        });
     let bonding_curve_v2_authority =
         p37_shadow_probe_bonding_curve_v2_authority_diagnostics(request, account_set_diagnostics);
     let route_resolution = p37_shadow_probe_route_resolution_diagnostics_with_mode(
@@ -9376,6 +9693,12 @@ fn active_shadow_account_diagnostics_from_account_set_with_mode(
             .sender_manifest_account_roles,
         working_builder_manifest_contains_bcv2: working_builder.manifest_contains_bcv2,
         working_builder_manifest_source: working_builder.manifest_source,
+        working_builder_bcv2_source_authority: working_builder.bcv2_source_authority,
+        working_builder_bcv2_rpc_load_status: working_builder.bcv2_rpc_load_status,
+        working_builder_creator_vault_source_authority: working_builder
+            .creator_vault_source_authority,
+        working_builder_creator_vault_rpc_load_status: working_builder
+            .creator_vault_rpc_load_status,
         working_builder_required_accounts: working_builder.required_accounts,
         working_builder_creatable_accounts: working_builder.creatable_accounts,
         working_builder_ephemeral_accounts: working_builder.ephemeral_accounts,
@@ -10514,6 +10837,12 @@ fn p37_shadow_probe_execution_diagnostics(
             .sender_manifest_account_roles,
         working_builder_manifest_contains_bcv2: working_builder.manifest_contains_bcv2,
         working_builder_manifest_source: working_builder.manifest_source,
+        working_builder_bcv2_source_authority: working_builder.bcv2_source_authority,
+        working_builder_bcv2_rpc_load_status: working_builder.bcv2_rpc_load_status,
+        working_builder_creator_vault_source_authority: working_builder
+            .creator_vault_source_authority,
+        working_builder_creator_vault_rpc_load_status: working_builder
+            .creator_vault_rpc_load_status,
         working_builder_required_accounts: working_builder.required_accounts,
         working_builder_creatable_accounts: working_builder.creatable_accounts,
         working_builder_ephemeral_accounts: working_builder.ephemeral_accounts,
@@ -10819,6 +11148,12 @@ fn p37_shadow_probe_transport_from_event(
             .working_builder_sender_manifest_account_roles,
         working_builder_manifest_contains_bcv2: diagnostics.working_builder_manifest_contains_bcv2,
         working_builder_manifest_source: diagnostics.working_builder_manifest_source,
+        working_builder_bcv2_source_authority: diagnostics.working_builder_bcv2_source_authority,
+        working_builder_bcv2_rpc_load_status: diagnostics.working_builder_bcv2_rpc_load_status,
+        working_builder_creator_vault_source_authority: diagnostics
+            .working_builder_creator_vault_source_authority,
+        working_builder_creator_vault_rpc_load_status: diagnostics
+            .working_builder_creator_vault_rpc_load_status,
         working_builder_required_accounts: diagnostics.working_builder_required_accounts,
         working_builder_creatable_accounts: diagnostics.working_builder_creatable_accounts,
         working_builder_ephemeral_accounts: diagnostics.working_builder_ephemeral_accounts,
@@ -11076,6 +11411,12 @@ fn p37_shadow_probe_transport_from_error(
             .working_builder_sender_manifest_account_roles,
         working_builder_manifest_contains_bcv2: diagnostics.working_builder_manifest_contains_bcv2,
         working_builder_manifest_source: diagnostics.working_builder_manifest_source,
+        working_builder_bcv2_source_authority: diagnostics.working_builder_bcv2_source_authority,
+        working_builder_bcv2_rpc_load_status: diagnostics.working_builder_bcv2_rpc_load_status,
+        working_builder_creator_vault_source_authority: diagnostics
+            .working_builder_creator_vault_source_authority,
+        working_builder_creator_vault_rpc_load_status: diagnostics
+            .working_builder_creator_vault_rpc_load_status,
         working_builder_required_accounts: diagnostics.working_builder_required_accounts,
         working_builder_creatable_accounts: diagnostics.working_builder_creatable_accounts,
         working_builder_ephemeral_accounts: diagnostics.working_builder_ephemeral_accounts,
@@ -11289,6 +11630,16 @@ fn enrich_probe_shadow_entry(
         .clone();
     entry.working_builder_manifest_contains_bcv2 = transport.working_builder_manifest_contains_bcv2;
     entry.working_builder_manifest_source = transport.working_builder_manifest_source.clone();
+    entry.working_builder_bcv2_source_authority =
+        transport.working_builder_bcv2_source_authority.clone();
+    entry.working_builder_bcv2_rpc_load_status =
+        transport.working_builder_bcv2_rpc_load_status.clone();
+    entry.working_builder_creator_vault_source_authority = transport
+        .working_builder_creator_vault_source_authority
+        .clone();
+    entry.working_builder_creator_vault_rpc_load_status = transport
+        .working_builder_creator_vault_rpc_load_status
+        .clone();
     entry.working_builder_required_accounts = transport.working_builder_required_accounts.clone();
     entry.working_builder_creatable_accounts = transport.working_builder_creatable_accounts.clone();
     entry.working_builder_ephemeral_accounts = transport.working_builder_ephemeral_accounts.clone();
@@ -11355,17 +11706,20 @@ async fn run_p37_shadow_probe_dispatch(
         &record,
     );
     let account_overrides = override_context.account_overrides.clone();
-    if let Some(failure) = p37_shadow_probe_creator_vault_precheck_failure(&override_context) {
-        let skip_record = p37_shadow_probe_as_creator_vault_precheck_skip(record.clone(), failure);
-        if let Err(err) = append_p37_shadow_probe_record(&config, &skip_record).await {
-            warn!(
-                probe_id = ?skip_record.probe_id,
-                source_ab_record_id = ?skip_record.source_ab_record_id,
-                error = %err,
-                "P37_SHADOW_PROBE_CREATOR_VAULT_PRECHECK_SKIP_WRITE_FAILED"
-            );
+    if !working_builder_parity_mode {
+        if let Some(failure) = p37_shadow_probe_creator_vault_precheck_failure(&override_context) {
+            let skip_record =
+                p37_shadow_probe_as_creator_vault_precheck_skip(record.clone(), failure);
+            if let Err(err) = append_p37_shadow_probe_record(&config, &skip_record).await {
+                warn!(
+                    probe_id = ?skip_record.probe_id,
+                    source_ab_record_id = ?skip_record.source_ab_record_id,
+                    error = %err,
+                    "P37_SHADOW_PROBE_CREATOR_VAULT_PRECHECK_SKIP_WRITE_FAILED"
+                );
+            }
+            return;
         }
-        return;
     }
     if let Some(reason) =
         p37_shadow_probe_execution_precheck(&record, &account_overrides, &buy_mint, &pool_data)
@@ -11486,11 +11840,19 @@ async fn run_p37_shadow_probe_dispatch(
     };
     if let Some(reason) = final_manifest_failure_reason {
         record.execution_account_readiness_status = Some("not_ready".to_string());
-        record.execution_account_readiness_role = Some(if working_builder_parity_mode {
-            "working_builder_final_manifest".to_string()
+        if let Some((role, pubkey, _source)) =
+            p37_shadow_probe_parse_working_builder_final_manifest_account_reason(&reason)
+        {
+            record.execution_account_readiness_role = Some(role);
+            record.execution_account_readiness_pubkey = Some(pubkey);
         } else {
-            "selected_route_manifest".to_string()
-        });
+            record.execution_account_readiness_role = Some(if working_builder_parity_mode {
+                "working_builder_final_manifest".to_string()
+            } else {
+                "selected_route_manifest".to_string()
+            });
+            record.execution_account_readiness_pubkey = None;
+        }
         record.execution_account_readiness_reason = Some(reason.clone());
         record.precheck_failure_reason = Some(reason.clone());
         let dispatch_ts_ms = current_time_ms();
@@ -11769,9 +12131,11 @@ async fn maybe_handle_p37_shadow_probe_decision(
                 buy_mint,
                 &record,
             );
-            if let Some(failure) =
-                p37_shadow_probe_creator_vault_precheck_failure(&override_context)
-            {
+            let working_builder_parity_mode = p37_working_builder_parity_enabled(config);
+            let creator_vault_failure = (!working_builder_parity_mode)
+                .then(|| p37_shadow_probe_creator_vault_precheck_failure(&override_context))
+                .flatten();
+            if let Some(failure) = creator_vault_failure {
                 record = p37_shadow_probe_as_creator_vault_precheck_skip(record, failure);
             } else if let Some(reason) = p37_shadow_probe_execution_precheck(
                 &record,
@@ -13701,6 +14065,8 @@ fn p37_selected_legacy_buy_fallback_overrides(
         fee_recipient: primary.fee_recipient,
         token_program: Some(primary_request.token_program),
         creator_pubkey: primary.creator_pubkey,
+        creator_pubkey_source: primary.creator_pubkey_source.clone(),
+        creator_pubkey_authoritative: primary.creator_pubkey_authoritative,
         buy_variant: Some(trigger::PumpfunBuyVariant::LegacyBuy),
         associated_bonding_curve: primary.associated_bonding_curve,
         bonding_curve_v2: None,
@@ -14567,6 +14933,22 @@ fn shadow_entry_record_from_event(
             .account_diagnostics
             .working_builder_manifest_source
             .clone(),
+        working_builder_bcv2_source_authority: event
+            .account_diagnostics
+            .working_builder_bcv2_source_authority
+            .clone(),
+        working_builder_bcv2_rpc_load_status: event
+            .account_diagnostics
+            .working_builder_bcv2_rpc_load_status
+            .clone(),
+        working_builder_creator_vault_source_authority: event
+            .account_diagnostics
+            .working_builder_creator_vault_source_authority
+            .clone(),
+        working_builder_creator_vault_rpc_load_status: event
+            .account_diagnostics
+            .working_builder_creator_vault_rpc_load_status
+            .clone(),
         working_builder_required_accounts: event
             .account_diagnostics
             .working_builder_required_accounts
@@ -14750,6 +15132,10 @@ fn shadow_entry_record_from_request(
         working_builder_sender_manifest_account_roles: Vec::new(),
         working_builder_manifest_contains_bcv2: None,
         working_builder_manifest_source: None,
+        working_builder_bcv2_source_authority: None,
+        working_builder_bcv2_rpc_load_status: None,
+        working_builder_creator_vault_source_authority: None,
+        working_builder_creator_vault_rpc_load_status: None,
         working_builder_required_accounts: Vec::new(),
         working_builder_creatable_accounts: Vec::new(),
         working_builder_ephemeral_accounts: Vec::new(),
@@ -14950,6 +15336,16 @@ fn enrich_active_shadow_entry_with_account_diagnostics(
     entry.working_builder_manifest_contains_bcv2 =
         diagnostics.working_builder_manifest_contains_bcv2;
     entry.working_builder_manifest_source = diagnostics.working_builder_manifest_source.clone();
+    entry.working_builder_bcv2_source_authority =
+        diagnostics.working_builder_bcv2_source_authority.clone();
+    entry.working_builder_bcv2_rpc_load_status =
+        diagnostics.working_builder_bcv2_rpc_load_status.clone();
+    entry.working_builder_creator_vault_source_authority = diagnostics
+        .working_builder_creator_vault_source_authority
+        .clone();
+    entry.working_builder_creator_vault_rpc_load_status = diagnostics
+        .working_builder_creator_vault_rpc_load_status
+        .clone();
     entry.working_builder_required_accounts = diagnostics.working_builder_required_accounts.clone();
     entry.working_builder_creatable_accounts =
         diagnostics.working_builder_creatable_accounts.clone();
@@ -15454,6 +15850,14 @@ struct ShadowEntryRecord {
     working_builder_manifest_contains_bcv2: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     working_builder_manifest_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_source_authority: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_rpc_load_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_creator_vault_source_authority: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_creator_vault_rpc_load_status: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     working_builder_required_accounts: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -19904,6 +20308,120 @@ mod tests {
         );
     }
 
+    #[test]
+    fn p37_working_builder_parity_tracks_bcv2_source_authority_and_rpc_status() {
+        let request = test_working_builder_prepared_buy_request();
+        let mut diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        diagnostics.manifest_lookup_performed = true;
+
+        let working =
+            p37_working_builder_parity_diagnostics(Some(&request), Some(&diagnostics), true);
+
+        assert_eq!(
+            working.bcv2_source_authority.as_deref(),
+            Some("authoritative_observed_tx")
+        );
+        assert_eq!(
+            working.bcv2_rpc_load_status.as_deref(),
+            Some("rpc_load_ready")
+        );
+    }
+
+    #[test]
+    fn p37_working_builder_parity_tracks_creator_vault_source_authority_and_rpc_status() {
+        let request = test_working_builder_prepared_buy_request();
+        let mut diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        diagnostics.manifest_lookup_performed = true;
+
+        let working =
+            p37_working_builder_parity_diagnostics(Some(&request), Some(&diagnostics), true);
+
+        assert_eq!(
+            working.creator_vault_source_authority.as_deref(),
+            Some("authoritative_detected_pool_creator")
+        );
+        assert_eq!(
+            working.creator_vault_rpc_load_status.as_deref(),
+            Some("rpc_load_ready")
+        );
+    }
+
+    #[test]
+    fn p37_working_builder_final_manifest_blocks_non_authoritative_creator_vault() {
+        let mut request = test_working_builder_prepared_buy_request();
+        request.account_overrides.creator_pubkey_authoritative = Some(false);
+        request.account_overrides.creator_pubkey_source = Some("detected_pool.creator".to_string());
+        let mut diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        diagnostics.manifest_lookup_performed = true;
+
+        let reason = p37_working_builder_final_manifest_failure_reason(&request, &diagnostics)
+            .expect("working manifest must fail closed on non-authoritative creator_vault");
+        let account_diagnostics = active_shadow_account_diagnostics_from_account_set_with_mode(
+            Some(reason.clone()),
+            Some(&request),
+            Some(&diagnostics),
+            "precheck_failed",
+            true,
+        );
+
+        assert!(reason.starts_with(
+            "working_builder_final_manifest_account_source_not_authoritative:creator_vault:"
+        ));
+        assert_eq!(
+            account_diagnostics.simulation_error_account_role.as_deref(),
+            Some("creator_vault")
+        );
+        assert_eq!(
+            account_diagnostics
+                .working_builder_creator_vault_source_authority
+                .as_deref(),
+            Some("creator_vault_source_not_authoritative")
+        );
+        assert_eq!(
+            account_diagnostics
+                .working_builder_creator_vault_rpc_load_status
+                .as_deref(),
+            Some("rpc_load_ready")
+        );
+    }
+
+    #[test]
+    fn p37_working_builder_final_manifest_blocks_missing_creator_vault_account() {
+        let request = test_working_builder_prepared_buy_request();
+        let mut diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        let creator_vault_entry = diagnostics
+            .manifest
+            .iter()
+            .find(|entry| entry.role == "creator_vault")
+            .expect("working builder manifest creator_vault")
+            .clone();
+        diagnostics.manifest_lookup_performed = true;
+        diagnostics.missing_candidates.push(
+            p37_shadow_probe_account_not_found_candidate_from_entry(&creator_vault_entry),
+        );
+
+        let reason = p37_working_builder_final_manifest_failure_reason(&request, &diagnostics)
+            .expect("working manifest must fail closed on missing creator_vault");
+        let working =
+            p37_working_builder_parity_diagnostics(Some(&request), Some(&diagnostics), true);
+
+        assert_eq!(
+            reason,
+            format!(
+                "working_builder_final_manifest_missing_required_account:creator_vault:{}:{}",
+                creator_vault_entry.pubkey, creator_vault_entry.source
+            )
+        );
+        assert_eq!(
+            working.creator_vault_source_authority.as_deref(),
+            Some("authoritative_detected_pool_creator")
+        );
+        assert_eq!(
+            working.creator_vault_rpc_load_status.as_deref(),
+            Some("missing_on_rpc_precheck")
+        );
+    }
+
     fn p37_shadow_probe_test_bcv2_manifest_entry(
         pubkey: String,
         source: &str,
@@ -22552,6 +23070,8 @@ mod tests {
             fee_recipient: Some(trigger::DirectBuyBuilder::canonical_fee_recipient()),
             token_program: Some(token_program),
             creator_pubkey: Some(creator_pubkey),
+            creator_pubkey_source: Some("detected_pool.creator".to_string()),
+            creator_pubkey_authoritative: Some(true),
             buy_variant: Some(trigger::PumpfunBuyVariant::RoutedExactSolIn),
             associated_bonding_curve: Some(associated_bonding_curve),
             bonding_curve_v2: Some(bonding_curve_v2),

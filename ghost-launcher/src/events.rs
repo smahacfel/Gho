@@ -289,6 +289,14 @@ pub struct ShadowSimulationAccountDiagnostics {
     pub working_builder_manifest_contains_bcv2: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_builder_manifest_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_source_authority: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_rpc_load_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_creator_vault_source_authority: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_creator_vault_rpc_load_status: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub working_builder_required_accounts: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
