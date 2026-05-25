@@ -2269,6 +2269,68 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
         )
         self.assertEqual(payload["no_executable_route_but_simulated_rows"], 0)
 
+    def test_e5b_legacy_buy_unsupported_builder_layout_counters_are_reported(
+        self,
+    ) -> None:
+        rows = [
+            {
+                "fallback_route_kind": "legacy_buy",
+                "fallback_route_attempted": False,
+                "fallback_route_ready": False,
+                "fallback_route_not_ready_reason": (
+                    "unsupported_builder_layout_requires_bcv2"
+                ),
+                "fallback_failure_class": "fallback_unsupported_builder_layout",
+                "route_resolution_status": "no_executable_route_account_set",
+                "no_executable_route_account_set_reason": (
+                    "unsupported_builder_layout_requires_bcv2:"
+                    "bonding_curve_v2:BCV2"
+                ),
+                "legacy_buy_account_set_status": "ready",
+                "legacy_buy_curve_authority_readiness_status": (
+                    "authoritative_and_load_ready"
+                ),
+                "legacy_buy_route_ready": False,
+                "legacy_buy_route_not_ready_reason": (
+                    "legacy_buy_unsupported_builder_layout_requires_bcv2"
+                ),
+            }
+        ]
+
+        payload = audit.legacy_buy_route_payload(rows, [])
+
+        self.assertEqual(payload["legacy_buy_route_attempted_rows"], 1)
+        self.assertEqual(payload["legacy_buy_route_ready_rows"], 0)
+        self.assertEqual(
+            payload["legacy_buy_route_unsupported_builder_layout_rows"],
+            1,
+        )
+        self.assertEqual(
+            payload["legacy_buy_excluded_from_execution_route_universe_rows"],
+            1,
+        )
+        self.assertEqual(
+            payload["legacy_buy_removed_from_fallback_candidates_rows"],
+            1,
+        )
+        self.assertEqual(payload["legacy_buy_fallback_account_set_ready_rows"], 0)
+        self.assertEqual(
+            payload["legacy_buy_route_not_ready_reason_counts"],
+            {"legacy_buy_unsupported_builder_layout_requires_bcv2": 1},
+        )
+
+        fallback = audit.fallback_decision_payload(rows)
+
+        self.assertEqual(
+            fallback["fallback_failure_class_counts"],
+            {"fallback_unsupported_builder_layout": 1},
+        )
+        self.assertFalse(fallback["fallback_repairable"])
+        self.assertEqual(
+            fallback["recommended_next_path"],
+            "route_class_exclusion_from_execution_label_universe",
+        )
+
     def test_active_shadow_unattributed_account_not_found_blocks_readiness(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

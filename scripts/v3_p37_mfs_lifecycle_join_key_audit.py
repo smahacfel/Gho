@@ -523,6 +523,11 @@ def fallback_failure_class_for_row(row: dict[str, Any]) -> str:
     if explicit:
         return explicit
     reason = row_string(row, "fallback_route_not_ready_reason")
+    if reason in {
+        "unsupported_builder_layout_requires_bcv2",
+        "legacy_buy_unsupported_builder_layout_requires_bcv2",
+    }:
+        return "fallback_unsupported_builder_layout"
     if reason == "fallback_route_missing_legacy_buy_curve":
         return "fallback_missing_core_curve_account"
     if reason in {
@@ -587,6 +592,11 @@ def fallback_account_sources_for_row(row: dict[str, Any]) -> list[str]:
         return ["primary_route_account_set"]
     if reason == "fallback_route_not_available_for_primary":
         return ["route_builder"]
+    if reason in {
+        "unsupported_builder_layout_requires_bcv2",
+        "legacy_buy_unsupported_builder_layout_requires_bcv2",
+    }:
+        return ["direct_buy_builder"]
     return []
 
 
@@ -626,6 +636,7 @@ def fallback_decision_payload(failed_rows: list[dict[str, Any]]) -> dict[str, An
         "fallback_missing_route_identity",
         "fallback_builder_account_source_unverified",
         "fallback_no_prepared_route",
+        "fallback_unsupported_builder_layout",
     }
     observed_classes = set(class_counts)
     if not failed_rows or "fallback_unknown" in observed_classes:
@@ -788,6 +799,27 @@ def legacy_buy_missing_associated_curve(row: dict[str, Any]) -> bool:
         == "fallback_missing_associated_bonding_curve"
         or "associated_bonding_curve" in set(row_string_list(row, "legacy_buy_missing_roles"))
         or "associated_bonding_curve" in set(row_string_list(row, "fallback_missing_roles"))
+    )
+
+
+def legacy_buy_unsupported_builder_layout(row: dict[str, Any]) -> bool:
+    joined = ":".join(
+        filter(
+            None,
+            [
+                row_string(row, "legacy_buy_route_not_ready_reason"),
+                row_string(row, "fallback_route_not_ready_reason"),
+                row_string(row, "fallback_failure_class"),
+                row_string(row, "no_executable_route_account_set_reason"),
+                row_string(row, "precheck_failure_reason"),
+                row_string(row, "execution_account_readiness_reason"),
+            ],
+        )
+    )
+    return (
+        "legacy_buy_unsupported_builder_layout_requires_bcv2" in joined
+        or "unsupported_builder_layout_requires_bcv2" in joined
+        or "fallback_unsupported_builder_layout" in joined
     )
 
 
@@ -1052,6 +1084,15 @@ def legacy_buy_route_payload(
             or ""
         ).startswith("selected_route_handoff_mismatch:")
     ]
+    unsupported_builder_layout_rows = [
+        row for row in attempted_rows if legacy_buy_unsupported_builder_layout(row)
+    ]
+    removed_from_fallback_candidates_rows = [
+        row
+        for row in unsupported_builder_layout_rows
+        if row_string(row, "fallback_route_kind") in {"legacy_buy", "LegacyBuy"}
+        and row_bool_string(row, "fallback_route_attempted") != "true"
+    ]
     return {
         "legacy_buy_route_attempted_rows": len(attempted_rows),
         "legacy_buy_route_ready_rows": len(ready_rows),
@@ -1179,6 +1220,15 @@ def legacy_buy_route_payload(
         ),
         "legacy_buy_selected_and_simulation_uses_legacy_account_set_rows": len(
             selected_simulation_uses_legacy_rows
+        ),
+        "legacy_buy_route_unsupported_builder_layout_rows": len(
+            unsupported_builder_layout_rows
+        ),
+        "legacy_buy_excluded_from_execution_route_universe_rows": len(
+            unsupported_builder_layout_rows
+        ),
+        "legacy_buy_removed_from_fallback_candidates_rows": len(
+            removed_from_fallback_candidates_rows
         ),
     }
 
@@ -3323,6 +3373,9 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- active_shadow_legacy_buy_non_blocking_ephemeral_payer_rows: `{active_shadow['active_shadow_legacy_buy_non_blocking_ephemeral_payer_rows']}`",
             f"- active_shadow_legacy_buy_fallback_account_set_ready_rows: `{active_shadow['active_shadow_legacy_buy_fallback_account_set_ready_rows']}`",
             f"- active_shadow_legacy_buy_route_ready_after_account_set_separation_rows: `{active_shadow['active_shadow_legacy_buy_route_ready_after_account_set_separation_rows']}`",
+            f"- active_shadow_legacy_buy_route_unsupported_builder_layout_rows: `{active_shadow['active_shadow_legacy_buy_route_unsupported_builder_layout_rows']}`",
+            f"- active_shadow_legacy_buy_excluded_from_execution_route_universe_rows: `{active_shadow['active_shadow_legacy_buy_excluded_from_execution_route_universe_rows']}`",
+            f"- active_shadow_legacy_buy_removed_from_fallback_candidates_rows: `{active_shadow['active_shadow_legacy_buy_removed_from_fallback_candidates_rows']}`",
             f"- active_shadow_selected_fallback_route_ready_rows: `{active_shadow['active_shadow_selected_fallback_route_ready_rows']}`",
             f"- active_shadow_selected_fallback_route_handoff_applied_rows: `{active_shadow['active_shadow_selected_fallback_route_handoff_applied_rows']}`",
             f"- active_shadow_selected_fallback_route_handoff_mismatch_rows: `{active_shadow['active_shadow_selected_fallback_route_handoff_mismatch_rows']}`",
@@ -3443,6 +3496,9 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- legacy_buy_non_blocking_ephemeral_payer_rows: `{materialization['legacy_buy_non_blocking_ephemeral_payer_rows']}`",
             f"- legacy_buy_fallback_account_set_ready_rows: `{materialization['legacy_buy_fallback_account_set_ready_rows']}`",
             f"- legacy_buy_route_ready_after_account_set_separation_rows: `{materialization['legacy_buy_route_ready_after_account_set_separation_rows']}`",
+            f"- legacy_buy_route_unsupported_builder_layout_rows: `{materialization['legacy_buy_route_unsupported_builder_layout_rows']}`",
+            f"- legacy_buy_excluded_from_execution_route_universe_rows: `{materialization['legacy_buy_excluded_from_execution_route_universe_rows']}`",
+            f"- legacy_buy_removed_from_fallback_candidates_rows: `{materialization['legacy_buy_removed_from_fallback_candidates_rows']}`",
             f"- selected_fallback_route_ready_rows: `{materialization['selected_fallback_route_ready_rows']}`",
             f"- selected_fallback_route_handoff_applied_rows: `{materialization['selected_fallback_route_handoff_applied_rows']}`",
             f"- selected_fallback_route_handoff_mismatch_rows: `{materialization['selected_fallback_route_handoff_mismatch_rows']}`",

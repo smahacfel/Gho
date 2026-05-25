@@ -6368,6 +6368,10 @@ fn p37_shadow_probe_fallback_failure_class_from_reason(
             "fallback_route_not_available_for_primary" => {
                 return Some("fallback_no_prepared_route".to_string());
             }
+            P37_LEGACY_BUY_UNSUPPORTED_ROUTE_REASON
+            | P37_LEGACY_BUY_FALLBACK_SUPPORT_STATUS => {
+                return Some("fallback_unsupported_builder_layout".to_string());
+            }
             _ => {}
         }
     }
@@ -6558,6 +6562,11 @@ struct P37LegacyBuyRouteDiagnostics {
     route_ready: Option<bool>,
     route_not_ready_reason: Option<String>,
 }
+
+const P37_LEGACY_BUY_FALLBACK_SUPPORT_STATUS: &str =
+    "unsupported_builder_layout_requires_bcv2";
+const P37_LEGACY_BUY_UNSUPPORTED_ROUTE_REASON: &str =
+    "legacy_buy_unsupported_builder_layout_requires_bcv2";
 
 fn p37_shadow_probe_manifest_entry_for_role<'a>(
     diagnostics: Option<&'a P37ShadowProbeAccountSetDiagnostics>,
@@ -6813,12 +6822,13 @@ fn p37_shadow_probe_legacy_buy_route_diagnostics(
         curve_rpc_load_status.as_deref(),
         curve_rpc_load_ready,
     );
-    let route_ready = overrides.legacy_buy_curve.is_some()
+    let account_set_ready = overrides.legacy_buy_curve.is_some()
         && curve_authoritative
         && curve_rpc_load_ready == Some(true)
         && manifest_ready;
-    let route_not_ready_reason = if route_ready {
-        None
+    let route_ready = false;
+    let route_not_ready_reason = if account_set_ready {
+        Some(P37_LEGACY_BUY_UNSUPPORTED_ROUTE_REASON.to_string())
     } else if curve_authority_readiness_status == "load_ready_but_authority_unverified" {
         Some("legacy_buy_curve_authority_not_verified".to_string())
     } else if curve_authority_readiness_status == "derived_mismatch_authoritative_source" {
@@ -6844,7 +6854,7 @@ fn p37_shadow_probe_legacy_buy_route_diagnostics(
         Some("legacy_buy_unknown_not_ready".to_string())
     };
     P37LegacyBuyRouteDiagnostics {
-        account_set_status: Some(if route_ready { "ready" } else { "not_ready" }.to_string()),
+        account_set_status: Some(if account_set_ready { "ready" } else { "not_ready" }.to_string()),
         curve_pubkey,
         curve_source,
         curve_authority_status,
@@ -6974,7 +6984,12 @@ fn p37_shadow_probe_route_resolution_diagnostics(
                 legacy_buy_route_not_ready_reason: legacy_buy.route_not_ready_reason,
             };
         }
-        let fallback_not_ready_reason = if fallback_attempted {
+        let legacy_buy_removed_from_fallback = fallback_attempted
+            && legacy_buy.route_not_ready_reason.as_deref()
+                == Some(P37_LEGACY_BUY_UNSUPPORTED_ROUTE_REASON);
+        let fallback_not_ready_reason = if legacy_buy_removed_from_fallback {
+            Some(P37_LEGACY_BUY_FALLBACK_SUPPORT_STATUS.to_string())
+        } else if fallback_attempted {
             match legacy_buy.route_not_ready_reason.as_deref() {
                 Some("legacy_buy_missing_core_curve_account") => {
                     Some("fallback_route_missing_legacy_buy_curve".to_string())
@@ -7007,7 +7022,9 @@ fn p37_shadow_probe_route_resolution_diagnostics(
             fallback_not_ready_reason.as_deref(),
             Some(pubkey.as_str()),
         );
-        let no_executable_reason = if primary_reason.contains("source_not_authoritative")
+        let no_executable_reason = if legacy_buy_removed_from_fallback {
+            format!("{P37_LEGACY_BUY_FALLBACK_SUPPORT_STATUS}:bonding_curve_v2:{pubkey}")
+        } else if primary_reason.contains("source_not_authoritative")
             || primary_reason.contains("identity_not_authoritative")
         {
             format!("primary_route_identity_not_authoritative:bonding_curve_v2:{pubkey}")
@@ -7024,7 +7041,7 @@ fn p37_shadow_probe_route_resolution_diagnostics(
             primary_route_ready: Some(false),
             primary_route_not_ready_reason: Some(primary_reason),
             fallback_route_kind,
-            fallback_route_attempted: Some(fallback_attempted),
+            fallback_route_attempted: Some(fallback_attempted && !legacy_buy_removed_from_fallback),
             fallback_route_ready: Some(false),
             fallback_route_not_ready_reason: fallback_not_ready_reason,
             fallback_missing_roles,
@@ -7060,11 +7077,15 @@ fn p37_shadow_probe_route_resolution_diagnostics(
             .route_not_ready_reason
             .clone()
             .unwrap_or_else(|| "legacy_buy_simulation_load_not_ready".to_string());
-        let no_executable_reason = legacy_buy
-            .curve_pubkey
-            .as_ref()
-            .map(|pubkey| format!("{primary_reason}:bonding_curve:{pubkey}"))
-            .unwrap_or(primary_reason.clone());
+        let no_executable_reason = if primary_reason == P37_LEGACY_BUY_UNSUPPORTED_ROUTE_REASON {
+            primary_reason.clone()
+        } else {
+            legacy_buy
+                .curve_pubkey
+                .as_ref()
+                .map(|pubkey| format!("{primary_reason}:bonding_curve:{pubkey}"))
+                .unwrap_or(primary_reason.clone())
+        };
         return P37ExecutableRouteResolutionDiagnostics {
             route_resolution_status: Some("no_executable_route_account_set".to_string()),
             selected_route_kind: None,
@@ -19417,7 +19438,19 @@ mod tests {
                 .as_deref(),
             Some("authoritative_and_load_ready")
         );
-        assert_eq!(resolution.legacy_buy_route_ready, Some(true));
+        assert_eq!(resolution.legacy_buy_route_ready, Some(false));
+        assert_eq!(
+            resolution.legacy_buy_route_not_ready_reason.as_deref(),
+            Some(P37_LEGACY_BUY_UNSUPPORTED_ROUTE_REASON)
+        );
+        assert_eq!(
+            resolution.route_resolution_status.as_deref(),
+            Some("no_executable_route_account_set")
+        );
+        assert_eq!(
+            resolution.no_executable_route_account_set_reason.as_deref(),
+            Some(P37_LEGACY_BUY_UNSUPPORTED_ROUTE_REASON)
+        );
     }
 
     #[test]
@@ -19527,7 +19560,7 @@ mod tests {
     }
 
     #[test]
-    fn p37_route_resolver_primary_bcv2_missing_attempts_fallback() {
+    fn p37_route_resolver_primary_bcv2_missing_excludes_unsupported_legacy_fallback() {
         let mut request = test_prepared_buy_request();
         let bcv2 = Pubkey::new_unique().to_string();
         let legacy_curve_pubkey = Pubkey::new_unique();
@@ -19565,12 +19598,9 @@ mod tests {
 
         assert_eq!(
             resolution.route_resolution_status.as_deref(),
-            Some("fallback_route_ready")
+            Some("no_executable_route_account_set")
         );
-        assert_eq!(
-            resolution.selected_route_kind.as_deref(),
-            Some("legacy_buy")
-        );
+        assert_eq!(resolution.selected_route_kind, None);
         assert_eq!(
             resolution.primary_route_kind.as_deref(),
             Some("routed_exact_sol_in")
@@ -19584,9 +19614,12 @@ mod tests {
             resolution.fallback_route_kind.as_deref(),
             Some("legacy_buy")
         );
-        assert_eq!(resolution.fallback_route_attempted, Some(true));
-        assert_eq!(resolution.fallback_route_ready, Some(true));
-        assert_eq!(resolution.fallback_route_not_ready_reason, None);
+        assert_eq!(resolution.fallback_route_attempted, Some(false));
+        assert_eq!(resolution.fallback_route_ready, Some(false));
+        assert_eq!(
+            resolution.fallback_route_not_ready_reason.as_deref(),
+            Some(P37_LEGACY_BUY_FALLBACK_SUPPORT_STATUS)
+        );
         let legacy_curve_pubkey_string = legacy_curve_pubkey.to_string();
         assert_eq!(
             resolution.legacy_buy_curve_pubkey.as_deref(),
@@ -19611,19 +19644,31 @@ mod tests {
                 .as_deref(),
             Some("authoritative_and_load_ready")
         );
-        assert_eq!(resolution.legacy_buy_route_ready, Some(true));
-        assert_eq!(resolution.legacy_buy_route_not_ready_reason, None);
-        assert_eq!(resolution.fallback_failure_class, None);
+        assert_eq!(resolution.legacy_buy_account_set_status.as_deref(), Some("ready"));
+        assert_eq!(resolution.legacy_buy_route_ready, Some(false));
+        assert_eq!(
+            resolution.legacy_buy_route_not_ready_reason.as_deref(),
+            Some(P37_LEGACY_BUY_UNSUPPORTED_ROUTE_REASON)
+        );
+        assert_eq!(
+            resolution.fallback_failure_class.as_deref(),
+            Some("fallback_unsupported_builder_layout")
+        );
         assert!(resolution.fallback_missing_roles.is_empty());
         assert!(resolution.fallback_missing_pubkeys.is_empty());
         assert!(resolution.fallback_account_sources.is_empty());
         assert!(!resolution.fallback_simulation_load_account_set.is_empty());
         assert!(!resolution.fallback_required_precheck_account_set.is_empty());
-        assert_eq!(resolution.no_executable_route_account_set_reason, None);
+        let expected_reason =
+            format!("{P37_LEGACY_BUY_FALLBACK_SUPPORT_STATUS}:bonding_curve_v2:{bcv2}");
+        assert_eq!(
+            resolution.no_executable_route_account_set_reason.as_deref(),
+            Some(expected_reason.as_str())
+        );
     }
 
     #[test]
-    fn p37_route_resolver_primary_bcv2_manifest_missing_attempts_fallback_without_precheck_reason()
+    fn p37_route_resolver_primary_bcv2_manifest_missing_excludes_unsupported_legacy_fallback_without_precheck_reason()
     {
         let mut request = test_prepared_buy_request();
         let bcv2 = Pubkey::new_unique().to_string();
@@ -19662,14 +19707,24 @@ mod tests {
 
         assert_eq!(
             resolution.route_resolution_status.as_deref(),
-            Some("fallback_route_ready")
+            Some("no_executable_route_account_set")
+        );
+        assert_eq!(resolution.selected_route_kind, None);
+        assert_eq!(resolution.fallback_route_attempted, Some(false));
+        assert_eq!(resolution.fallback_route_ready, Some(false));
+        assert_eq!(
+            resolution.fallback_route_not_ready_reason.as_deref(),
+            Some(P37_LEGACY_BUY_FALLBACK_SUPPORT_STATUS)
         );
         assert_eq!(
-            resolution.selected_route_kind.as_deref(),
-            Some("legacy_buy")
+            resolution.fallback_failure_class.as_deref(),
+            Some("fallback_unsupported_builder_layout")
         );
-        assert_eq!(resolution.fallback_route_ready, Some(true));
-        assert_eq!(resolution.no_executable_route_account_set_reason, None);
+        assert_eq!(
+            resolution.legacy_buy_route_not_ready_reason.as_deref(),
+            Some(P37_LEGACY_BUY_UNSUPPORTED_ROUTE_REASON)
+        );
+        assert!(resolution.no_executable_route_account_set_reason.is_some());
     }
 
     #[test]
@@ -19839,7 +19894,7 @@ mod tests {
 
     #[test]
     fn selected_legacy_buy_handoff_happens_before_precheck() {
-        p37_route_resolver_primary_bcv2_manifest_missing_attempts_fallback_without_precheck_reason(
+        p37_route_resolver_primary_bcv2_manifest_missing_excludes_unsupported_legacy_fallback_without_precheck_reason(
         );
     }
 
@@ -20000,9 +20055,26 @@ mod tests {
 
         assert_eq!(
             resolution.route_resolution_status.as_deref(),
-            Some("primary_route_ready")
+            Some("no_executable_route_account_set")
         );
-        assert_eq!(resolution.legacy_buy_route_ready, Some(true));
+        assert_eq!(resolution.legacy_buy_account_set_status.as_deref(), Some("ready"));
+        assert_eq!(resolution.legacy_buy_route_ready, Some(false));
+        assert_eq!(
+            resolution.legacy_buy_route_not_ready_reason.as_deref(),
+            Some(P37_LEGACY_BUY_UNSUPPORTED_ROUTE_REASON)
+        );
+        assert_eq!(
+            resolution.primary_route_not_ready_reason.as_deref(),
+            Some(P37_LEGACY_BUY_UNSUPPORTED_ROUTE_REASON)
+        );
+        assert_eq!(
+            resolution.no_executable_route_account_set_reason.as_deref(),
+            Some(P37_LEGACY_BUY_UNSUPPORTED_ROUTE_REASON)
+        );
+        assert_eq!(
+            resolution.fallback_failure_class.as_deref(),
+            Some("fallback_unsupported_builder_layout")
+        );
         assert!(resolution.legacy_buy_missing_roles.is_empty());
         assert!(resolution.legacy_buy_missing_pubkeys.is_empty());
     }
