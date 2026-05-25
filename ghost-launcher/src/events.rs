@@ -290,13 +290,39 @@ pub struct ShadowSimulationAccountDiagnostics {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_builder_manifest_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_pubkey: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_builder_bcv2_source_authority: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_builder_bcv2_rpc_load_status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_rpc_load_ready: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_seen_in_observed_tx: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_seen_in_account_state: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_seen_in_mfs: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_seen_in_diag: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_readiness_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_creator_vault_pubkey: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_builder_creator_vault_source_authority: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_builder_creator_vault_rpc_load_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_creator_vault_rpc_load_ready: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_creator_vault_seen_in_account_state: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_creator_vault_seen_in_mfs: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_creator_vault_seen_in_observed_tx: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_creator_vault_readiness_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub working_builder_required_accounts: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

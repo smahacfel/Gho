@@ -5083,10 +5083,23 @@ struct P37ShadowProbeSelectionRecord {
     working_builder_sender_manifest_account_roles: Vec<String>,
     working_builder_manifest_contains_bcv2: Option<bool>,
     working_builder_manifest_source: Option<String>,
+    working_builder_bcv2_pubkey: Option<String>,
     working_builder_bcv2_source_authority: Option<String>,
     working_builder_bcv2_rpc_load_status: Option<String>,
+    working_builder_bcv2_rpc_load_ready: Option<bool>,
+    working_builder_bcv2_seen_in_observed_tx: Option<bool>,
+    working_builder_bcv2_seen_in_account_state: Option<bool>,
+    working_builder_bcv2_seen_in_mfs: Option<bool>,
+    working_builder_bcv2_seen_in_diag: Option<bool>,
+    working_builder_bcv2_readiness_reason: Option<String>,
+    working_builder_creator_vault_pubkey: Option<String>,
     working_builder_creator_vault_source_authority: Option<String>,
     working_builder_creator_vault_rpc_load_status: Option<String>,
+    working_builder_creator_vault_rpc_load_ready: Option<bool>,
+    working_builder_creator_vault_seen_in_account_state: Option<bool>,
+    working_builder_creator_vault_seen_in_mfs: Option<bool>,
+    working_builder_creator_vault_seen_in_observed_tx: Option<bool>,
+    working_builder_creator_vault_readiness_reason: Option<String>,
     working_builder_required_accounts: Vec<String>,
     working_builder_creatable_accounts: Vec<String>,
     working_builder_ephemeral_accounts: Vec<String>,
@@ -5236,10 +5249,23 @@ struct P37ShadowProbeTransportRecord {
     working_builder_sender_manifest_account_roles: Vec<String>,
     working_builder_manifest_contains_bcv2: Option<bool>,
     working_builder_manifest_source: Option<String>,
+    working_builder_bcv2_pubkey: Option<String>,
     working_builder_bcv2_source_authority: Option<String>,
     working_builder_bcv2_rpc_load_status: Option<String>,
+    working_builder_bcv2_rpc_load_ready: Option<bool>,
+    working_builder_bcv2_seen_in_observed_tx: Option<bool>,
+    working_builder_bcv2_seen_in_account_state: Option<bool>,
+    working_builder_bcv2_seen_in_mfs: Option<bool>,
+    working_builder_bcv2_seen_in_diag: Option<bool>,
+    working_builder_bcv2_readiness_reason: Option<String>,
+    working_builder_creator_vault_pubkey: Option<String>,
     working_builder_creator_vault_source_authority: Option<String>,
     working_builder_creator_vault_rpc_load_status: Option<String>,
+    working_builder_creator_vault_rpc_load_ready: Option<bool>,
+    working_builder_creator_vault_seen_in_account_state: Option<bool>,
+    working_builder_creator_vault_seen_in_mfs: Option<bool>,
+    working_builder_creator_vault_seen_in_observed_tx: Option<bool>,
+    working_builder_creator_vault_readiness_reason: Option<String>,
     working_builder_required_accounts: Vec<String>,
     working_builder_creatable_accounts: Vec<String>,
     working_builder_ephemeral_accounts: Vec<String>,
@@ -5688,10 +5714,23 @@ fn p37_shadow_probe_selection_record(
         working_builder_sender_manifest_account_roles: Vec::new(),
         working_builder_manifest_contains_bcv2: None,
         working_builder_manifest_source: None,
+        working_builder_bcv2_pubkey: None,
         working_builder_bcv2_source_authority: None,
         working_builder_bcv2_rpc_load_status: None,
+        working_builder_bcv2_rpc_load_ready: None,
+        working_builder_bcv2_seen_in_observed_tx: None,
+        working_builder_bcv2_seen_in_account_state: None,
+        working_builder_bcv2_seen_in_mfs: None,
+        working_builder_bcv2_seen_in_diag: None,
+        working_builder_bcv2_readiness_reason: None,
+        working_builder_creator_vault_pubkey: None,
         working_builder_creator_vault_source_authority: None,
         working_builder_creator_vault_rpc_load_status: None,
+        working_builder_creator_vault_rpc_load_ready: None,
+        working_builder_creator_vault_seen_in_account_state: None,
+        working_builder_creator_vault_seen_in_mfs: None,
+        working_builder_creator_vault_seen_in_observed_tx: None,
+        working_builder_creator_vault_readiness_reason: None,
         working_builder_required_accounts: Vec::new(),
         working_builder_creatable_accounts: Vec::new(),
         working_builder_ephemeral_accounts: Vec::new(),
@@ -5918,13 +5957,32 @@ fn p37_shadow_probe_artifact_records(
             .clone(),
         working_builder_manifest_contains_bcv2: record.working_builder_manifest_contains_bcv2,
         working_builder_manifest_source: record.working_builder_manifest_source.clone(),
+        working_builder_bcv2_pubkey: record.working_builder_bcv2_pubkey.clone(),
         working_builder_bcv2_source_authority: record.working_builder_bcv2_source_authority.clone(),
         working_builder_bcv2_rpc_load_status: record.working_builder_bcv2_rpc_load_status.clone(),
+        working_builder_bcv2_rpc_load_ready: record.working_builder_bcv2_rpc_load_ready,
+        working_builder_bcv2_seen_in_observed_tx: record.working_builder_bcv2_seen_in_observed_tx,
+        working_builder_bcv2_seen_in_account_state: record
+            .working_builder_bcv2_seen_in_account_state,
+        working_builder_bcv2_seen_in_mfs: record.working_builder_bcv2_seen_in_mfs,
+        working_builder_bcv2_seen_in_diag: record.working_builder_bcv2_seen_in_diag,
+        working_builder_bcv2_readiness_reason: record.working_builder_bcv2_readiness_reason.clone(),
+        working_builder_creator_vault_pubkey: record.working_builder_creator_vault_pubkey.clone(),
         working_builder_creator_vault_source_authority: record
             .working_builder_creator_vault_source_authority
             .clone(),
         working_builder_creator_vault_rpc_load_status: record
             .working_builder_creator_vault_rpc_load_status
+            .clone(),
+        working_builder_creator_vault_rpc_load_ready: record
+            .working_builder_creator_vault_rpc_load_ready,
+        working_builder_creator_vault_seen_in_account_state: record
+            .working_builder_creator_vault_seen_in_account_state,
+        working_builder_creator_vault_seen_in_mfs: record.working_builder_creator_vault_seen_in_mfs,
+        working_builder_creator_vault_seen_in_observed_tx: record
+            .working_builder_creator_vault_seen_in_observed_tx,
+        working_builder_creator_vault_readiness_reason: record
+            .working_builder_creator_vault_readiness_reason
             .clone(),
         working_builder_required_accounts: record.working_builder_required_accounts.clone(),
         working_builder_creatable_accounts: record.working_builder_creatable_accounts.clone(),
@@ -6120,13 +6178,32 @@ fn p37_shadow_probe_artifact_records(
             .clone(),
         working_builder_manifest_contains_bcv2: record.working_builder_manifest_contains_bcv2,
         working_builder_manifest_source: record.working_builder_manifest_source.clone(),
+        working_builder_bcv2_pubkey: record.working_builder_bcv2_pubkey.clone(),
         working_builder_bcv2_source_authority: record.working_builder_bcv2_source_authority.clone(),
         working_builder_bcv2_rpc_load_status: record.working_builder_bcv2_rpc_load_status.clone(),
+        working_builder_bcv2_rpc_load_ready: record.working_builder_bcv2_rpc_load_ready,
+        working_builder_bcv2_seen_in_observed_tx: record.working_builder_bcv2_seen_in_observed_tx,
+        working_builder_bcv2_seen_in_account_state: record
+            .working_builder_bcv2_seen_in_account_state,
+        working_builder_bcv2_seen_in_mfs: record.working_builder_bcv2_seen_in_mfs,
+        working_builder_bcv2_seen_in_diag: record.working_builder_bcv2_seen_in_diag,
+        working_builder_bcv2_readiness_reason: record.working_builder_bcv2_readiness_reason.clone(),
+        working_builder_creator_vault_pubkey: record.working_builder_creator_vault_pubkey.clone(),
         working_builder_creator_vault_source_authority: record
             .working_builder_creator_vault_source_authority
             .clone(),
         working_builder_creator_vault_rpc_load_status: record
             .working_builder_creator_vault_rpc_load_status
+            .clone(),
+        working_builder_creator_vault_rpc_load_ready: record
+            .working_builder_creator_vault_rpc_load_ready,
+        working_builder_creator_vault_seen_in_account_state: record
+            .working_builder_creator_vault_seen_in_account_state,
+        working_builder_creator_vault_seen_in_mfs: record.working_builder_creator_vault_seen_in_mfs,
+        working_builder_creator_vault_seen_in_observed_tx: record
+            .working_builder_creator_vault_seen_in_observed_tx,
+        working_builder_creator_vault_readiness_reason: record
+            .working_builder_creator_vault_readiness_reason
             .clone(),
         working_builder_required_accounts: record.working_builder_required_accounts.clone(),
         working_builder_creatable_accounts: record.working_builder_creatable_accounts.clone(),
@@ -7748,10 +7825,23 @@ struct P37ShadowProbeExecutionDiagnostics {
     working_builder_sender_manifest_account_roles: Vec<String>,
     working_builder_manifest_contains_bcv2: Option<bool>,
     working_builder_manifest_source: Option<String>,
+    working_builder_bcv2_pubkey: Option<String>,
     working_builder_bcv2_source_authority: Option<String>,
     working_builder_bcv2_rpc_load_status: Option<String>,
+    working_builder_bcv2_rpc_load_ready: Option<bool>,
+    working_builder_bcv2_seen_in_observed_tx: Option<bool>,
+    working_builder_bcv2_seen_in_account_state: Option<bool>,
+    working_builder_bcv2_seen_in_mfs: Option<bool>,
+    working_builder_bcv2_seen_in_diag: Option<bool>,
+    working_builder_bcv2_readiness_reason: Option<String>,
+    working_builder_creator_vault_pubkey: Option<String>,
     working_builder_creator_vault_source_authority: Option<String>,
     working_builder_creator_vault_rpc_load_status: Option<String>,
+    working_builder_creator_vault_rpc_load_ready: Option<bool>,
+    working_builder_creator_vault_seen_in_account_state: Option<bool>,
+    working_builder_creator_vault_seen_in_mfs: Option<bool>,
+    working_builder_creator_vault_seen_in_observed_tx: Option<bool>,
+    working_builder_creator_vault_readiness_reason: Option<String>,
     working_builder_required_accounts: Vec<String>,
     working_builder_creatable_accounts: Vec<String>,
     working_builder_ephemeral_accounts: Vec<String>,
@@ -8686,10 +8776,23 @@ struct P37WorkingBuilderParityDiagnostics {
     sender_manifest_account_roles: Vec<String>,
     manifest_contains_bcv2: Option<bool>,
     manifest_source: Option<String>,
+    bcv2_pubkey: Option<String>,
     bcv2_source_authority: Option<String>,
     bcv2_rpc_load_status: Option<String>,
+    bcv2_rpc_load_ready: Option<bool>,
+    bcv2_seen_in_observed_tx: Option<bool>,
+    bcv2_seen_in_account_state: Option<bool>,
+    bcv2_seen_in_mfs: Option<bool>,
+    bcv2_seen_in_diag: Option<bool>,
+    bcv2_readiness_reason: Option<String>,
+    creator_vault_pubkey: Option<String>,
     creator_vault_source_authority: Option<String>,
     creator_vault_rpc_load_status: Option<String>,
+    creator_vault_rpc_load_ready: Option<bool>,
+    creator_vault_seen_in_account_state: Option<bool>,
+    creator_vault_seen_in_mfs: Option<bool>,
+    creator_vault_seen_in_observed_tx: Option<bool>,
+    creator_vault_readiness_reason: Option<String>,
     required_accounts: Vec<String>,
     creatable_accounts: Vec<String>,
     ephemeral_accounts: Vec<String>,
@@ -8879,6 +8982,31 @@ struct P37WorkingBuilderCreatorVaultReadiness {
     source_authority: Option<String>,
     rpc_load_status: Option<String>,
     rpc_load_ready: Option<bool>,
+    seen_in_account_state: Option<bool>,
+    seen_in_mfs: Option<bool>,
+    seen_in_observed_tx: Option<bool>,
+    readiness_reason: Option<String>,
+}
+
+fn p37_working_builder_creator_vault_readiness_reason(
+    source_authority: Option<&str>,
+    rpc_load_status: Option<&str>,
+    rpc_load_ready: Option<bool>,
+) -> Option<String> {
+    if !p37_working_builder_creator_vault_is_authoritative(source_authority) {
+        return Some("creator_vault_source_not_authoritative".to_string());
+    }
+    match (rpc_load_ready, rpc_load_status) {
+        (Some(true), Some(status)) => Some(format!("load_ready:{status}")),
+        (Some(true), None) => Some("load_ready:unknown".to_string()),
+        (Some(false), Some("missing_on_rpc_precheck")) => {
+            Some("creator_vault_missing_on_rpc".to_string())
+        }
+        (Some(false), Some(status)) => Some(format!("not_load_ready:{status}")),
+        (Some(false), None) => Some("not_load_ready:unknown".to_string()),
+        (None, Some(status)) => Some(format!("load_readiness_unknown:{status}")),
+        (None, None) => None,
+    }
 }
 
 fn p37_working_builder_creator_vault_readiness(
@@ -8901,11 +9029,21 @@ fn p37_working_builder_creator_vault_readiness(
         "creator_vault",
         pubkey.as_deref(),
     );
+    let source_authority = p37_working_builder_creator_vault_source_authority(request);
+    let readiness_reason = p37_working_builder_creator_vault_readiness_reason(
+        source_authority.as_deref(),
+        rpc_load_status.as_deref(),
+        rpc_load_ready,
+    );
     P37WorkingBuilderCreatorVaultReadiness {
         pubkey,
-        source_authority: p37_working_builder_creator_vault_source_authority(request),
+        source_authority,
         rpc_load_status,
         rpc_load_ready,
+        seen_in_account_state: Some(false),
+        seen_in_mfs: Some(false),
+        seen_in_observed_tx: Some(false),
+        readiness_reason,
     }
 }
 
@@ -8959,6 +9097,19 @@ fn p37_working_builder_parity_diagnostics(
     );
     let creator_vault_readiness =
         p37_working_builder_creator_vault_readiness(request, account_set_diagnostics);
+    let bcv2_seen_in_observed_tx = bonding_curve_v2_authority.pubkey.as_ref().map(|_| {
+        bonding_curve_v2_authority.source.as_deref() == Some("observed_tx_account_meta")
+            || bonding_curve_v2_authority
+                .observed_bcv2_provenance_status
+                .is_some()
+            || bonding_curve_v2_authority
+                .observed_bcv2_resolved_pubkey
+                .is_some()
+    });
+    let bcv2_readiness_reason = bonding_curve_v2_authority
+        .builder_required_curve_account_ready_reason
+        .clone()
+        .or_else(|| bonding_curve_v2_authority.mismatch_reason.clone());
     P37WorkingBuilderParityDiagnostics {
         mode: Some(P37_EXECUTION_BUILDER_MODE_WORKING_BUILDER_PARITY.to_string()),
         request_built: Some(request_built),
@@ -8971,10 +9122,23 @@ fn p37_working_builder_parity_diagnostics(
         sender_manifest_account_roles,
         manifest_contains_bcv2: Some(manifest_contains_bcv2),
         manifest_source: request_built.then(|| "direct_buy_builder".to_string()),
+        bcv2_pubkey: bonding_curve_v2_authority.pubkey,
         bcv2_source_authority: bonding_curve_v2_authority.authority_status,
         bcv2_rpc_load_status: bonding_curve_v2_authority.rpc_load_status,
+        bcv2_rpc_load_ready: bonding_curve_v2_authority.rpc_load_ready,
+        bcv2_seen_in_observed_tx,
+        bcv2_seen_in_account_state: bonding_curve_v2_authority.seen_in_account_state,
+        bcv2_seen_in_mfs: bonding_curve_v2_authority.seen_in_mfs,
+        bcv2_seen_in_diag: bonding_curve_v2_authority.seen_in_diag,
+        bcv2_readiness_reason,
+        creator_vault_pubkey: creator_vault_readiness.pubkey,
         creator_vault_source_authority: creator_vault_readiness.source_authority,
         creator_vault_rpc_load_status: creator_vault_readiness.rpc_load_status,
+        creator_vault_rpc_load_ready: creator_vault_readiness.rpc_load_ready,
+        creator_vault_seen_in_account_state: creator_vault_readiness.seen_in_account_state,
+        creator_vault_seen_in_mfs: creator_vault_readiness.seen_in_mfs,
+        creator_vault_seen_in_observed_tx: creator_vault_readiness.seen_in_observed_tx,
+        creator_vault_readiness_reason: creator_vault_readiness.readiness_reason,
         required_accounts,
         creatable_accounts,
         ephemeral_accounts: p37_working_builder_ephemeral_accounts(request),
@@ -8996,12 +9160,28 @@ fn p37_apply_working_builder_parity_to_record(
         diagnostics.sender_manifest_account_roles;
     record.working_builder_manifest_contains_bcv2 = diagnostics.manifest_contains_bcv2;
     record.working_builder_manifest_source = diagnostics.manifest_source;
+    record.working_builder_bcv2_pubkey = diagnostics.bcv2_pubkey;
     record.working_builder_bcv2_source_authority = diagnostics.bcv2_source_authority;
     record.working_builder_bcv2_rpc_load_status = diagnostics.bcv2_rpc_load_status;
+    record.working_builder_bcv2_rpc_load_ready = diagnostics.bcv2_rpc_load_ready;
+    record.working_builder_bcv2_seen_in_observed_tx = diagnostics.bcv2_seen_in_observed_tx;
+    record.working_builder_bcv2_seen_in_account_state = diagnostics.bcv2_seen_in_account_state;
+    record.working_builder_bcv2_seen_in_mfs = diagnostics.bcv2_seen_in_mfs;
+    record.working_builder_bcv2_seen_in_diag = diagnostics.bcv2_seen_in_diag;
+    record.working_builder_bcv2_readiness_reason = diagnostics.bcv2_readiness_reason;
+    record.working_builder_creator_vault_pubkey = diagnostics.creator_vault_pubkey;
     record.working_builder_creator_vault_source_authority =
         diagnostics.creator_vault_source_authority;
     record.working_builder_creator_vault_rpc_load_status =
         diagnostics.creator_vault_rpc_load_status;
+    record.working_builder_creator_vault_rpc_load_ready = diagnostics.creator_vault_rpc_load_ready;
+    record.working_builder_creator_vault_seen_in_account_state =
+        diagnostics.creator_vault_seen_in_account_state;
+    record.working_builder_creator_vault_seen_in_mfs = diagnostics.creator_vault_seen_in_mfs;
+    record.working_builder_creator_vault_seen_in_observed_tx =
+        diagnostics.creator_vault_seen_in_observed_tx;
+    record.working_builder_creator_vault_readiness_reason =
+        diagnostics.creator_vault_readiness_reason;
     record.working_builder_required_accounts = diagnostics.required_accounts;
     record.working_builder_creatable_accounts = diagnostics.creatable_accounts;
     record.working_builder_ephemeral_accounts = diagnostics.ephemeral_accounts;
@@ -9042,6 +9222,38 @@ fn p37_working_builder_final_manifest_failure_reason(
                 .as_deref()
                 .unwrap_or("rpc_not_load_ready")
         ));
+    }
+    let bcv2_required_by_manifest = diagnostics
+        .manifest
+        .iter()
+        .any(|entry| entry.role == "bonding_curve_v2" && entry.required);
+    if bcv2_required_by_manifest {
+        let bcv2 = p37_shadow_probe_bonding_curve_v2_authority_diagnostics(
+            Some(request),
+            Some(diagnostics),
+        );
+        if !bcv2.is_authoritative() {
+            let pubkey = bcv2.pubkey.as_deref().unwrap_or("missing_bonding_curve_v2");
+            return Some(format!(
+                "working_builder_final_manifest_account_source_not_authoritative:bonding_curve_v2:{pubkey}:{}",
+                bcv2
+                    .authority_status
+                    .as_deref()
+                    .unwrap_or("bonding_curve_v2_source_not_authoritative")
+            ));
+        }
+        if bcv2.rpc_load_ready == Some(false)
+            && bcv2.rpc_load_status.as_deref() != Some("missing_on_rpc_precheck")
+        {
+            let pubkey = bcv2.pubkey.as_deref().unwrap_or("missing_bonding_curve_v2");
+            return Some(format!(
+                "working_builder_final_manifest_missing_required_account:bonding_curve_v2:{pubkey}:{}",
+                bcv2
+                    .rpc_load_status
+                    .as_deref()
+                    .unwrap_or("rpc_not_load_ready")
+            ));
+        }
     }
     p37_working_builder_final_manifest_missing_required_accounts(request, diagnostics)
         .into_iter()
@@ -9745,12 +9957,28 @@ fn active_shadow_account_diagnostics_from_account_set_with_mode(
             .sender_manifest_account_roles,
         working_builder_manifest_contains_bcv2: working_builder.manifest_contains_bcv2,
         working_builder_manifest_source: working_builder.manifest_source,
+        working_builder_bcv2_pubkey: working_builder.bcv2_pubkey,
         working_builder_bcv2_source_authority: working_builder.bcv2_source_authority,
         working_builder_bcv2_rpc_load_status: working_builder.bcv2_rpc_load_status,
+        working_builder_bcv2_rpc_load_ready: working_builder.bcv2_rpc_load_ready,
+        working_builder_bcv2_seen_in_observed_tx: working_builder.bcv2_seen_in_observed_tx,
+        working_builder_bcv2_seen_in_account_state: working_builder.bcv2_seen_in_account_state,
+        working_builder_bcv2_seen_in_mfs: working_builder.bcv2_seen_in_mfs,
+        working_builder_bcv2_seen_in_diag: working_builder.bcv2_seen_in_diag,
+        working_builder_bcv2_readiness_reason: working_builder.bcv2_readiness_reason,
+        working_builder_creator_vault_pubkey: working_builder.creator_vault_pubkey,
         working_builder_creator_vault_source_authority: working_builder
             .creator_vault_source_authority,
         working_builder_creator_vault_rpc_load_status: working_builder
             .creator_vault_rpc_load_status,
+        working_builder_creator_vault_rpc_load_ready: working_builder.creator_vault_rpc_load_ready,
+        working_builder_creator_vault_seen_in_account_state: working_builder
+            .creator_vault_seen_in_account_state,
+        working_builder_creator_vault_seen_in_mfs: working_builder.creator_vault_seen_in_mfs,
+        working_builder_creator_vault_seen_in_observed_tx: working_builder
+            .creator_vault_seen_in_observed_tx,
+        working_builder_creator_vault_readiness_reason: working_builder
+            .creator_vault_readiness_reason,
         working_builder_required_accounts: working_builder.required_accounts,
         working_builder_creatable_accounts: working_builder.creatable_accounts,
         working_builder_ephemeral_accounts: working_builder.ephemeral_accounts,
@@ -10903,12 +11131,28 @@ fn p37_shadow_probe_execution_diagnostics(
             .sender_manifest_account_roles,
         working_builder_manifest_contains_bcv2: working_builder.manifest_contains_bcv2,
         working_builder_manifest_source: working_builder.manifest_source,
+        working_builder_bcv2_pubkey: working_builder.bcv2_pubkey,
         working_builder_bcv2_source_authority: working_builder.bcv2_source_authority,
         working_builder_bcv2_rpc_load_status: working_builder.bcv2_rpc_load_status,
+        working_builder_bcv2_rpc_load_ready: working_builder.bcv2_rpc_load_ready,
+        working_builder_bcv2_seen_in_observed_tx: working_builder.bcv2_seen_in_observed_tx,
+        working_builder_bcv2_seen_in_account_state: working_builder.bcv2_seen_in_account_state,
+        working_builder_bcv2_seen_in_mfs: working_builder.bcv2_seen_in_mfs,
+        working_builder_bcv2_seen_in_diag: working_builder.bcv2_seen_in_diag,
+        working_builder_bcv2_readiness_reason: working_builder.bcv2_readiness_reason,
+        working_builder_creator_vault_pubkey: working_builder.creator_vault_pubkey,
         working_builder_creator_vault_source_authority: working_builder
             .creator_vault_source_authority,
         working_builder_creator_vault_rpc_load_status: working_builder
             .creator_vault_rpc_load_status,
+        working_builder_creator_vault_rpc_load_ready: working_builder.creator_vault_rpc_load_ready,
+        working_builder_creator_vault_seen_in_account_state: working_builder
+            .creator_vault_seen_in_account_state,
+        working_builder_creator_vault_seen_in_mfs: working_builder.creator_vault_seen_in_mfs,
+        working_builder_creator_vault_seen_in_observed_tx: working_builder
+            .creator_vault_seen_in_observed_tx,
+        working_builder_creator_vault_readiness_reason: working_builder
+            .creator_vault_readiness_reason,
         working_builder_required_accounts: working_builder.required_accounts,
         working_builder_creatable_accounts: working_builder.creatable_accounts,
         working_builder_ephemeral_accounts: working_builder.ephemeral_accounts,
@@ -11214,12 +11458,32 @@ fn p37_shadow_probe_transport_from_event(
             .working_builder_sender_manifest_account_roles,
         working_builder_manifest_contains_bcv2: diagnostics.working_builder_manifest_contains_bcv2,
         working_builder_manifest_source: diagnostics.working_builder_manifest_source,
+        working_builder_bcv2_pubkey: diagnostics.working_builder_bcv2_pubkey,
         working_builder_bcv2_source_authority: diagnostics.working_builder_bcv2_source_authority,
         working_builder_bcv2_rpc_load_status: diagnostics.working_builder_bcv2_rpc_load_status,
+        working_builder_bcv2_rpc_load_ready: diagnostics.working_builder_bcv2_rpc_load_ready,
+        working_builder_bcv2_seen_in_observed_tx: diagnostics
+            .working_builder_bcv2_seen_in_observed_tx,
+        working_builder_bcv2_seen_in_account_state: diagnostics
+            .working_builder_bcv2_seen_in_account_state,
+        working_builder_bcv2_seen_in_mfs: diagnostics.working_builder_bcv2_seen_in_mfs,
+        working_builder_bcv2_seen_in_diag: diagnostics.working_builder_bcv2_seen_in_diag,
+        working_builder_bcv2_readiness_reason: diagnostics.working_builder_bcv2_readiness_reason,
+        working_builder_creator_vault_pubkey: diagnostics.working_builder_creator_vault_pubkey,
         working_builder_creator_vault_source_authority: diagnostics
             .working_builder_creator_vault_source_authority,
         working_builder_creator_vault_rpc_load_status: diagnostics
             .working_builder_creator_vault_rpc_load_status,
+        working_builder_creator_vault_rpc_load_ready: diagnostics
+            .working_builder_creator_vault_rpc_load_ready,
+        working_builder_creator_vault_seen_in_account_state: diagnostics
+            .working_builder_creator_vault_seen_in_account_state,
+        working_builder_creator_vault_seen_in_mfs: diagnostics
+            .working_builder_creator_vault_seen_in_mfs,
+        working_builder_creator_vault_seen_in_observed_tx: diagnostics
+            .working_builder_creator_vault_seen_in_observed_tx,
+        working_builder_creator_vault_readiness_reason: diagnostics
+            .working_builder_creator_vault_readiness_reason,
         working_builder_required_accounts: diagnostics.working_builder_required_accounts,
         working_builder_creatable_accounts: diagnostics.working_builder_creatable_accounts,
         working_builder_ephemeral_accounts: diagnostics.working_builder_ephemeral_accounts,
@@ -11477,12 +11741,32 @@ fn p37_shadow_probe_transport_from_error(
             .working_builder_sender_manifest_account_roles,
         working_builder_manifest_contains_bcv2: diagnostics.working_builder_manifest_contains_bcv2,
         working_builder_manifest_source: diagnostics.working_builder_manifest_source,
+        working_builder_bcv2_pubkey: diagnostics.working_builder_bcv2_pubkey,
         working_builder_bcv2_source_authority: diagnostics.working_builder_bcv2_source_authority,
         working_builder_bcv2_rpc_load_status: diagnostics.working_builder_bcv2_rpc_load_status,
+        working_builder_bcv2_rpc_load_ready: diagnostics.working_builder_bcv2_rpc_load_ready,
+        working_builder_bcv2_seen_in_observed_tx: diagnostics
+            .working_builder_bcv2_seen_in_observed_tx,
+        working_builder_bcv2_seen_in_account_state: diagnostics
+            .working_builder_bcv2_seen_in_account_state,
+        working_builder_bcv2_seen_in_mfs: diagnostics.working_builder_bcv2_seen_in_mfs,
+        working_builder_bcv2_seen_in_diag: diagnostics.working_builder_bcv2_seen_in_diag,
+        working_builder_bcv2_readiness_reason: diagnostics.working_builder_bcv2_readiness_reason,
+        working_builder_creator_vault_pubkey: diagnostics.working_builder_creator_vault_pubkey,
         working_builder_creator_vault_source_authority: diagnostics
             .working_builder_creator_vault_source_authority,
         working_builder_creator_vault_rpc_load_status: diagnostics
             .working_builder_creator_vault_rpc_load_status,
+        working_builder_creator_vault_rpc_load_ready: diagnostics
+            .working_builder_creator_vault_rpc_load_ready,
+        working_builder_creator_vault_seen_in_account_state: diagnostics
+            .working_builder_creator_vault_seen_in_account_state,
+        working_builder_creator_vault_seen_in_mfs: diagnostics
+            .working_builder_creator_vault_seen_in_mfs,
+        working_builder_creator_vault_seen_in_observed_tx: diagnostics
+            .working_builder_creator_vault_seen_in_observed_tx,
+        working_builder_creator_vault_readiness_reason: diagnostics
+            .working_builder_creator_vault_readiness_reason,
         working_builder_required_accounts: diagnostics.working_builder_required_accounts,
         working_builder_creatable_accounts: diagnostics.working_builder_creatable_accounts,
         working_builder_ephemeral_accounts: diagnostics.working_builder_ephemeral_accounts,
@@ -11696,15 +11980,38 @@ fn enrich_probe_shadow_entry(
         .clone();
     entry.working_builder_manifest_contains_bcv2 = transport.working_builder_manifest_contains_bcv2;
     entry.working_builder_manifest_source = transport.working_builder_manifest_source.clone();
+    entry.working_builder_bcv2_pubkey = transport.working_builder_bcv2_pubkey.clone();
     entry.working_builder_bcv2_source_authority =
         transport.working_builder_bcv2_source_authority.clone();
     entry.working_builder_bcv2_rpc_load_status =
         transport.working_builder_bcv2_rpc_load_status.clone();
+    entry.working_builder_bcv2_rpc_load_ready = transport.working_builder_bcv2_rpc_load_ready;
+    entry.working_builder_bcv2_seen_in_observed_tx =
+        transport.working_builder_bcv2_seen_in_observed_tx;
+    entry.working_builder_bcv2_seen_in_account_state =
+        transport.working_builder_bcv2_seen_in_account_state;
+    entry.working_builder_bcv2_seen_in_mfs = transport.working_builder_bcv2_seen_in_mfs;
+    entry.working_builder_bcv2_seen_in_diag = transport.working_builder_bcv2_seen_in_diag;
+    entry.working_builder_bcv2_readiness_reason =
+        transport.working_builder_bcv2_readiness_reason.clone();
+    entry.working_builder_creator_vault_pubkey =
+        transport.working_builder_creator_vault_pubkey.clone();
     entry.working_builder_creator_vault_source_authority = transport
         .working_builder_creator_vault_source_authority
         .clone();
     entry.working_builder_creator_vault_rpc_load_status = transport
         .working_builder_creator_vault_rpc_load_status
+        .clone();
+    entry.working_builder_creator_vault_rpc_load_ready =
+        transport.working_builder_creator_vault_rpc_load_ready;
+    entry.working_builder_creator_vault_seen_in_account_state =
+        transport.working_builder_creator_vault_seen_in_account_state;
+    entry.working_builder_creator_vault_seen_in_mfs =
+        transport.working_builder_creator_vault_seen_in_mfs;
+    entry.working_builder_creator_vault_seen_in_observed_tx =
+        transport.working_builder_creator_vault_seen_in_observed_tx;
+    entry.working_builder_creator_vault_readiness_reason = transport
+        .working_builder_creator_vault_readiness_reason
         .clone();
     entry.working_builder_required_accounts = transport.working_builder_required_accounts.clone();
     entry.working_builder_creatable_accounts = transport.working_builder_creatable_accounts.clone();
@@ -15002,6 +15309,10 @@ fn shadow_entry_record_from_event(
             .account_diagnostics
             .working_builder_manifest_source
             .clone(),
+        working_builder_bcv2_pubkey: event
+            .account_diagnostics
+            .working_builder_bcv2_pubkey
+            .clone(),
         working_builder_bcv2_source_authority: event
             .account_diagnostics
             .working_builder_bcv2_source_authority
@@ -15010,6 +15321,29 @@ fn shadow_entry_record_from_event(
             .account_diagnostics
             .working_builder_bcv2_rpc_load_status
             .clone(),
+        working_builder_bcv2_rpc_load_ready: event
+            .account_diagnostics
+            .working_builder_bcv2_rpc_load_ready,
+        working_builder_bcv2_seen_in_observed_tx: event
+            .account_diagnostics
+            .working_builder_bcv2_seen_in_observed_tx,
+        working_builder_bcv2_seen_in_account_state: event
+            .account_diagnostics
+            .working_builder_bcv2_seen_in_account_state,
+        working_builder_bcv2_seen_in_mfs: event
+            .account_diagnostics
+            .working_builder_bcv2_seen_in_mfs,
+        working_builder_bcv2_seen_in_diag: event
+            .account_diagnostics
+            .working_builder_bcv2_seen_in_diag,
+        working_builder_bcv2_readiness_reason: event
+            .account_diagnostics
+            .working_builder_bcv2_readiness_reason
+            .clone(),
+        working_builder_creator_vault_pubkey: event
+            .account_diagnostics
+            .working_builder_creator_vault_pubkey
+            .clone(),
         working_builder_creator_vault_source_authority: event
             .account_diagnostics
             .working_builder_creator_vault_source_authority
@@ -15017,6 +15351,22 @@ fn shadow_entry_record_from_event(
         working_builder_creator_vault_rpc_load_status: event
             .account_diagnostics
             .working_builder_creator_vault_rpc_load_status
+            .clone(),
+        working_builder_creator_vault_rpc_load_ready: event
+            .account_diagnostics
+            .working_builder_creator_vault_rpc_load_ready,
+        working_builder_creator_vault_seen_in_account_state: event
+            .account_diagnostics
+            .working_builder_creator_vault_seen_in_account_state,
+        working_builder_creator_vault_seen_in_mfs: event
+            .account_diagnostics
+            .working_builder_creator_vault_seen_in_mfs,
+        working_builder_creator_vault_seen_in_observed_tx: event
+            .account_diagnostics
+            .working_builder_creator_vault_seen_in_observed_tx,
+        working_builder_creator_vault_readiness_reason: event
+            .account_diagnostics
+            .working_builder_creator_vault_readiness_reason
             .clone(),
         working_builder_required_accounts: event
             .account_diagnostics
@@ -15201,10 +15551,23 @@ fn shadow_entry_record_from_request(
         working_builder_sender_manifest_account_roles: Vec::new(),
         working_builder_manifest_contains_bcv2: None,
         working_builder_manifest_source: None,
+        working_builder_bcv2_pubkey: None,
         working_builder_bcv2_source_authority: None,
         working_builder_bcv2_rpc_load_status: None,
+        working_builder_bcv2_rpc_load_ready: None,
+        working_builder_bcv2_seen_in_observed_tx: None,
+        working_builder_bcv2_seen_in_account_state: None,
+        working_builder_bcv2_seen_in_mfs: None,
+        working_builder_bcv2_seen_in_diag: None,
+        working_builder_bcv2_readiness_reason: None,
+        working_builder_creator_vault_pubkey: None,
         working_builder_creator_vault_source_authority: None,
         working_builder_creator_vault_rpc_load_status: None,
+        working_builder_creator_vault_rpc_load_ready: None,
+        working_builder_creator_vault_seen_in_account_state: None,
+        working_builder_creator_vault_seen_in_mfs: None,
+        working_builder_creator_vault_seen_in_observed_tx: None,
+        working_builder_creator_vault_readiness_reason: None,
         working_builder_required_accounts: Vec::new(),
         working_builder_creatable_accounts: Vec::new(),
         working_builder_ephemeral_accounts: Vec::new(),
@@ -15405,15 +15768,38 @@ fn enrich_active_shadow_entry_with_account_diagnostics(
     entry.working_builder_manifest_contains_bcv2 =
         diagnostics.working_builder_manifest_contains_bcv2;
     entry.working_builder_manifest_source = diagnostics.working_builder_manifest_source.clone();
+    entry.working_builder_bcv2_pubkey = diagnostics.working_builder_bcv2_pubkey.clone();
     entry.working_builder_bcv2_source_authority =
         diagnostics.working_builder_bcv2_source_authority.clone();
     entry.working_builder_bcv2_rpc_load_status =
         diagnostics.working_builder_bcv2_rpc_load_status.clone();
+    entry.working_builder_bcv2_rpc_load_ready = diagnostics.working_builder_bcv2_rpc_load_ready;
+    entry.working_builder_bcv2_seen_in_observed_tx =
+        diagnostics.working_builder_bcv2_seen_in_observed_tx;
+    entry.working_builder_bcv2_seen_in_account_state =
+        diagnostics.working_builder_bcv2_seen_in_account_state;
+    entry.working_builder_bcv2_seen_in_mfs = diagnostics.working_builder_bcv2_seen_in_mfs;
+    entry.working_builder_bcv2_seen_in_diag = diagnostics.working_builder_bcv2_seen_in_diag;
+    entry.working_builder_bcv2_readiness_reason =
+        diagnostics.working_builder_bcv2_readiness_reason.clone();
+    entry.working_builder_creator_vault_pubkey =
+        diagnostics.working_builder_creator_vault_pubkey.clone();
     entry.working_builder_creator_vault_source_authority = diagnostics
         .working_builder_creator_vault_source_authority
         .clone();
     entry.working_builder_creator_vault_rpc_load_status = diagnostics
         .working_builder_creator_vault_rpc_load_status
+        .clone();
+    entry.working_builder_creator_vault_rpc_load_ready =
+        diagnostics.working_builder_creator_vault_rpc_load_ready;
+    entry.working_builder_creator_vault_seen_in_account_state =
+        diagnostics.working_builder_creator_vault_seen_in_account_state;
+    entry.working_builder_creator_vault_seen_in_mfs =
+        diagnostics.working_builder_creator_vault_seen_in_mfs;
+    entry.working_builder_creator_vault_seen_in_observed_tx =
+        diagnostics.working_builder_creator_vault_seen_in_observed_tx;
+    entry.working_builder_creator_vault_readiness_reason = diagnostics
+        .working_builder_creator_vault_readiness_reason
         .clone();
     entry.working_builder_required_accounts = diagnostics.working_builder_required_accounts.clone();
     entry.working_builder_creatable_accounts =
@@ -15920,13 +16306,39 @@ struct ShadowEntryRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     working_builder_manifest_source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_pubkey: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     working_builder_bcv2_source_authority: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     working_builder_bcv2_rpc_load_status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_rpc_load_ready: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_seen_in_observed_tx: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_seen_in_account_state: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_seen_in_mfs: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_seen_in_diag: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_readiness_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_creator_vault_pubkey: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     working_builder_creator_vault_source_authority: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     working_builder_creator_vault_rpc_load_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_creator_vault_rpc_load_ready: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_creator_vault_seen_in_account_state: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_creator_vault_seen_in_mfs: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_creator_vault_seen_in_observed_tx: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_creator_vault_readiness_reason: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     working_builder_required_accounts: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -20555,6 +20967,101 @@ mod tests {
             working.creator_vault_rpc_load_status.as_deref(),
             Some("rpc_load_ready")
         );
+    }
+
+    #[test]
+    fn p37_working_builder_account_source_tracks_bcv2_pubkey_and_readiness_reason() {
+        let request = test_working_builder_prepared_buy_request();
+        let bcv2 = request
+            .account_overrides
+            .bonding_curve_v2
+            .expect("working request bcv2");
+        let bcv2 = bcv2.to_string();
+        let mut diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        diagnostics.manifest_lookup_performed = true;
+
+        let working =
+            p37_working_builder_parity_diagnostics(Some(&request), Some(&diagnostics), true);
+
+        assert_eq!(working.bcv2_pubkey.as_deref(), Some(bcv2.as_str()));
+        assert_eq!(
+            working.bcv2_source_authority.as_deref(),
+            Some("authoritative_observed_tx")
+        );
+        assert_eq!(
+            working.bcv2_rpc_load_status.as_deref(),
+            Some("rpc_load_ready")
+        );
+        assert_eq!(working.bcv2_rpc_load_ready, Some(true));
+        assert_eq!(working.bcv2_seen_in_observed_tx, Some(true));
+        assert_eq!(working.bcv2_seen_in_account_state, Some(false));
+        assert_eq!(working.bcv2_seen_in_mfs, Some(false));
+        assert_eq!(working.bcv2_seen_in_diag, Some(false));
+        assert_eq!(
+            working.bcv2_readiness_reason.as_deref(),
+            Some("load_ready:rpc_load_ready")
+        );
+    }
+
+    #[test]
+    fn p37_working_builder_account_source_tracks_creator_vault_pubkey_and_missing_rpc_reason() {
+        let request = test_working_builder_prepared_buy_request();
+        let mut diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        let creator_vault_entry = diagnostics
+            .manifest
+            .iter()
+            .find(|entry| entry.role == "creator_vault")
+            .expect("working builder manifest creator_vault")
+            .clone();
+        diagnostics.manifest_lookup_performed = true;
+        diagnostics.missing_candidates.push(
+            p37_shadow_probe_account_not_found_candidate_from_entry(&creator_vault_entry),
+        );
+
+        let working =
+            p37_working_builder_parity_diagnostics(Some(&request), Some(&diagnostics), true);
+
+        assert_eq!(
+            working.creator_vault_pubkey.as_deref(),
+            Some(creator_vault_entry.pubkey.as_str())
+        );
+        assert_eq!(
+            working.creator_vault_source_authority.as_deref(),
+            Some("authoritative_detected_pool_creator")
+        );
+        assert_eq!(
+            working.creator_vault_rpc_load_status.as_deref(),
+            Some("missing_on_rpc_precheck")
+        );
+        assert_eq!(working.creator_vault_rpc_load_ready, Some(false));
+        assert_eq!(working.creator_vault_seen_in_account_state, Some(false));
+        assert_eq!(working.creator_vault_seen_in_mfs, Some(false));
+        assert_eq!(working.creator_vault_seen_in_observed_tx, Some(false));
+        assert_eq!(
+            working.creator_vault_readiness_reason.as_deref(),
+            Some("creator_vault_missing_on_rpc")
+        );
+    }
+
+    #[test]
+    fn p37_working_builder_account_source_blocks_non_authoritative_bcv2_source() {
+        let request = test_working_builder_prepared_buy_request();
+        let mut diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        let bcv2_entry = diagnostics
+            .manifest
+            .iter_mut()
+            .find(|entry| entry.role == "bonding_curve_v2")
+            .expect("working builder manifest bcv2");
+        bcv2_entry.source = "route_builder".to_string();
+        diagnostics.manifest_lookup_performed = true;
+
+        let reason = p37_working_builder_final_manifest_failure_reason(&request, &diagnostics)
+            .expect("working manifest must fail closed on non-authoritative bcv2");
+
+        assert!(reason.starts_with(
+            "working_builder_final_manifest_account_source_not_authoritative:bonding_curve_v2:"
+        ));
+        assert!(reason.ends_with(":builder_only"));
     }
 
     #[test]

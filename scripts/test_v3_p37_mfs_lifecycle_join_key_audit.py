@@ -2153,10 +2153,25 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
                     "16:bonding_curve_v2:bcv2:observed_tx_account_meta:required=true"
                 ],
                 "working_builder_missing_required_accounts": [],
+                "working_builder_bcv2_pubkey": "bcv2",
+                "bonding_curve_v2_pubkey": "bcv2",
+                "observed_bcv2_resolved_pubkey": "bcv2",
                 "working_builder_bcv2_source_authority": "authoritative_observed_tx",
                 "working_builder_bcv2_rpc_load_status": "rpc_load_ready",
+                "working_builder_bcv2_rpc_load_ready": True,
+                "working_builder_bcv2_seen_in_observed_tx": True,
+                "working_builder_bcv2_seen_in_account_state": False,
+                "working_builder_bcv2_seen_in_mfs": False,
+                "working_builder_bcv2_seen_in_diag": False,
+                "working_builder_bcv2_readiness_reason": "load_ready:rpc_load_ready",
+                "working_builder_creator_vault_pubkey": "creator-vault",
                 "working_builder_creator_vault_source_authority": "authoritative_detected_pool_creator",
                 "working_builder_creator_vault_rpc_load_status": "rpc_load_ready",
+                "working_builder_creator_vault_rpc_load_ready": True,
+                "working_builder_creator_vault_seen_in_account_state": False,
+                "working_builder_creator_vault_seen_in_mfs": False,
+                "working_builder_creator_vault_seen_in_observed_tx": False,
+                "working_builder_creator_vault_readiness_reason": "load_ready:rpc_load_ready",
             },
             {
                 "working_builder_parity_mode": "working_builder_parity",
@@ -2167,10 +2182,25 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
                 "working_builder_missing_required_accounts": [
                     "bonding_curve_v2:bcv2:observed_tx_account_meta"
                 ],
+                "working_builder_bcv2_pubkey": "bcv2-2",
+                "bonding_curve_v2_pubkey": "bcv2-2",
+                "observed_bcv2_resolved_pubkey": "bcv2-2",
                 "working_builder_bcv2_source_authority": "authoritative_observed_tx",
                 "working_builder_bcv2_rpc_load_status": "missing_on_rpc_precheck",
+                "working_builder_bcv2_rpc_load_ready": False,
+                "working_builder_bcv2_seen_in_observed_tx": True,
+                "working_builder_bcv2_seen_in_account_state": False,
+                "working_builder_bcv2_seen_in_mfs": False,
+                "working_builder_bcv2_seen_in_diag": False,
+                "working_builder_bcv2_readiness_reason": "bonding_curve_v2_observed_meta_missing_on_rpc",
+                "working_builder_creator_vault_pubkey": "creator-vault-2",
                 "working_builder_creator_vault_source_authority": "creator_vault_source_not_authoritative",
                 "working_builder_creator_vault_rpc_load_status": "identity_only_rpc_unverified",
+                "working_builder_creator_vault_rpc_load_ready": False,
+                "working_builder_creator_vault_seen_in_account_state": False,
+                "working_builder_creator_vault_seen_in_mfs": False,
+                "working_builder_creator_vault_seen_in_observed_tx": False,
+                "working_builder_creator_vault_readiness_reason": "creator_vault_source_not_authoritative",
             },
             {
                 "fallback_route_kind": "legacy_buy",
@@ -2213,6 +2243,44 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
             payload["working_builder_creator_vault_rpc_load_status_counts"],
             {"identity_only_rpc_unverified": 1, "rpc_load_ready": 1},
         )
+        self.assertEqual(
+            payload["working_builder_bcv2_authoritative_and_load_ready_rows"], 1
+        )
+        self.assertEqual(
+            payload["working_builder_bcv2_authoritative_but_missing_on_rpc_rows"], 1
+        )
+        self.assertEqual(payload["working_builder_bcv2_pubkey_mismatch_rows"], 0)
+        self.assertEqual(
+            payload["working_builder_bcv2_observed_tx_missing_on_rpc_rows"], 1
+        )
+        self.assertEqual(payload["working_builder_bcv2_account_state_missing_rows"], 2)
+        self.assertEqual(
+            payload[
+                "working_builder_creator_vault_authoritative_and_load_ready_rows"
+            ],
+            1,
+        )
+        self.assertEqual(
+            payload[
+                "working_builder_creator_vault_authoritative_but_missing_on_rpc_rows"
+            ],
+            0,
+        )
+        self.assertEqual(
+            payload["working_builder_creator_vault_source_mismatch_rows"], 1
+        )
+        self.assertEqual(
+            payload[
+                "working_builder_manifest_ready_after_account_source_repair_rows"
+            ],
+            1,
+        )
+        self.assertEqual(
+            payload[
+                "working_builder_manifest_still_not_ready_after_account_source_repair_rows"
+            ],
+            1,
+        )
         self.assertEqual(active_payload["active_shadow_working_builder_parity_rows"], 2)
         self.assertEqual(
             active_payload["active_shadow_working_builder_buy_variant_counts"],
@@ -2223,6 +2291,12 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
             0,
         )
         self.assertEqual(active_payload["active_shadow_legacy_fallback_attempted_rows"], 1)
+        self.assertEqual(
+            active_payload[
+                "active_shadow_working_builder_bcv2_authoritative_but_missing_on_rpc_rows"
+            ],
+            1,
+        )
 
     def test_audit_flags_probe_working_builder_legacy_variant_rows(self) -> None:
         payload = audit.working_builder_parity_payload(
@@ -2257,6 +2331,53 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
 
         self.assertEqual(payload["probe_working_builder_selected_legacy_handoff_rows"], 1)
         self.assertEqual(payload["probe_working_builder_stale_route_diagnostics_rows"], 1)
+
+    def test_audit_flags_x5_account_source_readiness_blockers(self) -> None:
+        payload = audit.working_builder_parity_payload(
+            [
+                {
+                    "working_builder_parity_mode": "working_builder_parity",
+                    "working_builder_request_built": True,
+                    "working_builder_bcv2_pubkey": "bcv2-final",
+                    "bonding_curve_v2_pubkey": "bcv2-stale",
+                    "working_builder_bcv2_source_authority": "authoritative_observed_tx",
+                    "working_builder_bcv2_rpc_load_status": "missing_on_rpc_precheck",
+                    "working_builder_bcv2_rpc_load_ready": False,
+                    "working_builder_bcv2_seen_in_observed_tx": True,
+                    "working_builder_bcv2_seen_in_account_state": False,
+                    "working_builder_creator_vault_source_authority": "authoritative_detected_pool_creator",
+                    "working_builder_creator_vault_rpc_load_status": "missing_on_rpc_precheck",
+                    "working_builder_creator_vault_rpc_load_ready": False,
+                    "working_builder_missing_required_accounts": [
+                        "bonding_curve_v2:bcv2-final:observed_tx_account_meta",
+                        "creator_vault:creator-vault:route_builder",
+                    ],
+                }
+            ]
+        )
+
+        self.assertEqual(payload["working_builder_bcv2_pubkey_mismatch_rows"], 1)
+        self.assertEqual(
+            payload["working_builder_bcv2_observed_tx_missing_on_rpc_rows"], 1
+        )
+        self.assertEqual(
+            payload[
+                "working_builder_creator_vault_authoritative_but_missing_on_rpc_rows"
+            ],
+            1,
+        )
+        self.assertEqual(
+            payload[
+                "working_builder_manifest_ready_after_account_source_repair_rows"
+            ],
+            0,
+        )
+        self.assertEqual(
+            payload[
+                "working_builder_manifest_still_not_ready_after_account_source_repair_rows"
+            ],
+            1,
+        )
 
     def test_audit_blocks_pass_b_when_probe_variant_drift_present(self) -> None:
         report = {
