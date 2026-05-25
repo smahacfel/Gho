@@ -14,17 +14,17 @@ stream_mode = "single_global"
 tx_filter_strategy = "per_pool"
 # PR-6 guardrail: committed future-live profile stays neutral until post-shadow go/no-go.
 funding_lane_mode = "disabled"
-grpc_endpoint = "yellowstone-solana-mainnet.core.chainstack.com:443"
-grpc_x_token = "f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+grpc_endpoint = "${CHAINSTACK_GRPC_ENDPOINT}"
+grpc_x_token = "${CHAINSTACK_GRPC_TOKEN}"
 helius_endpoint = "https://mainnet.helius-rpc.com/?api-key=0ef958d5-c877-47ab-89da-c8a001dd0f12"
-rpc_endpoint = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+rpc_endpoint = "${CHAINSTACK_RPC_URL}"
 enable_pumpfun = true
 enable_bonkfun = false
 enable_raydium = false
 
 [trigger]
 enabled = true
-rpc_url = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+rpc_url = "${CHAINSTACK_RPC_URL}"
 keypair_path = "../../wallets/dual-micro-live-wallet.json"
 entry_mode = "live"
 max_concurrent_positions = 1

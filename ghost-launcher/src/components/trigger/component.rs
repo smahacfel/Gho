@@ -8655,6 +8655,74 @@ mod tests {
     }
 
     #[test]
+    fn e5a_prepared_legacy_buy_final_manifest_still_contains_bcv2() {
+        let config = create_test_config();
+        let trigger =
+            TriggerComponent::new_with_shadow_simulator(config, Arc::new(MockShadowSimulator));
+        let payer = Keypair::new();
+        let mint = Pubkey::new_unique();
+        let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).expect("valid token program");
+        let amount_lamports = trigger
+            .configured_trade_amount_lamports()
+            .expect("configured amount");
+        let curve = BondingCurve {
+            discriminator: 0,
+            virtual_token_reserves: 1_000_000_000_000,
+            virtual_sol_reserves: 30_000_000_000,
+            real_token_reserves: 1_000_000_000_000,
+            real_sol_reserves: 30_000_000_000,
+            token_total_supply: 0,
+            complete: 0,
+            _padding: [0; 7],
+        };
+        let request = trigger
+            .build_prepared_buy_request(
+                &payer,
+                &mint,
+                &token_program,
+                false,
+                &BuyAccountOverrides {
+                    buy_variant: Some(trigger::PumpfunBuyVariant::LegacyBuy),
+                    legacy_buy_curve: Some(curve),
+                    associated_bonding_curve: Some(
+                        DirectBuyBuilder::canonical_associated_bonding_curve(&mint, &token_program),
+                    ),
+                    ..BuyAccountOverrides::default()
+                },
+                amount_lamports,
+                1_000_000,
+                Hash::new_unique(),
+            )
+            .expect("legacy probe request");
+        let build_profile = request.build_profile.as_ref().expect("build profile");
+        let buy_accounts = &build_profile.buy_instruction.accounts;
+
+        assert_eq!(
+            build_profile.buy_variant,
+            trigger::PumpfunBuyVariant::LegacyBuy
+        );
+        assert!(request.account_overrides.bonding_curve_v2.is_none());
+        assert_eq!(buy_accounts.len(), 18);
+        assert_eq!(
+            buy_accounts[16].pubkey,
+            DirectBuyBuilder::derive_bonding_curve_v2(&mint).0
+        );
+        assert_eq!(
+            TriggerComponent::counterfactual_probe_account_role_for(
+                &request,
+                &buy_accounts[16].pubkey,
+            ),
+            "bonding_curve_v2"
+        );
+
+        let required_roles =
+            TriggerComponent::counterfactual_probe_required_account_roles(&request);
+        assert!(!required_roles
+            .iter()
+            .any(|(_, role)| role == "bonding_curve_v2"));
+    }
+
+    #[test]
     fn shadow_retry_happens_only_for_transient_error() {
         assert!(
             crate::components::trigger::shadow_run::RpcShadowSimulator::is_retryable(

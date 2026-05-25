@@ -666,6 +666,63 @@ mod tests {
     }
 
     #[test]
+    fn e5a_legacy_buy_final_manifest_uses_extended_bcv2_layout() {
+        let payer = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).expect("valid token program");
+
+        let ix = DirectBuyBuilder::build_buy_ix_with_accounts(
+            &payer,
+            &mint,
+            &token_program,
+            None,
+            None,
+            None,
+            Some(PumpfunBuyVariant::LegacyBuy),
+            None,
+            2_000_000,
+            42,
+        );
+
+        assert_eq!(&ix.data[0..8], &LEGACY_BUY_DISCRIMINATOR);
+        assert_eq!(ix.data.len(), 24);
+        assert_eq!(ix.accounts.len(), 18);
+        assert_eq!(
+            ix.accounts[16].pubkey,
+            DirectBuyBuilder::derive_bonding_curve_v2(&mint).0
+        );
+        assert_ne!(ix.accounts[3].pubkey, ix.accounts[16].pubkey);
+    }
+
+    #[test]
+    fn e5a_routed_exact_sol_in_final_manifest_uses_bcv2_layout() {
+        let payer = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).expect("valid token program");
+
+        let ix = DirectBuyBuilder::build_buy_ix_with_accounts(
+            &payer,
+            &mint,
+            &token_program,
+            None,
+            None,
+            None,
+            Some(PumpfunBuyVariant::RoutedExactSolIn),
+            None,
+            2_000_000,
+            42,
+        );
+
+        assert_eq!(&ix.data[0..8], &BUY_EXACT_SOL_IN_DISCRIMINATOR);
+        assert_eq!(ix.data.len(), 25);
+        assert_eq!(ix.accounts.len(), 18);
+        assert_eq!(
+            ix.accounts[16].pubkey,
+            DirectBuyBuilder::derive_bonding_curve_v2(&mint).0
+        );
+    }
+
+    #[test]
     fn test_legacy_buy_extended_accounts_match_observed_chain_required_layout() {
         let payer =
             Pubkey::from_str("CMFqYV58y9wk5CwRm7vf8gfeD8yRMxFn2kgv49zHdbkK").expect("valid payer");

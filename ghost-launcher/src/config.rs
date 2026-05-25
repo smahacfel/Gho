@@ -3661,7 +3661,8 @@ fn should_override_secret_value(current: Option<&str>) -> bool {
     }
 
     let lowered = trimmed.to_ascii_lowercase();
-    lowered.contains("example.invalid")
+    is_env_placeholder_secret_value(trimmed)
+        || lowered.contains("example.invalid")
         || lowered.contains("placeholder")
         || lowered.contains("replace-me")
         || lowered == "http://localhost:10000"
@@ -3670,6 +3671,32 @@ fn should_override_secret_value(current: Option<&str>) -> bool {
         || lowered == "127.0.0.1:8899"
         || lowered == "http://localhost:8899"
         || lowered == "localhost:8899"
+}
+
+fn is_env_placeholder_secret_value(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    trimmed.starts_with("${")
+        && trimmed.ends_with('}')
+        && trimmed.len() > 3
+        && trimmed[2..trimmed.len() - 1]
+            .chars()
+            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+}
+
+fn env_placeholder_secret_name(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim();
+    if !is_env_placeholder_secret_value(trimmed) {
+        return None;
+    }
+    Some(&trimmed[2..trimmed.len() - 1])
+}
+
+fn lookup_placeholder_secret_env(
+    current: Option<&str>,
+    secret_env: &LoadedSecretEnv,
+) -> Option<ResolvedSecretValue> {
+    env_placeholder_secret_name(current?)
+        .and_then(|var_name| lookup_secret_env(var_name, secret_env))
 }
 
 fn validate_uuid_v4(raw: &str, field_name: &str) -> Result<(), String> {
@@ -3690,43 +3717,69 @@ fn apply_secret_env_overrides(
     secret_env: &LoadedSecretEnv,
 ) {
     if should_override_secret_value(Some(&config.seer.grpc_endpoint)) {
-        if let Some(value) = lookup_secret_env("GHOST_SEER_GRPC_ENDPOINT", secret_env) {
+        if let Some(value) =
+            lookup_placeholder_secret_env(Some(&config.seer.grpc_endpoint), secret_env)
+                .or_else(|| lookup_secret_env("GHOST_SEER_GRPC_ENDPOINT", secret_env))
+        {
             config.seer.grpc_endpoint = value.value;
         }
     }
     if should_override_secret_value(config.seer.grpc_x_token.as_deref()) {
-        if let Some(value) = lookup_secret_env("GHOST_SEER_GRPC_X_TOKEN", secret_env) {
+        if let Some(value) =
+            lookup_placeholder_secret_env(config.seer.grpc_x_token.as_deref(), secret_env)
+                .or_else(|| lookup_secret_env("GHOST_SEER_GRPC_X_TOKEN", secret_env))
+        {
             config.seer.grpc_x_token = Some(value.value);
         }
     }
     if should_override_secret_value(config.seer.grpc_auth_token.as_deref()) {
-        if let Some(value) = lookup_secret_env("GHOST_SEER_GRPC_AUTH_TOKEN", secret_env) {
+        if let Some(value) =
+            lookup_placeholder_secret_env(config.seer.grpc_auth_token.as_deref(), secret_env)
+                .or_else(|| lookup_secret_env("GHOST_SEER_GRPC_AUTH_TOKEN", secret_env))
+        {
             config.seer.grpc_auth_token = Some(value.value);
         }
     }
     if should_override_secret_value(Some(&config.seer.rpc_endpoint)) {
-        if let Some(value) = lookup_secret_env("GHOST_SEER_RPC_ENDPOINT", secret_env) {
+        if let Some(value) =
+            lookup_placeholder_secret_env(Some(&config.seer.rpc_endpoint), secret_env)
+                .or_else(|| lookup_secret_env("GHOST_SEER_RPC_ENDPOINT", secret_env))
+        {
             config.seer.rpc_endpoint = value.value;
         }
     }
     if should_override_secret_value(config.seer.helius_endpoint.as_deref()) {
-        if let Some(value) = lookup_secret_env("GHOST_SEER_HELIUS_ENDPOINT", secret_env) {
+        if let Some(value) =
+            lookup_placeholder_secret_env(config.seer.helius_endpoint.as_deref(), secret_env)
+                .or_else(|| lookup_secret_env("GHOST_SEER_HELIUS_ENDPOINT", secret_env))
+        {
             config.seer.helius_endpoint = Some(value.value);
         }
     }
     if should_override_secret_value(Some(&config.trigger.rpc_url)) {
-        if let Some(value) = lookup_secret_env("GHOST_TRIGGER_RPC_URL", secret_env) {
+        if let Some(value) =
+            lookup_placeholder_secret_env(Some(&config.trigger.rpc_url), secret_env)
+                .or_else(|| lookup_secret_env("GHOST_TRIGGER_RPC_URL", secret_env))
+        {
             config.trigger.rpc_url = value.value;
         }
     }
     if should_override_secret_value(config.trigger.keypair_path.as_deref()) {
-        if let Some(value) = lookup_secret_env("GHOST_TRIGGER_KEYPAIR_PATH", secret_env) {
+        if let Some(value) =
+            lookup_placeholder_secret_env(config.trigger.keypair_path.as_deref(), secret_env)
+                .or_else(|| lookup_secret_env("GHOST_TRIGGER_KEYPAIR_PATH", secret_env))
+        {
             config.trigger.keypair_path =
                 Some(resolve_secret_path_value(&value, config_dir, secret_env));
         }
     }
     if should_override_secret_value(Some(&config.trigger.shadow_run.shadow_rpc_url)) {
-        if let Some(value) = lookup_secret_env("GHOST_TRIGGER_SHADOW_RPC_URL", secret_env) {
+        if let Some(value) = lookup_placeholder_secret_env(
+            Some(&config.trigger.shadow_run.shadow_rpc_url),
+            secret_env,
+        )
+        .or_else(|| lookup_secret_env("GHOST_TRIGGER_SHADOW_RPC_URL", secret_env))
+        {
             config.trigger.shadow_run.shadow_rpc_url = value.value;
         }
     }
@@ -3842,6 +3895,71 @@ enabled = true
         assert_eq!(
             config.trigger.shadow_run.shadow_rpc_url,
             "https://shadow.example.com/api-key"
+        );
+    }
+
+    #[test]
+    fn test_from_file_resolves_explicit_secret_env_placeholders_from_dotenv() {
+        let base = unique_temp_dir("explicit_secret_env_placeholders");
+        let config_dir = base.join("configs/rollout");
+        fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("chainstack-template.toml");
+
+        fs::write(
+            base.join(".env"),
+            "CHAINSTACK_GRPC_ENDPOINT=yellowstone.example.com:443\n\
+CHAINSTACK_GRPC_TOKEN=env-token\n\
+CHAINSTACK_RPC_URL=https://rpc.example.com/api-key\n",
+        )
+        .unwrap();
+
+        fs::write(
+            &config_path,
+            r#"
+mode = "production"
+
+[seer]
+enabled = true
+source_mode = "grpc"
+grpc_endpoint = "${CHAINSTACK_GRPC_ENDPOINT}"
+grpc_x_token = "${CHAINSTACK_GRPC_TOKEN}"
+rpc_endpoint = "${CHAINSTACK_RPC_URL}"
+
+[trigger]
+enabled = true
+rpc_url = "${CHAINSTACK_RPC_URL}"
+entry_mode = "shadow_only"
+max_concurrent_positions = 1
+max_position_size_sol = 0.005
+emergency_floor_sol = 0.05
+position_size_buffer_sol = 0.02
+
+[trigger.shadow_run]
+enabled = true
+shadow_rpc_url = "${CHAINSTACK_RPC_URL}"
+
+[execution]
+execution_mode = "paper"
+
+[durability]
+wal_dir = "data/wal"
+snapshot_dir = "data/snapshots"
+
+[gui_backend]
+enabled = true
+"#,
+        )
+        .unwrap();
+
+        let config = LauncherConfig::from_file(&config_path).unwrap();
+
+        assert_eq!(config.seer.grpc_endpoint, "yellowstone.example.com:443");
+        assert_eq!(config.effective_grpc_token(), Some("env-token"));
+        assert_eq!(config.seer.rpc_endpoint, "https://rpc.example.com/api-key");
+        assert_eq!(config.trigger.rpc_url, "https://rpc.example.com/api-key");
+        assert_eq!(
+            config.trigger.shadow_run.shadow_rpc_url,
+            "https://rpc.example.com/api-key"
         );
     }
 

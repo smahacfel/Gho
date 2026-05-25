@@ -12,16 +12,16 @@ commitment = "processed"
 stream_mode = "single_global"
 tx_filter_strategy = "per_pool"
 funding_lane_mode = "disabled"
-grpc_endpoint = "yellowstone-solana-mainnet.core.chainstack.com:443"
-grpc_x_token = "f2993325e24cc4aaa8f2d5fdd2b4c6fa"
-rpc_endpoint = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+grpc_endpoint = "${CHAINSTACK_GRPC_ENDPOINT}"
+grpc_x_token = "${CHAINSTACK_GRPC_TOKEN}"
+rpc_endpoint = "${CHAINSTACK_RPC_URL}"
 enable_pumpfun = true
 enable_bonkfun = false
 enable_raydium = false
 
 [trigger]
 enabled = true
-rpc_url = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+rpc_url = "${CHAINSTACK_RPC_URL}"
 entry_mode = "shadow_only"
 max_concurrent_positions = 5
 max_position_size_sol = 0.007
@@ -33,7 +33,7 @@ live_exit_stop_loss_pct = 0.50
 
 [trigger.shadow_run]
 enabled = true
-shadow_rpc_url = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+shadow_rpc_url = "${CHAINSTACK_RPC_URL}"
 payer_strategy = "ephemeral"
 commitment = "processed"
 sig_verify = false

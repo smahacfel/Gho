@@ -37,12 +37,12 @@ reconnect_max_delay_secs = 300
 stats_window_secs = 900
 # Chainstack gRPC Configuration (Wklej dane z panelu Chainstack)
 # Adres BEZ "https://". Format: "nd-xxx-xxx.p2pify.com:443"
-grpc_endpoint = "yellowstone-solana-mainnet.core.chainstack.com:443"
+grpc_endpoint = "${CHAINSTACK_GRPC_ENDPOINT}"
 # Token X (jeśli wymagany, w przeciwnym razie zostaw puste "")
-grpc_x_token = "f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+grpc_x_token = "${CHAINSTACK_GRPC_TOKEN}"
 
 # Szybki RPC (HTTPS) do zapytań Triggera (get_balance, simulate) - Użyj HTTPS z Chainstack Growth
-rpc_endpoint = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+rpc_endpoint = "${CHAINSTACK_RPC_URL}"
 grpc_manual_backfill_enabled = false
 grpc_commitment_fallback_to_websocket = false
 grpc_max_stalls_before_open = 3
@@ -78,7 +78,7 @@ default_profile = "standard"
 [trigger]
 enabled = true
 # Tutaj też wklej HTTPS z Chainstacka (dla spójności)
-rpc_url = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+rpc_url = "${CHAINSTACK_RPC_URL}"
 max_position_size_sol = 0.004
 entry_mode = "shadow_only"
 
@@ -137,7 +137,7 @@ stale_policy = "emit_warning"
 # live_and_shadow entry modes even though canonical proof artifacts live under
 # [execution.shadow].*
 enabled = true
-shadow_rpc_url = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+shadow_rpc_url = "${CHAINSTACK_RPC_URL}"
 commitment = "processed"
 sig_verify = false
 replace_recent_blockhash = true

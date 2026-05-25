@@ -13,8 +13,8 @@ stream_mode = "single_global"
 tx_filter_strategy = "per_pool"
 # PR-6 guardrail: dual stays neutral until canonical shadow burn-in is accepted.
 funding_lane_mode = "disabled"
-grpc_endpoint = "yellowstone-solana-mainnet.core.chainstack.com:443"
-grpc_x_token = "f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+grpc_endpoint = "${CHAINSTACK_GRPC_ENDPOINT}"
+grpc_x_token = "${CHAINSTACK_GRPC_TOKEN}"
 # REQUIRED for real live use: override via GHOST_SEER_HELIUS_ENDPOINT in env/.env.
 # This placeholder must fail preflight/startup until a real Helius RPC URL with API key is supplied.
 helius_endpoint = "replace-me"
@@ -25,7 +25,7 @@ enable_raydium = false
 
 [trigger]
 enabled = true
-rpc_url = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+rpc_url = "${CHAINSTACK_RPC_URL}"
 keypair_path = "../../wallets/dual-micro-live-wallet.json"
 entry_mode = "live_and_shadow"
 max_concurrent_positions = 1

@@ -37,16 +37,16 @@ tx_filter_strategy = "per_pool"
 # For current V3 validation under the single-stream provider constraint, ADR-0130
 # pauses FSC/full-chain bake; use primary-only profiles with funding lane disabled.
 funding_lane_mode = "full_chain"
-grpc_endpoint = "yellowstone-solana-mainnet.core.chainstack.com:443"
-grpc_x_token = "f2993325e24cc4aaa8f2d5fdd2b4c6fa"
-rpc_endpoint = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+grpc_endpoint = "${CHAINSTACK_GRPC_ENDPOINT}"
+grpc_x_token = "${CHAINSTACK_GRPC_TOKEN}"
+rpc_endpoint = "${CHAINSTACK_RPC_URL}"
 enable_pumpfun = true
 enable_bonkfun = false
 enable_raydium = false
 
 [trigger]
 enabled = true
-rpc_url = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+rpc_url = "${CHAINSTACK_RPC_URL}"
 # REQUIRED in production (live/dual): override via GHOST_TRIGGER_KEYPAIR_PATH.
 # This repaired shadow-only rerun uses a launcher-local ephemeral payer so the
 # clean validation lane no longer depends on the live keypair contract.
@@ -68,7 +68,7 @@ live_exit_stop_loss_pct = 0.50  # Updated: hard stop at -12%
 [trigger.shadow_run]
 enabled = true
 # REQUIRED in production: override via GHOST_TRIGGER_SHADOW_RPC_URL.
-shadow_rpc_url = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+shadow_rpc_url = "${CHAINSTACK_RPC_URL}"
 # Read the rollout wallet from [trigger].keypair_path / GHOST_TRIGGER_KEYPAIR_PATH
 # so shadow simulation uses a funded, chain-visible payer account.
 # P5: Ephemeral payer for shadow_only — no live payer dependency (B6).
