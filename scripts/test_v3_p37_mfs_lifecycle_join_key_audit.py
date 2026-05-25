@@ -2164,6 +2164,19 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
                 "working_builder_bcv2_seen_in_mfs": False,
                 "working_builder_bcv2_seen_in_diag": False,
                 "working_builder_bcv2_readiness_reason": "load_ready:rpc_load_ready",
+                "working_builder_bcv2_precheck_pubkey": "bcv2",
+                "working_builder_bcv2_builder_pubkey": "bcv2",
+                "working_builder_bcv2_observed_pubkey": "bcv2",
+                "working_builder_bcv2_pubkey_consistency_status": "builder_observed_precheck_match",
+                "working_builder_bcv2_observed_slot": 100,
+                "working_builder_bcv2_observed_tx_signature": "sig-1",
+                "working_builder_bcv2_precheck_context_slot": 105,
+                "working_builder_bcv2_precheck_commitment": "processed",
+                "working_builder_bcv2_precheck_attempt_count": 1,
+                "working_builder_bcv2_precheck_latency_ms": 7,
+                "working_builder_bcv2_precheck_age_from_observed_slot": 5,
+                "working_builder_bcv2_reconciliation_class": "rpc_ready_but_account_state_missing",
+                "observed_bcv2_loaded_address_source": "static_message_key",
                 "working_builder_creator_vault_pubkey": "creator-vault",
                 "working_builder_creator_vault_source_authority": "authoritative_detected_pool_creator",
                 "working_builder_creator_vault_rpc_load_status": "rpc_load_ready",
@@ -2193,6 +2206,20 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
                 "working_builder_bcv2_seen_in_mfs": False,
                 "working_builder_bcv2_seen_in_diag": False,
                 "working_builder_bcv2_readiness_reason": "bonding_curve_v2_observed_meta_missing_on_rpc",
+                "working_builder_bcv2_precheck_pubkey": "bcv2-2",
+                "working_builder_bcv2_builder_pubkey": "bcv2-2",
+                "working_builder_bcv2_observed_pubkey": "bcv2-2",
+                "working_builder_bcv2_pubkey_consistency_status": "builder_observed_precheck_match",
+                "working_builder_bcv2_observed_slot": 200,
+                "working_builder_bcv2_observed_tx_signature": "sig-2",
+                "working_builder_bcv2_precheck_context_slot": 203,
+                "working_builder_bcv2_precheck_commitment": "processed",
+                "working_builder_bcv2_precheck_attempt_count": 1,
+                "working_builder_bcv2_precheck_latency_ms": 11,
+                "working_builder_bcv2_precheck_age_from_observed_slot": 3,
+                "working_builder_bcv2_rpc_error_class": "account_missing",
+                "working_builder_bcv2_reconciliation_class": "local_state_gap",
+                "observed_bcv2_loaded_address_source": "resolved_transaction_account_keys",
                 "working_builder_creator_vault_pubkey": "creator-vault-2",
                 "working_builder_creator_vault_source_authority": "creator_vault_source_not_authoritative",
                 "working_builder_creator_vault_rpc_load_status": "identity_only_rpc_unverified",
@@ -2231,6 +2258,47 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
         self.assertEqual(
             payload["working_builder_bcv2_rpc_load_status_counts"],
             {"missing_on_rpc_precheck": 1, "rpc_load_ready": 1},
+        )
+        self.assertEqual(
+            payload["working_builder_bcv2_reconciliation_class_counts"],
+            {"local_state_gap": 1, "rpc_ready_but_account_state_missing": 1},
+        )
+        self.assertEqual(
+            payload["working_builder_bcv2_pubkey_consistency_status_counts"],
+            {"builder_observed_precheck_match": 2},
+        )
+        self.assertEqual(
+            payload["working_builder_bcv2_precheck_commitment_counts"],
+            {"processed": 2},
+        )
+        self.assertEqual(
+            payload["working_builder_bcv2_rpc_error_class_counts"],
+            {"account_missing": 1, "missing": 1},
+        )
+        self.assertEqual(
+            payload["working_builder_bcv2_loaded_address_source_counts"],
+            {
+                "resolved_transaction_account_keys": 1,
+                "static_message_key": 1,
+            },
+        )
+        self.assertEqual(
+            payload["working_builder_bcv2_precheck_age_bucket_counts"],
+            {"3_8": 2},
+        )
+        self.assertEqual(payload["working_builder_bcv2_precheck_pubkey_rows"], 2)
+        self.assertEqual(payload["working_builder_bcv2_builder_pubkey_rows"], 2)
+        self.assertEqual(payload["working_builder_bcv2_observed_pubkey_rows"], 2)
+        self.assertEqual(payload["working_builder_bcv2_observed_slot_rows"], 2)
+        self.assertEqual(payload["working_builder_bcv2_observed_tx_signature_rows"], 2)
+        self.assertEqual(payload["working_builder_bcv2_precheck_context_slot_rows"], 2)
+        self.assertEqual(payload["working_builder_bcv2_precheck_attempt_count_rows"], 2)
+        self.assertEqual(payload["working_builder_bcv2_precheck_latency_rows"], 2)
+        self.assertEqual(
+            payload["working_builder_bcv2_precheck_age_from_observed_slot_rows"], 2
+        )
+        self.assertEqual(
+            payload["working_builder_bcv2_loaded_address_source_missing_rows"], 0
         )
         self.assertEqual(
             payload["working_builder_creator_vault_source_authority_counts"],
@@ -2378,6 +2446,75 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
             ],
             1,
         )
+
+    def test_audit_flags_x6_bcv2_reconciliation_counters(self) -> None:
+        payload = audit.working_builder_parity_payload(
+            [
+                {
+                    "working_builder_parity_mode": "working_builder_parity",
+                    "working_builder_request_built": True,
+                    "working_builder_bcv2_pubkey": "bcv2-a",
+                    "working_builder_bcv2_builder_pubkey": "bcv2-a",
+                    "working_builder_bcv2_observed_pubkey": "bcv2-a",
+                    "working_builder_bcv2_precheck_pubkey": "bcv2-a",
+                    "working_builder_bcv2_pubkey_consistency_status": "builder_observed_precheck_match",
+                    "working_builder_bcv2_source_authority": "authoritative_observed_tx",
+                    "working_builder_bcv2_rpc_load_status": "missing_on_rpc_precheck",
+                    "working_builder_bcv2_rpc_load_ready": False,
+                    "working_builder_bcv2_seen_in_observed_tx": True,
+                    "working_builder_bcv2_seen_in_account_state": False,
+                    "working_builder_bcv2_observed_slot": 10,
+                    "working_builder_bcv2_observed_tx_signature": "sig-a",
+                    "working_builder_bcv2_precheck_context_slot": 11,
+                    "working_builder_bcv2_precheck_commitment": "processed",
+                    "working_builder_bcv2_precheck_attempt_count": 1,
+                    "working_builder_bcv2_precheck_latency_ms": 9,
+                    "working_builder_bcv2_precheck_age_from_observed_slot": 1,
+                    "working_builder_bcv2_rpc_error_class": "account_missing",
+                    "working_builder_bcv2_reconciliation_class": "commitment_or_timing_suspected",
+                    "observed_bcv2_loaded_address_source": "resolved_transaction_account_keys",
+                },
+                {
+                    "working_builder_parity_mode": "working_builder_parity",
+                    "working_builder_request_built": True,
+                    "working_builder_bcv2_pubkey": "bcv2-b",
+                    "working_builder_bcv2_builder_pubkey": "bcv2-b",
+                    "working_builder_bcv2_observed_pubkey": "bcv2-c",
+                    "working_builder_bcv2_precheck_pubkey": "bcv2-b",
+                    "working_builder_bcv2_pubkey_consistency_status": "observed_pubkey_mismatch",
+                    "working_builder_bcv2_source_authority": "authoritative_observed_tx",
+                    "working_builder_bcv2_rpc_load_status": "missing_on_rpc_precheck",
+                    "working_builder_bcv2_rpc_load_ready": False,
+                    "working_builder_bcv2_reconciliation_class": "pubkey_mismatch",
+                },
+            ]
+        )
+
+        self.assertEqual(
+            payload["working_builder_bcv2_reconciliation_class_counts"],
+            {"commitment_or_timing_suspected": 1, "pubkey_mismatch": 1},
+        )
+        self.assertEqual(
+            payload["working_builder_bcv2_pubkey_consistency_status_counts"],
+            {
+                "builder_observed_precheck_match": 1,
+                "observed_pubkey_mismatch": 1,
+            },
+        )
+        self.assertEqual(
+            payload["working_builder_bcv2_precheck_age_bucket_counts"],
+            {"1_2": 1, "missing": 1},
+        )
+        self.assertEqual(
+            payload["working_builder_bcv2_loaded_address_source_counts"],
+            {"missing": 1, "resolved_transaction_account_keys": 1},
+        )
+        self.assertEqual(
+            payload["working_builder_bcv2_loaded_address_source_missing_rows"], 1
+        )
+        self.assertEqual(payload["working_builder_bcv2_precheck_context_slot_rows"], 1)
+        self.assertEqual(payload["working_builder_bcv2_precheck_attempt_count_rows"], 1)
+        self.assertEqual(payload["working_builder_bcv2_precheck_latency_rows"], 1)
 
     def test_audit_blocks_pass_b_when_probe_variant_drift_present(self) -> None:
         report = {

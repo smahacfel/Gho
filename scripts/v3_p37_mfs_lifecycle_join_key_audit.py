@@ -12,7 +12,7 @@ from typing import Any, Iterable
 from shadow_run_report import load_toml, resolve_config_path, resolve_runtime_path
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 DECISION_FILE_NAMES = ("gatekeeper_v2_decisions.jsonl", "gatekeeper_v2_buys.jsonl")
 FIELD_GROUPS = {
     "ab_record_id": ("ab_record_id",),
@@ -490,6 +490,16 @@ def row_bool_string(row: dict[str, Any], field: str) -> str | None:
     return str(value).lower()
 
 
+def row_int(row: dict[str, Any], field: str) -> int | None:
+    value = row.get(field)
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def is_account_not_found_row(row: dict[str, Any]) -> bool:
     kind = row_string(row, "simulation_error_kind")
     category = row_string(row, "simulation_error_category")
@@ -544,6 +554,22 @@ def row_has_legacy_route_diagnostics(row: dict[str, Any]) -> bool:
     return any(row_string(row, field) is not None for field in scalar_fields) or any(
         row_string_list(row, field) for field in vector_fields
     )
+
+
+def slot_age_bucket(value: int | None) -> str:
+    if value is None:
+        return "missing"
+    if value < 0:
+        return "negative"
+    if value == 0:
+        return "0"
+    if value <= 2:
+        return "1_2"
+    if value <= 8:
+        return "3_8"
+    if value <= 32:
+        return "9_32"
+    return "gt_32"
 
 
 def fallback_failure_class_for_row(row: dict[str, Any]) -> str:
@@ -841,6 +867,84 @@ def working_builder_parity_payload(
         row_string(row, "working_builder_bcv2_rpc_load_status") or "missing"
         for row in parity_rows
     )
+    bcv2_reconciliation_class_counts = Counter(
+        row_string(row, "working_builder_bcv2_reconciliation_class") or "missing"
+        for row in parity_rows
+    )
+    bcv2_pubkey_consistency_status_counts = Counter(
+        row_string(row, "working_builder_bcv2_pubkey_consistency_status") or "missing"
+        for row in parity_rows
+    )
+    bcv2_precheck_commitment_counts = Counter(
+        row_string(row, "working_builder_bcv2_precheck_commitment") or "missing"
+        for row in parity_rows
+    )
+    bcv2_rpc_error_class_counts = Counter(
+        row_string(row, "working_builder_bcv2_rpc_error_class") or "missing"
+        for row in parity_rows
+    )
+    bcv2_loaded_address_source_counts = Counter(
+        row_string(row, "observed_bcv2_loaded_address_source") or "missing"
+        for row in parity_rows
+    )
+    bcv2_precheck_age_bucket_counts = Counter(
+        slot_age_bucket(
+            row_int(row, "working_builder_bcv2_precheck_age_from_observed_slot")
+        )
+        for row in parity_rows
+    )
+    bcv2_precheck_pubkey_rows = [
+        row
+        for row in parity_rows
+        if row_string(row, "working_builder_bcv2_precheck_pubkey") is not None
+    ]
+    bcv2_builder_pubkey_rows = [
+        row
+        for row in parity_rows
+        if row_string(row, "working_builder_bcv2_builder_pubkey") is not None
+    ]
+    bcv2_observed_pubkey_rows = [
+        row
+        for row in parity_rows
+        if row_string(row, "working_builder_bcv2_observed_pubkey") is not None
+    ]
+    bcv2_observed_slot_rows = [
+        row
+        for row in parity_rows
+        if row_int(row, "working_builder_bcv2_observed_slot") is not None
+    ]
+    bcv2_observed_tx_signature_rows = [
+        row
+        for row in parity_rows
+        if row_string(row, "working_builder_bcv2_observed_tx_signature") is not None
+    ]
+    bcv2_precheck_context_slot_rows = [
+        row
+        for row in parity_rows
+        if row_int(row, "working_builder_bcv2_precheck_context_slot") is not None
+    ]
+    bcv2_precheck_attempt_count_rows = [
+        row
+        for row in parity_rows
+        if row_int(row, "working_builder_bcv2_precheck_attempt_count") is not None
+    ]
+    bcv2_precheck_latency_rows = [
+        row
+        for row in parity_rows
+        if row_int(row, "working_builder_bcv2_precheck_latency_ms") is not None
+    ]
+    bcv2_precheck_age_from_observed_slot_rows = [
+        row
+        for row in parity_rows
+        if row_int(row, "working_builder_bcv2_precheck_age_from_observed_slot")
+        is not None
+    ]
+    bcv2_loaded_address_source_missing_rows = [
+        row
+        for row in parity_rows
+        if row_string(row, "working_builder_bcv2_observed_pubkey") is not None
+        and row_string(row, "observed_bcv2_loaded_address_source") is None
+    ]
     creator_vault_source_authority_counts = Counter(
         row_string(row, "working_builder_creator_vault_source_authority") or "missing"
         for row in parity_rows
@@ -985,6 +1089,54 @@ def working_builder_parity_payload(
         ),
         f"{prefix}working_builder_bcv2_rpc_load_status_counts": dict(
             sorted(bcv2_rpc_load_status_counts.items())
+        ),
+        f"{prefix}working_builder_bcv2_reconciliation_class_counts": dict(
+            sorted(bcv2_reconciliation_class_counts.items())
+        ),
+        f"{prefix}working_builder_bcv2_pubkey_consistency_status_counts": dict(
+            sorted(bcv2_pubkey_consistency_status_counts.items())
+        ),
+        f"{prefix}working_builder_bcv2_precheck_commitment_counts": dict(
+            sorted(bcv2_precheck_commitment_counts.items())
+        ),
+        f"{prefix}working_builder_bcv2_rpc_error_class_counts": dict(
+            sorted(bcv2_rpc_error_class_counts.items())
+        ),
+        f"{prefix}working_builder_bcv2_loaded_address_source_counts": dict(
+            sorted(bcv2_loaded_address_source_counts.items())
+        ),
+        f"{prefix}working_builder_bcv2_precheck_age_bucket_counts": dict(
+            sorted(bcv2_precheck_age_bucket_counts.items())
+        ),
+        f"{prefix}working_builder_bcv2_precheck_pubkey_rows": len(
+            bcv2_precheck_pubkey_rows
+        ),
+        f"{prefix}working_builder_bcv2_builder_pubkey_rows": len(
+            bcv2_builder_pubkey_rows
+        ),
+        f"{prefix}working_builder_bcv2_observed_pubkey_rows": len(
+            bcv2_observed_pubkey_rows
+        ),
+        f"{prefix}working_builder_bcv2_observed_slot_rows": len(
+            bcv2_observed_slot_rows
+        ),
+        f"{prefix}working_builder_bcv2_observed_tx_signature_rows": len(
+            bcv2_observed_tx_signature_rows
+        ),
+        f"{prefix}working_builder_bcv2_precheck_context_slot_rows": len(
+            bcv2_precheck_context_slot_rows
+        ),
+        f"{prefix}working_builder_bcv2_precheck_attempt_count_rows": len(
+            bcv2_precheck_attempt_count_rows
+        ),
+        f"{prefix}working_builder_bcv2_precheck_latency_rows": len(
+            bcv2_precheck_latency_rows
+        ),
+        f"{prefix}working_builder_bcv2_precheck_age_from_observed_slot_rows": len(
+            bcv2_precheck_age_from_observed_slot_rows
+        ),
+        f"{prefix}working_builder_bcv2_loaded_address_source_missing_rows": len(
+            bcv2_loaded_address_source_missing_rows
         ),
         f"{prefix}working_builder_creator_vault_source_authority_counts": dict(
             sorted(creator_vault_source_authority_counts.items())
@@ -3734,6 +3886,22 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- active_shadow_working_builder_manifest_contains_bcv2_rows: `{active_shadow['active_shadow_working_builder_manifest_contains_bcv2_rows']}`",
             f"- active_shadow_working_builder_bcv2_source_authority_counts: `{json.dumps(active_shadow['active_shadow_working_builder_bcv2_source_authority_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- active_shadow_working_builder_bcv2_rpc_load_status_counts: `{json.dumps(active_shadow['active_shadow_working_builder_bcv2_rpc_load_status_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_working_builder_bcv2_reconciliation_class_counts: `{json.dumps(active_shadow['active_shadow_working_builder_bcv2_reconciliation_class_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_working_builder_bcv2_pubkey_consistency_status_counts: `{json.dumps(active_shadow['active_shadow_working_builder_bcv2_pubkey_consistency_status_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_working_builder_bcv2_precheck_commitment_counts: `{json.dumps(active_shadow['active_shadow_working_builder_bcv2_precheck_commitment_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_working_builder_bcv2_rpc_error_class_counts: `{json.dumps(active_shadow['active_shadow_working_builder_bcv2_rpc_error_class_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_working_builder_bcv2_loaded_address_source_counts: `{json.dumps(active_shadow['active_shadow_working_builder_bcv2_loaded_address_source_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_working_builder_bcv2_precheck_age_bucket_counts: `{json.dumps(active_shadow['active_shadow_working_builder_bcv2_precheck_age_bucket_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_working_builder_bcv2_precheck_pubkey_rows: `{active_shadow['active_shadow_working_builder_bcv2_precheck_pubkey_rows']}`",
+            f"- active_shadow_working_builder_bcv2_builder_pubkey_rows: `{active_shadow['active_shadow_working_builder_bcv2_builder_pubkey_rows']}`",
+            f"- active_shadow_working_builder_bcv2_observed_pubkey_rows: `{active_shadow['active_shadow_working_builder_bcv2_observed_pubkey_rows']}`",
+            f"- active_shadow_working_builder_bcv2_observed_slot_rows: `{active_shadow['active_shadow_working_builder_bcv2_observed_slot_rows']}`",
+            f"- active_shadow_working_builder_bcv2_observed_tx_signature_rows: `{active_shadow['active_shadow_working_builder_bcv2_observed_tx_signature_rows']}`",
+            f"- active_shadow_working_builder_bcv2_precheck_context_slot_rows: `{active_shadow['active_shadow_working_builder_bcv2_precheck_context_slot_rows']}`",
+            f"- active_shadow_working_builder_bcv2_precheck_attempt_count_rows: `{active_shadow['active_shadow_working_builder_bcv2_precheck_attempt_count_rows']}`",
+            f"- active_shadow_working_builder_bcv2_precheck_latency_rows: `{active_shadow['active_shadow_working_builder_bcv2_precheck_latency_rows']}`",
+            f"- active_shadow_working_builder_bcv2_precheck_age_from_observed_slot_rows: `{active_shadow['active_shadow_working_builder_bcv2_precheck_age_from_observed_slot_rows']}`",
+            f"- active_shadow_working_builder_bcv2_loaded_address_source_missing_rows: `{active_shadow['active_shadow_working_builder_bcv2_loaded_address_source_missing_rows']}`",
             f"- active_shadow_working_builder_creator_vault_source_authority_counts: `{json.dumps(active_shadow['active_shadow_working_builder_creator_vault_source_authority_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- active_shadow_working_builder_creator_vault_rpc_load_status_counts: `{json.dumps(active_shadow['active_shadow_working_builder_creator_vault_rpc_load_status_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- active_shadow_working_builder_bcv2_authoritative_and_load_ready_rows: `{active_shadow['active_shadow_working_builder_bcv2_authoritative_and_load_ready_rows']}`",
@@ -3883,6 +4051,22 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- working_builder_manifest_contains_bcv2_rows: `{materialization['working_builder_manifest_contains_bcv2_rows']}`",
             f"- working_builder_bcv2_source_authority_counts: `{json.dumps(materialization['working_builder_bcv2_source_authority_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- working_builder_bcv2_rpc_load_status_counts: `{json.dumps(materialization['working_builder_bcv2_rpc_load_status_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- working_builder_bcv2_reconciliation_class_counts: `{json.dumps(materialization['working_builder_bcv2_reconciliation_class_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- working_builder_bcv2_pubkey_consistency_status_counts: `{json.dumps(materialization['working_builder_bcv2_pubkey_consistency_status_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- working_builder_bcv2_precheck_commitment_counts: `{json.dumps(materialization['working_builder_bcv2_precheck_commitment_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- working_builder_bcv2_rpc_error_class_counts: `{json.dumps(materialization['working_builder_bcv2_rpc_error_class_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- working_builder_bcv2_loaded_address_source_counts: `{json.dumps(materialization['working_builder_bcv2_loaded_address_source_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- working_builder_bcv2_precheck_age_bucket_counts: `{json.dumps(materialization['working_builder_bcv2_precheck_age_bucket_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- working_builder_bcv2_precheck_pubkey_rows: `{materialization['working_builder_bcv2_precheck_pubkey_rows']}`",
+            f"- working_builder_bcv2_builder_pubkey_rows: `{materialization['working_builder_bcv2_builder_pubkey_rows']}`",
+            f"- working_builder_bcv2_observed_pubkey_rows: `{materialization['working_builder_bcv2_observed_pubkey_rows']}`",
+            f"- working_builder_bcv2_observed_slot_rows: `{materialization['working_builder_bcv2_observed_slot_rows']}`",
+            f"- working_builder_bcv2_observed_tx_signature_rows: `{materialization['working_builder_bcv2_observed_tx_signature_rows']}`",
+            f"- working_builder_bcv2_precheck_context_slot_rows: `{materialization['working_builder_bcv2_precheck_context_slot_rows']}`",
+            f"- working_builder_bcv2_precheck_attempt_count_rows: `{materialization['working_builder_bcv2_precheck_attempt_count_rows']}`",
+            f"- working_builder_bcv2_precheck_latency_rows: `{materialization['working_builder_bcv2_precheck_latency_rows']}`",
+            f"- working_builder_bcv2_precheck_age_from_observed_slot_rows: `{materialization['working_builder_bcv2_precheck_age_from_observed_slot_rows']}`",
+            f"- working_builder_bcv2_loaded_address_source_missing_rows: `{materialization['working_builder_bcv2_loaded_address_source_missing_rows']}`",
             f"- working_builder_creator_vault_source_authority_counts: `{json.dumps(materialization['working_builder_creator_vault_source_authority_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- working_builder_creator_vault_rpc_load_status_counts: `{json.dumps(materialization['working_builder_creator_vault_rpc_load_status_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- working_builder_bcv2_authoritative_and_load_ready_rows: `{materialization['working_builder_bcv2_authoritative_and_load_ready_rows']}`",

@@ -308,6 +308,32 @@ pub struct ShadowSimulationAccountDiagnostics {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_builder_bcv2_readiness_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_precheck_pubkey: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_builder_pubkey: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_observed_pubkey: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_pubkey_consistency_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_observed_slot: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_observed_tx_signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_precheck_context_slot: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_precheck_commitment: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_precheck_attempt_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_precheck_latency_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_precheck_age_from_observed_slot: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_rpc_error_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_reconciliation_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_builder_creator_vault_pubkey: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_builder_creator_vault_source_authority: Option<String>,

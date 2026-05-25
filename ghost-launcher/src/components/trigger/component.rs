@@ -386,6 +386,19 @@ pub(crate) struct CounterfactualProbeMissingAccount {
     pub role: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CounterfactualProbeManifestAccountCheck {
+    pub pubkey: Pubkey,
+    pub role: String,
+    pub rpc_load_status: String,
+    pub rpc_load_ready: bool,
+    pub commitment: String,
+    pub context_slot: Option<u64>,
+    pub attempt_count: u64,
+    pub latency_ms: u64,
+    pub rpc_error_class: Option<String>,
+}
+
 pub struct PendingShadowSimulation {
     pub request: PreparedBuyRequest,
     pub handle: tokio::task::JoinHandle<Result<super::shadow_run::ShadowBuySimulationReport>>,
@@ -4623,26 +4636,68 @@ impl TriggerComponent {
         &self,
         accounts: &[(Pubkey, String)],
     ) -> Result<Vec<CounterfactualProbeMissingAccount>> {
+        Ok(self
+            .counterfactual_probe_manifest_account_checks(accounts)
+            .await?
+            .into_iter()
+            .filter(|check| !check.rpc_load_ready)
+            .map(|check| CounterfactualProbeMissingAccount {
+                pubkey: check.pubkey,
+                role: check.role,
+            })
+            .collect())
+    }
+
+    pub(crate) async fn counterfactual_probe_manifest_account_checks(
+        &self,
+        accounts: &[(Pubkey, String)],
+    ) -> Result<Vec<CounterfactualProbeManifestAccountCheck>> {
         let rpc = self.preparation_rpc();
-        let mut missing = Vec::new();
+        let commitment = CommitmentConfig::processed();
+        let commitment_label = "processed".to_string();
+        let mut checks = Vec::new();
         let mut seen = HashSet::new();
         for (pubkey, role) in accounts {
             if !seen.insert(*pubkey) {
                 continue;
             }
-            match rpc
-                .get_account_with_commitment(pubkey, CommitmentConfig::processed())
-                .await
-            {
-                Ok(response) if response.value.is_some() => {}
-                Ok(_) => missing.push(CounterfactualProbeMissingAccount {
-                    pubkey: *pubkey,
-                    role: role.clone(),
-                }),
-                Err(err) if Self::is_account_not_found_error(&err) => {
-                    missing.push(CounterfactualProbeMissingAccount {
+            let started = Instant::now();
+            match rpc.get_account_with_commitment(pubkey, commitment).await {
+                Ok(response) if response.value.is_some() => {
+                    checks.push(CounterfactualProbeManifestAccountCheck {
                         pubkey: *pubkey,
                         role: role.clone(),
+                        rpc_load_status: "rpc_load_ready".to_string(),
+                        rpc_load_ready: true,
+                        commitment: commitment_label.clone(),
+                        context_slot: Some(response.context.slot),
+                        attempt_count: 1,
+                        latency_ms: started.elapsed().as_millis() as u64,
+                        rpc_error_class: None,
+                    });
+                }
+                Ok(response) => checks.push(CounterfactualProbeManifestAccountCheck {
+                    pubkey: *pubkey,
+                    role: role.clone(),
+                    rpc_load_status: "missing_on_rpc_precheck".to_string(),
+                    rpc_load_ready: false,
+                    commitment: commitment_label.clone(),
+                    context_slot: Some(response.context.slot),
+                    attempt_count: 1,
+                    latency_ms: started.elapsed().as_millis() as u64,
+                    rpc_error_class: Some("account_missing".to_string()),
+                }),
+                Err(err) if Self::is_account_not_found_error(&err) => {
+                    checks.push(CounterfactualProbeManifestAccountCheck {
+                        pubkey: *pubkey,
+                        role: role.clone(),
+                        rpc_load_status: "missing_on_rpc_precheck".to_string(),
+                        rpc_load_ready: false,
+                        commitment: commitment_label.clone(),
+                        context_slot: None,
+                        attempt_count: 1,
+                        latency_ms: started.elapsed().as_millis() as u64,
+                        rpc_error_class: Some("account_not_found_error".to_string()),
                     });
                 }
                 Err(err) => {
@@ -4655,7 +4710,7 @@ impl TriggerComponent {
                 }
             }
         }
-        Ok(missing)
+        Ok(checks)
     }
 
     pub fn spawn_shadow_simulation(&self, request: PreparedBuyRequest) -> PendingShadowSimulation {

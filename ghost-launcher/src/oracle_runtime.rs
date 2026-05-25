@@ -5092,6 +5092,19 @@ struct P37ShadowProbeSelectionRecord {
     working_builder_bcv2_seen_in_mfs: Option<bool>,
     working_builder_bcv2_seen_in_diag: Option<bool>,
     working_builder_bcv2_readiness_reason: Option<String>,
+    working_builder_bcv2_precheck_pubkey: Option<String>,
+    working_builder_bcv2_builder_pubkey: Option<String>,
+    working_builder_bcv2_observed_pubkey: Option<String>,
+    working_builder_bcv2_pubkey_consistency_status: Option<String>,
+    working_builder_bcv2_observed_slot: Option<u64>,
+    working_builder_bcv2_observed_tx_signature: Option<String>,
+    working_builder_bcv2_precheck_context_slot: Option<u64>,
+    working_builder_bcv2_precheck_commitment: Option<String>,
+    working_builder_bcv2_precheck_attempt_count: Option<u64>,
+    working_builder_bcv2_precheck_latency_ms: Option<u64>,
+    working_builder_bcv2_precheck_age_from_observed_slot: Option<i64>,
+    working_builder_bcv2_rpc_error_class: Option<String>,
+    working_builder_bcv2_reconciliation_class: Option<String>,
     working_builder_creator_vault_pubkey: Option<String>,
     working_builder_creator_vault_source_authority: Option<String>,
     working_builder_creator_vault_rpc_load_status: Option<String>,
@@ -5258,6 +5271,19 @@ struct P37ShadowProbeTransportRecord {
     working_builder_bcv2_seen_in_mfs: Option<bool>,
     working_builder_bcv2_seen_in_diag: Option<bool>,
     working_builder_bcv2_readiness_reason: Option<String>,
+    working_builder_bcv2_precheck_pubkey: Option<String>,
+    working_builder_bcv2_builder_pubkey: Option<String>,
+    working_builder_bcv2_observed_pubkey: Option<String>,
+    working_builder_bcv2_pubkey_consistency_status: Option<String>,
+    working_builder_bcv2_observed_slot: Option<u64>,
+    working_builder_bcv2_observed_tx_signature: Option<String>,
+    working_builder_bcv2_precheck_context_slot: Option<u64>,
+    working_builder_bcv2_precheck_commitment: Option<String>,
+    working_builder_bcv2_precheck_attempt_count: Option<u64>,
+    working_builder_bcv2_precheck_latency_ms: Option<u64>,
+    working_builder_bcv2_precheck_age_from_observed_slot: Option<i64>,
+    working_builder_bcv2_rpc_error_class: Option<String>,
+    working_builder_bcv2_reconciliation_class: Option<String>,
     working_builder_creator_vault_pubkey: Option<String>,
     working_builder_creator_vault_source_authority: Option<String>,
     working_builder_creator_vault_rpc_load_status: Option<String>,
@@ -5723,6 +5749,19 @@ fn p37_shadow_probe_selection_record(
         working_builder_bcv2_seen_in_mfs: None,
         working_builder_bcv2_seen_in_diag: None,
         working_builder_bcv2_readiness_reason: None,
+        working_builder_bcv2_precheck_pubkey: None,
+        working_builder_bcv2_builder_pubkey: None,
+        working_builder_bcv2_observed_pubkey: None,
+        working_builder_bcv2_pubkey_consistency_status: None,
+        working_builder_bcv2_observed_slot: None,
+        working_builder_bcv2_observed_tx_signature: None,
+        working_builder_bcv2_precheck_context_slot: None,
+        working_builder_bcv2_precheck_commitment: None,
+        working_builder_bcv2_precheck_attempt_count: None,
+        working_builder_bcv2_precheck_latency_ms: None,
+        working_builder_bcv2_precheck_age_from_observed_slot: None,
+        working_builder_bcv2_rpc_error_class: None,
+        working_builder_bcv2_reconciliation_class: None,
         working_builder_creator_vault_pubkey: None,
         working_builder_creator_vault_source_authority: None,
         working_builder_creator_vault_rpc_load_status: None,
@@ -5967,6 +6006,30 @@ fn p37_shadow_probe_artifact_records(
         working_builder_bcv2_seen_in_mfs: record.working_builder_bcv2_seen_in_mfs,
         working_builder_bcv2_seen_in_diag: record.working_builder_bcv2_seen_in_diag,
         working_builder_bcv2_readiness_reason: record.working_builder_bcv2_readiness_reason.clone(),
+        working_builder_bcv2_precheck_pubkey: record.working_builder_bcv2_precheck_pubkey.clone(),
+        working_builder_bcv2_builder_pubkey: record.working_builder_bcv2_builder_pubkey.clone(),
+        working_builder_bcv2_observed_pubkey: record.working_builder_bcv2_observed_pubkey.clone(),
+        working_builder_bcv2_pubkey_consistency_status: record
+            .working_builder_bcv2_pubkey_consistency_status
+            .clone(),
+        working_builder_bcv2_observed_slot: record.working_builder_bcv2_observed_slot,
+        working_builder_bcv2_observed_tx_signature: record
+            .working_builder_bcv2_observed_tx_signature
+            .clone(),
+        working_builder_bcv2_precheck_context_slot: record
+            .working_builder_bcv2_precheck_context_slot,
+        working_builder_bcv2_precheck_commitment: record
+            .working_builder_bcv2_precheck_commitment
+            .clone(),
+        working_builder_bcv2_precheck_attempt_count: record
+            .working_builder_bcv2_precheck_attempt_count,
+        working_builder_bcv2_precheck_latency_ms: record.working_builder_bcv2_precheck_latency_ms,
+        working_builder_bcv2_precheck_age_from_observed_slot: record
+            .working_builder_bcv2_precheck_age_from_observed_slot,
+        working_builder_bcv2_rpc_error_class: record.working_builder_bcv2_rpc_error_class.clone(),
+        working_builder_bcv2_reconciliation_class: record
+            .working_builder_bcv2_reconciliation_class
+            .clone(),
         working_builder_creator_vault_pubkey: record.working_builder_creator_vault_pubkey.clone(),
         working_builder_creator_vault_source_authority: record
             .working_builder_creator_vault_source_authority
@@ -6188,6 +6251,30 @@ fn p37_shadow_probe_artifact_records(
         working_builder_bcv2_seen_in_mfs: record.working_builder_bcv2_seen_in_mfs,
         working_builder_bcv2_seen_in_diag: record.working_builder_bcv2_seen_in_diag,
         working_builder_bcv2_readiness_reason: record.working_builder_bcv2_readiness_reason.clone(),
+        working_builder_bcv2_precheck_pubkey: record.working_builder_bcv2_precheck_pubkey.clone(),
+        working_builder_bcv2_builder_pubkey: record.working_builder_bcv2_builder_pubkey.clone(),
+        working_builder_bcv2_observed_pubkey: record.working_builder_bcv2_observed_pubkey.clone(),
+        working_builder_bcv2_pubkey_consistency_status: record
+            .working_builder_bcv2_pubkey_consistency_status
+            .clone(),
+        working_builder_bcv2_observed_slot: record.working_builder_bcv2_observed_slot,
+        working_builder_bcv2_observed_tx_signature: record
+            .working_builder_bcv2_observed_tx_signature
+            .clone(),
+        working_builder_bcv2_precheck_context_slot: record
+            .working_builder_bcv2_precheck_context_slot,
+        working_builder_bcv2_precheck_commitment: record
+            .working_builder_bcv2_precheck_commitment
+            .clone(),
+        working_builder_bcv2_precheck_attempt_count: record
+            .working_builder_bcv2_precheck_attempt_count,
+        working_builder_bcv2_precheck_latency_ms: record.working_builder_bcv2_precheck_latency_ms,
+        working_builder_bcv2_precheck_age_from_observed_slot: record
+            .working_builder_bcv2_precheck_age_from_observed_slot,
+        working_builder_bcv2_rpc_error_class: record.working_builder_bcv2_rpc_error_class.clone(),
+        working_builder_bcv2_reconciliation_class: record
+            .working_builder_bcv2_reconciliation_class
+            .clone(),
         working_builder_creator_vault_pubkey: record.working_builder_creator_vault_pubkey.clone(),
         working_builder_creator_vault_source_authority: record
             .working_builder_creator_vault_source_authority
@@ -7690,6 +7777,20 @@ struct P37ShadowProbeAccountManifestEntry {
     observed_bcv2_meta_err: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     observed_bcv2_provenance_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    precheck_rpc_load_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    precheck_rpc_load_ready: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    precheck_commitment: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    precheck_context_slot: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    precheck_attempt_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    precheck_latency_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    precheck_rpc_error_class: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Default)]
@@ -7834,6 +7935,19 @@ struct P37ShadowProbeExecutionDiagnostics {
     working_builder_bcv2_seen_in_mfs: Option<bool>,
     working_builder_bcv2_seen_in_diag: Option<bool>,
     working_builder_bcv2_readiness_reason: Option<String>,
+    working_builder_bcv2_precheck_pubkey: Option<String>,
+    working_builder_bcv2_builder_pubkey: Option<String>,
+    working_builder_bcv2_observed_pubkey: Option<String>,
+    working_builder_bcv2_pubkey_consistency_status: Option<String>,
+    working_builder_bcv2_observed_slot: Option<u64>,
+    working_builder_bcv2_observed_tx_signature: Option<String>,
+    working_builder_bcv2_precheck_context_slot: Option<u64>,
+    working_builder_bcv2_precheck_commitment: Option<String>,
+    working_builder_bcv2_precheck_attempt_count: Option<u64>,
+    working_builder_bcv2_precheck_latency_ms: Option<u64>,
+    working_builder_bcv2_precheck_age_from_observed_slot: Option<i64>,
+    working_builder_bcv2_rpc_error_class: Option<String>,
+    working_builder_bcv2_reconciliation_class: Option<String>,
     working_builder_creator_vault_pubkey: Option<String>,
     working_builder_creator_vault_source_authority: Option<String>,
     working_builder_creator_vault_rpc_load_status: Option<String>,
@@ -8618,6 +8732,13 @@ fn p37_shadow_probe_account_manifest(
                     .and_then(|value| value.meta_err.clone()),
                 observed_bcv2_provenance_status: observed_bcv2_provenance
                     .and_then(|value| value.provenance_status.clone()),
+                precheck_rpc_load_status: None,
+                precheck_rpc_load_ready: None,
+                precheck_commitment: None,
+                precheck_context_slot: None,
+                precheck_attempt_count: None,
+                precheck_latency_ms: None,
+                precheck_rpc_error_class: None,
             }
         })
         .collect()
@@ -8724,13 +8845,14 @@ async fn p37_shadow_probe_account_set_diagnostics(
 
     diagnostics.manifest_lookup_performed = true;
     match trigger_component
-        .counterfactual_probe_missing_manifest_accounts(&manifest_accounts)
+        .counterfactual_probe_manifest_account_checks(&manifest_accounts)
         .await
     {
-        Ok(missing) => {
-            let missing_pubkeys: HashSet<String> = missing
+        Ok(checks) => {
+            let missing_pubkeys: HashSet<String> = checks
                 .iter()
-                .map(|missing| missing.pubkey.to_string())
+                .filter(|check| !check.rpc_load_ready)
+                .map(|check| check.pubkey.to_string())
                 .collect();
             diagnostics.missing_candidates = diagnostics
                 .manifest
@@ -8738,6 +8860,22 @@ async fn p37_shadow_probe_account_set_diagnostics(
                 .filter(|entry| missing_pubkeys.contains(&entry.pubkey))
                 .map(p37_shadow_probe_account_not_found_candidate_from_entry)
                 .collect();
+            let checks_by_pubkey: HashMap<String, _> = checks
+                .into_iter()
+                .map(|check| (check.pubkey.to_string(), check))
+                .collect();
+            for entry in &mut diagnostics.manifest {
+                let Some(check) = checks_by_pubkey.get(&entry.pubkey) else {
+                    continue;
+                };
+                entry.precheck_rpc_load_status = Some(check.rpc_load_status.clone());
+                entry.precheck_rpc_load_ready = Some(check.rpc_load_ready);
+                entry.precheck_commitment = Some(check.commitment.clone());
+                entry.precheck_context_slot = check.context_slot;
+                entry.precheck_attempt_count = Some(check.attempt_count);
+                entry.precheck_latency_ms = Some(check.latency_ms);
+                entry.precheck_rpc_error_class = check.rpc_error_class.clone();
+            }
         }
         Err(err) => {
             diagnostics.manifest_lookup_error = Some(err.to_string());
@@ -8785,6 +8923,19 @@ struct P37WorkingBuilderParityDiagnostics {
     bcv2_seen_in_mfs: Option<bool>,
     bcv2_seen_in_diag: Option<bool>,
     bcv2_readiness_reason: Option<String>,
+    bcv2_precheck_pubkey: Option<String>,
+    bcv2_builder_pubkey: Option<String>,
+    bcv2_observed_pubkey: Option<String>,
+    bcv2_pubkey_consistency_status: Option<String>,
+    bcv2_observed_slot: Option<u64>,
+    bcv2_observed_tx_signature: Option<String>,
+    bcv2_precheck_context_slot: Option<u64>,
+    bcv2_precheck_commitment: Option<String>,
+    bcv2_precheck_attempt_count: Option<u64>,
+    bcv2_precheck_latency_ms: Option<u64>,
+    bcv2_precheck_age_from_observed_slot: Option<i64>,
+    bcv2_rpc_error_class: Option<String>,
+    bcv2_reconciliation_class: Option<String>,
     creator_vault_pubkey: Option<String>,
     creator_vault_source_authority: Option<String>,
     creator_vault_rpc_load_status: Option<String>,
@@ -8947,6 +9098,108 @@ fn p37_working_builder_manifest_rpc_load_status(
     )
 }
 
+fn p37_working_builder_bcv2_pubkey_consistency_status(
+    builder_pubkey: Option<&str>,
+    observed_pubkey: Option<&str>,
+    precheck_pubkey: Option<&str>,
+) -> Option<String> {
+    let builder_pubkey = builder_pubkey.filter(|value| !value.trim().is_empty());
+    let observed_pubkey = observed_pubkey.filter(|value| !value.trim().is_empty());
+    let precheck_pubkey = precheck_pubkey.filter(|value| !value.trim().is_empty());
+    match (builder_pubkey, observed_pubkey, precheck_pubkey) {
+        (Some(builder), Some(observed), Some(precheck))
+            if builder == observed && builder == precheck =>
+        {
+            Some("builder_observed_precheck_match".to_string())
+        }
+        (Some(builder), Some(observed), Some(precheck))
+            if builder == observed && builder != precheck =>
+        {
+            Some("precheck_pubkey_mismatch".to_string())
+        }
+        (Some(builder), Some(observed), Some(precheck))
+            if builder == precheck && builder != observed =>
+        {
+            Some("observed_pubkey_mismatch".to_string())
+        }
+        (Some(builder), Some(observed), None) if builder == observed => {
+            Some("builder_observed_match_precheck_missing".to_string())
+        }
+        (Some(builder), None, Some(precheck)) if builder == precheck => {
+            Some("builder_precheck_match_observed_missing".to_string())
+        }
+        (Some(_), Some(_), Some(_)) => Some("pubkey_mismatch".to_string()),
+        (None, Some(_), Some(_)) => Some("builder_pubkey_missing".to_string()),
+        (Some(_), None, Some(_)) => Some("observed_pubkey_missing".to_string()),
+        (Some(_), Some(_), None) => Some("precheck_pubkey_missing".to_string()),
+        (None, None, None) => None,
+        _ => Some("pubkey_evidence_incomplete".to_string()),
+    }
+}
+
+fn p37_working_builder_bcv2_precheck_age_from_observed_slot(
+    observed_slot: Option<u64>,
+    precheck_context_slot: Option<u64>,
+) -> Option<i64> {
+    Some(precheck_context_slot? as i64 - observed_slot? as i64)
+}
+
+fn p37_working_builder_bcv2_reconciliation_class(
+    consistency_status: Option<&str>,
+    source_authority: Option<&str>,
+    rpc_load_status: Option<&str>,
+    rpc_load_ready: Option<bool>,
+    seen_in_account_state: Option<bool>,
+    seen_in_mfs: Option<bool>,
+    seen_in_diag: Option<bool>,
+    precheck_context_slot: Option<u64>,
+    observed_slot: Option<u64>,
+) -> Option<String> {
+    if matches!(
+        consistency_status,
+        Some("pubkey_mismatch")
+            | Some("precheck_pubkey_mismatch")
+            | Some("observed_pubkey_mismatch")
+    ) {
+        return Some("pubkey_mismatch".to_string());
+    }
+    if matches!(consistency_status, Some("precheck_pubkey_missing")) {
+        return Some("precheck_path_mismatch".to_string());
+    }
+    if rpc_load_ready == Some(true) && seen_in_account_state != Some(true) {
+        return Some("rpc_ready_but_account_state_missing".to_string());
+    }
+    if rpc_load_status == Some("missing_on_rpc_precheck")
+        && source_authority.is_some_and(|value| value.starts_with("authoritative_"))
+    {
+        if seen_in_account_state == Some(true)
+            || seen_in_mfs == Some(true)
+            || seen_in_diag == Some(true)
+        {
+            return Some("rpc_missing_but_local_state_present".to_string());
+        }
+        if let Some(age) = p37_working_builder_bcv2_precheck_age_from_observed_slot(
+            observed_slot,
+            precheck_context_slot,
+        ) {
+            if (0..=2).contains(&age) {
+                return Some("commitment_or_timing_suspected".to_string());
+            }
+        }
+        if source_authority == Some("authoritative_observed_tx") {
+            return Some("local_state_gap".to_string());
+        }
+        return Some("rpc_missing_same_pubkey".to_string());
+    }
+    if rpc_load_status == Some("missing_on_rpc_precheck") {
+        return Some("true_not_load_ready".to_string());
+    }
+    if rpc_load_status.is_none() && source_authority.is_none() {
+        return None;
+    }
+    Some("unknown_gap".to_string())
+}
+
 fn p37_working_builder_creator_vault_source_authority(
     request: &crate::components::trigger::PreparedBuyRequest,
 ) -> Option<String> {
@@ -9095,6 +9348,42 @@ fn p37_working_builder_parity_diagnostics(
         Some(request),
         account_set_diagnostics,
     );
+    let bcv2_manifest_entry =
+        p37_shadow_probe_manifest_entry_for_role(account_set_diagnostics, "bonding_curve_v2");
+    let bcv2_builder_pubkey = bonding_curve_v2_authority.pubkey.clone();
+    let bcv2_observed_pubkey = bonding_curve_v2_authority
+        .observed_bcv2_resolved_pubkey
+        .clone()
+        .or_else(|| {
+            (bonding_curve_v2_authority.source.as_deref() == Some("observed_tx_account_meta"))
+                .then(|| bonding_curve_v2_authority.pubkey.clone())
+                .flatten()
+        });
+    let bcv2_precheck_pubkey = bcv2_manifest_entry.map(|entry| entry.pubkey.clone());
+    let bcv2_pubkey_consistency_status = p37_working_builder_bcv2_pubkey_consistency_status(
+        bcv2_builder_pubkey.as_deref(),
+        bcv2_observed_pubkey.as_deref(),
+        bcv2_precheck_pubkey.as_deref(),
+    );
+    let bcv2_observed_slot = bonding_curve_v2_authority.observed_bcv2_source_slot;
+    let bcv2_precheck_context_slot =
+        bcv2_manifest_entry.and_then(|entry| entry.precheck_context_slot);
+    let bcv2_precheck_age_from_observed_slot =
+        p37_working_builder_bcv2_precheck_age_from_observed_slot(
+            bcv2_observed_slot,
+            bcv2_precheck_context_slot,
+        );
+    let bcv2_reconciliation_class = p37_working_builder_bcv2_reconciliation_class(
+        bcv2_pubkey_consistency_status.as_deref(),
+        bonding_curve_v2_authority.authority_status.as_deref(),
+        bonding_curve_v2_authority.rpc_load_status.as_deref(),
+        bonding_curve_v2_authority.rpc_load_ready,
+        bonding_curve_v2_authority.seen_in_account_state,
+        bonding_curve_v2_authority.seen_in_mfs,
+        bonding_curve_v2_authority.seen_in_diag,
+        bcv2_precheck_context_slot,
+        bcv2_observed_slot,
+    );
     let creator_vault_readiness =
         p37_working_builder_creator_vault_readiness(request, account_set_diagnostics);
     let bcv2_seen_in_observed_tx = bonding_curve_v2_authority.pubkey.as_ref().map(|_| {
@@ -9131,6 +9420,22 @@ fn p37_working_builder_parity_diagnostics(
         bcv2_seen_in_mfs: bonding_curve_v2_authority.seen_in_mfs,
         bcv2_seen_in_diag: bonding_curve_v2_authority.seen_in_diag,
         bcv2_readiness_reason,
+        bcv2_precheck_pubkey,
+        bcv2_builder_pubkey,
+        bcv2_observed_pubkey,
+        bcv2_pubkey_consistency_status,
+        bcv2_observed_slot,
+        bcv2_observed_tx_signature: bonding_curve_v2_authority.observed_bcv2_source_tx_signature,
+        bcv2_precheck_context_slot,
+        bcv2_precheck_commitment: bcv2_manifest_entry
+            .and_then(|entry| entry.precheck_commitment.clone()),
+        bcv2_precheck_attempt_count: bcv2_manifest_entry
+            .and_then(|entry| entry.precheck_attempt_count),
+        bcv2_precheck_latency_ms: bcv2_manifest_entry.and_then(|entry| entry.precheck_latency_ms),
+        bcv2_precheck_age_from_observed_slot,
+        bcv2_rpc_error_class: bcv2_manifest_entry
+            .and_then(|entry| entry.precheck_rpc_error_class.clone()),
+        bcv2_reconciliation_class,
         creator_vault_pubkey: creator_vault_readiness.pubkey,
         creator_vault_source_authority: creator_vault_readiness.source_authority,
         creator_vault_rpc_load_status: creator_vault_readiness.rpc_load_status,
@@ -9169,6 +9474,21 @@ fn p37_apply_working_builder_parity_to_record(
     record.working_builder_bcv2_seen_in_mfs = diagnostics.bcv2_seen_in_mfs;
     record.working_builder_bcv2_seen_in_diag = diagnostics.bcv2_seen_in_diag;
     record.working_builder_bcv2_readiness_reason = diagnostics.bcv2_readiness_reason;
+    record.working_builder_bcv2_precheck_pubkey = diagnostics.bcv2_precheck_pubkey;
+    record.working_builder_bcv2_builder_pubkey = diagnostics.bcv2_builder_pubkey;
+    record.working_builder_bcv2_observed_pubkey = diagnostics.bcv2_observed_pubkey;
+    record.working_builder_bcv2_pubkey_consistency_status =
+        diagnostics.bcv2_pubkey_consistency_status;
+    record.working_builder_bcv2_observed_slot = diagnostics.bcv2_observed_slot;
+    record.working_builder_bcv2_observed_tx_signature = diagnostics.bcv2_observed_tx_signature;
+    record.working_builder_bcv2_precheck_context_slot = diagnostics.bcv2_precheck_context_slot;
+    record.working_builder_bcv2_precheck_commitment = diagnostics.bcv2_precheck_commitment;
+    record.working_builder_bcv2_precheck_attempt_count = diagnostics.bcv2_precheck_attempt_count;
+    record.working_builder_bcv2_precheck_latency_ms = diagnostics.bcv2_precheck_latency_ms;
+    record.working_builder_bcv2_precheck_age_from_observed_slot =
+        diagnostics.bcv2_precheck_age_from_observed_slot;
+    record.working_builder_bcv2_rpc_error_class = diagnostics.bcv2_rpc_error_class;
+    record.working_builder_bcv2_reconciliation_class = diagnostics.bcv2_reconciliation_class;
     record.working_builder_creator_vault_pubkey = diagnostics.creator_vault_pubkey;
     record.working_builder_creator_vault_source_authority =
         diagnostics.creator_vault_source_authority;
@@ -9966,6 +10286,21 @@ fn active_shadow_account_diagnostics_from_account_set_with_mode(
         working_builder_bcv2_seen_in_mfs: working_builder.bcv2_seen_in_mfs,
         working_builder_bcv2_seen_in_diag: working_builder.bcv2_seen_in_diag,
         working_builder_bcv2_readiness_reason: working_builder.bcv2_readiness_reason,
+        working_builder_bcv2_precheck_pubkey: working_builder.bcv2_precheck_pubkey,
+        working_builder_bcv2_builder_pubkey: working_builder.bcv2_builder_pubkey,
+        working_builder_bcv2_observed_pubkey: working_builder.bcv2_observed_pubkey,
+        working_builder_bcv2_pubkey_consistency_status: working_builder
+            .bcv2_pubkey_consistency_status,
+        working_builder_bcv2_observed_slot: working_builder.bcv2_observed_slot,
+        working_builder_bcv2_observed_tx_signature: working_builder.bcv2_observed_tx_signature,
+        working_builder_bcv2_precheck_context_slot: working_builder.bcv2_precheck_context_slot,
+        working_builder_bcv2_precheck_commitment: working_builder.bcv2_precheck_commitment,
+        working_builder_bcv2_precheck_attempt_count: working_builder.bcv2_precheck_attempt_count,
+        working_builder_bcv2_precheck_latency_ms: working_builder.bcv2_precheck_latency_ms,
+        working_builder_bcv2_precheck_age_from_observed_slot: working_builder
+            .bcv2_precheck_age_from_observed_slot,
+        working_builder_bcv2_rpc_error_class: working_builder.bcv2_rpc_error_class,
+        working_builder_bcv2_reconciliation_class: working_builder.bcv2_reconciliation_class,
         working_builder_creator_vault_pubkey: working_builder.creator_vault_pubkey,
         working_builder_creator_vault_source_authority: working_builder
             .creator_vault_source_authority,
@@ -10594,6 +10929,9 @@ fn p37_shadow_probe_bonding_curve_v2_rpc_load_readiness(
     entry: &P37ShadowProbeAccountManifestEntry,
     account_set_diagnostics: Option<&P37ShadowProbeAccountSetDiagnostics>,
 ) -> (Option<String>, Option<bool>) {
+    if let Some(status) = entry.precheck_rpc_load_status.as_ref() {
+        return (Some(status.clone()), entry.precheck_rpc_load_ready);
+    }
     let Some(diagnostics) = account_set_diagnostics else {
         return match entry.source.as_str() {
             "diag_account_update_relay" => (Some("local_diag_ready".to_string()), Some(true)),
@@ -11140,6 +11478,21 @@ fn p37_shadow_probe_execution_diagnostics(
         working_builder_bcv2_seen_in_mfs: working_builder.bcv2_seen_in_mfs,
         working_builder_bcv2_seen_in_diag: working_builder.bcv2_seen_in_diag,
         working_builder_bcv2_readiness_reason: working_builder.bcv2_readiness_reason,
+        working_builder_bcv2_precheck_pubkey: working_builder.bcv2_precheck_pubkey,
+        working_builder_bcv2_builder_pubkey: working_builder.bcv2_builder_pubkey,
+        working_builder_bcv2_observed_pubkey: working_builder.bcv2_observed_pubkey,
+        working_builder_bcv2_pubkey_consistency_status: working_builder
+            .bcv2_pubkey_consistency_status,
+        working_builder_bcv2_observed_slot: working_builder.bcv2_observed_slot,
+        working_builder_bcv2_observed_tx_signature: working_builder.bcv2_observed_tx_signature,
+        working_builder_bcv2_precheck_context_slot: working_builder.bcv2_precheck_context_slot,
+        working_builder_bcv2_precheck_commitment: working_builder.bcv2_precheck_commitment,
+        working_builder_bcv2_precheck_attempt_count: working_builder.bcv2_precheck_attempt_count,
+        working_builder_bcv2_precheck_latency_ms: working_builder.bcv2_precheck_latency_ms,
+        working_builder_bcv2_precheck_age_from_observed_slot: working_builder
+            .bcv2_precheck_age_from_observed_slot,
+        working_builder_bcv2_rpc_error_class: working_builder.bcv2_rpc_error_class,
+        working_builder_bcv2_reconciliation_class: working_builder.bcv2_reconciliation_class,
         working_builder_creator_vault_pubkey: working_builder.creator_vault_pubkey,
         working_builder_creator_vault_source_authority: working_builder
             .creator_vault_source_authority,
@@ -11469,6 +11822,27 @@ fn p37_shadow_probe_transport_from_event(
         working_builder_bcv2_seen_in_mfs: diagnostics.working_builder_bcv2_seen_in_mfs,
         working_builder_bcv2_seen_in_diag: diagnostics.working_builder_bcv2_seen_in_diag,
         working_builder_bcv2_readiness_reason: diagnostics.working_builder_bcv2_readiness_reason,
+        working_builder_bcv2_precheck_pubkey: diagnostics.working_builder_bcv2_precheck_pubkey,
+        working_builder_bcv2_builder_pubkey: diagnostics.working_builder_bcv2_builder_pubkey,
+        working_builder_bcv2_observed_pubkey: diagnostics.working_builder_bcv2_observed_pubkey,
+        working_builder_bcv2_pubkey_consistency_status: diagnostics
+            .working_builder_bcv2_pubkey_consistency_status,
+        working_builder_bcv2_observed_slot: diagnostics.working_builder_bcv2_observed_slot,
+        working_builder_bcv2_observed_tx_signature: diagnostics
+            .working_builder_bcv2_observed_tx_signature,
+        working_builder_bcv2_precheck_context_slot: diagnostics
+            .working_builder_bcv2_precheck_context_slot,
+        working_builder_bcv2_precheck_commitment: diagnostics
+            .working_builder_bcv2_precheck_commitment,
+        working_builder_bcv2_precheck_attempt_count: diagnostics
+            .working_builder_bcv2_precheck_attempt_count,
+        working_builder_bcv2_precheck_latency_ms: diagnostics
+            .working_builder_bcv2_precheck_latency_ms,
+        working_builder_bcv2_precheck_age_from_observed_slot: diagnostics
+            .working_builder_bcv2_precheck_age_from_observed_slot,
+        working_builder_bcv2_rpc_error_class: diagnostics.working_builder_bcv2_rpc_error_class,
+        working_builder_bcv2_reconciliation_class: diagnostics
+            .working_builder_bcv2_reconciliation_class,
         working_builder_creator_vault_pubkey: diagnostics.working_builder_creator_vault_pubkey,
         working_builder_creator_vault_source_authority: diagnostics
             .working_builder_creator_vault_source_authority,
@@ -11752,6 +12126,27 @@ fn p37_shadow_probe_transport_from_error(
         working_builder_bcv2_seen_in_mfs: diagnostics.working_builder_bcv2_seen_in_mfs,
         working_builder_bcv2_seen_in_diag: diagnostics.working_builder_bcv2_seen_in_diag,
         working_builder_bcv2_readiness_reason: diagnostics.working_builder_bcv2_readiness_reason,
+        working_builder_bcv2_precheck_pubkey: diagnostics.working_builder_bcv2_precheck_pubkey,
+        working_builder_bcv2_builder_pubkey: diagnostics.working_builder_bcv2_builder_pubkey,
+        working_builder_bcv2_observed_pubkey: diagnostics.working_builder_bcv2_observed_pubkey,
+        working_builder_bcv2_pubkey_consistency_status: diagnostics
+            .working_builder_bcv2_pubkey_consistency_status,
+        working_builder_bcv2_observed_slot: diagnostics.working_builder_bcv2_observed_slot,
+        working_builder_bcv2_observed_tx_signature: diagnostics
+            .working_builder_bcv2_observed_tx_signature,
+        working_builder_bcv2_precheck_context_slot: diagnostics
+            .working_builder_bcv2_precheck_context_slot,
+        working_builder_bcv2_precheck_commitment: diagnostics
+            .working_builder_bcv2_precheck_commitment,
+        working_builder_bcv2_precheck_attempt_count: diagnostics
+            .working_builder_bcv2_precheck_attempt_count,
+        working_builder_bcv2_precheck_latency_ms: diagnostics
+            .working_builder_bcv2_precheck_latency_ms,
+        working_builder_bcv2_precheck_age_from_observed_slot: diagnostics
+            .working_builder_bcv2_precheck_age_from_observed_slot,
+        working_builder_bcv2_rpc_error_class: diagnostics.working_builder_bcv2_rpc_error_class,
+        working_builder_bcv2_reconciliation_class: diagnostics
+            .working_builder_bcv2_reconciliation_class,
         working_builder_creator_vault_pubkey: diagnostics.working_builder_creator_vault_pubkey,
         working_builder_creator_vault_source_authority: diagnostics
             .working_builder_creator_vault_source_authority,
@@ -11994,6 +12389,32 @@ fn enrich_probe_shadow_entry(
     entry.working_builder_bcv2_seen_in_diag = transport.working_builder_bcv2_seen_in_diag;
     entry.working_builder_bcv2_readiness_reason =
         transport.working_builder_bcv2_readiness_reason.clone();
+    entry.working_builder_bcv2_precheck_pubkey =
+        transport.working_builder_bcv2_precheck_pubkey.clone();
+    entry.working_builder_bcv2_builder_pubkey =
+        transport.working_builder_bcv2_builder_pubkey.clone();
+    entry.working_builder_bcv2_observed_pubkey =
+        transport.working_builder_bcv2_observed_pubkey.clone();
+    entry.working_builder_bcv2_pubkey_consistency_status = transport
+        .working_builder_bcv2_pubkey_consistency_status
+        .clone();
+    entry.working_builder_bcv2_observed_slot = transport.working_builder_bcv2_observed_slot;
+    entry.working_builder_bcv2_observed_tx_signature =
+        transport.working_builder_bcv2_observed_tx_signature.clone();
+    entry.working_builder_bcv2_precheck_context_slot =
+        transport.working_builder_bcv2_precheck_context_slot;
+    entry.working_builder_bcv2_precheck_commitment =
+        transport.working_builder_bcv2_precheck_commitment.clone();
+    entry.working_builder_bcv2_precheck_attempt_count =
+        transport.working_builder_bcv2_precheck_attempt_count;
+    entry.working_builder_bcv2_precheck_latency_ms =
+        transport.working_builder_bcv2_precheck_latency_ms;
+    entry.working_builder_bcv2_precheck_age_from_observed_slot =
+        transport.working_builder_bcv2_precheck_age_from_observed_slot;
+    entry.working_builder_bcv2_rpc_error_class =
+        transport.working_builder_bcv2_rpc_error_class.clone();
+    entry.working_builder_bcv2_reconciliation_class =
+        transport.working_builder_bcv2_reconciliation_class.clone();
     entry.working_builder_creator_vault_pubkey =
         transport.working_builder_creator_vault_pubkey.clone();
     entry.working_builder_creator_vault_source_authority = transport
@@ -15340,6 +15761,53 @@ fn shadow_entry_record_from_event(
             .account_diagnostics
             .working_builder_bcv2_readiness_reason
             .clone(),
+        working_builder_bcv2_precheck_pubkey: event
+            .account_diagnostics
+            .working_builder_bcv2_precheck_pubkey
+            .clone(),
+        working_builder_bcv2_builder_pubkey: event
+            .account_diagnostics
+            .working_builder_bcv2_builder_pubkey
+            .clone(),
+        working_builder_bcv2_observed_pubkey: event
+            .account_diagnostics
+            .working_builder_bcv2_observed_pubkey
+            .clone(),
+        working_builder_bcv2_pubkey_consistency_status: event
+            .account_diagnostics
+            .working_builder_bcv2_pubkey_consistency_status
+            .clone(),
+        working_builder_bcv2_observed_slot: event
+            .account_diagnostics
+            .working_builder_bcv2_observed_slot,
+        working_builder_bcv2_observed_tx_signature: event
+            .account_diagnostics
+            .working_builder_bcv2_observed_tx_signature
+            .clone(),
+        working_builder_bcv2_precheck_context_slot: event
+            .account_diagnostics
+            .working_builder_bcv2_precheck_context_slot,
+        working_builder_bcv2_precheck_commitment: event
+            .account_diagnostics
+            .working_builder_bcv2_precheck_commitment
+            .clone(),
+        working_builder_bcv2_precheck_attempt_count: event
+            .account_diagnostics
+            .working_builder_bcv2_precheck_attempt_count,
+        working_builder_bcv2_precheck_latency_ms: event
+            .account_diagnostics
+            .working_builder_bcv2_precheck_latency_ms,
+        working_builder_bcv2_precheck_age_from_observed_slot: event
+            .account_diagnostics
+            .working_builder_bcv2_precheck_age_from_observed_slot,
+        working_builder_bcv2_rpc_error_class: event
+            .account_diagnostics
+            .working_builder_bcv2_rpc_error_class
+            .clone(),
+        working_builder_bcv2_reconciliation_class: event
+            .account_diagnostics
+            .working_builder_bcv2_reconciliation_class
+            .clone(),
         working_builder_creator_vault_pubkey: event
             .account_diagnostics
             .working_builder_creator_vault_pubkey
@@ -15560,6 +16028,19 @@ fn shadow_entry_record_from_request(
         working_builder_bcv2_seen_in_mfs: None,
         working_builder_bcv2_seen_in_diag: None,
         working_builder_bcv2_readiness_reason: None,
+        working_builder_bcv2_precheck_pubkey: None,
+        working_builder_bcv2_builder_pubkey: None,
+        working_builder_bcv2_observed_pubkey: None,
+        working_builder_bcv2_pubkey_consistency_status: None,
+        working_builder_bcv2_observed_slot: None,
+        working_builder_bcv2_observed_tx_signature: None,
+        working_builder_bcv2_precheck_context_slot: None,
+        working_builder_bcv2_precheck_commitment: None,
+        working_builder_bcv2_precheck_attempt_count: None,
+        working_builder_bcv2_precheck_latency_ms: None,
+        working_builder_bcv2_precheck_age_from_observed_slot: None,
+        working_builder_bcv2_rpc_error_class: None,
+        working_builder_bcv2_reconciliation_class: None,
         working_builder_creator_vault_pubkey: None,
         working_builder_creator_vault_source_authority: None,
         working_builder_creator_vault_rpc_load_status: None,
@@ -15782,6 +16263,34 @@ fn enrich_active_shadow_entry_with_account_diagnostics(
     entry.working_builder_bcv2_seen_in_diag = diagnostics.working_builder_bcv2_seen_in_diag;
     entry.working_builder_bcv2_readiness_reason =
         diagnostics.working_builder_bcv2_readiness_reason.clone();
+    entry.working_builder_bcv2_precheck_pubkey =
+        diagnostics.working_builder_bcv2_precheck_pubkey.clone();
+    entry.working_builder_bcv2_builder_pubkey =
+        diagnostics.working_builder_bcv2_builder_pubkey.clone();
+    entry.working_builder_bcv2_observed_pubkey =
+        diagnostics.working_builder_bcv2_observed_pubkey.clone();
+    entry.working_builder_bcv2_pubkey_consistency_status = diagnostics
+        .working_builder_bcv2_pubkey_consistency_status
+        .clone();
+    entry.working_builder_bcv2_observed_slot = diagnostics.working_builder_bcv2_observed_slot;
+    entry.working_builder_bcv2_observed_tx_signature = diagnostics
+        .working_builder_bcv2_observed_tx_signature
+        .clone();
+    entry.working_builder_bcv2_precheck_context_slot =
+        diagnostics.working_builder_bcv2_precheck_context_slot;
+    entry.working_builder_bcv2_precheck_commitment =
+        diagnostics.working_builder_bcv2_precheck_commitment.clone();
+    entry.working_builder_bcv2_precheck_attempt_count =
+        diagnostics.working_builder_bcv2_precheck_attempt_count;
+    entry.working_builder_bcv2_precheck_latency_ms =
+        diagnostics.working_builder_bcv2_precheck_latency_ms;
+    entry.working_builder_bcv2_precheck_age_from_observed_slot =
+        diagnostics.working_builder_bcv2_precheck_age_from_observed_slot;
+    entry.working_builder_bcv2_rpc_error_class =
+        diagnostics.working_builder_bcv2_rpc_error_class.clone();
+    entry.working_builder_bcv2_reconciliation_class = diagnostics
+        .working_builder_bcv2_reconciliation_class
+        .clone();
     entry.working_builder_creator_vault_pubkey =
         diagnostics.working_builder_creator_vault_pubkey.clone();
     entry.working_builder_creator_vault_source_authority = diagnostics
@@ -16323,6 +16832,32 @@ struct ShadowEntryRecord {
     working_builder_bcv2_seen_in_diag: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     working_builder_bcv2_readiness_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_precheck_pubkey: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_builder_pubkey: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_observed_pubkey: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_pubkey_consistency_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_observed_slot: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_observed_tx_signature: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_precheck_context_slot: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_precheck_commitment: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_precheck_attempt_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_precheck_latency_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_precheck_age_from_observed_slot: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_rpc_error_class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_reconciliation_class: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     working_builder_creator_vault_pubkey: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -21004,6 +21539,133 @@ mod tests {
     }
 
     #[test]
+    fn p37_working_builder_account_source_bcv2_reconciliation_tracks_precheck_metadata() {
+        let request = test_working_builder_prepared_buy_request();
+        let bcv2 = request
+            .account_overrides
+            .bonding_curve_v2
+            .expect("working request bcv2")
+            .to_string();
+        let mut diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        let bcv2_missing_candidate = {
+            let bcv2_entry = diagnostics
+                .manifest
+                .iter_mut()
+                .find(|entry| entry.role == "bonding_curve_v2")
+                .expect("working builder manifest bcv2");
+            bcv2_entry.precheck_rpc_load_status = Some("missing_on_rpc_precheck".to_string());
+            bcv2_entry.precheck_rpc_load_ready = Some(false);
+            bcv2_entry.precheck_commitment = Some("processed".to_string());
+            bcv2_entry.precheck_context_slot = Some(104);
+            bcv2_entry.precheck_attempt_count = Some(1);
+            bcv2_entry.precheck_latency_ms = Some(17);
+            bcv2_entry.precheck_rpc_error_class = Some("account_missing".to_string());
+            bcv2_entry.observed_bcv2_source_slot = Some(100);
+            bcv2_entry.observed_bcv2_source_tx_signature = Some("observed-signature".to_string());
+            bcv2_entry.observed_bcv2_resolved_pubkey = Some(bcv2.clone());
+            p37_shadow_probe_account_not_found_candidate_from_entry(bcv2_entry)
+        };
+        diagnostics.manifest_lookup_performed = true;
+        diagnostics.missing_candidates.push(bcv2_missing_candidate);
+
+        let working =
+            p37_working_builder_parity_diagnostics(Some(&request), Some(&diagnostics), true);
+
+        assert_eq!(working.bcv2_precheck_pubkey.as_deref(), Some(bcv2.as_str()));
+        assert_eq!(working.bcv2_builder_pubkey.as_deref(), Some(bcv2.as_str()));
+        assert_eq!(working.bcv2_observed_pubkey.as_deref(), Some(bcv2.as_str()));
+        assert_eq!(
+            working.bcv2_pubkey_consistency_status.as_deref(),
+            Some("builder_observed_precheck_match")
+        );
+        assert_eq!(working.bcv2_observed_slot, Some(100));
+        assert_eq!(
+            working.bcv2_observed_tx_signature.as_deref(),
+            Some("observed-signature")
+        );
+        assert_eq!(working.bcv2_precheck_context_slot, Some(104));
+        assert_eq!(
+            working.bcv2_precheck_commitment.as_deref(),
+            Some("processed")
+        );
+        assert_eq!(working.bcv2_precheck_attempt_count, Some(1));
+        assert_eq!(working.bcv2_precheck_latency_ms, Some(17));
+        assert_eq!(working.bcv2_precheck_age_from_observed_slot, Some(4));
+        assert_eq!(
+            working.bcv2_rpc_error_class.as_deref(),
+            Some("account_missing")
+        );
+        assert_eq!(
+            working.bcv2_reconciliation_class.as_deref(),
+            Some("local_state_gap")
+        );
+    }
+
+    #[test]
+    fn p37_working_builder_account_source_bcv2_reconciliation_class_has_closed_failure_buckets() {
+        assert_eq!(
+            p37_working_builder_bcv2_reconciliation_class(
+                Some("observed_pubkey_mismatch"),
+                Some("authoritative_observed_tx"),
+                Some("missing_on_rpc_precheck"),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(104),
+                Some(100),
+            )
+            .as_deref(),
+            Some("pubkey_mismatch")
+        );
+        assert_eq!(
+            p37_working_builder_bcv2_reconciliation_class(
+                Some("builder_observed_precheck_match"),
+                Some("authoritative_observed_tx"),
+                Some("missing_on_rpc_precheck"),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(101),
+                Some(100),
+            )
+            .as_deref(),
+            Some("commitment_or_timing_suspected")
+        );
+        assert_eq!(
+            p37_working_builder_bcv2_reconciliation_class(
+                Some("builder_observed_precheck_match"),
+                Some("authoritative_observed_tx"),
+                Some("missing_on_rpc_precheck"),
+                Some(false),
+                Some(true),
+                Some(false),
+                Some(false),
+                Some(104),
+                Some(100),
+            )
+            .as_deref(),
+            Some("rpc_missing_but_local_state_present")
+        );
+        assert_eq!(
+            p37_working_builder_bcv2_reconciliation_class(
+                Some("builder_observed_precheck_match"),
+                Some("builder_only"),
+                Some("missing_on_rpc_precheck"),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(104),
+                Some(100),
+            )
+            .as_deref(),
+            Some("true_not_load_ready")
+        );
+    }
+
+    #[test]
     fn p37_working_builder_account_source_tracks_creator_vault_pubkey_and_missing_rpc_reason() {
         let request = test_working_builder_prepared_buy_request();
         let mut diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
@@ -21173,6 +21835,7 @@ mod tests {
             observed_bcv2_tx_success: None,
             observed_bcv2_meta_err: None,
             observed_bcv2_provenance_status: None,
+            ..Default::default()
         }
     }
 
@@ -22463,6 +23126,7 @@ mod tests {
                 observed_bcv2_tx_success: None,
                 observed_bcv2_meta_err: None,
                 observed_bcv2_provenance_status: None,
+                ..Default::default()
             });
 
         let active = active_shadow_account_diagnostics_from_account_set(
