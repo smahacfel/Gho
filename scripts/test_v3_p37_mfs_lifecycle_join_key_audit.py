@@ -2144,6 +2144,8 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
             {
                 "working_builder_parity_mode": "working_builder_parity",
                 "working_builder_request_built": True,
+                "buy_variant": "routed_exact_sol_in",
+                "working_builder_buy_variant": "routed_exact_sol_in",
                 "working_builder_rpc_manifest_hash": "rpc-hash",
                 "working_builder_sender_manifest_hash": "sender-hash",
                 "working_builder_manifest_contains_bcv2": True,
@@ -2159,6 +2161,8 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
             {
                 "working_builder_parity_mode": "working_builder_parity",
                 "working_builder_request_built": True,
+                "buy_variant": "routed_exact_sol_in",
+                "working_builder_buy_variant": "routed_exact_sol_in",
                 "working_builder_rpc_manifest_hash": "rpc-hash-2",
                 "working_builder_missing_required_accounts": [
                     "bonding_curve_v2:bcv2:observed_tx_account_meta"
@@ -2180,6 +2184,11 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
 
         self.assertEqual(payload["working_builder_parity_rows"], 2)
         self.assertEqual(payload["working_builder_request_built_rows"], 2)
+        self.assertEqual(payload["working_builder_buy_variant_counts"], {"routed_exact_sol_in": 2})
+        self.assertEqual(payload["probe_working_builder_variant_drift_rows"], 0)
+        self.assertEqual(payload["probe_working_builder_legacy_variant_rows"], 0)
+        self.assertEqual(payload["probe_working_builder_selected_legacy_handoff_rows"], 0)
+        self.assertEqual(payload["probe_working_builder_stale_route_diagnostics_rows"], 0)
         self.assertEqual(payload["legacy_fallback_attempted_rows"], 1)
         self.assertEqual(payload["selected_route_handoff_mismatch_rows"], 1)
         self.assertEqual(payload["working_builder_manifest_missing_required_rows"], 1)
@@ -2205,7 +2214,116 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
             {"identity_only_rpc_unverified": 1, "rpc_load_ready": 1},
         )
         self.assertEqual(active_payload["active_shadow_working_builder_parity_rows"], 2)
+        self.assertEqual(
+            active_payload["active_shadow_working_builder_buy_variant_counts"],
+            {"routed_exact_sol_in": 2},
+        )
+        self.assertEqual(
+            active_payload["active_shadow_probe_working_builder_legacy_variant_rows"],
+            0,
+        )
         self.assertEqual(active_payload["active_shadow_legacy_fallback_attempted_rows"], 1)
+
+    def test_audit_flags_probe_working_builder_legacy_variant_rows(self) -> None:
+        payload = audit.working_builder_parity_payload(
+            [
+                {
+                    "working_builder_parity_mode": "working_builder_parity",
+                    "working_builder_request_built": True,
+                    "buy_variant": "legacy_buy",
+                    "working_builder_buy_variant": "legacy_buy",
+                }
+            ]
+        )
+
+        self.assertEqual(payload["probe_working_builder_legacy_variant_rows"], 1)
+        self.assertEqual(payload["probe_working_builder_stale_route_diagnostics_rows"], 0)
+
+    def test_audit_flags_probe_working_builder_selected_legacy_handoff_rows(self) -> None:
+        payload = audit.working_builder_parity_payload(
+            [
+                {
+                    "working_builder_parity_mode": "working_builder_parity",
+                    "working_builder_request_built": True,
+                    "buy_variant": "routed_exact_sol_in",
+                    "working_builder_buy_variant": "routed_exact_sol_in",
+                    "selected_route_kind": "legacy_buy",
+                    "selected_route_source": "selected_fallback_route_execution_handoff",
+                    "selected_route_handoff_status": "selected_route_handoff_mismatch",
+                    "legacy_buy_curve_pubkey": "LegacyCurve11111111111111111111111111111111",
+                }
+            ]
+        )
+
+        self.assertEqual(payload["probe_working_builder_selected_legacy_handoff_rows"], 1)
+        self.assertEqual(payload["probe_working_builder_stale_route_diagnostics_rows"], 1)
+
+    def test_audit_blocks_pass_b_when_probe_variant_drift_present(self) -> None:
+        report = {
+            "probe_join_key_coverage": {
+                "probe_selection_rows": 1,
+                "probe_transport_rows": 1,
+                "probe_entry_rows": 1,
+                "probe_join_quality": "exact_probe_id_and_ab_record_id",
+            },
+            "probe_decision_join": {
+                "decision_join_acceptance": "pass",
+                "required_exact_decision_v3_join_coverage": 1.0,
+            },
+            "probe_artifact_intersections": {
+                "ab_record_id": {"common_values": 1},
+                "probe_id": {"common_values": 1},
+            },
+            "probe_entry_materialization": {
+                "probe_working_builder_variant_drift_rows": 1,
+                "probe_working_builder_legacy_variant_rows": 0,
+                "probe_working_builder_selected_legacy_handoff_rows": 0,
+                "probe_working_builder_stale_route_diagnostics_rows": 0,
+            },
+        }
+
+        readiness = audit.probe_readiness(report)
+
+        self.assertEqual(readiness["status"], "not_ready")
+        self.assertIn(
+            "probe_working_builder_variant_drift",
+            readiness["reasons"],
+        )
+
+    def test_audit_allows_pass_b_only_when_legacy_rows_zero_and_remaining_blocker_is_account_source(
+        self,
+    ) -> None:
+        report = {
+            "probe_join_key_coverage": {
+                "probe_selection_rows": 1,
+                "probe_transport_rows": 1,
+                "probe_entry_rows": 1,
+                "probe_join_quality": "exact_probe_id_and_ab_record_id",
+            },
+            "probe_decision_join": {
+                "decision_join_acceptance": "pass",
+                "required_exact_decision_v3_join_coverage": 1.0,
+            },
+            "probe_artifact_intersections": {
+                "ab_record_id": {"common_values": 1},
+                "probe_id": {"common_values": 1},
+            },
+            "probe_entry_materialization": {
+                "probe_working_builder_variant_drift_rows": 0,
+                "probe_working_builder_legacy_variant_rows": 0,
+                "probe_working_builder_selected_legacy_handoff_rows": 0,
+                "probe_working_builder_stale_route_diagnostics_rows": 0,
+                "working_builder_manifest_missing_required_rows": 1,
+            },
+        }
+
+        readiness = audit.probe_readiness(report)
+
+        self.assertEqual(readiness["status"], "ready_for_probe_transport_entry_join")
+        self.assertNotIn(
+            "probe_working_builder_legacy_variant",
+            readiness["reasons"],
+        )
 
     def test_e4r2_selected_fallback_handoff_violation_counters_are_reported(
         self,

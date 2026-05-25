@@ -518,6 +518,34 @@ def row_string_list(row: dict[str, Any], field: str) -> list[str]:
     return []
 
 
+LEGACY_ROUTE_VALUES = {"legacy_buy", "LegacyBuy"}
+
+
+def row_has_legacy_route_diagnostics(row: dict[str, Any]) -> bool:
+    scalar_fields = [
+        "legacy_buy_account_set_status",
+        "legacy_buy_curve_pubkey",
+        "legacy_buy_curve_source",
+        "legacy_buy_curve_authority_status",
+        "legacy_buy_curve_rpc_load_status",
+        "legacy_buy_curve_rpc_load_ready",
+        "legacy_buy_curve_authority_readiness_status",
+        "legacy_buy_associated_bonding_curve_pubkey",
+        "legacy_buy_associated_bonding_curve_source",
+        "legacy_buy_associated_bonding_curve_rpc_load_ready",
+        "legacy_buy_route_ready",
+        "legacy_buy_route_not_ready_reason",
+    ]
+    vector_fields = [
+        "legacy_buy_required_roles",
+        "legacy_buy_missing_roles",
+        "legacy_buy_missing_pubkeys",
+    ]
+    return any(row_string(row, field) is not None for field in scalar_fields) or any(
+        row_string_list(row, field) for field in vector_fields
+    )
+
+
 def fallback_failure_class_for_row(row: dict[str, Any]) -> str:
     explicit = row_string(row, "fallback_failure_class")
     if explicit:
@@ -694,10 +722,50 @@ def working_builder_parity_payload(
         for row in parity_rows
         if row_bool_string(row, "working_builder_request_built") == "true"
     ]
+    working_builder_buy_variant_counts = Counter(
+        row_string(row, "working_builder_buy_variant") or "missing"
+        for row in parity_rows
+    )
+    variant_drift_rows = [
+        row
+        for row in parity_rows
+        if row_string(row, "buy_variant") is not None
+        and row_string(row, "working_builder_buy_variant") is not None
+        and row_string(row, "buy_variant") != row_string(row, "working_builder_buy_variant")
+    ]
+    legacy_variant_rows = [
+        row
+        for row in parity_rows
+        if row_string(row, "buy_variant") in LEGACY_ROUTE_VALUES
+        or row_string(row, "working_builder_buy_variant") in LEGACY_ROUTE_VALUES
+    ]
+    selected_legacy_handoff_rows = [
+        row
+        for row in parity_rows
+        if row_string(row, "selected_route_kind") in LEGACY_ROUTE_VALUES
+        or row_string(row, "selected_route_source")
+        == "selected_fallback_route_execution_handoff"
+        or row_string(row, "selected_route_handoff_status")
+        in {
+            "selected_route_handoff_applied",
+            "selected_route_handoff_mismatch",
+            "selected_route_handoff_hash_mismatch",
+        }
+    ]
+    stale_route_diagnostics_rows = [
+        row
+        for row in parity_rows
+        if row_string(row, "fallback_route_kind") in LEGACY_ROUTE_VALUES
+        or row_string(row, "selected_route_kind") in LEGACY_ROUTE_VALUES
+        or row_string(row, "selected_route_source")
+        == "selected_fallback_route_execution_handoff"
+        or row_string(row, "route_resolution_status") == "fallback_route_ready"
+        or row_has_legacy_route_diagnostics(row)
+    ]
     legacy_fallback_attempted_rows = [
         row
         for row in rows
-        if row_string(row, "fallback_route_kind") in {"legacy_buy", "LegacyBuy"}
+        if row_string(row, "fallback_route_kind") in LEGACY_ROUTE_VALUES
         and row_bool_string(row, "fallback_route_attempted") == "true"
     ]
     selected_route_handoff_mismatch_rows = [
@@ -760,6 +828,17 @@ def working_builder_parity_payload(
     return {
         f"{prefix}working_builder_parity_rows": len(parity_rows),
         f"{prefix}working_builder_request_built_rows": len(request_built_rows),
+        f"{prefix}working_builder_buy_variant_counts": dict(
+            sorted(working_builder_buy_variant_counts.items())
+        ),
+        f"{prefix}probe_working_builder_variant_drift_rows": len(variant_drift_rows),
+        f"{prefix}probe_working_builder_legacy_variant_rows": len(legacy_variant_rows),
+        f"{prefix}probe_working_builder_selected_legacy_handoff_rows": len(
+            selected_legacy_handoff_rows
+        ),
+        f"{prefix}probe_working_builder_stale_route_diagnostics_rows": len(
+            stale_route_diagnostics_rows
+        ),
         f"{prefix}legacy_fallback_attempted_rows": len(legacy_fallback_attempted_rows),
         f"{prefix}selected_route_handoff_mismatch_rows": len(
             selected_route_handoff_mismatch_rows
@@ -786,9 +865,9 @@ def working_builder_parity_payload(
 
 def is_legacy_buy_route_row(row: dict[str, Any]) -> bool:
     return (
-        row_string(row, "fallback_route_kind") in {"legacy_buy", "LegacyBuy"}
-        or row_string(row, "selected_route_kind") in {"legacy_buy", "LegacyBuy"}
-        or row_string(row, "buy_variant") in {"legacy_buy", "LegacyBuy"}
+        row_string(row, "fallback_route_kind") in LEGACY_ROUTE_VALUES
+        or row_string(row, "selected_route_kind") in LEGACY_ROUTE_VALUES
+        or row_string(row, "buy_variant") in LEGACY_ROUTE_VALUES
     )
 
 
@@ -3122,6 +3201,16 @@ def probe_readiness(report: dict[str, Any]) -> dict[str, Any]:
     if materialization.get("unexplained_account_set_mismatch_rows", 0) > 0:
         status = "not_ready"
         reasons.append("unexplained_precheck_simulation_account_set_mismatch")
+    probe_working_builder_invariants = {
+        "probe_working_builder_variant_drift_rows": "probe_working_builder_variant_drift",
+        "probe_working_builder_legacy_variant_rows": "probe_working_builder_legacy_variant",
+        "probe_working_builder_selected_legacy_handoff_rows": "probe_working_builder_selected_legacy_handoff",
+        "probe_working_builder_stale_route_diagnostics_rows": "probe_working_builder_stale_route_diagnostics",
+    }
+    for field, reason in probe_working_builder_invariants.items():
+        if materialization.get(field, 0) > 0:
+            status = "not_ready"
+            reasons.append(reason)
     if materialization.get("bonding_curve_v2_account_not_found_after_simulation_rows", 0) > 0:
         status = "not_ready"
         reasons.append("bonding_curve_v2_account_not_found_after_simulation")
@@ -3471,6 +3560,11 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- active_shadow_route_fallback_failed_rows: `{active_shadow['active_shadow_route_fallback_failed_rows']}`",
             f"- active_shadow_working_builder_parity_rows: `{active_shadow['active_shadow_working_builder_parity_rows']}`",
             f"- active_shadow_working_builder_request_built_rows: `{active_shadow['active_shadow_working_builder_request_built_rows']}`",
+            f"- active_shadow_working_builder_buy_variant_counts: `{json.dumps(active_shadow['active_shadow_working_builder_buy_variant_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_probe_working_builder_variant_drift_rows: `{active_shadow['active_shadow_probe_working_builder_variant_drift_rows']}`",
+            f"- active_shadow_probe_working_builder_legacy_variant_rows: `{active_shadow['active_shadow_probe_working_builder_legacy_variant_rows']}`",
+            f"- active_shadow_probe_working_builder_selected_legacy_handoff_rows: `{active_shadow['active_shadow_probe_working_builder_selected_legacy_handoff_rows']}`",
+            f"- active_shadow_probe_working_builder_stale_route_diagnostics_rows: `{active_shadow['active_shadow_probe_working_builder_stale_route_diagnostics_rows']}`",
             f"- active_shadow_legacy_fallback_attempted_rows: `{active_shadow['active_shadow_legacy_fallback_attempted_rows']}`",
             f"- active_shadow_selected_route_handoff_mismatch_rows: `{active_shadow['active_shadow_selected_route_handoff_mismatch_rows']}`",
             f"- active_shadow_working_builder_manifest_missing_required_rows: `{active_shadow['active_shadow_working_builder_manifest_missing_required_rows']}`",
@@ -3605,6 +3699,11 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- route_fallback_failed_rows: `{materialization['route_fallback_failed_rows']}`",
             f"- working_builder_parity_rows: `{materialization['working_builder_parity_rows']}`",
             f"- working_builder_request_built_rows: `{materialization['working_builder_request_built_rows']}`",
+            f"- working_builder_buy_variant_counts: `{json.dumps(materialization['working_builder_buy_variant_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- probe_working_builder_variant_drift_rows: `{materialization['probe_working_builder_variant_drift_rows']}`",
+            f"- probe_working_builder_legacy_variant_rows: `{materialization['probe_working_builder_legacy_variant_rows']}`",
+            f"- probe_working_builder_selected_legacy_handoff_rows: `{materialization['probe_working_builder_selected_legacy_handoff_rows']}`",
+            f"- probe_working_builder_stale_route_diagnostics_rows: `{materialization['probe_working_builder_stale_route_diagnostics_rows']}`",
             f"- legacy_fallback_attempted_rows: `{materialization['legacy_fallback_attempted_rows']}`",
             f"- selected_route_handoff_mismatch_rows: `{materialization['selected_route_handoff_mismatch_rows']}`",
             f"- working_builder_manifest_missing_required_rows: `{materialization['working_builder_manifest_missing_required_rows']}`",

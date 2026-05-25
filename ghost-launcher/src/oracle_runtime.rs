@@ -6395,6 +6395,25 @@ struct P37ExecutableRouteResolutionDiagnostics {
 }
 
 impl P37ExecutableRouteResolutionDiagnostics {
+    fn without_legacy_buy_route_diagnostics(mut self) -> Self {
+        self.legacy_buy_account_set_status = None;
+        self.legacy_buy_curve_pubkey = None;
+        self.legacy_buy_curve_source = None;
+        self.legacy_buy_curve_authority_status = None;
+        self.legacy_buy_curve_rpc_load_status = None;
+        self.legacy_buy_curve_rpc_load_ready = None;
+        self.legacy_buy_curve_authority_readiness_status = None;
+        self.legacy_buy_associated_bonding_curve_pubkey = None;
+        self.legacy_buy_associated_bonding_curve_source = None;
+        self.legacy_buy_associated_bonding_curve_rpc_load_ready = None;
+        self.legacy_buy_required_roles.clear();
+        self.legacy_buy_missing_roles.clear();
+        self.legacy_buy_missing_pubkeys.clear();
+        self.legacy_buy_route_ready = None;
+        self.legacy_buy_route_not_ready_reason = None;
+        self
+    }
+
     fn no_executable_reason(&self) -> Option<String> {
         if self.route_resolution_status.as_deref() != Some("no_executable_route_account_set") {
             return None;
@@ -7025,8 +7044,11 @@ fn p37_shadow_probe_route_resolution_diagnostics_with_mode(
         p37_shadow_probe_route_kind(request).unwrap_or_else(|| "unknown".to_string());
     let fallback_route_kind = (!working_builder_parity_mode && primary_route_kind != "legacy_buy")
         .then(|| "legacy_buy".to_string());
-    let legacy_buy =
-        p37_shadow_probe_legacy_buy_route_diagnostics(request, account_set_diagnostics);
+    let legacy_buy = if working_builder_parity_mode {
+        P37LegacyBuyRouteDiagnostics::default()
+    } else {
+        p37_shadow_probe_legacy_buy_route_diagnostics(request, account_set_diagnostics)
+    };
 
     let bcv2_from_failure = precheck_failure_reason
         .and_then(p37_shadow_probe_parse_no_executable_route_bcv2)
@@ -7131,7 +7153,8 @@ fn p37_shadow_probe_route_resolution_diagnostics_with_mode(
                 legacy_buy_missing_pubkeys: legacy_buy.missing_pubkeys,
                 legacy_buy_route_ready: legacy_buy.route_ready,
                 legacy_buy_route_not_ready_reason: legacy_buy.route_not_ready_reason,
-            };
+            }
+            .without_legacy_buy_route_diagnostics();
         }
         if fallback_attempted && legacy_buy.route_ready == Some(true) {
             let (
@@ -7326,7 +7349,8 @@ fn p37_shadow_probe_route_resolution_diagnostics_with_mode(
                 legacy_buy_missing_pubkeys: legacy_buy.missing_pubkeys,
                 legacy_buy_route_ready: legacy_buy.route_ready,
                 legacy_buy_route_not_ready_reason: legacy_buy.route_not_ready_reason,
-            };
+            }
+            .without_legacy_buy_route_diagnostics();
         }
     }
 
@@ -7887,8 +7911,33 @@ fn p37_shadow_probe_derive_account_override_context_for_pool(
     buy_mint: Pubkey,
     record: &P37ShadowProbeSelectionRecord,
 ) -> P37ShadowProbeAccountOverrideContext {
-    let mut account_overrides = p37_shadow_probe_derive_legacy_buy_account_overrides(buffered_txs)
-        .unwrap_or_else(|| derive_buy_account_overrides(buffered_txs));
+    p37_shadow_probe_derive_account_override_context_for_pool_with_mode(
+        oracle_runtime,
+        pool_data,
+        buffered_txs,
+        buy_mint,
+        record,
+        false,
+    )
+}
+
+fn p37_shadow_probe_derive_account_override_context_for_pool_with_mode(
+    oracle_runtime: &OracleRuntime,
+    pool_data: &DetectedPool,
+    buffered_txs: &[crate::components::gatekeeper::GatekeeperBufferedTx],
+    buy_mint: Pubkey,
+    record: &P37ShadowProbeSelectionRecord,
+    working_builder_parity_mode: bool,
+) -> P37ShadowProbeAccountOverrideContext {
+    let mut account_overrides = if working_builder_parity_mode {
+        derive_buy_account_overrides(buffered_txs)
+    } else {
+        p37_shadow_probe_derive_legacy_buy_account_overrides(buffered_txs)
+            .unwrap_or_else(|| derive_buy_account_overrides(buffered_txs))
+    };
+    if working_builder_parity_mode {
+        account_overrides.buy_variant = Some(trigger::PumpfunBuyVariant::RoutedExactSolIn);
+    }
     let mut creator_identity_source = account_overrides
         .creator_pubkey
         .map(|_| "derived_buy_account_overrides.creator_pubkey".to_string());
@@ -9520,8 +9569,11 @@ fn active_shadow_account_diagnostics_from_account_set_with_mode(
     } else {
         precheck_status
     };
-    let selected_route_handoff =
-        p37_selected_route_handoff_diagnostics(request, account_set_diagnostics);
+    let selected_route_handoff = p37_selected_route_handoff_diagnostics_with_mode(
+        request,
+        account_set_diagnostics,
+        working_builder_parity_mode,
+    );
     let working_builder = p37_working_builder_parity_diagnostics(
         request,
         account_set_diagnostics,
@@ -10607,6 +10659,17 @@ fn p37_selected_route_handoff_diagnostics(
     }
 }
 
+fn p37_selected_route_handoff_diagnostics_with_mode(
+    request: Option<&crate::components::trigger::PreparedBuyRequest>,
+    account_set_diagnostics: Option<&P37ShadowProbeAccountSetDiagnostics>,
+    working_builder_parity_mode: bool,
+) -> P37SelectedRouteHandoffDiagnostics {
+    if working_builder_parity_mode {
+        return P37SelectedRouteHandoffDiagnostics::default();
+    }
+    p37_selected_route_handoff_diagnostics(request, account_set_diagnostics)
+}
+
 fn p37_selected_route_final_manifest_failure_reason(
     request: &crate::components::trigger::PreparedBuyRequest,
     account_set_diagnostics: &P37ShadowProbeAccountSetDiagnostics,
@@ -10710,8 +10773,11 @@ fn p37_shadow_probe_execution_diagnostics(
     let route_resolution_terminal_reason = route_resolution.terminal_reason();
     let (execution_feasibility_status, execution_feasibility_reason, lifecycle_label_eligibility) =
         route_resolution.execution_feasibility();
-    let selected_route_handoff =
-        p37_selected_route_handoff_diagnostics(request, account_set_diagnostics);
+    let selected_route_handoff = p37_selected_route_handoff_diagnostics_with_mode(
+        request,
+        account_set_diagnostics,
+        working_builder_parity_mode,
+    );
     let working_builder = p37_working_builder_parity_diagnostics(
         request,
         account_set_diagnostics,
@@ -11698,12 +11764,13 @@ async fn run_p37_shadow_probe_dispatch(
         }
     };
     let decision_ts_ms = record.decision_ts_ms.unwrap_or_else(current_time_ms);
-    let override_context = p37_shadow_probe_derive_account_override_context_for_pool(
+    let override_context = p37_shadow_probe_derive_account_override_context_for_pool_with_mode(
         &oracle_runtime,
         pool_data.as_ref(),
         &buffered_txs,
         buy_mint,
         &record,
+        working_builder_parity_mode,
     );
     let account_overrides = override_context.account_overrides.clone();
     if !working_builder_parity_mode {
@@ -12124,14 +12191,16 @@ async fn maybe_handle_p37_shadow_probe_decision(
         } else if base_mint_pubkey.is_none() {
             record = p37_shadow_probe_as_skip(record, "invalid_mint_identity");
         } else if let (Some(pool_data), Some(buy_mint)) = (pool_data.as_ref(), base_mint_pubkey) {
-            let override_context = p37_shadow_probe_derive_account_override_context_for_pool(
-                ctx.oracle_runtime.as_ref(),
-                pool_data.as_ref(),
-                buffered_txs,
-                buy_mint,
-                &record,
-            );
             let working_builder_parity_mode = p37_working_builder_parity_enabled(config);
+            let override_context =
+                p37_shadow_probe_derive_account_override_context_for_pool_with_mode(
+                    ctx.oracle_runtime.as_ref(),
+                    pool_data.as_ref(),
+                    buffered_txs,
+                    buy_mint,
+                    &record,
+                    working_builder_parity_mode,
+                );
             let creator_vault_failure = (!working_builder_parity_mode)
                 .then(|| p37_shadow_probe_creator_vault_precheck_failure(&override_context))
                 .flatten();
@@ -20063,6 +20132,76 @@ mod tests {
     }
 
     #[test]
+    fn probe_working_builder_parity_does_not_emit_legacy_buy() {
+        use ghost_brain::oracle::snapshot_engine::PoolMetrics;
+        use ghost_core::shadow_ledger::TxKey;
+        use std::sync::Arc;
+
+        let (mut record, pool, buy_mint) = p37_shadow_probe_precheck_record_and_pool();
+        let curve = BondingCurve {
+            discriminator: 0,
+            virtual_token_reserves: 1_000_000_000_000,
+            virtual_sol_reserves: 30_000_000_000,
+            real_token_reserves: 1_000_000_000_000,
+            real_sol_reserves: 30_000_000_000,
+            token_total_supply: ghost_core::PROTOCOL_GENESIS_TOKEN_TOTAL_SUPPLY,
+            complete: 0,
+            _padding: [0; 7],
+        };
+        record.legacy_bonding_curve_snapshot = Some(curve);
+        let assoc_curve = trigger::DirectBuyBuilder::canonical_associated_bonding_curve(
+            &buy_mint,
+            &Pubkey::from_str(TOKEN_PROGRAM_ID).expect("valid token program"),
+        );
+        let mut tx = (*test_pool_observation_tx("legacy-probe-parity-cleanup")).clone();
+        tx.buy_variant = Some("legacy_buy".to_string());
+        tx.associated_bonding_curve = Some(assoc_curve.to_string());
+        tx.token_program = Some(TOKEN_PROGRAM_ID.to_string());
+        tx.success = true;
+        tx.is_buy = true;
+        let buffered_txs = vec![crate::components::gatekeeper::GatekeeperBufferedTx {
+            tx: Arc::new(tx),
+            metrics: PoolMetrics::default(),
+            tx_key: TxKey::new(1_000, Some(1), Some(0), None, 0).expect("tx key"),
+        }];
+        let runtime = OracleRuntime::new(
+            Arc::new(HyperPredictionOracle::default()),
+            "pump_program".to_string(),
+            "bonk_program".to_string(),
+            Arc::new(ShadowLedger::new()),
+        );
+
+        let context = p37_shadow_probe_derive_account_override_context_for_pool_with_mode(
+            &runtime,
+            &pool,
+            &buffered_txs,
+            buy_mint,
+            &record,
+            true,
+        );
+
+        assert_eq!(
+            context.account_overrides.buy_variant,
+            Some(trigger::PumpfunBuyVariant::RoutedExactSolIn)
+        );
+        assert_eq!(context.account_overrides.legacy_buy_curve, Some(curve));
+        assert_eq!(
+            context.creator_identity_source.as_deref(),
+            Some("detected_pool.creator")
+        );
+        assert_eq!(context.creator_identity_authoritative, Some(true));
+        assert_eq!(
+            p37_shadow_probe_execution_precheck(
+                &record,
+                &context.account_overrides,
+                &buy_mint,
+                &pool
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn p37_shadow_probe_transport_uses_simulated_token_quantity_when_request_quote_missing() {
         let config = P37ShadowProbeConfig {
             enabled: true,
@@ -20207,6 +20346,57 @@ mod tests {
     }
 
     #[test]
+    fn probe_working_builder_parity_clears_stale_legacy_route_diagnostics() {
+        let mut request = test_working_builder_prepared_buy_request();
+        let bcv2 = request
+            .account_overrides
+            .bonding_curve_v2
+            .expect("working request bcv2");
+        request.account_overrides.legacy_buy_curve = Some(p37_shadow_probe_test_legacy_curve());
+        request.account_overrides.legacy_buy_curve_pubkey = Some(Pubkey::new_unique());
+        request.account_overrides.legacy_buy_curve_source =
+            Some("materialized_feature_set".to_string());
+        request.account_overrides.legacy_buy_curve_authority_status =
+            Some("authoritative_mfs".to_string());
+        let mut diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        diagnostics.manifest_lookup_performed = true;
+        diagnostics
+            .missing_candidates
+            .push(P37ShadowProbeAccountNotFoundCandidate {
+                pubkey: bcv2.to_string(),
+                role: "bonding_curve_v2".to_string(),
+                source: "observed_tx_account_meta".to_string(),
+                instruction_index: Some(0),
+                account_index: Some(16),
+                required: true,
+                ..Default::default()
+            });
+
+        let resolution = p37_shadow_probe_route_resolution_diagnostics_with_mode(
+            Some(&request),
+            Some(&diagnostics),
+            None,
+            Some(("bonding_curve_v2", bcv2.to_string().as_str())),
+            true,
+        );
+
+        assert_eq!(
+            resolution.route_resolution_status.as_deref(),
+            Some("no_executable_route_account_set")
+        );
+        assert_eq!(resolution.selected_route_kind, None);
+        assert_eq!(resolution.fallback_route_kind, None);
+        assert_eq!(resolution.fallback_route_attempted, Some(false));
+        assert_eq!(resolution.legacy_buy_account_set_status, None);
+        assert_eq!(resolution.legacy_buy_curve_pubkey, None);
+        assert!(resolution.legacy_buy_required_roles.is_empty());
+        assert!(resolution.legacy_buy_missing_roles.is_empty());
+        assert!(resolution.legacy_buy_missing_pubkeys.is_empty());
+        assert_eq!(resolution.legacy_buy_route_ready, None);
+        assert_eq!(resolution.legacy_buy_route_not_ready_reason, None);
+    }
+
+    #[test]
     fn p37_working_builder_parity_does_not_mutate_buy_variant_after_request_build() {
         let request = test_working_builder_prepared_buy_request();
         let original_profile_variant = request
@@ -20231,6 +20421,27 @@ mod tests {
         assert!(
             p37_selected_legacy_buy_fallback_overrides(&request).is_some(),
             "parity mode must keep the already-built request even if the old fallback helper could rewrite it"
+        );
+    }
+
+    #[test]
+    fn probe_working_builder_parity_preserves_post_build_buy_variant() {
+        let mut request = test_working_builder_prepared_buy_request();
+        request.account_overrides.buy_variant = Some(trigger::PumpfunBuyVariant::LegacyBuy);
+        let diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+
+        let working =
+            p37_working_builder_parity_diagnostics(Some(&request), Some(&diagnostics), true);
+
+        assert_eq!(working.request_built, Some(true));
+        assert_eq!(working.buy_variant.as_deref(), Some("routed_exact_sol_in"));
+        assert_eq!(
+            request
+                .build_profile
+                .as_ref()
+                .expect("build profile")
+                .buy_variant,
+            trigger::PumpfunBuyVariant::RoutedExactSolIn
         );
     }
 
@@ -21231,6 +21442,82 @@ mod tests {
             .account_set_roles
             .iter()
             .any(|role| role.starts_with("bonding_curve_v2:")));
+    }
+
+    #[test]
+    fn probe_working_builder_parity_disables_selected_legacy_handoff() {
+        let mut request = test_working_builder_prepared_buy_request();
+        let legacy_curve_pubkey = Pubkey::new_unique();
+        request.account_overrides.buy_variant = Some(trigger::PumpfunBuyVariant::LegacyBuy);
+        request.account_overrides.legacy_buy_curve = Some(p37_shadow_probe_test_legacy_curve());
+        request.account_overrides.legacy_buy_curve_pubkey = Some(legacy_curve_pubkey);
+        let account_set = P37ShadowProbeAccountSetDiagnostics {
+            precheck_account_set_hash: Some("legacy-precheck".to_string()),
+            prepared_request_account_set_hash: Some("legacy-prepared".to_string()),
+            simulation_account_set_hash: Some("legacy-simulation".to_string()),
+            manifest: vec![p37_shadow_probe_test_legacy_curve_manifest_entry(
+                legacy_curve_pubkey,
+            )],
+            ..Default::default()
+        };
+
+        let legacy_handoff =
+            p37_selected_route_handoff_diagnostics(Some(&request), Some(&account_set));
+        let parity_handoff = p37_selected_route_handoff_diagnostics_with_mode(
+            Some(&request),
+            Some(&account_set),
+            true,
+        );
+
+        assert_eq!(
+            legacy_handoff.source.as_deref(),
+            Some("selected_fallback_route_execution_handoff")
+        );
+        assert_eq!(parity_handoff.source, None);
+        assert_eq!(parity_handoff.status, None);
+        assert_eq!(parity_handoff.reason, None);
+        assert!(parity_handoff.account_set_roles.is_empty());
+    }
+
+    #[test]
+    fn probe_transport_uses_final_prepared_request_variant_not_selection_variant() {
+        let config = P37ShadowProbeConfig {
+            enabled: true,
+            sample_threshold: 100,
+            ..Default::default()
+        };
+        let candidate = p37_shadow_probe_test_candidate();
+        let mut record = p37_shadow_probe_selection_record(&config, &candidate, 3_000);
+        record.working_builder_parity_mode =
+            Some(P37_EXECUTION_BUILDER_MODE_WORKING_BUILDER_PARITY.to_string());
+        let mut request = test_working_builder_prepared_buy_request()
+            .with_join_metadata(p37_shadow_probe_join_metadata(&record).expect("join metadata"));
+        request.account_overrides.buy_variant = Some(trigger::PumpfunBuyVariant::LegacyBuy);
+        let diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        let err = anyhow::anyhow!(
+            "working_builder_final_manifest_missing_required_account:bonding_curve_v2:{}",
+            Pubkey::new_unique()
+        );
+
+        let transport = p37_shadow_probe_transport_from_error(
+            &record,
+            &request,
+            &err,
+            Some(&diagnostics),
+            3_100,
+        );
+
+        assert_eq!(
+            transport.buy_variant.as_deref(),
+            Some("routed_exact_sol_in")
+        );
+        assert_eq!(
+            transport.working_builder_buy_variant.as_deref(),
+            Some("routed_exact_sol_in")
+        );
+        assert_eq!(transport.selected_route_source, None);
+        assert_eq!(transport.selected_route_handoff_status, None);
+        assert_eq!(transport.selected_route_handoff_reason, None);
     }
 
     #[test]
