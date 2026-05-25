@@ -2180,6 +2180,95 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
             1,
         )
 
+    def test_e4r3_final_manifest_bcv2_and_no_executable_simulation_are_flagged(
+        self,
+    ) -> None:
+        rows = [
+            {
+                "selected_route_kind": "legacy_buy",
+                "selected_route_source": "selected_fallback_route_execution_handoff",
+                "selected_route_handoff_status": "selected_route_handoff_mismatch",
+                "selected_route_handoff_reason": (
+                    "selected_legacy_buy_final_manifest_contains_primary_bcv2"
+                ),
+                "route_resolution_status": "no_executable_route_account_set",
+                "fallback_route_kind": "legacy_buy",
+                "buy_variant": "legacy_buy",
+                "execution_outcome": "counterfactual_shadow_probe_simulation_error",
+                "simulation_error_kind": "AccountNotFound",
+                "simulation_error_account_role": "bonding_curve_v2",
+                "simulation_error_account_source": "route_builder",
+                "simulation_account_manifest": [
+                    {
+                        "role": "bonding_curve",
+                        "pubkey": "CURVE",
+                        "source": "materialized_feature_set",
+                    },
+                    {
+                        "role": "bonding_curve_v2",
+                        "pubkey": "BCV2",
+                        "source": "route_builder",
+                    },
+                ],
+            }
+        ]
+
+        payload = audit.legacy_buy_route_payload(rows, [])
+
+        self.assertEqual(payload["selected_legacy_handoff_claimed_rows"], 1)
+        self.assertEqual(payload["selected_legacy_handoff_validated_rows"], 0)
+        self.assertEqual(payload["selected_legacy_handoff_mismatch_rows"], 1)
+        self.assertEqual(
+            payload["selected_legacy_final_manifest_contains_bcv2_rows"],
+            1,
+        )
+        self.assertEqual(
+            payload[
+                "selected_legacy_final_manifest_contains_primary_route_builder_rows"
+            ],
+            1,
+        )
+        self.assertEqual(payload["no_executable_route_but_simulated_rows"], 1)
+
+    def test_e4r3_selected_route_handoff_mismatch_precheck_is_not_simulated(
+        self,
+    ) -> None:
+        rows = [
+            {
+                "selected_route_kind": "legacy_buy",
+                "selected_route_source": "selected_fallback_route_execution_handoff",
+                "selected_route_handoff_status": "selected_route_handoff_mismatch",
+                "selected_route_handoff_reason": (
+                    "selected_legacy_buy_final_manifest_contains_primary_bcv2"
+                ),
+                "route_resolution_status": "no_executable_route_account_set",
+                "fallback_route_kind": "legacy_buy",
+                "buy_variant": "legacy_buy",
+                "execution_outcome": "selected_route_handoff_mismatch",
+                "precheck_failure_reason": (
+                    "selected_route_handoff_mismatch:"
+                    "selected_legacy_buy_final_manifest_contains_primary_bcv2"
+                ),
+                "simulation_account_manifest": [
+                    {
+                        "role": "bonding_curve_v2",
+                        "pubkey": "BCV2",
+                        "source": "route_builder",
+                    }
+                ],
+            }
+        ]
+
+        payload = audit.legacy_buy_route_payload(rows, [])
+
+        self.assertEqual(payload["selected_legacy_handoff_claimed_rows"], 1)
+        self.assertEqual(payload["selected_legacy_handoff_mismatch_rows"], 1)
+        self.assertEqual(
+            payload["selected_legacy_final_manifest_contains_bcv2_rows"],
+            1,
+        )
+        self.assertEqual(payload["no_executable_route_but_simulated_rows"], 0)
+
     def test_active_shadow_unattributed_account_not_found_blocks_readiness(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

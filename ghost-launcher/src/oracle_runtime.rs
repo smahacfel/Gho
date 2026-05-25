@@ -8630,6 +8630,7 @@ fn active_shadow_account_diagnostics_from_account_set(
             || message.starts_with("active_shadow_precheck_failed:")
             || message.starts_with("bonding_curve_v2_source_not_authoritative:")
             || message.starts_with("no_executable_route_account_set:")
+            || message.starts_with("selected_route_handoff_mismatch:")
         {
             Some(message.to_string())
         } else {
@@ -9722,26 +9723,68 @@ fn p37_selected_route_handoff_diagnostics(
     request: Option<&crate::components::trigger::PreparedBuyRequest>,
     account_set_diagnostics: Option<&P37ShadowProbeAccountSetDiagnostics>,
 ) -> P37SelectedRouteHandoffDiagnostics {
+    let Some(request) = request else {
+        return P37SelectedRouteHandoffDiagnostics::default();
+    };
     let selected_route_is_legacy = request
-        .and_then(|request| request.account_overrides.buy_variant)
+        .account_overrides
+        .buy_variant
         .is_some_and(|variant| matches!(variant, trigger::PumpfunBuyVariant::LegacyBuy));
     if !selected_route_is_legacy {
         return P37SelectedRouteHandoffDiagnostics::default();
     }
 
-    let account_set_roles = p37_shadow_probe_required_account_roles_for_request(request);
-    let handoff_mismatch = account_set_roles
-        .iter()
-        .any(|role| role.starts_with("bonding_curve_v2:"));
-    let status = if handoff_mismatch {
-        "selected_route_handoff_mismatch"
+    let manifest = account_set_diagnostics
+        .map(|diagnostics| diagnostics.manifest.as_slice())
+        .unwrap_or(&[]);
+    let account_set_roles = if manifest.is_empty() {
+        p37_shadow_probe_required_account_roles_for_request(Some(request))
     } else {
-        "selected_route_handoff_applied"
+        manifest
+            .iter()
+            .map(p37_shadow_probe_account_manifest_descriptor)
+            .collect()
     };
-    let reason = if handoff_mismatch {
-        "selected_legacy_buy_request_still_requires_primary_bcv2"
+    let final_buy_variant_is_legacy = request
+        .build_profile
+        .as_ref()
+        .map(|profile| profile.buy_variant)
+        .or(request.account_overrides.buy_variant)
+        .is_some_and(|variant| matches!(variant, trigger::PumpfunBuyVariant::LegacyBuy));
+    let final_manifest_contains_primary_route_builder_bcv2 = manifest
+        .iter()
+        .any(|entry| entry.role == "bonding_curve_v2" && entry.source == "route_builder");
+    let final_manifest_contains_bcv2 = manifest
+        .iter()
+        .any(|entry| entry.role == "bonding_curve_v2");
+    let legacy_curve_pubkey = request
+        .account_overrides
+        .legacy_buy_curve_pubkey
+        .map(|pubkey| pubkey.to_string());
+    let final_manifest_contains_legacy_curve = manifest.iter().any(|entry| {
+        entry.role == "bonding_curve"
+            && legacy_curve_pubkey
+                .as_deref()
+                .map(|pubkey| pubkey == entry.pubkey)
+                .unwrap_or(true)
+    });
+    let reason = if !final_buy_variant_is_legacy {
+        "selected_legacy_buy_request_variant_not_legacy"
+    } else if manifest.is_empty() {
+        "selected_legacy_buy_final_manifest_missing"
+    } else if final_manifest_contains_primary_route_builder_bcv2 {
+        "selected_legacy_buy_final_manifest_contains_primary_bcv2"
+    } else if final_manifest_contains_bcv2 {
+        "selected_legacy_buy_final_manifest_contains_bonding_curve_v2"
+    } else if !final_manifest_contains_legacy_curve {
+        "selected_legacy_buy_final_manifest_missing_legacy_curve"
     } else {
-        "selected_legacy_buy_request_uses_legacy_account_set"
+        "selected_legacy_buy_final_manifest_validated"
+    };
+    let status = if reason == "selected_legacy_buy_final_manifest_validated" {
+        "selected_route_handoff_applied"
+    } else {
+        "selected_route_handoff_mismatch"
     };
 
     P37SelectedRouteHandoffDiagnostics {
@@ -9756,6 +9799,23 @@ fn p37_selected_route_handoff_diagnostics(
         status: Some(status.to_string()),
         reason: Some(reason.to_string()),
     }
+}
+
+fn p37_selected_route_final_manifest_failure_reason(
+    request: &crate::components::trigger::PreparedBuyRequest,
+    account_set_diagnostics: &P37ShadowProbeAccountSetDiagnostics,
+) -> Option<String> {
+    let handoff =
+        p37_selected_route_handoff_diagnostics(Some(request), Some(account_set_diagnostics));
+    if handoff.status.as_deref() == Some("selected_route_handoff_mismatch") {
+        return Some(format!(
+            "selected_route_handoff_mismatch:{}",
+            handoff
+                .reason
+                .unwrap_or_else(|| "selected_route_handoff_unknown".to_string())
+        ));
+    }
+    None
 }
 
 fn p37_shadow_probe_execution_diagnostics(
@@ -10538,7 +10598,14 @@ fn p37_shadow_probe_transport_from_error(
         err: Some(err.to_string()),
         error_class: Some("simulation_failure".to_string()),
         live_signature: None,
-        execution_outcome: "counterfactual_shadow_probe_simulation_failed".to_string(),
+        execution_outcome: if err
+            .to_string()
+            .starts_with("selected_route_handoff_mismatch:")
+        {
+            "selected_route_handoff_mismatch".to_string()
+        } else {
+            "counterfactual_shadow_probe_simulation_failed".to_string()
+        },
         probe_bucket: record.probe_bucket.clone(),
         probe_bucket_reason: record.probe_bucket_reason.clone(),
         probe_bucket_version: record.probe_bucket_version.clone(),
@@ -10835,6 +10902,46 @@ async fn run_p37_shadow_probe_dispatch(
             }
             return;
         }
+    }
+
+    let final_manifest_diagnostics =
+        p37_shadow_probe_account_set_diagnostics(&trigger_component, &request).await;
+    if let Some(reason) =
+        p37_selected_route_final_manifest_failure_reason(&request, &final_manifest_diagnostics)
+    {
+        record.execution_account_readiness_status = Some("not_ready".to_string());
+        record.execution_account_readiness_role = Some("selected_route_manifest".to_string());
+        record.execution_account_readiness_reason = Some(reason.clone());
+        record.precheck_failure_reason = Some(reason.clone());
+        let dispatch_ts_ms = current_time_ms();
+        let err = anyhow::anyhow!(reason.clone());
+        let transport = p37_shadow_probe_transport_from_error(
+            &record,
+            &request,
+            &err,
+            Some(&final_manifest_diagnostics),
+            dispatch_ts_ms,
+        );
+        if let Err(write_err) = append_p37_shadow_probe_transport_record(
+            std::path::Path::new(&config.transport_log_path),
+            &transport,
+        )
+        .await
+        {
+            warn!(
+                probe_id = ?record.probe_id,
+                source_ab_record_id = ?record.source_ab_record_id,
+                error = %write_err,
+                "P37_SHADOW_PROBE_SELECTED_ROUTE_MANIFEST_SKIP_WRITE_FAILED"
+            );
+        }
+        warn!(
+            probe_id = ?record.probe_id,
+            source_ab_record_id = ?record.source_ab_record_id,
+            precheck_failure_reason = %reason,
+            "P37_SHADOW_PROBE_SELECTED_ROUTE_FINAL_MANIFEST_BLOCKED"
+        );
+        return;
     }
 
     match p37_shadow_probe_wait_for_required_account_readiness(
@@ -13000,10 +13107,24 @@ fn p37_selected_legacy_buy_fallback_overrides(
     if primary_request.account_overrides.legacy_buy_curve.is_none() {
         return None;
     }
-    let mut fallback = primary_request.account_overrides.clone();
-    fallback.buy_variant = Some(trigger::PumpfunBuyVariant::LegacyBuy);
-    fallback.bonding_curve_v2 = None;
-    fallback.bonding_curve_v2_provenance = None;
+    let primary = &primary_request.account_overrides;
+    let mut fallback = crate::components::trigger::BuyAccountOverrides {
+        global_config: primary.global_config,
+        fee_recipient: primary.fee_recipient,
+        token_program: Some(primary_request.token_program),
+        creator_pubkey: primary.creator_pubkey,
+        buy_variant: Some(trigger::PumpfunBuyVariant::LegacyBuy),
+        associated_bonding_curve: primary.associated_bonding_curve,
+        bonding_curve_v2: None,
+        bonding_curve_v2_provenance: None,
+        legacy_buy_curve: primary.legacy_buy_curve,
+        legacy_buy_curve_pubkey: primary.legacy_buy_curve_pubkey,
+        legacy_buy_curve_source: primary.legacy_buy_curve_source.clone(),
+        legacy_buy_curve_authority_status: primary.legacy_buy_curve_authority_status.clone(),
+    };
+    if fallback.legacy_buy_curve_pubkey.is_none() {
+        fallback.legacy_buy_curve_pubkey = primary.legacy_buy_curve_pubkey;
+    }
     Some(fallback)
 }
 
@@ -13058,25 +13179,28 @@ async fn p37_apply_selected_fallback_route_handoff_for_shadow_only(
         Some(&fallback_request),
         Some(&fallback_account_set),
     );
-    if selected_handoff.status.as_deref() != Some("selected_route_handoff_applied") {
-        let reason = selected_handoff
-            .reason
-            .unwrap_or_else(|| "selected_route_handoff_missing_request_override".to_string());
-        return Err(anyhow::anyhow!(
-            "selected_fallback_route_handoff_not_applied:{reason}"
-        ));
-    }
     let primary_not_ready_reason = primary_resolution
         .primary_route_not_ready_reason
         .as_deref()
         .or(primary_bcv2_reason.as_deref())
         .unwrap_or("primary_route_not_ready");
-    info!(
-        mint = %buy_mint,
-        primary_route_not_ready_reason = %primary_not_ready_reason,
-        selected_route_kind = "legacy_buy",
-        "P3.7 selected fallback route handoff applied for shadow-only execution"
-    );
+    if selected_handoff.status.as_deref() == Some("selected_route_handoff_applied") {
+        info!(
+            mint = %buy_mint,
+            primary_route_not_ready_reason = %primary_not_ready_reason,
+            selected_route_kind = "legacy_buy",
+            "P3.7 selected fallback route handoff applied for shadow-only execution"
+        );
+    } else {
+        warn!(
+            mint = %buy_mint,
+            primary_route_not_ready_reason = %primary_not_ready_reason,
+            selected_route_kind = "legacy_buy",
+            selected_route_handoff_status = ?selected_handoff.status,
+            selected_route_handoff_reason = ?selected_handoff.reason,
+            "P3.7 selected fallback route handoff failed final manifest validation"
+        );
+    }
     Ok(fallback_request)
 }
 
@@ -13099,6 +13223,26 @@ async fn active_shadow_simulation_load_precheck_receipt(
 ) -> Option<crate::components::trigger::TriggerDispatchReceipt> {
     if !shadow_only_dispatch {
         return None;
+    }
+
+    if matches!(
+        request.account_overrides.buy_variant,
+        Some(trigger::PumpfunBuyVariant::LegacyBuy)
+    ) {
+        let account_set_diagnostics =
+            p37_shadow_probe_account_set_diagnostics(trigger_component, request).await;
+        if let Some(reason) =
+            p37_selected_route_final_manifest_failure_reason(request, &account_set_diagnostics)
+        {
+            return Some(crate::components::trigger::TriggerDispatchReceipt {
+                primary_outcome: Err(anyhow::anyhow!("{reason}")),
+                shadow_task: None,
+                active_position_lease: None,
+                retain_position_slot_on_error: false,
+                failed_request: Some(request.clone()),
+                failed_context: None,
+            });
+        }
     }
 
     if !matches!(
@@ -14271,6 +14415,9 @@ fn shadow_execution_outcome_from_dispatch_error(
     }
     if lower.contains("failed to fetch mint account") || lower.contains("accountnotfound") {
         return "shadow_account_not_visible".to_string();
+    }
+    if lower.contains("selected_route_handoff_mismatch") {
+        return "selected_route_handoff_mismatch".to_string();
     }
     if lower.contains("connection refused")
         || lower.contains("error trying to connect")
@@ -19559,13 +19706,17 @@ mod tests {
     #[test]
     fn p37_selected_legacy_buy_fallback_handoff_uses_legacy_account_set() {
         let mut request = test_prepared_buy_request();
+        let legacy_curve_pubkey = Pubkey::new_unique();
         request.account_overrides.buy_variant = Some(trigger::PumpfunBuyVariant::LegacyBuy);
         request.account_overrides.legacy_buy_curve = Some(p37_shadow_probe_test_legacy_curve());
-        request.account_overrides.legacy_buy_curve_pubkey = Some(Pubkey::new_unique());
+        request.account_overrides.legacy_buy_curve_pubkey = Some(legacy_curve_pubkey);
         let account_set = P37ShadowProbeAccountSetDiagnostics {
             precheck_account_set_hash: Some("legacy-precheck".to_string()),
             prepared_request_account_set_hash: Some("legacy-prepared".to_string()),
             simulation_account_set_hash: Some("legacy-simulation".to_string()),
+            manifest: vec![p37_shadow_probe_test_legacy_curve_manifest_entry(
+                legacy_curve_pubkey,
+            )],
             ..Default::default()
         };
 
@@ -19581,7 +19732,7 @@ mod tests {
         );
         assert_eq!(
             handoff.reason.as_deref(),
-            Some("selected_legacy_buy_request_uses_legacy_account_set")
+            Some("selected_legacy_buy_final_manifest_validated")
         );
         assert_eq!(handoff.precheck_hash.as_deref(), Some("legacy-precheck"));
         assert_eq!(handoff.account_set_hash.as_deref(), Some("legacy-prepared"));
@@ -19603,6 +19754,74 @@ mod tests {
     #[test]
     fn selected_legacy_buy_simulation_manifest_excludes_primary_bcv2() {
         p37_selected_legacy_buy_fallback_handoff_uses_legacy_account_set();
+    }
+
+    #[test]
+    fn selected_legacy_buy_final_manifest_containing_bcv2_blocks_handoff() {
+        let mut request = test_prepared_buy_request();
+        let legacy_curve_pubkey = Pubkey::new_unique();
+        let bcv2 = Pubkey::new_unique().to_string();
+        request.account_overrides.buy_variant = Some(trigger::PumpfunBuyVariant::LegacyBuy);
+        request.account_overrides.legacy_buy_curve = Some(p37_shadow_probe_test_legacy_curve());
+        request.account_overrides.legacy_buy_curve_pubkey = Some(legacy_curve_pubkey);
+        let account_set = P37ShadowProbeAccountSetDiagnostics {
+            precheck_account_set_hash: Some("legacy-precheck".to_string()),
+            prepared_request_account_set_hash: Some("legacy-prepared".to_string()),
+            simulation_account_set_hash: Some("legacy-simulation".to_string()),
+            manifest: vec![
+                p37_shadow_probe_test_legacy_curve_manifest_entry(legacy_curve_pubkey),
+                p37_shadow_probe_test_bcv2_manifest_entry(bcv2, "route_builder"),
+            ],
+            ..Default::default()
+        };
+
+        let handoff = p37_selected_route_handoff_diagnostics(Some(&request), Some(&account_set));
+
+        assert_eq!(
+            handoff.status.as_deref(),
+            Some("selected_route_handoff_mismatch")
+        );
+        assert_eq!(
+            handoff.reason.as_deref(),
+            Some("selected_legacy_buy_final_manifest_contains_primary_bcv2")
+        );
+        assert!(p37_selected_route_final_manifest_failure_reason(&request, &account_set).is_some());
+    }
+
+    #[test]
+    fn selected_legacy_buy_builder_final_manifest_bcv2_blocks_simulation() {
+        let mut request = test_prepared_buy_request();
+        let legacy_curve_pubkey = Pubkey::new_unique();
+        let bcv2 = Pubkey::new_unique().to_string();
+        request.account_overrides.buy_variant = Some(trigger::PumpfunBuyVariant::LegacyBuy);
+        request.account_overrides.legacy_buy_curve = Some(p37_shadow_probe_test_legacy_curve());
+        request.account_overrides.legacy_buy_curve_pubkey = Some(legacy_curve_pubkey);
+        request.account_overrides.legacy_buy_curve_source =
+            Some("materialized_feature_set".to_string());
+        request.account_overrides.legacy_buy_curve_authority_status =
+            Some("authoritative_mfs".to_string());
+        if let Some(profile) = request.build_profile.as_mut() {
+            profile.buy_variant = trigger::PumpfunBuyVariant::LegacyBuy;
+            profile.token_param_role = "token_amount";
+        }
+        let diagnostics = P37ShadowProbeAccountSetDiagnostics {
+            manifest: vec![
+                p37_shadow_probe_test_legacy_curve_manifest_entry(legacy_curve_pubkey),
+                p37_shadow_probe_test_bcv2_manifest_entry(bcv2, "route_builder"),
+            ],
+            ..Default::default()
+        };
+
+        assert!(diagnostics
+            .manifest
+            .iter()
+            .any(|entry| entry.role == "bonding_curve_v2"));
+        assert_eq!(
+            p37_selected_route_final_manifest_failure_reason(&request, &diagnostics).as_deref(),
+            Some(
+                "selected_route_handoff_mismatch:selected_legacy_buy_final_manifest_contains_primary_bcv2"
+            )
+        );
     }
 
     #[test]
