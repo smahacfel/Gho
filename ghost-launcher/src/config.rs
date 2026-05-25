@@ -1038,6 +1038,15 @@ fn validate_p37_shadow_probe_contract(config: &LauncherConfig) -> Result<(), Str
                 .to_string(),
         );
     }
+    match probe.p37_execution_builder_mode.as_str() {
+        "route_resolver" | "working_builder_parity" => {}
+        _ => {
+            return Err(
+                "[p37_shadow_probe].p37_execution_builder_mode must be \"route_resolver\" or \"working_builder_parity\""
+                    .to_string(),
+            );
+        }
+    }
 
     if probe.sample_mode != default_p37_shadow_probe_sample_mode() {
         return Err(
@@ -1843,6 +1852,9 @@ pub struct P37ShadowProbeConfig {
     #[serde(default = "default_p37_shadow_probe_dispatch_source")]
     pub dispatch_source: String,
 
+    #[serde(default = "default_p37_shadow_probe_execution_builder_mode")]
+    pub p37_execution_builder_mode: String,
+
     #[serde(default = "default_p37_shadow_probe_sample_source")]
     pub sample_source: String,
 
@@ -1978,6 +1990,7 @@ impl Default for P37ShadowProbeConfig {
             enabled: false,
             namespace: default_p37_shadow_probe_namespace(),
             dispatch_source: default_p37_shadow_probe_dispatch_source(),
+            p37_execution_builder_mode: default_p37_shadow_probe_execution_builder_mode(),
             sample_source: default_p37_shadow_probe_sample_source(),
             sample_mode: default_p37_shadow_probe_sample_mode(),
             sample_modulus: default_p37_shadow_probe_sample_modulus(),
@@ -3096,6 +3109,10 @@ fn default_p37_shadow_probe_namespace() -> String {
 
 fn default_p37_shadow_probe_dispatch_source() -> String {
     "counterfactual_shadow_probe".to_string()
+}
+
+fn default_p37_shadow_probe_execution_builder_mode() -> String {
+    "route_resolver".to_string()
 }
 
 fn default_p37_shadow_probe_sample_source() -> String {
@@ -4430,6 +4447,10 @@ enabled = true
             "counterfactual_shadow_probe"
         );
         assert_eq!(
+            config.p37_shadow_probe.p37_execution_builder_mode,
+            "route_resolver"
+        );
+        assert_eq!(
             config.p37_shadow_probe.probe_amount_source,
             "trigger_max_position_size"
         );
@@ -4495,6 +4516,7 @@ lifecycle_log_path = "logs/active/shadow_lifecycle.jsonl"
 [p37_shadow_probe]
 enabled = true
 namespace = "probe-test"
+p37_execution_builder_mode = "working_builder_parity"
 selection_log_path = "logs/probe/probe_selection.jsonl"
 skip_log_path = "logs/probe/probe_skips.jsonl"
 transport_log_path = "logs/probe/probe_transport.jsonl"
@@ -4508,12 +4530,32 @@ lifecycle_log_path = "logs/probe/probe_shadow_lifecycle.jsonl"
 
         assert!(config.p37_shadow_probe.enabled);
         assert_eq!(config.p37_shadow_probe.namespace, "probe-test");
+        assert_eq!(
+            config.p37_shadow_probe.p37_execution_builder_mode,
+            "working_builder_parity"
+        );
         assert!(!config.p37_shadow_probe.emit_event_bus);
         assert!(config
             .p37_shadow_probe
             .transport_log_path
             .ends_with("logs/probe/probe_transport.jsonl"));
         assert!(config.validate_execution_profile().is_ok());
+    }
+
+    #[test]
+    fn p37_shadow_probe_unknown_execution_builder_mode_fails_closed() {
+        let mut config = LauncherConfig::default();
+        config.execution.execution_mode = ExecutionMode::Shadow;
+        config.trigger.entry_mode = TriggerEntryMode::ShadowOnly;
+        config.trigger.shadow_run.enabled = true;
+        config.p37_shadow_probe.enabled = true;
+        config.p37_shadow_probe.p37_execution_builder_mode = "legacy_buy".to_string();
+
+        let err = validate_p37_shadow_probe_contract(&config)
+            .expect_err("unknown P3.7 builder mode must fail closed");
+
+        assert!(err.contains("p37_execution_builder_mode"));
+        assert!(err.contains("working_builder_parity"));
     }
 
     #[test]

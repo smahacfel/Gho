@@ -272,6 +272,32 @@ pub struct ShadowSimulationAccountDiagnostics {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legacy_buy_route_not_ready_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_parity_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_request_built: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_buy_variant: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_rpc_manifest_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_sender_manifest_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub working_builder_rpc_manifest_account_roles: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub working_builder_sender_manifest_account_roles: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_manifest_contains_bcv2: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_manifest_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub working_builder_required_accounts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub working_builder_creatable_accounts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub working_builder_ephemeral_accounts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub working_builder_missing_required_accounts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub precheck_account_set_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prepared_request_account_set_hash: Option<String>,

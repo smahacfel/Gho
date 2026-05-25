@@ -2139,6 +2139,47 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
             1,
         )
 
+    def test_x2_working_builder_parity_counters_are_reported(self) -> None:
+        rows = [
+            {
+                "working_builder_parity_mode": "working_builder_parity",
+                "working_builder_request_built": True,
+                "working_builder_rpc_manifest_hash": "rpc-hash",
+                "working_builder_sender_manifest_hash": "sender-hash",
+                "working_builder_manifest_contains_bcv2": True,
+                "working_builder_rpc_manifest_account_roles": [
+                    "16:bonding_curve_v2:bcv2:observed_tx_account_meta:required=true"
+                ],
+                "working_builder_missing_required_accounts": [],
+            },
+            {
+                "working_builder_parity_mode": "working_builder_parity",
+                "working_builder_request_built": True,
+                "working_builder_rpc_manifest_hash": "rpc-hash-2",
+                "working_builder_missing_required_accounts": [
+                    "bonding_curve_v2:bcv2:observed_tx_account_meta"
+                ],
+            },
+            {
+                "fallback_route_kind": "legacy_buy",
+                "fallback_route_attempted": True,
+                "selected_route_handoff_status": "selected_route_handoff_mismatch",
+            },
+        ]
+
+        payload = audit.working_builder_parity_payload(rows)
+        active_payload = audit.working_builder_parity_payload(rows, "active_shadow_")
+
+        self.assertEqual(payload["working_builder_parity_rows"], 2)
+        self.assertEqual(payload["working_builder_request_built_rows"], 2)
+        self.assertEqual(payload["legacy_fallback_attempted_rows"], 1)
+        self.assertEqual(payload["selected_route_handoff_mismatch_rows"], 1)
+        self.assertEqual(payload["working_builder_manifest_missing_required_rows"], 1)
+        self.assertEqual(payload["working_builder_manifest_ready_rows"], 1)
+        self.assertEqual(payload["working_builder_manifest_contains_bcv2_rows"], 1)
+        self.assertEqual(active_payload["active_shadow_working_builder_parity_rows"], 2)
+        self.assertEqual(active_payload["active_shadow_legacy_fallback_attempted_rows"], 1)
+
     def test_e4r2_selected_fallback_handoff_violation_counters_are_reported(
         self,
     ) -> None:

@@ -5074,6 +5074,19 @@ struct P37ShadowProbeSelectionRecord {
     legacy_buy_missing_pubkeys: Vec<String>,
     legacy_buy_route_ready: Option<bool>,
     legacy_buy_route_not_ready_reason: Option<String>,
+    working_builder_parity_mode: Option<String>,
+    working_builder_request_built: Option<bool>,
+    working_builder_buy_variant: Option<String>,
+    working_builder_rpc_manifest_hash: Option<String>,
+    working_builder_sender_manifest_hash: Option<String>,
+    working_builder_rpc_manifest_account_roles: Vec<String>,
+    working_builder_sender_manifest_account_roles: Vec<String>,
+    working_builder_manifest_contains_bcv2: Option<bool>,
+    working_builder_manifest_source: Option<String>,
+    working_builder_required_accounts: Vec<String>,
+    working_builder_creatable_accounts: Vec<String>,
+    working_builder_ephemeral_accounts: Vec<String>,
+    working_builder_missing_required_accounts: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq)]
@@ -5210,6 +5223,19 @@ struct P37ShadowProbeTransportRecord {
     legacy_buy_missing_pubkeys: Vec<String>,
     legacy_buy_route_ready: Option<bool>,
     legacy_buy_route_not_ready_reason: Option<String>,
+    working_builder_parity_mode: Option<String>,
+    working_builder_request_built: Option<bool>,
+    working_builder_buy_variant: Option<String>,
+    working_builder_rpc_manifest_hash: Option<String>,
+    working_builder_sender_manifest_hash: Option<String>,
+    working_builder_rpc_manifest_account_roles: Vec<String>,
+    working_builder_sender_manifest_account_roles: Vec<String>,
+    working_builder_manifest_contains_bcv2: Option<bool>,
+    working_builder_manifest_source: Option<String>,
+    working_builder_required_accounts: Vec<String>,
+    working_builder_creatable_accounts: Vec<String>,
+    working_builder_ephemeral_accounts: Vec<String>,
+    working_builder_missing_required_accounts: Vec<String>,
     execution_feasibility_status: Option<String>,
     execution_feasibility_reason: Option<String>,
     route_resolution_terminal_reason: Option<String>,
@@ -5645,6 +5671,19 @@ fn p37_shadow_probe_selection_record(
         legacy_buy_missing_pubkeys: Vec::new(),
         legacy_buy_route_ready: None,
         legacy_buy_route_not_ready_reason: None,
+        working_builder_parity_mode: None,
+        working_builder_request_built: None,
+        working_builder_buy_variant: None,
+        working_builder_rpc_manifest_hash: None,
+        working_builder_sender_manifest_hash: None,
+        working_builder_rpc_manifest_account_roles: Vec::new(),
+        working_builder_sender_manifest_account_roles: Vec::new(),
+        working_builder_manifest_contains_bcv2: None,
+        working_builder_manifest_source: None,
+        working_builder_required_accounts: Vec::new(),
+        working_builder_creatable_accounts: Vec::new(),
+        working_builder_ephemeral_accounts: Vec::new(),
+        working_builder_missing_required_accounts: Vec::new(),
         execution_feasibility_status: None,
         execution_feasibility_reason: None,
         route_resolution_terminal_reason: None,
@@ -5854,6 +5893,25 @@ fn p37_shadow_probe_artifact_records(
         legacy_buy_missing_pubkeys: record.legacy_buy_missing_pubkeys.clone(),
         legacy_buy_route_ready: record.legacy_buy_route_ready,
         legacy_buy_route_not_ready_reason: record.legacy_buy_route_not_ready_reason.clone(),
+        working_builder_parity_mode: record.working_builder_parity_mode.clone(),
+        working_builder_request_built: record.working_builder_request_built,
+        working_builder_buy_variant: record.working_builder_buy_variant.clone(),
+        working_builder_rpc_manifest_hash: record.working_builder_rpc_manifest_hash.clone(),
+        working_builder_sender_manifest_hash: record.working_builder_sender_manifest_hash.clone(),
+        working_builder_rpc_manifest_account_roles: record
+            .working_builder_rpc_manifest_account_roles
+            .clone(),
+        working_builder_sender_manifest_account_roles: record
+            .working_builder_sender_manifest_account_roles
+            .clone(),
+        working_builder_manifest_contains_bcv2: record.working_builder_manifest_contains_bcv2,
+        working_builder_manifest_source: record.working_builder_manifest_source.clone(),
+        working_builder_required_accounts: record.working_builder_required_accounts.clone(),
+        working_builder_creatable_accounts: record.working_builder_creatable_accounts.clone(),
+        working_builder_ephemeral_accounts: record.working_builder_ephemeral_accounts.clone(),
+        working_builder_missing_required_accounts: record
+            .working_builder_missing_required_accounts
+            .clone(),
         execution_feasibility_status: record.execution_feasibility_status.clone(),
         execution_feasibility_reason: record.execution_feasibility_reason.clone(),
         route_resolution_terminal_reason: record.route_resolution_terminal_reason.clone(),
@@ -6029,6 +6087,25 @@ fn p37_shadow_probe_artifact_records(
         legacy_buy_missing_pubkeys: record.legacy_buy_missing_pubkeys.clone(),
         legacy_buy_route_ready: record.legacy_buy_route_ready,
         legacy_buy_route_not_ready_reason: record.legacy_buy_route_not_ready_reason.clone(),
+        working_builder_parity_mode: record.working_builder_parity_mode.clone(),
+        working_builder_request_built: record.working_builder_request_built,
+        working_builder_buy_variant: record.working_builder_buy_variant.clone(),
+        working_builder_rpc_manifest_hash: record.working_builder_rpc_manifest_hash.clone(),
+        working_builder_sender_manifest_hash: record.working_builder_sender_manifest_hash.clone(),
+        working_builder_rpc_manifest_account_roles: record
+            .working_builder_rpc_manifest_account_roles
+            .clone(),
+        working_builder_sender_manifest_account_roles: record
+            .working_builder_sender_manifest_account_roles
+            .clone(),
+        working_builder_manifest_contains_bcv2: record.working_builder_manifest_contains_bcv2,
+        working_builder_manifest_source: record.working_builder_manifest_source.clone(),
+        working_builder_required_accounts: record.working_builder_required_accounts.clone(),
+        working_builder_creatable_accounts: record.working_builder_creatable_accounts.clone(),
+        working_builder_ephemeral_accounts: record.working_builder_ephemeral_accounts.clone(),
+        working_builder_missing_required_accounts: record
+            .working_builder_missing_required_accounts
+            .clone(),
         execution_feasibility_status: record.execution_feasibility_status.clone(),
         execution_feasibility_reason: record.execution_feasibility_reason.clone(),
         route_resolution_terminal_reason: record.route_resolution_terminal_reason.clone(),
@@ -6368,8 +6445,7 @@ fn p37_shadow_probe_fallback_failure_class_from_reason(
             "fallback_route_not_available_for_primary" => {
                 return Some("fallback_no_prepared_route".to_string());
             }
-            P37_LEGACY_BUY_UNSUPPORTED_ROUTE_REASON
-            | P37_LEGACY_BUY_FALLBACK_SUPPORT_STATUS => {
+            P37_LEGACY_BUY_UNSUPPORTED_ROUTE_REASON | P37_LEGACY_BUY_FALLBACK_SUPPORT_STATUS => {
                 return Some("fallback_unsupported_builder_layout".to_string());
             }
             _ => {}
@@ -6563,10 +6639,15 @@ struct P37LegacyBuyRouteDiagnostics {
     route_not_ready_reason: Option<String>,
 }
 
-const P37_LEGACY_BUY_FALLBACK_SUPPORT_STATUS: &str =
-    "unsupported_builder_layout_requires_bcv2";
+const P37_LEGACY_BUY_FALLBACK_SUPPORT_STATUS: &str = "unsupported_builder_layout_requires_bcv2";
 const P37_LEGACY_BUY_UNSUPPORTED_ROUTE_REASON: &str =
     "legacy_buy_unsupported_builder_layout_requires_bcv2";
+const P37_EXECUTION_BUILDER_MODE_WORKING_BUILDER_PARITY: &str = "working_builder_parity";
+
+fn p37_working_builder_parity_enabled(config: &P37ShadowProbeConfig) -> bool {
+    config.enabled
+        && config.p37_execution_builder_mode == P37_EXECUTION_BUILDER_MODE_WORKING_BUILDER_PARITY
+}
 
 fn p37_shadow_probe_manifest_entry_for_role<'a>(
     diagnostics: Option<&'a P37ShadowProbeAccountSetDiagnostics>,
@@ -6854,7 +6935,14 @@ fn p37_shadow_probe_legacy_buy_route_diagnostics(
         Some("legacy_buy_unknown_not_ready".to_string())
     };
     P37LegacyBuyRouteDiagnostics {
-        account_set_status: Some(if account_set_ready { "ready" } else { "not_ready" }.to_string()),
+        account_set_status: Some(
+            if account_set_ready {
+                "ready"
+            } else {
+                "not_ready"
+            }
+            .to_string(),
+        ),
         curve_pubkey,
         curve_source,
         curve_authority_status,
@@ -6878,10 +6966,26 @@ fn p37_shadow_probe_route_resolution_diagnostics(
     precheck_failure_reason: Option<&str>,
     missing_account: Option<(&str, &str)>,
 ) -> P37ExecutableRouteResolutionDiagnostics {
+    p37_shadow_probe_route_resolution_diagnostics_with_mode(
+        request,
+        account_set_diagnostics,
+        precheck_failure_reason,
+        missing_account,
+        false,
+    )
+}
+
+fn p37_shadow_probe_route_resolution_diagnostics_with_mode(
+    request: Option<&crate::components::trigger::PreparedBuyRequest>,
+    account_set_diagnostics: Option<&P37ShadowProbeAccountSetDiagnostics>,
+    precheck_failure_reason: Option<&str>,
+    missing_account: Option<(&str, &str)>,
+    working_builder_parity_mode: bool,
+) -> P37ExecutableRouteResolutionDiagnostics {
     let primary_route_kind =
         p37_shadow_probe_route_kind(request).unwrap_or_else(|| "unknown".to_string());
-    let fallback_route_kind =
-        (primary_route_kind != "legacy_buy").then(|| "legacy_buy".to_string());
+    let fallback_route_kind = (!working_builder_parity_mode && primary_route_kind != "legacy_buy")
+        .then(|| "legacy_buy".to_string());
     let legacy_buy =
         p37_shadow_probe_legacy_buy_route_diagnostics(request, account_set_diagnostics);
 
@@ -6928,6 +7032,58 @@ fn p37_shadow_probe_route_resolution_diagnostics(
             .clone()
             .unwrap_or_else(|| "primary_route_bcv2_missing".to_string());
         let fallback_attempted = fallback_route_kind.is_some();
+        if working_builder_parity_mode {
+            let no_executable_reason = if primary_reason.contains("source_not_authoritative")
+                || primary_reason.contains("identity_not_authoritative")
+            {
+                format!(
+                    "working_builder_final_manifest_account_source_not_authoritative:bonding_curve_v2:{pubkey}"
+                )
+            } else {
+                format!(
+                    "working_builder_final_manifest_missing_required_account:bonding_curve_v2:{pubkey}"
+                )
+            };
+            return P37ExecutableRouteResolutionDiagnostics {
+                route_resolution_status: Some("no_executable_route_account_set".to_string()),
+                selected_route_kind: None,
+                selected_route_reason: Some("working_builder_final_manifest_not_ready".to_string()),
+                primary_route_kind: Some(primary_route_kind),
+                primary_route_ready: Some(false),
+                primary_route_not_ready_reason: Some(primary_reason),
+                fallback_route_kind: None,
+                fallback_route_attempted: Some(false),
+                fallback_route_ready: Some(false),
+                fallback_route_not_ready_reason: None,
+                fallback_missing_roles: Vec::new(),
+                fallback_missing_pubkeys: Vec::new(),
+                fallback_account_sources: Vec::new(),
+                fallback_simulation_load_account_set: Vec::new(),
+                fallback_creatable_account_set: Vec::new(),
+                fallback_required_precheck_account_set: Vec::new(),
+                fallback_failure_class: None,
+                no_executable_route_account_set_reason: Some(no_executable_reason),
+                legacy_buy_account_set_status: legacy_buy.account_set_status,
+                legacy_buy_curve_pubkey: legacy_buy.curve_pubkey,
+                legacy_buy_curve_source: legacy_buy.curve_source,
+                legacy_buy_curve_authority_status: legacy_buy.curve_authority_status,
+                legacy_buy_curve_rpc_load_status: legacy_buy.curve_rpc_load_status,
+                legacy_buy_curve_rpc_load_ready: legacy_buy.curve_rpc_load_ready,
+                legacy_buy_curve_authority_readiness_status: legacy_buy
+                    .curve_authority_readiness_status,
+                legacy_buy_associated_bonding_curve_pubkey: legacy_buy
+                    .associated_bonding_curve_pubkey,
+                legacy_buy_associated_bonding_curve_source: legacy_buy
+                    .associated_bonding_curve_source,
+                legacy_buy_associated_bonding_curve_rpc_load_ready: legacy_buy
+                    .associated_bonding_curve_rpc_load_ready,
+                legacy_buy_required_roles: legacy_buy.required_roles,
+                legacy_buy_missing_roles: legacy_buy.missing_roles,
+                legacy_buy_missing_pubkeys: legacy_buy.missing_pubkeys,
+                legacy_buy_route_ready: legacy_buy.route_ready,
+                legacy_buy_route_not_ready_reason: legacy_buy.route_not_ready_reason,
+            };
+        }
         if fallback_attempted && legacy_buy.route_ready == Some(true) {
             let (
                 _fallback_missing_roles,
@@ -7457,6 +7613,19 @@ struct P37ShadowProbeExecutionDiagnostics {
     legacy_buy_missing_pubkeys: Vec<String>,
     legacy_buy_route_ready: Option<bool>,
     legacy_buy_route_not_ready_reason: Option<String>,
+    working_builder_parity_mode: Option<String>,
+    working_builder_request_built: Option<bool>,
+    working_builder_buy_variant: Option<String>,
+    working_builder_rpc_manifest_hash: Option<String>,
+    working_builder_sender_manifest_hash: Option<String>,
+    working_builder_rpc_manifest_account_roles: Vec<String>,
+    working_builder_sender_manifest_account_roles: Vec<String>,
+    working_builder_manifest_contains_bcv2: Option<bool>,
+    working_builder_manifest_source: Option<String>,
+    working_builder_required_accounts: Vec<String>,
+    working_builder_creatable_accounts: Vec<String>,
+    working_builder_ephemeral_accounts: Vec<String>,
+    working_builder_missing_required_accounts: Vec<String>,
     execution_feasibility_status: Option<String>,
     execution_feasibility_reason: Option<String>,
     route_resolution_terminal_reason: Option<String>,
@@ -7903,6 +8072,33 @@ fn p37_shadow_probe_as_bonding_curve_v2_source_precheck_skip(
     p37_shadow_probe_as_precheck_skip(record, reason)
 }
 
+fn p37_shadow_probe_as_bonding_curve_v2_source_precheck_skip_with_mode(
+    record: P37ShadowProbeSelectionRecord,
+    request: &crate::components::trigger::PreparedBuyRequest,
+    account_set_diagnostics: &P37ShadowProbeAccountSetDiagnostics,
+    diagnostics: P37ShadowProbeBondingCurveV2AuthorityDiagnostics,
+    working_builder_parity_mode: bool,
+) -> P37ShadowProbeSelectionRecord {
+    let reason = diagnostics.non_authoritative_reason().unwrap_or_else(|| {
+        "bonding_curve_v2_source_not_authoritative:unknown:unknown:missing_pubkey".to_string()
+    });
+    let mut record = p37_shadow_probe_as_bonding_curve_v2_source_precheck_skip(record, diagnostics);
+    if working_builder_parity_mode {
+        let route_resolution = p37_shadow_probe_route_resolution_diagnostics_with_mode(
+            Some(request),
+            Some(account_set_diagnostics),
+            Some(reason.as_str()),
+            record
+                .bonding_curve_v2_pubkey
+                .as_deref()
+                .map(|pubkey| ("bonding_curve_v2", pubkey)),
+            true,
+        );
+        p37_shadow_probe_apply_route_resolution_to_record(&mut record, route_resolution);
+    }
+    record
+}
+
 fn p37_shadow_probe_error_pubkey(message: &str) -> Option<String> {
     for marker in ["pubkey=", "account=", "AccountNotFound:"] {
         if let Some((_, tail)) = message.split_once(marker) {
@@ -8315,6 +8511,225 @@ fn p37_shadow_probe_account_manifest_summary(
     ))
 }
 
+#[derive(Debug, Clone, Default)]
+struct P37WorkingBuilderParityDiagnostics {
+    mode: Option<String>,
+    request_built: Option<bool>,
+    buy_variant: Option<String>,
+    rpc_manifest_hash: Option<String>,
+    sender_manifest_hash: Option<String>,
+    rpc_manifest_account_roles: Vec<String>,
+    sender_manifest_account_roles: Vec<String>,
+    manifest_contains_bcv2: Option<bool>,
+    manifest_source: Option<String>,
+    required_accounts: Vec<String>,
+    creatable_accounts: Vec<String>,
+    ephemeral_accounts: Vec<String>,
+    missing_required_accounts: Vec<String>,
+}
+
+fn p37_working_builder_manifest_order_hash(items: &[String]) -> Option<String> {
+    if items.is_empty() {
+        return None;
+    }
+    Some(
+        blake3::hash(items.join("\n").as_bytes())
+            .to_hex()
+            .to_string(),
+    )
+}
+
+fn p37_working_builder_rpc_manifest_account_roles(
+    diagnostics: &P37ShadowProbeAccountSetDiagnostics,
+) -> Vec<String> {
+    diagnostics
+        .manifest
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            format!(
+                "{}:{}:{}:{}:required={}",
+                index, entry.role, entry.pubkey, entry.source, entry.required
+            )
+        })
+        .collect()
+}
+
+fn p37_working_builder_sender_manifest_account_roles(
+    request: &crate::components::trigger::PreparedBuyRequest,
+) -> Vec<String> {
+    let account_keys = match &request.buy_tx.message {
+        solana_sdk::message::VersionedMessage::Legacy(message) => message.account_keys.as_slice(),
+        solana_sdk::message::VersionedMessage::V0(message) => message.account_keys.as_slice(),
+    };
+    account_keys
+        .iter()
+        .enumerate()
+        .map(|(index, pubkey)| {
+            let role =
+                crate::components::trigger::TriggerComponent::counterfactual_probe_account_role_for(
+                    request, pubkey,
+                );
+            format!("{index}:{role}:{pubkey}:sender_buy_tx_static")
+        })
+        .collect()
+}
+
+fn p37_working_builder_account_descriptor(
+    candidate: &P37ShadowProbeAccountNotFoundCandidate,
+) -> String {
+    format!(
+        "{}:{}:{}",
+        candidate.role, candidate.pubkey, candidate.source
+    )
+}
+
+fn p37_working_builder_final_manifest_missing_required_accounts(
+    request: &crate::components::trigger::PreparedBuyRequest,
+    diagnostics: &P37ShadowProbeAccountSetDiagnostics,
+) -> Vec<String> {
+    diagnostics
+        .missing_candidates
+        .iter()
+        .filter(|candidate| candidate.required)
+        .map(|candidate| {
+            p37_shadow_probe_classified_account_not_found_candidate(candidate, Some(request))
+        })
+        .filter(|candidate| candidate.candidate_fatality.as_deref() != Some("non_fatal"))
+        .map(|candidate| p37_working_builder_account_descriptor(&candidate))
+        .collect()
+}
+
+fn p37_working_builder_creatable_accounts(
+    request: &crate::components::trigger::PreparedBuyRequest,
+    diagnostics: &P37ShadowProbeAccountSetDiagnostics,
+) -> Vec<String> {
+    p37_shadow_probe_sorted_unique(diagnostics.manifest.iter().filter_map(|entry| {
+        let candidate = p37_shadow_probe_account_not_found_candidate_from_entry(entry);
+        let classified =
+            p37_shadow_probe_classified_account_not_found_candidate(&candidate, Some(request));
+        (classified.candidate_fatality.as_deref() == Some("non_fatal"))
+            .then(|| p37_working_builder_account_descriptor(&classified))
+    }))
+}
+
+fn p37_working_builder_required_accounts(
+    request: &crate::components::trigger::PreparedBuyRequest,
+) -> Vec<String> {
+    p37_shadow_probe_sorted_unique(
+        crate::components::trigger::TriggerComponent::counterfactual_probe_required_account_roles(
+            request,
+        )
+        .into_iter()
+        .map(|(pubkey, role)| format!("{role}:{pubkey}")),
+    )
+}
+
+fn p37_working_builder_ephemeral_accounts(
+    request: &crate::components::trigger::PreparedBuyRequest,
+) -> Vec<String> {
+    if request.payer_provenance == "ephemeral" {
+        vec![format!("payer_pubkey:{}:ephemeral", request.payer_pubkey)]
+    } else {
+        Vec::new()
+    }
+}
+
+fn p37_working_builder_parity_diagnostics(
+    request: Option<&crate::components::trigger::PreparedBuyRequest>,
+    account_set_diagnostics: Option<&P37ShadowProbeAccountSetDiagnostics>,
+    enabled: bool,
+) -> P37WorkingBuilderParityDiagnostics {
+    if !enabled {
+        return P37WorkingBuilderParityDiagnostics::default();
+    }
+    let Some(request) = request else {
+        return P37WorkingBuilderParityDiagnostics {
+            mode: Some(P37_EXECUTION_BUILDER_MODE_WORKING_BUILDER_PARITY.to_string()),
+            request_built: Some(false),
+            manifest_source: Some("direct_buy_builder".to_string()),
+            ..Default::default()
+        };
+    };
+    let token_params = p37_shadow_probe_request_token_params(request);
+    let request_built = request.build_profile.is_some();
+    let rpc_manifest_account_roles = account_set_diagnostics
+        .map(p37_working_builder_rpc_manifest_account_roles)
+        .unwrap_or_default();
+    let sender_manifest_account_roles = p37_working_builder_sender_manifest_account_roles(request);
+    let manifest_contains_bcv2 = account_set_diagnostics
+        .map(|diagnostics| {
+            diagnostics
+                .manifest
+                .iter()
+                .any(|entry| entry.role == "bonding_curve_v2")
+        })
+        .unwrap_or(false)
+        || sender_manifest_account_roles
+            .iter()
+            .any(|entry| entry.contains(":bonding_curve_v2:"));
+    let required_accounts = p37_working_builder_required_accounts(request);
+    let creatable_accounts = account_set_diagnostics
+        .map(|diagnostics| p37_working_builder_creatable_accounts(request, diagnostics))
+        .unwrap_or_default();
+    let missing_required_accounts = account_set_diagnostics
+        .map(|diagnostics| {
+            p37_shadow_probe_sorted_unique(
+                p37_working_builder_final_manifest_missing_required_accounts(request, diagnostics),
+            )
+        })
+        .unwrap_or_default();
+    P37WorkingBuilderParityDiagnostics {
+        mode: Some(P37_EXECUTION_BUILDER_MODE_WORKING_BUILDER_PARITY.to_string()),
+        request_built: Some(request_built),
+        buy_variant: token_params.buy_variant,
+        rpc_manifest_hash: p37_working_builder_manifest_order_hash(&rpc_manifest_account_roles),
+        sender_manifest_hash: p37_working_builder_manifest_order_hash(
+            &sender_manifest_account_roles,
+        ),
+        rpc_manifest_account_roles,
+        sender_manifest_account_roles,
+        manifest_contains_bcv2: Some(manifest_contains_bcv2),
+        manifest_source: request_built.then(|| "direct_buy_builder".to_string()),
+        required_accounts,
+        creatable_accounts,
+        ephemeral_accounts: p37_working_builder_ephemeral_accounts(request),
+        missing_required_accounts,
+    }
+}
+
+fn p37_apply_working_builder_parity_to_record(
+    record: &mut P37ShadowProbeSelectionRecord,
+    diagnostics: P37WorkingBuilderParityDiagnostics,
+) {
+    record.working_builder_parity_mode = diagnostics.mode;
+    record.working_builder_request_built = diagnostics.request_built;
+    record.working_builder_buy_variant = diagnostics.buy_variant;
+    record.working_builder_rpc_manifest_hash = diagnostics.rpc_manifest_hash;
+    record.working_builder_sender_manifest_hash = diagnostics.sender_manifest_hash;
+    record.working_builder_rpc_manifest_account_roles = diagnostics.rpc_manifest_account_roles;
+    record.working_builder_sender_manifest_account_roles =
+        diagnostics.sender_manifest_account_roles;
+    record.working_builder_manifest_contains_bcv2 = diagnostics.manifest_contains_bcv2;
+    record.working_builder_manifest_source = diagnostics.manifest_source;
+    record.working_builder_required_accounts = diagnostics.required_accounts;
+    record.working_builder_creatable_accounts = diagnostics.creatable_accounts;
+    record.working_builder_ephemeral_accounts = diagnostics.ephemeral_accounts;
+    record.working_builder_missing_required_accounts = diagnostics.missing_required_accounts;
+}
+
+fn p37_working_builder_final_manifest_failure_reason(
+    request: &crate::components::trigger::PreparedBuyRequest,
+    diagnostics: &P37ShadowProbeAccountSetDiagnostics,
+) -> Option<String> {
+    p37_working_builder_final_manifest_missing_required_accounts(request, diagnostics)
+        .into_iter()
+        .next()
+        .map(|descriptor| {
+            format!("working_builder_final_manifest_missing_required_account:{descriptor}")
+        })
+}
+
 fn p37_shadow_probe_classified_account_not_found_candidate(
     candidate: &P37ShadowProbeAccountNotFoundCandidate,
     request: Option<&crate::components::trigger::PreparedBuyRequest>,
@@ -8646,6 +9061,22 @@ fn active_shadow_account_diagnostics_from_account_set(
     account_set_diagnostics: Option<&P37ShadowProbeAccountSetDiagnostics>,
     precheck_status: &str,
 ) -> crate::events::ShadowSimulationAccountDiagnostics {
+    active_shadow_account_diagnostics_from_account_set_with_mode(
+        error_message,
+        request,
+        account_set_diagnostics,
+        precheck_status,
+        false,
+    )
+}
+
+fn active_shadow_account_diagnostics_from_account_set_with_mode(
+    error_message: Option<String>,
+    request: Option<&crate::components::trigger::PreparedBuyRequest>,
+    account_set_diagnostics: Option<&P37ShadowProbeAccountSetDiagnostics>,
+    precheck_status: &str,
+    working_builder_parity_mode: bool,
+) -> crate::events::ShadowSimulationAccountDiagnostics {
     let precheck_failure_reason = error_message.as_deref().and_then(|message| {
         if message.starts_with("execution_account_not_ready:")
             || message.starts_with("active_shadow_precheck_failed:")
@@ -8712,11 +9143,12 @@ fn active_shadow_account_diagnostics_from_account_set(
     });
     let bonding_curve_v2_authority =
         p37_shadow_probe_bonding_curve_v2_authority_diagnostics(request, account_set_diagnostics);
-    let route_resolution = p37_shadow_probe_route_resolution_diagnostics(
+    let route_resolution = p37_shadow_probe_route_resolution_diagnostics_with_mode(
         request,
         account_set_diagnostics,
         precheck_failure_reason.as_deref(),
         account_role.as_deref().zip(account_pubkey.as_deref()),
+        working_builder_parity_mode,
     );
     let route_resolution_terminal_reason = route_resolution.terminal_reason();
     let (execution_feasibility_status, execution_feasibility_reason, lifecycle_label_eligibility) =
@@ -8773,6 +9205,11 @@ fn active_shadow_account_diagnostics_from_account_set(
     };
     let selected_route_handoff =
         p37_selected_route_handoff_diagnostics(request, account_set_diagnostics);
+    let working_builder = p37_working_builder_parity_diagnostics(
+        request,
+        account_set_diagnostics,
+        working_builder_parity_mode,
+    );
     let active_shadow_lifecycle_eligibility_status = if !is_precheck_failure
         && lifecycle_label_eligibility.as_deref() == Some("lifecycle_label_candidate")
     {
@@ -8929,6 +9366,20 @@ fn active_shadow_account_diagnostics_from_account_set(
         legacy_buy_missing_pubkeys: route_resolution.legacy_buy_missing_pubkeys,
         legacy_buy_route_ready: route_resolution.legacy_buy_route_ready,
         legacy_buy_route_not_ready_reason: route_resolution.legacy_buy_route_not_ready_reason,
+        working_builder_parity_mode: working_builder.mode,
+        working_builder_request_built: working_builder.request_built,
+        working_builder_buy_variant: working_builder.buy_variant,
+        working_builder_rpc_manifest_hash: working_builder.rpc_manifest_hash,
+        working_builder_sender_manifest_hash: working_builder.sender_manifest_hash,
+        working_builder_rpc_manifest_account_roles: working_builder.rpc_manifest_account_roles,
+        working_builder_sender_manifest_account_roles: working_builder
+            .sender_manifest_account_roles,
+        working_builder_manifest_contains_bcv2: working_builder.manifest_contains_bcv2,
+        working_builder_manifest_source: working_builder.manifest_source,
+        working_builder_required_accounts: working_builder.required_accounts,
+        working_builder_creatable_accounts: working_builder.creatable_accounts,
+        working_builder_ephemeral_accounts: working_builder.ephemeral_accounts,
+        working_builder_missing_required_accounts: working_builder.missing_required_accounts,
         precheck_account_set_hash: account_set_diagnostics
             .and_then(|diagnostics| diagnostics.precheck_account_set_hash.clone()),
         prepared_request_account_set_hash: account_set_diagnostics
@@ -8972,12 +9423,23 @@ async fn active_shadow_account_diagnostics_from_request(
     request: &crate::components::trigger::PreparedBuyRequest,
     err: &anyhow::Error,
 ) -> crate::events::ShadowSimulationAccountDiagnostics {
+    active_shadow_account_diagnostics_from_request_with_mode(trigger_component, request, err, false)
+        .await
+}
+
+async fn active_shadow_account_diagnostics_from_request_with_mode(
+    trigger_component: &crate::components::trigger::TriggerComponent,
+    request: &crate::components::trigger::PreparedBuyRequest,
+    err: &anyhow::Error,
+    working_builder_parity_mode: bool,
+) -> crate::events::ShadowSimulationAccountDiagnostics {
     let diagnostics = p37_shadow_probe_account_set_diagnostics(trigger_component, request).await;
-    active_shadow_account_diagnostics_from_account_set(
+    active_shadow_account_diagnostics_from_account_set_with_mode(
         Some(err.to_string()),
         Some(request),
         Some(&diagnostics),
         "not_run_post_simulation_attribution",
+        working_builder_parity_mode,
     )
 }
 
@@ -9887,11 +10349,14 @@ fn p37_shadow_probe_execution_diagnostics(
     );
     let bonding_curve_v2_authority =
         p37_shadow_probe_bonding_curve_v2_authority_diagnostics(request, account_set_diagnostics);
-    let route_resolution = p37_shadow_probe_route_resolution_diagnostics(
+    let working_builder_parity_mode = record.working_builder_parity_mode.as_deref()
+        == Some(P37_EXECUTION_BUILDER_MODE_WORKING_BUILDER_PARITY);
+    let route_resolution = p37_shadow_probe_route_resolution_diagnostics_with_mode(
         request,
         account_set_diagnostics,
         precheck_failure_reason.as_deref(),
         account_role.as_deref().zip(account_pubkey.as_deref()),
+        working_builder_parity_mode,
     );
     let amount_guard = p37_shadow_probe_amount_guard_diagnostics(
         instruction_diagnostics.custom_code,
@@ -9924,6 +10389,11 @@ fn p37_shadow_probe_execution_diagnostics(
         route_resolution.execution_feasibility();
     let selected_route_handoff =
         p37_selected_route_handoff_diagnostics(request, account_set_diagnostics);
+    let working_builder = p37_working_builder_parity_diagnostics(
+        request,
+        account_set_diagnostics,
+        working_builder_parity_mode,
+    );
     P37ShadowProbeExecutionDiagnostics {
         precheck_failure_reason,
         simulation_error_kind: p37_shadow_probe_error_kind(error_message.as_deref()),
@@ -10034,6 +10504,20 @@ fn p37_shadow_probe_execution_diagnostics(
         legacy_buy_missing_pubkeys: route_resolution.legacy_buy_missing_pubkeys,
         legacy_buy_route_ready: route_resolution.legacy_buy_route_ready,
         legacy_buy_route_not_ready_reason: route_resolution.legacy_buy_route_not_ready_reason,
+        working_builder_parity_mode: working_builder.mode,
+        working_builder_request_built: working_builder.request_built,
+        working_builder_buy_variant: working_builder.buy_variant,
+        working_builder_rpc_manifest_hash: working_builder.rpc_manifest_hash,
+        working_builder_sender_manifest_hash: working_builder.sender_manifest_hash,
+        working_builder_rpc_manifest_account_roles: working_builder.rpc_manifest_account_roles,
+        working_builder_sender_manifest_account_roles: working_builder
+            .sender_manifest_account_roles,
+        working_builder_manifest_contains_bcv2: working_builder.manifest_contains_bcv2,
+        working_builder_manifest_source: working_builder.manifest_source,
+        working_builder_required_accounts: working_builder.required_accounts,
+        working_builder_creatable_accounts: working_builder.creatable_accounts,
+        working_builder_ephemeral_accounts: working_builder.ephemeral_accounts,
+        working_builder_missing_required_accounts: working_builder.missing_required_accounts,
         execution_feasibility_status,
         execution_feasibility_reason,
         route_resolution_terminal_reason,
@@ -10324,6 +10808,22 @@ fn p37_shadow_probe_transport_from_event(
         legacy_buy_missing_pubkeys: diagnostics.legacy_buy_missing_pubkeys,
         legacy_buy_route_ready: diagnostics.legacy_buy_route_ready,
         legacy_buy_route_not_ready_reason: diagnostics.legacy_buy_route_not_ready_reason,
+        working_builder_parity_mode: diagnostics.working_builder_parity_mode,
+        working_builder_request_built: diagnostics.working_builder_request_built,
+        working_builder_buy_variant: diagnostics.working_builder_buy_variant,
+        working_builder_rpc_manifest_hash: diagnostics.working_builder_rpc_manifest_hash,
+        working_builder_sender_manifest_hash: diagnostics.working_builder_sender_manifest_hash,
+        working_builder_rpc_manifest_account_roles: diagnostics
+            .working_builder_rpc_manifest_account_roles,
+        working_builder_sender_manifest_account_roles: diagnostics
+            .working_builder_sender_manifest_account_roles,
+        working_builder_manifest_contains_bcv2: diagnostics.working_builder_manifest_contains_bcv2,
+        working_builder_manifest_source: diagnostics.working_builder_manifest_source,
+        working_builder_required_accounts: diagnostics.working_builder_required_accounts,
+        working_builder_creatable_accounts: diagnostics.working_builder_creatable_accounts,
+        working_builder_ephemeral_accounts: diagnostics.working_builder_ephemeral_accounts,
+        working_builder_missing_required_accounts: diagnostics
+            .working_builder_missing_required_accounts,
         execution_feasibility_status: diagnostics.execution_feasibility_status,
         execution_feasibility_reason: diagnostics.execution_feasibility_reason,
         route_resolution_terminal_reason: diagnostics.route_resolution_terminal_reason,
@@ -10565,6 +11065,22 @@ fn p37_shadow_probe_transport_from_error(
         legacy_buy_missing_pubkeys: diagnostics.legacy_buy_missing_pubkeys,
         legacy_buy_route_ready: diagnostics.legacy_buy_route_ready,
         legacy_buy_route_not_ready_reason: diagnostics.legacy_buy_route_not_ready_reason,
+        working_builder_parity_mode: diagnostics.working_builder_parity_mode,
+        working_builder_request_built: diagnostics.working_builder_request_built,
+        working_builder_buy_variant: diagnostics.working_builder_buy_variant,
+        working_builder_rpc_manifest_hash: diagnostics.working_builder_rpc_manifest_hash,
+        working_builder_sender_manifest_hash: diagnostics.working_builder_sender_manifest_hash,
+        working_builder_rpc_manifest_account_roles: diagnostics
+            .working_builder_rpc_manifest_account_roles,
+        working_builder_sender_manifest_account_roles: diagnostics
+            .working_builder_sender_manifest_account_roles,
+        working_builder_manifest_contains_bcv2: diagnostics.working_builder_manifest_contains_bcv2,
+        working_builder_manifest_source: diagnostics.working_builder_manifest_source,
+        working_builder_required_accounts: diagnostics.working_builder_required_accounts,
+        working_builder_creatable_accounts: diagnostics.working_builder_creatable_accounts,
+        working_builder_ephemeral_accounts: diagnostics.working_builder_ephemeral_accounts,
+        working_builder_missing_required_accounts: diagnostics
+            .working_builder_missing_required_accounts,
         execution_feasibility_status: diagnostics.execution_feasibility_status,
         execution_feasibility_reason: diagnostics.execution_feasibility_reason,
         route_resolution_terminal_reason: diagnostics.route_resolution_terminal_reason,
@@ -10760,6 +11276,24 @@ fn enrich_probe_shadow_entry(
     entry.fallback_failure_class = transport.fallback_failure_class.clone();
     entry.no_executable_route_account_set_reason =
         transport.no_executable_route_account_set_reason.clone();
+    entry.working_builder_parity_mode = transport.working_builder_parity_mode.clone();
+    entry.working_builder_request_built = transport.working_builder_request_built;
+    entry.working_builder_buy_variant = transport.working_builder_buy_variant.clone();
+    entry.working_builder_rpc_manifest_hash = transport.working_builder_rpc_manifest_hash.clone();
+    entry.working_builder_sender_manifest_hash =
+        transport.working_builder_sender_manifest_hash.clone();
+    entry.working_builder_rpc_manifest_account_roles =
+        transport.working_builder_rpc_manifest_account_roles.clone();
+    entry.working_builder_sender_manifest_account_roles = transport
+        .working_builder_sender_manifest_account_roles
+        .clone();
+    entry.working_builder_manifest_contains_bcv2 = transport.working_builder_manifest_contains_bcv2;
+    entry.working_builder_manifest_source = transport.working_builder_manifest_source.clone();
+    entry.working_builder_required_accounts = transport.working_builder_required_accounts.clone();
+    entry.working_builder_creatable_accounts = transport.working_builder_creatable_accounts.clone();
+    entry.working_builder_ephemeral_accounts = transport.working_builder_ephemeral_accounts.clone();
+    entry.working_builder_missing_required_accounts =
+        transport.working_builder_missing_required_accounts.clone();
     entry.execution_feasibility_status = transport.execution_feasibility_status.clone();
     entry.execution_feasibility_reason = transport.execution_feasibility_reason.clone();
     entry.route_resolution_terminal_reason = transport.route_resolution_terminal_reason.clone();
@@ -10796,6 +11330,7 @@ async fn run_p37_shadow_probe_dispatch(
     buffered_txs: Vec<crate::components::gatekeeper::GatekeeperBufferedTx>,
     buy_mint: Pubkey,
 ) {
+    let working_builder_parity_mode = p37_working_builder_parity_enabled(&config);
     let _scan_permit = match runtime_state.acquire_scan_permit().await {
         Ok(permit) => permit,
         Err(reason) => {
@@ -10880,38 +11415,57 @@ async fn run_p37_shadow_probe_dispatch(
             return;
         }
     };
-    let request = match p37_apply_selected_fallback_route_handoff_for_shadow_only(
-        trigger_component.as_ref(),
-        buy_mint,
-        request,
-    )
-    .await
-    {
-        Ok(request) => request,
-        Err(err) => {
-            warn!(
-                probe_id = ?record.probe_id,
-                source_ab_record_id = ?record.source_ab_record_id,
-                error = %err,
-                "P37_SHADOW_PROBE_SELECTED_FALLBACK_HANDOFF_FAILED"
-            );
-            return;
+    let request = if working_builder_parity_mode {
+        request
+    } else {
+        match p37_apply_selected_fallback_route_handoff_for_shadow_only(
+            trigger_component.as_ref(),
+            buy_mint,
+            request,
+        )
+        .await
+        {
+            Ok(request) => request,
+            Err(err) => {
+                warn!(
+                    probe_id = ?record.probe_id,
+                    source_ab_record_id = ?record.source_ab_record_id,
+                    error = %err,
+                    "P37_SHADOW_PROBE_SELECTED_FALLBACK_HANDOFF_FAILED"
+                );
+                return;
+            }
         }
     };
+    let final_manifest_diagnostics =
+        p37_shadow_probe_account_set_diagnostics(&trigger_component, &request).await;
+    if working_builder_parity_mode {
+        let working_builder = p37_working_builder_parity_diagnostics(
+            Some(&request),
+            Some(&final_manifest_diagnostics),
+            true,
+        );
+        p37_apply_working_builder_parity_to_record(&mut record, working_builder);
+    }
 
     if !matches!(
         request.account_overrides.buy_variant,
         Some(trigger::PumpfunBuyVariant::LegacyBuy)
     ) {
-        let bonding_curve_v2_authority =
-            p37_shadow_probe_bonding_curve_v2_authority_diagnostics(Some(&request), None);
+        let bonding_curve_v2_authority = p37_shadow_probe_bonding_curve_v2_authority_diagnostics(
+            Some(&request),
+            Some(&final_manifest_diagnostics),
+        );
         if bonding_curve_v2_authority
             .non_authoritative_reason()
             .is_some()
         {
-            let skip_record = p37_shadow_probe_as_bonding_curve_v2_source_precheck_skip(
+            let skip_record = p37_shadow_probe_as_bonding_curve_v2_source_precheck_skip_with_mode(
                 record.clone(),
+                &request,
+                &final_manifest_diagnostics,
                 bonding_curve_v2_authority,
+                working_builder_parity_mode,
             );
             if let Err(err) = append_p37_shadow_probe_record(&config, &skip_record).await {
                 warn!(
@@ -10925,13 +11479,18 @@ async fn run_p37_shadow_probe_dispatch(
         }
     }
 
-    let final_manifest_diagnostics =
-        p37_shadow_probe_account_set_diagnostics(&trigger_component, &request).await;
-    if let Some(reason) =
+    let final_manifest_failure_reason = if working_builder_parity_mode {
+        p37_working_builder_final_manifest_failure_reason(&request, &final_manifest_diagnostics)
+    } else {
         p37_selected_route_final_manifest_failure_reason(&request, &final_manifest_diagnostics)
-    {
+    };
+    if let Some(reason) = final_manifest_failure_reason {
         record.execution_account_readiness_status = Some("not_ready".to_string());
-        record.execution_account_readiness_role = Some("selected_route_manifest".to_string());
+        record.execution_account_readiness_role = Some(if working_builder_parity_mode {
+            "working_builder_final_manifest".to_string()
+        } else {
+            "selected_route_manifest".to_string()
+        });
         record.execution_account_readiness_reason = Some(reason.clone());
         record.precheck_failure_reason = Some(reason.clone());
         let dispatch_ts_ms = current_time_ms();
@@ -10977,11 +11536,12 @@ async fn run_p37_shadow_probe_dispatch(
             record.probe_execution_account_wait_result = Some(wait_result);
             let account_set_diagnostics =
                 p37_shadow_probe_account_set_diagnostics(&trigger_component, &request).await;
-            let route_resolution = p37_shadow_probe_route_resolution_diagnostics(
+            let route_resolution = p37_shadow_probe_route_resolution_diagnostics_with_mode(
                 Some(&request),
                 Some(&account_set_diagnostics),
                 None,
                 Some((missing_role.as_str(), &missing_pubkey.to_string())),
+                working_builder_parity_mode,
             );
             let route_no_executable_reason = route_resolution.no_executable_reason();
             p37_shadow_probe_apply_route_resolution_to_record(&mut record, route_resolution);
@@ -13032,9 +13592,12 @@ async fn execute_gatekeeper_buy_path(
                         tip_lamports,
                         Some(resolved_tip.telemetry.clone()),
                         Some(join_metadata),
+                        p37_working_builder_parity_enabled(
+                            &ctx.oracle_runtime.config.p37_shadow_probe,
+                        ),
                     )
                     .await;
-                    match apply_trigger_dispatch_receipt(
+                    match apply_trigger_dispatch_receipt_with_builder_mode(
                         &ctx.event_tx,
                         ctx.post_buy_tx.as_ref(),
                         trigger_component,
@@ -13049,6 +13612,9 @@ async fn execute_gatekeeper_buy_path(
                         tip_lamports,
                         post_buy_lane,
                         receipt,
+                        p37_working_builder_parity_enabled(
+                            &ctx.oracle_runtime.config.p37_shadow_probe,
+                        ),
                     )
                     .await
                     {
@@ -13112,6 +13678,7 @@ async fn execute_gatekeeper_buy_via_trigger(
         tip_lamports,
         tip_floor_telemetry,
         None,
+        false,
     )
     .await
 }
@@ -13241,12 +13808,28 @@ async fn active_shadow_simulation_load_precheck_receipt(
     trigger_component: &crate::components::trigger::TriggerComponent,
     request: &crate::components::trigger::PreparedBuyRequest,
     shadow_only_dispatch: bool,
+    working_builder_parity_mode: bool,
 ) -> Option<crate::components::trigger::TriggerDispatchReceipt> {
     if !shadow_only_dispatch {
         return None;
     }
 
-    if matches!(
+    if working_builder_parity_mode {
+        let account_set_diagnostics =
+            p37_shadow_probe_account_set_diagnostics(trigger_component, request).await;
+        if let Some(reason) =
+            p37_working_builder_final_manifest_failure_reason(request, &account_set_diagnostics)
+        {
+            return Some(crate::components::trigger::TriggerDispatchReceipt {
+                primary_outcome: Err(anyhow::anyhow!("{reason}")),
+                shadow_task: None,
+                active_position_lease: None,
+                retain_position_slot_on_error: false,
+                failed_request: Some(request.clone()),
+                failed_context: None,
+            });
+        }
+    } else if matches!(
         request.account_overrides.buy_variant,
         Some(trigger::PumpfunBuyVariant::LegacyBuy)
     ) {
@@ -13271,11 +13854,12 @@ async fn active_shadow_simulation_load_precheck_receipt(
         Some(trigger::PumpfunBuyVariant::LegacyBuy)
     ) {
         if let Some(reason) = p37_shadow_probe_bonding_curve_v2_source_precheck_reason(request) {
-            let route_resolution = p37_shadow_probe_route_resolution_diagnostics(
+            let route_resolution = p37_shadow_probe_route_resolution_diagnostics_with_mode(
                 Some(request),
                 None,
                 Some(reason.as_str()),
                 None,
+                working_builder_parity_mode,
             );
             let error = route_resolution.no_executable_reason().unwrap_or(reason);
             return Some(crate::components::trigger::TriggerDispatchReceipt {
@@ -13294,11 +13878,12 @@ async fn active_shadow_simulation_load_precheck_receipt(
         .await;
     let error = match precheck_result {
         Ok(Some(missing)) => {
-            let route_resolution = p37_shadow_probe_route_resolution_diagnostics(
+            let route_resolution = p37_shadow_probe_route_resolution_diagnostics_with_mode(
                 Some(request),
                 None,
                 None,
                 Some((missing.role.as_str(), &missing.pubkey.to_string())),
+                working_builder_parity_mode,
             );
             if let Some(reason) = route_resolution.no_executable_reason() {
                 anyhow::anyhow!("{reason}")
@@ -13334,6 +13919,7 @@ async fn execute_gatekeeper_buy_via_trigger_with_fsc_gate(
     tip_lamports: u64,
     tip_floor_telemetry: Option<crate::components::live_tx_sender::TipFloorResolutionTelemetry>,
     join_metadata: Option<ExecutionJoinMetadata>,
+    working_builder_parity_mode: bool,
 ) -> crate::components::trigger::TriggerDispatchReceipt {
     if let Some(gate_status) = fsc_gate_status {
         match trigger_component.entry_mode() {
@@ -13370,7 +13956,9 @@ async fn execute_gatekeeper_buy_via_trigger_with_fsc_gate(
                         } else {
                             prepared_buy
                         };
-                        let prepared_buy =
+                        let prepared_buy = if working_builder_parity_mode {
+                            prepared_buy
+                        } else {
                             match p37_apply_selected_fallback_route_handoff_for_shadow_only(
                                 trigger_component,
                                 buy_mint,
@@ -13394,11 +13982,13 @@ async fn execute_gatekeeper_buy_via_trigger_with_fsc_gate(
                                             ),
                                     };
                                 }
-                            };
+                            }
+                        };
                         if let Some(receipt) = active_shadow_simulation_load_precheck_receipt(
                             trigger_component,
                             &prepared_buy,
                             true,
+                            working_builder_parity_mode,
                         )
                         .await
                         {
@@ -13488,27 +14078,31 @@ async fn execute_gatekeeper_buy_via_trigger_with_fsc_gate(
                 } else {
                     prepared_buy
                 };
-                let prepared_buy = match p37_apply_selected_fallback_route_handoff_for_shadow_only(
-                    trigger_component,
-                    buy_mint,
-                    prepared_buy,
-                )
-                .await
-                {
-                    Ok(prepared_buy) => prepared_buy,
-                    Err(e) => {
-                        return crate::components::trigger::TriggerDispatchReceipt {
-                            primary_outcome: Err(e),
-                            shadow_task: None,
-                            active_position_lease: None,
-                            retain_position_slot_on_error: false,
-                            failed_request: None,
-                            failed_context: trigger_dispatch_failure_context_with_join_metadata(
-                                trigger_component,
-                                tip_lamports,
-                                join_metadata.as_ref(),
-                            ),
-                        };
+                let prepared_buy = if working_builder_parity_mode {
+                    prepared_buy
+                } else {
+                    match p37_apply_selected_fallback_route_handoff_for_shadow_only(
+                        trigger_component,
+                        buy_mint,
+                        prepared_buy,
+                    )
+                    .await
+                    {
+                        Ok(prepared_buy) => prepared_buy,
+                        Err(e) => {
+                            return crate::components::trigger::TriggerDispatchReceipt {
+                                primary_outcome: Err(e),
+                                shadow_task: None,
+                                active_position_lease: None,
+                                retain_position_slot_on_error: false,
+                                failed_request: None,
+                                failed_context: trigger_dispatch_failure_context_with_join_metadata(
+                                    trigger_component,
+                                    tip_lamports,
+                                    join_metadata.as_ref(),
+                                ),
+                            };
+                        }
                     }
                 };
                 if let Some(receipt) = active_shadow_simulation_load_precheck_receipt(
@@ -13518,6 +14112,7 @@ async fn execute_gatekeeper_buy_via_trigger_with_fsc_gate(
                         trigger_component.entry_mode(),
                         crate::config::TriggerEntryMode::ShadowOnly
                     ),
+                    working_builder_parity_mode,
                 )
                 .await
                 {
@@ -13940,6 +14535,54 @@ fn shadow_entry_record_from_event(
             .account_diagnostics
             .legacy_buy_route_not_ready_reason
             .clone(),
+        working_builder_parity_mode: event
+            .account_diagnostics
+            .working_builder_parity_mode
+            .clone(),
+        working_builder_request_built: event.account_diagnostics.working_builder_request_built,
+        working_builder_buy_variant: event
+            .account_diagnostics
+            .working_builder_buy_variant
+            .clone(),
+        working_builder_rpc_manifest_hash: event
+            .account_diagnostics
+            .working_builder_rpc_manifest_hash
+            .clone(),
+        working_builder_sender_manifest_hash: event
+            .account_diagnostics
+            .working_builder_sender_manifest_hash
+            .clone(),
+        working_builder_rpc_manifest_account_roles: event
+            .account_diagnostics
+            .working_builder_rpc_manifest_account_roles
+            .clone(),
+        working_builder_sender_manifest_account_roles: event
+            .account_diagnostics
+            .working_builder_sender_manifest_account_roles
+            .clone(),
+        working_builder_manifest_contains_bcv2: event
+            .account_diagnostics
+            .working_builder_manifest_contains_bcv2,
+        working_builder_manifest_source: event
+            .account_diagnostics
+            .working_builder_manifest_source
+            .clone(),
+        working_builder_required_accounts: event
+            .account_diagnostics
+            .working_builder_required_accounts
+            .clone(),
+        working_builder_creatable_accounts: event
+            .account_diagnostics
+            .working_builder_creatable_accounts
+            .clone(),
+        working_builder_ephemeral_accounts: event
+            .account_diagnostics
+            .working_builder_ephemeral_accounts
+            .clone(),
+        working_builder_missing_required_accounts: event
+            .account_diagnostics
+            .working_builder_missing_required_accounts
+            .clone(),
         precheck_account_set_hash: None,
         prepared_request_account_set_hash: None,
         simulation_account_set_hash: None,
@@ -14098,6 +14741,19 @@ fn shadow_entry_record_from_request(
         legacy_buy_missing_pubkeys: Vec::new(),
         legacy_buy_route_ready: None,
         legacy_buy_route_not_ready_reason: None,
+        working_builder_parity_mode: None,
+        working_builder_request_built: None,
+        working_builder_buy_variant: None,
+        working_builder_rpc_manifest_hash: None,
+        working_builder_sender_manifest_hash: None,
+        working_builder_rpc_manifest_account_roles: Vec::new(),
+        working_builder_sender_manifest_account_roles: Vec::new(),
+        working_builder_manifest_contains_bcv2: None,
+        working_builder_manifest_source: None,
+        working_builder_required_accounts: Vec::new(),
+        working_builder_creatable_accounts: Vec::new(),
+        working_builder_ephemeral_accounts: Vec::new(),
+        working_builder_missing_required_accounts: Vec::new(),
         precheck_account_set_hash: None,
         prepared_request_account_set_hash: None,
         simulation_account_set_hash: None,
@@ -14279,6 +14935,29 @@ fn enrich_active_shadow_entry_with_account_diagnostics(
     entry.legacy_buy_missing_pubkeys = diagnostics.legacy_buy_missing_pubkeys.clone();
     entry.legacy_buy_route_ready = diagnostics.legacy_buy_route_ready;
     entry.legacy_buy_route_not_ready_reason = diagnostics.legacy_buy_route_not_ready_reason.clone();
+    entry.working_builder_parity_mode = diagnostics.working_builder_parity_mode.clone();
+    entry.working_builder_request_built = diagnostics.working_builder_request_built;
+    entry.working_builder_buy_variant = diagnostics.working_builder_buy_variant.clone();
+    entry.working_builder_rpc_manifest_hash = diagnostics.working_builder_rpc_manifest_hash.clone();
+    entry.working_builder_sender_manifest_hash =
+        diagnostics.working_builder_sender_manifest_hash.clone();
+    entry.working_builder_rpc_manifest_account_roles = diagnostics
+        .working_builder_rpc_manifest_account_roles
+        .clone();
+    entry.working_builder_sender_manifest_account_roles = diagnostics
+        .working_builder_sender_manifest_account_roles
+        .clone();
+    entry.working_builder_manifest_contains_bcv2 =
+        diagnostics.working_builder_manifest_contains_bcv2;
+    entry.working_builder_manifest_source = diagnostics.working_builder_manifest_source.clone();
+    entry.working_builder_required_accounts = diagnostics.working_builder_required_accounts.clone();
+    entry.working_builder_creatable_accounts =
+        diagnostics.working_builder_creatable_accounts.clone();
+    entry.working_builder_ephemeral_accounts =
+        diagnostics.working_builder_ephemeral_accounts.clone();
+    entry.working_builder_missing_required_accounts = diagnostics
+        .working_builder_missing_required_accounts
+        .clone();
     entry.execution_feasibility_status = diagnostics.execution_feasibility_status.clone();
     entry.execution_feasibility_reason = diagnostics.execution_feasibility_reason.clone();
     entry.route_resolution_terminal_reason = diagnostics.route_resolution_terminal_reason.clone();
@@ -14757,6 +15436,32 @@ struct ShadowEntryRecord {
     legacy_buy_route_ready: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     legacy_buy_route_not_ready_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_parity_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_request_built: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_buy_variant: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_rpc_manifest_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_sender_manifest_hash: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    working_builder_rpc_manifest_account_roles: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    working_builder_sender_manifest_account_roles: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_manifest_contains_bcv2: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_manifest_source: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    working_builder_required_accounts: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    working_builder_creatable_accounts: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    working_builder_ephemeral_accounts: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    working_builder_missing_required_accounts: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     precheck_account_set_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -15429,6 +16134,43 @@ async fn apply_trigger_dispatch_receipt(
     post_buy_lane: &str,
     receipt: crate::components::trigger::TriggerDispatchReceipt,
 ) -> anyhow::Result<TriggerBuyOutcomeApplied> {
+    apply_trigger_dispatch_receipt_with_builder_mode(
+        event_tx,
+        post_buy_tx,
+        trigger_component,
+        post_buy_epoch,
+        execution_mode,
+        canonical_shadow_entry_log_path,
+        shadow_lifecycle_log_path,
+        rollout_profile,
+        pool_amm_id,
+        pool_data,
+        trade_value_sol,
+        tip_lamports,
+        post_buy_lane,
+        receipt,
+        false,
+    )
+    .await
+}
+
+async fn apply_trigger_dispatch_receipt_with_builder_mode(
+    event_tx: &crate::events::EventBusSender,
+    post_buy_tx: Option<&DirectPostBuySender>,
+    trigger_component: &Arc<crate::components::trigger::TriggerComponent>,
+    post_buy_epoch: &std::sync::atomic::AtomicU64,
+    execution_mode: ExecutionMode,
+    canonical_shadow_entry_log_path: &std::path::Path,
+    shadow_lifecycle_log_path: Option<&std::path::Path>,
+    rollout_profile: &str,
+    pool_amm_id: Pubkey,
+    pool_data: &DetectedPool,
+    trade_value_sol: f64,
+    tip_lamports: u64,
+    post_buy_lane: &str,
+    receipt: crate::components::trigger::TriggerDispatchReceipt,
+    working_builder_parity_mode: bool,
+) -> anyhow::Result<TriggerBuyOutcomeApplied> {
     let crate::components::trigger::TriggerDispatchReceipt {
         primary_outcome,
         shadow_task,
@@ -15469,10 +16211,11 @@ async fn apply_trigger_dispatch_receipt(
                 if let Some((request, error_message)) = active_shadow_report_error_diagnostics {
                     let err = anyhow::anyhow!(error_message.clone());
                     Some(
-                        active_shadow_account_diagnostics_from_request(
+                        active_shadow_account_diagnostics_from_request_with_mode(
                             trigger_component,
                             request,
                             &err,
+                            working_builder_parity_mode,
                         )
                         .await,
                     )
@@ -15561,9 +16304,13 @@ async fn apply_trigger_dispatch_receipt(
                 )
                 .await;
             } else if let Some(request) = failed_request {
-                let account_diagnostics =
-                    active_shadow_account_diagnostics_from_request(trigger_component, &request, &e)
-                        .await;
+                let account_diagnostics = active_shadow_account_diagnostics_from_request_with_mode(
+                    trigger_component,
+                    &request,
+                    &e,
+                    working_builder_parity_mode,
+                )
+                .await;
                 if trigger_component.supports_shadow_run() {
                     let shadow_log_path =
                         std::path::PathBuf::from(trigger_component.shadow_run_output_path());
@@ -18993,6 +19740,170 @@ mod tests {
         assert!(diagnostics.prepared_request_account_set_hash.is_some());
     }
 
+    #[test]
+    fn p37_working_builder_parity_builds_prepared_request_via_trigger_path() {
+        let request = test_working_builder_prepared_buy_request();
+        let diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        let working =
+            p37_working_builder_parity_diagnostics(Some(&request), Some(&diagnostics), true);
+
+        assert!(request.build_profile.is_some());
+        assert_eq!(working.request_built, Some(true));
+        assert_eq!(working.buy_variant.as_deref(), Some("routed_exact_sol_in"));
+        assert_eq!(
+            working.manifest_source.as_deref(),
+            Some("direct_buy_builder")
+        );
+    }
+
+    #[test]
+    fn p37_working_builder_parity_does_not_select_legacy_fallback() {
+        let request = test_working_builder_prepared_buy_request();
+        let bcv2 = request
+            .account_overrides
+            .bonding_curve_v2
+            .expect("working request bcv2");
+        assert!(
+            p37_selected_legacy_buy_fallback_overrides(&request).is_some(),
+            "test fixture must prove a legacy fallback could exist outside parity mode"
+        );
+        let mut diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        diagnostics.manifest_lookup_performed = true;
+        diagnostics
+            .missing_candidates
+            .push(P37ShadowProbeAccountNotFoundCandidate {
+                pubkey: bcv2.to_string(),
+                role: "bonding_curve_v2".to_string(),
+                source: "observed_tx_account_meta".to_string(),
+                instruction_index: Some(0),
+                account_index: Some(16),
+                required: true,
+                ..Default::default()
+            });
+
+        let resolution = p37_shadow_probe_route_resolution_diagnostics_with_mode(
+            Some(&request),
+            Some(&diagnostics),
+            None,
+            Some(("bonding_curve_v2", bcv2.to_string().as_str())),
+            true,
+        );
+
+        assert_eq!(
+            resolution.route_resolution_status.as_deref(),
+            Some("no_executable_route_account_set")
+        );
+        assert_eq!(resolution.selected_route_kind, None);
+        assert_eq!(resolution.fallback_route_kind, None);
+        assert_eq!(resolution.fallback_route_attempted, Some(false));
+        assert_eq!(
+            resolution.selected_route_reason.as_deref(),
+            Some("working_builder_final_manifest_not_ready")
+        );
+    }
+
+    #[test]
+    fn p37_working_builder_parity_does_not_mutate_buy_variant_after_request_build() {
+        let request = test_working_builder_prepared_buy_request();
+        let original_profile_variant = request
+            .build_profile
+            .as_ref()
+            .expect("build profile")
+            .buy_variant;
+        let original_override_variant = request.account_overrides.buy_variant;
+        let diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        let working =
+            p37_working_builder_parity_diagnostics(Some(&request), Some(&diagnostics), true);
+
+        assert_eq!(
+            original_profile_variant,
+            trigger::PumpfunBuyVariant::RoutedExactSolIn
+        );
+        assert_eq!(
+            original_override_variant,
+            Some(trigger::PumpfunBuyVariant::RoutedExactSolIn)
+        );
+        assert_eq!(working.buy_variant.as_deref(), Some("routed_exact_sol_in"));
+        assert!(
+            p37_selected_legacy_buy_fallback_overrides(&request).is_some(),
+            "parity mode must keep the already-built request even if the old fallback helper could rewrite it"
+        );
+    }
+
+    #[test]
+    fn p37_working_builder_parity_logs_rpc_and_sender_manifest_hashes() {
+        let request = test_working_builder_prepared_buy_request();
+        let diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        let working =
+            p37_working_builder_parity_diagnostics(Some(&request), Some(&diagnostics), true);
+
+        assert!(working.rpc_manifest_hash.is_some());
+        assert!(working.sender_manifest_hash.is_some());
+        assert!(!working.rpc_manifest_account_roles.is_empty());
+        assert!(!working.sender_manifest_account_roles.is_empty());
+        assert_eq!(working.manifest_contains_bcv2, Some(true));
+    }
+
+    #[test]
+    fn p37_working_builder_parity_precheck_uses_final_builder_manifest() {
+        let request = test_working_builder_prepared_buy_request();
+        let diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        let working =
+            p37_working_builder_parity_diagnostics(Some(&request), Some(&diagnostics), true);
+        let bcv2 = request
+            .account_overrides
+            .bonding_curve_v2
+            .expect("working request bcv2");
+
+        assert!(working
+            .required_accounts
+            .iter()
+            .any(|entry| entry == &format!("bonding_curve_v2:{bcv2}")));
+        assert!(working
+            .rpc_manifest_account_roles
+            .iter()
+            .any(|entry| entry.contains(":bonding_curve_v2:")));
+        assert!(working.missing_required_accounts.is_empty());
+    }
+
+    #[test]
+    fn p37_working_builder_parity_blocks_when_final_manifest_account_missing() {
+        let request = test_working_builder_prepared_buy_request();
+        let bcv2 = request
+            .account_overrides
+            .bonding_curve_v2
+            .expect("working request bcv2");
+        let mut diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        diagnostics.manifest_lookup_performed = true;
+        diagnostics
+            .missing_candidates
+            .push(P37ShadowProbeAccountNotFoundCandidate {
+                pubkey: bcv2.to_string(),
+                role: "bonding_curve_v2".to_string(),
+                source: "observed_tx_account_meta".to_string(),
+                instruction_index: Some(0),
+                account_index: Some(16),
+                required: true,
+                ..Default::default()
+            });
+
+        let reason = p37_working_builder_final_manifest_failure_reason(&request, &diagnostics)
+            .expect("working manifest must fail closed on missing required bcv2");
+        let working =
+            p37_working_builder_parity_diagnostics(Some(&request), Some(&diagnostics), true);
+
+        assert_eq!(
+            reason,
+            format!(
+                "working_builder_final_manifest_missing_required_account:bonding_curve_v2:{bcv2}:observed_tx_account_meta"
+            )
+        );
+        assert_eq!(
+            working.missing_required_accounts,
+            vec![format!("bonding_curve_v2:{bcv2}:observed_tx_account_meta")]
+        );
+    }
+
     fn p37_shadow_probe_test_bcv2_manifest_entry(
         pubkey: String,
         source: &str,
@@ -19644,7 +20555,10 @@ mod tests {
                 .as_deref(),
             Some("authoritative_and_load_ready")
         );
-        assert_eq!(resolution.legacy_buy_account_set_status.as_deref(), Some("ready"));
+        assert_eq!(
+            resolution.legacy_buy_account_set_status.as_deref(),
+            Some("ready")
+        );
         assert_eq!(resolution.legacy_buy_route_ready, Some(false));
         assert_eq!(
             resolution.legacy_buy_route_not_ready_reason.as_deref(),
@@ -19668,8 +20582,8 @@ mod tests {
     }
 
     #[test]
-    fn p37_route_resolver_primary_bcv2_manifest_missing_excludes_unsupported_legacy_fallback_without_precheck_reason()
-    {
+    fn p37_route_resolver_primary_bcv2_manifest_missing_excludes_unsupported_legacy_fallback_without_precheck_reason(
+    ) {
         let mut request = test_prepared_buy_request();
         let bcv2 = Pubkey::new_unique().to_string();
         let legacy_curve_pubkey = Pubkey::new_unique();
@@ -20057,7 +20971,10 @@ mod tests {
             resolution.route_resolution_status.as_deref(),
             Some("no_executable_route_account_set")
         );
-        assert_eq!(resolution.legacy_buy_account_set_status.as_deref(), Some("ready"));
+        assert_eq!(
+            resolution.legacy_buy_account_set_status.as_deref(),
+            Some("ready")
+        );
         assert_eq!(resolution.legacy_buy_route_ready, Some(false));
         assert_eq!(
             resolution.legacy_buy_route_not_ready_reason.as_deref(),
@@ -21605,6 +22522,134 @@ mod tests {
             shadow_spawn_latency_ms: 0,
             preparation_telemetry: Default::default(),
             build_profile: None,
+            rpc_buy_tx,
+            buy_tx,
+            tip_tx: None,
+            decision_ts_ms: 10,
+        }
+    }
+
+    fn test_working_builder_prepared_buy_request() -> crate::components::trigger::PreparedBuyRequest
+    {
+        let payer = solana_sdk::signature::Keypair::new();
+        let recent_blockhash = solana_sdk::hash::Hash::new_unique();
+        let mint = Pubkey::new_unique();
+        let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).expect("valid token program");
+        let associated_bonding_curve =
+            trigger::DirectBuyBuilder::canonical_associated_bonding_curve(&mint, &token_program);
+        let bonding_curve_v2 = trigger::DirectBuyBuilder::derive_bonding_curve_v2(&mint).0;
+        let legacy_curve_pubkey = trigger::DirectBuyBuilder::derive_bonding_curve(&mint).0;
+        let creator_pubkey = Pubkey::new_unique();
+        let amount_lamports = 100_000_000;
+        let min_tokens_out = 250_000;
+        let user_ata = spl_associated_token_account::get_associated_token_address_with_program_id(
+            &payer.pubkey(),
+            &mint,
+            &token_program,
+        );
+        let account_overrides = crate::components::trigger::BuyAccountOverrides {
+            global_config: Some(trigger::DirectBuyBuilder::canonical_global_config()),
+            fee_recipient: Some(trigger::DirectBuyBuilder::canonical_fee_recipient()),
+            token_program: Some(token_program),
+            creator_pubkey: Some(creator_pubkey),
+            buy_variant: Some(trigger::PumpfunBuyVariant::RoutedExactSolIn),
+            associated_bonding_curve: Some(associated_bonding_curve),
+            bonding_curve_v2: Some(bonding_curve_v2),
+            bonding_curve_v2_provenance: Some(crate::events::ObservedAccountMetaProvenance {
+                provenance_status: Some("route_compatible".to_string()),
+                resolved_pubkey: Some(bonding_curve_v2.to_string()),
+                source_buy_variant: Some("routed_exact_sol_in".to_string()),
+                instruction_account_position: Some(16),
+                tx_success: Some(true),
+                ..Default::default()
+            }),
+            legacy_buy_curve: Some(p37_shadow_probe_test_legacy_curve()),
+            legacy_buy_curve_pubkey: Some(legacy_curve_pubkey),
+            legacy_buy_curve_source: Some("materialized_feature_set".to_string()),
+            legacy_buy_curve_authority_status: Some("authoritative_mfs".to_string()),
+        };
+        let buy_instruction =
+            trigger::DirectBuyBuilder::build_buy_ix_with_accounts_and_bonding_curve_v2(
+                &payer.pubkey(),
+                &mint,
+                &token_program,
+                account_overrides.global_config,
+                account_overrides.fee_recipient,
+                account_overrides.creator_pubkey,
+                account_overrides.buy_variant,
+                account_overrides.associated_bonding_curve,
+                account_overrides.bonding_curve_v2,
+                amount_lamports,
+                min_tokens_out,
+            );
+        let rpc_buy_tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
+            std::slice::from_ref(&buy_instruction),
+            Some(&payer.pubkey()),
+            &[&payer],
+            recent_blockhash,
+        );
+        let buy_tx = solana_sdk::transaction::VersionedTransaction::try_new(
+            solana_sdk::message::VersionedMessage::V0(
+                solana_sdk::message::v0::Message::try_compile(
+                    &payer.pubkey(),
+                    std::slice::from_ref(&buy_instruction),
+                    &[],
+                    recent_blockhash,
+                )
+                .expect("working builder test message"),
+            ),
+            &[&payer],
+        )
+        .expect("working builder test versioned tx");
+        let build_profile = crate::components::trigger::BuyBuildProfile {
+            mint,
+            payer_pubkey: payer.pubkey(),
+            user_ata,
+            token_program,
+            attach_idempotent_ata_create: false,
+            ata_missing_pre_submit: false,
+            account_overrides: account_overrides.clone(),
+            amount_lamports,
+            trade_value_sol: amount_lamports as f64 / LAMPORTS_PER_SOL,
+            pre_submit_token_balance: Some(0),
+            buy_variant: trigger::PumpfunBuyVariant::RoutedExactSolIn,
+            entry_token_amount_raw: Some(min_tokens_out),
+            min_tokens_out,
+            token_param_role: "min_tokens_out",
+            ata_instruction: None,
+            buy_instruction,
+        };
+
+        crate::components::trigger::PreparedBuyRequest {
+            join_metadata: ExecutionJoinMetadata::default(),
+            mint,
+            payer_pubkey: payer.pubkey(),
+            payer_provenance: "configured",
+            user_ata,
+            token_program,
+            attach_idempotent_ata_create: false,
+            ata_missing_pre_submit: false,
+            account_overrides,
+            pre_submit_token_balance: Some(0),
+            amount_lamports,
+            trade_value_sol: amount_lamports as f64 / LAMPORTS_PER_SOL,
+            entry_token_amount_raw: Some(min_tokens_out),
+            tip_lamports: 10,
+            min_tokens_out,
+            priority_fee_micro_lamports:
+                crate::components::live_tx_sender::HELIUS_PRIORITY_FEE_FALLBACK_MICRO_LAMPORTS,
+            recent_blockhash,
+            blockhash_source: "test",
+            blockhash_age_ms: 0,
+            blockhash_last_valid_block_height: 0,
+            blockhash_observed_block_height: 0,
+            blockhash_fetched_at: std::time::Instant::now(),
+            blockhash_fetch_latency_ms: 0,
+            post_blockhash_build_latency_ms: 0,
+            reserve_slot_latency_ms: 0,
+            shadow_spawn_latency_ms: 0,
+            preparation_telemetry: Default::default(),
+            build_profile: Some(build_profile),
             rpc_buy_tx,
             buy_tx,
             tip_tx: None,
@@ -25464,6 +26509,7 @@ mod tests {
             1_000_000,
             None,
             None,
+            false,
         )
         .await;
         let err = receipt
@@ -25520,6 +26566,7 @@ mod tests {
             1_000_000,
             None,
             None,
+            false,
         )
         .await;
         let err = receipt
