@@ -8,7 +8,7 @@ use anyhow::Result;
 use ghost_brain::oracle::{InitPoolEvent, SnapshotEngine};
 use ghost_core::health::RuntimeHealth;
 use ghost_core::shadow_ledger::ShadowLedger;
-use ghost_core::{TimestampQuality, Wal};
+use ghost_core::{ExecutionAccountRole, TimestampQuality, Wal};
 use metrics::increment_counter;
 use seer::{
     config::{
@@ -72,6 +72,28 @@ fn trade_has_forwardable_identity(trade: &seer::types::TradeEvent) -> bool {
     trade.pool_amm_id != Pubkey::default() && trade.mint != Pubkey::default()
 }
 
+fn route_compatible_trade_bcv2_context(
+    trade: &seer::types::TradeEvent,
+) -> Option<SessionBcv2Context> {
+    if !trade.success || trade.pool_amm_id == Pubkey::default() || trade.mint == Pubkey::default() {
+        return None;
+    }
+    let bcv2 = trade
+        .bonding_curve_v2
+        .filter(|value| *value != Pubkey::default())?;
+    let provenance = trade.bonding_curve_v2_provenance.as_ref()?;
+    if provenance.provenance_status.as_deref() != Some("route_compatible") {
+        return None;
+    }
+
+    Some(SessionBcv2Context {
+        account_pubkey: bcv2,
+        base_mint: Some(trade.mint),
+        pool_id: Some(trade.pool_amm_id),
+        canonical_bonding_curve: None,
+    })
+}
+
 #[derive(Clone)]
 struct BufferedSessionTrade {
     trade: seer::types::TradeEvent,
@@ -125,6 +147,90 @@ struct BufferedSessionAccountUpdate {
     buffered_at: Instant,
 }
 
+#[derive(Clone)]
+struct BufferedSessionExecutionAccountEvidence {
+    event: seer::ipc::DetectedExecutionAccountEvidenceEvent,
+    buffered_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SessionDetectedKeyRole {
+    Pool,
+    BaseMint,
+    BondingCurve,
+    BondingCurveV2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct SessionDetectedKey {
+    role: SessionDetectedKeyRole,
+    pubkey: Pubkey,
+}
+
+impl SessionDetectedKey {
+    fn new(role: SessionDetectedKeyRole, pubkey: Pubkey) -> Self {
+        Self { role, pubkey }
+    }
+
+    fn pool(pubkey: Pubkey) -> Self {
+        Self::new(SessionDetectedKeyRole::Pool, pubkey)
+    }
+
+    fn base_mint(pubkey: Pubkey) -> Self {
+        Self::new(SessionDetectedKeyRole::BaseMint, pubkey)
+    }
+
+    fn bonding_curve(pubkey: Pubkey) -> Self {
+        Self::new(SessionDetectedKeyRole::BondingCurve, pubkey)
+    }
+
+    fn bonding_curve_v2(pubkey: Pubkey) -> Self {
+        Self::new(SessionDetectedKeyRole::BondingCurveV2, pubkey)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SessionBcv2Context {
+    account_pubkey: Pubkey,
+    base_mint: Option<Pubkey>,
+    pool_id: Option<Pubkey>,
+    canonical_bonding_curve: Option<Pubkey>,
+}
+
+impl SessionBcv2Context {
+    fn from_evidence(evidence: &ghost_core::ExecutionAccountEvidence) -> Option<Self> {
+        (evidence.role == ExecutionAccountRole::BondingCurveV2
+            && evidence.account_pubkey != Pubkey::default())
+        .then_some(Self {
+            account_pubkey: evidence.account_pubkey,
+            base_mint: evidence
+                .base_mint
+                .filter(|value| *value != Pubkey::default()),
+            pool_id: evidence.pool_id.filter(|value| *value != Pubkey::default()),
+            canonical_bonding_curve: evidence
+                .canonical_bonding_curve
+                .filter(|value| *value != Pubkey::default()),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionExecutionAccountEvidenceDecision {
+    ForwardNow,
+    BufferedUntilPoolDetected,
+    SilentDrop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionExecutionAccountEvidenceIngressResult {
+    pub decision: SessionExecutionAccountEvidenceDecision,
+    pub expired_count: usize,
+    pub expired_detected_keys: usize,
+    pub expired_evidence_count: usize,
+    pub evicted_per_key: usize,
+    pub evicted_global: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionAccountUpdateDecision {
     ForwardNow,
@@ -143,21 +249,32 @@ pub struct SessionAccountUpdateIngressResult {
 
 pub struct SessionAccountUpdateFlushResult {
     pub replay_ready: Vec<seer::ipc::DetectedAccountUpdateEvent>,
+    pub replay_ready_evidence: Vec<seer::ipc::DetectedExecutionAccountEvidenceEvent>,
     pub expired_count: usize,
+    pub expired_evidence_count: usize,
     pub expired_detected_keys: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct SessionAccountUpdateLivenessResult {
     expired_count: usize,
+    expired_evidence_count: usize,
     expired_detected_keys: usize,
+    replay_ready_evidence: Vec<seer::ipc::DetectedExecutionAccountEvidenceEvent>,
 }
 
 pub struct SessionAccountUpdateBridge {
-    detected_keys: HashMap<Pubkey, Instant>,
-    detected_key_order: VecDeque<Pubkey>,
-    pending_updates: HashMap<Pubkey, VecDeque<BufferedSessionAccountUpdate>>,
+    detected_keys: HashMap<SessionDetectedKey, Instant>,
+    detected_key_order: VecDeque<SessionDetectedKey>,
+    pending_updates: HashMap<SessionDetectedKey, VecDeque<BufferedSessionAccountUpdate>>,
+    pending_execution_evidence:
+        HashMap<SessionDetectedKey, VecDeque<BufferedSessionExecutionAccountEvidence>>,
     pending_total: usize,
+    pending_execution_evidence_total: usize,
+    bcv2_contexts_by_pubkey: HashMap<Pubkey, SessionBcv2Context>,
+    bcv2_by_base_mint: HashMap<Pubkey, HashSet<Pubkey>>,
+    bcv2_by_pool: HashMap<Pubkey, HashSet<Pubkey>>,
+    bcv2_by_canonical_bonding_curve: HashMap<Pubkey, HashSet<Pubkey>>,
     ttl: Duration,
     per_key_cap: usize,
     global_cap: usize,
@@ -189,7 +306,13 @@ impl SessionAccountUpdateBridge {
             detected_keys: HashMap::new(),
             detected_key_order: VecDeque::new(),
             pending_updates: HashMap::new(),
+            pending_execution_evidence: HashMap::new(),
             pending_total: 0,
+            pending_execution_evidence_total: 0,
+            bcv2_contexts_by_pubkey: HashMap::new(),
+            bcv2_by_base_mint: HashMap::new(),
+            bcv2_by_pool: HashMap::new(),
+            bcv2_by_canonical_bonding_curve: HashMap::new(),
             ttl,
             per_key_cap: per_key_cap.max(1),
             global_cap: global_cap.max(1),
@@ -215,9 +338,9 @@ impl SessionAccountUpdateBridge {
     ) -> SessionAccountUpdateFlushResult {
         let liveness = self.refresh_detected_keys(
             [
-                candidate.pool_amm_id,
-                candidate.bonding_curve,
-                candidate.base_mint,
+                SessionDetectedKey::pool(candidate.pool_amm_id),
+                SessionDetectedKey::bonding_curve(candidate.bonding_curve),
+                SessionDetectedKey::base_mint(candidate.base_mint),
             ],
             now,
         );
@@ -225,11 +348,11 @@ impl SessionAccountUpdateBridge {
         let mut replay_ready = Vec::new();
         let mut flush_keys = Vec::new();
         for key in [
-            candidate.pool_amm_id,
-            candidate.bonding_curve,
-            candidate.base_mint,
+            SessionDetectedKey::pool(candidate.pool_amm_id),
+            SessionDetectedKey::bonding_curve(candidate.bonding_curve),
+            SessionDetectedKey::base_mint(candidate.base_mint),
         ] {
-            if key != Pubkey::default() && !flush_keys.contains(&key) {
+            if key.pubkey != Pubkey::default() && !flush_keys.contains(&key) {
                 flush_keys.push(key);
             }
         }
@@ -253,9 +376,26 @@ impl SessionAccountUpdateBridge {
             )
         });
 
+        let mut replay_ready_evidence = liveness.replay_ready_evidence;
+        let mut expired_evidence_count = liveness.expired_evidence_count;
+        for bcv2 in self.related_bcv2_for_detected_pool(candidate) {
+            if let Some(context) = self.bcv2_contexts_by_pubkey.get(&bcv2).copied() {
+                self.register_bcv2_key(context, now, "pool_detected");
+            } else {
+                self.mark_detected_key(SessionDetectedKey::bonding_curve_v2(bcv2), now);
+            }
+            let (mut flushed, expired) =
+                self.flush_pending_bcv2_evidence(bcv2, now, "pool_detected");
+            replay_ready_evidence.append(&mut flushed);
+            expired_evidence_count += expired;
+        }
+        replay_ready_evidence.sort_by_key(|event| event.sequence_number);
+
         SessionAccountUpdateFlushResult {
             replay_ready,
+            replay_ready_evidence,
             expired_count: liveness.expired_count,
+            expired_evidence_count,
             expired_detected_keys: liveness.expired_detected_keys,
         }
     }
@@ -265,7 +405,28 @@ impl SessionAccountUpdateBridge {
         trade: &seer::types::TradeEvent,
         now: Instant,
     ) -> SessionAccountUpdateLivenessResult {
-        self.refresh_detected_keys([trade.pool_amm_id, trade.mint], now)
+        let mut liveness = self.refresh_detected_keys(
+            [
+                SessionDetectedKey::pool(trade.pool_amm_id),
+                SessionDetectedKey::base_mint(trade.mint),
+            ],
+            now,
+        );
+        if let Some(context) = route_compatible_trade_bcv2_context(trade) {
+            self.record_bcv2_context(context);
+            self.register_bcv2_key(context, now, "route_compatible_trade");
+            let (mut flushed, expired) = self.flush_pending_bcv2_evidence(
+                context.account_pubkey,
+                now,
+                "route_compatible_trade",
+            );
+            liveness.replay_ready_evidence.append(&mut flushed);
+            liveness.expired_evidence_count += expired;
+            liveness
+                .replay_ready_evidence
+                .sort_by_key(|event| event.sequence_number);
+        }
+        liveness
     }
 
     pub fn ingest_account_update(
@@ -273,12 +434,14 @@ impl SessionAccountUpdateBridge {
         update: &seer::ipc::DetectedAccountUpdateEvent,
         now: Instant,
     ) -> SessionAccountUpdateIngressResult {
-        let (expired_count, expired_detected_keys) = self.prune_expired(now);
+        let (expired_count, expired_detected_keys, _) = self.prune_expired(now);
 
-        if self.detected_keys.contains_key(&update.bonding_curve)
-            || self.detected_keys.contains_key(&update.base_mint)
+        let bonding_curve_key = SessionDetectedKey::bonding_curve(update.bonding_curve);
+        let base_mint_key = SessionDetectedKey::base_mint(update.base_mint);
+        if self.detected_keys.contains_key(&bonding_curve_key)
+            || self.detected_keys.contains_key(&base_mint_key)
         {
-            self.mark_detected_keys([update.bonding_curve, update.base_mint], now);
+            self.mark_detected_keys([bonding_curve_key, base_mint_key], now);
             return SessionAccountUpdateIngressResult {
                 decision: SessionAccountUpdateDecision::ForwardNow,
                 expired_count,
@@ -289,9 +452,9 @@ impl SessionAccountUpdateBridge {
         }
 
         let key = if update.bonding_curve != Pubkey::default() {
-            update.bonding_curve
+            bonding_curve_key
         } else if update.base_mint != Pubkey::default() {
-            update.base_mint
+            base_mint_key
         } else {
             return SessionAccountUpdateIngressResult {
                 decision: SessionAccountUpdateDecision::SilentDrop,
@@ -338,7 +501,92 @@ impl SessionAccountUpdateBridge {
         }
     }
 
-    fn prune_expired(&mut self, now: Instant) -> (usize, usize) {
+    pub fn ingest_execution_account_evidence(
+        &mut self,
+        event: &seer::ipc::DetectedExecutionAccountEvidenceEvent,
+        now: Instant,
+    ) -> SessionExecutionAccountEvidenceIngressResult {
+        let (expired_count, expired_detected_keys, expired_evidence_count) =
+            self.prune_expired(now);
+
+        if event.evidence.role != ExecutionAccountRole::BondingCurveV2 {
+            return SessionExecutionAccountEvidenceIngressResult {
+                decision: SessionExecutionAccountEvidenceDecision::ForwardNow,
+                expired_count,
+                expired_detected_keys,
+                expired_evidence_count,
+                evicted_per_key: 0,
+                evicted_global: 0,
+            };
+        }
+
+        let Some(context) = SessionBcv2Context::from_evidence(&event.evidence) else {
+            return SessionExecutionAccountEvidenceIngressResult {
+                decision: SessionExecutionAccountEvidenceDecision::SilentDrop,
+                expired_count,
+                expired_detected_keys,
+                expired_evidence_count,
+                evicted_per_key: 0,
+                evicted_global: 0,
+            };
+        };
+
+        self.record_bcv2_context(context);
+        let bcv2_key = SessionDetectedKey::bonding_curve_v2(context.account_pubkey);
+        if self.detected_keys.contains_key(&bcv2_key)
+            || self.bcv2_context_has_detected_session(&context)
+        {
+            self.register_bcv2_key(context, now, "execution_account_evidence");
+            return SessionExecutionAccountEvidenceIngressResult {
+                decision: SessionExecutionAccountEvidenceDecision::ForwardNow,
+                expired_count,
+                expired_detected_keys,
+                expired_evidence_count,
+                evicted_per_key: 0,
+                evicted_global: 0,
+            };
+        }
+
+        let mut evicted_per_key = 0;
+        let mut evicted_global = 0;
+
+        while self.pending_execution_evidence_total >= self.global_cap {
+            if self.evict_oldest_pending_evidence().is_some() {
+                evicted_global += 1;
+            } else {
+                break;
+            }
+        }
+
+        let queue = self.pending_execution_evidence.entry(bcv2_key).or_default();
+        while queue.len() >= self.per_key_cap {
+            if queue.pop_front().is_some() {
+                self.pending_execution_evidence_total =
+                    self.pending_execution_evidence_total.saturating_sub(1);
+                evicted_per_key += 1;
+            } else {
+                break;
+            }
+        }
+
+        queue.push_back(BufferedSessionExecutionAccountEvidence {
+            event: event.clone(),
+            buffered_at: now,
+        });
+        self.pending_execution_evidence_total += 1;
+        increment_counter!("seer_bridge_session_bcv2_evidence_buffered_total");
+
+        SessionExecutionAccountEvidenceIngressResult {
+            decision: SessionExecutionAccountEvidenceDecision::BufferedUntilPoolDetected,
+            expired_count,
+            expired_detected_keys,
+            expired_evidence_count,
+            evicted_per_key,
+            evicted_global,
+        }
+    }
+
+    fn prune_expired(&mut self, now: Instant) -> (usize, usize, usize) {
         let mut expired = 0;
         let mut empty_keys = Vec::new();
 
@@ -360,6 +608,36 @@ impl SessionAccountUpdateBridge {
             self.pending_updates.remove(&key);
         }
 
+        let mut expired_evidence = 0;
+        let mut empty_evidence_keys = Vec::new();
+
+        for (key, queue) in self.pending_execution_evidence.iter_mut() {
+            while matches!(queue.front(), Some(front) if now.duration_since(front.buffered_at) > self.ttl)
+            {
+                if queue.pop_front().is_some() {
+                    self.pending_execution_evidence_total =
+                        self.pending_execution_evidence_total.saturating_sub(1);
+                    expired_evidence += 1;
+                }
+            }
+
+            if queue.is_empty() {
+                empty_evidence_keys.push(*key);
+            }
+        }
+
+        for key in empty_evidence_keys {
+            self.pending_execution_evidence.remove(&key);
+        }
+
+        if expired_evidence > 0 {
+            ::metrics::counter!(
+                "seer_bridge_session_bcv2_pending_expired_total",
+                expired_evidence as u64
+            );
+            tracing::info!(count = expired_evidence, "BCV2_SESSION_PENDING_EXPIRED");
+        }
+
         let mut expired_detected_keys = 0;
         while let Some(key) = self.detected_key_order.front().copied() {
             let is_expired = self
@@ -377,23 +655,28 @@ impl SessionAccountUpdateBridge {
             }
         }
 
-        (expired, expired_detected_keys)
+        (expired, expired_detected_keys, expired_evidence)
     }
 
-    fn mark_detected_key(&mut self, key: Pubkey, now: Instant) {
+    fn mark_detected_key(&mut self, key: SessionDetectedKey, now: Instant) -> bool {
+        if key.pubkey == Pubkey::default() {
+            return false;
+        }
+        let is_new = !self.detected_keys.contains_key(&key);
         if !self.detected_keys.contains_key(&key) {
             self.detected_key_order.push_back(key);
         }
         self.detected_keys.insert(key, now);
+        is_new
     }
 
     fn mark_detected_keys<I>(&mut self, keys: I, now: Instant)
     where
-        I: IntoIterator<Item = Pubkey>,
+        I: IntoIterator<Item = SessionDetectedKey>,
     {
         let mut protected_keys = HashSet::new();
         for key in keys {
-            if key != Pubkey::default() {
+            if key.pubkey != Pubkey::default() {
                 self.mark_detected_key(key, now);
                 protected_keys.insert(key);
             }
@@ -412,13 +695,16 @@ impl SessionAccountUpdateBridge {
         now: Instant,
     ) -> SessionAccountUpdateLivenessResult
     where
-        I: IntoIterator<Item = Pubkey>,
+        I: IntoIterator<Item = SessionDetectedKey>,
     {
-        let (expired_count, expired_detected_keys) = self.prune_expired(now);
+        let (expired_count, expired_detected_keys, expired_evidence_count) =
+            self.prune_expired(now);
         self.mark_detected_keys(keys, now);
         SessionAccountUpdateLivenessResult {
             expired_count,
+            expired_evidence_count,
             expired_detected_keys,
+            replay_ready_evidence: Vec::new(),
         }
     }
 
@@ -447,7 +733,202 @@ impl SessionAccountUpdateBridge {
         removed.0.map(|buffered| buffered.update)
     }
 
-    fn evict_oldest_detected_key(&mut self, protected_keys: &HashSet<Pubkey>) -> Option<Pubkey> {
+    fn evict_oldest_pending_evidence(
+        &mut self,
+    ) -> Option<seer::ipc::DetectedExecutionAccountEvidenceEvent> {
+        let oldest_key = self
+            .pending_execution_evidence
+            .iter()
+            .filter_map(|(key, queue)| queue.front().map(|front| (*key, front.buffered_at)))
+            .min_by_key(|(_, buffered_at)| *buffered_at)
+            .map(|(key, _)| key)?;
+
+        let removed = {
+            let queue = self.pending_execution_evidence.get_mut(&oldest_key)?;
+            let removed = queue.pop_front();
+            let emptied = queue.is_empty();
+            (removed, emptied)
+        };
+
+        if removed.0.is_some() {
+            self.pending_execution_evidence_total =
+                self.pending_execution_evidence_total.saturating_sub(1);
+        }
+        if removed.1 {
+            self.pending_execution_evidence.remove(&oldest_key);
+        }
+
+        removed.0.map(|buffered| buffered.event)
+    }
+
+    fn record_bcv2_context(&mut self, context: SessionBcv2Context) {
+        if context.account_pubkey == Pubkey::default() {
+            return;
+        }
+
+        self.bcv2_contexts_by_pubkey
+            .entry(context.account_pubkey)
+            .and_modify(|existing| {
+                if existing.base_mint.is_none() {
+                    existing.base_mint = context.base_mint;
+                }
+                if existing.pool_id.is_none() {
+                    existing.pool_id = context.pool_id;
+                }
+                if existing.canonical_bonding_curve.is_none() {
+                    existing.canonical_bonding_curve = context.canonical_bonding_curve;
+                }
+            })
+            .or_insert(context);
+
+        if let Some(base_mint) = context.base_mint {
+            self.bcv2_by_base_mint
+                .entry(base_mint)
+                .or_default()
+                .insert(context.account_pubkey);
+        }
+        if let Some(pool_id) = context.pool_id {
+            self.bcv2_by_pool
+                .entry(pool_id)
+                .or_default()
+                .insert(context.account_pubkey);
+        }
+        if let Some(canonical_bonding_curve) = context.canonical_bonding_curve {
+            self.bcv2_by_canonical_bonding_curve
+                .entry(canonical_bonding_curve)
+                .or_default()
+                .insert(context.account_pubkey);
+        }
+    }
+
+    fn bcv2_context_has_detected_session(&self, context: &SessionBcv2Context) -> bool {
+        self.detected_keys
+            .contains_key(&SessionDetectedKey::bonding_curve_v2(
+                context.account_pubkey,
+            ))
+            || context
+                .pool_id
+                .map(|pool| {
+                    self.detected_keys
+                        .contains_key(&SessionDetectedKey::pool(pool))
+                })
+                .unwrap_or(false)
+            || context
+                .base_mint
+                .map(|base_mint| {
+                    self.detected_keys
+                        .contains_key(&SessionDetectedKey::base_mint(base_mint))
+                })
+                .unwrap_or(false)
+            || context
+                .canonical_bonding_curve
+                .map(|bonding_curve| {
+                    self.detected_keys
+                        .contains_key(&SessionDetectedKey::bonding_curve(bonding_curve))
+                })
+                .unwrap_or(false)
+    }
+
+    fn register_bcv2_key(
+        &mut self,
+        context: SessionBcv2Context,
+        now: Instant,
+        trigger: &'static str,
+    ) -> bool {
+        let inserted = self.mark_detected_key(
+            SessionDetectedKey::bonding_curve_v2(context.account_pubkey),
+            now,
+        );
+        if inserted {
+            increment_counter!("seer_bridge_session_bcv2_key_registered_total");
+            tracing::info!(
+                account_pubkey = %context.account_pubkey,
+                base_mint = ?context.base_mint,
+                pool_id = ?context.pool_id,
+                trigger,
+                "BCV2_SESSION_KEY_REGISTERED"
+            );
+        }
+        inserted
+    }
+
+    fn related_bcv2_for_detected_pool(
+        &self,
+        candidate: &seer::types::CandidatePool,
+    ) -> Vec<Pubkey> {
+        let mut related = HashSet::new();
+        if let Some(values) = self.bcv2_by_pool.get(&candidate.pool_amm_id) {
+            related.extend(values.iter().copied());
+        }
+        if let Some(values) = self.bcv2_by_base_mint.get(&candidate.base_mint) {
+            related.extend(values.iter().copied());
+        }
+        if let Some(values) = self
+            .bcv2_by_canonical_bonding_curve
+            .get(&candidate.bonding_curve)
+        {
+            related.extend(values.iter().copied());
+        }
+        let mut related = related.into_iter().collect::<Vec<_>>();
+        related.sort();
+        related
+    }
+
+    fn flush_pending_bcv2_evidence(
+        &mut self,
+        account_pubkey: Pubkey,
+        now: Instant,
+        trigger: &'static str,
+    ) -> (Vec<seer::ipc::DetectedExecutionAccountEvidenceEvent>, usize) {
+        let key = SessionDetectedKey::bonding_curve_v2(account_pubkey);
+        let mut replay_ready = Vec::new();
+        let mut expired = 0;
+
+        if let Some(mut queue) = self.pending_execution_evidence.remove(&key) {
+            while let Some(buffered) = queue.pop_front() {
+                self.pending_execution_evidence_total =
+                    self.pending_execution_evidence_total.saturating_sub(1);
+                if now.duration_since(buffered.buffered_at) <= self.ttl {
+                    replay_ready.push(buffered.event);
+                } else {
+                    expired += 1;
+                }
+            }
+        }
+
+        if !replay_ready.is_empty() {
+            ::metrics::counter!(
+                "seer_bridge_session_bcv2_pending_flushed_total",
+                replay_ready.len() as u64
+            );
+            tracing::info!(
+                account_pubkey = %account_pubkey,
+                count = replay_ready.len(),
+                trigger,
+                "BCV2_SESSION_PENDING_FLUSHED"
+            );
+        }
+        if expired > 0 {
+            ::metrics::counter!(
+                "seer_bridge_session_bcv2_pending_expired_total",
+                expired as u64
+            );
+            tracing::info!(
+                account_pubkey = %account_pubkey,
+                count = expired,
+                trigger,
+                "BCV2_SESSION_PENDING_EXPIRED"
+            );
+        }
+
+        replay_ready.sort_by_key(|event| event.sequence_number);
+        (replay_ready, expired)
+    }
+
+    fn evict_oldest_detected_key(
+        &mut self,
+        protected_keys: &HashSet<SessionDetectedKey>,
+    ) -> Option<SessionDetectedKey> {
         let mut deferred = VecDeque::new();
         let mut evicted = None;
 
@@ -475,6 +956,17 @@ impl SessionAccountUpdateBridge {
     #[cfg(test)]
     fn pending_total(&self) -> usize {
         self.pending_total
+    }
+
+    #[cfg(test)]
+    fn pending_execution_evidence_total(&self) -> usize {
+        self.pending_execution_evidence_total
+    }
+
+    #[cfg(test)]
+    fn has_detected_bcv2_key(&self, pubkey: Pubkey) -> bool {
+        self.detected_keys
+            .contains_key(&SessionDetectedKey::bonding_curve_v2(pubkey))
     }
 }
 
@@ -1367,7 +1859,7 @@ pub async fn run(
                         session_trade_bridge.prune_expired(Instant::now());
                     record_session_buffer_expired(expired_pending);
                     record_session_detected_pool_expired(expired_detected);
-                    let (expired_updates, expired_update_keys) =
+                    let (expired_updates, expired_update_keys, _expired_evidence) =
                         session_account_update_bridge.prune_expired(Instant::now());
                     record_session_account_update_expired(expired_updates);
                     record_session_account_update_detected_key_expired(expired_update_keys);
@@ -1572,6 +2064,13 @@ pub async fn run(
                                 );
                             }
                         }
+                        for evidence in &flush.replay_ready_evidence {
+                            emit_execution_account_evidence_to_event_bus(
+                                tx,
+                                evidence,
+                                health_ipc.as_ref(),
+                            );
+                        }
                     } else {
                         let flush_result = session_trade_bridge
                             .register_detected_pool(candidate.pool_amm_id, Instant::now());
@@ -1638,6 +2137,13 @@ pub async fn run(
                             record_session_account_update_detected_key_expired(
                                 liveness.expired_detected_keys,
                             );
+                            for evidence in &liveness.replay_ready_evidence {
+                                emit_execution_account_evidence_to_event_bus(
+                                    tx,
+                                    evidence,
+                                    health_ipc.as_ref(),
+                                );
+                            }
                             let ipc_volume_sol = if trade.is_buy {
                                 trade.max_sol_cost as f64 / 1_000_000_000.0
                             } else {
@@ -1664,11 +2170,27 @@ pub async fn run(
 
                 seer::ipc::SeerEvent::ExecutionAccountEvidence(evidence_event) => {
                     if let Some(ref tx) = event_bus_tx {
-                        emit_execution_account_evidence_to_event_bus(
-                            tx,
-                            &evidence_event,
-                            health_ipc.as_ref(),
+                        let ingress = session_account_update_bridge
+                            .ingest_execution_account_evidence(&evidence_event, Instant::now());
+                        record_session_account_update_expired(ingress.expired_count);
+                        record_session_account_update_detected_key_expired(
+                            ingress.expired_detected_keys,
                         );
+                        match ingress.decision {
+                            SessionExecutionAccountEvidenceDecision::ForwardNow => {
+                                emit_execution_account_evidence_to_event_bus(
+                                    tx,
+                                    &evidence_event,
+                                    health_ipc.as_ref(),
+                                );
+                            }
+                            SessionExecutionAccountEvidenceDecision::BufferedUntilPoolDetected => {}
+                            SessionExecutionAccountEvidenceDecision::SilentDrop => {
+                                increment_counter!(
+                                    "seer_bridge_session_bcv2_evidence_silent_drop_total"
+                                );
+                            }
+                        }
                     }
                 }
 
@@ -1881,8 +2403,8 @@ mod tests {
         emit_execution_account_evidence_to_event_bus, emit_funding_transfer_to_event_bus,
         process_pool_detected_event_for_session_gate, process_trade_event_for_session_gate,
         pumpswap_program_id, trade_event_to_pool_transaction, trade_has_forwardable_identity,
-        SessionAccountUpdateBridge, SessionAccountUpdateDecision, SessionPoolTradeBridge,
-        SessionTradeDecision,
+        SessionAccountUpdateBridge, SessionAccountUpdateDecision, SessionBcv2Context,
+        SessionExecutionAccountEvidenceDecision, SessionPoolTradeBridge, SessionTradeDecision,
     };
     use crate::events::{create_event_bus, GhostEvent};
     use ghost_core::CurveFinality;
@@ -1891,7 +2413,10 @@ mod tests {
         DetectedExecutionAccountEvidenceEvent, DetectedFundingTransferEvent, DetectedPoolEvent,
         DetectedTradeEvent, EventPriority, FundingTransferEvent, SeerEvent,
     };
-    use seer::types::{CandidatePool, InstructionProvenance, RawBytesMissingReason, TradeEvent};
+    use seer::types::{
+        CandidatePool, InstructionProvenance, ObservedAccountMetaProvenance, RawBytesMissingReason,
+        TradeEvent,
+    };
     use solana_sdk::{pubkey::Pubkey, signature::Signature};
     use std::str::FromStr;
     use std::time::{Duration, Instant, SystemTime};
@@ -2016,6 +2541,70 @@ mod tests {
             evidence_ready: true,
             reason: None,
         }
+    }
+
+    fn make_bcv2_execution_account_evidence_event(
+        bcv2: Pubkey,
+        base_mint: Option<Pubkey>,
+        pool_id: Option<Pubkey>,
+        source: ghost_core::ExecutionAccountEvidenceSource,
+        status: ghost_core::ExecutionAccountEvidenceStatus,
+    ) -> DetectedExecutionAccountEvidenceEvent {
+        DetectedExecutionAccountEvidenceEvent {
+            evidence: ghost_core::ExecutionAccountEvidence {
+                role: ghost_core::ExecutionAccountRole::BondingCurveV2,
+                account_pubkey: bcv2,
+                base_mint,
+                pool_id,
+                canonical_bonding_curve: None,
+                source,
+                status,
+                slot: Some(42),
+                context_slot: Some(43),
+                write_version: Some(7),
+                owner: Some(Pubkey::new_unique()),
+                data_len: Some(256),
+                tx_signature: Some("evidence-sig".to_string()),
+                observed_instruction_index: Some(1),
+                observed_account_position: Some(9),
+                provenance_status: Some("route_compatible".to_string()),
+                detected_at_ms: 22_000,
+                received_at_ms: 22_010,
+                evidence_ready: true,
+                reason: None,
+            },
+            detected_at: SystemTime::now(),
+            sequence_number: 11,
+            priority: EventPriority::High,
+        }
+    }
+
+    fn make_route_compatible_bcv2_trade(pool: Pubkey, mint: Pubkey, bcv2: Pubkey) -> TradeEvent {
+        let mut trade = make_trade(pool, mint);
+        trade.bonding_curve_v2 = Some(bcv2);
+        trade.bonding_curve_v2_provenance = Some(ObservedAccountMetaProvenance {
+            source_tx_signature: Some(trade.signature.to_string()),
+            source_slot: trade.slot,
+            source_instruction_index: Some(3),
+            instruction_account_position: Some(16),
+            resolved_pubkey: Some(bcv2.to_string()),
+            tx_success: Some(true),
+            provenance_status: Some("route_compatible".to_string()),
+            ..Default::default()
+        });
+        trade
+    }
+
+    fn make_non_route_compatible_bcv2_trade(
+        pool: Pubkey,
+        mint: Pubkey,
+        bcv2: Pubkey,
+    ) -> TradeEvent {
+        let mut trade = make_route_compatible_bcv2_trade(pool, mint, bcv2);
+        if let Some(provenance) = trade.bonding_curve_v2_provenance.as_mut() {
+            provenance.provenance_status = Some("message_index_resolution_failed".to_string());
+        }
+        trade
     }
 
     fn make_account_update(base_mint: Pubkey, bonding_curve: Pubkey) -> DetectedAccountUpdateEvent {
@@ -2543,6 +3132,245 @@ mod tests {
         assert_eq!(ingress.decision, SessionAccountUpdateDecision::ForwardNow);
     }
 
+    #[test]
+    fn session_bridge_buffers_bcv2_evidence_until_pool_detected() {
+        let mut bridge = SessionAccountUpdateBridge::new(
+            Duration::from_millis(100),
+            4,
+            16,
+            Duration::from_secs(60),
+            32,
+        );
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let bcv2 = Pubkey::new_unique();
+        let evidence = make_bcv2_execution_account_evidence_event(
+            bcv2,
+            Some(mint),
+            Some(pool),
+            ghost_core::ExecutionAccountEvidenceSource::RpcHydration,
+            ghost_core::ExecutionAccountEvidenceStatus::RpcReady,
+        );
+
+        let ingress = bridge.ingest_execution_account_evidence(&evidence, Instant::now());
+
+        assert_eq!(
+            ingress.decision,
+            SessionExecutionAccountEvidenceDecision::BufferedUntilPoolDetected
+        );
+        assert_eq!(bridge.pending_execution_evidence_total(), 1);
+        assert!(!bridge.has_detected_bcv2_key(bcv2));
+    }
+
+    #[test]
+    fn session_bridge_pool_detected_flushes_bcv2_evidence_by_base_mint_context() {
+        let mut bridge = SessionAccountUpdateBridge::new(
+            Duration::from_millis(100),
+            4,
+            16,
+            Duration::from_secs(60),
+            32,
+        );
+        let candidate_pool = Pubkey::new_unique();
+        let other_pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let bcv2 = Pubkey::new_unique();
+        let candidate = make_candidate(candidate_pool, mint);
+        let evidence = make_bcv2_execution_account_evidence_event(
+            bcv2,
+            Some(mint),
+            Some(other_pool),
+            ghost_core::ExecutionAccountEvidenceSource::ObservedTxMeta,
+            ghost_core::ExecutionAccountEvidenceStatus::DiscoveryHint,
+        );
+        let now = Instant::now();
+        assert_eq!(
+            bridge
+                .ingest_execution_account_evidence(&evidence, now)
+                .decision,
+            SessionExecutionAccountEvidenceDecision::BufferedUntilPoolDetected
+        );
+
+        let flush = bridge.register_detected_pool(&candidate, now + Duration::from_millis(1));
+
+        assert_eq!(flush.replay_ready_evidence.len(), 1);
+        assert_eq!(flush.replay_ready_evidence[0].evidence.account_pubkey, bcv2);
+        assert_eq!(flush.expired_evidence_count, 0);
+        assert_eq!(bridge.pending_execution_evidence_total(), 0);
+        assert!(bridge.has_detected_bcv2_key(bcv2));
+    }
+
+    #[test]
+    fn session_bridge_pool_detected_flushes_bcv2_evidence_by_pool_context() {
+        let mut bridge = SessionAccountUpdateBridge::new(
+            Duration::from_millis(100),
+            4,
+            16,
+            Duration::from_secs(60),
+            32,
+        );
+        let pool = Pubkey::new_unique();
+        let evidence_mint = Pubkey::new_unique();
+        let candidate_mint = Pubkey::new_unique();
+        let bcv2 = Pubkey::new_unique();
+        let candidate = make_candidate(pool, candidate_mint);
+        let evidence = make_bcv2_execution_account_evidence_event(
+            bcv2,
+            Some(evidence_mint),
+            Some(pool),
+            ghost_core::ExecutionAccountEvidenceSource::YellowstoneAccountUpdate,
+            ghost_core::ExecutionAccountEvidenceStatus::AccountUpdateReceived,
+        );
+        let now = Instant::now();
+        assert_eq!(
+            bridge
+                .ingest_execution_account_evidence(&evidence, now)
+                .decision,
+            SessionExecutionAccountEvidenceDecision::BufferedUntilPoolDetected
+        );
+
+        let flush = bridge.register_detected_pool(&candidate, now + Duration::from_millis(1));
+
+        assert_eq!(flush.replay_ready_evidence.len(), 1);
+        assert_eq!(flush.replay_ready_evidence[0].evidence.account_pubkey, bcv2);
+        assert!(bridge.has_detected_bcv2_key(bcv2));
+    }
+
+    #[test]
+    fn session_bridge_refresh_from_route_compatible_trade_registers_bcv2_and_flushes_pending() {
+        let mut bridge = SessionAccountUpdateBridge::new(
+            Duration::from_millis(100),
+            4,
+            16,
+            Duration::from_secs(60),
+            32,
+        );
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let bcv2 = Pubkey::new_unique();
+        let candidate = make_candidate(pool, mint);
+        let evidence = make_bcv2_execution_account_evidence_event(
+            bcv2,
+            None,
+            None,
+            ghost_core::ExecutionAccountEvidenceSource::RpcHydration,
+            ghost_core::ExecutionAccountEvidenceStatus::RpcReady,
+        );
+        let now = Instant::now();
+        bridge.register_detected_pool(&candidate, now);
+        assert_eq!(
+            bridge
+                .ingest_execution_account_evidence(&evidence, now + Duration::from_millis(1))
+                .decision,
+            SessionExecutionAccountEvidenceDecision::BufferedUntilPoolDetected
+        );
+
+        let trade = make_route_compatible_bcv2_trade(pool, mint, bcv2);
+        let liveness = bridge.refresh_from_trade(&trade, now + Duration::from_millis(2));
+
+        assert_eq!(liveness.replay_ready_evidence.len(), 1);
+        assert_eq!(
+            liveness.replay_ready_evidence[0].evidence.account_pubkey,
+            bcv2
+        );
+        assert_eq!(bridge.pending_execution_evidence_total(), 0);
+        assert!(bridge.has_detected_bcv2_key(bcv2));
+    }
+
+    #[test]
+    fn session_bridge_non_route_compatible_bcv2_trade_does_not_register_session_key() {
+        let mut bridge = SessionAccountUpdateBridge::new(
+            Duration::from_millis(100),
+            4,
+            16,
+            Duration::from_secs(60),
+            32,
+        );
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let bcv2 = Pubkey::new_unique();
+        let candidate = make_candidate(pool, mint);
+        let evidence = make_bcv2_execution_account_evidence_event(
+            bcv2,
+            None,
+            None,
+            ghost_core::ExecutionAccountEvidenceSource::RpcHydration,
+            ghost_core::ExecutionAccountEvidenceStatus::RpcReady,
+        );
+        let now = Instant::now();
+        bridge.register_detected_pool(&candidate, now);
+        bridge.ingest_execution_account_evidence(&evidence, now + Duration::from_millis(1));
+
+        let trade = make_non_route_compatible_bcv2_trade(pool, mint, bcv2);
+        let liveness = bridge.refresh_from_trade(&trade, now + Duration::from_millis(2));
+
+        assert!(liveness.replay_ready_evidence.is_empty());
+        assert_eq!(bridge.pending_execution_evidence_total(), 1);
+        assert!(!bridge.has_detected_bcv2_key(bcv2));
+    }
+
+    #[test]
+    fn session_bridge_missing_bcv2_provenance_does_not_register_session_key() {
+        let mut bridge = SessionAccountUpdateBridge::new(
+            Duration::from_millis(100),
+            4,
+            16,
+            Duration::from_secs(60),
+            32,
+        );
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let bcv2 = Pubkey::new_unique();
+        let candidate = make_candidate(pool, mint);
+        let evidence = make_bcv2_execution_account_evidence_event(
+            bcv2,
+            None,
+            None,
+            ghost_core::ExecutionAccountEvidenceSource::RpcHydration,
+            ghost_core::ExecutionAccountEvidenceStatus::RpcReady,
+        );
+        let now = Instant::now();
+        bridge.register_detected_pool(&candidate, now);
+        bridge.ingest_execution_account_evidence(&evidence, now + Duration::from_millis(1));
+        let mut trade = make_trade(pool, mint);
+        trade.bonding_curve_v2 = Some(bcv2);
+
+        let liveness = bridge.refresh_from_trade(&trade, now + Duration::from_millis(2));
+
+        assert!(liveness.replay_ready_evidence.is_empty());
+        assert_eq!(bridge.pending_execution_evidence_total(), 1);
+        assert!(!bridge.has_detected_bcv2_key(bcv2));
+    }
+
+    #[test]
+    fn session_bridge_canonical_account_update_semantics_remain_classic_only() {
+        let mut bridge = SessionAccountUpdateBridge::new(
+            Duration::from_millis(100),
+            4,
+            16,
+            Duration::from_secs(60),
+            32,
+        );
+        let bcv2 = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let context = SessionBcv2Context {
+            account_pubkey: bcv2,
+            base_mint: None,
+            pool_id: None,
+            canonical_bonding_curve: None,
+        };
+        bridge.register_bcv2_key(context, Instant::now(), "test");
+        let update = make_account_update(base_mint, bcv2);
+
+        let ingress = bridge.ingest_account_update(&update, Instant::now());
+
+        assert_eq!(
+            ingress.decision,
+            SessionAccountUpdateDecision::BufferedUntilPoolDetected
+        );
+        assert_eq!(bridge.pending_total(), 1);
+    }
+
     #[tokio::test]
     async fn seer_trade_without_pool_detected_is_silently_dropped() {
         // Trade for an unknown pool must not hit the event bus immediately; it is
@@ -2767,6 +3595,91 @@ mod tests {
             }
             other => panic!(
                 "expected FundingTransferObserved, got {}",
+                other.event_type()
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn seer_execution_account_evidence_before_pool_detected_replays_after_pool_detected() {
+        let (tx, mut rx) = create_event_bus();
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let bcv2 = Pubkey::new_unique();
+        let candidate = make_candidate(pool, mint);
+        let evidence_event = make_bcv2_execution_account_evidence_event(
+            bcv2,
+            Some(mint),
+            Some(pool),
+            ghost_core::ExecutionAccountEvidenceSource::ObservedTxMeta,
+            ghost_core::ExecutionAccountEvidenceStatus::DiscoveryHint,
+        );
+        let mut trade_bridge = SessionPoolTradeBridge::new(
+            Duration::from_millis(100),
+            4,
+            16,
+            Duration::from_secs(60),
+            32,
+        );
+        let mut account_bridge = SessionAccountUpdateBridge::new(
+            Duration::from_millis(100),
+            4,
+            16,
+            Duration::from_secs(60),
+            32,
+        );
+        let now = Instant::now();
+
+        let ingress = account_bridge.ingest_execution_account_evidence(&evidence_event, now);
+        assert_eq!(
+            ingress.decision,
+            SessionExecutionAccountEvidenceDecision::BufferedUntilPoolDetected
+        );
+        assert!(tokio::time::timeout(Duration::from_millis(50), rx.recv())
+            .await
+            .is_err());
+
+        let detected_ms = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        process_pool_detected_event_for_session_gate(
+            &tx,
+            &mut trade_bridge,
+            &candidate,
+            None,
+            now + Duration::from_millis(1),
+            detected_ms,
+        );
+        let flush =
+            account_bridge.register_detected_pool(&candidate, now + Duration::from_millis(1));
+        assert_eq!(flush.replay_ready_evidence.len(), 1);
+        for evidence in &flush.replay_ready_evidence {
+            emit_execution_account_evidence_to_event_bus(&tx, evidence, None);
+        }
+
+        let first = recv_only_event(&mut rx).await;
+        match first {
+            GhostEvent::NewPoolDetected(pool_event) => {
+                assert_eq!(pool_event.pool_amm_id, pool.to_string());
+            }
+            other => panic!("expected NewPoolDetected, got {}", other.event_type()),
+        }
+
+        let second = recv_only_event(&mut rx).await;
+        match second {
+            GhostEvent::ExecutionAccountEvidence(observed) => {
+                assert_eq!(observed.evidence.account_pubkey, bcv2);
+                assert_eq!(
+                    observed.evidence.role,
+                    ghost_core::ExecutionAccountRole::BondingCurveV2
+                );
+            }
+            GhostEvent::AccountUpdate(_) => {
+                panic!("ExecutionAccountEvidence replay must not route through AccountUpdate")
+            }
+            other => panic!(
+                "expected ExecutionAccountEvidence, got {}",
                 other.event_type()
             ),
         }
