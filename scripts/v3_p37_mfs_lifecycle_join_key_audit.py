@@ -12,7 +12,7 @@ from typing import Any, Iterable
 from shadow_run_report import load_toml, resolve_config_path, resolve_runtime_path
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 DECISION_FILE_NAMES = ("gatekeeper_v2_decisions.jsonl", "gatekeeper_v2_buys.jsonl")
 FIELD_GROUPS = {
     "ab_record_id": ("ab_record_id",),
@@ -139,6 +139,14 @@ def iter_jsonl(path: Path) -> Iterable[dict[str, Any]]:
                     idx += 1
 
 
+def iter_text_lines(path: Path) -> Iterable[str]:
+    if not path.exists():
+        return
+    with path.open("r", encoding="utf-8", errors="ignore") as fh:
+        for line in fh:
+            yield line.rstrip("\n")
+
+
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -215,6 +223,14 @@ def resolve_paths(config_path: Path) -> dict[str, list[Path]]:
         if root.exists():
             paths["decision"].extend(path for path in root.rglob(name) if path.is_file() and path != direct)
 
+    logging_cfg = config.get("logging", {})
+    system_log_path = logging_cfg.get("file_path")
+    if system_log_path:
+        paths["system_log"].append(Path(resolve_runtime_path(resolved, system_log_path)))
+    oracle_log_path = logging_cfg.get("oracle_log_path")
+    if oracle_log_path:
+        paths["oracle_log"].append(Path(resolve_runtime_path(resolved, oracle_log_path)))
+
     trigger_path = config.get("trigger", {}).get("shadow_run", {}).get("output_path")
     if trigger_path:
         paths["shadow_transport"].append(Path(resolve_runtime_path(resolved, trigger_path)))
@@ -277,6 +293,51 @@ def artifact_totals(report: dict[str, Any], artifact_type: str, field_group: str
         item["field_counts"].get(field_group, 0)
         for item in report["artifacts"].get(artifact_type, [])
     )
+
+
+def count_marker_rows(paths: dict[str, list[Path]], marker: str) -> int:
+    log_paths = sorted(set(paths.get("system_log", []) + paths.get("oracle_log", [])))
+    return sum(1 for path in log_paths for line in iter_text_lines(path) if marker in line)
+
+
+def bcv2_exact_watch_coverage(paths: dict[str, list[Path]], report: dict[str, Any]) -> dict[str, int]:
+    materialization = report.get("probe_entry_materialization", {})
+    active = report.get("active_shadow_dispatch_diagnostics", {})
+    return {
+        "bcv2_exact_watch_registered_rows": count_marker_rows(
+            paths, "BCV2_EXACT_WATCH_REGISTERED"
+        ),
+        "bcv2_exact_watch_in_subscribe_request_rows": count_marker_rows(
+            paths, "BCV2_EXACT_WATCH_SUBSCRIBE_INCLUDED"
+        ),
+        "bcv2_exact_watch_subscribe_dropped_rows": count_marker_rows(
+            paths, "BCV2_EXACT_WATCH_SUBSCRIBE_DROPPED"
+        ),
+        "bcv2_resubscribe_sent_rows": count_marker_rows(
+            paths, "BCV2_EXACT_WATCH_RESUBSCRIBE_SENT"
+        ),
+        "bcv2_rpc_hydration_ready_rows": count_marker_rows(
+            paths, "BCV2_RPC_HYDRATION_READY"
+        ),
+        "bcv2_rpc_hydration_missing_rows": count_marker_rows(
+            paths, "BCV2_RPC_HYDRATION_MISSING"
+        ),
+        "bcv2_account_update_received_rows": count_marker_rows(
+            paths, "BCV2_ACCOUNT_UPDATE_RECEIVED"
+        ),
+        "bcv2_account_state_seen_rows": materialization.get(
+            "working_builder_bcv2_account_state_seen_rows", 0
+        )
+        + active.get("active_shadow_working_builder_bcv2_account_state_seen_rows", 0),
+        "bcv2_account_state_owner_rows": materialization.get(
+            "working_builder_bcv2_account_state_owner_rows", 0
+        )
+        + active.get("active_shadow_working_builder_bcv2_account_state_owner_rows", 0),
+        "bcv2_account_state_data_len_rows": materialization.get(
+            "working_builder_bcv2_account_state_data_len_rows", 0
+        )
+        + active.get("active_shadow_working_builder_bcv2_account_state_data_len_rows", 0),
+    }
 
 
 def join_quality(report: dict[str, Any]) -> str:
@@ -3948,6 +4009,7 @@ def build_report(config_path: Path) -> dict[str, Any]:
     report["probe_join_key_coverage"] = probe_join_key_coverage(report)
     report["probe_decision_join"] = probe_decision_join(paths)
     report["probe_entry_materialization"] = probe_entry_materialization(paths)
+    report["bcv2_exact_watch_coverage"] = bcv2_exact_watch_coverage(paths, report)
     report["probe_readiness"] = probe_readiness(report)
     report["execution_feasibility"] = execution_feasibility_summary(report)
     return report
@@ -4013,6 +4075,24 @@ def render_markdown(report: dict[str, Any]) -> str:
     )
     for key, value in report["probe_decision_join"]["artifacts"].items():
         lines.append(f"- `{key}`: `{json.dumps(value, ensure_ascii=False, sort_keys=True)}`")
+    bcv2_exact_watch = report["bcv2_exact_watch_coverage"]
+    lines.extend(
+        [
+            "",
+            "## BCV2 Exact Watch Coverage",
+            "",
+            f"- bcv2_exact_watch_registered_rows: `{bcv2_exact_watch['bcv2_exact_watch_registered_rows']}`",
+            f"- bcv2_exact_watch_in_subscribe_request_rows: `{bcv2_exact_watch['bcv2_exact_watch_in_subscribe_request_rows']}`",
+            f"- bcv2_exact_watch_subscribe_dropped_rows: `{bcv2_exact_watch['bcv2_exact_watch_subscribe_dropped_rows']}`",
+            f"- bcv2_resubscribe_sent_rows: `{bcv2_exact_watch['bcv2_resubscribe_sent_rows']}`",
+            f"- bcv2_rpc_hydration_ready_rows: `{bcv2_exact_watch['bcv2_rpc_hydration_ready_rows']}`",
+            f"- bcv2_rpc_hydration_missing_rows: `{bcv2_exact_watch['bcv2_rpc_hydration_missing_rows']}`",
+            f"- bcv2_account_update_received_rows: `{bcv2_exact_watch['bcv2_account_update_received_rows']}`",
+            f"- bcv2_account_state_seen_rows: `{bcv2_exact_watch['bcv2_account_state_seen_rows']}`",
+            f"- bcv2_account_state_owner_rows: `{bcv2_exact_watch['bcv2_account_state_owner_rows']}`",
+            f"- bcv2_account_state_data_len_rows: `{bcv2_exact_watch['bcv2_account_state_data_len_rows']}`",
+        ]
+    )
     execution_feasibility = report["execution_feasibility"]
     lines.extend(
         [

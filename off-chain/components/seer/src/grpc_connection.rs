@@ -307,6 +307,7 @@ impl DualLaneChannel {
 #[derive(Clone, Default)]
 pub struct AccountRegistry {
     generic_accounts: Arc<DashSet<String>>,
+    bcv2_accounts: Arc<DashSet<String>>,
     curve_accounts: Arc<DashSet<String>>,
     pool_accounts: Arc<DashSet<String>>,
     mint_accounts: Arc<DashSet<String>>,
@@ -318,6 +319,10 @@ pub struct AccountRegistry {
     /// Only modes that opt into immediate exact-watch refresh consume this
     /// signal; single_global batches registry changes until the next health tick.
     resub_notify: Arc<tokio::sync::Notify>,
+    /// Dedicated BCV2 refresh signal. Route-compatible observed BCV2 accounts
+    /// are not covered by the known curve/pool discriminators, so they get an
+    /// immediate primary-global refresh path without changing curve/pool churn.
+    bcv2_resub_notify: Arc<tokio::sync::Notify>,
     touch_seq: Arc<AtomicU64>,
     last_touch: Arc<DashMap<String, u64>>,
 }
@@ -325,6 +330,7 @@ pub struct AccountRegistry {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AccountRegistrySnapshot {
     pub generic_accounts: Vec<String>,
+    pub bcv2_accounts: Vec<String>,
     pub curve_accounts: Vec<String>,
     pub pool_accounts: Vec<String>,
     pub mint_accounts: Vec<String>,
@@ -414,6 +420,22 @@ impl AccountRegistry {
     }
 
     #[inline(always)]
+    pub fn insert_bcv2(&self, addr: impl Into<String>) -> bool {
+        let addr = addr.into();
+        let inserted = self.bcv2_accounts.insert(addr.clone());
+        if inserted {
+            self.version.fetch_add(1, Ordering::Relaxed);
+        } else {
+            // BCV2 exact-watch is priority-ranked by recency. Touching an
+            // already-known account may change the over-cap selection surface.
+            self.version.fetch_add(1, Ordering::Relaxed);
+        }
+        Self::record_touch(&self.last_touch, &self.touch_seq, &addr);
+        self.bcv2_resub_notify.notify_one();
+        inserted
+    }
+
+    #[inline(always)]
     pub fn insert_mint(&self, addr: impl Into<String>) -> bool {
         Self::insert_into(
             &self.mint_accounts,
@@ -435,6 +457,7 @@ impl AccountRegistry {
     pub fn snapshot_by_lane(&self) -> AccountRegistrySnapshot {
         AccountRegistrySnapshot {
             generic_accounts: Self::snapshot_set(&self.generic_accounts),
+            bcv2_accounts: Self::snapshot_set(&self.bcv2_accounts),
             curve_accounts: Self::snapshot_set(&self.curve_accounts),
             pool_accounts: Self::snapshot_set(&self.pool_accounts),
             mint_accounts: Self::snapshot_set(&self.mint_accounts),
@@ -445,6 +468,9 @@ impl AccountRegistry {
         let lanes = self.snapshot_by_lane();
         let mut merged = BTreeSet::new();
         for value in lanes.generic_accounts {
+            merged.insert(value);
+        }
+        for value in lanes.bcv2_accounts {
             merged.insert(value);
         }
         for value in lanes.curve_accounts {
@@ -464,6 +490,11 @@ impl AccountRegistry {
         Arc::clone(&self.resub_notify)
     }
 
+    /// Dedicated notify handle for route-compatible BCV2 exact-watch refresh.
+    pub fn bcv2_resub_notify(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.bcv2_resub_notify)
+    }
+
     /// Snapshot of merged dynamic exact-watch accounts across all lanes.
     ///
     /// Not every subscription profile consumes every exact-watch lane. In
@@ -480,6 +511,7 @@ impl AccountRegistry {
             .iter()
             .map(|value| value.clone())
             .chain(self.pool_accounts.iter().map(|value| value.clone()))
+            .chain(self.bcv2_accounts.iter().map(|value| value.clone()))
             .chain(self.generic_accounts.iter().map(|value| value.clone()))
             .collect();
         merged.sort_by(|a, b| {
@@ -519,9 +551,20 @@ impl AccountRegistry {
     }
 
     pub fn snapshot_primary_global_exact_accounts(&self, budget: usize) -> Vec<String> {
-        let mut out = self.snapshot_set_by_recency(&self.generic_accounts);
-        if out.len() > budget {
-            out.truncate(budget);
+        let mut out = Vec::with_capacity(budget);
+        let mut seen = BTreeSet::new();
+        for lane in [
+            self.snapshot_set_by_recency(&self.bcv2_accounts),
+            self.snapshot_set_by_recency(&self.generic_accounts),
+        ] {
+            for value in lane {
+                if seen.insert(value.clone()) {
+                    out.push(value);
+                    if out.len() >= budget {
+                        return out;
+                    }
+                }
+            }
         }
         out
     }
@@ -532,6 +575,7 @@ impl AccountRegistry {
         for lane in [
             self.snapshot_set_by_recency(&self.pool_accounts),
             self.snapshot_set_by_recency(&self.curve_accounts),
+            self.snapshot_set_by_recency(&self.bcv2_accounts),
             self.snapshot_set_by_recency(&self.generic_accounts),
         ] {
             for value in lane {
@@ -550,6 +594,7 @@ impl AccountRegistry {
     }
     pub fn is_empty(&self) -> bool {
         self.generic_accounts.is_empty()
+            && self.bcv2_accounts.is_empty()
             && self.curve_accounts.is_empty()
             && self.pool_accounts.is_empty()
             && self.mint_accounts.is_empty()
@@ -600,6 +645,21 @@ impl AccountRegistry {
     }
 
     #[inline(always)]
+    pub fn remove_bcv2(&self, addr: &str) -> bool {
+        let removed = Self::remove_from(
+            &self.bcv2_accounts,
+            &self.version,
+            &self.last_touch,
+            addr,
+            true,
+        );
+        if removed {
+            self.bcv2_resub_notify.notify_one();
+        }
+        removed
+    }
+
+    #[inline(always)]
     pub fn remove_generic(&self, addr: &str) -> bool {
         Self::remove_from(
             &self.generic_accounts,
@@ -608,6 +668,11 @@ impl AccountRegistry {
             addr,
             true,
         )
+    }
+
+    #[inline(always)]
+    pub fn contains_bcv2(&self, addr: &str) -> bool {
+        self.bcv2_accounts.contains(addr)
     }
 }
 
@@ -1888,9 +1953,50 @@ fn tracked_exact_total_for_profile(
     lanes: &AccountRegistrySnapshot,
 ) -> usize {
     match subscription_profile {
-        GrpcSubscriptionProfile::PrimaryGlobal => lanes.generic_accounts.len(),
+        GrpcSubscriptionProfile::PrimaryGlobal => {
+            lanes.bcv2_accounts.len() + lanes.generic_accounts.len()
+        }
         GrpcSubscriptionProfile::FundingLanePumpFiltered
         | GrpcSubscriptionProfile::FundingLaneFullChain => 0,
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ExactAccountSelectionCounts {
+    exact_total: usize,
+    tracked_sent: usize,
+    tracked_dropped: usize,
+    tracked_bcv2: usize,
+    bcv2_sent: usize,
+    bcv2_dropped: usize,
+}
+
+fn exact_account_selection_counts_for_profile(
+    subscription_profile: GrpcSubscriptionProfile,
+    lanes: &AccountRegistrySnapshot,
+    tracked_accounts: &[String],
+) -> ExactAccountSelectionCounts {
+    let exact_total = tracked_exact_total_for_profile(subscription_profile, lanes);
+    let tracked_sent = tracked_accounts.len();
+    let tracked_dropped = exact_total.saturating_sub(tracked_sent);
+    let tracked_bcv2 = match subscription_profile {
+        GrpcSubscriptionProfile::PrimaryGlobal => lanes.bcv2_accounts.len(),
+        GrpcSubscriptionProfile::FundingLanePumpFiltered
+        | GrpcSubscriptionProfile::FundingLaneFullChain => 0,
+    };
+    let selected: HashSet<&str> = tracked_accounts.iter().map(String::as_str).collect();
+    let bcv2_sent = lanes
+        .bcv2_accounts
+        .iter()
+        .filter(|account| selected.contains(account.as_str()))
+        .count();
+    ExactAccountSelectionCounts {
+        exact_total,
+        tracked_sent,
+        tracked_dropped,
+        tracked_bcv2,
+        bcv2_sent,
+        bcv2_dropped: tracked_bcv2.saturating_sub(bcv2_sent),
     }
 }
 
@@ -1938,32 +2044,58 @@ fn build_subscribe_request_for_profile(
         tracked_pool_count,
         tracked_mint_count,
         tracked_generic_count,
+        tracked_bcv2_count,
         exact_total,
         tracked_sent,
         tracked_dropped,
+        bcv2_sent,
+        bcv2_dropped,
     ) = if subscription_profile.uses_registry_filters() {
         let lanes = registry.snapshot_by_lane();
         let tracked_curve_count = lanes.curve_accounts.len();
         let tracked_pool_count = lanes.pool_accounts.len();
         let tracked_mint_count = lanes.mint_accounts.len();
         let tracked_generic_count = lanes.generic_accounts.len();
-        let exact_total = tracked_exact_total_for_profile(subscription_profile, &lanes);
         let tracked_accounts = tracked_exact_accounts_for_profile(
             subscription_profile,
             registry,
             EXACT_ACCOUNT_PAYLOAD_CAP,
         );
-        let tracked_sent = tracked_accounts.len();
-        let tracked_dropped = exact_total.saturating_sub(tracked_sent);
-        if tracked_dropped > 0 {
+        let counts = exact_account_selection_counts_for_profile(
+            subscription_profile,
+            &lanes,
+            &tracked_accounts,
+        );
+        if counts.tracked_dropped > 0 {
             warn!(
                     "AccountRegistry exact watch set for profile {} has {} dynamic entries but filter allows only {} — dropping {} accounts (from_slot={})",
                     subscription_profile.as_str(),
-                    exact_total,
+                    counts.exact_total,
                     EXACT_ACCOUNT_PAYLOAD_CAP,
-                    tracked_dropped,
+                    counts.tracked_dropped,
                     from_slot,
                 );
+        }
+        if counts.bcv2_sent > 0 {
+            info!(
+                "BCV2_EXACT_WATCH_SUBSCRIBE_INCLUDED profile={} bcv2_sent={} bcv2_dropped={} tracked_bcv2={} from_slot={}",
+                subscription_profile.as_str(),
+                counts.bcv2_sent,
+                counts.bcv2_dropped,
+                counts.tracked_bcv2,
+                from_slot
+            );
+        }
+        if counts.bcv2_dropped > 0 {
+            warn!(
+                "BCV2_EXACT_WATCH_SUBSCRIBE_DROPPED profile={} bcv2_dropped={} tracked_bcv2={} bcv2_sent={} exact_payload_cap={} from_slot={}",
+                subscription_profile.as_str(),
+                counts.bcv2_dropped,
+                counts.tracked_bcv2,
+                counts.bcv2_sent,
+                EXACT_ACCOUNT_PAYLOAD_CAP,
+                from_slot
+            );
         }
 
         let mut acc_filters = HashMap::new();
@@ -2024,12 +2156,15 @@ fn build_subscribe_request_for_profile(
             tracked_pool_count,
             tracked_mint_count,
             tracked_generic_count,
-            exact_total,
-            tracked_sent,
-            tracked_dropped,
+            counts.tracked_bcv2,
+            counts.exact_total,
+            counts.tracked_sent,
+            counts.tracked_dropped,
+            counts.bcv2_sent,
+            counts.bcv2_dropped,
         )
     } else {
-        (HashMap::new(), 0, 0, 0, 0, 0, 0, 0)
+        (HashMap::new(), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
     };
 
     // ── Entry filter ──────────────────────────────────────────────────────────
@@ -2076,8 +2211,8 @@ fn build_subscribe_request_for_profile(
          accounts={} \
          blocks_meta=ghost_blocks_meta \
          entry=DISABLED \
-         tracked_curves={} tracked_pools={} tracked_mints={} tracked_generic={} \
-         exact_total={} tracked_sent={} tracked_dropped={} \
+         tracked_curves={} tracked_pools={} tracked_mints={} tracked_generic={} tracked_bcv2={} \
+         exact_total={} tracked_sent={} tracked_dropped={} bcv2_sent={} bcv2_dropped={} \
          note={} \
          filter_branches={} \
          from_slot={from_slot} \
@@ -2101,9 +2236,12 @@ fn build_subscribe_request_for_profile(
         tracked_pool_count,
         tracked_mint_count,
         tracked_generic_count,
+        tracked_bcv2_count,
         exact_total,
         tracked_sent,
         tracked_dropped,
+        bcv2_sent,
+        bcv2_dropped,
         match subscription_profile {
             GrpcSubscriptionProfile::PrimaryGlobal => {
                 "canonical_account_updates_via_global_layout_filters_generic_exact_only"
@@ -2167,6 +2305,7 @@ async fn maybe_send_resubscribe<S>(
     last_request_fingerprint: &mut u64,
     last_resub_at: &mut Instant,
     force: bool,
+    bypass_debounce: bool,
 ) -> Result<()>
 where
     S: Sink<SubscribeRequest> + Unpin,
@@ -2196,7 +2335,9 @@ where
     }
 
     let now = Instant::now();
-    if now.duration_since(*last_resub_at) < Duration::from_millis(cfg.resub_debounce_ms) {
+    if !bypass_debounce
+        && now.duration_since(*last_resub_at) < Duration::from_millis(cfg.resub_debounce_ms)
+    {
         return Ok(());
     }
 
@@ -2221,6 +2362,15 @@ where
         h.set_grpc_state(GRPC_STATE_CONNECTED);
     }
     stats.bump_resub();
+    if reason.starts_with("bcv2") {
+        info!(
+            "BCV2_EXACT_WATCH_RESUBSCRIBE_SENT reason={} profile={} from_slot={} registry_version={}",
+            reason,
+            cfg.subscription_profile.as_str(),
+            resub_from_slot,
+            cur_version
+        );
+    }
     *last_reg_version = cur_version;
     *last_request_fingerprint = current_request_fingerprint;
     *last_resub_at = now;
@@ -2284,6 +2434,7 @@ async fn stream_loop(
     let mut registry_resub_ticker =
         tokio::time::interval(Duration::from_millis(REGISTRY_RESUB_TICK_MS));
     let resub_notify = registry.resub_notify();
+    let bcv2_resub_notify = registry.bcv2_resub_notify();
 
     let mut ping_seq: i32 = 0;
     let mut last_pong: i32 = -1;
@@ -2330,7 +2481,7 @@ async fn stream_loop(
                             debug!("[{id}] ← pong {}", p.id);
                         } else {
                             breaker.record_message_progress();
-                            route_update(id, msg, channel, stats, slots, gap_tx, latest_block_time_secs);
+                            route_update(id, msg, channel, stats, slots, gap_tx, latest_block_time_secs, registry);
                         }
 
                         // [RC-2 fix] Removed immediate resub on every incoming event.
@@ -2390,6 +2541,36 @@ async fn stream_loop(
                     &mut last_request_fingerprint,
                     &mut last_resub_at,
                     true,
+                    false,
+                ).await?;
+            }
+
+            // ── Immediate forced resub for route-compatible BCV2 exact-watch ──
+            // This path is intentionally narrower than regular registry_notify:
+            // curve/pool churn remains debounced/batched, while BCV2 accounts
+            // discovered from route-compatible observed tx meta refresh the
+            // active PrimaryGlobal exact branch immediately.
+            _ = async {
+                if cfg.subscription_profile.uses_registry_filters() {
+                    bcv2_resub_notify.notified().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                maybe_send_resubscribe(
+                    id,
+                    "bcv2_registry_notify",
+                    &mut sink,
+                    cfg,
+                    registry,
+                    slots,
+                    stats,
+                    health.as_ref(),
+                    &mut last_reg_version,
+                    &mut last_request_fingerprint,
+                    &mut last_resub_at,
+                    true,
+                    true,
                 ).await?;
             }
 
@@ -2413,6 +2594,7 @@ async fn stream_loop(
                     &mut last_reg_version,
                     &mut last_request_fingerprint,
                     &mut last_resub_at,
+                    false,
                     false,
                 ).await?;
             }
@@ -2485,6 +2667,7 @@ async fn stream_loop(
                     &mut last_request_fingerprint,
                     &mut last_resub_at,
                     false,
+                    false,
                 ).await?;
             }
         }
@@ -2502,6 +2685,7 @@ fn route_update(
     slots: &Arc<SlotTracker>,
     gap_tx: &tokio::sync::mpsc::UnboundedSender<SlotGap>,
     latest_block_time_secs: &Arc<AtomicI64>,
+    registry: &AccountRegistry,
 ) {
     let received_at = Instant::now();
 
@@ -2554,6 +2738,22 @@ fn route_update(
                 .unwrap_or_default();
             if pubkey.is_empty() {
                 return;
+            }
+            if registry.contains_bcv2(&pubkey) {
+                let (owner, data_len) = a
+                    .account
+                    .as_ref()
+                    .map(|account| {
+                        (
+                            bs58::encode(&account.owner).into_string(),
+                            account.data.len(),
+                        )
+                    })
+                    .unwrap_or_else(|| ("".to_string(), 0));
+                info!(
+                    "BCV2_ACCOUNT_UPDATE_RECEIVED pubkey={} slot={} owner={} data_len={}",
+                    pubkey, slot, owner, data_len
+                );
             }
 
             stats.bump_account();
@@ -3998,10 +4198,13 @@ mod tests {
         assert!(r.insert_pool("pool-A"));
         let v_pool = r.version();
         assert!(v_pool > v_curve);
+        assert!(r.insert_bcv2("bcv2-A"));
+        let v_bcv2 = r.version();
+        assert!(v_bcv2 > v_pool);
         assert!(r.insert_mint("mint-A"));
-        assert_eq!(r.version(), v_pool);
+        assert_eq!(r.version(), v_bcv2);
         assert!(r.insert("generic-A"));
-        assert!(r.version() > v_pool);
+        assert!(r.version() > v_bcv2);
     }
     #[test]
     fn registry_snapshot_all() {
@@ -4452,6 +4655,100 @@ mod tests {
     }
 
     #[test]
+    fn bcv2_insert_primary_global_exact_branch_contains_bcv2() {
+        let r = AccountRegistry::new();
+        r.insert_bcv2("Bcv2Watch1111111111111111111111111111111111");
+        r.insert("GenericWatch111111111111111111111111111111111");
+
+        let req = build_subscribe_request(CommitmentLevel::Processed, &r, 0);
+        let tracked_filter = req.accounts.get("tracked_accounts").unwrap();
+
+        assert!(tracked_filter
+            .account
+            .contains(&"Bcv2Watch1111111111111111111111111111111111".to_string()));
+        assert!(tracked_filter
+            .account
+            .contains(&"GenericWatch111111111111111111111111111111111".to_string()));
+    }
+
+    #[test]
+    fn bcv2_insert_changes_primary_global_request_fingerprint() {
+        let r = AccountRegistry::new();
+        let baseline =
+            subscribe_request_fingerprint_for_profile(GrpcSubscriptionProfile::PrimaryGlobal, &r);
+
+        r.insert_bcv2("bcv2-A");
+
+        let after_bcv2 =
+            subscribe_request_fingerprint_for_profile(GrpcSubscriptionProfile::PrimaryGlobal, &r);
+        assert_ne!(
+            after_bcv2, baseline,
+            "route-compatible BCV2 exact-watch registrations must alter the active primary request shape"
+        );
+    }
+
+    #[test]
+    fn bcv2_insert_does_not_include_curve_pool_lanes_in_primary_exact_branch() {
+        let r = AccountRegistry::new();
+        r.insert_curve("curve-A");
+        r.insert_pool("pool-A");
+        r.insert_bcv2("bcv2-A");
+
+        let req = build_subscribe_request(CommitmentLevel::Processed, &r, 0);
+        let tracked_filter = req.accounts.get("tracked_accounts").unwrap();
+
+        assert!(tracked_filter.account.contains(&"bcv2-A".to_string()));
+        assert!(!tracked_filter.account.contains(&"curve-A".to_string()));
+        assert!(!tracked_filter.account.contains(&"pool-A".to_string()));
+    }
+
+    #[test]
+    fn bcv2_insert_preserves_fee_account_and_exact_account_cap() {
+        let r = AccountRegistry::new();
+        for i in 0..EXACT_ACCOUNT_FILTER_CAP {
+            r.insert(format!("generic-{i:03}"));
+        }
+        r.insert_bcv2("bcv2-priority");
+
+        let req = build_subscribe_request(CommitmentLevel::Processed, &r, 0);
+        let tracked_filter = req.accounts.get("tracked_accounts").unwrap();
+
+        assert_eq!(tracked_filter.account.len(), EXACT_ACCOUNT_FILTER_CAP);
+        assert!(tracked_filter
+            .account
+            .contains(&PUMP_FUN_FEE_ACCOUNT.to_string()));
+        assert!(tracked_filter
+            .account
+            .contains(&"bcv2-priority".to_string()));
+    }
+
+    #[test]
+    fn bcv2_insert_over_cap_drops_oldest_or_lowest_priority_with_bcv2_dropped_count() {
+        let r = AccountRegistry::new();
+        for i in 0..(EXACT_ACCOUNT_PAYLOAD_CAP + 6) {
+            r.insert_bcv2(format!("bcv2-{i:03}"));
+        }
+
+        let lanes = r.snapshot_by_lane();
+        let tracked_accounts = tracked_exact_accounts_for_profile(
+            GrpcSubscriptionProfile::PrimaryGlobal,
+            &r,
+            EXACT_ACCOUNT_PAYLOAD_CAP,
+        );
+        let counts = exact_account_selection_counts_for_profile(
+            GrpcSubscriptionProfile::PrimaryGlobal,
+            &lanes,
+            &tracked_accounts,
+        );
+
+        assert_eq!(counts.tracked_bcv2, EXACT_ACCOUNT_PAYLOAD_CAP + 6);
+        assert_eq!(counts.bcv2_sent, EXACT_ACCOUNT_PAYLOAD_CAP);
+        assert_eq!(counts.bcv2_dropped, 6);
+        assert!(!tracked_accounts.contains(&"bcv2-000".to_string()));
+        assert!(tracked_accounts.contains(&format!("bcv2-{:03}", EXACT_ACCOUNT_PAYLOAD_CAP + 5)));
+    }
+
+    #[test]
     fn subscribe_layout_filters_cover_curve_and_pool_discriminators() {
         let req = build_subscribe_request(CommitmentLevel::Processed, &AccountRegistry::new(), 0);
 
@@ -4514,6 +4811,8 @@ mod tests {
     #[test]
     fn registry_snapshot_is_deterministic_across_lanes() {
         let r = AccountRegistry::new();
+        r.insert_bcv2("bcv2-b");
+        r.insert_bcv2("bcv2-a");
         r.insert_pool("pool-b");
         r.insert_pool("pool-a");
         r.insert_curve("curve-b");
@@ -4522,6 +4821,10 @@ mod tests {
         r.insert_mint("mint-a");
 
         let snap = r.snapshot_by_lane();
+        assert_eq!(
+            snap.bcv2_accounts,
+            vec!["bcv2-a".to_string(), "bcv2-b".to_string()]
+        );
         assert_eq!(
             snap.pool_accounts,
             vec!["pool-a".to_string(), "pool-b".to_string()]
@@ -4574,6 +4877,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bcv2_insert_triggers_immediate_primary_global_resubscribe() {
+        let registry = AccountRegistry::new();
+        let cfg = GrpcConfig::default();
+        let slots = SlotTracker::new();
+        let stats = Arc::new(TransportStats::default());
+        let (mut sink, mut rx) = futures::channel::mpsc::unbounded::<SubscribeRequest>();
+        let mut last_reg_version = registry.version();
+        let mut last_request_fingerprint = subscribe_request_fingerprint_for_profile(
+            GrpcSubscriptionProfile::PrimaryGlobal,
+            &registry,
+        );
+        let mut last_resub_at = Instant::now();
+
+        registry.insert_bcv2("bcv2-A");
+
+        maybe_send_resubscribe(
+            "primary:0",
+            "bcv2_registry_notify",
+            &mut sink,
+            &cfg,
+            &registry,
+            &slots,
+            &stats,
+            None,
+            &mut last_reg_version,
+            &mut last_request_fingerprint,
+            &mut last_resub_at,
+            true,
+            true,
+        )
+        .await
+        .expect("bcv2 exact-watch changes should trigger an immediate resubscribe");
+
+        let req = tokio::time::timeout(Duration::from_millis(50), rx.next())
+            .await
+            .expect("bcv2 resubscribe request should be sent")
+            .expect("resubscribe stream item should exist");
+        let tracked_filter = req.accounts.get("tracked_accounts").unwrap();
+        assert!(tracked_filter.account.contains(&"bcv2-A".to_string()));
+        assert_eq!(stats.resubs_sent.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
     async fn primary_global_skips_resubscribe_when_curve_pool_churn_does_not_change_request_shape()
     {
         let registry = AccountRegistry::new();
@@ -4603,6 +4949,7 @@ mod tests {
             &mut last_reg_version,
             &mut last_request_fingerprint,
             &mut last_resub_at,
+            false,
             false,
         )
         .await
@@ -4645,6 +4992,7 @@ mod tests {
             &mut last_reg_version,
             &mut last_request_fingerprint,
             &mut last_resub_at,
+            false,
             false,
         )
         .await

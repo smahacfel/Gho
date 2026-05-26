@@ -71,6 +71,67 @@ lifecycle_log_path = "../../logs/shadow_run/r14/shadow_lifecycle.jsonl"
         self.assertEqual(report["join_key_coverage"]["full_chain_ab_record_id_coverage"], 1.0)
         self.assertEqual(report["join_key_coverage"]["shadow_entry_rows_with_ab_record_id"], 1)
 
+    def test_bcv2_exact_watch_coverage_counts_log_markers_and_account_state_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "configs/rollout/x8a.toml"
+            config.parent.mkdir(parents=True)
+            config.write_text(
+                """
+[oracle]
+decision_log_path = "../../logs/rollout/x8a/decisions"
+
+[logging]
+file_path = "../../logs/rollout/x8a/system.log"
+
+[p37_shadow_probe]
+entry_log_path = "../../logs/shadow_run/x8a/probe_entries.jsonl"
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            (root / "logs/rollout/x8a").mkdir(parents=True)
+            (root / "logs/rollout/x8a/system.log").write_text(
+                "\n".join(
+                    [
+                        "BCV2_EXACT_WATCH_REGISTERED pubkey=bcv2",
+                        "BCV2_EXACT_WATCH_SUBSCRIBE_INCLUDED profile=primary_global",
+                        "BCV2_EXACT_WATCH_SUBSCRIBE_DROPPED profile=primary_global",
+                        "BCV2_EXACT_WATCH_RESUBSCRIBE_SENT reason=bcv2_registry_notify",
+                        "BCV2_RPC_HYDRATION_READY pubkey=bcv2 context_slot=10 owner=owner data_len=256",
+                        "BCV2_RPC_HYDRATION_MISSING pubkey=bcv2 error_class=missing_on_rpc",
+                        "BCV2_ACCOUNT_UPDATE_RECEIVED pubkey=bcv2 owner=owner data_len=256",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            write_jsonl(
+                root / "logs/shadow_run/x8a/probe_entries.jsonl",
+                [
+                    {
+                        "working_builder_parity_mode": "working_builder_parity",
+                        "working_builder_bcv2_account_state_seen": True,
+                        "working_builder_bcv2_account_state_owner": "owner",
+                        "working_builder_bcv2_account_state_data_len": 256,
+                    }
+                ],
+            )
+
+            report = audit.build_report(config)
+
+        coverage = report["bcv2_exact_watch_coverage"]
+        self.assertEqual(coverage["bcv2_exact_watch_registered_rows"], 1)
+        self.assertEqual(coverage["bcv2_exact_watch_in_subscribe_request_rows"], 1)
+        self.assertEqual(coverage["bcv2_exact_watch_subscribe_dropped_rows"], 1)
+        self.assertEqual(coverage["bcv2_resubscribe_sent_rows"], 1)
+        self.assertEqual(coverage["bcv2_rpc_hydration_ready_rows"], 1)
+        self.assertEqual(coverage["bcv2_rpc_hydration_missing_rows"], 1)
+        self.assertEqual(coverage["bcv2_account_update_received_rows"], 1)
+        self.assertEqual(coverage["bcv2_account_state_seen_rows"], 1)
+        self.assertEqual(coverage["bcv2_account_state_owner_rows"], 1)
+        self.assertEqual(coverage["bcv2_account_state_data_len_rows"], 1)
+
     def test_candidate_id_only_join_is_degraded(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

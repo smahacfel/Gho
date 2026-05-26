@@ -13,10 +13,17 @@ use parking_lot::Mutex as ParkingMutex;
 ///   • Route account updates → ShadowLedger (truth-first: curve state, not trades)
 ///   • Classify backfill replays identically to live events (parser-first policy)
 ///   • Resolve queue for account updates that arrive before curve→mint mapping exists
-use std::{collections::VecDeque, sync::Arc, time::Instant};
+use std::{
+    collections::VecDeque,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
 
 use borsh::BorshDeserialize;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use prost::Message as _;
 use smallvec::SmallVec;
 use tracing::{debug, info, trace, warn};
@@ -24,6 +31,7 @@ use tracing::{debug, info, trace, warn};
 use crate::grpc_connection::{
     AccountRegistry, PumpEvent, PUMP_FUN_PROGRAM_ID, PUMP_SWAP_PROGRAM_ID,
 };
+use crate::rpc_http_client::new_async_rpc_client;
 use crate::types::{record_trade_outcome_metric, InstructionProvenance, TradeOutcome};
 
 // ─── Discriminators ───────────────────────────────────────────────────────────
@@ -3310,6 +3318,7 @@ use crate::types::{
     TokenDelta, ToolchainFingerprintInput, TradeEvent,
 };
 use ghost_core::transaction_parser::ProgramIds;
+use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -3345,6 +3354,230 @@ struct RuntimeTradeContext {
     signer_post_balance_lamports: HashMap<String, u64>,
 }
 
+const BCV2_RPC_HYDRATION_QUEUE_CAP: usize = 1024;
+const BCV2_RPC_HYDRATION_TIMEOUT_MS: u64 = 750;
+
+#[derive(Debug, Clone)]
+struct Bcv2HydrationRequest {
+    pubkey: String,
+    signature: String,
+    observed_slot: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Bcv2RpcHydrationEvidence {
+    ready: bool,
+    context_slot: Option<u64>,
+    owner: Option<String>,
+    data_len: Option<usize>,
+    latency_ms: u128,
+    error_class: Option<String>,
+}
+
+impl Bcv2RpcHydrationEvidence {
+    fn ready(context_slot: u64, owner: String, data_len: usize, latency_ms: u128) -> Self {
+        Self {
+            ready: true,
+            context_slot: Some(context_slot),
+            owner: Some(owner),
+            data_len: Some(data_len),
+            latency_ms,
+            error_class: None,
+        }
+    }
+
+    fn missing(
+        context_slot: Option<u64>,
+        error_class: impl Into<String>,
+        latency_ms: u128,
+    ) -> Self {
+        Self {
+            ready: false,
+            context_slot,
+            owner: None,
+            data_len: None,
+            latency_ms,
+            error_class: Some(error_class.into()),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct Bcv2HydrationService {
+    endpoint: Arc<str>,
+    tx: tokio::sync::mpsc::Sender<Bcv2HydrationRequest>,
+    rx: Arc<ParkingMutex<Option<tokio::sync::mpsc::Receiver<Bcv2HydrationRequest>>>>,
+    worker_started: Arc<AtomicBool>,
+    queued_pubkeys: Arc<DashSet<String>>,
+}
+
+impl Bcv2HydrationService {
+    fn new(endpoint: impl Into<String>) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::channel(BCV2_RPC_HYDRATION_QUEUE_CAP);
+        Self {
+            endpoint: Arc::from(endpoint.into()),
+            tx,
+            rx: Arc::new(ParkingMutex::new(Some(rx))),
+            worker_started: Arc::new(AtomicBool::new(false)),
+            queued_pubkeys: Arc::new(DashSet::new()),
+        }
+    }
+
+    fn ensure_worker_started(&self) -> bool {
+        if self
+            .worker_started
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return true;
+        }
+
+        let Some(rx) = self.rx.lock().take() else {
+            return true;
+        };
+        let endpoint = Arc::clone(&self.endpoint);
+        let queued_pubkeys = Arc::clone(&self.queued_pubkeys);
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    run_bcv2_hydration_worker(endpoint, rx, queued_pubkeys).await;
+                });
+                true
+            }
+            Err(_) => {
+                *self.rx.lock() = Some(rx);
+                self.worker_started.store(false, Ordering::SeqCst);
+                false
+            }
+        }
+    }
+
+    fn enqueue(&self, request: Bcv2HydrationRequest) {
+        if !self.queued_pubkeys.insert(request.pubkey.clone()) {
+            return;
+        }
+
+        if !self.ensure_worker_started() {
+            self.queued_pubkeys.remove(&request.pubkey);
+            record_bcv2_rpc_hydration_evidence(
+                &request.pubkey,
+                &request,
+                &Bcv2RpcHydrationEvidence::missing(None, "no_tokio_runtime", 0),
+            );
+            return;
+        }
+
+        match self.tx.try_send(request) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(request)) => {
+                self.queued_pubkeys.remove(&request.pubkey);
+                record_bcv2_rpc_hydration_evidence(
+                    &request.pubkey,
+                    &request,
+                    &Bcv2RpcHydrationEvidence::missing(None, "queue_full", 0),
+                );
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(request)) => {
+                self.queued_pubkeys.remove(&request.pubkey);
+                record_bcv2_rpc_hydration_evidence(
+                    &request.pubkey,
+                    &request,
+                    &Bcv2RpcHydrationEvidence::missing(None, "worker_closed", 0),
+                );
+            }
+        }
+    }
+}
+
+async fn run_bcv2_hydration_worker(
+    endpoint: Arc<str>,
+    mut rx: tokio::sync::mpsc::Receiver<Bcv2HydrationRequest>,
+    queued_pubkeys: Arc<DashSet<String>>,
+) {
+    let rpc = new_async_rpc_client(endpoint.to_string());
+    let commitment = CommitmentConfig::processed();
+    while let Some(request) = rx.recv().await {
+        let started = Instant::now();
+        let evidence = match Pubkey::from_str(&request.pubkey) {
+            Ok(pubkey) => {
+                let result = tokio::time::timeout(
+                    Duration::from_millis(BCV2_RPC_HYDRATION_TIMEOUT_MS),
+                    rpc.get_account_with_commitment(&pubkey, commitment),
+                )
+                .await;
+                let latency_ms = started.elapsed().as_millis();
+                match result {
+                    Ok(Ok(response)) => {
+                        let context_slot = response.context.slot;
+                        match response.value {
+                            Some(account) => Bcv2RpcHydrationEvidence::ready(
+                                context_slot,
+                                account.owner.to_string(),
+                                account.data.len(),
+                                latency_ms,
+                            ),
+                            None => Bcv2RpcHydrationEvidence::missing(
+                                Some(context_slot),
+                                "missing_on_rpc",
+                                latency_ms,
+                            ),
+                        }
+                    }
+                    Ok(Err(err)) => Bcv2RpcHydrationEvidence::missing(
+                        None,
+                        format!("rpc_error:{:?}", err.kind()),
+                        latency_ms,
+                    ),
+                    Err(_) => Bcv2RpcHydrationEvidence::missing(None, "timeout", latency_ms),
+                }
+            }
+            Err(_) => Bcv2RpcHydrationEvidence::missing(None, "invalid_pubkey", 0),
+        };
+        record_bcv2_rpc_hydration_evidence(&request.pubkey, &request, &evidence);
+        queued_pubkeys.remove(&request.pubkey);
+    }
+}
+
+fn record_bcv2_rpc_hydration_evidence(
+    pubkey: &str,
+    request: &Bcv2HydrationRequest,
+    evidence: &Bcv2RpcHydrationEvidence,
+) {
+    let context_slot = evidence
+        .context_slot
+        .map(|slot| slot.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let observed_slot = request
+        .observed_slot
+        .map(|slot| slot.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    if evidence.ready {
+        info!(
+            "BCV2_RPC_HYDRATION_READY pubkey={} commitment=processed context_slot={} owner={} data_len={} latency_ms={} observed_slot={} signature={}",
+            pubkey,
+            context_slot,
+            evidence.owner.as_deref().unwrap_or("none"),
+            evidence
+                .data_len
+                .map(|len| len.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            evidence.latency_ms,
+            observed_slot,
+            request.signature
+        );
+    } else {
+        info!(
+            "BCV2_RPC_HYDRATION_MISSING pubkey={} commitment=processed context_slot={} latency_ms={} error_class={} observed_slot={} signature={}",
+            pubkey,
+            context_slot,
+            evidence.latency_ms,
+            evidence.error_class.as_deref().unwrap_or("unknown"),
+            observed_slot,
+            request.signature
+        );
+    }
+}
+
 #[derive(Clone)]
 pub struct BinaryParser {
     #[allow(dead_code)]
@@ -3353,16 +3586,33 @@ pub struct BinaryParser {
     account_reg: AccountRegistry,
     resolve_queue: ResolveQueue,
     complete_tracker: CompleteTracker,
+    bcv2_hydrator: Option<Bcv2HydrationService>,
 }
 
 impl BinaryParser {
     pub fn new(verbose: bool) -> Self {
+        Self::with_account_registry_and_bcv2_hydration(verbose, AccountRegistry::new(), None)
+    }
+
+    pub fn with_account_registry(verbose: bool, account_reg: AccountRegistry) -> Self {
+        Self::with_account_registry_and_bcv2_hydration(verbose, account_reg, None)
+    }
+
+    pub fn with_account_registry_and_bcv2_hydration(
+        verbose: bool,
+        account_reg: AccountRegistry,
+        rpc_endpoint: Option<String>,
+    ) -> Self {
+        let bcv2_hydrator = rpc_endpoint
+            .filter(|endpoint| !endpoint.trim().is_empty())
+            .map(Bcv2HydrationService::new);
         Self {
             verbose,
             curve_mint_reg: CurveMintRegistry::new(),
-            account_reg: AccountRegistry::new(),
+            account_reg,
             resolve_queue: ResolveQueue::with_default_cap(),
             complete_tracker: CompleteTracker::new(),
+            bcv2_hydrator,
         }
     }
 
@@ -4121,6 +4371,11 @@ impl BinaryParser {
         for trade in &mut deduped {
             enrich_trade_optional_accounts_from_source_ix(event, trade);
             populate_trade_toolchain_fingerprint_from_source_tx(event, trade);
+            register_route_compatible_observed_bcv2(
+                &self.account_reg,
+                self.bcv2_hydrator.as_ref(),
+                trade,
+            );
         }
         Ok(deduped)
     }
@@ -5769,6 +6024,69 @@ fn populate_trade_toolchain_fingerprint_from_source_tx(
     };
 }
 
+fn register_route_compatible_observed_bcv2(
+    account_reg: &AccountRegistry,
+    hydrator: Option<&Bcv2HydrationService>,
+    trade: &TradeEvent,
+) -> bool {
+    let Some(bcv2) = trade.bonding_curve_v2 else {
+        return false;
+    };
+    let Some(provenance) = trade.bonding_curve_v2_provenance.as_ref() else {
+        return false;
+    };
+    if provenance.provenance_status.as_deref() != Some("route_compatible") {
+        return false;
+    }
+
+    let pubkey = bcv2.to_string();
+    let inserted = account_reg.insert_bcv2(pubkey.clone());
+    let observed_slot = provenance.source_slot.or(trade.slot);
+    let observed_slot_label = observed_slot
+        .map(|slot| slot.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let observed_slot_index = provenance
+        .source_slot_index
+        .or(trade.event_ordinal)
+        .map(|slot_index| slot_index.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let instruction_index = provenance
+        .source_instruction_index
+        .map(|index| index.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let buy_variant = provenance
+        .source_buy_variant
+        .as_deref()
+        .or(trade.buy_variant.as_deref())
+        .unwrap_or("none");
+    let signature = provenance
+        .source_tx_signature
+        .clone()
+        .unwrap_or_else(|| trade.signature.to_string());
+
+    info!(
+        "BCV2_EXACT_WATCH_REGISTERED pubkey={} inserted={} signature={} observed_slot={} observed_slot_index={} instruction_index={} buy_variant={} registry_version={}",
+        pubkey,
+        inserted,
+        signature,
+        observed_slot_label,
+        observed_slot_index,
+        instruction_index,
+        buy_variant,
+        account_reg.version()
+    );
+
+    if let Some(hydrator) = hydrator {
+        hydrator.enqueue(Bcv2HydrationRequest {
+            pubkey,
+            signature,
+            observed_slot,
+        });
+    }
+
+    true
+}
+
 fn count_trade_fee_transfers(
     accounts: &[Pubkey],
     inner_instructions: &[crate::types::InnerInstructionGroup],
@@ -6304,7 +6622,7 @@ mod tests {
     }
 
     fn make_ftdi_buy_event(external_fee_count: usize, include_wsol_self_wrap: bool) -> GeyserEvent {
-        let signer = Pubkey::new_unique();
+        let signer = Keypair::new().pubkey();
         let mint = Pubkey::new_unique();
         let curve = Pubkey::new_unique();
         let fee_recipient = Pubkey::new_unique();
@@ -9832,6 +10150,111 @@ mod tests {
             provenance.provenance_status.as_deref(),
             Some("route_compatible")
         );
+    }
+
+    fn observed_bcv2_provenance(
+        signature: solana_sdk::signature::Signature,
+        bonding_curve_v2: Pubkey,
+        status: &str,
+    ) -> ObservedAccountMetaProvenance {
+        ObservedAccountMetaProvenance {
+            source_tx_signature: Some(signature.to_string()),
+            source_slot: Some(42),
+            source_slot_index: Some(0),
+            source_instruction_index: Some(0),
+            source_program_id: Some(PUMP_FUN_PROGRAM_ID.to_string()),
+            source_discriminator: discriminator_hex(&DISC_BUY),
+            source_buy_variant: Some("legacy_buy".to_string()),
+            instruction_account_position: Some(PUMP_IDX_BONDING_CURVE_V2 as u32),
+            message_account_index: Some(PUMP_IDX_BONDING_CURVE_V2 as u32),
+            resolved_pubkey: Some(bonding_curve_v2.to_string()),
+            loaded_address_source: Some("resolved_transaction_account_keys".to_string()),
+            tx_success: Some(true),
+            meta_err: None,
+            provenance_status: Some(status.to_string()),
+        }
+    }
+
+    #[test]
+    fn route_compatible_observed_bcv2_registers_exact_watch() {
+        let registry = AccountRegistry::new();
+        let signature = solana_sdk::signature::Signature::new_unique();
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let signer = Pubkey::new_unique();
+        let bonding_curve_v2 = Pubkey::new_unique();
+        let mut trade = sample_trade_event(signature, pool, mint, signer, Some(0));
+        trade.bonding_curve_v2 = Some(bonding_curve_v2);
+        trade.bonding_curve_v2_provenance = Some(observed_bcv2_provenance(
+            signature,
+            bonding_curve_v2,
+            "route_compatible",
+        ));
+
+        let baseline_version = registry.version();
+        assert!(register_route_compatible_observed_bcv2(
+            &registry, None, &trade
+        ));
+
+        assert!(registry.contains_bcv2(&bonding_curve_v2.to_string()));
+        assert!(
+            registry.version() > baseline_version,
+            "route-compatible observed bcv2 must change the active exact-watch request surface"
+        );
+    }
+
+    #[test]
+    fn observed_bcv2_without_route_compatible_provenance_does_not_change_request_fingerprint() {
+        let registry = AccountRegistry::new();
+        let signature = solana_sdk::signature::Signature::new_unique();
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let signer = Pubkey::new_unique();
+        let bonding_curve_v2 = Pubkey::new_unique();
+        let mut trade = sample_trade_event(signature, pool, mint, signer, Some(0));
+        trade.bonding_curve_v2 = Some(bonding_curve_v2);
+        trade.bonding_curve_v2_provenance = Some(observed_bcv2_provenance(
+            signature,
+            bonding_curve_v2,
+            "tx_failed",
+        ));
+
+        let baseline_version = registry.version();
+        assert!(!register_route_compatible_observed_bcv2(
+            &registry, None, &trade
+        ));
+
+        assert!(!registry.contains_bcv2(&bonding_curve_v2.to_string()));
+        assert_eq!(
+            registry.version(),
+            baseline_version,
+            "non-route-compatible observed tx meta must remain a hint only"
+        );
+    }
+
+    #[test]
+    fn bcv2_hydration_ready_records_owner_data_len_context_slot() {
+        let owner = Pubkey::new_unique().to_string();
+        let evidence = Bcv2RpcHydrationEvidence::ready(123, owner.clone(), 256, 7);
+
+        assert!(evidence.ready);
+        assert_eq!(evidence.context_slot, Some(123));
+        assert_eq!(evidence.owner.as_deref(), Some(owner.as_str()));
+        assert_eq!(evidence.data_len, Some(256));
+        assert_eq!(evidence.latency_ms, 7);
+        assert!(evidence.error_class.is_none());
+    }
+
+    #[test]
+    fn bcv2_hydration_missing_remains_fail_closed() {
+        let evidence = Bcv2RpcHydrationEvidence::missing(Some(123), "missing_on_rpc", 9);
+
+        assert!(!evidence.ready);
+        assert_eq!(evidence.context_slot, Some(123));
+        assert_eq!(evidence.error_class.as_deref(), Some("missing_on_rpc"));
+        assert_eq!(evidence.latency_ms, 9);
+        assert!(evidence.owner.is_none());
+        assert!(evidence.data_len.is_none());
     }
 
     #[test]

@@ -1463,7 +1463,19 @@ impl Seer {
                     "🔀 Source Router: {} mode - binary parser ENABLED",
                     mode_name
                 );
-                Some(BinaryParser::new(config.verbose))
+                if matches!(effective_mode, SeerSourceMode::GeyserGrpc) {
+                    if let Some(grpc_connection) = grpc_connection.as_ref() {
+                        Some(BinaryParser::with_account_registry_and_bcv2_hydration(
+                            config.verbose,
+                            grpc_connection.account_registry(),
+                            Some(config.rpc_endpoint.clone()),
+                        ))
+                    } else {
+                        Some(BinaryParser::new(config.verbose))
+                    }
+                } else {
+                    Some(BinaryParser::new(config.verbose))
+                }
             }
         };
 
