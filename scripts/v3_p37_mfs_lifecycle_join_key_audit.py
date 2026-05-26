@@ -1165,6 +1165,53 @@ def working_builder_parity_payload(
         for row in parity_rows
         if row_bool_string(row, "working_builder_bcv2_diag_materialized") == "true"
     ]
+    bcv2_evidence_status_counts = Counter(
+        row_string(row, "working_builder_bcv2_evidence_status") or "missing"
+        for row in parity_rows
+    )
+    bcv2_evidence_source_counts = Counter(
+        row_string(row, "working_builder_bcv2_evidence_source") or "missing"
+        for row in parity_rows
+    )
+    bcv2_evidence_reason_counts = Counter(
+        row_string(row, "working_builder_bcv2_evidence_reason") or "missing"
+        for row in parity_rows
+    )
+    bcv2_evidence_rows = [
+        row
+        for row in parity_rows
+        if row_string(row, "working_builder_bcv2_evidence_status") is not None
+    ]
+    bcv2_evidence_ready_rows = [
+        row
+        for row in parity_rows
+        if row_bool_string(row, "working_builder_bcv2_evidence_ready") == "true"
+    ]
+    bcv2_evidence_conflict_rows = [
+        row
+        for row in parity_rows
+        if row_string(row, "working_builder_bcv2_evidence_conflict") is not None
+    ]
+    bcv2_evidence_owner_rows = [
+        row
+        for row in parity_rows
+        if row_string(row, "working_builder_bcv2_evidence_owner") is not None
+    ]
+    bcv2_evidence_data_len_rows = [
+        row
+        for row in parity_rows
+        if row_int(row, "working_builder_bcv2_evidence_data_len") is not None
+    ]
+    bcv2_evidence_slot_rows = [
+        row
+        for row in parity_rows
+        if row_int(row, "working_builder_bcv2_evidence_slot") is not None
+    ]
+    bcv2_evidence_context_slot_rows = [
+        row
+        for row in parity_rows
+        if row_int(row, "working_builder_bcv2_evidence_context_slot") is not None
+    ]
     creator_vault_source_authority_counts = Counter(
         row_string(row, "working_builder_creator_vault_source_authority") or "missing"
         for row in parity_rows
@@ -1422,6 +1469,34 @@ def working_builder_parity_payload(
         ),
         f"{prefix}working_builder_bcv2_diag_materialized_rows": len(
             bcv2_diag_materialized_rows
+        ),
+        f"{prefix}working_builder_bcv2_evidence_rows": len(bcv2_evidence_rows),
+        f"{prefix}working_builder_bcv2_evidence_ready_rows": len(
+            bcv2_evidence_ready_rows
+        ),
+        f"{prefix}working_builder_bcv2_evidence_conflict_rows": len(
+            bcv2_evidence_conflict_rows
+        ),
+        f"{prefix}working_builder_bcv2_evidence_owner_rows": len(
+            bcv2_evidence_owner_rows
+        ),
+        f"{prefix}working_builder_bcv2_evidence_data_len_rows": len(
+            bcv2_evidence_data_len_rows
+        ),
+        f"{prefix}working_builder_bcv2_evidence_slot_rows": len(
+            bcv2_evidence_slot_rows
+        ),
+        f"{prefix}working_builder_bcv2_evidence_context_slot_rows": len(
+            bcv2_evidence_context_slot_rows
+        ),
+        f"{prefix}working_builder_bcv2_evidence_status_counts": dict(
+            sorted(bcv2_evidence_status_counts.items())
+        ),
+        f"{prefix}working_builder_bcv2_evidence_source_counts": dict(
+            sorted(bcv2_evidence_source_counts.items())
+        ),
+        f"{prefix}working_builder_bcv2_evidence_reason_counts": dict(
+            sorted(bcv2_evidence_reason_counts.items())
         ),
         f"{prefix}working_builder_creator_vault_source_authority_counts": dict(
             sorted(creator_vault_source_authority_counts.items())
@@ -4231,6 +4306,16 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- active_shadow_working_builder_bcv2_account_state_materialized_rows: `{active_shadow['active_shadow_working_builder_bcv2_account_state_materialized_rows']}`",
             f"- active_shadow_working_builder_bcv2_mfs_materialized_rows: `{active_shadow['active_shadow_working_builder_bcv2_mfs_materialized_rows']}`",
             f"- active_shadow_working_builder_bcv2_diag_materialized_rows: `{active_shadow['active_shadow_working_builder_bcv2_diag_materialized_rows']}`",
+            f"- active_shadow_working_builder_bcv2_evidence_rows: `{active_shadow['active_shadow_working_builder_bcv2_evidence_rows']}`",
+            f"- active_shadow_working_builder_bcv2_evidence_ready_rows: `{active_shadow['active_shadow_working_builder_bcv2_evidence_ready_rows']}`",
+            f"- active_shadow_working_builder_bcv2_evidence_conflict_rows: `{active_shadow['active_shadow_working_builder_bcv2_evidence_conflict_rows']}`",
+            f"- active_shadow_working_builder_bcv2_evidence_owner_rows: `{active_shadow['active_shadow_working_builder_bcv2_evidence_owner_rows']}`",
+            f"- active_shadow_working_builder_bcv2_evidence_data_len_rows: `{active_shadow['active_shadow_working_builder_bcv2_evidence_data_len_rows']}`",
+            f"- active_shadow_working_builder_bcv2_evidence_slot_rows: `{active_shadow['active_shadow_working_builder_bcv2_evidence_slot_rows']}`",
+            f"- active_shadow_working_builder_bcv2_evidence_context_slot_rows: `{active_shadow['active_shadow_working_builder_bcv2_evidence_context_slot_rows']}`",
+            f"- active_shadow_working_builder_bcv2_evidence_status_counts: `{json.dumps(active_shadow['active_shadow_working_builder_bcv2_evidence_status_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_working_builder_bcv2_evidence_source_counts: `{json.dumps(active_shadow['active_shadow_working_builder_bcv2_evidence_source_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_working_builder_bcv2_evidence_reason_counts: `{json.dumps(active_shadow['active_shadow_working_builder_bcv2_evidence_reason_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- active_shadow_working_builder_creator_vault_source_authority_counts: `{json.dumps(active_shadow['active_shadow_working_builder_creator_vault_source_authority_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- active_shadow_working_builder_creator_vault_rpc_load_status_counts: `{json.dumps(active_shadow['active_shadow_working_builder_creator_vault_rpc_load_status_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- active_shadow_working_builder_bcv2_authoritative_and_load_ready_rows: `{active_shadow['active_shadow_working_builder_bcv2_authoritative_and_load_ready_rows']}`",
@@ -4421,6 +4506,16 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- working_builder_bcv2_account_state_materialized_rows: `{materialization['working_builder_bcv2_account_state_materialized_rows']}`",
             f"- working_builder_bcv2_mfs_materialized_rows: `{materialization['working_builder_bcv2_mfs_materialized_rows']}`",
             f"- working_builder_bcv2_diag_materialized_rows: `{materialization['working_builder_bcv2_diag_materialized_rows']}`",
+            f"- working_builder_bcv2_evidence_rows: `{materialization['working_builder_bcv2_evidence_rows']}`",
+            f"- working_builder_bcv2_evidence_ready_rows: `{materialization['working_builder_bcv2_evidence_ready_rows']}`",
+            f"- working_builder_bcv2_evidence_conflict_rows: `{materialization['working_builder_bcv2_evidence_conflict_rows']}`",
+            f"- working_builder_bcv2_evidence_owner_rows: `{materialization['working_builder_bcv2_evidence_owner_rows']}`",
+            f"- working_builder_bcv2_evidence_data_len_rows: `{materialization['working_builder_bcv2_evidence_data_len_rows']}`",
+            f"- working_builder_bcv2_evidence_slot_rows: `{materialization['working_builder_bcv2_evidence_slot_rows']}`",
+            f"- working_builder_bcv2_evidence_context_slot_rows: `{materialization['working_builder_bcv2_evidence_context_slot_rows']}`",
+            f"- working_builder_bcv2_evidence_status_counts: `{json.dumps(materialization['working_builder_bcv2_evidence_status_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- working_builder_bcv2_evidence_source_counts: `{json.dumps(materialization['working_builder_bcv2_evidence_source_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- working_builder_bcv2_evidence_reason_counts: `{json.dumps(materialization['working_builder_bcv2_evidence_reason_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- working_builder_creator_vault_source_authority_counts: `{json.dumps(materialization['working_builder_creator_vault_source_authority_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- working_builder_creator_vault_rpc_load_status_counts: `{json.dumps(materialization['working_builder_creator_vault_rpc_load_status_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- working_builder_bcv2_authoritative_and_load_ready_rows: `{materialization['working_builder_bcv2_authoritative_and_load_ready_rows']}`",

@@ -2511,6 +2511,88 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
             1,
         )
 
+    def test_audit_counts_bcv2_evidence_without_manifest_ready_unlock(self) -> None:
+        rows = [
+            {
+                "working_builder_parity_mode": "working_builder_parity",
+                "working_builder_request_built": True,
+                "working_builder_buy_variant": "routed_exact_sol_in",
+                "working_builder_rpc_manifest_hash": "rpc-hash-a",
+                "working_builder_sender_manifest_hash": "sender-hash-a",
+                "working_builder_bcv2_source_authority": "authoritative_observed_tx",
+                "working_builder_bcv2_rpc_load_status": "rpc_load_ready",
+                "working_builder_bcv2_rpc_load_ready": True,
+                "working_builder_creator_vault_source_authority": "authoritative_detected_pool_creator",
+                "working_builder_creator_vault_rpc_load_status": "rpc_load_ready",
+                "working_builder_bcv2_evidence_status": "rpc_ready",
+                "working_builder_bcv2_evidence_source": "rpc_hydration",
+                "working_builder_bcv2_evidence_ready": True,
+                "working_builder_bcv2_evidence_owner": "owner-a",
+                "working_builder_bcv2_evidence_data_len": 512,
+                "working_builder_bcv2_evidence_slot": 100,
+                "working_builder_bcv2_evidence_context_slot": 101,
+            },
+            {
+                "working_builder_parity_mode": "working_builder_parity",
+                "working_builder_request_built": True,
+                "working_builder_buy_variant": "routed_exact_sol_in",
+                "working_builder_rpc_manifest_hash": "rpc-hash-b",
+                "working_builder_sender_manifest_hash": "sender-hash-b",
+                "working_builder_bcv2_source_authority": "authoritative_observed_tx",
+                "working_builder_bcv2_rpc_load_status": "missing_on_rpc_precheck",
+                "working_builder_bcv2_rpc_load_ready": False,
+                "working_builder_creator_vault_source_authority": "authoritative_detected_pool_creator",
+                "working_builder_creator_vault_rpc_load_status": "rpc_load_ready",
+                "working_builder_bcv2_evidence_status": "rpc_missing",
+                "working_builder_bcv2_evidence_source": "rpc_hydration",
+                "working_builder_bcv2_evidence_ready": False,
+                "working_builder_bcv2_evidence_reason": "provider_timeout",
+                "working_builder_bcv2_evidence_conflict": "positive_account_update_received_conflicts_with_negative_rpc_missing",
+            },
+        ]
+
+        payload = audit.working_builder_parity_payload(rows)
+        active_payload = audit.working_builder_parity_payload(rows, "active_shadow_")
+
+        self.assertEqual(payload["working_builder_bcv2_evidence_rows"], 2)
+        self.assertEqual(payload["working_builder_bcv2_evidence_ready_rows"], 1)
+        self.assertEqual(payload["working_builder_bcv2_evidence_conflict_rows"], 1)
+        self.assertEqual(payload["working_builder_bcv2_evidence_owner_rows"], 1)
+        self.assertEqual(payload["working_builder_bcv2_evidence_data_len_rows"], 1)
+        self.assertEqual(payload["working_builder_bcv2_evidence_slot_rows"], 1)
+        self.assertEqual(payload["working_builder_bcv2_evidence_context_slot_rows"], 1)
+        self.assertEqual(
+            payload["working_builder_bcv2_evidence_status_counts"],
+            {"rpc_missing": 1, "rpc_ready": 1},
+        )
+        self.assertEqual(
+            payload["working_builder_bcv2_evidence_source_counts"],
+            {"rpc_hydration": 2},
+        )
+        self.assertEqual(
+            payload["working_builder_bcv2_evidence_reason_counts"],
+            {"missing": 1, "provider_timeout": 1},
+        )
+        self.assertEqual(
+            payload["working_builder_manifest_ready_rows"],
+            0,
+            "PR4 evidence diagnostics must not unlock manifest readiness",
+        )
+        self.assertEqual(
+            active_payload["active_shadow_working_builder_bcv2_evidence_rows"], 2
+        )
+        self.assertEqual(
+            active_payload["active_shadow_working_builder_bcv2_evidence_ready_rows"], 1
+        )
+        self.assertEqual(
+            active_payload["active_shadow_working_builder_bcv2_evidence_status_counts"],
+            {"rpc_missing": 1, "rpc_ready": 1},
+        )
+        self.assertEqual(
+            active_payload["active_shadow_working_builder_manifest_ready_rows"],
+            0,
+        )
+
     def test_audit_flags_probe_working_builder_legacy_variant_rows(self) -> None:
         payload = audit.working_builder_parity_payload(
             [

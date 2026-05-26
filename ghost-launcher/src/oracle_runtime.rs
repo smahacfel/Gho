@@ -60,8 +60,11 @@ use ghost_core::shadow_ledger::{
 };
 use ghost_core::{
     coverage_audit, BaseMint, BondingCurveKey, CoverageAuditClosedWindow, CoverageAuditRecord,
-    CoverageAuditTruthSignatureState, CurveFinality, GatekeeperDecision as WalGatekeeperDecision,
-    PoolId, PoolIdentity as DomainPoolIdentity, PoolIdentityRegistry, Wal, WalRecord,
+    CoverageAuditTruthSignatureState, CurveFinality, ExecutionAccountEvidence,
+    ExecutionAccountEvidenceRecord, ExecutionAccountEvidenceStore, ExecutionAccountRole,
+    GatekeeperDecision as WalGatekeeperDecision, PoolId, PoolIdentity as DomainPoolIdentity,
+    PoolIdentityRegistry, UpsertExecutionAccountEvidenceOutcome,
+    UpsertExecutionAccountEvidenceResult, Wal, WalRecord,
 };
 
 use crate::components::fallback_contract::{
@@ -1538,6 +1541,7 @@ pub struct OracleRuntime {
     registered_mints: RwLock<HashMap<Pubkey, Pubkey>>,
     pool_identities: Arc<PoolIdentityRegistry>,
     account_state_core: Arc<AccountStateReducer>,
+    execution_account_evidence_store: Arc<ExecutionAccountEvidenceStore>,
     canonical_readiness_notifier: CanonicalReadinessNotifier,
     runtime_pool_states: RwLock<HashMap<Pubkey, PoolState>>,
     orphans: RwLock<HashMap<Pubkey, Vec<OrphanTx>>>,
@@ -1575,6 +1579,54 @@ pub struct OracleRuntime {
     /// Rollback reeval seeds recovered during WAL replay at startup.
     recovered_rollback_seeds: Mutex<Vec<ghost_core::wal::RollbackReevalSeedRecord>>,
     p37_shadow_probe_state: Arc<P37ShadowProbeRuntimeState>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Bcv2EvidenceStatus {
+    pub status: Option<String>,
+    pub source: Option<String>,
+    pub ready: Option<bool>,
+    pub owner: Option<String>,
+    pub data_len: Option<u64>,
+    pub slot: Option<u64>,
+    pub context_slot: Option<u64>,
+    pub reason: Option<String>,
+    pub conflict: Option<String>,
+}
+
+fn bcv2_evidence_status_from_record(record: &ExecutionAccountEvidenceRecord) -> Bcv2EvidenceStatus {
+    let positive_with_payload = record.best_positive.as_ref().filter(|evidence| {
+        evidence.owner.is_some()
+            || evidence.data_len.is_some()
+            || evidence.slot.is_some()
+            || evidence.context_slot.is_some()
+    });
+    let payload_source = positive_with_payload
+        .or(record.best_positive.as_ref())
+        .unwrap_or(&record.latest);
+
+    Bcv2EvidenceStatus {
+        status: Some(record.latest.status.as_str().to_string()),
+        source: Some(record.latest.source.as_str().to_string()),
+        ready: record
+            .best_positive
+            .as_ref()
+            .map(|evidence| evidence.evidence_ready),
+        owner: payload_source.owner.map(|owner| owner.to_string()),
+        data_len: payload_source.data_len,
+        slot: payload_source.slot,
+        context_slot: payload_source.context_slot,
+        reason: record.latest.reason.clone().or_else(|| {
+            record
+                .conflict
+                .as_ref()
+                .map(|conflict| conflict.reason.clone())
+        }),
+        conflict: record
+            .conflict
+            .as_ref()
+            .map(|conflict| conflict.reason.clone()),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1691,6 +1743,7 @@ impl OracleRuntime {
         );
 
         let account_state_core = Arc::new(AccountStateReducer::new());
+        let execution_account_evidence_store = Arc::new(ExecutionAccountEvidenceStore::new());
         let session_manager = Arc::new(SessionManager::new_with_account_state_core(
             config.session_manager_config(),
             Arc::clone(&account_state_core),
@@ -1714,6 +1767,7 @@ impl OracleRuntime {
             registered_mints: RwLock::new(HashMap::new()),
             pool_identities: Arc::new(PoolIdentityRegistry::new()),
             account_state_core,
+            execution_account_evidence_store,
             canonical_readiness_notifier: CanonicalReadinessNotifier::default(),
             runtime_pool_states: RwLock::new(HashMap::new()),
             orphans: RwLock::new(HashMap::new()),
@@ -1746,6 +1800,60 @@ impl OracleRuntime {
 
     pub fn session_manager(&self) -> Arc<SessionManager> {
         Arc::clone(&self.session_manager)
+    }
+
+    pub fn execution_account_evidence_store(&self) -> Arc<ExecutionAccountEvidenceStore> {
+        Arc::clone(&self.execution_account_evidence_store)
+    }
+
+    pub fn record_execution_account_evidence(
+        &self,
+        evidence: ExecutionAccountEvidence,
+    ) -> UpsertExecutionAccountEvidenceResult {
+        let role = evidence.role.label();
+        let account_pubkey = evidence.account_pubkey;
+        let source = evidence.source.as_str();
+        let status = evidence.status.as_str();
+        let ready = evidence.evidence_ready;
+        let result = self.execution_account_evidence_store.upsert(evidence);
+        let outcome = match result.outcome {
+            UpsertExecutionAccountEvidenceOutcome::Inserted => "inserted",
+            UpsertExecutionAccountEvidenceOutcome::Updated => "updated",
+        };
+        let conflict = result
+            .conflict
+            .as_ref()
+            .map(|conflict| conflict.reason.as_str());
+        increment_counter!(
+            "execution_account_evidence_upsert_total",
+            "role" => role.clone(),
+            "status" => status,
+            "source" => source,
+            "outcome" => outcome
+        );
+        info!(
+            role = %role,
+            account_pubkey = %account_pubkey,
+            source = source,
+            status = status,
+            outcome = outcome,
+            ready = ready,
+            conflict = ?conflict,
+            "DIAG_EXECUTION_ACCOUNT_EVIDENCE_UPSERT"
+        );
+        result
+    }
+
+    pub fn lookup_bcv2_evidence(&self, pubkey: &Pubkey) -> Option<ExecutionAccountEvidenceRecord> {
+        self.execution_account_evidence_store
+            .get(ExecutionAccountRole::BondingCurveV2, pubkey)
+    }
+
+    pub fn bcv2_evidence_status(&self, pubkey: &Pubkey) -> Bcv2EvidenceStatus {
+        self.lookup_bcv2_evidence(pubkey)
+            .as_ref()
+            .map(bcv2_evidence_status_from_record)
+            .unwrap_or_default()
     }
 
     // =========================================================================
@@ -5125,6 +5233,15 @@ struct P37ShadowProbeSelectionRecord {
     working_builder_bcv2_mfs_seen_reason: Option<String>,
     working_builder_bcv2_diag_seen_reason: Option<String>,
     working_builder_bcv2_local_coverage_class: Option<String>,
+    working_builder_bcv2_evidence_status: Option<String>,
+    working_builder_bcv2_evidence_source: Option<String>,
+    working_builder_bcv2_evidence_ready: Option<bool>,
+    working_builder_bcv2_evidence_owner: Option<String>,
+    working_builder_bcv2_evidence_data_len: Option<u64>,
+    working_builder_bcv2_evidence_slot: Option<u64>,
+    working_builder_bcv2_evidence_context_slot: Option<u64>,
+    working_builder_bcv2_evidence_reason: Option<String>,
+    working_builder_bcv2_evidence_conflict: Option<String>,
     working_builder_creator_vault_pubkey: Option<String>,
     working_builder_creator_vault_source_authority: Option<String>,
     working_builder_creator_vault_rpc_load_status: Option<String>,
@@ -5324,6 +5441,15 @@ struct P37ShadowProbeTransportRecord {
     working_builder_bcv2_mfs_seen_reason: Option<String>,
     working_builder_bcv2_diag_seen_reason: Option<String>,
     working_builder_bcv2_local_coverage_class: Option<String>,
+    working_builder_bcv2_evidence_status: Option<String>,
+    working_builder_bcv2_evidence_source: Option<String>,
+    working_builder_bcv2_evidence_ready: Option<bool>,
+    working_builder_bcv2_evidence_owner: Option<String>,
+    working_builder_bcv2_evidence_data_len: Option<u64>,
+    working_builder_bcv2_evidence_slot: Option<u64>,
+    working_builder_bcv2_evidence_context_slot: Option<u64>,
+    working_builder_bcv2_evidence_reason: Option<String>,
+    working_builder_bcv2_evidence_conflict: Option<String>,
     working_builder_creator_vault_pubkey: Option<String>,
     working_builder_creator_vault_source_authority: Option<String>,
     working_builder_creator_vault_rpc_load_status: Option<String>,
@@ -5822,6 +5948,15 @@ fn p37_shadow_probe_selection_record(
         working_builder_bcv2_mfs_seen_reason: None,
         working_builder_bcv2_diag_seen_reason: None,
         working_builder_bcv2_local_coverage_class: None,
+        working_builder_bcv2_evidence_status: None,
+        working_builder_bcv2_evidence_source: None,
+        working_builder_bcv2_evidence_ready: None,
+        working_builder_bcv2_evidence_owner: None,
+        working_builder_bcv2_evidence_data_len: None,
+        working_builder_bcv2_evidence_slot: None,
+        working_builder_bcv2_evidence_context_slot: None,
+        working_builder_bcv2_evidence_reason: None,
+        working_builder_bcv2_evidence_conflict: None,
         working_builder_creator_vault_pubkey: None,
         working_builder_creator_vault_source_authority: None,
         working_builder_creator_vault_rpc_load_status: None,
@@ -6123,6 +6258,18 @@ fn p37_shadow_probe_artifact_records(
         working_builder_bcv2_diag_seen_reason: record.working_builder_bcv2_diag_seen_reason.clone(),
         working_builder_bcv2_local_coverage_class: record
             .working_builder_bcv2_local_coverage_class
+            .clone(),
+        working_builder_bcv2_evidence_status: record.working_builder_bcv2_evidence_status.clone(),
+        working_builder_bcv2_evidence_source: record.working_builder_bcv2_evidence_source.clone(),
+        working_builder_bcv2_evidence_ready: record.working_builder_bcv2_evidence_ready,
+        working_builder_bcv2_evidence_owner: record.working_builder_bcv2_evidence_owner.clone(),
+        working_builder_bcv2_evidence_data_len: record.working_builder_bcv2_evidence_data_len,
+        working_builder_bcv2_evidence_slot: record.working_builder_bcv2_evidence_slot,
+        working_builder_bcv2_evidence_context_slot: record
+            .working_builder_bcv2_evidence_context_slot,
+        working_builder_bcv2_evidence_reason: record.working_builder_bcv2_evidence_reason.clone(),
+        working_builder_bcv2_evidence_conflict: record
+            .working_builder_bcv2_evidence_conflict
             .clone(),
         working_builder_creator_vault_pubkey: record.working_builder_creator_vault_pubkey.clone(),
         working_builder_creator_vault_source_authority: record
@@ -8100,6 +8247,15 @@ struct P37ShadowProbeExecutionDiagnostics {
     working_builder_bcv2_mfs_seen_reason: Option<String>,
     working_builder_bcv2_diag_seen_reason: Option<String>,
     working_builder_bcv2_local_coverage_class: Option<String>,
+    working_builder_bcv2_evidence_status: Option<String>,
+    working_builder_bcv2_evidence_source: Option<String>,
+    working_builder_bcv2_evidence_ready: Option<bool>,
+    working_builder_bcv2_evidence_owner: Option<String>,
+    working_builder_bcv2_evidence_data_len: Option<u64>,
+    working_builder_bcv2_evidence_slot: Option<u64>,
+    working_builder_bcv2_evidence_context_slot: Option<u64>,
+    working_builder_bcv2_evidence_reason: Option<String>,
+    working_builder_bcv2_evidence_conflict: Option<String>,
     working_builder_creator_vault_pubkey: Option<String>,
     working_builder_creator_vault_source_authority: Option<String>,
     working_builder_creator_vault_rpc_load_status: Option<String>,
@@ -9112,6 +9268,15 @@ struct P37WorkingBuilderParityDiagnostics {
     bcv2_mfs_seen_reason: Option<String>,
     bcv2_diag_seen_reason: Option<String>,
     bcv2_local_coverage_class: Option<String>,
+    bcv2_evidence_status: Option<String>,
+    bcv2_evidence_source: Option<String>,
+    bcv2_evidence_ready: Option<bool>,
+    bcv2_evidence_owner: Option<String>,
+    bcv2_evidence_data_len: Option<u64>,
+    bcv2_evidence_slot: Option<u64>,
+    bcv2_evidence_context_slot: Option<u64>,
+    bcv2_evidence_reason: Option<String>,
+    bcv2_evidence_conflict: Option<String>,
     creator_vault_pubkey: Option<String>,
     creator_vault_source_authority: Option<String>,
     creator_vault_rpc_load_status: Option<String>,
@@ -9696,6 +9861,20 @@ fn p37_working_builder_parity_diagnostics(
     account_set_diagnostics: Option<&P37ShadowProbeAccountSetDiagnostics>,
     enabled: bool,
 ) -> P37WorkingBuilderParityDiagnostics {
+    p37_working_builder_parity_diagnostics_with_evidence_store(
+        request,
+        account_set_diagnostics,
+        enabled,
+        None,
+    )
+}
+
+fn p37_working_builder_parity_diagnostics_with_evidence_store(
+    request: Option<&crate::components::trigger::PreparedBuyRequest>,
+    account_set_diagnostics: Option<&P37ShadowProbeAccountSetDiagnostics>,
+    enabled: bool,
+    evidence_store: Option<&ExecutionAccountEvidenceStore>,
+) -> P37WorkingBuilderParityDiagnostics {
     if !enabled {
         return P37WorkingBuilderParityDiagnostics::default();
     }
@@ -9818,6 +9997,15 @@ fn p37_working_builder_parity_diagnostics(
         .builder_required_curve_account_ready_reason
         .clone()
         .or_else(|| bonding_curve_v2_authority.mismatch_reason.clone());
+    let bcv2_evidence = evidence_store.and_then(|store| {
+        let pubkey = bcv2_builder_pubkey
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .and_then(|value| Pubkey::from_str(value).ok())?;
+        store
+            .get(ExecutionAccountRole::BondingCurveV2, &pubkey)
+            .map(|record| bcv2_evidence_status_from_record(&record))
+    });
     P37WorkingBuilderParityDiagnostics {
         mode: Some(P37_EXECUTION_BUILDER_MODE_WORKING_BUILDER_PARITY.to_string()),
         request_built: Some(request_built),
@@ -9875,6 +10063,27 @@ fn p37_working_builder_parity_diagnostics(
         bcv2_mfs_seen_reason: bcv2_local_coverage.mfs_seen_reason,
         bcv2_diag_seen_reason: bcv2_local_coverage.diag_seen_reason,
         bcv2_local_coverage_class: bcv2_local_coverage.local_coverage_class,
+        bcv2_evidence_status: bcv2_evidence
+            .as_ref()
+            .and_then(|status| status.status.clone()),
+        bcv2_evidence_source: bcv2_evidence
+            .as_ref()
+            .and_then(|status| status.source.clone()),
+        bcv2_evidence_ready: bcv2_evidence.as_ref().and_then(|status| status.ready),
+        bcv2_evidence_owner: bcv2_evidence
+            .as_ref()
+            .and_then(|status| status.owner.clone()),
+        bcv2_evidence_data_len: bcv2_evidence.as_ref().and_then(|status| status.data_len),
+        bcv2_evidence_slot: bcv2_evidence.as_ref().and_then(|status| status.slot),
+        bcv2_evidence_context_slot: bcv2_evidence
+            .as_ref()
+            .and_then(|status| status.context_slot),
+        bcv2_evidence_reason: bcv2_evidence
+            .as_ref()
+            .and_then(|status| status.reason.clone()),
+        bcv2_evidence_conflict: bcv2_evidence
+            .as_ref()
+            .and_then(|status| status.conflict.clone()),
         creator_vault_pubkey: creator_vault_readiness.pubkey,
         creator_vault_source_authority: creator_vault_readiness.source_authority,
         creator_vault_rpc_load_status: creator_vault_readiness.rpc_load_status,
@@ -9950,6 +10159,15 @@ fn p37_apply_working_builder_parity_to_record(
     record.working_builder_bcv2_mfs_seen_reason = diagnostics.bcv2_mfs_seen_reason;
     record.working_builder_bcv2_diag_seen_reason = diagnostics.bcv2_diag_seen_reason;
     record.working_builder_bcv2_local_coverage_class = diagnostics.bcv2_local_coverage_class;
+    record.working_builder_bcv2_evidence_status = diagnostics.bcv2_evidence_status;
+    record.working_builder_bcv2_evidence_source = diagnostics.bcv2_evidence_source;
+    record.working_builder_bcv2_evidence_ready = diagnostics.bcv2_evidence_ready;
+    record.working_builder_bcv2_evidence_owner = diagnostics.bcv2_evidence_owner;
+    record.working_builder_bcv2_evidence_data_len = diagnostics.bcv2_evidence_data_len;
+    record.working_builder_bcv2_evidence_slot = diagnostics.bcv2_evidence_slot;
+    record.working_builder_bcv2_evidence_context_slot = diagnostics.bcv2_evidence_context_slot;
+    record.working_builder_bcv2_evidence_reason = diagnostics.bcv2_evidence_reason;
+    record.working_builder_bcv2_evidence_conflict = diagnostics.bcv2_evidence_conflict;
     record.working_builder_creator_vault_pubkey = diagnostics.creator_vault_pubkey;
     record.working_builder_creator_vault_source_authority =
         diagnostics.creator_vault_source_authority;
@@ -10784,6 +11002,15 @@ fn active_shadow_account_diagnostics_from_account_set_with_mode(
         working_builder_bcv2_mfs_seen_reason: working_builder.bcv2_mfs_seen_reason,
         working_builder_bcv2_diag_seen_reason: working_builder.bcv2_diag_seen_reason,
         working_builder_bcv2_local_coverage_class: working_builder.bcv2_local_coverage_class,
+        working_builder_bcv2_evidence_status: working_builder.bcv2_evidence_status,
+        working_builder_bcv2_evidence_source: working_builder.bcv2_evidence_source,
+        working_builder_bcv2_evidence_ready: working_builder.bcv2_evidence_ready,
+        working_builder_bcv2_evidence_owner: working_builder.bcv2_evidence_owner,
+        working_builder_bcv2_evidence_data_len: working_builder.bcv2_evidence_data_len,
+        working_builder_bcv2_evidence_slot: working_builder.bcv2_evidence_slot,
+        working_builder_bcv2_evidence_context_slot: working_builder.bcv2_evidence_context_slot,
+        working_builder_bcv2_evidence_reason: working_builder.bcv2_evidence_reason,
+        working_builder_bcv2_evidence_conflict: working_builder.bcv2_evidence_conflict,
         working_builder_creator_vault_pubkey: working_builder.creator_vault_pubkey,
         working_builder_creator_vault_source_authority: working_builder
             .creator_vault_source_authority,
@@ -11998,6 +12225,33 @@ fn p37_shadow_probe_execution_diagnostics(
         working_builder_bcv2_mfs_seen_reason: working_builder.bcv2_mfs_seen_reason,
         working_builder_bcv2_diag_seen_reason: working_builder.bcv2_diag_seen_reason,
         working_builder_bcv2_local_coverage_class: working_builder.bcv2_local_coverage_class,
+        working_builder_bcv2_evidence_status: working_builder
+            .bcv2_evidence_status
+            .or_else(|| record.working_builder_bcv2_evidence_status.clone()),
+        working_builder_bcv2_evidence_source: working_builder
+            .bcv2_evidence_source
+            .or_else(|| record.working_builder_bcv2_evidence_source.clone()),
+        working_builder_bcv2_evidence_ready: working_builder
+            .bcv2_evidence_ready
+            .or(record.working_builder_bcv2_evidence_ready),
+        working_builder_bcv2_evidence_owner: working_builder
+            .bcv2_evidence_owner
+            .or_else(|| record.working_builder_bcv2_evidence_owner.clone()),
+        working_builder_bcv2_evidence_data_len: working_builder
+            .bcv2_evidence_data_len
+            .or(record.working_builder_bcv2_evidence_data_len),
+        working_builder_bcv2_evidence_slot: working_builder
+            .bcv2_evidence_slot
+            .or(record.working_builder_bcv2_evidence_slot),
+        working_builder_bcv2_evidence_context_slot: working_builder
+            .bcv2_evidence_context_slot
+            .or(record.working_builder_bcv2_evidence_context_slot),
+        working_builder_bcv2_evidence_reason: working_builder
+            .bcv2_evidence_reason
+            .or_else(|| record.working_builder_bcv2_evidence_reason.clone()),
+        working_builder_bcv2_evidence_conflict: working_builder
+            .bcv2_evidence_conflict
+            .or_else(|| record.working_builder_bcv2_evidence_conflict.clone()),
         working_builder_creator_vault_pubkey: working_builder.creator_vault_pubkey,
         working_builder_creator_vault_source_authority: working_builder
             .creator_vault_source_authority,
@@ -12381,6 +12635,16 @@ fn p37_shadow_probe_transport_from_event(
         working_builder_bcv2_diag_seen_reason: diagnostics.working_builder_bcv2_diag_seen_reason,
         working_builder_bcv2_local_coverage_class: diagnostics
             .working_builder_bcv2_local_coverage_class,
+        working_builder_bcv2_evidence_status: diagnostics.working_builder_bcv2_evidence_status,
+        working_builder_bcv2_evidence_source: diagnostics.working_builder_bcv2_evidence_source,
+        working_builder_bcv2_evidence_ready: diagnostics.working_builder_bcv2_evidence_ready,
+        working_builder_bcv2_evidence_owner: diagnostics.working_builder_bcv2_evidence_owner,
+        working_builder_bcv2_evidence_data_len: diagnostics.working_builder_bcv2_evidence_data_len,
+        working_builder_bcv2_evidence_slot: diagnostics.working_builder_bcv2_evidence_slot,
+        working_builder_bcv2_evidence_context_slot: diagnostics
+            .working_builder_bcv2_evidence_context_slot,
+        working_builder_bcv2_evidence_reason: diagnostics.working_builder_bcv2_evidence_reason,
+        working_builder_bcv2_evidence_conflict: diagnostics.working_builder_bcv2_evidence_conflict,
         working_builder_creator_vault_pubkey: diagnostics.working_builder_creator_vault_pubkey,
         working_builder_creator_vault_source_authority: diagnostics
             .working_builder_creator_vault_source_authority,
@@ -12718,6 +12982,16 @@ fn p37_shadow_probe_transport_from_error(
         working_builder_bcv2_diag_seen_reason: diagnostics.working_builder_bcv2_diag_seen_reason,
         working_builder_bcv2_local_coverage_class: diagnostics
             .working_builder_bcv2_local_coverage_class,
+        working_builder_bcv2_evidence_status: diagnostics.working_builder_bcv2_evidence_status,
+        working_builder_bcv2_evidence_source: diagnostics.working_builder_bcv2_evidence_source,
+        working_builder_bcv2_evidence_ready: diagnostics.working_builder_bcv2_evidence_ready,
+        working_builder_bcv2_evidence_owner: diagnostics.working_builder_bcv2_evidence_owner,
+        working_builder_bcv2_evidence_data_len: diagnostics.working_builder_bcv2_evidence_data_len,
+        working_builder_bcv2_evidence_slot: diagnostics.working_builder_bcv2_evidence_slot,
+        working_builder_bcv2_evidence_context_slot: diagnostics
+            .working_builder_bcv2_evidence_context_slot,
+        working_builder_bcv2_evidence_reason: diagnostics.working_builder_bcv2_evidence_reason,
+        working_builder_bcv2_evidence_conflict: diagnostics.working_builder_bcv2_evidence_conflict,
         working_builder_creator_vault_pubkey: diagnostics.working_builder_creator_vault_pubkey,
         working_builder_creator_vault_source_authority: diagnostics
             .working_builder_creator_vault_source_authority,
@@ -13196,10 +13470,12 @@ async fn run_p37_shadow_probe_dispatch(
     let final_manifest_diagnostics =
         p37_shadow_probe_account_set_diagnostics(&trigger_component, &request).await;
     if working_builder_parity_mode {
-        let working_builder = p37_working_builder_parity_diagnostics(
+        let evidence_store = oracle_runtime.execution_account_evidence_store();
+        let working_builder = p37_working_builder_parity_diagnostics_with_evidence_store(
             Some(&request),
             Some(&final_manifest_diagnostics),
             true,
+            Some(evidence_store.as_ref()),
         );
         p37_apply_working_builder_parity_to_record(&mut record, working_builder);
     }
@@ -20814,6 +21090,10 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                         );
                     }
 
+                    GhostEvent::ExecutionAccountEvidence(event) => {
+                        oracle_runtime.record_execution_account_evidence(event.evidence.clone());
+                    }
+
                     GhostEvent::GatekeeperCommitted {
                         pool_amm_id,
                         base_mint,
@@ -21017,7 +21297,10 @@ mod tests {
         OrganicBroadeningFeatures,
     };
     use ghost_core::shadow_ledger::LivePipelineConfig;
-    use ghost_core::{GatekeeperDecision as WalGatekeeperDecision, Wal, WalRecord};
+    use ghost_core::{
+        ExecutionAccountEvidenceSource, ExecutionAccountEvidenceStatus,
+        GatekeeperDecision as WalGatekeeperDecision, Wal, WalRecord,
+    };
     use solana_sdk::signature::Keypair;
     use solana_sdk::signer::Signer;
     use std::sync::Arc;
@@ -21065,6 +21348,191 @@ mod tests {
         std::fs::write(path, serde_json::to_vec(&bytes).expect("serialize keypair"))
             .expect("write keypair");
         keypair
+    }
+
+    fn test_bcv2_execution_account_evidence(
+        account_pubkey: Pubkey,
+        source: ExecutionAccountEvidenceSource,
+        status: ExecutionAccountEvidenceStatus,
+        evidence_ready: bool,
+    ) -> ExecutionAccountEvidence {
+        ExecutionAccountEvidence {
+            role: ExecutionAccountRole::BondingCurveV2,
+            account_pubkey,
+            base_mint: Some(Pubkey::new_unique()),
+            pool_id: Some(Pubkey::new_unique()),
+            canonical_bonding_curve: Some(Pubkey::new_unique()),
+            source,
+            status,
+            slot: Some(123),
+            context_slot: Some(456),
+            write_version: Some(7),
+            owner: Some(Pubkey::new_unique()),
+            data_len: Some(512),
+            tx_signature: Some("execution-evidence-test-signature".to_string()),
+            observed_instruction_index: Some(1),
+            observed_account_position: Some(16),
+            provenance_status: Some("route_compatible".to_string()),
+            detected_at_ms: 1_000,
+            received_at_ms: 1_001,
+            evidence_ready,
+            reason: None,
+        }
+    }
+
+    #[test]
+    fn execution_account_evidence_runtime_store_records_exact_bcv2_lookup() {
+        let runtime = OracleRuntime::new(
+            Arc::new(HyperPredictionOracle::default()),
+            "pump_program".to_string(),
+            "bonk_program".to_string(),
+            Arc::new(ShadowLedger::new()),
+        );
+        let bcv2 = Pubkey::new_unique();
+        let evidence = test_bcv2_execution_account_evidence(
+            bcv2,
+            ExecutionAccountEvidenceSource::RpcHydration,
+            ExecutionAccountEvidenceStatus::RpcReady,
+            true,
+        );
+
+        let upsert = runtime.record_execution_account_evidence(evidence);
+        let record = runtime
+            .lookup_bcv2_evidence(&bcv2)
+            .expect("exact bcv2 evidence lookup");
+
+        assert_eq!(upsert.account_pubkey, bcv2);
+        assert_eq!(upsert.role, ExecutionAccountRole::BondingCurveV2);
+        assert_eq!(
+            upsert.latest_status,
+            ExecutionAccountEvidenceStatus::RpcReady
+        );
+        assert_eq!(record.latest.account_pubkey, bcv2);
+        assert_eq!(record.latest.role, ExecutionAccountRole::BondingCurveV2);
+        assert_eq!(
+            record.latest.status,
+            ExecutionAccountEvidenceStatus::RpcReady
+        );
+        assert!(
+            runtime
+                .execution_account_evidence_store()
+                .get(ExecutionAccountRole::CreatorVault, &bcv2)
+                .is_none(),
+            "BCV2 evidence must not collapse into another role"
+        );
+    }
+
+    #[test]
+    fn execution_account_evidence_bcv2_status_prefers_rpc_ready_payload() {
+        let runtime = OracleRuntime::new(
+            Arc::new(HyperPredictionOracle::default()),
+            "pump_program".to_string(),
+            "bonk_program".to_string(),
+            Arc::new(ShadowLedger::new()),
+        );
+        let bcv2 = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let mut evidence = test_bcv2_execution_account_evidence(
+            bcv2,
+            ExecutionAccountEvidenceSource::RpcHydration,
+            ExecutionAccountEvidenceStatus::RpcReady,
+            true,
+        );
+        evidence.owner = Some(owner);
+        evidence.data_len = Some(768);
+        evidence.context_slot = Some(99_001);
+
+        runtime.record_execution_account_evidence(evidence);
+        let status = runtime.bcv2_evidence_status(&bcv2);
+
+        assert_eq!(status.status.as_deref(), Some("rpc_ready"));
+        assert_eq!(status.source.as_deref(), Some("rpc_hydration"));
+        assert_eq!(status.ready, Some(true));
+        assert_eq!(status.owner.as_deref(), Some(owner.to_string().as_str()));
+        assert_eq!(status.data_len, Some(768));
+        assert_eq!(status.context_slot, Some(99_001));
+        assert_eq!(status.conflict, None);
+    }
+
+    #[test]
+    fn execution_account_evidence_rpc_missing_preserves_positive_bcv2_conflict() {
+        let runtime = OracleRuntime::new(
+            Arc::new(HyperPredictionOracle::default()),
+            "pump_program".to_string(),
+            "bonk_program".to_string(),
+            Arc::new(ShadowLedger::new()),
+        );
+        let bcv2 = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let mut account_update = test_bcv2_execution_account_evidence(
+            bcv2,
+            ExecutionAccountEvidenceSource::YellowstoneAccountUpdate,
+            ExecutionAccountEvidenceStatus::AccountUpdateReceived,
+            true,
+        );
+        account_update.owner = Some(owner);
+        account_update.data_len = Some(384);
+        account_update.context_slot = Some(55);
+        runtime.record_execution_account_evidence(account_update);
+
+        let mut rpc_missing = test_bcv2_execution_account_evidence(
+            bcv2,
+            ExecutionAccountEvidenceSource::RpcHydration,
+            ExecutionAccountEvidenceStatus::RpcMissing,
+            false,
+        );
+        rpc_missing.owner = None;
+        rpc_missing.data_len = None;
+        rpc_missing.context_slot = None;
+        rpc_missing.reason = Some("account_missing".to_string());
+        runtime.record_execution_account_evidence(rpc_missing);
+
+        let record = runtime
+            .lookup_bcv2_evidence(&bcv2)
+            .expect("bcv2 evidence record");
+        assert_eq!(
+            record
+                .best_positive
+                .as_ref()
+                .map(|evidence| evidence.status),
+            Some(ExecutionAccountEvidenceStatus::AccountUpdateReceived)
+        );
+        assert_eq!(
+            record
+                .latest_negative
+                .as_ref()
+                .map(|evidence| evidence.status),
+            Some(ExecutionAccountEvidenceStatus::RpcMissing)
+        );
+        let status = runtime.bcv2_evidence_status(&bcv2);
+        assert_eq!(status.status.as_deref(), Some("rpc_missing"));
+        assert_eq!(status.source.as_deref(), Some("rpc_hydration"));
+        assert_eq!(status.ready, Some(true));
+        assert_eq!(status.owner.as_deref(), Some(owner.to_string().as_str()));
+        assert_eq!(status.data_len, Some(384));
+        assert_eq!(status.context_slot, Some(55));
+        assert_eq!(status.reason.as_deref(), Some("account_missing"));
+        assert_eq!(
+            status.conflict.as_deref(),
+            Some("positive_account_update_received_conflicts_with_negative_rpc_missing")
+        );
+    }
+
+    #[test]
+    fn execution_account_evidence_event_loop_has_dedicated_non_account_update_arm() {
+        let source = include_str!("oracle_runtime.rs");
+        let arm_start = source
+            .find("GhostEvent::ExecutionAccountEvidence(event) => {")
+            .expect("dedicated execution evidence event arm");
+        let arm_end = source[arm_start..]
+            .find("GhostEvent::GatekeeperCommitted")
+            .expect("next event arm after execution evidence");
+        let arm = &source[arm_start..arm_start + arm_end];
+
+        assert!(arm.contains("record_execution_account_evidence"));
+        assert!(!arm.contains("AccountUpdate"));
+        assert!(!arm.contains("process_account_update"));
+        assert!(!arm.contains("handle_account_update"));
     }
 
     fn p37_shadow_probe_test_candidate() -> P37ShadowProbeCandidate {
@@ -22422,6 +22890,108 @@ mod tests {
         assert_eq!(working.bcv2_account_state_materialized, Some(false));
         assert_eq!(working.bcv2_mfs_materialized, Some(false));
         assert_eq!(working.bcv2_diag_materialized, Some(false));
+    }
+
+    #[test]
+    fn p37_working_builder_bcv2_evidence_store_exposes_exact_pubkey_diagnostics() {
+        let request = test_working_builder_prepared_buy_request();
+        let bcv2 = request
+            .account_overrides
+            .bonding_curve_v2
+            .expect("working request bcv2");
+        let mut diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        diagnostics.manifest_lookup_performed = true;
+        let evidence_store = ExecutionAccountEvidenceStore::new();
+        let owner = Pubkey::new_unique();
+        let mut evidence = test_bcv2_execution_account_evidence(
+            bcv2,
+            ExecutionAccountEvidenceSource::RpcHydration,
+            ExecutionAccountEvidenceStatus::RpcReady,
+            true,
+        );
+        evidence.owner = Some(owner);
+        evidence.data_len = Some(1_024);
+        evidence.slot = Some(10_001);
+        evidence.context_slot = Some(10_002);
+        evidence_store.upsert(evidence);
+
+        let working = p37_working_builder_parity_diagnostics_with_evidence_store(
+            Some(&request),
+            Some(&diagnostics),
+            true,
+            Some(&evidence_store),
+        );
+
+        assert_eq!(working.bcv2_evidence_status.as_deref(), Some("rpc_ready"));
+        assert_eq!(
+            working.bcv2_evidence_source.as_deref(),
+            Some("rpc_hydration")
+        );
+        assert_eq!(working.bcv2_evidence_ready, Some(true));
+        assert_eq!(
+            working.bcv2_evidence_owner.as_deref(),
+            Some(owner.to_string().as_str())
+        );
+        assert_eq!(working.bcv2_evidence_data_len, Some(1_024));
+        assert_eq!(working.bcv2_evidence_slot, Some(10_001));
+        assert_eq!(working.bcv2_evidence_context_slot, Some(10_002));
+        assert_eq!(working.bcv2_evidence_reason, None);
+        assert_eq!(working.bcv2_evidence_conflict, None);
+        assert_eq!(working.bcv2_rpc_load_ready, Some(true));
+    }
+
+    #[test]
+    fn p37_working_builder_bcv2_evidence_without_store_remains_none() {
+        let request = test_working_builder_prepared_buy_request();
+        let diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+
+        let working =
+            p37_working_builder_parity_diagnostics(Some(&request), Some(&diagnostics), true);
+
+        assert_eq!(working.bcv2_evidence_status, None);
+        assert_eq!(working.bcv2_evidence_source, None);
+        assert_eq!(working.bcv2_evidence_ready, None);
+        assert_eq!(working.bcv2_evidence_owner, None);
+        assert_eq!(working.bcv2_evidence_data_len, None);
+        assert_eq!(working.bcv2_evidence_slot, None);
+        assert_eq!(working.bcv2_evidence_context_slot, None);
+        assert_eq!(working.bcv2_evidence_reason, None);
+        assert_eq!(working.bcv2_evidence_conflict, None);
+    }
+
+    #[test]
+    fn p37_working_builder_bcv2_evidence_store_does_not_use_observed_only_fallback_key() {
+        let request = test_working_builder_prepared_buy_request();
+        let builder_bcv2 = request
+            .account_overrides
+            .bonding_curve_v2
+            .expect("working request bcv2");
+        let unrelated_observed_bcv2 = Pubkey::new_unique();
+        assert_ne!(builder_bcv2, unrelated_observed_bcv2);
+        let mut diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        diagnostics.manifest_lookup_performed = true;
+        let evidence_store = ExecutionAccountEvidenceStore::new();
+        evidence_store.upsert(test_bcv2_execution_account_evidence(
+            unrelated_observed_bcv2,
+            ExecutionAccountEvidenceSource::ObservedTxMeta,
+            ExecutionAccountEvidenceStatus::DiscoveryHint,
+            false,
+        ));
+
+        let working = p37_working_builder_parity_diagnostics_with_evidence_store(
+            Some(&request),
+            Some(&diagnostics),
+            true,
+            Some(&evidence_store),
+        );
+
+        let builder_bcv2_string = builder_bcv2.to_string();
+        assert_eq!(
+            working.bcv2_builder_pubkey.as_deref(),
+            Some(builder_bcv2_string.as_str())
+        );
+        assert_eq!(working.bcv2_evidence_status, None);
+        assert_eq!(working.bcv2_evidence_ready, None);
     }
 
     #[test]

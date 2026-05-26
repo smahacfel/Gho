@@ -374,6 +374,24 @@ pub struct ShadowSimulationAccountDiagnostics {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_builder_bcv2_local_coverage_class: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_evidence_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_evidence_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_evidence_ready: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_evidence_owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_evidence_data_len: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_evidence_slot: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_evidence_context_slot: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_evidence_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_evidence_conflict: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_builder_creator_vault_pubkey: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_builder_creator_vault_source_authority: Option<String>,
