@@ -5287,6 +5287,10 @@ pub async fn run_with_oracle(
                                     // Funding-transfer observations feed FSC rolling-state in
                                     // OracleRuntime; Trigger does not consume them.
                                 }
+                                GhostEvent::ExecutionAccountEvidence(_) => {
+                                    // Execution account evidence is consumed by OracleRuntime
+                                    // evidence store in later PRs; Trigger does not consume it.
+                                }
                                 GhostEvent::TransactionSent { signature, slot, tx_type } => {
                                     debug!(
                                         "Trigger: Received TransactionSent - sig={}, slot={:?}, type={}",

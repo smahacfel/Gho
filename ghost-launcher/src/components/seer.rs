@@ -1047,6 +1047,38 @@ fn emit_funding_transfer_to_event_bus(
     }
 }
 
+fn emit_execution_account_evidence_to_event_bus(
+    tx: &EventBusSender,
+    evidence_event: &seer::ipc::DetectedExecutionAccountEvidenceEvent,
+    health: Option<&Arc<RuntimeHealth>>,
+) {
+    tracing::info!(
+        role = %evidence_event.evidence.role.label(),
+        account_pubkey = %evidence_event.evidence.account_pubkey,
+        source = %evidence_event.evidence.source.as_str(),
+        status = %evidence_event.evidence.status.as_str(),
+        evidence_ready = evidence_event.evidence.evidence_ready,
+        sequence_number = evidence_event.sequence_number,
+        "DIAG_EXECUTION_ACCOUNT_EVIDENCE_RELAY"
+    );
+
+    let ghost_event = GhostEvent::execution_account_evidence(
+        evidence_event.evidence.clone(),
+        evidence_event.detected_at,
+        evidence_event.sequence_number,
+    );
+    if let Err(e) = tx.send(ghost_event) {
+        tracing::debug!(
+            "Seer: ExecutionAccountEvidence event not delivered (no receivers or lag): {}",
+            e
+        );
+        return;
+    }
+    if let Some(health) = health {
+        health.mark_bus_event();
+    }
+}
+
 /// Run the Seer component
 pub async fn run(
     config: SeerComponentConfig,
@@ -1630,6 +1662,16 @@ pub async fn run(
                     }
                 }
 
+                seer::ipc::SeerEvent::ExecutionAccountEvidence(evidence_event) => {
+                    if let Some(ref tx) = event_bus_tx {
+                        emit_execution_account_evidence_to_event_bus(
+                            tx,
+                            &evidence_event,
+                            health_ipc.as_ref(),
+                        );
+                    }
+                }
+
                 // ── Live AccountUpdate canonical ingest wiring ────────────────
                 // This boolean is the launcher-derived effective runtime state,
                 // not a primary production config selector. When true, Seer
@@ -1835,7 +1877,8 @@ pub fn trade_event_to_pool_transaction(
 #[cfg(test)]
 mod tests {
     use super::{
-        detected_pool_from_candidate, detection_clock_summary, emit_funding_transfer_to_event_bus,
+        detected_pool_from_candidate, detection_clock_summary,
+        emit_execution_account_evidence_to_event_bus, emit_funding_transfer_to_event_bus,
         process_pool_detected_event_for_session_gate, process_trade_event_for_session_gate,
         pumpswap_program_id, trade_event_to_pool_transaction, trade_has_forwardable_identity,
         SessionAccountUpdateBridge, SessionAccountUpdateDecision, SessionPoolTradeBridge,
@@ -1844,8 +1887,9 @@ mod tests {
     use crate::events::{create_event_bus, GhostEvent};
     use ghost_core::CurveFinality;
     use seer::ipc::{
-        AccountUpdateReplayOrigin, DetectedAccountUpdateEvent, DetectedFundingTransferEvent,
-        DetectedPoolEvent, DetectedTradeEvent, EventPriority, FundingTransferEvent, SeerEvent,
+        AccountUpdateReplayOrigin, DetectedAccountUpdateEvent,
+        DetectedExecutionAccountEvidenceEvent, DetectedFundingTransferEvent, DetectedPoolEvent,
+        DetectedTradeEvent, EventPriority, FundingTransferEvent, SeerEvent,
     };
     use seer::types::{CandidatePool, InstructionProvenance, RawBytesMissingReason, TradeEvent};
     use solana_sdk::{pubkey::Pubkey, signature::Signature};
@@ -1946,6 +1990,31 @@ mod tests {
             lamports: 50_000_000,
             full_chain_coverage: false,
             provenance: seer::ipc::FundingTransferProvenance::filtered_grpc_global_stream_live(),
+        }
+    }
+
+    fn make_execution_account_evidence() -> ghost_core::ExecutionAccountEvidence {
+        ghost_core::ExecutionAccountEvidence {
+            role: ghost_core::ExecutionAccountRole::BondingCurveV2,
+            account_pubkey: Pubkey::new_unique(),
+            base_mint: Some(Pubkey::new_unique()),
+            pool_id: Some(Pubkey::new_unique()),
+            canonical_bonding_curve: Some(Pubkey::new_unique()),
+            source: ghost_core::ExecutionAccountEvidenceSource::RpcHydration,
+            status: ghost_core::ExecutionAccountEvidenceStatus::RpcReady,
+            slot: Some(42),
+            context_slot: Some(43),
+            write_version: Some(7),
+            owner: Some(Pubkey::new_unique()),
+            data_len: Some(256),
+            tx_signature: Some("evidence-sig".to_string()),
+            observed_instruction_index: Some(1),
+            observed_account_position: Some(9),
+            provenance_status: Some("route_compatible".to_string()),
+            detected_at_ms: 22_000,
+            received_at_ms: 22_010,
+            evidence_ready: true,
+            reason: None,
         }
     }
 
@@ -2698,6 +2767,45 @@ mod tests {
             }
             other => panic!(
                 "expected FundingTransferObserved, got {}",
+                other.event_type()
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn seer_execution_account_evidence_emits_ghost_event_without_account_update_path() {
+        let (tx, mut rx) = create_event_bus();
+        let evidence = make_execution_account_evidence();
+        let evidence_event =
+            SeerEvent::ExecutionAccountEvidence(DetectedExecutionAccountEvidenceEvent {
+                evidence: evidence.clone(),
+                detected_at: SystemTime::now(),
+                sequence_number: 11,
+                priority: EventPriority::High,
+            });
+
+        match evidence_event {
+            SeerEvent::ExecutionAccountEvidence(event) => {
+                emit_execution_account_evidence_to_event_bus(&tx, &event, None);
+            }
+            _ => unreachable!(),
+        }
+
+        let received = recv_only_event(&mut rx).await;
+        match received {
+            GhostEvent::ExecutionAccountEvidence(observed) => {
+                assert_eq!(observed.evidence, evidence);
+                assert_eq!(observed.sequence_number, 11);
+                assert_eq!(
+                    observed.evidence.role,
+                    ghost_core::ExecutionAccountRole::BondingCurveV2
+                );
+            }
+            GhostEvent::AccountUpdate(_) => {
+                panic!("ExecutionAccountEvidence must not be routed through AccountUpdate")
+            }
+            other => panic!(
+                "expected ExecutionAccountEvidence, got {}",
                 other.event_type()
             ),
         }

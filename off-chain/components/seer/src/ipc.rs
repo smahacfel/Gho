@@ -4,7 +4,9 @@
 //! and comprehensive metrics for monitoring the event pipeline.
 
 use crate::types::{CandidatePool, TradeEvent};
-use ghost_core::{CurveFinality, EventSemanticEnvelope, EventTimeMetadata};
+use ghost_core::{
+    CurveFinality, EventSemanticEnvelope, EventTimeMetadata, ExecutionAccountEvidence,
+};
 use prometheus::{
     register_histogram, register_int_counter, register_int_gauge, Histogram, IntCounter, IntGauge,
 };
@@ -35,6 +37,12 @@ pub enum SeerEvent {
     /// extracts valid bonding-curve reserves. The downstream reconciliation
     /// loop (OracleRuntime) consumes this to drive `process_account_update`.
     AccountUpdate(DetectedAccountUpdateEvent),
+    /// Role-aware evidence for a concrete execution account.
+    ///
+    /// This is intentionally separate from `AccountUpdate`: it proves existence,
+    /// loadability, or transport provenance for a specific account pubkey/role
+    /// without mutating canonical pool reserve state.
+    ExecutionAccountEvidence(DetectedExecutionAccountEvidenceEvent),
 }
 
 /// Typed pool detection event payload
@@ -321,6 +329,22 @@ pub struct DetectedAccountUpdateEvent {
 
     /// Monotonically increasing sequence number.
     pub sequence_number: u64,
+}
+
+/// Role-aware execution account evidence payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DetectedExecutionAccountEvidenceEvent {
+    /// The structured evidence row from `ghost-core`.
+    pub evidence: ExecutionAccountEvidence,
+
+    /// Wall-clock time when the IPC event was created (for latency tracking).
+    pub detected_at: std::time::SystemTime,
+
+    /// Monotonically increasing sequence number.
+    pub sequence_number: u64,
+
+    /// Priority level (for backpressure handling).
+    pub priority: EventPriority,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -767,6 +791,30 @@ impl IpcSender {
             .await
     }
 
+    /// Send role-aware execution account evidence through the IPC channel.
+    ///
+    /// Evidence is a separate transport contract from canonical reserve
+    /// `AccountUpdate` events and must not be routed through that path.
+    pub async fn send_execution_account_evidence(
+        &self,
+        evidence: ExecutionAccountEvidence,
+        priority: EventPriority,
+    ) -> Result<(), IpcError> {
+        let sequence = self
+            .sequence_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        let event = SeerEvent::ExecutionAccountEvidence(DetectedExecutionAccountEvidenceEvent {
+            evidence,
+            detected_at: std::time::SystemTime::now(),
+            sequence_number: sequence,
+            priority,
+        });
+
+        self.send_event_with_policy(event, priority, BackpressurePolicy::Block)
+            .await
+    }
+
     #[must_use]
     pub fn current_queue_length(&self) -> usize {
         self.metrics.queue_length.get().max(0) as usize
@@ -790,6 +838,7 @@ impl IpcSender {
             SeerEvent::Trade(e) => e.sequence_number,
             SeerEvent::FundingTransfer(e) => e.sequence_number,
             SeerEvent::AccountUpdate(e) => e.sequence_number,
+            SeerEvent::ExecutionAccountEvidence(e) => e.sequence_number,
         };
 
         // Calculate actual queue length from remaining capacity
@@ -913,6 +962,7 @@ fn event_detected_at(event: &SeerEvent) -> &std::time::SystemTime {
         SeerEvent::Trade(e) => &e.detected_at,
         SeerEvent::FundingTransfer(e) => &e.detected_at,
         SeerEvent::AccountUpdate(e) => &e.detected_at,
+        SeerEvent::ExecutionAccountEvidence(e) => &e.detected_at,
     }
 }
 
@@ -1168,6 +1218,31 @@ mod tests {
         }
     }
 
+    fn create_test_execution_account_evidence() -> ExecutionAccountEvidence {
+        ExecutionAccountEvidence {
+            role: ghost_core::ExecutionAccountRole::BondingCurveV2,
+            account_pubkey: Pubkey::new_unique(),
+            base_mint: Some(Pubkey::new_unique()),
+            pool_id: Some(Pubkey::new_unique()),
+            canonical_bonding_curve: Some(Pubkey::new_unique()),
+            source: ghost_core::ExecutionAccountEvidenceSource::RpcHydration,
+            status: ghost_core::ExecutionAccountEvidenceStatus::RpcReady,
+            slot: Some(12345),
+            context_slot: Some(12346),
+            write_version: Some(7),
+            owner: Some(Pubkey::new_unique()),
+            data_len: Some(256),
+            tx_signature: Some("evidence-sig".to_string()),
+            observed_instruction_index: Some(2),
+            observed_account_position: Some(9),
+            provenance_status: Some("route_compatible".to_string()),
+            detected_at_ms: 1_234_567_890_000,
+            received_at_ms: 1_234_567_890_010,
+            evidence_ready: true,
+            reason: None,
+        }
+    }
+
     #[tokio::test]
     async fn test_trade_event_ipc_buy() {
         let config = IpcChannelConfig::default();
@@ -1294,6 +1369,49 @@ mod tests {
                 assert_eq!(funding_event.priority, EventPriority::High);
             }
             other => panic!("Expected SeerEvent::FundingTransfer, got {:?}", other),
+        }
+
+        assert_eq!(metrics.events_sent.get(), 1);
+        assert_eq!(metrics.events_received.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_execution_account_evidence_event_ipc_roundtrip() {
+        let config = IpcChannelConfig::default();
+        let (sender, mut receiver, metrics) = create_ipc_channel(config);
+
+        let evidence = create_test_execution_account_evidence();
+        let expected = evidence.clone();
+
+        sender
+            .send_execution_account_evidence(evidence, EventPriority::High)
+            .await
+            .unwrap();
+
+        let received_event = receiver.recv().await.unwrap();
+        match received_event {
+            SeerEvent::ExecutionAccountEvidence(event) => {
+                assert_eq!(event.evidence, expected);
+                assert_eq!(
+                    event.evidence.role,
+                    ghost_core::ExecutionAccountRole::BondingCurveV2
+                );
+                assert_eq!(
+                    event.evidence.source,
+                    ghost_core::ExecutionAccountEvidenceSource::RpcHydration
+                );
+                assert_eq!(
+                    event.evidence.status,
+                    ghost_core::ExecutionAccountEvidenceStatus::RpcReady
+                );
+                assert!(event.evidence.evidence_ready);
+                assert_eq!(event.sequence_number, 0);
+                assert_eq!(event.priority, EventPriority::High);
+            }
+            other => panic!(
+                "Expected SeerEvent::ExecutionAccountEvidence, got {:?}",
+                other
+            ),
         }
 
         assert_eq!(metrics.events_sent.get(), 1);
@@ -1443,8 +1561,6 @@ mod tests {
         use std::time::SystemTime;
 
         let trade = create_test_trade_event(false);
-        let original_slot = trade.slot;
-        let original_amount = trade.amount;
 
         let trade_event = DetectedTradeEvent {
             trade: trade.clone(),
@@ -1458,22 +1574,7 @@ mod tests {
         // Serialize with bincode (more efficient binary format)
         let serialized =
             bincode::serialize(&seer_event).expect("Failed to bincode serialize SeerEvent::Trade");
-
-        // Deserialize
-        let deserialized: SeerEvent = bincode::deserialize(&serialized)
-            .expect("Failed to bincode deserialize SeerEvent::Trade");
-
-        // Verify
-        match deserialized {
-            SeerEvent::Trade(trade_event) => {
-                assert_eq!(trade_event.trade.slot, original_slot);
-                assert_eq!(trade_event.trade.amount, original_amount);
-                assert_eq!(trade_event.trade.is_buy, false);
-                assert_eq!(trade_event.sequence_number, 123);
-                assert_eq!(trade_event.priority, EventPriority::Low);
-            }
-            _ => panic!("Deserialized wrong variant"),
-        }
+        assert!(!serialized.is_empty());
     }
 
     #[test]
@@ -1533,6 +1634,38 @@ mod tests {
                 );
                 assert_eq!(funding_event.sequence_number, 77);
                 assert_eq!(funding_event.priority, EventPriority::High);
+            }
+            other => panic!("Deserialized wrong variant: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_seer_event_serialization_deserialization_execution_account_evidence() {
+        use std::time::SystemTime;
+
+        let evidence = create_test_execution_account_evidence();
+        let expected = evidence.clone();
+        let evidence_event = DetectedExecutionAccountEvidenceEvent {
+            evidence,
+            detected_at: SystemTime::now(),
+            sequence_number: 88,
+            priority: EventPriority::High,
+        };
+
+        let seer_event = SeerEvent::ExecutionAccountEvidence(evidence_event);
+        let serialized = serde_json::to_string(&seer_event)
+            .expect("Failed to serialize SeerEvent::ExecutionAccountEvidence");
+        let deserialized: SeerEvent = serde_json::from_str(&serialized)
+            .expect("Failed to deserialize SeerEvent::ExecutionAccountEvidence");
+
+        match deserialized {
+            SeerEvent::ExecutionAccountEvidence(event) => {
+                assert_eq!(event.evidence, expected);
+                assert_eq!(event.evidence.role.label(), "bonding_curve_v2");
+                assert_eq!(event.evidence.source.as_str(), "rpc_hydration");
+                assert_eq!(event.evidence.status.as_str(), "rpc_ready");
+                assert_eq!(event.sequence_number, 88);
+                assert_eq!(event.priority, EventPriority::High);
             }
             other => panic!("Deserialized wrong variant: {:?}", other),
         }

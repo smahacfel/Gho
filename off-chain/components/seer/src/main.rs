@@ -171,6 +171,10 @@ async fn main() -> anyhow::Result<()> {
                 // AccountUpdate events are consumed by OracleRuntime via the
                 // ghost-launcher event bus; nothing to do in the standalone binary.
                 SeerEvent::AccountUpdate(_) => {}
+
+                // Execution account evidence is forwarded by ghost-launcher in
+                // integrated runtime; standalone Seer has no consumer.
+                SeerEvent::ExecutionAccountEvidence(_) => {}
             }
         }
         info!("IPC event processing loop ended");

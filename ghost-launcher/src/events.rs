@@ -428,7 +428,9 @@ pub struct ShadowSimulationAccountDiagnostics {
 use crate::components::trigger::safety::PositionSlotId;
 use tokio::sync::broadcast;
 
-use ghost_core::{CurveFinality, EventSemanticEnvelope, EventTimeMetadata};
+use ghost_core::{
+    CurveFinality, EventSemanticEnvelope, EventTimeMetadata, ExecutionAccountEvidence,
+};
 use seer::ipc::{AccountUpdateReplayOrigin, FundingTransferProvenance};
 
 // Re-export RawBytesMissingReason from seer for use in events
@@ -830,6 +832,18 @@ impl FundingTransferObserved {
     }
 }
 
+/// Role-aware execution account evidence on the launcher event bus.
+///
+/// This event carries account-existence/loadability evidence for a concrete
+/// execution account pubkey and role. It is intentionally separate from
+/// canonical reserve `AccountUpdateEvent`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionAccountEvidenceEvent {
+    pub evidence: ExecutionAccountEvidence,
+    pub detected_at: std::time::SystemTime,
+    pub sequence_number: u64,
+}
+
 /// On-chain AccountUpdate payload on the launcher event bus.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountUpdateEvent {
@@ -1086,6 +1100,9 @@ pub enum GhostEvent {
     /// A funding transfer observation was observed on the bus.
     FundingTransferObserved(Arc<FundingTransferObserved>),
 
+    /// Role-aware evidence for a concrete execution account.
+    ExecutionAccountEvidence(Arc<ExecutionAccountEvidenceEvent>),
+
     /// A pool has been scored by the Oracle
     PoolScored(Arc<PoolScoredEvent>),
 
@@ -1199,6 +1216,19 @@ impl GhostEvent {
     /// Create a FundingTransferObserved event.
     pub fn funding_transfer_observed(transfer: FundingTransferObserved) -> Self {
         GhostEvent::FundingTransferObserved(Arc::new(transfer))
+    }
+
+    /// Create an ExecutionAccountEvidence event.
+    pub fn execution_account_evidence(
+        evidence: ExecutionAccountEvidence,
+        detected_at: std::time::SystemTime,
+        sequence_number: u64,
+    ) -> Self {
+        GhostEvent::ExecutionAccountEvidence(Arc::new(ExecutionAccountEvidenceEvent {
+            evidence,
+            detected_at,
+            sequence_number,
+        }))
     }
 
     /// Create a PoolScored event
@@ -1320,6 +1350,7 @@ impl GhostEvent {
             GhostEvent::NewPoolDetected(_) => "new_pool_detected",
             GhostEvent::PoolTransaction(_) => "pool_transaction",
             GhostEvent::FundingTransferObserved(_) => "funding_transfer_observed",
+            GhostEvent::ExecutionAccountEvidence(_) => "execution_account_evidence",
             GhostEvent::PoolScored(_) => "pool_scored",
             GhostEvent::GatekeeperCommitted { .. } => "gatekeeper_committed",
             GhostEvent::TransactionSent { .. } => "transaction_sent",
@@ -1580,6 +1611,84 @@ mod tests {
         } else {
             panic!("Expected FundingTransferObserved event");
         }
+    }
+
+    #[tokio::test]
+    async fn test_execution_account_evidence_event() {
+        let (tx, mut rx) = create_event_bus();
+        let evidence = ExecutionAccountEvidence {
+            role: ghost_core::ExecutionAccountRole::BondingCurveV2,
+            account_pubkey: solana_sdk::pubkey::Pubkey::new_unique(),
+            base_mint: Some(solana_sdk::pubkey::Pubkey::new_unique()),
+            pool_id: Some(solana_sdk::pubkey::Pubkey::new_unique()),
+            canonical_bonding_curve: Some(solana_sdk::pubkey::Pubkey::new_unique()),
+            source: ghost_core::ExecutionAccountEvidenceSource::RpcHydration,
+            status: ghost_core::ExecutionAccountEvidenceStatus::RpcReady,
+            slot: Some(42),
+            context_slot: Some(43),
+            write_version: Some(2),
+            owner: Some(solana_sdk::pubkey::Pubkey::new_unique()),
+            data_len: Some(256),
+            tx_signature: Some("evidence-sig".to_string()),
+            observed_instruction_index: Some(1),
+            observed_account_position: Some(7),
+            provenance_status: Some("route_compatible".to_string()),
+            detected_at_ms: 1_700_000_000_000,
+            received_at_ms: 1_700_000_000_050,
+            evidence_ready: true,
+            reason: None,
+        };
+        let detected_at = std::time::SystemTime::now();
+
+        tx.send(GhostEvent::execution_account_evidence(
+            evidence.clone(),
+            detected_at,
+            17,
+        ))
+        .unwrap();
+
+        let event = rx.recv().await.unwrap();
+        assert_eq!(event.event_type(), "execution_account_evidence");
+
+        if let GhostEvent::ExecutionAccountEvidence(observed) = event {
+            assert_eq!(observed.evidence, evidence);
+            assert_eq!(observed.detected_at, detected_at);
+            assert_eq!(observed.sequence_number, 17);
+        } else {
+            panic!("Expected ExecutionAccountEvidence event");
+        }
+    }
+
+    #[test]
+    fn account_update_event_schema_remains_canonical_reserve_update() {
+        let update = AccountUpdateEvent {
+            semantic: ghost_core::EventSemanticEnvelope::default(),
+            event_time: ghost_core::EventTimeMetadata::default(),
+            base_mint: solana_sdk::pubkey::Pubkey::new_unique(),
+            bonding_curve: solana_sdk::pubkey::Pubkey::new_unique(),
+            curve_finality: CurveFinality::Provisional,
+            sol_reserves: 10,
+            token_reserves: 20,
+            complete: 0,
+            slot: 42,
+            write_version: Some(7),
+            replay_origin: AccountUpdateReplayOrigin::Live,
+            replay_buffer_dwell_ms: None,
+            detected_at: std::time::SystemTime::now(),
+            sequence_number: 3,
+        };
+
+        let serialized = serde_json::to_value(update).expect("serialize account update");
+        let object = serialized
+            .as_object()
+            .expect("account update must serialize as object");
+
+        assert!(object.contains_key("base_mint"));
+        assert!(object.contains_key("bonding_curve"));
+        assert!(!object.contains_key("evidence"));
+        assert!(!object.contains_key("account_pubkey"));
+        assert!(!object.contains_key("role"));
+        assert!(!object.contains_key("bonding_curve_v2"));
     }
 
     #[test]
