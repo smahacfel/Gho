@@ -334,6 +334,28 @@ pub struct ShadowSimulationAccountDiagnostics {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_builder_bcv2_reconciliation_class: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_materialization_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_subscription_requested: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_account_update_received: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_account_update_mapped: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_rpc_fetch_ready: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_rpc_fetch_missing: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_rpc_fetch_owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_rpc_fetch_data_len: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_account_state_materialized: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_mfs_materialized: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_diag_materialized: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_builder_bcv2_account_state_lookup_performed: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_builder_bcv2_account_state_seen: Option<bool>,

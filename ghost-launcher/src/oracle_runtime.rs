@@ -5105,6 +5105,17 @@ struct P37ShadowProbeSelectionRecord {
     working_builder_bcv2_precheck_age_from_observed_slot: Option<i64>,
     working_builder_bcv2_rpc_error_class: Option<String>,
     working_builder_bcv2_reconciliation_class: Option<String>,
+    working_builder_bcv2_materialization_class: Option<String>,
+    working_builder_bcv2_subscription_requested: Option<bool>,
+    working_builder_bcv2_account_update_received: Option<bool>,
+    working_builder_bcv2_account_update_mapped: Option<bool>,
+    working_builder_bcv2_rpc_fetch_ready: Option<bool>,
+    working_builder_bcv2_rpc_fetch_missing: Option<bool>,
+    working_builder_bcv2_rpc_fetch_owner: Option<String>,
+    working_builder_bcv2_rpc_fetch_data_len: Option<u64>,
+    working_builder_bcv2_account_state_materialized: Option<bool>,
+    working_builder_bcv2_mfs_materialized: Option<bool>,
+    working_builder_bcv2_diag_materialized: Option<bool>,
     working_builder_bcv2_account_state_lookup_performed: Option<bool>,
     working_builder_bcv2_account_state_seen: Option<bool>,
     working_builder_bcv2_account_state_seen_slot: Option<u64>,
@@ -5293,6 +5304,17 @@ struct P37ShadowProbeTransportRecord {
     working_builder_bcv2_precheck_age_from_observed_slot: Option<i64>,
     working_builder_bcv2_rpc_error_class: Option<String>,
     working_builder_bcv2_reconciliation_class: Option<String>,
+    working_builder_bcv2_materialization_class: Option<String>,
+    working_builder_bcv2_subscription_requested: Option<bool>,
+    working_builder_bcv2_account_update_received: Option<bool>,
+    working_builder_bcv2_account_update_mapped: Option<bool>,
+    working_builder_bcv2_rpc_fetch_ready: Option<bool>,
+    working_builder_bcv2_rpc_fetch_missing: Option<bool>,
+    working_builder_bcv2_rpc_fetch_owner: Option<String>,
+    working_builder_bcv2_rpc_fetch_data_len: Option<u64>,
+    working_builder_bcv2_account_state_materialized: Option<bool>,
+    working_builder_bcv2_mfs_materialized: Option<bool>,
+    working_builder_bcv2_diag_materialized: Option<bool>,
     working_builder_bcv2_account_state_lookup_performed: Option<bool>,
     working_builder_bcv2_account_state_seen: Option<bool>,
     working_builder_bcv2_account_state_seen_slot: Option<u64>,
@@ -5780,6 +5802,17 @@ fn p37_shadow_probe_selection_record(
         working_builder_bcv2_precheck_age_from_observed_slot: None,
         working_builder_bcv2_rpc_error_class: None,
         working_builder_bcv2_reconciliation_class: None,
+        working_builder_bcv2_materialization_class: None,
+        working_builder_bcv2_subscription_requested: None,
+        working_builder_bcv2_account_update_received: None,
+        working_builder_bcv2_account_update_mapped: None,
+        working_builder_bcv2_rpc_fetch_ready: None,
+        working_builder_bcv2_rpc_fetch_missing: None,
+        working_builder_bcv2_rpc_fetch_owner: None,
+        working_builder_bcv2_rpc_fetch_data_len: None,
+        working_builder_bcv2_account_state_materialized: None,
+        working_builder_bcv2_mfs_materialized: None,
+        working_builder_bcv2_diag_materialized: None,
         working_builder_bcv2_account_state_lookup_performed: None,
         working_builder_bcv2_account_state_seen: None,
         working_builder_bcv2_account_state_seen_slot: None,
@@ -6057,6 +6090,23 @@ fn p37_shadow_probe_artifact_records(
         working_builder_bcv2_reconciliation_class: record
             .working_builder_bcv2_reconciliation_class
             .clone(),
+        working_builder_bcv2_materialization_class: record
+            .working_builder_bcv2_materialization_class
+            .clone(),
+        working_builder_bcv2_subscription_requested: record
+            .working_builder_bcv2_subscription_requested,
+        working_builder_bcv2_account_update_received: record
+            .working_builder_bcv2_account_update_received,
+        working_builder_bcv2_account_update_mapped: record
+            .working_builder_bcv2_account_update_mapped,
+        working_builder_bcv2_rpc_fetch_ready: record.working_builder_bcv2_rpc_fetch_ready,
+        working_builder_bcv2_rpc_fetch_missing: record.working_builder_bcv2_rpc_fetch_missing,
+        working_builder_bcv2_rpc_fetch_owner: record.working_builder_bcv2_rpc_fetch_owner.clone(),
+        working_builder_bcv2_rpc_fetch_data_len: record.working_builder_bcv2_rpc_fetch_data_len,
+        working_builder_bcv2_account_state_materialized: record
+            .working_builder_bcv2_account_state_materialized,
+        working_builder_bcv2_mfs_materialized: record.working_builder_bcv2_mfs_materialized,
+        working_builder_bcv2_diag_materialized: record.working_builder_bcv2_diag_materialized,
         working_builder_bcv2_account_state_lookup_performed: record
             .working_builder_bcv2_account_state_lookup_performed,
         working_builder_bcv2_account_state_seen: record.working_builder_bcv2_account_state_seen,
@@ -6319,6 +6369,23 @@ fn p37_shadow_probe_artifact_records(
         working_builder_bcv2_reconciliation_class: record
             .working_builder_bcv2_reconciliation_class
             .clone(),
+        working_builder_bcv2_materialization_class: record
+            .working_builder_bcv2_materialization_class
+            .clone(),
+        working_builder_bcv2_subscription_requested: record
+            .working_builder_bcv2_subscription_requested,
+        working_builder_bcv2_account_update_received: record
+            .working_builder_bcv2_account_update_received,
+        working_builder_bcv2_account_update_mapped: record
+            .working_builder_bcv2_account_update_mapped,
+        working_builder_bcv2_rpc_fetch_ready: record.working_builder_bcv2_rpc_fetch_ready,
+        working_builder_bcv2_rpc_fetch_missing: record.working_builder_bcv2_rpc_fetch_missing,
+        working_builder_bcv2_rpc_fetch_owner: record.working_builder_bcv2_rpc_fetch_owner.clone(),
+        working_builder_bcv2_rpc_fetch_data_len: record.working_builder_bcv2_rpc_fetch_data_len,
+        working_builder_bcv2_account_state_materialized: record
+            .working_builder_bcv2_account_state_materialized,
+        working_builder_bcv2_mfs_materialized: record.working_builder_bcv2_mfs_materialized,
+        working_builder_bcv2_diag_materialized: record.working_builder_bcv2_diag_materialized,
         working_builder_bcv2_account_state_lookup_performed: record
             .working_builder_bcv2_account_state_lookup_performed,
         working_builder_bcv2_account_state_seen: record.working_builder_bcv2_account_state_seen,
@@ -7852,6 +7919,10 @@ struct P37ShadowProbeAccountManifestEntry {
     precheck_latency_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     precheck_rpc_error_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    precheck_account_owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    precheck_account_data_len: Option<u64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Default)]
@@ -8009,6 +8080,17 @@ struct P37ShadowProbeExecutionDiagnostics {
     working_builder_bcv2_precheck_age_from_observed_slot: Option<i64>,
     working_builder_bcv2_rpc_error_class: Option<String>,
     working_builder_bcv2_reconciliation_class: Option<String>,
+    working_builder_bcv2_materialization_class: Option<String>,
+    working_builder_bcv2_subscription_requested: Option<bool>,
+    working_builder_bcv2_account_update_received: Option<bool>,
+    working_builder_bcv2_account_update_mapped: Option<bool>,
+    working_builder_bcv2_rpc_fetch_ready: Option<bool>,
+    working_builder_bcv2_rpc_fetch_missing: Option<bool>,
+    working_builder_bcv2_rpc_fetch_owner: Option<String>,
+    working_builder_bcv2_rpc_fetch_data_len: Option<u64>,
+    working_builder_bcv2_account_state_materialized: Option<bool>,
+    working_builder_bcv2_mfs_materialized: Option<bool>,
+    working_builder_bcv2_diag_materialized: Option<bool>,
     working_builder_bcv2_account_state_lookup_performed: Option<bool>,
     working_builder_bcv2_account_state_seen: Option<bool>,
     working_builder_bcv2_account_state_seen_slot: Option<u64>,
@@ -8809,6 +8891,8 @@ fn p37_shadow_probe_account_manifest(
                 precheck_attempt_count: None,
                 precheck_latency_ms: None,
                 precheck_rpc_error_class: None,
+                precheck_account_owner: None,
+                precheck_account_data_len: None,
             }
         })
         .collect()
@@ -8945,6 +9029,8 @@ async fn p37_shadow_probe_account_set_diagnostics(
                 entry.precheck_attempt_count = Some(check.attempt_count);
                 entry.precheck_latency_ms = Some(check.latency_ms);
                 entry.precheck_rpc_error_class = check.rpc_error_class.clone();
+                entry.precheck_account_owner = check.account_owner.clone();
+                entry.precheck_account_data_len = check.account_data_len;
             }
         }
         Err(err) => {
@@ -9006,6 +9092,17 @@ struct P37WorkingBuilderParityDiagnostics {
     bcv2_precheck_age_from_observed_slot: Option<i64>,
     bcv2_rpc_error_class: Option<String>,
     bcv2_reconciliation_class: Option<String>,
+    bcv2_materialization_class: Option<String>,
+    bcv2_subscription_requested: Option<bool>,
+    bcv2_account_update_received: Option<bool>,
+    bcv2_account_update_mapped: Option<bool>,
+    bcv2_rpc_fetch_ready: Option<bool>,
+    bcv2_rpc_fetch_missing: Option<bool>,
+    bcv2_rpc_fetch_owner: Option<String>,
+    bcv2_rpc_fetch_data_len: Option<u64>,
+    bcv2_account_state_materialized: Option<bool>,
+    bcv2_mfs_materialized: Option<bool>,
+    bcv2_diag_materialized: Option<bool>,
     bcv2_account_state_lookup_performed: Option<bool>,
     bcv2_account_state_seen: Option<bool>,
     bcv2_account_state_seen_slot: Option<u64>,
@@ -9292,6 +9389,21 @@ struct P37WorkingBuilderBcv2LocalCoverageDiagnostics {
     local_coverage_class: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct P37WorkingBuilderBcv2MaterializationDiagnostics {
+    materialization_class: Option<String>,
+    subscription_requested: Option<bool>,
+    account_update_received: Option<bool>,
+    account_update_mapped: Option<bool>,
+    rpc_fetch_ready: Option<bool>,
+    rpc_fetch_missing: Option<bool>,
+    rpc_fetch_owner: Option<String>,
+    rpc_fetch_data_len: Option<u64>,
+    account_state_materialized: Option<bool>,
+    mfs_materialized: Option<bool>,
+    diag_materialized: Option<bool>,
+}
+
 fn p37_working_builder_bcv2_seen_reason(
     seen: Option<bool>,
     present_reason: &str,
@@ -9374,6 +9486,108 @@ fn p37_working_builder_bcv2_local_coverage_diagnostics(
             seen_in_diag,
             account_state_lookup_performed,
         ),
+    }
+}
+
+fn p37_working_builder_bcv2_materialization_class(
+    source_authority: Option<&str>,
+    seen_in_observed_tx: Option<bool>,
+    account_state_materialized: Option<bool>,
+    mfs_materialized: Option<bool>,
+    diag_materialized: Option<bool>,
+    rpc_fetch_ready: Option<bool>,
+    rpc_fetch_missing: Option<bool>,
+    reconciliation_class: Option<&str>,
+    has_bcv2_identity: bool,
+) -> Option<String> {
+    if account_state_materialized == Some(true) {
+        return Some("account_state_materialized".to_string());
+    }
+    if mfs_materialized == Some(true) {
+        return Some("mfs_materialized".to_string());
+    }
+    if diag_materialized == Some(true) {
+        return Some("diag_materialized".to_string());
+    }
+    if rpc_fetch_ready == Some(true) {
+        return Some("rpc_fetch_ready".to_string());
+    }
+    if rpc_fetch_missing == Some(true) {
+        if reconciliation_class == Some("true_not_load_ready") {
+            return Some("true_not_load_ready".to_string());
+        }
+        return Some("rpc_fetch_missing".to_string());
+    }
+    if source_authority == Some("authoritative_observed_tx") && seen_in_observed_tx == Some(true) {
+        return Some("observed_hint_registered".to_string());
+    }
+    if source_authority.is_some_and(|status| status.starts_with("authoritative_")) {
+        return Some("materialization_gap".to_string());
+    }
+    if has_bcv2_identity {
+        return Some("materialization_gap".to_string());
+    }
+    None
+}
+
+fn p37_working_builder_bcv2_materialization_diagnostics(
+    source_authority: Option<&str>,
+    seen_in_observed_tx: Option<bool>,
+    seen_in_account_state: Option<bool>,
+    seen_in_mfs: Option<bool>,
+    seen_in_diag: Option<bool>,
+    rpc_load_status: Option<&str>,
+    rpc_load_ready: Option<bool>,
+    rpc_fetch_owner: Option<String>,
+    rpc_fetch_data_len: Option<u64>,
+    reconciliation_class: Option<&str>,
+    has_bcv2_identity: bool,
+) -> P37WorkingBuilderBcv2MaterializationDiagnostics {
+    let account_state_materialized = seen_in_account_state.map(|value| value);
+    let mfs_materialized = seen_in_mfs.map(|value| value);
+    let diag_materialized = seen_in_diag.map(|value| value);
+    let account_update_received = match (
+        account_state_materialized,
+        mfs_materialized,
+        diag_materialized,
+    ) {
+        (Some(account_state), Some(mfs), Some(diag)) => Some(account_state || mfs || diag),
+        (Some(account_state), None, None) => Some(account_state),
+        (None, Some(mfs), None) => Some(mfs),
+        (None, None, Some(diag)) => Some(diag),
+        (Some(account_state), Some(mfs), None) => Some(account_state || mfs),
+        (Some(account_state), None, Some(diag)) => Some(account_state || diag),
+        (None, Some(mfs), Some(diag)) => Some(mfs || diag),
+        (None, None, None) => None,
+    };
+    let account_update_mapped = account_update_received;
+    let rpc_fetch_ready = rpc_load_ready
+        .map(|ready| ready && rpc_fetch_owner.is_some() && rpc_fetch_data_len.is_some());
+    let rpc_fetch_missing = rpc_load_status.map(|status| status == "missing_on_rpc_precheck");
+    let subscription_requested = Some(false);
+    let materialization_class = p37_working_builder_bcv2_materialization_class(
+        source_authority,
+        seen_in_observed_tx,
+        account_state_materialized,
+        mfs_materialized,
+        diag_materialized,
+        rpc_fetch_ready,
+        rpc_fetch_missing,
+        reconciliation_class,
+        has_bcv2_identity,
+    );
+    P37WorkingBuilderBcv2MaterializationDiagnostics {
+        materialization_class,
+        subscription_requested,
+        account_update_received,
+        account_update_mapped,
+        rpc_fetch_ready,
+        rpc_fetch_missing,
+        rpc_fetch_owner,
+        rpc_fetch_data_len,
+        account_state_materialized,
+        mfs_materialized,
+        diag_materialized,
     }
 }
 
@@ -9545,6 +9759,10 @@ fn p37_working_builder_parity_diagnostics(
     let bcv2_observed_slot = bonding_curve_v2_authority.observed_bcv2_source_slot;
     let bcv2_precheck_context_slot =
         bcv2_manifest_entry.and_then(|entry| entry.precheck_context_slot);
+    let bcv2_rpc_fetch_owner =
+        bcv2_manifest_entry.and_then(|entry| entry.precheck_account_owner.clone());
+    let bcv2_rpc_fetch_data_len =
+        bcv2_manifest_entry.and_then(|entry| entry.precheck_account_data_len);
     let bcv2_precheck_age_from_observed_slot =
         p37_working_builder_bcv2_precheck_age_from_observed_slot(
             bcv2_observed_slot,
@@ -9578,6 +9796,23 @@ fn p37_working_builder_parity_diagnostics(
         bonding_curve_v2_authority.seen_in_account_state,
         bonding_curve_v2_authority.seen_in_mfs,
         bonding_curve_v2_authority.seen_in_diag,
+    );
+    let has_bcv2_identity = bcv2_builder_pubkey.is_some()
+        || bcv2_observed_pubkey.is_some()
+        || bcv2_precheck_pubkey.is_some()
+        || bonding_curve_v2_authority.pubkey.is_some();
+    let bcv2_materialization = p37_working_builder_bcv2_materialization_diagnostics(
+        bonding_curve_v2_authority.authority_status.as_deref(),
+        bcv2_seen_in_observed_tx,
+        bonding_curve_v2_authority.seen_in_account_state,
+        bonding_curve_v2_authority.seen_in_mfs,
+        bonding_curve_v2_authority.seen_in_diag,
+        bonding_curve_v2_authority.rpc_load_status.as_deref(),
+        bonding_curve_v2_authority.rpc_load_ready,
+        bcv2_rpc_fetch_owner,
+        bcv2_rpc_fetch_data_len,
+        bcv2_reconciliation_class.as_deref(),
+        has_bcv2_identity,
     );
     let bcv2_readiness_reason = bonding_curve_v2_authority
         .builder_required_curve_account_ready_reason
@@ -9620,6 +9855,17 @@ fn p37_working_builder_parity_diagnostics(
         bcv2_rpc_error_class: bcv2_manifest_entry
             .and_then(|entry| entry.precheck_rpc_error_class.clone()),
         bcv2_reconciliation_class,
+        bcv2_materialization_class: bcv2_materialization.materialization_class,
+        bcv2_subscription_requested: bcv2_materialization.subscription_requested,
+        bcv2_account_update_received: bcv2_materialization.account_update_received,
+        bcv2_account_update_mapped: bcv2_materialization.account_update_mapped,
+        bcv2_rpc_fetch_ready: bcv2_materialization.rpc_fetch_ready,
+        bcv2_rpc_fetch_missing: bcv2_materialization.rpc_fetch_missing,
+        bcv2_rpc_fetch_owner: bcv2_materialization.rpc_fetch_owner,
+        bcv2_rpc_fetch_data_len: bcv2_materialization.rpc_fetch_data_len,
+        bcv2_account_state_materialized: bcv2_materialization.account_state_materialized,
+        bcv2_mfs_materialized: bcv2_materialization.mfs_materialized,
+        bcv2_diag_materialized: bcv2_materialization.diag_materialized,
         bcv2_account_state_lookup_performed: bcv2_local_coverage.account_state_lookup_performed,
         bcv2_account_state_seen: bcv2_local_coverage.account_state_seen,
         bcv2_account_state_seen_slot: bcv2_local_coverage.account_state_seen_slot,
@@ -9682,6 +9928,18 @@ fn p37_apply_working_builder_parity_to_record(
         diagnostics.bcv2_precheck_age_from_observed_slot;
     record.working_builder_bcv2_rpc_error_class = diagnostics.bcv2_rpc_error_class;
     record.working_builder_bcv2_reconciliation_class = diagnostics.bcv2_reconciliation_class;
+    record.working_builder_bcv2_materialization_class = diagnostics.bcv2_materialization_class;
+    record.working_builder_bcv2_subscription_requested = diagnostics.bcv2_subscription_requested;
+    record.working_builder_bcv2_account_update_received = diagnostics.bcv2_account_update_received;
+    record.working_builder_bcv2_account_update_mapped = diagnostics.bcv2_account_update_mapped;
+    record.working_builder_bcv2_rpc_fetch_ready = diagnostics.bcv2_rpc_fetch_ready;
+    record.working_builder_bcv2_rpc_fetch_missing = diagnostics.bcv2_rpc_fetch_missing;
+    record.working_builder_bcv2_rpc_fetch_owner = diagnostics.bcv2_rpc_fetch_owner;
+    record.working_builder_bcv2_rpc_fetch_data_len = diagnostics.bcv2_rpc_fetch_data_len;
+    record.working_builder_bcv2_account_state_materialized =
+        diagnostics.bcv2_account_state_materialized;
+    record.working_builder_bcv2_mfs_materialized = diagnostics.bcv2_mfs_materialized;
+    record.working_builder_bcv2_diag_materialized = diagnostics.bcv2_diag_materialized;
     record.working_builder_bcv2_account_state_lookup_performed =
         diagnostics.bcv2_account_state_lookup_performed;
     record.working_builder_bcv2_account_state_seen = diagnostics.bcv2_account_state_seen;
@@ -10504,6 +10762,18 @@ fn active_shadow_account_diagnostics_from_account_set_with_mode(
             .bcv2_precheck_age_from_observed_slot,
         working_builder_bcv2_rpc_error_class: working_builder.bcv2_rpc_error_class,
         working_builder_bcv2_reconciliation_class: working_builder.bcv2_reconciliation_class,
+        working_builder_bcv2_materialization_class: working_builder.bcv2_materialization_class,
+        working_builder_bcv2_subscription_requested: working_builder.bcv2_subscription_requested,
+        working_builder_bcv2_account_update_received: working_builder.bcv2_account_update_received,
+        working_builder_bcv2_account_update_mapped: working_builder.bcv2_account_update_mapped,
+        working_builder_bcv2_rpc_fetch_ready: working_builder.bcv2_rpc_fetch_ready,
+        working_builder_bcv2_rpc_fetch_missing: working_builder.bcv2_rpc_fetch_missing,
+        working_builder_bcv2_rpc_fetch_owner: working_builder.bcv2_rpc_fetch_owner,
+        working_builder_bcv2_rpc_fetch_data_len: working_builder.bcv2_rpc_fetch_data_len,
+        working_builder_bcv2_account_state_materialized: working_builder
+            .bcv2_account_state_materialized,
+        working_builder_bcv2_mfs_materialized: working_builder.bcv2_mfs_materialized,
+        working_builder_bcv2_diag_materialized: working_builder.bcv2_diag_materialized,
         working_builder_bcv2_account_state_lookup_performed: working_builder
             .bcv2_account_state_lookup_performed,
         working_builder_bcv2_account_state_seen: working_builder.bcv2_account_state_seen,
@@ -11706,6 +11976,18 @@ fn p37_shadow_probe_execution_diagnostics(
             .bcv2_precheck_age_from_observed_slot,
         working_builder_bcv2_rpc_error_class: working_builder.bcv2_rpc_error_class,
         working_builder_bcv2_reconciliation_class: working_builder.bcv2_reconciliation_class,
+        working_builder_bcv2_materialization_class: working_builder.bcv2_materialization_class,
+        working_builder_bcv2_subscription_requested: working_builder.bcv2_subscription_requested,
+        working_builder_bcv2_account_update_received: working_builder.bcv2_account_update_received,
+        working_builder_bcv2_account_update_mapped: working_builder.bcv2_account_update_mapped,
+        working_builder_bcv2_rpc_fetch_ready: working_builder.bcv2_rpc_fetch_ready,
+        working_builder_bcv2_rpc_fetch_missing: working_builder.bcv2_rpc_fetch_missing,
+        working_builder_bcv2_rpc_fetch_owner: working_builder.bcv2_rpc_fetch_owner,
+        working_builder_bcv2_rpc_fetch_data_len: working_builder.bcv2_rpc_fetch_data_len,
+        working_builder_bcv2_account_state_materialized: working_builder
+            .bcv2_account_state_materialized,
+        working_builder_bcv2_mfs_materialized: working_builder.bcv2_mfs_materialized,
+        working_builder_bcv2_diag_materialized: working_builder.bcv2_diag_materialized,
         working_builder_bcv2_account_state_lookup_performed: working_builder
             .bcv2_account_state_lookup_performed,
         working_builder_bcv2_account_state_seen: working_builder.bcv2_account_state_seen,
@@ -12066,6 +12348,23 @@ fn p37_shadow_probe_transport_from_event(
         working_builder_bcv2_rpc_error_class: diagnostics.working_builder_bcv2_rpc_error_class,
         working_builder_bcv2_reconciliation_class: diagnostics
             .working_builder_bcv2_reconciliation_class,
+        working_builder_bcv2_materialization_class: diagnostics
+            .working_builder_bcv2_materialization_class,
+        working_builder_bcv2_subscription_requested: diagnostics
+            .working_builder_bcv2_subscription_requested,
+        working_builder_bcv2_account_update_received: diagnostics
+            .working_builder_bcv2_account_update_received,
+        working_builder_bcv2_account_update_mapped: diagnostics
+            .working_builder_bcv2_account_update_mapped,
+        working_builder_bcv2_rpc_fetch_ready: diagnostics.working_builder_bcv2_rpc_fetch_ready,
+        working_builder_bcv2_rpc_fetch_missing: diagnostics.working_builder_bcv2_rpc_fetch_missing,
+        working_builder_bcv2_rpc_fetch_owner: diagnostics.working_builder_bcv2_rpc_fetch_owner,
+        working_builder_bcv2_rpc_fetch_data_len: diagnostics
+            .working_builder_bcv2_rpc_fetch_data_len,
+        working_builder_bcv2_account_state_materialized: diagnostics
+            .working_builder_bcv2_account_state_materialized,
+        working_builder_bcv2_mfs_materialized: diagnostics.working_builder_bcv2_mfs_materialized,
+        working_builder_bcv2_diag_materialized: diagnostics.working_builder_bcv2_diag_materialized,
         working_builder_bcv2_account_state_lookup_performed: diagnostics
             .working_builder_bcv2_account_state_lookup_performed,
         working_builder_bcv2_account_state_seen: diagnostics
@@ -12386,6 +12685,23 @@ fn p37_shadow_probe_transport_from_error(
         working_builder_bcv2_rpc_error_class: diagnostics.working_builder_bcv2_rpc_error_class,
         working_builder_bcv2_reconciliation_class: diagnostics
             .working_builder_bcv2_reconciliation_class,
+        working_builder_bcv2_materialization_class: diagnostics
+            .working_builder_bcv2_materialization_class,
+        working_builder_bcv2_subscription_requested: diagnostics
+            .working_builder_bcv2_subscription_requested,
+        working_builder_bcv2_account_update_received: diagnostics
+            .working_builder_bcv2_account_update_received,
+        working_builder_bcv2_account_update_mapped: diagnostics
+            .working_builder_bcv2_account_update_mapped,
+        working_builder_bcv2_rpc_fetch_ready: diagnostics.working_builder_bcv2_rpc_fetch_ready,
+        working_builder_bcv2_rpc_fetch_missing: diagnostics.working_builder_bcv2_rpc_fetch_missing,
+        working_builder_bcv2_rpc_fetch_owner: diagnostics.working_builder_bcv2_rpc_fetch_owner,
+        working_builder_bcv2_rpc_fetch_data_len: diagnostics
+            .working_builder_bcv2_rpc_fetch_data_len,
+        working_builder_bcv2_account_state_materialized: diagnostics
+            .working_builder_bcv2_account_state_materialized,
+        working_builder_bcv2_mfs_materialized: diagnostics.working_builder_bcv2_mfs_materialized,
+        working_builder_bcv2_diag_materialized: diagnostics.working_builder_bcv2_diag_materialized,
         working_builder_bcv2_account_state_lookup_performed: diagnostics
             .working_builder_bcv2_account_state_lookup_performed,
         working_builder_bcv2_account_state_seen: diagnostics
@@ -12670,6 +12986,24 @@ fn enrich_probe_shadow_entry(
         transport.working_builder_bcv2_rpc_error_class.clone();
     entry.working_builder_bcv2_reconciliation_class =
         transport.working_builder_bcv2_reconciliation_class.clone();
+    entry.working_builder_bcv2_materialization_class =
+        transport.working_builder_bcv2_materialization_class.clone();
+    entry.working_builder_bcv2_subscription_requested =
+        transport.working_builder_bcv2_subscription_requested;
+    entry.working_builder_bcv2_account_update_received =
+        transport.working_builder_bcv2_account_update_received;
+    entry.working_builder_bcv2_account_update_mapped =
+        transport.working_builder_bcv2_account_update_mapped;
+    entry.working_builder_bcv2_rpc_fetch_ready = transport.working_builder_bcv2_rpc_fetch_ready;
+    entry.working_builder_bcv2_rpc_fetch_missing = transport.working_builder_bcv2_rpc_fetch_missing;
+    entry.working_builder_bcv2_rpc_fetch_owner =
+        transport.working_builder_bcv2_rpc_fetch_owner.clone();
+    entry.working_builder_bcv2_rpc_fetch_data_len =
+        transport.working_builder_bcv2_rpc_fetch_data_len;
+    entry.working_builder_bcv2_account_state_materialized =
+        transport.working_builder_bcv2_account_state_materialized;
+    entry.working_builder_bcv2_mfs_materialized = transport.working_builder_bcv2_mfs_materialized;
+    entry.working_builder_bcv2_diag_materialized = transport.working_builder_bcv2_diag_materialized;
     entry.working_builder_bcv2_account_state_lookup_performed =
         transport.working_builder_bcv2_account_state_lookup_performed;
     entry.working_builder_bcv2_account_state_seen =
@@ -16081,6 +16415,41 @@ fn shadow_entry_record_from_event(
             .account_diagnostics
             .working_builder_bcv2_reconciliation_class
             .clone(),
+        working_builder_bcv2_materialization_class: event
+            .account_diagnostics
+            .working_builder_bcv2_materialization_class
+            .clone(),
+        working_builder_bcv2_subscription_requested: event
+            .account_diagnostics
+            .working_builder_bcv2_subscription_requested,
+        working_builder_bcv2_account_update_received: event
+            .account_diagnostics
+            .working_builder_bcv2_account_update_received,
+        working_builder_bcv2_account_update_mapped: event
+            .account_diagnostics
+            .working_builder_bcv2_account_update_mapped,
+        working_builder_bcv2_rpc_fetch_ready: event
+            .account_diagnostics
+            .working_builder_bcv2_rpc_fetch_ready,
+        working_builder_bcv2_rpc_fetch_missing: event
+            .account_diagnostics
+            .working_builder_bcv2_rpc_fetch_missing,
+        working_builder_bcv2_rpc_fetch_owner: event
+            .account_diagnostics
+            .working_builder_bcv2_rpc_fetch_owner
+            .clone(),
+        working_builder_bcv2_rpc_fetch_data_len: event
+            .account_diagnostics
+            .working_builder_bcv2_rpc_fetch_data_len,
+        working_builder_bcv2_account_state_materialized: event
+            .account_diagnostics
+            .working_builder_bcv2_account_state_materialized,
+        working_builder_bcv2_mfs_materialized: event
+            .account_diagnostics
+            .working_builder_bcv2_mfs_materialized,
+        working_builder_bcv2_diag_materialized: event
+            .account_diagnostics
+            .working_builder_bcv2_diag_materialized,
         working_builder_bcv2_account_state_lookup_performed: event
             .account_diagnostics
             .working_builder_bcv2_account_state_lookup_performed,
@@ -16345,6 +16714,17 @@ fn shadow_entry_record_from_request(
         working_builder_bcv2_precheck_age_from_observed_slot: None,
         working_builder_bcv2_rpc_error_class: None,
         working_builder_bcv2_reconciliation_class: None,
+        working_builder_bcv2_materialization_class: None,
+        working_builder_bcv2_subscription_requested: None,
+        working_builder_bcv2_account_update_received: None,
+        working_builder_bcv2_account_update_mapped: None,
+        working_builder_bcv2_rpc_fetch_ready: None,
+        working_builder_bcv2_rpc_fetch_missing: None,
+        working_builder_bcv2_rpc_fetch_owner: None,
+        working_builder_bcv2_rpc_fetch_data_len: None,
+        working_builder_bcv2_account_state_materialized: None,
+        working_builder_bcv2_mfs_materialized: None,
+        working_builder_bcv2_diag_materialized: None,
         working_builder_bcv2_account_state_lookup_performed: None,
         working_builder_bcv2_account_state_seen: None,
         working_builder_bcv2_account_state_seen_slot: None,
@@ -16604,6 +16984,27 @@ fn enrich_active_shadow_entry_with_account_diagnostics(
     entry.working_builder_bcv2_reconciliation_class = diagnostics
         .working_builder_bcv2_reconciliation_class
         .clone();
+    entry.working_builder_bcv2_materialization_class = diagnostics
+        .working_builder_bcv2_materialization_class
+        .clone();
+    entry.working_builder_bcv2_subscription_requested =
+        diagnostics.working_builder_bcv2_subscription_requested;
+    entry.working_builder_bcv2_account_update_received =
+        diagnostics.working_builder_bcv2_account_update_received;
+    entry.working_builder_bcv2_account_update_mapped =
+        diagnostics.working_builder_bcv2_account_update_mapped;
+    entry.working_builder_bcv2_rpc_fetch_ready = diagnostics.working_builder_bcv2_rpc_fetch_ready;
+    entry.working_builder_bcv2_rpc_fetch_missing =
+        diagnostics.working_builder_bcv2_rpc_fetch_missing;
+    entry.working_builder_bcv2_rpc_fetch_owner =
+        diagnostics.working_builder_bcv2_rpc_fetch_owner.clone();
+    entry.working_builder_bcv2_rpc_fetch_data_len =
+        diagnostics.working_builder_bcv2_rpc_fetch_data_len;
+    entry.working_builder_bcv2_account_state_materialized =
+        diagnostics.working_builder_bcv2_account_state_materialized;
+    entry.working_builder_bcv2_mfs_materialized = diagnostics.working_builder_bcv2_mfs_materialized;
+    entry.working_builder_bcv2_diag_materialized =
+        diagnostics.working_builder_bcv2_diag_materialized;
     entry.working_builder_creator_vault_pubkey =
         diagnostics.working_builder_creator_vault_pubkey.clone();
     entry.working_builder_creator_vault_source_authority = diagnostics
@@ -17171,6 +17572,28 @@ struct ShadowEntryRecord {
     working_builder_bcv2_rpc_error_class: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     working_builder_bcv2_reconciliation_class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_materialization_class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_subscription_requested: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_account_update_received: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_account_update_mapped: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_rpc_fetch_ready: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_rpc_fetch_missing: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_rpc_fetch_owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_rpc_fetch_data_len: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_account_state_materialized: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_mfs_materialized: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_diag_materialized: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     working_builder_bcv2_account_state_lookup_performed: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -21930,6 +22353,20 @@ mod tests {
             working.bcv2_reconciliation_class.as_deref(),
             Some("local_state_gap")
         );
+        assert_eq!(
+            working.bcv2_materialization_class.as_deref(),
+            Some("rpc_fetch_missing")
+        );
+        assert_eq!(working.bcv2_subscription_requested, Some(false));
+        assert_eq!(working.bcv2_account_update_received, Some(false));
+        assert_eq!(working.bcv2_account_update_mapped, Some(false));
+        assert_eq!(working.bcv2_rpc_fetch_ready, Some(false));
+        assert_eq!(working.bcv2_rpc_fetch_missing, Some(true));
+        assert_eq!(working.bcv2_rpc_fetch_owner, None);
+        assert_eq!(working.bcv2_rpc_fetch_data_len, None);
+        assert_eq!(working.bcv2_account_state_materialized, Some(false));
+        assert_eq!(working.bcv2_mfs_materialized, Some(false));
+        assert_eq!(working.bcv2_diag_materialized, Some(false));
         assert_eq!(working.bcv2_account_state_lookup_performed, Some(true));
         assert_eq!(working.bcv2_account_state_seen, Some(false));
         assert_eq!(working.bcv2_account_state_seen_slot, None);
@@ -21946,6 +22383,45 @@ mod tests {
             working.bcv2_local_coverage_class.as_deref(),
             Some("observed_only_no_account_state")
         );
+    }
+
+    #[test]
+    fn p37_working_builder_bcv2_materialization_tracks_rpc_fetch_evidence() {
+        let request = test_working_builder_prepared_buy_request();
+        let mut diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        let bcv2_owner = trigger::DirectBuyBuilder::pump_program_id().to_string();
+        let bcv2_entry = diagnostics
+            .manifest
+            .iter_mut()
+            .find(|entry| entry.role == "bonding_curve_v2")
+            .expect("working builder manifest bcv2");
+        bcv2_entry.precheck_rpc_load_status = Some("rpc_load_ready".to_string());
+        bcv2_entry.precheck_rpc_load_ready = Some(true);
+        bcv2_entry.precheck_commitment = Some("processed".to_string());
+        bcv2_entry.precheck_context_slot = Some(107);
+        bcv2_entry.precheck_attempt_count = Some(1);
+        bcv2_entry.precheck_latency_ms = Some(12);
+        bcv2_entry.precheck_account_owner = Some(bcv2_owner.clone());
+        bcv2_entry.precheck_account_data_len = Some(256);
+        diagnostics.manifest_lookup_performed = true;
+
+        let working =
+            p37_working_builder_parity_diagnostics(Some(&request), Some(&diagnostics), true);
+
+        assert_eq!(
+            working.bcv2_materialization_class.as_deref(),
+            Some("rpc_fetch_ready")
+        );
+        assert_eq!(working.bcv2_rpc_fetch_ready, Some(true));
+        assert_eq!(working.bcv2_rpc_fetch_missing, Some(false));
+        assert_eq!(
+            working.bcv2_rpc_fetch_owner.as_deref(),
+            Some(bcv2_owner.as_str())
+        );
+        assert_eq!(working.bcv2_rpc_fetch_data_len, Some(256));
+        assert_eq!(working.bcv2_account_state_materialized, Some(false));
+        assert_eq!(working.bcv2_mfs_materialized, Some(false));
+        assert_eq!(working.bcv2_diag_materialized, Some(false));
     }
 
     #[test]

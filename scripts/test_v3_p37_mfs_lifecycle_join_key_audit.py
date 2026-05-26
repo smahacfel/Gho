@@ -2176,6 +2176,17 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
                 "working_builder_bcv2_precheck_latency_ms": 7,
                 "working_builder_bcv2_precheck_age_from_observed_slot": 5,
                 "working_builder_bcv2_reconciliation_class": "rpc_ready_but_account_state_missing",
+                "working_builder_bcv2_materialization_class": "rpc_fetch_ready",
+                "working_builder_bcv2_subscription_requested": False,
+                "working_builder_bcv2_account_update_received": False,
+                "working_builder_bcv2_account_update_mapped": False,
+                "working_builder_bcv2_rpc_fetch_ready": True,
+                "working_builder_bcv2_rpc_fetch_missing": False,
+                "working_builder_bcv2_rpc_fetch_owner": "pump-program",
+                "working_builder_bcv2_rpc_fetch_data_len": 256,
+                "working_builder_bcv2_account_state_materialized": False,
+                "working_builder_bcv2_mfs_materialized": False,
+                "working_builder_bcv2_diag_materialized": False,
                 "working_builder_bcv2_account_state_lookup_performed": True,
                 "working_builder_bcv2_account_state_seen": False,
                 "working_builder_bcv2_mfs_seen_reason": "mfs_missing_bonding_curve_v2_identity",
@@ -2224,6 +2235,15 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
                 "working_builder_bcv2_precheck_age_from_observed_slot": 3,
                 "working_builder_bcv2_rpc_error_class": "account_missing",
                 "working_builder_bcv2_reconciliation_class": "local_state_gap",
+                "working_builder_bcv2_materialization_class": "rpc_fetch_missing",
+                "working_builder_bcv2_subscription_requested": False,
+                "working_builder_bcv2_account_update_received": False,
+                "working_builder_bcv2_account_update_mapped": False,
+                "working_builder_bcv2_rpc_fetch_ready": False,
+                "working_builder_bcv2_rpc_fetch_missing": True,
+                "working_builder_bcv2_account_state_materialized": False,
+                "working_builder_bcv2_mfs_materialized": False,
+                "working_builder_bcv2_diag_materialized": False,
                 "working_builder_bcv2_account_state_lookup_performed": True,
                 "working_builder_bcv2_account_state_seen": False,
                 "working_builder_bcv2_mfs_seen_reason": "mfs_missing_bonding_curve_v2_identity",
@@ -2301,6 +2321,22 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
             {"observed_only_no_account_state": 2},
         )
         self.assertEqual(
+            payload["working_builder_bcv2_materialization_class_counts"],
+            {"rpc_fetch_missing": 1, "rpc_fetch_ready": 1},
+        )
+        self.assertEqual(
+            payload["working_builder_bcv2_subscription_requested_counts"],
+            {"false": 2},
+        )
+        self.assertEqual(
+            payload["working_builder_bcv2_account_update_received_counts"],
+            {"false": 2},
+        )
+        self.assertEqual(
+            payload["working_builder_bcv2_account_update_mapped_counts"],
+            {"false": 2},
+        )
+        self.assertEqual(
             payload["working_builder_bcv2_account_state_lookup_performed_counts"],
             {"true": 2},
         )
@@ -2338,6 +2374,16 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
         self.assertEqual(payload["working_builder_bcv2_account_state_age_slots_rows"], 0)
         self.assertEqual(payload["working_builder_bcv2_account_state_owner_rows"], 0)
         self.assertEqual(payload["working_builder_bcv2_account_state_data_len_rows"], 0)
+        self.assertEqual(payload["working_builder_bcv2_subscription_requested_rows"], 0)
+        self.assertEqual(payload["working_builder_bcv2_account_update_received_rows"], 0)
+        self.assertEqual(payload["working_builder_bcv2_account_update_mapped_rows"], 0)
+        self.assertEqual(payload["working_builder_bcv2_rpc_fetch_ready_rows"], 1)
+        self.assertEqual(payload["working_builder_bcv2_rpc_fetch_missing_rows"], 1)
+        self.assertEqual(payload["working_builder_bcv2_rpc_fetch_owner_rows"], 1)
+        self.assertEqual(payload["working_builder_bcv2_rpc_fetch_data_len_rows"], 1)
+        self.assertEqual(payload["working_builder_bcv2_account_state_materialized_rows"], 0)
+        self.assertEqual(payload["working_builder_bcv2_mfs_materialized_rows"], 0)
+        self.assertEqual(payload["working_builder_bcv2_diag_materialized_rows"], 0)
         self.assertEqual(
             payload["working_builder_creator_vault_source_authority_counts"],
             {

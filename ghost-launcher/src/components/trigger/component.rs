@@ -397,6 +397,8 @@ pub(crate) struct CounterfactualProbeManifestAccountCheck {
     pub attempt_count: u64,
     pub latency_ms: u64,
     pub rpc_error_class: Option<String>,
+    pub account_owner: Option<String>,
+    pub account_data_len: Option<u64>,
 }
 
 pub struct PendingShadowSimulation {
@@ -4664,6 +4666,9 @@ impl TriggerComponent {
             let started = Instant::now();
             match rpc.get_account_with_commitment(pubkey, commitment).await {
                 Ok(response) if response.value.is_some() => {
+                    let Some(account) = response.value.as_ref() else {
+                        continue;
+                    };
                     checks.push(CounterfactualProbeManifestAccountCheck {
                         pubkey: *pubkey,
                         role: role.clone(),
@@ -4674,6 +4679,8 @@ impl TriggerComponent {
                         attempt_count: 1,
                         latency_ms: started.elapsed().as_millis() as u64,
                         rpc_error_class: None,
+                        account_owner: Some(account.owner.to_string()),
+                        account_data_len: Some(account.data.len() as u64),
                     });
                 }
                 Ok(response) => checks.push(CounterfactualProbeManifestAccountCheck {
@@ -4686,6 +4693,8 @@ impl TriggerComponent {
                     attempt_count: 1,
                     latency_ms: started.elapsed().as_millis() as u64,
                     rpc_error_class: Some("account_missing".to_string()),
+                    account_owner: None,
+                    account_data_len: None,
                 }),
                 Err(err) if Self::is_account_not_found_error(&err) => {
                     checks.push(CounterfactualProbeManifestAccountCheck {
@@ -4698,6 +4707,8 @@ impl TriggerComponent {
                         attempt_count: 1,
                         latency_ms: started.elapsed().as_millis() as u64,
                         rpc_error_class: Some("account_not_found_error".to_string()),
+                        account_owner: None,
+                        account_data_len: None,
                     });
                 }
                 Err(err) => {
