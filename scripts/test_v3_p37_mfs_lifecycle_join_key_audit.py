@@ -2176,6 +2176,11 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
                 "working_builder_bcv2_precheck_latency_ms": 7,
                 "working_builder_bcv2_precheck_age_from_observed_slot": 5,
                 "working_builder_bcv2_reconciliation_class": "rpc_ready_but_account_state_missing",
+                "working_builder_bcv2_account_state_lookup_performed": True,
+                "working_builder_bcv2_account_state_seen": False,
+                "working_builder_bcv2_mfs_seen_reason": "mfs_missing_bonding_curve_v2_identity",
+                "working_builder_bcv2_diag_seen_reason": "diag_missing_bonding_curve_v2_identity",
+                "working_builder_bcv2_local_coverage_class": "observed_only_no_account_state",
                 "observed_bcv2_loaded_address_source": "static_message_key",
                 "working_builder_creator_vault_pubkey": "creator-vault",
                 "working_builder_creator_vault_source_authority": "authoritative_detected_pool_creator",
@@ -2219,6 +2224,11 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
                 "working_builder_bcv2_precheck_age_from_observed_slot": 3,
                 "working_builder_bcv2_rpc_error_class": "account_missing",
                 "working_builder_bcv2_reconciliation_class": "local_state_gap",
+                "working_builder_bcv2_account_state_lookup_performed": True,
+                "working_builder_bcv2_account_state_seen": False,
+                "working_builder_bcv2_mfs_seen_reason": "mfs_missing_bonding_curve_v2_identity",
+                "working_builder_bcv2_diag_seen_reason": "diag_missing_bonding_curve_v2_identity",
+                "working_builder_bcv2_local_coverage_class": "observed_only_no_account_state",
                 "observed_bcv2_loaded_address_source": "resolved_transaction_account_keys",
                 "working_builder_creator_vault_pubkey": "creator-vault-2",
                 "working_builder_creator_vault_source_authority": "creator_vault_source_not_authoritative",
@@ -2286,6 +2296,26 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
             payload["working_builder_bcv2_precheck_age_bucket_counts"],
             {"3_8": 2},
         )
+        self.assertEqual(
+            payload["working_builder_bcv2_local_coverage_class_counts"],
+            {"observed_only_no_account_state": 2},
+        )
+        self.assertEqual(
+            payload["working_builder_bcv2_account_state_lookup_performed_counts"],
+            {"true": 2},
+        )
+        self.assertEqual(
+            payload["working_builder_bcv2_account_state_age_bucket_counts"],
+            {"missing": 2},
+        )
+        self.assertEqual(
+            payload["working_builder_bcv2_mfs_seen_reason_counts"],
+            {"mfs_missing_bonding_curve_v2_identity": 2},
+        )
+        self.assertEqual(
+            payload["working_builder_bcv2_diag_seen_reason_counts"],
+            {"diag_missing_bonding_curve_v2_identity": 2},
+        )
         self.assertEqual(payload["working_builder_bcv2_precheck_pubkey_rows"], 2)
         self.assertEqual(payload["working_builder_bcv2_builder_pubkey_rows"], 2)
         self.assertEqual(payload["working_builder_bcv2_observed_pubkey_rows"], 2)
@@ -2300,6 +2330,14 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
         self.assertEqual(
             payload["working_builder_bcv2_loaded_address_source_missing_rows"], 0
         )
+        self.assertEqual(
+            payload["working_builder_bcv2_account_state_lookup_performed_rows"], 2
+        )
+        self.assertEqual(payload["working_builder_bcv2_account_state_seen_rows"], 0)
+        self.assertEqual(payload["working_builder_bcv2_account_state_seen_slot_rows"], 0)
+        self.assertEqual(payload["working_builder_bcv2_account_state_age_slots_rows"], 0)
+        self.assertEqual(payload["working_builder_bcv2_account_state_owner_rows"], 0)
+        self.assertEqual(payload["working_builder_bcv2_account_state_data_len_rows"], 0)
         self.assertEqual(
             payload["working_builder_creator_vault_source_authority_counts"],
             {

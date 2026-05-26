@@ -5105,6 +5105,15 @@ struct P37ShadowProbeSelectionRecord {
     working_builder_bcv2_precheck_age_from_observed_slot: Option<i64>,
     working_builder_bcv2_rpc_error_class: Option<String>,
     working_builder_bcv2_reconciliation_class: Option<String>,
+    working_builder_bcv2_account_state_lookup_performed: Option<bool>,
+    working_builder_bcv2_account_state_seen: Option<bool>,
+    working_builder_bcv2_account_state_seen_slot: Option<u64>,
+    working_builder_bcv2_account_state_age_slots: Option<i64>,
+    working_builder_bcv2_account_state_owner: Option<String>,
+    working_builder_bcv2_account_state_data_len: Option<u64>,
+    working_builder_bcv2_mfs_seen_reason: Option<String>,
+    working_builder_bcv2_diag_seen_reason: Option<String>,
+    working_builder_bcv2_local_coverage_class: Option<String>,
     working_builder_creator_vault_pubkey: Option<String>,
     working_builder_creator_vault_source_authority: Option<String>,
     working_builder_creator_vault_rpc_load_status: Option<String>,
@@ -5284,6 +5293,15 @@ struct P37ShadowProbeTransportRecord {
     working_builder_bcv2_precheck_age_from_observed_slot: Option<i64>,
     working_builder_bcv2_rpc_error_class: Option<String>,
     working_builder_bcv2_reconciliation_class: Option<String>,
+    working_builder_bcv2_account_state_lookup_performed: Option<bool>,
+    working_builder_bcv2_account_state_seen: Option<bool>,
+    working_builder_bcv2_account_state_seen_slot: Option<u64>,
+    working_builder_bcv2_account_state_age_slots: Option<i64>,
+    working_builder_bcv2_account_state_owner: Option<String>,
+    working_builder_bcv2_account_state_data_len: Option<u64>,
+    working_builder_bcv2_mfs_seen_reason: Option<String>,
+    working_builder_bcv2_diag_seen_reason: Option<String>,
+    working_builder_bcv2_local_coverage_class: Option<String>,
     working_builder_creator_vault_pubkey: Option<String>,
     working_builder_creator_vault_source_authority: Option<String>,
     working_builder_creator_vault_rpc_load_status: Option<String>,
@@ -5762,6 +5780,15 @@ fn p37_shadow_probe_selection_record(
         working_builder_bcv2_precheck_age_from_observed_slot: None,
         working_builder_bcv2_rpc_error_class: None,
         working_builder_bcv2_reconciliation_class: None,
+        working_builder_bcv2_account_state_lookup_performed: None,
+        working_builder_bcv2_account_state_seen: None,
+        working_builder_bcv2_account_state_seen_slot: None,
+        working_builder_bcv2_account_state_age_slots: None,
+        working_builder_bcv2_account_state_owner: None,
+        working_builder_bcv2_account_state_data_len: None,
+        working_builder_bcv2_mfs_seen_reason: None,
+        working_builder_bcv2_diag_seen_reason: None,
+        working_builder_bcv2_local_coverage_class: None,
         working_builder_creator_vault_pubkey: None,
         working_builder_creator_vault_source_authority: None,
         working_builder_creator_vault_rpc_load_status: None,
@@ -6030,6 +6057,23 @@ fn p37_shadow_probe_artifact_records(
         working_builder_bcv2_reconciliation_class: record
             .working_builder_bcv2_reconciliation_class
             .clone(),
+        working_builder_bcv2_account_state_lookup_performed: record
+            .working_builder_bcv2_account_state_lookup_performed,
+        working_builder_bcv2_account_state_seen: record.working_builder_bcv2_account_state_seen,
+        working_builder_bcv2_account_state_seen_slot: record
+            .working_builder_bcv2_account_state_seen_slot,
+        working_builder_bcv2_account_state_age_slots: record
+            .working_builder_bcv2_account_state_age_slots,
+        working_builder_bcv2_account_state_owner: record
+            .working_builder_bcv2_account_state_owner
+            .clone(),
+        working_builder_bcv2_account_state_data_len: record
+            .working_builder_bcv2_account_state_data_len,
+        working_builder_bcv2_mfs_seen_reason: record.working_builder_bcv2_mfs_seen_reason.clone(),
+        working_builder_bcv2_diag_seen_reason: record.working_builder_bcv2_diag_seen_reason.clone(),
+        working_builder_bcv2_local_coverage_class: record
+            .working_builder_bcv2_local_coverage_class
+            .clone(),
         working_builder_creator_vault_pubkey: record.working_builder_creator_vault_pubkey.clone(),
         working_builder_creator_vault_source_authority: record
             .working_builder_creator_vault_source_authority
@@ -6274,6 +6318,23 @@ fn p37_shadow_probe_artifact_records(
         working_builder_bcv2_rpc_error_class: record.working_builder_bcv2_rpc_error_class.clone(),
         working_builder_bcv2_reconciliation_class: record
             .working_builder_bcv2_reconciliation_class
+            .clone(),
+        working_builder_bcv2_account_state_lookup_performed: record
+            .working_builder_bcv2_account_state_lookup_performed,
+        working_builder_bcv2_account_state_seen: record.working_builder_bcv2_account_state_seen,
+        working_builder_bcv2_account_state_seen_slot: record
+            .working_builder_bcv2_account_state_seen_slot,
+        working_builder_bcv2_account_state_age_slots: record
+            .working_builder_bcv2_account_state_age_slots,
+        working_builder_bcv2_account_state_owner: record
+            .working_builder_bcv2_account_state_owner
+            .clone(),
+        working_builder_bcv2_account_state_data_len: record
+            .working_builder_bcv2_account_state_data_len,
+        working_builder_bcv2_mfs_seen_reason: record.working_builder_bcv2_mfs_seen_reason.clone(),
+        working_builder_bcv2_diag_seen_reason: record.working_builder_bcv2_diag_seen_reason.clone(),
+        working_builder_bcv2_local_coverage_class: record
+            .working_builder_bcv2_local_coverage_class
             .clone(),
         working_builder_creator_vault_pubkey: record.working_builder_creator_vault_pubkey.clone(),
         working_builder_creator_vault_source_authority: record
@@ -7948,6 +8009,15 @@ struct P37ShadowProbeExecutionDiagnostics {
     working_builder_bcv2_precheck_age_from_observed_slot: Option<i64>,
     working_builder_bcv2_rpc_error_class: Option<String>,
     working_builder_bcv2_reconciliation_class: Option<String>,
+    working_builder_bcv2_account_state_lookup_performed: Option<bool>,
+    working_builder_bcv2_account_state_seen: Option<bool>,
+    working_builder_bcv2_account_state_seen_slot: Option<u64>,
+    working_builder_bcv2_account_state_age_slots: Option<i64>,
+    working_builder_bcv2_account_state_owner: Option<String>,
+    working_builder_bcv2_account_state_data_len: Option<u64>,
+    working_builder_bcv2_mfs_seen_reason: Option<String>,
+    working_builder_bcv2_diag_seen_reason: Option<String>,
+    working_builder_bcv2_local_coverage_class: Option<String>,
     working_builder_creator_vault_pubkey: Option<String>,
     working_builder_creator_vault_source_authority: Option<String>,
     working_builder_creator_vault_rpc_load_status: Option<String>,
@@ -8936,6 +9006,15 @@ struct P37WorkingBuilderParityDiagnostics {
     bcv2_precheck_age_from_observed_slot: Option<i64>,
     bcv2_rpc_error_class: Option<String>,
     bcv2_reconciliation_class: Option<String>,
+    bcv2_account_state_lookup_performed: Option<bool>,
+    bcv2_account_state_seen: Option<bool>,
+    bcv2_account_state_seen_slot: Option<u64>,
+    bcv2_account_state_age_slots: Option<i64>,
+    bcv2_account_state_owner: Option<String>,
+    bcv2_account_state_data_len: Option<u64>,
+    bcv2_mfs_seen_reason: Option<String>,
+    bcv2_diag_seen_reason: Option<String>,
+    bcv2_local_coverage_class: Option<String>,
     creator_vault_pubkey: Option<String>,
     creator_vault_source_authority: Option<String>,
     creator_vault_rpc_load_status: Option<String>,
@@ -9200,6 +9279,104 @@ fn p37_working_builder_bcv2_reconciliation_class(
     Some("unknown_gap".to_string())
 }
 
+#[derive(Debug, Clone, Default)]
+struct P37WorkingBuilderBcv2LocalCoverageDiagnostics {
+    account_state_lookup_performed: Option<bool>,
+    account_state_seen: Option<bool>,
+    account_state_seen_slot: Option<u64>,
+    account_state_age_slots: Option<i64>,
+    account_state_owner: Option<String>,
+    account_state_data_len: Option<u64>,
+    mfs_seen_reason: Option<String>,
+    diag_seen_reason: Option<String>,
+    local_coverage_class: Option<String>,
+}
+
+fn p37_working_builder_bcv2_seen_reason(
+    seen: Option<bool>,
+    present_reason: &str,
+    missing_reason: &str,
+) -> Option<String> {
+    match seen {
+        Some(true) => Some(present_reason.to_string()),
+        Some(false) => Some(missing_reason.to_string()),
+        None => None,
+    }
+}
+
+fn p37_working_builder_bcv2_local_coverage_class(
+    source_authority: Option<&str>,
+    seen_in_observed_tx: Option<bool>,
+    seen_in_account_state: Option<bool>,
+    seen_in_mfs: Option<bool>,
+    seen_in_diag: Option<bool>,
+    account_state_lookup_performed: Option<bool>,
+) -> Option<String> {
+    if seen_in_account_state == Some(true) {
+        return Some("account_state_present".to_string());
+    }
+    if seen_in_mfs == Some(true) {
+        return Some("mfs_present".to_string());
+    }
+    if seen_in_diag == Some(true) {
+        return Some("diag_present".to_string());
+    }
+    if source_authority == Some("authoritative_observed_tx")
+        && seen_in_observed_tx == Some(true)
+        && account_state_lookup_performed == Some(true)
+    {
+        return Some("observed_only_no_account_state".to_string());
+    }
+    if source_authority.is_some_and(|status| status.starts_with("authoritative_"))
+        && account_state_lookup_performed == Some(true)
+    {
+        return Some("state_mapping_gap".to_string());
+    }
+    if source_authority == Some("authoritative_observed_tx") && seen_in_observed_tx == Some(true) {
+        return Some("observed_only_no_account_state".to_string());
+    }
+    if source_authority.is_none() {
+        return None;
+    }
+    Some("unknown_local_coverage_gap".to_string())
+}
+
+fn p37_working_builder_bcv2_local_coverage_diagnostics(
+    source_authority: Option<&str>,
+    seen_in_observed_tx: Option<bool>,
+    seen_in_account_state: Option<bool>,
+    seen_in_mfs: Option<bool>,
+    seen_in_diag: Option<bool>,
+) -> P37WorkingBuilderBcv2LocalCoverageDiagnostics {
+    let account_state_lookup_performed = seen_in_account_state.map(|_| true);
+    P37WorkingBuilderBcv2LocalCoverageDiagnostics {
+        account_state_lookup_performed,
+        account_state_seen: seen_in_account_state,
+        account_state_seen_slot: None,
+        account_state_age_slots: None,
+        account_state_owner: None,
+        account_state_data_len: None,
+        mfs_seen_reason: p37_working_builder_bcv2_seen_reason(
+            seen_in_mfs,
+            "mfs_contains_bonding_curve_v2_identity",
+            "mfs_missing_bonding_curve_v2_identity",
+        ),
+        diag_seen_reason: p37_working_builder_bcv2_seen_reason(
+            seen_in_diag,
+            "diag_contains_bonding_curve_v2_identity",
+            "diag_missing_bonding_curve_v2_identity",
+        ),
+        local_coverage_class: p37_working_builder_bcv2_local_coverage_class(
+            source_authority,
+            seen_in_observed_tx,
+            seen_in_account_state,
+            seen_in_mfs,
+            seen_in_diag,
+            account_state_lookup_performed,
+        ),
+    }
+}
+
 fn p37_working_builder_creator_vault_source_authority(
     request: &crate::components::trigger::PreparedBuyRequest,
 ) -> Option<String> {
@@ -9395,6 +9572,13 @@ fn p37_working_builder_parity_diagnostics(
                 .observed_bcv2_resolved_pubkey
                 .is_some()
     });
+    let bcv2_local_coverage = p37_working_builder_bcv2_local_coverage_diagnostics(
+        bonding_curve_v2_authority.authority_status.as_deref(),
+        bcv2_seen_in_observed_tx,
+        bonding_curve_v2_authority.seen_in_account_state,
+        bonding_curve_v2_authority.seen_in_mfs,
+        bonding_curve_v2_authority.seen_in_diag,
+    );
     let bcv2_readiness_reason = bonding_curve_v2_authority
         .builder_required_curve_account_ready_reason
         .clone()
@@ -9436,6 +9620,15 @@ fn p37_working_builder_parity_diagnostics(
         bcv2_rpc_error_class: bcv2_manifest_entry
             .and_then(|entry| entry.precheck_rpc_error_class.clone()),
         bcv2_reconciliation_class,
+        bcv2_account_state_lookup_performed: bcv2_local_coverage.account_state_lookup_performed,
+        bcv2_account_state_seen: bcv2_local_coverage.account_state_seen,
+        bcv2_account_state_seen_slot: bcv2_local_coverage.account_state_seen_slot,
+        bcv2_account_state_age_slots: bcv2_local_coverage.account_state_age_slots,
+        bcv2_account_state_owner: bcv2_local_coverage.account_state_owner,
+        bcv2_account_state_data_len: bcv2_local_coverage.account_state_data_len,
+        bcv2_mfs_seen_reason: bcv2_local_coverage.mfs_seen_reason,
+        bcv2_diag_seen_reason: bcv2_local_coverage.diag_seen_reason,
+        bcv2_local_coverage_class: bcv2_local_coverage.local_coverage_class,
         creator_vault_pubkey: creator_vault_readiness.pubkey,
         creator_vault_source_authority: creator_vault_readiness.source_authority,
         creator_vault_rpc_load_status: creator_vault_readiness.rpc_load_status,
@@ -9489,6 +9682,16 @@ fn p37_apply_working_builder_parity_to_record(
         diagnostics.bcv2_precheck_age_from_observed_slot;
     record.working_builder_bcv2_rpc_error_class = diagnostics.bcv2_rpc_error_class;
     record.working_builder_bcv2_reconciliation_class = diagnostics.bcv2_reconciliation_class;
+    record.working_builder_bcv2_account_state_lookup_performed =
+        diagnostics.bcv2_account_state_lookup_performed;
+    record.working_builder_bcv2_account_state_seen = diagnostics.bcv2_account_state_seen;
+    record.working_builder_bcv2_account_state_seen_slot = diagnostics.bcv2_account_state_seen_slot;
+    record.working_builder_bcv2_account_state_age_slots = diagnostics.bcv2_account_state_age_slots;
+    record.working_builder_bcv2_account_state_owner = diagnostics.bcv2_account_state_owner;
+    record.working_builder_bcv2_account_state_data_len = diagnostics.bcv2_account_state_data_len;
+    record.working_builder_bcv2_mfs_seen_reason = diagnostics.bcv2_mfs_seen_reason;
+    record.working_builder_bcv2_diag_seen_reason = diagnostics.bcv2_diag_seen_reason;
+    record.working_builder_bcv2_local_coverage_class = diagnostics.bcv2_local_coverage_class;
     record.working_builder_creator_vault_pubkey = diagnostics.creator_vault_pubkey;
     record.working_builder_creator_vault_source_authority =
         diagnostics.creator_vault_source_authority;
@@ -10301,6 +10504,16 @@ fn active_shadow_account_diagnostics_from_account_set_with_mode(
             .bcv2_precheck_age_from_observed_slot,
         working_builder_bcv2_rpc_error_class: working_builder.bcv2_rpc_error_class,
         working_builder_bcv2_reconciliation_class: working_builder.bcv2_reconciliation_class,
+        working_builder_bcv2_account_state_lookup_performed: working_builder
+            .bcv2_account_state_lookup_performed,
+        working_builder_bcv2_account_state_seen: working_builder.bcv2_account_state_seen,
+        working_builder_bcv2_account_state_seen_slot: working_builder.bcv2_account_state_seen_slot,
+        working_builder_bcv2_account_state_age_slots: working_builder.bcv2_account_state_age_slots,
+        working_builder_bcv2_account_state_owner: working_builder.bcv2_account_state_owner,
+        working_builder_bcv2_account_state_data_len: working_builder.bcv2_account_state_data_len,
+        working_builder_bcv2_mfs_seen_reason: working_builder.bcv2_mfs_seen_reason,
+        working_builder_bcv2_diag_seen_reason: working_builder.bcv2_diag_seen_reason,
+        working_builder_bcv2_local_coverage_class: working_builder.bcv2_local_coverage_class,
         working_builder_creator_vault_pubkey: working_builder.creator_vault_pubkey,
         working_builder_creator_vault_source_authority: working_builder
             .creator_vault_source_authority,
@@ -11493,6 +11706,16 @@ fn p37_shadow_probe_execution_diagnostics(
             .bcv2_precheck_age_from_observed_slot,
         working_builder_bcv2_rpc_error_class: working_builder.bcv2_rpc_error_class,
         working_builder_bcv2_reconciliation_class: working_builder.bcv2_reconciliation_class,
+        working_builder_bcv2_account_state_lookup_performed: working_builder
+            .bcv2_account_state_lookup_performed,
+        working_builder_bcv2_account_state_seen: working_builder.bcv2_account_state_seen,
+        working_builder_bcv2_account_state_seen_slot: working_builder.bcv2_account_state_seen_slot,
+        working_builder_bcv2_account_state_age_slots: working_builder.bcv2_account_state_age_slots,
+        working_builder_bcv2_account_state_owner: working_builder.bcv2_account_state_owner,
+        working_builder_bcv2_account_state_data_len: working_builder.bcv2_account_state_data_len,
+        working_builder_bcv2_mfs_seen_reason: working_builder.bcv2_mfs_seen_reason,
+        working_builder_bcv2_diag_seen_reason: working_builder.bcv2_diag_seen_reason,
+        working_builder_bcv2_local_coverage_class: working_builder.bcv2_local_coverage_class,
         working_builder_creator_vault_pubkey: working_builder.creator_vault_pubkey,
         working_builder_creator_vault_source_authority: working_builder
             .creator_vault_source_authority,
@@ -11843,6 +12066,22 @@ fn p37_shadow_probe_transport_from_event(
         working_builder_bcv2_rpc_error_class: diagnostics.working_builder_bcv2_rpc_error_class,
         working_builder_bcv2_reconciliation_class: diagnostics
             .working_builder_bcv2_reconciliation_class,
+        working_builder_bcv2_account_state_lookup_performed: diagnostics
+            .working_builder_bcv2_account_state_lookup_performed,
+        working_builder_bcv2_account_state_seen: diagnostics
+            .working_builder_bcv2_account_state_seen,
+        working_builder_bcv2_account_state_seen_slot: diagnostics
+            .working_builder_bcv2_account_state_seen_slot,
+        working_builder_bcv2_account_state_age_slots: diagnostics
+            .working_builder_bcv2_account_state_age_slots,
+        working_builder_bcv2_account_state_owner: diagnostics
+            .working_builder_bcv2_account_state_owner,
+        working_builder_bcv2_account_state_data_len: diagnostics
+            .working_builder_bcv2_account_state_data_len,
+        working_builder_bcv2_mfs_seen_reason: diagnostics.working_builder_bcv2_mfs_seen_reason,
+        working_builder_bcv2_diag_seen_reason: diagnostics.working_builder_bcv2_diag_seen_reason,
+        working_builder_bcv2_local_coverage_class: diagnostics
+            .working_builder_bcv2_local_coverage_class,
         working_builder_creator_vault_pubkey: diagnostics.working_builder_creator_vault_pubkey,
         working_builder_creator_vault_source_authority: diagnostics
             .working_builder_creator_vault_source_authority,
@@ -12147,6 +12386,22 @@ fn p37_shadow_probe_transport_from_error(
         working_builder_bcv2_rpc_error_class: diagnostics.working_builder_bcv2_rpc_error_class,
         working_builder_bcv2_reconciliation_class: diagnostics
             .working_builder_bcv2_reconciliation_class,
+        working_builder_bcv2_account_state_lookup_performed: diagnostics
+            .working_builder_bcv2_account_state_lookup_performed,
+        working_builder_bcv2_account_state_seen: diagnostics
+            .working_builder_bcv2_account_state_seen,
+        working_builder_bcv2_account_state_seen_slot: diagnostics
+            .working_builder_bcv2_account_state_seen_slot,
+        working_builder_bcv2_account_state_age_slots: diagnostics
+            .working_builder_bcv2_account_state_age_slots,
+        working_builder_bcv2_account_state_owner: diagnostics
+            .working_builder_bcv2_account_state_owner,
+        working_builder_bcv2_account_state_data_len: diagnostics
+            .working_builder_bcv2_account_state_data_len,
+        working_builder_bcv2_mfs_seen_reason: diagnostics.working_builder_bcv2_mfs_seen_reason,
+        working_builder_bcv2_diag_seen_reason: diagnostics.working_builder_bcv2_diag_seen_reason,
+        working_builder_bcv2_local_coverage_class: diagnostics
+            .working_builder_bcv2_local_coverage_class,
         working_builder_creator_vault_pubkey: diagnostics.working_builder_creator_vault_pubkey,
         working_builder_creator_vault_source_authority: diagnostics
             .working_builder_creator_vault_source_authority,
@@ -12415,6 +12670,24 @@ fn enrich_probe_shadow_entry(
         transport.working_builder_bcv2_rpc_error_class.clone();
     entry.working_builder_bcv2_reconciliation_class =
         transport.working_builder_bcv2_reconciliation_class.clone();
+    entry.working_builder_bcv2_account_state_lookup_performed =
+        transport.working_builder_bcv2_account_state_lookup_performed;
+    entry.working_builder_bcv2_account_state_seen =
+        transport.working_builder_bcv2_account_state_seen;
+    entry.working_builder_bcv2_account_state_seen_slot =
+        transport.working_builder_bcv2_account_state_seen_slot;
+    entry.working_builder_bcv2_account_state_age_slots =
+        transport.working_builder_bcv2_account_state_age_slots;
+    entry.working_builder_bcv2_account_state_owner =
+        transport.working_builder_bcv2_account_state_owner.clone();
+    entry.working_builder_bcv2_account_state_data_len =
+        transport.working_builder_bcv2_account_state_data_len;
+    entry.working_builder_bcv2_mfs_seen_reason =
+        transport.working_builder_bcv2_mfs_seen_reason.clone();
+    entry.working_builder_bcv2_diag_seen_reason =
+        transport.working_builder_bcv2_diag_seen_reason.clone();
+    entry.working_builder_bcv2_local_coverage_class =
+        transport.working_builder_bcv2_local_coverage_class.clone();
     entry.working_builder_creator_vault_pubkey =
         transport.working_builder_creator_vault_pubkey.clone();
     entry.working_builder_creator_vault_source_authority = transport
@@ -15808,6 +16081,37 @@ fn shadow_entry_record_from_event(
             .account_diagnostics
             .working_builder_bcv2_reconciliation_class
             .clone(),
+        working_builder_bcv2_account_state_lookup_performed: event
+            .account_diagnostics
+            .working_builder_bcv2_account_state_lookup_performed,
+        working_builder_bcv2_account_state_seen: event
+            .account_diagnostics
+            .working_builder_bcv2_account_state_seen,
+        working_builder_bcv2_account_state_seen_slot: event
+            .account_diagnostics
+            .working_builder_bcv2_account_state_seen_slot,
+        working_builder_bcv2_account_state_age_slots: event
+            .account_diagnostics
+            .working_builder_bcv2_account_state_age_slots,
+        working_builder_bcv2_account_state_owner: event
+            .account_diagnostics
+            .working_builder_bcv2_account_state_owner
+            .clone(),
+        working_builder_bcv2_account_state_data_len: event
+            .account_diagnostics
+            .working_builder_bcv2_account_state_data_len,
+        working_builder_bcv2_mfs_seen_reason: event
+            .account_diagnostics
+            .working_builder_bcv2_mfs_seen_reason
+            .clone(),
+        working_builder_bcv2_diag_seen_reason: event
+            .account_diagnostics
+            .working_builder_bcv2_diag_seen_reason
+            .clone(),
+        working_builder_bcv2_local_coverage_class: event
+            .account_diagnostics
+            .working_builder_bcv2_local_coverage_class
+            .clone(),
         working_builder_creator_vault_pubkey: event
             .account_diagnostics
             .working_builder_creator_vault_pubkey
@@ -16041,6 +16345,15 @@ fn shadow_entry_record_from_request(
         working_builder_bcv2_precheck_age_from_observed_slot: None,
         working_builder_bcv2_rpc_error_class: None,
         working_builder_bcv2_reconciliation_class: None,
+        working_builder_bcv2_account_state_lookup_performed: None,
+        working_builder_bcv2_account_state_seen: None,
+        working_builder_bcv2_account_state_seen_slot: None,
+        working_builder_bcv2_account_state_age_slots: None,
+        working_builder_bcv2_account_state_owner: None,
+        working_builder_bcv2_account_state_data_len: None,
+        working_builder_bcv2_mfs_seen_reason: None,
+        working_builder_bcv2_diag_seen_reason: None,
+        working_builder_bcv2_local_coverage_class: None,
         working_builder_creator_vault_pubkey: None,
         working_builder_creator_vault_source_authority: None,
         working_builder_creator_vault_rpc_load_status: None,
@@ -16858,6 +17171,24 @@ struct ShadowEntryRecord {
     working_builder_bcv2_rpc_error_class: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     working_builder_bcv2_reconciliation_class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_account_state_lookup_performed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_account_state_seen: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_account_state_seen_slot: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_account_state_age_slots: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_account_state_owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_account_state_data_len: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_mfs_seen_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_diag_seen_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_local_coverage_class: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     working_builder_creator_vault_pubkey: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -21599,6 +21930,22 @@ mod tests {
             working.bcv2_reconciliation_class.as_deref(),
             Some("local_state_gap")
         );
+        assert_eq!(working.bcv2_account_state_lookup_performed, Some(true));
+        assert_eq!(working.bcv2_account_state_seen, Some(false));
+        assert_eq!(working.bcv2_account_state_seen_slot, None);
+        assert_eq!(working.bcv2_account_state_age_slots, None);
+        assert_eq!(
+            working.bcv2_mfs_seen_reason.as_deref(),
+            Some("mfs_missing_bonding_curve_v2_identity")
+        );
+        assert_eq!(
+            working.bcv2_diag_seen_reason.as_deref(),
+            Some("diag_missing_bonding_curve_v2_identity")
+        );
+        assert_eq!(
+            working.bcv2_local_coverage_class.as_deref(),
+            Some("observed_only_no_account_state")
+        );
     }
 
     #[test]
@@ -21662,6 +22009,70 @@ mod tests {
             )
             .as_deref(),
             Some("true_not_load_ready")
+        );
+    }
+
+    #[test]
+    fn p37_working_builder_bcv2_local_coverage_has_closed_classes() {
+        assert_eq!(
+            p37_working_builder_bcv2_local_coverage_class(
+                Some("authoritative_account_state"),
+                Some(false),
+                Some(true),
+                Some(false),
+                Some(false),
+                Some(true),
+            )
+            .as_deref(),
+            Some("account_state_present")
+        );
+        assert_eq!(
+            p37_working_builder_bcv2_local_coverage_class(
+                Some("authoritative_mfs"),
+                Some(false),
+                Some(false),
+                Some(true),
+                Some(false),
+                Some(true),
+            )
+            .as_deref(),
+            Some("mfs_present")
+        );
+        assert_eq!(
+            p37_working_builder_bcv2_local_coverage_class(
+                Some("authoritative_exact_diag"),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(true),
+                Some(true),
+            )
+            .as_deref(),
+            Some("diag_present")
+        );
+        assert_eq!(
+            p37_working_builder_bcv2_local_coverage_class(
+                Some("authoritative_observed_tx"),
+                Some(true),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(true),
+            )
+            .as_deref(),
+            Some("observed_only_no_account_state")
+        );
+        assert_eq!(
+            p37_working_builder_bcv2_local_coverage_class(
+                Some("authoritative_derived"),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(true),
+            )
+            .as_deref(),
+            Some("state_mapping_gap")
         );
     }
 

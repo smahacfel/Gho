@@ -334,6 +334,24 @@ pub struct ShadowSimulationAccountDiagnostics {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_builder_bcv2_reconciliation_class: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_account_state_lookup_performed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_account_state_seen: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_account_state_seen_slot: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_account_state_age_slots: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_account_state_owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_account_state_data_len: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_mfs_seen_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_diag_seen_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_builder_bcv2_local_coverage_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_builder_creator_vault_pubkey: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_builder_creator_vault_source_authority: Option<String>,

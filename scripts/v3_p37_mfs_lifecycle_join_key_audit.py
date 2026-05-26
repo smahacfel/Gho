@@ -893,6 +893,27 @@ def working_builder_parity_payload(
         )
         for row in parity_rows
     )
+    bcv2_local_coverage_class_counts = Counter(
+        row_string(row, "working_builder_bcv2_local_coverage_class") or "missing"
+        for row in parity_rows
+    )
+    bcv2_account_state_lookup_performed_counts = Counter(
+        row_bool_string(row, "working_builder_bcv2_account_state_lookup_performed")
+        or "missing"
+        for row in parity_rows
+    )
+    bcv2_account_state_age_bucket_counts = Counter(
+        slot_age_bucket(row_int(row, "working_builder_bcv2_account_state_age_slots"))
+        for row in parity_rows
+    )
+    bcv2_mfs_seen_reason_counts = Counter(
+        row_string(row, "working_builder_bcv2_mfs_seen_reason") or "missing"
+        for row in parity_rows
+    )
+    bcv2_diag_seen_reason_counts = Counter(
+        row_string(row, "working_builder_bcv2_diag_seen_reason") or "missing"
+        for row in parity_rows
+    )
     bcv2_precheck_pubkey_rows = [
         row
         for row in parity_rows
@@ -944,6 +965,37 @@ def working_builder_parity_payload(
         for row in parity_rows
         if row_string(row, "working_builder_bcv2_observed_pubkey") is not None
         and row_string(row, "observed_bcv2_loaded_address_source") is None
+    ]
+    bcv2_account_state_lookup_performed_rows = [
+        row
+        for row in parity_rows
+        if row_bool_string(row, "working_builder_bcv2_account_state_lookup_performed")
+        is not None
+    ]
+    bcv2_account_state_seen_rows = [
+        row
+        for row in parity_rows
+        if row_bool_string(row, "working_builder_bcv2_account_state_seen") == "true"
+    ]
+    bcv2_account_state_seen_slot_rows = [
+        row
+        for row in parity_rows
+        if row_int(row, "working_builder_bcv2_account_state_seen_slot") is not None
+    ]
+    bcv2_account_state_age_slots_rows = [
+        row
+        for row in parity_rows
+        if row_int(row, "working_builder_bcv2_account_state_age_slots") is not None
+    ]
+    bcv2_account_state_owner_rows = [
+        row
+        for row in parity_rows
+        if row_string(row, "working_builder_bcv2_account_state_owner") is not None
+    ]
+    bcv2_account_state_data_len_rows = [
+        row
+        for row in parity_rows
+        if row_int(row, "working_builder_bcv2_account_state_data_len") is not None
     ]
     creator_vault_source_authority_counts = Counter(
         row_string(row, "working_builder_creator_vault_source_authority") or "missing"
@@ -1108,6 +1160,21 @@ def working_builder_parity_payload(
         f"{prefix}working_builder_bcv2_precheck_age_bucket_counts": dict(
             sorted(bcv2_precheck_age_bucket_counts.items())
         ),
+        f"{prefix}working_builder_bcv2_local_coverage_class_counts": dict(
+            sorted(bcv2_local_coverage_class_counts.items())
+        ),
+        f"{prefix}working_builder_bcv2_account_state_lookup_performed_counts": dict(
+            sorted(bcv2_account_state_lookup_performed_counts.items())
+        ),
+        f"{prefix}working_builder_bcv2_account_state_age_bucket_counts": dict(
+            sorted(bcv2_account_state_age_bucket_counts.items())
+        ),
+        f"{prefix}working_builder_bcv2_mfs_seen_reason_counts": dict(
+            sorted(bcv2_mfs_seen_reason_counts.items())
+        ),
+        f"{prefix}working_builder_bcv2_diag_seen_reason_counts": dict(
+            sorted(bcv2_diag_seen_reason_counts.items())
+        ),
         f"{prefix}working_builder_bcv2_precheck_pubkey_rows": len(
             bcv2_precheck_pubkey_rows
         ),
@@ -1137,6 +1204,24 @@ def working_builder_parity_payload(
         ),
         f"{prefix}working_builder_bcv2_loaded_address_source_missing_rows": len(
             bcv2_loaded_address_source_missing_rows
+        ),
+        f"{prefix}working_builder_bcv2_account_state_lookup_performed_rows": len(
+            bcv2_account_state_lookup_performed_rows
+        ),
+        f"{prefix}working_builder_bcv2_account_state_seen_rows": len(
+            bcv2_account_state_seen_rows
+        ),
+        f"{prefix}working_builder_bcv2_account_state_seen_slot_rows": len(
+            bcv2_account_state_seen_slot_rows
+        ),
+        f"{prefix}working_builder_bcv2_account_state_age_slots_rows": len(
+            bcv2_account_state_age_slots_rows
+        ),
+        f"{prefix}working_builder_bcv2_account_state_owner_rows": len(
+            bcv2_account_state_owner_rows
+        ),
+        f"{prefix}working_builder_bcv2_account_state_data_len_rows": len(
+            bcv2_account_state_data_len_rows
         ),
         f"{prefix}working_builder_creator_vault_source_authority_counts": dict(
             sorted(creator_vault_source_authority_counts.items())
@@ -3892,6 +3977,11 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- active_shadow_working_builder_bcv2_rpc_error_class_counts: `{json.dumps(active_shadow['active_shadow_working_builder_bcv2_rpc_error_class_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- active_shadow_working_builder_bcv2_loaded_address_source_counts: `{json.dumps(active_shadow['active_shadow_working_builder_bcv2_loaded_address_source_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- active_shadow_working_builder_bcv2_precheck_age_bucket_counts: `{json.dumps(active_shadow['active_shadow_working_builder_bcv2_precheck_age_bucket_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_working_builder_bcv2_local_coverage_class_counts: `{json.dumps(active_shadow['active_shadow_working_builder_bcv2_local_coverage_class_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_working_builder_bcv2_account_state_lookup_performed_counts: `{json.dumps(active_shadow['active_shadow_working_builder_bcv2_account_state_lookup_performed_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_working_builder_bcv2_account_state_age_bucket_counts: `{json.dumps(active_shadow['active_shadow_working_builder_bcv2_account_state_age_bucket_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_working_builder_bcv2_mfs_seen_reason_counts: `{json.dumps(active_shadow['active_shadow_working_builder_bcv2_mfs_seen_reason_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_working_builder_bcv2_diag_seen_reason_counts: `{json.dumps(active_shadow['active_shadow_working_builder_bcv2_diag_seen_reason_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- active_shadow_working_builder_bcv2_precheck_pubkey_rows: `{active_shadow['active_shadow_working_builder_bcv2_precheck_pubkey_rows']}`",
             f"- active_shadow_working_builder_bcv2_builder_pubkey_rows: `{active_shadow['active_shadow_working_builder_bcv2_builder_pubkey_rows']}`",
             f"- active_shadow_working_builder_bcv2_observed_pubkey_rows: `{active_shadow['active_shadow_working_builder_bcv2_observed_pubkey_rows']}`",
@@ -3902,6 +3992,12 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- active_shadow_working_builder_bcv2_precheck_latency_rows: `{active_shadow['active_shadow_working_builder_bcv2_precheck_latency_rows']}`",
             f"- active_shadow_working_builder_bcv2_precheck_age_from_observed_slot_rows: `{active_shadow['active_shadow_working_builder_bcv2_precheck_age_from_observed_slot_rows']}`",
             f"- active_shadow_working_builder_bcv2_loaded_address_source_missing_rows: `{active_shadow['active_shadow_working_builder_bcv2_loaded_address_source_missing_rows']}`",
+            f"- active_shadow_working_builder_bcv2_account_state_lookup_performed_rows: `{active_shadow['active_shadow_working_builder_bcv2_account_state_lookup_performed_rows']}`",
+            f"- active_shadow_working_builder_bcv2_account_state_seen_rows: `{active_shadow['active_shadow_working_builder_bcv2_account_state_seen_rows']}`",
+            f"- active_shadow_working_builder_bcv2_account_state_seen_slot_rows: `{active_shadow['active_shadow_working_builder_bcv2_account_state_seen_slot_rows']}`",
+            f"- active_shadow_working_builder_bcv2_account_state_age_slots_rows: `{active_shadow['active_shadow_working_builder_bcv2_account_state_age_slots_rows']}`",
+            f"- active_shadow_working_builder_bcv2_account_state_owner_rows: `{active_shadow['active_shadow_working_builder_bcv2_account_state_owner_rows']}`",
+            f"- active_shadow_working_builder_bcv2_account_state_data_len_rows: `{active_shadow['active_shadow_working_builder_bcv2_account_state_data_len_rows']}`",
             f"- active_shadow_working_builder_creator_vault_source_authority_counts: `{json.dumps(active_shadow['active_shadow_working_builder_creator_vault_source_authority_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- active_shadow_working_builder_creator_vault_rpc_load_status_counts: `{json.dumps(active_shadow['active_shadow_working_builder_creator_vault_rpc_load_status_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- active_shadow_working_builder_bcv2_authoritative_and_load_ready_rows: `{active_shadow['active_shadow_working_builder_bcv2_authoritative_and_load_ready_rows']}`",
@@ -4057,6 +4153,11 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- working_builder_bcv2_rpc_error_class_counts: `{json.dumps(materialization['working_builder_bcv2_rpc_error_class_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- working_builder_bcv2_loaded_address_source_counts: `{json.dumps(materialization['working_builder_bcv2_loaded_address_source_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- working_builder_bcv2_precheck_age_bucket_counts: `{json.dumps(materialization['working_builder_bcv2_precheck_age_bucket_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- working_builder_bcv2_local_coverage_class_counts: `{json.dumps(materialization['working_builder_bcv2_local_coverage_class_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- working_builder_bcv2_account_state_lookup_performed_counts: `{json.dumps(materialization['working_builder_bcv2_account_state_lookup_performed_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- working_builder_bcv2_account_state_age_bucket_counts: `{json.dumps(materialization['working_builder_bcv2_account_state_age_bucket_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- working_builder_bcv2_mfs_seen_reason_counts: `{json.dumps(materialization['working_builder_bcv2_mfs_seen_reason_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- working_builder_bcv2_diag_seen_reason_counts: `{json.dumps(materialization['working_builder_bcv2_diag_seen_reason_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- working_builder_bcv2_precheck_pubkey_rows: `{materialization['working_builder_bcv2_precheck_pubkey_rows']}`",
             f"- working_builder_bcv2_builder_pubkey_rows: `{materialization['working_builder_bcv2_builder_pubkey_rows']}`",
             f"- working_builder_bcv2_observed_pubkey_rows: `{materialization['working_builder_bcv2_observed_pubkey_rows']}`",
@@ -4067,6 +4168,12 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- working_builder_bcv2_precheck_latency_rows: `{materialization['working_builder_bcv2_precheck_latency_rows']}`",
             f"- working_builder_bcv2_precheck_age_from_observed_slot_rows: `{materialization['working_builder_bcv2_precheck_age_from_observed_slot_rows']}`",
             f"- working_builder_bcv2_loaded_address_source_missing_rows: `{materialization['working_builder_bcv2_loaded_address_source_missing_rows']}`",
+            f"- working_builder_bcv2_account_state_lookup_performed_rows: `{materialization['working_builder_bcv2_account_state_lookup_performed_rows']}`",
+            f"- working_builder_bcv2_account_state_seen_rows: `{materialization['working_builder_bcv2_account_state_seen_rows']}`",
+            f"- working_builder_bcv2_account_state_seen_slot_rows: `{materialization['working_builder_bcv2_account_state_seen_slot_rows']}`",
+            f"- working_builder_bcv2_account_state_age_slots_rows: `{materialization['working_builder_bcv2_account_state_age_slots_rows']}`",
+            f"- working_builder_bcv2_account_state_owner_rows: `{materialization['working_builder_bcv2_account_state_owner_rows']}`",
+            f"- working_builder_bcv2_account_state_data_len_rows: `{materialization['working_builder_bcv2_account_state_data_len_rows']}`",
             f"- working_builder_creator_vault_source_authority_counts: `{json.dumps(materialization['working_builder_creator_vault_source_authority_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- working_builder_creator_vault_rpc_load_status_counts: `{json.dumps(materialization['working_builder_creator_vault_rpc_load_status_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- working_builder_bcv2_authoritative_and_load_ready_rows: `{materialization['working_builder_bcv2_authoritative_and_load_ready_rows']}`",
