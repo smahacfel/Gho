@@ -132,6 +132,138 @@ entry_log_path = "../../logs/shadow_run/x8a/probe_entries.jsonl"
         self.assertEqual(coverage["bcv2_account_state_owner_rows"], 1)
         self.assertEqual(coverage["bcv2_account_state_data_len_rows"], 1)
 
+    def test_bcv2_working_builder_pubkey_join_dedupes_and_classifies_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "configs/rollout/x8b.toml"
+            config.parent.mkdir(parents=True)
+            config.write_text(
+                """
+[oracle]
+decision_log_path = "../../logs/rollout/x8b/decisions"
+
+[logging]
+file_path = "../../logs/rollout/x8b/system.log"
+oracle_log_path = "../../logs/rollout/x8b/oracle.log"
+
+[p37_shadow_probe]
+transport_log_path = "../../logs/shadow_run/x8b/probe_transport.jsonl"
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            marker_lines = "\n".join(
+                [
+                    "2026-05-26T06:33:39.000Z INFO BCV2_EXACT_WATCH_REGISTERED pubkey=wb1 inserted=true signature=sig1 observed_slot=10 registry_version=1",
+                    "2026-05-26T06:33:39.001Z INFO BCV2_EXACT_WATCH_SUBSCRIBE_INCLUDED profile=primary_global bcv2_sent=1 bcv2_dropped=0 tracked_bcv2=1 from_slot=10",
+                    "2026-05-26T06:33:39.002Z INFO BCV2_EXACT_WATCH_RESUBSCRIBE_SENT reason=bcv2_registry_notify profile=primary_global from_slot=10 registry_version=1",
+                    "2026-05-26T06:33:39.003Z INFO BCV2_RPC_HYDRATION_MISSING pubkey=wb1 commitment=processed context_slot=none latency_ms=750 error_class=timeout observed_slot=10 signature=sig1",
+                    "2026-05-26T06:33:40.000Z INFO BCV2_EXACT_WATCH_REGISTERED pubkey=wb2 inserted=true signature=sig2 observed_slot=11 registry_version=2",
+                    "2026-05-26T06:33:40.001Z INFO BCV2_EXACT_WATCH_SUBSCRIBE_INCLUDED profile=primary_global bcv2_sent=2 bcv2_dropped=0 tracked_bcv2=2 from_slot=11",
+                    "2026-05-26T06:33:40.002Z INFO BCV2_EXACT_WATCH_RESUBSCRIBE_SENT reason=bcv2_registry_notify profile=primary_global from_slot=11 registry_version=2",
+                    "2026-05-26T06:33:40.003Z INFO BCV2_ACCOUNT_UPDATE_RECEIVED pubkey=wb2 owner=owner data_len=256",
+                    "2026-05-26T06:33:40.004Z INFO BCV2_ACCOUNT_UPDATE_RECEIVED pubkey=other owner=owner data_len=256",
+                    "2026-05-26T06:39:38.000Z ERROR WATCHDOG FATAL: gRPC stalled for 359166ms",
+                ]
+            )
+            (root / "logs/rollout/x8b").mkdir(parents=True)
+            (root / "logs/rollout/x8b/system.log.2026-05-26").write_text(
+                marker_lines + "\n",
+                encoding="utf-8",
+            )
+            (root / "logs/rollout/x8b/oracle.log.2026-05-26").write_text(
+                marker_lines + "\n",
+                encoding="utf-8",
+            )
+            write_jsonl(
+                root / "logs/shadow_run/x8b/probe_transport.jsonl",
+                [
+                    {
+                        "working_builder_parity_mode": "working_builder_parity",
+                        "working_builder_bcv2_pubkey": "wb1",
+                        "working_builder_bcv2_precheck_pubkey": "wb1",
+                        "working_builder_bcv2_observed_pubkey": "wb1",
+                        "working_builder_bcv2_observed_slot": 10,
+                        "working_builder_bcv2_precheck_context_slot": 20,
+                        "working_builder_bcv2_precheck_age_from_observed_slot": 10,
+                        "working_builder_bcv2_rpc_fetch_missing": True,
+                        "working_builder_bcv2_rpc_fetch_ready": False,
+                        "working_builder_bcv2_rpc_error_class": "account_missing",
+                        "working_builder_bcv2_account_update_received": False,
+                        "working_builder_bcv2_account_update_mapped": False,
+                    },
+                    {
+                        "working_builder_parity_mode": "working_builder_parity",
+                        "working_builder_bcv2_pubkey": "wb2",
+                        "working_builder_bcv2_precheck_pubkey": "wb2",
+                        "working_builder_bcv2_observed_pubkey": "wb2",
+                        "working_builder_bcv2_observed_slot": 11,
+                        "working_builder_bcv2_precheck_context_slot": 21,
+                        "working_builder_bcv2_precheck_age_from_observed_slot": 10,
+                        "working_builder_bcv2_rpc_fetch_missing": False,
+                        "working_builder_bcv2_rpc_fetch_ready": False,
+                        "working_builder_bcv2_account_update_received": False,
+                        "working_builder_bcv2_account_update_mapped": False,
+                    },
+                ],
+            )
+
+            report = audit.build_report(config)
+
+        join = report["bcv2_working_builder_pubkey_join"]
+        self.assertEqual(join["marker_rows"]["BCV2_EXACT_WATCH_REGISTERED"], 4)
+        self.assertEqual(
+            join["marker_unique_pubkeys"]["BCV2_EXACT_WATCH_REGISTERED"],
+            2,
+        )
+        self.assertEqual(join["working_builder_bcv2_unique_pubkeys"], 2)
+        self.assertEqual(join["working_builder_bcv2_registered_unique_pubkeys"], 2)
+        self.assertEqual(join["working_builder_bcv2_included_unique_pubkeys"], 2)
+        self.assertEqual(join["working_builder_bcv2_resubscribe_sent_unique_pubkeys"], 2)
+        self.assertEqual(join["global_bcv2_account_update_unique_pubkeys"], 2)
+        self.assertEqual(
+            join["working_builder_bcv2_account_update_same_pubkey_unique_pubkeys"],
+            1,
+        )
+        self.assertEqual(
+            join["global_bcv2_account_update_other_pubkey_unique_pubkeys"],
+            1,
+        )
+        self.assertEqual(
+            join["classification_unique_pubkeys"][
+                "working_builder_bcv2_included_no_update"
+            ],
+            1,
+        )
+        self.assertEqual(
+            join["classification_unique_pubkeys"][
+                "working_builder_bcv2_update_received_unmapped"
+            ],
+            1,
+        )
+        self.assertEqual(
+            join["classification_unique_pubkeys"][
+                "working_builder_bcv2_update_received_other_pubkey_only"
+            ],
+            1,
+        )
+        self.assertEqual(
+            join["classification_unique_pubkeys"][
+                "working_builder_bcv2_hydration_missing_after_include"
+            ],
+            1,
+        )
+        self.assertEqual(
+            join["classification_unique_pubkeys"][
+                "working_builder_bcv2_runtime_inconclusive_watchdog"
+            ],
+            2,
+        )
+        self.assertNotIn(
+            "working_builder_bcv2_true_missing_or_not_loadable",
+            join["classification_unique_pubkeys"],
+        )
+
     def test_candidate_id_only_join_is_degraded(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

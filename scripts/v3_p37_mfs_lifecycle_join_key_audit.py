@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Iterable
@@ -14,6 +15,17 @@ from shadow_run_report import load_toml, resolve_config_path, resolve_runtime_pa
 
 SCHEMA_VERSION = 6
 DECISION_FILE_NAMES = ("gatekeeper_v2_decisions.jsonl", "gatekeeper_v2_buys.jsonl")
+BCV2_MARKERS = (
+    "BCV2_EXACT_WATCH_REGISTERED",
+    "BCV2_EXACT_WATCH_SUBSCRIBE_INCLUDED",
+    "BCV2_EXACT_WATCH_SUBSCRIBE_DROPPED",
+    "BCV2_EXACT_WATCH_RESUBSCRIBE_SENT",
+    "BCV2_RPC_HYDRATION_READY",
+    "BCV2_RPC_HYDRATION_MISSING",
+    "BCV2_ACCOUNT_UPDATE_RECEIVED",
+)
+LOG_KV_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=([^ \t]+)")
+LOG_TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T[0-9:.]+Z)")
 FIELD_GROUPS = {
     "ab_record_id": ("ab_record_id",),
     "source_ab_record_id": ("source_ab_record_id",),
@@ -310,6 +322,390 @@ def artifact_totals(report: dict[str, Any], artifact_type: str, field_group: str
 def count_marker_rows(paths: dict[str, list[Path]], marker: str) -> int:
     log_paths = sorted(set(paths.get("system_log", []) + paths.get("oracle_log", [])))
     return sum(1 for path in log_paths for line in iter_text_lines(path) if marker in line)
+
+
+def parse_bcv2_marker_events(paths: dict[str, list[Path]]) -> list[dict[str, Any]]:
+    log_paths = sorted(set(paths.get("system_log", []) + paths.get("oracle_log", [])))
+    events: list[dict[str, Any]] = []
+    for path_index, path in enumerate(log_paths):
+        for line_number, line in enumerate(iter_text_lines(path), start=1):
+            marker = next((item for item in BCV2_MARKERS if item in line), None)
+            if marker is None:
+                continue
+            fields = dict(LOG_KV_RE.findall(line))
+            timestamp_match = LOG_TS_RE.search(line)
+            event = {
+                "marker": marker,
+                "path": str(path),
+                "line_number": line_number,
+                "path_index": path_index,
+                "order": path_index * 1_000_000_000 + line_number,
+                "timestamp": timestamp_match.group(1) if timestamp_match else None,
+                "fields": fields,
+            }
+            pubkey = fields.get("pubkey")
+            if pubkey:
+                event["pubkey"] = pubkey
+            events.append(event)
+
+    registry_pubkeys: dict[str, str] = {}
+    for event in events:
+        if event["marker"] != "BCV2_EXACT_WATCH_REGISTERED":
+            continue
+        registry_version = event["fields"].get("registry_version")
+        pubkey = event.get("pubkey")
+        if registry_version and pubkey:
+            registry_pubkeys[registry_version] = str(pubkey)
+
+    events_by_path: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for event in events:
+        events_by_path[event["path"]].append(event)
+    for path_events in events_by_path.values():
+        pending_included: dict[str, Any] | None = None
+        for event in sorted(path_events, key=lambda item: item["line_number"]):
+            marker = event["marker"]
+            if marker == "BCV2_EXACT_WATCH_SUBSCRIBE_INCLUDED":
+                pending_included = event
+                continue
+            if marker != "BCV2_EXACT_WATCH_RESUBSCRIBE_SENT":
+                continue
+            registry_version = event["fields"].get("registry_version")
+            pubkey = registry_pubkeys.get(str(registry_version)) if registry_version else None
+            if pubkey:
+                event["attributed_pubkey"] = pubkey
+            if pending_included is not None and pubkey:
+                pending_included["attributed_pubkey"] = pubkey
+                pending_included["attributed_registry_version"] = registry_version
+                pending_included = None
+    return events
+
+
+def bcv2_marker_dedupe_key(event: dict[str, Any]) -> tuple[str, ...]:
+    fields = event.get("fields", {})
+    return tuple(
+        str(value)
+        for value in (
+            event.get("marker"),
+            event.get("pubkey") or event.get("attributed_pubkey"),
+            fields.get("registry_version"),
+            fields.get("signature"),
+            fields.get("observed_slot"),
+            fields.get("from_slot"),
+            fields.get("context_slot"),
+            fields.get("error_class"),
+            fields.get("owner"),
+            fields.get("data_len"),
+            fields.get("bcv2_sent"),
+            fields.get("tracked_bcv2"),
+        )
+    )
+
+
+def unique_marker_events(events: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[tuple[str, ...]] = set()
+    unique: list[dict[str, Any]] = []
+    for event in events:
+        key = bcv2_marker_dedupe_key(event)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(event)
+    return unique
+
+
+def bcv2_marker_pubkey(event: dict[str, Any]) -> str | None:
+    pubkey = event.get("pubkey") or event.get("attributed_pubkey")
+    return str(pubkey) if pubkey else None
+
+
+def bcv2_pubkey_for_working_builder(row: dict[str, Any]) -> str | None:
+    for field in (
+        "working_builder_bcv2_pubkey",
+        "working_builder_bcv2_precheck_pubkey",
+        "working_builder_bcv2_builder_pubkey",
+        "working_builder_bcv2_observed_pubkey",
+        "observed_bcv2_resolved_pubkey",
+        "bonding_curve_v2_pubkey",
+        "execution_account_readiness_pubkey",
+    ):
+        value = row_string(row, field)
+        if value:
+            return value
+    return None
+
+
+def bcv2_working_builder_rows(paths: dict[str, list[Path]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for artifact_type in (
+        "probe_transport",
+        "probe_skip",
+        "probe_entry",
+        "shadow_transport",
+        "shadow_entry",
+        "shadow_lifecycle",
+    ):
+        for row in artifact_rows(paths, artifact_type):
+            if row_string(row, "working_builder_parity_mode") != "working_builder_parity":
+                continue
+            pubkey = bcv2_pubkey_for_working_builder(row)
+            if pubkey is None:
+                continue
+            enriched = dict(row)
+            enriched["_artifact_type"] = artifact_type
+            enriched["_bcv2_pubkey"] = pubkey
+            rows.append(enriched)
+    return rows
+
+
+def int_values(rows: Iterable[dict[str, Any]], field: str) -> list[int]:
+    values = [value for row in rows if (value := row_int(row, field)) is not None]
+    return sorted(values)
+
+
+def min_max_or_none(values: list[int]) -> dict[str, int | None]:
+    return {
+        "min": values[0] if values else None,
+        "max": values[-1] if values else None,
+    }
+
+
+def marker_events_for_pubkey(
+    events_by_marker_pubkey: dict[str, dict[str, list[dict[str, Any]]]],
+    marker: str,
+    pubkey: str,
+) -> list[dict[str, Any]]:
+    return events_by_marker_pubkey.get(marker, {}).get(pubkey, [])
+
+
+def event_order_relation(
+    left_events: list[dict[str, Any]],
+    right_events: list[dict[str, Any]],
+) -> dict[str, int]:
+    before = 0
+    after = 0
+    for left in left_events:
+        for right in right_events:
+            if left.get("path") != right.get("path"):
+                continue
+            if left.get("line_number", 0) < right.get("line_number", 0):
+                before += 1
+            elif left.get("line_number", 0) > right.get("line_number", 0):
+                after += 1
+    return {"before": before, "after": after}
+
+
+def bcv2_working_builder_pubkey_join(paths: dict[str, list[Path]]) -> dict[str, Any]:
+    events = parse_bcv2_marker_events(paths)
+    unique_events = unique_marker_events(events)
+    events_by_marker_pubkey: dict[str, dict[str, list[dict[str, Any]]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    marker_row_counts = Counter(event["marker"] for event in events)
+    marker_unique_pubkeys: dict[str, set[str]] = {marker: set() for marker in BCV2_MARKERS}
+    for event in unique_events:
+        pubkey = bcv2_marker_pubkey(event)
+        if not pubkey:
+            continue
+        marker = event["marker"]
+        events_by_marker_pubkey[marker][pubkey].append(event)
+        marker_unique_pubkeys[marker].add(pubkey)
+
+    watchdog_fatal_rows = count_marker_rows(paths, "WATCHDOG FATAL")
+    wb_rows = bcv2_working_builder_rows(paths)
+    rows_by_pubkey: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in wb_rows:
+        rows_by_pubkey[row["_bcv2_pubkey"]].append(row)
+
+    account_update_pubkeys = marker_unique_pubkeys["BCV2_ACCOUNT_UPDATE_RECEIVED"]
+    working_pubkeys = set(rows_by_pubkey)
+    other_update_pubkeys = account_update_pubkeys - working_pubkeys
+    class_rows: Counter[str] = Counter()
+    class_pubkeys: dict[str, set[str]] = defaultdict(set)
+    pubkey_rows: list[dict[str, Any]] = []
+
+    def add_class(pubkey: str, row_count: int, class_name: str) -> None:
+        class_rows[class_name] += row_count
+        class_pubkeys[class_name].add(pubkey)
+
+    for pubkey, pubkey_wb_rows in sorted(rows_by_pubkey.items()):
+        row_count = len(pubkey_wb_rows)
+        registered_events = marker_events_for_pubkey(
+            events_by_marker_pubkey,
+            "BCV2_EXACT_WATCH_REGISTERED",
+            pubkey,
+        )
+        included_events = marker_events_for_pubkey(
+            events_by_marker_pubkey,
+            "BCV2_EXACT_WATCH_SUBSCRIBE_INCLUDED",
+            pubkey,
+        )
+        resubscribe_events = marker_events_for_pubkey(
+            events_by_marker_pubkey,
+            "BCV2_EXACT_WATCH_RESUBSCRIBE_SENT",
+            pubkey,
+        )
+        update_events = marker_events_for_pubkey(
+            events_by_marker_pubkey,
+            "BCV2_ACCOUNT_UPDATE_RECEIVED",
+            pubkey,
+        )
+        hydration_ready_events = marker_events_for_pubkey(
+            events_by_marker_pubkey,
+            "BCV2_RPC_HYDRATION_READY",
+            pubkey,
+        )
+        hydration_missing_events = marker_events_for_pubkey(
+            events_by_marker_pubkey,
+            "BCV2_RPC_HYDRATION_MISSING",
+            pubkey,
+        )
+        update_order = event_order_relation(update_events, included_events)
+        has_ready = any(
+            row_bool_string(row, "working_builder_bcv2_rpc_fetch_ready") == "true"
+            or row_bool_string(row, "working_builder_bcv2_account_state_seen") == "true"
+            or row_bool_string(row, "working_builder_bcv2_account_state_materialized")
+            == "true"
+            or row_bool_string(row, "working_builder_bcv2_mfs_materialized") == "true"
+            or row_bool_string(row, "working_builder_bcv2_diag_materialized") == "true"
+            for row in pubkey_wb_rows
+        ) or bool(hydration_ready_events)
+        row_update_mapped = any(
+            row_bool_string(row, "working_builder_bcv2_account_update_mapped") == "true"
+            for row in pubkey_wb_rows
+        )
+        row_update_received = any(
+            row_bool_string(row, "working_builder_bcv2_account_update_received") == "true"
+            for row in pubkey_wb_rows
+        )
+        rpc_error_classes = sorted(
+            {
+                value
+                for row in pubkey_wb_rows
+                if (value := row_string(row, "working_builder_bcv2_rpc_error_class"))
+            }
+        )
+        classes: list[str] = []
+        if included_events and not update_events:
+            classes.append("working_builder_bcv2_included_no_update")
+        if update_events and not row_update_mapped:
+            classes.append("working_builder_bcv2_update_received_unmapped")
+        if not update_events and other_update_pubkeys:
+            classes.append("working_builder_bcv2_update_received_other_pubkey_only")
+        if included_events and hydration_missing_events and not hydration_ready_events:
+            classes.append("working_builder_bcv2_hydration_missing_after_include")
+        if watchdog_fatal_rows and not has_ready:
+            classes.append("working_builder_bcv2_provider_stall_before_evidence")
+            classes.append("working_builder_bcv2_runtime_inconclusive_watchdog")
+        if (
+            not watchdog_fatal_rows
+            and included_events
+            and not has_ready
+            and not update_events
+            and (
+                "account_missing" in rpc_error_classes
+                or any(
+                    event.get("fields", {}).get("error_class") == "account_missing"
+                    for event in hydration_missing_events
+                )
+            )
+        ):
+            classes.append("working_builder_bcv2_true_missing_or_not_loadable")
+        for class_name in sorted(set(classes)):
+            add_class(pubkey, row_count, class_name)
+        observed_slots = int_values(pubkey_wb_rows, "working_builder_bcv2_observed_slot")
+        precheck_slots = int_values(pubkey_wb_rows, "working_builder_bcv2_precheck_context_slot")
+        precheck_age_slots = int_values(
+            pubkey_wb_rows,
+            "working_builder_bcv2_precheck_age_from_observed_slot",
+        )
+        pubkey_rows.append(
+            {
+                "pubkey": pubkey,
+                "working_builder_rows": row_count,
+                "artifacts": dict(
+                    sorted(Counter(row["_artifact_type"] for row in pubkey_wb_rows).items())
+                ),
+                "registered": bool(registered_events),
+                "registered_rows": len(registered_events),
+                "included": bool(included_events),
+                "included_rows": len(included_events),
+                "resubscribe_sent": bool(resubscribe_events),
+                "resubscribe_sent_rows": len(resubscribe_events),
+                "account_update_received_same_pubkey": bool(update_events),
+                "account_update_received_same_pubkey_rows": len(update_events),
+                "account_update_before_include_rows": update_order["before"],
+                "account_update_after_include_rows": update_order["after"],
+                "hydration_ready": bool(hydration_ready_events),
+                "hydration_ready_rows": len(hydration_ready_events),
+                "hydration_missing": bool(hydration_missing_events),
+                "hydration_missing_rows": len(hydration_missing_events),
+                "hydration_missing_error_classes": dict(
+                    sorted(
+                        Counter(
+                            event.get("fields", {}).get("error_class") or "missing"
+                            for event in hydration_missing_events
+                        ).items()
+                    )
+                ),
+                "observed_slot": min_max_or_none(observed_slots),
+                "precheck_context_slot": min_max_or_none(precheck_slots),
+                "precheck_age_from_observed_slot": min_max_or_none(precheck_age_slots),
+                "row_account_update_received": row_update_received,
+                "row_account_update_mapped": row_update_mapped,
+                "row_rpc_fetch_ready": any(
+                    row_bool_string(row, "working_builder_bcv2_rpc_fetch_ready") == "true"
+                    for row in pubkey_wb_rows
+                ),
+                "row_rpc_fetch_missing": any(
+                    row_bool_string(row, "working_builder_bcv2_rpc_fetch_missing") == "true"
+                    for row in pubkey_wb_rows
+                ),
+                "row_account_state_seen": any(
+                    row_bool_string(row, "working_builder_bcv2_account_state_seen") == "true"
+                    for row in pubkey_wb_rows
+                ),
+                "rpc_error_classes": rpc_error_classes,
+                "classes": sorted(set(classes)),
+            }
+        )
+
+    return {
+        "marker_rows": {marker: marker_row_counts.get(marker, 0) for marker in BCV2_MARKERS},
+        "marker_unique_pubkeys": {
+            marker: len(marker_unique_pubkeys[marker]) for marker in BCV2_MARKERS
+        },
+        "watchdog_fatal_rows": watchdog_fatal_rows,
+        "working_builder_bcv2_rows": len(wb_rows),
+        "working_builder_bcv2_unique_pubkeys": len(working_pubkeys),
+        "working_builder_bcv2_registered_unique_pubkeys": len(
+            working_pubkeys
+            & marker_unique_pubkeys["BCV2_EXACT_WATCH_REGISTERED"]
+        ),
+        "working_builder_bcv2_included_unique_pubkeys": len(
+            working_pubkeys
+            & marker_unique_pubkeys["BCV2_EXACT_WATCH_SUBSCRIBE_INCLUDED"]
+        ),
+        "working_builder_bcv2_resubscribe_sent_unique_pubkeys": len(
+            working_pubkeys
+            & marker_unique_pubkeys["BCV2_EXACT_WATCH_RESUBSCRIBE_SENT"]
+        ),
+        "working_builder_bcv2_hydration_ready_unique_pubkeys": len(
+            working_pubkeys & marker_unique_pubkeys["BCV2_RPC_HYDRATION_READY"]
+        ),
+        "working_builder_bcv2_hydration_missing_unique_pubkeys": len(
+            working_pubkeys & marker_unique_pubkeys["BCV2_RPC_HYDRATION_MISSING"]
+        ),
+        "working_builder_bcv2_account_update_same_pubkey_unique_pubkeys": len(
+            working_pubkeys & account_update_pubkeys
+        ),
+        "global_bcv2_account_update_unique_pubkeys": len(account_update_pubkeys),
+        "global_bcv2_account_update_other_pubkey_unique_pubkeys": len(other_update_pubkeys),
+        "classification_rows": dict(sorted(class_rows.items())),
+        "classification_unique_pubkeys": {
+            key: len(value) for key, value in sorted(class_pubkeys.items())
+        },
+        "pubkey_rows": pubkey_rows,
+    }
 
 
 def bcv2_exact_watch_coverage(paths: dict[str, list[Path]], report: dict[str, Any]) -> dict[str, int]:
@@ -4180,6 +4576,7 @@ def build_report(config_path: Path) -> dict[str, Any]:
     report["probe_decision_join"] = probe_decision_join(paths)
     report["probe_entry_materialization"] = probe_entry_materialization(paths)
     report["bcv2_exact_watch_coverage"] = bcv2_exact_watch_coverage(paths, report)
+    report["bcv2_working_builder_pubkey_join"] = bcv2_working_builder_pubkey_join(paths)
     report["probe_readiness"] = probe_readiness(report)
     report["execution_feasibility"] = execution_feasibility_summary(report)
     return report
@@ -4263,6 +4660,41 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- bcv2_account_state_data_len_rows: `{bcv2_exact_watch['bcv2_account_state_data_len_rows']}`",
         ]
     )
+    bcv2_pubkey_join = report["bcv2_working_builder_pubkey_join"]
+    lines.extend(
+        [
+            "",
+            "## BCV2 Working-Builder Pubkey Join",
+            "",
+            f"- marker_rows: `{json.dumps(bcv2_pubkey_join['marker_rows'], ensure_ascii=False, sort_keys=True)}`",
+            f"- marker_unique_pubkeys: `{json.dumps(bcv2_pubkey_join['marker_unique_pubkeys'], ensure_ascii=False, sort_keys=True)}`",
+            f"- watchdog_fatal_rows: `{bcv2_pubkey_join['watchdog_fatal_rows']}`",
+            f"- working_builder_bcv2_rows: `{bcv2_pubkey_join['working_builder_bcv2_rows']}`",
+            f"- working_builder_bcv2_unique_pubkeys: `{bcv2_pubkey_join['working_builder_bcv2_unique_pubkeys']}`",
+            f"- working_builder_bcv2_registered_unique_pubkeys: `{bcv2_pubkey_join['working_builder_bcv2_registered_unique_pubkeys']}`",
+            f"- working_builder_bcv2_included_unique_pubkeys: `{bcv2_pubkey_join['working_builder_bcv2_included_unique_pubkeys']}`",
+            f"- working_builder_bcv2_resubscribe_sent_unique_pubkeys: `{bcv2_pubkey_join['working_builder_bcv2_resubscribe_sent_unique_pubkeys']}`",
+            f"- working_builder_bcv2_hydration_ready_unique_pubkeys: `{bcv2_pubkey_join['working_builder_bcv2_hydration_ready_unique_pubkeys']}`",
+            f"- working_builder_bcv2_hydration_missing_unique_pubkeys: `{bcv2_pubkey_join['working_builder_bcv2_hydration_missing_unique_pubkeys']}`",
+            f"- working_builder_bcv2_account_update_same_pubkey_unique_pubkeys: `{bcv2_pubkey_join['working_builder_bcv2_account_update_same_pubkey_unique_pubkeys']}`",
+            f"- global_bcv2_account_update_unique_pubkeys: `{bcv2_pubkey_join['global_bcv2_account_update_unique_pubkeys']}`",
+            f"- global_bcv2_account_update_other_pubkey_unique_pubkeys: `{bcv2_pubkey_join['global_bcv2_account_update_other_pubkey_unique_pubkeys']}`",
+            f"- classification_rows: `{json.dumps(bcv2_pubkey_join['classification_rows'], ensure_ascii=False, sort_keys=True)}`",
+            f"- classification_unique_pubkeys: `{json.dumps(bcv2_pubkey_join['classification_unique_pubkeys'], ensure_ascii=False, sort_keys=True)}`",
+            "",
+            "| pubkey | rows | registered | included | resubscribe | update_same_pubkey | hydration_missing | classes |",
+            "| --- | ---: | --- | --- | --- | --- | --- | --- |",
+        ]
+    )
+    for row in bcv2_pubkey_join["pubkey_rows"][:25]:
+        lines.append(
+            f"| `{row['pubkey']}` | {row['working_builder_rows']} | "
+            f"`{row['registered']}` | `{row['included']}` | "
+            f"`{row['resubscribe_sent']}` | "
+            f"`{row['account_update_received_same_pubkey']}` | "
+            f"`{row['hydration_missing']}` | "
+            f"`{json.dumps(row['classes'], ensure_ascii=False, sort_keys=True)}` |"
+        )
     execution_feasibility = report["execution_feasibility"]
     lines.extend(
         [
