@@ -264,6 +264,117 @@ transport_log_path = "../../logs/shadow_run/x8b/probe_transport.jsonl"
             join["classification_unique_pubkeys"],
         )
 
+    def test_x8d_unique_bcv2_pubkey_join_splits_rpcmissing_capacity_buckets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "configs/rollout/x8d.toml"
+            config.parent.mkdir(parents=True)
+            config.write_text(
+                """
+[oracle]
+decision_log_path = "../../logs/rollout/x8d/decisions"
+
+[logging]
+file_path = "../../logs/rollout/x8d/system.log"
+
+[p37_shadow_probe]
+transport_log_path = "../../logs/shadow_run/x8d/probe_transport.jsonl"
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            marker_lines = "\n".join(
+                [
+                    "2026-05-26T20:00:00.000Z INFO BCV2_EXACT_WATCH_REGISTERED pubkey=wb1 registry_version=1",
+                    "2026-05-26T20:00:00.001Z INFO BCV2_EXACT_WATCH_SUBSCRIBE_INCLUDED profile=primary_global bcv2_sent=1 bcv2_dropped=0 tracked_bcv2=1 from_slot=10",
+                    "2026-05-26T20:00:00.002Z INFO BCV2_EXACT_WATCH_RESUBSCRIBE_SENT registry_version=1",
+                    "2026-05-26T20:00:00.003Z INFO BCV2_RPC_HYDRATION_MISSING pubkey=wb1 error_class=missing_on_rpc",
+                    "2026-05-26T20:00:01.000Z INFO BCV2_EXACT_WATCH_REGISTERED pubkey=wb2 registry_version=2",
+                    "2026-05-26T20:00:01.001Z INFO BCV2_EXACT_WATCH_SUBSCRIBE_INCLUDED profile=primary_global bcv2_sent=2 bcv2_dropped=0 tracked_bcv2=2 from_slot=11",
+                    "2026-05-26T20:00:01.002Z INFO BCV2_EXACT_WATCH_RESUBSCRIBE_SENT registry_version=2",
+                    "2026-05-26T20:00:01.003Z INFO BCV2_ACCOUNT_UPDATE_RECEIVED pubkey=wb2 owner=owner data_len=256",
+                    "2026-05-26T20:00:01.004Z INFO BCV2_RPC_HYDRATION_MISSING pubkey=wb2 error_class=missing_on_rpc",
+                    "2026-05-26T20:00:02.000Z INFO BCV2_EXACT_WATCH_REGISTERED pubkey=wb3 registry_version=3",
+                    "2026-05-26T20:00:02.001Z WARN BCV2_EXACT_WATCH_SUBSCRIBE_DROPPED profile=primary_global bcv2_dropped=5 tracked_bcv2=10 bcv2_sent=5 exact_payload_cap=5",
+                    "2026-05-26T20:00:02.002Z INFO BCV2_RPC_HYDRATION_MISSING pubkey=wb3 error_class=missing_on_rpc",
+                ]
+            )
+            (root / "logs/rollout/x8d").mkdir(parents=True)
+            (root / "logs/rollout/x8d/system.log.2026-05-26").write_text(
+                marker_lines + "\n",
+                encoding="utf-8",
+            )
+            transport_rows = [
+                {
+                    "working_builder_parity_mode": "working_builder_parity",
+                    "working_builder_bcv2_pubkey": "wb1",
+                    "working_builder_bcv2_rpc_fetch_missing": True,
+                    "working_builder_bcv2_execution_evidence_status": "rpc_missing",
+                    "working_builder_bcv2_execution_evidence_source": "rpc_hydration",
+                    "working_builder_bcv2_execution_evidence_reason": "missing_on_rpc",
+                    "working_builder_bcv2_execution_evidence_ready": False,
+                    "working_builder_bcv2_execution_evidence_exact_pubkey_match": True,
+                },
+                {
+                    "working_builder_parity_mode": "working_builder_parity",
+                    "working_builder_bcv2_pubkey": "wb2",
+                    "working_builder_bcv2_rpc_fetch_missing": True,
+                    "working_builder_bcv2_execution_evidence_status": "account_update_received",
+                    "working_builder_bcv2_execution_evidence_source": "yellowstone_account_update",
+                    "working_builder_bcv2_execution_evidence_reason": "account_update_received_not_execution_load_ready",
+                    "working_builder_bcv2_execution_evidence_ready": False,
+                    "working_builder_bcv2_execution_evidence_exact_pubkey_match": True,
+                },
+                {
+                    "working_builder_parity_mode": "working_builder_parity",
+                    "working_builder_bcv2_pubkey": "wb3",
+                    "working_builder_bcv2_rpc_fetch_missing": True,
+                    "working_builder_bcv2_execution_evidence_status": "rpc_missing",
+                    "working_builder_bcv2_execution_evidence_source": "rpc_hydration",
+                    "working_builder_bcv2_execution_evidence_reason": "missing_on_rpc",
+                    "working_builder_bcv2_execution_evidence_ready": False,
+                    "working_builder_bcv2_execution_evidence_exact_pubkey_match": True,
+                },
+                {
+                    "working_builder_parity_mode": "working_builder_parity",
+                    "working_builder_bcv2_pubkey": "wb4",
+                    "working_builder_bcv2_execution_evidence_status": "discovery_hint",
+                    "working_builder_bcv2_execution_evidence_source": "observed_tx_meta",
+                    "working_builder_bcv2_execution_evidence_reason": "not_execution_load_ready:discovery_hint",
+                    "working_builder_bcv2_execution_evidence_ready": False,
+                    "working_builder_bcv2_execution_evidence_exact_pubkey_match": True,
+                },
+            ]
+            write_jsonl(root / "logs/shadow_run/x8d/probe_transport.jsonl", transport_rows)
+
+            report = audit.build_report(config)
+
+        unique_join = report["x8d_unique_bcv2_pubkey_join"]
+        self.assertEqual(unique_join["unique_bcv2_pubkeys"], 4)
+        self.assertEqual(
+            unique_join["primary_bucket_unique_pubkeys"],
+            {
+                "included_rpc_missing_no_same_update": 1,
+                "no_registered_evidence": 1,
+                "registered_not_included_rpc_missing": 1,
+                "same_pubkey_update_but_not_execution_ready": 1,
+            },
+        )
+        self.assertEqual(unique_join["audit_bucket_unique_pubkeys"]["dropped_over_cap"], 1)
+        self.assertEqual(unique_join["audit_bucket_unique_pubkeys"]["no_registered_evidence"], 1)
+        self.assertEqual(unique_join["capacity_summary"]["max_bcv2_dropped"], 5)
+        self.assertEqual(unique_join["capacity_summary"]["max_exact_payload_cap"], 5)
+        by_pubkey = {row["bcv2_pubkey"]: row for row in unique_join["rows"]}
+        self.assertTrue(by_pubkey["wb3"]["dropped_over_cap_inferred"])
+        self.assertFalse(by_pubkey["wb4"]["registered"])
+        self.assertEqual(
+            by_pubkey["wb2"]["execution_evidence_reason_counts"],
+            {"account_update_received_not_execution_load_ready": 1},
+        )
+        flattened = audit.flatten_x8d_unique_bcv2_rows(unique_join)
+        self.assertEqual(len(flattened), 4)
+        self.assertIn("dropped_over_cap", flattened[2]["x8d_pr1_audit_buckets"])
+
     def test_candidate_id_only_join_is_degraded(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

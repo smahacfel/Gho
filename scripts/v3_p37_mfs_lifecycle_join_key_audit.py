@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import re
 from collections import Counter, defaultdict
@@ -469,12 +470,27 @@ def min_max_or_none(values: list[int]) -> dict[str, int | None]:
     }
 
 
+def max_or_none(values: Iterable[int]) -> int | None:
+    values = list(values)
+    return max(values) if values else None
+
+
 def marker_events_for_pubkey(
     events_by_marker_pubkey: dict[str, dict[str, list[dict[str, Any]]]],
     marker: str,
     pubkey: str,
 ) -> list[dict[str, Any]]:
     return events_by_marker_pubkey.get(marker, {}).get(pubkey, [])
+
+
+def event_int_field(event: dict[str, Any], field: str) -> int | None:
+    value = event.get("fields", {}).get(field)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def event_order_relation(
@@ -706,6 +722,359 @@ def bcv2_working_builder_pubkey_join(paths: dict[str, list[Path]]) -> dict[str, 
         },
         "pubkey_rows": pubkey_rows,
     }
+
+
+def x8d_unique_bcv2_pubkey_join(paths: dict[str, list[Path]]) -> dict[str, Any]:
+    events = unique_marker_events(parse_bcv2_marker_events(paths))
+    events_by_marker_pubkey: dict[str, dict[str, list[dict[str, Any]]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for event in events:
+        pubkey = bcv2_marker_pubkey(event)
+        if not pubkey:
+            continue
+        events_by_marker_pubkey[event["marker"]][pubkey].append(event)
+
+    drop_events = [
+        event
+        for event in events
+        if event["marker"] == "BCV2_EXACT_WATCH_SUBSCRIBE_DROPPED"
+        and (event_int_field(event, "bcv2_dropped") or 0) > 0
+    ]
+    capacity_summary = {
+        "drop_marker_rows": len(drop_events),
+        "max_tracked_bcv2": max_or_none(
+            event_int_field(event, "tracked_bcv2")
+            for event in drop_events
+            if event_int_field(event, "tracked_bcv2") is not None
+        ),
+        "max_bcv2_sent": max_or_none(
+            event_int_field(event, "bcv2_sent")
+            for event in drop_events
+            if event_int_field(event, "bcv2_sent") is not None
+        ),
+        "max_bcv2_dropped": max_or_none(
+            event_int_field(event, "bcv2_dropped")
+            for event in drop_events
+            if event_int_field(event, "bcv2_dropped") is not None
+        ),
+        "max_exact_payload_cap": max_or_none(
+            event_int_field(event, "exact_payload_cap")
+            for event in drop_events
+            if event_int_field(event, "exact_payload_cap") is not None
+        ),
+    }
+
+    rows_by_pubkey: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in bcv2_working_builder_rows(paths):
+        rows_by_pubkey[row["_bcv2_pubkey"]].append(row)
+
+    primary_bucket_unique: Counter[str] = Counter()
+    primary_bucket_rows: Counter[str] = Counter()
+    audit_bucket_unique: Counter[str] = Counter()
+    audit_bucket_rows: Counter[str] = Counter()
+    output_rows: list[dict[str, Any]] = []
+
+    def counter_for_field(rows: Iterable[dict[str, Any]], field: str) -> dict[str, int]:
+        counter: Counter[str] = Counter()
+        for row in rows:
+            value = row_string(row, field)
+            if value is None:
+                value = row_bool_string(row, field)
+            counter[value or "missing"] += 1
+        return dict(sorted(counter.items()))
+
+    def count_bool(rows: Iterable[dict[str, Any]], field: str) -> int:
+        return sum(1 for row in rows if row_bool_string(row, field) == "true")
+
+    def count_present(rows: Iterable[dict[str, Any]], field: str) -> int:
+        return sum(1 for row in rows if row.get(field) is not None and row.get(field) != "")
+
+    def drop_after_registration(registered_events: list[dict[str, Any]]) -> bool:
+        for registered in registered_events:
+            for dropped in drop_events:
+                if registered.get("path") != dropped.get("path"):
+                    continue
+                if registered.get("line_number", 0) < dropped.get("line_number", 0):
+                    return True
+        return False
+
+    for pubkey, pubkey_rows in sorted(rows_by_pubkey.items()):
+        registered_events = marker_events_for_pubkey(
+            events_by_marker_pubkey,
+            "BCV2_EXACT_WATCH_REGISTERED",
+            pubkey,
+        )
+        included_events = marker_events_for_pubkey(
+            events_by_marker_pubkey,
+            "BCV2_EXACT_WATCH_SUBSCRIBE_INCLUDED",
+            pubkey,
+        )
+        resubscribe_events = marker_events_for_pubkey(
+            events_by_marker_pubkey,
+            "BCV2_EXACT_WATCH_RESUBSCRIBE_SENT",
+            pubkey,
+        )
+        update_events = marker_events_for_pubkey(
+            events_by_marker_pubkey,
+            "BCV2_ACCOUNT_UPDATE_RECEIVED",
+            pubkey,
+        )
+        hydration_ready_events = marker_events_for_pubkey(
+            events_by_marker_pubkey,
+            "BCV2_RPC_HYDRATION_READY",
+            pubkey,
+        )
+        hydration_missing_events = marker_events_for_pubkey(
+            events_by_marker_pubkey,
+            "BCV2_RPC_HYDRATION_MISSING",
+            pubkey,
+        )
+        row_count = len(pubkey_rows)
+        execution_ready_rows = count_bool(
+            pubkey_rows,
+            "working_builder_bcv2_execution_evidence_ready",
+        )
+        raw_ready_rows = count_bool(pubkey_rows, "working_builder_bcv2_evidence_ready")
+        manifest_ready_rows = count_bool(pubkey_rows, "working_builder_manifest_ready")
+        manifest_missing_required_rows = sum(
+            1 for row in pubkey_rows if row.get("working_builder_missing_required_accounts")
+        )
+        rpc_fetch_missing_rows = count_bool(
+            pubkey_rows,
+            "working_builder_bcv2_rpc_fetch_missing",
+        )
+        rpc_fetch_ready_rows = count_bool(
+            pubkey_rows,
+            "working_builder_bcv2_rpc_fetch_ready",
+        )
+        same_pubkey_update = bool(update_events)
+        registered = bool(registered_events)
+        included = bool(included_events)
+        hydration_missing = bool(hydration_missing_events)
+        dropped_over_cap = registered and not included and drop_after_registration(registered_events)
+
+        audit_buckets: list[str] = []
+        if dropped_over_cap:
+            audit_buckets.append("dropped_over_cap")
+        if not registered:
+            audit_buckets.append("no_registered_evidence")
+        if same_pubkey_update and execution_ready_rows == 0:
+            audit_buckets.append("same_pubkey_update_but_not_execution_ready")
+        if included and hydration_missing and not same_pubkey_update:
+            audit_buckets.append("included_rpc_missing_no_same_update")
+        if registered and not included and hydration_missing:
+            audit_buckets.append("registered_not_included_rpc_missing")
+
+        if execution_ready_rows > 0:
+            primary_bucket = "execution_ready"
+        elif not registered:
+            primary_bucket = "no_registered_evidence"
+        elif same_pubkey_update and execution_ready_rows == 0:
+            primary_bucket = "same_pubkey_update_but_not_execution_ready"
+        elif registered and not included and hydration_missing:
+            primary_bucket = "registered_not_included_rpc_missing"
+        elif included and hydration_missing and not same_pubkey_update:
+            primary_bucket = "included_rpc_missing_no_same_update"
+        else:
+            primary_bucket = "other"
+
+        primary_bucket_unique[primary_bucket] += 1
+        primary_bucket_rows[primary_bucket] += row_count
+        for bucket in audit_buckets:
+            audit_bucket_unique[bucket] += 1
+            audit_bucket_rows[bucket] += row_count
+
+        observed_slots = int_values(pubkey_rows, "working_builder_bcv2_observed_slot")
+        precheck_slots = int_values(pubkey_rows, "working_builder_bcv2_precheck_context_slot")
+        precheck_age_slots = int_values(
+            pubkey_rows,
+            "working_builder_bcv2_precheck_age_from_observed_slot",
+        )
+        precheck_latency_ms = int_values(
+            pubkey_rows,
+            "working_builder_bcv2_precheck_latency_ms",
+        )
+        output_rows.append(
+            {
+                "bcv2_pubkey": pubkey,
+                "x8d_pr1_primary_bucket": primary_bucket,
+                "x8d_pr1_audit_buckets": sorted(set(audit_buckets)),
+                "working_builder_rows": row_count,
+                "artifacts": dict(
+                    sorted(Counter(row["_artifact_type"] for row in pubkey_rows).items())
+                ),
+                "pool_ids": sorted(
+                    {value for row in pubkey_rows if (value := row_string(row, "pool_id"))}
+                ),
+                "base_mints": sorted(
+                    {
+                        value
+                        for row in pubkey_rows
+                        if (value := row_string(row, "base_mint") or row_string(row, "mint"))
+                    }
+                ),
+                "registered": registered,
+                "registered_rows": len(registered_events),
+                "included_in_subscribe_inferred": included,
+                "included_rows_inferred": len(included_events),
+                "resubscribe_sent_inferred": bool(resubscribe_events),
+                "resubscribe_sent_rows_inferred": len(resubscribe_events),
+                "dropped_over_cap_inferred": dropped_over_cap,
+                "same_pubkey_account_update": same_pubkey_update,
+                "same_pubkey_account_update_rows": len(update_events),
+                "same_pubkey_account_update_order": event_order_relation(
+                    update_events,
+                    included_events,
+                ),
+                "hydration_ready": bool(hydration_ready_events),
+                "hydration_ready_rows": len(hydration_ready_events),
+                "hydration_missing": hydration_missing,
+                "hydration_missing_rows": len(hydration_missing_events),
+                "hydration_missing_error_classes": dict(
+                    sorted(
+                        Counter(
+                            event.get("fields", {}).get("error_class") or "missing"
+                            for event in hydration_missing_events
+                        ).items()
+                    )
+                ),
+                "execution_evidence_status_counts": counter_for_field(
+                    pubkey_rows,
+                    "working_builder_bcv2_execution_evidence_status",
+                ),
+                "execution_evidence_source_counts": counter_for_field(
+                    pubkey_rows,
+                    "working_builder_bcv2_execution_evidence_source",
+                ),
+                "execution_evidence_reason_counts": counter_for_field(
+                    pubkey_rows,
+                    "working_builder_bcv2_execution_evidence_reason",
+                ),
+                "execution_evidence_ready_rows": execution_ready_rows,
+                "execution_evidence_conflict_rows": count_present(
+                    pubkey_rows,
+                    "working_builder_bcv2_execution_evidence_conflict",
+                ),
+                "execution_evidence_stale_rows": count_bool(
+                    pubkey_rows,
+                    "working_builder_bcv2_execution_evidence_stale",
+                ),
+                "execution_evidence_exact_pubkey_match_rows": count_bool(
+                    pubkey_rows,
+                    "working_builder_bcv2_execution_evidence_exact_pubkey_match",
+                ),
+                "raw_evidence_status_counts": counter_for_field(
+                    pubkey_rows,
+                    "working_builder_bcv2_evidence_status",
+                ),
+                "raw_evidence_source_counts": counter_for_field(
+                    pubkey_rows,
+                    "working_builder_bcv2_evidence_source",
+                ),
+                "raw_evidence_reason_counts": counter_for_field(
+                    pubkey_rows,
+                    "working_builder_bcv2_evidence_reason",
+                ),
+                "raw_evidence_ready_rows": raw_ready_rows,
+                "raw_evidence_owner_rows": count_present(
+                    pubkey_rows,
+                    "working_builder_bcv2_evidence_owner",
+                ),
+                "raw_evidence_data_len_rows": count_present(
+                    pubkey_rows,
+                    "working_builder_bcv2_evidence_data_len",
+                ),
+                "manifest_ready_rows": manifest_ready_rows,
+                "manifest_missing_required_rows": manifest_missing_required_rows,
+                "rpc_fetch_ready_rows": rpc_fetch_ready_rows,
+                "rpc_fetch_missing_rows": rpc_fetch_missing_rows,
+                "account_update_received_rows_in_transport": count_bool(
+                    pubkey_rows,
+                    "working_builder_bcv2_account_update_received",
+                ),
+                "account_update_mapped_rows_in_transport": count_bool(
+                    pubkey_rows,
+                    "working_builder_bcv2_account_update_mapped",
+                ),
+                "reconciliation_class_counts": counter_for_field(
+                    pubkey_rows,
+                    "working_builder_bcv2_reconciliation_class",
+                ),
+                "precheck_age_slot_range": min_max_or_none(precheck_age_slots),
+                "precheck_latency_ms_range": min_max_or_none(precheck_latency_ms),
+                "observed_slot_range": min_max_or_none(observed_slots),
+                "precheck_context_slot_range": min_max_or_none(precheck_slots),
+            }
+        )
+
+    return {
+        "schema": "x8d_pr1_unique_bcv2_pubkey_join_v1",
+        "unique_bcv2_pubkeys": len(rows_by_pubkey),
+        "working_builder_rows": sum(len(rows) for rows in rows_by_pubkey.values()),
+        "primary_bucket_unique_pubkeys": dict(sorted(primary_bucket_unique.items())),
+        "primary_bucket_rows": dict(sorted(primary_bucket_rows.items())),
+        "audit_bucket_unique_pubkeys": dict(sorted(audit_bucket_unique.items())),
+        "audit_bucket_rows": dict(sorted(audit_bucket_rows.items())),
+        "capacity_summary": capacity_summary,
+        "rows": output_rows,
+    }
+
+
+def flatten_x8d_unique_bcv2_rows(section: dict[str, Any]) -> list[dict[str, Any]]:
+    csv_fields = (
+        "bcv2_pubkey",
+        "x8d_pr1_primary_bucket",
+        "x8d_pr1_audit_buckets",
+        "working_builder_rows",
+        "registered",
+        "included_in_subscribe_inferred",
+        "resubscribe_sent_inferred",
+        "dropped_over_cap_inferred",
+        "same_pubkey_account_update",
+        "same_pubkey_account_update_rows",
+        "hydration_ready",
+        "hydration_missing",
+        "execution_evidence_ready_rows",
+        "execution_evidence_conflict_rows",
+        "execution_evidence_status_counts",
+        "execution_evidence_source_counts",
+        "execution_evidence_reason_counts",
+        "raw_evidence_ready_rows",
+        "raw_evidence_status_counts",
+        "manifest_ready_rows",
+        "manifest_missing_required_rows",
+        "rpc_fetch_ready_rows",
+        "rpc_fetch_missing_rows",
+        "account_update_received_rows_in_transport",
+        "account_update_mapped_rows_in_transport",
+        "reconciliation_class_counts",
+        "precheck_age_slot_range",
+        "precheck_latency_ms_range",
+        "pool_ids",
+        "base_mints",
+    )
+    flattened: list[dict[str, Any]] = []
+    for row in section.get("rows", []):
+        item = {field: row.get(field) for field in csv_fields}
+        for key, value in list(item.items()):
+            if isinstance(value, (dict, list)):
+                item[key] = json.dumps(value, ensure_ascii=False, sort_keys=True)
+        flattened.append(item)
+    return flattened
+
+
+def write_x8d_unique_bcv2_csv(path: Path, section: dict[str, Any]) -> None:
+    rows = flatten_x8d_unique_bcv2_rows(section)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = list(rows[0].keys()) if rows else [
+        "bcv2_pubkey",
+        "x8d_pr1_primary_bucket",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def bcv2_exact_watch_coverage(paths: dict[str, list[Path]], report: dict[str, Any]) -> dict[str, int]:
@@ -4577,6 +4946,7 @@ def build_report(config_path: Path) -> dict[str, Any]:
     report["probe_entry_materialization"] = probe_entry_materialization(paths)
     report["bcv2_exact_watch_coverage"] = bcv2_exact_watch_coverage(paths, report)
     report["bcv2_working_builder_pubkey_join"] = bcv2_working_builder_pubkey_join(paths)
+    report["x8d_unique_bcv2_pubkey_join"] = x8d_unique_bcv2_pubkey_join(paths)
     report["probe_readiness"] = probe_readiness(report)
     report["execution_feasibility"] = execution_feasibility_summary(report)
     return report
@@ -4694,6 +5064,33 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"`{row['account_update_received_same_pubkey']}` | "
             f"`{row['hydration_missing']}` | "
             f"`{json.dumps(row['classes'], ensure_ascii=False, sort_keys=True)}` |"
+        )
+    x8d_bcv2_join = report["x8d_unique_bcv2_pubkey_join"]
+    lines.extend(
+        [
+            "",
+            "## X8D Unique BCV2 Pubkey Join",
+            "",
+            f"- schema: `{x8d_bcv2_join['schema']}`",
+            f"- unique_bcv2_pubkeys: `{x8d_bcv2_join['unique_bcv2_pubkeys']}`",
+            f"- working_builder_rows: `{x8d_bcv2_join['working_builder_rows']}`",
+            f"- primary_bucket_unique_pubkeys: `{json.dumps(x8d_bcv2_join['primary_bucket_unique_pubkeys'], ensure_ascii=False, sort_keys=True)}`",
+            f"- primary_bucket_rows: `{json.dumps(x8d_bcv2_join['primary_bucket_rows'], ensure_ascii=False, sort_keys=True)}`",
+            f"- audit_bucket_unique_pubkeys: `{json.dumps(x8d_bcv2_join['audit_bucket_unique_pubkeys'], ensure_ascii=False, sort_keys=True)}`",
+            f"- audit_bucket_rows: `{json.dumps(x8d_bcv2_join['audit_bucket_rows'], ensure_ascii=False, sort_keys=True)}`",
+            f"- capacity_summary: `{json.dumps(x8d_bcv2_join['capacity_summary'], ensure_ascii=False, sort_keys=True)}`",
+            "",
+            "| pubkey | primary_bucket | audit_buckets | registered | included_inferred | dropped_over_cap | same_pubkey_update | hydration_missing | exec_ready_rows |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | ---: |",
+        ]
+    )
+    for row in x8d_bcv2_join["rows"][:25]:
+        lines.append(
+            f"| `{row['bcv2_pubkey']}` | `{row['x8d_pr1_primary_bucket']}` | "
+            f"`{json.dumps(row['x8d_pr1_audit_buckets'], ensure_ascii=False, sort_keys=True)}` | "
+            f"`{row['registered']}` | `{row['included_in_subscribe_inferred']}` | "
+            f"`{row['dropped_over_cap_inferred']}` | `{row['same_pubkey_account_update']}` | "
+            f"`{row['hydration_missing']}` | {row['execution_evidence_ready_rows']} |"
         )
     execution_feasibility = report["execution_feasibility"]
     lines.extend(
@@ -5167,6 +5564,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--output-json", required=True, type=Path)
     parser.add_argument("--output-md", required=True, type=Path)
+    parser.add_argument("--output-bcv2-unique-json", type=Path)
+    parser.add_argument("--output-bcv2-unique-csv", type=Path)
     return parser.parse_args()
 
 
@@ -5176,6 +5575,13 @@ def main() -> int:
     write_json(args.output_json, report)
     args.output_md.parent.mkdir(parents=True, exist_ok=True)
     args.output_md.write_text(render_markdown(report), encoding="utf-8")
+    if args.output_bcv2_unique_json:
+        write_json(args.output_bcv2_unique_json, report["x8d_unique_bcv2_pubkey_join"])
+    if args.output_bcv2_unique_csv:
+        write_x8d_unique_bcv2_csv(
+            args.output_bcv2_unique_csv,
+            report["x8d_unique_bcv2_pubkey_join"],
+        )
     return 0
 
 
