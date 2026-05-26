@@ -226,10 +226,10 @@ def resolve_paths(config_path: Path) -> dict[str, list[Path]]:
     logging_cfg = config.get("logging", {})
     system_log_path = logging_cfg.get("file_path")
     if system_log_path:
-        paths["system_log"].append(Path(resolve_runtime_path(resolved, system_log_path)))
+        paths["system_log"].extend(resolve_rotated_log_paths(resolved, system_log_path))
     oracle_log_path = logging_cfg.get("oracle_log_path")
     if oracle_log_path:
-        paths["oracle_log"].append(Path(resolve_runtime_path(resolved, oracle_log_path)))
+        paths["oracle_log"].extend(resolve_rotated_log_paths(resolved, oracle_log_path))
 
     trigger_path = config.get("trigger", {}).get("shadow_run", {}).get("output_path")
     if trigger_path:
@@ -260,6 +260,18 @@ def resolve_paths(config_path: Path) -> dict[str, list[Path]]:
         if raw_path:
             paths[artifact_type].append(Path(resolve_runtime_path(resolved, raw_path)))
     return {key: sorted(set(value)) for key, value in paths.items()}
+
+
+def resolve_rotated_log_paths(config_path: Path, raw_path: str) -> list[Path]:
+    base = Path(resolve_runtime_path(config_path, raw_path))
+    paths = [base]
+    if base.parent.exists():
+        paths.extend(
+            path
+            for path in base.parent.glob(f"{base.name}.*")
+            if path.is_file()
+        )
+    return sorted(set(paths))
 
 
 def intersection_counts(summaries: list[dict[str, Any]]) -> dict[str, Any]:

@@ -69,6 +69,7 @@ Out-of-scope i niezmienione:
 ### Audit
 
 Rozszerzono `scripts/v3_p37_mfs_lifecycle_join_key_audit.py` o sekcje `bcv2_exact_watch_coverage` i markdown `BCV2 Exact Watch Coverage`.
+Audit uwzglednia tez rotowane pliki `system.log.*` i `oracle.log.*`, bo X8AS zapisuje runtime markery do logow z sufiksem daty.
 
 Nowe liczniki:
 
@@ -107,19 +108,105 @@ Uwagi do walidacji:
 - `cargo check` i testy nadal emituja istniejace ostrzezenia z `ghost-core`/`seer`.
 - W `binary_parser` naprawiono test fixture `make_ftdi_buy_event`, ktory uzywal `Pubkey::new_unique()` jako signera. Ten pubkey moze byc off-curve, a runtime context celowo filtruje off-curve ownerow. Fixture uzywa teraz realnego `Keypair::new().pubkey()`.
 
+## X8AS Runtime Smoke
+
+Konfiguracja smoke:
+
+- namespace: `shadow-burnin-v3-p37-x8as-bcv2-exact-watch-coverage-restoration-smoke`
+- config lokalny: `configs/rollout/shadow-burnin-v3-p37-x8as-bcv2-exact-watch-coverage-restoration-smoke.local.toml`
+- execution mode: `Shadow`
+- entry mode: `shadow_only`
+- builder mode: `working_builder_parity`
+- R18/P2/live/Sender path: nieuruchomione
+
+Artefakty runtime:
+
+- preflight: `logs/rollout/shadow-burnin-v3-p37-x8as-bcv2-exact-watch-coverage-restoration-smoke/x8as_preflight.log`
+- runtime console: `logs/rollout/shadow-burnin-v3-p37-x8as-bcv2-exact-watch-coverage-restoration-smoke/x8as_runtime_console.log`
+- runtime status: `logs/rollout/shadow-burnin-v3-p37-x8as-bcv2-exact-watch-coverage-restoration-smoke/x8as_runtime_status.env`
+- audit JSON: `logs/shadow_run/shadow-burnin-v3-p37-x8as-bcv2-exact-watch-coverage-restoration-smoke/v3_p37_x8as_join_key_audit.json`
+- audit MD: `logs/shadow_run/shadow-burnin-v3-p37-x8as-bcv2-exact-watch-coverage-restoration-smoke/v3_p37_x8as_join_key_audit.md`
+
+Runtime window:
+
+- start UTC: `2026-05-26T06:33:39Z`
+- stop UTC: `2026-05-26T06:41:39Z`
+- exit status: `2`
+- stop reason: watchdog fatal, gRPC stalled for `359166ms` with transport progress also stale for `359166ms`, above `300000ms`
+
+Preflight: PASS.
+
+Runtime zakonczyl sie przed planowanym limitem 30 minut z powodu provider/transport stall. Run nadal daje dowod exact-watch coverage, bo BCV2 registration, subscribe inclusion i forced resubscribe wystapily przed watchdog exit.
+
+## Runtime Evidence
+
+BCV2 exact-watch marker rows from the X8AS audit:
+
+- `bcv2_exact_watch_registered_rows`: `2304`
+- `bcv2_exact_watch_in_subscribe_request_rows`: `1508`
+- `bcv2_exact_watch_subscribe_dropped_rows`: `0`
+- `bcv2_resubscribe_sent_rows`: `1504`
+- `bcv2_rpc_hydration_ready_rows`: `0`
+- `bcv2_rpc_hydration_missing_rows`: `366`
+- `bcv2_account_update_received_rows`: `64`
+- `bcv2_account_state_seen_rows`: `0`
+- `bcv2_account_state_owner_rows`: `0`
+- `bcv2_account_state_data_len_rows`: `0`
+
+Interpretacja:
+
+- `BCV2_EXACT_WATCH_REGISTERED` jest dodatni.
+- `BCV2_EXACT_WATCH_SUBSCRIBE_INCLUDED` jest dodatni, wiec BCV2 weszlo do aktywnego `PrimaryGlobal` exact request surface.
+- `BCV2_EXACT_WATCH_RESUBSCRIBE_SENT` jest dodatni, wiec osobny BCV2 immediate forced resubscribe path zadzialal.
+- `BCV2_EXACT_WATCH_SUBSCRIBE_DROPPED` pozostaje `0`, wiec smoke nie pokazal utraty BCV2 przez cap.
+- `BCV2_RPC_HYDRATION_READY` pozostaje `0`, a `BCV2_RPC_HYDRATION_MISSING` jest dodatni.
+- `BCV2_ACCOUNT_UPDATE_RECEIVED` jest dodatni jako globalny exact-watch marker, ale nie wolno go mieszac z working-builder readiness evidence.
+
+Uwaga licznikowa: powyzsze sa rows markerow z `system_log + oracle_log`; oba logi moga zawierac te same wpisy runtime, wiec traktujemy je jako evidence rows, nie jako unique pubkey count.
+
+Working-builder/readiness evidence:
+
+- `decision_rows_total`: `36`
+- `probe_selected_rows`: `21`
+- `observed_bcv2_rows`: `20`
+- `observed_bcv2_route_compatible_rows`: `20`
+- `working_builder_buy_variant_counts`: `{"routed_exact_sol_in": 20}`
+- `working_builder_manifest_contains_bcv2_rows`: `20`
+- `working_builder_manifest_ready_rows`: `0`
+- `working_builder_manifest_missing_required_rows`: `20`
+- `working_builder_bcv2_account_state_lookup_performed_rows`: `20`
+- `working_builder_bcv2_account_state_seen_rows`: `0`
+- `working_builder_bcv2_account_state_owner_rows`: `0`
+- `working_builder_bcv2_account_state_data_len_rows`: `0`
+- `working_builder_bcv2_rpc_fetch_ready_rows`: `0`
+- `working_builder_bcv2_rpc_fetch_missing_rows`: `20`
+- `working_builder_bcv2_account_update_received_rows`: `0`
+- `working_builder_bcv2_account_update_mapped_rows`: `0`
+- `working_builder_bcv2_subscription_requested_rows`: `0`
+- `successful_probe_entry_rows`: `0`
+- `active_shadow_successful_entry_rows`: `0`
+
+To potwierdza fail-closed readiness: observed tx meta nie odblokowalo manifest-ready bez realnego AccountState/MFS/DIAG/RPC-ready evidence.
+
+`working_builder_bcv2_subscription_requested_rows=0` jest polem decision/probe diagnostics i nie jest dowodem przeciw aktywnemu subscribe. Dowod aktywnego subscribe w X8AS pochodzi z runtime markerow `BCV2_EXACT_WATCH_SUBSCRIBE_INCLUDED` oraz `SUBSCRIBE_SENT`.
+
 ## X8AS Smoke Decision
 
-Code-level verdict: PASS.
+Werdykt code-level: PASS.
 
-Runtime X8AS verdict: PENDING.
+Werdykt X8AS exact-watch coverage: PASS-B z watchdog caveat.
 
-Nie uruchamiano nowego runtime smoke, R18, P2/live ani Sender path. Ten raport nie claimuje `PASS-A` ani `PASS-B`.
+Pelny PASS-A: NIEOSIAGNIETY.
 
-Warunki runtime:
+R18 nadal NO-GO.
 
-- `PASS-A`: BCV2 jest registered, included w aktywnym SubscribeRequest, hydration albo AccountUpdate daje real evidence, `working_builder_manifest_ready_rows > 0`, entries > 0, invarianty czyste.
-- `PASS-B`: BCV2 jest included w SubscribeRequest, ale AccountUpdate/hydration nadal nie daje ready evidence. Blocker przechodzi wtedy na provider/timing/layout albo true missing, nie registry/fingerprint.
-- `FAIL`: route-compatible observed BCV2 nie zmienia request shape, nie wymusza resubscribe, nie trafia do aktywnego SubscribeRequest, albo pojawia sie legacy/fallback/handoff pollution.
+Uzasadnienie:
+
+- PASS-A nie jest spelniony, bo `working_builder_manifest_ready_rows=0`, `successful_probe_entry_rows=0`, `active_shadow_successful_entry_rows=0`, `bcv2_rpc_hydration_ready_rows=0`, a runtime zakonczyl sie watchdogiem `exit=2`.
+- PASS-B coverage jest spelniony, bo route-compatible BCV2 zostalo registered, included w aktywnym SubscribeRequest i wymusilo resubscribe, ale AccountUpdate/hydration nie dostarczyly working-builder ready evidence.
+- To nie jest registry/fingerprint failure: aktywny request shape i BCV2 resubscribe sa udowodnione runtime markerami.
+- Nastepny blocker jest po stronie provider/transport stability, timing/layout albo true missing. Dodatkowy caveat to watchdog fatal po gRPC stall.
+- Ten smoke nie pokazal legacy/fallback/handoff/live pollution.
 
 ## Invarianty
 

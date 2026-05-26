@@ -91,7 +91,7 @@ entry_log_path = "../../logs/shadow_run/x8a/probe_entries.jsonl"
                 encoding="utf-8",
             )
             (root / "logs/rollout/x8a").mkdir(parents=True)
-            (root / "logs/rollout/x8a/system.log").write_text(
+            (root / "logs/rollout/x8a/system.log.2026-05-26").write_text(
                 "\n".join(
                     [
                         "BCV2_EXACT_WATCH_REGISTERED pubkey=bcv2",
