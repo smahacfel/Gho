@@ -61,10 +61,10 @@ use ghost_core::shadow_ledger::{
 use ghost_core::{
     coverage_audit, BaseMint, BondingCurveKey, CoverageAuditClosedWindow, CoverageAuditRecord,
     CoverageAuditTruthSignatureState, CurveFinality, ExecutionAccountEvidence,
-    ExecutionAccountEvidenceRecord, ExecutionAccountEvidenceStore, ExecutionAccountRole,
-    GatekeeperDecision as WalGatekeeperDecision, PoolId, PoolIdentity as DomainPoolIdentity,
-    PoolIdentityRegistry, UpsertExecutionAccountEvidenceOutcome,
-    UpsertExecutionAccountEvidenceResult, Wal, WalRecord,
+    ExecutionAccountEvidenceRecord, ExecutionAccountEvidenceStatus, ExecutionAccountEvidenceStore,
+    ExecutionAccountRole, GatekeeperDecision as WalGatekeeperDecision, PoolId,
+    PoolIdentity as DomainPoolIdentity, PoolIdentityRegistry,
+    UpsertExecutionAccountEvidenceOutcome, UpsertExecutionAccountEvidenceResult, Wal, WalRecord,
 };
 
 use crate::components::fallback_contract::{
@@ -5242,6 +5242,18 @@ struct P37ShadowProbeSelectionRecord {
     working_builder_bcv2_evidence_context_slot: Option<u64>,
     working_builder_bcv2_evidence_reason: Option<String>,
     working_builder_bcv2_evidence_conflict: Option<String>,
+    working_builder_bcv2_execution_evidence_status: Option<String>,
+    working_builder_bcv2_execution_evidence_source: Option<String>,
+    working_builder_bcv2_execution_evidence_ready: Option<bool>,
+    working_builder_bcv2_execution_evidence_reason: Option<String>,
+    working_builder_bcv2_execution_evidence_conflict: Option<String>,
+    working_builder_bcv2_execution_evidence_stale: Option<bool>,
+    working_builder_bcv2_execution_evidence_exact_pubkey_match: Option<bool>,
+    working_builder_bcv2_execution_evidence_age_ms: Option<u64>,
+    working_builder_bcv2_execution_evidence_owner: Option<String>,
+    working_builder_bcv2_execution_evidence_data_len: Option<u64>,
+    working_builder_bcv2_execution_evidence_slot: Option<u64>,
+    working_builder_bcv2_execution_evidence_context_slot: Option<u64>,
     working_builder_creator_vault_pubkey: Option<String>,
     working_builder_creator_vault_source_authority: Option<String>,
     working_builder_creator_vault_rpc_load_status: Option<String>,
@@ -5450,6 +5462,18 @@ struct P37ShadowProbeTransportRecord {
     working_builder_bcv2_evidence_context_slot: Option<u64>,
     working_builder_bcv2_evidence_reason: Option<String>,
     working_builder_bcv2_evidence_conflict: Option<String>,
+    working_builder_bcv2_execution_evidence_status: Option<String>,
+    working_builder_bcv2_execution_evidence_source: Option<String>,
+    working_builder_bcv2_execution_evidence_ready: Option<bool>,
+    working_builder_bcv2_execution_evidence_reason: Option<String>,
+    working_builder_bcv2_execution_evidence_conflict: Option<String>,
+    working_builder_bcv2_execution_evidence_stale: Option<bool>,
+    working_builder_bcv2_execution_evidence_exact_pubkey_match: Option<bool>,
+    working_builder_bcv2_execution_evidence_age_ms: Option<u64>,
+    working_builder_bcv2_execution_evidence_owner: Option<String>,
+    working_builder_bcv2_execution_evidence_data_len: Option<u64>,
+    working_builder_bcv2_execution_evidence_slot: Option<u64>,
+    working_builder_bcv2_execution_evidence_context_slot: Option<u64>,
     working_builder_creator_vault_pubkey: Option<String>,
     working_builder_creator_vault_source_authority: Option<String>,
     working_builder_creator_vault_rpc_load_status: Option<String>,
@@ -5957,6 +5981,18 @@ fn p37_shadow_probe_selection_record(
         working_builder_bcv2_evidence_context_slot: None,
         working_builder_bcv2_evidence_reason: None,
         working_builder_bcv2_evidence_conflict: None,
+        working_builder_bcv2_execution_evidence_status: None,
+        working_builder_bcv2_execution_evidence_source: None,
+        working_builder_bcv2_execution_evidence_ready: None,
+        working_builder_bcv2_execution_evidence_reason: None,
+        working_builder_bcv2_execution_evidence_conflict: None,
+        working_builder_bcv2_execution_evidence_stale: None,
+        working_builder_bcv2_execution_evidence_exact_pubkey_match: None,
+        working_builder_bcv2_execution_evidence_age_ms: None,
+        working_builder_bcv2_execution_evidence_owner: None,
+        working_builder_bcv2_execution_evidence_data_len: None,
+        working_builder_bcv2_execution_evidence_slot: None,
+        working_builder_bcv2_execution_evidence_context_slot: None,
         working_builder_creator_vault_pubkey: None,
         working_builder_creator_vault_source_authority: None,
         working_builder_creator_vault_rpc_load_status: None,
@@ -6271,6 +6307,35 @@ fn p37_shadow_probe_artifact_records(
         working_builder_bcv2_evidence_conflict: record
             .working_builder_bcv2_evidence_conflict
             .clone(),
+        working_builder_bcv2_execution_evidence_status: record
+            .working_builder_bcv2_execution_evidence_status
+            .clone(),
+        working_builder_bcv2_execution_evidence_source: record
+            .working_builder_bcv2_execution_evidence_source
+            .clone(),
+        working_builder_bcv2_execution_evidence_ready: record
+            .working_builder_bcv2_execution_evidence_ready,
+        working_builder_bcv2_execution_evidence_reason: record
+            .working_builder_bcv2_execution_evidence_reason
+            .clone(),
+        working_builder_bcv2_execution_evidence_conflict: record
+            .working_builder_bcv2_execution_evidence_conflict
+            .clone(),
+        working_builder_bcv2_execution_evidence_stale: record
+            .working_builder_bcv2_execution_evidence_stale,
+        working_builder_bcv2_execution_evidence_exact_pubkey_match: record
+            .working_builder_bcv2_execution_evidence_exact_pubkey_match,
+        working_builder_bcv2_execution_evidence_age_ms: record
+            .working_builder_bcv2_execution_evidence_age_ms,
+        working_builder_bcv2_execution_evidence_owner: record
+            .working_builder_bcv2_execution_evidence_owner
+            .clone(),
+        working_builder_bcv2_execution_evidence_data_len: record
+            .working_builder_bcv2_execution_evidence_data_len,
+        working_builder_bcv2_execution_evidence_slot: record
+            .working_builder_bcv2_execution_evidence_slot,
+        working_builder_bcv2_execution_evidence_context_slot: record
+            .working_builder_bcv2_execution_evidence_context_slot,
         working_builder_creator_vault_pubkey: record.working_builder_creator_vault_pubkey.clone(),
         working_builder_creator_vault_source_authority: record
             .working_builder_creator_vault_source_authority
@@ -6550,6 +6615,35 @@ fn p37_shadow_probe_artifact_records(
         working_builder_bcv2_local_coverage_class: record
             .working_builder_bcv2_local_coverage_class
             .clone(),
+        working_builder_bcv2_execution_evidence_status: record
+            .working_builder_bcv2_execution_evidence_status
+            .clone(),
+        working_builder_bcv2_execution_evidence_source: record
+            .working_builder_bcv2_execution_evidence_source
+            .clone(),
+        working_builder_bcv2_execution_evidence_ready: record
+            .working_builder_bcv2_execution_evidence_ready,
+        working_builder_bcv2_execution_evidence_reason: record
+            .working_builder_bcv2_execution_evidence_reason
+            .clone(),
+        working_builder_bcv2_execution_evidence_conflict: record
+            .working_builder_bcv2_execution_evidence_conflict
+            .clone(),
+        working_builder_bcv2_execution_evidence_stale: record
+            .working_builder_bcv2_execution_evidence_stale,
+        working_builder_bcv2_execution_evidence_exact_pubkey_match: record
+            .working_builder_bcv2_execution_evidence_exact_pubkey_match,
+        working_builder_bcv2_execution_evidence_age_ms: record
+            .working_builder_bcv2_execution_evidence_age_ms,
+        working_builder_bcv2_execution_evidence_owner: record
+            .working_builder_bcv2_execution_evidence_owner
+            .clone(),
+        working_builder_bcv2_execution_evidence_data_len: record
+            .working_builder_bcv2_execution_evidence_data_len,
+        working_builder_bcv2_execution_evidence_slot: record
+            .working_builder_bcv2_execution_evidence_slot,
+        working_builder_bcv2_execution_evidence_context_slot: record
+            .working_builder_bcv2_execution_evidence_context_slot,
         working_builder_creator_vault_pubkey: record.working_builder_creator_vault_pubkey.clone(),
         working_builder_creator_vault_source_authority: record
             .working_builder_creator_vault_source_authority
@@ -7140,6 +7234,7 @@ const P37_LEGACY_BUY_FALLBACK_SUPPORT_STATUS: &str = "unsupported_builder_layout
 const P37_LEGACY_BUY_UNSUPPORTED_ROUTE_REASON: &str =
     "legacy_buy_unsupported_builder_layout_requires_bcv2";
 const P37_EXECUTION_BUILDER_MODE_WORKING_BUILDER_PARITY: &str = "working_builder_parity";
+const P37_DEFAULT_EXECUTION_ACCOUNT_EVIDENCE_FRESHNESS_MS: u64 = 10_000;
 
 fn p37_working_builder_parity_enabled(config: &P37ShadowProbeConfig) -> bool {
     config.enabled
@@ -8256,6 +8351,18 @@ struct P37ShadowProbeExecutionDiagnostics {
     working_builder_bcv2_evidence_context_slot: Option<u64>,
     working_builder_bcv2_evidence_reason: Option<String>,
     working_builder_bcv2_evidence_conflict: Option<String>,
+    working_builder_bcv2_execution_evidence_status: Option<String>,
+    working_builder_bcv2_execution_evidence_source: Option<String>,
+    working_builder_bcv2_execution_evidence_ready: Option<bool>,
+    working_builder_bcv2_execution_evidence_reason: Option<String>,
+    working_builder_bcv2_execution_evidence_conflict: Option<String>,
+    working_builder_bcv2_execution_evidence_stale: Option<bool>,
+    working_builder_bcv2_execution_evidence_exact_pubkey_match: Option<bool>,
+    working_builder_bcv2_execution_evidence_age_ms: Option<u64>,
+    working_builder_bcv2_execution_evidence_owner: Option<String>,
+    working_builder_bcv2_execution_evidence_data_len: Option<u64>,
+    working_builder_bcv2_execution_evidence_slot: Option<u64>,
+    working_builder_bcv2_execution_evidence_context_slot: Option<u64>,
     working_builder_creator_vault_pubkey: Option<String>,
     working_builder_creator_vault_source_authority: Option<String>,
     working_builder_creator_vault_rpc_load_status: Option<String>,
@@ -9277,6 +9384,18 @@ struct P37WorkingBuilderParityDiagnostics {
     bcv2_evidence_context_slot: Option<u64>,
     bcv2_evidence_reason: Option<String>,
     bcv2_evidence_conflict: Option<String>,
+    bcv2_execution_evidence_status: Option<String>,
+    bcv2_execution_evidence_source: Option<String>,
+    bcv2_execution_evidence_ready: Option<bool>,
+    bcv2_execution_evidence_reason: Option<String>,
+    bcv2_execution_evidence_conflict: Option<String>,
+    bcv2_execution_evidence_stale: Option<bool>,
+    bcv2_execution_evidence_exact_pubkey_match: Option<bool>,
+    bcv2_execution_evidence_age_ms: Option<u64>,
+    bcv2_execution_evidence_owner: Option<String>,
+    bcv2_execution_evidence_data_len: Option<u64>,
+    bcv2_execution_evidence_slot: Option<u64>,
+    bcv2_execution_evidence_context_slot: Option<u64>,
     creator_vault_pubkey: Option<String>,
     creator_vault_source_authority: Option<String>,
     creator_vault_rpc_load_status: Option<String>,
@@ -9756,6 +9875,185 @@ fn p37_working_builder_bcv2_materialization_diagnostics(
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct P37WorkingBuilderBcv2ExecutionEvidenceReadiness {
+    status: Option<String>,
+    source: Option<String>,
+    ready: Option<bool>,
+    reason: Option<String>,
+    conflict: Option<String>,
+    stale: Option<bool>,
+    exact_pubkey_match: Option<bool>,
+    age_ms: Option<u64>,
+    owner: Option<String>,
+    data_len: Option<u64>,
+    slot: Option<u64>,
+    context_slot: Option<u64>,
+}
+
+fn p37_bcv2_execution_load_positive(
+    record: &ExecutionAccountEvidenceRecord,
+) -> Option<&ExecutionAccountEvidence> {
+    record.best_positive.as_ref().filter(|evidence| {
+        matches!(
+            evidence.status,
+            ExecutionAccountEvidenceStatus::RpcReady
+                | ExecutionAccountEvidenceStatus::PrecheckReady
+        )
+    })
+}
+
+fn p37_bcv2_execution_evidence_payload_source<'a>(
+    record: &'a ExecutionAccountEvidenceRecord,
+    positive: Option<&'a ExecutionAccountEvidence>,
+) -> &'a ExecutionAccountEvidence {
+    positive
+        .or_else(|| {
+            record.best_positive.as_ref().filter(|evidence| {
+                evidence.owner.is_some()
+                    || evidence.data_len.is_some()
+                    || evidence.slot.is_some()
+                    || evidence.context_slot.is_some()
+            })
+        })
+        .or(record.best_positive.as_ref())
+        .unwrap_or(&record.latest)
+}
+
+fn p37_bcv2_execution_evidence_blocking_negative<'a>(
+    record: &'a ExecutionAccountEvidenceRecord,
+    positive: &ExecutionAccountEvidence,
+) -> Option<&'a ExecutionAccountEvidence> {
+    record.latest_negative.as_ref().filter(|negative| {
+        negative.status.is_missing_or_negative()
+            && negative.received_at_ms >= positive.received_at_ms
+    })
+}
+
+fn p37_bcv2_execution_evidence_reason_for_latest(
+    record: &ExecutionAccountEvidenceRecord,
+) -> String {
+    if record.latest.status == ExecutionAccountEvidenceStatus::AccountUpdateReceived {
+        return "account_update_received_not_execution_load_ready".to_string();
+    }
+    if record.latest.status.is_missing_or_negative() {
+        return record
+            .latest
+            .reason
+            .clone()
+            .unwrap_or_else(|| format!("negative_evidence:{}", record.latest.status.as_str()));
+    }
+    format!("not_execution_load_ready:{}", record.latest.status.as_str())
+}
+
+fn p37_working_builder_bcv2_execution_evidence_readiness(
+    builder_bcv2_pubkey: Option<&str>,
+    evidence_store: Option<&ExecutionAccountEvidenceStore>,
+    freshness_ms: u64,
+    now_ms: u64,
+) -> P37WorkingBuilderBcv2ExecutionEvidenceReadiness {
+    let Some(builder_bcv2_pubkey) = builder_bcv2_pubkey.filter(|value| !value.trim().is_empty())
+    else {
+        return P37WorkingBuilderBcv2ExecutionEvidenceReadiness {
+            ready: Some(false),
+            reason: Some("missing_working_builder_bcv2_pubkey".to_string()),
+            exact_pubkey_match: Some(false),
+            ..Default::default()
+        };
+    };
+    let Ok(pubkey) = Pubkey::from_str(builder_bcv2_pubkey) else {
+        return P37WorkingBuilderBcv2ExecutionEvidenceReadiness {
+            ready: Some(false),
+            reason: Some("invalid_working_builder_bcv2_pubkey".to_string()),
+            exact_pubkey_match: Some(false),
+            ..Default::default()
+        };
+    };
+    let Some(evidence_store) = evidence_store else {
+        return P37WorkingBuilderBcv2ExecutionEvidenceReadiness::default();
+    };
+    let Some(record) = evidence_store.get(ExecutionAccountRole::BondingCurveV2, &pubkey) else {
+        return P37WorkingBuilderBcv2ExecutionEvidenceReadiness {
+            ready: Some(false),
+            reason: Some("execution_evidence_missing".to_string()),
+            exact_pubkey_match: Some(false),
+            ..Default::default()
+        };
+    };
+
+    let positive = p37_bcv2_execution_load_positive(&record);
+    let payload = p37_bcv2_execution_evidence_payload_source(&record, positive);
+    let status = Some(record.latest.status.as_str().to_string());
+    let source = Some(record.latest.source.as_str().to_string());
+    let conflict = record
+        .conflict
+        .as_ref()
+        .map(|conflict| conflict.reason.clone());
+    let owner = payload.owner.map(|owner| owner.to_string());
+    let data_len = payload.data_len;
+    let slot = payload.slot;
+    let context_slot = payload.context_slot;
+
+    let Some(positive) = positive else {
+        return P37WorkingBuilderBcv2ExecutionEvidenceReadiness {
+            status,
+            source,
+            ready: Some(false),
+            reason: Some(p37_bcv2_execution_evidence_reason_for_latest(&record)),
+            conflict,
+            stale: Some(false),
+            exact_pubkey_match: Some(true),
+            age_ms: record
+                .latest
+                .received_at_ms
+                .checked_sub(0)
+                .map(|received_at_ms| now_ms.saturating_sub(received_at_ms)),
+            owner,
+            data_len,
+            slot,
+            context_slot,
+        };
+    };
+
+    let age_ms =
+        (positive.received_at_ms > 0).then(|| now_ms.saturating_sub(positive.received_at_ms));
+    let stale = match age_ms {
+        Some(age_ms) => freshness_ms == 0 || age_ms > freshness_ms,
+        None => true,
+    };
+    let mut reason = None;
+    if positive.owner.is_none() {
+        reason = Some("execution_evidence_owner_missing".to_string());
+    } else if positive.data_len.is_none() {
+        reason = Some("execution_evidence_data_len_missing".to_string());
+    } else if positive.received_at_ms == 0 {
+        reason = Some("execution_evidence_received_at_missing".to_string());
+    } else if stale {
+        reason = Some("execution_evidence_stale".to_string());
+    } else if let Some(negative) = p37_bcv2_execution_evidence_blocking_negative(&record, positive)
+    {
+        reason = Some(format!(
+            "newer_negative_evidence:{}",
+            negative.status.as_str()
+        ));
+    }
+
+    P37WorkingBuilderBcv2ExecutionEvidenceReadiness {
+        status,
+        source,
+        ready: Some(reason.is_none()),
+        reason: Some(reason.unwrap_or_else(|| "execution_evidence_ready".to_string())),
+        conflict,
+        stale: Some(stale),
+        exact_pubkey_match: Some(true),
+        age_ms,
+        owner,
+        data_len,
+        slot,
+        context_slot,
+    }
+}
+
 fn p37_working_builder_creator_vault_source_authority(
     request: &crate::components::trigger::PreparedBuyRequest,
 ) -> Option<String> {
@@ -9874,6 +10172,24 @@ fn p37_working_builder_parity_diagnostics_with_evidence_store(
     account_set_diagnostics: Option<&P37ShadowProbeAccountSetDiagnostics>,
     enabled: bool,
     evidence_store: Option<&ExecutionAccountEvidenceStore>,
+) -> P37WorkingBuilderParityDiagnostics {
+    p37_working_builder_parity_diagnostics_with_execution_evidence_config(
+        request,
+        account_set_diagnostics,
+        enabled,
+        evidence_store,
+        P37_DEFAULT_EXECUTION_ACCOUNT_EVIDENCE_FRESHNESS_MS,
+        current_time_ms(),
+    )
+}
+
+fn p37_working_builder_parity_diagnostics_with_execution_evidence_config(
+    request: Option<&crate::components::trigger::PreparedBuyRequest>,
+    account_set_diagnostics: Option<&P37ShadowProbeAccountSetDiagnostics>,
+    enabled: bool,
+    evidence_store: Option<&ExecutionAccountEvidenceStore>,
+    evidence_freshness_ms: u64,
+    now_ms: u64,
 ) -> P37WorkingBuilderParityDiagnostics {
     if !enabled {
         return P37WorkingBuilderParityDiagnostics::default();
@@ -10006,6 +10322,12 @@ fn p37_working_builder_parity_diagnostics_with_evidence_store(
             .get(ExecutionAccountRole::BondingCurveV2, &pubkey)
             .map(|record| bcv2_evidence_status_from_record(&record))
     });
+    let bcv2_execution_evidence = p37_working_builder_bcv2_execution_evidence_readiness(
+        bcv2_builder_pubkey.as_deref(),
+        evidence_store,
+        evidence_freshness_ms,
+        now_ms,
+    );
     P37WorkingBuilderParityDiagnostics {
         mode: Some(P37_EXECUTION_BUILDER_MODE_WORKING_BUILDER_PARITY.to_string()),
         request_built: Some(request_built),
@@ -10084,6 +10406,18 @@ fn p37_working_builder_parity_diagnostics_with_evidence_store(
         bcv2_evidence_conflict: bcv2_evidence
             .as_ref()
             .and_then(|status| status.conflict.clone()),
+        bcv2_execution_evidence_status: bcv2_execution_evidence.status,
+        bcv2_execution_evidence_source: bcv2_execution_evidence.source,
+        bcv2_execution_evidence_ready: bcv2_execution_evidence.ready,
+        bcv2_execution_evidence_reason: bcv2_execution_evidence.reason,
+        bcv2_execution_evidence_conflict: bcv2_execution_evidence.conflict,
+        bcv2_execution_evidence_stale: bcv2_execution_evidence.stale,
+        bcv2_execution_evidence_exact_pubkey_match: bcv2_execution_evidence.exact_pubkey_match,
+        bcv2_execution_evidence_age_ms: bcv2_execution_evidence.age_ms,
+        bcv2_execution_evidence_owner: bcv2_execution_evidence.owner,
+        bcv2_execution_evidence_data_len: bcv2_execution_evidence.data_len,
+        bcv2_execution_evidence_slot: bcv2_execution_evidence.slot,
+        bcv2_execution_evidence_context_slot: bcv2_execution_evidence.context_slot,
         creator_vault_pubkey: creator_vault_readiness.pubkey,
         creator_vault_source_authority: creator_vault_readiness.source_authority,
         creator_vault_rpc_load_status: creator_vault_readiness.rpc_load_status,
@@ -10168,6 +10502,29 @@ fn p37_apply_working_builder_parity_to_record(
     record.working_builder_bcv2_evidence_context_slot = diagnostics.bcv2_evidence_context_slot;
     record.working_builder_bcv2_evidence_reason = diagnostics.bcv2_evidence_reason;
     record.working_builder_bcv2_evidence_conflict = diagnostics.bcv2_evidence_conflict;
+    record.working_builder_bcv2_execution_evidence_status =
+        diagnostics.bcv2_execution_evidence_status;
+    record.working_builder_bcv2_execution_evidence_source =
+        diagnostics.bcv2_execution_evidence_source;
+    record.working_builder_bcv2_execution_evidence_ready =
+        diagnostics.bcv2_execution_evidence_ready;
+    record.working_builder_bcv2_execution_evidence_reason =
+        diagnostics.bcv2_execution_evidence_reason;
+    record.working_builder_bcv2_execution_evidence_conflict =
+        diagnostics.bcv2_execution_evidence_conflict;
+    record.working_builder_bcv2_execution_evidence_stale =
+        diagnostics.bcv2_execution_evidence_stale;
+    record.working_builder_bcv2_execution_evidence_exact_pubkey_match =
+        diagnostics.bcv2_execution_evidence_exact_pubkey_match;
+    record.working_builder_bcv2_execution_evidence_age_ms =
+        diagnostics.bcv2_execution_evidence_age_ms;
+    record.working_builder_bcv2_execution_evidence_owner =
+        diagnostics.bcv2_execution_evidence_owner;
+    record.working_builder_bcv2_execution_evidence_data_len =
+        diagnostics.bcv2_execution_evidence_data_len;
+    record.working_builder_bcv2_execution_evidence_slot = diagnostics.bcv2_execution_evidence_slot;
+    record.working_builder_bcv2_execution_evidence_context_slot =
+        diagnostics.bcv2_execution_evidence_context_slot;
     record.working_builder_creator_vault_pubkey = diagnostics.creator_vault_pubkey;
     record.working_builder_creator_vault_source_authority =
         diagnostics.creator_vault_source_authority;
@@ -10190,6 +10547,22 @@ fn p37_apply_working_builder_parity_to_record(
 fn p37_working_builder_final_manifest_failure_reason(
     request: &crate::components::trigger::PreparedBuyRequest,
     diagnostics: &P37ShadowProbeAccountSetDiagnostics,
+) -> Option<String> {
+    p37_working_builder_final_manifest_failure_reason_with_execution_evidence(
+        request,
+        diagnostics,
+        None,
+        P37_DEFAULT_EXECUTION_ACCOUNT_EVIDENCE_FRESHNESS_MS,
+        current_time_ms(),
+    )
+}
+
+fn p37_working_builder_final_manifest_failure_reason_with_execution_evidence(
+    request: &crate::components::trigger::PreparedBuyRequest,
+    diagnostics: &P37ShadowProbeAccountSetDiagnostics,
+    evidence_store: Option<&ExecutionAccountEvidenceStore>,
+    evidence_freshness_ms: u64,
+    now_ms: u64,
 ) -> Option<String> {
     let creator_vault = p37_working_builder_creator_vault_readiness(request, Some(diagnostics));
     if !p37_working_builder_creator_vault_is_authoritative(
@@ -10241,7 +10614,24 @@ fn p37_working_builder_final_manifest_failure_reason(
                     .unwrap_or("bonding_curve_v2_source_not_authoritative")
             ));
         }
-        if bcv2.rpc_load_ready == Some(false)
+        if let Some(evidence_store) = evidence_store {
+            let pubkey = bcv2.pubkey.as_deref().unwrap_or("missing_bonding_curve_v2");
+            let execution_evidence = p37_working_builder_bcv2_execution_evidence_readiness(
+                Some(pubkey),
+                Some(evidence_store),
+                evidence_freshness_ms,
+                now_ms,
+            );
+            if execution_evidence.ready != Some(true) {
+                return Some(format!(
+                    "working_builder_final_manifest_execution_evidence_not_ready:bonding_curve_v2:{pubkey}:{}",
+                    execution_evidence
+                        .reason
+                        .as_deref()
+                        .unwrap_or("execution_evidence_not_ready")
+                ));
+            }
+        } else if bcv2.rpc_load_ready == Some(false)
             && bcv2.rpc_load_status.as_deref() != Some("missing_on_rpc_precheck")
         {
             let pubkey = bcv2.pubkey.as_deref().unwrap_or("missing_bonding_curve_v2");
@@ -10269,6 +10659,9 @@ fn p37_shadow_probe_parse_working_builder_final_manifest_account_reason(
         .strip_prefix("working_builder_final_manifest_missing_required_account:")
         .or_else(|| {
             reason.strip_prefix("working_builder_final_manifest_account_source_not_authoritative:")
+        })
+        .or_else(|| {
+            reason.strip_prefix("working_builder_final_manifest_execution_evidence_not_ready:")
         })?;
     let mut parts = tail.split(':');
     let role = parts.next()?.trim();
@@ -10643,6 +11036,7 @@ fn active_shadow_account_diagnostics_from_account_set_with_mode(
             || message.starts_with("working_builder_final_manifest_missing_required_account:")
             || message
                 .starts_with("working_builder_final_manifest_account_source_not_authoritative:")
+            || message.starts_with("working_builder_final_manifest_execution_evidence_not_ready:")
         {
             Some(message.to_string())
         } else {
@@ -11011,6 +11405,29 @@ fn active_shadow_account_diagnostics_from_account_set_with_mode(
         working_builder_bcv2_evidence_context_slot: working_builder.bcv2_evidence_context_slot,
         working_builder_bcv2_evidence_reason: working_builder.bcv2_evidence_reason,
         working_builder_bcv2_evidence_conflict: working_builder.bcv2_evidence_conflict,
+        working_builder_bcv2_execution_evidence_status: working_builder
+            .bcv2_execution_evidence_status,
+        working_builder_bcv2_execution_evidence_source: working_builder
+            .bcv2_execution_evidence_source,
+        working_builder_bcv2_execution_evidence_ready: working_builder
+            .bcv2_execution_evidence_ready,
+        working_builder_bcv2_execution_evidence_reason: working_builder
+            .bcv2_execution_evidence_reason,
+        working_builder_bcv2_execution_evidence_conflict: working_builder
+            .bcv2_execution_evidence_conflict,
+        working_builder_bcv2_execution_evidence_stale: working_builder
+            .bcv2_execution_evidence_stale,
+        working_builder_bcv2_execution_evidence_exact_pubkey_match: working_builder
+            .bcv2_execution_evidence_exact_pubkey_match,
+        working_builder_bcv2_execution_evidence_age_ms: working_builder
+            .bcv2_execution_evidence_age_ms,
+        working_builder_bcv2_execution_evidence_owner: working_builder
+            .bcv2_execution_evidence_owner,
+        working_builder_bcv2_execution_evidence_data_len: working_builder
+            .bcv2_execution_evidence_data_len,
+        working_builder_bcv2_execution_evidence_slot: working_builder.bcv2_execution_evidence_slot,
+        working_builder_bcv2_execution_evidence_context_slot: working_builder
+            .bcv2_execution_evidence_context_slot,
         working_builder_creator_vault_pubkey: working_builder.creator_vault_pubkey,
         working_builder_creator_vault_source_authority: working_builder
             .creator_vault_source_authority,
@@ -12252,6 +12669,58 @@ fn p37_shadow_probe_execution_diagnostics(
         working_builder_bcv2_evidence_conflict: working_builder
             .bcv2_evidence_conflict
             .or_else(|| record.working_builder_bcv2_evidence_conflict.clone()),
+        working_builder_bcv2_execution_evidence_status: working_builder
+            .bcv2_execution_evidence_status
+            .or_else(|| {
+                record
+                    .working_builder_bcv2_execution_evidence_status
+                    .clone()
+            }),
+        working_builder_bcv2_execution_evidence_source: working_builder
+            .bcv2_execution_evidence_source
+            .or_else(|| {
+                record
+                    .working_builder_bcv2_execution_evidence_source
+                    .clone()
+            }),
+        working_builder_bcv2_execution_evidence_ready: working_builder
+            .bcv2_execution_evidence_ready
+            .or(record.working_builder_bcv2_execution_evidence_ready),
+        working_builder_bcv2_execution_evidence_reason: working_builder
+            .bcv2_execution_evidence_reason
+            .or_else(|| {
+                record
+                    .working_builder_bcv2_execution_evidence_reason
+                    .clone()
+            }),
+        working_builder_bcv2_execution_evidence_conflict: working_builder
+            .bcv2_execution_evidence_conflict
+            .or_else(|| {
+                record
+                    .working_builder_bcv2_execution_evidence_conflict
+                    .clone()
+            }),
+        working_builder_bcv2_execution_evidence_stale: working_builder
+            .bcv2_execution_evidence_stale
+            .or(record.working_builder_bcv2_execution_evidence_stale),
+        working_builder_bcv2_execution_evidence_exact_pubkey_match: working_builder
+            .bcv2_execution_evidence_exact_pubkey_match
+            .or(record.working_builder_bcv2_execution_evidence_exact_pubkey_match),
+        working_builder_bcv2_execution_evidence_age_ms: working_builder
+            .bcv2_execution_evidence_age_ms
+            .or(record.working_builder_bcv2_execution_evidence_age_ms),
+        working_builder_bcv2_execution_evidence_owner: working_builder
+            .bcv2_execution_evidence_owner
+            .or_else(|| record.working_builder_bcv2_execution_evidence_owner.clone()),
+        working_builder_bcv2_execution_evidence_data_len: working_builder
+            .bcv2_execution_evidence_data_len
+            .or(record.working_builder_bcv2_execution_evidence_data_len),
+        working_builder_bcv2_execution_evidence_slot: working_builder
+            .bcv2_execution_evidence_slot
+            .or(record.working_builder_bcv2_execution_evidence_slot),
+        working_builder_bcv2_execution_evidence_context_slot: working_builder
+            .bcv2_execution_evidence_context_slot
+            .or(record.working_builder_bcv2_execution_evidence_context_slot),
         working_builder_creator_vault_pubkey: working_builder.creator_vault_pubkey,
         working_builder_creator_vault_source_authority: working_builder
             .creator_vault_source_authority,
@@ -12645,6 +13114,30 @@ fn p37_shadow_probe_transport_from_event(
             .working_builder_bcv2_evidence_context_slot,
         working_builder_bcv2_evidence_reason: diagnostics.working_builder_bcv2_evidence_reason,
         working_builder_bcv2_evidence_conflict: diagnostics.working_builder_bcv2_evidence_conflict,
+        working_builder_bcv2_execution_evidence_status: diagnostics
+            .working_builder_bcv2_execution_evidence_status,
+        working_builder_bcv2_execution_evidence_source: diagnostics
+            .working_builder_bcv2_execution_evidence_source,
+        working_builder_bcv2_execution_evidence_ready: diagnostics
+            .working_builder_bcv2_execution_evidence_ready,
+        working_builder_bcv2_execution_evidence_reason: diagnostics
+            .working_builder_bcv2_execution_evidence_reason,
+        working_builder_bcv2_execution_evidence_conflict: diagnostics
+            .working_builder_bcv2_execution_evidence_conflict,
+        working_builder_bcv2_execution_evidence_stale: diagnostics
+            .working_builder_bcv2_execution_evidence_stale,
+        working_builder_bcv2_execution_evidence_exact_pubkey_match: diagnostics
+            .working_builder_bcv2_execution_evidence_exact_pubkey_match,
+        working_builder_bcv2_execution_evidence_age_ms: diagnostics
+            .working_builder_bcv2_execution_evidence_age_ms,
+        working_builder_bcv2_execution_evidence_owner: diagnostics
+            .working_builder_bcv2_execution_evidence_owner,
+        working_builder_bcv2_execution_evidence_data_len: diagnostics
+            .working_builder_bcv2_execution_evidence_data_len,
+        working_builder_bcv2_execution_evidence_slot: diagnostics
+            .working_builder_bcv2_execution_evidence_slot,
+        working_builder_bcv2_execution_evidence_context_slot: diagnostics
+            .working_builder_bcv2_execution_evidence_context_slot,
         working_builder_creator_vault_pubkey: diagnostics.working_builder_creator_vault_pubkey,
         working_builder_creator_vault_source_authority: diagnostics
             .working_builder_creator_vault_source_authority,
@@ -12992,6 +13485,30 @@ fn p37_shadow_probe_transport_from_error(
             .working_builder_bcv2_evidence_context_slot,
         working_builder_bcv2_evidence_reason: diagnostics.working_builder_bcv2_evidence_reason,
         working_builder_bcv2_evidence_conflict: diagnostics.working_builder_bcv2_evidence_conflict,
+        working_builder_bcv2_execution_evidence_status: diagnostics
+            .working_builder_bcv2_execution_evidence_status,
+        working_builder_bcv2_execution_evidence_source: diagnostics
+            .working_builder_bcv2_execution_evidence_source,
+        working_builder_bcv2_execution_evidence_ready: diagnostics
+            .working_builder_bcv2_execution_evidence_ready,
+        working_builder_bcv2_execution_evidence_reason: diagnostics
+            .working_builder_bcv2_execution_evidence_reason,
+        working_builder_bcv2_execution_evidence_conflict: diagnostics
+            .working_builder_bcv2_execution_evidence_conflict,
+        working_builder_bcv2_execution_evidence_stale: diagnostics
+            .working_builder_bcv2_execution_evidence_stale,
+        working_builder_bcv2_execution_evidence_exact_pubkey_match: diagnostics
+            .working_builder_bcv2_execution_evidence_exact_pubkey_match,
+        working_builder_bcv2_execution_evidence_age_ms: diagnostics
+            .working_builder_bcv2_execution_evidence_age_ms,
+        working_builder_bcv2_execution_evidence_owner: diagnostics
+            .working_builder_bcv2_execution_evidence_owner,
+        working_builder_bcv2_execution_evidence_data_len: diagnostics
+            .working_builder_bcv2_execution_evidence_data_len,
+        working_builder_bcv2_execution_evidence_slot: diagnostics
+            .working_builder_bcv2_execution_evidence_slot,
+        working_builder_bcv2_execution_evidence_context_slot: diagnostics
+            .working_builder_bcv2_execution_evidence_context_slot,
         working_builder_creator_vault_pubkey: diagnostics.working_builder_creator_vault_pubkey,
         working_builder_creator_vault_source_authority: diagnostics
             .working_builder_creator_vault_source_authority,
@@ -13296,6 +13813,35 @@ fn enrich_probe_shadow_entry(
         transport.working_builder_bcv2_diag_seen_reason.clone();
     entry.working_builder_bcv2_local_coverage_class =
         transport.working_builder_bcv2_local_coverage_class.clone();
+    entry.working_builder_bcv2_execution_evidence_status = transport
+        .working_builder_bcv2_execution_evidence_status
+        .clone();
+    entry.working_builder_bcv2_execution_evidence_source = transport
+        .working_builder_bcv2_execution_evidence_source
+        .clone();
+    entry.working_builder_bcv2_execution_evidence_ready =
+        transport.working_builder_bcv2_execution_evidence_ready;
+    entry.working_builder_bcv2_execution_evidence_reason = transport
+        .working_builder_bcv2_execution_evidence_reason
+        .clone();
+    entry.working_builder_bcv2_execution_evidence_conflict = transport
+        .working_builder_bcv2_execution_evidence_conflict
+        .clone();
+    entry.working_builder_bcv2_execution_evidence_stale =
+        transport.working_builder_bcv2_execution_evidence_stale;
+    entry.working_builder_bcv2_execution_evidence_exact_pubkey_match =
+        transport.working_builder_bcv2_execution_evidence_exact_pubkey_match;
+    entry.working_builder_bcv2_execution_evidence_age_ms =
+        transport.working_builder_bcv2_execution_evidence_age_ms;
+    entry.working_builder_bcv2_execution_evidence_owner = transport
+        .working_builder_bcv2_execution_evidence_owner
+        .clone();
+    entry.working_builder_bcv2_execution_evidence_data_len =
+        transport.working_builder_bcv2_execution_evidence_data_len;
+    entry.working_builder_bcv2_execution_evidence_slot =
+        transport.working_builder_bcv2_execution_evidence_slot;
+    entry.working_builder_bcv2_execution_evidence_context_slot =
+        transport.working_builder_bcv2_execution_evidence_context_slot;
     entry.working_builder_creator_vault_pubkey =
         transport.working_builder_creator_vault_pubkey.clone();
     entry.working_builder_creator_vault_source_authority = transport
@@ -13471,11 +14017,13 @@ async fn run_p37_shadow_probe_dispatch(
         p37_shadow_probe_account_set_diagnostics(&trigger_component, &request).await;
     if working_builder_parity_mode {
         let evidence_store = oracle_runtime.execution_account_evidence_store();
-        let working_builder = p37_working_builder_parity_diagnostics_with_evidence_store(
+        let working_builder = p37_working_builder_parity_diagnostics_with_execution_evidence_config(
             Some(&request),
             Some(&final_manifest_diagnostics),
             true,
             Some(evidence_store.as_ref()),
+            config.execution_account_evidence_freshness_ms,
+            current_time_ms(),
         );
         p37_apply_working_builder_parity_to_record(&mut record, working_builder);
     }
@@ -13512,7 +14060,14 @@ async fn run_p37_shadow_probe_dispatch(
     }
 
     let final_manifest_failure_reason = if working_builder_parity_mode {
-        p37_working_builder_final_manifest_failure_reason(&request, &final_manifest_diagnostics)
+        let evidence_store = oracle_runtime.execution_account_evidence_store();
+        p37_working_builder_final_manifest_failure_reason_with_execution_evidence(
+            &request,
+            &final_manifest_diagnostics,
+            Some(evidence_store.as_ref()),
+            config.execution_account_evidence_freshness_ms,
+            current_time_ms(),
+        )
     } else {
         p37_selected_route_final_manifest_failure_reason(&request, &final_manifest_diagnostics)
     };
@@ -15628,6 +16183,18 @@ async fn execute_gatekeeper_buy_path(
                         &ctx.gatekeeper_rollout_profile,
                         &ctx.oracle_runtime.config,
                     );
+                    let working_builder_parity_mode = p37_working_builder_parity_enabled(
+                        &ctx.oracle_runtime.config.p37_shadow_probe,
+                    );
+                    let working_builder_execution_evidence_context = working_builder_parity_mode
+                        .then(|| P37WorkingBuilderExecutionEvidenceContext {
+                            store: ctx.oracle_runtime.execution_account_evidence_store(),
+                            freshness_ms: ctx
+                                .oracle_runtime
+                                .config
+                                .p37_shadow_probe
+                                .execution_account_evidence_freshness_ms,
+                        });
                     let receipt = execute_gatekeeper_buy_via_trigger_with_fsc_gate(
                         trigger_component,
                         fsc_gate_status,
@@ -15636,9 +16203,8 @@ async fn execute_gatekeeper_buy_path(
                         tip_lamports,
                         Some(resolved_tip.telemetry.clone()),
                         Some(join_metadata),
-                        p37_working_builder_parity_enabled(
-                            &ctx.oracle_runtime.config.p37_shadow_probe,
-                        ),
+                        working_builder_parity_mode,
+                        working_builder_execution_evidence_context,
                     )
                     .await;
                     match apply_trigger_dispatch_receipt_with_builder_mode(
@@ -15723,6 +16289,7 @@ async fn execute_gatekeeper_buy_via_trigger(
         tip_floor_telemetry,
         None,
         false,
+        None,
     )
     .await
 }
@@ -15850,11 +16417,18 @@ fn trigger_dispatch_failure_context_with_join_metadata(
     Some(context)
 }
 
+#[derive(Clone)]
+struct P37WorkingBuilderExecutionEvidenceContext {
+    store: Arc<ExecutionAccountEvidenceStore>,
+    freshness_ms: u64,
+}
+
 async fn active_shadow_simulation_load_precheck_receipt(
     trigger_component: &crate::components::trigger::TriggerComponent,
     request: &crate::components::trigger::PreparedBuyRequest,
     shadow_only_dispatch: bool,
     working_builder_parity_mode: bool,
+    execution_evidence_context: Option<&P37WorkingBuilderExecutionEvidenceContext>,
 ) -> Option<crate::components::trigger::TriggerDispatchReceipt> {
     if !shadow_only_dispatch {
         return None;
@@ -15863,9 +16437,18 @@ async fn active_shadow_simulation_load_precheck_receipt(
     if working_builder_parity_mode {
         let account_set_diagnostics =
             p37_shadow_probe_account_set_diagnostics(trigger_component, request).await;
-        if let Some(reason) =
+        let reason = if let Some(context) = execution_evidence_context {
+            p37_working_builder_final_manifest_failure_reason_with_execution_evidence(
+                request,
+                &account_set_diagnostics,
+                Some(context.store.as_ref()),
+                context.freshness_ms,
+                current_time_ms(),
+            )
+        } else {
             p37_working_builder_final_manifest_failure_reason(request, &account_set_diagnostics)
-        {
+        };
+        if let Some(reason) = reason {
             return Some(crate::components::trigger::TriggerDispatchReceipt {
                 primary_outcome: Err(anyhow::anyhow!("{reason}")),
                 shadow_task: None,
@@ -15966,6 +16549,7 @@ async fn execute_gatekeeper_buy_via_trigger_with_fsc_gate(
     tip_floor_telemetry: Option<crate::components::live_tx_sender::TipFloorResolutionTelemetry>,
     join_metadata: Option<ExecutionJoinMetadata>,
     working_builder_parity_mode: bool,
+    working_builder_execution_evidence_context: Option<P37WorkingBuilderExecutionEvidenceContext>,
 ) -> crate::components::trigger::TriggerDispatchReceipt {
     if let Some(gate_status) = fsc_gate_status {
         match trigger_component.entry_mode() {
@@ -16035,6 +16619,7 @@ async fn execute_gatekeeper_buy_via_trigger_with_fsc_gate(
                             &prepared_buy,
                             true,
                             working_builder_parity_mode,
+                            working_builder_execution_evidence_context.as_ref(),
                         )
                         .await
                         {
@@ -16159,6 +16744,7 @@ async fn execute_gatekeeper_buy_via_trigger_with_fsc_gate(
                         crate::config::TriggerEntryMode::ShadowOnly
                     ),
                     working_builder_parity_mode,
+                    working_builder_execution_evidence_context.as_ref(),
                 )
                 .await
                 {
@@ -16757,6 +17343,47 @@ fn shadow_entry_record_from_event(
             .account_diagnostics
             .working_builder_bcv2_local_coverage_class
             .clone(),
+        working_builder_bcv2_execution_evidence_status: event
+            .account_diagnostics
+            .working_builder_bcv2_execution_evidence_status
+            .clone(),
+        working_builder_bcv2_execution_evidence_source: event
+            .account_diagnostics
+            .working_builder_bcv2_execution_evidence_source
+            .clone(),
+        working_builder_bcv2_execution_evidence_ready: event
+            .account_diagnostics
+            .working_builder_bcv2_execution_evidence_ready,
+        working_builder_bcv2_execution_evidence_reason: event
+            .account_diagnostics
+            .working_builder_bcv2_execution_evidence_reason
+            .clone(),
+        working_builder_bcv2_execution_evidence_conflict: event
+            .account_diagnostics
+            .working_builder_bcv2_execution_evidence_conflict
+            .clone(),
+        working_builder_bcv2_execution_evidence_stale: event
+            .account_diagnostics
+            .working_builder_bcv2_execution_evidence_stale,
+        working_builder_bcv2_execution_evidence_exact_pubkey_match: event
+            .account_diagnostics
+            .working_builder_bcv2_execution_evidence_exact_pubkey_match,
+        working_builder_bcv2_execution_evidence_age_ms: event
+            .account_diagnostics
+            .working_builder_bcv2_execution_evidence_age_ms,
+        working_builder_bcv2_execution_evidence_owner: event
+            .account_diagnostics
+            .working_builder_bcv2_execution_evidence_owner
+            .clone(),
+        working_builder_bcv2_execution_evidence_data_len: event
+            .account_diagnostics
+            .working_builder_bcv2_execution_evidence_data_len,
+        working_builder_bcv2_execution_evidence_slot: event
+            .account_diagnostics
+            .working_builder_bcv2_execution_evidence_slot,
+        working_builder_bcv2_execution_evidence_context_slot: event
+            .account_diagnostics
+            .working_builder_bcv2_execution_evidence_context_slot,
         working_builder_creator_vault_pubkey: event
             .account_diagnostics
             .working_builder_creator_vault_pubkey
@@ -17010,6 +17637,18 @@ fn shadow_entry_record_from_request(
         working_builder_bcv2_mfs_seen_reason: None,
         working_builder_bcv2_diag_seen_reason: None,
         working_builder_bcv2_local_coverage_class: None,
+        working_builder_bcv2_execution_evidence_status: None,
+        working_builder_bcv2_execution_evidence_source: None,
+        working_builder_bcv2_execution_evidence_ready: None,
+        working_builder_bcv2_execution_evidence_reason: None,
+        working_builder_bcv2_execution_evidence_conflict: None,
+        working_builder_bcv2_execution_evidence_stale: None,
+        working_builder_bcv2_execution_evidence_exact_pubkey_match: None,
+        working_builder_bcv2_execution_evidence_age_ms: None,
+        working_builder_bcv2_execution_evidence_owner: None,
+        working_builder_bcv2_execution_evidence_data_len: None,
+        working_builder_bcv2_execution_evidence_slot: None,
+        working_builder_bcv2_execution_evidence_context_slot: None,
         working_builder_creator_vault_pubkey: None,
         working_builder_creator_vault_source_authority: None,
         working_builder_creator_vault_rpc_load_status: None,
@@ -17281,6 +17920,35 @@ fn enrich_active_shadow_entry_with_account_diagnostics(
     entry.working_builder_bcv2_mfs_materialized = diagnostics.working_builder_bcv2_mfs_materialized;
     entry.working_builder_bcv2_diag_materialized =
         diagnostics.working_builder_bcv2_diag_materialized;
+    entry.working_builder_bcv2_execution_evidence_status = diagnostics
+        .working_builder_bcv2_execution_evidence_status
+        .clone();
+    entry.working_builder_bcv2_execution_evidence_source = diagnostics
+        .working_builder_bcv2_execution_evidence_source
+        .clone();
+    entry.working_builder_bcv2_execution_evidence_ready =
+        diagnostics.working_builder_bcv2_execution_evidence_ready;
+    entry.working_builder_bcv2_execution_evidence_reason = diagnostics
+        .working_builder_bcv2_execution_evidence_reason
+        .clone();
+    entry.working_builder_bcv2_execution_evidence_conflict = diagnostics
+        .working_builder_bcv2_execution_evidence_conflict
+        .clone();
+    entry.working_builder_bcv2_execution_evidence_stale =
+        diagnostics.working_builder_bcv2_execution_evidence_stale;
+    entry.working_builder_bcv2_execution_evidence_exact_pubkey_match =
+        diagnostics.working_builder_bcv2_execution_evidence_exact_pubkey_match;
+    entry.working_builder_bcv2_execution_evidence_age_ms =
+        diagnostics.working_builder_bcv2_execution_evidence_age_ms;
+    entry.working_builder_bcv2_execution_evidence_owner = diagnostics
+        .working_builder_bcv2_execution_evidence_owner
+        .clone();
+    entry.working_builder_bcv2_execution_evidence_data_len =
+        diagnostics.working_builder_bcv2_execution_evidence_data_len;
+    entry.working_builder_bcv2_execution_evidence_slot =
+        diagnostics.working_builder_bcv2_execution_evidence_slot;
+    entry.working_builder_bcv2_execution_evidence_context_slot =
+        diagnostics.working_builder_bcv2_execution_evidence_context_slot;
     entry.working_builder_creator_vault_pubkey =
         diagnostics.working_builder_creator_vault_pubkey.clone();
     entry.working_builder_creator_vault_source_authority = diagnostics
@@ -17888,6 +18556,30 @@ struct ShadowEntryRecord {
     working_builder_bcv2_diag_seen_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     working_builder_bcv2_local_coverage_class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_execution_evidence_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_execution_evidence_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_execution_evidence_ready: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_execution_evidence_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_execution_evidence_conflict: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_execution_evidence_stale: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_execution_evidence_exact_pubkey_match: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_execution_evidence_age_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_execution_evidence_owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_execution_evidence_data_len: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_execution_evidence_slot: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    working_builder_bcv2_execution_evidence_context_slot: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     working_builder_creator_vault_pubkey: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -22432,7 +23124,8 @@ mod tests {
     #[test]
     fn p37_shadow_probe_account_manifest_and_hashes_are_built_from_prepared_request() {
         let request = test_prepared_buy_request();
-        let diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        let mut diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        diagnostics.manifest_lookup_performed = true;
 
         assert!(!diagnostics.manifest.is_empty());
         assert!(diagnostics
@@ -22455,7 +23148,8 @@ mod tests {
     #[test]
     fn p37_working_builder_parity_builds_prepared_request_via_trigger_path() {
         let request = test_working_builder_prepared_buy_request();
-        let diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        let mut diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        diagnostics.manifest_lookup_performed = true;
         let working =
             p37_working_builder_parity_diagnostics(Some(&request), Some(&diagnostics), true);
 
@@ -22574,7 +23268,8 @@ mod tests {
             .expect("build profile")
             .buy_variant;
         let original_override_variant = request.account_overrides.buy_variant;
-        let diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        let mut diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        diagnostics.manifest_lookup_performed = true;
         let working =
             p37_working_builder_parity_diagnostics(Some(&request), Some(&diagnostics), true);
 
@@ -22597,7 +23292,8 @@ mod tests {
     fn probe_working_builder_parity_preserves_post_build_buy_variant() {
         let mut request = test_working_builder_prepared_buy_request();
         request.account_overrides.buy_variant = Some(trigger::PumpfunBuyVariant::LegacyBuy);
-        let diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        let mut diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        diagnostics.manifest_lookup_performed = true;
 
         let working =
             p37_working_builder_parity_diagnostics(Some(&request), Some(&diagnostics), true);
@@ -22617,7 +23313,8 @@ mod tests {
     #[test]
     fn p37_working_builder_parity_logs_rpc_and_sender_manifest_hashes() {
         let request = test_working_builder_prepared_buy_request();
-        let diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        let mut diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        diagnostics.manifest_lookup_performed = true;
         let working =
             p37_working_builder_parity_diagnostics(Some(&request), Some(&diagnostics), true);
 
@@ -22631,7 +23328,8 @@ mod tests {
     #[test]
     fn p37_working_builder_parity_precheck_uses_final_builder_manifest() {
         let request = test_working_builder_prepared_buy_request();
-        let diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        let mut diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        diagnostics.manifest_lookup_performed = true;
         let working =
             p37_working_builder_parity_diagnostics(Some(&request), Some(&diagnostics), true);
         let bcv2 = request
@@ -22943,7 +23641,8 @@ mod tests {
     #[test]
     fn p37_working_builder_bcv2_evidence_without_store_remains_none() {
         let request = test_working_builder_prepared_buy_request();
-        let diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        let mut diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        diagnostics.manifest_lookup_performed = true;
 
         let working =
             p37_working_builder_parity_diagnostics(Some(&request), Some(&diagnostics), true);
@@ -22992,6 +23691,297 @@ mod tests {
         );
         assert_eq!(working.bcv2_evidence_status, None);
         assert_eq!(working.bcv2_evidence_ready, None);
+    }
+
+    #[test]
+    fn p37_working_builder_execution_evidence_allows_fresh_rpc_ready_manifest() {
+        let request = test_working_builder_prepared_buy_request();
+        let bcv2 = request
+            .account_overrides
+            .bonding_curve_v2
+            .expect("working request bcv2");
+        let mut diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        diagnostics.manifest_lookup_performed = true;
+        let evidence_store = ExecutionAccountEvidenceStore::new();
+        let mut evidence = test_bcv2_execution_account_evidence(
+            bcv2,
+            ExecutionAccountEvidenceSource::RpcHydration,
+            ExecutionAccountEvidenceStatus::RpcReady,
+            true,
+        );
+        evidence.received_at_ms = 10_000;
+        evidence.owner = Some(Pubkey::new_unique());
+        evidence.data_len = Some(512);
+        evidence_store.upsert(evidence);
+
+        let reason = p37_working_builder_final_manifest_failure_reason_with_execution_evidence(
+            &request,
+            &diagnostics,
+            Some(&evidence_store),
+            10_000,
+            10_500,
+        );
+        let working = p37_working_builder_parity_diagnostics_with_execution_evidence_config(
+            Some(&request),
+            Some(&diagnostics),
+            true,
+            Some(&evidence_store),
+            10_000,
+            10_500,
+        );
+
+        assert_eq!(reason, None);
+        assert_eq!(
+            working.bcv2_execution_evidence_status.as_deref(),
+            Some("rpc_ready")
+        );
+        assert_eq!(
+            working.bcv2_execution_evidence_source.as_deref(),
+            Some("rpc_hydration")
+        );
+        assert_eq!(working.bcv2_execution_evidence_ready, Some(true));
+        assert_eq!(
+            working.bcv2_execution_evidence_reason.as_deref(),
+            Some("execution_evidence_ready")
+        );
+        assert_eq!(working.bcv2_execution_evidence_stale, Some(false));
+        assert_eq!(
+            working.bcv2_execution_evidence_exact_pubkey_match,
+            Some(true)
+        );
+        assert_eq!(working.bcv2_execution_evidence_age_ms, Some(500));
+        assert_eq!(working.bcv2_execution_evidence_data_len, Some(512));
+    }
+
+    #[test]
+    fn p37_working_builder_execution_evidence_allows_fresh_precheck_ready_manifest() {
+        let request = test_working_builder_prepared_buy_request();
+        let bcv2 = request
+            .account_overrides
+            .bonding_curve_v2
+            .expect("working request bcv2");
+        let mut diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        diagnostics.manifest_lookup_performed = true;
+        let evidence_store = ExecutionAccountEvidenceStore::new();
+        let mut evidence = test_bcv2_execution_account_evidence(
+            bcv2,
+            ExecutionAccountEvidenceSource::ManifestPrecheck,
+            ExecutionAccountEvidenceStatus::PrecheckReady,
+            true,
+        );
+        evidence.received_at_ms = 20_000;
+        evidence.owner = Some(Pubkey::new_unique());
+        evidence.data_len = Some(768);
+        evidence_store.upsert(evidence);
+
+        let reason = p37_working_builder_final_manifest_failure_reason_with_execution_evidence(
+            &request,
+            &diagnostics,
+            Some(&evidence_store),
+            10_000,
+            20_001,
+        );
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn p37_working_builder_execution_evidence_blocks_observed_and_account_update_only() {
+        let request = test_working_builder_prepared_buy_request();
+        let bcv2 = request
+            .account_overrides
+            .bonding_curve_v2
+            .expect("working request bcv2");
+        let mut diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        diagnostics.manifest_lookup_performed = true;
+
+        for (status, source, expected_reason) in [
+            (
+                ExecutionAccountEvidenceStatus::DiscoveryHint,
+                ExecutionAccountEvidenceSource::ObservedTxMeta,
+                "not_execution_load_ready:discovery_hint",
+            ),
+            (
+                ExecutionAccountEvidenceStatus::SubscriptionRequested,
+                ExecutionAccountEvidenceSource::ExactWatchRegistered,
+                "not_execution_load_ready:subscription_requested",
+            ),
+            (
+                ExecutionAccountEvidenceStatus::AccountUpdateReceived,
+                ExecutionAccountEvidenceSource::YellowstoneAccountUpdate,
+                "account_update_received_not_execution_load_ready",
+            ),
+        ] {
+            let evidence_store = ExecutionAccountEvidenceStore::new();
+            let mut evidence = test_bcv2_execution_account_evidence(bcv2, source, status, true);
+            evidence.received_at_ms = 30_000;
+            evidence.owner = Some(Pubkey::new_unique());
+            evidence.data_len = Some(512);
+            evidence_store.upsert(evidence);
+
+            let reason = p37_working_builder_final_manifest_failure_reason_with_execution_evidence(
+                &request,
+                &diagnostics,
+                Some(&evidence_store),
+                10_000,
+                30_001,
+            )
+            .expect("non-load-ready evidence must fail closed");
+
+            assert!(
+                reason.ends_with(expected_reason),
+                "reason {reason} must end with {expected_reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn p37_working_builder_execution_evidence_blocks_stale_or_incomplete_positive() {
+        let request = test_working_builder_prepared_buy_request();
+        let bcv2 = request
+            .account_overrides
+            .bonding_curve_v2
+            .expect("working request bcv2");
+        let mut diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        diagnostics.manifest_lookup_performed = true;
+
+        let stale_store = ExecutionAccountEvidenceStore::new();
+        let mut stale = test_bcv2_execution_account_evidence(
+            bcv2,
+            ExecutionAccountEvidenceSource::RpcHydration,
+            ExecutionAccountEvidenceStatus::RpcReady,
+            true,
+        );
+        stale.received_at_ms = 1_000;
+        stale.owner = Some(Pubkey::new_unique());
+        stale.data_len = Some(512);
+        stale_store.upsert(stale);
+        let stale_reason =
+            p37_working_builder_final_manifest_failure_reason_with_execution_evidence(
+                &request,
+                &diagnostics,
+                Some(&stale_store),
+                500,
+                2_000,
+            )
+            .expect("stale evidence must fail closed");
+        assert!(stale_reason.ends_with(":execution_evidence_stale"));
+
+        let missing_owner_store = ExecutionAccountEvidenceStore::new();
+        let mut missing_owner = test_bcv2_execution_account_evidence(
+            bcv2,
+            ExecutionAccountEvidenceSource::RpcHydration,
+            ExecutionAccountEvidenceStatus::RpcReady,
+            true,
+        );
+        missing_owner.received_at_ms = 4_000;
+        missing_owner.owner = None;
+        missing_owner.data_len = Some(512);
+        missing_owner_store.upsert(missing_owner);
+        let missing_owner_reason =
+            p37_working_builder_final_manifest_failure_reason_with_execution_evidence(
+                &request,
+                &diagnostics,
+                Some(&missing_owner_store),
+                10_000,
+                4_001,
+            )
+            .expect("missing owner must fail closed");
+        assert!(missing_owner_reason.ends_with(":execution_evidence_owner_missing"));
+
+        let missing_data_len_store = ExecutionAccountEvidenceStore::new();
+        let mut missing_data_len = test_bcv2_execution_account_evidence(
+            bcv2,
+            ExecutionAccountEvidenceSource::RpcHydration,
+            ExecutionAccountEvidenceStatus::RpcReady,
+            true,
+        );
+        missing_data_len.received_at_ms = 5_000;
+        missing_data_len.owner = Some(Pubkey::new_unique());
+        missing_data_len.data_len = None;
+        missing_data_len_store.upsert(missing_data_len);
+        let missing_data_len_reason =
+            p37_working_builder_final_manifest_failure_reason_with_execution_evidence(
+                &request,
+                &diagnostics,
+                Some(&missing_data_len_store),
+                10_000,
+                5_001,
+            )
+            .expect("missing data_len must fail closed");
+        assert!(missing_data_len_reason.ends_with(":execution_evidence_data_len_missing"));
+    }
+
+    #[test]
+    fn p37_working_builder_execution_evidence_blocks_pubkey_mismatch_and_newer_negative() {
+        let request = test_working_builder_prepared_buy_request();
+        let bcv2 = request
+            .account_overrides
+            .bonding_curve_v2
+            .expect("working request bcv2");
+        let mut diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        diagnostics.manifest_lookup_performed = true;
+
+        let mismatch_store = ExecutionAccountEvidenceStore::new();
+        let mut unrelated = test_bcv2_execution_account_evidence(
+            Pubkey::new_unique(),
+            ExecutionAccountEvidenceSource::RpcHydration,
+            ExecutionAccountEvidenceStatus::RpcReady,
+            true,
+        );
+        unrelated.received_at_ms = 10_000;
+        unrelated.owner = Some(Pubkey::new_unique());
+        unrelated.data_len = Some(512);
+        mismatch_store.upsert(unrelated);
+        let working = p37_working_builder_parity_diagnostics_with_execution_evidence_config(
+            Some(&request),
+            Some(&diagnostics),
+            true,
+            Some(&mismatch_store),
+            10_000,
+            10_001,
+        );
+        assert_eq!(working.bcv2_execution_evidence_ready, Some(false));
+        assert_eq!(
+            working.bcv2_execution_evidence_reason.as_deref(),
+            Some("execution_evidence_missing")
+        );
+        assert_eq!(
+            working.bcv2_execution_evidence_exact_pubkey_match,
+            Some(false)
+        );
+
+        let negative_store = ExecutionAccountEvidenceStore::new();
+        let mut ready = test_bcv2_execution_account_evidence(
+            bcv2,
+            ExecutionAccountEvidenceSource::RpcHydration,
+            ExecutionAccountEvidenceStatus::RpcReady,
+            true,
+        );
+        ready.received_at_ms = 10_000;
+        ready.owner = Some(Pubkey::new_unique());
+        ready.data_len = Some(512);
+        negative_store.upsert(ready);
+        let mut missing = test_bcv2_execution_account_evidence(
+            bcv2,
+            ExecutionAccountEvidenceSource::RpcHydration,
+            ExecutionAccountEvidenceStatus::RpcMissing,
+            false,
+        );
+        missing.received_at_ms = 10_000;
+        missing.owner = None;
+        missing.data_len = None;
+        negative_store.upsert(missing);
+
+        let reason = p37_working_builder_final_manifest_failure_reason_with_execution_evidence(
+            &request,
+            &diagnostics,
+            Some(&negative_store),
+            10_000,
+            10_001,
+        )
+        .expect("newer or equal negative evidence must fail closed");
+        assert!(reason.ends_with(":newer_negative_evidence:rpc_missing"));
     }
 
     #[test]
@@ -29945,6 +30935,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .await;
         let err = receipt
@@ -30002,6 +30993,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .await;
         let err = receipt

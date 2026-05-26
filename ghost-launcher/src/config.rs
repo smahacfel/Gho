@@ -1108,6 +1108,12 @@ fn validate_p37_shadow_probe_contract(config: &LauncherConfig) -> Result<(), Str
             "[p37_shadow_probe] slippage and quote/curve age limits must be positive".to_string(),
         );
     }
+    if probe.execution_account_evidence_freshness_ms == 0 {
+        return Err(
+            "[p37_shadow_probe].execution_account_evidence_freshness_ms must be positive"
+                .to_string(),
+        );
+    }
 
     for (name, path) in [
         ("selection_log_path", probe.selection_log_path.as_str()),
@@ -1954,6 +1960,9 @@ pub struct P37ShadowProbeConfig {
     #[serde(default = "default_p37_shadow_probe_curve_age_max_ms")]
     pub probe_curve_age_max_ms: u64,
 
+    #[serde(default = "default_p37_execution_account_evidence_freshness_ms")]
+    pub execution_account_evidence_freshness_ms: u64,
+
     /// Optional decision-time-safe wait for required execution accounts.
     ///
     /// This wait happens only in the isolated counterfactual probe background
@@ -2021,6 +2030,8 @@ impl Default for P37ShadowProbeConfig {
             probe_slippage_bps: default_p37_shadow_probe_slippage_bps(),
             probe_quote_age_max_ms: default_p37_shadow_probe_quote_age_max_ms(),
             probe_curve_age_max_ms: default_p37_shadow_probe_curve_age_max_ms(),
+            execution_account_evidence_freshness_ms:
+                default_p37_execution_account_evidence_freshness_ms(),
             probe_wait_for_execution_accounts_ms: 0,
             append: false,
             require_unique_namespace: true,
@@ -3173,6 +3184,10 @@ fn default_p37_shadow_probe_quote_age_max_ms() -> u64 {
 
 fn default_p37_shadow_probe_curve_age_max_ms() -> u64 {
     1500
+}
+
+fn default_p37_execution_account_evidence_freshness_ms() -> u64 {
+    10_000
 }
 
 fn default_p37_shadow_probe_selection_log_path() -> String {
@@ -4454,6 +4469,12 @@ enabled = true
             config.p37_shadow_probe.probe_amount_source,
             "trigger_max_position_size"
         );
+        assert_eq!(
+            config
+                .p37_shadow_probe
+                .execution_account_evidence_freshness_ms,
+            10_000
+        );
     }
 
     #[test]
@@ -4534,11 +4555,82 @@ lifecycle_log_path = "logs/probe/probe_shadow_lifecycle.jsonl"
             config.p37_shadow_probe.p37_execution_builder_mode,
             "working_builder_parity"
         );
+        assert_eq!(
+            config
+                .p37_shadow_probe
+                .execution_account_evidence_freshness_ms,
+            10_000
+        );
         assert!(!config.p37_shadow_probe.emit_event_bus);
         assert!(config
             .p37_shadow_probe
             .transport_log_path
             .ends_with("logs/probe/probe_transport.jsonl"));
+        assert!(config.validate_execution_profile().is_ok());
+    }
+
+    #[test]
+    fn p37_shadow_probe_custom_execution_evidence_freshness_loads() {
+        let base = unique_temp_dir("p37_shadow_probe_evidence_freshness_loads");
+        let config_path = base.join("config.toml");
+        let brain_config_path = base.join("ghost_brain.toml");
+        fs::write(
+            &brain_config_path,
+            "[gatekeeper_v3]\nreplay_payload_enabled = true\n",
+        )
+        .unwrap();
+        let config_body = r#"
+ghost_brain_config_path = "ghost_brain.toml"
+
+[seer]
+enabled = true
+source_mode = "pump_portal_ws"
+
+[gui_backend]
+enabled = true
+
+[trigger]
+entry_mode = "shadow_only"
+max_concurrent_positions = 2
+max_position_size_sol = 0.1
+emergency_floor_sol = 0.01
+position_size_buffer_sol = 0.001
+
+[trigger.shadow_run]
+enabled = true
+shadow_rpc_url = "https://shadow.example.com/api-key"
+payer_strategy = "ephemeral"
+output_path = "logs/active/buys.jsonl"
+
+[execution]
+execution_mode = "shadow"
+
+[execution.shadow]
+entry_log_path = "logs/active/shadow_entries.jsonl"
+lifecycle_log_path = "logs/active/shadow_lifecycle.jsonl"
+
+[p37_shadow_probe]
+enabled = true
+namespace = "probe-test-evidence-freshness"
+p37_execution_builder_mode = "working_builder_parity"
+execution_account_evidence_freshness_ms = 2500
+selection_log_path = "logs/probe/freshness_selection.jsonl"
+skip_log_path = "logs/probe/freshness_skips.jsonl"
+transport_log_path = "logs/probe/freshness_transport.jsonl"
+entry_log_path = "logs/probe/freshness_entries.jsonl"
+lifecycle_log_path = "logs/probe/freshness_lifecycle.jsonl"
+"#;
+        fs::write(&config_path, config_body).unwrap();
+
+        let config =
+            LauncherConfig::from_file(&config_path).expect("probe config should load safely");
+
+        assert_eq!(
+            config
+                .p37_shadow_probe
+                .execution_account_evidence_freshness_ms,
+            2_500
+        );
         assert!(config.validate_execution_profile().is_ok());
     }
 
@@ -4556,6 +4648,24 @@ lifecycle_log_path = "logs/probe/probe_shadow_lifecycle.jsonl"
 
         assert!(err.contains("p37_execution_builder_mode"));
         assert!(err.contains("working_builder_parity"));
+    }
+
+    #[test]
+    fn p37_shadow_probe_zero_execution_evidence_freshness_fails_closed() {
+        let mut config = LauncherConfig::default();
+        config.execution.execution_mode = ExecutionMode::Shadow;
+        config.trigger.entry_mode = TriggerEntryMode::ShadowOnly;
+        config.trigger.shadow_run.enabled = true;
+        config.p37_shadow_probe.enabled = true;
+        config
+            .p37_shadow_probe
+            .execution_account_evidence_freshness_ms = 0;
+
+        let err = validate_p37_shadow_probe_contract(&config)
+            .expect_err("zero execution evidence freshness must fail closed");
+
+        assert!(err.contains("execution_account_evidence_freshness_ms"));
+        assert!(err.contains("positive"));
     }
 
     #[test]

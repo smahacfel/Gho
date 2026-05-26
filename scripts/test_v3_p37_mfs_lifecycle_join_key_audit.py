@@ -2245,6 +2245,12 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
                 "working_builder_bcv2_rpc_fetch_missing": False,
                 "working_builder_bcv2_rpc_fetch_owner": "pump-program",
                 "working_builder_bcv2_rpc_fetch_data_len": 256,
+                "working_builder_bcv2_execution_evidence_status": "rpc_ready",
+                "working_builder_bcv2_execution_evidence_source": "rpc_hydration",
+                "working_builder_bcv2_execution_evidence_ready": True,
+                "working_builder_bcv2_execution_evidence_reason": "execution_evidence_ready",
+                "working_builder_bcv2_execution_evidence_stale": False,
+                "working_builder_bcv2_execution_evidence_exact_pubkey_match": True,
                 "working_builder_bcv2_account_state_materialized": False,
                 "working_builder_bcv2_mfs_materialized": False,
                 "working_builder_bcv2_diag_materialized": False,
@@ -2302,6 +2308,12 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
                 "working_builder_bcv2_account_update_mapped": False,
                 "working_builder_bcv2_rpc_fetch_ready": False,
                 "working_builder_bcv2_rpc_fetch_missing": True,
+                "working_builder_bcv2_execution_evidence_status": "rpc_missing",
+                "working_builder_bcv2_execution_evidence_source": "rpc_hydration",
+                "working_builder_bcv2_execution_evidence_ready": False,
+                "working_builder_bcv2_execution_evidence_reason": "account_missing",
+                "working_builder_bcv2_execution_evidence_stale": False,
+                "working_builder_bcv2_execution_evidence_exact_pubkey_match": True,
                 "working_builder_bcv2_account_state_materialized": False,
                 "working_builder_bcv2_mfs_materialized": False,
                 "working_builder_bcv2_diag_materialized": False,
@@ -2446,6 +2458,33 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
         self.assertEqual(payload["working_builder_bcv2_mfs_materialized_rows"], 0)
         self.assertEqual(payload["working_builder_bcv2_diag_materialized_rows"], 0)
         self.assertEqual(
+            payload["working_builder_bcv2_execution_evidence_status_counts"],
+            {"rpc_missing": 1, "rpc_ready": 1},
+        )
+        self.assertEqual(
+            payload["working_builder_bcv2_execution_evidence_source_counts"],
+            {"rpc_hydration": 2},
+        )
+        self.assertEqual(
+            payload["working_builder_bcv2_execution_evidence_reason_counts"],
+            {"account_missing": 1, "execution_evidence_ready": 1},
+        )
+        self.assertEqual(
+            payload["working_builder_bcv2_execution_evidence_ready_rows"], 1
+        )
+        self.assertEqual(
+            payload["working_builder_bcv2_execution_evidence_conflict_rows"], 0
+        )
+        self.assertEqual(
+            payload["working_builder_bcv2_execution_evidence_stale_rows"], 0
+        )
+        self.assertEqual(
+            payload[
+                "working_builder_bcv2_execution_evidence_exact_pubkey_match_rows"
+            ],
+            2,
+        )
+        self.assertEqual(
             payload["working_builder_creator_vault_source_authority_counts"],
             {
                 "authoritative_detected_pool_creator": 1,
@@ -2507,6 +2546,12 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
         self.assertEqual(
             active_payload[
                 "active_shadow_working_builder_bcv2_authoritative_but_missing_on_rpc_rows"
+            ],
+            1,
+        )
+        self.assertEqual(
+            active_payload[
+                "active_shadow_working_builder_bcv2_execution_evidence_ready_rows"
             ],
             1,
         )
@@ -2591,6 +2636,128 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
         self.assertEqual(
             active_payload["active_shadow_working_builder_manifest_ready_rows"],
             0,
+        )
+
+    def test_audit_counts_bcv2_execution_evidence_gates_manifest_ready(self) -> None:
+        def base_row(suffix: str) -> dict[str, object]:
+            return {
+                "working_builder_parity_mode": "working_builder_parity",
+                "working_builder_request_built": True,
+                "working_builder_buy_variant": "routed_exact_sol_in",
+                "working_builder_rpc_manifest_hash": f"rpc-hash-{suffix}",
+                "working_builder_sender_manifest_hash": f"sender-hash-{suffix}",
+                "working_builder_manifest_contains_bcv2": True,
+                "working_builder_bcv2_source_authority": "authoritative_observed_tx",
+                "working_builder_bcv2_rpc_load_status": "rpc_load_ready",
+                "working_builder_bcv2_rpc_load_ready": True,
+                "working_builder_creator_vault_source_authority": "authoritative_detected_pool_creator",
+                "working_builder_creator_vault_rpc_load_status": "rpc_load_ready",
+            }
+
+        ready = base_row("ready")
+        ready.update(
+            {
+                "working_builder_bcv2_execution_evidence_status": "rpc_ready",
+                "working_builder_bcv2_execution_evidence_source": "rpc_hydration",
+                "working_builder_bcv2_execution_evidence_ready": True,
+                "working_builder_bcv2_execution_evidence_reason": "execution_evidence_ready",
+                "working_builder_bcv2_execution_evidence_stale": False,
+                "working_builder_bcv2_execution_evidence_exact_pubkey_match": True,
+            }
+        )
+        conflict = base_row("conflict")
+        conflict.update(
+            {
+                "working_builder_bcv2_execution_evidence_status": "rpc_missing",
+                "working_builder_bcv2_execution_evidence_source": "rpc_hydration",
+                "working_builder_bcv2_execution_evidence_ready": False,
+                "working_builder_bcv2_execution_evidence_reason": "newer_negative_evidence:rpc_missing",
+                "working_builder_bcv2_execution_evidence_conflict": "positive_rpc_ready_conflicts_with_negative_rpc_missing",
+                "working_builder_bcv2_execution_evidence_exact_pubkey_match": True,
+            }
+        )
+        stale = base_row("stale")
+        stale.update(
+            {
+                "working_builder_bcv2_execution_evidence_status": "rpc_ready",
+                "working_builder_bcv2_execution_evidence_source": "rpc_hydration",
+                "working_builder_bcv2_execution_evidence_ready": False,
+                "working_builder_bcv2_execution_evidence_reason": "execution_evidence_stale",
+                "working_builder_bcv2_execution_evidence_stale": True,
+                "working_builder_bcv2_execution_evidence_exact_pubkey_match": True,
+            }
+        )
+        mismatch = base_row("mismatch")
+        mismatch.update(
+            {
+                "working_builder_bcv2_execution_evidence_ready": False,
+                "working_builder_bcv2_execution_evidence_reason": "execution_evidence_missing",
+                "working_builder_bcv2_execution_evidence_exact_pubkey_match": False,
+            }
+        )
+        account_update_only = base_row("account-update")
+        account_update_only.update(
+            {
+                "working_builder_bcv2_execution_evidence_status": "account_update_received",
+                "working_builder_bcv2_execution_evidence_source": "yellowstone_account_update",
+                "working_builder_bcv2_execution_evidence_ready": False,
+                "working_builder_bcv2_execution_evidence_reason": "account_update_received_not_execution_load_ready",
+                "working_builder_bcv2_execution_evidence_exact_pubkey_match": True,
+            }
+        )
+
+        rows = [ready, conflict, stale, mismatch, account_update_only]
+        payload = audit.working_builder_parity_payload(rows)
+        active_payload = audit.working_builder_parity_payload(rows, "active_shadow_")
+
+        self.assertEqual(payload["working_builder_manifest_ready_rows"], 1)
+        self.assertEqual(
+            payload["working_builder_bcv2_execution_evidence_status_counts"],
+            {
+                "account_update_received": 1,
+                "missing": 1,
+                "rpc_missing": 1,
+                "rpc_ready": 2,
+            },
+        )
+        self.assertEqual(
+            payload["working_builder_bcv2_execution_evidence_source_counts"],
+            {"missing": 1, "rpc_hydration": 3, "yellowstone_account_update": 1},
+        )
+        self.assertEqual(
+            payload["working_builder_bcv2_execution_evidence_reason_counts"],
+            {
+                "account_update_received_not_execution_load_ready": 1,
+                "execution_evidence_missing": 1,
+                "execution_evidence_ready": 1,
+                "execution_evidence_stale": 1,
+                "newer_negative_evidence:rpc_missing": 1,
+            },
+        )
+        self.assertEqual(
+            payload["working_builder_bcv2_execution_evidence_ready_rows"], 1
+        )
+        self.assertEqual(
+            payload["working_builder_bcv2_execution_evidence_conflict_rows"], 1
+        )
+        self.assertEqual(
+            payload["working_builder_bcv2_execution_evidence_stale_rows"], 1
+        )
+        self.assertEqual(
+            payload[
+                "working_builder_bcv2_execution_evidence_exact_pubkey_match_rows"
+            ],
+            4,
+        )
+        self.assertEqual(
+            active_payload[
+                "active_shadow_working_builder_bcv2_execution_evidence_ready_rows"
+            ],
+            1,
+        )
+        self.assertEqual(
+            active_payload["active_shadow_working_builder_manifest_ready_rows"],
+            1,
         )
 
     def test_audit_flags_probe_working_builder_legacy_variant_rows(self) -> None:
