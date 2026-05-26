@@ -24,6 +24,7 @@ pub mod enhanced_candidate;
 pub mod errors;
 pub mod event_semantics;
 pub mod event_time;
+pub mod execution_account_evidence;
 pub mod features;
 pub mod health;
 pub mod init_pool_parser;
@@ -62,6 +63,12 @@ pub use event_semantics::{
     EventTruthKind, SlotQuality, SourceKind, TimestampQuality,
 };
 pub use event_time::EventTimeMetadata;
+pub use execution_account_evidence::{
+    ExecutionAccountEvidence, ExecutionAccountEvidenceConflict, ExecutionAccountEvidenceRecord,
+    ExecutionAccountEvidenceSnapshotCounts, ExecutionAccountEvidenceSource,
+    ExecutionAccountEvidenceStatus, ExecutionAccountEvidenceStore, ExecutionAccountRole,
+    UpsertExecutionAccountEvidenceOutcome, UpsertExecutionAccountEvidenceResult,
+};
 pub use init_pool_parser::{
     compute_initialize_pool_discriminator,
     extract_accounts,
