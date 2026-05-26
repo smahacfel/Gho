@@ -83,7 +83,7 @@ use config::{FundingLaneMode, SeerConfig, SeerSourceMode};
 use errors::{SeerError, SeerResult};
 use futures_util::StreamExt;
 use grpc_connection::{
-    EventStream, GrpcConnection, GrpcSubscriptionProfile,
+    Bcv2AccountContext, EventStream, GrpcConnection, GrpcSubscriptionProfile,
     GRPC_FUNDING_LANE_FULL_CHAIN_SOURCE_LABEL, GRPC_FUNDING_LANE_PUMP_FILTERED_SOURCE_LABEL,
     GRPC_GLOBAL_STREAM_SOURCE_LABEL,
 };
@@ -125,7 +125,9 @@ use ghost_core::market_state::BondingCurve;
 use ghost_core::CoverageAuditWatchRegistration;
 use ghost_core::{
     normalize_account_update_semantics, normalize_transaction_semantics,
-    record_event_semantic_metric, EventSemanticEnvelope, TimestampQuality,
+    record_event_semantic_metric, EventSemanticEnvelope, ExecutionAccountEvidence,
+    ExecutionAccountEvidenceSource, ExecutionAccountEvidenceStatus, ExecutionAccountRole,
+    TimestampQuality,
 };
 use ghost_core::{pipeline_coverage, PipelineCoverageStage};
 use ghost_core::{ParsedEventKind as WalParsedEventKind, Wal, WalRecord, WalRecordClock};
@@ -1465,10 +1467,11 @@ impl Seer {
                 );
                 if matches!(effective_mode, SeerSourceMode::GeyserGrpc) {
                     if let Some(grpc_connection) = grpc_connection.as_ref() {
-                        Some(BinaryParser::with_account_registry_and_bcv2_hydration(
+                        Some(BinaryParser::with_account_registry_bcv2_hydration_and_ipc(
                             config.verbose,
                             grpc_connection.account_registry(),
                             Some(config.rpc_endpoint.clone()),
+                            ipc_sender.clone(),
                         ))
                     } else {
                         Some(BinaryParser::new(config.verbose))
@@ -2667,6 +2670,69 @@ impl Seer {
         outcome
     }
 
+    /// Look up route-aware BCV2 context without mutating canonical AccountUpdate state.
+    fn bcv2_context_for_account_update(&self, pubkey: Pubkey) -> Option<Bcv2AccountContext> {
+        self.grpc_connection
+            .as_ref()
+            .and_then(|grpc| grpc.account_registry().bcv2_context(&pubkey.to_string()))
+    }
+
+    async fn emit_bcv2_account_update_evidence(
+        &self,
+        context: Bcv2AccountContext,
+        slot: u64,
+        write_version: Option<u64>,
+        owner: Pubkey,
+        data_len: usize,
+    ) {
+        let Some(ipc) = &self.ipc_sender else {
+            return;
+        };
+        let now_ms = types::ingress_epoch_ms();
+        let evidence = ExecutionAccountEvidence {
+            role: ExecutionAccountRole::BondingCurveV2,
+            account_pubkey: context.account_pubkey,
+            base_mint: context.base_mint,
+            pool_id: context.pool_id,
+            canonical_bonding_curve: context.canonical_bonding_curve,
+            source: ExecutionAccountEvidenceSource::YellowstoneAccountUpdate,
+            status: ExecutionAccountEvidenceStatus::AccountUpdateReceived,
+            slot: Some(slot),
+            context_slot: None,
+            write_version,
+            owner: Some(owner),
+            data_len: Some(data_len as u64),
+            tx_signature: context.tx_signature,
+            observed_instruction_index: context.observed_instruction_index,
+            observed_account_position: context.observed_account_position,
+            provenance_status: context.provenance_status,
+            detected_at_ms: now_ms,
+            received_at_ms: now_ms,
+            evidence_ready: true,
+            reason: None,
+        };
+
+        match ipc
+            .send_execution_account_evidence(evidence, EventPriority::High)
+            .await
+        {
+            Ok(()) => {
+                ::metrics::increment_counter!(
+                    "seer.execution_account_evidence.emitted_total",
+                    "source" => "yellowstone_account_update",
+                    "status" => "account_update_received"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    account_pubkey = %context.account_pubkey,
+                    error = %err,
+                    "BCV2_ACCOUNT_UPDATE_EVIDENCE_SEND_FAILED"
+                );
+            }
+        }
+    }
+
     /// Handle AccountUpdate events and forward canonical state if the pubkey is tracked.
     ///
     /// Curve account data does not include mint, so mint resolution is delegated
@@ -2696,6 +2762,11 @@ impl Seer {
             _ => return Ok(false),
         };
         ::metrics::increment_counter!("seer.account_updates.received_total");
+
+        if let Some(context) = self.bcv2_context_for_account_update(pubkey) {
+            self.emit_bcv2_account_update_evidence(context, slot, write_version, owner, data.len())
+                .await;
+        }
 
         let update_payload = match decode_canonical_account_update(owner, data) {
             Ok(payload) => payload,
@@ -6764,6 +6835,81 @@ mod tests {
         assert!(
             ledger.get_curve_info(&bonding_curve).is_none(),
             "ShadowLedger must not be written in tx-only mode (canonical_account_update_relay_enabled=false)"
+        );
+    }
+
+    #[tokio::test]
+    async fn registered_bcv2_account_update_emits_evidence_before_canonical_decode() {
+        let (ipc_sender, mut ipc_receiver, _metrics) =
+            create_ipc_channel(IpcChannelConfig::default());
+        let seer = Seer::new_with_ipc(SeerConfig::default(), ipc_sender);
+
+        let account_pubkey = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let pool_id = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        seer.grpc_connection
+            .as_ref()
+            .expect("default seer config should create grpc connection")
+            .account_registry()
+            .insert_bcv2_with_context(Bcv2AccountContext {
+                account_pubkey,
+                base_mint: Some(base_mint),
+                pool_id: Some(pool_id),
+                canonical_bonding_curve: Some(pool_id),
+                tx_signature: Some("bcv2-sig".to_string()),
+                observed_instruction_index: Some(4),
+                observed_account_position: Some(16),
+                provenance_status: Some("route_compatible".to_string()),
+                observed_slot: Some(41),
+            });
+
+        seer.process_event(types::GeyserEvent::AccountUpdate {
+            slot: 99,
+            event_time: ghost_core::EventTimeMetadata::default(),
+            write_version: Some(7),
+            pubkey: account_pubkey,
+            data: vec![1, 2, 3],
+            owner,
+        })
+        .await
+        .expect("account update processing must not fail");
+
+        let event = tokio::time::timeout(Duration::from_millis(250), ipc_receiver.recv())
+            .await
+            .expect("bcv2 evidence should be emitted before canonical decode")
+            .expect("IPC channel should remain open");
+
+        match event {
+            SeerEvent::ExecutionAccountEvidence(event) => {
+                assert_eq!(event.evidence.role, ExecutionAccountRole::BondingCurveV2);
+                assert_eq!(event.evidence.account_pubkey, account_pubkey);
+                assert_eq!(event.evidence.base_mint, Some(base_mint));
+                assert_eq!(event.evidence.pool_id, Some(pool_id));
+                assert_eq!(event.evidence.canonical_bonding_curve, Some(pool_id));
+                assert_eq!(
+                    event.evidence.source,
+                    ExecutionAccountEvidenceSource::YellowstoneAccountUpdate
+                );
+                assert_eq!(
+                    event.evidence.status,
+                    ExecutionAccountEvidenceStatus::AccountUpdateReceived
+                );
+                assert!(event.evidence.evidence_ready);
+                assert_eq!(event.evidence.slot, Some(99));
+                assert_eq!(event.evidence.write_version, Some(7));
+                assert_eq!(event.evidence.owner, Some(owner));
+                assert_eq!(event.evidence.data_len, Some(3));
+            }
+            SeerEvent::AccountUpdate(_) => {
+                panic!("BCV2 evidence must not be routed through AccountUpdate")
+            }
+            other => panic!("expected ExecutionAccountEvidence, got {:?}", other),
+        }
+
+        assert!(
+            ipc_receiver.try_recv().is_err(),
+            "canonical decode failure should not emit AccountUpdate"
         );
     }
 

@@ -19,7 +19,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use borsh::BorshDeserialize;
@@ -29,8 +29,9 @@ use smallvec::SmallVec;
 use tracing::{debug, info, trace, warn};
 
 use crate::grpc_connection::{
-    AccountRegistry, PumpEvent, PUMP_FUN_PROGRAM_ID, PUMP_SWAP_PROGRAM_ID,
+    AccountRegistry, Bcv2AccountContext, PumpEvent, PUMP_FUN_PROGRAM_ID, PUMP_SWAP_PROGRAM_ID,
 };
+use crate::ipc::{EventPriority, IpcSender};
 use crate::rpc_http_client::new_async_rpc_client;
 use crate::types::{record_trade_outcome_metric, InstructionProvenance, TradeOutcome};
 
@@ -3323,6 +3324,11 @@ use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
 use std::str::FromStr;
 
+use ghost_core::{
+    ExecutionAccountEvidence, ExecutionAccountEvidenceSource, ExecutionAccountEvidenceStatus,
+    ExecutionAccountRole,
+};
+
 const COMPUTE_BUDGET_PROGRAM_ID: &str = "ComputeBudget111111111111111111111111111111";
 const ASSOCIATED_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 const SYSTEM_PROGRAM_ID: &str = "11111111111111111111111111111111";
@@ -3356,12 +3362,14 @@ struct RuntimeTradeContext {
 
 const BCV2_RPC_HYDRATION_QUEUE_CAP: usize = 1024;
 const BCV2_RPC_HYDRATION_TIMEOUT_MS: u64 = 750;
+const BCV2_EVIDENCE_SEND_TIMEOUT_MS: u64 = 250;
 
 #[derive(Debug, Clone)]
 struct Bcv2HydrationRequest {
     pubkey: String,
     signature: String,
     observed_slot: Option<u64>,
+    context: Bcv2AccountContext,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3402,6 +3410,195 @@ impl Bcv2RpcHydrationEvidence {
     }
 }
 
+fn bcv2_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn non_default_pubkey(pubkey: Pubkey) -> Option<Pubkey> {
+    (pubkey != Pubkey::default()).then_some(pubkey)
+}
+
+fn build_execution_account_evidence(
+    context: &Bcv2AccountContext,
+    source: ExecutionAccountEvidenceSource,
+    status: ExecutionAccountEvidenceStatus,
+    evidence_ready: bool,
+    slot: Option<u64>,
+    context_slot: Option<u64>,
+    write_version: Option<u64>,
+    owner: Option<Pubkey>,
+    data_len: Option<u64>,
+    reason: Option<String>,
+    detected_at_ms: u64,
+    received_at_ms: u64,
+) -> ExecutionAccountEvidence {
+    ExecutionAccountEvidence {
+        role: ExecutionAccountRole::BondingCurveV2,
+        account_pubkey: context.account_pubkey,
+        base_mint: context.base_mint,
+        pool_id: context.pool_id,
+        canonical_bonding_curve: context.canonical_bonding_curve,
+        source,
+        status,
+        slot,
+        context_slot,
+        write_version,
+        owner,
+        data_len,
+        tx_signature: context.tx_signature.clone(),
+        observed_instruction_index: context.observed_instruction_index,
+        observed_account_position: context.observed_account_position,
+        provenance_status: context.provenance_status.clone(),
+        detected_at_ms,
+        received_at_ms,
+        evidence_ready,
+        reason,
+    }
+}
+
+fn emit_execution_account_evidence_background(
+    ipc_sender: Option<&IpcSender>,
+    evidence: ExecutionAccountEvidence,
+    source_label: &'static str,
+) {
+    let Some(ipc_sender) = ipc_sender.cloned() else {
+        return;
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn(async move {
+                let send_result = tokio::time::timeout(
+                    Duration::from_millis(BCV2_EVIDENCE_SEND_TIMEOUT_MS),
+                    ipc_sender.send_execution_account_evidence(evidence, EventPriority::High),
+                )
+                .await;
+                match send_result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        warn!(
+                            error = %err,
+                            source = source_label,
+                            "BCV2_EXECUTION_ACCOUNT_EVIDENCE_SEND_FAILED"
+                        );
+                    }
+                    Err(_) => {
+                        warn!(
+                            source = source_label,
+                            timeout_ms = BCV2_EVIDENCE_SEND_TIMEOUT_MS,
+                            "BCV2_EXECUTION_ACCOUNT_EVIDENCE_SEND_TIMEOUT"
+                        );
+                    }
+                }
+            });
+        }
+        Err(_) => {
+            warn!(
+                source = source_label,
+                "BCV2_EXECUTION_ACCOUNT_EVIDENCE_SEND_SKIPPED_NO_RUNTIME"
+            );
+        }
+    }
+}
+
+async fn send_execution_account_evidence(
+    ipc_sender: Option<&IpcSender>,
+    evidence: ExecutionAccountEvidence,
+    source_label: &'static str,
+) {
+    let Some(ipc_sender) = ipc_sender else {
+        return;
+    };
+    if let Err(err) = ipc_sender
+        .send_execution_account_evidence(evidence, EventPriority::High)
+        .await
+    {
+        warn!(
+            error = %err,
+            source = source_label,
+            "BCV2_EXECUTION_ACCOUNT_EVIDENCE_SEND_FAILED"
+        );
+    }
+}
+
+fn bcv2_context_from_trade(
+    bcv2: Pubkey,
+    signature: String,
+    observed_slot: Option<u64>,
+    trade: &TradeEvent,
+) -> Bcv2AccountContext {
+    let provenance = trade.bonding_curve_v2_provenance.as_ref();
+    Bcv2AccountContext {
+        account_pubkey: bcv2,
+        base_mint: non_default_pubkey(trade.mint),
+        pool_id: non_default_pubkey(trade.pool_amm_id),
+        canonical_bonding_curve: non_default_pubkey(trade.pool_amm_id),
+        tx_signature: Some(signature),
+        observed_instruction_index: provenance.and_then(|p| p.source_instruction_index),
+        observed_account_position: provenance.and_then(|p| p.instruction_account_position),
+        provenance_status: provenance.and_then(|p| p.provenance_status.clone()),
+        observed_slot,
+    }
+}
+
+fn bcv2_rpc_hydration_execution_evidence(
+    request: &Bcv2HydrationRequest,
+    evidence: &Bcv2RpcHydrationEvidence,
+) -> ExecutionAccountEvidence {
+    let received_at_ms = bcv2_now_ms();
+    let owner = evidence
+        .owner
+        .as_deref()
+        .and_then(|owner| Pubkey::from_str(owner).ok());
+    build_execution_account_evidence(
+        &request.context,
+        ExecutionAccountEvidenceSource::RpcHydration,
+        if evidence.ready {
+            ExecutionAccountEvidenceStatus::RpcReady
+        } else {
+            ExecutionAccountEvidenceStatus::RpcMissing
+        },
+        evidence.ready,
+        request.observed_slot,
+        evidence.context_slot,
+        None,
+        owner,
+        evidence.data_len.map(|len| len as u64),
+        evidence.error_class.clone(),
+        received_at_ms,
+        received_at_ms,
+    )
+}
+
+fn emit_bcv2_rpc_hydration_evidence_background(
+    ipc_sender: Option<&IpcSender>,
+    request: &Bcv2HydrationRequest,
+    evidence: &Bcv2RpcHydrationEvidence,
+) {
+    emit_execution_account_evidence_background(
+        ipc_sender,
+        bcv2_rpc_hydration_execution_evidence(request, evidence),
+        "rpc_hydration",
+    );
+}
+
+async fn send_bcv2_rpc_hydration_evidence(
+    ipc_sender: Option<&IpcSender>,
+    request: &Bcv2HydrationRequest,
+    evidence: &Bcv2RpcHydrationEvidence,
+) {
+    send_execution_account_evidence(
+        ipc_sender,
+        bcv2_rpc_hydration_execution_evidence(request, evidence),
+        "rpc_hydration",
+    )
+    .await;
+}
+
 #[derive(Clone)]
 struct Bcv2HydrationService {
     endpoint: Arc<str>,
@@ -3409,10 +3606,11 @@ struct Bcv2HydrationService {
     rx: Arc<ParkingMutex<Option<tokio::sync::mpsc::Receiver<Bcv2HydrationRequest>>>>,
     worker_started: Arc<AtomicBool>,
     queued_pubkeys: Arc<DashSet<String>>,
+    ipc_sender: Option<IpcSender>,
 }
 
 impl Bcv2HydrationService {
-    fn new(endpoint: impl Into<String>) -> Self {
+    fn new(endpoint: impl Into<String>, ipc_sender: Option<IpcSender>) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(BCV2_RPC_HYDRATION_QUEUE_CAP);
         Self {
             endpoint: Arc::from(endpoint.into()),
@@ -3420,6 +3618,7 @@ impl Bcv2HydrationService {
             rx: Arc::new(ParkingMutex::new(Some(rx))),
             worker_started: Arc::new(AtomicBool::new(false)),
             queued_pubkeys: Arc::new(DashSet::new()),
+            ipc_sender,
         }
     }
 
@@ -3437,10 +3636,11 @@ impl Bcv2HydrationService {
         };
         let endpoint = Arc::clone(&self.endpoint);
         let queued_pubkeys = Arc::clone(&self.queued_pubkeys);
+        let ipc_sender = self.ipc_sender.clone();
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
-                    run_bcv2_hydration_worker(endpoint, rx, queued_pubkeys).await;
+                    run_bcv2_hydration_worker(endpoint, rx, queued_pubkeys, ipc_sender).await;
                 });
                 true
             }
@@ -3459,10 +3659,12 @@ impl Bcv2HydrationService {
 
         if !self.ensure_worker_started() {
             self.queued_pubkeys.remove(&request.pubkey);
-            record_bcv2_rpc_hydration_evidence(
-                &request.pubkey,
+            let evidence = Bcv2RpcHydrationEvidence::missing(None, "no_tokio_runtime", 0);
+            record_bcv2_rpc_hydration_evidence(&request.pubkey, &request, &evidence);
+            emit_bcv2_rpc_hydration_evidence_background(
+                self.ipc_sender.as_ref(),
                 &request,
-                &Bcv2RpcHydrationEvidence::missing(None, "no_tokio_runtime", 0),
+                &evidence,
             );
             return;
         }
@@ -3471,18 +3673,22 @@ impl Bcv2HydrationService {
             Ok(()) => {}
             Err(tokio::sync::mpsc::error::TrySendError::Full(request)) => {
                 self.queued_pubkeys.remove(&request.pubkey);
-                record_bcv2_rpc_hydration_evidence(
-                    &request.pubkey,
+                let evidence = Bcv2RpcHydrationEvidence::missing(None, "queue_full", 0);
+                record_bcv2_rpc_hydration_evidence(&request.pubkey, &request, &evidence);
+                emit_bcv2_rpc_hydration_evidence_background(
+                    self.ipc_sender.as_ref(),
                     &request,
-                    &Bcv2RpcHydrationEvidence::missing(None, "queue_full", 0),
+                    &evidence,
                 );
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(request)) => {
                 self.queued_pubkeys.remove(&request.pubkey);
-                record_bcv2_rpc_hydration_evidence(
-                    &request.pubkey,
+                let evidence = Bcv2RpcHydrationEvidence::missing(None, "worker_closed", 0);
+                record_bcv2_rpc_hydration_evidence(&request.pubkey, &request, &evidence);
+                emit_bcv2_rpc_hydration_evidence_background(
+                    self.ipc_sender.as_ref(),
                     &request,
-                    &Bcv2RpcHydrationEvidence::missing(None, "worker_closed", 0),
+                    &evidence,
                 );
             }
         }
@@ -3493,6 +3699,7 @@ async fn run_bcv2_hydration_worker(
     endpoint: Arc<str>,
     mut rx: tokio::sync::mpsc::Receiver<Bcv2HydrationRequest>,
     queued_pubkeys: Arc<DashSet<String>>,
+    ipc_sender: Option<IpcSender>,
 ) {
     let rpc = new_async_rpc_client(endpoint.to_string());
     let commitment = CommitmentConfig::processed();
@@ -3534,6 +3741,7 @@ async fn run_bcv2_hydration_worker(
             Err(_) => Bcv2RpcHydrationEvidence::missing(None, "invalid_pubkey", 0),
         };
         record_bcv2_rpc_hydration_evidence(&request.pubkey, &request, &evidence);
+        send_bcv2_rpc_hydration_evidence(ipc_sender.as_ref(), &request, &evidence).await;
         queued_pubkeys.remove(&request.pubkey);
     }
 }
@@ -3586,6 +3794,7 @@ pub struct BinaryParser {
     account_reg: AccountRegistry,
     resolve_queue: ResolveQueue,
     complete_tracker: CompleteTracker,
+    ipc_sender: Option<IpcSender>,
     bcv2_hydrator: Option<Bcv2HydrationService>,
 }
 
@@ -3603,15 +3812,25 @@ impl BinaryParser {
         account_reg: AccountRegistry,
         rpc_endpoint: Option<String>,
     ) -> Self {
+        Self::with_account_registry_bcv2_hydration_and_ipc(verbose, account_reg, rpc_endpoint, None)
+    }
+
+    pub fn with_account_registry_bcv2_hydration_and_ipc(
+        verbose: bool,
+        account_reg: AccountRegistry,
+        rpc_endpoint: Option<String>,
+        ipc_sender: Option<IpcSender>,
+    ) -> Self {
         let bcv2_hydrator = rpc_endpoint
             .filter(|endpoint| !endpoint.trim().is_empty())
-            .map(Bcv2HydrationService::new);
+            .map(|endpoint| Bcv2HydrationService::new(endpoint, ipc_sender.clone()));
         Self {
             verbose,
             curve_mint_reg: CurveMintRegistry::new(),
             account_reg,
             resolve_queue: ResolveQueue::with_default_cap(),
             complete_tracker: CompleteTracker::new(),
+            ipc_sender,
             bcv2_hydrator,
         }
     }
@@ -4373,6 +4592,7 @@ impl BinaryParser {
             populate_trade_toolchain_fingerprint_from_source_tx(event, trade);
             register_route_compatible_observed_bcv2(
                 &self.account_reg,
+                self.ipc_sender.as_ref(),
                 self.bcv2_hydrator.as_ref(),
                 trade,
             );
@@ -6026,6 +6246,7 @@ fn populate_trade_toolchain_fingerprint_from_source_tx(
 
 fn register_route_compatible_observed_bcv2(
     account_reg: &AccountRegistry,
+    ipc_sender: Option<&IpcSender>,
     hydrator: Option<&Bcv2HydrationService>,
     trade: &TradeEvent,
 ) -> bool {
@@ -6040,7 +6261,6 @@ fn register_route_compatible_observed_bcv2(
     }
 
     let pubkey = bcv2.to_string();
-    let inserted = account_reg.insert_bcv2(pubkey.clone());
     let observed_slot = provenance.source_slot.or(trade.slot);
     let observed_slot_label = observed_slot
         .map(|slot| slot.to_string())
@@ -6063,6 +6283,9 @@ fn register_route_compatible_observed_bcv2(
         .source_tx_signature
         .clone()
         .unwrap_or_else(|| trade.signature.to_string());
+    let context = bcv2_context_from_trade(bcv2, signature.clone(), observed_slot, trade);
+
+    let inserted = account_reg.insert_bcv2_with_context(context.clone());
 
     info!(
         "BCV2_EXACT_WATCH_REGISTERED pubkey={} inserted={} signature={} observed_slot={} observed_slot_index={} instruction_index={} buy_variant={} registry_version={}",
@@ -6076,11 +6299,51 @@ fn register_route_compatible_observed_bcv2(
         account_reg.version()
     );
 
+    let detected_at_ms = trade.compat_event_ts_ms().unwrap_or_else(bcv2_now_ms);
+    let received_at_ms = bcv2_now_ms();
+    emit_execution_account_evidence_background(
+        ipc_sender,
+        build_execution_account_evidence(
+            &context,
+            ExecutionAccountEvidenceSource::ObservedTxMeta,
+            ExecutionAccountEvidenceStatus::DiscoveryHint,
+            false,
+            observed_slot,
+            None,
+            None,
+            None,
+            None,
+            None,
+            detected_at_ms,
+            received_at_ms,
+        ),
+        "observed_tx_meta",
+    );
+    emit_execution_account_evidence_background(
+        ipc_sender,
+        build_execution_account_evidence(
+            &context,
+            ExecutionAccountEvidenceSource::ExactWatchRegistered,
+            ExecutionAccountEvidenceStatus::SubscriptionRequested,
+            false,
+            observed_slot,
+            None,
+            None,
+            None,
+            None,
+            None,
+            detected_at_ms,
+            received_at_ms,
+        ),
+        "exact_watch_registered",
+    );
+
     if let Some(hydrator) = hydrator {
         hydrator.enqueue(Bcv2HydrationRequest {
             pubkey,
             signature,
             observed_slot,
+            context,
         });
     }
 
@@ -6266,6 +6529,7 @@ pub fn peek_trade_pool_id(event: &crate::types::GeyserEvent) -> Option<solana_sd
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::{create_ipc_channel, IpcChannelConfig, SeerEvent};
     use metrics::{
         Counter, CounterFn, Gauge, Histogram, Key, KeyName, Recorder, SharedString, Unit,
     };
@@ -10175,6 +10439,30 @@ mod tests {
         }
     }
 
+    fn sample_bcv2_hydration_request(
+        account_pubkey: Pubkey,
+        base_mint: Pubkey,
+        pool_id: Pubkey,
+        canonical_bonding_curve: Pubkey,
+    ) -> Bcv2HydrationRequest {
+        Bcv2HydrationRequest {
+            pubkey: account_pubkey.to_string(),
+            signature: "bcv2-sig".to_string(),
+            observed_slot: Some(42),
+            context: Bcv2AccountContext {
+                account_pubkey,
+                base_mint: Some(base_mint),
+                pool_id: Some(pool_id),
+                canonical_bonding_curve: Some(canonical_bonding_curve),
+                tx_signature: Some("bcv2-sig".to_string()),
+                observed_instruction_index: Some(3),
+                observed_account_position: Some(PUMP_IDX_BONDING_CURVE_V2 as u32),
+                provenance_status: Some("route_compatible".to_string()),
+                observed_slot: Some(42),
+            },
+        }
+    }
+
     #[test]
     fn route_compatible_observed_bcv2_registers_exact_watch() {
         let registry = AccountRegistry::new();
@@ -10193,7 +10481,7 @@ mod tests {
 
         let baseline_version = registry.version();
         assert!(register_route_compatible_observed_bcv2(
-            &registry, None, &trade
+            &registry, None, None, &trade
         ));
 
         assert!(registry.contains_bcv2(&bonding_curve_v2.to_string()));
@@ -10201,6 +10489,76 @@ mod tests {
             registry.version() > baseline_version,
             "route-compatible observed bcv2 must change the active exact-watch request surface"
         );
+    }
+
+    #[tokio::test]
+    async fn route_compatible_observed_bcv2_emits_execution_account_evidence() {
+        let registry = AccountRegistry::new();
+        let (ipc_sender, mut ipc_receiver, _metrics) =
+            create_ipc_channel(IpcChannelConfig::default());
+        let signature = solana_sdk::signature::Signature::new_unique();
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let signer = Pubkey::new_unique();
+        let bonding_curve_v2 = Pubkey::new_unique();
+        let mut trade = sample_trade_event(signature, pool, mint, signer, Some(0));
+        trade.bonding_curve_v2 = Some(bonding_curve_v2);
+        trade.bonding_curve_v2_provenance = Some(observed_bcv2_provenance(
+            signature,
+            bonding_curve_v2,
+            "route_compatible",
+        ));
+
+        assert!(register_route_compatible_observed_bcv2(
+            &registry,
+            Some(&ipc_sender),
+            None,
+            &trade
+        ));
+
+        let mut observed = Vec::new();
+        for _ in 0..2 {
+            let event = tokio::time::timeout(Duration::from_millis(250), ipc_receiver.recv())
+                .await
+                .expect("evidence event should arrive")
+                .expect("IPC channel must remain open");
+            match event {
+                SeerEvent::ExecutionAccountEvidence(event) => {
+                    observed.push((
+                        event.evidence.source,
+                        event.evidence.status,
+                        event.evidence.evidence_ready,
+                        event.evidence.account_pubkey,
+                        event.evidence.base_mint,
+                        event.evidence.pool_id,
+                        event.evidence.canonical_bonding_curve,
+                    ));
+                }
+                SeerEvent::AccountUpdate(_) => {
+                    panic!("BCV2 execution evidence must not use AccountUpdate")
+                }
+                other => panic!("expected ExecutionAccountEvidence, got {:?}", other),
+            }
+        }
+
+        assert!(observed.contains(&(
+            ExecutionAccountEvidenceSource::ObservedTxMeta,
+            ExecutionAccountEvidenceStatus::DiscoveryHint,
+            false,
+            bonding_curve_v2,
+            Some(mint),
+            Some(pool),
+            Some(pool),
+        )));
+        assert!(observed.contains(&(
+            ExecutionAccountEvidenceSource::ExactWatchRegistered,
+            ExecutionAccountEvidenceStatus::SubscriptionRequested,
+            false,
+            bonding_curve_v2,
+            Some(mint),
+            Some(pool),
+            Some(pool),
+        )));
     }
 
     #[test]
@@ -10221,7 +10579,7 @@ mod tests {
 
         let baseline_version = registry.version();
         assert!(!register_route_compatible_observed_bcv2(
-            &registry, None, &trade
+            &registry, None, None, &trade
         ));
 
         assert!(!registry.contains_bcv2(&bonding_curve_v2.to_string()));
@@ -10230,6 +10588,34 @@ mod tests {
             baseline_version,
             "non-route-compatible observed tx meta must remain a hint only"
         );
+    }
+
+    #[tokio::test]
+    async fn non_route_compatible_observed_bcv2_emits_no_execution_account_evidence() {
+        let registry = AccountRegistry::new();
+        let (ipc_sender, mut ipc_receiver, _metrics) =
+            create_ipc_channel(IpcChannelConfig::default());
+        let signature = solana_sdk::signature::Signature::new_unique();
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let signer = Pubkey::new_unique();
+        let bonding_curve_v2 = Pubkey::new_unique();
+        let mut trade = sample_trade_event(signature, pool, mint, signer, Some(0));
+        trade.bonding_curve_v2 = Some(bonding_curve_v2);
+        trade.bonding_curve_v2_provenance = Some(observed_bcv2_provenance(
+            signature,
+            bonding_curve_v2,
+            "tx_failed",
+        ));
+
+        assert!(!register_route_compatible_observed_bcv2(
+            &registry,
+            Some(&ipc_sender),
+            None,
+            &trade
+        ));
+
+        assert!(ipc_receiver.try_recv().is_err());
     }
 
     #[test]
@@ -10255,6 +10641,56 @@ mod tests {
         assert_eq!(evidence.latency_ms, 9);
         assert!(evidence.owner.is_none());
         assert!(evidence.data_len.is_none());
+    }
+
+    #[test]
+    fn bcv2_hydration_ready_builds_rpc_ready_execution_evidence() {
+        let account_pubkey = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let pool_id = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let request = sample_bcv2_hydration_request(account_pubkey, base_mint, pool_id, pool_id);
+        let hydration = Bcv2RpcHydrationEvidence::ready(123, owner.to_string(), 256, 7);
+
+        let evidence = bcv2_rpc_hydration_execution_evidence(&request, &hydration);
+
+        assert_eq!(evidence.role, ExecutionAccountRole::BondingCurveV2);
+        assert_eq!(evidence.account_pubkey, account_pubkey);
+        assert_eq!(evidence.base_mint, Some(base_mint));
+        assert_eq!(evidence.pool_id, Some(pool_id));
+        assert_eq!(evidence.canonical_bonding_curve, Some(pool_id));
+        assert_eq!(
+            evidence.source,
+            ExecutionAccountEvidenceSource::RpcHydration
+        );
+        assert_eq!(evidence.status, ExecutionAccountEvidenceStatus::RpcReady);
+        assert!(evidence.evidence_ready);
+        assert_eq!(evidence.context_slot, Some(123));
+        assert_eq!(evidence.owner, Some(owner));
+        assert_eq!(evidence.data_len, Some(256));
+        assert!(evidence.reason.is_none());
+    }
+
+    #[test]
+    fn bcv2_hydration_missing_builds_rpc_missing_execution_evidence() {
+        let account_pubkey = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let pool_id = Pubkey::new_unique();
+        let request = sample_bcv2_hydration_request(account_pubkey, base_mint, pool_id, pool_id);
+        let hydration = Bcv2RpcHydrationEvidence::missing(Some(123), "missing_on_rpc", 9);
+
+        let evidence = bcv2_rpc_hydration_execution_evidence(&request, &hydration);
+
+        assert_eq!(
+            evidence.source,
+            ExecutionAccountEvidenceSource::RpcHydration
+        );
+        assert_eq!(evidence.status, ExecutionAccountEvidenceStatus::RpcMissing);
+        assert!(!evidence.evidence_ready);
+        assert_eq!(evidence.context_slot, Some(123));
+        assert_eq!(evidence.owner, None);
+        assert_eq!(evidence.data_len, None);
+        assert_eq!(evidence.reason.as_deref(), Some("missing_on_rpc"));
     }
 
     #[test]

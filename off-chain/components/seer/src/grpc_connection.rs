@@ -304,10 +304,24 @@ impl DualLaneChannel {
 
 // ─── Dynamic account registry ─────────────────────────────────────────────────
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bcv2AccountContext {
+    pub account_pubkey: Pubkey,
+    pub base_mint: Option<Pubkey>,
+    pub pool_id: Option<Pubkey>,
+    pub canonical_bonding_curve: Option<Pubkey>,
+    pub tx_signature: Option<String>,
+    pub observed_instruction_index: Option<u32>,
+    pub observed_account_position: Option<u32>,
+    pub provenance_status: Option<String>,
+    pub observed_slot: Option<u64>,
+}
+
 #[derive(Clone, Default)]
 pub struct AccountRegistry {
     generic_accounts: Arc<DashSet<String>>,
     bcv2_accounts: Arc<DashSet<String>>,
+    bcv2_contexts: Arc<DashMap<String, Bcv2AccountContext>>,
     curve_accounts: Arc<DashSet<String>>,
     pool_accounts: Arc<DashSet<String>>,
     mint_accounts: Arc<DashSet<String>>,
@@ -433,6 +447,13 @@ impl AccountRegistry {
         Self::record_touch(&self.last_touch, &self.touch_seq, &addr);
         self.bcv2_resub_notify.notify_one();
         inserted
+    }
+
+    #[inline(always)]
+    pub fn insert_bcv2_with_context(&self, context: Bcv2AccountContext) -> bool {
+        let addr = context.account_pubkey.to_string();
+        self.bcv2_contexts.insert(addr.clone(), context);
+        self.insert_bcv2(addr)
     }
 
     #[inline(always)]
@@ -654,6 +675,7 @@ impl AccountRegistry {
             true,
         );
         if removed {
+            self.bcv2_contexts.remove(addr);
             self.bcv2_resub_notify.notify_one();
         }
         removed
@@ -673,6 +695,13 @@ impl AccountRegistry {
     #[inline(always)]
     pub fn contains_bcv2(&self, addr: &str) -> bool {
         self.bcv2_accounts.contains(addr)
+    }
+
+    #[inline(always)]
+    pub fn bcv2_context(&self, addr: &str) -> Option<Bcv2AccountContext> {
+        self.bcv2_contexts
+            .get(addr)
+            .map(|entry| entry.value().clone())
     }
 }
 
@@ -4206,6 +4235,45 @@ mod tests {
         assert!(r.insert("generic-A"));
         assert!(r.version() > v_bcv2);
     }
+
+    #[test]
+    fn bcv2_context_roundtrip_and_remove() {
+        let r = AccountRegistry::new();
+        let account_pubkey = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let pool_id = Pubkey::new_unique();
+        let canonical_bonding_curve = Pubkey::new_unique();
+        let context = Bcv2AccountContext {
+            account_pubkey,
+            base_mint: Some(base_mint),
+            pool_id: Some(pool_id),
+            canonical_bonding_curve: Some(canonical_bonding_curve),
+            tx_signature: Some("bcv2-sig".to_string()),
+            observed_instruction_index: Some(4),
+            observed_account_position: Some(16),
+            provenance_status: Some("route_compatible".to_string()),
+            observed_slot: Some(77),
+        };
+
+        assert!(r.insert_bcv2_with_context(context.clone()));
+        assert!(r.contains_bcv2(&account_pubkey.to_string()));
+
+        let observed = r
+            .bcv2_context(&account_pubkey.to_string())
+            .expect("bcv2 context must be stored");
+        assert_eq!(observed, context);
+        assert_eq!(observed.base_mint, Some(base_mint));
+        assert_eq!(observed.pool_id, Some(pool_id));
+        assert_eq!(
+            observed.canonical_bonding_curve,
+            Some(canonical_bonding_curve)
+        );
+
+        assert!(r.remove_bcv2(&account_pubkey.to_string()));
+        assert!(!r.contains_bcv2(&account_pubkey.to_string()));
+        assert!(r.bcv2_context(&account_pubkey.to_string()).is_none());
+    }
+
     #[test]
     fn registry_snapshot_all() {
         let r = AccountRegistry::new();
