@@ -527,23 +527,23 @@ impl AccountRegistry {
     /// provider cap favors the newest session-relevant accounts instead of
     /// starving one lane behind another.
     pub fn snapshot_exact_watch_accounts(&self, budget: usize) -> Vec<String> {
-        let mut merged: Vec<String> = self
+        let mut merged: Vec<(String, u64)> = self
             .curve_accounts
             .iter()
             .map(|value| value.clone())
             .chain(self.pool_accounts.iter().map(|value| value.clone()))
             .chain(self.bcv2_accounts.iter().map(|value| value.clone()))
             .chain(self.generic_accounts.iter().map(|value| value.clone()))
+            .map(|value| {
+                let rank = self.touch_rank(&value);
+                (value, rank)
+            })
             .collect();
-        merged.sort_by(|a, b| {
-            self.touch_rank(b)
-                .cmp(&self.touch_rank(a))
-                .then_with(|| a.cmp(b))
-        });
+        Self::sort_ranked_accounts_by_recency(&mut merged);
 
         let mut out = Vec::with_capacity(budget);
         let mut seen = BTreeSet::new();
-        for value in merged {
+        for (value, _) in merged {
             if seen.insert(value.clone()) {
                 out.push(value);
                 if out.len() >= budget {
@@ -561,14 +561,21 @@ impl AccountRegistry {
             .unwrap_or_default()
     }
 
+    fn sort_ranked_accounts_by_recency(accounts: &mut [(String, u64)]) {
+        accounts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    }
+
     fn snapshot_set_by_recency(&self, set: &DashSet<String>) -> Vec<String> {
-        let mut out: Vec<String> = set.iter().map(|r| r.clone()).collect();
-        out.sort_by(|a, b| {
-            self.touch_rank(b)
-                .cmp(&self.touch_rank(a))
-                .then_with(|| a.cmp(b))
-        });
-        out
+        let mut out: Vec<(String, u64)> = set
+            .iter()
+            .map(|entry| {
+                let value = entry.clone();
+                let rank = self.touch_rank(&value);
+                (value, rank)
+            })
+            .collect();
+        Self::sort_ranked_accounts_by_recency(&mut out);
+        out.into_iter().map(|(value, _)| value).collect()
     }
 
     pub fn snapshot_primary_global_exact_accounts(&self, budget: usize) -> Vec<String> {
@@ -4814,6 +4821,59 @@ mod tests {
         assert_eq!(counts.bcv2_dropped, 6);
         assert!(!tracked_accounts.contains(&"bcv2-000".to_string()));
         assert!(tracked_accounts.contains(&format!("bcv2-{:03}", EXACT_ACCOUNT_PAYLOAD_CAP + 5)));
+    }
+
+    #[test]
+    fn account_registry_recency_sort_uses_total_order_for_ties() {
+        let mut ranked = vec![
+            ("bcv2-b".to_string(), 7),
+            ("bcv2-c".to_string(), 9),
+            ("bcv2-a".to_string(), 7),
+        ];
+
+        AccountRegistry::sort_ranked_accounts_by_recency(&mut ranked);
+
+        assert_eq!(
+            ranked,
+            vec![
+                ("bcv2-c".to_string(), 9),
+                ("bcv2-a".to_string(), 7),
+                ("bcv2-b".to_string(), 7),
+            ]
+        );
+    }
+
+    #[test]
+    fn primary_global_exact_snapshot_survives_concurrent_bcv2_retouch() {
+        let r = Arc::new(AccountRegistry::new());
+        let account_count = EXACT_ACCOUNT_PAYLOAD_CAP + 32;
+        for i in 0..account_count {
+            r.insert_bcv2(format!("bcv2-{i:03}"));
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut handles = Vec::new();
+        for worker in 0..4 {
+            let registry = Arc::clone(&r);
+            let stop = Arc::clone(&stop);
+            handles.push(std::thread::spawn(move || {
+                let mut index = worker;
+                while !stop.load(Ordering::Relaxed) {
+                    registry.insert_bcv2(format!("bcv2-{index:03}"));
+                    index = (index + 7) % account_count;
+                }
+            }));
+        }
+
+        for _ in 0..200 {
+            let snapshot = r.snapshot_primary_global_exact_accounts(EXACT_ACCOUNT_PAYLOAD_CAP);
+            assert!(snapshot.len() <= EXACT_ACCOUNT_PAYLOAD_CAP);
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        for handle in handles {
+            handle.join().expect("bcv2 retouch thread must not panic");
+        }
     }
 
     #[test]
