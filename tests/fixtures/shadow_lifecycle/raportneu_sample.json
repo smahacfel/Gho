@@ -1,0 +1,62 @@
+[
+  {
+    "candidate_id": "EsuK9TuRwE3zcrkFrRNWP193w6Rn9Wk1pc1MuKVRpump_9rFN75jKP2BbQ2UUxnENEzWQgfWofCGsc8CLyAjgtwzW_1777170307154",
+    "close_reason": "Target",
+    "curve_t0_event_ts_ms": 1777170299012,
+    "entry_execution_ts_ms": 1777170307409,
+    "close_ts_ms": 1777170323162,
+    "position_duration_ms": 15753,
+    "entry_price_logged": 7.474232171051712e-08,
+    "effective_exit_price_sol": 1.2004600262113267e-07,
+    "final_pnl_pct": 60.61315714285713,
+    "match_slot": 415691992,
+    "fills": [
+      {
+        "fill_index": 1,
+        "target_sample_slot": 415692030,
+        "shadow_exit_vs_onchain_executable_pct": -8.894484904153899e-06,
+        "shadow_exit_vs_onchain_spot_pct": -1.017989602643754
+      }
+    ]
+  },
+  {
+    "candidate_id": "9MRm3g36Ua7xvX19Cy5vBH6QKHQDLWMi9nthQD9Ypump_EymaaoJUmZKQH8E4HskFaRy4HQjM6ZjHPxav1DLkhV4Q_1777174190419",
+    "close_reason": "TimeStop",
+    "curve_t0_event_ts_ms": 1777174182339,
+    "entry_execution_ts_ms": 1777174190659,
+    "close_ts_ms": 1777174275667,
+    "position_duration_ms": 85008,
+    "entry_price_logged": 1.1009954177081576e-07,
+    "effective_exit_price_sol": 1.0776830980186648e-07,
+    "final_pnl_pct": -2.1173857142857138,
+    "match_slot": 415701800,
+    "fills": [
+      {
+        "fill_index": 1,
+        "target_sample_slot": 415701946,
+        "shadow_exit_vs_onchain_executable_pct": -1.4594739117246291e-05,
+        "shadow_exit_vs_onchain_spot_pct": -1.0115625776899062
+      }
+    ]
+  },
+  {
+    "candidate_id": "4UVphW8QiNqQTL7dUfMv7SLbUgFEYb3zRthaPc2npump_FUfsrDjQKRebkLgTXsdKZ3pJY57wUjkoFfvwaRkPVeqe_1777177319313",
+    "close_reason": "StopLoss",
+    "curve_t0_event_ts_ms": 1777177311228,
+    "entry_execution_ts_ms": 1777177319572,
+    "close_ts_ms": 1777177373664,
+    "position_duration_ms": 54092,
+    "entry_price_logged": 7.022503908579759e-08,
+    "effective_exit_price_sol": 3.257623190268237e-08,
+    "final_pnl_pct": -53.61165714285714,
+    "match_slot": 415709740,
+    "fills": [
+      {
+        "fill_index": 1,
+        "target_sample_slot": 415709879,
+        "shadow_exit_vs_onchain_executable_pct": -3.0795904748526226e-05,
+        "shadow_exit_vs_onchain_spot_pct": -1.0099517286648263
+      }
+    ]
+  }
+]

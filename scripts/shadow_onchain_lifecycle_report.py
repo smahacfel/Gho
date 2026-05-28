@@ -236,6 +236,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--outcome-summary-output",
+        type=Path,
+        help=(
+            "Optional compact JSON output path for raportneu-style outcome rows. "
+            "The full JSONL output remains the source of truth."
+        ),
+    )
+    parser.add_argument(
         "--session-start-ms",
         type=int,
         help=(
@@ -1381,6 +1389,59 @@ def write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
             fh.write("\n")
 
 
+def write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=False) + "\n",
+        encoding="utf-8",
+    )
+
+
+def project_outcome_summary_row(row: dict[str, Any]) -> dict[str, Any]:
+    timing = row.get("timing") if isinstance(row.get("timing"), dict) else {}
+    shadow = row.get("shadow") if isinstance(row.get("shadow"), dict) else {}
+    onchain = row.get("onchain") if isinstance(row.get("onchain"), dict) else {}
+    onchain_entry = (
+        onchain.get("entry") if isinstance(onchain.get("entry"), dict) else {}
+    )
+    exit_fills = row.get("exit_fills") if isinstance(row.get("exit_fills"), list) else []
+
+    fills = []
+    for fill in exit_fills:
+        if not isinstance(fill, dict):
+            continue
+        fills.append(
+            {
+                "fill_index": fill.get("fill_index"),
+                "target_sample_slot": fill.get("target_sample_slot"),
+                "shadow_exit_vs_onchain_executable_pct": fill.get(
+                    "shadow_exit_vs_onchain_executable_pct"
+                ),
+                "shadow_exit_vs_onchain_spot_pct": fill.get(
+                    "shadow_exit_vs_onchain_spot_pct"
+                ),
+            }
+        )
+
+    return {
+        "candidate_id": row.get("candidate_id"),
+        "close_reason": row.get("close_reason"),
+        "curve_t0_event_ts_ms": timing.get("curve_t0_event_ts_ms"),
+        "entry_execution_ts_ms": timing.get("entry_execution_ts_ms"),
+        "close_ts_ms": timing.get("close_ts_ms"),
+        "position_duration_ms": timing.get("position_duration_ms"),
+        "entry_price_logged": shadow.get("entry_price_logged"),
+        "effective_exit_price_sol": shadow.get("effective_exit_price_sol"),
+        "final_pnl_pct": shadow.get("final_pnl_pct"),
+        "match_slot": onchain_entry.get("match_slot"),
+        "fills": fills,
+    }
+
+
+def project_outcome_summary_rows(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [project_outcome_summary_row(row) for row in rows]
+
+
 def summarize(
     rows: list[dict[str, Any]],
     skipped: Counter[str],
@@ -1477,8 +1538,15 @@ def main() -> int:
         for bundle in lifecycle_by_candidate.values()
         if bundle.position_closed is not None and bundle.position_closed.mint_id
     }
+    outcome_summary_output = (
+        resolve_runtime_path(inputs.config_path, str(args.outcome_summary_output))
+        if args.outcome_summary_output is not None
+        else None
+    )
     if not relevant_mints:
         write_jsonl(inputs.output_path, [])
+        if outcome_summary_output is not None:
+            write_json(outcome_summary_output, [])
         print(
             summarize([], Counter({"no_closed_positions_in_scope": 1}), inputs, scope_stats)
         )
@@ -1500,6 +1568,8 @@ def main() -> int:
         )
     )
     write_jsonl(inputs.output_path, rows)
+    if outcome_summary_output is not None:
+        write_json(outcome_summary_output, project_outcome_summary_rows(rows))
     print(summarize(rows, skipped, inputs, scope_stats))
     return 0
 
