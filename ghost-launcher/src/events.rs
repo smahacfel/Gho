@@ -709,6 +709,10 @@ pub struct PoolTransaction {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bonding_curve_v2_provenance: Option<ObservedAccountMetaProvenance>,
 
+    /// Remaining accounts observed after the fixed legacy Pump.fun buy account list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub buy_remaining_accounts: Vec<String>,
+
     /// PumpPortal internal flag indicating unusual market conditions.
     /// Passed through for future analysis.
     #[serde(default)]

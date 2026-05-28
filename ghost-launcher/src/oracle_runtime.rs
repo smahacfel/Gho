@@ -5254,6 +5254,8 @@ struct P37ShadowProbeSelectionRecord {
     working_builder_bcv2_execution_evidence_data_len: Option<u64>,
     working_builder_bcv2_execution_evidence_slot: Option<u64>,
     working_builder_bcv2_execution_evidence_context_slot: Option<u64>,
+    working_builder_bcv2_terminal_route_exclusion: Option<bool>,
+    working_builder_bcv2_terminal_route_exclusion_reason: Option<String>,
     working_builder_creator_vault_pubkey: Option<String>,
     working_builder_creator_vault_source_authority: Option<String>,
     working_builder_creator_vault_rpc_load_status: Option<String>,
@@ -5474,6 +5476,8 @@ struct P37ShadowProbeTransportRecord {
     working_builder_bcv2_execution_evidence_data_len: Option<u64>,
     working_builder_bcv2_execution_evidence_slot: Option<u64>,
     working_builder_bcv2_execution_evidence_context_slot: Option<u64>,
+    working_builder_bcv2_terminal_route_exclusion: Option<bool>,
+    working_builder_bcv2_terminal_route_exclusion_reason: Option<String>,
     working_builder_creator_vault_pubkey: Option<String>,
     working_builder_creator_vault_source_authority: Option<String>,
     working_builder_creator_vault_rpc_load_status: Option<String>,
@@ -5993,6 +5997,8 @@ fn p37_shadow_probe_selection_record(
         working_builder_bcv2_execution_evidence_data_len: None,
         working_builder_bcv2_execution_evidence_slot: None,
         working_builder_bcv2_execution_evidence_context_slot: None,
+        working_builder_bcv2_terminal_route_exclusion: None,
+        working_builder_bcv2_terminal_route_exclusion_reason: None,
         working_builder_creator_vault_pubkey: None,
         working_builder_creator_vault_source_authority: None,
         working_builder_creator_vault_rpc_load_status: None,
@@ -6336,6 +6342,11 @@ fn p37_shadow_probe_artifact_records(
             .working_builder_bcv2_execution_evidence_slot,
         working_builder_bcv2_execution_evidence_context_slot: record
             .working_builder_bcv2_execution_evidence_context_slot,
+        working_builder_bcv2_terminal_route_exclusion: record
+            .working_builder_bcv2_terminal_route_exclusion,
+        working_builder_bcv2_terminal_route_exclusion_reason: record
+            .working_builder_bcv2_terminal_route_exclusion_reason
+            .clone(),
         working_builder_creator_vault_pubkey: record.working_builder_creator_vault_pubkey.clone(),
         working_builder_creator_vault_source_authority: record
             .working_builder_creator_vault_source_authority
@@ -6881,7 +6892,9 @@ fn p37_shadow_probe_parse_no_executable_route_bcv2(reason: &str) -> Option<Strin
     let pubkey = parts.next()?;
     if !matches!(
         route_reason,
-        "primary_route_bcv2_missing" | "primary_route_identity_not_authoritative"
+        "primary_route_bcv2_missing"
+            | "primary_route_identity_not_authoritative"
+            | P37_BCV2_TERMINAL_ROUTE_EXCLUSION_REASON
     ) || role != "bonding_curve_v2"
         || pubkey.trim().is_empty()
     {
@@ -6960,6 +6973,13 @@ impl P37ExecutableRouteResolutionDiagnostics {
     }
 
     fn terminal_reason(&self) -> Option<String> {
+        if self
+            .no_executable_route_account_set_reason
+            .as_deref()
+            .is_some_and(p37_is_bcv2_terminal_route_exclusion_reason)
+        {
+            return Some(P37_BCV2_TERMINAL_ROUTE_EXCLUSION_REASON.to_string());
+        }
         self.no_executable_route_account_set_reason
             .clone()
             .or_else(|| self.primary_route_not_ready_reason.clone())
@@ -6974,11 +6994,19 @@ impl P37ExecutableRouteResolutionDiagnostics {
                 self.route_resolution_status.clone(),
                 Some("lifecycle_label_candidate".to_string()),
             ),
-            Some("no_executable_route_account_set") => (
-                Some("not_executable_route".to_string()),
-                Some("no_executable_route_account_set".to_string()),
-                Some("not_lifecycle_label_eligible".to_string()),
-            ),
+            Some("no_executable_route_account_set") => {
+                let reason = self
+                    .no_executable_route_account_set_reason
+                    .as_deref()
+                    .filter(|reason| p37_is_bcv2_terminal_route_exclusion_reason(reason))
+                    .map(|_| P37_BCV2_TERMINAL_ROUTE_EXCLUSION_REASON.to_string())
+                    .unwrap_or_else(|| "no_executable_route_account_set".to_string());
+                (
+                    Some("not_executable_route".to_string()),
+                    Some(reason),
+                    Some("not_lifecycle_label_eligible".to_string()),
+                )
+            }
             Some(status) => (
                 Some("unknown".to_string()),
                 Some(status.to_string()),
@@ -7235,10 +7263,71 @@ const P37_LEGACY_BUY_UNSUPPORTED_ROUTE_REASON: &str =
     "legacy_buy_unsupported_builder_layout_requires_bcv2";
 const P37_EXECUTION_BUILDER_MODE_WORKING_BUILDER_PARITY: &str = "working_builder_parity";
 const P37_DEFAULT_EXECUTION_ACCOUNT_EVIDENCE_FRESHNESS_MS: u64 = 10_000;
+const P37_BCV2_TERMINAL_ROUTE_EXCLUSION_REASON: &str = "bcv2_not_persistent_or_not_loadable";
 
 fn p37_working_builder_parity_enabled(config: &P37ShadowProbeConfig) -> bool {
     config.enabled
         && config.p37_execution_builder_mode == P37_EXECUTION_BUILDER_MODE_WORKING_BUILDER_PARITY
+}
+
+fn p37_bcv2_terminal_route_closure_enabled(config: &P37ShadowProbeConfig) -> bool {
+    p37_working_builder_parity_enabled(config) && config.bcv2_terminal_route_closure_enabled
+}
+
+fn p37_bcv2_terminal_route_exclusion_failure_reason(pubkey: &str) -> String {
+    format!(
+        "no_executable_route_account_set:{P37_BCV2_TERMINAL_ROUTE_EXCLUSION_REASON}:bonding_curve_v2:{pubkey}"
+    )
+}
+
+fn p37_bcv2_terminal_route_exclusion_route_reason(pubkey: &str) -> String {
+    format!("{P37_BCV2_TERMINAL_ROUTE_EXCLUSION_REASON}:bonding_curve_v2:{pubkey}")
+}
+
+fn p37_is_bcv2_terminal_route_exclusion_reason(reason: &str) -> bool {
+    reason == P37_BCV2_TERMINAL_ROUTE_EXCLUSION_REASON
+        || reason.starts_with(&format!("{P37_BCV2_TERMINAL_ROUTE_EXCLUSION_REASON}:"))
+        || reason.starts_with(&format!(
+            "no_executable_route_account_set:{P37_BCV2_TERMINAL_ROUTE_EXCLUSION_REASON}:"
+        ))
+}
+
+fn p37_bcv2_terminal_route_exclusion_fields(
+    terminal_reason: Option<&str>,
+) -> (Option<bool>, Option<String>) {
+    if terminal_reason.is_some_and(p37_is_bcv2_terminal_route_exclusion_reason) {
+        (
+            Some(true),
+            Some(P37_BCV2_TERMINAL_ROUTE_EXCLUSION_REASON.to_string()),
+        )
+    } else {
+        (None, None)
+    }
+}
+
+fn p37_bcv2_terminal_route_closure_applies(
+    readiness: &P37WorkingBuilderBcv2ExecutionEvidenceReadiness,
+) -> bool {
+    if readiness.ready == Some(true) {
+        return false;
+    }
+    let missing_reason = matches!(
+        readiness.reason.as_deref(),
+        Some("missing_on_rpc")
+            | Some("account_missing")
+            | Some("account_not_found")
+            | Some("negative_evidence:rpc_missing")
+            | Some("negative_evidence:precheck_missing")
+            | Some("newer_negative_evidence:rpc_missing")
+            | Some("newer_negative_evidence:precheck_missing")
+    );
+    if matches!(
+        readiness.status.as_deref(),
+        Some("rpc_missing") | Some("precheck_missing")
+    ) {
+        return missing_reason;
+    }
+    missing_reason
 }
 
 fn p37_shadow_probe_manifest_entry_for_role<'a>(
@@ -7349,6 +7438,13 @@ fn p37_legacy_buy_missing_candidate_is_non_blocking(
             .and_then(|profile| profile.buy_instruction.accounts.get(13))
             .is_some_and(|account| account.pubkey == pubkey),
         "payer_pubkey" => request.payer_provenance == "ephemeral" && pubkey == request.payer_pubkey,
+        "buyback_fee_recipient" | "buyback_quote_account" => {
+            crate::components::trigger::TriggerComponent::counterfactual_probe_can_use_missing_legacy_buy_remaining_account(
+                request,
+                &pubkey,
+                &candidate.role,
+            )
+        }
         _ => false,
     }
 }
@@ -7471,16 +7567,6 @@ fn p37_shadow_probe_legacy_buy_route_diagnostics(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let curve_authoritative =
-        p37_legacy_buy_curve_authority_is_verified(curve_authority_status.as_deref());
-    if overrides.legacy_buy_curve.is_none() || !curve_authoritative {
-        missing_roles.push("bonding_curve".to_string());
-        if let Some(pubkey) = curve_pubkey.as_ref() {
-            missing_pubkeys.push(pubkey.clone());
-        }
-    }
-    let missing_roles = p37_shadow_probe_sorted_unique(missing_roles);
-    let missing_pubkeys = p37_shadow_probe_sorted_unique(missing_pubkeys);
     let manifest_ready = account_set_diagnostics
         .map(|diagnostics| {
             diagnostics.manifest_lookup_performed
@@ -7495,15 +7581,26 @@ fn p37_shadow_probe_legacy_buy_route_diagnostics(
         curve_rpc_load_status.as_deref(),
         curve_rpc_load_ready,
     );
-    let account_set_ready = overrides.legacy_buy_curve.is_some()
-        && curve_authoritative
+    let curve_authoritative =
+        p37_legacy_buy_curve_authority_is_verified(curve_authority_status.as_deref());
+    let shadow_legacy_curve_load_ready = overrides.legacy_buy_curve.is_some()
         && curve_rpc_load_ready == Some(true)
-        && manifest_ready;
-    let route_ready = false;
+        && matches!(
+            curve_authority_readiness_status.as_str(),
+            "authoritative_and_load_ready" | "load_ready_but_authority_unverified"
+        );
+    if !shadow_legacy_curve_load_ready {
+        missing_roles.push("bonding_curve".to_string());
+        if let Some(pubkey) = curve_pubkey.as_ref() {
+            missing_pubkeys.push(pubkey.clone());
+        }
+    }
+    let missing_roles = p37_shadow_probe_sorted_unique(missing_roles);
+    let missing_pubkeys = p37_shadow_probe_sorted_unique(missing_pubkeys);
+    let account_set_ready = shadow_legacy_curve_load_ready && manifest_ready;
+    let route_ready = account_set_ready;
     let route_not_ready_reason = if account_set_ready {
-        Some(P37_LEGACY_BUY_UNSUPPORTED_ROUTE_REASON.to_string())
-    } else if curve_authority_readiness_status == "load_ready_but_authority_unverified" {
-        Some("legacy_buy_curve_authority_not_verified".to_string())
+        None
     } else if curve_authority_readiness_status == "derived_mismatch_authoritative_source" {
         Some("legacy_buy_curve_authority_mismatch".to_string())
     } else if curve_authority_readiness_status == "authoritative_but_not_load_checked" {
@@ -7632,13 +7729,21 @@ fn p37_shadow_probe_route_resolution_diagnostics_with_mode(
             .then(|| bcv2_authority.pubkey.clone())
             .flatten()
     }) {
-        let primary_reason = bcv2_authority
-            .builder_required_curve_account_ready_reason
-            .clone()
-            .unwrap_or_else(|| "primary_route_bcv2_missing".to_string());
+        let bcv2_terminal_route_exclusion =
+            precheck_failure_reason.is_some_and(p37_is_bcv2_terminal_route_exclusion_reason);
+        let primary_reason = if bcv2_terminal_route_exclusion {
+            P37_BCV2_TERMINAL_ROUTE_EXCLUSION_REASON.to_string()
+        } else {
+            bcv2_authority
+                .builder_required_curve_account_ready_reason
+                .clone()
+                .unwrap_or_else(|| "primary_route_bcv2_missing".to_string())
+        };
         let fallback_attempted = fallback_route_kind.is_some();
         if working_builder_parity_mode {
-            let no_executable_reason = if primary_reason.contains("source_not_authoritative")
+            let no_executable_reason = if bcv2_terminal_route_exclusion {
+                p37_bcv2_terminal_route_exclusion_route_reason(&pubkey)
+            } else if primary_reason.contains("source_not_authoritative")
                 || primary_reason.contains("identity_not_authoritative")
             {
                 format!(
@@ -7652,7 +7757,11 @@ fn p37_shadow_probe_route_resolution_diagnostics_with_mode(
             return P37ExecutableRouteResolutionDiagnostics {
                 route_resolution_status: Some("no_executable_route_account_set".to_string()),
                 selected_route_kind: None,
-                selected_route_reason: Some("working_builder_final_manifest_not_ready".to_string()),
+                selected_route_reason: Some(if bcv2_terminal_route_exclusion {
+                    "bcv2_terminal_route_exclusion".to_string()
+                } else {
+                    "working_builder_final_manifest_not_ready".to_string()
+                }),
                 primary_route_kind: Some(primary_route_kind),
                 primary_route_ready: Some(false),
                 primary_route_not_ready_reason: Some(primary_reason),
@@ -8032,8 +8141,12 @@ fn p37_shadow_probe_apply_route_resolution_to_record(
     record.legacy_buy_route_not_ready_reason = resolution.legacy_buy_route_not_ready_reason;
     record.execution_feasibility_status = execution_feasibility_status;
     record.execution_feasibility_reason = execution_feasibility_reason;
+    let (terminal_route_exclusion, terminal_route_exclusion_reason) =
+        p37_bcv2_terminal_route_exclusion_fields(terminal_reason.as_deref());
     record.route_resolution_terminal_reason = terminal_reason;
     record.lifecycle_label_eligibility = lifecycle_label_eligibility;
+    record.working_builder_bcv2_terminal_route_exclusion = terminal_route_exclusion;
+    record.working_builder_bcv2_terminal_route_exclusion_reason = terminal_route_exclusion_reason;
 }
 
 async fn p37_shadow_probe_wait_for_required_account_readiness(
@@ -8363,6 +8476,8 @@ struct P37ShadowProbeExecutionDiagnostics {
     working_builder_bcv2_execution_evidence_data_len: Option<u64>,
     working_builder_bcv2_execution_evidence_slot: Option<u64>,
     working_builder_bcv2_execution_evidence_context_slot: Option<u64>,
+    working_builder_bcv2_terminal_route_exclusion: Option<bool>,
+    working_builder_bcv2_terminal_route_exclusion_reason: Option<String>,
     working_builder_creator_vault_pubkey: Option<String>,
     working_builder_creator_vault_source_authority: Option<String>,
     working_builder_creator_vault_rpc_load_status: Option<String>,
@@ -8435,6 +8550,7 @@ fn p37_shadow_probe_account_overrides_present(
         || overrides.buy_variant.is_some()
         || overrides.associated_bonding_curve.is_some()
         || overrides.bonding_curve_v2.is_some()
+        || !overrides.buy_remaining_accounts.is_empty()
         || overrides.legacy_buy_curve.is_some()
         || overrides.legacy_buy_curve_pubkey.is_some()
         || overrides.legacy_buy_curve_source.is_some()
@@ -8485,6 +8601,11 @@ fn p37_shadow_probe_derive_legacy_buy_account_overrides(
                 .as_deref()
                 .and_then(|value| Pubkey::try_from(value).ok()),
             bonding_curve_v2_provenance: tx.bonding_curve_v2_provenance.clone(),
+            buy_remaining_accounts: tx
+                .buy_remaining_accounts
+                .iter()
+                .filter_map(|value| Pubkey::try_from(value.as_str()).ok())
+                .collect(),
             ..Default::default()
         });
     }
@@ -10564,6 +10685,24 @@ fn p37_working_builder_final_manifest_failure_reason_with_execution_evidence(
     evidence_freshness_ms: u64,
     now_ms: u64,
 ) -> Option<String> {
+    p37_working_builder_final_manifest_failure_reason_with_execution_policy(
+        request,
+        diagnostics,
+        evidence_store,
+        evidence_freshness_ms,
+        now_ms,
+        false,
+    )
+}
+
+fn p37_working_builder_final_manifest_failure_reason_with_execution_policy(
+    request: &crate::components::trigger::PreparedBuyRequest,
+    diagnostics: &P37ShadowProbeAccountSetDiagnostics,
+    evidence_store: Option<&ExecutionAccountEvidenceStore>,
+    evidence_freshness_ms: u64,
+    now_ms: u64,
+    bcv2_terminal_route_closure_enabled: bool,
+) -> Option<String> {
     let creator_vault = p37_working_builder_creator_vault_readiness(request, Some(diagnostics));
     if !p37_working_builder_creator_vault_is_authoritative(
         creator_vault.source_authority.as_deref(),
@@ -10623,6 +10762,11 @@ fn p37_working_builder_final_manifest_failure_reason_with_execution_evidence(
                 now_ms,
             );
             if execution_evidence.ready != Some(true) {
+                if bcv2_terminal_route_closure_enabled
+                    && p37_bcv2_terminal_route_closure_applies(&execution_evidence)
+                {
+                    return Some(p37_bcv2_terminal_route_exclusion_failure_reason(pubkey));
+                }
                 return Some(format!(
                     "working_builder_final_manifest_execution_evidence_not_ready:bonding_curve_v2:{pubkey}:{}",
                     execution_evidence
@@ -10746,6 +10890,27 @@ fn p37_shadow_probe_classified_account_not_found_candidate(
                 ("route_specific_required_account", "conditional", None)
             }
         }
+        "buyback_fee_recipient" | "buyback_quote_account" => {
+            let observed_legacy_remaining = request
+                .zip(parsed_pubkey)
+                .map(|(request, pubkey)| {
+                    crate::components::trigger::TriggerComponent::counterfactual_probe_can_use_missing_legacy_buy_remaining_account(
+                        request,
+                        &pubkey,
+                        role,
+                    )
+                })
+                .unwrap_or(false);
+            if observed_legacy_remaining {
+                (
+                    "observed_legacy_buy_remaining_account",
+                    "non_fatal",
+                    Some("legacy_buy_remaining_account_not_precheck_required"),
+                )
+            } else {
+                ("program_or_sysvar", "fatal", None)
+            }
+        }
         "bonding_curve_v2"
         | "bonding_curve"
         | "associated_bonding_curve"
@@ -10759,8 +10924,7 @@ fn p37_shadow_probe_classified_account_not_found_candidate(
         | "pump_program"
         | "fee_program"
         | "global_volume_accumulator"
-        | "fee_config"
-        | "buyback_fee_recipient" => ("program_or_sysvar", "fatal", None),
+        | "fee_config" => ("program_or_sysvar", "fatal", None),
         "legacy_buy_instruction_account" | "routed_buy_instruction_account" => {
             ("route_specific_required_account", "conditional", None)
         }
@@ -12466,6 +12630,8 @@ fn p37_shadow_probe_execution_diagnostics(
     let route_resolution_terminal_reason = route_resolution.terminal_reason();
     let (execution_feasibility_status, execution_feasibility_reason, lifecycle_label_eligibility) =
         route_resolution.execution_feasibility();
+    let (terminal_route_exclusion, terminal_route_exclusion_reason) =
+        p37_bcv2_terminal_route_exclusion_fields(route_resolution_terminal_reason.as_deref());
     let selected_route_handoff = p37_selected_route_handoff_diagnostics_with_mode(
         request,
         account_set_diagnostics,
@@ -12721,6 +12887,14 @@ fn p37_shadow_probe_execution_diagnostics(
         working_builder_bcv2_execution_evidence_context_slot: working_builder
             .bcv2_execution_evidence_context_slot
             .or(record.working_builder_bcv2_execution_evidence_context_slot),
+        working_builder_bcv2_terminal_route_exclusion: terminal_route_exclusion
+            .or(record.working_builder_bcv2_terminal_route_exclusion),
+        working_builder_bcv2_terminal_route_exclusion_reason: terminal_route_exclusion_reason
+            .or_else(|| {
+                record
+                    .working_builder_bcv2_terminal_route_exclusion_reason
+                    .clone()
+            }),
         working_builder_creator_vault_pubkey: working_builder.creator_vault_pubkey,
         working_builder_creator_vault_source_authority: working_builder
             .creator_vault_source_authority,
@@ -13138,6 +13312,10 @@ fn p37_shadow_probe_transport_from_event(
             .working_builder_bcv2_execution_evidence_slot,
         working_builder_bcv2_execution_evidence_context_slot: diagnostics
             .working_builder_bcv2_execution_evidence_context_slot,
+        working_builder_bcv2_terminal_route_exclusion: diagnostics
+            .working_builder_bcv2_terminal_route_exclusion,
+        working_builder_bcv2_terminal_route_exclusion_reason: diagnostics
+            .working_builder_bcv2_terminal_route_exclusion_reason,
         working_builder_creator_vault_pubkey: diagnostics.working_builder_creator_vault_pubkey,
         working_builder_creator_vault_source_authority: diagnostics
             .working_builder_creator_vault_source_authority,
@@ -13509,6 +13687,10 @@ fn p37_shadow_probe_transport_from_error(
             .working_builder_bcv2_execution_evidence_slot,
         working_builder_bcv2_execution_evidence_context_slot: diagnostics
             .working_builder_bcv2_execution_evidence_context_slot,
+        working_builder_bcv2_terminal_route_exclusion: diagnostics
+            .working_builder_bcv2_terminal_route_exclusion,
+        working_builder_bcv2_terminal_route_exclusion_reason: diagnostics
+            .working_builder_bcv2_terminal_route_exclusion_reason,
         working_builder_creator_vault_pubkey: diagnostics.working_builder_creator_vault_pubkey,
         working_builder_creator_vault_source_authority: diagnostics
             .working_builder_creator_vault_source_authority,
@@ -14061,12 +14243,13 @@ async fn run_p37_shadow_probe_dispatch(
 
     let final_manifest_failure_reason = if working_builder_parity_mode {
         let evidence_store = oracle_runtime.execution_account_evidence_store();
-        p37_working_builder_final_manifest_failure_reason_with_execution_evidence(
+        p37_working_builder_final_manifest_failure_reason_with_execution_policy(
             &request,
             &final_manifest_diagnostics,
             Some(evidence_store.as_ref()),
             config.execution_account_evidence_freshness_ms,
             current_time_ms(),
+            p37_bcv2_terminal_route_closure_enabled(&config),
         )
     } else {
         p37_selected_route_final_manifest_failure_reason(&request, &final_manifest_diagnostics)
@@ -14077,6 +14260,9 @@ async fn run_p37_shadow_probe_dispatch(
             p37_shadow_probe_parse_working_builder_final_manifest_account_reason(&reason)
         {
             record.execution_account_readiness_role = Some(role);
+            record.execution_account_readiness_pubkey = Some(pubkey);
+        } else if let Some(pubkey) = p37_shadow_probe_parse_no_executable_route_bcv2(&reason) {
+            record.execution_account_readiness_role = Some("bonding_curve_v2".to_string());
             record.execution_account_readiness_pubkey = Some(pubkey);
         } else {
             record.execution_account_readiness_role = Some(if working_builder_parity_mode {
@@ -16140,6 +16326,7 @@ async fn execute_gatekeeper_buy_path(
                         has_associated_bonding_curve =
                             account_overrides.associated_bonding_curve.is_some(),
                         has_legacy_buy_curve = account_overrides.legacy_buy_curve.is_some(),
+                        buy_remaining_account_count = account_overrides.buy_remaining_accounts.len(),
                         token_program = %account_overrides
                             .token_program
                             .map(|value| value.to_string())
@@ -16194,6 +16381,10 @@ async fn execute_gatekeeper_buy_path(
                                 .config
                                 .p37_shadow_probe
                                 .execution_account_evidence_freshness_ms,
+                            bcv2_terminal_route_closure_enabled:
+                                p37_bcv2_terminal_route_closure_enabled(
+                                    &ctx.oracle_runtime.config.p37_shadow_probe,
+                                ),
                         });
                     let receipt = execute_gatekeeper_buy_via_trigger_with_fsc_gate(
                         trigger_component,
@@ -16318,6 +16509,7 @@ fn p37_selected_legacy_buy_fallback_overrides(
         associated_bonding_curve: primary.associated_bonding_curve,
         bonding_curve_v2: None,
         bonding_curve_v2_provenance: None,
+        buy_remaining_accounts: primary.buy_remaining_accounts.clone(),
         legacy_buy_curve: primary.legacy_buy_curve,
         legacy_buy_curve_pubkey: primary.legacy_buy_curve_pubkey,
         legacy_buy_curve_source: primary.legacy_buy_curve_source.clone(),
@@ -16421,6 +16613,7 @@ fn trigger_dispatch_failure_context_with_join_metadata(
 struct P37WorkingBuilderExecutionEvidenceContext {
     store: Arc<ExecutionAccountEvidenceStore>,
     freshness_ms: u64,
+    bcv2_terminal_route_closure_enabled: bool,
 }
 
 async fn active_shadow_simulation_load_precheck_receipt(
@@ -16438,12 +16631,13 @@ async fn active_shadow_simulation_load_precheck_receipt(
         let account_set_diagnostics =
             p37_shadow_probe_account_set_diagnostics(trigger_component, request).await;
         let reason = if let Some(context) = execution_evidence_context {
-            p37_working_builder_final_manifest_failure_reason_with_execution_evidence(
+            p37_working_builder_final_manifest_failure_reason_with_execution_policy(
                 request,
                 &account_set_diagnostics,
                 Some(context.store.as_ref()),
                 context.freshness_ms,
                 current_time_ms(),
+                context.bcv2_terminal_route_closure_enabled,
             )
         } else {
             p37_working_builder_final_manifest_failure_reason(request, &account_set_diagnostics)
@@ -18214,6 +18408,7 @@ fn derive_buy_account_overrides(
         }
         if overrides.buy_variant.is_none() {
             overrides.buy_variant = tx.buy_variant.as_deref().and_then(|value| match value {
+                "legacy_buy" => Some(trigger::PumpfunBuyVariant::LegacyBuy),
                 "routed_exact_sol_in" => Some(trigger::PumpfunBuyVariant::RoutedExactSolIn),
                 _ => None,
             });
@@ -18233,12 +18428,28 @@ fn derive_buy_account_overrides(
                 overrides.bonding_curve_v2_provenance = tx.bonding_curve_v2_provenance.clone();
             }
         }
+        if overrides.buy_remaining_accounts.is_empty() && !tx.buy_remaining_accounts.is_empty() {
+            overrides.buy_remaining_accounts = tx
+                .buy_remaining_accounts
+                .iter()
+                .filter_map(|value| Pubkey::try_from(value.as_str()).ok())
+                .collect();
+        }
+        let route_complete = match overrides.buy_variant {
+            Some(trigger::PumpfunBuyVariant::LegacyBuy) => {
+                !overrides.buy_remaining_accounts.is_empty()
+            }
+            Some(trigger::PumpfunBuyVariant::RoutedExactSolIn) => {
+                overrides.bonding_curve_v2.is_some()
+            }
+            None => false,
+        };
         if overrides.global_config.is_some()
             && overrides.fee_recipient.is_some()
             && overrides.token_program.is_some()
             && overrides.buy_variant.is_some()
             && overrides.associated_bonding_curve.is_some()
-            && overrides.bonding_curve_v2.is_some()
+            && route_complete
         {
             break;
         }
@@ -23985,6 +24196,195 @@ mod tests {
     }
 
     #[test]
+    fn p37_working_builder_terminal_route_closure_marks_exact_bcv2_rpc_missing_not_executable() {
+        let request = test_working_builder_prepared_buy_request();
+        let bcv2 = request
+            .account_overrides
+            .bonding_curve_v2
+            .expect("working request bcv2");
+        let mut diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        diagnostics.manifest_lookup_performed = true;
+
+        let evidence_store = ExecutionAccountEvidenceStore::new();
+        let mut missing = test_bcv2_execution_account_evidence(
+            bcv2,
+            ExecutionAccountEvidenceSource::RpcHydration,
+            ExecutionAccountEvidenceStatus::RpcMissing,
+            false,
+        );
+        missing.received_at_ms = 30_000;
+        missing.owner = None;
+        missing.data_len = None;
+        missing.reason = Some("missing_on_rpc".to_string());
+        evidence_store.upsert(missing);
+
+        let reason = p37_working_builder_final_manifest_failure_reason_with_execution_policy(
+            &request,
+            &diagnostics,
+            Some(&evidence_store),
+            10_000,
+            30_001,
+            true,
+        )
+        .expect("terminal route closure must fail closed before manifest-ready");
+
+        assert_eq!(
+            reason,
+            p37_bcv2_terminal_route_exclusion_failure_reason(&bcv2.to_string())
+        );
+
+        let route_resolution = p37_shadow_probe_route_resolution_diagnostics_with_mode(
+            Some(&request),
+            Some(&diagnostics),
+            Some(reason.as_str()),
+            None,
+            true,
+        );
+        assert_eq!(
+            route_resolution.route_resolution_status.as_deref(),
+            Some("no_executable_route_account_set")
+        );
+        assert_eq!(
+            route_resolution.primary_route_not_ready_reason.as_deref(),
+            Some(P37_BCV2_TERMINAL_ROUTE_EXCLUSION_REASON)
+        );
+        assert_eq!(
+            route_resolution.terminal_reason().as_deref(),
+            Some(P37_BCV2_TERMINAL_ROUTE_EXCLUSION_REASON)
+        );
+        assert_eq!(
+            route_resolution.execution_feasibility(),
+            (
+                Some("not_executable_route".to_string()),
+                Some(P37_BCV2_TERMINAL_ROUTE_EXCLUSION_REASON.to_string()),
+                Some("not_lifecycle_label_eligible".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn p37_working_builder_terminal_route_closure_is_config_gated() {
+        let request = test_working_builder_prepared_buy_request();
+        let bcv2 = request
+            .account_overrides
+            .bonding_curve_v2
+            .expect("working request bcv2");
+        let mut diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        diagnostics.manifest_lookup_performed = true;
+
+        let evidence_store = ExecutionAccountEvidenceStore::new();
+        let mut missing = test_bcv2_execution_account_evidence(
+            bcv2,
+            ExecutionAccountEvidenceSource::RpcHydration,
+            ExecutionAccountEvidenceStatus::RpcMissing,
+            false,
+        );
+        missing.received_at_ms = 40_000;
+        missing.reason = Some("missing_on_rpc".to_string());
+        evidence_store.upsert(missing);
+
+        let reason = p37_working_builder_final_manifest_failure_reason_with_execution_policy(
+            &request,
+            &diagnostics,
+            Some(&evidence_store),
+            10_000,
+            40_001,
+            false,
+        )
+        .expect("disabled terminal route closure must preserve PR6 evidence gate");
+
+        assert_eq!(
+            reason,
+            format!(
+                "working_builder_final_manifest_execution_evidence_not_ready:bonding_curve_v2:{bcv2}:missing_on_rpc"
+            )
+        );
+    }
+
+    #[test]
+    fn p37_working_builder_terminal_route_closure_does_not_classify_discovery_or_stale_ready() {
+        let request = test_working_builder_prepared_buy_request();
+        let bcv2 = request
+            .account_overrides
+            .bonding_curve_v2
+            .expect("working request bcv2");
+        let mut diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        diagnostics.manifest_lookup_performed = true;
+
+        let discovery_store = ExecutionAccountEvidenceStore::new();
+        let mut discovery = test_bcv2_execution_account_evidence(
+            bcv2,
+            ExecutionAccountEvidenceSource::ObservedTxMeta,
+            ExecutionAccountEvidenceStatus::DiscoveryHint,
+            false,
+        );
+        discovery.received_at_ms = 50_000;
+        discovery_store.upsert(discovery);
+        let discovery_reason =
+            p37_working_builder_final_manifest_failure_reason_with_execution_policy(
+                &request,
+                &diagnostics,
+                Some(&discovery_store),
+                10_000,
+                50_001,
+                true,
+            )
+            .expect("discovery evidence must remain non-ready");
+        assert!(discovery_reason.ends_with(":not_execution_load_ready:discovery_hint"));
+
+        let stale_store = ExecutionAccountEvidenceStore::new();
+        let mut stale = test_bcv2_execution_account_evidence(
+            bcv2,
+            ExecutionAccountEvidenceSource::RpcHydration,
+            ExecutionAccountEvidenceStatus::RpcReady,
+            true,
+        );
+        stale.received_at_ms = 1_000;
+        stale.owner = Some(Pubkey::new_unique());
+        stale.data_len = Some(512);
+        stale_store.upsert(stale);
+        let stale_reason = p37_working_builder_final_manifest_failure_reason_with_execution_policy(
+            &request,
+            &diagnostics,
+            Some(&stale_store),
+            500,
+            2_000,
+            true,
+        )
+        .expect("stale ready evidence must remain a non-terminal evidence failure");
+        assert!(stale_reason.ends_with(":execution_evidence_stale"));
+
+        let provider_timeout_store = ExecutionAccountEvidenceStore::new();
+        let mut provider_timeout = test_bcv2_execution_account_evidence(
+            bcv2,
+            ExecutionAccountEvidenceSource::RpcHydration,
+            ExecutionAccountEvidenceStatus::RpcMissing,
+            false,
+        );
+        provider_timeout.received_at_ms = 51_000;
+        provider_timeout.reason = Some("provider_timeout".to_string());
+        provider_timeout_store.upsert(provider_timeout);
+        let provider_timeout_reason =
+            p37_working_builder_final_manifest_failure_reason_with_execution_policy(
+                &request,
+                &diagnostics,
+                Some(&provider_timeout_store),
+                10_000,
+                51_001,
+                true,
+            )
+            .expect(
+                "provider timeout must remain an evidence failure, not a terminal route exclusion",
+            );
+        assert_eq!(
+            provider_timeout_reason,
+            format!(
+                "working_builder_final_manifest_execution_evidence_not_ready:bonding_curve_v2:{bcv2}:provider_timeout"
+            )
+        );
+    }
+
+    #[test]
     fn p37_working_builder_account_source_bcv2_reconciliation_class_has_closed_failure_buckets() {
         assert_eq!(
             p37_working_builder_bcv2_reconciliation_class(
@@ -24695,23 +25095,21 @@ mod tests {
                 .as_deref(),
             Some("authoritative_and_load_ready")
         );
-        assert_eq!(resolution.legacy_buy_route_ready, Some(false));
-        assert_eq!(
-            resolution.legacy_buy_route_not_ready_reason.as_deref(),
-            Some(P37_LEGACY_BUY_UNSUPPORTED_ROUTE_REASON)
-        );
+        assert_eq!(resolution.legacy_buy_route_ready, Some(true));
+        assert_eq!(resolution.legacy_buy_route_not_ready_reason, None);
         assert_eq!(
             resolution.route_resolution_status.as_deref(),
-            Some("no_executable_route_account_set")
+            Some("primary_route_ready")
         );
         assert_eq!(
-            resolution.no_executable_route_account_set_reason.as_deref(),
-            Some(P37_LEGACY_BUY_UNSUPPORTED_ROUTE_REASON)
+            resolution.selected_route_kind.as_deref(),
+            Some("legacy_buy")
         );
+        assert_eq!(resolution.no_executable_route_account_set_reason, None);
     }
 
     #[test]
-    fn p37_legacy_buy_load_ready_but_unverified_does_not_select_route() {
+    fn p37_legacy_buy_load_ready_but_unverified_selects_shadow_legacy_route() {
         let curve_pubkey = Pubkey::new_unique();
         let mut request = test_prepared_buy_request();
         request.account_overrides.buy_variant = Some(trigger::PumpfunBuyVariant::LegacyBuy);
@@ -24742,10 +25140,15 @@ mod tests {
             Some("load_ready_but_authority_unverified")
         );
         assert_eq!(resolution.legacy_buy_curve_rpc_load_ready, Some(true));
-        assert_eq!(resolution.legacy_buy_route_ready, Some(false));
+        assert_eq!(resolution.legacy_buy_route_ready, Some(true));
+        assert_eq!(resolution.legacy_buy_route_not_ready_reason, None);
         assert_eq!(
-            resolution.primary_route_not_ready_reason.as_deref(),
-            Some("legacy_buy_curve_authority_not_verified")
+            resolution.route_resolution_status.as_deref(),
+            Some("primary_route_ready")
+        );
+        assert_eq!(
+            resolution.selected_route_kind.as_deref(),
+            Some("legacy_buy")
         );
     }
 
@@ -24817,7 +25220,7 @@ mod tests {
     }
 
     #[test]
-    fn p37_route_resolver_primary_bcv2_missing_excludes_unsupported_legacy_fallback() {
+    fn p37_route_resolver_primary_bcv2_missing_selects_ready_legacy_fallback() {
         let mut request = test_prepared_buy_request();
         let bcv2 = Pubkey::new_unique().to_string();
         let legacy_curve_pubkey = Pubkey::new_unique();
@@ -24855,9 +25258,16 @@ mod tests {
 
         assert_eq!(
             resolution.route_resolution_status.as_deref(),
-            Some("no_executable_route_account_set")
+            Some("fallback_route_ready")
         );
-        assert_eq!(resolution.selected_route_kind, None);
+        assert_eq!(
+            resolution.selected_route_kind.as_deref(),
+            Some("legacy_buy")
+        );
+        assert_eq!(
+            resolution.selected_route_reason.as_deref(),
+            Some("fallback_route_passed_simulation_load_readiness")
+        );
         assert_eq!(
             resolution.primary_route_kind.as_deref(),
             Some("routed_exact_sol_in")
@@ -24871,12 +25281,9 @@ mod tests {
             resolution.fallback_route_kind.as_deref(),
             Some("legacy_buy")
         );
-        assert_eq!(resolution.fallback_route_attempted, Some(false));
-        assert_eq!(resolution.fallback_route_ready, Some(false));
-        assert_eq!(
-            resolution.fallback_route_not_ready_reason.as_deref(),
-            Some(P37_LEGACY_BUY_FALLBACK_SUPPORT_STATUS)
-        );
+        assert_eq!(resolution.fallback_route_attempted, Some(true));
+        assert_eq!(resolution.fallback_route_ready, Some(true));
+        assert_eq!(resolution.fallback_route_not_ready_reason, None);
         let legacy_curve_pubkey_string = legacy_curve_pubkey.to_string();
         assert_eq!(
             resolution.legacy_buy_curve_pubkey.as_deref(),
@@ -24905,30 +25312,19 @@ mod tests {
             resolution.legacy_buy_account_set_status.as_deref(),
             Some("ready")
         );
-        assert_eq!(resolution.legacy_buy_route_ready, Some(false));
-        assert_eq!(
-            resolution.legacy_buy_route_not_ready_reason.as_deref(),
-            Some(P37_LEGACY_BUY_UNSUPPORTED_ROUTE_REASON)
-        );
-        assert_eq!(
-            resolution.fallback_failure_class.as_deref(),
-            Some("fallback_unsupported_builder_layout")
-        );
+        assert_eq!(resolution.legacy_buy_route_ready, Some(true));
+        assert_eq!(resolution.legacy_buy_route_not_ready_reason, None);
+        assert_eq!(resolution.fallback_failure_class, None);
         assert!(resolution.fallback_missing_roles.is_empty());
         assert!(resolution.fallback_missing_pubkeys.is_empty());
         assert!(resolution.fallback_account_sources.is_empty());
         assert!(!resolution.fallback_simulation_load_account_set.is_empty());
         assert!(!resolution.fallback_required_precheck_account_set.is_empty());
-        let expected_reason =
-            format!("{P37_LEGACY_BUY_FALLBACK_SUPPORT_STATUS}:bonding_curve_v2:{bcv2}");
-        assert_eq!(
-            resolution.no_executable_route_account_set_reason.as_deref(),
-            Some(expected_reason.as_str())
-        );
+        assert_eq!(resolution.no_executable_route_account_set_reason, None);
     }
 
     #[test]
-    fn p37_route_resolver_primary_bcv2_manifest_missing_excludes_unsupported_legacy_fallback_without_precheck_reason(
+    fn p37_route_resolver_primary_bcv2_manifest_missing_selects_ready_legacy_fallback_without_precheck_reason(
     ) {
         let mut request = test_prepared_buy_request();
         let bcv2 = Pubkey::new_unique().to_string();
@@ -24967,24 +25363,19 @@ mod tests {
 
         assert_eq!(
             resolution.route_resolution_status.as_deref(),
-            Some("no_executable_route_account_set")
-        );
-        assert_eq!(resolution.selected_route_kind, None);
-        assert_eq!(resolution.fallback_route_attempted, Some(false));
-        assert_eq!(resolution.fallback_route_ready, Some(false));
-        assert_eq!(
-            resolution.fallback_route_not_ready_reason.as_deref(),
-            Some(P37_LEGACY_BUY_FALLBACK_SUPPORT_STATUS)
+            Some("fallback_route_ready")
         );
         assert_eq!(
-            resolution.fallback_failure_class.as_deref(),
-            Some("fallback_unsupported_builder_layout")
+            resolution.selected_route_kind.as_deref(),
+            Some("legacy_buy")
         );
-        assert_eq!(
-            resolution.legacy_buy_route_not_ready_reason.as_deref(),
-            Some(P37_LEGACY_BUY_UNSUPPORTED_ROUTE_REASON)
-        );
-        assert!(resolution.no_executable_route_account_set_reason.is_some());
+        assert_eq!(resolution.fallback_route_attempted, Some(true));
+        assert_eq!(resolution.fallback_route_ready, Some(true));
+        assert_eq!(resolution.fallback_route_not_ready_reason, None);
+        assert_eq!(resolution.fallback_failure_class, None);
+        assert_eq!(resolution.legacy_buy_route_ready, Some(true));
+        assert_eq!(resolution.legacy_buy_route_not_ready_reason, None);
+        assert_eq!(resolution.no_executable_route_account_set_reason, None);
     }
 
     #[test]
@@ -25230,7 +25621,7 @@ mod tests {
 
     #[test]
     fn selected_legacy_buy_handoff_happens_before_precheck() {
-        p37_route_resolver_primary_bcv2_manifest_missing_excludes_unsupported_legacy_fallback_without_precheck_reason(
+        p37_route_resolver_primary_bcv2_manifest_missing_selects_ready_legacy_fallback_without_precheck_reason(
         );
     }
 
@@ -25391,29 +25782,22 @@ mod tests {
 
         assert_eq!(
             resolution.route_resolution_status.as_deref(),
-            Some("no_executable_route_account_set")
+            Some("primary_route_ready")
+        );
+        assert_eq!(
+            resolution.selected_route_kind.as_deref(),
+            Some("legacy_buy")
         );
         assert_eq!(
             resolution.legacy_buy_account_set_status.as_deref(),
             Some("ready")
         );
-        assert_eq!(resolution.legacy_buy_route_ready, Some(false));
-        assert_eq!(
-            resolution.legacy_buy_route_not_ready_reason.as_deref(),
-            Some(P37_LEGACY_BUY_UNSUPPORTED_ROUTE_REASON)
-        );
-        assert_eq!(
-            resolution.primary_route_not_ready_reason.as_deref(),
-            Some(P37_LEGACY_BUY_UNSUPPORTED_ROUTE_REASON)
-        );
-        assert_eq!(
-            resolution.no_executable_route_account_set_reason.as_deref(),
-            Some(P37_LEGACY_BUY_UNSUPPORTED_ROUTE_REASON)
-        );
-        assert_eq!(
-            resolution.fallback_failure_class.as_deref(),
-            Some("fallback_unsupported_builder_layout")
-        );
+        assert_eq!(resolution.primary_route_ready, Some(true));
+        assert_eq!(resolution.legacy_buy_route_ready, Some(true));
+        assert_eq!(resolution.legacy_buy_route_not_ready_reason, None);
+        assert_eq!(resolution.primary_route_not_ready_reason, None);
+        assert_eq!(resolution.no_executable_route_account_set_reason, None);
+        assert_eq!(resolution.fallback_failure_class, None);
         assert!(resolution.legacy_buy_missing_roles.is_empty());
         assert!(resolution.legacy_buy_missing_pubkeys.is_empty());
     }
@@ -26988,6 +27372,7 @@ mod tests {
                 tx_success: Some(true),
                 ..Default::default()
             }),
+            buy_remaining_accounts: vec![],
             legacy_buy_curve: Some(p37_shadow_probe_test_legacy_curve()),
             legacy_buy_curve_pubkey: Some(legacy_curve_pubkey),
             legacy_buy_curve_source: Some("materialized_feature_set".to_string()),
@@ -27127,6 +27512,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -32867,6 +33253,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -32964,6 +33351,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -33022,6 +33410,7 @@ mod tests {
             associated_bonding_curve: Some(expected_assoc_curve.to_string()),
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -33113,6 +33502,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -33250,6 +33640,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -33323,6 +33714,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -33394,6 +33786,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -33465,6 +33858,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -33536,6 +33930,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -34829,6 +35224,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -34963,6 +35359,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -35188,6 +35585,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -35293,6 +35691,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -35372,6 +35771,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -35465,6 +35865,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -35586,6 +35987,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -35683,6 +36085,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -37782,6 +38185,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -37846,6 +38250,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -37986,6 +38391,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -38065,6 +38471,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -38142,6 +38549,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -38203,6 +38611,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -38270,6 +38679,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -38418,6 +38828,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -38479,6 +38890,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -38686,6 +39098,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -39072,6 +39485,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -40361,6 +40775,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -40479,6 +40894,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -40624,6 +41040,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -40782,6 +41199,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -40866,6 +41284,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,

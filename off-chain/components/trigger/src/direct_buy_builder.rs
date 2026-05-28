@@ -69,7 +69,12 @@ const BUYBACK_FEE_RECIPIENTS: [&str; 8] = [
     "A7hAgCzFw14fejgCp387JUJRMNyz4j89JKnhtKU8piqW",
 ];
 const BUY_EXACT_SOL_IN_DISCRIMINATOR: [u8; 8] = [0x38, 0xfc, 0x74, 0x08, 0x9e, 0xdf, 0xcd, 0x5f];
+const LEGACY_TRACK_VOLUME_ENABLED: u8 = 1;
 const ROUTED_TRACK_VOLUME_ENABLED: u8 = 1;
+pub const PUMPFUN_BUY_FIXED_ACCOUNT_COUNT: usize = 16;
+// Current legacy Pump.fun BUY compatibility path passes the buyback recipient
+// and its associated quote account as observed remaining accounts.
+pub const PUMPFUN_BUYBACK_REMAINING_ACCOUNT_COUNT: usize = 2;
 const FEE_SEED_CONST: [u8; 32] = [
     1, 86, 224, 246, 147, 102, 90, 207, 68, 219, 21, 104, 191, 23, 91, 170, 81, 137, 203, 151, 245,
     210, 255, 59, 101, 93, 43, 182, 253, 109, 24, 176,
@@ -77,9 +82,10 @@ const FEE_SEED_CONST: [u8; 32] = [
 
 /// Legacy Pump.fun `buy` discriminator (`global:buy`).
 ///
-/// Current on-chain `global:buy` transactions still use this 24-byte payload,
-/// but with the newer extended account list. Do not infer the account layout
-/// from the discriminator alone.
+/// Current shadow-burnin legacy restore keeps the legacy discriminator and
+/// token-amount payload order, but mainnet buys require a buyback-fee
+/// recipient tail. Do not infer routed BCV2 requirements from the
+/// discriminator alone.
 const LEGACY_BUY_DISCRIMINATOR: [u8; 8] = [0x66, 0x06, 0x3d, 0x12, 0x01, 0xda, 0xeb, 0xea];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -240,6 +246,36 @@ impl DirectBuyBuilder {
         amount_sol_in: u64,
         min_tokens_out: u64,
     ) -> Instruction {
+        Self::build_buy_ix_with_accounts_and_remaining(
+            payer,
+            mint,
+            token_program,
+            global_config,
+            fee_recipient,
+            creator_pubkey,
+            buy_variant,
+            associated_bonding_curve,
+            bonding_curve_v2_override,
+            &[],
+            amount_sol_in,
+            min_tokens_out,
+        )
+    }
+
+    pub fn build_buy_ix_with_accounts_and_remaining(
+        payer: &Pubkey,
+        mint: &Pubkey,
+        token_program: &Pubkey,
+        global_config: Option<Pubkey>,
+        fee_recipient: Option<Pubkey>,
+        creator_pubkey: Option<Pubkey>,
+        buy_variant: Option<PumpfunBuyVariant>,
+        associated_bonding_curve: Option<Pubkey>,
+        bonding_curve_v2_override: Option<Pubkey>,
+        buy_remaining_accounts: &[Pubkey],
+        amount_sol_in: u64,
+        min_tokens_out: u64,
+    ) -> Instruction {
         let program_id = Self::pump_program_id();
         let buy_variant = buy_variant.unwrap_or(PumpfunBuyVariant::RoutedExactSolIn);
         let fee_program =
@@ -281,10 +317,11 @@ impl DirectBuyBuilder {
         // Build instruction data for the selected on-chain buy variant.
         let data = match buy_variant {
             PumpfunBuyVariant::LegacyBuy => {
-                let mut data = Vec::with_capacity(24);
+                let mut data = Vec::with_capacity(25);
                 data.extend_from_slice(&LEGACY_BUY_DISCRIMINATOR);
                 data.extend_from_slice(&min_tokens_out.to_le_bytes());
                 data.extend_from_slice(&amount_sol_in.to_le_bytes());
+                data.push(LEGACY_TRACK_VOLUME_ENABLED);
                 data
             }
             PumpfunBuyVariant::RoutedExactSolIn => {
@@ -297,9 +334,9 @@ impl DirectBuyBuilder {
             }
         };
 
-        // Build account metas. Both current Pump.fun buy payload variants use
-        // the extended account list observed on-chain; `LegacyBuy` differs by
-        // discriminator and data args, not by account count.
+        // Build account metas. Current pump.fun legacy buys require the
+        // buyback-fee recipient as the first trailing account, while BCV2 is
+        // only part of the routed exact-sol-in layout.
         let mut accounts = vec![
             AccountMeta::new_readonly(global, false), // 0: global state
             AccountMeta::new(fee_recipient, false),   // 1: fee recipient
@@ -319,17 +356,32 @@ impl DirectBuyBuilder {
         accounts.push(AccountMeta::new(user_volume_accumulator, false)); // 13
         accounts.push(AccountMeta::new_readonly(fee_config, false)); // 14
         accounts.push(AccountMeta::new_readonly(fee_program, false)); // 15
-        accounts.push(AccountMeta::new_readonly(bonding_curve_v2, false)); // 16
-        accounts.push(AccountMeta::new(
-            Self::routed_buyback_fee_recipient(payer, mint),
-            false,
-        )); // 17
+        match buy_variant {
+            PumpfunBuyVariant::LegacyBuy => {
+                accounts.extend(
+                    buy_remaining_accounts
+                        .iter()
+                        .map(|pubkey| AccountMeta::new(*pubkey, false)),
+                );
+            }
+            PumpfunBuyVariant::RoutedExactSolIn => {
+                accounts.push(AccountMeta::new_readonly(bonding_curve_v2, false)); // 16
+                accounts.push(AccountMeta::new(
+                    Self::routed_buyback_fee_recipient(payer, mint),
+                    false,
+                )); // 17
+            }
+        }
 
         Instruction {
             program_id,
             accounts,
             data,
         }
+    }
+
+    pub fn valid_buyback_remaining_account_count(count: usize) -> bool {
+        count == 0 || count == PUMPFUN_BUYBACK_REMAINING_ACCOUNT_COUNT
     }
 
     /// Derive the bonding curve PDA for a given mint
@@ -594,7 +646,7 @@ mod tests {
         );
 
         assert_eq!(&ix.data[0..8], &LEGACY_BUY_DISCRIMINATOR);
-        assert_eq!(ix.accounts.len(), 18);
+        assert_eq!(ix.accounts.len(), PUMPFUN_BUY_FIXED_ACCOUNT_COUNT);
         assert_eq!(
             ix.accounts[9].pubkey,
             Pubkey::find_program_address(
@@ -617,14 +669,7 @@ mod tests {
             DirectBuyBuilder::derive_user_volume_accumulator(&payer).0
         );
         assert_eq!(ix.accounts[15].pubkey, DirectBuyBuilder::fee_program_id());
-        assert_eq!(
-            ix.accounts[16].pubkey,
-            DirectBuyBuilder::derive_bonding_curve_v2(&mint).0
-        );
-        assert_eq!(
-            ix.accounts[17].pubkey,
-            DirectBuyBuilder::routed_buyback_fee_recipient(&payer, &mint)
-        );
+        assert_eq!(ix.accounts.len(), PUMPFUN_BUY_FIXED_ACCOUNT_COUNT);
         assert_eq!(
             u64::from_le_bytes(ix.data[8..16].try_into().unwrap()),
             1_024_500_538_013
@@ -633,7 +678,8 @@ mod tests {
             u64::from_le_bytes(ix.data[16..24].try_into().unwrap()),
             47_958_222
         );
-        assert_eq!(ix.data.len(), 24);
+        assert_eq!(ix.data[24], LEGACY_TRACK_VOLUME_ENABLED);
+        assert_eq!(ix.data.len(), 25);
     }
 
     #[test]
@@ -666,12 +712,15 @@ mod tests {
     }
 
     #[test]
-    fn e5a_legacy_buy_final_manifest_uses_extended_bcv2_layout() {
+    fn legacy_buy_final_manifest_uses_buyback_tail_without_bcv2() {
         let payer = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
         let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).expect("valid token program");
+        let remaining = (0..PUMPFUN_BUYBACK_REMAINING_ACCOUNT_COUNT)
+            .map(|_| Pubkey::new_unique())
+            .collect::<Vec<_>>();
 
-        let ix = DirectBuyBuilder::build_buy_ix_with_accounts(
+        let ix = DirectBuyBuilder::build_buy_ix_with_accounts_and_remaining(
             &payer,
             &mint,
             &token_program,
@@ -680,18 +729,25 @@ mod tests {
             None,
             Some(PumpfunBuyVariant::LegacyBuy),
             None,
+            None,
+            &remaining,
             2_000_000,
             42,
         );
 
         assert_eq!(&ix.data[0..8], &LEGACY_BUY_DISCRIMINATOR);
-        assert_eq!(ix.data.len(), 24);
-        assert_eq!(ix.accounts.len(), 18);
+        assert_eq!(ix.data[24], LEGACY_TRACK_VOLUME_ENABLED);
+        assert_eq!(ix.data.len(), 25);
         assert_eq!(
-            ix.accounts[16].pubkey,
-            DirectBuyBuilder::derive_bonding_curve_v2(&mint).0
+            ix.accounts.len(),
+            PUMPFUN_BUY_FIXED_ACCOUNT_COUNT + PUMPFUN_BUYBACK_REMAINING_ACCOUNT_COUNT
         );
-        assert_ne!(ix.accounts[3].pubkey, ix.accounts[16].pubkey);
+        assert_eq!(ix.accounts[16].pubkey, remaining[0]);
+        assert_eq!(ix.accounts[17].pubkey, remaining[1]);
+        assert!(!ix
+            .accounts
+            .iter()
+            .any(|meta| meta.pubkey == DirectBuyBuilder::derive_bonding_curve_v2(&mint).0));
     }
 
     #[test]
@@ -723,7 +779,7 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_buy_extended_accounts_match_observed_chain_required_layout() {
+    fn test_legacy_buy_accounts_match_shadow_burnin_buyback_layout() {
         let payer =
             Pubkey::from_str("CMFqYV58y9wk5CwRm7vf8gfeD8yRMxFn2kgv49zHdbkK").expect("valid payer");
         let mint =
@@ -738,20 +794,7 @@ mod tests {
             Pubkey::from_str("B9SGHMUCijzWiX4xP9C9bFK45ba1Ctqcund3FgiLc8k7")
                 .expect("valid associated bonding curve");
 
-        let ix = DirectBuyBuilder::build_buy_ix_with_accounts(
-            &payer,
-            &mint,
-            &token_program,
-            Some(DirectBuyBuilder::canonical_global_config()),
-            Some(fee_recipient),
-            Some(creator),
-            Some(PumpfunBuyVariant::LegacyBuy),
-            Some(associated_bonding_curve),
-            422,
-            9_000_000,
-        );
-
-        let expected_prefix = [
+        let mut expected_accounts = [
             "4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf",
             "62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV",
             "2CCxpdG6cCTiDE4krfYTQAFArPYCFRSGAMjspy4fpump",
@@ -768,25 +811,49 @@ mod tests {
             "2qMitwuxRNKZtixyUbHxWeDSgVPwoD6FK3j7ySW8UK2U",
             "8Wf5TiAheLUqBrKXeYg2JtAFFMWtKdG2BSFgqUcPVwTt",
             "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ",
-            "3tdiQYcf1JR3bpJsjeTxdnaUhvs67Vcc8QnwvA6iF2f4",
-        ];
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        expected_accounts.extend([
+            "2gy2YHVJ3fEMh7V5y67YEV45xAJRwo4YDzKmxD3N7YnD".to_string(),
+            "HVwQxmzK2Qf6ZKu1SksTZTtFrNKr4j2MTA27v9VKuEAD".to_string(),
+        ]);
+        let remaining = expected_accounts
+            .iter()
+            .skip(PUMPFUN_BUY_FIXED_ACCOUNT_COUNT)
+            .map(|value| Pubkey::from_str(value).expect("valid remaining account"))
+            .collect::<Vec<_>>();
+
+        let ix = DirectBuyBuilder::build_buy_ix_with_accounts_and_remaining(
+            &payer,
+            &mint,
+            &token_program,
+            Some(DirectBuyBuilder::canonical_global_config()),
+            Some(fee_recipient),
+            Some(creator),
+            Some(PumpfunBuyVariant::LegacyBuy),
+            Some(associated_bonding_curve),
+            None,
+            &remaining,
+            422,
+            9_000_000,
+        );
+
         let actual: Vec<String> = ix
             .accounts
             .iter()
             .map(|meta| meta.pubkey.to_string())
             .collect();
-        assert_eq!(&actual[..17], expected_prefix);
-        assert!(
-            BUYBACK_FEE_RECIPIENTS.contains(&actual[17].as_str()),
-            "buyback fee recipient must be drawn from the current allowlist"
-        );
+        assert_eq!(actual, expected_accounts);
         assert_eq!(&ix.data[0..8], &LEGACY_BUY_DISCRIMINATOR);
         assert_eq!(
             u64::from_le_bytes(ix.data[8..16].try_into().unwrap()),
             9_000_000
         );
         assert_eq!(u64::from_le_bytes(ix.data[16..24].try_into().unwrap()), 422);
-        assert_eq!(ix.data.len(), 24);
+        assert_eq!(ix.data[24], LEGACY_TRACK_VOLUME_ENABLED);
+        assert_eq!(ix.data.len(), 25);
     }
 
     #[test]

@@ -121,6 +121,8 @@ const PUMP_IDX_FEE_RECIPIENT: usize = 1;
 const PUMP_IDX_ASSOCIATED_BONDING_CURVE: usize = 4;
 const PUMP_IDX_TOKEN_PROGRAM: usize = 8;
 const PUMP_IDX_BONDING_CURVE_V2: usize = 16;
+const PUMP_BUY_FIXED_ACCOUNT_COUNT: usize = 16;
+const PUMP_BUYBACK_REMAINING_ACCOUNT_COUNT: usize = 2;
 
 // Pump.fun CREATE instruction layout (different from Buy/Sell!):
 //   0=Mint, 1=MintAuthority, 2=BondingCurve, 3=AssocBondingCurve, 4=Global,
@@ -4105,6 +4107,7 @@ impl BinaryParser {
                         associated_bonding_curve: None,
                         bonding_curve_v2: None,
                         bonding_curve_v2_provenance: None,
+                        buy_remaining_accounts: vec![],
                         is_mayhem_mode: None,
                         cu_price_micro_lamports: runtime_ctx.cu_price_micro_lamports,
                         compute_unit_limit: runtime_ctx.compute_unit_limit,
@@ -4168,6 +4171,7 @@ impl BinaryParser {
                         associated_bonding_curve: None,
                         bonding_curve_v2: None,
                         bonding_curve_v2_provenance: None,
+                        buy_remaining_accounts: vec![],
                         is_mayhem_mode: None,
                         cu_price_micro_lamports: runtime_ctx.cu_price_micro_lamports,
                         compute_unit_limit: runtime_ctx.compute_unit_limit,
@@ -4254,6 +4258,7 @@ impl BinaryParser {
                         associated_bonding_curve: None,
                         bonding_curve_v2: None,
                         bonding_curve_v2_provenance: None,
+                        buy_remaining_accounts: vec![],
                         is_mayhem_mode: None,
                         cu_price_micro_lamports: runtime_ctx.cu_price_micro_lamports,
                         compute_unit_limit: runtime_ctx.compute_unit_limit,
@@ -4331,6 +4336,7 @@ impl BinaryParser {
                         associated_bonding_curve: None,
                         bonding_curve_v2: None,
                         bonding_curve_v2_provenance: None,
+                        buy_remaining_accounts: vec![],
                         is_mayhem_mode: None,
                         cu_price_micro_lamports: runtime_ctx.cu_price_micro_lamports,
                         compute_unit_limit: runtime_ctx.compute_unit_limit,
@@ -4441,6 +4447,7 @@ impl BinaryParser {
                         associated_bonding_curve: None,
                         bonding_curve_v2: None,
                         bonding_curve_v2_provenance: None,
+                        buy_remaining_accounts: vec![],
                         is_mayhem_mode: None,
                         cu_price_micro_lamports: runtime_ctx.cu_price_micro_lamports,
                         compute_unit_limit: runtime_ctx.compute_unit_limit,
@@ -4551,6 +4558,7 @@ impl BinaryParser {
                         associated_bonding_curve: None,
                         bonding_curve_v2: None,
                         bonding_curve_v2_provenance: None,
+                        buy_remaining_accounts: vec![],
                         is_mayhem_mode: None,
                         cu_price_micro_lamports: runtime_ctx.cu_price_micro_lamports,
                         compute_unit_limit: runtime_ctx.compute_unit_limit,
@@ -4697,6 +4705,7 @@ impl BinaryParser {
                 associated_bonding_curve: None,
                 bonding_curve_v2: None,
                 bonding_curve_v2_provenance: None,
+                buy_remaining_accounts: vec![],
                 is_mayhem_mode: None,
                 cu_price_micro_lamports: runtime_ctx.cu_price_micro_lamports,
                 compute_unit_limit: runtime_ctx.compute_unit_limit,
@@ -5671,6 +5680,9 @@ fn trade_candidate_score(cm_reg: &CurveMintRegistry, trade: &TradeEvent) -> u32 
     if trade.bonding_curve_v2.is_some() {
         score += 10;
     }
+    if !trade.buy_remaining_accounts.is_empty() {
+        score += 10;
+    }
     if trade.mint != Pubkey::default()
         && cm_reg.mint_for_curve_pk(&trade.pool_amm_id) == Some(trade.mint)
     {
@@ -5711,6 +5723,9 @@ fn merge_trade_optional_accounts(target: &mut TradeEvent, source: &TradeEvent) {
     }
     if target.bonding_curve_v2.is_none() {
         target.bonding_curve_v2 = source.bonding_curve_v2;
+    }
+    if target.buy_remaining_accounts.is_empty() {
+        target.buy_remaining_accounts = source.buy_remaining_accounts.clone();
     }
     if target.is_mayhem_mode.is_none() {
         target.is_mayhem_mode = source.is_mayhem_mode;
@@ -5943,6 +5958,10 @@ fn pump_buy_variant_from_ix_data(ix_data: &[u8]) -> Option<&'static str> {
     }
 }
 
+fn pump_buy_variant_has_bcv2(ix_data: &[u8]) -> bool {
+    ix_data.starts_with(&DISC_PUMP_BUY_ROUTED) || ix_data.starts_with(&DISC_SWAP_BUY_EXACT_QUOTE_IN)
+}
+
 fn discriminator_hex(ix_data: &[u8]) -> Option<String> {
     let disc = ix_data.get(..8)?;
     let mut out = String::with_capacity(16);
@@ -5970,6 +5989,9 @@ fn observed_bcv2_provenance_status(
     }
     if source_buy_variant.is_none() {
         return "discriminator_mismatch";
+    }
+    if source_buy_variant != Some("routed_exact_sol_in") {
+        return "legacy_buy_no_bcv2_account";
     }
     if instruction_account_position != Some(PUMP_IDX_BONDING_CURVE_V2 as u32) {
         return "account_position_out_of_range";
@@ -6055,12 +6077,15 @@ fn fill_trade_from_ix_accounts(
                 .ok()
                 .filter(|value| *value != Pubkey::default());
     }
-    if trade.is_buy && trade.bonding_curve_v2.is_none() {
+    if trade.is_buy && pump_buy_variant_has_bcv2(ix_data) && trade.bonding_curve_v2.is_none() {
         trade.bonding_curve_v2 = Pubkey::from_str(&acs(ix_accounts, PUMP_IDX_BONDING_CURVE_V2))
             .ok()
             .filter(|value| *value != Pubkey::default());
     }
-    if trade.is_buy && trade.bonding_curve_v2_provenance.is_none() {
+    if trade.is_buy
+        && pump_buy_variant_has_bcv2(ix_data)
+        && trade.bonding_curve_v2_provenance.is_none()
+    {
         if let Some(bonding_curve_v2) = trade.bonding_curve_v2 {
             trade.bonding_curve_v2_provenance = Some(bonding_curve_v2_provenance_from_ix(
                 trade,
@@ -6069,6 +6094,19 @@ fn fill_trade_from_ix_accounts(
                 bonding_curve_v2,
             ));
         }
+    }
+    if trade.is_buy
+        && pump_buy_variant_from_ix_data(ix_data) == Some("legacy_buy")
+        && trade.buy_remaining_accounts.is_empty()
+        && ix_accounts.len() > PUMP_BUY_FIXED_ACCOUNT_COUNT
+    {
+        trade.buy_remaining_accounts = ix_accounts
+            .iter()
+            .skip(PUMP_BUY_FIXED_ACCOUNT_COUNT)
+            .take(PUMP_BUYBACK_REMAINING_ACCOUNT_COUNT)
+            .filter_map(|value| Pubkey::from_str(value).ok())
+            .filter(|value| *value != Pubkey::default())
+            .collect();
     }
     trade_enrich_complete(trade)
 }
@@ -6199,12 +6237,13 @@ fn enrich_trade_optional_accounts_from_source_ix(event: &GeyserEvent, trade: &mu
     }
 
     info!(
-        "ENRICH_RESULT sig={} is_buy={} buy_variant={:?} assoc_bc={:?} bcv2={:?} fee={:?} token_prog={:?}",
+        "ENRICH_RESULT sig={} is_buy={} buy_variant={:?} assoc_bc={:?} bcv2={:?} remaining_count={} fee={:?} token_prog={:?}",
         trade.signature,
         trade.is_buy,
         trade.buy_variant,
         trade.associated_bonding_curve,
         trade.bonding_curve_v2,
+        trade.buy_remaining_accounts.len(),
         trade.fee_recipient,
         trade.token_program
     );
@@ -6852,6 +6891,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -9852,6 +9892,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -9900,6 +9941,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -9965,6 +10007,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -10114,6 +10157,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -10250,7 +10294,7 @@ mod tests {
             vec![crate::types::RawInstruction {
                 program_id: Pubkey::from_str(PUMP_FUN_PROGRAM_ID).unwrap(),
                 account_indices: (0u8..18u8).collect(),
-                data: trade_data(DISC_BUY, 1_000_000, 50_000_000),
+                data: trade_data(DISC_PUMP_BUY_ROUTED, 1_000_000, 50_000_000),
             }],
         );
 
@@ -10287,6 +10331,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -10307,7 +10352,7 @@ mod tests {
         assert_eq!(trade.global_config, Some(global_config));
         assert_eq!(trade.fee_recipient, Some(fee_recipient));
         assert_eq!(trade.token_program, Some(token_program));
-        assert_eq!(trade.buy_variant.as_deref(), Some("legacy_buy"));
+        assert_eq!(trade.buy_variant.as_deref(), Some("routed_exact_sol_in"));
         assert_eq!(
             trade.associated_bonding_curve,
             Some(associated_bonding_curve)
@@ -10324,7 +10369,10 @@ mod tests {
             provenance.source_program_id.as_deref(),
             Some(PUMP_FUN_PROGRAM_ID)
         );
-        assert_eq!(provenance.source_buy_variant.as_deref(), Some("legacy_buy"));
+        assert_eq!(
+            provenance.source_buy_variant.as_deref(),
+            Some("routed_exact_sol_in")
+        );
         assert_eq!(
             provenance.instruction_account_position,
             Some(PUMP_IDX_BONDING_CURVE_V2 as u32)
@@ -10345,6 +10393,60 @@ mod tests {
         assert_eq!(
             provenance.provenance_status.as_deref(),
             Some("route_compatible")
+        );
+    }
+
+    #[test]
+    fn enrich_trade_optional_accounts_does_not_treat_legacy_buyback_as_bcv2() {
+        let mint = Pubkey::new_unique();
+        let curve = Pubkey::new_unique();
+        let user = Pubkey::new_unique();
+        let global_config = Pubkey::new_unique();
+        let fee_recipient = Pubkey::new_unique();
+        let token_program = Pubkey::new_unique();
+        let associated_bonding_curve = Pubkey::new_unique();
+        let buyback_fee_recipient = Pubkey::new_unique();
+        let buyback_quote_account = Pubkey::new_unique();
+
+        let mut accounts = vec![Pubkey::new_unique(); 18];
+        accounts[PUMP_IDX_GLOBAL_CONFIG] = global_config;
+        accounts[PUMP_IDX_FEE_RECIPIENT] = fee_recipient;
+        accounts[PUMP_IDX_MINT] = mint;
+        accounts[PUMP_IDX_BONDING_CURVE] = curve;
+        accounts[PUMP_IDX_ASSOCIATED_BONDING_CURVE] = associated_bonding_curve;
+        accounts[PUMP_IDX_USER] = user;
+        accounts[PUMP_IDX_TOKEN_PROGRAM] = token_program;
+        accounts[16] = buyback_fee_recipient;
+        accounts[17] = buyback_quote_account;
+
+        let event = make_decoded_tx_event(
+            accounts,
+            vec![crate::types::RawInstruction {
+                program_id: Pubkey::from_str(PUMP_FUN_PROGRAM_ID).unwrap(),
+                account_indices: (0u8..18u8).collect(),
+                data: trade_data(DISC_BUY, 1_000_000, 50_000_000),
+            }],
+        );
+        let mut trade = sample_trade_event(
+            solana_sdk::signature::Signature::new_unique(),
+            curve,
+            mint,
+            user,
+            Some(0),
+        );
+
+        enrich_trade_optional_accounts_from_source_ix(&event, &mut trade);
+
+        assert_eq!(trade.buy_variant.as_deref(), Some("legacy_buy"));
+        assert_eq!(
+            trade.associated_bonding_curve,
+            Some(associated_bonding_curve)
+        );
+        assert_eq!(trade.bonding_curve_v2, None);
+        assert_eq!(trade.bonding_curve_v2_provenance, None);
+        assert_eq!(
+            trade.buy_remaining_accounts,
+            vec![buyback_fee_recipient, buyback_quote_account]
         );
     }
 
@@ -10375,7 +10477,7 @@ mod tests {
             vec![crate::types::RawInstruction {
                 program_id: Pubkey::from_str(PUMP_FUN_PROGRAM_ID).unwrap(),
                 account_indices: (offset as u8..(offset + 18) as u8).collect(),
-                data: trade_data(DISC_BUY, 1_000_000, 50_000_000),
+                data: trade_data(DISC_PUMP_BUY_ROUTED, 1_000_000, 50_000_000),
             }],
         );
 
@@ -10427,8 +10529,8 @@ mod tests {
             source_slot_index: Some(0),
             source_instruction_index: Some(0),
             source_program_id: Some(PUMP_FUN_PROGRAM_ID.to_string()),
-            source_discriminator: discriminator_hex(&DISC_BUY),
-            source_buy_variant: Some("legacy_buy".to_string()),
+            source_discriminator: discriminator_hex(&DISC_PUMP_BUY_ROUTED),
+            source_buy_variant: Some("routed_exact_sol_in".to_string()),
             instruction_account_position: Some(PUMP_IDX_BONDING_CURVE_V2 as u32),
             message_account_index: Some(PUMP_IDX_BONDING_CURVE_V2 as u32),
             resolved_pubkey: Some(bonding_curve_v2.to_string()),
@@ -10746,6 +10848,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -10846,6 +10949,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -10956,6 +11060,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -11049,6 +11154,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -11156,6 +11262,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,

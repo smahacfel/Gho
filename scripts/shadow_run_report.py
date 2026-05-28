@@ -262,12 +262,12 @@ def resolve_gatekeeper_log_path(
     preferred_plane: str | None = None,
 ) -> Path:
     direct = decisions_dir / file_name
-    if direct.exists():
-        return direct
     if not decisions_dir.exists():
         return direct
 
     candidates = [candidate for candidate in decisions_dir.rglob(file_name) if candidate.is_file()]
+    if direct.exists() and direct not in candidates:
+        candidates.append(direct)
     if preferred_plane is not None:
         plane_candidates = [
             candidate for candidate in candidates if preferred_plane in candidate.parts

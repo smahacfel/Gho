@@ -622,6 +622,13 @@ pub struct TradeEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bonding_curve_v2_provenance: Option<ObservedAccountMetaProvenance>,
 
+    /// Remaining accounts passed after the fixed legacy Pump.fun buy account list.
+    ///
+    /// Current on-chain legacy buys may require the observed buyback recipient
+    /// and its companion quote account. These are not BCV2 accounts.
+    #[serde(default)]
+    pub buy_remaining_accounts: Vec<Pubkey>,
+
     /// PumpPortal internal flag indicating unusual market conditions.
     /// Passed through for future analysis.
     #[serde(default)]

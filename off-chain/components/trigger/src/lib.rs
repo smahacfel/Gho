@@ -78,7 +78,10 @@ pub use config::{
 pub use control_command::{
     AemCommandApplyResult, AemCommandDirective, AemCommandPriority, ExecutionStressSnapshot,
 };
-pub use direct_buy_builder::{DirectBuyBuilder, PumpfunBuyVariant};
+pub use direct_buy_builder::{
+    DirectBuyBuilder, PumpfunBuyVariant, PUMPFUN_BUYBACK_REMAINING_ACCOUNT_COUNT,
+    PUMPFUN_BUY_FIXED_ACCOUNT_COUNT,
+};
 pub use direct_sell_builder::{DirectSellBuilder, DEFAULT_SELL_SLIPPAGE_BPS};
 pub use entry_price_extractor::{
     EntryPriceError, EntryPriceExtractor, EntryPriceInfo, PriceTruthError, PriceTruthEvidence,

@@ -36,20 +36,20 @@ tx_filter_strategy = "per_pool"
 # Legacy PR-6 shadow burn-in profile keeps the authoritative funding lane on.
 # For current V3 validation under the single-stream provider constraint, ADR-0130
 # pauses FSC/full-chain bake; use primary-only profiles with funding lane disabled.
-funding_lane_mode = "full_chain"
-grpc_endpoint = "${CHAINSTACK_GRPC_ENDPOINT}"
-grpc_x_token = "${CHAINSTACK_GRPC_TOKEN}"
-rpc_endpoint = "${CHAINSTACK_RPC_URL}"
+funding_lane_mode = "disabled"
+grpc_endpoint = "${GHOST_SEER_GRPC_ENDPOINT}"
+grpc_x_token = "${GHOST_SEER_GRPC_X_TOKEN}"
+rpc_endpoint = "${GHOST_SEER_RPC_ENDPOINT}"
 enable_pumpfun = true
 enable_bonkfun = false
 enable_raydium = false
 
 [trigger]
 enabled = true
-rpc_url = "${CHAINSTACK_RPC_URL}"
+rpc_url = "${GHOST_TRIGGER_RPC_URL}"
 # REQUIRED in production (live/dual): override via GHOST_TRIGGER_KEYPAIR_PATH.
-# This repaired shadow-only rerun uses a launcher-local ephemeral payer so the
-# clean validation lane no longer depends on the live keypair contract.
+# This repaired shadow-only rerun still uses the funded rollout wallet for
+# simulation. entry_mode remains shadow_only, so this does not enable live send.
 entry_mode = "shadow_only"
 # Even without live send, canonical shadow burn-in keeps the same production
 # bulkhead contract: these values are still the primary wallet/risk guardrails.
@@ -68,12 +68,10 @@ live_exit_stop_loss_pct = 0.50  # Updated: hard stop at -12%
 [trigger.shadow_run]
 enabled = true
 # REQUIRED in production: override via GHOST_TRIGGER_SHADOW_RPC_URL.
-shadow_rpc_url = "${CHAINSTACK_RPC_URL}"
+shadow_rpc_url = "${GHOST_TRIGGER_SHADOW_RPC_URL}"
 # Read the rollout wallet from [trigger].keypair_path / GHOST_TRIGGER_KEYPAIR_PATH
 # so shadow simulation uses a funded, chain-visible payer account.
-# P5: Ephemeral payer for shadow_only — no live payer dependency (B6).
-# Launcher-local keypair generated at startup.
-payer_strategy = "ephemeral"
+payer_strategy = "configured"
 commitment = "processed"
 sig_verify = false
 replace_recent_blockhash = true

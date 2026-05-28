@@ -282,18 +282,18 @@ pub async fn run_iwim_veto_gate(
     let total_budget = Duration::from_millis(config.max_wait_ms);
 
     let mut rpc_attempts: Vec<(&str, Arc<RpcClient>)> = Vec::new();
-    if !config.primary_rpc_url.is_empty() {
-        rpc_attempts.push((
-            "primary",
-            Arc::new(new_async_rpc_client(config.primary_rpc_url.clone())),
-        ));
-    }
-    if !config.fallback_rpc_url.is_empty() {
-        rpc_attempts.push((
-            "fallback",
-            Arc::new(new_async_rpc_client(config.fallback_rpc_url.clone())),
-        ));
-    }
+    push_configured_rpc_attempt(
+        &mut rpc_attempts,
+        "primary",
+        &config.primary_rpc_url,
+        pool_id,
+    );
+    push_configured_rpc_attempt(
+        &mut rpc_attempts,
+        "fallback",
+        &config.fallback_rpc_url,
+        pool_id,
+    );
     if let Some(shared_rpc) = rpc_client.cloned() {
         rpc_attempts.push(("runtime", shared_rpc));
     }
@@ -539,6 +539,59 @@ fn apply_policy_no_data(
     apply_policy_timeout(pool_id, strength, result)
 }
 
+fn configured_rpc_url(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with("${") && trimmed.ends_with('}') {
+        return None;
+    }
+    if trimmed.eq_ignore_ascii_case("primary")
+        || trimmed.eq_ignore_ascii_case("fallback")
+        || trimmed.eq_ignore_ascii_case("runtime")
+    {
+        return None;
+    }
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return Some(trimmed);
+    }
+    None
+}
+
+fn push_configured_rpc_attempt(
+    rpc_attempts: &mut Vec<(&str, Arc<RpcClient>)>,
+    label: &'static str,
+    raw_url: &str,
+    pool_id: &Pubkey,
+) {
+    let raw_url = raw_url.trim();
+    if raw_url.is_empty() {
+        return;
+    }
+    let Some(url) = configured_rpc_url(raw_url) else {
+        if raw_url.starts_with("${")
+            || raw_url.eq_ignore_ascii_case("primary")
+            || raw_url.eq_ignore_ascii_case("fallback")
+            || raw_url.eq_ignore_ascii_case("runtime")
+        {
+            debug!(
+                pool = %pool_id,
+                rpc = label,
+                "IWIM_VETO: configured RPC URL is a placeholder or alias; using remaining RPC attempts"
+            );
+        } else {
+            warn!(
+                pool = %pool_id,
+                rpc = label,
+                "IWIM_VETO: configured RPC URL is not absolute HTTP(S); skipping configured RPC attempt"
+            );
+        }
+        return;
+    };
+    rpc_attempts.push((label, Arc::new(new_async_rpc_client(url.to_string()))));
+}
+
 // =============================================================================
 // RPC Fetch Layer
 // =============================================================================
@@ -580,4 +633,33 @@ async fn fetch_dev_signatures(
         .collect();
 
     Ok(tx_data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::configured_rpc_url;
+
+    #[test]
+    fn configured_rpc_url_accepts_absolute_http_urls() {
+        assert_eq!(
+            configured_rpc_url(" https://rpc.example.com/key "),
+            Some("https://rpc.example.com/key")
+        );
+        assert_eq!(
+            configured_rpc_url("http://127.0.0.1:8899"),
+            Some("http://127.0.0.1:8899")
+        );
+    }
+
+    #[test]
+    fn configured_rpc_url_rejects_placeholders_and_aliases() {
+        assert_eq!(configured_rpc_url(""), None);
+        assert_eq!(configured_rpc_url("${CHAINSTACK_RPC_URL}"), None);
+        assert_eq!(configured_rpc_url("primary"), None);
+        assert_eq!(configured_rpc_url("runtime"), None);
+        assert_eq!(
+            configured_rpc_url("solana-mainnet.core.chainstack.com"),
+            None
+        );
+    }
 }

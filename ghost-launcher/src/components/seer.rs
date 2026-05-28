@@ -2381,6 +2381,11 @@ pub fn trade_event_to_pool_transaction(
                 provenance_status: value.provenance_status.clone(),
             }
         }),
+        buy_remaining_accounts: trade
+            .buy_remaining_accounts
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
         is_mayhem_mode: trade.is_mayhem_mode,
         cu_price_micro_lamports: trade.cu_price_micro_lamports,
         compute_unit_limit: trade.compute_unit_limit,
@@ -2483,6 +2488,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
