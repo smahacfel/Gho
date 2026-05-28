@@ -42,6 +42,10 @@ pub struct SeerConfig {
     /// gRPC authentication token (optional, for authenticated endpoints)
     pub grpc_auth_token: Option<String>,
 
+    /// gRPC authentication metadata header name.
+    #[serde(default = "SeerConfig::default_grpc_auth_header")]
+    pub grpc_auth_header: String,
+
     /// Maximum reconnection attempts
     pub max_reconnect_attempts: u32,
 
@@ -277,6 +281,7 @@ impl Default for SeerConfig {
             grpc_manual_backfill_enabled: Self::default_grpc_manual_backfill_enabled(),
             grpc_client_id: None,
             grpc_auth_token: None,
+            grpc_auth_header: Self::default_grpc_auth_header(),
             max_reconnect_attempts: 10,
             reconnect_delay_secs: 5,
             max_reconnect_delay_secs: 300, // 5 minutes max backoff
@@ -324,6 +329,10 @@ impl SeerConfig {
 
     fn default_grpc_manual_backfill_enabled() -> bool {
         true
+    }
+
+    pub fn default_grpc_auth_header() -> String {
+        "x-token".to_string()
     }
 
     pub fn default_grpc_max_stalls_before_open() -> u32 {

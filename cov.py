@@ -37,10 +37,9 @@ Semantyka coverage:
         i failed-vs-failed na poziomie transakcji.
 
 Przepustowość zależy od planu RPC oraz limitów specyficznych dla Solany.
-Chainstack może pokazywać globalny limit planu (np. 250 RPS dla Growth), ale
-dla Solana Mainnet obowiązuje osobny throughput guideline i archival
+Dostawca może pokazywać globalny limit planu, ale dla Solana Mainnet archival
 `getTransaction` bardzo łatwo wpada w 429 przy burstach. Domyślny profil tego
-skryptu zostawia zapas poniżej solanowego limitu planu.
+skryptu zostawia konserwatywny zapas poniżej projektowego limitu operacyjnego.
 
 Usage:
     python coverage_scanner.py [INPUT] [options]
@@ -81,6 +80,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 try:
     aiohttp = importlib.import_module("aiohttp")
@@ -111,7 +111,7 @@ from fetch_pool_trade_counts import classify_trade
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-DEFAULT_RPC_URL  = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+DEFAULT_RPC_URL  = "https://rpc.nln.clr3.org"
 DEFAULT_INPUT_PATH = str(SCRIPT_DIR / "gatekeeper_v2_buys.jsonl")
 DEFAULT_RPS      = 24.0
 DEFAULT_CONCUR   = 8
@@ -126,9 +126,44 @@ DEFAULT_TX_CACHE_DIR = OUTPUT_BASE / ".tx_cache"
 DEFAULT_WINDOW_MS = 10_000
 EXACT_WINDOW_LOG_START_SKEW_MS = 100
 EXACT_WINDOW_LOG_END_SKEW_MS = 100
-SOLANA_MAINNET_CHAINSTACK_GUIDELINE_RPS = 50.0
+SOLANA_MAINNET_PROVIDER_GUIDELINE_RPS = 50.0
 MAX_SNAPSHOT_RETRIES = 4
 SNAPSHOT_RETRY_BACKOFF_BASE_S = 0.5
+
+RPC_AUTH_HEADER_ENV = "GHOST_RPC_AUTH_HEADER"
+RPC_AUTH_TOKEN_ENV = "GHOST_RPC_AUTH_TOKEN"
+LEGACY_PROVIDER_AUTH_HEADER_ENV = "GHOST_SEER_GRPC_AUTH_HEADER"
+LEGACY_PROVIDER_AUTH_TOKEN_ENV = "GHOST_SEER_GRPC_X_TOKEN"
+DEFAULT_RPC_AUTH_HEADER = "x-api-key"
+NLN_RPC_HOST = "rpc.nln.clr3.org"
+NLN_RPC_HOST_SUFFIX = ".nln.clr3.org"
+
+
+def _non_empty_env(name: str) -> str | None:
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _is_nln_rpc_url(rpc_url: str) -> bool:
+    host = (urlparse(rpc_url).hostname or "").lower()
+    return host == NLN_RPC_HOST or host.endswith(NLN_RPC_HOST_SUFFIX)
+
+
+def rpc_auth_headers(rpc_url: str) -> dict[str, str]:
+    if not _is_nln_rpc_url(rpc_url):
+        return {}
+    token = _non_empty_env(RPC_AUTH_TOKEN_ENV) or _non_empty_env(LEGACY_PROVIDER_AUTH_TOKEN_ENV)
+    if not token:
+        return {}
+    header = (
+        _non_empty_env(RPC_AUTH_HEADER_ENV)
+        or _non_empty_env(LEGACY_PROVIDER_AUTH_HEADER_ENV)
+        or DEFAULT_RPC_AUTH_HEADER
+    )
+    return {header: token}
 SNAPSHOT_RETRY_JITTER_S = 0.25
 LAMPORTS_PER_SOL = 1_000_000_000
 WSOL_MINT = "So11111111111111111111111111111111111111112"
@@ -2980,18 +3015,18 @@ async def run(args: argparse.Namespace) -> None:
     if args.tx_rps > args.rps:
         raise RuntimeError("--tx-rps nie może być większe niż --rps")
 
-    if args.rpc.startswith("https://solana-mainnet.core.chainstack.com"):
-        if args.rps > SOLANA_MAINNET_CHAINSTACK_GUIDELINE_RPS:
+    if args.rpc.startswith("https://rpc.nln.clr3.org"):
+        if args.rps > SOLANA_MAINNET_PROVIDER_GUIDELINE_RPS:
             log.warning(
-                "Ustawione --rps=%.1f przekracza Chainstack throughput guideline dla Solana Mainnet (%.0f RPS). Spodziewaj się 429.",
+                "Ustawione --rps=%.1f przekracza projektowy throughput guideline dla Solana Mainnet (%.0f RPS). Spodziewaj się 429.",
                 args.rps,
-                SOLANA_MAINNET_CHAINSTACK_GUIDELINE_RPS,
+                SOLANA_MAINNET_PROVIDER_GUIDELINE_RPS,
             )
-        if args.tx_rps > SOLANA_MAINNET_CHAINSTACK_GUIDELINE_RPS:
+        if args.tx_rps > SOLANA_MAINNET_PROVIDER_GUIDELINE_RPS:
             log.warning(
-                "Ustawione --tx-rps=%.1f przekracza Chainstack throughput guideline dla Solana Mainnet (%.0f RPS).",
+                "Ustawione --tx-rps=%.1f przekracza projektowy throughput guideline dla Solana Mainnet (%.0f RPS).",
                 args.tx_rps,
-                SOLANA_MAINNET_CHAINSTACK_GUIDELINE_RPS,
+                SOLANA_MAINNET_PROVIDER_GUIDELINE_RPS,
             )
 
     # ── 1. Wczytaj input ──────────────────────────────────────────────────────
@@ -3203,8 +3238,8 @@ async def run(args: argparse.Namespace) -> None:
     t0 = time.monotonic()
 
     # Headers celowo imitują przeglądarkę Chrome — Cloudflare stojący przed
-    # Chainstackiem blokuje 403 żądania, których User-Agent / nagłówki zdradzają
-    # automatyzację (bot/agent/rpc/solana itp.).  Neutralna nazwa + pełny zestaw
+    # dostawcami RPC potrafi blokować 403 żądania, których User-Agent / nagłówki
+    # zdradzają automatyzację (bot/agent/rpc/solana itp.).  Neutralna nazwa + pełny zestaw
     # nagłówków browserowych omija WAF bez konieczności zmian po stronie whitelist.
     _CF_SAFE_HEADERS = {
         "Content-Type":    "application/json",
@@ -3222,11 +3257,13 @@ async def run(args: argparse.Namespace) -> None:
         "Origin":          "https://explorer.solana.com",
         "Referer":         "https://explorer.solana.com/",
     }
+    rpc_headers = dict(_CF_SAFE_HEADERS)
+    rpc_headers.update(rpc_auth_headers(args.rpc))
 
     async with aiohttp.ClientSession(
         connector = connector,
         timeout   = session_timeout,
-        headers   = _CF_SAFE_HEADERS,
+        headers   = rpc_headers,
     ) as session:
         rpc = SolanaRPC(
             args.rpc,

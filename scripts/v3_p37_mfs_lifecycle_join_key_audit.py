@@ -16,6 +16,7 @@ from shadow_run_report import load_toml, resolve_config_path, resolve_runtime_pa
 
 SCHEMA_VERSION = 6
 DECISION_FILE_NAMES = ("gatekeeper_v2_decisions.jsonl", "gatekeeper_v2_buys.jsonl")
+BCV2_TERMINAL_ROUTE_EXCLUSION_REASON = "bcv2_not_persistent_or_not_loadable"
 BCV2_MARKERS = (
     "BCV2_EXACT_WATCH_REGISTERED",
     "BCV2_EXACT_WATCH_SUBSCRIBE_INCLUDED",
@@ -433,6 +434,25 @@ def bcv2_pubkey_for_working_builder(row: dict[str, Any]) -> str | None:
         if value:
             return value
     return None
+
+
+def row_has_bcv2_terminal_route_exclusion(row: dict[str, Any]) -> bool:
+    reason_fields = (
+        "working_builder_bcv2_terminal_route_exclusion_reason",
+        "execution_feasibility_reason",
+        "route_resolution_terminal_reason",
+        "no_executable_route_account_set_reason",
+        "precheck_failure_reason",
+        "execution_account_readiness_reason",
+    )
+    return (
+        row_bool_string(row, "working_builder_bcv2_terminal_route_exclusion")
+        == "true"
+        or any(
+            BCV2_TERMINAL_ROUTE_EXCLUSION_REASON in (row_string(row, field) or "")
+            for field in reason_fields
+        )
+    )
 
 
 def bcv2_working_builder_rows(paths: dict[str, list[Path]]) -> list[dict[str, Any]]:
@@ -2039,6 +2059,32 @@ def working_builder_parity_payload(
         )
         == "true"
     ]
+    bcv2_terminal_route_exclusion_rows = [
+        row for row in parity_rows if row_has_bcv2_terminal_route_exclusion(row)
+    ]
+    bcv2_terminal_route_exclusion_unique_pubkeys = {
+        pubkey
+        for row in bcv2_terminal_route_exclusion_rows
+        if (pubkey := bcv2_pubkey_for_working_builder(row))
+    }
+    execution_feasibility_reject_bcv2_not_persistent_rows = [
+        row
+        for row in parity_rows
+        if execution_feasibility_status_for_row(row) == "not_executable_route"
+        and execution_feasibility_reason_for_row(row)
+        == BCV2_TERMINAL_ROUTE_EXCLUSION_REASON
+    ]
+    buy_quality_denominator_excluded_bcv2_rows = bcv2_terminal_route_exclusion_rows
+    lifecycle_denominator_excluded_bcv2_rows = [
+        row
+        for row in bcv2_terminal_route_exclusion_rows
+        if lifecycle_label_eligibility_for_row(row)
+        in {
+            "not_lifecycle_label_eligible",
+            "not_lifecycle_eligible",
+            "false",
+        }
+    ]
     creator_vault_source_authority_counts = Counter(
         row_string(row, "working_builder_creator_vault_source_authority") or "missing"
         for row in parity_rows
@@ -2345,6 +2391,21 @@ def working_builder_parity_payload(
         ),
         f"{prefix}working_builder_bcv2_execution_evidence_exact_pubkey_match_rows": len(
             bcv2_execution_evidence_exact_pubkey_match_rows
+        ),
+        f"{prefix}bcv2_terminal_route_exclusion_rows": len(
+            bcv2_terminal_route_exclusion_rows
+        ),
+        f"{prefix}bcv2_terminal_route_exclusion_unique_pubkeys": len(
+            bcv2_terminal_route_exclusion_unique_pubkeys
+        ),
+        f"{prefix}execution_feasibility_reject_bcv2_not_persistent_rows": len(
+            execution_feasibility_reject_bcv2_not_persistent_rows
+        ),
+        f"{prefix}buy_quality_denominator_excluded_bcv2_rows": len(
+            buy_quality_denominator_excluded_bcv2_rows
+        ),
+        f"{prefix}lifecycle_denominator_excluded_bcv2_rows": len(
+            lifecycle_denominator_excluded_bcv2_rows
         ),
         f"{prefix}working_builder_creator_vault_source_authority_counts": dict(
             sorted(creator_vault_source_authority_counts.items())
@@ -2962,6 +3023,7 @@ def is_no_executable_route_row(row: dict[str, Any]) -> bool:
         row_string(row, "route_resolution_status") in NON_EXECUTABLE_ROUTE_STATUSES
         or row_string(row, "probe_skip_reason") == "no_executable_route_account_set"
         or row_string(row, "execution_outcome") == "no_executable_route_account_set"
+        or row_has_bcv2_terminal_route_exclusion(row)
         or "no_executable_route_account_set"
         in (
             row_string(row, "precheck_failure_reason")
@@ -3009,6 +3071,8 @@ def execution_feasibility_reason_for_row(row: dict[str, Any]) -> str:
     explicit = row_string(row, "execution_feasibility_reason")
     if explicit:
         return explicit
+    if row_has_bcv2_terminal_route_exclusion(row):
+        return BCV2_TERMINAL_ROUTE_EXCLUSION_REASON
     if is_no_executable_route_row(row):
         return "no_executable_route_account_set"
     return (
@@ -5235,6 +5299,11 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- active_shadow_working_builder_bcv2_execution_evidence_status_counts: `{json.dumps(active_shadow['active_shadow_working_builder_bcv2_execution_evidence_status_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- active_shadow_working_builder_bcv2_execution_evidence_source_counts: `{json.dumps(active_shadow['active_shadow_working_builder_bcv2_execution_evidence_source_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- active_shadow_working_builder_bcv2_execution_evidence_reason_counts: `{json.dumps(active_shadow['active_shadow_working_builder_bcv2_execution_evidence_reason_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- active_shadow_bcv2_terminal_route_exclusion_rows: `{active_shadow['active_shadow_bcv2_terminal_route_exclusion_rows']}`",
+            f"- active_shadow_bcv2_terminal_route_exclusion_unique_pubkeys: `{active_shadow['active_shadow_bcv2_terminal_route_exclusion_unique_pubkeys']}`",
+            f"- active_shadow_execution_feasibility_reject_bcv2_not_persistent_rows: `{active_shadow['active_shadow_execution_feasibility_reject_bcv2_not_persistent_rows']}`",
+            f"- active_shadow_buy_quality_denominator_excluded_bcv2_rows: `{active_shadow['active_shadow_buy_quality_denominator_excluded_bcv2_rows']}`",
+            f"- active_shadow_lifecycle_denominator_excluded_bcv2_rows: `{active_shadow['active_shadow_lifecycle_denominator_excluded_bcv2_rows']}`",
             f"- active_shadow_working_builder_creator_vault_source_authority_counts: `{json.dumps(active_shadow['active_shadow_working_builder_creator_vault_source_authority_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- active_shadow_working_builder_creator_vault_rpc_load_status_counts: `{json.dumps(active_shadow['active_shadow_working_builder_creator_vault_rpc_load_status_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- active_shadow_working_builder_bcv2_authoritative_and_load_ready_rows: `{active_shadow['active_shadow_working_builder_bcv2_authoritative_and_load_ready_rows']}`",
@@ -5442,6 +5511,11 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- working_builder_bcv2_execution_evidence_status_counts: `{json.dumps(materialization['working_builder_bcv2_execution_evidence_status_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- working_builder_bcv2_execution_evidence_source_counts: `{json.dumps(materialization['working_builder_bcv2_execution_evidence_source_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- working_builder_bcv2_execution_evidence_reason_counts: `{json.dumps(materialization['working_builder_bcv2_execution_evidence_reason_counts'], ensure_ascii=False, sort_keys=True)}`",
+            f"- bcv2_terminal_route_exclusion_rows: `{materialization['bcv2_terminal_route_exclusion_rows']}`",
+            f"- bcv2_terminal_route_exclusion_unique_pubkeys: `{materialization['bcv2_terminal_route_exclusion_unique_pubkeys']}`",
+            f"- execution_feasibility_reject_bcv2_not_persistent_rows: `{materialization['execution_feasibility_reject_bcv2_not_persistent_rows']}`",
+            f"- buy_quality_denominator_excluded_bcv2_rows: `{materialization['buy_quality_denominator_excluded_bcv2_rows']}`",
+            f"- lifecycle_denominator_excluded_bcv2_rows: `{materialization['lifecycle_denominator_excluded_bcv2_rows']}`",
             f"- working_builder_creator_vault_source_authority_counts: `{json.dumps(materialization['working_builder_creator_vault_source_authority_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- working_builder_creator_vault_rpc_load_status_counts: `{json.dumps(materialization['working_builder_creator_vault_rpc_load_status_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- working_builder_bcv2_authoritative_and_load_ready_rows: `{materialization['working_builder_bcv2_authoritative_and_load_ready_rows']}`",

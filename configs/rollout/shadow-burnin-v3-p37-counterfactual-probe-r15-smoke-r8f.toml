@@ -11,16 +11,17 @@ commitment = "processed"
 stream_mode = "single_global"
 tx_filter_strategy = "per_pool"
 funding_lane_mode = "disabled"
-grpc_endpoint = "${CHAINSTACK_GRPC_ENDPOINT}"
-grpc_x_token = "${CHAINSTACK_GRPC_TOKEN}"
-rpc_endpoint = "${CHAINSTACK_RPC_URL}"
+grpc_endpoint = "${GHOST_SEER_GRPC_ENDPOINT}"
+grpc_x_token = "${GHOST_SEER_GRPC_X_TOKEN}"
+grpc_auth_header = "x-api-key"
+rpc_endpoint = "${GHOST_SEER_RPC_ENDPOINT}"
 enable_pumpfun = true
 enable_bonkfun = false
 enable_raydium = false
 
 [trigger]
 enabled = true
-rpc_url = "${CHAINSTACK_RPC_URL}"
+rpc_url = "${GHOST_TRIGGER_RPC_URL}"
 entry_mode = "shadow_only"
 max_concurrent_positions = 5
 max_position_size_sol = 0.007
@@ -32,7 +33,7 @@ live_exit_stop_loss_pct = 0.50
 
 [trigger.shadow_run]
 enabled = true
-shadow_rpc_url = "${CHAINSTACK_RPC_URL}"
+shadow_rpc_url = "${GHOST_TRIGGER_SHADOW_RPC_URL}"
 payer_strategy = "ephemeral"
 commitment = "processed"
 sig_verify = false

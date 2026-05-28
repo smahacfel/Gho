@@ -2047,6 +2047,140 @@ impl GatekeeperAssessment {
             .or(Some(GatekeeperReasonCode::InvariantTimeoutNoVerdict))
     }
 
+    fn serialization_error_payload(context: &str, err: serde_json::Error) -> serde_json::Value {
+        serde_json::json!({
+            "context": context,
+            "serialization_error": err.to_string(),
+        })
+    }
+
+    fn materialized_feature_snapshot_payload(&self) -> serde_json::Value {
+        serde_json::to_value(&self.feature_snapshot).unwrap_or_else(|err| {
+            Self::serialization_error_payload("materialized_feature_snapshot", err)
+        })
+    }
+
+    fn gatekeeper_v2_config_payload(config: &GatekeeperV2Config) -> serde_json::Value {
+        serde_json::to_value(config)
+            .unwrap_or_else(|err| Self::serialization_error_payload("gatekeeper_v2_config", err))
+    }
+
+    fn gatekeeper_decision_payload(&self) -> serde_json::Value {
+        let decision = self.decision.as_ref().map(|decision| {
+            serde_json::json!({
+                "hard_fail_reason": decision.hard_fail_reason.clone(),
+                "core": {
+                    "core1_passed": decision.core1_passed,
+                    "core2_passed": decision.core2_passed,
+                    "core3_passed": decision.core3_passed,
+                },
+                "legacy_soft": {
+                    "flags": decision.soft_signals.format_flags(),
+                    "points": decision.soft_points,
+                    "max_points_possible": decision.max_soft_points_possible,
+                    "effective_max_points": decision.effective_max_soft_points,
+                },
+                "sybil_policy": {
+                    "enabled": decision.sybil_policy.enabled,
+                    "combo_veto_enabled": decision.sybil_policy.combo_veto_enabled,
+                    "flags": decision.sybil_policy.soft_signals.format_flags(),
+                    "points": decision.sybil_policy.soft_points,
+                    "max_points_possible": decision.sybil_policy.max_soft_points_possible,
+                    "effective_max_points": decision.sybil_policy.effective_max_soft_points,
+                    "lead_signal": decision.sybil_policy.lead_signal.map(|signal| signal.tag()),
+                    "interference_patterns": decision
+                        .sybil_policy
+                        .interference_patterns
+                        .iter()
+                        .map(SybilInterferencePattern::tag)
+                        .collect::<Vec<_>>(),
+                    "meta_score": decision.sybil_policy.meta_score,
+                    "metric_degraded_reasons": decision.sybil_policy.metric_degraded_reasons.clone(),
+                },
+                "alpha_gate": {
+                    "enabled": decision.alpha_gate.enabled,
+                    "actionable": decision.alpha_gate.actionable,
+                    "momentum": decision.alpha_gate.momentum,
+                    "demand": decision.alpha_gate.demand,
+                    "joint": decision.alpha_gate.joint,
+                    "pass": decision.alpha_gate.pass,
+                    "reject_trigger": decision.alpha_gate.reject_trigger.map(|trigger| trigger.as_str()),
+                    "skip_reason": decision.alpha_gate.skip_reason,
+                },
+                "prosperity_filter": {
+                    "enabled": decision.prosperity_filter.enabled,
+                    "actionable": decision.prosperity_filter.actionable,
+                    "pass": decision.prosperity_filter.pass,
+                    "reject_trigger": decision
+                        .prosperity_filter
+                        .reject_trigger
+                        .map(|trigger| trigger.as_str()),
+                    "market_cap_floor_pass": decision.prosperity_filter.market_cap_floor_pass,
+                    "cpv_pass": decision.prosperity_filter.cpv_pass,
+                    "branch1_pass": decision.prosperity_filter.branch1_pass,
+                    "branch2_pass": decision.prosperity_filter.branch2_pass,
+                    "branch3_pass": decision.prosperity_filter.branch3_pass,
+                    "overlay_enabled": decision.prosperity_filter.overlay_enabled,
+                    "overlay_pass": decision.prosperity_filter.overlay_pass,
+                    "overlay_price_change_pass": decision.prosperity_filter.overlay_price_change_pass,
+                    "overlay_bonding_progress_pass": decision.prosperity_filter.overlay_bonding_progress_pass,
+                    "overlay_fee_topology_diversity_pass": decision
+                        .prosperity_filter
+                        .overlay_fee_topology_diversity_pass,
+                    "overlay_branch23_sell_buy_pass": decision
+                        .prosperity_filter
+                        .overlay_branch23_sell_buy_pass,
+                    "overlay_branch2_price_change_pass": decision
+                        .prosperity_filter
+                        .overlay_branch2_price_change_pass,
+                    "matched_branches": decision.prosperity_filter.matched_branches.clone(),
+                },
+                "dev_unknown": decision.dev_unknown,
+                "total_soft_points": decision.total_soft_points,
+                "verdict_type": decision.verdict_type.tag(),
+                "verdict_buy": decision.verdict_buy,
+                "reason_chain": decision.reason_chain.clone(),
+                "reason_code": decision.reason_code.map(GatekeeperReasonCode::as_log_str),
+                "gatekeeper_strength": decision.gatekeeper_strength.map(|strength| strength.to_string()),
+            })
+        });
+
+        serde_json::json!({
+            "decision_present": self.decision.is_some(),
+            "terminal_reason_code": self.terminal_reason_code.map(GatekeeperReasonCode::as_log_str),
+            "hard_reject_reason": self.hard_reject_reason.clone(),
+            "phase_pass_vector": {
+                "phase1": self.phase1_passed,
+                "phase2": self.phase2_passed,
+                "phase3": self.phase3_passed,
+                "phase4": self.phase4_passed,
+                "phase5": self.phase5_passed,
+                "phase6": self.phase6_passed,
+                "phases_passed": self.phases_passed,
+            },
+            "decision": decision,
+        })
+    }
+
+    fn v25_shadow_decisions_payload(&self) -> serde_json::Value {
+        serde_json::Value::Array(
+            self.v25_shadow_decisions
+                .iter()
+                .map(|shadow| {
+                    serde_json::json!({
+                        "kind": shadow.kind.verdict_str(),
+                        "window": shadow.window.as_str(),
+                        "elapsed_ms": shadow.elapsed_ms,
+                        "confidence": shadow.confidence,
+                        "phases_passed": shadow.phases_passed,
+                        "reason_code": shadow.reason_code.map(GatekeeperReasonCode::as_log_str),
+                        "reason": shadow.reason.clone(),
+                    })
+                })
+                .collect(),
+        )
+    }
+
     fn decision_eval_snapshot_targets(&self) -> HashSet<u64> {
         self.decision_eval_snapshots
             .iter()
@@ -3036,6 +3170,11 @@ impl GatekeeperAssessment {
                     .as_array()
                     .is_some_and(|snapshots| !snapshots.is_empty())
             }),
+            gatekeeper_v2_config_payload: Some(Self::gatekeeper_v2_config_payload(config)),
+            gatekeeper_v3_config_payload: None,
+            materialized_feature_snapshot: Some(self.materialized_feature_snapshot_payload()),
+            gatekeeper_decision_payload: Some(self.gatekeeper_decision_payload()),
+            v25_shadow_decisions_payload: Some(self.v25_shadow_decisions_payload()),
             aps_regime: self
                 .aps_diagnostics
                 .as_ref()
@@ -8232,6 +8371,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,
@@ -11091,6 +11231,31 @@ mod tests {
         assert_eq!(buy_log.decision_eval_snapshots, None);
         assert_eq!(
             buy_log
+                .gatekeeper_v2_config_payload
+                .as_ref()
+                .and_then(|value| value.get("min_tx_count"))
+                .and_then(serde_json::Value::as_u64),
+            Some(config.min_tx_count as u64)
+        );
+        assert!(buy_log.materialized_feature_snapshot.is_some());
+        assert_eq!(
+            buy_log
+                .gatekeeper_decision_payload
+                .as_ref()
+                .and_then(|value| value.get("decision_present"))
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            buy_log
+                .v25_shadow_decisions_payload
+                .as_ref()
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+        assert_eq!(
+            buy_log
                 .gatekeeper_v2_phase_pass_vector
                 .as_ref()
                 .and_then(|value| value.get("phase1"))
@@ -11235,15 +11400,20 @@ mod tests {
         assert_eq!(parsed["total_tx_evaluated"], 10);
         assert_eq!(parsed["min_sol_threshold"], config.min_sol_threshold);
 
-        // Verify None fields are skipped in serialization
+        // Verify top-level None fields are skipped in serialization. Full payload fields
+        // may contain nested metric names as part of the v23 replay/calibration evidence.
         assert!(
-            !json.contains("\"interval_cv\""),
-            "Optional None fields should be skipped"
+            parsed.get("interval_cv").is_none(),
+            "Top-level optional None fields should be skipped"
         );
         assert!(
-            !json.contains("\"unique_ratio\""),
-            "Optional None fields should be skipped"
+            parsed.get("unique_ratio").is_none(),
+            "Top-level optional None fields should be skipped"
         );
+        assert!(parsed.get("gatekeeper_v2_config_payload").is_some());
+        assert!(parsed.get("materialized_feature_snapshot").is_some());
+        assert!(parsed.get("gatekeeper_decision_payload").is_some());
+        assert!(parsed.get("v25_shadow_decisions_payload").is_some());
 
         // Test deserialization round-trip
         let deserialized: ghost_brain::oracle::GatekeeperBuyLog =

@@ -121,6 +121,7 @@ impl TestScenario for ScenarioE2EFull {
                     grpc_manual_backfill_enabled: true,
                     grpc_client_id: None,
                     grpc_auth_token: None,
+                    grpc_auth_header: seer::config::SeerConfig::default_grpc_auth_header(),
                     max_reconnect_attempts: config.seer.max_reconnect_attempts,
                     reconnect_delay_secs: config.seer.reconnect_delay_secs,
                     max_reconnect_delay_secs: 300,

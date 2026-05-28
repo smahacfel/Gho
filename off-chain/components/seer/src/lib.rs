@@ -1369,10 +1369,11 @@ impl Seer {
             SeerSourceMode::GeyserGrpc => {
                 let build_grpc_connection =
                     |subscription_profile: GrpcSubscriptionProfile, manual_backfill_enabled| {
-                        GrpcConnection::new(
+                        GrpcConnection::new_with_auth_header(
                             config.grpc_endpoint.clone(),
                             config.grpc_client_id.clone(),
                             config.grpc_auth_token.clone(),
+                            config.grpc_auth_header.clone(),
                             Arc::clone(&metrics),
                             config.max_reconnect_attempts,
                             config.reconnect_delay_secs,
@@ -4699,6 +4700,7 @@ mod tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: None,
             compute_unit_limit: None,

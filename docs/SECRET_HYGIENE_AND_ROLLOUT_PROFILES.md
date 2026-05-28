@@ -15,8 +15,11 @@ Ten dokument definiuje kontrakt PR-6 dla sekretów runtime, walletów rolloutowy
 | Zmienna | Znaczenie |
 | --- | --- |
 | `GHOST_SEER_GRPC_ENDPOINT` | gRPC endpoint dla ingestu |
-| `GHOST_SEER_GRPC_X_TOKEN` | token x-token dla Yellowstone/Chainstack |
+| `GHOST_SEER_GRPC_X_TOKEN` | API key dla Yellowstone/providera gRPC |
+| `GHOST_SEER_GRPC_AUTH_HEADER` | nazwa nagłówka auth dla gRPC, np. `x-api-key` |
 | `GHOST_SEER_RPC_ENDPOINT` | RPC pomocniczy Seera |
+| `GHOST_RPC_AUTH_HEADER` | nazwa nagłówka auth dla providerów RPC wymagających header auth |
+| `GHOST_RPC_AUTH_TOKEN` | API key dla providerów RPC wymagających header auth |
 | `GHOST_TRIGGER_RPC_URL` | RPC używany przez Trigger |
 | `GHOST_TRIGGER_KEYPAIR_PATH` | ścieżka do rollout walleta |
 | `GHOST_TRIGGER_SHADOW_RPC_URL` | RPC dla shadow-run |

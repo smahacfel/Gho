@@ -32,16 +32,17 @@ tx_filter_strategy = "per_pool"
 # Canonical PR-6 shadow burn-in profile keeps the authoritative funding lane on,
 # so the standard operator command exercises standalone shadow + real FSC coverage.
 funding_lane_mode = "full_chain"
-grpc_endpoint = "${CHAINSTACK_GRPC_ENDPOINT}"
-grpc_x_token = "${CHAINSTACK_GRPC_TOKEN}"
-rpc_endpoint = "${CHAINSTACK_RPC_URL}"
+grpc_endpoint = "${GHOST_SEER_GRPC_ENDPOINT}"
+grpc_x_token = "${GHOST_SEER_GRPC_X_TOKEN}"
+grpc_auth_header = "x-api-key"
+rpc_endpoint = "${GHOST_SEER_RPC_ENDPOINT}"
 enable_pumpfun = true
 enable_bonkfun = false
 enable_raydium = false
 
 [trigger]
 enabled = true
-rpc_url = "${CHAINSTACK_RPC_URL}"
+rpc_url = "${GHOST_TRIGGER_RPC_URL}"
 # REQUIRED in production: override via GHOST_TRIGGER_KEYPAIR_PATH.
 keypair_path = "replace-me"
 entry_mode = "shadow_only"
@@ -62,7 +63,7 @@ live_exit_stop_loss_pct = 0.50  # Updated: hard stop at -12%
 [trigger.shadow_run]
 enabled = true
 # REQUIRED in production: override via GHOST_TRIGGER_SHADOW_RPC_URL.
-shadow_rpc_url = "${CHAINSTACK_RPC_URL}"
+shadow_rpc_url = "${GHOST_TRIGGER_SHADOW_RPC_URL}"
 commitment = "processed"
 sig_verify = false
 replace_recent_blockhash = true

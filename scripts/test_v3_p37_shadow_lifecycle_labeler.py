@@ -31,10 +31,18 @@ def report_row(
 ) -> dict:
     return {
         "analysis_status": "ok",
+        "truth_dataset_kind": "shadow_burnin_lifecycle_onchain",
+        "collection_plane": "active_shadow",
+        "execution_verification_class_hint": "shadow_onchain_speculative_snapshot_verified",
         "candidate_id": "mint_pool_1000",
         "position_id": "pool:mint:1000",
         "mint_id": "mint",
         "pool_id": "pool",
+        "ab_record_id": "ab-1",
+        "v3_feature_snapshot_hash": "mfs-hash",
+        "v3_policy_config_hash": "policy-hash",
+        "decision_plane": "v25_shadow",
+        "rollout_namespace": "unit-ns",
         "close_reason": close_reason,
         "truth_status": "resolved",
         "truth_source": "canonical_account_state_snapshot",
@@ -168,6 +176,37 @@ class P37ShadowLifecycleLabelerTests(unittest.TestCase):
         self.assertEqual(label["exit_truth_gap_class"], "truth_gap_too_large")
         self.assertEqual(label["truth_gap_class"], "truth_gap_too_large")
         self.assertEqual(label["buy_quality_class"], "buy_quality_unknown")
+
+    def test_reporter_proof_metadata_is_propagated_to_labels_and_summary(self) -> None:
+        row = report_row(final_pnl_pct=10.0, finality="finalized")
+        row["execution_verification_class_hint"] = "shadow_onchain_finalized_verified"
+
+        label = labeler.build_label(row, args())
+
+        self.assertEqual(label["truth_dataset_kind"], "shadow_burnin_lifecycle_onchain")
+        self.assertEqual(label["collection_plane"], "active_shadow")
+        self.assertEqual(label["execution_verification_class_hint"], "shadow_onchain_finalized_verified")
+        self.assertEqual(label["ab_record_id"], "ab-1")
+        self.assertEqual(label["v3_feature_snapshot_hash"], "mfs-hash")
+        self.assertEqual(label["v3_policy_config_hash"], "policy-hash")
+        self.assertEqual(label["decision_plane"], "v25_shadow")
+        self.assertEqual(label["rollout_namespace"], "unit-ns")
+
+        summary = labeler.build_summary(
+            [label],
+            source_path=Path("shadow_onchain.jsonl"),
+            output_path=Path("labels.jsonl"),
+            args=args(),
+        )
+        self.assertEqual(
+            summary["truth_dataset_kind_counts"],
+            {"shadow_burnin_lifecycle_onchain": 1},
+        )
+        self.assertEqual(summary["collection_plane_counts"], {"active_shadow": 1})
+        self.assertEqual(
+            summary["execution_verification_class_hint_counts"],
+            {"shadow_onchain_finalized_verified": 1},
+        )
 
 
 if __name__ == "__main__":

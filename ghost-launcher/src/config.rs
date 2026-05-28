@@ -772,7 +772,7 @@ impl LauncherConfig {
             ));
         }
 
-        // Token is required for Chainstack/Yellowstone
+        // Token is required for authenticated Yellowstone/gRPC providers.
         if self.effective_grpc_token().is_none() {
             return Err(
                 "grpc_x_token is required in gRPC mode but is empty or missing".to_string(),
@@ -1594,10 +1594,13 @@ pub struct SeerComponentConfig {
     /// gRPC authentication token (optional, legacy field - prefer grpc_x_token)
     pub grpc_auth_token: Option<String>,
 
-    /// gRPC x-token for Chainstack/Yellowstone authentication (required for streaming)
-    /// This token is sent with EVERY request including streaming messages via x-token header.
+    /// gRPC auth token for Yellowstone authentication (required for streaming).
     /// Takes precedence over grpc_auth_token if both are provided.
     pub grpc_x_token: Option<String>,
+
+    /// gRPC authentication metadata header name.
+    #[serde(default = "default_grpc_auth_header")]
+    pub grpc_auth_header: String,
 
     /// Enable Pump.fun detection
     #[serde(default = "default_true")]
@@ -1963,6 +1966,11 @@ pub struct P37ShadowProbeConfig {
     #[serde(default = "default_p37_execution_account_evidence_freshness_ms")]
     pub execution_account_evidence_freshness_ms: u64,
 
+    /// Enables X9 terminal classification for working-builder routes whose
+    /// required BCV2 account has only exact negative load evidence.
+    #[serde(default)]
+    pub bcv2_terminal_route_closure_enabled: bool,
+
     /// Optional decision-time-safe wait for required execution accounts.
     ///
     /// This wait happens only in the isolated counterfactual probe background
@@ -2032,6 +2040,7 @@ impl Default for P37ShadowProbeConfig {
             probe_curve_age_max_ms: default_p37_shadow_probe_curve_age_max_ms(),
             execution_account_evidence_freshness_ms:
                 default_p37_execution_account_evidence_freshness_ms(),
+            bcv2_terminal_route_closure_enabled: false,
             probe_wait_for_execution_accounts_ms: 0,
             append: false,
             require_unique_namespace: true,
@@ -2623,6 +2632,10 @@ fn default_geyser_endpoint() -> String {
 
 fn default_grpc_endpoint() -> String {
     "http://localhost:10000".to_string()
+}
+
+fn default_grpc_auth_header() -> String {
+    "x-token".to_string()
 }
 
 fn default_rpc_endpoint() -> String {
@@ -3369,6 +3382,7 @@ impl LauncherConfig {
                 grpc_client_id: None,
                 grpc_auth_token: None,
                 grpc_x_token: None,
+                grpc_auth_header: default_grpc_auth_header(),
                 enable_pumpfun: true,
                 enable_bonkfun: true,
                 pump_program_id: default_pump_program_id(),
@@ -3772,6 +3786,14 @@ fn apply_secret_env_overrides(
             config.seer.grpc_auth_token = Some(value.value);
         }
     }
+    if should_override_secret_value(Some(&config.seer.grpc_auth_header)) {
+        if let Some(value) =
+            lookup_placeholder_secret_env(Some(&config.seer.grpc_auth_header), secret_env)
+                .or_else(|| lookup_secret_env("GHOST_SEER_GRPC_AUTH_HEADER", secret_env))
+        {
+            config.seer.grpc_auth_header = value.value;
+        }
+    }
     if should_override_secret_value(Some(&config.seer.rpc_endpoint)) {
         if let Some(value) =
             lookup_placeholder_secret_env(Some(&config.seer.rpc_endpoint), secret_env)
@@ -3935,13 +3957,16 @@ enabled = true
         let base = unique_temp_dir("explicit_secret_env_placeholders");
         let config_dir = base.join("configs/rollout");
         fs::create_dir_all(&config_dir).unwrap();
-        let config_path = config_dir.join("chainstack-template.toml");
+        let config_path = config_dir.join("provider-template.toml");
 
         fs::write(
             base.join(".env"),
-            "CHAINSTACK_GRPC_ENDPOINT=yellowstone.example.com:443\n\
-CHAINSTACK_GRPC_TOKEN=env-token\n\
-CHAINSTACK_RPC_URL=https://rpc.example.com/api-key\n",
+            "GHOST_SEER_GRPC_ENDPOINT=yellowstone.example.com:443\n\
+GHOST_SEER_GRPC_X_TOKEN=env-token\n\
+GHOST_SEER_GRPC_AUTH_HEADER=x-api-key\n\
+GHOST_SEER_RPC_ENDPOINT=https://rpc.example.com/api-key\n\
+GHOST_TRIGGER_RPC_URL=https://rpc.example.com/api-key\n\
+GHOST_TRIGGER_SHADOW_RPC_URL=https://rpc.example.com/api-key\n",
         )
         .unwrap();
 
@@ -3953,13 +3978,14 @@ mode = "production"
 [seer]
 enabled = true
 source_mode = "grpc"
-grpc_endpoint = "${CHAINSTACK_GRPC_ENDPOINT}"
-grpc_x_token = "${CHAINSTACK_GRPC_TOKEN}"
-rpc_endpoint = "${CHAINSTACK_RPC_URL}"
+grpc_endpoint = "${GHOST_SEER_GRPC_ENDPOINT}"
+grpc_x_token = "${GHOST_SEER_GRPC_X_TOKEN}"
+grpc_auth_header = "${GHOST_SEER_GRPC_AUTH_HEADER}"
+rpc_endpoint = "${GHOST_SEER_RPC_ENDPOINT}"
 
 [trigger]
 enabled = true
-rpc_url = "${CHAINSTACK_RPC_URL}"
+rpc_url = "${GHOST_TRIGGER_RPC_URL}"
 entry_mode = "shadow_only"
 max_concurrent_positions = 1
 max_position_size_sol = 0.005
@@ -3968,7 +3994,7 @@ position_size_buffer_sol = 0.02
 
 [trigger.shadow_run]
 enabled = true
-shadow_rpc_url = "${CHAINSTACK_RPC_URL}"
+shadow_rpc_url = "${GHOST_TRIGGER_SHADOW_RPC_URL}"
 
 [execution]
 execution_mode = "paper"
@@ -3987,6 +4013,7 @@ enabled = true
 
         assert_eq!(config.seer.grpc_endpoint, "yellowstone.example.com:443");
         assert_eq!(config.effective_grpc_token(), Some("env-token"));
+        assert_eq!(config.seer.grpc_auth_header, "x-api-key");
         assert_eq!(config.seer.rpc_endpoint, "https://rpc.example.com/api-key");
         assert_eq!(config.trigger.rpc_url, "https://rpc.example.com/api-key");
         assert_eq!(
@@ -4010,14 +4037,14 @@ mode = "production"
 [seer]
 enabled = true
 source_mode = "grpc"
-grpc_endpoint = "yellowstone-solana-mainnet.core.chainstack.com:443"
+grpc_endpoint = "grpc.nln.clr3.org:443"
 grpc_x_token = "token"
 helius_endpoint = "https://mainnet.helius-rpc.com/?api-key=test"
-rpc_endpoint = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+rpc_endpoint = "https://rpc.nln.clr3.org"
 
 [trigger]
 enabled = true
-rpc_url = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+rpc_url = "https://rpc.nln.clr3.org"
 entry_mode = "live_and_shadow"
 max_concurrent_positions = 1
 max_position_size_sol = 0.0001
@@ -4084,7 +4111,7 @@ mode = "production"
 [seer]
 enabled = true
 source_mode = "grpc"
-grpc_endpoint = "yellowstone-solana-mainnet.core.chainstack.com:443"
+grpc_endpoint = "grpc.nln.clr3.org:443"
 grpc_x_token = "config-token"
 rpc_endpoint = "https://mainnet.helius-rpc.com/?api-key=config"
 
@@ -4119,7 +4146,7 @@ enabled = true
 
         assert_eq!(
             config.seer.grpc_endpoint,
-            "yellowstone-solana-mainnet.core.chainstack.com:443"
+            "grpc.nln.clr3.org:443"
         );
         assert_eq!(config.effective_grpc_token(), Some("config-token"));
         assert_eq!(
@@ -4324,7 +4351,7 @@ enabled = true
     fn test_validate_grpc_config_token_missing_rejected() {
         let mut config = LauncherConfig::default();
         config.seer.source_mode = Some("geyser_grpc".to_string());
-        config.seer.grpc_endpoint = "https://my-node.chainstack.com:443".to_string();
+        config.seer.grpc_endpoint = "https://yellowstone.example.test:443".to_string();
         config.seer.grpc_x_token = None;
         config.seer.grpc_auth_token = None;
         let result = config.validate_grpc_config();
@@ -4345,7 +4372,7 @@ enabled = true
     fn test_validate_grpc_config_valid() {
         let mut config = LauncherConfig::default();
         config.seer.source_mode = Some("geyser_grpc".to_string());
-        config.seer.grpc_endpoint = "https://my-node.chainstack.com:443".to_string();
+        config.seer.grpc_endpoint = "https://yellowstone.example.test:443".to_string();
         config.seer.grpc_x_token = Some("valid-token".to_string());
         assert!(config.validate_grpc_config().is_ok());
     }
@@ -4475,6 +4502,7 @@ enabled = true
                 .execution_account_evidence_freshness_ms,
             10_000
         );
+        assert!(!config.p37_shadow_probe.bcv2_terminal_route_closure_enabled);
     }
 
     #[test]
@@ -4538,6 +4566,7 @@ lifecycle_log_path = "logs/active/shadow_lifecycle.jsonl"
 enabled = true
 namespace = "probe-test"
 p37_execution_builder_mode = "working_builder_parity"
+bcv2_terminal_route_closure_enabled = true
 selection_log_path = "logs/probe/probe_selection.jsonl"
 skip_log_path = "logs/probe/probe_skips.jsonl"
 transport_log_path = "logs/probe/probe_transport.jsonl"
@@ -4561,6 +4590,7 @@ lifecycle_log_path = "logs/probe/probe_shadow_lifecycle.jsonl"
                 .execution_account_evidence_freshness_ms,
             10_000
         );
+        assert!(config.p37_shadow_probe.bcv2_terminal_route_closure_enabled);
         assert!(!config.p37_shadow_probe.emit_event_bus);
         assert!(config
             .p37_shadow_probe
@@ -4888,13 +4918,13 @@ mode = "production"
 [seer]
 enabled = true
 source_mode = "grpc"
-grpc_endpoint = "yellowstone-solana-mainnet.core.chainstack.com:443"
+grpc_endpoint = "grpc.nln.clr3.org:443"
 grpc_x_token = "token"
-rpc_endpoint = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+rpc_endpoint = "https://rpc.nln.clr3.org"
 
 [trigger]
 enabled = true
-rpc_url = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+rpc_url = "https://rpc.nln.clr3.org"
 entry_mode = "shadow_only"
 max_concurrent_positions = 8
 max_position_size_sol = 0.1
@@ -5222,14 +5252,14 @@ mode = "production"
 [seer]
 enabled = true
 source_mode = "grpc"
-grpc_endpoint = "yellowstone-solana-mainnet.core.chainstack.com:443"
+grpc_endpoint = "grpc.nln.clr3.org:443"
 grpc_x_token = "token"
 helius_endpoint = "https://mainnet.helius-rpc.com/?api-key=test"
-rpc_endpoint = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+rpc_endpoint = "https://rpc.nln.clr3.org"
 
 [trigger]
 enabled = true
-rpc_url = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+rpc_url = "https://rpc.nln.clr3.org"
 keypair_path = "keys/id.json"
 entry_mode = "live"
 
@@ -5345,14 +5375,14 @@ mode = "production"
 [seer]
 enabled = true
 source_mode = "grpc"
-grpc_endpoint = "yellowstone-solana-mainnet.core.chainstack.com:443"
+grpc_endpoint = "grpc.nln.clr3.org:443"
 grpc_x_token = "token"
 helius_endpoint = "https://mainnet.helius-rpc.com/?api-key=test"
-rpc_endpoint = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+rpc_endpoint = "https://rpc.nln.clr3.org"
 
 [trigger]
 enabled = true
-rpc_url = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+rpc_url = "https://rpc.nln.clr3.org"
 entry_mode = "shadow_only"
 max_concurrent_positions = 1
 max_position_size_sol = 0.005
@@ -5395,14 +5425,14 @@ mode = "test"
 [seer]
 enabled = true
 source_mode = "grpc"
-grpc_endpoint = "yellowstone-solana-mainnet.core.chainstack.com:443"
+grpc_endpoint = "grpc.nln.clr3.org:443"
 grpc_x_token = "token"
 helius_endpoint = "https://mainnet.helius-rpc.com/?api-key=test"
-rpc_endpoint = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+rpc_endpoint = "https://rpc.nln.clr3.org"
 
 [trigger]
 enabled = true
-rpc_url = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+rpc_url = "https://rpc.nln.clr3.org"
 entry_mode = "shadow_only"
 max_concurrent_positions = 1
 max_position_size_sol = 0.005
@@ -5439,14 +5469,14 @@ mode = "test"
 [seer]
 enabled = true
 source_mode = "grpc"
-grpc_endpoint = "yellowstone-solana-mainnet.core.chainstack.com:443"
+grpc_endpoint = "grpc.nln.clr3.org:443"
 grpc_x_token = "token"
 helius_endpoint = "https://mainnet.helius-rpc.com/?api-key=test"
-rpc_endpoint = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+rpc_endpoint = "https://rpc.nln.clr3.org"
 
 [trigger]
 enabled = true
-rpc_url = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+rpc_url = "https://rpc.nln.clr3.org"
 entry_mode = "shadow_only"
 max_concurrent_positions = 1
 max_position_size_sol = 0.005
@@ -5491,14 +5521,14 @@ mode = "production"
 [seer]
 enabled = true
 source_mode = "grpc"
-grpc_endpoint = "yellowstone-solana-mainnet.core.chainstack.com:443"
+grpc_endpoint = "grpc.nln.clr3.org:443"
 grpc_x_token = "token"
 helius_endpoint = "https://mainnet.helius-rpc.com/?api-key=test"
-rpc_endpoint = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+rpc_endpoint = "https://rpc.nln.clr3.org"
 
 [trigger]
 enabled = true
-rpc_url = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+rpc_url = "https://rpc.nln.clr3.org"
 entry_mode = "shadow_only"
 max_concurrent_positions = 1
 max_position_size_sol = 0.005
@@ -5543,14 +5573,14 @@ mode = "test"
 [seer]
 enabled = true
 source_mode = "grpc"
-grpc_endpoint = "yellowstone-solana-mainnet.core.chainstack.com:443"
+grpc_endpoint = "grpc.nln.clr3.org:443"
 grpc_x_token = "token"
 helius_endpoint = "https://mainnet.helius-rpc.com/?api-key=test"
-rpc_endpoint = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+rpc_endpoint = "https://rpc.nln.clr3.org"
 
 [trigger]
 enabled = true
-rpc_url = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+rpc_url = "https://rpc.nln.clr3.org"
 entry_mode = "shadow_only"
 
 [execution]
@@ -5578,14 +5608,14 @@ mode = "test"
 [seer]
 enabled = true
 source_mode = "grpc"
-grpc_endpoint = "yellowstone-solana-mainnet.core.chainstack.com:443"
+grpc_endpoint = "grpc.nln.clr3.org:443"
 grpc_x_token = "token"
 helius_endpoint = "https://mainnet.helius-rpc.com/?api-key=test"
-rpc_endpoint = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+rpc_endpoint = "https://rpc.nln.clr3.org"
 
 [trigger]
 enabled = true
-rpc_url = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+rpc_url = "https://rpc.nln.clr3.org"
 entry_mode = "live"
 
 [execution]
@@ -5613,14 +5643,14 @@ mode = "production"
 [seer]
 enabled = true
 source_mode = "grpc"
-grpc_endpoint = "yellowstone-solana-mainnet.core.chainstack.com:443"
+grpc_endpoint = "grpc.nln.clr3.org:443"
 grpc_x_token = "token"
 helius_endpoint = "https://mainnet.helius-rpc.com/?api-key=test"
-rpc_endpoint = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+rpc_endpoint = "https://rpc.nln.clr3.org"
 
 [trigger]
 enabled = true
-rpc_url = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+rpc_url = "https://rpc.nln.clr3.org"
 entry_mode = "live_and_shadow"
 max_concurrent_positions = 1
 max_position_size_sol = 0.005
@@ -5660,13 +5690,13 @@ mode = "production"
 [seer]
 enabled = true
 source_mode = "grpc"
-grpc_endpoint = "yellowstone-solana-mainnet.core.chainstack.com:443"
+grpc_endpoint = "grpc.nln.clr3.org:443"
 grpc_x_token = "token"
-rpc_endpoint = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+rpc_endpoint = "https://rpc.nln.clr3.org"
 
 [trigger]
 enabled = true
-rpc_url = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+rpc_url = "https://rpc.nln.clr3.org"
 entry_mode = "shadow_only"
 max_concurrent_positions = 3
 max_position_size_sol = 0.1
@@ -5701,13 +5731,13 @@ mode = "production"
 [seer]
 enabled = true
 source_mode = "grpc"
-grpc_endpoint = "yellowstone-solana-mainnet.core.chainstack.com:443"
+grpc_endpoint = "grpc.nln.clr3.org:443"
 grpc_x_token = "token"
-rpc_endpoint = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+rpc_endpoint = "https://rpc.nln.clr3.org"
 
 [trigger]
 enabled = true
-rpc_url = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+rpc_url = "https://rpc.nln.clr3.org"
 entry_mode = "shadow_only"
 max_concurrent_positions = 1
 max_position_size_sol = 0.00001
@@ -5744,13 +5774,13 @@ mode = "production"
 [seer]
 enabled = true
 source_mode = "grpc"
-grpc_endpoint = "yellowstone-solana-mainnet.core.chainstack.com:443"
+grpc_endpoint = "grpc.nln.clr3.org:443"
 grpc_x_token = "token"
-rpc_endpoint = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+rpc_endpoint = "https://rpc.nln.clr3.org"
 
 [trigger]
 enabled = true
-rpc_url = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+rpc_url = "https://rpc.nln.clr3.org"
 entry_mode = "shadow_only"
 
 [gui_backend]
@@ -5774,13 +5804,13 @@ mode = "production"
 [seer]
 enabled = true
 source_mode = "grpc"
-grpc_endpoint = "yellowstone-solana-mainnet.core.chainstack.com:443"
+grpc_endpoint = "grpc.nln.clr3.org:443"
 grpc_x_token = "token"
-rpc_endpoint = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+rpc_endpoint = "https://rpc.nln.clr3.org"
 
 [trigger]
 enabled = true
-rpc_url = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+rpc_url = "https://rpc.nln.clr3.org"
 
 [execution]
 execution_mode = "paper"
@@ -5806,13 +5836,13 @@ mode = "production"
 [seer]
 enabled = true
 source_mode = "grpc"
-grpc_endpoint = "yellowstone-solana-mainnet.core.chainstack.com:443"
+grpc_endpoint = "grpc.nln.clr3.org:443"
 grpc_x_token = "token"
-rpc_endpoint = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+rpc_endpoint = "https://rpc.nln.clr3.org"
 
 [trigger]
 enabled = true
-rpc_url = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+rpc_url = "https://rpc.nln.clr3.org"
 entry_mode = "shadow_only"
 
 [execution]
@@ -5839,13 +5869,13 @@ mode = "production"
 [seer]
 enabled = true
 source_mode = "grpc"
-grpc_endpoint = "yellowstone-solana-mainnet.core.chainstack.com:443"
+grpc_endpoint = "grpc.nln.clr3.org:443"
 grpc_x_token = "token"
-rpc_endpoint = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+rpc_endpoint = "https://rpc.nln.clr3.org"
 
 [trigger]
 enabled = true
-rpc_url = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+rpc_url = "https://rpc.nln.clr3.org"
 entry_mode = "shadow_only"
 
 [execution]
@@ -5873,13 +5903,13 @@ mode = "production"
 [seer]
 enabled = true
 source_mode = "grpc"
-grpc_endpoint = "yellowstone-solana-mainnet.core.chainstack.com:443"
+grpc_endpoint = "grpc.nln.clr3.org:443"
 grpc_x_token = "token"
-rpc_endpoint = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+rpc_endpoint = "https://rpc.nln.clr3.org"
 
 [trigger]
 enabled = true
-rpc_url = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+rpc_url = "https://rpc.nln.clr3.org"
 entry_mode = "shadow_only"
 max_concurrent_positions = 1
 max_position_size_sol = 0.00001

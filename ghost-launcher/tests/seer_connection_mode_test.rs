@@ -31,6 +31,7 @@ fn create_test_config(
         grpc_client_id: None,
         grpc_auth_token: None,
         grpc_x_token: None,
+        grpc_auth_header: "x-token".to_string(),
         enable_pumpfun: true,
         enable_bonkfun: true,
         pump_program_id: TEST_PUMP_PROGRAM_ID.to_string(),
@@ -156,9 +157,9 @@ fn test_explicit_source_mode_overrides() {
 fn test_grpc_x_token_precedence() {
     // Test case 6: grpc_x_token takes precedence over grpc_auth_token
     let mut config = create_test_config("grpc", None, None);
-    config.grpc_endpoint = "https://yellowstone-solana-mainnet.core.chainstack.com:443".to_string();
+    config.grpc_endpoint = "https://grpc.nln.clr3.org:443".to_string();
     config.grpc_auth_token = Some("legacy-token".to_string());
-    config.grpc_x_token = Some("chainstack-x-token".to_string());
+    config.grpc_x_token = Some("provider-x-token".to_string());
 
     // Verify that grpc_x_token takes precedence over grpc_auth_token
     // This is the logic used in ghost-launcher/src/components/seer.rs
@@ -167,14 +168,14 @@ fn test_grpc_x_token_precedence() {
         .clone()
         .or(config.grpc_auth_token.clone());
 
-    assert_eq!(effective_token, Some("chainstack-x-token".to_string()));
+    assert_eq!(effective_token, Some("provider-x-token".to_string()));
 }
 
 #[test]
 fn test_grpc_auth_token_fallback() {
     // Test case 7: grpc_auth_token is used when grpc_x_token is not provided
     let mut config = create_test_config("grpc", None, None);
-    config.grpc_endpoint = "https://yellowstone-solana-mainnet.core.chainstack.com:443".to_string();
+    config.grpc_endpoint = "https://grpc.nln.clr3.org:443".to_string();
     config.grpc_auth_token = Some("legacy-token".to_string());
     // grpc_x_token is already None from create_test_config
 

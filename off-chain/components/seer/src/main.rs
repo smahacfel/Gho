@@ -239,6 +239,10 @@ fn load_config() -> SeerConfig {
         config.grpc_auth_token = Some(auth_token);
     }
 
+    if let Ok(auth_header) = std::env::var("SEER_GRPC_AUTH_HEADER") {
+        config.grpc_auth_header = auth_header;
+    }
+
     // Commitment configuration
     if let Ok(commitment) = std::env::var("SEER_COMMITMENT") {
         config.commitment = match commitment.to_lowercase().as_str() {

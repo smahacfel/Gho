@@ -3003,6 +3003,55 @@ lifecycle_log_path = "../../logs/shadow_run/r16-route-resolver/probe_lifecycle.j
             1,
         )
 
+    def test_audit_counts_bcv2_terminal_route_exclusion_denominator_removal(self) -> None:
+        row = {
+            "working_builder_parity_mode": "working_builder_parity",
+            "working_builder_request_built": True,
+            "working_builder_buy_variant": "routed_exact_sol_in",
+            "working_builder_manifest_contains_bcv2": True,
+            "working_builder_bcv2_pubkey": "bcv2-terminal",
+            "working_builder_bcv2_terminal_route_exclusion": True,
+            "working_builder_bcv2_terminal_route_exclusion_reason": audit.BCV2_TERMINAL_ROUTE_EXCLUSION_REASON,
+            "working_builder_bcv2_execution_evidence_status": "rpc_missing",
+            "working_builder_bcv2_execution_evidence_source": "rpc_hydration",
+            "working_builder_bcv2_execution_evidence_ready": False,
+            "working_builder_bcv2_execution_evidence_reason": "missing_on_rpc",
+            "working_builder_bcv2_execution_evidence_exact_pubkey_match": True,
+            "route_resolution_status": "no_executable_route_account_set",
+            "no_executable_route_account_set_reason": f"{audit.BCV2_TERMINAL_ROUTE_EXCLUSION_REASON}:bonding_curve_v2:bcv2-terminal",
+            "route_resolution_terminal_reason": audit.BCV2_TERMINAL_ROUTE_EXCLUSION_REASON,
+            "execution_feasibility_status": "not_executable_route",
+            "execution_feasibility_reason": audit.BCV2_TERMINAL_ROUTE_EXCLUSION_REASON,
+            "lifecycle_label_eligibility": "not_lifecycle_label_eligible",
+        }
+
+        payload = audit.working_builder_parity_payload([row])
+        active_payload = audit.working_builder_parity_payload([row], "active_shadow_")
+
+        self.assertEqual(payload["working_builder_manifest_ready_rows"], 0)
+        self.assertEqual(payload["bcv2_terminal_route_exclusion_rows"], 1)
+        self.assertEqual(payload["bcv2_terminal_route_exclusion_unique_pubkeys"], 1)
+        self.assertEqual(
+            payload["execution_feasibility_reject_bcv2_not_persistent_rows"],
+            1,
+        )
+        self.assertEqual(payload["buy_quality_denominator_excluded_bcv2_rows"], 1)
+        self.assertEqual(payload["lifecycle_denominator_excluded_bcv2_rows"], 1)
+        self.assertEqual(
+            active_payload["active_shadow_bcv2_terminal_route_exclusion_rows"],
+            1,
+        )
+        self.assertEqual(
+            active_payload[
+                "active_shadow_execution_feasibility_reject_bcv2_not_persistent_rows"
+            ],
+            1,
+        )
+        self.assertEqual(
+            active_payload["active_shadow_working_builder_manifest_ready_rows"],
+            0,
+        )
+
     def test_audit_flags_probe_working_builder_legacy_variant_rows(self) -> None:
         payload = audit.working_builder_parity_payload(
             [

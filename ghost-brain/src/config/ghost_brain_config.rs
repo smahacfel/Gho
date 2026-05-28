@@ -5036,13 +5036,16 @@ min_dev_paperhand_latency_ms = 2500
         assert_eq!(config.dow.extended_window_ms, 10000);
         // P0 invariant
         assert!(config.dow.extended_window_ms <= config.max_wait_time_ms);
-        assert!((config.dow.early_entry_min_confidence - 0.85).abs() < f64::EPSILON);
+        assert!((config.dow.early_entry_min_confidence - 0.50).abs() < f64::EPSILON);
+        assert!(!config.dow.extended_require_pdd_clean);
         // TAS
         assert!(config.tas.enabled);
-        assert!((config.tas.tas_hard_reject_threshold - 0.30).abs() < f64::EPSILON);
+        assert!((config.tas.tas_hard_reject_threshold - 0.10).abs() < f64::EPSILON);
         assert!((config.tas.momentum_trajectory_weight - 0.25).abs() < f64::EPSILON);
         // PDD
         assert!(config.pdd.enabled);
+        assert!(!config.pdd.spike_promoted_to_live);
+        assert!(!config.pdd.ramping_promoted_to_live);
         assert!((config.pdd.entry_drift_max_pct - 5.0).abs() < f64::EPSILON);
         assert!(config.pdd.spike_detection_enabled);
         assert!(config.pdd.ramping_detection_enabled);
@@ -5053,10 +5056,10 @@ min_dev_paperhand_latency_ms = 2500
         // Legacy fields must still deserialize
         assert!(config.use_three_layer_decision);
         assert_eq!(config.mode, GatekeeperMode::Long);
-        // P3: Legacy drift cap — must be 1.50, not 9999.0 (closed blind spot)
+        // Collector profile keeps the legacy cap permissive for wide evidence gathering.
         assert!(
-            (config.max_price_change_ratio - 1.50).abs() < f64::EPSILON,
-            "max_price_change_ratio must be 1.50 (temporary legacy safety cap, not 9999.0 blind spot), got {}",
+            (config.max_price_change_ratio - 9.50).abs() < f64::EPSILON,
+            "max_price_change_ratio must be 9.50 in the collector profile, got {}",
             config.max_price_change_ratio,
         );
     }

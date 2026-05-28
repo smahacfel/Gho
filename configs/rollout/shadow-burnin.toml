@@ -39,6 +39,7 @@ tx_filter_strategy = "per_pool"
 funding_lane_mode = "disabled"
 grpc_endpoint = "${GHOST_SEER_GRPC_ENDPOINT}"
 grpc_x_token = "${GHOST_SEER_GRPC_X_TOKEN}"
+grpc_auth_header = "x-api-key"
 rpc_endpoint = "${GHOST_SEER_RPC_ENDPOINT}"
 enable_pumpfun = true
 enable_bonkfun = false

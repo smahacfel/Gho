@@ -13,8 +13,9 @@ stream_mode = "single_global"
 tx_filter_strategy = "per_pool"
 # PR-6 guardrail: dual stays neutral until canonical shadow burn-in is accepted.
 funding_lane_mode = "disabled"
-grpc_endpoint = "${CHAINSTACK_GRPC_ENDPOINT}"
-grpc_x_token = "${CHAINSTACK_GRPC_TOKEN}"
+grpc_endpoint = "${GHOST_SEER_GRPC_ENDPOINT}"
+grpc_x_token = "${GHOST_SEER_GRPC_X_TOKEN}"
+grpc_auth_header = "x-api-key"
 # REQUIRED for real live use: override via GHOST_SEER_HELIUS_ENDPOINT in env/.env.
 # This placeholder must fail preflight/startup until a real Helius RPC URL with API key is supplied.
 helius_endpoint = "replace-me"
@@ -25,7 +26,7 @@ enable_raydium = false
 
 [trigger]
 enabled = true
-rpc_url = "${CHAINSTACK_RPC_URL}"
+rpc_url = "${GHOST_TRIGGER_RPC_URL}"
 keypair_path = "../../wallets/dual-micro-live-wallet.json"
 entry_mode = "live_and_shadow"
 max_concurrent_positions = 1

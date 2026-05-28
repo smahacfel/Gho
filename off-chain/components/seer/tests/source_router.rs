@@ -27,6 +27,7 @@ fn default_test_config() -> SeerConfig {
         grpc_manual_backfill_enabled: true,
         grpc_client_id: None,
         grpc_auth_token: None,
+        grpc_auth_header: SeerConfig::default_grpc_auth_header(),
         max_reconnect_attempts: 5,
         reconnect_delay_secs: 1,
         max_reconnect_delay_secs: 60,

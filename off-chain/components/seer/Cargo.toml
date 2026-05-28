@@ -62,6 +62,7 @@ rustfft = "6.1"
 yellowstone-grpc-client = "1.14"
 yellowstone-grpc-proto = "1.14"
 tonic = { version = "0.10", features = ["tls", "tls-roots"] }
+tonic-health = "0.10"
 prost = "0.12"
 
 # Internal dependencies

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import threading
 import time
@@ -18,6 +19,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.parse import urlparse
 
 import requests
 
@@ -27,7 +29,7 @@ import gatekeeper_outcome_labeler as v1
 PRICE_PATH_SCHEMA_VERSION = 1
 DEFAULT_WINDOW_S = 60.0
 IMPLEMENTATION_STATUS = "schema_only_no_collector"
-DEFAULT_RPC = "https://solana-mainnet.core.chainstack.com/f2993325e24cc4aaa8f2d5fdd2b4c6fa"
+DEFAULT_RPC = "https://rpc.nln.clr3.org"
 DEFAULT_WORKERS = 8
 DEFAULT_MAX_RPS = 40.0
 DEFAULT_MAX_PAGES = 20
@@ -42,6 +44,41 @@ PUMP_VIRTUAL_TOKEN_INITIAL_RAW = 1_073_000_191_000_000
 PUMP_K = PUMP_VIRTUAL_SOL_OFFSET * PUMP_VIRTUAL_TOKEN_INITIAL_RAW
 PRICE_MIN_SOL = 1e-14
 PRICE_MAX_SOL = 1e-2
+
+RPC_AUTH_HEADER_ENV = "GHOST_RPC_AUTH_HEADER"
+RPC_AUTH_TOKEN_ENV = "GHOST_RPC_AUTH_TOKEN"
+LEGACY_PROVIDER_AUTH_HEADER_ENV = "GHOST_SEER_GRPC_AUTH_HEADER"
+LEGACY_PROVIDER_AUTH_TOKEN_ENV = "GHOST_SEER_GRPC_X_TOKEN"
+DEFAULT_RPC_AUTH_HEADER = "x-api-key"
+NLN_RPC_HOST = "rpc.nln.clr3.org"
+NLN_RPC_HOST_SUFFIX = ".nln.clr3.org"
+
+
+def _non_empty_env(name: str) -> str | None:
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _is_nln_rpc_url(rpc_url: str) -> bool:
+    host = (urlparse(rpc_url).hostname or "").lower()
+    return host == NLN_RPC_HOST or host.endswith(NLN_RPC_HOST_SUFFIX)
+
+
+def rpc_auth_headers(rpc_url: str) -> dict[str, str]:
+    if not _is_nln_rpc_url(rpc_url):
+        return {}
+    token = _non_empty_env(RPC_AUTH_TOKEN_ENV) or _non_empty_env(LEGACY_PROVIDER_AUTH_TOKEN_ENV)
+    if not token:
+        return {}
+    header = (
+        _non_empty_env(RPC_AUTH_HEADER_ENV)
+        or _non_empty_env(LEGACY_PROVIDER_AUTH_HEADER_ENV)
+        or DEFAULT_RPC_AUTH_HEADER
+    )
+    return {header: token}
 
 PATH_STATUS_OK = "ok"
 PATH_STATUS_PARTIAL = "partial"
@@ -195,13 +232,19 @@ class RpcClient:
         self.timeout_s = timeout_s
         self.retries = retries
         self.bucket = TokenBucket(max_rps)
+        self.headers = rpc_auth_headers(rpc_url)
 
     def call(self, method: str, params: list[Any]) -> dict[str, Any]:
         payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
         for attempt in range(1, self.retries + 2):
             self.bucket.acquire()
             try:
-                response = requests.post(self.rpc_url, json=payload, timeout=self.timeout_s)
+                response = requests.post(
+                    self.rpc_url,
+                    json=payload,
+                    headers=self.headers,
+                    timeout=self.timeout_s,
+                )
             except requests.exceptions.RequestException as exc:
                 if attempt > self.retries:
                     raise RuntimeError(f"rpc_network_error:{exc}") from exc
@@ -872,7 +915,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "no_live": True,
             "no_threshold_tuning": True,
             "does_not_use_decision_vectors_as_outcome_truth": True,
-            "default_rpc_provider": "chainstack",
+            "default_rpc_provider": "nln_clr3",
             "diag_account_update_fallback_enabled": args.system_log_base is not None,
         },
         "paths": {
@@ -891,7 +934,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--threshold-hits", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--checkpoint", type=Path)
-    parser.add_argument("--rpc", default=DEFAULT_RPC, help="Solana JSON-RPC endpoint; defaults to project Chainstack endpoint")
+    parser.add_argument("--rpc", default=DEFAULT_RPC, help="Solana JSON-RPC endpoint; defaults to project provider endpoint")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
     parser.add_argument("--max-rps", type=float, default=DEFAULT_MAX_RPS)
     parser.add_argument("--max-pages", type=int, default=DEFAULT_MAX_PAGES)

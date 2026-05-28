@@ -3028,7 +3028,9 @@ min_consecutive_buys = 1.0
                 "{} must satisfy the Phase 2 production Gatekeeper contract",
                 path.display()
             );
-            let expected_funding_lane_mode = if is_shadow_only_profile {
+            let expected_funding_lane_mode = if is_shadow_burnin {
+                "disabled"
+            } else if is_paper_burnin {
                 "full_chain"
             } else {
                 "disabled"
@@ -3073,14 +3075,19 @@ min_consecutive_buys = 1.0
     }
 
     #[test]
-    fn test_tracked_shadow_burnin_config_enables_authoritative_funding_lane() {
+    fn test_tracked_shadow_burnin_config_uses_primary_only_funding_mode() {
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let path = manifest_dir.join("../configs/rollout/shadow-burnin.toml");
         let source = std::fs::read_to_string(&path)
             .unwrap_or_else(|read_err| panic!("failed to read {}: {read_err}", path.display()));
         assert!(
-            source.contains("funding_lane_mode = \"full_chain\""),
-            "{} must keep the authoritative funding lane enabled for the canonical shadow burn-in command",
+            source.contains("funding_lane_mode = \"disabled\""),
+            "{} must keep the canonical shadow burn-in command on the primary stream under single-stream provider constraints",
+            path.display()
+        );
+        assert!(
+            source.contains("payer_strategy = \"configured\""),
+            "{} must use a funded, chain-visible configured payer for shadow simulation",
             path.display()
         );
     }

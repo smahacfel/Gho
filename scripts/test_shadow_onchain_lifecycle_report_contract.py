@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
+import contextlib
+from datetime import datetime, timezone
+import io
 import json
 import sys
 import tempfile
@@ -80,6 +84,287 @@ def full_lifecycle_row(*, exit_fills: list[dict[str, object]] | None = None) -> 
             }
         ],
     }
+
+
+def iso_ms(timestamp_ms: int) -> str:
+    return datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc).isoformat(
+        timespec="milliseconds"
+    ).replace("+00:00", "Z")
+
+
+def write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "".join(json.dumps(row, sort_keys=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+
+def write_config(path: Path, root: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"""
+[oracle]
+decision_log_path = "{root / "decisions"}"
+
+[trigger.shadow_run]
+output_path = "{root / "buys.jsonl"}"
+
+[execution.shadow]
+entry_log_path = "{root / "shadow_entries.jsonl"}"
+lifecycle_log_path = "{root / "shadow_lifecycle.jsonl"}"
+
+[execution.events]
+output_dir = "{root / "events"}"
+
+[logging]
+file_path = "{root / "system.log"}"
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+
+def diag_line(timestamp_ms: int, mint: str, slot: int, finality: str = "finalized") -> str:
+    return (
+        f"{iso_ms(timestamp_ms)} INFO DIAG_ACCOUNT_UPDATE_RELAY "
+        f"base_mint={mint} bonding_curve=bc_{mint} slot={slot} "
+        "sol_reserves=1000000000 token_reserves=100000000000000 "
+        f"complete=0 curve_finality={finality}\n"
+    )
+
+
+def build_report_fixture(root: Path, *, max_truth_gap_ms: int | None = None) -> dict[str, object]:
+    base = 1_700_000_000_000
+    config_path = root / "configs" / "shadow.toml"
+    output_path = root / "report.jsonl"
+    write_config(config_path, root)
+    (root / "events").mkdir(parents=True, exist_ok=True)
+
+    good_candidate = f"mint_pool_{base + 1000}"
+    future_candidate = f"mintfuture_poolfuture_{base + 1100}"
+    error_candidate = f"minterr_poolerr_{base + 900}"
+
+    write_jsonl(
+        root / "buys.jsonl",
+        [
+            {
+                "candidate_id": good_candidate,
+                "base_mint": "mint",
+                "pool_amm_id": "pool",
+                "decision_ts_ms": base + 1900,
+                "sim_started_ts_ms": base + 1950,
+                "sim_finished_ts_ms": base + 2000,
+                "amount_lamports": 7_000_000,
+                "ab_record_id": "ab-1",
+                "v3_feature_snapshot_hash": "mfs-hash",
+                "v3_policy_config_hash": "policy-hash",
+                "decision_plane": "v25_shadow",
+                "rollout_namespace": "unit-ns",
+            },
+            {
+                "candidate_id": future_candidate,
+                "base_mint": "mintfuture",
+                "pool_amm_id": "poolfuture",
+                "decision_ts_ms": base + 1900,
+                "sim_started_ts_ms": base + 2050,
+                "sim_finished_ts_ms": base + 2100,
+                "amount_lamports": 7_000_000,
+            },
+            {
+                "candidate_id": error_candidate,
+                "base_mint": "minterr",
+                "pool_amm_id": "poolerr",
+                "decision_ts_ms": base + 1500,
+                "error_class": "simulation_error",
+            },
+        ],
+    )
+    write_jsonl(
+        root / "shadow_entries.jsonl",
+        [
+            {
+                "candidate_id": good_candidate,
+                "pool_id": "pool",
+                "mint_id": "mint",
+                "entry_price": 0.00000002,
+                "slot": 10,
+                "timestamp_ms": base + 2000,
+                "execution_outcome": "shadow_simulated",
+            },
+            {
+                "candidate_id": future_candidate,
+                "pool_id": "poolfuture",
+                "mint_id": "mintfuture",
+                "entry_price": 0.00000002,
+                "slot": 20,
+                "timestamp_ms": base + 2100,
+                "execution_outcome": "shadow_simulated",
+            },
+        ],
+    )
+    write_jsonl(
+        root / "shadow_lifecycle.jsonl",
+        [
+            {
+                "record_type": "exit_filled",
+                "candidate_id": good_candidate,
+                "position_id": "pool:mint:entry",
+                "pool_id": "pool",
+                "mint_id": "mint",
+                "timestamp_ms": base + 4000,
+                "sample_timestamp_ms": base + 4000,
+                "sample_slot": 14,
+                "sample_age_ms": 0,
+                "fraction_bps": 5000,
+                "remaining_fraction_bps": 5000,
+                "entry_price": 0.00000002,
+                "exit_price": 0.00000003,
+                "entry_value_sol": 0.0035,
+                "exit_value_sol": 0.004,
+                "truth_status": "resolved",
+                "truth_source": "canonical_account_state_snapshot",
+                "sample_price_state": "Valid",
+            },
+            {
+                "record_type": "exit_filled",
+                "candidate_id": good_candidate,
+                "position_id": "pool:mint:entry",
+                "pool_id": "pool",
+                "mint_id": "mint",
+                "timestamp_ms": base + 5000,
+                "sample_timestamp_ms": base + 5000,
+                "sample_slot": 15,
+                "sample_age_ms": 0,
+                "fraction_bps": 5000,
+                "remaining_fraction_bps": 0,
+                "entry_price": 0.00000002,
+                "exit_price": 0.00000003,
+                "entry_value_sol": 0.0035,
+                "exit_value_sol": 0.004,
+                "truth_status": "resolved",
+                "truth_source": "canonical_account_state_snapshot",
+                "sample_price_state": "Valid",
+            },
+            {
+                "record_type": "position_closed",
+                "candidate_id": good_candidate,
+                "position_id": "pool:mint:entry",
+                "pool_id": "pool",
+                "mint_id": "mint",
+                "timestamp_ms": base + 5000,
+                "sample_timestamp_ms": base + 5000,
+                "sample_slot": 15,
+                "entry_price": 0.00000002,
+                "entry_value_sol": 0.007,
+                "exit_value_sol": 0.008,
+                "gross_pnl_sol": 0.001,
+                "net_pnl_sol": 0.001,
+                "estimated_costs_sol": 0.0,
+                "final_pnl": 0.001,
+                "final_pnl_pct": 14.285714,
+                "duration_ms": 3000,
+                "close_reason": "Target",
+                "total_exits": 2,
+                "truth_status": "resolved",
+                "truth_source": "canonical_account_state_snapshot",
+                "sample_price_state": "Valid",
+            },
+            {
+                "record_type": "exit_filled",
+                "candidate_id": future_candidate,
+                "position_id": "poolfuture:mintfuture:entry",
+                "pool_id": "poolfuture",
+                "mint_id": "mintfuture",
+                "timestamp_ms": base + 5000,
+                "sample_timestamp_ms": base + 5000,
+                "sample_slot": 25,
+                "sample_age_ms": 0,
+                "fraction_bps": 10000,
+                "remaining_fraction_bps": 0,
+                "entry_price": 0.00000002,
+                "exit_price": 0.00000003,
+                "entry_value_sol": 0.007,
+                "exit_value_sol": 0.008,
+                "truth_status": "resolved",
+                "truth_source": "canonical_account_state_snapshot",
+                "sample_price_state": "Valid",
+            },
+            {
+                "record_type": "position_closed",
+                "candidate_id": future_candidate,
+                "position_id": "poolfuture:mintfuture:entry",
+                "pool_id": "poolfuture",
+                "mint_id": "mintfuture",
+                "timestamp_ms": base + 5000,
+                "sample_timestamp_ms": base + 5000,
+                "sample_slot": 25,
+                "entry_price": 0.00000002,
+                "entry_value_sol": 0.007,
+                "exit_value_sol": 0.008,
+                "gross_pnl_sol": 0.001,
+                "net_pnl_sol": 0.001,
+                "estimated_costs_sol": 0.0,
+                "final_pnl": 0.001,
+                "final_pnl_pct": 14.285714,
+                "duration_ms": 2900,
+                "close_reason": "Target",
+                "total_exits": 1,
+                "truth_status": "resolved",
+                "truth_source": "canonical_account_state_snapshot",
+                "sample_price_state": "Valid",
+            },
+        ],
+    )
+    write_jsonl(
+        root / "decisions" / "gatekeeper_v2_buys.jsonl",
+        [
+            {
+                "base_mint": "mint",
+                "pool_id": "pool",
+                "first_seen_ts_ms": base + 900,
+                "observation_start_ts_ms": base + 900,
+                "observation_end_ts_ms": base + 1800,
+                "curve_t0_event_ts_ms": base + 800,
+                "timestamp": iso_ms(base + 1800),
+                "shadow_execution_outcome": "shadow_simulated",
+                "decision_verdict_buy": True,
+                "verdict_type": "BUY",
+                "decision_reason": "unit",
+            }
+        ],
+    )
+    (root / "system.log").write_text(
+        "".join(
+            [
+                diag_line(base + 1500, "mint", 11),
+                diag_line(base + 3500, "mint", 13),
+                diag_line(base + 4500, "mint", 14),
+                diag_line(base + 6000, "mint", 16),
+                diag_line(base + 2600, "mintfuture", 21),
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    args = argparse.Namespace(
+        config=config_path,
+        output=output_path,
+        outcome_summary_output=root / "compact.json",
+        manifest_output=None,
+        summary_output=None,
+        emit_skipped_rows="",
+        label_output=None,
+        label_summary_output=None,
+        label_summary_md_output=None,
+        session_start_ms=None,
+        session_end_ms=None,
+        all_sessions=True,
+        artifact_plane="shadow",
+        probe=False,
+        max_truth_gap_ms=max_truth_gap_ms,
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        return report.run_report(args)
 
 
 class ShadowOnchainLifecycleReportContractTests(unittest.TestCase):
@@ -176,6 +461,108 @@ class ShadowOnchainLifecycleReportContractTests(unittest.TestCase):
             )
             compact = json.loads(compact_json.read_text(encoding="utf-8"))
             self.assertEqual([report.project_outcome_summary_row(rows[0])], compact)
+
+    def test_previous_only_truth_matching_and_neighbor_deltas(self) -> None:
+        timeline = report.DiagTimeline(
+            timestamps_ms=[2000],
+            updates=[
+                report.DiagUpdate(
+                    timestamp_ms=2000,
+                    base_mint="mint",
+                    bonding_curve="bc",
+                    slot=1,
+                    sol_reserves_lamports=1,
+                    token_reserves_raw=1,
+                    complete=0,
+                    curve_finality="finalized",
+                )
+            ],
+        )
+
+        self.assertIsNone(report.find_causal_truth(timeline, 1000))
+        matched, prev_delta, next_delta = report.find_causal_truth_with_neighbors(timeline, 1000)
+        self.assertIsNone(matched)
+        self.assertIsNone(prev_delta)
+        self.assertEqual(1000, next_delta)
+
+    def test_synthetic_report_writes_manifest_summary_skips_and_labels(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_raw:
+            tmp = Path(tmp_raw)
+            result = build_report_fixture(tmp)
+            rows = result["rows"]
+            summary = result["summary"]
+            manifest = result["manifest"]
+            outputs = result["outputs"]
+
+            self.assertEqual(1, len(rows))
+            row = rows[0]
+            self.assertEqual("shadow_burnin_lifecycle_onchain", row["truth_dataset_kind"])
+            self.assertEqual("active_shadow", row["collection_plane"])
+            self.assertEqual("shadow_onchain_finalized_verified", row["execution_verification_class_hint"])
+            self.assertEqual("ab-1", row["ab_record_id"])
+            self.assertEqual("mfs-hash", row["v3_feature_snapshot_hash"])
+            self.assertEqual("policy-hash", row["v3_policy_config_hash"])
+            self.assertEqual("v25_shadow", row["decision_plane"])
+            self.assertEqual("unit-ns", row["rollout_namespace"])
+            self.assertEqual(report.PUMP_FUN_FEE_BPS, row["consistency"]["fee_bps"])
+            self.assertIsInstance(row["shadow"]["entry_price_scale_candidates"], list)
+            self.assertEqual(500, row["onchain"]["entry"]["match_prev_delta_ms"])
+            self.assertEqual(1500, row["onchain"]["entry"]["match_next_delta_ms"])
+            self.assertEqual(2, len(row["exit_fills"]))
+            self.assertEqual(500, row["exit_fills"][0]["onchain_match_prev_delta_ms"])
+            self.assertEqual(500, row["exit_fills"][0]["onchain_match_next_delta_ms"])
+            self.assertEqual(2, row["onchain"]["exit"]["fill_count"])
+
+            self.assertEqual(3, summary["transport_candidates"])
+            self.assertEqual(2, summary["transport_simulated"])
+            self.assertEqual({"simulation_error": 1}, summary["transport_errors_by_class"])
+            self.assertEqual(2, summary["entry_rows"])
+            self.assertEqual(2, summary["lifecycle_candidates"])
+            self.assertEqual(2, summary["position_closed"])
+            self.assertEqual(1, summary["rows_written"])
+            self.assertEqual({"entry_truth_future_only": 1}, summary["skipped_by_reason"])
+            self.assertEqual(1, summary["denominator_breakdown"]["simulation_error"])
+            self.assertEqual(1, summary["denominator_breakdown"]["no_position_closed"])
+
+            self.assertTrue(outputs.manifest_output.exists())
+            self.assertTrue(outputs.summary_output.exists())
+            self.assertTrue(outputs.skipped_rows_output.exists())
+            self.assertTrue(outputs.label_output.exists())
+            self.assertTrue(outputs.label_summary_output.exists())
+            self.assertTrue(outputs.label_summary_md_output.exists())
+            self.assertEqual(str(outputs.raw_output), manifest["outputs"]["raw_jsonl"])
+            self.assertEqual("ok", manifest["label_generation_status"]["status"])
+            self.assertEqual(1, manifest["rows_written"])
+            self.assertEqual({"entry_truth_future_only": 1}, manifest["skipped_by_reason"])
+
+            skipped_rows = [
+                json.loads(line)
+                for line in outputs.skipped_rows_output.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(1, len(skipped_rows))
+            self.assertEqual("entry_truth_future_only", skipped_rows[0]["reason"])
+            self.assertEqual(500, skipped_rows[0]["match_next_delta_ms"])
+
+            labels = [
+                json.loads(line)
+                for line in outputs.label_output.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(1, len(labels))
+            self.assertEqual("shadow_burnin_lifecycle_onchain", labels[0]["truth_dataset_kind"])
+            self.assertEqual("active_shadow", labels[0]["collection_plane"])
+            self.assertEqual("ab-1", labels[0]["ab_record_id"])
+            self.assertEqual(
+                "shadow_onchain_finalized_verified",
+                labels[0]["execution_verification_class_hint"],
+            )
+
+    def test_max_truth_gap_skips_rows_before_clean_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_raw:
+            result = build_report_fixture(Path(tmp_raw), max_truth_gap_ms=100)
+
+            self.assertEqual([], result["rows"])
+            self.assertEqual(1, result["skipped"]["entry_truth_too_far"])
+            self.assertEqual(1, result["skipped"]["entry_truth_future_only"])
 
 
 if __name__ == "__main__":

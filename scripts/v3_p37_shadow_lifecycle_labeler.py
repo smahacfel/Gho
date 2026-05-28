@@ -402,6 +402,12 @@ def build_label(row: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]
 
     label = {
         "schema_version": SCHEMA_VERSION,
+        "truth_dataset_kind": row.get("truth_dataset_kind")
+        if isinstance(row.get("truth_dataset_kind"), str)
+        else None,
+        "collection_plane": row.get("collection_plane")
+        if isinstance(row.get("collection_plane"), str)
+        else None,
         "candidate_id": row.get("candidate_id"),
         "position_id": row.get("position_id"),
         "pool_id": row.get("pool_id"),
@@ -413,6 +419,9 @@ def build_label(row: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]
         "sample_price_state": row.get("sample_price_state"),
         "market_outcome_class": market_class,
         "execution_verification_class": execution_class,
+        "execution_verification_class_hint": row.get("execution_verification_class_hint")
+        if isinstance(row.get("execution_verification_class_hint"), str)
+        else None,
         "execution_feasibility_status": execution_feasibility_status(row),
         "execution_feasibility_reason": execution_feasibility_reason(row),
         "route_resolution_status": row_string(row, "route_resolution_status"),
@@ -479,6 +488,11 @@ def build_summary(labels: list[dict[str, Any]], *, source_path: Path, output_pat
         "close_reason_counts": Counter(str(row.get("close_reason") or "unknown") for row in labels),
         "curve_finality_entry_counts": Counter(str(row.get("curve_finality_entry") or "unknown") for row in labels),
         "curve_finality_exit_counts": Counter(str(row.get("curve_finality_exit") or "unknown") for row in labels),
+        "truth_dataset_kind_counts": Counter(str(row.get("truth_dataset_kind") or "unknown") for row in labels),
+        "collection_plane_counts": Counter(str(row.get("collection_plane") or "unknown") for row in labels),
+        "execution_verification_class_hint_counts": Counter(
+            str(row.get("execution_verification_class_hint") or "unknown") for row in labels
+        ),
         "execution_feasibility_status_counts": Counter(
             str(row.get("execution_feasibility_status") or "unknown") for row in labels
         ),
@@ -573,6 +587,7 @@ def render_markdown(summary: dict[str, Any]) -> str:
         "truth_status_counts",
         "market_outcome_class_counts",
         "execution_verification_class_counts",
+        "execution_verification_class_hint_counts",
         "truth_gap_class_counts",
         "entry_truth_gap_class_counts",
         "exit_truth_gap_class_counts",
@@ -585,6 +600,8 @@ def render_markdown(summary: dict[str, Any]) -> str:
         "close_reason_counts",
         "curve_finality_entry_counts",
         "curve_finality_exit_counts",
+        "truth_dataset_kind_counts",
+        "collection_plane_counts",
         "gatekeeper_context_split",
         "close_reason_by_buy_quality",
         "degraded_reason_counts",

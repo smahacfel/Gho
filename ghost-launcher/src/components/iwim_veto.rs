@@ -654,11 +654,11 @@ mod tests {
     #[test]
     fn configured_rpc_url_rejects_placeholders_and_aliases() {
         assert_eq!(configured_rpc_url(""), None);
-        assert_eq!(configured_rpc_url("${CHAINSTACK_RPC_URL}"), None);
+        assert_eq!(configured_rpc_url("${GHOST_TRIGGER_RPC_URL}"), None);
         assert_eq!(configured_rpc_url("primary"), None);
         assert_eq!(configured_rpc_url("runtime"), None);
         assert_eq!(
-            configured_rpc_url("solana-mainnet.core.chainstack.com"),
+            configured_rpc_url("rpc.nln.clr3.org"),
             None
         );
     }

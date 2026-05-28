@@ -4592,6 +4592,8 @@ fn enrich_buy_log_with_v3_shadow(
     config: &GatekeeperV3Config,
     deadline_elapsed: bool,
 ) {
+    log.gatekeeper_v3_config_payload = Some(config.v3_policy_config_payload());
+
     if !config.shadow_emit_enabled {
         return;
     }
@@ -37740,6 +37742,7 @@ mod tests {
         assert!(log.v3_replay_payload_schema_version.is_none());
         assert!(log.v3_materialized_feature_snapshot.is_none());
         assert!(log.v3_policy_config_payload.is_none());
+        assert!(log.gatekeeper_v3_config_payload.is_some());
     }
 
     #[test]
@@ -37816,6 +37819,7 @@ mod tests {
         assert!(log.v3_replay_payload_schema_version.is_none());
         assert!(log.v3_materialized_feature_snapshot.is_none());
         assert!(log.v3_policy_config_payload.is_none());
+        assert!(log.gatekeeper_v3_config_payload.is_some());
     }
 
     #[test]
@@ -37833,11 +37837,13 @@ mod tests {
         assert!(log.v3_replay_payload_schema_version.is_none());
         assert!(log.v3_materialized_feature_snapshot.is_none());
         assert!(log.v3_policy_config_payload.is_none());
+        assert!(log.gatekeeper_v3_config_payload.is_some());
 
         let mut payload_config = review_test_gatekeeper_v3_config();
         payload_config.replay_payload_enabled = true;
         let mut log = assessment.to_buy_log(&pool_id, &active_config);
         enrich_buy_log_with_v3_shadow(&mut log, &assessment, &payload_config, false);
+        assert!(log.gatekeeper_v3_config_payload.is_some());
 
         assert_eq!(
             log.v3_replay_payload_schema_version,

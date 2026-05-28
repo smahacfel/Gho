@@ -35,14 +35,15 @@ subscription_batch_size = 10
 reconnect_base_delay_secs = 5
 reconnect_max_delay_secs = 300
 stats_window_secs = 900
-# Chainstack gRPC Configuration (Wklej dane z panelu Chainstack)
-# Adres BEZ "https://". Format: "nd-xxx-xxx.p2pify.com:443"
-grpc_endpoint = "${CHAINSTACK_GRPC_ENDPOINT}"
-# Token X (jeśli wymagany, w przeciwnym razie zostaw puste "")
-grpc_x_token = "${CHAINSTACK_GRPC_TOKEN}"
+# NLN/CLR3 gRPC Configuration
+# Adres BEZ "https://". Format: "host:443"
+grpc_endpoint = "${GHOST_SEER_GRPC_ENDPOINT}"
+# API key dla gRPC.
+grpc_x_token = "${GHOST_SEER_GRPC_X_TOKEN}"
+grpc_auth_header = "x-api-key"
 
-# Szybki RPC (HTTPS) do zapytań Triggera (get_balance, simulate) - Użyj HTTPS z Chainstack Growth
-rpc_endpoint = "${CHAINSTACK_RPC_URL}"
+# Szybki RPC (HTTPS) do zapytań Seera / backfill.
+rpc_endpoint = "${GHOST_SEER_RPC_ENDPOINT}"
 grpc_manual_backfill_enabled = false
 grpc_commitment_fallback_to_websocket = false
 grpc_max_stalls_before_open = 3
@@ -77,8 +78,8 @@ default_profile = "standard"
 # Spust rewolwera - odpowiedzialny za tx building i wysyłkę, stworzony w architekturze DirectBuilder.
 [trigger]
 enabled = true
-# Tutaj też wklej HTTPS z Chainstacka (dla spójności)
-rpc_url = "${CHAINSTACK_RPC_URL}"
+# RPC używany przez Trigger.
+rpc_url = "${GHOST_TRIGGER_RPC_URL}"
 max_position_size_sol = 0.004
 entry_mode = "shadow_only"
 
@@ -137,7 +138,7 @@ stale_policy = "emit_warning"
 # live_and_shadow entry modes even though canonical proof artifacts live under
 # [execution.shadow].*
 enabled = true
-shadow_rpc_url = "${CHAINSTACK_RPC_URL}"
+shadow_rpc_url = "${GHOST_TRIGGER_SHADOW_RPC_URL}"
 commitment = "processed"
 sig_verify = false
 replace_recent_blockhash = true
@@ -224,8 +225,8 @@ rotation_interval = 60000    # (opcjonalne) Rotacja: co ile milisekund tworzyć 
 
 # 12 TX wystarczy. IWIM zrobi robotę w międzyczasie.
 min_txs_for_analysis = 25
-min_time_window_ms = 1    
-analysis_window_ms = 1      
+min_time_window_ms = 1
+analysis_window_ms = 500
 
 [account_state_core]
 enable = true
@@ -261,7 +262,7 @@ drift_alert_threshold_lamports = 50000000
 
 # Konfiguracja Guardiana (Bezpieczeństwo i integralność)
 [guardian]
-max_void_duration_ms = 1   # Jeśli Helius/Chainstack milczy przez 2s -> Abort (Hard Truth)
+max_void_duration_ms = 1   # Jeśli provider milczy przez 2s -> Abort (Hard Truth)
 max_integrity_violations = 5  # 5 błędów Jittera z rzędu -> Abort
 enable_parallel_tasks = true  # Pozwalamy na asynchroniczne sprawdzanie
 min_qass_score = 0.928          # Poniżej tego Guardian nawet nie pyta Oracle o zdanie

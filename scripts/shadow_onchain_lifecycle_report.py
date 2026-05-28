@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
+import v3_p37_shadow_lifecycle_labeler as lifecycle_labeler
 from shadow_run_report import (
     BUY_LOG_NAME,
     DEFAULT_CONFIG,
@@ -31,7 +32,14 @@ LAMPORTS_PER_SOL = 1_000_000_000
 PUMP_TOKEN_DECIMAL_FACTOR = 1_000_000
 PUMP_TOKEN_DECIMAL_FACTOR_F64 = float(PUMP_TOKEN_DECIMAL_FACTOR)
 LEGACY_PRICE_SCALE = PUMP_TOKEN_DECIMAL_FACTOR_F64
+PUMP_FUN_FEE_BPS = 100
+PRICE_SCALE_CANDIDATES = (1.0, LEGACY_PRICE_SCALE)
 DEFAULT_MAX_BUY_MATCH_DRIFT_MS = 60_000
+TRUTH_DATASET_KIND = "shadow_burnin_lifecycle_onchain"
+COLLECTION_PLANE_BY_ARTIFACT = {
+    "shadow": "active_shadow",
+    "probe": "counterfactual_shadow_probe",
+}
 JOIN_METADATA_FIELDS = (
     "ab_record_id",
     "source_ab_record_id",
@@ -71,6 +79,18 @@ class Inputs:
     session_end_ms: int | None
     output_path: Path
     max_truth_gap_ms: int | None
+
+
+@dataclass(slots=True)
+class ReportOutputs:
+    raw_output: Path
+    manifest_output: Path
+    summary_output: Path
+    skipped_rows_output: Path | None
+    label_output: Path
+    label_summary_output: Path
+    label_summary_md_output: Path
+    outcome_summary_output: Path | None
 
 
 @dataclass(slots=True)
@@ -244,6 +264,42 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--manifest-output",
+        type=Path,
+        help="Optional provenance manifest JSON path. Defaults next to --output.",
+    )
+    parser.add_argument(
+        "--summary-output",
+        type=Path,
+        help="Optional denominator summary JSON path. Defaults next to --output.",
+    )
+    parser.add_argument(
+        "--emit-skipped-rows",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Optionally write skipped candidate/fill diagnostics as JSONL. "
+            "When PATH is omitted, defaults next to --output."
+        ),
+    )
+    parser.add_argument(
+        "--label-output",
+        type=Path,
+        help="Optional lifecycle label JSONL path. Defaults next to --output.",
+    )
+    parser.add_argument(
+        "--label-summary-output",
+        type=Path,
+        help="Optional lifecycle label summary JSON path. Defaults next to --output.",
+    )
+    parser.add_argument(
+        "--label-summary-md-output",
+        type=Path,
+        help="Optional lifecycle label summary Markdown path. Defaults next to --output.",
+    )
+    parser.add_argument(
         "--session-start-ms",
         type=int,
         help=(
@@ -363,6 +419,70 @@ def resolve_inputs(args: argparse.Namespace) -> Inputs:
         session_end_ms=session_end_ms,
         output_path=output_path,
         max_truth_gap_ms=args.max_truth_gap_ms,
+    )
+
+
+def default_companion_path(output_path: Path, suffix: str) -> Path:
+    return output_path.with_suffix(suffix)
+
+
+def resolve_optional_output(
+    config_path: Path,
+    raw_path: Path | str | None,
+    default_path: Path | None,
+) -> Path | None:
+    if raw_path is None:
+        return default_path
+    if raw_path == "":
+        return default_path
+    return resolve_runtime_path(config_path, str(raw_path))
+
+
+def resolve_report_outputs(args: argparse.Namespace, inputs: Inputs) -> ReportOutputs:
+    return ReportOutputs(
+        raw_output=inputs.output_path,
+        manifest_output=resolve_optional_output(
+            inputs.config_path,
+            args.manifest_output,
+            default_companion_path(inputs.output_path, ".manifest.json"),
+        )
+        or default_companion_path(inputs.output_path, ".manifest.json"),
+        summary_output=resolve_optional_output(
+            inputs.config_path,
+            args.summary_output,
+            default_companion_path(inputs.output_path, ".summary.json"),
+        )
+        or default_companion_path(inputs.output_path, ".summary.json"),
+        skipped_rows_output=resolve_optional_output(
+            inputs.config_path,
+            args.emit_skipped_rows,
+            default_companion_path(inputs.output_path, ".skipped.jsonl"),
+        )
+        if args.emit_skipped_rows is not None
+        else None,
+        label_output=resolve_optional_output(
+            inputs.config_path,
+            args.label_output,
+            default_companion_path(inputs.output_path, ".labels.jsonl"),
+        )
+        or default_companion_path(inputs.output_path, ".labels.jsonl"),
+        label_summary_output=resolve_optional_output(
+            inputs.config_path,
+            args.label_summary_output,
+            default_companion_path(inputs.output_path, ".labels.summary.json"),
+        )
+        or default_companion_path(inputs.output_path, ".labels.summary.json"),
+        label_summary_md_output=resolve_optional_output(
+            inputs.config_path,
+            args.label_summary_md_output,
+            default_companion_path(inputs.output_path, ".labels.summary.md"),
+        )
+        or default_companion_path(inputs.output_path, ".labels.summary.md"),
+        outcome_summary_output=resolve_optional_output(
+            inputs.config_path,
+            args.outcome_summary_output,
+            None,
+        ),
     )
 
 
@@ -501,21 +621,86 @@ def pct_diff(actual: float | None, reference: float | None) -> float | None:
     return ((actual / reference) - 1.0) * 100.0
 
 
+def counter_dict(counter: Counter[str]) -> dict[str, int]:
+    return {key: counter[key] for key in sorted(counter)}
+
+
+def collection_plane_for_artifact(artifact_plane: str) -> str:
+    return COLLECTION_PLANE_BY_ARTIFACT.get(artifact_plane, artifact_plane)
+
+
+def execution_verification_class_hint_for_finality(finality: str | None) -> str:
+    normalized = (finality or "").strip().lower()
+    if normalized == "finalized":
+        return "shadow_onchain_finalized_verified"
+    if normalized == "confirmed":
+        return "shadow_onchain_confirmed_verified"
+    if normalized == "speculative":
+        return "shadow_onchain_speculative_snapshot_verified"
+    if normalized:
+        return "shadow_onchain_snapshot_verified_non_final"
+    return "shadow_onchain_degraded_unknown_finality"
+
+
+def combined_execution_verification_class_hint(finalities: Iterable[str | None]) -> str:
+    hints = [execution_verification_class_hint_for_finality(value) for value in finalities]
+    if not hints:
+        return "shadow_onchain_degraded_unknown_finality"
+    if "shadow_onchain_speculative_snapshot_verified" in hints:
+        return "shadow_onchain_speculative_snapshot_verified"
+    if any(hint.startswith("shadow_onchain_degraded") for hint in hints):
+        return "shadow_onchain_degraded_unknown_finality"
+    if any(hint == "shadow_onchain_snapshot_verified_non_final" for hint in hints):
+        return "shadow_onchain_snapshot_verified_non_final"
+    if all(hint == "shadow_onchain_finalized_verified" for hint in hints):
+        return "shadow_onchain_finalized_verified"
+    if all(
+        hint in {"shadow_onchain_confirmed_verified", "shadow_onchain_finalized_verified"}
+        for hint in hints
+    ):
+        return "shadow_onchain_confirmed_verified"
+    return "shadow_onchain_degraded_unknown_finality"
+
+
+def score_shadow_price_multipliers(
+    logged_price: float, reference_price: float | None
+) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for multiplier in PRICE_SCALE_CANDIDATES:
+        normalized = logged_price * multiplier if math.isfinite(logged_price) else None
+        if (
+            normalized is None
+            or normalized <= 0.0
+            or not math.isfinite(normalized)
+            or reference_price is None
+            or reference_price <= 0.0
+            or not math.isfinite(reference_price)
+        ):
+            ratio = None
+            score = None
+        else:
+            ratio = normalized / reference_price
+            score = abs(math.log10(ratio)) if ratio > 0.0 and math.isfinite(ratio) else None
+        candidates.append(
+            {
+                "multiplier": multiplier,
+                "normalized_price": normalized,
+                "reference_price": reference_price,
+                "ratio_to_reference": ratio,
+                "score": score,
+            }
+        )
+    return candidates
+
+
 def choose_shadow_price_multiplier(logged_price: float, reference_price: float | None) -> float:
-    if reference_price is None or reference_price <= 0.0 or not math.isfinite(reference_price):
-        return LEGACY_PRICE_SCALE if logged_price < 1e-10 else 1.0
-    candidates = (1.0, LEGACY_PRICE_SCALE)
-
-    def score(multiplier: float) -> float:
-        normalized = logged_price * multiplier
-        if normalized <= 0.0 or not math.isfinite(normalized):
-            return float("inf")
-        ratio = normalized / reference_price
-        if ratio <= 0.0 or not math.isfinite(ratio):
-            return float("inf")
-        return abs(math.log10(ratio))
-
-    return min(candidates, key=score)
+    candidates = score_shadow_price_multipliers(logged_price, reference_price)
+    valid_candidates = [candidate for candidate in candidates if candidate["score"] is not None]
+    if not valid_candidates:
+        if reference_price is None or reference_price <= 0.0 or not math.isfinite(reference_price):
+            return LEGACY_PRICE_SCALE if logged_price < 1e-10 else 1.0
+        return min(PRICE_SCALE_CANDIDATES, key=lambda multiplier: abs(multiplier - 1.0))
+    return min(valid_candidates, key=lambda candidate: candidate["score"])["multiplier"]
 
 
 def shadow_price_with_multiplier(price: float | None, multiplier: float) -> float | None:
@@ -524,10 +709,13 @@ def shadow_price_with_multiplier(price: float | None, multiplier: float) -> floa
     return price * multiplier
 
 
-def simulate_buy_tokens_raw(sol_in_lamports: int, update: DiagUpdate) -> int:
+def simulate_buy_tokens_raw(
+    sol_in_lamports: int, update: DiagUpdate, fee_bps: int = PUMP_FUN_FEE_BPS
+) -> int:
     if sol_in_lamports <= 0 or update.sol_reserves_lamports <= 0 or update.token_reserves_raw <= 0:
         return 0
-    fee = sol_in_lamports // 100
+    fee_bps = max(0, min(10_000, int(fee_bps)))
+    fee = (sol_in_lamports * fee_bps) // 10_000
     effective_sol = sol_in_lamports - fee
     invariant = update.sol_reserves_lamports * update.token_reserves_raw
     new_sol_reserves = update.sol_reserves_lamports + effective_sol
@@ -538,29 +726,36 @@ def simulate_buy_tokens_raw(sol_in_lamports: int, update: DiagUpdate) -> int:
     return max(0, tokens_out)
 
 
-def calculate_sell_sol_out_lamports(tokens_in_raw: int, update: DiagUpdate) -> int:
+def calculate_sell_sol_out_lamports(
+    tokens_in_raw: int, update: DiagUpdate, fee_bps: int = PUMP_FUN_FEE_BPS
+) -> int:
     if tokens_in_raw <= 0 or update.sol_reserves_lamports <= 0 or update.token_reserves_raw <= 0:
         return 0
+    fee_bps = max(0, min(10_000, int(fee_bps)))
     invariant = update.sol_reserves_lamports * update.token_reserves_raw
     new_token_reserves = update.token_reserves_raw + tokens_in_raw
     if new_token_reserves <= 0:
         return 0
     new_sol_reserves = invariant // new_token_reserves
     sol_out = update.sol_reserves_lamports - new_sol_reserves
-    fee = sol_out // 100
+    fee = (sol_out * fee_bps) // 10_000
     return max(0, sol_out - fee)
 
 
-def buy_executable_price_sol(sol_in_lamports: int, update: DiagUpdate) -> tuple[float | None, int]:
-    tokens_out_raw = simulate_buy_tokens_raw(sol_in_lamports, update)
+def buy_executable_price_sol(
+    sol_in_lamports: int, update: DiagUpdate, fee_bps: int = PUMP_FUN_FEE_BPS
+) -> tuple[float | None, int]:
+    tokens_out_raw = simulate_buy_tokens_raw(sol_in_lamports, update, fee_bps=fee_bps)
     if tokens_out_raw <= 0:
         return None, 0
     price_sol = lamports_to_sol(sol_in_lamports) / raw_to_display_tokens(tokens_out_raw)
     return price_sol, tokens_out_raw
 
 
-def sell_executable_price_sol(tokens_in_raw: int, update: DiagUpdate) -> tuple[float | None, int]:
-    sol_out_lamports = calculate_sell_sol_out_lamports(tokens_in_raw, update)
+def sell_executable_price_sol(
+    tokens_in_raw: int, update: DiagUpdate, fee_bps: int = PUMP_FUN_FEE_BPS
+) -> tuple[float | None, int]:
+    sol_out_lamports = calculate_sell_sol_out_lamports(tokens_in_raw, update, fee_bps=fee_bps)
     if sol_out_lamports <= 0 or tokens_in_raw <= 0:
         return None, 0
     price_sol = lamports_to_sol(sol_out_lamports) / raw_to_display_tokens(tokens_in_raw)
@@ -959,13 +1154,48 @@ def find_causal_truth(timeline: DiagTimeline | None, target_ts_ms: int | None) -
     if timeline is None or not timeline.updates or target_ts_ms is None:
         return None
     index = bisect.bisect_right(timeline.timestamps_ms, target_ts_ms) - 1
-    if index >= 0:
-        update = timeline.updates[index]
-    else:
-        update = timeline.updates[0]
+    if index < 0:
+        return None
+    update = timeline.updates[index]
     delta_ms = target_ts_ms - update.timestamp_ms
-    direction = "before" if delta_ms >= 0 else "after"
-    return MatchedTruth(update=update, delta_ms=delta_ms, direction=direction)
+    return MatchedTruth(update=update, delta_ms=delta_ms, direction="before")
+
+
+def find_causal_truth_with_neighbors(
+    timeline: DiagTimeline | None, target_ts_ms: int | None
+) -> tuple[MatchedTruth | None, int | None, int | None]:
+    if timeline is None or not timeline.updates or target_ts_ms is None:
+        return None, None, None
+    index = bisect.bisect_right(timeline.timestamps_ms, target_ts_ms) - 1
+    prev_update = timeline.updates[index] if index >= 0 else None
+    next_index = index + 1 if index >= 0 else 0
+    next_update = timeline.updates[next_index] if next_index < len(timeline.updates) else None
+    matched = find_causal_truth(timeline, target_ts_ms)
+    prev_delta = target_ts_ms - prev_update.timestamp_ms if prev_update is not None else None
+    next_delta = next_update.timestamp_ms - target_ts_ms if next_update is not None else None
+    return matched, prev_delta, next_delta
+
+
+def record_skip(
+    skipped: Counter[str],
+    skipped_rows: list[dict[str, Any]],
+    reason: str,
+    *,
+    candidate_id: str | None,
+    stage: str,
+    context: dict[str, Any] | None = None,
+) -> None:
+    skipped[reason] += 1
+    row = {
+        "schema_version": 1,
+        "truth_dataset_kind": TRUTH_DATASET_KIND,
+        "candidate_id": candidate_id,
+        "stage": stage,
+        "reason": reason,
+    }
+    if context:
+        row.update(context)
+    skipped_rows.append(row)
 
 
 def analyze_positions(
@@ -975,34 +1205,49 @@ def analyze_positions(
     lifecycle_by_candidate: dict[str, LifecycleBundle],
     gatekeeper_buys_by_key: dict[tuple[str, str], list[GatekeeperBuyRow]],
     diag_updates_by_mint: dict[str, DiagTimeline],
-) -> tuple[list[dict[str, Any]], Counter[str]]:
+) -> tuple[list[dict[str, Any]], Counter[str], list[dict[str, Any]]]:
     rows: list[dict[str, Any]] = []
     skipped = Counter()
+    skipped_rows: list[dict[str, Any]] = []
     for candidate_id in sorted(lifecycle_by_candidate, key=lambda value: extract_candidate_ts_ms(value) or 0):
         bundle = lifecycle_by_candidate[candidate_id]
         closed = bundle.position_closed
         if closed is None:
-            skipped["missing_position_closed"] += 1
+            record_skip(skipped, skipped_rows, "missing_position_closed", candidate_id=candidate_id, stage="lifecycle")
             continue
         if closed.truth_status != "resolved":
-            skipped["close_truth_not_resolved"] += 1
+            record_skip(
+                skipped,
+                skipped_rows,
+                "close_truth_not_resolved",
+                candidate_id=candidate_id,
+                stage="lifecycle",
+                context={"truth_status": closed.truth_status},
+            )
             continue
         resolved_exit_fills = [fill for fill in bundle.exit_fills if fill.truth_status == "resolved"]
         if not resolved_exit_fills:
-            skipped["no_resolved_exit_fills"] += 1
+            record_skip(skipped, skipped_rows, "no_resolved_exit_fills", candidate_id=candidate_id, stage="lifecycle")
             continue
 
         transport = transport_by_candidate.get(candidate_id)
         if transport is None:
-            skipped["missing_transport_record"] += 1
+            record_skip(skipped, skipped_rows, "missing_transport_record", candidate_id=candidate_id, stage="transport")
             continue
         if transport.error_class:
-            skipped["transport_record_has_error"] += 1
+            record_skip(
+                skipped,
+                skipped_rows,
+                "transport_record_has_error",
+                candidate_id=candidate_id,
+                stage="transport",
+                context={"error_class": transport.error_class},
+            )
             continue
 
         parsed_candidate = parse_candidate_id(candidate_id)
         if parsed_candidate is None:
-            skipped["unparseable_candidate_id"] += 1
+            record_skip(skipped, skipped_rows, "unparseable_candidate_id", candidate_id=candidate_id, stage="identity")
             continue
         mint_id, pool_id, _ = parsed_candidate
         if closed.mint_id and closed.mint_id != mint_id:
@@ -1024,7 +1269,7 @@ def analyze_positions(
             None,
         )
         if raw_shadow_entry_price is None:
-            skipped["missing_entry_price"] += 1
+            record_skip(skipped, skipped_rows, "missing_entry_price", candidate_id=candidate_id, stage="entry")
             continue
         entry_value_sol = next(
             (
@@ -1038,7 +1283,7 @@ def analyze_positions(
             None,
         )
         if entry_value_sol is None:
-            skipped["missing_entry_value"] += 1
+            record_skip(skipped, skipped_rows, "missing_entry_value", candidate_id=candidate_id, stage="entry")
             continue
 
         entry_execution_ts_ms = next(
@@ -1057,7 +1302,7 @@ def analyze_positions(
             None,
         )
         if entry_execution_ts_ms is None:
-            skipped["missing_entry_execution_ts"] += 1
+            record_skip(skipped, skipped_rows, "missing_entry_execution_ts", candidate_id=candidate_id, stage="entry")
             continue
 
         gatekeeper_buy = match_gatekeeper_buy(
@@ -1067,15 +1312,47 @@ def analyze_positions(
         )
         mint_timeline = diag_updates_by_mint.get(mint_id)
         if mint_timeline is None:
-            skipped["missing_diag_updates"] += 1
+            record_skip(
+                skipped,
+                skipped_rows,
+                "missing_diag_updates",
+                candidate_id=candidate_id,
+                stage="truth",
+                context={"mint_id": mint_id},
+            )
             continue
 
-        entry_truth = find_causal_truth(mint_timeline, entry_execution_ts_ms)
+        entry_truth, entry_prev_delta_ms, entry_next_delta_ms = find_causal_truth_with_neighbors(
+            mint_timeline, entry_execution_ts_ms
+        )
         if entry_truth is None:
-            skipped["missing_entry_truth"] += 1
+            reason = "entry_truth_future_only" if entry_next_delta_ms is not None else "missing_entry_truth"
+            record_skip(
+                skipped,
+                skipped_rows,
+                reason,
+                candidate_id=candidate_id,
+                stage="entry_truth",
+                context={
+                    "target_ts_ms": entry_execution_ts_ms,
+                    "match_prev_delta_ms": entry_prev_delta_ms,
+                    "match_next_delta_ms": entry_next_delta_ms,
+                },
+            )
             continue
         if inputs.max_truth_gap_ms is not None and abs(entry_truth.delta_ms) > inputs.max_truth_gap_ms:
-            skipped["entry_truth_too_far"] += 1
+            record_skip(
+                skipped,
+                skipped_rows,
+                "entry_truth_too_far",
+                candidate_id=candidate_id,
+                stage="entry_truth",
+                context={
+                    "target_ts_ms": entry_execution_ts_ms,
+                    "match_delta_ms": entry_truth.delta_ms,
+                    "max_truth_gap_ms": inputs.max_truth_gap_ms,
+                },
+            )
             continue
 
         trade_amount_lamports = next(
@@ -1090,27 +1367,30 @@ def analyze_positions(
             None,
         )
         if trade_amount_lamports is None:
-            skipped["missing_trade_amount_lamports"] += 1
+            record_skip(skipped, skipped_rows, "missing_trade_amount_lamports", candidate_id=candidate_id, stage="entry")
             continue
 
         onchain_entry_exec_price_sol, onchain_entry_tokens_raw = buy_executable_price_sol(
             trade_amount_lamports, entry_truth.update
         )
         if onchain_entry_exec_price_sol is None or onchain_entry_tokens_raw <= 0:
-            skipped["entry_executable_quote_failed"] += 1
+            record_skip(skipped, skipped_rows, "entry_executable_quote_failed", candidate_id=candidate_id, stage="entry_quote")
             continue
 
+        entry_price_scale_candidates = score_shadow_price_multipliers(
+            raw_shadow_entry_price, onchain_entry_exec_price_sol
+        )
         entry_multiplier = choose_shadow_price_multiplier(
             raw_shadow_entry_price, onchain_entry_exec_price_sol
         )
         shadow_entry_price_sol = shadow_price_with_multiplier(raw_shadow_entry_price, entry_multiplier)
         if shadow_entry_price_sol is None or shadow_entry_price_sol <= 0.0:
-            skipped["invalid_shadow_entry_price"] += 1
+            record_skip(skipped, skipped_rows, "invalid_shadow_entry_price", candidate_id=candidate_id, stage="entry")
             continue
 
         shadow_entry_tokens_display = entry_value_sol / shadow_entry_price_sol
         if not math.isfinite(shadow_entry_tokens_display) or shadow_entry_tokens_display <= 0.0:
-            skipped["invalid_shadow_entry_token_qty"] += 1
+            record_skip(skipped, skipped_rows, "invalid_shadow_entry_token_qty", candidate_id=candidate_id, stage="entry")
             continue
         shadow_entry_tokens_raw_estimated = display_to_raw_tokens(shadow_entry_tokens_display)
 
@@ -1137,13 +1417,27 @@ def analyze_positions(
                 None,
             )
             if fill_entry_value_sol is None:
-                skipped["missing_exit_fill_entry_value"] += 1
+                record_skip(
+                    skipped,
+                    skipped_rows,
+                    "missing_exit_fill_entry_value",
+                    candidate_id=candidate_id,
+                    stage="exit_fill",
+                    context={"fill_index": fill_index},
+                )
                 exit_fill_rows = []
                 break
 
             fill_tokens_display = fill_entry_value_sol / shadow_entry_price_sol
             if not math.isfinite(fill_tokens_display) or fill_tokens_display <= 0.0:
-                skipped["invalid_exit_fill_token_qty"] += 1
+                record_skip(
+                    skipped,
+                    skipped_rows,
+                    "invalid_exit_fill_token_qty",
+                    candidate_id=candidate_id,
+                    stage="exit_fill",
+                    context={"fill_index": fill_index},
+                )
                 exit_fill_rows = []
                 break
             fill_tokens_raw = display_to_raw_tokens(fill_tokens_display)
@@ -1151,13 +1445,40 @@ def analyze_positions(
                 (value for value in (fill.sample_timestamp_ms, fill.timestamp_ms) if value is not None),
                 None,
             )
-            exit_truth = find_causal_truth(mint_timeline, fill_target_ts_ms)
+            exit_truth, exit_prev_delta_ms, exit_next_delta_ms = find_causal_truth_with_neighbors(
+                mint_timeline, fill_target_ts_ms
+            )
             if exit_truth is None:
-                skipped["missing_exit_truth"] += 1
+                reason = "exit_truth_future_only" if exit_next_delta_ms is not None else "missing_exit_truth"
+                record_skip(
+                    skipped,
+                    skipped_rows,
+                    reason,
+                    candidate_id=candidate_id,
+                    stage="exit_truth",
+                    context={
+                        "fill_index": fill_index,
+                        "target_ts_ms": fill_target_ts_ms,
+                        "match_prev_delta_ms": exit_prev_delta_ms,
+                        "match_next_delta_ms": exit_next_delta_ms,
+                    },
+                )
                 exit_fill_rows = []
                 break
             if inputs.max_truth_gap_ms is not None and abs(exit_truth.delta_ms) > inputs.max_truth_gap_ms:
-                skipped["exit_truth_too_far"] += 1
+                record_skip(
+                    skipped,
+                    skipped_rows,
+                    "exit_truth_too_far",
+                    candidate_id=candidate_id,
+                    stage="exit_truth",
+                    context={
+                        "fill_index": fill_index,
+                        "target_ts_ms": fill_target_ts_ms,
+                        "match_delta_ms": exit_truth.delta_ms,
+                        "max_truth_gap_ms": inputs.max_truth_gap_ms,
+                    },
+                )
                 exit_fill_rows = []
                 break
 
@@ -1165,7 +1486,14 @@ def analyze_positions(
                 fill_tokens_raw, exit_truth.update
             )
             if onchain_exit_exec_price_sol is None or onchain_exit_sol_out_lamports <= 0:
-                skipped["exit_executable_quote_failed"] += 1
+                record_skip(
+                    skipped,
+                    skipped_rows,
+                    "exit_executable_quote_failed",
+                    candidate_id=candidate_id,
+                    stage="exit_quote",
+                    context={"fill_index": fill_index},
+                )
                 exit_fill_rows = []
                 break
 
@@ -1188,7 +1516,14 @@ def analyze_positions(
                 None,
             )
             if shadow_fill_exit_value_sol is None:
-                skipped["missing_shadow_exit_value"] += 1
+                record_skip(
+                    skipped,
+                    skipped_rows,
+                    "missing_shadow_exit_value",
+                    candidate_id=candidate_id,
+                    stage="exit_fill",
+                    context={"fill_index": fill_index},
+                )
                 exit_fill_rows = []
                 break
 
@@ -1233,9 +1568,14 @@ def analyze_positions(
                     "sample_price_state": fill.sample_price_state,
                     "onchain_match_ts_ms": exit_truth.update.timestamp_ms,
                     "onchain_match_delta_ms": exit_truth.delta_ms,
+                    "onchain_match_prev_delta_ms": exit_prev_delta_ms,
+                    "onchain_match_next_delta_ms": exit_next_delta_ms,
                     "onchain_match_direction": exit_truth.direction,
                     "onchain_match_slot": exit_truth.update.slot,
                     "onchain_curve_finality": exit_truth.update.curve_finality,
+                    "execution_verification_class_hint": execution_verification_class_hint_for_finality(
+                        exit_truth.update.curve_finality
+                    ),
                     "onchain_spot_price_sol": onchain_spot_price_sol,
                     "onchain_executable_price_sol": onchain_exit_exec_price_sol,
                     "onchain_executable_value_sol": lamports_to_sol(onchain_exit_sol_out_lamports),
@@ -1245,7 +1585,7 @@ def analyze_positions(
         if not exit_fill_rows:
             continue
         if total_exit_tokens_display <= 0.0 or not math.isfinite(total_exit_tokens_display):
-            skipped["invalid_total_exit_qty"] += 1
+            record_skip(skipped, skipped_rows, "invalid_total_exit_qty", candidate_id=candidate_id, stage="exit")
             continue
 
         shadow_effective_exit_price_sol = shadow_exit_value_sum / total_exit_tokens_display
@@ -1269,8 +1609,19 @@ def analyze_positions(
             if transport.decision_ts_ms is not None
             else None
         )
+        execution_hint = combined_execution_verification_class_hint(
+            [entry_truth.update.curve_finality]
+            + [
+                fill.get("onchain_curve_finality")
+                for fill in exit_fill_rows
+                if isinstance(fill.get("onchain_curve_finality"), str)
+            ]
+        )
         row = {
             "schema_version": 1,
+            "truth_dataset_kind": TRUTH_DATASET_KIND,
+            "collection_plane": collection_plane_for_artifact(inputs.artifact_plane),
+            "execution_verification_class_hint": execution_hint,
             "analysis_status": "ok",
             "candidate_id": candidate_id,
             "position_id": closed.position_id,
@@ -1305,6 +1656,9 @@ def analyze_positions(
                 "execution_outcome": entry.execution_outcome if entry is not None else None,
                 "entry_price_logged": raw_shadow_entry_price,
                 "entry_price_multiplier": entry_multiplier,
+                "entry_price_scale_candidates": entry_price_scale_candidates,
+                "entry_truth_prev_delta_ms": entry_prev_delta_ms,
+                "entry_truth_next_delta_ms": entry_next_delta_ms,
                 "entry_price_sol": shadow_entry_price_sol,
                 "entry_value_sol": entry_value_sol,
                 "reported_entry_value_sol": reported_entry_value_sol,
@@ -1325,9 +1679,14 @@ def analyze_positions(
                 "entry": {
                     "match_ts_ms": entry_truth.update.timestamp_ms,
                     "match_delta_ms": entry_truth.delta_ms,
+                    "match_prev_delta_ms": entry_prev_delta_ms,
+                    "match_next_delta_ms": entry_next_delta_ms,
                     "match_direction": entry_truth.direction,
                     "match_slot": entry_truth.update.slot,
                     "curve_finality": entry_truth.update.curve_finality,
+                    "execution_verification_class_hint": execution_verification_class_hint_for_finality(
+                        entry_truth.update.curve_finality
+                    ),
                     "spot_price_sol": entry_truth.update.spot_price_sol(),
                     "executable_price_sol": onchain_entry_exec_price_sol,
                     "token_amount_display": raw_to_display_tokens(onchain_entry_tokens_raw),
@@ -1339,6 +1698,13 @@ def analyze_positions(
                     "total_executable_value_sol": onchain_exit_value_sum,
                     "fill_count": len(exit_fill_rows),
                     "max_abs_truth_gap_ms": max(exit_truth_gap_values) if exit_truth_gap_values else None,
+                    "execution_verification_class_hint": combined_execution_verification_class_hint(
+                        [
+                            fill.get("onchain_curve_finality")
+                            for fill in exit_fill_rows
+                            if isinstance(fill.get("onchain_curve_finality"), str)
+                        ]
+                    ),
                 },
             },
             "drift_pct": {
@@ -1365,6 +1731,7 @@ def analyze_positions(
                     else None
                 ),
                 "all_shadow_exit_prices_leq_onchain_spot": weighted_shadow_exit_spot_invariant_ok,
+                "fee_bps": PUMP_FUN_FEE_BPS,
             },
             "exit_fills": exit_fill_rows,
         }
@@ -1378,7 +1745,7 @@ def analyze_positions(
             )
         )
         rows.append(row)
-    return rows, skipped
+    return rows, skipped, skipped_rows
 
 
 def write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
@@ -1440,6 +1807,209 @@ def project_outcome_summary_row(row: dict[str, Any]) -> dict[str, Any]:
 
 def project_outcome_summary_rows(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     return [project_outcome_summary_row(row) for row in rows]
+
+
+def build_denominator_summary(
+    rows: list[dict[str, Any]],
+    skipped: Counter[str],
+    inputs: Inputs,
+    transport_by_candidate: dict[str, ShadowTransportRecord],
+    entry_by_candidate: dict[str, ShadowEntryRecord],
+    lifecycle_by_candidate: dict[str, LifecycleBundle],
+    scope_stats: ScopeStats,
+    outputs: ReportOutputs,
+) -> dict[str, Any]:
+    candidate_ids = (
+        set(transport_by_candidate.keys())
+        | set(entry_by_candidate.keys())
+        | set(lifecycle_by_candidate.keys())
+    )
+    closed_candidate_ids = {
+        candidate_id
+        for candidate_id, bundle in lifecycle_by_candidate.items()
+        if bundle.position_closed is not None
+    }
+    transport_errors = Counter(
+        record.error_class
+        for record in transport_by_candidate.values()
+        if isinstance(record.error_class, str) and record.error_class
+    )
+    entry_outcomes = Counter(
+        str(record.execution_outcome or "unknown") for record in entry_by_candidate.values()
+    )
+    resolved_lifecycle_candidates = sum(
+        1
+        for bundle in lifecycle_by_candidate.values()
+        if bundle.position_closed is not None and bundle.position_closed.truth_status == "resolved"
+    )
+    no_position_closed = len(candidate_ids - closed_candidate_ids)
+    missing_diag = sum(
+        skipped.get(reason, 0)
+        for reason in ("missing_diag_updates", "missing_entry_truth", "missing_exit_truth")
+    )
+    return {
+        "schema_version": 1,
+        "truth_dataset_kind": TRUTH_DATASET_KIND,
+        "collection_plane": collection_plane_for_artifact(inputs.artifact_plane),
+        "artifact_plane": inputs.artifact_plane,
+        "output": str(outputs.raw_output),
+        "scope_start_ms": inputs.session_start_ms,
+        "scope_end_ms": inputs.session_end_ms,
+        "session_run_id": inputs.session_run_id,
+        "scope_candidates": scope_stats.candidate_count,
+        "transport_candidates": len(transport_by_candidate),
+        "transport_simulated": sum(1 for record in transport_by_candidate.values() if not record.error_class),
+        "transport_errors_by_class": counter_dict(transport_errors),
+        "entry_rows": len(entry_by_candidate),
+        "entry_execution_outcome_counts": counter_dict(entry_outcomes),
+        "lifecycle_candidates": len(lifecycle_by_candidate),
+        "position_closed": scope_stats.closed_positions,
+        "close_truth_resolved": scope_stats.resolved_close_truth,
+        "close_truth_failed": scope_stats.failed_close_truth,
+        "resolved_lifecycle_candidates": resolved_lifecycle_candidates,
+        "rows_written": len(rows),
+        "skipped_by_reason": counter_dict(skipped),
+        "denominator_breakdown": {
+            "simulated": sum(1 for record in transport_by_candidate.values() if not record.error_class),
+            "closed": scope_stats.closed_positions,
+            "resolved": resolved_lifecycle_candidates,
+            "simulation_error": sum(transport_errors.values()),
+            "no_position_closed": no_position_closed,
+            "missing_diag": missing_diag,
+            "missing_diag_updates": skipped.get("missing_diag_updates", 0),
+            "entry_truth_future_only": skipped.get("entry_truth_future_only", 0),
+            "exit_truth_future_only": skipped.get("exit_truth_future_only", 0),
+            "entry_truth_too_far": skipped.get("entry_truth_too_far", 0),
+            "exit_truth_too_far": skipped.get("exit_truth_too_far", 0),
+        },
+    }
+
+
+def git_output(args: list[str]) -> str | None:
+    repo_root = Path(__file__).resolve().parents[1]
+    try:
+        completed = subprocess.run(
+            ["git", *args],
+            cwd=repo_root,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    if completed.returncode != 0:
+        return None
+    output = completed.stdout.strip()
+    return output or None
+
+
+def file_provenance(path: Path) -> dict[str, Any]:
+    exists = path.exists()
+    payload: dict[str, Any] = {
+        "path": str(path),
+        "exists": exists,
+        "size_bytes": None,
+        "mtime_ms": None,
+    }
+    if exists:
+        stat = path.stat()
+        payload["size_bytes"] = stat.st_size
+        payload["mtime_ms"] = int(stat.st_mtime * 1000)
+    return payload
+
+
+def build_manifest(
+    *,
+    inputs: Inputs,
+    outputs: ReportOutputs,
+    system_log_paths: list[Path],
+    rows: list[dict[str, Any]],
+    skipped: Counter[str],
+    scope_stats: ScopeStats,
+    label_summary: dict[str, Any],
+) -> dict[str, Any]:
+    script_path = Path(__file__).resolve()
+    script_git_sha = git_output(["log", "-1", "--format=%H", "--", str(script_path)])
+    if script_git_sha is None:
+        script_git_sha = git_output(["rev-parse", "HEAD"])
+    script_status = git_output(["status", "--short", "--", str(script_path)]) or ""
+    input_paths = {
+        "config": file_provenance(inputs.config_path),
+        "gatekeeper_buys_log": file_provenance(inputs.gatekeeper_buys_log),
+        "shadow_transport_log": file_provenance(inputs.shadow_transport_log),
+        "shadow_entry_log": file_provenance(inputs.shadow_entry_log),
+        "shadow_lifecycle_log": file_provenance(inputs.shadow_lifecycle_log),
+        "events_dir": file_provenance(inputs.events_dir),
+        "system_log_base": file_provenance(inputs.system_log_base),
+        "system_log_paths": [file_provenance(path) for path in system_log_paths],
+    }
+    return {
+        "schema_version": 1,
+        "truth_dataset_kind": TRUTH_DATASET_KIND,
+        "collection_plane": collection_plane_for_artifact(inputs.artifact_plane),
+        "artifact_plane": inputs.artifact_plane,
+        "script_path": str(script_path),
+        "script_git_sha": script_git_sha,
+        "script_git_dirty": bool(script_status),
+        "script_git_status": script_status,
+        "config_path": str(inputs.config_path),
+        "input_paths": input_paths,
+        "gatekeeper_buys_log": str(inputs.gatekeeper_buys_log),
+        "system_log_paths": [str(path) for path in system_log_paths],
+        "scope_start_ms": inputs.session_start_ms,
+        "scope_end_ms": inputs.session_end_ms,
+        "session_run_id": inputs.session_run_id,
+        "scope_candidates": scope_stats.candidate_count,
+        "rows_written": len(rows),
+        "skipped_by_reason": counter_dict(skipped),
+        "outputs": {
+            "raw_jsonl": str(outputs.raw_output),
+            "manifest_json": str(outputs.manifest_output),
+            "summary_json": str(outputs.summary_output),
+            "skipped_rows_jsonl": str(outputs.skipped_rows_output) if outputs.skipped_rows_output else None,
+            "label_jsonl": str(outputs.label_output),
+            "label_summary_json": str(outputs.label_summary_output),
+            "label_summary_md": str(outputs.label_summary_md_output),
+            "outcome_summary_json": str(outputs.outcome_summary_output)
+            if outputs.outcome_summary_output is not None
+            else None,
+        },
+        "label_generation_status": {
+            "status": "ok",
+            "rows_total": label_summary.get("rows_total"),
+            "phase_f_label_status": label_summary.get("phase_f_label_status"),
+        },
+    }
+
+
+def default_labeler_args() -> argparse.Namespace:
+    return argparse.Namespace(
+        entry_truth_gap_clean_ms=1500,
+        entry_truth_gap_degraded_acceptable_ms=10000,
+        exit_truth_gap_clean_ms=5000,
+        exit_truth_gap_timestop_acceptable_ms=45000,
+        exit_truth_gap_other_acceptable_ms=15000,
+        entry_drift_acceptable_abs_pct=15.0,
+        exit_drift_acceptable_abs_pct=5.0,
+    )
+
+
+def write_lifecycle_labels(
+    rows: list[dict[str, Any]],
+    outputs: ReportOutputs,
+) -> dict[str, Any]:
+    label_args = default_labeler_args()
+    labels = lifecycle_labeler.build_labels(rows, label_args)
+    lifecycle_labeler.write_jsonl(outputs.label_output, labels)
+    summary = lifecycle_labeler.build_summary(
+        labels,
+        source_path=outputs.raw_output,
+        output_path=outputs.label_output,
+        args=label_args,
+    )
+    lifecycle_labeler.write_json(outputs.label_summary_output, summary)
+    lifecycle_labeler.write_markdown(outputs.label_summary_md_output, summary)
+    return summary
 
 
 def summarize(
@@ -1521,9 +2091,9 @@ def format_stat_line(name: str, values: list[float]) -> str:
     )
 
 
-def main() -> int:
-    args = parse_args()
+def run_report(args: argparse.Namespace) -> dict[str, Any]:
     inputs = resolve_inputs(args)
+    outputs = resolve_report_outputs(args, inputs)
     transport_by_candidate = load_shadow_transport_records(inputs)
     entry_by_candidate = load_shadow_entries(inputs)
     lifecycle_by_candidate = load_lifecycle(inputs)
@@ -1533,44 +2103,85 @@ def main() -> int:
         lifecycle_by_candidate,
     )
     gatekeeper_buys_by_key = load_gatekeeper_buys(inputs)
+    system_log_paths = iter_system_log_paths(inputs.system_log_base)
     relevant_mints = {
         bundle.position_closed.mint_id
         for bundle in lifecycle_by_candidate.values()
         if bundle.position_closed is not None and bundle.position_closed.mint_id
     }
-    outcome_summary_output = (
-        resolve_runtime_path(inputs.config_path, str(args.outcome_summary_output))
-        if args.outcome_summary_output is not None
-        else None
-    )
     if not relevant_mints:
-        write_jsonl(inputs.output_path, [])
-        if outcome_summary_output is not None:
-            write_json(outcome_summary_output, [])
-        print(
-            summarize([], Counter({"no_closed_positions_in_scope": 1}), inputs, scope_stats)
+        rows: list[dict[str, Any]] = []
+        skipped = Counter({"no_closed_positions_in_scope": 1})
+        skipped_rows = [
+            {
+                "schema_version": 1,
+                "truth_dataset_kind": TRUTH_DATASET_KIND,
+                "collection_plane": collection_plane_for_artifact(inputs.artifact_plane),
+                "candidate_id": None,
+                "stage": "scope",
+                "reason": "no_closed_positions_in_scope",
+            }
+        ]
+    else:
+        diag_updates_by_mint = load_diag_updates(system_log_paths, relevant_mints)
+        rows, skipped, skipped_rows = analyze_positions(
+            inputs,
+            transport_by_candidate,
+            entry_by_candidate,
+            lifecycle_by_candidate,
+            gatekeeper_buys_by_key,
+            diag_updates_by_mint,
         )
-        return 0
-    system_log_paths = iter_system_log_paths(inputs.system_log_base)
-    diag_updates_by_mint = load_diag_updates(system_log_paths, relevant_mints)
-    rows, skipped = analyze_positions(
+        rows.sort(
+            key=lambda row: (
+                row["timing"]["close_ts_ms"] if row["timing"].get("close_ts_ms") is not None else 0,
+                row["candidate_id"],
+            )
+        )
+
+    write_jsonl(outputs.raw_output, rows)
+    if outputs.outcome_summary_output is not None:
+        write_json(outputs.outcome_summary_output, project_outcome_summary_rows(rows))
+    if outputs.skipped_rows_output is not None:
+        write_jsonl(outputs.skipped_rows_output, skipped_rows)
+    denominator_summary = build_denominator_summary(
+        rows,
+        skipped,
         inputs,
         transport_by_candidate,
         entry_by_candidate,
         lifecycle_by_candidate,
-        gatekeeper_buys_by_key,
-        diag_updates_by_mint,
+        scope_stats,
+        outputs,
     )
-    rows.sort(
-        key=lambda row: (
-            row["timing"]["close_ts_ms"] if row["timing"].get("close_ts_ms") is not None else 0,
-            row["candidate_id"],
-        )
+    write_json(outputs.summary_output, denominator_summary)
+    label_summary = write_lifecycle_labels(rows, outputs)
+    manifest = build_manifest(
+        inputs=inputs,
+        outputs=outputs,
+        system_log_paths=system_log_paths,
+        rows=rows,
+        skipped=skipped,
+        scope_stats=scope_stats,
+        label_summary=label_summary,
     )
-    write_jsonl(inputs.output_path, rows)
-    if outcome_summary_output is not None:
-        write_json(outcome_summary_output, project_outcome_summary_rows(rows))
+    write_json(outputs.manifest_output, manifest)
     print(summarize(rows, skipped, inputs, scope_stats))
+    return {
+        "inputs": inputs,
+        "outputs": outputs,
+        "rows": rows,
+        "skipped": skipped,
+        "skipped_rows": skipped_rows,
+        "summary": denominator_summary,
+        "label_summary": label_summary,
+        "manifest": manifest,
+    }
+
+
+def main() -> int:
+    args = parse_args()
+    run_report(args)
     return 0
 
 

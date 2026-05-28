@@ -255,7 +255,7 @@ def render_markdown(report: dict[str, Any]) -> str:
             "ale `good_executable=0` i brakuje execution proof dla market-good rows."
         )
         strongest_for = (
-            "Najmocniejsze evidence za V3: Chainstack price path daje niezerowe `good_clean` w R11/R13 "
+            "Najmocniejsze evidence za V3: RPC price path daje niezerowe `good_clean` w R11/R13 "
             "oraz stabilny, audytowalny temporal split dla market-quality targetu."
         )
         strongest_against = (

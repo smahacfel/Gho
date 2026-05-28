@@ -64,6 +64,7 @@ mod stress_tests {
             associated_bonding_curve: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
             is_mayhem_mode: None,
             cu_price_micro_lamports: Some(100),
             compute_unit_limit: Some(200_000),

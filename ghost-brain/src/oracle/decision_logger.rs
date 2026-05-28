@@ -84,7 +84,7 @@ pub const CYCLIC_LOG_SCHEMA_VERSION: u32 = 1;
 /// v21 adds ordered Gatekeeper gate trace diagnostics.
 /// v22 adds Gatekeeper V2 replay-input contract fields for manifest-locked
 /// offline axis replay.
-pub const GATEKEEPER_BUY_LOG_SCHEMA_VERSION: u32 = 22;
+pub const GATEKEEPER_BUY_LOG_SCHEMA_VERSION: u32 = 23;
 /// Gatekeeper version string embedded in every V2.5 shadow BUY log for traceability.
 pub const GATEKEEPER_VERSION: &str = "v2.5";
 /// Legacy Gatekeeper version string for pre-V2.5 live-plane semantics.
@@ -1495,6 +1495,28 @@ pub struct GatekeeperBuyLog {
     pub observed_stage: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision_eval_snapshots: Option<serde_json::Value>,
+
+    // ═══════════════════════════════════════════
+    // Full replay/calibration evidence payloads (v23)
+    // ═══════════════════════════════════════════
+    /// Complete Gatekeeper V2/V2.5 config that was active for this decision row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gatekeeper_v2_config_payload: Option<serde_json::Value>,
+    /// Complete Gatekeeper V3 config payload carried even when V3 replay payloads
+    /// are disabled, so every row records the sidecar policy context for the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gatekeeper_v3_config_payload: Option<serde_json::Value>,
+    /// Canonical decision-time feature snapshot used by Gatekeeper evaluation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub materialized_feature_snapshot: Option<serde_json::Value>,
+    /// Structured terminal decision object, preserving fields that are otherwise
+    /// spread across flat compatibility columns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gatekeeper_decision_payload: Option<serde_json::Value>,
+    /// Complete list of V2.5 shadow checkpoint decisions, not only the terminal
+    /// convenience aliases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v25_shadow_decisions_payload: Option<serde_json::Value>,
 
     // ═══════════════════════════════════════════
     // V2.5 Adaptive Prosperity (APS) fields
@@ -3141,6 +3163,11 @@ mod tests {
             observed_window_ms: None,
             observed_stage: None,
             decision_eval_snapshots: None,
+            gatekeeper_v2_config_payload: None,
+            gatekeeper_v3_config_payload: None,
+            materialized_feature_snapshot: None,
+            gatekeeper_decision_payload: None,
+            v25_shadow_decisions_payload: None,
             aps_regime: None,
             aps_shadow_entry_drift_max: None,
             aps_shadow_confidence_min: None,
@@ -3633,6 +3660,11 @@ mod tests {
             observed_window_ms: None,
             observed_stage: None,
             decision_eval_snapshots: None,
+            gatekeeper_v2_config_payload: None,
+            gatekeeper_v3_config_payload: None,
+            materialized_feature_snapshot: None,
+            gatekeeper_decision_payload: None,
+            v25_shadow_decisions_payload: None,
             aps_regime: None,
             aps_shadow_entry_drift_max: None,
             aps_shadow_confidence_min: None,

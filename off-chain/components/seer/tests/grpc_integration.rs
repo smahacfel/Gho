@@ -121,11 +121,11 @@ mod grpc_integration_tests {
 
     #[tokio::test]
     async fn test_grpc_configuration_with_https_endpoint() {
-        // Test HTTPS endpoint configuration (Chainstack-style)
+        // Test HTTPS endpoint configuration (provider-style)
         let config = SeerConfig {
             connection_mode: ConnectionMode::Grpc,
-            grpc_endpoint: "https://yellowstone-solana-mainnet.core.chainstack.com".to_string(),
-            grpc_client_id: Some("chainstack-client".to_string()),
+            grpc_endpoint: "https://grpc.nln.clr3.org".to_string(),
+            grpc_client_id: Some("provider-client".to_string()),
             grpc_auth_token: Some("test-x-token-secret".to_string()),
             max_reconnect_attempts: 3,
             reconnect_delay_secs: 2,
@@ -155,7 +155,7 @@ mod grpc_integration_tests {
         // Test HTTPS endpoint with explicit port 443
         let config = SeerConfig {
             connection_mode: ConnectionMode::Grpc,
-            grpc_endpoint: "https://yellowstone-solana-mainnet.core.chainstack.com:443".to_string(),
+            grpc_endpoint: "https://grpc.nln.clr3.org:443".to_string(),
             grpc_client_id: None,
             grpc_auth_token: Some("test-token".to_string()),
             max_reconnect_attempts: 5,

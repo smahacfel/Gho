@@ -1647,8 +1647,9 @@ pub async fn run(
         grpc_manual_backfill_enabled: config.grpc_manual_backfill_enabled,
         grpc_client_id: config.grpc_client_id,
         // Use grpc_x_token if provided, otherwise fall back to grpc_auth_token
-        // grpc_x_token is the preferred way to authenticate with Chainstack/Yellowstone
+        // grpc_x_token is the preferred way to authenticate with Yellowstone
         grpc_auth_token: config.grpc_x_token.or(config.grpc_auth_token),
+        grpc_auth_header: config.grpc_auth_header,
         max_reconnect_attempts: 10,
         reconnect_delay_secs: 5,
         max_reconnect_delay_secs: 300,
@@ -1754,7 +1755,7 @@ pub async fn run(
         );
     }
     info!(
-        "  x-token auth: {}",
+        "  gRPC auth: {}",
         if seer_config.grpc_auth_token.is_some() {
             "ENABLED (will be sent with every streaming message)"
         } else {

@@ -12,9 +12,9 @@ fn gatekeeper_v3_config_loads_from_production_toml() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("ghost_brain_config.toml");
     let config = GhostBrainConfig::from_toml_file(&path).expect("production config should load");
 
-    assert!(!config.gatekeeper_v3.enabled);
+    assert!(config.gatekeeper_v3.enabled);
     assert!(config.gatekeeper_v3.shadow_emit_enabled);
-    assert!(!config.gatekeeper_v3.replay_payload_enabled);
+    assert!(config.gatekeeper_v3.replay_payload_enabled);
     assert_eq!(config.gatekeeper_v3.policy_version, 1);
     assert_eq!(config.gatekeeper_v3.materialization_version, 1);
     assert!(!config.gatekeeper_v3.promotion.enabled);
@@ -22,11 +22,13 @@ fn gatekeeper_v3_config_loads_from_production_toml() {
         .gatekeeper_v2
         .as_ref()
         .expect("production config should include gatekeeper_v2");
-    assert_eq!(gatekeeper_v2.min_market_cap_sol, 41.0);
-    assert_eq!(config.gatekeeper_v3.normal.min_tx_count, 12);
-    assert_eq!(config.gatekeeper_v3.normal.min_unique_signers, 8);
-    assert_eq!(config.gatekeeper_v3.normal.min_buy_count, 6);
-    assert_eq!(config.gatekeeper_v3.extended.min_tx_count, 12);
+    assert_eq!(gatekeeper_v2.min_market_cap_sol, 5.0);
+    assert_eq!(config.gatekeeper_v3.normal.min_tx_count, 4);
+    assert_eq!(config.gatekeeper_v3.normal.min_unique_signers, 3);
+    assert_eq!(config.gatekeeper_v3.normal.min_buy_count, 2);
+    assert_eq!(config.gatekeeper_v3.extended.min_tx_count, 4);
+    assert!(!config.gatekeeper_v3.evidence_requirements.tx_segments);
+    assert!(!config.gatekeeper_v3.evidence_requirements.fsc);
     assert!(!config.gatekeeper_v3.evidence_requirements.execution);
     assert_eq!(config.gatekeeper_v3.confidence_caps.execution_not_run, 0.80);
     assert_eq!(

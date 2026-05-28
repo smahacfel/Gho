@@ -53,8 +53,16 @@ use parking_lot::Mutex;
 use tracing::{debug, error, info, warn};
 
 use crate::rpc_http_client::new_async_rpc_client;
+use tonic::{
+    metadata::{Ascii, AsciiMetadataValue, MetadataKey},
+    service::Interceptor,
+    transport::Endpoint,
+    Request, Status,
+};
+use tonic_health::pb::health_client::HealthClient;
 use yellowstone_grpc_client::GeyserGrpcClient;
 use yellowstone_grpc_proto::prelude::{
+    geyser_client::GeyserClient,
     subscribe_request_filter_accounts_filter, subscribe_request_filter_accounts_filter_memcmp,
     subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest,
     SubscribeRequestFilterAccounts, SubscribeRequestFilterAccountsFilter,
@@ -70,6 +78,7 @@ pub const PUMP_FUN_FEE_ACCOUNT: &str = "CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4x
 pub const GRPC_GLOBAL_STREAM_SOURCE_LABEL: &str = "grpc_global_stream";
 pub const GRPC_FUNDING_LANE_PUMP_FILTERED_SOURCE_LABEL: &str = "grpc_funding_lane_pump_filtered";
 pub const GRPC_FUNDING_LANE_FULL_CHAIN_SOURCE_LABEL: &str = "grpc_funding_lane_full_chain";
+const DEFAULT_GRPC_AUTH_HEADER: &str = "x-token";
 
 /// Bonding-curve account discriminator — used in memcmp filter so we receive
 /// account updates only for actual BondingCurve accounts, not every account
@@ -1401,8 +1410,10 @@ impl Default for SlotTracker {
 pub struct Provider {
     /// gRPC endpoint URL.
     pub endpoint: String,
-    /// Bearer token (if required).
+    /// Authentication token (if required).
     pub x_token: Option<String>,
+    /// Metadata header used for authentication.
+    pub auth_header: String,
     /// Human-readable label for logs / metrics.
     pub label: String,
 }
@@ -1413,9 +1424,19 @@ impl Provider {
         x_token: Option<String>,
         label: impl Into<String>,
     ) -> Self {
+        Self::new_with_auth_header(endpoint, x_token, label, DEFAULT_GRPC_AUTH_HEADER)
+    }
+
+    pub fn new_with_auth_header(
+        endpoint: impl Into<String>,
+        x_token: Option<String>,
+        label: impl Into<String>,
+        auth_header: impl Into<String>,
+    ) -> Self {
         Self {
             endpoint: endpoint.into(),
             x_token,
+            auth_header: auth_header.into(),
             label: label.into(),
         }
     }
@@ -1423,6 +1444,14 @@ impl Provider {
     /// Convenience: single anonymous provider.
     pub fn single(endpoint: impl Into<String>, x_token: Option<String>) -> Self {
         Self::new(endpoint, x_token, "primary")
+    }
+
+    pub fn single_with_auth_header(
+        endpoint: impl Into<String>,
+        x_token: Option<String>,
+        auth_header: impl Into<String>,
+    ) -> Self {
+        Self::new_with_auth_header(endpoint, x_token, "primary", auth_header)
     }
 }
 
@@ -1930,12 +1959,46 @@ fn normalise_endpoint(raw: &str) -> String {
     }
 }
 
+#[derive(Clone)]
+struct AuthHeaderInterceptor {
+    auth: Option<(MetadataKey<Ascii>, AsciiMetadataValue)>,
+}
+
+impl AuthHeaderInterceptor {
+    fn new(header: &str, token: Option<&str>) -> Result<Self> {
+        let auth = match token.filter(|value| !value.trim().is_empty()) {
+            Some(token) => {
+                let header = if header.trim().is_empty() {
+                    DEFAULT_GRPC_AUTH_HEADER
+                } else {
+                    header.trim()
+                };
+                let key = MetadataKey::<Ascii>::from_bytes(header.as_bytes())
+                    .with_context(|| format!("invalid gRPC auth header name: {header}"))?;
+                let value = AsciiMetadataValue::try_from(token.trim())
+                    .context("invalid gRPC auth token metadata value")?;
+                Some((key, value))
+            }
+            None => None,
+        };
+        Ok(Self { auth })
+    }
+}
+
+impl Interceptor for AuthHeaderInterceptor {
+    fn call(&mut self, mut request: Request<()>) -> std::result::Result<Request<()>, Status> {
+        if let Some((key, value)) = self.auth.clone() {
+            request.metadata_mut().insert(key, value);
+        }
+        Ok(request)
+    }
+}
+
 async fn build_client(
     prov: &Provider,
 ) -> Result<GeyserGrpcClient<impl tonic::service::Interceptor>> {
     let uri = normalise_endpoint(&prov.endpoint);
-    GeyserGrpcClient::build_from_shared(uri.clone())?
-        .x_token(prov.x_token.clone())?
+    let endpoint = Endpoint::from_shared(uri.clone())?
         .http2_adaptive_window(true)
         .initial_connection_window_size(1 << 26) // 64 MiB flow control
         .initial_stream_window_size(1 << 25) // 32 MiB
@@ -1944,10 +2007,16 @@ async fn build_client(
         .keep_alive_timeout(Duration::from_secs(5))
         .tcp_nodelay(true)
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(30));
+
+    let channel = endpoint
         .connect()
         .await
-        .with_context(|| format!("gRPC connect to {uri}"))
+        .with_context(|| format!("gRPC connect to {uri}"))?;
+    let interceptor = AuthHeaderInterceptor::new(&prov.auth_header, prov.x_token.as_deref())?;
+    let health = HealthClient::with_interceptor(channel.clone(), interceptor.clone());
+    let geyser = GeyserClient::with_interceptor(channel, interceptor);
+    Ok(GeyserGrpcClient::new(health, geyser))
 }
 
 // ─── SubscribeRequest builder — SSOT ─────────────────────────────────────────
@@ -3143,6 +3212,34 @@ impl GrpcConnection {
         commitment: SeerCommitmentLevel,
         rpc_endpoint: Option<String>,
     ) -> Self {
+        Self::new_with_auth_header(
+            endpoint,
+            _client_id,
+            auth_token,
+            DEFAULT_GRPC_AUTH_HEADER.to_string(),
+            _metrics,
+            _max_reconnect,
+            _reconnect_delay,
+            _max_reconnect_delay,
+            _verbose,
+            commitment,
+            rpc_endpoint,
+        )
+    }
+
+    pub fn new_with_auth_header(
+        endpoint: String,
+        _client_id: Option<String>,
+        auth_token: Option<String>,
+        auth_header: String,
+        _metrics: Arc<SeerMetrics>,
+        _max_reconnect: u32,
+        _reconnect_delay: u64,
+        _max_reconnect_delay: u64,
+        _verbose: bool,
+        commitment: SeerCommitmentLevel,
+        rpc_endpoint: Option<String>,
+    ) -> Self {
         let proto_commitment = match commitment {
             SeerCommitmentLevel::Mempool => {
                 yellowstone_grpc_proto::prelude::CommitmentLevel::Processed
@@ -3156,7 +3253,11 @@ impl GrpcConnection {
         };
 
         let cfg = GrpcConfig {
-            providers: vec![Provider::single(endpoint, auth_token)],
+            providers: vec![Provider::single_with_auth_header(
+                endpoint,
+                auth_token,
+                auth_header,
+            )],
             streams_per_provider: 1,
             commitment: proto_commitment,
             stall_timeout_secs: SILENT_STALL_SECS,

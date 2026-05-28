@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail if tracked config files contain literal Chainstack credentials.
+"""Fail if tracked config files contain literal provider credentials.
 
 The scanner intentionally redacts values in its output. It checks repository
 tracked files only, so old local smoke configs can stay untracked without
@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 
-CHAINSTACK_VALUE_KEYS = {
+PROVIDER_VALUE_KEYS = {
     "grpc_endpoint",
     "rpc_endpoint",
     "rpc_url",
@@ -24,14 +24,15 @@ CHAINSTACK_VALUE_KEYS = {
 }
 TOKEN_KEYS = {"grpc_x_token", "grpc_auth_token"}
 SAFE_PLACEHOLDERS = {
-    "grpc_endpoint": {"${CHAINSTACK_GRPC_ENDPOINT}", "${GHOST_SEER_GRPC_ENDPOINT}"},
-    "grpc_x_token": {"", "${CHAINSTACK_GRPC_TOKEN}", "${GHOST_SEER_GRPC_X_TOKEN}"},
-    "grpc_auth_token": {"", "${CHAINSTACK_GRPC_TOKEN}", "${GHOST_SEER_GRPC_AUTH_TOKEN}"},
-    "rpc_endpoint": {"${CHAINSTACK_RPC_URL}", "${GHOST_SEER_RPC_ENDPOINT}"},
-    "rpc_url": {"${CHAINSTACK_RPC_URL}", "${GHOST_TRIGGER_RPC_URL}"},
-    "shadow_rpc_url": {"${CHAINSTACK_RPC_URL}", "${GHOST_TRIGGER_SHADOW_RPC_URL}"},
-    "primary_rpc_url": {"${CHAINSTACK_RPC_URL}"},
-    "fallback_rpc_url": {"", "${CHAINSTACK_RPC_URL}"},
+    "grpc_endpoint": {"${GHOST_SEER_GRPC_ENDPOINT}"},
+    "grpc_x_token": {"", "${GHOST_SEER_GRPC_X_TOKEN}"},
+    "grpc_auth_token": {"", "${GHOST_SEER_GRPC_AUTH_TOKEN}"},
+    "grpc_auth_header": {"", "x-token", "x-api-key", "${GHOST_SEER_GRPC_AUTH_HEADER}"},
+    "rpc_endpoint": {"${GHOST_SEER_RPC_ENDPOINT}"},
+    "rpc_url": {"${GHOST_TRIGGER_RPC_URL}"},
+    "shadow_rpc_url": {"${GHOST_TRIGGER_SHADOW_RPC_URL}"},
+    "primary_rpc_url": {"${GHOST_TRIGGER_RPC_URL}"},
+    "fallback_rpc_url": {"", "${GHOST_TRIGGER_RPC_URL}"},
 }
 
 ASSIGNMENT_RE = re.compile(r"^\s*([A-Za-z0-9_]+)\s*=\s*\"([^\"]*)\"")
@@ -68,8 +69,10 @@ def scan_file(path: Path) -> list[tuple[int, str, str]]:
         safe_values = SAFE_PLACEHOLDERS.get(key, set())
         if key in TOKEN_KEYS and value not in safe_values and value:
             findings.append((lineno, key, "literal_token"))
-        if key in CHAINSTACK_VALUE_KEYS and "core.chainstack.com" in value.lower():
-            findings.append((lineno, key, "literal_chainstack_endpoint"))
+        if key in PROVIDER_VALUE_KEYS and (
+            "core.chainstack.com" in value.lower() or "rpc.nln.clr3.org" in value.lower()
+        ):
+            findings.append((lineno, key, "literal_provider_endpoint"))
     return findings
 
 
@@ -82,10 +85,10 @@ def main() -> int:
             all_findings.append((path, lineno, key, reason))
 
     if not all_findings:
-        print("OK: no literal Chainstack credentials in tracked config files")
+        print("OK: no literal provider credentials in tracked config files")
         return 0
 
-    print("ERROR: tracked config files contain literal Chainstack credentials")
+    print("ERROR: tracked config files contain literal provider credentials")
     for path, lineno, key, reason in all_findings:
         print(f"{path}:{lineno}: {key}=<redacted> ({reason})")
     return 1

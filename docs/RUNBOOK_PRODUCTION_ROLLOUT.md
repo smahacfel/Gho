@@ -35,7 +35,7 @@ Ten runbook jest autorytatywną procedurą dla canonical shadow burn-in i późn
    $EDITOR .env
      ./scripts/ghost_production_preflight.sh --config /root/Gho/configs/rollout/shadow-burnin.toml
    ```
-   Minimalny komplet sekretow dla `shadow-burnin`: `GHOST_SEER_GRPC_ENDPOINT`, `GHOST_SEER_GRPC_X_TOKEN`, `GHOST_SEER_RPC_ENDPOINT`, `GHOST_TRIGGER_RPC_URL`, `GHOST_TRIGGER_KEYPAIR_PATH`, `GHOST_TRIGGER_SHADOW_RPC_URL`.
+   Minimalny komplet sekretow dla `shadow-burnin`: `GHOST_SEER_GRPC_ENDPOINT`, `GHOST_SEER_GRPC_X_TOKEN`, `GHOST_SEER_RPC_ENDPOINT`, `GHOST_TRIGGER_RPC_URL`, `GHOST_TRIGGER_KEYPAIR_PATH`, `GHOST_TRIGGER_SHADOW_RPC_URL`. Providerzy RPC wymagajacy header auth wymagaja dodatkowo `GHOST_RPC_AUTH_HEADER` i `GHOST_RPC_AUTH_TOKEN`.
 3. Nie startuj procesu, jeśli którykolwiek check zwróci `[fail]`.
 
 ## 2. Start

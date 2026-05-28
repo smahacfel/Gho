@@ -399,7 +399,7 @@ def render_markdown(report: dict[str, Any]) -> str:
     )
     execution_blocked = "no_good_executable_rows" in report["gate"]["blockers"]
     strongest_for = (
-        "Najmocniejsze evidence za V3: mamy Chainstack post-decision price path, niezerowe `good_clean` w R10/R11/R13 oraz stabilne label-v2/feasibility artefakty do dalszej diagnostyki."
+        "Najmocniejsze evidence za V3: mamy post-decision RPC price path, niezerowe `good_clean` w R10/R11/R13 oraz stabilne label-v2/feasibility artefakty do dalszej diagnostyki."
         if combined_good_clean
         else "Najmocniejsze evidence za V3: mamy pelny replay, stabilne label-v2/feasibility artefakty i decision-time vectors, ktore moga posluzyc do przyszlej diagnostyki feature families."
     )

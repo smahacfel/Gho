@@ -16,6 +16,7 @@ tx_filter_strategy = "per_pool"
 funding_lane_mode = "full_chain"
 grpc_endpoint = "yellowstone.example.invalid:443"
 grpc_x_token = ""
+grpc_auth_header = "x-api-key"
 rpc_endpoint = "https://rpc.example.invalid/seer"
 enable_pumpfun = true
 enable_bonkfun = false

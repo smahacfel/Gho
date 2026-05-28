@@ -22,11 +22,11 @@ mode = "long"
 min_sol_threshold = 0.001
 
 # ── Phase 1: Quantity Gate ─────────────────────────────────────────────────────
-# Dead strict 14/8/7 okazał się zbyt suchy na bieżący flow, ale pełne wyjęcie
-# gate'u było tylko sondą. Wracamy do umiarkowanego 12/8/6.
-min_tx_count = 12
-min_unique_signers = 8
-min_buy_count = 6
+# Dataset collector: celowo niskie minima, żeby zbierać szeroki universe
+# terminalnych rows/counterfactual candidates w godzinach, nie tygodniach.
+min_tx_count = 3
+min_unique_signers = 2
+min_buy_count = 2
 
 
 # Finalna ewaluacja nadal zbiera wczesne okno; nie wydłużamy go agresywnie.
@@ -40,10 +40,10 @@ max_wait_time_ms = 10000
 min_interval_cv = 0.0
 max_burst_ratio = 9999.0
 min_avg_interval_ms = 0.0
-max_avg_interval_ms = 450.0
+max_avg_interval_ms = 950.0
 min_timing_entropy = 0.0
 min_dust_filtered_count = 0
-max_interval_cv = 2.3
+max_interval_cv = 9.3
 max_timing_entropy = 9999.0
 
 # ── Phase 3: Signer Diversity ──────────────────────────────────────────────────
@@ -51,35 +51,35 @@ max_timing_entropy = 9999.0
 # Survivors: 0.155 | Early-death: 0.200 → Lower concentration = better
 min_unique_ratio = 0.0
 max_unique_ratio = 1.0
-max_hhi = 0.155
+max_hhi = 0.99
 max_tx_per_signer = 999999
-min_volume_gini = 0.53
+min_volume_gini = 0.01
 max_volume_gini = 9999.0
-max_top3_volume_pct = 0.70
+max_top3_volume_pct = 0.99
 max_same_ms_tx_ratio = 0.99
 
 # ── Phase 4: Volume Sanity ─────────────────────────────────────────────────────
-# SURVIVAL FILTER: buy_ratio nadal jest ważny, ale 0.83/0.84 zjadało zbyt dużo
-# flow razem z innymi gate'ami. 0.80 zostawia sentiment-positive bias.
-min_buy_ratio = 0.80
+# Dataset collector: buy_ratio zostaje permissive, a jakość oceniana offline
+# na pełnym evidence zamiast przez agresywne wycinanie na wejściu.
+min_buy_ratio = 0.50
 max_buy_ratio = 1.0
 min_sol_buy_ratio = 0.0
 max_sol_buy_ratio = 0.96
 min_avg_tx_sol = 0.01
 max_avg_tx_sol = 9999.0
 min_volume_cv = 0.01
-min_total_volume_sol = 1.0
+min_total_volume_sol = 0.25
 max_volume_cv = 9999.0
 max_total_volume_sol = 999999.0
-min_consecutive_buys = 3
+min_consecutive_buys = 2
 
 # ── Phase 5: Dev Behavior ──────────────────────────────────────────────────────
 # Sekcja pozostaje permissive: nie wracamy tu do hardego dev-side filtra ani do
 # `reject_on_dev_sell`, bo to było juz wczesniej falszywie negatywne dla A-like pools.
 min_dev_buy_sol = 0.0
-max_dev_buy_sol = 2.0
+max_dev_buy_sol = 10.0
 max_dev_tx_ratio = 0.99
-max_dev_volume_ratio = 0.23
+max_dev_volume_ratio = 0.93
 min_dev_volume_ratio = 0.0
 min_dev_tx_ratio = 0.0
 reject_on_dev_sell = false
@@ -88,41 +88,40 @@ reject_on_dev_sell = false
 # Shadow-burnin A/B: A-like pools miały nizszy price_change, nizszy bonding
 # oraz czesciej miescily sie pod capem wolumenu / market cap.
 min_price_change_ratio = 0.01
-# Tymczasowy legacy safety cap — zamyka blind spot 9999.0.
-# To NIE jest pełny PDD alignment (1.05), tylko pierwszy krok de-riskingu.
-# Docelowe zaostrzanie: 1.20 → 1.10 → 1.05 (osobne ADR-y po validation).
-max_price_change_ratio = 1.50
+# Dataset collector: permissive cap do szerokiego zbierania counterfactuals.
+# To NIE jest próg produkcyjny ani rekomendacja live execution.
+max_price_change_ratio = 9.50
 max_single_tx_price_impact_pct = 9999.0
 min_single_sell_impact_pct = 0.0
 max_single_sell_impact_pct = 9999.0
 max_bonding_progress_pct = 99.0
-min_bonding_progress_pct = 40.0
-min_market_cap_sol = 41.0
+min_bonding_progress_pct = 4.0
+min_market_cap_sol = 5.0
 
 # ── Decision ────────────────────────────────────────────────────────────────────
 # 3-layer decision ON: tokeny nie giną od razu przy lekkim przekroczeniu progów —
 # dostają flagę soft_score i mogą nadrobić w innych metrykach
-min_phases_to_pass = 3
-re_eval_tx_interval = 3
+min_phases_to_pass = 1
+re_eval_tx_interval = 1
 use_three_layer_decision = true
 
 # Hard Fails ────────────────────────────────────────────────────────────────────
 # Tylko skrajna koncentracja ma prawo ubić BUY na hard-fail.
-hard_fail_hhi = 0.10
-hard_fail_same_ms_tx_ratio = 0.60
-hard_fail_top3_volume_pct = 0.70
+hard_fail_hhi = 0.99
+hard_fail_same_ms_tx_ratio = 0.99
+hard_fail_top3_volume_pct = 0.99
 
-# Soft signals ── AKTYWNE (3L scoring) ──────────────────────────────────────────
-# manipulation (3) >> diversity (2) > timing (1) > ecosystem (1) 
-max_soft_points = 8
+# Soft signals ── COLLECTOR-PERMISSIVE (3L scoring) ─────────────────────────────
+# Wagi zostają logowane, ale threshold jest celowo neutralny dla dataset runu.
+max_soft_points = 255
 soft_weight_timing = 1
 soft_weight_manipulation = 3
 soft_weight_diversity = 2
 soft_weight_ecosystem = 1
-max_soft_score = 6
+max_soft_score = 255
 
 # ── Alpha Gate (positive selector after sybil) ───────────────────────────────
-enable_alpha_gate = true
+enable_alpha_gate = false
 min_momentum = 0.55
 min_demand = 0.55
 min_alpha_joint = 0.35
@@ -131,7 +130,7 @@ min_alpha_sample = 15
 # ── Prosperity filter (Balanced v1 final selector) ──────────────────────────
 # Wchodzi dopiero po hard/core/sybil/alpha i ma odsiać BUY-e, które nie
 # przypominają historycznie zyskownych branchy ze shadow outcome set.
-enable_prosperity_filter = true
+enable_prosperity_filter = false
 prosperity_min_market_cap_sol = 45.0
 prosperity_max_signer_cross_pool_velocity = 0.50
 prosperity_branch1_min_block0_sniped_supply_pct = 0.28
@@ -150,10 +149,10 @@ prosperity_overlay_branch23_max_sell_buy_ratio = 9999.0
 prosperity_overlay_branch2_max_price_change_ratio = 1.50
 
 # Dev Unknown ── AKTYWNE (dev nieznany = podejrzane) ────────────────────────────
-dev_unknown_min_market_cap_sol = 65.0
-dev_unknown_min_sol_buy_ratio = 0.65
-dev_unknown_max_soft_points = 5
-dev_unknown_max_single_tx_price_impact_pct = 28.0
+dev_unknown_min_market_cap_sol = 10.0
+dev_unknown_min_sol_buy_ratio = 0.05
+dev_unknown_max_soft_points = 255
+dev_unknown_max_single_tx_price_impact_pct = 98.0
 
 # ── Hybrid gRPC / Yellowstone fingerprint thresholds ──────────────────────────
 # Lekki upstream choke zsynchronizowany z Balanced: odcinamy ewidentny churn i
@@ -168,7 +167,7 @@ max_fixed_size_buy_ratio_1e4 = 9999.0
 max_flipper_presence_ratio = 9999.0
 max_jito_tip_intensity = 9999.0
 max_early_slot_volume_dominance_buy = 9999.0
-max_early_top3_buy_volume_pct_3s = 0.71
+max_early_top3_buy_volume_pct_3s = 0.99
 max_whale_reversal_ratio_top3 = 9999.0
 max_whale_reversal_ratio_top1 = 9999.0
 min_sell_buy_ratio = 0.0
@@ -238,17 +237,17 @@ enabled = true
 early_entry_enabled = true
 early_entry_min_ms = 2000
 early_entry_max_ms = 5000
-early_entry_min_confidence = 0.85
-early_entry_min_tx_count = 15
-early_entry_min_phases_passed = 6
-early_entry_min_momentum = 0.40
-early_entry_max_sybil_points = 1
-early_entry_max_entry_drift_pct = 3.0
+early_entry_min_confidence = 0.50
+early_entry_min_tx_count = 5
+early_entry_min_phases_passed = 2
+early_entry_min_momentum = 0.20
+early_entry_max_sybil_points = 255
+early_entry_max_entry_drift_pct = 9999.0
 normal_window_ms = 7000
-normal_window_min_confidence = 0.65
+normal_window_min_confidence = 0.25
 extended_window_ms = 10000
-extended_window_min_confidence = 0.55
-extended_require_pdd_clean = true
+extended_window_min_confidence = 0.15
+extended_require_pdd_clean = false
 tick_interval_ms = 250
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -256,11 +255,11 @@ tick_interval_ms = 250
 # ══════════════════════════════════════════════════════════════════════════════
 [gatekeeper_v2.tas]
 enabled = true
-tas_hard_reject_threshold = 0.30
-tas_confidence_modulator_min = 0.75
+tas_hard_reject_threshold = 0.10
+tas_confidence_modulator_min = 0.50
 tas_confidence_modulator_max = 1.25
-tas_min_tx_per_segment = 3
-tas_min_total_duration_ms = 3000
+tas_min_tx_per_segment = 1
+tas_min_total_duration_ms = 1000
 momentum_trajectory_weight = 0.25
 momentum_accel_min_ratio = 1.15
 momentum_decel_max_ratio = 0.85
@@ -278,6 +277,12 @@ buy_ratio_stability_min = 0.55
 # ══════════════════════════════════════════════════════════════════════════════
 [gatekeeper_v2.pdd]
 enabled = true
+entry_drift_promoted_to_live = false
+spike_promoted_to_live = false
+ramping_promoted_to_live = false
+whale_promoted_to_live = false
+reserve_promoted_to_live = false
+flash_crash_promoted_to_live = false
 entry_drift_max_pct = 5.0
 entry_drift_soft_max_pct = 3.0
 entry_drift_soft_weight = 2
@@ -328,8 +333,9 @@ cross_pool_outcome_tracker_available = false
 # GATEKEEPER V3: calibrated shadow sidecar (P1)
 # ══════════════════════════════════════════════════════════════════════════════
 [gatekeeper_v3]
-enabled = false
+enabled = true
 shadow_emit_enabled = true
+replay_payload_enabled = true
 policy_version = 1
 materialization_version = 1
 early_window_ms = 2000
@@ -338,73 +344,73 @@ early_window_ms = 2000
 enabled = false
 
 [gatekeeper_v3.early]
-min_tx_count = 12
-min_unique_signers = 8
-min_buy_count = 6
-min_buy_ratio = 0.80
+min_tx_count = 4
+min_unique_signers = 3
+min_buy_count = 2
+min_buy_ratio = 0.40
 max_buy_ratio = 1.0
-max_hhi = 0.155
-hard_fail_hhi = 0.10
-hard_fail_same_ms_tx_ratio = 0.60
-hard_fail_top3_volume_pct = 0.70
+max_hhi = 0.99
+hard_fail_hhi = 0.99
+hard_fail_same_ms_tx_ratio = 0.99
+hard_fail_top3_volume_pct = 0.99
 max_tx_per_signer = 999999
-max_dev_volume_ratio = 0.23
+max_dev_volume_ratio = 0.99
 reject_on_dev_sell = false
 max_signer_cross_pool_velocity = 9999.0
 max_funding_source_concentration = 0.99
-organic_min_tx_count_growth_ratio = 1.0
-organic_min_unique_signer_growth_ratio = 1.0
+organic_min_tx_count_growth_ratio = 0.0
+organic_min_unique_signer_growth_ratio = 0.0
 
 [gatekeeper_v3.normal]
-min_tx_count = 12
-min_unique_signers = 8
-min_buy_count = 6
-min_buy_ratio = 0.80
+min_tx_count = 4
+min_unique_signers = 3
+min_buy_count = 2
+min_buy_ratio = 0.40
 max_buy_ratio = 1.0
-max_hhi = 0.155
-hard_fail_hhi = 0.10
-hard_fail_same_ms_tx_ratio = 0.60
-hard_fail_top3_volume_pct = 0.70
+max_hhi = 0.99
+hard_fail_hhi = 0.99
+hard_fail_same_ms_tx_ratio = 0.99
+hard_fail_top3_volume_pct = 0.99
 max_tx_per_signer = 999999
-max_dev_volume_ratio = 0.23
+max_dev_volume_ratio = 0.99
 reject_on_dev_sell = false
 max_signer_cross_pool_velocity = 9999.0
 max_funding_source_concentration = 0.99
-organic_min_tx_count_growth_ratio = 1.0
-organic_min_unique_signer_growth_ratio = 1.0
+organic_min_tx_count_growth_ratio = 0.0
+organic_min_unique_signer_growth_ratio = 0.0
 
 [gatekeeper_v3.extended]
-min_tx_count = 12
-min_unique_signers = 8
-min_buy_count = 6
-min_buy_ratio = 0.80
+min_tx_count = 4
+min_unique_signers = 3
+min_buy_count = 2
+min_buy_ratio = 0.40
 max_buy_ratio = 1.0
-max_hhi = 0.155
-hard_fail_hhi = 0.10
-hard_fail_same_ms_tx_ratio = 0.60
-hard_fail_top3_volume_pct = 0.70
+max_hhi = 0.99
+hard_fail_hhi = 0.99
+hard_fail_same_ms_tx_ratio = 0.99
+hard_fail_top3_volume_pct = 0.99
 max_tx_per_signer = 999999
-max_dev_volume_ratio = 0.23
+max_dev_volume_ratio = 0.99
 reject_on_dev_sell = false
 max_signer_cross_pool_velocity = 9999.0
 max_funding_source_concentration = 0.99
-organic_min_tx_count_growth_ratio = 1.0
-organic_min_unique_signer_growth_ratio = 1.0
+organic_min_tx_count_growth_ratio = 0.0
+organic_min_unique_signer_growth_ratio = 0.0
 
 [gatekeeper_v3.evidence_requirements]
 identity = true
 account_state = true
 tx_intel = true
-tx_segments = true
-checkpoints = true
-trajectory = true
-pdd_sequence = true
+tx_segments = false
+checkpoints = false
+trajectory = false
+pdd_sequence = false
 curve = true
-sybil = true
-cpv = true
-fsc = true
-alpha = true
-manipulation = true
+sybil = false
+cpv = false
+fsc = false
+alpha = false
+manipulation = false
 organic_broadening = true
 manipulation_contradiction = true
 execution = false
@@ -505,7 +511,7 @@ confidence_threshold = 0.8
 enabled = true
 mode = "pp"
 max_wait_ms = 500
-primary_rpc_url = "${CHAINSTACK_RPC_URL}"
+primary_rpc_url = "${GHOST_TRIGGER_RPC_URL}"
 fallback_rpc_url = ""
 min_confidence = 0.75
 min_tx_pp = 10
