@@ -59,6 +59,10 @@ pub struct SeerConfig {
     #[serde(default = "SeerConfig::default_grpc_max_stalls_before_open")]
     pub grpc_max_stalls_before_open: u32,
 
+    /// Seconds without any gRPC message before the stream is treated as stalled.
+    #[serde(default = "SeerConfig::default_grpc_stall_timeout_secs")]
+    pub grpc_stall_timeout_secs: u64,
+
     /// Cooldown before an open provider circuit performs a half-open probe.
     #[serde(default = "SeerConfig::default_grpc_circuit_breaker_cooldown_ms")]
     pub grpc_circuit_breaker_cooldown_ms: u64,
@@ -112,6 +116,13 @@ pub struct SeerConfig {
     /// `grpc_global_stream` contract remains filtered-only.
     #[serde(default)]
     pub funding_lane_mode: FundingLaneMode,
+
+    /// Optional NLN Program Streams semantic event lane.
+    ///
+    /// PR-FSC1 only adds the inert config surface. No Program Streams client is
+    /// started until a later implementation phase explicitly wires it.
+    #[serde(default)]
+    pub program_streams: ProgramStreamsConfig,
 
     /// TTL for watched pools in milliseconds (single_global mode).
     #[serde(default = "SeerConfig::default_watched_pools_ttl_ms")]
@@ -221,6 +232,114 @@ impl FundingLaneMode {
     }
 }
 
+/// Payload encoding requested from NLN Program Streams.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ProgramStreamPayloadFormat {
+    /// Base64-wrapped JSON payloads inside SubscribeResponse.
+    #[serde(rename = "JSON", alias = "json")]
+    Json,
+}
+
+impl Default for ProgramStreamPayloadFormat {
+    fn default() -> Self {
+        ProgramStreamPayloadFormat::Json
+    }
+}
+
+impl ProgramStreamPayloadFormat {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ProgramStreamPayloadFormat::Json => "JSON",
+        }
+    }
+}
+
+/// NLN Program Streams configuration for FSC v2 capture/evidence.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProgramStreamsConfig {
+    /// Start the Program Streams lane. Defaults off until PR-FSC2 wires a client.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// NLN Program Streams endpoint.
+    #[serde(default = "ProgramStreamsConfig::default_endpoint")]
+    pub endpoint: String,
+
+    /// Metadata header used for NLN API key authentication.
+    #[serde(default = "ProgramStreamsConfig::default_auth_header")]
+    pub auth_header: String,
+
+    /// Primary environment variable that contains the NLN API key.
+    #[serde(default = "ProgramStreamsConfig::default_api_key_env")]
+    pub api_key_env: String,
+
+    /// Optional fallback environment variable for deployments using Ghost naming.
+    #[serde(default = "ProgramStreamsConfig::default_api_key_env_fallback")]
+    pub api_key_env_fallback: Option<String>,
+
+    /// Payload format requested from the Program Streams Subscribe API.
+    #[serde(default)]
+    pub format: ProgramStreamPayloadFormat,
+
+    /// Pump.fun create topic used for candidate birth artifacts.
+    #[serde(default = "ProgramStreamsConfig::default_pumpfun_create_topic")]
+    pub pumpfun_create_topic: String,
+
+    /// Pump.fun trade topic used for early buyer flow.
+    #[serde(default = "ProgramStreamsConfig::default_pumpfun_trade_topic")]
+    pub pumpfun_trade_topic: String,
+
+    /// Native SOL transfer topic used for FSC v2 funding index capture.
+    #[serde(default = "ProgramStreamsConfig::default_system_transfers_topic")]
+    pub system_transfers_topic: String,
+}
+
+impl Default for ProgramStreamsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: Self::default_endpoint(),
+            auth_header: Self::default_auth_header(),
+            api_key_env: Self::default_api_key_env(),
+            api_key_env_fallback: Self::default_api_key_env_fallback(),
+            format: ProgramStreamPayloadFormat::default(),
+            pumpfun_create_topic: Self::default_pumpfun_create_topic(),
+            pumpfun_trade_topic: Self::default_pumpfun_trade_topic(),
+            system_transfers_topic: Self::default_system_transfers_topic(),
+        }
+    }
+}
+
+impl ProgramStreamsConfig {
+    pub fn default_endpoint() -> String {
+        "stream-1.nln.clr3.org:443".to_string()
+    }
+
+    pub fn default_auth_header() -> String {
+        "x-api-key".to_string()
+    }
+
+    pub fn default_api_key_env() -> String {
+        "NLN_API_KEY".to_string()
+    }
+
+    pub fn default_api_key_env_fallback() -> Option<String> {
+        Some("GHOST_NLN_API_KEY".to_string())
+    }
+
+    pub fn default_pumpfun_create_topic() -> String {
+        "prod.rpc.solana.pumpfun.create".to_string()
+    }
+
+    pub fn default_pumpfun_trade_topic() -> String {
+        "prod.rpc.solana.pumpfun.trade".to_string()
+    }
+
+    pub fn default_system_transfers_topic() -> String {
+        "prod.rpc.solana.system.transfers".to_string()
+    }
+}
+
 /// Commitment level configuration for Seer connections
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -286,6 +405,7 @@ impl Default for SeerConfig {
             reconnect_delay_secs: 5,
             max_reconnect_delay_secs: 300, // 5 minutes max backoff
             grpc_max_stalls_before_open: Self::default_grpc_max_stalls_before_open(),
+            grpc_stall_timeout_secs: Self::default_grpc_stall_timeout_secs(),
             grpc_circuit_breaker_cooldown_ms: Self::default_grpc_circuit_breaker_cooldown_ms(),
             verbose: false,
             filter: FilterConfig::default(),
@@ -300,6 +420,7 @@ impl Default for SeerConfig {
             stream_mode: StreamMode::default(),
             tx_filter_strategy: TxFilterStrategy::default(),
             funding_lane_mode: FundingLaneMode::default(),
+            program_streams: ProgramStreamsConfig::default(),
             watched_pools_ttl_ms: Self::default_watched_pools_ttl_ms(),
             watched_pools_cap: Self::default_watched_pools_cap(),
             watch_debounce_ms: 0,
@@ -337,6 +458,10 @@ impl SeerConfig {
 
     pub fn default_grpc_max_stalls_before_open() -> u32 {
         3
+    }
+
+    pub fn default_grpc_stall_timeout_secs() -> u64 {
+        20
     }
 
     pub fn default_grpc_circuit_breaker_cooldown_ms() -> u64 {
@@ -496,6 +621,12 @@ mod tests {
         assert_eq!(config.stream_mode, StreamMode::SingleGlobal);
         assert_eq!(config.tx_filter_strategy, TxFilterStrategy::PerPool);
         assert_eq!(config.funding_lane_mode, FundingLaneMode::Disabled);
+        assert!(!config.program_streams.enabled);
+        assert_eq!(config.program_streams.endpoint, "stream-1.nln.clr3.org:443");
+        assert_eq!(
+            config.program_streams.format,
+            ProgramStreamPayloadFormat::Json
+        );
         assert_eq!(config.watched_pools_ttl_ms, 120_000);
         assert_eq!(config.watched_pools_cap, 32_768);
     }
@@ -682,6 +813,47 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<FundingLaneMode>("\"full_chain\"").unwrap(),
             FundingLaneMode::FullChain
+        );
+    }
+
+    #[test]
+    fn test_program_streams_defaults_are_inert() {
+        let config = ProgramStreamsConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.endpoint, "stream-1.nln.clr3.org:443");
+        assert_eq!(config.auth_header, "x-api-key");
+        assert_eq!(config.api_key_env, "NLN_API_KEY");
+        assert_eq!(
+            config.api_key_env_fallback.as_deref(),
+            Some("GHOST_NLN_API_KEY")
+        );
+        assert_eq!(config.format.as_str(), "JSON");
+        assert_eq!(
+            config.pumpfun_create_topic,
+            "prod.rpc.solana.pumpfun.create"
+        );
+        assert_eq!(config.pumpfun_trade_topic, "prod.rpc.solana.pumpfun.trade");
+        assert_eq!(
+            config.system_transfers_topic,
+            "prod.rpc.solana.system.transfers"
+        );
+    }
+
+    #[test]
+    fn test_program_streams_deserializes_json_format() {
+        let config: ProgramStreamsConfig = serde_json::from_str(
+            r#"{
+                "enabled": true,
+                "format": "JSON",
+                "endpoint": "stream-1.nln.clr3.org:443"
+            }"#,
+        )
+        .unwrap();
+        assert!(config.enabled);
+        assert_eq!(config.format, ProgramStreamPayloadFormat::Json);
+        assert_eq!(
+            config.system_transfers_topic,
+            "prod.rpc.solana.system.transfers"
         );
     }
 }

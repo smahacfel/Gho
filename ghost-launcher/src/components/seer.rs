@@ -12,8 +12,9 @@ use ghost_core::{ExecutionAccountRole, TimestampQuality, Wal};
 use metrics::increment_counter;
 use seer::{
     config::{
-        ConnectionMode, FilterConfig, FundingLaneMode, PumpPortalConfig, SeerConfig,
-        SeerSourceMode, StreamMode, TxFilterStrategy,
+        ConnectionMode, FilterConfig, FundingLaneMode, ProgramStreamPayloadFormat,
+        ProgramStreamsConfig, PumpPortalConfig, SeerConfig, SeerSourceMode, StreamMode,
+        TxFilterStrategy,
     },
     ipc::{create_ipc_channel, BackpressurePolicy, IpcChannelConfig},
     Seer,
@@ -1632,6 +1633,16 @@ pub async fn run(
             FundingLaneMode::Disabled
         }
     };
+    let program_streams_format = match config.program_streams.format.to_ascii_uppercase().as_str() {
+        "JSON" => ProgramStreamPayloadFormat::Json,
+        other => {
+            warn!(
+                "Unknown seer.program_streams.format='{}' - defaulting to JSON",
+                other
+            );
+            ProgramStreamPayloadFormat::Json
+        }
+    };
 
     let seer_config = SeerConfig {
         connection_mode: match config.connection_mode.to_lowercase().as_str() {
@@ -1653,8 +1664,9 @@ pub async fn run(
         max_reconnect_attempts: 10,
         reconnect_delay_secs: 5,
         max_reconnect_delay_secs: 300,
-        grpc_max_stalls_before_open: SeerConfig::default_grpc_max_stalls_before_open(),
-        grpc_circuit_breaker_cooldown_ms: SeerConfig::default_grpc_circuit_breaker_cooldown_ms(),
+        grpc_max_stalls_before_open: config.grpc_max_stalls_before_open,
+        grpc_stall_timeout_secs: config.grpc_stall_timeout_secs,
+        grpc_circuit_breaker_cooldown_ms: config.grpc_circuit_breaker_cooldown_ms,
         verbose: false,
         filter: FilterConfig {
             enable_pumpfun: config.enable_pumpfun,
@@ -1690,6 +1702,17 @@ pub async fn run(
             _ => TxFilterStrategy::PerPool,
         },
         funding_lane_mode,
+        program_streams: ProgramStreamsConfig {
+            enabled: config.program_streams.enabled,
+            endpoint: config.program_streams.endpoint.clone(),
+            auth_header: config.program_streams.auth_header.clone(),
+            api_key_env: config.program_streams.api_key_env.clone(),
+            api_key_env_fallback: config.program_streams.api_key_env_fallback.clone(),
+            format: program_streams_format,
+            pumpfun_create_topic: config.program_streams.pumpfun_create_topic.clone(),
+            pumpfun_trade_topic: config.program_streams.pumpfun_trade_topic.clone(),
+            system_transfers_topic: config.program_streams.system_transfers_topic.clone(),
+        },
         watched_pools_ttl_ms: config.watched_pools_ttl_ms,
         watched_pools_cap: config.watched_pools_cap,
         watch_debounce_ms: config.watch_debounce_ms,
@@ -1720,6 +1743,10 @@ pub async fn run(
     info!(
         "  grpc_manual_backfill_enabled: {}",
         seer_config.grpc_manual_backfill_enabled
+    );
+    info!(
+        "  grpc_stall_timeout_secs: {}",
+        seer_config.grpc_stall_timeout_secs
     );
     info!(
         "  grpc_commitment_fallback_to_websocket: {}",

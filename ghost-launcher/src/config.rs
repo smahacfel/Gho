@@ -1584,6 +1584,10 @@ pub struct SeerComponentConfig {
     #[serde(default = "default_seer_grpc_max_stalls_before_open")]
     pub grpc_max_stalls_before_open: u32,
 
+    /// Seconds without any gRPC message before the stream is treated as stalled.
+    #[serde(default = "default_seer_grpc_stall_timeout_secs")]
+    pub grpc_stall_timeout_secs: u64,
+
     /// Cooldown before an open provider circuit performs a half-open probe.
     #[serde(default = "default_seer_grpc_circuit_breaker_cooldown_ms")]
     pub grpc_circuit_breaker_cooldown_ms: u64,
@@ -1642,6 +1646,13 @@ pub struct SeerComponentConfig {
     #[serde(default = "default_funding_lane_mode")]
     pub funding_lane_mode: String,
 
+    /// Optional NLN Program Streams semantic lane for FSC v2 capture/evidence.
+    ///
+    /// PR-FSC1 only adds the inert config surface; no stream is started until
+    /// later PRs wire a Program Streams client.
+    #[serde(default)]
+    pub program_streams: SeerProgramStreamsComponentConfig,
+
     /// TTL for watched pools in milliseconds (single_global mode).
     #[serde(default = "default_watched_pools_ttl_ms")]
     pub watched_pools_ttl_ms: u64,
@@ -1661,6 +1672,62 @@ pub struct SeerComponentConfig {
     /// PumpPortal WebSocket configuration
     #[serde(default)]
     pub pumpportal: PumpPortalComponentConfig,
+}
+
+/// NLN Program Streams configuration for the Seer component.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SeerProgramStreamsComponentConfig {
+    /// Enable Program Streams capture. Defaults off in all existing profiles.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Program Streams endpoint.
+    #[serde(default = "default_program_streams_endpoint")]
+    pub endpoint: String,
+
+    /// gRPC metadata header for the API key.
+    #[serde(default = "default_program_streams_auth_header")]
+    pub auth_header: String,
+
+    /// Primary API-key environment variable.
+    #[serde(default = "default_program_streams_api_key_env")]
+    pub api_key_env: String,
+
+    /// Optional fallback API-key environment variable.
+    #[serde(default = "default_program_streams_api_key_env_fallback")]
+    pub api_key_env_fallback: Option<String>,
+
+    /// Subscribe payload format. PR-FSC1 supports the config surface only.
+    #[serde(default = "default_program_streams_format")]
+    pub format: String,
+
+    /// Pump.fun create topic.
+    #[serde(default = "default_program_streams_pumpfun_create_topic")]
+    pub pumpfun_create_topic: String,
+
+    /// Pump.fun trade topic.
+    #[serde(default = "default_program_streams_pumpfun_trade_topic")]
+    pub pumpfun_trade_topic: String,
+
+    /// Solana system transfer topic.
+    #[serde(default = "default_program_streams_system_transfers_topic")]
+    pub system_transfers_topic: String,
+}
+
+impl Default for SeerProgramStreamsComponentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: default_program_streams_endpoint(),
+            auth_header: default_program_streams_auth_header(),
+            api_key_env: default_program_streams_api_key_env(),
+            api_key_env_fallback: default_program_streams_api_key_env_fallback(),
+            format: default_program_streams_format(),
+            pumpfun_create_topic: default_program_streams_pumpfun_create_topic(),
+            pumpfun_trade_topic: default_program_streams_pumpfun_trade_topic(),
+            system_transfers_topic: default_program_streams_system_transfers_topic(),
+        }
+    }
 }
 
 /// PumpPortal WebSocket configuration for launcher
@@ -2670,12 +2737,48 @@ fn default_funding_lane_mode() -> String {
     "disabled".to_string()
 }
 
+fn default_program_streams_endpoint() -> String {
+    "stream-1.nln.clr3.org:443".to_string()
+}
+
+fn default_program_streams_auth_header() -> String {
+    "x-api-key".to_string()
+}
+
+fn default_program_streams_api_key_env() -> String {
+    "NLN_API_KEY".to_string()
+}
+
+fn default_program_streams_api_key_env_fallback() -> Option<String> {
+    Some("GHOST_NLN_API_KEY".to_string())
+}
+
+fn default_program_streams_format() -> String {
+    "JSON".to_string()
+}
+
+fn default_program_streams_pumpfun_create_topic() -> String {
+    "prod.rpc.solana.pumpfun.create".to_string()
+}
+
+fn default_program_streams_pumpfun_trade_topic() -> String {
+    "prod.rpc.solana.pumpfun.trade".to_string()
+}
+
+fn default_program_streams_system_transfers_topic() -> String {
+    "prod.rpc.solana.system.transfers".to_string()
+}
+
 fn default_watched_pools_ttl_ms() -> u64 {
     120_000
 }
 
 fn default_seer_grpc_max_stalls_before_open() -> u32 {
     3
+}
+
+fn default_seer_grpc_stall_timeout_secs() -> u64 {
+    20
 }
 
 fn default_seer_grpc_circuit_breaker_cooldown_ms() -> u64 {
@@ -3378,6 +3481,7 @@ impl LauncherConfig {
                 grpc_manual_backfill_enabled: true,
                 grpc_commitment_fallback_to_websocket: false,
                 grpc_max_stalls_before_open: default_seer_grpc_max_stalls_before_open(),
+                grpc_stall_timeout_secs: default_seer_grpc_stall_timeout_secs(),
                 grpc_circuit_breaker_cooldown_ms: default_seer_grpc_circuit_breaker_cooldown_ms(),
                 grpc_client_id: None,
                 grpc_auth_token: None,
@@ -3393,6 +3497,7 @@ impl LauncherConfig {
                 stream_mode: default_stream_mode(),
                 tx_filter_strategy: default_tx_filter_strategy(),
                 funding_lane_mode: default_funding_lane_mode(),
+                program_streams: SeerProgramStreamsComponentConfig::default(),
                 watched_pools_ttl_ms: default_watched_pools_ttl_ms(),
                 watched_pools_cap: default_watched_pools_cap(),
                 watch_debounce_ms: 0,
@@ -4144,10 +4249,7 @@ enabled = true
 
         let config = LauncherConfig::from_file(&config_path).unwrap();
 
-        assert_eq!(
-            config.seer.grpc_endpoint,
-            "grpc.nln.clr3.org:443"
-        );
+        assert_eq!(config.seer.grpc_endpoint, "grpc.nln.clr3.org:443");
         assert_eq!(config.effective_grpc_token(), Some("config-token"));
         assert_eq!(
             config.seer.rpc_endpoint,
@@ -4184,6 +4286,41 @@ enabled = true
         assert_eq!(config.trigger.entry_mode, TriggerEntryMode::Live);
         assert_eq!(config.snapshot_inactive_tx_buffer_capacity, 8_192);
         assert_eq!(config.snapshot_inactive_tx_ttl_margin_ms, 2_000);
+        assert!(!config.seer.program_streams.enabled);
+        assert_eq!(
+            config.seer.program_streams.endpoint,
+            "stream-1.nln.clr3.org:443"
+        );
+        assert_eq!(config.seer.program_streams.format, "JSON");
+    }
+
+    #[test]
+    fn test_seer_program_streams_config_surface_deserializes() {
+        let toml = r#"
+enabled = true
+endpoint = "stream-1.nln.clr3.org:443"
+auth_header = "x-api-key"
+api_key_env = "NLN_API_KEY"
+api_key_env_fallback = "GHOST_NLN_API_KEY"
+format = "JSON"
+pumpfun_create_topic = "prod.rpc.solana.pumpfun.create"
+pumpfun_trade_topic = "prod.rpc.solana.pumpfun.trade"
+system_transfers_topic = "prod.rpc.solana.system.transfers"
+"#;
+
+        let config: SeerProgramStreamsComponentConfig = toml::from_str(toml).unwrap();
+        assert!(config.enabled);
+        assert_eq!(config.auth_header, "x-api-key");
+        assert_eq!(config.api_key_env, "NLN_API_KEY");
+        assert_eq!(
+            config.api_key_env_fallback.as_deref(),
+            Some("GHOST_NLN_API_KEY")
+        );
+        assert_eq!(config.format, "JSON");
+        assert_eq!(
+            config.system_transfers_topic,
+            "prod.rpc.solana.system.transfers"
+        );
     }
 
     #[test]
@@ -5008,6 +5145,31 @@ enabled = true
                 .unwrap_or_default()
                 .contains("shadow-burnin-v3-p37-mfs-lifecycle-r14"));
         }
+    }
+
+    #[test]
+    fn test_fsc_v2_capture_profile_loads_capture_only_program_streams() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let path = manifest_dir
+            .join("../configs/rollout")
+            .join("shadow-burnin-v3-fsc-capture-nln-r1.toml");
+        let config = LauncherConfig::from_file(&path)
+            .unwrap_or_else(|err| panic!("failed to load {}: {err}", path.display()));
+
+        assert_eq!(config.seer.funding_lane_mode, "disabled");
+        assert!(config.seer.program_streams.enabled);
+        assert_eq!(
+            config.seer.program_streams.endpoint,
+            "${NLN_PROGRAM_STREAM_ENDPOINT}"
+        );
+        assert_eq!(config.seer.program_streams.auth_header, "x-api-key");
+        assert_eq!(config.seer.program_streams.api_key_env, "NLN_API_KEY");
+        assert_eq!(config.seer.program_streams.format, "JSON");
+        assert_eq!(config.trigger.entry_mode, TriggerEntryMode::ShadowOnly);
+        assert_eq!(config.execution.execution_mode, ExecutionMode::Shadow);
+        assert!(config
+            .ghost_brain_config_path
+            .ends_with("configs/rollout/ghost_brain_v3_p36_primary_only_fsc_capture.toml"));
     }
 
     #[test]

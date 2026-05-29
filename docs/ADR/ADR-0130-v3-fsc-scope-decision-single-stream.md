@@ -3,6 +3,8 @@
 **Date:** 2026-05-16
 **Status:** Accepted
 **Author:** Ghost Father
+**Amended by:** `ADR-0138-fsc-v2-nln-program-streams-capture-evidence.md` for NLN Program Streams
+capture/evidence only; active Gatekeeper use remains out of scope.
 
 ## Context
 

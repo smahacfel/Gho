@@ -27,6 +27,7 @@ fn create_test_config(
         grpc_manual_backfill_enabled: true,
         grpc_commitment_fallback_to_websocket: false,
         grpc_max_stalls_before_open: 3,
+        grpc_stall_timeout_secs: 20,
         grpc_circuit_breaker_cooldown_ms: 15_000,
         grpc_client_id: None,
         grpc_auth_token: None,

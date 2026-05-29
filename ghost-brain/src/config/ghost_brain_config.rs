@@ -76,6 +76,13 @@ pub struct GhostBrainConfig {
     #[serde(default)]
     pub gatekeeper_v3: GatekeeperV3Config,
 
+    /// FSC v2 capture/evidence configuration.
+    ///
+    /// This is intentionally separate from legacy Gatekeeper V2 FSC thresholds
+    /// so the new evidence payload cannot silently change active policy meaning.
+    #[serde(default)]
+    pub fsc_v2: FscV2Config,
+
     /// MPCF (Micro-Payload Cognitive Fingerprint) configuration
     pub mpcf: MpcfConfig,
 
@@ -831,6 +838,160 @@ impl std::fmt::Display for GatekeeperMode {
             GatekeeperMode::Long => write!(f, "long"),
         }
     }
+}
+
+/// FSC v2 capture/evidence configuration.
+///
+/// PR-FSC1 only introduces an inert config surface. Active decision use remains
+/// rejected by validation until a later ADR and implementation phase explicitly
+/// promote FSC v2 beyond capture/evidence.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct FscV2Config {
+    /// Collect FSC v2 source evidence.
+    pub capture_enabled: bool,
+    /// Emit FSC v2 evidence into logs/datasets.
+    pub feature_emit_enabled: bool,
+    /// Reserved for a future policy ADR. Must remain false in PR-FSC1.
+    pub decision_enabled: bool,
+    /// Reserved for a future policy ADR. Must remain false in PR-FSC1.
+    pub hard_reject_enabled: bool,
+
+    /// Provider label for evidence provenance.
+    pub provider: String,
+    /// Emit decision-time snapshots when capture is enabled.
+    pub snapshot_decision_time_enabled: bool,
+    /// Emit eventual/postfill snapshots when capture is enabled.
+    pub snapshot_eventual_enabled: bool,
+
+    /// Funding lookback window for FSC v2 attribution.
+    pub lookback_window_s: u64,
+    /// Warmup window required before clean capture status.
+    pub warmup_window_s: u64,
+
+    /// Minimum native-SOL transfer amount retained in the rolling index.
+    pub min_abs_store_lamports: u64,
+    /// Minimum absolute native-SOL transfer amount used for attribution.
+    pub min_abs_attribution_lamports: u64,
+    /// Minimum transfer-to-buy ratio for attribution.
+    pub min_rel_to_buy: f64,
+    /// Dominant source confidence required for non-neutral known attribution.
+    pub min_attribution_confidence: f64,
+
+    /// Minimum total buyers before FSC v2 can be clean.
+    pub min_total_buyers: u8,
+    /// Minimum known non-neutral buyers before HHI is defined.
+    pub min_known_non_neutral_buyers: u8,
+    /// Minimum known coverage before clean status.
+    pub min_known_coverage: f64,
+    /// Minimum non-neutral known coverage before clean scoring status.
+    pub min_non_neutral_known_coverage: f64,
+
+    /// Same-slot cross-signature ordering policy.
+    pub same_slot_cross_signature_policy: String,
+    /// Include WSOL transfers in primary FSC v2. Must remain false for V1.
+    pub include_wsol: bool,
+    /// Include SPL transfers in primary FSC v2. Must remain false for V1.
+    pub include_spl: bool,
+
+    /// Optional neutral funder set file.
+    pub neutral_funder_set_path: Option<String>,
+    /// Optional neutral funder set version.
+    pub neutral_funder_set_version: Option<String>,
+}
+
+impl Default for FscV2Config {
+    fn default() -> Self {
+        Self {
+            capture_enabled: false,
+            feature_emit_enabled: false,
+            decision_enabled: false,
+            hard_reject_enabled: false,
+            provider: "nln_program_streams".to_string(),
+            snapshot_decision_time_enabled: true,
+            snapshot_eventual_enabled: true,
+            lookback_window_s: 300,
+            warmup_window_s: 300,
+            min_abs_store_lamports: 1_000_000,
+            min_abs_attribution_lamports: 10_000_000,
+            min_rel_to_buy: 0.20,
+            min_attribution_confidence: 0.60,
+            min_total_buyers: 2,
+            min_known_non_neutral_buyers: 2,
+            min_known_coverage: 0.50,
+            min_non_neutral_known_coverage: 0.30,
+            same_slot_cross_signature_policy: "require_tx_index".to_string(),
+            include_wsol: false,
+            include_spl: false,
+            neutral_funder_set_path: Some("configs/fsc/neutral_funders_v1.toml".to_string()),
+            neutral_funder_set_version: Some("neutral_funders_v1".to_string()),
+        }
+    }
+}
+
+impl FscV2Config {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.decision_enabled {
+            anyhow::bail!(
+                "fsc_v2.decision_enabled is reserved for a future FSC policy ADR and must remain false"
+            );
+        }
+        if self.hard_reject_enabled {
+            anyhow::bail!(
+                "fsc_v2.hard_reject_enabled is reserved for a future FSC policy ADR and must remain false"
+            );
+        }
+        if self.provider.trim().is_empty() {
+            anyhow::bail!("fsc_v2.provider must not be empty");
+        }
+        if self.lookback_window_s == 0 {
+            anyhow::bail!("fsc_v2.lookback_window_s must be positive");
+        }
+        if self.warmup_window_s == 0 {
+            anyhow::bail!("fsc_v2.warmup_window_s must be positive");
+        }
+        if self.min_abs_store_lamports == 0 {
+            anyhow::bail!("fsc_v2.min_abs_store_lamports must be positive");
+        }
+        if self.min_abs_attribution_lamports == 0 {
+            anyhow::bail!("fsc_v2.min_abs_attribution_lamports must be positive");
+        }
+        if self.min_abs_store_lamports > self.min_abs_attribution_lamports {
+            anyhow::bail!("fsc_v2.min_abs_store_lamports must be <= min_abs_attribution_lamports");
+        }
+        validate_unit_interval("fsc_v2.min_rel_to_buy", self.min_rel_to_buy)?;
+        validate_unit_interval(
+            "fsc_v2.min_attribution_confidence",
+            self.min_attribution_confidence,
+        )?;
+        validate_unit_interval("fsc_v2.min_known_coverage", self.min_known_coverage)?;
+        validate_unit_interval(
+            "fsc_v2.min_non_neutral_known_coverage",
+            self.min_non_neutral_known_coverage,
+        )?;
+        if self.min_total_buyers == 0 {
+            anyhow::bail!("fsc_v2.min_total_buyers must be positive");
+        }
+        if self.min_known_non_neutral_buyers == 0 {
+            anyhow::bail!("fsc_v2.min_known_non_neutral_buyers must be positive");
+        }
+        if self.same_slot_cross_signature_policy != "require_tx_index" {
+            anyhow::bail!(
+                "fsc_v2.same_slot_cross_signature_policy must be require_tx_index in PR-FSC1"
+            );
+        }
+        if self.include_wsol || self.include_spl {
+            anyhow::bail!("fsc_v2 primary capture must keep include_wsol/include_spl false");
+        }
+        Ok(())
+    }
+}
+
+fn validate_unit_interval(name: &str, value: f64) -> anyhow::Result<()> {
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        anyhow::bail!("{name} must be in range [0.0, 1.0]");
+    }
+    Ok(())
 }
 
 /// Complete configuration for Gatekeeper v2.
@@ -3857,6 +4018,7 @@ impl Default for GhostBrainConfig {
             gatekeeper: GatekeeperConfig::default(),
             gatekeeper_v2: None,
             gatekeeper_v3: GatekeeperV3Config::default(),
+            fsc_v2: FscV2Config::default(),
             mpcf: MpcfConfig::default(),
             ssmi: SsmiConfig::default(),
             iwim: IwimConfig::default(),
@@ -4338,6 +4500,7 @@ impl GhostBrainConfig {
             gatekeeper_v2.validate()?;
         }
         self.gatekeeper_v3.validate()?;
+        self.fsc_v2.validate()?;
 
         // Validate QASS
         if self.qass.collapse_threshold < 0.0 || self.qass.collapse_threshold > 1.0 {
@@ -5009,6 +5172,86 @@ min_dev_paperhand_latency_ms = 2500
         assert_eq!(
             cfg.max_whale_reversal_ratio_top3,
             GatekeeperV2Config::default().max_whale_reversal_ratio_top3
+        );
+    }
+
+    #[test]
+    fn test_fsc_v2_defaults_are_capture_inert() {
+        let config = GhostBrainConfig::default();
+        assert!(!config.fsc_v2.capture_enabled);
+        assert!(!config.fsc_v2.feature_emit_enabled);
+        assert!(!config.fsc_v2.decision_enabled);
+        assert!(!config.fsc_v2.hard_reject_enabled);
+        assert_eq!(config.fsc_v2.provider, "nln_program_streams");
+        assert_eq!(config.fsc_v2.lookback_window_s, 300);
+        assert_eq!(config.fsc_v2.min_abs_store_lamports, 1_000_000);
+        assert_eq!(config.fsc_v2.min_abs_attribution_lamports, 10_000_000);
+        assert_eq!(
+            config.fsc_v2.same_slot_cross_signature_policy,
+            "require_tx_index"
+        );
+        assert!(!config.fsc_v2.include_wsol);
+        assert!(!config.fsc_v2.include_spl);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_fsc_v2_capture_config_deserializes_without_decision_enablement() {
+        let toml = r#"
+capture_enabled = true
+feature_emit_enabled = true
+decision_enabled = false
+hard_reject_enabled = false
+provider = "nln_program_streams"
+lookback_window_s = 300
+warmup_window_s = 300
+min_abs_store_lamports = 1000000
+min_abs_attribution_lamports = 10000000
+min_rel_to_buy = 0.20
+min_attribution_confidence = 0.60
+min_total_buyers = 2
+min_known_non_neutral_buyers = 2
+min_known_coverage = 0.50
+min_non_neutral_known_coverage = 0.30
+same_slot_cross_signature_policy = "require_tx_index"
+include_wsol = false
+include_spl = false
+"#;
+
+        let config: FscV2Config = toml::from_str(toml).unwrap();
+        assert!(config.capture_enabled);
+        assert!(config.feature_emit_enabled);
+        assert!(!config.decision_enabled);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_fsc_v2_decision_enablement_is_rejected_in_pr_fsc1() {
+        let mut config = GhostBrainConfig::default();
+        config.fsc_v2.decision_enabled = true;
+        let err = config
+            .validate()
+            .expect_err("PR-FSC1 must reject active FSC v2 decision enablement");
+        assert!(err.to_string().contains("fsc_v2.decision_enabled"));
+    }
+
+    #[test]
+    fn test_fsc_v2_capture_rollout_profile_loads_decision_off() {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let path = manifest_dir
+            .join("../configs/rollout")
+            .join("ghost_brain_v3_p36_primary_only_fsc_capture.toml");
+        let config = GhostBrainConfig::from_toml_file(&path)
+            .unwrap_or_else(|err| panic!("failed to load {}: {err}", path.display()));
+
+        assert!(config.fsc_v2.capture_enabled);
+        assert!(config.fsc_v2.feature_emit_enabled);
+        assert!(!config.fsc_v2.decision_enabled);
+        assert!(!config.fsc_v2.hard_reject_enabled);
+        assert_eq!(config.fsc_v2.provider, "nln_program_streams");
+        assert_eq!(
+            config.fsc_v2.same_slot_cross_signature_policy,
+            "require_tx_index"
         );
     }
 

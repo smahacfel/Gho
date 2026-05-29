@@ -6,8 +6,8 @@
 //! - Synthetic events are NEVER parsed by binary parser
 
 use seer::config::{
-    CommitmentLevel, ConnectionMode, FilterConfig, FundingLaneMode, PumpPortalConfig, SeerConfig,
-    SeerSourceMode, StreamMode, TxFilterStrategy,
+    CommitmentLevel, ConnectionMode, FilterConfig, FundingLaneMode, ProgramStreamsConfig,
+    PumpPortalConfig, SeerConfig, SeerSourceMode, StreamMode, TxFilterStrategy,
 };
 use seer::types::{GeyserEvent, RawBytesMissingReason, RawInstruction};
 use solana_sdk::pubkey::Pubkey;
@@ -32,6 +32,7 @@ fn default_test_config() -> SeerConfig {
         reconnect_delay_secs: 1,
         max_reconnect_delay_secs: 60,
         grpc_max_stalls_before_open: 3,
+        grpc_stall_timeout_secs: SeerConfig::default_grpc_stall_timeout_secs(),
         grpc_circuit_breaker_cooldown_ms: 15_000,
         verbose: false,
         filter: FilterConfig {
@@ -57,6 +58,7 @@ fn default_test_config() -> SeerConfig {
         stream_mode: StreamMode::SingleGlobal,
         tx_filter_strategy: TxFilterStrategy::PerPool,
         funding_lane_mode: FundingLaneMode::Disabled,
+        program_streams: ProgramStreamsConfig::default(),
         watched_pools_ttl_ms: 120_000,
         watched_pools_cap: 512,
         watch_debounce_ms: 0,

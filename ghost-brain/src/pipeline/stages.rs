@@ -47,6 +47,7 @@ impl E2EPipeline {
             max_reconnect_delay_secs: 300,
             grpc_max_stalls_before_open:
                 seer::config::SeerConfig::default_grpc_max_stalls_before_open(),
+            grpc_stall_timeout_secs: seer::config::SeerConfig::default_grpc_stall_timeout_secs(),
             grpc_circuit_breaker_cooldown_ms:
                 seer::config::SeerConfig::default_grpc_circuit_breaker_cooldown_ms(),
             verbose: self.config.seer.verbose,
@@ -73,6 +74,7 @@ impl E2EPipeline {
             stream_mode: seer::config::StreamMode::SingleGlobal,
             tx_filter_strategy: seer::config::TxFilterStrategy::PerPool,
             funding_lane_mode: seer::config::FundingLaneMode::Disabled,
+            program_streams: seer::config::ProgramStreamsConfig::default(),
             watched_pools_ttl_ms: 120_000,
             watched_pools_cap: 512,
             watch_debounce_ms: 0,
