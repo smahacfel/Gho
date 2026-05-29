@@ -115,6 +115,52 @@ impl EventEmitter {
 
     // ── Typed emitters ──────────────────────────────────────────────────
 
+    /// Emit durable ingest evidence for a pump.fun birth/create event.
+    ///
+    /// This is selector-denominator evidence only. It does not represent a
+    /// Gatekeeper verdict, entry attempt, or lifecycle label.
+    #[allow(clippy::too_many_arguments)]
+    pub fn emit_new_pool_detected(
+        &self,
+        candidate_id: &CandidateId,
+        pool_amm_id: &str,
+        base_mint: &str,
+        quote_mint: &str,
+        bonding_curve: &str,
+        creator: &str,
+        amm_program: &str,
+        signature: &str,
+        birth_ts_ms: u64,
+        event_slot: Option<u64>,
+        detected_wall_ts_ms: Option<u64>,
+        chain_event_ts_ms: Option<u64>,
+        source: &str,
+    ) {
+        let mut env = self.make_envelope_at(candidate_id, birth_ts_ms);
+        env.slot = event_slot;
+        self.emit(ExecutionEvent::new(
+            env,
+            EventKind::NewPoolDetected(NewPoolDetectedPayload {
+                is_birth_event: true,
+                pool_amm_id: pool_amm_id.to_string(),
+                pool_id: pool_amm_id.to_string(),
+                base_mint: base_mint.to_string(),
+                mint_id: base_mint.to_string(),
+                quote_mint: quote_mint.to_string(),
+                bonding_curve: bonding_curve.to_string(),
+                creator: creator.to_string(),
+                amm_program: amm_program.to_string(),
+                signature: signature.to_string(),
+                birth_ts_ms,
+                timestamp_ms: birth_ts_ms,
+                event_slot,
+                detected_wall_ts_ms,
+                chain_event_ts_ms,
+                source: source.to_string(),
+            }),
+        ));
+    }
+
     /// Emit a CandidateEvent (Gatekeeper PASS).
     pub fn emit_candidate(
         &self,
@@ -536,6 +582,42 @@ mod tests {
         );
         emitter.flush().unwrap();
         assert_eq!(emitter.total_events_written(), 1);
+    }
+
+    #[test]
+    fn test_emit_new_pool_detected_birth_evidence() {
+        let (emitter, tmp) = make_emitter();
+        emitter.emit_new_pool_detected(
+            &"mint:curve:1700000000000".to_string(),
+            "pool",
+            "mint",
+            "SOL",
+            "curve",
+            "creator",
+            "pumpfun",
+            "sig",
+            1_700_000_000_000,
+            Some(123),
+            Some(1_700_000_000_010),
+            Some(1_700_000_000_000),
+            "seer_new_pool_detected",
+        );
+        emitter.flush().unwrap();
+        assert_eq!(emitter.total_events_written(), 1);
+
+        let jsonl_path = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+            .expect("jsonl event file");
+        let content = std::fs::read_to_string(jsonl_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(parsed["kind"]["type"], "NewPoolDetected");
+        assert_eq!(parsed["kind"]["payload"]["is_birth_event"], true);
+        assert_eq!(parsed["kind"]["payload"]["quote_mint"], "SOL");
+        assert_eq!(parsed["kind"]["payload"]["bonding_curve"], "curve");
+        assert_eq!(parsed["envelope"]["slot"], 123);
     }
 
     #[test]

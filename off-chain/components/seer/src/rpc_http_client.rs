@@ -1,3 +1,4 @@
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, USER_AGENT};
@@ -11,13 +12,15 @@ pub const RPC_HTTP_USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36";
 pub const RPC_HTTP_AUTH_HEADER_ENV: &str = "GHOST_RPC_AUTH_HEADER";
 pub const RPC_HTTP_AUTH_TOKEN_ENV: &str = "GHOST_RPC_AUTH_TOKEN";
+pub const LEGACY_PROVIDER_AUTH_HEADER_ENV: &str = "GHOST_SEER_GRPC_AUTH_HEADER";
+pub const LEGACY_PROVIDER_AUTH_TOKEN_ENV: &str = "GHOST_SEER_GRPC_X_TOKEN";
 
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
-const DEFAULT_RPC_AUTH_HEADER: &str = "x-api-key";
-const LEGACY_PROVIDER_AUTH_HEADER_ENV: &str = "GHOST_SEER_GRPC_AUTH_HEADER";
-const LEGACY_PROVIDER_AUTH_TOKEN_ENV: &str = "GHOST_SEER_GRPC_X_TOKEN";
+pub const DEFAULT_RPC_AUTH_HEADER: &str = "x-api-key";
 const NLN_RPC_HOST: &str = "rpc.nln.clr3.org";
 const NLN_RPC_HOST_SUFFIX: &str = ".nln.clr3.org";
+
+static CONFIGURED_RPC_AUTH: OnceLock<RpcAuthConfig> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RpcAuthConfig {
@@ -61,7 +64,49 @@ where
 }
 
 fn rpc_auth_config_for_url(url: &str) -> Option<RpcAuthConfig> {
+    if !is_nln_rpc_url(url) {
+        return None;
+    }
+
+    if let Some(config) = CONFIGURED_RPC_AUTH.get() {
+        return Some(config.clone());
+    }
+
     rpc_auth_config_for_url_with_lookup(url, non_empty_env_value)
+}
+
+pub fn rpc_http_auth_applies_to_url(url: &str) -> bool {
+    is_nln_rpc_url(url)
+}
+
+pub fn configure_rpc_http_auth(
+    header_name: impl Into<String>,
+    token: impl Into<String>,
+) -> Result<(), String> {
+    let header_name = header_name.into().trim().to_string();
+    if header_name.is_empty() {
+        return Err("RPC auth header name is empty".to_string());
+    }
+    HeaderName::from_bytes(header_name.as_bytes())
+        .map_err(|err| format!("invalid RPC auth header name: {err}"))?;
+
+    let token = token.into().trim().to_string();
+    if token.is_empty() {
+        return Err("RPC auth token is empty".to_string());
+    }
+    HeaderValue::from_str(&token).map_err(|err| format!("invalid RPC auth token value: {err}"))?;
+
+    let config = RpcAuthConfig { header_name, token };
+    if let Some(existing) = CONFIGURED_RPC_AUTH.get() {
+        if existing == &config {
+            return Ok(());
+        }
+        return Err("RPC auth is already configured with different values".to_string());
+    }
+
+    CONFIGURED_RPC_AUTH
+        .set(config)
+        .map_err(|_| "RPC auth is already configured".to_string())
 }
 
 fn rpc_http_headers(url: &str) -> HeaderMap {

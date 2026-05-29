@@ -49,7 +49,11 @@ use ghost_launcher::{
     logging::{OracleDecisionFormatter, StandardFormatter},
     oracle_metrics, oracle_runtime, wal_recovery,
 };
-use seer::{new_async_rpc_client, new_async_rpc_client_with_timeout};
+use seer::{
+    configure_rpc_http_auth, new_async_rpc_client, new_async_rpc_client_with_timeout,
+    rpc_http_auth_applies_to_url, DEFAULT_RPC_AUTH_HEADER, LEGACY_PROVIDER_AUTH_HEADER_ENV,
+    LEGACY_PROVIDER_AUTH_TOKEN_ENV, RPC_HTTP_AUTH_HEADER_ENV, RPC_HTTP_AUTH_TOKEN_ENV,
+};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{read_keypair_file, Signer};
 use std::env;
@@ -355,6 +359,54 @@ async fn probe_rpc_endpoint_app(rpc_url: &str) -> Result<String> {
         .with_context(|| format!("rpc probe timed out for {redacted_rpc_url}"))?
         .with_context(|| format!("rpc getVersion failed for {redacted_rpc_url}"))?;
     Ok(version.solana_core)
+}
+
+fn lookup_runtime_secret(config_path: &Path, env_name: &str) -> Result<Option<String>> {
+    LauncherConfig::lookup_secret_value_for_config_path(config_path, env_name)
+}
+
+fn configure_rpc_http_auth_from_secret_env(
+    config: &LauncherConfig,
+    config_path: &Path,
+) -> Result<()> {
+    let uses_header_auth_rpc = rpc_http_auth_applies_to_url(&config.seer.rpc_endpoint)
+        || rpc_http_auth_applies_to_url(&config.trigger.rpc_url)
+        || rpc_http_auth_applies_to_url(&config.trigger.shadow_run.shadow_rpc_url);
+    if !uses_header_auth_rpc {
+        return Ok(());
+    }
+
+    let mut token = lookup_runtime_secret(config_path, RPC_HTTP_AUTH_TOKEN_ENV)?;
+    if token.is_none() {
+        token = lookup_runtime_secret(config_path, LEGACY_PROVIDER_AUTH_TOKEN_ENV)?;
+    }
+
+    let mut header = lookup_runtime_secret(config_path, RPC_HTTP_AUTH_HEADER_ENV)?;
+    if header.is_none() {
+        header = lookup_runtime_secret(config_path, LEGACY_PROVIDER_AUTH_HEADER_ENV)?;
+    }
+    let header = header.unwrap_or_else(|| DEFAULT_RPC_AUTH_HEADER.to_string());
+
+    match token {
+        Some(token) => {
+            configure_rpc_http_auth(header.clone(), token)
+                .map_err(|err| anyhow::anyhow!("failed to configure RPC HTTP auth: {err}"))?;
+            info!(
+                header = %header,
+                "RPC HTTP auth configured for header-auth RPC endpoints"
+            );
+        }
+        None if uses_header_auth_rpc => {
+            warn!(
+                rpc_auth_token_env = RPC_HTTP_AUTH_TOKEN_ENV,
+                legacy_fallback_env = LEGACY_PROVIDER_AUTH_TOKEN_ENV,
+                "Header-auth RPC endpoint configured but no RPC auth token was found in process env or .env"
+            );
+        }
+        None => {}
+    }
+
+    Ok(())
 }
 
 async fn probe_grpc_endpoint_app(config: &LauncherConfig) -> Result<String> {
@@ -1048,6 +1100,8 @@ async fn main() -> Result<()> {
 
     // Initialize logging — guards must live until end of main to flush buffers on exit
     let _log_guards = init_logging(&config)?;
+
+    configure_rpc_http_auth_from_secret_env(&config, &config_path)?;
 
     // ── CONFIG FINGERPRINT (always, single INFO line) ───────────────
     config.log_config_fingerprint();

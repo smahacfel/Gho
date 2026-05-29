@@ -111,7 +111,7 @@ from fetch_pool_trade_counts import classify_trade
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-DEFAULT_RPC_URL  = "https://rpc.nln.clr3.org"
+DEFAULT_RPC_URL  = "https://solana-mainnet.g.alchemy.com/v2/t3ipHfJnGWRbwo6i21IGu"
 DEFAULT_INPUT_PATH = str(SCRIPT_DIR / "gatekeeper_v2_buys.jsonl")
 DEFAULT_RPS      = 24.0
 DEFAULT_CONCUR   = 8
@@ -137,6 +137,7 @@ LEGACY_PROVIDER_AUTH_TOKEN_ENV = "GHOST_SEER_GRPC_X_TOKEN"
 DEFAULT_RPC_AUTH_HEADER = "x-api-key"
 NLN_RPC_HOST = "rpc.nln.clr3.org"
 NLN_RPC_HOST_SUFFIX = ".nln.clr3.org"
+ALCHEMY_RPC_HOST = "solana-mainnet.g.alchemy.com"
 
 
 def _non_empty_env(name: str) -> str | None:
@@ -3015,7 +3016,8 @@ async def run(args: argparse.Namespace) -> None:
     if args.tx_rps > args.rps:
         raise RuntimeError("--tx-rps nie może być większe niż --rps")
 
-    if args.rpc.startswith("https://rpc.nln.clr3.org"):
+    rpc_host = (urlparse(args.rpc).hostname or "").lower()
+    if _is_nln_rpc_url(args.rpc) or rpc_host == ALCHEMY_RPC_HOST:
         if args.rps > SOLANA_MAINNET_PROVIDER_GUIDELINE_RPS:
             log.warning(
                 "Ustawione --rps=%.1f przekracza projektowy throughput guideline dla Solana Mainnet (%.0f RPS). Spodziewaj się 429.",

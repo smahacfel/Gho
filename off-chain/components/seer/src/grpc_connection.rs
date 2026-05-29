@@ -62,12 +62,12 @@ use tonic::{
 use tonic_health::pb::health_client::HealthClient;
 use yellowstone_grpc_client::GeyserGrpcClient;
 use yellowstone_grpc_proto::prelude::{
-    geyser_client::GeyserClient,
-    subscribe_request_filter_accounts_filter, subscribe_request_filter_accounts_filter_memcmp,
-    subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest,
-    SubscribeRequestFilterAccounts, SubscribeRequestFilterAccountsFilter,
-    SubscribeRequestFilterAccountsFilterMemcmp, SubscribeRequestFilterBlocksMeta,
-    SubscribeRequestFilterEntry, SubscribeRequestFilterTransactions, SubscribeRequestPing,
+    geyser_client::GeyserClient, subscribe_request_filter_accounts_filter,
+    subscribe_request_filter_accounts_filter_memcmp, subscribe_update::UpdateOneof,
+    CommitmentLevel, SubscribeRequest, SubscribeRequestFilterAccounts,
+    SubscribeRequestFilterAccountsFilter, SubscribeRequestFilterAccountsFilterMemcmp,
+    SubscribeRequestFilterBlocksMeta, SubscribeRequestFilterEntry,
+    SubscribeRequestFilterTransactions, SubscribeRequestPing,
 };
 
 // ─── Program / account constants ─────────────────────────────────────────────
@@ -118,10 +118,12 @@ const BACKOFF_MAX_MS: u64 = 5_000;
 const DEFAULT_RESUB_DEBOUNCE_MS: u64 = 1_000;
 
 /// If no gRPC message arrives for this long → force reconnect.
-/// Reduced from 20s → 5s (RC-3.3), now further reduced to 3s (RC-4 fix):
-/// at 5s stall threshold + 2s watchdog tick, the actual silence window before
-/// reconnect can reach 7s, losing up to 7s of events.  3s + 2s tick = 5s max gap.
-const SILENT_STALL_SECS: u64 = 2;
+///
+/// This is intentionally provider-configurable. Some Yellowstone providers emit
+/// BlockMeta/Slot heartbeats frequently; others keep filtered streams quiet
+/// between matching transactions. A 2s hard-coded watchdog caused NLN streams
+/// to reconnect before the first useful message arrived.
+const DEFAULT_SILENT_STALL_SECS: u64 = 20;
 
 const WATCHDOG_TICK_SECS: u64 = 2;
 const HEALTH_TICK_SECS: u64 = 5;
@@ -1479,7 +1481,7 @@ impl Default for GrpcConfig {
             providers: vec![],
             streams_per_provider: 1,
             commitment: CommitmentLevel::Processed,
-            stall_timeout_secs: SILENT_STALL_SECS,
+            stall_timeout_secs: DEFAULT_SILENT_STALL_SECS,
             resub_debounce_ms: DEFAULT_RESUB_DEBOUNCE_MS,
             max_stalls_before_open: DEFAULT_PROVIDER_MAX_STALLS_BEFORE_OPEN,
             circuit_breaker_cooldown_ms: DEFAULT_PROVIDER_CIRCUIT_BREAKER_COOLDOWN_MS,
@@ -2650,13 +2652,16 @@ async fn stream_loop(
                 ).await?;
             }
 
-            // ── Immediate forced resub for route-compatible BCV2 exact-watch ──
-            // This path is intentionally narrower than regular registry_notify:
-            // curve/pool churn remains debounced/batched, while BCV2 accounts
-            // discovered from route-compatible observed tx meta refresh the
-            // active PrimaryGlobal exact branch immediately.
+            // ── BCV2 exact-watch refresh ─────────────────────────────────
+            // In SingleGlobal mode this must stay batched on health_tick like
+            // regular registry changes. NLN accepted rapid SubscribeRequest
+            // updates but then stopped delivering data; keeping request-shape
+            // churn off the hot path preserves the active stream while RPC
+            // hydration covers immediate BCV2 evidence.
             _ = async {
-                if cfg.subscription_profile.uses_registry_filters() {
+                if cfg.subscription_profile.uses_registry_filters()
+                    && cfg.registry_resubscribe_mode.uses_immediate_notify()
+                {
                     bcv2_resub_notify.notified().await;
                 } else {
                     std::future::pending::<()>().await;
@@ -2674,8 +2679,8 @@ async fn stream_loop(
                     &mut last_reg_version,
                     &mut last_request_fingerprint,
                     &mut last_resub_at,
-                    true,
-                    true,
+                    false,
+                    false,
                 ).await?;
             }
 
@@ -3260,7 +3265,7 @@ impl GrpcConnection {
             )],
             streams_per_provider: 1,
             commitment: proto_commitment,
-            stall_timeout_secs: SILENT_STALL_SECS,
+            stall_timeout_secs: DEFAULT_SILENT_STALL_SECS,
             resub_debounce_ms: DEFAULT_RESUB_DEBOUNCE_MS,
             max_stalls_before_open: DEFAULT_PROVIDER_MAX_STALLS_BEFORE_OPEN,
             circuit_breaker_cooldown_ms: DEFAULT_PROVIDER_CIRCUIT_BREAKER_COOLDOWN_MS,
@@ -3359,6 +3364,15 @@ impl GrpcConnection {
         if let Some(connector) = self.connector.get_mut().as_mut() {
             connector.config.max_stalls_before_open = max_stalls_before_open;
             connector.config.circuit_breaker_cooldown_ms = cooldown_ms;
+        }
+        self
+    }
+
+    pub fn with_stall_timeout_secs(mut self, stall_timeout_secs: u64) -> Self {
+        let stall_timeout_secs = stall_timeout_secs.max(1);
+        self.config.stall_timeout_secs = stall_timeout_secs;
+        if let Some(connector) = self.connector.get_mut().as_mut() {
+            connector.config.stall_timeout_secs = stall_timeout_secs;
         }
         self
     }

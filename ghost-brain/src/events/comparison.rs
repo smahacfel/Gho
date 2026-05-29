@@ -155,6 +155,10 @@ pub fn generate_comparison_report(
             run_id = event.envelope.run_id.clone();
         }
 
+        if matches!(&event.kind, EventKind::NewPoolDetected(_)) {
+            continue;
+        }
+
         let lane = event.envelope.lane;
         let counts = match lane {
             Lane::Paper | Lane::Single => &mut paper_counts,

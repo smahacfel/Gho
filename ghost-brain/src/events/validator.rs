@@ -97,6 +97,10 @@ impl EventValidator {
                 ));
             }
 
+            if matches!(&event.kind, EventKind::NewPoolDetected(_)) {
+                continue;
+            }
+
             if let Some(ref quote_id) = event.envelope.quote_id {
                 if let Some(violation) = Self::quote_freshness_violation(
                     quote_id,

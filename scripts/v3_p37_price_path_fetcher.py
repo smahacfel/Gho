@@ -29,7 +29,7 @@ import gatekeeper_outcome_labeler as v1
 PRICE_PATH_SCHEMA_VERSION = 1
 DEFAULT_WINDOW_S = 60.0
 IMPLEMENTATION_STATUS = "schema_only_no_collector"
-DEFAULT_RPC = "https://rpc.nln.clr3.org"
+DEFAULT_RPC = "https://solana-mainnet.g.alchemy.com/v2/t3ipHfJnGWRbwo6i21IGu"
 DEFAULT_WORKERS = 8
 DEFAULT_MAX_RPS = 40.0
 DEFAULT_MAX_PAGES = 20
@@ -934,7 +934,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--threshold-hits", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--checkpoint", type=Path)
-    parser.add_argument("--rpc", default=DEFAULT_RPC, help="Solana JSON-RPC endpoint; defaults to project provider endpoint")
+    parser.add_argument("--rpc", default=DEFAULT_RPC, help="Solana JSON-RPC endpoint; defaults to archive-capable Alchemy endpoint")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
     parser.add_argument("--max-rps", type=float, default=DEFAULT_MAX_RPS)
     parser.add_argument("--max-pages", type=int, default=DEFAULT_MAX_PAGES)

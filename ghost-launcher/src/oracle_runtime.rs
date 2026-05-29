@@ -105,18 +105,17 @@ use seer::websocket_connection::{
 };
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
-use solana_client::rpc_config::RpcTransactionConfig;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
-use solana_transaction_status::{EncodedConfirmedTransactionWithStatusMeta, UiTransactionEncoding};
+use solana_transaction_status::EncodedConfirmedTransactionWithStatusMeta;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{watch, Mutex as TokioMutex, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, info, trace, warn};
 
 // =============================================================================
@@ -166,6 +165,10 @@ const HOT_POOL_BACKPRESSURE_WAIT_MS: u64 = 25;
 /// deterministic and bounded (no unbounded waiting or memory growth).
 const HOT_POOL_BACKPRESSURE_RETRY_ATTEMPTS: usize = 20;
 const FSC_COVERAGE_WINDOW_POLL_INTERVAL_MS: u64 = 1_000;
+const COVERAGE_AUDIT_RPC_MIN_INTERVAL_MS: u64 = 10_000;
+const COVERAGE_AUDIT_RPC_RATE_LIMIT_BACKOFF_MS: u64 = 30_000;
+const COVERAGE_AUDIT_SIGNATURE_PAGE_LIMIT: usize = 100;
+const COVERAGE_AUDIT_SIGNATURE_MAX_PAGES: usize = 2;
 #[derive(Debug, Clone, Copy, Default)]
 struct ResolvedPriceContext {
     reserve_base: Option<f64>,
@@ -7019,6 +7022,40 @@ impl P37ExecutableRouteResolutionDiagnostics {
     }
 }
 
+fn p37_route_resolution_selected_route_matches_request(
+    request: &crate::components::trigger::PreparedBuyRequest,
+    resolution: &P37ExecutableRouteResolutionDiagnostics,
+) -> bool {
+    let Some(selected_route_kind) = resolution.selected_route_kind.as_deref() else {
+        return false;
+    };
+    p37_shadow_probe_route_kind(Some(request))
+        .as_deref()
+        .is_some_and(|prepared_route_kind| prepared_route_kind == selected_route_kind)
+}
+
+fn p37_active_shadow_precheck_route_ready_for_missing_account(
+    request: &crate::components::trigger::PreparedBuyRequest,
+    resolution: &P37ExecutableRouteResolutionDiagnostics,
+    missing_role: &str,
+) -> bool {
+    if !matches!(
+        resolution.route_resolution_status.as_deref(),
+        Some("primary_route_ready") | Some("fallback_route_ready")
+    ) || !p37_route_resolution_selected_route_matches_request(request, resolution)
+    {
+        return false;
+    }
+
+    if missing_role == "bonding_curve_v2" {
+        return true;
+    }
+
+    resolution.selected_route_kind.as_deref() == Some("legacy_buy")
+        && resolution.legacy_buy_route_ready == Some(true)
+        && matches!(missing_role, "bonding_curve" | "associated_bonding_curve")
+}
+
 fn p37_shadow_probe_account_manifest_descriptor(
     entry: &P37ShadowProbeAccountManifestEntry,
 ) -> String {
@@ -11773,6 +11810,16 @@ fn p37_shadow_probe_program_error_mapping(
             Some("slippage_or_amount_constraint".to_string()),
             Some("simulation_slippage_or_price_mismatch".to_string()),
         ),
+        (Some(PUMPFUN_PROGRAM_ID), Some(6024)) => (
+            Some("overflow".to_string()),
+            Some("legacy_buy_amount_constraint".to_string()),
+            Some("simulation_amount_overflow".to_string()),
+        ),
+        (Some(PUMPFUN_PROGRAM_ID), Some(6062)) => (
+            Some("buyback_fee_recipient_missing".to_string()),
+            Some("legacy_buy_account_constraint".to_string()),
+            Some("simulation_account_layout_mismatch".to_string()),
+        ),
         (_, Some(2006)) => (
             Some("anchor_constraint_seeds_best_effort".to_string()),
             Some("anchor_account_constraint".to_string()),
@@ -11782,6 +11829,16 @@ fn p37_shadow_probe_program_error_mapping(
             Some("too_much_sol_required_best_effort".to_string()),
             Some("slippage_or_amount_constraint".to_string()),
             Some("simulation_slippage_or_price_mismatch".to_string()),
+        ),
+        (_, Some(6024)) => (
+            Some("overflow_best_effort".to_string()),
+            Some("amount_constraint".to_string()),
+            Some("simulation_amount_overflow".to_string()),
+        ),
+        (_, Some(6062)) => (
+            Some("buyback_fee_recipient_missing_best_effort".to_string()),
+            Some("account_constraint".to_string()),
+            Some("simulation_account_layout_mismatch".to_string()),
         ),
         (_, Some(_)) => (
             Some("unknown_custom_program_error".to_string()),
@@ -12543,6 +12600,48 @@ fn p37_selected_route_final_manifest_failure_reason(
                 .unwrap_or_else(|| "selected_route_handoff_unknown".to_string())
         ));
     }
+
+    if matches!(
+        request.account_overrides.buy_variant,
+        Some(trigger::PumpfunBuyVariant::LegacyBuy)
+    ) {
+        let remaining_count = request.account_overrides.buy_remaining_accounts.len();
+        if remaining_count != trigger::PUMPFUN_BUYBACK_REMAINING_ACCOUNT_COUNT {
+            return Some(format!(
+                "legacy_buy_missing_buyback_remaining_accounts:count={remaining_count}:expected={}",
+                trigger::PUMPFUN_BUYBACK_REMAINING_ACCOUNT_COUNT
+            ));
+        }
+        if request.account_overrides.creator_pubkey_authoritative == Some(false) {
+            return Some(format!(
+                "creator_vault_source_not_authoritative:legacy_buy:{}:{}",
+                request
+                    .account_overrides
+                    .creator_pubkey_source
+                    .as_deref()
+                    .unwrap_or("creator_pubkey_source_unknown"),
+                request
+                    .account_overrides
+                    .creator_pubkey
+                    .map(|pubkey| pubkey.to_string())
+                    .unwrap_or_else(|| "missing_creator_pubkey".to_string())
+            ));
+        }
+        if let Some(curve) = request.account_overrides.legacy_buy_curve {
+            if request.min_tokens_out > curve.real_token_reserves {
+                return Some(format!(
+                    "legacy_buy_token_amount_exceeds_real_reserves:requested_token_amount={}:real_token_reserves={}:simulated_tokens_out={}",
+                    request.min_tokens_out,
+                    curve.real_token_reserves,
+                    request
+                        .entry_token_amount_raw
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "unknown".to_string())
+                ));
+            }
+        }
+    }
+
     None
 }
 
@@ -14790,6 +14889,30 @@ fn emit_gatekeeper_decision_event(
     );
 }
 
+/// Emit a durable NewPoolDetected/birth row for offline selector denominator
+/// construction. This is evidence-only and must not affect policy or execution.
+fn emit_new_pool_detected_evidence_event(emitter: &EventEmitter, pool_data: &DetectedPool) {
+    let candidate_id = format!(
+        "{}:{}:{}",
+        pool_data.base_mint, pool_data.bonding_curve, pool_data.timestamp_ms
+    );
+    emitter.emit_new_pool_detected(
+        &candidate_id,
+        &pool_data.pool_amm_id,
+        &pool_data.base_mint,
+        &pool_data.quote_mint,
+        &pool_data.bonding_curve,
+        &pool_data.creator,
+        &pool_data.amm_program,
+        &pool_data.signature,
+        pool_data.timestamp_ms,
+        pool_data.slot,
+        pool_data.detected_wall_ts_ms,
+        pool_data.event_time.chain_event_ts_ms,
+        "seer_new_pool_detected",
+    );
+}
+
 // =============================================================================
 // Oracle Runtime Task & Helpers
 // =============================================================================
@@ -16293,8 +16416,15 @@ async fn execute_gatekeeper_buy_path(
                     let tip_lamports = resolved_tip.tip_lamports;
                     let mut account_overrides = derive_buy_account_overrides(buffered_txs);
                     if account_overrides.creator_pubkey.is_none() {
-                        account_overrides.creator_pubkey =
-                            Pubkey::try_from(pd.creator.as_str()).ok();
+                        if let Ok(pool_creator) = Pubkey::try_from(pd.creator.as_str()) {
+                            account_overrides.creator_pubkey = Some(pool_creator);
+                            account_overrides.creator_pubkey_source =
+                                Some("detected_pool.creator".to_string());
+                            account_overrides.creator_pubkey_authoritative = Some(matches!(
+                                account_overrides.buy_variant,
+                                Some(trigger::PumpfunBuyVariant::RoutedExactSolIn)
+                            ));
+                        }
                     }
                     if matches!(
                         account_overrides.buy_variant,
@@ -16679,14 +16809,32 @@ async fn active_shadow_simulation_load_precheck_receipt(
         Some(trigger::PumpfunBuyVariant::LegacyBuy)
     ) {
         if let Some(reason) = p37_shadow_probe_bonding_curve_v2_source_precheck_reason(request) {
+            let account_set_diagnostics =
+                p37_shadow_probe_account_set_diagnostics(trigger_component, request).await;
             let route_resolution = p37_shadow_probe_route_resolution_diagnostics_with_mode(
                 Some(request),
-                None,
+                Some(&account_set_diagnostics),
                 Some(reason.as_str()),
                 None,
                 working_builder_parity_mode,
             );
-            let error = route_resolution.no_executable_reason().unwrap_or(reason);
+            if p37_active_shadow_precheck_route_ready_for_missing_account(
+                request,
+                &route_resolution,
+                "bonding_curve_v2",
+            ) {
+                return None;
+            }
+            let error = route_resolution.no_executable_reason().unwrap_or_else(|| {
+                if route_resolution.route_resolution_status.as_deref()
+                    == Some("fallback_route_ready")
+                {
+                    "selected_route_handoff_mismatch:fallback_route_ready_selected_route_not_prepared"
+                        .to_string()
+                } else {
+                    reason
+                }
+            });
             return Some(crate::components::trigger::TriggerDispatchReceipt {
                 primary_outcome: Err(anyhow::anyhow!("{error}")),
                 shadow_task: None,
@@ -16703,21 +16851,33 @@ async fn active_shadow_simulation_load_precheck_receipt(
         .await;
     let error = match precheck_result {
         Ok(Some(missing)) => {
+            let missing_role = missing.role.clone();
+            let missing_pubkey = missing.pubkey;
+            let missing_pubkey_string = missing_pubkey.to_string();
+            let account_set_diagnostics =
+                p37_shadow_probe_account_set_diagnostics(trigger_component, request).await;
             let route_resolution = p37_shadow_probe_route_resolution_diagnostics_with_mode(
                 Some(request),
+                Some(&account_set_diagnostics),
                 None,
-                None,
-                Some((missing.role.as_str(), &missing.pubkey.to_string())),
+                Some((missing_role.as_str(), missing_pubkey_string.as_str())),
                 working_builder_parity_mode,
             );
+            if p37_active_shadow_precheck_route_ready_for_missing_account(
+                request,
+                &route_resolution,
+                missing_role.as_str(),
+            ) {
+                return None;
+            }
             if let Some(reason) = route_resolution.no_executable_reason() {
                 anyhow::anyhow!("{reason}")
             } else {
                 anyhow::anyhow!(
                     "{}",
                     p37_shadow_probe_execution_account_not_ready_reason(
-                        &missing.role,
-                        &missing.pubkey
+                        &missing_role,
+                        &missing_pubkey
                     )
                 )
             }
@@ -18410,7 +18570,6 @@ fn derive_buy_account_overrides(
         }
         if overrides.buy_variant.is_none() {
             overrides.buy_variant = tx.buy_variant.as_deref().and_then(|value| match value {
-                "legacy_buy" => Some(trigger::PumpfunBuyVariant::LegacyBuy),
                 "routed_exact_sol_in" => Some(trigger::PumpfunBuyVariant::RoutedExactSolIn),
                 _ => None,
             });
@@ -19960,34 +20119,48 @@ async fn fetch_chain_truth_signatures(
         .ok_or_else(|| "rpc_client_unavailable".to_string())?;
     let pool_pubkey =
         Pubkey::from_str(&window.pool_id).map_err(|err| format!("invalid_pool_id:{}", err))?;
-    let parser = BinaryParser::new(false);
-    if let Some(base_mint) = &window.base_mint {
-        parser.set_curve_mapping(&window.pool_id, base_mint);
-    }
 
     let block_time_start_sec = window.t0_ms.saturating_sub(1_000) / 1_000;
     let block_time_end_sec = window.t_end_ms.saturating_add(1_000) / 1_000;
-    let tx_config = RpcTransactionConfig {
-        encoding: Some(UiTransactionEncoding::Base64),
-        commitment: Some(CommitmentConfig::confirmed()),
-        max_supported_transaction_version: Some(0),
-    };
 
     let mut before: Option<Signature> = None;
     let mut signature_infos = Vec::new();
-    for _ in 0..5 {
-        let batch = rpc_client
+    for _ in 0..COVERAGE_AUDIT_SIGNATURE_MAX_PAGES {
+        throttle_coverage_audit_rpc().await;
+        let batch = match rpc_client
             .get_signatures_for_address_with_config(
                 &pool_pubkey,
                 GetConfirmedSignaturesForAddress2Config {
                     before,
                     until: None,
-                    limit: Some(1_000),
+                    limit: Some(COVERAGE_AUDIT_SIGNATURE_PAGE_LIMIT),
                     commitment: Some(CommitmentConfig::confirmed()),
                 },
             )
             .await
-            .map_err(|err| format!("get_signatures_failed:{}", err))?;
+        {
+            Ok(batch) => batch,
+            Err(err) => {
+                let err_string = err.to_string();
+                if !is_coverage_audit_rate_limit_error(&err_string) {
+                    return Err(format!("get_signatures_failed:{}", err_string));
+                }
+                coverage_audit_rate_limit_backoff().await;
+                throttle_coverage_audit_rpc().await;
+                rpc_client
+                    .get_signatures_for_address_with_config(
+                        &pool_pubkey,
+                        GetConfirmedSignaturesForAddress2Config {
+                            before,
+                            until: None,
+                            limit: Some(COVERAGE_AUDIT_SIGNATURE_PAGE_LIMIT),
+                            commitment: Some(CommitmentConfig::confirmed()),
+                        },
+                    )
+                    .await
+                    .map_err(|retry_err| format!("get_signatures_failed:{}", retry_err))?
+            }
+        };
         if batch.is_empty() {
             break;
         }
@@ -20016,30 +20189,55 @@ async fn fetch_chain_truth_signatures(
 
     let mut truth_signatures: HashMap<String, CoverageAuditTruthSignatureState> = HashMap::new();
     for info in signature_infos {
-        let signature = match Signature::from_str(&info.signature) {
-            Ok(signature) => signature,
-            Err(_) => continue,
-        };
-        let tx = match rpc_client
-            .get_transaction_with_config(&signature, tx_config)
-            .await
-        {
-            Ok(tx) => tx,
-            Err(_) => continue,
-        };
-        let Some(event) = build_seer_geyser_event_from_confirmed_tx(&tx, &signature) else {
-            continue;
-        };
-        let trades = match parser.parse_trades(&event) {
-            Ok(trades) => trades,
-            Err(_) => continue,
-        };
-        for trade in trades {
-            merge_truth_trade(&mut truth_signatures, window, &trade);
-        }
+        let failed = info.err.is_some();
+        let time_source = info
+            .block_time
+            .map(|_| "rpc_signature_block_time".to_string());
+        truth_signatures
+            .entry(info.signature)
+            .and_modify(|existing| {
+                existing.failed |= failed;
+                if existing.time_source.is_none() {
+                    existing.time_source = time_source.clone();
+                }
+            })
+            .or_insert_with(|| CoverageAuditTruthSignatureState {
+                failed,
+                time_source,
+            });
     }
 
     Ok(truth_signatures)
+}
+
+async fn throttle_coverage_audit_rpc() {
+    fn last_request_at() -> &'static TokioMutex<Option<Instant>> {
+        static LAST_REQUEST_AT: OnceLock<TokioMutex<Option<Instant>>> = OnceLock::new();
+        LAST_REQUEST_AT.get_or_init(|| TokioMutex::new(None))
+    }
+
+    let mut last_request_at = last_request_at().lock().await;
+    if let Some(previous_request_at) = *last_request_at {
+        let min_interval = Duration::from_millis(COVERAGE_AUDIT_RPC_MIN_INTERVAL_MS);
+        let elapsed = previous_request_at.elapsed();
+        if elapsed < min_interval {
+            tokio::time::sleep(min_interval - elapsed).await;
+        }
+    }
+    *last_request_at = Some(Instant::now());
+}
+
+fn is_coverage_audit_rate_limit_error(err: &str) -> bool {
+    err.contains("429")
+        || err.contains("Too Many Requests")
+        || err.contains("exceeded its compute units per second capacity")
+}
+
+async fn coverage_audit_rate_limit_backoff() {
+    tokio::time::sleep(Duration::from_millis(
+        COVERAGE_AUDIT_RPC_RATE_LIMIT_BACKOFF_MS,
+    ))
+    .await;
 }
 
 fn spawn_coverage_audit_for_closed_window(
@@ -21760,6 +21958,9 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                             "🔮 OBSLUGUJE EVENT NewPoolDetected: pool={}",
                             pool_data.pool_amm_id
                         );
+                        if let Some(emitter) = ctx.event_emitter.as_ref() {
+                            emit_new_pool_detected_evidence_event(emitter, &pool_data);
+                        }
                         let registered_wall_ts_ms = current_time_ms();
 
                         if let Ok(candidate) = build_enhanced_candidate_from_pool_data(
@@ -22801,6 +23002,29 @@ mod tests {
         assert_eq!(
             category.as_deref(),
             Some("simulation_slippage_or_price_mismatch")
+        );
+    }
+
+    #[test]
+    fn p37_shadow_probe_maps_pumpfun_custom_6024_as_amount_overflow() {
+        let (error_name, family, category) =
+            p37_shadow_probe_program_error_mapping(Some(PUMPFUN_PROGRAM_ID), Some(6024));
+
+        assert_eq!(error_name.as_deref(), Some("overflow"));
+        assert_eq!(family.as_deref(), Some("legacy_buy_amount_constraint"));
+        assert_eq!(category.as_deref(), Some("simulation_amount_overflow"));
+    }
+
+    #[test]
+    fn p37_shadow_probe_maps_pumpfun_custom_6062_as_buyback_missing() {
+        let (error_name, family, category) =
+            p37_shadow_probe_program_error_mapping(Some(PUMPFUN_PROGRAM_ID), Some(6062));
+
+        assert_eq!(error_name.as_deref(), Some("buyback_fee_recipient_missing"));
+        assert_eq!(family.as_deref(), Some("legacy_buy_account_constraint"));
+        assert_eq!(
+            category.as_deref(),
+            Some("simulation_account_layout_mismatch")
         );
     }
 
@@ -25378,6 +25602,95 @@ mod tests {
         assert_eq!(resolution.legacy_buy_route_ready, Some(true));
         assert_eq!(resolution.legacy_buy_route_not_ready_reason, None);
         assert_eq!(resolution.no_executable_route_account_set_reason, None);
+    }
+
+    #[test]
+    fn active_shadow_precheck_treats_ready_legacy_route_as_resolved_missing_curve() {
+        let mut request = test_prepared_buy_request();
+        let legacy_curve_pubkey = Pubkey::new_unique();
+        request.account_overrides.buy_variant = Some(trigger::PumpfunBuyVariant::LegacyBuy);
+        request.account_overrides.legacy_buy_curve = Some(p37_shadow_probe_test_legacy_curve());
+        request.account_overrides.legacy_buy_curve_pubkey = Some(legacy_curve_pubkey);
+        request.account_overrides.legacy_buy_curve_source =
+            Some("materialized_feature_set".to_string());
+        request.account_overrides.legacy_buy_curve_authority_status =
+            Some("authoritative_mfs".to_string());
+        let diagnostics = P37ShadowProbeAccountSetDiagnostics {
+            manifest: vec![p37_shadow_probe_test_legacy_curve_manifest_entry(
+                legacy_curve_pubkey,
+            )],
+            manifest_lookup_performed: true,
+            ..Default::default()
+        };
+
+        let resolution = p37_shadow_probe_route_resolution_diagnostics(
+            Some(&request),
+            Some(&diagnostics),
+            None,
+            Some(("bonding_curve", legacy_curve_pubkey.to_string().as_str())),
+        );
+
+        assert_eq!(
+            resolution.route_resolution_status.as_deref(),
+            Some("primary_route_ready")
+        );
+        assert!(p37_active_shadow_precheck_route_ready_for_missing_account(
+            &request,
+            &resolution,
+            "bonding_curve"
+        ));
+    }
+
+    #[test]
+    fn active_shadow_precheck_does_not_treat_unapplied_fallback_as_current_request_ready() {
+        let mut request = test_prepared_buy_request();
+        let bcv2 = Pubkey::new_unique().to_string();
+        let legacy_curve_pubkey = Pubkey::new_unique();
+        request.account_overrides.buy_variant = Some(trigger::PumpfunBuyVariant::RoutedExactSolIn);
+        request.account_overrides.legacy_buy_curve = Some(p37_shadow_probe_test_legacy_curve());
+        request.account_overrides.legacy_buy_curve_pubkey = Some(legacy_curve_pubkey);
+        request.account_overrides.legacy_buy_curve_source =
+            Some("materialized_feature_set".to_string());
+        request.account_overrides.legacy_buy_curve_authority_status =
+            Some("authoritative_mfs".to_string());
+        let diagnostics = P37ShadowProbeAccountSetDiagnostics {
+            manifest: vec![
+                p37_shadow_probe_test_legacy_curve_manifest_entry(legacy_curve_pubkey),
+                p37_shadow_probe_route_compatible_bcv2_manifest_entry(bcv2.clone()),
+            ],
+            missing_candidates: vec![P37ShadowProbeAccountNotFoundCandidate {
+                pubkey: bcv2.clone(),
+                role: "bonding_curve_v2".to_string(),
+                source: "observed_tx_account_meta".to_string(),
+                instruction_index: Some(0),
+                account_index: Some(16),
+                required: true,
+                ..Default::default()
+            }],
+            manifest_lookup_performed: true,
+            ..Default::default()
+        };
+
+        let resolution = p37_shadow_probe_route_resolution_diagnostics(
+            Some(&request),
+            Some(&diagnostics),
+            None,
+            Some(("bonding_curve_v2", bcv2.as_str())),
+        );
+
+        assert_eq!(
+            resolution.route_resolution_status.as_deref(),
+            Some("fallback_route_ready")
+        );
+        assert_eq!(
+            resolution.selected_route_kind.as_deref(),
+            Some("legacy_buy")
+        );
+        assert!(!p37_active_shadow_precheck_route_ready_for_missing_account(
+            &request,
+            &resolution,
+            "bonding_curve_v2"
+        ));
     }
 
     #[test]

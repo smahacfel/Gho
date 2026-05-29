@@ -2572,15 +2572,36 @@ impl TriggerComponent {
 
     fn validate_creator_pubkey_for_buy(
         mint: &Pubkey,
-        creator_pubkey: Option<Pubkey>,
+        buy_variant: trigger::PumpfunBuyVariant,
+        account_overrides: &BuyAccountOverrides,
     ) -> Result<()> {
-        match creator_pubkey {
-            Some(pubkey) if pubkey != Pubkey::default() => Ok(()),
-            _ => bail!(
+        if !matches!(
+            account_overrides.creator_pubkey,
+            Some(pubkey) if pubkey != Pubkey::default()
+        ) {
+            bail!(
                 "Missing canonical creator_pubkey for trigger buy: mint={} refusing to derive creator_vault from default pubkey",
                 mint
-            ),
+            );
         }
+
+        if matches!(buy_variant, trigger::PumpfunBuyVariant::LegacyBuy)
+            && account_overrides.creator_pubkey_authoritative == Some(false)
+        {
+            bail!(
+                "creator_vault_source_not_authoritative:legacy_buy:{}:{}",
+                account_overrides
+                    .creator_pubkey_source
+                    .as_deref()
+                    .unwrap_or("creator_pubkey_source_unknown"),
+                account_overrides
+                    .creator_pubkey
+                    .map(|pubkey| pubkey.to_string())
+                    .unwrap_or_else(|| "missing_creator_pubkey".to_string())
+            );
+        }
+
+        Ok(())
     }
 
     fn validate_buy_remaining_accounts_for_buy(
@@ -2588,15 +2609,27 @@ impl TriggerComponent {
         account_overrides: &BuyAccountOverrides,
     ) -> Result<()> {
         let count = account_overrides.buy_remaining_accounts.len();
-        if DirectBuyBuilder::valid_buyback_remaining_account_count(count) {
-            return Ok(());
+        if matches!(
+            account_overrides.buy_variant,
+            Some(trigger::PumpfunBuyVariant::LegacyBuy)
+        ) && count != trigger::PUMPFUN_BUYBACK_REMAINING_ACCOUNT_COUNT
+        {
+            bail!(
+                "legacy_buy_missing_buyback_remaining_accounts:mint={} count={} expected={}",
+                mint,
+                count,
+                trigger::PUMPFUN_BUYBACK_REMAINING_ACCOUNT_COUNT
+            );
         }
-        bail!(
-            "Invalid Pump.fun buyback remaining account count for trigger buy: mint={} count={} expected=0_or_{}",
-            mint,
-            count,
-            trigger::PUMPFUN_BUYBACK_REMAINING_ACCOUNT_COUNT
-        );
+        if !DirectBuyBuilder::valid_buyback_remaining_account_count(count) {
+            bail!(
+                "Invalid Pump.fun buyback remaining account count for trigger buy: mint={} count={} expected=0_or_{}",
+                mint,
+                count,
+                trigger::PUMPFUN_BUYBACK_REMAINING_ACCOUNT_COUNT
+            );
+        }
+        Ok(())
     }
 
     fn validate_payer_balance_for_buy(
@@ -2700,9 +2733,7 @@ impl TriggerComponent {
         let buy_variant = account_overrides
             .buy_variant
             .unwrap_or(trigger::PumpfunBuyVariant::RoutedExactSolIn);
-        if matches!(buy_variant, trigger::PumpfunBuyVariant::RoutedExactSolIn) {
-            Self::validate_creator_pubkey_for_buy(mint, account_overrides.creator_pubkey)?;
-        }
+        Self::validate_creator_pubkey_for_buy(mint, buy_variant, account_overrides)?;
         Self::validate_buy_remaining_accounts_for_buy(mint, account_overrides)?;
         let token_param_role = match buy_variant {
             trigger::PumpfunBuyVariant::LegacyBuy => "token_amount",
@@ -3251,9 +3282,20 @@ impl TriggerComponent {
                     )
                 })?;
                 let entry_token_amount_raw = curve.simulate_buy(amount_lamports);
+                let min_tokens_out = apply_configured_slippage(entry_token_amount_raw)?;
+                if min_tokens_out > curve.real_token_reserves {
+                    bail!(
+                        "legacy_buy_token_amount_exceeds_real_reserves:mint={} requested_token_amount={} real_token_reserves={} simulated_tokens_out={} amount_lamports={}",
+                        mint,
+                        min_tokens_out,
+                        curve.real_token_reserves,
+                        entry_token_amount_raw,
+                        amount_lamports
+                    );
+                }
                 Ok(ResolvedBuyTokenParam {
                     entry_token_amount_raw: Some(entry_token_amount_raw),
-                    min_tokens_out: apply_configured_slippage(entry_token_amount_raw)?,
+                    min_tokens_out,
                 })
             }
         }
@@ -6841,7 +6883,10 @@ mod tests {
             apply_slippage_bps(curve.simulate_buy(expected_amount), 2_000).max(1);
         let overrides = BuyAccountOverrides {
             creator_pubkey: Some(Pubkey::new_unique()),
+            creator_pubkey_source: Some("unit_test.creator".to_string()),
+            creator_pubkey_authoritative: Some(true),
             buy_variant: Some(trigger::PumpfunBuyVariant::LegacyBuy),
+            buy_remaining_accounts: vec![Pubkey::new_unique(), Pubkey::new_unique()],
             legacy_buy_curve: Some(curve),
             ..BuyAccountOverrides::default()
         };
@@ -6860,7 +6905,7 @@ mod tests {
             .expect("legacy prepared buy request should build");
 
         assert_eq!(request.min_tokens_out, expected_token_amount);
-        let buy_ix = DirectBuyBuilder::build_buy_ix_with_accounts(
+        let buy_ix = DirectBuyBuilder::build_buy_ix_with_accounts_and_remaining(
             &payer.pubkey(),
             &mint,
             &token_program,
@@ -6869,6 +6914,8 @@ mod tests {
             overrides.creator_pubkey,
             overrides.buy_variant,
             None,
+            None,
+            &overrides.buy_remaining_accounts,
             request.amount_lamports,
             request.min_tokens_out,
         );
@@ -6879,6 +6926,155 @@ mod tests {
         assert_eq!(
             u64::from_le_bytes(buy_ix.data[16..24].try_into().unwrap()),
             expected_amount
+        );
+    }
+
+    #[test]
+    fn test_build_prepared_buy_request_rejects_legacy_without_buyback_tail() {
+        let trigger = TriggerComponent::new(create_test_config());
+        let payer = Keypair::new();
+        let mint = Pubkey::new_unique();
+        let recent_blockhash = Hash::new_unique();
+        let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).expect("valid token program");
+        let curve = BondingCurve {
+            discriminator: 0,
+            virtual_token_reserves: 1_000_000_000_000,
+            virtual_sol_reserves: 30_000_000_000,
+            real_token_reserves: 1_000_000_000_000,
+            real_sol_reserves: 30_000_000_000,
+            token_total_supply: 0,
+            complete: 0,
+            _padding: [0; 7],
+        };
+        let overrides = BuyAccountOverrides {
+            creator_pubkey: Some(Pubkey::new_unique()),
+            creator_pubkey_source: Some("unit_test.creator".to_string()),
+            creator_pubkey_authoritative: Some(true),
+            buy_variant: Some(trigger::PumpfunBuyVariant::LegacyBuy),
+            legacy_buy_curve: Some(curve),
+            ..BuyAccountOverrides::default()
+        };
+        let amount_lamports = trigger
+            .configured_trade_amount_lamports()
+            .expect("configured amount");
+
+        let err = trigger
+            .build_prepared_buy_request(
+                &payer,
+                &mint,
+                &token_program,
+                false,
+                &overrides,
+                amount_lamports,
+                0,
+                recent_blockhash,
+            )
+            .expect_err("legacy buy without buyback tail must fail closed");
+
+        assert!(
+            err.to_string()
+                .contains("legacy_buy_missing_buyback_remaining_accounts"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_build_prepared_buy_request_rejects_legacy_non_authoritative_creator() {
+        let trigger = TriggerComponent::new(create_test_config());
+        let payer = Keypair::new();
+        let mint = Pubkey::new_unique();
+        let recent_blockhash = Hash::new_unique();
+        let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).expect("valid token program");
+        let curve = BondingCurve {
+            discriminator: 0,
+            virtual_token_reserves: 1_000_000_000_000,
+            virtual_sol_reserves: 30_000_000_000,
+            real_token_reserves: 1_000_000_000_000,
+            real_sol_reserves: 30_000_000_000,
+            token_total_supply: 0,
+            complete: 0,
+            _padding: [0; 7],
+        };
+        let overrides = BuyAccountOverrides {
+            creator_pubkey: Some(Pubkey::new_unique()),
+            creator_pubkey_source: Some("detected_pool.creator".to_string()),
+            creator_pubkey_authoritative: Some(false),
+            buy_variant: Some(trigger::PumpfunBuyVariant::LegacyBuy),
+            buy_remaining_accounts: vec![Pubkey::new_unique(), Pubkey::new_unique()],
+            legacy_buy_curve: Some(curve),
+            ..BuyAccountOverrides::default()
+        };
+        let amount_lamports = trigger
+            .configured_trade_amount_lamports()
+            .expect("configured amount");
+
+        let err = trigger
+            .build_prepared_buy_request(
+                &payer,
+                &mint,
+                &token_program,
+                false,
+                &overrides,
+                amount_lamports,
+                0,
+                recent_blockhash,
+            )
+            .expect_err("legacy buy with non-authoritative creator must fail closed");
+
+        assert!(
+            err.to_string()
+                .contains("creator_vault_source_not_authoritative:legacy_buy"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_build_prepared_buy_request_rejects_legacy_amount_over_real_reserves() {
+        let trigger = TriggerComponent::new(create_test_config());
+        let payer = Keypair::new();
+        let mint = Pubkey::new_unique();
+        let recent_blockhash = Hash::new_unique();
+        let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).expect("valid token program");
+        let curve = BondingCurve {
+            discriminator: 0,
+            virtual_token_reserves: 1_000_000_000_000,
+            virtual_sol_reserves: 30_000_000_000,
+            real_token_reserves: 1,
+            real_sol_reserves: 30_000_000_000,
+            token_total_supply: 0,
+            complete: 0,
+            _padding: [0; 7],
+        };
+        let overrides = BuyAccountOverrides {
+            creator_pubkey: Some(Pubkey::new_unique()),
+            creator_pubkey_source: Some("unit_test.creator".to_string()),
+            creator_pubkey_authoritative: Some(true),
+            buy_variant: Some(trigger::PumpfunBuyVariant::LegacyBuy),
+            buy_remaining_accounts: vec![Pubkey::new_unique(), Pubkey::new_unique()],
+            legacy_buy_curve: Some(curve),
+            ..BuyAccountOverrides::default()
+        };
+        let amount_lamports = trigger
+            .configured_trade_amount_lamports()
+            .expect("configured amount");
+
+        let err = trigger
+            .build_prepared_buy_request(
+                &payer,
+                &mint,
+                &token_program,
+                false,
+                &overrides,
+                amount_lamports,
+                0,
+                recent_blockhash,
+            )
+            .expect_err("legacy buy amount above real reserves must fail closed");
+
+        assert!(
+            err.to_string()
+                .contains("legacy_buy_token_amount_exceeds_real_reserves"),
+            "unexpected error: {err}"
         );
     }
 
@@ -7004,7 +7200,10 @@ mod tests {
             .expect("configured amount");
         let overrides = BuyAccountOverrides {
             creator_pubkey: Some(Pubkey::new_unique()),
+            creator_pubkey_source: Some("unit_test.creator".to_string()),
+            creator_pubkey_authoritative: Some(true),
             buy_variant: Some(trigger::PumpfunBuyVariant::LegacyBuy),
+            buy_remaining_accounts: vec![Pubkey::new_unique(), Pubkey::new_unique()],
             ..BuyAccountOverrides::default()
         };
 
@@ -8740,11 +8939,15 @@ mod tests {
                 &token_program,
                 false,
                 &BuyAccountOverrides {
+                    creator_pubkey: Some(Pubkey::new_unique()),
+                    creator_pubkey_source: Some("unit_test.creator".to_string()),
+                    creator_pubkey_authoritative: Some(true),
                     buy_variant: Some(trigger::PumpfunBuyVariant::LegacyBuy),
                     legacy_buy_curve: Some(curve),
                     associated_bonding_curve: Some(
                         DirectBuyBuilder::canonical_associated_bonding_curve(&mint, &token_program),
                     ),
+                    buy_remaining_accounts: vec![Pubkey::new_unique(), Pubkey::new_unique()],
                     ..BuyAccountOverrides::default()
                 },
                 amount_lamports,
@@ -8759,7 +8962,11 @@ mod tests {
             .buy_instruction
             .accounts;
 
-        assert_eq!(buy_accounts.len(), trigger::PUMPFUN_BUY_FIXED_ACCOUNT_COUNT);
+        assert_eq!(
+            buy_accounts.len(),
+            trigger::PUMPFUN_BUY_FIXED_ACCOUNT_COUNT
+                + trigger::PUMPFUN_BUYBACK_REMAINING_ACCOUNT_COUNT
+        );
         assert_eq!(
             TriggerComponent::counterfactual_probe_account_role_for(
                 &request,
@@ -8873,7 +9080,7 @@ mod tests {
     }
 
     #[test]
-    fn e5a_prepared_legacy_buy_final_manifest_without_observed_remaining_accounts_has_no_bcv2() {
+    fn e5a_prepared_legacy_buy_final_manifest_with_observed_remaining_accounts_has_no_bcv2() {
         let config = create_test_config();
         let trigger =
             TriggerComponent::new_with_shadow_simulator(config, Arc::new(MockShadowSimulator));
@@ -8900,11 +9107,15 @@ mod tests {
                 &token_program,
                 false,
                 &BuyAccountOverrides {
+                    creator_pubkey: Some(Pubkey::new_unique()),
+                    creator_pubkey_source: Some("unit_test.creator".to_string()),
+                    creator_pubkey_authoritative: Some(true),
                     buy_variant: Some(trigger::PumpfunBuyVariant::LegacyBuy),
                     legacy_buy_curve: Some(curve),
                     associated_bonding_curve: Some(
                         DirectBuyBuilder::canonical_associated_bonding_curve(&mint, &token_program),
                     ),
+                    buy_remaining_accounts: vec![Pubkey::new_unique(), Pubkey::new_unique()],
                     ..BuyAccountOverrides::default()
                 },
                 amount_lamports,
@@ -8920,7 +9131,11 @@ mod tests {
             trigger::PumpfunBuyVariant::LegacyBuy
         );
         assert!(request.account_overrides.bonding_curve_v2.is_none());
-        assert_eq!(buy_accounts.len(), trigger::PUMPFUN_BUY_FIXED_ACCOUNT_COUNT);
+        assert_eq!(
+            buy_accounts.len(),
+            trigger::PUMPFUN_BUY_FIXED_ACCOUNT_COUNT
+                + trigger::PUMPFUN_BUYBACK_REMAINING_ACCOUNT_COUNT
+        );
         assert!(!buy_accounts
             .iter()
             .any(|account| account.pubkey == DirectBuyBuilder::derive_bonding_curve_v2(&mint).0));

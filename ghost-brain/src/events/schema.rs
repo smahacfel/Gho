@@ -119,6 +119,9 @@ impl ExecutionEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum EventKind {
+    // ── Ingest / selector evidence ──────────────────────────────────────
+    NewPoolDetected(NewPoolDetectedPayload),
+
     // ── Mandatory (12) ──────────────────────────────────────────────────
     Candidate(CandidatePayload),
     EntrySubmitted(EntrySubmittedPayload),
@@ -143,6 +146,7 @@ impl EventKind {
     /// Returns the event type name as a string (for logging / filtering).
     pub fn type_name(&self) -> &'static str {
         match self {
+            Self::NewPoolDetected(_) => "NewPoolDetected",
             Self::Candidate(_) => "Candidate",
             Self::EntrySubmitted(_) => "EntrySubmitted",
             Self::EntryFilled(_) => "EntryFilled",
@@ -171,6 +175,50 @@ impl EventKind {
 }
 
 // ─── Payloads ───────────────────────────────────────────────────────────────
+
+/// Durable birth/create event for selector dataset construction.
+///
+/// This is an ingest evidence event, not a Gatekeeper decision or lifecycle
+/// label. It intentionally contains only identity/provenance available at
+/// `NewPoolDetected` time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewPoolDetectedPayload {
+    /// Explicit marker consumed by offline selector universe builders.
+    pub is_birth_event: bool,
+    /// Pool AMM ID.
+    pub pool_amm_id: String,
+    /// Alias used by selector normalizers.
+    pub pool_id: String,
+    /// Base token mint.
+    pub base_mint: String,
+    /// Alias used by selector normalizers.
+    pub mint_id: String,
+    /// Quote token mint.
+    pub quote_mint: String,
+    /// Pump.fun bonding curve address.
+    pub bonding_curve: String,
+    /// Creator/deployer wallet address when available from ingest.
+    pub creator: String,
+    /// AMM program ID.
+    pub amm_program: String,
+    /// Source transaction signature for the create/birth event.
+    pub signature: String,
+    /// Selector birth timestamp in epoch milliseconds.
+    pub birth_ts_ms: u64,
+    /// Alias retained for historical artifact normalizers.
+    pub timestamp_ms: u64,
+    /// Chain slot when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_slot: Option<u64>,
+    /// Local wall-clock timestamp of launcher detection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detected_wall_ts_ms: Option<u64>,
+    /// Effective chain/event timestamp if provided by ingest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chain_event_ts_ms: Option<u64>,
+    /// Source label for offline provenance.
+    pub source: String,
+}
 
 /// 1. CandidateEvent — Gatekeeper PASS
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -494,6 +542,27 @@ mod tests {
         });
         assert_eq!(kind.type_name(), "EntrySubmitted");
         assert!(!kind.is_optional());
+
+        let birth_kind = EventKind::NewPoolDetected(NewPoolDetectedPayload {
+            is_birth_event: true,
+            pool_amm_id: "pool".to_string(),
+            pool_id: "pool".to_string(),
+            base_mint: "mint".to_string(),
+            mint_id: "mint".to_string(),
+            quote_mint: "SOL".to_string(),
+            bonding_curve: "curve".to_string(),
+            creator: "creator".to_string(),
+            amm_program: "pumpfun".to_string(),
+            signature: "sig".to_string(),
+            birth_ts_ms: 1_700_000_000_000,
+            timestamp_ms: 1_700_000_000_000,
+            event_slot: Some(123),
+            detected_wall_ts_ms: Some(1_700_000_000_100),
+            chain_event_ts_ms: Some(1_700_000_000_000),
+            source: "seer_new_pool_detected".to_string(),
+        });
+        assert_eq!(birth_kind.type_name(), "NewPoolDetected");
+        assert!(!birth_kind.is_optional());
     }
 
     #[test]
@@ -511,6 +580,27 @@ mod tests {
         // Verify that all event kinds can be serialized to JSON
         let env = make_envelope();
         let events = vec![
+            ExecutionEvent::new(
+                env.derive(0),
+                EventKind::NewPoolDetected(NewPoolDetectedPayload {
+                    is_birth_event: true,
+                    pool_amm_id: "pool".to_string(),
+                    pool_id: "pool".to_string(),
+                    base_mint: "mint".to_string(),
+                    mint_id: "mint".to_string(),
+                    quote_mint: "SOL".to_string(),
+                    bonding_curve: "curve".to_string(),
+                    creator: "creator".to_string(),
+                    amm_program: "pumpfun".to_string(),
+                    signature: "sig".to_string(),
+                    birth_ts_ms: 1,
+                    timestamp_ms: 1,
+                    event_slot: Some(1),
+                    detected_wall_ts_ms: Some(2),
+                    chain_event_ts_ms: Some(1),
+                    source: "seer_new_pool_detected".to_string(),
+                }),
+            ),
             ExecutionEvent::new(
                 env.derive(1),
                 EventKind::Candidate(CandidatePayload {

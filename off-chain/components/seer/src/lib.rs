@@ -73,8 +73,10 @@ pub mod websocket_connection;
 
 pub use crate::curve_parser::{parse_curve_from_account, ParseCurveError};
 pub use crate::rpc_http_client::{
-    new_async_rpc_client, new_async_rpc_client_with_timeout, new_blocking_rpc_client,
-    new_blocking_rpc_client_with_timeout, RPC_HTTP_USER_AGENT,
+    configure_rpc_http_auth, new_async_rpc_client, new_async_rpc_client_with_timeout,
+    new_blocking_rpc_client, new_blocking_rpc_client_with_timeout, rpc_http_auth_applies_to_url,
+    DEFAULT_RPC_AUTH_HEADER, LEGACY_PROVIDER_AUTH_HEADER_ENV, LEGACY_PROVIDER_AUTH_TOKEN_ENV,
+    RPC_HTTP_AUTH_HEADER_ENV, RPC_HTTP_AUTH_TOKEN_ENV, RPC_HTTP_USER_AGENT,
 };
 
 use binary_parser::{BinaryParser, PumpAccountState};
@@ -1383,6 +1385,11 @@ impl Seer {
                             Some(config.rpc_endpoint.clone()),
                         )
                         .with_subscription_profile(subscription_profile)
+                        .with_stall_timeout_secs(config.grpc_stall_timeout_secs)
+                        .with_circuit_breaker_config(
+                            config.grpc_max_stalls_before_open,
+                            config.grpc_circuit_breaker_cooldown_ms,
+                        )
                         .with_manual_backfill_enabled(manual_backfill_enabled)
                         .with_stream_config(
                             config.stream_mode.clone(),
@@ -1673,10 +1680,11 @@ impl Seer {
         info!("Effective source mode: {:?}", effective_mode);
         info!("Pump.fun enabled: {}", self.config.filter.enable_pumpfun);
         info!(
-            "Stream mode: {:?} | tx_filter_strategy: {:?} | funding_lane_mode={} | watched_pools_ttl_ms={} | watched_pools_cap={} | watch_debounce_ms={} | event_worker_concurrency={}",
+            "Stream mode: {:?} | tx_filter_strategy: {:?} | funding_lane_mode={} | grpc_stall_timeout_secs={} | watched_pools_ttl_ms={} | watched_pools_cap={} | watch_debounce_ms={} | event_worker_concurrency={}",
             self.config.stream_mode,
             self.config.tx_filter_strategy,
             self.config.funding_lane_mode.as_str(),
+            self.config.grpc_stall_timeout_secs,
             self.config.watched_pools_ttl_ms,
             self.config.watched_pools_cap,
             self.config.watch_debounce_ms,

@@ -271,6 +271,12 @@ fn load_config() -> SeerConfig {
         config.grpc_max_stalls_before_open = max_stalls.parse().unwrap_or(3);
     }
 
+    if let Ok(stall_timeout_secs) = std::env::var("SEER_GRPC_STALL_TIMEOUT_SECS") {
+        config.grpc_stall_timeout_secs = stall_timeout_secs
+            .parse()
+            .unwrap_or_else(|_| SeerConfig::default_grpc_stall_timeout_secs());
+    }
+
     if let Ok(cooldown_ms) = std::env::var("SEER_GRPC_CIRCUIT_BREAKER_COOLDOWN_MS") {
         config.grpc_circuit_breaker_cooldown_ms = cooldown_ms.parse().unwrap_or(15_000);
     }

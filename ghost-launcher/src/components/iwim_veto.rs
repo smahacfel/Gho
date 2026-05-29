@@ -657,9 +657,6 @@ mod tests {
         assert_eq!(configured_rpc_url("${GHOST_TRIGGER_RPC_URL}"), None);
         assert_eq!(configured_rpc_url("primary"), None);
         assert_eq!(configured_rpc_url("runtime"), None);
-        assert_eq!(
-            configured_rpc_url("rpc.nln.clr3.org"),
-            None
-        );
+        assert_eq!(configured_rpc_url("rpc.nln.clr3.org"), None);
     }
 }

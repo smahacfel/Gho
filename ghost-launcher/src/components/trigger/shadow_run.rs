@@ -800,6 +800,8 @@ fn extract_shadow_error_code(err: &str) -> Option<&'static str> {
         Some("6000")
     } else if lower.contains("custom(6062)") {
         Some("6062")
+    } else if lower.contains("custom(6024)") || lower.contains("overflow") {
+        Some("6024")
     } else {
         None
     }
@@ -812,7 +814,9 @@ fn classify_shadow_error_detail(err: &str) -> Option<&'static str> {
     } else if lower.contains("custom(6000)") || lower.contains("notauthorized") {
         Some("protocol_not_authorized")
     } else if lower.contains("custom(6062)") {
-        Some("protocol_constraint_6062")
+        Some("buyback_fee_recipient_missing")
+    } else if lower.contains("custom(6024)") || lower.contains("overflow") {
+        Some("legacy_buy_amount_overflow")
     } else {
         None
     }
@@ -1637,7 +1641,13 @@ mod tests {
         assert_eq!(extract_shadow_error_code(err_6062), Some("6062"));
         assert_eq!(
             classify_shadow_error_detail(err_6062),
-            Some("protocol_constraint_6062")
+            Some("buyback_fee_recipient_missing")
+        );
+        let err_6024 = "InstructionError(3, Custom(6024))";
+        assert_eq!(extract_shadow_error_code(err_6024), Some("6024"));
+        assert_eq!(
+            classify_shadow_error_detail(err_6024),
+            Some("legacy_buy_amount_overflow")
         );
     }
 

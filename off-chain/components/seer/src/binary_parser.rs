@@ -3412,6 +3412,39 @@ impl Bcv2RpcHydrationEvidence {
     }
 }
 
+fn bcv2_rpc_error_class(kind_debug: &str, err_text: &str) -> String {
+    let combined = format!("{kind_debug} {err_text}");
+    let combined_lower = combined.to_ascii_lowercase();
+    if combined_lower.contains("services are paused due to unpaid invoices")
+        || combined_lower.contains("unpaid invoices")
+    {
+        return "rpc_provider_disabled:http_403".to_string();
+    }
+    if combined.contains("401 Unauthorized") || combined.contains("HTTP status client error (401") {
+        return "rpc_auth_error:http_401".to_string();
+    }
+    if combined.contains("403 Forbidden") || combined.contains("HTTP status client error (403") {
+        return "rpc_auth_error:http_403".to_string();
+    }
+    if combined.contains("429 Too Many Requests")
+        || combined.contains("HTTP status client error (429")
+    {
+        return "rpc_rate_limited:http_429".to_string();
+    }
+    if combined.contains("HTTP status server error (502") || combined.contains("502 Bad Gateway") {
+        return "rpc_transport_error:http_502".to_string();
+    }
+    if combined.contains("HTTP status server error")
+        || combined.contains("HTTP status client error")
+    {
+        return format!("rpc_transport_error:{kind_debug}");
+    }
+    if combined.contains("AccountNotFound") {
+        return "missing_on_rpc".to_string();
+    }
+    format!("rpc_error:{kind_debug}")
+}
+
 fn bcv2_now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3732,11 +3765,15 @@ async fn run_bcv2_hydration_worker(
                             ),
                         }
                     }
-                    Ok(Err(err)) => Bcv2RpcHydrationEvidence::missing(
-                        None,
-                        format!("rpc_error:{:?}", err.kind()),
-                        latency_ms,
-                    ),
+                    Ok(Err(err)) => {
+                        let kind_debug = format!("{:?}", err.kind());
+                        let err_text = err.to_string();
+                        Bcv2RpcHydrationEvidence::missing(
+                            None,
+                            bcv2_rpc_error_class(&kind_debug, &err_text),
+                            latency_ms,
+                        )
+                    }
                     Err(_) => Bcv2RpcHydrationEvidence::missing(None, "timeout", latency_ms),
                 }
             }
@@ -10743,6 +10780,35 @@ mod tests {
         assert_eq!(evidence.latency_ms, 9);
         assert!(evidence.owner.is_none());
         assert!(evidence.data_len.is_none());
+    }
+
+    #[test]
+    fn bcv2_hydration_rpc_error_class_separates_transport_from_missing_account() {
+        assert_eq!(
+            bcv2_rpc_error_class(
+                r#"RpcError(ForUser("AccountNotFound: pubkey=abc: HTTP status server error (502 Bad Gateway) for url (https://rpc.example/)"))"#,
+                ""
+            ),
+            "rpc_transport_error:http_502"
+        );
+        assert_eq!(
+            bcv2_rpc_error_class(r#"RpcError(ForUser("AccountNotFound"))"#, "AccountNotFound"),
+            "missing_on_rpc"
+        );
+        assert_eq!(
+            bcv2_rpc_error_class(
+                r#"RpcError(ForUser("HTTP status client error (429 Too Many Requests)"))"#,
+                ""
+            ),
+            "rpc_rate_limited:http_429"
+        );
+        assert_eq!(
+            bcv2_rpc_error_class(
+                r#"RpcError(ForUser("HTTP status client error (403 Forbidden)"))"#,
+                r#"The services are paused due to unpaid invoices on your account."#
+            ),
+            "rpc_provider_disabled:http_403"
+        );
     }
 
     #[test]
