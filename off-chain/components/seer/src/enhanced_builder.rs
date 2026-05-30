@@ -135,6 +135,7 @@ mod tests {
         let candidate_pool = CandidatePool {
             semantic: ghost_core::EventSemanticEnvelope::default(),
             slot: Some(12345),
+            tx_index: None,
             event_ts_ms: None,
             event_time: ghost_core::EventTimeMetadata::default(),
             signature: "test".to_string(),

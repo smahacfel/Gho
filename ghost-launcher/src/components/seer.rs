@@ -1320,6 +1320,7 @@ fn detected_pool_from_candidate(
         bonding_curve: candidate.bonding_curve.to_string(),
         creator: sanitize_detected_creator(candidate.creator),
         slot: candidate.slot,
+        tx_index: candidate.tx_index,
         timestamp_ms: candidate.compat_event_ts_ms().unwrap_or(detected_ms),
         event_time: candidate.event_time,
         detected_wall_ts_ms: Some(detected_ms),
@@ -1514,6 +1515,7 @@ fn emit_funding_transfer_to_event_bus(
         semantic: funding_event.transfer.semantic.clone(),
         slot: funding_event.transfer.slot,
         event_ordinal: funding_event.transfer.event_ordinal,
+        tx_index: funding_event.transfer.tx_index,
         outer_instruction_index: funding_event.transfer.outer_instruction_index,
         inner_group_index: funding_event.transfer.inner_group_index,
         cpi_stack_height: funding_event.transfer.cpi_stack_height,
@@ -2333,6 +2335,7 @@ pub fn trade_event_to_pool_transaction(
         pool_amm_id: trade.pool_amm_id.to_string(),
         slot: trade.slot,
         event_ordinal: trade.event_ordinal,
+        tx_index: trade.tx_index,
         outer_instruction_index: trade
             .provenance
             .as_ref()
@@ -2458,6 +2461,7 @@ mod tests {
         CandidatePool {
             semantic: ghost_core::EventSemanticEnvelope::default(),
             slot: Some(11),
+            tx_index: None,
             event_ts_ms: Some(11_000),
             event_time: ghost_core::EventTimeMetadata::default(),
             signature: Signature::new_unique().to_string(),
@@ -2488,6 +2492,7 @@ mod tests {
             slot: Some(1),
             signature: Signature::new_unique(),
             event_ordinal: Some(7),
+            tx_index: None,
             provenance: None,
             timestamp_ms: 1_000,
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -2538,6 +2543,7 @@ mod tests {
             semantic: ghost_core::EventSemanticEnvelope::default(),
             slot: Some(22),
             event_ordinal: Some(4),
+            tx_index: None,
             outer_instruction_index: Some(1),
             inner_group_index: Some(1),
             cpi_stack_height: Some(2),
@@ -2767,6 +2773,16 @@ mod tests {
         let trade = make_trade(Pubkey::new_unique(), Pubkey::new_unique());
         let tx = trade_event_to_pool_transaction(&trade);
         assert_eq!(tx.event_ordinal, trade.event_ordinal);
+    }
+
+    #[test]
+    fn bridge_preserves_tx_index() {
+        let mut trade = make_trade(Pubkey::new_unique(), Pubkey::new_unique());
+        trade.tx_index = Some(123);
+
+        let tx = trade_event_to_pool_transaction(&trade);
+
+        assert_eq!(tx.tx_index, Some(123));
     }
 
     #[test]
@@ -3596,8 +3612,10 @@ mod tests {
     #[tokio::test]
     async fn seer_funding_transfer_emits_funding_transfer_observed() {
         let (tx, mut rx) = create_event_bus();
+        let mut transfer = make_funding_transfer();
+        transfer.tx_index = Some(77);
         let funding = SeerEvent::FundingTransfer(DetectedFundingTransferEvent {
-            transfer: make_funding_transfer(),
+            transfer,
             detected_at: SystemTime::now(),
             sequence_number: 7,
             priority: EventPriority::High,
@@ -3616,6 +3634,7 @@ mod tests {
                 assert_eq!(observed.signature, "funding-sig");
                 assert_eq!(observed.lamports, 50_000_000);
                 assert_eq!(observed.event_ordinal, Some(4));
+                assert_eq!(observed.tx_index, Some(77));
                 assert_eq!(observed.outer_instruction_index, Some(1));
                 assert_eq!(observed.inner_group_index, Some(1));
                 assert_eq!(observed.cpi_stack_height, Some(2));

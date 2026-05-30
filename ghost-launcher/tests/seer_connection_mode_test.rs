@@ -47,6 +47,7 @@ fn create_test_config(
         watched_pools_cap: 32_768,
         watch_debounce_ms: 0,
         commitment: SeerCommitment::default(),
+        program_streams: Default::default(),
         pumpportal: Default::default(),
     }
 }

@@ -79,6 +79,7 @@ struct FundingTransferRecord {
     observed_at_ms: u64,
     arrival_ts_ms: u64,
     event_ordinal: Option<u32>,
+    tx_index: Option<u32>,
     outer_instruction_index: Option<u32>,
     inner_group_index: Option<u32>,
     cpi_stack_height: Option<u32>,
@@ -232,6 +233,7 @@ impl FundingSourceIndex {
                     && last.observed_at_ms == observed_at_ms
                     && last.arrival_ts_ms == transfer.arrival_ts_ms
                     && last.event_ordinal == transfer.event_ordinal
+                    && last.tx_index == transfer.tx_index
                     && last.outer_instruction_index == transfer.outer_instruction_index
                     && last.inner_group_index == transfer.inner_group_index
                     && last.cpi_stack_height == transfer.cpi_stack_height
@@ -245,6 +247,7 @@ impl FundingSourceIndex {
                     observed_at_ms,
                     arrival_ts_ms: transfer.arrival_ts_ms,
                     event_ordinal: transfer.event_ordinal,
+                    tx_index: transfer.tx_index,
                     outer_instruction_index: transfer.outer_instruction_index,
                     inner_group_index: transfer.inner_group_index,
                     cpi_stack_height: transfer.cpi_stack_height,
@@ -829,6 +832,7 @@ mod tests {
             pool_amm_id: "pool-1".to_string(),
             slot: Some(1),
             event_ordinal: Some(0),
+            tx_index: None,
             outer_instruction_index: None,
             inner_group_index: None,
             outer_program_id: None,
@@ -906,6 +910,7 @@ mod tests {
             semantic: EventSemanticEnvelope::default(),
             slot: Some(1),
             event_ordinal: None,
+            tx_index: None,
             outer_instruction_index: None,
             inner_group_index: None,
             cpi_stack_height: None,

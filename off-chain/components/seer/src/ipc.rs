@@ -89,6 +89,8 @@ pub enum FundingTransferLaneKind {
     FundingLanePumpFiltered,
     /// Future dedicated authoritative full-feed funding lane.
     AuthoritativeFullFeed,
+    /// NLN Program Streams semantic transfer lane.
+    NlnProgramStreams,
 }
 
 /// Coverage class for funding provenance.
@@ -160,6 +162,15 @@ impl FundingTransferProvenance {
     }
 
     #[must_use]
+    pub const fn nln_program_streams_live(coverage_class: FundingTransferCoverageClass) -> Self {
+        Self {
+            lane_kind: FundingTransferLaneKind::NlnProgramStreams,
+            coverage_class,
+            replay_origin: FundingTransferReplayOrigin::Live,
+        }
+    }
+
+    #[must_use]
     pub fn is_legacy_default(&self) -> bool {
         *self == Self::default()
     }
@@ -172,6 +183,7 @@ impl FundingTransferLaneKind {
             FundingTransferLaneKind::GrpcGlobalStreamFiltered => "grpc_global_stream_filtered",
             FundingTransferLaneKind::FundingLanePumpFiltered => "funding_lane_pump_filtered",
             FundingTransferLaneKind::AuthoritativeFullFeed => "authoritative_full_feed",
+            FundingTransferLaneKind::NlnProgramStreams => "nln_program_streams",
         }
     }
 }
@@ -205,6 +217,10 @@ pub struct FundingTransferEvent {
     /// Stable event ordinal within the source transaction when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_ordinal: Option<u32>,
+
+    /// Transaction index within the Solana slot when the upstream feed exposes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_index: Option<u32>,
 
     /// Optional parser-side outer instruction index for execution provenance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1023,6 +1039,7 @@ mod tests {
         CandidatePool {
             semantic: ghost_core::EventSemanticEnvelope::default(),
             slot: Some(100),
+            tx_index: None,
             event_ts_ms: Some(1_234_567_890_000),
             event_time: ghost_core::EventTimeMetadata::default(),
             signature: "test_sig".to_string(),
@@ -1155,6 +1172,7 @@ mod tests {
             slot: Some(12345),
             signature: Signature::new_unique(),
             event_ordinal: Some(0),
+            tx_index: None,
             provenance: None,
             timestamp_ms: 1234567890000,
             arrival_ts_ms: 1234567890001,
@@ -1205,6 +1223,7 @@ mod tests {
             semantic: ghost_core::EventSemanticEnvelope::default(),
             slot: Some(12345),
             event_ordinal: Some(3),
+            tx_index: None,
             outer_instruction_index: Some(1),
             inner_group_index: Some(1),
             cpi_stack_height: Some(2),

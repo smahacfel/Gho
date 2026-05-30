@@ -566,6 +566,9 @@ pub struct DetectedPool {
     pub creator: String,
     /// Slot when detected
     pub slot: Option<u64>,
+    /// Transaction index within the Solana slot when the upstream feed exposes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_index: Option<u32>,
     /// Detection timestamp in epoch-milliseconds
     pub timestamp_ms: u64,
     /// Explicit provenance for event/ingest time axes.
@@ -594,6 +597,9 @@ pub struct PoolTransaction {
     /// Stable event ordinal within the source transaction, when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_ordinal: Option<u32>,
+    /// Transaction index within the Solana slot when the upstream feed exposes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_index: Option<u32>,
     /// Optional parser-side outer instruction index for execution provenance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outer_instruction_index: Option<u32>,
@@ -811,6 +817,9 @@ pub struct FundingTransferObserved {
     /// Stable event ordinal within the source transaction when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_ordinal: Option<u32>,
+    /// Transaction index within the Solana slot when the upstream feed exposes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_index: Option<u32>,
 
     /// Optional parser-side outer instruction index for execution provenance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1564,6 +1573,7 @@ mod tests {
             bonding_curve: "curve123".to_string(),
             creator: "creator123".to_string(),
             slot: Some(12345),
+            tx_index: None,
             timestamp_ms: 1700000000000,
             event_time: ghost_core::EventTimeMetadata::default(),
             detected_wall_ts_ms: Some(1700000000123),
@@ -1617,6 +1627,7 @@ mod tests {
             semantic: ghost_core::EventSemanticEnvelope::default(),
             slot: Some(42),
             event_ordinal: Some(5),
+            tx_index: None,
             outer_instruction_index: Some(1),
             inner_group_index: Some(1),
             cpi_stack_height: Some(2),
@@ -1743,6 +1754,7 @@ mod tests {
             semantic: ghost_core::EventSemanticEnvelope::default(),
             slot: Some(42),
             event_ordinal: None,
+            tx_index: None,
             outer_instruction_index: None,
             inner_group_index: None,
             cpi_stack_height: None,
@@ -1775,6 +1787,7 @@ mod tests {
             semantic: ghost_core::EventSemanticEnvelope::default(),
             slot: Some(42),
             event_ordinal: None,
+            tx_index: None,
             outer_instruction_index: None,
             inner_group_index: None,
             cpi_stack_height: None,
@@ -2057,6 +2070,7 @@ mod tests {
             bonding_curve: "curve".to_string(),
             creator: "creator".to_string(),
             slot: Some(100),
+            tx_index: None,
             timestamp_ms: 1700000000000,
             event_time: ghost_core::EventTimeMetadata::default(),
             detected_wall_ts_ms: Some(1700000000123),

@@ -1475,6 +1475,7 @@ fn convert_enhanced_to_candidate_pool(
     seer::types::CandidatePool {
         semantic: ghost_core::EventSemanticEnvelope::default(),
         slot: candidate.slot,
+        tx_index: None,
         event_ts_ms: Some(candidate.timestamp.saturating_mul(1000)),
         event_time: ghost_core::EventTimeMetadata::default(),
         signature: candidate.signature.clone(),

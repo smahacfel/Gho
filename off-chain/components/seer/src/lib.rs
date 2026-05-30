@@ -4528,6 +4528,7 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
                         semantic: semantic.clone(),
                         slot: *slot,
                         event_ordinal: transfer.event_ordinal,
+                        tx_index: None,
                         outer_instruction_index: transfer.outer_instruction_index,
                         inner_group_index: transfer.inner_group_index,
                         cpi_stack_height: transfer.cpi_stack_height,
@@ -4681,6 +4682,7 @@ mod tests {
             slot: Some(1),
             signature: Signature::new_unique(),
             event_ordinal: Some(0),
+            tx_index: None,
             provenance: None,
             timestamp_ms: 1_000,
             arrival_ts_ms: 1_000,
@@ -5183,6 +5185,7 @@ mod tests {
         let candidate = CandidatePool {
             semantic: ghost_core::EventSemanticEnvelope::default(),
             slot: Some(1),
+            tx_index: None,
             event_ts_ms: Some(1_000),
             event_time: ghost_core::EventTimeMetadata::default(),
             signature: Signature::new_unique().to_string(),
@@ -6099,6 +6102,7 @@ mod tests {
         let candidate = CandidatePool {
             semantic: ghost_core::EventSemanticEnvelope::default(),
             slot: Some(1),
+            tx_index: None,
             event_ts_ms: None,
             event_time: ghost_core::EventTimeMetadata::default(),
             signature: "sig1".to_string(),
@@ -9151,6 +9155,7 @@ mod tests {
         let candidate = types::CandidatePool {
             semantic: ghost_core::EventSemanticEnvelope::default(),
             slot: Some(1),
+            tx_index: None,
             event_ts_ms: Some(1_000_000),
             event_time: ghost_core::EventTimeMetadata::default(),
             signature: Signature::new_unique().to_string(),

@@ -9,6 +9,7 @@ mod stress_tests {
         CandidatePool {
             semantic: ghost_core::EventSemanticEnvelope::default(),
             slot: Some(999),
+            tx_index: None,
             event_ts_ms: Some(1700000000000),
             event_time: ghost_core::EventTimeMetadata::default(),
             signature: Signature::new_unique().to_string(),
@@ -36,6 +37,7 @@ mod stress_tests {
             slot: Some(999),
             signature: Signature::new_unique(),
             event_ordinal: Some(1),
+            tx_index: None,
             provenance: None,
             timestamp_ms: 1700000000000,
             event_time: ghost_core::EventTimeMetadata::default(),

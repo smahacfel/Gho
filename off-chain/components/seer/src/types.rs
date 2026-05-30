@@ -515,6 +515,14 @@ pub struct TradeEvent {
     #[serde(default)]
     pub event_ordinal: Option<u32>,
 
+    /// Transaction index within the Solana slot when the upstream feed exposes it.
+    ///
+    /// This is additive ordering metadata for FSC v2 anti-leakage. It must not
+    /// be confused with `event_ordinal`, which is local to semantic events inside
+    /// one transaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_index: Option<u32>,
+
     /// Execution-tree provenance copied from the parser event source.
     #[serde(default)]
     pub provenance: Option<InstructionProvenance>,
@@ -767,6 +775,10 @@ pub struct CandidatePool {
     /// Slot when detected
     pub slot: Option<u64>,
 
+    /// Transaction index within the Solana slot when the upstream feed exposes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_index: Option<u32>,
+
     /// Effective event timestamp in milliseconds, derived via provenance helpers.
     pub event_ts_ms: Option<u64>,
 
@@ -849,6 +861,7 @@ impl From<InitializePoolEvent> for CandidatePool {
         Self {
             semantic: EventSemanticEnvelope::default(),
             slot: event.slot,
+            tx_index: None,
             event_ts_ms: event
                 .event_ts_ms
                 .or_else(|| event_ts_from_block_time(event.block_time)),

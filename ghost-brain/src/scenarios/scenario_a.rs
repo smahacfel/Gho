@@ -40,6 +40,7 @@ impl ScenarioA {
         CandidatePool {
             semantic: ghost_core::EventSemanticEnvelope::default(),
             slot: Some(123456789),
+            tx_index: None,
             event_ts_ms: Some(1_234_567_890_000),
             event_time: ghost_core::EventTimeMetadata::default(),
             signature: "test_signature_1".repeat(4), // Make it long enough

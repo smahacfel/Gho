@@ -886,6 +886,7 @@ mod tests {
             pool_amm_id: Pubkey::new_unique().to_string(),
             slot: Some(1),
             event_ordinal: Some(0),
+            tx_index: None,
             outer_instruction_index: None,
             inner_group_index: None,
             outer_program_id: None,

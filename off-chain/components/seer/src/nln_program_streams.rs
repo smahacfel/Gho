@@ -5,13 +5,21 @@
 //! coverage from offsets. Offsets are carried as diagnostic evidence only.
 
 use crate::config::{ProgramStreamPayloadFormat, ProgramStreamsConfig};
+use crate::grpc_connection::PUMP_FUN_PROGRAM_ID;
+use crate::ipc::{FundingTransferCoverageClass, FundingTransferEvent, FundingTransferProvenance};
+use crate::types::{CandidatePool, RawBytesMissingReason, ToolchainFingerprintInput, TradeEvent};
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose, Engine as _};
 use futures::Stream;
+use ghost_core::{
+    CurveFinality, EventCompleteness, EventSemanticEnvelope, EventTimeMetadata, EventTruthKind,
+    SlotQuality, SourceKind, TimestampQuality,
+};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::pin::Pin;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -26,6 +34,8 @@ use tracing::{debug, warn};
 
 const LIST_TOPICS_PATH: &str = "/nln.stream.v1.StreamService/ListTopics";
 const SUBSCRIBE_PATH: &str = "/nln.stream.v1.StreamService/Subscribe";
+const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
+const LAMPORTS_PER_SOL_F64: f64 = 1_000_000_000.0;
 
 /// Empty request for `nln.stream.v1.StreamService/ListTopics`.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -110,6 +120,302 @@ pub struct NlnProgramStreamMessage {
 pub struct NlnTopicInfo {
     pub topic: String,
     pub proto_message_type: Option<String>,
+}
+
+/// Normalized ingest metadata attached to decoded NLN payloads.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NlnIngestMeta {
+    pub provider: String,
+    pub topic: String,
+    pub partition: u32,
+    /// Raw provider offset. Diagnostic-only; do not infer drops from gaps.
+    pub offset_raw: String,
+    /// Parsed provider offset when decimal. Diagnostic-only.
+    pub offset: Option<u64>,
+    pub provider_ts_ms: Option<i64>,
+    pub recv_ts_ms: u64,
+    pub decode_ts_ms: u64,
+    pub slot: Option<u64>,
+    pub signature: Option<String>,
+    pub tx_index: Option<u32>,
+    pub instruction_index: Option<u32>,
+}
+
+impl NlnIngestMeta {
+    fn from_message(
+        message: &NlnProgramStreamMessage,
+        slot: Option<u64>,
+        signature: Option<String>,
+        tx_index: Option<u32>,
+        instruction_index: Option<u32>,
+    ) -> Self {
+        Self {
+            provider: "NLN".to_string(),
+            topic: message.topic.clone(),
+            partition: message.partition,
+            offset_raw: message.offset_raw.clone(),
+            offset: message.offset,
+            provider_ts_ms: message.provider_ts_ms,
+            recv_ts_ms: message.recv_ts_ms,
+            decode_ts_ms: message.decode_ts_ms,
+            slot,
+            signature,
+            tx_index,
+            instruction_index,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum NlnEvent {
+    PumpFunCreate(NlnPumpFunCreateEvent),
+    PumpFunTrade(NlnPumpFunTradeEvent),
+    Transfer(NlnTransferEvent),
+    Unknown { meta: NlnIngestMeta, raw: Value },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PumpFunTradeSide {
+    Buy,
+    Sell,
+}
+
+impl PumpFunTradeSide {
+    pub const fn is_buy(self) -> bool {
+        matches!(self, Self::Buy)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferAsset {
+    NativeSol,
+    WrappedSol,
+    SplToken,
+    Unknown,
+}
+
+/// Coverage contract for converting NLN transfer entries into primary FSC events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NlnFundingTransferCoverage {
+    CaptureOnly,
+    HealthyDedicatedFullChain,
+}
+
+impl NlnFundingTransferCoverage {
+    const fn full_chain_coverage(self) -> bool {
+        matches!(self, Self::HealthyDedicatedFullChain)
+    }
+
+    const fn provenance(self) -> FundingTransferProvenance {
+        match self {
+            Self::CaptureOnly => FundingTransferProvenance::nln_program_streams_live(
+                FundingTransferCoverageClass::FilteredObservations,
+            ),
+            Self::HealthyDedicatedFullChain => FundingTransferProvenance::nln_program_streams_live(
+                FundingTransferCoverageClass::FullChainCoverage,
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NlnPumpFunCreateEvent {
+    pub meta: NlnIngestMeta,
+    pub signature: String,
+    pub tx_index: Option<u32>,
+    pub slot: u64,
+    pub mint: solana_sdk::pubkey::Pubkey,
+    pub creator: solana_sdk::pubkey::Pubkey,
+    pub bonding_curve: Option<solana_sdk::pubkey::Pubkey>,
+    pub block_time: Option<i64>,
+    pub virtual_sol_reserves: Option<u64>,
+    pub virtual_token_reserves: Option<u64>,
+    pub real_sol_reserves: Option<u64>,
+    pub real_token_reserves: Option<u64>,
+}
+
+impl NlnPumpFunCreateEvent {
+    pub fn to_candidate_pool(&self) -> Result<CandidatePool> {
+        let bonding_curve = self
+            .bonding_curve
+            .context("NLN pumpfun.create missing bonding_curve; cannot build CandidatePool")?;
+        let quote_mint =
+            solana_sdk::pubkey::Pubkey::from_str(WSOL_MINT).context("invalid WSOL mint")?;
+        let amm_program_id = solana_sdk::pubkey::Pubkey::from_str(PUMP_FUN_PROGRAM_ID)
+            .context("invalid pump.fun program id")?;
+        let event_time = event_time_from_meta(&self.meta, self.block_time);
+        let event_ts_ms = event_time.effective_event_ts_ms();
+        let timestamp = self
+            .block_time
+            .and_then(|value| (value >= 0).then_some(value as u64))
+            .or_else(|| event_ts_ms.map(|value| value / 1000))
+            .unwrap_or_else(|| self.meta.recv_ts_ms / 1000);
+
+        Ok(CandidatePool {
+            semantic: nln_semantic(self.meta.slot, event_time),
+            slot: Some(self.slot),
+            tx_index: self.tx_index,
+            event_ts_ms,
+            event_time,
+            signature: self.signature.clone(),
+            amm_program_id,
+            pool_amm_id: bonding_curve,
+            base_mint: self.mint,
+            quote_mint,
+            bonding_curve,
+            creator: self.creator,
+            timestamp,
+            bonding_curve_progress: None,
+            initial_liquidity_sol: self
+                .virtual_sol_reserves
+                .or(self.real_sol_reserves)
+                .map(lamports_to_sol),
+            token_total_supply: None,
+            block_time: self.block_time,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NlnPumpFunTradeEvent {
+    pub meta: NlnIngestMeta,
+    pub signature: solana_sdk::signature::Signature,
+    pub tx_index: u32,
+    pub slot: u64,
+    pub mint: solana_sdk::pubkey::Pubkey,
+    pub user: solana_sdk::pubkey::Pubkey,
+    pub creator: Option<solana_sdk::pubkey::Pubkey>,
+    pub side: PumpFunTradeSide,
+    pub sol_amount_lamports: u64,
+    pub token_amount_units: u64,
+    pub block_time: Option<i64>,
+    pub virtual_sol_reserves: Option<u64>,
+    pub virtual_token_reserves: Option<u64>,
+    pub real_sol_reserves: Option<u64>,
+    pub real_token_reserves: Option<u64>,
+}
+
+impl NlnPumpFunTradeEvent {
+    /// Convert into the existing Seer trade boundary after the caller resolves
+    /// mint -> canonical pool/bonding-curve identity.
+    pub fn to_trade_event(&self, pool_amm_id: solana_sdk::pubkey::Pubkey) -> TradeEvent {
+        let event_time = event_time_from_meta(&self.meta, self.block_time);
+        let timestamp_ms = event_time
+            .effective_event_ts_ms()
+            .unwrap_or(self.meta.recv_ts_ms);
+        let is_buy = self.side.is_buy();
+
+        TradeEvent {
+            semantic: nln_semantic(Some(self.slot), event_time),
+            slot: Some(self.slot),
+            signature: self.signature,
+            event_ordinal: None,
+            tx_index: Some(self.tx_index),
+            provenance: None,
+            timestamp_ms,
+            arrival_ts_ms: self.meta.recv_ts_ms,
+            event_time,
+            pool_amm_id,
+            mint: self.mint,
+            signer: self.user,
+            is_buy,
+            is_dev_buy: false,
+            amount: self.token_amount_units,
+            max_sol_cost: if is_buy { self.sol_amount_lamports } else { 0 },
+            min_sol_output: if is_buy { 0 } else { self.sol_amount_lamports },
+            success: true,
+            error_code: None,
+            compute_units_consumed: None,
+            owner_token_deltas: vec![],
+            mpcf_payload: vec![],
+            mpcf_payload_missing_reason: RawBytesMissingReason::ProviderDoesNotSupport,
+            v_tokens_in_bonding_curve: self.virtual_token_reserves.map(|value| value as f64),
+            v_sol_in_bonding_curve: self.virtual_sol_reserves.map(lamports_to_sol),
+            market_cap_sol: None,
+            global_config: None,
+            fee_recipient: None,
+            token_program: None,
+            buy_variant: Some(match self.side {
+                PumpFunTradeSide::Buy => "nln_pumpfun_buy".to_string(),
+                PumpFunTradeSide::Sell => "nln_pumpfun_sell".to_string(),
+            }),
+            associated_bonding_curve: None,
+            bonding_curve_v2: None,
+            bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![],
+            is_mayhem_mode: None,
+            cu_price_micro_lamports: None,
+            compute_unit_limit: None,
+            inner_ix_count: None,
+            cpi_depth: None,
+            ata_create_count: None,
+            signer_pre_balance_lamports: None,
+            signer_post_balance_lamports: None,
+            jito_tip_detected: None,
+            toolchain_fingerprint: ToolchainFingerprintInput::default(),
+            curve_data_known: self.virtual_sol_reserves.is_some()
+                || self.virtual_token_reserves.is_some()
+                || self.real_sol_reserves.is_some()
+                || self.real_token_reserves.is_some(),
+            curve_finality: CurveFinality::Speculative,
+            is_pumpswap: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NlnTransferEvent {
+    pub meta: NlnIngestMeta,
+    pub signature: String,
+    pub tx_index: u32,
+    pub instruction_index: u32,
+    pub slot: u64,
+    pub from_wallet: solana_sdk::pubkey::Pubkey,
+    pub to_wallet: solana_sdk::pubkey::Pubkey,
+    pub amount_lamports: u64,
+    pub token_address: String,
+}
+
+impl NlnTransferEvent {
+    pub fn asset(&self) -> TransferAsset {
+        match self.token_address.as_str() {
+            "solana" => TransferAsset::NativeSol,
+            WSOL_MINT => TransferAsset::WrappedSol,
+            "" => TransferAsset::Unknown,
+            _ => TransferAsset::SplToken,
+        }
+    }
+
+    /// Convert only native SOL transfers into the primary FSC funding boundary.
+    pub fn to_native_sol_funding_transfer_event(
+        &self,
+        coverage: NlnFundingTransferCoverage,
+    ) -> Option<FundingTransferEvent> {
+        if self.asset() != TransferAsset::NativeSol {
+            return None;
+        }
+
+        let event_time = event_time_from_meta(&self.meta, None);
+        Some(FundingTransferEvent {
+            semantic: nln_semantic(Some(self.slot), event_time),
+            slot: Some(self.slot),
+            event_ordinal: None,
+            tx_index: Some(self.tx_index),
+            outer_instruction_index: Some(self.instruction_index),
+            inner_group_index: None,
+            cpi_stack_height: None,
+            event_time,
+            arrival_ts_ms: self.meta.recv_ts_ms,
+            signature: self.signature.clone(),
+            source_wallet: self.from_wallet.to_string(),
+            recipient_wallet: self.to_wallet.to_string(),
+            lamports: self.amount_lamports,
+            full_chain_coverage: coverage.full_chain_coverage(),
+            provenance: coverage.provenance(),
+        })
+    }
 }
 
 /// Subscribe loop options. Defaults are bounded and inert until explicitly used.
@@ -507,6 +813,145 @@ pub fn decode_subscribe_response(
     })
 }
 
+pub fn normalize_nln_event(
+    message: &NlnProgramStreamMessage,
+    config: &ProgramStreamsConfig,
+) -> Result<NlnEvent> {
+    if message.topic == config.pumpfun_create_topic {
+        return parse_pumpfun_create(message).map(NlnEvent::PumpFunCreate);
+    }
+    if message.topic == config.pumpfun_trade_topic {
+        return parse_pumpfun_trade(message).map(NlnEvent::PumpFunTrade);
+    }
+    if message.topic == config.system_transfers_topic {
+        return parse_system_transfer(message).map(NlnEvent::Transfer);
+    }
+
+    Ok(NlnEvent::Unknown {
+        meta: NlnIngestMeta::from_message(message, None, None, None, None),
+        raw: message.payload_json.clone(),
+    })
+}
+
+pub fn parse_pumpfun_create(message: &NlnProgramStreamMessage) -> Result<NlnPumpFunCreateEvent> {
+    let object = payload_object(message)?;
+    let signature = required_string(object, &["signature"])?;
+    let tx_index = optional_u32(object, &["tx_index", "txIndex"])?;
+    let slot = required_u64(object, &["slot"])?;
+    let mint = required_pubkey(object, &["mint"])?;
+    let creator = required_pubkey(object, &["creator", "user"])?;
+    let bonding_curve = optional_pubkey(
+        object,
+        &[
+            "bonding_curve",
+            "bondingCurve",
+            "pool_amm_id",
+            "pool",
+            "bondingCurveAddress",
+        ],
+    )?;
+    let block_time = optional_i64(object, &["block_time", "blockTime", "timestamp"])?;
+    let meta = NlnIngestMeta::from_message(
+        message,
+        Some(slot),
+        Some(signature.clone()),
+        tx_index,
+        optional_u32(object, &["instruction_index", "instructionIndex"])?,
+    );
+
+    Ok(NlnPumpFunCreateEvent {
+        meta,
+        signature,
+        tx_index,
+        slot,
+        mint,
+        creator,
+        bonding_curve,
+        block_time,
+        virtual_sol_reserves: optional_u64(
+            object,
+            &["virtual_sol_reserves", "virtualSolReserves"],
+        )?,
+        virtual_token_reserves: optional_u64(
+            object,
+            &["virtual_token_reserves", "virtualTokenReserves"],
+        )?,
+        real_sol_reserves: optional_u64(object, &["real_sol_reserves", "realSolReserves"])?,
+        real_token_reserves: optional_u64(object, &["real_token_reserves", "realTokenReserves"])?,
+    })
+}
+
+pub fn parse_pumpfun_trade(message: &NlnProgramStreamMessage) -> Result<NlnPumpFunTradeEvent> {
+    let object = payload_object(message)?;
+    let signature_text = required_string(object, &["signature"])?;
+    let signature = solana_sdk::signature::Signature::from_str(&signature_text)
+        .with_context(|| format!("invalid NLN pumpfun.trade signature '{signature_text}'"))?;
+    let tx_index = required_u32(object, &["tx_index", "txIndex"])?;
+    let slot = required_u64(object, &["slot"])?;
+    let mint = required_pubkey(object, &["mint"])?;
+    let user = required_pubkey(object, &["user", "buyer", "wallet"])?;
+    let side = parse_trade_side(&required_string(object, &["ix_name", "ixName", "side"])?)
+        .context("invalid NLN pumpfun.trade ix_name")?;
+    let meta = NlnIngestMeta::from_message(
+        message,
+        Some(slot),
+        Some(signature_text),
+        Some(tx_index),
+        optional_u32(object, &["instruction_index", "instructionIndex"])?,
+    );
+
+    Ok(NlnPumpFunTradeEvent {
+        meta,
+        signature,
+        tx_index,
+        slot,
+        mint,
+        user,
+        creator: optional_pubkey(object, &["creator"])?,
+        side,
+        sol_amount_lamports: required_u64(object, &["sol_amount", "solAmount"])?,
+        token_amount_units: required_u64(object, &["token_amount", "tokenAmount"])?,
+        block_time: optional_i64(object, &["block_time", "blockTime", "timestamp"])?,
+        virtual_sol_reserves: optional_u64(
+            object,
+            &["virtual_sol_reserves", "virtualSolReserves"],
+        )?,
+        virtual_token_reserves: optional_u64(
+            object,
+            &["virtual_token_reserves", "virtualTokenReserves"],
+        )?,
+        real_sol_reserves: optional_u64(object, &["real_sol_reserves", "realSolReserves"])?,
+        real_token_reserves: optional_u64(object, &["real_token_reserves", "realTokenReserves"])?,
+    })
+}
+
+pub fn parse_system_transfer(message: &NlnProgramStreamMessage) -> Result<NlnTransferEvent> {
+    let object = payload_object(message)?;
+    let signature = required_string(object, &["signature"])?;
+    let tx_index = required_u32(object, &["tx_index", "txIndex"])?;
+    let instruction_index = required_u32(object, &["instruction_index", "instructionIndex"])?;
+    let slot = required_u64(object, &["slot"])?;
+    let meta = NlnIngestMeta::from_message(
+        message,
+        Some(slot),
+        Some(signature.clone()),
+        Some(tx_index),
+        Some(instruction_index),
+    );
+
+    Ok(NlnTransferEvent {
+        meta,
+        signature,
+        tx_index,
+        instruction_index,
+        slot,
+        from_wallet: required_pubkey(object, &["from_wallet", "fromWallet", "from"])?,
+        to_wallet: required_pubkey(object, &["to_wallet", "toWallet", "to"])?,
+        amount_lamports: required_u64(object, &["amount", "lamports", "amount_lamports"])?,
+        token_address: required_string(object, &["token_address", "tokenAddress"])?,
+    })
+}
+
 pub fn decode_json_payload(payload: &[u8]) -> Result<Value> {
     if payload.is_empty() {
         bail!("NLN Program Streams payload is empty");
@@ -600,6 +1045,174 @@ fn jitter_backoff(base: Duration) -> Duration {
     base + Duration::from_millis(rand::thread_rng().gen_range(0..=max_jitter_ms))
 }
 
+fn payload_object(message: &NlnProgramStreamMessage) -> Result<&Map<String, Value>> {
+    message.payload_json.as_object().with_context(|| {
+        format!(
+            "NLN Program Streams payload for topic '{}' is not a JSON object",
+            message.topic
+        )
+    })
+}
+
+fn parse_trade_side(value: &str) -> Result<PumpFunTradeSide> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "buy" => Ok(PumpFunTradeSide::Buy),
+        "sell" => Ok(PumpFunTradeSide::Sell),
+        other => bail!("unsupported pumpfun trade side '{other}'"),
+    }
+}
+
+fn event_time_from_meta(meta: &NlnIngestMeta, block_time: Option<i64>) -> EventTimeMetadata {
+    EventTimeMetadata::new(
+        block_time.and_then(|value| {
+            if value >= 0 {
+                Some((value as u64).saturating_mul(1000))
+            } else {
+                None
+            }
+        }),
+        Some(meta.recv_ts_ms),
+        None,
+    )
+}
+
+fn nln_semantic(slot: Option<u64>, event_time: EventTimeMetadata) -> EventSemanticEnvelope {
+    let timestamp_quality = if event_time.chain_event_ts_ms.is_some() {
+        TimestampQuality::Chain
+    } else {
+        TimestampQuality::WallClock
+    };
+    let slot_quality = if slot.is_some() {
+        SlotQuality::Present
+    } else {
+        SlotQuality::Absent
+    };
+    let completeness =
+        if slot_quality == SlotQuality::Present && timestamp_quality == TimestampQuality::Chain {
+            EventCompleteness::Full
+        } else {
+            EventCompleteness::Partial
+        };
+
+    EventSemanticEnvelope::new(
+        SourceKind::Grpc,
+        EventTruthKind::AdaptedChain,
+        slot_quality,
+        timestamp_quality,
+        completeness,
+    )
+}
+
+fn lamports_to_sol(lamports: u64) -> f64 {
+    lamports as f64 / LAMPORTS_PER_SOL_F64
+}
+
+fn get_field<'a>(object: &'a Map<String, Value>, names: &[&str]) -> Option<&'a Value> {
+    names.iter().find_map(|name| object.get(*name))
+}
+
+fn value_to_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.trim().to_string()),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+    .filter(|value| !value.is_empty())
+}
+
+fn required_string(object: &Map<String, Value>, names: &[&str]) -> Result<String> {
+    get_field(object, names)
+        .and_then(value_to_string)
+        .with_context(|| format!("missing required NLN field {}", names.join("|")))
+}
+
+fn optional_string(object: &Map<String, Value>, names: &[&str]) -> Result<Option<String>> {
+    match get_field(object, names) {
+        Some(Value::Null) | None => Ok(None),
+        Some(value) => value_to_string(value)
+            .map(Some)
+            .with_context(|| format!("invalid string NLN field {}", names.join("|"))),
+    }
+}
+
+fn required_u64(object: &Map<String, Value>, names: &[&str]) -> Result<u64> {
+    optional_u64(object, names)?
+        .with_context(|| format!("missing required numeric NLN field {}", names.join("|")))
+}
+
+fn optional_u64(object: &Map<String, Value>, names: &[&str]) -> Result<Option<u64>> {
+    let Some(value) = get_field(object, names) else {
+        return Ok(None);
+    };
+    match value {
+        Value::Null => Ok(None),
+        Value::Number(number) => number
+            .as_u64()
+            .map(Some)
+            .with_context(|| format!("invalid unsigned numeric NLN field {}", names.join("|"))),
+        Value::String(text) => text
+            .trim()
+            .parse::<u64>()
+            .map(Some)
+            .with_context(|| format!("invalid unsigned string NLN field {}", names.join("|"))),
+        _ => bail!("invalid numeric NLN field {}", names.join("|")),
+    }
+}
+
+fn required_u32(object: &Map<String, Value>, names: &[&str]) -> Result<u32> {
+    let value = required_u64(object, names)?;
+    u32::try_from(value).with_context(|| format!("NLN field {} exceeds u32", names.join("|")))
+}
+
+fn optional_u32(object: &Map<String, Value>, names: &[&str]) -> Result<Option<u32>> {
+    optional_u64(object, names)?
+        .map(|value| {
+            u32::try_from(value)
+                .with_context(|| format!("NLN field {} exceeds u32", names.join("|")))
+        })
+        .transpose()
+}
+
+fn optional_i64(object: &Map<String, Value>, names: &[&str]) -> Result<Option<i64>> {
+    let Some(value) = get_field(object, names) else {
+        return Ok(None);
+    };
+    match value {
+        Value::Null => Ok(None),
+        Value::Number(number) => number
+            .as_i64()
+            .map(Some)
+            .with_context(|| format!("invalid signed numeric NLN field {}", names.join("|"))),
+        Value::String(text) => text
+            .trim()
+            .parse::<i64>()
+            .map(Some)
+            .with_context(|| format!("invalid signed string NLN field {}", names.join("|"))),
+        _ => bail!("invalid signed NLN field {}", names.join("|")),
+    }
+}
+
+fn required_pubkey(
+    object: &Map<String, Value>,
+    names: &[&str],
+) -> Result<solana_sdk::pubkey::Pubkey> {
+    let value = required_string(object, names)?;
+    solana_sdk::pubkey::Pubkey::from_str(&value)
+        .with_context(|| format!("invalid pubkey in NLN field {}", names.join("|")))
+}
+
+fn optional_pubkey(
+    object: &Map<String, Value>,
+    names: &[&str],
+) -> Result<Option<solana_sdk::pubkey::Pubkey>> {
+    optional_string(object, names)?
+        .map(|value| {
+            solana_sdk::pubkey::Pubkey::from_str(&value)
+                .with_context(|| format!("invalid pubkey in NLN field {}", names.join("|")))
+        })
+        .transpose()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -610,6 +1223,19 @@ mod tests {
             api_key_env: env_name.to_string(),
             api_key_env_fallback: fallback,
             ..ProgramStreamsConfig::default()
+        }
+    }
+
+    fn decoded_message(topic: String, payload_json: Value) -> NlnProgramStreamMessage {
+        NlnProgramStreamMessage {
+            topic,
+            partition: 0,
+            offset_raw: "42".to_string(),
+            offset: Some(42),
+            provider_ts_ms: Some(1_700_000_000_000),
+            recv_ts_ms: 1_700_000_000_010,
+            decode_ts_ms: 1_700_000_000_011,
+            payload_json,
         }
     }
 
@@ -756,5 +1382,176 @@ mod tests {
         let err = resolve_api_key(&config).unwrap_err().to_string();
         assert!(err.contains(primary));
         assert!(err.contains(fallback));
+    }
+
+    #[test]
+    fn normalizes_native_sol_transfer_and_preserves_tx_index() {
+        let from_wallet = solana_sdk::pubkey::Pubkey::new_unique();
+        let to_wallet = solana_sdk::pubkey::Pubkey::new_unique();
+        let message = decoded_message(
+            ProgramStreamsConfig::default_system_transfers_topic(),
+            json!({
+                "signature": "transfer-sig",
+                "tx_index": "408",
+                "slot": "422819679",
+                "from_wallet": from_wallet.to_string(),
+                "to_wallet": to_wallet.to_string(),
+                "amount": "1000",
+                "token_address": "solana",
+                "instruction_index": 2
+            }),
+        );
+
+        let transfer = parse_system_transfer(&message).unwrap();
+        assert_eq!(transfer.tx_index, 408);
+        assert_eq!(transfer.instruction_index, 2);
+        assert_eq!(transfer.asset(), TransferAsset::NativeSol);
+
+        let event = transfer
+            .to_native_sol_funding_transfer_event(NlnFundingTransferCoverage::CaptureOnly)
+            .expect("native SOL transfer should convert to FSC funding event");
+        assert_eq!(event.tx_index, Some(408));
+        assert_eq!(event.outer_instruction_index, Some(2));
+        assert!(!event.full_chain_coverage);
+        assert_eq!(
+            event.provenance,
+            FundingTransferProvenance::nln_program_streams_live(
+                FundingTransferCoverageClass::FilteredObservations
+            )
+        );
+
+        let full = transfer
+            .to_native_sol_funding_transfer_event(
+                NlnFundingTransferCoverage::HealthyDedicatedFullChain,
+            )
+            .expect("native SOL transfer should convert to FSC funding event");
+        assert!(full.full_chain_coverage);
+        assert_eq!(
+            full.provenance.coverage_class,
+            FundingTransferCoverageClass::FullChainCoverage
+        );
+    }
+
+    #[test]
+    fn non_native_transfer_is_not_primary_fsc_input() {
+        let from_wallet = solana_sdk::pubkey::Pubkey::new_unique();
+        let to_wallet = solana_sdk::pubkey::Pubkey::new_unique();
+        let message = decoded_message(
+            ProgramStreamsConfig::default_system_transfers_topic(),
+            json!({
+                "signature": "transfer-sig",
+                "tx_index": "1",
+                "slot": "2",
+                "from_wallet": from_wallet.to_string(),
+                "to_wallet": to_wallet.to_string(),
+                "amount": "1000",
+                "token_address": WSOL_MINT,
+                "instruction_index": 3
+            }),
+        );
+
+        let transfer = parse_system_transfer(&message).unwrap();
+        assert_eq!(transfer.asset(), TransferAsset::WrappedSol);
+        assert!(transfer
+            .to_native_sol_funding_transfer_event(NlnFundingTransferCoverage::CaptureOnly)
+            .is_none());
+    }
+
+    #[test]
+    fn normalizes_trade_user_as_buyer_and_builds_trade_event() {
+        let signature = solana_sdk::signature::Signature::new_unique();
+        let mint = solana_sdk::pubkey::Pubkey::new_unique();
+        let user = solana_sdk::pubkey::Pubkey::new_unique();
+        let creator = solana_sdk::pubkey::Pubkey::new_unique();
+        let pool = solana_sdk::pubkey::Pubkey::new_unique();
+        let message = decoded_message(
+            ProgramStreamsConfig::default_pumpfun_trade_topic(),
+            json!({
+                "signature": signature.to_string(),
+                "tx_index": "70",
+                "mint": mint.to_string(),
+                "sol_amount": "8418446",
+                "token_amount": "330719451263",
+                "user": user.to_string(),
+                "creator": creator.to_string(),
+                "ix_name": "buy",
+                "slot": "422817405",
+                "block_time": "1780009808",
+                "virtual_sol_reserves": "26551096335",
+                "virtual_token_reserves": "1043392990434519"
+            }),
+        );
+
+        let trade = parse_pumpfun_trade(&message).unwrap();
+        assert_eq!(trade.user, user);
+        assert_eq!(trade.side, PumpFunTradeSide::Buy);
+        assert_eq!(trade.tx_index, 70);
+
+        let trade_event = trade.to_trade_event(pool);
+        assert_eq!(trade_event.signer, user);
+        assert!(trade_event.is_buy);
+        assert_eq!(trade_event.max_sol_cost, 8_418_446);
+        assert_eq!(trade_event.min_sol_output, 0);
+        assert_eq!(trade_event.tx_index, Some(70));
+        assert_eq!(trade_event.event_ordinal, None);
+    }
+
+    #[test]
+    fn normalizes_create_with_provenance_to_candidate_pool() {
+        let mint = solana_sdk::pubkey::Pubkey::new_unique();
+        let creator = solana_sdk::pubkey::Pubkey::new_unique();
+        let bonding_curve = solana_sdk::pubkey::Pubkey::new_unique();
+        let message = decoded_message(
+            ProgramStreamsConfig::default_pumpfun_create_topic(),
+            json!({
+                "signature": "create-sig",
+                "tx_index": "9",
+                "slot": "422817000",
+                "mint": mint.to_string(),
+                "creator": creator.to_string(),
+                "bonding_curve": bonding_curve.to_string(),
+                "block_time": "1780009700",
+                "virtual_sol_reserves": "10000000"
+            }),
+        );
+
+        let create = parse_pumpfun_create(&message).unwrap();
+        assert_eq!(create.tx_index, Some(9));
+        assert_eq!(create.meta.tx_index, Some(9));
+        let candidate = create.to_candidate_pool().unwrap();
+        assert_eq!(candidate.tx_index, Some(9));
+        assert_eq!(candidate.base_mint, mint);
+        assert_eq!(candidate.creator, creator);
+        assert_eq!(candidate.bonding_curve, bonding_curve);
+        assert_eq!(candidate.pool_amm_id, bonding_curve);
+        assert_eq!(candidate.block_time, Some(1_780_009_700));
+    }
+
+    #[test]
+    fn dispatches_known_topics_and_preserves_unknown_payloads() {
+        let config = ProgramStreamsConfig::default();
+        let transfer_message = decoded_message(
+            config.system_transfers_topic.clone(),
+            json!({
+                "signature": "transfer-sig",
+                "tx_index": "1",
+                "slot": "2",
+                "from_wallet": solana_sdk::pubkey::Pubkey::new_unique().to_string(),
+                "to_wallet": solana_sdk::pubkey::Pubkey::new_unique().to_string(),
+                "amount": "1000",
+                "token_address": "solana",
+                "instruction_index": 0
+            }),
+        );
+        assert!(matches!(
+            normalize_nln_event(&transfer_message, &config).unwrap(),
+            NlnEvent::Transfer(_)
+        ));
+
+        let unknown = decoded_message("prod.rpc.solana.unknown".to_string(), json!({"x": 1}));
+        assert!(matches!(
+            normalize_nln_event(&unknown, &config).unwrap(),
+            NlnEvent::Unknown { .. }
+        ));
     }
 }
