@@ -228,6 +228,7 @@ fn materialized_feature_set_contains_complete_inputs() {
             signer_cross_pool_velocity: None,
             funding_source_concentration: Some(0.27),
             funding_source_diagnostics: None,
+            funding_source_v2: None,
             degraded_reasons: vec!["DBIA_NO_DEV_BUY".to_string()],
             buy_sample_count: 9,
             signer_sample_count: 5,

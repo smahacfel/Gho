@@ -2973,6 +2973,7 @@ impl GatekeeperAssessment {
             funding_source_concentration: sybil.funding_source_concentration,
             max_funding_source_concentration: config.max_funding_source_concentration,
             funding_source_diagnostics: sybil.funding_source_diagnostics.clone(),
+            funding_source_v2: sybil.funding_source_v2.clone(),
             sybil_metric_degraded_reasons: sybil.degraded_reasons.clone(),
 
             // A/B Window – defaults; enriched by oracle_runtime before logging
@@ -13645,6 +13646,7 @@ mod tests {
                     ],
                 },
             ),
+            funding_source_v2: None,
             degraded_reasons: vec!["FTDI_INSUFFICIENT_BUYS".to_string()],
             buy_sample_count: 5,
             signer_sample_count: 5,

@@ -306,6 +306,8 @@ pub struct SybilResistanceFeatures {
     pub funding_source_concentration: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub funding_source_diagnostics: Option<FundingSourceDiagnostics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub funding_source_v2: Option<FscV2Evidence>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub degraded_reasons: Vec<String>,
     #[serde(default)]

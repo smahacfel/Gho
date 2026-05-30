@@ -867,9 +867,28 @@ fn materialize_features_populates_fsc_from_shared_funding_source_index() {
         guard.materialize_features()
     };
 
-    assert_eq!(
-        features.sybil_resistance.funding_source_concentration,
-        Some(0.5)
+    let legacy_fsc = features
+        .sybil_resistance
+        .funding_source_concentration
+        .expect("legacy FSC should be materialized");
+    assert!((legacy_fsc - (1.0 / 3.0)).abs() < f64::EPSILON);
+    let fsc_v2 = features
+        .sybil_resistance
+        .funding_source_v2
+        .as_ref()
+        .expect("FSC v2 evidence should be materialized additively");
+    assert!(matches!(
+        fsc_v2.status,
+        ghost_core::tx_intelligence::types::FscEvidenceStatus::Clean
+            | ghost_core::tx_intelligence::types::FscEvidenceStatus::Degraded
+    ));
+    assert!(
+        (fsc_v2
+            .hhi_norm_count
+            .expect("FSC v2 HHI should be materialized")
+            - (1.0 / 3.0))
+            .abs()
+            < f64::EPSILON
     );
     assert!(!features.sybil_resistance.degraded_reasons.contains(
         &ghost_core::tx_intelligence::types::FSC_FUNDING_STREAM_UNAVAILABLE_REASON.to_string()

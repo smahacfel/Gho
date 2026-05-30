@@ -414,6 +414,10 @@ pub fn v3_feature_snapshot_hash(
                 .funding_source_diagnostics
                 .as_ref()
                 .map_or(Value::Null, funding_source_diagnostics_payload),
+            "funding_source_v2": sybil
+                .funding_source_v2
+                .as_ref()
+                .map_or(Value::Null, serde_value),
             "signer_cross_pool_velocity_bits": opt_f64_bits(sybil.signer_cross_pool_velocity),
             "signer_sample_count": sybil.signer_sample_count,
             "spend_fraction_divergence_bits": opt_f64_bits(sybil.spend_fraction_divergence)

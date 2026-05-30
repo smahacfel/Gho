@@ -38,7 +38,7 @@
 
 use anyhow::{Context, Result};
 use ghost_core::health::RuntimeHealth;
-use ghost_core::tx_intelligence::types::FundingSourceDiagnostics;
+use ghost_core::tx_intelligence::types::{FscV2Evidence, FundingSourceDiagnostics};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -84,7 +84,9 @@ pub const CYCLIC_LOG_SCHEMA_VERSION: u32 = 1;
 /// v21 adds ordered Gatekeeper gate trace diagnostics.
 /// v22 adds Gatekeeper V2 replay-input contract fields for manifest-locked
 /// offline axis replay.
-pub const GATEKEEPER_BUY_LOG_SCHEMA_VERSION: u32 = 23;
+/// v23 adds additive replay payload hash fields for V3 shadow-sidecar parity.
+/// v24 adds additive FSC v2 evidence capture fields without policy activation.
+pub const GATEKEEPER_BUY_LOG_SCHEMA_VERSION: u32 = 24;
 /// Gatekeeper version string embedded in every V2.5 shadow BUY log for traceability.
 pub const GATEKEEPER_VERSION: &str = "v2.5";
 /// Legacy Gatekeeper version string for pre-V2.5 live-plane semantics.
@@ -1199,6 +1201,9 @@ pub struct GatekeeperBuyLog {
     /// Additive FSC diagnostics that separate structural vs operational miss causes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub funding_source_diagnostics: Option<FundingSourceDiagnostics>,
+    /// Additive FSC v2 evidence payload. Export-only until FSC v2 policy is explicitly enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub funding_source_v2: Option<FscV2Evidence>,
 
     /// Sybil metric degraded reasons from canonical feature materialization.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -3072,6 +3077,7 @@ mod tests {
             funding_source_concentration: Some(0.52),
             max_funding_source_concentration: 1.0,
             funding_source_diagnostics: None,
+            funding_source_v2: None,
             sybil_metric_degraded_reasons: vec!["DBIA_NO_DEV_BUY".to_string()],
             // A/B Window fields (not used in this test)
             ab_window_ms: None,
@@ -3571,6 +3577,7 @@ mod tests {
             funding_source_concentration: Some(0.52),
             max_funding_source_concentration: 1.0,
             funding_source_diagnostics: None,
+            funding_source_v2: None,
             sybil_metric_degraded_reasons: vec!["DBIA_NO_DEV_BUY".to_string()],
             ab_window_ms: Some(10_000),
             ab_t0_event_ts_ms: Some(1000),

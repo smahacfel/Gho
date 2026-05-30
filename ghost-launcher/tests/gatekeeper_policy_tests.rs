@@ -354,6 +354,7 @@ fn neutral_sybil_defaults_preserve_buy_and_reject_verdicts() {
         signer_cross_pool_velocity: Some(1.0),
         funding_source_concentration: Some(1.0),
         funding_source_diagnostics: None,
+        funding_source_v2: None,
         degraded_reasons: vec!["FTDI_INSUFFICIENT_BUYS".to_string()],
         buy_sample_count: 24,
         signer_sample_count: 18,

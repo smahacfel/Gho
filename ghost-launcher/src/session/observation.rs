@@ -964,6 +964,7 @@ impl PoolObservationSession {
         materialized.sybil_resistance.funding_source_concentration =
             fsc.funding_source_concentration;
         materialized.sybil_resistance.funding_source_diagnostics = Some(fsc.diagnostics.clone());
+        materialized.sybil_resistance.funding_source_v2 = Some(fsc.funding_source_v2.clone());
         for reason in fsc.degraded_reasons {
             if !materialized
                 .sybil_resistance
