@@ -65,6 +65,7 @@ pub mod grpc_connection;
 pub mod helius_websocket_adapter;
 pub mod ipc;
 pub mod metrics;
+pub mod nln_program_streams;
 pub mod paradox_sensor;
 pub mod pumpportal_connection;
 pub mod rpc_http_client;
