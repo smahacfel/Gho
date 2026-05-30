@@ -7,17 +7,26 @@ use crate::oracle_metrics::{
 };
 use ghost_brain::config::GatekeeperV2Config;
 use ghost_core::tx_intelligence::types::{
-    FscMissClass, FundingSourceDiagnostics, FundingSourceMissReasonCount,
-    FSC_BUYER_IDENTITY_UNAVAILABLE_REASON, FSC_BUY_TIMESTAMP_UNAVAILABLE_REASON,
-    FSC_FUNDING_STREAM_UNAVAILABLE_REASON, FSC_GLOBAL_RECIPIENT_EVICTED_REASON,
-    FSC_INSUFFICIENT_KNOWN_SOURCES_REASON, FSC_LOOKBACK_WINDOW_EXHAUSTED_REASON,
-    FSC_LOW_ATTRIBUTION_CONFIDENCE_REASON, FSC_NO_PREBUY_TRANSFER_IN_WINDOW_REASON,
-    FSC_NO_RETAINED_RECIPIENT_HISTORY_REASON, FSC_PER_RECIPIENT_HISTORY_OVERFLOW_REASON,
-    FSC_ROLLING_STATE_UNAVAILABLE_REASON, FSC_SAME_SLOT_ORDERING_UNAVAILABLE_REASON,
+    FscAttributionScope, FscEvidenceStatus, FscExcludedReason, FscMissClass, FscSnapshotMode,
+    FscV2Evidence, FscVersion, FundingSourceCount, FundingSourceDiagnostics, FundingSourceKey,
+    FundingSourceMissReasonCount, FSC_BUYER_IDENTITY_UNAVAILABLE_REASON,
+    FSC_BUY_TIMESTAMP_UNAVAILABLE_REASON, FSC_FUNDING_STREAM_UNAVAILABLE_REASON,
+    FSC_GLOBAL_RECIPIENT_EVICTED_REASON, FSC_INSUFFICIENT_KNOWN_SOURCES_REASON,
+    FSC_LOOKBACK_WINDOW_EXHAUSTED_REASON, FSC_LOW_ATTRIBUTION_CONFIDENCE_REASON,
+    FSC_NO_PREBUY_TRANSFER_IN_WINDOW_REASON, FSC_NO_RETAINED_RECIPIENT_HISTORY_REASON,
+    FSC_PER_RECIPIENT_HISTORY_OVERFLOW_REASON, FSC_ROLLING_STATE_UNAVAILABLE_REASON,
+    FSC_SAME_SLOT_ORDERING_UNAVAILABLE_REASON,
 };
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+const FSC_V2_PROVIDER_LEGACY_ROLLING_INDEX: &str = "ghost_legacy_rolling_funding_index";
+const FSC_V2_TOPIC_LEGACY_FUNDING_TRANSFERS: &str = "ghost.funding_transfers";
+const FSC_V2_MIN_TOTAL_BUYERS: u64 = 2;
+const FSC_V2_MIN_KNOWN_NON_NEUTRAL_BUYERS: u64 = 2;
+const FSC_V2_MIN_KNOWN_COVERAGE: f64 = 0.50;
+const FSC_V2_MIN_NON_NEUTRAL_KNOWN_COVERAGE: f64 = 0.30;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FundingSourceConfig {
@@ -60,6 +69,7 @@ impl FundingSourceConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FscComputation {
     pub funding_source_concentration: Option<f64>,
+    pub funding_source_v2: FscV2Evidence,
     pub degraded_reasons: Vec<String>,
     pub diagnostics: FundingSourceDiagnostics,
 }
@@ -120,7 +130,10 @@ pub struct FundingSourceIndex {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FundingSourceMatch {
     Concrete(String),
-    Neutral(String),
+    Neutral {
+        source_wallet: String,
+        legacy_key: String,
+    },
     Unknown,
 }
 
@@ -129,6 +142,9 @@ struct LookupSourceResult {
     matched: FundingSourceMatch,
     removed: bool,
     miss: Option<LookupMiss>,
+    attribution_confidence_bps: Option<u16>,
+    selected_lamports: u128,
+    total_lamports: u128,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,6 +158,9 @@ enum WalletLookupOutcome {
     Matched {
         matched: FundingSourceMatch,
         removed: bool,
+        attribution_confidence_bps: u16,
+        selected_lamports: u128,
+        total_lamports: u128,
     },
     ContinueMiss {
         miss: LookupMiss,
@@ -194,6 +213,420 @@ enum TransferBuyOrder {
     Precedes,
     DoesNotPrecede,
     Unorderable,
+}
+
+#[derive(Debug, Default)]
+struct FscV2Accumulator {
+    total_buyers: u64,
+    known_buyers: u64,
+    known_non_neutral_buyers: u64,
+    unknown_count: u64,
+    neutral_count: u64,
+    confidence_sum_bps: u64,
+    confidence_min_bps: Option<u16>,
+    non_neutral_source_counts: HashMap<String, u64>,
+    non_neutral_source_buy_sol: HashMap<String, f64>,
+    raw_source_counts: HashMap<String, u64>,
+    non_neutral_buyer_weights: Vec<(String, f64)>,
+}
+
+impl FscV2Accumulator {
+    fn new(total_buyers: usize) -> Self {
+        Self {
+            total_buyers: total_buyers as u64,
+            ..Self::default()
+        }
+    }
+
+    fn record_concrete(&mut self, source: String, buy_sol: f64, confidence_bps: Option<u16>) {
+        self.known_buyers = self.known_buyers.saturating_add(1);
+        self.known_non_neutral_buyers = self.known_non_neutral_buyers.saturating_add(1);
+        increment_count(&mut self.non_neutral_source_counts, source.clone());
+        *self
+            .non_neutral_source_buy_sol
+            .entry(source.clone())
+            .or_default() += buy_sol.max(0.0);
+        increment_count(&mut self.raw_source_counts, source.clone());
+        self.non_neutral_buyer_weights
+            .push((source, buy_sol.max(0.0)));
+        self.record_confidence(confidence_bps);
+    }
+
+    fn record_neutral(&mut self, source: String, confidence_bps: Option<u16>) {
+        self.known_buyers = self.known_buyers.saturating_add(1);
+        self.neutral_count = self.neutral_count.saturating_add(1);
+        increment_count(&mut self.raw_source_counts, format!("neutral:{source}"));
+        self.record_confidence(confidence_bps);
+    }
+
+    fn record_unknown(&mut self) {
+        self.unknown_count = self.unknown_count.saturating_add(1);
+    }
+
+    fn record_confidence(&mut self, confidence_bps: Option<u16>) {
+        if let Some(confidence_bps) = confidence_bps {
+            self.confidence_sum_bps = self
+                .confidence_sum_bps
+                .saturating_add(u64::from(confidence_bps));
+            self.confidence_min_bps = Some(
+                self.confidence_min_bps
+                    .map(|existing| existing.min(confidence_bps))
+                    .unwrap_or(confidence_bps),
+            );
+        }
+    }
+}
+
+fn increment_count(counts: &mut HashMap<String, u64>, key: String) {
+    let current = counts.get(&key).copied().unwrap_or_default();
+    counts.insert(key, current.saturating_add(1));
+}
+
+fn build_fsc_v2_evidence(
+    accumulator: &FscV2Accumulator,
+    diagnostics: &FundingSourceDiagnostics,
+    stream_available: bool,
+    saw_transfer: bool,
+    config: &FundingSourceConfig,
+    max_buy_slot: Option<u64>,
+) -> FscV2Evidence {
+    let total_buyers = accumulator.total_buyers;
+    let known_buyers = accumulator.known_buyers;
+    let unknown_count = if known_buyers == 0 && accumulator.unknown_count == 0 {
+        total_buyers
+    } else {
+        accumulator.unknown_count
+    };
+    let known_coverage = ratio(known_buyers, total_buyers);
+    let non_neutral_known_coverage = ratio(accumulator.known_non_neutral_buyers, total_buyers);
+    let neutral_share = ratio(accumulator.neutral_count, total_buyers);
+
+    let hhi_norm_count = normalized_hhi_from_counts(
+        accumulator
+            .non_neutral_source_counts
+            .values()
+            .copied()
+            .collect::<Vec<_>>()
+            .as_slice(),
+    );
+    let raw_hhi_including_neutral = normalized_hhi_from_counts(
+        accumulator
+            .raw_source_counts
+            .values()
+            .copied()
+            .collect::<Vec<_>>()
+            .as_slice(),
+    );
+    let hhi_norm_sol_weighted_excess =
+        normalized_sol_weighted_excess(&accumulator.non_neutral_buyer_weights);
+
+    let mut source_counts = accumulator
+        .non_neutral_source_counts
+        .iter()
+        .map(|(source, count)| FundingSourceCount {
+            source: FundingSourceKey::new(source.clone()),
+            count: saturating_u8(*count),
+        })
+        .collect::<Vec<_>>();
+    source_counts.sort_by(|lhs, rhs| {
+        rhs.count
+            .cmp(&lhs.count)
+            .then_with(|| lhs.source.wallet.cmp(&rhs.source.wallet))
+    });
+
+    let top_funder_count = source_counts
+        .first()
+        .map(|entry| entry.count)
+        .unwrap_or_default();
+    let top_funder = source_counts.first().map(|entry| entry.source.clone());
+    let top_funder_buy_sol = top_funder
+        .as_ref()
+        .and_then(|source| accumulator.non_neutral_source_buy_sol.get(&source.wallet))
+        .copied()
+        .unwrap_or_default();
+    let top1_share_count = (accumulator.known_non_neutral_buyers > 0)
+        .then(|| f64::from(top_funder_count) / accumulator.known_non_neutral_buyers as f64);
+    let total_non_neutral_buy_sol = accumulator
+        .non_neutral_buyer_weights
+        .iter()
+        .map(|(_, buy_sol)| *buy_sol)
+        .sum::<f64>();
+    let top1_share_sol = (total_non_neutral_buy_sol > 0.0)
+        .then(|| (top_funder_buy_sol / total_non_neutral_buy_sol).clamp(0.0, 1.0));
+
+    let confidence_denominator = known_buyers.max(1);
+    let attribution_confidence_mean = (known_buyers > 0).then(|| {
+        (accumulator.confidence_sum_bps as f64 / confidence_denominator as f64) / 10_000.0
+    });
+    let attribution_confidence_min = accumulator
+        .confidence_min_bps
+        .map(|confidence_bps| f64::from(confidence_bps) / 10_000.0);
+
+    let low_confidence_count =
+        miss_reason_count(diagnostics, FSC_LOW_ATTRIBUTION_CONFIDENCE_REASON);
+    let same_slot_unorderable_count =
+        miss_reason_count(diagnostics, FSC_SAME_SLOT_ORDERING_UNAVAILABLE_REASON);
+
+    let (status, excluded_reason) = fsc_v2_status(
+        stream_available,
+        saw_transfer,
+        total_buyers,
+        accumulator.known_non_neutral_buyers,
+        accumulator.neutral_count,
+        known_coverage,
+        non_neutral_known_coverage,
+        low_confidence_count,
+        same_slot_unorderable_count,
+        hhi_norm_count,
+    );
+
+    FscV2Evidence {
+        version: FscVersion::V2,
+        attribution_scope: FscAttributionScope::SingleHopNativeSol,
+        snapshot_mode: FscSnapshotMode::DecisionTime,
+        total_buyers: saturating_u8(total_buyers),
+        known_buyers: saturating_u8(known_buyers),
+        known_non_neutral_buyers: saturating_u8(accumulator.known_non_neutral_buyers),
+        unknown_count: saturating_u8(unknown_count),
+        neutral_count: saturating_u8(accumulator.neutral_count),
+        low_confidence_count: saturating_u8(low_confidence_count),
+        same_slot_unorderable_count: saturating_u16(same_slot_unorderable_count),
+        known_coverage,
+        non_neutral_known_coverage,
+        neutral_share,
+        top1_share_count,
+        top1_share_sol,
+        hhi_norm_count,
+        hhi_norm_sol_weighted_excess,
+        raw_hhi_including_neutral,
+        scoring_hhi_non_neutral: hhi_norm_count,
+        top_funder,
+        top_funder_count,
+        top_funder_buy_sol,
+        source_counts,
+        attribution_confidence_mean,
+        attribution_confidence_min,
+        dust_filtered_count: 0,
+        post_buy_filtered_count: 0,
+        rel_too_small_count: 0,
+        index_warm: stream_available && saw_transfer,
+        capture_ready: stream_available && saw_transfer,
+        status,
+        excluded_reason,
+        funding_lane_watermark_slot: None,
+        max_buy_slot,
+        funding_lane_lag_slots: None,
+        stream_epoch: 0,
+        gap_suspected: false,
+        min_abs_store_lamports: config.dust_threshold_lamports,
+        min_abs_attribution_lamports: config.dust_threshold_lamports,
+        min_rel_to_buy: 0.0,
+        ttl_seconds: config.lookback_window_ms / 1_000,
+        neutral_funder_set_version: None,
+        neutral_funder_set_hash: neutral_funder_set_hash(config),
+        config_hash: funding_source_config_hash(config),
+        provider: FSC_V2_PROVIDER_LEGACY_ROLLING_INDEX.to_string(),
+        source_topics: vec![FSC_V2_TOPIC_LEGACY_FUNDING_TRANSFERS.to_string()],
+    }
+}
+
+fn fsc_v2_status(
+    stream_available: bool,
+    saw_transfer: bool,
+    total_buyers: u64,
+    known_non_neutral_buyers: u64,
+    neutral_count: u64,
+    known_coverage: f64,
+    non_neutral_known_coverage: f64,
+    low_confidence_count: u64,
+    same_slot_unorderable_count: u64,
+    hhi_norm_count: Option<f64>,
+) -> (FscEvidenceStatus, Option<FscExcludedReason>) {
+    if !stream_available {
+        return (
+            FscEvidenceStatus::Unavailable,
+            Some(FscExcludedReason::FundingLaneUnavailable),
+        );
+    }
+    if !saw_transfer {
+        return (
+            FscEvidenceStatus::Unavailable,
+            Some(FscExcludedReason::IndexCold),
+        );
+    }
+    if total_buyers == 0 {
+        return (
+            FscEvidenceStatus::Unavailable,
+            Some(FscExcludedReason::NoBuyerCohort),
+        );
+    }
+    if same_slot_unorderable_count > 0 {
+        return (
+            FscEvidenceStatus::Degraded,
+            Some(FscExcludedReason::SameSlotOrderingUnavailable),
+        );
+    }
+    if low_confidence_count > 0 {
+        return (
+            FscEvidenceStatus::Degraded,
+            Some(FscExcludedReason::LowAttributionConfidence),
+        );
+    }
+    if known_non_neutral_buyers < FSC_V2_MIN_KNOWN_NON_NEUTRAL_BUYERS || hhi_norm_count.is_none() {
+        let reason = if known_non_neutral_buyers == 0 && neutral_count > 0 {
+            FscExcludedReason::NeutralOnly
+        } else {
+            FscExcludedReason::InsufficientNonNeutralSupport
+        };
+        return (FscEvidenceStatus::Degraded, Some(reason));
+    }
+    if total_buyers < FSC_V2_MIN_TOTAL_BUYERS
+        || known_coverage < FSC_V2_MIN_KNOWN_COVERAGE
+        || non_neutral_known_coverage < FSC_V2_MIN_NON_NEUTRAL_KNOWN_COVERAGE
+    {
+        return (
+            FscEvidenceStatus::Degraded,
+            Some(FscExcludedReason::LowCoverage),
+        );
+    }
+
+    (FscEvidenceStatus::Clean, None)
+}
+
+fn normalized_hhi_from_counts(counts: &[u64]) -> Option<f64> {
+    let sample_n = counts.iter().copied().sum::<u64>();
+    if sample_n < 2 {
+        return None;
+    }
+
+    let sample_n_f64 = sample_n as f64;
+    let hhi = counts
+        .iter()
+        .map(|count| {
+            let p = *count as f64 / sample_n_f64;
+            p * p
+        })
+        .sum::<f64>();
+    let minimum_hhi = 1.0 / sample_n_f64;
+    let denominator = 1.0 - minimum_hhi;
+    if denominator <= 0.0 {
+        return None;
+    }
+    Some(clamp_unit_epsilon((hhi - minimum_hhi) / denominator))
+}
+
+fn normalized_sol_weighted_excess(weights: &[(String, f64)]) -> Option<f64> {
+    if weights.len() < 2 {
+        return None;
+    }
+    let total = weights.iter().map(|(_, weight)| *weight).sum::<f64>();
+    if total <= 0.0 {
+        return None;
+    }
+
+    let buyer_weight_hhi = weights
+        .iter()
+        .map(|(_, weight)| {
+            let normalized = *weight / total;
+            normalized * normalized
+        })
+        .sum::<f64>();
+    let denominator = 1.0 - buyer_weight_hhi;
+    if denominator <= 0.0 {
+        return None;
+    }
+
+    let mut source_weights = HashMap::<String, f64>::new();
+    for (source, weight) in weights {
+        *source_weights.entry(source.clone()).or_default() += *weight / total;
+    }
+    let source_hhi = source_weights
+        .values()
+        .map(|weight| weight * weight)
+        .sum::<f64>();
+
+    Some(clamp_unit_epsilon(
+        (source_hhi - buyer_weight_hhi) / denominator,
+    ))
+}
+
+fn ratio(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        (numerator as f64 / denominator as f64).clamp(0.0, 1.0)
+    }
+}
+
+fn clamp_unit_epsilon(value: f64) -> f64 {
+    let clamped = value.clamp(0.0, 1.0);
+    if clamped <= 1e-12 {
+        0.0
+    } else if (1.0 - clamped) <= 1e-12 {
+        1.0
+    } else {
+        clamped
+    }
+}
+
+fn miss_reason_count(diagnostics: &FundingSourceDiagnostics, reason: &str) -> u64 {
+    diagnostics
+        .miss_reason_counts
+        .iter()
+        .find(|entry| entry.reason == reason)
+        .map(|entry| entry.count)
+        .unwrap_or_default()
+}
+
+fn saturating_u8(value: u64) -> u8 {
+    value.min(u64::from(u8::MAX)) as u8
+}
+
+fn saturating_u16(value: u64) -> u16 {
+    value.min(u64::from(u16::MAX)) as u16
+}
+
+fn neutral_funder_set_hash(config: &FundingSourceConfig) -> Option<String> {
+    if config.neutral_funding_sources.is_empty() {
+        return None;
+    }
+    let mut sources = config
+        .neutral_funding_sources
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    sources.sort();
+    Some(stable_fnv64_hex(sources.join("\n").as_bytes()))
+}
+
+fn funding_source_config_hash(config: &FundingSourceConfig) -> String {
+    let mut neutral_sources = config
+        .neutral_funding_sources
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    neutral_sources.sort();
+    stable_fnv64_hex(
+        format!(
+            "lookback_window_ms={};dust_threshold_lamports={};min_attribution_confidence_bps={};per_recipient_cap={};global_recipient_cap={};neutral_sources={}",
+            config.lookback_window_ms,
+            config.dust_threshold_lamports,
+            config.min_attribution_confidence_bps,
+            config.per_recipient_cap,
+            config.global_recipient_cap,
+            neutral_sources.join(",")
+        )
+        .as_bytes(),
+    )
+}
+
+fn stable_fnv64_hex(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("fnv64:{hash:016x}")
 }
 
 impl FundingSourceIndex {
@@ -357,6 +790,8 @@ impl FundingSourceIndex {
             buyer_sample_count: buyer_samples.len() as u64,
             ..FundingSourceDiagnostics::default()
         };
+        let max_buy_slot = buyer_samples.iter().filter_map(|tx| tx.slot).max();
+        let mut fsc_v2_accumulator = FscV2Accumulator::new(buyer_samples.len());
 
         let earliest_buy_ts_ms = buyer_samples
             .iter()
@@ -369,16 +804,34 @@ impl FundingSourceIndex {
         let mut inner = self.inner.write();
 
         if !inner.stream_available {
+            let funding_source_v2 = build_fsc_v2_evidence(
+                &fsc_v2_accumulator,
+                &diagnostics,
+                false,
+                inner.saw_transfer,
+                config,
+                max_buy_slot,
+            );
             return FscComputation {
                 funding_source_concentration: None,
+                funding_source_v2,
                 degraded_reasons: vec![FSC_FUNDING_STREAM_UNAVAILABLE_REASON.to_string()],
                 diagnostics,
             };
         }
 
         if !inner.saw_transfer {
+            let funding_source_v2 = build_fsc_v2_evidence(
+                &fsc_v2_accumulator,
+                &diagnostics,
+                inner.stream_available,
+                false,
+                config,
+                max_buy_slot,
+            );
             return FscComputation {
                 funding_source_concentration: None,
+                funding_source_v2,
                 degraded_reasons: vec![FSC_ROLLING_STATE_UNAVAILABLE_REASON.to_string()],
                 diagnostics,
             };
@@ -396,14 +849,31 @@ impl FundingSourceIndex {
                 removed_entries = removed_entries.saturating_add(1);
             }
             match matched {
-                FundingSourceMatch::Concrete(source) | FundingSourceMatch::Neutral(source) => {
+                FundingSourceMatch::Concrete(source) => {
                     lookup_hits = lookup_hits.saturating_add(1);
                     diagnostics.known_source_count =
                         diagnostics.known_source_count.saturating_add(1);
-                    known_sources.push(source);
+                    known_sources.push(source.clone());
+                    fsc_v2_accumulator.record_concrete(
+                        source,
+                        tx_buy_sol(tx),
+                        lookup.attribution_confidence_bps,
+                    );
+                }
+                FundingSourceMatch::Neutral {
+                    source_wallet,
+                    legacy_key,
+                } => {
+                    lookup_hits = lookup_hits.saturating_add(1);
+                    diagnostics.known_source_count =
+                        diagnostics.known_source_count.saturating_add(1);
+                    known_sources.push(legacy_key);
+                    fsc_v2_accumulator
+                        .record_neutral(source_wallet, lookup.attribution_confidence_bps);
                 }
                 FundingSourceMatch::Unknown => {
                     lookup_misses = lookup_misses.saturating_add(1);
+                    fsc_v2_accumulator.record_unknown();
                     if let Some(miss) = lookup.miss {
                         record_lookup_miss(&mut diagnostics, miss);
                     }
@@ -429,10 +899,19 @@ impl FundingSourceIndex {
             record_fsc_lookup_misses(lookup_misses);
         }
         sort_lookup_miss_counts(&mut diagnostics);
+        let funding_source_v2 = build_fsc_v2_evidence(
+            &fsc_v2_accumulator,
+            &diagnostics,
+            inner.stream_available,
+            inner.saw_transfer,
+            config,
+            max_buy_slot,
+        );
 
         if known_sources.len() < 2 {
             return FscComputation {
                 funding_source_concentration: None,
+                funding_source_v2,
                 degraded_reasons: vec![FSC_INSUFFICIENT_KNOWN_SOURCES_REASON.to_string()],
                 diagnostics,
             };
@@ -443,6 +922,7 @@ impl FundingSourceIndex {
             funding_source_concentration: Some(
                 1.0 - (distinct_known_sources as f64 / known_sources.len() as f64),
             ),
+            funding_source_v2,
             degraded_reasons: Vec::new(),
             diagnostics,
         }
@@ -645,6 +1125,9 @@ fn lookup_source_for_buy(
                 reason: FSC_BUYER_IDENTITY_UNAVAILABLE_REASON,
                 class: FscMissClass::Operational,
             }),
+            attribution_confidence_bps: None,
+            selected_lamports: 0,
+            total_lamports: 0,
         };
     }
 
@@ -657,6 +1140,9 @@ fn lookup_source_for_buy(
                 reason: FSC_BUY_TIMESTAMP_UNAVAILABLE_REASON,
                 class: FscMissClass::Operational,
             }),
+            attribution_confidence_bps: None,
+            selected_lamports: 0,
+            total_lamports: 0,
         };
     }
     let buy_window_start = buy_event_ts_ms.saturating_sub(config.lookback_window_ms);
@@ -675,6 +1161,9 @@ fn lookup_source_for_buy(
             WalletLookupOutcome::Matched {
                 matched,
                 removed: wallet_removed,
+                attribution_confidence_bps,
+                selected_lamports,
+                total_lamports,
             } => {
                 if wallet_removed {
                     inner.histories.remove(wallet.as_str());
@@ -684,6 +1173,9 @@ fn lookup_source_for_buy(
                     matched,
                     removed,
                     miss: None,
+                    attribution_confidence_bps: Some(attribution_confidence_bps),
+                    selected_lamports,
+                    total_lamports,
                 };
             }
             WalletLookupOutcome::ContinueMiss {
@@ -708,6 +1200,9 @@ fn lookup_source_for_buy(
                     matched: FundingSourceMatch::Unknown,
                     removed,
                     miss: Some(choose_lookup_miss(lookup_miss, miss)),
+                    attribution_confidence_bps: None,
+                    selected_lamports: 0,
+                    total_lamports: 0,
                 };
             }
         }
@@ -717,6 +1212,9 @@ fn lookup_source_for_buy(
         matched: FundingSourceMatch::Unknown,
         removed,
         miss: lookup_miss,
+        attribution_confidence_bps: None,
+        selected_lamports: 0,
+        total_lamports: 0,
     }
 }
 
@@ -821,14 +1319,22 @@ fn lookup_source_for_wallet(
             };
         }
 
+        let attribution_confidence_bps =
+            attribution_confidence_bps(selection.selected_lamports, selection.total_lamports);
         let matched = if config.is_neutral_source(&selection.source_wallet) {
-            FundingSourceMatch::Neutral(format!("neutral:{}", selection.recipient_wallet))
+            FundingSourceMatch::Neutral {
+                source_wallet: selection.source_wallet.clone(),
+                legacy_key: format!("neutral:{}", selection.recipient_wallet),
+            }
         } else {
-            FundingSourceMatch::Concrete(selection.source_wallet)
+            FundingSourceMatch::Concrete(selection.source_wallet.clone())
         };
         return WalletLookupOutcome::Matched {
             matched,
             removed: false,
+            attribution_confidence_bps,
+            selected_lamports: selection.selected_lamports,
+            total_lamports: selection.total_lamports,
         };
     }
 
@@ -881,6 +1387,17 @@ fn attribution_confidence_passes(
     }
     selected_lamports.saturating_mul(10_000)
         >= total_lamports.saturating_mul(u128::from(min_confidence_bps))
+}
+
+fn attribution_confidence_bps(selected_lamports: u128, total_lamports: u128) -> u16 {
+    if total_lamports == 0 {
+        return 0;
+    }
+    selected_lamports
+        .saturating_mul(10_000)
+        .checked_div(total_lamports)
+        .unwrap_or_default()
+        .min(u128::from(u16::MAX)) as u16
 }
 
 fn transfer_buy_order(
@@ -1061,6 +1578,13 @@ fn tx_event_ts_ms(tx: &PoolTransaction) -> u64 {
     tx.event_time
         .compat_event_ts_ms(Some(tx.timestamp_ms))
         .unwrap_or(tx.timestamp_ms)
+}
+
+fn tx_buy_sol(tx: &PoolTransaction) -> f64 {
+    tx.sol_amount_lamports
+        .map(|lamports| lamports as f64 / 1_000_000_000.0)
+        .unwrap_or(tx.volume_sol)
+        .max(0.0)
 }
 
 fn funding_transfer_event_ts_ms(transfer: &FundingTransferObserved) -> u64 {
@@ -1286,6 +1810,56 @@ mod tests {
 
         assert_eq!(computed.funding_source_concentration, Some(0.0));
         assert!(computed.degraded_reasons.is_empty());
+        assert_eq!(
+            computed.funding_source_v2.status,
+            FscEvidenceStatus::Degraded
+        );
+        assert_eq!(
+            computed.funding_source_v2.excluded_reason,
+            Some(FscExcludedReason::NeutralOnly)
+        );
+        assert_eq!(computed.funding_source_v2.hhi_norm_count, None);
+        assert_eq!(
+            computed.funding_source_v2.raw_hhi_including_neutral,
+            Some(1.0)
+        );
+        assert_eq!(computed.funding_source_v2.neutral_count, 3);
+    }
+
+    #[test]
+    fn fsc_v2_mixed_neutral_and_non_neutral_support_is_not_neutral_only() {
+        let mut gatekeeper_config = GatekeeperV2Config::default();
+        gatekeeper_config.funding_lookback_window_s = 1;
+        gatekeeper_config.funding_dust_threshold_lamports = 10_000;
+        gatekeeper_config.neutral_funding_sources = vec!["neutral-hot-wallet".to_string()];
+        let config = FundingSourceConfig::from_gatekeeper_config(&gatekeeper_config);
+        let index = FundingSourceIndex::new();
+        index.observe_transfer(
+            &funding_transfer("neutral-hot-wallet", "buyer-a", "fund-a", 100, 50_000_000),
+            &config,
+        );
+        index.observe_transfer(
+            &funding_transfer("non-neutral-funder", "buyer-b", "fund-b", 200, 50_000_000),
+            &config,
+        );
+
+        let buys = vec![
+            buy_tx("buyer-a", "buy-a", 400),
+            buy_tx("buyer-b", "buy-b", 500),
+        ];
+        let computed = index.compute_for_transactions(buys.iter(), &config);
+
+        assert_eq!(
+            computed.funding_source_v2.status,
+            FscEvidenceStatus::Degraded
+        );
+        assert_eq!(
+            computed.funding_source_v2.excluded_reason,
+            Some(FscExcludedReason::InsufficientNonNeutralSupport)
+        );
+        assert_eq!(computed.funding_source_v2.known_non_neutral_buyers, 1);
+        assert_eq!(computed.funding_source_v2.neutral_count, 1);
+        assert_eq!(computed.funding_source_v2.hhi_norm_count, None);
     }
 
     #[test]
@@ -1420,6 +1994,16 @@ mod tests {
         let computed = index.compute_for_transactions(buys.iter(), &config);
 
         assert_eq!(computed.funding_source_concentration, None);
+        assert_eq!(
+            computed.funding_source_v2.status,
+            FscEvidenceStatus::Degraded
+        );
+        assert_eq!(
+            computed.funding_source_v2.excluded_reason,
+            Some(FscExcludedReason::LowAttributionConfidence)
+        );
+        assert_eq!(computed.funding_source_v2.low_confidence_count, 1);
+        assert_eq!(computed.funding_source_v2.hhi_norm_count, None);
         assert_eq!(computed.diagnostics.known_source_count, 1);
         assert_eq!(computed.diagnostics.unknown_buyer_count, 1);
         assert_eq!(computed.diagnostics.indeterminate_unknown_buyer_count, 1);
@@ -1458,6 +2042,15 @@ mod tests {
         let computed = index.compute_for_transactions(buys.iter(), &config);
 
         assert_eq!(computed.funding_source_concentration, None);
+        assert_eq!(
+            computed.funding_source_v2.status,
+            FscEvidenceStatus::Degraded
+        );
+        assert_eq!(
+            computed.funding_source_v2.excluded_reason,
+            Some(FscExcludedReason::SameSlotOrderingUnavailable)
+        );
+        assert_eq!(computed.funding_source_v2.same_slot_unorderable_count, 1);
         assert_eq!(computed.diagnostics.known_source_count, 1);
         assert_eq!(computed.diagnostics.unknown_buyer_count, 1);
         assert_eq!(
@@ -1720,8 +2313,70 @@ mod tests {
         let computed = index.compute_for_transactions(buys.iter(), &config);
 
         assert_eq!(computed.funding_source_concentration, Some(0.5));
+        assert_eq!(computed.funding_source_v2.hhi_norm_count, Some(1.0));
+        assert_eq!(
+            computed.funding_source_v2.top_funder,
+            Some(FundingSourceKey::new("shared-funder"))
+        );
         assert_eq!(computed.diagnostics.known_source_count, 2);
         assert_eq!(computed.diagnostics.unknown_buyer_count, 0);
+    }
+
+    #[test]
+    fn fsc_v2_sample_normalized_hhi_controls_match_plan_examples() {
+        assert_eq!(normalized_hhi_from_counts(&[5]), Some(1.0));
+        assert_eq!(normalized_hhi_from_counts(&[1, 1, 1, 1, 1]), Some(0.0));
+        assert_approx_eq(normalized_hhi_from_counts(&[4, 1]).unwrap(), 0.60);
+        assert_eq!(normalized_hhi_from_counts(&[1]), None);
+    }
+
+    #[test]
+    fn fsc_v2_weighted_excess_does_not_confuse_unequal_unique_buy_sizes_with_coordination() {
+        let unique_sources = vec![
+            ("source-a".to_string(), 1.0),
+            ("source-b".to_string(), 2.0),
+            ("source-c".to_string(), 7.0),
+        ];
+        assert_eq!(normalized_sol_weighted_excess(&unique_sources), Some(0.0));
+
+        let shared_source = vec![
+            ("source-a".to_string(), 1.0),
+            ("source-a".to_string(), 2.0),
+            ("source-a".to_string(), 7.0),
+        ];
+        assert_eq!(normalized_sol_weighted_excess(&shared_source), Some(1.0));
+    }
+
+    #[test]
+    fn fsc_v2_evidence_serializes_additively_without_legacy_field_redefinition() {
+        let config = config();
+        let index = FundingSourceIndex::new();
+        index.observe_transfer(
+            &funding_transfer("shared-funder", "buyer-a", "fund-a", 100, 50_000_000),
+            &config,
+        );
+        index.observe_transfer(
+            &funding_transfer("shared-funder", "buyer-b", "fund-b", 200, 50_000_000),
+            &config,
+        );
+
+        let buys = vec![
+            buy_tx("buyer-a", "buy-a", 400),
+            buy_tx("buyer-b", "buy-b", 500),
+        ];
+        let computed = index.compute_for_transactions(buys.iter(), &config);
+
+        assert_eq!(computed.funding_source_concentration, Some(0.5));
+        assert_eq!(computed.funding_source_v2.hhi_norm_count, Some(1.0));
+        assert_eq!(computed.funding_source_v2.status, FscEvidenceStatus::Clean);
+
+        let payload = serde_json::to_value(&computed.funding_source_v2)
+            .expect("fsc v2 evidence should serialize");
+        assert_eq!(payload["version"], "v2");
+        assert_eq!(payload["attribution_scope"], "single_hop_native_sol");
+        assert_eq!(payload["snapshot_mode"], "decision_time");
+        assert_eq!(payload["hhi_norm_count"], 1.0);
+        assert_eq!(payload["top_funder"]["wallet"], "shared-funder");
     }
 
     #[test]

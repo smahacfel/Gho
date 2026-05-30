@@ -150,6 +150,146 @@ pub struct FundingSourceMissReasonCount {
     pub count: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FscVersion {
+    #[default]
+    V2,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FscAttributionScope {
+    #[default]
+    SingleHopNativeSol,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FscSnapshotMode {
+    #[default]
+    DecisionTime,
+    EventualPostfill,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FscEvidenceStatus {
+    Clean,
+    Degraded,
+    #[default]
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FscExcludedReason {
+    FundingLaneUnavailable,
+    IndexCold,
+    NoBuyerCohort,
+    InsufficientNonNeutralSupport,
+    LowCoverage,
+    NeutralOnly,
+    SameSlotOrderingUnavailable,
+    LowAttributionConfidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FundingSourceKey {
+    pub wallet: String,
+}
+
+impl FundingSourceKey {
+    #[must_use]
+    pub fn new(wallet: impl Into<String>) -> Self {
+        Self {
+            wallet: wallet.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FundingSourceCount {
+    pub source: FundingSourceKey,
+    pub count: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FscV2Evidence {
+    pub version: FscVersion,
+    pub attribution_scope: FscAttributionScope,
+    pub snapshot_mode: FscSnapshotMode,
+
+    pub total_buyers: u8,
+    pub known_buyers: u8,
+    pub known_non_neutral_buyers: u8,
+    pub unknown_count: u8,
+    pub neutral_count: u8,
+    pub low_confidence_count: u8,
+    pub same_slot_unorderable_count: u16,
+
+    pub known_coverage: f64,
+    pub non_neutral_known_coverage: f64,
+    pub neutral_share: f64,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top1_share_count: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top1_share_sol: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hhi_norm_count: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hhi_norm_sol_weighted_excess: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_hhi_including_neutral: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scoring_hhi_non_neutral: Option<f64>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_funder: Option<FundingSourceKey>,
+    pub top_funder_count: u8,
+    pub top_funder_buy_sol: f64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_counts: Vec<FundingSourceCount>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attribution_confidence_mean: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attribution_confidence_min: Option<f64>,
+
+    pub dust_filtered_count: u16,
+    pub post_buy_filtered_count: u16,
+    pub rel_too_small_count: u16,
+
+    pub index_warm: bool,
+    pub capture_ready: bool,
+    pub status: FscEvidenceStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub excluded_reason: Option<FscExcludedReason>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub funding_lane_watermark_slot: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_buy_slot: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub funding_lane_lag_slots: Option<i64>,
+    pub stream_epoch: u64,
+    pub gap_suspected: bool,
+
+    pub min_abs_store_lamports: u64,
+    pub min_abs_attribution_lamports: u64,
+    pub min_rel_to_buy: f64,
+    pub ttl_seconds: u64,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub neutral_funder_set_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub neutral_funder_set_hash: Option<String>,
+    pub config_hash: String,
+    pub provider: String,
+    pub source_topics: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SybilResistanceFeatures {
     #[serde(default, skip_serializing_if = "Option::is_none")]
