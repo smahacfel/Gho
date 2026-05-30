@@ -11,8 +11,9 @@ use ghost_core::tx_intelligence::types::{
     FSC_BUYER_IDENTITY_UNAVAILABLE_REASON, FSC_BUY_TIMESTAMP_UNAVAILABLE_REASON,
     FSC_FUNDING_STREAM_UNAVAILABLE_REASON, FSC_GLOBAL_RECIPIENT_EVICTED_REASON,
     FSC_INSUFFICIENT_KNOWN_SOURCES_REASON, FSC_LOOKBACK_WINDOW_EXHAUSTED_REASON,
-    FSC_NO_PREBUY_TRANSFER_IN_WINDOW_REASON, FSC_NO_RETAINED_RECIPIENT_HISTORY_REASON,
-    FSC_PER_RECIPIENT_HISTORY_OVERFLOW_REASON, FSC_ROLLING_STATE_UNAVAILABLE_REASON,
+    FSC_LOW_ATTRIBUTION_CONFIDENCE_REASON, FSC_NO_PREBUY_TRANSFER_IN_WINDOW_REASON,
+    FSC_NO_RETAINED_RECIPIENT_HISTORY_REASON, FSC_PER_RECIPIENT_HISTORY_OVERFLOW_REASON,
+    FSC_ROLLING_STATE_UNAVAILABLE_REASON, FSC_SAME_SLOT_ORDERING_UNAVAILABLE_REASON,
 };
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -22,6 +23,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 pub struct FundingSourceConfig {
     pub lookback_window_ms: u64,
     pub dust_threshold_lamports: u64,
+    pub min_attribution_confidence_bps: u16,
     pub per_recipient_cap: usize,
     pub global_recipient_cap: usize,
     neutral_funding_sources: HashSet<String>,
@@ -36,6 +38,7 @@ impl FundingSourceConfig {
                 .saturating_mul(1_000)
                 .max(1),
             dust_threshold_lamports: config.funding_dust_threshold_lamports,
+            min_attribution_confidence_bps: 6_000,
             per_recipient_cap: config.fsc_per_recipient_cap.max(1),
             global_recipient_cap: config.fsc_global_recipient_cap.max(1),
             neutral_funding_sources: config
@@ -132,6 +135,65 @@ struct LookupSourceResult {
 struct LookupMiss {
     reason: &'static str,
     class: FscMissClass,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WalletLookupOutcome {
+    Matched {
+        matched: FundingSourceMatch,
+        removed: bool,
+    },
+    ContinueMiss {
+        miss: LookupMiss,
+        removed: bool,
+    },
+    TerminalMiss {
+        miss: LookupMiss,
+        removed: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FundingAttributionSelection {
+    recipient_wallet: String,
+    source_wallet: String,
+    selected_lamports: u128,
+    total_lamports: u128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceAccumulator {
+    recipient_wallet: String,
+    source_wallet: String,
+    total_lamports: u128,
+    latest_transfer_key: TransferTieBreakKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct BuyOrderKey {
+    slot: u64,
+    tx_index: u32,
+    event_ordinal: u32,
+    event_ts_ms: u64,
+    arrival_ts_ms: u64,
+    signature: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct TransferTieBreakKey {
+    slot: u64,
+    tx_index: u32,
+    event_ordinal: u32,
+    observed_at_ms: u64,
+    arrival_ts_ms: u64,
+    signature: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransferBuyOrder {
+    Precedes,
+    DoesNotPrecede,
+    Unorderable,
 }
 
 impl FundingSourceIndex {
@@ -290,9 +352,7 @@ impl FundingSourceIndex {
         transactions: impl IntoIterator<Item = &'a PoolTransaction>,
         config: &FundingSourceConfig,
     ) -> FscComputation {
-        let mut buyer_samples = unique_successful_buyers(transactions);
-        buyer_samples
-            .sort_by_key(|tx| (tx_event_ts_ms(tx), tx.arrival_ts_ms, tx.signature.clone()));
+        let buyer_samples = unique_successful_buyers(transactions);
         let mut diagnostics = FundingSourceDiagnostics {
             buyer_sample_count: buyer_samples.len() as u64,
             ..FundingSourceDiagnostics::default()
@@ -444,6 +504,8 @@ fn lookup_miss_rank(miss: LookupMiss) -> (u8, u8) {
         FSC_PER_RECIPIENT_HISTORY_OVERFLOW_REASON => 1,
         FSC_NO_RETAINED_RECIPIENT_HISTORY_REASON => 1,
         FSC_LOOKBACK_WINDOW_EXHAUSTED_REASON => 1,
+        FSC_SAME_SLOT_ORDERING_UNAVAILABLE_REASON => 1,
+        FSC_LOW_ATTRIBUTION_CONFIDENCE_REASON => 1,
         FSC_NO_PREBUY_TRANSFER_IN_WINDOW_REASON => 0,
         _ => 0,
     };
@@ -597,37 +659,134 @@ fn lookup_source_for_buy(
             }),
         };
     }
-    let buy_arrival_ts_ms = tx.arrival_ts_ms;
     let buy_window_start = buy_event_ts_ms.saturating_sub(config.lookback_window_ms);
 
-    let mut remove_wallets = Vec::new();
-    let mut matched_source = None::<(String, String)>;
     let mut lookup_miss = None::<LookupMiss>;
+    let mut removed = false;
     for wallet in lookup_wallets {
-        if let Some(history) = inner.histories.get_mut(&wallet) {
-            prune_transfer_history(&mut history.transfers, buy_window_start);
-            if history.transfers.is_empty() {
-                lookup_miss = Some(choose_lookup_miss(
-                    lookup_miss,
-                    LookupMiss {
-                        reason: FSC_LOOKBACK_WINDOW_EXHAUSTED_REASON,
-                        class: FscMissClass::Structural,
-                    },
-                ));
-                remove_wallets.push(wallet);
-                continue;
+        match lookup_source_for_wallet(
+            inner,
+            wallet.as_str(),
+            tx,
+            config,
+            buy_event_ts_ms,
+            buy_window_start,
+        ) {
+            WalletLookupOutcome::Matched {
+                matched,
+                removed: wallet_removed,
+            } => {
+                if wallet_removed {
+                    inner.histories.remove(wallet.as_str());
+                }
+                removed |= wallet_removed;
+                return LookupSourceResult {
+                    matched,
+                    removed,
+                    miss: None,
+                };
             }
+            WalletLookupOutcome::ContinueMiss {
+                miss,
+                removed: wallet_removed,
+            } => {
+                if wallet_removed {
+                    inner.histories.remove(wallet.as_str());
+                }
+                removed |= wallet_removed;
+                lookup_miss = Some(choose_lookup_miss(lookup_miss, miss));
+            }
+            WalletLookupOutcome::TerminalMiss {
+                miss,
+                removed: wallet_removed,
+            } => {
+                if wallet_removed {
+                    inner.histories.remove(wallet.as_str());
+                }
+                removed |= wallet_removed;
+                return LookupSourceResult {
+                    matched: FundingSourceMatch::Unknown,
+                    removed,
+                    miss: Some(choose_lookup_miss(lookup_miss, miss)),
+                };
+            }
+        }
+    }
 
-            matched_source = history
-                .transfers
-                .iter()
-                .rev()
-                .find(|transfer| {
-                    transfer_precedes_buy(transfer, tx, buy_event_ts_ms, buy_arrival_ts_ms)
-                })
-                .map(|transfer| (wallet, transfer.source_wallet.clone()));
-            if matched_source.is_some() {
-                break;
+    LookupSourceResult {
+        matched: FundingSourceMatch::Unknown,
+        removed,
+        miss: lookup_miss,
+    }
+}
+
+fn lookup_source_for_wallet(
+    inner: &mut FundingSourceInner,
+    wallet: &str,
+    tx: &PoolTransaction,
+    config: &FundingSourceConfig,
+    buy_event_ts_ms: u64,
+    buy_window_start: u64,
+) -> WalletLookupOutcome {
+    if let Some(history) = inner.histories.get_mut(wallet) {
+        prune_transfer_history(&mut history.transfers, buy_window_start);
+        if history.transfers.is_empty() {
+            return WalletLookupOutcome::ContinueMiss {
+                miss: LookupMiss {
+                    reason: FSC_LOOKBACK_WINDOW_EXHAUSTED_REASON,
+                    class: FscMissClass::Structural,
+                },
+                removed: true,
+            };
+        }
+
+        let mut source_accumulators = HashMap::<String, SourceAccumulator>::new();
+        let mut total_candidate_lamports = 0u128;
+        let mut wallet_candidate_count = 0u64;
+        let mut saw_unorderable_prebuy_candidate = false;
+
+        for transfer in &history.transfers {
+            match transfer_buy_order(transfer, tx, buy_event_ts_ms) {
+                TransferBuyOrder::Precedes => {
+                    wallet_candidate_count = wallet_candidate_count.saturating_add(1);
+                    let transfer_lamports = u128::from(transfer.lamports);
+                    total_candidate_lamports =
+                        total_candidate_lamports.saturating_add(transfer_lamports);
+                    let tie_key = transfer_tie_break_key(transfer);
+                    source_accumulators
+                        .entry(transfer.source_wallet.clone())
+                        .and_modify(|source| {
+                            source.total_lamports =
+                                source.total_lamports.saturating_add(transfer_lamports);
+                            if tie_key > source.latest_transfer_key {
+                                source.latest_transfer_key = tie_key.clone();
+                                source.recipient_wallet = wallet.to_string();
+                            }
+                        })
+                        .or_insert_with(|| SourceAccumulator {
+                            recipient_wallet: wallet.to_string(),
+                            source_wallet: transfer.source_wallet.clone(),
+                            total_lamports: transfer_lamports,
+                            latest_transfer_key: tie_key,
+                        });
+                }
+                TransferBuyOrder::DoesNotPrecede => {}
+                TransferBuyOrder::Unorderable => {
+                    saw_unorderable_prebuy_candidate = true;
+                }
+            }
+        }
+
+        let Some(selection) = select_dominant_source(source_accumulators, total_candidate_lamports)
+        else {
+            if saw_unorderable_prebuy_candidate {
+                return WalletLookupOutcome::TerminalMiss {
+                    miss: LookupMiss {
+                        reason: FSC_SAME_SLOT_ORDERING_UNAVAILABLE_REASON,
+                        class: FscMissClass::Indeterminate,
+                    },
+                    removed: false,
+                };
             }
 
             let miss = if history.overflowed_before_oldest_retained {
@@ -641,73 +800,143 @@ fn lookup_source_for_buy(
                     class: FscMissClass::Structural,
                 }
             };
-            lookup_miss = Some(choose_lookup_miss(lookup_miss, miss));
-        } else if inner.evicted_recipients.contains_key(&wallet) {
-            lookup_miss = Some(choose_lookup_miss(
-                lookup_miss,
-                LookupMiss {
-                    reason: FSC_GLOBAL_RECIPIENT_EVICTED_REASON,
-                    class: FscMissClass::Operational,
-                },
-            ));
-        } else {
-            lookup_miss = Some(choose_lookup_miss(
-                lookup_miss,
-                LookupMiss {
-                    reason: FSC_NO_RETAINED_RECIPIENT_HISTORY_REASON,
+            return WalletLookupOutcome::ContinueMiss {
+                miss,
+                removed: false,
+            };
+        };
+
+        debug_assert!(wallet_candidate_count > 0);
+        if !attribution_confidence_passes(
+            selection.selected_lamports,
+            selection.total_lamports,
+            config.min_attribution_confidence_bps,
+        ) {
+            return WalletLookupOutcome::TerminalMiss {
+                miss: LookupMiss {
+                    reason: FSC_LOW_ATTRIBUTION_CONFIDENCE_REASON,
                     class: FscMissClass::Indeterminate,
                 },
-            ));
+                removed: false,
+            };
         }
-    }
 
-    let removed = !remove_wallets.is_empty();
-    for wallet in remove_wallets {
-        inner.histories.remove(wallet.as_str());
-    }
-
-    let Some((matched_wallet, source_wallet)) = matched_source else {
-        return LookupSourceResult {
-            matched: FundingSourceMatch::Unknown,
-            removed,
-            miss: lookup_miss,
+        let matched = if config.is_neutral_source(&selection.source_wallet) {
+            FundingSourceMatch::Neutral(format!("neutral:{}", selection.recipient_wallet))
+        } else {
+            FundingSourceMatch::Concrete(selection.source_wallet)
         };
-    };
-    if config.is_neutral_source(&source_wallet) {
-        return LookupSourceResult {
-            matched: FundingSourceMatch::Neutral(format!("neutral:{matched_wallet}")),
-            removed,
-            miss: None,
+        return WalletLookupOutcome::Matched {
+            matched,
+            removed: false,
         };
     }
-    LookupSourceResult {
-        matched: FundingSourceMatch::Concrete(source_wallet),
-        removed,
-        miss: None,
+
+    if inner.evicted_recipients.contains_key(wallet) {
+        return WalletLookupOutcome::ContinueMiss {
+            miss: LookupMiss {
+                reason: FSC_GLOBAL_RECIPIENT_EVICTED_REASON,
+                class: FscMissClass::Operational,
+            },
+            removed: false,
+        };
+    }
+
+    WalletLookupOutcome::ContinueMiss {
+        miss: LookupMiss {
+            reason: FSC_NO_RETAINED_RECIPIENT_HISTORY_REASON,
+            class: FscMissClass::Indeterminate,
+        },
+        removed: false,
     }
 }
 
-fn transfer_precedes_buy(
+fn select_dominant_source(
+    source_accumulators: HashMap<String, SourceAccumulator>,
+    total_lamports: u128,
+) -> Option<FundingAttributionSelection> {
+    source_accumulators
+        .into_values()
+        .max_by(|lhs, rhs| {
+            lhs.total_lamports
+                .cmp(&rhs.total_lamports)
+                .then_with(|| lhs.latest_transfer_key.cmp(&rhs.latest_transfer_key))
+                .then_with(|| lhs.source_wallet.cmp(&rhs.source_wallet))
+        })
+        .map(|selected| FundingAttributionSelection {
+            recipient_wallet: selected.recipient_wallet,
+            source_wallet: selected.source_wallet,
+            selected_lamports: selected.total_lamports,
+            total_lamports,
+        })
+}
+
+fn attribution_confidence_passes(
+    selected_lamports: u128,
+    total_lamports: u128,
+    min_confidence_bps: u16,
+) -> bool {
+    if total_lamports == 0 {
+        return false;
+    }
+    selected_lamports.saturating_mul(10_000)
+        >= total_lamports.saturating_mul(u128::from(min_confidence_bps))
+}
+
+fn transfer_buy_order(
     transfer: &FundingTransferRecord,
     buy: &PoolTransaction,
     buy_event_ts_ms: u64,
-    buy_arrival_ts_ms: u64,
-) -> bool {
+) -> TransferBuyOrder {
     if transfer.signature == buy.signature {
         if let Some(precedes) = same_signature_transfer_precedes_buy(transfer, buy) {
-            return precedes;
+            return if precedes {
+                TransferBuyOrder::Precedes
+            } else {
+                TransferBuyOrder::DoesNotPrecede
+            };
         }
     }
 
     if let (Some(transfer_slot), Some(buy_slot)) = (transfer.slot, buy.slot) {
         if transfer_slot != buy_slot {
-            return transfer_slot < buy_slot;
+            return if transfer_slot < buy_slot {
+                TransferBuyOrder::Precedes
+            } else {
+                TransferBuyOrder::DoesNotPrecede
+            };
         }
+
+        if transfer.signature == buy.signature {
+            return TransferBuyOrder::Unorderable;
+        }
+
+        return match (transfer.tx_index, buy.tx_index) {
+            (Some(transfer_tx_index), Some(buy_tx_index)) if transfer_tx_index < buy_tx_index => {
+                TransferBuyOrder::Precedes
+            }
+            (Some(transfer_tx_index), Some(buy_tx_index)) if transfer_tx_index > buy_tx_index => {
+                TransferBuyOrder::DoesNotPrecede
+            }
+            _ => TransferBuyOrder::Unorderable,
+        };
     }
 
-    transfer.observed_at_ms < buy_event_ts_ms
-        || (transfer.observed_at_ms == buy_event_ts_ms
-            && transfer.arrival_ts_ms < buy_arrival_ts_ms)
+    if transfer.observed_at_ms < buy_event_ts_ms {
+        TransferBuyOrder::Precedes
+    } else if transfer.observed_at_ms > buy_event_ts_ms {
+        TransferBuyOrder::DoesNotPrecede
+    } else {
+        match (transfer.tx_index, buy.tx_index) {
+            (Some(transfer_tx_index), Some(buy_tx_index)) if transfer_tx_index < buy_tx_index => {
+                TransferBuyOrder::Precedes
+            }
+            (Some(transfer_tx_index), Some(buy_tx_index)) if transfer_tx_index > buy_tx_index => {
+                TransferBuyOrder::DoesNotPrecede
+            }
+            _ => TransferBuyOrder::Unorderable,
+        }
+    }
 }
 
 fn same_signature_transfer_precedes_buy(
@@ -750,21 +979,52 @@ fn same_signature_transfer_precedes_buy(
 fn unique_successful_buyers<'a>(
     transactions: impl IntoIterator<Item = &'a PoolTransaction>,
 ) -> Vec<&'a PoolTransaction> {
-    let mut seen = HashSet::new();
-    let mut buyers = Vec::new();
+    let mut by_identity = HashMap::<String, &'a PoolTransaction>::new();
+    let mut unresolved_buyers = Vec::new();
     for tx in transactions {
         if !tx.is_buy || !tx.success {
             continue;
         }
         if let Some(buyer_identity) = canonical_buyer_identity(tx) {
-            if seen.insert(buyer_identity) {
-                buyers.push(tx);
-            }
+            by_identity
+                .entry(buyer_identity)
+                .and_modify(|existing| {
+                    if buy_order_key(tx) < buy_order_key(existing) {
+                        *existing = tx;
+                    }
+                })
+                .or_insert(tx);
             continue;
         }
-        buyers.push(tx);
+        unresolved_buyers.push(tx);
     }
+
+    let mut buyers = by_identity.into_values().collect::<Vec<_>>();
+    buyers.extend(unresolved_buyers);
+    buyers.sort_by_key(|tx| buy_order_key(tx));
     buyers
+}
+
+fn buy_order_key(tx: &PoolTransaction) -> BuyOrderKey {
+    BuyOrderKey {
+        slot: tx.slot.unwrap_or(u64::MAX),
+        tx_index: tx.tx_index.unwrap_or(u32::MAX),
+        event_ordinal: tx.event_ordinal.unwrap_or(u32::MAX),
+        event_ts_ms: tx_event_ts_ms(tx),
+        arrival_ts_ms: tx.arrival_ts_ms,
+        signature: tx.signature.clone(),
+    }
+}
+
+fn transfer_tie_break_key(transfer: &FundingTransferRecord) -> TransferTieBreakKey {
+    TransferTieBreakKey {
+        slot: transfer.slot.unwrap_or_default(),
+        tx_index: transfer.tx_index.unwrap_or_default(),
+        event_ordinal: transfer.event_ordinal.unwrap_or_default(),
+        observed_at_ms: transfer.observed_at_ms,
+        arrival_ts_ms: transfer.arrival_ts_ms,
+        signature: transfer.signature.clone(),
+    }
 }
 
 #[must_use]
@@ -830,7 +1090,7 @@ mod tests {
         PoolTransaction {
             semantic: EventSemanticEnvelope::default(),
             pool_amm_id: "pool-1".to_string(),
-            slot: Some(1),
+            slot: None,
             event_ordinal: Some(0),
             tx_index: None,
             outer_instruction_index: None,
@@ -908,7 +1168,7 @@ mod tests {
     ) -> FundingTransferObserved {
         FundingTransferObserved {
             semantic: EventSemanticEnvelope::default(),
-            slot: Some(1),
+            slot: None,
             event_ordinal: None,
             tx_index: None,
             outer_instruction_index: None,
@@ -1065,7 +1325,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_eligible_pre_buy_transfer_wins() {
+    fn dominant_pre_buy_source_can_be_latest_transfer() {
         let config = config();
         let index = FundingSourceIndex::new();
         index.observe_transfer(
@@ -1073,7 +1333,7 @@ mod tests {
             &config,
         );
         index.observe_transfer(
-            &funding_transfer("shared-funder", "buyer-a", "fund-a-new", 250, 50_000_000),
+            &funding_transfer("shared-funder", "buyer-a", "fund-a-new", 250, 75_000_000),
             &config,
         );
         index.observe_transfer(
@@ -1088,6 +1348,173 @@ mod tests {
         let computed = index.compute_for_transactions(buys.iter(), &config);
 
         assert_eq!(computed.funding_source_concentration, Some(0.5));
+    }
+
+    #[test]
+    fn dominant_source_resists_late_small_transfer_poisoning() {
+        let config = config();
+        let index = FundingSourceIndex::new();
+        index.observe_transfer(
+            &funding_transfer(
+                "shared-funder",
+                "buyer-a",
+                "fund-a-dominant",
+                100,
+                400_000_000,
+            ),
+            &config,
+        );
+        index.observe_transfer(
+            &funding_transfer(
+                "late-small-funder",
+                "buyer-a",
+                "fund-a-late-small",
+                250,
+                30_000_000,
+            ),
+            &config,
+        );
+        index.observe_transfer(
+            &funding_transfer(
+                "shared-funder",
+                "buyer-b",
+                "fund-b-dominant",
+                260,
+                50_000_000,
+            ),
+            &config,
+        );
+
+        let buys = vec![
+            buy_tx("buyer-a", "buy-a", 300),
+            buy_tx("buyer-b", "buy-b", 400),
+        ];
+        let computed = index.compute_for_transactions(buys.iter(), &config);
+
+        assert_eq!(computed.funding_source_concentration, Some(0.5));
+        assert_eq!(computed.diagnostics.known_source_count, 2);
+        assert_eq!(computed.diagnostics.unknown_buyer_count, 0);
+    }
+
+    #[test]
+    fn low_attribution_confidence_is_explicit_unknown() {
+        let config = config();
+        let index = FundingSourceIndex::new();
+        index.observe_transfer(
+            &funding_transfer("funder-a", "buyer-a", "fund-a", 100, 55_000_000),
+            &config,
+        );
+        index.observe_transfer(
+            &funding_transfer("funder-b", "buyer-a", "fund-b", 200, 45_000_000),
+            &config,
+        );
+        index.observe_transfer(
+            &funding_transfer("funder-c", "buyer-b", "fund-c", 210, 50_000_000),
+            &config,
+        );
+
+        let buys = vec![
+            buy_tx("buyer-a", "buy-a", 300),
+            buy_tx("buyer-b", "buy-b", 400),
+        ];
+        let computed = index.compute_for_transactions(buys.iter(), &config);
+
+        assert_eq!(computed.funding_source_concentration, None);
+        assert_eq!(computed.diagnostics.known_source_count, 1);
+        assert_eq!(computed.diagnostics.unknown_buyer_count, 1);
+        assert_eq!(computed.diagnostics.indeterminate_unknown_buyer_count, 1);
+        assert_eq!(
+            computed.diagnostics.miss_reason_counts,
+            vec![FundingSourceMissReasonCount {
+                reason: FSC_LOW_ATTRIBUTION_CONFIDENCE_REASON.to_string(),
+                class: FscMissClass::Indeterminate,
+                count: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn same_slot_cross_signature_without_tx_index_is_unorderable() {
+        let config = config();
+        let index = FundingSourceIndex::new();
+
+        let mut funding_a = funding_transfer("shared-funder", "buyer-a", "fund-a", 400, 50_000_000);
+        funding_a.slot = Some(42);
+        funding_a.tx_index = None;
+        index.observe_transfer(&funding_a, &config);
+
+        let mut funding_b = funding_transfer("shared-funder", "buyer-b", "fund-b", 100, 50_000_000);
+        funding_b.slot = Some(41);
+        index.observe_transfer(&funding_b, &config);
+
+        let mut buy_a = buy_tx("buyer-a", "buy-a", 500);
+        buy_a.slot = Some(42);
+        buy_a.tx_index = None;
+
+        let mut buy_b = buy_tx("buyer-b", "buy-b", 500);
+        buy_b.slot = Some(42);
+
+        let buys = vec![buy_a, buy_b];
+        let computed = index.compute_for_transactions(buys.iter(), &config);
+
+        assert_eq!(computed.funding_source_concentration, None);
+        assert_eq!(computed.diagnostics.known_source_count, 1);
+        assert_eq!(computed.diagnostics.unknown_buyer_count, 1);
+        assert_eq!(
+            computed.diagnostics.miss_reason_counts,
+            vec![FundingSourceMissReasonCount {
+                reason: FSC_SAME_SLOT_ORDERING_UNAVAILABLE_REASON.to_string(),
+                class: FscMissClass::Indeterminate,
+                count: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn same_slot_cross_signature_tx_index_orders_transfer_before_buy() {
+        let config = config();
+        let index = FundingSourceIndex::new();
+
+        let mut funding_a = funding_transfer("shared-funder", "buyer-a", "fund-a", 400, 50_000_000);
+        funding_a.slot = Some(42);
+        funding_a.tx_index = Some(3);
+        index.observe_transfer(&funding_a, &config);
+
+        let mut funding_b = funding_transfer("shared-funder", "buyer-b", "fund-b", 400, 50_000_000);
+        funding_b.slot = Some(42);
+        funding_b.tx_index = Some(4);
+        index.observe_transfer(&funding_b, &config);
+
+        let mut buy_a = buy_tx("buyer-a", "buy-a", 400);
+        buy_a.slot = Some(42);
+        buy_a.tx_index = Some(5);
+
+        let mut buy_b = buy_tx("buyer-b", "buy-b", 400);
+        buy_b.slot = Some(42);
+        buy_b.tx_index = Some(6);
+
+        let buys = vec![buy_a, buy_b];
+        let computed = index.compute_for_transactions(buys.iter(), &config);
+
+        assert_eq!(computed.funding_source_concentration, Some(0.5));
+        assert_eq!(computed.diagnostics.known_source_count, 2);
+        assert!(computed.degraded_reasons.is_empty());
+    }
+
+    #[test]
+    fn first_buy_per_buyer_uses_order_key_not_buffer_order() {
+        let mut later = buy_tx("buyer-a", "buy-later", 500);
+        later.slot = Some(20);
+        later.tx_index = Some(2);
+
+        let mut earlier = buy_tx("buyer-a", "buy-earlier", 400);
+        earlier.slot = Some(20);
+        earlier.tx_index = Some(1);
+
+        let buyers = unique_successful_buyers([&later, &earlier]);
+
+        assert_eq!(buyers.len(), 1);
+        assert_eq!(buyers[0].signature, "buy-earlier");
     }
 
     #[test]
@@ -1249,6 +1676,52 @@ mod tests {
 
         assert_eq!(computed.funding_source_concentration, Some(0.5));
         assert!(computed.degraded_reasons.is_empty());
+    }
+
+    #[test]
+    fn owner_wallet_attribution_is_not_poisoned_by_larger_signer_funding() {
+        let config = config();
+        let index = FundingSourceIndex::new();
+        index.observe_transfer(
+            &funding_transfer(
+                "shared-funder",
+                "buyer-owner-a",
+                "fund-owner-a",
+                100,
+                50_000_000,
+            ),
+            &config,
+        );
+        index.observe_transfer(
+            &funding_transfer(
+                "signer-funder",
+                "relayer-a",
+                "fund-signer-a",
+                150,
+                500_000_000,
+            ),
+            &config,
+        );
+        index.observe_transfer(
+            &funding_transfer(
+                "shared-funder",
+                "buyer-owner-b",
+                "fund-owner-b",
+                200,
+                50_000_000,
+            ),
+            &config,
+        );
+
+        let buys = vec![
+            buy_tx_with_owner("relayer-a", "buyer-owner-a", "buy-a", 400),
+            buy_tx_with_owner("relayer-b", "buyer-owner-b", "buy-b", 500),
+        ];
+        let computed = index.compute_for_transactions(buys.iter(), &config);
+
+        assert_eq!(computed.funding_source_concentration, Some(0.5));
+        assert_eq!(computed.diagnostics.known_source_count, 2);
+        assert_eq!(computed.diagnostics.unknown_buyer_count, 0);
     }
 
     #[test]
