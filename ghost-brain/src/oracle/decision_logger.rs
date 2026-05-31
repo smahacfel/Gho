@@ -2240,11 +2240,34 @@ fn hydrate_coordination_risk_routing_fields(
 }
 
 fn gatekeeper_buy_alias_from_verdict(verdict_type: Option<&str>) -> Option<bool> {
-    verdict_type.map(|verdict| {
-        matches!(
-            verdict,
-            "BUY" | "EARLY_BUY" | "BUY_NORMAL" | "BUY_EARLY" | "BUY_EXTENDED"
-        )
+    let verdict = verdict_type?.trim();
+    if matches!(
+        verdict,
+        "BUY" | "EARLY_BUY" | "BUY_NORMAL" | "BUY_EARLY" | "BUY_EXTENDED"
+    ) {
+        Some(true)
+    } else if verdict.starts_with("TIMEOUT") {
+        None
+    } else if verdict.starts_with("REJECT") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn has_v25_shadow_cached_assessment_evidence(log: &GatekeeperBuyLog) -> bool {
+    log.v25_shadow_confidence.is_some() || log.v25_shadow_observation_stage.is_some()
+}
+
+fn v25_shadow_verdict_type_or_terminal_fallback(log: &GatekeeperBuyLog) -> Option<String> {
+    log.v25_shadow_verdict_type.clone().or_else(|| {
+        if !has_v25_shadow_cached_assessment_evidence(log) {
+            return None;
+        }
+        log.verdict_type.as_deref().and_then(|verdict| {
+            let verdict = verdict.trim();
+            verdict.starts_with("TIMEOUT").then(|| verdict.to_string())
+        })
     })
 }
 
@@ -2292,18 +2315,33 @@ fn expand_gatekeeper_plane_logs(log: GatekeeperBuyLog) -> Vec<GatekeeperBuyLog> 
 
     if has_shadow_plane {
         let mut shadow = log.clone();
-        let shadow_verdict_type = shadow.v25_shadow_verdict_type.clone();
+        let used_terminal_timeout_fallback = shadow.v25_shadow_verdict_type.is_none()
+            && has_v25_shadow_cached_assessment_evidence(&shadow)
+            && shadow
+                .verdict_type
+                .as_deref()
+                .map(|verdict| verdict.trim().starts_with("TIMEOUT"))
+                .unwrap_or(false);
+        let shadow_verdict_type = v25_shadow_verdict_type_or_terminal_fallback(&shadow);
         shadow.gatekeeper_version = Some(GATEKEEPER_VERSION.to_string());
         shadow.decision_plane = Some(DECISION_PLANE_V25_SHADOW.to_string());
-        shadow.decision_reason = shadow.v25_shadow_reason_chain.clone();
+        shadow.decision_reason = shadow
+            .v25_shadow_reason_chain
+            .clone()
+            .or_else(|| shadow.decision_reason.clone());
         shadow.decision_verdict_buy =
             gatekeeper_buy_alias_from_verdict(shadow_verdict_type.as_deref());
         shadow.verdict_type = shadow_verdict_type;
-        shadow.reason_code = shadow
+        let shadow_reason_code = shadow
             .verdict_type
             .as_deref()
             .and_then(crate::oracle::reason_code::GatekeeperReasonCode::from_log_str)
             .map(crate::oracle::reason_code::GatekeeperReasonCode::as_log_str);
+        shadow.reason_code = if shadow_reason_code.is_none() && used_terminal_timeout_fallback {
+            shadow.reason_code.clone()
+        } else {
+            shadow_reason_code
+        };
         expanded.push(shadow);
     }
 
@@ -4527,6 +4565,88 @@ mod tests {
         logger.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn test_logger_persists_v25_timeout_with_cached_confidence_only() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().to_path_buf();
+        let config = DecisionLoggerConfig {
+            log_dir: log_dir.clone(),
+            gatekeeper_log_dir: log_dir.clone(),
+            gatekeeper_rollout_profile: "test-rollout".to_string(),
+            gatekeeper_config_hash: "test-config-hash".to_string(),
+            gatekeeper_run_id: None,
+            gatekeeper_session_id: None,
+            brain_config_path: None,
+            brain_config_hash: None,
+            channel_buffer_size: 10,
+            enabled: true,
+        };
+        let logger = DecisionLogger::new(config);
+
+        let mut timeout_log = create_test_buy_log();
+        timeout_log.pool_id = "pool_v25_timeout".to_string();
+        timeout_log.decision_reason =
+            Some("TIMEOUT_PHASE1_INSUFFICIENT: tx=1/3 signers=1/2 buys=1/2".to_string());
+        timeout_log.decision_verdict_buy = None;
+        timeout_log.verdict_type = Some("TIMEOUT_PHASE1_INSUFFICIENT".to_string());
+        timeout_log.reason_code =
+            Some(GatekeeperReasonCode::TimeoutPhase1Insufficient.as_log_str());
+        timeout_log.reason_code_version = GatekeeperReasonCode::version();
+        timeout_log.legacy_live_reason_chain = timeout_log.decision_reason.clone();
+        timeout_log.legacy_live_verdict_buy = None;
+        timeout_log.legacy_live_verdict_type = timeout_log.verdict_type.clone();
+        timeout_log.v25_shadow_verdict_type = None;
+        timeout_log.v25_shadow_reason_chain = None;
+        timeout_log.v25_shadow_confidence = Some(0.0);
+        timeout_log.v25_shadow_confidence_source = Some("assessment_cached".to_string());
+        timeout_log.v25_shadow_observation_stage = Some("Extended".to_string());
+        timeout_log.ab_record_id = Some("pool_v25_timeout:1000:11000:TIMEOUT".to_string());
+
+        logger.log_gatekeeper_buy_decision(timeout_log).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        let shadow_dir =
+            test_gatekeeper_route_dir(&log_dir, GATEKEEPER_VERSION, DECISION_PLANE_V25_SHADOW);
+        let shadow_decisions = shadow_dir.join(GATEKEEPER_DECISIONS_JSONL);
+        let shadow_buys = shadow_dir.join(GATEKEEPER_PASSED_JSONL);
+
+        assert!(
+            shadow_decisions.exists(),
+            "v25 shadow timeout decisions file should exist"
+        );
+        assert!(
+            !shadow_buys.exists(),
+            "TIMEOUT must not be written to the v25 shadow BUY file"
+        );
+
+        let shadow_lines = fs::read_to_string(&shadow_decisions).await.unwrap();
+        let lines: Vec<&str> = shadow_lines.trim().lines().collect();
+        assert_eq!(lines.len(), 1);
+        let record: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+
+        assert_eq!(record["decision_plane"], DECISION_PLANE_V25_SHADOW);
+        assert_eq!(record["gatekeeper_version"], GATEKEEPER_VERSION);
+        assert_eq!(
+            record["ab_record_id"],
+            "pool_v25_timeout:1000:11000:TIMEOUT"
+        );
+        assert_eq!(record["verdict_type"], "TIMEOUT_PHASE1_INSUFFICIENT");
+        assert_eq!(
+            record["reason_code"],
+            GatekeeperReasonCode::TimeoutPhase1Insufficient.as_log_str()
+        );
+        assert!(
+            record.get("decision_verdict_buy").is_none(),
+            "TIMEOUT rows must keep decision_verdict_buy absent/null, not false"
+        );
+        assert_eq!(
+            record["decision_reason"],
+            "TIMEOUT_PHASE1_INSUFFICIENT: tx=1/3 signers=1/2 buys=1/2"
+        );
+
+        logger.shutdown().await;
+    }
+
     #[test]
     fn test_expand_shadow_plane_does_not_fallback_to_main_reason_code() {
         let mut mixed_log = create_test_buy_log();
@@ -4568,6 +4688,51 @@ mod tests {
         assert_eq!(
             shadow.reason_code, None,
             "shadow plane must not inherit main reason_code"
+        );
+    }
+
+    #[test]
+    fn test_expand_timeout_fallback_requires_cached_shadow_assessment_evidence() {
+        let mut timeout_log = create_test_buy_log();
+        timeout_log.pool_id = "pool_shadow_reason_only_timeout".to_string();
+        timeout_log.decision_reason =
+            Some("TIMEOUT_PHASE1_INSUFFICIENT: terminal active timeout".to_string());
+        timeout_log.decision_verdict_buy = None;
+        timeout_log.verdict_type = Some("TIMEOUT_PHASE1_INSUFFICIENT".to_string());
+        timeout_log.reason_code =
+            Some(GatekeeperReasonCode::TimeoutPhase1Insufficient.as_log_str());
+        timeout_log.reason_code_version = GatekeeperReasonCode::version();
+        timeout_log.legacy_live_reason_chain = timeout_log.decision_reason.clone();
+        timeout_log.legacy_live_verdict_buy = None;
+        timeout_log.legacy_live_verdict_type = timeout_log.verdict_type.clone();
+        timeout_log.v25_shadow_reason_chain = Some("shadow reason only".to_string());
+        timeout_log.v25_shadow_verdict_type = None;
+        timeout_log.v25_shadow_confidence = None;
+        timeout_log.v25_shadow_observation_stage = None;
+
+        let expanded = expand_gatekeeper_plane_logs(timeout_log);
+        assert_eq!(expanded.len(), 2, "expected legacy and shadow plane rows");
+
+        let shadow = expanded
+            .iter()
+            .find(|log| log.decision_plane.as_deref() == Some(DECISION_PLANE_V25_SHADOW))
+            .expect("shadow plane row");
+
+        assert_eq!(
+            shadow.decision_reason.as_deref(),
+            Some("shadow reason only")
+        );
+        assert_eq!(
+            shadow.verdict_type, None,
+            "reason-chain-only shadow evidence must not inherit terminal TIMEOUT verdict"
+        );
+        assert_eq!(
+            shadow.reason_code, None,
+            "reason-chain-only shadow evidence must not inherit terminal TIMEOUT reason_code"
+        );
+        assert_eq!(
+            shadow.decision_verdict_buy, None,
+            "TIMEOUT fallback must not synthesize a BUY/REJECT alias without cached shadow assessment evidence"
         );
     }
 
