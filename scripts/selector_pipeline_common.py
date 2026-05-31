@@ -152,6 +152,14 @@ def bool_or_none(value: Any) -> bool | None:
     return value if isinstance(value, bool) else None
 
 
+def first_top_level(row: dict[str, Any], fields: Iterable[str]) -> Any:
+    for field in fields:
+        value = row.get(field)
+        if value not in (None, ""):
+            return value
+    return None
+
+
 def counter_dict(counter: Counter[str]) -> dict[str, int]:
     return {key: counter[key] for key in sorted(counter)}
 
@@ -325,6 +333,21 @@ def candidate_universe_row(row: dict[str, Any], *, source_path: str, source_inde
     decision_buy = bool_or_none(find_first_key(row, ("decision_verdict_buy",)))
     if decision_buy is None and isinstance(verdict, str):
         decision_buy = verdict.upper() in {"BUY", "EARLY_BUY"}
+    gatekeeper_v25_score = float_or_none(
+        first_top_level(row, ("gatekeeper_v25_score", "v25_score", "v25_shadow_confidence"))
+    )
+    gatekeeper_v3_score = float_or_none(
+        first_top_level(
+            row,
+            (
+                "gatekeeper_v3_score",
+                "v3_score",
+                "v3_shadow_score",
+                "v3_shadow_confidence_final",
+                "v3_shadow_confidence",
+            ),
+        )
+    )
     return {
         "selector_schema_version": SCHEMA_VERSION,
         "candidate_id": candidate_id,
@@ -346,6 +369,26 @@ def candidate_universe_row(row: dict[str, Any], *, source_path: str, source_inde
         "gatekeeper_verdict": verdict,
         "decision_verdict_buy": decision_buy,
         "decision_reason": find_first_key(row, ("decision_reason", "reason_code")),
+        "gatekeeper_v25_score": gatekeeper_v25_score,
+        "gatekeeper_v25_accept": bool_or_none(
+            first_top_level(row, ("gatekeeper_v25_accept", "v25_accept"))
+        ),
+        "gatekeeper_v25_replay_artifact_version": str_or_none(
+            first_top_level(row, ("gatekeeper_v25_replay_artifact_version", "v25_replay_artifact_version"))
+        ),
+        "gatekeeper_v3_score": gatekeeper_v3_score,
+        "gatekeeper_v3_accept": bool_or_none(
+            first_top_level(row, ("gatekeeper_v3_accept", "v3_decision_verdict_buy", "v3_shadow_accept"))
+        ),
+        "gatekeeper_v3_verdict": str_or_none(
+            first_top_level(row, ("gatekeeper_v3_verdict", "v3_verdict", "v3_shadow_verdict"))
+        ),
+        "gatekeeper_v3_replay_artifact_version": str_or_none(
+            first_top_level(row, ("gatekeeper_v3_replay_artifact_version", "v3_replay_artifact_version"))
+        ),
+        "v3_shadow_verdict": str_or_none(row.get("v3_shadow_verdict")),
+        "v3_shadow_confidence": float_or_none(row.get("v3_shadow_confidence")),
+        "v25_shadow_confidence": float_or_none(row.get("v25_shadow_confidence")),
         "event_type": event_type(row),
         "event_source": source_path,
         "event_source_index": source_index,
@@ -498,6 +541,70 @@ def candidate_match_keys(row: dict[str, Any]) -> set[str]:
         if value:
             keys.add(f"{field}:{value}")
     return keys
+
+
+def identity_join_keys(row: dict[str, Any], *, include_candidate_id: bool = True) -> list[str]:
+    """Ordered, strict identity keys for offline cross-artifact joins.
+
+    Single-field mint or pool matches are intentionally excluded here.  These
+    joins attach labels/decision context to an existing birth denominator, so
+    they must be exact enough to fail closed when evidence is ambiguous.
+    """
+    keys: list[str] = []
+    seen: set[str] = set()
+
+    def push(key: str) -> None:
+        if key not in seen:
+            seen.add(key)
+            keys.append(key)
+
+    if include_candidate_id:
+        candidate_id = str_or_none(
+            first_top_level(row, ("candidate_id", "execution_candidate_id", "lifecycle_candidate_id"))
+        )
+        if candidate_id:
+            push(f"candidate_id:{candidate_id}")
+    mint = str_or_none(first_top_level(row, ("base_mint", "mint_id", "mint", "token_mint")))
+    pool_id = str_or_none(first_top_level(row, ("pool_id", "pool_amm_id", "amm_id", "pool")))
+    bonding_curve = str_or_none(
+        first_top_level(row, ("bonding_curve", "bonding_curve_pubkey", "canonical_bonding_curve"))
+    )
+    if mint and pool_id:
+        push(f"mint_pool:{mint}:{pool_id}")
+    if mint and bonding_curve:
+        push(f"mint_bonding_curve:{mint}:{bonding_curve}")
+    return keys
+
+
+def build_identity_join_index(
+    rows: Iterable[dict[str, Any]],
+) -> tuple[dict[str, dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        for key in identity_join_keys(row):
+            grouped[key].append(row)
+    indexed: dict[str, dict[str, Any]] = {}
+    ambiguous: dict[str, list[dict[str, Any]]] = {}
+    for key, values in grouped.items():
+        if len(values) == 1:
+            indexed[key] = values[0]
+        else:
+            ambiguous[key] = values
+    return indexed, ambiguous
+
+
+def lookup_identity_join(
+    row: dict[str, Any],
+    indexed: dict[str, dict[str, Any]],
+    ambiguous: dict[str, list[dict[str, Any]]] | None = None,
+) -> tuple[dict[str, Any] | None, str | None, bool]:
+    saw_ambiguous = False
+    for key in identity_join_keys(row):
+        if key in indexed:
+            return indexed[key], key, False
+        if ambiguous is not None and key in ambiguous:
+            saw_ambiguous = True
+    return None, None, saw_ambiguous
 
 
 def index_rows_by_candidate(rows: Iterable[dict[str, Any]]) -> dict[str, dict[str, Any]]:

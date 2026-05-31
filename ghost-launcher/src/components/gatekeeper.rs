@@ -28,6 +28,7 @@ use ghost_core::shadow_ledger::{
     BufferedTx as CommitBufferedTx, CommitResult, MarketSnapshot, ReconstructedState, ShadowLedger,
     ShadowLedgerStaleFallback, TxKey,
 };
+use ghost_core::tx_intelligence::types::{FscEvidenceStatus, FscSnapshotMode, FscV2Evidence};
 use ghost_core::{CurveFinality, CurveFreshnessState};
 use parking_lot::{Mutex, RwLock};
 use seer::early_fingerprint::EarlyFingerprintMetrics;
@@ -876,6 +877,75 @@ pub struct SybilPolicyDiagnostics {
     pub interference_patterns: Vec<SybilInterferencePattern>,
     pub meta_score: Option<u16>,
     pub metric_degraded_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ShadowFscV2PolicyCounterfactual {
+    policy_signal: Option<bool>,
+    soft_points_if_enabled: Option<u16>,
+    reason_if_enabled: Option<String>,
+}
+
+fn shadow_fsc_v2_policy_counterfactual(
+    evidence: Option<&FscV2Evidence>,
+    signer_cross_pool_velocity: Option<f64>,
+    config: &GatekeeperV2Config,
+) -> ShadowFscV2PolicyCounterfactual {
+    let Some(evidence) = evidence else {
+        return ShadowFscV2PolicyCounterfactual::default();
+    };
+
+    if evidence.snapshot_mode != FscSnapshotMode::DecisionTime {
+        return ShadowFscV2PolicyCounterfactual {
+            policy_signal: Some(false),
+            soft_points_if_enabled: Some(0),
+            reason_if_enabled: Some("FSC_V2_SHADOW_NOT_DECISION_TIME".to_string()),
+        };
+    }
+    if evidence.status != FscEvidenceStatus::Clean {
+        return ShadowFscV2PolicyCounterfactual {
+            policy_signal: Some(false),
+            soft_points_if_enabled: Some(0),
+            reason_if_enabled: Some(format!("FSC_V2_SHADOW_NOT_CLEAN:{:?}", evidence.status)),
+        };
+    }
+
+    let Some(fsc_value) = evidence.hhi_norm_count else {
+        return ShadowFscV2PolicyCounterfactual {
+            policy_signal: Some(false),
+            soft_points_if_enabled: Some(0),
+            reason_if_enabled: Some("FSC_V2_SHADOW_SCORE_UNAVAILABLE".to_string()),
+        };
+    };
+
+    if fsc_value <= config.max_funding_source_concentration {
+        return ShadowFscV2PolicyCounterfactual {
+            policy_signal: Some(false),
+            soft_points_if_enabled: Some(0),
+            reason_if_enabled: Some("FSC_V2_SHADOW_BELOW_THRESHOLD".to_string()),
+        };
+    }
+
+    let high_cpv = signer_cross_pool_velocity
+        .is_some_and(|value| value > config.max_signer_cross_pool_velocity);
+    let soft_points = config.soft_penalty_high_fsc as u16
+        + if high_cpv {
+            config.soft_penalty_high_fsc_high_cpv_combo as u16
+        } else {
+            0
+        };
+    ShadowFscV2PolicyCounterfactual {
+        policy_signal: Some(true),
+        soft_points_if_enabled: Some(soft_points),
+        reason_if_enabled: Some(
+            if high_cpv {
+                "FSC_V2_SHADOW_HIGH_FSC_HIGH_CPV"
+            } else {
+                "FSC_V2_SHADOW_HIGH_FSC"
+            }
+            .to_string(),
+        ),
+    }
 }
 
 /// Verdict type for explicit log classification.
@@ -2330,6 +2400,11 @@ impl GatekeeperAssessment {
                 .map_or(0, |pdd| pdd.soft_penalty_points),
         );
         let pdd_hard_fail_evaluated = Some(self.pdd_assessment.is_some());
+        let shadow_fsc_v2 = shadow_fsc_v2_policy_counterfactual(
+            sybil.funding_source_v2.as_ref(),
+            sybil.signer_cross_pool_velocity,
+            config,
+        );
         let gatekeeper_v2_phase_pass_vector = Some(serde_json::json!({
             "phase1": self.phase1_passed,
             "phase2": self.phase2_passed,
@@ -2974,6 +3049,9 @@ impl GatekeeperAssessment {
             max_funding_source_concentration: config.max_funding_source_concentration,
             funding_source_diagnostics: sybil.funding_source_diagnostics.clone(),
             funding_source_v2: sybil.funding_source_v2.clone(),
+            shadow_fsc_v2_policy_signal: shadow_fsc_v2.policy_signal,
+            shadow_fsc_v2_soft_points_if_enabled: shadow_fsc_v2.soft_points_if_enabled,
+            shadow_fsc_v2_reason_if_enabled: shadow_fsc_v2.reason_if_enabled,
             sybil_metric_degraded_reasons: sybil.degraded_reasons.clone(),
 
             // A/B Window – defaults; enriched by oracle_runtime before logging
@@ -13811,6 +13889,108 @@ mod tests {
         assert!(summary.contains("cpv=0.4400"));
         assert!(summary.contains("fsc=0.5200"));
         assert!(summary.contains("sybil_degraded=FTDI_INSUFFICIENT_BUYS"));
+    }
+
+    fn clean_fsc_v2_evidence(hhi_norm_count: f64) -> FscV2Evidence {
+        FscV2Evidence {
+            version: ghost_core::tx_intelligence::types::FscVersion::V2,
+            attribution_scope:
+                ghost_core::tx_intelligence::types::FscAttributionScope::SingleHopNativeSol,
+            snapshot_mode: FscSnapshotMode::DecisionTime,
+            total_buyers: 3,
+            known_buyers: 3,
+            known_non_neutral_buyers: 3,
+            unknown_count: 0,
+            neutral_count: 0,
+            low_confidence_count: 0,
+            same_slot_unorderable_count: 0,
+            known_coverage: 1.0,
+            non_neutral_known_coverage: 1.0,
+            neutral_share: 0.0,
+            top1_share_count: Some(1.0),
+            top1_share_sol: Some(1.0),
+            hhi_norm_count: Some(hhi_norm_count),
+            hhi_norm_sol_weighted_excess: Some(hhi_norm_count),
+            raw_hhi_including_neutral: Some(hhi_norm_count),
+            scoring_hhi_non_neutral: Some(hhi_norm_count),
+            top_funder: Some(ghost_core::tx_intelligence::types::FundingSourceKey::new(
+                "source",
+            )),
+            top_funder_count: 3,
+            top_funder_buy_sol: 1.0,
+            source_counts: vec![],
+            attribution_confidence_mean: Some(1.0),
+            attribution_confidence_min: Some(1.0),
+            dust_filtered_count: 0,
+            post_buy_filtered_count: 0,
+            rel_too_small_count: 0,
+            index_warm: true,
+            capture_ready: true,
+            status: FscEvidenceStatus::Clean,
+            excluded_reason: None,
+            funding_lane_watermark_slot: Some(10),
+            max_buy_slot: Some(11),
+            funding_lane_lag_slots: Some(0),
+            stream_epoch: 1,
+            gap_suspected: false,
+            min_abs_store_lamports: 10_000_000,
+            min_abs_attribution_lamports: 10_000_000,
+            min_rel_to_buy: 0.2,
+            ttl_seconds: 300,
+            neutral_funder_set_version: Some("neutral_funders_v1".to_string()),
+            neutral_funder_set_hash: Some("hash".to_string()),
+            config_hash: "config_hash".to_string(),
+            provider: "NLN".to_string(),
+            source_topics: vec!["prod.rpc.solana.system.transfers".to_string()],
+        }
+    }
+
+    #[test]
+    fn fsc_v2_shadow_policy_counterfactual_reports_without_policy_drift() {
+        let mut config = GatekeeperV2Config {
+            max_funding_source_concentration: 0.70,
+            soft_penalty_high_fsc: 3,
+            soft_penalty_high_fsc_high_cpv_combo: 5,
+            max_signer_cross_pool_velocity: 0.50,
+            ..GatekeeperV2Config::default()
+        };
+
+        let high_fsc = clean_fsc_v2_evidence(0.90);
+        let counterfactual =
+            shadow_fsc_v2_policy_counterfactual(Some(&high_fsc), Some(0.70), &config);
+        assert_eq!(counterfactual.policy_signal, Some(true));
+        assert_eq!(counterfactual.soft_points_if_enabled, Some(8));
+        assert_eq!(
+            counterfactual.reason_if_enabled.as_deref(),
+            Some("FSC_V2_SHADOW_HIGH_FSC_HIGH_CPV")
+        );
+
+        config.soft_penalty_high_fsc = 0;
+        config.soft_penalty_high_fsc_high_cpv_combo = 0;
+        let zero_weight_counterfactual =
+            shadow_fsc_v2_policy_counterfactual(Some(&high_fsc), Some(0.70), &config);
+        assert_eq!(zero_weight_counterfactual.policy_signal, Some(true));
+        assert_eq!(zero_weight_counterfactual.soft_points_if_enabled, Some(0));
+
+        let below_threshold = clean_fsc_v2_evidence(0.20);
+        let below =
+            shadow_fsc_v2_policy_counterfactual(Some(&below_threshold), Some(0.70), &config);
+        assert_eq!(below.policy_signal, Some(false));
+        assert_eq!(below.soft_points_if_enabled, Some(0));
+        assert_eq!(
+            below.reason_if_enabled.as_deref(),
+            Some("FSC_V2_SHADOW_BELOW_THRESHOLD")
+        );
+
+        let mut eventual = clean_fsc_v2_evidence(0.90);
+        eventual.snapshot_mode = FscSnapshotMode::EventualPostfill;
+        let eventual_counterfactual =
+            shadow_fsc_v2_policy_counterfactual(Some(&eventual), Some(0.70), &config);
+        assert_eq!(eventual_counterfactual.policy_signal, Some(false));
+        assert_eq!(
+            eventual_counterfactual.reason_if_enabled.as_deref(),
+            Some("FSC_V2_SHADOW_NOT_DECISION_TIME")
+        );
     }
 
     // ═══════════════════════════════════════════

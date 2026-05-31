@@ -32,6 +32,11 @@ format = "JSON"
 pumpfun_create_topic = "prod.rpc.solana.pumpfun.create"
 pumpfun_trade_topic = "prod.rpc.solana.pumpfun.trade"
 system_transfers_topic = "prod.rpc.solana.system.transfers"
+artifact_capture_enabled = true
+artifact_capture_dir = "logs/nln_capture/shadow-burnin-v3-fsc-capture-nln-r1"
+artifact_queue_capacity = 32768
+artifact_flush_interval_ms = 1000
+artifact_transfer_sample_rate = 200
 
 [trigger]
 enabled = true
@@ -96,7 +101,7 @@ bind_address = "127.0.0.1"
 port = 8801
 
 [logging]
-level = "info"
+level = "warn"
 console_enabled = true
 json_format = false
 file_enabled = true

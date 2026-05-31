@@ -60,6 +60,10 @@ def build_universe(
     )
     decision_load = {"rows_read": 0, "rows_loaded": 0, "skipped_counts": {}}
     decision_only_rows_skipped = 0
+    decision_context_rows_joined = 0
+    decision_context_rows_ambiguous = 0
+    decision_context_join_key_counts: Counter[str] = Counter()
+    decision_context_join_samples: list[dict[str, Any]] = []
     if decision_paths:
         decision_rows, decision_load = load_source_rows(
             decision_paths,
@@ -71,17 +75,40 @@ def build_universe(
                 row["universe_source_kind"] = "decision_log_degraded"
             source_rows.extend(decision_rows)
         else:
-            universe_ids = {
-                common.str_or_none(row.get("candidate_id"))
-                for row in source_rows
-                if common.str_or_none(row.get("candidate_id"))
-            }
-            matched_decisions = [
-                row
-                for row in decision_rows
-                if common.str_or_none(row.get("candidate_id")) in universe_ids
-            ]
-            decision_only_rows_skipped = len(decision_rows) - len(matched_decisions)
+            event_denominator_rows, _event_denominator_merge = common.merge_candidate_rows(source_rows)
+            universe_index, universe_ambiguous = common.build_identity_join_index(
+                event_denominator_rows
+            )
+            matched_decisions = []
+            for row in decision_rows:
+                matched, join_key, ambiguous = common.lookup_identity_join(
+                    row, universe_index, universe_ambiguous
+                )
+                if matched is None:
+                    decision_only_rows_skipped += 1
+                    if ambiguous:
+                        decision_context_rows_ambiguous += 1
+                    continue
+                normalized = dict(row)
+                original_candidate_id = common.str_or_none(normalized.get("candidate_id"))
+                normalized["candidate_id"] = matched.get("candidate_id")
+                normalized["decision_context_join_key"] = join_key
+                normalized["decision_context_original_candidate_id"] = original_candidate_id
+                normalized["universe_source_kind"] = "decision_log_context"
+                matched_decisions.append(normalized)
+                decision_context_rows_joined += 1
+                if join_key:
+                    decision_context_join_key_counts[join_key.split(":", 1)[0]] += 1
+                if len(decision_context_join_samples) < 20:
+                    decision_context_join_samples.append(
+                        {
+                            "join_key": join_key,
+                            "candidate_id": matched.get("candidate_id"),
+                            "decision_candidate_id": original_candidate_id,
+                            "base_mint": normalized.get("base_mint"),
+                            "pool_id": normalized.get("pool_id"),
+                        }
+                    )
             source_rows.extend(matched_decisions)
     rows, merge_report = common.merge_candidate_rows(source_rows)
     status_counts = Counter(str(row.get("candidate_universe_status") or "unknown") for row in rows)
@@ -121,6 +148,10 @@ def build_universe(
         "event_load": event_load,
         "decision_load": decision_load,
         "decision_only_rows_skipped": decision_only_rows_skipped,
+        "decision_context_rows_joined": decision_context_rows_joined,
+        "decision_context_rows_ambiguous": decision_context_rows_ambiguous,
+        "decision_context_join_key_counts": common.counter_dict(decision_context_join_key_counts),
+        "decision_context_join_samples": decision_context_join_samples,
         "rows_loaded_for_merge": len(source_rows),
         "rows_written": len(rows),
         "status_counts": common.counter_dict(status_counts),

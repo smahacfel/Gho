@@ -1712,6 +1712,33 @@ pub struct SeerProgramStreamsComponentConfig {
     /// Solana system transfer topic.
     #[serde(default = "default_program_streams_system_transfers_topic")]
     pub system_transfers_topic: String,
+
+    /// Persist NLN Program Streams capture evidence to JSONL files for PR-FSC8
+    /// provider qualification. This is disabled by default because it is a
+    /// high-volume diagnostics lane, not a runtime decision dependency.
+    #[serde(default)]
+    pub artifact_capture_enabled: bool,
+
+    /// Directory for live NLN capture JSONL inputs consumed by the offline PR8
+    /// artifact builder.
+    #[serde(default)]
+    pub artifact_capture_dir: Option<String>,
+
+    /// Bounded queue capacity for artifact writes. Overflow must degrade only
+    /// the offline artifact lane and must not block Seer/Gatekeeper/executor.
+    #[serde(default = "default_program_streams_artifact_queue_capacity")]
+    pub artifact_queue_capacity: usize,
+
+    /// Flush interval for artifact writer files.
+    #[serde(default = "default_program_streams_artifact_flush_interval_ms")]
+    pub artifact_flush_interval_ms: u64,
+
+    /// Deterministic sampling rate for high-volume system.transfer artifacts.
+    /// A value of 1 persists every normalized native-SOL transfer. Values above
+    /// 1 persist one stable-keyed transfer out of N for durable PR8 evidence,
+    /// while the runtime funding index still receives the full stream.
+    #[serde(default = "default_program_streams_artifact_transfer_sample_rate")]
+    pub artifact_transfer_sample_rate: u32,
 }
 
 impl Default for SeerProgramStreamsComponentConfig {
@@ -1726,6 +1753,11 @@ impl Default for SeerProgramStreamsComponentConfig {
             pumpfun_create_topic: default_program_streams_pumpfun_create_topic(),
             pumpfun_trade_topic: default_program_streams_pumpfun_trade_topic(),
             system_transfers_topic: default_program_streams_system_transfers_topic(),
+            artifact_capture_enabled: false,
+            artifact_capture_dir: None,
+            artifact_queue_capacity: default_program_streams_artifact_queue_capacity(),
+            artifact_flush_interval_ms: default_program_streams_artifact_flush_interval_ms(),
+            artifact_transfer_sample_rate: default_program_streams_artifact_transfer_sample_rate(),
         }
     }
 }
@@ -2767,6 +2799,18 @@ fn default_program_streams_pumpfun_trade_topic() -> String {
 
 fn default_program_streams_system_transfers_topic() -> String {
     "prod.rpc.solana.system.transfers".to_string()
+}
+
+fn default_program_streams_artifact_queue_capacity() -> usize {
+    32_768
+}
+
+fn default_program_streams_artifact_flush_interval_ms() -> u64 {
+    1_000
+}
+
+fn default_program_streams_artifact_transfer_sample_rate() -> u32 {
+    1
 }
 
 fn default_watched_pools_ttl_ms() -> u64 {
@@ -4306,6 +4350,11 @@ format = "JSON"
 pumpfun_create_topic = "prod.rpc.solana.pumpfun.create"
 pumpfun_trade_topic = "prod.rpc.solana.pumpfun.trade"
 system_transfers_topic = "prod.rpc.solana.system.transfers"
+artifact_capture_enabled = true
+artifact_capture_dir = "logs/nln_capture/test"
+artifact_queue_capacity = 4096
+artifact_flush_interval_ms = 500
+artifact_transfer_sample_rate = 50
 "#;
 
         let config: SeerProgramStreamsComponentConfig = toml::from_str(toml).unwrap();
@@ -4321,6 +4370,14 @@ system_transfers_topic = "prod.rpc.solana.system.transfers"
             config.system_transfers_topic,
             "prod.rpc.solana.system.transfers"
         );
+        assert!(config.artifact_capture_enabled);
+        assert_eq!(
+            config.artifact_capture_dir.as_deref(),
+            Some("logs/nln_capture/test")
+        );
+        assert_eq!(config.artifact_queue_capacity, 4096);
+        assert_eq!(config.artifact_flush_interval_ms, 500);
+        assert_eq!(config.artifact_transfer_sample_rate, 50);
     }
 
     #[test]
@@ -5165,6 +5222,15 @@ enabled = true
         assert_eq!(config.seer.program_streams.auth_header, "x-api-key");
         assert_eq!(config.seer.program_streams.api_key_env, "NLN_API_KEY");
         assert_eq!(config.seer.program_streams.format, "JSON");
+        assert!(config.seer.program_streams.artifact_capture_enabled);
+        assert_eq!(
+            config.seer.program_streams.artifact_capture_dir.as_deref(),
+            Some("logs/nln_capture/shadow-burnin-v3-fsc-capture-nln-r1")
+        );
+        assert_eq!(
+            config.seer.program_streams.artifact_transfer_sample_rate,
+            200
+        );
         assert_eq!(config.trigger.entry_mode, TriggerEntryMode::ShadowOnly);
         assert_eq!(config.execution.execution_mode, ExecutionMode::Shadow);
         assert!(config

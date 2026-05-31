@@ -34,14 +34,39 @@ def choose_feature(
     )
 
 
-def index_price_paths(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    indexed: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        for field in ("candidate_id", "execution_candidate_id", "ab_record_id"):
-            value = common.str_or_none(row.get(field))
-            if value:
-                indexed.setdefault(value, row)
-    return indexed
+def lifecycle_ts_ms(row: dict[str, Any]) -> int | None:
+    for field in ("decision_ts_ms", "entry_execution_ts_ms", "first_seen_ts_ms", "curve_t0_event_ts_ms"):
+        value = common.int_or_none(row.get(field))
+        if value is not None:
+            return value
+    return None
+
+
+def candidate_time_scope(candidates: list[dict[str, Any]], *, horizon_ms: int) -> dict[str, int | None]:
+    timestamps = [
+        value
+        for candidate in candidates
+        for value in (
+            common.int_or_none(candidate.get("birth_ts_ms")),
+            common.int_or_none(candidate.get("decision_ts_ms")),
+        )
+        if value is not None
+    ]
+    if not timestamps:
+        return {"start_ts_ms": None, "end_ts_ms": None}
+    return {
+        "start_ts_ms": min(timestamps) - horizon_ms,
+        "end_ts_ms": max(timestamps) + horizon_ms,
+    }
+
+
+def in_candidate_time_scope(row: dict[str, Any], scope: dict[str, int | None]) -> bool:
+    ts = lifecycle_ts_ms(row)
+    start = scope.get("start_ts_ms")
+    end = scope.get("end_ts_ms")
+    if ts is None or start is None or end is None:
+        return True
+    return start <= ts <= end
 
 
 def leakage_audit(feature_rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -70,11 +95,15 @@ def build_training_view(
 ) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
     candidates = list(common.iter_json_objects(candidate_universe))
     accepted_rows = list(common.iter_json_objects(accepted_lifecycle))
-    lifecycle_by_candidate = common.index_rows_by_candidate(accepted_rows)
+    lifecycle_by_identity, lifecycle_ambiguous = common.build_identity_join_index(accepted_rows)
     feature_rows = list(common.iter_json_objects(feature_snapshots))
     feature_index = index_feature_rows(feature_rows)
-    price_by_key = index_price_paths(list(common.iter_json_objects(price_paths)))
+    price_by_identity, price_ambiguous = common.build_identity_join_index(
+        list(common.iter_json_objects(price_paths))
+    )
     splits = common.choose_temporal_split(candidates)
+    candidate_identity_index, candidate_identity_ambiguous = common.build_identity_join_index(candidates)
+    lifecycle_scope = candidate_time_scope(candidates, horizon_ms=horizon_ms)
 
     rows: list[dict[str, Any]] = []
     universe_candidate_ids = {
@@ -83,10 +112,28 @@ def build_training_view(
         if common.str_or_none(candidate.get("candidate_id"))
     }
     accepted_total = len(accepted_rows)
+    accepted_in_scope_rows = [
+        row for row in accepted_rows if in_candidate_time_scope(row, lifecycle_scope)
+    ]
     accepted_joined = sum(
         1
-        for row in accepted_rows
+        for row in accepted_in_scope_rows
+        if common.lookup_identity_join(
+            row, candidate_identity_index, candidate_identity_ambiguous
+        )[0]
+        is not None
+    )
+    accepted_exact_candidate_id_joined = sum(
+        1
+        for row in accepted_in_scope_rows
         if common.str_or_none(row.get("candidate_id")) in universe_candidate_ids
+    )
+    accepted_ambiguous = sum(
+        1
+        for row in accepted_in_scope_rows
+        if common.lookup_identity_join(
+            row, candidate_identity_index, candidate_identity_ambiguous
+        )[2]
     )
     accepted_missing_candidate_id = sum(
         1 for row in accepted_rows if not common.str_or_none(row.get("candidate_id"))
@@ -101,8 +148,12 @@ def build_training_view(
             snapshot_kind=snapshot_kind,
             fallback_snapshot_kind=fallback_snapshot_kind,
         )
-        lifecycle = lifecycle_by_candidate.get(candidate_id)
-        price_path = price_by_key.get(candidate_id)
+        lifecycle, lifecycle_join_key, lifecycle_ambiguous_match = common.lookup_identity_join(
+            candidate, lifecycle_by_identity, lifecycle_ambiguous
+        )
+        price_path, price_join_key, price_ambiguous_match = common.lookup_identity_join(
+            candidate, price_by_identity, price_ambiguous
+        )
         feature_complete = bool(feature and feature.get("feature_snapshot_status") == "ok")
         r2 = common.classify_r2(
             price_path,
@@ -140,7 +191,38 @@ def build_training_view(
             "gatekeeper_verdict": candidate.get("gatekeeper_verdict"),
             "decision_verdict_buy": candidate.get("decision_verdict_buy"),
             "decision_reason": candidate.get("decision_reason"),
+            "gatekeeper_v25_score": candidate.get("gatekeeper_v25_score"),
+            "gatekeeper_v25_accept": candidate.get("gatekeeper_v25_accept"),
+            "gatekeeper_v25_replay_artifact_version": candidate.get(
+                "gatekeeper_v25_replay_artifact_version"
+            ),
+            "gatekeeper_v3_score": candidate.get("gatekeeper_v3_score"),
+            "gatekeeper_v3_accept": candidate.get("gatekeeper_v3_accept"),
+            "gatekeeper_v3_verdict": candidate.get("gatekeeper_v3_verdict"),
+            "gatekeeper_v3_replay_artifact_version": candidate.get(
+                "gatekeeper_v3_replay_artifact_version"
+            ),
+            "v3_shadow_verdict": candidate.get("v3_shadow_verdict"),
+            "v3_shadow_confidence": candidate.get("v3_shadow_confidence"),
+            "v25_shadow_confidence": candidate.get("v25_shadow_confidence"),
             "accepted_lifecycle_joined": lifecycle is not None,
+            "accepted_lifecycle_join_key": lifecycle_join_key,
+            "accepted_lifecycle_candidate_id": lifecycle.get("candidate_id") if lifecycle else None,
+            "accepted_lifecycle_join_status": (
+                "joined"
+                if lifecycle is not None
+                else "ambiguous"
+                if lifecycle_ambiguous_match
+                else "not_found"
+            ),
+            "r2_price_path_join_key": price_join_key,
+            "r2_price_path_join_status": (
+                "joined"
+                if price_path is not None
+                else "ambiguous"
+                if price_ambiguous_match
+                else "not_found"
+            ),
             "execution_only_failure": False,
             "label_resolved": r2.get("r2_label") in {"positive", "negative"},
         }
@@ -188,7 +270,10 @@ def build_training_view(
         and row.get("label_resolved")
         and row.get("r2_label") in {"positive", "negative"}
     ]
-    accepted_join_completeness = accepted_joined / accepted_total if accepted_total else 1.0
+    accepted_join_scope_rows = len(accepted_in_scope_rows)
+    accepted_join_completeness = (
+        accepted_joined / accepted_join_scope_rows if accepted_join_scope_rows else 1.0
+    )
     coverage_fail_reasons = []
     if not denominator_rows:
         coverage_fail_reasons.append("no_resolved_r2_denominator")
@@ -202,7 +287,14 @@ def build_training_view(
         "candidate_rows": len(candidates),
         "training_rows": len(rows),
         "accepted_lifecycle_rows": accepted_total,
+        "accepted_lifecycle_join_scope": "candidate_event_time_window",
+        "accepted_lifecycle_join_scope_start_ts_ms": lifecycle_scope.get("start_ts_ms"),
+        "accepted_lifecycle_join_scope_end_ts_ms": lifecycle_scope.get("end_ts_ms"),
+        "accepted_lifecycle_join_scope_rows": accepted_join_scope_rows,
+        "accepted_lifecycle_out_of_scope_rows": accepted_total - accepted_join_scope_rows,
         "accepted_lifecycle_joined": accepted_joined,
+        "accepted_lifecycle_exact_candidate_id_joined": accepted_exact_candidate_id_joined,
+        "accepted_lifecycle_identity_ambiguous": accepted_ambiguous,
         "accepted_lifecycle_missing_candidate_id": accepted_missing_candidate_id,
         "accepted_lifecycle_join_completeness": accepted_join_completeness,
         "accepted_lifecycle_join_gate": {

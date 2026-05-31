@@ -5,6 +5,7 @@ use crate::events::{
     AccountUpdateEvent, DetectedPool, EventBusSender, FundingTransferObserved, GhostEvent,
 };
 use anyhow::Result;
+use futures::StreamExt;
 use ghost_brain::oracle::{InitPoolEvent, SnapshotEngine};
 use ghost_core::health::RuntimeHealth;
 use ghost_core::shadow_ledger::ShadowLedger;
@@ -17,16 +18,25 @@ use seer::{
         TxFilterStrategy,
     },
     ipc::{create_ipc_channel, BackpressurePolicy, IpcChannelConfig},
+    nln_program_streams::{
+        normalize_nln_event, NlnEvent, NlnFundingTransferCoverage, NlnProgramStreamMessage,
+        NlnProgramStreamsClient, NlnPumpFunCreateEvent, NlnSubscribeLoopOptions, NlnTransferEvent,
+    },
     Seer,
 };
+use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::env;
+use std::path::PathBuf;
 use std::sync::Arc;
 // SystemTime is used transitively via event.detected_at.elapsed()
 use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncWriteExt, BufWriter};
+use tokio::sync::mpsc;
 use tokio::sync::{broadcast, watch};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 const SYSTEM_PROGRAM_ID: &str = "11111111111111111111111111111111";
 const PUMPSWAP_PROGRAM_ID_STR: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
@@ -43,6 +53,617 @@ const SESSION_ACCOUNT_UPDATE_BUFFER_GLOBAL_CAP: usize = 4_096;
 const SESSION_POOL_REGISTRY_FALLBACK_TTL: Duration = Duration::from_secs(30 * 60);
 const SESSION_POOL_REGISTRY_FALLBACK_CAP: usize = 16_384;
 const SESSION_POOL_BRIDGE_PRUNE_INTERVAL: Duration = Duration::from_millis(250);
+const NLN_ARTIFACT_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone)]
+struct NlnArtifactCaptureConfig {
+    enabled: bool,
+    capture_dir: PathBuf,
+    queue_capacity: usize,
+    flush_interval: Duration,
+    transfer_sample_rate: u32,
+}
+
+impl NlnArtifactCaptureConfig {
+    fn from_launcher(config: &crate::config::SeerProgramStreamsComponentConfig) -> Self {
+        let capture_dir = config
+            .artifact_capture_dir
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("logs/nln_capture/default"));
+        let flush_ms = config.artifact_flush_interval_ms.max(250);
+        Self {
+            enabled: config.artifact_capture_enabled,
+            capture_dir,
+            queue_capacity: config.artifact_queue_capacity.max(1_024),
+            flush_interval: Duration::from_millis(flush_ms),
+            transfer_sample_rate: config.artifact_transfer_sample_rate.max(1),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum NlnArtifactRecord {
+    PumpFunCreateRaw(Value),
+    PumpFunTradeRaw(Value),
+    SystemTransfersRaw(Value),
+    CandidateBirth(Value),
+    FundingEvent(Value),
+}
+
+#[derive(Clone)]
+struct NlnArtifactWriter {
+    tx: mpsc::Sender<NlnArtifactRecord>,
+    transfer_sample_rate: u32,
+}
+
+impl NlnArtifactWriter {
+    fn try_send(&self, record: NlnArtifactRecord, label: &'static str) {
+        match self.tx.try_send(record) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                metrics::counter!(
+                    "seer_nln_program_streams_artifact_dropped_total",
+                    1,
+                    "label" => label
+                );
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                metrics::counter!(
+                    "seer_nln_program_streams_artifact_writer_closed_total",
+                    1,
+                    "label" => label
+                );
+            }
+        }
+    }
+
+    fn should_capture_transfer(&self, event: &NlnTransferEvent) -> bool {
+        let rate = self.transfer_sample_rate;
+        if rate <= 1 {
+            return true;
+        }
+        let parts = vec![
+            event.signature.clone(),
+            event
+                .tx_index
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            event
+                .instruction_index
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            event.from_wallet.to_string(),
+            event.to_wallet.to_string(),
+            event.amount_lamports.to_string(),
+        ];
+        nln_stable_hash_u64(&parts) % u64::from(rate) == 0
+    }
+}
+
+fn resolve_program_streams_endpoint(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Some(var_name) = trimmed
+        .strip_prefix("${")
+        .and_then(|value| value.strip_suffix('}'))
+    {
+        if let Ok(value) = env::var(var_name) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return value.to_string();
+            }
+        }
+    }
+    trimmed.to_string()
+}
+
+fn nln_artifact_raw_row(message: &NlnProgramStreamMessage) -> Value {
+    json!({
+        "schema_version": NLN_ARTIFACT_SCHEMA_VERSION,
+        "provider": "NLN",
+        "topic": message.topic,
+        "partition": message.partition,
+        "offset_raw": message.offset_raw,
+        "offset": message.offset,
+        "provider_ts_ms": message.provider_ts_ms,
+        "recv_ts_ms": message.recv_ts_ms,
+        "decode_ts_ms": message.decode_ts_ms,
+        "payload_json": message.payload_json,
+    })
+}
+
+fn add_nln_artifact_sampling(row: &mut Value, transfer_sample_rate: u32) {
+    if let Value::Object(map) = row {
+        map.insert(
+            "artifact_transfer_sample_rate".to_string(),
+            json!(transfer_sample_rate),
+        );
+        map.insert(
+            "artifact_sampled".to_string(),
+            json!(transfer_sample_rate > 1),
+        );
+    }
+}
+
+fn nln_effective_event_ts_ms(
+    provider_ts_ms: Option<i64>,
+    block_time: Option<i64>,
+    recv_ts_ms: u64,
+) -> u64 {
+    if let Some(block_time) = block_time.and_then(|value| (value >= 0).then_some(value as u64)) {
+        return block_time.saturating_mul(1_000);
+    }
+    if let Some(provider_ts_ms) =
+        provider_ts_ms.and_then(|value| (value >= 0).then_some(value as u64))
+    {
+        return provider_ts_ms;
+    }
+    recv_ts_ms
+}
+
+fn nln_stable_hash(parts: &[String]) -> String {
+    format!("fnv64:{:016x}", nln_stable_hash_u64(parts))
+}
+
+fn nln_stable_hash_u64(parts: &[String]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut hash = FNV_OFFSET;
+    for part in parts {
+        for byte in part.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+fn nln_candidate_birth_artifact_row(event: &NlnPumpFunCreateEvent) -> Value {
+    let bonding_curve = event.bonding_curve.map(|value| value.to_string());
+    let birth_ts_ms = nln_effective_event_ts_ms(
+        event.meta.provider_ts_ms,
+        event.block_time,
+        event.meta.recv_ts_ms,
+    );
+    let candidate_id = format!(
+        "nln:{}:{}:{}",
+        event.mint,
+        bonding_curve.as_deref().unwrap_or("missing_bonding_curve"),
+        event.signature
+    );
+    let mut missing = Vec::new();
+    if bonding_curve.is_none() {
+        missing.push("bonding_curve");
+    }
+
+    json!({
+        "selector_schema_version": NLN_ARTIFACT_SCHEMA_VERSION,
+        "artifact": "nln_candidate_birth_v1",
+        "candidate_id": candidate_id,
+        "candidate_id_source": "nln_mint_bonding_curve_signature",
+        "candidate_birth_status": if missing.is_empty() { "ok" } else { "universe_incomplete" },
+        "candidate_identity_missing_fields": missing,
+        "cohort": "pumpfun_bonding_curve_sol_v1",
+        "cohort_in_scope": missing.is_empty(),
+        "provider": "NLN",
+        "source_topic": event.meta.topic,
+        "source_kind": "nln_program_stream",
+        "source_partition": event.meta.partition,
+        "source_offset": event.meta.offset,
+        "source_offset_raw": event.meta.offset_raw,
+        "signature": event.signature,
+        "slot": event.slot,
+        "tx_index": event.tx_index,
+        "birth_ts_ms": birth_ts_ms,
+        "base_mint": event.mint.to_string(),
+        "mint_id": event.mint.to_string(),
+        "pool_id": bonding_curve.clone(),
+        "bonding_curve": bonding_curve,
+        "creator": event.creator.to_string(),
+        "quote_mint": "SOL",
+        "quote_mint_source": "verified_nln_pumpfun_create_topic",
+    })
+}
+
+fn nln_funding_event_artifact_row(event: &NlnTransferEvent) -> Value {
+    let missing = [
+        ("tx_index", event.tx_index.is_none()),
+        ("instruction_index", event.instruction_index.is_none()),
+    ]
+    .into_iter()
+    .filter_map(|(field, is_missing)| is_missing.then_some(field))
+    .collect::<Vec<_>>();
+    let parts = vec![
+        event.signature.clone(),
+        event
+            .tx_index
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        event
+            .instruction_index
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        event.from_wallet.to_string(),
+        event.to_wallet.to_string(),
+        event.amount_lamports.to_string(),
+    ];
+    let event_id = nln_stable_hash(&parts);
+    let event_ts_ms =
+        nln_effective_event_ts_ms(event.meta.provider_ts_ms, None, event.meta.recv_ts_ms);
+
+    json!({
+        "selector_schema_version": NLN_ARTIFACT_SCHEMA_VERSION,
+        "artifact": "funding_events_v1",
+        "funding_event_status": if missing.is_empty() { "ok" } else { "incomplete" },
+        "missing_fields": missing,
+        "provider": "NLN",
+        "source_topic": event.meta.topic,
+        "source_kind": "nln_program_stream",
+        "source_partition": event.meta.partition,
+        "source_offset": event.meta.offset,
+        "source_offset_raw": event.meta.offset_raw,
+        "event_id": event_id,
+        "signature": event.signature,
+        "slot": event.slot,
+        "tx_index": event.tx_index,
+        "instruction_index": event.instruction_index,
+        "event_ts_ms": event_ts_ms,
+        "from_wallet": event.from_wallet.to_string(),
+        "to_wallet": event.to_wallet.to_string(),
+        "amount_lamports": event.amount_lamports,
+        "token_address": event.token_address,
+        "asset": "native_sol",
+        "event_order_key": [
+            event.slot.to_string(),
+            event.tx_index.map(|value| value.to_string()).unwrap_or_else(|| "none".to_string()),
+            event.instruction_index.map(|value| value.to_string()).unwrap_or_else(|| "none".to_string()),
+            event.signature.clone()
+        ],
+    })
+}
+
+async fn write_nln_artifact_line(
+    writer: &mut Option<BufWriter<tokio::fs::File>>,
+    row: &Value,
+    label: &'static str,
+) {
+    let Some(inner) = writer.as_mut() else {
+        return;
+    };
+    let Ok(mut line) = serde_json::to_string(row) else {
+        metrics::counter!(
+            "seer_nln_program_streams_artifact_serialize_errors_total",
+            1,
+            "label" => label
+        );
+        return;
+    };
+    line.push('\n');
+    if let Err(err) = inner.write_all(line.as_bytes()).await {
+        warn!(
+            label,
+            error = %err,
+            "Seer: disabling NLN artifact writer after write failure"
+        );
+        *writer = None;
+    }
+}
+
+async fn flush_nln_artifact_writer(
+    writer: &mut Option<BufWriter<tokio::fs::File>>,
+    label: &'static str,
+) {
+    let Some(inner) = writer.as_mut() else {
+        return;
+    };
+    if let Err(err) = inner.flush().await {
+        warn!(
+            label,
+            error = %err,
+            "Seer: disabling NLN artifact writer after flush failure"
+        );
+        *writer = None;
+    }
+}
+
+async fn open_nln_artifact_file(path: PathBuf) -> Option<BufWriter<tokio::fs::File>> {
+    match tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .await
+    {
+        Ok(file) => Some(BufWriter::new(file)),
+        Err(err) => {
+            warn!(
+                path = %path.display(),
+                error = %err,
+                "Seer: NLN artifact file could not be opened"
+            );
+            None
+        }
+    }
+}
+
+fn spawn_nln_artifact_writer(config: NlnArtifactCaptureConfig) -> Option<NlnArtifactWriter> {
+    if !config.enabled {
+        return None;
+    }
+
+    let transfer_sample_rate = config.transfer_sample_rate;
+    let (tx, mut rx) = mpsc::channel(config.queue_capacity);
+    tokio::spawn(async move {
+        if let Err(err) = tokio::fs::create_dir_all(&config.capture_dir).await {
+            warn!(
+                dir = %config.capture_dir.display(),
+                error = %err,
+                "Seer: NLN artifact capture directory unavailable; artifact writes disabled"
+            );
+            return;
+        }
+
+        let mut create_raw =
+            open_nln_artifact_file(config.capture_dir.join("pumpfun_create_raw_v1.jsonl")).await;
+        let mut trade_raw =
+            open_nln_artifact_file(config.capture_dir.join("pumpfun_trade_raw_v1.jsonl")).await;
+        let mut transfers_raw =
+            open_nln_artifact_file(config.capture_dir.join("system_transfers_raw_v1.jsonl")).await;
+        let mut candidate_birth =
+            open_nln_artifact_file(config.capture_dir.join("nln_candidate_birth_v1.jsonl")).await;
+        let mut funding_events =
+            open_nln_artifact_file(config.capture_dir.join("funding_events_v1.jsonl")).await;
+        let mut flush = tokio::time::interval(config.flush_interval);
+
+        info!(
+            dir = %config.capture_dir.display(),
+            queue_capacity = config.queue_capacity,
+            flush_interval_ms = config.flush_interval.as_millis(),
+            transfer_sample_rate = config.transfer_sample_rate,
+            "Seer: NLN PR8 artifact capture writer started"
+        );
+
+        loop {
+            tokio::select! {
+                maybe_record = rx.recv() => {
+                    let Some(record) = maybe_record else {
+                        break;
+                    };
+                    match record {
+                        NlnArtifactRecord::PumpFunCreateRaw(row) => {
+                            write_nln_artifact_line(&mut create_raw, &row, "pumpfun_create_raw_v1").await;
+                        }
+                        NlnArtifactRecord::PumpFunTradeRaw(row) => {
+                            write_nln_artifact_line(&mut trade_raw, &row, "pumpfun_trade_raw_v1").await;
+                        }
+                        NlnArtifactRecord::SystemTransfersRaw(row) => {
+                            write_nln_artifact_line(&mut transfers_raw, &row, "system_transfers_raw_v1").await;
+                        }
+                        NlnArtifactRecord::CandidateBirth(row) => {
+                            write_nln_artifact_line(&mut candidate_birth, &row, "nln_candidate_birth_v1").await;
+                        }
+                        NlnArtifactRecord::FundingEvent(row) => {
+                            write_nln_artifact_line(&mut funding_events, &row, "funding_events_v1").await;
+                        }
+                    }
+                }
+                _ = flush.tick() => {
+                    flush_nln_artifact_writer(&mut create_raw, "pumpfun_create_raw_v1").await;
+                    flush_nln_artifact_writer(&mut trade_raw, "pumpfun_trade_raw_v1").await;
+                    flush_nln_artifact_writer(&mut transfers_raw, "system_transfers_raw_v1").await;
+                    flush_nln_artifact_writer(&mut candidate_birth, "nln_candidate_birth_v1").await;
+                    flush_nln_artifact_writer(&mut funding_events, "funding_events_v1").await;
+                }
+            }
+        }
+
+        flush_nln_artifact_writer(&mut create_raw, "pumpfun_create_raw_v1").await;
+        flush_nln_artifact_writer(&mut trade_raw, "pumpfun_trade_raw_v1").await;
+        flush_nln_artifact_writer(&mut transfers_raw, "system_transfers_raw_v1").await;
+        flush_nln_artifact_writer(&mut candidate_birth, "nln_candidate_birth_v1").await;
+        flush_nln_artifact_writer(&mut funding_events, "funding_events_v1").await;
+        info!("Seer: NLN PR8 artifact capture writer stopped");
+    });
+
+    Some(NlnArtifactWriter {
+        tx,
+        transfer_sample_rate,
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+enum NlnProgramStreamCaptureTopic {
+    PumpFunCreate,
+    PumpFunTrade,
+    SystemTransfers,
+}
+
+impl NlnProgramStreamCaptureTopic {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::PumpFunCreate => "pumpfun_create",
+            Self::PumpFunTrade => "pumpfun_trade",
+            Self::SystemTransfers => "system_transfers",
+        }
+    }
+}
+
+async fn run_nln_program_streams_topic_capture(
+    client: NlnProgramStreamsClient,
+    config: ProgramStreamsConfig,
+    topic: String,
+    topic_kind: NlnProgramStreamCaptureTopic,
+    event_bus_tx: Option<EventBusSender>,
+    health: Option<Arc<RuntimeHealth>>,
+    artifact_writer: Option<NlnArtifactWriter>,
+) {
+    let options = NlnSubscribeLoopOptions {
+        max_reconnects: None,
+        stall_timeout: Some(Duration::from_secs(30)),
+        ..NlnSubscribeLoopOptions::default()
+    };
+    let mut stream = client.subscribe_json_with_reconnect(topic.clone(), options);
+    let mut sequence_number = 0u64;
+    let mut native_transfer_count = 0u64;
+    let mut non_native_transfer_count = 0u64;
+    let mut create_count = 0u64;
+    let mut trade_count = 0u64;
+    let mut decode_error_count = 0u64;
+
+    while let Some(next) = stream.next().await {
+        let message = match next {
+            Ok(message) => message,
+            Err(err) => {
+                decode_error_count = decode_error_count.saturating_add(1);
+                warn!(
+                    topic = %topic,
+                    kind = topic_kind.label(),
+                    decode_error_count,
+                    error = %err,
+                    "Seer: NLN Program Streams message decode failed"
+                );
+                continue;
+            }
+        };
+
+        let raw_row = artifact_writer
+            .as_ref()
+            .map(|_| nln_artifact_raw_row(&message));
+
+        let event = match normalize_nln_event(&message, &config) {
+            Ok(event) => event,
+            Err(err) => {
+                decode_error_count = decode_error_count.saturating_add(1);
+                warn!(
+                    topic = %message.topic,
+                    kind = topic_kind.label(),
+                    partition = message.partition,
+                    offset = %message.offset_raw,
+                    decode_error_count,
+                    error = %err,
+                    "Seer: NLN Program Streams event normalization failed"
+                );
+                continue;
+            }
+        };
+
+        match (topic_kind, event) {
+            (NlnProgramStreamCaptureTopic::PumpFunCreate, NlnEvent::PumpFunCreate(create)) => {
+                create_count = create_count.saturating_add(1);
+                if let Some(writer) = artifact_writer.as_ref() {
+                    if let Some(row) = raw_row {
+                        writer.try_send(
+                            NlnArtifactRecord::PumpFunCreateRaw(row),
+                            "pumpfun_create_raw_v1",
+                        );
+                    }
+                    writer.try_send(
+                        NlnArtifactRecord::CandidateBirth(nln_candidate_birth_artifact_row(
+                            &create,
+                        )),
+                        "nln_candidate_birth_v1",
+                    );
+                }
+                if create_count == 1 || create_count % 1_000 == 0 {
+                    info!(
+                        topic = %topic,
+                        create_count,
+                        "Seer: NLN Program Streams pumpfun.create events captured"
+                    );
+                }
+            }
+            (NlnProgramStreamCaptureTopic::PumpFunTrade, NlnEvent::PumpFunTrade(_trade)) => {
+                trade_count = trade_count.saturating_add(1);
+                if let Some(writer) = artifact_writer.as_ref() {
+                    if let Some(row) = raw_row {
+                        writer.try_send(
+                            NlnArtifactRecord::PumpFunTradeRaw(row),
+                            "pumpfun_trade_raw_v1",
+                        );
+                    }
+                }
+                if trade_count == 1 || trade_count % 1_000 == 0 {
+                    info!(
+                        topic = %topic,
+                        trade_count,
+                        "Seer: NLN Program Streams pumpfun.trade events captured"
+                    );
+                }
+            }
+            (NlnProgramStreamCaptureTopic::SystemTransfers, NlnEvent::Transfer(transfer)) => {
+                let Some(transfer_event) = transfer
+                    .to_native_sol_funding_transfer_event(NlnFundingTransferCoverage::CaptureOnly)
+                else {
+                    non_native_transfer_count = non_native_transfer_count.saturating_add(1);
+                    continue;
+                };
+
+                native_transfer_count = native_transfer_count.saturating_add(1);
+                sequence_number = sequence_number.saturating_add(1);
+
+                if let Some(writer) = artifact_writer
+                    .as_ref()
+                    .filter(|writer| writer.should_capture_transfer(&transfer))
+                {
+                    if let Some(mut row) = raw_row {
+                        add_nln_artifact_sampling(&mut row, writer.transfer_sample_rate);
+                        writer.try_send(
+                            NlnArtifactRecord::SystemTransfersRaw(row),
+                            "system_transfers_raw_v1",
+                        );
+                    }
+                    let mut funding_row = nln_funding_event_artifact_row(&transfer);
+                    add_nln_artifact_sampling(&mut funding_row, writer.transfer_sample_rate);
+                    writer.try_send(
+                        NlnArtifactRecord::FundingEvent(funding_row),
+                        "funding_events_v1",
+                    );
+                }
+
+                if let Some(ref tx) = event_bus_tx {
+                    let detected = seer::ipc::DetectedFundingTransferEvent {
+                        transfer: transfer_event,
+                        detected_at: std::time::SystemTime::now(),
+                        sequence_number,
+                        priority: seer::ipc::EventPriority::High,
+                    };
+                    emit_funding_transfer_to_event_bus(tx, &detected, health.as_ref());
+                }
+
+                if native_transfer_count == 1 || native_transfer_count % 1_000 == 0 {
+                    info!(
+                        topic = %topic,
+                        native_transfer_count,
+                        non_native_transfer_count,
+                        sequence_number,
+                        "Seer: NLN Program Streams native SOL funding transfers captured"
+                    );
+                }
+            }
+            (_, other) => {
+                debug!(
+                    topic = %topic,
+                    kind = topic_kind.label(),
+                    event = ?other,
+                    "Seer: NLN Program Streams capture ignored unexpected event kind"
+                );
+            }
+        }
+    }
+
+    warn!(
+        topic = %topic,
+        kind = topic_kind.label(),
+        native_transfer_count,
+        non_native_transfer_count,
+        create_count,
+        trade_count,
+        decode_error_count,
+        "Seer: NLN Program Streams topic capture lane exited"
+    );
+}
 
 fn map_launcher_commitment(commitment: SeerCommitment) -> seer::config::CommitmentLevel {
     match commitment {
@@ -1574,6 +2195,110 @@ fn emit_execution_account_evidence_to_event_bus(
     }
 }
 
+fn spawn_nln_program_streams_capture(
+    config: ProgramStreamsConfig,
+    artifact_config: NlnArtifactCaptureConfig,
+    event_bus_tx: Option<EventBusSender>,
+    health: Option<Arc<RuntimeHealth>>,
+    authoritative_funding_stream_tx: Option<watch::Sender<bool>>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !config.enabled {
+        return None;
+    }
+
+    Some(tokio::spawn(async move {
+        let endpoint = redact_endpoint_for_logs(&config.endpoint);
+        let create_topic = config.pumpfun_create_topic.clone();
+        let trade_topic = config.pumpfun_trade_topic.clone();
+        let transfers_topic = config.system_transfers_topic.clone();
+        let artifact_writer = spawn_nln_artifact_writer(artifact_config);
+        info!(
+            endpoint = %endpoint,
+            format = config.format.as_str(),
+            create_topic = %create_topic,
+            trade_topic = %trade_topic,
+            transfers_topic = %transfers_topic,
+            "Seer: starting NLN Program Streams FSC capture lane"
+        );
+
+        let client = match NlnProgramStreamsClient::connect(config.clone()).await {
+            Ok(client) => client,
+            Err(err) => {
+                error!(
+                    endpoint = %endpoint,
+                    error = %err,
+                    "Seer: NLN Program Streams FSC capture connection failed"
+                );
+                if let Some(tx) = authoritative_funding_stream_tx.as_ref() {
+                    let _ = tx.send(false);
+                }
+                return;
+            }
+        };
+
+        match client.clone().list_topics().await {
+            Ok(topics) => {
+                let topic_count = topics.len();
+                let has_transfers_topic = topics
+                    .iter()
+                    .any(|topic| topic.topic == config.system_transfers_topic);
+                info!(
+                    endpoint = %endpoint,
+                    topic_count,
+                    has_transfers_topic,
+                    "Seer: NLN Program Streams ListTopics completed"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    endpoint = %endpoint,
+                    error = %err,
+                    "Seer: NLN Program Streams ListTopics failed; continuing with configured topic"
+                );
+            }
+        }
+
+        if let Some(tx) = authoritative_funding_stream_tx.as_ref() {
+            let _ = tx.send(true);
+        }
+
+        let create_handle = tokio::spawn(run_nln_program_streams_topic_capture(
+            client.clone(),
+            config.clone(),
+            create_topic,
+            NlnProgramStreamCaptureTopic::PumpFunCreate,
+            None,
+            None,
+            artifact_writer.clone(),
+        ));
+        let trade_handle = tokio::spawn(run_nln_program_streams_topic_capture(
+            client.clone(),
+            config.clone(),
+            trade_topic,
+            NlnProgramStreamCaptureTopic::PumpFunTrade,
+            None,
+            None,
+            artifact_writer.clone(),
+        ));
+        let transfers_handle = tokio::spawn(run_nln_program_streams_topic_capture(
+            client,
+            config,
+            transfers_topic,
+            NlnProgramStreamCaptureTopic::SystemTransfers,
+            event_bus_tx,
+            health,
+            artifact_writer,
+        ));
+
+        let _ = tokio::join!(create_handle, trade_handle, transfers_handle);
+
+        warn!("Seer: NLN Program Streams FSC capture lane exited");
+        if let Some(tx) = authoritative_funding_stream_tx.as_ref() {
+            let _ = tx.send(false);
+        }
+    }))
+}
+
 /// Run the Seer component
 pub async fn run(
     config: SeerComponentConfig,
@@ -1598,6 +2323,8 @@ pub async fn run(
     }
 
     // Convert launcher config to Seer config
+    let program_streams_artifact_config =
+        NlnArtifactCaptureConfig::from_launcher(&config.program_streams);
 
     // Determine source mode first, checking both specific source_mode and legacy connection_mode
     let derived_source_mode = if let Some(mode) = &config.source_mode {
@@ -1706,7 +2433,7 @@ pub async fn run(
         funding_lane_mode,
         program_streams: ProgramStreamsConfig {
             enabled: config.program_streams.enabled,
-            endpoint: config.program_streams.endpoint.clone(),
+            endpoint: resolve_program_streams_endpoint(&config.program_streams.endpoint),
             auth_header: config.program_streams.auth_header.clone(),
             api_key_env: config.program_streams.api_key_env.clone(),
             api_key_env_fallback: config.program_streams.api_key_env_fallback.clone(),
@@ -1728,6 +2455,7 @@ pub async fn run(
             stats_window_secs: config.pumpportal.stats_window_secs,
         },
     };
+    let program_streams_capture_config = seer_config.program_streams.clone();
 
     info!("Seer: Configuration loaded");
     info!(
@@ -1813,6 +2541,7 @@ pub async fn run(
         seer_instance = seer_instance.with_wal(wal);
     }
 
+    let nln_authoritative_funding_stream_tx = authoritative_funding_stream_tx.clone();
     if let Some(tx) = authoritative_funding_stream_tx {
         if seer_instance.set_authoritative_funding_stream_availability_sender(tx) {
             info!(
@@ -1862,6 +2591,14 @@ pub async fn run(
             }
         })
     };
+
+    let nln_program_streams_handle = spawn_nln_program_streams_capture(
+        program_streams_capture_config,
+        program_streams_artifact_config,
+        event_bus_tx.clone(),
+        health.clone(),
+        nln_authoritative_funding_stream_tx,
+    );
 
     // Process IPC events and emit to event bus
     let health_ipc = health.clone();
@@ -2287,6 +3024,9 @@ pub async fn run(
     // Cancel tasks
     seer_handle.abort();
     ipc_handle.abort();
+    if let Some(handle) = nln_program_streams_handle {
+        handle.abort();
+    }
 
     info!("Seer: Component stopped");
     Ok(())

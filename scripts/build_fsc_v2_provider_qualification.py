@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Iterable
@@ -144,6 +145,35 @@ def raw_log_row(row: dict[str, Any], *, provider_topic: str) -> dict[str, Any]:
 
 def copy_raw_topic(rows: list[dict[str, Any]], output: Path, *, provider_topic: str) -> int:
     return common.write_jsonl(output, (raw_log_row(row, provider_topic=provider_topic) for row in rows))
+
+
+def link_or_copy_raw_topic(
+    input_paths: list[Path],
+    rows: list[dict[str, Any]],
+    output: Path,
+    *,
+    provider_topic: str,
+) -> int:
+    """Materialize raw topic evidence without duplicating live capture bytes.
+
+    PR8 live capture writes durable JSONL under logs/nln_capture/<scope>.  When
+    there is a single source path on the same filesystem, the official
+    logs/nln/<scope> artifact can be a hardlink to that durable source.  This
+    preserves the .jsonl file contract while avoiding a second copy of high
+    volume Program Stream rows during 24h qualification runs.
+    """
+    existing_inputs = [path for path in input_paths if path.exists()]
+    if len(existing_inputs) == 1:
+        source = existing_inputs[0]
+        output.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if output.exists() or output.is_symlink():
+                output.unlink()
+            os.link(source, output)
+            return len(rows)
+        except OSError:
+            pass
+    return copy_raw_topic(rows, output, provider_topic=provider_topic)
 
 
 def candidate_birth_row(row: dict[str, Any], *, provider_topic: str) -> dict[str, Any]:
@@ -616,9 +646,24 @@ def build_artifacts(args: argparse.Namespace) -> dict[str, Any]:
         "fsc_provider_qualification_manifest_v1": report_dir / "fsc_provider_qualification_manifest_v1.json",
     }
 
-    copy_raw_topic(create_rows, outputs["pumpfun_create_raw_v1"], provider_topic=args.create_topic)
-    copy_raw_topic(trade_rows, outputs["pumpfun_trade_raw_v1"], provider_topic=args.trade_topic)
-    copy_raw_topic(transfer_rows, outputs["system_transfers_raw_v1"], provider_topic=args.transfer_topic)
+    link_or_copy_raw_topic(
+        args.nln_create,
+        create_rows,
+        outputs["pumpfun_create_raw_v1"],
+        provider_topic=args.create_topic,
+    )
+    link_or_copy_raw_topic(
+        args.nln_trade,
+        trade_rows,
+        outputs["pumpfun_trade_raw_v1"],
+        provider_topic=args.trade_topic,
+    )
+    link_or_copy_raw_topic(
+        args.nln_transfer,
+        transfer_rows,
+        outputs["system_transfers_raw_v1"],
+        provider_topic=args.transfer_topic,
+    )
 
     birth_rows = [candidate_birth_row(row, provider_topic=args.create_topic) for row in create_rows]
     funding_rows = [

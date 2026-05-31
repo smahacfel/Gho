@@ -92,8 +92,8 @@ pub struct SubscribeResponse {
     pub topic: String,
     #[prost(uint32, tag = "2")]
     pub partition: u32,
-    #[prost(string, tag = "3")]
-    pub offset: String,
+    #[prost(uint64, tag = "3")]
+    pub offset: u64,
     #[prost(int64, tag = "4")]
     pub timestamp_ms: i64,
     #[prost(bytes = "vec", tag = "5")]
@@ -369,8 +369,8 @@ impl NlnPumpFunTradeEvent {
 pub struct NlnTransferEvent {
     pub meta: NlnIngestMeta,
     pub signature: String,
-    pub tx_index: u32,
-    pub instruction_index: u32,
+    pub tx_index: Option<u32>,
+    pub instruction_index: Option<u32>,
     pub slot: u64,
     pub from_wallet: solana_sdk::pubkey::Pubkey,
     pub to_wallet: solana_sdk::pubkey::Pubkey,
@@ -402,8 +402,8 @@ impl NlnTransferEvent {
             semantic: nln_semantic(Some(self.slot), event_time),
             slot: Some(self.slot),
             event_ordinal: None,
-            tx_index: Some(self.tx_index),
-            outer_instruction_index: Some(self.instruction_index),
+            tx_index: self.tx_index,
+            outer_instruction_index: self.instruction_index,
             inner_group_index: None,
             cpi_stack_height: None,
             event_time,
@@ -804,8 +804,8 @@ pub fn decode_subscribe_response(
     Ok(NlnProgramStreamMessage {
         topic: response.topic.clone(),
         partition: response.partition,
-        offset_raw: response.offset.clone(),
-        offset: response.offset.parse::<u64>().ok(),
+        offset_raw: response.offset.to_string(),
+        offset: Some(response.offset),
         provider_ts_ms,
         recv_ts_ms,
         decode_ts_ms: now_ms(),
@@ -928,15 +928,15 @@ pub fn parse_pumpfun_trade(message: &NlnProgramStreamMessage) -> Result<NlnPumpF
 pub fn parse_system_transfer(message: &NlnProgramStreamMessage) -> Result<NlnTransferEvent> {
     let object = payload_object(message)?;
     let signature = required_string(object, &["signature"])?;
-    let tx_index = required_u32(object, &["tx_index", "txIndex"])?;
-    let instruction_index = required_u32(object, &["instruction_index", "instructionIndex"])?;
+    let tx_index = optional_u32(object, &["tx_index", "txIndex"])?;
+    let instruction_index = optional_u32(object, &["instruction_index", "instructionIndex"])?;
     let slot = required_u64(object, &["slot"])?;
     let meta = NlnIngestMeta::from_message(
         message,
         Some(slot),
         Some(signature.clone()),
-        Some(tx_index),
-        Some(instruction_index),
+        tx_index,
+        instruction_index,
     );
 
     Ok(NlnTransferEvent {
@@ -1303,7 +1303,7 @@ mod tests {
         let response = SubscribeResponse {
             topic: "prod.rpc.solana.system.transfers".to_string(),
             partition: 3,
-            offset: "12345".to_string(),
+            offset: 12345,
             timestamp_ms: 1,
             payload: br#"{"from_wallet":"a","to_wallet":"b"}"#.to_vec(),
         };
@@ -1322,7 +1322,7 @@ mod tests {
         let response = SubscribeResponse {
             topic: "prod.rpc.solana.pumpfun.trade".to_string(),
             partition: 0,
-            offset: "bad".to_string(),
+            offset: 0,
             timestamp_ms: 0,
             payload: b"not-json-not-base64".to_vec(),
         };
@@ -1403,8 +1403,8 @@ mod tests {
         );
 
         let transfer = parse_system_transfer(&message).unwrap();
-        assert_eq!(transfer.tx_index, 408);
-        assert_eq!(transfer.instruction_index, 2);
+        assert_eq!(transfer.tx_index, Some(408));
+        assert_eq!(transfer.instruction_index, Some(2));
         assert_eq!(transfer.asset(), TransferAsset::NativeSol);
 
         let event = transfer
@@ -1430,6 +1430,33 @@ mod tests {
             full.provenance.coverage_class,
             FundingTransferCoverageClass::FullChainCoverage
         );
+    }
+
+    #[test]
+    fn transfer_order_fields_are_optional_for_capture_lane() {
+        let from_wallet = solana_sdk::pubkey::Pubkey::new_unique();
+        let to_wallet = solana_sdk::pubkey::Pubkey::new_unique();
+        let message = decoded_message(
+            ProgramStreamsConfig::default_system_transfers_topic(),
+            json!({
+                "signature": "transfer-sig",
+                "slot": "422819679",
+                "from_wallet": from_wallet.to_string(),
+                "to_wallet": to_wallet.to_string(),
+                "amount": "1000",
+                "token_address": "solana"
+            }),
+        );
+
+        let transfer = parse_system_transfer(&message).unwrap();
+        assert_eq!(transfer.tx_index, None);
+        assert_eq!(transfer.instruction_index, None);
+
+        let event = transfer
+            .to_native_sol_funding_transfer_event(NlnFundingTransferCoverage::CaptureOnly)
+            .expect("native SOL transfer should still enter capture lane");
+        assert_eq!(event.tx_index, None);
+        assert_eq!(event.outer_instruction_index, None);
     }
 
     #[test]

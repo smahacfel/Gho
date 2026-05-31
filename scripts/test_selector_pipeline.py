@@ -540,6 +540,56 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertEqual(summary["status"], "NO-GO")
         self.assertTrue(summary["identity_collisions"])
 
+    def test_candidate_universe_joins_decision_context_by_mint_pool_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            events = root / "events.jsonl"
+            decisions = root / "decisions.jsonl"
+            output = root / "candidate_universe_v1.jsonl"
+            write_jsonl(
+                events,
+                [
+                    {
+                        "type": "NewPoolDetected",
+                        "candidate_id": "mint1:pool1:1000",
+                        "base_mint": "mint1",
+                        "pool_id": "pool1",
+                        "bonding_curve": "pool1",
+                        "quote_mint": "SOL",
+                        "birth_ts_ms": 1_000,
+                    }
+                ],
+            )
+            write_jsonl(
+                decisions,
+                [
+                    {
+                        "base_mint": "mint1",
+                        "pool_id": "pool1",
+                        "decision_ts_ms": 11_000,
+                        "decision_verdict_buy": True,
+                        "verdict_type": "BUY",
+                        "v25_shadow_confidence": 0.7,
+                        "v3_shadow_verdict": "BUY_CANDIDATE",
+                        "v3_shadow_confidence": 0.8,
+                    }
+                ],
+            )
+            summary = universe.run(
+                universe.build_parser().parse_args(
+                    ["--events", str(events), "--decisions", str(decisions), "--output", str(output)]
+                )
+            )
+            rows = read_jsonl(output)
+
+        self.assertEqual(summary["status"], "ok")
+        self.assertEqual(summary["decision_context_rows_joined"], 1)
+        self.assertEqual(summary["decision_only_rows_skipped"], 0)
+        self.assertEqual(rows[0]["candidate_id"], "mint1:pool1:1000")
+        self.assertTrue(rows[0]["decision_verdict_buy"])
+        self.assertEqual(rows[0]["gatekeeper_v3_verdict"], "BUY_CANDIDATE")
+        self.assertEqual(rows[0]["gatekeeper_v25_score"], 0.7)
+
     def test_training_view_reports_accepted_join_completeness_no_go(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -604,6 +654,166 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertEqual(coverage["accepted_lifecycle_join_gate"]["status"], "NO-GO")
         self.assertEqual(coverage["status"], "NO-GO")
 
+    def test_training_view_joins_accepted_lifecycle_by_mint_pool_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            candidates = root / "candidate_universe_v1.jsonl"
+            lifecycle = root / "accepted_lifecycle_v1.jsonl"
+            features = root / "feature_snapshots_v1.jsonl"
+            paths = root / "price_paths.jsonl"
+            write_jsonl(
+                candidates,
+                [
+                    {
+                        "candidate_id": "mint1:pool1:1000",
+                        "candidate_universe_status": "ok",
+                        "cohort_in_scope": True,
+                        "stream_completeness_ok": True,
+                        "base_mint": "mint1",
+                        "pool_id": "pool1",
+                        "bonding_curve": "pool1",
+                        "quote_mint": "SOL",
+                        "birth_ts_ms": 1_000,
+                    }
+                ],
+            )
+            write_jsonl(
+                lifecycle,
+                [
+                    {
+                        "candidate_id": "mint1_pool1_11000",
+                        "base_mint": "mint1",
+                        "pool_id": "pool1",
+                        "decision_ts_ms": 11_000,
+                        "truth_status": "resolved",
+                        "r1_label": "positive",
+                    }
+                ],
+            )
+            write_jsonl(
+                features,
+                [
+                    {
+                        "candidate_id": "mint1:pool1:1000",
+                        "snapshot_kind": "decision",
+                        "feature_cutoff_ts_ms": 5_000,
+                        "feature_cutoff_slot": 9,
+                        "feature_source": "selector_offline_event_rollup",
+                        "feature_observed_lag_ms": 0,
+                        "feature_source_max_ts_ms": 5_000,
+                        "feature_snapshot_status": "ok",
+                    }
+                ],
+            )
+            write_jsonl(
+                paths,
+                [
+                    {
+                        "candidate_id": "mint1:pool1:1000",
+                        "path_source": "yellowstone_account_update",
+                        "path_status": "ok",
+                        "path_coverage_ok": True,
+                        "horizon_matured": True,
+                        "samples": [{"offset_ms": 60_000, "return_pct": 50.0}],
+                    }
+                ],
+            )
+            rows, coverage, _audit = training.build_training_view(
+                candidate_universe=candidates,
+                accepted_lifecycle=lifecycle,
+                feature_snapshots=features,
+                price_paths=paths,
+                target_net_pct=40,
+                stop_net_pct=40,
+                horizon_ms=60_000,
+                snapshot_kind="decision",
+                fallback_snapshot_kind="decision",
+            )
+
+        self.assertTrue(rows[0]["accepted_lifecycle_joined"])
+        self.assertEqual(rows[0]["accepted_lifecycle_join_key"], "mint_pool:mint1:pool1")
+        self.assertEqual(rows[0]["accepted_lifecycle_candidate_id"], "mint1_pool1_11000")
+        self.assertEqual(coverage["accepted_lifecycle_exact_candidate_id_joined"], 0)
+        self.assertEqual(coverage["accepted_lifecycle_joined"], 1)
+        self.assertEqual(coverage["accepted_lifecycle_join_gate"]["status"], "PASS")
+
+    def test_training_view_excludes_out_of_scope_lifecycle_rows_from_join_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            candidates = root / "candidate_universe_v1.jsonl"
+            lifecycle = root / "accepted_lifecycle_v1.jsonl"
+            features = root / "feature_snapshots_v1.jsonl"
+            paths = root / "price_paths.jsonl"
+            write_jsonl(
+                candidates,
+                [
+                    {
+                        "candidate_id": "c1",
+                        "candidate_universe_status": "ok",
+                        "cohort_in_scope": True,
+                        "stream_completeness_ok": True,
+                        "base_mint": "mint1",
+                        "pool_id": "pool1",
+                        "birth_ts_ms": 1_000_000,
+                    }
+                ],
+            )
+            write_jsonl(
+                lifecycle,
+                [
+                    {
+                        "candidate_id": "old",
+                        "base_mint": "old_mint",
+                        "pool_id": "old_pool",
+                        "decision_ts_ms": 1_000,
+                    }
+                ],
+            )
+            write_jsonl(
+                features,
+                [
+                    {
+                        "candidate_id": "c1",
+                        "snapshot_kind": "decision",
+                        "feature_cutoff_ts_ms": 1_005_000,
+                        "feature_cutoff_slot": 9,
+                        "feature_source": "selector_offline_event_rollup",
+                        "feature_observed_lag_ms": 0,
+                        "feature_source_max_ts_ms": 1_005_000,
+                        "feature_snapshot_status": "ok",
+                    }
+                ],
+            )
+            write_jsonl(
+                paths,
+                [
+                    {
+                        "candidate_id": "c1",
+                        "path_source": "yellowstone_account_update",
+                        "path_status": "ok",
+                        "path_coverage_ok": True,
+                        "horizon_matured": True,
+                        "samples": [{"offset_ms": 60_000, "return_pct": 50.0}],
+                    }
+                ],
+            )
+            _rows, coverage, _audit = training.build_training_view(
+                candidate_universe=candidates,
+                accepted_lifecycle=lifecycle,
+                feature_snapshots=features,
+                price_paths=paths,
+                target_net_pct=40,
+                stop_net_pct=40,
+                horizon_ms=60_000,
+                snapshot_kind="decision",
+                fallback_snapshot_kind="decision",
+            )
+
+        self.assertEqual(coverage["accepted_lifecycle_rows"], 1)
+        self.assertEqual(coverage["accepted_lifecycle_join_scope_rows"], 0)
+        self.assertEqual(coverage["accepted_lifecycle_out_of_scope_rows"], 1)
+        self.assertEqual(coverage["accepted_lifecycle_join_gate"]["status"], "PASS")
+
     def test_gatekeeper_compare_reports_missing_v3_replay_without_pseudo_score(self) -> None:
         rows = [
             {
@@ -636,6 +846,33 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertEqual(by_model["gatekeeper_v3"]["status"], "replay_input_missing")
         self.assertFalse(report["comparison_contract"]["same_candidate_set"])
         self.assertFalse(report["model_candidate_sets"]["same_model_candidate_set"])
+
+    def test_gatekeeper_compare_empty_eligible_rows_is_not_replay_input_missing(self) -> None:
+        rows = [
+            {
+                "candidate_id": "c1",
+                "split": "holdout",
+                "eligible": True,
+                "cohort_in_scope": True,
+                "stream_completeness_ok": False,
+                "label_resolved": False,
+                "r2_status": "missing_path",
+            }
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            training_view = root / "training.jsonl"
+            output = root / "compare.json"
+            write_jsonl(training_view, rows)
+            report = compare.run(
+                compare.build_parser().parse_args(["--training-view", str(training_view), "--output", str(output)])
+            )
+
+        by_model = {item["model"]: item for item in report["models"]}
+        self.assertEqual(by_model["gatekeeper_v25"]["status"], "no_comparison_rows")
+        self.assertEqual(by_model["gatekeeper_v3"]["status"], "no_comparison_rows")
+        self.assertIn("no_comparison_eligible_rows", report["contract_checks"]["fail_reasons"])
+        self.assertNotIn("model_candidate_set_mismatch", report["contract_checks"]["fail_reasons"])
 
     def test_baseline_sample_gate_blocks_promotion_on_tiny_holdout(self) -> None:
         rows = []

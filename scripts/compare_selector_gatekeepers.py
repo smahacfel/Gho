@@ -97,6 +97,21 @@ def model_report(
     replay_version_fields: tuple[str, ...],
     buckets: list[float],
 ) -> dict[str, Any]:
+    if not rows:
+        return {
+            "model": model_name,
+            "status": "no_comparison_rows",
+            "eligible_rows": 0,
+            "ok_replay_rows": 0,
+            "row_status_counts": {},
+            "missing_score_rows": 0,
+            "missing_replay_artifact_version_rows": 0,
+            "native": metric_rows([], lambda _row: False),
+            "accept_rate_buckets": {
+                f"top_{rate:g}": metric_rows([], lambda _row: False) for rate in buckets
+            },
+            "row_results": [],
+        }
     row_results = []
     ok_rows: list[dict[str, Any]] = []
     status_counts: dict[str, int] = {}
@@ -163,6 +178,23 @@ def first_string(row: dict[str, Any], fields: tuple[str, ...]) -> str | None:
 
 def contract_checks(rows: list[dict[str, Any]], *, split: str) -> dict[str, Any]:
     eligible = [row for row in rows if comparison_eligible(row, split=split)]
+    split_rows = [row for row in rows if row.get("split") == split]
+    cohort_rows = [row for row in split_rows if row.get("cohort_in_scope") is True]
+    stream_rows = [row for row in cohort_rows if row.get("stream_completeness_ok") is True]
+    label_rows = [row for row in stream_rows if row.get("label_resolved") is True]
+    r2_rows = [row for row in label_rows if row.get("r2_label") in {"positive", "negative"}]
+    eligibility_breakdown = {
+        "rows_total": len(rows),
+        "split_rows": len(split_rows),
+        "cohort_in_scope_rows": len(cohort_rows),
+        "stream_completeness_ok_rows": len(stream_rows),
+        "label_resolved_rows": len(label_rows),
+        "r2_positive_negative_rows": len(r2_rows),
+        "comparison_eligible_rows": len(eligible),
+        "r2_label_or_status_counts": common.counter_dict(
+            Counter(str(row.get("r2_label") or row.get("r2_status") or "unknown") for row in rows)
+        ),
+    }
     candidate_ids = [common.str_or_none(row.get("candidate_id")) for row in eligible]
     missing_candidate_id = sum(1 for candidate_id in candidate_ids if not candidate_id)
     candidate_id_counts = Counter(candidate_id for candidate_id in candidate_ids if candidate_id)
@@ -245,6 +277,7 @@ def contract_checks(rows: list[dict[str, Any]], *, split: str) -> dict[str, Any]
         "same_replay_artifact_version": not mismatched_replay_versions,
         "replay_artifact_versions_seen": sorted(replay_versions),
         "mismatched_replay_versions_sample": mismatched_replay_versions[:50],
+        "eligibility_breakdown": eligibility_breakdown,
     }
 
 
@@ -299,7 +332,11 @@ def compare(training_view: Path, buckets: list[float], *, split: str) -> dict[st
     same_model_candidate_set = bool(eligible_ids) and bool(model_sets) and all(
         item == eligible_ids for item in model_sets
     )
-    if not same_model_candidate_set and "model_candidate_set_mismatch" not in checks["fail_reasons"]:
+    if (
+        eligible_ids
+        and not same_model_candidate_set
+        and "model_candidate_set_mismatch" not in checks["fail_reasons"]
+    ):
         checks["status"] = "NO-GO"
         checks["fail_reasons"] = [*checks["fail_reasons"], "model_candidate_set_mismatch"]
     report = {

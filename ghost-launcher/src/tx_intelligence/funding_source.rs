@@ -22,7 +22,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const FSC_V2_PROVIDER_LEGACY_ROLLING_INDEX: &str = "ghost_legacy_rolling_funding_index";
+const FSC_V2_PROVIDER_NLN_PROGRAM_STREAMS: &str = "nln_program_streams";
 const FSC_V2_TOPIC_LEGACY_FUNDING_TRANSFERS: &str = "ghost.funding_transfers";
+const FSC_V2_TOPIC_NLN_SYSTEM_TRANSFERS: &str = "prod.rpc.solana.system.transfers";
 const FSC_V2_MIN_TOTAL_BUYERS: u64 = 2;
 const FSC_V2_MIN_KNOWN_NON_NEUTRAL_BUYERS: u64 = 2;
 const FSC_V2_MIN_KNOWN_COVERAGE: f64 = 0.50;
@@ -120,6 +122,7 @@ struct FundingSourceInner {
     stream_available_since_ms: Option<u64>,
     saw_transfer: bool,
     availability_controlled: bool,
+    observed_funding_lane_kinds: HashSet<String>,
 }
 
 #[derive(Debug, Default)]
@@ -289,6 +292,8 @@ fn build_fsc_v2_evidence(
     saw_transfer: bool,
     config: &FundingSourceConfig,
     max_buy_slot: Option<u64>,
+    provider: String,
+    source_topics: Vec<String>,
 ) -> FscV2Evidence {
     let total_buyers = accumulator.total_buyers;
     let known_buyers = accumulator.known_buyers;
@@ -425,9 +430,25 @@ fn build_fsc_v2_evidence(
         neutral_funder_set_version: None,
         neutral_funder_set_hash: neutral_funder_set_hash(config),
         config_hash: funding_source_config_hash(config),
-        provider: FSC_V2_PROVIDER_LEGACY_ROLLING_INDEX.to_string(),
-        source_topics: vec![FSC_V2_TOPIC_LEGACY_FUNDING_TRANSFERS.to_string()],
+        provider,
+        source_topics,
     }
+}
+
+fn fsc_v2_source_provenance(inner: &FundingSourceInner) -> (String, Vec<String>) {
+    if inner
+        .observed_funding_lane_kinds
+        .contains("nln_program_streams")
+    {
+        return (
+            FSC_V2_PROVIDER_NLN_PROGRAM_STREAMS.to_string(),
+            vec![FSC_V2_TOPIC_NLN_SYSTEM_TRANSFERS.to_string()],
+        );
+    }
+    (
+        FSC_V2_PROVIDER_LEGACY_ROLLING_INDEX.to_string(),
+        vec![FSC_V2_TOPIC_LEGACY_FUNDING_TRANSFERS.to_string()],
+    )
 }
 
 fn fsc_v2_status(
@@ -700,6 +721,12 @@ impl FundingSourceIndex {
 
         let prune_started_at = Instant::now();
         let mut inner = self.inner.write();
+        // Any accepted funding transfer warms the rolling index for capture/evidence.
+        // Full-chain transfers may additionally mark availability automatically.
+        inner.saw_transfer = true;
+        inner
+            .observed_funding_lane_kinds
+            .insert(transfer.provenance.lane_kind.as_str().to_string());
         if transfer.full_chain_coverage {
             if !inner.availability_controlled {
                 inner.stream_available = true;
@@ -707,7 +734,6 @@ impl FundingSourceIndex {
                     .stream_available_since_ms
                     .get_or_insert(observation_wall_ms);
             }
-            inner.saw_transfer = true;
         }
 
         let mut tracked_last_seen = None;
@@ -804,6 +830,7 @@ impl FundingSourceIndex {
         let mut inner = self.inner.write();
 
         if !inner.stream_available {
+            let (provider, source_topics) = fsc_v2_source_provenance(&inner);
             let funding_source_v2 = build_fsc_v2_evidence(
                 &fsc_v2_accumulator,
                 &diagnostics,
@@ -811,6 +838,8 @@ impl FundingSourceIndex {
                 inner.saw_transfer,
                 config,
                 max_buy_slot,
+                provider,
+                source_topics,
             );
             return FscComputation {
                 funding_source_concentration: None,
@@ -821,6 +850,7 @@ impl FundingSourceIndex {
         }
 
         if !inner.saw_transfer {
+            let (provider, source_topics) = fsc_v2_source_provenance(&inner);
             let funding_source_v2 = build_fsc_v2_evidence(
                 &fsc_v2_accumulator,
                 &diagnostics,
@@ -828,6 +858,8 @@ impl FundingSourceIndex {
                 false,
                 config,
                 max_buy_slot,
+                provider,
+                source_topics,
             );
             return FscComputation {
                 funding_source_concentration: None,
@@ -899,6 +931,7 @@ impl FundingSourceIndex {
             record_fsc_lookup_misses(lookup_misses);
         }
         sort_lookup_miss_counts(&mut diagnostics);
+        let (provider, source_topics) = fsc_v2_source_provenance(&inner);
         let funding_source_v2 = build_fsc_v2_evidence(
             &fsc_v2_accumulator,
             &diagnostics,
@@ -906,6 +939,8 @@ impl FundingSourceIndex {
             inner.saw_transfer,
             config,
             max_buy_slot,
+            provider,
+            source_topics,
         );
 
         if known_sources.len() < 2 {
@@ -2687,6 +2722,44 @@ mod tests {
         assert_eq!(
             computed.degraded_reasons,
             vec![FSC_FUNDING_STREAM_UNAVAILABLE_REASON.to_string()]
+        );
+    }
+
+    #[test]
+    fn capture_transfer_warms_index_when_stream_is_explicitly_available() {
+        let config = config();
+        let index = FundingSourceIndex::new();
+        index.set_stream_available(true);
+
+        let mut transfer_a =
+            funding_transfer("funder-shared", "buyer-a", "fund-a", 100, 50_000_000);
+        transfer_a.full_chain_coverage = false;
+        transfer_a.provenance = seer::ipc::FundingTransferProvenance::nln_program_streams_live(
+            seer::ipc::FundingTransferCoverageClass::FilteredObservations,
+        );
+        let mut transfer_b =
+            funding_transfer("funder-shared", "buyer-b", "fund-b", 110, 50_000_000);
+        transfer_b.full_chain_coverage = false;
+        transfer_b.provenance = seer::ipc::FundingTransferProvenance::nln_program_streams_live(
+            seer::ipc::FundingTransferCoverageClass::FilteredObservations,
+        );
+        index.observe_transfer(&transfer_a, &config);
+        index.observe_transfer(&transfer_b, &config);
+
+        let buys = vec![
+            buy_tx("buyer-a", "buy-a", 400),
+            buy_tx("buyer-b", "buy-b", 500),
+        ];
+        let computed = index.compute_for_transactions(buys.iter(), &config);
+
+        assert!(index.warmup_ready());
+        assert_eq!(computed.degraded_reasons, Vec::<String>::new());
+        assert_approx_eq(
+            computed
+                .funding_source_v2
+                .hhi_norm_count
+                .expect("capture FSC v2 should be materialized"),
+            1.0,
         );
     }
 

@@ -86,7 +86,8 @@ pub const CYCLIC_LOG_SCHEMA_VERSION: u32 = 1;
 /// offline axis replay.
 /// v23 adds additive replay payload hash fields for V3 shadow-sidecar parity.
 /// v24 adds additive FSC v2 evidence capture fields without policy activation.
-pub const GATEKEEPER_BUY_LOG_SCHEMA_VERSION: u32 = 24;
+/// v25 adds additive FSC v2 shadow-policy counterfactual fields without verdict impact.
+pub const GATEKEEPER_BUY_LOG_SCHEMA_VERSION: u32 = 25;
 /// Gatekeeper version string embedded in every V2.5 shadow BUY log for traceability.
 pub const GATEKEEPER_VERSION: &str = "v2.5";
 /// Legacy Gatekeeper version string for pre-V2.5 live-plane semantics.
@@ -1204,6 +1205,15 @@ pub struct GatekeeperBuyLog {
     /// Additive FSC v2 evidence payload. Export-only until FSC v2 policy is explicitly enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub funding_source_v2: Option<FscV2Evidence>,
+    /// Shadow-only indication whether FSC v2 would be a policy signal if enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_fsc_v2_policy_signal: Option<bool>,
+    /// Shadow-only soft points FSC v2 would add if the FSC policy branch were enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_fsc_v2_soft_points_if_enabled: Option<u16>,
+    /// Shadow-only reason for the FSC v2 counterfactual.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_fsc_v2_reason_if_enabled: Option<String>,
 
     /// Sybil metric degraded reasons from canonical feature materialization.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -3078,6 +3088,9 @@ mod tests {
             max_funding_source_concentration: 1.0,
             funding_source_diagnostics: None,
             funding_source_v2: None,
+            shadow_fsc_v2_policy_signal: None,
+            shadow_fsc_v2_soft_points_if_enabled: None,
+            shadow_fsc_v2_reason_if_enabled: None,
             sybil_metric_degraded_reasons: vec!["DBIA_NO_DEV_BUY".to_string()],
             // A/B Window fields (not used in this test)
             ab_window_ms: None,
@@ -3578,6 +3591,9 @@ mod tests {
             max_funding_source_concentration: 1.0,
             funding_source_diagnostics: None,
             funding_source_v2: None,
+            shadow_fsc_v2_policy_signal: None,
+            shadow_fsc_v2_soft_points_if_enabled: None,
+            shadow_fsc_v2_reason_if_enabled: None,
             sybil_metric_degraded_reasons: vec!["DBIA_NO_DEV_BUY".to_string()],
             ab_window_ms: Some(10_000),
             ab_t0_event_ts_ms: Some(1000),
