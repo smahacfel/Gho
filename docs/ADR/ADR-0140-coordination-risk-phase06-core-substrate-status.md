@@ -359,6 +359,89 @@ Observed result:
 legacy/deprecated `shadow_ledger` paths and unused variables. These warnings are not introduced by
 the coordination-risk substrate work.
 
+### Artifact validation run: r2
+
+After this ADR was first written, a dedicated artifact-backed validation run was executed and left
+under:
+
+```text
+logs/validation/coordination-risk-phase06-core-substrate-r2-20260531T130918Z/
+```
+
+Run identity:
+
+```text
+run_id=coordination-risk-phase06-core-substrate-r2
+started_at_utc=2026-05-31T13:09:18Z
+finished_at_utc=2026-05-31T13:09:19Z
+branch=main
+head=9f6abc565b6fade6094e15c4dcc7a8d3bb4b9f20
+head_short=9f6abc5
+scope=phase06_targeted_validation
+```
+
+The run executed the exact Phase 0.6 core validation command set:
+
+```text
+git diff --check
+cargo fmt --package ghost-core --check
+cargo check -p ghost-core
+cargo test -p ghost-core --test coordination_samples_pr1 --test coordination_evidence_pr2 --test coordination_stats_pr3 --test coordination_metrics_phase06
+```
+
+Observed exit codes from `summary.env`:
+
+| Command | Exit |
+| --- | ---: |
+| `git diff --check` | 0 |
+| `cargo fmt --package ghost-core --check` | 0 |
+| `cargo check -p ghost-core` | 0 |
+| targeted coordination tests | 0 |
+
+Targeted test breakdown from `cargo_test_coordination_phase06.log`:
+
+| Test binary | Passed | Failed |
+| --- | ---: | ---: |
+| `coordination_evidence_pr2` | 7 | 0 |
+| `coordination_metrics_phase06` | 20 | 0 |
+| `coordination_samples_pr1` | 6 | 0 |
+| `coordination_stats_pr3` | 19 | 0 |
+| Total | 52 | 0 |
+
+Validation observations:
+
+1. `git_diff_check.log` is empty and the command exit is `0`; there are no whitespace/conflict
+   marker errors in the current dirty worktree.
+2. `cargo_fmt_ghost_core.log` is empty and the command exit is `0`; `ghost-core` formatting passes.
+3. `cargo_check_ghost_core.log` exits `0` and reports 25 existing warnings in legacy/deprecated
+   `shadow_ledger` and unrelated unused-code paths.
+4. `cargo_test_coordination_phase06.log` exits `0`; all PR1/PR2/PR3 and Phase 0.6 targeted tests
+   pass.
+5. `git_status_start.txt` and `git_status_end.txt` are identical, so the validation run did not
+   mutate the worktree.
+
+Important scope caveat:
+
+```text
+This run validates the current dirty worktree core substrate,
+not a clean checkout of commit 9f6abc5 alone.
+```
+
+At validation time, the worktree still contained uncommitted/untracked implementation files for
+Phase 0.6, including `ghost-core/src/features/coordination/metrics.rs` and
+`ghost-core/tests/coordination_metrics_phase06.rs`. Therefore the artifact proves that the working
+copy of the core substrate passes the targeted checks. It does not prove that the pushed
+documentation-only commit contains a buildable implementation by itself.
+
+Conclusion from artifact validation:
+
+```text
+Phase 0.6 core substrate validation: PASS for the current worktree
+Phase 0.6 runtime frozen sidecar: still not implemented
+Phase 0.6 behavioral Gatekeeper no-drift proof: still not implemented
+Phase 0.6 full closure: still NO-GO
+```
+
 ## Consequences
 
 The current implementation is safe to keep as an inert core substrate because:
