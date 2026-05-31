@@ -787,6 +787,14 @@ pub fn build_coordination_risk_evidence_unit(
     if input.source_snapshot_hash.is_none() {
         push_unique_reason(&mut degraded_reasons, DegradedReason::MissingFrozenBuffer);
     }
+    append_snapshot_time_bound_reasons(
+        &mut degraded_reasons,
+        input.decision_ts_ms,
+        input.decision_slot,
+        input.feature_cutoff_ts_ms,
+        input.feature_cutoff_slot,
+        input.source_buffer_watermark_slot,
+    );
 
     let skipped_metrics = skipped_phase06_metrics(DegradedReason::NotConfigured);
     let (features, metric_breakdowns) = if degraded_reasons.is_empty() {
@@ -838,7 +846,14 @@ pub fn build_coordination_risk_evidence_unit_from_snapshot(
     config: &CoordinationRiskConfig,
 ) -> CoordinationRiskEvidenceUnit {
     let snapshot_available = snapshot.snapshot_mode == CoordinationSnapshotMode::DecisionTime
-        && snapshot.source_snapshot_hash.is_some();
+        && snapshot.source_snapshot_hash.is_some()
+        && snapshot_time_bounds_are_decision_safe(
+            snapshot.decision_ts_ms,
+            snapshot.decision_slot,
+            snapshot.feature_cutoff_ts_ms,
+            snapshot.feature_cutoff_slot,
+            snapshot.source_buffer_watermark_slot,
+        );
     let funding_visibility = FundingVisibility::from_fsc_v2_lane_health(snapshot.fsc_v2.as_ref());
     let sample_summary = summarize_observed_buy_txs(&snapshot.txs);
 
@@ -873,6 +888,11 @@ pub fn build_coordination_risk_evidence_unit_from_snapshot(
             ..CoordinationRiskFeatures::default()
         };
         features.degraded_reasons.clear();
+        if snapshot.fsc_v2.is_none() {
+            features
+                .degraded_reasons
+                .push(DegradedReason::FundingLaneUnavailable);
+        }
 
         CoordinationRiskEvidenceInput {
             schema_version: snapshot.schema_version,
@@ -984,6 +1004,55 @@ fn sanitize_export_only_features(
     features.cross_pool_cohort_recurrence = None;
     features.execution_template_concentration = None;
     features
+}
+
+fn snapshot_time_bounds_are_decision_safe(
+    decision_ts_ms: u64,
+    decision_slot: Option<u64>,
+    feature_cutoff_ts_ms: u64,
+    feature_cutoff_slot: Option<u64>,
+    source_buffer_watermark_slot: Option<u64>,
+) -> bool {
+    let mut reasons = SmallVec::<[DegradedReason; 4]>::new();
+    append_snapshot_time_bound_reasons(
+        &mut reasons,
+        decision_ts_ms,
+        decision_slot,
+        feature_cutoff_ts_ms,
+        feature_cutoff_slot,
+        source_buffer_watermark_slot,
+    );
+    reasons.is_empty()
+}
+
+fn append_snapshot_time_bound_reasons(
+    degraded_reasons: &mut SmallVec<[DegradedReason; 4]>,
+    decision_ts_ms: u64,
+    decision_slot: Option<u64>,
+    feature_cutoff_ts_ms: u64,
+    feature_cutoff_slot: Option<u64>,
+    source_buffer_watermark_slot: Option<u64>,
+) {
+    if feature_cutoff_ts_ms > decision_ts_ms {
+        push_unique_reason(degraded_reasons, DegradedReason::FeatureCutoffAfterDecision);
+    }
+
+    if let (Some(feature_cutoff_slot), Some(decision_slot)) = (feature_cutoff_slot, decision_slot) {
+        if feature_cutoff_slot > decision_slot {
+            push_unique_reason(degraded_reasons, DegradedReason::FeatureCutoffAfterDecision);
+        }
+    }
+
+    if let (Some(source_buffer_watermark_slot), Some(decision_slot)) =
+        (source_buffer_watermark_slot, decision_slot)
+    {
+        if source_buffer_watermark_slot > decision_slot {
+            push_unique_reason(
+                degraded_reasons,
+                DegradedReason::SourceWatermarkAfterDecision,
+            );
+        }
+    }
 }
 
 fn sanitize_metric_breakdowns(

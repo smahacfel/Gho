@@ -37,6 +37,7 @@
 //! ```
 
 use anyhow::{Context, Result};
+use ghost_core::features::coordination::CoordinationRiskEvidenceUnit;
 use ghost_core::health::RuntimeHealth;
 use ghost_core::tx_intelligence::types::{FscV2Evidence, FundingSourceDiagnostics};
 use serde::{Deserialize, Serialize};
@@ -92,6 +93,7 @@ pub const GATEKEEPER_BUY_LOG_SCHEMA_VERSION: u32 = 25;
 pub const GATEKEEPER_VERSION: &str = "v2.5";
 /// Legacy Gatekeeper version string for pre-V2.5 live-plane semantics.
 pub const LEGACY_GATEKEEPER_VERSION: &str = "v2.2";
+const COORDINATION_RISK_EVIDENCE_JSONL: &str = "coordination_risk_evidence.jsonl";
 const DECISION_PLANE_LEGACY_LIVE: &str = "legacy_live";
 const DECISION_PLANE_V25_SHADOW: &str = "v25_shadow";
 
@@ -1895,6 +1897,7 @@ enum LogCommand {
     Write(OracleDecisionLog),
     WriteCyclic(CyclicEngineLog),
     WriteGatekeeperBuy(GatekeeperBuyLog),
+    WriteCoordinationRiskEvidence(CoordinationRiskEvidenceUnit),
     Shutdown,
 }
 
@@ -2082,6 +2085,29 @@ impl DecisionLogger {
                             }
                         }
                     }
+                    LogCommand::WriteCoordinationRiskEvidence(mut unit) => {
+                        if logging_disabled_due_to_enospc {
+                            continue;
+                        }
+                        hydrate_coordination_risk_routing_fields(&mut unit, &config);
+                        if let Err(e) =
+                            write_coordination_risk_evidence_unit(&config.gatekeeper_log_dir, &unit)
+                                .await
+                        {
+                            if is_no_space_error(e.chain()) {
+                                logging_disabled_due_to_enospc = true;
+                                error!(
+                                    "DecisionLogger: disabling file writes after ENOSPC on coordination-risk sidecar for {}",
+                                    unit.pool_id
+                                );
+                                continue;
+                            }
+                            error!(
+                                "Failed to write coordination-risk evidence sidecar for {}: {}",
+                                unit.pool_id, e
+                            );
+                        }
+                    }
                     LogCommand::Shutdown => {
                         info!("DecisionLogger: shutting down");
                         break;
@@ -2154,6 +2180,23 @@ impl DecisionLogger {
         }
     }
 
+    /// Log additive Phase 0.6 coordination-risk evidence.
+    ///
+    /// This sidecar is export-only. It is routed independently from the
+    /// decision JSONL and must not mutate Gatekeeper verdict payloads.
+    pub async fn log_coordination_risk_evidence(&self, unit: CoordinationRiskEvidenceUnit) {
+        if let Err(e) = self
+            .tx
+            .send(LogCommand::WriteCoordinationRiskEvidence(unit))
+            .await
+        {
+            warn!(
+                "Failed to send coordination-risk evidence log command: {}",
+                e
+            );
+        }
+    }
+
     /// Shutdown the logger gracefully
     pub async fn shutdown(&self) {
         let _ = self.tx.send(LogCommand::Shutdown).await;
@@ -2178,6 +2221,21 @@ fn hydrate_gatekeeper_routing_fields(log: &mut GatekeeperBuyLog, config: &Decisi
     }
     if log.brain_config_hash.is_none() {
         log.brain_config_hash = config.brain_config_hash.clone();
+    }
+}
+
+fn hydrate_coordination_risk_routing_fields(
+    unit: &mut CoordinationRiskEvidenceUnit,
+    config: &DecisionLoggerConfig,
+) {
+    if unit.scope_id.trim().is_empty() {
+        unit.scope_id = config.gatekeeper_rollout_profile.clone();
+    }
+    if unit.run_id.is_none() {
+        unit.run_id = config.gatekeeper_run_id.clone();
+    }
+    if unit.gatekeeper_version.is_none() {
+        unit.gatekeeper_version = Some(GATEKEEPER_VERSION.to_string());
     }
 }
 
@@ -2276,6 +2334,40 @@ fn gatekeeper_route_dir(base_dir: &Path, log: &GatekeeperBuyLog) -> PathBuf {
         .join(gatekeeper_version)
         .join(decision_plane)
         .join(config_hash)
+}
+
+fn coordination_risk_route_dir(base_dir: &Path, unit: &CoordinationRiskEvidenceUnit) -> PathBuf {
+    let scope_id = safe_log_path_component(unit.scope_id.as_str(), "unknown_scope");
+    let gatekeeper_version = safe_log_path_component(
+        unit.gatekeeper_version
+            .as_deref()
+            .unwrap_or("unknown_gatekeeper_version"),
+        "unknown_gatekeeper_version",
+    );
+
+    base_dir
+        .join(scope_id)
+        .join(gatekeeper_version)
+        .join("coordination_risk")
+}
+
+fn safe_log_path_component(value: &str, fallback: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let sanitized = sanitized.trim_matches('_');
+    if sanitized.is_empty() {
+        fallback.to_string()
+    } else {
+        sanitized.to_string()
+    }
 }
 
 fn v3_serialized_replay_payload_hash(
@@ -2440,6 +2532,43 @@ async fn write_cyclic_log(base_dir: &Path, log: &CyclicEngineLog) -> Result<()> 
     Ok(())
 }
 
+/// Write an additive coordination-risk evidence sidecar.
+///
+/// The sidecar is intentionally separate from Gatekeeper decision rows so Phase
+/// 0.6 cannot change `GatekeeperBuyLog`, `MaterializedFeatureSet`, verdicts, or
+/// replay payload hashes. Routing mirrors the rollout/gatekeeper-version prefix
+/// and then writes a dedicated coordination-risk JSONL file.
+async fn write_coordination_risk_evidence_unit(
+    base_dir: &Path,
+    unit: &CoordinationRiskEvidenceUnit,
+) -> Result<()> {
+    let routed_dir = coordination_risk_route_dir(base_dir, unit);
+    create_dir_all(&routed_dir)
+        .await
+        .context("Failed to create coordination-risk evidence log directory")?;
+
+    let path = routed_dir.join(COORDINATION_RISK_EVIDENCE_JSONL);
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .await
+        .context("Failed to open coordination-risk evidence log file")?;
+
+    let json =
+        serde_json::to_string(unit).context("Failed to serialize coordination-risk evidence")?;
+    file.write_all(json.as_bytes()).await?;
+    file.write_all(b"\n").await?;
+    file.flush().await?;
+
+    debug!(
+        "Coordination-risk evidence sidecar written for {} to {:?}",
+        unit.pool_id, path
+    );
+
+    Ok(())
+}
+
 /// Write a gatekeeper V2 decision log with routing.
 ///
 /// Every plane-specific decision is appended to:
@@ -2544,6 +2673,11 @@ async fn write_gatekeeper_buy_log(base_dir: &Path, log: &GatekeeperBuyLog) -> Re
 mod tests {
     use super::*;
     use crate::oracle::reason_code::GatekeeperReasonCode;
+    use ghost_core::features::coordination::{
+        CoordinationMetricBreakdowns, CoordinationRiskFeatures, CoordinationSnapshotMode,
+        FundingVisibility,
+    };
+    use solana_sdk::pubkey::Pubkey;
     use std::collections::HashMap;
     use tempfile::TempDir;
     use tokio::fs;
@@ -4656,6 +4790,78 @@ mod tests {
                 _ => panic!("Unexpected pool_id: {}", pool_id),
             }
         }
+
+        logger.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_coordination_risk_evidence_sidecar_logging() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().to_path_buf();
+        let config = DecisionLoggerConfig {
+            log_dir: log_dir.clone(),
+            gatekeeper_log_dir: log_dir.clone(),
+            gatekeeper_rollout_profile: "test-rollout".to_string(),
+            gatekeeper_config_hash: "test-config-hash".to_string(),
+            gatekeeper_run_id: Some("run-42".to_string()),
+            gatekeeper_session_id: None,
+            brain_config_path: None,
+            brain_config_hash: None,
+            channel_buffer_size: 10,
+            enabled: true,
+        };
+        let logger = DecisionLogger::new(config);
+        let pool_id = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let unit = CoordinationRiskEvidenceUnit {
+            schema_version: 1,
+            scope_id: String::new(),
+            run_id: None,
+            candidate_id: Some("candidate-42".to_string()),
+            pool_id,
+            mint,
+            decision_id: Some("decision-42".to_string()),
+            decision_ts_ms: 1_000,
+            decision_slot: Some(10),
+            snapshot_mode: CoordinationSnapshotMode::DecisionTime,
+            feature_cutoff_ts_ms: 999,
+            feature_cutoff_slot: Some(10),
+            source_buffer_watermark_slot: Some(10),
+            computed_at_recv_ts_ns: 1_000_000,
+            gatekeeper_version: None,
+            source_snapshot_hash: Some("snapshot-hash".to_string()),
+            sample_summary: Default::default(),
+            funding_visibility: FundingVisibility::Unavailable,
+            features: CoordinationRiskFeatures::default(),
+            metric_breakdowns: CoordinationMetricBreakdowns::default(),
+            skipped_metrics: Default::default(),
+            degraded_reasons: Default::default(),
+        };
+
+        logger.log_coordination_risk_evidence(unit).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let sidecar_path = log_dir
+            .join("test-rollout")
+            .join(GATEKEEPER_VERSION)
+            .join("coordination_risk")
+            .join(COORDINATION_RISK_EVIDENCE_JSONL);
+        assert!(sidecar_path.exists(), "sidecar file should be created");
+        let content = fs::read_to_string(&sidecar_path).await.unwrap();
+        let lines: Vec<&str> = content.trim().lines().collect();
+        assert_eq!(lines.len(), 1);
+
+        let parsed: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(parsed["schema_version"], 1);
+        assert_eq!(parsed["scope_id"], "test-rollout");
+        assert_eq!(parsed["run_id"], "run-42");
+        assert_eq!(parsed["gatekeeper_version"], GATEKEEPER_VERSION);
+        assert_eq!(parsed["pool_id"], serde_json::to_value(pool_id).unwrap());
+        assert_eq!(parsed["mint"], serde_json::to_value(mint).unwrap());
+        assert!(parsed["features"]
+            .get("total_coordination_penalty")
+            .is_none());
+        assert!(parsed["features"].get("interaction_penalty").is_none());
 
         logger.shutdown().await;
     }

@@ -92,6 +92,12 @@ use ghost_core::account_state_core::types::{
     AccountStateUpdate, BootstrapHints, CanonicalPoolState, UpdateSource,
 };
 use ghost_core::checkpoint::MaterializedFeatureSet;
+use ghost_core::features::coordination::{
+    build_coordination_risk_evidence_unit_from_snapshot, CoordinationRiskConfig,
+    CoordinationRiskEvidenceUnit, CoordinationSnapshotMode, EconomicSpend, EconomicSpendSource,
+    ExecutionTemplateFingerprint, FeeTopologyFingerprint, FrozenCoordinationDecisionSnapshot,
+    ObservedBuyTx, T0Source, TxTimeSource,
+};
 use metrics::increment_counter;
 use parking_lot::{Mutex, RwLock};
 use seer::binary_parser::BinaryParser;
@@ -1160,6 +1166,443 @@ fn tx_signature(signature: &str) -> Option<Signature> {
     } else {
         Signature::from_str(signature).ok()
     }
+}
+
+fn current_time_ns() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+}
+
+fn spawn_gatekeeper_decision_logs(
+    ctx: &Arc<PoolObservationContext>,
+    session: &SharedSession,
+    buy_log: ghost_brain::oracle::GatekeeperBuyLog,
+) {
+    let coordination_evidence = {
+        let session = session.read();
+        build_coordination_risk_evidence_unit_for_runtime(ctx.as_ref(), &session, &buy_log)
+    };
+    let dl = ctx.decision_logger.clone();
+    tokio::spawn(async move {
+        dl.log_gatekeeper_buy_decision(buy_log).await;
+        dl.log_coordination_risk_evidence(coordination_evidence)
+            .await;
+    });
+}
+
+fn build_coordination_risk_evidence_unit_for_runtime(
+    ctx: &PoolObservationContext,
+    session: &PoolObservationSession,
+    buy_log: &ghost_brain::oracle::GatekeeperBuyLog,
+) -> CoordinationRiskEvidenceUnit {
+    build_coordination_risk_evidence_unit_from_session(
+        session,
+        buy_log,
+        ctx.gatekeeper_rollout_profile.as_str(),
+    )
+}
+
+fn build_coordination_risk_evidence_unit_from_session(
+    session: &PoolObservationSession,
+    buy_log: &ghost_brain::oracle::GatekeeperBuyLog,
+    default_scope_id: &str,
+) -> CoordinationRiskEvidenceUnit {
+    let decision_ts_ms = current_time_ms();
+    let txs: Vec<ObservedBuyTx> = session
+        .tx_buffer
+        .iter()
+        .filter_map(|tx| coordination_observed_buy_tx_from_pool_tx(session, tx.as_ref()))
+        .collect();
+    let feature_cutoff_ts_ms = coordination_feature_cutoff_ts_ms(session);
+    let watermark_slot = session.tx_buffer.iter().filter_map(|tx| tx.slot).max();
+    let source_snapshot_hash = coordination_source_snapshot_hash(
+        session,
+        &txs,
+        buy_log.funding_source_v2.as_ref(),
+        decision_ts_ms,
+        feature_cutoff_ts_ms,
+        watermark_slot,
+    );
+    let mint = buy_log
+        .base_mint
+        .as_deref()
+        .and_then(|mint| Pubkey::try_from(mint).ok())
+        .unwrap_or(session.base_mint);
+
+    let snapshot = FrozenCoordinationDecisionSnapshot {
+        schema_version: 1,
+        scope_id: buy_log
+            .rollout_profile
+            .clone()
+            .unwrap_or_else(|| default_scope_id.to_string()),
+        run_id: buy_log.run_id.clone(),
+        candidate_id: buy_log
+            .execution_candidate_id
+            .clone()
+            .or_else(|| buy_log.join_key.clone())
+            .or_else(|| Some(buy_log.pool_id.clone())),
+        pool_id: session.pool_amm_id,
+        mint,
+        decision_id: buy_log
+            .ab_record_id
+            .clone()
+            .or_else(|| buy_log.execution_candidate_id.clone()),
+        decision_ts_ms,
+        decision_slot: watermark_slot,
+        snapshot_mode: CoordinationSnapshotMode::DecisionTime,
+        feature_cutoff_ts_ms,
+        feature_cutoff_slot: watermark_slot,
+        source_buffer_watermark_slot: watermark_slot,
+        computed_at_recv_ts_ns: current_time_ns(),
+        gatekeeper_version: buy_log
+            .gatekeeper_version
+            .clone()
+            .or_else(|| Some(ghost_brain::oracle::GATEKEEPER_VERSION.to_string())),
+        source_snapshot_hash,
+        txs: txs.into_iter().collect(),
+        dev_reference: None,
+        signer_activity: Default::default(),
+        rolling_state_ready: false,
+        fsc_v2: buy_log.funding_source_v2.clone(),
+    };
+
+    build_coordination_risk_evidence_unit_from_snapshot(
+        snapshot,
+        &CoordinationRiskConfig::default(),
+    )
+}
+
+fn coordination_observed_buy_tx_from_pool_tx(
+    session: &PoolObservationSession,
+    tx: &PoolTransaction,
+) -> Option<ObservedBuyTx> {
+    let signature = tx_signature(&tx.signature)?;
+    let signer = Pubkey::try_from(tx.signer.as_str()).ok()?;
+    let pool_id = Pubkey::try_from(tx.pool_amm_id.as_str()).unwrap_or(session.pool_amm_id);
+    let mint = tx
+        .token_mint
+        .as_deref()
+        .and_then(|mint| Pubkey::try_from(mint).ok())
+        .unwrap_or(session.base_mint);
+    let slot_index = coordination_slot_index(tx);
+    let tx_event_ts_ms = coordination_tx_event_ts_ms(tx);
+    let fee_topology_fp = coordination_fee_topology_fingerprint(tx);
+
+    Some(ObservedBuyTx {
+        signature,
+        pool_id,
+        mint,
+        signer,
+        slot: tx.slot.unwrap_or_default(),
+        slot_index,
+        tx_elapsed_ms_from_pool_create: tx_event_ts_ms
+            .and_then(|ts| ts.checked_sub(session.created_at_wall_ms)),
+        t0_source: Some(T0Source::Unknown),
+        tx_time_source: Some(coordination_tx_time_source(tx, slot_index)),
+        is_success: tx.success,
+        is_buy: tx.is_buy,
+        is_sell: !tx.is_buy,
+        is_dev: tx.is_dev_buy,
+        is_create_or_init_tx: false,
+        is_unknown_direction: false,
+        account_keys_resolved: coordination_account_keys(tx, pool_id, mint, signer)
+            .into_iter()
+            .collect(),
+        outer_ix_count: coordination_outer_ix_count(tx),
+        inner_ix_group_count: coordination_inner_ix_group_count(tx),
+        fee_lamports: None,
+        pre_balance_signer: tx.signer_pre_balance_lamports,
+        post_balance_signer: tx.signer_post_balance_lamports,
+        decoded_buy_sol_lamports: tx.is_buy.then_some(tx.sol_amount_lamports).flatten(),
+        curve_sol_delta_lamports: (tx.is_buy && tx.curve_data_known)
+            .then_some(tx.sol_amount_lamports)
+            .flatten(),
+        economic_spent_lamports: tx.is_buy.then_some(tx.sol_amount_lamports).flatten().map(
+            |lamports| EconomicSpend {
+                lamports,
+                source: EconomicSpendSource::DecodedPumpInstruction,
+                confidence: 1.0,
+            },
+        ),
+        tokens_received: tx.is_buy.then_some(tx.token_amount_units).flatten(),
+        price_before: None,
+        price_after: tx
+            .price_quote
+            .filter(|price| price.is_finite() && *price > 0.0),
+        compute_units_consumed: tx.compute_units_consumed,
+        cost_units: tx.compute_unit_limit.map(u64::from),
+        fee_topology_fp,
+        execution_template_fp: coordination_execution_template_fingerprint(tx, fee_topology_fp),
+        capital_template_fp: None,
+    })
+}
+
+fn coordination_feature_cutoff_ts_ms(session: &PoolObservationSession) -> u64 {
+    session.highest_seen_ts_ms.max(
+        session
+            .tx_buffer
+            .iter()
+            .filter_map(|tx| coordination_tx_event_ts_ms(tx.as_ref()))
+            .max()
+            .unwrap_or_default(),
+    )
+}
+
+fn coordination_tx_event_ts_ms(tx: &PoolTransaction) -> Option<u64> {
+    tx.compat_event_ts_ms()
+        .or_else(|| (tx.timestamp_ms > 0).then_some(tx.timestamp_ms))
+        .or_else(|| (tx.arrival_ts_ms > 0).then_some(tx.arrival_ts_ms))
+}
+
+fn coordination_slot_index(tx: &PoolTransaction) -> Option<u64> {
+    match (tx.tx_index, tx.event_ordinal) {
+        (Some(tx_index), Some(event_ordinal)) => Some(
+            u64::from(tx_index)
+                .saturating_mul(1_000_000)
+                .saturating_add(u64::from(event_ordinal)),
+        ),
+        (Some(tx_index), None) => Some(u64::from(tx_index)),
+        (None, Some(event_ordinal)) => Some(u64::from(event_ordinal)),
+        (None, None) => None,
+    }
+}
+
+fn coordination_tx_time_source(tx: &PoolTransaction, slot_index: Option<u64>) -> TxTimeSource {
+    if slot_index.is_some() {
+        TxTimeSource::SlotIndex
+    } else if tx.event_time.has_chain_time() {
+        TxTimeSource::BlockTime
+    } else if tx.compat_event_ts_ms().is_some() || tx.arrival_ts_ms > 0 {
+        TxTimeSource::LocalReceiverTimeDiagnosticOnly
+    } else {
+        TxTimeSource::Unknown
+    }
+}
+
+fn coordination_account_keys(
+    tx: &PoolTransaction,
+    pool_id: Pubkey,
+    mint: Pubkey,
+    signer: Pubkey,
+) -> Vec<Pubkey> {
+    let mut keys = Vec::with_capacity(8);
+    for key in [
+        Some(pool_id),
+        Some(mint),
+        Some(signer),
+        tx.global_config
+            .as_deref()
+            .and_then(|value| Pubkey::try_from(value).ok()),
+        tx.fee_recipient
+            .as_deref()
+            .and_then(|value| Pubkey::try_from(value).ok()),
+        tx.token_program
+            .as_deref()
+            .and_then(|value| Pubkey::try_from(value).ok()),
+        tx.associated_bonding_curve
+            .as_deref()
+            .and_then(|value| Pubkey::try_from(value).ok()),
+        tx.bonding_curve_v2
+            .as_deref()
+            .and_then(|value| Pubkey::try_from(value).ok()),
+    ] {
+        if let Some(key) = key {
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+    }
+    keys
+}
+
+fn coordination_outer_ix_count(tx: &PoolTransaction) -> Option<u8> {
+    tx.toolchain_fingerprint
+        .outer_instruction_count
+        .or_else(|| {
+            tx.outer_instruction_index
+                .map(|index| index.saturating_add(1))
+        })
+        .and_then(coordination_u32_to_u8)
+}
+
+fn coordination_inner_ix_group_count(tx: &PoolTransaction) -> Option<u8> {
+    tx.toolchain_fingerprint
+        .inner_instruction_group_count
+        .or(tx.inner_ix_count)
+        .or_else(|| tx.inner_group_index.map(|index| index.saturating_add(1)))
+        .and_then(coordination_u32_to_u8)
+}
+
+fn coordination_u32_to_u8(value: u32) -> Option<u8> {
+    Some(value.min(u32::from(u8::MAX)) as u8)
+}
+
+fn coordination_fee_topology_fingerprint(tx: &PoolTransaction) -> Option<FeeTopologyFingerprint> {
+    let (external_fee_count, internal_fee_count) = tx.toolchain_fingerprint.fee_topology()?;
+    Some(FeeTopologyFingerprint {
+        external_fee_count: external_fee_count.min(u32::from(u8::MAX)) as u8,
+        internal_fee_count: internal_fee_count.min(u32::from(u8::MAX)) as u8,
+        external_amount_pattern_hash: coordination_hash_u16(&[
+            tx.fee_recipient.as_deref().unwrap_or(""),
+            tx.global_config.as_deref().unwrap_or(""),
+            if tx.jito_tip_detected.unwrap_or(false) {
+                "jito_tip"
+            } else {
+                "no_jito_tip"
+            },
+        ]),
+        has_wsol_self_flow: tx
+            .toolchain_fingerprint
+            .filtered_wsol_self_transfer_count
+            .is_some_and(|count| count > 0),
+        has_create_ata_flow: tx.ata_create_count.is_some_and(|count| count > 0),
+    })
+}
+
+fn coordination_execution_template_fingerprint(
+    tx: &PoolTransaction,
+    fee_topology_fp: Option<FeeTopologyFingerprint>,
+) -> Option<ExecutionTemplateFingerprint> {
+    if tx.toolchain_fingerprint.is_empty()
+        && tx.compute_unit_limit.is_none()
+        && tx.cu_price_micro_lamports.is_none()
+        && tx.inner_ix_count.is_none()
+        && tx.cpi_depth.is_none()
+    {
+        return None;
+    }
+
+    let compute_budget_shape = u8::from(
+        tx.compute_unit_limit.is_some()
+            || tx
+                .toolchain_fingerprint
+                .has_set_compute_unit_limit
+                .unwrap_or(false),
+    ) | (u8::from(
+        tx.cu_price_micro_lamports.is_some()
+            || tx
+                .toolchain_fingerprint
+                .has_set_compute_unit_price
+                .unwrap_or(false),
+    ) << 1);
+    let inner_instruction_count_bucket = tx
+        .inner_ix_count
+        .or(tx.toolchain_fingerprint.inner_instruction_group_count)
+        .map(|count| count.min(31) as u8)
+        .unwrap_or_default();
+    let ata_wsol_shape = u8::from(tx.ata_create_count.is_some_and(|count| count > 0))
+        | (u8::from(
+            tx.toolchain_fingerprint
+                .filtered_wsol_self_transfer_count
+                .is_some_and(|count| count > 0),
+        ) << 1);
+
+    Some(ExecutionTemplateFingerprint {
+        compute_budget_shape,
+        outer_program_sequence_hash: coordination_hash_u16(&[
+            tx.outer_program_id.as_deref().unwrap_or(""),
+            tx.buy_variant.as_deref().unwrap_or(""),
+            tx.token_program.as_deref().unwrap_or(""),
+        ]),
+        inner_program_sequence_hash: coordination_hash_u16(&[
+            tx.inner_ix_count
+                .map(|value| value.to_string())
+                .as_deref()
+                .unwrap_or(""),
+            tx.cpi_depth
+                .map(|value| value.to_string())
+                .as_deref()
+                .unwrap_or(""),
+        ]),
+        inner_instruction_count_bucket,
+        account_role_pattern_hash: coordination_hash_u16(&[
+            tx.global_config.as_deref().unwrap_or(""),
+            tx.fee_recipient.as_deref().unwrap_or(""),
+            tx.associated_bonding_curve.as_deref().unwrap_or(""),
+            tx.bonding_curve_v2.as_deref().unwrap_or(""),
+            tx.buy_remaining_accounts.len().to_string().as_str(),
+        ]),
+        fee_topology_hash: fee_topology_fp
+            .map(|fp| {
+                coordination_hash_u16(&[
+                    &fp.external_fee_count.to_string(),
+                    &fp.internal_fee_count.to_string(),
+                    &fp.external_amount_pattern_hash.to_string(),
+                    if fp.has_wsol_self_flow {
+                        "wsol"
+                    } else {
+                        "no_wsol"
+                    },
+                    if fp.has_create_ata_flow {
+                        "ata"
+                    } else {
+                        "no_ata"
+                    },
+                ])
+            })
+            .unwrap_or_default(),
+        ata_wsol_shape,
+    })
+}
+
+fn coordination_hash_u16(parts: &[&str]) -> u16 {
+    let mut hasher = blake3::Hasher::new();
+    for part in parts {
+        hasher.update(part.as_bytes());
+        hasher.update(&[0x1f]);
+    }
+    let digest = hasher.finalize();
+    let bytes = digest.as_bytes();
+    u16::from_le_bytes([bytes[0], bytes[1]])
+}
+
+fn coordination_source_snapshot_hash(
+    session: &PoolObservationSession,
+    txs: &[ObservedBuyTx],
+    fsc_v2: Option<&ghost_core::tx_intelligence::types::FscV2Evidence>,
+    decision_ts_ms: u64,
+    feature_cutoff_ts_ms: u64,
+    watermark_slot: Option<u64>,
+) -> Option<String> {
+    let txs: Vec<_> = txs
+        .iter()
+        .map(|tx| {
+            serde_json::json!({
+                "signature": tx.signature.to_string(),
+                "pool_id": tx.pool_id.to_string(),
+                "mint": tx.mint.to_string(),
+                "signer": tx.signer.to_string(),
+                "slot": tx.slot,
+                "slot_index": tx.slot_index,
+                "is_success": tx.is_success,
+                "is_buy": tx.is_buy,
+                "is_sell": tx.is_sell,
+                "is_dev": tx.is_dev,
+                "economic_spent_lamports": tx.economic_spent_lamports.as_ref().map(|spend| spend.lamports),
+                "decoded_buy_sol_lamports": tx.decoded_buy_sol_lamports,
+                "price_after": tx.price_after,
+                "compute_units_consumed": tx.compute_units_consumed,
+                "cost_units": tx.cost_units,
+                "fee_topology_fp": tx.fee_topology_fp,
+                "execution_template_fp": tx.execution_template_fp,
+            })
+        })
+        .collect();
+    let payload = serde_json::json!({
+        "schema_version": 1,
+        "snapshot_mode": "decision_time",
+        "pool_id": session.pool_amm_id.to_string(),
+        "mint": session.base_mint.to_string(),
+        "decision_ts_ms": decision_ts_ms,
+        "feature_cutoff_ts_ms": feature_cutoff_ts_ms,
+        "source_buffer_watermark_slot": watermark_slot,
+        "txs": txs,
+        "fsc_v2": fsc_v2,
+    });
+    let bytes = serde_json::to_vec(&payload).ok()?;
+    Some(blake3::hash(&bytes).to_hex().to_string())
 }
 
 fn fallback_counter_for_pool_tx(tx: &PoolTransaction, event_ts_ms: u64) -> u64 {
@@ -20857,10 +21300,7 @@ async fn pool_observation_task(
                         base_mint_pubkey,
                     )
                     .await;
-                let dl = ctx.decision_logger.clone();
-                tokio::spawn(async move {
-                    dl.log_gatekeeper_buy_decision(buy_log).await;
-                });
+                spawn_gatekeeper_decision_logs(&ctx, &session, buy_log);
                 if let Some(ref emitter) = ctx.event_emitter {
                     emit_gatekeeper_decision_event(emitter, &pool_id, "REJECT", &assessment);
                     if let Some(ref h) = ctx.health {
@@ -20973,10 +21413,7 @@ async fn pool_observation_task(
                         base_mint_pubkey,
                     )
                     .await;
-                let dl = ctx.decision_logger.clone();
-                tokio::spawn(async move {
-                    dl.log_gatekeeper_buy_decision(buy_log).await;
-                });
+                spawn_gatekeeper_decision_logs(&ctx, &session, buy_log);
                 if let Some(ref emitter) = ctx.event_emitter {
                     emit_gatekeeper_decision_event(emitter, &pool_id, "TIMEOUT", &assessment);
                     if let Some(ref h) = ctx.health {
@@ -21166,10 +21603,7 @@ async fn pool_observation_task(
                                 base_mint_pubkey,
                             )
                             .await;
-                        let dl = ctx.decision_logger.clone();
-                        tokio::spawn(async move {
-                            dl.log_gatekeeper_buy_decision(buy_log).await;
-                        });
+                        spawn_gatekeeper_decision_logs(&ctx, &session, buy_log);
                         if let Some(ref emitter) = ctx.event_emitter {
                             emit_gatekeeper_decision_event(
                                 emitter,
@@ -21381,10 +21815,7 @@ async fn pool_observation_task(
                         base_mint_pubkey,
                     )
                     .await;
-                let dl = ctx.decision_logger.clone();
-                tokio::spawn(async move {
-                    dl.log_gatekeeper_buy_decision(buy_log).await;
-                });
+                spawn_gatekeeper_decision_logs(&ctx, &session, buy_log);
                 spawn_coverage_audit_for_closed_window(
                     ctx.clone(),
                     pool_id,
@@ -28987,6 +29418,141 @@ mod tests {
             }
             _ => panic!("expected timeout from pure deadline trigger"),
         }
+    }
+
+    #[test]
+    fn phase06_runtime_sidecar_build_is_behavioral_no_drift_for_terminal_timeout() {
+        fn make_timeout_session(
+            pool_id: Pubkey,
+            detected_pool: &DetectedPool,
+            gatekeeper_config: &GatekeeperV2Config,
+        ) -> PoolObservationSession {
+            let base_mint = Pubkey::from_str(&detected_pool.base_mint).expect("base mint");
+            let quote_mint = Pubkey::from_str(&detected_pool.quote_mint).expect("quote mint");
+            let bonding_curve =
+                Pubkey::from_str(&detected_pool.bonding_curve).expect("bonding curve");
+            let dev_wallet = Pubkey::from_str(&detected_pool.creator).ok();
+            let candidate_snapshot = EnhancedCandidate {
+                pool_amm_id: pool_id,
+                base_mint,
+                quote_mint,
+                bonding_curve,
+                slot: detected_pool.slot,
+                timestamp: detected_pool
+                    .detected_wall_ts_ms
+                    .unwrap_or(detected_pool.timestamp_ms),
+                initial_liquidity_sol: detected_pool.initial_liquidity_sol.unwrap_or_default(),
+                signature: detected_pool.signature.clone(),
+                ..Default::default()
+            };
+            let mut session = PoolObservationSession::new(
+                ghost_core::session::types::SessionId(70),
+                pool_id,
+                base_mint,
+                bonding_curve,
+                dev_wallet,
+                candidate_snapshot,
+                1_000,
+                1_050,
+                gatekeeper_config,
+                crate::tx_intelligence::TxIntelligenceConfig::from_gatekeeper_config(
+                    gatekeeper_config,
+                    EarlyFingerprintConfig::default(),
+                ),
+            );
+
+            let mut observed_tx =
+                (*test_pool_observation_tx(&Signature::new_unique().to_string())).clone();
+            observed_tx.pool_amm_id = pool_id.to_string();
+            observed_tx.token_mint = Some(base_mint.to_string());
+            observed_tx.signer = Pubkey::new_unique().to_string();
+            observed_tx.timestamp_ms = 1_010;
+            observed_tx.event_time.ingress_wall_ts_ms = Some(1_010);
+            observed_tx.arrival_ts_ms = 1_010;
+            observed_tx.slot = Some(101);
+            observed_tx.tx_index = Some(0);
+            observed_tx.event_ordinal = Some(0);
+            observed_tx.compute_units_consumed = Some(80_000);
+            observed_tx.compute_unit_limit = Some(120_000);
+            observed_tx.signer_pre_balance_lamports = Some(1_000_000_000);
+            observed_tx.signer_post_balance_lamports = Some(900_000_000);
+            let ingress = session.ingest_transaction(Arc::new(observed_tx));
+            assert!(matches!(ingress, GatekeeperIngressOutcome::Wait));
+
+            session.try_checkpoint(1_010);
+            session.gatekeeper_buffer_mut().advance_event_clock(1_100);
+            session
+        }
+
+        fn timeout_signature(
+            verdict: &GatekeeperVerdict,
+        ) -> (bool, String, String, u8, usize, u64) {
+            match verdict {
+                GatekeeperVerdict::Timeout { assessment } => {
+                    let decision = assessment.decision.as_ref().expect("timeout decision");
+                    (
+                        decision.verdict_buy,
+                        decision.verdict_type.tag().to_string(),
+                        decision.reason_chain.clone(),
+                        assessment.phases_passed,
+                        assessment.total_tx_evaluated,
+                        assessment.dust_filtered_count,
+                    )
+                }
+                _ => panic!("expected timeout verdict"),
+            }
+        }
+
+        let pool_id = Pubkey::new_unique();
+        let detected_pool = test_detected_pool(pool_id);
+        let mut gatekeeper_config = review_test_gatekeeper_config();
+        gatekeeper_config.min_tx_count = 3;
+        gatekeeper_config.min_unique_signers = 3;
+        gatekeeper_config.min_buy_count = 3;
+        gatekeeper_config.max_wait_time_ms = 50;
+
+        let mut baseline_session =
+            make_timeout_session(pool_id, detected_pool.as_ref(), &gatekeeper_config);
+        let baseline_verdict = evaluate_feature_driven_terminal_verdict(
+            &mut baseline_session,
+            &gatekeeper_config,
+            true,
+        );
+        let baseline_signature = timeout_signature(&baseline_verdict);
+
+        let mut sidecar_session =
+            make_timeout_session(pool_id, detected_pool.as_ref(), &gatekeeper_config);
+        let sidecar_verdict = evaluate_feature_driven_terminal_verdict(
+            &mut sidecar_session,
+            &gatekeeper_config,
+            true,
+        );
+        let sidecar_signature = timeout_signature(&sidecar_verdict);
+        let sidecar_unit = match &sidecar_verdict {
+            GatekeeperVerdict::Timeout { assessment } => {
+                let mut buy_log = assessment.to_buy_log(&pool_id, &gatekeeper_config);
+                buy_log.rollout_profile = Some("phase06-test".to_string());
+                buy_log.base_mint = Some(sidecar_session.base_mint.to_string());
+                build_coordination_risk_evidence_unit_from_session(
+                    &sidecar_session,
+                    &buy_log,
+                    "phase06-test",
+                )
+            }
+            _ => panic!("expected timeout verdict"),
+        };
+
+        assert_eq!(baseline_signature, sidecar_signature);
+        assert_eq!(
+            sidecar_unit.snapshot_mode,
+            CoordinationSnapshotMode::DecisionTime
+        );
+        assert_eq!(sidecar_unit.features.total_coordination_penalty, None);
+        assert_eq!(sidecar_unit.features.interaction_penalty, None);
+        assert_eq!(sidecar_unit.skipped_metrics.len(), 3);
+        assert!(sidecar_unit.source_snapshot_hash.is_some());
+        assert_eq!(sidecar_unit.feature_cutoff_ts_ms, 1_010);
+        assert_eq!(sidecar_unit.source_buffer_watermark_slot, Some(101));
     }
 
     #[test]

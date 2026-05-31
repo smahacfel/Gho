@@ -744,6 +744,72 @@ fn evidence_unit_requires_source_snapshot_hash_for_frozen_snapshot_proof() {
 }
 
 #[test]
+fn evidence_unit_rejects_cutoff_or_watermark_after_decision() {
+    let base_input = CoordinationRiskEvidenceInput {
+        schema_version: 1,
+        scope_id: "phase06-time-bounds".to_string(),
+        run_id: None,
+        candidate_id: None,
+        pool_id: pk(1),
+        mint: pk(2),
+        decision_id: Some("decision-4".to_string()),
+        decision_ts_ms: 1_000,
+        decision_slot: Some(10),
+        snapshot_mode: CoordinationSnapshotMode::DecisionTime,
+        snapshot_available: true,
+        feature_cutoff_ts_ms: 1_001,
+        feature_cutoff_slot: Some(10),
+        source_buffer_watermark_slot: Some(10),
+        computed_at_recv_ts_ns: 1_000_000,
+        gatekeeper_version: Some("v2.5".to_string()),
+        source_snapshot_hash: Some("hash".to_string()),
+        sample_summary: Default::default(),
+        funding_visibility: FundingVisibility::Available,
+        features: CoordinationRiskFeatures {
+            funding_visibility: FundingVisibility::Available,
+            fee_topology_diversity_index: Some(
+                ghost_core::features::coordination::MetricValue::new(
+                    0.4,
+                    0.0,
+                    1.0,
+                    5,
+                    1.0,
+                    MetricEvidenceStatus::Clean,
+                ),
+            ),
+            ..CoordinationRiskFeatures::default()
+        },
+        metric_breakdowns: CoordinationMetricBreakdowns::default(),
+    };
+
+    let cutoff_after_decision = build_coordination_risk_evidence_unit(base_input.clone());
+    assert_eq!(
+        cutoff_after_decision.features.fee_topology_diversity_index,
+        None
+    );
+    assert!(cutoff_after_decision
+        .degraded_reasons
+        .contains(&DegradedReason::FeatureCutoffAfterDecision));
+
+    let watermark_after_decision =
+        build_coordination_risk_evidence_unit(CoordinationRiskEvidenceInput {
+            feature_cutoff_ts_ms: 999,
+            feature_cutoff_slot: Some(9),
+            source_buffer_watermark_slot: Some(11),
+            ..base_input
+        });
+    assert_eq!(
+        watermark_after_decision
+            .features
+            .fee_topology_diversity_index,
+        None
+    );
+    assert!(watermark_after_decision
+        .degraded_reasons
+        .contains(&DegradedReason::SourceWatermarkAfterDecision));
+}
+
+#[test]
 fn funding_visibility_maps_fsc_v2_lane_health_not_metric_quality() {
     let low_coverage_or_neutral_only = fsc_v2_evidence(
         Some(FscExcludedReason::InsufficientNonNeutralSupport),
@@ -860,6 +926,10 @@ fn evidence_unit_from_snapshot_computes_metrics_from_frozen_input() {
         .metric_breakdowns
         .fee_topology_diversity_index
         .is_some());
+    assert!(unit
+        .features
+        .degraded_reasons
+        .contains(&DegradedReason::FundingLaneUnavailable));
     assert_eq!(unit.skipped_metrics.len(), 3);
 }
 

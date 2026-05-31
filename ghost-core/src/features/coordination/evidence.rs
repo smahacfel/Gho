@@ -72,6 +72,8 @@ pub enum DegradedReason {
     LowCoverage,
     SameSlotDominated,
     SpendFractionOutOfRange,
+    FeatureCutoffAfterDecision,
+    SourceWatermarkAfterDecision,
     DuplicateSlotIndex,
 
     ZeroOrInvalidMean,
