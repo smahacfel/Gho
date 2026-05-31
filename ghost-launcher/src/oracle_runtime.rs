@@ -94,9 +94,9 @@ use ghost_core::account_state_core::types::{
 use ghost_core::checkpoint::MaterializedFeatureSet;
 use ghost_core::features::coordination::{
     build_coordination_risk_evidence_unit_from_snapshot, CoordinationRiskConfig,
-    CoordinationRiskEvidenceUnit, CoordinationSnapshotMode, EconomicSpend, EconomicSpendSource,
-    ExecutionTemplateFingerprint, FeeTopologyFingerprint, FrozenCoordinationDecisionSnapshot,
-    ObservedBuyTx, T0Source, TxTimeSource,
+    CoordinationSnapshotMode, EconomicSpend, EconomicSpendSource, ExecutionTemplateFingerprint,
+    FeeTopologyFingerprint, FrozenCoordinationDecisionSnapshot, ObservedBuyTx, T0Source,
+    TxTimeSource,
 };
 use metrics::increment_counter;
 use parking_lot::{Mutex, RwLock};
@@ -1177,13 +1177,13 @@ fn current_time_ns() -> u128 {
 
 fn spawn_gatekeeper_decision_logs(
     ctx: &Arc<PoolObservationContext>,
-    session: &SharedSession,
     buy_log: ghost_brain::oracle::GatekeeperBuyLog,
+    coordination_snapshot: FrozenCoordinationDecisionSnapshot,
 ) {
-    let coordination_evidence = {
-        let session = session.read();
-        build_coordination_risk_evidence_unit_for_runtime(ctx.as_ref(), &session, &buy_log)
-    };
+    let coordination_evidence = build_coordination_risk_evidence_unit_from_snapshot(
+        coordination_snapshot,
+        &CoordinationRiskConfig::default(),
+    );
     let dl = ctx.decision_logger.clone();
     tokio::spawn(async move {
         dl.log_gatekeeper_buy_decision(buy_log).await;
@@ -1192,24 +1192,28 @@ fn spawn_gatekeeper_decision_logs(
     });
 }
 
-fn build_coordination_risk_evidence_unit_for_runtime(
+fn freeze_coordination_decision_snapshot_for_runtime(
     ctx: &PoolObservationContext,
-    session: &PoolObservationSession,
+    session: &SharedSession,
     buy_log: &ghost_brain::oracle::GatekeeperBuyLog,
-) -> CoordinationRiskEvidenceUnit {
-    build_coordination_risk_evidence_unit_from_session(
-        session,
+) -> FrozenCoordinationDecisionSnapshot {
+    let session = session.read();
+    freeze_coordination_decision_snapshot_from_session(
+        &session,
         buy_log,
         ctx.gatekeeper_rollout_profile.as_str(),
+        current_time_ms(),
+        current_time_ns(),
     )
 }
 
-fn build_coordination_risk_evidence_unit_from_session(
+fn freeze_coordination_decision_snapshot_from_session(
     session: &PoolObservationSession,
     buy_log: &ghost_brain::oracle::GatekeeperBuyLog,
     default_scope_id: &str,
-) -> CoordinationRiskEvidenceUnit {
-    let decision_ts_ms = current_time_ms();
+    decision_ts_ms: u64,
+    computed_at_recv_ts_ns: u128,
+) -> FrozenCoordinationDecisionSnapshot {
     let txs: Vec<ObservedBuyTx> = session
         .tx_buffer
         .iter()
@@ -1231,7 +1235,7 @@ fn build_coordination_risk_evidence_unit_from_session(
         .and_then(|mint| Pubkey::try_from(mint).ok())
         .unwrap_or(session.base_mint);
 
-    let snapshot = FrozenCoordinationDecisionSnapshot {
+    FrozenCoordinationDecisionSnapshot {
         schema_version: 1,
         scope_id: buy_log
             .rollout_profile
@@ -1255,7 +1259,7 @@ fn build_coordination_risk_evidence_unit_from_session(
         feature_cutoff_ts_ms,
         feature_cutoff_slot: watermark_slot,
         source_buffer_watermark_slot: watermark_slot,
-        computed_at_recv_ts_ns: current_time_ns(),
+        computed_at_recv_ts_ns,
         gatekeeper_version: buy_log
             .gatekeeper_version
             .clone()
@@ -1266,12 +1270,7 @@ fn build_coordination_risk_evidence_unit_from_session(
         signer_activity: Default::default(),
         rolling_state_ready: false,
         fsc_v2: buy_log.funding_source_v2.clone(),
-    };
-
-    build_coordination_risk_evidence_unit_from_snapshot(
-        snapshot,
-        &CoordinationRiskConfig::default(),
-    )
+    }
 }
 
 fn coordination_observed_buy_tx_from_pool_tx(
@@ -21287,6 +21286,11 @@ async fn pool_observation_task(
                     );
                 }
                 enrich_buy_log_with_runtime_identity(&mut buy_log, ctx.as_ref());
+                let coordination_snapshot = freeze_coordination_decision_snapshot_for_runtime(
+                    ctx.as_ref(),
+                    &session,
+                    &buy_log,
+                );
                 let probe_buffered_txs = {
                     let session = session.read();
                     session.gatekeeper_buffer().buffered_txs_slice().to_vec()
@@ -21300,7 +21304,7 @@ async fn pool_observation_task(
                         base_mint_pubkey,
                     )
                     .await;
-                spawn_gatekeeper_decision_logs(&ctx, &session, buy_log);
+                spawn_gatekeeper_decision_logs(&ctx, buy_log, coordination_snapshot);
                 if let Some(ref emitter) = ctx.event_emitter {
                     emit_gatekeeper_decision_event(emitter, &pool_id, "REJECT", &assessment);
                     if let Some(ref h) = ctx.health {
@@ -21400,6 +21404,11 @@ async fn pool_observation_task(
                     );
                 }
                 enrich_buy_log_with_runtime_identity(&mut buy_log, ctx.as_ref());
+                let coordination_snapshot = freeze_coordination_decision_snapshot_for_runtime(
+                    ctx.as_ref(),
+                    &session,
+                    &buy_log,
+                );
                 let probe_buffered_txs = {
                     let session = session.read();
                     session.gatekeeper_buffer().buffered_txs_slice().to_vec()
@@ -21413,7 +21422,7 @@ async fn pool_observation_task(
                         base_mint_pubkey,
                     )
                     .await;
-                spawn_gatekeeper_decision_logs(&ctx, &session, buy_log);
+                spawn_gatekeeper_decision_logs(&ctx, buy_log, coordination_snapshot);
                 if let Some(ref emitter) = ctx.event_emitter {
                     emit_gatekeeper_decision_event(emitter, &pool_id, "TIMEOUT", &assessment);
                     if let Some(ref h) = ctx.health {
@@ -21594,6 +21603,12 @@ async fn pool_observation_task(
                             );
                         }
                         enrich_buy_log_with_runtime_identity(&mut buy_log, ctx.as_ref());
+                        let coordination_snapshot =
+                            freeze_coordination_decision_snapshot_for_runtime(
+                                ctx.as_ref(),
+                                &session,
+                                &buy_log,
+                            );
                         let retain_runtime_pool_for_probe_lifecycle =
                             maybe_handle_p37_shadow_probe_decision(
                                 ctx.as_ref(),
@@ -21603,7 +21618,7 @@ async fn pool_observation_task(
                                 base_mint_pubkey,
                             )
                             .await;
-                        spawn_gatekeeper_decision_logs(&ctx, &session, buy_log);
+                        spawn_gatekeeper_decision_logs(&ctx, buy_log, coordination_snapshot);
                         if let Some(ref emitter) = ctx.event_emitter {
                             emit_gatekeeper_decision_event(
                                 emitter,
@@ -21806,6 +21821,11 @@ async fn pool_observation_task(
                     );
                 }
                 enrich_buy_log_with_runtime_identity(&mut buy_log, ctx.as_ref());
+                let coordination_snapshot = freeze_coordination_decision_snapshot_for_runtime(
+                    ctx.as_ref(),
+                    &session,
+                    &buy_log,
+                );
                 let retain_runtime_pool_for_probe_lifecycle =
                     maybe_handle_p37_shadow_probe_decision(
                         ctx.as_ref(),
@@ -21815,7 +21835,7 @@ async fn pool_observation_task(
                         base_mint_pubkey,
                     )
                     .await;
-                spawn_gatekeeper_decision_logs(&ctx, &session, buy_log);
+                spawn_gatekeeper_decision_logs(&ctx, buy_log, coordination_snapshot);
                 spawn_coverage_audit_for_closed_window(
                     ctx.clone(),
                     pool_id,
@@ -22834,6 +22854,7 @@ mod tests {
         ManipulationContradictionFeatures, MaterializedEvidenceStatus, MaterializedFeatureSet,
         OrganicBroadeningFeatures,
     };
+    use ghost_core::features::coordination::CoordinationRiskEvidenceUnit;
     use ghost_core::shadow_ledger::LivePipelineConfig;
     use ghost_core::{
         ExecutionAccountEvidenceSource, ExecutionAccountEvidenceStatus,
@@ -29421,11 +29442,13 @@ mod tests {
     }
 
     #[test]
-    fn phase06_runtime_sidecar_build_is_behavioral_no_drift_for_terminal_timeout() {
-        fn make_timeout_session(
+    fn phase06_runtime_sidecar_is_behavioral_no_drift_for_buy_reject_timeout() {
+        fn make_session(
             pool_id: Pubkey,
             detected_pool: &DetectedPool,
             gatekeeper_config: &GatekeeperV2Config,
+            session_id: u64,
+            deadline_wall_ms: u64,
         ) -> PoolObservationSession {
             let base_mint = Pubkey::from_str(&detected_pool.base_mint).expect("base mint");
             let quote_mint = Pubkey::from_str(&detected_pool.quote_mint).expect("quote mint");
@@ -29445,26 +29468,35 @@ mod tests {
                 signature: detected_pool.signature.clone(),
                 ..Default::default()
             };
-            let mut session = PoolObservationSession::new(
-                ghost_core::session::types::SessionId(70),
+            PoolObservationSession::new(
+                ghost_core::session::types::SessionId(session_id),
                 pool_id,
                 base_mint,
                 bonding_curve,
                 dev_wallet,
                 candidate_snapshot,
                 1_000,
-                1_050,
+                deadline_wall_ms,
                 gatekeeper_config,
                 crate::tx_intelligence::TxIntelligenceConfig::from_gatekeeper_config(
                     gatekeeper_config,
                     EarlyFingerprintConfig::default(),
                 ),
-            );
+            )
+        }
 
+        fn make_timeout_session(
+            pool_id: Pubkey,
+            detected_pool: &DetectedPool,
+            gatekeeper_config: &GatekeeperV2Config,
+            session_id: u64,
+        ) -> PoolObservationSession {
+            let mut session =
+                make_session(pool_id, detected_pool, gatekeeper_config, session_id, 1_050);
             let mut observed_tx =
-                (*test_pool_observation_tx(&Signature::new_unique().to_string())).clone();
+                (*test_pool_observation_tx(&format!("phase06-timeout-{session_id}"))).clone();
             observed_tx.pool_amm_id = pool_id.to_string();
-            observed_tx.token_mint = Some(base_mint.to_string());
+            observed_tx.token_mint = Some(session.base_mint.to_string());
             observed_tx.signer = Pubkey::new_unique().to_string();
             observed_tx.timestamp_ms = 1_010;
             observed_tx.event_time.ingress_wall_ts_ms = Some(1_010);
@@ -29484,75 +29516,312 @@ mod tests {
             session
         }
 
-        fn timeout_signature(
+        fn make_buy_session(
+            pool_id: Pubkey,
+            detected_pool: &DetectedPool,
+            gatekeeper_config: &GatekeeperV2Config,
+            session_id: u64,
+        ) -> PoolObservationSession {
+            let mut session =
+                make_session(pool_id, detected_pool, gatekeeper_config, session_id, 6_000);
+            review_seed_feature_buy_session(
+                &mut session,
+                pool_id,
+                &format!("phase06-buy-{session_id}"),
+            );
+            session
+        }
+
+        fn make_reject_session(
+            pool_id: Pubkey,
+            detected_pool: &DetectedPool,
+            gatekeeper_config: &GatekeeperV2Config,
+            session_id: u64,
+        ) -> PoolObservationSession {
+            let mut session =
+                make_buy_session(pool_id, detected_pool, gatekeeper_config, session_id);
+            session.tx_intel_features.dev_has_sold = true;
+            session
+        }
+
+        fn verdict_signature(
             verdict: &GatekeeperVerdict,
-        ) -> (bool, String, String, u8, usize, u64) {
+        ) -> (
+            String,
+            bool,
+            String,
+            Option<String>,
+            u8,
+            u8,
+            u16,
+            u8,
+            usize,
+            u64,
+        ) {
             match verdict {
-                GatekeeperVerdict::Timeout { assessment } => {
-                    let decision = assessment.decision.as_ref().expect("timeout decision");
+                GatekeeperVerdict::Buy { assessment, .. } => {
+                    let decision = assessment.decision.as_ref().expect("buy decision");
                     (
+                        "BUY".to_string(),
                         decision.verdict_buy,
                         decision.verdict_type.tag().to_string(),
-                        decision.reason_chain.clone(),
+                        decision.hard_fail_reason.clone(),
+                        decision.soft_points,
+                        decision.effective_max_soft_points,
+                        decision.total_soft_points,
                         assessment.phases_passed,
                         assessment.total_tx_evaluated,
                         assessment.dust_filtered_count,
                     )
                 }
-                _ => panic!("expected timeout verdict"),
+                GatekeeperVerdict::Reject { assessment, .. } => {
+                    let decision = assessment.decision.as_ref().expect("reject decision");
+                    (
+                        "REJECT".to_string(),
+                        decision.verdict_buy,
+                        decision.verdict_type.tag().to_string(),
+                        decision.hard_fail_reason.clone(),
+                        decision.soft_points,
+                        decision.effective_max_soft_points,
+                        decision.total_soft_points,
+                        assessment.phases_passed,
+                        assessment.total_tx_evaluated,
+                        assessment.dust_filtered_count,
+                    )
+                }
+                GatekeeperVerdict::Timeout { assessment } => {
+                    let decision = assessment.decision.as_ref().expect("timeout decision");
+                    (
+                        "TIMEOUT".to_string(),
+                        decision.verdict_buy,
+                        decision.verdict_type.tag().to_string(),
+                        decision.hard_fail_reason.clone(),
+                        decision.soft_points,
+                        decision.effective_max_soft_points,
+                        decision.total_soft_points,
+                        assessment.phases_passed,
+                        assessment.total_tx_evaluated,
+                        assessment.dust_filtered_count,
+                    )
+                }
+                _ => panic!("expected terminal verdict"),
             }
         }
 
+        fn evidence_from_verdict(
+            pool_id: Pubkey,
+            session: &PoolObservationSession,
+            verdict: &GatekeeperVerdict,
+            gatekeeper_config: &GatekeeperV2Config,
+            decision_ts_ms: u64,
+        ) -> CoordinationRiskEvidenceUnit {
+            let assessment = match verdict {
+                GatekeeperVerdict::Buy { assessment, .. }
+                | GatekeeperVerdict::Reject { assessment, .. }
+                | GatekeeperVerdict::Timeout { assessment } => assessment,
+                _ => panic!("expected terminal verdict"),
+            };
+            let mut buy_log = assessment.to_buy_log(&pool_id, gatekeeper_config);
+            buy_log.rollout_profile = Some("phase06-test".to_string());
+            buy_log.base_mint = Some(session.base_mint.to_string());
+            let snapshot = freeze_coordination_decision_snapshot_from_session(
+                session,
+                &buy_log,
+                "phase06-test",
+                decision_ts_ms,
+                u128::from(decision_ts_ms) * 1_000_000,
+            );
+            build_coordination_risk_evidence_unit_from_snapshot(
+                snapshot,
+                &CoordinationRiskConfig::default(),
+            )
+        }
+
+        fn assert_no_drift_for_case(
+            case_name: &str,
+            force_deadline: bool,
+            baseline_session: &mut PoolObservationSession,
+            sidecar_session: &mut PoolObservationSession,
+            gatekeeper_config: &GatekeeperV2Config,
+            pool_id: Pubkey,
+        ) -> CoordinationRiskEvidenceUnit {
+            let baseline_verdict = evaluate_feature_driven_terminal_verdict(
+                baseline_session,
+                gatekeeper_config,
+                force_deadline,
+            );
+            let sidecar_verdict = evaluate_feature_driven_terminal_verdict(
+                sidecar_session,
+                gatekeeper_config,
+                force_deadline,
+            );
+            assert_eq!(
+                verdict_signature(&baseline_verdict),
+                verdict_signature(&sidecar_verdict),
+                "{case_name} verdict signature drifted"
+            );
+            evidence_from_verdict(
+                pool_id,
+                sidecar_session,
+                &sidecar_verdict,
+                gatekeeper_config,
+                2_500,
+            )
+        }
+
+        let buy_pool_id = Pubkey::new_unique();
+        let buy_pool = test_detected_pool(buy_pool_id);
+        let buy_config = review_test_gatekeeper_config();
+        let mut buy_baseline = make_buy_session(buy_pool_id, buy_pool.as_ref(), &buy_config, 71);
+        let mut buy_sidecar = make_buy_session(buy_pool_id, buy_pool.as_ref(), &buy_config, 72);
+        let buy_unit = assert_no_drift_for_case(
+            "BUY",
+            false,
+            &mut buy_baseline,
+            &mut buy_sidecar,
+            &buy_config,
+            buy_pool_id,
+        );
+        assert_eq!(buy_unit.features.total_coordination_penalty, None);
+        assert_eq!(buy_unit.features.interaction_penalty, None);
+
+        let reject_pool_id = Pubkey::new_unique();
+        let reject_pool = test_detected_pool(reject_pool_id);
+        let reject_config = review_test_gatekeeper_config();
+        let mut reject_baseline =
+            make_reject_session(reject_pool_id, reject_pool.as_ref(), &reject_config, 73);
+        let mut reject_sidecar =
+            make_reject_session(reject_pool_id, reject_pool.as_ref(), &reject_config, 74);
+        let reject_unit = assert_no_drift_for_case(
+            "REJECT",
+            false,
+            &mut reject_baseline,
+            &mut reject_sidecar,
+            &reject_config,
+            reject_pool_id,
+        );
+        assert_eq!(reject_unit.features.total_coordination_penalty, None);
+        assert_eq!(reject_unit.features.interaction_penalty, None);
+
+        let timeout_pool_id = Pubkey::new_unique();
+        let timeout_pool = test_detected_pool(timeout_pool_id);
+        let mut timeout_config = review_test_gatekeeper_config();
+        timeout_config.min_tx_count = 3;
+        timeout_config.min_unique_signers = 3;
+        timeout_config.min_buy_count = 3;
+        timeout_config.max_wait_time_ms = 50;
+        let mut timeout_baseline =
+            make_timeout_session(timeout_pool_id, timeout_pool.as_ref(), &timeout_config, 75);
+        let mut timeout_sidecar =
+            make_timeout_session(timeout_pool_id, timeout_pool.as_ref(), &timeout_config, 76);
+        let timeout_unit = assert_no_drift_for_case(
+            "TIMEOUT",
+            true,
+            &mut timeout_baseline,
+            &mut timeout_sidecar,
+            &timeout_config,
+            timeout_pool_id,
+        );
+
+        assert_eq!(
+            timeout_unit.snapshot_mode,
+            CoordinationSnapshotMode::DecisionTime
+        );
+        assert_eq!(timeout_unit.features.total_coordination_penalty, None);
+        assert_eq!(timeout_unit.features.interaction_penalty, None);
+        assert_eq!(timeout_unit.skipped_metrics.len(), 3);
+        assert!(timeout_unit.source_snapshot_hash.is_some());
+        assert_eq!(timeout_unit.feature_cutoff_ts_ms, 1_010);
+        assert_eq!(timeout_unit.source_buffer_watermark_slot, Some(101));
+    }
+
+    #[test]
+    fn phase06_runtime_sidecar_uses_frozen_snapshot_not_late_session_state() {
         let pool_id = Pubkey::new_unique();
         let detected_pool = test_detected_pool(pool_id);
-        let mut gatekeeper_config = review_test_gatekeeper_config();
-        gatekeeper_config.min_tx_count = 3;
-        gatekeeper_config.min_unique_signers = 3;
-        gatekeeper_config.min_buy_count = 3;
-        gatekeeper_config.max_wait_time_ms = 50;
-
-        let mut baseline_session =
-            make_timeout_session(pool_id, detected_pool.as_ref(), &gatekeeper_config);
-        let baseline_verdict = evaluate_feature_driven_terminal_verdict(
-            &mut baseline_session,
-            &gatekeeper_config,
-            true,
-        );
-        let baseline_signature = timeout_signature(&baseline_verdict);
-
-        let mut sidecar_session =
-            make_timeout_session(pool_id, detected_pool.as_ref(), &gatekeeper_config);
-        let sidecar_verdict = evaluate_feature_driven_terminal_verdict(
-            &mut sidecar_session,
-            &gatekeeper_config,
-            true,
-        );
-        let sidecar_signature = timeout_signature(&sidecar_verdict);
-        let sidecar_unit = match &sidecar_verdict {
-            GatekeeperVerdict::Timeout { assessment } => {
-                let mut buy_log = assessment.to_buy_log(&pool_id, &gatekeeper_config);
-                buy_log.rollout_profile = Some("phase06-test".to_string());
-                buy_log.base_mint = Some(sidecar_session.base_mint.to_string());
-                build_coordination_risk_evidence_unit_from_session(
-                    &sidecar_session,
-                    &buy_log,
-                    "phase06-test",
-                )
-            }
-            _ => panic!("expected timeout verdict"),
+        let gatekeeper_config = review_test_gatekeeper_config();
+        let base_mint = Pubkey::from_str(&detected_pool.base_mint).expect("base mint");
+        let quote_mint = Pubkey::from_str(&detected_pool.quote_mint).expect("quote mint");
+        let bonding_curve = Pubkey::from_str(&detected_pool.bonding_curve).expect("bonding curve");
+        let dev_wallet = Pubkey::from_str(&detected_pool.creator).ok();
+        let candidate_snapshot = EnhancedCandidate {
+            pool_amm_id: pool_id,
+            base_mint,
+            quote_mint,
+            bonding_curve,
+            slot: detected_pool.slot,
+            timestamp: detected_pool
+                .detected_wall_ts_ms
+                .unwrap_or(detected_pool.timestamp_ms),
+            initial_liquidity_sol: detected_pool.initial_liquidity_sol.unwrap_or_default(),
+            signature: detected_pool.signature.clone(),
+            ..Default::default()
         };
+        let mut session = PoolObservationSession::new(
+            ghost_core::session::types::SessionId(77),
+            pool_id,
+            base_mint,
+            bonding_curve,
+            dev_wallet,
+            candidate_snapshot,
+            1_000,
+            6_000,
+            &gatekeeper_config,
+            crate::tx_intelligence::TxIntelligenceConfig::from_gatekeeper_config(
+                &gatekeeper_config,
+                EarlyFingerprintConfig::default(),
+            ),
+        );
+        review_seed_feature_buy_session(&mut session, pool_id, "phase06-freeze-before");
+        let verdict =
+            evaluate_feature_driven_terminal_verdict(&mut session, &gatekeeper_config, false);
+        let assessment = match &verdict {
+            GatekeeperVerdict::Buy { assessment, .. } => assessment,
+            _ => panic!("expected buy verdict"),
+        };
+        let mut buy_log = assessment.to_buy_log(&pool_id, &gatekeeper_config);
+        buy_log.rollout_profile = Some("phase06-test".to_string());
+        buy_log.base_mint = Some(session.base_mint.to_string());
+        let frozen_snapshot = freeze_coordination_decision_snapshot_from_session(
+            &session,
+            &buy_log,
+            "phase06-test",
+            2_500,
+            2_500_000,
+        );
+        let frozen_hash = frozen_snapshot.source_snapshot_hash.clone();
+        let frozen_len = frozen_snapshot.txs.len();
 
-        assert_eq!(baseline_signature, sidecar_signature);
+        let mut late_tx = (*test_pool_observation_tx("phase06-late-after-freeze")).clone();
+        late_tx.pool_amm_id = pool_id.to_string();
+        late_tx.token_mint = Some(session.base_mint.to_string());
+        late_tx.signer = Pubkey::new_unique().to_string();
+        late_tx.timestamp_ms = 9_999;
+        late_tx.event_time.ingress_wall_ts_ms = Some(9_999);
+        late_tx.arrival_ts_ms = 9_999;
+        late_tx.slot = Some(999);
+        late_tx.tx_index = Some(1);
+        session.tx_buffer.push_back(Arc::new(late_tx));
+        assert!(
+            session.tx_buffer.len() > frozen_len,
+            "late mutable session state should diverge from frozen snapshot"
+        );
+
+        let sidecar_unit = build_coordination_risk_evidence_unit_from_snapshot(
+            frozen_snapshot,
+            &CoordinationRiskConfig::default(),
+        );
+        assert_eq!(sidecar_unit.source_snapshot_hash, frozen_hash);
+        assert_eq!(
+            sidecar_unit.sample_summary.total_txs_seen,
+            frozen_len as u16
+        );
         assert_eq!(
             sidecar_unit.snapshot_mode,
             CoordinationSnapshotMode::DecisionTime
         );
         assert_eq!(sidecar_unit.features.total_coordination_penalty, None);
         assert_eq!(sidecar_unit.features.interaction_penalty, None);
-        assert_eq!(sidecar_unit.skipped_metrics.len(), 3);
-        assert!(sidecar_unit.source_snapshot_hash.is_some());
-        assert_eq!(sidecar_unit.feature_cutoff_ts_ms, 1_010);
-        assert_eq!(sidecar_unit.source_buffer_watermark_slot, Some(101));
     }
 
     #[test]
