@@ -274,11 +274,42 @@ pub struct FundingTransferEvent {
     pub provenance: FundingTransferProvenance,
 }
 
+/// Runtime health snapshot for the funding lane that produced an event.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FundingLaneRuntimeHealth {
+    /// Monotonic stream epoch, incremented when the funding lane reconnects.
+    #[serde(default)]
+    pub stream_epoch: u64,
+
+    /// True when the lane has observed a reconnect/drop condition that may have
+    /// created a coverage gap inside the active FSC lookback window.
+    #[serde(default)]
+    pub gap_suspected: bool,
+
+    /// Cumulative dropped event count known to this producer.
+    #[serde(default)]
+    pub dropped_events: u64,
+
+    /// Wall-clock timestamp of the latest known reconnect, if available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_reconnect_ts_ms: Option<u64>,
+}
+
+impl FundingLaneRuntimeHealth {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Typed funding-transfer event payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectedFundingTransferEvent {
     /// The funding transfer observation.
     pub transfer: FundingTransferEvent,
+
+    /// Runtime health of the funding lane at the time this event was emitted.
+    #[serde(default, skip_serializing_if = "FundingLaneRuntimeHealth::is_default")]
+    pub lane_health: FundingLaneRuntimeHealth,
 
     /// Timestamp when the event was created (for latency tracking).
     pub detected_at: std::time::SystemTime,
@@ -748,6 +779,7 @@ impl IpcSender {
 
         let event = SeerEvent::FundingTransfer(DetectedFundingTransferEvent {
             transfer,
+            lane_health: FundingLaneRuntimeHealth::default(),
             detected_at: std::time::SystemTime::now(),
             sequence_number: sequence,
             priority,
@@ -1616,6 +1648,7 @@ mod tests {
 
         let funding_event = DetectedFundingTransferEvent {
             transfer,
+            lane_health: FundingLaneRuntimeHealth::default(),
             detected_at: SystemTime::now(),
             sequence_number: 77,
             priority: EventPriority::High,
@@ -1709,6 +1742,7 @@ mod tests {
         let transfer = create_test_funding_transfer_event();
         let funding_event = DetectedFundingTransferEvent {
             transfer,
+            lane_health: FundingLaneRuntimeHealth::default(),
             detected_at: std::time::SystemTime::now(),
             sequence_number: 77,
             priority: EventPriority::High,

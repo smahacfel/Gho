@@ -473,7 +473,7 @@ use tokio::sync::broadcast;
 use ghost_core::{
     CurveFinality, EventSemanticEnvelope, EventTimeMetadata, ExecutionAccountEvidence,
 };
-use seer::ipc::{AccountUpdateReplayOrigin, FundingTransferProvenance};
+use seer::ipc::{AccountUpdateReplayOrigin, FundingLaneRuntimeHealth, FundingTransferProvenance};
 
 // Re-export RawBytesMissingReason from seer for use in events
 pub use seer::types::RawBytesMissingReason;
@@ -869,6 +869,10 @@ pub struct FundingTransferObserved {
         skip_serializing_if = "FundingTransferProvenance::is_legacy_default"
     )]
     pub provenance: FundingTransferProvenance,
+
+    /// Runtime health of the funding lane that emitted this transfer.
+    #[serde(default, skip_serializing_if = "FundingLaneRuntimeHealth::is_default")]
+    pub lane_health: FundingLaneRuntimeHealth,
 
     /// Wall-clock time when the producer emitted the event.
     pub detected_at: std::time::SystemTime,
@@ -1639,6 +1643,7 @@ mod tests {
             lamports: 25_000_000,
             full_chain_coverage: true,
             provenance: FundingTransferProvenance::authoritative_full_feed_live(),
+            lane_health: FundingLaneRuntimeHealth::default(),
             detected_at: std::time::SystemTime::now(),
             sequence_number: 9,
         };
@@ -1766,6 +1771,7 @@ mod tests {
             lamports: 1_000,
             full_chain_coverage: false,
             provenance: FundingTransferProvenance::filtered_grpc_global_stream_live(),
+            lane_health: FundingLaneRuntimeHealth::default(),
             detected_at: std::time::SystemTime::now(),
             sequence_number: 1,
         };
@@ -1799,6 +1805,7 @@ mod tests {
             lamports: 1_000,
             full_chain_coverage: false,
             provenance: FundingTransferProvenance::filtered_grpc_global_stream_live(),
+            lane_health: FundingLaneRuntimeHealth::default(),
             detected_at: std::time::SystemTime::now(),
             sequence_number: 1,
         })

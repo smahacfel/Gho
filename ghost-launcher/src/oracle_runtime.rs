@@ -15891,6 +15891,7 @@ fn observe_funding_transfer(
     let funding_source_index = session_manager.funding_source_index();
     let warmup_ready_before = funding_source_index.warmup_ready();
     funding_source_index.observe_transfer(transfer, config);
+    funding_source_index.observe_lane_health(transfer.lane_health);
 
     if transfer.full_chain_coverage {
         let warmup_ready_after = funding_source_index.warmup_ready();

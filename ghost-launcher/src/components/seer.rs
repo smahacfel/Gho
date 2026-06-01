@@ -17,7 +17,7 @@ use seer::{
         ProgramStreamsConfig, PumpPortalConfig, SeerConfig, SeerSourceMode, StreamMode,
         TxFilterStrategy,
     },
-    ipc::{create_ipc_channel, BackpressurePolicy, IpcChannelConfig},
+    ipc::{create_ipc_channel, BackpressurePolicy, FundingLaneRuntimeHealth, IpcChannelConfig},
     nln_program_streams::{
         normalize_nln_event, NlnEvent, NlnFundingTransferCoverage, NlnProgramStreamMessage,
         NlnProgramStreamsClient, NlnPumpFunCreateEvent, NlnSubscribeLoopOptions, NlnTransferEvent,
@@ -274,6 +274,13 @@ fn nln_effective_event_ts_ms(
         return provider_ts_ms;
     }
     recv_ts_ms
+}
+
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
 }
 
 fn nln_stable_hash(parts: &[String]) -> String {
@@ -748,6 +755,9 @@ async fn run_nln_program_streams_topic_capture(
         stall_timeout: Some(Duration::from_secs(30)),
         ..NlnSubscribeLoopOptions::default()
     };
+    let stats = client.stats();
+    let mut last_reconnect_total = stats.snapshot().reconnects;
+    let mut lane_health = FundingLaneRuntimeHealth::default();
     let mut stream = client.subscribe_json_with_reconnect(topic.clone(), options);
     let mut sequence_number = 0u64;
     let mut native_transfer_count = 0u64;
@@ -771,6 +781,16 @@ async fn run_nln_program_streams_topic_capture(
                 continue;
             }
         };
+        let stats_snapshot = stats.snapshot();
+        if stats_snapshot.reconnects > last_reconnect_total {
+            let delta = stats_snapshot
+                .reconnects
+                .saturating_sub(last_reconnect_total);
+            last_reconnect_total = stats_snapshot.reconnects;
+            lane_health.stream_epoch = lane_health.stream_epoch.saturating_add(delta);
+            lane_health.gap_suspected = true;
+            lane_health.last_reconnect_ts_ms = Some(unix_now_ms());
+        }
 
         let raw_row = artifact_writer
             .as_ref()
@@ -871,6 +891,7 @@ async fn run_nln_program_streams_topic_capture(
                 if let Some(ref tx) = event_bus_tx {
                     let detected = seer::ipc::DetectedFundingTransferEvent {
                         transfer: transfer_event,
+                        lane_health,
                         detected_at: std::time::SystemTime::now(),
                         sequence_number,
                         priority: seer::ipc::EventPriority::High,
@@ -2394,6 +2415,7 @@ fn emit_funding_transfer_to_event_bus(
         lamports: funding_event.transfer.lamports,
         full_chain_coverage: funding_event.transfer.full_chain_coverage,
         provenance: funding_event.transfer.provenance,
+        lane_health: funding_event.lane_health,
         detected_at: funding_event.detected_at.clone(),
         sequence_number: funding_event.sequence_number,
     });
@@ -4786,6 +4808,7 @@ mod tests {
         transfer.tx_index = Some(77);
         let funding = SeerEvent::FundingTransfer(DetectedFundingTransferEvent {
             transfer,
+            lane_health: seer::ipc::FundingLaneRuntimeHealth::default(),
             detected_at: SystemTime::now(),
             sequence_number: 7,
             priority: EventPriority::High,

@@ -934,6 +934,23 @@ impl FundingSourceIndex {
         update_index_metrics(&inner);
     }
 
+    pub fn observe_lane_health(&self, health: seer::ipc::FundingLaneRuntimeHealth) {
+        if health.is_default() {
+            return;
+        }
+        let mut inner = self.inner.write();
+        if health.stream_epoch > inner.stream_epoch {
+            inner.stream_epoch = health.stream_epoch;
+            inner.last_reconnect_ts_ms = health.last_reconnect_ts_ms;
+        } else if health.last_reconnect_ts_ms.is_some() {
+            inner.last_reconnect_ts_ms =
+                max_option_u64(inner.last_reconnect_ts_ms, health.last_reconnect_ts_ms);
+        }
+        inner.gap_suspected |= health.gap_suspected;
+        inner.dropped_events = inner.dropped_events.max(health.dropped_events);
+        update_index_metrics(&inner);
+    }
+
     pub fn record_dropped_events(&self, count: u64) {
         if count == 0 {
             return;
@@ -2055,6 +2072,7 @@ mod tests {
             lamports,
             full_chain_coverage: true,
             provenance: seer::ipc::FundingTransferProvenance::authoritative_full_feed_live(),
+            lane_health: seer::ipc::FundingLaneRuntimeHealth::default(),
             detected_at: std::time::SystemTime::now(),
             sequence_number: event_ts_ms,
         }

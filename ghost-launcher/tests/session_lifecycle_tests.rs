@@ -223,6 +223,7 @@ fn funding_transfer(
         lamports,
         full_chain_coverage: true,
         provenance: seer::ipc::FundingTransferProvenance::authoritative_full_feed_live(),
+        lane_health: seer::ipc::FundingLaneRuntimeHealth::default(),
         detected_at: std::time::SystemTime::now(),
         sequence_number: timestamp_ms,
     }
