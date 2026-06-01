@@ -88,6 +88,7 @@ enum NlnArtifactRecord {
     PumpFunCreateRaw(Value),
     PumpFunTradeRaw(Value),
     SystemTransfersRaw(Value),
+    NormalizationError(Value),
     CandidateBirth(Value),
     FundingEvent(Value),
 }
@@ -99,22 +100,20 @@ struct NlnArtifactWriter {
 }
 
 impl NlnArtifactWriter {
-    fn try_send(&self, record: NlnArtifactRecord, label: &'static str) {
-        match self.tx.try_send(record) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                metrics::counter!(
-                    "seer_nln_program_streams_artifact_dropped_total",
-                    1,
-                    "label" => label
-                );
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
+    async fn send_lossless(&self, record: NlnArtifactRecord, label: &'static str) -> bool {
+        match self.tx.send(record).await {
+            Ok(()) => true,
+            Err(_) => {
                 metrics::counter!(
                     "seer_nln_program_streams_artifact_writer_closed_total",
                     1,
                     "label" => label
                 );
+                warn!(
+                    label = %label,
+                    "Seer: NLN artifact writer closed; required artifact record could not be persisted"
+                );
+                false
             }
         }
     }
@@ -139,6 +138,43 @@ impl NlnArtifactWriter {
             event.amount_lamports.to_string(),
         ];
         nln_stable_hash_u64(&parts) % u64::from(rate) == 0
+    }
+
+    fn should_capture_raw_transfer_message(&self, message: &NlnProgramStreamMessage) -> bool {
+        let rate = self.transfer_sample_rate;
+        if rate <= 1 {
+            return true;
+        }
+        let body = message.payload_json.as_object();
+        let value = |keys: &[&str]| -> String {
+            keys.iter()
+                .find_map(|key| body.and_then(|object| object.get(*key)))
+                .and_then(json_scalar_string)
+                .unwrap_or_else(|| "none".to_string())
+        };
+        let parts = vec![
+            value(&["signature", "tx_signature"]),
+            value(&["tx_index", "txIndex"]),
+            value(&[
+                "instruction_index",
+                "instructionIndex",
+                "outer_instruction_index",
+            ]),
+            value(&["from_wallet", "fromWallet", "source_wallet", "from"]),
+            value(&["to_wallet", "toWallet", "recipient_wallet", "to"]),
+            value(&["amount", "amount_lamports", "lamports"]),
+            message.partition.to_string(),
+            message.offset_raw.clone(),
+        ];
+        nln_stable_hash_u64(&parts) % u64::from(rate) == 0
+    }
+}
+
+fn json_scalar_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) if !value.is_empty() => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
     }
 }
 
@@ -170,6 +206,44 @@ fn nln_artifact_raw_row(message: &NlnProgramStreamMessage) -> Value {
         "recv_ts_ms": message.recv_ts_ms,
         "decode_ts_ms": message.decode_ts_ms,
         "payload_json": message.payload_json,
+    })
+}
+
+fn nln_payload_scalar_string(message: &NlnProgramStreamMessage, keys: &[&str]) -> Option<String> {
+    let object = message.payload_json.as_object()?;
+    keys.iter()
+        .find_map(|key| object.get(*key))
+        .and_then(json_scalar_string)
+}
+
+fn nln_normalization_error_row(
+    message: &NlnProgramStreamMessage,
+    topic_kind: NlnProgramStreamCaptureTopic,
+    error: &anyhow::Error,
+) -> Value {
+    let raw_payload_hash = nln_stable_hash(&[message.payload_json.to_string()]);
+    json!({
+        "schema_version": NLN_ARTIFACT_SCHEMA_VERSION,
+        "artifact": "nln_normalization_errors_v1",
+        "provider": "NLN",
+        "topic": message.topic,
+        "topic_kind": topic_kind.label(),
+        "partition": message.partition,
+        "offset_raw": message.offset_raw,
+        "offset": message.offset,
+        "signature": nln_payload_scalar_string(message, &["signature", "tx_signature"]),
+        "slot": nln_payload_scalar_string(message, &["slot"]),
+        "tx_index": nln_payload_scalar_string(message, &["tx_index", "txIndex"]),
+        "instruction_index": nln_payload_scalar_string(message, &[
+            "instruction_index",
+            "instructionIndex",
+            "outer_instruction_index"
+        ]),
+        "provider_ts_ms": message.provider_ts_ms,
+        "recv_ts_ms": message.recv_ts_ms,
+        "decode_ts_ms": message.decode_ts_ms,
+        "error": error.to_string(),
+        "raw_payload_hash": raw_payload_hash,
     })
 }
 
@@ -411,6 +485,9 @@ fn spawn_nln_artifact_writer(config: NlnArtifactCaptureConfig) -> Option<NlnArti
             open_nln_artifact_file(config.capture_dir.join("pumpfun_trade_raw_v1.jsonl")).await;
         let mut transfers_raw =
             open_nln_artifact_file(config.capture_dir.join("system_transfers_raw_v1.jsonl")).await;
+        let mut normalization_errors =
+            open_nln_artifact_file(config.capture_dir.join("nln_normalization_errors_v1.jsonl"))
+                .await;
         let mut candidate_birth =
             open_nln_artifact_file(config.capture_dir.join("nln_candidate_birth_v1.jsonl")).await;
         let mut funding_events =
@@ -441,6 +518,9 @@ fn spawn_nln_artifact_writer(config: NlnArtifactCaptureConfig) -> Option<NlnArti
                         NlnArtifactRecord::SystemTransfersRaw(row) => {
                             write_nln_artifact_line(&mut transfers_raw, &row, "system_transfers_raw_v1").await;
                         }
+                        NlnArtifactRecord::NormalizationError(row) => {
+                            write_nln_artifact_line(&mut normalization_errors, &row, "nln_normalization_errors_v1").await;
+                        }
                         NlnArtifactRecord::CandidateBirth(row) => {
                             write_nln_artifact_line(&mut candidate_birth, &row, "nln_candidate_birth_v1").await;
                         }
@@ -453,6 +533,7 @@ fn spawn_nln_artifact_writer(config: NlnArtifactCaptureConfig) -> Option<NlnArti
                     flush_nln_artifact_writer(&mut create_raw, "pumpfun_create_raw_v1").await;
                     flush_nln_artifact_writer(&mut trade_raw, "pumpfun_trade_raw_v1").await;
                     flush_nln_artifact_writer(&mut transfers_raw, "system_transfers_raw_v1").await;
+                    flush_nln_artifact_writer(&mut normalization_errors, "nln_normalization_errors_v1").await;
                     flush_nln_artifact_writer(&mut candidate_birth, "nln_candidate_birth_v1").await;
                     flush_nln_artifact_writer(&mut funding_events, "funding_events_v1").await;
                 }
@@ -462,6 +543,7 @@ fn spawn_nln_artifact_writer(config: NlnArtifactCaptureConfig) -> Option<NlnArti
         flush_nln_artifact_writer(&mut create_raw, "pumpfun_create_raw_v1").await;
         flush_nln_artifact_writer(&mut trade_raw, "pumpfun_trade_raw_v1").await;
         flush_nln_artifact_writer(&mut transfers_raw, "system_transfers_raw_v1").await;
+        flush_nln_artifact_writer(&mut normalization_errors, "nln_normalization_errors_v1").await;
         flush_nln_artifact_writer(&mut candidate_birth, "nln_candidate_birth_v1").await;
         flush_nln_artifact_writer(&mut funding_events, "funding_events_v1").await;
         info!("Seer: NLN PR8 artifact capture writer stopped");
@@ -473,7 +555,7 @@ fn spawn_nln_artifact_writer(config: NlnArtifactCaptureConfig) -> Option<NlnArti
     })
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NlnProgramStreamCaptureTopic {
     PumpFunCreate,
     PumpFunTrade,
@@ -486,6 +568,168 @@ impl NlnProgramStreamCaptureTopic {
             Self::PumpFunCreate => "pumpfun_create",
             Self::PumpFunTrade => "pumpfun_trade",
             Self::SystemTransfers => "system_transfers",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct NlnProgramStreamSubscription {
+    topic: String,
+    topic_kind: NlnProgramStreamCaptureTopic,
+    required_for_fsc: bool,
+    priority: u8,
+}
+
+#[derive(Debug, Clone)]
+struct NlnProgramStreamsSelection {
+    requested_topic_count: usize,
+    allowed_stream_count: usize,
+    subscriptions: Vec<NlnProgramStreamSubscription>,
+    dropped_optional_topics: Vec<String>,
+    required_topics_exceed_limit: bool,
+}
+
+fn select_nln_program_stream_subscriptions(
+    config: &ProgramStreamsConfig,
+) -> NlnProgramStreamsSelection {
+    let enabled_topics: HashSet<String> = config
+        .enabled_topics
+        .iter()
+        .map(|topic| topic.trim())
+        .filter(|topic| !topic.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let disabled_optional_topics: HashSet<String> = config
+        .disabled_optional_topics
+        .iter()
+        .map(|topic| topic.trim())
+        .filter(|topic| !topic.is_empty())
+        .map(str::to_owned)
+        .collect();
+
+    let mut seen_topics = HashSet::new();
+    let mut candidates = Vec::new();
+    for (topic, topic_kind, required_for_fsc, priority) in [
+        (
+            config.system_transfers_topic.trim(),
+            NlnProgramStreamCaptureTopic::SystemTransfers,
+            true,
+            0,
+        ),
+        (
+            config.pumpfun_trade_topic.trim(),
+            NlnProgramStreamCaptureTopic::PumpFunTrade,
+            true,
+            1,
+        ),
+        (
+            config.pumpfun_create_topic.trim(),
+            NlnProgramStreamCaptureTopic::PumpFunCreate,
+            false,
+            2,
+        ),
+    ] {
+        if topic.is_empty() {
+            continue;
+        }
+        if !enabled_topics.is_empty() && !enabled_topics.contains(topic) {
+            continue;
+        }
+        if !seen_topics.insert(topic.to_owned()) {
+            continue;
+        }
+        candidates.push(NlnProgramStreamSubscription {
+            topic: topic.to_owned(),
+            topic_kind,
+            required_for_fsc,
+            priority,
+        });
+    }
+
+    let requested_topic_count = candidates.len();
+    let mut dropped_optional_topics = Vec::new();
+    let mut selected = Vec::new();
+    for candidate in candidates {
+        if !candidate.required_for_fsc && disabled_optional_topics.contains(&candidate.topic) {
+            dropped_optional_topics.push(candidate.topic);
+            continue;
+        }
+        selected.push(candidate);
+    }
+
+    selected.sort_by_key(|candidate| candidate.priority);
+    let allowed_stream_count = config.max_streams;
+    let required_count = selected
+        .iter()
+        .filter(|candidate| candidate.required_for_fsc)
+        .count();
+    let required_topics_exceed_limit = required_count > allowed_stream_count;
+
+    if required_topics_exceed_limit {
+        NlnProgramStreamsSelection {
+            requested_topic_count,
+            allowed_stream_count,
+            subscriptions: Vec::new(),
+            dropped_optional_topics,
+            required_topics_exceed_limit,
+        }
+    } else {
+        while selected.len() > allowed_stream_count {
+            let Some(drop_index) = selected
+                .iter()
+                .rposition(|candidate| !candidate.required_for_fsc)
+            else {
+                break;
+            };
+            dropped_optional_topics.push(selected.remove(drop_index).topic);
+        }
+        NlnProgramStreamsSelection {
+            requested_topic_count,
+            allowed_stream_count,
+            subscriptions: selected,
+            dropped_optional_topics,
+            required_topics_exceed_limit,
+        }
+    }
+}
+
+async fn capture_raw_nln_message(
+    writer: &NlnArtifactWriter,
+    topic_kind: NlnProgramStreamCaptureTopic,
+    message: &NlnProgramStreamMessage,
+    raw_row: &Value,
+    force: bool,
+) -> bool {
+    match topic_kind {
+        NlnProgramStreamCaptureTopic::PumpFunCreate => {
+            writer
+                .send_lossless(
+                    NlnArtifactRecord::PumpFunCreateRaw(raw_row.clone()),
+                    "pumpfun_create_raw_v1",
+                )
+                .await
+        }
+        NlnProgramStreamCaptureTopic::PumpFunTrade => {
+            writer
+                .send_lossless(
+                    NlnArtifactRecord::PumpFunTradeRaw(raw_row.clone()),
+                    "pumpfun_trade_raw_v1",
+                )
+                .await
+        }
+        NlnProgramStreamCaptureTopic::SystemTransfers => {
+            if force || writer.should_capture_raw_transfer_message(message) {
+                let mut row = raw_row.clone();
+                add_nln_artifact_sampling(&mut row, writer.transfer_sample_rate);
+                writer
+                    .send_lossless(
+                        NlnArtifactRecord::SystemTransfersRaw(row),
+                        "system_transfers_raw_v1",
+                    )
+                    .await
+            } else {
+                false
+            }
         }
     }
 }
@@ -531,11 +775,30 @@ async fn run_nln_program_streams_topic_capture(
         let raw_row = artifact_writer
             .as_ref()
             .map(|_| nln_artifact_raw_row(&message));
+        let mut raw_captured = false;
+        if let (Some(writer), Some(row)) = (artifact_writer.as_ref(), raw_row.as_ref()) {
+            raw_captured = capture_raw_nln_message(writer, topic_kind, &message, row, false).await;
+        }
 
         let event = match normalize_nln_event(&message, &config) {
             Ok(event) => event,
             Err(err) => {
                 decode_error_count = decode_error_count.saturating_add(1);
+                if let Some(writer) = artifact_writer.as_ref() {
+                    if let Some(row) = raw_row.as_ref() {
+                        if !raw_captured {
+                            capture_raw_nln_message(writer, topic_kind, &message, row, true).await;
+                        }
+                    }
+                    writer
+                        .send_lossless(
+                            NlnArtifactRecord::NormalizationError(nln_normalization_error_row(
+                                &message, topic_kind, &err,
+                            )),
+                            "nln_normalization_errors_v1",
+                        )
+                        .await;
+                }
                 warn!(
                     topic = %message.topic,
                     kind = topic_kind.label(),
@@ -553,18 +816,14 @@ async fn run_nln_program_streams_topic_capture(
             (NlnProgramStreamCaptureTopic::PumpFunCreate, NlnEvent::PumpFunCreate(create)) => {
                 create_count = create_count.saturating_add(1);
                 if let Some(writer) = artifact_writer.as_ref() {
-                    if let Some(row) = raw_row {
-                        writer.try_send(
-                            NlnArtifactRecord::PumpFunCreateRaw(row),
-                            "pumpfun_create_raw_v1",
-                        );
-                    }
-                    writer.try_send(
-                        NlnArtifactRecord::CandidateBirth(nln_candidate_birth_artifact_row(
-                            &create,
-                        )),
-                        "nln_candidate_birth_v1",
-                    );
+                    writer
+                        .send_lossless(
+                            NlnArtifactRecord::CandidateBirth(nln_candidate_birth_artifact_row(
+                                &create,
+                            )),
+                            "nln_candidate_birth_v1",
+                        )
+                        .await;
                 }
                 if create_count == 1 || create_count % 1_000 == 0 {
                     info!(
@@ -576,14 +835,6 @@ async fn run_nln_program_streams_topic_capture(
             }
             (NlnProgramStreamCaptureTopic::PumpFunTrade, NlnEvent::PumpFunTrade(_trade)) => {
                 trade_count = trade_count.saturating_add(1);
-                if let Some(writer) = artifact_writer.as_ref() {
-                    if let Some(row) = raw_row {
-                        writer.try_send(
-                            NlnArtifactRecord::PumpFunTradeRaw(row),
-                            "pumpfun_trade_raw_v1",
-                        );
-                    }
-                }
                 if trade_count == 1 || trade_count % 1_000 == 0 {
                     info!(
                         topic = %topic,
@@ -607,19 +858,14 @@ async fn run_nln_program_streams_topic_capture(
                     .as_ref()
                     .filter(|writer| writer.should_capture_transfer(&transfer))
                 {
-                    if let Some(mut row) = raw_row {
-                        add_nln_artifact_sampling(&mut row, writer.transfer_sample_rate);
-                        writer.try_send(
-                            NlnArtifactRecord::SystemTransfersRaw(row),
-                            "system_transfers_raw_v1",
-                        );
-                    }
                     let mut funding_row = nln_funding_event_artifact_row(&transfer);
                     add_nln_artifact_sampling(&mut funding_row, writer.transfer_sample_rate);
-                    writer.try_send(
-                        NlnArtifactRecord::FundingEvent(funding_row),
-                        "funding_events_v1",
-                    );
+                    writer
+                        .send_lossless(
+                            NlnArtifactRecord::FundingEvent(funding_row),
+                            "funding_events_v1",
+                        )
+                        .await;
                 }
 
                 if let Some(ref tx) = event_bus_tx {
@@ -2208,18 +2454,52 @@ fn spawn_nln_program_streams_capture(
 
     Some(tokio::spawn(async move {
         let endpoint = redact_endpoint_for_logs(&config.endpoint);
-        let create_topic = config.pumpfun_create_topic.clone();
-        let trade_topic = config.pumpfun_trade_topic.clone();
-        let transfers_topic = config.system_transfers_topic.clone();
         let artifact_writer = spawn_nln_artifact_writer(artifact_config);
+        let selection = select_nln_program_stream_subscriptions(&config);
+        let started_topics: Vec<String> = selection
+            .subscriptions
+            .iter()
+            .map(|subscription| subscription.topic.clone())
+            .collect();
+        let started_topic_kinds: Vec<&'static str> = selection
+            .subscriptions
+            .iter()
+            .map(|subscription| subscription.topic_kind.label())
+            .collect();
         info!(
             endpoint = %endpoint,
             format = config.format.as_str(),
-            create_topic = %create_topic,
-            trade_topic = %trade_topic,
-            transfers_topic = %transfers_topic,
+            requested_topic_count = selection.requested_topic_count,
+            allowed_stream_count = selection.allowed_stream_count,
+            started_topic_count = selection.subscriptions.len(),
+            started_topics = ?started_topics,
+            started_topic_kinds = ?started_topic_kinds,
+            dropped_optional_topics = ?selection.dropped_optional_topics,
             "Seer: starting NLN Program Streams FSC capture lane"
         );
+        if selection.required_topics_exceed_limit {
+            error!(
+                endpoint = %endpoint,
+                requested_topic_count = selection.requested_topic_count,
+                allowed_stream_count = selection.allowed_stream_count,
+                "Seer: NLN Program Streams required FSC topics exceed provider stream limit"
+            );
+            if let Some(tx) = authoritative_funding_stream_tx.as_ref() {
+                let _ = tx.send(false);
+            }
+            return;
+        }
+        if selection.subscriptions.is_empty() {
+            error!(
+                endpoint = %endpoint,
+                allowed_stream_count = selection.allowed_stream_count,
+                "Seer: NLN Program Streams capture lane has no selected topics"
+            );
+            if let Some(tx) = authoritative_funding_stream_tx.as_ref() {
+                let _ = tx.send(false);
+            }
+            return;
+        }
 
         let client = match NlnProgramStreamsClient::connect(config.clone()).await {
             Ok(client) => client,
@@ -2242,10 +2522,19 @@ fn spawn_nln_program_streams_capture(
                 let has_transfers_topic = topics
                     .iter()
                     .any(|topic| topic.topic == config.system_transfers_topic);
+                let listed_topics: HashSet<&str> =
+                    topics.iter().map(|topic| topic.topic.as_str()).collect();
+                let missing_selected_topics: Vec<&str> = selection
+                    .subscriptions
+                    .iter()
+                    .map(|subscription| subscription.topic.as_str())
+                    .filter(|topic| !listed_topics.contains(topic))
+                    .collect();
                 info!(
                     endpoint = %endpoint,
                     topic_count,
                     has_transfers_topic,
+                    missing_selected_topics = ?missing_selected_topics,
                     "Seer: NLN Program Streams ListTopics completed"
                 );
             }
@@ -2259,38 +2548,45 @@ fn spawn_nln_program_streams_capture(
         }
 
         if let Some(tx) = authoritative_funding_stream_tx.as_ref() {
-            let _ = tx.send(true);
+            let funding_stream_selected = selection.subscriptions.iter().any(|subscription| {
+                matches!(
+                    subscription.topic_kind,
+                    NlnProgramStreamCaptureTopic::SystemTransfers
+                )
+            });
+            let _ = tx.send(funding_stream_selected);
         }
 
-        let create_handle = tokio::spawn(run_nln_program_streams_topic_capture(
-            client.clone(),
-            config.clone(),
-            create_topic,
-            NlnProgramStreamCaptureTopic::PumpFunCreate,
-            None,
-            None,
-            artifact_writer.clone(),
-        ));
-        let trade_handle = tokio::spawn(run_nln_program_streams_topic_capture(
-            client.clone(),
-            config.clone(),
-            trade_topic,
-            NlnProgramStreamCaptureTopic::PumpFunTrade,
-            None,
-            None,
-            artifact_writer.clone(),
-        ));
-        let transfers_handle = tokio::spawn(run_nln_program_streams_topic_capture(
-            client,
-            config,
-            transfers_topic,
-            NlnProgramStreamCaptureTopic::SystemTransfers,
-            event_bus_tx,
-            health,
-            artifact_writer,
-        ));
+        let mut handles = Vec::with_capacity(selection.subscriptions.len());
+        for subscription in selection.subscriptions {
+            let is_funding_topic = matches!(
+                subscription.topic_kind,
+                NlnProgramStreamCaptureTopic::SystemTransfers
+            );
+            let topic_event_bus_tx = if is_funding_topic {
+                event_bus_tx.clone()
+            } else {
+                None
+            };
+            let topic_health = if is_funding_topic {
+                health.clone()
+            } else {
+                None
+            };
+            handles.push(tokio::spawn(run_nln_program_streams_topic_capture(
+                client.clone(),
+                config.clone(),
+                subscription.topic,
+                subscription.topic_kind,
+                topic_event_bus_tx,
+                topic_health,
+                artifact_writer.clone(),
+            )));
+        }
 
-        let _ = tokio::join!(create_handle, trade_handle, transfers_handle);
+        for handle in handles {
+            let _ = handle.await;
+        }
 
         warn!("Seer: NLN Program Streams FSC capture lane exited");
         if let Some(tx) = authoritative_funding_stream_tx.as_ref() {
@@ -2438,6 +2734,9 @@ pub async fn run(
             api_key_env: config.program_streams.api_key_env.clone(),
             api_key_env_fallback: config.program_streams.api_key_env_fallback.clone(),
             format: program_streams_format,
+            max_streams: config.program_streams.max_streams,
+            enabled_topics: config.program_streams.enabled_topics.clone(),
+            disabled_optional_topics: config.program_streams.disabled_optional_topics.clone(),
             pumpfun_create_topic: config.program_streams.pumpfun_create_topic.clone(),
             pumpfun_trade_topic: config.program_streams.pumpfun_trade_topic.clone(),
             system_transfers_topic: config.program_streams.system_transfers_topic.clone(),
@@ -3177,18 +3476,22 @@ mod tests {
     use super::{
         detected_pool_from_candidate, detection_clock_summary,
         emit_execution_account_evidence_to_event_bus, emit_funding_transfer_to_event_bus,
-        process_pool_detected_event_for_session_gate, process_trade_event_for_session_gate,
-        pumpswap_program_id, trade_event_to_pool_transaction, trade_has_forwardable_identity,
-        SessionAccountUpdateBridge, SessionAccountUpdateDecision, SessionBcv2Context,
-        SessionExecutionAccountEvidenceDecision, SessionPoolTradeBridge, SessionTradeDecision,
+        nln_normalization_error_row, process_pool_detected_event_for_session_gate,
+        process_trade_event_for_session_gate, pumpswap_program_id,
+        select_nln_program_stream_subscriptions, trade_event_to_pool_transaction,
+        trade_has_forwardable_identity, NlnProgramStreamCaptureTopic, SessionAccountUpdateBridge,
+        SessionAccountUpdateDecision, SessionBcv2Context, SessionExecutionAccountEvidenceDecision,
+        SessionPoolTradeBridge, SessionTradeDecision,
     };
     use crate::events::{create_event_bus, GhostEvent};
     use ghost_core::CurveFinality;
+    use seer::config::ProgramStreamsConfig;
     use seer::ipc::{
         AccountUpdateReplayOrigin, DetectedAccountUpdateEvent,
         DetectedExecutionAccountEvidenceEvent, DetectedFundingTransferEvent, DetectedPoolEvent,
         DetectedTradeEvent, EventPriority, FundingTransferEvent, SeerEvent,
     };
+    use seer::nln_program_streams::NlnProgramStreamMessage;
     use seer::types::{
         CandidatePool, InstructionProvenance, ObservedAccountMetaProvenance, RawBytesMissingReason,
         TradeEvent,
@@ -3224,6 +3527,133 @@ mod tests {
             .await
             .expect("timed out waiting for event")
             .expect("event bus closed")
+    }
+
+    #[test]
+    fn test_program_stream_selection_preserves_legacy_three_topics_by_default() {
+        let config = ProgramStreamsConfig::default();
+        let selection = select_nln_program_stream_subscriptions(&config);
+
+        assert_eq!(selection.allowed_stream_count, 3);
+        assert_eq!(selection.requested_topic_count, 3);
+        assert!(!selection.required_topics_exceed_limit);
+        assert!(selection.dropped_optional_topics.is_empty());
+        assert_eq!(selection.subscriptions.len(), 3);
+        assert_eq!(
+            selection
+                .subscriptions
+                .iter()
+                .map(|subscription| subscription.topic_kind)
+                .collect::<Vec<_>>(),
+            vec![
+                NlnProgramStreamCaptureTopic::SystemTransfers,
+                NlnProgramStreamCaptureTopic::PumpFunTrade,
+                NlnProgramStreamCaptureTopic::PumpFunCreate,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_program_stream_selection_drops_optional_create_under_two_stream_limit() {
+        let config = ProgramStreamsConfig {
+            enabled: true,
+            max_streams: 2,
+            ..ProgramStreamsConfig::default()
+        };
+        let selection = select_nln_program_stream_subscriptions(&config);
+
+        assert_eq!(selection.allowed_stream_count, 2);
+        assert_eq!(selection.requested_topic_count, 3);
+        assert_eq!(
+            selection.dropped_optional_topics,
+            vec!["prod.rpc.solana.pumpfun.create".to_string()]
+        );
+        assert_eq!(
+            selection
+                .subscriptions
+                .iter()
+                .map(|subscription| subscription.topic_kind)
+                .collect::<Vec<_>>(),
+            vec![
+                NlnProgramStreamCaptureTopic::SystemTransfers,
+                NlnProgramStreamCaptureTopic::PumpFunTrade,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_program_stream_selection_honors_explicit_fsc_topic_allowlist() {
+        let config = ProgramStreamsConfig {
+            enabled: true,
+            max_streams: 2,
+            enabled_topics: vec![
+                "prod.rpc.solana.system.transfers".to_string(),
+                "prod.rpc.solana.pumpfun.trade".to_string(),
+            ],
+            disabled_optional_topics: vec!["prod.rpc.solana.pumpfun.create".to_string()],
+            ..ProgramStreamsConfig::default()
+        };
+        let selection = select_nln_program_stream_subscriptions(&config);
+
+        assert_eq!(selection.requested_topic_count, 2);
+        assert!(selection.dropped_optional_topics.is_empty());
+        assert_eq!(selection.subscriptions.len(), 2);
+        assert!(selection.subscriptions.iter().all(|subscription| {
+            subscription.topic_kind != NlnProgramStreamCaptureTopic::PumpFunCreate
+        }));
+    }
+
+    #[test]
+    fn test_program_stream_selection_fails_closed_when_required_topics_exceed_limit() {
+        let config = ProgramStreamsConfig {
+            enabled: true,
+            max_streams: 1,
+            ..ProgramStreamsConfig::default()
+        };
+        let selection = select_nln_program_stream_subscriptions(&config);
+
+        assert!(selection.required_topics_exceed_limit);
+        assert!(selection.subscriptions.is_empty());
+    }
+
+    #[test]
+    fn test_nln_normalization_error_row_preserves_join_keys_and_payload_hash() {
+        let message = NlnProgramStreamMessage {
+            topic: "prod.rpc.solana.system.transfers".to_string(),
+            partition: 7,
+            offset_raw: "42".to_string(),
+            offset: Some(42),
+            provider_ts_ms: Some(1_700_000_000_001),
+            recv_ts_ms: 1_700_000_000_111,
+            decode_ts_ms: 1_700_000_000_112,
+            payload_json: serde_json::json!({
+                "signature": "sig-test",
+                "slot": "321",
+                "tx_index": 3,
+                "instruction_index": "2",
+                "from_wallet": "from-test",
+                "to_wallet": "to-test",
+                "amount": "10000000"
+            }),
+        };
+        let err = anyhow::anyhow!("bad transfer payload");
+
+        let row = nln_normalization_error_row(
+            &message,
+            NlnProgramStreamCaptureTopic::SystemTransfers,
+            &err,
+        );
+
+        assert_eq!(row["artifact"], "nln_normalization_errors_v1");
+        assert_eq!(row["signature"], "sig-test");
+        assert_eq!(row["slot"], "321");
+        assert_eq!(row["tx_index"], "3");
+        assert_eq!(row["instruction_index"], "2");
+        assert_eq!(row["error"], "bad transfer payload");
+        assert!(row["raw_payload_hash"]
+            .as_str()
+            .expect("payload hash")
+            .starts_with("fnv64:"));
     }
 
     fn make_trade(pool: Pubkey, mint: Pubkey) -> TradeEvent {

@@ -1701,6 +1701,21 @@ pub struct SeerProgramStreamsComponentConfig {
     #[serde(default = "default_program_streams_format")]
     pub format: String,
 
+    /// Maximum concurrent NLN Program Streams subscriptions.
+    ///
+    /// Defaults to the legacy three-topic lane. Provider-constrained rollout
+    /// profiles can lower this and let optional topics be dropped explicitly.
+    #[serde(default = "default_program_streams_max_streams")]
+    pub max_streams: usize,
+
+    /// Explicit topic allowlist. Empty preserves the legacy topic fields.
+    #[serde(default)]
+    pub enabled_topics: Vec<String>,
+
+    /// Optional topics disabled for this rollout profile.
+    #[serde(default)]
+    pub disabled_optional_topics: Vec<String>,
+
     /// Pump.fun create topic.
     #[serde(default = "default_program_streams_pumpfun_create_topic")]
     pub pumpfun_create_topic: String,
@@ -1750,6 +1765,9 @@ impl Default for SeerProgramStreamsComponentConfig {
             api_key_env: default_program_streams_api_key_env(),
             api_key_env_fallback: default_program_streams_api_key_env_fallback(),
             format: default_program_streams_format(),
+            max_streams: default_program_streams_max_streams(),
+            enabled_topics: Vec::new(),
+            disabled_optional_topics: Vec::new(),
             pumpfun_create_topic: default_program_streams_pumpfun_create_topic(),
             pumpfun_trade_topic: default_program_streams_pumpfun_trade_topic(),
             system_transfers_topic: default_program_streams_system_transfers_topic(),
@@ -2787,6 +2805,10 @@ fn default_program_streams_api_key_env_fallback() -> Option<String> {
 
 fn default_program_streams_format() -> String {
     "JSON".to_string()
+}
+
+fn default_program_streams_max_streams() -> usize {
+    3
 }
 
 fn default_program_streams_pumpfun_create_topic() -> String {
@@ -4336,6 +4358,13 @@ enabled = true
             "stream-1.nln.clr3.org:443"
         );
         assert_eq!(config.seer.program_streams.format, "JSON");
+        assert_eq!(config.seer.program_streams.max_streams, 3);
+        assert!(config.seer.program_streams.enabled_topics.is_empty());
+        assert!(config
+            .seer
+            .program_streams
+            .disabled_optional_topics
+            .is_empty());
     }
 
     #[test]
@@ -4347,6 +4376,14 @@ auth_header = "x-api-key"
 api_key_env = "NLN_API_KEY"
 api_key_env_fallback = "GHOST_NLN_API_KEY"
 format = "JSON"
+max_streams = 2
+enabled_topics = [
+  "prod.rpc.solana.system.transfers",
+  "prod.rpc.solana.pumpfun.trade",
+]
+disabled_optional_topics = [
+  "prod.rpc.solana.pumpfun.create",
+]
 pumpfun_create_topic = "prod.rpc.solana.pumpfun.create"
 pumpfun_trade_topic = "prod.rpc.solana.pumpfun.trade"
 system_transfers_topic = "prod.rpc.solana.system.transfers"
@@ -4366,6 +4403,18 @@ artifact_transfer_sample_rate = 50
             Some("GHOST_NLN_API_KEY")
         );
         assert_eq!(config.format, "JSON");
+        assert_eq!(config.max_streams, 2);
+        assert_eq!(
+            config.enabled_topics,
+            vec![
+                "prod.rpc.solana.system.transfers".to_string(),
+                "prod.rpc.solana.pumpfun.trade".to_string()
+            ]
+        );
+        assert_eq!(
+            config.disabled_optional_topics,
+            vec!["prod.rpc.solana.pumpfun.create".to_string()]
+        );
         assert_eq!(
             config.system_transfers_topic,
             "prod.rpc.solana.system.transfers"
@@ -5236,6 +5285,40 @@ enabled = true
         assert!(config
             .ghost_brain_config_path
             .ends_with("configs/rollout/ghost_brain_v3_p36_primary_only_fsc_capture.toml"));
+    }
+
+    #[test]
+    fn test_fsc_v2_capture_r4_profile_uses_two_required_program_streams() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let path = manifest_dir
+            .join("../configs/rollout")
+            .join("shadow-burnin-v3-fsc-capture-nln-r4-12h-alchemy-2stream.toml");
+        let config = LauncherConfig::from_file(&path)
+            .unwrap_or_else(|err| panic!("failed to load {}: {err}", path.display()));
+
+        assert_eq!(config.seer.funding_lane_mode, "disabled");
+        assert!(config.seer.program_streams.enabled);
+        assert_eq!(config.seer.program_streams.max_streams, 2);
+        assert_eq!(
+            config.seer.program_streams.enabled_topics,
+            vec![
+                "prod.rpc.solana.system.transfers".to_string(),
+                "prod.rpc.solana.pumpfun.trade".to_string()
+            ]
+        );
+        assert_eq!(
+            config.seer.program_streams.disabled_optional_topics,
+            vec!["prod.rpc.solana.pumpfun.create".to_string()]
+        );
+        assert!(config
+            .seer
+            .program_streams
+            .artifact_capture_dir
+            .as_deref()
+            .unwrap_or_default()
+            .contains("shadow-burnin-v3-fsc-capture-nln-r4-12h-alchemy-2stream"));
+        assert_eq!(config.trigger.entry_mode, TriggerEntryMode::ShadowOnly);
+        assert_eq!(config.execution.execution_mode, ExecutionMode::Shadow);
     }
 
     #[test]

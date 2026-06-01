@@ -281,6 +281,22 @@ pub struct ProgramStreamsConfig {
     #[serde(default)]
     pub format: ProgramStreamPayloadFormat,
 
+    /// Maximum concurrent NLN Program Streams subscriptions.
+    ///
+    /// Default preserves the legacy three-topic capture lane. Rollout profiles
+    /// with provider limits can lower this and rely on optional-topic dropping.
+    #[serde(default = "ProgramStreamsConfig::default_max_streams")]
+    pub max_streams: usize,
+
+    /// Explicit topic allowlist. When empty, the legacy topic fields below are
+    /// used. When non-empty, only matching configured topics are subscribed.
+    #[serde(default)]
+    pub enabled_topics: Vec<String>,
+
+    /// Optional topics that must not be subscribed in the current profile.
+    #[serde(default)]
+    pub disabled_optional_topics: Vec<String>,
+
     /// Pump.fun create topic used for candidate birth artifacts.
     #[serde(default = "ProgramStreamsConfig::default_pumpfun_create_topic")]
     pub pumpfun_create_topic: String,
@@ -303,6 +319,9 @@ impl Default for ProgramStreamsConfig {
             api_key_env: Self::default_api_key_env(),
             api_key_env_fallback: Self::default_api_key_env_fallback(),
             format: ProgramStreamPayloadFormat::default(),
+            max_streams: Self::default_max_streams(),
+            enabled_topics: Vec::new(),
+            disabled_optional_topics: Vec::new(),
             pumpfun_create_topic: Self::default_pumpfun_create_topic(),
             pumpfun_trade_topic: Self::default_pumpfun_trade_topic(),
             system_transfers_topic: Self::default_system_transfers_topic(),
@@ -325,6 +344,10 @@ impl ProgramStreamsConfig {
 
     pub fn default_api_key_env_fallback() -> Option<String> {
         Some("GHOST_NLN_API_KEY".to_string())
+    }
+
+    pub const fn default_max_streams() -> usize {
+        3
     }
 
     pub fn default_pumpfun_create_topic() -> String {
@@ -627,6 +650,9 @@ mod tests {
             config.program_streams.format,
             ProgramStreamPayloadFormat::Json
         );
+        assert_eq!(config.program_streams.max_streams, 3);
+        assert!(config.program_streams.enabled_topics.is_empty());
+        assert!(config.program_streams.disabled_optional_topics.is_empty());
         assert_eq!(config.watched_pools_ttl_ms, 120_000);
         assert_eq!(config.watched_pools_cap, 32_768);
     }
@@ -828,6 +854,9 @@ mod tests {
             Some("GHOST_NLN_API_KEY")
         );
         assert_eq!(config.format.as_str(), "JSON");
+        assert_eq!(config.max_streams, 3);
+        assert!(config.enabled_topics.is_empty());
+        assert!(config.disabled_optional_topics.is_empty());
         assert_eq!(
             config.pumpfun_create_topic,
             "prod.rpc.solana.pumpfun.create"
@@ -845,12 +874,32 @@ mod tests {
             r#"{
                 "enabled": true,
                 "format": "JSON",
-                "endpoint": "stream-1.nln.clr3.org:443"
+                "endpoint": "stream-1.nln.clr3.org:443",
+                "max_streams": 2,
+                "enabled_topics": [
+                    "prod.rpc.solana.system.transfers",
+                    "prod.rpc.solana.pumpfun.trade"
+                ],
+                "disabled_optional_topics": [
+                    "prod.rpc.solana.pumpfun.create"
+                ]
             }"#,
         )
         .unwrap();
         assert!(config.enabled);
         assert_eq!(config.format, ProgramStreamPayloadFormat::Json);
+        assert_eq!(config.max_streams, 2);
+        assert_eq!(
+            config.enabled_topics,
+            vec![
+                "prod.rpc.solana.system.transfers".to_string(),
+                "prod.rpc.solana.pumpfun.trade".to_string()
+            ]
+        );
+        assert_eq!(
+            config.disabled_optional_topics,
+            vec!["prod.rpc.solana.pumpfun.create".to_string()]
+        );
         assert_eq!(
             config.system_transfers_topic,
             "prod.rpc.solana.system.transfers"

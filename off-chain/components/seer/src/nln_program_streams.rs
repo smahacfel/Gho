@@ -282,7 +282,7 @@ impl NlnPumpFunCreateEvent {
 pub struct NlnPumpFunTradeEvent {
     pub meta: NlnIngestMeta,
     pub signature: solana_sdk::signature::Signature,
-    pub tx_index: u32,
+    pub tx_index: Option<u32>,
     pub slot: u64,
     pub mint: solana_sdk::pubkey::Pubkey,
     pub user: solana_sdk::pubkey::Pubkey,
@@ -312,7 +312,7 @@ impl NlnPumpFunTradeEvent {
             slot: Some(self.slot),
             signature: self.signature,
             event_ordinal: None,
-            tx_index: Some(self.tx_index),
+            tx_index: self.tx_index,
             provenance: None,
             timestamp_ms,
             arrival_ts_ms: self.meta.recv_ts_ms,
@@ -886,17 +886,26 @@ pub fn parse_pumpfun_trade(message: &NlnProgramStreamMessage) -> Result<NlnPumpF
     let signature_text = required_string(object, &["signature"])?;
     let signature = solana_sdk::signature::Signature::from_str(&signature_text)
         .with_context(|| format!("invalid NLN pumpfun.trade signature '{signature_text}'"))?;
-    let tx_index = required_u32(object, &["tx_index", "txIndex"])?;
+    let tx_index = optional_u32(object, &["tx_index", "txIndex"])?;
     let slot = required_u64(object, &["slot"])?;
     let mint = required_pubkey(object, &["mint"])?;
     let user = required_pubkey(object, &["user", "buyer", "wallet"])?;
-    let side = parse_trade_side(&required_string(object, &["ix_name", "ixName", "side"])?)
-        .context("invalid NLN pumpfun.trade ix_name")?;
+    let ix_name = required_string(object, &["ix_name", "ixName", "side"])?;
+    let side = parse_trade_side(&ix_name).context("invalid NLN pumpfun.trade ix_name")?;
+    if let Some(is_buy) = optional_bool(object, &["is_buy", "isBuy"])? {
+        if is_buy != side.is_buy() {
+            bail!(
+                "conflicting NLN pumpfun.trade side fields ix_name='{}' is_buy={}",
+                ix_name,
+                is_buy
+            );
+        }
+    }
     let meta = NlnIngestMeta::from_message(
         message,
         Some(slot),
         Some(signature_text),
-        Some(tx_index),
+        tx_index,
         optional_u32(object, &["instruction_index", "instructionIndex"])?,
     );
 
@@ -1056,7 +1065,7 @@ fn payload_object(message: &NlnProgramStreamMessage) -> Result<&Map<String, Valu
 
 fn parse_trade_side(value: &str) -> Result<PumpFunTradeSide> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "buy" => Ok(PumpFunTradeSide::Buy),
+        "buy" | "buy_exact_quote_in" | "buy_exact_sol_in" => Ok(PumpFunTradeSide::Buy),
         "sell" => Ok(PumpFunTradeSide::Sell),
         other => bail!("unsupported pumpfun trade side '{other}'"),
     }
@@ -1159,11 +1168,6 @@ fn optional_u64(object: &Map<String, Value>, names: &[&str]) -> Result<Option<u6
     }
 }
 
-fn required_u32(object: &Map<String, Value>, names: &[&str]) -> Result<u32> {
-    let value = required_u64(object, names)?;
-    u32::try_from(value).with_context(|| format!("NLN field {} exceeds u32", names.join("|")))
-}
-
 fn optional_u32(object: &Map<String, Value>, names: &[&str]) -> Result<Option<u32>> {
     optional_u64(object, names)?
         .map(|value| {
@@ -1171,6 +1175,22 @@ fn optional_u32(object: &Map<String, Value>, names: &[&str]) -> Result<Option<u3
                 .with_context(|| format!("NLN field {} exceeds u32", names.join("|")))
         })
         .transpose()
+}
+
+fn optional_bool(object: &Map<String, Value>, names: &[&str]) -> Result<Option<bool>> {
+    let Some(value) = get_field(object, names) else {
+        return Ok(None);
+    };
+    match value {
+        Value::Null => Ok(None),
+        Value::Bool(value) => Ok(Some(*value)),
+        Value::String(text) => match text.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" => Ok(Some(true)),
+            "false" | "0" => Ok(Some(false)),
+            _ => bail!("invalid boolean string NLN field {}", names.join("|")),
+        },
+        _ => bail!("invalid boolean NLN field {}", names.join("|")),
+    }
 }
 
 fn optional_i64(object: &Map<String, Value>, names: &[&str]) -> Result<Option<i64>> {
@@ -1512,7 +1532,7 @@ mod tests {
         let trade = parse_pumpfun_trade(&message).unwrap();
         assert_eq!(trade.user, user);
         assert_eq!(trade.side, PumpFunTradeSide::Buy);
-        assert_eq!(trade.tx_index, 70);
+        assert_eq!(trade.tx_index, Some(70));
 
         let trade_event = trade.to_trade_event(pool);
         assert_eq!(trade_event.signer, user);
@@ -1521,6 +1541,91 @@ mod tests {
         assert_eq!(trade_event.min_sol_output, 0);
         assert_eq!(trade_event.tx_index, Some(70));
         assert_eq!(trade_event.event_ordinal, None);
+    }
+
+    #[test]
+    fn normalizes_trade_exact_buy_variants_without_losing_side() {
+        let signature = solana_sdk::signature::Signature::new_unique();
+        let mint = solana_sdk::pubkey::Pubkey::new_unique();
+        let user = solana_sdk::pubkey::Pubkey::new_unique();
+        for ix_name in ["buy_exact_quote_in", "buy_exact_sol_in"] {
+            let message = decoded_message(
+                ProgramStreamsConfig::default_pumpfun_trade_topic(),
+                json!({
+                    "signature": signature.to_string(),
+                    "tx_index": "70",
+                    "mint": mint.to_string(),
+                    "sol_amount": "8418446",
+                    "token_amount": "330719451263",
+                    "user": user.to_string(),
+                    "ix_name": ix_name,
+                    "is_buy": true,
+                    "slot": "422817405"
+                }),
+            );
+
+            let trade = parse_pumpfun_trade(&message).unwrap();
+
+            assert_eq!(trade.side, PumpFunTradeSide::Buy);
+            assert_eq!(trade.tx_index, Some(70));
+        }
+    }
+
+    #[test]
+    fn normalizes_trade_without_tx_index_as_incomplete_ordering_metadata() {
+        let signature = solana_sdk::signature::Signature::new_unique();
+        let mint = solana_sdk::pubkey::Pubkey::new_unique();
+        let user = solana_sdk::pubkey::Pubkey::new_unique();
+        let pool = solana_sdk::pubkey::Pubkey::new_unique();
+        let message = decoded_message(
+            ProgramStreamsConfig::default_pumpfun_trade_topic(),
+            json!({
+                "signature": signature.to_string(),
+                "mint": mint.to_string(),
+                "sol_amount": "8418446",
+                "token_amount": "330719451263",
+                "user": user.to_string(),
+                "ix_name": "sell",
+                "slot": "422817405"
+            }),
+        );
+
+        let trade = parse_pumpfun_trade(&message).unwrap();
+        assert_eq!(trade.side, PumpFunTradeSide::Sell);
+        assert_eq!(trade.tx_index, None);
+        assert_eq!(trade.meta.tx_index, None);
+
+        let trade_event = trade.to_trade_event(pool);
+        assert!(!trade_event.is_buy);
+        assert_eq!(trade_event.tx_index, None);
+        assert_eq!(trade_event.event_ordinal, None);
+    }
+
+    #[test]
+    fn rejects_conflicting_trade_side_fields() {
+        let signature = solana_sdk::signature::Signature::new_unique();
+        let mint = solana_sdk::pubkey::Pubkey::new_unique();
+        let user = solana_sdk::pubkey::Pubkey::new_unique();
+        let message = decoded_message(
+            ProgramStreamsConfig::default_pumpfun_trade_topic(),
+            json!({
+                "signature": signature.to_string(),
+                "tx_index": "70",
+                "mint": mint.to_string(),
+                "sol_amount": "8418446",
+                "token_amount": "330719451263",
+                "user": user.to_string(),
+                "ix_name": "buy_exact_quote_in",
+                "is_buy": false,
+                "slot": "422817405"
+            }),
+        );
+
+        let err = parse_pumpfun_trade(&message).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("conflicting NLN pumpfun.trade side fields"));
     }
 
     #[test]

@@ -1,0 +1,119 @@
+# FSC v2 NLN capture/evidence profile (r4 12h Alchemy audit, 2-stream Pro limit).
+# Birth/create remains canonical in the existing Ghost NewPoolDetected/Candidate
+# lane. NLN Program Streams are capture/evidence only for FSC: native SOL
+# transfers plus pump.fun trades. Active Gatekeeper decisions remain unchanged
+# until a later FSC policy ADR.
+
+mode = "production"
+ghost_brain_config_path = "../../configs/rollout/ghost_brain_v3_p36_primary_only_fsc_capture.toml"
+
+[seer]
+enabled = true
+source_mode = "grpc"
+commitment = "processed"
+stream_mode = "single_global"
+tx_filter_strategy = "per_pool"
+funding_lane_mode = "disabled"
+grpc_endpoint = "${GHOST_SEER_GRPC_ENDPOINT}"
+grpc_x_token = "${GHOST_SEER_GRPC_X_TOKEN}"
+grpc_auth_header = "x-api-key"
+rpc_endpoint = "${GHOST_SEER_RPC_ENDPOINT}"
+enable_pumpfun = true
+enable_bonkfun = false
+enable_raydium = false
+
+[seer.program_streams]
+enabled = true
+endpoint = "${NLN_PROGRAM_STREAM_ENDPOINT}"
+auth_header = "x-api-key"
+api_key_env = "NLN_API_KEY"
+api_key_env_fallback = "GHOST_NLN_API_KEY"
+format = "JSON"
+max_streams = 2
+enabled_topics = [
+  "prod.rpc.solana.system.transfers",
+  "prod.rpc.solana.pumpfun.trade",
+]
+disabled_optional_topics = [
+  "prod.rpc.solana.pumpfun.create",
+]
+pumpfun_create_topic = "prod.rpc.solana.pumpfun.create"
+pumpfun_trade_topic = "prod.rpc.solana.pumpfun.trade"
+system_transfers_topic = "prod.rpc.solana.system.transfers"
+artifact_capture_enabled = true
+artifact_capture_dir = "logs/nln_capture/shadow-burnin-v3-fsc-capture-nln-r4-12h-alchemy-2stream"
+artifact_queue_capacity = 32768
+artifact_flush_interval_ms = 1000
+artifact_transfer_sample_rate = 200
+
+[trigger]
+enabled = true
+rpc_url = "${GHOST_TRIGGER_RPC_URL}"
+entry_mode = "shadow_only"
+max_concurrent_positions = 5
+max_position_size_sol = 0.007
+emergency_floor_sol = 0.0001
+position_size_buffer_sol = 0.0001
+slippage_tolerance = 0.20
+live_exit_take_profit_pct = 0.50
+live_exit_stop_loss_pct = 0.50
+
+[trigger.shadow_run]
+enabled = true
+shadow_rpc_url = "${GHOST_TRIGGER_SHADOW_RPC_URL}"
+payer_strategy = "ephemeral"
+commitment = "processed"
+sig_verify = false
+replace_recent_blockhash = true
+timeout_ms = 1600
+max_retries = 1
+max_concurrent = 8
+output_path = "../../logs/shadow_run/shadow-burnin-v3-fsc-capture-nln-r4-12h-alchemy-2stream-buys.jsonl"
+emit_event_bus = true
+
+[execution]
+execution_mode = "shadow"
+
+[execution.shadow]
+tx_build_compensation_ms = 200
+max_quote_age_ms = 1500
+entry_log_path = "../../logs/shadow_run/shadow-burnin-v3-fsc-capture-nln-r4-12h-alchemy-2stream/shadow_entries.jsonl"
+lifecycle_log_path = "../../logs/shadow_run/shadow-burnin-v3-fsc-capture-nln-r4-12h-alchemy-2stream/shadow_lifecycle.jsonl"
+timing_model = "prepared_entry_mirror"
+stale_policy = "emit_warning"
+
+[execution.events]
+output_dir = "../../datasets/events/shadow-burnin-v3-fsc-capture-nln-r4-12h-alchemy-2stream"
+rotation_interval_ms = 300000
+flush_interval_ms = 1000
+max_file_size_bytes = 50000000
+enable_aem_ticks = true
+enable_optional_events = false
+
+[oracle]
+decision_log_path = "../../logs/rollout/shadow-burnin-v3-fsc-capture-nln-r4-12h-alchemy-2stream/decisions"
+
+[durability]
+wal_enabled = false
+wal_dir = "../../data/rollout/shadow-burnin-v3-fsc-capture-nln-r4-12h-alchemy-2stream/wal"
+snapshot_dir = "../../data/rollout/shadow-burnin-v3-fsc-capture-nln-r4-12h-alchemy-2stream/snapshots"
+
+[metrics]
+enabled = true
+bind = "0.0.0.0"
+port = 9090
+
+[gui_backend]
+enabled = true
+bind_address = "127.0.0.1"
+port = 8801
+
+[logging]
+level = "warn"
+console_enabled = true
+json_format = false
+file_enabled = true
+file_path = "../../logs/rollout/shadow-burnin-v3-fsc-capture-nln-r4-12h-alchemy-2stream/system.log"
+oracle_log_enabled = true
+oracle_log_path = "../../logs/rollout/shadow-burnin-v3-fsc-capture-nln-r4-12h-alchemy-2stream/oracle.log"
+oracle_json_format = false
