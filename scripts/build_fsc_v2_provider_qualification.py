@@ -1192,12 +1192,19 @@ def first_buys_by_mint_buyer(trade_rows: list[dict[str, Any]]) -> dict[tuple[str
     return first
 
 
-def native_transfers_by_recipient(
-    transfer_rows: list[dict[str, Any]],
+def parse_native_transfers(transfer_rows: list[dict[str, Any]]) -> list[NlnTransfer]:
+    return [
+        transfer
+        for row in transfer_rows
+        if (transfer := parse_nln_transfer(row)) is not None
+    ]
+
+
+def index_native_transfers_by_recipient(
+    transfers: list[NlnTransfer],
     *,
     global_recipient_cap: int | None,
 ) -> tuple[dict[str, list[NlnTransfer]], int, int]:
-    transfers = [transfer for row in transfer_rows if (transfer := parse_nln_transfer(row)) is not None]
     last_order_by_recipient: dict[str, tuple[int, int, int, str]] = {}
     for transfer in transfers:
         current = last_order_by_recipient.get(transfer.to_wallet)
@@ -1225,6 +1232,17 @@ def native_transfers_by_recipient(
     return by_recipient, len(transfers), evicted_recipient_count
 
 
+def native_transfers_by_recipient(
+    transfer_rows: list[dict[str, Any]],
+    *,
+    global_recipient_cap: int | None,
+) -> tuple[dict[str, list[NlnTransfer]], int, int]:
+    return index_native_transfers_by_recipient(
+        parse_native_transfers(transfer_rows),
+        global_recipient_cap=global_recipient_cap,
+    )
+
+
 def transfer_precedes_buy(transfer: NlnTransfer, buy: NlnBuy) -> bool | None:
     if transfer.slot is not None and buy.slot is not None:
         if transfer.slot < buy.slot:
@@ -1245,20 +1263,17 @@ def transfer_precedes_buy(transfer: NlnTransfer, buy: NlnBuy) -> bool | None:
     return None
 
 
-def nln_native_join_summary(
+def nln_native_join_summary_from_index(
     *,
-    trade_rows: list[dict[str, Any]],
-    transfer_rows: list[dict[str, Any]],
+    buys: dict[tuple[str | None, str], NlnBuy],
+    transfers_by_recipient: dict[str, list[NlnTransfer]],
+    native_transfer_count: int,
+    evicted_recipient_count: int,
     ttl_seconds: int,
     min_abs_attribution_lamports: int,
     min_rel_to_buy: float,
     global_recipient_cap: int | None,
 ) -> dict[str, Any]:
-    buys = first_buys_by_mint_buyer(trade_rows)
-    transfers_by_recipient, native_transfer_count, evicted_recipient_count = native_transfers_by_recipient(
-        transfer_rows,
-        global_recipient_cap=global_recipient_cap,
-    )
     known_buyers = 0
     no_history = 0
     same_slot_unorderable = 0
@@ -1341,20 +1356,60 @@ def nln_native_join_summary(
     }
 
 
+def nln_native_join_summary(
+    *,
+    trade_rows: list[dict[str, Any]],
+    transfer_rows: list[dict[str, Any]],
+    ttl_seconds: int,
+    min_abs_attribution_lamports: int,
+    min_rel_to_buy: float,
+    global_recipient_cap: int | None,
+) -> dict[str, Any]:
+    buys = first_buys_by_mint_buyer(trade_rows)
+    transfers_by_recipient, native_transfer_count, evicted_recipient_count = native_transfers_by_recipient(
+        transfer_rows,
+        global_recipient_cap=global_recipient_cap,
+    )
+    return nln_native_join_summary_from_index(
+        buys=buys,
+        transfers_by_recipient=transfers_by_recipient,
+        native_transfer_count=native_transfer_count,
+        evicted_recipient_count=evicted_recipient_count,
+        ttl_seconds=ttl_seconds,
+        min_abs_attribution_lamports=min_abs_attribution_lamports,
+        min_rel_to_buy=min_rel_to_buy,
+        global_recipient_cap=global_recipient_cap,
+    )
+
+
 def build_fsc_parameter_grid_report(
     *,
     trade_rows: list[dict[str, Any]],
     transfer_rows: list[dict[str, Any]],
 ) -> dict[str, Any]:
+    buys = first_buys_by_mint_buyer(trade_rows)
+    native_transfers = parse_native_transfers(transfer_rows)
+    transfer_indexes = {
+        global_cap: index_native_transfers_by_recipient(
+            native_transfers,
+            global_recipient_cap=global_cap,
+        )
+        for global_cap in FSC_PARAMETER_GRID_GLOBAL_RECIPIENT_CAPS
+    }
     variants = []
     for ttl_seconds in FSC_PARAMETER_GRID_TTL_SECONDS:
         for global_cap in FSC_PARAMETER_GRID_GLOBAL_RECIPIENT_CAPS:
+            transfers_by_recipient, native_transfer_count, evicted_recipient_count = transfer_indexes[
+                global_cap
+            ]
             for store_dust in FSC_PARAMETER_GRID_STORE_DUST_LAMPORTS:
                 for min_abs in FSC_PARAMETER_GRID_ATTRIBUTION_ABS_LAMPORTS:
                     for rel_to_buy in FSC_PARAMETER_GRID_REL_TO_BUY:
-                        summary = nln_native_join_summary(
-                            trade_rows=trade_rows,
-                            transfer_rows=transfer_rows,
+                        summary = nln_native_join_summary_from_index(
+                            buys=buys,
+                            transfers_by_recipient=transfers_by_recipient,
+                            native_transfer_count=native_transfer_count,
+                            evicted_recipient_count=evicted_recipient_count,
                             ttl_seconds=ttl_seconds,
                             min_abs_attribution_lamports=min_abs,
                             min_rel_to_buy=rel_to_buy,
