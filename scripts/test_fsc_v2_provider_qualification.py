@@ -366,8 +366,142 @@ class FscV2ProviderQualificationTests(unittest.TestCase):
         self.assertEqual(benchmark["status"], "NOT_AVAILABLE")
         self.assertEqual(benchmark["fail_reasons"], [])
         self.assertFalse(benchmark["blocking"])
+        self.assertTrue(benchmark["benchmark_skipped"])
         self.assertEqual(canary["status"], "PASS")
         self.assertEqual(unknown_reason["top_reason"], "FSC_INSUFFICIENT_KNOWN_SOURCES")
+
+    def test_bounded_tail_marks_windowed_reports_without_provider_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            trade = root / "trade.jsonl"
+            transfers = root / "transfers.jsonl"
+            decisions = root / "decisions.jsonl"
+            write_jsonl(
+                trade,
+                [
+                    {
+                        "topic": "prod.rpc.solana.pumpfun.trade",
+                        "signature": "sig-trade",
+                        "mint": "mint1",
+                        "user": "buyer3",
+                        "ix_name": "buy",
+                        "sol_amount": 50_000_000,
+                        "slot": 10,
+                        "tx_index": 0,
+                        "recv_ts_ms": 10_000,
+                    }
+                ],
+            )
+            write_jsonl(
+                transfers,
+                [
+                    {
+                        "topic": "prod.rpc.solana.system.transfers",
+                        "signature": "sig-transfer-1",
+                        "slot": 1,
+                        "tx_index": 0,
+                        "instruction_index": 0,
+                        "from_wallet": "source1",
+                        "to_wallet": "buyer1",
+                        "amount": 20_000_000,
+                        "token_address": "solana",
+                        "recv_ts_ms": 1_000,
+                    },
+                    {
+                        "topic": "prod.rpc.solana.system.transfers",
+                        "signature": "sig-transfer-2",
+                        "slot": 2,
+                        "tx_index": 0,
+                        "instruction_index": 0,
+                        "from_wallet": "source2",
+                        "to_wallet": "buyer2",
+                        "amount": 20_000_000,
+                        "token_address": "solana",
+                        "recv_ts_ms": 2_000,
+                    },
+                    {
+                        "topic": "prod.rpc.solana.system.transfers",
+                        "signature": "sig-transfer-3",
+                        "slot": 9,
+                        "tx_index": 0,
+                        "instruction_index": 0,
+                        "from_wallet": "source3",
+                        "to_wallet": "buyer3",
+                        "amount": 20_000_000,
+                        "token_address": "solana",
+                        "recv_ts_ms": 9_000,
+                    },
+                ],
+            )
+            write_jsonl(
+                decisions,
+                [
+                    {
+                        "candidate_id": "candidate1",
+                        "funding_source_v2": {
+                            "snapshot_mode": "decision_time",
+                            "status": "clean",
+                            "hhi_norm_count": 1.0,
+                            "total_buyers": 2,
+                            "known_buyers": 2,
+                            "known_non_neutral_buyers": 2,
+                            "unknown_count": 0,
+                            "neutral_count": 0,
+                            "low_confidence_count": 0,
+                            "same_slot_unorderable_count": 0,
+                            "known_coverage": 1.0,
+                            "non_neutral_known_coverage": 1.0,
+                            "source_counts": [{"source": "source3", "count": 2}],
+                        },
+                    }
+                ],
+            )
+
+            manifest = fscq.build_artifacts(
+                fscq.build_parser().parse_args(
+                    [
+                        "--scope",
+                        "unit",
+                        "--root",
+                        str(root),
+                        "--mode",
+                        "bounded-tail",
+                        "--max-transfer-rows",
+                        "1",
+                        "--nln-trade",
+                        str(trade),
+                        "--nln-transfer",
+                        str(transfers),
+                        "--decision-log",
+                        str(decisions),
+                    ]
+                )
+            )
+
+            report_dir = root / "reports" / "selector" / "unit"
+            topic_liveness = read_json(report_dir / "nln_topic_liveness_v1.json")
+            parameter_grid = read_json(report_dir / "fsc_parameter_grid_v1.json")
+            benchmark = read_json(report_dir / "nln_provider_benchmark_v1.json")
+            canary = read_json(report_dir / "fsc_capture_canary_v1.json")
+
+        self.assertEqual(manifest["status"], "PASS_FOR_PHASE1_EVIDENCE")
+        self.assertEqual(manifest["transfer_processing_mode"], "bounded_tail")
+        self.assertTrue(manifest["builder_scale_caveat"])
+        self.assertEqual(manifest["parameter_grid_scope"], "windowed")
+        self.assertEqual(manifest["full_provider_qualification"], "NOT_CLAIMED_WINDOWED_INPUT")
+        self.assertEqual(manifest["row_counts"]["nln_transfer_rows"], 3)
+        self.assertEqual(manifest["row_counts"]["nln_transfer_rows_used"], 1)
+        self.assertEqual(topic_liveness["system_transfer_rows"], 3)
+        self.assertEqual(topic_liveness["system_transfer_rows_used"], 1)
+        self.assertEqual(topic_liveness["system_transfer_input_scope"], "windowed")
+        self.assertEqual(canary["transfer_rows"], 3)
+        self.assertEqual(canary["transfer_rows_used"], 1)
+        self.assertEqual(parameter_grid["parameter_grid_scope"], "windowed")
+        self.assertTrue(parameter_grid["builder_scale_caveat"])
+        self.assertEqual(benchmark["status"], "NOT_AVAILABLE")
+        self.assertEqual(benchmark["nln_rows"], 3)
+        self.assertEqual(benchmark["nln_rows_used"], 1)
+        self.assertEqual(benchmark["nln_input_scope"], "windowed")
 
     def test_provider_benchmark_classifies_incomplete_transfer_key(self) -> None:
         self.assertIsNone(fscq.event_key({"signature": "sig"}))

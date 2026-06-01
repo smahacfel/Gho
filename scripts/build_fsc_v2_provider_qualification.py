@@ -13,7 +13,7 @@ import argparse
 import json
 import math
 import os
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -33,6 +33,7 @@ FSC_PARAMETER_GRID_STORE_DUST_LAMPORTS = [1_000_000]
 FSC_PARAMETER_GRID_ATTRIBUTION_ABS_LAMPORTS = [5_000_000, 10_000_000, 50_000_000]
 FSC_PARAMETER_GRID_REL_TO_BUY = [0.0, 0.10, 0.20]
 FSC_V2_MIN_KNOWN_NON_NEUTRAL_BUYERS = 2
+DEFAULT_MAX_TRANSFER_ROWS = 200_000
 
 FSC_NO_RETAINED_RECIPIENT_HISTORY_REASON = "FSC_NO_RETAINED_RECIPIENT_HISTORY"
 FSC_FUNDING_STREAM_UNAVAILABLE_REASON = "FSC_FUNDING_STREAM_UNAVAILABLE"
@@ -71,15 +72,85 @@ class NlnTransfer:
     order_key: tuple[int, int, int, str]
 
 
+@dataclass(frozen=True)
+class RowSelection:
+    rows: list[dict[str, Any]]
+    total_rows: int
+    processing_mode: str
+    max_rows: int | None
+    first_ts_ms: int | None
+    last_ts_ms: int | None
+
+    @property
+    def selected_rows(self) -> int:
+        return len(self.rows)
+
+    @property
+    def truncated(self) -> bool:
+        return self.selected_rows < self.total_rows
+
+    @property
+    def scope(self) -> str:
+        return "windowed" if self.truncated else "full"
+
+    @property
+    def duration_hours(self) -> float:
+        if self.first_ts_ms is None or self.last_ts_ms is None:
+            return 0.0
+        return max(0, self.last_ts_ms - self.first_ts_ms) / 3_600_000.0
+
+
 def rows_from_paths(paths: list[Path]) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
+    return select_rows_from_paths(paths, processing_mode="full_scan", max_rows=None).rows
+
+
+def select_rows_from_paths(
+    paths: list[Path],
+    *,
+    processing_mode: str,
+    max_rows: int | None,
+) -> RowSelection:
+    if max_rows is not None and max_rows <= 0:
+        raise ValueError("max_rows must be positive when provided")
+
+    selected: list[dict[str, Any]] | deque[dict[str, Any]]
+    selected = deque(maxlen=max_rows) if max_rows is not None else []
+    total_rows = 0
+    first_ts_ms: int | None = None
+    last_ts_ms: int | None = None
     for path in paths:
         for index, row in enumerate(common.iter_json_objects(path), start=1):
             copy = dict(row)
             copy["_source_path"] = str(path)
             copy["_source_index"] = index
-            rows.append(copy)
-    return rows
+            total_rows += 1
+            ts_ms = event_time_for_benchmark(copy)
+            if ts_ms is not None:
+                first_ts_ms = ts_ms if first_ts_ms is None else min(first_ts_ms, ts_ms)
+                last_ts_ms = ts_ms if last_ts_ms is None else max(last_ts_ms, ts_ms)
+            selected.append(copy)
+    return RowSelection(
+        rows=list(selected),
+        total_rows=total_rows,
+        processing_mode=processing_mode,
+        max_rows=max_rows,
+        first_ts_ms=first_ts_ms,
+        last_ts_ms=last_ts_ms,
+    )
+
+
+def selection_provenance(selection: RowSelection) -> dict[str, Any]:
+    return {
+        "processing_mode": selection.processing_mode,
+        "scope": selection.scope,
+        "total_rows": selection.total_rows,
+        "selected_rows": selection.selected_rows,
+        "max_rows": selection.max_rows,
+        "truncated": selection.truncated,
+        "first_ts_ms": selection.first_ts_ms,
+        "last_ts_ms": selection.last_ts_ms,
+        "duration_hours": selection.duration_hours,
+    }
 
 
 def payload(row: dict[str, Any]) -> dict[str, Any]:
@@ -193,6 +264,20 @@ def copy_raw_topic(rows: list[dict[str, Any]], output: Path, *, provider_topic: 
     return common.write_jsonl(output, (raw_log_row(row, provider_topic=provider_topic) for row in rows))
 
 
+def copy_raw_topic_from_paths(
+    input_paths: list[Path],
+    output: Path,
+    *,
+    provider_topic: str,
+) -> int:
+    def iter_rows() -> Iterable[dict[str, Any]]:
+        for path in input_paths:
+            for row in common.iter_json_objects(path):
+                yield raw_log_row(row, provider_topic=provider_topic)
+
+    return common.write_jsonl(output, iter_rows())
+
+
 def link_or_copy_raw_topic(
     input_paths: list[Path],
     rows: list[dict[str, Any]],
@@ -219,7 +304,7 @@ def link_or_copy_raw_topic(
             return len(rows)
         except OSError:
             pass
-    return copy_raw_topic(rows, output, provider_topic=provider_topic)
+    return copy_raw_topic_from_paths(input_paths, output, provider_topic=provider_topic)
 
 
 def candidate_birth_row(row: dict[str, Any], *, provider_topic: str) -> dict[str, Any]:
@@ -725,11 +810,51 @@ def build_provider_benchmark(
     *,
     nln_rows: list[dict[str, Any]],
     audit_rows: list[dict[str, Any]],
+    nln_total_rows: int | None = None,
+    nln_input_scope: str = "full",
+    transfer_processing_mode: str = "full_scan",
     min_benchmark_hours: float,
     min_audit_slots: int,
     min_audit_transfer_events: int,
 ) -> dict[str, Any]:
+    total_nln_rows = len(nln_rows) if nln_total_rows is None else nln_total_rows
     topic_counts = Counter(topic(row, string_value(row, "topic") or "unknown_topic") for row in nln_rows)
+    times = [event_time_for_benchmark(row) for row in nln_rows]
+    clean_times = [value for value in times if value is not None]
+    duration_hours = ((max(clean_times) - min(clean_times)) / 3_600_000.0) if len(clean_times) >= 2 else 0.0
+    if not audit_rows:
+        return {
+            "selector_schema_version": common.SCHEMA_VERSION,
+            "artifact": "nln_provider_benchmark_v1",
+            "status": "NOT_AVAILABLE",
+            "blocking": False,
+            "reason": "no_external_audit_source_configured",
+            "claim": "no independent provider-completeness claim",
+            "benchmark_skipped": True,
+            "fail_reasons": [],
+            "min_benchmark_hours": min_benchmark_hours,
+            "min_audit_slots": min_audit_slots,
+            "min_audit_transfer_events": min_audit_transfer_events,
+            "observed_duration_hours": duration_hours,
+            "nln_rows": total_nln_rows,
+            "nln_rows_used": len(nln_rows),
+            "nln_input_scope": nln_input_scope,
+            "transfer_processing_mode": transfer_processing_mode,
+            "audit_rows": 0,
+            "shared_event_keys": 0,
+            "keyable_nln_event_keys": None,
+            "keyable_audit_event_keys": 0,
+            "incomplete_nln_event_key_count": None,
+            "incomplete_audit_event_key_count": 0,
+            "incomplete_nln_event_key_classification": "not_evaluated_without_audit_source",
+            "unkeyed_nln_non_transfer_rows": None,
+            "duplicate_nln_event_key_count": None,
+            "topic_counts": common.counter_dict(topic_counts),
+            "samples": {
+                "incomplete_nln_event_keys": [],
+            },
+            "audit_contract": "Independent provider benchmark is not available without an external Chainstack/raw Yellowstone/archive-capable audit source.",
+        }
     nln_index, nln_incomplete, nln_unkeyed_non_transfer, nln_duplicate_keys = index_by_event_key(
         nln_rows
     )
@@ -756,42 +881,6 @@ def build_provider_benchmark(
             audit_first += 1
         else:
             ties += 1
-    times = [event_time_for_benchmark(row) for row in nln_rows]
-    clean_times = [value for value in times if value is not None]
-    duration_hours = ((max(clean_times) - min(clean_times)) / 3_600_000.0) if len(clean_times) >= 2 else 0.0
-    if not audit_rows:
-        return {
-            "selector_schema_version": common.SCHEMA_VERSION,
-            "artifact": "nln_provider_benchmark_v1",
-            "status": "NOT_AVAILABLE",
-            "blocking": False,
-            "reason": "no_external_audit_source_configured",
-            "claim": "no independent provider-completeness claim",
-            "fail_reasons": [],
-            "min_benchmark_hours": min_benchmark_hours,
-            "min_audit_slots": min_audit_slots,
-            "min_audit_transfer_events": min_audit_transfer_events,
-            "observed_duration_hours": duration_hours,
-            "nln_rows": len(nln_rows),
-            "audit_rows": 0,
-            "shared_event_keys": 0,
-            "keyable_nln_event_keys": len(nln_index),
-            "keyable_audit_event_keys": 0,
-            "incomplete_nln_event_key_count": len(nln_incomplete),
-            "incomplete_audit_event_key_count": 0,
-            "incomplete_nln_event_key_classification": (
-                "excluded_from_transfer_event_key_benchmark"
-                if nln_incomplete
-                else "none"
-            ),
-            "unkeyed_nln_non_transfer_rows": nln_unkeyed_non_transfer,
-            "duplicate_nln_event_key_count": nln_duplicate_keys,
-            "topic_counts": common.counter_dict(topic_counts),
-            "samples": {
-                "incomplete_nln_event_keys": nln_incomplete[:20],
-            },
-            "audit_contract": "Independent provider benchmark is not available without an external Chainstack/raw Yellowstone/archive-capable audit source.",
-        }
     fail_reasons: list[str] = []
     if not nln_rows:
         fail_reasons.append("nln_rows_missing")
@@ -845,7 +934,10 @@ def build_provider_benchmark(
         "min_audit_slots": min_audit_slots,
         "min_audit_transfer_events": min_audit_transfer_events,
         "observed_duration_hours": duration_hours,
-        "nln_rows": len(nln_rows),
+        "nln_rows": total_nln_rows,
+        "nln_rows_used": len(nln_rows),
+        "nln_input_scope": nln_input_scope,
+        "transfer_processing_mode": transfer_processing_mode,
         "audit_rows": len(audit_rows),
         "audit_sampling_mode": SAMPLED_BLOCK_AUDIT_MODE if sampled_audit_rows else None,
         "audit_mode_counts": common.counter_dict(audit_modes),
@@ -895,6 +987,7 @@ def build_topic_liveness_report(
     trade_rows: list[dict[str, Any]],
     transfer_rows: list[dict[str, Any]],
     normalization_error_rows: list[dict[str, Any]],
+    transfer_selection: RowSelection | None = None,
 ) -> dict[str, Any]:
     topic_inputs = {
         "pumpfun.create": create_rows,
@@ -905,13 +998,18 @@ def build_topic_liveness_report(
     first_ts_by_topic: dict[str, int | None] = {}
     last_ts_by_topic: dict[str, int | None] = {}
     for name, rows in topic_inputs.items():
-        times = [event_time_for_benchmark(row) for row in rows]
-        clean = [value for value in times if value is not None]
-        first_ts_by_topic[name] = min(clean) if clean else None
-        last_ts_by_topic[name] = max(clean) if clean else None
-        duration_by_topic[name] = (
-            (max(clean) - min(clean)) / 3_600_000.0 if len(clean) >= 2 else 0.0
-        )
+        if name == "system.transfers" and transfer_selection is not None:
+            first_ts_by_topic[name] = transfer_selection.first_ts_ms
+            last_ts_by_topic[name] = transfer_selection.last_ts_ms
+            duration_by_topic[name] = transfer_selection.duration_hours
+        else:
+            times = [event_time_for_benchmark(row) for row in rows]
+            clean = [value for value in times if value is not None]
+            first_ts_by_topic[name] = min(clean) if clean else None
+            last_ts_by_topic[name] = max(clean) if clean else None
+            duration_by_topic[name] = (
+                (max(clean) - min(clean)) / 3_600_000.0 if len(clean) >= 2 else 0.0
+            )
     normalization_by_topic = Counter(
         str(row.get("topic_kind") or row.get("topic") or "unknown")
         for row in normalization_error_rows
@@ -921,10 +1019,20 @@ def build_topic_liveness_report(
         notes.append("create_coverage_no_rows")
     if not trade_rows:
         notes.append("trade_coverage_no_rows")
-    if not transfer_rows:
+    transfer_total_rows = (
+        transfer_selection.total_rows if transfer_selection is not None else len(transfer_rows)
+    )
+    transfer_selected_rows = (
+        transfer_selection.selected_rows if transfer_selection is not None else len(transfer_rows)
+    )
+    transfer_scope = transfer_selection.scope if transfer_selection is not None else "full"
+    transfer_mode = (
+        transfer_selection.processing_mode if transfer_selection is not None else "full_scan"
+    )
+    if not transfer_total_rows:
         notes.append("transfer_coverage_no_rows")
     trade_status = "PASS" if trade_rows else "NO-GO"
-    transfer_status = "PASS" if transfer_rows else "NO-GO"
+    transfer_status = "PASS" if transfer_total_rows else "NO-GO"
     create_status = "PASS" if create_rows else "NO_COVERAGE"
     return {
         "selector_schema_version": common.SCHEMA_VERSION,
@@ -932,7 +1040,10 @@ def build_topic_liveness_report(
         "status": "PASS" if trade_rows and transfer_rows else "NO-GO",
         "notes": notes,
         "pumpfun_trade_rows": len(trade_rows),
-        "system_transfer_rows": len(transfer_rows),
+        "system_transfer_rows": transfer_total_rows,
+        "system_transfer_rows_used": transfer_selected_rows,
+        "system_transfer_input_scope": transfer_scope,
+        "transfer_processing_mode": transfer_mode,
         "pumpfun_create_rows": len(create_rows),
         "trade_status": trade_status,
         "transfer_status": transfer_status,
@@ -941,7 +1052,8 @@ def build_topic_liveness_report(
         "fsc_required_topics_status": "PASS" if trade_rows and transfer_rows else "NO-GO",
         "create_rows": len(create_rows),
         "trade_rows": len(trade_rows),
-        "transfer_rows": len(transfer_rows),
+        "transfer_rows": transfer_total_rows,
+        "transfer_rows_used": transfer_selected_rows,
         "normalization_error_rows": len(normalization_error_rows),
         "normalization_errors_by_topic": common.counter_dict(normalization_by_topic),
         "first_ts_ms_by_topic": first_ts_by_topic,
@@ -999,6 +1111,7 @@ def build_capture_canary_report(
     canary_minutes: float,
     fsc_decision_enabled: bool,
     fsc_hard_reject_enabled: bool,
+    transfer_selection: RowSelection | None = None,
 ) -> dict[str, Any]:
     fake_zero_rows = [row for row in fsc_rows if fake_zero_fsc_row(row)]
     shadow_counterfactual_rows = sum(
@@ -1018,7 +1131,13 @@ def build_capture_canary_report(
     fail_reasons: list[str] = []
     if not trade_rows:
         fail_reasons.append("no_trade_rows")
-    if not transfer_rows:
+    transfer_total_rows = (
+        transfer_selection.total_rows if transfer_selection is not None else len(transfer_rows)
+    )
+    transfer_selected_rows = (
+        transfer_selection.selected_rows if transfer_selection is not None else len(transfer_rows)
+    )
+    if not transfer_total_rows:
         fail_reasons.append("no_transfer_rows")
     if not decision_rows:
         fail_reasons.append("no_decision_rows")
@@ -1039,7 +1158,12 @@ def build_capture_canary_report(
         "fail_reasons": fail_reasons,
         "canary_minutes": canary_minutes,
         "trade_rows": len(trade_rows),
-        "transfer_rows": len(transfer_rows),
+        "transfer_rows": transfer_total_rows,
+        "transfer_rows_used": transfer_selected_rows,
+        "transfer_input_scope": transfer_selection.scope if transfer_selection else "full",
+        "transfer_processing_mode": (
+            transfer_selection.processing_mode if transfer_selection else "full_scan"
+        ),
         "create_rows": len(create_rows),
         "decision_rows": len(decision_rows),
         "fsc_snapshot_rows": len(fsc_rows),
@@ -1403,6 +1527,9 @@ def build_fsc_parameter_grid_report(
     *,
     trade_rows: list[dict[str, Any]],
     transfer_rows: list[dict[str, Any]],
+    parameter_grid_scope: str = "full",
+    transfer_processing_mode: str = "full_scan",
+    transfer_total_rows: int | None = None,
 ) -> dict[str, Any]:
     buys = first_buys_by_mint_buyer(trade_rows)
     native_transfers = parse_native_transfers(transfer_rows)
@@ -1454,6 +1581,11 @@ def build_fsc_parameter_grid_report(
         "selector_schema_version": common.SCHEMA_VERSION,
         "artifact": "fsc_parameter_grid_v1",
         "status": "PASS" if trade_rows and transfer_rows else "NO-GO",
+        "parameter_grid_scope": parameter_grid_scope,
+        "transfer_processing_mode": transfer_processing_mode,
+        "transfer_rows": len(transfer_rows) if transfer_total_rows is None else transfer_total_rows,
+        "transfer_rows_used": len(transfer_rows),
+        "builder_scale_caveat": parameter_grid_scope != "full",
         "variant_count": len(variants),
         "ttl_seconds_grid": FSC_PARAMETER_GRID_TTL_SECONDS,
         "global_recipient_cap_grid": FSC_PARAMETER_GRID_GLOBAL_RECIPIENT_CAPS,
@@ -1526,7 +1658,16 @@ def build_artifacts(args: argparse.Namespace) -> dict[str, Any]:
 
     create_rows = rows_from_paths(args.nln_create)
     trade_rows = rows_from_paths(args.nln_trade)
-    transfer_rows = rows_from_paths(args.nln_transfer)
+    transfer_max_rows = None if args.mode == "full-scan" else args.max_transfer_rows
+    transfer_processing_mode = "full_scan" if args.mode == "full-scan" else "bounded_tail"
+    transfer_selection = select_rows_from_paths(
+        args.nln_transfer,
+        processing_mode=transfer_processing_mode,
+        max_rows=transfer_max_rows,
+    )
+    transfer_rows = transfer_selection.rows
+    parameter_grid_scope = transfer_selection.scope
+    builder_scale_caveat = transfer_selection.truncated
     decision_rows = rows_from_paths(args.decision_log)
     normalization_error_rows = rows_from_paths(args.nln_normalization_error)
     audit_rows = rows_from_paths(args.audit_event)
@@ -1586,6 +1727,9 @@ def build_artifacts(args: argparse.Namespace) -> dict[str, Any]:
     fsc_parameter_grid = build_fsc_parameter_grid_report(
         trade_rows=trade_rows,
         transfer_rows=transfer_rows,
+        parameter_grid_scope=parameter_grid_scope,
+        transfer_processing_mode=transfer_processing_mode,
+        transfer_total_rows=transfer_selection.total_rows,
     )
     nln_native_join_sanity = build_nln_native_fsc_join_sanity_report(
         trade_rows=trade_rows,
@@ -1597,6 +1741,7 @@ def build_artifacts(args: argparse.Namespace) -> dict[str, Any]:
         trade_rows=trade_rows,
         transfer_rows=transfer_rows,
         normalization_error_rows=normalization_error_rows,
+        transfer_selection=transfer_selection,
     )
     capture_canary = build_capture_canary_report(
         create_rows=create_rows,
@@ -1608,9 +1753,13 @@ def build_artifacts(args: argparse.Namespace) -> dict[str, Any]:
         canary_minutes=args.canary_minutes,
         fsc_decision_enabled=args.fsc_decision_enabled,
         fsc_hard_reject_enabled=args.fsc_hard_reject_enabled,
+        transfer_selection=transfer_selection,
     )
     benchmark = build_provider_benchmark(
         nln_rows=transfer_rows,
+        nln_total_rows=transfer_selection.total_rows,
+        nln_input_scope=transfer_selection.scope,
+        transfer_processing_mode=transfer_processing_mode,
         audit_rows=audit_rows,
         min_benchmark_hours=args.min_benchmark_hours,
         min_audit_slots=args.min_audit_slots,
@@ -1701,6 +1850,15 @@ def build_artifacts(args: argparse.Namespace) -> dict[str, Any]:
             else "NO-GO"
         ),
         "provider_policy_qualification": "NOT_CLAIMED",
+        "full_provider_qualification": (
+            "NOT_CLAIMED_WINDOWED_INPUT"
+            if builder_scale_caveat
+            else "NOT_CLAIMED"
+        ),
+        "parameter_grid_scope": parameter_grid_scope,
+        "transfer_processing_mode": transfer_processing_mode,
+        "builder_scale_caveat": builder_scale_caveat,
+        "transfer_selection": selection_provenance(transfer_selection),
         "runtime_impact": "offline_artifact_builder_only; no Gatekeeper, execution, or runtime config changes",
         "active_gatekeeper_fsc_v2": "disabled",
         "r2_ssot_contract": "Program Streams are not R2 SSOT; use raw Yellowstone/DIAG/canonical account-state snapshots for R2.",
@@ -1720,7 +1878,9 @@ def build_artifacts(args: argparse.Namespace) -> dict[str, Any]:
         "row_counts": {
             "nln_create_rows": len(create_rows),
             "nln_trade_rows": len(trade_rows),
-            "nln_transfer_rows": len(transfer_rows),
+            "nln_transfer_rows": transfer_selection.total_rows,
+            "nln_transfer_rows_used": transfer_selection.selected_rows,
+            "nln_transfer_input_scope": transfer_selection.scope,
             "decision_rows": len(decision_rows),
             "normalization_error_rows": len(normalization_error_rows),
             "audit_rows": len(audit_rows),
@@ -1757,6 +1917,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-audit-slots", type=int, default=1000)
     parser.add_argument("--min-audit-transfer-events", type=int, default=10_000)
     parser.add_argument("--canary-minutes", type=float, default=DEFAULT_CANARY_MINUTES)
+    parser.add_argument(
+        "--mode",
+        choices=("bounded-tail", "full-scan"),
+        default="bounded-tail",
+        help=(
+            "Transfer processing mode. bounded-tail keeps only the last "
+            "--max-transfer-rows transfer rows in memory and marks windowed "
+            "reports with a builder scale caveat. full-scan preserves the old "
+            "behavior and should be used only on small inputs."
+        ),
+    )
+    parser.add_argument(
+        "--max-transfer-rows",
+        type=int,
+        default=DEFAULT_MAX_TRANSFER_ROWS,
+        help="Maximum system.transfer rows retained in memory in --mode bounded-tail.",
+    )
     parser.add_argument("--fsc-decision-enabled", action="store_true")
     parser.add_argument("--fsc-hard-reject-enabled", action="store_true")
     parser.add_argument("--create-topic", default="prod.rpc.solana.pumpfun.create")

@@ -9,6 +9,8 @@ REQUIRE_EXTERNAL_AUDIT="${FSC_PR8_REQUIRE_EXTERNAL_AUDIT:-0}"
 MIN_BENCHMARK_HOURS="${FSC_PR8_MIN_BENCHMARK_HOURS:-0}"
 MIN_AUDIT_SLOTS="${FSC_PR8_MIN_AUDIT_SLOTS:-1000}"
 MIN_AUDIT_TRANSFER_EVENTS="${FSC_PR8_MIN_AUDIT_TRANSFER_EVENTS:-10000}"
+BUILDER_MODE="${FSC_PR8_BUILDER_MODE:-bounded-tail}"
+MAX_TRANSFER_ROWS="${FSC_PR8_MAX_TRANSFER_ROWS:-200000}"
 
 CAPTURE_DIR="${ROOT}/logs/nln_capture/${SCOPE}"
 DECISION_ROOT="${ROOT}/logs/rollout/${SCOPE}/decisions/${SCOPE}"
@@ -29,6 +31,8 @@ while true; do
     --min-audit-slots "${MIN_AUDIT_SLOTS}"
     --min-audit-transfer-events "${MIN_AUDIT_TRANSFER_EVENTS}"
     --canary-minutes "${CANARY_MINUTES}"
+    --mode "${BUILDER_MODE}"
+    --max-transfer-rows "${MAX_TRANSFER_ROWS}"
     --nln-create "${CAPTURE_DIR}/pumpfun_create_raw_v1.jsonl"
     --nln-trade "${CAPTURE_DIR}/pumpfun_trade_raw_v1.jsonl"
     --nln-transfer "${CAPTURE_DIR}/system_transfers_raw_v1.jsonl"
@@ -73,7 +77,7 @@ while true; do
   "${CMD[@]}" --json >"${TMP_JSON}" 2>"${LAST_STDERR}"
   STATUS=$?
   mv "${TMP_JSON}" "${LAST_JSON}"
-  printf '%s status=%s scope=%s interval_seconds=%s canary_minutes=%s require_external_audit=%s min_benchmark_hours=%s min_audit_slots=%s min_audit_transfer_events=%s\n' \
+  printf '%s status=%s scope=%s interval_seconds=%s canary_minutes=%s require_external_audit=%s min_benchmark_hours=%s min_audit_slots=%s min_audit_transfer_events=%s builder_mode=%s max_transfer_rows=%s\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     "${STATUS}" \
     "${SCOPE}" \
@@ -82,7 +86,9 @@ while true; do
     "${REQUIRE_EXTERNAL_AUDIT}" \
     "${MIN_BENCHMARK_HOURS}" \
     "${MIN_AUDIT_SLOTS}" \
-    "${MIN_AUDIT_TRANSFER_EVENTS}" >"${LAST_STATUS}"
+    "${MIN_AUDIT_TRANSFER_EVENTS}" \
+    "${BUILDER_MODE}" \
+    "${MAX_TRANSFER_ROWS}" >"${LAST_STATUS}"
 
   sleep "${INTERVAL_SECONDS}"
 done
