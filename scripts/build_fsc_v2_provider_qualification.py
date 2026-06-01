@@ -23,6 +23,8 @@ import selector_pipeline_common as common
 NLN_PROVIDER = "NLN"
 NATIVE_SOL_TOKEN_ADDRESS = "solana"
 DEFAULT_MIN_BENCHMARK_HOURS = 24.0
+DEFAULT_CANARY_MINUTES = 45.0
+SAMPLED_BLOCK_AUDIT_MODE = "sampled_block_audit"
 
 
 def rows_from_paths(paths: list[Path]) -> list[dict[str, Any]]:
@@ -328,6 +330,12 @@ def fsc_snapshot_row(row: dict[str, Any]) -> dict[str, Any] | None:
         "fsc_config_hash": fsc.get("config_hash"),
         "fsc_index_warm": fsc.get("index_warm"),
         "fsc_gap_suspected": fsc.get("gap_suspected"),
+        "fsc_funding_lane_watermark_slot": fsc.get("funding_lane_watermark_slot"),
+        "fsc_funding_lane_lag_slots": fsc.get("funding_lane_lag_slots"),
+        "fsc_stream_epoch": fsc.get("stream_epoch"),
+        "fsc_last_transfer_recv_ts_ms": fsc.get("last_transfer_recv_ts_ms"),
+        "fsc_last_reconnect_ts_ms": fsc.get("last_reconnect_ts_ms"),
+        "fsc_dropped_events": fsc.get("dropped_events"),
         "raw_fsc_v2": fsc,
     }
 
@@ -351,8 +359,13 @@ def build_fsc_coverage_report(rows: list[dict[str, Any]], *, decision_rows: int)
         fail_reasons.append("decision_logs_missing")
     if not rows:
         fail_reasons.append("fsc_v2_rows_missing")
+    coverage_notes: list[str] = []
     if status_counts.get("clean", 0) == 0:
-        fail_reasons.append("no_clean_fsc_v2_rows")
+        coverage_notes.append("no_clean_fsc_v2_rows")
+    watermark_rows = sum(
+        1 for row in rows if row.get("fsc_funding_lane_watermark_slot") is not None
+    )
+    lag_rows = sum(1 for row in rows if row.get("fsc_funding_lane_lag_slots") is not None)
     return {
         "selector_schema_version": common.SCHEMA_VERSION,
         "artifact": "fsc_coverage_v2",
@@ -363,6 +376,7 @@ def build_fsc_coverage_report(rows: list[dict[str, Any]], *, decision_rows: int)
         "fsc_available_rows": sum(1 for row in rows if row.get("fsc_available") is True),
         "status_counts": common.counter_dict(status_counts),
         "excluded_reason_counts": common.counter_dict(excluded_counts),
+        "coverage_notes": coverage_notes,
         "total_buyers": total_buyers,
         "unknown_count": unknown,
         "neutral_count": neutral,
@@ -374,6 +388,51 @@ def build_fsc_coverage_report(rows: list[dict[str, Any]], *, decision_rows: int)
         "avg_non_neutral_known_coverage": average(
             row.get("fsc_non_neutral_known_coverage") for row in rows
         ),
+        "lane_health": {
+            "watermark_rows": watermark_rows,
+            "lag_rows": lag_rows,
+            "gap_suspected_rows": sum(1 for row in rows if row.get("fsc_gap_suspected") is True),
+            "max_funding_lane_watermark_slot": max(
+                (
+                    int(row["fsc_funding_lane_watermark_slot"])
+                    for row in rows
+                    if row.get("fsc_funding_lane_watermark_slot") is not None
+                ),
+                default=None,
+            ),
+            "max_stream_epoch": max(
+                (
+                    int(row["fsc_stream_epoch"])
+                    for row in rows
+                    if row.get("fsc_stream_epoch") is not None
+                ),
+                default=None,
+            ),
+            "max_dropped_events": max(
+                (
+                    int(row["fsc_dropped_events"])
+                    for row in rows
+                    if row.get("fsc_dropped_events") is not None
+                ),
+                default=None,
+            ),
+            "last_transfer_recv_ts_ms": max(
+                (
+                    int(row["fsc_last_transfer_recv_ts_ms"])
+                    for row in rows
+                    if row.get("fsc_last_transfer_recv_ts_ms") is not None
+                ),
+                default=None,
+            ),
+            "last_reconnect_ts_ms": max(
+                (
+                    int(row["fsc_last_reconnect_ts_ms"])
+                    for row in rows
+                    if row.get("fsc_last_reconnect_ts_ms") is not None
+                ),
+                default=None,
+            ),
+        },
         "guardrail": "UNKNOWN and NEUTRAL are reported separately and are not treated as clean zero FSC.",
     }
 
@@ -466,6 +525,8 @@ def build_provider_benchmark(
     nln_rows: list[dict[str, Any]],
     audit_rows: list[dict[str, Any]],
     min_benchmark_hours: float,
+    min_audit_slots: int,
+    min_audit_transfer_events: int,
 ) -> dict[str, Any]:
     topic_counts = Counter(topic(row, string_value(row, "topic") or "unknown_topic") for row in nln_rows)
     nln_index, nln_incomplete, nln_unkeyed_non_transfer, nln_duplicate_keys = index_by_event_key(
@@ -497,13 +558,42 @@ def build_provider_benchmark(
     times = [event_time_for_benchmark(row) for row in nln_rows]
     clean_times = [value for value in times if value is not None]
     duration_hours = ((max(clean_times) - min(clean_times)) / 3_600_000.0) if len(clean_times) >= 2 else 0.0
+    if not audit_rows:
+        return {
+            "selector_schema_version": common.SCHEMA_VERSION,
+            "artifact": "nln_provider_benchmark_v1",
+            "status": "NOT_AVAILABLE",
+            "blocking": False,
+            "reason": "no_external_audit_source_configured",
+            "claim": "no independent provider-completeness claim",
+            "fail_reasons": [],
+            "min_benchmark_hours": min_benchmark_hours,
+            "min_audit_slots": min_audit_slots,
+            "min_audit_transfer_events": min_audit_transfer_events,
+            "observed_duration_hours": duration_hours,
+            "nln_rows": len(nln_rows),
+            "audit_rows": 0,
+            "shared_event_keys": 0,
+            "keyable_nln_event_keys": len(nln_index),
+            "keyable_audit_event_keys": 0,
+            "incomplete_nln_event_key_count": len(nln_incomplete),
+            "incomplete_audit_event_key_count": 0,
+            "incomplete_nln_event_key_classification": (
+                "excluded_from_transfer_event_key_benchmark"
+                if nln_incomplete
+                else "none"
+            ),
+            "unkeyed_nln_non_transfer_rows": nln_unkeyed_non_transfer,
+            "duplicate_nln_event_key_count": nln_duplicate_keys,
+            "topic_counts": common.counter_dict(topic_counts),
+            "samples": {
+                "incomplete_nln_event_keys": nln_incomplete[:20],
+            },
+            "audit_contract": "Independent provider benchmark is not available without an external Chainstack/raw Yellowstone/archive-capable audit source.",
+        }
     fail_reasons: list[str] = []
     if not nln_rows:
         fail_reasons.append("nln_rows_missing")
-    if not audit_rows:
-        fail_reasons.append("audit_rows_missing")
-    if nln_incomplete:
-        fail_reasons.append("incomplete_nln_event_key")
     if audit_incomplete:
         fail_reasons.append("incomplete_audit_event_key")
     if nln_rows and not nln_index:
@@ -514,20 +604,67 @@ def build_provider_benchmark(
         fail_reasons.append("benchmark_duration_below_minimum")
     if not shared and audit_index:
         fail_reasons.append("no_overlap_with_audit_source")
+    audit_modes = Counter(str(row.get("audit_mode") or "missing") for row in audit_rows)
+    sampled_audit_rows = [
+        row for row in audit_rows if str(row.get("audit_mode") or "") == SAMPLED_BLOCK_AUDIT_MODE
+    ]
+    audit_slots_sampled_from_rows = len(
+        {
+            slot
+            for slot in (int_value(row, "slot") for row in sampled_audit_rows)
+            if slot is not None
+        }
+    )
+    audit_slots_sampled = max(
+        [audit_slots_sampled_from_rows]
+        + [
+            value
+            for value in (
+                int_value(row, "audit_slots_sampled_total", "audit_slots_sampled")
+                for row in sampled_audit_rows
+            )
+            if value is not None
+        ]
+    )
+    sampled_audit_index, _, _, _ = index_by_event_key(sampled_audit_rows)
+    audit_transfer_event_keys = len(sampled_audit_index)
+    if audit_rows and not sampled_audit_rows:
+        fail_reasons.append("audit_mode_not_sampled_block_audit")
+    if sampled_audit_rows and (
+        audit_slots_sampled < min_audit_slots
+        and audit_transfer_event_keys < min_audit_transfer_events
+    ):
+        fail_reasons.append("audit_sample_below_minimum")
     return {
         "selector_schema_version": common.SCHEMA_VERSION,
         "artifact": "nln_provider_benchmark_v1",
         "status": "PASS" if not fail_reasons else "NO-GO",
         "fail_reasons": fail_reasons,
         "min_benchmark_hours": min_benchmark_hours,
+        "min_audit_slots": min_audit_slots,
+        "min_audit_transfer_events": min_audit_transfer_events,
         "observed_duration_hours": duration_hours,
         "nln_rows": len(nln_rows),
         "audit_rows": len(audit_rows),
+        "audit_sampling_mode": SAMPLED_BLOCK_AUDIT_MODE if sampled_audit_rows else None,
+        "audit_mode_counts": common.counter_dict(audit_modes),
+        "audit_slots_sampled": audit_slots_sampled,
+        "audit_transfer_event_keys": audit_transfer_event_keys,
         "shared_event_keys": len(shared),
         "keyable_nln_event_keys": len(nln_index),
         "keyable_audit_event_keys": len(audit_index),
         "incomplete_nln_event_key_count": len(nln_incomplete),
         "incomplete_audit_event_key_count": len(audit_incomplete),
+        "incomplete_nln_event_key_classification": (
+            "excluded_from_transfer_event_key_benchmark"
+            if nln_incomplete
+            else "none"
+        ),
+        "incomplete_audit_event_key_classification": (
+            "audit_source_incomplete_fail_closed"
+            if audit_incomplete
+            else "none"
+        ),
         "unkeyed_nln_non_transfer_rows": nln_unkeyed_non_transfer,
         "unkeyed_audit_non_transfer_rows": audit_unkeyed_non_transfer,
         "duplicate_nln_event_key_count": nln_duplicate_keys,
@@ -547,7 +684,162 @@ def build_provider_benchmark(
             "incomplete_nln_event_keys": nln_incomplete[:20],
             "incomplete_audit_event_keys": audit_incomplete[:20],
         },
-        "audit_contract": "Audit rows must come from Chainstack/raw Yellowstone/archive-capable source; NLN RPC is not sufficient coverage proof.",
+        "audit_contract": "Provider benchmark coverage PASS requires archive-capable sampled_block_audit rows; observed_event_fidelity is diagnostic-only.",
+    }
+
+
+def build_topic_liveness_report(
+    *,
+    create_rows: list[dict[str, Any]],
+    trade_rows: list[dict[str, Any]],
+    transfer_rows: list[dict[str, Any]],
+    normalization_error_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    topic_inputs = {
+        "pumpfun.create": create_rows,
+        "pumpfun.trade": trade_rows,
+        "system.transfers": transfer_rows,
+    }
+    duration_by_topic: dict[str, float | None] = {}
+    first_ts_by_topic: dict[str, int | None] = {}
+    last_ts_by_topic: dict[str, int | None] = {}
+    for name, rows in topic_inputs.items():
+        times = [event_time_for_benchmark(row) for row in rows]
+        clean = [value for value in times if value is not None]
+        first_ts_by_topic[name] = min(clean) if clean else None
+        last_ts_by_topic[name] = max(clean) if clean else None
+        duration_by_topic[name] = (
+            (max(clean) - min(clean)) / 3_600_000.0 if len(clean) >= 2 else 0.0
+        )
+    normalization_by_topic = Counter(
+        str(row.get("topic_kind") or row.get("topic") or "unknown")
+        for row in normalization_error_rows
+    )
+    notes = []
+    if not create_rows:
+        notes.append("create_coverage_no_rows")
+    if not trade_rows:
+        notes.append("trade_coverage_no_rows")
+    if not transfer_rows:
+        notes.append("transfer_coverage_no_rows")
+    trade_status = "PASS" if trade_rows else "NO-GO"
+    transfer_status = "PASS" if transfer_rows else "NO-GO"
+    create_status = "PASS" if create_rows else "NO_COVERAGE"
+    return {
+        "selector_schema_version": common.SCHEMA_VERSION,
+        "artifact": "nln_topic_liveness_v1",
+        "status": "PASS" if trade_rows and transfer_rows else "NO-GO",
+        "notes": notes,
+        "pumpfun_trade_rows": len(trade_rows),
+        "system_transfer_rows": len(transfer_rows),
+        "pumpfun_create_rows": len(create_rows),
+        "trade_status": trade_status,
+        "transfer_status": transfer_status,
+        "create_status": create_status,
+        "nln_create_used_for_birth": False,
+        "fsc_required_topics_status": "PASS" if trade_rows and transfer_rows else "NO-GO",
+        "create_rows": len(create_rows),
+        "trade_rows": len(trade_rows),
+        "transfer_rows": len(transfer_rows),
+        "normalization_error_rows": len(normalization_error_rows),
+        "normalization_errors_by_topic": common.counter_dict(normalization_by_topic),
+        "first_ts_ms_by_topic": first_ts_by_topic,
+        "last_ts_ms_by_topic": last_ts_by_topic,
+        "duration_hours_by_topic": duration_by_topic,
+        "benchmark_boundary": "Event-key provider benchmark is transfer-only; create/trade liveness is reported here and does not poison transfer coverage.",
+    }
+
+
+def fake_zero_fsc_row(row: dict[str, Any]) -> bool:
+    value = row.get("fsc_count")
+    if not isinstance(value, (int, float)) or float(value) != 0.0:
+        return False
+    status = str(row.get("fsc_status") or "").lower()
+    total_buyers = int(row.get("fsc_total_buyers") or 0)
+    unknown = int(row.get("fsc_unknown_count") or 0)
+    non_neutral = int(row.get("fsc_known_non_neutral_buyers") or 0)
+    return status != "clean" or (total_buyers > 0 and unknown >= total_buyers) or non_neutral < 2
+
+
+def bool_flag(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on", "enabled"}
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value != 0
+    return False
+
+
+def build_capture_canary_report(
+    *,
+    create_rows: list[dict[str, Any]],
+    trade_rows: list[dict[str, Any]],
+    transfer_rows: list[dict[str, Any]],
+    decision_rows: list[dict[str, Any]],
+    fsc_rows: list[dict[str, Any]],
+    topic_liveness: dict[str, Any],
+    canary_minutes: float,
+    fsc_decision_enabled: bool,
+    fsc_hard_reject_enabled: bool,
+) -> dict[str, Any]:
+    fake_zero_rows = [row for row in fsc_rows if fake_zero_fsc_row(row)]
+    shadow_counterfactual_rows = sum(
+        1
+        for row in decision_rows
+        if row.get("shadow_fsc_v2_policy_signal") is not None
+        or row.get("shadow_fsc_v2_soft_points_if_enabled") is not None
+        or row.get("shadow_fsc_v2_reason_if_enabled") is not None
+    )
+    active_score_enabled_count = sum(
+        1
+        for row in decision_rows
+        if bool_flag(row.get("fsc_v2_decision_enabled"))
+        or bool_flag(row.get("funding_source_v2_decision_enabled"))
+        or bool_flag(row.get("active_fsc_v2_policy_signal"))
+    )
+    fail_reasons: list[str] = []
+    if not trade_rows:
+        fail_reasons.append("no_trade_rows")
+    if not transfer_rows:
+        fail_reasons.append("no_transfer_rows")
+    if not decision_rows:
+        fail_reasons.append("no_decision_rows")
+    if not fsc_rows:
+        fail_reasons.append("no_fsc_snapshots")
+    if fake_zero_rows:
+        fail_reasons.append("fake_zero_fsc_detected")
+    if active_score_enabled_count:
+        fail_reasons.append("active_fsc_policy_signal_detected")
+    if fsc_decision_enabled:
+        fail_reasons.append("fsc_decision_enabled")
+    if fsc_hard_reject_enabled:
+        fail_reasons.append("fsc_hard_reject_enabled")
+    return {
+        "selector_schema_version": common.SCHEMA_VERSION,
+        "artifact": "fsc_capture_canary_v1",
+        "status": "PASS" if not fail_reasons else "NO-GO",
+        "fail_reasons": fail_reasons,
+        "canary_minutes": canary_minutes,
+        "trade_rows": len(trade_rows),
+        "transfer_rows": len(transfer_rows),
+        "create_rows": len(create_rows),
+        "decision_rows": len(decision_rows),
+        "fsc_snapshot_rows": len(fsc_rows),
+        "funding_source_v2_present_rows": len(fsc_rows),
+        "fake_zero_fsc_count": len(fake_zero_rows),
+        "active_score_enabled_count": active_score_enabled_count,
+        "shadow_counterfactual_rows": shadow_counterfactual_rows,
+        "decision_enabled": fsc_decision_enabled,
+        "hard_reject_enabled": fsc_hard_reject_enabled,
+        "policy_activation": "OFF",
+        "low_coverage_blocks_capture": False,
+        "nln_trade_liveness": topic_liveness.get("trade_status"),
+        "nln_transfer_liveness": topic_liveness.get("transfer_status"),
+        "nln_create_liveness": topic_liveness.get("create_status"),
+        "samples": {
+            "fake_zero_fsc": fake_zero_rows[:20],
+        },
     }
 
 
@@ -586,11 +878,23 @@ def build_decision_time_vs_eventual(rows: list[dict[str, Any]]) -> dict[str, Any
     if not rows:
         fail_reasons.append("fsc_snapshots_missing")
     if not comparisons:
-        fail_reasons.append("no_candidate_with_both_decision_time_and_eventual_snapshots")
+        has_eventual = any(row.get("snapshot_mode") == "eventual_postfill" for row in rows)
+        if has_eventual:
+            fail_reasons.append("no_candidate_with_both_decision_time_and_eventual_snapshots")
+        else:
+            fail_reasons.append("eventual_postfill_snapshots_missing")
     return {
         "selector_schema_version": common.SCHEMA_VERSION,
         "artifact": "decision_time_vs_eventual_fsc_v1",
-        "status": "PASS" if not fail_reasons else "NO-GO",
+        "status": (
+            "PASS"
+            if not fail_reasons
+            else (
+                "PENDING_NOT_BLOCKING_FOR_PHASE1"
+                if fail_reasons == ["eventual_postfill_snapshots_missing"]
+                else "NO-GO"
+            )
+        ),
         "fail_reasons": fail_reasons,
         "fsc_snapshot_rows": len(rows),
         "comparison_rows": len(comparisons),
@@ -631,7 +935,9 @@ def build_artifacts(args: argparse.Namespace) -> dict[str, Any]:
     trade_rows = rows_from_paths(args.nln_trade)
     transfer_rows = rows_from_paths(args.nln_transfer)
     decision_rows = rows_from_paths(args.decision_log)
+    normalization_error_rows = rows_from_paths(args.nln_normalization_error)
     audit_rows = rows_from_paths(args.audit_event)
+    eventual_rows = rows_from_paths(args.eventual_fsc_snapshot)
 
     outputs = {
         "pumpfun_create_raw_v1": raw_dir / "pumpfun_create_raw_v1.jsonl",
@@ -641,6 +947,8 @@ def build_artifacts(args: argparse.Namespace) -> dict[str, Any]:
         "funding_events_v1": dataset_dir / "funding_events_v1.jsonl",
         "fsc_snapshots_v2": dataset_dir / "fsc_snapshots_v2.jsonl",
         "fsc_coverage_v2": report_dir / "fsc_coverage_v2.json",
+        "nln_topic_liveness_v1": report_dir / "nln_topic_liveness_v1.json",
+        "fsc_capture_canary_v1": report_dir / "fsc_capture_canary_v1.json",
         "nln_provider_benchmark_v1": report_dir / "nln_provider_benchmark_v1.json",
         "decision_time_vs_eventual_fsc_v1": report_dir / "decision_time_vs_eventual_fsc_v1.json",
         "fsc_provider_qualification_manifest_v1": report_dir / "fsc_provider_qualification_manifest_v1.json",
@@ -672,37 +980,106 @@ def build_artifacts(args: argparse.Namespace) -> dict[str, Any]:
         if event is not None
     ]
     fsc_rows = [row for row in (fsc_snapshot_row(row) for row in decision_rows) if row is not None]
+    fsc_rows.extend(eventual_rows)
     common.write_jsonl(outputs["nln_candidate_birth_v1"], birth_rows)
     common.write_jsonl(outputs["funding_events_v1"], funding_rows)
     common.write_jsonl(outputs["fsc_snapshots_v2"], fsc_rows)
 
     fsc_coverage = build_fsc_coverage_report(fsc_rows, decision_rows=len(decision_rows))
+    topic_liveness = build_topic_liveness_report(
+        create_rows=create_rows,
+        trade_rows=trade_rows,
+        transfer_rows=transfer_rows,
+        normalization_error_rows=normalization_error_rows,
+    )
+    capture_canary = build_capture_canary_report(
+        create_rows=create_rows,
+        trade_rows=trade_rows,
+        transfer_rows=transfer_rows,
+        decision_rows=decision_rows,
+        fsc_rows=fsc_rows,
+        topic_liveness=topic_liveness,
+        canary_minutes=args.canary_minutes,
+        fsc_decision_enabled=args.fsc_decision_enabled,
+        fsc_hard_reject_enabled=args.fsc_hard_reject_enabled,
+    )
     benchmark = build_provider_benchmark(
-        nln_rows=create_rows + trade_rows + transfer_rows,
+        nln_rows=transfer_rows,
         audit_rows=audit_rows,
         min_benchmark_hours=args.min_benchmark_hours,
+        min_audit_slots=args.min_audit_slots,
+        min_audit_transfer_events=args.min_audit_transfer_events,
     )
     decision_vs_eventual = build_decision_time_vs_eventual(fsc_rows)
     common.write_json(outputs["fsc_coverage_v2"], fsc_coverage)
+    common.write_json(outputs["nln_topic_liveness_v1"], topic_liveness)
+    common.write_json(outputs["fsc_capture_canary_v1"], capture_canary)
     common.write_json(outputs["nln_provider_benchmark_v1"], benchmark)
     common.write_json(outputs["decision_time_vs_eventual_fsc_v1"], decision_vs_eventual)
 
     stage_reports = {
         "fsc_coverage_v2": fsc_coverage,
+        "nln_topic_liveness_v1": topic_liveness,
+        "fsc_capture_canary_v1": capture_canary,
         "nln_provider_benchmark_v1": benchmark,
         "decision_time_vs_eventual_fsc_v1": decision_vs_eventual,
     }
-    fail_reasons = [
+    blocking_stage_names = {
+        "fsc_coverage_v2",
+        "nln_topic_liveness_v1",
+        "fsc_capture_canary_v1",
+    }
+    blocking_fail_reasons = [
         f"{name}:{report.get('status')}"
         for name, report in stage_reports.items()
-        if report.get("status") not in {"PASS", "ok"}
+        if name in blocking_stage_names and report.get("status") != "PASS"
     ]
+    pending_reasons = [
+        f"{name}:{report.get('status')}"
+        for name, report in stage_reports.items()
+        if report.get("status") == "PENDING_NOT_BLOCKING_FOR_PHASE1"
+    ]
+    manifest_status = "NO-GO" if blocking_fail_reasons else "PASS_FOR_PHASE1_EVIDENCE"
+    provider_benchmark_status = str(benchmark.get("status") or "missing")
+    component_statuses = {
+        "fsc_pr8_capture_canary": capture_canary.get("status"),
+        "fsc_stream_integrity": topic_liveness.get("status"),
+        "fsc_materialization": "PASS" if fsc_rows else "NO-GO",
+        "fsc_no_fake_zero": "PASS"
+        if capture_canary.get("fake_zero_fsc_count") == 0
+        else "NO-GO",
+        "nln_trade_liveness": topic_liveness.get("trade_status"),
+        "nln_transfer_liveness": topic_liveness.get("transfer_status"),
+        "nln_create_liveness": topic_liveness.get("create_status"),
+        "provider_independent_benchmark": provider_benchmark_status,
+        "provider_independent_benchmark_blocking": False,
+        "fsc_policy_activation": "OFF",
+        "phase1_dataset_unblock": "PASS" if manifest_status != "NO-GO" else "NO-GO",
+    }
     manifest = {
         "selector_schema_version": common.SCHEMA_VERSION,
         "artifact": "fsc_provider_qualification_manifest_v1",
         "scope": args.scope,
-        "status": "PASS" if not fail_reasons else "NO-GO",
-        "fail_reasons": fail_reasons,
+        "status": manifest_status,
+        "fail_reasons": blocking_fail_reasons,
+        "pending_reasons": pending_reasons,
+        "component_statuses": component_statuses,
+        "fsc_pr8_capture_canary": component_statuses["fsc_pr8_capture_canary"],
+        "fsc_stream_integrity": component_statuses["fsc_stream_integrity"],
+        "fsc_materialization": component_statuses["fsc_materialization"],
+        "fsc_no_fake_zero": component_statuses["fsc_no_fake_zero"],
+        "nln_trade_liveness": component_statuses["nln_trade_liveness"],
+        "nln_transfer_liveness": component_statuses["nln_transfer_liveness"],
+        "nln_create_liveness": component_statuses["nln_create_liveness"],
+        "provider_independent_benchmark": component_statuses["provider_independent_benchmark"],
+        "fsc_policy_activation": component_statuses["fsc_policy_activation"],
+        "phase1_dataset_unblock": component_statuses["phase1_dataset_unblock"],
+        "capture_evidence_status": (
+            "PASS"
+            if manifest_status != "NO-GO"
+            else "NO-GO"
+        ),
+        "provider_policy_qualification": "NOT_CLAIMED",
         "runtime_impact": "offline_artifact_builder_only; no Gatekeeper, execution, or runtime config changes",
         "active_gatekeeper_fsc_v2": "disabled",
         "r2_ssot_contract": "Program Streams are not R2 SSOT; use raw Yellowstone/DIAG/canonical account-state snapshots for R2.",
@@ -711,14 +1088,22 @@ def build_artifacts(args: argparse.Namespace) -> dict[str, Any]:
             "nln_trade": [file_provenance(path) for path in args.nln_trade],
             "nln_transfer": [file_provenance(path) for path in args.nln_transfer],
             "decision_log": [file_provenance(path) for path in args.decision_log],
+            "nln_normalization_error": [
+                file_provenance(path) for path in args.nln_normalization_error
+            ],
             "audit_event": [file_provenance(path) for path in args.audit_event],
+            "eventual_fsc_snapshot": [
+                file_provenance(path) for path in args.eventual_fsc_snapshot
+            ],
         },
         "row_counts": {
             "nln_create_rows": len(create_rows),
             "nln_trade_rows": len(trade_rows),
             "nln_transfer_rows": len(transfer_rows),
             "decision_rows": len(decision_rows),
+            "normalization_error_rows": len(normalization_error_rows),
             "audit_rows": len(audit_rows),
+            "eventual_fsc_snapshot_rows": len(eventual_rows),
             "candidate_birth_rows": len(birth_rows),
             "funding_event_rows": len(funding_rows),
             "fsc_snapshot_rows": len(fsc_rows),
@@ -737,7 +1122,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--nln-create", type=Path, action="append", default=[])
     parser.add_argument("--nln-trade", type=Path, action="append", default=[])
     parser.add_argument("--nln-transfer", type=Path, action="append", default=[])
+    parser.add_argument("--nln-normalization-error", type=Path, action="append", default=[])
     parser.add_argument("--decision-log", type=Path, action="append", default=[])
+    parser.add_argument("--eventual-fsc-snapshot", type=Path, action="append", default=[])
     parser.add_argument(
         "--audit-event",
         type=Path,
@@ -746,6 +1133,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Chainstack/raw Yellowstone/archive-capable audit JSONL rows for benchmark comparison.",
     )
     parser.add_argument("--min-benchmark-hours", type=float, default=DEFAULT_MIN_BENCHMARK_HOURS)
+    parser.add_argument("--min-audit-slots", type=int, default=1000)
+    parser.add_argument("--min-audit-transfer-events", type=int, default=10_000)
+    parser.add_argument("--canary-minutes", type=float, default=DEFAULT_CANARY_MINUTES)
+    parser.add_argument("--fsc-decision-enabled", action="store_true")
+    parser.add_argument("--fsc-hard-reject-enabled", action="store_true")
     parser.add_argument("--create-topic", default="prod.rpc.solana.pumpfun.create")
     parser.add_argument("--trade-topic", default="prod.rpc.solana.pumpfun.trade")
     parser.add_argument("--transfer-topic", default="prod.rpc.solana.system.transfers")
@@ -758,7 +1150,7 @@ def main(argv: list[str] | None = None) -> int:
     manifest = build_artifacts(args)
     if args.json:
         print(json.dumps(manifest, ensure_ascii=False, sort_keys=True))
-    return 0 if manifest["status"] == "PASS" else 2
+    return 0 if manifest["status"] != "NO-GO" else 2
 
 
 if __name__ == "__main__":

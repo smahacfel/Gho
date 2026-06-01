@@ -140,6 +140,10 @@ class FscV2ProviderQualificationTests(unittest.TestCase):
                 audit,
                 [
                     {
+                        "provider": "Alchemy",
+                        "source_kind": "archive_rpc",
+                        "audit_mode": "sampled_block_audit",
+                        "slot": 9,
                         "topic": "raw_yellowstone_audit",
                         "signature": "sig-transfer",
                         "tx_index": "0",
@@ -171,6 +175,10 @@ class FscV2ProviderQualificationTests(unittest.TestCase):
                         str(audit),
                         "--min-benchmark-hours",
                         "0",
+                        "--min-audit-slots",
+                        "0",
+                        "--min-audit-transfer-events",
+                        "0",
                     ]
                 )
             )
@@ -192,6 +200,8 @@ class FscV2ProviderQualificationTests(unittest.TestCase):
             fsc_rows = read_jsonl(dataset_dir / "fsc_snapshots_v2.jsonl")
             coverage = read_json(report_dir / "fsc_coverage_v2.json")
             benchmark = read_json(report_dir / "nln_provider_benchmark_v1.json")
+            topic_liveness = read_json(report_dir / "nln_topic_liveness_v1.json")
+            canary = read_json(report_dir / "fsc_capture_canary_v1.json")
 
         self.assertEqual(births[0]["candidate_birth_status"], "ok")
         self.assertEqual(births[0]["slot"], 10)
@@ -208,31 +218,109 @@ class FscV2ProviderQualificationTests(unittest.TestCase):
         self.assertEqual(coverage["status"], "PASS")
         self.assertEqual(benchmark["status"], "PASS")
         self.assertEqual(benchmark["shared_event_keys"], 1)
+        self.assertEqual(benchmark["audit_sampling_mode"], "sampled_block_audit")
+        self.assertEqual(topic_liveness["status"], "PASS")
+        self.assertEqual(topic_liveness["create_rows"], 1)
+        self.assertEqual(topic_liveness["trade_status"], "PASS")
+        self.assertEqual(topic_liveness["transfer_status"], "PASS")
+        self.assertEqual(canary["status"], "PASS")
+        self.assertEqual(manifest["status"], "PASS_FOR_PHASE1_EVIDENCE")
+        self.assertEqual(manifest["capture_evidence_status"], "PASS")
+        self.assertEqual(manifest["provider_policy_qualification"], "NOT_CLAIMED")
+        self.assertEqual(manifest["phase1_dataset_unblock"], "PASS")
         self.assertEqual(benchmark["incomplete_nln_event_key_count"], 0)
         self.assertEqual(benchmark["incomplete_audit_event_key_count"], 0)
 
-    def test_default_benchmark_fails_closed_without_audit_and_duration(self) -> None:
+    def test_missing_external_audit_is_not_capture_blocker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            create = root / "create.jsonl"
-            write_jsonl(create, [{"signature": "sig-create", "slot": 1, "recv_ts_ms": 1000}])
+            trade = root / "trade.jsonl"
+            transfers = root / "transfers.jsonl"
+            decisions = root / "decisions.jsonl"
+            write_jsonl(
+                trade,
+                [
+                    {
+                        "topic": "prod.rpc.solana.pumpfun.trade",
+                        "signature": "sig-trade",
+                        "slot": 2,
+                        "tx_index": 0,
+                        "recv_ts_ms": 2000,
+                    }
+                ],
+            )
+            write_jsonl(
+                transfers,
+                [
+                    {
+                        "topic": "prod.rpc.solana.system.transfers",
+                        "signature": "sig-transfer",
+                        "slot": 1,
+                        "tx_index": 0,
+                        "instruction_index": 0,
+                        "from_wallet": "source1",
+                        "to_wallet": "buyer1",
+                        "amount": 20_000_000,
+                        "token_address": "solana",
+                        "recv_ts_ms": 1000,
+                    }
+                ],
+            )
+            write_jsonl(
+                decisions,
+                [
+                    {
+                        "candidate_id": "candidate1",
+                        "funding_source_v2": {
+                            "snapshot_mode": "decision_time",
+                            "status": "unavailable",
+                            "excluded_reason": "insufficient_non_neutral_support",
+                            "hhi_norm_count": None,
+                            "total_buyers": 1,
+                            "known_buyers": 0,
+                            "known_non_neutral_buyers": 0,
+                            "unknown_count": 1,
+                            "neutral_count": 0,
+                            "low_confidence_count": 0,
+                            "same_slot_unorderable_count": 0,
+                            "known_coverage": 0.0,
+                            "non_neutral_known_coverage": 0.0,
+                        },
+                    }
+                ],
+            )
 
             manifest = fscq.build_artifacts(
                 fscq.build_parser().parse_args(
-                    ["--scope", "unit", "--root", str(root), "--nln-create", str(create)]
+                    [
+                        "--scope",
+                        "unit",
+                        "--root",
+                        str(root),
+                        "--nln-trade",
+                        str(trade),
+                        "--nln-transfer",
+                        str(transfers),
+                        "--decision-log",
+                        str(decisions),
+                    ]
                 )
             )
 
             benchmark = read_json(
                 root / "reports" / "selector" / "unit" / "nln_provider_benchmark_v1.json"
             )
+            canary = read_json(root / "reports" / "selector" / "unit" / "fsc_capture_canary_v1.json")
 
-        self.assertEqual(manifest["status"], "NO-GO")
-        self.assertEqual(benchmark["status"], "NO-GO")
-        self.assertIn("audit_rows_missing", benchmark["fail_reasons"])
-        self.assertIn("benchmark_duration_below_minimum", benchmark["fail_reasons"])
+        self.assertEqual(manifest["status"], "PASS_FOR_PHASE1_EVIDENCE")
+        self.assertEqual(manifest["provider_independent_benchmark"], "NOT_AVAILABLE")
+        self.assertEqual(manifest["phase1_dataset_unblock"], "PASS")
+        self.assertEqual(benchmark["status"], "NOT_AVAILABLE")
+        self.assertEqual(benchmark["fail_reasons"], [])
+        self.assertFalse(benchmark["blocking"])
+        self.assertEqual(canary["status"], "PASS")
 
-    def test_provider_benchmark_fails_closed_on_incomplete_transfer_key(self) -> None:
+    def test_provider_benchmark_classifies_incomplete_transfer_key(self) -> None:
         self.assertIsNone(fscq.event_key({"signature": "sig"}))
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -253,6 +341,10 @@ class FscV2ProviderQualificationTests(unittest.TestCase):
                 audit,
                 [
                     {
+                        "provider": "Alchemy",
+                        "source_kind": "archive_rpc",
+                        "audit_mode": "sampled_block_audit",
+                        "slot": 1,
                         "topic": "raw_yellowstone_audit",
                         "signature": "sig-transfer",
                         "tx_index": 0,
@@ -278,6 +370,10 @@ class FscV2ProviderQualificationTests(unittest.TestCase):
                         str(audit),
                         "--min-benchmark-hours",
                         "0",
+                        "--min-audit-slots",
+                        "0",
+                        "--min-audit-transfer-events",
+                        "0",
                     ]
                 )
             )
@@ -287,8 +383,13 @@ class FscV2ProviderQualificationTests(unittest.TestCase):
 
         self.assertEqual(manifest["status"], "NO-GO")
         self.assertEqual(benchmark["status"], "NO-GO")
-        self.assertIn("incomplete_nln_event_key", benchmark["fail_reasons"])
+        self.assertNotIn("incomplete_nln_event_key", benchmark["fail_reasons"])
+        self.assertIn("no_keyable_nln_transfer_rows", benchmark["fail_reasons"])
         self.assertEqual(benchmark["incomplete_nln_event_key_count"], 1)
+        self.assertEqual(
+            benchmark["incomplete_nln_event_key_classification"],
+            "excluded_from_transfer_event_key_benchmark",
+        )
         self.assertEqual(benchmark["shared_event_keys"], 0)
         self.assertIn(
             "tx_index",

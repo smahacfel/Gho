@@ -1,7 +1,7 @@
 # ADR-0139: FSC v2 PR8 runtime capture state
 
 **Date:** 2026-05-31
-**Status:** Accepted as current PR8 operational state
+**Status:** Amended fast-loop capture contract
 **Author:** Codex, based on FSC v2 NLN implementation work
 **Follows:** `ADR-0138-fsc-v2-nln-program-streams-capture-evidence.md`
 **Plan:** `PLANS/PLAN_FSC_V2_NLN_CAPTURE_EVIDENCE_20260529.md`
@@ -27,8 +27,10 @@ pieces required to run a long FSC v2 capture and qualification burn-in:
   artifacts;
 - a dedicated PR8 capture rollout profile and artifact-builder loop.
 
-The current objective is a minimum 24h run that proves capture stability, artifact durability,
-coverage shape and report behavior. It is not a decision-system promotion run.
+The current objective is a 30-60 minute PR8 canary loop that proves capture mechanics,
+artifact durability, topic liveness, FSC v2 materialization and fail-closed evidence semantics.
+It is not a decision-system promotion run. A 24h run remains useful later as a stability
+burn-in, but it is no longer a blocker for debugging, fixes or Phase 1 dataset-path work.
 
 ## Current Runtime State
 
@@ -38,7 +40,7 @@ The PR8 capture profile is:
 configs/rollout/shadow-burnin-v3-fsc-capture-nln-r1.toml
 ```
 
-The active PR8 run uses:
+The fast-loop PR8 run uses:
 
 ```text
 target/release/ghost-launcher --config configs/rollout/shadow-burnin-v3-fsc-capture-nln-r1.toml
@@ -60,6 +62,8 @@ datasets/selector/<scope>/nln_candidate_birth_v1.jsonl
 datasets/selector/<scope>/funding_events_v1.jsonl
 datasets/selector/<scope>/fsc_snapshots_v2.jsonl
 reports/selector/<scope>/fsc_coverage_v2.json
+reports/selector/<scope>/nln_topic_liveness_v1.json
+reports/selector/<scope>/fsc_capture_canary_v1.json
 reports/selector/<scope>/nln_provider_benchmark_v1.json
 reports/selector/<scope>/decision_time_vs_eventual_fsc_v1.json
 reports/selector/<scope>/fsc_provider_qualification_manifest_v1.json
@@ -89,8 +93,8 @@ The current repository state provides the following FSC v2 behavior.
 8. FSC v2 primary score is sample-normalized HHI over non-neutral known buyer funding sources.
 9. Legacy `funding_source_concentration` is not silently redefined as FSC v2.
 10. Decision logs can carry FSC v2 evidence for offline review.
-11. Provider qualification tooling is fail-closed for missing audit data, incomplete keys and
-    insufficient duration.
+11. Provider-independent benchmark tooling is separated from capture qualification. Missing audit
+    data becomes `NOT_AVAILABLE` / `NOT_CLAIMED` instead of blocking FSC capture.
 12. Numeric JSON strings from provider artifacts are handled by the qualification tooling.
 13. Raw official artifact paths are preserved without duplicating bytes when hardlinks are possible.
 14. The capture profile stores only environment variable names for secrets, not API key values.
@@ -100,17 +104,19 @@ The current repository state provides the following FSC v2 behavior.
 The current run is expected to report incomplete qualification until the required evidence exists.
 The following limitations are known and accepted for PR8 capture, but block policy promotion:
 
-1. **Minimum duration gate:** provider qualification is not complete until at least 24h of capture
-   exists. A 72h run remains preferred before stronger conclusions.
-2. **Audit feed gap:** `nln_provider_benchmark_v1.json` remains `NO-GO` when no Chainstack/raw
-   Yellowstone/archive-capable audit event source is provided.
+1. **24h stability is not the PR8 capture gate:** a 24h or 72h run is deferred to later stability
+   burn-in and does not block fast-loop fixes or Phase 1 dataset work.
+2. **Audit feed gap:** when no Chainstack/raw Yellowstone/archive-capable audit source exists,
+   `nln_provider_benchmark_v1.json` must report `NOT_AVAILABLE` and make no provider-completeness
+   claim. This is not a capture blocker.
 3. **Decision-time vs eventual gap:** `decision_time_vs_eventual_fsc_v1.json` remains incomplete
    until eventual/postfill reconstruction exists for comparison.
 4. **Coverage is empirical, not assumed:** early unknown rate, neutral share and known
    non-neutral coverage must be measured from the run instead of inferred from provider claims.
-5. **Create/trade coverage still needs validation:** `pumpfun.create` and `pumpfun.trade`
-   artifacts are useful candidate-universe evidence, but not yet canonical proof for all
-   denominator work.
+5. **Create topic is not required for FSC:** `pumpfun.trade` and `system.transfers` are the two
+   fixed FSC lanes. If `pumpfun.create` has zero rows while trade/transfer are live, the status is
+   `NO_COVERAGE` / `nln_create_used_for_birth=false`; Phase 1 birth must use the canonical
+   Yellowstone/Seer create path instead.
 6. **Program Streams are not R2 SSOT:** R2 canonical market path still requires raw Yellowstone
    AccountUpdates, DIAG or canonical account-state snapshots.
 7. **Provider offsets are diagnostic:** offset continuity is not treated as authoritative resume
@@ -127,16 +133,17 @@ The following limitations are known and accepted for PR8 capture, but block poli
 
 The current PR8 state is accepted as a capture/evidence runtime, under these constraints:
 
-1. Continue the 24h capture run using the dedicated FSC v2 NLN capture profile.
+1. Replace the old wait-24h gate with 30-60 minute canary loops:
+   capture snapshot, diagnose, fix, rerun, repeat.
 2. Persist PR8 source code, config, scripts, provider specification and this ADR.
 3. Do not commit generated `logs/`, `datasets/` or `reports/` artifacts as source state.
 4. Keep `fsc_v2.decision_enabled=false`.
 5. Keep `fsc_v2.hard_reject_enabled=false`.
 6. Keep active Gatekeeper policy behavior unchanged.
 7. Keep Program Streams outside the R2 SSOT contract.
-8. Treat all PR8 reports as qualification evidence, not as promotion approval.
-9. Treat missing audit source, insufficient duration and incomplete event keys as fail-closed report
-   states.
+8. Treat all PR8 reports as capture evidence, not as promotion approval.
+9. Treat missing audit source as `FSC_PROVIDER_INDEPENDENT_BENCHMARK_NOT_AVAILABLE`; do not use
+   `benchmark_duration_below_minimum` as a global PR8 capture blocker.
 10. Use environment variables or external secret management for the NLN API key; do not store the
     key in repository files.
 
@@ -157,7 +164,7 @@ git diff --check
 ```
 
 Runtime proof is still in progress. Passing compile and unit checks does not prove provider
-coverage, 24h stability, audit overlap or FSC predictive value.
+completeness, long-run stability, audit overlap or FSC predictive value.
 
 ## Non-Goals
 
@@ -168,6 +175,8 @@ This ADR does not authorize:
 - active FSC size-down;
 - active FSC combo veto;
 - using FSC v2 as promotion-readiness evidence;
+- using the absence of an independent provider benchmark as a PR8 capture blocker;
+- using 24h duration as a blocker for fast-loop debugging or Phase 1 dataset path;
 - treating `UNKNOWN` funding as clean `0.0`;
 - treating neutral hubs as cabal sources;
 - treating Program Streams as R2 canonical market path;
@@ -179,17 +188,24 @@ This ADR does not authorize:
 
 FSC v2 cannot move beyond capture/evidence until all of the following are complete:
 
-1. Minimum 24h PR8 run completes without unacceptable stream stalls, queue drops or process
-   instability.
-2. Provider benchmark includes a valid external audit source.
-3. `system.transfers`, `pumpfun.trade` and `pumpfun.create` coverage are measured and reported.
-4. Decision-time FSC and eventual FSC are compared.
-5. Same-slot unorderable rate is quantified.
-6. Unknown, neutral and low-confidence rates are quantified.
-7. Baseline offline ablation proves `baseline_core + FSC v2` improves holdout R1/R2 outcomes
+1. `FSC_PR8_CANARY_CAPTURE_PASS`: 30-60 minute canary has live trade rows, transfer rows, decision
+   rows and FSC v2 snapshots.
+2. `FSC_CONFIG_PLUMBING_PASS`: runtime evidence reports the configured TTL, attribution dust,
+   relative-to-buy threshold and confidence threshold.
+3. `FSC_RAW_FAILURE_CAPTURE_PASS`: raw Program Stream artifacts are written before normalization and
+   normalization failures are captured separately.
+4. `FSC_LANE_HEALTH_PASS`: funding watermark, lag, stream epoch, dropped events and gap state are
+   reported from runtime state rather than placeholders.
+5. `FSC_UNKNOWN_REASON_REPORT_PASS`: unknown, neutral, low-confidence and ordering reasons are
+   quantified.
+6. `FSC_NLN_NATIVE_JOIN_SANITY_PASS`: NLN-native trade/transfer join sanity is reported.
+7. `FSC_ACTIVE_POLICY_OFF`: active FSC scoring and hard reject remain disabled.
+8. `FSC_PROVIDER_BENCHMARK_NOT_AVAILABLE_OR_NOT_CLAIMED`: no independent provider-completeness
+   claim is made without an external audit feed.
+9. Baseline offline ablation proves `baseline_core + FSC v2` improves holdout R1/R2 outcomes
    without dishonest denominator shrinkage.
-8. Shadow counterfactual policy impact is measured.
-9. A separate ADR explicitly authorizes any future `fsc_v2.decision_enabled=true` mode.
+10. Shadow counterfactual policy impact is measured.
+11. A separate ADR explicitly authorizes any future `fsc_v2.decision_enabled=true` mode.
 
 Until then, the correct operational mode is:
 

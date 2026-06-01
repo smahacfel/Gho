@@ -4,7 +4,11 @@ set -u
 ROOT="${ROOT:-/root/Gho}"
 SCOPE="${1:-shadow-burnin-v3-fsc-capture-nln-r1}"
 INTERVAL_SECONDS="${FSC_PR8_BUILDER_INTERVAL_SECONDS:-300}"
-MIN_BENCHMARK_HOURS="${FSC_PR8_MIN_BENCHMARK_HOURS:-24}"
+CANARY_MINUTES="${FSC_PR8_CANARY_MINUTES:-45}"
+REQUIRE_EXTERNAL_AUDIT="${FSC_PR8_REQUIRE_EXTERNAL_AUDIT:-0}"
+MIN_BENCHMARK_HOURS="${FSC_PR8_MIN_BENCHMARK_HOURS:-0}"
+MIN_AUDIT_SLOTS="${FSC_PR8_MIN_AUDIT_SLOTS:-1000}"
+MIN_AUDIT_TRANSFER_EVENTS="${FSC_PR8_MIN_AUDIT_TRANSFER_EVENTS:-10000}"
 
 CAPTURE_DIR="${ROOT}/logs/nln_capture/${SCOPE}"
 DECISION_ROOT="${ROOT}/logs/rollout/${SCOPE}/decisions/${SCOPE}"
@@ -22,9 +26,13 @@ while true; do
     --scope "${SCOPE}"
     --root "${ROOT}"
     --min-benchmark-hours "${MIN_BENCHMARK_HOURS}"
+    --min-audit-slots "${MIN_AUDIT_SLOTS}"
+    --min-audit-transfer-events "${MIN_AUDIT_TRANSFER_EVENTS}"
+    --canary-minutes "${CANARY_MINUTES}"
     --nln-create "${CAPTURE_DIR}/pumpfun_create_raw_v1.jsonl"
     --nln-trade "${CAPTURE_DIR}/pumpfun_trade_raw_v1.jsonl"
     --nln-transfer "${CAPTURE_DIR}/system_transfers_raw_v1.jsonl"
+    --nln-normalization-error "${CAPTURE_DIR}/nln_normalization_errors_v1.jsonl"
   )
 
   for decision_log in "${DECISION_LOGS[@]}"; do
@@ -38,6 +46,23 @@ while true; do
         CMD+=(--audit-event "${audit_path}")
       fi
     done
+  elif [[ "${REQUIRE_EXTERNAL_AUDIT}" == "1" ]]; then
+    printf '%s status=2 scope=%s interval_seconds=%s canary_minutes=%s reason=missing_required_external_audit\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      "${SCOPE}" \
+      "${INTERVAL_SECONDS}" \
+      "${CANARY_MINUTES}" >"${REPORT_DIR}/fsc_provider_qualification_builder_status.txt"
+    sleep "${INTERVAL_SECONDS}"
+    continue
+  fi
+
+  if [[ -n "${FSC_PR8_EVENTUAL_FSC_SNAPSHOT_PATH:-}" ]]; then
+    IFS=':' read -r -a EVENTUAL_PATHS <<< "${FSC_PR8_EVENTUAL_FSC_SNAPSHOT_PATH}"
+    for eventual_path in "${EVENTUAL_PATHS[@]}"; do
+      if [[ -n "${eventual_path}" ]]; then
+        CMD+=(--eventual-fsc-snapshot "${eventual_path}")
+      fi
+    done
   fi
 
   TMP_JSON="${REPORT_DIR}/fsc_provider_qualification_manifest_last.json.tmp"
@@ -48,12 +73,16 @@ while true; do
   "${CMD[@]}" --json >"${TMP_JSON}" 2>"${LAST_STDERR}"
   STATUS=$?
   mv "${TMP_JSON}" "${LAST_JSON}"
-  printf '%s status=%s scope=%s interval_seconds=%s min_benchmark_hours=%s\n' \
+  printf '%s status=%s scope=%s interval_seconds=%s canary_minutes=%s require_external_audit=%s min_benchmark_hours=%s min_audit_slots=%s min_audit_transfer_events=%s\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     "${STATUS}" \
     "${SCOPE}" \
     "${INTERVAL_SECONDS}" \
-    "${MIN_BENCHMARK_HOURS}" >"${LAST_STATUS}"
+    "${CANARY_MINUTES}" \
+    "${REQUIRE_EXTERNAL_AUDIT}" \
+    "${MIN_BENCHMARK_HOURS}" \
+    "${MIN_AUDIT_SLOTS}" \
+    "${MIN_AUDIT_TRANSFER_EVENTS}" >"${LAST_STATUS}"
 
   sleep "${INTERVAL_SECONDS}"
 done
