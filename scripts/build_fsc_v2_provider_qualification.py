@@ -14,6 +14,7 @@ import json
 import math
 import os
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -22,9 +23,51 @@ import selector_pipeline_common as common
 
 NLN_PROVIDER = "NLN"
 NATIVE_SOL_TOKEN_ADDRESS = "solana"
-DEFAULT_MIN_BENCHMARK_HOURS = 24.0
+DEFAULT_MIN_BENCHMARK_HOURS = 0.0
 DEFAULT_CANARY_MINUTES = 45.0
 SAMPLED_BLOCK_AUDIT_MODE = "sampled_block_audit"
+LAMPORTS_PER_SOL = 1_000_000_000
+FSC_PARAMETER_GRID_TTL_SECONDS = [180, 300, 600]
+FSC_PARAMETER_GRID_GLOBAL_RECIPIENT_CAPS = [13_000, 50_000, 100_000]
+FSC_PARAMETER_GRID_STORE_DUST_LAMPORTS = [1_000_000]
+FSC_PARAMETER_GRID_ATTRIBUTION_ABS_LAMPORTS = [5_000_000, 10_000_000, 50_000_000]
+FSC_PARAMETER_GRID_REL_TO_BUY = [0.0, 0.10, 0.20]
+
+FSC_NO_RETAINED_RECIPIENT_HISTORY_REASON = "FSC_NO_RETAINED_RECIPIENT_HISTORY"
+FSC_FUNDING_STREAM_UNAVAILABLE_REASON = "FSC_FUNDING_STREAM_UNAVAILABLE"
+FSC_ROLLING_STATE_UNAVAILABLE_REASON = "FSC_ROLLING_STATE_UNAVAILABLE"
+FSC_INSUFFICIENT_KNOWN_SOURCES_REASON = "FSC_INSUFFICIENT_KNOWN_SOURCES"
+FSC_SAME_SLOT_ORDERING_UNAVAILABLE_REASON = "FSC_SAME_SLOT_ORDERING_UNAVAILABLE"
+FSC_LOW_ATTRIBUTION_CONFIDENCE_REASON = "FSC_LOW_ATTRIBUTION_CONFIDENCE"
+FSC_ABS_ATTRIBUTION_TOO_SMALL_REASON = "FSC_ABS_ATTRIBUTION_TOO_SMALL"
+FSC_RELATIVE_FUNDING_TOO_SMALL_REASON = "FSC_RELATIVE_FUNDING_TOO_SMALL"
+FSC_NO_PREBUY_TRANSFER_IN_WINDOW_REASON = "FSC_NO_PREBUY_TRANSFER_IN_WINDOW"
+
+
+@dataclass(frozen=True)
+class NlnBuy:
+    buyer: str
+    mint: str | None
+    amount_lamports: int
+    slot: int | None
+    tx_index: int | None
+    instruction_index: int | None
+    signature: str | None
+    event_ts_ms: int | None
+    order_key: tuple[int, int, int, str]
+
+
+@dataclass(frozen=True)
+class NlnTransfer:
+    from_wallet: str
+    to_wallet: str
+    amount_lamports: int
+    slot: int | None
+    tx_index: int | None
+    instruction_index: int | None
+    signature: str | None
+    event_ts_ms: int | None
+    order_key: tuple[int, int, int, str]
 
 
 def rows_from_paths(paths: list[Path]) -> list[dict[str, Any]]:
@@ -287,10 +330,33 @@ def funding_event_row(row: dict[str, Any], *, provider_topic: str) -> dict[str, 
     }
 
 
+def nested_dict(row: dict[str, Any], path: list[str]) -> dict[str, Any] | None:
+    current: Any = row
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current if isinstance(current, dict) else None
+
+
+def funding_source_diagnostics(row: dict[str, Any]) -> dict[str, Any] | None:
+    for path in (
+        ["funding_source_diagnostics"],
+        ["sybil_resistance", "funding_source_diagnostics"],
+        ["materialized", "sybil_resistance", "funding_source_diagnostics"],
+        ["features", "sybil_resistance", "funding_source_diagnostics"],
+    ):
+        diagnostics = nested_dict(row, path)
+        if diagnostics is not None:
+            return diagnostics
+    return None
+
+
 def fsc_snapshot_row(row: dict[str, Any]) -> dict[str, Any] | None:
     fsc = row.get("funding_source_v2")
     if not isinstance(fsc, dict):
         return None
+    diagnostics = funding_source_diagnostics(row)
     candidate_id = string_value(row, "candidate_id", "execution_candidate_id", "join_key")
     mint = string_value(row, "base_mint", "mint_id", "token_mint")
     cutoff_ts = int_value(row, "decision_ts_ms", "decision_timestamp_ms", "timestamp", "ts_ms")
@@ -336,6 +402,7 @@ def fsc_snapshot_row(row: dict[str, Any]) -> dict[str, Any] | None:
         "fsc_last_transfer_recv_ts_ms": fsc.get("last_transfer_recv_ts_ms"),
         "fsc_last_reconnect_ts_ms": fsc.get("last_reconnect_ts_ms"),
         "fsc_dropped_events": fsc.get("dropped_events"),
+        "raw_funding_source_diagnostics": diagnostics,
         "raw_fsc_v2": fsc,
     }
 
@@ -434,6 +501,139 @@ def build_fsc_coverage_report(rows: list[dict[str, Any]], *, decision_rows: int)
             ),
         },
         "guardrail": "UNKNOWN and NEUTRAL are reported separately and are not treated as clean zero FSC.",
+    }
+
+
+def excluded_reason_to_miss_reason(reason: str | None) -> str:
+    normalized = (reason or "").strip().lower()
+    return {
+        "funding_lane_unavailable": FSC_FUNDING_STREAM_UNAVAILABLE_REASON,
+        "index_cold": FSC_ROLLING_STATE_UNAVAILABLE_REASON,
+        "no_buyer_cohort": FSC_INSUFFICIENT_KNOWN_SOURCES_REASON,
+        "insufficient_non_neutral_support": FSC_INSUFFICIENT_KNOWN_SOURCES_REASON,
+        "low_coverage": FSC_INSUFFICIENT_KNOWN_SOURCES_REASON,
+        "neutral_only": FSC_INSUFFICIENT_KNOWN_SOURCES_REASON,
+        "same_slot_ordering_unavailable": FSC_SAME_SLOT_ORDERING_UNAVAILABLE_REASON,
+        "low_attribution_confidence": FSC_LOW_ATTRIBUTION_CONFIDENCE_REASON,
+    }.get(normalized, FSC_NO_RETAINED_RECIPIENT_HISTORY_REASON)
+
+
+def add_reason_count(counter: Counter[str], reason: str, count: int | None) -> None:
+    if count is not None and count > 0:
+        counter[reason] += int(count)
+
+
+def build_fsc_unknown_reason_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    reason_counts: Counter[str] = Counter()
+    class_counts: Counter[str] = Counter()
+    buyer_sample_count = 0
+    known_source_count = 0
+    unknown_buyer_count = 0
+    structural_unknown_count = 0
+    operational_unknown_count = 0
+    indeterminate_unknown_count = 0
+    diagnostics_rows = 0
+
+    for row in rows:
+        diagnostics = row.get("raw_funding_source_diagnostics")
+        if isinstance(diagnostics, dict):
+            diagnostics_rows += 1
+            buyer_sample_count += int_value(diagnostics, "buyer_sample_count") or 0
+            known_source_count += int_value(diagnostics, "known_source_count") or 0
+            unknown_buyer_count += int_value(diagnostics, "unknown_buyer_count") or 0
+            structural_unknown_count += (
+                int_value(diagnostics, "structural_unknown_buyer_count") or 0
+            )
+            operational_unknown_count += (
+                int_value(diagnostics, "operational_unknown_buyer_count") or 0
+            )
+            indeterminate_unknown_count += (
+                int_value(diagnostics, "indeterminate_unknown_buyer_count") or 0
+            )
+            miss_counts = diagnostics.get("miss_reason_counts")
+            used_miss_counts = False
+            if isinstance(miss_counts, list):
+                for entry in miss_counts:
+                    if not isinstance(entry, dict):
+                        continue
+                    reason = string_value(entry, "reason")
+                    count = int_value(entry, "count")
+                    miss_class = string_value(entry, "class") or "unknown"
+                    if reason and count:
+                        reason_counts[reason] += count
+                        class_counts[miss_class] += count
+                        used_miss_counts = True
+            if not used_miss_counts:
+                add_reason_count(
+                    reason_counts,
+                    excluded_reason_to_miss_reason(
+                        common.str_or_none(row.get("fsc_excluded_reason"))
+                    ),
+                    int_value(diagnostics, "unknown_buyer_count") or 0,
+                )
+            continue
+
+        total = int(row.get("fsc_total_buyers") or 0)
+        known = int(row.get("fsc_known_buyers") or 0)
+        unknown = int(row.get("fsc_unknown_count") or 0)
+        buyer_sample_count += total
+        known_source_count += known
+        unknown_buyer_count += unknown
+
+        same_slot = int(row.get("fsc_same_slot_unorderable_count") or 0)
+        low_confidence = int(row.get("fsc_low_confidence_count") or 0)
+        raw_fsc = row.get("raw_fsc_v2") if isinstance(row.get("raw_fsc_v2"), dict) else {}
+        rel_too_small = int(raw_fsc.get("rel_too_small_count") or 0)
+        dust_filtered = int(raw_fsc.get("dust_filtered_count") or 0)
+        post_buy_filtered = int(raw_fsc.get("post_buy_filtered_count") or 0)
+
+        add_reason_count(reason_counts, FSC_SAME_SLOT_ORDERING_UNAVAILABLE_REASON, same_slot)
+        add_reason_count(reason_counts, FSC_LOW_ATTRIBUTION_CONFIDENCE_REASON, low_confidence)
+        add_reason_count(reason_counts, FSC_RELATIVE_FUNDING_TOO_SMALL_REASON, rel_too_small)
+        add_reason_count(reason_counts, FSC_ABS_ATTRIBUTION_TOO_SMALL_REASON, dust_filtered)
+        add_reason_count(reason_counts, FSC_NO_PREBUY_TRANSFER_IN_WINDOW_REASON, post_buy_filtered)
+
+        explained = same_slot + low_confidence + rel_too_small + dust_filtered + post_buy_filtered
+        remaining_unknown = max(0, unknown - explained)
+        add_reason_count(
+            reason_counts,
+            excluded_reason_to_miss_reason(common.str_or_none(row.get("fsc_excluded_reason"))),
+            remaining_unknown,
+        )
+
+    top_reason = reason_counts.most_common(1)[0][0] if reason_counts else None
+    if top_reason == FSC_NO_RETAINED_RECIPIENT_HISTORY_REASON:
+        interpretation = "Most buyers have no retained direct native-SOL inbound transfer in the active FSC window."
+    elif top_reason == FSC_FUNDING_STREAM_UNAVAILABLE_REASON:
+        interpretation = "Funding lane was unavailable for the dominant share of unresolved FSC buyer samples."
+    elif top_reason == FSC_ROLLING_STATE_UNAVAILABLE_REASON:
+        interpretation = "Funding lane/index was still cold for the dominant share of unresolved FSC buyer samples."
+    elif top_reason == FSC_SAME_SLOT_ORDERING_UNAVAILABLE_REASON:
+        interpretation = "Strict same-slot ordering could not prove transfer-before-buy for many buyer samples."
+    elif top_reason == FSC_LOW_ATTRIBUTION_CONFIDENCE_REASON:
+        interpretation = "Funding attribution was ambiguous between competing inbound sources."
+    else:
+        interpretation = "Unresolved FSC buyer samples are diagnostic; low coverage is not treated as clean zero FSC."
+
+    return {
+        "selector_schema_version": common.SCHEMA_VERSION,
+        "artifact": "fsc_unknown_reason_v2",
+        "status": "PASS" if rows else "NO-GO",
+        "buyer_sample_count": buyer_sample_count,
+        "known_source_count": known_source_count,
+        "known_rate": (known_source_count / buyer_sample_count) if buyer_sample_count else None,
+        "unknown_buyer_count": unknown_buyer_count,
+        "unknown_rate": (unknown_buyer_count / buyer_sample_count) if buyer_sample_count else None,
+        "structural_unknown_buyer_count": structural_unknown_count,
+        "operational_unknown_buyer_count": operational_unknown_count,
+        "indeterminate_unknown_buyer_count": indeterminate_unknown_count,
+        "diagnostics_rows": diagnostics_rows,
+        "fallback_derived_rows": max(0, len(rows) - diagnostics_rows),
+        "reason_counts": common.counter_dict(reason_counts),
+        "class_counts": common.counter_dict(class_counts),
+        "top_reason": top_reason,
+        "interpretation": interpretation,
+        "low_coverage_blocks_capture": False,
     }
 
 
@@ -913,6 +1113,327 @@ def numeric_delta(left: Any, right: Any) -> float | None:
     return left_f - right_f
 
 
+def event_order_key(row: dict[str, Any]) -> tuple[int, int, int, str]:
+    return (
+        int_value(row, "slot") if int_value(row, "slot") is not None else 2**63 - 1,
+        int_value(row, "tx_index", "txIndex")
+        if int_value(row, "tx_index", "txIndex") is not None
+        else 2**31 - 1,
+        int_value(row, "instruction_index", "instructionIndex", "outer_instruction_index")
+        if int_value(row, "instruction_index", "instructionIndex", "outer_instruction_index")
+        is not None
+        else 2**31 - 1,
+        string_value(row, "signature", "tx_signature") or "",
+    )
+
+
+def nln_trade_is_buy(row: dict[str, Any]) -> bool:
+    is_buy = first_value(row, ["is_buy", "isBuy"])
+    if isinstance(is_buy, bool):
+        return is_buy
+    if isinstance(is_buy, str) and is_buy.strip().lower() in {"true", "1", "yes"}:
+        return True
+    side = (string_value(row, "ix_name", "ixName", "side") or "").strip().lower()
+    return side.startswith("buy")
+
+
+def parse_nln_buy(row: dict[str, Any]) -> NlnBuy | None:
+    if not nln_trade_is_buy(row):
+        return None
+    buyer = string_value(row, "user", "buyer", "signer")
+    if not buyer:
+        return None
+    amount = int_value(row, "sol_amount", "solAmount", "sol_amount_lamports", "max_sol_cost") or 0
+    return NlnBuy(
+        buyer=buyer,
+        mint=string_value(row, "mint", "base_mint", "token_mint"),
+        amount_lamports=amount,
+        slot=int_value(row, "slot"),
+        tx_index=int_value(row, "tx_index", "txIndex"),
+        instruction_index=int_value(row, "instruction_index", "instructionIndex", "outer_instruction_index"),
+        signature=string_value(row, "signature", "tx_signature"),
+        event_ts_ms=event_ts_ms(row),
+        order_key=event_order_key(row),
+    )
+
+
+def parse_nln_transfer(row: dict[str, Any]) -> NlnTransfer | None:
+    token_address = string_value(row, "token_address", "tokenAddress")
+    if token_address != NATIVE_SOL_TOKEN_ADDRESS:
+        return None
+    from_wallet = string_value(row, "from_wallet", "fromWallet", "source_wallet", "from")
+    to_wallet = string_value(row, "to_wallet", "toWallet", "recipient_wallet", "to")
+    amount = int_value(row, "amount", "amount_lamports", "lamports")
+    if not from_wallet or not to_wallet or amount is None:
+        return None
+    return NlnTransfer(
+        from_wallet=from_wallet,
+        to_wallet=to_wallet,
+        amount_lamports=amount,
+        slot=int_value(row, "slot"),
+        tx_index=int_value(row, "tx_index", "txIndex"),
+        instruction_index=int_value(row, "instruction_index", "instructionIndex", "outer_instruction_index"),
+        signature=string_value(row, "signature", "tx_signature"),
+        event_ts_ms=event_ts_ms(row),
+        order_key=event_order_key(row),
+    )
+
+
+def first_buys_by_mint_buyer(trade_rows: list[dict[str, Any]]) -> dict[tuple[str | None, str], NlnBuy]:
+    first: dict[tuple[str | None, str], NlnBuy] = {}
+    for row in trade_rows:
+        buy = parse_nln_buy(row)
+        if buy is None:
+            continue
+        key = (buy.mint, buy.buyer)
+        current = first.get(key)
+        if current is None or buy.order_key < current.order_key:
+            first[key] = buy
+    return first
+
+
+def native_transfers_by_recipient(
+    transfer_rows: list[dict[str, Any]],
+    *,
+    global_recipient_cap: int | None,
+) -> tuple[dict[str, list[NlnTransfer]], int, int]:
+    transfers = [transfer for row in transfer_rows if (transfer := parse_nln_transfer(row)) is not None]
+    last_order_by_recipient: dict[str, tuple[int, int, int, str]] = {}
+    for transfer in transfers:
+        current = last_order_by_recipient.get(transfer.to_wallet)
+        if current is None or transfer.order_key > current:
+            last_order_by_recipient[transfer.to_wallet] = transfer.order_key
+    retained_recipients: set[str] | None = None
+    evicted_recipient_count = 0
+    if global_recipient_cap is not None and len(last_order_by_recipient) > global_recipient_cap:
+        retained_recipients = {
+            recipient
+            for recipient, _ in sorted(
+                last_order_by_recipient.items(),
+                key=lambda item: item[1],
+                reverse=True,
+            )[:global_recipient_cap]
+        }
+        evicted_recipient_count = len(last_order_by_recipient) - len(retained_recipients)
+    by_recipient: dict[str, list[NlnTransfer]] = defaultdict(list)
+    for transfer in transfers:
+        if retained_recipients is not None and transfer.to_wallet not in retained_recipients:
+            continue
+        by_recipient[transfer.to_wallet].append(transfer)
+    for recipient in by_recipient:
+        by_recipient[recipient].sort(key=lambda transfer: transfer.order_key)
+    return by_recipient, len(transfers), evicted_recipient_count
+
+
+def transfer_precedes_buy(transfer: NlnTransfer, buy: NlnBuy) -> bool | None:
+    if transfer.slot is not None and buy.slot is not None:
+        if transfer.slot < buy.slot:
+            return True
+        if transfer.slot > buy.slot:
+            return False
+        if transfer.tx_index is not None and buy.tx_index is not None:
+            return transfer.tx_index < buy.tx_index
+        if (
+            transfer.signature
+            and buy.signature
+            and transfer.signature == buy.signature
+            and transfer.instruction_index is not None
+            and buy.instruction_index is not None
+        ):
+            return transfer.instruction_index < buy.instruction_index
+        return None
+    return None
+
+
+def nln_native_join_summary(
+    *,
+    trade_rows: list[dict[str, Any]],
+    transfer_rows: list[dict[str, Any]],
+    ttl_seconds: int,
+    min_abs_attribution_lamports: int,
+    min_rel_to_buy: float,
+    global_recipient_cap: int | None,
+) -> dict[str, Any]:
+    buys = first_buys_by_mint_buyer(trade_rows)
+    transfers_by_recipient, native_transfer_count, evicted_recipient_count = native_transfers_by_recipient(
+        transfer_rows,
+        global_recipient_cap=global_recipient_cap,
+    )
+    known_buyers = 0
+    no_history = 0
+    same_slot_unorderable = 0
+    timestamp_unverifiable = 0
+    no_prebuy = 0
+    ttl_filtered = 0
+    abs_too_small = 0
+    rel_too_small = 0
+    top_sources: Counter[str] = Counter()
+
+    for buy in buys.values():
+        history = transfers_by_recipient.get(buy.buyer) or []
+        if not history:
+            no_history += 1
+            continue
+        valid_source_seen = False
+        ordered_candidate_seen = False
+        ttl_candidate_seen = False
+        amount_candidate_seen = False
+        unorderable_for_buy = False
+        ts_missing_for_buy = False
+        for transfer in history:
+            precedes = transfer_precedes_buy(transfer, buy)
+            if precedes is None:
+                unorderable_for_buy = True
+                continue
+            if not precedes:
+                continue
+            ordered_candidate_seen = True
+            if buy.event_ts_ms is None or transfer.event_ts_ms is None:
+                ts_missing_for_buy = True
+                continue
+            if transfer.event_ts_ms < buy.event_ts_ms - ttl_seconds * 1000:
+                continue
+            ttl_candidate_seen = True
+            rel_floor = int(math.ceil(float(buy.amount_lamports) * min_rel_to_buy))
+            if transfer.amount_lamports < min_abs_attribution_lamports:
+                abs_too_small += 1
+                continue
+            if transfer.amount_lamports < rel_floor:
+                rel_too_small += 1
+                continue
+            amount_candidate_seen = True
+            valid_source_seen = True
+            top_sources[transfer.from_wallet] += 1
+        if valid_source_seen:
+            known_buyers += 1
+        elif unorderable_for_buy and not ordered_candidate_seen:
+            same_slot_unorderable += 1
+        elif ts_missing_for_buy and ordered_candidate_seen:
+            timestamp_unverifiable += 1
+        elif not ordered_candidate_seen:
+            no_prebuy += 1
+        elif not ttl_candidate_seen:
+            ttl_filtered += 1
+        elif not amount_candidate_seen:
+            pass
+
+    total_buyers = len(buys)
+    return {
+        "ttl_seconds": ttl_seconds,
+        "global_recipient_cap": global_recipient_cap,
+        "min_abs_attribution_lamports": min_abs_attribution_lamports,
+        "min_rel_to_buy": min_rel_to_buy,
+        "total_buyers": total_buyers,
+        "native_transfer_rows": native_transfer_count,
+        "known_buyers": known_buyers,
+        "known_rate": (known_buyers / total_buyers) if total_buyers else None,
+        "unknown_buyer_count": max(0, total_buyers - known_buyers),
+        "no_retained_recipient_history_count": no_history,
+        "same_slot_unorderable_count": same_slot_unorderable,
+        "timestamp_unverifiable_count": timestamp_unverifiable,
+        "no_prebuy_transfer_in_window_count": no_prebuy,
+        "ttl_filtered_count": ttl_filtered,
+        "abs_too_small_count": abs_too_small,
+        "rel_too_small_count": rel_too_small,
+        "global_recipient_evicted_count": evicted_recipient_count,
+        "top_funder": top_sources.most_common(1)[0][0] if top_sources else None,
+        "top_funder_count": top_sources.most_common(1)[0][1] if top_sources else 0,
+    }
+
+
+def build_fsc_parameter_grid_report(
+    *,
+    trade_rows: list[dict[str, Any]],
+    transfer_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    variants = []
+    for ttl_seconds in FSC_PARAMETER_GRID_TTL_SECONDS:
+        for global_cap in FSC_PARAMETER_GRID_GLOBAL_RECIPIENT_CAPS:
+            for store_dust in FSC_PARAMETER_GRID_STORE_DUST_LAMPORTS:
+                for min_abs in FSC_PARAMETER_GRID_ATTRIBUTION_ABS_LAMPORTS:
+                    for rel_to_buy in FSC_PARAMETER_GRID_REL_TO_BUY:
+                        summary = nln_native_join_summary(
+                            trade_rows=trade_rows,
+                            transfer_rows=transfer_rows,
+                            ttl_seconds=ttl_seconds,
+                            min_abs_attribution_lamports=min_abs,
+                            min_rel_to_buy=rel_to_buy,
+                            global_recipient_cap=global_cap,
+                        )
+                        summary["min_abs_store_lamports"] = store_dust
+                        variants.append(summary)
+    best = max(
+        variants,
+        key=lambda row: row.get("known_rate") if row.get("known_rate") is not None else -1.0,
+        default=None,
+    )
+    baseline = next(
+        (
+            row
+            for row in variants
+            if row["ttl_seconds"] == 300
+            and row["global_recipient_cap"] == 100_000
+            and row["min_abs_attribution_lamports"] == 10_000_000
+            and row["min_rel_to_buy"] == 0.20
+        ),
+        None,
+    )
+    return {
+        "selector_schema_version": common.SCHEMA_VERSION,
+        "artifact": "fsc_parameter_grid_v1",
+        "status": "PASS" if trade_rows and transfer_rows else "NO-GO",
+        "variant_count": len(variants),
+        "ttl_seconds_grid": FSC_PARAMETER_GRID_TTL_SECONDS,
+        "global_recipient_cap_grid": FSC_PARAMETER_GRID_GLOBAL_RECIPIENT_CAPS,
+        "min_abs_store_lamports_grid": FSC_PARAMETER_GRID_STORE_DUST_LAMPORTS,
+        "min_abs_attribution_lamports_grid": FSC_PARAMETER_GRID_ATTRIBUTION_ABS_LAMPORTS,
+        "min_rel_to_buy_grid": FSC_PARAMETER_GRID_REL_TO_BUY,
+        "baseline_variant": baseline,
+        "best_known_rate_variant": best,
+        "variants": variants,
+        "purpose": "Diagnostic-only NLN-native sensitivity grid; it does not tune active Gatekeeper policy.",
+    }
+
+
+def build_nln_native_fsc_join_sanity_report(
+    *,
+    trade_rows: list[dict[str, Any]],
+    transfer_rows: list[dict[str, Any]],
+    fsc_coverage: dict[str, Any],
+) -> dict[str, Any]:
+    summary = nln_native_join_summary(
+        trade_rows=trade_rows,
+        transfer_rows=transfer_rows,
+        ttl_seconds=300,
+        min_abs_attribution_lamports=10_000_000,
+        min_rel_to_buy=0.20,
+        global_recipient_cap=100_000,
+    )
+    runtime_known_rate = fsc_coverage.get("known_non_neutral_rate")
+    nln_known_rate = summary.get("known_rate")
+    if isinstance(runtime_known_rate, (int, float)) and isinstance(nln_known_rate, (int, float)):
+        if nln_known_rate > runtime_known_rate * 2 and (nln_known_rate - runtime_known_rate) > 0.02:
+            interpretation = "NLN-native join sees materially higher funding coverage than runtime FSC; inspect buyer identity/session alignment."
+        elif nln_known_rate < 0.05 and runtime_known_rate < 0.05:
+            interpretation = "Both NLN-native and runtime FSC have low direct native-SOL coverage; likely market/single-hop limitation rather than only session alignment."
+        else:
+            interpretation = "NLN-native and runtime FSC coverage are broadly comparable for this capture sample."
+    else:
+        interpretation = "Join comparison is incomplete because at least one side lacks a known-rate denominator."
+    return {
+        "selector_schema_version": common.SCHEMA_VERSION,
+        "artifact": "nln_native_fsc_join_sanity_v1",
+        "status": "PASS" if trade_rows and transfer_rows else "NO-GO",
+        "runtime_session_fsc_known_rate": runtime_known_rate,
+        "runtime_session_total_buyers": fsc_coverage.get("total_buyers"),
+        "runtime_session_known_non_neutral_buyers": fsc_coverage.get("known_non_neutral_buyers"),
+        "nln_native_fsc_known_rate": nln_known_rate,
+        "nln_native_summary": summary,
+        "interpretation": interpretation,
+        "guardrail": "Diagnostic-only; does not claim provider completeness and does not enable FSC policy.",
+    }
+
+
 def file_provenance(path: Path | None) -> dict[str, Any]:
     if path is None:
         return {"path": None, "exists": False}
@@ -947,6 +1468,9 @@ def build_artifacts(args: argparse.Namespace) -> dict[str, Any]:
         "funding_events_v1": dataset_dir / "funding_events_v1.jsonl",
         "fsc_snapshots_v2": dataset_dir / "fsc_snapshots_v2.jsonl",
         "fsc_coverage_v2": report_dir / "fsc_coverage_v2.json",
+        "fsc_unknown_reason_v2": report_dir / "fsc_unknown_reason_v2.json",
+        "fsc_parameter_grid_v1": report_dir / "fsc_parameter_grid_v1.json",
+        "nln_native_fsc_join_sanity_v1": report_dir / "nln_native_fsc_join_sanity_v1.json",
         "nln_topic_liveness_v1": report_dir / "nln_topic_liveness_v1.json",
         "fsc_capture_canary_v1": report_dir / "fsc_capture_canary_v1.json",
         "nln_provider_benchmark_v1": report_dir / "nln_provider_benchmark_v1.json",
@@ -986,6 +1510,16 @@ def build_artifacts(args: argparse.Namespace) -> dict[str, Any]:
     common.write_jsonl(outputs["fsc_snapshots_v2"], fsc_rows)
 
     fsc_coverage = build_fsc_coverage_report(fsc_rows, decision_rows=len(decision_rows))
+    fsc_unknown_reason = build_fsc_unknown_reason_report(fsc_rows)
+    fsc_parameter_grid = build_fsc_parameter_grid_report(
+        trade_rows=trade_rows,
+        transfer_rows=transfer_rows,
+    )
+    nln_native_join_sanity = build_nln_native_fsc_join_sanity_report(
+        trade_rows=trade_rows,
+        transfer_rows=transfer_rows,
+        fsc_coverage=fsc_coverage,
+    )
     topic_liveness = build_topic_liveness_report(
         create_rows=create_rows,
         trade_rows=trade_rows,
@@ -1012,6 +1546,9 @@ def build_artifacts(args: argparse.Namespace) -> dict[str, Any]:
     )
     decision_vs_eventual = build_decision_time_vs_eventual(fsc_rows)
     common.write_json(outputs["fsc_coverage_v2"], fsc_coverage)
+    common.write_json(outputs["fsc_unknown_reason_v2"], fsc_unknown_reason)
+    common.write_json(outputs["fsc_parameter_grid_v1"], fsc_parameter_grid)
+    common.write_json(outputs["nln_native_fsc_join_sanity_v1"], nln_native_join_sanity)
     common.write_json(outputs["nln_topic_liveness_v1"], topic_liveness)
     common.write_json(outputs["fsc_capture_canary_v1"], capture_canary)
     common.write_json(outputs["nln_provider_benchmark_v1"], benchmark)
@@ -1019,6 +1556,9 @@ def build_artifacts(args: argparse.Namespace) -> dict[str, Any]:
 
     stage_reports = {
         "fsc_coverage_v2": fsc_coverage,
+        "fsc_unknown_reason_v2": fsc_unknown_reason,
+        "fsc_parameter_grid_v1": fsc_parameter_grid,
+        "nln_native_fsc_join_sanity_v1": nln_native_join_sanity,
         "nln_topic_liveness_v1": topic_liveness,
         "fsc_capture_canary_v1": capture_canary,
         "nln_provider_benchmark_v1": benchmark,
@@ -1026,6 +1566,9 @@ def build_artifacts(args: argparse.Namespace) -> dict[str, Any]:
     }
     blocking_stage_names = {
         "fsc_coverage_v2",
+        "fsc_unknown_reason_v2",
+        "fsc_parameter_grid_v1",
+        "nln_native_fsc_join_sanity_v1",
         "nln_topic_liveness_v1",
         "fsc_capture_canary_v1",
     }
@@ -1045,6 +1588,9 @@ def build_artifacts(args: argparse.Namespace) -> dict[str, Any]:
         "fsc_pr8_capture_canary": capture_canary.get("status"),
         "fsc_stream_integrity": topic_liveness.get("status"),
         "fsc_materialization": "PASS" if fsc_rows else "NO-GO",
+        "fsc_unknown_reason_report": fsc_unknown_reason.get("status"),
+        "fsc_parameter_grid": fsc_parameter_grid.get("status"),
+        "fsc_nln_native_join_sanity": nln_native_join_sanity.get("status"),
         "fsc_no_fake_zero": "PASS"
         if capture_canary.get("fake_zero_fsc_count") == 0
         else "NO-GO",
@@ -1067,6 +1613,9 @@ def build_artifacts(args: argparse.Namespace) -> dict[str, Any]:
         "fsc_pr8_capture_canary": component_statuses["fsc_pr8_capture_canary"],
         "fsc_stream_integrity": component_statuses["fsc_stream_integrity"],
         "fsc_materialization": component_statuses["fsc_materialization"],
+        "fsc_unknown_reason_report": component_statuses["fsc_unknown_reason_report"],
+        "fsc_parameter_grid": component_statuses["fsc_parameter_grid"],
+        "fsc_nln_native_join_sanity": component_statuses["fsc_nln_native_join_sanity"],
         "fsc_no_fake_zero": component_statuses["fsc_no_fake_zero"],
         "nln_trade_liveness": component_statuses["nln_trade_liveness"],
         "nln_transfer_liveness": component_statuses["nln_transfer_liveness"],

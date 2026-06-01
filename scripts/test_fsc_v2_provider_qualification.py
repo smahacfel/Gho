@@ -62,6 +62,10 @@ class FscV2ProviderQualificationTests(unittest.TestCase):
                     {
                         "topic": "prod.rpc.solana.pumpfun.trade",
                         "signature": "sig-trade",
+                        "mint": "mint1",
+                        "user": "buyer1",
+                        "ix_name": "buy",
+                        "sol_amount": "50000000",
                         "slot": "11",
                         "tx_index": "2",
                         "recv_ts_ms": "101000",
@@ -199,6 +203,9 @@ class FscV2ProviderQualificationTests(unittest.TestCase):
             funding = read_jsonl(dataset_dir / "funding_events_v1.jsonl")
             fsc_rows = read_jsonl(dataset_dir / "fsc_snapshots_v2.jsonl")
             coverage = read_json(report_dir / "fsc_coverage_v2.json")
+            unknown_reason = read_json(report_dir / "fsc_unknown_reason_v2.json")
+            parameter_grid = read_json(report_dir / "fsc_parameter_grid_v1.json")
+            join_sanity = read_json(report_dir / "nln_native_fsc_join_sanity_v1.json")
             benchmark = read_json(report_dir / "nln_provider_benchmark_v1.json")
             topic_liveness = read_json(report_dir / "nln_topic_liveness_v1.json")
             canary = read_json(report_dir / "fsc_capture_canary_v1.json")
@@ -216,6 +223,12 @@ class FscV2ProviderQualificationTests(unittest.TestCase):
         self.assertEqual(funding[0]["amount_lamports"], 20_000_000)
         self.assertEqual(fsc_rows[0]["fsc_count"], 1.0)
         self.assertEqual(coverage["status"], "PASS")
+        self.assertEqual(unknown_reason["status"], "PASS")
+        self.assertEqual(unknown_reason["unknown_buyer_count"], 0)
+        self.assertEqual(parameter_grid["status"], "PASS")
+        self.assertEqual(parameter_grid["baseline_variant"]["known_buyers"], 1)
+        self.assertEqual(join_sanity["status"], "PASS")
+        self.assertEqual(join_sanity["nln_native_summary"]["known_buyers"], 1)
         self.assertEqual(benchmark["status"], "PASS")
         self.assertEqual(benchmark["shared_event_keys"], 1)
         self.assertEqual(benchmark["audit_sampling_mode"], "sampled_block_audit")
@@ -243,6 +256,10 @@ class FscV2ProviderQualificationTests(unittest.TestCase):
                     {
                         "topic": "prod.rpc.solana.pumpfun.trade",
                         "signature": "sig-trade",
+                        "mint": "mint1",
+                        "user": "buyer1",
+                        "ix_name": "buy",
+                        "sol_amount": 50_000_000,
                         "slot": 2,
                         "tx_index": 0,
                         "recv_ts_ms": 2000,
@@ -311,6 +328,9 @@ class FscV2ProviderQualificationTests(unittest.TestCase):
                 root / "reports" / "selector" / "unit" / "nln_provider_benchmark_v1.json"
             )
             canary = read_json(root / "reports" / "selector" / "unit" / "fsc_capture_canary_v1.json")
+            unknown_reason = read_json(
+                root / "reports" / "selector" / "unit" / "fsc_unknown_reason_v2.json"
+            )
 
         self.assertEqual(manifest["status"], "PASS_FOR_PHASE1_EVIDENCE")
         self.assertEqual(manifest["provider_independent_benchmark"], "NOT_AVAILABLE")
@@ -319,6 +339,7 @@ class FscV2ProviderQualificationTests(unittest.TestCase):
         self.assertEqual(benchmark["fail_reasons"], [])
         self.assertFalse(benchmark["blocking"])
         self.assertEqual(canary["status"], "PASS")
+        self.assertEqual(unknown_reason["top_reason"], "FSC_INSUFFICIENT_KNOWN_SOURCES")
 
     def test_provider_benchmark_classifies_incomplete_transfer_key(self) -> None:
         self.assertIsNone(fscq.event_key({"signature": "sig"}))
