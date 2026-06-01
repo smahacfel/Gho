@@ -29,6 +29,34 @@ def read_json(path: Path) -> dict:
 
 
 class FscV2ProviderQualificationTests(unittest.TestCase):
+    def test_legitimate_zero_hhi_is_not_fake_zero(self) -> None:
+        legitimate_distinct_sources = {
+            "fsc_count": 0.0,
+            "fsc_status": "degraded",
+            "fsc_excluded_reason": "low_coverage",
+            "fsc_total_buyers": 7,
+            "fsc_unknown_count": 5,
+            "fsc_known_non_neutral_buyers": 2,
+            "raw_fsc_v2": {
+                "source_counts": [
+                    {"source": {"wallet": "source1"}, "count": 1},
+                    {"source": {"wallet": "source2"}, "count": 1},
+                ]
+            },
+        }
+        self.assertFalse(fscq.fake_zero_fsc_row(legitimate_distinct_sources))
+
+        unavailable_zero = {
+            "fsc_count": 0.0,
+            "fsc_status": "unavailable",
+            "fsc_excluded_reason": "index_cold",
+            "fsc_total_buyers": 3,
+            "fsc_unknown_count": 3,
+            "fsc_known_non_neutral_buyers": 0,
+            "raw_fsc_v2": {"source_counts": []},
+        }
+        self.assertTrue(fscq.fake_zero_fsc_row(unavailable_zero))
+
     def test_builds_required_artifacts_without_promoting_provider(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

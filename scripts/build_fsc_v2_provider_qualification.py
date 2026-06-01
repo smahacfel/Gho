@@ -32,6 +32,7 @@ FSC_PARAMETER_GRID_GLOBAL_RECIPIENT_CAPS = [13_000, 50_000, 100_000]
 FSC_PARAMETER_GRID_STORE_DUST_LAMPORTS = [1_000_000]
 FSC_PARAMETER_GRID_ATTRIBUTION_ABS_LAMPORTS = [5_000_000, 10_000_000, 50_000_000]
 FSC_PARAMETER_GRID_REL_TO_BUY = [0.0, 0.10, 0.20]
+FSC_V2_MIN_KNOWN_NON_NEUTRAL_BUYERS = 2
 
 FSC_NO_RETAINED_RECIPIENT_HISTORY_REASON = "FSC_NO_RETAINED_RECIPIENT_HISTORY"
 FSC_FUNDING_STREAM_UNAVAILABLE_REASON = "FSC_FUNDING_STREAM_UNAVAILABLE"
@@ -955,10 +956,26 @@ def fake_zero_fsc_row(row: dict[str, Any]) -> bool:
     if not isinstance(value, (int, float)) or float(value) != 0.0:
         return False
     status = str(row.get("fsc_status") or "").lower()
+    excluded_reason = str(row.get("fsc_excluded_reason") or "").lower()
     total_buyers = int(row.get("fsc_total_buyers") or 0)
     unknown = int(row.get("fsc_unknown_count") or 0)
     non_neutral = int(row.get("fsc_known_non_neutral_buyers") or 0)
-    return status != "clean" or (total_buyers > 0 and unknown >= total_buyers) or non_neutral < 2
+    raw_fsc = row.get("raw_fsc_v2") if isinstance(row.get("raw_fsc_v2"), dict) else {}
+    source_counts = raw_fsc.get("source_counts")
+    source_count_len = len(source_counts) if isinstance(source_counts, list) else 0
+    unavailable_reasons = {
+        "funding_lane_unavailable",
+        "index_cold",
+        "no_buyer_cohort",
+        "insufficient_non_neutral_support",
+    }
+    if status == "unavailable" or excluded_reason in unavailable_reasons:
+        return True
+    if total_buyers > 0 and unknown >= total_buyers:
+        return True
+    if non_neutral < FSC_V2_MIN_KNOWN_NON_NEUTRAL_BUYERS:
+        return True
+    return source_count_len < FSC_V2_MIN_KNOWN_NON_NEUTRAL_BUYERS
 
 
 def bool_flag(value: Any) -> bool:
