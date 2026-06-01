@@ -1840,6 +1840,7 @@ pub struct OracleRuntimeConfig {
     pub shadow_ledger_enrichment_freshness_ms: u64,
     pub session: SessionRuntimeConfig,
     pub tx_intelligence: TxIntelligenceRuntimeConfig,
+    pub funding_source_config: FundingSourceConfig,
     pub p37_shadow_probe: P37ShadowProbeConfig,
     pub run_id: Option<String>,
     pub session_id: Option<String>,
@@ -1884,6 +1885,9 @@ impl OracleRuntimeConfig {
             shadow_ledger_enrichment_freshness_ms,
             session: SessionRuntimeConfig::default(),
             tx_intelligence: TxIntelligenceRuntimeConfig::default(),
+            funding_source_config: FundingSourceConfig::from_gatekeeper_config(
+                &GatekeeperV2Config::default(),
+            ),
             p37_shadow_probe: P37ShadowProbeConfig::default(),
             run_id: None,
             session_id: None,
@@ -1899,6 +1903,9 @@ impl OracleRuntimeConfig {
             shadow_ledger_enrichment_freshness_ms: config.enrichment_freshness_ms,
             session: SessionRuntimeConfig::default(),
             tx_intelligence: TxIntelligenceRuntimeConfig::default(),
+            funding_source_config: FundingSourceConfig::from_gatekeeper_config(
+                &GatekeeperV2Config::default(),
+            ),
             p37_shadow_probe: P37ShadowProbeConfig::default(),
             run_id: None,
             session_id: None,
@@ -1955,6 +1962,9 @@ impl Default for OracleRuntimeConfig {
             shadow_ledger_enrichment_freshness_ms: DEFAULT_SHADOW_LEDGER_ENRICHMENT_FRESHNESS_MS,
             session: SessionRuntimeConfig::default(),
             tx_intelligence: TxIntelligenceRuntimeConfig::default(),
+            funding_source_config: FundingSourceConfig::from_gatekeeper_config(
+                &GatekeeperV2Config::default(),
+            ),
             p37_shadow_probe: P37ShadowProbeConfig::default(),
             run_id: None,
             session_id: None,
@@ -3442,6 +3452,7 @@ impl OracleRuntime {
                 registered_wall_ts_ms.saturating_add(self.config.session.max_observation_window_ms),
             ),
             gatekeeper_config: gatekeeper_config.clone(),
+            funding_source_config: self.config.funding_source_config.clone(),
             fingerprint_config: fingerprint_config.clone(),
         })
     }
@@ -22283,7 +22294,7 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
     let (result_tx, mut result_rx) =
         tokio::sync::mpsc::unbounded_channel::<PoolObservationResult>();
     let session_manager = oracle_runtime.session_manager();
-    let funding_source_config = FundingSourceConfig::from_gatekeeper_config(&gatekeeper_config);
+    let funding_source_config = oracle_runtime.config.funding_source_config.clone();
     apply_authoritative_funding_stream_availability(
         session_manager.as_ref(),
         authoritative_funding_stream_available,

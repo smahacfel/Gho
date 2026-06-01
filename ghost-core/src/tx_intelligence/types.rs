@@ -122,6 +122,15 @@ pub struct FundingSourceDiagnostics {
     /// Aggregated miss taxonomy counts for the buyer sample.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub miss_reason_counts: Vec<FundingSourceMissReasonCount>,
+    /// Transfer candidates below the configured absolute attribution floor.
+    #[serde(default)]
+    pub dust_filtered_count: u64,
+    /// Transfer candidates observed after the buyer's first buy.
+    #[serde(default)]
+    pub post_buy_filtered_count: u64,
+    /// Transfer candidates below the configured transfer-to-buy ratio.
+    #[serde(default)]
+    pub rel_too_small_count: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -275,6 +284,12 @@ pub struct FscV2Evidence {
     pub funding_lane_lag_slots: Option<i64>,
     pub stream_epoch: u64,
     pub gap_suspected: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_transfer_recv_ts_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_reconnect_ts_ms: Option<u64>,
+    #[serde(default)]
+    pub dropped_events: u64,
 
     pub min_abs_store_lamports: u64,
     pub min_abs_attribution_lamports: u64,
@@ -345,5 +360,7 @@ pub const FSC_LOOKBACK_WINDOW_EXHAUSTED_REASON: &str = "FSC_LOOKBACK_WINDOW_EXHA
 pub const FSC_NO_PREBUY_TRANSFER_IN_WINDOW_REASON: &str = "FSC_NO_PREBUY_TRANSFER_IN_WINDOW";
 pub const FSC_SAME_SLOT_ORDERING_UNAVAILABLE_REASON: &str = "FSC_SAME_SLOT_ORDERING_UNAVAILABLE";
 pub const FSC_LOW_ATTRIBUTION_CONFIDENCE_REASON: &str = "FSC_LOW_ATTRIBUTION_CONFIDENCE";
+pub const FSC_ABS_ATTRIBUTION_TOO_SMALL_REASON: &str = "FSC_ABS_ATTRIBUTION_TOO_SMALL";
+pub const FSC_RELATIVE_FUNDING_TOO_SMALL_REASON: &str = "FSC_RELATIVE_FUNDING_TOO_SMALL";
 pub const FSC_PER_RECIPIENT_HISTORY_OVERFLOW_REASON: &str = "FSC_PER_RECIPIENT_HISTORY_OVERFLOW";
 pub const FSC_GLOBAL_RECIPIENT_EVICTED_REASON: &str = "FSC_GLOBAL_RECIPIENT_EVICTED";

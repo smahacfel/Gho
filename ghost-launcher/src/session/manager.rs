@@ -1,6 +1,8 @@
 use super::observation::{PoolObservationSession, SharedSession};
 use crate::config::TxIntelligenceRuntimeConfig;
-use crate::tx_intelligence::{CrossPoolVelocityIndex, FundingSourceIndex, TxIntelligenceConfig};
+use crate::tx_intelligence::{
+    CrossPoolVelocityIndex, FundingSourceConfig, FundingSourceIndex, TxIntelligenceConfig,
+};
 use dashmap::DashMap;
 use ghost_brain::config::GatekeeperV2Config;
 use ghost_brain::fast_pipeline::EnhancedCandidate;
@@ -43,6 +45,7 @@ pub struct OpenSessionRequest {
     pub created_at_wall_ms: u64,
     pub deadline_wall_ms: Option<u64>,
     pub gatekeeper_config: GatekeeperV2Config,
+    pub funding_source_config: FundingSourceConfig,
     pub fingerprint_config: EarlyFingerprintConfig,
 }
 
@@ -130,6 +133,7 @@ impl SessionManager {
         );
         session.set_cross_pool_velocity_index(Arc::clone(&self.cross_pool_velocity_index));
         session.set_funding_source_index(Arc::clone(&self.funding_source_index));
+        session.set_funding_source_config(request.funding_source_config);
         session.set_checkpoint_interval_ms(self.config.checkpoint_interval_ms);
         let session = Arc::new(RwLock::new(session));
         self.sessions.insert(request.pool_amm_id, session);

@@ -1077,6 +1077,10 @@ impl PoolObservationSession {
         self.funding_source_index = index;
     }
 
+    pub fn set_funding_source_config(&mut self, config: FundingSourceConfig) {
+        self.funding_source_config = config;
+    }
+
     #[must_use]
     pub fn fingerprint_metrics(&self) -> Option<EarlyFingerprintMetrics> {
         self.tx_intelligence.fingerprint_metrics()

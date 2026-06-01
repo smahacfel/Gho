@@ -5,16 +5,17 @@ use crate::oracle_metrics::{
     record_fsc_lookup_hits, record_fsc_lookup_miss_reason, record_fsc_lookup_misses,
     record_fsc_prune_duration_ms, record_fsc_warmup_ready,
 };
-use ghost_brain::config::GatekeeperV2Config;
+use ghost_brain::config::{FscV2Config, GatekeeperV2Config};
 use ghost_core::tx_intelligence::types::{
     FscAttributionScope, FscEvidenceStatus, FscExcludedReason, FscMissClass, FscSnapshotMode,
     FscV2Evidence, FscVersion, FundingSourceCount, FundingSourceDiagnostics, FundingSourceKey,
-    FundingSourceMissReasonCount, FSC_BUYER_IDENTITY_UNAVAILABLE_REASON,
-    FSC_BUY_TIMESTAMP_UNAVAILABLE_REASON, FSC_FUNDING_STREAM_UNAVAILABLE_REASON,
-    FSC_GLOBAL_RECIPIENT_EVICTED_REASON, FSC_INSUFFICIENT_KNOWN_SOURCES_REASON,
-    FSC_LOOKBACK_WINDOW_EXHAUSTED_REASON, FSC_LOW_ATTRIBUTION_CONFIDENCE_REASON,
-    FSC_NO_PREBUY_TRANSFER_IN_WINDOW_REASON, FSC_NO_RETAINED_RECIPIENT_HISTORY_REASON,
-    FSC_PER_RECIPIENT_HISTORY_OVERFLOW_REASON, FSC_ROLLING_STATE_UNAVAILABLE_REASON,
+    FundingSourceMissReasonCount, FSC_ABS_ATTRIBUTION_TOO_SMALL_REASON,
+    FSC_BUYER_IDENTITY_UNAVAILABLE_REASON, FSC_BUY_TIMESTAMP_UNAVAILABLE_REASON,
+    FSC_FUNDING_STREAM_UNAVAILABLE_REASON, FSC_GLOBAL_RECIPIENT_EVICTED_REASON,
+    FSC_INSUFFICIENT_KNOWN_SOURCES_REASON, FSC_LOOKBACK_WINDOW_EXHAUSTED_REASON,
+    FSC_LOW_ATTRIBUTION_CONFIDENCE_REASON, FSC_NO_PREBUY_TRANSFER_IN_WINDOW_REASON,
+    FSC_NO_RETAINED_RECIPIENT_HISTORY_REASON, FSC_PER_RECIPIENT_HISTORY_OVERFLOW_REASON,
+    FSC_RELATIVE_FUNDING_TOO_SMALL_REASON, FSC_ROLLING_STATE_UNAVAILABLE_REASON,
     FSC_SAME_SLOT_ORDERING_UNAVAILABLE_REASON,
 };
 use parking_lot::RwLock;
@@ -30,28 +31,55 @@ const FSC_V2_MIN_KNOWN_NON_NEUTRAL_BUYERS: u64 = 2;
 const FSC_V2_MIN_KNOWN_COVERAGE: f64 = 0.50;
 const FSC_V2_MIN_NON_NEUTRAL_KNOWN_COVERAGE: f64 = 0.30;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FundingSourceConfig {
     pub lookback_window_ms: u64,
-    pub dust_threshold_lamports: u64,
+    pub min_abs_store_lamports: u64,
+    pub min_abs_attribution_lamports: u64,
+    pub min_rel_to_buy: f64,
     pub min_attribution_confidence_bps: u16,
     pub per_recipient_cap: usize,
     pub global_recipient_cap: usize,
+    pub neutral_funder_set_version: Option<String>,
     neutral_funding_sources: HashSet<String>,
 }
 
 impl FundingSourceConfig {
     #[must_use]
     pub fn from_gatekeeper_config(config: &GatekeeperV2Config) -> Self {
+        Self::from_configs(config, None)
+    }
+
+    #[must_use]
+    pub fn from_configs(config: &GatekeeperV2Config, fsc_v2: Option<&FscV2Config>) -> Self {
+        let lookback_window_ms = fsc_v2
+            .map(|fsc| fsc.lookback_window_s.saturating_mul(1_000).max(1))
+            .unwrap_or_else(|| {
+                config
+                    .funding_lookback_window_s
+                    .saturating_mul(1_000)
+                    .max(1)
+            });
+        let min_abs_store_lamports = fsc_v2
+            .map(|fsc| fsc.min_abs_store_lamports)
+            .unwrap_or(config.funding_dust_threshold_lamports);
+        let min_abs_attribution_lamports = fsc_v2
+            .map(|fsc| fsc.min_abs_attribution_lamports)
+            .unwrap_or(config.funding_dust_threshold_lamports);
+        let min_rel_to_buy = fsc_v2.map(|fsc| fsc.min_rel_to_buy).unwrap_or(0.0);
+        let min_attribution_confidence_bps = fsc_v2
+            .map(|fsc| unit_interval_to_bps(fsc.min_attribution_confidence))
+            .unwrap_or(6_000);
         Self {
-            lookback_window_ms: config
-                .funding_lookback_window_s
-                .saturating_mul(1_000)
-                .max(1),
-            dust_threshold_lamports: config.funding_dust_threshold_lamports,
-            min_attribution_confidence_bps: 6_000,
+            lookback_window_ms,
+            min_abs_store_lamports,
+            min_abs_attribution_lamports,
+            min_rel_to_buy,
+            min_attribution_confidence_bps,
             per_recipient_cap: config.fsc_per_recipient_cap.max(1),
             global_recipient_cap: config.fsc_global_recipient_cap.max(1),
+            neutral_funder_set_version: fsc_v2
+                .and_then(|fsc| fsc.neutral_funder_set_version.clone()),
             neutral_funding_sources: config
                 .neutral_funding_sources
                 .iter()
@@ -66,6 +94,13 @@ impl FundingSourceConfig {
     fn is_neutral_source(&self, wallet: &str) -> bool {
         self.neutral_funding_sources.contains(wallet)
     }
+}
+
+fn unit_interval_to_bps(value: f64) -> u16 {
+    if !value.is_finite() {
+        return 0;
+    }
+    (value.clamp(0.0, 1.0) * 10_000.0).round() as u16
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -123,6 +158,12 @@ struct FundingSourceInner {
     saw_transfer: bool,
     availability_controlled: bool,
     observed_funding_lane_kinds: HashSet<String>,
+    funding_lane_watermark_slot: Option<u64>,
+    last_transfer_recv_ts_ms: Option<u64>,
+    last_reconnect_ts_ms: Option<u64>,
+    stream_epoch: u64,
+    gap_suspected: bool,
+    dropped_events: u64,
 }
 
 #[derive(Debug, Default)]
@@ -148,6 +189,9 @@ struct LookupSourceResult {
     attribution_confidence_bps: Option<u16>,
     selected_lamports: u128,
     total_lamports: u128,
+    dust_filtered_count: u64,
+    post_buy_filtered_count: u64,
+    rel_too_small_count: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,14 +208,23 @@ enum WalletLookupOutcome {
         attribution_confidence_bps: u16,
         selected_lamports: u128,
         total_lamports: u128,
+        dust_filtered_count: u64,
+        post_buy_filtered_count: u64,
+        rel_too_small_count: u64,
     },
     ContinueMiss {
         miss: LookupMiss,
         removed: bool,
+        dust_filtered_count: u64,
+        post_buy_filtered_count: u64,
+        rel_too_small_count: u64,
     },
     TerminalMiss {
         miss: LookupMiss,
         removed: bool,
+        dust_filtered_count: u64,
+        post_buy_filtered_count: u64,
+        rel_too_small_count: u64,
     },
 }
 
@@ -181,6 +234,27 @@ struct FundingAttributionSelection {
     source_wallet: String,
     selected_lamports: u128,
     total_lamports: u128,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LookupCounters {
+    dust_filtered_count: u64,
+    post_buy_filtered_count: u64,
+    rel_too_small_count: u64,
+}
+
+impl LookupCounters {
+    fn merge(&mut self, other: LookupCounters) {
+        self.dust_filtered_count = self
+            .dust_filtered_count
+            .saturating_add(other.dust_filtered_count);
+        self.post_buy_filtered_count = self
+            .post_buy_filtered_count
+            .saturating_add(other.post_buy_filtered_count);
+        self.rel_too_small_count = self
+            .rel_too_small_count
+            .saturating_add(other.rel_too_small_count);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -292,6 +366,7 @@ fn build_fsc_v2_evidence(
     saw_transfer: bool,
     config: &FundingSourceConfig,
     max_buy_slot: Option<u64>,
+    lane_health: FundingLaneHealth,
     provider: String,
     source_topics: Vec<String>,
 ) -> FscV2Evidence {
@@ -411,27 +486,67 @@ fn build_fsc_v2_evidence(
         source_counts,
         attribution_confidence_mean,
         attribution_confidence_min,
-        dust_filtered_count: 0,
-        post_buy_filtered_count: 0,
-        rel_too_small_count: 0,
+        dust_filtered_count: saturating_u16(diagnostics.dust_filtered_count),
+        post_buy_filtered_count: saturating_u16(diagnostics.post_buy_filtered_count),
+        rel_too_small_count: saturating_u16(diagnostics.rel_too_small_count),
         index_warm: stream_available && saw_transfer,
         capture_ready: stream_available && saw_transfer,
         status,
         excluded_reason,
-        funding_lane_watermark_slot: None,
+        funding_lane_watermark_slot: lane_health.funding_lane_watermark_slot,
         max_buy_slot,
-        funding_lane_lag_slots: None,
-        stream_epoch: 0,
-        gap_suspected: false,
-        min_abs_store_lamports: config.dust_threshold_lamports,
-        min_abs_attribution_lamports: config.dust_threshold_lamports,
-        min_rel_to_buy: 0.0,
+        funding_lane_lag_slots: funding_lane_lag_slots(
+            lane_health.funding_lane_watermark_slot,
+            max_buy_slot,
+        ),
+        stream_epoch: lane_health.stream_epoch,
+        gap_suspected: lane_health.gap_suspected,
+        last_transfer_recv_ts_ms: lane_health.last_transfer_recv_ts_ms,
+        last_reconnect_ts_ms: lane_health.last_reconnect_ts_ms,
+        dropped_events: lane_health.dropped_events,
+        min_abs_store_lamports: config.min_abs_store_lamports,
+        min_abs_attribution_lamports: config.min_abs_attribution_lamports,
+        min_rel_to_buy: config.min_rel_to_buy,
         ttl_seconds: config.lookback_window_ms / 1_000,
-        neutral_funder_set_version: None,
+        neutral_funder_set_version: config.neutral_funder_set_version.clone(),
         neutral_funder_set_hash: neutral_funder_set_hash(config),
         config_hash: funding_source_config_hash(config),
         provider,
         source_topics,
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct FundingLaneHealth {
+    funding_lane_watermark_slot: Option<u64>,
+    stream_epoch: u64,
+    gap_suspected: bool,
+    last_transfer_recv_ts_ms: Option<u64>,
+    last_reconnect_ts_ms: Option<u64>,
+    dropped_events: u64,
+}
+
+fn lane_health_locked(inner: &FundingSourceInner) -> FundingLaneHealth {
+    FundingLaneHealth {
+        funding_lane_watermark_slot: inner.funding_lane_watermark_slot,
+        stream_epoch: inner.stream_epoch,
+        gap_suspected: inner.gap_suspected,
+        last_transfer_recv_ts_ms: inner.last_transfer_recv_ts_ms,
+        last_reconnect_ts_ms: inner.last_reconnect_ts_ms,
+        dropped_events: inner.dropped_events,
+    }
+}
+
+fn funding_lane_lag_slots(watermark_slot: Option<u64>, max_buy_slot: Option<u64>) -> Option<i64> {
+    Some(watermark_slot? as i64 - max_buy_slot? as i64)
+}
+
+fn max_option_u64(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
     }
 }
 
@@ -629,12 +744,15 @@ fn funding_source_config_hash(config: &FundingSourceConfig) -> String {
     neutral_sources.sort();
     stable_fnv64_hex(
         format!(
-            "lookback_window_ms={};dust_threshold_lamports={};min_attribution_confidence_bps={};per_recipient_cap={};global_recipient_cap={};neutral_sources={}",
+            "lookback_window_ms={};min_abs_store_lamports={};min_abs_attribution_lamports={};min_rel_to_buy_bits={};min_attribution_confidence_bps={};per_recipient_cap={};global_recipient_cap={};neutral_funder_set_version={};neutral_sources={}",
             config.lookback_window_ms,
-            config.dust_threshold_lamports,
+            config.min_abs_store_lamports,
+            config.min_abs_attribution_lamports,
+            config.min_rel_to_buy.to_bits(),
             config.min_attribution_confidence_bps,
             config.per_recipient_cap,
             config.global_recipient_cap,
+            config.neutral_funder_set_version.as_deref().unwrap_or(""),
             neutral_sources.join(",")
         )
         .as_bytes(),
@@ -702,7 +820,7 @@ impl FundingSourceIndex {
         transfer: &FundingTransferObserved,
         config: &FundingSourceConfig,
     ) {
-        if transfer.lamports < config.dust_threshold_lamports {
+        if transfer.lamports < config.min_abs_store_lamports {
             return;
         }
 
@@ -724,6 +842,9 @@ impl FundingSourceIndex {
         // Any accepted funding transfer warms the rolling index for capture/evidence.
         // Full-chain transfers may additionally mark availability automatically.
         inner.saw_transfer = true;
+        inner.funding_lane_watermark_slot =
+            max_option_u64(inner.funding_lane_watermark_slot, transfer.slot);
+        inner.last_transfer_recv_ts_ms = Some(observation_wall_ms);
         inner
             .observed_funding_lane_kinds
             .insert(transfer.provenance.lane_kind.as_str().to_string());
@@ -805,6 +926,23 @@ impl FundingSourceIndex {
         update_index_metrics(&inner);
     }
 
+    pub fn record_stream_reconnect(&self, reconnect_ts_ms: u64) {
+        let mut inner = self.inner.write();
+        inner.stream_epoch = inner.stream_epoch.saturating_add(1);
+        inner.last_reconnect_ts_ms = Some(reconnect_ts_ms);
+        inner.gap_suspected = true;
+        update_index_metrics(&inner);
+    }
+
+    pub fn record_dropped_events(&self, count: u64) {
+        if count == 0 {
+            return;
+        }
+        let mut inner = self.inner.write();
+        inner.dropped_events = inner.dropped_events.saturating_add(count);
+        inner.gap_suspected = true;
+    }
+
     #[must_use]
     pub fn compute_for_transactions<'a>(
         &self,
@@ -838,6 +976,7 @@ impl FundingSourceIndex {
                 inner.saw_transfer,
                 config,
                 max_buy_slot,
+                lane_health_locked(&inner),
                 provider,
                 source_topics,
             );
@@ -858,6 +997,7 @@ impl FundingSourceIndex {
                 false,
                 config,
                 max_buy_slot,
+                lane_health_locked(&inner),
                 provider,
                 source_topics,
             );
@@ -876,6 +1016,15 @@ impl FundingSourceIndex {
 
         for tx in buyer_samples {
             let lookup = lookup_source_for_buy(&mut inner, tx, config);
+            diagnostics.dust_filtered_count = diagnostics
+                .dust_filtered_count
+                .saturating_add(lookup.dust_filtered_count);
+            diagnostics.post_buy_filtered_count = diagnostics
+                .post_buy_filtered_count
+                .saturating_add(lookup.post_buy_filtered_count);
+            diagnostics.rel_too_small_count = diagnostics
+                .rel_too_small_count
+                .saturating_add(lookup.rel_too_small_count);
             let matched = lookup.matched;
             if lookup.removed {
                 removed_entries = removed_entries.saturating_add(1);
@@ -939,6 +1088,7 @@ impl FundingSourceIndex {
             inner.saw_transfer,
             config,
             max_buy_slot,
+            lane_health_locked(&inner),
             provider,
             source_topics,
         );
@@ -1021,6 +1171,8 @@ fn lookup_miss_rank(miss: LookupMiss) -> (u8, u8) {
         FSC_LOOKBACK_WINDOW_EXHAUSTED_REASON => 1,
         FSC_SAME_SLOT_ORDERING_UNAVAILABLE_REASON => 1,
         FSC_LOW_ATTRIBUTION_CONFIDENCE_REASON => 1,
+        FSC_RELATIVE_FUNDING_TOO_SMALL_REASON => 1,
+        FSC_ABS_ATTRIBUTION_TOO_SMALL_REASON => 1,
         FSC_NO_PREBUY_TRANSFER_IN_WINDOW_REASON => 0,
         _ => 0,
     };
@@ -1163,6 +1315,9 @@ fn lookup_source_for_buy(
             attribution_confidence_bps: None,
             selected_lamports: 0,
             total_lamports: 0,
+            dust_filtered_count: 0,
+            post_buy_filtered_count: 0,
+            rel_too_small_count: 0,
         };
     }
 
@@ -1178,12 +1333,16 @@ fn lookup_source_for_buy(
             attribution_confidence_bps: None,
             selected_lamports: 0,
             total_lamports: 0,
+            dust_filtered_count: 0,
+            post_buy_filtered_count: 0,
+            rel_too_small_count: 0,
         };
     }
     let buy_window_start = buy_event_ts_ms.saturating_sub(config.lookback_window_ms);
 
     let mut lookup_miss = None::<LookupMiss>;
     let mut removed = false;
+    let mut counters = LookupCounters::default();
     for wallet in lookup_wallets {
         match lookup_source_for_wallet(
             inner,
@@ -1199,7 +1358,15 @@ fn lookup_source_for_buy(
                 attribution_confidence_bps,
                 selected_lamports,
                 total_lamports,
+                dust_filtered_count,
+                post_buy_filtered_count,
+                rel_too_small_count,
             } => {
+                counters.merge(LookupCounters {
+                    dust_filtered_count,
+                    post_buy_filtered_count,
+                    rel_too_small_count,
+                });
                 if wallet_removed {
                     inner.histories.remove(wallet.as_str());
                 }
@@ -1211,12 +1378,23 @@ fn lookup_source_for_buy(
                     attribution_confidence_bps: Some(attribution_confidence_bps),
                     selected_lamports,
                     total_lamports,
+                    dust_filtered_count: counters.dust_filtered_count,
+                    post_buy_filtered_count: counters.post_buy_filtered_count,
+                    rel_too_small_count: counters.rel_too_small_count,
                 };
             }
             WalletLookupOutcome::ContinueMiss {
                 miss,
                 removed: wallet_removed,
+                dust_filtered_count,
+                post_buy_filtered_count,
+                rel_too_small_count,
             } => {
+                counters.merge(LookupCounters {
+                    dust_filtered_count,
+                    post_buy_filtered_count,
+                    rel_too_small_count,
+                });
                 if wallet_removed {
                     inner.histories.remove(wallet.as_str());
                 }
@@ -1226,7 +1404,15 @@ fn lookup_source_for_buy(
             WalletLookupOutcome::TerminalMiss {
                 miss,
                 removed: wallet_removed,
+                dust_filtered_count,
+                post_buy_filtered_count,
+                rel_too_small_count,
             } => {
+                counters.merge(LookupCounters {
+                    dust_filtered_count,
+                    post_buy_filtered_count,
+                    rel_too_small_count,
+                });
                 if wallet_removed {
                     inner.histories.remove(wallet.as_str());
                 }
@@ -1238,6 +1424,9 @@ fn lookup_source_for_buy(
                     attribution_confidence_bps: None,
                     selected_lamports: 0,
                     total_lamports: 0,
+                    dust_filtered_count: counters.dust_filtered_count,
+                    post_buy_filtered_count: counters.post_buy_filtered_count,
+                    rel_too_small_count: counters.rel_too_small_count,
                 };
             }
         }
@@ -1250,6 +1439,9 @@ fn lookup_source_for_buy(
         attribution_confidence_bps: None,
         selected_lamports: 0,
         total_lamports: 0,
+        dust_filtered_count: counters.dust_filtered_count,
+        post_buy_filtered_count: counters.post_buy_filtered_count,
+        rel_too_small_count: counters.rel_too_small_count,
     }
 }
 
@@ -1270,17 +1462,47 @@ fn lookup_source_for_wallet(
                     class: FscMissClass::Structural,
                 },
                 removed: true,
+                dust_filtered_count: 0,
+                post_buy_filtered_count: 0,
+                rel_too_small_count: 0,
             };
         }
 
         let mut source_accumulators = HashMap::<String, SourceAccumulator>::new();
         let mut total_candidate_lamports = 0u128;
         let mut wallet_candidate_count = 0u64;
+        let mut counters = LookupCounters::default();
         let mut saw_unorderable_prebuy_candidate = false;
+        let buy_amount_lamports = tx_buy_amount_lamports(tx);
 
         for transfer in &history.transfers {
             match transfer_buy_order(transfer, tx, buy_event_ts_ms) {
                 TransferBuyOrder::Precedes => {
+                    if transfer.lamports < config.min_abs_attribution_lamports {
+                        counters.dust_filtered_count =
+                            counters.dust_filtered_count.saturating_add(1);
+                        continue;
+                    }
+                    if let Some(min_rel_lamports) =
+                        min_relative_attribution_lamports(config, buy_amount_lamports)
+                    {
+                        if transfer.lamports < min_rel_lamports {
+                            counters.rel_too_small_count =
+                                counters.rel_too_small_count.saturating_add(1);
+                            continue;
+                        }
+                    } else if config.min_rel_to_buy > 0.0 {
+                        return WalletLookupOutcome::TerminalMiss {
+                            miss: LookupMiss {
+                                reason: FSC_LOW_ATTRIBUTION_CONFIDENCE_REASON,
+                                class: FscMissClass::Indeterminate,
+                            },
+                            removed: false,
+                            dust_filtered_count: counters.dust_filtered_count,
+                            post_buy_filtered_count: counters.post_buy_filtered_count,
+                            rel_too_small_count: counters.rel_too_small_count,
+                        };
+                    }
                     wallet_candidate_count = wallet_candidate_count.saturating_add(1);
                     let transfer_lamports = u128::from(transfer.lamports);
                     total_candidate_lamports =
@@ -1303,7 +1525,10 @@ fn lookup_source_for_wallet(
                             latest_transfer_key: tie_key,
                         });
                 }
-                TransferBuyOrder::DoesNotPrecede => {}
+                TransferBuyOrder::DoesNotPrecede => {
+                    counters.post_buy_filtered_count =
+                        counters.post_buy_filtered_count.saturating_add(1);
+                }
                 TransferBuyOrder::Unorderable => {
                     saw_unorderable_prebuy_candidate = true;
                 }
@@ -1319,10 +1544,23 @@ fn lookup_source_for_wallet(
                         class: FscMissClass::Indeterminate,
                     },
                     removed: false,
+                    dust_filtered_count: counters.dust_filtered_count,
+                    post_buy_filtered_count: counters.post_buy_filtered_count,
+                    rel_too_small_count: counters.rel_too_small_count,
                 };
             }
 
-            let miss = if history.overflowed_before_oldest_retained {
+            let miss = if counters.rel_too_small_count > 0 {
+                LookupMiss {
+                    reason: FSC_RELATIVE_FUNDING_TOO_SMALL_REASON,
+                    class: FscMissClass::Structural,
+                }
+            } else if counters.dust_filtered_count > 0 {
+                LookupMiss {
+                    reason: FSC_ABS_ATTRIBUTION_TOO_SMALL_REASON,
+                    class: FscMissClass::Structural,
+                }
+            } else if history.overflowed_before_oldest_retained {
                 LookupMiss {
                     reason: FSC_PER_RECIPIENT_HISTORY_OVERFLOW_REASON,
                     class: FscMissClass::Operational,
@@ -1336,6 +1574,9 @@ fn lookup_source_for_wallet(
             return WalletLookupOutcome::ContinueMiss {
                 miss,
                 removed: false,
+                dust_filtered_count: counters.dust_filtered_count,
+                post_buy_filtered_count: counters.post_buy_filtered_count,
+                rel_too_small_count: counters.rel_too_small_count,
             };
         };
 
@@ -1351,6 +1592,9 @@ fn lookup_source_for_wallet(
                     class: FscMissClass::Indeterminate,
                 },
                 removed: false,
+                dust_filtered_count: counters.dust_filtered_count,
+                post_buy_filtered_count: counters.post_buy_filtered_count,
+                rel_too_small_count: counters.rel_too_small_count,
             };
         }
 
@@ -1370,6 +1614,9 @@ fn lookup_source_for_wallet(
             attribution_confidence_bps,
             selected_lamports: selection.selected_lamports,
             total_lamports: selection.total_lamports,
+            dust_filtered_count: counters.dust_filtered_count,
+            post_buy_filtered_count: counters.post_buy_filtered_count,
+            rel_too_small_count: counters.rel_too_small_count,
         };
     }
 
@@ -1380,6 +1627,9 @@ fn lookup_source_for_wallet(
                 class: FscMissClass::Operational,
             },
             removed: false,
+            dust_filtered_count: 0,
+            post_buy_filtered_count: 0,
+            rel_too_small_count: 0,
         };
     }
 
@@ -1389,6 +1639,9 @@ fn lookup_source_for_wallet(
             class: FscMissClass::Indeterminate,
         },
         removed: false,
+        dust_filtered_count: 0,
+        post_buy_filtered_count: 0,
+        rel_too_small_count: 0,
     }
 }
 
@@ -1433,6 +1686,25 @@ fn attribution_confidence_bps(selected_lamports: u128, total_lamports: u128) -> 
         .checked_div(total_lamports)
         .unwrap_or_default()
         .min(u128::from(u16::MAX)) as u16
+}
+
+fn tx_buy_amount_lamports(tx: &PoolTransaction) -> Option<u64> {
+    tx.sol_amount_lamports.or_else(|| {
+        (tx.volume_sol.is_finite() && tx.volume_sol > 0.0)
+            .then(|| (tx.volume_sol * 1_000_000_000.0).round() as u64)
+            .filter(|value| *value > 0)
+    })
+}
+
+fn min_relative_attribution_lamports(
+    config: &FundingSourceConfig,
+    buy_amount_lamports: Option<u64>,
+) -> Option<u64> {
+    if config.min_rel_to_buy <= 0.0 {
+        return Some(0);
+    }
+    let buy_amount_lamports = buy_amount_lamports?;
+    Some((buy_amount_lamports as f64 * config.min_rel_to_buy).ceil() as u64)
 }
 
 fn transfer_buy_order(
@@ -1643,6 +1915,48 @@ mod tests {
         gatekeeper_config.fsc_per_recipient_cap = 2;
         gatekeeper_config.fsc_global_recipient_cap = 8;
         FundingSourceConfig::from_gatekeeper_config(&gatekeeper_config)
+    }
+
+    #[test]
+    fn fsc_v2_config_plumbing_controls_thresholds_and_hash() {
+        let mut gatekeeper_config = GatekeeperV2Config::default();
+        gatekeeper_config.funding_lookback_window_s = 1;
+        gatekeeper_config.funding_dust_threshold_lamports = 10_000;
+        gatekeeper_config.fsc_per_recipient_cap = 2;
+        gatekeeper_config.fsc_global_recipient_cap = 8;
+
+        let mut fsc_config = FscV2Config::default();
+        fsc_config.lookback_window_s = 300;
+        fsc_config.min_abs_store_lamports = 1_000_000;
+        fsc_config.min_abs_attribution_lamports = 10_000_000;
+        fsc_config.min_rel_to_buy = 0.20;
+        fsc_config.min_attribution_confidence = 0.60;
+        fsc_config.neutral_funder_set_version = Some("neutral-v-test".to_string());
+
+        let legacy_config = FundingSourceConfig::from_gatekeeper_config(&gatekeeper_config);
+        let config = FundingSourceConfig::from_configs(&gatekeeper_config, Some(&fsc_config));
+
+        assert_eq!(config.lookback_window_ms, 300_000);
+        assert_eq!(config.min_abs_store_lamports, 1_000_000);
+        assert_eq!(config.min_abs_attribution_lamports, 10_000_000);
+        assert_eq!(config.min_rel_to_buy, 0.20);
+        assert_eq!(config.min_attribution_confidence_bps, 6_000);
+        assert_eq!(
+            config.neutral_funder_set_version.as_deref(),
+            Some("neutral-v-test")
+        );
+        assert_ne!(
+            funding_source_config_hash(&legacy_config),
+            funding_source_config_hash(&config)
+        );
+
+        let mut changed = fsc_config.clone();
+        changed.min_rel_to_buy = 0.25;
+        let changed_config = FundingSourceConfig::from_configs(&gatekeeper_config, Some(&changed));
+        assert_ne!(
+            funding_source_config_hash(&config),
+            funding_source_config_hash(&changed_config)
+        );
     }
 
     fn buy_tx(signer: &str, signature: &str, timestamp_ms: u64) -> PoolTransaction {
@@ -2412,6 +2726,54 @@ mod tests {
         assert_eq!(payload["snapshot_mode"], "decision_time");
         assert_eq!(payload["hhi_norm_count"], 1.0);
         assert_eq!(payload["top_funder"]["wallet"], "shared-funder");
+    }
+
+    #[test]
+    fn fsc_v2_relative_threshold_and_lane_health_are_reported() {
+        let gatekeeper_config = GatekeeperV2Config::default();
+        let mut fsc_config = FscV2Config::default();
+        fsc_config.lookback_window_s = 1;
+        fsc_config.min_abs_store_lamports = 1_000_000;
+        fsc_config.min_abs_attribution_lamports = 10_000_000;
+        fsc_config.min_rel_to_buy = 0.20;
+        fsc_config.min_attribution_confidence = 0.60;
+        let config = FundingSourceConfig::from_configs(&gatekeeper_config, Some(&fsc_config));
+
+        let index = FundingSourceIndex::new();
+        let mut transfer = funding_transfer("source-a", "buyer-a", "fund-a", 100, 20_000_000);
+        transfer.slot = Some(10);
+        index.observe_transfer(&transfer, &config);
+        index.record_stream_reconnect(150);
+        index.record_dropped_events(2);
+
+        let mut buy = buy_tx("buyer-a", "buy-a", 400);
+        buy.slot = Some(12);
+        let buys = vec![buy];
+        let computed = index.compute_for_transactions(buys.iter(), &config);
+
+        assert_eq!(computed.diagnostics.rel_too_small_count, 1);
+        assert_eq!(computed.diagnostics.known_source_count, 0);
+        assert_eq!(computed.funding_source_v2.rel_too_small_count, 1);
+        assert_eq!(computed.funding_source_v2.min_abs_store_lamports, 1_000_000);
+        assert_eq!(
+            computed.funding_source_v2.min_abs_attribution_lamports,
+            10_000_000
+        );
+        assert_eq!(computed.funding_source_v2.min_rel_to_buy, 0.20);
+        assert_eq!(
+            computed.funding_source_v2.funding_lane_watermark_slot,
+            Some(10)
+        );
+        assert_eq!(computed.funding_source_v2.max_buy_slot, Some(12));
+        assert_eq!(computed.funding_source_v2.funding_lane_lag_slots, Some(-2));
+        assert_eq!(computed.funding_source_v2.stream_epoch, 1);
+        assert_eq!(computed.funding_source_v2.last_reconnect_ts_ms, Some(150));
+        assert_eq!(computed.funding_source_v2.dropped_events, 2);
+        assert!(computed.funding_source_v2.gap_suspected);
+        assert!(computed
+            .funding_source_v2
+            .last_transfer_recv_ts_ms
+            .is_some());
     }
 
     #[test]

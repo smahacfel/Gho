@@ -1723,6 +1723,14 @@ async fn main() -> Result<()> {
         oracle_runtime::OracleRuntimeConfig::from_shadow_ledger_config(&config.shadow_ledger);
     oracle_runtime_config.session = config.session.clone();
     oracle_runtime_config.tx_intelligence = config.tx_intelligence.clone();
+    oracle_runtime_config.funding_source_config =
+        ghost_launcher::tx_intelligence::FundingSourceConfig::from_configs(
+            &gatekeeper_v2_config,
+            ghost_brain_config.as_ref().and_then(|brain| {
+                (brain.fsc_v2.capture_enabled || brain.fsc_v2.feature_emit_enabled)
+                    .then_some(&brain.fsc_v2)
+            }),
+        );
     oracle_runtime_config.p37_shadow_probe = config.p37_shadow_probe.clone();
     oracle_runtime_config.run_id = (!config.p37_shadow_probe.run_id.trim().is_empty())
         .then(|| config.p37_shadow_probe.run_id.clone());
