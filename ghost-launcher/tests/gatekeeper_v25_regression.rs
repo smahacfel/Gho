@@ -2011,6 +2011,7 @@ fn p4_base_assessment() -> GatekeeperAssessment {
         trajectory_available: false,
         v25_shadow_decisions: Vec::new(),
         trajectory: None,
+        decision_eval_snapshots: Vec::new(),
         pdd_assessment: None,
         aps_diagnostics: None,
         observation_stage: None,
@@ -2441,6 +2442,7 @@ fn p5_shadow_record_has_idempotency_key_field() {
     // Verify the field exists and can be set.
     let record = ShadowBuySimulationRecord {
         join_metadata: ExecutionJoinMetadata::default(),
+        account_diagnostics: Default::default(),
         candidate_id: "test".to_string(),
         pool_amm_id: "pool1".to_string(),
         base_mint: "mint1".to_string(),
@@ -2454,6 +2456,7 @@ fn p5_shadow_record_has_idempotency_key_field() {
         tip_lamports: 0,
         entry_token_amount_raw: None,
         payer_provenance: "ephemeral".to_string(),
+        payer_pubkey: None,
         err: None,
         error_class: None,
         error_code: None,

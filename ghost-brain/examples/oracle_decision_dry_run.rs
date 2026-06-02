@@ -38,6 +38,10 @@ async fn main() {
         gatekeeper_log_dir: log_dir,
         gatekeeper_rollout_profile: "dry-run".to_string(),
         gatekeeper_config_hash: "example-config-hash".to_string(),
+        gatekeeper_run_id: Some("example-dry-run".to_string()),
+        gatekeeper_session_id: Some("example-session".to_string()),
+        brain_config_path: None,
+        brain_config_hash: None,
         channel_buffer_size: 1000,
         enabled: true,
     };

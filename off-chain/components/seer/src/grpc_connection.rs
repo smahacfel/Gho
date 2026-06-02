@@ -456,6 +456,7 @@ impl AccountRegistry {
             self.version.fetch_add(1, Ordering::Relaxed);
         }
         Self::record_touch(&self.last_touch, &self.touch_seq, &addr);
+        self.prune_bcv2_exact_watch_retention(EXACT_ACCOUNT_PAYLOAD_CAP);
         self.bcv2_resub_notify.notify_one();
         inserted
     }
@@ -587,6 +588,40 @@ impl AccountRegistry {
             .collect();
         Self::sort_ranked_accounts_by_recency(&mut out);
         out.into_iter().map(|(value, _)| value).collect()
+    }
+
+    fn remove_touch_if_unreferenced(&self, addr: &str) {
+        if !self.generic_accounts.contains(addr)
+            && !self.bcv2_accounts.contains(addr)
+            && !self.curve_accounts.contains(addr)
+            && !self.pool_accounts.contains(addr)
+            && !self.mint_accounts.contains(addr)
+        {
+            self.last_touch.remove(addr);
+        }
+    }
+
+    fn prune_bcv2_exact_watch_retention(&self, budget: usize) -> usize {
+        let ranked = self.snapshot_set_by_recency(&self.bcv2_accounts);
+        if ranked.len() <= budget {
+            return 0;
+        }
+        let mut removed = 0usize;
+        for stale in ranked.into_iter().skip(budget) {
+            if self.bcv2_accounts.remove(&stale).is_some() {
+                self.bcv2_contexts.remove(&stale);
+                self.remove_touch_if_unreferenced(&stale);
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            self.version.fetch_add(1, Ordering::Relaxed);
+            warn!(
+                "BCV2_EXACT_WATCH_RETAIN_PRUNED removed={} retain_cap={}",
+                removed, budget
+            );
+        }
+        removed
     }
 
     pub fn snapshot_primary_global_exact_accounts(&self, budget: usize) -> Vec<String> {
@@ -4913,7 +4948,7 @@ mod tests {
     }
 
     #[test]
-    fn bcv2_insert_over_cap_drops_oldest_or_lowest_priority_with_bcv2_dropped_count() {
+    fn bcv2_insert_retains_newest_accounts_within_payload_cap() {
         let r = AccountRegistry::new();
         for i in 0..(EXACT_ACCOUNT_PAYLOAD_CAP + 6) {
             r.insert_bcv2(format!("bcv2-{i:03}"));
@@ -4931,9 +4966,10 @@ mod tests {
             &tracked_accounts,
         );
 
-        assert_eq!(counts.tracked_bcv2, EXACT_ACCOUNT_PAYLOAD_CAP + 6);
+        assert_eq!(counts.tracked_bcv2, EXACT_ACCOUNT_PAYLOAD_CAP);
         assert_eq!(counts.bcv2_sent, EXACT_ACCOUNT_PAYLOAD_CAP);
-        assert_eq!(counts.bcv2_dropped, 6);
+        assert_eq!(counts.bcv2_dropped, 0);
+        assert!(!lanes.bcv2_accounts.contains(&"bcv2-000".to_string()));
         assert!(!tracked_accounts.contains(&"bcv2-000".to_string()));
         assert!(tracked_accounts.contains(&format!("bcv2-{:03}", EXACT_ACCOUNT_PAYLOAD_CAP + 5)));
     }

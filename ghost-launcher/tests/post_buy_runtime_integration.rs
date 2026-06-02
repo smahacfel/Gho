@@ -85,6 +85,7 @@ async fn test_post_buy_runtime_paper_lifecycle() {
         live_exit_take_profit_pct: 0.02,
         live_exit_stop_loss_pct: 0.02,
         shadow_lifecycle_log_path: None,
+        probe_lifecycle_log_path: None,
         account_state_core: Some(Arc::new(AccountStateReducer::new())),
         shadow_ledger: Some(Arc::new(ShadowLedger::new())),
     };
@@ -303,6 +304,7 @@ async fn test_post_buy_runtime_no_event_loss_with_early_subscribe() {
         live_exit_take_profit_pct: 0.02,
         live_exit_stop_loss_pct: 0.02,
         shadow_lifecycle_log_path: None,
+        probe_lifecycle_log_path: None,
         account_state_core: Some(Arc::new(AccountStateReducer::new())),
         shadow_ledger: Some(Arc::new(ShadowLedger::new())),
     };
@@ -430,6 +432,7 @@ async fn test_live_lane_routes_to_sender_not_paper_lifecycle() {
         live_exit_take_profit_pct: 0.02,
         live_exit_stop_loss_pct: 0.02,
         shadow_lifecycle_log_path: None,
+        probe_lifecycle_log_path: None,
         account_state_core: Some(Arc::new(AccountStateReducer::new())),
         shadow_ledger: Some(Arc::new(ShadowLedger::new())),
     };
@@ -542,6 +545,7 @@ async fn test_live_lane_without_handle_fails_closed_instead_of_paper_fallback() 
         live_exit_take_profit_pct: 0.02,
         live_exit_stop_loss_pct: 0.02,
         shadow_lifecycle_log_path: None,
+        probe_lifecycle_log_path: None,
         account_state_core: Some(Arc::new(AccountStateReducer::new())),
         shadow_ledger: Some(Arc::new(ShadowLedger::new())),
     };

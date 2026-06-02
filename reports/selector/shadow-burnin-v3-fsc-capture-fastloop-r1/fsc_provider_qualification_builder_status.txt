@@ -1,0 +1,1 @@
+2026-06-01T16:40:46Z status=2 scope=shadow-burnin-v3-fsc-capture-fastloop-r1 interval_seconds=60 canary_minutes=45 require_external_audit=0 min_benchmark_hours=0 min_audit_slots=1000 min_audit_transfer_events=10000

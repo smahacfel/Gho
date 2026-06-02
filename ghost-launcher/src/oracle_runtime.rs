@@ -7807,6 +7807,7 @@ fn p37_bcv2_terminal_route_closure_applies(
     let missing_reason = matches!(
         readiness.reason.as_deref(),
         Some("missing_on_rpc")
+            | Some("rpc_missing_after_retry")
             | Some("account_missing")
             | Some("account_not_found")
             | Some("negative_evidence:rpc_missing")
@@ -24989,6 +24990,45 @@ mod tests {
             reason,
             format!(
                 "working_builder_final_manifest_execution_evidence_not_ready:bonding_curve_v2:{bcv2}:missing_on_rpc"
+            )
+        );
+    }
+
+    #[test]
+    fn p37_working_builder_initial_rpc_missing_is_not_terminal_route_closure() {
+        let request = test_working_builder_prepared_buy_request();
+        let bcv2 = request
+            .account_overrides
+            .bonding_curve_v2
+            .expect("working request bcv2");
+        let mut diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        diagnostics.manifest_lookup_performed = true;
+
+        let evidence_store = ExecutionAccountEvidenceStore::new();
+        let mut missing = test_bcv2_execution_account_evidence(
+            bcv2,
+            ExecutionAccountEvidenceSource::RpcHydration,
+            ExecutionAccountEvidenceStatus::RpcMissing,
+            false,
+        );
+        missing.received_at_ms = 40_000;
+        missing.reason = Some("rpc_missing_initial".to_string());
+        evidence_store.upsert(missing);
+
+        let reason = p37_working_builder_final_manifest_failure_reason_with_execution_policy(
+            &request,
+            &diagnostics,
+            Some(&evidence_store),
+            10_000,
+            40_001,
+            true,
+        )
+        .expect("initial rpc missing still fails closed as not ready");
+
+        assert_eq!(
+            reason,
+            format!(
+                "working_builder_final_manifest_execution_evidence_not_ready:bonding_curve_v2:{bcv2}:rpc_missing_initial"
             )
         );
     }

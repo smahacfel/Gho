@@ -171,6 +171,15 @@ async fn main() -> anyhow::Result<()> {
                         account_evt.curve_finality.as_str()
                     );
                 }
+                SeerEvent::ExecutionAccountEvidence(evidence_evt) => {
+                    info!(
+                        "Trigger received execution account evidence #{}: account={}, role={}, status={}",
+                        event_count,
+                        evidence_evt.evidence.account_pubkey,
+                        evidence_evt.evidence.role.label(),
+                        evidence_evt.evidence.status.as_str()
+                    );
+                }
             }
 
             // Log IPC metrics periodically

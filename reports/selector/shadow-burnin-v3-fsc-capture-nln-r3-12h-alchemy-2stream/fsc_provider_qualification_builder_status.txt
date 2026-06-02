@@ -1,0 +1,1 @@
+2026-06-01T07:38:16Z status=2 scope=shadow-burnin-v3-fsc-capture-nln-r3-12h-alchemy-2stream interval_seconds=300 min_benchmark_hours=12 min_audit_slots=1000 min_audit_transfer_events=10000

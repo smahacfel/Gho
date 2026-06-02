@@ -3365,6 +3365,7 @@ struct RuntimeTradeContext {
 const BCV2_RPC_HYDRATION_QUEUE_CAP: usize = 1024;
 const BCV2_RPC_HYDRATION_TIMEOUT_MS: u64 = 750;
 const BCV2_EVIDENCE_SEND_TIMEOUT_MS: u64 = 250;
+const BCV2_RPC_HYDRATION_RETRY_DELAYS_MS: [u64; 3] = [0, 250, 750];
 
 #[derive(Debug, Clone)]
 struct Bcv2HydrationRequest {
@@ -3382,10 +3383,19 @@ struct Bcv2RpcHydrationEvidence {
     data_len: Option<usize>,
     latency_ms: u128,
     error_class: Option<String>,
+    attempt: u8,
+    attempt_count: u8,
 }
 
 impl Bcv2RpcHydrationEvidence {
-    fn ready(context_slot: u64, owner: String, data_len: usize, latency_ms: u128) -> Self {
+    fn ready(
+        context_slot: u64,
+        owner: String,
+        data_len: usize,
+        latency_ms: u128,
+        attempt: u8,
+        attempt_count: u8,
+    ) -> Self {
         Self {
             ready: true,
             context_slot: Some(context_slot),
@@ -3393,6 +3403,8 @@ impl Bcv2RpcHydrationEvidence {
             data_len: Some(data_len),
             latency_ms,
             error_class: None,
+            attempt,
+            attempt_count,
         }
     }
 
@@ -3400,6 +3412,8 @@ impl Bcv2RpcHydrationEvidence {
         context_slot: Option<u64>,
         error_class: impl Into<String>,
         latency_ms: u128,
+        attempt: u8,
+        attempt_count: u8,
     ) -> Self {
         Self {
             ready: false,
@@ -3408,7 +3422,21 @@ impl Bcv2RpcHydrationEvidence {
             data_len: None,
             latency_ms,
             error_class: Some(error_class.into()),
+            attempt,
+            attempt_count,
         }
+    }
+}
+
+fn bcv2_missing_reason_for_attempt(
+    error_class: impl AsRef<str>,
+    attempt: u8,
+    attempt_count: u8,
+) -> String {
+    match error_class.as_ref() {
+        "missing_on_rpc" if attempt < attempt_count => "rpc_missing_initial".to_string(),
+        "missing_on_rpc" => "rpc_missing_after_retry".to_string(),
+        other => other.to_string(),
     }
 }
 
@@ -3694,7 +3722,7 @@ impl Bcv2HydrationService {
 
         if !self.ensure_worker_started() {
             self.queued_pubkeys.remove(&request.pubkey);
-            let evidence = Bcv2RpcHydrationEvidence::missing(None, "no_tokio_runtime", 0);
+            let evidence = Bcv2RpcHydrationEvidence::missing(None, "no_tokio_runtime", 0, 0, 0);
             record_bcv2_rpc_hydration_evidence(&request.pubkey, &request, &evidence);
             emit_bcv2_rpc_hydration_evidence_background(
                 self.ipc_sender.as_ref(),
@@ -3708,7 +3736,7 @@ impl Bcv2HydrationService {
             Ok(()) => {}
             Err(tokio::sync::mpsc::error::TrySendError::Full(request)) => {
                 self.queued_pubkeys.remove(&request.pubkey);
-                let evidence = Bcv2RpcHydrationEvidence::missing(None, "queue_full", 0);
+                let evidence = Bcv2RpcHydrationEvidence::missing(None, "queue_full", 0, 0, 0);
                 record_bcv2_rpc_hydration_evidence(&request.pubkey, &request, &evidence);
                 emit_bcv2_rpc_hydration_evidence_background(
                     self.ipc_sender.as_ref(),
@@ -3718,7 +3746,7 @@ impl Bcv2HydrationService {
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(request)) => {
                 self.queued_pubkeys.remove(&request.pubkey);
-                let evidence = Bcv2RpcHydrationEvidence::missing(None, "worker_closed", 0);
+                let evidence = Bcv2RpcHydrationEvidence::missing(None, "worker_closed", 0, 0, 0);
                 record_bcv2_rpc_hydration_evidence(&request.pubkey, &request, &evidence);
                 emit_bcv2_rpc_hydration_evidence_background(
                     self.ipc_sender.as_ref(),
@@ -3738,49 +3766,85 @@ async fn run_bcv2_hydration_worker(
 ) {
     let rpc = new_async_rpc_client(endpoint.to_string());
     let commitment = CommitmentConfig::processed();
+    let attempt_count = u8::try_from(BCV2_RPC_HYDRATION_RETRY_DELAYS_MS.len()).unwrap_or(u8::MAX);
     while let Some(request) = rx.recv().await {
-        let started = Instant::now();
-        let evidence = match Pubkey::from_str(&request.pubkey) {
-            Ok(pubkey) => {
-                let result = tokio::time::timeout(
-                    Duration::from_millis(BCV2_RPC_HYDRATION_TIMEOUT_MS),
-                    rpc.get_account_with_commitment(&pubkey, commitment),
-                )
-                .await;
-                let latency_ms = started.elapsed().as_millis();
-                match result {
-                    Ok(Ok(response)) => {
-                        let context_slot = response.context.slot;
-                        match response.value {
-                            Some(account) => Bcv2RpcHydrationEvidence::ready(
-                                context_slot,
-                                account.owner.to_string(),
-                                account.data.len(),
-                                latency_ms,
-                            ),
-                            None => Bcv2RpcHydrationEvidence::missing(
-                                Some(context_slot),
-                                "missing_on_rpc",
-                                latency_ms,
-                            ),
-                        }
-                    }
-                    Ok(Err(err)) => {
-                        let kind_debug = format!("{:?}", err.kind());
-                        let err_text = err.to_string();
-                        Bcv2RpcHydrationEvidence::missing(
-                            None,
-                            bcv2_rpc_error_class(&kind_debug, &err_text),
-                            latency_ms,
-                        )
-                    }
-                    Err(_) => Bcv2RpcHydrationEvidence::missing(None, "timeout", latency_ms),
-                }
+        let pubkey = match Pubkey::from_str(&request.pubkey) {
+            Ok(pubkey) => pubkey,
+            Err(_) => {
+                let evidence =
+                    Bcv2RpcHydrationEvidence::missing(None, "invalid_pubkey", 0, 0, attempt_count);
+                record_bcv2_rpc_hydration_evidence(&request.pubkey, &request, &evidence);
+                send_bcv2_rpc_hydration_evidence(ipc_sender.as_ref(), &request, &evidence).await;
+                queued_pubkeys.remove(&request.pubkey);
+                continue;
             }
-            Err(_) => Bcv2RpcHydrationEvidence::missing(None, "invalid_pubkey", 0),
         };
-        record_bcv2_rpc_hydration_evidence(&request.pubkey, &request, &evidence);
-        send_bcv2_rpc_hydration_evidence(ipc_sender.as_ref(), &request, &evidence).await;
+
+        for (attempt_index, delay_ms) in BCV2_RPC_HYDRATION_RETRY_DELAYS_MS.iter().enumerate() {
+            let attempt = u8::try_from(attempt_index + 1).unwrap_or(u8::MAX);
+            if *delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
+            }
+
+            let started = Instant::now();
+            let result = tokio::time::timeout(
+                Duration::from_millis(BCV2_RPC_HYDRATION_TIMEOUT_MS),
+                rpc.get_account_with_commitment(&pubkey, commitment),
+            )
+            .await;
+            let latency_ms = started.elapsed().as_millis();
+            let evidence = match result {
+                Ok(Ok(response)) => {
+                    let context_slot = response.context.slot;
+                    match response.value {
+                        Some(account) => Bcv2RpcHydrationEvidence::ready(
+                            context_slot,
+                            account.owner.to_string(),
+                            account.data.len(),
+                            latency_ms,
+                            attempt,
+                            attempt_count,
+                        ),
+                        None => Bcv2RpcHydrationEvidence::missing(
+                            Some(context_slot),
+                            bcv2_missing_reason_for_attempt(
+                                "missing_on_rpc",
+                                attempt,
+                                attempt_count,
+                            ),
+                            latency_ms,
+                            attempt,
+                            attempt_count,
+                        ),
+                    }
+                }
+                Ok(Err(err)) => {
+                    let kind_debug = format!("{:?}", err.kind());
+                    let err_text = err.to_string();
+                    Bcv2RpcHydrationEvidence::missing(
+                        None,
+                        bcv2_rpc_error_class(&kind_debug, &err_text),
+                        latency_ms,
+                        attempt,
+                        attempt_count,
+                    )
+                }
+                Err(_) => Bcv2RpcHydrationEvidence::missing(
+                    None,
+                    "timeout",
+                    latency_ms,
+                    attempt,
+                    attempt_count,
+                ),
+            };
+            let should_retry =
+                evidence.error_class.as_deref() == Some("rpc_missing_initial") && !evidence.ready;
+            record_bcv2_rpc_hydration_evidence(&request.pubkey, &request, &evidence);
+            send_bcv2_rpc_hydration_evidence(ipc_sender.as_ref(), &request, &evidence).await;
+            if !should_retry {
+                break;
+            }
+        }
         queued_pubkeys.remove(&request.pubkey);
     }
 }
@@ -3800,8 +3864,10 @@ fn record_bcv2_rpc_hydration_evidence(
         .unwrap_or_else(|| "none".to_string());
     if evidence.ready {
         info!(
-            "BCV2_RPC_HYDRATION_READY pubkey={} commitment=processed context_slot={} owner={} data_len={} latency_ms={} observed_slot={} signature={}",
+            "BCV2_RPC_HYDRATION_READY pubkey={} commitment=processed attempt={} attempt_count={} context_slot={} owner={} data_len={} latency_ms={} observed_slot={} signature={}",
             pubkey,
+            evidence.attempt,
+            evidence.attempt_count,
             context_slot,
             evidence.owner.as_deref().unwrap_or("none"),
             evidence
@@ -3814,8 +3880,10 @@ fn record_bcv2_rpc_hydration_evidence(
         );
     } else {
         info!(
-            "BCV2_RPC_HYDRATION_MISSING pubkey={} commitment=processed context_slot={} latency_ms={} error_class={} observed_slot={} signature={}",
+            "BCV2_RPC_HYDRATION_MISSING pubkey={} commitment=processed attempt={} attempt_count={} context_slot={} latency_ms={} error_class={} observed_slot={} signature={}",
             pubkey,
+            evidence.attempt,
+            evidence.attempt_count,
             context_slot,
             evidence.latency_ms,
             evidence.error_class.as_deref().unwrap_or("unknown"),
@@ -10773,26 +10841,50 @@ mod tests {
     #[test]
     fn bcv2_hydration_ready_records_owner_data_len_context_slot() {
         let owner = Pubkey::new_unique().to_string();
-        let evidence = Bcv2RpcHydrationEvidence::ready(123, owner.clone(), 256, 7);
+        let evidence = Bcv2RpcHydrationEvidence::ready(123, owner.clone(), 256, 7, 2, 3);
 
         assert!(evidence.ready);
         assert_eq!(evidence.context_slot, Some(123));
         assert_eq!(evidence.owner.as_deref(), Some(owner.as_str()));
         assert_eq!(evidence.data_len, Some(256));
         assert_eq!(evidence.latency_ms, 7);
+        assert_eq!(evidence.attempt, 2);
+        assert_eq!(evidence.attempt_count, 3);
         assert!(evidence.error_class.is_none());
     }
 
     #[test]
     fn bcv2_hydration_missing_remains_fail_closed() {
-        let evidence = Bcv2RpcHydrationEvidence::missing(Some(123), "missing_on_rpc", 9);
+        let evidence =
+            Bcv2RpcHydrationEvidence::missing(Some(123), "rpc_missing_after_retry", 9, 3, 3);
 
         assert!(!evidence.ready);
         assert_eq!(evidence.context_slot, Some(123));
-        assert_eq!(evidence.error_class.as_deref(), Some("missing_on_rpc"));
+        assert_eq!(
+            evidence.error_class.as_deref(),
+            Some("rpc_missing_after_retry")
+        );
         assert_eq!(evidence.latency_ms, 9);
+        assert_eq!(evidence.attempt, 3);
+        assert_eq!(evidence.attempt_count, 3);
         assert!(evidence.owner.is_none());
         assert!(evidence.data_len.is_none());
+    }
+
+    #[test]
+    fn bcv2_missing_reason_tracks_initial_vs_retry_exhausted() {
+        assert_eq!(
+            bcv2_missing_reason_for_attempt("missing_on_rpc", 1, 3),
+            "rpc_missing_initial"
+        );
+        assert_eq!(
+            bcv2_missing_reason_for_attempt("missing_on_rpc", 3, 3),
+            "rpc_missing_after_retry"
+        );
+        assert_eq!(
+            bcv2_missing_reason_for_attempt("rpc_auth_error:http_401", 1, 3),
+            "rpc_auth_error:http_401"
+        );
     }
 
     #[test]
@@ -10831,7 +10923,7 @@ mod tests {
         let pool_id = Pubkey::new_unique();
         let owner = Pubkey::new_unique();
         let request = sample_bcv2_hydration_request(account_pubkey, base_mint, pool_id, pool_id);
-        let hydration = Bcv2RpcHydrationEvidence::ready(123, owner.to_string(), 256, 7);
+        let hydration = Bcv2RpcHydrationEvidence::ready(123, owner.to_string(), 256, 7, 2, 3);
 
         let evidence = bcv2_rpc_hydration_execution_evidence(&request, &hydration);
 
@@ -10858,7 +10950,8 @@ mod tests {
         let base_mint = Pubkey::new_unique();
         let pool_id = Pubkey::new_unique();
         let request = sample_bcv2_hydration_request(account_pubkey, base_mint, pool_id, pool_id);
-        let hydration = Bcv2RpcHydrationEvidence::missing(Some(123), "missing_on_rpc", 9);
+        let hydration =
+            Bcv2RpcHydrationEvidence::missing(Some(123), "rpc_missing_after_retry", 9, 3, 3);
 
         let evidence = bcv2_rpc_hydration_execution_evidence(&request, &hydration);
 
@@ -10871,7 +10964,7 @@ mod tests {
         assert_eq!(evidence.context_slot, Some(123));
         assert_eq!(evidence.owner, None);
         assert_eq!(evidence.data_len, None);
-        assert_eq!(evidence.reason.as_deref(), Some("missing_on_rpc"));
+        assert_eq!(evidence.reason.as_deref(), Some("rpc_missing_after_retry"));
     }
 
     #[test]

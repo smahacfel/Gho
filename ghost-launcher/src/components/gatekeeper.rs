@@ -13722,6 +13722,7 @@ mod tests {
                             count: 1,
                         },
                     ],
+                    ..Default::default()
                 },
             ),
             funding_source_v2: None,
@@ -13933,6 +13934,9 @@ mod tests {
             funding_lane_lag_slots: Some(0),
             stream_epoch: 1,
             gap_suspected: false,
+            last_transfer_recv_ts_ms: Some(1_000),
+            last_reconnect_ts_ms: None,
+            dropped_events: 0,
             min_abs_store_lamports: 10_000_000,
             min_abs_attribution_lamports: 10_000_000,
             min_rel_to_buy: 0.2,

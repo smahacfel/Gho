@@ -31,6 +31,7 @@ pub use ghost_brain_config::{
     // Cycle Weights & Gunshot Thresholds (Section 10)
     CycleWeightsConfig,
     FrbConfig,
+    FscV2Config,
     GatekeeperConfig,
     GatekeeperMode,
     GatekeeperV2Config,
