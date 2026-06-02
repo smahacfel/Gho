@@ -5,7 +5,8 @@ use ghost_core::{CurveFinality, EventSemanticEnvelope};
 use ghost_launcher::events::{PoolTransaction, RawBytesMissingReason};
 use ghost_launcher::session::{OpenSessionRequest, SessionConfig, SessionManager};
 use ghost_launcher::tx_intelligence::{
-    TxIntelligenceConfig, TxIntelligenceEngine, DEFAULT_SESSION_TX_RING_CAPACITY,
+    FundingSourceConfig, TxIntelligenceConfig, TxIntelligenceEngine,
+    DEFAULT_SESSION_TX_RING_CAPACITY,
 };
 use seer::early_fingerprint::EarlyFingerprintConfig;
 use solana_sdk::pubkey::Pubkey;
@@ -278,6 +279,7 @@ fn session_tx_buffer_is_bounded() {
     gatekeeper_config.min_unique_signers = DEFAULT_SESSION_TX_RING_CAPACITY * 2;
     gatekeeper_config.min_buy_count = DEFAULT_SESSION_TX_RING_CAPACITY * 2;
     gatekeeper_config.max_wait_time_ms = 10_000;
+    let funding_source_config = FundingSourceConfig::from_gatekeeper_config(&gatekeeper_config);
 
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -294,6 +296,7 @@ fn session_tx_buffer_is_bounded() {
             created_at_wall_ms: now_ms,
             deadline_wall_ms: Some(now_ms + 10_000),
             gatekeeper_config,
+            funding_source_config,
             fingerprint_config: EarlyFingerprintConfig::default(),
         })
         .expect("session should open");

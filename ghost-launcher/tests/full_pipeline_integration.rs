@@ -11,6 +11,7 @@ use ghost_launcher::components::gatekeeper_policy::{
 };
 use ghost_launcher::events::{PoolTransaction, RawBytesMissingReason};
 use ghost_launcher::session::{OpenSessionRequest, SessionManager};
+use ghost_launcher::tx_intelligence::FundingSourceConfig;
 use seer::early_fingerprint::EarlyFingerprintConfig;
 use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
@@ -278,6 +279,7 @@ fn canonical_ready_terminal_verdict(config: GatekeeperV2Config) -> GatekeeperVer
             created_at_wall_ms: 1_000,
             deadline_wall_ms: Some(6_000),
             gatekeeper_config: config.clone(),
+            funding_source_config: FundingSourceConfig::from_gatekeeper_config(&config),
             fingerprint_config: EarlyFingerprintConfig::default(),
         })
         .expect("session should open");
@@ -386,6 +388,7 @@ fn phase1_incomplete_feature_snapshot(
             created_at_wall_ms: 1_000,
             deadline_wall_ms: Some(6_000),
             gatekeeper_config: config.clone(),
+            funding_source_config: FundingSourceConfig::from_gatekeeper_config(config),
             fingerprint_config: EarlyFingerprintConfig::default(),
         })
         .expect("session should open");
@@ -436,6 +439,7 @@ fn full_pipeline_dual_ingest_reaches_buy_verdict() {
             created_at_wall_ms: 1_000,
             deadline_wall_ms: Some(6_000),
             gatekeeper_config: config.clone(),
+            funding_source_config: FundingSourceConfig::from_gatekeeper_config(&config),
             fingerprint_config: EarlyFingerprintConfig::default(),
         })
         .expect("session should open");
@@ -671,6 +675,7 @@ fn full_pipeline_bootstrap_state_stays_non_canonical_without_account_ingest() {
     let pool_id = Pubkey::new_unique();
     let base_mint = Pubkey::new_unique();
     let bonding_curve = Pubkey::new_unique();
+    let config = pipeline_config();
 
     manager
         .open_session(OpenSessionRequest {
@@ -681,7 +686,8 @@ fn full_pipeline_bootstrap_state_stays_non_canonical_without_account_ingest() {
             candidate_snapshot: candidate(pool_id, base_mint, bonding_curve),
             created_at_wall_ms: 1_000,
             deadline_wall_ms: Some(6_000),
-            gatekeeper_config: pipeline_config(),
+            gatekeeper_config: config.clone(),
+            funding_source_config: FundingSourceConfig::from_gatekeeper_config(&config),
             fingerprint_config: EarlyFingerprintConfig::default(),
         })
         .expect("session should open");
@@ -700,6 +706,7 @@ fn full_pipeline_ignores_out_of_order_account_updates() {
     let pool_id = Pubkey::new_unique();
     let base_mint = Pubkey::new_unique();
     let bonding_curve = Pubkey::new_unique();
+    let config = pipeline_config();
 
     manager
         .open_session(OpenSessionRequest {
@@ -710,7 +717,8 @@ fn full_pipeline_ignores_out_of_order_account_updates() {
             candidate_snapshot: candidate(pool_id, base_mint, bonding_curve),
             created_at_wall_ms: 1_000,
             deadline_wall_ms: Some(6_000),
-            gatekeeper_config: pipeline_config(),
+            gatekeeper_config: config.clone(),
+            funding_source_config: FundingSourceConfig::from_gatekeeper_config(&config),
             fingerprint_config: EarlyFingerprintConfig::default(),
         })
         .expect("session should open");

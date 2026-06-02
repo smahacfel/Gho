@@ -9,6 +9,7 @@ use ghost_core::EventSemanticEnvelope;
 use ghost_core::{CurveFinality, CurveFreshnessState};
 use ghost_launcher::events::{FundingTransferObserved, PoolTransaction, RawBytesMissingReason};
 use ghost_launcher::session::{OpenSessionRequest, SessionConfig, SessionManager};
+use ghost_launcher::tx_intelligence::FundingSourceConfig;
 use seer::early_fingerprint::EarlyFingerprintConfig;
 use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
@@ -296,6 +297,7 @@ fn open_session_with_deadline_and_gatekeeper_config(
     deadline_wall_ms: u64,
     gatekeeper_config: GatekeeperV2Config,
 ) -> ghost_launcher::session::SharedSession {
+    let funding_source_config = FundingSourceConfig::from_gatekeeper_config(&gatekeeper_config);
     manager
         .open_session(OpenSessionRequest {
             pool_amm_id: pool_id,
@@ -306,6 +308,7 @@ fn open_session_with_deadline_and_gatekeeper_config(
             created_at_wall_ms,
             deadline_wall_ms: Some(deadline_wall_ms),
             gatekeeper_config,
+            funding_source_config,
             fingerprint_config: EarlyFingerprintConfig::default(),
         })
         .expect("session open should succeed");
@@ -1153,6 +1156,9 @@ fn open_session_same_pool_reuses_existing_session() {
             created_at_wall_ms: 6_500,
             deadline_wall_ms: Some(6_999),
             gatekeeper_config: GatekeeperV2Config::default(),
+            funding_source_config: FundingSourceConfig::from_gatekeeper_config(
+                &GatekeeperV2Config::default(),
+            ),
             fingerprint_config: EarlyFingerprintConfig::default(),
         })
         .expect("reopening same pool should reuse existing session");
@@ -1190,6 +1196,9 @@ fn session_limit_rejects_new_pool_without_replacing_existing_session() {
         created_at_wall_ms: 7_100,
         deadline_wall_ms: Some(7_200),
         gatekeeper_config: GatekeeperV2Config::default(),
+        funding_source_config: FundingSourceConfig::from_gatekeeper_config(
+            &GatekeeperV2Config::default(),
+        ),
         fingerprint_config: EarlyFingerprintConfig::default(),
     });
     assert!(matches!(
@@ -1207,6 +1216,9 @@ fn session_limit_rejects_new_pool_without_replacing_existing_session() {
             created_at_wall_ms: 7_150,
             deadline_wall_ms: Some(7_250),
             gatekeeper_config: GatekeeperV2Config::default(),
+            funding_source_config: FundingSourceConfig::from_gatekeeper_config(
+                &GatekeeperV2Config::default(),
+            ),
             fingerprint_config: EarlyFingerprintConfig::default(),
         })
         .expect("existing pool should still be reusable at capacity");

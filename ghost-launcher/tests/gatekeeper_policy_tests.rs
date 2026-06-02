@@ -25,6 +25,7 @@ use ghost_launcher::components::gatekeeper_policy::{
 };
 use ghost_launcher::events::{PoolTransaction, RawBytesMissingReason};
 use ghost_launcher::session::{OpenSessionRequest, PoolObservationSession, SessionManager};
+use ghost_launcher::tx_intelligence::FundingSourceConfig;
 use seer::early_fingerprint::EarlyFingerprintConfig;
 use seer::early_fingerprint::EarlyFingerprintMetrics;
 use solana_sdk::pubkey::Pubkey;
@@ -2095,6 +2096,7 @@ fn session_features_drive_policy_buy() {
             created_at_wall_ms,
             deadline_wall_ms: Some(created_at_wall_ms.saturating_add(5_000)),
             gatekeeper_config: config.clone(),
+            funding_source_config: FundingSourceConfig::from_gatekeeper_config(&config),
             fingerprint_config: EarlyFingerprintConfig::default(),
         })
         .expect("session should open");
@@ -2196,6 +2198,7 @@ fn feature_policy_buys_seeded_flow_without_account_updates_when_curve_data_is_kn
             created_at_wall_ms,
             deadline_wall_ms: Some(created_at_wall_ms.saturating_add(5_000)),
             gatekeeper_config: config.clone(),
+            funding_source_config: FundingSourceConfig::from_gatekeeper_config(&config),
             fingerprint_config: EarlyFingerprintConfig::default(),
         })
         .expect("session should open");
@@ -2315,6 +2318,7 @@ fn feature_policy_buys_seeded_organic_flow() {
             created_at_wall_ms,
             deadline_wall_ms: Some(created_at_wall_ms.saturating_add(5_000)),
             gatekeeper_config: config.clone(),
+            funding_source_config: FundingSourceConfig::from_gatekeeper_config(&config),
             fingerprint_config: EarlyFingerprintConfig::default(),
         })
         .expect("session should open");
@@ -2446,6 +2450,7 @@ fn feature_policy_rejects_dev_sell_after_seeded_flow() {
             created_at_wall_ms,
             deadline_wall_ms: Some(created_at_wall_ms.saturating_add(5_000)),
             gatekeeper_config: config.clone(),
+            funding_source_config: FundingSourceConfig::from_gatekeeper_config(&config),
             fingerprint_config: EarlyFingerprintConfig::default(),
         })
         .expect("session should open");
@@ -2550,6 +2555,7 @@ fn feature_policy_rejects_sell_impact_after_seeded_flow() {
             created_at_wall_ms,
             deadline_wall_ms: Some(created_at_wall_ms.saturating_add(5_000)),
             gatekeeper_config: config.clone(),
+            funding_source_config: FundingSourceConfig::from_gatekeeper_config(&config),
             fingerprint_config: EarlyFingerprintConfig::default(),
         })
         .expect("session should open");
