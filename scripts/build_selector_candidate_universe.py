@@ -113,6 +113,22 @@ def build_universe(
     rows, merge_report = common.merge_candidate_rows(source_rows)
     status_counts = Counter(str(row.get("candidate_universe_status") or "unknown") for row in rows)
     quote_counts = Counter(str(row.get("quote_mint") or "missing") for row in rows)
+    event_denominator_rows_after_dedupe = sum(
+        1 for row in rows if row.get("universe_source_kind") != "decision_log_degraded"
+    )
+    decision_logs_created_denominator_rows = (
+        max(0, len(rows) - event_denominator_rows_after_dedupe)
+        if allow_decision_universe
+        else 0
+    )
+    candidate_ids_from_decision_only = decision_logs_created_denominator_rows
+    denominator_invariant_failures = []
+    if decision_logs_created_denominator_rows != 0:
+        denominator_invariant_failures.append("decision_logs_created_denominator_rows_nonzero")
+    if candidate_ids_from_decision_only != 0:
+        denominator_invariant_failures.append("candidate_ids_from_decision_only_nonzero")
+    if not allow_decision_universe and event_denominator_rows_after_dedupe != len(rows):
+        denominator_invariant_failures.append("rows_written_not_equal_event_denominator_rows_after_dedupe")
     fail_reasons = []
     if status_counts.get("ok", 0) == 0:
         fail_reasons.append("no_ok_birth_create_rows")
@@ -124,11 +140,21 @@ def build_universe(
         fail_reasons.append("degraded_non_birth_events_allowed")
     if allow_decision_universe:
         fail_reasons.append("decision_log_used_as_universe_denominator")
+    fail_reasons.extend(denominator_invariant_failures)
     manifest = {
         "selector_schema_version": common.SCHEMA_VERSION,
         "artifact": "candidate_universe_v1",
         "status": "ok" if not fail_reasons else "NO-GO",
         "fail_reasons": fail_reasons,
+        "denominator_source": "event_artifact_only"
+        if not allow_decision_universe
+        else "decision_log_degraded_no_go",
+        "event_denominator_rows_after_dedupe": event_denominator_rows_after_dedupe,
+        "decision_logs_created_denominator_rows": decision_logs_created_denominator_rows,
+        "candidate_ids_from_decision_only": candidate_ids_from_decision_only,
+        "denominator_invariant_status": "PASS"
+        if not denominator_invariant_failures
+        else "NO-GO",
         "universe_contract": {
             "cohort": "SOL-paired pump.fun bonding-curve birth/create events",
             "birth_create_event_filter": sorted(common.BIRTH_EVENT_TYPES),

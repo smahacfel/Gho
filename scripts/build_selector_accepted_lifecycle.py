@@ -23,6 +23,7 @@ def build_accepted_lifecycle(
         for row in input_rows
     ]
     status_counts = Counter(str(row.get("analysis_status") or "unknown") for row in rows)
+    lifecycle_status_counts = Counter(str(row.get("lifecycle_status") or "unknown") for row in rows)
     r1_counts = Counter(str(row.get("r1_label") or row.get("r1_excluded_reason") or "gray") for row in rows)
     manifest = {
         "selector_schema_version": common.SCHEMA_VERSION,
@@ -33,6 +34,7 @@ def build_accepted_lifecycle(
         "rows_written": len(rows),
         "pnl_target_net_pct": pnl_target_net_pct,
         "analysis_status_counts": common.counter_dict(status_counts),
+        "lifecycle_status_counts": common.counter_dict(lifecycle_status_counts),
         "r1_counts": common.counter_dict(r1_counts),
         "source_contract": "projection_of_existing_shadow_onchain_lifecycle_report_not_new_labeler",
     }
@@ -75,4 +77,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

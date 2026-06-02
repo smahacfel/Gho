@@ -526,7 +526,16 @@ def project_accepted_lifecycle_row(row: dict[str, Any], *, pnl_target_net_pct: f
         "final_pnl_sol": shadow.get("final_pnl_sol"),
         "execution_outcome": shadow.get("execution_outcome") or row.get("execution_outcome"),
     }
-    out.update(classify_r1(row, pnl_target_net_pct=pnl_target_net_pct))
+    r1 = classify_r1(row, pnl_target_net_pct=pnl_target_net_pct)
+    if row.get("truth_status") == "resolved" and r1.get("execution_realized") is True:
+        lifecycle_status = "resolved"
+    elif row.get("truth_status") == "resolved":
+        lifecycle_status = "execution_not_realized"
+    else:
+        lifecycle_status = "unresolved"
+    out["lifecycle_status"] = lifecycle_status
+    out["label_resolved"] = lifecycle_status == "resolved"
+    out.update(r1)
     return out
 
 

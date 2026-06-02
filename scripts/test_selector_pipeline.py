@@ -14,6 +14,7 @@ import build_selector_candidate_universe as universe
 import build_selector_canonical_r2_source as canonical_r2
 import build_selector_dataset as dataset
 import build_selector_feature_snapshots as snapshots
+import build_selector_phase1_report as phase1_report
 import build_selector_phase2 as phase2
 import build_selector_r2_market_paths as r2_paths
 import build_selector_training_view as training
@@ -102,6 +103,11 @@ class SelectorPipelineTests(unittest.TestCase):
 
         self.assertEqual(summary["duplicates"], 2)
         self.assertEqual(summary["status"], "NO-GO")
+        self.assertEqual(summary["denominator_source"], "event_artifact_only")
+        self.assertEqual(summary["event_denominator_rows_after_dedupe"], 2)
+        self.assertEqual(summary["decision_logs_created_denominator_rows"], 0)
+        self.assertEqual(summary["candidate_ids_from_decision_only"], 0)
+        self.assertEqual(summary["denominator_invariant_status"], "PASS")
         self.assertEqual(summary["identity_collisions"], [])
         self.assertEqual(len(rows), 2)
         by_id = {row["candidate_id"]: row for row in rows}
@@ -109,6 +115,95 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertFalse(by_id["c1"]["decision_verdict_buy"])
         self.assertEqual(by_id["c2"]["candidate_universe_status"], "universe_incomplete")
         self.assertIn("quote_mint", by_id["c2"]["candidate_identity_missing_fields"])
+
+    def test_phase1_report_join_coverage_keeps_r2_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            candidate_universe = root / "candidate_universe_v1.jsonl"
+            accepted_lifecycle = root / "accepted_lifecycle_v1.jsonl"
+            candidate_manifest = root / "candidate_universe_manifest_v1.json"
+            accepted_manifest = root / "accepted_lifecycle_manifest_v1.json"
+            phase1_join = root / "phase1_join_coverage_v1.json"
+            label_coverage = root / "label_coverage_v1.json"
+            dataset_manifest = root / "dataset_manifest_v1.json"
+            write_jsonl(
+                candidate_universe,
+                [
+                    {
+                        "candidate_id": "c1",
+                        "candidate_universe_status": "ok",
+                        "base_mint": "mint1",
+                        "pool_id": "pool1",
+                        "bonding_curve": "curve1",
+                        "quote_mint": "SOL",
+                        "birth_ts_ms": 1_000,
+                    }
+                ],
+            )
+            write_jsonl(
+                accepted_lifecycle,
+                [
+                    {
+                        "candidate_id": "c1",
+                        "lifecycle_status": "resolved",
+                        "label_resolved": True,
+                        "base_mint": "mint1",
+                        "pool_id": "pool1",
+                    }
+                ],
+            )
+            candidate_manifest.write_text(
+                json.dumps(
+                    {
+                        "status": "ok",
+                        "identity_collisions": [],
+                        "decision_logs_created_denominator_rows": 0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            accepted_manifest.write_text(json.dumps({"status": "ok"}), encoding="utf-8")
+
+            manifest = phase1_report.run(
+                phase1_report.build_parser().parse_args(
+                    [
+                        "--scope",
+                        "selector-phase1-test",
+                        "--source-scope",
+                        "source-test",
+                        "--root",
+                        str(root),
+                        "--candidate-universe",
+                        str(candidate_universe),
+                        "--accepted-lifecycle",
+                        str(accepted_lifecycle),
+                        "--candidate-manifest",
+                        str(candidate_manifest),
+                        "--accepted-manifest",
+                        str(accepted_manifest),
+                        "--lifecycle-report",
+                        str(accepted_lifecycle),
+                        "--phase1-join-output",
+                        str(phase1_join),
+                        "--label-coverage-output",
+                        str(label_coverage),
+                        "--dataset-manifest-output",
+                        str(dataset_manifest),
+                    ]
+                )
+            )
+            coverage = json.loads(phase1_join.read_text(encoding="utf-8"))
+            label_payload = json.loads(label_coverage.read_text(encoding="utf-8"))
+
+        self.assertEqual(manifest["phase1_status"], "PASS")
+        self.assertEqual(manifest["denominator_source"], "event_artifact_only")
+        self.assertFalse(manifest["r2_labels_built"])
+        self.assertFalse(manifest["selector_training_view_built"])
+        self.assertFalse(manifest["baseline_built"])
+        self.assertFalse(manifest["shadow_only_emit"]["enabled"])
+        self.assertEqual(coverage["accepted_lifecycle_join_completeness"], 1.0)
+        self.assertEqual(coverage["accepted_rows_joined"], 1)
+        self.assertEqual(label_payload["r2_status"], "not_built_in_phase1")
 
     def test_accepted_lifecycle_r1_timestop_below_target_is_explicit_negative(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -148,6 +243,8 @@ class SelectorPipelineTests(unittest.TestCase):
             row = read_jsonl(output)[0]
 
         self.assertTrue(row["execution_realized"])
+        self.assertEqual(row["lifecycle_status"], "resolved")
+        self.assertTrue(row["label_resolved"])
         self.assertEqual(row["r1_label"], "negative")
         self.assertEqual(row["r1_label_reason"], "time_stop_below_target")
         self.assertIsNone(row["r1_gray_reason"])
