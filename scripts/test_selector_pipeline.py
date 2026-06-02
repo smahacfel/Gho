@@ -14,6 +14,7 @@ import build_selector_candidate_universe as universe
 import build_selector_dataset as dataset
 import build_selector_feature_snapshots as snapshots
 import build_selector_phase2 as phase2
+import build_selector_r2_market_paths as r2_paths
 import build_selector_training_view as training
 import compare_selector_gatekeepers as compare
 import selector_pipeline_common as common
@@ -1092,7 +1093,7 @@ class SelectorPipelineTests(unittest.TestCase):
             self.assertTrue((report_dir / "dataset_manifest_v1.json").exists())
             self.assertIn("dataset_manifest_v1", manifest["outputs"])
 
-    def test_phase2_p2a_orchestrator_writes_features_and_keeps_scoring_disabled(self) -> None:
+    def test_phase2_orchestrator_writes_features_and_r2_missing_paths_without_scoring(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             scope = "unit"
@@ -1174,15 +1175,261 @@ class SelectorPipelineTests(unittest.TestCase):
             self.assertFalse((dataset_dir / "selector_training_view_v1.jsonl").exists())
             self.assertFalse((report_dir / "selector_baseline_v1.json").exists())
             self.assertFalse((report_dir / "gatekeeper_compare_v25_v3_v1.json").exists())
-            self.assertEqual(manifest["phase2_stage_status"], "P2A_PASS")
+            self.assertTrue((dataset_dir / "r2_market_paths_v1.jsonl").exists())
+            self.assertTrue((report_dir / "r2_market_path_coverage_v1.json").exists())
+            r2_rows = read_jsonl(dataset_dir / "r2_market_paths_v1.jsonl")
+            self.assertEqual(len(r2_rows), 1)
+            self.assertEqual(r2_rows[0]["r2_status"], "missing_path")
+            self.assertEqual(r2_rows[0]["r2_excluded_reason"], "no_canonical_market_path")
+            self.assertEqual(manifest["phase2_stage_status"], "P2B_PENDING_R2_DENOMINATOR")
             self.assertEqual(manifest["phase2_status"], "NO-GO/PENDING_R2_DENOMINATOR")
             self.assertEqual(manifest["r2_config"]["profile"], "r2_40_40_60s_v1")
-            self.assertFalse(manifest["r2_market_paths_built"])
-            self.assertFalse(manifest["r2_label_projection_built"])
+            self.assertTrue(manifest["r2_market_paths_built"])
+            self.assertTrue(manifest["r2_label_projection_built"])
             self.assertFalse(manifest["r2_resolved_denominator_built"])
             self.assertFalse(manifest["selector_training_view_built"])
             self.assertFalse(manifest["baseline_built"])
             self.assertFalse(manifest["shadow_only_emit"]["enabled"])
+
+    def test_r2_market_paths_writes_one_row_per_candidate_and_missing_path_is_unresolved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            candidates = root / "candidate_universe_v1.jsonl"
+            write_jsonl(
+                candidates,
+                [
+                    {
+                        "candidate_id": "c1",
+                        "base_mint": "mint1",
+                        "pool_id": "pool1",
+                        "bonding_curve": "curve1",
+                        "decision_ts_ms": 1_000,
+                    },
+                    {
+                        "candidate_id": "c2",
+                        "base_mint": "mint2",
+                        "pool_id": "pool2",
+                        "bonding_curve": "curve2",
+                        "decision_ts_ms": 1_000,
+                    },
+                ],
+            )
+            rows, coverage = r2_paths.build_r2_market_paths(
+                candidate_universe=candidates,
+                account_update_paths=[],
+                diag_account_update_paths=[],
+                canonical_snapshot_paths=[],
+                target_net_pct=40,
+                stop_net_pct=40,
+                horizon_ms=60_000,
+            )
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({row["r2_status"] for row in rows}, {"missing_path"})
+        self.assertEqual(coverage["status"], "NO-GO/PENDING_R2_DENOMINATOR")
+        self.assertEqual(coverage["r2_missing_path_rows"], 2)
+        self.assertEqual(coverage["r2_resolved_rows"], 0)
+
+    def test_r2_market_paths_target_stop_and_no_target_labels(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            candidates = root / "candidate_universe_v1.jsonl"
+            source = root / "account_updates.jsonl"
+            write_jsonl(
+                candidates,
+                [
+                    {
+                        "candidate_id": "target",
+                        "base_mint": "mint1",
+                        "pool_id": "pool1",
+                        "bonding_curve": "curve1",
+                        "decision_ts_ms": 1_000,
+                    },
+                    {
+                        "candidate_id": "stop",
+                        "base_mint": "mint2",
+                        "pool_id": "pool2",
+                        "bonding_curve": "curve2",
+                        "decision_ts_ms": 1_000,
+                    },
+                    {
+                        "candidate_id": "flat",
+                        "base_mint": "mint3",
+                        "pool_id": "pool3",
+                        "bonding_curve": "curve3",
+                        "decision_ts_ms": 1_000,
+                    },
+                ],
+            )
+            write_jsonl(
+                source,
+                [
+                    {
+                        "candidate_id": "target",
+                        "path_source": "yellowstone_account_update",
+                        "path_coverage_ok": True,
+                        "horizon_matured": True,
+                        "samples": [
+                            {"offset_ms": 1_000, "return_pct": 45.0},
+                            {"offset_ms": 60_000, "return_pct": -45.0},
+                        ],
+                    },
+                    {
+                        "candidate_id": "stop",
+                        "path_source": "DIAG_ACCOUNT_UPDATE_RELAY",
+                        "path_coverage_ok": True,
+                        "horizon_matured": True,
+                        "samples": [
+                            {"offset_ms": 1_000, "return_pct": -45.0},
+                            {"offset_ms": 60_000, "return_pct": 45.0},
+                        ],
+                    },
+                    {
+                        "candidate_id": "flat",
+                        "path_source": "canonical_account_state_snapshot",
+                        "path_coverage_ok": True,
+                        "horizon_matured": True,
+                        "samples": [{"offset_ms": 60_000, "return_pct": 5.0}],
+                    },
+                ],
+            )
+            rows, coverage = r2_paths.build_r2_market_paths(
+                candidate_universe=candidates,
+                account_update_paths=[source],
+                diag_account_update_paths=[],
+                canonical_snapshot_paths=[],
+                target_net_pct=40,
+                stop_net_pct=40,
+                horizon_ms=60_000,
+            )
+
+        by_id = {row["candidate_id"]: row for row in rows}
+        self.assertEqual(by_id["target"]["r2_label"], "positive")
+        self.assertEqual(by_id["target"]["r2_status"], "positive")
+        self.assertEqual(by_id["target"]["r2_label_reason"], "target_before_stop")
+        self.assertEqual(by_id["stop"]["r2_label"], "negative")
+        self.assertEqual(by_id["stop"]["r2_label_reason"], "stop_before_target")
+        self.assertEqual(by_id["flat"]["r2_label"], "negative")
+        self.assertEqual(by_id["flat"]["r2_label_reason"], "no_target_by_horizon")
+        self.assertEqual(coverage["status"], "PASS")
+        self.assertEqual(coverage["r2_resolved_rows"], 3)
+
+    def test_r2_market_paths_unresolved_statuses_do_not_become_negative(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            candidates = root / "candidate_universe_v1.jsonl"
+            source = root / "account_updates.jsonl"
+            write_jsonl(
+                candidates,
+                [
+                    {
+                        "candidate_id": "incomplete",
+                        "base_mint": "mint1",
+                        "pool_id": "pool1",
+                        "bonding_curve": "curve1",
+                        "decision_ts_ms": 1_000,
+                    },
+                    {
+                        "candidate_id": "unmatured",
+                        "base_mint": "mint2",
+                        "pool_id": "pool2",
+                        "bonding_curve": "curve2",
+                        "decision_ts_ms": 1_000,
+                    },
+                ],
+            )
+            write_jsonl(
+                source,
+                [
+                    {
+                        "candidate_id": "incomplete",
+                        "path_source": "yellowstone_account_update",
+                        "path_coverage_ok": False,
+                        "horizon_matured": True,
+                        "samples": [{"offset_ms": 60_000, "return_pct": 5.0}],
+                    },
+                    {
+                        "candidate_id": "unmatured",
+                        "path_source": "yellowstone_account_update",
+                        "path_coverage_ok": True,
+                        "horizon_matured": False,
+                        "samples": [{"offset_ms": 1_000, "return_pct": 5.0}],
+                    },
+                ],
+            )
+            rows, _coverage = r2_paths.build_r2_market_paths(
+                candidate_universe=candidates,
+                account_update_paths=[source],
+                diag_account_update_paths=[],
+                canonical_snapshot_paths=[],
+                target_net_pct=40,
+                stop_net_pct=40,
+                horizon_ms=60_000,
+            )
+
+        by_id = {row["candidate_id"]: row for row in rows}
+        self.assertIsNone(by_id["incomplete"]["r2_label"])
+        self.assertEqual(by_id["incomplete"]["r2_status"], "stream_incomplete")
+        self.assertIsNone(by_id["unmatured"]["r2_label"])
+        self.assertEqual(by_id["unmatured"]["r2_status"], "horizon_unmatured")
+
+    def test_r2_market_paths_reject_nln_and_rpc_as_canonical_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            candidates = root / "candidate_universe_v1.jsonl"
+            source = root / "account_updates.jsonl"
+            write_jsonl(
+                candidates,
+                [
+                    {
+                        "candidate_id": "nln",
+                        "base_mint": "mint1",
+                        "pool_id": "pool1",
+                        "bonding_curve": "curve1",
+                        "decision_ts_ms": 1_000,
+                    },
+                    {
+                        "candidate_id": "rpc",
+                        "base_mint": "mint2",
+                        "pool_id": "pool2",
+                        "bonding_curve": "curve2",
+                        "decision_ts_ms": 1_000,
+                    },
+                ],
+            )
+            write_jsonl(
+                source,
+                [
+                    {
+                        "candidate_id": "nln",
+                        "path_source": "nln_program_stream_pumpfun_trade",
+                        "path_coverage_ok": True,
+                        "horizon_matured": True,
+                        "samples": [{"offset_ms": 60_000, "return_pct": 50.0}],
+                    },
+                    {
+                        "candidate_id": "rpc",
+                        "path_source": "rpc_canonical_account_state",
+                        "path_coverage_ok": True,
+                        "horizon_matured": True,
+                        "samples": [{"offset_ms": 60_000, "return_pct": 50.0}],
+                    },
+                ],
+            )
+            rows, coverage = r2_paths.build_r2_market_paths(
+                candidate_universe=candidates,
+                account_update_paths=[source],
+                diag_account_update_paths=[],
+                canonical_snapshot_paths=[],
+                target_net_pct=40,
+                stop_net_pct=40,
+                horizon_ms=60_000,
+            )
+
+        self.assertEqual({row["r2_status"] for row in rows}, {"noncanonical_source"})
+        self.assertTrue(all(row["r2_label"] is None for row in rows))
+        self.assertEqual(coverage["r2_noncanonical_source_rows"], 2)
+        self.assertEqual(coverage["r2_resolved_rows"], 0)
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import build_selector_feature_snapshots as snapshots
+import build_selector_r2_market_paths as r2_paths
 import selector_pipeline_common as common
 
 
@@ -147,23 +148,42 @@ def build_phase2(args: argparse.Namespace) -> dict[str, Any]:
     shadow_audit = shadow_ledger_snapshot_audit(args.shadow_ledger_snapshot_audit)
     common.write_json(shadow_audit_path, shadow_audit)
 
+    r2_output = dataset_dir / "r2_market_paths_v1.jsonl"
+    r2_coverage_output = report_dir / "r2_market_path_coverage_v1.json"
+    r2_rows, r2_coverage = r2_paths.build_r2_market_paths(
+        candidate_universe=candidate_universe,
+        account_update_paths=args.account_update,
+        diag_account_update_paths=args.diag_account_update,
+        canonical_snapshot_paths=args.canonical_snapshot_jsonl,
+        target_net_pct=args.target_net_pct,
+        stop_net_pct=args.stop_net_pct,
+        horizon_ms=args.horizon_ms,
+    )
+    common.write_jsonl(r2_output, r2_rows)
+    common.write_json(r2_coverage_output, r2_coverage)
+
     feature_ok = (
         feature_report.get("status") == "ok"
         and feature_report.get("feature_snapshot_gate_status") == "PASS"
         and feature_report.get("leakage_precheck") == "PASS"
     )
-    phase2_stage_status = "P2A_PASS" if feature_ok else "NO-GO/FEATURE_SNAPSHOTS"
+    r2_resolved_rows = int(r2_coverage.get("r2_resolved_rows") or 0)
+    r2_resolved_denominator_built = r2_resolved_rows > 0
+    if not feature_ok:
+        phase2_stage_status = "NO-GO/FEATURE_SNAPSHOTS"
+        phase2_status = "NO-GO/FEATURE_SNAPSHOTS"
+    elif r2_resolved_denominator_built:
+        phase2_stage_status = "P2B_PASS"
+        phase2_status = "P2B_PASS_PENDING_LABEL_COVERAGE"
+    else:
+        phase2_stage_status = "P2B_PENDING_R2_DENOMINATOR"
+        phase2_status = "NO-GO/PENDING_R2_DENOMINATOR"
     phase2_fail_reasons: list[str] = []
     if not feature_ok:
         phase2_fail_reasons.append("feature_snapshots_not_phase2_ready")
         phase2_fail_reasons.extend(str(reason) for reason in feature_report.get("fail_reasons", []))
-    if feature_ok:
-        phase2_fail_reasons.extend(
-            [
-                "r2_market_paths_not_built_in_p2a",
-                "r2_resolved_denominator_not_built",
-            ]
-        )
+    if feature_ok and not r2_resolved_denominator_built:
+        phase2_fail_reasons.extend(str(reason) for reason in r2_coverage.get("fail_reasons", []))
 
     r2_config = {
         "profile": "r2_40_40_60s_v1",
@@ -178,44 +198,39 @@ def build_phase2(args: argparse.Namespace) -> dict[str, Any]:
         {
             "feature_snapshots_v1": file_provenance(feature_output),
             "feature_snapshots_manifest_v1": file_provenance(feature_manifest_output),
+            "r2_market_paths_v1": file_provenance(r2_output),
+            "r2_market_path_coverage_v1": file_provenance(r2_coverage_output),
             "shadow_ledger_snapshot_audit_v1": file_provenance(shadow_audit_path),
         }
     )
     stage_reports = dict(manifest.get("stage_reports") or {})
     stage_reports["feature_snapshots_v1"] = feature_report
+    stage_reports["r2_market_paths_v1"] = r2_coverage
     stage_reports["shadow_ledger_snapshot_audit_v1"] = shadow_audit
-    stage_reports["phase2_p2a"] = {
+    stage_reports["phase2_p2b"] = {
         "status": phase2_stage_status,
-        "phase2_status": (
-            "NO-GO/PENDING_R2_DENOMINATOR"
-            if feature_ok
-            else "NO-GO/FEATURE_SNAPSHOTS"
-        ),
+        "phase2_status": phase2_status,
         "r2_config": r2_config,
         "feature_snapshots_built": True,
-        "r2_market_paths_built": False,
-        "r2_label_projection_built": False,
-        "r2_resolved_denominator_built": False,
-        "r2_resolved_rows": 0,
+        "r2_market_paths_built": True,
+        "r2_label_projection_built": True,
+        "r2_resolved_denominator_built": r2_resolved_denominator_built,
+        "r2_resolved_rows": r2_resolved_rows,
     }
 
     manifest.update(
         {
             "current_phase": "phase2",
             "phase2_stage_status": phase2_stage_status,
-            "phase2_status": (
-                "NO-GO/PENDING_R2_DENOMINATOR"
-                if feature_ok
-                else "NO-GO/FEATURE_SNAPSHOTS"
-            ),
+            "phase2_status": phase2_status,
             "phase2_fail_reasons": phase2_fail_reasons,
             "r2_config": r2_config,
             "feature_snapshots_built": True,
             "r2_labels_built": False,
-            "r2_market_paths_built": False,
-            "r2_label_projection_built": False,
-            "r2_resolved_denominator_built": False,
-            "r2_resolved_rows": 0,
+            "r2_market_paths_built": True,
+            "r2_label_projection_built": True,
+            "r2_resolved_denominator_built": r2_resolved_denominator_built,
+            "r2_resolved_rows": r2_resolved_rows,
             "selector_training_view_built": False,
             "baseline_built": False,
             "gatekeeper_compare_built": False,
@@ -238,6 +253,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--phase1-manifest", type=Path)
     parser.add_argument("--candidate-universe", type=Path)
     parser.add_argument("--events", type=Path, action="append", default=[])
+    parser.add_argument("--account-update", type=Path, action="append", default=[])
+    parser.add_argument("--diag-account-update", type=Path, action="append", default=[])
+    parser.add_argument("--canonical-snapshot-jsonl", type=Path, action="append", default=[])
     parser.add_argument("--shadow-ledger-snapshot-audit", type=Path, action="append", default=[])
     parser.add_argument("--target-net-pct", required=True, type=float)
     parser.add_argument("--stop-net-pct", required=True, type=float)
@@ -257,7 +275,7 @@ def main(argv: list[str] | None = None) -> int:
     manifest = build_phase2(args)
     if args.json:
         print(json.dumps(manifest, ensure_ascii=False, sort_keys=True))
-    return 0 if manifest.get("phase2_stage_status") == "P2A_PASS" else 2
+    return 0 if manifest.get("phase2_stage_status") in {"P2B_PASS", "P2B_PENDING_R2_DENOMINATOR"} else 2
 
 
 if __name__ == "__main__":
