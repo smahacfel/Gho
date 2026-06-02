@@ -18,6 +18,8 @@ def load_source_rows(
     source_kind: str,
     require_birth_event: bool,
     allow_degraded_events: bool = False,
+    window_start_ms: int | None = None,
+    window_end_ms: int | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     skipped = Counter()
@@ -34,6 +36,19 @@ def load_source_rows(
                 source_path=str(path),
                 source_index=index,
             )
+            window_ts = common.int_or_none(
+                item.get("birth_ts_ms") if require_birth_event else item.get("decision_ts_ms")
+            )
+            if window_start_ms is not None or window_end_ms is not None:
+                if window_ts is None:
+                    skipped["missing_window_timestamp"] += 1
+                    continue
+                if window_start_ms is not None and window_ts < window_start_ms:
+                    skipped["before_window"] += 1
+                    continue
+                if window_end_ms is not None and window_ts > window_end_ms:
+                    skipped["after_window"] += 1
+                    continue
             item["universe_source_kind"] = source_kind
             item["birth_create_event_verified"] = is_birth
             rows.append(item)
@@ -51,12 +66,16 @@ def build_universe(
     allow_degraded_events: bool = False,
     allow_decision_universe: bool = False,
     allow_incomplete_universe: bool = False,
+    window_start_ms: int | None = None,
+    window_end_ms: int | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     source_rows, event_load = load_source_rows(
         event_paths,
         source_kind="event_artifact" if not allow_degraded_events else "event_artifact_degraded",
         require_birth_event=True,
         allow_degraded_events=allow_degraded_events,
+        window_start_ms=window_start_ms,
+        window_end_ms=window_end_ms,
     )
     decision_load = {"rows_read": 0, "rows_loaded": 0, "skipped_counts": {}}
     decision_only_rows_skipped = 0
@@ -69,6 +88,8 @@ def build_universe(
             decision_paths,
             source_kind="decision_log_context",
             require_birth_event=False,
+            window_start_ms=window_start_ms,
+            window_end_ms=window_end_ms,
         )
         if allow_decision_universe:
             for row in decision_rows:
@@ -146,6 +167,14 @@ def build_universe(
         "artifact": "candidate_universe_v1",
         "status": "ok" if not fail_reasons else "NO-GO",
         "fail_reasons": fail_reasons,
+        "scope_kind": "windowed" if window_start_ms is not None or window_end_ms is not None else "full",
+        "window_start_ts_ms": window_start_ms,
+        "window_end_ts_ms": window_end_ms,
+        "window_filter": {
+            "event_artifact_timestamp": "birth_ts_ms",
+            "decision_context_timestamp": "decision_ts_ms",
+            "missing_timestamp": "skipped_not_denominator",
+        },
         "denominator_source": "event_artifact_only"
         if not allow_decision_universe
         else "decision_log_degraded_no_go",
@@ -215,6 +244,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Diagnostic mode: do not fail manifest solely on universe_incomplete rows.",
     )
+    parser.add_argument("--window-start-ms", type=int)
+    parser.add_argument("--window-end-ms", type=int)
     parser.add_argument("--json", action="store_true", help="print manifest JSON")
     return parser
 
@@ -226,6 +257,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         allow_degraded_events=args.allow_degraded_events,
         allow_decision_universe=args.allow_decision_universe,
         allow_incomplete_universe=args.allow_incomplete_universe,
+        window_start_ms=args.window_start_ms,
+        window_end_ms=args.window_end_ms,
     )
     common.write_jsonl(args.output, rows)
     if args.manifest_output:

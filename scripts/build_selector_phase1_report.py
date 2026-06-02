@@ -48,6 +48,8 @@ def build_phase1_join_coverage(
     accepted_lifecycle: Path,
     candidate_manifest: Path | None,
     accepted_manifest: Path | None,
+    window_start_ms: int | None = None,
+    window_end_ms: int | None = None,
 ) -> dict[str, Any]:
     candidates = list(common.iter_json_objects(candidate_universe))
     accepted_rows = list(common.iter_json_objects(accepted_lifecycle))
@@ -122,6 +124,9 @@ def build_phase1_join_coverage(
         "selector_schema_version": common.SCHEMA_VERSION,
         "artifact": "phase1_join_coverage_v1",
         "phase": "phase1",
+        "scope_kind": "windowed" if window_start_ms is not None or window_end_ms is not None else "full",
+        "window_start_ts_ms": window_start_ms,
+        "window_end_ts_ms": window_end_ms,
         "status": "PASS" if not fail_reasons else "NO-GO",
         "phase1_gate_status": "PASS" if not fail_reasons else "NO-GO",
         "fail_reasons": fail_reasons,
@@ -170,11 +175,21 @@ def build_dataset_manifest(
         "dataset_manifest_v1": report_dir / "dataset_manifest_v1.json",
     }
     phase1_status = "PASS" if join_coverage.get("status") == "PASS" else "NO-GO"
+    scope_kind = (
+        "windowed"
+        if args.window_start_ms is not None or args.window_end_ms is not None
+        else "full"
+    )
     return {
         "selector_schema_version": common.SCHEMA_VERSION,
         "artifact": "dataset_manifest_v1",
         "scope": args.scope,
         "source_scope": args.source_scope,
+        "scope_kind": scope_kind,
+        "window_start_ts_ms": args.window_start_ms,
+        "window_end_ts_ms": args.window_end_ms,
+        "window_reason": args.window_reason,
+        "excluded_window_reason": args.excluded_window_reason,
         "phase": "phase1",
         "current_phase": "phase1",
         "status": phase1_status,
@@ -213,6 +228,12 @@ def build_dataset_manifest(
             "lifecycle_report_manifest": file_provenance(args.lifecycle_report_manifest),
             "config_snapshot": file_provenance(args.config_snapshot),
         },
+        "window_contract": {
+            "scope_kind": scope_kind,
+            "candidate_universe_filter": "birth_ts_ms",
+            "accepted_lifecycle_filter": "decision_ts_ms_or_entry_execution_ts_ms",
+            "decision_logs": "context_only_not_denominator",
+        },
         "outputs": {name: file_provenance(path) for name, path in sorted(outputs.items())},
         "stage_reports": {
             "candidate_universe_v1": read_json(outputs["candidate_universe_manifest_v1"]),
@@ -243,6 +264,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--accepted-buy-log", type=Path)
     parser.add_argument("--lifecycle-report-manifest", type=Path)
     parser.add_argument("--config-snapshot", type=Path)
+    parser.add_argument("--window-start-ms", type=int)
+    parser.add_argument("--window-end-ms", type=int)
+    parser.add_argument("--window-reason")
+    parser.add_argument("--excluded-window-reason")
     parser.add_argument("--phase1-join-output", required=True, type=Path)
     parser.add_argument("--label-coverage-output", required=True, type=Path)
     parser.add_argument("--dataset-manifest-output", required=True, type=Path)
@@ -256,6 +281,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         accepted_lifecycle=args.accepted_lifecycle,
         candidate_manifest=args.candidate_manifest,
         accepted_manifest=args.accepted_manifest,
+        window_start_ms=args.window_start_ms,
+        window_end_ms=args.window_end_ms,
     )
     common.write_json(args.phase1_join_output, join_coverage)
     label_coverage = {

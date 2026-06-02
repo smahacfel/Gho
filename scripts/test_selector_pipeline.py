@@ -116,6 +116,74 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertEqual(by_id["c2"]["candidate_universe_status"], "universe_incomplete")
         self.assertIn("quote_mint", by_id["c2"]["candidate_identity_missing_fields"])
 
+    def test_candidate_universe_window_filters_birth_events_not_decision_denominator(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            events = root / "events.jsonl"
+            decisions = root / "decisions.jsonl"
+            output = root / "candidate_universe_v1.jsonl"
+            write_jsonl(
+                events,
+                [
+                    {
+                        "type": "NewPoolDetected",
+                        "candidate_id": "before",
+                        "base_mint": "mint_before",
+                        "pool_id": "pool_before",
+                        "bonding_curve": "curve_before",
+                        "quote_mint": "SOL",
+                        "birth_ts_ms": 900,
+                    },
+                    {
+                        "type": "NewPoolDetected",
+                        "candidate_id": "inside",
+                        "base_mint": "mint_inside",
+                        "pool_id": "pool_inside",
+                        "bonding_curve": "curve_inside",
+                        "quote_mint": "SOL",
+                        "birth_ts_ms": 1_500,
+                    },
+                ],
+            )
+            write_jsonl(
+                decisions,
+                [
+                    {
+                        "base_mint": "mint_inside",
+                        "pool_id": "pool_inside",
+                        "bonding_curve": "curve_inside",
+                        "decision_ts_ms": 1_600,
+                        "decision_verdict_buy": True,
+                    }
+                ],
+            )
+            summary = universe.run(
+                universe.build_parser().parse_args(
+                    [
+                        "--events",
+                        str(events),
+                        "--decisions",
+                        str(decisions),
+                        "--output",
+                        str(output),
+                        "--window-start-ms",
+                        "1000",
+                        "--window-end-ms",
+                        "2000",
+                    ]
+                )
+            )
+            rows = read_jsonl(output)
+
+        self.assertEqual(summary["status"], "ok")
+        self.assertEqual(summary["scope_kind"], "windowed")
+        self.assertEqual(summary["event_load"]["skipped_counts"]["before_window"], 1)
+        self.assertEqual(summary["decision_logs_created_denominator_rows"], 0)
+        self.assertEqual(summary["event_denominator_rows_after_dedupe"], 1)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["candidate_id"], "inside")
+        self.assertTrue(rows[0]["decision_verdict_buy"])
+
     def test_phase1_report_join_coverage_keeps_r2_disabled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -183,6 +251,14 @@ class SelectorPipelineTests(unittest.TestCase):
                         str(accepted_manifest),
                         "--lifecycle-report",
                         str(accepted_lifecycle),
+                        "--window-start-ms",
+                        "1000",
+                        "--window-end-ms",
+                        "2000",
+                        "--window-reason",
+                        "unit_test_window",
+                        "--excluded-window-reason",
+                        "unit_test_exclusion",
                         "--phase1-join-output",
                         str(phase1_join),
                         "--label-coverage-output",
@@ -196,11 +272,16 @@ class SelectorPipelineTests(unittest.TestCase):
             label_payload = json.loads(label_coverage.read_text(encoding="utf-8"))
 
         self.assertEqual(manifest["phase1_status"], "PASS")
+        self.assertEqual(manifest["scope_kind"], "windowed")
+        self.assertEqual(manifest["window_start_ts_ms"], 1000)
+        self.assertEqual(manifest["window_end_ts_ms"], 2000)
+        self.assertEqual(manifest["window_reason"], "unit_test_window")
         self.assertEqual(manifest["denominator_source"], "event_artifact_only")
         self.assertFalse(manifest["r2_labels_built"])
         self.assertFalse(manifest["selector_training_view_built"])
         self.assertFalse(manifest["baseline_built"])
         self.assertFalse(manifest["shadow_only_emit"]["enabled"])
+        self.assertEqual(coverage["scope_kind"], "windowed")
         self.assertEqual(coverage["accepted_lifecycle_join_completeness"], 1.0)
         self.assertEqual(coverage["accepted_rows_joined"], 1)
         self.assertEqual(label_payload["r2_status"], "not_built_in_phase1")
@@ -248,6 +329,61 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertEqual(row["r1_label"], "negative")
         self.assertEqual(row["r1_label_reason"], "time_stop_below_target")
         self.assertIsNone(row["r1_gray_reason"])
+
+    def test_accepted_lifecycle_window_filters_by_decision_or_entry_time(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "lifecycle.jsonl"
+            output = root / "accepted_lifecycle_v1.jsonl"
+            write_jsonl(
+                source,
+                [
+                    {
+                        "analysis_status": "ok",
+                        "candidate_id": "before",
+                        "mint_id": "mint_before",
+                        "pool_id": "pool_before",
+                        "close_reason": "TimeStop",
+                        "truth_status": "resolved",
+                        "timing": {"decision_ts_ms": 900},
+                        "shadow": {"final_pnl_pct": -1.0},
+                    },
+                    {
+                        "analysis_status": "ok",
+                        "candidate_id": "inside",
+                        "mint_id": "mint_inside",
+                        "pool_id": "pool_inside",
+                        "close_reason": "Target",
+                        "truth_status": "resolved",
+                        "timing": {"entry_execution_ts_ms": 1_500},
+                        "shadow": {"final_pnl_pct": 60.0},
+                    },
+                ],
+            )
+            summary = accepted.run(
+                accepted.build_parser().parse_args(
+                    [
+                        "--lifecycle-report",
+                        str(source),
+                        "--output",
+                        str(output),
+                        "--pnl-target-net-pct",
+                        "50",
+                        "--window-start-ms",
+                        "1000",
+                        "--window-end-ms",
+                        "2000",
+                    ]
+                )
+            )
+            rows = read_jsonl(output)
+
+        self.assertEqual(summary["scope_kind"], "windowed")
+        self.assertEqual(summary["rows_read"], 2)
+        self.assertEqual(summary["rows_written"], 1)
+        self.assertEqual(summary["window_skipped_counts"]["before_window"], 1)
+        self.assertEqual(rows[0]["candidate_id"], "inside")
+        self.assertEqual(rows[0]["lifecycle_status"], "resolved")
 
     def test_r1_target_stop_nonpositive_excluded_and_gray_cases(self) -> None:
         base = {"truth_status": "resolved", "analysis_status": "ok"}
