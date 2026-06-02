@@ -26,10 +26,6 @@ const FSC_V2_PROVIDER_LEGACY_ROLLING_INDEX: &str = "ghost_legacy_rolling_funding
 const FSC_V2_PROVIDER_NLN_PROGRAM_STREAMS: &str = "nln_program_streams";
 const FSC_V2_TOPIC_LEGACY_FUNDING_TRANSFERS: &str = "ghost.funding_transfers";
 const FSC_V2_TOPIC_NLN_SYSTEM_TRANSFERS: &str = "prod.rpc.solana.system.transfers";
-const FSC_V2_MIN_TOTAL_BUYERS: u64 = 2;
-const FSC_V2_MIN_KNOWN_NON_NEUTRAL_BUYERS: u64 = 2;
-const FSC_V2_MIN_KNOWN_COVERAGE: f64 = 0.50;
-const FSC_V2_MIN_NON_NEUTRAL_KNOWN_COVERAGE: f64 = 0.30;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FundingSourceConfig {
@@ -41,6 +37,10 @@ pub struct FundingSourceConfig {
     pub per_recipient_cap: usize,
     pub global_recipient_cap: usize,
     pub neutral_funder_set_version: Option<String>,
+    pub min_total_buyers: u64,
+    pub min_known_non_neutral_buyers: u64,
+    pub min_known_coverage: f64,
+    pub min_non_neutral_known_coverage: f64,
     neutral_funding_sources: HashSet<String>,
 }
 
@@ -80,6 +80,15 @@ impl FundingSourceConfig {
             global_recipient_cap: config.fsc_global_recipient_cap.max(1),
             neutral_funder_set_version: fsc_v2
                 .and_then(|fsc| fsc.neutral_funder_set_version.clone()),
+            min_total_buyers: fsc_v2
+                .map(|fsc| u64::from(fsc.min_total_buyers))
+                .unwrap_or(2),
+            min_known_non_neutral_buyers: fsc_v2
+                .map(|fsc| u64::from(fsc.min_known_non_neutral_buyers))
+                .unwrap_or(2),
+            min_known_coverage: fsc_v2.map_or(0.50, |fsc| fsc.min_known_coverage),
+            min_non_neutral_known_coverage: fsc_v2
+                .map_or(0.30, |fsc| fsc.min_non_neutral_known_coverage),
             neutral_funding_sources: config
                 .neutral_funding_sources
                 .iter()
@@ -458,7 +467,19 @@ fn build_fsc_v2_evidence(
         low_confidence_count,
         same_slot_unorderable_count,
         hhi_norm_count,
+        config,
     );
+    ::metrics::counter!(
+        "fsc_evidence_emitted",
+        1,
+        "status" => fsc_evidence_status_label(status),
+        "reason" => excluded_reason
+            .map(fsc_excluded_reason_label)
+            .unwrap_or("none")
+    );
+    if let Some(reason) = excluded_reason {
+        ::metrics::counter!("fsc_degraded_reason", 1, "reason" => fsc_excluded_reason_label(reason));
+    }
 
     FscV2Evidence {
         version: FscVersion::V2,
@@ -577,6 +598,7 @@ fn fsc_v2_status(
     low_confidence_count: u64,
     same_slot_unorderable_count: u64,
     hhi_norm_count: Option<f64>,
+    config: &FundingSourceConfig,
 ) -> (FscEvidenceStatus, Option<FscExcludedReason>) {
     if !stream_available {
         return (
@@ -608,7 +630,7 @@ fn fsc_v2_status(
             Some(FscExcludedReason::LowAttributionConfidence),
         );
     }
-    if known_non_neutral_buyers < FSC_V2_MIN_KNOWN_NON_NEUTRAL_BUYERS || hhi_norm_count.is_none() {
+    if known_non_neutral_buyers < config.min_known_non_neutral_buyers || hhi_norm_count.is_none() {
         let reason = if known_non_neutral_buyers == 0 && neutral_count > 0 {
             FscExcludedReason::NeutralOnly
         } else {
@@ -616,9 +638,9 @@ fn fsc_v2_status(
         };
         return (FscEvidenceStatus::Degraded, Some(reason));
     }
-    if total_buyers < FSC_V2_MIN_TOTAL_BUYERS
-        || known_coverage < FSC_V2_MIN_KNOWN_COVERAGE
-        || non_neutral_known_coverage < FSC_V2_MIN_NON_NEUTRAL_KNOWN_COVERAGE
+    if total_buyers < config.min_total_buyers
+        || known_coverage < config.min_known_coverage
+        || non_neutral_known_coverage < config.min_non_neutral_known_coverage
     {
         return (
             FscEvidenceStatus::Degraded,
@@ -744,7 +766,7 @@ fn funding_source_config_hash(config: &FundingSourceConfig) -> String {
     neutral_sources.sort();
     stable_fnv64_hex(
         format!(
-            "lookback_window_ms={};min_abs_store_lamports={};min_abs_attribution_lamports={};min_rel_to_buy_bits={};min_attribution_confidence_bps={};per_recipient_cap={};global_recipient_cap={};neutral_funder_set_version={};neutral_sources={}",
+            "lookback_window_ms={};min_abs_store_lamports={};min_abs_attribution_lamports={};min_rel_to_buy_bits={};min_attribution_confidence_bps={};per_recipient_cap={};global_recipient_cap={};min_total_buyers={};min_known_non_neutral_buyers={};min_known_coverage_bits={};min_non_neutral_known_coverage_bits={};neutral_funder_set_version={};neutral_sources={}",
             config.lookback_window_ms,
             config.min_abs_store_lamports,
             config.min_abs_attribution_lamports,
@@ -752,6 +774,10 @@ fn funding_source_config_hash(config: &FundingSourceConfig) -> String {
             config.min_attribution_confidence_bps,
             config.per_recipient_cap,
             config.global_recipient_cap,
+            config.min_total_buyers,
+            config.min_known_non_neutral_buyers,
+            config.min_known_coverage.to_bits(),
+            config.min_non_neutral_known_coverage.to_bits(),
             config.neutral_funder_set_version.as_deref().unwrap_or(""),
             neutral_sources.join(",")
         )
@@ -1135,6 +1161,36 @@ fn update_index_metrics(inner: &FundingSourceInner) {
     record_fsc_index_entries(inner.histories.len());
     record_fsc_authoritative_funding_stream_available(inner.stream_available);
     record_fsc_warmup_ready(inner.stream_available && inner.saw_transfer);
+    ::metrics::gauge!("funding_index_size", inner.histories.len() as f64);
+    ::metrics::gauge!(
+        "funding_index_warm",
+        if inner.stream_available && inner.saw_transfer {
+            1.0
+        } else {
+            0.0
+        }
+    );
+}
+
+fn fsc_evidence_status_label(status: FscEvidenceStatus) -> &'static str {
+    match status {
+        FscEvidenceStatus::Clean => "clean",
+        FscEvidenceStatus::Degraded => "degraded",
+        FscEvidenceStatus::Unavailable => "unavailable",
+    }
+}
+
+fn fsc_excluded_reason_label(reason: FscExcludedReason) -> &'static str {
+    match reason {
+        FscExcludedReason::FundingLaneUnavailable => "funding_lane_unavailable",
+        FscExcludedReason::IndexCold => "index_cold",
+        FscExcludedReason::NoBuyerCohort => "no_buyer_cohort",
+        FscExcludedReason::InsufficientNonNeutralSupport => "insufficient_non_neutral_support",
+        FscExcludedReason::LowCoverage => "low_coverage",
+        FscExcludedReason::NeutralOnly => "neutral_only",
+        FscExcludedReason::SameSlotOrderingUnavailable => "same_slot_ordering_unavailable",
+        FscExcludedReason::LowAttributionConfidence => "low_attribution_confidence",
+    }
 }
 
 fn coverage_window_status_locked(
@@ -1958,6 +2014,10 @@ mod tests {
         assert_eq!(config.min_abs_attribution_lamports, 10_000_000);
         assert_eq!(config.min_rel_to_buy, 0.20);
         assert_eq!(config.min_attribution_confidence_bps, 6_000);
+        assert_eq!(config.min_total_buyers, 2);
+        assert_eq!(config.min_known_non_neutral_buyers, 2);
+        assert_eq!(config.min_known_coverage, 0.50);
+        assert_eq!(config.min_non_neutral_known_coverage, 0.30);
         assert_eq!(
             config.neutral_funder_set_version.as_deref(),
             Some("neutral-v-test")
@@ -1973,6 +2033,15 @@ mod tests {
         assert_ne!(
             funding_source_config_hash(&config),
             funding_source_config_hash(&changed_config)
+        );
+
+        let mut changed_status_threshold = fsc_config.clone();
+        changed_status_threshold.min_known_coverage = 0.75;
+        let changed_status_config =
+            FundingSourceConfig::from_configs(&gatekeeper_config, Some(&changed_status_threshold));
+        assert_ne!(
+            funding_source_config_hash(&config),
+            funding_source_config_hash(&changed_status_config)
         );
     }
 

@@ -1,6 +1,9 @@
 //! Seer component wrapper
 
-use crate::config::{redact_endpoint_for_logs, SeerCommitment, SeerComponentConfig};
+use crate::config::{
+    redact_endpoint_for_logs, ProgramStreamsQuotaPolicy as LauncherProgramStreamsQuotaPolicy,
+    SeerCommitment, SeerComponentConfig,
+};
 use crate::events::{
     AccountUpdateEvent, DetectedPool, EventBusSender, FundingTransferObserved, GhostEvent,
 };
@@ -14,21 +17,23 @@ use metrics::increment_counter;
 use seer::{
     config::{
         ConnectionMode, FilterConfig, FundingLaneMode, ProgramStreamPayloadFormat,
-        ProgramStreamsConfig, PumpPortalConfig, SeerConfig, SeerSourceMode, StreamMode,
-        TxFilterStrategy,
+        ProgramStreamsConfig, ProgramStreamsQuotaPolicy as SeerProgramStreamsQuotaPolicy,
+        PumpPortalConfig, SeerConfig, SeerSourceMode, StreamMode, TxFilterStrategy,
     },
     ipc::{create_ipc_channel, BackpressurePolicy, FundingLaneRuntimeHealth, IpcChannelConfig},
     nln_program_streams::{
         normalize_nln_event, NlnEvent, NlnFundingTransferCoverage, NlnProgramStreamMessage,
-        NlnProgramStreamsClient, NlnPumpFunCreateEvent, NlnSubscribeLoopOptions, NlnTransferEvent,
+        NlnProgramStreamsClient, NlnPumpFunCreateEvent, NlnPumpFunTradeEvent,
+        NlnSubscribeLoopOptions, NlnTransferEvent,
     },
     Seer,
 };
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
+use std::hash::Hash;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 // SystemTime is used transitively via event.detected_at.elapsed()
 use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
@@ -204,6 +209,7 @@ fn nln_artifact_raw_row(message: &NlnProgramStreamMessage) -> Value {
         "offset": message.offset,
         "provider_ts_ms": message.provider_ts_ms,
         "recv_ts_ms": message.recv_ts_ms,
+        "recv_ts_ns": message.recv_ts_ns,
         "decode_ts_ms": message.decode_ts_ms,
         "payload_json": message.payload_json,
     })
@@ -241,6 +247,7 @@ fn nln_normalization_error_row(
         ]),
         "provider_ts_ms": message.provider_ts_ms,
         "recv_ts_ms": message.recv_ts_ms,
+        "recv_ts_ns": message.recv_ts_ns,
         "decode_ts_ms": message.decode_ts_ms,
         "error": error.to_string(),
         "raw_payload_hash": raw_payload_hash,
@@ -429,6 +436,13 @@ async fn write_nln_artifact_line(
             error = %err,
             "Seer: disabling NLN artifact writer after write failure"
         );
+        ::metrics::gauge!("nln_artifact_capture_available", 0.0, "label" => label);
+        ::metrics::counter!(
+            "nln_artifact_capture_degraded",
+            1,
+            "label" => label,
+            "reason" => "write_failure"
+        );
         *writer = None;
     }
 }
@@ -446,23 +460,43 @@ async fn flush_nln_artifact_writer(
             error = %err,
             "Seer: disabling NLN artifact writer after flush failure"
         );
+        ::metrics::gauge!("nln_artifact_capture_available", 0.0, "label" => label);
+        ::metrics::counter!(
+            "nln_artifact_capture_degraded",
+            1,
+            "label" => label,
+            "reason" => "flush_failure"
+        );
         *writer = None;
     }
 }
 
-async fn open_nln_artifact_file(path: PathBuf) -> Option<BufWriter<tokio::fs::File>> {
+async fn open_nln_artifact_file(
+    path: PathBuf,
+    label: &'static str,
+) -> Option<BufWriter<tokio::fs::File>> {
     match tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
         .await
     {
-        Ok(file) => Some(BufWriter::new(file)),
+        Ok(file) => {
+            ::metrics::gauge!("nln_artifact_capture_available", 1.0, "label" => label);
+            Some(BufWriter::new(file))
+        }
         Err(err) => {
             warn!(
                 path = %path.display(),
                 error = %err,
                 "Seer: NLN artifact file could not be opened"
+            );
+            ::metrics::gauge!("nln_artifact_capture_available", 0.0, "label" => label);
+            ::metrics::counter!(
+                "nln_artifact_capture_degraded",
+                1,
+                "label" => label,
+                "reason" => "open_failure"
             );
             None
         }
@@ -483,22 +517,45 @@ fn spawn_nln_artifact_writer(config: NlnArtifactCaptureConfig) -> Option<NlnArti
                 error = %err,
                 "Seer: NLN artifact capture directory unavailable; artifact writes disabled"
             );
+            ::metrics::counter!(
+                "nln_artifact_capture_degraded",
+                1,
+                "label" => "capture_dir",
+                "reason" => "directory_unavailable"
+            );
             return;
         }
 
-        let mut create_raw =
-            open_nln_artifact_file(config.capture_dir.join("pumpfun_create_raw_v1.jsonl")).await;
-        let mut trade_raw =
-            open_nln_artifact_file(config.capture_dir.join("pumpfun_trade_raw_v1.jsonl")).await;
-        let mut transfers_raw =
-            open_nln_artifact_file(config.capture_dir.join("system_transfers_raw_v1.jsonl")).await;
-        let mut normalization_errors =
-            open_nln_artifact_file(config.capture_dir.join("nln_normalization_errors_v1.jsonl"))
-                .await;
-        let mut candidate_birth =
-            open_nln_artifact_file(config.capture_dir.join("nln_candidate_birth_v1.jsonl")).await;
-        let mut funding_events =
-            open_nln_artifact_file(config.capture_dir.join("funding_events_v1.jsonl")).await;
+        let mut create_raw = open_nln_artifact_file(
+            config.capture_dir.join("pumpfun_create_raw_v1.jsonl"),
+            "pumpfun_create_raw_v1",
+        )
+        .await;
+        let mut trade_raw = open_nln_artifact_file(
+            config.capture_dir.join("pumpfun_trade_raw_v1.jsonl"),
+            "pumpfun_trade_raw_v1",
+        )
+        .await;
+        let mut transfers_raw = open_nln_artifact_file(
+            config.capture_dir.join("system_transfers_raw_v1.jsonl"),
+            "system_transfers_raw_v1",
+        )
+        .await;
+        let mut normalization_errors = open_nln_artifact_file(
+            config.capture_dir.join("nln_normalization_errors_v1.jsonl"),
+            "nln_normalization_errors_v1",
+        )
+        .await;
+        let mut candidate_birth = open_nln_artifact_file(
+            config.capture_dir.join("nln_candidate_birth_v1.jsonl"),
+            "nln_candidate_birth_v1",
+        )
+        .await;
+        let mut funding_events = open_nln_artifact_file(
+            config.capture_dir.join("funding_events_v1.jsonl"),
+            "funding_events_v1",
+        )
+        .await;
         let mut flush = tokio::time::interval(config.flush_interval);
 
         info!(
@@ -594,6 +651,8 @@ struct NlnProgramStreamsSelection {
     subscriptions: Vec<NlnProgramStreamSubscription>,
     dropped_optional_topics: Vec<String>,
     required_topics_exceed_limit: bool,
+    quota_policy_violation: bool,
+    fail_reasons: Vec<String>,
 }
 
 fn select_nln_program_stream_subscriptions(
@@ -606,6 +665,14 @@ fn select_nln_program_stream_subscriptions(
         .filter(|topic| !topic.is_empty())
         .map(str::to_owned)
         .collect();
+    let optional_topics: HashSet<String> = config
+        .optional_topics
+        .iter()
+        .chain(config.disabled_optional_topics.iter())
+        .map(|topic| topic.trim())
+        .filter(|topic| !topic.is_empty())
+        .map(str::to_owned)
+        .collect();
     let disabled_optional_topics: HashSet<String> = config
         .disabled_optional_topics
         .iter()
@@ -613,6 +680,44 @@ fn select_nln_program_stream_subscriptions(
         .filter(|topic| !topic.is_empty())
         .map(str::to_owned)
         .collect();
+
+    let known_candidate_topics: HashSet<String> = [
+        config.system_transfers_topic.trim(),
+        config.pumpfun_trade_topic.trim(),
+        config.pumpfun_create_topic.trim(),
+    ]
+    .into_iter()
+    .filter(|topic| !topic.is_empty())
+    .map(str::to_owned)
+    .collect();
+    let mut fail_reasons = Vec::new();
+    if config.quota_policy == SeerProgramStreamsQuotaPolicy::FailFast {
+        if enabled_topics.len() > config.max_streams {
+            fail_reasons.push("enabled_topics_exceed_max_streams".to_string());
+        }
+        let enabled_optional_topics: Vec<String> = enabled_topics
+            .iter()
+            .filter(|topic| optional_topics.contains(*topic))
+            .cloned()
+            .collect();
+        if !enabled_optional_topics.is_empty() {
+            fail_reasons.push(format!(
+                "optional_topics_enabled:{}",
+                enabled_optional_topics.join(",")
+            ));
+        }
+        let unknown_enabled_topics: Vec<String> = enabled_topics
+            .iter()
+            .filter(|topic| !known_candidate_topics.contains(*topic))
+            .cloned()
+            .collect();
+        if !unknown_enabled_topics.is_empty() {
+            fail_reasons.push(format!(
+                "unknown_enabled_topics:{}",
+                unknown_enabled_topics.join(",")
+            ));
+        }
+    }
 
     let mut seen_topics = HashSet::new();
     let mut candidates = Vec::new();
@@ -671,14 +776,23 @@ fn select_nln_program_stream_subscriptions(
         .filter(|candidate| candidate.required_for_fsc)
         .count();
     let required_topics_exceed_limit = required_count > allowed_stream_count;
+    let selected_topics_exceed_limit = selected.len() > allowed_stream_count;
+    if config.quota_policy == SeerProgramStreamsQuotaPolicy::FailFast
+        && selected_topics_exceed_limit
+    {
+        fail_reasons.push("selected_topics_exceed_max_streams".to_string());
+    }
+    let quota_policy_violation = !fail_reasons.is_empty();
 
-    if required_topics_exceed_limit {
+    if required_topics_exceed_limit || quota_policy_violation {
         NlnProgramStreamsSelection {
             requested_topic_count,
             allowed_stream_count,
             subscriptions: Vec::new(),
             dropped_optional_topics,
             required_topics_exceed_limit,
+            quota_policy_violation,
+            fail_reasons,
         }
     } else {
         while selected.len() > allowed_stream_count {
@@ -696,6 +810,8 @@ fn select_nln_program_stream_subscriptions(
             subscriptions: selected,
             dropped_optional_topics,
             required_topics_exceed_limit,
+            quota_policy_violation,
+            fail_reasons,
         }
     }
 }
@@ -749,6 +865,8 @@ async fn run_nln_program_streams_topic_capture(
     event_bus_tx: Option<EventBusSender>,
     health: Option<Arc<RuntimeHealth>>,
     artifact_writer: Option<NlnArtifactWriter>,
+    trade_resolver: Option<Arc<Mutex<NlnTradePoolIdentityResolver>>>,
+    authoritative_funding_stream_tx: Option<watch::Sender<bool>>,
 ) {
     let options = NlnSubscribeLoopOptions {
         max_reconnects: None,
@@ -765,6 +883,16 @@ async fn run_nln_program_streams_topic_capture(
     let mut create_count = 0u64;
     let mut trade_count = 0u64;
     let mut decode_error_count = 0u64;
+    let mut transfer_dedupe = BoundedTtlSet::new(
+        Duration::from_millis(config.transfer_dedupe_ttl_ms.max(1)),
+        config.transfer_dedupe_max_entries,
+    );
+    ::metrics::gauge!("nln_stream_connected", 1.0, "topic" => topic.clone());
+    if matches!(topic_kind, NlnProgramStreamCaptureTopic::SystemTransfers) {
+        if let Some(tx) = authoritative_funding_stream_tx.as_ref() {
+            let _ = tx.send(false);
+        }
+    }
 
     while let Some(next) = stream.next().await {
         let message = match next {
@@ -778,6 +906,8 @@ async fn run_nln_program_streams_topic_capture(
                     error = %err,
                     "Seer: NLN Program Streams message decode failed"
                 );
+                ::metrics::counter!("nln_decode_errors", 1, "topic" => topic.clone());
+                ::metrics::increment_counter!("nln_decode_errors_total", "topic" => topic.clone());
                 continue;
             }
         };
@@ -790,6 +920,13 @@ async fn run_nln_program_streams_topic_capture(
             lane_health.stream_epoch = lane_health.stream_epoch.saturating_add(delta);
             lane_health.gap_suspected = true;
             lane_health.last_reconnect_ts_ms = Some(unix_now_ms());
+            ::metrics::counter!("nln_reconnect_count", delta, "topic" => topic.clone());
+            ::metrics::counter!("nln_reconnect_count_total", delta, "topic" => topic.clone());
+            if matches!(topic_kind, NlnProgramStreamCaptureTopic::SystemTransfers) {
+                if let Some(tx) = authoritative_funding_stream_tx.as_ref() {
+                    let _ = tx.send(false);
+                }
+            }
         }
 
         let raw_row = artifact_writer
@@ -828,6 +965,8 @@ async fn run_nln_program_streams_topic_capture(
                     error = %err,
                     "Seer: NLN Program Streams event normalization failed"
                 );
+                ::metrics::counter!("nln_decode_errors", 1, "topic" => topic.clone());
+                ::metrics::increment_counter!("nln_decode_errors_total", "topic" => topic.clone());
                 continue;
             }
         };
@@ -853,8 +992,108 @@ async fn run_nln_program_streams_topic_capture(
                     );
                 }
             }
-            (NlnProgramStreamCaptureTopic::PumpFunTrade, NlnEvent::PumpFunTrade(_trade)) => {
+            (NlnProgramStreamCaptureTopic::PumpFunTrade, NlnEvent::PumpFunTrade(trade)) => {
                 trade_count = trade_count.saturating_add(1);
+                ::metrics::counter!("nln_trade_rows", 1);
+                increment_counter!("nln_trade_rows_total");
+                ::metrics::counter!("nln_events_received", 1, "topic" => topic.clone());
+                ::metrics::increment_counter!("nln_events_received_total", "topic" => topic.clone());
+                if trade.side.is_buy() {
+                    ::metrics::counter!("nln_trade_buy_rows", 1);
+                    increment_counter!("nln_trade_buy_rows_total");
+                }
+                if let (Some(tx), Some(resolver)) = (event_bus_tx.as_ref(), trade_resolver.as_ref())
+                {
+                    let now = Instant::now();
+                    let resolve = match resolver.lock() {
+                        Ok(mut guard) => Some(guard.resolve_or_buffer(trade.clone(), now)),
+                        Err(err) => {
+                            warn!(
+                                topic = %topic,
+                                error = %err,
+                                "Seer: NLN trade pool identity resolver lock poisoned"
+                            );
+                            None
+                        }
+                    };
+                    if let Some(resolve) = resolve {
+                        if resolve.expired_count > 0 {
+                            ::metrics::counter!(
+                                "nln_trade_unresolved_after_ttl",
+                                resolve.expired_count as u64
+                            );
+                        }
+                        if resolve.evicted_per_mint > 0 {
+                            ::metrics::counter!(
+                                "nln_trade_resolver_evicted",
+                                resolve.evicted_per_mint as u64,
+                                "reason" => "per_mint_cap"
+                            );
+                            ::metrics::counter!(
+                                "nln_trade_resolver_evicted_total",
+                                resolve.evicted_per_mint as u64,
+                                "reason" => "per_mint_cap"
+                            );
+                        }
+                        if resolve.evicted_global > 0 {
+                            ::metrics::counter!(
+                                "nln_trade_resolver_evicted",
+                                resolve.evicted_global as u64,
+                                "reason" => "global_cap"
+                            );
+                            ::metrics::counter!(
+                                "nln_trade_resolver_evicted_total",
+                                resolve.evicted_global as u64,
+                                "reason" => "global_cap"
+                            );
+                        }
+                        match resolve.decision {
+                            NlnTradeResolveDecision::ForwardNow { pool_amm_id } => {
+                                let trade_event = trade.to_trade_event(pool_amm_id);
+                                emit_pool_transaction_to_event_bus(
+                                    tx,
+                                    &trade_event,
+                                    health.as_ref(),
+                                    false,
+                                );
+                                ::metrics::counter!("nln_trade_resolved_to_pool", 1);
+                                ::metrics::counter!("nln_trade_forwarded_pool_transaction", 1);
+                                increment_counter!("nln_trade_resolved_to_pool_total");
+                                increment_counter!("nln_trade_forwarded_pool_transaction_total");
+                                info!(
+                                    topic = %topic,
+                                    mint = %trade.mint,
+                                    pool = %pool_amm_id,
+                                    signature = %trade.signature,
+                                    slot = trade.slot,
+                                    side = ?trade.side,
+                                    resolver_action = "forward_now",
+                                    "Seer: NLN pumpfun.trade forwarded to PoolTransaction"
+                                );
+                            }
+                            NlnTradeResolveDecision::Buffered => {
+                                ::metrics::counter!("nln_trade_buffered", 1);
+                                increment_counter!("nln_trade_buffered_total");
+                            }
+                            NlnTradeResolveDecision::Duplicate => {
+                                ::metrics::counter!("nln_trade_deduped", 1);
+                                increment_counter!("nln_trade_deduped_total");
+                            }
+                            NlnTradeResolveDecision::IdentityCollision => {
+                                ::metrics::counter!("nln_trade_pool_identity_collision", 1);
+                                increment_counter!("nln_trade_pool_identity_collision_total");
+                                warn!(
+                                    topic = %topic,
+                                    mint = %trade.mint,
+                                    signature = %trade.signature,
+                                    slot = trade.slot,
+                                    resolver_action = "identity_collision",
+                                    "Seer: NLN pumpfun.trade not forwarded due to mint/pool identity collision"
+                                );
+                            }
+                        }
+                    }
+                }
                 if trade_count == 1 || trade_count % 1_000 == 0 {
                     info!(
                         topic = %topic,
@@ -864,6 +1103,16 @@ async fn run_nln_program_streams_topic_capture(
                 }
             }
             (NlnProgramStreamCaptureTopic::SystemTransfers, NlnEvent::Transfer(transfer)) => {
+                ::metrics::counter!("nln_events_received", 1, "topic" => topic.clone());
+                ::metrics::increment_counter!("nln_events_received_total", "topic" => topic.clone());
+                if !transfer_dedupe.insert_new(
+                    NlnTransferDedupeKey::from_transfer(&transfer),
+                    Instant::now(),
+                ) {
+                    ::metrics::counter!("nln_transfer_deduped", 1);
+                    increment_counter!("nln_transfer_deduped_total");
+                    continue;
+                }
                 let Some(transfer_event) = transfer
                     .to_native_sol_funding_transfer_event(NlnFundingTransferCoverage::CaptureOnly)
                 else {
@@ -873,6 +1122,10 @@ async fn run_nln_program_streams_topic_capture(
 
                 native_transfer_count = native_transfer_count.saturating_add(1);
                 sequence_number = sequence_number.saturating_add(1);
+                if let Some(tx) = authoritative_funding_stream_tx.as_ref() {
+                    // This marks live native-SOL lane evidence, not FundingSourceIndex store acceptance.
+                    let _ = tx.send(true);
+                }
 
                 if let Some(writer) = artifact_writer
                     .as_ref()
@@ -930,6 +1183,12 @@ async fn run_nln_program_streams_topic_capture(
         decode_error_count,
         "Seer: NLN Program Streams topic capture lane exited"
     );
+    ::metrics::gauge!("nln_stream_connected", 0.0, "topic" => topic.clone());
+    if matches!(topic_kind, NlnProgramStreamCaptureTopic::SystemTransfers) {
+        if let Some(tx) = authoritative_funding_stream_tx.as_ref() {
+            let _ = tx.send(false);
+        }
+    }
 }
 
 fn map_launcher_commitment(commitment: SeerCommitment) -> seer::config::CommitmentLevel {
@@ -1004,6 +1263,372 @@ impl BufferedSessionTradeKey {
             signature: trade.signature.to_string(),
             event_ordinal: trade.event_ordinal,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct NlnTradeDedupeKey {
+    signature: String,
+    tx_index: Option<u32>,
+    instruction_index: Option<u32>,
+    mint: Pubkey,
+    user: Pubkey,
+    ix_name: Option<String>,
+    sol_amount_lamports: u64,
+}
+
+impl NlnTradeDedupeKey {
+    fn from_trade(trade: &NlnPumpFunTradeEvent) -> Self {
+        Self {
+            signature: trade.signature.to_string(),
+            tx_index: trade.tx_index,
+            instruction_index: trade.meta.instruction_index,
+            mint: trade.mint,
+            user: trade.user,
+            ix_name: trade.ix_name.clone(),
+            sol_amount_lamports: trade.sol_amount_lamports,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct NlnTransferDedupeKey {
+    signature: String,
+    instruction_index: Option<u32>,
+    from_wallet: Pubkey,
+    to_wallet: Pubkey,
+    amount_lamports: u64,
+    token_address: String,
+}
+
+impl NlnTransferDedupeKey {
+    fn from_transfer(transfer: &NlnTransferEvent) -> Self {
+        Self {
+            signature: transfer.signature.clone(),
+            instruction_index: transfer.instruction_index,
+            from_wallet: transfer.from_wallet,
+            to_wallet: transfer.to_wallet,
+            amount_lamports: transfer.amount_lamports,
+            token_address: transfer.token_address.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BoundedTtlSet<K>
+where
+    K: Clone + Eq + Hash,
+{
+    entries: HashSet<K>,
+    order: VecDeque<(Instant, K)>,
+    ttl: Duration,
+    cap: usize,
+}
+
+impl<K> BoundedTtlSet<K>
+where
+    K: Clone + Eq + Hash,
+{
+    fn new(ttl: Duration, cap: usize) -> Self {
+        Self {
+            entries: HashSet::new(),
+            order: VecDeque::new(),
+            ttl,
+            cap: cap.max(1),
+        }
+    }
+
+    fn insert_new(&mut self, key: K, now: Instant) -> bool {
+        self.prune(now);
+        if self.entries.contains(&key) {
+            return false;
+        }
+        while self.entries.len() >= self.cap {
+            if let Some((_, oldest)) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        self.entries.insert(key.clone());
+        self.order.push_back((now, key));
+        true
+    }
+
+    fn prune(&mut self, now: Instant) -> usize {
+        let mut expired = 0usize;
+        while let Some((seen_at, key)) = self.order.front().cloned() {
+            if now.duration_since(seen_at) <= self.ttl {
+                break;
+            }
+            self.order.pop_front();
+            if self.entries.remove(&key) {
+                expired += 1;
+            }
+        }
+        expired
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NlnPoolIdentity {
+    pool_amm_id: Pubkey,
+    base_mint: Pubkey,
+    bonding_curve: Pubkey,
+    first_seen_ts_ms: u64,
+}
+
+#[derive(Clone)]
+struct BufferedNlnTrade {
+    trade: NlnPumpFunTradeEvent,
+    buffered_at: Instant,
+}
+
+#[derive(Debug, Default)]
+struct NlnTradeResolverRegisterResult {
+    replay_ready: Vec<NlnPumpFunTradeEvent>,
+    expired_count: usize,
+    collision: bool,
+}
+
+#[derive(Debug)]
+enum NlnTradeResolveDecision {
+    ForwardNow { pool_amm_id: Pubkey },
+    Buffered,
+    Duplicate,
+    IdentityCollision,
+}
+
+#[derive(Debug)]
+struct NlnTradeResolveResult {
+    decision: NlnTradeResolveDecision,
+    expired_count: usize,
+    evicted_per_mint: usize,
+    evicted_global: usize,
+}
+
+struct NlnTradePoolIdentityResolver {
+    mint_to_pool: HashMap<Pubkey, NlnPoolIdentity>,
+    mint_order: VecDeque<Pubkey>,
+    collided_mints: HashSet<Pubkey>,
+    pending_by_mint: HashMap<Pubkey, VecDeque<BufferedNlnTrade>>,
+    pending_total: usize,
+    seen_trade_keys: BoundedTtlSet<NlnTradeDedupeKey>,
+    ttl: Duration,
+    per_mint_cap: usize,
+    global_cap: usize,
+    identity_cap: usize,
+}
+
+impl NlnTradePoolIdentityResolver {
+    fn from_program_streams_config(config: &ProgramStreamsConfig) -> Self {
+        Self {
+            mint_to_pool: HashMap::new(),
+            mint_order: VecDeque::new(),
+            collided_mints: HashSet::new(),
+            pending_by_mint: HashMap::new(),
+            pending_total: 0,
+            seen_trade_keys: BoundedTtlSet::new(
+                Duration::from_millis(config.trade_dedupe_ttl_ms.max(1)),
+                config.trade_dedupe_max_entries,
+            ),
+            ttl: Duration::from_millis(config.trade_resolver_ttl_ms.max(1)),
+            per_mint_cap: config.trade_resolver_per_mint_cap.max(1),
+            global_cap: config.trade_resolver_global_cap.max(1),
+            identity_cap: SESSION_POOL_REGISTRY_FALLBACK_CAP,
+        }
+    }
+
+    fn register_candidate(
+        &mut self,
+        candidate: &seer::types::CandidatePool,
+        now: Instant,
+    ) -> NlnTradeResolverRegisterResult {
+        let expired_count = self.prune_expired(now);
+        let identity = NlnPoolIdentity {
+            pool_amm_id: candidate.pool_amm_id,
+            base_mint: candidate.base_mint,
+            bonding_curve: candidate.bonding_curve,
+            first_seen_ts_ms: candidate.compat_event_ts_ms().unwrap_or_else(unix_now_ms),
+        };
+
+        if let Some(existing) = self.mint_to_pool.get(&candidate.base_mint).copied() {
+            if existing.pool_amm_id != identity.pool_amm_id
+                || existing.bonding_curve != identity.bonding_curve
+            {
+                self.collided_mints.insert(candidate.base_mint);
+                self.mint_to_pool.remove(&candidate.base_mint);
+                self.pending_total = self.pending_total.saturating_sub(
+                    self.pending_by_mint
+                        .remove(&candidate.base_mint)
+                        .map_or(0, |queue| queue.len()),
+                );
+                ::metrics::counter!("nln_trade_pool_identity_collision", 1);
+                increment_counter!("nln_trade_pool_identity_collision_total");
+                return NlnTradeResolverRegisterResult {
+                    replay_ready: Vec::new(),
+                    expired_count,
+                    collision: true,
+                };
+            }
+        }
+
+        if self.collided_mints.contains(&candidate.base_mint) {
+            return NlnTradeResolverRegisterResult {
+                replay_ready: Vec::new(),
+                expired_count,
+                collision: true,
+            };
+        }
+
+        if !self.mint_to_pool.contains_key(&candidate.base_mint) {
+            self.mint_order.push_back(candidate.base_mint);
+        }
+        self.mint_to_pool.insert(candidate.base_mint, identity);
+        while self.mint_to_pool.len() > self.identity_cap {
+            if let Some(oldest) = self.mint_order.pop_front() {
+                self.mint_to_pool.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+
+        let mut replay_ready = Vec::new();
+        if let Some(mut queue) = self.pending_by_mint.remove(&candidate.base_mint) {
+            while let Some(buffered) = queue.pop_front() {
+                self.pending_total = self.pending_total.saturating_sub(1);
+                if now.duration_since(buffered.buffered_at) <= self.ttl {
+                    replay_ready.push(buffered.trade);
+                }
+            }
+        }
+        if !replay_ready.is_empty() {
+            ::metrics::counter!("nln_trade_resolved_to_pool", replay_ready.len() as u64);
+            ::metrics::counter!(
+                "nln_trade_resolved_to_pool_total",
+                replay_ready.len() as u64
+            );
+        }
+        NlnTradeResolverRegisterResult {
+            replay_ready,
+            expired_count,
+            collision: false,
+        }
+    }
+
+    fn resolve_or_buffer(
+        &mut self,
+        trade: NlnPumpFunTradeEvent,
+        now: Instant,
+    ) -> NlnTradeResolveResult {
+        let expired_count = self.prune_expired(now);
+        if !self
+            .seen_trade_keys
+            .insert_new(NlnTradeDedupeKey::from_trade(&trade), now)
+        {
+            return NlnTradeResolveResult {
+                decision: NlnTradeResolveDecision::Duplicate,
+                expired_count,
+                evicted_per_mint: 0,
+                evicted_global: 0,
+            };
+        }
+
+        if self.collided_mints.contains(&trade.mint) {
+            return NlnTradeResolveResult {
+                decision: NlnTradeResolveDecision::IdentityCollision,
+                expired_count,
+                evicted_per_mint: 0,
+                evicted_global: 0,
+            };
+        }
+
+        if let Some(identity) = self.mint_to_pool.get(&trade.mint).copied() {
+            debug_assert_eq!(identity.base_mint, trade.mint);
+            let _identity_age_ms = unix_now_ms().saturating_sub(identity.first_seen_ts_ms);
+            return NlnTradeResolveResult {
+                decision: NlnTradeResolveDecision::ForwardNow {
+                    pool_amm_id: identity.pool_amm_id,
+                },
+                expired_count,
+                evicted_per_mint: 0,
+                evicted_global: 0,
+            };
+        }
+
+        let mut evicted_per_mint = 0usize;
+        let mut evicted_global = 0usize;
+        while self.pending_total >= self.global_cap {
+            if self.evict_oldest_pending().is_some() {
+                evicted_global += 1;
+            } else {
+                break;
+            }
+        }
+        let queue = self.pending_by_mint.entry(trade.mint).or_default();
+        while queue.len() >= self.per_mint_cap {
+            if queue.pop_front().is_some() {
+                self.pending_total = self.pending_total.saturating_sub(1);
+                evicted_per_mint += 1;
+            } else {
+                break;
+            }
+        }
+        queue.push_back(BufferedNlnTrade {
+            trade,
+            buffered_at: now,
+        });
+        self.pending_total += 1;
+        NlnTradeResolveResult {
+            decision: NlnTradeResolveDecision::Buffered,
+            expired_count,
+            evicted_per_mint,
+            evicted_global,
+        }
+    }
+
+    fn prune_expired(&mut self, now: Instant) -> usize {
+        self.seen_trade_keys.prune(now);
+        let mut expired = 0usize;
+        let mut empty_mints = Vec::new();
+        for (mint, queue) in self.pending_by_mint.iter_mut() {
+            while matches!(queue.front(), Some(front) if now.duration_since(front.buffered_at) > self.ttl)
+            {
+                if queue.pop_front().is_some() {
+                    self.pending_total = self.pending_total.saturating_sub(1);
+                    expired += 1;
+                }
+            }
+            if queue.is_empty() {
+                empty_mints.push(*mint);
+            }
+        }
+        for mint in empty_mints {
+            self.pending_by_mint.remove(&mint);
+        }
+        if expired > 0 {
+            ::metrics::counter!("nln_trade_unresolved_after_ttl", expired as u64);
+            ::metrics::counter!("nln_trade_unresolved_after_ttl_total", expired as u64);
+        }
+        expired
+    }
+
+    fn evict_oldest_pending(&mut self) -> Option<NlnPumpFunTradeEvent> {
+        let oldest_mint = self
+            .pending_by_mint
+            .iter()
+            .filter_map(|(mint, queue)| queue.front().map(|front| (*mint, front.buffered_at)))
+            .min_by_key(|(_, buffered_at)| *buffered_at)
+            .map(|(mint, _)| mint)?;
+        let queue = self.pending_by_mint.get_mut(&oldest_mint)?;
+        let removed = queue.pop_front();
+        if queue.is_empty() {
+            self.pending_by_mint.remove(&oldest_mint);
+        }
+        if removed.is_some() {
+            self.pending_total = self.pending_total.saturating_sub(1);
+        }
+        removed.map(|buffered| buffered.trade)
     }
 }
 
@@ -2469,6 +3094,7 @@ fn spawn_nln_program_streams_capture(
     event_bus_tx: Option<EventBusSender>,
     health: Option<Arc<RuntimeHealth>>,
     authoritative_funding_stream_tx: Option<watch::Sender<bool>>,
+    trade_resolver: Arc<Mutex<NlnTradePoolIdentityResolver>>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if !config.enabled {
         return None;
@@ -2499,12 +3125,15 @@ fn spawn_nln_program_streams_capture(
             dropped_optional_topics = ?selection.dropped_optional_topics,
             "Seer: starting NLN Program Streams FSC capture lane"
         );
-        if selection.required_topics_exceed_limit {
+        if selection.required_topics_exceed_limit || selection.quota_policy_violation {
             error!(
                 endpoint = %endpoint,
                 requested_topic_count = selection.requested_topic_count,
                 allowed_stream_count = selection.allowed_stream_count,
-                "Seer: NLN Program Streams required FSC topics exceed provider stream limit"
+                required_topics_exceed_limit = selection.required_topics_exceed_limit,
+                quota_policy_violation = selection.quota_policy_violation,
+                fail_reasons = ?selection.fail_reasons,
+                "Seer: NLN Program Streams topic selection failed before connect"
             );
             if let Some(tx) = authoritative_funding_stream_tx.as_ref() {
                 let _ = tx.send(false);
@@ -2569,23 +3198,17 @@ fn spawn_nln_program_streams_capture(
             }
         }
 
-        if let Some(tx) = authoritative_funding_stream_tx.as_ref() {
-            let funding_stream_selected = selection.subscriptions.iter().any(|subscription| {
-                matches!(
-                    subscription.topic_kind,
-                    NlnProgramStreamCaptureTopic::SystemTransfers
-                )
-            });
-            let _ = tx.send(funding_stream_selected);
-        }
-
         let mut handles = Vec::with_capacity(selection.subscriptions.len());
         for subscription in selection.subscriptions {
             let is_funding_topic = matches!(
                 subscription.topic_kind,
                 NlnProgramStreamCaptureTopic::SystemTransfers
             );
-            let topic_event_bus_tx = if is_funding_topic {
+            let is_trade_topic = matches!(
+                subscription.topic_kind,
+                NlnProgramStreamCaptureTopic::PumpFunTrade
+            );
+            let topic_event_bus_tx = if is_funding_topic || is_trade_topic {
                 event_bus_tx.clone()
             } else {
                 None
@@ -2595,6 +3218,9 @@ fn spawn_nln_program_streams_capture(
             } else {
                 None
             };
+            let topic_authoritative_funding_stream_tx = is_funding_topic
+                .then(|| authoritative_funding_stream_tx.clone())
+                .flatten();
             handles.push(tokio::spawn(run_nln_program_streams_topic_capture(
                 client.clone(),
                 config.clone(),
@@ -2603,6 +3229,8 @@ fn spawn_nln_program_streams_capture(
                 topic_event_bus_tx,
                 topic_health,
                 artifact_writer.clone(),
+                is_trade_topic.then(|| trade_resolver.clone()),
+                topic_authoritative_funding_stream_tx,
             )));
         }
 
@@ -2757,11 +3385,27 @@ pub async fn run(
             api_key_env_fallback: config.program_streams.api_key_env_fallback.clone(),
             format: program_streams_format,
             max_streams: config.program_streams.max_streams,
+            quota_policy: match config.program_streams.quota_policy {
+                LauncherProgramStreamsQuotaPolicy::DropOptional => {
+                    SeerProgramStreamsQuotaPolicy::DropOptional
+                }
+                LauncherProgramStreamsQuotaPolicy::FailFast => {
+                    SeerProgramStreamsQuotaPolicy::FailFast
+                }
+            },
             enabled_topics: config.program_streams.enabled_topics.clone(),
+            optional_topics: config.program_streams.optional_topics.clone(),
             disabled_optional_topics: config.program_streams.disabled_optional_topics.clone(),
             pumpfun_create_topic: config.program_streams.pumpfun_create_topic.clone(),
             pumpfun_trade_topic: config.program_streams.pumpfun_trade_topic.clone(),
             system_transfers_topic: config.program_streams.system_transfers_topic.clone(),
+            trade_resolver_ttl_ms: config.program_streams.trade_resolver_ttl_ms,
+            trade_resolver_per_mint_cap: config.program_streams.trade_resolver_per_mint_cap,
+            trade_resolver_global_cap: config.program_streams.trade_resolver_global_cap,
+            trade_dedupe_ttl_ms: config.program_streams.trade_dedupe_ttl_ms,
+            trade_dedupe_max_entries: config.program_streams.trade_dedupe_max_entries,
+            transfer_dedupe_ttl_ms: config.program_streams.transfer_dedupe_ttl_ms,
+            transfer_dedupe_max_entries: config.program_streams.transfer_dedupe_max_entries,
         },
         watched_pools_ttl_ms: config.watched_pools_ttl_ms,
         watched_pools_cap: config.watched_pools_cap,
@@ -2777,6 +3421,9 @@ pub async fn run(
         },
     };
     let program_streams_capture_config = seer_config.program_streams.clone();
+    let nln_trade_pool_resolver = Arc::new(Mutex::new(
+        NlnTradePoolIdentityResolver::from_program_streams_config(&program_streams_capture_config),
+    ));
 
     info!("Seer: Configuration loaded");
     info!(
@@ -2919,10 +3566,12 @@ pub async fn run(
         event_bus_tx.clone(),
         health.clone(),
         nln_authoritative_funding_stream_tx,
+        nln_trade_pool_resolver.clone(),
     );
 
     // Process IPC events and emit to event bus
     let health_ipc = health.clone();
+    let nln_trade_pool_resolver_ipc = nln_trade_pool_resolver.clone();
     let ipc_handle = tokio::spawn(async move {
         let detected_pool_ttl = Duration::from_millis(seer_config.watched_pools_ttl_ms.max(1));
         let detected_pool_cap = seer_config.watched_pools_cap.max(1);
@@ -3124,14 +3773,62 @@ pub async fn run(
 
                     // Emit to unified event bus if available
                     if let Some(ref tx) = event_bus_tx {
+                        let now = Instant::now();
                         process_pool_detected_event_for_session_gate(
                             tx,
                             &mut session_trade_bridge,
                             candidate,
                             health_ipc.as_ref(),
-                            Instant::now(),
+                            now,
                             detected_ms,
                         );
+                        let nln_replay_ready = match nln_trade_pool_resolver_ipc.lock() {
+                            Ok(mut resolver) => {
+                                let result = resolver.register_candidate(candidate, now);
+                                if result.expired_count > 0 {
+                                    ::metrics::counter!(
+                                        "nln_trade_unresolved_after_ttl",
+                                        result.expired_count as u64
+                                    );
+                                }
+                                if result.collision {
+                                    warn!(
+                                        mint = %candidate.base_mint,
+                                        pool = %candidate.pool_amm_id,
+                                        bonding_curve = %candidate.bonding_curve,
+                                        "Seer: NLN trade pool identity collision; trades for mint will not be forwarded"
+                                    );
+                                }
+                                result.replay_ready
+                            }
+                            Err(err) => {
+                                warn!(
+                                    error = %err,
+                                    "Seer: NLN trade pool identity resolver lock poisoned"
+                                );
+                                Vec::new()
+                            }
+                        };
+                        for nln_trade in nln_replay_ready {
+                            let trade_event = nln_trade.to_trade_event(candidate.pool_amm_id);
+                            emit_pool_transaction_to_event_bus(
+                                tx,
+                                &trade_event,
+                                health_ipc.as_ref(),
+                                true,
+                            );
+                            ::metrics::counter!("nln_trade_forwarded_pool_transaction", 1);
+                            increment_counter!("nln_trade_forwarded_pool_transaction_total");
+                            info!(
+                                mint = %nln_trade.mint,
+                                pool = %candidate.pool_amm_id,
+                                signature = %nln_trade.signature,
+                                slot = nln_trade.slot,
+                                side = ?nln_trade.side,
+                                resolver_action = "replay_after_candidate",
+                                "Seer: NLN pumpfun.trade replayed to PoolTransaction after Ghost birth"
+                            );
+                        }
                         let flush = session_account_update_bridge
                             .register_detected_pool(candidate, Instant::now());
                         record_session_account_update_expired(flush.expired_count);
@@ -3162,6 +3859,9 @@ pub async fn run(
                     } else {
                         let flush_result = session_trade_bridge
                             .register_detected_pool(candidate.pool_amm_id, Instant::now());
+                        if let Ok(mut resolver) = nln_trade_pool_resolver_ipc.lock() {
+                            let _ = resolver.register_candidate(candidate, Instant::now());
+                        }
                         record_session_buffer_expired(flush_result.expired_count);
                         record_session_detected_pool_expired(flush_result.expired_detected_pools);
                         record_session_detected_pool_evicted(flush_result.evicted_detected_pools);
@@ -3501,19 +4201,22 @@ mod tests {
         nln_normalization_error_row, process_pool_detected_event_for_session_gate,
         process_trade_event_for_session_gate, pumpswap_program_id,
         select_nln_program_stream_subscriptions, trade_event_to_pool_transaction,
-        trade_has_forwardable_identity, NlnProgramStreamCaptureTopic, SessionAccountUpdateBridge,
-        SessionAccountUpdateDecision, SessionBcv2Context, SessionExecutionAccountEvidenceDecision,
-        SessionPoolTradeBridge, SessionTradeDecision,
+        trade_has_forwardable_identity, NlnProgramStreamCaptureTopic, NlnTradePoolIdentityResolver,
+        NlnTradeResolveDecision, SessionAccountUpdateBridge, SessionAccountUpdateDecision,
+        SessionBcv2Context, SessionExecutionAccountEvidenceDecision, SessionPoolTradeBridge,
+        SessionTradeDecision,
     };
     use crate::events::{create_event_bus, GhostEvent};
     use ghost_core::CurveFinality;
-    use seer::config::ProgramStreamsConfig;
+    use seer::config::{ProgramStreamsConfig, ProgramStreamsQuotaPolicy};
     use seer::ipc::{
         AccountUpdateReplayOrigin, DetectedAccountUpdateEvent,
         DetectedExecutionAccountEvidenceEvent, DetectedFundingTransferEvent, DetectedPoolEvent,
         DetectedTradeEvent, EventPriority, FundingTransferEvent, SeerEvent,
     };
-    use seer::nln_program_streams::NlnProgramStreamMessage;
+    use seer::nln_program_streams::{
+        NlnIngestMeta, NlnProgramStreamMessage, NlnPumpFunTradeEvent, PumpFunTradeSide,
+    };
     use seer::types::{
         CandidatePool, InstructionProvenance, ObservedAccountMetaProvenance, RawBytesMissingReason,
         TradeEvent,
@@ -3544,6 +4247,41 @@ mod tests {
         }
     }
 
+    fn make_nln_trade(mint: Pubkey, user: Pubkey, signature: Signature) -> NlnPumpFunTradeEvent {
+        NlnPumpFunTradeEvent {
+            meta: NlnIngestMeta {
+                provider: "NLN".to_string(),
+                topic: ProgramStreamsConfig::default_pumpfun_trade_topic(),
+                partition: 0,
+                offset_raw: "1".to_string(),
+                offset: Some(1),
+                provider_ts_ms: Some(1_700_000_000_000),
+                recv_ts_ms: 1_700_000_000_010,
+                recv_ts_ns: 1_700_000_000_010_000_000,
+                decode_ts_ms: 1_700_000_000_011,
+                slot: Some(42),
+                signature: Some(signature.to_string()),
+                tx_index: Some(3),
+                instruction_index: Some(2),
+            },
+            signature,
+            tx_index: Some(3),
+            slot: 42,
+            mint,
+            user,
+            creator: None,
+            ix_name: Some("buy".to_string()),
+            side: PumpFunTradeSide::Buy,
+            sol_amount_lamports: 10_000_000,
+            token_amount_units: 1_000,
+            block_time: Some(1_700_000_000),
+            virtual_sol_reserves: Some(30_000_000_000),
+            virtual_token_reserves: Some(1_000_000_000_000),
+            real_sol_reserves: None,
+            real_token_reserves: None,
+        }
+    }
+
     async fn recv_only_event(rx: &mut tokio::sync::broadcast::Receiver<GhostEvent>) -> GhostEvent {
         tokio::time::timeout(Duration::from_millis(50), rx.recv())
             .await
@@ -3559,6 +4297,7 @@ mod tests {
         assert_eq!(selection.allowed_stream_count, 3);
         assert_eq!(selection.requested_topic_count, 3);
         assert!(!selection.required_topics_exceed_limit);
+        assert!(!selection.quota_policy_violation);
         assert!(selection.dropped_optional_topics.is_empty());
         assert_eq!(selection.subscriptions.len(), 3);
         assert_eq!(
@@ -3586,6 +4325,7 @@ mod tests {
 
         assert_eq!(selection.allowed_stream_count, 2);
         assert_eq!(selection.requested_topic_count, 3);
+        assert!(!selection.quota_policy_violation);
         assert_eq!(
             selection.dropped_optional_topics,
             vec!["prod.rpc.solana.pumpfun.create".to_string()]
@@ -3618,6 +4358,7 @@ mod tests {
         let selection = select_nln_program_stream_subscriptions(&config);
 
         assert_eq!(selection.requested_topic_count, 2);
+        assert!(!selection.quota_policy_violation);
         assert!(selection.dropped_optional_topics.is_empty());
         assert_eq!(selection.subscriptions.len(), 2);
         assert!(selection.subscriptions.iter().all(|subscription| {
@@ -3639,6 +4380,138 @@ mod tests {
     }
 
     #[test]
+    fn test_program_stream_selection_fail_fast_rejects_enabled_topic_over_quota() {
+        let config = ProgramStreamsConfig {
+            enabled: true,
+            max_streams: 2,
+            quota_policy: ProgramStreamsQuotaPolicy::FailFast,
+            enabled_topics: vec![
+                "prod.rpc.solana.system.transfers".to_string(),
+                "prod.rpc.solana.pumpfun.trade".to_string(),
+                "prod.rpc.solana.pumpfun.create".to_string(),
+            ],
+            optional_topics: vec!["prod.rpc.solana.pumpfun.create".to_string()],
+            ..ProgramStreamsConfig::default()
+        };
+        let selection = select_nln_program_stream_subscriptions(&config);
+
+        assert!(selection.quota_policy_violation);
+        assert!(selection.subscriptions.is_empty());
+        assert!(selection
+            .fail_reasons
+            .iter()
+            .any(|reason| reason == "enabled_topics_exceed_max_streams"));
+        assert!(selection
+            .fail_reasons
+            .iter()
+            .any(|reason| reason.starts_with("optional_topics_enabled:")));
+    }
+
+    #[test]
+    fn test_program_stream_selection_fail_fast_rejects_unknown_enabled_topic() {
+        let config = ProgramStreamsConfig {
+            enabled: true,
+            max_streams: 2,
+            quota_policy: ProgramStreamsQuotaPolicy::FailFast,
+            enabled_topics: vec![
+                "prod.rpc.solana.system.transfers".to_string(),
+                "prod.rpc.solana.pumpfun.trade".to_string(),
+                "prod.rpc.solana.pumpfun.transaction".to_string(),
+            ],
+            optional_topics: vec!["prod.rpc.solana.pumpfun.transaction".to_string()],
+            ..ProgramStreamsConfig::default()
+        };
+        let selection = select_nln_program_stream_subscriptions(&config);
+
+        assert!(selection.quota_policy_violation);
+        assert!(selection.subscriptions.is_empty());
+        assert!(selection
+            .fail_reasons
+            .iter()
+            .any(|reason| reason.starts_with("unknown_enabled_topics:")));
+    }
+
+    #[test]
+    fn test_nln_trade_resolver_buffers_until_candidate_then_replays() {
+        let mut resolver =
+            NlnTradePoolIdentityResolver::from_program_streams_config(&ProgramStreamsConfig {
+                trade_resolver_ttl_ms: 1_000,
+                ..ProgramStreamsConfig::default()
+            });
+        let mint = Pubkey::new_unique();
+        let pool = Pubkey::new_unique();
+        let user = Pubkey::new_unique();
+        let trade = make_nln_trade(mint, user, Signature::new_unique());
+        let now = Instant::now();
+
+        let resolve = resolver.resolve_or_buffer(trade, now);
+        assert!(matches!(
+            resolve.decision,
+            NlnTradeResolveDecision::Buffered
+        ));
+
+        let candidate = make_candidate(pool, mint);
+        let replay = resolver.register_candidate(&candidate, now + Duration::from_millis(10));
+
+        assert!(!replay.collision);
+        assert_eq!(replay.replay_ready.len(), 1);
+        let forwarded = replay.replay_ready[0].to_trade_event(pool);
+        assert_eq!(forwarded.pool_amm_id, pool);
+        assert_eq!(forwarded.mint, mint);
+        assert!(forwarded.bonding_curve_v2.is_none());
+    }
+
+    #[test]
+    fn test_nln_trade_resolver_dedupes_trade_keys() {
+        let mut resolver =
+            NlnTradePoolIdentityResolver::from_program_streams_config(&ProgramStreamsConfig {
+                trade_resolver_ttl_ms: 1_000,
+                ..ProgramStreamsConfig::default()
+            });
+        let mint = Pubkey::new_unique();
+        let user = Pubkey::new_unique();
+        let signature = Signature::new_unique();
+        let now = Instant::now();
+
+        let first = resolver.resolve_or_buffer(make_nln_trade(mint, user, signature), now);
+        let second = resolver.resolve_or_buffer(make_nln_trade(mint, user, signature), now);
+
+        assert!(matches!(first.decision, NlnTradeResolveDecision::Buffered));
+        assert!(matches!(
+            second.decision,
+            NlnTradeResolveDecision::Duplicate
+        ));
+    }
+
+    #[test]
+    fn test_nln_trade_resolver_fails_closed_on_mint_pool_collision() {
+        let mut resolver =
+            NlnTradePoolIdentityResolver::from_program_streams_config(&ProgramStreamsConfig {
+                trade_resolver_ttl_ms: 1_000,
+                ..ProgramStreamsConfig::default()
+            });
+        let mint = Pubkey::new_unique();
+        let first = make_candidate(Pubkey::new_unique(), mint);
+        let mut second = make_candidate(Pubkey::new_unique(), mint);
+        second.bonding_curve = Pubkey::new_unique();
+        let now = Instant::now();
+
+        let first_result = resolver.register_candidate(&first, now);
+        let collision = resolver.register_candidate(&second, now + Duration::from_millis(1));
+        let trade_result = resolver.resolve_or_buffer(
+            make_nln_trade(mint, Pubkey::new_unique(), Signature::new_unique()),
+            now + Duration::from_millis(2),
+        );
+
+        assert!(!first_result.collision);
+        assert!(collision.collision);
+        assert!(matches!(
+            trade_result.decision,
+            NlnTradeResolveDecision::IdentityCollision
+        ));
+    }
+
+    #[test]
     fn test_nln_normalization_error_row_preserves_join_keys_and_payload_hash() {
         let message = NlnProgramStreamMessage {
             topic: "prod.rpc.solana.system.transfers".to_string(),
@@ -3647,6 +4520,7 @@ mod tests {
             offset: Some(42),
             provider_ts_ms: Some(1_700_000_000_001),
             recv_ts_ms: 1_700_000_000_111,
+            recv_ts_ns: 1_700_000_000_111_000_000,
             decode_ts_ms: 1_700_000_000_112,
             payload_json: serde_json::json!({
                 "signature": "sig-test",

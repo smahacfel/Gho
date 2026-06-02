@@ -1675,6 +1675,23 @@ pub struct SeerComponentConfig {
 }
 
 /// NLN Program Streams configuration for the Seer component.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgramStreamsQuotaPolicy {
+    /// Preserve legacy behavior: selected optional topics may be dropped under
+    /// provider stream limits.
+    DropOptional,
+    /// Fail before opening any stream if the configured topic set exceeds the
+    /// provider quota.
+    FailFast,
+}
+
+impl Default for ProgramStreamsQuotaPolicy {
+    fn default() -> Self {
+        Self::DropOptional
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SeerProgramStreamsComponentConfig {
     /// Enable Program Streams capture. Defaults off in all existing profiles.
@@ -1708,9 +1725,17 @@ pub struct SeerProgramStreamsComponentConfig {
     #[serde(default = "default_program_streams_max_streams")]
     pub max_streams: usize,
 
+    /// How provider stream quotas should be enforced.
+    #[serde(default)]
+    pub quota_policy: ProgramStreamsQuotaPolicy,
+
     /// Explicit topic allowlist. Empty preserves the legacy topic fields.
     #[serde(default)]
     pub enabled_topics: Vec<String>,
+
+    /// Optional topics known to this profile. These are not required for FSC.
+    #[serde(default)]
+    pub optional_topics: Vec<String>,
 
     /// Optional topics disabled for this rollout profile.
     #[serde(default)]
@@ -1727,6 +1752,34 @@ pub struct SeerProgramStreamsComponentConfig {
     /// Solana system transfer topic.
     #[serde(default = "default_program_streams_system_transfers_topic")]
     pub system_transfers_topic: String,
+
+    /// TTL for NLN trade rows waiting for Ghost birth-lane pool identity.
+    #[serde(default = "default_program_streams_trade_resolver_ttl_ms")]
+    pub trade_resolver_ttl_ms: u64,
+
+    /// Per-mint cap for unresolved NLN trade buffering.
+    #[serde(default = "default_program_streams_trade_resolver_per_mint_cap")]
+    pub trade_resolver_per_mint_cap: usize,
+
+    /// Global cap for unresolved NLN trade buffering.
+    #[serde(default = "default_program_streams_trade_resolver_global_cap")]
+    pub trade_resolver_global_cap: usize,
+
+    /// TTL for NLN trade dedupe keys.
+    #[serde(default = "default_program_streams_trade_dedupe_ttl_ms")]
+    pub trade_dedupe_ttl_ms: u64,
+
+    /// Maximum retained NLN trade dedupe keys.
+    #[serde(default = "default_program_streams_trade_dedupe_max_entries")]
+    pub trade_dedupe_max_entries: usize,
+
+    /// TTL for NLN system transfer dedupe keys.
+    #[serde(default = "default_program_streams_transfer_dedupe_ttl_ms")]
+    pub transfer_dedupe_ttl_ms: u64,
+
+    /// Maximum retained NLN system transfer dedupe keys.
+    #[serde(default = "default_program_streams_transfer_dedupe_max_entries")]
+    pub transfer_dedupe_max_entries: usize,
 
     /// Persist NLN Program Streams capture evidence to JSONL files for PR-FSC8
     /// provider qualification. This is disabled by default because it is a
@@ -1766,11 +1819,20 @@ impl Default for SeerProgramStreamsComponentConfig {
             api_key_env_fallback: default_program_streams_api_key_env_fallback(),
             format: default_program_streams_format(),
             max_streams: default_program_streams_max_streams(),
+            quota_policy: ProgramStreamsQuotaPolicy::default(),
             enabled_topics: Vec::new(),
+            optional_topics: Vec::new(),
             disabled_optional_topics: Vec::new(),
             pumpfun_create_topic: default_program_streams_pumpfun_create_topic(),
             pumpfun_trade_topic: default_program_streams_pumpfun_trade_topic(),
             system_transfers_topic: default_program_streams_system_transfers_topic(),
+            trade_resolver_ttl_ms: default_program_streams_trade_resolver_ttl_ms(),
+            trade_resolver_per_mint_cap: default_program_streams_trade_resolver_per_mint_cap(),
+            trade_resolver_global_cap: default_program_streams_trade_resolver_global_cap(),
+            trade_dedupe_ttl_ms: default_program_streams_trade_dedupe_ttl_ms(),
+            trade_dedupe_max_entries: default_program_streams_trade_dedupe_max_entries(),
+            transfer_dedupe_ttl_ms: default_program_streams_transfer_dedupe_ttl_ms(),
+            transfer_dedupe_max_entries: default_program_streams_transfer_dedupe_max_entries(),
             artifact_capture_enabled: false,
             artifact_capture_dir: None,
             artifact_queue_capacity: default_program_streams_artifact_queue_capacity(),
@@ -2821,6 +2883,34 @@ fn default_program_streams_pumpfun_trade_topic() -> String {
 
 fn default_program_streams_system_transfers_topic() -> String {
     "prod.rpc.solana.system.transfers".to_string()
+}
+
+fn default_program_streams_trade_resolver_ttl_ms() -> u64 {
+    30_000
+}
+
+fn default_program_streams_trade_resolver_per_mint_cap() -> usize {
+    256
+}
+
+fn default_program_streams_trade_resolver_global_cap() -> usize {
+    50_000
+}
+
+fn default_program_streams_trade_dedupe_ttl_ms() -> u64 {
+    300_000
+}
+
+fn default_program_streams_trade_dedupe_max_entries() -> usize {
+    250_000
+}
+
+fn default_program_streams_transfer_dedupe_ttl_ms() -> u64 {
+    300_000
+}
+
+fn default_program_streams_transfer_dedupe_max_entries() -> usize {
+    500_000
 }
 
 fn default_program_streams_artifact_queue_capacity() -> usize {
@@ -4359,7 +4449,12 @@ enabled = true
         );
         assert_eq!(config.seer.program_streams.format, "JSON");
         assert_eq!(config.seer.program_streams.max_streams, 3);
+        assert_eq!(
+            config.seer.program_streams.quota_policy,
+            ProgramStreamsQuotaPolicy::DropOptional
+        );
         assert!(config.seer.program_streams.enabled_topics.is_empty());
+        assert!(config.seer.program_streams.optional_topics.is_empty());
         assert!(config
             .seer
             .program_streams
@@ -4377,9 +4472,14 @@ api_key_env = "NLN_API_KEY"
 api_key_env_fallback = "GHOST_NLN_API_KEY"
 format = "JSON"
 max_streams = 2
+quota_policy = "fail_fast"
 enabled_topics = [
   "prod.rpc.solana.system.transfers",
   "prod.rpc.solana.pumpfun.trade",
+]
+optional_topics = [
+  "prod.rpc.solana.pumpfun.create",
+  "prod.rpc.solana.pumpfun.transaction",
 ]
 disabled_optional_topics = [
   "prod.rpc.solana.pumpfun.create",
@@ -4387,6 +4487,13 @@ disabled_optional_topics = [
 pumpfun_create_topic = "prod.rpc.solana.pumpfun.create"
 pumpfun_trade_topic = "prod.rpc.solana.pumpfun.trade"
 system_transfers_topic = "prod.rpc.solana.system.transfers"
+trade_resolver_ttl_ms = 30000
+trade_resolver_per_mint_cap = 256
+trade_resolver_global_cap = 50000
+trade_dedupe_ttl_ms = 300000
+trade_dedupe_max_entries = 250000
+transfer_dedupe_ttl_ms = 300000
+transfer_dedupe_max_entries = 500000
 artifact_capture_enabled = true
 artifact_capture_dir = "logs/nln_capture/test"
 artifact_queue_capacity = 4096
@@ -4404,11 +4511,19 @@ artifact_transfer_sample_rate = 50
         );
         assert_eq!(config.format, "JSON");
         assert_eq!(config.max_streams, 2);
+        assert_eq!(config.quota_policy, ProgramStreamsQuotaPolicy::FailFast);
         assert_eq!(
             config.enabled_topics,
             vec![
                 "prod.rpc.solana.system.transfers".to_string(),
                 "prod.rpc.solana.pumpfun.trade".to_string()
+            ]
+        );
+        assert_eq!(
+            config.optional_topics,
+            vec![
+                "prod.rpc.solana.pumpfun.create".to_string(),
+                "prod.rpc.solana.pumpfun.transaction".to_string()
             ]
         );
         assert_eq!(
@@ -4427,6 +4542,11 @@ artifact_transfer_sample_rate = 50
         assert_eq!(config.artifact_queue_capacity, 4096);
         assert_eq!(config.artifact_flush_interval_ms, 500);
         assert_eq!(config.artifact_transfer_sample_rate, 50);
+        assert_eq!(config.trade_resolver_ttl_ms, 30_000);
+        assert_eq!(config.trade_resolver_per_mint_cap, 256);
+        assert_eq!(config.trade_resolver_global_cap, 50_000);
+        assert_eq!(config.trade_dedupe_ttl_ms, 300_000);
+        assert_eq!(config.transfer_dedupe_ttl_ms, 300_000);
     }
 
     #[test]
@@ -5319,6 +5439,52 @@ enabled = true
             .contains("shadow-burnin-v3-fsc-capture-nln-r4-12h-alchemy-2stream"));
         assert_eq!(config.trigger.entry_mode, TriggerEntryMode::ShadowOnly);
         assert_eq!(config.execution.execution_mode, ExecutionMode::Shadow);
+        assert!(config.metrics.enabled);
+    }
+
+    #[test]
+    fn test_nln_pro_two_stream_profile_fail_fast_and_disables_optional_topics() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let path = manifest_dir
+            .join("../configs/rollout")
+            .join("shadow-burnin-v3-fsc-capture-nln-pro-2stream.toml");
+        let config = LauncherConfig::from_file(&path)
+            .unwrap_or_else(|err| panic!("failed to load {}: {err}", path.display()));
+
+        assert_eq!(config.seer.funding_lane_mode, "disabled");
+        assert!(config.seer.program_streams.enabled);
+        assert_eq!(config.seer.program_streams.max_streams, 2);
+        assert_eq!(
+            config.seer.program_streams.quota_policy,
+            ProgramStreamsQuotaPolicy::FailFast
+        );
+        assert_eq!(
+            config.seer.program_streams.enabled_topics,
+            vec![
+                "prod.rpc.solana.pumpfun.trade".to_string(),
+                "prod.rpc.solana.system.transfers".to_string()
+            ]
+        );
+        assert!(config
+            .seer
+            .program_streams
+            .disabled_optional_topics
+            .contains(&"prod.rpc.solana.pumpfun.create".to_string()));
+        assert!(!config
+            .seer
+            .program_streams
+            .enabled_topics
+            .contains(&"prod.rpc.solana.pumpfun.create".to_string()));
+        assert_eq!(config.seer.program_streams.artifact_transfer_sample_rate, 100);
+        assert_eq!(config.seer.program_streams.trade_resolver_ttl_ms, 30_000);
+        assert_eq!(config.seer.program_streams.trade_resolver_per_mint_cap, 256);
+        assert_eq!(
+            config.seer.program_streams.trade_resolver_global_cap,
+            50_000
+        );
+        assert_eq!(config.trigger.entry_mode, TriggerEntryMode::ShadowOnly);
+        assert_eq!(config.execution.execution_mode, ExecutionMode::Shadow);
+        assert!(config.metrics.enabled);
     }
 
     #[test]

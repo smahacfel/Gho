@@ -254,6 +254,24 @@ impl ProgramStreamPayloadFormat {
     }
 }
 
+/// Provider quota behavior for Program Streams subscription selection.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgramStreamsQuotaPolicy {
+    /// Preserve legacy behavior: selected optional topics may be dropped under
+    /// provider stream limits.
+    DropOptional,
+    /// Fail before opening any stream if the configured topic set exceeds the
+    /// provider quota.
+    FailFast,
+}
+
+impl Default for ProgramStreamsQuotaPolicy {
+    fn default() -> Self {
+        Self::DropOptional
+    }
+}
+
 /// NLN Program Streams configuration for FSC v2 capture/evidence.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProgramStreamsConfig {
@@ -288,10 +306,19 @@ pub struct ProgramStreamsConfig {
     #[serde(default = "ProgramStreamsConfig::default_max_streams")]
     pub max_streams: usize,
 
+    /// How provider stream quotas should be enforced.
+    #[serde(default)]
+    pub quota_policy: ProgramStreamsQuotaPolicy,
+
     /// Explicit topic allowlist. When empty, the legacy topic fields below are
     /// used. When non-empty, only matching configured topics are subscribed.
     #[serde(default)]
     pub enabled_topics: Vec<String>,
+
+    /// Optional topics known to this profile. These are never required for FSC
+    /// capture and are useful for fail-fast quota audits.
+    #[serde(default)]
+    pub optional_topics: Vec<String>,
 
     /// Optional topics that must not be subscribed in the current profile.
     #[serde(default)]
@@ -308,6 +335,34 @@ pub struct ProgramStreamsConfig {
     /// Native SOL transfer topic used for FSC v2 funding index capture.
     #[serde(default = "ProgramStreamsConfig::default_system_transfers_topic")]
     pub system_transfers_topic: String,
+
+    /// TTL for NLN trade rows waiting for Ghost birth-lane pool identity.
+    #[serde(default = "ProgramStreamsConfig::default_trade_resolver_ttl_ms")]
+    pub trade_resolver_ttl_ms: u64,
+
+    /// Per-mint cap for unresolved NLN trade buffering.
+    #[serde(default = "ProgramStreamsConfig::default_trade_resolver_per_mint_cap")]
+    pub trade_resolver_per_mint_cap: usize,
+
+    /// Global cap for unresolved NLN trade buffering.
+    #[serde(default = "ProgramStreamsConfig::default_trade_resolver_global_cap")]
+    pub trade_resolver_global_cap: usize,
+
+    /// TTL for NLN trade dedupe keys.
+    #[serde(default = "ProgramStreamsConfig::default_trade_dedupe_ttl_ms")]
+    pub trade_dedupe_ttl_ms: u64,
+
+    /// Maximum retained NLN trade dedupe keys.
+    #[serde(default = "ProgramStreamsConfig::default_trade_dedupe_max_entries")]
+    pub trade_dedupe_max_entries: usize,
+
+    /// TTL for NLN system transfer dedupe keys.
+    #[serde(default = "ProgramStreamsConfig::default_transfer_dedupe_ttl_ms")]
+    pub transfer_dedupe_ttl_ms: u64,
+
+    /// Maximum retained NLN system transfer dedupe keys.
+    #[serde(default = "ProgramStreamsConfig::default_transfer_dedupe_max_entries")]
+    pub transfer_dedupe_max_entries: usize,
 }
 
 impl Default for ProgramStreamsConfig {
@@ -320,11 +375,20 @@ impl Default for ProgramStreamsConfig {
             api_key_env_fallback: Self::default_api_key_env_fallback(),
             format: ProgramStreamPayloadFormat::default(),
             max_streams: Self::default_max_streams(),
+            quota_policy: ProgramStreamsQuotaPolicy::default(),
             enabled_topics: Vec::new(),
+            optional_topics: Vec::new(),
             disabled_optional_topics: Vec::new(),
             pumpfun_create_topic: Self::default_pumpfun_create_topic(),
             pumpfun_trade_topic: Self::default_pumpfun_trade_topic(),
             system_transfers_topic: Self::default_system_transfers_topic(),
+            trade_resolver_ttl_ms: Self::default_trade_resolver_ttl_ms(),
+            trade_resolver_per_mint_cap: Self::default_trade_resolver_per_mint_cap(),
+            trade_resolver_global_cap: Self::default_trade_resolver_global_cap(),
+            trade_dedupe_ttl_ms: Self::default_trade_dedupe_ttl_ms(),
+            trade_dedupe_max_entries: Self::default_trade_dedupe_max_entries(),
+            transfer_dedupe_ttl_ms: Self::default_transfer_dedupe_ttl_ms(),
+            transfer_dedupe_max_entries: Self::default_transfer_dedupe_max_entries(),
         }
     }
 }
@@ -360,6 +424,34 @@ impl ProgramStreamsConfig {
 
     pub fn default_system_transfers_topic() -> String {
         "prod.rpc.solana.system.transfers".to_string()
+    }
+
+    pub const fn default_trade_resolver_ttl_ms() -> u64 {
+        30_000
+    }
+
+    pub const fn default_trade_resolver_per_mint_cap() -> usize {
+        256
+    }
+
+    pub const fn default_trade_resolver_global_cap() -> usize {
+        50_000
+    }
+
+    pub const fn default_trade_dedupe_ttl_ms() -> u64 {
+        300_000
+    }
+
+    pub const fn default_trade_dedupe_max_entries() -> usize {
+        250_000
+    }
+
+    pub const fn default_transfer_dedupe_ttl_ms() -> u64 {
+        300_000
+    }
+
+    pub const fn default_transfer_dedupe_max_entries() -> usize {
+        500_000
     }
 }
 
@@ -651,7 +743,12 @@ mod tests {
             ProgramStreamPayloadFormat::Json
         );
         assert_eq!(config.program_streams.max_streams, 3);
+        assert_eq!(
+            config.program_streams.quota_policy,
+            ProgramStreamsQuotaPolicy::DropOptional
+        );
         assert!(config.program_streams.enabled_topics.is_empty());
+        assert!(config.program_streams.optional_topics.is_empty());
         assert!(config.program_streams.disabled_optional_topics.is_empty());
         assert_eq!(config.watched_pools_ttl_ms, 120_000);
         assert_eq!(config.watched_pools_cap, 32_768);
@@ -855,8 +952,15 @@ mod tests {
         );
         assert_eq!(config.format.as_str(), "JSON");
         assert_eq!(config.max_streams, 3);
+        assert_eq!(config.quota_policy, ProgramStreamsQuotaPolicy::DropOptional);
         assert!(config.enabled_topics.is_empty());
+        assert!(config.optional_topics.is_empty());
         assert!(config.disabled_optional_topics.is_empty());
+        assert_eq!(config.trade_resolver_ttl_ms, 30_000);
+        assert_eq!(config.trade_resolver_per_mint_cap, 256);
+        assert_eq!(config.trade_resolver_global_cap, 50_000);
+        assert_eq!(config.trade_dedupe_ttl_ms, 300_000);
+        assert_eq!(config.transfer_dedupe_ttl_ms, 300_000);
         assert_eq!(
             config.pumpfun_create_topic,
             "prod.rpc.solana.pumpfun.create"
@@ -876,24 +980,44 @@ mod tests {
                 "format": "JSON",
                 "endpoint": "stream-1.nln.clr3.org:443",
                 "max_streams": 2,
+                "quota_policy": "fail_fast",
                 "enabled_topics": [
                     "prod.rpc.solana.system.transfers",
                     "prod.rpc.solana.pumpfun.trade"
                 ],
+                "optional_topics": [
+                    "prod.rpc.solana.pumpfun.create",
+                    "prod.rpc.solana.pumpfun.transaction"
+                ],
                 "disabled_optional_topics": [
                     "prod.rpc.solana.pumpfun.create"
-                ]
+                ],
+                "trade_resolver_ttl_ms": 30000,
+                "trade_resolver_per_mint_cap": 256,
+                "trade_resolver_global_cap": 50000,
+                "trade_dedupe_ttl_ms": 300000,
+                "trade_dedupe_max_entries": 250000,
+                "transfer_dedupe_ttl_ms": 300000,
+                "transfer_dedupe_max_entries": 500000
             }"#,
         )
         .unwrap();
         assert!(config.enabled);
         assert_eq!(config.format, ProgramStreamPayloadFormat::Json);
         assert_eq!(config.max_streams, 2);
+        assert_eq!(config.quota_policy, ProgramStreamsQuotaPolicy::FailFast);
         assert_eq!(
             config.enabled_topics,
             vec![
                 "prod.rpc.solana.system.transfers".to_string(),
                 "prod.rpc.solana.pumpfun.trade".to_string()
+            ]
+        );
+        assert_eq!(
+            config.optional_topics,
+            vec![
+                "prod.rpc.solana.pumpfun.create".to_string(),
+                "prod.rpc.solana.pumpfun.transaction".to_string()
             ]
         );
         assert_eq!(

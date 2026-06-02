@@ -111,6 +111,8 @@ pub struct NlnProgramStreamMessage {
     pub offset: Option<u64>,
     pub provider_ts_ms: Option<i64>,
     pub recv_ts_ms: u64,
+    #[serde(default)]
+    pub recv_ts_ns: u64,
     pub decode_ts_ms: u64,
     pub payload_json: Value,
 }
@@ -134,6 +136,8 @@ pub struct NlnIngestMeta {
     pub offset: Option<u64>,
     pub provider_ts_ms: Option<i64>,
     pub recv_ts_ms: u64,
+    #[serde(default)]
+    pub recv_ts_ns: u64,
     pub decode_ts_ms: u64,
     pub slot: Option<u64>,
     pub signature: Option<String>,
@@ -157,6 +161,7 @@ impl NlnIngestMeta {
             offset: message.offset,
             provider_ts_ms: message.provider_ts_ms,
             recv_ts_ms: message.recv_ts_ms,
+            recv_ts_ns: message.recv_ts_ns,
             decode_ts_ms: message.decode_ts_ms,
             slot,
             signature,
@@ -287,6 +292,8 @@ pub struct NlnPumpFunTradeEvent {
     pub mint: solana_sdk::pubkey::Pubkey,
     pub user: solana_sdk::pubkey::Pubkey,
     pub creator: Option<solana_sdk::pubkey::Pubkey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ix_name: Option<String>,
     pub side: PumpFunTradeSide,
     pub sol_amount_lamports: u64,
     pub token_amount_units: u64,
@@ -784,6 +791,7 @@ pub fn decode_subscribe_response(
     stats: &NlnProgramStreamsStats,
 ) -> Result<NlnProgramStreamMessage> {
     let recv_ts_ms = now_ms();
+    let recv_ts_ns = now_ns();
     let provider_ts_ms = (response.timestamp_ms > 0).then_some(response.timestamp_ms);
     stats.record_message(&response.topic, recv_ts_ms, provider_ts_ms);
 
@@ -808,6 +816,7 @@ pub fn decode_subscribe_response(
         offset: Some(response.offset),
         provider_ts_ms,
         recv_ts_ms,
+        recv_ts_ns,
         decode_ts_ms: now_ms(),
         payload_json,
     })
@@ -890,17 +899,31 @@ pub fn parse_pumpfun_trade(message: &NlnProgramStreamMessage) -> Result<NlnPumpF
     let slot = required_u64(object, &["slot"])?;
     let mint = required_pubkey(object, &["mint"])?;
     let user = required_pubkey(object, &["user", "buyer", "wallet"])?;
-    let ix_name = required_string(object, &["ix_name", "ixName", "side"])?;
-    let side = parse_trade_side(&ix_name).context("invalid NLN pumpfun.trade ix_name")?;
-    if let Some(is_buy) = optional_bool(object, &["is_buy", "isBuy"])? {
-        if is_buy != side.is_buy() {
-            bail!(
-                "conflicting NLN pumpfun.trade side fields ix_name='{}' is_buy={}",
-                ix_name,
-                is_buy
-            );
+    let ix_name = optional_string(object, &["ix_name", "ixName", "side"])?;
+    let is_buy = optional_bool(object, &["is_buy", "isBuy"])?;
+    let side = if let Some(is_buy) = is_buy {
+        if let Some(ix_name) = ix_name.as_deref() {
+            if let Ok(ix_side) = parse_trade_side(ix_name) {
+                if is_buy != ix_side.is_buy() {
+                    bail!(
+                        "conflicting NLN pumpfun.trade side fields ix_name='{}' is_buy={}",
+                        ix_name,
+                        is_buy
+                    );
+                }
+            }
         }
-    }
+        if is_buy {
+            PumpFunTradeSide::Buy
+        } else {
+            PumpFunTradeSide::Sell
+        }
+    } else {
+        let ix_name = ix_name
+            .as_deref()
+            .context("missing required NLN field ix_name|ixName|side or is_buy|isBuy")?;
+        parse_trade_side(ix_name).context("invalid NLN pumpfun.trade ix_name")?
+    };
     let meta = NlnIngestMeta::from_message(
         message,
         Some(slot),
@@ -917,6 +940,7 @@ pub fn parse_pumpfun_trade(message: &NlnProgramStreamMessage) -> Result<NlnPumpF
         mint,
         user,
         creator: optional_pubkey(object, &["creator"])?,
+        ix_name,
         side,
         sol_amount_lamports: required_u64(object, &["sol_amount", "solAmount"])?,
         token_amount_units: required_u64(object, &["token_amount", "tokenAmount"])?,
@@ -1042,6 +1066,14 @@ fn now_ms() -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
+fn now_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .min(u128::from(u64::MAX)) as u64
+}
+
 fn next_backoff(current: Duration, max: Duration) -> Duration {
     std::cmp::min(current.saturating_mul(2), max)
 }
@@ -1064,9 +1096,19 @@ fn payload_object(message: &NlnProgramStreamMessage) -> Result<&Map<String, Valu
 }
 
 fn parse_trade_side(value: &str) -> Result<PumpFunTradeSide> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "buy" | "buy_exact_quote_in" | "buy_exact_sol_in" => Ok(PumpFunTradeSide::Buy),
-        "sell" => Ok(PumpFunTradeSide::Sell),
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "buy"
+        | "buy_v2"
+        | "buy_exact_quote_in"
+        | "buy_exact_sol_in"
+        | "routed_exact_sol_in"
+        | "legacy_buy" => Ok(PumpFunTradeSide::Buy),
+        "sell" | "sell_v2" | "sell_exact_quote_in" | "sell_exact_sol_out" | "legacy_sell" => {
+            Ok(PumpFunTradeSide::Sell)
+        }
+        other if other.contains("buy") && !other.contains("sell") => Ok(PumpFunTradeSide::Buy),
+        other if other.contains("sell") && !other.contains("buy") => Ok(PumpFunTradeSide::Sell),
         other => bail!("unsupported pumpfun trade side '{other}'"),
     }
 }
@@ -1254,6 +1296,7 @@ mod tests {
             offset: Some(42),
             provider_ts_ms: Some(1_700_000_000_000),
             recv_ts_ms: 1_700_000_000_010,
+            recv_ts_ns: 1_700_000_000_010_000_000,
             decode_ts_ms: 1_700_000_000_011,
             payload_json,
         }
@@ -1569,6 +1612,32 @@ mod tests {
             assert_eq!(trade.side, PumpFunTradeSide::Buy);
             assert_eq!(trade.tx_index, Some(70));
         }
+    }
+
+    #[test]
+    fn normalizes_trade_with_is_buy_even_when_ix_name_is_provider_specific() {
+        let signature = solana_sdk::signature::Signature::new_unique();
+        let mint = solana_sdk::pubkey::Pubkey::new_unique();
+        let user = solana_sdk::pubkey::Pubkey::new_unique();
+        let message = decoded_message(
+            ProgramStreamsConfig::default_pumpfun_trade_topic(),
+            json!({
+                "signature": signature.to_string(),
+                "tx_index": "70",
+                "mint": mint.to_string(),
+                "sol_amount": "8418446",
+                "token_amount": "330719451263",
+                "user": user.to_string(),
+                "ix_name": "provider_specific_route",
+                "is_buy": true,
+                "slot": "422817405"
+            }),
+        );
+
+        let trade = parse_pumpfun_trade(&message).unwrap();
+
+        assert_eq!(trade.side, PumpFunTradeSide::Buy);
+        assert_eq!(trade.ix_name.as_deref(), Some("provider_specific_route"));
     }
 
     #[test]
