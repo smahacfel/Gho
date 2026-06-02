@@ -1,0 +1,51 @@
+after_df:
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda1       150G  106G   39G  74% /
+
+remaining_selected:
+deleted logs/nln_capture/shadow-burnin-v3-fsc-capture-nln-pro-2stream
+deleted logs/nln/shadow-burnin-v3-fsc-capture-nln-pro-2stream
+deleted logs/rollout/shadow-burnin-v3-fsc-capture-nln-pro-2stream
+deleted logs/nln_capture/shadow-burnin-v3-fsc-capture-nln-r5-12h-alchemy-2stream-parserfix
+deleted logs/nln/shadow-burnin-v3-fsc-capture-nln-r5-12h-alchemy-2stream-parserfix
+deleted logs/rollout/shadow-burnin-v3-fsc-capture-nln-r5-12h-alchemy-2stream-parserfix
+deleted logs/nln_capture/shadow-burnin-v3-fsc-capture-nln-r1
+deleted logs/nln/shadow-burnin-v3-fsc-capture-nln-r1
+deleted logs/rollout/shadow-burnin-v3-fsc-capture-nln-r1
+deleted logs/nln_capture/shadow-burnin-v3-fsc-capture-fastloop-r2
+deleted logs/nln/shadow-burnin-v3-fsc-capture-fastloop-r2
+deleted logs/rollout/shadow-burnin-v3-fsc-capture-fastloop-r2
+deleted logs/nln_capture/shadow-burnin-v3-fsc-capture-nln-r2-12h-alchemy
+deleted logs/nln/shadow-burnin-v3-fsc-capture-nln-r2-12h-alchemy
+deleted logs/rollout/shadow-burnin-v3-fsc-capture-nln-r2-12h-alchemy
+deleted logs/nln_capture/shadow-burnin-v3-fsc-capture-nln-r4-12h-alchemy-2stream
+deleted logs/nln/shadow-burnin-v3-fsc-capture-nln-r4-12h-alchemy-2stream
+deleted logs/rollout/shadow-burnin-v3-fsc-capture-nln-r4-12h-alchemy-2stream
+deleted logs/nln_capture/shadow-burnin-v3-fsc-capture-fastloop-r1
+deleted logs/nln/shadow-burnin-v3-fsc-capture-fastloop-r1
+deleted logs/rollout/shadow-burnin-v3-fsc-capture-fastloop-r1
+
+preserved_reports:
+92K	reports/selector/shadow-burnin-v3-fsc-capture-nln-r5-12h-alchemy-2stream-parserfix
+64K	reports/selector/shadow-burnin-v3-fsc-capture-nln-r1
+284K	reports/selector/shadow-burnin-v3-fsc-capture-fastloop-r2
+116K	reports/selector/shadow-burnin-v3-fsc-capture-nln-r2-12h-alchemy
+92K	reports/selector/shadow-burnin-v3-fsc-capture-nln-r4-12h-alchemy-2stream
+340K	reports/selector/shadow-burnin-v3-fsc-capture-fastloop-r1
+
+preserved_datasets_events:
+3.2M	datasets/events/shadow-burnin-v3-fsc-capture-nln-pro-2stream
+11M	datasets/events/shadow-burnin-v3-fsc-capture-nln-r5-12h-alchemy-2stream-parserfix
+22M	datasets/events/shadow-burnin-v3-fsc-capture-nln-r1
+1.7M	datasets/events/shadow-burnin-v3-fsc-capture-fastloop-r2
+832K	datasets/events/shadow-burnin-v3-fsc-capture-nln-r2-12h-alchemy
+684K	datasets/events/shadow-burnin-v3-fsc-capture-nln-r4-12h-alchemy-2stream
+840K	datasets/events/shadow-burnin-v3-fsc-capture-fastloop-r1
+
+after_extra_df:
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda1       150G  103G   42G  72% /
+
+logs_nln_after_extra:
+4.0K	logs/nln/shadow-burnin-v3-fsc-capture-nln-r3-12h-alchemy-2stream
+8.0K	logs/nln

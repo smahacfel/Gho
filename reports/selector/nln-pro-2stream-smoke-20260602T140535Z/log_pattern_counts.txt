@@ -1,0 +1,6 @@
+starting NLN Program Streams FSC capture lane 2
+NLN Program Streams ListTopics completed 2
+NLN Program Streams pumpfun.trade events captured 398
+NLN Program Streams native SOL funding transfers captured 9522
+BCV2_RPC_HYDRATION_MISSING 32578
+ERROR 0

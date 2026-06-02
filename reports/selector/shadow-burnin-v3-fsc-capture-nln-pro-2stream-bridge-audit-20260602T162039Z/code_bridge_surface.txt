@@ -1,0 +1,371 @@
+off-chain/components/seer/src/config.rs:332:    #[serde(default = "ProgramStreamsConfig::default_pumpfun_trade_topic")]
+off-chain/components/seer/src/config.rs:333:    pub pumpfun_trade_topic: String,
+off-chain/components/seer/src/config.rs:383:            pumpfun_trade_topic: Self::default_pumpfun_trade_topic(),
+off-chain/components/seer/src/config.rs:421:    pub fn default_pumpfun_trade_topic() -> String {
+off-chain/components/seer/src/config.rs:968:        assert_eq!(config.pumpfun_trade_topic, "prod.rpc.solana.pumpfun.trade");
+off-chain/components/seer/src/nln_program_streams.rs:832:    if message.topic == config.pumpfun_trade_topic {
+off-chain/components/seer/src/nln_program_streams.rs:833:        return parse_pumpfun_trade(message).map(NlnEvent::PumpFunTrade);
+off-chain/components/seer/src/nln_program_streams.rs:893:pub fn parse_pumpfun_trade(message: &NlnProgramStreamMessage) -> Result<NlnPumpFunTradeEvent> {
+off-chain/components/seer/src/nln_program_streams.rs:1558:            ProgramStreamsConfig::default_pumpfun_trade_topic(),
+off-chain/components/seer/src/nln_program_streams.rs:1575:        let trade = parse_pumpfun_trade(&message).unwrap();
+off-chain/components/seer/src/nln_program_streams.rs:1596:                ProgramStreamsConfig::default_pumpfun_trade_topic(),
+off-chain/components/seer/src/nln_program_streams.rs:1610:            let trade = parse_pumpfun_trade(&message).unwrap();
+off-chain/components/seer/src/nln_program_streams.rs:1623:            ProgramStreamsConfig::default_pumpfun_trade_topic(),
+off-chain/components/seer/src/nln_program_streams.rs:1637:        let trade = parse_pumpfun_trade(&message).unwrap();
+off-chain/components/seer/src/nln_program_streams.rs:1650:            ProgramStreamsConfig::default_pumpfun_trade_topic(),
+off-chain/components/seer/src/nln_program_streams.rs:1662:        let trade = parse_pumpfun_trade(&message).unwrap();
+off-chain/components/seer/src/nln_program_streams.rs:1679:            ProgramStreamsConfig::default_pumpfun_trade_topic(),
+off-chain/components/seer/src/nln_program_streams.rs:1693:        let err = parse_pumpfun_trade(&message).unwrap_err();
+ghost-launcher/src/main.rs:1442:                        Ok(GhostEvent::PoolTransaction(tx)) => {
+ghost-launcher/src/main.rs:1461:                                    "PoolTransaction received for {} (volume={:.4} SOL) - \
+off-chain/components/seer/src/pumpportal_connection.rs:915:        // This ensures the PoolTransaction with is_dev_buy=true, sol_amount_lamports,
+ghost-launcher/src/config.rs:1749:    #[serde(default = "default_program_streams_pumpfun_trade_topic")]
+ghost-launcher/src/config.rs:1750:    pub pumpfun_trade_topic: String,
+ghost-launcher/src/config.rs:1827:            pumpfun_trade_topic: default_program_streams_pumpfun_trade_topic(),
+ghost-launcher/src/config.rs:2880:fn default_program_streams_pumpfun_trade_topic() -> String {
+ghost-launcher/src/config.rs:4488:pumpfun_trade_topic = "prod.rpc.solana.pumpfun.trade"
+ghost-launcher/src/session/observation.rs:4:use crate::events::PoolTransaction;
+ghost-launcher/src/session/observation.rs:47:    pub tx_buffer: VecDeque<Arc<PoolTransaction>>,
+ghost-launcher/src/session/observation.rs:170:        tx: Arc<PoolTransaction>,
+ghost-launcher/src/session/observation.rs:208:    pub(crate) fn on_transaction(&mut self, tx: Arc<PoolTransaction>) -> GatekeeperVerdict {
+ghost-launcher/src/session/observation.rs:213:    pub fn ingest_transaction(&mut self, tx: Arc<PoolTransaction>) -> GatekeeperIngressOutcome {
+ghost-launcher/src/components/gatekeeper_trajectory.rs:11:use crate::events::PoolTransaction;
+ghost-launcher/src/components/gatekeeper_trajectory.rs:81:pub fn build_segment(txs: &[&PoolTransaction]) -> TrajectorySegment {
+ghost-launcher/src/components/oracle_pipeline.rs:59:use crate::events::{DetectedPool, PoolTransaction};
+ghost-launcher/src/components/oracle_pipeline.rs:685:        early_txs: &[PoolTransaction],
+ghost-launcher/src/components/oracle_pipeline.rs:1167:    ) -> PoolTransaction {
+ghost-launcher/src/components/oracle_pipeline.rs:1169:        PoolTransaction {
+off-chain/components/seer/src/bin/pumpfun_collector.rs:1042:            if let Some(trade) = parse_pumpfun_trade(
+off-chain/components/seer/src/bin/pumpfun_collector.rs:1096:fn parse_pumpfun_trade(
+off-chain/components/seer/src/lib.rs:2388:                    "Emitting PoolTransaction sig={} pool={} side={} volume={} source={} replayed=true outcome={} reason={}",
+off-chain/components/seer/src/lib.rs:3542:            "Emitting PoolTransaction sig={} pool={} side={} volume={} source={} replayed={} outcome={} has_token_program={} has_global_config={} has_fee_recipient={}",
+ghost-launcher/src/lib.rs:51:    EventBusSender, GhostEvent, PoolScoredEvent, PoolTransaction, TradeResult,
+ghost-launcher/src/oracle_metrics.rs:14:/// Counter for real events (PoolTransaction) gathered per pool
+ghost-launcher/src/oracle_metrics.rs:20:            "Total real events (PoolTransaction) gathered per pool"
+ghost-launcher/src/components/west_listener.rs:3://! This component listens to PoolTransaction events from the event bus
+ghost-launcher/src/components/west_listener.rs:17:/// This component subscribes to the event bus and processes PoolTransaction events,
+ghost-launcher/src/components/west_listener.rs:54:                            GhostEvent::PoolTransaction(pool_tx) => {
+ghost-launcher/src/components/snapshot_listener.rs:3://! This component listens to PoolTransaction events from the event bus
+ghost-launcher/src/components/snapshot_listener.rs:14:    DetectedPool, EventBusReceiver, GhostEvent, PoolTransaction, RawBytesMissingReason,
+ghost-launcher/src/components/snapshot_listener.rs:34:struct StagedPoolTransaction {
+ghost-launcher/src/components/snapshot_listener.rs:35:    tx: Arc<PoolTransaction>,
+ghost-launcher/src/components/snapshot_listener.rs:98:    staged_transactions: &mut HashMap<Pubkey, VecDeque<StagedPoolTransaction>>,
+ghost-launcher/src/components/snapshot_listener.rs:100:) -> Option<StagedPoolTransaction> {
+ghost-launcher/src/components/snapshot_listener.rs:125:    staged_transactions: &mut HashMap<Pubkey, VecDeque<StagedPoolTransaction>>,
+ghost-launcher/src/components/snapshot_listener.rs:157:/// Build a TxEvent from a PoolTransaction for SnapshotEngine consumption.
+ghost-launcher/src/components/snapshot_listener.rs:162:    pool_tx: &PoolTransaction,
+ghost-launcher/src/components/snapshot_listener.rs:214:fn is_raw_chain_semantic(pool_tx: &PoolTransaction) -> bool {
+ghost-launcher/src/components/snapshot_listener.rs:219:    pool_tx: &PoolTransaction,
+ghost-launcher/src/components/snapshot_listener.rs:270:    staged_transactions: &mut HashMap<Pubkey, VecDeque<StagedPoolTransaction>>,
+ghost-launcher/src/components/snapshot_listener.rs:275:    pool_tx: Arc<PoolTransaction>,
+ghost-launcher/src/components/snapshot_listener.rs:296:    queue.push_back(StagedPoolTransaction {
+ghost-launcher/src/components/snapshot_listener.rs:334:    pool_tx: &PoolTransaction,
+ghost-launcher/src/components/snapshot_listener.rs:393:    staged_transactions: &mut HashMap<Pubkey, VecDeque<StagedPoolTransaction>>,
+ghost-launcher/src/components/snapshot_listener.rs:480:/// This component subscribes to the event bus and processes PoolTransaction events,
+ghost-launcher/src/components/snapshot_listener.rs:506:    let mut staged_transactions: HashMap<Pubkey, VecDeque<StagedPoolTransaction>> = HashMap::new();
+ghost-launcher/src/components/snapshot_listener.rs:546:                            GhostEvent::PoolTransaction(pool_tx) => {
+ghost-launcher/src/components/snapshot_listener.rs:834:    /// Helper: build a PoolTransaction with real Pubkeys.
+ghost-launcher/src/components/snapshot_listener.rs:840:    ) -> PoolTransaction {
+ghost-launcher/src/components/snapshot_listener.rs:841:        PoolTransaction {
+ghost-launcher/src/components/snapshot_listener.rs:1050:        // 4. Send PoolTransaction
+ghost-launcher/src/tx_intelligence/sybil_metrics.rs:1:use crate::events::PoolTransaction;
+ghost-launcher/src/tx_intelligence/sybil_metrics.rs:78:    tx: &'a PoolTransaction,
+ghost-launcher/src/tx_intelligence/sybil_metrics.rs:84:    tx: &'a PoolTransaction,
+ghost-launcher/src/tx_intelligence/sybil_metrics.rs:99:    tx: &'a PoolTransaction,
+ghost-launcher/src/tx_intelligence/sybil_metrics.rs:143:    transactions: impl IntoIterator<Item = &'a PoolTransaction>,
+ghost-launcher/src/tx_intelligence/sybil_metrics.rs:144:) -> Vec<&'a PoolTransaction> {
+ghost-launcher/src/tx_intelligence/sybil_metrics.rs:151:fn successful_buy_samples<'a>(transactions: &[&'a PoolTransaction]) -> Vec<SequencedBuyTx<'a>> {
+ghost-launcher/src/tx_intelligence/sybil_metrics.rs:162:fn buy_sample_stats(buy_txs: &[&PoolTransaction]) -> BuySampleStats {
+ghost-launcher/src/tx_intelligence/sybil_metrics.rs:173:fn unique_buyer_samples<'a>(buy_txs: &[&'a PoolTransaction]) -> Vec<&'a PoolTransaction> {
+ghost-launcher/src/tx_intelligence/sybil_metrics.rs:184:fn sfd_sample_coverage(tx: &PoolTransaction) -> SfdSampleCoverage {
+ghost-launcher/src/tx_intelligence/sybil_metrics.rs:192:fn selected_sfd_samples<'a>(buy_txs: &[&'a PoolTransaction]) -> Vec<&'a PoolTransaction> {
+ghost-launcher/src/tx_intelligence/sybil_metrics.rs:219:    buy_txs: &[&'a PoolTransaction],
+ghost-launcher/src/tx_intelligence/sybil_metrics.rs:282:fn curve_price(tx: &PoolTransaction) -> Option<f64> {
+ghost-launcher/src/tx_intelligence/sybil_metrics.rs:332:    transactions: impl IntoIterator<Item = &'a PoolTransaction>,
+ghost-launcher/src/tx_intelligence/sybil_metrics.rs:338:fn compute_ftdi_from_buys(buy_txs: &[&PoolTransaction]) -> FtdiComputation {
+ghost-launcher/src/tx_intelligence/sybil_metrics.rs:379:    transactions: impl IntoIterator<Item = &'a PoolTransaction>,
+ghost-launcher/src/tx_intelligence/sybil_metrics.rs:387:    buy_txs: &[&'a PoolTransaction],
+ghost-launcher/src/tx_intelligence/sybil_metrics.rs:421:    let buyer_txs: Vec<&PoolTransaction> = unique_samples
+ghost-launcher/src/tx_intelligence/sybil_metrics.rs:457:    transactions: impl IntoIterator<Item = &'a PoolTransaction>,
+ghost-launcher/src/tx_intelligence/sybil_metrics.rs:463:fn compute_sfd_from_buys(buy_txs: &[&PoolTransaction]) -> SfdComputation {
+ghost-launcher/src/tx_intelligence/sybil_metrics.rs:538:    transactions: impl IntoIterator<Item = &'a PoolTransaction>,
+ghost-launcher/src/tx_intelligence/sybil_metrics.rs:540:    let transactions: Vec<&PoolTransaction> = transactions.into_iter().collect();
+ghost-launcher/src/tx_intelligence/sybil_metrics.rs:544:fn compute_des_from_transactions(transactions: &[&PoolTransaction]) -> DesComputation {
+ghost-launcher/src/tx_intelligence/sybil_metrics.rs:546:    let buy_txs: Vec<&PoolTransaction> = buy_samples.iter().map(|sample| sample.tx).collect();
+ghost-launcher/src/tx_intelligence/sybil_metrics.rs:598:    transactions: impl IntoIterator<Item = &'a PoolTransaction>,
+ghost-launcher/src/tx_intelligence/sybil_metrics.rs:601:    let transactions: Vec<&PoolTransaction> = transactions.into_iter().collect();
+ghost-launcher/src/tx_intelligence/sybil_metrics.rs:636:    use crate::events::{PoolTransaction, RawBytesMissingReason};
+ghost-launcher/src/tx_intelligence/sybil_metrics.rs:643:    ) -> PoolTransaction {
+ghost-launcher/src/tx_intelligence/sybil_metrics.rs:644:        PoolTransaction {
+ghost-launcher/src/tx_intelligence/sybil_metrics.rs:734:    ) -> PoolTransaction {
+ghost-launcher/src/tx_intelligence/sybil_metrics.rs:745:    ) -> PoolTransaction {
+ghost-launcher/src/tx_intelligence/sybil_metrics.rs:759:    ) -> PoolTransaction {
+ghost-launcher/src/events.rs:588:pub struct PoolTransaction {
+ghost-launcher/src/events.rs:790:impl PoolTransaction {
+ghost-launcher/src/events.rs:1157:    PoolTransaction(Arc<PoolTransaction>),
+ghost-launcher/src/events.rs:1270:    /// Create a PoolTransaction event
+ghost-launcher/src/events.rs:1271:    pub fn pool_transaction(tx: PoolTransaction) -> Self {
+ghost-launcher/src/events.rs:1272:        GhostEvent::PoolTransaction(Arc::new(tx))
+ghost-launcher/src/events.rs:1410:            GhostEvent::PoolTransaction(_) => "pool_transaction",
+ghost-launcher/src/components/seer.rs:535:            config.capture_dir.join("pumpfun_trade_raw_v1.jsonl"),
+ghost-launcher/src/components/seer.rs:536:            "pumpfun_trade_raw_v1",
+ghost-launcher/src/components/seer.rs:580:                            write_nln_artifact_line(&mut trade_raw, &row, "pumpfun_trade_raw_v1").await;
+ghost-launcher/src/components/seer.rs:598:                    flush_nln_artifact_writer(&mut trade_raw, "pumpfun_trade_raw_v1").await;
+ghost-launcher/src/components/seer.rs:608:        flush_nln_artifact_writer(&mut trade_raw, "pumpfun_trade_raw_v1").await;
+ghost-launcher/src/components/seer.rs:633:            Self::PumpFunTrade => "pumpfun_trade",
+ghost-launcher/src/components/seer.rs:686:        config.pumpfun_trade_topic.trim(),
+ghost-launcher/src/components/seer.rs:732:            config.pumpfun_trade_topic.trim(),
+ghost-launcher/src/components/seer.rs:839:                    "pumpfun_trade_raw_v1",
+ghost-launcher/src/components/seer.rs:868:    trade_resolver: Option<Arc<Mutex<NlnTradePoolIdentityResolver>>>,
+ghost-launcher/src/components/seer.rs:997:                ::metrics::counter!("nln_trade_rows", 1);
+ghost-launcher/src/components/seer.rs:998:                increment_counter!("nln_trade_rows_total");
+ghost-launcher/src/components/seer.rs:1002:                    ::metrics::counter!("nln_trade_buy_rows", 1);
+ghost-launcher/src/components/seer.rs:1003:                    increment_counter!("nln_trade_buy_rows_total");
+ghost-launcher/src/components/seer.rs:1022:                                "nln_trade_unresolved_after_ttl",
+ghost-launcher/src/components/seer.rs:1028:                                "nln_trade_resolver_evicted",
+ghost-launcher/src/components/seer.rs:1033:                                "nln_trade_resolver_evicted_total",
+ghost-launcher/src/components/seer.rs:1040:                                "nln_trade_resolver_evicted",
+ghost-launcher/src/components/seer.rs:1045:                                "nln_trade_resolver_evicted_total",
+ghost-launcher/src/components/seer.rs:1051:                            NlnTradeResolveDecision::ForwardNow { pool_amm_id } => {
+ghost-launcher/src/components/seer.rs:1059:                                ::metrics::counter!("nln_trade_resolved_to_pool", 1);
+ghost-launcher/src/components/seer.rs:1060:                                ::metrics::counter!("nln_trade_forwarded_pool_transaction", 1);
+ghost-launcher/src/components/seer.rs:1061:                                increment_counter!("nln_trade_resolved_to_pool_total");
+ghost-launcher/src/components/seer.rs:1062:                                increment_counter!("nln_trade_forwarded_pool_transaction_total");
+ghost-launcher/src/components/seer.rs:1071:                                    "Seer: NLN pumpfun.trade forwarded to PoolTransaction"
+ghost-launcher/src/components/seer.rs:1074:                            NlnTradeResolveDecision::Buffered => {
+ghost-launcher/src/components/seer.rs:1075:                                ::metrics::counter!("nln_trade_buffered", 1);
+ghost-launcher/src/components/seer.rs:1076:                                increment_counter!("nln_trade_buffered_total");
+ghost-launcher/src/components/seer.rs:1078:                            NlnTradeResolveDecision::Duplicate => {
+ghost-launcher/src/components/seer.rs:1079:                                ::metrics::counter!("nln_trade_deduped", 1);
+ghost-launcher/src/components/seer.rs:1080:                                increment_counter!("nln_trade_deduped_total");
+ghost-launcher/src/components/seer.rs:1082:                            NlnTradeResolveDecision::IdentityCollision => {
+ghost-launcher/src/components/seer.rs:1083:                                ::metrics::counter!("nln_trade_pool_identity_collision", 1);
+ghost-launcher/src/components/seer.rs:1084:                                increment_counter!("nln_trade_pool_identity_collision_total");
+ghost-launcher/src/components/seer.rs:1270:struct NlnTradeDedupeKey {
+ghost-launcher/src/components/seer.rs:1280:impl NlnTradeDedupeKey {
+ghost-launcher/src/components/seer.rs:1382:struct BufferedNlnTrade {
+ghost-launcher/src/components/seer.rs:1388:struct NlnTradeResolverRegisterResult {
+ghost-launcher/src/components/seer.rs:1395:enum NlnTradeResolveDecision {
+ghost-launcher/src/components/seer.rs:1403:struct NlnTradeResolveResult {
+ghost-launcher/src/components/seer.rs:1404:    decision: NlnTradeResolveDecision,
+ghost-launcher/src/components/seer.rs:1410:struct NlnTradePoolIdentityResolver {
+ghost-launcher/src/components/seer.rs:1414:    pending_by_mint: HashMap<Pubkey, VecDeque<BufferedNlnTrade>>,
+ghost-launcher/src/components/seer.rs:1416:    seen_trade_keys: BoundedTtlSet<NlnTradeDedupeKey>,
+ghost-launcher/src/components/seer.rs:1423:impl NlnTradePoolIdentityResolver {
+ghost-launcher/src/components/seer.rs:1446:    ) -> NlnTradeResolverRegisterResult {
+ghost-launcher/src/components/seer.rs:1466:                ::metrics::counter!("nln_trade_pool_identity_collision", 1);
+ghost-launcher/src/components/seer.rs:1467:                increment_counter!("nln_trade_pool_identity_collision_total");
+ghost-launcher/src/components/seer.rs:1468:                return NlnTradeResolverRegisterResult {
+ghost-launcher/src/components/seer.rs:1477:            return NlnTradeResolverRegisterResult {
+ghost-launcher/src/components/seer.rs:1506:            ::metrics::counter!("nln_trade_resolved_to_pool", replay_ready.len() as u64);
+ghost-launcher/src/components/seer.rs:1508:                "nln_trade_resolved_to_pool_total",
+ghost-launcher/src/components/seer.rs:1512:        NlnTradeResolverRegisterResult {
+ghost-launcher/src/components/seer.rs:1523:    ) -> NlnTradeResolveResult {
+ghost-launcher/src/components/seer.rs:1527:            .insert_new(NlnTradeDedupeKey::from_trade(&trade), now)
+ghost-launcher/src/components/seer.rs:1529:            return NlnTradeResolveResult {
+ghost-launcher/src/components/seer.rs:1530:                decision: NlnTradeResolveDecision::Duplicate,
+ghost-launcher/src/components/seer.rs:1538:            return NlnTradeResolveResult {
+ghost-launcher/src/components/seer.rs:1539:                decision: NlnTradeResolveDecision::IdentityCollision,
+ghost-launcher/src/components/seer.rs:1549:            return NlnTradeResolveResult {
+ghost-launcher/src/components/seer.rs:1550:                decision: NlnTradeResolveDecision::ForwardNow {
+ghost-launcher/src/components/seer.rs:1577:        queue.push_back(BufferedNlnTrade {
+ghost-launcher/src/components/seer.rs:1582:        NlnTradeResolveResult {
+ghost-launcher/src/components/seer.rs:1583:            decision: NlnTradeResolveDecision::Buffered,
+ghost-launcher/src/components/seer.rs:1610:            ::metrics::counter!("nln_trade_unresolved_after_ttl", expired as u64);
+ghost-launcher/src/components/seer.rs:1611:            ::metrics::counter!("nln_trade_unresolved_after_ttl_total", expired as u64);
+ghost-launcher/src/components/seer.rs:2956:        "Seer: 🚀 Emitting PoolTransaction: {} pool={} volume={:.4} SOL replayed_from_session_buffer={}",
+ghost-launcher/src/components/seer.rs:2964:        error!("Seer: ❌ Failed to emit PoolTransaction event: {}", e);
+ghost-launcher/src/components/seer.rs:2970:            "Seer: ✅ PoolTransaction ZOSTAŁA PRZEKAZANA DO MAGISTRALI ZDARZEŃ: receivers={} replayed_from_session_buffer={}",
+ghost-launcher/src/components/seer.rs:3097:    trade_resolver: Arc<Mutex<NlnTradePoolIdentityResolver>>,
+ghost-launcher/src/components/seer.rs:3400:            pumpfun_trade_topic: config.program_streams.pumpfun_trade_topic.clone(),
+ghost-launcher/src/components/seer.rs:3424:    let nln_trade_pool_resolver = Arc::new(Mutex::new(
+ghost-launcher/src/components/seer.rs:3425:        NlnTradePoolIdentityResolver::from_program_streams_config(&program_streams_capture_config),
+ghost-launcher/src/components/seer.rs:3569:        nln_trade_pool_resolver.clone(),
+ghost-launcher/src/components/seer.rs:3574:    let nln_trade_pool_resolver_ipc = nln_trade_pool_resolver.clone();
+ghost-launcher/src/components/seer.rs:3785:                        let nln_replay_ready = match nln_trade_pool_resolver_ipc.lock() {
+ghost-launcher/src/components/seer.rs:3790:                                        "nln_trade_unresolved_after_ttl",
+ghost-launcher/src/components/seer.rs:3812:                        for nln_trade in nln_replay_ready {
+ghost-launcher/src/components/seer.rs:3813:                            let trade_event = nln_trade.to_trade_event(candidate.pool_amm_id);
+ghost-launcher/src/components/seer.rs:3820:                            ::metrics::counter!("nln_trade_forwarded_pool_transaction", 1);
+ghost-launcher/src/components/seer.rs:3821:                            increment_counter!("nln_trade_forwarded_pool_transaction_total");
+ghost-launcher/src/components/seer.rs:3823:                                mint = %nln_trade.mint,
+ghost-launcher/src/components/seer.rs:3825:                                signature = %nln_trade.signature,
+ghost-launcher/src/components/seer.rs:3826:                                slot = nln_trade.slot,
+ghost-launcher/src/components/seer.rs:3827:                                side = ?nln_trade.side,
+ghost-launcher/src/components/seer.rs:3829:                                "Seer: NLN pumpfun.trade replayed to PoolTransaction after Ghost birth"
+ghost-launcher/src/components/seer.rs:3862:                        if let Ok(mut resolver) = nln_trade_pool_resolver_ipc.lock() {
+ghost-launcher/src/components/seer.rs:3901:                    // --- Canonical Bridge: Seer TradeEvent → Shadow Ledger PoolTransaction ---
+ghost-launcher/src/components/seer.rs:3903:                    // into the canonical PoolTransaction input model consumed by the Shadow Ledger
+ghost-launcher/src/components/seer.rs:4056:/// Canonical bridge: maps a Seer-parsed `TradeEvent` into the `PoolTransaction` input
+ghost-launcher/src/components/seer.rs:4067:///   `PoolTransaction` produced here via `forward_approved_tx_to_commit_or_live_pipeline`.
+ghost-launcher/src/components/seer.rs:4070:/// | `TradeEvent` source        | `PoolTransaction` field          |
+ghost-launcher/src/components/seer.rs:4086:) -> crate::events::PoolTransaction {
+ghost-launcher/src/components/seer.rs:4094:    crate::events::PoolTransaction {
+ghost-launcher/src/components/seer.rs:4204:        trade_has_forwardable_identity, NlnProgramStreamCaptureTopic, NlnTradePoolIdentityResolver,
+ghost-launcher/src/components/seer.rs:4205:        NlnTradeResolveDecision, SessionAccountUpdateBridge, SessionAccountUpdateDecision,
+ghost-launcher/src/components/seer.rs:4250:    fn make_nln_trade(mint: Pubkey, user: Pubkey, signature: Signature) -> NlnPumpFunTradeEvent {
+ghost-launcher/src/components/seer.rs:4254:                topic: ProgramStreamsConfig::default_pumpfun_trade_topic(),
+ghost-launcher/src/components/seer.rs:4435:    fn test_nln_trade_resolver_buffers_until_candidate_then_replays() {
+ghost-launcher/src/components/seer.rs:4437:            NlnTradePoolIdentityResolver::from_program_streams_config(&ProgramStreamsConfig {
+ghost-launcher/src/components/seer.rs:4444:        let trade = make_nln_trade(mint, user, Signature::new_unique());
+ghost-launcher/src/components/seer.rs:4450:            NlnTradeResolveDecision::Buffered
+ghost-launcher/src/components/seer.rs:4465:    fn test_nln_trade_resolver_dedupes_trade_keys() {
+ghost-launcher/src/components/seer.rs:4467:            NlnTradePoolIdentityResolver::from_program_streams_config(&ProgramStreamsConfig {
+ghost-launcher/src/components/seer.rs:4476:        let first = resolver.resolve_or_buffer(make_nln_trade(mint, user, signature), now);
+ghost-launcher/src/components/seer.rs:4477:        let second = resolver.resolve_or_buffer(make_nln_trade(mint, user, signature), now);
+ghost-launcher/src/components/seer.rs:4479:        assert!(matches!(first.decision, NlnTradeResolveDecision::Buffered));
+ghost-launcher/src/components/seer.rs:4482:            NlnTradeResolveDecision::Duplicate
+ghost-launcher/src/components/seer.rs:4487:    fn test_nln_trade_resolver_fails_closed_on_mint_pool_collision() {
+ghost-launcher/src/components/seer.rs:4489:            NlnTradePoolIdentityResolver::from_program_streams_config(&ProgramStreamsConfig {
+ghost-launcher/src/components/seer.rs:4502:            make_nln_trade(mint, Pubkey::new_unique(), Signature::new_unique()),
+ghost-launcher/src/components/seer.rs:4510:            NlnTradeResolveDecision::IdentityCollision
+ghost-launcher/src/components/seer.rs:5585:        // 2. Trade → bridge returns ForwardNow + event bus receives PoolTransaction
+ghost-launcher/src/components/seer.rs:5663:        // Second event: PoolTransaction.
+ghost-launcher/src/components/seer.rs:5666:            GhostEvent::PoolTransaction(pool_tx) => {
+ghost-launcher/src/components/seer.rs:5670:            other => panic!("expected PoolTransaction, got {}", other.event_type()),
+ghost-launcher/src/tx_intelligence/funding_source.rs:1:use crate::events::{FundingTransferObserved, PoolTransaction};
+ghost-launcher/src/tx_intelligence/funding_source.rs:992:        transactions: impl IntoIterator<Item = &'a PoolTransaction>,
+ghost-launcher/src/tx_intelligence/funding_source.rs:1376:    tx: &PoolTransaction,
+ghost-launcher/src/tx_intelligence/funding_source.rs:1524:    tx: &PoolTransaction,
+ghost-launcher/src/tx_intelligence/funding_source.rs:1764:fn tx_buy_amount_lamports(tx: &PoolTransaction) -> Option<u64> {
+ghost-launcher/src/tx_intelligence/funding_source.rs:1785:    buy: &PoolTransaction,
+ghost-launcher/src/tx_intelligence/funding_source.rs:1841:    buy: &PoolTransaction,
+ghost-launcher/src/tx_intelligence/funding_source.rs:1877:    transactions: impl IntoIterator<Item = &'a PoolTransaction>,
+ghost-launcher/src/tx_intelligence/funding_source.rs:1878:) -> Vec<&'a PoolTransaction> {
+ghost-launcher/src/tx_intelligence/funding_source.rs:1879:    let mut by_identity = HashMap::<String, &'a PoolTransaction>::new();
+ghost-launcher/src/tx_intelligence/funding_source.rs:1905:fn buy_order_key(tx: &PoolTransaction) -> BuyOrderKey {
+ghost-launcher/src/tx_intelligence/funding_source.rs:1928:pub fn funding_lookup_wallets(tx: &PoolTransaction) -> Vec<String> {
+ghost-launcher/src/tx_intelligence/funding_source.rs:1953:fn canonical_buyer_identity(tx: &PoolTransaction) -> Option<String> {
+ghost-launcher/src/tx_intelligence/funding_source.rs:1957:fn tx_event_ts_ms(tx: &PoolTransaction) -> u64 {
+ghost-launcher/src/tx_intelligence/funding_source.rs:1963:fn tx_buy_sol(tx: &PoolTransaction) -> f64 {
+ghost-launcher/src/tx_intelligence/funding_source.rs:2048:    fn buy_tx(signer: &str, signature: &str, timestamp_ms: u64) -> PoolTransaction {
+ghost-launcher/src/tx_intelligence/funding_source.rs:2049:        PoolTransaction {
+ghost-launcher/src/tx_intelligence/funding_source.rs:2111:    ) -> PoolTransaction {
+ghost-launcher/src/tx_intelligence/cross_pool_velocity.rs:1:use crate::events::PoolTransaction;
+ghost-launcher/src/tx_intelligence/cross_pool_velocity.rs:71:        tx: &PoolTransaction,
+ghost-launcher/src/tx_intelligence/cross_pool_velocity.rs:140:        transactions: impl IntoIterator<Item = &'a PoolTransaction>,
+ghost-launcher/src/tx_intelligence/cross_pool_velocity.rs:279:    transactions: impl IntoIterator<Item = &'a PoolTransaction>,
+ghost-launcher/src/tx_intelligence/cross_pool_velocity.rs:294:fn tx_event_ts_ms(tx: &PoolTransaction) -> u64 {
+ghost-launcher/src/tx_intelligence/cross_pool_velocity.rs:314:    fn tx(pool_id: &str, signer: &str, signature: &str, timestamp_ms: u64) -> PoolTransaction {
+ghost-launcher/src/tx_intelligence/cross_pool_velocity.rs:315:        PoolTransaction {
+ghost-launcher/src/tx_intelligence/engine.rs:1:use crate::events::PoolTransaction;
+ghost-launcher/src/tx_intelligence/engine.rs:150:    pub fn on_transaction(&mut self, tx: &PoolTransaction) {
+ghost-launcher/src/tx_intelligence/engine.rs:644:    fn ingest_fingerprint(&mut self, tx: &PoolTransaction) {
+ghost-launcher/src/tx_intelligence/engine.rs:754:fn tx_epoch_like_event_ts_ms(tx: &PoolTransaction) -> u64 {
+ghost-launcher/src/tx_intelligence/engine.rs:762:fn tx_ordering_ts_ms(tx: &PoolTransaction) -> u64 {
+ghost-launcher/src/tx_intelligence/engine.rs:780:fn tx_key_for(tx: &PoolTransaction) -> Option<TxKey> {
+ghost-launcher/src/tx_intelligence/engine.rs:806:fn fallback_counter_for_tx(tx: &PoolTransaction, event_ts_ms: u64) -> u64 {
+ghost-launcher/src/tx_intelligence/engine.rs:822:fn pool_tx_to_fingerprint_event(tx: &PoolTransaction) -> Option<FingerprintTxEvent> {
+ghost-launcher/src/tx_intelligence/engine.rs:880:    fn make_tx() -> PoolTransaction {
+ghost-launcher/src/tx_intelligence/engine.rs:881:        PoolTransaction {
+ghost-launcher/src/components/gatekeeper.rs:14:use crate::events::PoolTransaction;
+ghost-launcher/src/components/gatekeeper.rs:78:    pub tx: Arc<PoolTransaction>,
+ghost-launcher/src/components/gatekeeper.rs:3365:        tx: Arc<PoolTransaction>,
+ghost-launcher/src/components/gatekeeper.rs:3379:        tx: Arc<PoolTransaction>,
+ghost-launcher/src/components/gatekeeper.rs:3394:///   PumpPortal WS → PoolTransaction → ingest_transaction_tracking_only() →
+ghost-launcher/src/components/gatekeeper.rs:4377:        primary_buy_tx: Option<&PoolTransaction>,
+ghost-launcher/src/components/gatekeeper.rs:4651:    fn tx_event_ts_ms(tx: &PoolTransaction) -> u64 {
+ghost-launcher/src/components/gatekeeper.rs:4660:    pub fn tx_key_for(tx: &PoolTransaction) -> Option<TxKey> {
+ghost-launcher/src/components/gatekeeper.rs:5034:        tx: Arc<PoolTransaction>,
+ghost-launcher/src/components/gatekeeper.rs:5101:        tx: Arc<PoolTransaction>,
+ghost-launcher/src/components/gatekeeper.rs:5213:    pub fn update_tracking(&mut self, tx: &PoolTransaction) {
+ghost-launcher/src/components/gatekeeper.rs:5326:    fn apply_tx_to_metrics(&mut self, tx: &PoolTransaction) {
+ghost-launcher/src/components/gatekeeper.rs:5343:    fn tx_key_from_tx(tx: &PoolTransaction) -> Option<TxKey> {
+ghost-launcher/src/components/gatekeeper.rs:5379:    fn track_tx_signature(&mut self, tx: &PoolTransaction) {
+ghost-launcher/src/components/gatekeeper.rs:5388:    fn fallback_counter_for_tx(tx: &PoolTransaction) -> u64 {
+ghost-launcher/src/components/gatekeeper.rs:6846:        tx: Arc<PoolTransaction>,
+ghost-launcher/src/components/gatekeeper.rs:6866:    fn on_transaction(&mut self, tx: Arc<PoolTransaction>) -> GatekeeperVerdict {
+ghost-launcher/src/components/gatekeeper.rs:7582:        let mut seg0: Vec<&PoolTransaction> = Vec::new();
+ghost-launcher/src/components/gatekeeper.rs:7583:        let mut seg1: Vec<&PoolTransaction> = Vec::new();
+ghost-launcher/src/components/gatekeeper.rs:7584:        let mut seg2: Vec<&PoolTransaction> = Vec::new();
+ghost-launcher/src/components/gatekeeper.rs:7644:        let mut seg0: Vec<&PoolTransaction> = Vec::new();
+ghost-launcher/src/components/gatekeeper.rs:7645:        let mut seg1: Vec<&PoolTransaction> = Vec::new();
+ghost-launcher/src/components/gatekeeper.rs:7646:        let mut seg2: Vec<&PoolTransaction> = Vec::new();
+ghost-launcher/src/components/gatekeeper.rs:7660:        fn snapshot(seg: &[&PoolTransaction]) -> TrajectorySegmentSnapshot {
+ghost-launcher/src/components/gatekeeper.rs:7736:    fn on_transaction_long(&mut self, tx: Arc<PoolTransaction>) -> GatekeeperVerdict {
+ghost-launcher/src/components/gatekeeper.rs:8408:    fn create_v2_mock_tx(timestamp_ms: u64, signature: &str) -> PoolTransaction {
+ghost-launcher/src/components/gatekeeper.rs:8409:        PoolTransaction {
+ghost-launcher/src/components/gatekeeper.rs:10252:    ) -> PoolTransaction {
+ghost-launcher/src/components/gatekeeper.rs:12664:    /// Verify that PoolTransactions enriched with ShadowLedger reserves
+ghost-launcher/src/components/trigger/component.rs:5383:                                GhostEvent::PoolTransaction(_tx) => {
+ghost-launcher/src/components/trigger/component.rs:5384:                                    // PoolTransaction events are handled by SnapshotListener
+ghost-launcher/src/oracle_runtime.rs:28:    FundingTransferObserved, GhostEvent, PoolTransaction, PostBuySource,
+ghost-launcher/src/oracle_runtime.rs:185:fn parse_tx_base_mint(tx: &PoolTransaction, fallback: Option<Pubkey>) -> Option<Pubkey> {
+ghost-launcher/src/oracle_runtime.rs:439:    tx: &PoolTransaction,
+ghost-launcher/src/oracle_runtime.rs:460:fn raw_tx_curve_reserves(tx: &PoolTransaction) -> Option<(u64, u64)> {
+ghost-launcher/src/oracle_runtime.rs:496:/// Enrich a PoolTransaction with canonical reserves when the transaction is
+ghost-launcher/src/oracle_runtime.rs:508:    tx: Arc<PoolTransaction>,
+ghost-launcher/src/oracle_runtime.rs:514:) -> Arc<PoolTransaction> {
+ghost-launcher/src/oracle_runtime.rs:683:        "🔧 Enriched gRPC PoolTransaction with canonical/shadow reserves"
+ghost-launcher/src/oracle_runtime.rs:692:/// Convert a [`PoolTransaction`] into a [`FingerprintTxEvent`] for the
+ghost-launcher/src/oracle_runtime.rs:695:fn pool_tx_to_fingerprint_event(tx: &PoolTransaction) -> Option<FingerprintTxEvent> {
+ghost-launcher/src/oracle_runtime.rs:724:        tx_index: 0, // not available in PoolTransaction
+ghost-launcher/src/oracle_runtime.rs:768:fn tx_observed_wall_ts_ms(tx: &PoolTransaction, fallback_now_ms: u64) -> u64 {
+ghost-launcher/src/oracle_runtime.rs:773:fn tx_observed_wall_source_label(tx: &PoolTransaction) -> &'static str {
+ghost-launcher/src/oracle_runtime.rs:1138:fn tx_event_ts_ms(tx: &PoolTransaction) -> u64 {
+ghost-launcher/src/oracle_runtime.rs:1147:    tx: &PoolTransaction,
+ghost-launcher/src/oracle_runtime.rs:1278:    tx: &PoolTransaction,
+ghost-launcher/src/oracle_runtime.rs:1352:fn coordination_tx_event_ts_ms(tx: &PoolTransaction) -> Option<u64> {
+ghost-launcher/src/oracle_runtime.rs:1358:fn coordination_slot_index(tx: &PoolTransaction) -> Option<u64> {
+ghost-launcher/src/oracle_runtime.rs:1371:fn coordination_tx_time_source(tx: &PoolTransaction, slot_index: Option<u64>) -> TxTimeSource {
+ghost-launcher/src/oracle_runtime.rs:1384:    tx: &PoolTransaction,
+ghost-launcher/src/oracle_runtime.rs:1419:fn coordination_outer_ix_count(tx: &PoolTransaction) -> Option<u8> {
+ghost-launcher/src/oracle_runtime.rs:1429:fn coordination_inner_ix_group_count(tx: &PoolTransaction) -> Option<u8> {
+ghost-launcher/src/oracle_runtime.rs:1441:fn coordination_fee_topology_fingerprint(tx: &PoolTransaction) -> Option<FeeTopologyFingerprint> {
+ghost-launcher/src/oracle_runtime.rs:1464:    tx: &PoolTransaction,
+ghost-launcher/src/oracle_runtime.rs:1607:fn fallback_counter_for_pool_tx(tx: &PoolTransaction, event_ts_ms: u64) -> u64 {
+ghost-launcher/src/oracle_runtime.rs:1634:fn pool_tx_to_tx_key(tx: &PoolTransaction, event_ts_ms: u64) -> Option<TxKey> {
+ghost-launcher/src/oracle_runtime.rs:1652:    tx: &PoolTransaction,
+ghost-launcher/src/oracle_runtime.rs:1677:                "Failed to build launcher commit BufferedTx from PoolTransaction"
+ghost-launcher/src/oracle_runtime.rs:1692:    tx: &PoolTransaction,
+ghost-launcher/src/oracle_runtime.rs:1714:                "Failed to build LiveTxEvent from PoolTransaction"
+ghost-launcher/src/oracle_runtime.rs:1794:pub fn extract_dev_buy_from_pool_txs(creator: &str, txs: &[PoolTransaction]) -> (f64, bool) {
+ghost-launcher/src/oracle_runtime.rs:2513:    /// Used by the Oracle Runtime task to enrich gRPC PoolTransaction events
+ghost-launcher/src/oracle_runtime.rs:2972:        tx: &PoolTransaction,
+ghost-launcher/src/oracle_runtime.rs:3526:        tx: &PoolTransaction,
+ghost-launcher/src/oracle_runtime.rs:4676:    tx: &PoolTransaction,
+ghost-launcher/src/oracle_runtime.rs:4780:    tx: &PoolTransaction,
+ghost-launcher/src/oracle_runtime.rs:4878:    tx_hint: Option<&PoolTransaction>,
+ghost-launcher/src/oracle_runtime.rs:15434:    Transaction(Arc<PoolTransaction>),
+ghost-launcher/src/oracle_runtime.rs:20516:fn runtime_tx_time_source_info(tx: &PoolTransaction) -> RuntimeTxTimeSourceInfo {
+ghost-launcher/src/oracle_runtime.rs:22528:                    GhostEvent::PoolTransaction(tx) => {
+ghost-launcher/src/oracle_runtime.rs:22575:                            // observation task has exited.  Raw PoolTransaction MUST NOT spawn
+ghost-launcher/src/oracle_runtime.rs:28292:    fn test_pool_observation_tx(signature: &str) -> Arc<PoolTransaction> {
+ghost-launcher/src/oracle_runtime.rs:28293:        Arc::new(PoolTransaction {
+ghost-launcher/src/oracle_runtime.rs:34532:        use crate::events::PoolTransaction;
+ghost-launcher/src/oracle_runtime.rs:34538:        let failed_buy = PoolTransaction {
+ghost-launcher/src/oracle_runtime.rs:34598:        let successful_buy = PoolTransaction {
+ghost-launcher/src/oracle_runtime.rs:34691:        let successful_buy = PoolTransaction {
+ghost-launcher/src/oracle_runtime.rs:34830:        let successful_buy = PoolTransaction {
+ghost-launcher/src/oracle_runtime.rs:34905:        let successful_buy = PoolTransaction {
+ghost-launcher/src/oracle_runtime.rs:34978:        let successful_buy = PoolTransaction {
+ghost-launcher/src/oracle_runtime.rs:35051:        let successful_buy = PoolTransaction {
+ghost-launcher/src/oracle_runtime.rs:35124:        let successful_buy = PoolTransaction {
+ghost-launcher/src/oracle_runtime.rs:36426:        let tx = PoolTransaction {
+ghost-launcher/src/oracle_runtime.rs:36562:        let tx = PoolTransaction {
+ghost-launcher/src/oracle_runtime.rs:36788:        // Create a PoolTransaction with NO reserve data (simulates gRPC source)
+ghost-launcher/src/oracle_runtime.rs:36789:        let tx = Arc::new(PoolTransaction {
+ghost-launcher/src/oracle_runtime.rs:36895:        // Create a PoolTransaction WITH existing reserve data (e.g., PumpPortal source)
+ghost-launcher/src/oracle_runtime.rs:36896:        let tx = Arc::new(PoolTransaction {
+ghost-launcher/src/oracle_runtime.rs:36977:        let tx = Arc::new(PoolTransaction {
+ghost-launcher/src/oracle_runtime.rs:37072:        let tx = Arc::new(PoolTransaction {
+ghost-launcher/src/oracle_runtime.rs:37195:        let tx = Arc::new(PoolTransaction {
+ghost-launcher/src/oracle_runtime.rs:37294:        let tx = Arc::new(PoolTransaction {
+ghost-launcher/src/oracle_runtime.rs:38733:            .find("GhostEvent::PoolTransaction(tx) => {")
+ghost-launcher/src/oracle_runtime.rs:38735:            .expect("PoolTransaction branch must follow NewPoolDetected");
+ghost-launcher/src/oracle_runtime.rs:39399:        let tx = PoolTransaction {
+ghost-launcher/src/oracle_runtime.rs:39465:        let tx = PoolTransaction {
+ghost-launcher/src/oracle_runtime.rs:39607:        let tx = PoolTransaction {
+ghost-launcher/src/oracle_runtime.rs:39688:        let tx = PoolTransaction {
+ghost-launcher/src/oracle_runtime.rs:39767:        let tx = PoolTransaction {
+ghost-launcher/src/oracle_runtime.rs:39830:        let mut tx = PoolTransaction {
+ghost-launcher/src/oracle_runtime.rs:39899:        let mut tx = PoolTransaction {
+ghost-launcher/src/oracle_runtime.rs:40049:        let tx = PoolTransaction {
+ghost-launcher/src/oracle_runtime.rs:40112:        let tx = PoolTransaction {
+ghost-launcher/src/oracle_runtime.rs:40321:        let tx = PoolTransaction {
+ghost-launcher/src/oracle_runtime.rs:40709:        let tx = PoolTransaction {
+ghost-launcher/src/oracle_runtime.rs:42000:        let tx = Arc::new(PoolTransaction {
+ghost-launcher/src/oracle_runtime.rs:42120:        let tx = Arc::new(PoolTransaction {
+ghost-launcher/src/oracle_runtime.rs:42267:        let tx = Arc::new(PoolTransaction {
+ghost-launcher/src/oracle_runtime.rs:42427:        let tx_mint_only = Arc::new(PoolTransaction {
+ghost-launcher/src/oracle_runtime.rs:42513:        let tx_signer = Arc::new(PoolTransaction {

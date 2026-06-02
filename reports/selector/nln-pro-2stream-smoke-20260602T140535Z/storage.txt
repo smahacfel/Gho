@@ -1,0 +1,5 @@
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda1       150G  142G  2.6G  99% /
+13G	logs/nln_capture/shadow-burnin-v3-fsc-capture-nln-pro-2stream
+2.6G	logs/rollout/shadow-burnin-v3-fsc-capture-nln-pro-2stream
+3.2M	datasets/events/shadow-burnin-v3-fsc-capture-nln-pro-2stream

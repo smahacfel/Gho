@@ -1,0 +1,7 @@
+   152764 logs/nln_capture/shadow-burnin-v3-fsc-capture-nln-pro-2stream/pumpfun_trade_raw_v1.jsonl
+    83793 logs/nln_capture/shadow-burnin-v3-fsc-capture-nln-pro-2stream/system_transfers_raw_v1.jsonl
+    30376 logs/nln_capture/shadow-burnin-v3-fsc-capture-nln-pro-2stream/funding_events_v1.jsonl
+        0 logs/nln_capture/shadow-burnin-v3-fsc-capture-nln-pro-2stream/nln_normalization_errors_v1.jsonl
+        0 logs/nln_capture/shadow-burnin-v3-fsc-capture-nln-pro-2stream/pumpfun_create_raw_v1.jsonl
+        0 logs/nln_capture/shadow-burnin-v3-fsc-capture-nln-pro-2stream/nln_candidate_birth_v1.jsonl
+   266933 total

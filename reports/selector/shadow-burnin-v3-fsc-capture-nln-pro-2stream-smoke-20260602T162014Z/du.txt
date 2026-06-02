@@ -1,0 +1,4 @@
+245M	logs/nln_capture/shadow-burnin-v3-fsc-capture-nln-pro-2stream
+250M	logs/rollout/shadow-burnin-v3-fsc-capture-nln-pro-2stream
+2.4M	datasets/events/shadow-burnin-v3-fsc-capture-nln-pro-2stream
+4.0K	logs/shadow_run/shadow-burnin-v3-fsc-capture-nln-pro-2stream
