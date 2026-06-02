@@ -10,7 +10,7 @@ Ghost birth lane: PASS
 FSC active policy: OFF / PASS
 Provider completeness: NOT CLAIMED
 Scoring readiness: NO-GO / not claimed
-Full plan closure: PENDING_BRIDGE_RUNTIME_PROOF
+Full plan closure: PASS
 ```
 
 This plan deliberately says that the NLN Pro 2-stream profile removes BCV2 RPC
@@ -110,8 +110,50 @@ NLN pumpfun.trade -> PoolTransaction forwarded
 
 The implementation surface contains a bounded mint-to-pool resolver, bounded
 trade dedupe, trade buffering, collision handling, and PoolTransaction emission.
-However the 2026-06-02 smoke did not produce live bridge proof in logs or
-metrics, so this plan remains `PENDING_BRIDGE_RUNTIME_PROOF`.
+The 2026-06-02 bridge-proof smoke produced durable runtime proof in logs, so
+this plan is closed as `PASS`.
+
+## Bridge Proof Smoke
+
+Targeted bridge-proof smoke:
+
+```text
+reports/selector/shadow-burnin-v3-fsc-capture-nln-pro-2stream-bridge-proof-20260602T174035Z/
+```
+
+Code provenance:
+
+```text
+591492bedec36be9bdabefbb2ec960baa68d105e
+```
+
+Bridge result:
+
+```text
+bridge_runtime_proof = PASS
+proof_basis = durable_log
+forward_log_count = 1012
+nln_trade_forwarded_pool_transaction_metric = not_exported_in_snapshot
+nln_trade_resolved_to_pool_metric = not_exported_in_snapshot
+```
+
+Run deltas from start to stop:
+
+```text
+pumpfun_trade_raw_v1 delta = 2934
+system_transfers_raw_v1 delta = 1062
+funding_events_v1 delta = 382
+nln_normalization_errors_v1 delta = 0
+```
+
+Representative durable proof line:
+
+```text
+Seer: NLN pumpfun.trade forwarded to PoolTransaction topic=prod.rpc.solana.pumpfun.trade ... resolver_action="forward_now"
+```
+
+This closes the runtime bridge proof only. Provider completeness, R2/account
+state readiness, scoring readiness, and active FSC policy remain not claimed.
 
 ## Smoke Snapshot
 
@@ -162,29 +204,24 @@ AccountUpdate SSOT/state-readiness work, not by this FSC capture profile.
 
 ## Next Step
 
-If live bridge proof is still missing after the next targeted run, implement or
-repair `PR-NLN2-BRIDGE` narrowly:
+The NLN Pro 2-stream profile is closed for capture/evidence and bridge proof.
+The next selector step may proceed only within the already defined boundaries:
 
 ```text
-1. Populate mint -> pool resolver from Ghost NewPoolDetected/Candidate.
-2. Buffer NLN trades by mint with TTL and caps.
-3. Flush buffered trades on resolver hit.
-4. Deduplicate NLN trade stream with bounded TTL set.
-5. Convert NLN pumpfun.trade to TradeEvent/PoolTransaction.
-6. Emit into the existing session path.
-7. Report unresolved-after-TTL as degraded/diagnostic.
-8. Do not call RPC and do not require BCV2 hydration.
+Phase 2A: feature_snapshots_v1
+Phase 2B: R1 label coverage
+Phase 2C: R2 canonical market path labels
+Phase 2D: leakage audit
 ```
 
-Acceptance:
+Still forbidden:
 
 ```text
-pumpfun.trade after known Candidate -> PoolTransaction
-pumpfun.trade before Candidate -> buffer -> flush
-unknown mint after TTL -> degraded, no RPC
-no AccountUpdate emitted from NLN reserves
-no semantic REJECT from missing BCV2 in this lane
-FSC active policy OFF
-hard reject OFF
-live/P2 untouched
+baseline
+Gatekeeper tuning
+FSC policy activation
+hard reject
+size-down
+R2 from NLN
+AccountUpdate from NLN trade reserves
 ```
