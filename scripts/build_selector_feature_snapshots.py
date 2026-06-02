@@ -12,6 +12,24 @@ from typing import Any
 import selector_pipeline_common as common
 
 
+FEATURE_COVERAGE_VIOLATIONS = {
+    "feature_snapshot_incomplete",
+    "missing_feature_cutoff_ts_ms",
+    "missing_feature_cutoff_slot",
+    "missing_feature_observed_lag_ms",
+    "missing_feature_source",
+}
+
+
+def feature_integrity_violations(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return leakage/source-after-cutoff violations, excluding explicit coverage gaps."""
+    return [
+        violation
+        for violation in common.feature_temporal_violations(rows)
+        if violation.get("violation") not in FEATURE_COVERAGE_VIOLATIONS
+    ]
+
+
 def snapshot_cutoff(candidate: dict[str, Any], snapshot_kind: str) -> int | None:
     if snapshot_kind == "decision":
         return common.int_or_none(candidate.get("decision_ts_ms"))
@@ -52,6 +70,14 @@ def build_feature_snapshots(
             cutoff = snapshot_cutoff(candidate, snapshot_kind)
             if cutoff is None:
                 skipped[f"missing_cutoff:{snapshot_kind}"] += 1
+                reason = "missing_decision_cutoff" if snapshot_kind == "decision" else "missing_snapshot_cutoff"
+                rows.append(
+                    common.build_incomplete_feature_snapshot(
+                        candidate,
+                        snapshot_kind=snapshot_kind,
+                        reason=reason,
+                    )
+                )
                 continue
             rows.append(
                 common.build_feature_snapshot(
@@ -63,10 +89,17 @@ def build_feature_snapshots(
             )
     kind_counts = Counter(str(row.get("snapshot_kind")) for row in rows)
     status_counts = Counter(str(row.get("feature_snapshot_status") or "missing") for row in rows)
+    excluded_counts = Counter(
+        str(row.get("feature_snapshot_excluded_reason") or "none") for row in rows
+    )
     temporal_violations = common.feature_temporal_violations(rows)
+    integrity_violations = feature_integrity_violations(rows)
+    usable_feature_rows = sum(1 for row in rows if row.get("feature_snapshot_status") == "ok")
     fail_reasons = []
-    if temporal_violations:
-        fail_reasons.append("feature_snapshot_incomplete_or_leaky")
+    if not rows:
+        fail_reasons.append("no_feature_snapshot_rows")
+    if integrity_violations:
+        fail_reasons.append("feature_snapshot_integrity_or_leakage_violation")
     if include_decision_context and decision_paths:
         fail_reasons.append("decision_logs_used_for_feature_rollup")
     manifest = {
@@ -84,12 +117,21 @@ def build_feature_snapshots(
         "candidate_rows": len(candidates),
         "source_event_rows": len(events),
         "rows_written": len(rows),
+        "usable_feature_snapshot_rows": usable_feature_rows,
+        "feature_snapshot_gate_status": "PASS" if usable_feature_rows > 0 else "NO-GO",
         "snapshot_kind_counts": common.counter_dict(kind_counts),
         "feature_snapshot_status_counts": common.counter_dict(status_counts),
+        "feature_snapshot_excluded_reason_counts": common.counter_dict(excluded_counts),
         "skipped_counts": common.counter_dict(skipped),
-        "leakage_guard": "feature_rows_checked_against_outcome_execution_fields_and_cutoff_provenance",
+        "leakage_precheck": "PASS" if not integrity_violations else "NO-GO",
+        "leakage_guard": (
+            "feature_rows_checked_against_outcome_execution_fields_and_source-after-cutoff; "
+            "coverage gaps remain explicit feature_snapshot_incomplete rows"
+        ),
         "temporal_violation_count": len(temporal_violations),
         "temporal_violations_sample": temporal_violations[:50],
+        "integrity_violation_count": len(integrity_violations),
+        "integrity_violations_sample": integrity_violations[:50],
     }
     return rows, manifest
 

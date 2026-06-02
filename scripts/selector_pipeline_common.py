@@ -773,6 +773,17 @@ def build_feature_snapshot(
     elif feature_observed_lag_ms < 0:
         incomplete_reasons.append("feature_source_after_cutoff")
     snapshot_status = "feature_snapshot_incomplete" if incomplete_reasons else "ok"
+    decision_context_source = (
+        snapshot_kind == "decision"
+        and str_or_none(candidate.get("decision_context_join_key")) is not None
+    )
+    decision_cutoff_source = None
+    if snapshot_kind == "decision":
+        decision_cutoff_source = (
+            "candidate_universe_decision_ts_ms_context_join"
+            if decision_context_source
+            else "candidate_universe_decision_ts_ms"
+        )
     snapshot = {
         "selector_schema_version": SCHEMA_VERSION,
         "feature_snapshot_schema_version": SCHEMA_VERSION,
@@ -791,7 +802,11 @@ def build_feature_snapshot(
         "feature_source_max_slot": latest_slot,
         "feature_snapshot_status": snapshot_status,
         "feature_snapshot_incomplete_reason": "|".join(incomplete_reasons) if incomplete_reasons else None,
+        "feature_snapshot_excluded_reason": "|".join(incomplete_reasons) if incomplete_reasons else None,
         "feature_time_provenance_ok": snapshot_status == "ok",
+        "decision_context_source": decision_context_source if snapshot_kind == "decision" else None,
+        "decision_context_not_denominator": decision_context_source if snapshot_kind == "decision" else None,
+        "decision_cutoff_source": decision_cutoff_source,
         "source_event_count": len(cutoff_events),
         "tx_event_count": len(tx_events),
         "curve_progress_pct": latest_numeric(
@@ -806,6 +821,57 @@ def build_feature_snapshot(
         "top1_wallet_share": top1_wallet_share,
         "buyer_hhi": buyer_hhi,
         "creator_sold_early_flag": creator_sold,
+    }
+    assert_no_feature_leakage(snapshot)
+    return snapshot
+
+
+def build_incomplete_feature_snapshot(
+    candidate: dict[str, Any],
+    *,
+    snapshot_kind: str,
+    reason: str,
+    cutoff_ts_ms: int | None = None,
+) -> dict[str, Any]:
+    """Emit a fail-closed feature row when a snapshot cutoff cannot be built."""
+    decision_context_source = (
+        snapshot_kind == "decision"
+        and str_or_none(candidate.get("decision_context_join_key")) is not None
+    )
+    snapshot = {
+        "selector_schema_version": SCHEMA_VERSION,
+        "feature_snapshot_schema_version": SCHEMA_VERSION,
+        "candidate_id": candidate.get("candidate_id"),
+        "base_mint": candidate.get("base_mint") or candidate.get("mint_id"),
+        "pool_id": candidate.get("pool_id"),
+        "bonding_curve": candidate.get("bonding_curve"),
+        "quote_mint": candidate.get("quote_mint"),
+        "quote_mint_is_sol": quote_mint_is_sol(str_or_none(candidate.get("quote_mint"))),
+        "snapshot_kind": snapshot_kind,
+        "feature_cutoff_ts_ms": cutoff_ts_ms,
+        "feature_cutoff_slot": None,
+        "feature_source": "selector_offline_event_rollup",
+        "feature_observed_lag_ms": None,
+        "feature_source_max_ts_ms": None,
+        "feature_source_max_slot": None,
+        "feature_snapshot_status": "feature_snapshot_incomplete",
+        "feature_snapshot_incomplete_reason": reason,
+        "feature_snapshot_excluded_reason": reason,
+        "feature_time_provenance_ok": False,
+        "decision_context_source": decision_context_source if snapshot_kind == "decision" else None,
+        "decision_context_not_denominator": decision_context_source if snapshot_kind == "decision" else None,
+        "decision_cutoff_source": "missing" if snapshot_kind == "decision" else None,
+        "source_event_count": 0,
+        "tx_event_count": 0,
+        "curve_progress_pct": None,
+        "net_quote_in_15s": None,
+        "net_quote_in_30s": None,
+        "trade_rate": None,
+        "unique_buyers": None,
+        "sell_share": None,
+        "top1_wallet_share": None,
+        "buyer_hhi": None,
+        "creator_sold_early_flag": None,
     }
     assert_no_feature_leakage(snapshot)
     return snapshot

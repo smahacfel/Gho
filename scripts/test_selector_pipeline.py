@@ -13,6 +13,7 @@ import build_selector_accepted_lifecycle as accepted
 import build_selector_candidate_universe as universe
 import build_selector_dataset as dataset
 import build_selector_feature_snapshots as snapshots
+import build_selector_phase2 as phase2
 import build_selector_training_view as training
 import compare_selector_gatekeepers as compare
 import selector_pipeline_common as common
@@ -459,6 +460,95 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertEqual(manifest["decision_context_rows_loaded"], 0)
         self.assertEqual(rows[0]["source_event_count"], 0)
         self.assertEqual(rows[0]["feature_snapshot_status"], "feature_snapshot_incomplete")
+
+    def test_feature_snapshot_decision_missing_cutoff_emits_incomplete_row(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            candidates = root / "candidate_universe_v1.jsonl"
+            output = root / "feature_snapshots_v1.jsonl"
+            write_jsonl(
+                candidates,
+                [
+                    {
+                        "candidate_id": "c1",
+                        "base_mint": "mint1",
+                        "pool_id": "pool1",
+                        "bonding_curve": "curve1",
+                        "quote_mint": "SOL",
+                        "birth_ts_ms": 1_000,
+                    }
+                ],
+            )
+            snapshots.run(
+                snapshots.build_parser().parse_args(
+                    [
+                        "--candidate-universe",
+                        str(candidates),
+                        "--output",
+                        str(output),
+                        "--snapshot-kind",
+                        "decision",
+                    ]
+                )
+            )
+            row = read_jsonl(output)[0]
+
+        self.assertEqual(row["snapshot_kind"], "decision")
+        self.assertEqual(row["feature_snapshot_status"], "feature_snapshot_incomplete")
+        self.assertEqual(row["feature_snapshot_excluded_reason"], "missing_decision_cutoff")
+        self.assertIsNone(row["feature_cutoff_ts_ms"])
+
+    def test_feature_snapshot_decision_context_provenance_is_explicit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            candidates = root / "candidate_universe_v1.jsonl"
+            events = root / "events.jsonl"
+            output = root / "feature_snapshots_v1.jsonl"
+            write_jsonl(
+                candidates,
+                [
+                    {
+                        "candidate_id": "c1",
+                        "base_mint": "mint1",
+                        "pool_id": "pool1",
+                        "bonding_curve": "curve1",
+                        "quote_mint": "SOL",
+                        "birth_ts_ms": 1_000,
+                        "decision_ts_ms": 2_000,
+                        "decision_context_join_key": "mint_pool:mint1:pool1",
+                    }
+                ],
+            )
+            write_jsonl(
+                events,
+                [
+                    {
+                        "candidate_id": "c1",
+                        "timestamp_ms": 1_500,
+                        "slot": 9,
+                    }
+                ],
+            )
+            snapshots.run(
+                snapshots.build_parser().parse_args(
+                    [
+                        "--candidate-universe",
+                        str(candidates),
+                        "--events",
+                        str(events),
+                        "--output",
+                        str(output),
+                        "--snapshot-kind",
+                        "decision",
+                    ]
+                )
+            )
+            row = read_jsonl(output)[0]
+
+        self.assertEqual(row["feature_snapshot_status"], "ok")
+        self.assertTrue(row["decision_context_source"])
+        self.assertTrue(row["decision_context_not_denominator"])
+        self.assertEqual(row["decision_cutoff_source"], "candidate_universe_decision_ts_ms_context_join")
 
     def test_candidate_universe_excludes_non_birth_events_and_non_sol_is_out_of_scope(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1001,6 +1091,98 @@ class SelectorPipelineTests(unittest.TestCase):
             self.assertTrue((dataset_dir / "selector_training_view_v1.jsonl").exists())
             self.assertTrue((report_dir / "dataset_manifest_v1.json").exists())
             self.assertIn("dataset_manifest_v1", manifest["outputs"])
+
+    def test_phase2_p2a_orchestrator_writes_features_and_keeps_scoring_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "unit"
+            dataset_dir = root / "datasets" / "selector" / scope
+            report_dir = root / "reports" / "selector" / scope
+            dataset_dir.mkdir(parents=True)
+            report_dir.mkdir(parents=True)
+            candidates = dataset_dir / "candidate_universe_v1.jsonl"
+            events = root / "events.jsonl"
+            manifest_path = report_dir / "dataset_manifest_v1.json"
+            write_jsonl(
+                candidates,
+                [
+                    {
+                        "candidate_id": "c1",
+                        "candidate_universe_status": "ok",
+                        "cohort_in_scope": True,
+                        "stream_completeness_ok": True,
+                        "base_mint": "mint1",
+                        "pool_id": "pool1",
+                        "bonding_curve": "curve1",
+                        "quote_mint": "SOL",
+                        "birth_ts_ms": 1_000,
+                        "decision_ts_ms": 2_000,
+                    }
+                ],
+            )
+            write_jsonl(
+                events,
+                [
+                    {
+                        "candidate_id": "c1",
+                        "timestamp_ms": 1_500,
+                        "slot": 9,
+                        "type": "NewPoolDetected",
+                    }
+                ],
+            )
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "artifact": "dataset_manifest_v1",
+                        "scope": scope,
+                        "status": "PASS",
+                        "phase1_status": "PASS",
+                        "denominator_source": "event_artifact_only",
+                        "r2_labels_built": False,
+                        "outputs": {
+                            "candidate_universe_v1": {
+                                "path": str(candidates),
+                                "exists": True,
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            manifest = phase2.build_phase2(
+                phase2.build_parser().parse_args(
+                    [
+                        "--scope",
+                        scope,
+                        "--root",
+                        str(root),
+                        "--events",
+                        str(events),
+                        "--target-net-pct",
+                        "40",
+                        "--stop-net-pct",
+                        "40",
+                        "--horizon-ms",
+                        "60000",
+                    ]
+                )
+            )
+            self.assertTrue((dataset_dir / "feature_snapshots_v1.jsonl").exists())
+            self.assertTrue((report_dir / "feature_snapshots_manifest_v1.json").exists())
+            self.assertFalse((dataset_dir / "selector_training_view_v1.jsonl").exists())
+            self.assertFalse((report_dir / "selector_baseline_v1.json").exists())
+            self.assertFalse((report_dir / "gatekeeper_compare_v25_v3_v1.json").exists())
+            self.assertEqual(manifest["phase2_stage_status"], "P2A_PASS")
+            self.assertEqual(manifest["phase2_status"], "NO-GO/PENDING_R2_DENOMINATOR")
+            self.assertEqual(manifest["r2_config"]["profile"], "r2_40_40_60s_v1")
+            self.assertFalse(manifest["r2_market_paths_built"])
+            self.assertFalse(manifest["r2_label_projection_built"])
+            self.assertFalse(manifest["r2_resolved_denominator_built"])
+            self.assertFalse(manifest["selector_training_view_built"])
+            self.assertFalse(manifest["baseline_built"])
+            self.assertFalse(manifest["shadow_only_emit"]["enabled"])
 
 
 if __name__ == "__main__":
