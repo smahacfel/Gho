@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import build_selector_accepted_lifecycle as accepted
 import build_selector_candidate_universe as universe
+import build_selector_canonical_r2_source as canonical_r2
 import build_selector_dataset as dataset
 import build_selector_feature_snapshots as snapshots
 import build_selector_phase2 as phase2
@@ -1430,6 +1431,137 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertTrue(all(row["r2_label"] is None for row in rows))
         self.assertEqual(coverage["r2_noncanonical_source_rows"], 2)
         self.assertEqual(coverage["r2_resolved_rows"], 0)
+
+    def test_canonical_r2_source_exports_diag_rows_compatible_with_r2_builder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            candidates = root / "candidate_universe_v1.jsonl"
+            diag_log = root / "system.log"
+            source_output = root / "canonical_r2_source_v1.jsonl"
+            manifest_output = root / "canonical_r2_source_manifest_v1.json"
+            write_jsonl(
+                candidates,
+                [
+                    {
+                        "candidate_id": "c1",
+                        "base_mint": "mint1",
+                        "pool_id": "curve1",
+                        "bonding_curve": "curve1",
+                        "decision_ts_ms": 1_000,
+                    }
+                ],
+            )
+            diag_log.write_text(
+                "\n".join(
+                    [
+                        (
+                            "1970-01-01T00:00:01.000Z INFO "
+                            "DIAG_ACCOUNT_UPDATE_RELAY base_mint=mint1 bonding_curve=curve1 "
+                            "slot=10 sol_reserves=1000000000 token_reserves=1000000 "
+                            "complete=0 curve_finality=confirmed"
+                        ),
+                        (
+                            "1970-01-01T00:01:01.000Z INFO "
+                            "DIAG_ACCOUNT_UPDATE_RELAY base_mint=mint1 bonding_curve=curve1 "
+                            "slot=11 sol_reserves=1500000000 token_reserves=1000000 "
+                            "complete=0 curve_finality=confirmed"
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            source_manifest = canonical_r2.run(
+                canonical_r2.build_parser().parse_args(
+                    [
+                        "--root",
+                        str(root),
+                        "--candidate-universe",
+                        str(candidates),
+                        "--diag-log",
+                        str(diag_log),
+                        "--output",
+                        str(source_output),
+                        "--manifest-output",
+                        str(manifest_output),
+                        "--horizon-ms",
+                        "60000",
+                    ]
+                )
+            )
+            rows, coverage = r2_paths.build_r2_market_paths(
+                candidate_universe=candidates,
+                account_update_paths=[],
+                diag_account_update_paths=[],
+                canonical_snapshot_paths=[source_output],
+                target_net_pct=40,
+                stop_net_pct=40,
+                horizon_ms=60_000,
+            )
+            source_rows = read_jsonl(source_output)
+            manifest_exists = manifest_output.exists()
+
+        self.assertEqual(source_manifest["status"], "PASS")
+        self.assertEqual(source_manifest["source_rows_written"], 1)
+        self.assertEqual(source_manifest["candidate_ok_rows"], 1)
+        self.assertEqual(len(source_rows), 1)
+        self.assertTrue(manifest_exists)
+        self.assertEqual(rows[0]["path_source"], "DIAG_ACCOUNT_UPDATE_RELAY")
+        self.assertEqual(rows[0]["r2_label"], "positive")
+        self.assertEqual(rows[0]["r2_label_reason"], "target_before_stop")
+        self.assertEqual(coverage["status"], "PASS")
+
+    def test_canonical_r2_source_fails_closed_without_matching_diag_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            candidates = root / "candidate_universe_v1.jsonl"
+            diag_log = root / "system.log"
+            source_output = root / "canonical_r2_source_v1.jsonl"
+            write_jsonl(
+                candidates,
+                [
+                    {
+                        "candidate_id": "c1",
+                        "base_mint": "mint1",
+                        "pool_id": "curve1",
+                        "bonding_curve": "curve1",
+                        "decision_ts_ms": 1_000,
+                    }
+                ],
+            )
+            diag_log.write_text(
+                (
+                    "1970-01-01T00:00:01.000Z INFO "
+                    "DIAG_ACCOUNT_UPDATE_RELAY base_mint=other bonding_curve=curve1 "
+                    "slot=10 sol_reserves=1000000000 token_reserves=1000000 "
+                    "complete=0 curve_finality=confirmed\n"
+                ),
+                encoding="utf-8",
+            )
+
+            source_manifest = canonical_r2.run(
+                canonical_r2.build_parser().parse_args(
+                    [
+                        "--root",
+                        str(root),
+                        "--candidate-universe",
+                        str(candidates),
+                        "--diag-log",
+                        str(diag_log),
+                        "--output",
+                        str(source_output),
+                        "--horizon-ms",
+                        "60000",
+                    ]
+                )
+            )
+            source_rows = read_jsonl(source_output)
+
+        self.assertEqual(source_manifest["status"], "NO-GO/PENDING_R2_SOURCE")
+        self.assertIn("no_candidate_matched_canonical_source", source_manifest["fail_reasons"])
+        self.assertEqual(source_manifest["source_rows_written"], 0)
+        self.assertEqual(source_rows, [])
 
 
 if __name__ == "__main__":
