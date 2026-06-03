@@ -50,6 +50,7 @@ def build_phase1_join_coverage(
     accepted_manifest: Path | None,
     window_start_ms: int | None = None,
     window_end_ms: int | None = None,
+    allow_r2_universe_only: bool = False,
 ) -> dict[str, Any]:
     candidates = list(common.iter_json_objects(candidate_universe))
     accepted_rows = list(common.iter_json_objects(accepted_lifecycle))
@@ -111,7 +112,7 @@ def build_phase1_join_coverage(
         fail_reasons.append("universe_incomplete_rows")
     if candidate_report.get("decision_logs_created_denominator_rows", 0) != 0:
         fail_reasons.append("decision_logs_created_denominator_rows_nonzero")
-    if not accepted_rows:
+    if not accepted_rows and not allow_r2_universe_only:
         fail_reasons.append("accepted_lifecycle_no_rows")
     if accepted_rows and completeness < 0.99:
         fail_reasons.append("accepted_lifecycle_join_completeness_below_99pct")
@@ -120,6 +121,21 @@ def build_phase1_join_coverage(
     accepted_pending = sum(1 for row in accepted_rows if row.get("lifecycle_status") == "pending_horizon_cutoff")
     accepted_unresolved = accepted_rows_count - accepted_resolved - accepted_pending
 
+    if allow_r2_universe_only and not accepted_rows and not fail_reasons:
+        status = "PASS_FOR_R2_UNIVERSE_ONLY"
+    elif not fail_reasons:
+        status = "PASS"
+    elif allow_r2_universe_only and not accepted_rows and "accepted_lifecycle_no_rows" in fail_reasons:
+        status = "NO-GO"
+    else:
+        status = "NO-GO"
+
+    phase3_precision_readiness = (
+        "NO-GO_NO_ACCEPTED_LIFECYCLE"
+        if status == "PASS_FOR_R2_UNIVERSE_ONLY"
+        else ("PENDING_PHASE2_R2_DENOMINATOR" if status == "PASS" else "NO-GO")
+    )
+
     return {
         "selector_schema_version": common.SCHEMA_VERSION,
         "artifact": "phase1_join_coverage_v1",
@@ -127,9 +143,11 @@ def build_phase1_join_coverage(
         "scope_kind": "windowed" if window_start_ms is not None or window_end_ms is not None else "full",
         "window_start_ts_ms": window_start_ms,
         "window_end_ts_ms": window_end_ms,
-        "status": "PASS" if not fail_reasons else "NO-GO",
-        "phase1_gate_status": "PASS" if not fail_reasons else "NO-GO",
+        "status": status,
+        "phase1_gate_status": status,
         "fail_reasons": fail_reasons,
+        "allow_r2_universe_only": allow_r2_universe_only,
+        "phase3_precision_readiness": phase3_precision_readiness,
         "candidate_universe_rows": len(candidates),
         "candidate_universe_ok_rows": status_counts.get("ok", 0),
         "candidate_universe_incomplete_rows": status_counts.get("universe_incomplete", 0),
@@ -174,7 +192,11 @@ def build_dataset_manifest(
         "label_coverage_v1": report_dir / "label_coverage_v1.json",
         "dataset_manifest_v1": report_dir / "dataset_manifest_v1.json",
     }
-    phase1_status = "PASS" if join_coverage.get("status") == "PASS" else "NO-GO"
+    phase1_status = (
+        str(join_coverage.get("status"))
+        if join_coverage.get("status") in {"PASS", "PASS_FOR_R2_UNIVERSE_ONLY"}
+        else "NO-GO"
+    )
     scope_kind = (
         "windowed"
         if args.window_start_ms is not None or args.window_end_ms is not None
@@ -195,6 +217,7 @@ def build_dataset_manifest(
         "status": phase1_status,
         "phase1_status": phase1_status,
         "phase1_fail_reasons": join_coverage.get("fail_reasons", []),
+        "phase3_precision_readiness": join_coverage.get("phase3_precision_readiness"),
         "dataset_dir": str(dataset_dir),
         "report_dir": str(report_dir),
         "denominator_source": "event_artifact_only",
@@ -268,6 +291,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--window-end-ms", type=int)
     parser.add_argument("--window-reason")
     parser.add_argument("--excluded-window-reason")
+    parser.add_argument(
+        "--allow-r2-universe-only",
+        action="store_true",
+        help=(
+            "Allow Phase 1 to pass as PASS_FOR_R2_UNIVERSE_ONLY when accepted "
+            "lifecycle rows are absent. This does not make the scope Phase 3 "
+            "precision-ready."
+        ),
+    )
     parser.add_argument("--phase1-join-output", required=True, type=Path)
     parser.add_argument("--label-coverage-output", required=True, type=Path)
     parser.add_argument("--dataset-manifest-output", required=True, type=Path)
@@ -283,6 +315,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         accepted_manifest=args.accepted_manifest,
         window_start_ms=args.window_start_ms,
         window_end_ms=args.window_end_ms,
+        allow_r2_universe_only=args.allow_r2_universe_only,
     )
     common.write_json(args.phase1_join_output, join_coverage)
     label_coverage = {
@@ -302,7 +335,7 @@ def main(argv: list[str] | None = None) -> int:
     manifest = run(args)
     if args.json:
         print(json.dumps(manifest, ensure_ascii=False, sort_keys=True))
-    return 0 if manifest.get("phase1_status") == "PASS" else 2
+    return 0 if manifest.get("phase1_status") in {"PASS", "PASS_FOR_R2_UNIVERSE_ONLY"} else 2
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -71,8 +72,8 @@ def event_paths_from_manifest(manifest: dict[str, Any]) -> list[Path]:
 
 
 def require_phase1_pass(manifest: dict[str, Any]) -> None:
-    if manifest.get("phase1_status") != "PASS":
-        raise ValueError("Phase 2 requires phase1_status=PASS")
+    if manifest.get("phase1_status") not in {"PASS", "PASS_FOR_R2_UNIVERSE_ONLY"}:
+        raise ValueError("Phase 2 requires phase1_status=PASS or PASS_FOR_R2_UNIVERSE_ONLY")
     if manifest.get("denominator_source") != "event_artifact_only":
         raise ValueError("Phase 2 requires event_artifact_only denominator")
     if manifest.get("r2_labels_built") not in {False, None}:
@@ -106,6 +107,83 @@ def shadow_ledger_snapshot_audit(paths: list[Path]) -> dict[str, Any]:
         "overlap_detection_status": "not_attempted_without_binary_adapter",
         "snapshot_count": len(entries),
         "snapshots": entries,
+    }
+
+
+def build_phase2_label_coverage(
+    *,
+    accepted_lifecycle: Path,
+    r2_rows: list[dict[str, Any]],
+    r2_coverage: dict[str, Any],
+    feature_report: dict[str, Any],
+    phase1_manifest: dict[str, Any],
+) -> dict[str, Any]:
+    accepted_rows = list(common.iter_json_objects(accepted_lifecycle)) if accepted_lifecycle.exists() else []
+    lifecycle_status_counts = Counter(
+        str(row.get("lifecycle_status") or row.get("analysis_status") or "unknown")
+        for row in accepted_rows
+    )
+    r1_label_counts = Counter(str(row.get("r1_label") or "unresolved") for row in accepted_rows)
+    r1_resolved_rows = sum(1 for row in accepted_rows if row.get("label_resolved") is True)
+    r2_label_counts = Counter(str(row.get("r2_label") or "unresolved") for row in r2_rows)
+    r2_status_counts = Counter(str(row.get("r2_status") or "unknown") for row in r2_rows)
+    r2_resolved_rows = int(r2_coverage.get("r2_resolved_rows") or 0)
+    accepted_lifecycle_rows = len(accepted_rows)
+    phase3_precision_readiness = str(
+        phase1_manifest.get("phase3_precision_readiness") or "PENDING_PHASE3_TRAINING_VIEW"
+    )
+    if accepted_lifecycle_rows == 0:
+        phase3_precision_readiness = "NO-GO_NO_ACCEPTED_LIFECYCLE"
+    elif r2_resolved_rows == 0:
+        phase3_precision_readiness = "NO-GO_NO_R2_RESOLVED_DENOMINATOR"
+
+    fail_reasons: list[str] = []
+    if feature_report.get("leakage_precheck") != "PASS":
+        fail_reasons.append("leakage_precheck_not_pass")
+    if r2_resolved_rows == 0:
+        fail_reasons.append("r2_resolved_denominator_empty")
+
+    if r2_resolved_rows > 0 and accepted_lifecycle_rows > 0:
+        status = "PASS"
+    elif r2_resolved_rows > 0:
+        status = "PASS_FOR_R2_COVERAGE_ONLY"
+    else:
+        status = "NO-GO/PENDING_R2_DENOMINATOR"
+
+    return {
+        "selector_schema_version": common.SCHEMA_VERSION,
+        "artifact": "label_coverage_v1",
+        "phase": "phase2",
+        "purpose": "r1_r2_label_coverage_and_phase3_readiness",
+        "status": status,
+        "fail_reasons": fail_reasons,
+        "denominator_source": "event_artifact_only",
+        "r2_ssot_contract": r2_coverage.get("r2_ssot_contract"),
+        "r2_market_paths_built": True,
+        "r2_label_projection_built": True,
+        "r2_resolved_denominator_built": r2_resolved_rows > 0,
+        "r2_resolved_rows": r2_resolved_rows,
+        "r2_positive_rows": int(r2_coverage.get("r2_positive_rows") or 0),
+        "r2_negative_rows": int(r2_coverage.get("r2_negative_rows") or 0),
+        "r2_unresolved_rows": max(len(r2_rows) - r2_resolved_rows, 0),
+        "r2_label_counts": common.counter_dict(r2_label_counts),
+        "r2_status_counts": common.counter_dict(r2_status_counts),
+        "r2_horizon_unmatured_rows": int(r2_coverage.get("r2_horizon_unmatured_rows") or 0),
+        "r2_missing_path_rows": int(r2_coverage.get("r2_missing_path_rows") or 0),
+        "r2_stream_incomplete_rows": int(r2_coverage.get("r2_stream_incomplete_rows") or 0),
+        "r1_label_projection_built": accepted_lifecycle_rows > 0,
+        "accepted_lifecycle_rows": accepted_lifecycle_rows,
+        "accepted_lifecycle_resolved_rows": r1_resolved_rows,
+        "accepted_lifecycle_unresolved_rows": max(accepted_lifecycle_rows - r1_resolved_rows, 0),
+        "lifecycle_status_counts": common.counter_dict(lifecycle_status_counts),
+        "r1_label_counts": common.counter_dict(r1_label_counts),
+        "leakage_precheck": feature_report.get("leakage_precheck"),
+        "feature_snapshot_gate_status": feature_report.get("feature_snapshot_gate_status"),
+        "phase3_precision_readiness": phase3_precision_readiness,
+        "selector_training_view_built": False,
+        "baseline_built": False,
+        "gatekeeper_compare_built": False,
+        "shadow_only_emit_enabled": False,
     }
 
 
@@ -162,6 +240,21 @@ def build_phase2(args: argparse.Namespace) -> dict[str, Any]:
     common.write_jsonl(r2_output, r2_rows)
     common.write_json(r2_coverage_output, r2_coverage)
 
+    accepted_lifecycle = output_path_from_manifest(
+        manifest,
+        "accepted_lifecycle_v1",
+        dataset_dir / "accepted_lifecycle_v1.jsonl",
+    )
+    label_coverage_output = report_dir / "label_coverage_v1.json"
+    label_coverage = build_phase2_label_coverage(
+        accepted_lifecycle=accepted_lifecycle,
+        r2_rows=r2_rows,
+        r2_coverage=r2_coverage,
+        feature_report=feature_report,
+        phase1_manifest=manifest,
+    )
+    common.write_json(label_coverage_output, label_coverage)
+
     feature_ok = (
         feature_report.get("status") == "ok"
         and feature_report.get("feature_snapshot_gate_status") == "PASS"
@@ -173,8 +266,12 @@ def build_phase2(args: argparse.Namespace) -> dict[str, Any]:
         phase2_stage_status = "NO-GO/FEATURE_SNAPSHOTS"
         phase2_status = "NO-GO/FEATURE_SNAPSHOTS"
     elif r2_resolved_denominator_built:
-        phase2_stage_status = "P2B_PASS"
-        phase2_status = "P2B_PASS_PENDING_LABEL_COVERAGE"
+        phase2_stage_status = "P2C_PASS"
+        phase2_status = (
+            "P2C_PASS_LABEL_COVERAGE"
+            if label_coverage.get("status") == "PASS"
+            else "P2C_PASS_LABEL_COVERAGE_R2_ONLY"
+        )
     else:
         phase2_stage_status = "P2B_PENDING_R2_DENOMINATOR"
         phase2_status = "NO-GO/PENDING_R2_DENOMINATOR"
@@ -200,14 +297,16 @@ def build_phase2(args: argparse.Namespace) -> dict[str, Any]:
             "feature_snapshots_manifest_v1": file_provenance(feature_manifest_output),
             "r2_market_paths_v1": file_provenance(r2_output),
             "r2_market_path_coverage_v1": file_provenance(r2_coverage_output),
+            "label_coverage_v1": file_provenance(label_coverage_output),
             "shadow_ledger_snapshot_audit_v1": file_provenance(shadow_audit_path),
         }
     )
     stage_reports = dict(manifest.get("stage_reports") or {})
     stage_reports["feature_snapshots_v1"] = feature_report
     stage_reports["r2_market_paths_v1"] = r2_coverage
+    stage_reports["label_coverage_v1"] = label_coverage
     stage_reports["shadow_ledger_snapshot_audit_v1"] = shadow_audit
-    stage_reports["phase2_p2b"] = {
+    phase2_stage_report = {
         "status": phase2_stage_status,
         "phase2_status": phase2_status,
         "r2_config": r2_config,
@@ -217,6 +316,14 @@ def build_phase2(args: argparse.Namespace) -> dict[str, Any]:
         "r2_resolved_denominator_built": r2_resolved_denominator_built,
         "r2_resolved_rows": r2_resolved_rows,
     }
+    stage_reports["phase2_p2b"] = phase2_stage_report
+    if phase2_stage_status == "P2C_PASS":
+        stage_reports["phase2_p2c"] = {
+            **phase2_stage_report,
+            "label_coverage_built": True,
+            "label_coverage_status": label_coverage.get("status"),
+            "phase3_precision_readiness": label_coverage.get("phase3_precision_readiness"),
+        }
 
     manifest.update(
         {
@@ -275,7 +382,11 @@ def main(argv: list[str] | None = None) -> int:
     manifest = build_phase2(args)
     if args.json:
         print(json.dumps(manifest, ensure_ascii=False, sort_keys=True))
-    return 0 if manifest.get("phase2_stage_status") in {"P2B_PASS", "P2B_PENDING_R2_DENOMINATOR"} else 2
+    return (
+        0
+        if manifest.get("phase2_stage_status") in {"P2C_PASS", "P2B_PASS", "P2B_PENDING_R2_DENOMINATOR"}
+        else 2
+    )
 
 
 if __name__ == "__main__":

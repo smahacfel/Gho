@@ -1425,6 +1425,207 @@ class SelectorPipelineTests(unittest.TestCase):
             self.assertFalse(manifest["baseline_built"])
             self.assertFalse(manifest["shadow_only_emit"]["enabled"])
 
+    def test_phase2_accepts_r2_universe_only_phase1_but_keeps_phase3_no_go(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "unit-r2-only"
+            dataset_dir = root / "datasets" / "selector" / scope
+            report_dir = root / "reports" / "selector" / scope
+            dataset_dir.mkdir(parents=True)
+            report_dir.mkdir(parents=True)
+            candidates = dataset_dir / "candidate_universe_v1.jsonl"
+            events = root / "events.jsonl"
+            manifest_path = report_dir / "dataset_manifest_v1.json"
+            write_jsonl(
+                candidates,
+                [
+                    {
+                        "candidate_id": "c1",
+                        "candidate_universe_status": "ok",
+                        "cohort_in_scope": True,
+                        "stream_completeness_ok": True,
+                        "base_mint": "mint1",
+                        "pool_id": "pool1",
+                        "bonding_curve": "curve1",
+                        "quote_mint": "SOL",
+                        "birth_ts_ms": 1_000,
+                        "decision_ts_ms": 2_000,
+                    }
+                ],
+            )
+            write_jsonl(
+                events,
+                [
+                    {
+                        "candidate_id": "c1",
+                        "timestamp_ms": 1_500,
+                        "slot": 9,
+                        "type": "NewPoolDetected",
+                    }
+                ],
+            )
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "artifact": "dataset_manifest_v1",
+                        "scope": scope,
+                        "status": "PASS_FOR_R2_UNIVERSE_ONLY",
+                        "phase1_status": "PASS_FOR_R2_UNIVERSE_ONLY",
+                        "phase3_precision_readiness": "NO-GO_NO_ACCEPTED_LIFECYCLE",
+                        "denominator_source": "event_artifact_only",
+                        "r2_labels_built": False,
+                        "outputs": {
+                            "candidate_universe_v1": {
+                                "path": str(candidates),
+                                "exists": True,
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            manifest = phase2.build_phase2(
+                phase2.build_parser().parse_args(
+                    [
+                        "--scope",
+                        scope,
+                        "--root",
+                        str(root),
+                        "--events",
+                        str(events),
+                        "--target-net-pct",
+                        "40",
+                        "--stop-net-pct",
+                        "40",
+                        "--horizon-ms",
+                        "60000",
+                    ]
+                )
+            )
+            self.assertEqual(manifest["phase1_status"], "PASS_FOR_R2_UNIVERSE_ONLY")
+            self.assertEqual(manifest["phase3_precision_readiness"], "NO-GO_NO_ACCEPTED_LIFECYCLE")
+            self.assertTrue(manifest["r2_market_paths_built"])
+            self.assertFalse(manifest["selector_training_view_built"])
+            self.assertFalse(manifest["baseline_built"])
+            self.assertFalse(manifest["shadow_only_emit"]["enabled"])
+
+    def test_phase2_writes_label_coverage_without_phase3_when_lifecycle_is_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "unit-r2-label-coverage"
+            dataset_dir = root / "datasets" / "selector" / scope
+            report_dir = root / "reports" / "selector" / scope
+            dataset_dir.mkdir(parents=True)
+            report_dir.mkdir(parents=True)
+            candidates = dataset_dir / "candidate_universe_v1.jsonl"
+            accepted_lifecycle = dataset_dir / "accepted_lifecycle_v1.jsonl"
+            events = root / "events.jsonl"
+            canonical = root / "canonical_r2_source_v1.jsonl"
+            manifest_path = report_dir / "dataset_manifest_v1.json"
+            write_jsonl(
+                candidates,
+                [
+                    {
+                        "candidate_id": "c1",
+                        "candidate_universe_status": "ok",
+                        "cohort_in_scope": True,
+                        "stream_completeness_ok": True,
+                        "base_mint": "mint1",
+                        "pool_id": "pool1",
+                        "bonding_curve": "curve1",
+                        "quote_mint": "SOL",
+                        "birth_ts_ms": 1_000,
+                        "decision_ts_ms": 2_000,
+                    }
+                ],
+            )
+            write_jsonl(accepted_lifecycle, [])
+            write_jsonl(
+                events,
+                [
+                    {
+                        "candidate_id": "c1",
+                        "timestamp_ms": 1_500,
+                        "slot": 9,
+                        "type": "NewPoolDetected",
+                    }
+                ],
+            )
+            write_jsonl(
+                canonical,
+                [
+                    {
+                        "base_mint": "mint1",
+                        "bonding_curve": "curve1",
+                        "path_source": "DIAG_ACCOUNT_UPDATE_RELAY",
+                        "samples": [
+                            {"offset_ms": 0, "ts_ms": 2_000, "slot": 10, "return_pct": 0.0},
+                            {"offset_ms": 10_000, "ts_ms": 12_000, "slot": 11, "return_pct": -50.0},
+                            {"offset_ms": 60_000, "ts_ms": 62_000, "slot": 12, "return_pct": -50.0},
+                        ],
+                    }
+                ],
+            )
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "artifact": "dataset_manifest_v1",
+                        "scope": scope,
+                        "status": "PASS_FOR_R2_UNIVERSE_ONLY",
+                        "phase1_status": "PASS_FOR_R2_UNIVERSE_ONLY",
+                        "phase3_precision_readiness": "NO-GO_NO_ACCEPTED_LIFECYCLE",
+                        "denominator_source": "event_artifact_only",
+                        "r2_labels_built": False,
+                        "outputs": {
+                            "candidate_universe_v1": {
+                                "path": str(candidates),
+                                "exists": True,
+                            },
+                            "accepted_lifecycle_v1": {
+                                "path": str(accepted_lifecycle),
+                                "exists": True,
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            manifest = phase2.build_phase2(
+                phase2.build_parser().parse_args(
+                    [
+                        "--scope",
+                        scope,
+                        "--root",
+                        str(root),
+                        "--events",
+                        str(events),
+                        "--canonical-snapshot-jsonl",
+                        str(canonical),
+                        "--target-net-pct",
+                        "40",
+                        "--stop-net-pct",
+                        "40",
+                        "--horizon-ms",
+                        "60000",
+                    ]
+                )
+            )
+            label_coverage = json.loads((report_dir / "label_coverage_v1.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["phase2_stage_status"], "P2C_PASS")
+            self.assertEqual(manifest["phase2_status"], "P2C_PASS_LABEL_COVERAGE_R2_ONLY")
+            self.assertEqual(manifest["phase3_precision_readiness"], "NO-GO_NO_ACCEPTED_LIFECYCLE")
+            self.assertEqual(label_coverage["phase"], "phase2")
+            self.assertEqual(label_coverage["status"], "PASS_FOR_R2_COVERAGE_ONLY")
+            self.assertEqual(label_coverage["r2_resolved_rows"], 1)
+            self.assertEqual(label_coverage["r2_negative_rows"], 1)
+            self.assertEqual(label_coverage["accepted_lifecycle_rows"], 0)
+            self.assertEqual(label_coverage["phase3_precision_readiness"], "NO-GO_NO_ACCEPTED_LIFECYCLE")
+            self.assertFalse(manifest["selector_training_view_built"])
+            self.assertFalse(manifest["baseline_built"])
+            self.assertFalse(manifest["shadow_only_emit"]["enabled"])
+
     def test_r2_market_paths_writes_one_row_per_candidate_and_missing_path_is_unresolved(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
