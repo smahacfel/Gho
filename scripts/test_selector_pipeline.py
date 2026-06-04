@@ -18,6 +18,7 @@ import build_selector_phase1_report as phase1_report
 import build_selector_phase2 as phase2
 import build_selector_phase3_r2only as phase3_r2only
 import build_selector_r2_market_paths as r2_paths
+import build_selector_r2only_baseline_report as r2only_baseline
 import build_selector_training_view as training
 import compare_selector_gatekeepers as compare
 import selector_pipeline_common as common
@@ -1805,6 +1806,110 @@ class SelectorPipelineTests(unittest.TestCase):
             training_rows[0]["execution_feasibility_status"],
             "not_available_r2_only",
         )
+
+    def test_r2only_baseline_report_is_draft_only_and_uses_resolved_denominator(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "selector-p3b-r2only-test"
+            dataset_dir = root / "datasets" / "selector" / scope
+            report_dir = root / "reports" / "selector" / scope
+            dataset_dir.mkdir(parents=True)
+            report_dir.mkdir(parents=True)
+            training_view = dataset_dir / "selector_training_view_v1.jsonl"
+            phase3_manifest = report_dir / "phase3_r2only_manifest_v1.json"
+
+            rows = []
+            for idx in range(20):
+                split = "train" if idx < 14 else "validation" if idx < 17 else "holdout"
+                rows.append(
+                    {
+                        "candidate_id": f"c{idx:02d}",
+                        "split": split,
+                        "cohort_in_scope": True,
+                        "stream_completeness_ok": True,
+                        "feature_snapshot_status": "ok",
+                        "r2_label": "positive" if idx % 2 == 0 else "negative",
+                        "r2_status": "resolved",
+                        "r2_path_coverage_ok": True,
+                        "r2_horizon_matured": True,
+                        "r2_only_training_denominator": True,
+                        "decision_verdict_buy": idx % 3 == 0,
+                        "gatekeeper_v25_score": float(20 - idx),
+                        "birth_ts_ms": idx,
+                        "unique_buyers": idx + 1,
+                        "quote_mint_is_sol": True,
+                        "execution_feasibility_status": "not_available_r2_only",
+                    }
+                )
+            rows.append(
+                {
+                    "candidate_id": "excluded-unmatured",
+                    "split": "holdout",
+                    "cohort_in_scope": True,
+                    "stream_completeness_ok": True,
+                    "feature_snapshot_status": "ok",
+                    "r2_label": None,
+                    "r2_status": "horizon_unmatured",
+                    "r2_path_coverage_ok": True,
+                    "r2_horizon_matured": False,
+                    "r2_only_training_denominator": False,
+                    "decision_verdict_buy": True,
+                }
+            )
+            write_jsonl(training_view, rows)
+            phase3_manifest.write_text(
+                json.dumps(
+                    {
+                        "status": "PASS_R2_ONLY_DRAFT",
+                        "dataset_kind": "r2_only",
+                        "market_recall_claim_allowed": False,
+                        "production_promotion_allowed": False,
+                        "leakage_audit_status": "PASS",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            report = r2only_baseline.run(
+                r2only_baseline.build_parser().parse_args(
+                    [
+                        "--scope",
+                        scope,
+                        "--root",
+                        str(root),
+                        "--min-resolved-rows",
+                        "10",
+                        "--min-holdout-resolved-rows",
+                        "3",
+                        "--bootstrap-samples",
+                        "50",
+                    ]
+                )
+            )
+
+        self.assertEqual(report["status"], "P3B_PASS_R2_ONLY_BASELINE_DRAFT")
+        self.assertEqual(report["dataset_kind"], "r2_only")
+        self.assertEqual(report["resolved_denominator_count"], 20)
+        self.assertEqual(report["positive_rows"], 10)
+        self.assertEqual(report["negative_rows"], 10)
+        self.assertEqual(report["split_counts"]["holdout"]["positive"], 1)
+        self.assertEqual(report["split_counts"]["holdout"]["negative"], 2)
+        self.assertEqual(
+            report["selector_accept_context"]["precision_at_accept"]["selected_count"],
+            1,
+        )
+        self.assertEqual(
+            report["selector_accept_context"]["precision_at_accept"]["precision_r2"],
+            1.0,
+        )
+        self.assertTrue(report["baseline_built"])
+        self.assertFalse(report["market_recall_claim_allowed"])
+        self.assertFalse(report["production_promotion_allowed"])
+        self.assertFalse(report["claim_boundaries"]["production_promotion_claim"])
+        self.assertFalse(report["claim_boundaries"]["gatekeeper_tuning_started"])
+        self.assertEqual(report["exclusions"]["horizon_unmatured"], 1)
+        self.assertTrue(report["outputs"]["selector_r2only_baseline_report_v1"]["exists"])
+        self.assertTrue(report["outputs"]["selector_r2only_baseline_by_bucket_v1"]["exists"])
 
     def test_r2_market_paths_writes_one_row_per_candidate_and_missing_path_is_unresolved(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
