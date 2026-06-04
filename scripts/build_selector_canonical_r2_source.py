@@ -164,10 +164,11 @@ def select_samples(
     *,
     decision_ts_ms: int,
     horizon_ms: int,
+    post_horizon_grace_ms: int,
     pre_decision_ms: int,
 ) -> list[dict[str, Any]]:
     start_ts = decision_ts_ms - max(pre_decision_ms, 0)
-    end_ts = decision_ts_ms + horizon_ms
+    end_ts = decision_ts_ms + horizon_ms + max(post_horizon_grace_ms, 0)
     samples = [
         source_sample(update, decision_ts_ms=decision_ts_ms)
         for update in updates
@@ -191,6 +192,8 @@ def build_source_rows(
     candidate_universe: Path,
     diag_log_paths: list[Path],
     horizon_ms: int,
+    horizon_tolerance_ms: int,
+    post_horizon_grace_ms: int,
     pre_decision_ms: int,
     max_sample_gap_ms: int,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -226,6 +229,7 @@ def build_source_rows(
             updates,
             decision_ts_ms=decision_ts_ms,
             horizon_ms=horizon_ms,
+            post_horizon_grace_ms=post_horizon_grace_ms,
             pre_decision_ms=pre_decision_ms,
         )
         if not samples:
@@ -235,7 +239,8 @@ def build_source_rows(
         max_offset = max(
             offset for sample in samples if (offset := common.int_or_none(sample.get("offset_ms"))) is not None
         )
-        horizon_matured = max_offset >= horizon_ms
+        effective_horizon_ms = max(horizon_ms - max(horizon_tolerance_ms, 0), 0)
+        horizon_matured = max_offset >= effective_horizon_ms
         path_coverage_ok = stream_gap_count == 0
         if not path_coverage_ok:
             path_status = "stream_incomplete"
@@ -261,6 +266,10 @@ def build_source_rows(
                 "path_status": path_status,
                 "path_coverage_ok": path_coverage_ok,
                 "horizon_matured": horizon_matured,
+                "horizon_ms": horizon_ms,
+                "horizon_tolerance_ms": max(horizon_tolerance_ms, 0),
+                "post_horizon_grace_ms": max(post_horizon_grace_ms, 0),
+                "effective_horizon_ms": effective_horizon_ms,
                 "stream_gap_count": stream_gap_count,
                 "restart_gap_count": 0,
                 "gap_classification": "sample_gap" if stream_gap_count else None,
@@ -288,6 +297,9 @@ def build_source_rows(
         "candidate_universe": str(candidate_universe),
         "candidate_universe_rows": len(candidates),
         "horizon_ms": horizon_ms,
+        "horizon_tolerance_ms": max(horizon_tolerance_ms, 0),
+        "post_horizon_grace_ms": max(post_horizon_grace_ms, 0),
+        "effective_horizon_ms": max(horizon_ms - max(horizon_tolerance_ms, 0), 0),
         "pre_decision_ms": pre_decision_ms,
         "max_sample_gap_ms": max_sample_gap_ms,
         "source_kind": "diag_account_update_relay_to_canonical_snapshot_jsonl",
@@ -326,6 +338,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--manifest-output", type=Path)
     parser.add_argument("--horizon-ms", required=True, type=int)
+    parser.add_argument(
+        "--horizon-tolerance-ms",
+        type=int,
+        default=1,
+        help=(
+            "Allow this many milliseconds of timestamp truncation at the horizon boundary. "
+            "Default 1 covers ISO/f64-to-ms flooring where a 60s DIAG sample appears as 59999ms."
+        ),
+    )
+    parser.add_argument(
+        "--post-horizon-grace-ms",
+        type=int,
+        default=0,
+        help=(
+            "Include samples this many milliseconds after the label horizon as maturity sentinels. "
+            "Phase 2 still ignores target/stop hits after --horizon-ms."
+        ),
+    )
     parser.add_argument("--pre-decision-ms", type=int, default=0)
     parser.add_argument("--max-sample-gap-ms", type=int, default=0)
     parser.add_argument("--json", action="store_true")
@@ -338,6 +368,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         candidate_universe=args.candidate_universe,
         diag_log_paths=diag_log_paths,
         horizon_ms=args.horizon_ms,
+        horizon_tolerance_ms=args.horizon_tolerance_ms,
+        post_horizon_grace_ms=args.post_horizon_grace_ms,
         pre_decision_ms=args.pre_decision_ms,
         max_sample_gap_ms=args.max_sample_gap_ms,
     )

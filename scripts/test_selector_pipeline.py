@@ -1946,6 +1946,163 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertEqual(rows[0]["r2_label_reason"], "target_before_stop")
         self.assertEqual(coverage["status"], "PASS")
 
+    def test_canonical_r2_source_allows_one_ms_horizon_flooring(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            candidates = root / "candidate_universe_v1.jsonl"
+            diag_log = root / "system.log"
+            source_output = root / "canonical_r2_source_v1.jsonl"
+            write_jsonl(
+                candidates,
+                [
+                    {
+                        "candidate_id": "c1",
+                        "base_mint": "mint1",
+                        "pool_id": "curve1",
+                        "bonding_curve": "curve1",
+                        "decision_ts_ms": 1_000,
+                    }
+                ],
+            )
+            diag_log.write_text(
+                "\n".join(
+                    [
+                        (
+                            "1970-01-01T00:00:01.000Z INFO "
+                            "DIAG_ACCOUNT_UPDATE_RELAY base_mint=mint1 bonding_curve=curve1 "
+                            "slot=10 sol_reserves=1000000000 token_reserves=1000000 "
+                            "complete=0 curve_finality=confirmed"
+                        ),
+                        (
+                            "1970-01-01T00:01:00.999Z INFO "
+                            "DIAG_ACCOUNT_UPDATE_RELAY base_mint=mint1 bonding_curve=curve1 "
+                            "slot=11 sol_reserves=900000000 token_reserves=1000000 "
+                            "complete=0 curve_finality=confirmed"
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            source_manifest = canonical_r2.run(
+                canonical_r2.build_parser().parse_args(
+                    [
+                        "--root",
+                        str(root),
+                        "--candidate-universe",
+                        str(candidates),
+                        "--diag-log",
+                        str(diag_log),
+                        "--output",
+                        str(source_output),
+                        "--horizon-ms",
+                        "60000",
+                    ]
+                )
+            )
+            source_rows = read_jsonl(source_output)
+            rows, coverage = r2_paths.build_r2_market_paths(
+                candidate_universe=candidates,
+                account_update_paths=[],
+                diag_account_update_paths=[],
+                canonical_snapshot_paths=[source_output],
+                target_net_pct=40,
+                stop_net_pct=40,
+                horizon_ms=60_000,
+            )
+
+        self.assertEqual(source_manifest["status"], "PASS")
+        self.assertEqual(source_manifest["horizon_tolerance_ms"], 1)
+        self.assertEqual(source_manifest["effective_horizon_ms"], 59_999)
+        self.assertEqual(source_manifest["candidate_ok_rows"], 1)
+        self.assertEqual(source_rows[0]["path_status"], "ok")
+        self.assertTrue(source_rows[0]["horizon_matured"])
+        self.assertEqual(source_rows[0]["horizon_tolerance_ms"], 1)
+        self.assertEqual(rows[0]["r2_status"], "negative")
+        self.assertEqual(rows[0]["r2_label"], "negative")
+        self.assertEqual(rows[0]["r2_label_reason"], "no_target_by_horizon")
+        self.assertEqual(coverage["status"], "PASS")
+
+    def test_canonical_r2_source_post_horizon_grace_is_maturity_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            candidates = root / "candidate_universe_v1.jsonl"
+            diag_log = root / "system.log"
+            source_output = root / "canonical_r2_source_v1.jsonl"
+            write_jsonl(
+                candidates,
+                [
+                    {
+                        "candidate_id": "c1",
+                        "base_mint": "mint1",
+                        "pool_id": "curve1",
+                        "bonding_curve": "curve1",
+                        "decision_ts_ms": 1_000,
+                    }
+                ],
+            )
+            diag_log.write_text(
+                "\n".join(
+                    [
+                        (
+                            "1970-01-01T00:00:01.000Z INFO "
+                            "DIAG_ACCOUNT_UPDATE_RELAY base_mint=mint1 bonding_curve=curve1 "
+                            "slot=10 sol_reserves=1000000000 token_reserves=1000000 "
+                            "complete=0 curve_finality=confirmed"
+                        ),
+                        (
+                            "1970-01-01T00:01:01.500Z INFO "
+                            "DIAG_ACCOUNT_UPDATE_RELAY base_mint=mint1 bonding_curve=curve1 "
+                            "slot=11 sol_reserves=2000000000 token_reserves=1000000 "
+                            "complete=0 curve_finality=confirmed"
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            source_manifest = canonical_r2.run(
+                canonical_r2.build_parser().parse_args(
+                    [
+                        "--root",
+                        str(root),
+                        "--candidate-universe",
+                        str(candidates),
+                        "--diag-log",
+                        str(diag_log),
+                        "--output",
+                        str(source_output),
+                        "--horizon-ms",
+                        "60000",
+                        "--post-horizon-grace-ms",
+                        "2000",
+                    ]
+                )
+            )
+            source_rows = read_jsonl(source_output)
+            rows, coverage = r2_paths.build_r2_market_paths(
+                candidate_universe=candidates,
+                account_update_paths=[],
+                diag_account_update_paths=[],
+                canonical_snapshot_paths=[source_output],
+                target_net_pct=40,
+                stop_net_pct=40,
+                horizon_ms=60_000,
+            )
+
+        self.assertEqual(source_manifest["status"], "PASS")
+        self.assertEqual(source_manifest["post_horizon_grace_ms"], 2_000)
+        self.assertEqual(source_manifest["candidate_ok_rows"], 1)
+        self.assertEqual(source_rows[0]["path_status"], "ok")
+        self.assertTrue(source_rows[0]["horizon_matured"])
+        self.assertEqual(source_rows[0]["post_horizon_grace_ms"], 2_000)
+        self.assertEqual(rows[0]["r2_status"], "negative")
+        self.assertEqual(rows[0]["r2_label"], "negative")
+        self.assertEqual(rows[0]["r2_label_reason"], "no_target_by_horizon")
+        self.assertEqual(coverage["status"], "PASS")
+
     def test_canonical_r2_source_fails_closed_without_matching_diag_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
