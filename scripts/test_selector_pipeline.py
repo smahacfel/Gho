@@ -16,6 +16,7 @@ import build_selector_dataset as dataset
 import build_selector_feature_snapshots as snapshots
 import build_selector_phase1_report as phase1_report
 import build_selector_phase2 as phase2
+import build_selector_phase3_r2only as phase3_r2only
 import build_selector_r2_market_paths as r2_paths
 import build_selector_training_view as training
 import compare_selector_gatekeepers as compare
@@ -1625,6 +1626,185 @@ class SelectorPipelineTests(unittest.TestCase):
             self.assertFalse(manifest["selector_training_view_built"])
             self.assertFalse(manifest["baseline_built"])
             self.assertFalse(manifest["shadow_only_emit"]["enabled"])
+
+    def test_phase3_r2only_builds_training_view_without_baseline_claims(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "selector-phase3-r2only-test"
+            dataset_dir = root / "datasets" / "selector" / scope
+            report_dir = root / "reports" / "selector" / scope
+            dataset_dir.mkdir(parents=True)
+            report_dir.mkdir(parents=True)
+            candidates = dataset_dir / "candidate_universe_v1.jsonl"
+            accepted_lifecycle = dataset_dir / "accepted_lifecycle_v1.jsonl"
+            features = dataset_dir / "feature_snapshots_v1.jsonl"
+            r2_paths = dataset_dir / "r2_market_paths_v1.jsonl"
+
+            candidate_rows = []
+            feature_rows = []
+            path_rows = []
+            for idx in range(20):
+                candidate_id = f"c{idx:02d}"
+                ts_ms = 1_000 + idx * 1_000
+                candidate_rows.append(
+                    {
+                        "candidate_id": candidate_id,
+                        "candidate_universe_status": "ok",
+                        "cohort_in_scope": True,
+                        "stream_completeness_ok": True,
+                        "base_mint": f"mint{idx}",
+                        "pool_id": f"pool{idx}",
+                        "bonding_curve": f"curve{idx}",
+                        "quote_mint": "SOL",
+                        "birth_ts_ms": ts_ms,
+                        "decision_ts_ms": ts_ms + 500,
+                        "decision_verdict_buy": idx % 3 == 0,
+                    }
+                )
+                feature_rows.append(
+                    {
+                        "candidate_id": candidate_id,
+                        "snapshot_kind": "decision",
+                        "feature_cutoff_ts_ms": ts_ms + 500,
+                        "feature_cutoff_slot": idx + 10,
+                        "feature_source": "selector_offline_event_rollup",
+                        "feature_observed_lag_ms": 0,
+                        "feature_source_max_ts_ms": ts_ms + 500,
+                        "feature_snapshot_status": "ok",
+                        "feature_time_provenance_ok": True,
+                        "unique_buyers": idx + 1,
+                    }
+                )
+                return_pct = 45.0 if idx % 2 == 0 else -45.0
+                path_rows.append(
+                    {
+                        "candidate_id": candidate_id,
+                        "base_mint": f"mint{idx}",
+                        "pool_id": f"pool{idx}",
+                        "bonding_curve": f"curve{idx}",
+                        "path_source": "DIAG_ACCOUNT_UPDATE_RELAY",
+                        "path_status": "ok",
+                        "path_coverage_ok": True,
+                        "horizon_matured": True,
+                        "samples": [{"offset_ms": 60_000, "return_pct": return_pct}],
+                    }
+                )
+
+            write_jsonl(candidates, candidate_rows)
+            write_jsonl(accepted_lifecycle, [])
+            write_jsonl(features, feature_rows)
+            write_jsonl(r2_paths, path_rows)
+            (report_dir / "dataset_manifest_v1.json").write_text(
+                json.dumps(
+                    {
+                        "phase2_status": "P2C_PASS_LABEL_COVERAGE_R2_ONLY",
+                        "denominator_source": "event_artifact_only",
+                        "r2_resolved_denominator_built": True,
+                        "selector_training_view_built": False,
+                        "baseline_built": False,
+                        "gatekeeper_compare_built": False,
+                        "outputs": {
+                            "candidate_universe_v1": {
+                                "path": str(candidates),
+                                "exists": True,
+                            },
+                            "accepted_lifecycle_v1": {
+                                "path": str(accepted_lifecycle),
+                                "exists": True,
+                            },
+                            "feature_snapshots_v1": {
+                                "path": str(features),
+                                "exists": True,
+                            },
+                            "r2_market_paths_v1": {
+                                "path": str(r2_paths),
+                                "exists": True,
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            phase3_manifest = phase3_r2only.run(
+                phase3_r2only.build_parser().parse_args(
+                    [
+                        "--scope",
+                        scope,
+                        "--root",
+                        str(root),
+                        "--target-net-pct",
+                        "40",
+                        "--stop-net-pct",
+                        "40",
+                        "--horizon-ms",
+                        "60000",
+                        "--min-resolved-rows",
+                        "10",
+                    ]
+                )
+            )
+            training_rows = read_jsonl(dataset_dir / "selector_training_view_v1.jsonl")
+            training_manifest = json.loads(
+                (report_dir / "selector_training_view_manifest_v1.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertEqual(phase3_manifest["status"], "PASS_R2_ONLY_DRAFT")
+        self.assertEqual(phase3_manifest["phase3_precision_readiness"], "R2_ONLY_READY")
+        self.assertEqual(phase3_manifest["dataset_kind"], "r2_only")
+        self.assertEqual(
+            phase3_manifest["universe_source_class"],
+            "ghost_observed_birth_universe",
+        )
+        self.assertEqual(
+            phase3_manifest["universe_completeness_claim"],
+            "system_observed_not_archive_complete",
+        )
+        self.assertEqual(
+            phase3_manifest["precision_claim_scope"],
+            "observed_birth_universe_only",
+        )
+        self.assertFalse(phase3_manifest["market_recall_claim_allowed"])
+        self.assertFalse(phase3_manifest["production_promotion_allowed"])
+        self.assertFalse(phase3_manifest["execution_success_claim_allowed"])
+        self.assertFalse(phase3_manifest["realized_pnl_available"])
+        self.assertFalse(phase3_manifest["claim_boundaries"]["r1_lifecycle_claim"])
+        self.assertFalse(phase3_manifest["claim_boundaries"]["realized_pnl_claim"])
+        self.assertFalse(phase3_manifest["baseline_built"])
+        self.assertFalse(phase3_manifest["gatekeeper_compare_built"])
+        self.assertEqual(phase3_manifest["training_rows"], 20)
+        self.assertEqual(phase3_manifest["r2_training_denominator_rows"], 20)
+        self.assertEqual(phase3_manifest["r2_positive_rows"], 10)
+        self.assertEqual(phase3_manifest["r2_negative_rows"], 10)
+        self.assertEqual(training_manifest["r2_training_denominator_rows"], 20)
+        self.assertEqual(training_manifest["dataset_kind"], "r2_only")
+        self.assertEqual(
+            training_manifest["universe_source_class"],
+            "ghost_observed_birth_universe",
+        )
+        self.assertFalse(training_manifest["market_recall_claim_allowed"])
+        self.assertFalse(training_manifest["production_promotion_allowed"])
+        self.assertEqual(
+            training_manifest["r2_training_denominator_split_counts"]["train"],
+            14,
+        )
+        self.assertEqual(
+            training_manifest["r2_training_denominator_split_counts"]["validation"],
+            3,
+        )
+        self.assertEqual(
+            training_manifest["r2_training_denominator_split_counts"]["holdout"],
+            3,
+        )
+        self.assertEqual(training_rows[0]["phase3_dataset_kind"], "r2_only")
+        self.assertTrue(training_rows[0]["r2_only_training_denominator"])
+        self.assertIn("selector_accept_context", training_rows[0])
+        self.assertEqual(
+            training_rows[0]["execution_feasibility_status"],
+            "not_available_r2_only",
+        )
 
     def test_r2_market_paths_writes_one_row_per_candidate_and_missing_path_is_unresolved(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

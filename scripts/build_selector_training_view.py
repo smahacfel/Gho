@@ -34,6 +34,46 @@ def choose_feature(
     )
 
 
+def r2_training_denominator(row: dict[str, Any]) -> bool:
+    return bool(
+        row.get("cohort_in_scope") is True
+        and row.get("stream_completeness_ok") is True
+        and row.get("feature_snapshot_status") == "ok"
+        and row.get("r2_label") in {"positive", "negative"}
+        and row.get("r2_status") in {"positive", "negative", "resolved"}
+        and row.get("r2_path_coverage_ok") is True
+        and row.get("r2_horizon_matured") is True
+    )
+
+
+def choose_resolved_r2_temporal_split(rows: list[dict[str, Any]]) -> dict[str, str]:
+    denominator_rows = [row for row in rows if r2_training_denominator(row)]
+    ordered = sorted(
+        denominator_rows,
+        key=lambda row: (
+            common.int_or_none(row.get("birth_ts_ms"))
+            or common.int_or_none(row.get("decision_ts_ms"))
+            or 0,
+            str(row.get("candidate_id")),
+        ),
+    )
+    total = len(ordered)
+    splits: dict[str, str] = {}
+    for idx, row in enumerate(ordered):
+        candidate_id = common.str_or_none(row.get("candidate_id"))
+        if not candidate_id:
+            continue
+        frac = idx / total if total else 0.0
+        if frac < 0.70:
+            split = "train"
+        elif frac < 0.85:
+            split = "validation"
+        else:
+            split = "holdout"
+        splits[candidate_id] = split
+    return splits
+
+
 def lifecycle_ts_ms(row: dict[str, Any]) -> int | None:
     for field in ("decision_ts_ms", "entry_execution_ts_ms", "first_seen_ts_ms", "curve_t0_event_ts_ms"):
         value = common.int_or_none(row.get(field))
@@ -92,6 +132,7 @@ def build_training_view(
     horizon_ms: int,
     snapshot_kind: str,
     fallback_snapshot_kind: str,
+    split_denominator: str = "candidate_universe",
 ) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
     candidates = list(common.iter_json_objects(candidate_universe))
     accepted_rows = list(common.iter_json_objects(accepted_lifecycle))
@@ -202,6 +243,22 @@ def build_training_view(
             "gatekeeper_v3_replay_artifact_version": candidate.get(
                 "gatekeeper_v3_replay_artifact_version"
             ),
+            "selector_accept_context": {
+                "decision_verdict_buy": candidate.get("decision_verdict_buy"),
+                "decision_reason": candidate.get("decision_reason"),
+                "gatekeeper_verdict": candidate.get("gatekeeper_verdict"),
+            },
+            "gatekeeper_legacy_verdict_context": {
+                "decision_verdict_buy": candidate.get("decision_verdict_buy"),
+                "decision_reason": candidate.get("decision_reason"),
+                "gatekeeper_verdict": candidate.get("gatekeeper_verdict"),
+            },
+            "gatekeeper_v25_verdict_context": {
+                "accept": candidate.get("gatekeeper_v25_accept"),
+                "score": candidate.get("gatekeeper_v25_score"),
+                "confidence": candidate.get("v25_shadow_confidence"),
+                "replay_artifact_version": candidate.get("gatekeeper_v25_replay_artifact_version"),
+            },
             "v3_shadow_verdict": candidate.get("v3_shadow_verdict"),
             "v3_shadow_confidence": candidate.get("v3_shadow_confidence"),
             "v25_shadow_confidence": candidate.get("v25_shadow_confidence"),
@@ -223,7 +280,14 @@ def build_training_view(
                 if price_ambiguous_match
                 else "not_found"
             ),
-            "execution_only_failure": False,
+            "execution_feasibility_status": (
+                lifecycle.get("execution_feasibility_status") if lifecycle else "not_available_r2_only"
+            ),
+            "execution_only_failure": (
+                bool(lifecycle.get("execution_only_failure")) if lifecycle else False
+            ),
+            "execution_realization_available": lifecycle is not None,
+            "phase3_dataset_kind": "r2_only",
             "label_resolved": r2.get("r2_label") in {"positive", "negative"},
         }
         if feature:
@@ -258,18 +322,22 @@ def build_training_view(
             ):
                 row[key] = lifecycle.get(key)
         row.update(r2)
+        row["r2_label_resolved"] = row.get("r2_label") in {"positive", "negative"}
+        row["label_resolved"] = row["r2_label_resolved"]
         row["label_excluded_reason"] = row.get("r2_excluded_reason") or row.get("r1_excluded_reason")
+        row["r2_only_training_denominator"] = r2_training_denominator(row)
         rows.append(row)
 
+    if split_denominator == "resolved_r2":
+        resolved_splits = choose_resolved_r2_temporal_split(rows)
+        for row in rows:
+            candidate_id = common.str_or_none(row.get("candidate_id"))
+            if candidate_id in resolved_splits:
+                row["split"] = resolved_splits[candidate_id]
+
     label_counts = Counter(str(row.get("r2_label") or row.get("r2_status") or "unknown") for row in rows)
-    denominator_rows = [
-        row
-        for row in rows
-        if row.get("cohort_in_scope")
-        and row.get("stream_completeness_ok")
-        and row.get("label_resolved")
-        and row.get("r2_label") in {"positive", "negative"}
-    ]
+    denominator_rows = [row for row in rows if r2_training_denominator(row)]
+    split_counts = Counter(str(row.get("split") or "unknown") for row in denominator_rows)
     accepted_join_scope_rows = len(accepted_in_scope_rows)
     accepted_join_completeness = (
         accepted_joined / accepted_join_scope_rows if accepted_join_scope_rows else 1.0
@@ -284,6 +352,8 @@ def build_training_view(
         "artifact": "label_coverage_v1",
         "status": "ok" if not coverage_fail_reasons else "NO-GO",
         "fail_reasons": coverage_fail_reasons,
+        "phase3_dataset_kind": "r2_only",
+        "split_denominator": split_denominator,
         "candidate_rows": len(candidates),
         "training_rows": len(rows),
         "accepted_lifecycle_rows": accepted_total,
@@ -302,6 +372,8 @@ def build_training_view(
             "status": "PASS" if accepted_join_completeness >= 0.99 else "NO-GO",
         },
         "resolved_r2_rows": len(denominator_rows),
+        "r2_training_denominator_rows": len(denominator_rows),
+        "r2_training_denominator_split_counts": common.counter_dict(split_counts),
         "r2_label_counts": common.counter_dict(label_counts),
         "matured_r2_resolved_rate": (
             len(denominator_rows) / len(rows) if rows else None
@@ -329,6 +401,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--horizon-ms", required=True, type=int)
     parser.add_argument("--snapshot-kind", default="decision")
     parser.add_argument("--fallback-snapshot-kind", default="birth+30s")
+    parser.add_argument(
+        "--split-denominator",
+        choices=["candidate_universe", "resolved_r2"],
+        default="candidate_universe",
+    )
     parser.add_argument("--json", action="store_true")
     return parser
 
@@ -344,6 +421,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         horizon_ms=args.horizon_ms,
         snapshot_kind=args.snapshot_kind,
         fallback_snapshot_kind=args.fallback_snapshot_kind,
+        split_denominator=args.split_denominator,
     )
     common.write_jsonl(args.output, rows)
     if args.label_coverage_output:
