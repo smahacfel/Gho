@@ -1,0 +1,57 @@
+name: Restore Lifecycle Guard
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      runtime:
+        description: "Run full 600s restore runtime guard"
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+jobs:
+  level1-static:
+    name: Level 1 static restore guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python syntax and unit tests
+        run: |
+          python3 -m py_compile scripts/guard_restore_shadow_lifecycle.py scripts/test_guard_restore_shadow_lifecycle.py
+          python3 -m unittest scripts.test_guard_restore_shadow_lifecycle -v
+      - name: Restore guard without runtime smoke
+        run: |
+          python3 scripts/guard_restore_shadow_lifecycle.py --skip-runtime --output-dir /tmp/restore_guard_static --json
+
+  level2-runtime:
+    name: Level 2 runtime restore guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    if: github.event_name == 'workflow_dispatch' && inputs.runtime == 'true'
+    env:
+      GHOST_SEER_GRPC_ENDPOINT: ${{ secrets.GHOST_SEER_GRPC_ENDPOINT }}
+      GHOST_SEER_GRPC_X_TOKEN: ${{ secrets.GHOST_SEER_GRPC_X_TOKEN }}
+      GHOST_SEER_RPC_ENDPOINT: ${{ secrets.GHOST_SEER_RPC_ENDPOINT }}
+      GHOST_TRIGGER_RPC_URL: ${{ secrets.GHOST_TRIGGER_RPC_URL }}
+      GHOST_TRIGGER_SHADOW_RPC_URL: ${{ secrets.GHOST_TRIGGER_SHADOW_RPC_URL }}
+      GHOST_TRIGGER_KEYPAIR_PATH: ${{ secrets.GHOST_TRIGGER_KEYPAIR_PATH }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Full restore runtime guard
+        run: |
+          OUT_DIR="reports/selector/restore_lifecycle_guard_$(date -u +%Y%m%dT%H%M%SZ)"
+          python3 scripts/guard_restore_shadow_lifecycle.py --output-dir "${OUT_DIR}" --json
+      - name: Upload restore guard report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: restore-lifecycle-guard
+          path: reports/selector/restore_lifecycle_guard_*
