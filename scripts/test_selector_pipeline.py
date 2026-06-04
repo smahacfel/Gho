@@ -19,6 +19,8 @@ import build_selector_phase2 as phase2
 import build_selector_phase3_r2only as phase3_r2only
 import build_selector_r2_market_paths as r2_paths
 import build_selector_r2only_baseline_report as r2only_baseline
+import build_selector_r2only_ablation_report as r2only_ablation
+import build_selector_r2only_feature_audit as r2only_feature_audit
 import build_selector_training_view as training
 import compare_selector_gatekeepers as compare
 import selector_pipeline_common as common
@@ -1910,6 +1912,158 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertEqual(report["exclusions"]["horizon_unmatured"], 1)
         self.assertTrue(report["outputs"]["selector_r2only_baseline_report_v1"]["exists"])
         self.assertTrue(report["outputs"]["selector_r2only_baseline_by_bucket_v1"]["exists"])
+
+    def test_r2only_feature_audit_flags_missing_tx_event_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "selector-p3c-feature-audit-test"
+            dataset_dir = root / "datasets" / "selector" / scope
+            report_dir = root / "reports" / "selector" / scope
+            event_dir = root / "datasets" / "events" / "source"
+            dataset_dir.mkdir(parents=True)
+            report_dir.mkdir(parents=True)
+            event_dir.mkdir(parents=True)
+            training_view = dataset_dir / "selector_training_view_v1.jsonl"
+            feature_snapshots = dataset_dir / "feature_snapshots_v1.jsonl"
+            r2_market_paths = dataset_dir / "r2_market_paths_v1.jsonl"
+            events = event_dir / "events.jsonl"
+            feature_manifest = report_dir / "feature_snapshots_manifest_v1.json"
+
+            write_jsonl(
+                training_view,
+                [
+                    {
+                        "candidate_id": "c1",
+                        "cohort_in_scope": True,
+                        "stream_completeness_ok": True,
+                        "feature_snapshot_status": "ok",
+                        "r2_label": "positive",
+                        "r2_status": "resolved",
+                        "r2_path_coverage_ok": True,
+                        "r2_horizon_matured": True,
+                        "buyer_hhi": None,
+                        "top1_wallet_share": None,
+                        "sell_share": None,
+                        "curve_progress_pct": None,
+                    }
+                ],
+            )
+            write_jsonl(
+                feature_snapshots,
+                [
+                    {
+                        "candidate_id": "c1",
+                        "snapshot_kind": "decision",
+                        "feature_snapshot_status": "ok",
+                        "source_event_count": 1,
+                        "tx_event_count": 0,
+                        "buyer_hhi": None,
+                        "top1_wallet_share": None,
+                        "sell_share": None,
+                        "curve_progress_pct": None,
+                    }
+                ],
+            )
+            write_jsonl(r2_market_paths, [{"candidate_id": "c1"}])
+            write_jsonl(
+                events,
+                [
+                    {
+                        "envelope": {"candidate_id": "c1", "event_time_ms": 1_000},
+                        "kind": {
+                            "type": "NewPoolDetected",
+                            "payload": {
+                                "is_birth_event": True,
+                                "base_mint": "mint1",
+                                "pool_id": "pool1",
+                                "timestamp_ms": 1_000,
+                            },
+                        },
+                    }
+                ],
+            )
+            feature_manifest.write_text(
+                json.dumps({"input_event_paths": [str(events)]}),
+                encoding="utf-8",
+            )
+
+            report = r2only_feature_audit.run(
+                r2only_feature_audit.build_parser().parse_args(
+                    ["--scope", scope, "--root", str(root)]
+                )
+            )
+
+        self.assertEqual(report["status"], "P3C_PASS_DIAGNOSTIC_ONLY")
+        self.assertEqual(report["source_event_probe"]["event_type_counts"]["NewPoolDetected"], 1)
+        self.assertEqual(report["snapshot_summary"]["tx_event_count_nonzero_rows"], 0)
+        buyer_hhi = {
+            item["feature"]: item for item in report["feature_reports"]
+        }["buyer_hhi"]
+        self.assertIn(
+            "source_event_artifacts_lack_pool_transaction_rows",
+            buyer_hhi["root_cause_candidates"],
+        )
+        self.assertIn("no_buy_side_detected", buyer_hhi["root_cause_candidates"])
+        self.assertTrue(report["claim_boundaries"]["diagnostic_only"])
+        self.assertFalse(report["claim_boundaries"]["gatekeeper_tuning_started"])
+
+    def test_r2only_ablation_report_is_diagnostic_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "selector-p3c-ablation-test"
+            dataset_dir = root / "datasets" / "selector" / scope
+            report_dir = root / "reports" / "selector" / scope
+            dataset_dir.mkdir(parents=True)
+            report_dir.mkdir(parents=True)
+            training_view = dataset_dir / "selector_training_view_v1.jsonl"
+            feature_audit = report_dir / "selector_r2only_feature_audit_v1.json"
+
+            rows = []
+            for idx in range(20):
+                split = "train" if idx < 14 else "validation" if idx < 17 else "holdout"
+                rows.append(
+                    {
+                        "candidate_id": f"c{idx:02d}",
+                        "split": split,
+                        "cohort_in_scope": True,
+                        "stream_completeness_ok": True,
+                        "feature_snapshot_status": "ok",
+                        "r2_label": "positive" if idx % 2 == 0 else "negative",
+                        "r2_status": "resolved",
+                        "r2_path_coverage_ok": True,
+                        "r2_horizon_matured": True,
+                        "decision_verdict_buy": idx % 4 == 0,
+                        "net_quote_in_15s": float(idx),
+                        "net_quote_in_30s": float(idx * 2),
+                        "trade_rate": float(idx + 1),
+                        "unique_buyers": idx + 1,
+                        "quote_mint_is_sol": True,
+                    }
+                )
+            write_jsonl(training_view, rows)
+            feature_audit.write_text(json.dumps({"status": "P3C_PASS_DIAGNOSTIC_ONLY"}), encoding="utf-8")
+
+            report = r2only_ablation.run(
+                r2only_ablation.build_parser().parse_args(
+                    [
+                        "--scope",
+                        scope,
+                        "--root",
+                        str(root),
+                        "--top-k",
+                        "2",
+                        "3",
+                    ]
+                )
+            )
+
+        self.assertEqual(report["status"], "P3C_PASS_DIAGNOSTIC_ONLY")
+        self.assertEqual(report["resolved_denominator_count"], 20)
+        self.assertIn("net_quote_in_15s", report["available_features_used"])
+        self.assertIn("holdout_precision_at_top_k", report["simple_available_feature_score"])
+        self.assertFalse(report["claim_boundaries"]["model_ready"])
+        self.assertFalse(report["claim_boundaries"]["gatekeeper_tuning_started"])
+        self.assertFalse(report["claim_boundaries"]["production_promotion_claim"])
 
     def test_r2_market_paths_writes_one_row_per_candidate_and_missing_path_is_unresolved(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
