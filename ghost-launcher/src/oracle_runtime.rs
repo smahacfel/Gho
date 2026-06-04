@@ -8204,9 +8204,8 @@ fn p37_shadow_probe_route_resolution_diagnostics_with_mode(
                     .filter(|reason| {
                         reason.starts_with("telemetry_only_trade_event:")
                             || reason.starts_with("route_account_manifest_incomplete:")
-                            || reason.starts_with(
-                                P37_LEGACY_BUY_REMAINING_ACCOUNTS_INCOMPLETE_REASON,
-                            )
+                            || reason
+                                .starts_with(P37_LEGACY_BUY_REMAINING_ACCOUNTS_INCOMPLETE_REASON)
                             || reason == P37_UNSUPPORTED_LEGACY_BUY_LAYOUT_REASON
                     })
             })?
@@ -8215,9 +8214,7 @@ fn p37_shadow_probe_route_resolution_diagnostics_with_mode(
         return P37ExecutableRouteResolutionDiagnostics {
             route_resolution_status: Some("no_executable_route_account_set".to_string()),
             selected_route_kind: None,
-            selected_route_reason: Some(
-                "route_account_contract_not_simulation_ready".to_string(),
-            ),
+            selected_route_reason: Some("route_account_contract_not_simulation_ready".to_string()),
             primary_route_kind: Some(primary_route_kind),
             primary_route_ready: Some(false),
             primary_route_not_ready_reason: Some(no_executable_reason.clone()),
@@ -8241,10 +8238,8 @@ fn p37_shadow_probe_route_resolution_diagnostics_with_mode(
             legacy_buy_curve_rpc_load_ready: legacy_buy.curve_rpc_load_ready,
             legacy_buy_curve_authority_readiness_status: legacy_buy
                 .curve_authority_readiness_status,
-            legacy_buy_associated_bonding_curve_pubkey: legacy_buy
-                .associated_bonding_curve_pubkey,
-            legacy_buy_associated_bonding_curve_source: legacy_buy
-                .associated_bonding_curve_source,
+            legacy_buy_associated_bonding_curve_pubkey: legacy_buy.associated_bonding_curve_pubkey,
+            legacy_buy_associated_bonding_curve_source: legacy_buy.associated_bonding_curve_source,
             legacy_buy_associated_bonding_curve_rpc_load_ready: legacy_buy
                 .associated_bonding_curve_rpc_load_ready,
             legacy_buy_required_roles: legacy_buy.required_roles,
@@ -8374,6 +8369,68 @@ fn p37_shadow_probe_route_resolution_diagnostics_with_mode(
             .without_legacy_buy_route_diagnostics();
         }
         if fallback_attempted && legacy_buy.route_ready == Some(true) {
+            let fallback_overrides = request.and_then(p37_selected_legacy_buy_fallback_overrides);
+            let fallback_contract_failure = fallback_overrides
+                .as_ref()
+                .and_then(p37_execution_account_contract_failure_tail);
+            if fallback_overrides.is_some() && fallback_contract_failure.is_none() {
+                let (
+                    _fallback_missing_roles,
+                    _fallback_missing_pubkeys,
+                    _fallback_account_sources,
+                    fallback_simulation_load_account_set,
+                    fallback_creatable_account_set,
+                    fallback_required_precheck_account_set,
+                    _fallback_failure_class,
+                ) = p37_shadow_probe_fallback_failure_diagnostics(
+                    account_set_diagnostics,
+                    None,
+                    Some(pubkey.as_str()),
+                );
+                return P37ExecutableRouteResolutionDiagnostics {
+                    route_resolution_status: Some("fallback_route_ready".to_string()),
+                    selected_route_kind: Some("legacy_buy".to_string()),
+                    selected_route_reason: Some(
+                        "legacy_buy_fallback_passed_simulation_load_readiness".to_string(),
+                    ),
+                    primary_route_kind: Some(primary_route_kind),
+                    primary_route_ready: Some(false),
+                    primary_route_not_ready_reason: Some(primary_reason),
+                    fallback_route_kind,
+                    fallback_route_attempted: Some(true),
+                    fallback_route_ready: Some(true),
+                    fallback_route_not_ready_reason: None,
+                    fallback_missing_roles: Vec::new(),
+                    fallback_missing_pubkeys: Vec::new(),
+                    fallback_account_sources: Vec::new(),
+                    fallback_simulation_load_account_set,
+                    fallback_creatable_account_set,
+                    fallback_required_precheck_account_set,
+                    fallback_failure_class: None,
+                    no_executable_route_account_set_reason: None,
+                    legacy_buy_account_set_status: legacy_buy.account_set_status,
+                    legacy_buy_curve_pubkey: legacy_buy.curve_pubkey,
+                    legacy_buy_curve_source: legacy_buy.curve_source,
+                    legacy_buy_curve_authority_status: legacy_buy.curve_authority_status,
+                    legacy_buy_curve_rpc_load_status: legacy_buy.curve_rpc_load_status,
+                    legacy_buy_curve_rpc_load_ready: legacy_buy.curve_rpc_load_ready,
+                    legacy_buy_curve_authority_readiness_status: legacy_buy
+                        .curve_authority_readiness_status,
+                    legacy_buy_associated_bonding_curve_pubkey: legacy_buy
+                        .associated_bonding_curve_pubkey,
+                    legacy_buy_associated_bonding_curve_source: legacy_buy
+                        .associated_bonding_curve_source,
+                    legacy_buy_associated_bonding_curve_rpc_load_ready: legacy_buy
+                        .associated_bonding_curve_rpc_load_ready,
+                    legacy_buy_required_roles: legacy_buy.required_roles,
+                    legacy_buy_missing_roles: legacy_buy.missing_roles,
+                    legacy_buy_missing_pubkeys: legacy_buy.missing_pubkeys,
+                    legacy_buy_route_ready: legacy_buy.route_ready,
+                    legacy_buy_route_not_ready_reason: legacy_buy.route_not_ready_reason,
+                };
+            }
+            let fallback_not_ready_reason = fallback_contract_failure
+                .unwrap_or_else(|| "fallback_route_not_available_for_primary".to_string());
             let (
                 fallback_missing_roles,
                 fallback_missing_pubkeys,
@@ -8384,14 +8441,14 @@ fn p37_shadow_probe_route_resolution_diagnostics_with_mode(
                 fallback_failure_class,
             ) = p37_shadow_probe_fallback_failure_diagnostics(
                 account_set_diagnostics,
-                Some(P37_UNSUPPORTED_LEGACY_BUY_LAYOUT_REASON),
+                Some(fallback_not_ready_reason.as_str()),
                 Some(pubkey.as_str()),
             );
             return P37ExecutableRouteResolutionDiagnostics {
                 route_resolution_status: Some("no_executable_route_account_set".to_string()),
                 selected_route_kind: None,
                 selected_route_reason: Some(
-                    "legacy_buy_fallback_unsupported_builder_layout".to_string(),
+                    "route_account_contract_not_simulation_ready".to_string(),
                 ),
                 primary_route_kind: Some(primary_route_kind),
                 primary_route_ready: Some(false),
@@ -8399,7 +8456,7 @@ fn p37_shadow_probe_route_resolution_diagnostics_with_mode(
                 fallback_route_kind,
                 fallback_route_attempted: Some(true),
                 fallback_route_ready: Some(false),
-                fallback_route_not_ready_reason: Some(P37_UNSUPPORTED_LEGACY_BUY_LAYOUT_REASON.to_string()),
+                fallback_route_not_ready_reason: Some(fallback_not_ready_reason.clone()),
                 fallback_missing_roles,
                 fallback_missing_pubkeys,
                 fallback_account_sources,
@@ -8408,7 +8465,7 @@ fn p37_shadow_probe_route_resolution_diagnostics_with_mode(
                 fallback_required_precheck_account_set,
                 fallback_failure_class,
                 no_executable_route_account_set_reason: Some(format!(
-                    "{P37_UNSUPPORTED_LEGACY_BUY_LAYOUT_REASON}:primary_route_bcv2_missing:bonding_curve_v2:{pubkey}"
+                    "{fallback_not_ready_reason}:primary_route_bcv2_missing:bonding_curve_v2:{pubkey}"
                 )),
                 legacy_buy_account_set_status: legacy_buy.account_set_status,
                 legacy_buy_curve_pubkey: legacy_buy.curve_pubkey,
@@ -9146,7 +9203,12 @@ fn p37_shadow_probe_derive_legacy_buy_account_overrides(
     let canonical_global_config = trigger::DirectBuyBuilder::canonical_global_config();
     for buffered in buffered_txs.iter().rev() {
         let tx = buffered.tx.as_ref();
-        if !tx.success || !tx.is_buy || tx.buy_variant.as_deref() != Some("legacy_buy") {
+        if !tx.success
+            || !tx.is_buy
+            || tx.is_nln_program_stream_trade_telemetry_only()
+            || tx.buy_variant.as_deref() != Some("legacy_buy")
+            || tx.buy_remaining_accounts.len() != trigger::PUMPFUN_BUYBACK_REMAINING_ACCOUNT_COUNT
+        {
             continue;
         }
 
@@ -9284,6 +9346,7 @@ fn p37_shadow_probe_derive_account_override_context_for_pool_with_mode(
             p37_apply_legacy_buy_curve_materialization(&mut account_overrides, materialization);
         }
     }
+    mark_buy_account_overrides_route_contract(&mut account_overrides, false, true);
     P37ShadowProbeAccountOverrideContext {
         account_overrides,
         creator_identity_source,
@@ -13238,6 +13301,43 @@ fn p37_selected_route_final_manifest_failure_reason(
     None
 }
 
+fn p37_restore_legacy_buy_can_authorize_detected_pool_creator(
+    overrides: &crate::components::trigger::BuyAccountOverrides,
+) -> bool {
+    if !matches!(
+        overrides.buy_variant,
+        Some(trigger::PumpfunBuyVariant::LegacyBuy)
+    ) {
+        return false;
+    }
+    if overrides.creator_pubkey.is_none()
+        || overrides.creator_pubkey_source.as_deref() != Some("detected_pool.creator")
+        || overrides.creator_pubkey_authoritative != Some(false)
+    {
+        return false;
+    }
+    if overrides.route_account_manifest_source.as_deref() == Some("nln_program_streams")
+        || overrides.execution_account_contract_status.as_deref() == Some("telemetry_only")
+    {
+        return false;
+    }
+    overrides.buy_remaining_accounts.len() == trigger::PUMPFUN_BUYBACK_REMAINING_ACCOUNT_COUNT
+        && overrides.global_config.is_some()
+        && overrides.fee_recipient.is_some()
+        && overrides.token_program.is_some()
+        && overrides.associated_bonding_curve.is_some()
+        && overrides.legacy_buy_curve.is_some()
+        && overrides.legacy_buy_curve_pubkey.is_some()
+}
+
+fn p37_restore_legacy_buy_authorize_detected_pool_creator(
+    overrides: &mut crate::components::trigger::BuyAccountOverrides,
+) {
+    if p37_restore_legacy_buy_can_authorize_detected_pool_creator(overrides) {
+        overrides.creator_pubkey_authoritative = Some(true);
+    }
+}
+
 fn p37_shadow_probe_execution_diagnostics(
     record: &P37ShadowProbeSelectionRecord,
     request: Option<&crate::components::trigger::PreparedBuyRequest>,
@@ -17170,6 +17270,8 @@ async fn execute_gatekeeper_buy_path(
                             );
                         }
                     }
+                    p37_restore_legacy_buy_authorize_detected_pool_creator(&mut account_overrides);
+                    mark_buy_account_overrides_route_contract(&mut account_overrides, false, true);
                     info!(
                         pool = %pool_amm_id,
                         base_mint = %pd.base_mint,
@@ -17352,6 +17454,11 @@ fn p37_selected_legacy_buy_fallback_overrides(
         return None;
     }
     let primary = &primary_request.account_overrides;
+    if primary.route_account_manifest_source.as_deref() == Some("nln_program_streams")
+        || primary.execution_account_contract_status.as_deref() == Some("telemetry_only")
+    {
+        return None;
+    }
     let mut fallback = crate::components::trigger::BuyAccountOverrides {
         global_config: primary.global_config,
         fee_recipient: primary.fee_recipient,
@@ -17369,12 +17476,13 @@ fn p37_selected_legacy_buy_fallback_overrides(
         legacy_buy_curve_source: primary.legacy_buy_curve_source.clone(),
         legacy_buy_curve_authority_status: primary.legacy_buy_curve_authority_status.clone(),
         route_account_manifest_source: primary.route_account_manifest_source.clone(),
-        execution_account_contract_status: primary.execution_account_contract_status.clone(),
-        execution_account_contract_reason: primary.execution_account_contract_reason.clone(),
+        execution_account_contract_status: None,
+        execution_account_contract_reason: None,
     };
     if fallback.legacy_buy_curve_pubkey.is_none() {
         fallback.legacy_buy_curve_pubkey = primary.legacy_buy_curve_pubkey;
     }
+    mark_buy_account_overrides_route_contract(&mut fallback, false, true);
     Some(fallback)
 }
 
@@ -19309,9 +19417,57 @@ fn p37_route_account_manifest_incomplete(reason: &str) -> String {
 fn p37_bcv2_provenance_route_compatible(
     provenance: Option<&crate::events::ObservedAccountMetaProvenance>,
 ) -> bool {
-    provenance
-        .and_then(|value| value.provenance_status.as_deref())
-        == Some("route_compatible")
+    provenance.and_then(|value| value.provenance_status.as_deref()) == Some("route_compatible")
+}
+
+fn p37_direct_buy_builder_required_account_failure_tail(
+    overrides: &crate::components::trigger::BuyAccountOverrides,
+) -> Option<String> {
+    if overrides.global_config.is_none() {
+        return Some(p37_route_account_manifest_incomplete(
+            "missing_global_config",
+        ));
+    }
+    if overrides.fee_recipient.is_none() {
+        return Some(p37_route_account_manifest_incomplete(
+            "missing_fee_recipient",
+        ));
+    }
+    if overrides.token_program.is_none() {
+        return Some(p37_route_account_manifest_incomplete(
+            "missing_token_program",
+        ));
+    }
+    if overrides.creator_pubkey.is_none() {
+        return Some(p37_route_account_manifest_incomplete(
+            "missing_creator_pubkey",
+        ));
+    }
+    if overrides.associated_bonding_curve.is_none() {
+        return Some(p37_route_account_manifest_incomplete(
+            "missing_associated_bonding_curve",
+        ));
+    }
+    None
+}
+
+fn p37_legacy_buy_creator_authority_failure_tail(
+    overrides: &crate::components::trigger::BuyAccountOverrides,
+) -> Option<String> {
+    if overrides.creator_pubkey_authoritative == Some(false) {
+        return Some(format!(
+            "creator_vault_source_not_authoritative:legacy_buy:{}:{}",
+            overrides
+                .creator_pubkey_source
+                .as_deref()
+                .unwrap_or("creator_pubkey_source_unknown"),
+            overrides
+                .creator_pubkey
+                .map(|pubkey| pubkey.to_string())
+                .unwrap_or_else(|| "missing_creator_pubkey".to_string())
+        ));
+    }
+    None
 }
 
 fn p37_execution_account_contract_failure_tail(
@@ -19323,30 +19479,8 @@ fn p37_execution_account_contract_failure_tail(
 
     match overrides.buy_variant {
         Some(trigger::PumpfunBuyVariant::RoutedExactSolIn) => {
-            if overrides.global_config.is_none() {
-                return Some(p37_route_account_manifest_incomplete(
-                    "missing_global_config",
-                ));
-            }
-            if overrides.fee_recipient.is_none() {
-                return Some(p37_route_account_manifest_incomplete(
-                    "missing_fee_recipient",
-                ));
-            }
-            if overrides.token_program.is_none() {
-                return Some(p37_route_account_manifest_incomplete(
-                    "missing_token_program",
-                ));
-            }
-            if overrides.creator_pubkey.is_none() {
-                return Some(p37_route_account_manifest_incomplete(
-                    "missing_creator_pubkey",
-                ));
-            }
-            if overrides.associated_bonding_curve.is_none() {
-                return Some(p37_route_account_manifest_incomplete(
-                    "missing_associated_bonding_curve",
-                ));
+            if let Some(reason) = p37_direct_buy_builder_required_account_failure_tail(overrides) {
+                return Some(reason);
             }
             if let Some(bcv2) = overrides.bonding_curve_v2 {
                 if !p37_bcv2_provenance_route_compatible(
@@ -19371,11 +19505,15 @@ fn p37_execution_account_contract_failure_tail(
                     trigger::PUMPFUN_BUYBACK_REMAINING_ACCOUNT_COUNT
                 ));
             }
-            Some(P37_UNSUPPORTED_LEGACY_BUY_LAYOUT_REASON.to_string())
+            if let Some(reason) = p37_direct_buy_builder_required_account_failure_tail(overrides) {
+                return Some(reason);
+            }
+            if let Some(reason) = p37_legacy_buy_creator_authority_failure_tail(overrides) {
+                return Some(reason);
+            }
+            None
         }
-        None => Some(p37_route_account_manifest_incomplete(
-            "missing_buy_variant",
-        )),
+        None => Some(p37_route_account_manifest_incomplete("missing_buy_variant")),
     }
 }
 
@@ -19410,7 +19548,8 @@ fn mark_buy_account_overrides_route_contract(
             .route_account_manifest_source
             .get_or_insert_with(|| "observed_pool_transaction".to_string());
         overrides.execution_account_contract_status = Some("complete".to_string());
-        overrides.execution_account_contract_reason = Some("route_account_contract_complete".to_string());
+        overrides.execution_account_contract_reason =
+            Some("route_account_contract_complete".to_string());
     }
 }
 
@@ -19465,6 +19604,12 @@ fn derive_buy_account_overrides(
         if overrides.buy_variant.is_none() {
             overrides.buy_variant = tx.buy_variant.as_deref().and_then(|value| match value {
                 "routed_exact_sol_in" => Some(trigger::PumpfunBuyVariant::RoutedExactSolIn),
+                "legacy_buy"
+                    if tx.buy_remaining_accounts.len()
+                        == trigger::PUMPFUN_BUYBACK_REMAINING_ACCOUNT_COUNT =>
+                {
+                    Some(trigger::PumpfunBuyVariant::LegacyBuy)
+                }
                 _ => None,
             });
         }
@@ -19492,7 +19637,8 @@ fn derive_buy_account_overrides(
         }
         let route_complete = match overrides.buy_variant {
             Some(trigger::PumpfunBuyVariant::LegacyBuy) => {
-                !overrides.buy_remaining_accounts.is_empty()
+                overrides.buy_remaining_accounts.len()
+                    == trigger::PUMPFUN_BUYBACK_REMAINING_ACCOUNT_COUNT
             }
             Some(trigger::PumpfunBuyVariant::RoutedExactSolIn) => {
                 overrides.bonding_curve_v2.is_some()
@@ -24329,6 +24475,10 @@ mod tests {
         tx.buy_variant = Some("legacy_buy".to_string());
         tx.associated_bonding_curve = Some(assoc_curve.to_string());
         tx.token_program = Some(TOKEN_PROGRAM_ID.to_string());
+        tx.buy_remaining_accounts = vec![
+            Pubkey::new_unique().to_string(),
+            Pubkey::new_unique().to_string(),
+        ];
         tx.success = true;
         tx.is_buy = true;
         let buffered_txs = vec![crate::components::gatekeeper::GatekeeperBufferedTx {
@@ -26276,6 +26426,7 @@ mod tests {
     fn p37_legacy_buy_account_state_curve_gets_rpc_readiness_check() {
         let curve_pubkey = Pubkey::new_unique();
         let mut request = test_prepared_buy_request();
+        request.account_overrides = complete_legacy_execution_contract_overrides(request.mint);
         request.account_overrides.buy_variant = Some(trigger::PumpfunBuyVariant::LegacyBuy);
         request.account_overrides.legacy_buy_curve = Some(p37_shadow_probe_test_legacy_curve());
         request.account_overrides.legacy_buy_curve_pubkey = Some(curve_pubkey);
@@ -26325,6 +26476,7 @@ mod tests {
     fn p37_legacy_buy_load_ready_but_unverified_selects_shadow_legacy_route() {
         let curve_pubkey = Pubkey::new_unique();
         let mut request = test_prepared_buy_request();
+        request.account_overrides = complete_legacy_execution_contract_overrides(request.mint);
         request.account_overrides.buy_variant = Some(trigger::PumpfunBuyVariant::LegacyBuy);
         request.account_overrides.legacy_buy_curve = Some(p37_shadow_probe_test_legacy_curve());
         request.account_overrides.legacy_buy_curve_pubkey = Some(curve_pubkey);
@@ -26369,6 +26521,7 @@ mod tests {
     fn p37_legacy_buy_authoritative_but_rpc_missing_fails_closed() {
         let curve_pubkey = Pubkey::new_unique();
         let mut request = test_prepared_buy_request();
+        request.account_overrides = complete_legacy_execution_contract_overrides(request.mint);
         request.account_overrides.buy_variant = Some(trigger::PumpfunBuyVariant::LegacyBuy);
         request.account_overrides.legacy_buy_curve = Some(p37_shadow_probe_test_legacy_curve());
         request.account_overrides.legacy_buy_curve_pubkey = Some(curve_pubkey);
@@ -26446,8 +26599,10 @@ mod tests {
     }
 
     #[test]
-    fn p37_route_resolver_primary_bcv2_missing_rejects_legacy_fallback() {
-        let request = test_working_builder_prepared_buy_request();
+    fn p37_route_resolver_primary_bcv2_missing_selects_validated_legacy_fallback() {
+        let mut request = test_working_builder_prepared_buy_request();
+        request.account_overrides.buy_remaining_accounts =
+            vec![Pubkey::new_unique(), Pubkey::new_unique()];
         let bcv2 = request
             .account_overrides
             .bonding_curve_v2
@@ -26484,12 +26639,15 @@ mod tests {
 
         assert_eq!(
             resolution.route_resolution_status.as_deref(),
-            Some("no_executable_route_account_set")
+            Some("fallback_route_ready")
         );
-        assert_eq!(resolution.selected_route_kind, None);
+        assert_eq!(
+            resolution.selected_route_kind.as_deref(),
+            Some("legacy_buy")
+        );
         assert_eq!(
             resolution.selected_route_reason.as_deref(),
-            Some("legacy_buy_fallback_unsupported_builder_layout")
+            Some("legacy_buy_fallback_passed_simulation_load_readiness")
         );
         assert_eq!(
             resolution.primary_route_kind.as_deref(),
@@ -26505,11 +26663,8 @@ mod tests {
             Some("legacy_buy")
         );
         assert_eq!(resolution.fallback_route_attempted, Some(true));
-        assert_eq!(resolution.fallback_route_ready, Some(false));
-        assert_eq!(
-            resolution.fallback_route_not_ready_reason.as_deref(),
-            Some("unsupported_legacy_buy_layout_requires_bcv2")
-        );
+        assert_eq!(resolution.fallback_route_ready, Some(true));
+        assert_eq!(resolution.fallback_route_not_ready_reason, None);
         let legacy_curve_pubkey_string = legacy_curve_pubkey.to_string();
         assert_eq!(
             resolution.legacy_buy_curve_pubkey.as_deref(),
@@ -26542,19 +26697,15 @@ mod tests {
         assert_eq!(resolution.legacy_buy_route_not_ready_reason, None);
         assert!(!resolution.fallback_simulation_load_account_set.is_empty());
         assert!(!resolution.fallback_required_precheck_account_set.is_empty());
-        assert!(resolution
-            .no_executable_route_account_set_reason
-            .as_deref()
-            .unwrap_or_default()
-            .starts_with(
-                "unsupported_legacy_buy_layout_requires_bcv2:primary_route_bcv2_missing:bonding_curve_v2:"
-            ));
+        assert_eq!(resolution.no_executable_route_account_set_reason, None);
     }
 
     #[test]
-    fn p37_route_resolver_primary_bcv2_manifest_missing_rejects_legacy_fallback_without_precheck_reason(
+    fn p37_route_resolver_primary_bcv2_manifest_missing_selects_validated_legacy_fallback_without_precheck_reason(
     ) {
-        let request = test_working_builder_prepared_buy_request();
+        let mut request = test_working_builder_prepared_buy_request();
+        request.account_overrides.buy_remaining_accounts =
+            vec![Pubkey::new_unique(), Pubkey::new_unique()];
         let bcv2 = request
             .account_overrides
             .bonding_curve_v2
@@ -26591,28 +26742,23 @@ mod tests {
 
         assert_eq!(
             resolution.route_resolution_status.as_deref(),
-            Some("no_executable_route_account_set")
+            Some("fallback_route_ready")
         );
-        assert_eq!(resolution.selected_route_kind, None);
-        assert_eq!(resolution.fallback_route_attempted, Some(true));
-        assert_eq!(resolution.fallback_route_ready, Some(false));
         assert_eq!(
-            resolution.fallback_route_not_ready_reason.as_deref(),
-            Some("unsupported_legacy_buy_layout_requires_bcv2")
+            resolution.selected_route_kind.as_deref(),
+            Some("legacy_buy")
         );
+        assert_eq!(resolution.primary_route_ready, Some(false));
+        assert_eq!(resolution.fallback_route_attempted, Some(true));
+        assert_eq!(resolution.fallback_route_ready, Some(true));
+        assert_eq!(resolution.fallback_route_not_ready_reason, None);
         assert_eq!(resolution.legacy_buy_route_ready, Some(true));
         assert_eq!(resolution.legacy_buy_route_not_ready_reason, None);
-        assert!(resolution
-            .no_executable_route_account_set_reason
-            .as_deref()
-            .unwrap_or_default()
-            .starts_with(
-                "unsupported_legacy_buy_layout_requires_bcv2:primary_route_bcv2_missing:bonding_curve_v2:"
-            ));
+        assert_eq!(resolution.no_executable_route_account_set_reason, None);
     }
 
     #[test]
-    fn active_shadow_precheck_rejects_legacy_route_even_when_curve_resolves() {
+    fn active_shadow_precheck_rejects_legacy_route_without_remaining_accounts() {
         let mut request = test_prepared_buy_request();
         let legacy_curve_pubkey = Pubkey::new_unique();
         request.account_overrides.buy_variant = Some(trigger::PumpfunBuyVariant::LegacyBuy);
@@ -26974,7 +27120,7 @@ mod tests {
 
     #[test]
     fn selected_legacy_buy_handoff_happens_before_precheck() {
-        p37_route_resolver_primary_bcv2_manifest_missing_rejects_legacy_fallback_without_precheck_reason(
+        p37_route_resolver_primary_bcv2_manifest_missing_selects_validated_legacy_fallback_without_precheck_reason(
         );
     }
 
@@ -27025,6 +27171,7 @@ mod tests {
         let mut request = test_prepared_buy_request();
         let legacy_curve_pubkey = Pubkey::new_unique();
         let associated_curve_pubkey = Pubkey::new_unique().to_string();
+        request.account_overrides = complete_legacy_execution_contract_overrides(request.mint);
         request.account_overrides.buy_variant = Some(trigger::PumpfunBuyVariant::LegacyBuy);
         request.account_overrides.legacy_buy_curve = Some(p37_shadow_probe_test_legacy_curve());
         request.account_overrides.legacy_buy_curve_pubkey = Some(legacy_curve_pubkey);
@@ -27092,6 +27239,7 @@ mod tests {
     fn p37_legacy_buy_creatable_and_ephemeral_missing_accounts_do_not_block_route() {
         let mut request = test_prepared_buy_request();
         let legacy_curve_pubkey = Pubkey::new_unique();
+        request.account_overrides = complete_legacy_execution_contract_overrides(request.mint);
         request.account_overrides.buy_variant = Some(trigger::PumpfunBuyVariant::LegacyBuy);
         request.account_overrides.legacy_buy_curve = Some(p37_shadow_probe_test_legacy_curve());
         request.account_overrides.legacy_buy_curve_pubkey = Some(legacy_curve_pubkey);
@@ -27454,7 +27602,9 @@ mod tests {
         let active = active_shadow_account_diagnostics_from_account_set(
             Some(reason.clone()),
             Some(&request),
-            Some(&p37_shadow_probe_account_set_diagnostics_from_request(&request)),
+            Some(&p37_shadow_probe_account_set_diagnostics_from_request(
+                &request,
+            )),
             "not_run_post_simulation_attribution",
         );
 
@@ -27462,7 +27612,10 @@ mod tests {
             active.active_shadow_precheck_status.as_deref(),
             Some("precheck_failed")
         );
-        assert_eq!(active.precheck_failure_reason.as_deref(), Some(reason.as_str()));
+        assert_eq!(
+            active.precheck_failure_reason.as_deref(),
+            Some(reason.as_str())
+        );
         assert_eq!(active.simulation_error_kind, None);
         assert_eq!(
             active.route_resolution_status.as_deref(),
@@ -27477,6 +27630,12 @@ mod tests {
             active.active_shadow_lifecycle_eligibility_status.as_deref(),
             Some("not_lifecycle_eligible")
         );
+    }
+
+    #[test]
+    fn telemetry_only_pool_transaction_cannot_unlock_legacy_buy() {
+        derive_buy_account_overrides_marks_nln_trade_as_telemetry_only_contract();
+        active_shadow_telemetry_only_route_contract_failure_is_not_lifecycle_eligible();
     }
 
     fn route_compatible_bcv2_provenance() -> crate::events::ObservedAccountMetaProvenance {
@@ -27507,6 +27666,36 @@ mod tests {
             bonding_curve_v2: Some(Pubkey::new_unique()),
             bonding_curve_v2_provenance: Some(route_compatible_bcv2_provenance()),
             route_account_manifest_source: Some("unit_test".to_string()),
+            execution_account_contract_status: Some("complete".to_string()),
+            execution_account_contract_reason: Some("route_account_contract_complete".to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn complete_legacy_execution_contract_overrides(
+        mint: Pubkey,
+    ) -> crate::components::trigger::BuyAccountOverrides {
+        let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).expect("valid token program");
+        crate::components::trigger::BuyAccountOverrides {
+            global_config: Some(trigger::DirectBuyBuilder::canonical_global_config()),
+            fee_recipient: Some(trigger::DirectBuyBuilder::canonical_fee_recipient()),
+            token_program: Some(token_program),
+            creator_pubkey: Some(Pubkey::new_unique()),
+            creator_pubkey_source: Some("unit_test.observed_creator".to_string()),
+            creator_pubkey_authoritative: Some(true),
+            buy_variant: Some(trigger::PumpfunBuyVariant::LegacyBuy),
+            associated_bonding_curve: Some(
+                trigger::DirectBuyBuilder::canonical_associated_bonding_curve(
+                    &mint,
+                    &token_program,
+                ),
+            ),
+            buy_remaining_accounts: vec![Pubkey::new_unique(), Pubkey::new_unique()],
+            legacy_buy_curve: Some(p37_shadow_probe_test_legacy_curve()),
+            legacy_buy_curve_pubkey: Some(trigger::DirectBuyBuilder::derive_bonding_curve(&mint).0),
+            legacy_buy_curve_source: Some("materialized_feature_set".to_string()),
+            legacy_buy_curve_authority_status: Some("authoritative_mfs".to_string()),
+            route_account_manifest_source: Some("observed_pool_transaction".to_string()),
             execution_account_contract_status: Some("complete".to_string()),
             execution_account_contract_reason: Some("route_account_contract_complete".to_string()),
             ..Default::default()
@@ -27578,6 +27767,11 @@ mod tests {
     }
 
     #[test]
+    fn routed_exact_sol_in_missing_bcv2_still_not_executable() {
+        routed_contract_non_route_compatible_bcv2_fails_before_dispatch();
+    }
+
+    #[test]
     fn routed_complete_contract_can_reach_shadow_precheck() {
         let mut request = test_prepared_buy_request();
         request.account_overrides = complete_routed_execution_contract_overrides(request.mint);
@@ -27589,7 +27783,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_contract_missing_buyback_remaining_accounts_fails_before_dispatch() {
+    fn legacy_buy_missing_remaining_accounts_is_not_executable() {
         let mut request = test_prepared_buy_request();
         request.account_overrides = crate::components::trigger::BuyAccountOverrides {
             buy_variant: Some(trigger::PumpfunBuyVariant::LegacyBuy),
@@ -27608,23 +27802,74 @@ mod tests {
     }
 
     #[test]
-    fn legacy_contract_with_buyback_tail_is_still_unsupported_for_shadow_dispatch() {
+    fn legacy_buy_non_authoritative_creator_is_not_executable() {
         let mut request = test_prepared_buy_request();
-        request.account_overrides = crate::components::trigger::BuyAccountOverrides {
-            buy_variant: Some(trigger::PumpfunBuyVariant::LegacyBuy),
-            legacy_buy_curve: Some(p37_shadow_probe_test_legacy_curve()),
-            legacy_buy_curve_pubkey: Some(Pubkey::new_unique()),
-            buy_remaining_accounts: vec![Pubkey::new_unique(), Pubkey::new_unique()],
-            ..Default::default()
-        };
+        request.account_overrides = complete_legacy_execution_contract_overrides(request.mint);
+        request.account_overrides.creator_pubkey_source = Some("detected_pool.creator".to_string());
+        request.account_overrides.creator_pubkey_authoritative = Some(false);
 
         let reason = p37_selected_route_account_contract_failure_reason(&request)
-            .expect("legacy fallback must stay unsupported for shadow dispatch");
+            .expect("non-authoritative legacy creator must fail closed before dispatch");
 
-        assert_eq!(
-            reason,
-            format!("no_executable_route_account_set:{P37_UNSUPPORTED_LEGACY_BUY_LAYOUT_REASON}")
+        assert!(reason.starts_with(
+            "no_executable_route_account_set:creator_vault_source_not_authoritative:legacy_buy:detected_pool.creator:"
+        ));
+        let active = active_shadow_account_diagnostics_from_account_set(
+            Some(reason),
+            Some(&request),
+            None,
+            "precheck_failed",
         );
+        assert_eq!(
+            active.execution_feasibility_status.as_deref(),
+            Some("not_executable_route")
+        );
+        assert_eq!(active.dispatch_attempted, Some(false));
+        assert_eq!(active.simulation_attempted, Some(false));
+    }
+
+    #[test]
+    fn restore_legacy_buy_with_observed_remaining_accounts_is_executable() {
+        let mut request = test_prepared_buy_request();
+        let buyback_fee_recipient = Pubkey::new_unique();
+        let buyback_quote_account = Pubkey::new_unique();
+        request.account_overrides = complete_legacy_execution_contract_overrides(request.mint);
+        request.account_overrides.buy_remaining_accounts =
+            vec![buyback_fee_recipient, buyback_quote_account];
+
+        let reason = p37_selected_route_account_contract_failure_reason(&request);
+
+        assert_eq!(reason, None);
+        assert_eq!(
+            request.account_overrides.buy_remaining_accounts,
+            vec![buyback_fee_recipient, buyback_quote_account]
+        );
+    }
+
+    #[test]
+    fn restore_legacy_buy_detected_pool_creator_recovery_requires_complete_observed_shape() {
+        let mint = Pubkey::new_unique();
+        let mut overrides = complete_legacy_execution_contract_overrides(mint);
+        overrides.creator_pubkey_source = Some("detected_pool.creator".to_string());
+        overrides.creator_pubkey_authoritative = Some(false);
+
+        p37_restore_legacy_buy_authorize_detected_pool_creator(&mut overrides);
+
+        assert_eq!(overrides.creator_pubkey_authoritative, Some(true));
+
+        let mut missing_remaining = complete_legacy_execution_contract_overrides(mint);
+        missing_remaining.creator_pubkey_source = Some("detected_pool.creator".to_string());
+        missing_remaining.creator_pubkey_authoritative = Some(false);
+        missing_remaining.buy_remaining_accounts.clear();
+        p37_restore_legacy_buy_authorize_detected_pool_creator(&mut missing_remaining);
+        assert_eq!(missing_remaining.creator_pubkey_authoritative, Some(false));
+
+        let mut telemetry = complete_legacy_execution_contract_overrides(mint);
+        telemetry.creator_pubkey_source = Some("detected_pool.creator".to_string());
+        telemetry.creator_pubkey_authoritative = Some(false);
+        telemetry.route_account_manifest_source = Some("nln_program_streams".to_string());
+        p37_restore_legacy_buy_authorize_detected_pool_creator(&mut telemetry);
+        assert_eq!(telemetry.creator_pubkey_authoritative, Some(false));
     }
 
     #[test]
@@ -35838,67 +36083,29 @@ mod tests {
     }
 
     #[test]
-    fn derive_buy_account_overrides_drops_legacy_buy_variant() {
+    fn derive_buy_account_overrides_maps_observed_legacy_buy_variant() {
         use ghost_brain::oracle::snapshot_engine::PoolMetrics;
         use ghost_core::shadow_ledger::TxKey;
-        use seer::types::RawBytesMissingReason;
         use std::sync::Arc;
 
-        let successful_buy = PoolTransaction {
-            semantic: Default::default(),
-            curve_finality: CurveFinality::Speculative,
-            pool_amm_id: "pool".to_string(),
-            slot: Some(1),
-            event_ordinal: None,
-            tx_index: None,
-            outer_instruction_index: None,
-            inner_group_index: None,
-            outer_program_id: None,
-            cpi_stack_height: None,
-            timestamp_ms: 1,
-            event_time: ghost_core::EventTimeMetadata::default(),
-            arrival_ts_ms: 1,
-            signer: "signer".to_string(),
-            is_buy: true,
-            volume_sol: 1.0,
-            sol_amount_lamports: None,
-            token_amount_units: None,
-            reserve_base: None,
-            reserve_quote: None,
-            price_quote: None,
-            is_dev_buy: false,
-            dev_buy_lamports: 0,
-            signature: "success_sig".to_string(),
-            success: true,
-            error_code: None,
-            compute_units_consumed: None,
-            owner_token_deltas: vec![],
-            mpcf_payload: vec![],
-            mpcf_payload_missing_reason: RawBytesMissingReason::FilteredByConfig,
-            token_mint: None,
-            v_tokens_in_bonding_curve: None,
-            v_sol_in_bonding_curve: None,
-            market_cap_sol: None,
-            global_config: None,
-            fee_recipient: None,
-            token_program: None,
-            buy_variant: Some("legacy_buy".to_string()),
-            associated_bonding_curve: None,
-            bonding_curve_v2: None,
-            bonding_curve_v2_provenance: None,
-            buy_remaining_accounts: vec![],
-            is_mayhem_mode: None,
-            cu_price_micro_lamports: None,
-            compute_unit_limit: None,
-            inner_ix_count: None,
-            cpi_depth: None,
-            ata_create_count: None,
-            signer_pre_balance_lamports: None,
-            signer_post_balance_lamports: None,
-            jito_tip_detected: None,
-            toolchain_fingerprint: seer::types::ToolchainFingerprintInput::default(),
-            curve_data_known: false,
-        };
+        let mint = Pubkey::new_unique();
+        let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).expect("valid token program");
+        let associated_bonding_curve =
+            trigger::DirectBuyBuilder::canonical_associated_bonding_curve(&mint, &token_program);
+        let buyback_fee_recipient = Pubkey::new_unique();
+        let buyback_quote_account = Pubkey::new_unique();
+        let mut successful_buy = (*test_pool_observation_tx("success_sig")).clone();
+        successful_buy.buy_variant = Some("legacy_buy".to_string());
+        successful_buy.global_config =
+            Some(trigger::DirectBuyBuilder::canonical_global_config().to_string());
+        successful_buy.fee_recipient =
+            Some(trigger::DirectBuyBuilder::canonical_fee_recipient().to_string());
+        successful_buy.token_program = Some(token_program.to_string());
+        successful_buy.associated_bonding_curve = Some(associated_bonding_curve.to_string());
+        successful_buy.buy_remaining_accounts = vec![
+            buyback_fee_recipient.to_string(),
+            buyback_quote_account.to_string(),
+        ];
 
         let buffered_txs = vec![GatekeeperBufferedTx {
             tx: Arc::new(successful_buy),
@@ -35906,8 +36113,37 @@ mod tests {
             tx_key: TxKey::new(1, Some(1), None, None, 0).unwrap(),
         }];
 
-        let overrides = derive_buy_account_overrides(&buffered_txs);
-        assert!(overrides.buy_variant.is_none());
+        let mut overrides = derive_buy_account_overrides(&buffered_txs);
+        assert_eq!(
+            overrides.buy_variant,
+            Some(trigger::PumpfunBuyVariant::LegacyBuy)
+        );
+        assert_eq!(
+            overrides.buy_remaining_accounts,
+            vec![buyback_fee_recipient, buyback_quote_account]
+        );
+        assert_eq!(overrides.bonding_curve_v2, None);
+        assert_ne!(
+            overrides.execution_account_contract_reason.as_deref(),
+            Some(P37_UNSUPPORTED_LEGACY_BUY_LAYOUT_REASON)
+        );
+
+        overrides.creator_pubkey = Some(Pubkey::new_unique());
+        overrides.creator_pubkey_source = Some("unit_test.observed_creator".to_string());
+        overrides.creator_pubkey_authoritative = Some(true);
+        mark_buy_account_overrides_route_contract(&mut overrides, false, true);
+        assert_eq!(
+            p37_execution_account_contract_failure_tail(&overrides),
+            None
+        );
+        assert_eq!(
+            overrides.execution_account_contract_status.as_deref(),
+            Some("complete")
+        );
+        assert_eq!(
+            overrides.execution_account_contract_reason.as_deref(),
+            Some("route_account_contract_complete")
+        );
     }
 
     #[test]
@@ -35945,17 +36181,23 @@ mod tests {
     }
 
     #[test]
-    fn p37_shadow_probe_preserves_legacy_buy_overrides_for_probe_only() {
+    fn p37_shadow_probe_preserves_observed_legacy_buy_overrides_for_active_and_probe() {
         use ghost_brain::oracle::snapshot_engine::PoolMetrics;
         use ghost_core::shadow_ledger::TxKey;
         use std::sync::Arc;
 
         let assoc_curve = Pubkey::new_unique();
+        let buyback_fee_recipient = Pubkey::new_unique();
+        let buyback_quote_account = Pubkey::new_unique();
         let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).expect("valid token program");
         let mut tx = (*test_pool_observation_tx("legacy-probe-route")).clone();
         tx.buy_variant = Some("legacy_buy".to_string());
         tx.associated_bonding_curve = Some(assoc_curve.to_string());
         tx.token_program = Some(token_program.to_string());
+        tx.buy_remaining_accounts = vec![
+            buyback_fee_recipient.to_string(),
+            buyback_quote_account.to_string(),
+        ];
         tx.success = true;
         tx.is_buy = true;
         let buffered_txs = vec![crate::components::gatekeeper::GatekeeperBufferedTx {
@@ -35965,9 +36207,13 @@ mod tests {
         }];
 
         let active_overrides = derive_buy_account_overrides(&buffered_txs);
-        assert!(
-            active_overrides.buy_variant.is_none(),
-            "active override derivation still drops legacy buy"
+        assert_eq!(
+            active_overrides.buy_variant,
+            Some(trigger::PumpfunBuyVariant::LegacyBuy)
+        );
+        assert_eq!(
+            active_overrides.buy_remaining_accounts,
+            vec![buyback_fee_recipient, buyback_quote_account]
         );
 
         let probe_overrides = p37_shadow_probe_derive_legacy_buy_account_overrides(&buffered_txs)
@@ -35978,6 +36224,10 @@ mod tests {
         );
         assert_eq!(probe_overrides.associated_bonding_curve, Some(assoc_curve));
         assert_eq!(probe_overrides.token_program, Some(token_program));
+        assert_eq!(
+            probe_overrides.buy_remaining_accounts,
+            vec![buyback_fee_recipient, buyback_quote_account]
+        );
     }
 
     #[tokio::test]
