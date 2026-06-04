@@ -60,6 +60,7 @@ pub fn derive_shadow_rollout_profile_from_path(path: &Path) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ShadowDispatchStatus {
+    NotDispatched,
     Submitted,
     Failed,
     Abandoned,
@@ -69,6 +70,7 @@ pub enum ShadowDispatchStatus {
 impl ShadowDispatchStatus {
     pub fn as_str(self) -> &'static str {
         match self {
+            ShadowDispatchStatus::NotDispatched => "not_dispatched",
             ShadowDispatchStatus::Submitted => "submitted",
             ShadowDispatchStatus::Failed => "failed",
             ShadowDispatchStatus::Abandoned => "abandoned",
@@ -142,13 +144,19 @@ impl ShadowDispatchLifecycleRecord {
             idempotency_key,
             dispatch_status: status,
             classification: match status {
+                ShadowDispatchStatus::NotDispatched => {
+                    "precheck_failed_not_dispatched".to_string()
+                }
                 ShadowDispatchStatus::Submitted => "dispatch_submitted".to_string(),
                 ShadowDispatchStatus::Closed => "simulation_completed".to_string(),
                 ShadowDispatchStatus::Failed | ShadowDispatchStatus::Abandoned => {
                     Self::failure_classification(record)
                 }
             },
-            simulation_outcome: status.as_str().to_string(),
+            simulation_outcome: match status {
+                ShadowDispatchStatus::NotDispatched => "not_attempted".to_string(),
+                _ => status.as_str().to_string(),
+            },
             candidate_id: record.candidate_id.clone(),
             pool_id: record.pool_amm_id.clone(),
             mint_id: record.base_mint.clone(),
@@ -226,6 +234,19 @@ impl ShadowDispatchLifecycleRecord {
             join_key,
             rollout_profile,
             ShadowDispatchStatus::Failed,
+        )
+    }
+
+    pub fn not_dispatched_from_shadow_buy_record(
+        record: &ShadowBuySimulationRecord,
+        join_key: impl Into<String>,
+        rollout_profile: impl Into<String>,
+    ) -> ShadowDispatchLifecycleRecord {
+        Self::from_shadow_buy_record_with_status(
+            record,
+            join_key,
+            rollout_profile,
+            ShadowDispatchStatus::NotDispatched,
         )
     }
 
@@ -1427,6 +1448,47 @@ mod tests {
         assert_eq!(row["join_key"], "pool:mint:1000");
         assert_eq!(row["rollout_profile"], "shadow-burnin");
         assert_eq!(row["classification"], "simulation_mismatch");
+    }
+
+    #[tokio::test]
+    async fn p5_precheck_failure_writes_not_dispatched_lifecycle_record() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let lifecycle_path = temp.path().join("shadow_lifecycle.jsonl");
+        let join_key = make_shadow_join_key("pool", "mint", 1000);
+        let mut event = sample_event(
+            None,
+            Some("no_executable_route_account_set:route_account_manifest_incomplete:missing_bonding_curve_v2"),
+        );
+        event.account_diagnostics.dispatch_attempted = Some(false);
+        event.account_diagnostics.simulation_attempted = Some(false);
+        event.account_diagnostics.active_shadow_precheck_status =
+            Some("precheck_failed".to_string());
+        event.account_diagnostics.execution_feasibility_status =
+            Some("not_executable_route".to_string());
+        let record = ShadowBuySimulationRecord::from_event(TriggerEntryMode::ShadowOnly, &event)
+            .with_lifecycle_identity(join_key.clone(), "shadow-burnin");
+        let lifecycle_record = ShadowDispatchLifecycleRecord::not_dispatched_from_shadow_buy_record(
+            &record,
+            join_key,
+            "shadow-burnin",
+        );
+
+        append_shadow_dispatch_lifecycle_record(&lifecycle_path, &lifecycle_record)
+            .await
+            .expect("write lifecycle record");
+
+        let contents = tokio::fs::read_to_string(&lifecycle_path)
+            .await
+            .expect("read lifecycle jsonl");
+        let row: serde_json::Value =
+            serde_json::from_str(contents.trim()).expect("parse lifecycle json");
+        assert_eq!(row["record_type"], "shadow_dispatch");
+        assert_eq!(row["dispatch_status"], "not_dispatched");
+        assert_eq!(row["classification"], "precheck_failed_not_dispatched");
+        assert_eq!(row["simulation_outcome"], "not_attempted");
+        assert_eq!(row["dispatch_attempted"], false);
+        assert_eq!(row["simulation_attempted"], false);
+        assert_eq!(row["execution_feasibility_status"], "not_executable_route");
     }
 
     #[test]

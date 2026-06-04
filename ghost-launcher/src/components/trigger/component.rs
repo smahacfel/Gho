@@ -523,6 +523,9 @@ pub struct BuyAccountOverrides {
     pub legacy_buy_curve_pubkey: Option<Pubkey>,
     pub legacy_buy_curve_source: Option<String>,
     pub legacy_buy_curve_authority_status: Option<String>,
+    pub route_account_manifest_source: Option<String>,
+    pub execution_account_contract_status: Option<String>,
+    pub execution_account_contract_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]

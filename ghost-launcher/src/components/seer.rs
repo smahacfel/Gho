@@ -107,7 +107,14 @@ struct NlnArtifactWriter {
 impl NlnArtifactWriter {
     async fn send_lossless(&self, record: NlnArtifactRecord, label: &'static str) -> bool {
         match self.tx.send(record).await {
-            Ok(()) => true,
+            Ok(()) => {
+                metrics::counter!(
+                    "seer_nln_program_streams_artifact_records_sent_total",
+                    1,
+                    "label" => label
+                );
+                true
+            }
             Err(_) => {
                 metrics::counter!(
                     "seer_nln_program_streams_artifact_writer_closed_total",
@@ -444,6 +451,12 @@ async fn write_nln_artifact_line(
             "reason" => "write_failure"
         );
         *writer = None;
+    } else {
+        metrics::counter!(
+            "seer_nln_program_streams_artifact_rows_written_total",
+            1,
+            "label" => label
+        );
     }
 }
 
@@ -883,6 +896,7 @@ async fn run_nln_program_streams_topic_capture(
     let mut create_count = 0u64;
     let mut trade_count = 0u64;
     let mut decode_error_count = 0u64;
+    let mut first_message_logged = false;
     let mut transfer_dedupe = BoundedTtlSet::new(
         Duration::from_millis(config.transfer_dedupe_ttl_ms.max(1)),
         config.transfer_dedupe_max_entries,
@@ -911,6 +925,17 @@ async fn run_nln_program_streams_topic_capture(
                 continue;
             }
         };
+        if !first_message_logged {
+            first_message_logged = true;
+            info!(
+                topic = %topic,
+                kind = topic_kind.label(),
+                partition = message.partition,
+                offset = %message.offset_raw,
+                has_artifact_writer = artifact_writer.is_some(),
+                "Seer: NLN Program Streams first message received"
+            );
+        }
         let stats_snapshot = stats.snapshot();
         if stats_snapshot.reconnects > last_reconnect_total {
             let delta = stats_snapshot

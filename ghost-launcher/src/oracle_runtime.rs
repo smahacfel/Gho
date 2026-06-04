@@ -7153,6 +7153,8 @@ fn p37_shadow_probe_artifact_records(
         probe_lifecycle_eligibility_status: Some("not_lifecycle_eligible".to_string()),
         active_shadow_precheck_status: None,
         active_shadow_lifecycle_eligibility_status: None,
+        dispatch_attempted: None,
+        simulation_attempted: None,
         precheck_failure_reason: None,
         timestamp: format_shadow_entry_timestamp(now_ms),
         pool_id: record.pool_id.clone(),
@@ -7757,6 +7759,12 @@ const P37_LEGACY_BUY_UNSUPPORTED_ROUTE_REASON: &str =
 const P37_EXECUTION_BUILDER_MODE_WORKING_BUILDER_PARITY: &str = "working_builder_parity";
 const P37_DEFAULT_EXECUTION_ACCOUNT_EVIDENCE_FRESHNESS_MS: u64 = 10_000;
 const P37_BCV2_TERMINAL_ROUTE_EXCLUSION_REASON: &str = "bcv2_not_persistent_or_not_loadable";
+const P37_TELEMETRY_ONLY_ROUTE_CONTRACT_REASON: &str =
+    "telemetry_only_trade_event:route_account_manifest_incomplete";
+const P37_LEGACY_BUY_REMAINING_ACCOUNTS_INCOMPLETE_REASON: &str =
+    "legacy_buy_missing_buyback_remaining_accounts";
+const P37_UNSUPPORTED_LEGACY_BUY_LAYOUT_REASON: &str =
+    "unsupported_legacy_buy_layout_requires_bcv2";
 
 fn p37_working_builder_parity_enabled(config: &P37ShadowProbeConfig) -> bool {
     config.enabled
@@ -7783,6 +7791,12 @@ fn p37_is_bcv2_terminal_route_exclusion_reason(reason: &str) -> bool {
         || reason.starts_with(&format!(
             "no_executable_route_account_set:{P37_BCV2_TERMINAL_ROUTE_EXCLUSION_REASON}:"
         ))
+}
+
+fn p37_no_executable_route_reason_tail(reason: &str) -> Option<String> {
+    reason
+        .strip_prefix("no_executable_route_account_set:")
+        .map(str::to_string)
 }
 
 fn p37_bcv2_terminal_route_exclusion_fields(
@@ -8175,6 +8189,72 @@ fn p37_shadow_probe_route_resolution_diagnostics_with_mode(
         p37_shadow_probe_legacy_buy_route_diagnostics(request, account_set_diagnostics)
     };
 
+    let explicit_route_contract_failure = precheck_failure_reason
+        .and_then(p37_no_executable_route_reason_tail)
+        .filter(|reason| {
+            reason.starts_with("telemetry_only_trade_event:")
+                || reason.starts_with("route_account_manifest_incomplete:")
+                || reason.starts_with(P37_LEGACY_BUY_REMAINING_ACCOUNTS_INCOMPLETE_REASON)
+                || reason == P37_UNSUPPORTED_LEGACY_BUY_LAYOUT_REASON
+        })
+        .or_else(|| {
+            precheck_failure_reason.is_none().then(|| {
+                request
+                    .and_then(p37_selected_route_account_contract_failure_tail)
+                    .filter(|reason| {
+                        reason.starts_with("telemetry_only_trade_event:")
+                            || reason.starts_with("route_account_manifest_incomplete:")
+                            || reason.starts_with(
+                                P37_LEGACY_BUY_REMAINING_ACCOUNTS_INCOMPLETE_REASON,
+                            )
+                            || reason == P37_UNSUPPORTED_LEGACY_BUY_LAYOUT_REASON
+                    })
+            })?
+        });
+    if let Some(no_executable_reason) = explicit_route_contract_failure {
+        return P37ExecutableRouteResolutionDiagnostics {
+            route_resolution_status: Some("no_executable_route_account_set".to_string()),
+            selected_route_kind: None,
+            selected_route_reason: Some(
+                "route_account_contract_not_simulation_ready".to_string(),
+            ),
+            primary_route_kind: Some(primary_route_kind),
+            primary_route_ready: Some(false),
+            primary_route_not_ready_reason: Some(no_executable_reason.clone()),
+            fallback_route_kind: None,
+            fallback_route_attempted: Some(false),
+            fallback_route_ready: Some(false),
+            fallback_route_not_ready_reason: None,
+            fallback_missing_roles: Vec::new(),
+            fallback_missing_pubkeys: Vec::new(),
+            fallback_account_sources: Vec::new(),
+            fallback_simulation_load_account_set: Vec::new(),
+            fallback_creatable_account_set: Vec::new(),
+            fallback_required_precheck_account_set: Vec::new(),
+            fallback_failure_class: None,
+            no_executable_route_account_set_reason: Some(no_executable_reason),
+            legacy_buy_account_set_status: legacy_buy.account_set_status,
+            legacy_buy_curve_pubkey: legacy_buy.curve_pubkey,
+            legacy_buy_curve_source: legacy_buy.curve_source,
+            legacy_buy_curve_authority_status: legacy_buy.curve_authority_status,
+            legacy_buy_curve_rpc_load_status: legacy_buy.curve_rpc_load_status,
+            legacy_buy_curve_rpc_load_ready: legacy_buy.curve_rpc_load_ready,
+            legacy_buy_curve_authority_readiness_status: legacy_buy
+                .curve_authority_readiness_status,
+            legacy_buy_associated_bonding_curve_pubkey: legacy_buy
+                .associated_bonding_curve_pubkey,
+            legacy_buy_associated_bonding_curve_source: legacy_buy
+                .associated_bonding_curve_source,
+            legacy_buy_associated_bonding_curve_rpc_load_ready: legacy_buy
+                .associated_bonding_curve_rpc_load_ready,
+            legacy_buy_required_roles: legacy_buy.required_roles,
+            legacy_buy_missing_roles: legacy_buy.missing_roles,
+            legacy_buy_missing_pubkeys: legacy_buy.missing_pubkeys,
+            legacy_buy_route_ready: legacy_buy.route_ready,
+            legacy_buy_route_not_ready_reason: legacy_buy.route_not_ready_reason,
+        };
+    }
+
     let bcv2_from_failure = precheck_failure_reason
         .and_then(p37_shadow_probe_parse_no_executable_route_bcv2)
         .or_else(|| {
@@ -8295,39 +8375,41 @@ fn p37_shadow_probe_route_resolution_diagnostics_with_mode(
         }
         if fallback_attempted && legacy_buy.route_ready == Some(true) {
             let (
-                _fallback_missing_roles,
-                _fallback_missing_pubkeys,
-                _fallback_account_sources,
+                fallback_missing_roles,
+                fallback_missing_pubkeys,
+                fallback_account_sources,
                 fallback_simulation_load_account_set,
                 fallback_creatable_account_set,
                 fallback_required_precheck_account_set,
-                _fallback_failure_class,
+                fallback_failure_class,
             ) = p37_shadow_probe_fallback_failure_diagnostics(
                 account_set_diagnostics,
-                None,
+                Some(P37_UNSUPPORTED_LEGACY_BUY_LAYOUT_REASON),
                 Some(pubkey.as_str()),
             );
             return P37ExecutableRouteResolutionDiagnostics {
-                route_resolution_status: Some("fallback_route_ready".to_string()),
-                selected_route_kind: fallback_route_kind.clone(),
+                route_resolution_status: Some("no_executable_route_account_set".to_string()),
+                selected_route_kind: None,
                 selected_route_reason: Some(
-                    "fallback_route_passed_simulation_load_readiness".to_string(),
+                    "legacy_buy_fallback_unsupported_builder_layout".to_string(),
                 ),
                 primary_route_kind: Some(primary_route_kind),
                 primary_route_ready: Some(false),
                 primary_route_not_ready_reason: Some(primary_reason),
                 fallback_route_kind,
                 fallback_route_attempted: Some(true),
-                fallback_route_ready: Some(true),
-                fallback_route_not_ready_reason: None,
-                fallback_missing_roles: Vec::new(),
-                fallback_missing_pubkeys: Vec::new(),
-                fallback_account_sources: Vec::new(),
+                fallback_route_ready: Some(false),
+                fallback_route_not_ready_reason: Some(P37_UNSUPPORTED_LEGACY_BUY_LAYOUT_REASON.to_string()),
+                fallback_missing_roles,
+                fallback_missing_pubkeys,
+                fallback_account_sources,
                 fallback_simulation_load_account_set,
                 fallback_creatable_account_set,
                 fallback_required_precheck_account_set,
-                fallback_failure_class: None,
-                no_executable_route_account_set_reason: None,
+                fallback_failure_class,
+                no_executable_route_account_set_reason: Some(format!(
+                    "{P37_UNSUPPORTED_LEGACY_BUY_LAYOUT_REASON}:primary_route_bcv2_missing:bonding_curve_v2:{pubkey}"
+                )),
                 legacy_buy_account_set_status: legacy_buy.account_set_status,
                 legacy_buy_curve_pubkey: legacy_buy.curve_pubkey,
                 legacy_buy_curve_source: legacy_buy.curve_source,
@@ -11842,15 +11924,32 @@ fn active_shadow_account_diagnostics_from_account_set_with_mode(
         account_set_diagnostics,
         working_builder_parity_mode,
     );
-    let active_shadow_lifecycle_eligibility_status = if !is_precheck_failure
+    let active_shadow_lifecycle_eligibility_status = if error_message.is_none()
+        && !is_precheck_failure
         && lifecycle_label_eligibility.as_deref() == Some("lifecycle_label_candidate")
     {
         "lifecycle_label_candidate"
     } else {
         "not_lifecycle_eligible"
     };
+    let dispatch_attempted = if is_precheck_failure {
+        Some(false)
+    } else if error_message.is_some() {
+        Some(true)
+    } else {
+        None
+    };
+    let simulation_attempted = if is_precheck_failure {
+        Some(false)
+    } else if error_message.is_some() {
+        Some(true)
+    } else {
+        None
+    };
 
     crate::events::ShadowSimulationAccountDiagnostics {
+        dispatch_attempted,
+        simulation_attempted,
         active_shadow_precheck_status: Some(precheck_status.to_string()),
         active_shadow_lifecycle_eligibility_status: Some(
             active_shadow_lifecycle_eligibility_status.to_string(),
@@ -12924,6 +13023,45 @@ fn p37_shadow_probe_route_kind(
                 trigger::PumpfunBuyVariant::RoutedExactSolIn => "routed_exact_sol_in".to_string(),
             })
     })
+}
+
+fn p37_selected_route_account_contract_failure_tail(
+    request: &crate::components::trigger::PreparedBuyRequest,
+) -> Option<String> {
+    let mut effective_overrides = request.account_overrides.clone();
+    if effective_overrides.buy_variant.is_none() {
+        if let Some(profile) = request.build_profile.as_ref() {
+            effective_overrides.buy_variant = Some(profile.buy_variant);
+        }
+    }
+
+    if let Some(reason) = p37_execution_account_contract_failure_tail(&effective_overrides) {
+        return Some(reason);
+    }
+
+    let contract_status = request
+        .account_overrides
+        .execution_account_contract_status
+        .as_deref();
+    let contract_reason = request
+        .account_overrides
+        .execution_account_contract_reason
+        .as_deref();
+
+    match contract_status {
+        Some("telemetry_only") => Some(P37_TELEMETRY_ONLY_ROUTE_CONTRACT_REASON.to_string()),
+        Some("unsupported_legacy_buy_layout") => contract_reason
+            .map(str::to_string)
+            .or_else(|| Some(P37_UNSUPPORTED_LEGACY_BUY_LAYOUT_REASON.to_string())),
+        _ => None,
+    }
+}
+
+fn p37_selected_route_account_contract_failure_reason(
+    request: &crate::components::trigger::PreparedBuyRequest,
+) -> Option<String> {
+    p37_selected_route_account_contract_failure_tail(request)
+        .map(|reason| format!("no_executable_route_account_set:{reason}"))
 }
 
 fn p37_shadow_probe_required_account_roles_for_request(
@@ -17102,6 +17240,9 @@ fn p37_selected_legacy_buy_fallback_overrides(
         legacy_buy_curve_pubkey: primary.legacy_buy_curve_pubkey,
         legacy_buy_curve_source: primary.legacy_buy_curve_source.clone(),
         legacy_buy_curve_authority_status: primary.legacy_buy_curve_authority_status.clone(),
+        route_account_manifest_source: primary.route_account_manifest_source.clone(),
+        execution_account_contract_status: primary.execution_account_contract_status.clone(),
+        execution_account_contract_reason: primary.execution_account_contract_reason.clone(),
     };
     if fallback.legacy_buy_curve_pubkey.is_none() {
         fallback.legacy_buy_curve_pubkey = primary.legacy_buy_curve_pubkey;
@@ -17140,6 +17281,15 @@ async fn p37_apply_selected_fallback_route_handoff_for_shadow_only(
     else {
         return Ok(primary_request);
     };
+    if let Some(reason) = p37_execution_account_contract_failure_tail(&fallback_overrides) {
+        warn!(
+            mint = %buy_mint,
+            selected_route_kind = "legacy_buy",
+            selected_route_contract_reason = %reason,
+            "P3.7 selected fallback route handoff skipped because legacy fallback is not execution-ready"
+        );
+        return Ok(primary_request);
+    }
     let mut fallback_request = trigger_component
         .prepare_buy_request_with_decision_ts_and_amount_lamports(
             &buy_mint,
@@ -17213,6 +17363,17 @@ async fn active_shadow_simulation_load_precheck_receipt(
 ) -> Option<crate::components::trigger::TriggerDispatchReceipt> {
     if !shadow_only_dispatch {
         return None;
+    }
+
+    if let Some(reason) = p37_selected_route_account_contract_failure_reason(request) {
+        return Some(crate::components::trigger::TriggerDispatchReceipt {
+            primary_outcome: Err(anyhow::anyhow!("{reason}")),
+            shadow_task: None,
+            active_position_lease: None,
+            retain_position_slot_on_error: false,
+            failed_request: Some(request.clone()),
+            failed_context: None,
+        });
     }
 
     if working_builder_parity_mode {
@@ -18250,6 +18411,8 @@ fn shadow_entry_record_from_event(
         account_set_mismatch_reason: None,
         probe_entry_materialization_status: None,
         probe_lifecycle_eligibility_status: None,
+        dispatch_attempted: event.account_diagnostics.dispatch_attempted,
+        simulation_attempted: event.account_diagnostics.simulation_attempted,
         active_shadow_precheck_status: event
             .account_diagnostics
             .active_shadow_precheck_status
@@ -18483,6 +18646,8 @@ fn shadow_entry_record_from_request(
         account_set_mismatch_reason: None,
         probe_entry_materialization_status: None,
         probe_lifecycle_eligibility_status: None,
+        dispatch_attempted: None,
+        simulation_attempted: None,
         active_shadow_precheck_status: None,
         active_shadow_lifecycle_eligibility_status: None,
         execution_feasibility_status: None,
@@ -18529,6 +18694,8 @@ fn enrich_active_shadow_entry_with_account_diagnostics(
     diagnostics: &crate::events::ShadowSimulationAccountDiagnostics,
 ) {
     entry.active_shadow_precheck_status = diagnostics.active_shadow_precheck_status.clone();
+    entry.dispatch_attempted = diagnostics.dispatch_attempted;
+    entry.simulation_attempted = diagnostics.simulation_attempted;
     entry.active_shadow_lifecycle_eligibility_status = diagnostics
         .active_shadow_lifecycle_eligibility_status
         .clone();
@@ -18858,15 +19025,24 @@ async fn append_shadow_buy_report_record(
         )
         .with_lifecycle_identity(join_key.to_string(), rollout_profile.to_string());
     crate::components::trigger::shadow_run::record_shadow_buy_metrics(&jsonl_record);
-    crate::oracle_metrics::record_shadow_lifecycle_status(if jsonl_record.err.is_some() {
-        "failed_reconciliation"
-    } else {
-        "dispatched"
+    crate::oracle_metrics::record_shadow_lifecycle_status(match dispatch_status {
+        crate::components::trigger::shadow_run::ShadowDispatchStatus::NotDispatched => {
+            "not_dispatched"
+        }
+        _ if jsonl_record.err.is_some() => "failed_reconciliation",
+        _ => "dispatched",
     });
     crate::components::trigger::shadow_run::append_shadow_buy_record(log_path, &jsonl_record)
         .await?;
     if let Some(lifecycle_log_path) = lifecycle_log_path {
         let lifecycle_record = match dispatch_status {
+            crate::components::trigger::shadow_run::ShadowDispatchStatus::NotDispatched => {
+                crate::components::trigger::shadow_run::ShadowDispatchLifecycleRecord::not_dispatched_from_shadow_buy_record(
+                    &jsonl_record,
+                    join_key.to_string(),
+                    rollout_profile.to_string(),
+                )
+            }
             crate::components::trigger::shadow_run::ShadowDispatchStatus::Submitted => {
                 anyhow::bail!("submitted lifecycle rows require request identity, not a report row")
             }
@@ -18992,15 +19168,149 @@ fn shadow_execution_outcome_from_handoff_ack(ack: DirectPostBuyHandoffAck) -> Op
     }
 }
 
+fn buy_account_overrides_has_execution_route_manifest(
+    overrides: &crate::components::trigger::BuyAccountOverrides,
+) -> bool {
+    p37_execution_account_contract_failure_tail(overrides).is_none()
+}
+
+fn p37_route_account_manifest_incomplete(reason: &str) -> String {
+    format!("route_account_manifest_incomplete:{reason}")
+}
+
+fn p37_bcv2_provenance_route_compatible(
+    provenance: Option<&crate::events::ObservedAccountMetaProvenance>,
+) -> bool {
+    provenance
+        .and_then(|value| value.provenance_status.as_deref())
+        == Some("route_compatible")
+}
+
+fn p37_execution_account_contract_failure_tail(
+    overrides: &crate::components::trigger::BuyAccountOverrides,
+) -> Option<String> {
+    if overrides.execution_account_contract_status.as_deref() == Some("telemetry_only") {
+        return Some(P37_TELEMETRY_ONLY_ROUTE_CONTRACT_REASON.to_string());
+    }
+
+    match overrides.buy_variant {
+        Some(trigger::PumpfunBuyVariant::RoutedExactSolIn) => {
+            if overrides.global_config.is_none() {
+                return Some(p37_route_account_manifest_incomplete(
+                    "missing_global_config",
+                ));
+            }
+            if overrides.fee_recipient.is_none() {
+                return Some(p37_route_account_manifest_incomplete(
+                    "missing_fee_recipient",
+                ));
+            }
+            if overrides.token_program.is_none() {
+                return Some(p37_route_account_manifest_incomplete(
+                    "missing_token_program",
+                ));
+            }
+            if overrides.creator_pubkey.is_none() {
+                return Some(p37_route_account_manifest_incomplete(
+                    "missing_creator_pubkey",
+                ));
+            }
+            if overrides.associated_bonding_curve.is_none() {
+                return Some(p37_route_account_manifest_incomplete(
+                    "missing_associated_bonding_curve",
+                ));
+            }
+            if let Some(bcv2) = overrides.bonding_curve_v2 {
+                if !p37_bcv2_provenance_route_compatible(
+                    overrides.bonding_curve_v2_provenance.as_ref(),
+                ) {
+                    return Some(format!(
+                        "primary_route_bcv2_missing:bonding_curve_v2:{bcv2}"
+                    ));
+                }
+            } else {
+                return Some(p37_route_account_manifest_incomplete(
+                    "missing_bonding_curve_v2",
+                ));
+            }
+            None
+        }
+        Some(trigger::PumpfunBuyVariant::LegacyBuy) => {
+            let remaining_count = overrides.buy_remaining_accounts.len();
+            if remaining_count != trigger::PUMPFUN_BUYBACK_REMAINING_ACCOUNT_COUNT {
+                return Some(format!(
+                    "{P37_LEGACY_BUY_REMAINING_ACCOUNTS_INCOMPLETE_REASON}:count={remaining_count}:expected={}",
+                    trigger::PUMPFUN_BUYBACK_REMAINING_ACCOUNT_COUNT
+                ));
+            }
+            Some(P37_UNSUPPORTED_LEGACY_BUY_LAYOUT_REASON.to_string())
+        }
+        None => Some(p37_route_account_manifest_incomplete(
+            "missing_buy_variant",
+        )),
+    }
+}
+
+fn mark_buy_account_overrides_route_contract(
+    overrides: &mut crate::components::trigger::BuyAccountOverrides,
+    saw_nln_telemetry_buy: bool,
+    saw_route_account_evidence: bool,
+) {
+    if saw_nln_telemetry_buy && !saw_route_account_evidence {
+        overrides.route_account_manifest_source = Some("nln_program_streams".to_string());
+        overrides.execution_account_contract_status = Some("telemetry_only".to_string());
+        overrides.execution_account_contract_reason =
+            Some("telemetry_only_trade_event".to_string());
+        return;
+    }
+
+    if let Some(reason) = p37_execution_account_contract_failure_tail(overrides) {
+        let status = if reason.starts_with("telemetry_only_trade_event:") {
+            "telemetry_only"
+        } else if reason == P37_UNSUPPORTED_LEGACY_BUY_LAYOUT_REASON {
+            "unsupported_legacy_buy_layout"
+        } else {
+            "route_account_manifest_incomplete"
+        };
+        overrides
+            .route_account_manifest_source
+            .get_or_insert_with(|| "observed_pool_transaction".to_string());
+        overrides.execution_account_contract_status = Some(status.to_string());
+        overrides.execution_account_contract_reason = Some(reason);
+    } else if buy_account_overrides_has_execution_route_manifest(overrides) {
+        overrides
+            .route_account_manifest_source
+            .get_or_insert_with(|| "observed_pool_transaction".to_string());
+        overrides.execution_account_contract_status = Some("complete".to_string());
+        overrides.execution_account_contract_reason = Some("route_account_contract_complete".to_string());
+    }
+}
+
 fn derive_buy_account_overrides(
     buffered_txs: &[crate::components::gatekeeper::GatekeeperBufferedTx],
 ) -> crate::components::trigger::BuyAccountOverrides {
     let canonical_global_config = trigger::DirectBuyBuilder::canonical_global_config();
     let mut overrides = crate::components::trigger::BuyAccountOverrides::default();
+    let mut saw_nln_telemetry_buy = false;
+    let mut saw_route_account_evidence = false;
     for buffered in buffered_txs.iter().rev() {
         let tx = buffered.tx.as_ref();
         if !tx.success || !tx.is_buy {
             continue;
+        }
+        if tx.is_nln_program_stream_trade_telemetry_only() {
+            saw_nln_telemetry_buy = true;
+            continue;
+        }
+        if tx.global_config.is_some()
+            || tx.fee_recipient.is_some()
+            || tx.token_program.is_some()
+            || tx.buy_variant.as_deref() == Some("routed_exact_sol_in")
+            || tx.associated_bonding_curve.is_some()
+            || tx.bonding_curve_v2.is_some()
+            || !tx.buy_remaining_accounts.is_empty()
+        {
+            saw_route_account_evidence = true;
         }
         if overrides.global_config.is_none() {
             overrides.global_config = tx
@@ -19071,6 +19381,11 @@ fn derive_buy_account_overrides(
             break;
         }
     }
+    mark_buy_account_overrides_route_contract(
+        &mut overrides,
+        saw_nln_telemetry_buy,
+        saw_route_account_evidence,
+    );
     overrides
 }
 
@@ -19452,6 +19767,10 @@ struct ShadowEntryRecord {
     probe_entry_materialization_status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     probe_lifecycle_eligibility_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dispatch_attempted: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    simulation_attempted: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     active_shadow_precheck_status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -20124,6 +20443,27 @@ async fn apply_trigger_dispatch_receipt(
     .await
 }
 
+fn shadow_dispatch_status_for_failed_shadow_event(
+    event: &crate::events::ShadowBuySimulationEvent,
+) -> crate::components::trigger::shadow_run::ShadowDispatchStatus {
+    let err = event.err.as_deref().unwrap_or_default();
+    if event.account_diagnostics.dispatch_attempted == Some(false)
+        || event.account_diagnostics.simulation_attempted == Some(false)
+        || err.starts_with("no_executable_route_account_set:")
+        || err.starts_with("active_shadow_precheck_failed:")
+        || err.starts_with("execution_account_not_ready:")
+        || err.starts_with("bonding_curve_v2_source_not_authoritative:")
+        || err.starts_with("selected_route_handoff_mismatch:")
+        || err.starts_with("working_builder_final_manifest_missing_required_account:")
+        || err.starts_with("working_builder_final_manifest_account_source_not_authoritative:")
+        || err.starts_with("working_builder_final_manifest_execution_evidence_not_ready:")
+    {
+        crate::components::trigger::shadow_run::ShadowDispatchStatus::NotDispatched
+    } else {
+        crate::components::trigger::shadow_run::ShadowDispatchStatus::Failed
+    }
+}
+
 async fn apply_trigger_dispatch_receipt_with_builder_mode(
     event_tx: &crate::events::EventBusSender,
     post_buy_tx: Option<&DirectPostBuySender>,
@@ -20311,7 +20651,7 @@ async fn apply_trigger_dispatch_receipt_with_builder_mode(
                         &shadow_event,
                         &shadow_join_key,
                         rollout_profile,
-                        crate::components::trigger::shadow_run::ShadowDispatchStatus::Failed,
+                        shadow_dispatch_status_for_failed_shadow_event(&shadow_event),
                     )
                     .await
                     {
@@ -20373,7 +20713,7 @@ async fn apply_trigger_dispatch_receipt_with_builder_mode(
                         &shadow_event,
                         &shadow_join_key,
                         rollout_profile,
-                        crate::components::trigger::shadow_run::ShadowDispatchStatus::Failed,
+                        shadow_dispatch_status_for_failed_shadow_event(&shadow_event),
                     )
                     .await
                     {
@@ -25932,11 +26272,24 @@ mod tests {
 
     #[test]
     fn p37_route_resolver_primary_route_ready_selects_primary() {
-        let mut request = test_prepared_buy_request();
-        request.account_overrides.buy_variant = Some(trigger::PumpfunBuyVariant::RoutedExactSolIn);
+        let request = test_working_builder_prepared_buy_request();
+        let mut diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        diagnostics.manifest_lookup_performed = true;
+        for entry in diagnostics
+            .manifest
+            .iter_mut()
+            .filter(|entry| entry.role == "bonding_curve_v2")
+        {
+            entry.precheck_rpc_load_status = Some("rpc_load_ready".to_string());
+            entry.precheck_rpc_load_ready = Some(true);
+        }
 
-        let resolution =
-            p37_shadow_probe_route_resolution_diagnostics(Some(&request), None, None, None);
+        let resolution = p37_shadow_probe_route_resolution_diagnostics(
+            Some(&request),
+            Some(&diagnostics),
+            None,
+            None,
+        );
 
         assert_eq!(
             resolution.route_resolution_status.as_deref(),
@@ -25952,17 +26305,17 @@ mod tests {
     }
 
     #[test]
-    fn p37_route_resolver_primary_bcv2_missing_selects_ready_legacy_fallback() {
-        let mut request = test_prepared_buy_request();
-        let bcv2 = Pubkey::new_unique().to_string();
-        let legacy_curve_pubkey = Pubkey::new_unique();
-        request.account_overrides.buy_variant = Some(trigger::PumpfunBuyVariant::RoutedExactSolIn);
-        request.account_overrides.legacy_buy_curve = Some(p37_shadow_probe_test_legacy_curve());
-        request.account_overrides.legacy_buy_curve_pubkey = Some(legacy_curve_pubkey);
-        request.account_overrides.legacy_buy_curve_source =
-            Some("materialized_feature_set".to_string());
-        request.account_overrides.legacy_buy_curve_authority_status =
-            Some("authoritative_mfs".to_string());
+    fn p37_route_resolver_primary_bcv2_missing_rejects_legacy_fallback() {
+        let request = test_working_builder_prepared_buy_request();
+        let bcv2 = request
+            .account_overrides
+            .bonding_curve_v2
+            .expect("test bcv2")
+            .to_string();
+        let legacy_curve_pubkey = request
+            .account_overrides
+            .legacy_buy_curve_pubkey
+            .expect("test legacy curve");
         let diagnostics = P37ShadowProbeAccountSetDiagnostics {
             manifest: vec![
                 p37_shadow_probe_test_legacy_curve_manifest_entry(legacy_curve_pubkey),
@@ -25990,15 +26343,12 @@ mod tests {
 
         assert_eq!(
             resolution.route_resolution_status.as_deref(),
-            Some("fallback_route_ready")
+            Some("no_executable_route_account_set")
         );
-        assert_eq!(
-            resolution.selected_route_kind.as_deref(),
-            Some("legacy_buy")
-        );
+        assert_eq!(resolution.selected_route_kind, None);
         assert_eq!(
             resolution.selected_route_reason.as_deref(),
-            Some("fallback_route_passed_simulation_load_readiness")
+            Some("legacy_buy_fallback_unsupported_builder_layout")
         );
         assert_eq!(
             resolution.primary_route_kind.as_deref(),
@@ -26014,8 +26364,11 @@ mod tests {
             Some("legacy_buy")
         );
         assert_eq!(resolution.fallback_route_attempted, Some(true));
-        assert_eq!(resolution.fallback_route_ready, Some(true));
-        assert_eq!(resolution.fallback_route_not_ready_reason, None);
+        assert_eq!(resolution.fallback_route_ready, Some(false));
+        assert_eq!(
+            resolution.fallback_route_not_ready_reason.as_deref(),
+            Some("unsupported_legacy_buy_layout_requires_bcv2")
+        );
         let legacy_curve_pubkey_string = legacy_curve_pubkey.to_string();
         assert_eq!(
             resolution.legacy_buy_curve_pubkey.as_deref(),
@@ -26046,28 +26399,30 @@ mod tests {
         );
         assert_eq!(resolution.legacy_buy_route_ready, Some(true));
         assert_eq!(resolution.legacy_buy_route_not_ready_reason, None);
-        assert_eq!(resolution.fallback_failure_class, None);
-        assert!(resolution.fallback_missing_roles.is_empty());
-        assert!(resolution.fallback_missing_pubkeys.is_empty());
-        assert!(resolution.fallback_account_sources.is_empty());
         assert!(!resolution.fallback_simulation_load_account_set.is_empty());
         assert!(!resolution.fallback_required_precheck_account_set.is_empty());
-        assert_eq!(resolution.no_executable_route_account_set_reason, None);
+        assert!(resolution
+            .no_executable_route_account_set_reason
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with(
+                "unsupported_legacy_buy_layout_requires_bcv2:primary_route_bcv2_missing:bonding_curve_v2:"
+            ));
     }
 
     #[test]
-    fn p37_route_resolver_primary_bcv2_manifest_missing_selects_ready_legacy_fallback_without_precheck_reason(
+    fn p37_route_resolver_primary_bcv2_manifest_missing_rejects_legacy_fallback_without_precheck_reason(
     ) {
-        let mut request = test_prepared_buy_request();
-        let bcv2 = Pubkey::new_unique().to_string();
-        let legacy_curve_pubkey = Pubkey::new_unique();
-        request.account_overrides.buy_variant = Some(trigger::PumpfunBuyVariant::RoutedExactSolIn);
-        request.account_overrides.legacy_buy_curve = Some(p37_shadow_probe_test_legacy_curve());
-        request.account_overrides.legacy_buy_curve_pubkey = Some(legacy_curve_pubkey);
-        request.account_overrides.legacy_buy_curve_source =
-            Some("materialized_feature_set".to_string());
-        request.account_overrides.legacy_buy_curve_authority_status =
-            Some("authoritative_mfs".to_string());
+        let request = test_working_builder_prepared_buy_request();
+        let bcv2 = request
+            .account_overrides
+            .bonding_curve_v2
+            .expect("test bcv2")
+            .to_string();
+        let legacy_curve_pubkey = request
+            .account_overrides
+            .legacy_buy_curve_pubkey
+            .expect("test legacy curve");
         let diagnostics = P37ShadowProbeAccountSetDiagnostics {
             manifest: vec![
                 p37_shadow_probe_test_legacy_curve_manifest_entry(legacy_curve_pubkey),
@@ -26095,23 +26450,28 @@ mod tests {
 
         assert_eq!(
             resolution.route_resolution_status.as_deref(),
-            Some("fallback_route_ready")
+            Some("no_executable_route_account_set")
         );
-        assert_eq!(
-            resolution.selected_route_kind.as_deref(),
-            Some("legacy_buy")
-        );
+        assert_eq!(resolution.selected_route_kind, None);
         assert_eq!(resolution.fallback_route_attempted, Some(true));
-        assert_eq!(resolution.fallback_route_ready, Some(true));
-        assert_eq!(resolution.fallback_route_not_ready_reason, None);
-        assert_eq!(resolution.fallback_failure_class, None);
+        assert_eq!(resolution.fallback_route_ready, Some(false));
+        assert_eq!(
+            resolution.fallback_route_not_ready_reason.as_deref(),
+            Some("unsupported_legacy_buy_layout_requires_bcv2")
+        );
         assert_eq!(resolution.legacy_buy_route_ready, Some(true));
         assert_eq!(resolution.legacy_buy_route_not_ready_reason, None);
-        assert_eq!(resolution.no_executable_route_account_set_reason, None);
+        assert!(resolution
+            .no_executable_route_account_set_reason
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with(
+                "unsupported_legacy_buy_layout_requires_bcv2:primary_route_bcv2_missing:bonding_curve_v2:"
+            ));
     }
 
     #[test]
-    fn active_shadow_precheck_treats_ready_legacy_route_as_resolved_missing_curve() {
+    fn active_shadow_precheck_rejects_legacy_route_even_when_curve_resolves() {
         let mut request = test_prepared_buy_request();
         let legacy_curve_pubkey = Pubkey::new_unique();
         request.account_overrides.buy_variant = Some(trigger::PumpfunBuyVariant::LegacyBuy);
@@ -26138,9 +26498,14 @@ mod tests {
 
         assert_eq!(
             resolution.route_resolution_status.as_deref(),
-            Some("primary_route_ready")
+            Some("no_executable_route_account_set")
         );
-        assert!(p37_active_shadow_precheck_route_ready_for_missing_account(
+        assert_eq!(resolution.selected_route_kind, None);
+        assert_eq!(
+            resolution.no_executable_route_account_set_reason.as_deref(),
+            Some("legacy_buy_missing_buyback_remaining_accounts:count=0:expected=2")
+        );
+        assert!(!p37_active_shadow_precheck_route_ready_for_missing_account(
             &request,
             &resolution,
             "bonding_curve"
@@ -26186,17 +26551,43 @@ mod tests {
 
         assert_eq!(
             resolution.route_resolution_status.as_deref(),
-            Some("fallback_route_ready")
+            Some("no_executable_route_account_set")
         );
+        assert_eq!(resolution.selected_route_kind, None);
         assert_eq!(
-            resolution.selected_route_kind.as_deref(),
-            Some("legacy_buy")
+            resolution.no_executable_route_account_set_reason.as_deref(),
+            Some("route_account_manifest_incomplete:missing_global_config")
         );
         assert!(!p37_active_shadow_precheck_route_ready_for_missing_account(
             &request,
             &resolution,
             "bonding_curve_v2"
         ));
+    }
+
+    #[test]
+    fn selected_route_contract_uses_prepared_request_build_variant() {
+        let mut request = test_working_builder_prepared_buy_request();
+        let bcv2 = request
+            .account_overrides
+            .bonding_curve_v2
+            .expect("test bcv2");
+        request.account_overrides.buy_variant = None;
+        request.account_overrides.bonding_curve_v2_provenance =
+            Some(crate::events::ObservedAccountMetaProvenance {
+                provenance_status: Some("builder_only".to_string()),
+                resolved_pubkey: Some(bcv2.to_string()),
+                source_buy_variant: Some("routed_exact_sol_in".to_string()),
+                instruction_account_position: Some(16),
+                tx_success: Some(true),
+                ..Default::default()
+            });
+
+        let reason =
+            p37_selected_route_account_contract_failure_tail(&request).expect("contract failure");
+
+        assert!(reason.starts_with("primary_route_bcv2_missing:bonding_curve_v2:"));
+        assert!(!reason.contains("missing_buy_variant"));
     }
 
     #[test]
@@ -26442,7 +26833,7 @@ mod tests {
 
     #[test]
     fn selected_legacy_buy_handoff_happens_before_precheck() {
-        p37_route_resolver_primary_bcv2_manifest_missing_selects_ready_legacy_fallback_without_precheck_reason(
+        p37_route_resolver_primary_bcv2_manifest_missing_rejects_legacy_fallback_without_precheck_reason(
         );
     }
 
@@ -26885,16 +27276,16 @@ mod tests {
         assert_eq!(active.fallback_route_ready, Some(false));
         assert_eq!(
             active.fallback_failure_class.as_deref(),
-            Some("fallback_builder_account_source_unverified")
+            Some("fallback_missing_core_curve_account")
         );
         assert!(active
             .fallback_missing_roles
             .iter()
-            .any(|role| role == "bonding_curve_v2"));
-        assert!(active
-            .fallback_missing_pubkeys
+            .any(|role| role == "bonding_curve"));
+        assert!(!active
+            .fallback_missing_roles
             .iter()
-            .any(|pubkey| pubkey == bonding_curve_v2.as_str()));
+            .any(|role| role == "bonding_curve_v2"));
         let expected_reason =
             format!("primary_route_bcv2_missing:bonding_curve_v2:{bonding_curve_v2}");
         assert_eq!(
@@ -26904,6 +27295,194 @@ mod tests {
         assert_eq!(
             active.active_shadow_lifecycle_eligibility_status.as_deref(),
             Some("not_lifecycle_eligible")
+        );
+    }
+
+    #[test]
+    fn active_shadow_telemetry_only_route_contract_failure_is_not_lifecycle_eligible() {
+        let mut request = test_prepared_buy_request();
+        request.account_overrides.route_account_manifest_source =
+            Some("nln_program_streams".to_string());
+        request.account_overrides.execution_account_contract_status =
+            Some("telemetry_only".to_string());
+        request.account_overrides.execution_account_contract_reason =
+            Some("telemetry_only_trade_event".to_string());
+        let reason = p37_selected_route_account_contract_failure_reason(&request)
+            .expect("telemetry-only route contract must fail closed");
+
+        let active = active_shadow_account_diagnostics_from_account_set(
+            Some(reason.clone()),
+            Some(&request),
+            Some(&p37_shadow_probe_account_set_diagnostics_from_request(&request)),
+            "not_run_post_simulation_attribution",
+        );
+
+        assert_eq!(
+            active.active_shadow_precheck_status.as_deref(),
+            Some("precheck_failed")
+        );
+        assert_eq!(active.precheck_failure_reason.as_deref(), Some(reason.as_str()));
+        assert_eq!(active.simulation_error_kind, None);
+        assert_eq!(
+            active.route_resolution_status.as_deref(),
+            Some("no_executable_route_account_set")
+        );
+        assert_eq!(active.primary_route_ready, Some(false));
+        assert_eq!(
+            active.no_executable_route_account_set_reason.as_deref(),
+            Some(P37_TELEMETRY_ONLY_ROUTE_CONTRACT_REASON)
+        );
+        assert_eq!(
+            active.active_shadow_lifecycle_eligibility_status.as_deref(),
+            Some("not_lifecycle_eligible")
+        );
+    }
+
+    fn route_compatible_bcv2_provenance() -> crate::events::ObservedAccountMetaProvenance {
+        crate::events::ObservedAccountMetaProvenance {
+            provenance_status: Some("route_compatible".to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn complete_routed_execution_contract_overrides(
+        mint: Pubkey,
+    ) -> crate::components::trigger::BuyAccountOverrides {
+        let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).expect("valid token program");
+        crate::components::trigger::BuyAccountOverrides {
+            global_config: Some(trigger::DirectBuyBuilder::canonical_global_config()),
+            fee_recipient: Some(trigger::DirectBuyBuilder::canonical_fee_recipient()),
+            token_program: Some(token_program),
+            creator_pubkey: Some(Pubkey::new_unique()),
+            creator_pubkey_source: Some("unit_test".to_string()),
+            creator_pubkey_authoritative: Some(true),
+            buy_variant: Some(trigger::PumpfunBuyVariant::RoutedExactSolIn),
+            associated_bonding_curve: Some(
+                trigger::DirectBuyBuilder::canonical_associated_bonding_curve(
+                    &mint,
+                    &token_program,
+                ),
+            ),
+            bonding_curve_v2: Some(Pubkey::new_unique()),
+            bonding_curve_v2_provenance: Some(route_compatible_bcv2_provenance()),
+            route_account_manifest_source: Some("unit_test".to_string()),
+            execution_account_contract_status: Some("complete".to_string()),
+            execution_account_contract_reason: Some("route_account_contract_complete".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn routed_contract_missing_global_config_fails_before_dispatch() {
+        let mut request = test_prepared_buy_request();
+        request.account_overrides = complete_routed_execution_contract_overrides(request.mint);
+        request.account_overrides.global_config = None;
+
+        let reason = p37_selected_route_account_contract_failure_reason(&request)
+            .expect("missing global_config must fail execution contract");
+
+        assert_eq!(
+            reason,
+            "no_executable_route_account_set:route_account_manifest_incomplete:missing_global_config"
+        );
+    }
+
+    #[test]
+    fn routed_contract_missing_fee_recipient_fails_before_dispatch() {
+        let mut request = test_prepared_buy_request();
+        request.account_overrides = complete_routed_execution_contract_overrides(request.mint);
+        request.account_overrides.fee_recipient = None;
+
+        let reason = p37_selected_route_account_contract_failure_reason(&request)
+            .expect("missing fee_recipient must fail execution contract");
+
+        assert_eq!(
+            reason,
+            "no_executable_route_account_set:route_account_manifest_incomplete:missing_fee_recipient"
+        );
+    }
+
+    #[test]
+    fn routed_contract_missing_token_program_fails_before_dispatch() {
+        let mut request = test_prepared_buy_request();
+        request.account_overrides = complete_routed_execution_contract_overrides(request.mint);
+        request.account_overrides.token_program = None;
+
+        let reason = p37_selected_route_account_contract_failure_reason(&request)
+            .expect("missing token_program must fail execution contract");
+
+        assert_eq!(
+            reason,
+            "no_executable_route_account_set:route_account_manifest_incomplete:missing_token_program"
+        );
+    }
+
+    #[test]
+    fn routed_contract_non_route_compatible_bcv2_fails_before_dispatch() {
+        let mut request = test_prepared_buy_request();
+        request.account_overrides = complete_routed_execution_contract_overrides(request.mint);
+        let bcv2 = request
+            .account_overrides
+            .bonding_curve_v2
+            .expect("test bcv2");
+        request.account_overrides.bonding_curve_v2_provenance = None;
+
+        let reason = p37_selected_route_account_contract_failure_reason(&request)
+            .expect("builder-only bcv2 must fail execution contract");
+
+        assert_eq!(
+            reason,
+            format!("no_executable_route_account_set:primary_route_bcv2_missing:bonding_curve_v2:{bcv2}")
+        );
+    }
+
+    #[test]
+    fn routed_complete_contract_can_reach_shadow_precheck() {
+        let mut request = test_prepared_buy_request();
+        request.account_overrides = complete_routed_execution_contract_overrides(request.mint);
+
+        assert_eq!(
+            p37_selected_route_account_contract_failure_reason(&request),
+            None
+        );
+    }
+
+    #[test]
+    fn legacy_contract_missing_buyback_remaining_accounts_fails_before_dispatch() {
+        let mut request = test_prepared_buy_request();
+        request.account_overrides = crate::components::trigger::BuyAccountOverrides {
+            buy_variant: Some(trigger::PumpfunBuyVariant::LegacyBuy),
+            legacy_buy_curve: Some(p37_shadow_probe_test_legacy_curve()),
+            legacy_buy_curve_pubkey: Some(Pubkey::new_unique()),
+            ..Default::default()
+        };
+
+        let reason = p37_selected_route_account_contract_failure_reason(&request)
+            .expect("legacy without buyback tail must fail execution contract");
+
+        assert_eq!(
+            reason,
+            "no_executable_route_account_set:legacy_buy_missing_buyback_remaining_accounts:count=0:expected=2"
+        );
+    }
+
+    #[test]
+    fn legacy_contract_with_buyback_tail_is_still_unsupported_for_shadow_dispatch() {
+        let mut request = test_prepared_buy_request();
+        request.account_overrides = crate::components::trigger::BuyAccountOverrides {
+            buy_variant: Some(trigger::PumpfunBuyVariant::LegacyBuy),
+            legacy_buy_curve: Some(p37_shadow_probe_test_legacy_curve()),
+            legacy_buy_curve_pubkey: Some(Pubkey::new_unique()),
+            buy_remaining_accounts: vec![Pubkey::new_unique(), Pubkey::new_unique()],
+            ..Default::default()
+        };
+
+        let reason = p37_selected_route_account_contract_failure_reason(&request)
+            .expect("legacy fallback must stay unsupported for shadow dispatch");
+
+        assert_eq!(
+            reason,
+            format!("no_executable_route_account_set:{P37_UNSUPPORTED_LEGACY_BUY_LAYOUT_REASON}")
         );
     }
 
@@ -28199,6 +28778,9 @@ mod tests {
             legacy_buy_curve_pubkey: Some(legacy_curve_pubkey),
             legacy_buy_curve_source: Some("materialized_feature_set".to_string()),
             legacy_buy_curve_authority_status: Some("authoritative_mfs".to_string()),
+            route_account_manifest_source: Some("unit_test".to_string()),
+            execution_account_contract_status: Some("route_account_manifest_candidate".to_string()),
+            execution_account_contract_reason: Some("unit_test_complete_route".to_string()),
         };
         let buy_instruction =
             trigger::DirectBuyBuilder::build_buy_ix_with_accounts_and_bonding_curve_v2(
@@ -35185,6 +35767,40 @@ mod tests {
 
         let overrides = derive_buy_account_overrides(&buffered_txs);
         assert!(overrides.buy_variant.is_none());
+    }
+
+    #[test]
+    fn derive_buy_account_overrides_marks_nln_trade_as_telemetry_only_contract() {
+        use ghost_brain::oracle::snapshot_engine::PoolMetrics;
+        use ghost_core::shadow_ledger::TxKey;
+        use std::sync::Arc;
+
+        let mut tx = (*test_pool_observation_tx("nln-telemetry-buy")).clone();
+        tx.buy_variant = Some("nln_pumpfun_buy".to_string());
+        assert!(tx.is_nln_program_stream_trade_telemetry_only());
+        let buffered_txs = vec![crate::components::gatekeeper::GatekeeperBufferedTx {
+            tx: Arc::new(tx),
+            metrics: PoolMetrics::default(),
+            tx_key: TxKey::new(1, Some(1), None, None, 0).unwrap(),
+        }];
+
+        let overrides = derive_buy_account_overrides(&buffered_txs);
+
+        assert_eq!(overrides.buy_variant, None);
+        assert_eq!(overrides.bonding_curve_v2, None);
+        assert_eq!(overrides.associated_bonding_curve, None);
+        assert_eq!(
+            overrides.route_account_manifest_source.as_deref(),
+            Some("nln_program_streams")
+        );
+        assert_eq!(
+            overrides.execution_account_contract_status.as_deref(),
+            Some("telemetry_only")
+        );
+        assert_eq!(
+            overrides.execution_account_contract_reason.as_deref(),
+            Some("telemetry_only_trade_event")
+        );
     }
 
     #[test]

@@ -90,6 +90,10 @@ pub struct SimulationAccountNotFoundCandidate {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ShadowSimulationAccountDiagnostics {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_attempted: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub simulation_attempted: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_shadow_precheck_status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_shadow_lifecycle_eligibility_status: Option<String>,
@@ -795,6 +799,19 @@ impl PoolTransaction {
     pub fn compat_event_ts_ms(&self) -> Option<u64> {
         self.event_time
             .compat_event_ts_ms((self.timestamp_ms > 0).then_some(self.timestamp_ms))
+    }
+
+    pub fn is_nln_program_stream_trade_telemetry_only(&self) -> bool {
+        matches!(
+            self.buy_variant.as_deref(),
+            Some("nln_pumpfun_buy" | "nln_pumpfun_sell")
+        ) && self.global_config.is_none()
+            && self.fee_recipient.is_none()
+            && self.token_program.is_none()
+            && self.associated_bonding_curve.is_none()
+            && self.bonding_curve_v2.is_none()
+            && self.bonding_curve_v2_provenance.is_none()
+            && self.buy_remaining_accounts.is_empty()
     }
 }
 
