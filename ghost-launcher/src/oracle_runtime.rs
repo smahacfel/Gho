@@ -42,7 +42,7 @@ use ghost_brain::oracle::{ApprovedPools, SnapshotEngine};
 // [INTEGRATION] Import additional engines
 use ghost_brain::chaos::amm_math::AmmPool;
 use ghost_brain::chaos::engine::{ChaosEngine, MarketScenario, SimulationConfig};
-use ghost_brain::events::{EventEmitter, EventWriterConfig};
+use ghost_brain::events::{EventEmitter, EventWriterConfig, PoolTransactionPayload};
 use ghost_brain::oracle::engine::PanicProvider;
 use ghost_brain::oracle::snapshot_engine::{
     derive_price_canonical, DataSource, InitPoolEvent, PoolLifecycle, TxEvent,
@@ -15506,6 +15506,134 @@ fn emit_new_pool_detected_evidence_event(emitter: &EventEmitter, pool_data: &Det
     );
 }
 
+fn pool_transaction_source_label(tx: &PoolTransaction) -> &'static str {
+    if tx.is_nln_program_stream_trade_telemetry_only() {
+        "nln_program_streams"
+    } else {
+        match tx.semantic.source_kind.as_str() {
+            "grpc" => "grpc_global_stream",
+            "geyser_ws" => "geyser_ws",
+            "helius_ws" => "helius_ws",
+            "pumpportal" => "pumpportal",
+            _ => "unknown",
+        }
+    }
+}
+
+fn pool_transaction_contract_status(tx: &PoolTransaction) -> (String, Option<String>) {
+    if tx.is_nln_program_stream_trade_telemetry_only() {
+        return (
+            "telemetry_only".to_string(),
+            Some("telemetry_only_trade_event".to_string()),
+        );
+    }
+    let reason = if tx.associated_bonding_curve.is_none() {
+        Some("missing_associated_bonding_curve")
+    } else if tx.global_config.is_none() {
+        Some("missing_global_config")
+    } else if tx.fee_recipient.is_none() {
+        Some("missing_fee_recipient")
+    } else if tx.token_program.is_none() {
+        Some("missing_token_program")
+    } else if tx.is_buy && tx.bonding_curve_v2.is_none() {
+        Some("missing_bonding_curve_v2")
+    } else if tx.is_buy && tx.buy_remaining_accounts.is_empty() {
+        Some("missing_buy_remaining_accounts")
+    } else {
+        None
+    };
+    match reason {
+        Some(reason) => (
+            "route_account_manifest_incomplete".to_string(),
+            Some(format!("route_account_manifest_incomplete:{reason}")),
+        ),
+        None => ("complete".to_string(), None),
+    }
+}
+
+fn pool_transaction_evidence_candidate_id(
+    tx: &PoolTransaction,
+    pool_id: &Pubkey,
+    base_mint: Option<&Pubkey>,
+    event_ts_ms: u64,
+) -> String {
+    if let Some(mint) = base_mint {
+        format!("{mint}:{pool_id}:{event_ts_ms}")
+    } else if let Some(mint) = tx.token_mint.as_deref().filter(|value| !value.is_empty()) {
+        format!("{mint}:{pool_id}:{event_ts_ms}")
+    } else {
+        format!("{pool_id}:{}:{event_ts_ms}", tx.signature)
+    }
+}
+
+fn emit_pool_transaction_evidence_event(
+    emitter: &EventEmitter,
+    tx: &PoolTransaction,
+    pool_id: Pubkey,
+    base_mint: Option<&Pubkey>,
+) {
+    let event_ts_ms = tx_event_ts_ms(tx);
+    let candidate_id = pool_transaction_evidence_candidate_id(tx, &pool_id, base_mint, event_ts_ms);
+    let canonical_pool = pool_id.to_string();
+    let source_pool = tx.pool_amm_id.clone();
+    let base_mint_string = base_mint
+        .map(|mint| mint.to_string())
+        .or_else(|| tx.token_mint.clone());
+    let side = if tx.is_buy { "buy" } else { "sell" }.to_string();
+    let quote_amount_sol = tx
+        .sol_amount_lamports
+        .map(|lamports| lamports as f64 / 1_000_000_000.0)
+        .unwrap_or(tx.volume_sol.abs());
+    let (contract_status, contract_reason) = pool_transaction_contract_status(tx);
+    emitter.emit_pool_transaction(
+        &candidate_id,
+        PoolTransactionPayload {
+            schema_version: "v1".to_string(),
+            pool_amm_id: canonical_pool.clone(),
+            pool_id: canonical_pool.clone(),
+            source_pool_amm_id: (source_pool != canonical_pool).then_some(source_pool),
+            base_mint: base_mint_string.clone(),
+            mint_id: base_mint_string.clone(),
+            token_mint: base_mint_string,
+            quote_mint: Some("So11111111111111111111111111111111111111112".to_string()),
+            bonding_curve: canonical_pool,
+            signature: tx.signature.clone(),
+            event_slot: tx.slot,
+            slot: tx.slot,
+            tx_index: tx.tx_index,
+            event_ordinal: tx.event_ordinal,
+            outer_instruction_index: tx.outer_instruction_index,
+            inner_group_index: tx.inner_group_index,
+            event_ts_ms,
+            timestamp_ms: event_ts_ms,
+            arrival_ts_ms: tx.arrival_ts_ms,
+            source: pool_transaction_source_label(tx).to_string(),
+            side: side.clone(),
+            is_buy: tx.is_buy,
+            success: tx.success,
+            error_code: tx.error_code.clone(),
+            signer: tx.signer.clone(),
+            wallet: tx.signer.clone(),
+            quote_amount_sol,
+            volume_sol: tx.volume_sol.abs(),
+            sol_amount_lamports: tx.sol_amount_lamports,
+            token_amount_units: tx.token_amount_units,
+            reserve_base: tx.reserve_base,
+            reserve_quote: tx.reserve_quote,
+            price_quote: tx.price_quote,
+            v_tokens_in_bonding_curve: tx.v_tokens_in_bonding_curve,
+            v_sol_in_bonding_curve: tx.v_sol_in_bonding_curve,
+            market_cap_sol: tx.market_cap_sol,
+            curve_progress_pct: None,
+            curve_progress_status: "unavailable_missing_curve_state_source".to_string(),
+            curve_finality: format!("{:?}", tx.curve_finality).to_lowercase(),
+            curve_data_known: tx.curve_data_known,
+            execution_account_contract_status: contract_status,
+            execution_account_contract_reason: contract_reason,
+        },
+    );
+}
+
 // =============================================================================
 // Oracle Runtime Task & Helpers
 // =============================================================================
@@ -22891,21 +23019,34 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                                 }
                             }
 
-                            // Skip rejected pools
+                            // Enrich base_mint from pool identity registry when not
+                            // available from the TX.  This broadens coverage for
+                            // selector event artifacts, the Shadow Ledger fast path
+                            // below, and subsequent routing.
+                            if base_mint.is_none() {
+                                base_mint =
+                                    oracle_runtime.lookup_base_mint_for_pool(&pool_id);
+                            }
+
+                            // Durable selector feature evidence is intentionally
+                            // emitted before runtime rejected-pool filtering.  The
+                            // artifact writer is not a session/dispatch unlock path.
+                            if let Some(emitter) = ctx.event_emitter.as_ref() {
+                                emit_pool_transaction_evidence_event(
+                                    emitter,
+                                    &tx,
+                                    pool_id,
+                                    base_mint.as_ref(),
+                                );
+                            }
+
+                            // Skip rejected pools for active runtime routing.
                             if rejected_pools.contains(&pool_id)
                                 || base_mint
                                     .as_ref()
                                     .is_some_and(|m| rejected_pools.contains(m))
                             {
                                 continue;
-                            }
-
-                            // Enrich base_mint from pool identity registry when not
-                            // available from the TX.  This broadens coverage for the
-                            // Shadow Ledger fast path below and for subsequent routing.
-                            if base_mint.is_none() {
-                                base_mint =
-                                    oracle_runtime.lookup_base_mint_for_pool(&pool_id);
                             }
 
                             // ── Shadow Ledger authoritative runtime engine fast path ──────

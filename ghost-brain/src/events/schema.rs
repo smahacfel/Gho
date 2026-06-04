@@ -121,6 +121,7 @@ impl ExecutionEvent {
 pub enum EventKind {
     // ── Ingest / selector evidence ──────────────────────────────────────
     NewPoolDetected(NewPoolDetectedPayload),
+    PoolTransaction(PoolTransactionPayload),
 
     // ── Mandatory (12) ──────────────────────────────────────────────────
     Candidate(CandidatePayload),
@@ -147,6 +148,7 @@ impl EventKind {
     pub fn type_name(&self) -> &'static str {
         match self {
             Self::NewPoolDetected(_) => "NewPoolDetected",
+            Self::PoolTransaction(_) => "PoolTransaction",
             Self::Candidate(_) => "Candidate",
             Self::EntrySubmitted(_) => "EntrySubmitted",
             Self::EntryFilled(_) => "EntryFilled",
@@ -169,7 +171,10 @@ impl EventKind {
     pub fn is_optional(&self) -> bool {
         matches!(
             self,
-            Self::ExecutionStressChanged(_) | Self::OracleStale(_) | Self::LedgerDegraded(_)
+            Self::PoolTransaction(_)
+                | Self::ExecutionStressChanged(_)
+                | Self::OracleStale(_)
+                | Self::LedgerDegraded(_)
         )
     }
 }
@@ -218,6 +223,128 @@ pub struct NewPoolDetectedPayload {
     pub chain_event_ts_ms: Option<u64>,
     /// Source label for offline provenance.
     pub source: String,
+}
+
+/// Durable transaction-flow evidence for selector feature snapshots.
+///
+/// This is not a Gatekeeper verdict, execution attempt, lifecycle event, or
+/// denominator source.  Offline selector builders may join it to an existing
+/// birth/candidate universe by mint + pool/bonding-curve identity and by
+/// decision-time cutoffs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoolTransactionPayload {
+    /// Payload schema marker for downstream artifact audits.
+    pub schema_version: String,
+    /// Pool AMM ID normalized for selector joins.
+    pub pool_amm_id: String,
+    /// Alias used by selector normalizers.
+    pub pool_id: String,
+    /// Source pool id before runtime remapping, if it differs from `pool_id`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_pool_amm_id: Option<String>,
+    /// Base token mint, when known at emit time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_mint: Option<String>,
+    /// Alias used by selector normalizers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mint_id: Option<String>,
+    /// Alias used by selector normalizers for historical event shapes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_mint: Option<String>,
+    /// Quote token mint, if known. Pump.fun primary quote is wrapped SOL.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quote_mint: Option<String>,
+    /// Bonding curve / pool identity used for strict joins.
+    pub bonding_curve: String,
+    /// Source transaction signature.
+    pub signature: String,
+    /// Chain slot when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_slot: Option<u64>,
+    /// Alias retained for downstream normalizers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slot: Option<u64>,
+    /// Transaction index in slot when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tx_index: Option<u32>,
+    /// Stable event ordinal inside the source transaction when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_ordinal: Option<u32>,
+    /// Parser-side outer instruction index when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outer_instruction_index: Option<u32>,
+    /// Parser-side inner instruction group when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inner_group_index: Option<u32>,
+    /// Selector event timestamp in epoch milliseconds.
+    pub event_ts_ms: u64,
+    /// Alias retained for historical normalizers.
+    pub timestamp_ms: u64,
+    /// Runtime arrival timestamp in epoch milliseconds.
+    pub arrival_ts_ms: u64,
+    /// Source label for offline provenance.
+    pub source: String,
+    /// `buy` or `sell`.
+    pub side: String,
+    /// Explicit boolean side for historical normalizers.
+    pub is_buy: bool,
+    /// True when the source transaction succeeded.
+    #[serde(default = "default_pool_transaction_success")]
+    pub success: bool,
+    /// Parsed error code if the source transaction failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    /// Primary signer / trader wallet observed by ingest.
+    pub signer: String,
+    /// Alias for feature rollups that use wallet identity.
+    pub wallet: String,
+    /// SOL-denominated trade amount used by flow features.
+    pub quote_amount_sol: f64,
+    /// Alias accepted by selector feature normalizers.
+    pub volume_sol: f64,
+    /// Canonical SOL amount in lamports when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sol_amount_lamports: Option<u64>,
+    /// Canonical token amount in base units when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_amount_units: Option<u64>,
+    /// Updated base reserve, if available from ingest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reserve_base: Option<f64>,
+    /// Updated quote/SOL reserve, if available from ingest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reserve_quote: Option<f64>,
+    /// Updated price, if available from ingest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price_quote: Option<f64>,
+    /// Virtual tokens remaining in bonding curve, if available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub v_tokens_in_bonding_curve: Option<f64>,
+    /// Virtual SOL remaining in bonding curve, if available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub v_sol_in_bonding_curve: Option<f64>,
+    /// Market cap in SOL, if available from ingest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub market_cap_sol: Option<f64>,
+    /// Curve progress is not inferred here. It is populated only if an
+    /// upstream source already supplied an authoritative value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub curve_progress_pct: Option<f64>,
+    /// Availability status for `curve_progress_pct`.
+    pub curve_progress_status: String,
+    /// Finality tier of the curve state used for this transaction.
+    pub curve_finality: String,
+    /// True when the parser had curve data, false for telemetry-only flow.
+    pub curve_data_known: bool,
+    /// Route/account contract status carried as evidence only.
+    pub execution_account_contract_status: String,
+    /// Optional reason when the route/account contract is incomplete.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_account_contract_reason: Option<String>,
+}
+
+const fn default_pool_transaction_success() -> bool {
+    true
 }
 
 /// 1. CandidateEvent — Gatekeeper PASS
@@ -563,6 +690,55 @@ mod tests {
         });
         assert_eq!(birth_kind.type_name(), "NewPoolDetected");
         assert!(!birth_kind.is_optional());
+
+        let tx_kind = EventKind::PoolTransaction(PoolTransactionPayload {
+            schema_version: "v1".to_string(),
+            pool_amm_id: "pool".to_string(),
+            pool_id: "pool".to_string(),
+            source_pool_amm_id: None,
+            base_mint: Some("mint".to_string()),
+            mint_id: Some("mint".to_string()),
+            token_mint: Some("mint".to_string()),
+            quote_mint: Some("SOL".to_string()),
+            bonding_curve: "pool".to_string(),
+            signature: "sig-tx".to_string(),
+            event_slot: Some(124),
+            slot: Some(124),
+            tx_index: Some(1),
+            event_ordinal: Some(2),
+            outer_instruction_index: Some(3),
+            inner_group_index: Some(4),
+            event_ts_ms: 1_700_000_001_000,
+            timestamp_ms: 1_700_000_001_000,
+            arrival_ts_ms: 1_700_000_001_001,
+            source: "grpc_global_stream".to_string(),
+            side: "buy".to_string(),
+            is_buy: true,
+            success: true,
+            error_code: None,
+            signer: "wallet".to_string(),
+            wallet: "wallet".to_string(),
+            quote_amount_sol: 0.42,
+            volume_sol: 0.42,
+            sol_amount_lamports: Some(420_000_000),
+            token_amount_units: Some(123),
+            reserve_base: None,
+            reserve_quote: None,
+            price_quote: None,
+            v_tokens_in_bonding_curve: None,
+            v_sol_in_bonding_curve: None,
+            market_cap_sol: None,
+            curve_progress_pct: None,
+            curve_progress_status: "unavailable_missing_curve_state_source".to_string(),
+            curve_finality: "speculative".to_string(),
+            curve_data_known: false,
+            execution_account_contract_status: "route_account_manifest_incomplete".to_string(),
+            execution_account_contract_reason: Some(
+                "route_account_manifest_incomplete:missing_global_config".to_string(),
+            ),
+        });
+        assert_eq!(tx_kind.type_name(), "PoolTransaction");
+        assert!(tx_kind.is_optional());
     }
 
     #[test]
@@ -603,6 +779,56 @@ mod tests {
             ),
             ExecutionEvent::new(
                 env.derive(1),
+                EventKind::PoolTransaction(PoolTransactionPayload {
+                    schema_version: "v1".to_string(),
+                    pool_amm_id: "pool".to_string(),
+                    pool_id: "pool".to_string(),
+                    source_pool_amm_id: None,
+                    base_mint: Some("mint".to_string()),
+                    mint_id: Some("mint".to_string()),
+                    token_mint: Some("mint".to_string()),
+                    quote_mint: Some("SOL".to_string()),
+                    bonding_curve: "pool".to_string(),
+                    signature: "sig-tx".to_string(),
+                    event_slot: Some(1),
+                    slot: Some(1),
+                    tx_index: Some(1),
+                    event_ordinal: Some(1),
+                    outer_instruction_index: None,
+                    inner_group_index: None,
+                    event_ts_ms: 1,
+                    timestamp_ms: 1,
+                    arrival_ts_ms: 1,
+                    source: "grpc_global_stream".to_string(),
+                    side: "buy".to_string(),
+                    is_buy: true,
+                    success: true,
+                    error_code: None,
+                    signer: "wallet".to_string(),
+                    wallet: "wallet".to_string(),
+                    quote_amount_sol: 1.0,
+                    volume_sol: 1.0,
+                    sol_amount_lamports: Some(1_000_000_000),
+                    token_amount_units: Some(100),
+                    reserve_base: None,
+                    reserve_quote: None,
+                    price_quote: None,
+                    v_tokens_in_bonding_curve: None,
+                    v_sol_in_bonding_curve: None,
+                    market_cap_sol: None,
+                    curve_progress_pct: None,
+                    curve_progress_status: "unavailable_missing_curve_state_source".to_string(),
+                    curve_finality: "speculative".to_string(),
+                    curve_data_known: false,
+                    execution_account_contract_status: "route_account_manifest_incomplete"
+                        .to_string(),
+                    execution_account_contract_reason: Some(
+                        "route_account_manifest_incomplete:missing_global_config".to_string(),
+                    ),
+                }),
+            ),
+            ExecutionEvent::new(
+                env.derive(2),
                 EventKind::Candidate(CandidatePayload {
                     mcap_snapshot: None,
                     price_snapshot: None,
@@ -612,7 +838,7 @@ mod tests {
                 }),
             ),
             ExecutionEvent::new(
-                env.derive(2),
+                env.derive(3),
                 EventKind::EntrySubmitted(EntrySubmittedPayload {
                     side: OrderSide::Entry,
                     planned_delay_ms: None,
@@ -622,7 +848,7 @@ mod tests {
                 }),
             ),
             ExecutionEvent::new(
-                env.derive(3),
+                env.derive(4),
                 EventKind::EntryFilled(EntryFilledPayload {
                     fill_time_ms: 3,
                     fill_price_effective: 0.001,
@@ -633,7 +859,7 @@ mod tests {
                 }),
             ),
             ExecutionEvent::new(
-                env.derive(4),
+                env.derive(5),
                 EventKind::PositionOpened(PositionOpenedPayload {
                     entry_price: 0.001,
                     entry_time_ms: 4,
@@ -643,7 +869,7 @@ mod tests {
                 }),
             ),
             ExecutionEvent::new(
-                env.derive(5),
+                env.derive(6),
                 EventKind::AemTick(AemTickPayload {
                     regime_key: "key".to_string(),
                     regime_tag: "tag".to_string(),
@@ -655,7 +881,7 @@ mod tests {
                 }),
             ),
             ExecutionEvent::new(
-                env.derive(6),
+                env.derive(7),
                 EventKind::ControlCommandIssued(ControlCommandIssuedPayload {
                     directive: "WAIT".to_string(),
                     fraction_bps: None,
@@ -669,7 +895,7 @@ mod tests {
                 }),
             ),
             ExecutionEvent::new(
-                env.derive(7),
+                env.derive(8),
                 EventKind::ControlCommandApplied(ControlCommandAppliedPayload {
                     accepted: true,
                     reject_reason: None,
@@ -677,14 +903,14 @@ mod tests {
                 }),
             ),
             ExecutionEvent::new(
-                env.derive(8),
+                env.derive(9),
                 EventKind::ExitSubmitted(ExitSubmittedPayload {
                     fraction_bps: 10000,
                     command_ref: None,
                 }),
             ),
             ExecutionEvent::new(
-                env.derive(9),
+                env.derive(10),
                 EventKind::ExitFilled(ExitFilledPayload {
                     fill_price: 0.002,
                     fill_qty: 1000,
@@ -695,7 +921,7 @@ mod tests {
                 }),
             ),
             ExecutionEvent::new(
-                env.derive(10),
+                env.derive(11),
                 EventKind::PositionClosed(PositionClosedPayload {
                     final_pnl: 0.001,
                     final_pnl_pct: 100.0,
@@ -710,14 +936,14 @@ mod tests {
                 }),
             ),
             ExecutionEvent::new(
-                env.derive(11),
+                env.derive(12),
                 EventKind::ManagementDecision(ManagementDecisionPayload {
                     decision: serde_json::json!({"action": "SELL_NOW"}),
                     counterfactual_basis_quote_id: None,
                 }),
             ),
             ExecutionEvent::new(
-                env.derive(12),
+                env.derive(13),
                 EventKind::ManagementOutcome(ManagementOutcomePayload {
                     outcome: serde_json::json!({"result": "success"}),
                 }),
@@ -730,7 +956,7 @@ mod tests {
             // Verify roundtrip
             let _: ExecutionEvent = serde_json::from_str(&json).unwrap();
         }
-        assert_eq!(events.len(), 12);
+        assert_eq!(events.len(), 14);
     }
 
     #[test]

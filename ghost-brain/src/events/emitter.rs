@@ -161,6 +161,23 @@ impl EventEmitter {
         ));
     }
 
+    /// Emit durable transaction-flow evidence for selector feature snapshots.
+    ///
+    /// This is selector feature evidence only. It is not a Gatekeeper verdict,
+    /// execution attempt, lifecycle label, or universe denominator row.
+    pub fn emit_pool_transaction(
+        &self,
+        candidate_id: &CandidateId,
+        payload: PoolTransactionPayload,
+    ) {
+        let mut env = self.make_envelope_at(candidate_id, payload.event_ts_ms);
+        env.slot = payload.slot;
+        self.emit(ExecutionEvent::new(
+            env,
+            EventKind::PoolTransaction(payload),
+        ));
+    }
+
     /// Emit a CandidateEvent (Gatekeeper PASS).
     pub fn emit_candidate(
         &self,
@@ -618,6 +635,80 @@ mod tests {
         assert_eq!(parsed["kind"]["payload"]["quote_mint"], "SOL");
         assert_eq!(parsed["kind"]["payload"]["bonding_curve"], "curve");
         assert_eq!(parsed["envelope"]["slot"], 123);
+    }
+
+    #[test]
+    fn test_emit_pool_transaction_feature_evidence() {
+        let (emitter, tmp) = make_emitter();
+        emitter.emit_pool_transaction(
+            &"mint:pool:1700000001000".to_string(),
+            PoolTransactionPayload {
+                schema_version: "v1".to_string(),
+                pool_amm_id: "pool".to_string(),
+                pool_id: "pool".to_string(),
+                source_pool_amm_id: None,
+                base_mint: Some("mint".to_string()),
+                mint_id: Some("mint".to_string()),
+                token_mint: Some("mint".to_string()),
+                quote_mint: Some("So11111111111111111111111111111111111111112".to_string()),
+                bonding_curve: "pool".to_string(),
+                signature: "sig-tx".to_string(),
+                event_slot: Some(124),
+                slot: Some(124),
+                tx_index: Some(1),
+                event_ordinal: Some(2),
+                outer_instruction_index: Some(3),
+                inner_group_index: Some(4),
+                event_ts_ms: 1_700_000_001_000,
+                timestamp_ms: 1_700_000_001_000,
+                arrival_ts_ms: 1_700_000_001_001,
+                source: "grpc_global_stream".to_string(),
+                side: "buy".to_string(),
+                is_buy: true,
+                success: true,
+                error_code: None,
+                signer: "wallet".to_string(),
+                wallet: "wallet".to_string(),
+                quote_amount_sol: 0.42,
+                volume_sol: 0.42,
+                sol_amount_lamports: Some(420_000_000),
+                token_amount_units: Some(123),
+                reserve_base: None,
+                reserve_quote: None,
+                price_quote: None,
+                v_tokens_in_bonding_curve: None,
+                v_sol_in_bonding_curve: None,
+                market_cap_sol: None,
+                curve_progress_pct: None,
+                curve_progress_status: "unavailable_missing_curve_state_source".to_string(),
+                curve_finality: "speculative".to_string(),
+                curve_data_known: false,
+                execution_account_contract_status: "route_account_manifest_incomplete".to_string(),
+                execution_account_contract_reason: Some(
+                    "route_account_manifest_incomplete:missing_global_config".to_string(),
+                ),
+            },
+        );
+        emitter.flush().unwrap();
+        assert_eq!(emitter.total_events_written(), 1);
+
+        let jsonl_path = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+            .expect("jsonl event file");
+        let content = std::fs::read_to_string(jsonl_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(parsed["kind"]["type"], "PoolTransaction");
+        assert_eq!(parsed["kind"]["payload"]["side"], "buy");
+        assert_eq!(parsed["kind"]["payload"]["signer"], "wallet");
+        assert_eq!(parsed["kind"]["payload"]["quote_amount_sol"], 0.42);
+        assert_eq!(
+            parsed["kind"]["payload"]["curve_progress_status"],
+            "unavailable_missing_curve_state_source"
+        );
+        assert_eq!(parsed["envelope"]["slot"], 124);
     }
 
     #[test]

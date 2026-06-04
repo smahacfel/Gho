@@ -37,6 +37,7 @@ pub use schema::{
     ManagementDecisionPayload,
     ManagementOutcomePayload,
     OracleStalePayload,
+    PoolTransactionPayload,
     PositionClosedPayload,
     PositionOpenedPayload,
 };

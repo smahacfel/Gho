@@ -97,7 +97,10 @@ impl EventValidator {
                 ));
             }
 
-            if matches!(&event.kind, EventKind::NewPoolDetected(_)) {
+            if matches!(
+                &event.kind,
+                EventKind::NewPoolDetected(_) | EventKind::PoolTransaction(_)
+            ) {
                 continue;
             }
 
@@ -670,6 +673,7 @@ mod tests {
     use super::*;
     use crate::events::schema::{
         CandidatePayload, EntryFilledPayload, EntrySubmittedPayload, EventEnvelope, EventKind,
+        PoolTransactionPayload,
     };
     use crate::execution::backend::{FillStatus, OrderSide};
     use std::io::Write;
@@ -723,6 +727,71 @@ mod tests {
         let metrics = EventValidator::validate_jsonl(file.path()).expect("validate");
         assert_eq!(metrics.invariant_violations.len(), 0);
         assert_eq!(metrics.valid_trajectories, 1);
+    }
+
+    #[test]
+    fn test_validator_treats_pool_transaction_as_evidence_only() {
+        let mut file = NamedTempFile::new().expect("tmp file");
+        let event = ExecutionEvent::new(
+            EventEnvelope::new("r1".into(), Lane::Paper, "mint:pool:100".into(), 100),
+            EventKind::PoolTransaction(PoolTransactionPayload {
+                schema_version: "v1".to_string(),
+                pool_amm_id: "pool".to_string(),
+                pool_id: "pool".to_string(),
+                source_pool_amm_id: None,
+                base_mint: Some("mint".to_string()),
+                mint_id: Some("mint".to_string()),
+                token_mint: Some("mint".to_string()),
+                quote_mint: Some("So11111111111111111111111111111111111111112".to_string()),
+                bonding_curve: "pool".to_string(),
+                signature: "sig-tx".to_string(),
+                event_slot: Some(1),
+                slot: Some(1),
+                tx_index: Some(0),
+                event_ordinal: Some(0),
+                outer_instruction_index: None,
+                inner_group_index: None,
+                event_ts_ms: 100,
+                timestamp_ms: 100,
+                arrival_ts_ms: 101,
+                source: "grpc_global_stream".to_string(),
+                side: "buy".to_string(),
+                is_buy: true,
+                success: true,
+                error_code: None,
+                signer: "wallet".to_string(),
+                wallet: "wallet".to_string(),
+                quote_amount_sol: 1.0,
+                volume_sol: 1.0,
+                sol_amount_lamports: Some(1_000_000_000),
+                token_amount_units: Some(100),
+                reserve_base: None,
+                reserve_quote: None,
+                price_quote: None,
+                v_tokens_in_bonding_curve: None,
+                v_sol_in_bonding_curve: None,
+                market_cap_sol: None,
+                curve_progress_pct: None,
+                curve_progress_status: "unavailable_missing_curve_state_source".to_string(),
+                curve_finality: "speculative".to_string(),
+                curve_data_known: false,
+                execution_account_contract_status: "route_account_manifest_incomplete".to_string(),
+                execution_account_contract_reason: Some(
+                    "route_account_manifest_incomplete:missing_global_config".to_string(),
+                ),
+            }),
+        );
+
+        writeln!(
+            file,
+            "{}",
+            serde_json::to_string(&event).expect("serialize")
+        )
+        .expect("write event");
+
+        let metrics = EventValidator::validate_jsonl(file.path()).expect("validate");
+        assert_eq!(metrics.invariant_violations.len(), 0);
+        assert_eq!(metrics.valid_trajectories, 0);
     }
 
     #[test]

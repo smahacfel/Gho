@@ -651,6 +651,9 @@ def index_events_by_candidate(
 
 
 def event_side(row: dict[str, Any]) -> str | None:
+    success = bool_or_none(find_first_key(row, ("success", "tx_success")))
+    if success is False:
+        return None
     side = str_or_none(find_first_key(row, ("side", "trade_side", "direction")))
     if side:
         normalized = side.lower()
@@ -793,6 +796,10 @@ def build_feature_snapshot(
             if decision_context_source
             else "candidate_universe_decision_ts_ms"
         )
+    curve_progress_pct = latest_numeric(
+        cutoff_events,
+        ("curve_progress_pct", "bonding_curve_progress_pct", "bonding_curve_progress"),
+    )
     snapshot = {
         "selector_schema_version": SCHEMA_VERSION,
         "feature_snapshot_schema_version": SCHEMA_VERSION,
@@ -818,9 +825,9 @@ def build_feature_snapshot(
         "decision_cutoff_source": decision_cutoff_source,
         "source_event_count": len(cutoff_events),
         "tx_event_count": len(tx_events),
-        "curve_progress_pct": latest_numeric(
-            cutoff_events,
-            ("curve_progress_pct", "bonding_curve_progress_pct", "bonding_curve_progress"),
+        "curve_progress_pct": curve_progress_pct,
+        "curve_progress_status": (
+            "available" if curve_progress_pct is not None else "unavailable_missing_curve_state_source"
         ),
         "net_quote_in_15s": amount_until(15_000),
         "net_quote_in_30s": amount_until(30_000),
@@ -873,6 +880,7 @@ def build_incomplete_feature_snapshot(
         "source_event_count": 0,
         "tx_event_count": 0,
         "curve_progress_pct": None,
+        "curve_progress_status": reason,
         "net_quote_in_15s": None,
         "net_quote_in_30s": None,
         "trade_rate": None,

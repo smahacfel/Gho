@@ -155,7 +155,10 @@ pub fn generate_comparison_report(
             run_id = event.envelope.run_id.clone();
         }
 
-        if matches!(&event.kind, EventKind::NewPoolDetected(_)) {
+        if matches!(
+            &event.kind,
+            EventKind::NewPoolDetected(_) | EventKind::PoolTransaction(_)
+        ) {
             continue;
         }
 

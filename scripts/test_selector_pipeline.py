@@ -700,6 +700,122 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertEqual(rows[0]["source_event_count"], 0)
         self.assertEqual(rows[0]["feature_snapshot_status"], "feature_snapshot_incomplete")
 
+    def test_feature_snapshot_rolls_up_pool_transaction_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            candidates = root / "candidate_universe_v1.jsonl"
+            events = root / "events.jsonl"
+            write_jsonl(
+                candidates,
+                [
+                    {
+                        "candidate_id": "c1",
+                        "base_mint": "mint1",
+                        "pool_id": "pool1",
+                        "bonding_curve": "curve1",
+                        "quote_mint": "SOL",
+                        "birth_ts_ms": 1_000,
+                    }
+                ],
+            )
+            write_jsonl(
+                events,
+                [
+                    {
+                        "kind": {
+                            "type": "NewPoolDetected",
+                            "payload": {
+                                "is_birth_event": True,
+                                "base_mint": "mint1",
+                                "pool_id": "pool1",
+                                "bonding_curve": "curve1",
+                                "quote_mint": "SOL",
+                                "birth_ts_ms": 1_000,
+                                "slot": 10,
+                            },
+                        }
+                    },
+                    {
+                        "kind": {
+                            "type": "PoolTransaction",
+                            "payload": {
+                                "base_mint": "mint1",
+                                "pool_id": "pool1",
+                                "bonding_curve": "curve1",
+                                "quote_mint": "SOL",
+                                "timestamp_ms": 2_000,
+                                "slot": 11,
+                                "side": "buy",
+                                "is_buy": True,
+                                "success": True,
+                                "signer": "buyer-a",
+                                "wallet": "buyer-a",
+                                "quote_amount_sol": 1.5,
+                            },
+                        }
+                    },
+                    {
+                        "kind": {
+                            "type": "PoolTransaction",
+                            "payload": {
+                                "base_mint": "mint1",
+                                "pool_id": "pool1",
+                                "bonding_curve": "curve1",
+                                "quote_mint": "SOL",
+                                "timestamp_ms": 3_000,
+                                "slot": 12,
+                                "side": "sell",
+                                "is_buy": False,
+                                "success": True,
+                                "signer": "seller-b",
+                                "wallet": "seller-b",
+                                "quote_amount_sol": 0.5,
+                            },
+                        }
+                    },
+                    {
+                        "kind": {
+                            "type": "PoolTransaction",
+                            "payload": {
+                                "base_mint": "mint1",
+                                "pool_id": "pool1",
+                                "bonding_curve": "curve1",
+                                "quote_mint": "SOL",
+                                "timestamp_ms": 4_000,
+                                "slot": 13,
+                                "side": "buy",
+                                "is_buy": True,
+                                "success": False,
+                                "signer": "failed-buyer",
+                                "wallet": "failed-buyer",
+                                "quote_amount_sol": 9.0,
+                            },
+                        }
+                    },
+                ],
+            )
+            rows, manifest = snapshots.build_feature_snapshots(
+                candidate_universe=candidates,
+                event_paths=[events],
+                decision_paths=[],
+                snapshot_kinds=["birth+5s"],
+            )
+
+        self.assertEqual(manifest["status"], "ok")
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["feature_snapshot_status"], "ok")
+        self.assertEqual(row["source_event_count"], 4)
+        self.assertEqual(row["tx_event_count"], 2)
+        self.assertEqual(row["unique_buyers"], 1)
+        self.assertAlmostEqual(row["net_quote_in_15s"], 1.0)
+        self.assertAlmostEqual(row["net_quote_in_30s"], 1.0)
+        self.assertAlmostEqual(row["trade_rate"], 0.4)
+        self.assertAlmostEqual(row["sell_share"], 0.5)
+        self.assertAlmostEqual(row["top1_wallet_share"], 0.75)
+        self.assertAlmostEqual(row["buyer_hhi"], 1.0)
+        self.assertEqual(row["curve_progress_status"], "unavailable_missing_curve_state_source")
+
     def test_feature_snapshot_decision_missing_cutoff_emits_incomplete_row(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -835,6 +951,62 @@ class SelectorPipelineTests(unittest.TestCase):
         by_id = {row["candidate_id"]: row for row in rows}
         self.assertFalse(by_id["non_sol"]["cohort_in_scope"])
         self.assertTrue(by_id["sol"]["cohort_in_scope"])
+
+    def test_candidate_universe_ignores_pool_transaction_denominator_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            events = root / "events.jsonl"
+            output = root / "candidate_universe_v1.jsonl"
+            write_jsonl(
+                events,
+                [
+                    {
+                        "kind": {
+                            "type": "NewPoolDetected",
+                            "payload": {
+                                "is_birth_event": True,
+                                "candidate_id": "birth-candidate",
+                                "base_mint": "mint1",
+                                "pool_id": "pool1",
+                                "bonding_curve": "curve1",
+                                "quote_mint": "SOL",
+                                "birth_ts_ms": 1_000,
+                            },
+                        }
+                    },
+                    {
+                        "kind": {
+                            "type": "PoolTransaction",
+                            "payload": {
+                                "candidate_id": "trade-only",
+                                "base_mint": "mint1",
+                                "pool_id": "pool1",
+                                "bonding_curve": "curve1",
+                                "quote_mint": "SOL",
+                                "timestamp_ms": 1_500,
+                                "side": "buy",
+                                "signer": "wallet1",
+                                "quote_amount_sol": 1.0,
+                                "success": True,
+                            },
+                        }
+                    },
+                ],
+            )
+            summary = universe.run(
+                universe.build_parser().parse_args(
+                    ["--events", str(events), "--output", str(output)]
+                )
+            )
+            rows = read_jsonl(output)
+
+        self.assertEqual(summary["status"], "ok")
+        self.assertEqual(summary["event_load"]["skipped_counts"]["non_birth_create_event"], 1)
+        self.assertEqual(summary["event_denominator_rows_after_dedupe"], 1)
+        self.assertEqual(summary["decision_logs_created_denominator_rows"], 0)
+        self.assertEqual(summary["candidate_ids_from_decision_only"], 0)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["candidate_id"], "birth-candidate")
 
     def test_candidate_universe_identity_collision_is_no_go(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
