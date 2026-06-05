@@ -22,6 +22,7 @@ import build_selector_r2only_baseline_report as r2only_baseline
 import build_selector_r2only_ablation_report as r2only_ablation
 import build_selector_r2only_feature_contribution as r2only_feature_contribution
 import build_selector_r2only_feature_audit as r2only_feature_audit
+import build_selector_r2only_model_candidate as r2only_model_candidate
 import build_selector_training_view as training
 import compare_selector_gatekeepers as compare
 import selector_pipeline_common as common
@@ -2307,7 +2308,7 @@ class SelectorPipelineTests(unittest.TestCase):
             "selector_r2only_baseline_report_v1.json": {"status": "P3B_PASS_R2_ONLY_BASELINE_DRAFT"},
             "selector_r2only_feature_audit_v1.json": {"status": "P3C_PASS_DIAGNOSTIC_ONLY"},
             "selector_r2only_ablation_report_v1.json": {"status": "P3C_PASS_DIAGNOSTIC_ONLY"},
-            "dataset_manifest_v1.json": {"phase2_status": "PASS"},
+            "dataset_manifest_v1.json": {"phase2_status": "PASS", "leakage_precheck": "PASS"},
         }.items():
             (report_dir / path).write_text(json.dumps(payload), encoding="utf-8")
         (report_dir / "FEATURE_RICH_R2_BASELINE_DECISION.md").write_text(
@@ -2430,6 +2431,121 @@ class SelectorPipelineTests(unittest.TestCase):
             top10["label_matrix"]["gatekeeper_accept_false|feature_top_true"]["positive"],
             1,
         )
+
+    def test_model_candidate_report_builds_diagnostic_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "selector-p3g-model-candidate-test"
+            self.write_feature_contribution_fixture(root, scope)
+            r2only_feature_contribution.build_report(
+                r2only_feature_contribution.build_parser().parse_args(
+                    ["--scope", scope, "--root", str(root)]
+                )
+            )
+
+            report = r2only_model_candidate.build_report(
+                r2only_model_candidate.build_parser().parse_args(
+                    [
+                        "--scope",
+                        scope,
+                        "--root",
+                        str(root),
+                        "--bootstrap-samples",
+                        "50",
+                        "--logistic-epochs",
+                        "20",
+                    ]
+                )
+            )
+            output_json_exists = Path(report["outputs"]["selector_r2only_model_candidate_v1"]).exists()
+            output_md_exists = Path(report["outputs"]["FEATURE_RICH_R2_MODEL_CANDIDATE"]).exists()
+
+        self.assertIn(
+            report["status"],
+            {
+                "P3G_PASS_DIAGNOSTIC_MODEL_CANDIDATE",
+                "P3G_DIAGNOSTIC_NO_GO_OR_NEEDS_MORE_DATA",
+            },
+        )
+        self.assertEqual(report["resolved_denominator_rows"], 9)
+        self.assertTrue(report["claim_boundaries"]["diagnostic_only"])
+        self.assertFalse(report["claim_boundaries"]["model_ready"])
+        self.assertFalse(report["claim_boundaries"]["production_ready"])
+        self.assertFalse(report["claim_boundaries"]["gatekeeper_tuned"])
+        self.assertTrue(output_json_exists)
+        self.assertTrue(output_md_exists)
+
+    def test_model_candidate_uses_resolved_r2_denominator_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "selector-p3g-resolved-only-test"
+            self.write_feature_contribution_fixture(root, scope)
+            r2only_feature_contribution.build_report(
+                r2only_feature_contribution.build_parser().parse_args(
+                    ["--scope", scope, "--root", str(root)]
+                )
+            )
+
+            report = r2only_model_candidate.build_report(
+                r2only_model_candidate.build_parser().parse_args(
+                    [
+                        "--scope",
+                        scope,
+                        "--root",
+                        str(root),
+                        "--bootstrap-samples",
+                        "50",
+                        "--logistic-epochs",
+                        "20",
+                    ]
+                )
+            )
+
+        self.assertEqual(report["training_rows"], 10)
+        self.assertEqual(report["resolved_denominator_rows"], 9)
+        self.assertEqual(report["split_counts"]["holdout"]["positive"], 1)
+        self.assertEqual(report["split_counts"]["holdout"]["negative"], 1)
+        self.assertNotIn("unresolved", json.dumps(report["candidates"], sort_keys=True))
+
+    def test_model_candidate_includes_simple_single_feature_and_logistic_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "selector-p3g-candidate-families-test"
+            self.write_feature_contribution_fixture(root, scope)
+            r2only_feature_contribution.build_report(
+                r2only_feature_contribution.build_parser().parse_args(
+                    ["--scope", scope, "--root", str(root)]
+                )
+            )
+
+            report = r2only_model_candidate.build_report(
+                r2only_model_candidate.build_parser().parse_args(
+                    [
+                        "--scope",
+                        scope,
+                        "--root",
+                        str(root),
+                        "--bootstrap-samples",
+                        "50",
+                        "--logistic-epochs",
+                        "20",
+                    ]
+                )
+            )
+
+        candidate_ids = {candidate["candidate_id"] for candidate in report["candidates"]}
+        self.assertIn("simple_feature_score_v1", candidate_ids)
+        self.assertIn("logistic_sanity_baseline", candidate_ids)
+        self.assertIn("single_feature_ranker:net_quote_in_15s", candidate_ids)
+        logistic = {
+            candidate["candidate_id"]: candidate for candidate in report["candidates"]
+        }["logistic_sanity_baseline"]
+        holdout_top10 = next(
+            item for item in logistic["by_split"]["holdout"]["precision_at_top_k"] if item["k"] == 10
+        )
+        self.assertIn("bootstrap_ci_precision", holdout_top10)
+        self.assertFalse(report["claim_boundaries"]["threshold_changes"])
+        self.assertFalse(report["claim_boundaries"]["runtime_changed"])
 
     def test_r2_market_paths_writes_one_row_per_candidate_and_missing_path_is_unresolved(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
