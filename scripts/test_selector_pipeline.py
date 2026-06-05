@@ -26,6 +26,7 @@ import build_selector_r2only_feature_audit as r2only_feature_audit
 import build_selector_r2only_model_candidate as r2only_model_candidate
 import build_selector_training_view as training
 import compare_selector_gatekeepers as compare
+import guard_gatekeeper_decision_feature_surface as gk_surface_guard
 import selector_pipeline_common as common
 import train_selector_baseline as baseline
 
@@ -43,6 +44,179 @@ def read_jsonl(path: Path) -> list[dict]:
 
 
 class SelectorPipelineTests(unittest.TestCase):
+    def write_gatekeeper_surface_guard_rows(
+        self,
+        root: Path,
+        *,
+        source_scope: str = "source-gk-surface-guard-test",
+        rows: list[dict] | None = None,
+    ) -> Path:
+        decision_dir = (
+            root
+            / "logs"
+            / "rollout"
+            / source_scope
+            / "decisions"
+            / source_scope
+            / "v2.5"
+            / "v25_shadow"
+            / "fixture"
+        )
+        decision_dir.mkdir(parents=True)
+        if rows is None:
+            rows = []
+            for idx in range(5):
+                rows.append(
+                    {
+                        "log_schema_version": 25,
+                        "decision_plane": "v25_shadow",
+                        "bonding_progress_pct": 40.0 + idx,
+                        "curve_data_known": True,
+                        "current_market_cap_sol": 50.0 + idx,
+                        "price_change_ratio": 1.0 + idx,
+                        "observation_duration_ms": 8_000,
+                        "curve_wait_ms": 800,
+                        "curve_wait_elapsed_ms": 8_000,
+                        "total_tx_evaluated": 10 + idx,
+                        "unique_signers_evaluated": 4 + idx,
+                        "buy_count": 3 + idx,
+                        "buy_ratio": 0.5,
+                        "sell_buy_ratio": 0.2,
+                        "hhi": 0.1 + idx,
+                        "top3_volume_pct": 0.2 + idx,
+                    }
+                )
+        path = decision_dir / "gatekeeper_v2_decisions.jsonl"
+        write_jsonl(path, rows)
+        return path
+
+    def test_gatekeeper_decision_feature_surface_guard_passes_required_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_scope = "source-gk-surface-pass"
+            self.write_gatekeeper_surface_guard_rows(root, source_scope=source_scope)
+
+            report = gk_surface_guard.build_guard(
+                gk_surface_guard.build_parser().parse_args(
+                    [
+                        "--source-scope",
+                        source_scope,
+                        "--root",
+                        str(root),
+                        "--decision-plane",
+                        "v25_shadow",
+                        "--min-rows",
+                        "5",
+                    ]
+                )
+            )
+            output_exists = Path(report["output"]).exists()
+
+        self.assertEqual(report["status"], "PASS")
+        self.assertEqual(report["decision_rows"], 5)
+        self.assertEqual(report["field_presence"]["bonding_progress_pct"]["present_rate"], 1.0)
+        self.assertEqual(report["field_presence"]["current_market_cap_sol"]["present_rate"], 1.0)
+        self.assertEqual(report["field_presence"]["hhi"]["present_rate"], 1.0)
+        self.assertFalse(report["claim_boundaries"]["runtime_changed"])
+        self.assertTrue(output_exists)
+
+    def test_gatekeeper_decision_feature_surface_guard_fails_without_curve_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_scope = "source-gk-surface-missing"
+            self.write_gatekeeper_surface_guard_rows(
+                root,
+                source_scope=source_scope,
+                rows=[
+                    {
+                        "log_schema_version": 25,
+                        "decision_plane": "v25_shadow",
+                        "observation_duration_ms": 8_000,
+                        "hhi": 0.1,
+                        "top3_volume_pct": 0.2,
+                    }
+                ],
+            )
+
+            report = gk_surface_guard.build_guard(
+                gk_surface_guard.build_parser().parse_args(
+                    [
+                        "--source-scope",
+                        source_scope,
+                        "--root",
+                        str(root),
+                        "--decision-plane",
+                        "v25_shadow",
+                        "--min-rows",
+                        "1",
+                    ]
+                )
+            )
+
+        self.assertEqual(report["status"], "FAIL_NO_REQUIRED_CURVE_METRICS")
+        self.assertIn("missing_required_curve_metrics", report["fail_reasons"][0])
+
+    def test_gatekeeper_decision_feature_surface_guard_uses_lower_concentration_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_scope = "source-gk-surface-concentration"
+            rows = []
+            for idx in range(10):
+                row = {
+                    "log_schema_version": 25,
+                    "decision_plane": "v25_shadow",
+                    "bonding_progress_pct": 40.0 + idx,
+                    "curve_data_known": True,
+                    "current_market_cap_sol": 50.0 + idx,
+                    "price_change_ratio": 1.0 + idx,
+                    "observation_duration_ms": 8_000,
+                    "curve_wait_ms": 800,
+                    "curve_wait_elapsed_ms": 8_000,
+                    "total_tx_evaluated": 10 + idx,
+                    "unique_signers_evaluated": 4 + idx,
+                    "buy_count": 3 + idx,
+                }
+                if idx < 6:
+                    row["hhi"] = 0.1 + idx
+                    row["top3_volume_pct"] = 0.2 + idx
+                rows.append(row)
+            self.write_gatekeeper_surface_guard_rows(root, source_scope=source_scope, rows=rows)
+
+            pass_report = gk_surface_guard.build_guard(
+                gk_surface_guard.build_parser().parse_args(
+                    [
+                        "--source-scope",
+                        source_scope,
+                        "--root",
+                        str(root),
+                        "--decision-plane",
+                        "v25_shadow",
+                        "--min-rows",
+                        "10",
+                    ]
+                )
+            )
+            fail_report = gk_surface_guard.build_guard(
+                gk_surface_guard.build_parser().parse_args(
+                    [
+                        "--source-scope",
+                        source_scope,
+                        "--root",
+                        str(root),
+                        "--decision-plane",
+                        "v25_shadow",
+                        "--min-rows",
+                        "10",
+                        "--concentration-metric-min-present-rate",
+                        "0.80",
+                    ]
+                )
+            )
+
+        self.assertEqual(pass_report["status"], "PASS")
+        self.assertEqual(pass_report["field_presence"]["hhi"]["present_rate"], 0.6)
+        self.assertEqual(fail_report["status"], "FAIL_LOW_CONCENTRATION_COVERAGE")
+
     def write_gatekeeper_context_fixture(
         self,
         root: Path,
