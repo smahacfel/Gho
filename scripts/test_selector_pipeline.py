@@ -20,6 +20,7 @@ import build_selector_phase3_r2only as phase3_r2only
 import build_selector_r2_market_paths as r2_paths
 import build_selector_r2only_baseline_report as r2only_baseline
 import build_selector_r2only_ablation_report as r2only_ablation
+import build_selector_r2only_feature_contribution as r2only_feature_contribution
 import build_selector_r2only_feature_audit as r2only_feature_audit
 import build_selector_training_view as training
 import compare_selector_gatekeepers as compare
@@ -2236,6 +2237,199 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertFalse(report["claim_boundaries"]["model_ready"])
         self.assertFalse(report["claim_boundaries"]["gatekeeper_tuning_started"])
         self.assertFalse(report["claim_boundaries"]["production_promotion_claim"])
+
+    def write_feature_contribution_fixture(self, root: Path, scope: str) -> list[dict]:
+        dataset_dir = root / "datasets" / "selector" / scope
+        report_dir = root / "reports" / "selector" / scope
+        dataset_dir.mkdir(parents=True)
+        report_dir.mkdir(parents=True)
+        rows: list[dict] = []
+        labels = [
+            ("train", "positive", True, 1.0, 0),
+            ("train", "negative", False, 2.0, 1),
+            ("train", "positive", False, 3.0, 2),
+            ("train", "negative", True, 4.0, 3),
+            ("train", "positive", False, 5.0, 4),
+            ("validation", "positive", False, 1.5, 5),
+            ("validation", "negative", True, 4.5, 6),
+            ("holdout", "positive", False, 1.2, 7),
+            ("holdout", "negative", True, 4.8, 8),
+        ]
+        for split, label, accepted, net_quote, idx in labels:
+            rows.append(
+                {
+                    "candidate_id": f"fc{idx}",
+                    "base_mint": f"mint{idx}",
+                    "birth_ts_ms": 1_000 + idx,
+                    "split": split,
+                    "cohort_in_scope": True,
+                    "stream_completeness_ok": True,
+                    "feature_snapshot_status": "ok",
+                    "r2_label": label,
+                    "r2_status": "resolved",
+                    "r2_path_coverage_ok": True,
+                    "r2_horizon_matured": True,
+                    "decision_verdict_buy": accepted,
+                    "net_quote_in_15s": net_quote,
+                    "net_quote_in_30s": net_quote * 2.0,
+                    "trade_rate": float(10 - idx),
+                    "unique_buyers": 2 + idx,
+                    "sell_share": 0.10 + (idx * 0.01),
+                    "top1_wallet_share": 0.20 + (idx * 0.01),
+                    "buyer_hhi": 0.30 + (idx * 0.01),
+                }
+            )
+        rows.append(
+            {
+                "candidate_id": "unresolved",
+                "base_mint": "mint-unresolved",
+                "birth_ts_ms": 9_999,
+                "split": "holdout",
+                "cohort_in_scope": True,
+                "stream_completeness_ok": True,
+                "feature_snapshot_status": "ok",
+                "r2_label": None,
+                "r2_status": "horizon_unmatured",
+                "r2_path_coverage_ok": True,
+                "r2_horizon_matured": False,
+                "decision_verdict_buy": True,
+                "net_quote_in_15s": 99.0,
+                "net_quote_in_30s": 99.0,
+                "trade_rate": 99.0,
+                "unique_buyers": 99,
+                "sell_share": 0.99,
+                "top1_wallet_share": 0.99,
+                "buyer_hhi": 0.99,
+            }
+        )
+        write_jsonl(dataset_dir / "selector_training_view_v1.jsonl", rows)
+        for path, payload in {
+            "selector_r2only_baseline_report_v1.json": {"status": "P3B_PASS_R2_ONLY_BASELINE_DRAFT"},
+            "selector_r2only_feature_audit_v1.json": {"status": "P3C_PASS_DIAGNOSTIC_ONLY"},
+            "selector_r2only_ablation_report_v1.json": {"status": "P3C_PASS_DIAGNOSTIC_ONLY"},
+            "dataset_manifest_v1.json": {"phase2_status": "PASS"},
+        }.items():
+            (report_dir / path).write_text(json.dumps(payload), encoding="utf-8")
+        (report_dir / "FEATURE_RICH_R2_BASELINE_DECISION.md").write_text(
+            "P3E_PASS_FEATURE_RICH_R2_BASELINE_DRAFT\n",
+            encoding="utf-8",
+        )
+        return rows
+
+    def test_feature_contribution_report_builds_diagnostic_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "selector-p3f-feature-contribution-test"
+            self.write_feature_contribution_fixture(root, scope)
+
+            report = r2only_feature_contribution.build_report(
+                r2only_feature_contribution.build_parser().parse_args(
+                    ["--scope", scope, "--root", str(root)]
+                )
+            )
+            output_json_exists = Path(report["outputs"]["selector_r2only_feature_contribution_v1"]).exists()
+            output_md_exists = Path(report["outputs"]["FEATURE_RICH_R2_FEATURE_CONTRIBUTION"]).exists()
+
+        self.assertEqual(report["status"], "P3F_PASS_FEATURE_CONTRIBUTION_DIAGNOSTIC")
+        self.assertEqual(report["resolved_denominator_rows"], 9)
+        self.assertEqual(report["positive_rows"], 5)
+        self.assertEqual(report["negative_rows"], 4)
+        self.assertTrue(report["claim_boundaries"]["diagnostic_only"])
+        self.assertFalse(report["claim_boundaries"]["model_ready"])
+        self.assertFalse(report["claim_boundaries"]["production_ready"])
+        self.assertFalse(report["claim_boundaries"]["gatekeeper_tuned"])
+        self.assertFalse(report["claim_boundaries"]["threshold_changes"])
+        self.assertFalse(report["claim_boundaries"]["runtime_changed"])
+        self.assertIn("net_quote_in_15s", report["available_features_used"])
+        self.assertTrue(output_json_exists)
+        self.assertTrue(output_md_exists)
+
+    def test_feature_contribution_uses_resolved_r2_denominator_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "selector-p3f-resolved-only-test"
+            self.write_feature_contribution_fixture(root, scope)
+
+            report = r2only_feature_contribution.build_report(
+                r2only_feature_contribution.build_parser().parse_args(
+                    ["--scope", scope, "--root", str(root)]
+                )
+            )
+
+        self.assertEqual(report["training_rows"], 10)
+        self.assertEqual(report["resolved_denominator_rows"], 9)
+        self.assertNotIn("unresolved", json.dumps(report["examples"], sort_keys=True))
+        self.assertEqual(report["split_counts"]["holdout"]["positive"], 1)
+        self.assertEqual(report["split_counts"]["holdout"]["negative"], 1)
+
+    def test_feature_contribution_bins_are_train_derived(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "selector-p3f-train-bins-test"
+            self.write_feature_contribution_fixture(root, scope)
+
+            report = r2only_feature_contribution.build_report(
+                r2only_feature_contribution.build_parser().parse_args(
+                    ["--scope", scope, "--root", str(root)]
+                )
+            )
+
+        edges = report["feature_bins"]["net_quote_in_15s"]["train_edges"]
+        self.assertEqual(edges, [1.0, 1.8, 2.6, 3.4, 4.2, 5.0])
+        holdout_bins = report["feature_bins"]["net_quote_in_15s"]["splits"]["holdout"]
+        self.assertEqual(sum(item["rows"] for item in holdout_bins), 2)
+        self.assertEqual(holdout_bins[0]["rows"], 1)
+        self.assertEqual(holdout_bins[4]["rows"], 1)
+
+    def test_feature_contribution_does_not_claim_model_or_production(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "selector-p3f-claims-test"
+            self.write_feature_contribution_fixture(root, scope)
+
+            report = r2only_feature_contribution.build_report(
+                r2only_feature_contribution.build_parser().parse_args(
+                    ["--scope", scope, "--root", str(root)]
+                )
+            )
+
+        self.assertIn("recommended_next_step", report["interpretation"])
+        self.assertEqual(report["phase"], "phase3")
+        self.assertEqual(report["dataset_kind"], "r2_only")
+        self.assertTrue(report["claim_boundaries"]["diagnostic_only"])
+        self.assertFalse(any(
+            report["claim_boundaries"][key]
+            for key in (
+                "model_ready",
+                "production_ready",
+                "gatekeeper_tuned",
+                "threshold_changes",
+                "runtime_changed",
+            )
+        ))
+
+    def test_feature_contribution_accept_vs_feature_score_overlap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "selector-p3f-overlap-test"
+            self.write_feature_contribution_fixture(root, scope)
+
+            report = r2only_feature_contribution.build_report(
+                r2only_feature_contribution.build_parser().parse_args(
+                    ["--scope", scope, "--root", str(root)]
+                )
+            )
+
+        top10 = report["gatekeeper_vs_feature_score"]["holdout"]["top10"]
+        self.assertEqual(top10["bucket_metrics"]["overlap"]["rows"], 1)
+        self.assertEqual(top10["bucket_metrics"]["feature_only"]["rows"], 1)
+        self.assertEqual(top10["bucket_metrics"]["gatekeeper_only"]["rows"], 0)
+        self.assertEqual(top10["feature_top_rejected_by_gatekeeper"], 1)
+        self.assertEqual(top10["gatekeeper_accepted_outside_feature_top"], 0)
+        self.assertEqual(
+            top10["label_matrix"]["gatekeeper_accept_false|feature_top_true"]["positive"],
+            1,
+        )
 
     def test_r2_market_paths_writes_one_row_per_candidate_and_missing_path_is_unresolved(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
