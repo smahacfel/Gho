@@ -34,6 +34,80 @@ def choose_feature(
     )
 
 
+def load_gatekeeper_feature_context(
+    path: Path | None,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    if path is None:
+        return {}, {
+            "enabled": False,
+            "rows": 0,
+            "joined_rows": 0,
+            "valid_for_model_rows": 0,
+            "context_status_counts": {},
+            "cutoff_status_counts": {},
+            "feature_columns": [],
+            "model_feature_columns": [],
+        }
+    if not path.exists():
+        raise FileNotFoundError(path)
+    rows = list(common.iter_json_objects(path))
+    indexed: dict[str, dict[str, Any]] = {}
+    status_counts: Counter[str] = Counter()
+    cutoff_counts: Counter[str] = Counter()
+    feature_columns = sorted({key for row in rows for key in row if key.startswith("gk_")})
+    model_feature_columns = [
+        column
+        for column in feature_columns
+        if column
+        not in {
+            "gk_log_schema_version",
+            "gk_decision_plane",
+            "gk_observation_profile",
+            "gk_context_status",
+            "gk_cutoff_status",
+        }
+    ]
+    valid_for_model_rows = 0
+    for row in rows:
+        candidate_id = common.str_or_none(row.get("candidate_id"))
+        if not candidate_id:
+            continue
+        indexed[candidate_id] = row
+        status_counts[str(row.get("gk_context_status") or "unknown")] += 1
+        cutoff_counts[str(row.get("gk_cutoff_status") or "unknown")] += 1
+        if row.get("gk_context_status") == "ok" and row.get("gk_cutoff_status") in {
+            "ok",
+            "same_decision_time",
+        }:
+            valid_for_model_rows += 1
+    return indexed, {
+        "enabled": True,
+        "path": str(path),
+        "rows": len(rows),
+        "joined_rows": len(indexed),
+        "valid_for_model_rows": valid_for_model_rows,
+        "context_status_counts": common.counter_dict(status_counts),
+        "cutoff_status_counts": common.counter_dict(cutoff_counts),
+        "feature_columns": feature_columns,
+        "model_feature_columns": model_feature_columns,
+    }
+
+
+def attach_gatekeeper_context(row: dict[str, Any], context: dict[str, Any] | None) -> None:
+    if context is None:
+        return
+    for key, value in context.items():
+        if key.startswith("gk_") or key in {
+            "gk_context_status",
+            "gk_cutoff_status",
+            "gk_observation_profile",
+        }:
+            row[key] = value
+    row["gatekeeper_feature_context_joined"] = True
+    row["gatekeeper_feature_context_join_method"] = context.get("join_method")
+    row["gatekeeper_feature_context_source"] = context.get("source")
+
+
 def r2_training_denominator(row: dict[str, Any]) -> bool:
     return bool(
         row.get("cohort_in_scope") is True
@@ -133,6 +207,7 @@ def build_training_view(
     snapshot_kind: str,
     fallback_snapshot_kind: str,
     split_denominator: str = "candidate_universe",
+    gatekeeper_feature_context: Path | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
     candidates = list(common.iter_json_objects(candidate_universe))
     accepted_rows = list(common.iter_json_objects(accepted_lifecycle))
@@ -145,6 +220,9 @@ def build_training_view(
     splits = common.choose_temporal_split(candidates)
     candidate_identity_index, candidate_identity_ambiguous = common.build_identity_join_index(candidates)
     lifecycle_scope = candidate_time_scope(candidates, horizon_ms=horizon_ms)
+    gatekeeper_context_by_candidate, gatekeeper_context_summary = load_gatekeeper_feature_context(
+        gatekeeper_feature_context
+    )
 
     rows: list[dict[str, Any]] = []
     universe_candidate_ids = {
@@ -289,6 +367,7 @@ def build_training_view(
             "execution_realization_available": lifecycle is not None,
             "phase3_dataset_kind": "r2_only",
             "label_resolved": r2.get("r2_label") in {"positive", "negative"},
+            "gatekeeper_feature_context_joined": False,
         }
         if feature:
             for key, value in feature.items():
@@ -321,6 +400,7 @@ def build_training_view(
                 "final_pnl_pct",
             ):
                 row[key] = lifecycle.get(key)
+        attach_gatekeeper_context(row, gatekeeper_context_by_candidate.get(candidate_id))
         row.update(r2)
         row["r2_label_resolved"] = row.get("r2_label") in {"positive", "negative"}
         row["label_resolved"] = row["r2_label_resolved"]
@@ -383,6 +463,19 @@ def build_training_view(
         "precision_r2_holdout_denominator": common.r2_counts(
             dict(row, selector_accept=row.get("decision_verdict_buy") is True) for row in rows
         ),
+        "gatekeeper_feature_context": {
+            **gatekeeper_context_summary,
+            "training_rows_joined": sum(
+                1 for row in rows if row.get("gatekeeper_feature_context_joined") is True
+            ),
+            "training_valid_for_model_rows": sum(
+                1
+                for row in rows
+                if row.get("gatekeeper_feature_context_joined") is True
+                and row.get("gk_context_status") == "ok"
+                and row.get("gk_cutoff_status") in {"ok", "same_decision_time"}
+            ),
+        },
     }
     return rows, coverage, leakage_audit(feature_rows)
 
@@ -406,6 +499,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["candidate_universe", "resolved_r2"],
         default="candidate_universe",
     )
+    parser.add_argument("--gatekeeper-feature-context", type=Path)
     parser.add_argument("--json", action="store_true")
     return parser
 
@@ -422,6 +516,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         snapshot_kind=args.snapshot_kind,
         fallback_snapshot_kind=args.fallback_snapshot_kind,
         split_denominator=args.split_denominator,
+        gatekeeper_feature_context=args.gatekeeper_feature_context,
     )
     common.write_jsonl(args.output, rows)
     if args.label_coverage_output:

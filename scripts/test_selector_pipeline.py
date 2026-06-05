@@ -14,6 +14,7 @@ import build_selector_candidate_universe as universe
 import build_selector_canonical_r2_source as canonical_r2
 import build_selector_dataset as dataset
 import build_selector_feature_snapshots as snapshots
+import build_selector_gatekeeper_feature_context as gk_context
 import build_selector_phase1_report as phase1_report
 import build_selector_phase2 as phase2
 import build_selector_phase3_r2only as phase3_r2only
@@ -42,6 +43,439 @@ def read_jsonl(path: Path) -> list[dict]:
 
 
 class SelectorPipelineTests(unittest.TestCase):
+    def write_gatekeeper_context_fixture(
+        self,
+        root: Path,
+        *,
+        scope: str = "selector-gk-context-test",
+        source_scope: str = "source-gk-context-test",
+        observation_duration_ms: int = 8_000,
+        candidate_decision_ts_ms: int | None = 9_000,
+    ) -> tuple[Path, Path]:
+        dataset_dir = root / "datasets" / "selector" / scope
+        decision_dir = (
+            root
+            / "logs"
+            / "rollout"
+            / source_scope
+            / "decisions"
+            / source_scope
+            / "v2.5"
+            / "v25_shadow"
+            / "fixture"
+        )
+        dataset_dir.mkdir(parents=True)
+        decision_dir.mkdir(parents=True)
+        candidate = {
+            "candidate_id": "candidate",
+            "candidate_universe_status": "ok",
+            "cohort_in_scope": True,
+            "stream_completeness_ok": True,
+            "base_mint": "mint",
+            "mint_id": "mint",
+            "pool_id": "pool",
+            "bonding_curve": "pool",
+            "quote_mint": "SOL",
+            "birth_ts_ms": 1_000,
+        }
+        if candidate_decision_ts_ms is not None:
+            candidate["decision_ts_ms"] = candidate_decision_ts_ms
+        write_jsonl(dataset_dir / "candidate_universe_v1.jsonl", [candidate])
+        write_jsonl(
+            decision_dir / "gatekeeper_v2_decisions.jsonl",
+            [
+                {
+                    "log_schema_version": 25,
+                    "pool_id": "pool",
+                    "join_key": "pool:mint:1000",
+                    "base_mint": "mint",
+                    "first_seen_ts_ms": 1_000,
+                    "observation_start_ts_ms": 1_000,
+                    "observation_end_ts_ms": 1_000 + observation_duration_ms,
+                    "observation_window_ms": observation_duration_ms,
+                    "observation_duration_ms": observation_duration_ms,
+                    "decision_plane": "v25_shadow",
+                    "bonding_progress_pct": 46.0,
+                    "current_market_cap_sol": 48.7,
+                    "price_change_ratio": 1.6,
+                    "hhi": 0.04,
+                    "top3_volume_pct": 0.27,
+                    "funding_source_diagnostics": {
+                        "buyer_sample_count": 10,
+                        "known_source_count": 3,
+                        "unknown_buyer_count": 2,
+                    },
+                    "vectors_prices": [1.0, 1.5, 1.25],
+                    "vectors_sol_amounts": [0.1, 0.2, 0.3],
+                    "vectors_ts_offsets_ms": [0, 500, 1_000],
+                    "decision_verdict_buy": True,
+                    "verdict_type": "BUY",
+                    "decision_reason": "BUY fixture",
+                }
+            ],
+        )
+        return dataset_dir / "candidate_universe_v1.jsonl", decision_dir / "gatekeeper_v2_decisions.jsonl"
+
+    def build_gatekeeper_context_fixture(
+        self,
+        root: Path,
+        *,
+        scope: str = "selector-gk-context-test",
+        source_scope: str = "source-gk-context-test",
+        observation_profile: str = "observation_8s_10s",
+        observation_duration_ms: int = 8_000,
+        candidate_decision_ts_ms: int | None = 9_000,
+    ) -> dict:
+        self.write_gatekeeper_context_fixture(
+            root,
+            scope=scope,
+            source_scope=source_scope,
+            observation_duration_ms=observation_duration_ms,
+            candidate_decision_ts_ms=candidate_decision_ts_ms,
+        )
+        return gk_context.run(
+            gk_context.build_parser().parse_args(
+                [
+                    "--root",
+                    str(root),
+                    "--scope",
+                    scope,
+                    "--source-scope",
+                    source_scope,
+                    "--decision-plane",
+                    "v25_shadow",
+                    "--observation-profile",
+                    observation_profile,
+                ]
+            )
+        )
+
+    def test_gatekeeper_feature_context_extracts_allowed_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            summary = self.build_gatekeeper_context_fixture(root)
+            rows = read_jsonl(Path(summary["outputs"]["gatekeeper_feature_context_v1"]))
+
+        self.assertEqual(summary["manifest"]["status"], "PASS")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["gk_bonding_progress_pct"], 46.0)
+        self.assertEqual(rows[0]["gk_current_market_cap_sol"], 48.7)
+        self.assertEqual(rows[0]["gk_price_change_ratio"], 1.6)
+        self.assertEqual(rows[0]["gk_hhi"], 0.04)
+        self.assertEqual(rows[0]["gk_top3_volume_pct"], 0.27)
+        self.assertEqual(rows[0]["gk_fsc_known_source_rate"], 0.3)
+        self.assertEqual(rows[0]["gk_vector_event_count"], 3)
+
+    def test_gatekeeper_feature_context_rejects_forbidden_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            summary = self.build_gatekeeper_context_fixture(root)
+            row = read_jsonl(Path(summary["outputs"]["gatekeeper_feature_context_v1"]))[0]
+
+        self.assertEqual(summary["manifest"]["forbidden_fields_detected"], [])
+        self.assertNotIn("decision_verdict_buy", row)
+        self.assertNotIn("verdict_type", row)
+        self.assertNotIn("decision_reason", row)
+        self.assertNotIn("gk_decision_verdict_buy", row)
+
+    def test_gatekeeper_feature_context_does_not_create_denominator(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "selector-gk-denominator-test"
+            source_scope = "source-gk-denominator-test"
+            self.write_gatekeeper_context_fixture(root, scope=scope, source_scope=source_scope)
+            decision_path = next(
+                (
+                    root
+                    / "logs"
+                    / "rollout"
+                    / source_scope
+                    / "decisions"
+                ).glob("**/gatekeeper_v2_decisions.jsonl")
+            )
+            with decision_path.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    json.dumps(
+                        {
+                            "log_schema_version": 25,
+                            "pool_id": "unmatched_pool",
+                            "base_mint": "unmatched_mint",
+                            "first_seen_ts_ms": 1_000,
+                            "observation_end_ts_ms": 9_000,
+                            "observation_duration_ms": 8_000,
+                            "decision_plane": "v25_shadow",
+                            "bonding_progress_pct": 99.0,
+                            "current_market_cap_sol": 99.0,
+                        }
+                    )
+                    + "\n"
+                )
+
+            summary = gk_context.run(
+                gk_context.build_parser().parse_args(
+                    [
+                        "--root",
+                        str(root),
+                        "--scope",
+                        scope,
+                        "--source-scope",
+                        source_scope,
+                    ]
+                )
+            )
+            rows = read_jsonl(Path(summary["outputs"]["gatekeeper_feature_context_v1"]))
+
+        self.assertEqual(summary["manifest"]["denominator_created_rows"], 0)
+        self.assertEqual(summary["manifest"]["join_method_counts"]["unmatched"], 1)
+        self.assertEqual([row["candidate_id"] for row in rows], ["candidate"])
+
+    def test_gatekeeper_feature_context_joins_by_pool_id_base_mint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            summary = self.build_gatekeeper_context_fixture(root)
+            row = read_jsonl(Path(summary["outputs"]["gatekeeper_feature_context_v1"]))[0]
+
+        self.assertEqual(row["join_method"], "pool_id_base_mint")
+        self.assertEqual(summary["manifest"]["join_method_counts"]["pool_id_base_mint"], 1)
+
+    def test_gatekeeper_feature_context_classifies_observation_8s_10s(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            summary = self.build_gatekeeper_context_fixture(root, observation_duration_ms=8_000)
+            row = read_jsonl(Path(summary["outputs"]["gatekeeper_feature_context_v1"]))[0]
+
+        self.assertEqual(row["gk_observation_profile"], "observation_8s_10s")
+        self.assertEqual(summary["manifest"]["observation_profile_counts"]["observation_8s_10s"], 1)
+
+    def test_gatekeeper_feature_context_classifies_observation_60s(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            summary = self.build_gatekeeper_context_fixture(
+                root,
+                observation_profile="observation_60s",
+                observation_duration_ms=60_000,
+                candidate_decision_ts_ms=61_000,
+            )
+            row = read_jsonl(Path(summary["outputs"]["gatekeeper_feature_context_v1"]))[0]
+
+        self.assertEqual(row["gk_observation_profile"], "observation_60s")
+        self.assertEqual(summary["manifest"]["observation_profile_counts"]["observation_60s"], 1)
+
+    def test_gatekeeper_feature_context_marks_unverified_cutoff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            summary = self.build_gatekeeper_context_fixture(root, candidate_decision_ts_ms=None)
+            row = read_jsonl(Path(summary["outputs"]["gatekeeper_feature_context_v1"]))[0]
+
+        self.assertEqual(row["gk_cutoff_status"], "unverified")
+
+    def test_training_view_joins_gatekeeper_feature_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            candidate_universe = root / "candidate_universe_v1.jsonl"
+            accepted_lifecycle = root / "accepted_lifecycle_v1.jsonl"
+            feature_snapshots = root / "feature_snapshots_v1.jsonl"
+            r2_paths_file = root / "r2_market_paths_v1.jsonl"
+            gatekeeper_context = root / "gatekeeper_feature_context_v1.jsonl"
+            write_jsonl(
+                candidate_universe,
+                [
+                    {
+                        "candidate_id": "candidate",
+                        "candidate_universe_status": "ok",
+                        "cohort_in_scope": True,
+                        "stream_completeness_ok": True,
+                        "base_mint": "mint",
+                        "pool_id": "pool",
+                        "bonding_curve": "curve",
+                        "quote_mint": "SOL",
+                        "birth_ts_ms": 1_000,
+                        "decision_ts_ms": 9_000,
+                    }
+                ],
+            )
+            write_jsonl(accepted_lifecycle, [])
+            write_jsonl(
+                feature_snapshots,
+                [
+                    {
+                        "candidate_id": "candidate",
+                        "snapshot_kind": "decision",
+                        "feature_snapshot_status": "ok",
+                        "feature_cutoff_ts_ms": 9_000,
+                        "feature_cutoff_slot": 1,
+                        "feature_source": "unit_test_feature_snapshot",
+                        "feature_source_max_ts_ms": 9_000,
+                        "feature_observed_lag_ms": 0,
+                    }
+                ],
+            )
+            write_jsonl(r2_paths_file, [])
+            write_jsonl(
+                gatekeeper_context,
+                [
+                    {
+                        "schema_version": "gatekeeper_feature_context_v1",
+                        "candidate_id": "candidate",
+                        "gk_context_status": "ok",
+                        "gk_cutoff_status": "same_decision_time",
+                        "gk_observation_profile": "observation_8s_10s",
+                        "gk_bonding_progress_pct": 46.0,
+                    }
+                ],
+            )
+
+            rows, coverage, _audit = training.build_training_view(
+                candidate_universe=candidate_universe,
+                accepted_lifecycle=accepted_lifecycle,
+                feature_snapshots=feature_snapshots,
+                price_paths=r2_paths_file,
+                target_net_pct=40.0,
+                stop_net_pct=40.0,
+                horizon_ms=60_000,
+                snapshot_kind="decision",
+                fallback_snapshot_kind="birth+30s",
+                gatekeeper_feature_context=gatekeeper_context,
+            )
+
+        self.assertEqual(rows[0]["gk_bonding_progress_pct"], 46.0)
+        self.assertEqual(rows[0]["gk_cutoff_status"], "same_decision_time")
+        self.assertTrue(rows[0]["gatekeeper_feature_context_joined"])
+        self.assertTrue(coverage["gatekeeper_feature_context"]["enabled"])
+        self.assertEqual(coverage["gatekeeper_feature_context"]["training_rows_joined"], 1)
+
+    def test_phase3_r2only_passes_gatekeeper_feature_context_to_training_view(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "selector-phase3-gk-context-test"
+            dataset_dir = root / "datasets" / "selector" / scope
+            report_dir = root / "reports" / "selector" / scope
+            dataset_dir.mkdir(parents=True)
+            report_dir.mkdir(parents=True)
+            write_jsonl(
+                dataset_dir / "candidate_universe_v1.jsonl",
+                [
+                    {
+                        "candidate_id": "candidate",
+                        "candidate_universe_status": "ok",
+                        "cohort_in_scope": True,
+                        "stream_completeness_ok": True,
+                        "base_mint": "mint",
+                        "pool_id": "pool",
+                        "bonding_curve": "curve",
+                        "quote_mint": "SOL",
+                        "birth_ts_ms": 1_000,
+                        "decision_ts_ms": 9_000,
+                    }
+                ],
+            )
+            write_jsonl(dataset_dir / "accepted_lifecycle_v1.jsonl", [])
+            write_jsonl(
+                dataset_dir / "feature_snapshots_v1.jsonl",
+                [
+                    {
+                        "candidate_id": "candidate",
+                        "snapshot_kind": "decision",
+                        "feature_snapshot_status": "ok",
+                        "feature_cutoff_ts_ms": 9_000,
+                        "feature_cutoff_slot": 1,
+                        "feature_source": "unit_test_feature_snapshot",
+                        "feature_source_max_ts_ms": 9_000,
+                        "feature_observed_lag_ms": 0,
+                    }
+                ],
+            )
+            write_jsonl(
+                dataset_dir / "r2_market_paths_v1.jsonl",
+                [
+                    {
+                        "candidate_id": "candidate",
+                        "base_mint": "mint",
+                        "pool_id": "pool",
+                        "bonding_curve": "curve",
+                        "path_source": "yellowstone_accountupdate",
+                        "path_status": "ok",
+                        "path_coverage_ok": True,
+                        "horizon_matured": True,
+                        "samples": [
+                            {"offset_ms": 0, "return_pct": 0.0},
+                            {"offset_ms": 60_000, "return_pct": -5.0},
+                        ],
+                    }
+                ],
+            )
+            gatekeeper_context = dataset_dir / "gatekeeper_feature_context_v1.jsonl"
+            write_jsonl(
+                gatekeeper_context,
+                [
+                    {
+                        "schema_version": "gatekeeper_feature_context_v1",
+                        "candidate_id": "candidate",
+                        "gk_context_status": "ok",
+                        "gk_cutoff_status": "same_decision_time",
+                        "gk_observation_profile": "observation_8s_10s",
+                        "gk_bonding_progress_pct": 46.0,
+                    }
+                ],
+            )
+            (report_dir / "dataset_manifest_v1.json").write_text(
+                json.dumps(
+                    {
+                        "denominator_source": "event_artifact_only",
+                        "phase2_status": "P2C_PASS_LABEL_COVERAGE_R2_ONLY",
+                        "r2_resolved_denominator_built": True,
+                        "selector_training_view_built": False,
+                        "baseline_built": False,
+                        "gatekeeper_compare_built": False,
+                        "outputs": {
+                            "candidate_universe_v1": {
+                                "path": str(dataset_dir / "candidate_universe_v1.jsonl")
+                            },
+                            "accepted_lifecycle_v1": {
+                                "path": str(dataset_dir / "accepted_lifecycle_v1.jsonl")
+                            },
+                            "feature_snapshots_v1": {
+                                "path": str(dataset_dir / "feature_snapshots_v1.jsonl")
+                            },
+                            "r2_market_paths_v1": {
+                                "path": str(dataset_dir / "r2_market_paths_v1.jsonl")
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            manifest = phase3_r2only.run(
+                phase3_r2only.build_parser().parse_args(
+                    [
+                        "--scope",
+                        scope,
+                        "--root",
+                        str(root),
+                        "--gatekeeper-feature-context",
+                        str(gatekeeper_context),
+                        "--min-resolved-rows",
+                        "1",
+                    ]
+                )
+            )
+            training_rows = read_jsonl(dataset_dir / "selector_training_view_v1.jsonl")
+            training_manifest = json.loads(
+                (report_dir / "selector_training_view_manifest_v1.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertEqual(manifest["status"], "PASS_R2_ONLY_DRAFT")
+        self.assertTrue(manifest["gatekeeper_feature_context_enabled"])
+        self.assertTrue(training_manifest["gatekeeper_feature_context_enabled"])
+        self.assertIn("gatekeeper_feature_context_v1", manifest["input_provenance"])
+        self.assertIn("gatekeeper_feature_context_v1", training_manifest["input_provenance"])
+        self.assertEqual(training_rows[0]["gk_bonding_progress_pct"], 46.0)
+        self.assertFalse(manifest["claim_boundaries"]["gatekeeper_tuning_started"])
+        self.assertFalse(manifest["claim_boundaries"]["production_promotion_claim"])
+
     def test_candidate_universe_dedupes_and_fails_closed_on_missing_quote(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2278,6 +2712,14 @@ class SelectorPipelineTests(unittest.TestCase):
                     "sell_share": 0.10 + (idx * 0.01),
                     "top1_wallet_share": 0.20 + (idx * 0.01),
                     "buyer_hhi": 0.30 + (idx * 0.01),
+                    "gk_context_status": "ok",
+                    "gk_cutoff_status": "same_decision_time",
+                    "gk_observation_profile": "observation_8s_10s",
+                    "gk_log_schema_version": 25,
+                    "gk_decision_plane": "v25_shadow",
+                    "gk_bonding_progress_pct": 10.0 + idx,
+                    "gk_current_market_cap_sol": 20.0 + (idx * 2.0),
+                    "gk_price_change_ratio": 1.0 + (idx * 0.1),
                 }
             )
         rows.append(
@@ -2301,6 +2743,14 @@ class SelectorPipelineTests(unittest.TestCase):
                 "sell_share": 0.99,
                 "top1_wallet_share": 0.99,
                 "buyer_hhi": 0.99,
+                "gk_context_status": "ok",
+                "gk_cutoff_status": "same_decision_time",
+                "gk_observation_profile": "observation_8s_10s",
+                "gk_log_schema_version": 25,
+                "gk_decision_plane": "v25_shadow",
+                "gk_bonding_progress_pct": 99.0,
+                "gk_current_market_cap_sol": 99.0,
+                "gk_price_change_ratio": 9.9,
             }
         )
         write_jsonl(dataset_dir / "selector_training_view_v1.jsonl", rows)
@@ -2313,6 +2763,29 @@ class SelectorPipelineTests(unittest.TestCase):
             (report_dir / path).write_text(json.dumps(payload), encoding="utf-8")
         (report_dir / "FEATURE_RICH_R2_BASELINE_DECISION.md").write_text(
             "P3E_PASS_FEATURE_RICH_R2_BASELINE_DRAFT\n",
+            encoding="utf-8",
+        )
+        (report_dir / "gatekeeper_feature_context_manifest_v1.json").write_text(
+            json.dumps(
+                {
+                    "status": "PASS",
+                    "feature_columns": [
+                        "gk_log_schema_version",
+                        "gk_decision_plane",
+                        "gk_observation_profile",
+                        "gk_context_status",
+                        "gk_cutoff_status",
+                        "gk_bonding_progress_pct",
+                        "gk_current_market_cap_sol",
+                        "gk_price_change_ratio",
+                    ],
+                    "model_feature_columns": [
+                        "gk_bonding_progress_pct",
+                        "gk_current_market_cap_sol",
+                        "gk_price_change_ratio",
+                    ],
+                }
+            ),
             encoding="utf-8",
         )
         return rows
@@ -2545,6 +3018,71 @@ class SelectorPipelineTests(unittest.TestCase):
         )
         self.assertIn("bootstrap_ci_precision", holdout_top10)
         self.assertFalse(report["claim_boundaries"]["threshold_changes"])
+        self.assertFalse(report["claim_boundaries"]["runtime_changed"])
+
+    def test_model_candidate_supports_flow_gk_combined_feature_sets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "selector-p3g-flow-gk-combined-test"
+            self.write_feature_contribution_fixture(root, scope)
+            p3f_report = r2only_feature_contribution.build_report(
+                r2only_feature_contribution.build_parser().parse_args(
+                    [
+                        "--scope",
+                        scope,
+                        "--root",
+                        str(root),
+                        "--feature-set",
+                        "flow",
+                        "--feature-set",
+                        "gk",
+                        "--feature-set",
+                        "combined",
+                    ]
+                )
+            )
+
+            report = r2only_model_candidate.build_report(
+                r2only_model_candidate.build_parser().parse_args(
+                    [
+                        "--scope",
+                        scope,
+                        "--root",
+                        str(root),
+                        "--feature-set",
+                        "flow",
+                        "--feature-set",
+                        "gk",
+                        "--feature-set",
+                        "combined",
+                        "--bootstrap-samples",
+                        "50",
+                        "--logistic-epochs",
+                        "20",
+                    ]
+                )
+            )
+
+        self.assertEqual(set(p3f_report["feature_set_reports"]), {"flow", "gk", "combined"})
+        self.assertEqual(set(report["feature_set_reports"]), {"flow", "gk", "combined"})
+        self.assertIn("gk_bonding_progress_pct", report["features_used_by_set"]["gk"])
+        self.assertIn("net_quote_in_15s", report["features_used_by_set"]["flow"])
+        self.assertIn("gk_bonding_progress_pct", report["features_used_by_set"]["combined"])
+        for forbidden in (
+            "gk_log_schema_version",
+            "gk_decision_plane",
+            "gk_observation_profile",
+            "gk_context_status",
+            "gk_cutoff_status",
+        ):
+            self.assertNotIn(forbidden, report["features_used_by_set"]["gk"])
+            self.assertNotIn(forbidden, report["features_used_by_set"]["combined"])
+        candidate_ids = {candidate["candidate_id"] for candidate in report["candidates"]}
+        self.assertIn("flow:simple_feature_score_v1", candidate_ids)
+        self.assertIn("gk:simple_feature_score_v1", candidate_ids)
+        self.assertIn("combined:simple_feature_score_v1", candidate_ids)
+        self.assertIn("gatekeeper_accept_context", report)
+        self.assertFalse(report["claim_boundaries"]["gatekeeper_tuned"])
         self.assertFalse(report["claim_boundaries"]["runtime_changed"])
 
     def test_r2_market_paths_writes_one_row_per_candidate_and_missing_path_is_unresolved(self) -> None:

@@ -133,6 +133,7 @@ def build_phase3(args: argparse.Namespace) -> dict[str, Any]:
         snapshot_kind=args.snapshot_kind,
         fallback_snapshot_kind=args.fallback_snapshot_kind,
         split_denominator="resolved_r2",
+        gatekeeper_feature_context=args.gatekeeper_feature_context,
     )
     common.write_jsonl(training_output, rows)
     common.write_json(leakage_output, leakage_audit)
@@ -170,6 +171,7 @@ def build_phase3(args: argparse.Namespace) -> dict[str, Any]:
             "accepted_lifecycle_v1": file_provenance(accepted_lifecycle),
             "feature_snapshots_v1": file_provenance(feature_snapshots),
             "r2_market_paths_v1": file_provenance(r2_market_paths),
+            "gatekeeper_feature_context_v1": file_provenance(args.gatekeeper_feature_context),
         },
         "training_rows": len(rows),
         "r2_training_denominator_rows": r2_denominator_rows,
@@ -190,6 +192,7 @@ def build_phase3(args: argparse.Namespace) -> dict[str, Any]:
         "execution_realization_available": False,
         "execution_success_claim_allowed": False,
         "selector_training_view_built": True,
+        "gatekeeper_feature_context_enabled": args.gatekeeper_feature_context is not None,
         "baseline_built": False,
         "gatekeeper_compare_built": False,
         "gatekeeper_tuning_started": False,
@@ -229,6 +232,14 @@ def build_phase3(args: argparse.Namespace) -> dict[str, Any]:
             "production_promotion_claim": False,
             "gatekeeper_tuning_started": False,
         },
+        "input_provenance": {
+            "phase2_manifest": file_provenance(phase2_manifest_path),
+            "candidate_universe_v1": file_provenance(candidate_universe),
+            "accepted_lifecycle_v1": file_provenance(accepted_lifecycle),
+            "feature_snapshots_v1": file_provenance(feature_snapshots),
+            "r2_market_paths_v1": file_provenance(r2_market_paths),
+            "gatekeeper_feature_context_v1": file_provenance(args.gatekeeper_feature_context),
+        },
         "outputs": {
             "selector_training_view_v1": file_provenance(training_output),
             "selector_training_view_manifest_v1": file_provenance(training_manifest_output),
@@ -237,6 +248,7 @@ def build_phase3(args: argparse.Namespace) -> dict[str, Any]:
         "label_coverage": coverage,
         "leakage_audit": leakage_audit,
         "selector_training_view_built": True,
+        "gatekeeper_feature_context_enabled": args.gatekeeper_feature_context is not None,
         "baseline_built": False,
         "gatekeeper_compare_built": False,
         "gatekeeper_tuning_started": False,
@@ -254,6 +266,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--accepted-lifecycle", type=Path)
     parser.add_argument("--feature-snapshots", type=Path)
     parser.add_argument("--r2-market-paths", type=Path)
+    parser.add_argument("--gatekeeper-feature-context", type=Path)
     parser.add_argument("--target-net-pct", type=float, default=40.0)
     parser.add_argument("--stop-net-pct", type=float, default=40.0)
     parser.add_argument("--horizon-ms", type=int, default=60_000)

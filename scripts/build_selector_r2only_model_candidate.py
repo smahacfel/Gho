@@ -17,7 +17,7 @@ import build_selector_r2only_feature_contribution as contribution
 import selector_pipeline_common as common
 
 
-FEATURES = (
+FLOW_FEATURES = (
     "net_quote_in_15s",
     "net_quote_in_30s",
     "trade_rate",
@@ -26,6 +26,15 @@ FEATURES = (
     "top1_wallet_share",
     "buyer_hhi",
 )
+FEATURES = FLOW_FEATURES
+GK_PROVENANCE_COLUMNS = {
+    "gk_log_schema_version",
+    "gk_decision_plane",
+    "gk_observation_profile",
+    "gk_context_status",
+    "gk_cutoff_status",
+}
+GK_MODEL_ALLOWED_CUTOFF_STATUSES = {"ok", "same_decision_time"}
 SPLITS = ("train", "validation", "holdout")
 TOP_K = (10, 25, 50, 100)
 
@@ -38,7 +47,26 @@ def read_json(path: Path) -> dict[str, Any]:
     return payload
 
 
+def requested_feature_sets(args: argparse.Namespace) -> list[str]:
+    raw = args.feature_set or ["flow"]
+    out: list[str] = []
+    for item in raw:
+        if item not in out:
+            out.append(item)
+    return out
+
+
+def gk_row_valid_for_model(row: dict[str, Any]) -> bool:
+    return bool(
+        row.get("gk_context_status") == "ok"
+        and row.get("gk_cutoff_status") in GK_MODEL_ALLOWED_CUTOFF_STATUSES
+    )
+
+
 def feature_value(row: dict[str, Any], feature: str) -> float | None:
+    if feature.startswith("gk_") and feature not in GK_PROVENANCE_COLUMNS:
+        if not gk_row_valid_for_model(row):
+            return None
     value = row.get(feature)
     if isinstance(value, bool):
         return 1.0 if value else 0.0
@@ -66,12 +94,60 @@ def split_counts(rows: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
     return {split: common.counter_dict(counter) for split, counter in sorted(counts.items())}
 
 
-def available_features(rows: list[dict[str, Any]], p3f_report: dict[str, Any]) -> list[str]:
-    p3f_features = p3f_report.get("available_features_used")
-    if isinstance(p3f_features, list):
-        candidates = [str(feature) for feature in p3f_features if str(feature) in FEATURES]
+def read_gatekeeper_manifest(report_dir: Path) -> dict[str, Any]:
+    path = report_dir / "gatekeeper_feature_context_manifest_v1.json"
+    if not path.exists() or path.stat().st_size == 0:
+        return {}
+    return read_json(path)
+
+
+def gk_manifest_feature_columns(report_dir: Path, rows: list[dict[str, Any]]) -> list[str]:
+    manifest = read_gatekeeper_manifest(report_dir)
+    raw_columns = manifest.get("model_feature_columns")
+    if not isinstance(raw_columns, list):
+        raw_columns = manifest.get("feature_columns")
+    if isinstance(raw_columns, list):
+        candidates = [str(feature) for feature in raw_columns if str(feature).startswith("gk_")]
     else:
-        candidates = list(FEATURES)
+        candidates = sorted({key for row in rows for key in row if key.startswith("gk_")})
+    return [
+        feature
+        for feature in candidates
+        if feature not in GK_PROVENANCE_COLUMNS
+    ]
+
+
+def has_variation(rows: list[dict[str, Any]], feature: str) -> bool:
+    values = [feature_value(row, feature) for row in rows]
+    present = [value for value in values if value is not None]
+    return bool(present and len(set(present)) > 1)
+
+
+def available_features(
+    rows: list[dict[str, Any]],
+    p3f_report: dict[str, Any],
+    *,
+    feature_set: str = "flow",
+    report_dir: Path | None = None,
+) -> list[str]:
+    by_set = p3f_report.get("available_features_by_set")
+    if isinstance(by_set, dict) and isinstance(by_set.get(feature_set), list):
+        candidates = [str(feature) for feature in by_set.get(feature_set, [])]
+    elif feature_set == "flow":
+        p3f_features = p3f_report.get("available_features_used")
+        if isinstance(p3f_features, list):
+            candidates = [str(feature) for feature in p3f_features if str(feature) in FLOW_FEATURES]
+        else:
+            candidates = list(FLOW_FEATURES)
+    elif feature_set == "gk":
+        candidates = gk_manifest_feature_columns(report_dir or Path("."), rows)
+    elif feature_set == "combined":
+        candidates = available_features(rows, p3f_report, feature_set="flow", report_dir=report_dir)
+        for feature in available_features(rows, p3f_report, feature_set="gk", report_dir=report_dir):
+            if feature not in candidates:
+                candidates.append(feature)
+    else:
+        raise ValueError(f"unsupported feature_set: {feature_set}")
     out = []
     for feature in candidates:
         values = [feature_value(row, feature) for row in rows]
@@ -512,6 +588,22 @@ def markdown_report(report: dict[str, Any]) -> str:
         lines.append(
             f"| {candidate.get('candidate_id')} | {format_pct(train)} | {format_pct(validation)} | {format_pct(holdout)} | {ci_text} |"
         )
+    if report.get("feature_set_reports"):
+        lines.extend(
+            [
+                "",
+                "## Feature Set Comparison",
+                "",
+                "| feature set | features | best candidate | holdout top10 |",
+                "| --- | ---: | --- | ---: |",
+            ]
+        )
+        for feature_set, payload in report.get("feature_set_reports", {}).items():
+            best = payload.get("best_candidate", {}) if isinstance(payload, dict) else {}
+            holdout = top_metric(best, "holdout", 10).get("precision_r2")
+            lines.append(
+                f"| {feature_set} | {len(payload.get('features_used', [])) if isinstance(payload, dict) else 0} | {best.get('candidate_id')} | {format_pct(holdout)} |"
+            )
     lines.extend(
         [
             "",
@@ -560,42 +652,67 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
     train_rows = [row for row in denominator if row.get("split") == "train"]
     p3f_report = read_json(p3f_path)
     dataset_manifest = read_json(dataset_manifest_path)
-    features = available_features(denominator, p3f_report)
+    feature_sets = requested_feature_sets(args)
+    primary_feature_set = feature_sets[0]
+    score_maps: dict[str, dict[str, float]] = {}
+    candidates: list[dict[str, Any]] = []
+    feature_set_reports: dict[str, dict[str, Any]] = {}
+    logistic_models: dict[str, dict[str, Any]] = {}
 
-    simple = simple_scores(denominator, train_rows=train_rows, features=features)
-    score_maps: dict[str, dict[str, float]] = {
-        "simple_feature_score_v1": {
-            candidate_id: payload["simple_feature_score_v1"]
-            for candidate_id, payload in simple.items()
-        }
-    }
-    for feature in features:
-        score_maps[f"single_feature_ranker:{feature}"] = {
-            candidate_id: payload[f"single_feature_ranker:{feature}"]
-            for candidate_id, payload in simple.items()
-        }
-    logistic_model = train_logistic(
-        train_rows,
-        features=features,
-        learning_rate=args.logistic_learning_rate,
-        l2=args.logistic_l2,
-        epochs=args.logistic_epochs,
-    )
-    score_maps["logistic_sanity_baseline"] = logistic_scores(denominator, model=logistic_model)
+    def candidate_id_for(feature_set: str, base_id: str) -> str:
+        if len(feature_sets) == 1 and feature_set == "flow":
+            return base_id
+        return f"{feature_set}:{base_id}"
 
-    candidates = []
-    for candidate_id, score_map in score_maps.items():
-        candidates.append(
-            {
+    for feature_set in feature_sets:
+        features = available_features(
+            denominator,
+            p3f_report,
+            feature_set=feature_set,
+            report_dir=report_dir,
+        )
+        simple = simple_scores(denominator, train_rows=train_rows, features=features)
+        set_score_maps: dict[str, dict[str, float]] = {
+            candidate_id_for(feature_set, "simple_feature_score_v1"): {
+                candidate_id: payload["simple_feature_score_v1"]
+                for candidate_id, payload in simple.items()
+            }
+        }
+        for feature in features:
+            base_id = f"single_feature_ranker:{feature}"
+            set_score_maps[candidate_id_for(feature_set, base_id)] = {
+                candidate_id: payload[base_id]
+                for candidate_id, payload in simple.items()
+            }
+        logistic_model = train_logistic(
+            train_rows,
+            features=features,
+            learning_rate=args.logistic_learning_rate,
+            l2=args.logistic_l2,
+            epochs=args.logistic_epochs,
+        )
+        logistic_models[feature_set] = logistic_model
+        set_score_maps[candidate_id_for(feature_set, "logistic_sanity_baseline")] = logistic_scores(
+            denominator, model=logistic_model
+        )
+        set_candidates: list[dict[str, Any]] = []
+        for candidate_id, score_map in set_score_maps.items():
+            base_candidate_id = candidate_id.split(":", 1)[1] if candidate_id.startswith(f"{feature_set}:") else candidate_id
+            candidate = {
                 "candidate_id": candidate_id,
+                "feature_set": feature_set,
                 "candidate_kind": (
                     "simple_feature_score"
-                    if candidate_id == "simple_feature_score_v1"
+                    if base_candidate_id == "simple_feature_score_v1"
                     else "single_feature_ranker"
-                    if candidate_id.startswith("single_feature_ranker:")
+                    if base_candidate_id.startswith("single_feature_ranker:")
                     else "logistic_or_tree_sanity_baseline"
                 ),
-                "features": features if not candidate_id.startswith("single_feature_ranker:") else [candidate_id.split(":", 1)[1]],
+                "features": (
+                    features
+                    if not base_candidate_id.startswith("single_feature_ranker:")
+                    else [base_candidate_id.split(":", 1)[1]]
+                ),
                 "by_split": candidate_metrics(
                     denominator,
                     score_map,
@@ -604,7 +721,19 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
                     bootstrap_seed=args.bootstrap_seed,
                 ),
             }
-        )
+            candidates.append(candidate)
+            set_candidates.append(candidate)
+        score_maps.update(set_score_maps)
+        feature_set_reports[feature_set] = {
+            "feature_set": feature_set,
+            "features_used": features,
+            "logistic_sanity_baseline": logistic_model,
+            "candidates": set_candidates,
+            "best_candidate": best_candidate(set_candidates),
+        }
+
+    features = feature_set_reports[primary_feature_set]["features_used"]
+    logistic_model = logistic_models[primary_feature_set]
 
     report: dict[str, Any] = {
         "selector_schema_version": common.SCHEMA_VERSION,
@@ -613,6 +742,8 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "status": "P3G_PENDING",
         "scope": args.scope,
         "dataset_kind": "r2_only",
+        "feature_sets_requested": feature_sets,
+        "primary_feature_set": primary_feature_set,
         "claim_boundaries": {
             "diagnostic_only": True,
             "model_ready": False,
@@ -632,9 +763,15 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "negative_rows": sum(1 for row in denominator if row.get("r2_label") == "negative"),
         "split_counts": split_counts(denominator),
         "features_used": features,
+        "features_used_by_set": {
+            feature_set: payload["features_used"]
+            for feature_set, payload in feature_set_reports.items()
+        },
         "gatekeeper_accept_context": gatekeeper_metrics(denominator),
         "p3f_simple_score_reference": p3f_report.get("simple_score_stability"),
         "logistic_sanity_baseline": logistic_model,
+        "logistic_sanity_baseline_by_set": logistic_models,
+        "feature_set_reports": feature_set_reports,
         "candidates": candidates,
     }
     report["acceptance"] = acceptance_status(candidates, dataset_manifest)
@@ -664,6 +801,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scope", required=True)
     parser.add_argument("--root", type=Path, default=Path("/root/Gho"))
+    parser.add_argument(
+        "--feature-set",
+        action="append",
+        choices=["flow", "gk", "combined"],
+        help="Feature set to evaluate. Repeat to compare multiple sets. Defaults to flow.",
+    )
     parser.add_argument("--bootstrap-samples", type=int, default=1000)
     parser.add_argument("--bootstrap-seed", type=int, default=4242)
     parser.add_argument("--logistic-learning-rate", type=float, default=0.05)

@@ -15,7 +15,7 @@ import build_selector_r2only_baseline_report as baseline
 import selector_pipeline_common as common
 
 
-FEATURES = (
+FLOW_FEATURES = (
     "net_quote_in_15s",
     "net_quote_in_30s",
     "trade_rate",
@@ -24,6 +24,15 @@ FEATURES = (
     "top1_wallet_share",
     "buyer_hhi",
 )
+FEATURES = FLOW_FEATURES
+GK_PROVENANCE_COLUMNS = {
+    "gk_log_schema_version",
+    "gk_decision_plane",
+    "gk_observation_profile",
+    "gk_context_status",
+    "gk_cutoff_status",
+}
+GK_MODEL_ALLOWED_CUTOFF_STATUSES = {"ok", "same_decision_time"}
 EXAMPLE_FIELDS = (
     "candidate_id",
     "base_mint",
@@ -53,11 +62,87 @@ def read_json(path: Path) -> dict[str, Any]:
     return payload
 
 
+def requested_feature_sets(args: argparse.Namespace) -> list[str]:
+    raw = args.feature_set or ["flow"]
+    out: list[str] = []
+    for item in raw:
+        if item not in out:
+            out.append(item)
+    return out
+
+
+def gk_row_valid_for_model(row: dict[str, Any]) -> bool:
+    return bool(
+        row.get("gk_context_status") == "ok"
+        and row.get("gk_cutoff_status") in GK_MODEL_ALLOWED_CUTOFF_STATUSES
+    )
+
+
 def feature_value(row: dict[str, Any], feature: str) -> float | None:
+    if feature.startswith("gk_") and feature not in GK_PROVENANCE_COLUMNS:
+        if not gk_row_valid_for_model(row):
+            return None
     value = row.get(feature)
     if isinstance(value, bool):
         return 1.0 if value else 0.0
     return common.float_or_none(value)
+
+
+def read_gatekeeper_manifest(report_dir: Path) -> dict[str, Any]:
+    path = report_dir / "gatekeeper_feature_context_manifest_v1.json"
+    if not path.exists() or path.stat().st_size == 0:
+        return {}
+    return read_json(path)
+
+
+def gk_manifest_feature_columns(report_dir: Path, rows: list[dict[str, Any]]) -> list[str]:
+    manifest = read_gatekeeper_manifest(report_dir)
+    raw_columns = manifest.get("model_feature_columns")
+    if not isinstance(raw_columns, list):
+        raw_columns = manifest.get("feature_columns")
+    if isinstance(raw_columns, list):
+        candidates = [str(column) for column in raw_columns if str(column).startswith("gk_")]
+    else:
+        candidates = sorted({key for row in rows for key in row if key.startswith("gk_")})
+    return [
+        feature
+        for feature in candidates
+        if feature not in GK_PROVENANCE_COLUMNS
+    ]
+
+
+def has_variation(rows: list[dict[str, Any]], feature: str) -> bool:
+    values = [feature_value(row, feature) for row in rows]
+    present = [value for value in values if value is not None]
+    return bool(present and len(set(present)) > 1)
+
+
+def features_for_set(
+    feature_set: str,
+    rows: list[dict[str, Any]],
+    *,
+    report_dir: Path,
+) -> list[str]:
+    if feature_set == "flow":
+        candidates = list(FLOW_FEATURES)
+        return [
+            feature
+            for feature in candidates
+            if any(feature_value(row, feature) is not None for row in rows)
+        ]
+    if feature_set == "gk":
+        return [
+            feature
+            for feature in gk_manifest_feature_columns(report_dir, rows)
+            if has_variation(rows, feature)
+        ]
+    if feature_set == "combined":
+        combined = features_for_set("flow", rows, report_dir=report_dir)
+        for feature in features_for_set("gk", rows, report_dir=report_dir):
+            if feature not in combined:
+                combined.append(feature)
+        return combined
+    raise ValueError(f"unsupported feature_set: {feature_set}")
 
 
 def label_positive(row: dict[str, Any]) -> bool:
@@ -223,10 +308,15 @@ def top_k_metrics(rows: list[dict[str, Any]], scores: dict[str, dict[str, Any]],
     return reports
 
 
-def feature_separation(rows: list[dict[str, Any]], train_rows: list[dict[str, Any]]) -> dict[str, Any]:
+def feature_separation(
+    rows: list[dict[str, Any]],
+    train_rows: list[dict[str, Any]],
+    *,
+    features: list[str] | None = None,
+) -> dict[str, Any]:
     report: dict[str, Any] = {}
     global_base_rate = base_rate(rows)
-    for feature in FEATURES:
+    for feature in features or list(FEATURES):
         positive_rows = [row for row in rows if label_positive(row)]
         negative_rows = [row for row in rows if not label_positive(row)]
         pos_summary = numeric_summary(positive_rows, feature)
@@ -310,10 +400,15 @@ def bin_index(value: float, edges: list[float]) -> int:
     return min(max(idx, 0), 4)
 
 
-def feature_bins(rows: list[dict[str, Any]], train_rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def feature_bins(
+    rows: list[dict[str, Any]],
+    train_rows: list[dict[str, Any]],
+    *,
+    features: list[str] | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     by_feature: dict[str, Any] = {}
     csv_rows: list[dict[str, Any]] = []
-    for feature in FEATURES:
+    for feature in features or list(FEATURES):
         edges = train_quantile_edges(train_rows, feature)
         feature_report = {"train_edges": edges, "splits": {}}
         for split in SPLITS:
@@ -694,27 +789,48 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
     rows = list(common.iter_json_objects(training_view))
     denominator = [row for row in rows if baseline.r2only_denominator(row)]
     train_rows = [row for row in denominator if row.get("split") == "train"]
-    features = [
-        feature
-        for feature in FEATURES
-        if any(feature_value(row, feature) is not None for row in denominator)
-    ]
-    scores = score_rows(denominator, features, train_rows)
-    separation = feature_separation(denominator, train_rows)
-    bins, bin_csv_rows = feature_bins(denominator, train_rows)
-    simple_score_stability = {
-        split: {
-            "rows": len([row for row in denominator if row.get("split") == split]),
-            "base_positive_rate": base_rate([row for row in denominator if row.get("split") == split]),
-            "precision_at_top_k": top_k_metrics(
-                [row for row in denominator if row.get("split") == split],
-                scores,
-                TOP_K,
-            ),
+    feature_sets = requested_feature_sets(args)
+    feature_set_reports: dict[str, dict[str, Any]] = {}
+    primary_feature_set = feature_sets[0]
+
+    for feature_set in feature_sets:
+        features = features_for_set(feature_set, denominator, report_dir=report_dir)
+        scores = score_rows(denominator, features, train_rows)
+        separation = feature_separation(denominator, train_rows, features=features)
+        bins, bin_csv_rows = feature_bins(denominator, train_rows, features=features)
+        simple_score_stability = {
+            split: {
+                "rows": len([row for row in denominator if row.get("split") == split]),
+                "base_positive_rate": base_rate([row for row in denominator if row.get("split") == split]),
+                "precision_at_top_k": top_k_metrics(
+                    [row for row in denominator if row.get("split") == split],
+                    scores,
+                    TOP_K,
+                ),
+            }
+            for split in SPLITS
         }
-        for split in SPLITS
-    }
-    gatekeeper_feature, gatekeeper_feature_csv = gatekeeper_vs_feature(denominator, scores)
+        gatekeeper_feature, gatekeeper_feature_csv = gatekeeper_vs_feature(denominator, scores)
+        feature_set_reports[feature_set] = {
+            "feature_set": feature_set,
+            "available_features_used": features,
+            "feature_separation": separation,
+            "feature_bins": bins,
+            "feature_bins_csv_rows": bin_csv_rows,
+            "simple_score_stability": simple_score_stability,
+            "gatekeeper_vs_feature_score": gatekeeper_feature,
+            "gatekeeper_vs_feature_csv_rows": gatekeeper_feature_csv,
+            "examples": examples(denominator, scores, limit=args.example_limit),
+        }
+
+    primary = feature_set_reports[primary_feature_set]
+    features = primary["available_features_used"]
+    separation = primary["feature_separation"]
+    bins = primary["feature_bins"]
+    bin_csv_rows = primary["feature_bins_csv_rows"]
+    simple_score_stability = primary["simple_score_stability"]
+    gatekeeper_feature = primary["gatekeeper_vs_feature_score"]
+    gatekeeper_feature_csv = primary["gatekeeper_vs_feature_csv_rows"]
 
     report: dict[str, Any] = {
         "selector_schema_version": common.SCHEMA_VERSION,
@@ -723,6 +839,8 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "status": "P3F_PASS_FEATURE_CONTRIBUTION_DIAGNOSTIC",
         "scope": args.scope,
         "dataset_kind": "r2_only",
+        "feature_sets_requested": feature_sets,
+        "primary_feature_set": primary_feature_set,
         "claim_boundaries": {
             "diagnostic_only": True,
             "model_ready": False,
@@ -738,6 +856,10 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "negative_rows": sum(1 for row in denominator if row.get("r2_label") == "negative"),
         "split_counts": split_counts(denominator),
         "available_features_used": features,
+        "available_features_by_set": {
+            feature_set: payload["available_features_used"]
+            for feature_set, payload in feature_set_reports.items()
+        },
         "baseline_status": read_json(baseline_report_path).get("status"),
         "feature_audit_status": read_json(feature_audit_path).get("status"),
         "ablation_status": read_json(ablation_path).get("status"),
@@ -746,7 +868,15 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "feature_bins": bins,
         "simple_score_stability": simple_score_stability,
         "gatekeeper_vs_feature_score": gatekeeper_feature,
-        "examples": examples(denominator, scores, limit=args.example_limit),
+        "feature_set_reports": {
+            feature_set: {
+                key: value
+                for key, value in payload.items()
+                if key not in {"feature_bins_csv_rows", "gatekeeper_vs_feature_csv_rows"}
+            }
+            for feature_set, payload in feature_set_reports.items()
+        },
+        "examples": primary["examples"],
     }
     report["interpretation"] = build_interpretation(report)
 
@@ -806,6 +936,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scope", required=True)
     parser.add_argument("--root", type=Path, default=Path("/root/Gho"))
+    parser.add_argument(
+        "--feature-set",
+        action="append",
+        choices=["flow", "gk", "combined"],
+        help="Feature set to report. Repeat to compare multiple sets. Defaults to flow.",
+    )
     parser.add_argument("--example-limit", type=int, default=15)
     parser.add_argument("--json", action="store_true")
     return parser
