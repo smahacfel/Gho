@@ -66,6 +66,54 @@ def free_gb(path: Path) -> float:
     return usage.free / (1024**3)
 
 
+def git_head(root: Path) -> str | None:
+    proc = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        return None
+    value = proc.stdout.strip()
+    return value or None
+
+
+def mtime_utc(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    return datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat()
+
+
+def run_release_build_before_start(root: Path, output_dir: Path, launcher: Path) -> dict[str, Any]:
+    started_at = datetime.now(timezone.utc)
+    result = run_command(
+        ["cargo", "build", "--release", "-p", "ghost-launcher"],
+        cwd=root,
+        log_path=output_dir / "commands" / "cargo_build_release_ghost_launcher.log",
+    )
+    finished_at = datetime.now(timezone.utc)
+    # Cargo may legitimately no-op when the release binary is already up to date.
+    # The freshness contract is that this launcher ran Cargo successfully before
+    # start and the expected release binary exists; binary_mtime is provenance,
+    # not a rebuild-required gate.
+    build_fresh = result["exit_code"] == 0 and launcher.exists()
+    return {
+        "status": PASS_STATUS if build_fresh else INCONCLUSIVE_ENV_OR_CONFIG,
+        "command": result["command"],
+        "exit_code": result["exit_code"],
+        "log_path": result["log_path"],
+        "started_at_utc": started_at.isoformat(),
+        "finished_at_utc": finished_at.isoformat(),
+        "runtime_binary": str(launcher),
+        "binary_exists": launcher.exists(),
+        "binary_mtime_utc": mtime_utc(launcher),
+        "git_head_at_build": git_head(root),
+        "build_freshness_status": PASS_STATUS if build_fresh else "FAIL_STALE_OR_MISSING_BINARY",
+    }
+
+
 def validate_scope_contract(
     *,
     scope: str,
@@ -240,6 +288,19 @@ def write_markdown(path: Path, payload: dict[str, Any]) -> None:
         value = payload.get(key) or {}
         status = value.get("status") if isinstance(value, dict) else None
         lines.append(f"- {key}: `{status}`")
+    lines.extend(
+        [
+            "",
+            "## Runtime Binary",
+            "",
+            f"- runtime_binary: `{payload.get('runtime_binary')}`",
+            f"- build_release_before_start: `{payload.get('build_release_before_start')}`",
+            f"- build_freshness_status: `{payload.get('build_freshness_status')}`",
+            f"- git_head_at_build: `{payload.get('git_head_at_build')}`",
+            f"- git_head_at_launch: `{payload.get('git_head_at_launch')}`",
+            f"- binary_mtime_utc: `{payload.get('binary_mtime_utc')}`",
+        ]
+    )
     errors = payload.get("errors") or []
     if errors:
         lines.extend(["", "## Errors", ""])
@@ -293,6 +354,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-reporter-rows", type=int, default=1)
     parser.add_argument("--allow-existing-session", action="store_true")
     parser.add_argument("--skip-static-tests", action="store_true")
+    parser.add_argument(
+        "--build-release-before-start",
+        action="store_true",
+        help="Run cargo build --release -p ghost-launcher before preflight/start and record binary provenance.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Run static/preflight gates and snapshot only; do not start tmux")
     return parser
 
@@ -317,6 +383,13 @@ def main(argv: list[str] | None = None) -> int:
         "config": str(config_path),
         "tmux_session": args.tmux_session,
         "output_dir": str(output_dir),
+        "runtime_binary": str(launcher),
+        "build_release_before_start": args.build_release_before_start,
+        "build_freshness_status": "NOT_REQUESTED",
+        "git_head_at_build": None,
+        "git_head_at_launch": None,
+        "binary_mtime_utc": mtime_utc(launcher),
+        "build_freshness": {},
         "storage": {},
         "config_contract": {},
         "scope_contract": {},
@@ -339,9 +412,22 @@ def main(argv: list[str] | None = None) -> int:
         report["errors"].append(f"free_gb={current_free_gb:.2f} < min_free_gb={args.min_free_gb:.2f}")
         return finish(report, output_dir, INCONCLUSIVE_ENV_OR_CONFIG)
 
+    if args.build_release_before_start:
+        build_report = run_release_build_before_start(root, output_dir, launcher)
+        report["build_freshness"] = build_report
+        report["build_freshness_status"] = build_report["build_freshness_status"]
+        report["git_head_at_build"] = build_report.get("git_head_at_build")
+        report["binary_mtime_utc"] = build_report.get("binary_mtime_utc")
+        if build_report["status"] != PASS_STATUS:
+            report["errors"].append("release build freshness check failed")
+            return finish(report, output_dir, INCONCLUSIVE_ENV_OR_CONFIG)
+
     if not launcher.exists():
         report["errors"].append(f"launcher binary missing: {launcher}")
         return finish(report, output_dir, INCONCLUSIVE_ENV_OR_CONFIG)
+    report["binary_mtime_utc"] = mtime_utc(launcher)
+    if not args.build_release_before_start:
+        report["build_freshness_status"] = "NOT_REQUESTED"
 
     try:
         resolved_config, artifact_paths = restore_guard.resolve_artifact_paths(root, config_path)
@@ -435,6 +521,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if tmux_session_exists(args.tmux_session) and args.allow_existing_session:
         kill_tmux_session(args.tmux_session)
+
+    report["git_head_at_launch"] = git_head(root)
+    if args.build_release_before_start and report.get("git_head_at_build") != report.get("git_head_at_launch"):
+        report["errors"].append("git HEAD changed between release build and launch")
+        return finish(report, output_dir, INCONCLUSIVE_ENV_OR_CONFIG)
 
     start = start_tmux_session(
         root=root,

@@ -514,6 +514,9 @@ pub struct BuyAccountOverrides {
     pub creator_pubkey: Option<Pubkey>,
     pub creator_pubkey_source: Option<String>,
     pub creator_pubkey_authoritative: Option<bool>,
+    pub creator_vault: Option<Pubkey>,
+    pub creator_vault_source: Option<String>,
+    pub creator_vault_authoritative: Option<bool>,
     pub buy_variant: Option<trigger::PumpfunBuyVariant>,
     pub associated_bonding_curve: Option<Pubkey>,
     pub bonding_curve_v2: Option<Pubkey>,
@@ -2578,18 +2581,25 @@ impl TriggerComponent {
         buy_variant: trigger::PumpfunBuyVariant,
         account_overrides: &BuyAccountOverrides,
     ) -> Result<()> {
-        if !matches!(
+        let has_observed_creator_vault = matches!(
+            account_overrides.creator_vault,
+            Some(pubkey) if pubkey != Pubkey::default()
+        ) && account_overrides.creator_vault_authoritative
+            == Some(true);
+        let has_creator_pubkey = matches!(
             account_overrides.creator_pubkey,
             Some(pubkey) if pubkey != Pubkey::default()
-        ) {
+        );
+        if !has_creator_pubkey && !has_observed_creator_vault {
             bail!(
-                "Missing canonical creator_pubkey for trigger buy: mint={} refusing to derive creator_vault from default pubkey",
+                "Missing canonical creator_pubkey or observed creator_vault for trigger buy: mint={} refusing to derive creator_vault from default pubkey",
                 mint
             );
         }
 
         if matches!(buy_variant, trigger::PumpfunBuyVariant::LegacyBuy)
             && account_overrides.creator_pubkey_authoritative == Some(false)
+            && !has_observed_creator_vault
         {
             bail!(
                 "creator_vault_source_not_authoritative:legacy_buy:{}:{}",
@@ -2759,20 +2769,22 @@ impl TriggerComponent {
             configured_slippage_bps = self.configured_buy_slippage_bps(),
             "Trigger: resolved buy instruction parameters"
         );
-        let buy_instruction = DirectBuyBuilder::build_buy_ix_with_accounts_and_remaining(
-            payer_pubkey,
-            mint,
-            token_program,
-            account_overrides.global_config,
-            account_overrides.fee_recipient,
-            account_overrides.creator_pubkey,
-            account_overrides.buy_variant,
-            account_overrides.associated_bonding_curve,
-            account_overrides.bonding_curve_v2,
-            &account_overrides.buy_remaining_accounts,
-            amount_lamports,
-            min_tokens_out,
-        );
+        let buy_instruction =
+            DirectBuyBuilder::build_buy_ix_with_accounts_and_remaining_and_creator_vault(
+                payer_pubkey,
+                mint,
+                token_program,
+                account_overrides.global_config,
+                account_overrides.fee_recipient,
+                account_overrides.creator_pubkey,
+                account_overrides.creator_vault,
+                account_overrides.buy_variant,
+                account_overrides.associated_bonding_curve,
+                account_overrides.bonding_curve_v2,
+                &account_overrides.buy_remaining_accounts,
+                amount_lamports,
+                min_tokens_out,
+            );
         let user_ata =
             get_associated_token_address_with_program_id(payer_pubkey, mint, token_program);
         let ata_instruction = attach_idempotent_ata_create.then(|| {
@@ -4577,6 +4589,11 @@ impl TriggerComponent {
                 return "creator_pubkey".to_string();
             }
         }
+        if let Some(value) = request.account_overrides.creator_vault {
+            if *pubkey == value {
+                return "creator_vault".to_string();
+            }
+        }
         if let Some(value) = request.account_overrides.associated_bonding_curve {
             if *pubkey == value {
                 return "associated_bonding_curve".to_string();
@@ -4618,6 +4635,11 @@ impl TriggerComponent {
             if let Some(value) = profile.account_overrides.creator_pubkey {
                 if *pubkey == value {
                     return "creator_pubkey".to_string();
+                }
+            }
+            if let Some(value) = profile.account_overrides.creator_vault {
+                if *pubkey == value {
+                    return "creator_vault".to_string();
                 }
             }
             if let Some(value) = profile.account_overrides.associated_bonding_curve {
@@ -6891,6 +6913,9 @@ mod tests {
             creator_pubkey: Some(Pubkey::new_unique()),
             creator_pubkey_source: Some("unit_test.creator".to_string()),
             creator_pubkey_authoritative: Some(true),
+            creator_vault: None,
+            creator_vault_source: None,
+            creator_vault_authoritative: None,
             buy_variant: Some(trigger::PumpfunBuyVariant::LegacyBuy),
             buy_remaining_accounts: vec![Pubkey::new_unique(), Pubkey::new_unique()],
             legacy_buy_curve: Some(curve),
@@ -6956,6 +6981,9 @@ mod tests {
             creator_pubkey: Some(Pubkey::new_unique()),
             creator_pubkey_source: Some("unit_test.creator".to_string()),
             creator_pubkey_authoritative: Some(true),
+            creator_vault: None,
+            creator_vault_source: None,
+            creator_vault_authoritative: None,
             buy_variant: Some(trigger::PumpfunBuyVariant::LegacyBuy),
             legacy_buy_curve: Some(curve),
             ..BuyAccountOverrides::default()
@@ -7005,6 +7033,9 @@ mod tests {
             creator_pubkey: Some(Pubkey::new_unique()),
             creator_pubkey_source: Some("detected_pool.creator".to_string()),
             creator_pubkey_authoritative: Some(false),
+            creator_vault: None,
+            creator_vault_source: None,
+            creator_vault_authoritative: None,
             buy_variant: Some(trigger::PumpfunBuyVariant::LegacyBuy),
             buy_remaining_accounts: vec![Pubkey::new_unique(), Pubkey::new_unique()],
             legacy_buy_curve: Some(curve),
@@ -7055,6 +7086,9 @@ mod tests {
             creator_pubkey: Some(Pubkey::new_unique()),
             creator_pubkey_source: Some("unit_test.creator".to_string()),
             creator_pubkey_authoritative: Some(true),
+            creator_vault: None,
+            creator_vault_source: None,
+            creator_vault_authoritative: None,
             buy_variant: Some(trigger::PumpfunBuyVariant::LegacyBuy),
             buy_remaining_accounts: vec![Pubkey::new_unique(), Pubkey::new_unique()],
             legacy_buy_curve: Some(curve),
@@ -7208,6 +7242,9 @@ mod tests {
             creator_pubkey: Some(Pubkey::new_unique()),
             creator_pubkey_source: Some("unit_test.creator".to_string()),
             creator_pubkey_authoritative: Some(true),
+            creator_vault: None,
+            creator_vault_source: None,
+            creator_vault_authoritative: None,
             buy_variant: Some(trigger::PumpfunBuyVariant::LegacyBuy),
             buy_remaining_accounts: vec![Pubkey::new_unique(), Pubkey::new_unique()],
             ..BuyAccountOverrides::default()
@@ -8948,6 +8985,9 @@ mod tests {
                     creator_pubkey: Some(Pubkey::new_unique()),
                     creator_pubkey_source: Some("unit_test.creator".to_string()),
                     creator_pubkey_authoritative: Some(true),
+                    creator_vault: None,
+                    creator_vault_source: None,
+                    creator_vault_authoritative: None,
                     buy_variant: Some(trigger::PumpfunBuyVariant::LegacyBuy),
                     legacy_buy_curve: Some(curve),
                     associated_bonding_curve: Some(
@@ -9116,6 +9156,9 @@ mod tests {
                     creator_pubkey: Some(Pubkey::new_unique()),
                     creator_pubkey_source: Some("unit_test.creator".to_string()),
                     creator_pubkey_authoritative: Some(true),
+                    creator_vault: None,
+                    creator_vault_source: None,
+                    creator_vault_authoritative: None,
                     buy_variant: Some(trigger::PumpfunBuyVariant::LegacyBuy),
                     legacy_buy_curve: Some(curve),
                     associated_bonding_curve: Some(

@@ -706,6 +706,14 @@ pub struct PoolTransaction {
     #[serde(default)]
     pub associated_bonding_curve: Option<String>,
 
+    /// Observed creator vault account from the source instruction fixed account layout.
+    ///
+    /// This is an execution account, not a creator identity. When present from
+    /// observed pump.fun account metas it can prevent reconstructing creator_vault
+    /// from a non-authoritative creator identity.
+    #[serde(default)]
+    pub creator_vault: Option<String>,
+
     /// Observed route-specific bonding_curve_v2 account from the source instruction.
     ///
     /// This account is separate from the canonical bonding_curve/pool id and
@@ -809,6 +817,7 @@ impl PoolTransaction {
             && self.fee_recipient.is_none()
             && self.token_program.is_none()
             && self.associated_bonding_curve.is_none()
+            && self.creator_vault.is_none()
             && self.bonding_curve_v2.is_none()
             && self.bonding_curve_v2_provenance.is_none()
             && self.buy_remaining_accounts.is_empty()

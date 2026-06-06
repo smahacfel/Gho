@@ -819,6 +819,8 @@ fn extract_shadow_error_code(err: &str) -> Option<&'static str> {
         Some("2006")
     } else if lower.contains("custom(6000)") || lower.contains("notauthorized") {
         Some("6000")
+    } else if lower.contains("custom(6002)") || lower.contains("toomuchsolrequired") {
+        Some("6002")
     } else if lower.contains("custom(6062)") {
         Some("6062")
     } else if lower.contains("custom(6024)") || lower.contains("overflow") {
@@ -830,14 +832,30 @@ fn extract_shadow_error_code(err: &str) -> Option<&'static str> {
 
 fn classify_shadow_error_detail(err: &str) -> Option<&'static str> {
     let lower = err.to_lowercase();
-    if lower.contains("custom(2006)") || lower.contains("constraintseeds") {
+    if lower.contains("legacy_buy_simulation_load_not_ready")
+        || lower.contains("simulation_load_not_ready")
+    {
+        Some("state_not_ready_bonding_curve")
+    } else if lower.contains("legacy_buy_missing_buyback_remaining_accounts") {
+        Some("missing_buyback_remaining_accounts")
+    } else if lower.contains("primary_route_bcv2_missing")
+        || lower.contains("missing_bonding_curve_v2")
+    {
+        Some("primary_route_bcv2_missing")
+    } else if lower.contains("route_account_manifest_incomplete") {
+        Some("route_account_manifest_incomplete")
+    } else if lower.contains("custom(2006)") || lower.contains("constraintseeds") {
         Some("seed_mismatch_constraint_seeds")
     } else if lower.contains("custom(6000)") || lower.contains("notauthorized") {
         Some("protocol_not_authorized")
+    } else if lower.contains("custom(6002)") || lower.contains("toomuchsolrequired") {
+        Some("too_much_sol_required")
     } else if lower.contains("custom(6062)") {
         Some("buyback_fee_recipient_missing")
     } else if lower.contains("custom(6024)") || lower.contains("overflow") {
         Some("legacy_buy_amount_overflow")
+    } else if lower.contains("429") || lower.contains("too many requests") {
+        Some("rpc_rate_limited")
     } else {
         None
     }
@@ -845,7 +863,23 @@ fn classify_shadow_error_detail(err: &str) -> Option<&'static str> {
 
 pub fn classify_shadow_error(err: &str) -> &'static str {
     let lower = err.to_lowercase();
-    if RpcShadowSimulator::is_retryable(&lower)
+    if lower.contains("legacy_buy_simulation_load_not_ready")
+        || lower.contains("simulation_load_not_ready")
+    {
+        "state_readiness_error"
+    } else if lower.contains("no_executable_route_account_set")
+        || lower.contains("legacy_buy_missing_buyback_remaining_accounts")
+        || lower.contains("primary_route_bcv2_missing")
+        || lower.contains("route_account_manifest_incomplete")
+    {
+        "route_materialization_error"
+    } else if lower.contains("custom(2006)") || lower.contains("constraintseeds") {
+        "account_pda_constraint_error"
+    } else if lower.contains("custom(6002)") || lower.contains("toomuchsolrequired") {
+        "quote_slippage_error"
+    } else if lower.contains("custom(6024)") || lower.contains("overflow") {
+        "quote_amount_error"
+    } else if RpcShadowSimulator::is_retryable(&lower)
         || lower.contains("rpc")
         || lower.contains("too many requests")
         || lower.contains("connection reset")
@@ -1688,6 +1722,7 @@ mod tests {
     fn classify_shadow_error_detail_extracts_known_custom_codes() {
         let err_2006 = "InstructionError(3, Custom(2006))";
         let err_6000 = "AnchorError occurred. Error Code: NotAuthorized. Error Number: 6000.";
+        let err_6002 = "InstructionError(3, Custom(6002))";
         let err_6062 = "InstructionError(3, Custom(6062))";
 
         assert_eq!(extract_shadow_error_code(err_2006), Some("2006"));
@@ -1700,6 +1735,11 @@ mod tests {
             classify_shadow_error_detail(err_6000),
             Some("protocol_not_authorized")
         );
+        assert_eq!(extract_shadow_error_code(err_6002), Some("6002"));
+        assert_eq!(
+            classify_shadow_error_detail(err_6002),
+            Some("too_much_sol_required")
+        );
         assert_eq!(extract_shadow_error_code(err_6062), Some("6062"));
         assert_eq!(
             classify_shadow_error_detail(err_6062),
@@ -1710,6 +1750,54 @@ mod tests {
         assert_eq!(
             classify_shadow_error_detail(err_6024),
             Some("legacy_buy_amount_overflow")
+        );
+    }
+
+    #[test]
+    fn classify_shadow_error_marks_route_and_state_readiness_failures() {
+        assert_eq!(
+            classify_shadow_error(
+                "no_executable_route_account_set:legacy_buy_missing_buyback_remaining_accounts:count=0:expected=2"
+            ),
+            "route_materialization_error"
+        );
+        assert_eq!(
+            classify_shadow_error_detail(
+                "no_executable_route_account_set:legacy_buy_missing_buyback_remaining_accounts:count=0:expected=2"
+            ),
+            Some("missing_buyback_remaining_accounts")
+        );
+        assert_eq!(
+            classify_shadow_error(
+                "no_executable_route_account_set:legacy_buy_simulation_load_not_ready:bonding_curve:pool"
+            ),
+            "state_readiness_error"
+        );
+        assert_eq!(
+            classify_shadow_error_detail(
+                "no_executable_route_account_set:legacy_buy_simulation_load_not_ready:bonding_curve:pool"
+            ),
+            Some("state_not_ready_bonding_curve")
+        );
+    }
+
+    #[test]
+    fn classify_shadow_error_marks_specific_simulation_failures() {
+        assert_eq!(
+            classify_shadow_error("InstructionError(3, Custom(2006))"),
+            "account_pda_constraint_error"
+        );
+        assert_eq!(
+            classify_shadow_error("InstructionError(3, Custom(6002))"),
+            "quote_slippage_error"
+        );
+        assert_eq!(
+            classify_shadow_error("InstructionError(3, Custom(6024))"),
+            "quote_amount_error"
+        );
+        assert_eq!(
+            classify_shadow_error_detail("HTTP status 429 Too Many Requests"),
+            Some("rpc_rate_limited")
         );
     }
 

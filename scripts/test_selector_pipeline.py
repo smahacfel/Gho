@@ -26,7 +26,9 @@ import build_selector_r2only_feature_audit as r2only_feature_audit
 import build_selector_r2only_model_candidate as r2only_model_candidate
 import build_selector_training_view as training
 import compare_selector_gatekeepers as compare
+import audit_selector_buy_simulation_coverage as simcov_audit
 import guard_gatekeeper_decision_feature_surface as gk_surface_guard
+import start_selector_lifecycle_run as lifecycle_launcher
 import selector_pipeline_common as common
 import train_selector_baseline as baseline
 
@@ -3259,6 +3261,23 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertFalse(report["claim_boundaries"]["gatekeeper_tuned"])
         self.assertFalse(report["claim_boundaries"]["runtime_changed"])
 
+    def test_selector_lifecycle_launcher_accepts_build_freshness_flag(self) -> None:
+        args = lifecycle_launcher.build_parser().parse_args(
+            [
+                "--scope",
+                "shadow-burnin-v3-selector-dataset-r11-simcov-route2-smoke",
+                "--config",
+                "configs/rollout/shadow-burnin-v3-selector-dataset-r11-simcov-route2-smoke.toml",
+                "--tmux-session",
+                "selector_dataset_r11_simcov_route2",
+                "--build-release-before-start",
+                "--dry-run",
+            ]
+        )
+
+        self.assertTrue(args.build_release_before_start)
+        self.assertTrue(args.dry_run)
+
     def test_r2_market_paths_writes_one_row_per_candidate_and_missing_path_is_unresolved(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3786,6 +3805,385 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertIn("no_candidate_matched_canonical_source", source_manifest["fail_reasons"])
         self.assertEqual(source_manifest["source_rows_written"], 0)
         self.assertEqual(source_rows, [])
+
+    def write_simcov_fixture(
+        self,
+        root: Path,
+        *,
+        scope: str,
+        buy_rows: list[dict],
+        shadow_rows: list[dict],
+    ) -> None:
+        decision_dir = (
+            root
+            / "logs"
+            / "rollout"
+            / scope
+            / "decisions"
+            / scope
+            / "v2.2"
+            / "legacy_live"
+            / "fixture"
+        )
+        shadow_dir = root / "logs" / "shadow_run" / scope
+        decision_rows = [
+            {
+                **row,
+                "log_schema_version": 25,
+                "decision_plane": "legacy_live",
+                "gatekeeper_version": "v2.2",
+                "decision_verdict_buy": True,
+                "verdict_type": "BUY",
+            }
+            for row in buy_rows
+        ]
+        write_jsonl(decision_dir / "gatekeeper_v2_decisions.jsonl", decision_rows)
+        write_jsonl(decision_dir / "gatekeeper_v2_buys.jsonl", decision_rows)
+        write_jsonl(root / "logs" / "shadow_run" / f"{scope}-buys.jsonl", shadow_rows)
+        write_jsonl(shadow_dir / "shadow_entries.jsonl", shadow_rows)
+        write_jsonl(shadow_dir / "shadow_lifecycle.jsonl", shadow_rows)
+        rollout_dir = root / "logs" / "rollout" / scope
+        rollout_dir.mkdir(parents=True, exist_ok=True)
+        (rollout_dir / "system.log").write_text("", encoding="utf-8")
+        (rollout_dir / "oracle.log").write_text("", encoding="utf-8")
+
+    def run_simcov_audit(self, root: Path, scope: str) -> dict:
+        return simcov_audit.build_audit(
+            simcov_audit.build_parser().parse_args(
+                [
+                    "--scope",
+                    scope,
+                    "--root",
+                    str(root),
+                    "--decision-plane",
+                    "legacy_live",
+                    "--max-unknown-rate",
+                    "1.0",
+                ]
+            )
+        )
+
+    def test_buy_simulation_audit_classifies_not_executable_legacy_tail_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "simcov-legacy-tail"
+            buy = {
+                "pool_id": "pool1",
+                "base_mint": "mint1",
+                "ab_record_id": "pool1:mint1:BUY",
+                "shadow_execution_outcome": "shadow_unknown_error",
+            }
+            shadow = {
+                "record_type": "shadow_dispatch",
+                "pool_id": "pool1",
+                "mint_id": "mint1",
+                "ab_record_id": "pool1:mint1:BUY",
+                "candidate_id": "mint1_pool1_1000",
+                "decision_plane": "legacy_live",
+                "decision_ts_ms": 1000,
+                "dispatch_status": "not_dispatched",
+                "simulation_outcome": "not_attempted",
+                "execution_feasibility_status": "not_executable_route",
+                "route_resolution_status": "no_executable_route_account_set",
+                "dispatch_attempted": False,
+                "simulation_attempted": False,
+                "precheck_failure_reason": (
+                    "no_executable_route_account_set:"
+                    "legacy_buy_missing_buyback_remaining_accounts:count=0:expected=2"
+                ),
+            }
+            self.write_simcov_fixture(root, scope=scope, buy_rows=[buy], shadow_rows=[shadow])
+            report = self.run_simcov_audit(root, scope)
+            samples = read_jsonl(Path(report["outputs"]["samples"]))
+
+        self.assertEqual(report["metrics"]["buy_rows"], 1)
+        self.assertEqual(report["metrics"]["not_executable_route_rows"], 1)
+        self.assertEqual(
+            report["failure_classes"]["ROUTE_INCOMPLETE_LEGACY_TAIL_MISSING"]["count"],
+            1,
+        )
+        self.assertEqual(samples[0]["classification"], "ROUTE_INCOMPLETE_LEGACY_TAIL_MISSING")
+        self.assertEqual(samples[0]["legacy_buy_remaining_account_count"], 0)
+
+    def test_buy_simulation_audit_reports_route_manifest_cache_lookup_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "simcov-route-cache-status"
+            buy = {
+                "pool_id": "pool1",
+                "base_mint": "mint1",
+                "ab_record_id": "pool1:mint1:BUY",
+                "shadow_execution_outcome": "shadow_unknown_error",
+            }
+            shadow = {
+                "record_type": "shadow_dispatch",
+                "pool_id": "pool1",
+                "mint_id": "mint1",
+                "ab_record_id": "pool1:mint1:BUY",
+                "candidate_id": "mint1_pool1_1000",
+                "decision_plane": "legacy_live",
+                "decision_ts_ms": 1000,
+                "dispatch_status": "not_dispatched",
+                "simulation_outcome": "not_attempted",
+                "execution_feasibility_status": "not_executable_route",
+                "route_resolution_status": "no_executable_route_account_set",
+                "precheck_failure_reason": (
+                    "no_executable_route_account_set:"
+                    "legacy_buy_missing_buyback_remaining_accounts:count=0:expected=2"
+                ),
+            }
+            self.write_simcov_fixture(root, scope=scope, buy_rows=[buy], shadow_rows=[shadow])
+            rollout_dir = root / "logs" / "rollout" / scope
+            (rollout_dir / "system.log").write_text(
+                "INFO pool=pool1 base_mint=mint1 phase=after_wait "
+                "manifest_cache_lookup_status=ROUTE_CACHE_MISS_NO_PRIOR_MANIFEST "
+                "manifest_cache_candidate_count=0 prior_complete_legacy_manifest_age_ms=0 "
+                "has_prior_complete_legacy_manifest_in_session=false "
+                "route_account_manifest_source=missing_observed_legacy_manifest "
+                "ACTIVE_BUY_ROUTE_MANIFEST_CACHE_LOOKUP\n",
+                encoding="utf-8",
+            )
+            report = self.run_simcov_audit(root, scope)
+            samples = read_jsonl(Path(report["outputs"]["samples"]))
+
+        self.assertEqual(
+            report["route_manifest_cache"]["classes"]["ROUTE_CACHE_MISS_NO_PRIOR_MANIFEST"]["count"],
+            1,
+        )
+        self.assertEqual(
+            samples[0]["manifest_cache_lookup_status"],
+            "ROUTE_CACHE_MISS_NO_PRIOR_MANIFEST",
+        )
+        self.assertEqual(samples[0]["manifest_cache_candidate_count"], 0)
+
+    def test_buy_simulation_audit_route_missing_with_rpc_status_not_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "simcov-route-rpc-status"
+            buy = {
+                "pool_id": "pool1",
+                "base_mint": "mint1",
+                "ab_record_id": "pool1:mint1:BUY",
+                "shadow_execution_outcome": "shadow_unknown_error",
+            }
+            shadow = {
+                "record_type": "shadow_dispatch",
+                "pool_id": "pool1",
+                "mint_id": "mint1",
+                "ab_record_id": "pool1:mint1:BUY",
+                "candidate_id": "mint1_pool1_1000",
+                "decision_plane": "legacy_live",
+                "decision_ts_ms": 1000,
+                "dispatch_status": "not_dispatched",
+                "simulation_outcome": "not_attempted",
+                "execution_feasibility_status": "not_executable_route",
+                "route_resolution_status": "no_executable_route_account_set",
+                "dispatch_attempted": False,
+                "simulation_attempted": False,
+                "legacy_buy_curve_rpc_load_status": "present_on_rpc_precheck",
+                "precheck_failure_reason": (
+                    "no_executable_route_account_set:"
+                    "legacy_buy_missing_buyback_remaining_accounts:count=0:expected=2"
+                ),
+            }
+            self.write_simcov_fixture(root, scope=scope, buy_rows=[buy], shadow_rows=[shadow])
+            report = self.run_simcov_audit(root, scope)
+            samples = read_jsonl(Path(report["outputs"]["samples"]))
+
+        self.assertEqual(
+            report["failure_classes"]["ROUTE_INCOMPLETE_LEGACY_TAIL_MISSING"]["count"],
+            1,
+        )
+        self.assertEqual(report["failure_classes"].get("SIM_FAIL_PROVIDER", {}).get("count", 0), 0)
+        self.assertEqual(samples[0]["classification"], "ROUTE_INCOMPLETE_LEGACY_TAIL_MISSING")
+
+    def test_buy_simulation_audit_classifies_bcv2_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "simcov-bcv2"
+            buy = {
+                "pool_id": "pool1",
+                "base_mint": "mint1",
+                "ab_record_id": "pool1:mint1:BUY",
+                "shadow_execution_outcome": "shadow_unknown_error",
+            }
+            shadow = {
+                "record_type": "shadow_dispatch",
+                "pool_id": "pool1",
+                "mint_id": "mint1",
+                "ab_record_id": "pool1:mint1:BUY",
+                "candidate_id": "mint1_pool1_1000",
+                "decision_plane": "legacy_live",
+                "decision_ts_ms": 1000,
+                "dispatch_status": "not_dispatched",
+                "simulation_outcome": "not_attempted",
+                "execution_feasibility_status": "not_executable_route",
+                "route_resolution_status": "no_executable_route_account_set",
+                "precheck_failure_reason": (
+                    "no_executable_route_account_set:"
+                    "primary_route_bcv2_missing:bonding_curve_v2:bcv2"
+                ),
+            }
+            self.write_simcov_fixture(root, scope=scope, buy_rows=[buy], shadow_rows=[shadow])
+            report = self.run_simcov_audit(root, scope)
+            samples = read_jsonl(Path(report["outputs"]["samples"]))
+
+        self.assertEqual(
+            report["failure_classes"]["ROUTE_INCOMPLETE_BCV2_MISSING"]["count"],
+            1,
+        )
+        self.assertTrue(samples[0]["primary_route_bcv2_missing"])
+
+    def test_buy_simulation_audit_classifies_legacy_curve_load_not_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "simcov-load-not-ready"
+            buy = {
+                "pool_id": "pool1",
+                "base_mint": "mint1",
+                "ab_record_id": "pool1:mint1:BUY",
+                "shadow_execution_outcome": "shadow_unknown_error",
+            }
+            shadow = {
+                "record_type": "shadow_dispatch",
+                "pool_id": "pool1",
+                "mint_id": "mint1",
+                "ab_record_id": "pool1:mint1:BUY",
+                "candidate_id": "mint1_pool1_1000",
+                "decision_plane": "legacy_live",
+                "dispatch_status": "not_dispatched",
+                "simulation_outcome": "not_attempted",
+                "execution_feasibility_status": "not_executable_route",
+                "route_resolution_status": "no_executable_route_account_set",
+                "dispatch_attempted": False,
+                "simulation_attempted": False,
+                "precheck_failure_reason": (
+                    "no_executable_route_account_set:"
+                    "legacy_buy_simulation_load_not_ready:bonding_curve:pool1"
+                ),
+            }
+            self.write_simcov_fixture(root, scope=scope, buy_rows=[buy], shadow_rows=[shadow])
+            report = self.run_simcov_audit(root, scope)
+            samples = read_jsonl(Path(report["outputs"]["samples"]))
+
+        self.assertEqual(
+            report["failure_classes"]["ROUTE_INCOMPLETE_STATE_NOT_READY"]["count"],
+            1,
+        )
+        self.assertEqual(report["failure_classes"]["UNKNOWN_UNCLASSIFIED"]["count"], 0)
+        self.assertEqual(samples[0]["classification"], "ROUTE_INCOMPLETE_STATE_NOT_READY")
+
+    def test_buy_simulation_audit_classifies_custom_program_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "simcov-custom"
+            buys = []
+            shadows = []
+            for code in ("2006", "6024", "6002"):
+                buys.append(
+                    {
+                        "pool_id": f"pool{code}",
+                        "base_mint": f"mint{code}",
+                        "ab_record_id": f"pool{code}:mint{code}:BUY",
+                        "shadow_execution_outcome": "shadow_simulation_error",
+                    }
+                )
+                shadows.append(
+                    {
+                        "record_type": "shadow_dispatch",
+                        "pool_id": f"pool{code}",
+                        "mint_id": f"mint{code}",
+                        "ab_record_id": f"pool{code}:mint{code}:BUY",
+                        "candidate_id": f"mint{code}_pool{code}_1000",
+                        "decision_plane": "legacy_live",
+                        "dispatch_status": "failed",
+                        "simulation_outcome": "failed",
+                        "dispatch_attempted": True,
+                        "simulation_attempted": True,
+                        "execution_feasibility_status": "executable",
+                        "route_resolution_status": "primary_route_ready",
+                        "err": f"InstructionError(3, Custom({code}))",
+                        "logs_excerpt": [f"custom {code}"],
+                        "retry_count": 0,
+                        "payer_provenance": "configured",
+                        "simulation_account_manifest": [{"role": "bonding_curve"}],
+                    }
+                )
+            self.write_simcov_fixture(root, scope=scope, buy_rows=buys, shadow_rows=shadows)
+            report = self.run_simcov_audit(root, scope)
+
+        self.assertEqual(report["failure_classes"]["SIM_FAIL_CUSTOM_2006"]["count"], 1)
+        self.assertEqual(report["failure_classes"]["SIM_FAIL_CUSTOM_6024"]["count"], 1)
+        self.assertEqual(report["failure_classes"]["SIM_FAIL_CUSTOM_6002"]["count"], 1)
+
+    def test_buy_simulation_audit_ignores_feature_timeout_for_provider_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "simcov-provider"
+            buy = {
+                "pool_id": "pool1",
+                "base_mint": "mint1",
+                "ab_record_id": "pool1:mint1:BUY",
+                "shadow_execution_outcome": "shadow_transport_error",
+                "iwim_fetch_status": "TIMEOUT",
+            }
+            shadow = {
+                "record_type": "shadow_dispatch",
+                "pool_id": "pool1",
+                "mint_id": "mint1",
+                "ab_record_id": "pool1:mint1:BUY",
+                "candidate_id": "mint1_pool1_1000",
+                "decision_plane": "legacy_live",
+                "dispatch_status": "failed",
+                "simulation_outcome": "failed",
+                "dispatch_attempted": True,
+                "simulation_attempted": True,
+                "execution_feasibility_status": "executable",
+                "route_resolution_status": "primary_route_ready",
+                "err": "Failed to fetch payer account: HTTP status client error (429 Too Many Requests)",
+                "error_class": "network_provider_problem",
+            }
+            self.write_simcov_fixture(root, scope=scope, buy_rows=[buy], shadow_rows=[shadow])
+            report = self.run_simcov_audit(root, scope)
+            samples = read_jsonl(Path(report["outputs"]["samples"]))
+
+        self.assertEqual(report["failure_classes"]["SIM_FAIL_PROVIDER"]["count"], 1)
+        self.assertEqual(report["failure_classes"].get("SIM_FAIL_TIMEOUT", {}).get("count", 0), 0)
+        self.assertEqual(samples[0]["classification"], "SIM_FAIL_PROVIDER")
+
+    def test_buy_simulation_audit_classifies_position_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "simcov-position-limit"
+            buy = {
+                "pool_id": "pool1",
+                "base_mint": "mint1",
+                "ab_record_id": "pool1:mint1:BUY",
+                "shadow_execution_outcome": "shadow_position_limit_reached",
+            }
+            shadow = {
+                "record_type": "shadow_dispatch",
+                "pool_id": "pool1",
+                "mint_id": "mint1",
+                "ab_record_id": "pool1:mint1:BUY",
+                "candidate_id": "mint1_pool1_1000",
+                "decision_plane": "legacy_live",
+                "dispatch_status": "failed",
+                "simulation_outcome": "failed",
+                "dispatch_attempted": True,
+                "simulation_attempted": True,
+                "execution_feasibility_status": "executable",
+                "route_resolution_status": "primary_route_ready",
+                "err": "Max concurrent positions reached: active=5, max=5",
+            }
+            self.write_simcov_fixture(root, scope=scope, buy_rows=[buy], shadow_rows=[shadow])
+            report = self.run_simcov_audit(root, scope)
+            samples = read_jsonl(Path(report["outputs"]["samples"]))
+
+        self.assertEqual(report["metrics"]["position_limit_rows"], 1)
+        self.assertEqual(report["failure_classes"]["POSITION_LIMIT_REACHED"]["count"], 1)
+        self.assertEqual(samples[0]["active_positions"], 5)
+        self.assertEqual(samples[0]["max_concurrent_positions"], 5)
 
 
 if __name__ == "__main__":

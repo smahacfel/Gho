@@ -349,6 +349,7 @@ impl NlnPumpFunTradeEvent {
                 PumpFunTradeSide::Sell => "nln_pumpfun_sell".to_string(),
             }),
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],

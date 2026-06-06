@@ -276,6 +276,38 @@ impl DirectBuyBuilder {
         amount_sol_in: u64,
         min_tokens_out: u64,
     ) -> Instruction {
+        Self::build_buy_ix_with_accounts_and_remaining_and_creator_vault(
+            payer,
+            mint,
+            token_program,
+            global_config,
+            fee_recipient,
+            creator_pubkey,
+            None,
+            buy_variant,
+            associated_bonding_curve,
+            bonding_curve_v2_override,
+            buy_remaining_accounts,
+            amount_sol_in,
+            min_tokens_out,
+        )
+    }
+
+    pub fn build_buy_ix_with_accounts_and_remaining_and_creator_vault(
+        payer: &Pubkey,
+        mint: &Pubkey,
+        token_program: &Pubkey,
+        global_config: Option<Pubkey>,
+        fee_recipient: Option<Pubkey>,
+        creator_pubkey: Option<Pubkey>,
+        creator_vault_override: Option<Pubkey>,
+        buy_variant: Option<PumpfunBuyVariant>,
+        associated_bonding_curve: Option<Pubkey>,
+        bonding_curve_v2_override: Option<Pubkey>,
+        buy_remaining_accounts: &[Pubkey],
+        amount_sol_in: u64,
+        min_tokens_out: u64,
+    ) -> Instruction {
         let program_id = Self::pump_program_id();
         let buy_variant = buy_variant.unwrap_or(PumpfunBuyVariant::RoutedExactSolIn);
         let fee_program =
@@ -301,10 +333,11 @@ impl DirectBuyBuilder {
             &[USER_VOLUME_ACCUMULATOR_SEED, payer.as_ref()],
             &program_id,
         );
-        let (creator_vault, _) = Pubkey::find_program_address(
+        let (derived_creator_vault, _) = Pubkey::find_program_address(
             &[CREATOR_VAULT_SEED, creator_pubkey.as_ref()],
             &program_id,
         );
+        let creator_vault = creator_vault_override.unwrap_or(derived_creator_vault);
         let (fee_config, _) =
             Pubkey::find_program_address(&[FEE_CONFIG_SEED, &FEE_SEED_CONST], &fee_program);
         let associated_bonding_curve = associated_bonding_curve
@@ -1030,6 +1063,39 @@ mod tests {
         );
 
         assert_eq!(ix.accounts[4].pubkey, assoc_override);
+    }
+
+    #[test]
+    fn test_build_buy_ix_uses_observed_creator_vault_override() {
+        let payer = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let creator = Pubkey::new_unique();
+        let observed_creator_vault = Pubkey::new_unique();
+        let token_program =
+            Pubkey::from_str(TOKEN_2022_PROGRAM_ID).expect("valid token2022 program");
+
+        let ix = DirectBuyBuilder::build_buy_ix_with_accounts_and_remaining_and_creator_vault(
+            &payer,
+            &mint,
+            &token_program,
+            None,
+            None,
+            Some(creator),
+            Some(observed_creator_vault),
+            Some(PumpfunBuyVariant::LegacyBuy),
+            None,
+            None,
+            &[Pubkey::new_unique(), Pubkey::new_unique()],
+            1_000_000,
+            1_000,
+        );
+
+        let (derived_creator_vault, _) = Pubkey::find_program_address(
+            &[CREATOR_VAULT_SEED, creator.as_ref()],
+            &DirectBuyBuilder::pump_program_id(),
+        );
+        assert_ne!(observed_creator_vault, derived_creator_vault);
+        assert_eq!(ix.accounts[9].pubkey, observed_creator_vault);
     }
 
     #[test]

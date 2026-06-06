@@ -120,6 +120,7 @@ const PUMP_IDX_GLOBAL_CONFIG: usize = 0;
 const PUMP_IDX_FEE_RECIPIENT: usize = 1;
 const PUMP_IDX_ASSOCIATED_BONDING_CURVE: usize = 4;
 const PUMP_IDX_TOKEN_PROGRAM: usize = 8;
+const PUMP_IDX_CREATOR_VAULT: usize = 9;
 const PUMP_IDX_BONDING_CURVE_V2: usize = 16;
 const PUMP_BUY_FIXED_ACCOUNT_COUNT: usize = 16;
 const PUMP_BUYBACK_REMAINING_ACCOUNT_COUNT: usize = 2;
@@ -4211,6 +4212,7 @@ impl BinaryParser {
                         token_program,
                         buy_variant: None,
                         associated_bonding_curve: None,
+                        creator_vault: None,
                         bonding_curve_v2: None,
                         bonding_curve_v2_provenance: None,
                         buy_remaining_accounts: vec![],
@@ -4276,6 +4278,7 @@ impl BinaryParser {
                         token_program: None,
                         buy_variant: None,
                         associated_bonding_curve: None,
+                        creator_vault: None,
                         bonding_curve_v2: None,
                         bonding_curve_v2_provenance: None,
                         buy_remaining_accounts: vec![],
@@ -4364,6 +4367,7 @@ impl BinaryParser {
                         token_program: None,
                         buy_variant: None,
                         associated_bonding_curve: None,
+                        creator_vault: None,
                         bonding_curve_v2: None,
                         bonding_curve_v2_provenance: None,
                         buy_remaining_accounts: vec![],
@@ -4443,6 +4447,7 @@ impl BinaryParser {
                         token_program: None,
                         buy_variant: None,
                         associated_bonding_curve: None,
+                        creator_vault: None,
                         bonding_curve_v2: None,
                         bonding_curve_v2_provenance: None,
                         buy_remaining_accounts: vec![],
@@ -4555,6 +4560,7 @@ impl BinaryParser {
                         token_program: None,
                         buy_variant: None,
                         associated_bonding_curve: None,
+                        creator_vault: None,
                         bonding_curve_v2: None,
                         bonding_curve_v2_provenance: None,
                         buy_remaining_accounts: vec![],
@@ -4667,6 +4673,7 @@ impl BinaryParser {
                         token_program: None,
                         buy_variant: None,
                         associated_bonding_curve: None,
+                        creator_vault: None,
                         bonding_curve_v2: None,
                         bonding_curve_v2_provenance: None,
                         buy_remaining_accounts: vec![],
@@ -4815,6 +4822,7 @@ impl BinaryParser {
                 token_program: None,
                 buy_variant: None,
                 associated_bonding_curve: None,
+                creator_vault: None,
                 bonding_curve_v2: None,
                 bonding_curve_v2_provenance: None,
                 buy_remaining_accounts: vec![],
@@ -5833,6 +5841,9 @@ fn merge_trade_optional_accounts(target: &mut TradeEvent, source: &TradeEvent) {
     if target.associated_bonding_curve.is_none() {
         target.associated_bonding_curve = source.associated_bonding_curve;
     }
+    if target.creator_vault.is_none() {
+        target.creator_vault = source.creator_vault;
+    }
     if target.bonding_curve_v2.is_none() {
         target.bonding_curve_v2 = source.bonding_curve_v2;
     }
@@ -6029,7 +6040,9 @@ fn trade_enrich_complete(trade: &TradeEvent) -> bool {
         && trade.fee_recipient.is_some()
         && trade.token_program.is_some()
         && (!trade.is_buy
-            || (trade.buy_variant.is_some() && trade.associated_bonding_curve.is_some()))
+            || (trade.buy_variant.is_some()
+                && trade.associated_bonding_curve.is_some()
+                && trade.creator_vault.is_some()))
 }
 
 fn pump_buy_enrichment_priority(ix_data: &[u8]) -> u8 {
@@ -6188,6 +6201,11 @@ fn fill_trade_from_ix_accounts(
             Pubkey::from_str(&acs(ix_accounts, PUMP_IDX_ASSOCIATED_BONDING_CURVE))
                 .ok()
                 .filter(|value| *value != Pubkey::default());
+    }
+    if trade.is_buy && trade.creator_vault.is_none() {
+        trade.creator_vault = Pubkey::from_str(&acs(ix_accounts, PUMP_IDX_CREATOR_VAULT))
+            .ok()
+            .filter(|value| *value != Pubkey::default());
     }
     if trade.is_buy && pump_buy_variant_has_bcv2(ix_data) && trade.bonding_curve_v2.is_none() {
         trade.bonding_curve_v2 = Pubkey::from_str(&acs(ix_accounts, PUMP_IDX_BONDING_CURVE_V2))
@@ -7002,6 +7020,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],
@@ -10004,6 +10023,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],
@@ -10054,6 +10074,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],
@@ -10121,6 +10142,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],
@@ -10272,6 +10294,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],
@@ -10447,6 +10470,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],
@@ -10523,6 +10547,7 @@ mod tests {
         let fee_recipient = Pubkey::new_unique();
         let token_program = Pubkey::new_unique();
         let associated_bonding_curve = Pubkey::new_unique();
+        let creator_vault = Pubkey::new_unique();
         let buyback_fee_recipient = Pubkey::new_unique();
         let buyback_quote_account = Pubkey::new_unique();
 
@@ -10534,6 +10559,7 @@ mod tests {
         accounts[PUMP_IDX_ASSOCIATED_BONDING_CURVE] = associated_bonding_curve;
         accounts[PUMP_IDX_USER] = user;
         accounts[PUMP_IDX_TOKEN_PROGRAM] = token_program;
+        accounts[PUMP_IDX_CREATOR_VAULT] = creator_vault;
         accounts[16] = buyback_fee_recipient;
         accounts[17] = buyback_quote_account;
 
@@ -10560,6 +10586,7 @@ mod tests {
             trade.associated_bonding_curve,
             Some(associated_bonding_curve)
         );
+        assert_eq!(trade.creator_vault, Some(creator_vault));
         assert_eq!(trade.bonding_curve_v2, None);
         assert_eq!(trade.bonding_curve_v2_provenance, None);
         assert_eq!(
@@ -11019,6 +11046,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],
@@ -11121,6 +11149,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],
@@ -11233,6 +11262,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],
@@ -11328,6 +11358,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],
@@ -11437,6 +11468,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],

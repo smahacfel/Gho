@@ -618,6 +618,14 @@ pub struct TradeEvent {
     #[serde(default)]
     pub associated_bonding_curve: Option<Pubkey>,
 
+    /// Observed creator vault account from the source instruction fixed account layout.
+    ///
+    /// This is execution account evidence. It is not a creator identity and
+    /// must only be used as authoritative when copied from observed pump.fun
+    /// instruction accounts.
+    #[serde(default)]
+    pub creator_vault: Option<Pubkey>,
+
     /// Observed route-specific bonding_curve_v2 account from the source instruction.
     ///
     /// This is an execution-load account for routed Pump.fun buy builders, not the

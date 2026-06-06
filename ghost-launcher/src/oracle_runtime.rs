@@ -1997,6 +1997,8 @@ pub struct OracleRuntime {
     pool_identities: Arc<PoolIdentityRegistry>,
     account_state_core: Arc<AccountStateReducer>,
     execution_account_evidence_store: Arc<ExecutionAccountEvidenceStore>,
+    active_buy_route_manifest_cache:
+        RwLock<HashMap<ActiveBuyRouteManifestKey, ActiveBuyRouteManifestEntry>>,
     canonical_readiness_notifier: CanonicalReadinessNotifier,
     runtime_pool_states: RwLock<HashMap<Pubkey, PoolState>>,
     orphans: RwLock<HashMap<Pubkey, Vec<OrphanTx>>>,
@@ -2090,6 +2092,265 @@ struct P37LegacyBuyCurveMaterialization {
     pubkey: Pubkey,
     source: String,
     authority_status: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ActiveBuyRouteManifestKey {
+    pool_id: Pubkey,
+    base_mint: Pubkey,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveBuyRouteManifestEntry {
+    pool_id: Pubkey,
+    base_mint: Pubkey,
+    observed_ts_ms: u64,
+    slot: Option<u64>,
+    signature: String,
+    source: String,
+    global_config: Pubkey,
+    fee_recipient: Pubkey,
+    token_program: Pubkey,
+    associated_bonding_curve: Pubkey,
+    creator_vault: Pubkey,
+    buy_remaining_accounts: Vec<Pubkey>,
+    bonding_curve_v2: Option<Pubkey>,
+    bonding_curve_v2_provenance: Option<crate::events::ObservedAccountMetaProvenance>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveBuyRouteManifestLookup {
+    overrides: Option<crate::components::trigger::BuyAccountOverrides>,
+    status: &'static str,
+    candidate_count: usize,
+    age_ms: Option<u64>,
+}
+
+impl ActiveBuyRouteManifestLookup {
+    fn disabled() -> Self {
+        Self {
+            overrides: None,
+            status: "ROUTE_CACHE_DISABLED",
+            candidate_count: 0,
+            age_ms: None,
+        }
+    }
+
+    fn miss(status: &'static str, candidate_count: usize, age_ms: Option<u64>) -> Self {
+        Self {
+            overrides: None,
+            status,
+            candidate_count,
+            age_ms,
+        }
+    }
+
+    fn hit(
+        overrides: crate::components::trigger::BuyAccountOverrides,
+        age_ms: Option<u64>,
+    ) -> Self {
+        Self {
+            overrides: Some(overrides),
+            status: "ROUTE_CACHE_HIT_REUSED",
+            candidate_count: 1,
+            age_ms,
+        }
+    }
+}
+
+fn active_buy_route_manifest_entry_from_tx(
+    pool_id: Pubkey,
+    base_mint: Pubkey,
+    tx: &PoolTransaction,
+) -> Option<ActiveBuyRouteManifestEntry> {
+    if tx.pool_amm_id != pool_id.to_string()
+        || !tx.success
+        || !tx.is_buy
+        || tx.is_nln_program_stream_trade_telemetry_only()
+        || tx.buy_variant.as_deref() != Some("legacy_buy")
+        || tx.buy_remaining_accounts.len() != trigger::PUMPFUN_BUYBACK_REMAINING_ACCOUNT_COUNT
+    {
+        return None;
+    }
+    let tx_base_mint = tx
+        .token_mint
+        .as_deref()
+        .and_then(|value| Pubkey::try_from(value).ok())?;
+    if tx_base_mint != base_mint {
+        return None;
+    }
+
+    let canonical_global_config = trigger::DirectBuyBuilder::canonical_global_config();
+    let global_config = tx
+        .global_config
+        .as_deref()
+        .and_then(|value| Pubkey::try_from(value).ok())
+        .filter(|value| *value == canonical_global_config)?;
+    let fee_recipient = tx
+        .fee_recipient
+        .as_deref()
+        .and_then(|value| Pubkey::try_from(value).ok())
+        .filter(trigger::DirectBuyBuilder::is_authorized_fee_recipient)?;
+    let token_program = tx
+        .token_program
+        .as_deref()
+        .and_then(|value| Pubkey::try_from(value).ok())?;
+    let associated_bonding_curve = tx
+        .associated_bonding_curve
+        .as_deref()
+        .and_then(|value| Pubkey::try_from(value).ok())?;
+    let creator_vault = tx
+        .creator_vault
+        .as_deref()
+        .and_then(|value| Pubkey::try_from(value).ok())
+        .filter(|value| *value != Pubkey::default())?;
+    let buy_remaining_accounts: Vec<Pubkey> = tx
+        .buy_remaining_accounts
+        .iter()
+        .filter_map(|value| Pubkey::try_from(value.as_str()).ok())
+        .collect();
+    if buy_remaining_accounts.len() != trigger::PUMPFUN_BUYBACK_REMAINING_ACCOUNT_COUNT {
+        return None;
+    }
+    Some(ActiveBuyRouteManifestEntry {
+        pool_id,
+        base_mint,
+        observed_ts_ms: tx_event_ts_ms(tx),
+        slot: tx.slot,
+        signature: tx.signature.clone(),
+        source: "observed_pool_transaction".to_string(),
+        global_config,
+        fee_recipient,
+        token_program,
+        associated_bonding_curve,
+        creator_vault,
+        buy_remaining_accounts,
+        bonding_curve_v2: tx
+            .bonding_curve_v2
+            .as_deref()
+            .and_then(|value| Pubkey::try_from(value).ok()),
+        bonding_curve_v2_provenance: tx.bonding_curve_v2_provenance.clone(),
+    })
+}
+
+fn active_buy_route_manifest_entry_conflicts(
+    left: &ActiveBuyRouteManifestEntry,
+    right: &ActiveBuyRouteManifestEntry,
+) -> bool {
+    left.pool_id != right.pool_id
+        || left.base_mint != right.base_mint
+        || left.global_config != right.global_config
+        || left.fee_recipient != right.fee_recipient
+        || left.token_program != right.token_program
+        || left.associated_bonding_curve != right.associated_bonding_curve
+        || left.creator_vault != right.creator_vault
+        || left.buy_remaining_accounts != right.buy_remaining_accounts
+}
+
+fn active_buy_route_manifest_entry_to_overrides(
+    entry: &ActiveBuyRouteManifestEntry,
+) -> crate::components::trigger::BuyAccountOverrides {
+    crate::components::trigger::BuyAccountOverrides {
+        global_config: Some(entry.global_config),
+        fee_recipient: Some(entry.fee_recipient),
+        token_program: Some(entry.token_program),
+        creator_pubkey: None,
+        creator_pubkey_source: None,
+        creator_pubkey_authoritative: None,
+        creator_vault: Some(entry.creator_vault),
+        creator_vault_source: Some("reused_observed_legacy_manifest.creator_vault".to_string()),
+        creator_vault_authoritative: Some(true),
+        buy_variant: Some(trigger::PumpfunBuyVariant::LegacyBuy),
+        associated_bonding_curve: Some(entry.associated_bonding_curve),
+        bonding_curve_v2: entry.bonding_curve_v2,
+        bonding_curve_v2_provenance: entry.bonding_curve_v2_provenance.clone(),
+        buy_remaining_accounts: entry.buy_remaining_accounts.clone(),
+        route_account_manifest_source: Some("reused_observed_legacy_manifest".to_string()),
+        execution_account_contract_status: Some("complete".to_string()),
+        execution_account_contract_reason: Some("route_account_contract_complete".to_string()),
+        ..Default::default()
+    }
+}
+
+fn active_buy_route_manifest_overrides_conflict(
+    current: &crate::components::trigger::BuyAccountOverrides,
+    cached: &crate::components::trigger::BuyAccountOverrides,
+) -> bool {
+    if current.route_account_manifest_source.as_deref() == Some("nln_program_streams")
+        || current.execution_account_contract_status.as_deref() == Some("telemetry_only")
+    {
+        return true;
+    }
+    if current.global_config.is_some() && current.global_config != cached.global_config {
+        return true;
+    }
+    if current.fee_recipient.is_some() && current.fee_recipient != cached.fee_recipient {
+        return true;
+    }
+    if current.token_program.is_some() && current.token_program != cached.token_program {
+        return true;
+    }
+    if current.associated_bonding_curve.is_some()
+        && current.associated_bonding_curve != cached.associated_bonding_curve
+    {
+        return true;
+    }
+    if current.creator_vault.is_some()
+        && current.creator_vault_authoritative == Some(true)
+        && current.creator_vault != cached.creator_vault
+    {
+        return true;
+    }
+    !current.buy_remaining_accounts.is_empty()
+        && current.buy_remaining_accounts != cached.buy_remaining_accounts
+}
+
+fn active_buy_should_try_route_manifest_cache(
+    overrides: &crate::components::trigger::BuyAccountOverrides,
+) -> bool {
+    if !buy_account_overrides_has_execution_route_manifest(overrides) {
+        return true;
+    }
+    matches!(
+        overrides.buy_variant,
+        Some(trigger::PumpfunBuyVariant::RoutedExactSolIn)
+    ) && overrides.buy_remaining_accounts.len() != trigger::PUMPFUN_BUYBACK_REMAINING_ACCOUNT_COUNT
+}
+
+fn active_buy_merge_cached_legacy_manifest_for_fallback(
+    current: &crate::components::trigger::BuyAccountOverrides,
+    cached_legacy: crate::components::trigger::BuyAccountOverrides,
+) -> crate::components::trigger::BuyAccountOverrides {
+    if !matches!(
+        current.buy_variant,
+        Some(trigger::PumpfunBuyVariant::RoutedExactSolIn)
+    ) {
+        return cached_legacy;
+    }
+    let mut merged = current.clone();
+    merged.buy_remaining_accounts = cached_legacy.buy_remaining_accounts.clone();
+    if merged.global_config.is_none() {
+        merged.global_config = cached_legacy.global_config;
+    }
+    if merged.fee_recipient.is_none() {
+        merged.fee_recipient = cached_legacy.fee_recipient;
+    }
+    if merged.token_program.is_none() {
+        merged.token_program = cached_legacy.token_program;
+    }
+    if merged.associated_bonding_curve.is_none() {
+        merged.associated_bonding_curve = cached_legacy.associated_bonding_curve;
+    }
+    if merged.creator_vault.is_none() || merged.creator_vault_authoritative != Some(true) {
+        merged.creator_vault = cached_legacy.creator_vault;
+        merged.creator_vault_source = cached_legacy.creator_vault_source;
+        merged.creator_vault_authoritative = cached_legacy.creator_vault_authoritative;
+    }
+    merged.route_account_manifest_source = Some("reused_observed_legacy_manifest".to_string());
+    merged.execution_account_contract_status = None;
+    merged.execution_account_contract_reason = None;
+    mark_buy_account_overrides_route_contract(&mut merged, false, true);
+    merged
 }
 
 impl OracleRuntime {
@@ -2223,6 +2484,7 @@ impl OracleRuntime {
             pool_identities: Arc::new(PoolIdentityRegistry::new()),
             account_state_core,
             execution_account_evidence_store,
+            active_buy_route_manifest_cache: RwLock::new(HashMap::new()),
             canonical_readiness_notifier: CanonicalReadinessNotifier::default(),
             runtime_pool_states: RwLock::new(HashMap::new()),
             orphans: RwLock::new(HashMap::new()),
@@ -2259,6 +2521,109 @@ impl OracleRuntime {
 
     pub fn execution_account_evidence_store(&self) -> Arc<ExecutionAccountEvidenceStore> {
         Arc::clone(&self.execution_account_evidence_store)
+    }
+
+    fn active_buy_route_manifest_cache_enabled(&self) -> bool {
+        self.config.session.active_buy_route_manifest_cache_enabled
+    }
+
+    fn active_buy_route_manifest_cache_ttl_ms(&self) -> u64 {
+        self.config.session.active_buy_route_manifest_cache_ttl_ms
+    }
+
+    fn maybe_cache_active_buy_route_manifest_from_tx(
+        &self,
+        pool_id: Pubkey,
+        base_mint: Option<Pubkey>,
+        tx: &PoolTransaction,
+    ) -> Option<&'static str> {
+        if !self.active_buy_route_manifest_cache_enabled() {
+            return None;
+        }
+        let base_mint = base_mint.or_else(|| {
+            tx.token_mint
+                .as_deref()
+                .and_then(|value| Pubkey::try_from(value).ok())
+        })?;
+        let entry = active_buy_route_manifest_entry_from_tx(pool_id, base_mint, tx)?;
+        let key = ActiveBuyRouteManifestKey { pool_id, base_mint };
+        let mut cache = self.active_buy_route_manifest_cache.write();
+        match cache.get(&key) {
+            Some(existing) if active_buy_route_manifest_entry_conflicts(existing, &entry) => {
+                warn!(
+                    pool = %pool_id,
+                    base_mint = %base_mint,
+                    existing_signature = %existing.signature,
+                    new_signature = %entry.signature,
+                    "ACTIVE_BUY_ROUTE_MANIFEST_CACHE_CONFLICT"
+                );
+                Some("ROUTE_CACHE_MISS_CONFLICT")
+            }
+            Some(existing) if existing.observed_ts_ms > entry.observed_ts_ms => {
+                Some("ROUTE_CACHE_KEPT_NEWER")
+            }
+            _ => {
+                cache.insert(key, entry.clone());
+                info!(
+                    pool = %pool_id,
+                    base_mint = %base_mint,
+                    observed_ts_ms = entry.observed_ts_ms,
+                    slot = ?entry.slot,
+                    signature = %entry.signature,
+                    source = %entry.source,
+                    buy_remaining_account_count = entry.buy_remaining_accounts.len(),
+                    "ACTIVE_BUY_ROUTE_MANIFEST_CACHE_STORE"
+                );
+                Some("ROUTE_CACHE_STORED")
+            }
+        }
+    }
+
+    fn lookup_active_buy_route_manifest(
+        &self,
+        pool_id: Pubkey,
+        base_mint: Pubkey,
+        cutoff_ts_ms: u64,
+        current: &crate::components::trigger::BuyAccountOverrides,
+    ) -> ActiveBuyRouteManifestLookup {
+        if !self.active_buy_route_manifest_cache_enabled() {
+            return ActiveBuyRouteManifestLookup::disabled();
+        }
+        if current.route_account_manifest_source.as_deref() == Some("nln_program_streams")
+            || current.execution_account_contract_status.as_deref() == Some("telemetry_only")
+        {
+            return ActiveBuyRouteManifestLookup::miss("ROUTE_CACHE_MISS_TELEMETRY_ONLY", 0, None);
+        }
+        let key = ActiveBuyRouteManifestKey { pool_id, base_mint };
+        let cache = self.active_buy_route_manifest_cache.read();
+        let Some(entry) = cache.get(&key) else {
+            return ActiveBuyRouteManifestLookup::miss(
+                "ROUTE_CACHE_MISS_NO_PRIOR_MANIFEST",
+                0,
+                None,
+            );
+        };
+        if entry.observed_ts_ms > cutoff_ts_ms {
+            return ActiveBuyRouteManifestLookup::miss(
+                "ROUTE_CACHE_MISS_NO_PRIOR_MANIFEST",
+                1,
+                Some(0),
+            );
+        }
+        let age_ms = cutoff_ts_ms.saturating_sub(entry.observed_ts_ms);
+        let ttl_ms = self.active_buy_route_manifest_cache_ttl_ms();
+        if ttl_ms > 0 && age_ms > ttl_ms {
+            return ActiveBuyRouteManifestLookup::miss("ROUTE_CACHE_MISS_EXPIRED", 1, Some(age_ms));
+        }
+        let cached_overrides = active_buy_route_manifest_entry_to_overrides(entry);
+        if active_buy_route_manifest_overrides_conflict(current, &cached_overrides) {
+            return ActiveBuyRouteManifestLookup::miss(
+                "ROUTE_CACHE_MISS_CONFLICT",
+                1,
+                Some(age_ms),
+            );
+        }
+        ActiveBuyRouteManifestLookup::hit(cached_overrides, Some(age_ms))
     }
 
     pub fn record_execution_account_evidence(
@@ -8207,47 +8572,60 @@ fn p37_shadow_probe_route_resolution_diagnostics_with_mode(
                             || reason
                                 .starts_with(P37_LEGACY_BUY_REMAINING_ACCOUNTS_INCOMPLETE_REASON)
                             || reason == P37_UNSUPPORTED_LEGACY_BUY_LAYOUT_REASON
-                    })
+                })
             })?
         });
     if let Some(no_executable_reason) = explicit_route_contract_failure {
-        return P37ExecutableRouteResolutionDiagnostics {
-            route_resolution_status: Some("no_executable_route_account_set".to_string()),
-            selected_route_kind: None,
-            selected_route_reason: Some("route_account_contract_not_simulation_ready".to_string()),
-            primary_route_kind: Some(primary_route_kind),
-            primary_route_ready: Some(false),
-            primary_route_not_ready_reason: Some(no_executable_reason.clone()),
-            fallback_route_kind: None,
-            fallback_route_attempted: Some(false),
-            fallback_route_ready: Some(false),
-            fallback_route_not_ready_reason: None,
-            fallback_missing_roles: Vec::new(),
-            fallback_missing_pubkeys: Vec::new(),
-            fallback_account_sources: Vec::new(),
-            fallback_simulation_load_account_set: Vec::new(),
-            fallback_creatable_account_set: Vec::new(),
-            fallback_required_precheck_account_set: Vec::new(),
-            fallback_failure_class: None,
-            no_executable_route_account_set_reason: Some(no_executable_reason),
-            legacy_buy_account_set_status: legacy_buy.account_set_status,
-            legacy_buy_curve_pubkey: legacy_buy.curve_pubkey,
-            legacy_buy_curve_source: legacy_buy.curve_source,
-            legacy_buy_curve_authority_status: legacy_buy.curve_authority_status,
-            legacy_buy_curve_rpc_load_status: legacy_buy.curve_rpc_load_status,
-            legacy_buy_curve_rpc_load_ready: legacy_buy.curve_rpc_load_ready,
-            legacy_buy_curve_authority_readiness_status: legacy_buy
-                .curve_authority_readiness_status,
-            legacy_buy_associated_bonding_curve_pubkey: legacy_buy.associated_bonding_curve_pubkey,
-            legacy_buy_associated_bonding_curve_source: legacy_buy.associated_bonding_curve_source,
-            legacy_buy_associated_bonding_curve_rpc_load_ready: legacy_buy
-                .associated_bonding_curve_rpc_load_ready,
-            legacy_buy_required_roles: legacy_buy.required_roles,
-            legacy_buy_missing_roles: legacy_buy.missing_roles,
-            legacy_buy_missing_pubkeys: legacy_buy.missing_pubkeys,
-            legacy_buy_route_ready: legacy_buy.route_ready,
-            legacy_buy_route_not_ready_reason: legacy_buy.route_not_ready_reason,
-        };
+        let defer_to_bcv2_fallback =
+            primary_route_kind != "legacy_buy"
+                && no_executable_reason
+                    .starts_with(P37_LEGACY_BUY_REMAINING_ACCOUNTS_INCOMPLETE_REASON)
+                && (no_executable_reason.contains("primary_route_bcv2_missing")
+                    || no_executable_reason.contains("bonding_curve_v2:"))
+                && legacy_buy.route_ready == Some(true);
+        if !defer_to_bcv2_fallback {
+            return P37ExecutableRouteResolutionDiagnostics {
+                route_resolution_status: Some("no_executable_route_account_set".to_string()),
+                selected_route_kind: None,
+                selected_route_reason: Some(
+                    "route_account_contract_not_simulation_ready".to_string(),
+                ),
+                primary_route_kind: Some(primary_route_kind),
+                primary_route_ready: Some(false),
+                primary_route_not_ready_reason: Some(no_executable_reason.clone()),
+                fallback_route_kind: None,
+                fallback_route_attempted: Some(false),
+                fallback_route_ready: Some(false),
+                fallback_route_not_ready_reason: None,
+                fallback_missing_roles: Vec::new(),
+                fallback_missing_pubkeys: Vec::new(),
+                fallback_account_sources: Vec::new(),
+                fallback_simulation_load_account_set: Vec::new(),
+                fallback_creatable_account_set: Vec::new(),
+                fallback_required_precheck_account_set: Vec::new(),
+                fallback_failure_class: None,
+                no_executable_route_account_set_reason: Some(no_executable_reason),
+                legacy_buy_account_set_status: legacy_buy.account_set_status,
+                legacy_buy_curve_pubkey: legacy_buy.curve_pubkey,
+                legacy_buy_curve_source: legacy_buy.curve_source,
+                legacy_buy_curve_authority_status: legacy_buy.curve_authority_status,
+                legacy_buy_curve_rpc_load_status: legacy_buy.curve_rpc_load_status,
+                legacy_buy_curve_rpc_load_ready: legacy_buy.curve_rpc_load_ready,
+                legacy_buy_curve_authority_readiness_status: legacy_buy
+                    .curve_authority_readiness_status,
+                legacy_buy_associated_bonding_curve_pubkey: legacy_buy
+                    .associated_bonding_curve_pubkey,
+                legacy_buy_associated_bonding_curve_source: legacy_buy
+                    .associated_bonding_curve_source,
+                legacy_buy_associated_bonding_curve_rpc_load_ready: legacy_buy
+                    .associated_bonding_curve_rpc_load_ready,
+                legacy_buy_required_roles: legacy_buy.required_roles,
+                legacy_buy_missing_roles: legacy_buy.missing_roles,
+                legacy_buy_missing_pubkeys: legacy_buy.missing_pubkeys,
+                legacy_buy_route_ready: legacy_buy.route_ready,
+                legacy_buy_route_not_ready_reason: legacy_buy.route_not_ready_reason,
+            };
+        }
     }
 
     let bcv2_from_failure = precheck_failure_reason
@@ -9234,6 +9612,7 @@ fn p37_shadow_probe_derive_legacy_buy_account_overrides(
                 .and_then(|value| Pubkey::try_from(value).ok()),
             buy_variant: Some(trigger::PumpfunBuyVariant::LegacyBuy),
             associated_bonding_curve: Some(associated_bonding_curve),
+            creator_vault: None,
             bonding_curve_v2: tx
                 .bonding_curve_v2
                 .as_deref()
@@ -10817,6 +11196,21 @@ fn p37_working_builder_bcv2_execution_evidence_readiness(
 fn p37_working_builder_creator_vault_source_authority(
     request: &crate::components::trigger::PreparedBuyRequest,
 ) -> Option<String> {
+    if request.account_overrides.creator_vault.is_some() {
+        return match request.account_overrides.creator_vault_authoritative {
+            Some(true) => Some(format!(
+                "authoritative_{}",
+                request
+                    .account_overrides
+                    .creator_vault_source
+                    .as_deref()
+                    .unwrap_or("account_overrides.creator_vault")
+                    .replace('.', "_")
+            )),
+            Some(false) => Some("creator_vault_source_not_authoritative".to_string()),
+            None => Some("creator_vault_source_authority_unknown".to_string()),
+        };
+    }
     let has_creator = request
         .account_overrides
         .creator_pubkey
@@ -13268,7 +13662,11 @@ fn p37_selected_route_final_manifest_failure_reason(
                 trigger::PUMPFUN_BUYBACK_REMAINING_ACCOUNT_COUNT
             ));
         }
-        if request.account_overrides.creator_pubkey_authoritative == Some(false) {
+        let has_authoritative_creator_vault = request.account_overrides.creator_vault.is_some()
+            && request.account_overrides.creator_vault_authoritative == Some(true);
+        if request.account_overrides.creator_pubkey_authoritative == Some(false)
+            && !has_authoritative_creator_vault
+        {
             return Some(format!(
                 "creator_vault_source_not_authoritative:legacy_buy:{}:{}",
                 request
@@ -17021,6 +17419,273 @@ async fn wait_for_live_trigger_readiness(
     }
 }
 
+fn active_buy_shadow_route_evidence_wait_ms(
+    ctx: &PoolObservationContext,
+    trigger_component: &crate::components::trigger::TriggerComponent,
+) -> u64 {
+    let shadow_only_active = ctx.execution_mode == ExecutionMode::Shadow
+        && matches!(
+            trigger_component.entry_mode(),
+            crate::config::TriggerEntryMode::ShadowOnly
+        )
+        && trigger_component.shadow_run_enabled();
+    if shadow_only_active {
+        ctx.oracle_runtime
+            .config
+            .session
+            .active_buy_route_evidence_wait_ms
+    } else {
+        0
+    }
+}
+
+fn build_active_buy_execution_evidence_txs(
+    buffered_txs: &[crate::components::gatekeeper::GatekeeperBufferedTx],
+) -> Vec<Arc<PoolTransaction>> {
+    buffered_txs
+        .iter()
+        .map(|buffered| Arc::clone(&buffered.tx))
+        .collect()
+}
+
+fn derive_active_buy_account_overrides_from_evidence(
+    ctx: &PoolObservationContext,
+    buy_mint: Pubkey,
+    pd: &DetectedPool,
+    execution_evidence_txs: &[Arc<PoolTransaction>],
+) -> crate::components::trigger::BuyAccountOverrides {
+    let account_overrides = derive_buy_account_overrides_from_pool_txs(
+        execution_evidence_txs.iter().map(|tx| tx.as_ref()),
+    );
+    finalize_active_buy_account_overrides(ctx, buy_mint, pd, account_overrides)
+}
+
+fn finalize_active_buy_account_overrides(
+    ctx: &PoolObservationContext,
+    buy_mint: Pubkey,
+    pd: &DetectedPool,
+    mut account_overrides: crate::components::trigger::BuyAccountOverrides,
+) -> crate::components::trigger::BuyAccountOverrides {
+    if account_overrides.creator_pubkey.is_none() {
+        if let Ok(pool_creator) = Pubkey::try_from(pd.creator.as_str()) {
+            account_overrides.creator_pubkey = Some(pool_creator);
+            account_overrides.creator_pubkey_source = Some("detected_pool.creator".to_string());
+            account_overrides.creator_pubkey_authoritative = Some(matches!(
+                account_overrides.buy_variant,
+                Some(trigger::PumpfunBuyVariant::RoutedExactSolIn)
+            ));
+        }
+    }
+    if matches!(
+        account_overrides.buy_variant,
+        Some(trigger::PumpfunBuyVariant::LegacyBuy)
+            | Some(trigger::PumpfunBuyVariant::RoutedExactSolIn)
+    ) {
+        if let Some(materialization) = ctx
+            .oracle_runtime
+            .resolve_trigger_buy_curve_materialization(buy_mint, &[])
+        {
+            p37_apply_legacy_buy_curve_materialization(&mut account_overrides, materialization);
+        }
+    }
+    p37_restore_legacy_buy_authorize_detected_pool_creator(&mut account_overrides);
+    mark_buy_account_overrides_route_contract(&mut account_overrides, false, true);
+    account_overrides
+}
+
+fn log_active_buy_route_manifest_cache_lookup(
+    pool_id: Pubkey,
+    base_mint: Pubkey,
+    phase: &str,
+    lookup: &ActiveBuyRouteManifestLookup,
+) {
+    info!(
+        pool = %pool_id,
+        base_mint = %base_mint,
+        phase,
+        manifest_cache_lookup_status = lookup.status,
+        manifest_cache_candidate_count = lookup.candidate_count,
+        prior_complete_legacy_manifest_age_ms = lookup.age_ms.unwrap_or_default(),
+        has_prior_complete_legacy_manifest_in_session = lookup.candidate_count > 0,
+        route_account_manifest_source = lookup
+            .overrides
+            .as_ref()
+            .and_then(|overrides| overrides.route_account_manifest_source.as_deref())
+            .unwrap_or("missing_observed_legacy_manifest"),
+        "ACTIVE_BUY_ROUTE_MANIFEST_CACHE_LOOKUP"
+    );
+}
+
+fn try_reuse_active_buy_route_manifest_cache(
+    ctx: &PoolObservationContext,
+    pool_id: Pubkey,
+    buy_mint: Pubkey,
+    pd: &DetectedPool,
+    phase: &str,
+    account_overrides: &crate::components::trigger::BuyAccountOverrides,
+) -> (
+    crate::components::trigger::BuyAccountOverrides,
+    ActiveBuyRouteManifestLookup,
+) {
+    let cutoff_ts_ms = current_time_ms();
+    let lookup = ctx.oracle_runtime.lookup_active_buy_route_manifest(
+        pool_id,
+        buy_mint,
+        cutoff_ts_ms,
+        account_overrides,
+    );
+    log_active_buy_route_manifest_cache_lookup(pool_id, buy_mint, phase, &lookup);
+    if let Some(cached_overrides) = lookup.overrides.clone() {
+        let merged_or_replaced = active_buy_merge_cached_legacy_manifest_for_fallback(
+            account_overrides,
+            cached_overrides,
+        );
+        let finalized =
+            finalize_active_buy_account_overrides(ctx, buy_mint, pd, merged_or_replaced);
+        return (finalized, lookup);
+    }
+    (account_overrides.clone(), lookup)
+}
+
+fn apply_active_buy_route_evidence_message(
+    pool_id: Pubkey,
+    registered_wall_ts_ms: u64,
+    msg: PoolObservationMsg,
+    ctx: &PoolObservationContext,
+    identity: &mut ObservationIdentity,
+    base_mint_pubkey: &mut Option<Pubkey>,
+    pool_data: &mut Option<Arc<DetectedPool>>,
+) -> Option<Arc<PoolTransaction>> {
+    match msg {
+        PoolObservationMsg::Transaction(tx) => {
+            if tx.pool_amm_id != pool_id.to_string() {
+                return None;
+            }
+            maybe_promote_observation_identity_from_tx(
+                pool_id,
+                tx.as_ref(),
+                ctx.ab_window_ms,
+                identity,
+                base_mint_pubkey,
+                current_time_ms(),
+                max_identity_promotion_retries(),
+            );
+            let _ = ctx
+                .oracle_runtime
+                .maybe_materialize_canonical_state_from_observed_tx(
+                    pool_id,
+                    *base_mint_pubkey,
+                    tx.as_ref(),
+                );
+            let enriched = enrich_pool_tx_from_canonical_state(
+                tx,
+                pool_id,
+                *base_mint_pubkey,
+                ctx.oracle_runtime.account_state_core(),
+                ctx.oracle_runtime.get_shadow_ledger(),
+                ctx.oracle_runtime.shadow_ledger_enrichment_freshness_ms(),
+            );
+            let _ = ctx
+                .oracle_runtime
+                .maybe_cache_active_buy_route_manifest_from_tx(
+                    pool_id,
+                    *base_mint_pubkey,
+                    enriched.as_ref(),
+                );
+            Some(enriched)
+        }
+        PoolObservationMsg::NewPool(pd) => {
+            install_buy_path_metadata(
+                pool_id,
+                registered_wall_ts_ms,
+                ctx.ab_window_ms,
+                pd,
+                identity,
+                base_mint_pubkey,
+                pool_data,
+            );
+            None
+        }
+    }
+}
+
+async fn wait_for_active_buy_route_evidence(
+    pool_id: Pubkey,
+    registered_wall_ts_ms: u64,
+    buy_mint: Pubkey,
+    pd: &DetectedPool,
+    wait_ms: u64,
+    rx: &mut tokio::sync::mpsc::Receiver<PoolObservationMsg>,
+    ctx: &PoolObservationContext,
+    identity: &mut ObservationIdentity,
+    base_mint_pubkey: &mut Option<Pubkey>,
+    pool_data: &mut Option<Arc<DetectedPool>>,
+    execution_evidence_txs: &mut Vec<Arc<PoolTransaction>>,
+    mut account_overrides: crate::components::trigger::BuyAccountOverrides,
+) -> (
+    crate::components::trigger::BuyAccountOverrides,
+    Option<u64>,
+    Option<String>,
+) {
+    if wait_ms == 0 || !active_buy_should_try_route_manifest_cache(&account_overrides) {
+        return (account_overrides, None, None);
+    }
+
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis(wait_ms);
+    loop {
+        if Instant::now() >= deadline {
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            return (
+                account_overrides,
+                Some(elapsed_ms),
+                Some("route_evidence_wait_timeout".to_string()),
+            );
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let poll_window = remaining.min(Duration::from_millis(25));
+        tokio::select! {
+            maybe_msg = rx.recv() => {
+                let Some(msg) = maybe_msg else {
+                    let elapsed_ms = started.elapsed().as_millis() as u64;
+                    return (
+                        account_overrides,
+                        Some(elapsed_ms),
+                        Some("route_evidence_wait_channel_closed".to_string()),
+                    );
+                };
+                if let Some(tx) = apply_active_buy_route_evidence_message(
+                    pool_id,
+                    registered_wall_ts_ms,
+                    msg,
+                    ctx,
+                    identity,
+                    base_mint_pubkey,
+                    pool_data,
+                ) {
+                    execution_evidence_txs.push(tx);
+                    account_overrides = derive_active_buy_account_overrides_from_evidence(
+                        ctx,
+                        buy_mint,
+                        pd,
+                        execution_evidence_txs,
+                    );
+                    if !active_buy_should_try_route_manifest_cache(&account_overrides) {
+                        let elapsed_ms = started.elapsed().as_millis() as u64;
+                        return (
+                            account_overrides,
+                            Some(elapsed_ms),
+                            Some("route_evidence_ready".to_string()),
+                        );
+                    }
+                }
+            }
+            _ = tokio::time::sleep(poll_window) => {}
+        }
+    }
+}
+
 async fn execute_gatekeeper_buy_path(
     pool_id: Pubkey,
     registered_wall_ts_ms: u64,
@@ -17228,6 +17893,8 @@ async fn execute_gatekeeper_buy_path(
                     );
                     shadow_execution_outcome = err.outcome_tag().to_string();
                 } else if let Some(pd) = pool_data.as_deref() {
+                    let pd_snapshot = pd.clone();
+                    let pd = &pd_snapshot;
                     let buy_mint = base_mint_pubkey.unwrap_or(initial_buy_mint);
                     let trade_value_sol =
                         trigger_component.estimate_trade_value_sol(pd.initial_liquidity_sol);
@@ -17236,42 +17903,88 @@ async fn execute_gatekeeper_buy_path(
                         .resolve_live_buy_tip(trade_value_sol, urgency)
                         .await;
                     let tip_lamports = resolved_tip.tip_lamports;
-                    let mut account_overrides = derive_buy_account_overrides(buffered_txs);
-                    if account_overrides.creator_pubkey.is_none() {
-                        if let Ok(pool_creator) = Pubkey::try_from(pd.creator.as_str()) {
-                            account_overrides.creator_pubkey = Some(pool_creator);
-                            account_overrides.creator_pubkey_source =
-                                Some("detected_pool.creator".to_string());
-                            account_overrides.creator_pubkey_authoritative = Some(matches!(
-                                account_overrides.buy_variant,
-                                Some(trigger::PumpfunBuyVariant::RoutedExactSolIn)
-                            ));
-                        }
-                    }
-                    if matches!(
-                        account_overrides.buy_variant,
-                        Some(trigger::PumpfunBuyVariant::LegacyBuy)
-                            | Some(trigger::PumpfunBuyVariant::RoutedExactSolIn)
-                    ) {
-                        if let Some(materialization) = ctx
-                            .oracle_runtime
-                            .resolve_trigger_buy_curve_materialization(buy_mint, buffered_txs)
-                        {
-                            p37_apply_legacy_buy_curve_materialization(
-                                &mut account_overrides,
-                                materialization,
+                    let mut execution_evidence_txs =
+                        build_active_buy_execution_evidence_txs(buffered_txs);
+                    let mut account_overrides = derive_active_buy_account_overrides_from_evidence(
+                        ctx,
+                        buy_mint,
+                        pd,
+                        &execution_evidence_txs,
+                    );
+                    if active_buy_should_try_route_manifest_cache(&account_overrides) {
+                        let (cached_overrides, _cache_lookup) =
+                            try_reuse_active_buy_route_manifest_cache(
+                                ctx,
+                                pool_amm_id,
+                                buy_mint,
+                                pd,
+                                "before_wait",
+                                &account_overrides,
                             );
-                        }
-                        if account_overrides.legacy_buy_curve.is_none() {
-                            warn!(
-                                pool = %pool_amm_id,
-                                base_mint = %pd.base_mint,
-                                "Trigger: legacy_buy override is missing ghost-core curve state; live BUY will fail closed"
-                            );
-                        }
+                        account_overrides = cached_overrides;
                     }
-                    p37_restore_legacy_buy_authorize_detected_pool_creator(&mut account_overrides);
-                    mark_buy_account_overrides_route_contract(&mut account_overrides, false, true);
+                    let route_wait_ms =
+                        active_buy_shadow_route_evidence_wait_ms(ctx, trigger_component.as_ref());
+                    let initial_route_contract_reason = account_overrides
+                        .execution_account_contract_reason
+                        .clone()
+                        .unwrap_or_else(|| "route_account_contract_status_unknown".to_string());
+                    let (waited_overrides, route_wait_elapsed_ms, route_wait_result) =
+                        wait_for_active_buy_route_evidence(
+                            pool_amm_id,
+                            registered_wall_ts_ms,
+                            buy_mint,
+                            pd,
+                            route_wait_ms,
+                            rx,
+                            ctx,
+                            identity,
+                            base_mint_pubkey,
+                            pool_data,
+                            &mut execution_evidence_txs,
+                            account_overrides,
+                        )
+                        .await;
+                    account_overrides = waited_overrides;
+                    if active_buy_should_try_route_manifest_cache(&account_overrides) {
+                        let (cached_overrides, _cache_lookup) =
+                            try_reuse_active_buy_route_manifest_cache(
+                                ctx,
+                                pool_amm_id,
+                                buy_mint,
+                                pd,
+                                "after_wait",
+                                &account_overrides,
+                            );
+                        account_overrides = cached_overrides;
+                    }
+                    if let Some(wait_result) = route_wait_result.as_deref() {
+                        info!(
+                            pool = %pool_amm_id,
+                            base_mint = %pd.base_mint,
+                            wait_ms = route_wait_ms,
+                            elapsed_ms = route_wait_elapsed_ms.unwrap_or_default(),
+                            wait_result,
+                            initial_route_contract_reason,
+                            final_route_contract_status = account_overrides
+                                .execution_account_contract_status
+                                .as_deref()
+                                .unwrap_or("unknown"),
+                            final_route_contract_reason = account_overrides
+                                .execution_account_contract_reason
+                                .as_deref()
+                                .unwrap_or("unknown"),
+                            execution_evidence_txs = execution_evidence_txs.len(),
+                            "ACTIVE_BUY_ROUTE_EVIDENCE_WAIT"
+                        );
+                    }
+                    if account_overrides.legacy_buy_curve.is_none() {
+                        warn!(
+                            pool = %pool_amm_id,
+                            base_mint = %pd.base_mint,
+                            "Trigger: buy override is missing ghost-core curve state; live BUY will fail closed"
+                        );
+                    }
                     info!(
                         pool = %pool_amm_id,
                         base_mint = %pd.base_mint,
@@ -17466,6 +18179,9 @@ fn p37_selected_legacy_buy_fallback_overrides(
         creator_pubkey: primary.creator_pubkey,
         creator_pubkey_source: primary.creator_pubkey_source.clone(),
         creator_pubkey_authoritative: primary.creator_pubkey_authoritative,
+        creator_vault: primary.creator_vault,
+        creator_vault_source: primary.creator_vault_source.clone(),
+        creator_vault_authoritative: primary.creator_vault_authoritative,
         buy_variant: Some(trigger::PumpfunBuyVariant::LegacyBuy),
         associated_bonding_curve: primary.associated_bonding_curve,
         bonding_curve_v2: None,
@@ -19348,7 +20064,28 @@ fn shadow_execution_outcome_from_dispatch_error(
         return "shadow_insufficient_balance".to_string();
     }
     if lower.contains("429") || lower.contains("too many requests") {
-        return "shadow_transport_error".to_string();
+        return "shadow_transport_rate_limit".to_string();
+    }
+    if lower.contains("legacy_buy_simulation_load_not_ready")
+        || lower.contains("simulation_load_not_ready")
+    {
+        return "shadow_state_readiness_error".to_string();
+    }
+    if lower.contains("no_executable_route_account_set")
+        || lower.contains("legacy_buy_missing_buyback_remaining_accounts")
+        || lower.contains("primary_route_bcv2_missing")
+        || lower.contains("route_account_manifest_incomplete")
+    {
+        return "shadow_route_materialization_error".to_string();
+    }
+    if lower.contains("custom(2006)") || lower.contains("constraintseeds") {
+        return "shadow_simulation_anchor_constraint_error".to_string();
+    }
+    if lower.contains("custom(6002)") || lower.contains("toomuchsolrequired") {
+        return "shadow_simulation_slippage_error".to_string();
+    }
+    if lower.contains("custom(6024)") || lower.contains("overflow") {
+        return "shadow_simulation_amount_error".to_string();
     }
     if lower.contains("invalid fee payer account owner")
         || lower.contains("invalid executable fee payer account")
@@ -19372,6 +20109,13 @@ fn shadow_execution_outcome_from_dispatch_error(
         "network_provider_problem" | "timing_blockhash_problem" => {
             "shadow_transport_error".to_string()
         }
+        "route_materialization_error" => "shadow_route_materialization_error".to_string(),
+        "state_readiness_error" => "shadow_state_readiness_error".to_string(),
+        "account_pda_constraint_error" => {
+            "shadow_simulation_anchor_constraint_error".to_string()
+        }
+        "quote_slippage_error" => "shadow_simulation_slippage_error".to_string(),
+        "quote_amount_error" => "shadow_simulation_amount_error".to_string(),
         "authority_problem" => "shadow_authority_error".to_string(),
         "fee_compute_problem" => "shadow_fee_compute_error".to_string(),
         "data_problem" => "shadow_data_problem".to_string(),
@@ -19382,10 +20126,21 @@ fn shadow_execution_outcome_from_dispatch_error(
 }
 
 fn shadow_execution_outcome_from_report_err(err: &str) -> String {
+    let lower = err.to_lowercase();
+    if lower.contains("429") || lower.contains("too many requests") {
+        return "shadow_transport_rate_limit".to_string();
+    }
     match crate::components::trigger::shadow_run::classify_shadow_error(err) {
         "network_provider_problem" | "timing_blockhash_problem" => {
             "shadow_transport_error".to_string()
         }
+        "route_materialization_error" => "shadow_route_materialization_error".to_string(),
+        "state_readiness_error" => "shadow_state_readiness_error".to_string(),
+        "account_pda_constraint_error" => {
+            "shadow_simulation_anchor_constraint_error".to_string()
+        }
+        "quote_slippage_error" => "shadow_simulation_slippage_error".to_string(),
+        "quote_amount_error" => "shadow_simulation_amount_error".to_string(),
         "authority_problem" => "shadow_authority_error".to_string(),
         "fee_compute_problem" => "shadow_fee_compute_error".to_string(),
         "data_problem" => "shadow_data_problem".to_string(),
@@ -19438,9 +20193,12 @@ fn p37_direct_buy_builder_required_account_failure_tail(
             "missing_token_program",
         ));
     }
-    if overrides.creator_pubkey.is_none() {
+    let has_creator_pubkey = overrides.creator_pubkey.is_some();
+    let has_authoritative_creator_vault =
+        overrides.creator_vault.is_some() && overrides.creator_vault_authoritative == Some(true);
+    if !has_creator_pubkey && !has_authoritative_creator_vault {
         return Some(p37_route_account_manifest_incomplete(
-            "missing_creator_pubkey",
+            "missing_creator_pubkey_or_creator_vault",
         ));
     }
     if overrides.associated_bonding_curve.is_none() {
@@ -19454,7 +20212,9 @@ fn p37_direct_buy_builder_required_account_failure_tail(
 fn p37_legacy_buy_creator_authority_failure_tail(
     overrides: &crate::components::trigger::BuyAccountOverrides,
 ) -> Option<String> {
-    if overrides.creator_pubkey_authoritative == Some(false) {
+    let has_authoritative_creator_vault =
+        overrides.creator_vault.is_some() && overrides.creator_vault_authoritative == Some(true);
+    if overrides.creator_pubkey_authoritative == Some(false) && !has_authoritative_creator_vault {
         return Some(format!(
             "creator_vault_source_not_authoritative:legacy_buy:{}:{}",
             overrides
@@ -19556,12 +20316,23 @@ fn mark_buy_account_overrides_route_contract(
 fn derive_buy_account_overrides(
     buffered_txs: &[crate::components::gatekeeper::GatekeeperBufferedTx],
 ) -> crate::components::trigger::BuyAccountOverrides {
+    derive_buy_account_overrides_from_pool_txs(
+        buffered_txs.iter().map(|buffered| buffered.tx.as_ref()),
+    )
+}
+
+fn derive_buy_account_overrides_from_pool_txs<'a, I>(
+    txs: I,
+) -> crate::components::trigger::BuyAccountOverrides
+where
+    I: IntoIterator<Item = &'a PoolTransaction>,
+    I::IntoIter: DoubleEndedIterator,
+{
     let canonical_global_config = trigger::DirectBuyBuilder::canonical_global_config();
     let mut overrides = crate::components::trigger::BuyAccountOverrides::default();
     let mut saw_nln_telemetry_buy = false;
     let mut saw_route_account_evidence = false;
-    for buffered in buffered_txs.iter().rev() {
-        let tx = buffered.tx.as_ref();
+    for tx in txs.into_iter().rev() {
         if !tx.success || !tx.is_buy {
             continue;
         }
@@ -19574,6 +20345,7 @@ fn derive_buy_account_overrides(
             || tx.token_program.is_some()
             || tx.buy_variant.as_deref() == Some("routed_exact_sol_in")
             || tx.associated_bonding_curve.is_some()
+            || tx.creator_vault.is_some()
             || tx.bonding_curve_v2.is_some()
             || !tx.buy_remaining_accounts.is_empty()
         {
@@ -19619,6 +20391,19 @@ fn derive_buy_account_overrides(
                 .as_deref()
                 .and_then(|value| Pubkey::try_from(value).ok());
         }
+        if overrides.creator_vault.is_none() {
+            if let Some(creator_vault) = tx
+                .creator_vault
+                .as_deref()
+                .and_then(|value| Pubkey::try_from(value).ok())
+                .filter(|value| *value != Pubkey::default())
+            {
+                overrides.creator_vault = Some(creator_vault);
+                overrides.creator_vault_source =
+                    Some("observed_pool_transaction.creator_vault".to_string());
+                overrides.creator_vault_authoritative = Some(true);
+            }
+        }
         if overrides.bonding_curve_v2.is_none() {
             overrides.bonding_curve_v2 = tx
                 .bonding_curve_v2
@@ -19650,6 +20435,7 @@ fn derive_buy_account_overrides(
             && overrides.token_program.is_some()
             && overrides.buy_variant.is_some()
             && overrides.associated_bonding_curve.is_some()
+            && (overrides.creator_pubkey.is_some() || overrides.creator_vault.is_some())
             && route_complete
         {
             break;
@@ -23173,6 +23959,11 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                                 base_mint =
                                     oracle_runtime.lookup_base_mint_for_pool(&pool_id);
                             }
+                            let _ = oracle_runtime.maybe_cache_active_buy_route_manifest_from_tx(
+                                pool_id,
+                                base_mint,
+                                tx.as_ref(),
+                            );
 
                             // Durable selector feature evidence is intentionally
                             // emitted before runtime rejected-pool filtering.  The
@@ -26701,6 +27492,62 @@ mod tests {
     }
 
     #[test]
+    fn p37_route_resolver_defers_stale_legacy_tail_failure_for_validated_bcv2_fallback() {
+        let mut request = test_working_builder_prepared_buy_request();
+        request.account_overrides.buy_remaining_accounts =
+            vec![Pubkey::new_unique(), Pubkey::new_unique()];
+        let bcv2 = request
+            .account_overrides
+            .bonding_curve_v2
+            .expect("test bcv2")
+            .to_string();
+        let legacy_curve_pubkey = request
+            .account_overrides
+            .legacy_buy_curve_pubkey
+            .expect("test legacy curve");
+        let diagnostics = P37ShadowProbeAccountSetDiagnostics {
+            manifest: vec![
+                p37_shadow_probe_test_legacy_curve_manifest_entry(legacy_curve_pubkey),
+                p37_shadow_probe_route_compatible_bcv2_manifest_entry(bcv2.clone()),
+            ],
+            missing_candidates: vec![P37ShadowProbeAccountNotFoundCandidate {
+                pubkey: bcv2.clone(),
+                role: "bonding_curve_v2".to_string(),
+                source: "observed_tx_account_meta".to_string(),
+                instruction_index: Some(0),
+                account_index: Some(16),
+                required: true,
+                ..Default::default()
+            }],
+            manifest_lookup_performed: true,
+            ..Default::default()
+        };
+        let stale_primary_failure = format!(
+            "no_executable_route_account_set:legacy_buy_missing_buyback_remaining_accounts:count=0:expected=2:primary_route_bcv2_missing:bonding_curve_v2:{bcv2}"
+        );
+
+        let resolution = p37_shadow_probe_route_resolution_diagnostics(
+            Some(&request),
+            Some(&diagnostics),
+            Some(stale_primary_failure.as_str()),
+            None,
+        );
+
+        assert_eq!(
+            resolution.route_resolution_status.as_deref(),
+            Some("fallback_route_ready")
+        );
+        assert_eq!(
+            resolution.selected_route_kind.as_deref(),
+            Some("legacy_buy")
+        );
+        assert_eq!(resolution.primary_route_ready, Some(false));
+        assert_eq!(resolution.fallback_route_attempted, Some(true));
+        assert_eq!(resolution.fallback_route_ready, Some(true));
+        assert_eq!(resolution.no_executable_route_account_set_reason, None);
+    }
+
+    #[test]
     fn p37_route_resolver_primary_bcv2_manifest_missing_selects_validated_legacy_fallback_without_precheck_reason(
     ) {
         let mut request = test_working_builder_prepared_buy_request();
@@ -27656,6 +28503,9 @@ mod tests {
             creator_pubkey: Some(Pubkey::new_unique()),
             creator_pubkey_source: Some("unit_test".to_string()),
             creator_pubkey_authoritative: Some(true),
+            creator_vault: None,
+            creator_vault_source: None,
+            creator_vault_authoritative: None,
             buy_variant: Some(trigger::PumpfunBuyVariant::RoutedExactSolIn),
             associated_bonding_curve: Some(
                 trigger::DirectBuyBuilder::canonical_associated_bonding_curve(
@@ -27683,6 +28533,9 @@ mod tests {
             creator_pubkey: Some(Pubkey::new_unique()),
             creator_pubkey_source: Some("unit_test.observed_creator".to_string()),
             creator_pubkey_authoritative: Some(true),
+            creator_vault: None,
+            creator_vault_source: None,
+            creator_vault_authoritative: None,
             buy_variant: Some(trigger::PumpfunBuyVariant::LegacyBuy),
             associated_bonding_curve: Some(
                 trigger::DirectBuyBuilder::canonical_associated_bonding_curve(
@@ -29148,6 +30001,9 @@ mod tests {
             creator_pubkey: Some(creator_pubkey),
             creator_pubkey_source: Some("detected_pool.creator".to_string()),
             creator_pubkey_authoritative: Some(true),
+            creator_vault: None,
+            creator_vault_source: None,
+            creator_vault_authoritative: None,
             buy_variant: Some(trigger::PumpfunBuyVariant::RoutedExactSolIn),
             associated_bonding_curve: Some(associated_bonding_curve),
             bonding_curve_v2: Some(bonding_curve_v2),
@@ -29301,6 +30157,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],
@@ -29364,6 +30221,57 @@ mod tests {
                 Pubkey::from_str(&pool.creator).ok(),
             ),
             "test pool should register exactly once"
+        );
+    }
+
+    fn test_complete_legacy_buy_tx_for_pool(
+        pool: &DetectedPool,
+        signature: &str,
+    ) -> Arc<PoolTransaction> {
+        let mut tx = (*test_pool_observation_tx(signature)).clone();
+        let base_mint = Pubkey::from_str(&pool.base_mint).expect("base mint");
+        let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).expect("valid token program");
+        tx.pool_amm_id = pool.pool_amm_id.clone();
+        tx.token_mint = Some(pool.base_mint.clone());
+        tx.slot = pool.slot.or(Some(1));
+        tx.success = true;
+        tx.is_buy = true;
+        tx.buy_variant = Some("legacy_buy".to_string());
+        tx.global_config = Some(trigger::DirectBuyBuilder::canonical_global_config().to_string());
+        tx.fee_recipient = Some(trigger::DirectBuyBuilder::canonical_fee_recipient().to_string());
+        tx.token_program = Some(token_program.to_string());
+        tx.associated_bonding_curve = Some(
+            trigger::DirectBuyBuilder::canonical_associated_bonding_curve(
+                &base_mint,
+                &token_program,
+            )
+            .to_string(),
+        );
+        tx.creator_vault = Some(Pubkey::new_unique().to_string());
+        tx.buy_remaining_accounts = vec![
+            Pubkey::new_unique().to_string(),
+            Pubkey::new_unique().to_string(),
+        ];
+        tx.curve_data_known = true;
+        tx.curve_finality = CurveFinality::Speculative;
+        tx.v_sol_in_bonding_curve = Some(31.0);
+        tx.v_tokens_in_bonding_curve = Some(900_000_000.0);
+        Arc::new(tx)
+    }
+
+    #[test]
+    fn session_runtime_config_defaults_active_buy_route_evidence_wait_disabled() {
+        assert_eq!(
+            SessionRuntimeConfig::default().active_buy_route_evidence_wait_ms,
+            0
+        );
+        assert!(
+            !SessionRuntimeConfig::default().active_buy_route_manifest_cache_enabled,
+            "manifest cache must be opt-in so old profiles do not change route behavior"
+        );
+        assert_eq!(
+            SessionRuntimeConfig::default().active_buy_route_manifest_cache_ttl_ms,
+            120_000
         );
     }
 
@@ -31353,6 +32261,381 @@ mod tests {
             base_mint_pubkey,
             Some(Pubkey::from_str(&detected_pool.base_mint).expect("base mint pubkey"))
         );
+    }
+
+    #[tokio::test]
+    async fn active_buy_route_evidence_wait_uses_late_observed_legacy_tail_for_same_pool() {
+        let runtime = Arc::new(OracleRuntime::new(
+            Arc::new(HyperPredictionOracle::default()),
+            "pump_program".to_string(),
+            "bonk_program".to_string(),
+            Arc::new(ShadowLedger::new()),
+        ));
+        let snapshot_engine = Arc::new(SnapshotEngine::new(16, 0));
+        runtime.configure_approval_gating(snapshot_engine.as_ref());
+
+        let pool_id = Pubkey::new_unique();
+        let detected_pool = test_detected_pool(pool_id);
+        let base_mint = Pubkey::from_str(&detected_pool.base_mint).expect("base mint");
+        register_test_detected_pool(runtime.as_ref(), detected_pool.as_ref());
+        runtime.remember_detected_pool(pool_id, detected_pool.clone());
+
+        let mut initial_tx = (*test_pool_observation_tx("initial-missing-tail")).clone();
+        initial_tx.pool_amm_id = pool_id.to_string();
+        initial_tx.token_mint = Some(base_mint.to_string());
+        initial_tx.buy_variant = Some("legacy_buy".to_string());
+        initial_tx.success = true;
+        initial_tx.is_buy = true;
+        initial_tx.buy_remaining_accounts.clear();
+        let mut execution_evidence_txs = vec![Arc::new(initial_tx)];
+
+        let (event_tx, _event_rx) = crate::events::create_event_bus();
+        let ctx = test_pool_observation_context(runtime, snapshot_engine, event_tx, None);
+        let mut identity =
+            build_registered_observation_identity(pool_id, base_mint, ctx.ab_window_ms);
+        let mut base_mint_pubkey = Some(base_mint);
+        let mut pool_data = Some(detected_pool.clone());
+        let initial_overrides = derive_active_buy_account_overrides_from_evidence(
+            ctx.as_ref(),
+            base_mint,
+            detected_pool.as_ref(),
+            &execution_evidence_txs,
+        );
+        assert_eq!(
+            initial_overrides
+                .execution_account_contract_reason
+                .as_deref(),
+            Some("route_account_manifest_incomplete:missing_buy_variant")
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let late_tx = test_complete_legacy_buy_tx_for_pool(detected_pool.as_ref(), "late-tail");
+        let expected_remaining: Vec<Pubkey> = late_tx
+            .buy_remaining_accounts
+            .iter()
+            .map(|value| Pubkey::from_str(value).expect("remaining pubkey"))
+            .collect();
+        tx.send(PoolObservationMsg::Transaction(late_tx))
+            .await
+            .expect("late route evidence send");
+
+        let (overrides, waited_ms, wait_result) = wait_for_active_buy_route_evidence(
+            pool_id,
+            2_000,
+            base_mint,
+            detected_pool.as_ref(),
+            100,
+            &mut rx,
+            ctx.as_ref(),
+            &mut identity,
+            &mut base_mint_pubkey,
+            &mut pool_data,
+            &mut execution_evidence_txs,
+            initial_overrides,
+        )
+        .await;
+
+        assert_eq!(wait_result.as_deref(), Some("route_evidence_ready"));
+        assert!(waited_ms.is_some());
+        assert_eq!(
+            overrides.buy_variant,
+            Some(trigger::PumpfunBuyVariant::LegacyBuy)
+        );
+        assert_eq!(overrides.buy_remaining_accounts, expected_remaining);
+        assert_eq!(
+            overrides.execution_account_contract_status.as_deref(),
+            Some("complete")
+        );
+        assert_eq!(
+            overrides.execution_account_contract_reason.as_deref(),
+            Some("route_account_contract_complete")
+        );
+    }
+
+    #[tokio::test]
+    async fn active_buy_route_evidence_wait_rejects_telemetry_only_source() {
+        let runtime = Arc::new(OracleRuntime::new(
+            Arc::new(HyperPredictionOracle::default()),
+            "pump_program".to_string(),
+            "bonk_program".to_string(),
+            Arc::new(ShadowLedger::new()),
+        ));
+        let snapshot_engine = Arc::new(SnapshotEngine::new(16, 0));
+        runtime.configure_approval_gating(snapshot_engine.as_ref());
+
+        let pool_id = Pubkey::new_unique();
+        let detected_pool = test_detected_pool(pool_id);
+        let base_mint = Pubkey::from_str(&detected_pool.base_mint).expect("base mint");
+        register_test_detected_pool(runtime.as_ref(), detected_pool.as_ref());
+        runtime.remember_detected_pool(pool_id, detected_pool.clone());
+
+        let mut telemetry_tx = (*test_pool_observation_tx("nln-telemetry-late")).clone();
+        telemetry_tx.pool_amm_id = pool_id.to_string();
+        telemetry_tx.token_mint = Some(base_mint.to_string());
+        telemetry_tx.buy_variant = Some("nln_pumpfun_buy".to_string());
+        telemetry_tx.global_config = None;
+        telemetry_tx.fee_recipient = None;
+        telemetry_tx.token_program = None;
+        telemetry_tx.associated_bonding_curve = None;
+        telemetry_tx.bonding_curve_v2 = None;
+        telemetry_tx.buy_remaining_accounts.clear();
+
+        let (event_tx, _event_rx) = crate::events::create_event_bus();
+        let ctx = test_pool_observation_context(runtime, snapshot_engine, event_tx, None);
+        let mut identity =
+            build_registered_observation_identity(pool_id, base_mint, ctx.ab_window_ms);
+        let mut base_mint_pubkey = Some(base_mint);
+        let mut pool_data = Some(detected_pool.clone());
+        let mut execution_evidence_txs = Vec::new();
+        let initial_overrides = derive_active_buy_account_overrides_from_evidence(
+            ctx.as_ref(),
+            base_mint,
+            detected_pool.as_ref(),
+            &execution_evidence_txs,
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        tx.send(PoolObservationMsg::Transaction(Arc::new(telemetry_tx)))
+            .await
+            .expect("telemetry send");
+
+        let (overrides, _waited_ms, wait_result) = wait_for_active_buy_route_evidence(
+            pool_id,
+            2_000,
+            base_mint,
+            detected_pool.as_ref(),
+            25,
+            &mut rx,
+            ctx.as_ref(),
+            &mut identity,
+            &mut base_mint_pubkey,
+            &mut pool_data,
+            &mut execution_evidence_txs,
+            initial_overrides,
+        )
+        .await;
+
+        assert_eq!(wait_result.as_deref(), Some("route_evidence_wait_timeout"));
+        assert_eq!(
+            overrides.execution_account_contract_status.as_deref(),
+            Some("telemetry_only")
+        );
+        assert_eq!(
+            overrides.execution_account_contract_reason.as_deref(),
+            Some("telemetry_only_trade_event:route_account_manifest_incomplete")
+        );
+        assert!(!buy_account_overrides_has_execution_route_manifest(
+            &overrides
+        ));
+    }
+
+    #[tokio::test]
+    async fn active_buy_route_evidence_wait_rejects_wrong_pool_manifest() {
+        let runtime = Arc::new(OracleRuntime::new(
+            Arc::new(HyperPredictionOracle::default()),
+            "pump_program".to_string(),
+            "bonk_program".to_string(),
+            Arc::new(ShadowLedger::new()),
+        ));
+        let snapshot_engine = Arc::new(SnapshotEngine::new(16, 0));
+        runtime.configure_approval_gating(snapshot_engine.as_ref());
+
+        let pool_id = Pubkey::new_unique();
+        let detected_pool = test_detected_pool(pool_id);
+        let base_mint = Pubkey::from_str(&detected_pool.base_mint).expect("base mint");
+        register_test_detected_pool(runtime.as_ref(), detected_pool.as_ref());
+        runtime.remember_detected_pool(pool_id, detected_pool.clone());
+
+        let wrong_pool = test_detected_pool(Pubkey::new_unique());
+        let wrong_pool_tx =
+            test_complete_legacy_buy_tx_for_pool(wrong_pool.as_ref(), "wrong-pool-tail");
+
+        let (event_tx, _event_rx) = crate::events::create_event_bus();
+        let ctx = test_pool_observation_context(runtime, snapshot_engine, event_tx, None);
+        let mut identity =
+            build_registered_observation_identity(pool_id, base_mint, ctx.ab_window_ms);
+        let mut base_mint_pubkey = Some(base_mint);
+        let mut pool_data = Some(detected_pool.clone());
+        let mut execution_evidence_txs = Vec::new();
+        let initial_overrides = derive_active_buy_account_overrides_from_evidence(
+            ctx.as_ref(),
+            base_mint,
+            detected_pool.as_ref(),
+            &execution_evidence_txs,
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        tx.send(PoolObservationMsg::Transaction(wrong_pool_tx))
+            .await
+            .expect("wrong pool route evidence send");
+
+        let (overrides, _waited_ms, wait_result) = wait_for_active_buy_route_evidence(
+            pool_id,
+            2_000,
+            base_mint,
+            detected_pool.as_ref(),
+            25,
+            &mut rx,
+            ctx.as_ref(),
+            &mut identity,
+            &mut base_mint_pubkey,
+            &mut pool_data,
+            &mut execution_evidence_txs,
+            initial_overrides,
+        )
+        .await;
+
+        assert_eq!(wait_result.as_deref(), Some("route_evidence_wait_timeout"));
+        assert!(execution_evidence_txs.is_empty());
+        assert!(!buy_account_overrides_has_execution_route_manifest(
+            &overrides
+        ));
+    }
+
+    fn test_runtime_with_active_buy_manifest_cache(ttl_ms: u64) -> Arc<OracleRuntime> {
+        let mut config = OracleRuntimeConfig::default();
+        config.session.active_buy_route_manifest_cache_enabled = true;
+        config.session.active_buy_route_manifest_cache_ttl_ms = ttl_ms;
+        Arc::new(OracleRuntime::new_with_config(
+            Arc::new(HyperPredictionOracle::default()),
+            "pump_program".to_string(),
+            "bonk_program".to_string(),
+            Arc::new(ShadowLedger::new()),
+            None,
+            None,
+            Arc::new(ghost_core::shadow_ledger::LivePipeline::new()),
+            config,
+        ))
+    }
+
+    #[test]
+    fn complete_observed_legacy_manifest_is_reused_for_same_pool() {
+        let runtime = test_runtime_with_active_buy_manifest_cache(120_000);
+        let pool_id = Pubkey::new_unique();
+        let detected_pool = test_detected_pool(pool_id);
+        let base_mint = Pubkey::from_str(&detected_pool.base_mint).expect("base mint");
+        let observed_tx = test_complete_legacy_buy_tx_for_pool(
+            detected_pool.as_ref(),
+            "cache-hit-observed-legacy",
+        );
+
+        let store_status = runtime.maybe_cache_active_buy_route_manifest_from_tx(
+            pool_id,
+            Some(base_mint),
+            observed_tx.as_ref(),
+        );
+        assert_eq!(store_status, Some("ROUTE_CACHE_STORED"));
+
+        let current = crate::components::trigger::BuyAccountOverrides {
+            buy_variant: Some(trigger::PumpfunBuyVariant::LegacyBuy),
+            ..Default::default()
+        };
+        let lookup = runtime.lookup_active_buy_route_manifest(pool_id, base_mint, 2_000, &current);
+
+        assert_eq!(lookup.status, "ROUTE_CACHE_HIT_REUSED");
+        let overrides = lookup.overrides.expect("cache hit overrides");
+        assert_eq!(
+            overrides.route_account_manifest_source.as_deref(),
+            Some("reused_observed_legacy_manifest")
+        );
+        assert_eq!(
+            overrides.buy_remaining_accounts.len(),
+            trigger::PUMPFUN_BUYBACK_REMAINING_ACCOUNT_COUNT
+        );
+        assert_eq!(overrides.creator_vault_authoritative, Some(true));
+        assert_eq!(
+            p37_execution_account_contract_failure_tail(&overrides),
+            None
+        );
+    }
+
+    #[test]
+    fn manifest_reuse_rejects_telemetry_only_source() {
+        let runtime = test_runtime_with_active_buy_manifest_cache(120_000);
+        let pool_id = Pubkey::new_unique();
+        let detected_pool = test_detected_pool(pool_id);
+        let base_mint = Pubkey::from_str(&detected_pool.base_mint).expect("base mint");
+        let mut telemetry_tx = (*test_pool_observation_tx("telemetry-cache-reject")).clone();
+        telemetry_tx.pool_amm_id = pool_id.to_string();
+        telemetry_tx.token_mint = Some(base_mint.to_string());
+        telemetry_tx.buy_variant = Some("nln_pumpfun_buy".to_string());
+        assert!(telemetry_tx.is_nln_program_stream_trade_telemetry_only());
+
+        let store_status = runtime.maybe_cache_active_buy_route_manifest_from_tx(
+            pool_id,
+            Some(base_mint),
+            &telemetry_tx,
+        );
+        assert_eq!(store_status, None);
+
+        let mut current = crate::components::trigger::BuyAccountOverrides::default();
+        current.route_account_manifest_source = Some("nln_program_streams".to_string());
+        current.execution_account_contract_status = Some("telemetry_only".to_string());
+        let lookup = runtime.lookup_active_buy_route_manifest(pool_id, base_mint, 2_000, &current);
+        assert_eq!(lookup.status, "ROUTE_CACHE_MISS_TELEMETRY_ONLY");
+        assert!(lookup.overrides.is_none());
+    }
+
+    #[test]
+    fn manifest_reuse_rejects_wrong_pool_or_base_mint() {
+        let runtime = test_runtime_with_active_buy_manifest_cache(120_000);
+        let pool_id = Pubkey::new_unique();
+        let detected_pool = test_detected_pool(pool_id);
+        let base_mint = Pubkey::from_str(&detected_pool.base_mint).expect("base mint");
+        let observed_tx =
+            test_complete_legacy_buy_tx_for_pool(detected_pool.as_ref(), "cache-wrong-pool-source");
+        assert_eq!(
+            runtime.maybe_cache_active_buy_route_manifest_from_tx(
+                pool_id,
+                Some(base_mint),
+                observed_tx.as_ref(),
+            ),
+            Some("ROUTE_CACHE_STORED")
+        );
+
+        let current = crate::components::trigger::BuyAccountOverrides::default();
+        let wrong_pool_lookup = runtime.lookup_active_buy_route_manifest(
+            Pubkey::new_unique(),
+            base_mint,
+            2_000,
+            &current,
+        );
+        assert_eq!(
+            wrong_pool_lookup.status,
+            "ROUTE_CACHE_MISS_NO_PRIOR_MANIFEST"
+        );
+        let wrong_mint_lookup = runtime.lookup_active_buy_route_manifest(
+            pool_id,
+            Pubkey::new_unique(),
+            2_000,
+            &current,
+        );
+        assert_eq!(
+            wrong_mint_lookup.status,
+            "ROUTE_CACHE_MISS_NO_PRIOR_MANIFEST"
+        );
+    }
+
+    #[test]
+    fn bounded_route_manifest_cache_expires_before_reuse() {
+        let runtime = test_runtime_with_active_buy_manifest_cache(10);
+        let pool_id = Pubkey::new_unique();
+        let detected_pool = test_detected_pool(pool_id);
+        let base_mint = Pubkey::from_str(&detected_pool.base_mint).expect("base mint");
+        let observed_tx =
+            test_complete_legacy_buy_tx_for_pool(detected_pool.as_ref(), "cache-expired-source");
+        assert_eq!(
+            runtime.maybe_cache_active_buy_route_manifest_from_tx(
+                pool_id,
+                Some(base_mint),
+                observed_tx.as_ref(),
+            ),
+            Some("ROUTE_CACHE_STORED")
+        );
+        let current = crate::components::trigger::BuyAccountOverrides::default();
+        let lookup = runtime.lookup_active_buy_route_manifest(pool_id, base_mint, 2_000, &current);
+        assert_eq!(lookup.status, "ROUTE_CACHE_MISS_EXPIRED");
+        assert!(lookup.overrides.is_none());
     }
 
     #[tokio::test]
@@ -35394,6 +36677,32 @@ mod tests {
             shadow_execution_outcome_from_report_err("shadow RPC simulate timed out after 100ms"),
             "shadow_transport_error"
         );
+        assert_eq!(
+            shadow_execution_outcome_from_report_err(
+                "HTTP status client error (429 Too Many Requests)"
+            ),
+            "shadow_transport_rate_limit"
+        );
+        assert_eq!(
+            shadow_execution_outcome_from_report_err(
+                "no_executable_route_account_set:legacy_buy_missing_buyback_remaining_accounts:count=0:expected=2"
+            ),
+            "shadow_route_materialization_error"
+        );
+        assert_eq!(
+            shadow_execution_outcome_from_report_err(
+                "no_executable_route_account_set:legacy_buy_simulation_load_not_ready:bonding_curve:pool"
+            ),
+            "shadow_state_readiness_error"
+        );
+        assert_eq!(
+            shadow_execution_outcome_from_report_err("InstructionError(3, Custom(2006))"),
+            "shadow_simulation_anchor_constraint_error"
+        );
+        assert_eq!(
+            shadow_execution_outcome_from_report_err("InstructionError(3, Custom(6002))"),
+            "shadow_simulation_slippage_error"
+        );
     }
 
     #[test]
@@ -35444,6 +36753,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],
@@ -35543,6 +36853,7 @@ mod tests {
             token_program: Some(Pubkey::new_unique().to_string()),
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],
@@ -35603,6 +36914,7 @@ mod tests {
             token_program: Some(expected_token.to_string()),
             buy_variant: Some("routed_exact_sol_in".to_string()),
             associated_bonding_curve: Some(expected_assoc_curve.to_string()),
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],
@@ -35696,6 +37008,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],
@@ -35835,6 +37148,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],
@@ -35910,6 +37224,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],
@@ -35983,6 +37298,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],
@@ -36056,6 +37372,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],
@@ -36143,6 +37460,49 @@ mod tests {
         assert_eq!(
             overrides.execution_account_contract_reason.as_deref(),
             Some("route_account_contract_complete")
+        );
+    }
+
+    #[test]
+    fn derive_buy_account_overrides_uses_observed_creator_vault_as_authoritative() {
+        use ghost_brain::oracle::snapshot_engine::PoolMetrics;
+        use ghost_core::shadow_ledger::TxKey;
+        use std::sync::Arc;
+
+        let mint = Pubkey::new_unique();
+        let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).expect("valid token program");
+        let associated_bonding_curve =
+            trigger::DirectBuyBuilder::canonical_associated_bonding_curve(&mint, &token_program);
+        let observed_creator_vault = Pubkey::new_unique();
+        let mut tx = (*test_pool_observation_tx("legacy-observed-creator-vault")).clone();
+        tx.buy_variant = Some("legacy_buy".to_string());
+        tx.global_config = Some(trigger::DirectBuyBuilder::canonical_global_config().to_string());
+        tx.fee_recipient = Some(trigger::DirectBuyBuilder::canonical_fee_recipient().to_string());
+        tx.token_program = Some(token_program.to_string());
+        tx.associated_bonding_curve = Some(associated_bonding_curve.to_string());
+        tx.creator_vault = Some(observed_creator_vault.to_string());
+        tx.buy_remaining_accounts = vec![
+            Pubkey::new_unique().to_string(),
+            Pubkey::new_unique().to_string(),
+        ];
+
+        let buffered_txs = vec![GatekeeperBufferedTx {
+            tx: Arc::new(tx),
+            metrics: PoolMetrics::default(),
+            tx_key: TxKey::new(1, Some(1), None, None, 0).unwrap(),
+        }];
+
+        let overrides = derive_buy_account_overrides(&buffered_txs);
+
+        assert_eq!(overrides.creator_vault, Some(observed_creator_vault));
+        assert_eq!(
+            overrides.creator_vault_source.as_deref(),
+            Some("observed_pool_transaction.creator_vault")
+        );
+        assert_eq!(overrides.creator_vault_authoritative, Some(true));
+        assert_eq!(
+            p37_execution_account_contract_failure_tail(&overrides),
+            None
         );
     }
 
@@ -37470,6 +38830,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],
@@ -37606,6 +38967,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],
@@ -37833,6 +39195,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],
@@ -37940,6 +39303,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],
@@ -38021,6 +39385,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],
@@ -38116,6 +39481,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],
@@ -38239,6 +39605,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],
@@ -38338,6 +39705,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],
@@ -40443,6 +41811,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],
@@ -40509,6 +41878,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],
@@ -40651,6 +42021,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],
@@ -40732,6 +42103,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],
@@ -40811,6 +42183,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],
@@ -40874,6 +42247,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],
@@ -40943,6 +42317,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],
@@ -41093,6 +42468,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],
@@ -41156,6 +42532,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],
@@ -41365,6 +42742,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],
@@ -41753,6 +43131,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],
@@ -43044,6 +44423,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],
@@ -43164,6 +44544,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],
@@ -43311,6 +44692,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],
@@ -43471,6 +44853,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],
@@ -43557,6 +44940,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],

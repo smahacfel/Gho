@@ -4179,6 +4179,7 @@ pub fn trade_event_to_pool_transaction(
         associated_bonding_curve: trade
             .associated_bonding_curve
             .map(|value| value.to_string()),
+        creator_vault: trade.creator_vault.map(|value| value.to_string()),
         bonding_curve_v2: trade.bonding_curve_v2.map(|value| value.to_string()),
         bonding_curve_v2_provenance: trade.bonding_curve_v2_provenance.as_ref().map(|value| {
             crate::events::ObservedAccountMetaProvenance {
@@ -4610,6 +4611,7 @@ mod tests {
             token_program: None,
             buy_variant: None,
             associated_bonding_curve: None,
+            creator_vault: None,
             bonding_curve_v2: None,
             bonding_curve_v2_provenance: None,
             buy_remaining_accounts: vec![],

@@ -261,6 +261,18 @@ fn default_session_max_observation_window_ms() -> u64 {
     10_000
 }
 
+fn default_session_active_buy_route_evidence_wait_ms() -> u64 {
+    0
+}
+
+fn default_session_active_buy_route_manifest_cache_enabled() -> bool {
+    false
+}
+
+fn default_session_active_buy_route_manifest_cache_ttl_ms() -> u64 {
+    120_000
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRuntimeConfig {
     #[serde(default = "default_session_max_sessions")]
@@ -269,6 +281,12 @@ pub struct SessionRuntimeConfig {
     pub checkpoint_interval_ms: u64,
     #[serde(default = "default_session_max_observation_window_ms")]
     pub max_observation_window_ms: u64,
+    #[serde(default = "default_session_active_buy_route_evidence_wait_ms")]
+    pub active_buy_route_evidence_wait_ms: u64,
+    #[serde(default = "default_session_active_buy_route_manifest_cache_enabled")]
+    pub active_buy_route_manifest_cache_enabled: bool,
+    #[serde(default = "default_session_active_buy_route_manifest_cache_ttl_ms")]
+    pub active_buy_route_manifest_cache_ttl_ms: u64,
 }
 
 impl Default for SessionRuntimeConfig {
@@ -277,6 +295,11 @@ impl Default for SessionRuntimeConfig {
             max_sessions: default_session_max_sessions(),
             checkpoint_interval_ms: default_session_checkpoint_interval_ms(),
             max_observation_window_ms: default_session_max_observation_window_ms(),
+            active_buy_route_evidence_wait_ms: default_session_active_buy_route_evidence_wait_ms(),
+            active_buy_route_manifest_cache_enabled:
+                default_session_active_buy_route_manifest_cache_enabled(),
+            active_buy_route_manifest_cache_ttl_ms:
+                default_session_active_buy_route_manifest_cache_ttl_ms(),
         }
     }
 }
@@ -5475,7 +5498,10 @@ enabled = true
             .program_streams
             .enabled_topics
             .contains(&"prod.rpc.solana.pumpfun.create".to_string()));
-        assert_eq!(config.seer.program_streams.artifact_transfer_sample_rate, 100);
+        assert_eq!(
+            config.seer.program_streams.artifact_transfer_sample_rate,
+            100
+        );
         assert_eq!(config.seer.program_streams.trade_resolver_ttl_ms, 30_000);
         assert_eq!(config.seer.program_streams.trade_resolver_per_mint_cap, 256);
         assert_eq!(

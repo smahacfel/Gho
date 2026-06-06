@@ -98,6 +98,7 @@ fn tx_with_curve(
         token_program: None,
         buy_variant: None,
         associated_bonding_curve: None,
+        creator_vault: None,
         bonding_curve_v2: None,
         bonding_curve_v2_provenance: None,
         buy_remaining_accounts: Vec::new(),

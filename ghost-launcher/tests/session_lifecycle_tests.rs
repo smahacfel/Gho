@@ -64,6 +64,7 @@ fn test_tx(pool_id: Pubkey, signature: &str, timestamp_ms: u64) -> Arc<PoolTrans
         token_program: None,
         buy_variant: None,
         associated_bonding_curve: None,
+        creator_vault: None,
         bonding_curve_v2: None,
         bonding_curve_v2_provenance: None,
         buy_remaining_accounts: Vec::new(),
