@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import re
 import subprocess
@@ -26,6 +27,7 @@ PASS_STATUS = "PASS"
 NOT_REQUIRED_STATUS = "RESTORE_GUARD_NOT_REQUIRED_FOR_THIS_DIFF"
 FAIL_TESTS = "FAIL_TESTS"
 FAIL_PREFLIGHT = "FAIL_PREFLIGHT"
+FAIL_CONFIG_CONTRACT = "FAIL_CONFIG_CONTRACT"
 FAIL_RUNTIME_REQUIRED = "FAIL_RUNTIME_REQUIRED"
 FAIL_RUNTIME_SMOKE = "FAIL_RUNTIME_SMOKE"
 FAIL_RUNTIME_ARTIFACTS = "FAIL_RUNTIME_ARTIFACTS"
@@ -46,6 +48,12 @@ CRITICAL_RESTORE_FILES = [
     "off-chain/components/trigger/src/lib.rs",
     "scripts/shadow_run_report.py",
     "scripts/shadow_onchain_lifecycle_report.py",
+    "scripts/check_selector_lifecycle_canary.py",
+    "scripts/start_selector_lifecycle_run.py",
+]
+
+CRITICAL_RESTORE_FILE_PATTERNS = [
+    "configs/rollout/shadow-burnin-v3-selector-dataset-*.toml",
 ]
 
 TARGETED_TEST_COMMANDS = [
@@ -194,6 +202,10 @@ def guard_required_for_changed_files(changed_files: Iterable[str]) -> tuple[bool
         normalize_repo_path(path)
         for path in changed_files
         if normalize_repo_path(path) in critical
+        or any(
+            fnmatch.fnmatch(normalize_repo_path(path), pattern)
+            for pattern in CRITICAL_RESTORE_FILE_PATTERNS
+        )
     ]
     return bool(touched), sorted(set(touched))
 
@@ -251,6 +263,29 @@ def classify_preflight_failure(text: str) -> str:
     if any(pattern in lowered for pattern in env_patterns):
         return INCONCLUSIVE_ENV_OR_CONFIG
     return FAIL_PREFLIGHT
+
+
+def validate_shadow_run_config_contract(config: dict[str, Any]) -> tuple[str, list[str]]:
+    trigger_shadow = config.get("trigger", {}).get("shadow_run", {})
+    if trigger_shadow.get("enabled") is not True:
+        return PASS_STATUS, []
+
+    errors: list[str] = []
+    payer_strategy = trigger_shadow.get("payer_strategy")
+    if payer_strategy != "configured":
+        errors.append(
+            "trigger.shadow_run.payer_strategy must be configured for lifecycle-capable shadow simulation"
+        )
+
+    timeout_ms = trigger_shadow.get("timeout_ms")
+    if not isinstance(timeout_ms, int) or timeout_ms < 5000:
+        errors.append("trigger.shadow_run.timeout_ms must be >= 5000 for lifecycle guard configs")
+
+    max_concurrent = trigger_shadow.get("max_concurrent")
+    if not isinstance(max_concurrent, int) or max_concurrent > 1:
+        errors.append("trigger.shadow_run.max_concurrent must be <= 1 for lifecycle guard configs")
+
+    return (PASS_STATUS if not errors else FAIL_CONFIG_CONTRACT), errors
 
 
 def resolve_repo_path(root: Path, raw: Path) -> Path:
@@ -657,6 +692,10 @@ def write_markdown(path: Path, payload: dict[str, Any]) -> None:
         f"- status: `{payload.get('tests', {}).get('status')}`",
         f"- commands: `{len(payload.get('tests', {}).get('commands', []))}`",
         "",
+        "## Config Contract",
+        "",
+        f"- status: `{payload.get('config_contract', {}).get('status')}`",
+        "",
         "## Runtime Smoke",
         "",
         f"- preflight: `{payload.get('preflight', {}).get('status')}`",
@@ -704,6 +743,7 @@ def base_report(args: argparse.Namespace, root: Path, config_path: Path, output_
             "guard_required": None,
             "changed_critical_files": [],
         },
+        "config_contract": {"status": "PENDING", "errors": []},
         "preflight": {"status": "SKIPPED", "exit_code": None},
         "runtime_smoke": {"status": "SKIPPED", "timeout_seconds": args.timeout_seconds, "exit_code": None},
         "artifact_deltas": {},
@@ -781,6 +821,26 @@ def main(argv: list[str] | None = None) -> int:
             "oracle_log": str(artifact_paths.oracle_log),
         }
     )
+
+    try:
+        config_contract_status, config_contract_errors = validate_shadow_run_config_contract(
+            load_toml(config_path)
+        )
+    except Exception as exc:
+        report["config_contract"] = {
+            "status": INCONCLUSIVE_ENV_OR_CONFIG,
+            "errors": [f"cannot validate shadow_run config contract: {exc}"],
+        }
+        report["errors"].extend(report["config_contract"]["errors"])
+        return finish(report, output_dir, INCONCLUSIVE_ENV_OR_CONFIG, json_stdout=args.json)
+
+    report["config_contract"] = {
+        "status": config_contract_status,
+        "errors": config_contract_errors,
+    }
+    if config_contract_status != PASS_STATUS:
+        report["errors"].extend(config_contract_errors)
+        return finish(report, output_dir, config_contract_status, json_stdout=args.json)
 
     if args.changed_files_from_git_diff:
         try:

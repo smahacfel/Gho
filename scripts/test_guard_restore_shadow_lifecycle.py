@@ -81,6 +81,42 @@ class RestoreShadowLifecycleGuardTests(unittest.TestCase):
         self.assertEqual(guard.FAIL_RUNTIME_ARTIFACTS, status)
         self.assertIn("unsupported_legacy_buy_layout_requires_bcv2 > 0", errors)
 
+    def test_shadow_run_config_contract_blocks_ephemeral_lifecycle_profile(self) -> None:
+        status, errors = guard.validate_shadow_run_config_contract(
+            {
+                "trigger": {
+                    "shadow_run": {
+                        "enabled": True,
+                        "payer_strategy": "ephemeral",
+                        "timeout_ms": 1600,
+                        "max_concurrent": 8,
+                    }
+                }
+            }
+        )
+
+        self.assertEqual(guard.FAIL_CONFIG_CONTRACT, status)
+        self.assertIn("payer_strategy", " ".join(errors))
+        self.assertIn("timeout_ms", " ".join(errors))
+        self.assertIn("max_concurrent", " ".join(errors))
+
+    def test_shadow_run_config_contract_allows_configured_lifecycle_profile(self) -> None:
+        status, errors = guard.validate_shadow_run_config_contract(
+            {
+                "trigger": {
+                    "shadow_run": {
+                        "enabled": True,
+                        "payer_strategy": "configured",
+                        "timeout_ms": 5000,
+                        "max_concurrent": 1,
+                    }
+                }
+            }
+        )
+
+        self.assertEqual(guard.PASS_STATUS, status)
+        self.assertEqual([], errors)
+
     def test_critical_file_changed_requires_guard(self) -> None:
         required, changed = guard.guard_required_for_changed_files(
             [
@@ -102,6 +138,19 @@ class RestoreShadowLifecycleGuardTests(unittest.TestCase):
 
         self.assertFalse(required)
         self.assertEqual([], changed)
+
+    def test_selector_dataset_config_changed_requires_guard(self) -> None:
+        required, changed = guard.guard_required_for_changed_files(
+            [
+                "configs/rollout/shadow-burnin-v3-selector-dataset-r8-feature-rich-r2diag.toml",
+            ]
+        )
+
+        self.assertTrue(required)
+        self.assertEqual(
+            ["configs/rollout/shadow-burnin-v3-selector-dataset-r8-feature-rich-r2diag.toml"],
+            changed,
+        )
 
     def test_preflight_provider_or_env_failure_is_inconclusive(self) -> None:
         text = "trigger.rpc_url: jsonrpc getVersion failed: missing env GHOST_TRIGGER_RPC_URL"

@@ -85,13 +85,16 @@ live_exit_stop_loss_pct = 0.50
 [trigger.shadow_run]
 enabled = true
 shadow_rpc_url = "${GHOST_TRIGGER_SHADOW_RPC_URL}"
-payer_strategy = "ephemeral"
+# Lifecycle-capable shadow simulation must use the configured rollout wallet.
+# Ephemeral payer accounts are not chain-visible and produce AccountNotFound
+# simulation artifacts instead of valid lifecycle rows.
+payer_strategy = "configured"
 commitment = "processed"
 sig_verify = false
 replace_recent_blockhash = true
-timeout_ms = 1600
+timeout_ms = 5000
 max_retries = 1
-max_concurrent = 8
+max_concurrent = 1
 output_path = "../../logs/shadow_run/shadow-burnin-v3-selector-dataset-r7-feature-rich-r2diag-buys.jsonl"
 emit_event_bus = true
 
