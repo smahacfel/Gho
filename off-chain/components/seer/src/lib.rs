@@ -88,7 +88,7 @@ use futures_util::StreamExt;
 use grpc_connection::{
     Bcv2AccountContext, EventStream, GrpcConnection, GrpcSubscriptionProfile,
     GRPC_FUNDING_LANE_FULL_CHAIN_SOURCE_LABEL, GRPC_FUNDING_LANE_PUMP_FILTERED_SOURCE_LABEL,
-    GRPC_GLOBAL_STREAM_SOURCE_LABEL,
+    GRPC_GLOBAL_STREAM_SOURCE_LABEL, PUMP_FUN_PROGRAM_ID,
 };
 use helius_websocket_adapter::HeliusWebSocketAdapter;
 use ipc::{AccountUpdateReplayOrigin, EventPriority, IpcSender};
@@ -96,13 +96,17 @@ use metrics::SeerMetrics;
 use paradox_sensor::ParadoxSensor;
 use parking_lot::{Mutex, RwLock};
 use pumpportal_connection::PumpPortalConnection;
+use serde_json::{json, Value};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
+use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, trace, warn};
@@ -120,6 +124,385 @@ fn is_no_space_error(err: &anyhow::Error) -> bool {
             .downcast_ref::<std::io::Error>()
             .is_some_and(|io_err| io_err.raw_os_error() == Some(28))
     })
+}
+
+fn raw_evidence_stable_hash(parts: &[String]) -> String {
+    format!("fnv64:{:016x}", raw_evidence_stable_hash_u64(parts))
+}
+
+fn raw_evidence_stable_hash_u64(parts: &[String]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut hash = FNV_OFFSET;
+    for part in parts {
+        for byte in part.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+fn raw_instruction_discriminator_hex(data: &[u8]) -> Option<String> {
+    if data.len() < 8 {
+        return None;
+    }
+    Some(raw_bytes_hex(&data[..8]))
+}
+
+fn raw_bytes_hex(data: &[u8]) -> String {
+    let mut output = String::with_capacity(data.len().saturating_mul(2));
+    for byte in data {
+        use std::fmt::Write as _;
+        let _ = write!(&mut output, "{byte:02x}");
+    }
+    output
+}
+
+fn raw_pumpfun_route_kind(data: &[u8]) -> Option<&'static str> {
+    if data.starts_with(&binary_parser::DISC_BUY) {
+        Some("legacy_buy")
+    } else if data.starts_with(&binary_parser::DISC_PUMP_BUY_ROUTED) {
+        Some("routed_exact_sol_in")
+    } else {
+        None
+    }
+}
+
+fn raw_pubkeys_from_indices(
+    accounts: &[Pubkey],
+    indices: &[u8],
+) -> (Vec<String>, Vec<u32>, Vec<u32>) {
+    let mut pubkeys = Vec::with_capacity(indices.len());
+    let mut compiled_indices = Vec::with_capacity(indices.len());
+    let mut out_of_bounds = Vec::new();
+    for index in indices {
+        let index_u32 = u32::from(*index);
+        compiled_indices.push(index_u32);
+        if let Some(pubkey) = accounts.get(usize::from(*index)) {
+            pubkeys.push(pubkey.to_string());
+        } else {
+            out_of_bounds.push(index_u32);
+        }
+    }
+    (pubkeys, compiled_indices, out_of_bounds)
+}
+
+fn raw_named_accounts_from_order(instruction_account_pubkeys: &[String]) -> Vec<Value> {
+    RAW_PUMPFUN_ACCOUNT_ROLES
+        .iter()
+        .enumerate()
+        .map(|(position, role)| {
+            json!({
+                "role": role,
+                "instruction_account_position": position,
+                "pubkey": instruction_account_pubkeys.get(position),
+            })
+        })
+        .collect()
+}
+
+fn raw_remaining_accounts_from_order(instruction_account_pubkeys: &[String]) -> Vec<Value> {
+    instruction_account_pubkeys
+        .iter()
+        .skip(RAW_PUMPFUN_BUY_FIXED_ACCOUNT_COUNT)
+        .enumerate()
+        .map(|(offset, pubkey)| {
+            json!({
+                "index": offset,
+                "instruction_account_position": RAW_PUMPFUN_BUY_FIXED_ACCOUNT_COUNT + offset,
+                "pubkey": pubkey,
+            })
+        })
+        .collect()
+}
+
+fn raw_named_account_pubkey(instruction_account_pubkeys: &[String], role: &str) -> Option<String> {
+    RAW_PUMPFUN_ACCOUNT_ROLES
+        .iter()
+        .position(|candidate| *candidate == role)
+        .and_then(|position| instruction_account_pubkeys.get(position).cloned())
+}
+
+fn build_raw_pumpfun_instruction_evidence_row(
+    event: &types::GeyserEvent,
+    route_kind: &str,
+    ix_index: u32,
+    inner_ix_index: Option<u32>,
+    program_id: &Pubkey,
+    instruction_account_indices: &[u8],
+    instruction_data: &[u8],
+) -> Option<Value> {
+    let types::GeyserEvent::Transaction {
+        slot,
+        event_ts_ms,
+        arrival_ts_ms,
+        signature,
+        accounts,
+        success,
+        error_code,
+        source,
+        ..
+    } = event
+    else {
+        return None;
+    };
+
+    let (instruction_account_pubkeys, compiled_indices, out_of_bounds_indices) =
+        raw_pubkeys_from_indices(accounts, instruction_account_indices);
+    let account_keys: Vec<String> = accounts.iter().map(ToString::to_string).collect();
+    let named_accounts = raw_named_accounts_from_order(&instruction_account_pubkeys);
+    let remaining_accounts = raw_remaining_accounts_from_order(&instruction_account_pubkeys);
+    let remaining_accounts_count = remaining_accounts.len();
+    let has_legacy_tail = remaining_accounts_count == RAW_PUMPFUN_LEGACY_TAIL_COUNT;
+    let mint = raw_named_account_pubkey(&instruction_account_pubkeys, "mint");
+    let discriminator = raw_instruction_discriminator_hex(instruction_data);
+    let instruction_data_hash = raw_evidence_stable_hash(&[raw_bytes_hex(instruction_data)]);
+    let parser_status = if !out_of_bounds_indices.is_empty() {
+        "ACCOUNT_INDEX_OUT_OF_BOUNDS"
+    } else if instruction_data.len() < 8 {
+        "DATA_TOO_SHORT"
+    } else if instruction_account_pubkeys.len() < RAW_PUMPFUN_BUY_FIXED_ACCOUNT_COUNT {
+        "ACCOUNT_ORDER_TOO_SHORT"
+    } else {
+        "OK"
+    };
+
+    let mut manifest_layout = BTreeMap::new();
+    manifest_layout.insert("schema_version", json!(1));
+    manifest_layout.insert("route_kind", json!(route_kind));
+    manifest_layout.insert("program_id", json!(program_id.to_string()));
+    manifest_layout.insert("named_accounts", json!(named_accounts));
+    manifest_layout.insert("remaining_accounts", json!(remaining_accounts));
+    manifest_layout.insert(
+        "account_order_schema",
+        json!("pumpfun_buy_fixed16_plus_remaining_tail_v1"),
+    );
+    let account_manifest_hash =
+        raw_evidence_stable_hash(&[serde_json::to_string(&manifest_layout).unwrap_or_default()]);
+
+    let instruction_evidence = json!({
+        "schema_version": 1,
+        "source": "raw_grpc_transaction",
+        "signature": signature.to_string(),
+        "slot": slot,
+        "tx_index": Value::Null,
+        "ix_index": ix_index,
+        "inner_ix_index": inner_ix_index,
+        "route_kind": route_kind,
+        "program_id": program_id.to_string(),
+        "instruction_data_discriminator": discriminator,
+        "instruction_data_hash": instruction_data_hash,
+        "compiled_instruction_account_indices": compiled_indices,
+        "instruction_account_pubkeys_in_order": instruction_account_pubkeys,
+        "account_manifest_hash": account_manifest_hash,
+    });
+    let instruction_evidence_hash =
+        raw_evidence_stable_hash(&[
+            serde_json::to_string(&instruction_evidence).unwrap_or_default()
+        ]);
+
+    Some(json!({
+        "artifact": "raw_pumpfun_instruction_evidence_v1",
+        "schema_version": 1,
+        "signature": signature.to_string(),
+        "slot": slot,
+        "tx_index": Value::Null,
+        "ix_index": ix_index,
+        "outer_instruction_index": ix_index,
+        "inner_ix_index": inner_ix_index,
+        "instruction_path": if inner_ix_index.is_some() { "inner_cpi" } else { "top_level" },
+        "program_id": program_id.to_string(),
+        "route_kind": route_kind,
+        "mint": mint,
+        "account_keys": account_keys,
+        "compiled_instruction_account_indices": compiled_indices,
+        "instruction_account_pubkeys_in_order": instruction_account_pubkeys,
+        "instruction_data_discriminator": discriminator,
+        "instruction_data_hash": instruction_data_hash,
+        "instruction_data_len": instruction_data.len(),
+        "named_accounts_resolved_from_order": manifest_layout.get("named_accounts").cloned().unwrap_or(Value::Null),
+        "named_accounts": manifest_layout.get("named_accounts").cloned().unwrap_or(Value::Null),
+        "remaining_accounts_resolved_from_order": manifest_layout.get("remaining_accounts").cloned().unwrap_or(Value::Null),
+        "remaining_accounts": manifest_layout.get("remaining_accounts").cloned().unwrap_or(Value::Null),
+        "remaining_accounts_count": remaining_accounts_count,
+        "has_legacy_tail": has_legacy_tail,
+        "source": "raw_grpc_transaction",
+        "source_stream_label": source,
+        "received_at_ms": (*arrival_ts_ms).or(*event_ts_ms),
+        "parser_status": parser_status,
+        "out_of_bounds_account_indices": out_of_bounds_indices,
+        "account_manifest_hash": account_manifest_hash,
+        "instruction_evidence_hash": instruction_evidence_hash,
+        "resolver_validation_status": if parser_status == "OK" { "PASS" } else { "FAIL" },
+        "resolver_validation_notes": {
+            "raw_evidence_from_transaction_message": true,
+            "program_stream_candidate_used": false,
+            "can_unlock_execution": false,
+            "account_manifest_hash_excludes_dynamic_args": true,
+            "instruction_evidence_hash_includes_signature_slot_ix_and_manifest": true
+        },
+        "can_unlock_execution": false,
+        "tx_success": success,
+        "tx_error_code": error_code,
+    }))
+}
+
+fn raw_pumpfun_instruction_evidence_rows(event: &types::GeyserEvent) -> Vec<Value> {
+    let types::GeyserEvent::Transaction {
+        accounts,
+        instructions,
+        inner_instructions,
+        ..
+    } = event
+    else {
+        return Vec::new();
+    };
+    let pump_program = Pubkey::from_str(PUMP_FUN_PROGRAM_ID).unwrap_or_default();
+    let mut rows = Vec::new();
+
+    for (ix_index, ix) in instructions.iter().enumerate() {
+        if ix.program_id != pump_program {
+            continue;
+        }
+        let Some(route_kind) = raw_pumpfun_route_kind(&ix.data) else {
+            continue;
+        };
+        if let Some(row) = build_raw_pumpfun_instruction_evidence_row(
+            event,
+            route_kind,
+            ix_index as u32,
+            None,
+            &ix.program_id,
+            &ix.account_indices,
+            &ix.data,
+        ) {
+            rows.push(row);
+        }
+    }
+
+    for group in inner_instructions {
+        for (inner_ix_index, ix) in group.instructions.iter().enumerate() {
+            let Some(program_id) = accounts.get(ix.program_id_index as usize) else {
+                continue;
+            };
+            if *program_id != pump_program {
+                continue;
+            }
+            let Some(route_kind) = raw_pumpfun_route_kind(&ix.data) else {
+                continue;
+            };
+            if let Some(row) = build_raw_pumpfun_instruction_evidence_row(
+                event,
+                route_kind,
+                group.index,
+                Some(inner_ix_index as u32),
+                program_id,
+                &ix.accounts,
+                &ix.data,
+            ) {
+                rows.push(row);
+            }
+        }
+    }
+
+    rows
+}
+
+fn spawn_raw_pumpfun_instruction_evidence_writer(
+    config: &SeerConfig,
+) -> Option<mpsc::Sender<Value>> {
+    if !config.program_streams.enabled {
+        return None;
+    }
+    let capture_dir = config.program_streams.artifact_capture_dir.as_ref()?;
+    let path = PathBuf::from(capture_dir).join("raw_pumpfun_instruction_evidence_v1.jsonl");
+    let (tx, mut rx) = mpsc::channel(RAW_PUMPFUN_INSTRUCTION_EVIDENCE_QUEUE_CAP);
+    tokio::spawn(async move {
+        if let Some(parent) = path.parent() {
+            if let Err(err) = tokio::fs::create_dir_all(parent).await {
+                warn!(
+                    path = %parent.display(),
+                    error = %err,
+                    "Seer: raw Pump.fun instruction evidence capture dir unavailable"
+                );
+                return;
+            }
+        }
+        let file = match tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await
+        {
+            Ok(file) => file,
+            Err(err) => {
+                warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "Seer: raw Pump.fun instruction evidence file could not be opened"
+                );
+                return;
+            }
+        };
+        let mut writer = BufWriter::new(file);
+        let mut flush = tokio::time::interval(Duration::from_millis(
+            RAW_PUMPFUN_INSTRUCTION_EVIDENCE_FLUSH_MS,
+        ));
+        loop {
+            tokio::select! {
+                maybe_row = rx.recv() => {
+                    let Some(row) = maybe_row else {
+                        break;
+                    };
+                    match serde_json::to_vec(&row) {
+                        Ok(mut bytes) => {
+                            bytes.push(b'\n');
+                            if let Err(err) = writer.write_all(&bytes).await {
+                                warn!(
+                                    path = %path.display(),
+                                    error = %err,
+                                    "Seer: raw Pump.fun instruction evidence write failed"
+                                );
+                                break;
+                            }
+                            ::metrics::counter!("seer_raw_pumpfun_instruction_evidence_rows_written_total", 1);
+                        }
+                        Err(err) => {
+                            warn!(
+                                error = %err,
+                                "Seer: raw Pump.fun instruction evidence serialization failed"
+                            );
+                            ::metrics::counter!(
+                                "seer_raw_pumpfun_instruction_evidence_serialize_errors_total",
+                                1
+                            );
+                        }
+                    }
+                }
+                _ = flush.tick() => {
+                    if let Err(err) = writer.flush().await {
+                        warn!(
+                            path = %path.display(),
+                            error = %err,
+                            "Seer: raw Pump.fun instruction evidence flush failed"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+        if let Err(err) = writer.flush().await {
+            warn!(
+                path = %path.display(),
+                error = %err,
+                "Seer: raw Pump.fun instruction evidence final flush failed"
+            );
+        }
+    });
+    Some(tx)
 }
 
 use ghost_core::coverage_audit;
@@ -148,6 +531,28 @@ const COVERAGE_LOG_INTERVAL: Duration = Duration::from_secs(10);
 const PARSE_MISS_LOG_EVERY: u64 = 200;
 const PENDING_TRADE_TTL: Duration = Duration::from_millis(30);
 const PENDING_TRADES_PER_CURVE_MAX: usize = 1_024;
+const RAW_PUMPFUN_INSTRUCTION_EVIDENCE_QUEUE_CAP: usize = 16_384;
+const RAW_PUMPFUN_INSTRUCTION_EVIDENCE_FLUSH_MS: u64 = 1_000;
+const RAW_PUMPFUN_BUY_FIXED_ACCOUNT_COUNT: usize = 16;
+const RAW_PUMPFUN_LEGACY_TAIL_COUNT: usize = 2;
+const RAW_PUMPFUN_ACCOUNT_ROLES: [&str; RAW_PUMPFUN_BUY_FIXED_ACCOUNT_COUNT] = [
+    "global",
+    "fee_recipient",
+    "mint",
+    "bonding_curve",
+    "associated_bonding_curve",
+    "associated_user",
+    "user",
+    "system_program",
+    "token_program",
+    "creator_vault",
+    "event_authority",
+    "global_volume_accumulator",
+    "user_volume_accumulator",
+    "fee_config",
+    "fee_program",
+    "program",
+];
 const EVENT_WORKERS_PER_CORE: usize = 2;
 const MIN_EVENT_WORKERS: usize = 4;
 const MAX_EVENT_WORKERS: usize = 32;
@@ -1146,6 +1551,13 @@ pub struct Seer {
     /// are skipped for explicit degraded/test harnesses. Production launcher
     /// startup derives the effective setting from `AccountStateCore` enablement.
     canonical_account_update_relay_enabled: bool,
+
+    /// Capture-only raw Pump.fun instruction evidence writer.
+    ///
+    /// This lane is diagnostic evidence only. It is deliberately separate from
+    /// `TradeEvent`, Gatekeeper, and execution routing so raw account manifests
+    /// cannot unlock active execution by accident.
+    raw_pumpfun_instruction_evidence_tx: Option<mpsc::Sender<Value>>,
 }
 
 impl Seer {
@@ -1499,6 +1911,8 @@ impl Seer {
         } else {
             (None, None)
         };
+        let raw_pumpfun_instruction_evidence_tx =
+            spawn_raw_pumpfun_instruction_evidence_writer(&config);
 
         Self {
             config,
@@ -1531,6 +1945,7 @@ impl Seer {
             wal_disabled_due_to_enospc: AtomicBool::new(false),
             session_start_slot: AtomicU64::new(0),
             canonical_account_update_relay_enabled,
+            raw_pumpfun_instruction_evidence_tx,
         }
     }
 
@@ -1646,6 +2061,41 @@ impl Seer {
             "raw_tx",
             WalRecordClock::new(event_time, compat_event_ts_ms),
         );
+    }
+
+    fn enqueue_raw_pumpfun_instruction_evidence(&self, event: &types::GeyserEvent) {
+        let Some(tx) = self.raw_pumpfun_instruction_evidence_tx.as_ref() else {
+            return;
+        };
+        for row in raw_pumpfun_instruction_evidence_rows(event) {
+            match tx.try_send(row) {
+                Ok(()) => {
+                    ::metrics::counter!(
+                        "seer_raw_pumpfun_instruction_evidence_rows_enqueued_total",
+                        1
+                    );
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    ::metrics::counter!(
+                        "seer_raw_pumpfun_instruction_evidence_dropped_total",
+                        1,
+                        "reason" => "queue_full"
+                    );
+                    warn!(
+                        "Seer: raw Pump.fun instruction evidence queue full; dropping evidence row"
+                    );
+                    break;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    ::metrics::counter!(
+                        "seer_raw_pumpfun_instruction_evidence_dropped_total",
+                        1,
+                        "reason" => "writer_closed"
+                    );
+                    break;
+                }
+            }
+        }
     }
 
     fn append_parsed_event_to_wal(
@@ -3914,6 +4364,7 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
         }
 
         self.append_raw_tx_to_wal(&event);
+        self.enqueue_raw_pumpfun_instruction_evidence(&event);
 
         // Extract synthetic payload for PumpPortal events (pre-parsed data)
         let mut synthetic_pool: Option<types::InitializePoolEvent> = None;
@@ -4675,6 +5126,118 @@ mod tests {
     }
 
     const TRADE_FORWARD_TIMEOUT_MS: u64 = 200;
+
+    fn pumpfun_buy_raw_event_with_data(data: Vec<u8>) -> types::GeyserEvent {
+        let mut accounts = Vec::new();
+        for _ in 0..(RAW_PUMPFUN_BUY_FIXED_ACCOUNT_COUNT + RAW_PUMPFUN_LEGACY_TAIL_COUNT) {
+            accounts.push(Pubkey::new_unique());
+        }
+        types::GeyserEvent::Transaction {
+            slot: Some(42),
+            event_ts_ms: Some(1_000),
+            arrival_ts_ms: Some(1_005),
+            event_time: ghost_core::EventTimeMetadata::default(),
+            signature: Signature::new_unique(),
+            accounts,
+            instructions: vec![types::RawInstruction {
+                program_id: Pubkey::from_str(PUMP_FUN_PROGRAM_ID).expect("pump program id"),
+                account_indices: (0..(RAW_PUMPFUN_BUY_FIXED_ACCOUNT_COUNT
+                    + RAW_PUMPFUN_LEGACY_TAIL_COUNT))
+                    .map(|value| value as u8)
+                    .collect(),
+                data,
+            }],
+            logs: vec![],
+            block_time: None,
+            account_data: HashMap::new(),
+            pre_balances: vec![],
+            post_balances: vec![],
+            success: true,
+            error_code: None,
+            compute_units_consumed: None,
+            synthetic: false,
+            source: "grpc_global_stream".to_string(),
+            mpcf_payload_bytes: None,
+            mpcf_payload_missing_reason: types::RawBytesMissingReason::Unknown,
+            inner_instructions: vec![],
+            pre_token_balances: vec![],
+            post_token_balances: vec![],
+        }
+    }
+
+    #[test]
+    fn raw_pumpfun_instruction_evidence_captures_full_order_and_tail_without_unlock() {
+        let mut data = binary_parser::DISC_BUY.to_vec();
+        data.extend_from_slice(&[1, 2, 3, 4]);
+        let event = pumpfun_buy_raw_event_with_data(data);
+        let rows = raw_pumpfun_instruction_evidence_rows(&event);
+
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(
+            row["artifact"],
+            json!("raw_pumpfun_instruction_evidence_v1")
+        );
+        assert_eq!(row["route_kind"], json!("legacy_buy"));
+        assert_eq!(row["source"], json!("raw_grpc_transaction"));
+        assert_eq!(row["parser_status"], json!("OK"));
+        assert_eq!(row["tx_index"], Value::Null);
+        assert_eq!(row["ix_index"], json!(0));
+        assert_eq!(
+            row["account_keys"].as_array().expect("account keys").len(),
+            RAW_PUMPFUN_BUY_FIXED_ACCOUNT_COUNT + RAW_PUMPFUN_LEGACY_TAIL_COUNT
+        );
+        assert_eq!(
+            row["compiled_instruction_account_indices"]
+                .as_array()
+                .expect("compiled indices")
+                .len(),
+            RAW_PUMPFUN_BUY_FIXED_ACCOUNT_COUNT + RAW_PUMPFUN_LEGACY_TAIL_COUNT
+        );
+        assert_eq!(
+            row["named_accounts_resolved_from_order"]
+                .as_array()
+                .expect("named accounts")
+                .len(),
+            RAW_PUMPFUN_BUY_FIXED_ACCOUNT_COUNT
+        );
+        assert_eq!(
+            row["remaining_accounts_resolved_from_order"]
+                .as_array()
+                .expect("remaining accounts")
+                .len(),
+            RAW_PUMPFUN_LEGACY_TAIL_COUNT
+        );
+        assert_eq!(
+            "fnv64:",
+            &row["account_manifest_hash"].as_str().unwrap()[..6]
+        );
+        assert_eq!(
+            "fnv64:",
+            &row["instruction_evidence_hash"].as_str().unwrap()[..6]
+        );
+        assert_eq!(row["can_unlock_execution"], json!(false));
+
+        let mut changed_data = binary_parser::DISC_BUY.to_vec();
+        changed_data.extend_from_slice(&[9, 9, 9, 9]);
+        let mut changed_event = event.clone();
+        if let types::GeyserEvent::Transaction { instructions, .. } = &mut changed_event {
+            instructions[0].data = changed_data;
+        }
+        let changed = raw_pumpfun_instruction_evidence_rows(&changed_event);
+        assert_eq!(
+            row["account_manifest_hash"],
+            changed[0]["account_manifest_hash"]
+        );
+        assert_ne!(
+            row["instruction_data_hash"],
+            changed[0]["instruction_data_hash"]
+        );
+        assert_ne!(
+            row["instruction_evidence_hash"],
+            changed[0]["instruction_evidence_hash"]
+        );
+    }
 
     fn test_trade(pool_amm_id: Pubkey, mint: Pubkey) -> types::TradeEvent {
         types::TradeEvent {

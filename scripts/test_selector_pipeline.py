@@ -25,6 +25,7 @@ import build_selector_r2only_ablation_report as r2only_ablation
 import build_selector_r2only_feature_contribution as r2only_feature_contribution
 import build_selector_r2only_feature_audit as r2only_feature_audit
 import build_selector_r2only_model_candidate as r2only_model_candidate
+import build_selector_route_evidence_join_report as route_evidence_join
 import build_selector_training_view as training
 import compare_selector_gatekeepers as compare
 import audit_selector_buy_simulation_coverage as simcov_audit
@@ -3892,6 +3893,287 @@ class SelectorPipelineTests(unittest.TestCase):
                 ]
             )
         )
+
+    def run_route_evidence_join_report(self, root: Path, scope: str) -> dict:
+        return route_evidence_join.build_report(
+            route_evidence_join.build_parser().parse_args(
+                [
+                    "--scope",
+                    scope,
+                    "--root",
+                    str(root),
+                    "--decision-plane",
+                    "legacy_live",
+                ]
+            )
+        )
+
+    def write_route_evidence_candidates(self, root: Path, scope: str, rows: list[dict]) -> None:
+        write_jsonl(
+            root / "logs" / "nln_capture" / scope / "route_manifest_evidence_candidates_v1.jsonl",
+            rows,
+        )
+
+    def write_raw_route_evidence(self, root: Path, scope: str, rows: list[dict]) -> None:
+        write_jsonl(root / "datasets" / "events" / scope / "raw_route_evidence.jsonl", rows)
+
+    def write_program_stream_raw(self, root: Path, scope: str, *, topic_file: str, rows: list[dict]) -> None:
+        write_jsonl(root / "logs" / "nln_capture" / scope / topic_file, rows)
+
+    def route_evidence_candidate(
+        self,
+        *,
+        signature: str | None = "sig1",
+        slot: int | None = 10,
+        ix_index: int | None = 2,
+        remaining_accounts: list[str] | None = None,
+        account_manifest_hash: str = "manifest1",
+    ) -> dict:
+        if remaining_accounts is None:
+            remaining_accounts = ["buyback_fee", "buyback_quote"]
+        return {
+            "artifact": "route_manifest_evidence_candidate_v1",
+            "parse_status": "OK",
+            "topic": "solana.pump_fun.buy",
+            "route_kind": "legacy_buy",
+            "signature": signature,
+            "slot": slot,
+            "ix_index": ix_index,
+            "tx_index": None,
+            "account_manifest_hash": account_manifest_hash,
+            "instruction_evidence_hash": "instruction1",
+            "remaining_accounts_count": len(remaining_accounts),
+            "remaining_accounts": [
+                {"index": index, "pubkey": value}
+                for index, value in enumerate(remaining_accounts)
+            ],
+            "has_legacy_tail": len(remaining_accounts) == 2,
+            "can_unlock_execution": False,
+            "named_accounts": [
+                {"role": "global", "pubkey": "global1"},
+                {"role": "mint", "pubkey": "mint1"},
+                {"role": "bonding_curve", "pubkey": "pool1"},
+                {"role": "associated_bonding_curve", "pubkey": "abc1"},
+                {"role": "user", "pubkey": "user1"},
+                {"role": "program", "pubkey": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"},
+            ],
+        }
+
+    def raw_route_evidence(
+        self,
+        *,
+        signature: str = "sig1",
+        slot: int = 10,
+        ix_index: int = 2,
+        associated_bonding_curve: str = "abc1",
+        remaining_accounts: list[str] | None = None,
+        resolver_validation_status: str = "PASS",
+    ) -> dict:
+        if remaining_accounts is None:
+            remaining_accounts = ["buyback_fee", "buyback_quote"]
+        ordered_accounts = [
+            "global1",
+            "mint1",
+            "pool1",
+            associated_bonding_curve,
+            "user1",
+            *remaining_accounts,
+        ]
+        account_keys = ["unused0", *ordered_accounts]
+        return {
+            "artifact": "raw_pumpfun_instruction_evidence_v1",
+            "signature": signature,
+            "slot": slot,
+            "tx_index": None,
+            "ix_index": ix_index,
+            "route_kind": "legacy_buy",
+            "program_id": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+            "account_keys": account_keys,
+            "compiled_instruction_account_indices": list(range(1, len(account_keys))),
+            "remaining_accounts": remaining_accounts,
+            "resolver_validation_status": resolver_validation_status,
+            "named_accounts": [
+                {"role": "global", "pubkey": "global1"},
+                {"role": "mint", "pubkey": "mint1"},
+                {"role": "bonding_curve", "pubkey": "pool1"},
+                {"role": "associated_bonding_curve", "pubkey": associated_bonding_curve},
+                {"role": "user", "pubkey": "user1"},
+            ],
+        }
+
+    def test_route_evidence_join_complete_projects_attempt_without_success_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "route-evidence-complete"
+            buy = {
+                "pool_id": "pool1",
+                "base_mint": "mint1",
+                "ab_record_id": "pool1:mint1:BUY",
+                "signature": "sig1",
+                "slot": 10,
+                "ix_index": 2,
+                "route_kind": "legacy_buy",
+                "shadow_execution_outcome": "shadow_unknown_error",
+            }
+            shadow = {
+                "record_type": "shadow_dispatch",
+                "pool_id": "pool1",
+                "mint_id": "mint1",
+                "ab_record_id": "pool1:mint1:BUY",
+                "signature": "sig1",
+                "slot": 10,
+                "ix_index": 2,
+                "route_kind": "legacy_buy",
+                "dispatch_status": "not_dispatched",
+                "simulation_outcome": "not_attempted",
+                "execution_feasibility_status": "not_executable_route",
+                "route_resolution_status": "no_executable_route_account_set",
+                "precheck_failure_reason": (
+                    "no_executable_route_account_set:"
+                    "legacy_buy_missing_buyback_remaining_accounts:count=0:expected=2"
+                ),
+            }
+            self.write_simcov_fixture(root, scope=scope, buy_rows=[buy], shadow_rows=[shadow])
+            self.write_route_evidence_candidates(root, scope, [self.route_evidence_candidate()])
+            self.write_raw_route_evidence(root, scope, [self.raw_route_evidence()])
+
+            report = self.run_route_evidence_join_report(root, scope)
+            joined = read_jsonl(Path(report["outputs"]["joined"]))
+            blocker_rows = read_jsonl(Path(report["outputs"]["blocker_table"]))
+
+        self.assertEqual(report["join_evidence"]["complete_rows"], 1)
+        self.assertEqual(joined[0]["status"], "complete")
+        self.assertFalse(joined[0]["can_unlock_execution"])
+        self.assertEqual(report["baseline"]["buy_rows"], 1)
+        self.assertEqual(report["buy_blocker_rows"], 1)
+        self.assertEqual(report["baseline"]["shadow_simulation_attempted_rows"], 0)
+        self.assertEqual(report["evidence_enabled"]["shadow_simulation_attempted_rows"], 1)
+        self.assertEqual(report["evidence_enabled"]["shadow_simulation_success_rows"], 0)
+        self.assertTrue(
+            report["projection_meta"]["success_rows_not_projected_without_runtime_simulation"]
+        )
+        self.assertEqual(
+            report["evidence_enabled"]["simulation_attempt_coverage"]["display"],
+            "1 / 1 = 100.00%",
+        )
+        self.assertEqual(blocker_rows[0]["exact_blocker_reason"], "not_executable_route:ROUTE_INCOMPLETE_LEGACY_TAIL_MISSING:complete_join_available_offline_only")
+
+    def test_route_evidence_join_outlier_tail_len_3_missing_join_key_is_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "route-evidence-tail3"
+            self.write_simcov_fixture(root, scope=scope, buy_rows=[], shadow_rows=[])
+            self.write_route_evidence_candidates(
+                root,
+                scope,
+                [
+                    self.route_evidence_candidate(
+                        signature=None,
+                        slot=None,
+                        ix_index=None,
+                        remaining_accounts=["tail1", "tail2", "tail3"],
+                    )
+                ],
+            )
+            report = self.run_route_evidence_join_report(root, scope)
+            joined = read_jsonl(Path(report["outputs"]["joined"]))
+            outliers = read_jsonl(Path(report["outputs"]["outliers"]))
+
+        self.assertEqual(joined[0]["status"], "pending_join")
+        self.assertIn("tail_len_3", joined[0]["taxonomy"])
+        self.assertIn("missing_signature", joined[0]["taxonomy"])
+        self.assertIn("missing_ix_index", joined[0]["taxonomy"])
+        self.assertEqual(outliers[0]["tail_class"], "tail_len_3")
+        self.assertEqual(outliers[0]["raw_gRPC_match_status"], "missing_join_key")
+
+    def test_route_evidence_join_key_audit_confirms_absence_despite_remaining_index(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "route-evidence-join-key-audit"
+            self.write_simcov_fixture(root, scope=scope, buy_rows=[], shadow_rows=[])
+            self.write_route_evidence_candidates(root, scope, [])
+            self.write_program_stream_raw(
+                root,
+                scope,
+                topic_file="nln_pumpfun_buy_raw_v1.jsonl",
+                rows=[
+                    {
+                        "artifact": "nln_program_stream_raw_v1",
+                        "payload": {
+                            "accounts": {
+                                "remaining_accounts": [
+                                    {"index": 0, "pubkey": "tail1"},
+                                    {"index": 1, "pubkey": "tail2"},
+                                ]
+                            }
+                        },
+                    }
+                ],
+            )
+            report = self.run_route_evidence_join_report(root, scope)
+            audit = report["program_stream_join_key_audit"]
+
+        self.assertTrue(audit["PROGRAM_STREAM_JOIN_KEY_ABSENT_CONFIRMED"])
+        self.assertEqual(audit["field_group_counts"]["signature_like"], 0)
+        self.assertEqual(audit["field_group_counts"]["slot_like"], 0)
+        self.assertEqual(audit["field_group_counts"]["tx_index_like"], 0)
+        self.assertEqual(audit["field_group_counts"]["ix_index_like"], 0)
+        self.assertGreater(audit["field_group_counts"]["generic_index_ambiguous"], 0)
+
+    def test_route_evidence_historical_comparison_uses_attempt_rate_not_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "route-evidence-historical"
+            old_scope = "old-93-attempt-coverage"
+            self.write_simcov_fixture(root, scope=scope, buy_rows=[], shadow_rows=[])
+            self.write_route_evidence_candidates(root, scope, [])
+            common.write_json(
+                root / "reports" / "selector" / old_scope / "buy_simulation_coverage_audit_v1.json",
+                {
+                    "artifact": "buy_simulation_coverage_audit_v1",
+                    "scope": old_scope,
+                    "metrics": {
+                        "buy_rows": 100,
+                        "shadow_dispatch_rows": 100,
+                        "shadow_simulated_rows": 80,
+                        "simulation_attempt_coverage": 0.93,
+                        "simulation_success_coverage": 0.80,
+                        "simulation_failed_rows": 13,
+                        "not_executable_route_rows": 7,
+                    },
+                },
+            )
+
+            report = self.run_route_evidence_join_report(root, scope)
+            historical = report["historical_coverage_comparison"]
+
+        self.assertEqual(historical["old_93_coverage_claim_status"], "CONFIRMED_IN_LOCAL_ARTIFACTS")
+        matching = historical["old_93_matching_rows"]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0]["scope"], old_scope)
+        self.assertEqual(matching[0]["attempted_rows"], 93)
+        self.assertEqual(matching[0]["attempt_coverage"]["display"], "93 / 100 = 93.00%")
+
+    def test_route_evidence_join_conflict_emits_field_level_diff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "route-evidence-conflict"
+            self.write_simcov_fixture(root, scope=scope, buy_rows=[], shadow_rows=[])
+            self.write_route_evidence_candidates(root, scope, [self.route_evidence_candidate()])
+            self.write_raw_route_evidence(
+                root,
+                scope,
+                [self.raw_route_evidence(associated_bonding_curve="different_abc")],
+            )
+            report = self.run_route_evidence_join_report(root, scope)
+            joined = read_jsonl(Path(report["outputs"]["joined"]))
+            outliers = read_jsonl(Path(report["outputs"]["outliers"]))
+
+        self.assertEqual(report["join_evidence"]["status_counts"]["conflicted"], 1)
+        self.assertEqual(joined[0]["status"], "conflicted")
+        self.assertEqual(joined[0]["conflict_field"], "associated_bonding_curve")
+        self.assertEqual(outliers[0]["program_stream_value"], "abc1")
+        self.assertEqual(outliers[0]["raw_gRPC_value"], "different_abc")
 
     def test_buy_simulation_audit_classifies_not_executable_legacy_tail_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
