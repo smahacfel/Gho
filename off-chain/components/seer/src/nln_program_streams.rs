@@ -609,6 +609,7 @@ pub struct NlnProgramStreamsClient {
     inner: StreamServiceClient,
     auth_header: MetadataKey<Ascii>,
     api_key: AsciiMetadataValue,
+    eventstream_policy_header: Option<AsciiMetadataValue>,
     stats: Arc<NlnProgramStreamsStats>,
 }
 
@@ -629,6 +630,14 @@ impl NlnProgramStreamsClient {
         let api_key = resolve_api_key(&config)?;
         let api_key = AsciiMetadataValue::try_from(api_key.as_str())
             .context("NLN API key contains non-ASCII metadata bytes")?;
+        let eventstream_policy_header = config
+            .eventstream_policy_header
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(AsciiMetadataValue::try_from)
+            .transpose()
+            .context("NLN eventstream policy contains non-ASCII metadata bytes")?;
         let inner = StreamServiceClient::connect(endpoint).await?;
 
         Ok(Self {
@@ -636,6 +645,7 @@ impl NlnProgramStreamsClient {
             inner,
             auth_header,
             api_key,
+            eventstream_policy_header,
             stats,
         })
     }
@@ -784,6 +794,12 @@ impl NlnProgramStreamsClient {
         request
             .metadata_mut()
             .insert(self.auth_header.clone(), self.api_key.clone());
+        if let Some(policy) = self.eventstream_policy_header.clone() {
+            request.metadata_mut().insert(
+                MetadataKey::<Ascii>::from_static("x-eventstream-policy"),
+                policy,
+            );
+        }
     }
 }
 

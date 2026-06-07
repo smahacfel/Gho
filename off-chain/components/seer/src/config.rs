@@ -295,6 +295,11 @@ pub struct ProgramStreamsConfig {
     #[serde(default = "ProgramStreamsConfig::default_api_key_env_fallback")]
     pub api_key_env_fallback: Option<String>,
 
+    /// Optional NLN Event Streams policy metadata value. Runtime evidence
+    /// profiles should restrict this to the explicitly enabled topics.
+    #[serde(default)]
+    pub eventstream_policy_header: Option<String>,
+
     /// Payload format requested from the Program Streams Subscribe API.
     #[serde(default)]
     pub format: ProgramStreamPayloadFormat,
@@ -324,6 +329,11 @@ pub struct ProgramStreamsConfig {
     #[serde(default)]
     pub disabled_optional_topics: Vec<String>,
 
+    /// Topics intentionally disabled in the current profile, including topics
+    /// that are not optional in legacy profiles.
+    #[serde(default)]
+    pub disabled_streams: Vec<String>,
+
     /// Pump.fun create topic used for candidate birth artifacts.
     #[serde(default = "ProgramStreamsConfig::default_pumpfun_create_topic")]
     pub pumpfun_create_topic: String,
@@ -332,9 +342,23 @@ pub struct ProgramStreamsConfig {
     #[serde(default = "ProgramStreamsConfig::default_pumpfun_trade_topic")]
     pub pumpfun_trade_topic: String,
 
+    /// Pump.fun decoded buy Program Stream used only as route evidence capture.
+    #[serde(default = "ProgramStreamsConfig::default_pumpfun_buy_topic")]
+    pub pumpfun_buy_topic: String,
+
+    /// Pump.fun decoded buy_exact_sol_in Program Stream used only as route
+    /// evidence capture.
+    #[serde(default = "ProgramStreamsConfig::default_pumpfun_buy_exact_sol_in_topic")]
+    pub pumpfun_buy_exact_sol_in_topic: String,
+
     /// Native SOL transfer topic used for FSC v2 funding index capture.
     #[serde(default = "ProgramStreamsConfig::default_system_transfers_topic")]
     pub system_transfers_topic: String,
+
+    /// Optional artifact directory propagated by launch profiles for evidence
+    /// rows that need a durable run scope label.
+    #[serde(default)]
+    pub artifact_capture_dir: Option<String>,
 
     /// TTL for NLN trade rows waiting for Ghost birth-lane pool identity.
     #[serde(default = "ProgramStreamsConfig::default_trade_resolver_ttl_ms")]
@@ -373,15 +397,20 @@ impl Default for ProgramStreamsConfig {
             auth_header: Self::default_auth_header(),
             api_key_env: Self::default_api_key_env(),
             api_key_env_fallback: Self::default_api_key_env_fallback(),
+            eventstream_policy_header: None,
             format: ProgramStreamPayloadFormat::default(),
             max_streams: Self::default_max_streams(),
             quota_policy: ProgramStreamsQuotaPolicy::default(),
             enabled_topics: Vec::new(),
             optional_topics: Vec::new(),
             disabled_optional_topics: Vec::new(),
+            disabled_streams: Vec::new(),
             pumpfun_create_topic: Self::default_pumpfun_create_topic(),
             pumpfun_trade_topic: Self::default_pumpfun_trade_topic(),
+            pumpfun_buy_topic: Self::default_pumpfun_buy_topic(),
+            pumpfun_buy_exact_sol_in_topic: Self::default_pumpfun_buy_exact_sol_in_topic(),
             system_transfers_topic: Self::default_system_transfers_topic(),
+            artifact_capture_dir: None,
             trade_resolver_ttl_ms: Self::default_trade_resolver_ttl_ms(),
             trade_resolver_per_mint_cap: Self::default_trade_resolver_per_mint_cap(),
             trade_resolver_global_cap: Self::default_trade_resolver_global_cap(),
@@ -420,6 +449,14 @@ impl ProgramStreamsConfig {
 
     pub fn default_pumpfun_trade_topic() -> String {
         "prod.rpc.solana.pumpfun.trade".to_string()
+    }
+
+    pub fn default_pumpfun_buy_topic() -> String {
+        "solana.pump_fun.buy".to_string()
+    }
+
+    pub fn default_pumpfun_buy_exact_sol_in_topic() -> String {
+        "solana.pump_fun.buy_exact_sol_in".to_string()
     }
 
     pub fn default_system_transfers_topic() -> String {

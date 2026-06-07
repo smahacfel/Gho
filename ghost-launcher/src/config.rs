@@ -1737,6 +1737,11 @@ pub struct SeerProgramStreamsComponentConfig {
     #[serde(default = "default_program_streams_api_key_env_fallback")]
     pub api_key_env_fallback: Option<String>,
 
+    /// Optional NLN Event Streams policy metadata value. Route-evidence
+    /// profiles should restrict this to the exact enabled topics.
+    #[serde(default)]
+    pub eventstream_policy_header: Option<String>,
+
     /// Subscribe payload format. PR-FSC1 supports the config surface only.
     #[serde(default = "default_program_streams_format")]
     pub format: String,
@@ -1764,6 +1769,12 @@ pub struct SeerProgramStreamsComponentConfig {
     #[serde(default)]
     pub disabled_optional_topics: Vec<String>,
 
+    /// Topics intentionally disabled for this rollout profile, including
+    /// legacy required topics when a profile switches to isolated evidence
+    /// capture.
+    #[serde(default)]
+    pub disabled_streams: Vec<String>,
+
     /// Pump.fun create topic.
     #[serde(default = "default_program_streams_pumpfun_create_topic")]
     pub pumpfun_create_topic: String,
@@ -1771,6 +1782,16 @@ pub struct SeerProgramStreamsComponentConfig {
     /// Pump.fun trade topic.
     #[serde(default = "default_program_streams_pumpfun_trade_topic")]
     pub pumpfun_trade_topic: String,
+
+    /// Pump.fun decoded buy Program Stream used only for isolated route
+    /// evidence capture.
+    #[serde(default = "default_program_streams_pumpfun_buy_topic")]
+    pub pumpfun_buy_topic: String,
+
+    /// Pump.fun decoded buy_exact_sol_in Program Stream used only for isolated
+    /// route evidence capture.
+    #[serde(default = "default_program_streams_pumpfun_buy_exact_sol_in_topic")]
+    pub pumpfun_buy_exact_sol_in_topic: String,
 
     /// Solana system transfer topic.
     #[serde(default = "default_program_streams_system_transfers_topic")]
@@ -1840,14 +1861,19 @@ impl Default for SeerProgramStreamsComponentConfig {
             auth_header: default_program_streams_auth_header(),
             api_key_env: default_program_streams_api_key_env(),
             api_key_env_fallback: default_program_streams_api_key_env_fallback(),
+            eventstream_policy_header: None,
             format: default_program_streams_format(),
             max_streams: default_program_streams_max_streams(),
             quota_policy: ProgramStreamsQuotaPolicy::default(),
             enabled_topics: Vec::new(),
             optional_topics: Vec::new(),
             disabled_optional_topics: Vec::new(),
+            disabled_streams: Vec::new(),
             pumpfun_create_topic: default_program_streams_pumpfun_create_topic(),
             pumpfun_trade_topic: default_program_streams_pumpfun_trade_topic(),
+            pumpfun_buy_topic: default_program_streams_pumpfun_buy_topic(),
+            pumpfun_buy_exact_sol_in_topic: default_program_streams_pumpfun_buy_exact_sol_in_topic(
+            ),
             system_transfers_topic: default_program_streams_system_transfers_topic(),
             trade_resolver_ttl_ms: default_program_streams_trade_resolver_ttl_ms(),
             trade_resolver_per_mint_cap: default_program_streams_trade_resolver_per_mint_cap(),
@@ -2902,6 +2928,14 @@ fn default_program_streams_pumpfun_create_topic() -> String {
 
 fn default_program_streams_pumpfun_trade_topic() -> String {
     "prod.rpc.solana.pumpfun.trade".to_string()
+}
+
+fn default_program_streams_pumpfun_buy_topic() -> String {
+    "solana.pump_fun.buy".to_string()
+}
+
+fn default_program_streams_pumpfun_buy_exact_sol_in_topic() -> String {
+    "solana.pump_fun.buy_exact_sol_in".to_string()
 }
 
 fn default_program_streams_system_transfers_topic() -> String {

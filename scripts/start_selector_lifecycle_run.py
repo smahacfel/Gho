@@ -189,11 +189,19 @@ def start_tmux_session(
     launcher: Path,
     config_path: Path,
     runtime_log: Path,
+    runtime_timeout_seconds: int | None,
 ) -> dict[str, Any]:
     runtime_log.parent.mkdir(parents=True, exist_ok=True)
+    timeout_prefix = ""
+    if runtime_timeout_seconds is not None and runtime_timeout_seconds > 0:
+        timeout_prefix = f"timeout {int(runtime_timeout_seconds)}s "
     command = (
         f"cd {shlex.quote(str(root))} && "
-        f"RUST_LOG=info {shlex.quote(str(launcher))} "
+        "set -a && [ -f ./.env ] && . ./.env && set +a && "
+        'if [ -z "${NLN_API_KEY:-}" ] && [ -n "${GHOST_SEER_GRPC_X_TOKEN:-}" ]; then '
+        'export NLN_API_KEY="$GHOST_SEER_GRPC_X_TOKEN"; '
+        "fi && "
+        f"RUST_LOG=info {timeout_prefix}{shlex.quote(str(launcher))} "
         f"--config {shlex.quote(str(config_path))} "
         f">> {shlex.quote(str(runtime_log))} 2>&1"
     )
@@ -351,6 +359,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--event-canary-seconds", type=int, default=900)
     parser.add_argument("--lifecycle-proof-timeout-seconds", type=int, default=3600)
     parser.add_argument("--lifecycle-poll-seconds", type=int, default=60)
+    parser.add_argument(
+        "--runtime-timeout-seconds",
+        type=int,
+        default=None,
+        help="Optional timeout applied inside the launcher-owned tmux runtime command.",
+    )
     parser.add_argument("--min-reporter-rows", type=int, default=1)
     parser.add_argument("--allow-existing-session", action="store_true")
     parser.add_argument("--skip-static-tests", action="store_true")
@@ -382,6 +396,7 @@ def main(argv: list[str] | None = None) -> int:
         "scope": args.scope,
         "config": str(config_path),
         "tmux_session": args.tmux_session,
+        "runtime_timeout_seconds": args.runtime_timeout_seconds,
         "output_dir": str(output_dir),
         "runtime_binary": str(launcher),
         "build_release_before_start": args.build_release_before_start,
@@ -533,6 +548,7 @@ def main(argv: list[str] | None = None) -> int:
         launcher=launcher,
         config_path=resolved_config,
         runtime_log=runtime_log,
+        runtime_timeout_seconds=args.runtime_timeout_seconds,
     )
     report["tmux_start"] = start
     if start["exit_code"] != 0:

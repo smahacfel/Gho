@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
@@ -208,6 +209,31 @@ class SelectorLifecycleRunGuardTests(unittest.TestCase):
 
         self.assertEqual(launcher.FAIL_CONFIG_CONTRACT, status)
         self.assertTrue(any("shadow_buys" in error for error in errors))
+
+    def test_tmux_start_sources_env_and_aliases_nln_api_key_without_secret_literal(self) -> None:
+        captured = {}
+
+        def fake_run(command, **kwargs):
+            captured["command"] = command
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(launcher.subprocess, "run", fake_run):
+            root = Path(tmp)
+            result = launcher.start_tmux_session(
+                root=root,
+                session="selector_dataset_r12_simcov_evidence",
+                launcher=root / "target/release/ghost-launcher",
+                config_path=root / "configs/rollout/r12.toml",
+                runtime_log=root / "reports/runtime.log",
+                runtime_timeout_seconds=5400,
+            )
+
+        self.assertEqual(0, result["exit_code"])
+        tmux_payload = captured["command"][-1]
+        self.assertIn("set -a && [ -f ./.env ] && . ./.env && set +a", tmux_payload)
+        self.assertIn('export NLN_API_KEY="$GHOST_SEER_GRPC_X_TOKEN"', tmux_payload)
+        self.assertIn("timeout 5400s", tmux_payload)
+        self.assertNotIn("sk_live_", tmux_payload)
 
 
 if __name__ == "__main__":

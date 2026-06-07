@@ -8,6 +8,7 @@ use crate::events::{
     AccountUpdateEvent, DetectedPool, EventBusSender, FundingTransferObserved, GhostEvent,
 };
 use anyhow::Result;
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use futures::StreamExt;
 use ghost_brain::oracle::{InitPoolEvent, SnapshotEngine};
 use ghost_core::health::RuntimeHealth;
@@ -29,7 +30,7 @@ use seer::{
     Seer,
 };
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::hash::Hash;
 use std::path::PathBuf;
@@ -92,9 +93,12 @@ impl NlnArtifactCaptureConfig {
 enum NlnArtifactRecord {
     PumpFunCreateRaw(Value),
     PumpFunTradeRaw(Value),
+    PumpFunBuyRaw(Value),
+    PumpFunBuyExactSolInRaw(Value),
     SystemTransfersRaw(Value),
     NormalizationError(Value),
     CandidateBirth(Value),
+    RouteManifestEvidenceCandidate(Value),
     FundingEvent(Value),
 }
 
@@ -186,7 +190,29 @@ fn json_scalar_string(value: &Value) -> Option<String> {
     match value {
         Value::String(value) if !value.is_empty() => Some(value.clone()),
         Value::Number(value) => Some(value.to_string()),
+        Value::Object(object) => object.get("value").and_then(json_scalar_string),
         _ => None,
+    }
+}
+
+fn json_account_pubkey_string(value: &Value) -> Option<String> {
+    let raw = json_scalar_string(value)?;
+    if let Ok(bytes) = BASE64_STANDARD.decode(raw.as_bytes()) {
+        if let Ok(bytes) = <[u8; 32]>::try_from(bytes.as_slice()) {
+            return Some(Pubkey::new_from_array(bytes).to_string());
+        }
+    }
+    Some(raw)
+}
+
+fn json_scalar_value(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => object
+            .get("value")
+            .map(json_scalar_value)
+            .unwrap_or(Value::Null),
+        Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null => value.clone(),
+        _ => Value::Null,
     }
 }
 
@@ -206,10 +232,31 @@ fn resolve_program_streams_endpoint(raw: &str) -> String {
     trimmed.to_string()
 }
 
-fn nln_artifact_raw_row(message: &NlnProgramStreamMessage) -> Value {
+fn nln_program_stream_run_scope(config: &ProgramStreamsConfig) -> Option<String> {
+    config
+        .artifact_capture_dir
+        .as_deref()
+        .and_then(|dir| std::path::Path::new(dir).file_name())
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+}
+
+fn nln_artifact_raw_row(
+    message: &NlnProgramStreamMessage,
+    config: &ProgramStreamsConfig,
+    capture_version: &'static str,
+) -> Value {
     json!({
         "schema_version": NLN_ARTIFACT_SCHEMA_VERSION,
         "provider": "NLN",
+        "stream_kind": "program_stream",
+        "run_scope": nln_program_stream_run_scope(config),
+        "capture_version": capture_version,
+        "source_endpoint": config.endpoint,
+        "payload_format": config.format.as_str(),
+        "parse_status": "raw_captured",
+        "received_at_ms": message.recv_ts_ms,
         "topic": message.topic,
         "partition": message.partition,
         "offset_raw": message.offset_raw,
@@ -220,6 +267,416 @@ fn nln_artifact_raw_row(message: &NlnProgramStreamMessage) -> Value {
         "decode_ts_ms": message.decode_ts_ms,
         "payload_json": message.payload_json,
     })
+}
+
+fn nln_value_at_path<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a Value> {
+    let object = value.as_object()?;
+    keys.iter().find_map(|key| object.get(*key))
+}
+
+fn nln_nested_value<'a>(payload: &'a Value, keys: &[&str]) -> Option<&'a Value> {
+    nln_value_at_path(payload, keys).or_else(|| {
+        ["payload", "data", "event", "accounts", "args"]
+            .iter()
+            .find_map(|container| {
+                payload
+                    .get(*container)
+                    .and_then(|value| nln_value_at_path(value, keys))
+            })
+    })
+}
+
+fn nln_nested_scalar_string(payload: &Value, keys: &[&str]) -> Option<String> {
+    nln_nested_value(payload, keys).and_then(json_scalar_string)
+}
+
+fn nln_nested_account_pubkey_string(payload: &Value, keys: &[&str]) -> Option<String> {
+    nln_nested_value(payload, keys).and_then(json_account_pubkey_string)
+}
+
+fn nln_nested_u64(payload: &Value, keys: &[&str]) -> Option<u64> {
+    nln_nested_value(payload, keys).and_then(|value| {
+        value
+            .as_u64()
+            .or_else(|| value.as_str().and_then(|value| value.parse::<u64>().ok()))
+    })
+}
+
+fn nln_route_account_role_value(payload: &Value, role: &str, aliases: &[&str]) -> Value {
+    json!({
+        "role": role,
+        "pubkey": nln_nested_account_pubkey_string(payload, aliases),
+        "source": "nln_program_stream_named_account",
+    })
+}
+
+fn nln_route_named_accounts(payload: &Value) -> Vec<Value> {
+    [
+        ("global", &["global", "global_config", "globalConfig"][..]),
+        ("mint", &["mint", "base_mint", "baseMint"][..]),
+        ("bonding_curve", &["bonding_curve", "bondingCurve"][..]),
+        (
+            "associated_bonding_curve",
+            &["associated_bonding_curve", "associatedBondingCurve"][..],
+        ),
+        (
+            "associated_user",
+            &[
+                "associated_user",
+                "associatedUser",
+                "associated_token_account",
+            ][..],
+        ),
+        ("user", &["user", "buyer"][..]),
+        ("fee_recipient", &["fee_recipient", "feeRecipient"][..]),
+        ("creator_vault", &["creator_vault", "creatorVault"][..]),
+        ("token_program", &["token_program", "tokenProgram"][..]),
+        ("system_program", &["system_program", "systemProgram"][..]),
+        (
+            "event_authority",
+            &["event_authority", "eventAuthority"][..],
+        ),
+        (
+            "global_volume_accumulator",
+            &["global_volume_accumulator", "globalVolumeAccumulator"][..],
+        ),
+        (
+            "user_volume_accumulator",
+            &["user_volume_accumulator", "userVolumeAccumulator"][..],
+        ),
+        ("fee_config", &["fee_config", "feeConfig"][..]),
+        ("fee_program", &["fee_program", "feeProgram"][..]),
+        ("program", &["program", "program_id", "programId"][..]),
+    ]
+    .into_iter()
+    .map(|(role, aliases)| nln_route_account_role_value(payload, role, aliases))
+    .collect()
+}
+
+fn nln_route_remaining_accounts(payload: &Value) -> Vec<Value> {
+    let Some(value) = nln_nested_value(payload, &["remaining_accounts", "remainingAccounts"])
+    else {
+        return Vec::new();
+    };
+    let Some(accounts) = value.as_array() else {
+        return Vec::new();
+    };
+    accounts
+        .iter()
+        .enumerate()
+        .map(|(index, account)| {
+            json!({
+                "index": index,
+                "pubkey": json_account_pubkey_string(account),
+                "source": "nln_program_stream_remaining_account",
+            })
+        })
+        .collect()
+}
+
+fn nln_route_args(payload: &Value, topic_kind: NlnProgramStreamCaptureTopic) -> Vec<Value> {
+    let fields: &[(&str, &[&str])] = match topic_kind {
+        NlnProgramStreamCaptureTopic::PumpFunBuy => &[
+            ("amount", &["amount"][..]),
+            ("max_sol_cost", &["max_sol_cost", "maxSolCost"][..]),
+            ("track_volume", &["track_volume", "trackVolume"][..]),
+        ],
+        NlnProgramStreamCaptureTopic::PumpFunBuyExactSolIn => &[
+            (
+                "spendable_sol_in",
+                &["spendable_sol_in", "spendableSolIn"][..],
+            ),
+            ("min_tokens_out", &["min_tokens_out", "minTokensOut"][..]),
+            ("track_volume", &["track_volume", "trackVolume"][..]),
+        ],
+        _ => &[],
+    };
+    fields
+        .iter()
+        .map(|(name, aliases)| {
+            json!({
+                "name": name,
+                "value": nln_nested_value(payload, aliases)
+                    .map(json_scalar_value)
+                    .unwrap_or(Value::Null),
+            })
+        })
+        .collect()
+}
+
+fn nln_route_kind_for_topic(topic_kind: NlnProgramStreamCaptureTopic) -> Option<&'static str> {
+    match topic_kind {
+        NlnProgramStreamCaptureTopic::PumpFunBuy => Some("legacy_buy"),
+        NlnProgramStreamCaptureTopic::PumpFunBuyExactSolIn => Some("routed_exact_sol_in"),
+        _ => None,
+    }
+}
+
+fn nln_route_manifest_evidence_candidate_row(
+    message: &NlnProgramStreamMessage,
+    topic_kind: NlnProgramStreamCaptureTopic,
+    config: &ProgramStreamsConfig,
+) -> Option<Value> {
+    let route_kind = nln_route_kind_for_topic(topic_kind)?;
+    let payload = &message.payload_json;
+    let signature =
+        nln_nested_scalar_string(payload, &["signature", "tx_signature", "txSignature"]);
+    let slot = nln_nested_u64(payload, &["slot"]);
+    let tx_index = nln_nested_u64(payload, &["tx_index", "txIndex"]);
+    let ix_index = nln_nested_u64(
+        payload,
+        &[
+            "ix_index",
+            "ixIndex",
+            "instruction_index",
+            "instructionIndex",
+            "outer_instruction_index",
+        ],
+    );
+    let named_accounts = nln_route_named_accounts(payload);
+    let remaining_accounts = nln_route_remaining_accounts(payload);
+    let args = nln_route_args(payload, topic_kind);
+    let args_hash = nln_stable_hash(&[serde_json::to_string(&args).unwrap_or_default()]);
+    let named_accounts_value = json!(named_accounts);
+    let mut manifest_layout = BTreeMap::new();
+    manifest_layout.insert("schema_version", json!(1));
+    manifest_layout.insert("route_kind", json!(route_kind));
+    manifest_layout.insert("program_id", json!("pump_fun"));
+    manifest_layout.insert("named_accounts", named_accounts_value.clone());
+    manifest_layout.insert("remaining_accounts", json!(remaining_accounts.clone()));
+    manifest_layout.insert(
+        "remaining_accounts_status",
+        if remaining_accounts.is_empty() {
+            json!("unknown_until_raw_grpc_join")
+        } else {
+            json!("program_stream_tail_observed")
+        },
+    );
+    let account_manifest_hash =
+        nln_stable_hash(&[serde_json::to_string(&manifest_layout).unwrap_or_default()]);
+    let instruction_evidence = json!({
+        "schema_version": 1,
+        "source": "nln_program_stream",
+        "source_endpoint": config.endpoint,
+        "topic": message.topic,
+        "route_kind": route_kind,
+        "signature": signature,
+        "slot": slot,
+        "tx_index": tx_index,
+        "ix_index": ix_index,
+        "named_accounts": named_accounts_value,
+        "args_hash": args_hash,
+        "args": args,
+        "account_manifest_hash": account_manifest_hash,
+    });
+    let instruction_evidence_hash =
+        nln_stable_hash(&[serde_json::to_string(&instruction_evidence).unwrap_or_default()]);
+    let strong_join_keys_present =
+        signature.is_some() && slot.is_some() && tx_index.is_some() && ix_index.is_some();
+    let join_status = if strong_join_keys_present {
+        "pending_raw_grpc_join"
+    } else {
+        "degraded_missing_tx_or_instruction_index"
+    };
+    let manifest_status = if strong_join_keys_present {
+        "pending_join"
+    } else {
+        "degraded_pending_join"
+    };
+    let tail_evidence_status = if remaining_accounts.is_empty() {
+        "unknown_until_raw_grpc_join"
+    } else {
+        "program_stream_tail_observed_unverified"
+    };
+    let remaining_account_count = remaining_accounts.len();
+
+    let mut row = serde_json::Map::new();
+    row.insert("schema_version".to_string(), json!(1));
+    row.insert(
+        "artifact".to_string(),
+        json!("route_manifest_evidence_candidate_v1"),
+    );
+    row.insert("stream_kind".to_string(), json!("program_stream"));
+    row.insert("source".to_string(), json!("nln_program_stream"));
+    row.insert("source_endpoint".to_string(), json!(config.endpoint));
+    row.insert(
+        "run_scope".to_string(),
+        json!(nln_program_stream_run_scope(config)),
+    );
+    row.insert(
+        "capture_version".to_string(),
+        json!("nln_program_route_evidence_candidate_v1"),
+    );
+    row.insert("received_at_ms".to_string(), json!(message.recv_ts_ms));
+    row.insert("topic".to_string(), json!(message.topic));
+    row.insert("topic_kind".to_string(), json!(topic_kind.label()));
+    row.insert("route_kind".to_string(), json!(route_kind));
+    row.insert("signature".to_string(), json!(signature));
+    row.insert("slot".to_string(), json!(slot));
+    row.insert("tx_index".to_string(), json!(tx_index));
+    row.insert("ix_index".to_string(), json!(ix_index));
+    row.insert("parse_status".to_string(), json!("OK"));
+    row.insert("named_accounts".to_string(), named_accounts_value);
+    row.insert(
+        "global".to_string(),
+        json!(nln_nested_account_pubkey_string(
+            payload,
+            &["global", "global_config", "globalConfig"]
+        )),
+    );
+    row.insert(
+        "mint".to_string(),
+        json!(nln_nested_account_pubkey_string(
+            payload,
+            &["mint", "base_mint", "baseMint"]
+        )),
+    );
+    row.insert(
+        "bonding_curve".to_string(),
+        json!(nln_nested_account_pubkey_string(
+            payload,
+            &["bonding_curve", "bondingCurve"]
+        )),
+    );
+    row.insert(
+        "associated_bonding_curve".to_string(),
+        json!(nln_nested_account_pubkey_string(
+            payload,
+            &["associated_bonding_curve", "associatedBondingCurve"]
+        )),
+    );
+    row.insert(
+        "associated_user".to_string(),
+        json!(nln_nested_account_pubkey_string(
+            payload,
+            &[
+                "associated_user",
+                "associatedUser",
+                "associated_token_account"
+            ]
+        )),
+    );
+    row.insert(
+        "user".to_string(),
+        json!(nln_nested_account_pubkey_string(
+            payload,
+            &["user", "buyer"]
+        )),
+    );
+    row.insert(
+        "fee_recipient".to_string(),
+        json!(nln_nested_account_pubkey_string(
+            payload,
+            &["fee_recipient", "feeRecipient"]
+        )),
+    );
+    row.insert(
+        "creator_vault".to_string(),
+        json!(nln_nested_account_pubkey_string(
+            payload,
+            &["creator_vault", "creatorVault"]
+        )),
+    );
+    row.insert(
+        "token_program".to_string(),
+        json!(nln_nested_account_pubkey_string(
+            payload,
+            &["token_program", "tokenProgram"]
+        )),
+    );
+    row.insert(
+        "system_program".to_string(),
+        json!(nln_nested_account_pubkey_string(
+            payload,
+            &["system_program", "systemProgram"]
+        )),
+    );
+    row.insert(
+        "event_authority".to_string(),
+        json!(nln_nested_account_pubkey_string(
+            payload,
+            &["event_authority", "eventAuthority"]
+        )),
+    );
+    row.insert(
+        "global_volume_accumulator".to_string(),
+        json!(nln_nested_account_pubkey_string(
+            payload,
+            &["global_volume_accumulator", "globalVolumeAccumulator"]
+        )),
+    );
+    row.insert(
+        "user_volume_accumulator".to_string(),
+        json!(nln_nested_account_pubkey_string(
+            payload,
+            &["user_volume_accumulator", "userVolumeAccumulator"]
+        )),
+    );
+    row.insert(
+        "fee_config".to_string(),
+        json!(nln_nested_account_pubkey_string(
+            payload,
+            &["fee_config", "feeConfig"]
+        )),
+    );
+    row.insert(
+        "fee_program".to_string(),
+        json!(nln_nested_account_pubkey_string(
+            payload,
+            &["fee_program", "feeProgram"]
+        )),
+    );
+    row.insert(
+        "program".to_string(),
+        json!(nln_nested_account_pubkey_string(
+            payload,
+            &["program", "program_id", "programId"]
+        )),
+    );
+    row.insert("args".to_string(), instruction_evidence["args"].clone());
+    row.insert("args_hash".to_string(), json!(args_hash));
+    row.insert(
+        "instruction_evidence_hash".to_string(),
+        json!(instruction_evidence_hash),
+    );
+    row.insert(
+        "account_manifest_hash".to_string(),
+        json!(account_manifest_hash),
+    );
+    row.insert("remaining_accounts".to_string(), json!(remaining_accounts));
+    row.insert(
+        "remaining_accounts_count".to_string(),
+        json!(remaining_account_count),
+    );
+    row.insert(
+        "remaining_account_count".to_string(),
+        json!(remaining_account_count),
+    );
+    row.insert(
+        "has_legacy_tail".to_string(),
+        json!(remaining_account_count == 2),
+    );
+    row.insert(
+        "manifest_hash_notes".to_string(),
+        json!({
+            "account_manifest_hash_excludes_dynamic_args": true,
+            "instruction_evidence_hash_includes_args_hash": true
+        }),
+    );
+    row.insert("join_status".to_string(), json!(join_status));
+    row.insert("manifest_status".to_string(), json!(manifest_status));
+    row.insert(
+        "tail_evidence_status".to_string(),
+        json!(tail_evidence_status),
+    );
+    row.insert(
+        "program_stream_complete_is_executable".to_string(),
+        json!(false),
+    );
+    row.insert("degraded_join_can_complete".to_string(), json!(false));
+    row.insert("can_unlock_execution".to_string(), json!(false));
+
+    Some(Value::Object(row))
 }
 
 fn nln_payload_scalar_string(message: &NlnProgramStreamMessage, keys: &[&str]) -> Option<String> {
@@ -549,6 +1006,18 @@ fn spawn_nln_artifact_writer(config: NlnArtifactCaptureConfig) -> Option<NlnArti
             "pumpfun_trade_raw_v1",
         )
         .await;
+        let mut buy_raw = open_nln_artifact_file(
+            config.capture_dir.join("nln_pumpfun_buy_raw_v1.jsonl"),
+            "nln_pumpfun_buy_raw_v1",
+        )
+        .await;
+        let mut buy_exact_sol_in_raw = open_nln_artifact_file(
+            config
+                .capture_dir
+                .join("nln_pumpfun_buy_exact_sol_in_raw_v1.jsonl"),
+            "nln_pumpfun_buy_exact_sol_in_raw_v1",
+        )
+        .await;
         let mut transfers_raw = open_nln_artifact_file(
             config.capture_dir.join("system_transfers_raw_v1.jsonl"),
             "system_transfers_raw_v1",
@@ -562,6 +1031,13 @@ fn spawn_nln_artifact_writer(config: NlnArtifactCaptureConfig) -> Option<NlnArti
         let mut candidate_birth = open_nln_artifact_file(
             config.capture_dir.join("nln_candidate_birth_v1.jsonl"),
             "nln_candidate_birth_v1",
+        )
+        .await;
+        let mut route_manifest_candidates = open_nln_artifact_file(
+            config
+                .capture_dir
+                .join("route_manifest_evidence_candidates_v1.jsonl"),
+            "route_manifest_evidence_candidates_v1",
         )
         .await;
         let mut funding_events = open_nln_artifact_file(
@@ -592,6 +1068,12 @@ fn spawn_nln_artifact_writer(config: NlnArtifactCaptureConfig) -> Option<NlnArti
                         NlnArtifactRecord::PumpFunTradeRaw(row) => {
                             write_nln_artifact_line(&mut trade_raw, &row, "pumpfun_trade_raw_v1").await;
                         }
+                        NlnArtifactRecord::PumpFunBuyRaw(row) => {
+                            write_nln_artifact_line(&mut buy_raw, &row, "nln_pumpfun_buy_raw_v1").await;
+                        }
+                        NlnArtifactRecord::PumpFunBuyExactSolInRaw(row) => {
+                            write_nln_artifact_line(&mut buy_exact_sol_in_raw, &row, "nln_pumpfun_buy_exact_sol_in_raw_v1").await;
+                        }
                         NlnArtifactRecord::SystemTransfersRaw(row) => {
                             write_nln_artifact_line(&mut transfers_raw, &row, "system_transfers_raw_v1").await;
                         }
@@ -601,6 +1083,9 @@ fn spawn_nln_artifact_writer(config: NlnArtifactCaptureConfig) -> Option<NlnArti
                         NlnArtifactRecord::CandidateBirth(row) => {
                             write_nln_artifact_line(&mut candidate_birth, &row, "nln_candidate_birth_v1").await;
                         }
+                        NlnArtifactRecord::RouteManifestEvidenceCandidate(row) => {
+                            write_nln_artifact_line(&mut route_manifest_candidates, &row, "route_manifest_evidence_candidates_v1").await;
+                        }
                         NlnArtifactRecord::FundingEvent(row) => {
                             write_nln_artifact_line(&mut funding_events, &row, "funding_events_v1").await;
                         }
@@ -609,9 +1094,12 @@ fn spawn_nln_artifact_writer(config: NlnArtifactCaptureConfig) -> Option<NlnArti
                 _ = flush.tick() => {
                     flush_nln_artifact_writer(&mut create_raw, "pumpfun_create_raw_v1").await;
                     flush_nln_artifact_writer(&mut trade_raw, "pumpfun_trade_raw_v1").await;
+                    flush_nln_artifact_writer(&mut buy_raw, "nln_pumpfun_buy_raw_v1").await;
+                    flush_nln_artifact_writer(&mut buy_exact_sol_in_raw, "nln_pumpfun_buy_exact_sol_in_raw_v1").await;
                     flush_nln_artifact_writer(&mut transfers_raw, "system_transfers_raw_v1").await;
                     flush_nln_artifact_writer(&mut normalization_errors, "nln_normalization_errors_v1").await;
                     flush_nln_artifact_writer(&mut candidate_birth, "nln_candidate_birth_v1").await;
+                    flush_nln_artifact_writer(&mut route_manifest_candidates, "route_manifest_evidence_candidates_v1").await;
                     flush_nln_artifact_writer(&mut funding_events, "funding_events_v1").await;
                 }
             }
@@ -619,9 +1107,20 @@ fn spawn_nln_artifact_writer(config: NlnArtifactCaptureConfig) -> Option<NlnArti
 
         flush_nln_artifact_writer(&mut create_raw, "pumpfun_create_raw_v1").await;
         flush_nln_artifact_writer(&mut trade_raw, "pumpfun_trade_raw_v1").await;
+        flush_nln_artifact_writer(&mut buy_raw, "nln_pumpfun_buy_raw_v1").await;
+        flush_nln_artifact_writer(
+            &mut buy_exact_sol_in_raw,
+            "nln_pumpfun_buy_exact_sol_in_raw_v1",
+        )
+        .await;
         flush_nln_artifact_writer(&mut transfers_raw, "system_transfers_raw_v1").await;
         flush_nln_artifact_writer(&mut normalization_errors, "nln_normalization_errors_v1").await;
         flush_nln_artifact_writer(&mut candidate_birth, "nln_candidate_birth_v1").await;
+        flush_nln_artifact_writer(
+            &mut route_manifest_candidates,
+            "route_manifest_evidence_candidates_v1",
+        )
+        .await;
         flush_nln_artifact_writer(&mut funding_events, "funding_events_v1").await;
         info!("Seer: NLN PR8 artifact capture writer stopped");
     });
@@ -636,6 +1135,8 @@ fn spawn_nln_artifact_writer(config: NlnArtifactCaptureConfig) -> Option<NlnArti
 enum NlnProgramStreamCaptureTopic {
     PumpFunCreate,
     PumpFunTrade,
+    PumpFunBuy,
+    PumpFunBuyExactSolIn,
     SystemTransfers,
 }
 
@@ -644,8 +1145,18 @@ impl NlnProgramStreamCaptureTopic {
         match self {
             Self::PumpFunCreate => "pumpfun_create",
             Self::PumpFunTrade => "pumpfun_trade",
+            Self::PumpFunBuy => "pumpfun_buy",
+            Self::PumpFunBuyExactSolIn => "pumpfun_buy_exact_sol_in",
             Self::SystemTransfers => "system_transfers",
         }
+    }
+
+    const fn is_route_evidence(self) -> bool {
+        matches!(self, Self::PumpFunBuy | Self::PumpFunBuyExactSolIn)
+    }
+
+    const fn is_enhanced_legacy(self) -> bool {
+        !self.is_route_evidence()
     }
 }
 
@@ -693,11 +1204,36 @@ fn select_nln_program_stream_subscriptions(
         .filter(|topic| !topic.is_empty())
         .map(str::to_owned)
         .collect();
+    let disabled_streams: HashSet<String> = config
+        .disabled_streams
+        .iter()
+        .map(|topic| topic.trim())
+        .filter(|topic| !topic.is_empty())
+        .map(str::to_owned)
+        .collect();
 
     let known_candidate_topics: HashSet<String> = [
         config.system_transfers_topic.trim(),
         config.pumpfun_trade_topic.trim(),
         config.pumpfun_create_topic.trim(),
+        config.pumpfun_buy_topic.trim(),
+        config.pumpfun_buy_exact_sol_in_topic.trim(),
+    ]
+    .into_iter()
+    .filter(|topic| !topic.is_empty())
+    .map(str::to_owned)
+    .collect();
+    let route_evidence_topics: HashSet<String> = [
+        config.pumpfun_buy_topic.trim(),
+        config.pumpfun_buy_exact_sol_in_topic.trim(),
+    ]
+    .into_iter()
+    .filter(|topic| !topic.is_empty())
+    .map(str::to_owned)
+    .collect();
+    let legacy_enhanced_topics: HashSet<String> = [
+        config.pumpfun_trade_topic.trim(),
+        config.system_transfers_topic.trim(),
     ]
     .into_iter()
     .filter(|topic| !topic.is_empty())
@@ -730,11 +1266,45 @@ fn select_nln_program_stream_subscriptions(
                 unknown_enabled_topics.join(",")
             ));
         }
+        let enabled_disabled_streams: Vec<String> = enabled_topics
+            .iter()
+            .filter(|topic| disabled_streams.contains(*topic))
+            .cloned()
+            .collect();
+        if !enabled_disabled_streams.is_empty() {
+            fail_reasons.push(format!(
+                "disabled_streams_enabled:{}",
+                enabled_disabled_streams.join(",")
+            ));
+        }
+        let route_evidence_enabled = enabled_topics
+            .iter()
+            .any(|topic| route_evidence_topics.contains(topic));
+        if route_evidence_enabled {
+            let active_known_topic_count = enabled_topics
+                .iter()
+                .filter(|topic| known_candidate_topics.contains(*topic))
+                .count();
+            if active_known_topic_count > 2 {
+                fail_reasons.push("route_evidence_active_parsed_streams_exceed_two".to_string());
+            }
+            let mixed_enhanced_topics: Vec<String> = enabled_topics
+                .iter()
+                .filter(|topic| legacy_enhanced_topics.contains(*topic))
+                .cloned()
+                .collect();
+            if !mixed_enhanced_topics.is_empty() {
+                fail_reasons.push(format!(
+                    "route_evidence_profile_forbids_enhanced_streams:{}",
+                    mixed_enhanced_topics.join(",")
+                ));
+            }
+        }
     }
 
     let mut seen_topics = HashSet::new();
     let mut candidates = Vec::new();
-    for (topic, topic_kind, required_for_fsc, priority) in [
+    let mut configured_candidates = vec![
         (
             config.system_transfers_topic.trim(),
             NlnProgramStreamCaptureTopic::SystemTransfers,
@@ -753,7 +1323,25 @@ fn select_nln_program_stream_subscriptions(
             false,
             2,
         ),
-    ] {
+    ];
+    if !enabled_topics.is_empty() {
+        configured_candidates.extend([
+            (
+                config.pumpfun_buy_topic.trim(),
+                NlnProgramStreamCaptureTopic::PumpFunBuy,
+                false,
+                0,
+            ),
+            (
+                config.pumpfun_buy_exact_sol_in_topic.trim(),
+                NlnProgramStreamCaptureTopic::PumpFunBuyExactSolIn,
+                false,
+                1,
+            ),
+        ]);
+    }
+
+    for (topic, topic_kind, required_for_fsc, priority) in configured_candidates {
         if topic.is_empty() {
             continue;
         }
@@ -829,6 +1417,100 @@ fn select_nln_program_stream_subscriptions(
     }
 }
 
+async fn write_nln_program_stream_run_manifest(
+    capture_dir: &std::path::Path,
+    config: &ProgramStreamsConfig,
+    selection: &NlnProgramStreamsSelection,
+) {
+    if let Err(err) = tokio::fs::create_dir_all(capture_dir).await {
+        warn!(
+            dir = %capture_dir.display(),
+            error = %err,
+            "Seer: NLN Program Streams manifest directory unavailable"
+        );
+        return;
+    }
+
+    let active_program_streams = selection
+        .subscriptions
+        .iter()
+        .filter(|subscription| subscription.topic_kind.is_route_evidence())
+        .count();
+    let active_enhanced_streams = selection
+        .subscriptions
+        .iter()
+        .filter(|subscription| subscription.topic_kind.is_enhanced_legacy())
+        .count();
+    let active_topics: Vec<Value> = selection
+        .subscriptions
+        .iter()
+        .map(|subscription| {
+            json!({
+                "topic": subscription.topic,
+                "topic_kind": subscription.topic_kind.label(),
+                "route_evidence_stream": subscription.topic_kind.is_route_evidence(),
+            })
+        })
+        .collect();
+    let expected_missing_artifacts = if active_enhanced_streams == 0 {
+        json!([
+            {
+                "path": "pumpfun_trade_raw_v1.jsonl",
+                "status": "intentionally_disabled"
+            },
+            {
+                "path": "system_transfers_raw_v1.jsonl",
+                "status": "intentionally_disabled"
+            },
+            {
+                "path": "funding_events_v1.jsonl",
+                "status": "intentionally_disabled"
+            }
+        ])
+    } else {
+        json!([])
+    };
+    let manifest = json!({
+        "schema_version": 1,
+        "artifact": "nln_program_stream_run_manifest_v1",
+        "source_mode": "program_stream_route_evidence_capture_only",
+        "active_program_streams": active_program_streams,
+        "active_enhanced_streams": active_enhanced_streams,
+        "active_raw_grpc_streams": 1,
+        "active_topics": active_topics,
+        "disabled_streams": config.disabled_streams.clone(),
+        "disabled_optional_topics": config.disabled_optional_topics.clone(),
+        "expected_missing_artifacts": expected_missing_artifacts,
+        "stream_limit_policy": {
+            "max_active_parsed_streams": 2,
+            "active_program_streams_plus_enhanced_streams": active_program_streams + active_enhanced_streams,
+            "status": if active_program_streams + active_enhanced_streams <= 2 { "PASS" } else { "FAIL" }
+        },
+        "canonical_pool_birth_source": "yellowstone_geyser_grpc",
+        "canonical_account_state_source": "yellowstone_geyser_grpc",
+        "nln_program_streams_are_ssot": false,
+        "program_stream_candidate_can_unlock_execution": false,
+    });
+    let path = capture_dir.join("nln_program_stream_run_manifest_v1.json");
+    match serde_json::to_vec_pretty(&manifest) {
+        Ok(bytes) => {
+            if let Err(err) = tokio::fs::write(&path, bytes).await {
+                warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "Seer: NLN Program Streams manifest write failed"
+                );
+            }
+        }
+        Err(err) => {
+            warn!(
+                error = %err,
+                "Seer: NLN Program Streams manifest serialization failed"
+            );
+        }
+    }
+}
+
 async fn capture_raw_nln_message(
     writer: &NlnArtifactWriter,
     topic_kind: NlnProgramStreamCaptureTopic,
@@ -850,6 +1532,22 @@ async fn capture_raw_nln_message(
                 .send_lossless(
                     NlnArtifactRecord::PumpFunTradeRaw(raw_row.clone()),
                     "pumpfun_trade_raw_v1",
+                )
+                .await
+        }
+        NlnProgramStreamCaptureTopic::PumpFunBuy => {
+            writer
+                .send_lossless(
+                    NlnArtifactRecord::PumpFunBuyRaw(raw_row.clone()),
+                    "nln_pumpfun_buy_raw_v1",
+                )
+                .await
+        }
+        NlnProgramStreamCaptureTopic::PumpFunBuyExactSolIn => {
+            writer
+                .send_lossless(
+                    NlnArtifactRecord::PumpFunBuyExactSolInRaw(raw_row.clone()),
+                    "nln_pumpfun_buy_exact_sol_in_raw_v1",
                 )
                 .await
         }
@@ -956,10 +1654,43 @@ async fn run_nln_program_streams_topic_capture(
 
         let raw_row = artifact_writer
             .as_ref()
-            .map(|_| nln_artifact_raw_row(&message));
+            .map(|_| nln_artifact_raw_row(&message, &config, "nln_program_stream_raw_v1"));
         let mut raw_captured = false;
         if let (Some(writer), Some(row)) = (artifact_writer.as_ref(), raw_row.as_ref()) {
             raw_captured = capture_raw_nln_message(writer, topic_kind, &message, row, false).await;
+        }
+
+        if matches!(
+            topic_kind,
+            NlnProgramStreamCaptureTopic::PumpFunBuy
+                | NlnProgramStreamCaptureTopic::PumpFunBuyExactSolIn
+        ) {
+            if let (Some(writer), Some(candidate)) = (
+                artifact_writer.as_ref(),
+                nln_route_manifest_evidence_candidate_row(&message, topic_kind, &config),
+            ) {
+                writer
+                    .send_lossless(
+                        NlnArtifactRecord::RouteManifestEvidenceCandidate(candidate),
+                        "route_manifest_evidence_candidates_v1",
+                    )
+                    .await;
+            }
+            ::metrics::counter!(
+                "nln_program_route_evidence_captured_total",
+                1,
+                "topic_kind" => topic_kind.label()
+            );
+            match topic_kind {
+                NlnProgramStreamCaptureTopic::PumpFunBuy => {
+                    ::metrics::counter!("NLN_PROGRAM_BUY_CAPTURED", 1);
+                }
+                NlnProgramStreamCaptureTopic::PumpFunBuyExactSolIn => {
+                    ::metrics::counter!("NLN_PROGRAM_BUY_EXACT_SOL_IN_CAPTURED", 1);
+                }
+                _ => {}
+            }
+            continue;
         }
 
         let event = match normalize_nln_event(&message, &config) {
@@ -3127,6 +3858,8 @@ fn spawn_nln_program_streams_capture(
 
     Some(tokio::spawn(async move {
         let endpoint = redact_endpoint_for_logs(&config.endpoint);
+        let artifact_capture_enabled = artifact_config.enabled;
+        let artifact_capture_dir = artifact_config.capture_dir.clone();
         let artifact_writer = spawn_nln_artifact_writer(artifact_config);
         let selection = select_nln_program_stream_subscriptions(&config);
         let started_topics: Vec<String> = selection
@@ -3150,6 +3883,9 @@ fn spawn_nln_program_streams_capture(
             dropped_optional_topics = ?selection.dropped_optional_topics,
             "Seer: starting NLN Program Streams FSC capture lane"
         );
+        if artifact_capture_enabled {
+            write_nln_program_stream_run_manifest(&artifact_capture_dir, &config, &selection).await;
+        }
         if selection.required_topics_exceed_limit || selection.quota_policy_violation {
             error!(
                 endpoint = %endpoint,
@@ -3408,6 +4144,7 @@ pub async fn run(
             auth_header: config.program_streams.auth_header.clone(),
             api_key_env: config.program_streams.api_key_env.clone(),
             api_key_env_fallback: config.program_streams.api_key_env_fallback.clone(),
+            eventstream_policy_header: config.program_streams.eventstream_policy_header.clone(),
             format: program_streams_format,
             max_streams: config.program_streams.max_streams,
             quota_policy: match config.program_streams.quota_policy {
@@ -3421,9 +4158,16 @@ pub async fn run(
             enabled_topics: config.program_streams.enabled_topics.clone(),
             optional_topics: config.program_streams.optional_topics.clone(),
             disabled_optional_topics: config.program_streams.disabled_optional_topics.clone(),
+            disabled_streams: config.program_streams.disabled_streams.clone(),
             pumpfun_create_topic: config.program_streams.pumpfun_create_topic.clone(),
             pumpfun_trade_topic: config.program_streams.pumpfun_trade_topic.clone(),
+            pumpfun_buy_topic: config.program_streams.pumpfun_buy_topic.clone(),
+            pumpfun_buy_exact_sol_in_topic: config
+                .program_streams
+                .pumpfun_buy_exact_sol_in_topic
+                .clone(),
             system_transfers_topic: config.program_streams.system_transfers_topic.clone(),
+            artifact_capture_dir: config.program_streams.artifact_capture_dir.clone(),
             trade_resolver_ttl_ms: config.program_streams.trade_resolver_ttl_ms,
             trade_resolver_per_mint_cap: config.program_streams.trade_resolver_per_mint_cap,
             trade_resolver_global_cap: config.program_streams.trade_resolver_global_cap,
@@ -4224,15 +4968,17 @@ mod tests {
     use super::{
         detected_pool_from_candidate, detection_clock_summary,
         emit_execution_account_evidence_to_event_bus, emit_funding_transfer_to_event_bus,
-        nln_normalization_error_row, process_pool_detected_event_for_session_gate,
-        process_trade_event_for_session_gate, pumpswap_program_id,
-        select_nln_program_stream_subscriptions, trade_event_to_pool_transaction,
-        trade_has_forwardable_identity, NlnProgramStreamCaptureTopic, NlnTradePoolIdentityResolver,
-        NlnTradeResolveDecision, SessionAccountUpdateBridge, SessionAccountUpdateDecision,
-        SessionBcv2Context, SessionExecutionAccountEvidenceDecision, SessionPoolTradeBridge,
-        SessionTradeDecision,
+        nln_normalization_error_row, nln_route_manifest_evidence_candidate_row,
+        process_pool_detected_event_for_session_gate, process_trade_event_for_session_gate,
+        pumpswap_program_id, select_nln_program_stream_subscriptions,
+        trade_event_to_pool_transaction, trade_has_forwardable_identity,
+        NlnProgramStreamCaptureTopic, NlnTradePoolIdentityResolver, NlnTradeResolveDecision,
+        SessionAccountUpdateBridge, SessionAccountUpdateDecision, SessionBcv2Context,
+        SessionExecutionAccountEvidenceDecision, SessionPoolTradeBridge, SessionTradeDecision,
+        TOKEN_PROGRAM_ID,
     };
     use crate::events::{create_event_bus, GhostEvent};
+    use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
     use ghost_core::CurveFinality;
     use seer::config::{ProgramStreamsConfig, ProgramStreamsQuotaPolicy};
     use seer::ipc::{
@@ -4247,6 +4993,7 @@ mod tests {
         CandidatePool, InstructionProvenance, ObservedAccountMetaProvenance, RawBytesMissingReason,
         TradeEvent,
     };
+    use serde_json::{json, Value};
     use solana_sdk::{pubkey::Pubkey, signature::Signature};
     use std::str::FromStr;
     use std::time::{Duration, Instant, SystemTime};
@@ -4390,6 +5137,334 @@ mod tests {
         assert!(selection.subscriptions.iter().all(|subscription| {
             subscription.topic_kind != NlnProgramStreamCaptureTopic::PumpFunCreate
         }));
+    }
+
+    #[test]
+    fn test_program_stream_selection_accepts_route_evidence_topics_only() {
+        let config = ProgramStreamsConfig {
+            enabled: true,
+            max_streams: 2,
+            quota_policy: ProgramStreamsQuotaPolicy::FailFast,
+            enabled_topics: vec![
+                ProgramStreamsConfig::default_pumpfun_buy_topic(),
+                ProgramStreamsConfig::default_pumpfun_buy_exact_sol_in_topic(),
+            ],
+            disabled_streams: vec![
+                ProgramStreamsConfig::default_pumpfun_trade_topic(),
+                ProgramStreamsConfig::default_system_transfers_topic(),
+            ],
+            ..ProgramStreamsConfig::default()
+        };
+        let selection = select_nln_program_stream_subscriptions(&config);
+
+        assert!(!selection.quota_policy_violation);
+        assert_eq!(selection.requested_topic_count, 2);
+        assert_eq!(
+            selection
+                .subscriptions
+                .iter()
+                .map(|subscription| subscription.topic_kind)
+                .collect::<Vec<_>>(),
+            vec![
+                NlnProgramStreamCaptureTopic::PumpFunBuy,
+                NlnProgramStreamCaptureTopic::PumpFunBuyExactSolIn,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_route_evidence_profile_fails_when_legacy_enhanced_stream_is_enabled() {
+        let config = ProgramStreamsConfig {
+            enabled: true,
+            max_streams: 3,
+            quota_policy: ProgramStreamsQuotaPolicy::FailFast,
+            enabled_topics: vec![
+                ProgramStreamsConfig::default_pumpfun_buy_topic(),
+                ProgramStreamsConfig::default_pumpfun_buy_exact_sol_in_topic(),
+                ProgramStreamsConfig::default_pumpfun_trade_topic(),
+            ],
+            ..ProgramStreamsConfig::default()
+        };
+        let selection = select_nln_program_stream_subscriptions(&config);
+
+        assert!(selection.quota_policy_violation);
+        assert!(selection.subscriptions.is_empty());
+        assert!(selection
+            .fail_reasons
+            .iter()
+            .any(|reason| reason == "route_evidence_active_parsed_streams_exceed_two"));
+        assert!(selection
+            .fail_reasons
+            .iter()
+            .any(|reason| reason.starts_with("route_evidence_profile_forbids_enhanced_streams:")));
+    }
+
+    fn make_nln_route_evidence_message(
+        amount: u64,
+        include_ix_index: bool,
+    ) -> NlnProgramStreamMessage {
+        let mut payload = json!({
+            "signature": "5S1gnatureRouteEvidence",
+            "slot": 12345,
+            "tx_index": 7,
+            "mint": "Mint111111111111111111111111111111111111111",
+            "bonding_curve": "Curve11111111111111111111111111111111111111",
+            "associated_bonding_curve": "AssocCurve11111111111111111111111111111111",
+            "user": "User111111111111111111111111111111111111111",
+            "fee_recipient": "Fee111111111111111111111111111111111111111",
+            "creator_vault": "Vault11111111111111111111111111111111111111",
+            "token_program": TOKEN_PROGRAM_ID,
+            "amount": amount,
+            "max_sol_cost": 20_000_000u64,
+            "track_volume": true
+        });
+        if include_ix_index {
+            payload["instruction_index"] = json!(3);
+        }
+        NlnProgramStreamMessage {
+            topic: ProgramStreamsConfig::default_pumpfun_buy_topic(),
+            partition: 0,
+            offset_raw: "42".to_string(),
+            offset: Some(42),
+            provider_ts_ms: Some(1_780_000_000_000),
+            recv_ts_ms: 1_780_000_000_001,
+            recv_ts_ns: 1_780_000_000_001_000_000,
+            decode_ts_ms: 1_780_000_000_002,
+            payload_json: payload,
+        }
+    }
+
+    fn encoded_pubkey_value(pubkey: Pubkey) -> Value {
+        json!({
+            "value": BASE64_STANDARD.encode(pubkey.to_bytes()),
+        })
+    }
+
+    fn make_nln_route_evidence_message_with_value_accounts(
+        include_ix_index: bool,
+    ) -> (NlnProgramStreamMessage, Pubkey, Pubkey, Pubkey) {
+        let mint = Pubkey::new_unique();
+        let bonding_curve = Pubkey::new_unique();
+        let remaining_0 = Pubkey::new_unique();
+        let remaining_1 = Pubkey::new_unique();
+        let mut payload = json!({
+            "slot": 12345,
+            "tx_index": 7,
+            "accounts": {
+                "global": encoded_pubkey_value(Pubkey::new_unique()),
+                "mint": encoded_pubkey_value(mint),
+                "bonding_curve": encoded_pubkey_value(bonding_curve),
+                "associated_bonding_curve": encoded_pubkey_value(Pubkey::new_unique()),
+                "associated_user": encoded_pubkey_value(Pubkey::new_unique()),
+                "user": encoded_pubkey_value(Pubkey::new_unique()),
+                "fee_recipient": encoded_pubkey_value(Pubkey::new_unique()),
+                "creator_vault": encoded_pubkey_value(Pubkey::new_unique()),
+                "system_program": encoded_pubkey_value(Pubkey::default()),
+                "token_program": encoded_pubkey_value(Pubkey::from_str(TOKEN_PROGRAM_ID).unwrap()),
+                "event_authority": encoded_pubkey_value(Pubkey::new_unique()),
+                "program": encoded_pubkey_value(Pubkey::new_unique()),
+                "global_volume_accumulator": encoded_pubkey_value(Pubkey::new_unique()),
+                "user_volume_accumulator": encoded_pubkey_value(Pubkey::new_unique()),
+                "fee_config": encoded_pubkey_value(Pubkey::new_unique()),
+                "fee_program": encoded_pubkey_value(Pubkey::new_unique()),
+                "remaining_accounts": [
+                    encoded_pubkey_value(remaining_0),
+                    encoded_pubkey_value(remaining_1),
+                ],
+            },
+            "args": {
+                "amount": {"value": "68105046256"},
+                "max_sol_cost": {"value": "24975697"},
+                "track_volume": {"value": true}
+            }
+        });
+        if include_ix_index {
+            payload["instruction_index"] = json!(3);
+        }
+        let message = NlnProgramStreamMessage {
+            topic: ProgramStreamsConfig::default_pumpfun_buy_topic(),
+            partition: 0,
+            offset_raw: "42".to_string(),
+            offset: Some(42),
+            provider_ts_ms: Some(1_780_000_000_000),
+            recv_ts_ms: 1_780_000_000_001,
+            recv_ts_ns: 1_780_000_000_001_000_000,
+            decode_ts_ms: 1_780_000_000_002,
+            payload_json: payload,
+        };
+        (message, mint, bonding_curve, remaining_0)
+    }
+
+    #[test]
+    fn test_route_evidence_candidate_hashes_keep_args_out_of_account_manifest_hash() {
+        let config = ProgramStreamsConfig {
+            endpoint: "events.nln.clr3.org:443".to_string(),
+            artifact_capture_dir: Some(
+                "logs/nln_capture/shadow-burnin-v3-selector-dataset-r12-simcov-evidence"
+                    .to_string(),
+            ),
+            ..ProgramStreamsConfig::default()
+        };
+        let first = nln_route_manifest_evidence_candidate_row(
+            &make_nln_route_evidence_message(1_000, true),
+            NlnProgramStreamCaptureTopic::PumpFunBuy,
+            &config,
+        )
+        .expect("route evidence row");
+        let second = nln_route_manifest_evidence_candidate_row(
+            &make_nln_route_evidence_message(2_000, true),
+            NlnProgramStreamCaptureTopic::PumpFunBuy,
+            &config,
+        )
+        .expect("route evidence row");
+
+        assert_eq!(first["can_unlock_execution"], json!(false));
+        assert_eq!(first["program_stream_complete_is_executable"], json!(false));
+        assert_eq!(first["manifest_status"], json!("pending_join"));
+        assert_eq!(
+            first["account_manifest_hash"],
+            second["account_manifest_hash"]
+        );
+        assert_ne!(first["args_hash"], second["args_hash"]);
+        assert_ne!(
+            first["instruction_evidence_hash"],
+            second["instruction_evidence_hash"]
+        );
+    }
+
+    #[test]
+    fn test_route_evidence_candidate_without_instruction_index_is_degraded_only() {
+        let config = ProgramStreamsConfig::default();
+        let row = nln_route_manifest_evidence_candidate_row(
+            &make_nln_route_evidence_message(1_000, false),
+            NlnProgramStreamCaptureTopic::PumpFunBuy,
+            &config,
+        )
+        .expect("route evidence row");
+
+        assert_eq!(
+            row["join_status"],
+            json!("degraded_missing_tx_or_instruction_index")
+        );
+        assert_eq!(row["can_unlock_execution"], json!(false));
+        assert_eq!(row["degraded_join_can_complete"], json!(false));
+    }
+
+    #[test]
+    fn test_route_evidence_candidate_decodes_program_stream_value_accounts_and_tail() {
+        let config = ProgramStreamsConfig::default();
+        let (message, mint, bonding_curve, remaining_0) =
+            make_nln_route_evidence_message_with_value_accounts(true);
+        let row = nln_route_manifest_evidence_candidate_row(
+            &message,
+            NlnProgramStreamCaptureTopic::PumpFunBuy,
+            &config,
+        )
+        .expect("route evidence row");
+
+        assert_eq!(row["parse_status"], json!("OK"));
+        assert_eq!(row["route_kind"], json!("legacy_buy"));
+        assert_eq!(row["mint"], json!(mint.to_string()));
+        assert_eq!(row["bonding_curve"], json!(bonding_curve.to_string()));
+        for role in [
+            "global",
+            "mint",
+            "bonding_curve",
+            "associated_bonding_curve",
+            "associated_user",
+            "user",
+            "fee_recipient",
+            "creator_vault",
+            "system_program",
+            "token_program",
+            "event_authority",
+            "program",
+            "global_volume_accumulator",
+            "user_volume_accumulator",
+            "fee_config",
+            "fee_program",
+        ] {
+            assert!(
+                row[role].as_str().is_some(),
+                "expected named account role {role} to be extracted"
+            );
+        }
+        assert_eq!(row["args"][0]["name"], json!("amount"));
+        assert_eq!(row["args"][0]["value"], json!("68105046256"));
+        assert_eq!(row["args"][1]["name"], json!("max_sol_cost"));
+        assert_eq!(row["args"][1]["value"], json!("24975697"));
+        assert_eq!(row["args"][2]["name"], json!("track_volume"));
+        assert_eq!(row["args"][2]["value"], json!(true));
+        assert!(row["args_hash"].as_str().is_some());
+        assert_eq!(row["remaining_account_count"], json!(2));
+        assert_eq!(row["remaining_accounts_count"], json!(2));
+        assert_eq!(row["has_legacy_tail"], json!(true));
+        assert_eq!(
+            row["tail_evidence_status"],
+            json!("program_stream_tail_observed_unverified")
+        );
+        assert_eq!(
+            row["remaining_accounts"][0]["pubkey"],
+            json!(remaining_0.to_string())
+        );
+        assert_eq!(row["manifest_status"], json!("degraded_pending_join"));
+        assert_eq!(
+            row["join_status"],
+            json!("degraded_missing_tx_or_instruction_index")
+        );
+        assert_eq!(row["can_unlock_execution"], json!(false));
+        assert_eq!(row["program_stream_complete_is_executable"], json!(false));
+
+        let mut changed_args = message.clone();
+        changed_args.payload_json["args"]["amount"] = json!({"value": "999"});
+        changed_args.payload_json["args"]["max_sol_cost"] = json!({"value": "123"});
+        let changed_row = nln_route_manifest_evidence_candidate_row(
+            &changed_args,
+            NlnProgramStreamCaptureTopic::PumpFunBuy,
+            &config,
+        )
+        .expect("route evidence row");
+        assert_eq!(
+            row["account_manifest_hash"],
+            changed_row["account_manifest_hash"]
+        );
+        assert_ne!(row["args_hash"], changed_row["args_hash"]);
+        assert_ne!(
+            row["instruction_evidence_hash"],
+            changed_row["instruction_evidence_hash"]
+        );
+    }
+
+    #[test]
+    fn test_route_evidence_candidate_decodes_buy_exact_sol_in_value_args() {
+        let config = ProgramStreamsConfig::default();
+        let (mut message, _mint, _bonding_curve, _remaining_0) =
+            make_nln_route_evidence_message_with_value_accounts(true);
+        message.topic = ProgramStreamsConfig::default_pumpfun_buy_exact_sol_in_topic();
+        message.payload_json["args"] = json!({
+            "spendable_sol_in": {"value": "1000000"},
+            "min_tokens_out": {"value": "250000"},
+            "track_volume": {"value": false}
+        });
+        let row = nln_route_manifest_evidence_candidate_row(
+            &message,
+            NlnProgramStreamCaptureTopic::PumpFunBuyExactSolIn,
+            &config,
+        )
+        .expect("route evidence row");
+
+        assert_eq!(row["parse_status"], json!("OK"));
+        assert_eq!(row["route_kind"], json!("routed_exact_sol_in"));
+        assert_eq!(row["args"][0]["name"], json!("spendable_sol_in"));
+        assert_eq!(row["args"][0]["value"], json!("1000000"));
+        assert_eq!(row["args"][1]["name"], json!("min_tokens_out"));
+        assert_eq!(row["args"][1]["value"], json!("250000"));
+        assert_eq!(row["args"][2]["name"], json!("track_volume"));
+        assert_eq!(row["args"][2]["value"], json!(false));
+        assert!(row["args_hash"].as_str().is_some());
+        assert_eq!(row["remaining_accounts_count"], json!(2));
+        assert_eq!(row["has_legacy_tail"], json!(true));
+        assert_eq!(row["can_unlock_execution"], json!(false));
     }
 
     #[test]

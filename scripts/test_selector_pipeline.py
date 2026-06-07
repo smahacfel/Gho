@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -3277,6 +3278,35 @@ class SelectorPipelineTests(unittest.TestCase):
 
         self.assertTrue(args.build_release_before_start)
         self.assertTrue(args.dry_run)
+
+    def test_r12_nln_route_evidence_profile_uses_exact_two_program_streams(self) -> None:
+        config_path = (
+            Path(__file__).resolve().parents[1]
+            / "configs"
+            / "rollout"
+            / "shadow-burnin-v3-selector-dataset-r12-simcov-evidence.toml"
+        )
+        with config_path.open("rb") as fh:
+            config = tomllib.load(fh)
+        program_streams = config["seer"]["program_streams"]
+        enabled_topics = program_streams["enabled_topics"]
+        disabled_streams = program_streams["disabled_streams"]
+        eventstream_policy = json.loads(program_streams["eventstream_policy_header"])
+
+        self.assertEqual(program_streams["endpoint"], "events.nln.clr3.org:443")
+        self.assertEqual(program_streams["max_streams"], 2)
+        self.assertEqual(
+            enabled_topics,
+            ["solana.pump_fun.buy", "solana.pump_fun.buy_exact_sol_in"],
+        )
+        self.assertEqual(
+            eventstream_policy["allowed_topics"],
+            ["solana.pump_fun.buy", "solana.pump_fun.buy_exact_sol_in"],
+        )
+        self.assertIn("prod.rpc.solana.pumpfun.trade", disabled_streams)
+        self.assertIn("prod.rpc.solana.system.transfers", disabled_streams)
+        self.assertTrue(set(enabled_topics).isdisjoint(disabled_streams))
+        self.assertLessEqual(len(enabled_topics), 2)
 
     def test_r2_market_paths_writes_one_row_per_candidate_and_missing_path_is_unresolved(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
