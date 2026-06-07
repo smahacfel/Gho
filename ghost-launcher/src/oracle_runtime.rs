@@ -7705,6 +7705,7 @@ fn p37_shadow_probe_is_strict_execution_account_role(role: &str) -> bool {
             | "fee_config"
             | "fee_program"
             | "buyback_fee_recipient"
+            | "breaking_fee_recipient"
             | "mint"
             | "token_program"
     )
@@ -8153,10 +8154,24 @@ const P37_DEFAULT_EXECUTION_ACCOUNT_EVIDENCE_FRESHNESS_MS: u64 = 10_000;
 const P37_BCV2_TERMINAL_ROUTE_EXCLUSION_REASON: &str = "bcv2_not_persistent_or_not_loadable";
 const P37_TELEMETRY_ONLY_ROUTE_CONTRACT_REASON: &str =
     "telemetry_only_trade_event:route_account_manifest_incomplete";
-const P37_LEGACY_BUY_REMAINING_ACCOUNTS_INCOMPLETE_REASON: &str =
-    "legacy_buy_missing_buyback_remaining_accounts";
+const P37_LEGACY_BC_V2_TAIL_MISSING_REASON: &str = "LEGACY_BC_V2_TAIL_MISSING";
+const P37_LEGACY_BC_V2_TAIL_RESOLVED_BY_PROTOCOL_SCHEMA: &str =
+    "LEGACY_BC_V2_TAIL_RESOLVED_BY_PROTOCOL_SCHEMA";
+const P37_BCV2_META_READY_BY_PROTOCOL_SCHEMA: &str = "BCV2_META_READY_BY_PROTOCOL_SCHEMA";
+const P37_BCV2_PDA_DERIVATION_FAILED: &str = "BCV2_PDA_DERIVATION_FAILED";
+const P37_BCV2_META_ORDER_INVALID: &str = "BCV2_META_ORDER_INVALID";
+const P37_BCV2_META_MUTABILITY_INVALID: &str = "BCV2_META_MUTABILITY_INVALID";
+const P37_BCV2_META_SIGNER_INVALID: &str = "BCV2_META_SIGNER_INVALID";
+const P37_BCV2_FEE_RECIPIENT_INVALID: &str = "BCV2_FEE_RECIPIENT_INVALID";
+const P37_BCV2_LOAD_NOT_REQUIRED: &str = "BCV2_LOAD_NOT_REQUIRED";
+const P37_STATIC_KNOWN_WRITABLE_META: &str = "STATIC_KNOWN_WRITABLE_META";
 const P37_UNSUPPORTED_LEGACY_BUY_LAYOUT_REASON: &str =
     "unsupported_legacy_buy_layout_requires_bcv2";
+
+fn p37_legacy_tail_missing_reason_starts_with(reason: &str) -> bool {
+    reason.starts_with(P37_LEGACY_BC_V2_TAIL_MISSING_REASON)
+        || reason.starts_with("legacy_buy_missing_buyback_remaining_accounts")
+}
 
 fn p37_working_builder_parity_enabled(config: &P37ShadowProbeConfig) -> bool {
     config.enabled
@@ -8311,12 +8326,29 @@ fn p37_legacy_buy_curve_authority_readiness_status(
 
 fn p37_legacy_buy_missing_candidate_belongs_to_route(
     _buy_variant: Option<trigger::PumpfunBuyVariant>,
-    candidate: &P37ShadowProbeAccountNotFoundCandidate,
+    _candidate: &P37ShadowProbeAccountNotFoundCandidate,
 ) -> bool {
-    if candidate.role == "bonding_curve_v2" {
-        return false;
-    }
     true
+}
+
+fn p37_legacy_buy_remaining_account_matches_role(
+    overrides: &crate::components::trigger::BuyAccountOverrides,
+    pubkey: &Pubkey,
+    role: &str,
+) -> bool {
+    let Some(remaining_index) = (match role {
+        "bonding_curve_v2" => Some(0usize),
+        "breaking_fee_recipient" | "buyback_fee_recipient" | "buyback_quote_account" => {
+            Some(1usize)
+        }
+        _ => None,
+    }) else {
+        return false;
+    };
+    overrides
+        .buy_remaining_accounts
+        .get(remaining_index)
+        .is_some_and(|remaining| remaining == pubkey)
 }
 
 fn p37_legacy_buy_missing_candidate_is_non_blocking(
@@ -8338,12 +8370,17 @@ fn p37_legacy_buy_missing_candidate_is_non_blocking(
             .and_then(|profile| profile.buy_instruction.accounts.get(13))
             .is_some_and(|account| account.pubkey == pubkey),
         "payer_pubkey" => request.payer_provenance == "ephemeral" && pubkey == request.payer_pubkey,
-        "buyback_fee_recipient" | "buyback_quote_account" => {
+        "bonding_curve_v2"
+        | "breaking_fee_recipient"
+        | "buyback_fee_recipient"
+        | "buyback_quote_account" => {
             crate::components::trigger::TriggerComponent::counterfactual_probe_can_use_missing_legacy_buy_remaining_account(
                 request,
                 &pubkey,
                 &candidate.role,
-            )
+            ) || p37_selected_legacy_buy_fallback_overrides(request).is_some_and(|fallback| {
+                p37_legacy_buy_remaining_account_matches_role(&fallback, &pubkey, &candidate.role)
+            })
         }
         _ => false,
     }
@@ -8586,7 +8623,7 @@ fn p37_shadow_probe_route_resolution_diagnostics_with_mode(
         .filter(|reason| {
             reason.starts_with("telemetry_only_trade_event:")
                 || reason.starts_with("route_account_manifest_incomplete:")
-                || reason.starts_with(P37_LEGACY_BUY_REMAINING_ACCOUNTS_INCOMPLETE_REASON)
+                || p37_legacy_tail_missing_reason_starts_with(reason)
                 || reason == P37_UNSUPPORTED_LEGACY_BUY_LAYOUT_REASON
         })
         .or_else(|| {
@@ -8596,20 +8633,17 @@ fn p37_shadow_probe_route_resolution_diagnostics_with_mode(
                     .filter(|reason| {
                         reason.starts_with("telemetry_only_trade_event:")
                             || reason.starts_with("route_account_manifest_incomplete:")
-                            || reason
-                                .starts_with(P37_LEGACY_BUY_REMAINING_ACCOUNTS_INCOMPLETE_REASON)
+                            || p37_legacy_tail_missing_reason_starts_with(reason)
                             || reason == P37_UNSUPPORTED_LEGACY_BUY_LAYOUT_REASON
-                })
+                    })
             })?
         });
     if let Some(no_executable_reason) = explicit_route_contract_failure {
-        let defer_to_bcv2_fallback =
-            primary_route_kind != "legacy_buy"
-                && no_executable_reason
-                    .starts_with(P37_LEGACY_BUY_REMAINING_ACCOUNTS_INCOMPLETE_REASON)
-                && (no_executable_reason.contains("primary_route_bcv2_missing")
-                    || no_executable_reason.contains("bonding_curve_v2:"))
-                && legacy_buy.route_ready == Some(true);
+        let defer_to_bcv2_fallback = primary_route_kind != "legacy_buy"
+            && p37_legacy_tail_missing_reason_starts_with(&no_executable_reason)
+            && (no_executable_reason.contains("primary_route_bcv2_missing")
+                || no_executable_reason.contains("bonding_curve_v2:"))
+            && legacy_buy.route_ready == Some(true);
         if !defer_to_bcv2_fallback {
             return P37ExecutableRouteResolutionDiagnostics {
                 route_resolution_status: Some("no_executable_route_account_set".to_string()),
@@ -9612,7 +9646,6 @@ fn p37_shadow_probe_derive_legacy_buy_account_overrides(
             || !tx.is_buy
             || tx.is_nln_program_stream_trade_telemetry_only()
             || tx.buy_variant.as_deref() != Some("legacy_buy")
-            || tx.buy_remaining_accounts.len() != trigger::PUMPFUN_BUYBACK_REMAINING_ACCOUNT_COUNT
         {
             continue;
         }
@@ -9622,7 +9655,7 @@ fn p37_shadow_probe_derive_legacy_buy_account_overrides(
             .as_deref()
             .and_then(|value| Pubkey::try_from(value).ok())?;
 
-        return Some(crate::components::trigger::BuyAccountOverrides {
+        let mut overrides = crate::components::trigger::BuyAccountOverrides {
             global_config: tx
                 .global_config
                 .as_deref()
@@ -9651,7 +9684,15 @@ fn p37_shadow_probe_derive_legacy_buy_account_overrides(
                 .filter_map(|value| Pubkey::try_from(value.as_str()).ok())
                 .collect(),
             ..Default::default()
-        });
+        };
+        if let Some(mint) = tx
+            .token_mint
+            .as_deref()
+            .and_then(|value| Pubkey::try_from(value).ok())
+        {
+            p37_apply_legacy_bonding_curve_v2_tail_resolver(&mut overrides, mint);
+        }
+        return Some(overrides);
     }
     None
 }
@@ -9686,6 +9727,41 @@ fn p37_apply_legacy_buy_curve_materialization(
                 Some(materialization.authority_status);
         }
     }
+}
+
+fn p37_apply_legacy_bonding_curve_v2_tail_resolver(
+    account_overrides: &mut crate::components::trigger::BuyAccountOverrides,
+    buy_mint: Pubkey,
+) -> bool {
+    if !matches!(
+        account_overrides.buy_variant,
+        Some(trigger::PumpfunBuyVariant::LegacyBuy)
+    ) {
+        return false;
+    }
+    if account_overrides.route_account_manifest_source.as_deref() == Some("nln_program_streams")
+        || account_overrides
+            .execution_account_contract_status
+            .as_deref()
+            == Some("telemetry_only")
+    {
+        return false;
+    }
+
+    let [bonding_curve_v2, breaking_fee_recipient] =
+        trigger::LegacyBondingCurveTailResolver::resolve_pubkeys(
+            &buy_mint,
+            trigger::BreakingFeeRecipientStrategy::FirstStatic,
+        );
+    account_overrides.bonding_curve_v2 = Some(bonding_curve_v2);
+    account_overrides.bonding_curve_v2_provenance = None;
+    account_overrides.buy_remaining_accounts = vec![bonding_curve_v2, breaking_fee_recipient];
+    account_overrides.route_account_manifest_source =
+        Some("protocol_schema_legacy_bc_v2_tail".to_string());
+    account_overrides.execution_account_contract_status = None;
+    account_overrides.execution_account_contract_reason =
+        Some(P37_LEGACY_BC_V2_TAIL_RESOLVED_BY_PROTOCOL_SCHEMA.to_string());
+    true
 }
 
 fn p37_shadow_probe_derive_account_override_context_for_pool(
@@ -9752,6 +9828,7 @@ fn p37_shadow_probe_derive_account_override_context_for_pool_with_mode(
             p37_apply_legacy_buy_curve_materialization(&mut account_overrides, materialization);
         }
     }
+    p37_apply_legacy_bonding_curve_v2_tail_resolver(&mut account_overrides, buy_mint);
     mark_buy_account_overrides_route_contract(&mut account_overrides, false, true);
     P37ShadowProbeAccountOverrideContext {
         account_overrides,
@@ -10083,12 +10160,115 @@ fn p37_shadow_probe_account_source(role: &str) -> &'static str {
         | "user_volume_accumulator"
         | "fee_config"
         | "fee_program"
-        | "buyback_fee_recipient" => "route_builder",
+        | "buyback_fee_recipient"
+        | "breaking_fee_recipient" => "route_builder",
         "legacy_buy_instruction_account" | "routed_buy_instruction_account" => {
             "transaction_account_set"
         }
         _ => "unknown",
     }
+}
+
+fn p37_shadow_probe_request_uses_protocol_legacy_bcv2_tail(
+    request: &crate::components::trigger::PreparedBuyRequest,
+) -> bool {
+    let variant = request
+        .build_profile
+        .as_ref()
+        .map(|profile| profile.buy_variant)
+        .or(request.account_overrides.buy_variant);
+    if !matches!(variant, Some(trigger::PumpfunBuyVariant::LegacyBuy)) {
+        return false;
+    }
+    let [expected_bcv2, expected_fee_recipient] =
+        trigger::LegacyBondingCurveTailResolver::resolve_pubkeys(
+            &request.mint,
+            trigger::BreakingFeeRecipientStrategy::FirstStatic,
+        );
+    request
+        .account_overrides
+        .bonding_curve_v2
+        .is_some_and(|pubkey| pubkey == expected_bcv2)
+        && request
+            .account_overrides
+            .buy_remaining_accounts
+            .first()
+            .is_some_and(|pubkey| *pubkey == expected_bcv2)
+        && request
+            .account_overrides
+            .buy_remaining_accounts
+            .get(1)
+            .is_some_and(|pubkey| *pubkey == expected_fee_recipient)
+}
+
+fn p37_shadow_probe_bcv2_protocol_meta_status(
+    entry: &P37ShadowProbeAccountManifestEntry,
+    request: &crate::components::trigger::PreparedBuyRequest,
+) -> Option<(&'static str, bool)> {
+    if entry.role != "bonding_curve_v2"
+        || !p37_shadow_probe_request_uses_protocol_legacy_bcv2_tail(request)
+    {
+        return None;
+    }
+    let Ok(pubkey) = Pubkey::from_str(&entry.pubkey) else {
+        return Some((P37_BCV2_PDA_DERIVATION_FAILED, false));
+    };
+    let expected = trigger::DirectBuyBuilder::derive_bonding_curve_v2(&request.mint).0;
+    if pubkey != expected {
+        return Some((P37_BCV2_PDA_DERIVATION_FAILED, false));
+    }
+    if entry.account_index != Some(trigger::PUMPFUN_BUY_FIXED_ACCOUNT_COUNT as u64) {
+        return Some((P37_BCV2_META_ORDER_INVALID, false));
+    }
+    if entry.is_writable != Some(false) {
+        return Some((P37_BCV2_META_MUTABILITY_INVALID, false));
+    }
+    if entry.is_signer != Some(false) {
+        return Some((P37_BCV2_META_SIGNER_INVALID, false));
+    }
+    Some((P37_BCV2_LOAD_NOT_REQUIRED, true))
+}
+
+fn p37_shadow_probe_breaking_fee_protocol_meta_status(
+    entry: &P37ShadowProbeAccountManifestEntry,
+    request: &crate::components::trigger::PreparedBuyRequest,
+) -> Option<(&'static str, bool)> {
+    if entry.role != "breaking_fee_recipient"
+        || !p37_shadow_probe_request_uses_protocol_legacy_bcv2_tail(request)
+    {
+        return None;
+    }
+    let Ok(pubkey) = Pubkey::from_str(&entry.pubkey) else {
+        return Some((P37_BCV2_FEE_RECIPIENT_INVALID, false));
+    };
+    if !trigger::BREAKING_FEE_RECIPIENTS.contains(&pubkey) {
+        return Some((P37_BCV2_FEE_RECIPIENT_INVALID, false));
+    }
+    if entry.account_index != Some((trigger::PUMPFUN_BUY_FIXED_ACCOUNT_COUNT + 1) as u64) {
+        return Some((P37_BCV2_META_ORDER_INVALID, false));
+    }
+    if entry.is_writable != Some(true) {
+        return Some((P37_BCV2_META_MUTABILITY_INVALID, false));
+    }
+    if entry.is_signer != Some(false) {
+        return Some((P37_BCV2_META_SIGNER_INVALID, false));
+    }
+    Some((P37_STATIC_KNOWN_WRITABLE_META, true))
+}
+
+fn p37_shadow_probe_meta_only_protocol_status(
+    entry: &P37ShadowProbeAccountManifestEntry,
+    request: &crate::components::trigger::PreparedBuyRequest,
+) -> Option<(&'static str, bool)> {
+    p37_shadow_probe_bcv2_protocol_meta_status(entry, request)
+        .or_else(|| p37_shadow_probe_breaking_fee_protocol_meta_status(entry, request))
+}
+
+fn p37_shadow_probe_manifest_entry_requires_rpc_load_check(
+    entry: &P37ShadowProbeAccountManifestEntry,
+    request: &crate::components::trigger::PreparedBuyRequest,
+) -> bool {
+    p37_shadow_probe_meta_only_protocol_status(entry, request).is_none()
 }
 
 fn p37_shadow_probe_account_set_hash(items: impl IntoIterator<Item = String>) -> Option<String> {
@@ -10180,6 +10360,10 @@ fn p37_shadow_probe_account_manifest(
                     .account_overrides
                     .bonding_curve_v2
                     .is_some_and(|value| value == *pubkey)
+                && request
+                    .account_overrides
+                    .bonding_curve_v2_provenance
+                    .is_some()
             {
                 "observed_tx_account_meta".to_string()
             } else if role == "bonding_curve"
@@ -10416,9 +10600,19 @@ async fn p37_shadow_probe_account_set_diagnostics(
     request: &crate::components::trigger::PreparedBuyRequest,
 ) -> P37ShadowProbeAccountSetDiagnostics {
     let mut diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(request);
+    for entry in &mut diagnostics.manifest {
+        if let Some((status, ready)) = p37_shadow_probe_meta_only_protocol_status(entry, request) {
+            entry.precheck_rpc_load_status = Some(status.to_string());
+            entry.precheck_rpc_load_ready = Some(ready);
+            entry.precheck_commitment = Some("protocol_schema".to_string());
+            entry.precheck_attempt_count = Some(0);
+            entry.precheck_latency_ms = Some(0);
+        }
+    }
     let manifest_accounts: Vec<(Pubkey, String)> = diagnostics
         .manifest
         .iter()
+        .filter(|entry| p37_shadow_probe_manifest_entry_requires_rpc_load_check(entry, request))
         .filter_map(|entry| {
             Pubkey::from_str(&entry.pubkey)
                 .ok()
@@ -10781,6 +10975,9 @@ fn p37_working_builder_bcv2_reconciliation_class(
     precheck_context_slot: Option<u64>,
     observed_slot: Option<u64>,
 ) -> Option<String> {
+    if rpc_load_status == Some(P37_BCV2_LOAD_NOT_REQUIRED) && rpc_load_ready == Some(true) {
+        return Some("meta_only_protocol_derived_account".to_string());
+    }
     if matches!(
         consistency_status,
         Some("pubkey_mismatch")
@@ -10950,6 +11147,9 @@ fn p37_working_builder_bcv2_materialization_class(
     reconciliation_class: Option<&str>,
     has_bcv2_identity: bool,
 ) -> Option<String> {
+    if source_authority == Some("meta_only_protocol_derived") {
+        return Some("meta_only_protocol_derived".to_string());
+    }
     if account_state_materialized == Some(true) {
         return Some("account_state_materialized".to_string());
     }
@@ -11813,7 +12013,12 @@ fn p37_working_builder_final_manifest_failure_reason_with_execution_policy(
                     .unwrap_or("bonding_curve_v2_source_not_authoritative")
             ));
         }
-        if let Some(evidence_store) = evidence_store {
+        let bcv2_meta_only_protocol_ready = bcv2.rpc_load_status.as_deref()
+            == Some(P37_BCV2_LOAD_NOT_REQUIRED)
+            && bcv2.rpc_load_ready == Some(true)
+            && bcv2.builder_required_curve_account_ready_reason.as_deref()
+                == Some(P37_BCV2_META_READY_BY_PROTOCOL_SCHEMA);
+        if let Some(evidence_store) = evidence_store.filter(|_| !bcv2_meta_only_protocol_ready) {
             let pubkey = bcv2.pubkey.as_deref().unwrap_or("missing_bonding_curve_v2");
             let execution_evidence = p37_working_builder_bcv2_execution_evidence_readiness(
                 Some(pubkey),
@@ -11950,7 +12155,10 @@ fn p37_shadow_probe_classified_account_not_found_candidate(
                 ("route_specific_required_account", "conditional", None)
             }
         }
-        "buyback_fee_recipient" | "buyback_quote_account" => {
+        "bonding_curve_v2"
+        | "breaking_fee_recipient"
+        | "buyback_fee_recipient"
+        | "buyback_quote_account" => {
             let observed_legacy_remaining = request
                 .zip(parsed_pubkey)
                 .map(|(request, pubkey)| {
@@ -11971,8 +12179,7 @@ fn p37_shadow_probe_classified_account_not_found_candidate(
                 ("program_or_sysvar", "fatal", None)
             }
         }
-        "bonding_curve_v2"
-        | "bonding_curve"
+        "bonding_curve"
         | "associated_bonding_curve"
         | "creator_vault"
         | "mint"
@@ -13204,6 +13411,7 @@ impl P37ShadowProbeBondingCurveV2AuthorityDiagnostics {
                 | Some("authoritative_mfs")
                 | Some("authoritative_account_state")
                 | Some("authoritative_observed_tx")
+                | Some("meta_only_protocol_derived")
         )
     }
 
@@ -13230,6 +13438,8 @@ fn p37_shadow_probe_bonding_curve_v2_authority_from_entry(
         return P37ShadowProbeBondingCurveV2AuthorityDiagnostics::default();
     };
     let source = entry.source.as_str();
+    let protocol_meta_status =
+        request.and_then(|request| p37_shadow_probe_bcv2_protocol_meta_status(entry, request));
     let (
         authority_status,
         mismatch_reason,
@@ -13237,107 +13447,136 @@ fn p37_shadow_probe_bonding_curve_v2_authority_from_entry(
         seen_in_diag,
         seen_in_mfs,
         seen_in_account_state,
-    ) = match source {
-        "diag_account_update_relay" => (
-            "authoritative_exact_diag",
-            None,
-            true,
-            Some(true),
-            Some(false),
-            Some(false),
-        ),
-        "materialized_feature_set" => (
-            "authoritative_mfs",
-            None,
-            true,
-            Some(false),
-            Some(true),
-            Some(false),
-        ),
-        "account_state_core" => (
-            "authoritative_account_state",
+    ) = if matches!(
+        protocol_meta_status,
+        Some((P37_BCV2_LOAD_NOT_REQUIRED, true))
+    ) {
+        (
+            "meta_only_protocol_derived",
             None,
             true,
             Some(false),
             Some(false),
-            Some(true),
-        ),
-        "observed_tx_account_meta" => match entry.observed_bcv2_provenance_status.as_deref() {
-            Some("route_compatible") => (
-                "authoritative_observed_tx",
+            Some(false),
+        )
+    } else if let Some((status, false)) = protocol_meta_status {
+        (
+            status,
+            Some(status),
+            false,
+            Some(false),
+            Some(false),
+            Some(false),
+        )
+    } else {
+        match source {
+            "diag_account_update_relay" => (
+                "authoritative_exact_diag",
+                None,
+                true,
+                Some(true),
+                Some(false),
+                Some(false),
+            ),
+            "materialized_feature_set" => (
+                "authoritative_mfs",
+                None,
+                true,
+                Some(false),
+                Some(true),
+                Some(false),
+            ),
+            "account_state_core" => (
+                "authoritative_account_state",
                 None,
                 true,
                 Some(false),
                 Some(false),
-                Some(false),
+                Some(true),
             ),
-            Some(status) => (
-                "observed_meta_not_route_compatible",
-                Some(match status {
-                    "program_id_mismatch" => "bonding_curve_v2_observed_meta_not_route_compatible",
-                    "discriminator_mismatch" => {
-                        "bonding_curve_v2_observed_meta_not_route_compatible"
-                    }
-                    "account_position_out_of_range" => {
-                        "bonding_curve_v2_observed_meta_index_ambiguous"
-                    }
-                    "message_index_resolution_failed" => {
-                        "bonding_curve_v2_observed_meta_index_ambiguous"
-                    }
-                    "tx_failed" => "bonding_curve_v2_observed_meta_tx_failed",
-                    _ => "bonding_curve_v2_observed_meta_not_route_compatible",
-                }),
+            "observed_tx_account_meta" => match entry.observed_bcv2_provenance_status.as_deref() {
+                Some("route_compatible") => (
+                    "authoritative_observed_tx",
+                    None,
+                    true,
+                    Some(false),
+                    Some(false),
+                    Some(false),
+                ),
+                Some(status) => (
+                    "observed_meta_not_route_compatible",
+                    Some(match status {
+                        "program_id_mismatch" => {
+                            "bonding_curve_v2_observed_meta_not_route_compatible"
+                        }
+                        "discriminator_mismatch" => {
+                            "bonding_curve_v2_observed_meta_not_route_compatible"
+                        }
+                        "account_position_out_of_range" => {
+                            "bonding_curve_v2_observed_meta_index_ambiguous"
+                        }
+                        "message_index_resolution_failed" => {
+                            "bonding_curve_v2_observed_meta_index_ambiguous"
+                        }
+                        "tx_failed" => "bonding_curve_v2_observed_meta_tx_failed",
+                        _ => "bonding_curve_v2_observed_meta_not_route_compatible",
+                    }),
+                    false,
+                    Some(false),
+                    Some(false),
+                    Some(false),
+                ),
+                None => (
+                    "observed_tx_unverified",
+                    Some("bonding_curve_v2_observed_meta_index_ambiguous"),
+                    false,
+                    Some(false),
+                    Some(false),
+                    Some(false),
+                ),
+            },
+            "route_builder" => (
+                "builder_only",
+                Some("builder_pubkey_not_materialized"),
                 false,
-                Some(false),
-                Some(false),
-                Some(false),
+                None,
+                None,
+                None,
             ),
-            None => (
-                "observed_tx_unverified",
-                Some("bonding_curve_v2_observed_meta_index_ambiguous"),
+            "derived_pda" => (
+                "derived_unverified",
+                Some("derived_pubkey_without_materialized_authority"),
                 false,
-                Some(false),
-                Some(false),
-                Some(false),
+                None,
+                None,
+                None,
             ),
-        },
-        "route_builder" => (
-            "builder_only",
-            Some("builder_pubkey_not_materialized"),
-            false,
-            None,
-            None,
-            None,
-        ),
-        "derived_pda" => (
-            "derived_unverified",
-            Some("derived_pubkey_without_materialized_authority"),
-            false,
-            None,
-            None,
-            None,
-        ),
-        _ => (
-            "unknown",
-            Some("unknown_bonding_curve_v2_source"),
-            false,
-            None,
-            None,
-            None,
-        ),
+            _ => (
+                "unknown",
+                Some("unknown_bonding_curve_v2_source"),
+                false,
+                None,
+                None,
+                None,
+            ),
+        }
     };
     let bonding_curve_ready = request.map(|request| {
         request.account_overrides.legacy_buy_curve.is_some()
             || request.account_overrides.associated_bonding_curve.is_some()
     });
-    let (rpc_load_status, rpc_load_ready) =
-        p37_shadow_probe_bonding_curve_v2_rpc_load_readiness(entry, account_set_diagnostics);
+    let (rpc_load_status, rpc_load_ready) = if let Some((status, ready)) = protocol_meta_status {
+        (Some(status.to_string()), Some(ready))
+    } else {
+        p37_shadow_probe_bonding_curve_v2_rpc_load_readiness(entry, account_set_diagnostics)
+    };
     let identity_authoritative = matches!(
         authority_status,
         "authoritative_exact_diag"
             | "authoritative_mfs"
             | "authoritative_account_state"
             | "authoritative_observed_tx"
+            | "meta_only_protocol_derived"
     );
     let builder_required_curve_account_ready =
         Some(identity_authoritative && rpc_load_ready.unwrap_or(identity_ready));
@@ -13450,6 +13689,9 @@ fn p37_shadow_probe_bonding_curve_v2_ready_reason(
     ready: Option<bool>,
 ) -> Option<String> {
     match (ready, source, rpc_load_status) {
+        (Some(true), _, Some(P37_BCV2_LOAD_NOT_REQUIRED)) => {
+            Some(P37_BCV2_META_READY_BY_PROTOCOL_SCHEMA.to_string())
+        }
         (Some(true), _, Some(status)) => Some(format!("load_ready:{status}")),
         (Some(false), "observed_tx_account_meta", Some("missing_on_rpc_precheck")) => {
             Some("bonding_curve_v2_observed_meta_missing_on_rpc".to_string())
@@ -13652,13 +13894,142 @@ struct P37SelectedRouteHandoffDiagnostics {
     account_set_roles: Vec<String>,
     precheck_hash: Option<String>,
     simulation_hash: Option<String>,
+    selected_route_kind: Option<String>,
+    final_manifest_source: Option<String>,
+    bcv2_present: Option<bool>,
+    bcv2_meta_status: Option<String>,
+    bcv2_load_status: Option<String>,
+    fee_recipient_status: Option<String>,
+    legacy_tail_status: Option<String>,
+    stale_primary_reasons: Vec<String>,
+    fatal_reasons_after_final_manifest_validation: Vec<String>,
     status: Option<String>,
     reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct P37FinalExecutableRouteHandoff {
+    selected_route_kind: Option<String>,
+    final_manifest_source: Option<String>,
+    bcv2_present: bool,
+    bcv2_meta_status: Option<String>,
+    bcv2_load_status: Option<String>,
+    fee_recipient_status: Option<String>,
+    legacy_tail_status: Option<String>,
+    stale_primary_reasons: Vec<String>,
+    fatal_reasons_after_final_manifest_validation: Vec<String>,
+}
+
+fn p37_final_executable_route_handoff(
+    request: &crate::components::trigger::PreparedBuyRequest,
+    manifest: &[P37ShadowProbeAccountManifestEntry],
+    stale_primary_reason: Option<&str>,
+    final_manifest_reason: &str,
+) -> P37FinalExecutableRouteHandoff {
+    let selected_route_kind = request
+        .build_profile
+        .as_ref()
+        .map(|profile| profile.buy_variant.as_str().to_string())
+        .or_else(|| {
+            request
+                .account_overrides
+                .buy_variant
+                .map(|variant| variant.as_str().to_string())
+        });
+    let bcv2_entry = manifest
+        .iter()
+        .find(|entry| entry.role == "bonding_curve_v2");
+    let fee_recipient_entry = manifest
+        .iter()
+        .find(|entry| entry.role == "breaking_fee_recipient");
+    let bcv2_protocol_status =
+        bcv2_entry.and_then(|entry| p37_shadow_probe_bcv2_protocol_meta_status(entry, request));
+    let fee_recipient_status = fee_recipient_entry
+        .and_then(|entry| p37_shadow_probe_breaking_fee_protocol_meta_status(entry, request))
+        .map(|(status, _)| status.to_string());
+    let legacy_tail_status = if p37_shadow_probe_request_uses_protocol_legacy_bcv2_tail(request) {
+        Some(P37_LEGACY_BC_V2_TAIL_RESOLVED_BY_PROTOCOL_SCHEMA.to_string())
+    } else if matches!(
+        request.account_overrides.buy_variant,
+        Some(trigger::PumpfunBuyVariant::LegacyBuy)
+    ) && request.account_overrides.bonding_curve_v2.is_none()
+    {
+        Some("LEGACY_BC_V2_TAIL_RESOLVER_FAILED:missing_bonding_curve_v2".to_string())
+    } else if matches!(
+        request.account_overrides.buy_variant,
+        Some(trigger::PumpfunBuyVariant::LegacyBuy)
+    ) {
+        Some(format!(
+            "{P37_LEGACY_BC_V2_TAIL_MISSING_REASON}:count={}:expected={}",
+            request.account_overrides.buy_remaining_accounts.len(),
+            trigger::PUMPFUN_BUYBACK_REMAINING_ACCOUNT_COUNT
+        ))
+    } else {
+        None
+    };
+    let fatal_reasons_after_final_manifest_validation = (final_manifest_reason
+        != "selected_legacy_buy_final_manifest_validated")
+        .then(|| final_manifest_reason.to_string())
+        .into_iter()
+        .collect();
+    P37FinalExecutableRouteHandoff {
+        selected_route_kind,
+        final_manifest_source: request
+            .account_overrides
+            .route_account_manifest_source
+            .clone(),
+        bcv2_present: bcv2_entry.is_some(),
+        bcv2_meta_status: bcv2_protocol_status.map(|(status, ready)| {
+            if status == P37_BCV2_LOAD_NOT_REQUIRED && ready {
+                P37_BCV2_META_READY_BY_PROTOCOL_SCHEMA.to_string()
+            } else {
+                status.to_string()
+            }
+        }),
+        bcv2_load_status: bcv2_protocol_status.map(|(status, _)| status.to_string()),
+        fee_recipient_status,
+        legacy_tail_status,
+        stale_primary_reasons: stale_primary_reason
+            .filter(|reason| !reason.trim().is_empty())
+            .map(|reason| vec![reason.to_string()])
+            .unwrap_or_default(),
+        fatal_reasons_after_final_manifest_validation,
+    }
+}
+
+fn p37_canonicalize_selected_fallback_route_handoff_for_shadow_only(
+    request: &mut crate::components::trigger::PreparedBuyRequest,
+    buy_mint: Pubkey,
+) {
+    if !matches!(
+        request.account_overrides.buy_variant,
+        Some(trigger::PumpfunBuyVariant::LegacyBuy)
+    ) {
+        return;
+    }
+    p37_apply_legacy_bonding_curve_v2_tail_resolver(&mut request.account_overrides, buy_mint);
+    request.account_overrides.route_account_manifest_source =
+        Some("selected_fallback_route_execution_handoff".to_string());
+    mark_buy_account_overrides_route_contract(&mut request.account_overrides, false, true);
+    request.account_overrides.route_account_manifest_source =
+        Some("selected_fallback_route_execution_handoff".to_string());
 }
 
 fn p37_selected_route_handoff_diagnostics(
     request: Option<&crate::components::trigger::PreparedBuyRequest>,
     account_set_diagnostics: Option<&P37ShadowProbeAccountSetDiagnostics>,
+) -> P37SelectedRouteHandoffDiagnostics {
+    p37_selected_route_handoff_diagnostics_with_stale_primary_reason(
+        request,
+        account_set_diagnostics,
+        None,
+    )
+}
+
+fn p37_selected_route_handoff_diagnostics_with_stale_primary_reason(
+    request: Option<&crate::components::trigger::PreparedBuyRequest>,
+    account_set_diagnostics: Option<&P37ShadowProbeAccountSetDiagnostics>,
+    stale_primary_reason: Option<&str>,
 ) -> P37SelectedRouteHandoffDiagnostics {
     let Some(request) = request else {
         return P37SelectedRouteHandoffDiagnostics::default();
@@ -13688,12 +14059,12 @@ fn p37_selected_route_handoff_diagnostics(
         .map(|profile| profile.buy_variant)
         .or(request.account_overrides.buy_variant)
         .is_some_and(|variant| matches!(variant, trigger::PumpfunBuyVariant::LegacyBuy));
-    let final_manifest_contains_primary_route_builder_bcv2 = manifest
-        .iter()
-        .any(|entry| entry.role == "bonding_curve_v2" && entry.source == "route_builder");
     let final_manifest_contains_bcv2 = manifest
         .iter()
         .any(|entry| entry.role == "bonding_curve_v2");
+    let final_manifest_contains_breaking_fee_recipient = manifest
+        .iter()
+        .any(|entry| entry.role == "breaking_fee_recipient");
     let legacy_curve_pubkey = request
         .account_overrides
         .legacy_buy_curve_pubkey
@@ -13709,10 +14080,10 @@ fn p37_selected_route_handoff_diagnostics(
         "selected_legacy_buy_request_variant_not_legacy"
     } else if manifest.is_empty() {
         "selected_legacy_buy_final_manifest_missing"
-    } else if final_manifest_contains_primary_route_builder_bcv2 {
-        "selected_legacy_buy_final_manifest_contains_primary_bcv2"
-    } else if final_manifest_contains_bcv2 {
-        "selected_legacy_buy_final_manifest_contains_bonding_curve_v2"
+    } else if !final_manifest_contains_bcv2 {
+        "selected_legacy_buy_final_manifest_missing_bonding_curve_v2"
+    } else if !final_manifest_contains_breaking_fee_recipient {
+        "selected_legacy_buy_final_manifest_missing_breaking_fee_recipient"
     } else if !final_manifest_contains_legacy_curve {
         "selected_legacy_buy_final_manifest_missing_legacy_curve"
     } else {
@@ -13723,6 +14094,8 @@ fn p37_selected_route_handoff_diagnostics(
     } else {
         "selected_route_handoff_mismatch"
     };
+    let final_handoff =
+        p37_final_executable_route_handoff(request, manifest, stale_primary_reason, reason);
 
     P37SelectedRouteHandoffDiagnostics {
         source: Some("selected_fallback_route_execution_handoff".to_string()),
@@ -13733,6 +14106,16 @@ fn p37_selected_route_handoff_diagnostics(
             .and_then(|diagnostics| diagnostics.precheck_account_set_hash.clone()),
         simulation_hash: account_set_diagnostics
             .and_then(|diagnostics| diagnostics.simulation_account_set_hash.clone()),
+        selected_route_kind: final_handoff.selected_route_kind,
+        final_manifest_source: final_handoff.final_manifest_source,
+        bcv2_present: Some(final_handoff.bcv2_present),
+        bcv2_meta_status: final_handoff.bcv2_meta_status,
+        bcv2_load_status: final_handoff.bcv2_load_status,
+        fee_recipient_status: final_handoff.fee_recipient_status,
+        legacy_tail_status: final_handoff.legacy_tail_status,
+        stale_primary_reasons: final_handoff.stale_primary_reasons,
+        fatal_reasons_after_final_manifest_validation: final_handoff
+            .fatal_reasons_after_final_manifest_validation,
         status: Some(status.to_string()),
         reason: Some(reason.to_string()),
     }
@@ -13771,7 +14154,7 @@ fn p37_selected_route_final_manifest_failure_reason(
         let remaining_count = request.account_overrides.buy_remaining_accounts.len();
         if remaining_count != trigger::PUMPFUN_BUYBACK_REMAINING_ACCOUNT_COUNT {
             return Some(format!(
-                "legacy_buy_missing_buyback_remaining_accounts:count={remaining_count}:expected={}",
+                "{P37_LEGACY_BC_V2_TAIL_MISSING_REASON}:count={remaining_count}:expected={}",
                 trigger::PUMPFUN_BUYBACK_REMAINING_ACCOUNT_COUNT
             ));
         }
@@ -17602,6 +17985,7 @@ fn finalize_active_buy_account_overrides(
         }
     }
     p37_restore_legacy_buy_authorize_detected_pool_creator(&mut account_overrides);
+    p37_apply_legacy_bonding_curve_v2_tail_resolver(&mut account_overrides, buy_mint);
     mark_buy_account_overrides_route_contract(&mut account_overrides, false, true);
     account_overrides
 }
@@ -18178,7 +18562,11 @@ async fn execute_gatekeeper_buy_path(
                         Some(join_metadata),
                         working_builder_parity_mode,
                         working_builder_execution_evidence_context,
-                        &ctx.oracle_runtime.config.selector.simcov.state_readiness_latch,
+                        &ctx.oracle_runtime
+                            .config
+                            .selector
+                            .simcov
+                            .state_readiness_latch,
                     )
                     .await;
                     match apply_trigger_dispatch_receipt_with_builder_mode(
@@ -18314,6 +18702,7 @@ fn p37_selected_legacy_buy_fallback_overrides(
     if fallback.legacy_buy_curve_pubkey.is_none() {
         fallback.legacy_buy_curve_pubkey = primary.legacy_buy_curve_pubkey;
     }
+    p37_apply_legacy_bonding_curve_v2_tail_resolver(&mut fallback, primary_request.mint);
     mark_buy_account_overrides_route_contract(&mut fallback, false, true);
     Some(fallback)
 }
@@ -18368,21 +18757,22 @@ async fn p37_apply_selected_fallback_route_handoff_for_shadow_only(
         )
         .await?
         .with_join_metadata(primary_request.join_metadata.clone());
-    fallback_request.account_overrides.bonding_curve_v2 = None;
-    fallback_request
-        .account_overrides
-        .bonding_curve_v2_provenance = None;
-    let fallback_account_set =
-        p37_shadow_probe_account_set_diagnostics(trigger_component, &fallback_request).await;
-    let selected_handoff = p37_selected_route_handoff_diagnostics(
-        Some(&fallback_request),
-        Some(&fallback_account_set),
+    p37_canonicalize_selected_fallback_route_handoff_for_shadow_only(
+        &mut fallback_request,
+        buy_mint,
     );
     let primary_not_ready_reason = primary_resolution
         .primary_route_not_ready_reason
         .as_deref()
         .or(primary_bcv2_reason.as_deref())
         .unwrap_or("primary_route_not_ready");
+    let fallback_account_set =
+        p37_shadow_probe_account_set_diagnostics(trigger_component, &fallback_request).await;
+    let selected_handoff = p37_selected_route_handoff_diagnostics_with_stale_primary_reason(
+        Some(&fallback_request),
+        Some(&fallback_account_set),
+        Some(primary_not_ready_reason),
+    );
     if selected_handoff.status.as_deref() == Some("selected_route_handoff_applied") {
         info!(
             mint = %buy_mint,
@@ -18485,10 +18875,7 @@ fn state_readiness_latch_eligibility_diagnostics(
     request: &crate::components::trigger::PreparedBuyRequest,
     original_error: &str,
     config: &SelectorStateReadinessLatchConfig,
-) -> (
-    crate::events::ShadowSimulationAccountDiagnostics,
-    bool,
-) {
+) -> (crate::events::ShadowSimulationAccountDiagnostics, bool) {
     let route_kind = p37_shadow_probe_route_kind(Some(request));
     let bonding_curve_present = request.account_overrides.legacy_buy_curve_pubkey.is_some();
     let decision_ts_ms_present = request.decision_ts_ms > 0;
@@ -18558,13 +18945,12 @@ async fn maybe_apply_state_readiness_latch_for_precheck(
     if !should_emit_eligibility {
         return StateReadinessLatchStatus::NotRecovered;
     }
-    let (eligibility_diagnostics, eligible) =
-        state_readiness_latch_eligibility_diagnostics(
-            trigger_component,
-            request,
-            original_error,
-            config,
-        );
+    let (eligibility_diagnostics, eligible) = state_readiness_latch_eligibility_diagnostics(
+        trigger_component,
+        request,
+        original_error,
+        config,
+    );
     if !eligible {
         request.state_readiness_latch_diagnostics = Some(eligibility_diagnostics);
         return StateReadinessLatchStatus::NotRecovered;
@@ -18693,8 +19079,11 @@ async fn run_state_readiness_latch(
     let mut after = before;
     while started.elapsed() < max_wait {
         tokio::time::sleep(poll_interval).await;
-        after =
-            state_readiness_latch_snapshot_status(trigger_component, request, &expected_bonding_curve);
+        after = state_readiness_latch_snapshot_status(
+            trigger_component,
+            request,
+            &expected_bonding_curve,
+        );
         if after.ready {
             let wait_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
             diagnostics.state_latch_wait_ms = Some(wait_ms);
@@ -18914,12 +19303,12 @@ async fn active_shadow_simulation_load_precheck_receipt(
                 p37_shadow_probe_execution_account_not_ready_reason(&missing_role, &missing_pubkey)
             };
             if maybe_apply_state_readiness_latch_for_precheck(
-                    trigger_component,
-                    request,
-                    &reason,
-                    state_latch_config,
-                )
-                .await
+                trigger_component,
+                request,
+                &reason,
+                state_latch_config,
+            )
+            .await
                 == StateReadinessLatchStatus::Recovered
             {
                 return None;
@@ -20623,6 +21012,9 @@ fn shadow_execution_outcome_from_dispatch_error(
     }
     if lower.contains("no_executable_route_account_set")
         || lower.contains("legacy_buy_missing_buyback_remaining_accounts")
+        || lower.contains("legacy_bc_v2_tail_missing")
+        || lower.contains("legacy_bc_v2_tail_resolver_failed")
+        || lower.contains("legacy_bc_v2_fee_recipient_missing")
         || lower.contains("primary_route_bcv2_missing")
         || lower.contains("route_account_manifest_incomplete")
     {
@@ -20661,9 +21053,7 @@ fn shadow_execution_outcome_from_dispatch_error(
         }
         "route_materialization_error" => "shadow_route_materialization_error".to_string(),
         "state_readiness_error" => "shadow_state_readiness_error".to_string(),
-        "account_pda_constraint_error" => {
-            "shadow_simulation_anchor_constraint_error".to_string()
-        }
+        "account_pda_constraint_error" => "shadow_simulation_anchor_constraint_error".to_string(),
         "quote_slippage_error" => "shadow_simulation_slippage_error".to_string(),
         "quote_amount_error" => "shadow_simulation_amount_error".to_string(),
         "authority_problem" => "shadow_authority_error".to_string(),
@@ -20686,9 +21076,7 @@ fn shadow_execution_outcome_from_report_err(err: &str) -> String {
         }
         "route_materialization_error" => "shadow_route_materialization_error".to_string(),
         "state_readiness_error" => "shadow_state_readiness_error".to_string(),
-        "account_pda_constraint_error" => {
-            "shadow_simulation_anchor_constraint_error".to_string()
-        }
+        "account_pda_constraint_error" => "shadow_simulation_anchor_constraint_error".to_string(),
         "quote_slippage_error" => "shadow_simulation_slippage_error".to_string(),
         "quote_amount_error" => "shadow_simulation_amount_error".to_string(),
         "authority_problem" => "shadow_authority_error".to_string(),
@@ -20811,8 +21199,24 @@ fn p37_execution_account_contract_failure_tail(
             let remaining_count = overrides.buy_remaining_accounts.len();
             if remaining_count != trigger::PUMPFUN_BUYBACK_REMAINING_ACCOUNT_COUNT {
                 return Some(format!(
-                    "{P37_LEGACY_BUY_REMAINING_ACCOUNTS_INCOMPLETE_REASON}:count={remaining_count}:expected={}",
+                    "{P37_LEGACY_BC_V2_TAIL_MISSING_REASON}:count={remaining_count}:expected={}",
                     trigger::PUMPFUN_BUYBACK_REMAINING_ACCOUNT_COUNT
+                ));
+            }
+            let Some(bonding_curve_v2) = overrides.bonding_curve_v2 else {
+                return Some(
+                    "LEGACY_BC_V2_TAIL_RESOLVER_FAILED:missing_bonding_curve_v2".to_string(),
+                );
+            };
+            if overrides.buy_remaining_accounts.first() != Some(&bonding_curve_v2) {
+                return Some(format!(
+                    "LEGACY_BC_V2_TAIL_RESOLVER_FAILED:tail_0_not_bonding_curve_v2:expected={bonding_curve_v2}"
+                ));
+            }
+            if !trigger::BREAKING_FEE_RECIPIENTS.contains(&overrides.buy_remaining_accounts[1]) {
+                return Some(format!(
+                    "LEGACY_BC_V2_FEE_RECIPIENT_MISSING:tail_1={}",
+                    overrides.buy_remaining_accounts[1]
                 ));
             }
             if let Some(reason) = p37_direct_buy_builder_required_account_failure_tail(overrides) {
@@ -20926,12 +21330,7 @@ where
         if overrides.buy_variant.is_none() {
             overrides.buy_variant = tx.buy_variant.as_deref().and_then(|value| match value {
                 "routed_exact_sol_in" => Some(trigger::PumpfunBuyVariant::RoutedExactSolIn),
-                "legacy_buy"
-                    if tx.buy_remaining_accounts.len()
-                        == trigger::PUMPFUN_BUYBACK_REMAINING_ACCOUNT_COUNT =>
-                {
-                    Some(trigger::PumpfunBuyVariant::LegacyBuy)
-                }
+                "legacy_buy" => Some(trigger::PumpfunBuyVariant::LegacyBuy),
                 _ => None,
             });
         }
@@ -20969,6 +21368,18 @@ where
                 .iter()
                 .filter_map(|value| Pubkey::try_from(value.as_str()).ok())
                 .collect();
+        }
+        if matches!(
+            overrides.buy_variant,
+            Some(trigger::PumpfunBuyVariant::LegacyBuy)
+        ) {
+            if let Some(mint) = tx
+                .token_mint
+                .as_deref()
+                .and_then(|value| Pubkey::try_from(value).ok())
+            {
+                p37_apply_legacy_bonding_curve_v2_tail_resolver(&mut overrides, mint);
+            }
         }
         let route_complete = match overrides.buy_variant {
             Some(trigger::PumpfunBuyVariant::LegacyBuy) => {
@@ -22277,15 +22688,15 @@ async fn apply_trigger_dispatch_receipt_with_builder_mode(
                 )
                 .await;
             } else if let Some(request) = failed_request {
-                let mut account_diagnostics = active_shadow_account_diagnostics_from_request_with_mode(
-                    trigger_component,
-                    &request,
-                    &e,
-                    working_builder_parity_mode,
-                )
-                .await;
-                if let Some(latch_diagnostics) =
-                    request.state_readiness_latch_diagnostics.as_ref()
+                let mut account_diagnostics =
+                    active_shadow_account_diagnostics_from_request_with_mode(
+                        trigger_component,
+                        &request,
+                        &e,
+                        working_builder_parity_mode,
+                    )
+                    .await;
+                if let Some(latch_diagnostics) = request.state_readiness_latch_diagnostics.as_ref()
                 {
                     account_diagnostics =
                         merge_state_latch_diagnostics(account_diagnostics, latch_diagnostics);
@@ -27449,6 +27860,25 @@ mod tests {
         }
     }
 
+    fn p37_shadow_probe_test_breaking_fee_recipient_manifest_entry(
+        pubkey: String,
+    ) -> P37ShadowProbeAccountManifestEntry {
+        P37ShadowProbeAccountManifestEntry {
+            pubkey,
+            role: "breaking_fee_recipient".to_string(),
+            source: "route_builder".to_string(),
+            instruction_index: Some(0),
+            account_index: Some(17),
+            is_signer: Some(false),
+            is_writable: Some(true),
+            required: true,
+            route_kind: Some("legacy_buy".to_string()),
+            buy_variant: Some("legacy_buy".to_string()),
+            token_param_role: Some("token_amount".to_string()),
+            ..Default::default()
+        }
+    }
+
     fn p37_shadow_probe_route_compatible_bcv2_manifest_entry(
         pubkey: String,
     ) -> P37ShadowProbeAccountManifestEntry {
@@ -27527,6 +27957,155 @@ mod tests {
         );
         assert_eq!(authority.builder_required_curve_account_ready, Some(false));
         assert!(authority.non_authoritative_reason().is_some());
+    }
+
+    #[test]
+    fn p37_shadow_probe_protocol_legacy_bcv2_tail_is_meta_ready_by_schema() {
+        let request = test_protocol_legacy_bcv2_tail_prepared_buy_request();
+        let diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        let bcv2 = request
+            .account_overrides
+            .bonding_curve_v2
+            .expect("protocol bcv2");
+        let entry = diagnostics
+            .manifest
+            .iter()
+            .find(|entry| entry.role == "bonding_curve_v2")
+            .expect("bcv2 manifest entry");
+
+        assert_eq!(entry.pubkey, bcv2.to_string());
+        assert_eq!(
+            Pubkey::from_str(&entry.pubkey).ok(),
+            Some(trigger::DirectBuyBuilder::derive_bonding_curve_v2(&request.mint).0)
+        );
+        assert_eq!(entry.account_index, Some(16));
+        assert_eq!(entry.is_writable, Some(false));
+        assert_eq!(entry.is_signer, Some(false));
+        assert_eq!(
+            p37_shadow_probe_bcv2_protocol_meta_status(entry, &request),
+            Some((P37_BCV2_LOAD_NOT_REQUIRED, true))
+        );
+
+        let authority = p37_shadow_probe_bonding_curve_v2_authority_diagnostics(
+            Some(&request),
+            Some(&diagnostics),
+        );
+        assert_eq!(
+            authority.authority_status.as_deref(),
+            Some("meta_only_protocol_derived")
+        );
+        assert_eq!(
+            authority.rpc_load_status.as_deref(),
+            Some(P37_BCV2_LOAD_NOT_REQUIRED)
+        );
+        assert_eq!(authority.rpc_load_ready, Some(true));
+        assert_eq!(
+            authority
+                .builder_required_curve_account_ready_reason
+                .as_deref(),
+            Some(P37_BCV2_META_READY_BY_PROTOCOL_SCHEMA)
+        );
+        assert!(authority.non_authoritative_reason().is_none());
+    }
+
+    #[test]
+    fn p37_shadow_probe_protocol_legacy_breaking_fee_recipient_is_static_meta() {
+        let request = test_protocol_legacy_bcv2_tail_prepared_buy_request();
+        let diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        let entry = diagnostics
+            .manifest
+            .iter()
+            .find(|entry| entry.role == "breaking_fee_recipient")
+            .expect("breaking fee recipient manifest entry");
+        let pubkey = Pubkey::from_str(&entry.pubkey).expect("fee recipient pubkey");
+
+        assert!(trigger::BREAKING_FEE_RECIPIENTS.contains(&pubkey));
+        assert_eq!(entry.account_index, Some(17));
+        assert_eq!(entry.is_writable, Some(true));
+        assert_eq!(entry.is_signer, Some(false));
+        assert_eq!(
+            p37_shadow_probe_breaking_fee_protocol_meta_status(entry, &request),
+            Some((P37_STATIC_KNOWN_WRITABLE_META, true))
+        );
+    }
+
+    #[test]
+    fn p37_shadow_probe_protocol_tail_meta_only_accounts_are_excluded_from_rpc_load_precheck() {
+        let request = test_protocol_legacy_bcv2_tail_prepared_buy_request();
+        let diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        let bcv2_entry = diagnostics
+            .manifest
+            .iter()
+            .find(|entry| entry.role == "bonding_curve_v2")
+            .expect("bcv2 manifest entry");
+        let fee_entry = diagnostics
+            .manifest
+            .iter()
+            .find(|entry| entry.role == "breaking_fee_recipient")
+            .expect("breaking fee recipient manifest entry");
+        let curve_entry = diagnostics
+            .manifest
+            .iter()
+            .find(|entry| entry.role == "bonding_curve")
+            .expect("bonding curve manifest entry");
+
+        assert!(!p37_shadow_probe_manifest_entry_requires_rpc_load_check(
+            bcv2_entry, &request
+        ));
+        assert!(!p37_shadow_probe_manifest_entry_requires_rpc_load_check(
+            fee_entry, &request
+        ));
+        assert!(p37_shadow_probe_manifest_entry_requires_rpc_load_check(
+            curve_entry,
+            &request
+        ));
+    }
+
+    #[test]
+    fn p37_shadow_probe_protocol_legacy_bcv2_tail_skips_execution_evidence_load_gate() {
+        let request = test_protocol_legacy_bcv2_tail_prepared_buy_request();
+        let mut diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        diagnostics.manifest_lookup_performed = true;
+        for entry in &mut diagnostics.manifest {
+            if entry.role == "creator_vault" {
+                entry.precheck_rpc_load_status = Some("rpc_load_ready".to_string());
+                entry.precheck_rpc_load_ready = Some(true);
+            }
+        }
+        let bcv2 = request
+            .account_overrides
+            .bonding_curve_v2
+            .expect("protocol bcv2");
+        let evidence_store = ExecutionAccountEvidenceStore::new();
+        let mut missing = test_bcv2_execution_account_evidence(
+            bcv2,
+            ExecutionAccountEvidenceSource::RpcHydration,
+            ExecutionAccountEvidenceStatus::RpcMissing,
+            false,
+        );
+        missing.reason = Some("missing_on_rpc".to_string());
+        evidence_store.upsert(missing);
+
+        let reason = p37_working_builder_final_manifest_failure_reason_with_execution_policy(
+            &request,
+            &diagnostics,
+            Some(&evidence_store),
+            10_000,
+            10_001,
+            true,
+        );
+
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn p37_shadow_probe_protocol_legacy_bcv2_source_precheck_does_not_fail_on_meta_only_account() {
+        let request = test_protocol_legacy_bcv2_tail_prepared_buy_request();
+
+        assert_eq!(
+            p37_shadow_probe_bonding_curve_v2_source_precheck_reason(&request),
+            None
+        );
     }
 
     #[test]
@@ -28104,7 +28683,11 @@ mod tests {
     fn p37_route_resolver_defers_stale_legacy_tail_failure_for_validated_bcv2_fallback() {
         let mut request = test_working_builder_prepared_buy_request();
         request.account_overrides.buy_remaining_accounts =
-            vec![Pubkey::new_unique(), Pubkey::new_unique()];
+            trigger::LegacyBondingCurveTailResolver::resolve_pubkeys(
+                &request.mint,
+                trigger::BreakingFeeRecipientStrategy::FirstStatic,
+            )
+            .to_vec();
         let bcv2 = request
             .account_overrides
             .bonding_curve_v2
@@ -28161,7 +28744,11 @@ mod tests {
     ) {
         let mut request = test_working_builder_prepared_buy_request();
         request.account_overrides.buy_remaining_accounts =
-            vec![Pubkey::new_unique(), Pubkey::new_unique()];
+            trigger::LegacyBondingCurveTailResolver::resolve_pubkeys(
+                &request.mint,
+                trigger::BreakingFeeRecipientStrategy::FirstStatic,
+            )
+            .to_vec();
         let bcv2 = request
             .account_overrides
             .bonding_curve_v2
@@ -28214,7 +28801,7 @@ mod tests {
     }
 
     #[test]
-    fn active_shadow_precheck_rejects_legacy_route_without_remaining_accounts() {
+    fn active_shadow_precheck_rejects_unmaterialized_legacy_bcv2_tail() {
         let mut request = test_prepared_buy_request();
         let legacy_curve_pubkey = Pubkey::new_unique();
         request.account_overrides.buy_variant = Some(trigger::PumpfunBuyVariant::LegacyBuy);
@@ -28246,7 +28833,7 @@ mod tests {
         assert_eq!(resolution.selected_route_kind, None);
         assert_eq!(
             resolution.no_executable_route_account_set_reason.as_deref(),
-            Some("legacy_buy_missing_buyback_remaining_accounts:count=0:expected=2")
+            Some("LEGACY_BC_V2_TAIL_MISSING:count=0:expected=2")
         );
         assert!(!p37_active_shadow_precheck_route_ready_for_missing_account(
             &request,
@@ -28334,7 +28921,7 @@ mod tests {
     }
 
     #[test]
-    fn p37_selected_legacy_buy_fallback_overrides_clear_primary_bcv2() {
+    fn p37_selected_legacy_buy_fallback_overrides_uses_protocol_bcv2_tail() {
         let mut request = test_prepared_buy_request();
         request.account_overrides.buy_variant = Some(trigger::PumpfunBuyVariant::RoutedExactSolIn);
         request.account_overrides.legacy_buy_curve = Some(p37_shadow_probe_test_legacy_curve());
@@ -28350,18 +28937,28 @@ mod tests {
         );
         assert!(fallback.legacy_buy_curve.is_some());
         assert!(fallback.legacy_buy_curve_pubkey.is_some());
-        assert_eq!(fallback.bonding_curve_v2, None);
+        assert_eq!(
+            fallback.bonding_curve_v2,
+            Some(trigger::DirectBuyBuilder::derive_bonding_curve_v2(&request.mint).0)
+        );
         assert_eq!(fallback.bonding_curve_v2_provenance, None);
+        assert_eq!(
+            fallback.buy_remaining_accounts,
+            trigger::LegacyBondingCurveTailResolver::resolve_pubkeys(
+                &request.mint,
+                trigger::BreakingFeeRecipientStrategy::FirstStatic,
+            )
+        );
     }
 
     #[test]
     fn selected_legacy_buy_rewrites_prepared_request_variant() {
-        p37_selected_legacy_buy_fallback_overrides_clear_primary_bcv2();
+        p37_selected_legacy_buy_fallback_overrides_uses_protocol_bcv2_tail();
     }
 
     #[test]
-    fn selected_legacy_buy_clears_primary_bcv2_override() {
-        p37_selected_legacy_buy_fallback_overrides_clear_primary_bcv2();
+    fn selected_legacy_buy_resolves_protocol_bcv2_tail() {
+        p37_selected_legacy_buy_fallback_overrides_uses_protocol_bcv2_tail();
     }
 
     #[test]
@@ -28371,13 +28968,31 @@ mod tests {
         request.account_overrides.buy_variant = Some(trigger::PumpfunBuyVariant::LegacyBuy);
         request.account_overrides.legacy_buy_curve = Some(p37_shadow_probe_test_legacy_curve());
         request.account_overrides.legacy_buy_curve_pubkey = Some(legacy_curve_pubkey);
+        p37_apply_legacy_bonding_curve_v2_tail_resolver(
+            &mut request.account_overrides,
+            request.mint,
+        );
+        request.account_overrides.route_account_manifest_source =
+            Some("selected_fallback_route_execution_handoff".to_string());
+        let [expected_bcv2, expected_fee_recipient] =
+            trigger::LegacyBondingCurveTailResolver::resolve_pubkeys(
+                &request.mint,
+                trigger::BreakingFeeRecipientStrategy::FirstStatic,
+            );
         let account_set = P37ShadowProbeAccountSetDiagnostics {
             precheck_account_set_hash: Some("legacy-precheck".to_string()),
             prepared_request_account_set_hash: Some("legacy-prepared".to_string()),
             simulation_account_set_hash: Some("legacy-simulation".to_string()),
-            manifest: vec![p37_shadow_probe_test_legacy_curve_manifest_entry(
-                legacy_curve_pubkey,
-            )],
+            manifest: vec![
+                p37_shadow_probe_test_legacy_curve_manifest_entry(legacy_curve_pubkey),
+                p37_shadow_probe_test_bcv2_manifest_entry(
+                    expected_bcv2.to_string(),
+                    "route_builder",
+                ),
+                p37_shadow_probe_test_breaking_fee_recipient_manifest_entry(
+                    expected_fee_recipient.to_string(),
+                ),
+            ],
             ..Default::default()
         };
 
@@ -28401,10 +29016,228 @@ mod tests {
             handoff.simulation_hash.as_deref(),
             Some("legacy-simulation")
         );
-        assert!(!handoff
+        assert!(handoff
             .account_set_roles
             .iter()
             .any(|role| role.starts_with("bonding_curve_v2:")));
+        assert!(handoff
+            .account_set_roles
+            .iter()
+            .any(|role| role.starts_with("breaking_fee_recipient:")));
+        assert_eq!(handoff.selected_route_kind.as_deref(), Some("legacy_buy"));
+        assert_eq!(
+            handoff.final_manifest_source.as_deref(),
+            request
+                .account_overrides
+                .route_account_manifest_source
+                .as_deref()
+        );
+        assert_eq!(handoff.bcv2_present, Some(true));
+        assert_eq!(
+            handoff.bcv2_meta_status.as_deref(),
+            Some(P37_BCV2_META_READY_BY_PROTOCOL_SCHEMA)
+        );
+        assert_eq!(
+            handoff.bcv2_load_status.as_deref(),
+            Some(P37_BCV2_LOAD_NOT_REQUIRED)
+        );
+        assert_eq!(
+            handoff.fee_recipient_status.as_deref(),
+            Some(P37_STATIC_KNOWN_WRITABLE_META)
+        );
+        assert_eq!(
+            handoff.legacy_tail_status.as_deref(),
+            Some(P37_LEGACY_BC_V2_TAIL_RESOLVED_BY_PROTOCOL_SCHEMA)
+        );
+        assert!(handoff
+            .fatal_reasons_after_final_manifest_validation
+            .is_empty());
+        assert!(handoff.stale_primary_reasons.is_empty());
+    }
+
+    #[test]
+    fn selected_fallback_handoff_canonicalizes_protocol_bcv2_tail_after_prepare() {
+        let mut request = test_protocol_legacy_bcv2_tail_prepared_buy_request();
+        let [expected_bcv2, expected_fee_recipient] =
+            trigger::LegacyBondingCurveTailResolver::resolve_pubkeys(
+                &request.mint,
+                trigger::BreakingFeeRecipientStrategy::FirstStatic,
+            );
+        request.account_overrides.bonding_curve_v2 = None;
+        request.account_overrides.bonding_curve_v2_provenance = None;
+        request.account_overrides.buy_remaining_accounts.clear();
+        request.account_overrides.route_account_manifest_source =
+            Some("selected_fallback_route_execution_handoff".to_string());
+        request.account_overrides.execution_account_contract_status =
+            Some("route_account_manifest_incomplete".to_string());
+        request.account_overrides.execution_account_contract_reason =
+            Some("primary_route_bcv2_missing:bonding_curve_v2:stale_primary_candidate".to_string());
+
+        let request_mint = request.mint;
+        p37_canonicalize_selected_fallback_route_handoff_for_shadow_only(
+            &mut request,
+            request_mint,
+        );
+        let diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        let handoff = p37_selected_route_handoff_diagnostics_with_stale_primary_reason(
+            Some(&request),
+            Some(&diagnostics),
+            Some("primary_route_bcv2_missing"),
+        );
+
+        assert_eq!(
+            request.account_overrides.buy_variant,
+            Some(trigger::PumpfunBuyVariant::LegacyBuy)
+        );
+        assert_eq!(
+            request.account_overrides.bonding_curve_v2,
+            Some(expected_bcv2)
+        );
+        assert_eq!(
+            request.account_overrides.buy_remaining_accounts,
+            vec![expected_bcv2, expected_fee_recipient]
+        );
+        assert_eq!(
+            request
+                .account_overrides
+                .route_account_manifest_source
+                .as_deref(),
+            Some("selected_fallback_route_execution_handoff")
+        );
+        assert_eq!(
+            p37_execution_account_contract_failure_tail(&request.account_overrides),
+            None
+        );
+        assert_eq!(
+            p37_selected_route_final_manifest_failure_reason(&request, &diagnostics),
+            None
+        );
+        assert_eq!(
+            handoff.status.as_deref(),
+            Some("selected_route_handoff_applied")
+        );
+        assert_eq!(handoff.selected_route_kind.as_deref(), Some("legacy_buy"));
+        assert_eq!(handoff.bcv2_present, Some(true));
+        assert_eq!(
+            handoff.bcv2_meta_status.as_deref(),
+            Some(P37_BCV2_META_READY_BY_PROTOCOL_SCHEMA)
+        );
+        assert_eq!(
+            handoff.bcv2_load_status.as_deref(),
+            Some(P37_BCV2_LOAD_NOT_REQUIRED)
+        );
+        assert_ne!(
+            handoff.bcv2_load_status.as_deref(),
+            Some("missing_on_rpc_precheck")
+        );
+        assert_eq!(
+            handoff.legacy_tail_status.as_deref(),
+            Some(P37_LEGACY_BC_V2_TAIL_RESOLVED_BY_PROTOCOL_SCHEMA)
+        );
+        assert_eq!(
+            handoff.stale_primary_reasons,
+            vec!["primary_route_bcv2_missing".to_string()]
+        );
+        assert!(handoff
+            .fatal_reasons_after_final_manifest_validation
+            .is_empty());
+    }
+
+    #[test]
+    fn selected_fallback_handoff_keeps_stale_primary_bcv2_reason_non_fatal() {
+        let mut request = test_protocol_legacy_bcv2_tail_prepared_buy_request();
+        request.account_overrides.route_account_manifest_source =
+            Some("selected_fallback_route_execution_handoff".to_string());
+        request.account_overrides.execution_account_contract_reason =
+            Some("primary_route_bcv2_missing:stale_primary_candidate".to_string());
+        let request_mint = request.mint;
+        p37_canonicalize_selected_fallback_route_handoff_for_shadow_only(
+            &mut request,
+            request_mint,
+        );
+        let diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(&request);
+        let handoff = p37_selected_route_handoff_diagnostics_with_stale_primary_reason(
+            Some(&request),
+            Some(&diagnostics),
+            Some("primary_route_bcv2_missing"),
+        );
+
+        assert_eq!(handoff.selected_route_kind.as_deref(), Some("legacy_buy"));
+        assert_eq!(
+            handoff.final_manifest_source.as_deref(),
+            Some("selected_fallback_route_execution_handoff")
+        );
+        assert_eq!(handoff.bcv2_present, Some(true));
+        assert_eq!(
+            handoff.bcv2_meta_status.as_deref(),
+            Some(P37_BCV2_META_READY_BY_PROTOCOL_SCHEMA)
+        );
+        assert_eq!(
+            handoff.bcv2_load_status.as_deref(),
+            Some(P37_BCV2_LOAD_NOT_REQUIRED)
+        );
+        assert_eq!(
+            handoff.stale_primary_reasons,
+            vec!["primary_route_bcv2_missing".to_string()]
+        );
+        assert!(!handoff
+            .fatal_reasons_after_final_manifest_validation
+            .iter()
+            .any(|reason| reason.contains("primary_route_bcv2_missing")));
+        assert_eq!(
+            p37_selected_route_final_manifest_failure_reason(&request, &diagnostics),
+            None
+        );
+    }
+
+    #[test]
+    fn selected_fallback_handoff_fails_closed_when_bcv2_absent_from_final_manifest() {
+        let mut request = test_protocol_legacy_bcv2_tail_prepared_buy_request();
+        request.account_overrides.bonding_curve_v2 = None;
+        request.account_overrides.buy_remaining_accounts.clear();
+        request.account_overrides.route_account_manifest_source =
+            Some("selected_fallback_route_execution_handoff".to_string());
+        let legacy_curve_pubkey = request
+            .account_overrides
+            .legacy_buy_curve_pubkey
+            .expect("legacy curve pubkey");
+        let account_set = P37ShadowProbeAccountSetDiagnostics {
+            precheck_account_set_hash: Some("legacy-precheck".to_string()),
+            prepared_request_account_set_hash: Some("legacy-prepared".to_string()),
+            simulation_account_set_hash: Some("legacy-simulation".to_string()),
+            manifest: vec![
+                p37_shadow_probe_test_legacy_curve_manifest_entry(legacy_curve_pubkey),
+                p37_shadow_probe_test_breaking_fee_recipient_manifest_entry(
+                    trigger::LegacyBondingCurveTailResolver::first_static_breaking_fee_recipient()
+                        .to_string(),
+                ),
+            ],
+            ..Default::default()
+        };
+
+        let handoff = p37_selected_route_handoff_diagnostics(Some(&request), Some(&account_set));
+        let final_reason = p37_selected_route_final_manifest_failure_reason(&request, &account_set)
+            .expect("missing bcv2 must fail closed");
+
+        assert_eq!(
+            handoff.status.as_deref(),
+            Some("selected_route_handoff_mismatch")
+        );
+        assert_eq!(
+            handoff.reason.as_deref(),
+            Some("selected_legacy_buy_final_manifest_missing_bonding_curve_v2")
+        );
+        assert_eq!(handoff.selected_route_kind.as_deref(), Some("legacy_buy"));
+        assert_eq!(handoff.bcv2_present, Some(false));
+        assert!(handoff.bcv2_meta_status.is_none());
+        assert!(handoff
+            .fatal_reasons_after_final_manifest_validation
+            .iter()
+            .any(|reason| reason == "selected_legacy_buy_final_manifest_missing_bonding_curve_v2"));
+        assert_eq!(
+            final_reason,
+            "selected_route_handoff_mismatch:selected_legacy_buy_final_manifest_missing_bonding_curve_v2"
+        );
     }
 
     #[test]
@@ -28484,17 +29317,17 @@ mod tests {
     }
 
     #[test]
-    fn selected_legacy_buy_precheck_manifest_excludes_primary_bcv2() {
+    fn selected_legacy_buy_precheck_manifest_uses_protocol_bcv2_tail() {
         p37_selected_legacy_buy_fallback_handoff_uses_legacy_account_set();
     }
 
     #[test]
-    fn selected_legacy_buy_simulation_manifest_excludes_primary_bcv2() {
+    fn selected_legacy_buy_simulation_manifest_uses_protocol_bcv2_tail() {
         p37_selected_legacy_buy_fallback_handoff_uses_legacy_account_set();
     }
 
     #[test]
-    fn selected_legacy_buy_final_manifest_containing_bcv2_blocks_handoff() {
+    fn selected_legacy_buy_final_manifest_missing_breaking_fee_recipient_blocks_handoff() {
         let mut request = test_prepared_buy_request();
         let legacy_curve_pubkey = Pubkey::new_unique();
         let bcv2 = Pubkey::new_unique().to_string();
@@ -28520,13 +29353,14 @@ mod tests {
         );
         assert_eq!(
             handoff.reason.as_deref(),
-            Some("selected_legacy_buy_final_manifest_contains_primary_bcv2")
+            Some("selected_legacy_buy_final_manifest_missing_breaking_fee_recipient")
         );
         assert!(p37_selected_route_final_manifest_failure_reason(&request, &account_set).is_some());
     }
 
     #[test]
-    fn selected_legacy_buy_builder_final_manifest_bcv2_blocks_simulation() {
+    fn selected_legacy_buy_builder_final_manifest_missing_breaking_fee_recipient_blocks_simulation()
+    {
         let mut request = test_prepared_buy_request();
         let legacy_curve_pubkey = Pubkey::new_unique();
         let bcv2 = Pubkey::new_unique().to_string();
@@ -28556,7 +29390,7 @@ mod tests {
         assert_eq!(
             p37_selected_route_final_manifest_failure_reason(&request, &diagnostics).as_deref(),
             Some(
-                "selected_route_handoff_mismatch:selected_legacy_buy_final_manifest_contains_primary_bcv2"
+                "selected_route_handoff_mismatch:selected_legacy_buy_final_manifest_missing_breaking_fee_recipient"
             )
         );
     }
@@ -29135,6 +29969,11 @@ mod tests {
         mint: Pubkey,
     ) -> crate::components::trigger::BuyAccountOverrides {
         let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).expect("valid token program");
+        let [bonding_curve_v2, breaking_fee_recipient] =
+            trigger::LegacyBondingCurveTailResolver::resolve_pubkeys(
+                &mint,
+                trigger::BreakingFeeRecipientStrategy::FirstStatic,
+            );
         crate::components::trigger::BuyAccountOverrides {
             global_config: Some(trigger::DirectBuyBuilder::canonical_global_config()),
             fee_recipient: Some(trigger::DirectBuyBuilder::canonical_fee_recipient()),
@@ -29152,12 +29991,14 @@ mod tests {
                     &token_program,
                 ),
             ),
-            buy_remaining_accounts: vec![Pubkey::new_unique(), Pubkey::new_unique()],
+            bonding_curve_v2: Some(bonding_curve_v2),
+            bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![bonding_curve_v2, breaking_fee_recipient],
             legacy_buy_curve: Some(p37_shadow_probe_test_legacy_curve()),
             legacy_buy_curve_pubkey: Some(trigger::DirectBuyBuilder::derive_bonding_curve(&mint).0),
             legacy_buy_curve_source: Some("materialized_feature_set".to_string()),
             legacy_buy_curve_authority_status: Some("authoritative_mfs".to_string()),
-            route_account_manifest_source: Some("observed_pool_transaction".to_string()),
+            route_account_manifest_source: Some("protocol_schema_legacy_bc_v2_tail".to_string()),
             execution_account_contract_status: Some("complete".to_string()),
             execution_account_contract_reason: Some("route_account_contract_complete".to_string()),
             ..Default::default()
@@ -29245,7 +30086,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_buy_missing_remaining_accounts_is_not_executable() {
+    fn legacy_buy_missing_protocol_tail_is_not_executable() {
         let mut request = test_prepared_buy_request();
         request.account_overrides = crate::components::trigger::BuyAccountOverrides {
             buy_variant: Some(trigger::PumpfunBuyVariant::LegacyBuy),
@@ -29259,7 +30100,7 @@ mod tests {
 
         assert_eq!(
             reason,
-            "no_executable_route_account_set:legacy_buy_missing_buyback_remaining_accounts:count=0:expected=2"
+            "no_executable_route_account_set:LEGACY_BC_V2_TAIL_MISSING:count=0:expected=2"
         );
     }
 
@@ -29291,20 +30132,19 @@ mod tests {
     }
 
     #[test]
-    fn restore_legacy_buy_with_observed_remaining_accounts_is_executable() {
+    fn restore_legacy_buy_with_protocol_tail_is_executable() {
         let mut request = test_prepared_buy_request();
-        let buyback_fee_recipient = Pubkey::new_unique();
-        let buyback_quote_account = Pubkey::new_unique();
         request.account_overrides = complete_legacy_execution_contract_overrides(request.mint);
-        request.account_overrides.buy_remaining_accounts =
-            vec![buyback_fee_recipient, buyback_quote_account];
 
         let reason = p37_selected_route_account_contract_failure_reason(&request);
 
         assert_eq!(reason, None);
         assert_eq!(
             request.account_overrides.buy_remaining_accounts,
-            vec![buyback_fee_recipient, buyback_quote_account]
+            trigger::LegacyBondingCurveTailResolver::resolve_pubkeys(
+                &request.mint,
+                trigger::BreakingFeeRecipientStrategy::FirstStatic,
+            )
         );
     }
 
@@ -31074,6 +31914,143 @@ mod tests {
             entry_token_amount_raw: Some(min_tokens_out),
             min_tokens_out,
             token_param_role: "min_tokens_out",
+            ata_instruction: None,
+            buy_instruction,
+        };
+
+        crate::components::trigger::PreparedBuyRequest {
+            join_metadata: ExecutionJoinMetadata::default(),
+            state_readiness_latch_diagnostics: None,
+            mint,
+            payer_pubkey: payer.pubkey(),
+            payer_provenance: "configured",
+            user_ata,
+            token_program,
+            attach_idempotent_ata_create: false,
+            ata_missing_pre_submit: false,
+            account_overrides,
+            pre_submit_token_balance: Some(0),
+            amount_lamports,
+            trade_value_sol: amount_lamports as f64 / LAMPORTS_PER_SOL,
+            entry_token_amount_raw: Some(min_tokens_out),
+            tip_lamports: 10,
+            min_tokens_out,
+            priority_fee_micro_lamports:
+                crate::components::live_tx_sender::HELIUS_PRIORITY_FEE_FALLBACK_MICRO_LAMPORTS,
+            recent_blockhash,
+            blockhash_source: "test",
+            blockhash_age_ms: 0,
+            blockhash_last_valid_block_height: 0,
+            blockhash_observed_block_height: 0,
+            blockhash_fetched_at: std::time::Instant::now(),
+            blockhash_fetch_latency_ms: 0,
+            post_blockhash_build_latency_ms: 0,
+            reserve_slot_latency_ms: 0,
+            shadow_spawn_latency_ms: 0,
+            preparation_telemetry: Default::default(),
+            build_profile: Some(build_profile),
+            rpc_buy_tx,
+            buy_tx,
+            tip_tx: None,
+            decision_ts_ms: 10,
+        }
+    }
+
+    fn test_protocol_legacy_bcv2_tail_prepared_buy_request(
+    ) -> crate::components::trigger::PreparedBuyRequest {
+        let payer = solana_sdk::signature::Keypair::new();
+        let recent_blockhash = solana_sdk::hash::Hash::new_unique();
+        let mint = Pubkey::new_unique();
+        let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).expect("valid token program");
+        let associated_bonding_curve =
+            trigger::DirectBuyBuilder::canonical_associated_bonding_curve(&mint, &token_program);
+        let [bonding_curve_v2, breaking_fee_recipient] =
+            trigger::LegacyBondingCurveTailResolver::resolve_pubkeys(
+                &mint,
+                trigger::BreakingFeeRecipientStrategy::FirstStatic,
+            );
+        let legacy_curve_pubkey = trigger::DirectBuyBuilder::derive_bonding_curve(&mint).0;
+        let creator_pubkey = Pubkey::new_unique();
+        let amount_lamports = 100_000_000;
+        let min_tokens_out = 250_000;
+        let user_ata = spl_associated_token_account::get_associated_token_address_with_program_id(
+            &payer.pubkey(),
+            &mint,
+            &token_program,
+        );
+        let account_overrides = crate::components::trigger::BuyAccountOverrides {
+            global_config: Some(trigger::DirectBuyBuilder::canonical_global_config()),
+            fee_recipient: Some(trigger::DirectBuyBuilder::canonical_fee_recipient()),
+            token_program: Some(token_program),
+            creator_pubkey: Some(creator_pubkey),
+            creator_pubkey_source: Some("unit_test.creator".to_string()),
+            creator_pubkey_authoritative: Some(true),
+            creator_vault: None,
+            creator_vault_source: None,
+            creator_vault_authoritative: None,
+            buy_variant: Some(trigger::PumpfunBuyVariant::LegacyBuy),
+            associated_bonding_curve: Some(associated_bonding_curve),
+            bonding_curve_v2: Some(bonding_curve_v2),
+            bonding_curve_v2_provenance: None,
+            buy_remaining_accounts: vec![bonding_curve_v2, breaking_fee_recipient],
+            legacy_buy_curve: Some(p37_shadow_probe_test_legacy_curve()),
+            legacy_buy_curve_pubkey: Some(legacy_curve_pubkey),
+            legacy_buy_curve_source: Some("materialized_feature_set".to_string()),
+            legacy_buy_curve_authority_status: Some("authoritative_mfs".to_string()),
+            route_account_manifest_source: Some("protocol_schema_legacy_bc_v2_tail".to_string()),
+            execution_account_contract_status: Some("complete".to_string()),
+            execution_account_contract_reason: Some("route_account_contract_complete".to_string()),
+        };
+        let buy_instruction =
+            trigger::DirectBuyBuilder::build_buy_ix_with_accounts_and_remaining_and_creator_vault(
+                &payer.pubkey(),
+                &mint,
+                &token_program,
+                account_overrides.global_config,
+                account_overrides.fee_recipient,
+                account_overrides.creator_pubkey,
+                account_overrides.creator_vault,
+                account_overrides.buy_variant,
+                account_overrides.associated_bonding_curve,
+                account_overrides.bonding_curve_v2,
+                &account_overrides.buy_remaining_accounts,
+                amount_lamports,
+                min_tokens_out,
+            );
+        let rpc_buy_tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
+            std::slice::from_ref(&buy_instruction),
+            Some(&payer.pubkey()),
+            &[&payer],
+            recent_blockhash,
+        );
+        let buy_tx = solana_sdk::transaction::VersionedTransaction::try_new(
+            solana_sdk::message::VersionedMessage::V0(
+                solana_sdk::message::v0::Message::try_compile(
+                    &payer.pubkey(),
+                    std::slice::from_ref(&buy_instruction),
+                    &[],
+                    recent_blockhash,
+                )
+                .expect("legacy bcv2 test message"),
+            ),
+            &[&payer],
+        )
+        .expect("legacy bcv2 test versioned tx");
+        let build_profile = crate::components::trigger::BuyBuildProfile {
+            mint,
+            payer_pubkey: payer.pubkey(),
+            user_ata,
+            token_program,
+            attach_idempotent_ata_create: false,
+            ata_missing_pre_submit: false,
+            account_overrides: account_overrides.clone(),
+            amount_lamports,
+            trade_value_sol: amount_lamports as f64 / LAMPORTS_PER_SOL,
+            pre_submit_token_balance: Some(0),
+            buy_variant: trigger::PumpfunBuyVariant::LegacyBuy,
+            entry_token_amount_raw: Some(min_tokens_out),
+            min_tokens_out,
+            token_param_role: "token_amount",
             ata_instruction: None,
             buy_instruction,
         };
@@ -38414,9 +39391,8 @@ mod tests {
         let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).expect("valid token program");
         let associated_bonding_curve =
             trigger::DirectBuyBuilder::canonical_associated_bonding_curve(&mint, &token_program);
-        let buyback_fee_recipient = Pubkey::new_unique();
-        let buyback_quote_account = Pubkey::new_unique();
         let mut successful_buy = (*test_pool_observation_tx("success_sig")).clone();
+        successful_buy.token_mint = Some(mint.to_string());
         successful_buy.buy_variant = Some("legacy_buy".to_string());
         successful_buy.global_config =
             Some(trigger::DirectBuyBuilder::canonical_global_config().to_string());
@@ -38424,10 +39400,6 @@ mod tests {
             Some(trigger::DirectBuyBuilder::canonical_fee_recipient().to_string());
         successful_buy.token_program = Some(token_program.to_string());
         successful_buy.associated_bonding_curve = Some(associated_bonding_curve.to_string());
-        successful_buy.buy_remaining_accounts = vec![
-            buyback_fee_recipient.to_string(),
-            buyback_quote_account.to_string(),
-        ];
 
         let buffered_txs = vec![GatekeeperBufferedTx {
             tx: Arc::new(successful_buy),
@@ -38442,9 +39414,15 @@ mod tests {
         );
         assert_eq!(
             overrides.buy_remaining_accounts,
-            vec![buyback_fee_recipient, buyback_quote_account]
+            trigger::LegacyBondingCurveTailResolver::resolve_pubkeys(
+                &mint,
+                trigger::BreakingFeeRecipientStrategy::FirstStatic,
+            )
         );
-        assert_eq!(overrides.bonding_curve_v2, None);
+        assert_eq!(
+            overrides.bonding_curve_v2,
+            Some(trigger::DirectBuyBuilder::derive_bonding_curve_v2(&mint).0)
+        );
         assert_ne!(
             overrides.execution_account_contract_reason.as_deref(),
             Some(P37_UNSUPPORTED_LEGACY_BUY_LAYOUT_REASON)
@@ -38480,6 +39458,7 @@ mod tests {
             trigger::DirectBuyBuilder::canonical_associated_bonding_curve(&mint, &token_program);
         let observed_creator_vault = Pubkey::new_unique();
         let mut tx = (*test_pool_observation_tx("legacy-observed-creator-vault")).clone();
+        tx.token_mint = Some(mint.to_string());
         tx.buy_variant = Some("legacy_buy".to_string());
         tx.global_config = Some(trigger::DirectBuyBuilder::canonical_global_config().to_string());
         tx.fee_recipient = Some(trigger::DirectBuyBuilder::canonical_fee_recipient().to_string());
@@ -38546,23 +39525,19 @@ mod tests {
     }
 
     #[test]
-    fn p37_shadow_probe_preserves_observed_legacy_buy_overrides_for_active_and_probe() {
+    fn p37_shadow_probe_resolves_protocol_legacy_buy_tail_for_active_and_probe() {
         use ghost_brain::oracle::snapshot_engine::PoolMetrics;
         use ghost_core::shadow_ledger::TxKey;
         use std::sync::Arc;
 
         let assoc_curve = Pubkey::new_unique();
-        let buyback_fee_recipient = Pubkey::new_unique();
-        let buyback_quote_account = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
         let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).expect("valid token program");
         let mut tx = (*test_pool_observation_tx("legacy-probe-route")).clone();
+        tx.token_mint = Some(mint.to_string());
         tx.buy_variant = Some("legacy_buy".to_string());
         tx.associated_bonding_curve = Some(assoc_curve.to_string());
         tx.token_program = Some(token_program.to_string());
-        tx.buy_remaining_accounts = vec![
-            buyback_fee_recipient.to_string(),
-            buyback_quote_account.to_string(),
-        ];
         tx.success = true;
         tx.is_buy = true;
         let buffered_txs = vec![crate::components::gatekeeper::GatekeeperBufferedTx {
@@ -38578,7 +39553,10 @@ mod tests {
         );
         assert_eq!(
             active_overrides.buy_remaining_accounts,
-            vec![buyback_fee_recipient, buyback_quote_account]
+            trigger::LegacyBondingCurveTailResolver::resolve_pubkeys(
+                &mint,
+                trigger::BreakingFeeRecipientStrategy::FirstStatic,
+            )
         );
 
         let probe_overrides = p37_shadow_probe_derive_legacy_buy_account_overrides(&buffered_txs)
@@ -38591,7 +39569,10 @@ mod tests {
         assert_eq!(probe_overrides.token_program, Some(token_program));
         assert_eq!(
             probe_overrides.buy_remaining_accounts,
-            vec![buyback_fee_recipient, buyback_quote_account]
+            trigger::LegacyBondingCurveTailResolver::resolve_pubkeys(
+                &mint,
+                trigger::BreakingFeeRecipientStrategy::FirstStatic,
+            )
         );
     }
 

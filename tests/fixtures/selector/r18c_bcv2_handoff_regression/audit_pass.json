@@ -1,0 +1,40 @@
+{
+  "artifact": "buy_simulation_coverage_audit_v1",
+  "schema_version": 1,
+  "status": "AUDIT_COMPLETE_PASS",
+  "scope": "r18c-bcv2-handoff-regression-fixture",
+  "decision_plane": "legacy_live",
+  "metrics": {
+    "buy_rows": 2,
+    "shadow_dispatch_rows": 2,
+    "shadow_simulated_rows": 2,
+    "shadow_simulation_attempted_rows": 2,
+    "shadow_closed_rows": 2,
+    "not_executable_route_rows": 0,
+    "simulation_failed_rows": 0,
+    "position_limit_rows": 0,
+    "critical_regression_marker_rows": 0,
+    "simulation_attempt_coverage": 1.0,
+    "simulation_success_coverage": 1.0,
+    "not_executable_rate": 0.0,
+    "simulation_failure_rate": 0.0,
+    "position_limit_rate": 0.0
+  },
+  "failure_classes": {
+    "UNKNOWN_UNCLASSIFIED": {
+      "count": 0,
+      "rate": 0.0,
+      "sample_candidate_ids": []
+    }
+  },
+  "critical_regression_markers": {
+    "AccountNotFound": 0,
+    "unsupported_legacy_buy_layout_requires_bcv2": 0,
+    "Custom(6062)": 0,
+    "custom program error: 0x17ae": 0,
+    "0x17ae": 0,
+    "ResourceExhausted": 0,
+    "relative URL without a base": 0
+  },
+  "fail_reasons": []
+}

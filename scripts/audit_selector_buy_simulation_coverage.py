@@ -35,6 +35,16 @@ CLASS_ORDER = (
     "SIM_FAIL_CUSTOM_6024",
     "SIM_FAIL_CUSTOM_6002",
     "ROUTE_INCOMPLETE_TELEMETRY_ONLY",
+    "LEGACY_BC_V2_TAIL_RESOLVED_BY_PROTOCOL_SCHEMA",
+    "BCV2_PDA_DERIVATION_FAILED",
+    "BCV2_META_ORDER_INVALID",
+    "BCV2_META_MUTABILITY_INVALID",
+    "BCV2_META_SIGNER_INVALID",
+    "BCV2_FEE_RECIPIENT_INVALID",
+    "LEGACY_BC_V2_TAIL_MISSING",
+    "LEGACY_BC_V2_TAIL_RESOLVER_FAILED",
+    "LEGACY_BC_V2_FEE_RECIPIENT_MISSING",
+    "LEGACY_BC_V2_PDA_DERIVATION_FAILED",
     "ROUTE_INCOMPLETE_LEGACY_TAIL_MISSING",
     "ROUTE_INCOMPLETE_BCV2_MISSING",
     "ROUTE_INCOMPLETE_STATE_NOT_READY",
@@ -52,6 +62,15 @@ CACHE_CLASS_ORDER = (
 )
 ROUTE_INCOMPLETE_CLASSES = {
     "ROUTE_INCOMPLETE_TELEMETRY_ONLY",
+    "BCV2_PDA_DERIVATION_FAILED",
+    "BCV2_META_ORDER_INVALID",
+    "BCV2_META_MUTABILITY_INVALID",
+    "BCV2_META_SIGNER_INVALID",
+    "BCV2_FEE_RECIPIENT_INVALID",
+    "LEGACY_BC_V2_TAIL_MISSING",
+    "LEGACY_BC_V2_TAIL_RESOLVER_FAILED",
+    "LEGACY_BC_V2_FEE_RECIPIENT_MISSING",
+    "LEGACY_BC_V2_PDA_DERIVATION_FAILED",
     "ROUTE_INCOMPLETE_LEGACY_TAIL_MISSING",
     "ROUTE_INCOMPLETE_BCV2_MISSING",
     "ROUTE_INCOMPLETE_STATE_NOT_READY",
@@ -158,7 +177,7 @@ def extract_custom_code(text: str) -> str | None:
 
 
 def extract_legacy_remaining_count(text: str) -> int | None:
-    match = re.search(r"legacy_buy_missing_buyback_remaining_accounts:count=(\d+)", text)
+    match = re.search(r"(?:legacy_buy_missing_buyback_remaining_accounts|LEGACY_BC_V2_TAIL_MISSING):count=(\d+)", text)
     return int(match.group(1)) if match else None
 
 
@@ -316,7 +335,13 @@ def complete_legacy_manifest(row: dict[str, Any]) -> bool:
         return False
     if row.get("execution_feasibility_status") == "not_executable_route":
         return False
-    return role_present(row, "buyback_fee_recipient") and role_present(row, "buyback_quote_account")
+    return (
+        role_present(row, "bonding_curve_v2")
+        and role_present(row, "breaking_fee_recipient")
+    ) or (
+        role_present(row, "buyback_fee_recipient")
+        and role_present(row, "buyback_quote_account")
+    )
 
 
 def complete_manifest_index(shadow_rows: list[dict[str, Any]]) -> dict[tuple[str | None, str | None], list[dict[str, Any]]]:
@@ -469,6 +494,30 @@ def classify_failure(buy: dict[str, Any], shadow: dict[str, Any] | None) -> tupl
         matches.append("SIM_FAIL_PROVIDER")
     if "telemetry_only" in lower or "feature-only" in lower or "feature_only" in lower:
         matches.append("ROUTE_INCOMPLETE_TELEMETRY_ONLY")
+    if "legacy_bc_v2_tail_resolved_by_protocol_schema" in lower:
+        matches.append("LEGACY_BC_V2_TAIL_RESOLVED_BY_PROTOCOL_SCHEMA")
+    if "bcv2_meta_ready_by_protocol_schema" in lower:
+        matches.append("BCV2_META_READY_BY_PROTOCOL_SCHEMA")
+    if "bcv2_load_not_required" in lower:
+        matches.append("BCV2_LOAD_NOT_REQUIRED")
+    if "bcv2_pda_derivation_failed" in lower:
+        matches.append("BCV2_PDA_DERIVATION_FAILED")
+    if "bcv2_meta_order_invalid" in lower:
+        matches.append("BCV2_META_ORDER_INVALID")
+    if "bcv2_meta_mutability_invalid" in lower:
+        matches.append("BCV2_META_MUTABILITY_INVALID")
+    if "bcv2_meta_signer_invalid" in lower:
+        matches.append("BCV2_META_SIGNER_INVALID")
+    if "bcv2_fee_recipient_invalid" in lower:
+        matches.append("BCV2_FEE_RECIPIENT_INVALID")
+    if "legacy_bc_v2_tail_missing" in lower:
+        matches.append("LEGACY_BC_V2_TAIL_MISSING")
+    if "legacy_bc_v2_tail_resolver_failed" in lower:
+        matches.append("LEGACY_BC_V2_TAIL_RESOLVER_FAILED")
+    if "legacy_bc_v2_fee_recipient_missing" in lower:
+        matches.append("LEGACY_BC_V2_FEE_RECIPIENT_MISSING")
+    if "legacy_bc_v2_pda_derivation_failed" in lower:
+        matches.append("LEGACY_BC_V2_PDA_DERIVATION_FAILED")
     if "legacy_buy_missing_buyback_remaining_accounts" in lower:
         matches.append("ROUTE_INCOMPLETE_LEGACY_TAIL_MISSING")
     if "primary_route_bcv2_missing" in lower or "missing_bonding_curve_v2" in lower:
@@ -1009,6 +1058,7 @@ def build_audit(args: argparse.Namespace) -> dict[str, Any]:
             "buy_missing_from_buy_file": missing_from_buy_file,
             "shadow_dispatch_rows": shadow_dispatch_row_count,
             "shadow_simulated_rows": shadow_simulated_rows,
+            "shadow_simulation_attempted_rows": simulation_attempted_rows,
             "shadow_closed_rows": shadow_closed_rows,
             "not_executable_route_rows": not_executable_rows,
             "simulation_failed_rows": simulation_failed_rows,

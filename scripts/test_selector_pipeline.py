@@ -25,10 +25,13 @@ import build_selector_r2only_ablation_report as r2only_ablation
 import build_selector_r2only_feature_contribution as r2only_feature_contribution
 import build_selector_r2only_feature_audit as r2only_feature_audit
 import build_selector_r2only_model_candidate as r2only_model_candidate
+import build_selector_route_manifest_reuse_projection as route_manifest_reuse
 import build_selector_route_evidence_join_report as route_evidence_join
 import build_selector_training_view as training
 import compare_selector_gatekeepers as compare
 import audit_selector_buy_simulation_coverage as simcov_audit
+import build_selector_coverage_breakthrough_projection as coverage_breakthrough
+import ci_assert_selector_regression_gates as selector_regression_gates
 import guard_gatekeeper_decision_feature_surface as gk_surface_guard
 import start_selector_lifecycle_run as lifecycle_launcher
 import selector_pipeline_common as common
@@ -3894,6 +3897,173 @@ class SelectorPipelineTests(unittest.TestCase):
             )
         )
 
+    def r18c_regression_fixture_dir(self) -> Path:
+        return (
+            Path(__file__).resolve().parents[1]
+            / "tests"
+            / "fixtures"
+            / "selector"
+            / "r18c_bcv2_handoff_regression"
+        )
+
+    def run_selector_regression_gate(self, audit_json: Path, jsonl: Path) -> dict:
+        return selector_regression_gates.build_report(
+            selector_regression_gates.build_parser().parse_args(
+                [
+                    "--scope",
+                    "r18c-bcv2-handoff-regression-fixture",
+                    "--root",
+                    str(Path(__file__).resolve().parents[1]),
+                    "--audit-json",
+                    str(audit_json),
+                    "--jsonl",
+                    str(jsonl),
+                    "--require-attempted-equals-buy",
+                    "--require-not-executable-zero",
+                    "--min-attempt-coverage",
+                    "0.95",
+                ]
+            )
+        )
+
+    def test_selector_regression_gate_accepts_r18c_bcv2_handoff_fixture(self) -> None:
+        fixture = self.r18c_regression_fixture_dir()
+
+        report = self.run_selector_regression_gate(
+            fixture / "audit_pass.json",
+            fixture / "shadow_buys.jsonl",
+        )
+
+        self.assertEqual(report["status"], "PASS")
+        self.assertEqual(report["metrics"]["buy_rows"], 2)
+        self.assertEqual(report["metrics"]["attempted_rows"], 2)
+        self.assertEqual(report["metrics"]["not_executable_route_rows"], 0)
+        self.assertGreaterEqual(report["metrics"]["attempt_coverage"], 0.95)
+        self.assertTrue(report["config_guard"]["normal_bonding_curve_load_required"])
+        self.assertFalse(report["fail_reasons"])
+
+    def test_selector_regression_gate_rejects_not_executable_r18c_fixture(self) -> None:
+        fixture = self.r18c_regression_fixture_dir()
+        audit = read_jsonl(fixture / "shadow_buys.jsonl")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            audit_json = json.loads((fixture / "audit_pass.json").read_text(encoding="utf-8"))
+            audit_json["metrics"]["shadow_simulation_attempted_rows"] = 1
+            audit_json["metrics"]["not_executable_route_rows"] = 1
+            audit_json["metrics"]["simulation_attempt_coverage"] = 0.5
+            audit_path = tmp / "audit.json"
+            audit_path.write_text(json.dumps(audit_json), encoding="utf-8")
+            write_jsonl(tmp / "rows.jsonl", audit)
+
+            report = self.run_selector_regression_gate(audit_path, tmp / "rows.jsonl")
+
+        self.assertEqual(report["status"], "FAIL")
+        self.assertIn("not_executable_route_rows_nonzero", report["fail_reasons"])
+        self.assertIn("attempted_rows_not_equal_buy_rows", report["fail_reasons"])
+        self.assertIn("attempt_coverage_below_minimum", report["fail_reasons"])
+
+    def test_selector_regression_gate_rejects_selected_fallback_without_route_kind(self) -> None:
+        fixture = self.r18c_regression_fixture_dir()
+        rows = read_jsonl(fixture / "shadow_buys.jsonl")
+        rows[0]["selected_route_kind"] = None
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            write_jsonl(tmp / "rows.jsonl", rows)
+
+            report = self.run_selector_regression_gate(
+                fixture / "audit_pass.json",
+                tmp / "rows.jsonl",
+            )
+
+        self.assertEqual(report["status"], "FAIL")
+        self.assertIn(
+            "forbidden_marker_present:selected_route_kind=None for selected_fallback_route_execution_handoff",
+            report["fail_reasons"],
+        )
+
+    def test_selector_regression_gate_rejects_stale_bcv2_reason_when_fatal(self) -> None:
+        fixture = self.r18c_regression_fixture_dir()
+        rows = read_jsonl(fixture / "shadow_buys.jsonl")
+        rows[0]["fatal_reasons_after_final_manifest_validation"] = [
+            "primary_route_bcv2_missing"
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            write_jsonl(tmp / "rows.jsonl", rows)
+
+            report = self.run_selector_regression_gate(
+                fixture / "audit_pass.json",
+                tmp / "rows.jsonl",
+            )
+
+        self.assertEqual(report["status"], "FAIL")
+        self.assertIn(
+            "forbidden_marker_present:primary_route_bcv2_missing fatal after final handoff",
+            report["fail_reasons"],
+        )
+
+    def test_selector_regression_gate_rejects_bcv2_missing_rpc_precheck(self) -> None:
+        fixture = self.r18c_regression_fixture_dir()
+        rows = read_jsonl(fixture / "shadow_buys.jsonl")
+        rows[0]["simulation_account_manifest"][1][
+            "precheck_rpc_load_status"
+        ] = "missing_on_rpc_precheck"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            write_jsonl(tmp / "rows.jsonl", rows)
+
+            report = self.run_selector_regression_gate(
+                fixture / "audit_pass.json",
+                tmp / "rows.jsonl",
+            )
+
+        self.assertEqual(report["status"], "FAIL")
+        self.assertIn(
+            "forbidden_marker_present:missing_on_rpc_precheck for bonding_curve_v2",
+            report["fail_reasons"],
+        )
+
+    def test_selector_regression_gate_rejects_meta_only_on_normal_bonding_curve(self) -> None:
+        fixture = self.r18c_regression_fixture_dir()
+        rows = read_jsonl(fixture / "shadow_buys.jsonl")
+        rows[0]["simulation_account_manifest"][0][
+            "precheck_rpc_load_status"
+        ] = "BCV2_LOAD_NOT_REQUIRED"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            write_jsonl(tmp / "rows.jsonl", rows)
+
+            report = self.run_selector_regression_gate(
+                fixture / "audit_pass.json",
+                tmp / "rows.jsonl",
+            )
+
+        self.assertEqual(report["status"], "FAIL")
+        self.assertFalse(report["config_guard"]["normal_bonding_curve_load_required"])
+        self.assertIn(
+            "forbidden_marker_present:BCV2 meta-only applied to normal bonding_curve",
+            report["fail_reasons"],
+        )
+
+    def test_selector_regression_gate_rejects_can_unlock_execution(self) -> None:
+        fixture = self.r18c_regression_fixture_dir()
+        rows = read_jsonl(fixture / "shadow_buys.jsonl")
+        rows[0]["can_unlock_execution"] = True
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            write_jsonl(tmp / "rows.jsonl", rows)
+
+            report = self.run_selector_regression_gate(
+                fixture / "audit_pass.json",
+                tmp / "rows.jsonl",
+            )
+
+        self.assertEqual(report["status"], "FAIL")
+        self.assertIn(
+            "forbidden_marker_present:can_unlock_execution=true",
+            report["fail_reasons"],
+        )
+
     def run_route_evidence_join_report(self, root: Path, scope: str) -> dict:
         return route_evidence_join.build_report(
             route_evidence_join.build_parser().parse_args(
@@ -3904,6 +4074,38 @@ class SelectorPipelineTests(unittest.TestCase):
                     str(root),
                     "--decision-plane",
                     "legacy_live",
+                ]
+            )
+        )
+
+    def run_route_manifest_reuse_projection(self, root: Path, scope: str) -> dict:
+        return route_manifest_reuse.build_report(
+            route_manifest_reuse.build_parser().parse_args(
+                [
+                    "--scope",
+                    scope,
+                    "--root",
+                    str(root),
+                    "--decision-plane",
+                    "legacy_live",
+                    "--raw-transaction-evidence-glob",
+                    f"datasets/events/{scope}/raw_route_evidence.jsonl",
+                ]
+            )
+        )
+
+    def run_coverage_breakthrough_projection(self, root: Path, scope: str) -> dict:
+        return coverage_breakthrough.build_report(
+            coverage_breakthrough.build_parser().parse_args(
+                [
+                    "--scope",
+                    scope,
+                    "--root",
+                    str(root),
+                    "--decision-plane",
+                    "legacy_live",
+                    "--raw-transaction-evidence-glob",
+                    f"datasets/events/{scope}/raw_route_evidence.jsonl",
                 ]
             )
         )
@@ -3977,6 +4179,8 @@ class SelectorPipelineTests(unittest.TestCase):
             "pool1",
             associated_bonding_curve,
             "user1",
+            "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+            "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
             *remaining_accounts,
         ]
         account_keys = ["unused0", *ordered_accounts]
@@ -3987,17 +4191,24 @@ class SelectorPipelineTests(unittest.TestCase):
             "tx_index": None,
             "ix_index": ix_index,
             "route_kind": "legacy_buy",
+            "mint": "mint1",
             "program_id": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+            "account_manifest_hash": "manifest1",
             "account_keys": account_keys,
             "compiled_instruction_account_indices": list(range(1, len(account_keys))),
             "remaining_accounts": remaining_accounts,
+            "remaining_accounts_count": len(remaining_accounts),
+            "has_legacy_tail": len(remaining_accounts) == 2,
             "resolver_validation_status": resolver_validation_status,
+            "can_unlock_execution": False,
             "named_accounts": [
                 {"role": "global", "pubkey": "global1"},
                 {"role": "mint", "pubkey": "mint1"},
                 {"role": "bonding_curve", "pubkey": "pool1"},
                 {"role": "associated_bonding_curve", "pubkey": associated_bonding_curve},
                 {"role": "user", "pubkey": "user1"},
+                {"role": "token_program", "pubkey": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"},
+                {"role": "program", "pubkey": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"},
             ],
         }
 
@@ -4174,6 +4385,235 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertEqual(joined[0]["conflict_field"], "associated_bonding_curve")
         self.assertEqual(outliers[0]["program_stream_value"], "abc1")
         self.assertEqual(outliers[0]["raw_gRPC_value"], "different_abc")
+
+    def test_route_manifest_reuse_projects_tail_recovery_without_unlock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "route-manifest-reuse-tail"
+            buy = {
+                "pool_id": "pool1",
+                "base_mint": "mint1",
+                "ab_record_id": "pool1:mint1:BUY",
+                "shadow_execution_outcome": "shadow_unknown_error",
+            }
+            shadow = {
+                "record_type": "shadow_dispatch",
+                "pool_id": "pool1",
+                "mint_id": "mint1",
+                "ab_record_id": "pool1:mint1:BUY",
+                "decision_plane": "legacy_live",
+                "decision_ts_ms": 2000,
+                "rpc_slot": 20,
+                "dispatch_status": "not_dispatched",
+                "simulation_outcome": "not_attempted",
+                "execution_feasibility_status": "not_executable_route",
+                "route_resolution_status": "no_executable_route_account_set",
+                "dispatch_attempted": False,
+                "simulation_attempted": False,
+                "fallback_route_kind": "legacy_buy",
+                "fallback_route_attempted": True,
+                "legacy_buy_curve_pubkey": "pool1",
+                "legacy_buy_associated_bonding_curve_pubkey": "abc1",
+                "selected_route_account_set_roles": [
+                    "bonding_curve:pool1:account_state_core",
+                    "associated_bonding_curve:abc1:account_overrides",
+                    "token_program:TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb:token_program",
+                ],
+                "precheck_failure_reason": (
+                    "no_executable_route_account_set:"
+                    "legacy_buy_missing_buyback_remaining_accounts:count=0:expected=2"
+                ),
+            }
+            self.write_simcov_fixture(root, scope=scope, buy_rows=[buy], shadow_rows=[shadow])
+            self.write_raw_route_evidence(root, scope, [self.raw_route_evidence(slot=10)])
+
+            report = self.run_route_manifest_reuse_projection(root, scope)
+            rows = read_jsonl(Path(report["outputs"]["projection_rows"]))
+            store = read_jsonl(Path(report["outputs"]["manifest_store"]))
+
+        self.assertEqual(report["baseline"]["buy_rows"], 1)
+        self.assertEqual(report["manifest_store"]["clean_manifest_rows"], 1)
+        self.assertEqual(report["projection"]["not_executable_rows_matched_by_manifest"], 1)
+        self.assertEqual(report["projection"]["LEGACY_TAIL_MISSING_rows_recoverable"], 1)
+        self.assertEqual(report["projection"]["projected_attempt_coverage"]["display"], "1 / 1 = 100.00%")
+        self.assertEqual(rows[0]["manifest_lookup_status"], "exact_pool_route_manifest_found")
+        self.assertEqual(rows[0]["projected_attempt_status"], "would_be_route_materializable_offline")
+        self.assertTrue(rows[0]["recoverable_by_manifest"])
+        self.assertFalse(rows[0]["can_unlock_execution"])
+        self.assertFalse(store[0]["can_unlock_execution"])
+        self.assertFalse(report["claim_boundaries"]["observed_manifest_store_can_unlock_execution"])
+
+    def test_route_manifest_reuse_keeps_state_readiness_as_separate_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "route-manifest-reuse-state"
+            buy = {
+                "pool_id": "pool1",
+                "base_mint": "mint1",
+                "ab_record_id": "pool1:mint1:BUY",
+                "shadow_execution_outcome": "shadow_unknown_error",
+            }
+            shadow = {
+                "record_type": "shadow_dispatch",
+                "pool_id": "pool1",
+                "mint_id": "mint1",
+                "ab_record_id": "pool1:mint1:BUY",
+                "decision_plane": "legacy_live",
+                "decision_ts_ms": 2000,
+                "rpc_slot": 20,
+                "dispatch_status": "not_dispatched",
+                "simulation_outcome": "not_attempted",
+                "execution_feasibility_status": "not_executable_route",
+                "route_resolution_status": "no_executable_route_account_set",
+                "dispatch_attempted": False,
+                "simulation_attempted": False,
+                "primary_route_kind": "legacy_buy",
+                "legacy_buy_curve_pubkey": "pool1",
+                "legacy_buy_associated_bonding_curve_pubkey": "abc1",
+                "selected_route_account_set_roles": [
+                    "bonding_curve:pool1:account_state_core",
+                    "associated_bonding_curve:abc1:account_overrides",
+                    "token_program:TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb:token_program",
+                ],
+                "precheck_failure_reason": (
+                    "no_executable_route_account_set:"
+                    "legacy_buy_simulation_load_not_ready:bonding_curve:pool1"
+                ),
+            }
+            self.write_simcov_fixture(root, scope=scope, buy_rows=[buy], shadow_rows=[shadow])
+            self.write_raw_route_evidence(root, scope, [self.raw_route_evidence(slot=10)])
+            (root / "logs" / "rollout" / scope / "system.log").write_text(
+                "DIAG_ACCOUNT_UPDATE_RELAY pool1\n",
+                encoding="utf-8",
+            )
+
+            report = self.run_route_manifest_reuse_projection(root, scope)
+            rows = read_jsonl(Path(report["outputs"]["projection_rows"]))
+            state_rows = read_jsonl(Path(report["outputs"]["state_readiness_audit"]))
+
+        self.assertEqual(report["baseline"]["root_cause_counts"]["ROUTE_INCOMPLETE_STATE_NOT_READY"], 1)
+        self.assertEqual(report["projection"]["not_executable_rows_matched_by_manifest"], 0)
+        self.assertEqual(report["projection"]["STATE_NOT_READY_rows_recoverable"], 0)
+        self.assertEqual(report["projection"]["rows_blocked_by_state_readiness"], 1)
+        self.assertEqual(rows[0]["manifest_lookup_status"], "exact_pool_route_manifest_found")
+        self.assertEqual(rows[0]["projected_attempt_status"], "blocked_by_state_readiness")
+        self.assertFalse(rows[0]["recoverable_by_manifest"])
+        self.assertEqual(report["state_readiness"]["state_rows_with_diag_update"], 1)
+        self.assertEqual(state_rows[0]["state_readiness_diagnosis"], "diag_update_seen_but_timing_unverified")
+
+    def test_coverage_breakthrough_projects_state_hold_windows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "coverage-breakthrough-state"
+            buy = {
+                "pool_id": "pool1",
+                "base_mint": "mint1",
+                "ab_record_id": "pool1:mint1:BUY",
+                "shadow_execution_outcome": "shadow_unknown_error",
+            }
+            shadow = {
+                "record_type": "shadow_dispatch",
+                "pool_id": "pool1",
+                "mint_id": "mint1",
+                "ab_record_id": "pool1:mint1:BUY",
+                "decision_plane": "legacy_live",
+                "decision_ts_ms": 1780824550000,
+                "dispatch_status": "not_dispatched",
+                "simulation_outcome": "not_attempted",
+                "execution_feasibility_status": "not_executable_route",
+                "route_resolution_status": "no_executable_route_account_set",
+                "dispatch_attempted": False,
+                "simulation_attempted": False,
+                "primary_route_kind": "legacy_buy",
+                "legacy_buy_curve_pubkey": "pool1",
+                "legacy_buy_associated_bonding_curve_pubkey": "abc1",
+                "selected_route_account_set_roles": [
+                    "bonding_curve:pool1:account_state_core",
+                    "associated_bonding_curve:abc1:account_overrides",
+                    "token_program:TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb:token_program",
+                ],
+                "precheck_failure_reason": (
+                    "no_executable_route_account_set:"
+                    "legacy_buy_simulation_load_not_ready:bonding_curve:pool1"
+                ),
+            }
+            self.write_simcov_fixture(root, scope=scope, buy_rows=[buy], shadow_rows=[shadow])
+            self.write_raw_route_evidence(root, scope, [self.raw_route_evidence(slot=10)])
+            (root / "logs" / "rollout" / scope / "system.log").write_text(
+                "2026-06-07T09:29:10.040Z INFO DIAG_ACCOUNT_UPDATE_RELAY "
+                "base_mint=mint1 bonding_curve=pool1 slot=20 sol_reserves=1 token_reserves=2 complete=0\n",
+                encoding="utf-8",
+            )
+
+            report = self.run_coverage_breakthrough_projection(root, scope)
+            state_rows = read_jsonl(Path(report["outputs"]["state_rows"]))
+
+        self.assertEqual(report["state_projection"]["state_not_ready_rows"], 1)
+        self.assertEqual(
+            state_rows[0]["projected_recoverability"],
+            "STATE_UPDATE_AFTER_DECISION_WITHIN_50MS",
+        )
+        self.assertFalse(state_rows[0]["recoverable_with_hold_ms"]["25"])
+        self.assertTrue(state_rows[0]["recoverable_with_hold_ms"]["50"])
+        self.assertEqual(report["state_projection"]["hold_windows"]["25ms"]["recovered_rows"], 0)
+        self.assertEqual(report["state_projection"]["hold_windows"]["50ms"]["recovered_rows"], 1)
+        self.assertEqual(report["combined_projection"]["hold_windows"]["50ms"]["attempted"]["display"], "1 / 1 = 100.00%")
+        self.assertEqual(report["claim_boundaries"]["can_unlock_execution_true_rows"], 0)
+
+    def test_coverage_breakthrough_role_split_ignores_user_derived_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "coverage-breakthrough-role-split"
+            buy = {
+                "pool_id": "pool1",
+                "base_mint": "mint1",
+                "ab_record_id": "pool1:mint1:BUY",
+                "shadow_execution_outcome": "shadow_unknown_error",
+            }
+            shadow = {
+                "record_type": "shadow_dispatch",
+                "pool_id": "pool1",
+                "mint_id": "mint1",
+                "ab_record_id": "pool1:mint1:BUY",
+                "decision_plane": "legacy_live",
+                "decision_ts_ms": 1780824550000,
+                "rpc_slot": 30,
+                "dispatch_status": "not_dispatched",
+                "simulation_outcome": "not_attempted",
+                "execution_feasibility_status": "not_executable_route",
+                "route_resolution_status": "no_executable_route_account_set",
+                "dispatch_attempted": False,
+                "simulation_attempted": False,
+                "fallback_route_kind": "legacy_buy",
+                "legacy_buy_curve_pubkey": "pool1",
+                "legacy_buy_associated_bonding_curve_pubkey": "abc1",
+                "selected_route_account_set_roles": [
+                    "bonding_curve:pool1:account_state_core",
+                    "associated_bonding_curve:abc1:account_overrides",
+                    "token_program:TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb:token_program",
+                ],
+                "precheck_failure_reason": (
+                    "no_executable_route_account_set:"
+                    "legacy_buy_missing_buyback_remaining_accounts:count=0:expected=2"
+                ),
+            }
+            raw_a = self.raw_route_evidence(signature="sig1", slot=10)
+            raw_b = self.raw_route_evidence(signature="sig2", slot=11)
+            raw_a["named_accounts"].append({"role": "user_volume_accumulator", "pubkey": "uva1"})
+            raw_b["named_accounts"].append({"role": "user_volume_accumulator", "pubkey": "uva2"})
+            self.write_simcov_fixture(root, scope=scope, buy_rows=[buy], shadow_rows=[shadow])
+            self.write_raw_route_evidence(root, scope, [raw_a, raw_b])
+
+            report = self.run_coverage_breakthrough_projection(root, scope)
+            conflict_rows = read_jsonl(Path(report["outputs"]["conflict_rows"]))
+
+        self.assertEqual(report["baseline"]["projected_after_R14_attempted"]["display"], "0 / 1 = 0.00%")
+        self.assertEqual(report["conflict_role_split"]["conflict_rows_before_role_split"], 1)
+        self.assertEqual(report["conflict_role_split"]["blocked_by_conflict_recoverable_after_role_split"], 1)
+        self.assertEqual(report["conflict_role_split"]["attempted_after_role_split"]["display"], "1 / 1 = 100.00%")
+        self.assertEqual(conflict_rows[0]["role_split_lookup_status"], "pool_static_manifest_found")
+        self.assertTrue(conflict_rows[0]["recoverable_after_role_split"])
+        self.assertFalse(conflict_rows[0]["can_unlock_execution"])
 
     def test_buy_simulation_audit_classifies_not_executable_legacy_tail_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
