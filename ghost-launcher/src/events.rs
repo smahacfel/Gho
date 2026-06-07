@@ -459,6 +459,52 @@ pub struct ShadowSimulationAccountDiagnostics {
     pub account_set_match: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_set_mismatch_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_latch_eligibility_marker: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_latch_eligibility_checked: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_latch_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_latch_bonding_curve_present: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_latch_decision_ts_ms_present: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_latch_normalized_error_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_latch_eligible: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_latch_skip_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_latch_attempted: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_latch_outcome: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_latch_wait_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_latch_mint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_latch_bonding_curve: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_latch_route_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_latch_decision_ts_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_latch_decision_slot: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_latch_first_update_ts_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_latch_first_update_slot: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_latch_state_before: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_latch_state_after: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_latch_original_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_latch_error_after_latch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub can_unlock_execution: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accounts_only_in_precheck: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

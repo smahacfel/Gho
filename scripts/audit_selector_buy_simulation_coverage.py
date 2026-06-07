@@ -547,6 +547,29 @@ def error_text(buy: dict[str, Any], shadow: dict[str, Any] | None) -> str | None
     return str(value) if value not in (None, "") else None
 
 
+def latch_eligibility_checked(row: dict[str, Any] | None) -> bool:
+    if not isinstance(row, dict):
+        return False
+    return (
+        row.get("state_latch_eligibility_checked") is True
+        or row.get("state_latch_eligibility_marker") == "STATE_LATCH_ELIGIBILITY_CHECKED"
+    )
+
+
+def latch_attempted(row: dict[str, Any] | None) -> bool:
+    return bool(isinstance(row, dict) and row.get("state_latch_attempted") is True)
+
+
+def latch_skipped(row: dict[str, Any] | None) -> bool:
+    if not isinstance(row, dict):
+        return False
+    skip_reason = common.str_or_none(row.get("state_latch_skip_reason"))
+    outcome = common.str_or_none(row.get("state_latch_outcome"))
+    return bool(skip_reason and skip_reason.startswith("STATE_LATCH_SKIPPED_")) or bool(
+        outcome and outcome.startswith("STATE_LATCH_SKIPPED_")
+    )
+
+
 def sample_row(
     *,
     buy: dict[str, Any],
@@ -653,6 +676,17 @@ def sample_row(
             cache_lookup.get("route_account_manifest_source") if cache_lookup else None
         ),
         "manifest_cache_lookup_phase": cache_lookup.get("phase") if cache_lookup else None,
+        "state_latch_eligibility_marker": shadow.get("state_latch_eligibility_marker") if shadow else None,
+        "state_latch_eligibility_checked": shadow.get("state_latch_eligibility_checked") if shadow else None,
+        "state_latch_enabled": shadow.get("state_latch_enabled") if shadow else None,
+        "state_latch_normalized_error_class": shadow.get("state_latch_normalized_error_class") if shadow else None,
+        "state_latch_eligible": shadow.get("state_latch_eligible") if shadow else None,
+        "state_latch_skip_reason": shadow.get("state_latch_skip_reason") if shadow else None,
+        "state_latch_attempted": shadow.get("state_latch_attempted") if shadow else None,
+        "state_latch_outcome": shadow.get("state_latch_outcome") if shadow else None,
+        "state_latch_wait_ms": shadow.get("state_latch_wait_ms") if shadow else None,
+        "state_latch_state_before": shadow.get("state_latch_state_before") if shadow else None,
+        "state_latch_state_after": shadow.get("state_latch_state_after") if shadow else None,
         "raw_shadow_source_line": shadow.get("_source_line") if shadow else None,
         "raw_buy_source_line": buy.get("_source_line"),
     }
@@ -736,6 +770,29 @@ def build_markdown(report: dict[str, Any]) -> str:
             lines.append(f"| `{klass}` | {payload['count']} | {payload['rate']:.6f} |")
     else:
         lines.append("| `none` | 0 | 0.000000 |")
+    latch = report.get("state_latch_contract") or {}
+    lines.extend(
+        [
+            "",
+            "## State Latch Contract",
+            "",
+            f"- contract_status: `{latch.get('contract_status', 'UNKNOWN')}`",
+            f"- state_not_ready_rows: `{latch.get('state_not_ready_rows', 0)}`",
+            f"- state_latch_eligibility_checked_rows: `{latch.get('state_latch_eligibility_checked_rows', 0)}`",
+            f"- state_latch_attempted_rows: `{latch.get('state_latch_attempted_rows', 0)}`",
+            f"- state_latch_skipped_rows: `{latch.get('state_latch_skipped_rows', 0)}`",
+            f"- state_not_ready_latch_marker_missing_rows: `{latch.get('state_not_ready_latch_marker_missing_rows', 0)}`",
+            "",
+            "| outcome | count |",
+            "|---|---:|",
+        ]
+    )
+    outcomes = latch.get("state_latch_outcomes") or {}
+    if outcomes:
+        for outcome, count in outcomes.items():
+            lines.append(f"| `{outcome}` | {count} |")
+    else:
+        lines.append("| `none` | 0 |")
     lines.extend(
         [
             "",
@@ -808,12 +865,29 @@ def build_audit(args: argparse.Namespace) -> dict[str, Any]:
     position_limit_rows = 0
     diagnostic_missing_fields: Counter[str] = Counter()
     joined_shadow_rows: list[dict[str, Any]] = []
+    latch_eligibility_checked_rows = 0
+    latch_attempted_rows = 0
+    latch_skipped_rows = 0
+    state_not_ready_rows = 0
+    state_not_ready_latch_marker_missing_rows = 0
+    state_latch_outcomes: Counter[str] = Counter()
+    state_latch_skip_reasons: Counter[str] = Counter()
 
     for buy in buy_rows:
         shadow = find_shadow_for_buy(dispatch_index, buy)
         if shadow:
             joined_shadow_rows.append(shadow)
             shadow_dispatch_row_count += 1
+            if latch_eligibility_checked(shadow):
+                latch_eligibility_checked_rows += 1
+            if latch_attempted(shadow):
+                latch_attempted_rows += 1
+            if latch_skipped(shadow):
+                latch_skipped_rows += 1
+            if shadow.get("state_latch_outcome") not in (None, ""):
+                state_latch_outcomes[str(shadow.get("state_latch_outcome"))] += 1
+            if shadow.get("state_latch_skip_reason") not in (None, ""):
+                state_latch_skip_reasons[str(shadow.get("state_latch_skip_reason"))] += 1
         success = simulation_success(buy, shadow)
         if success:
             shadow_simulated_rows += 1
@@ -831,6 +905,14 @@ def build_audit(args: argparse.Namespace) -> dict[str, Any]:
         if not success:
             classification, secondary = classify_failure(buy, shadow)
             class_counts[classification] += 1
+            state_not_ready = (
+                classification == "ROUTE_INCOMPLETE_STATE_NOT_READY"
+                or "ROUTE_INCOMPLETE_STATE_NOT_READY" in secondary
+            )
+            if state_not_ready:
+                state_not_ready_rows += 1
+                if not latch_eligibility_checked(shadow):
+                    state_not_ready_latch_marker_missing_rows += 1
             if classification == "POSITION_LIMIT_REACHED":
                 position_limit_rows += 1
             elif "max concurrent positions reached" in text_blob(buy, shadow).lower():
@@ -895,6 +977,8 @@ def build_audit(args: argparse.Namespace) -> dict[str, Any]:
         fail_reasons.append("unknown_unclassified_rate_above_limit")
     if simulation_failed_rows and diagnostic_missing_fields:
         fail_reasons.append("INSUFFICIENT_SIMULATION_DIAGNOSTICS")
+    if state_not_ready_latch_marker_missing_rows:
+        fail_reasons.append("STATE_LATCH_MARKER_MISSING_FOR_STATE_NOT_READY")
     for marker, count in marker_row_counts.items():
         if marker in ("AccountNotFound", "unsupported_legacy_buy_layout_requires_bcv2", "Custom(6062)", "0x17ae", "ResourceExhausted", "relative URL without a base") and count > 0:
             fail_reasons.append(f"critical_marker_present:{marker}")
@@ -941,6 +1025,22 @@ def build_audit(args: argparse.Namespace) -> dict[str, Any]:
         "route_manifest_cache": {
             "lookup_rows": sum(len(rows) for rows in route_cache_lookup_index.values()),
             "classes": route_manifest_cache_classes,
+        },
+        "state_latch_contract": {
+            "state_not_ready_rows": state_not_ready_rows,
+            "state_latch_eligibility_checked_rows": latch_eligibility_checked_rows,
+            "state_latch_attempted_rows": latch_attempted_rows,
+            "state_latch_skipped_rows": latch_skipped_rows,
+            "state_latch_attempted_plus_skipped_rows": latch_attempted_rows + latch_skipped_rows,
+            "state_not_ready_latch_marker_missing_rows": state_not_ready_latch_marker_missing_rows,
+            "state_latch_outcomes": common.counter_dict(state_latch_outcomes),
+            "state_latch_skip_reasons": common.counter_dict(state_latch_skip_reasons),
+            "contract_status": (
+                "PASS"
+                if state_not_ready_latch_marker_missing_rows == 0
+                and latch_attempted_rows + latch_skipped_rows == latch_eligibility_checked_rows
+                else "FAIL"
+            ),
         },
         "critical_regression_markers": marker_row_counts,
         "critical_regression_marker_occurrences": marker_occurrence_counts,

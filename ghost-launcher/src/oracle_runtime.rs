@@ -20,8 +20,8 @@ use crate::components::post_buy_runtime::{
 };
 use crate::components::trigger::safety::{PositionSlotId, SafetyViolation};
 use crate::config::{
-    ExecutionMode, P37ShadowProbeConfig, SessionRuntimeConfig, ShadowLedgerConfig,
-    TxIntelligenceRuntimeConfig,
+    ExecutionMode, P37ShadowProbeConfig, SelectorRuntimeConfig, SelectorStateReadinessLatchConfig,
+    SessionRuntimeConfig, ShadowLedgerConfig, TxIntelligenceRuntimeConfig,
 };
 use crate::events::{
     AccountUpdateEvent, DetectedPool, EventBusSender, ExecutionJoinMetadata,
@@ -1842,6 +1842,7 @@ pub struct OracleRuntimeConfig {
     pub tx_intelligence: TxIntelligenceRuntimeConfig,
     pub funding_source_config: FundingSourceConfig,
     pub p37_shadow_probe: P37ShadowProbeConfig,
+    pub selector: SelectorRuntimeConfig,
     pub run_id: Option<String>,
     pub session_id: Option<String>,
     pub brain_config_path: Option<String>,
@@ -1889,6 +1890,7 @@ impl OracleRuntimeConfig {
                 &GatekeeperV2Config::default(),
             ),
             p37_shadow_probe: P37ShadowProbeConfig::default(),
+            selector: SelectorRuntimeConfig::default(),
             run_id: None,
             session_id: None,
             brain_config_path: None,
@@ -1907,6 +1909,7 @@ impl OracleRuntimeConfig {
                 &GatekeeperV2Config::default(),
             ),
             p37_shadow_probe: P37ShadowProbeConfig::default(),
+            selector: SelectorRuntimeConfig::default(),
             run_id: None,
             session_id: None,
             brain_config_path: None,
@@ -1966,6 +1969,7 @@ impl Default for OracleRuntimeConfig {
                 &GatekeeperV2Config::default(),
             ),
             p37_shadow_probe: P37ShadowProbeConfig::default(),
+            selector: SelectorRuntimeConfig::default(),
             run_id: None,
             session_id: None,
             brain_config_path: None,
@@ -7514,6 +7518,29 @@ fn p37_shadow_probe_artifact_records(
         simulation_account_set_count: None,
         account_set_match: None,
         account_set_mismatch_reason: None,
+        state_latch_eligibility_marker: None,
+        state_latch_eligibility_checked: None,
+        state_latch_enabled: None,
+        state_latch_bonding_curve_present: None,
+        state_latch_decision_ts_ms_present: None,
+        state_latch_normalized_error_class: None,
+        state_latch_eligible: None,
+        state_latch_skip_reason: None,
+        state_latch_attempted: None,
+        state_latch_outcome: None,
+        state_latch_wait_ms: None,
+        state_latch_mint: None,
+        state_latch_bonding_curve: None,
+        state_latch_route_kind: None,
+        state_latch_decision_ts_ms: None,
+        state_latch_decision_slot: None,
+        state_latch_first_update_ts_ms: None,
+        state_latch_first_update_slot: None,
+        state_latch_state_before: None,
+        state_latch_state_after: None,
+        state_latch_original_error: None,
+        state_latch_error_after_latch: None,
+        can_unlock_execution: None,
         probe_entry_materialization_status: Some("transport_only".to_string()),
         probe_lifecycle_eligibility_status: Some("not_lifecycle_eligible".to_string()),
         active_shadow_precheck_status: None,
@@ -12675,6 +12702,29 @@ fn active_shadow_account_diagnostics_from_account_set_with_mode(
             .and_then(|diagnostics| diagnostics.account_set_match),
         account_set_mismatch_reason: account_set_diagnostics
             .and_then(|diagnostics| diagnostics.account_set_mismatch_reason.clone()),
+        state_latch_eligibility_marker: None,
+        state_latch_eligibility_checked: None,
+        state_latch_enabled: None,
+        state_latch_bonding_curve_present: None,
+        state_latch_decision_ts_ms_present: None,
+        state_latch_normalized_error_class: None,
+        state_latch_eligible: None,
+        state_latch_skip_reason: None,
+        state_latch_attempted: None,
+        state_latch_outcome: None,
+        state_latch_wait_ms: None,
+        state_latch_mint: None,
+        state_latch_bonding_curve: None,
+        state_latch_route_kind: None,
+        state_latch_decision_ts_ms: None,
+        state_latch_decision_slot: None,
+        state_latch_first_update_ts_ms: None,
+        state_latch_first_update_slot: None,
+        state_latch_state_before: None,
+        state_latch_state_after: None,
+        state_latch_original_error: None,
+        state_latch_error_after_latch: None,
+        can_unlock_execution: None,
         accounts_only_in_precheck: account_set_diagnostics
             .map(|diagnostics| diagnostics.accounts_only_in_precheck.clone())
             .unwrap_or_default(),
@@ -12731,6 +12781,69 @@ fn active_shadow_account_diagnostics_without_request(
         None,
         "not_run_no_prepared_request",
     )
+}
+
+fn merge_state_latch_diagnostics(
+    mut base: crate::events::ShadowSimulationAccountDiagnostics,
+    latch: &crate::events::ShadowSimulationAccountDiagnostics,
+) -> crate::events::ShadowSimulationAccountDiagnostics {
+    base.state_latch_eligibility_marker = latch
+        .state_latch_eligibility_marker
+        .clone()
+        .or(base.state_latch_eligibility_marker);
+    base.state_latch_eligibility_checked = latch
+        .state_latch_eligibility_checked
+        .or(base.state_latch_eligibility_checked);
+    base.state_latch_enabled = latch.state_latch_enabled.or(base.state_latch_enabled);
+    base.state_latch_bonding_curve_present = latch
+        .state_latch_bonding_curve_present
+        .or(base.state_latch_bonding_curve_present);
+    base.state_latch_decision_ts_ms_present = latch
+        .state_latch_decision_ts_ms_present
+        .or(base.state_latch_decision_ts_ms_present);
+    base.state_latch_normalized_error_class = latch
+        .state_latch_normalized_error_class
+        .clone()
+        .or(base.state_latch_normalized_error_class);
+    base.state_latch_eligible = latch.state_latch_eligible.or(base.state_latch_eligible);
+    base.state_latch_skip_reason = latch
+        .state_latch_skip_reason
+        .clone()
+        .or(base.state_latch_skip_reason);
+    base.state_latch_attempted = latch.state_latch_attempted;
+    base.state_latch_outcome = latch.state_latch_outcome.clone();
+    base.state_latch_wait_ms = latch.state_latch_wait_ms;
+    base.state_latch_mint = latch.state_latch_mint.clone();
+    base.state_latch_bonding_curve = latch.state_latch_bonding_curve.clone();
+    base.state_latch_route_kind = latch.state_latch_route_kind.clone();
+    base.state_latch_decision_ts_ms = latch.state_latch_decision_ts_ms;
+    base.state_latch_decision_slot = latch.state_latch_decision_slot;
+    base.state_latch_first_update_ts_ms = latch.state_latch_first_update_ts_ms;
+    base.state_latch_first_update_slot = latch.state_latch_first_update_slot;
+    base.state_latch_state_before = latch.state_latch_state_before.clone();
+    base.state_latch_state_after = latch.state_latch_state_after.clone();
+    base.state_latch_original_error = latch.state_latch_original_error.clone();
+    base.state_latch_error_after_latch = latch.state_latch_error_after_latch.clone();
+    base.can_unlock_execution = latch.can_unlock_execution.or(base.can_unlock_execution);
+    base.dispatch_attempted = latch.dispatch_attempted.or(base.dispatch_attempted);
+    base.simulation_attempted = latch.simulation_attempted.or(base.simulation_attempted);
+    base.active_shadow_precheck_status = latch
+        .active_shadow_precheck_status
+        .clone()
+        .or(base.active_shadow_precheck_status);
+    base
+}
+
+fn merge_optional_state_latch_diagnostics(
+    base: Option<crate::events::ShadowSimulationAccountDiagnostics>,
+    latch: Option<crate::events::ShadowSimulationAccountDiagnostics>,
+) -> Option<crate::events::ShadowSimulationAccountDiagnostics> {
+    match (base, latch) {
+        (Some(base), Some(latch)) => Some(merge_state_latch_diagnostics(base, &latch)),
+        (Some(base), None) => Some(base),
+        (None, Some(latch)) => Some(latch),
+        (None, None) => None,
+    }
 }
 
 fn p37_shadow_probe_account_role(
@@ -18065,6 +18178,7 @@ async fn execute_gatekeeper_buy_path(
                         Some(join_metadata),
                         working_builder_parity_mode,
                         working_builder_execution_evidence_context,
+                        &ctx.oracle_runtime.config.selector.simcov.state_readiness_latch,
                     )
                     .await;
                     match apply_trigger_dispatch_receipt_with_builder_mode(
@@ -18140,6 +18254,7 @@ async fn execute_gatekeeper_buy_via_trigger(
     tip_lamports: u64,
     tip_floor_telemetry: Option<crate::components::live_tx_sender::TipFloorResolutionTelemetry>,
 ) -> crate::components::trigger::TriggerDispatchReceipt {
+    let state_latch_config = SelectorStateReadinessLatchConfig::default();
     execute_gatekeeper_buy_via_trigger_with_fsc_gate(
         trigger_component,
         None,
@@ -18150,6 +18265,7 @@ async fn execute_gatekeeper_buy_via_trigger(
         None,
         false,
         None,
+        &state_latch_config,
     )
     .await
 }
@@ -18306,18 +18422,338 @@ struct P37WorkingBuilderExecutionEvidenceContext {
     bcv2_terminal_route_closure_enabled: bool,
 }
 
-async fn active_shadow_simulation_load_precheck_receipt(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StateReadinessLatchStatus {
+    Recovered,
+    NotRecovered,
+}
+
+#[derive(Debug, Clone)]
+struct StateReadinessSnapshotStatus {
+    status: String,
+    ready: bool,
+    first_update_ts_ms: Option<u64>,
+    first_update_slot: Option<u64>,
+}
+
+fn state_readiness_latch_metric(outcome: &str) {
+    increment_counter!("state_latch_attempts");
+    match outcome {
+        "STATE_LATCH_RECOVERED_BY_FRESH_READ" => {
+            increment_counter!("state_latch_recovered_by_fresh_read");
+        }
+        "STATE_LATCH_RECOVERED_AFTER_WAIT" => {
+            increment_counter!("state_latch_recovered_after_wait");
+        }
+        "STATE_LATCH_TIMEOUT" => {
+            increment_counter!("state_latch_timeout");
+        }
+        "STATE_LATCH_IDENTITY_INCOMPLETE" => {
+            increment_counter!("state_latch_identity_incomplete");
+        }
+        "STATE_LATCH_DECODE_MISSING" => {
+            increment_counter!("state_latch_decode_missing");
+        }
+        "STATE_LATCH_FAIL_CLOSED" => {
+            increment_counter!("state_latch_fail_closed");
+        }
+        _ => {}
+    }
+}
+
+fn state_readiness_latch_error_is_state_not_ready(reason: &str) -> bool {
+    let lower = reason.to_ascii_lowercase();
+    lower.contains("legacy_buy_simulation_load_not_ready")
+        || lower.contains("simulation_load_not_ready:bonding_curve")
+        || lower.contains("route_incomplete_state_not_ready")
+}
+
+fn state_readiness_latch_normalized_error_class(reason: &str) -> &'static str {
+    if state_readiness_latch_error_is_state_not_ready(reason) {
+        "ROUTE_INCOMPLETE_STATE_NOT_READY"
+    } else {
+        "NOT_STATE_NOT_READY"
+    }
+}
+
+fn state_readiness_latch_skip_metric(skip_reason: &str) {
+    increment_counter!("state_latch_skipped_total", "reason" => skip_reason.to_string());
+}
+
+fn state_readiness_latch_eligibility_diagnostics(
     trigger_component: &crate::components::trigger::TriggerComponent,
     request: &crate::components::trigger::PreparedBuyRequest,
+    original_error: &str,
+    config: &SelectorStateReadinessLatchConfig,
+) -> (
+    crate::events::ShadowSimulationAccountDiagnostics,
+    bool,
+) {
+    let route_kind = p37_shadow_probe_route_kind(Some(request));
+    let bonding_curve_present = request.account_overrides.legacy_buy_curve_pubkey.is_some();
+    let decision_ts_ms_present = request.decision_ts_ms > 0;
+    let error_is_state_not_ready = state_readiness_latch_error_is_state_not_ready(original_error);
+    let entry_mode_shadow_only = matches!(
+        trigger_component.entry_mode(),
+        crate::config::TriggerEntryMode::ShadowOnly
+    );
+    let skip_reason = if !config.enabled {
+        Some("STATE_LATCH_SKIPPED_CONFIG_DISABLED")
+    } else if config.mode != "shadow_only" {
+        Some("STATE_LATCH_SKIPPED_NOT_SHADOW_MODE")
+    } else if !entry_mode_shadow_only {
+        Some("STATE_LATCH_SKIPPED_ENTRY_MODE_NOT_SHADOW_ONLY")
+    } else if route_kind.as_deref() != Some("legacy_buy") {
+        Some("STATE_LATCH_SKIPPED_ROUTE_KIND_NOT_LEGACY_BUY")
+    } else if !bonding_curve_present {
+        Some("STATE_LATCH_SKIPPED_BONDING_CURVE_MISSING")
+    } else if !decision_ts_ms_present {
+        Some("STATE_LATCH_SKIPPED_DECISION_TS_MISSING")
+    } else if !error_is_state_not_ready {
+        Some("STATE_LATCH_SKIPPED_REASON_NOT_STATE_NOT_READY")
+    } else {
+        None
+    };
+    let eligible = skip_reason.is_none();
+    let diagnostics = crate::events::ShadowSimulationAccountDiagnostics {
+        state_latch_eligibility_marker: Some("STATE_LATCH_ELIGIBILITY_CHECKED".to_string()),
+        state_latch_eligibility_checked: Some(true),
+        state_latch_enabled: Some(config.enabled),
+        state_latch_bonding_curve_present: Some(bonding_curve_present),
+        state_latch_decision_ts_ms_present: Some(decision_ts_ms_present),
+        state_latch_normalized_error_class: Some(
+            state_readiness_latch_normalized_error_class(original_error).to_string(),
+        ),
+        state_latch_eligible: Some(eligible),
+        state_latch_skip_reason: skip_reason.map(str::to_string),
+        state_latch_attempted: Some(false),
+        state_latch_outcome: skip_reason.map(str::to_string),
+        state_latch_mint: Some(request.mint.to_string()),
+        state_latch_bonding_curve: request
+            .account_overrides
+            .legacy_buy_curve_pubkey
+            .map(|pubkey| pubkey.to_string()),
+        state_latch_route_kind: route_kind,
+        state_latch_decision_ts_ms: Some(request.decision_ts_ms),
+        state_latch_decision_slot: None,
+        state_latch_original_error: Some(original_error.to_string()),
+        state_latch_error_after_latch: Some(original_error.to_string()),
+        can_unlock_execution: Some(false),
+        ..Default::default()
+    };
+    if let Some(skip_reason) = diagnostics.state_latch_skip_reason.as_deref() {
+        state_readiness_latch_skip_metric(skip_reason);
+    }
+    (diagnostics, eligible)
+}
+
+async fn maybe_apply_state_readiness_latch_for_precheck(
+    trigger_component: &crate::components::trigger::TriggerComponent,
+    request: &mut crate::components::trigger::PreparedBuyRequest,
+    original_error: &str,
+    config: &SelectorStateReadinessLatchConfig,
+) -> StateReadinessLatchStatus {
+    let should_emit_eligibility =
+        config.enabled || state_readiness_latch_error_is_state_not_ready(original_error);
+    if !should_emit_eligibility {
+        return StateReadinessLatchStatus::NotRecovered;
+    }
+    let (eligibility_diagnostics, eligible) =
+        state_readiness_latch_eligibility_diagnostics(
+            trigger_component,
+            request,
+            original_error,
+            config,
+        );
+    if !eligible {
+        request.state_readiness_latch_diagnostics = Some(eligibility_diagnostics);
+        return StateReadinessLatchStatus::NotRecovered;
+    }
+    let (status, latch_diagnostics) =
+        run_state_readiness_latch(trigger_component, request, original_error, config).await;
+    request.state_readiness_latch_diagnostics = Some(merge_state_latch_diagnostics(
+        eligibility_diagnostics,
+        &latch_diagnostics,
+    ));
+    status
+}
+
+fn state_readiness_latch_snapshot_status(
+    trigger_component: &crate::components::trigger::TriggerComponent,
+    request: &crate::components::trigger::PreparedBuyRequest,
+    expected_bonding_curve: &Pubkey,
+) -> StateReadinessSnapshotStatus {
+    let Some(state) = trigger_component.canonical_pool_state(&request.mint) else {
+        return StateReadinessSnapshotStatus {
+            status: "canonical_state_missing".to_string(),
+            ready: false,
+            first_update_ts_ms: None,
+            first_update_slot: None,
+        };
+    };
+    if state.bonding_curve != *expected_bonding_curve {
+        return StateReadinessSnapshotStatus {
+            status: "bonding_curve_mismatch".to_string(),
+            ready: false,
+            first_update_ts_ms: Some(state.last_update_ts_ms),
+            first_update_slot: Some(state.last_update_slot),
+        };
+    }
+    if state.virtual_sol_reserves == 0 || state.virtual_token_reserves == 0 {
+        return StateReadinessSnapshotStatus {
+            status: "decoded_reserves_missing".to_string(),
+            ready: false,
+            first_update_ts_ms: Some(state.last_update_ts_ms),
+            first_update_slot: Some(state.last_update_slot),
+        };
+    }
+    if state.update_count == 0 {
+        return StateReadinessSnapshotStatus {
+            status: "state_store_insert_missing".to_string(),
+            ready: false,
+            first_update_ts_ms: Some(state.last_update_ts_ms),
+            first_update_slot: Some(state.last_update_slot),
+        };
+    }
+    StateReadinessSnapshotStatus {
+        status: format!(
+            "canonical_state_ready:phase={:?}:finality={:?}",
+            state.state_phase, state.curve_finality
+        ),
+        ready: true,
+        first_update_ts_ms: Some(state.last_update_ts_ms),
+        first_update_slot: Some(state.last_update_slot),
+    }
+}
+
+async fn run_state_readiness_latch(
+    trigger_component: &crate::components::trigger::TriggerComponent,
+    request: &crate::components::trigger::PreparedBuyRequest,
+    original_error: &str,
+    config: &SelectorStateReadinessLatchConfig,
+) -> (
+    StateReadinessLatchStatus,
+    crate::events::ShadowSimulationAccountDiagnostics,
+) {
+    let route_kind = p37_shadow_probe_route_kind(Some(request));
+    let mut diagnostics = crate::events::ShadowSimulationAccountDiagnostics {
+        state_latch_attempted: Some(true),
+        state_latch_mint: Some(request.mint.to_string()),
+        state_latch_bonding_curve: request
+            .account_overrides
+            .legacy_buy_curve_pubkey
+            .map(|pubkey| pubkey.to_string()),
+        state_latch_route_kind: route_kind.clone(),
+        state_latch_decision_ts_ms: Some(request.decision_ts_ms),
+        state_latch_decision_slot: None,
+        state_latch_original_error: Some(original_error.to_string()),
+        can_unlock_execution: Some(false),
+        ..Default::default()
+    };
+
+    let identity_complete = route_kind.as_deref() == Some("legacy_buy")
+        && request.account_overrides.legacy_buy_curve_pubkey.is_some()
+        && request.decision_ts_ms > 0;
+    let Some(expected_bonding_curve) = request.account_overrides.legacy_buy_curve_pubkey else {
+        diagnostics.state_latch_attempted = Some(false);
+        diagnostics.state_latch_outcome = Some("STATE_LATCH_IDENTITY_INCOMPLETE".to_string());
+        diagnostics.state_latch_error_after_latch = Some(original_error.to_string());
+        state_readiness_latch_metric("STATE_LATCH_IDENTITY_INCOMPLETE");
+        return (StateReadinessLatchStatus::NotRecovered, diagnostics);
+    };
+    if !identity_complete {
+        diagnostics.state_latch_attempted = Some(false);
+        diagnostics.state_latch_outcome = Some("STATE_LATCH_IDENTITY_INCOMPLETE".to_string());
+        diagnostics.state_latch_error_after_latch = Some(original_error.to_string());
+        state_readiness_latch_metric("STATE_LATCH_IDENTITY_INCOMPLETE");
+        return (StateReadinessLatchStatus::NotRecovered, diagnostics);
+    }
+
+    let before =
+        state_readiness_latch_snapshot_status(trigger_component, request, &expected_bonding_curve);
+    diagnostics.state_latch_state_before = Some(before.status.clone());
+    diagnostics.state_latch_first_update_ts_ms = before.first_update_ts_ms;
+    diagnostics.state_latch_first_update_slot = before.first_update_slot;
+    if before.ready {
+        diagnostics.state_latch_wait_ms = Some(0);
+        diagnostics.state_latch_state_after = Some(before.status);
+        diagnostics.state_latch_outcome = Some("STATE_LATCH_RECOVERED_BY_FRESH_READ".to_string());
+        diagnostics.state_latch_error_after_latch =
+            Some("state_readiness_available_by_fresh_read".to_string());
+        diagnostics.dispatch_attempted = Some(true);
+        diagnostics.simulation_attempted = Some(true);
+        diagnostics.active_shadow_precheck_status = Some("precheck_recovered".to_string());
+        state_readiness_latch_metric("STATE_LATCH_RECOVERED_BY_FRESH_READ");
+        return (StateReadinessLatchStatus::Recovered, diagnostics);
+    }
+
+    let started = Instant::now();
+    let max_wait = Duration::from_millis(config.max_wait_ms);
+    let poll_interval = Duration::from_millis(config.poll_interval_ms.max(1));
+    let mut after = before;
+    while started.elapsed() < max_wait {
+        tokio::time::sleep(poll_interval).await;
+        after =
+            state_readiness_latch_snapshot_status(trigger_component, request, &expected_bonding_curve);
+        if after.ready {
+            let wait_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+            diagnostics.state_latch_wait_ms = Some(wait_ms);
+            diagnostics.state_latch_state_after = Some(after.status);
+            diagnostics.state_latch_first_update_ts_ms = after.first_update_ts_ms;
+            diagnostics.state_latch_first_update_slot = after.first_update_slot;
+            diagnostics.state_latch_outcome = Some("STATE_LATCH_RECOVERED_AFTER_WAIT".to_string());
+            diagnostics.state_latch_error_after_latch =
+                Some("state_readiness_available_after_wait".to_string());
+            diagnostics.dispatch_attempted = Some(true);
+            diagnostics.simulation_attempted = Some(true);
+            diagnostics.active_shadow_precheck_status = Some("precheck_recovered".to_string());
+            state_readiness_latch_metric("STATE_LATCH_RECOVERED_AFTER_WAIT");
+            return (StateReadinessLatchStatus::Recovered, diagnostics);
+        }
+    }
+
+    let wait_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    let outcome = if after.status.contains("decoded_reserves_missing") {
+        "STATE_LATCH_DECODE_MISSING"
+    } else if config.fail_closed {
+        "STATE_LATCH_TIMEOUT"
+    } else {
+        "STATE_LATCH_FAIL_CLOSED"
+    };
+    diagnostics.state_latch_wait_ms = Some(wait_ms);
+    diagnostics.state_latch_state_after = Some(after.status);
+    diagnostics.state_latch_first_update_ts_ms = after.first_update_ts_ms;
+    diagnostics.state_latch_first_update_slot = after.first_update_slot;
+    diagnostics.state_latch_outcome = Some(outcome.to_string());
+    diagnostics.state_latch_error_after_latch = Some(original_error.to_string());
+    state_readiness_latch_metric(outcome);
+    (StateReadinessLatchStatus::NotRecovered, diagnostics)
+}
+
+async fn active_shadow_simulation_load_precheck_receipt(
+    trigger_component: &crate::components::trigger::TriggerComponent,
+    request: &mut crate::components::trigger::PreparedBuyRequest,
     shadow_only_dispatch: bool,
     working_builder_parity_mode: bool,
     execution_evidence_context: Option<&P37WorkingBuilderExecutionEvidenceContext>,
+    state_latch_config: &SelectorStateReadinessLatchConfig,
 ) -> Option<crate::components::trigger::TriggerDispatchReceipt> {
     if !shadow_only_dispatch {
         return None;
     }
 
     if let Some(reason) = p37_selected_route_account_contract_failure_reason(request) {
+        if maybe_apply_state_readiness_latch_for_precheck(
+            trigger_component,
+            request,
+            &reason,
+            state_latch_config,
+        )
+        .await
+            == StateReadinessLatchStatus::Recovered
+        {
+            return None;
+        }
         return Some(crate::components::trigger::TriggerDispatchReceipt {
             primary_outcome: Err(anyhow::anyhow!("{reason}")),
             shadow_task: None,
@@ -18344,6 +18780,17 @@ async fn active_shadow_simulation_load_precheck_receipt(
             p37_working_builder_final_manifest_failure_reason(request, &account_set_diagnostics)
         };
         if let Some(reason) = reason {
+            if maybe_apply_state_readiness_latch_for_precheck(
+                trigger_component,
+                request,
+                &reason,
+                state_latch_config,
+            )
+            .await
+                == StateReadinessLatchStatus::Recovered
+            {
+                return None;
+            }
             return Some(crate::components::trigger::TriggerDispatchReceipt {
                 primary_outcome: Err(anyhow::anyhow!("{reason}")),
                 shadow_task: None,
@@ -18362,6 +18809,17 @@ async fn active_shadow_simulation_load_precheck_receipt(
         if let Some(reason) =
             p37_selected_route_final_manifest_failure_reason(request, &account_set_diagnostics)
         {
+            if maybe_apply_state_readiness_latch_for_precheck(
+                trigger_component,
+                request,
+                &reason,
+                state_latch_config,
+            )
+            .await
+                == StateReadinessLatchStatus::Recovered
+            {
+                return None;
+            }
             return Some(crate::components::trigger::TriggerDispatchReceipt {
                 primary_outcome: Err(anyhow::anyhow!("{reason}")),
                 shadow_task: None,
@@ -18404,6 +18862,17 @@ async fn active_shadow_simulation_load_precheck_receipt(
                     reason
                 }
             });
+            if maybe_apply_state_readiness_latch_for_precheck(
+                trigger_component,
+                request,
+                &error,
+                state_latch_config,
+            )
+            .await
+                == StateReadinessLatchStatus::Recovered
+            {
+                return None;
+            }
             return Some(crate::components::trigger::TriggerDispatchReceipt {
                 primary_outcome: Err(anyhow::anyhow!("{error}")),
                 shadow_task: None,
@@ -18439,17 +18908,23 @@ async fn active_shadow_simulation_load_precheck_receipt(
             ) {
                 return None;
             }
-            if let Some(reason) = route_resolution.no_executable_reason() {
-                anyhow::anyhow!("{reason}")
+            let reason = if let Some(reason) = route_resolution.no_executable_reason() {
+                reason
             } else {
-                anyhow::anyhow!(
-                    "{}",
-                    p37_shadow_probe_execution_account_not_ready_reason(
-                        &missing_role,
-                        &missing_pubkey
-                    )
+                p37_shadow_probe_execution_account_not_ready_reason(&missing_role, &missing_pubkey)
+            };
+            if maybe_apply_state_readiness_latch_for_precheck(
+                    trigger_component,
+                    request,
+                    &reason,
+                    state_latch_config,
                 )
+                .await
+                == StateReadinessLatchStatus::Recovered
+            {
+                return None;
             }
+            anyhow::anyhow!("{reason}")
         }
         Ok(None) => return None,
         Err(err) => anyhow::anyhow!("active_shadow_precheck_failed:{}", err),
@@ -18475,6 +18950,7 @@ async fn execute_gatekeeper_buy_via_trigger_with_fsc_gate(
     join_metadata: Option<ExecutionJoinMetadata>,
     working_builder_parity_mode: bool,
     working_builder_execution_evidence_context: Option<P37WorkingBuilderExecutionEvidenceContext>,
+    state_latch_config: &SelectorStateReadinessLatchConfig,
 ) -> crate::components::trigger::TriggerDispatchReceipt {
     if let Some(gate_status) = fsc_gate_status {
         match trigger_component.entry_mode() {
@@ -18539,12 +19015,14 @@ async fn execute_gatekeeper_buy_via_trigger_with_fsc_gate(
                                 }
                             }
                         };
+                        let mut prepared_buy = prepared_buy;
                         if let Some(receipt) = active_shadow_simulation_load_precheck_receipt(
                             trigger_component,
-                            &prepared_buy,
+                            &mut prepared_buy,
                             true,
                             working_builder_parity_mode,
                             working_builder_execution_evidence_context.as_ref(),
+                            state_latch_config,
                         )
                         .await
                         {
@@ -18661,15 +19139,17 @@ async fn execute_gatekeeper_buy_via_trigger_with_fsc_gate(
                         }
                     }
                 };
+                let mut prepared_buy = prepared_buy;
                 if let Some(receipt) = active_shadow_simulation_load_precheck_receipt(
                     trigger_component,
-                    &prepared_buy,
+                    &mut prepared_buy,
                     matches!(
                         trigger_component.entry_mode(),
                         crate::config::TriggerEntryMode::ShadowOnly
                     ),
                     working_builder_parity_mode,
                     working_builder_execution_evidence_context.as_ref(),
+                    state_latch_config,
                 )
                 .await
                 {
@@ -19361,6 +19841,29 @@ fn shadow_entry_record_from_event(
         simulation_account_set_count: None,
         account_set_match: None,
         account_set_mismatch_reason: None,
+        state_latch_eligibility_marker: None,
+        state_latch_eligibility_checked: None,
+        state_latch_enabled: None,
+        state_latch_bonding_curve_present: None,
+        state_latch_decision_ts_ms_present: None,
+        state_latch_normalized_error_class: None,
+        state_latch_eligible: None,
+        state_latch_skip_reason: None,
+        state_latch_attempted: None,
+        state_latch_outcome: None,
+        state_latch_wait_ms: None,
+        state_latch_mint: None,
+        state_latch_bonding_curve: None,
+        state_latch_route_kind: None,
+        state_latch_decision_ts_ms: None,
+        state_latch_decision_slot: None,
+        state_latch_first_update_ts_ms: None,
+        state_latch_first_update_slot: None,
+        state_latch_state_before: None,
+        state_latch_state_after: None,
+        state_latch_original_error: None,
+        state_latch_error_after_latch: None,
+        can_unlock_execution: None,
         probe_entry_materialization_status: None,
         probe_lifecycle_eligibility_status: None,
         dispatch_attempted: event.account_diagnostics.dispatch_attempted,
@@ -19596,6 +20099,29 @@ fn shadow_entry_record_from_request(
         simulation_account_set_count: None,
         account_set_match: None,
         account_set_mismatch_reason: None,
+        state_latch_eligibility_marker: None,
+        state_latch_eligibility_checked: None,
+        state_latch_enabled: None,
+        state_latch_bonding_curve_present: None,
+        state_latch_decision_ts_ms_present: None,
+        state_latch_normalized_error_class: None,
+        state_latch_eligible: None,
+        state_latch_skip_reason: None,
+        state_latch_attempted: None,
+        state_latch_outcome: None,
+        state_latch_wait_ms: None,
+        state_latch_mint: None,
+        state_latch_bonding_curve: None,
+        state_latch_route_kind: None,
+        state_latch_decision_ts_ms: None,
+        state_latch_decision_slot: None,
+        state_latch_first_update_ts_ms: None,
+        state_latch_first_update_slot: None,
+        state_latch_state_before: None,
+        state_latch_state_after: None,
+        state_latch_original_error: None,
+        state_latch_error_after_latch: None,
+        can_unlock_execution: None,
         probe_entry_materialization_status: None,
         probe_lifecycle_eligibility_status: None,
         dispatch_attempted: None,
@@ -19919,6 +20445,30 @@ fn enrich_active_shadow_entry_with_account_diagnostics(
     entry.simulation_account_set_count = diagnostics.simulation_account_set_count;
     entry.account_set_match = diagnostics.account_set_match;
     entry.account_set_mismatch_reason = diagnostics.account_set_mismatch_reason.clone();
+    entry.state_latch_eligibility_marker = diagnostics.state_latch_eligibility_marker.clone();
+    entry.state_latch_eligibility_checked = diagnostics.state_latch_eligibility_checked;
+    entry.state_latch_enabled = diagnostics.state_latch_enabled;
+    entry.state_latch_bonding_curve_present = diagnostics.state_latch_bonding_curve_present;
+    entry.state_latch_decision_ts_ms_present = diagnostics.state_latch_decision_ts_ms_present;
+    entry.state_latch_normalized_error_class =
+        diagnostics.state_latch_normalized_error_class.clone();
+    entry.state_latch_eligible = diagnostics.state_latch_eligible;
+    entry.state_latch_skip_reason = diagnostics.state_latch_skip_reason.clone();
+    entry.state_latch_attempted = diagnostics.state_latch_attempted;
+    entry.state_latch_outcome = diagnostics.state_latch_outcome.clone();
+    entry.state_latch_wait_ms = diagnostics.state_latch_wait_ms;
+    entry.state_latch_mint = diagnostics.state_latch_mint.clone();
+    entry.state_latch_bonding_curve = diagnostics.state_latch_bonding_curve.clone();
+    entry.state_latch_route_kind = diagnostics.state_latch_route_kind.clone();
+    entry.state_latch_decision_ts_ms = diagnostics.state_latch_decision_ts_ms;
+    entry.state_latch_decision_slot = diagnostics.state_latch_decision_slot;
+    entry.state_latch_first_update_ts_ms = diagnostics.state_latch_first_update_ts_ms;
+    entry.state_latch_first_update_slot = diagnostics.state_latch_first_update_slot;
+    entry.state_latch_state_before = diagnostics.state_latch_state_before.clone();
+    entry.state_latch_state_after = diagnostics.state_latch_state_after.clone();
+    entry.state_latch_original_error = diagnostics.state_latch_original_error.clone();
+    entry.state_latch_error_after_latch = diagnostics.state_latch_error_after_latch.clone();
+    entry.can_unlock_execution = diagnostics.can_unlock_execution;
 }
 
 async fn append_shadow_entry_record(
@@ -20824,6 +21374,52 @@ struct ShadowEntryRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     account_set_mismatch_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    state_latch_eligibility_marker: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state_latch_eligibility_checked: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state_latch_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state_latch_bonding_curve_present: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state_latch_decision_ts_ms_present: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state_latch_normalized_error_class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state_latch_eligible: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state_latch_skip_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state_latch_attempted: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state_latch_outcome: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state_latch_wait_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state_latch_mint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state_latch_bonding_curve: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state_latch_route_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state_latch_decision_ts_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state_latch_decision_slot: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state_latch_first_update_ts_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state_latch_first_update_slot: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state_latch_state_before: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state_latch_state_after: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state_latch_original_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state_latch_error_after_latch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    can_unlock_execution: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     probe_entry_materialization_status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     probe_lifecycle_eligibility_status: Option<String>,
@@ -21321,12 +21917,12 @@ async fn apply_trigger_buy_outcome(
                     &pool_data.base_mint,
                     report,
                 );
-            if let Some(error_message) = report_err {
-                shadow_event.account_diagnostics = active_shadow_report_error_diagnostics
-                    .unwrap_or_else(|| {
-                        let err = anyhow::anyhow!(error_message);
-                        active_shadow_account_diagnostics_without_request(&err)
-                    });
+            if let Some(diagnostics) = active_shadow_report_error_diagnostics {
+                shadow_event.account_diagnostics = diagnostics;
+            } else if let Some(error_message) = report_err {
+                let err = anyhow::anyhow!(error_message);
+                shadow_event.account_diagnostics =
+                    active_shadow_account_diagnostics_without_request(&err);
             }
             if trigger_component.shadow_run_emit_event_bus() {
                 if let Err(e) =
@@ -21567,6 +22163,9 @@ async fn apply_trigger_dispatch_receipt_with_builder_mode(
                 } => Some(signature.to_string()),
                 _ => None,
             };
+            let state_latch_diagnostics = failed_request
+                .as_ref()
+                .and_then(|request| request.state_readiness_latch_diagnostics.clone());
             let active_shadow_report_error_diagnostics = match (&outcome, failed_request.as_ref()) {
                 (
                     crate::components::trigger::TriggerBuyOutcome::ShadowSimulated { report },
@@ -21600,6 +22199,10 @@ async fn apply_trigger_dispatch_receipt_with_builder_mode(
                 } else {
                     None
                 };
+            let active_shadow_report_error_diagnostics = merge_optional_state_latch_diagnostics(
+                active_shadow_report_error_diagnostics,
+                state_latch_diagnostics,
+            );
             if live_signature.is_some() && shadow_task.is_some() {
                 increment_counter!("trigger_live_success_with_shadow_companion_total");
             }
@@ -21674,13 +22277,19 @@ async fn apply_trigger_dispatch_receipt_with_builder_mode(
                 )
                 .await;
             } else if let Some(request) = failed_request {
-                let account_diagnostics = active_shadow_account_diagnostics_from_request_with_mode(
+                let mut account_diagnostics = active_shadow_account_diagnostics_from_request_with_mode(
                     trigger_component,
                     &request,
                     &e,
                     working_builder_parity_mode,
                 )
                 .await;
+                if let Some(latch_diagnostics) =
+                    request.state_readiness_latch_diagnostics.as_ref()
+                {
+                    account_diagnostics =
+                        merge_state_latch_diagnostics(account_diagnostics, latch_diagnostics);
+                }
                 if trigger_component.supports_shadow_run() {
                     let shadow_log_path =
                         std::path::PathBuf::from(trigger_component.shadow_run_output_path());
@@ -29003,6 +29612,397 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn state_readiness_latch_identity_incomplete_fails_closed_without_wait() {
+        let trigger_config = crate::config::TriggerComponentConfig {
+            enabled: true,
+            entry_mode: crate::config::TriggerEntryMode::ShadowOnly,
+            rpc_url: "https://api.devnet.solana.com".to_string(),
+            keypair_path: None,
+            tip_guard: crate::config::TriggerTipGuardConfig::default(),
+            metrics_port: 9091,
+            max_concurrent_positions: 3,
+            max_position_size_sol: 0.1,
+            emergency_floor_sol: 0.05,
+            position_size_buffer_sol: 0.02,
+            slippage_tolerance: 0.20,
+            live_preflight_max_state_age_slots: 10,
+            live_exit_take_profit_pct: 0.02,
+            live_exit_stop_loss_pct: 0.02,
+            shadow_run: crate::config::TriggerShadowRunConfig::default(),
+        };
+        let trigger = crate::components::trigger::TriggerComponent::new_with_shadow_simulator(
+            trigger_config,
+            Arc::new(MockShadowSimulator),
+        );
+        let request = test_prepared_buy_request();
+        let config = SelectorStateReadinessLatchConfig {
+            enabled: true,
+            mode: "shadow_only".to_string(),
+            max_wait_ms: 25,
+            poll_interval_ms: 1,
+            fail_closed: true,
+            allow_rpc: false,
+        };
+
+        let (status, diagnostics) = run_state_readiness_latch(
+            &trigger,
+            &request,
+            "legacy_buy_simulation_load_not_ready:bonding_curve",
+            &config,
+        )
+        .await;
+
+        assert_eq!(status, StateReadinessLatchStatus::NotRecovered);
+        assert_eq!(
+            diagnostics.state_latch_outcome.as_deref(),
+            Some("STATE_LATCH_IDENTITY_INCOMPLETE")
+        );
+        assert_eq!(diagnostics.state_latch_attempted, Some(false));
+        assert_eq!(diagnostics.can_unlock_execution, Some(false));
+        assert_eq!(
+            diagnostics.state_latch_error_after_latch.as_deref(),
+            Some("legacy_buy_simulation_load_not_ready:bonding_curve")
+        );
+    }
+
+    fn test_state_latch_config() -> SelectorStateReadinessLatchConfig {
+        SelectorStateReadinessLatchConfig {
+            enabled: true,
+            mode: "shadow_only".to_string(),
+            max_wait_ms: 5,
+            poll_interval_ms: 1,
+            fail_closed: true,
+            allow_rpc: false,
+        }
+    }
+
+    fn test_shadow_only_trigger_config_for_latch() -> crate::config::TriggerComponentConfig {
+        crate::config::TriggerComponentConfig {
+            enabled: true,
+            entry_mode: crate::config::TriggerEntryMode::ShadowOnly,
+            rpc_url: "https://api.devnet.solana.com".to_string(),
+            keypair_path: None,
+            tip_guard: crate::config::TriggerTipGuardConfig::default(),
+            metrics_port: 9091,
+            max_concurrent_positions: 3,
+            max_position_size_sol: 0.1,
+            emergency_floor_sol: 0.05,
+            position_size_buffer_sol: 0.02,
+            slippage_tolerance: 0.20,
+            live_preflight_max_state_age_slots: 10,
+            live_exit_take_profit_pct: 0.02,
+            live_exit_stop_loss_pct: 0.02,
+            shadow_run: crate::config::TriggerShadowRunConfig::default(),
+        }
+    }
+
+    fn test_latch_trigger_with_account_state(
+        account_state_core: Arc<AccountStateReducer>,
+    ) -> crate::components::trigger::TriggerComponent {
+        crate::components::trigger::TriggerComponent::new_with_runtime_guards_and_runtime_state(
+            test_shadow_only_trigger_config_for_latch(),
+            Arc::new(MockShadowSimulator),
+            crate::components::trigger::safety::PositionLimitTracker::new(3),
+            Arc::new(ghost_core::shadow_ledger::ShadowLedger::new()),
+            account_state_core,
+        )
+    }
+
+    fn seed_latch_canonical_state(
+        account_state_core: &Arc<AccountStateReducer>,
+        mint: Pubkey,
+        bonding_curve: Pubkey,
+    ) {
+        let update = ghost_core::account_state_core::types::AccountStateUpdate {
+            pool_amm_id: bonding_curve,
+            base_mint: mint,
+            bonding_curve,
+            sol_reserves: 30_000_000_000,
+            token_reserves: 1_073_000_000_000_000,
+            is_complete: 0,
+            slot: 100,
+            write_version: Some(1),
+            receive_ts_ms: 1_000,
+            receive_seq: 1,
+            curve_finality: ghost_core::CurveFinality::Provisional,
+            source: ghost_core::account_state_core::types::UpdateSource::GeyserAccountUpdate,
+        };
+        let result = account_state_core.apply_account_update(update);
+        assert!(
+            matches!(
+                result,
+                ghost_core::account_state_core::types::AccountUpdateResult::Applied
+                    | ghost_core::account_state_core::types::AccountUpdateResult::PromotedFromBootstrap
+            ),
+            "canonical state seed must apply cleanly"
+        );
+    }
+
+    fn test_legacy_state_latch_request(
+        bonding_curve: Option<Pubkey>,
+        decision_ts_ms: u64,
+    ) -> crate::components::trigger::PreparedBuyRequest {
+        let mut request = test_prepared_buy_request();
+        request.account_overrides.buy_variant = Some(trigger::PumpfunBuyVariant::LegacyBuy);
+        request.account_overrides.legacy_buy_curve_pubkey = bonding_curve;
+        request.account_overrides.legacy_buy_curve_source = Some("account_state_core".to_string());
+        request.decision_ts_ms = decision_ts_ms;
+        request
+    }
+
+    #[tokio::test]
+    async fn state_readiness_latch_hook_marks_eligible_and_recovers_by_fresh_read() {
+        let account_state_core = Arc::new(AccountStateReducer::new());
+        let bonding_curve = Pubkey::new_unique();
+        let mut request = test_legacy_state_latch_request(Some(bonding_curve), 10);
+        seed_latch_canonical_state(&account_state_core, request.mint, bonding_curve);
+        let trigger = test_latch_trigger_with_account_state(account_state_core);
+
+        let status = maybe_apply_state_readiness_latch_for_precheck(
+            &trigger,
+            &mut request,
+            "legacy_buy_simulation_load_not_ready:bonding_curve",
+            &test_state_latch_config(),
+        )
+        .await;
+
+        assert_eq!(status, StateReadinessLatchStatus::Recovered);
+        let diagnostics = request
+            .state_readiness_latch_diagnostics
+            .expect("latch diagnostics must be attached to request");
+        assert_eq!(
+            diagnostics.state_latch_eligibility_marker.as_deref(),
+            Some("STATE_LATCH_ELIGIBILITY_CHECKED")
+        );
+        assert_eq!(diagnostics.state_latch_eligibility_checked, Some(true));
+        assert_eq!(diagnostics.state_latch_eligible, Some(true));
+        assert_eq!(diagnostics.state_latch_attempted, Some(true));
+        assert_eq!(
+            diagnostics.state_latch_outcome.as_deref(),
+            Some("STATE_LATCH_RECOVERED_BY_FRESH_READ")
+        );
+        assert_eq!(diagnostics.dispatch_attempted, Some(true));
+        assert_eq!(diagnostics.simulation_attempted, Some(true));
+        assert_eq!(diagnostics.can_unlock_execution, Some(false));
+    }
+
+    #[tokio::test]
+    async fn state_readiness_latch_hook_times_out_fail_closed_with_marker() {
+        let account_state_core = Arc::new(AccountStateReducer::new());
+        let bonding_curve = Pubkey::new_unique();
+        let mut request = test_legacy_state_latch_request(Some(bonding_curve), 10);
+        let trigger = test_latch_trigger_with_account_state(account_state_core);
+
+        let status = maybe_apply_state_readiness_latch_for_precheck(
+            &trigger,
+            &mut request,
+            "legacy_buy_simulation_load_not_ready:bonding_curve",
+            &test_state_latch_config(),
+        )
+        .await;
+
+        assert_eq!(status, StateReadinessLatchStatus::NotRecovered);
+        let diagnostics = request
+            .state_readiness_latch_diagnostics
+            .expect("latch diagnostics must be attached to timeout request");
+        assert_eq!(
+            diagnostics.state_latch_eligibility_marker.as_deref(),
+            Some("STATE_LATCH_ELIGIBILITY_CHECKED")
+        );
+        assert_eq!(diagnostics.state_latch_eligible, Some(true));
+        assert_eq!(diagnostics.state_latch_attempted, Some(true));
+        assert_eq!(
+            diagnostics.state_latch_outcome.as_deref(),
+            Some("STATE_LATCH_TIMEOUT")
+        );
+        assert_eq!(
+            diagnostics.state_latch_error_after_latch.as_deref(),
+            Some("legacy_buy_simulation_load_not_ready:bonding_curve")
+        );
+        assert_eq!(diagnostics.can_unlock_execution, Some(false));
+    }
+
+    #[tokio::test]
+    async fn state_readiness_latch_hook_marks_identity_skip_reason() {
+        let account_state_core = Arc::new(AccountStateReducer::new());
+        let mut request = test_legacy_state_latch_request(None, 10);
+        let trigger = test_latch_trigger_with_account_state(account_state_core);
+
+        let status = maybe_apply_state_readiness_latch_for_precheck(
+            &trigger,
+            &mut request,
+            "legacy_buy_simulation_load_not_ready:bonding_curve",
+            &test_state_latch_config(),
+        )
+        .await;
+
+        assert_eq!(status, StateReadinessLatchStatus::NotRecovered);
+        let diagnostics = request
+            .state_readiness_latch_diagnostics
+            .expect("latch diagnostics must be attached to skipped request");
+        assert_eq!(
+            diagnostics.state_latch_eligibility_marker.as_deref(),
+            Some("STATE_LATCH_ELIGIBILITY_CHECKED")
+        );
+        assert_eq!(diagnostics.state_latch_eligible, Some(false));
+        assert_eq!(diagnostics.state_latch_attempted, Some(false));
+        assert_eq!(
+            diagnostics.state_latch_skip_reason.as_deref(),
+            Some("STATE_LATCH_SKIPPED_BONDING_CURVE_MISSING")
+        );
+        assert_eq!(
+            diagnostics.state_latch_outcome.as_deref(),
+            Some("STATE_LATCH_SKIPPED_BONDING_CURVE_MISSING")
+        );
+        assert_eq!(diagnostics.can_unlock_execution, Some(false));
+    }
+
+    #[tokio::test]
+    async fn active_shadow_report_success_preserves_state_latch_diagnostics() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut trigger_config = crate::config::TriggerComponentConfig {
+            enabled: true,
+            entry_mode: crate::config::TriggerEntryMode::ShadowOnly,
+            rpc_url: "https://api.devnet.solana.com".to_string(),
+            keypair_path: None,
+            tip_guard: crate::config::TriggerTipGuardConfig::default(),
+            metrics_port: 9091,
+            max_concurrent_positions: 3,
+            max_position_size_sol: 0.1,
+            emergency_floor_sol: 0.05,
+            position_size_buffer_sol: 0.02,
+            slippage_tolerance: 0.20,
+            live_preflight_max_state_age_slots: 10,
+            live_exit_take_profit_pct: 0.02,
+            live_exit_stop_loss_pct: 0.02,
+            shadow_run: crate::config::TriggerShadowRunConfig::default(),
+        };
+        trigger_config.shadow_run.output_path = temp
+            .path()
+            .join("shadow.jsonl")
+            .to_string_lossy()
+            .into_owned();
+        let trigger = crate::components::trigger::TriggerComponent::new_with_shadow_simulator(
+            trigger_config,
+            Arc::new(MockShadowSimulator),
+        );
+        let (event_tx, _event_rx) = crate::events::create_event_bus();
+        let mut rx = event_tx.subscribe();
+        let post_buy_epoch = std::sync::atomic::AtomicU64::new(1);
+        let pool_id = Pubkey::new_unique();
+        let pool = crate::events::DetectedPool {
+            semantic: Default::default(),
+            pool_amm_id: pool_id.to_string(),
+            base_mint: Pubkey::new_unique().to_string(),
+            quote_mint: "SOL".to_string(),
+            amm_program: "pumpfun".to_string(),
+            bonding_curve: "curve".to_string(),
+            creator: "creator".to_string(),
+            slot: Some(1),
+            tx_index: None,
+            timestamp_ms: 1_000,
+            event_time: ghost_core::EventTimeMetadata::default(),
+            detected_wall_ts_ms: Some(1_001),
+            initial_liquidity_sol: Some(1.0),
+            signature: "sig".to_string(),
+        };
+        let shadow_entry_path = temp.path().join("shadow_entries.jsonl");
+        let diagnostics = crate::events::ShadowSimulationAccountDiagnostics {
+            state_latch_attempted: Some(true),
+            state_latch_outcome: Some("STATE_LATCH_RECOVERED_BY_FRESH_READ".to_string()),
+            state_latch_wait_ms: Some(0),
+            state_latch_mint: Some(pool.base_mint.clone()),
+            state_latch_bonding_curve: Some("curve".to_string()),
+            state_latch_route_kind: Some("legacy_buy".to_string()),
+            state_latch_decision_ts_ms: Some(10),
+            state_latch_first_update_ts_ms: Some(9),
+            state_latch_first_update_slot: Some(777),
+            state_latch_state_before: Some("canonical_state_ready".to_string()),
+            state_latch_state_after: Some("canonical_state_ready".to_string()),
+            state_latch_original_error: Some(
+                "legacy_buy_simulation_load_not_ready:bonding_curve".to_string(),
+            ),
+            state_latch_error_after_latch: Some(
+                "state_readiness_available_by_fresh_read".to_string(),
+            ),
+            can_unlock_execution: Some(false),
+            ..Default::default()
+        };
+
+        apply_trigger_buy_outcome(
+            &event_tx,
+            None,
+            &trigger,
+            &post_buy_epoch,
+            ExecutionMode::Shadow,
+            &shadow_entry_path,
+            None,
+            "test-join",
+            "test-rollout",
+            pool_id,
+            &pool,
+            0.1,
+            10,
+            "paper",
+            None,
+            None,
+            Some(diagnostics),
+            crate::components::trigger::TriggerBuyOutcome::ShadowSimulated {
+                report: crate::components::trigger::ShadowBuySimulationReport {
+                    join_metadata: ExecutionJoinMetadata::default(),
+                    mint: pool.base_mint.clone(),
+                    live_signature: None,
+                    payer_pubkey: Pubkey::new_unique().to_string(),
+                    payer_provenance: "configured".to_string(),
+                    amount_lamports: 100,
+                    entry_token_amount_raw: Some(250_000),
+                    tip_lamports: 10,
+                    decision_ts_ms: 10,
+                    simulation_started_ts_ms: 11,
+                    simulation_finished_ts_ms: 16,
+                    latency_ms: 5,
+                    shadow_duration_ms: 5,
+                    rpc_slot: 777,
+                    retry_count: 0,
+                    used_sig_verify: false,
+                    used_replace_recent_blockhash: true,
+                    units_consumed: Some(42_000),
+                    logs: vec!["shadow".to_string()],
+                    return_data: None,
+                    err: None,
+                },
+            },
+        )
+        .await
+        .expect("shadow report success apply should succeed");
+
+        let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("shadow event timeout")
+            .expect("shadow event receive");
+        let event = match event {
+            GhostEvent::ShadowBuySimulated(event) => event,
+            other => panic!("expected ShadowBuySimulated, got {other:?}"),
+        };
+        assert_eq!(
+            event.account_diagnostics.state_latch_outcome.as_deref(),
+            Some("STATE_LATCH_RECOVERED_BY_FRESH_READ")
+        );
+        assert_eq!(event.account_diagnostics.can_unlock_execution, Some(false));
+
+        let entry = tokio::fs::read_to_string(&shadow_entry_path)
+            .await
+            .expect("shadow entry row");
+        let entry: serde_json::Value =
+            serde_json::from_str(entry.lines().next().expect("entry line")).expect("entry json");
+        assert_eq!(
+            entry["state_latch_outcome"],
+            "STATE_LATCH_RECOVERED_BY_FRESH_READ"
+        );
+        assert_eq!(entry["can_unlock_execution"], false);
+    }
+
     #[test]
     fn p37_shadow_probe_account_not_found_multi_candidate_and_unattributed_are_explicit() {
         let request = test_prepared_buy_request();
@@ -29877,6 +30877,7 @@ mod tests {
         crate::components::trigger::PendingShadowSimulation {
             request: crate::components::trigger::PreparedBuyRequest {
                 join_metadata: ExecutionJoinMetadata::default(),
+                state_readiness_latch_diagnostics: None,
                 mint: Pubkey::new_unique(),
                 payer_pubkey: payer.pubkey(),
                 payer_provenance: "configured",
@@ -29941,6 +30942,7 @@ mod tests {
 
         crate::components::trigger::PreparedBuyRequest {
             join_metadata: ExecutionJoinMetadata::default(),
+            state_readiness_latch_diagnostics: None,
             mint: Pubkey::new_unique(),
             payer_pubkey: payer.pubkey(),
             payer_provenance: "configured",
@@ -30078,6 +31080,7 @@ mod tests {
 
         crate::components::trigger::PreparedBuyRequest {
             join_metadata: ExecutionJoinMetadata::default(),
+            state_readiness_latch_diagnostics: None,
             mint,
             payer_pubkey: payer.pubkey(),
             payer_provenance: "configured",
@@ -34784,6 +35787,7 @@ mod tests {
             None,
             false,
             None,
+            &SelectorStateReadinessLatchConfig::default(),
         )
         .await;
         let err = receipt
@@ -34842,6 +35846,7 @@ mod tests {
             None,
             false,
             None,
+            &SelectorStateReadinessLatchConfig::default(),
         )
         .await;
         let err = receipt

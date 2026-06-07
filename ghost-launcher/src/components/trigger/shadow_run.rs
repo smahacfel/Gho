@@ -1323,6 +1323,7 @@ mod tests {
         );
         PreparedBuyRequest {
             join_metadata: ExecutionJoinMetadata::default(),
+            state_readiness_latch_diagnostics: None,
             mint: solana_sdk::pubkey::Pubkey::new_unique(),
             payer_pubkey: payer.pubkey(),
             payer_provenance: "configured",
@@ -1653,6 +1654,7 @@ mod tests {
         );
         let request = PreparedBuyRequest {
             join_metadata: ExecutionJoinMetadata::default(),
+            state_readiness_latch_diagnostics: None,
             mint: solana_sdk::pubkey::Pubkey::new_unique(),
             payer_pubkey: payer.pubkey(),
             payer_provenance: "configured",

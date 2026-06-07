@@ -46,6 +46,10 @@ pub struct LauncherConfig {
     #[serde(default)]
     pub p37_shadow_probe: P37ShadowProbeConfig,
 
+    /// Selector/simcov diagnostic runtime knobs.
+    #[serde(default)]
+    pub selector: SelectorRuntimeConfig,
+
     /// Execution SSOT configuration (mode + paper/quotes/events).
     #[serde(default)]
     pub execution: ExecutionConfig,
@@ -693,6 +697,7 @@ impl LauncherConfig {
         validate_trigger_payer_contract(self)?;
         validate_shadow_transport(self)?;
         validate_p37_shadow_probe_contract(self)?;
+        validate_selector_simcov_contract(self)?;
         validate_live_sender_transport(self)?;
         validate_rollout_safety_profile(self)
     }
@@ -1035,6 +1040,55 @@ fn validate_p37_shadow_probe_replay_payload_enabled(config: &LauncherConfig) -> 
             "[p37_shadow_probe] requires [gatekeeper_v3].replay_payload_enabled=true in ghost brain config: {}",
             path.display()
         ));
+    }
+    Ok(())
+}
+
+fn validate_selector_simcov_contract(config: &LauncherConfig) -> Result<(), String> {
+    let latch = &config.selector.simcov.state_readiness_latch;
+    if !latch.enabled {
+        return Ok(());
+    }
+
+    if config.execution.execution_mode != ExecutionMode::Shadow
+        || config.trigger.entry_mode != TriggerEntryMode::ShadowOnly
+        || !config.trigger.shadow_run.enabled
+    {
+        return Err(
+            "[selector.simcov.state_readiness_latch].enabled=true requires [execution].execution_mode=\"shadow\", [trigger].entry_mode=\"shadow_only\", and [trigger.shadow_run].enabled=true"
+                .to_string(),
+        );
+    }
+
+    if latch.mode != default_selector_state_readiness_latch_mode() {
+        return Err(
+            "[selector.simcov.state_readiness_latch].mode must remain \"shadow_only\""
+                .to_string(),
+        );
+    }
+    if latch.max_wait_ms == 0 || latch.max_wait_ms > 25 {
+        return Err(
+            "[selector.simcov.state_readiness_latch].max_wait_ms must be in 1..=25"
+                .to_string(),
+        );
+    }
+    if latch.poll_interval_ms == 0 || latch.poll_interval_ms > latch.max_wait_ms {
+        return Err(
+            "[selector.simcov.state_readiness_latch].poll_interval_ms must be in 1..=max_wait_ms"
+                .to_string(),
+        );
+    }
+    if !latch.fail_closed {
+        return Err(
+            "[selector.simcov.state_readiness_latch].fail_closed must remain true"
+                .to_string(),
+        );
+    }
+    if latch.allow_rpc {
+        return Err(
+            "[selector.simcov.state_readiness_latch].allow_rpc must remain false"
+                .to_string(),
+        );
     }
     Ok(())
 }
@@ -2071,6 +2125,75 @@ impl Default for TriggerShadowRunConfig {
             emit_event_bus: true,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectorRuntimeConfig {
+    #[serde(default)]
+    pub simcov: SelectorSimcovConfig,
+}
+
+impl Default for SelectorRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            simcov: SelectorSimcovConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectorSimcovConfig {
+    #[serde(default)]
+    pub state_readiness_latch: SelectorStateReadinessLatchConfig,
+}
+
+impl Default for SelectorSimcovConfig {
+    fn default() -> Self {
+        Self {
+            state_readiness_latch: SelectorStateReadinessLatchConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SelectorStateReadinessLatchConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_selector_state_readiness_latch_mode")]
+    pub mode: String,
+    #[serde(default = "default_selector_state_readiness_latch_max_wait_ms")]
+    pub max_wait_ms: u64,
+    #[serde(default = "default_selector_state_readiness_latch_poll_interval_ms")]
+    pub poll_interval_ms: u64,
+    #[serde(default = "default_true")]
+    pub fail_closed: bool,
+    #[serde(default)]
+    pub allow_rpc: bool,
+}
+
+impl Default for SelectorStateReadinessLatchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: default_selector_state_readiness_latch_mode(),
+            max_wait_ms: default_selector_state_readiness_latch_max_wait_ms(),
+            poll_interval_ms: default_selector_state_readiness_latch_poll_interval_ms(),
+            fail_closed: true,
+            allow_rpc: false,
+        }
+    }
+}
+
+fn default_selector_state_readiness_latch_mode() -> String {
+    "shadow_only".to_string()
+}
+
+fn default_selector_state_readiness_latch_max_wait_ms() -> u64 {
+    25
+}
+
+fn default_selector_state_readiness_latch_poll_interval_ms() -> u64 {
+    1
 }
 
 /// P3.7-J3 counterfactual shadow-only probe plane configuration.
@@ -3735,6 +3858,7 @@ impl LauncherConfig {
                 shadow_run: TriggerShadowRunConfig::default(),
             },
             p37_shadow_probe: P37ShadowProbeConfig::default(),
+            selector: SelectorRuntimeConfig::default(),
             execution: ExecutionConfig::default(),
             gui_backend: GuiBackendComponentConfig {
                 enabled: true,
@@ -4923,6 +5047,68 @@ artifact_transfer_sample_rate = 50
             10_000
         );
         assert!(!config.p37_shadow_probe.bcv2_terminal_route_closure_enabled);
+    }
+
+    #[test]
+    fn selector_state_readiness_latch_defaults_disabled() {
+        let config = LauncherConfig::default();
+        let latch = &config.selector.simcov.state_readiness_latch;
+
+        assert!(!latch.enabled);
+        assert_eq!(latch.mode, "shadow_only");
+        assert_eq!(latch.max_wait_ms, 25);
+        assert_eq!(latch.poll_interval_ms, 1);
+        assert!(latch.fail_closed);
+        assert!(!latch.allow_rpc);
+    }
+
+    #[test]
+    fn selector_state_readiness_latch_accepts_shadow_only_profile() {
+        let mut config = LauncherConfig::default();
+        config.execution.execution_mode = ExecutionMode::Shadow;
+        config.trigger.entry_mode = TriggerEntryMode::ShadowOnly;
+        config.trigger.keypair_path = Some("/tmp/test-keypair.json".to_string());
+        config.trigger.shadow_run.enabled = true;
+        config.trigger.shadow_run.shadow_rpc_url = "https://shadow.example.com/api-key".to_string();
+        config.selector.simcov.state_readiness_latch.enabled = true;
+        config.selector.simcov.state_readiness_latch.max_wait_ms = 25;
+        config.selector.simcov.state_readiness_latch.poll_interval_ms = 1;
+
+        assert!(config.validate_execution_profile().is_ok());
+    }
+
+    #[test]
+    fn selector_state_readiness_latch_rejects_non_shadow_profile() {
+        let mut config = LauncherConfig::default();
+        config.execution.execution_mode = ExecutionMode::Live;
+        config.trigger.entry_mode = TriggerEntryMode::Live;
+        config.trigger.keypair_path = Some("/tmp/test-keypair.json".to_string());
+        config.trigger.shadow_run.enabled = true;
+        config.selector.simcov.state_readiness_latch.enabled = true;
+
+        let err = config
+            .validate_execution_profile()
+            .expect_err("state readiness latch must fail closed outside shadow-only profile");
+
+        assert!(err.contains("state_readiness_latch"));
+        assert!(err.contains("execution_mode=\"shadow\""));
+        assert!(err.contains("entry_mode=\"shadow_only\""));
+    }
+
+    #[test]
+    fn selector_state_readiness_latch_rejects_rpc_fallback() {
+        let mut config = LauncherConfig::default();
+        config.execution.execution_mode = ExecutionMode::Shadow;
+        config.trigger.entry_mode = TriggerEntryMode::ShadowOnly;
+        config.trigger.shadow_run.enabled = true;
+        config.selector.simcov.state_readiness_latch.enabled = true;
+        config.selector.simcov.state_readiness_latch.allow_rpc = true;
+
+        let err = validate_selector_simcov_contract(&config)
+            .expect_err("state readiness latch must not allow RPC in simcov path");
+
+        assert!(err.contains("allow_rpc"));
+        assert!(err.contains("false"));
     }
 
     #[test]

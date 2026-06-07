@@ -340,6 +340,8 @@ impl PreparedBuyRequestBuildMetadata {
 #[derive(Debug, Clone)]
 pub struct PreparedBuyRequest {
     pub join_metadata: ExecutionJoinMetadata,
+    pub state_readiness_latch_diagnostics:
+        Option<crate::events::ShadowSimulationAccountDiagnostics>,
     pub mint: Pubkey,
     pub payer_pubkey: Pubkey,
     pub payer_provenance: &'static str,
@@ -376,6 +378,14 @@ pub struct PreparedBuyRequest {
 impl PreparedBuyRequest {
     pub fn with_join_metadata(mut self, join_metadata: ExecutionJoinMetadata) -> Self {
         self.join_metadata = join_metadata;
+        self
+    }
+
+    pub fn with_state_readiness_latch_diagnostics(
+        mut self,
+        diagnostics: crate::events::ShadowSimulationAccountDiagnostics,
+    ) -> Self {
+        self.state_readiness_latch_diagnostics = Some(diagnostics);
         self
     }
 }
@@ -1760,6 +1770,13 @@ impl TriggerComponent {
         self.config.shadow_run.timeout_ms
     }
 
+    pub(crate) fn canonical_pool_state(
+        &self,
+        mint: &Pubkey,
+    ) -> Option<ghost_core::account_state_core::types::CanonicalPoolState> {
+        self.account_state_core.get_canonical_state(mint)
+    }
+
     pub fn shadow_run_enabled(&self) -> bool {
         self.config.shadow_run.enabled
     }
@@ -2951,6 +2968,7 @@ impl TriggerComponent {
     ) -> PreparedBuyRequest {
         PreparedBuyRequest {
             join_metadata: ExecutionJoinMetadata::default(),
+            state_readiness_latch_diagnostics: None,
             mint: build_profile.mint,
             payer_pubkey: build_profile.payer_pubkey,
             payer_provenance,

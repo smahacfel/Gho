@@ -1732,6 +1732,7 @@ async fn main() -> Result<()> {
             }),
         );
     oracle_runtime_config.p37_shadow_probe = config.p37_shadow_probe.clone();
+    oracle_runtime_config.selector = config.selector.clone();
     oracle_runtime_config.run_id = (!config.p37_shadow_probe.run_id.trim().is_empty())
         .then(|| config.p37_shadow_probe.run_id.clone());
     oracle_runtime_config.session_id = (!config.p37_shadow_probe.session_id.trim().is_empty())

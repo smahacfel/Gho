@@ -4385,6 +4385,95 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertEqual(report["failure_classes"]["UNKNOWN_UNCLASSIFIED"]["count"], 0)
         self.assertEqual(samples[0]["classification"], "ROUTE_INCOMPLETE_STATE_NOT_READY")
 
+    def test_buy_simulation_audit_requires_latch_marker_for_state_not_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "simcov-load-not-ready-no-latch-marker"
+            buy = {
+                "pool_id": "pool1",
+                "base_mint": "mint1",
+                "ab_record_id": "pool1:mint1:BUY",
+                "shadow_execution_outcome": "shadow_unknown_error",
+            }
+            shadow = {
+                "record_type": "shadow_dispatch",
+                "pool_id": "pool1",
+                "mint_id": "mint1",
+                "ab_record_id": "pool1:mint1:BUY",
+                "candidate_id": "mint1_pool1_1000",
+                "decision_plane": "legacy_live",
+                "dispatch_status": "not_dispatched",
+                "simulation_outcome": "not_attempted",
+                "execution_feasibility_status": "not_executable_route",
+                "route_resolution_status": "no_executable_route_account_set",
+                "dispatch_attempted": False,
+                "simulation_attempted": False,
+                "precheck_failure_reason": (
+                    "no_executable_route_account_set:"
+                    "legacy_buy_simulation_load_not_ready:bonding_curve:pool1"
+                ),
+            }
+            self.write_simcov_fixture(root, scope=scope, buy_rows=[buy], shadow_rows=[shadow])
+            report = self.run_simcov_audit(root, scope)
+
+        self.assertIn("STATE_LATCH_MARKER_MISSING_FOR_STATE_NOT_READY", report["fail_reasons"])
+        self.assertEqual(report["state_latch_contract"]["state_not_ready_rows"], 1)
+        self.assertEqual(
+            report["state_latch_contract"]["state_not_ready_latch_marker_missing_rows"],
+            1,
+        )
+        self.assertEqual(report["state_latch_contract"]["contract_status"], "FAIL")
+
+    def test_buy_simulation_audit_accepts_latch_marker_for_state_not_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "simcov-load-not-ready-with-latch-marker"
+            buy = {
+                "pool_id": "pool1",
+                "base_mint": "mint1",
+                "ab_record_id": "pool1:mint1:BUY",
+                "shadow_execution_outcome": "shadow_unknown_error",
+            }
+            shadow = {
+                "record_type": "shadow_dispatch",
+                "pool_id": "pool1",
+                "mint_id": "mint1",
+                "ab_record_id": "pool1:mint1:BUY",
+                "candidate_id": "mint1_pool1_1000",
+                "decision_plane": "legacy_live",
+                "dispatch_status": "not_dispatched",
+                "simulation_outcome": "not_attempted",
+                "execution_feasibility_status": "not_executable_route",
+                "route_resolution_status": "no_executable_route_account_set",
+                "dispatch_attempted": False,
+                "simulation_attempted": False,
+                "precheck_failure_reason": (
+                    "no_executable_route_account_set:"
+                    "legacy_buy_simulation_load_not_ready:bonding_curve:pool1"
+                ),
+                "state_latch_eligibility_marker": "STATE_LATCH_ELIGIBILITY_CHECKED",
+                "state_latch_eligibility_checked": True,
+                "state_latch_attempted": False,
+                "state_latch_outcome": "STATE_LATCH_SKIPPED_BONDING_CURVE_MISSING",
+                "state_latch_skip_reason": "STATE_LATCH_SKIPPED_BONDING_CURVE_MISSING",
+                "state_latch_eligible": False,
+                "can_unlock_execution": False,
+            }
+            self.write_simcov_fixture(root, scope=scope, buy_rows=[buy], shadow_rows=[shadow])
+            report = self.run_simcov_audit(root, scope)
+
+        self.assertNotIn(
+            "STATE_LATCH_MARKER_MISSING_FOR_STATE_NOT_READY",
+            report["fail_reasons"],
+        )
+        self.assertEqual(report["state_latch_contract"]["state_not_ready_rows"], 1)
+        self.assertEqual(
+            report["state_latch_contract"]["state_latch_eligibility_checked_rows"],
+            1,
+        )
+        self.assertEqual(report["state_latch_contract"]["state_latch_skipped_rows"], 1)
+        self.assertEqual(report["state_latch_contract"]["contract_status"], "PASS")
+
     def test_buy_simulation_audit_classifies_custom_program_errors(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
