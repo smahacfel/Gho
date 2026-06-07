@@ -116,6 +116,54 @@ exit_fills_total >= 1
 accepted close_reason rows >= 1
 ```
 
+## Selector Regression Gates
+
+After a selector smoke that validates route materialization or BCV2 handoff
+behavior, run the offline regression gate before making a closure claim:
+
+```bash
+python3 scripts/ci_assert_selector_regression_gates.py \
+  --scope shadow-burnin-v3-selector-dataset-r18c-bcv2-handoff-canonicalization-smoke \
+  --root /root/Gho \
+  --require-attempted-equals-buy \
+  --require-not-executable-zero \
+  --min-attempt-coverage 0.95 \
+  --json
+```
+
+For the repository fixture, use the artifact-only form so CI can validate the
+contract without runtime logs:
+
+```bash
+python3 scripts/ci_assert_selector_regression_gates.py \
+  --scope r18c-bcv2-handoff-regression-fixture \
+  --root /root/Gho \
+  --audit-json tests/fixtures/selector/r18c_bcv2_handoff_regression/audit_pass.json \
+  --jsonl tests/fixtures/selector/r18c_bcv2_handoff_regression/shadow_buys.jsonl \
+  --require-attempted-equals-buy \
+  --require-not-executable-zero \
+  --min-attempt-coverage 0.95 \
+  --json
+```
+
+The gate must fail closed on:
+
+```text
+AccountNotFound > 0
+LEGACY_BC_V2_TAIL_RESOLVER_FAILED > 0
+missing_on_rpc_precheck for bonding_curve_v2 > 0
+selected_route_kind=None for selected_fallback_route_execution_handoff > 0
+primary_route_bcv2_missing fatal after final handoff > 0
+UNKNOWN_UNCLASSIFIED > 0
+can_unlock_execution=true > 0
+not_executable_route_rows > 0
+attempted_rows < ceil(buy_rows * 0.95)
+```
+
+This regression gate is offline/audit-only. It does not start runtime, does not
+unlock execution, and does not change Gatekeeper, send path, provider behavior,
+slippage, or simulation success tuning.
+
 ## Failure Handling
 
 If event canary fails, the launcher kills the `tmux` session and writes `FAIL_EVENT_CANARY`.
