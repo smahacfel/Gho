@@ -33,6 +33,7 @@ import build_selector_training_view as training
 import compare_selector_gatekeepers as compare
 import audit_selector_buy_simulation_coverage as simcov_audit
 import audit_selector_shadow_score_sidecar as shadow_score_sidecar_audit
+import audit_selector_shadow_score_parity as shadow_score_parity_audit
 try:
     import build_selector_coverage_breakthrough_projection as coverage_breakthrough
 except ModuleNotFoundError:
@@ -3879,6 +3880,157 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertEqual(report["decision_influence_claim_rows"], 0)
         self.assertEqual(report["execution_influence_claim_rows"], 0)
         self.assertEqual(report["send_path_changed_claim_rows"], 0)
+
+    def write_shadow_score_parity_fixture(
+        self,
+        root: Path,
+        *,
+        scope: str = "shadow-score-parity-test",
+        score_delta: float = 0.0,
+        threshold_mismatch: bool = False,
+        claim_boundary_violation: bool = False,
+    ) -> tuple[Path, Path]:
+        decision_dir = (
+            root
+            / "logs"
+            / "rollout"
+            / scope
+            / "decisions"
+            / scope
+            / "v2.2"
+            / "legacy_live"
+            / "fixture"
+        )
+        rust_source = Path(__file__).resolve().parents[1] / "ghost-brain/src/oracle/decision_logger.rs"
+        specs, thresholds = shadow_score_parity_audit.parse_runtime_spec(rust_source)
+        decision = {
+            "execution_candidate_id": "candidate-1",
+            "pool_id": "pool-1",
+            "base_mint": "mint-1",
+            "verdict_type": "BUY",
+            "observation_end_ts_ms": 1_000,
+            "curve_data_known": True,
+            "curve_wait_elapsed_ms": 10_010,
+            "bonding_progress_pct": 50.0,
+            "current_market_cap_sol": 100.0,
+            "price_change_ratio": 2.0,
+            "hhi": 0.2,
+            "top3_volume_pct": 0.3,
+            "total_tx_evaluated": 10,
+            "unique_signers_evaluated": 5,
+            "buy_count": 4,
+            "buy_ratio": 0.5,
+            "sell_buy_ratio": 0.2,
+            "total_volume_sol": 5.0,
+            "avg_tx_sol": 0.5,
+        }
+        expected = shadow_score_parity_audit.recompute(decision, specs, thresholds)
+        score_row = {
+            "schema_version": "selector_shadow_score_v1",
+            "score_version": "selector_shadow_score_combined_simple_v1",
+            "score_candidate_id": "combined:simple_feature_score_v1",
+            "candidate_id": "candidate-1",
+            "pool_id": "pool-1",
+            "base_mint": "mint-1",
+            "gatekeeper_verdict_type": "BUY",
+            "selector_shadow_score": expected["selector_shadow_score"] + score_delta,
+            "score_validity_status": expected["score_validity_status"],
+            "feature_availability": expected["feature_availability"],
+            "thresholds": dict(expected["thresholds"]),
+            "reason_vector": {"positive": [], "negative": [], "missing": []},
+            "claim_boundaries": {
+                "diagnostic_only": True,
+                "shadow_only": True,
+                "production_promotion_allowed": False,
+                "gatekeeper_tuning_started": False,
+                "changes_gatekeeper_decision": False,
+                "changes_execution": claim_boundary_violation,
+                "send_path_changed": False,
+            },
+        }
+        if threshold_mismatch:
+            score_row["thresholds"]["top10_equiv_pass"] = not score_row["thresholds"][
+                "top10_equiv_pass"
+            ]
+        write_jsonl(decision_dir / "gatekeeper_v2_decisions.jsonl", [decision])
+        write_jsonl(decision_dir / "selector_shadow_score_v1.jsonl", [score_row])
+        return decision_dir, rust_source
+
+    def run_shadow_score_parity_fixture(self, root: Path, scope: str, rust_source: Path) -> dict:
+        return shadow_score_parity_audit.build_report(
+            shadow_score_parity_audit.build_parser().parse_args(
+                [
+                    "--runtime-scope",
+                    scope,
+                    "--root",
+                    str(root),
+                    "--decision-plane",
+                    "legacy_live",
+                    "--rust-source",
+                    str(rust_source),
+                ]
+            )
+        )
+
+    def test_shadow_score_parity_recomputes_runtime_mapped_subset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "shadow-score-parity-pass"
+            _, rust_source = self.write_shadow_score_parity_fixture(root, scope=scope)
+            report = self.run_shadow_score_parity_fixture(root, scope, rust_source)
+
+        self.assertEqual(report["status"], "PASS")
+        self.assertEqual(report["matched_rows"], 1)
+        self.assertEqual(report["runtime_formula_parity"]["score_mismatch_rows"], 0)
+        self.assertEqual(report["runtime_formula_parity"]["threshold_pass_mismatch_count"], 0)
+        self.assertEqual(report["runtime_formula_parity"]["validity_status_mismatch_count"], 0)
+
+    def test_shadow_score_parity_detects_score_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "shadow-score-parity-score-mismatch"
+            _, rust_source = self.write_shadow_score_parity_fixture(
+                root, scope=scope, score_delta=0.01
+            )
+            report = self.run_shadow_score_parity_fixture(root, scope, rust_source)
+
+        self.assertEqual(report["status"], "FAIL")
+        self.assertIn("score_mismatch_rows=1", report["fail_reasons"])
+
+    def test_shadow_score_parity_detects_threshold_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "shadow-score-parity-threshold-mismatch"
+            _, rust_source = self.write_shadow_score_parity_fixture(
+                root, scope=scope, threshold_mismatch=True
+            )
+            report = self.run_shadow_score_parity_fixture(root, scope, rust_source)
+
+        self.assertEqual(report["status"], "FAIL")
+        self.assertIn("threshold_pass_mismatch_count=1", report["fail_reasons"])
+
+    def test_shadow_score_parity_reports_missing_flow_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "shadow-score-parity-drift"
+            _, rust_source = self.write_shadow_score_parity_fixture(root, scope=scope)
+            report = self.run_shadow_score_parity_fixture(root, scope, rust_source)
+
+        self.assertEqual(report["mapped_only_drift"]["status"], "DRIFT_MEASURED_EXPECTED_MISSING_FLOW_FEATURES")
+        self.assertIn("net_quote_in_15s", report["feature_spec"]["missing_runtime_mapping_features"])
+        self.assertGreater(report["feature_spec"]["mapped_features"], 0)
+
+    def test_shadow_score_parity_requires_non_claim_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "shadow-score-parity-boundary"
+            _, rust_source = self.write_shadow_score_parity_fixture(
+                root, scope=scope, claim_boundary_violation=True
+            )
+            report = self.run_shadow_score_parity_fixture(root, scope, rust_source)
+
+        self.assertEqual(report["status"], "FAIL")
+        self.assertIn("claim_boundary_violation_rows=1", report["fail_reasons"])
 
     def test_selector_lifecycle_launcher_accepts_build_freshness_flag(self) -> None:
         args = lifecycle_launcher.build_parser().parse_args(
