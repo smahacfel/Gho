@@ -26,6 +26,7 @@ import build_selector_r2only_feature_contribution as r2only_feature_contribution
 import build_selector_r2only_feature_audit as r2only_feature_audit
 import build_selector_r2only_model_candidate as r2only_model_candidate
 import build_selector_r2only_candidate_selection as r2only_candidate_selection
+import build_selector_shadow_score_contract as shadow_score_contract
 import build_selector_route_manifest_reuse_projection as route_manifest_reuse
 import build_selector_route_evidence_join_report as route_evidence_join
 import build_selector_training_view as training
@@ -3590,6 +3591,219 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertTrue(output_md_exists)
         self.assertTrue(threshold_csv_exists)
         self.assertTrue(stability_csv_exists)
+
+    def build_shadow_score_contract_fixture(
+        self,
+        root: Path,
+        scope: str,
+        *,
+        missing_core_candidate_id: str | None = None,
+    ) -> dict:
+        source_scope = f"{scope}-source"
+        rows = self.write_feature_contribution_fixture(root, scope)
+        dataset_path = root / "datasets" / "selector" / scope / "selector_training_view_v1.jsonl"
+        if missing_core_candidate_id:
+            for row in rows:
+                if row.get("candidate_id") == missing_core_candidate_id:
+                    row.pop("gk_bonding_progress_pct", None)
+            write_jsonl(dataset_path, rows)
+        report_dir = root / "reports" / "selector" / scope
+        dataset_manifest_path = report_dir / "dataset_manifest_v1.json"
+        dataset_manifest = json.loads(dataset_manifest_path.read_text(encoding="utf-8"))
+        dataset_manifest["source_scope"] = source_scope
+        dataset_manifest_path.write_text(json.dumps(dataset_manifest), encoding="utf-8")
+        (report_dir / "phase3_r2only_manifest_v1.json").write_text(
+            json.dumps(
+                {
+                    "status": "PASS_R2_ONLY_DRAFT",
+                    "phase3_precision_readiness": "R2_ONLY_READY",
+                    "leakage_audit_status": "PASS",
+                    "fail_reasons": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        r2only_feature_contribution.build_report(
+            r2only_feature_contribution.build_parser().parse_args(
+                [
+                    "--scope",
+                    scope,
+                    "--root",
+                    str(root),
+                    "--feature-set",
+                    "flow",
+                    "--feature-set",
+                    "gk",
+                    "--feature-set",
+                    "combined",
+                ]
+            )
+        )
+        r2only_model_candidate.build_report(
+            r2only_model_candidate.build_parser().parse_args(
+                [
+                    "--scope",
+                    scope,
+                    "--root",
+                    str(root),
+                    "--feature-set",
+                    "flow",
+                    "--feature-set",
+                    "gk",
+                    "--feature-set",
+                    "combined",
+                    "--bootstrap-samples",
+                    "25",
+                    "--logistic-epochs",
+                    "20",
+                ]
+            )
+        )
+        simcov_report_dir = root / "reports" / "selector" / source_scope
+        simcov_report_dir.mkdir(parents=True)
+        (simcov_report_dir / "buy_simulation_coverage_audit_v1.json").write_text(
+            json.dumps(
+                {
+                    "metrics": {
+                        "buy_rows": 20,
+                        "shadow_simulation_attempted_rows": 20,
+                        "shadow_simulated_rows": 19,
+                        "not_executable_route_rows": 0,
+                    },
+                    "critical_regression_markers": {
+                        "AccountNotFound": 0,
+                        "unsupported_legacy_buy_layout_requires_bcv2": 0,
+                        "ResourceExhausted": 0,
+                    },
+                    "failure_classes": {
+                        "UNKNOWN_UNCLASSIFIED": {"count": 0},
+                        "LEGACY_BC_V2_TAIL_RESOLVER_FAILED": {"count": 0},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        r2only_candidate_selection.build_report(
+            r2only_candidate_selection.build_parser().parse_args(
+                [
+                    "--scope",
+                    scope,
+                    "--root",
+                    str(root),
+                    "--feature-set",
+                    "combined",
+                    "--bootstrap-samples",
+                    "25",
+                    "--logistic-epochs",
+                    "20",
+                ]
+            )
+        )
+        return shadow_score_contract.build_report(
+            shadow_score_contract.build_parser().parse_args(
+                [
+                    "--scope",
+                    scope,
+                    "--root",
+                    str(root),
+                ]
+            )
+        )
+
+    def test_shadow_score_contract_builds_from_p3j_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "selector-p3k-contract-test"
+            report = self.build_shadow_score_contract_fixture(root, scope)
+            output_json_exists = Path(report["outputs"]["selector_shadow_score_contract_v1"]).exists()
+            output_md_exists = Path(report["outputs"]["SELECTOR_SHADOW_SCORE_CONTRACT"]).exists()
+            output_scores_exists = Path(report["outputs"]["selector_shadow_scores_v1"]).exists()
+            output_thresholds_exists = Path(report["outputs"]["selector_shadow_score_thresholds_v1"]).exists()
+
+        self.assertEqual(report["status"], "P3K_PASS_SHADOW_SCORE_CONTRACT_DRAFT")
+        self.assertEqual(report["candidate_contract"]["candidate_id"], "combined:simple_feature_score_v1")
+        self.assertEqual(report["candidate_contract"]["score_version"], "selector_shadow_score_combined_simple_v1")
+        self.assertIn("flow", report["feature_groups"])
+        self.assertIn("gk_curve_market_core", report["feature_groups"])
+        self.assertTrue(output_json_exists)
+        self.assertTrue(output_md_exists)
+        self.assertTrue(output_scores_exists)
+        self.assertTrue(output_thresholds_exists)
+
+    def test_shadow_score_contract_preserves_non_claims(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = self.build_shadow_score_contract_fixture(root, "selector-p3k-non-claims-test")
+
+        self.assertTrue(report["claim_boundaries"]["diagnostic_only"])
+        self.assertTrue(report["claim_boundaries"]["shadow_only"])
+        self.assertFalse(report["claim_boundaries"]["production_promotion_allowed"])
+        self.assertFalse(report["claim_boundaries"]["gatekeeper_tuning_started"])
+        self.assertFalse(report["claim_boundaries"]["runtime_changed"])
+        self.assertFalse(report["claim_boundaries"]["active_execution_changed"])
+        self.assertFalse(report["claim_boundaries"]["send_path_changed"])
+        self.assertFalse(report["candidate_contract"]["production_ready"])
+        self.assertFalse(report["candidate_contract"]["gatekeeper_tuning_ready"])
+        self.assertFalse(report["candidate_contract"]["runtime_active"])
+
+    def test_shadow_score_contract_marks_missing_concentration_degraded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = self.build_shadow_score_contract_fixture(root, "selector-p3k-concentration-test")
+            score_rows = read_jsonl(Path(report["outputs"]["selector_shadow_scores_v1"]))
+
+        self.assertGreater(
+            report["score_validity_status_counts"].get("score_degraded_missing_concentration", 0),
+            0,
+        )
+        self.assertTrue(any(row["concentration_available"] is False for row in score_rows))
+        self.assertTrue(report["missing_policy"]["missing_not_safe"])
+        self.assertTrue(report["missing_policy"]["missing_not_negative_automatically"])
+
+    def test_shadow_score_contract_invalidates_missing_core_curve_market(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "selector-p3k-core-missing-test"
+            candidate_id = "fc0"
+            report = self.build_shadow_score_contract_fixture(
+                root,
+                scope,
+                missing_core_candidate_id=candidate_id,
+            )
+            score_rows = read_jsonl(Path(report["outputs"]["selector_shadow_scores_v1"]))
+            row = next(item for item in score_rows if item["candidate_id"] == candidate_id)
+
+        self.assertEqual(row["score_validity_status"], "score_invalid_missing_core_curve_market")
+        self.assertIn("gk_bonding_progress_pct", row["reason_vector"]["missing"])
+        self.assertGreaterEqual(row["required_feature_missing_count"], 1)
+
+    def test_shadow_score_contract_reproduces_topk_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = self.build_shadow_score_contract_fixture(root, "selector-p3k-repro-test")
+
+        self.assertEqual(report["acceptance"]["topk_reproduction_status"], "PASS")
+        for split_payload in report["topk_reproduction"].values():
+            for payload in split_payload.values():
+                self.assertEqual(payload["status"], "PASS")
+                self.assertEqual(payload["delta"], 0.0)
+
+    def test_shadow_score_contract_writes_reason_vector(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = self.build_shadow_score_contract_fixture(root, "selector-p3k-reason-vector-test")
+            score_rows = read_jsonl(Path(report["outputs"]["selector_shadow_scores_v1"]))
+
+        top_rows = [row for row in score_rows if row["threshold_pass_top10_equiv"]]
+        self.assertTrue(top_rows)
+        for row in top_rows:
+            self.assertIsInstance(row["reason_vector"], dict)
+            self.assertIn("positive", row["reason_vector"])
+            self.assertIn("negative", row["reason_vector"])
+            self.assertIn("missing", row["reason_vector"])
+            self.assertFalse(row["non_claims"]["changes_gatekeeper_decision"])
+            self.assertFalse(row["non_claims"]["changes_execution"])
+            self.assertFalse(row["non_claims"]["production_signal"])
 
     def test_selector_lifecycle_launcher_accepts_build_freshness_flag(self) -> None:
         args = lifecycle_launcher.build_parser().parse_args(
