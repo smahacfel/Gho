@@ -3080,7 +3080,7 @@ fn selector_shadow_median(values: &[f64]) -> Option<f64> {
 }
 
 fn selector_shadow_runtime_feature_value(log: &GatekeeperBuyLog, feature: &str) -> Option<f64> {
-    match feature {
+    let value = match feature {
         "gk_curve_wait_elapsed_ms" => log.curve_wait_elapsed_ms.map(|value| value as f64),
         "gk_bonding_progress_pct" => log.bonding_progress_pct,
         "gk_current_market_cap_sol" => log.current_market_cap_sol,
@@ -3186,13 +3186,17 @@ fn selector_shadow_runtime_feature_value(log: &GatekeeperBuyLog, feature: &str) 
                 .reduce(f64::max)
         }),
         _ => None,
-    }
+    };
+    value.filter(|value| value.is_finite())
 }
 
 fn selector_shadow_normalized_feature(value: Option<f64>, spec: &SelectorShadowFeatureSpec) -> f64 {
     let Some(value) = value else {
         return 0.0;
     };
+    if !value.is_finite() {
+        return 0.0;
+    }
     let denom = spec.max - spec.min;
     if denom.abs() <= f64::EPSILON {
         return 0.0;
@@ -5559,6 +5563,40 @@ mod tests {
             .unwrap()
             .iter()
             .any(|value| value.as_str() == Some("net_quote_in_15s")));
+
+        logger.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_selector_shadow_score_filters_non_finite_feature_values() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().to_path_buf();
+        let logger = DecisionLogger::new(test_decision_logger_config(log_dir.clone()));
+
+        let mut buy_log = create_test_buy_log();
+        buy_log.pool_id = "pool_score_non_finite".to_string();
+        buy_log.observation_end_ts_ms = Some(11_000);
+        buy_log.vectors_prices = Some(vec![f64::NAN, 0.00000004, 0.00000005]);
+        buy_log.vectors_sol_amounts = Some(vec![0.5, 1.0, 2.0]);
+        buy_log.vectors_ts_offsets_ms = Some(vec![0, 250, 1000]);
+        buy_log.ab_record_id = Some("pool_score_non_finite:1000:11000:REJECT".to_string());
+
+        logger.log_gatekeeper_buy_decision(buy_log).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let rows = read_test_selector_shadow_score_rows(&log_dir).await;
+        let row = &rows[0];
+        let score = row["selector_shadow_score"]
+            .as_f64()
+            .expect("non-finite feature inputs must not serialize score as null");
+        assert!(score.is_finite());
+        let missing = row["reason_vector"]["missing"].as_array().unwrap();
+        assert!(missing
+            .iter()
+            .any(|value| value.as_str() == Some("gk_vector_price_first")));
+        assert!(missing
+            .iter()
+            .any(|value| value.as_str() == Some("gk_vector_price_return")));
 
         logger.shutdown().await;
     }
