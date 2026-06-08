@@ -94,6 +94,13 @@ pub const GATEKEEPER_VERSION: &str = "v2.5";
 /// Legacy Gatekeeper version string for pre-V2.5 live-plane semantics.
 pub const LEGACY_GATEKEEPER_VERSION: &str = "v2.2";
 const COORDINATION_RISK_EVIDENCE_JSONL: &str = "coordination_risk_evidence.jsonl";
+/// Additive selector score sidecar. This file is diagnostic-only and must never
+/// be consumed as a Gatekeeper verdict or execution signal.
+pub const SELECTOR_SHADOW_SCORE_JSONL: &str = "selector_shadow_score_v1.jsonl";
+const SELECTOR_SHADOW_SCORE_SCHEMA_VERSION: &str = "selector_shadow_score_v1";
+const SELECTOR_SHADOW_SCORE_VERSION: &str = "selector_shadow_score_combined_simple_v1";
+const SELECTOR_SHADOW_SCORE_CANDIDATE_ID: &str = "combined:simple_feature_score_v1";
+const SELECTOR_SHADOW_SCORE_UNAVAILABLE_STATUS: &str = "score_unavailable_missing_runtime_adapter";
 const DECISION_PLANE_LEGACY_LIVE: &str = "legacy_live";
 const DECISION_PLANE_V25_SHADOW: &str = "v25_shadow";
 
@@ -230,6 +237,74 @@ pub struct GatekeeperGateTraceEntry {
     pub threshold_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason_code: Option<String>,
+}
+
+/// Shadow-only selector score sidecar row.
+///
+/// P3L-A intentionally emits a schema and feature availability inventory before
+/// enabling any runtime score calculation. This keeps the offline P3K score
+/// contract auditable without mutating Gatekeeper decisions, execution
+/// eligibility, or live/send paths.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectorShadowScoreSidecarLog {
+    pub schema_version: String,
+    pub score_version: String,
+    pub score_candidate_id: String,
+    pub scope: String,
+    pub decision_plane: String,
+    pub candidate_id: String,
+    pub pool_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_mint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_ts_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feature_cutoff_ts_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector_shadow_score: Option<f64>,
+    pub score_validity_status: String,
+    pub score_valid: bool,
+    pub score_degraded: bool,
+    pub thresholds: SelectorShadowScoreThresholds,
+    pub reason_vector: SelectorShadowScoreReasonVector,
+    pub feature_availability: SelectorShadowScoreFeatureAvailability,
+    pub claim_boundaries: SelectorShadowScoreClaimBoundaries,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectorShadowScoreThresholds {
+    pub top10_equiv_pass: bool,
+    pub top25_equiv_pass: bool,
+    pub q98_pass: bool,
+    pub q975_pass: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectorShadowScoreReasonVector {
+    pub positive: Vec<String>,
+    pub negative: Vec<String>,
+    pub missing: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectorShadowScoreFeatureAvailability {
+    pub core_curve_market_available: bool,
+    pub concentration_available: bool,
+    pub gk_context_available: bool,
+    pub flow_available: bool,
+    pub runtime_score_adapter_available: bool,
+    pub feature_mapping_status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectorShadowScoreClaimBoundaries {
+    pub diagnostic_only: bool,
+    pub shadow_only: bool,
+    pub production_promotion_allowed: bool,
+    pub gatekeeper_tuning_started: bool,
+    pub changes_gatekeeper_decision: bool,
+    pub changes_execution: bool,
+    pub send_path_changed: bool,
 }
 
 /// Gatekeeper V2 Buy decision log with full phase breakdown
@@ -2082,6 +2157,34 @@ impl DecisionLogger {
                                 );
                             } else {
                                 mark_gatekeeper_log_progress(health.as_ref(), buy_eligible);
+                                if let Err(e) = write_selector_shadow_score_sidecar(
+                                    &config.gatekeeper_log_dir,
+                                    &plane_log,
+                                )
+                                .await
+                                {
+                                    if is_no_space_error(e.chain()) {
+                                        logging_disabled_due_to_enospc = true;
+                                        error!(
+                                            "DecisionLogger: disabling file writes after ENOSPC on selector shadow-score sidecar for {} plane={}",
+                                            plane_log.pool_id,
+                                            plane_log
+                                                .decision_plane
+                                                .as_deref()
+                                                .unwrap_or("unknown")
+                                        );
+                                        continue;
+                                    }
+                                    error!(
+                                        "Failed to write selector shadow-score sidecar for {} plane={}: {}",
+                                        plane_log.pool_id,
+                                        plane_log
+                                            .decision_plane
+                                            .as_deref()
+                                            .unwrap_or("unknown"),
+                                        e
+                                    );
+                                }
                             }
                         }
                     }
@@ -2374,6 +2477,89 @@ fn gatekeeper_route_dir(base_dir: &Path, log: &GatekeeperBuyLog) -> PathBuf {
         .join(config_hash)
 }
 
+fn build_selector_shadow_score_sidecar(log: &GatekeeperBuyLog) -> SelectorShadowScoreSidecarLog {
+    let core_curve_market_available = log.bonding_progress_pct.is_some()
+        && log.current_market_cap_sol.is_some()
+        && log.price_change_ratio.is_some()
+        && log.curve_data_known.unwrap_or(false);
+    let concentration_available = log.hhi.is_some() && log.top3_volume_pct.is_some();
+    let gk_context_available = core_curve_market_available
+        || concentration_available
+        || log.buy_ratio.is_some()
+        || log.total_volume_sol.is_some()
+        || log.unique_tx_evaluated.is_some();
+    let flow_available = false;
+
+    let mut missing = vec!["runtime_score_adapter".to_string()];
+    if !flow_available {
+        missing.push("flow_feature_runtime_mapping".to_string());
+    }
+    if !core_curve_market_available {
+        missing.push("core_curve_market_features".to_string());
+    }
+    if !concentration_available {
+        missing.push("gk_concentration_features".to_string());
+    }
+
+    SelectorShadowScoreSidecarLog {
+        schema_version: SELECTOR_SHADOW_SCORE_SCHEMA_VERSION.to_string(),
+        score_version: SELECTOR_SHADOW_SCORE_VERSION.to_string(),
+        score_candidate_id: SELECTOR_SHADOW_SCORE_CANDIDATE_ID.to_string(),
+        scope: log
+            .rollout_profile
+            .clone()
+            .unwrap_or_else(|| "unknown_rollout".to_string()),
+        decision_plane: log
+            .decision_plane
+            .clone()
+            .unwrap_or_else(|| "unknown_decision_plane".to_string()),
+        candidate_id: log
+            .execution_candidate_id
+            .clone()
+            .or_else(|| log.join_key.clone())
+            .unwrap_or_else(|| log.pool_id.clone()),
+        pool_id: log.pool_id.clone(),
+        base_mint: log.base_mint.clone(),
+        decision_ts_ms: log
+            .observation_end_ts_ms
+            .or(log.end_10s_ts_ms)
+            .or(log.first_seen_ts_ms),
+        feature_cutoff_ts_ms: log.observation_end_ts_ms,
+        selector_shadow_score: None,
+        score_validity_status: SELECTOR_SHADOW_SCORE_UNAVAILABLE_STATUS.to_string(),
+        score_valid: false,
+        score_degraded: false,
+        thresholds: SelectorShadowScoreThresholds {
+            top10_equiv_pass: false,
+            top25_equiv_pass: false,
+            q98_pass: false,
+            q975_pass: false,
+        },
+        reason_vector: SelectorShadowScoreReasonVector {
+            positive: Vec::new(),
+            negative: vec![SELECTOR_SHADOW_SCORE_UNAVAILABLE_STATUS.to_string()],
+            missing,
+        },
+        feature_availability: SelectorShadowScoreFeatureAvailability {
+            core_curve_market_available,
+            concentration_available,
+            gk_context_available,
+            flow_available,
+            runtime_score_adapter_available: false,
+            feature_mapping_status: "schema_only_missing_score_adapter".to_string(),
+        },
+        claim_boundaries: SelectorShadowScoreClaimBoundaries {
+            diagnostic_only: true,
+            shadow_only: true,
+            production_promotion_allowed: false,
+            gatekeeper_tuning_started: false,
+            changes_gatekeeper_decision: false,
+            changes_execution: false,
+            send_path_changed: false,
+        },
+    }
+}
+
 fn coordination_risk_route_dir(base_dir: &Path, unit: &CoordinationRiskEvidenceUnit) -> PathBuf {
     let scope_id = safe_log_path_component(unit.scope_id.as_str(), "unknown_scope");
     let gatekeeper_version = safe_log_path_component(
@@ -2602,6 +2788,44 @@ async fn write_coordination_risk_evidence_unit(
     debug!(
         "Coordination-risk evidence sidecar written for {} to {:?}",
         unit.pool_id, path
+    );
+
+    Ok(())
+}
+
+/// Write an additive selector shadow-score sidecar.
+///
+/// P3L-A keeps this as a dedicated JSONL file next to routed Gatekeeper
+/// decisions. The sidecar is diagnostic-only and deliberately omitted from
+/// `GatekeeperBuyLog` so replay payloads, verdicts, and execution eligibility
+/// remain unchanged.
+async fn write_selector_shadow_score_sidecar(
+    base_dir: &Path,
+    log: &GatekeeperBuyLog,
+) -> Result<()> {
+    let routed_dir = gatekeeper_route_dir(base_dir, log);
+    create_dir_all(&routed_dir)
+        .await
+        .context("Failed to create selector shadow-score sidecar directory")?;
+
+    let path = routed_dir.join(SELECTOR_SHADOW_SCORE_JSONL);
+    let sidecar = build_selector_shadow_score_sidecar(log);
+    let json =
+        serde_json::to_string(&sidecar).context("Failed to serialize selector shadow-score")?;
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .await
+        .context("Failed to open selector shadow-score sidecar file")?;
+    file.write_all(json.as_bytes()).await?;
+    file.write_all(b"\n").await?;
+    file.flush().await?;
+
+    debug!(
+        "Selector shadow-score sidecar written for {} to {:?}",
+        log.pool_id, path
     );
 
     Ok(())
@@ -2933,7 +3157,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_gatekeeper_buy_log_file_write() {
-        use std::path::PathBuf;
         use tempfile::TempDir;
 
         // Create a temporary directory for the test
@@ -4231,6 +4454,292 @@ mod tests {
             .join(gatekeeper_version)
             .join(decision_plane)
             .join("test-config-hash")
+    }
+
+    fn test_decision_logger_config(log_dir: PathBuf) -> DecisionLoggerConfig {
+        DecisionLoggerConfig {
+            log_dir: log_dir.clone(),
+            gatekeeper_log_dir: log_dir,
+            gatekeeper_rollout_profile: "test-rollout".to_string(),
+            gatekeeper_config_hash: "test-config-hash".to_string(),
+            gatekeeper_run_id: None,
+            gatekeeper_session_id: None,
+            brain_config_path: None,
+            brain_config_hash: None,
+            channel_buffer_size: 10,
+            enabled: true,
+        }
+    }
+
+    async fn read_test_selector_shadow_score_rows(log_dir: &Path) -> Vec<serde_json::Value> {
+        let sidecar_file = test_gatekeeper_route_dir(
+            log_dir,
+            LEGACY_GATEKEEPER_VERSION,
+            DECISION_PLANE_LEGACY_LIVE,
+        )
+        .join(SELECTOR_SHADOW_SCORE_JSONL);
+        assert!(sidecar_file.exists(), "selector sidecar should exist");
+        let content = fs::read_to_string(&sidecar_file).await.unwrap();
+        content
+            .trim()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_selector_shadow_score_sidecar_writes_additive_jsonl() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().to_path_buf();
+        let logger = DecisionLogger::new(test_decision_logger_config(log_dir.clone()));
+
+        let mut buy_log = create_test_buy_log();
+        buy_log.pool_id = "pool_score_sidecar".to_string();
+        buy_log.base_mint = Some("mint_score_sidecar".to_string());
+        buy_log.execution_candidate_id = Some("candidate_score_sidecar".to_string());
+        buy_log.ab_record_id = Some("pool_score_sidecar:1000:11000:BUY".to_string());
+        buy_log.decision_verdict_buy = Some(true);
+        buy_log.verdict_type = Some("BUY".to_string());
+        buy_log.reason_code = Some(GatekeeperReasonCode::BuyNormal.as_log_str());
+
+        logger.log_gatekeeper_buy_decision(buy_log).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let decisions_file = test_gatekeeper_route_dir(
+            &log_dir,
+            LEGACY_GATEKEEPER_VERSION,
+            DECISION_PLANE_LEGACY_LIVE,
+        )
+        .join(GATEKEEPER_DECISIONS_JSONL);
+        assert!(decisions_file.exists(), "decision JSONL should still exist");
+
+        let rows = read_test_selector_shadow_score_rows(&log_dir).await;
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row["schema_version"], SELECTOR_SHADOW_SCORE_SCHEMA_VERSION);
+        assert_eq!(row["score_version"], SELECTOR_SHADOW_SCORE_VERSION);
+        assert_eq!(
+            row["score_candidate_id"],
+            SELECTOR_SHADOW_SCORE_CANDIDATE_ID
+        );
+        assert_eq!(row["candidate_id"], "candidate_score_sidecar");
+        assert_eq!(row["pool_id"], "pool_score_sidecar");
+        assert_eq!(row["base_mint"], "mint_score_sidecar");
+
+        logger.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_selector_shadow_score_emitted_for_buy_reject_timeout() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().to_path_buf();
+        let logger = DecisionLogger::new(test_decision_logger_config(log_dir.clone()));
+
+        let mut pass_log = create_test_buy_log();
+        pass_log.pool_id = "pool_score_buy".to_string();
+        pass_log.decision_verdict_buy = Some(true);
+        pass_log.verdict_type = Some("BUY".to_string());
+        pass_log.reason_code = Some(GatekeeperReasonCode::BuyNormal.as_log_str());
+        pass_log.ab_record_id = Some("pool_score_buy:1000:11000:BUY".to_string());
+
+        let mut reject_log = create_test_buy_log();
+        reject_log.pool_id = "pool_score_reject".to_string();
+        reject_log.decision_verdict_buy = Some(false);
+        reject_log.verdict_type = Some("REJECT_CORE_FAIL".to_string());
+        reject_log.reason_code = Some(GatekeeperReasonCode::RejectCoreFail.as_log_str());
+        reject_log.ab_record_id = Some("pool_score_reject:1000:11000:REJECT".to_string());
+
+        let mut timeout_log = create_test_buy_log();
+        timeout_log.pool_id = "pool_score_timeout".to_string();
+        timeout_log.decision_verdict_buy = None;
+        timeout_log.verdict_type = Some("TIMEOUT_PHASE1".to_string());
+        timeout_log.reason_code =
+            Some(GatekeeperReasonCode::TimeoutPhase1Insufficient.as_log_str());
+        timeout_log.ab_record_id = Some("pool_score_timeout:1000:11000:TIMEOUT".to_string());
+
+        logger.log_gatekeeper_buy_decision(pass_log).await;
+        logger.log_gatekeeper_buy_decision(reject_log).await;
+        logger.log_gatekeeper_buy_decision(timeout_log).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        let decisions_file = test_gatekeeper_route_dir(
+            &log_dir,
+            LEGACY_GATEKEEPER_VERSION,
+            DECISION_PLANE_LEGACY_LIVE,
+        )
+        .join(GATEKEEPER_DECISIONS_JSONL);
+        let decisions_content = fs::read_to_string(&decisions_file).await.unwrap();
+        assert_eq!(decisions_content.trim().lines().count(), 3);
+
+        let rows = read_test_selector_shadow_score_rows(&log_dir).await;
+        let pool_ids: Vec<&str> = rows
+            .iter()
+            .map(|row| row["pool_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(pool_ids.len(), 3);
+        assert!(pool_ids.contains(&"pool_score_buy"));
+        assert!(pool_ids.contains(&"pool_score_reject"));
+        assert!(pool_ids.contains(&"pool_score_timeout"));
+
+        logger.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_selector_shadow_score_sidecar_has_non_claim_boundaries() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().to_path_buf();
+        let logger = DecisionLogger::new(test_decision_logger_config(log_dir.clone()));
+
+        let mut buy_log = create_test_buy_log();
+        buy_log.pool_id = "pool_score_boundaries".to_string();
+        buy_log.ab_record_id = Some("pool_score_boundaries:1000:11000:REJECT".to_string());
+
+        logger.log_gatekeeper_buy_decision(buy_log).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let rows = read_test_selector_shadow_score_rows(&log_dir).await;
+        let boundaries = &rows[0]["claim_boundaries"];
+        assert_eq!(boundaries["diagnostic_only"], true);
+        assert_eq!(boundaries["shadow_only"], true);
+        assert_eq!(boundaries["production_promotion_allowed"], false);
+        assert_eq!(boundaries["gatekeeper_tuning_started"], false);
+        assert_eq!(boundaries["changes_gatekeeper_decision"], false);
+        assert_eq!(boundaries["changes_execution"], false);
+        assert_eq!(boundaries["send_path_changed"], false);
+
+        logger.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_selector_shadow_score_does_not_change_gatekeeper_verdict() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().to_path_buf();
+        let logger = DecisionLogger::new(test_decision_logger_config(log_dir.clone()));
+
+        let mut reject_log = create_test_buy_log();
+        reject_log.pool_id = "pool_score_verdict".to_string();
+        reject_log.decision_verdict_buy = Some(false);
+        reject_log.verdict_type = Some("REJECT_CORE_FAIL".to_string());
+        reject_log.reason_code = Some(GatekeeperReasonCode::RejectCoreFail.as_log_str());
+        reject_log.ab_record_id = Some("pool_score_verdict:1000:11000:REJECT".to_string());
+
+        logger.log_gatekeeper_buy_decision(reject_log).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let decisions_file = test_gatekeeper_route_dir(
+            &log_dir,
+            LEGACY_GATEKEEPER_VERSION,
+            DECISION_PLANE_LEGACY_LIVE,
+        )
+        .join(GATEKEEPER_DECISIONS_JSONL);
+        let decisions_content = fs::read_to_string(&decisions_file).await.unwrap();
+        let decision: serde_json::Value =
+            serde_json::from_str(decisions_content.trim().lines().next().unwrap()).unwrap();
+        assert_eq!(decision["decision_verdict_buy"], false);
+        assert_eq!(decision["verdict_type"], "REJECT_CORE_FAIL");
+        assert!(decision.get("selector_shadow_score").is_none());
+
+        let sidecar_rows = read_test_selector_shadow_score_rows(&log_dir).await;
+        assert_eq!(
+            sidecar_rows[0]["claim_boundaries"]["changes_gatekeeper_decision"],
+            false
+        );
+
+        logger.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_selector_shadow_score_does_not_change_execution_eligibility() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().to_path_buf();
+        let logger = DecisionLogger::new(test_decision_logger_config(log_dir.clone()));
+
+        let mut buy_log = create_test_buy_log();
+        buy_log.pool_id = "pool_score_execution".to_string();
+        buy_log.shadow_trigger_eligible = Some(true);
+        buy_log.shadow_execution_outcome = Some("shadow_dispatch_ready".to_string());
+        buy_log.ab_record_id = Some("pool_score_execution:1000:11000:BUY".to_string());
+        buy_log.decision_verdict_buy = Some(true);
+        buy_log.verdict_type = Some("BUY".to_string());
+        buy_log.reason_code = Some(GatekeeperReasonCode::BuyNormal.as_log_str());
+
+        logger.log_gatekeeper_buy_decision(buy_log).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let decisions_file = test_gatekeeper_route_dir(
+            &log_dir,
+            LEGACY_GATEKEEPER_VERSION,
+            DECISION_PLANE_LEGACY_LIVE,
+        )
+        .join(GATEKEEPER_DECISIONS_JSONL);
+        let decisions_content = fs::read_to_string(&decisions_file).await.unwrap();
+        let decision: serde_json::Value =
+            serde_json::from_str(decisions_content.trim().lines().next().unwrap()).unwrap();
+        assert_eq!(decision["shadow_trigger_eligible"], true);
+        assert_eq!(
+            decision["shadow_execution_outcome"],
+            "shadow_dispatch_ready"
+        );
+
+        let sidecar_rows = read_test_selector_shadow_score_rows(&log_dir).await;
+        assert_eq!(
+            sidecar_rows[0]["claim_boundaries"]["changes_execution"],
+            false
+        );
+        assert_eq!(
+            sidecar_rows[0]["claim_boundaries"]["send_path_changed"],
+            false
+        );
+
+        logger.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_selector_shadow_score_unavailable_when_required_features_missing() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().to_path_buf();
+        let logger = DecisionLogger::new(test_decision_logger_config(log_dir.clone()));
+
+        let mut buy_log = create_test_buy_log();
+        buy_log.pool_id = "pool_score_unavailable".to_string();
+        buy_log.bonding_progress_pct = None;
+        buy_log.current_market_cap_sol = None;
+        buy_log.price_change_ratio = None;
+        buy_log.curve_data_known = Some(false);
+        buy_log.hhi = None;
+        buy_log.top3_volume_pct = None;
+        buy_log.ab_record_id = Some("pool_score_unavailable:1000:11000:REJECT".to_string());
+
+        logger.log_gatekeeper_buy_decision(buy_log).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let rows = read_test_selector_shadow_score_rows(&log_dir).await;
+        let row = &rows[0];
+        assert_eq!(
+            row["score_validity_status"],
+            SELECTOR_SHADOW_SCORE_UNAVAILABLE_STATUS
+        );
+        assert_eq!(row["score_valid"], false);
+        assert!(row.get("selector_shadow_score").is_none());
+        assert_eq!(
+            row["feature_availability"]["runtime_score_adapter_available"],
+            false
+        );
+        assert_eq!(
+            row["feature_availability"]["core_curve_market_available"],
+            false
+        );
+        assert_eq!(
+            row["feature_availability"]["concentration_available"],
+            false
+        );
+        assert!(row["reason_vector"]["missing"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value.as_str() == Some("runtime_score_adapter")));
+
+        logger.shutdown().await;
     }
 
     #[tokio::test]
