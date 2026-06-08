@@ -32,6 +32,7 @@ import build_selector_route_evidence_join_report as route_evidence_join
 import build_selector_training_view as training
 import compare_selector_gatekeepers as compare
 import audit_selector_buy_simulation_coverage as simcov_audit
+import audit_selector_shadow_score_sidecar as shadow_score_sidecar_audit
 try:
     import build_selector_coverage_breakthrough_projection as coverage_breakthrough
 except ModuleNotFoundError:
@@ -3804,6 +3805,80 @@ class SelectorPipelineTests(unittest.TestCase):
             self.assertFalse(row["non_claims"]["changes_gatekeeper_decision"])
             self.assertFalse(row["non_claims"]["changes_execution"])
             self.assertFalse(row["non_claims"]["production_signal"])
+
+    def test_shadow_score_sidecar_audit_validates_terminal_decision_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "shadow-score-sidecar-audit-test"
+            decision_dir = (
+                root
+                / "logs"
+                / "rollout"
+                / scope
+                / "decisions"
+                / scope
+                / "v2.2"
+                / "legacy_live"
+                / "fixture"
+            )
+            decisions = [
+                {"candidate_id": "c1", "verdict_type": "BUY"},
+                {"candidate_id": "c2", "verdict_type": "REJECT_HARD_FAIL"},
+                {"candidate_id": "c3", "verdict_type": "TIMEOUT_PHASE1_NO_DATA"},
+            ]
+            score_rows = []
+            for row in decisions:
+                score_rows.append(
+                    {
+                        "schema_version": "selector_shadow_score_v1",
+                        "score_version": "selector_shadow_score_combined_simple_v1",
+                        "score_candidate_id": "combined:simple_feature_score_v1",
+                        "candidate_id": row["candidate_id"],
+                        "gatekeeper_verdict_type": row["verdict_type"],
+                        "selector_shadow_score": 0.42,
+                        "score_validity_status": "score_valid",
+                        "feature_availability": {
+                            "feature_mapping_status": "partial_runtime_mapping_missing_flow_features"
+                        },
+                        "thresholds": {"top10_equiv_pass": False},
+                        "reason_vector": {"positive": [], "negative": [], "missing": []},
+                        "claim_boundaries": {
+                            "diagnostic_only": True,
+                            "shadow_only": True,
+                            "production_promotion_allowed": False,
+                            "gatekeeper_tuning_started": False,
+                            "changes_gatekeeper_decision": False,
+                            "changes_execution": False,
+                            "send_path_changed": False,
+                        },
+                    }
+                )
+            write_jsonl(decision_dir / "gatekeeper_v2_decisions.jsonl", decisions)
+            write_jsonl(decision_dir / "selector_shadow_score_v1.jsonl", score_rows)
+
+            report = shadow_score_sidecar_audit.build_report(
+                shadow_score_sidecar_audit.build_parser().parse_args(
+                    [
+                        "--scope",
+                        scope,
+                        "--root",
+                        str(root),
+                        "--decision-plane",
+                        "legacy_live",
+                        "--min-score-coverage",
+                        "0.95",
+                    ]
+                )
+            )
+
+        self.assertEqual(report["status"], "PASS")
+        self.assertEqual(report["decision_rows"], 3)
+        self.assertEqual(report["score_rows"], 3)
+        self.assertEqual(report["numeric_score_rows"], 3)
+        self.assertEqual(report["claim_boundary_violation_rows"], 0)
+        self.assertEqual(report["decision_influence_claim_rows"], 0)
+        self.assertEqual(report["execution_influence_claim_rows"], 0)
+        self.assertEqual(report["send_path_changed_claim_rows"], 0)
 
     def test_selector_lifecycle_launcher_accepts_build_freshness_flag(self) -> None:
         args = lifecycle_launcher.build_parser().parse_args(
