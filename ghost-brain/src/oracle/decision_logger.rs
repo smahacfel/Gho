@@ -100,9 +100,530 @@ pub const SELECTOR_SHADOW_SCORE_JSONL: &str = "selector_shadow_score_v1.jsonl";
 const SELECTOR_SHADOW_SCORE_SCHEMA_VERSION: &str = "selector_shadow_score_v1";
 const SELECTOR_SHADOW_SCORE_VERSION: &str = "selector_shadow_score_combined_simple_v1";
 const SELECTOR_SHADOW_SCORE_CANDIDATE_ID: &str = "combined:simple_feature_score_v1";
-const SELECTOR_SHADOW_SCORE_UNAVAILABLE_STATUS: &str = "score_unavailable_missing_runtime_adapter";
+const SELECTOR_SHADOW_SCORE_VALID: &str = "score_valid";
+const SELECTOR_SHADOW_SCORE_DEGRADED_MISSING_CONCENTRATION: &str =
+    "score_degraded_missing_concentration";
+const SELECTOR_SHADOW_SCORE_INVALID_MISSING_CORE: &str = "score_invalid_missing_core_curve_market";
+const SELECTOR_SHADOW_SCORE_INVALID_CUTOFF_UNVERIFIED: &str = "score_invalid_cutoff_unverified";
+const SELECTOR_SHADOW_TOP10_EQUIV_THRESHOLD: f64 = 0.69986805365771;
+const SELECTOR_SHADOW_TOP25_EQUIV_THRESHOLD: f64 = 0.6925460600540485;
+const SELECTOR_SHADOW_Q99_THRESHOLD: f64 = 0.6944972661163069;
+const SELECTOR_SHADOW_Q98_THRESHOLD: f64 = 0.6910207260694384;
+const SELECTOR_SHADOW_Q975_THRESHOLD: f64 = 0.6897754365786619;
+const SELECTOR_SHADOW_TARGET_PRECISION_0_70_THRESHOLD: f64 = 0.6851504774409787;
 const DECISION_PLANE_LEGACY_LIVE: &str = "legacy_live";
 const DECISION_PLANE_V25_SHADOW: &str = "v25_shadow";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectorShadowRuntimeFeatureSource {
+    Mapped,
+    MissingRuntimeMapping,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SelectorShadowFeatureSpec {
+    name: &'static str,
+    min: f64,
+    max: f64,
+    direction: f64,
+    source: SelectorShadowRuntimeFeatureSource,
+}
+
+// Frozen from r19 P3J/P3K:
+// selector-phase1-pumpfun-sol-v1-20260608-r19-feature-rich-r2diag-simcov-final
+// candidate_id=combined:simple_feature_score_v1.
+const SELECTOR_SHADOW_FEATURE_SPECS: &[SelectorShadowFeatureSpec] = &[
+    SelectorShadowFeatureSpec {
+        name: "net_quote_in_15s",
+        min: -0.93354436800000196,
+        max: 267.14919743400009,
+        direction: 1.0,
+        source: SelectorShadowRuntimeFeatureSource::MissingRuntimeMapping,
+    },
+    SelectorShadowFeatureSpec {
+        name: "net_quote_in_30s",
+        min: -0.93354436800000196,
+        max: 267.14919743400009,
+        direction: 1.0,
+        source: SelectorShadowRuntimeFeatureSource::MissingRuntimeMapping,
+    },
+    SelectorShadowFeatureSpec {
+        name: "trade_rate",
+        min: 0.0,
+        max: 17.998200179982003,
+        direction: 1.0,
+        source: SelectorShadowRuntimeFeatureSource::MissingRuntimeMapping,
+    },
+    SelectorShadowFeatureSpec {
+        name: "unique_buyers",
+        min: 0.0,
+        max: 107.0,
+        direction: 1.0,
+        source: SelectorShadowRuntimeFeatureSource::MissingRuntimeMapping,
+    },
+    SelectorShadowFeatureSpec {
+        name: "sell_share",
+        min: 0.0,
+        max: 0.90909090909090906,
+        direction: 1.0,
+        source: SelectorShadowRuntimeFeatureSource::MissingRuntimeMapping,
+    },
+    SelectorShadowFeatureSpec {
+        name: "top1_wallet_share",
+        min: 0.061039535295271542,
+        max: 1.0,
+        direction: -1.0,
+        source: SelectorShadowRuntimeFeatureSource::MissingRuntimeMapping,
+    },
+    SelectorShadowFeatureSpec {
+        name: "buyer_hhi",
+        min: 0.018038408746430926,
+        max: 1.0,
+        direction: -1.0,
+        source: SelectorShadowRuntimeFeatureSource::MissingRuntimeMapping,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_curve_wait_elapsed_ms",
+        min: 10002.0,
+        max: 10033.0,
+        direction: -1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_bonding_progress_pct",
+        min: 0.0,
+        max: 100.0,
+        direction: 1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_current_market_cap_sol",
+        min: 0.0,
+        max: 215.158814914,
+        direction: 1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_price_change_ratio",
+        min: 0.0,
+        max: 7.2846422337758385,
+        direction: 1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_max_single_tx_price_impact_pct_observed",
+        min: 0.0,
+        max: 1277.0596242129784,
+        direction: 1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_max_single_sell_impact_pct_observed",
+        min: 0.0,
+        max: 85.206741389537655,
+        direction: 1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_total_tx_evaluated",
+        min: 0.0,
+        max: 174.0,
+        direction: 1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_unique_tx_evaluated",
+        min: 0.0,
+        max: 174.0,
+        direction: 1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_unique_signers_evaluated",
+        min: 0.0,
+        max: 103.0,
+        direction: 1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_buy_count",
+        min: 0.0,
+        max: 109.0,
+        direction: 1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_buy_ratio",
+        min: 0.090909090909090912,
+        max: 1.0,
+        direction: -1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_sell_buy_ratio",
+        min: 0.0,
+        max: 10.0,
+        direction: -1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_sol_buy_ratio",
+        min: 0.48712774238836481,
+        max: 1.0,
+        direction: -1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_total_volume_sol",
+        min: 0.001,
+        max: 267.42312335400004,
+        direction: 1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_avg_tx_sol",
+        min: 0.001,
+        max: 39.506172837999998,
+        direction: 1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_volume_cv",
+        min: 0.0,
+        max: 5.0730213797575932,
+        direction: 1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_volume_gini",
+        min: 0.0,
+        max: 0.93775422557405719,
+        direction: 1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_hhi",
+        min: 0.011687363038714402,
+        max: 1.0,
+        direction: -1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_top3_volume_pct",
+        min: 0.16526499168337733,
+        max: 1.0000000000000013,
+        direction: -1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_same_ms_tx_ratio",
+        min: 0.0,
+        max: 0.72727272727272729,
+        direction: -1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_max_consecutive_buys_observed",
+        min: 1.0,
+        max: 57.0,
+        direction: 1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_dev_buy_total_sol",
+        min: 0.0,
+        max: 85.005359057000007,
+        direction: 1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_dev_tx_ratio",
+        min: 0.0,
+        max: 1.0,
+        direction: -1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_dev_volume_ratio",
+        min: 0.0,
+        max: 1.0000000000000002,
+        direction: -1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_dev_has_sold",
+        min: 0.0,
+        max: 1.0,
+        direction: -1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_dev_sold_within_3s",
+        min: 0.0,
+        max: 1.0,
+        direction: -1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_dev_sold_within_5s",
+        min: 0.0,
+        max: 1.0,
+        direction: -1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_block0_sniped_supply_pct",
+        min: 0.0,
+        max: 1.0435198862184567,
+        direction: 1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_flip_ratio_10s",
+        min: 0.0,
+        max: 1.0,
+        direction: -1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_buyer_pre_balance_cv",
+        min: 0.43297197375371305,
+        max: 7.1006613119179018,
+        direction: 1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_cu_price_p90_1s",
+        min: 1.0,
+        max: 15000000000.0,
+        direction: -1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_cu_price_p90_10s",
+        min: 1.0,
+        max: 2444444444.0,
+        direction: -1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_priority_fee_surge_slope",
+        min: -1664965880.7777777,
+        max: 265113805.1111111,
+        direction: -1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_fee_topology_diversity_index",
+        min: 0.042857142857142858,
+        max: 1.0,
+        direction: 1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_dev_buyer_infrastructure_affinity",
+        min: 0.0,
+        max: 0.55000000000000004,
+        direction: 1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_spend_fraction_divergence",
+        min: 0.0,
+        max: 0.44452863472766163,
+        direction: 1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_demand_elasticity_score",
+        min: -1.0,
+        max: 1.0,
+        direction: -1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_signer_cross_pool_velocity",
+        min: 0.0,
+        max: 1.0,
+        direction: 1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_compute_unit_cluster_dominance",
+        min: 0.16037735849056603,
+        max: 0.92307692307692313,
+        direction: -1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_static_fee_profile_ratio",
+        min: 0.058823529411764705,
+        max: 1.0,
+        direction: 1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_fixed_size_buy_ratio",
+        min: 0.024691358024691357,
+        max: 1.0,
+        direction: -1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_flipper_presence_ratio",
+        min: 0.0,
+        max: 1.0,
+        direction: -1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_jito_tip_intensity",
+        min: 0.0,
+        max: 1.0,
+        direction: 1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_early_slot_volume_dominance_buy",
+        min: 0.0,
+        max: 1.0000000000000002,
+        direction: -1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_early_top3_buy_volume_pct_3s",
+        min: 0.16313553352604218,
+        max: 1.0000000000000002,
+        direction: -1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_whale_reversal_ratio_top3",
+        min: 0.0,
+        max: 1.4811318070421395,
+        direction: -1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_whale_reversal_ratio_top1",
+        min: 0.0,
+        max: 3.3959483927726843,
+        direction: -1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_iwim_confidence",
+        min: 0.0,
+        max: 1.0,
+        direction: 1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_iwim_sybil_score",
+        min: 0.20000000000000001,
+        max: 0.40000000000000002,
+        direction: 1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_iwim_organic_score",
+        min: 0.90000000000000002,
+        max: 1.0,
+        direction: -1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_fsc_buyer_sample_count",
+        min: 0.0,
+        max: 88.0,
+        direction: 1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_vector_event_count",
+        min: 1.0,
+        max: 48.0,
+        direction: 1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_vector_price_first",
+        min: 2.7960857440198816e-08,
+        max: 4.1088016812075742e-07,
+        direction: 1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_vector_price_last",
+        min: 6.5405163524447076e-09,
+        max: 1.7881629156092599e-06,
+        direction: 1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_vector_price_return",
+        min: -0.76761931836160091,
+        max: 58.944681273478011,
+        direction: 1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_vector_price_max",
+        min: 2.7960857440198816e-08,
+        max: 1.7881629156092599e-06,
+        direction: 1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_vector_price_min",
+        min: 6.5405163524447076e-09,
+        max: 4.1088016812075742e-07,
+        direction: 1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_vector_price_drawdown",
+        min: 0.0,
+        max: 0.76761931836160091,
+        direction: 1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_vector_sol_sum",
+        min: 0.001,
+        max: 262.35652092100003,
+        direction: 1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_vector_sol_max",
+        min: 0.001,
+        max: 89.686098654000006,
+        direction: 1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_vector_interval_median",
+        min: 0.0,
+        max: 1998.0,
+        direction: 1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_vector_interval_min",
+        min: 0.0,
+        max: 1998.0,
+        direction: 1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+    SelectorShadowFeatureSpec {
+        name: "gk_vector_interval_max",
+        min: 0.0,
+        max: 1998.0,
+        direction: 1.0,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
+    },
+];
 
 fn is_no_space_error<'a>(
     errors: impl IntoIterator<Item = &'a (dyn std::error::Error + 'static)>,
@@ -257,6 +778,8 @@ pub struct SelectorShadowScoreSidecarLog {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_mint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gatekeeper_verdict_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision_ts_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feature_cutoff_ts_ms: Option<u64>,
@@ -265,6 +788,8 @@ pub struct SelectorShadowScoreSidecarLog {
     pub score_validity_status: String,
     pub score_valid: bool,
     pub score_degraded: bool,
+    pub feature_missing_count: usize,
+    pub required_feature_missing_count: usize,
     pub thresholds: SelectorShadowScoreThresholds,
     pub reason_vector: SelectorShadowScoreReasonVector,
     pub feature_availability: SelectorShadowScoreFeatureAvailability,
@@ -275,8 +800,10 @@ pub struct SelectorShadowScoreSidecarLog {
 pub struct SelectorShadowScoreThresholds {
     pub top10_equiv_pass: bool,
     pub top25_equiv_pass: bool,
+    pub q99_pass: bool,
     pub q98_pass: bool,
     pub q975_pass: bool,
+    pub target_precision_0_70_pass: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -294,6 +821,9 @@ pub struct SelectorShadowScoreFeatureAvailability {
     pub flow_available: bool,
     pub runtime_score_adapter_available: bool,
     pub feature_mapping_status: String,
+    pub mapped_feature_count: usize,
+    pub missing_runtime_mapping_count: usize,
+    pub cutoff_verified: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2477,29 +3007,300 @@ fn gatekeeper_route_dir(base_dir: &Path, log: &GatekeeperBuyLog) -> PathBuf {
         .join(config_hash)
 }
 
+fn selector_shadow_bool_value(value: Option<bool>) -> Option<f64> {
+    value.map(|flag| if flag { 1.0 } else { 0.0 })
+}
+
+fn selector_shadow_vector_event_count(log: &GatekeeperBuyLog) -> Option<f64> {
+    let count = [
+        log.vectors_prices.as_ref().map(Vec::len),
+        log.vectors_sol_amounts.as_ref().map(Vec::len),
+        log.vectors_ts_offsets_ms.as_ref().map(Vec::len),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+    .unwrap_or(0);
+    if count > 0 {
+        Some(count as f64)
+    } else {
+        None
+    }
+}
+
+fn selector_shadow_price_return(prices: &[f64]) -> Option<f64> {
+    let first = *prices.first()?;
+    if first == 0.0 {
+        return None;
+    }
+    let last = *prices.last()?;
+    Some((last / first) - 1.0)
+}
+
+fn selector_shadow_price_drawdown(prices: &[f64]) -> Option<f64> {
+    let mut iter = prices.iter().copied();
+    let mut peak = iter.next()?;
+    let mut max_drawdown = 0.0;
+    for price in std::iter::once(peak).chain(iter) {
+        if price > peak {
+            peak = price;
+        }
+        if peak > 0.0 {
+            let drawdown = (peak - price) / peak;
+            if drawdown > max_drawdown {
+                max_drawdown = drawdown;
+            }
+        }
+    }
+    Some(max_drawdown)
+}
+
+fn selector_shadow_intervals_from_offsets(offsets: &[i64]) -> Vec<f64> {
+    if offsets.len() < 2 {
+        return Vec::new();
+    }
+    offsets
+        .windows(2)
+        .map(|pair| (pair[1] - pair[0]).max(0) as f64)
+        .collect()
+}
+
+fn selector_shadow_median(values: &[f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = sorted.len() / 2;
+    if sorted.len() % 2 == 0 {
+        Some((sorted[mid - 1] + sorted[mid]) / 2.0)
+    } else {
+        Some(sorted[mid])
+    }
+}
+
+fn selector_shadow_runtime_feature_value(log: &GatekeeperBuyLog, feature: &str) -> Option<f64> {
+    match feature {
+        "gk_curve_wait_elapsed_ms" => log.curve_wait_elapsed_ms.map(|value| value as f64),
+        "gk_bonding_progress_pct" => log.bonding_progress_pct,
+        "gk_current_market_cap_sol" => log.current_market_cap_sol,
+        "gk_price_change_ratio" => log.price_change_ratio,
+        "gk_max_single_tx_price_impact_pct_observed" => log.max_single_tx_price_impact_pct_observed,
+        "gk_max_single_sell_impact_pct_observed" => log.max_single_sell_impact_pct_observed,
+        "gk_total_tx_evaluated" => Some(log.total_tx_evaluated as f64),
+        "gk_unique_tx_evaluated" => log.unique_tx_evaluated.map(|value| value as f64),
+        "gk_unique_signers_evaluated" => Some(log.unique_signers_evaluated as f64),
+        "gk_buy_count" => Some(log.buy_count as f64),
+        "gk_buy_ratio" => log.buy_ratio,
+        "gk_sell_buy_ratio" => log.sell_buy_ratio,
+        "gk_sol_buy_ratio" => log.sol_buy_ratio,
+        "gk_total_volume_sol" => log.total_volume_sol,
+        "gk_avg_tx_sol" => log.avg_tx_sol,
+        "gk_volume_cv" => log.volume_cv,
+        "gk_volume_gini" => log.volume_gini,
+        "gk_hhi" => log.hhi,
+        "gk_top3_volume_pct" => log.top3_volume_pct,
+        "gk_same_ms_tx_ratio" => log.same_ms_tx_ratio,
+        "gk_max_consecutive_buys_observed" => {
+            log.max_consecutive_buys_observed.map(|value| value as f64)
+        }
+        "gk_dev_buy_total_sol" => log.dev_buy_total_sol,
+        "gk_dev_tx_ratio" => log.dev_tx_ratio,
+        "gk_dev_volume_ratio" => log.dev_volume_ratio,
+        "gk_dev_has_sold" => selector_shadow_bool_value(log.dev_has_sold),
+        "gk_dev_sold_within_3s" => selector_shadow_bool_value(log.dev_sold_within_3s),
+        "gk_dev_sold_within_5s" => selector_shadow_bool_value(log.dev_sold_within_5s),
+        "gk_block0_sniped_supply_pct" => log.block0_sniped_supply_pct,
+        "gk_flip_ratio_10s" => log.flip_ratio_10s,
+        "gk_buyer_pre_balance_cv" => log.buyer_pre_balance_cv,
+        "gk_cu_price_p90_1s" => log.cu_price_p90_1s,
+        "gk_cu_price_p90_10s" => log.cu_price_p90_10s,
+        "gk_priority_fee_surge_slope" => log.priority_fee_surge_slope,
+        "gk_fee_topology_diversity_index" => log.fee_topology_diversity_index,
+        "gk_dev_buyer_infrastructure_affinity" => log.dev_buyer_infrastructure_affinity,
+        "gk_spend_fraction_divergence" => log.spend_fraction_divergence,
+        "gk_demand_elasticity_score" => log.demand_elasticity_score,
+        "gk_signer_cross_pool_velocity" => log.signer_cross_pool_velocity,
+        "gk_compute_unit_cluster_dominance" => log.compute_unit_cluster_dominance,
+        "gk_static_fee_profile_ratio" => log.static_fee_profile_ratio,
+        "gk_fixed_size_buy_ratio" => log.fixed_size_buy_ratio,
+        "gk_flipper_presence_ratio" => log.flipper_presence_ratio,
+        "gk_jito_tip_intensity" => log.jito_tip_intensity,
+        "gk_early_slot_volume_dominance_buy" => log.early_slot_volume_dominance_buy,
+        "gk_early_top3_buy_volume_pct_3s" => log.early_top3_buy_volume_pct_3s,
+        "gk_whale_reversal_ratio_top3" => log.whale_reversal_ratio_top3,
+        "gk_whale_reversal_ratio_top1" => log.whale_reversal_ratio_top1,
+        "gk_iwim_confidence" => log.iwim_confidence.map(f64::from),
+        "gk_iwim_sybil_score" => log.iwim_sybil_score.map(f64::from),
+        "gk_iwim_organic_score" => log.iwim_organic_score.map(f64::from),
+        "gk_fsc_buyer_sample_count" => log
+            .funding_source_v2
+            .as_ref()
+            .map(|evidence| f64::from(evidence.total_buyers)),
+        "gk_vector_event_count" => selector_shadow_vector_event_count(log),
+        "gk_vector_price_first" => log
+            .vectors_prices
+            .as_ref()
+            .and_then(|prices| prices.first().copied()),
+        "gk_vector_price_last" => log
+            .vectors_prices
+            .as_ref()
+            .and_then(|prices| prices.last().copied()),
+        "gk_vector_price_return" => log
+            .vectors_prices
+            .as_ref()
+            .and_then(|prices| selector_shadow_price_return(prices)),
+        "gk_vector_price_max" => log
+            .vectors_prices
+            .as_ref()
+            .and_then(|prices| prices.iter().copied().reduce(f64::max)),
+        "gk_vector_price_min" => log
+            .vectors_prices
+            .as_ref()
+            .and_then(|prices| prices.iter().copied().reduce(f64::min)),
+        "gk_vector_price_drawdown" => log
+            .vectors_prices
+            .as_ref()
+            .and_then(|prices| selector_shadow_price_drawdown(prices)),
+        "gk_vector_sol_sum" => log
+            .vectors_sol_amounts
+            .as_ref()
+            .map(|amounts| amounts.iter().sum()),
+        "gk_vector_sol_max" => log
+            .vectors_sol_amounts
+            .as_ref()
+            .and_then(|amounts| amounts.iter().copied().reduce(f64::max)),
+        "gk_vector_interval_median" => log.vectors_ts_offsets_ms.as_ref().and_then(|offsets| {
+            selector_shadow_median(&selector_shadow_intervals_from_offsets(offsets))
+        }),
+        "gk_vector_interval_min" => log.vectors_ts_offsets_ms.as_ref().and_then(|offsets| {
+            selector_shadow_intervals_from_offsets(offsets)
+                .iter()
+                .copied()
+                .reduce(f64::min)
+        }),
+        "gk_vector_interval_max" => log.vectors_ts_offsets_ms.as_ref().and_then(|offsets| {
+            selector_shadow_intervals_from_offsets(offsets)
+                .iter()
+                .copied()
+                .reduce(f64::max)
+        }),
+        _ => None,
+    }
+}
+
+fn selector_shadow_normalized_feature(value: Option<f64>, spec: &SelectorShadowFeatureSpec) -> f64 {
+    let Some(value) = value else {
+        return 0.0;
+    };
+    let denom = spec.max - spec.min;
+    if denom.abs() <= f64::EPSILON {
+        return 0.0;
+    }
+    let mut normalized = (value - spec.min) / denom;
+    if spec.direction < 0.0 {
+        normalized = 1.0 - normalized;
+    }
+    normalized.clamp(0.0, 1.0)
+}
+
 fn build_selector_shadow_score_sidecar(log: &GatekeeperBuyLog) -> SelectorShadowScoreSidecarLog {
+    let cutoff_verified = log.observation_end_ts_ms.is_some();
     let core_curve_market_available = log.bonding_progress_pct.is_some()
         && log.current_market_cap_sol.is_some()
         && log.price_change_ratio.is_some()
         && log.curve_data_known.unwrap_or(false);
     let concentration_available = log.hhi.is_some() && log.top3_volume_pct.is_some();
-    let gk_context_available = core_curve_market_available
-        || concentration_available
-        || log.buy_ratio.is_some()
-        || log.total_volume_sol.is_some()
-        || log.unique_tx_evaluated.is_some();
-    let flow_available = false;
 
-    let mut missing = vec!["runtime_score_adapter".to_string()];
-    if !flow_available {
-        missing.push("flow_feature_runtime_mapping".to_string());
+    let mut missing = Vec::new();
+    let mut positive = Vec::new();
+    let mut negative = Vec::new();
+    let mut missing_runtime_mapping_count = 0usize;
+    let mut mapped_feature_count = 0usize;
+    let mut normalized_sum = 0.0;
+
+    for spec in SELECTOR_SHADOW_FEATURE_SPECS {
+        let value = match spec.source {
+            SelectorShadowRuntimeFeatureSource::Mapped => {
+                let value = selector_shadow_runtime_feature_value(log, spec.name);
+                if value.is_some() {
+                    mapped_feature_count += 1;
+                }
+                value
+            }
+            SelectorShadowRuntimeFeatureSource::MissingRuntimeMapping => {
+                missing_runtime_mapping_count += 1;
+                None
+            }
+        };
+        if value.is_none() {
+            missing.push(spec.name.to_string());
+        }
+        let normalized = selector_shadow_normalized_feature(value, spec);
+        normalized_sum += normalized;
+        if value.is_some() {
+            if normalized >= 0.75 {
+                if spec.direction >= 0.0 {
+                    positive.push(format!("high_{}", spec.name));
+                } else {
+                    positive.push(format!("low_{}", spec.name));
+                }
+            } else if normalized <= 0.25 {
+                if spec.direction >= 0.0 {
+                    negative.push(format!("low_{}", spec.name));
+                } else {
+                    negative.push(format!("high_{}", spec.name));
+                }
+            }
+        }
     }
-    if !core_curve_market_available {
-        missing.push("core_curve_market_features".to_string());
+
+    let selector_shadow_score = Some(normalized_sum / SELECTOR_SHADOW_FEATURE_SPECS.len() as f64);
+    let required_missing = [
+        "gk_bonding_progress_pct",
+        "gk_current_market_cap_sol",
+        "gk_price_change_ratio",
+    ]
+    .into_iter()
+    .filter(|feature| selector_shadow_runtime_feature_value(log, feature).is_none())
+    .count()
+        + usize::from(!log.curve_data_known.unwrap_or(false));
+    let gk_context_available = mapped_feature_count > 0 && cutoff_verified;
+    let flow_available = SELECTOR_SHADOW_FEATURE_SPECS.iter().any(|spec| {
+        !spec.name.starts_with("gk_")
+            && spec.source == SelectorShadowRuntimeFeatureSource::Mapped
+            && selector_shadow_runtime_feature_value(log, spec.name).is_some()
+    });
+    let score_validity_status = if !cutoff_verified {
+        SELECTOR_SHADOW_SCORE_INVALID_CUTOFF_UNVERIFIED
+    } else if required_missing > 0 || !core_curve_market_available {
+        SELECTOR_SHADOW_SCORE_INVALID_MISSING_CORE
+    } else if !concentration_available {
+        SELECTOR_SHADOW_SCORE_DEGRADED_MISSING_CONCENTRATION
+    } else {
+        SELECTOR_SHADOW_SCORE_VALID
     }
+    .to_string();
+    let score_valid = score_validity_status == SELECTOR_SHADOW_SCORE_VALID;
+    let score_degraded = score_validity_status.starts_with("score_degraded");
+
     if !concentration_available {
-        missing.push("gk_concentration_features".to_string());
+        if log.hhi.is_none() {
+            negative.insert(0, "gk_concentration_missing".to_string());
+        }
+        if log.top3_volume_pct.is_none() {
+            negative.insert(0, "gk_top3_volume_pct_missing".to_string());
+        }
     }
+    if !gk_context_available {
+        negative.insert(0, "gk_context_missing_or_unverified".to_string());
+    }
+
+    positive.truncate(12);
+    negative.truncate(12);
+    missing.truncate(40);
+
+    let threshold_score = selector_shadow_score.unwrap_or(0.0);
 
     SelectorShadowScoreSidecarLog {
         schema_version: SELECTOR_SHADOW_SCORE_SCHEMA_VERSION.to_string(),
@@ -2520,24 +3321,30 @@ fn build_selector_shadow_score_sidecar(log: &GatekeeperBuyLog) -> SelectorShadow
             .unwrap_or_else(|| log.pool_id.clone()),
         pool_id: log.pool_id.clone(),
         base_mint: log.base_mint.clone(),
+        gatekeeper_verdict_type: log.verdict_type.clone(),
         decision_ts_ms: log
             .observation_end_ts_ms
             .or(log.end_10s_ts_ms)
             .or(log.first_seen_ts_ms),
         feature_cutoff_ts_ms: log.observation_end_ts_ms,
-        selector_shadow_score: None,
-        score_validity_status: SELECTOR_SHADOW_SCORE_UNAVAILABLE_STATUS.to_string(),
-        score_valid: false,
-        score_degraded: false,
+        selector_shadow_score,
+        score_validity_status,
+        score_valid,
+        score_degraded,
+        feature_missing_count: SELECTOR_SHADOW_FEATURE_SPECS.len() - mapped_feature_count,
+        required_feature_missing_count: required_missing,
         thresholds: SelectorShadowScoreThresholds {
-            top10_equiv_pass: false,
-            top25_equiv_pass: false,
-            q98_pass: false,
-            q975_pass: false,
+            top10_equiv_pass: threshold_score >= SELECTOR_SHADOW_TOP10_EQUIV_THRESHOLD,
+            top25_equiv_pass: threshold_score >= SELECTOR_SHADOW_TOP25_EQUIV_THRESHOLD,
+            q99_pass: threshold_score >= SELECTOR_SHADOW_Q99_THRESHOLD,
+            q98_pass: threshold_score >= SELECTOR_SHADOW_Q98_THRESHOLD,
+            q975_pass: threshold_score >= SELECTOR_SHADOW_Q975_THRESHOLD,
+            target_precision_0_70_pass: threshold_score
+                >= SELECTOR_SHADOW_TARGET_PRECISION_0_70_THRESHOLD,
         },
         reason_vector: SelectorShadowScoreReasonVector {
-            positive: Vec::new(),
-            negative: vec![SELECTOR_SHADOW_SCORE_UNAVAILABLE_STATUS.to_string()],
+            positive,
+            negative,
             missing,
         },
         feature_availability: SelectorShadowScoreFeatureAvailability {
@@ -2545,8 +3352,15 @@ fn build_selector_shadow_score_sidecar(log: &GatekeeperBuyLog) -> SelectorShadow
             concentration_available,
             gk_context_available,
             flow_available,
-            runtime_score_adapter_available: false,
-            feature_mapping_status: "schema_only_missing_score_adapter".to_string(),
+            runtime_score_adapter_available: true,
+            feature_mapping_status: if missing_runtime_mapping_count == 0 {
+                "complete_runtime_mapping".to_string()
+            } else {
+                "partial_runtime_mapping_missing_flow_features".to_string()
+            },
+            mapped_feature_count,
+            missing_runtime_mapping_count,
+            cutoff_verified,
         },
         claim_boundaries: SelectorShadowScoreClaimBoundaries {
             diagnostic_only: true,
@@ -4525,6 +5339,7 @@ mod tests {
         assert_eq!(row["candidate_id"], "candidate_score_sidecar");
         assert_eq!(row["pool_id"], "pool_score_sidecar");
         assert_eq!(row["base_mint"], "mint_score_sidecar");
+        assert_eq!(row["gatekeeper_verdict_type"], "BUY");
 
         logger.shutdown().await;
     }
@@ -4580,6 +5395,13 @@ mod tests {
         assert!(pool_ids.contains(&"pool_score_buy"));
         assert!(pool_ids.contains(&"pool_score_reject"));
         assert!(pool_ids.contains(&"pool_score_timeout"));
+        let verdict_types: Vec<&str> = rows
+            .iter()
+            .map(|row| row["gatekeeper_verdict_type"].as_str().unwrap())
+            .collect();
+        assert!(verdict_types.contains(&"BUY"));
+        assert!(verdict_types.contains(&"REJECT_CORE_FAIL"));
+        assert!(verdict_types.contains(&"TIMEOUT_PHASE1"));
 
         logger.shutdown().await;
     }
@@ -4695,20 +5517,107 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_selector_shadow_score_unavailable_when_required_features_missing() {
+    async fn test_selector_shadow_score_numeric_when_features_available() {
         let temp_dir = TempDir::new().unwrap();
         let log_dir = temp_dir.path().to_path_buf();
         let logger = DecisionLogger::new(test_decision_logger_config(log_dir.clone()));
 
         let mut buy_log = create_test_buy_log();
-        buy_log.pool_id = "pool_score_unavailable".to_string();
+        buy_log.pool_id = "pool_score_numeric".to_string();
+        buy_log.observation_end_ts_ms = Some(11_000);
+        buy_log.curve_wait_elapsed_ms = Some(10_010);
+        buy_log.vectors_ts_offsets_ms = Some(vec![0, 250, 1000, 1800]);
+        buy_log.vectors_sol_amounts = Some(vec![0.5, 1.0, 2.0, 0.75]);
+        buy_log.vectors_prices = Some(vec![0.00000003, 0.00000004, 0.00000005, 0.000000045]);
+        buy_log.ab_record_id = Some("pool_score_numeric:1000:11000:BUY".to_string());
+
+        logger.log_gatekeeper_buy_decision(buy_log).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let rows = read_test_selector_shadow_score_rows(&log_dir).await;
+        let row = &rows[0];
+        let score = row["selector_shadow_score"]
+            .as_f64()
+            .expect("P3L-B should emit a numeric shadow score");
+        assert!((0.0..=1.0).contains(&score));
+        assert_eq!(row["score_validity_status"], SELECTOR_SHADOW_SCORE_VALID);
+        assert_eq!(row["score_valid"], true);
+        assert_eq!(row["score_degraded"], false);
+        assert_eq!(
+            row["feature_availability"]["runtime_score_adapter_available"],
+            true
+        );
+        assert_eq!(
+            row["feature_availability"]["feature_mapping_status"],
+            "partial_runtime_mapping_missing_flow_features"
+        );
+        assert_eq!(row["feature_availability"]["cutoff_verified"], true);
+        assert!(row["feature_missing_count"].as_u64().unwrap() > 0);
+        assert_eq!(row["required_feature_missing_count"], 0);
+        assert!(row["reason_vector"]["missing"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value.as_str() == Some("net_quote_in_15s")));
+
+        logger.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_selector_shadow_score_degraded_when_concentration_missing() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().to_path_buf();
+        let logger = DecisionLogger::new(test_decision_logger_config(log_dir.clone()));
+
+        let mut buy_log = create_test_buy_log();
+        buy_log.pool_id = "pool_score_degraded_concentration".to_string();
+        buy_log.observation_end_ts_ms = Some(11_000);
+        buy_log.hhi = None;
+        buy_log.top3_volume_pct = None;
+        buy_log.ab_record_id =
+            Some("pool_score_degraded_concentration:1000:11000:REJECT".to_string());
+
+        logger.log_gatekeeper_buy_decision(buy_log).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let rows = read_test_selector_shadow_score_rows(&log_dir).await;
+        let row = &rows[0];
+        assert!(row["selector_shadow_score"].as_f64().is_some());
+        assert_eq!(
+            row["score_validity_status"],
+            SELECTOR_SHADOW_SCORE_DEGRADED_MISSING_CONCENTRATION
+        );
+        assert_eq!(row["score_valid"], false);
+        assert_eq!(row["score_degraded"], true);
+        assert_eq!(
+            row["feature_availability"]["concentration_available"],
+            false
+        );
+        assert!(row["reason_vector"]["negative"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value.as_str() == Some("gk_concentration_missing")));
+
+        logger.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_selector_shadow_score_invalid_when_core_curve_missing() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().to_path_buf();
+        let logger = DecisionLogger::new(test_decision_logger_config(log_dir.clone()));
+
+        let mut buy_log = create_test_buy_log();
+        buy_log.pool_id = "pool_score_invalid_core".to_string();
+        buy_log.observation_end_ts_ms = Some(11_000);
         buy_log.bonding_progress_pct = None;
         buy_log.current_market_cap_sol = None;
         buy_log.price_change_ratio = None;
         buy_log.curve_data_known = Some(false);
         buy_log.hhi = None;
         buy_log.top3_volume_pct = None;
-        buy_log.ab_record_id = Some("pool_score_unavailable:1000:11000:REJECT".to_string());
+        buy_log.ab_record_id = Some("pool_score_invalid_core:1000:11000:REJECT".to_string());
 
         logger.log_gatekeeper_buy_decision(buy_log).await;
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -4717,13 +5626,14 @@ mod tests {
         let row = &rows[0];
         assert_eq!(
             row["score_validity_status"],
-            SELECTOR_SHADOW_SCORE_UNAVAILABLE_STATUS
+            SELECTOR_SHADOW_SCORE_INVALID_MISSING_CORE
         );
         assert_eq!(row["score_valid"], false);
-        assert!(row.get("selector_shadow_score").is_none());
+        assert_eq!(row["score_degraded"], false);
+        assert!(row["selector_shadow_score"].as_f64().is_some());
         assert_eq!(
             row["feature_availability"]["runtime_score_adapter_available"],
-            false
+            true
         );
         assert_eq!(
             row["feature_availability"]["core_curve_market_available"],
@@ -4737,7 +5647,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .any(|value| value.as_str() == Some("runtime_score_adapter")));
+            .any(|value| value.as_str() == Some("gk_bonding_progress_pct")));
 
         logger.shutdown().await;
     }
