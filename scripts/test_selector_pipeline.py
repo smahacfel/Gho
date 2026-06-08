@@ -3923,6 +3923,13 @@ class SelectorPipelineTests(unittest.TestCase):
             "sell_buy_ratio": 0.2,
             "total_volume_sol": 5.0,
             "avg_tx_sol": 0.5,
+            "net_quote_in_15s": 3.0,
+            "net_quote_in_30s": 3.0,
+            "trade_rate": 1.0,
+            "unique_buyers": 4,
+            "sell_share": 0.2,
+            "top1_wallet_share": 0.35,
+            "buyer_hhi": 0.25,
         }
         expected = shadow_score_parity_audit.recompute(decision, specs, thresholds)
         score_row = {
@@ -4009,15 +4016,18 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertEqual(report["status"], "FAIL")
         self.assertIn("threshold_pass_mismatch_count=1", report["fail_reasons"])
 
-    def test_shadow_score_parity_reports_missing_flow_drift(self) -> None:
+    def test_shadow_score_parity_reports_complete_flow_mapping(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             scope = "shadow-score-parity-drift"
             _, rust_source = self.write_shadow_score_parity_fixture(root, scope=scope)
             report = self.run_shadow_score_parity_fixture(root, scope, rust_source)
 
-        self.assertEqual(report["mapped_only_drift"]["status"], "DRIFT_MEASURED_EXPECTED_MISSING_FLOW_FEATURES")
-        self.assertIn("net_quote_in_15s", report["feature_spec"]["missing_runtime_mapping_features"])
+        self.assertEqual(
+            report["mapped_only_drift"]["status"],
+            "NO_RUNTIME_MAPPING_DRIFT_FULL_MAPPING_AVAILABLE",
+        )
+        self.assertEqual(report["feature_spec"]["missing_runtime_mapping_features"], [])
         self.assertGreater(report["feature_spec"]["mapped_features"], 0)
 
     def test_shadow_score_parity_requires_non_claim_boundaries(self) -> None:

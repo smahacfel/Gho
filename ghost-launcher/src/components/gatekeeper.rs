@@ -470,6 +470,17 @@ pub struct WindowVectors {
     pub max_len: u32,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct SelectorFlowFeatures {
+    pub net_quote_in_15s: f64,
+    pub net_quote_in_30s: f64,
+    pub trade_rate: f64,
+    pub unique_buyers: u32,
+    pub sell_share: Option<f64>,
+    pub top1_wallet_share: Option<f64>,
+    pub buyer_hhi: Option<f64>,
+}
+
 /// Phase 6: Bonding Curve Dynamics
 #[derive(Debug, Clone)]
 pub struct BondingCurveDynamics {
@@ -3065,6 +3076,13 @@ impl GatekeeperAssessment {
             ab_fail_count_window: None,
             ab_window_origin: None,
             ab_record_id: None,
+            net_quote_in_15s: None,
+            net_quote_in_30s: None,
+            trade_rate: None,
+            unique_buyers: None,
+            sell_share: None,
+            top1_wallet_share: None,
+            buyer_hhi: None,
 
             // Window vectors – defaults; enriched by oracle_runtime before logging
             vectors_max_len: None,
@@ -6510,6 +6528,84 @@ impl GatekeeperBuffer {
             interval_ms,
             d_price,
             max_len: max_len as u32,
+        }
+    }
+
+    /// Extract selector shadow-score flow features from the same terminal
+    /// observation window used for decision logging. These values mirror the
+    /// offline selector event-rollup definitions and are sidecar inputs only.
+    pub fn extract_selector_flow_features(&self, t0: u64, t_end: u64) -> SelectorFlowFeatures {
+        let end_15s = t_end.min(t0.saturating_add(15_000));
+        let end_30s = t_end.min(t0.saturating_add(30_000));
+        let mut net_quote_in_15s = 0.0;
+        let mut net_quote_in_30s = 0.0;
+        let mut tx_count = 0usize;
+        let mut sell_count = 0usize;
+        let mut unique_buyers: HashSet<String> = HashSet::new();
+        let mut wallet_amounts: HashMap<String, f64> = HashMap::new();
+        let mut buyer_amounts: HashMap<String, f64> = HashMap::new();
+        let mut total_abs = 0.0;
+        let mut total_buy = 0.0;
+
+        for buffered in &self.buffered_txs {
+            let tx = buffered.tx.as_ref();
+            let ts = Self::tx_event_ts_ms(tx);
+            if ts < t0 || ts > t_end || !tx.volume_sol.is_finite() {
+                continue;
+            }
+
+            tx_count += 1;
+            let sign = if tx.is_buy { 1.0 } else { -1.0 };
+            if ts <= end_15s {
+                net_quote_in_15s += sign * tx.volume_sol;
+            }
+            if ts <= end_30s {
+                net_quote_in_30s += sign * tx.volume_sol;
+            }
+
+            *wallet_amounts.entry(tx.signer.clone()).or_default() += tx.volume_sol;
+            total_abs += tx.volume_sol;
+            if tx.is_buy {
+                unique_buyers.insert(tx.signer.clone());
+                *buyer_amounts.entry(tx.signer.clone()).or_default() += tx.volume_sol;
+                total_buy += tx.volume_sol;
+            } else {
+                sell_count += 1;
+            }
+        }
+
+        let elapsed_s = ((t_end.saturating_sub(t0)) as f64 / 1000.0).max(0.001);
+        let top1_wallet_share = if total_abs > 0.0 && !wallet_amounts.is_empty() {
+            wallet_amounts
+                .values()
+                .copied()
+                .reduce(f64::max)
+                .map(|amount| amount / total_abs)
+        } else {
+            None
+        };
+        let buyer_hhi = if total_buy > 0.0 && !buyer_amounts.is_empty() {
+            Some(
+                buyer_amounts
+                    .values()
+                    .map(|amount| {
+                        let share = amount / total_buy;
+                        share * share
+                    })
+                    .sum(),
+            )
+        } else {
+            None
+        };
+
+        SelectorFlowFeatures {
+            net_quote_in_15s,
+            net_quote_in_30s,
+            trade_rate: tx_count as f64 / elapsed_s,
+            unique_buyers: unique_buyers.len() as u32,
+            sell_share: (tx_count > 0).then_some(sell_count as f64 / tx_count as f64),
+            top1_wallet_share,
+            buyer_hhi,
         }
     }
 
@@ -12785,6 +12881,67 @@ mod tests {
                                                  // Derived vectors have length N-1.
         assert_eq!(vecs.interval_ms.len(), 4);
         assert_eq!(vecs.d_price.len(), 4);
+    }
+
+    #[test]
+    fn test_extract_selector_flow_features_matches_offline_rollup_shape() {
+        let mut config = v2_default_config();
+        config.min_tx_count = 100;
+        config.min_unique_signers = 100;
+        config.min_buy_count = 100;
+        config.max_wait_time_ms = 60_000;
+        let pool_id = Pubkey::new_unique();
+        let mut gk = GatekeeperBuffer::new(pool_id, &config);
+
+        let mut tx1 = create_v2_mock_tx(1_000, "flow_sig_1");
+        tx1.slot = Some(101);
+        tx1.event_ordinal = Some(1);
+        tx1.signer = "buyer_a".to_string();
+        tx1.is_buy = true;
+        tx1.volume_sol = 1.0;
+        gk.on_transaction(Arc::new(tx1));
+
+        let mut tx2 = create_v2_mock_tx(2_000, "flow_sig_2");
+        tx2.slot = Some(102);
+        tx2.event_ordinal = Some(2);
+        tx2.signer = "buyer_b".to_string();
+        tx2.is_buy = true;
+        tx2.volume_sol = 2.0;
+        gk.on_transaction(Arc::new(tx2));
+
+        let mut tx3 = create_v2_mock_tx(3_000, "flow_sig_3");
+        tx3.slot = Some(103);
+        tx3.event_ordinal = Some(3);
+        tx3.signer = "buyer_a".to_string();
+        tx3.is_buy = false;
+        tx3.volume_sol = 0.5;
+        gk.on_transaction(Arc::new(tx3));
+
+        let mut tx4 = create_v2_mock_tx(20_000, "flow_sig_4");
+        tx4.slot = Some(104);
+        tx4.event_ordinal = Some(4);
+        tx4.signer = "buyer_c".to_string();
+        tx4.is_buy = true;
+        tx4.volume_sol = 4.0;
+        gk.on_transaction(Arc::new(tx4));
+
+        let mut tx5 = create_v2_mock_tx(31_000, "flow_sig_5");
+        tx5.slot = Some(105);
+        tx5.event_ordinal = Some(5);
+        tx5.signer = "seller_d".to_string();
+        tx5.is_buy = false;
+        tx5.volume_sol = 1.0;
+        gk.on_transaction(Arc::new(tx5));
+
+        let flow = gk.extract_selector_flow_features(1_000, 31_000);
+
+        assert!((flow.net_quote_in_15s - 2.5).abs() < 1e-9);
+        assert!((flow.net_quote_in_30s - 5.5).abs() < 1e-9);
+        assert!((flow.trade_rate - (5.0 / 30.0)).abs() < 1e-9);
+        assert_eq!(flow.unique_buyers, 3);
+        assert!((flow.sell_share.unwrap() - 0.4).abs() < 1e-9);
+        assert!((flow.top1_wallet_share.unwrap() - (4.0 / 8.5)).abs() < 1e-9);
+        assert!((flow.buyer_hhi.unwrap() - (21.0 / 49.0)).abs() < 1e-9);
     }
 
     #[test]

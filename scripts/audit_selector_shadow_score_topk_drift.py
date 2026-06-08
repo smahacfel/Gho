@@ -315,6 +315,9 @@ def build_report(args: argparse.Namespace) -> tuple[dict[str, Any], list[dict[st
         for k in sorted(set(args.top_k))
     ]
     top25 = next((item for item in topk_reports if item["k"] == 25), None)
+    runtime_missing_flow_features = [
+        str(spec["name"]) for spec in specs if spec.get("source") == "MissingRuntimeMapping"
+    ]
 
     status = "PASS"
     fail_reasons: list[str] = []
@@ -343,9 +346,17 @@ def build_report(args: argparse.Namespace) -> tuple[dict[str, Any], list[dict[st
             and hit_rate_drop is not None
             and hit_rate_drop <= args.max_top25_hit_rate_drop
         ):
-            verdict = "FORWARD_SHADOW_READY_WITH_PARTIAL_SCORE"
+            verdict = (
+                "FORWARD_SHADOW_READY_WITH_FULL_RUNTIME_SCORE"
+                if not runtime_missing_flow_features
+                else "FORWARD_SHADOW_READY_WITH_PARTIAL_SCORE"
+            )
         else:
-            verdict = "FLOW_MAPPING_REQUIRED_BEFORE_FORWARD_SHADOW"
+            verdict = (
+                "TOPK_DRIFT_BLOCKS_FORWARD_SHADOW"
+                if not runtime_missing_flow_features
+                else "FLOW_MAPPING_REQUIRED_BEFORE_FORWARD_SHADOW"
+            )
 
     report = {
         "artifact": ARTIFACT,
@@ -361,7 +372,7 @@ def build_report(args: argparse.Namespace) -> tuple[dict[str, Any], list[dict[st
             "trained_model": False,
             "changed_gatekeeper": False,
             "changed_runtime_score": False,
-            "mapped_flow_features": False,
+            "mapped_flow_features": bool(not runtime_missing_flow_features),
             "changed_execution": False,
         },
         "inputs": {
@@ -379,9 +390,7 @@ def build_report(args: argparse.Namespace) -> tuple[dict[str, Any], list[dict[st
         "r2_positive_rows": r2_positive_rows,
         "r2_negative_rows": r2_negative_rows,
         "min_r2_resolved_rows": args.min_r2_resolved_rows,
-        "runtime_missing_flow_features": [
-            str(spec["name"]) for spec in specs if spec.get("source") == "MissingRuntimeMapping"
-        ],
+        "runtime_missing_flow_features": runtime_missing_flow_features,
         "thresholds": thresholds,
         "decision_rule": {
             "min_top25_overlap_rate": args.min_top25_overlap_rate,

@@ -531,6 +531,20 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         for plane in planes
         if plane["score_abs_diff_max"] is not None
     ]
+    missing_runtime_mapping_features = [
+        spec["name"] for spec in specs if spec["source"] != "Mapped"
+    ]
+    mapped_only_drift = (
+        {
+            "status": "NO_RUNTIME_MAPPING_DRIFT_FULL_MAPPING_AVAILABLE",
+            "meaning": "runtime score spec declares all frozen selector features as mapped; emitted runtime score is expected to match the recomputed runtime contract",
+        }
+        if not missing_runtime_mapping_features
+        else {
+            "status": "DRIFT_MEASURED_EXPECTED_MISSING_FLOW_FEATURES",
+            "meaning": "runtime score keeps missing flow mappings as zero contribution in the frozen full denominator; mapped-only score is diagnostic drift, not the emitted contract",
+        }
+    )
     report = {
         "artifact": ARTIFACT,
         "status": "PASS" if not fail_reasons else "FAIL",
@@ -549,16 +563,11 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
             "mapping_status_mismatch_count": totals["mapping_status_mismatch_count"],
             "max_score_abs_diff": max(all_diffs) if all_diffs else None,
         },
-        "mapped_only_drift": {
-            "status": "DRIFT_MEASURED_EXPECTED_MISSING_FLOW_FEATURES",
-            "meaning": "runtime score keeps missing flow mappings as zero contribution in the frozen full denominator; mapped-only score is diagnostic drift, not the emitted contract",
-        },
+        "mapped_only_drift": mapped_only_drift,
         "feature_spec": {
             "total_features": len(specs),
             "mapped_features": sum(1 for spec in specs if spec["source"] == "Mapped"),
-            "missing_runtime_mapping_features": [
-                spec["name"] for spec in specs if spec["source"] != "Mapped"
-            ],
+            "missing_runtime_mapping_features": missing_runtime_mapping_features,
         },
         "decision_rows": totals["decision_rows"],
         "score_rows": totals["score_rows"],

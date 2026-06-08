@@ -16407,6 +16407,14 @@ fn enrich_buy_log_with_vectors(
     ws: &WindowState,
 ) {
     let vecs = buf.extract_window_vectors(ws.t0_event_ts_ms, ws.t_end_event_ts_ms, VECTORS_MAX_LEN);
+    let flow = buf.extract_selector_flow_features(ws.t0_event_ts_ms, ws.t_end_event_ts_ms);
+    log.net_quote_in_15s = Some(flow.net_quote_in_15s);
+    log.net_quote_in_30s = Some(flow.net_quote_in_30s);
+    log.trade_rate = Some(flow.trade_rate);
+    log.unique_buyers = Some(flow.unique_buyers);
+    log.sell_share = flow.sell_share;
+    log.top1_wallet_share = flow.top1_wallet_share;
+    log.buyer_hhi = flow.buyer_hhi;
     log.vectors_max_len = Some(vecs.max_len);
     log.vectors_ts_offsets_ms = none_if_empty_i64(vecs.ts_offsets_ms);
     log.vectors_sol_amounts = none_if_empty(vecs.sol_amounts);

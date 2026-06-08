@@ -115,6 +115,7 @@ const DECISION_PLANE_LEGACY_LIVE: &str = "legacy_live";
 const DECISION_PLANE_V25_SHADOW: &str = "v25_shadow";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 enum SelectorShadowRuntimeFeatureSource {
     Mapped,
     MissingRuntimeMapping,
@@ -138,49 +139,49 @@ const SELECTOR_SHADOW_FEATURE_SPECS: &[SelectorShadowFeatureSpec] = &[
         min: -0.93354436800000196,
         max: 267.14919743400009,
         direction: 1.0,
-        source: SelectorShadowRuntimeFeatureSource::MissingRuntimeMapping,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
     },
     SelectorShadowFeatureSpec {
         name: "net_quote_in_30s",
         min: -0.93354436800000196,
         max: 267.14919743400009,
         direction: 1.0,
-        source: SelectorShadowRuntimeFeatureSource::MissingRuntimeMapping,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
     },
     SelectorShadowFeatureSpec {
         name: "trade_rate",
         min: 0.0,
         max: 17.998200179982003,
         direction: 1.0,
-        source: SelectorShadowRuntimeFeatureSource::MissingRuntimeMapping,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
     },
     SelectorShadowFeatureSpec {
         name: "unique_buyers",
         min: 0.0,
         max: 107.0,
         direction: 1.0,
-        source: SelectorShadowRuntimeFeatureSource::MissingRuntimeMapping,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
     },
     SelectorShadowFeatureSpec {
         name: "sell_share",
         min: 0.0,
         max: 0.90909090909090906,
         direction: 1.0,
-        source: SelectorShadowRuntimeFeatureSource::MissingRuntimeMapping,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
     },
     SelectorShadowFeatureSpec {
         name: "top1_wallet_share",
         min: 0.061039535295271542,
         max: 1.0,
         direction: -1.0,
-        source: SelectorShadowRuntimeFeatureSource::MissingRuntimeMapping,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
     },
     SelectorShadowFeatureSpec {
         name: "buyer_hhi",
         min: 0.018038408746430926,
         max: 1.0,
         direction: -1.0,
-        source: SelectorShadowRuntimeFeatureSource::MissingRuntimeMapping,
+        source: SelectorShadowRuntimeFeatureSource::Mapped,
     },
     SelectorShadowFeatureSpec {
         name: "gk_curve_wait_elapsed_ms",
@@ -1870,6 +1871,27 @@ pub struct GatekeeperBuyLog {
     pub ab_record_id: Option<String>,
 
     // ═══════════════════════════════════════════
+    // Selector shadow score runtime flow features
+    // These are additive sidecar inputs only. They mirror the offline selector
+    // event-rollup feature definitions for the terminal observation window and
+    // must not affect Gatekeeper policy or execution eligibility.
+    // ═══════════════════════════════════════════
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub net_quote_in_15s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub net_quote_in_30s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trade_rate: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unique_buyers: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sell_share: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top1_wallet_share: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buyer_hhi: Option<f64>,
+
+    // ═══════════════════════════════════════════
     // Window Vectors (v3: DTW/Hill/MI/TDA analysis)
     // Deterministic sequences from [t0, t_end], length-bounded.
     // All vectors aligned to the same tx-event axis.
@@ -3081,6 +3103,13 @@ fn selector_shadow_median(values: &[f64]) -> Option<f64> {
 
 fn selector_shadow_runtime_feature_value(log: &GatekeeperBuyLog, feature: &str) -> Option<f64> {
     let value = match feature {
+        "net_quote_in_15s" => log.net_quote_in_15s,
+        "net_quote_in_30s" => log.net_quote_in_30s,
+        "trade_rate" => log.trade_rate,
+        "unique_buyers" => log.unique_buyers.map(f64::from),
+        "sell_share" => log.sell_share,
+        "top1_wallet_share" => log.top1_wallet_share,
+        "buyer_hhi" => log.buyer_hhi,
         "gk_curve_wait_elapsed_ms" => log.curve_wait_elapsed_ms.map(|value| value as f64),
         "gk_bonding_progress_pct" => log.bonding_progress_pct,
         "gk_current_market_cap_sol" => log.current_market_cap_sol,
@@ -4316,6 +4345,13 @@ mod tests {
             ab_fail_count_window: None,
             ab_window_origin: None,
             ab_record_id: None,
+            net_quote_in_15s: Some(12.5),
+            net_quote_in_30s: Some(13.75),
+            trade_rate: Some(1.0),
+            unique_buyers: Some(5),
+            sell_share: Some(0.2),
+            top1_wallet_share: Some(0.35),
+            buyer_hhi: Some(0.18),
             // Window vectors (not used in this test)
             vectors_max_len: None,
             vectors_ts_offsets_ms: None,
@@ -4818,6 +4854,13 @@ mod tests {
             ab_fail_count_window: Some(0),
             ab_window_origin: Some("NewPoolDetected".to_string()),
             ab_record_id: Some("test_pool_dedup:1000:11000:REJECT".to_string()),
+            net_quote_in_15s: Some(12.5),
+            net_quote_in_30s: Some(13.75),
+            trade_rate: Some(1.0),
+            unique_buyers: Some(5),
+            sell_share: Some(0.2),
+            top1_wallet_share: Some(0.35),
+            buyer_hhi: Some(0.18),
             vectors_max_len: None,
             vectors_ts_offsets_ms: None,
             vectors_sol_amounts: None,
@@ -5553,16 +5596,21 @@ mod tests {
         );
         assert_eq!(
             row["feature_availability"]["feature_mapping_status"],
-            "partial_runtime_mapping_missing_flow_features"
+            "complete_runtime_mapping"
         );
+        assert_eq!(row["feature_availability"]["flow_available"], true);
         assert_eq!(row["feature_availability"]["cutoff_verified"], true);
         assert!(row["feature_missing_count"].as_u64().unwrap() > 0);
         assert_eq!(row["required_feature_missing_count"], 0);
-        assert!(row["reason_vector"]["missing"]
+        assert!(!row["reason_vector"]["missing"]
             .as_array()
             .unwrap()
             .iter()
             .any(|value| value.as_str() == Some("net_quote_in_15s")));
+        assert_eq!(
+            row["feature_availability"]["missing_runtime_mapping_count"],
+            0
+        );
 
         logger.shutdown().await;
     }
