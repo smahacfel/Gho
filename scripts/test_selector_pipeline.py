@@ -25,6 +25,7 @@ import build_selector_r2only_ablation_report as r2only_ablation
 import build_selector_r2only_feature_contribution as r2only_feature_contribution
 import build_selector_r2only_feature_audit as r2only_feature_audit
 import build_selector_r2only_model_candidate as r2only_model_candidate
+import build_selector_r2only_candidate_selection as r2only_candidate_selection
 import build_selector_route_manifest_reuse_projection as route_manifest_reuse
 import build_selector_route_evidence_join_report as route_evidence_join
 import build_selector_training_view as training
@@ -3483,6 +3484,112 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertIn("gatekeeper_accept_context", report)
         self.assertFalse(report["claim_boundaries"]["gatekeeper_tuned"])
         self.assertFalse(report["claim_boundaries"]["runtime_changed"])
+
+    def test_candidate_selection_builds_offline_threshold_and_stability_reports(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "selector-p3j-candidate-selection-test"
+            source_scope = "shadow-burnin-v3-selector-dataset-p3j-test"
+            self.write_feature_contribution_fixture(root, scope)
+            report_dir = root / "reports" / "selector" / scope
+            dataset_manifest_path = report_dir / "dataset_manifest_v1.json"
+            dataset_manifest = json.loads(dataset_manifest_path.read_text(encoding="utf-8"))
+            dataset_manifest["source_scope"] = source_scope
+            dataset_manifest_path.write_text(json.dumps(dataset_manifest), encoding="utf-8")
+            (report_dir / "phase3_r2only_manifest_v1.json").write_text(
+                json.dumps(
+                    {
+                        "status": "PASS_R2_ONLY_DRAFT",
+                        "phase3_precision_readiness": "R2_ONLY_READY",
+                        "leakage_audit_status": "PASS",
+                        "fail_reasons": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            r2only_feature_contribution.build_report(
+                r2only_feature_contribution.build_parser().parse_args(
+                    [
+                        "--scope",
+                        scope,
+                        "--root",
+                        str(root),
+                        "--feature-set",
+                        "flow",
+                        "--feature-set",
+                        "gk",
+                        "--feature-set",
+                        "combined",
+                    ]
+                )
+            )
+            simcov_report_dir = root / "reports" / "selector" / source_scope
+            simcov_report_dir.mkdir(parents=True)
+            (simcov_report_dir / "buy_simulation_coverage_audit_v1.json").write_text(
+                json.dumps(
+                    {
+                        "metrics": {
+                            "buy_rows": 20,
+                            "shadow_simulation_attempted_rows": 20,
+                            "shadow_simulated_rows": 19,
+                            "not_executable_route_rows": 0,
+                        },
+                        "critical_regression_markers": {
+                            "AccountNotFound": 0,
+                            "unsupported_legacy_buy_layout_requires_bcv2": 0,
+                            "ResourceExhausted": 0,
+                        },
+                        "failure_classes": {
+                            "UNKNOWN_UNCLASSIFIED": {"count": 0},
+                            "LEGACY_BC_V2_TAIL_RESOLVER_FAILED": {"count": 0},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            report = r2only_candidate_selection.build_report(
+                r2only_candidate_selection.build_parser().parse_args(
+                    [
+                        "--scope",
+                        scope,
+                        "--root",
+                        str(root),
+                        "--feature-set",
+                        "combined",
+                        "--bootstrap-samples",
+                        "25",
+                        "--logistic-epochs",
+                        "20",
+                    ]
+                )
+            )
+            output_json_exists = Path(report["outputs"]["selector_r2only_candidate_selection_v1"]).exists()
+            output_md_exists = Path(report["outputs"]["FEATURE_RICH_R2_CANDIDATE_SELECTION"]).exists()
+            threshold_csv_exists = Path(report["outputs"]["selector_r2only_threshold_grid_v1"]).exists()
+            stability_csv_exists = Path(report["outputs"]["selector_r2only_candidate_stability_v1"]).exists()
+
+        self.assertEqual(report["status"], "P3J_NO-GO_UNSTABLE_SIGNAL")
+        self.assertIn("r2_training_denominator_below_1440", report["acceptance"]["fail_reasons"])
+        self.assertEqual(report["simcov_operational_gate"]["status"], "PASS")
+        self.assertTrue(report["claim_boundaries"]["diagnostic_only"])
+        self.assertFalse(report["claim_boundaries"]["production_promotion_allowed"])
+        self.assertFalse(report["claim_boundaries"]["gatekeeper_tuning_started"])
+        self.assertFalse(report["claim_boundaries"]["runtime_changed"])
+        self.assertEqual(report["ev_proxy"]["claim"], "R2 market-opportunity EV proxy, not live PnL")
+        candidate_ids = {candidate["candidate_id"] for candidate in report["candidates"]}
+        self.assertIn("combined:simple_feature_score_v1", candidate_ids)
+        self.assertIn("gk_context_only:simple_feature_score_v1", candidate_ids)
+        self.assertIn("combined:logistic_sanity_baseline", candidate_ids)
+        self.assertIn("flow_only", report["comparators"])
+        self.assertIn("gatekeeper_accept", report["comparators"])
+        self.assertIn("combined:simple_feature_score_v1", report["threshold_grid"])
+        self.assertIn("gk_concentration_available", report["stability"])
+        self.assertIn("minus_concentration_features", report["feature_ablation"])
+        self.assertTrue(output_json_exists)
+        self.assertTrue(output_md_exists)
+        self.assertTrue(threshold_csv_exists)
+        self.assertTrue(stability_csv_exists)
 
     def test_selector_lifecycle_launcher_accepts_build_freshness_flag(self) -> None:
         args = lifecycle_launcher.build_parser().parse_args(
