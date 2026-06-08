@@ -139,6 +139,12 @@ def build_phase3(args: argparse.Namespace) -> dict[str, Any]:
     common.write_json(leakage_output, leakage_audit)
 
     r2_denominator_rows = int(coverage.get("r2_training_denominator_rows") or 0)
+    feature_snapshot_incomplete_excluded_rows = int(
+        coverage.get("feature_snapshot_incomplete_excluded_rows") or 0
+    )
+    missing_feature_cutoff_excluded_rows = int(
+        coverage.get("missing_feature_cutoff_excluded_rows") or 0
+    )
     resolved_label_counts = r2_label_counts(rows)
     r2_positive_rows = int(resolved_label_counts.get("positive") or 0)
     r2_negative_rows = int(resolved_label_counts.get("negative") or 0)
@@ -175,6 +181,12 @@ def build_phase3(args: argparse.Namespace) -> dict[str, Any]:
         },
         "training_rows": len(rows),
         "r2_training_denominator_rows": r2_denominator_rows,
+        "effective_r2_training_denominator_rows": r2_denominator_rows,
+        "feature_snapshot_incomplete_excluded_rows": feature_snapshot_incomplete_excluded_rows,
+        "missing_feature_cutoff_excluded_rows": missing_feature_cutoff_excluded_rows,
+        "excluded_feature_snapshot_incomplete_candidate_ids": coverage.get(
+            "excluded_feature_snapshot_incomplete_candidate_ids", []
+        ),
         "r2_positive_rows": r2_positive_rows,
         "r2_negative_rows": r2_negative_rows,
         "r2_training_denominator_split_counts": coverage.get(
@@ -221,6 +233,12 @@ def build_phase3(args: argparse.Namespace) -> dict[str, Any]:
         "production_promotion_allowed": False,
         "training_rows": len(rows),
         "r2_training_denominator_rows": r2_denominator_rows,
+        "effective_r2_training_denominator_rows": r2_denominator_rows,
+        "feature_snapshot_incomplete_excluded_rows": feature_snapshot_incomplete_excluded_rows,
+        "missing_feature_cutoff_excluded_rows": missing_feature_cutoff_excluded_rows,
+        "excluded_feature_snapshot_incomplete_candidate_ids": coverage.get(
+            "excluded_feature_snapshot_incomplete_candidate_ids", []
+        ),
         "r2_positive_rows": r2_positive_rows,
         "r2_negative_rows": r2_negative_rows,
         "leakage_audit_status": leakage_audit.get("status"),

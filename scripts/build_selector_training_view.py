@@ -108,6 +108,23 @@ def attach_gatekeeper_context(row: dict[str, Any], context: dict[str, Any] | Non
     row["gatekeeper_feature_context_source"] = context.get("source")
 
 
+def feature_snapshot_model_exclusion_reasons(row: dict[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    if row.get("feature_snapshot_status") != "ok":
+        reasons.append("feature_snapshot_status_not_ok")
+    if common.int_or_none(row.get("feature_cutoff_ts_ms")) is None:
+        reasons.append("missing_feature_cutoff_ts_ms")
+    if row.get("feature_cutoff_slot") is None:
+        reasons.append("missing_feature_cutoff_slot")
+    if common.int_or_none(row.get("feature_observed_lag_ms")) is None:
+        reasons.append("missing_feature_observed_lag_ms")
+    return reasons
+
+
+def feature_snapshot_model_eligible(row: dict[str, Any]) -> bool:
+    return not feature_snapshot_model_exclusion_reasons(row)
+
+
 def r2_training_denominator(row: dict[str, Any]) -> bool:
     return bool(
         row.get("cohort_in_scope") is True
@@ -121,7 +138,12 @@ def r2_training_denominator(row: dict[str, Any]) -> bool:
 
 
 def choose_resolved_r2_temporal_split(rows: list[dict[str, Any]]) -> dict[str, str]:
-    denominator_rows = [row for row in rows if r2_training_denominator(row)]
+    denominator_rows = [
+        row
+        for row in rows
+        if row.get("r2_only_training_denominator") is True
+        or ("r2_only_training_denominator" not in row and r2_training_denominator(row))
+    ]
     ordered = sorted(
         denominator_rows,
         key=lambda row: (
@@ -183,13 +205,28 @@ def in_candidate_time_scope(row: dict[str, Any], scope: dict[str, int | None]) -
     return start <= ts <= end
 
 
-def leakage_audit(feature_rows: list[dict[str, Any]]) -> dict[str, Any]:
-    violations = common.feature_temporal_violations(feature_rows)
+def leakage_audit(
+    feature_rows: list[dict[str, Any]],
+    *,
+    excluded_candidate_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    excluded_candidate_ids = excluded_candidate_ids or set()
+    checked_rows: list[dict[str, Any]] = []
+    excluded_rows: list[dict[str, Any]] = []
+    for row in feature_rows:
+        candidate_id = common.str_or_none(row.get("candidate_id"))
+        if candidate_id and candidate_id in excluded_candidate_ids:
+            excluded_rows.append(row)
+        else:
+            checked_rows.append(row)
+    violations = common.feature_temporal_violations(checked_rows)
     return {
         "selector_schema_version": common.SCHEMA_VERSION,
         "artifact": "leakage_audit_v1",
         "status": "PASS" if not violations else "NO-GO",
-        "rows_checked": len(feature_rows),
+        "rows_checked": len(checked_rows),
+        "rows_excluded_from_model_audit": len(excluded_rows),
+        "excluded_candidate_ids": sorted(excluded_candidate_ids),
         "violation_count": len(violations),
         "violations": violations[:50],
     }
@@ -405,7 +442,19 @@ def build_training_view(
         row["r2_label_resolved"] = row.get("r2_label") in {"positive", "negative"}
         row["label_resolved"] = row["r2_label_resolved"]
         row["label_excluded_reason"] = row.get("r2_excluded_reason") or row.get("r1_excluded_reason")
-        row["r2_only_training_denominator"] = r2_training_denominator(row)
+        feature_exclusion_reasons = feature_snapshot_model_exclusion_reasons(row)
+        row["feature_snapshot_model_exclusion_reasons"] = feature_exclusion_reasons
+        row["model_eligible"] = False
+        row["training_row_status"] = "not_r2_training_denominator"
+        if feature_exclusion_reasons:
+            row["training_row_status"] = "excluded_feature_snapshot_incomplete"
+            row["r2_only_training_denominator"] = False
+            row["model_eligible"] = False
+        else:
+            row["r2_only_training_denominator"] = r2_training_denominator(row)
+            row["model_eligible"] = row["r2_only_training_denominator"]
+            if row["r2_only_training_denominator"]:
+                row["training_row_status"] = "model_eligible"
         rows.append(row)
 
     if split_denominator == "resolved_r2":
@@ -416,7 +465,16 @@ def build_training_view(
                 row["split"] = resolved_splits[candidate_id]
 
     label_counts = Counter(str(row.get("r2_label") or row.get("r2_status") or "unknown") for row in rows)
-    denominator_rows = [row for row in rows if r2_training_denominator(row)]
+    denominator_rows = [row for row in rows if row.get("r2_only_training_denominator") is True]
+    feature_snapshot_incomplete_excluded_rows = [
+        row for row in rows if row.get("training_row_status") == "excluded_feature_snapshot_incomplete"
+    ]
+    missing_feature_cutoff_excluded_rows = [
+        row
+        for row in feature_snapshot_incomplete_excluded_rows
+        if "missing_feature_cutoff_ts_ms" in row.get("feature_snapshot_model_exclusion_reasons", [])
+        or "missing_feature_cutoff_slot" in row.get("feature_snapshot_model_exclusion_reasons", [])
+    ]
     split_counts = Counter(str(row.get("split") or "unknown") for row in denominator_rows)
     accepted_join_scope_rows = len(accepted_in_scope_rows)
     accepted_join_completeness = (
@@ -453,6 +511,13 @@ def build_training_view(
         },
         "resolved_r2_rows": len(denominator_rows),
         "r2_training_denominator_rows": len(denominator_rows),
+        "effective_r2_training_denominator_rows": len(denominator_rows),
+        "feature_snapshot_incomplete_excluded_rows": len(feature_snapshot_incomplete_excluded_rows),
+        "missing_feature_cutoff_excluded_rows": len(missing_feature_cutoff_excluded_rows),
+        "excluded_feature_snapshot_incomplete_candidate_ids": sorted(
+            common.str_or_none(row.get("candidate_id")) or ""
+            for row in feature_snapshot_incomplete_excluded_rows
+        ),
         "r2_training_denominator_split_counts": common.counter_dict(split_counts),
         "r2_label_counts": common.counter_dict(label_counts),
         "matured_r2_resolved_rate": (
@@ -477,7 +542,15 @@ def build_training_view(
             ),
         },
     }
-    return rows, coverage, leakage_audit(feature_rows)
+    excluded_candidate_ids = {
+        common.str_or_none(row.get("candidate_id"))
+        for row in feature_snapshot_incomplete_excluded_rows
+        if common.str_or_none(row.get("candidate_id"))
+    }
+    return rows, coverage, leakage_audit(
+        feature_rows,
+        excluded_candidate_ids={candidate_id for candidate_id in excluded_candidate_ids if candidate_id},
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:

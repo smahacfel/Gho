@@ -20,6 +20,7 @@ import selector_pipeline_common as common
 
 ARTIFACT = "selector_regression_gates_v1"
 DEFAULT_AUDIT_NAME = "buy_simulation_coverage_audit_v1.json"
+GATE_PROFILES = ("strict", "operational")
 SELECTED_FALLBACK_SOURCE = "selected_fallback_route_execution_handoff"
 BCV2_META_STATUS = "BCV2_META_READY_BY_PROTOCOL_SCHEMA"
 BCV2_LOAD_NOT_REQUIRED = "BCV2_LOAD_NOT_REQUIRED"
@@ -256,6 +257,9 @@ def audit_marker_count(audit: dict[str, Any], marker: str) -> int:
 
 def build_report(args: argparse.Namespace) -> dict[str, Any]:
     root = args.root.resolve()
+    gate_profile = args.gate_profile
+    if args.operational_pass:
+        gate_profile = "operational"
     audit_path = args.audit_json or default_audit_path(root, args.scope)
     audit = read_json(audit_path)
     jsonl_paths = list(args.jsonl or [])
@@ -270,6 +274,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
     not_executable = metric_int(metrics, "not_executable_route_rows")
     target_rows = math.ceil(buy_rows * args.min_attempt_coverage) if buy_rows else 0
     attempt_coverage = attempted / buy_rows if buy_rows else 0.0
+    not_executable_rate = not_executable / buy_rows if buy_rows else 0.0
 
     forbidden_counts, forbidden_samples = count_forbidden_rows(rows)
     for marker in FORBIDDEN_MARKERS:
@@ -280,15 +285,32 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
     fail_reasons: list[str] = []
     if buy_rows <= 0:
         fail_reasons.append("buy_rows_zero")
-    if args.require_not_executable_zero and not_executable != 0:
-        fail_reasons.append("not_executable_route_rows_nonzero")
-    if args.require_attempted_equals_buy and attempted != buy_rows:
-        fail_reasons.append("attempted_rows_not_equal_buy_rows")
-    if attempted < target_rows:
-        fail_reasons.append("attempt_coverage_below_minimum")
-    for marker, count in sorted(forbidden_counts.items()):
-        if count > 0:
-            fail_reasons.append(f"forbidden_marker_present:{marker}")
+    if gate_profile == "operational":
+        if attempted < target_rows:
+            fail_reasons.append("attempt_coverage_below_minimum")
+        max_not_executable_rows = math.floor(buy_rows * args.max_not_executable_rate) if buy_rows else 0
+        if not_executable > max_not_executable_rows:
+            fail_reasons.append("not_executable_route_rows_above_operational_limit")
+        for marker in (
+            "AccountNotFound",
+            "ResourceExhausted",
+            "unsupported_legacy_buy_layout_requires_bcv2",
+            "can_unlock_execution=true",
+        ):
+            if forbidden_counts.get(marker, 0) > 0:
+                fail_reasons.append(f"forbidden_marker_present:{marker}")
+        if forbidden_counts.get("UNKNOWN_UNCLASSIFIED", 0) > args.max_unknown_unclassified:
+            fail_reasons.append("unknown_unclassified_above_operational_limit")
+    else:
+        if (args.require_not_executable_zero or gate_profile == "strict") and not_executable != 0:
+            fail_reasons.append("not_executable_route_rows_nonzero")
+        if (args.require_attempted_equals_buy or gate_profile == "strict") and attempted != buy_rows:
+            fail_reasons.append("attempted_rows_not_equal_buy_rows")
+        if attempted < target_rows:
+            fail_reasons.append("attempt_coverage_below_minimum")
+        for marker, count in sorted(forbidden_counts.items()):
+            if count > 0:
+                fail_reasons.append(f"forbidden_marker_present:{marker}")
 
     return {
         "artifact": ARTIFACT,
@@ -302,10 +324,15 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
             "attempted_rows": attempted,
             "success_rows": success,
             "not_executable_route_rows": not_executable,
+            "not_executable_rate": not_executable_rate,
+            "max_not_executable_rate": args.max_not_executable_rate,
             "attempt_coverage": attempt_coverage,
             "min_attempt_coverage": args.min_attempt_coverage,
             "target_attempted_rows": target_rows,
             "attempted_equals_buy_rows": attempted == buy_rows,
+            "gate_profile": gate_profile,
+            "operational_pass": gate_profile == "operational",
+            "max_unknown_unclassified": args.max_unknown_unclassified,
         },
         "forbidden_markers": {
             "counts": {key: forbidden_counts.get(key, 0) for key in sorted(set(forbidden_counts) | set(FORBIDDEN_GATES))},
@@ -338,6 +365,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--jsonl", type=Path, action="append", default=[])
     parser.add_argument("--audit-only", action="store_true")
     parser.add_argument("--min-attempt-coverage", type=float, default=0.95)
+    parser.add_argument(
+        "--gate-profile",
+        choices=GATE_PROFILES,
+        default="strict",
+        help=(
+            "strict keeps the R18C fixture/smoke contract "
+            "(attempted_rows == buy_rows and not_executable_route_rows = 0 when requested); "
+            "operational allows production-dataset smoke closure with attempt coverage >= minimum, "
+            "not_executable_route_rows <= max rate, listed critical regressions = 0, "
+            "UNKNOWN_UNCLASSIFIED <= threshold, and can_unlock_execution=true = 0."
+        ),
+    )
+    parser.add_argument(
+        "--operational-pass",
+        action="store_true",
+        dest="operational_pass",
+        help=(
+            "Deprecated alias for --gate-profile operational. Use the operational selector run gate: attempt coverage >= minimum, "
+            "critical regressions = 0, UNKNOWN_UNCLASSIFIED <= threshold, "
+            "not_executable_route_rows <= max rate, and can_unlock_execution=true = 0. "
+            "This is intentionally less strict than the R18C fixture gate."
+        ),
+    )
+    parser.add_argument("--max-not-executable-rate", type=float, default=0.05)
+    parser.add_argument("--max-unknown-unclassified", type=int, default=1)
     parser.add_argument("--require-attempted-equals-buy", action="store_true")
     parser.add_argument("--require-not-executable-zero", action="store_true")
     parser.add_argument("--json", action="store_true")

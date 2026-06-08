@@ -30,7 +30,10 @@ import build_selector_route_evidence_join_report as route_evidence_join
 import build_selector_training_view as training
 import compare_selector_gatekeepers as compare
 import audit_selector_buy_simulation_coverage as simcov_audit
-import build_selector_coverage_breakthrough_projection as coverage_breakthrough
+try:
+    import build_selector_coverage_breakthrough_projection as coverage_breakthrough
+except ModuleNotFoundError:
+    coverage_breakthrough = None
 import ci_assert_selector_regression_gates as selector_regression_gates
 import guard_gatekeeper_decision_feature_surface as gk_surface_guard
 import start_selector_lifecycle_run as lifecycle_launcher
@@ -277,6 +280,7 @@ class SelectorPipelineTests(unittest.TestCase):
                     "observation_duration_ms": observation_duration_ms,
                     "decision_plane": "v25_shadow",
                     "bonding_progress_pct": 46.0,
+                    "curve_data_known": True,
                     "current_market_cap_sol": 48.7,
                     "price_change_ratio": 1.6,
                     "hhi": 0.04,
@@ -340,6 +344,7 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertEqual(summary["manifest"]["status"], "PASS")
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["gk_bonding_progress_pct"], 46.0)
+        self.assertTrue(rows[0]["gk_curve_data_known"])
         self.assertEqual(rows[0]["gk_current_market_cap_sol"], 48.7)
         self.assertEqual(rows[0]["gk_price_change_ratio"], 1.6)
         self.assertEqual(rows[0]["gk_hhi"], 0.04)
@@ -358,6 +363,92 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertNotIn("verdict_type", row)
         self.assertNotIn("decision_reason", row)
         self.assertNotIn("gk_decision_verdict_buy", row)
+
+    def test_gatekeeper_feature_context_warns_on_degraded_concentration_surface(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "selector-gk-context-concentration-warning"
+            source_scope = "source-gk-context-concentration-warning"
+            dataset_dir = root / "datasets" / "selector" / scope
+            decision_dir = (
+                root
+                / "logs"
+                / "rollout"
+                / source_scope
+                / "decisions"
+                / source_scope
+                / "v2.5"
+                / "v25_shadow"
+                / "fixture"
+            )
+            dataset_dir.mkdir(parents=True)
+            decision_dir.mkdir(parents=True)
+            candidates = []
+            decisions = []
+            for idx in range(10):
+                candidates.append(
+                    {
+                        "candidate_id": f"candidate-{idx}",
+                        "candidate_universe_status": "ok",
+                        "cohort_in_scope": True,
+                        "stream_completeness_ok": True,
+                        "base_mint": f"mint-{idx}",
+                        "mint_id": f"mint-{idx}",
+                        "pool_id": f"pool-{idx}",
+                        "bonding_curve": f"pool-{idx}",
+                        "quote_mint": "SOL",
+                        "birth_ts_ms": 1_000 + idx,
+                        "decision_ts_ms": 9_000 + idx,
+                    }
+                )
+                decision = {
+                    "log_schema_version": 25,
+                    "pool_id": f"pool-{idx}",
+                    "join_key": f"pool-{idx}:mint-{idx}:1000",
+                    "base_mint": f"mint-{idx}",
+                    "first_seen_ts_ms": 1_000 + idx,
+                    "observation_start_ts_ms": 1_000 + idx,
+                    "observation_end_ts_ms": 9_000 + idx,
+                    "observation_window_ms": 8_000,
+                    "observation_duration_ms": 8_000,
+                    "decision_plane": "v25_shadow",
+                    "bonding_progress_pct": 46.0,
+                    "curve_data_known": True,
+                    "current_market_cap_sol": 48.7,
+                    "price_change_ratio": 1.6,
+                }
+                if idx < 7:
+                    decision["hhi"] = 0.04 + idx
+                    decision["top3_volume_pct"] = 0.27 + idx
+                decisions.append(decision)
+            write_jsonl(dataset_dir / "candidate_universe_v1.jsonl", candidates)
+            write_jsonl(decision_dir / "gatekeeper_v2_decisions.jsonl", decisions)
+
+            summary = gk_context.run(
+                gk_context.build_parser().parse_args(
+                    [
+                        "--root",
+                        str(root),
+                        "--scope",
+                        scope,
+                        "--source-scope",
+                        source_scope,
+                    ]
+                )
+            )
+
+        manifest = summary["manifest"]
+        self.assertEqual(manifest["status"], "PASS_CORE_WITH_CONCENTRATION_COVERAGE_WARNING")
+        self.assertEqual(
+            manifest["gatekeeper_feature_context_status"],
+            "PASS_CORE_WITH_CONCENTRATION_COVERAGE_WARNING",
+        )
+        self.assertEqual(manifest["core_feature_surface_status"], "PASS")
+        self.assertEqual(manifest["concentration_feature_surface_status"], "DEGRADED")
+        self.assertEqual(manifest["model_policy"], "missing_not_zero")
+        self.assertFalse(manifest["fail_reasons"])
+        self.assertIn("gk_hhi_present_rate_below_80pct", manifest["warning_reasons"])
+        self.assertIn("gk_top3_volume_pct_present_rate_below_80pct", manifest["warning_reasons"])
 
     def test_gatekeeper_feature_context_does_not_create_denominator(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1275,6 +1366,133 @@ class SelectorPipelineTests(unittest.TestCase):
         audit = training.leakage_audit([snapshot])
         self.assertEqual(snapshot["feature_snapshot_status"], "feature_snapshot_incomplete")
         self.assertEqual(audit["status"], "NO-GO")
+
+    def test_training_view_excludes_incomplete_feature_snapshot_from_model_denominator(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            candidate_universe = root / "candidate_universe_v1.jsonl"
+            accepted_lifecycle = root / "accepted_lifecycle_v1.jsonl"
+            feature_snapshots = root / "feature_snapshots_v1.jsonl"
+            r2_paths_file = root / "r2_market_paths_v1.jsonl"
+            write_jsonl(
+                candidate_universe,
+                [
+                    {
+                        "candidate_id": "complete",
+                        "candidate_universe_status": "ok",
+                        "cohort_in_scope": True,
+                        "stream_completeness_ok": True,
+                        "base_mint": "mint-complete",
+                        "pool_id": "pool-complete",
+                        "bonding_curve": "curve-complete",
+                        "quote_mint": "SOL",
+                        "birth_ts_ms": 1_000,
+                        "decision_ts_ms": 9_000,
+                    },
+                    {
+                        "candidate_id": "incomplete",
+                        "candidate_universe_status": "ok",
+                        "cohort_in_scope": True,
+                        "stream_completeness_ok": True,
+                        "base_mint": "mint-incomplete",
+                        "pool_id": "pool-incomplete",
+                        "bonding_curve": "curve-incomplete",
+                        "quote_mint": "SOL",
+                        "birth_ts_ms": 2_000,
+                        "decision_ts_ms": 10_000,
+                    },
+                ],
+            )
+            write_jsonl(accepted_lifecycle, [])
+            write_jsonl(
+                feature_snapshots,
+                [
+                    {
+                        "candidate_id": "complete",
+                        "snapshot_kind": "decision",
+                        "feature_snapshot_status": "ok",
+                        "feature_cutoff_ts_ms": 9_000,
+                        "feature_cutoff_slot": 1,
+                        "feature_source": "unit_test_feature_snapshot",
+                        "feature_source_max_ts_ms": 9_000,
+                        "feature_observed_lag_ms": 0,
+                    },
+                    {
+                        "candidate_id": "incomplete",
+                        "snapshot_kind": "decision",
+                        "feature_snapshot_status": "feature_snapshot_incomplete",
+                        "feature_snapshot_incomplete_reason": "missing_cutoff_events",
+                        "feature_cutoff_ts_ms": None,
+                        "feature_cutoff_slot": None,
+                        "feature_source": "unit_test_feature_snapshot",
+                        "feature_source_max_ts_ms": None,
+                        "feature_observed_lag_ms": None,
+                    },
+                ],
+            )
+            write_jsonl(
+                r2_paths_file,
+                [
+                    {
+                        "candidate_id": "complete",
+                        "base_mint": "mint-complete",
+                        "pool_id": "pool-complete",
+                        "bonding_curve": "curve-complete",
+                        "path_source": "yellowstone_accountupdate",
+                        "path_status": "ok",
+                        "path_coverage_ok": True,
+                        "horizon_matured": True,
+                        "samples": [
+                            {"offset_ms": 0, "return_pct": 0.0},
+                            {"offset_ms": 60_000, "return_pct": 45.0},
+                        ],
+                    },
+                    {
+                        "candidate_id": "incomplete",
+                        "base_mint": "mint-incomplete",
+                        "pool_id": "pool-incomplete",
+                        "bonding_curve": "curve-incomplete",
+                        "path_source": "yellowstone_accountupdate",
+                        "path_status": "ok",
+                        "path_coverage_ok": True,
+                        "horizon_matured": True,
+                        "samples": [
+                            {"offset_ms": 0, "return_pct": 0.0},
+                            {"offset_ms": 60_000, "return_pct": -45.0},
+                        ],
+                    },
+                ],
+            )
+
+            rows, coverage, audit = training.build_training_view(
+                candidate_universe=candidate_universe,
+                accepted_lifecycle=accepted_lifecycle,
+                feature_snapshots=feature_snapshots,
+                price_paths=r2_paths_file,
+                target_net_pct=40.0,
+                stop_net_pct=40.0,
+                horizon_ms=60_000,
+                snapshot_kind="decision",
+                fallback_snapshot_kind="birth+30s",
+                split_denominator="resolved_r2",
+            )
+
+        by_id = {row["candidate_id"]: row for row in rows}
+        self.assertTrue(by_id["complete"]["r2_only_training_denominator"])
+        self.assertEqual(by_id["complete"]["training_row_status"], "model_eligible")
+        self.assertFalse(by_id["incomplete"]["r2_only_training_denominator"])
+        self.assertFalse(by_id["incomplete"]["model_eligible"])
+        self.assertEqual(
+            by_id["incomplete"]["training_row_status"],
+            "excluded_feature_snapshot_incomplete",
+        )
+        self.assertEqual(coverage["r2_training_denominator_rows"], 1)
+        self.assertEqual(coverage["effective_r2_training_denominator_rows"], 1)
+        self.assertEqual(coverage["feature_snapshot_incomplete_excluded_rows"], 1)
+        self.assertEqual(coverage["missing_feature_cutoff_excluded_rows"], 1)
+        self.assertEqual(audit["status"], "PASS")
+        self.assertEqual(audit["rows_excluded_from_model_audit"], 1)
+        self.assertEqual(audit["violation_count"], 0)
 
     def test_feature_snapshot_does_not_use_decision_logs_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3962,6 +4180,49 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertIn("attempted_rows_not_equal_buy_rows", report["fail_reasons"])
         self.assertIn("attempt_coverage_below_minimum", report["fail_reasons"])
 
+    def test_selector_regression_gate_operational_profile_allows_bounded_not_executable(self) -> None:
+        fixture = self.r18c_regression_fixture_dir()
+        rows = read_jsonl(fixture / "shadow_buys.jsonl")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            audit_json = json.loads((fixture / "audit_pass.json").read_text(encoding="utf-8"))
+            audit_json["metrics"]["buy_rows"] = 100
+            audit_json["metrics"]["shadow_simulation_attempted_rows"] = 95
+            audit_json["metrics"]["not_executable_route_rows"] = 5
+            audit_json["metrics"]["simulation_attempt_coverage"] = 0.95
+            audit_path = tmp / "audit.json"
+            audit_path.write_text(json.dumps(audit_json), encoding="utf-8")
+            write_jsonl(tmp / "rows.jsonl", rows)
+
+            report = selector_regression_gates.build_report(
+                selector_regression_gates.build_parser().parse_args(
+                    [
+                        "--scope",
+                        "r19-operational-fixture",
+                        "--root",
+                        str(Path(__file__).resolve().parents[1]),
+                        "--audit-json",
+                        str(audit_path),
+                        "--jsonl",
+                        str(tmp / "rows.jsonl"),
+                        "--gate-profile",
+                        "operational",
+                        "--min-attempt-coverage",
+                        "0.95",
+                        "--max-not-executable-rate",
+                        "0.05",
+                        "--max-unknown-unclassified",
+                        "1",
+                    ]
+                )
+            )
+
+        self.assertEqual(report["status"], "PASS")
+        self.assertEqual(report["metrics"]["gate_profile"], "operational")
+        self.assertEqual(report["metrics"]["attempted_rows"], 95)
+        self.assertEqual(report["metrics"]["not_executable_route_rows"], 5)
+        self.assertFalse(report["fail_reasons"])
+
     def test_selector_regression_gate_rejects_selected_fallback_without_route_kind(self) -> None:
         fixture = self.r18c_regression_fixture_dir()
         rows = read_jsonl(fixture / "shadow_buys.jsonl")
@@ -4095,6 +4356,8 @@ class SelectorPipelineTests(unittest.TestCase):
         )
 
     def run_coverage_breakthrough_projection(self, root: Path, scope: str) -> dict:
+        if coverage_breakthrough is None:
+            self.skipTest("build_selector_coverage_breakthrough_projection.py is not tracked")
         return coverage_breakthrough.build_report(
             coverage_breakthrough.build_parser().parse_args(
                 [

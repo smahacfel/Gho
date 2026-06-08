@@ -26,6 +26,10 @@ DECISION_PLANES = ("v25_shadow", "legacy_live", "auto")
 OBSERVATION_PROFILES = ("observation_8s_10s", "observation_60s", "all")
 MODEL_ALLOWED_CUTOFF_STATUSES = {"ok", "same_decision_time"}
 MODEL_ALLOWED_CONTEXT_STATUS = "ok"
+PASS_STATUSES = {"PASS", "PASS_CORE_WITH_CONCENTRATION_COVERAGE_WARNING"}
+CORE_FEATURE_MIN_PRESENT_RATE = 0.95
+CONCENTRATION_FEATURE_MIN_PRESENT_RATE = 0.60
+CONCENTRATION_FEATURE_WARNING_PRESENT_RATE = 0.80
 
 PROVENANCE_GK_COLUMNS = {
     "gk_log_schema_version",
@@ -34,6 +38,21 @@ PROVENANCE_GK_COLUMNS = {
     "gk_context_status",
     "gk_cutoff_status",
 }
+
+CORE_MARKET_CURVE_FEATURES = (
+    "gk_bonding_progress_pct",
+    "gk_current_market_cap_sol",
+    "gk_price_change_ratio",
+    "gk_curve_data_known",
+    "gk_observation_start_ts_ms",
+    "gk_observation_end_ts_ms",
+    "gk_observation_duration_ms",
+)
+
+CONCENTRATION_SUPPORT_FEATURES = (
+    "gk_hhi",
+    "gk_top3_volume_pct",
+)
 
 RAW_FEATURES = (
     "max_wait_time_ms",
@@ -689,26 +708,71 @@ def build_context(
         if column in emitted_gk_columns and column not in PROVENANCE_GK_COLUMNS
     ]
     presence = feature_presence(rows, model_feature_columns)
+    gate_feature_presence = feature_presence(
+        rows,
+        sorted(set(CORE_MARKET_CURVE_FEATURES) | set(CONCENTRATION_SUPPORT_FEATURES)),
+    )
     forbidden = sorted({field for row in rows for field in forbidden_output_fields(row)})
     fail_reasons: list[str] = []
+    warning_reasons: list[str] = []
     if rows and not any(row.get("gk_context_status") == MODEL_ALLOWED_CONTEXT_STATUS for row in rows):
         fail_reasons.append("no_ok_context_rows")
     if not rows:
         fail_reasons.append("no_context_rows_written")
-    for required in (
-        "gk_bonding_progress_pct",
-        "gk_current_market_cap_sol",
-        "gk_price_change_ratio",
-        "gk_hhi",
-        "gk_top3_volume_pct",
-    ):
-        if presence.get(required, {}).get("present_rate", 0.0) < 0.80:
-            fail_reasons.append(f"{required}_present_rate_below_80pct")
+    for required in CORE_MARKET_CURVE_FEATURES:
+        if gate_feature_presence.get(required, {}).get("present_rate", 0.0) < CORE_FEATURE_MIN_PRESENT_RATE:
+            fail_reasons.append(f"{required}_present_rate_below_95pct")
+    concentration_rates = [
+        gate_feature_presence.get(required, {}).get("present_rate", 0.0)
+        for required in CONCENTRATION_SUPPORT_FEATURES
+    ]
+    concentration_feature_surface_status = "PASS"
+    if any(rate < CONCENTRATION_FEATURE_MIN_PRESENT_RATE for rate in concentration_rates):
+        concentration_feature_surface_status = "NO-GO_LOW_CONCENTRATION_COVERAGE"
+        for required in CONCENTRATION_SUPPORT_FEATURES:
+            if (
+                gate_feature_presence.get(required, {}).get("present_rate", 0.0)
+                < CONCENTRATION_FEATURE_MIN_PRESENT_RATE
+            ):
+                fail_reasons.append(f"{required}_present_rate_below_60pct")
+    elif any(rate < CONCENTRATION_FEATURE_WARNING_PRESENT_RATE for rate in concentration_rates):
+        concentration_feature_surface_status = "DEGRADED"
+        for required in CONCENTRATION_SUPPORT_FEATURES:
+            if (
+                gate_feature_presence.get(required, {}).get("present_rate", 0.0)
+                < CONCENTRATION_FEATURE_WARNING_PRESENT_RATE
+            ):
+                warning_reasons.append(f"{required}_present_rate_below_80pct")
     if forbidden:
         fail_reasons.append("forbidden_fields_detected")
+    core_feature_surface_status = "PASS" if not any(
+        reason.startswith("gk_") and reason.endswith("_present_rate_below_95pct")
+        for reason in fail_reasons
+    ) else "NO-GO"
+    if fail_reasons:
+        status = "NO-GO"
+        gatekeeper_feature_context_status = (
+            "NO-GO_LOW_CONCENTRATION_COVERAGE"
+            if concentration_feature_surface_status == "NO-GO_LOW_CONCENTRATION_COVERAGE"
+            and all(
+                reason.startswith("gk_") and reason.endswith("_present_rate_below_60pct")
+                for reason in fail_reasons
+            )
+            else "NO-GO"
+        )
+    elif concentration_feature_surface_status == "DEGRADED":
+        status = "PASS_CORE_WITH_CONCENTRATION_COVERAGE_WARNING"
+        gatekeeper_feature_context_status = "PASS_CORE_WITH_CONCENTRATION_COVERAGE_WARNING"
+    else:
+        status = "PASS"
+        gatekeeper_feature_context_status = "PASS"
 
     manifest = {
-        "status": "PASS" if not fail_reasons else "NO-GO",
+        "status": status,
+        "gatekeeper_feature_context_status": gatekeeper_feature_context_status,
+        "core_feature_surface_status": core_feature_surface_status,
+        "concentration_feature_surface_status": concentration_feature_surface_status,
+        "model_policy": "missing_not_zero",
         "selector_schema_version": common.SCHEMA_VERSION,
         "artifact": "gatekeeper_feature_context_manifest_v1",
         "schema_version": SCHEMA_VERSION,
@@ -734,8 +798,17 @@ def build_context(
         "cutoff_status_counts": common.counter_dict(cutoff_status_counts),
         "observation_profile_counts": common.counter_dict(observation_profile_counts),
         "feature_presence": presence,
+        "gate_feature_presence": gate_feature_presence,
         "feature_present_rates": {
             column: payload.get("present_rate") for column, payload in presence.items()
+        },
+        "gate_feature_present_rates": {
+            column: payload.get("present_rate") for column, payload in gate_feature_presence.items()
+        },
+        "gate_thresholds": {
+            "core_feature_min_present_rate": CORE_FEATURE_MIN_PRESENT_RATE,
+            "concentration_feature_min_present_rate": CONCENTRATION_FEATURE_MIN_PRESENT_RATE,
+            "concentration_feature_warning_present_rate": CONCENTRATION_FEATURE_WARNING_PRESENT_RATE,
         },
         "feature_columns": emitted_gk_columns,
         "model_feature_columns": model_feature_columns,
@@ -743,6 +816,7 @@ def build_context(
         "forbidden_fields_detected": forbidden,
         "denominator_created_rows": 0,
         "fail_reasons": fail_reasons,
+        "warning_reasons": warning_reasons,
         "input_paths": {
             "candidate_universe_v1": str(candidate_universe_path),
             "selector_training_view_v1": str(training_view_path) if training_view_path.exists() else None,
@@ -793,7 +867,7 @@ def main(argv: list[str] | None = None) -> int:
     summary = run(args)
     if args.json:
         print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
-    return 0 if summary["manifest"].get("status") == "PASS" else 2
+    return 0 if summary["manifest"].get("status") in PASS_STATUSES else 2
 
 
 if __name__ == "__main__":

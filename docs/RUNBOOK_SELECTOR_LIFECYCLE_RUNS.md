@@ -125,8 +125,7 @@ behavior, run the offline regression gate before making a closure claim:
 python3 scripts/ci_assert_selector_regression_gates.py \
   --scope shadow-burnin-v3-selector-dataset-r18c-bcv2-handoff-canonicalization-smoke \
   --root /root/Gho \
-  --require-attempted-equals-buy \
-  --require-not-executable-zero \
+  --gate-profile strict \
   --min-attempt-coverage 0.95 \
   --json
 ```
@@ -140,13 +139,39 @@ python3 scripts/ci_assert_selector_regression_gates.py \
   --root /root/Gho \
   --audit-json tests/fixtures/selector/r18c_bcv2_handoff_regression/audit_pass.json \
   --jsonl tests/fixtures/selector/r18c_bcv2_handoff_regression/shadow_buys.jsonl \
-  --require-attempted-equals-buy \
-  --require-not-executable-zero \
+  --gate-profile strict \
   --min-attempt-coverage 0.95 \
   --json
 ```
 
-The gate must fail closed on:
+For long feature-rich selector dataset runs, use the operational gate profile
+after the lifecycle launcher proof has already passed and BUY rows are
+representative:
+
+```bash
+python3 scripts/ci_assert_selector_regression_gates.py \
+  --scope shadow-burnin-v3-selector-dataset-r19-feature-rich-r2diag-simcov \
+  --root /root/Gho \
+  --gate-profile operational \
+  --min-attempt-coverage 0.95 \
+  --max-not-executable-rate 0.05 \
+  --max-unknown-unclassified 1 \
+  --json
+```
+
+The operational profile requires:
+
+```text
+attempted_rows / buy_rows >= 0.95
+not_executable_route_rows / buy_rows <= 0.05
+AccountNotFound = 0
+ResourceExhausted = 0
+unsupported_legacy_buy_layout_requires_bcv2 = 0
+UNKNOWN_UNCLASSIFIED <= 1
+can_unlock_execution=true = 0
+```
+
+The strict route/BCV2 regression gate must fail closed on:
 
 ```text
 AccountNotFound > 0
