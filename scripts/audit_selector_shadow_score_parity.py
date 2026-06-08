@@ -258,7 +258,7 @@ def value_for_feature(row: dict[str, Any], feature: str) -> float | None:
             return max(intervals) if intervals else None
     if feature.startswith("gk_"):
         return numeric(row.get(feature[3:]))
-    return None
+    return numeric(row.get(feature))
 
 
 def normalize(value: float | None, spec: dict[str, Any]) -> float:
@@ -319,6 +319,13 @@ def recompute(row: dict[str, Any], specs: list[dict[str, Any]], thresholds: dict
     else:
         validity = "score_valid"
 
+    flow_available = any(
+        spec["source"] == "Mapped"
+        and not str(spec["name"]).startswith("gk_")
+        and value_for_feature(row, str(spec["name"])) is not None
+        for spec in specs
+    )
+
     return {
         "selector_shadow_score": score,
         "mapped_only_score": mapped_only_score,
@@ -336,7 +343,7 @@ def recompute(row: dict[str, Any], specs: list[dict[str, Any]], thresholds: dict
             "core_curve_market_available": core_curve_market_available,
             "concentration_available": concentration_available,
             "gk_context_available": mapped_feature_count > 0 and cutoff_verified,
-            "flow_available": False,
+            "flow_available": flow_available,
         },
         "feature_missing_count": len(specs) - mapped_feature_count,
         "required_feature_missing_count": required_missing,
