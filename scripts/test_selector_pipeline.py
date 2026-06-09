@@ -39,6 +39,7 @@ import analyze_selector_candidate_crossrun_stability as crossrun_stability
 import build_selector_model_redesign_report as model_redesign
 import build_selector_evidence_gated_candidate_redesign as evidence_gated_redesign
 import analyze_selector_label_segment_diagnostics as label_segment_diagnostics
+import build_selector_segment_specific_candidate as segment_specific_candidate
 try:
     import build_selector_coverage_breakthrough_projection as coverage_breakthrough
 except ModuleNotFoundError:
@@ -1977,6 +1978,241 @@ class SelectorPipelineTests(unittest.TestCase):
 
         self.assertTrue(report["claim_boundaries"]["offline_only"])
         self.assertFalse(report["claim_boundaries"]["builds_new_model"])
+        self.assertFalse(report["claim_boundaries"]["changes_runtime"])
+        self.assertFalse(report["claim_boundaries"]["changes_gatekeeper"])
+        self.assertFalse(report["claim_boundaries"]["changes_execution"])
+        self.assertFalse(report["claim_boundaries"]["changes_send_path"])
+
+    def write_segment_specific_fixture(
+        self,
+        root: Path,
+        train_scope: str,
+        validation_scope: str,
+        *,
+        mode: str = "promotable",
+    ) -> Path:
+        rust_source = root / "ghost-brain" / "src" / "oracle" / "decision_logger.rs"
+        rust_source.parent.mkdir(parents=True)
+        rust_source.write_text(
+            "\n".join(
+                [
+                    "const SELECTOR_SHADOW_TOP10_EQUIV_THRESHOLD: f64 = 0.90;",
+                    "const SELECTOR_SHADOW_TOP25_EQUIV_THRESHOLD: f64 = 0.75;",
+                    "const SELECTOR_SHADOW_Q99_THRESHOLD: f64 = 0.99;",
+                    "const SELECTOR_SHADOW_Q98_THRESHOLD: f64 = 0.98;",
+                    "const SELECTOR_SHADOW_Q975_THRESHOLD: f64 = 0.975;",
+                    "const SELECTOR_SHADOW_TARGET_PRECISION_0_70_THRESHOLD: f64 = 0.70;",
+                    "const SELECTOR_SHADOW_FEATURE_SPECS: &[SelectorShadowFeatureSpec] = &[",
+                    '    SelectorShadowFeatureSpec { name: "net_quote_in_15s", min: 0.0, max: 1.0, direction: 1.0, source: SelectorShadowRuntimeFeatureSource::Mapped, },',
+                    '    SelectorShadowFeatureSpec { name: "net_quote_in_30s", min: 0.0, max: 1.0, direction: 1.0, source: SelectorShadowRuntimeFeatureSource::Mapped, },',
+                    '    SelectorShadowFeatureSpec { name: "unique_buyers", min: 0.0, max: 10.0, direction: 1.0, source: SelectorShadowRuntimeFeatureSource::Mapped, },',
+                    '    SelectorShadowFeatureSpec { name: "gk_bonding_progress_pct", min: 0.0, max: 100.0, direction: 1.0, source: SelectorShadowRuntimeFeatureSource::Mapped, },',
+                    '    SelectorShadowFeatureSpec { name: "gk_current_market_cap_sol", min: 0.0, max: 200.0, direction: 1.0, source: SelectorShadowRuntimeFeatureSource::Mapped, },',
+                    '    SelectorShadowFeatureSpec { name: "gk_price_change_ratio", min: -1.0, max: 2.0, direction: 1.0, source: SelectorShadowRuntimeFeatureSource::Mapped, },',
+                    "];",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        def write_scope(scope: str, *, validation: bool) -> None:
+            rows = []
+            for idx in range(80):
+                in_segment = idx < 40
+                if mode == "promotable":
+                    positive = in_segment and idx < 30
+                    score = 0.95 - idx * 0.01 if in_segment else 0.30 - (idx - 40) * 0.002
+                    dev_ratio = 0.0
+                    sufficient = True
+                    sell_share = 0.05
+                elif mode == "high_dev_label_review":
+                    positive = in_segment and idx < 30
+                    score = 0.95 - idx * 0.01 if in_segment else 0.30 - (idx - 40) * 0.002
+                    dev_ratio = 0.95 if in_segment else 0.0
+                    sufficient = False if in_segment else True
+                    sell_share = 0.05
+                elif mode == "unstable":
+                    positive = (in_segment and idx < 30) if not validation else (not in_segment and idx >= 70)
+                    score = 0.95 - idx * 0.01 if in_segment else 0.30 - (idx - 40) * 0.002
+                    dev_ratio = 0.0
+                    sufficient = True
+                    sell_share = 0.05
+                else:
+                    raise AssertionError(mode)
+                rows.append(
+                    {
+                        "candidate_id": f"{scope}-c{idx}",
+                        "base_mint": f"mint{idx}",
+                        "pool_id": f"pool{idx}",
+                        "birth_ts_ms": 1_000_000 + idx,
+                        "decision_ts_ms": 2_000_000 + idx,
+                        "cohort_in_scope": True,
+                        "stream_completeness_ok": True,
+                        "feature_snapshot_status": "ok",
+                        "r2_status": "resolved",
+                        "r2_path_coverage_ok": True,
+                        "r2_horizon_matured": True,
+                        "execution_feasibility_status": "executable",
+                        "gk_context_status": "ok",
+                        "gk_cutoff_status": "ok",
+                        "r2_label": "positive" if positive else "negative",
+                        "net_quote_in_15s": score,
+                        "net_quote_in_30s": score,
+                        "unique_buyers": 6 if in_segment else 3,
+                        "trade_rate": score,
+                        "sell_share": sell_share,
+                        "gk_bonding_progress_pct": 80.0 if in_segment else 30.0,
+                        "gk_current_market_cap_sol": 20.0 if in_segment else 150.0,
+                        "gk_price_change_ratio": 1.0 if in_segment else 0.1,
+                        "gk_hhi": 0.30,
+                        "gk_top3_volume_pct": 0.40,
+                        "gk_dev_tx_ratio": dev_ratio,
+                        "gk_dev_volume_ratio": dev_ratio,
+                        "gk_dev_has_sold": False,
+                        "evidence_sufficiency_status": "sufficient" if sufficient else "insufficient",
+                        "score_eligibility_status": (
+                            "eligible"
+                            if sufficient
+                            else "score_invalid_insufficient_market_evidence"
+                        ),
+                        "score_eligibility_reasons": [] if sufficient else ["diagnostic_insufficient_evidence"],
+                        "evidence_tx_count": 10 if sufficient else 1,
+                        "evidence_buy_count": 6 if sufficient else 1,
+                        "evidence_unique_buyers": 6 if sufficient else 1,
+                        "evidence_unique_signers": 6 if sufficient else 1,
+                        "evidence_total_volume_sol": 4.0 if sufficient else 0.05,
+                        "evidence_sell_share": sell_share,
+                    }
+                )
+            write_jsonl(root / "datasets" / "selector" / scope / "selector_training_view_v1.jsonl", rows)
+            manifest = root / "reports" / "selector" / scope / "phase3_r2only_manifest_v1.json"
+            manifest.parent.mkdir(parents=True, exist_ok=True)
+            manifest.write_text(
+                json.dumps({"leakage_audit_status": "PASS", "fail_reasons": []}) + "\n",
+                encoding="utf-8",
+            )
+
+        write_scope(train_scope, validation=False)
+        write_scope(validation_scope, validation=True)
+        return rust_source
+
+    def run_segment_specific_fixture(self, root: Path, train_scope: str, validation_scope: str, rust_source: Path) -> dict:
+        return segment_specific_candidate.build_report(
+            segment_specific_candidate.build_parser().parse_args(
+                [
+                    "--root",
+                    str(root),
+                    "--train-scope",
+                    train_scope,
+                    "--validation-scope",
+                    validation_scope,
+                    "--rust-source",
+                    str(rust_source.relative_to(root)),
+                    "--min-candidate-rows",
+                    "10",
+                    "--max-toxic-false-positive-rate",
+                    "1.0",
+                ]
+            )
+        )
+
+    def test_segment_specific_candidate_detects_promotable_segment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            train_scope = "selector-p4e-promote-train"
+            validation_scope = "selector-p4e-promote-validation"
+            rust_source = self.write_segment_specific_fixture(root, train_scope, validation_scope)
+            report = self.run_segment_specific_fixture(root, train_scope, validation_scope, rust_source)
+
+        self.assertEqual(report["status"], "P4E_PROMOTABLE_CANDIDATE_FOUND")
+        self.assertIn(
+            "low_market_cap_evidence_sufficient_antijunk",
+            report["promotable_candidate_ids"],
+        )
+
+    def test_segment_specific_candidate_marks_insufficient_evidence_segment_diagnostic_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            train_scope = "selector-p4e-insufficient-train"
+            validation_scope = "selector-p4e-insufficient-validation"
+            rust_source = self.write_segment_specific_fixture(
+                root,
+                train_scope,
+                validation_scope,
+                mode="high_dev_label_review",
+            )
+            report = self.run_segment_specific_fixture(root, train_scope, validation_scope, rust_source)
+
+        diagnostic = report["candidates"]["risky_positive_segments_diagnostic_only"]
+        self.assertIn(
+            diagnostic["promotability"]["promotability_status"],
+            {"DIAGNOSTIC_ONLY", "REQUIRES_LABEL_REVIEW"},
+        )
+
+    def test_segment_specific_candidate_marks_high_dev_volume_segment_requires_label_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            train_scope = "selector-p4e-dev-train"
+            validation_scope = "selector-p4e-dev-validation"
+            rust_source = self.write_segment_specific_fixture(
+                root,
+                train_scope,
+                validation_scope,
+                mode="high_dev_label_review",
+            )
+            report = self.run_segment_specific_fixture(root, train_scope, validation_scope, rust_source)
+
+        self.assertEqual(report["status"], "P4E_REQUIRES_LABEL_REVIEW")
+        self.assertTrue(report["label_review_required"])
+
+    def test_segment_specific_candidate_rejects_unstable_segment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            train_scope = "selector-p4e-unstable-train"
+            validation_scope = "selector-p4e-unstable-validation"
+            rust_source = self.write_segment_specific_fixture(
+                root,
+                train_scope,
+                validation_scope,
+                mode="unstable",
+            )
+            report = self.run_segment_specific_fixture(root, train_scope, validation_scope, rust_source)
+
+        self.assertNotIn(
+            "low_market_cap_evidence_sufficient_antijunk",
+            report["promotable_candidate_ids"],
+        )
+        self.assertEqual(
+            report["candidates"]["low_market_cap_evidence_sufficient_antijunk"]["promotability"][
+                "promotability_status"
+            ],
+            "NO_STABLE_EDGE",
+        )
+
+    def test_segment_specific_candidate_reports_false_positive_risk_matrix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            train_scope = "selector-p4e-risk-train"
+            validation_scope = "selector-p4e-risk-validation"
+            rust_source = self.write_segment_specific_fixture(root, train_scope, validation_scope)
+            report = self.run_segment_specific_fixture(root, train_scope, validation_scope, rust_source)
+            review = Path(report["outputs"]["segment_false_positive_review_v1.csv"]).read_text(
+                encoding="utf-8"
+            )
+
+        self.assertIn("risk_flags", review)
+        self.assertIn("toxic_false_positive", review)
+
+    def test_segment_specific_candidate_has_no_runtime_claims(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            train_scope = "selector-p4e-claims-train"
+            validation_scope = "selector-p4e-claims-validation"
+            rust_source = self.write_segment_specific_fixture(root, train_scope, validation_scope)
+            report = self.run_segment_specific_fixture(root, train_scope, validation_scope, rust_source)
+
+        self.assertTrue(report["claim_boundaries"]["offline_only"])
+        self.assertFalse(report["claim_boundaries"]["builds_runtime_score"])
         self.assertFalse(report["claim_boundaries"]["changes_runtime"])
         self.assertFalse(report["claim_boundaries"]["changes_gatekeeper"])
         self.assertFalse(report["claim_boundaries"]["changes_execution"])
