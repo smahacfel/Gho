@@ -2512,6 +2512,178 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertEqual(rows[0]["bq_prior_pool_participation_count_sum"], 1)
         self.assertFalse(rows[0]["bq_uses_future_activity"])
 
+    def test_buyer_quality_context_accepts_is_buy_without_literal_buy_value(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "selector-p4e-bq-is-buy"
+            runtime_scope = "runtime-p4e-bq-is-buy"
+            write_jsonl(
+                root / "datasets" / "selector" / scope / "candidate_universe_v1.jsonl",
+                [{"candidate_id": "cand1", "pool_id": "poolA", "base_mint": "mintA", "decision_ts_ms": 2_000}],
+            )
+            write_jsonl(
+                root / "datasets" / "events" / runtime_scope / "events.jsonl",
+                [
+                    {
+                        "kind": {
+                            "type": "PoolTransaction",
+                            "payload": {
+                                "pool_id": "poolA",
+                                "base_mint": "mintA",
+                                "is_buy": True,
+                                "success": True,
+                                "wallet": "buyer1",
+                                "event_ts_ms": 1_900,
+                            },
+                        }
+                    }
+                ],
+            )
+            manifest = buyer_quality_context.build_context(
+                buyer_quality_context.build_parser().parse_args(
+                    ["--root", str(root), "--scope", scope, "--runtime-scope", runtime_scope]
+                )
+            )
+            rows = read_jsonl(root / "datasets" / "selector" / scope / "buyer_quality_context_v1.jsonl")
+
+        self.assertEqual(manifest["candidate_pool_transaction_buy_rows"], 1)
+        self.assertEqual(rows[0]["bq_buyer_sample_count"], 1)
+        self.assertEqual(rows[0]["bq_unique_buyer_count"], 1)
+        self.assertEqual(rows[0]["bq_context_status"], "no_prior_history_observed")
+
+    def test_buyer_quality_context_velocity_keeps_wallet_alignment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "selector-p4e-bq-velocity"
+            runtime_scope = "runtime-p4e-bq-velocity"
+            write_jsonl(
+                root / "datasets" / "selector" / scope / "candidate_universe_v1.jsonl",
+                [{"candidate_id": "cand1", "pool_id": "poolA", "base_mint": "mintA", "decision_ts_ms": 10_000}],
+            )
+            write_jsonl(
+                root / "datasets" / "events" / runtime_scope / "events.jsonl",
+                [
+                    {
+                        "kind": {
+                            "type": "PoolTransaction",
+                            "payload": {
+                                "pool_id": "poolA",
+                                "base_mint": "mintA",
+                                "side": "buy",
+                                "success": True,
+                                "wallet": "buyerFresh",
+                                "event_ts_ms": 8_000,
+                            },
+                        }
+                    },
+                    {
+                        "kind": {
+                            "type": "PoolTransaction",
+                            "payload": {
+                                "pool_id": "poolPrior1",
+                                "base_mint": "mintPrior1",
+                                "side": "buy",
+                                "success": True,
+                                "wallet": "buyerRepeat",
+                                "event_ts_ms": 1_000,
+                            },
+                        }
+                    },
+                    {
+                        "kind": {
+                            "type": "PoolTransaction",
+                            "payload": {
+                                "pool_id": "poolPrior2",
+                                "base_mint": "mintPrior2",
+                                "side": "buy",
+                                "success": True,
+                                "wallet": "buyerRepeat",
+                                "event_ts_ms": 2_000,
+                            },
+                        }
+                    },
+                    {
+                        "kind": {
+                            "type": "PoolTransaction",
+                            "payload": {
+                                "pool_id": "poolA",
+                                "base_mint": "mintA",
+                                "side": "buy",
+                                "success": True,
+                                "wallet": "buyerRepeat",
+                                "event_ts_ms": 8_500,
+                            },
+                        }
+                    },
+                ],
+            )
+            buyer_quality_context.build_context(
+                buyer_quality_context.build_parser().parse_args(
+                    ["--root", str(root), "--scope", scope, "--runtime-scope", runtime_scope]
+                )
+            )
+            rows = read_jsonl(root / "datasets" / "selector" / scope / "buyer_quality_context_v1.jsonl")
+
+        self.assertEqual(rows[0]["bq_prior_pool_participation_count_sum"], 2)
+        self.assertEqual(rows[0]["bq_repeat_buyer_count"], 1)
+        self.assertAlmostEqual(rows[0]["bq_cross_pool_velocity_mean"], 2.0)
+        self.assertAlmostEqual(rows[0]["bq_cross_pool_velocity_max"], 2.0)
+
+    def test_buyer_quality_context_proxy_mode_respects_first_n(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "selector-p4e-bq-proxy-first-n"
+            runtime_scope = "runtime-p4e-bq-proxy-first-n"
+            write_jsonl(
+                root / "datasets" / "selector" / scope / "candidate_universe_v1.jsonl",
+                [{"candidate_id": "mintA:poolA:birth", "pool_id": "poolA", "base_mint": "mintA", "decision_ts_ms": 2_000}],
+            )
+            write_jsonl(
+                root / "datasets" / "events" / runtime_scope / "events.jsonl",
+                [{"kind": {"type": "PoolTransaction", "payload": {"pool_id": "unused", "is_buy": False}}}],
+            )
+            write_jsonl(
+                root
+                / "logs"
+                / "rollout"
+                / runtime_scope
+                / "decisions"
+                / runtime_scope
+                / "v2.5"
+                / "coordination_risk"
+                / "coordination_risk_evidence.jsonl",
+                [
+                    {
+                        "candidate_id": "poolA:mintA:decision",
+                        "sample_summary": {
+                            "successful_buy_txs": 10,
+                            "unique_buyers": 7,
+                        },
+                        "signer_cross_pool_velocity": 0.25,
+                    }
+                ],
+            )
+            buyer_quality_context.build_context(
+                buyer_quality_context.build_parser().parse_args(
+                    [
+                        "--root",
+                        str(root),
+                        "--scope",
+                        scope,
+                        "--runtime-scope",
+                        runtime_scope,
+                        "--max-event-bytes-for-wallet-history",
+                        "0",
+                        "--first-n",
+                        "3",
+                    ]
+                )
+            )
+            rows = read_jsonl(root / "datasets" / "selector" / scope / "buyer_quality_context_v1.jsonl")
+
+        self.assertEqual(rows[0]["bq_context_status"], "proxy_status_only")
+        self.assertEqual(rows[0]["bq_first_n_buyer_count"], 3)
+
     def test_buyer_quality_context_does_not_use_future_pool_activity(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

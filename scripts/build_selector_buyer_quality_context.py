@@ -112,7 +112,7 @@ def iter_pool_transaction_rows(path: Path):
     decoder = json.JSONDecoder()
     with path.open("r", encoding="utf-8", errors="ignore") as fh:
         for line in fh:
-            if "PoolTransaction" not in line or '"buy"' not in line:
+            if "PoolTransaction" not in line:
                 continue
             raw = line.strip()
             if not raw:
@@ -226,7 +226,12 @@ def parse_coordination_buyer_proxy(paths: list[Path]) -> dict[str, dict[str, Any
     return out
 
 
-def proxy_context_row(candidate: dict[str, Any], proxy: dict[str, Any] | None) -> dict[str, Any]:
+def proxy_context_row(
+    candidate: dict[str, Any],
+    proxy: dict[str, Any] | None,
+    *,
+    first_n: int,
+) -> dict[str, Any]:
     candidate_id = common.str_or_none(candidate.get("candidate_id")) or ""
     sample = common.int_or_none(proxy.get("buyer_sample_count")) if proxy else None
     unique = common.int_or_none(proxy.get("unique_buyer_count")) if proxy else None
@@ -250,7 +255,7 @@ def proxy_context_row(candidate: dict[str, Any], proxy: dict[str, Any] | None) -
         "bq_prior_pool_participation_count_max": None,
         "bq_cross_pool_velocity_mean": velocity,
         "bq_cross_pool_velocity_max": velocity,
-        "bq_first_n_buyer_count": min(unique, DEFAULT_FIRST_N) if unique is not None else None,
+        "bq_first_n_buyer_count": min(unique, first_n) if unique is not None else None,
         "bq_first_n_repeat_buyer_count": None,
         "bq_first_n_repeat_buyer_share": None,
         "bq_context_status": "proxy_status_only" if proxy else "unknown",
@@ -372,7 +377,7 @@ def build_context_row(
     first_buyers = buyers[:first_n]
     prior_pool_counts: list[int] = []
     prior_tx_counts: list[int] = []
-    first_seen_values: list[int] = []
+    prior_history_by_wallet: dict[str, tuple[int, int, int | None]] = {}
     repeat_buyers = 0
     for wallet in buyers:
         if cutoff_ms is None:
@@ -383,10 +388,9 @@ def build_context_row(
             pool_id,
             txs_by_wallet,
         )
+        prior_history_by_wallet[wallet] = (prior_pool_count, prior_tx_count, first_seen)
         prior_pool_counts.append(prior_pool_count)
         prior_tx_counts.append(prior_tx_count)
-        if first_seen is not None:
-            first_seen_values.append(first_seen)
         if prior_pool_count > 0:
             repeat_buyers += 1
     first_repeat = 0
@@ -402,8 +406,11 @@ def build_context_row(
         if prior_pool_count > 0:
             first_repeat += 1
     velocity_values: list[float] = []
-    for count, first_seen in zip(prior_pool_counts, first_seen_values):
-        if cutoff_ms is None:
+    for wallet in buyers:
+        if cutoff_ms is None or wallet not in prior_history_by_wallet:
+            continue
+        count, _prior_tx_count, first_seen = prior_history_by_wallet[wallet]
+        if first_seen is None:
             continue
         hours = max((cutoff_ms - first_seen) / 3_600_000.0, 1.0)
         velocity_values.append(count / hours)
@@ -472,7 +479,7 @@ def build_context(args: argparse.Namespace) -> dict[str, Any]:
             proxy = proxy_by_candidate.get(f"candidate:{candidate_id}")
             if proxy is None and identity:
                 proxy = proxy_by_candidate.get(f"mint_pool:{identity[0]}:{identity[1]}")
-            rows.append(proxy_context_row(candidate, proxy))
+            rows.append(proxy_context_row(candidate, proxy, first_n=args.first_n))
     else:
         wanted_pools, wanted_mints = candidate_identity_sets(candidates)
         current_txs = parse_pool_transactions(
