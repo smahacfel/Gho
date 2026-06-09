@@ -51,6 +51,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-top25-overlap-rate", type=float, default=0.60)
     parser.add_argument("--max-top25-hit-rate-drop", type=float, default=0.05)
     parser.add_argument("--min-top25-resolved", type=int, default=10)
+    parser.add_argument("--min-model-top25-hit-rate", type=float, default=0.60)
+    parser.add_argument("--min-model-top50-lift-vs-base", type=float, default=0.05)
+    parser.add_argument("--min-model-top50-resolved", type=int, default=20)
     parser.add_argument("--output", default=None)
     parser.add_argument("--rows-output", default=None)
     parser.add_argument("--csv-output", default=None)
@@ -315,21 +318,28 @@ def build_report(args: argparse.Namespace) -> tuple[dict[str, Any], list[dict[st
         for k in sorted(set(args.top_k))
     ]
     top25 = next((item for item in topk_reports if item["k"] == 25), None)
+    top50 = next((item for item in topk_reports if item["k"] == 50), None)
     runtime_missing_flow_features = [
         str(spec["name"]) for spec in specs if spec.get("source") == "MissingRuntimeMapping"
     ]
+    base_positive_rate = (
+        r2_positive_rows / r2_resolved_rows
+        if r2_resolved_rows
+        else None
+    )
 
     status = "PASS"
     fail_reasons: list[str] = []
+    technical_verdict: str
     if claim_boundary_violations:
         status = "FAIL"
         fail_reasons.append("claim_boundary_violations")
     if unmatched_score_rows:
         fail_reasons.append("unmatched_score_rows_present")
     if r2_resolved_rows < args.min_r2_resolved_rows:
-        verdict = "INSUFFICIENT_R2_LABELS_FOR_DECISION"
+        technical_verdict = "INSUFFICIENT_R2_LABELS_FOR_TECHNICAL_FORWARD_SHADOW_DECISION"
     elif top25 is None:
-        verdict = "STRUCTURAL_DRIFT_ONLY_NO_LABEL_DECISION"
+        technical_verdict = "STRUCTURAL_DRIFT_ONLY_NO_LABEL_DECISION"
         fail_reasons.append("missing_top25_report")
     else:
         runtime_rate = top25.get("runtime_hit_rate")
@@ -346,23 +356,71 @@ def build_report(args: argparse.Namespace) -> tuple[dict[str, Any], list[dict[st
             and hit_rate_drop is not None
             and hit_rate_drop <= args.max_top25_hit_rate_drop
         ):
-            verdict = (
-                "FORWARD_SHADOW_READY_WITH_FULL_RUNTIME_SCORE"
+            technical_verdict = (
+                "FORWARD_SHADOW_TECHNICALLY_READY_WITH_FULL_RUNTIME_SCORE"
                 if not runtime_missing_flow_features
-                else "FORWARD_SHADOW_READY_WITH_PARTIAL_SCORE"
+                else "FORWARD_SHADOW_TECHNICALLY_READY_WITH_PARTIAL_SCORE"
             )
         else:
-            verdict = (
-                "TOPK_DRIFT_BLOCKS_FORWARD_SHADOW"
+            technical_verdict = (
+                "TOPK_DRIFT_BLOCKS_TECHNICAL_FORWARD_SHADOW"
                 if not runtime_missing_flow_features
-                else "FLOW_MAPPING_REQUIRED_BEFORE_FORWARD_SHADOW"
+                else "FLOW_MAPPING_REQUIRED_BEFORE_TECHNICAL_FORWARD_SHADOW"
             )
+
+    model_edge_verdict: str
+    model_edge_fail_reasons: list[str] = []
+    if r2_resolved_rows < args.min_r2_resolved_rows:
+        model_edge_verdict = "INSUFFICIENT_R2_LABELS_FOR_MODEL_EDGE_DECISION"
+        model_edge_fail_reasons.append("insufficient_r2_labels")
+    elif top25 is None or top50 is None:
+        model_edge_verdict = "MODEL_EDGE_NOT_EVALUABLE_ON_RUNTIME_SCOPE"
+        if top25 is None:
+            model_edge_fail_reasons.append("missing_top25_report")
+        if top50 is None:
+            model_edge_fail_reasons.append("missing_top50_report")
+    else:
+        top25_runtime_rate = top25.get("runtime_hit_rate")
+        top50_runtime_rate = top50.get("runtime_hit_rate")
+        top25_resolved = int(top25.get("runtime_resolved_count") or 0)
+        top50_resolved = int(top50.get("runtime_resolved_count") or 0)
+        top50_lift = (
+            top50_runtime_rate - base_positive_rate
+            if isinstance(top50_runtime_rate, (int, float))
+            and isinstance(base_positive_rate, (int, float))
+            else None
+        )
+        if top25_resolved < args.min_top25_resolved:
+            model_edge_fail_reasons.append("top25_resolved_below_minimum")
+        if top50_resolved < args.min_model_top50_resolved:
+            model_edge_fail_reasons.append("top50_resolved_below_minimum")
+        if not isinstance(top25_runtime_rate, (int, float)) or top25_runtime_rate < args.min_model_top25_hit_rate:
+            model_edge_fail_reasons.append("top25_runtime_hit_rate_below_model_edge_threshold")
+        if not isinstance(top50_lift, (int, float)) or top50_lift < args.min_model_top50_lift_vs_base:
+            model_edge_fail_reasons.append("top50_runtime_lift_below_model_edge_threshold")
+        model_edge_verdict = (
+            "MODEL_EDGE_CONFIRMED_ON_RUNTIME_SCOPE"
+            if not model_edge_fail_reasons
+            else "MODEL_EDGE_NOT_CONFIRMED_ON_RUNTIME_SCOPE"
+        )
+
+    business_decision = (
+        "FORWARD_SHADOW_BURN_IN_ALLOWED"
+        if technical_verdict.startswith("FORWARD_SHADOW_TECHNICALLY_READY")
+        and model_edge_verdict == "MODEL_EDGE_CONFIRMED_ON_RUNTIME_SCOPE"
+        and not claim_boundary_violations
+        else "DO_NOT_FORWARD_SHADOW_BURN_IN"
+    )
 
     report = {
         "artifact": ARTIFACT,
         "status": status,
         "fail_reasons": fail_reasons,
-        "verdict": verdict,
+        "verdict": business_decision,
+        "technical_verdict": technical_verdict,
+        "model_edge_verdict": model_edge_verdict,
+        "business_decision": business_decision,
+        "model_edge_fail_reasons": model_edge_fail_reasons,
         "runtime_scope": args.runtime_scope,
         "selector_scope": args.selector_scope,
         "decision_plane": args.decision_plane,
@@ -389,6 +447,7 @@ def build_report(args: argparse.Namespace) -> tuple[dict[str, Any], list[dict[st
         "r2_resolved_rows": r2_resolved_rows,
         "r2_positive_rows": r2_positive_rows,
         "r2_negative_rows": r2_negative_rows,
+        "base_positive_rate": base_positive_rate,
         "min_r2_resolved_rows": args.min_r2_resolved_rows,
         "runtime_missing_flow_features": runtime_missing_flow_features,
         "thresholds": thresholds,
@@ -397,6 +456,9 @@ def build_report(args: argparse.Namespace) -> tuple[dict[str, Any], list[dict[st
             "max_top25_hit_rate_drop": args.max_top25_hit_rate_drop,
             "min_top25_resolved": args.min_top25_resolved,
             "applies_only_when_r2_resolved_rows_at_least": args.min_r2_resolved_rows,
+            "min_model_top25_hit_rate": args.min_model_top25_hit_rate,
+            "min_model_top50_lift_vs_base": args.min_model_top50_lift_vs_base,
+            "min_model_top50_resolved": args.min_model_top50_resolved,
         },
         "topk": topk_reports,
     }
@@ -450,7 +512,9 @@ def write_markdown(path: Path, report: dict[str, Any]) -> None:
         "# Selector Shadow Score TopK Drift",
         "",
         f"Status: {report['status']}",
-        f"Verdict: {report['verdict']}",
+        f"Technical verdict: {report['technical_verdict']}",
+        f"Model edge verdict: {report['model_edge_verdict']}",
+        f"Business decision: {report['business_decision']}",
         f"Runtime scope: `{report['runtime_scope']}`",
         f"Selector scope: `{report['selector_scope']}`",
         "",
@@ -461,6 +525,7 @@ def write_markdown(path: Path, report: dict[str, Any]) -> None:
         f"- r2_resolved_rows: {report['r2_resolved_rows']}",
         f"- r2_positive_rows: {report['r2_positive_rows']}",
         f"- r2_negative_rows: {report['r2_negative_rows']}",
+        f"- base_positive_rate: {report['base_positive_rate']}",
         f"- claim_boundary_violations: {report['claim_boundary_violations']}",
         "",
         "## TopK",
