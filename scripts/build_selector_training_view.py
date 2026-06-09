@@ -108,6 +108,58 @@ def attach_gatekeeper_context(row: dict[str, Any], context: dict[str, Any] | Non
     row["gatekeeper_feature_context_source"] = context.get("source")
 
 
+def load_prefixed_context(
+    path: Path | None,
+    *,
+    prefix: str,
+    status_field: str,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    if path is None:
+        return {}, {
+            "enabled": False,
+            "rows": 0,
+            "joined_rows": 0,
+            "status_counts": {},
+            "feature_columns": [],
+        }
+    if not path.exists():
+        raise FileNotFoundError(path)
+    rows = list(common.iter_json_objects(path))
+    indexed: dict[str, dict[str, Any]] = {}
+    status_counts: Counter[str] = Counter()
+    feature_columns = sorted({key for row in rows for key in row if key.startswith(prefix)})
+    for row in rows:
+        candidate_id = common.str_or_none(row.get("candidate_id"))
+        if not candidate_id:
+            continue
+        indexed[candidate_id] = row
+        status_counts[str(row.get(status_field) or "unknown")] += 1
+    return indexed, {
+        "enabled": True,
+        "path": str(path),
+        "rows": len(rows),
+        "joined_rows": len(indexed),
+        "status_counts": common.counter_dict(status_counts),
+        "feature_columns": feature_columns,
+    }
+
+
+def attach_prefixed_context(
+    row: dict[str, Any],
+    context: dict[str, Any] | None,
+    *,
+    prefix: str,
+    joined_field: str,
+) -> None:
+    row[joined_field] = False
+    if context is None:
+        return
+    for key, value in context.items():
+        if key.startswith(prefix):
+            row[key] = value
+    row[joined_field] = True
+
+
 def finite_number(row: dict[str, Any], field: str) -> float | None:
     return common.float_or_none(row.get(field))
 
@@ -422,6 +474,8 @@ def build_training_view(
     fallback_snapshot_kind: str,
     split_denominator: str = "candidate_universe",
     gatekeeper_feature_context: Path | None = None,
+    buyer_quality_context: Path | None = None,
+    funding_graph_context: Path | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
     candidates = list(common.iter_json_objects(candidate_universe))
     accepted_rows = list(common.iter_json_objects(accepted_lifecycle))
@@ -436,6 +490,16 @@ def build_training_view(
     lifecycle_scope = candidate_time_scope(candidates, horizon_ms=horizon_ms)
     gatekeeper_context_by_candidate, gatekeeper_context_summary = load_gatekeeper_feature_context(
         gatekeeper_feature_context
+    )
+    buyer_quality_by_candidate, buyer_quality_summary = load_prefixed_context(
+        buyer_quality_context,
+        prefix="bq_",
+        status_field="bq_context_status",
+    )
+    funding_graph_by_candidate, funding_graph_summary = load_prefixed_context(
+        funding_graph_context,
+        prefix="fg_",
+        status_field="fg_status",
     )
 
     rows: list[dict[str, Any]] = []
@@ -582,6 +646,8 @@ def build_training_view(
             "phase3_dataset_kind": "r2_only",
             "label_resolved": r2.get("r2_label") in {"positive", "negative"},
             "gatekeeper_feature_context_joined": False,
+            "buyer_quality_context_joined": False,
+            "funding_graph_context_joined": False,
         }
         if feature:
             for key, value in feature.items():
@@ -615,6 +681,18 @@ def build_training_view(
             ):
                 row[key] = lifecycle.get(key)
         attach_gatekeeper_context(row, gatekeeper_context_by_candidate.get(candidate_id))
+        attach_prefixed_context(
+            row,
+            buyer_quality_by_candidate.get(candidate_id),
+            prefix="bq_",
+            joined_field="buyer_quality_context_joined",
+        )
+        attach_prefixed_context(
+            row,
+            funding_graph_by_candidate.get(candidate_id),
+            prefix="fg_",
+            joined_field="funding_graph_context_joined",
+        )
         materialize_evidence_sufficiency(row)
         row.update(r2)
         row["r2_label_resolved"] = row.get("r2_label") in {"positive", "negative"}
@@ -719,6 +797,18 @@ def build_training_view(
                 and row.get("gk_cutoff_status") in {"ok", "same_decision_time"}
             ),
         },
+        "buyer_quality_context": {
+            **buyer_quality_summary,
+            "training_rows_joined": sum(
+                1 for row in rows if row.get("buyer_quality_context_joined") is True
+            ),
+        },
+        "funding_graph_context": {
+            **funding_graph_summary,
+            "training_rows_joined": sum(
+                1 for row in rows if row.get("funding_graph_context_joined") is True
+            ),
+        },
     }
     excluded_candidate_ids = {
         common.str_or_none(row.get("candidate_id"))
@@ -751,6 +841,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="candidate_universe",
     )
     parser.add_argument("--gatekeeper-feature-context", type=Path)
+    parser.add_argument("--buyer-quality-context", type=Path)
+    parser.add_argument("--funding-graph-context", type=Path)
     parser.add_argument("--json", action="store_true")
     return parser
 
@@ -768,6 +860,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         fallback_snapshot_kind=args.fallback_snapshot_kind,
         split_denominator=args.split_denominator,
         gatekeeper_feature_context=args.gatekeeper_feature_context,
+        buyer_quality_context=args.buyer_quality_context,
+        funding_graph_context=args.funding_graph_context,
     )
     common.write_jsonl(args.output, rows)
     if args.label_coverage_output:

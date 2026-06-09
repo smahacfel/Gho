@@ -41,6 +41,8 @@ import build_selector_evidence_gated_candidate_redesign as evidence_gated_redesi
 import analyze_selector_label_segment_diagnostics as label_segment_diagnostics
 import build_selector_segment_specific_candidate as segment_specific_candidate
 import build_selector_new_signal_family_design as new_signal_family_design
+import build_selector_buyer_quality_context as buyer_quality_context
+import build_selector_funding_graph_context as funding_graph_context
 try:
     import build_selector_coverage_breakthrough_projection as coverage_breakthrough
 except ModuleNotFoundError:
@@ -2439,6 +2441,325 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertFalse(report["claim_boundaries"]["changes_execution"])
         self.assertFalse(report["claim_boundaries"]["changes_send_path"])
         self.assertFalse(report["claim_boundaries"]["tunes_thresholds"])
+
+    def write_buyer_quality_fixture(self, root: Path, scope: str, runtime_scope: str) -> None:
+        candidate = {
+            "candidate_id": "cand1",
+            "pool_id": "poolA",
+            "base_mint": "mintA",
+            "decision_ts_ms": 2_000,
+            "birth_ts_ms": 1_000,
+        }
+        write_jsonl(root / "datasets" / "selector" / scope / "candidate_universe_v1.jsonl", [candidate])
+        events = [
+            {
+                "kind": {
+                    "type": "PoolTransaction",
+                    "payload": {
+                        "pool_id": "poolPrior",
+                        "base_mint": "mintPrior",
+                        "side": "buy",
+                        "success": True,
+                        "wallet": "buyer1",
+                        "event_ts_ms": 1_500,
+                    },
+                }
+            },
+            {
+                "kind": {
+                    "type": "PoolTransaction",
+                    "payload": {
+                        "pool_id": "poolA",
+                        "base_mint": "mintA",
+                        "side": "buy",
+                        "success": True,
+                        "wallet": "buyer1",
+                        "event_ts_ms": 1_900,
+                    },
+                }
+            },
+            {
+                "kind": {
+                    "type": "PoolTransaction",
+                    "payload": {
+                        "pool_id": "poolFuture",
+                        "base_mint": "mintFuture",
+                        "side": "buy",
+                        "success": True,
+                        "wallet": "buyer1",
+                        "event_ts_ms": 2_500,
+                    },
+                }
+            },
+        ]
+        write_jsonl(root / "datasets" / "events" / runtime_scope / "events.jsonl", events)
+
+    def test_buyer_quality_context_counts_repeat_buyers_before_cutoff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "selector-p4e-bq"
+            runtime_scope = "runtime-p4e-bq"
+            self.write_buyer_quality_fixture(root, scope, runtime_scope)
+            manifest = buyer_quality_context.build_context(
+                buyer_quality_context.build_parser().parse_args(
+                    ["--root", str(root), "--scope", scope, "--runtime-scope", runtime_scope]
+                )
+            )
+            rows = read_jsonl(root / "datasets" / "selector" / scope / "buyer_quality_context_v1.jsonl")
+
+        self.assertEqual(manifest["status"], "PASS")
+        self.assertEqual(rows[0]["bq_repeat_buyer_count"], 1)
+        self.assertEqual(rows[0]["bq_prior_pool_participation_count_sum"], 1)
+        self.assertFalse(rows[0]["bq_uses_future_activity"])
+
+    def test_buyer_quality_context_does_not_use_future_pool_activity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "selector-p4e-bq-future"
+            runtime_scope = "runtime-p4e-bq-future"
+            write_jsonl(
+                root / "datasets" / "selector" / scope / "candidate_universe_v1.jsonl",
+                [
+                    {
+                        "candidate_id": "cand1",
+                        "pool_id": "poolA",
+                        "base_mint": "mintA",
+                        "decision_ts_ms": 2_000,
+                    }
+                ],
+            )
+            write_jsonl(
+                root / "datasets" / "events" / runtime_scope / "events.jsonl",
+                [
+                    {
+                        "kind": {
+                            "type": "PoolTransaction",
+                            "payload": {
+                                "pool_id": "poolA",
+                                "base_mint": "mintA",
+                                "side": "buy",
+                                "success": True,
+                                "wallet": "buyer1",
+                                "event_ts_ms": 1_900,
+                            },
+                        }
+                    },
+                    {
+                        "kind": {
+                            "type": "PoolTransaction",
+                            "payload": {
+                                "pool_id": "poolFuture",
+                                "base_mint": "mintFuture",
+                                "side": "buy",
+                                "success": True,
+                                "wallet": "buyer1",
+                                "event_ts_ms": 2_100,
+                            },
+                        }
+                    },
+                ],
+            )
+            buyer_quality_context.build_context(
+                buyer_quality_context.build_parser().parse_args(
+                    ["--root", str(root), "--scope", scope, "--runtime-scope", runtime_scope]
+                )
+            )
+            rows = read_jsonl(root / "datasets" / "selector" / scope / "buyer_quality_context_v1.jsonl")
+
+        self.assertEqual(rows[0]["bq_repeat_buyer_count"], 0)
+        self.assertEqual(rows[0]["bq_prior_pool_participation_count_sum"], 0)
+
+    def test_buyer_quality_context_marks_no_history_as_unknown_not_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "selector-p4e-bq-empty"
+            runtime_scope = "runtime-p4e-bq-empty"
+            write_jsonl(
+                root / "datasets" / "selector" / scope / "candidate_universe_v1.jsonl",
+                [{"candidate_id": "cand1", "pool_id": "poolA", "base_mint": "mintA", "decision_ts_ms": 2_000}],
+            )
+            write_jsonl(root / "datasets" / "events" / runtime_scope / "events.jsonl", [])
+            buyer_quality_context.build_context(
+                buyer_quality_context.build_parser().parse_args(
+                    ["--root", str(root), "--scope", scope, "--runtime-scope", runtime_scope]
+                )
+            )
+            rows = read_jsonl(root / "datasets" / "selector" / scope / "buyer_quality_context_v1.jsonl")
+
+        self.assertEqual(rows[0]["bq_context_status"], "unknown_no_buyer_evidence")
+        self.assertIsNone(rows[0]["bq_repeat_buyer_share"])
+
+    def test_funding_graph_context_materializes_known_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "selector-p4e-fg"
+            runtime_scope = "runtime-p4e-fg"
+            write_jsonl(
+                root / "datasets" / "selector" / scope / "candidate_universe_v1.jsonl",
+                [{"candidate_id": "cand1", "pool_id": "poolA", "base_mint": "mintA"}],
+            )
+            write_jsonl(
+                root
+                / "logs"
+                / "rollout"
+                / runtime_scope
+                / "decisions"
+                / runtime_scope
+                / "v2.5"
+                / "coordination_risk"
+                / "coordination_risk_evidence.jsonl",
+                [
+                    {
+                        "candidate_id": "cand1",
+                        "funding_visibility": "available",
+                        "sybil_resistance": {
+                            "funding_source_v2": {
+                                "status": "clean",
+                                "known_buyers": 3,
+                                "unknown_count": 1,
+                                "total_buyers": 4,
+                                "known_coverage": 0.75,
+                                "top_funder_count": 2,
+                            }
+                        },
+                    }
+                ],
+            )
+            funding_graph_context.build_context(
+                funding_graph_context.build_parser().parse_args(
+                    ["--root", str(root), "--scope", scope, "--runtime-scope", runtime_scope]
+                )
+            )
+            rows = read_jsonl(root / "datasets" / "selector" / scope / "funding_graph_context_v1.jsonl")
+
+        self.assertEqual(rows[0]["fg_status"], "clean")
+        self.assertEqual(rows[0]["fg_known_source_count"], 3)
+        self.assertEqual(rows[0]["fg_unknown_buyer_count"], 1)
+        self.assertEqual(rows[0]["fg_top_source_share"], 0.5)
+
+    def test_funding_graph_context_marks_unavailable_funding_lane(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "selector-p4e-fg-unavailable"
+            runtime_scope = "runtime-p4e-fg-unavailable"
+            write_jsonl(
+                root / "datasets" / "selector" / scope / "candidate_universe_v1.jsonl",
+                [{"candidate_id": "cand1", "pool_id": "poolA", "base_mint": "mintA"}],
+            )
+            write_jsonl(
+                root
+                / "logs"
+                / "rollout"
+                / runtime_scope
+                / "decisions"
+                / runtime_scope
+                / "v2.5"
+                / "coordination_risk"
+                / "coordination_risk_evidence.jsonl",
+                [
+                    {
+                        "candidate_id": "cand1",
+                        "funding_visibility": "unavailable",
+                        "sybil_resistance": {
+                            "funding_source_v2": {
+                                "status": "unavailable",
+                                "excluded_reason": "funding_lane_unavailable",
+                            }
+                        },
+                    }
+                ],
+            )
+            funding_graph_context.build_context(
+                funding_graph_context.build_parser().parse_args(
+                    ["--root", str(root), "--scope", scope, "--runtime-scope", runtime_scope]
+                )
+            )
+            rows = read_jsonl(root / "datasets" / "selector" / scope / "funding_graph_context_v1.jsonl")
+
+        self.assertEqual(rows[0]["fg_status"], "unavailable")
+        self.assertIsNone(rows[0]["fg_top_source_share"])
+        self.assertFalse(rows[0]["fg_unknown_is_safe"])
+
+    def test_training_view_joins_buyer_quality_and_funding_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.build_training_view_fixture(root)
+            write_jsonl(
+                root / "buyer_quality_context_v1.jsonl",
+                [
+                    {
+                        "candidate_id": "c1",
+                        "bq_context_status": "clean",
+                        "bq_repeat_buyer_count": 2,
+                    }
+                ],
+            )
+            write_jsonl(
+                root / "funding_graph_context_v1.jsonl",
+                [
+                    {
+                        "candidate_id": "c1",
+                        "fg_status": "unavailable",
+                        "fg_top_source_share": None,
+                    }
+                ],
+            )
+            rows, coverage, _audit = training.build_training_view(
+                candidate_universe=root / "candidate_universe_v1.jsonl",
+                accepted_lifecycle=root / "accepted_lifecycle_v1.jsonl",
+                feature_snapshots=root / "feature_snapshots_v1.jsonl",
+                price_paths=root / "price_paths.jsonl",
+                target_net_pct=40.0,
+                stop_net_pct=40.0,
+                horizon_ms=60_000,
+                snapshot_kind="decision",
+                fallback_snapshot_kind="decision",
+                buyer_quality_context=root / "buyer_quality_context_v1.jsonl",
+                funding_graph_context=root / "funding_graph_context_v1.jsonl",
+            )
+
+        self.assertTrue(rows[0]["buyer_quality_context_joined"])
+        self.assertTrue(rows[0]["funding_graph_context_joined"])
+        self.assertEqual(rows[0]["bq_context_status"], "clean")
+        self.assertEqual(rows[0]["fg_status"], "unavailable")
+        self.assertEqual(coverage["buyer_quality_context"]["training_rows_joined"], 1)
+        self.assertEqual(coverage["funding_graph_context"]["training_rows_joined"], 1)
+
+    def test_training_view_preserves_r2_denominator_with_new_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.build_training_view_fixture(root)
+            rows_without, _coverage_without, _audit_without = training.build_training_view(
+                candidate_universe=root / "candidate_universe_v1.jsonl",
+                accepted_lifecycle=root / "accepted_lifecycle_v1.jsonl",
+                feature_snapshots=root / "feature_snapshots_v1.jsonl",
+                price_paths=root / "price_paths.jsonl",
+                target_net_pct=40.0,
+                stop_net_pct=40.0,
+                horizon_ms=60_000,
+                snapshot_kind="decision",
+                fallback_snapshot_kind="decision",
+            )
+            write_jsonl(root / "buyer_quality_context_v1.jsonl", [{"candidate_id": "c1", "bq_context_status": "clean"}])
+            write_jsonl(root / "funding_graph_context_v1.jsonl", [{"candidate_id": "c1", "fg_status": "unavailable"}])
+            rows_with, _coverage_with, _audit_with = training.build_training_view(
+                candidate_universe=root / "candidate_universe_v1.jsonl",
+                accepted_lifecycle=root / "accepted_lifecycle_v1.jsonl",
+                feature_snapshots=root / "feature_snapshots_v1.jsonl",
+                price_paths=root / "price_paths.jsonl",
+                target_net_pct=40.0,
+                stop_net_pct=40.0,
+                horizon_ms=60_000,
+                snapshot_kind="decision",
+                fallback_snapshot_kind="decision",
+                buyer_quality_context=root / "buyer_quality_context_v1.jsonl",
+                funding_graph_context=root / "funding_graph_context_v1.jsonl",
+            )
+
+        self.assertEqual(
+            [row["r2_only_training_denominator"] for row in rows_without],
+            [row["r2_only_training_denominator"] for row in rows_with],
+        )
 
     def test_training_view_r2_no_target_is_negative_only_with_matured_coverage(self) -> None:
         path = {

@@ -134,6 +134,8 @@ def build_phase3(args: argparse.Namespace) -> dict[str, Any]:
         fallback_snapshot_kind=args.fallback_snapshot_kind,
         split_denominator="resolved_r2",
         gatekeeper_feature_context=args.gatekeeper_feature_context,
+        buyer_quality_context=args.buyer_quality_context,
+        funding_graph_context=args.funding_graph_context,
     )
     common.write_jsonl(training_output, rows)
     common.write_json(leakage_output, leakage_audit)
@@ -178,6 +180,8 @@ def build_phase3(args: argparse.Namespace) -> dict[str, Any]:
             "feature_snapshots_v1": file_provenance(feature_snapshots),
             "r2_market_paths_v1": file_provenance(r2_market_paths),
             "gatekeeper_feature_context_v1": file_provenance(args.gatekeeper_feature_context),
+            "buyer_quality_context_v1": file_provenance(args.buyer_quality_context),
+            "funding_graph_context_v1": file_provenance(args.funding_graph_context),
         },
         "training_rows": len(rows),
         "r2_training_denominator_rows": r2_denominator_rows,
@@ -205,6 +209,10 @@ def build_phase3(args: argparse.Namespace) -> dict[str, Any]:
         "execution_success_claim_allowed": False,
         "selector_training_view_built": True,
         "gatekeeper_feature_context_enabled": args.gatekeeper_feature_context is not None,
+        "buyer_quality_context_enabled": args.buyer_quality_context is not None,
+        "funding_graph_context_enabled": args.funding_graph_context is not None,
+        "buyer_quality_context": coverage.get("buyer_quality_context"),
+        "funding_graph_context": coverage.get("funding_graph_context"),
         "baseline_built": False,
         "gatekeeper_compare_built": False,
         "gatekeeper_tuning_started": False,
@@ -257,6 +265,8 @@ def build_phase3(args: argparse.Namespace) -> dict[str, Any]:
             "feature_snapshots_v1": file_provenance(feature_snapshots),
             "r2_market_paths_v1": file_provenance(r2_market_paths),
             "gatekeeper_feature_context_v1": file_provenance(args.gatekeeper_feature_context),
+            "buyer_quality_context_v1": file_provenance(args.buyer_quality_context),
+            "funding_graph_context_v1": file_provenance(args.funding_graph_context),
         },
         "outputs": {
             "selector_training_view_v1": file_provenance(training_output),
@@ -267,6 +277,10 @@ def build_phase3(args: argparse.Namespace) -> dict[str, Any]:
         "leakage_audit": leakage_audit,
         "selector_training_view_built": True,
         "gatekeeper_feature_context_enabled": args.gatekeeper_feature_context is not None,
+        "buyer_quality_context_enabled": args.buyer_quality_context is not None,
+        "funding_graph_context_enabled": args.funding_graph_context is not None,
+        "buyer_quality_context": coverage.get("buyer_quality_context"),
+        "funding_graph_context": coverage.get("funding_graph_context"),
         "baseline_built": False,
         "gatekeeper_compare_built": False,
         "gatekeeper_tuning_started": False,
@@ -285,6 +299,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--feature-snapshots", type=Path)
     parser.add_argument("--r2-market-paths", type=Path)
     parser.add_argument("--gatekeeper-feature-context", type=Path)
+    parser.add_argument("--buyer-quality-context", type=Path)
+    parser.add_argument("--funding-graph-context", type=Path)
     parser.add_argument("--target-net-pct", type=float, default=40.0)
     parser.add_argument("--stop-net-pct", type=float, default=40.0)
     parser.add_argument("--horizon-ms", type=int, default=60_000)
