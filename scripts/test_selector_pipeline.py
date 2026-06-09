@@ -38,6 +38,7 @@ import audit_selector_shadow_score_topk_drift as shadow_score_topk_drift
 import analyze_selector_candidate_crossrun_stability as crossrun_stability
 import build_selector_model_redesign_report as model_redesign
 import build_selector_evidence_gated_candidate_redesign as evidence_gated_redesign
+import analyze_selector_label_segment_diagnostics as label_segment_diagnostics
 try:
     import build_selector_coverage_breakthrough_projection as coverage_breakthrough
 except ModuleNotFoundError:
@@ -1566,6 +1567,120 @@ class SelectorPipelineTests(unittest.TestCase):
             20,
         )
 
+    def write_label_segment_fixture(
+        self,
+        root: Path,
+        train_scope: str,
+        validation_scope: str,
+        *,
+        high_market_cap_edge: bool = True,
+        early_label_edge: bool = False,
+    ) -> Path:
+        rust_source = root / "ghost-brain" / "src" / "oracle" / "decision_logger.rs"
+        rust_source.parent.mkdir(parents=True)
+        rust_source.write_text(
+            "\n".join(
+                [
+                    "const SELECTOR_SHADOW_TOP10_EQUIV_THRESHOLD: f64 = 0.90;",
+                    "const SELECTOR_SHADOW_TOP25_EQUIV_THRESHOLD: f64 = 0.75;",
+                    "const SELECTOR_SHADOW_Q99_THRESHOLD: f64 = 0.99;",
+                    "const SELECTOR_SHADOW_Q98_THRESHOLD: f64 = 0.98;",
+                    "const SELECTOR_SHADOW_Q975_THRESHOLD: f64 = 0.975;",
+                    "const SELECTOR_SHADOW_TARGET_PRECISION_0_70_THRESHOLD: f64 = 0.70;",
+                    "const SELECTOR_SHADOW_FEATURE_SPECS: &[SelectorShadowFeatureSpec] = &[",
+                    '    SelectorShadowFeatureSpec { name: "net_quote_in_15s", min: 0.0, max: 1.0, direction: 1.0, source: SelectorShadowRuntimeFeatureSource::Mapped, },',
+                    '    SelectorShadowFeatureSpec { name: "net_quote_in_30s", min: 0.0, max: 1.0, direction: 1.0, source: SelectorShadowRuntimeFeatureSource::Mapped, },',
+                    '    SelectorShadowFeatureSpec { name: "unique_buyers", min: 0.0, max: 10.0, direction: 1.0, source: SelectorShadowRuntimeFeatureSource::Mapped, },',
+                    '    SelectorShadowFeatureSpec { name: "gk_bonding_progress_pct", min: 0.0, max: 100.0, direction: 1.0, source: SelectorShadowRuntimeFeatureSource::Mapped, },',
+                    '    SelectorShadowFeatureSpec { name: "gk_current_market_cap_sol", min: 0.0, max: 200.0, direction: 1.0, source: SelectorShadowRuntimeFeatureSource::Mapped, },',
+                    '    SelectorShadowFeatureSpec { name: "gk_price_change_ratio", min: -1.0, max: 2.0, direction: 1.0, source: SelectorShadowRuntimeFeatureSource::Mapped, },',
+                    "];",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        def write_scope(scope: str) -> None:
+            rows = []
+            paths = []
+            for idx in range(80):
+                high_market = idx < 40
+                if high_market_cap_edge:
+                    positive = (high_market and idx < 30) or idx >= 70
+                elif early_label_edge:
+                    positive = idx % 4 == 0
+                else:
+                    positive = idx % 2 == 0
+                score = 0.95 - (idx % 40) * 0.015 if high_market else 0.45 - (idx % 40) * 0.004
+                if early_label_edge:
+                    score = 0.95 - idx * 0.004
+                candidate_id = f"{scope}-c{idx}"
+                row = {
+                    "candidate_id": candidate_id,
+                    "base_mint": f"mint{idx}",
+                    "pool_id": f"pool{idx}",
+                    "birth_ts_ms": 1_000_000 + idx,
+                    "decision_ts_ms": 2_000_000 + idx,
+                    "cohort_in_scope": True,
+                    "stream_completeness_ok": True,
+                    "feature_snapshot_status": "ok",
+                    "r2_status": "resolved",
+                    "r2_path_coverage_ok": True,
+                    "r2_horizon_matured": True,
+                    "execution_feasibility_status": "executable",
+                    "gk_context_status": "ok",
+                    "gk_cutoff_status": "ok",
+                    "r2_label": "positive" if positive else "negative",
+                    "net_quote_in_15s": score,
+                    "net_quote_in_30s": score,
+                    "unique_buyers": 6 if high_market else 3,
+                    "trade_rate": score,
+                    "sell_share": 0.05 if high_market else 0.45,
+                    "gk_bonding_progress_pct": 80.0 if high_market else 30.0,
+                    "gk_current_market_cap_sol": 150.0 if high_market else 20.0,
+                    "gk_price_change_ratio": 1.0 if high_market else 0.1,
+                    "gk_hhi": 0.30,
+                    "gk_top3_volume_pct": 0.40,
+                    "gk_dev_tx_ratio": 0.0,
+                    "gk_dev_volume_ratio": 0.0,
+                    "gk_dev_has_sold": False,
+                    "evidence_sufficiency_status": "sufficient",
+                    "score_eligibility_status": "eligible",
+                    "score_eligibility_reasons": [],
+                    "evidence_tx_count": 10 if high_market else 4,
+                    "evidence_buy_count": 6 if high_market else 2,
+                    "evidence_unique_buyers": 6 if high_market else 2,
+                    "evidence_unique_signers": 6 if high_market else 2,
+                    "evidence_total_volume_sol": 4.0 if high_market else 0.5,
+                    "evidence_sell_share": 0.05 if high_market else 0.45,
+                }
+                rows.append(row)
+                if early_label_edge:
+                    samples = [{"offset_ms": 30_000, "return_pct": 25.0 if idx < 30 else -25.0}]
+                else:
+                    samples = [{"offset_ms": 60_000, "return_pct": 45.0 if positive else -45.0}]
+                paths.append(
+                    {
+                        "candidate_id": candidate_id,
+                        "path_source": "DIAG_ACCOUNT_UPDATE_RELAY",
+                        "path_coverage_ok": True,
+                        "horizon_matured": True,
+                        "samples": samples,
+                    }
+                )
+            write_jsonl(root / "datasets" / "selector" / scope / "selector_training_view_v1.jsonl", rows)
+            write_jsonl(root / "datasets" / "selector" / scope / "r2_market_paths_v1.jsonl", paths)
+            manifest = root / "reports" / "selector" / scope / "phase3_r2only_manifest_v1.json"
+            manifest.parent.mkdir(parents=True, exist_ok=True)
+            manifest.write_text(
+                json.dumps({"leakage_audit_status": "PASS", "fail_reasons": []}) + "\n",
+                encoding="utf-8",
+            )
+
+        write_scope(train_scope)
+        write_scope(validation_scope)
+        return rust_source
+
     def test_evidence_gated_candidate_redesign_finds_stable_synthetic_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1686,6 +1801,186 @@ class SelectorPipelineTests(unittest.TestCase):
             strict["validation"]["hard_reject_reason_counts"]["evidence_tx_count_below_3"],
             20,
         )
+
+    def test_label_segment_diagnostics_builds_segment_lift_matrix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            train_scope = "selector-p4d-train"
+            validation_scope = "selector-p4d-validation"
+            rust_source = self.write_label_segment_fixture(root, train_scope, validation_scope)
+            report = label_segment_diagnostics.build_report(
+                label_segment_diagnostics.build_parser().parse_args(
+                    [
+                        "--root",
+                        str(root),
+                        "--train-scope",
+                        train_scope,
+                        "--validation-scope",
+                        validation_scope,
+                        "--rust-source",
+                        str(rust_source.relative_to(root)),
+                        "--min-segment-rows",
+                        "10",
+                    ]
+                )
+            )
+
+        self.assertGreater(report["summary"]["segment_rows"], 0)
+        self.assertGreater(report["summary"]["label_variant_rows"], 0)
+        self.assertEqual(report["run_quality"]["validation"]["leakage_audit_status"], "PASS")
+
+    def test_label_segment_diagnostics_detects_segment_edge(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            train_scope = "selector-p4d-edge-train"
+            validation_scope = "selector-p4d-edge-validation"
+            rust_source = self.write_label_segment_fixture(root, train_scope, validation_scope)
+            report = label_segment_diagnostics.build_report(
+                label_segment_diagnostics.build_parser().parse_args(
+                    [
+                        "--root",
+                        str(root),
+                        "--train-scope",
+                        train_scope,
+                        "--validation-scope",
+                        validation_scope,
+                        "--rust-source",
+                        str(rust_source.relative_to(root)),
+                        "--min-segment-rows",
+                        "10",
+                    ]
+                )
+            )
+
+        self.assertEqual(report["status"], "P4D_SEGMENT_EDGE_FOUND")
+        self.assertTrue(
+            any(
+                edge["segment"] == "market_cap" and edge["segment_value"] == "high"
+                for edge in report["stable_segment_edges"]
+            )
+        )
+        self.assertFalse(report["claim_boundaries"]["changes_runtime"])
+        self.assertFalse(report["claim_boundaries"]["changes_gatekeeper"])
+
+    def test_label_segment_diagnostics_detects_label_review_required(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            train_scope = "selector-p4d-label-train"
+            validation_scope = "selector-p4d-label-validation"
+            rust_source = self.write_label_segment_fixture(
+                root,
+                train_scope,
+                validation_scope,
+                high_market_cap_edge=False,
+                early_label_edge=True,
+            )
+            report = label_segment_diagnostics.build_report(
+                label_segment_diagnostics.build_parser().parse_args(
+                    [
+                        "--root",
+                        str(root),
+                        "--train-scope",
+                        train_scope,
+                        "--validation-scope",
+                        validation_scope,
+                        "--rust-source",
+                        str(rust_source.relative_to(root)),
+                        "--min-segment-rows",
+                        "10",
+                    ]
+                )
+            )
+
+        self.assertEqual(report["status"], "P4D_LABEL_REVIEW_REQUIRED")
+        self.assertTrue(report["label_review_required"])
+
+    def test_label_segment_diagnostics_reports_false_positive_clusters(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            train_scope = "selector-p4d-fp-train"
+            validation_scope = "selector-p4d-fp-validation"
+            rust_source = self.write_label_segment_fixture(root, train_scope, validation_scope)
+            report = label_segment_diagnostics.build_report(
+                label_segment_diagnostics.build_parser().parse_args(
+                    [
+                        "--root",
+                        str(root),
+                        "--train-scope",
+                        train_scope,
+                        "--validation-scope",
+                        validation_scope,
+                        "--rust-source",
+                        str(rust_source.relative_to(root)),
+                        "--min-segment-rows",
+                        "10",
+                    ]
+                )
+            )
+            cluster_text = Path(report["outputs"]["selector_failure_case_clusters_v1.csv"]).read_text(
+                encoding="utf-8"
+            )
+
+        self.assertGreater(report["summary"]["failure_cluster_rows"], 0)
+        self.assertIn("other_false_positive", cluster_text)
+        self.assertTrue(report["claim_boundaries"]["offline_only"])
+
+    def test_label_segment_diagnostics_reports_rejected_positive_clusters(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            train_scope = "selector-p4d-rp-train"
+            validation_scope = "selector-p4d-rp-validation"
+            rust_source = self.write_label_segment_fixture(root, train_scope, validation_scope)
+            report = label_segment_diagnostics.build_report(
+                label_segment_diagnostics.build_parser().parse_args(
+                    [
+                        "--root",
+                        str(root),
+                        "--train-scope",
+                        train_scope,
+                        "--validation-scope",
+                        validation_scope,
+                        "--rust-source",
+                        str(rust_source.relative_to(root)),
+                        "--min-segment-rows",
+                        "10",
+                    ]
+                )
+            )
+            cluster_text = Path(report["outputs"]["selector_failure_case_clusters_v1.csv"]).read_text(
+                encoding="utf-8"
+            )
+
+        self.assertIn("positive_", cluster_text)
+
+    def test_label_segment_diagnostics_no_runtime_or_tuning_claims(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            train_scope = "selector-p4d-claims-train"
+            validation_scope = "selector-p4d-claims-validation"
+            rust_source = self.write_label_segment_fixture(root, train_scope, validation_scope)
+            report = label_segment_diagnostics.build_report(
+                label_segment_diagnostics.build_parser().parse_args(
+                    [
+                        "--root",
+                        str(root),
+                        "--train-scope",
+                        train_scope,
+                        "--validation-scope",
+                        validation_scope,
+                        "--rust-source",
+                        str(rust_source.relative_to(root)),
+                        "--min-segment-rows",
+                        "10",
+                    ]
+                )
+            )
+
+        self.assertTrue(report["claim_boundaries"]["offline_only"])
+        self.assertFalse(report["claim_boundaries"]["builds_new_model"])
+        self.assertFalse(report["claim_boundaries"]["changes_runtime"])
+        self.assertFalse(report["claim_boundaries"]["changes_gatekeeper"])
+        self.assertFalse(report["claim_boundaries"]["changes_execution"])
+        self.assertFalse(report["claim_boundaries"]["changes_send_path"])
 
     def test_training_view_r2_no_target_is_negative_only_with_matured_coverage(self) -> None:
         path = {
