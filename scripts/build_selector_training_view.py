@@ -108,6 +108,183 @@ def attach_gatekeeper_context(row: dict[str, Any], context: dict[str, Any] | Non
     row["gatekeeper_feature_context_source"] = context.get("source")
 
 
+def finite_number(row: dict[str, Any], field: str) -> float | None:
+    return common.float_or_none(row.get(field))
+
+
+def first_finite_source(row: dict[str, Any], sources: list[tuple[str, str]]) -> tuple[float | None, str | None]:
+    for field, source in sources:
+        value = finite_number(row, field)
+        if value is not None:
+            return value, source
+    return None, None
+
+
+def materialize_evidence_sufficiency(row: dict[str, Any]) -> None:
+    """Attach decision-time evidence sufficiency fields to a training row.
+
+    The source row is already bounded by the feature cutoff and optional
+    Gatekeeper decision-time context.  This helper only exposes provenance and
+    eligibility semantics; it does not change R2 labels or model denominator.
+    """
+    tx_count, tx_source = first_finite_source(
+        row,
+        [
+            ("tx_event_count", "flow_tx_event_count"),
+            ("gk_total_tx_evaluated", "gk_total_tx_evaluated"),
+            ("gk_unique_tx_evaluated", "gk_unique_tx_evaluated"),
+        ],
+    )
+    buy_count, buy_source = first_finite_source(
+        row,
+        [
+            ("buy_count", "flow_buy_count"),
+            ("gk_buy_count", "gk_buy_count"),
+        ],
+    )
+    unique_buyers, unique_buyers_source = first_finite_source(
+        row,
+        [
+            ("unique_buyers", "flow_unique_buyers"),
+            ("gk_unique_buyers", "gk_unique_buyers"),
+        ],
+    )
+    unique_signers, unique_signers_source = first_finite_source(
+        row,
+        [
+            ("unique_signers", "flow_unique_signers"),
+            ("gk_unique_signers_evaluated", "gk_unique_signers_evaluated"),
+        ],
+    )
+    total_volume, total_volume_source = first_finite_source(
+        row,
+        [
+            ("total_volume_sol", "flow_total_volume_sol"),
+            ("gk_total_volume_sol", "gk_total_volume_sol"),
+        ],
+    )
+    net_quote_15s, net_quote_15s_source = first_finite_source(
+        row,
+        [("net_quote_in_15s", "flow_net_quote_in_15s")],
+    )
+    net_quote_30s, net_quote_30s_source = first_finite_source(
+        row,
+        [("net_quote_in_30s", "flow_net_quote_in_30s")],
+    )
+    sell_share, sell_share_source = first_finite_source(
+        row,
+        [("sell_share", "flow_sell_share")],
+    )
+    evidence_window, evidence_window_source = first_finite_source(
+        row,
+        [
+            ("gk_observation_duration_ms", "gk_observation_duration_ms"),
+            ("observation_window_ms", "training_observation_window_ms"),
+        ],
+    )
+
+    row.update(
+        {
+            "evidence_tx_count": tx_count,
+            "evidence_tx_count_source": tx_source,
+            "evidence_buy_count": buy_count,
+            "evidence_buy_count_source": buy_source,
+            "evidence_unique_buyers": unique_buyers,
+            "evidence_unique_buyers_source": unique_buyers_source,
+            "evidence_unique_signers": unique_signers,
+            "evidence_unique_signers_source": unique_signers_source,
+            "evidence_total_volume_sol": total_volume,
+            "evidence_total_volume_sol_source": total_volume_source,
+            "evidence_net_quote_in_15s": net_quote_15s,
+            "evidence_net_quote_in_15s_source": net_quote_15s_source,
+            "evidence_net_quote_in_30s": net_quote_30s,
+            "evidence_net_quote_in_30s_source": net_quote_30s_source,
+            "evidence_sell_share": sell_share,
+            "evidence_sell_share_source": sell_share_source,
+            "evidence_window_ms": evidence_window,
+            "evidence_window_source": evidence_window_source,
+        }
+    )
+
+    reasons: list[str] = []
+    hard_fail_reasons: list[str] = []
+    partial_reasons: list[str] = []
+    evidence_sources = {
+        source
+        for source in (
+            tx_source,
+            buy_source,
+            unique_buyers_source,
+            unique_signers_source,
+            total_volume_source,
+            net_quote_15s_source,
+            net_quote_30s_source,
+            sell_share_source,
+        )
+        if source
+    }
+    if not evidence_sources:
+        reasons.append("no_evidence_sources_available")
+
+    if tx_count is None:
+        hard_fail_reasons.append("missing_evidence_tx_count")
+    elif tx_count < 3:
+        hard_fail_reasons.append("evidence_tx_count_below_3")
+    if buy_count is None:
+        hard_fail_reasons.append("missing_evidence_buy_count")
+    elif buy_count < 2:
+        hard_fail_reasons.append("evidence_buy_count_below_2")
+    actor_count = unique_buyers if unique_buyers is not None else unique_signers
+    if actor_count is None:
+        hard_fail_reasons.append("missing_evidence_unique_actor_count")
+    elif actor_count < 2:
+        hard_fail_reasons.append("evidence_unique_actor_count_below_2")
+    if unique_buyers is None and unique_signers is not None:
+        partial_reasons.append("unique_actor_count_uses_gk_unique_signers_fallback")
+    if total_volume is None:
+        hard_fail_reasons.append("missing_evidence_total_volume_sol")
+    for field in (
+        "gk_bonding_progress_pct",
+        "gk_current_market_cap_sol",
+        "gk_price_change_ratio",
+    ):
+        if finite_number(row, field) is None:
+            hard_fail_reasons.append(f"missing_core_curve_market:{field}")
+    if tx_source and tx_source.startswith("gk_"):
+        partial_reasons.append("tx_count_uses_gk_fallback")
+
+    reasons.extend(hard_fail_reasons)
+    reasons.extend(reason for reason in partial_reasons if reason not in reasons)
+    if not evidence_sources:
+        sufficiency_status = "unknown"
+    elif hard_fail_reasons:
+        sufficiency_status = "insufficient"
+    elif partial_reasons:
+        sufficiency_status = "partial"
+    else:
+        sufficiency_status = "sufficient"
+
+    if sufficiency_status == "sufficient":
+        eligibility_status = "eligible"
+    elif sufficiency_status == "partial":
+        eligibility_status = "score_degraded_partial_evidence"
+    else:
+        eligibility_status = "score_invalid_insufficient_market_evidence"
+    row["evidence_source_status"] = (
+        "missing_sources"
+        if not evidence_sources
+        else "gk_only"
+        if all(source.startswith("gk_") for source in evidence_sources)
+        else "flow_only"
+        if all(source.startswith("flow_") for source in evidence_sources)
+        else "flow_and_gk"
+    )
+    row["evidence_sufficiency_status"] = sufficiency_status
+    row["evidence_sufficiency_reasons"] = reasons
+    row["score_eligibility_status"] = eligibility_status
+    row["score_eligibility_reasons"] = list(reasons)
+
+
 def feature_snapshot_model_exclusion_reasons(row: dict[str, Any]) -> list[str]:
     reasons: list[str] = []
     if row.get("feature_snapshot_status") != "ok":
@@ -438,6 +615,7 @@ def build_training_view(
             ):
                 row[key] = lifecycle.get(key)
         attach_gatekeeper_context(row, gatekeeper_context_by_candidate.get(candidate_id))
+        materialize_evidence_sufficiency(row)
         row.update(r2)
         row["r2_label_resolved"] = row.get("r2_label") in {"positive", "negative"}
         row["label_resolved"] = row["r2_label_resolved"]

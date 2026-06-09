@@ -156,17 +156,29 @@ def missing_features(row: dict[str, Any], features: list[str]) -> list[str]:
 
 def evidence_values(row: dict[str, Any]) -> dict[str, float | None]:
     return {
-        "tx_count": numeric_any(row, ["tx_count", "total_tx_count", "total_tx_evaluated", "gk_total_tx_count"]),
-        "unique_buyers": numeric_any(row, ["unique_buyers", "gk_unique_buyers", "gk_unique_signers_evaluated"]),
-        "buy_count": numeric_any(row, ["buy_count", "gk_buy_count"]),
-        "total_volume_sol": numeric_any(row, ["total_volume_sol", "gk_total_volume_sol"]),
+        "tx_count": numeric_any(
+            row,
+            ["evidence_tx_count", "tx_count", "total_tx_count", "total_tx_evaluated", "gk_total_tx_evaluated"],
+        ),
+        "unique_buyers": numeric_any(row, ["evidence_unique_buyers", "unique_buyers", "gk_unique_buyers"]),
+        "unique_signers": numeric_any(row, ["evidence_unique_signers", "gk_unique_signers_evaluated"]),
+        "buy_count": numeric_any(row, ["evidence_buy_count", "buy_count", "gk_buy_count"]),
+        "total_volume_sol": numeric_any(row, ["evidence_total_volume_sol", "total_volume_sol", "gk_total_volume_sol"]),
     }
 
 
 def evidence_status(row: dict[str, Any], gate: dict[str, Any]) -> tuple[str, list[str], dict[str, float | None]]:
     values = evidence_values(row)
+    existing_status = common.str_or_none(row.get("score_eligibility_status"))
+    existing_reasons = row.get("score_eligibility_reasons")
+    if existing_status == "score_invalid_insufficient_market_evidence":
+        return (
+            existing_status,
+            list(existing_reasons) if isinstance(existing_reasons, list) else ["score_eligibility_invalid"],
+            values,
+        )
     missing: list[str] = []
-    for field in ("tx_count", "unique_buyers", "buy_count", "total_volume_sol"):
+    for field in ("tx_count", "buy_count", "total_volume_sol"):
         threshold = gate.get(f"min_{field}")
         if threshold is None:
             continue
@@ -175,6 +187,15 @@ def evidence_status(row: dict[str, Any], gate: dict[str, Any]) -> tuple[str, lis
             missing.append(f"{field}_missing")
         elif value < float(threshold):
             missing.append(f"{field}_below_min")
+    unique_threshold = gate.get("min_unique_buyers")
+    if unique_threshold is not None:
+        unique_value = values.get("unique_buyers")
+        signer_value = values.get("unique_signers")
+        actor_value = unique_value if unique_value is not None else signer_value
+        if actor_value is None:
+            missing.append("unique_actor_count_missing")
+        elif actor_value < float(unique_threshold):
+            missing.append("unique_actor_count_below_min")
     core_missing = missing_features(row, CORE_REQUIRED_FEATURES)
     if core_missing:
         missing.extend(f"{feature}_missing" for feature in core_missing)
@@ -244,7 +265,7 @@ def candidate_scores(
             continue
         status, _reasons, _values = evidence_status(row, gate)
         status_counts[status] += 1
-        if status != "score_eligible":
+        if status not in {"score_eligible", "score_degraded_partial_evidence"}:
             continue
         score = score_row(row, subset)
         if score is None:

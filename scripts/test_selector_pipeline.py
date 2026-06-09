@@ -61,6 +61,126 @@ def read_jsonl(path: Path) -> list[dict]:
 
 
 class SelectorPipelineTests(unittest.TestCase):
+    def build_training_view_fixture(
+        self,
+        root: Path,
+        *,
+        candidate_id: str = "c1",
+        feature_row: dict | None = None,
+        gk_context: dict | None = None,
+    ) -> dict:
+        candidates = root / "candidate_universe_v1.jsonl"
+        lifecycle = root / "accepted_lifecycle_v1.jsonl"
+        features = root / "feature_snapshots_v1.jsonl"
+        paths = root / "price_paths.jsonl"
+        gk_context_path = root / "gatekeeper_feature_context_v1.jsonl"
+        output = root / "selector_training_view_v1.jsonl"
+        coverage = root / "coverage.json"
+        audit = root / "audit.json"
+        write_jsonl(
+            candidates,
+            [
+                {
+                    "candidate_id": candidate_id,
+                    "candidate_universe_status": "ok",
+                    "cohort_in_scope": True,
+                    "stream_completeness_ok": True,
+                    "base_mint": f"mint-{candidate_id}",
+                    "pool_id": f"pool-{candidate_id}",
+                    "bonding_curve": f"curve-{candidate_id}",
+                    "quote_mint": "SOL",
+                    "birth_ts_ms": 1_000,
+                    "decision_ts_ms": 10_000,
+                }
+            ],
+        )
+        write_jsonl(lifecycle, [])
+        base_feature = {
+            "candidate_id": candidate_id,
+            "snapshot_kind": "decision",
+            "feature_snapshot_status": "ok",
+            "feature_cutoff_ts_ms": 10_000,
+            "feature_cutoff_slot": 42,
+            "feature_source": "unit_test_feature_snapshot",
+            "feature_source_max_ts_ms": 9_900,
+            "feature_observed_lag_ms": 100,
+            "feature_time_provenance_ok": True,
+            "tx_event_count": 5,
+            "unique_buyers": 3,
+            "net_quote_in_15s": 2.0,
+            "net_quote_in_30s": 2.5,
+            "sell_share": 0.2,
+            "trade_rate": 0.5,
+            "buyer_hhi": 0.4,
+            "top1_wallet_share": 0.5,
+        }
+        if feature_row:
+            base_feature.update(feature_row)
+        write_jsonl(features, [base_feature])
+        base_gk_context = {
+            "candidate_id": candidate_id,
+            "gk_context_status": "ok",
+            "gk_cutoff_status": "ok",
+            "gk_observation_duration_ms": 10_000,
+            "gk_total_tx_evaluated": 7,
+            "gk_buy_count": 4,
+            "gk_unique_signers_evaluated": 4,
+            "gk_total_volume_sol": 3.5,
+            "gk_bonding_progress_pct": 45.0,
+            "gk_current_market_cap_sol": 100.0,
+            "gk_price_change_ratio": 1.5,
+            "join_method": "unit_test_candidate_id",
+            "source": "unit_test_gk_context",
+        }
+        if gk_context:
+            base_gk_context.update(gk_context)
+        write_jsonl(gk_context_path, [base_gk_context])
+        write_jsonl(
+            paths,
+            [
+                {
+                    "candidate_id": candidate_id,
+                    "base_mint": f"mint-{candidate_id}",
+                    "pool_id": f"pool-{candidate_id}",
+                    "bonding_curve": f"curve-{candidate_id}",
+                    "path_source": "yellowstone_account_update",
+                    "path_status": "ok",
+                    "path_coverage_ok": True,
+                    "horizon_matured": True,
+                    "samples": [{"offset_ms": 60_000, "return_pct": 45.0}],
+                }
+            ],
+        )
+        training.run(
+            training.build_parser().parse_args(
+                [
+                    "--candidate-universe",
+                    str(candidates),
+                    "--accepted-lifecycle",
+                    str(lifecycle),
+                    "--feature-snapshots",
+                    str(features),
+                    "--price-paths",
+                    str(paths),
+                    "--output",
+                    str(output),
+                    "--label-coverage-output",
+                    str(coverage),
+                    "--leakage-audit-output",
+                    str(audit),
+                    "--gatekeeper-feature-context",
+                    str(gk_context_path),
+                    "--target-net-pct",
+                    "40",
+                    "--stop-net-pct",
+                    "40",
+                    "--horizon-ms",
+                    "60000",
+                ]
+            )
+        )
+        return read_jsonl(output)[0]
+
     def write_gatekeeper_surface_guard_rows(
         self,
         root: Path,
@@ -1284,6 +1404,166 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertEqual(row["r2_status"], "horizon_unmatured")
         self.assertFalse(row["label_resolved"])
         self.assertEqual(audit_payload["status"], "PASS")
+
+    def test_training_view_materializes_evidence_sufficiency_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            row = self.build_training_view_fixture(Path(tmp))
+
+        self.assertEqual(row["evidence_tx_count"], 5.0)
+        self.assertEqual(row["evidence_tx_count_source"], "flow_tx_event_count")
+        self.assertEqual(row["evidence_buy_count"], 4.0)
+        self.assertEqual(row["evidence_buy_count_source"], "gk_buy_count")
+        self.assertEqual(row["evidence_unique_buyers"], 3.0)
+        self.assertEqual(row["evidence_unique_buyers_source"], "flow_unique_buyers")
+        self.assertEqual(row["evidence_total_volume_sol"], 3.5)
+        self.assertEqual(row["evidence_sufficiency_status"], "sufficient")
+        self.assertEqual(row["score_eligibility_status"], "eligible")
+        self.assertTrue(row["r2_only_training_denominator"])
+
+    def test_evidence_sufficiency_falls_back_to_gk_unique_signers_with_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            row = self.build_training_view_fixture(
+                Path(tmp),
+                feature_row={"unique_buyers": None},
+                gk_context={"gk_unique_signers_evaluated": 3},
+            )
+
+        self.assertIsNone(row["evidence_unique_buyers"])
+        self.assertEqual(row["evidence_unique_signers"], 3.0)
+        self.assertEqual(row["evidence_unique_signers_source"], "gk_unique_signers_evaluated")
+        self.assertEqual(row["evidence_sufficiency_status"], "partial")
+        self.assertEqual(row["score_eligibility_status"], "score_degraded_partial_evidence")
+        self.assertIn(
+            "unique_actor_count_uses_gk_unique_signers_fallback",
+            row["evidence_sufficiency_reasons"],
+        )
+
+    def test_evidence_sufficiency_marks_one_tx_dev_buy_as_insufficient(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            row = self.build_training_view_fixture(
+                Path(tmp),
+                feature_row={"tx_event_count": 1, "unique_buyers": 1},
+                gk_context={"gk_buy_count": 1, "gk_unique_signers_evaluated": 1},
+            )
+
+        self.assertEqual(row["evidence_sufficiency_status"], "insufficient")
+        self.assertEqual(
+            row["score_eligibility_status"],
+            "score_invalid_insufficient_market_evidence",
+        )
+        self.assertIn("evidence_tx_count_below_3", row["score_eligibility_reasons"])
+        self.assertIn("evidence_buy_count_below_2", row["score_eligibility_reasons"])
+        self.assertIn("evidence_unique_actor_count_below_2", row["score_eligibility_reasons"])
+        self.assertTrue(row["r2_only_training_denominator"])
+
+    def test_evidence_sufficiency_does_not_treat_missing_as_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            row = self.build_training_view_fixture(
+                Path(tmp),
+                feature_row={"tx_event_count": None, "unique_buyers": None},
+                gk_context={
+                    "gk_total_tx_evaluated": None,
+                    "gk_buy_count": None,
+                    "gk_unique_signers_evaluated": None,
+                    "gk_total_volume_sol": None,
+                },
+            )
+
+        self.assertIsNone(row["evidence_tx_count"])
+        self.assertIsNone(row["evidence_buy_count"])
+        self.assertEqual(row["evidence_sufficiency_status"], "insufficient")
+        self.assertIn("missing_evidence_tx_count", row["evidence_sufficiency_reasons"])
+        self.assertIn("missing_evidence_buy_count", row["evidence_sufficiency_reasons"])
+        self.assertNotIn("evidence_tx_count_below_3", row["evidence_sufficiency_reasons"])
+
+    def test_model_redesign_uses_evidence_sufficiency_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "selector-evidence-sufficiency"
+            rust_source = root / "ghost-brain" / "src" / "oracle" / "decision_logger.rs"
+            rust_source.parent.mkdir(parents=True)
+            rust_source.write_text(
+                "\n".join(
+                    [
+                        "const SELECTOR_SHADOW_TOP10_EQUIV_THRESHOLD: f64 = 0.90;",
+                        "const SELECTOR_SHADOW_TOP25_EQUIV_THRESHOLD: f64 = 0.75;",
+                        "const SELECTOR_SHADOW_Q99_THRESHOLD: f64 = 0.99;",
+                        "const SELECTOR_SHADOW_Q98_THRESHOLD: f64 = 0.98;",
+                        "const SELECTOR_SHADOW_Q975_THRESHOLD: f64 = 0.975;",
+                        "const SELECTOR_SHADOW_TARGET_PRECISION_0_70_THRESHOLD: f64 = 0.70;",
+                        "const SELECTOR_SHADOW_FEATURE_SPECS: &[SelectorShadowFeatureSpec] = &[",
+                        '    SelectorShadowFeatureSpec { name: "net_quote_in_15s", min: 0.0, max: 1.0, direction: 1.0, source: SelectorShadowRuntimeFeatureSource::Mapped, },',
+                        '    SelectorShadowFeatureSpec { name: "gk_bonding_progress_pct", min: 0.0, max: 1.0, direction: 1.0, source: SelectorShadowRuntimeFeatureSource::Mapped, },',
+                        '    SelectorShadowFeatureSpec { name: "gk_current_market_cap_sol", min: 0.0, max: 1.0, direction: 1.0, source: SelectorShadowRuntimeFeatureSource::Mapped, },',
+                        '    SelectorShadowFeatureSpec { name: "gk_price_change_ratio", min: 0.0, max: 1.0, direction: 1.0, source: SelectorShadowRuntimeFeatureSource::Mapped, },',
+                        "];",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            rows = []
+            for idx in range(60):
+                score = 1.0 - idx * 0.01
+                invalid = idx < 20
+                rows.append(
+                    {
+                        "candidate_id": f"c{idx}",
+                        "base_mint": f"mint{idx}",
+                        "pool_id": f"pool{idx}",
+                        "birth_ts_ms": idx,
+                        "decision_ts_ms": 1_000 + idx,
+                        "cohort_in_scope": True,
+                        "stream_completeness_ok": True,
+                        "feature_snapshot_status": "ok",
+                        "r2_status": "resolved",
+                        "r2_path_coverage_ok": True,
+                        "r2_horizon_matured": True,
+                        "execution_feasibility_status": "executable",
+                        "gk_context_status": "ok",
+                        "gk_cutoff_status": "ok",
+                        "r2_label": "negative" if invalid else "positive",
+                        "net_quote_in_15s": score,
+                        "gk_bonding_progress_pct": score,
+                        "gk_current_market_cap_sol": score,
+                        "gk_price_change_ratio": score,
+                        "evidence_tx_count": 1 if invalid else 5,
+                        "evidence_buy_count": 1 if invalid else 3,
+                        "evidence_unique_buyers": 1 if invalid else 3,
+                        "evidence_total_volume_sol": 0.1 if invalid else 2.0,
+                        "score_eligibility_status": (
+                            "score_invalid_insufficient_market_evidence"
+                            if invalid
+                            else "eligible"
+                        ),
+                        "score_eligibility_reasons": (
+                            ["evidence_tx_count_below_3"] if invalid else []
+                        ),
+                    }
+                )
+            write_jsonl(root / "datasets" / "selector" / scope / "selector_training_view_v1.jsonl", rows)
+            report = model_redesign.build_report(
+                model_redesign.build_parser().parse_args(
+                    [
+                        "--root",
+                        str(root),
+                        "--train-scope",
+                        scope,
+                        "--validation-scope",
+                        scope,
+                        "--rust-source",
+                        str(rust_source.relative_to(root)),
+                    ]
+                )
+            )
+
+        candidate = report["candidate_grid"]["eligibility_tx3_buy2_buyer2_plus_combined"]
+        self.assertEqual(candidate["validation"]["eligible_rows"], 40)
+        self.assertEqual(
+            candidate["validation"]["eligibility_status_counts"][
+                "score_invalid_insufficient_market_evidence"
+            ],
+            20,
+        )
 
     def test_training_view_r2_no_target_is_negative_only_with_matured_coverage(self) -> None:
         path = {
