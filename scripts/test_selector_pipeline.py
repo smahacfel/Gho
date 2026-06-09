@@ -36,6 +36,7 @@ import audit_selector_shadow_score_sidecar as shadow_score_sidecar_audit
 import audit_selector_shadow_score_parity as shadow_score_parity_audit
 import audit_selector_shadow_score_topk_drift as shadow_score_topk_drift
 import analyze_selector_candidate_crossrun_stability as crossrun_stability
+import build_selector_model_redesign_report as model_redesign
 try:
     import build_selector_coverage_breakthrough_projection as coverage_breakthrough
 except ModuleNotFoundError:
@@ -4007,6 +4008,108 @@ class SelectorPipelineTests(unittest.TestCase):
         )
         self.assertTrue(report["claim_boundaries"]["offline_only"])
         self.assertFalse(report["claim_boundaries"]["changed_gatekeeper"])
+
+    def test_model_redesign_reports_evidence_gate_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            train_scope = "selector-r19-like"
+            validation_scope = "selector-r21-like"
+            rust_source = root / "ghost-brain" / "src" / "oracle" / "decision_logger.rs"
+            rust_source.parent.mkdir(parents=True)
+            rust_source.write_text(
+                "\n".join(
+                    [
+                        "const SELECTOR_SHADOW_TOP10_EQUIV_THRESHOLD: f64 = 0.90;",
+                        "const SELECTOR_SHADOW_TOP25_EQUIV_THRESHOLD: f64 = 0.75;",
+                        "const SELECTOR_SHADOW_Q99_THRESHOLD: f64 = 0.99;",
+                        "const SELECTOR_SHADOW_Q98_THRESHOLD: f64 = 0.98;",
+                        "const SELECTOR_SHADOW_Q975_THRESHOLD: f64 = 0.975;",
+                        "const SELECTOR_SHADOW_TARGET_PRECISION_0_70_THRESHOLD: f64 = 0.70;",
+                        "const SELECTOR_SHADOW_FEATURE_SPECS: &[SelectorShadowFeatureSpec] = &[",
+                        '    SelectorShadowFeatureSpec { name: "net_quote_in_15s", min: 0.0, max: 1.0, direction: 1.0, source: SelectorShadowRuntimeFeatureSource::Mapped, },',
+                        '    SelectorShadowFeatureSpec { name: "unique_buyers", min: 0.0, max: 10.0, direction: 1.0, source: SelectorShadowRuntimeFeatureSource::Mapped, },',
+                        '    SelectorShadowFeatureSpec { name: "gk_bonding_progress_pct", min: 0.0, max: 1.0, direction: 1.0, source: SelectorShadowRuntimeFeatureSource::Mapped, },',
+                        '    SelectorShadowFeatureSpec { name: "gk_current_market_cap_sol", min: 0.0, max: 1.0, direction: 1.0, source: SelectorShadowRuntimeFeatureSource::Mapped, },',
+                        '    SelectorShadowFeatureSpec { name: "gk_price_change_ratio", min: 0.0, max: 1.0, direction: 1.0, source: SelectorShadowRuntimeFeatureSource::Mapped, },',
+                        "];",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            def write_scope(scope: str) -> None:
+                rows = []
+                for idx in range(100):
+                    high_noise = idx < 50
+                    score = 1.0 - idx * 0.006
+                    rows.append(
+                        {
+                            "candidate_id": f"{scope}-c{idx}",
+                            "base_mint": f"mint{idx}",
+                            "pool_id": f"pool{idx}",
+                            "birth_ts_ms": idx,
+                            "decision_ts_ms": 1_000 + idx,
+                            "r2_only_training_denominator": True,
+                            "cohort_in_scope": True,
+                            "stream_completeness_ok": True,
+                            "feature_snapshot_status": "ok",
+                            "r2_status": "resolved",
+                            "r2_path_coverage_ok": True,
+                            "r2_horizon_matured": True,
+                            "execution_feasibility_status": "executable",
+                            "gk_context_status": "ok",
+                            "gk_cutoff_status": "ok",
+                            "r2_label": "negative" if high_noise else "positive",
+                            "net_quote_in_15s": score,
+                            "net_quote_in_30s": score,
+                            "trade_rate": score,
+                            "sell_share": 0.05,
+                            "top1_wallet_share": 0.10,
+                            "buyer_hhi": 0.10,
+                            "gk_bonding_progress_pct": score,
+                            "gk_current_market_cap_sol": score,
+                            "gk_price_change_ratio": score,
+                            "tx_count": 1 if high_noise else 8,
+                            "buy_count": 1 if high_noise else 5,
+                            "unique_buyers": 1 if high_noise else 5,
+                            "gk_buy_count": 1 if high_noise else 5,
+                            "gk_unique_signers_evaluated": 1 if high_noise else 5,
+                        }
+                    )
+                write_jsonl(
+                    root / "datasets" / "selector" / scope / "selector_training_view_v1.jsonl",
+                    rows,
+                )
+
+            write_scope(train_scope)
+            write_scope(validation_scope)
+            report = model_redesign.build_report(
+                model_redesign.build_parser().parse_args(
+                    [
+                        "--root",
+                        str(root),
+                        "--train-scope",
+                        train_scope,
+                        "--validation-scope",
+                        validation_scope,
+                        "--rust-source",
+                        str(rust_source.relative_to(root)),
+                    ]
+                )
+            )
+
+        self.assertEqual(report["status"], "P4A_NEW_CANDIDATE_FOUND_NEEDS_FRESH_VALIDATION")
+        self.assertEqual(report["current_candidate_status"], "REJECTED_FOR_FORWARD_SHADOW")
+        self.assertTrue(report["claim_boundaries"]["offline_only"])
+        self.assertFalse(report["claim_boundaries"]["changed_runtime_score"])
+        self.assertIn(
+            "eligibility_tx3_buy2_buyer2_plus_combined",
+            report["summary"]["stable_candidate_ids"],
+        )
+        self.assertGreater(
+            report["summary"]["validation_current_top50_insufficient_evidence_failed_rows"],
+            0,
+        )
 
     def test_shadow_score_sidecar_audit_validates_terminal_decision_coverage(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
