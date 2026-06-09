@@ -37,6 +37,7 @@ import audit_selector_shadow_score_parity as shadow_score_parity_audit
 import audit_selector_shadow_score_topk_drift as shadow_score_topk_drift
 import analyze_selector_candidate_crossrun_stability as crossrun_stability
 import build_selector_model_redesign_report as model_redesign
+import build_selector_evidence_gated_candidate_redesign as evidence_gated_redesign
 try:
     import build_selector_coverage_breakthrough_projection as coverage_breakthrough
 except ModuleNotFoundError:
@@ -1562,6 +1563,127 @@ class SelectorPipelineTests(unittest.TestCase):
             candidate["validation"]["eligibility_status_counts"][
                 "score_invalid_insufficient_market_evidence"
             ],
+            20,
+        )
+
+    def test_evidence_gated_candidate_redesign_finds_stable_synthetic_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            train_scope = "selector-p4c-train"
+            validation_scope = "selector-p4c-validation"
+            rust_source = root / "ghost-brain" / "src" / "oracle" / "decision_logger.rs"
+            rust_source.parent.mkdir(parents=True)
+            rust_source.write_text(
+                "\n".join(
+                    [
+                        "const SELECTOR_SHADOW_TOP10_EQUIV_THRESHOLD: f64 = 0.90;",
+                        "const SELECTOR_SHADOW_TOP25_EQUIV_THRESHOLD: f64 = 0.75;",
+                        "const SELECTOR_SHADOW_Q99_THRESHOLD: f64 = 0.99;",
+                        "const SELECTOR_SHADOW_Q98_THRESHOLD: f64 = 0.98;",
+                        "const SELECTOR_SHADOW_Q975_THRESHOLD: f64 = 0.975;",
+                        "const SELECTOR_SHADOW_TARGET_PRECISION_0_70_THRESHOLD: f64 = 0.70;",
+                        "const SELECTOR_SHADOW_FEATURE_SPECS: &[SelectorShadowFeatureSpec] = &[",
+                        '    SelectorShadowFeatureSpec { name: "net_quote_in_15s", min: 0.0, max: 1.0, direction: 1.0, source: SelectorShadowRuntimeFeatureSource::Mapped, },',
+                        '    SelectorShadowFeatureSpec { name: "net_quote_in_30s", min: 0.0, max: 1.0, direction: 1.0, source: SelectorShadowRuntimeFeatureSource::Mapped, },',
+                        '    SelectorShadowFeatureSpec { name: "unique_buyers", min: 0.0, max: 10.0, direction: 1.0, source: SelectorShadowRuntimeFeatureSource::Mapped, },',
+                        '    SelectorShadowFeatureSpec { name: "gk_bonding_progress_pct", min: 0.0, max: 1.0, direction: 1.0, source: SelectorShadowRuntimeFeatureSource::Mapped, },',
+                        '    SelectorShadowFeatureSpec { name: "gk_current_market_cap_sol", min: 0.0, max: 1.0, direction: 1.0, source: SelectorShadowRuntimeFeatureSource::Mapped, },',
+                        '    SelectorShadowFeatureSpec { name: "gk_price_change_ratio", min: 0.0, max: 1.0, direction: 1.0, source: SelectorShadowRuntimeFeatureSource::Mapped, },',
+                        "];",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            def write_scope(scope: str) -> None:
+                rows = []
+                for idx in range(100):
+                    invalid_noise = idx < 20
+                    positive_band = 20 <= idx < 60
+                    score = 1.0 - idx * 0.006
+                    rows.append(
+                        {
+                            "candidate_id": f"{scope}-c{idx}",
+                            "base_mint": f"mint{idx}",
+                            "pool_id": f"pool{idx}",
+                            "birth_ts_ms": idx,
+                            "decision_ts_ms": 1_000 + idx,
+                            "cohort_in_scope": True,
+                            "stream_completeness_ok": True,
+                            "feature_snapshot_status": "ok",
+                            "r2_status": "resolved",
+                            "r2_path_coverage_ok": True,
+                            "r2_horizon_matured": True,
+                            "execution_feasibility_status": "executable",
+                            "gk_context_status": "ok",
+                            "gk_cutoff_status": "ok",
+                            "r2_label": "positive" if positive_band else "negative",
+                            "net_quote_in_15s": score,
+                            "net_quote_in_30s": score,
+                            "unique_buyers": 1 if invalid_noise else 5,
+                            "trade_rate": score,
+                            "sell_share": 0.10,
+                            "gk_bonding_progress_pct": score,
+                            "gk_current_market_cap_sol": score,
+                            "gk_price_change_ratio": score,
+                            "gk_hhi": 0.30,
+                            "gk_top3_volume_pct": 0.40,
+                            "gk_dev_tx_ratio": 0.0,
+                            "gk_dev_volume_ratio": 0.0,
+                            "gk_dev_has_sold": False,
+                            "evidence_sufficiency_status": "insufficient" if invalid_noise else "sufficient",
+                            "score_eligibility_status": (
+                                "score_invalid_insufficient_market_evidence"
+                                if invalid_noise
+                                else "eligible"
+                            ),
+                            "score_eligibility_reasons": (
+                                ["evidence_tx_count_below_3"] if invalid_noise else []
+                            ),
+                            "evidence_tx_count": 1 if invalid_noise else 8,
+                            "evidence_buy_count": 1 if invalid_noise else 5,
+                            "evidence_unique_buyers": 1 if invalid_noise else 5,
+                            "evidence_total_volume_sol": 0.05 if invalid_noise else 2.0,
+                            "evidence_sell_share": 0.10,
+                        }
+                    )
+                write_jsonl(
+                    root / "datasets" / "selector" / scope / "selector_training_view_v1.jsonl",
+                    rows,
+                )
+                manifest = root / "reports" / "selector" / scope / "phase3_r2only_manifest_v1.json"
+                manifest.parent.mkdir(parents=True, exist_ok=True)
+                manifest.write_text(
+                    json.dumps({"leakage_audit_status": "PASS", "fail_reasons": []}) + "\n",
+                    encoding="utf-8",
+                )
+
+            write_scope(train_scope)
+            write_scope(validation_scope)
+            report = evidence_gated_redesign.build_report(
+                evidence_gated_redesign.build_parser().parse_args(
+                    [
+                        "--root",
+                        str(root),
+                        "--train-scope",
+                        train_scope,
+                        "--validation-scope",
+                        validation_scope,
+                        "--rust-source",
+                        str(rust_source.relative_to(root)),
+                    ]
+                )
+            )
+
+        self.assertEqual(report["candidate_count"], 3)
+        self.assertEqual(report["status"], "P4C_STABLE_CANDIDATE_FOUND")
+        self.assertIn("strict_precision_candidate", report["stable_candidate_ids"])
+        self.assertTrue(report["claim_boundaries"]["offline_only"])
+        self.assertFalse(report["claim_boundaries"]["changed_gatekeeper"])
+        strict = report["candidates"]["strict_precision_candidate"]
+        self.assertGreaterEqual(strict["validation"]["topk"]["top25"]["lift_vs_base_rate_pp"], 0.10)
+        self.assertEqual(
+            strict["validation"]["hard_reject_reason_counts"]["evidence_tx_count_below_3"],
             20,
         )
 
