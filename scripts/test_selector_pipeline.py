@@ -40,6 +40,7 @@ import build_selector_model_redesign_report as model_redesign
 import build_selector_evidence_gated_candidate_redesign as evidence_gated_redesign
 import analyze_selector_label_segment_diagnostics as label_segment_diagnostics
 import build_selector_segment_specific_candidate as segment_specific_candidate
+import build_selector_new_signal_family_design as new_signal_family_design
 try:
     import build_selector_coverage_breakthrough_projection as coverage_breakthrough
 except ModuleNotFoundError:
@@ -2217,6 +2218,227 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertFalse(report["claim_boundaries"]["changes_gatekeeper"])
         self.assertFalse(report["claim_boundaries"]["changes_execution"])
         self.assertFalse(report["claim_boundaries"]["changes_send_path"])
+
+    def write_new_signal_family_fixture(
+        self,
+        root: Path,
+        train_scope: str,
+        validation_scope: str,
+        *,
+        funding_available: bool = False,
+    ) -> tuple[str, str]:
+        def write_scope(scope: str, *, validation: bool) -> None:
+            rows = []
+            for idx in range(80):
+                positive = idx < (36 if validation else 40)
+                rows.append(
+                    {
+                        "candidate_id": f"{scope}-c{idx}",
+                        "base_mint": f"mint{idx}",
+                        "pool_id": f"pool{idx}",
+                        "birth_ts_ms": 1_000_000 + idx,
+                        "decision_ts_ms": 2_000_000 + idx,
+                        "cohort_in_scope": True,
+                        "stream_completeness_ok": True,
+                        "feature_snapshot_status": "ok",
+                        "r2_status": "resolved",
+                        "r2_path_coverage_ok": True,
+                        "r2_horizon_matured": True,
+                        "execution_feasibility_status": "executable",
+                        "gk_context_status": "ok",
+                        "gk_cutoff_status": "ok",
+                        "r2_label": "positive" if positive else "negative",
+                        "gk_signer_cross_pool_velocity": 0.05 if positive else 0.95,
+                        "gk_fsc_unknown_buyer_rate": 0.05 if positive else 0.90,
+                        "gk_fsc_known_source_rate": 0.80 if positive else 0.10,
+                        "gk_sell_buy_ratio": 0.10 if positive else 1.20,
+                        "sell_share": 0.05 if positive else 0.70,
+                        "gk_dev_buyer_infrastructure_affinity": 0.05 if positive else 0.80,
+                        "gk_buyer_pre_balance_cv": 0.10 if positive else 1.00,
+                    }
+                )
+            write_jsonl(
+                root / "datasets" / "selector" / scope / "selector_training_view_v1.jsonl",
+                rows,
+            )
+            manifest = root / "reports" / "selector" / scope / "phase3_r2only_manifest_v1.json"
+            manifest.parent.mkdir(parents=True, exist_ok=True)
+            manifest.write_text(
+                json.dumps({"leakage_audit_status": "PASS", "fail_reasons": []}) + "\n",
+                encoding="utf-8",
+            )
+
+        def write_coordination(scope: str, runtime_scope: str) -> None:
+            path = (
+                root
+                / "logs"
+                / "rollout"
+                / runtime_scope
+                / "decisions"
+                / runtime_scope
+                / "v2.5"
+                / "coordination_risk"
+                / "coordination_risk_evidence.jsonl"
+            )
+            rows = []
+            for idx in range(20):
+                if funding_available:
+                    funding = {
+                        "status": "clean",
+                        "capture_ready": True,
+                        "known_buyers": 5,
+                        "unknown_count": 0,
+                        "total_buyers": 5,
+                        "known_coverage": 1.0,
+                        "top_funder_count": 1,
+                    }
+                    visibility = "available"
+                else:
+                    funding = {
+                        "status": "unavailable",
+                        "capture_ready": False,
+                        "known_buyers": 0,
+                        "unknown_count": 5,
+                        "total_buyers": 5,
+                        "known_coverage": 0.0,
+                        "excluded_reason": "funding_lane_unavailable",
+                    }
+                    visibility = "unavailable"
+                rows.append(
+                    {
+                        "candidate_id": f"{scope}-c{idx}",
+                        "funding_visibility": visibility,
+                        "sybil_resistance": {"funding_source_v2": funding},
+                    }
+                )
+            write_jsonl(path, rows)
+
+        train_runtime = f"{train_scope}-runtime"
+        validation_runtime = f"{validation_scope}-runtime"
+        write_scope(train_scope, validation=False)
+        write_scope(validation_scope, validation=True)
+        write_coordination(train_scope, train_runtime)
+        write_coordination(validation_scope, validation_runtime)
+        return train_runtime, validation_runtime
+
+    def run_new_signal_family_fixture(
+        self,
+        root: Path,
+        train_scope: str,
+        validation_scope: str,
+        train_runtime: str,
+        validation_runtime: str,
+    ) -> dict:
+        return new_signal_family_design.build_report(
+            new_signal_family_design.build_parser().parse_args(
+                [
+                    "--root",
+                    str(root),
+                    "--train-scope",
+                    train_scope,
+                    "--validation-scope",
+                    validation_scope,
+                    "--train-runtime-scope",
+                    train_runtime,
+                    "--validation-runtime-scope",
+                    validation_runtime,
+                ]
+            )
+        )
+
+    def test_new_signal_family_design_closes_p4c_no_go(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            train_scope = "selector-p4d-signal-train"
+            validation_scope = "selector-p4d-signal-validation"
+            train_runtime, validation_runtime = self.write_new_signal_family_fixture(
+                root,
+                train_scope,
+                validation_scope,
+            )
+            report = self.run_new_signal_family_fixture(
+                root,
+                train_scope,
+                validation_scope,
+                train_runtime,
+                validation_runtime,
+            )
+
+        self.assertEqual(
+            report["p4c_closure"]["status"],
+            "P4C_NO_GO_SIMPLE_EVIDENCE_GATED_CANDIDATES",
+        )
+        self.assertIn(report["recommendation"], {"IMPLEMENT_BOTH_MINIMAL", "IMPLEMENT_BUYER_QUALITY"})
+
+    def test_new_signal_family_design_marks_funding_lane_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            train_scope = "selector-p4d-funding-train"
+            validation_scope = "selector-p4d-funding-validation"
+            train_runtime, validation_runtime = self.write_new_signal_family_fixture(
+                root,
+                train_scope,
+                validation_scope,
+                funding_available=False,
+            )
+            report = self.run_new_signal_family_fixture(
+                root,
+                train_scope,
+                validation_scope,
+                train_runtime,
+                validation_runtime,
+            )
+
+        validation = report["funding_graph_probe"]["runs"]["validation"]
+        self.assertEqual(validation["current_probe_status"], "funding_lane_not_available_for_scoring")
+        self.assertIn(report["recommendation"], {"IMPLEMENT_FUNDING_GRAPH", "IMPLEMENT_BOTH_MINIMAL"})
+
+    def test_new_signal_family_design_writes_required_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            train_scope = "selector-p4d-output-train"
+            validation_scope = "selector-p4d-output-validation"
+            train_runtime, validation_runtime = self.write_new_signal_family_fixture(
+                root,
+                train_scope,
+                validation_scope,
+            )
+            report = self.run_new_signal_family_fixture(
+                root,
+                train_scope,
+                validation_scope,
+                train_runtime,
+                validation_runtime,
+            )
+
+            for path in report["outputs"].values():
+                self.assertTrue(Path(path).exists())
+
+    def test_new_signal_family_design_has_no_runtime_claims(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            train_scope = "selector-p4d-claims-train"
+            validation_scope = "selector-p4d-claims-validation"
+            train_runtime, validation_runtime = self.write_new_signal_family_fixture(
+                root,
+                train_scope,
+                validation_scope,
+            )
+            report = self.run_new_signal_family_fixture(
+                root,
+                train_scope,
+                validation_scope,
+                train_runtime,
+                validation_runtime,
+            )
+
+        self.assertTrue(report["claim_boundaries"]["offline_only"])
+        self.assertFalse(report["claim_boundaries"]["builds_runtime_score"])
+        self.assertFalse(report["claim_boundaries"]["changes_runtime"])
+        self.assertFalse(report["claim_boundaries"]["changes_gatekeeper"])
+        self.assertFalse(report["claim_boundaries"]["changes_execution"])
+        self.assertFalse(report["claim_boundaries"]["changes_send_path"])
+        self.assertFalse(report["claim_boundaries"]["tunes_thresholds"])
 
     def test_training_view_r2_no_target_is_negative_only_with_matured_coverage(self) -> None:
         path = {
