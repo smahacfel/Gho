@@ -111,6 +111,28 @@ const SELECTOR_SHADOW_Q99_THRESHOLD: f64 = 0.6944972661163069;
 const SELECTOR_SHADOW_Q98_THRESHOLD: f64 = 0.6910207260694384;
 const SELECTOR_SHADOW_Q975_THRESHOLD: f64 = 0.6897754365786619;
 const SELECTOR_SHADOW_TARGET_PRECISION_0_70_THRESHOLD: f64 = 0.6851504774409787;
+const COMBINED_SCORE_TAIL_V1_OBSERVATION_THRESHOLD: u8 = 9;
+const COMBINED_SCORE_TAIL_V1_STRICT_THRESHOLD: u8 = 10;
+const COMBINED_SCORE_TAIL_V1_ULTRA_STRICT_THRESHOLD: u8 = 11;
+const COMBINED_SCORE_TAIL_V1_CONTRACT_PAYLOAD: &str = concat!(
+    "combined_score_tail_v1|",
+    "current_market_cap_sol>=42.6|",
+    "bonding_progress_pct>=42.5|",
+    "flipper_presence_ratio<0.4110|",
+    "burst_ratio<0.337|",
+    "price_change_ratio>=1.032|",
+    "max_single_tx_price_impact_pct_observed>=32.3|",
+    "early_slot_volume_dominance_buy<0.4152|",
+    "timing_entropy>=1.780|",
+    "flip_ratio_10s<0.3943|",
+    "dev_tx_ratio<0.088|",
+    "sol_buy_ratio>=0.571|",
+    "buy_count>=10|",
+    "observation_threshold=9|strict_threshold=10|ultra_strict_threshold=11|",
+    "shadow_only|diagnostic_only|no_min_phases_to_pass|",
+    "no_gatekeeper_decision_change|no_execution_change|no_send_path_change|",
+    "fsc_excluded|vectors_d_price_excluded|not_live_execution_readiness"
+);
 const DECISION_PLANE_LEGACY_LIVE: &str = "legacy_live";
 const DECISION_PLANE_V25_SHADOW: &str = "v25_shadow";
 
@@ -795,6 +817,30 @@ pub struct SelectorShadowScoreSidecarLog {
     pub reason_vector: SelectorShadowScoreReasonVector,
     pub feature_availability: SelectorShadowScoreFeatureAvailability,
     pub claim_boundaries: SelectorShadowScoreClaimBoundaries,
+    #[serde(default)]
+    pub combined_score_tail_v1_score: u8,
+    #[serde(default)]
+    pub combined_score_tail_v1_bucket: String,
+    #[serde(default)]
+    pub combined_score_tail_v1_passed_conditions: Vec<String>,
+    #[serde(default)]
+    pub combined_score_tail_v1_failed_conditions: Vec<String>,
+    #[serde(default)]
+    pub combined_score_tail_v1_missing_features: Vec<String>,
+    #[serde(default)]
+    pub combined_score_tail_v1_observation_pass: bool,
+    #[serde(default)]
+    pub combined_score_tail_v1_strict_pass: bool,
+    #[serde(default)]
+    pub combined_score_tail_v1_ultra_strict_pass: bool,
+    #[serde(default)]
+    pub score_contract_hash: String,
+    #[serde(default)]
+    pub changes_gatekeeper_decision: bool,
+    #[serde(default)]
+    pub changes_execution: bool,
+    #[serde(default)]
+    pub send_path_changed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -836,6 +882,22 @@ pub struct SelectorShadowScoreClaimBoundaries {
     pub changes_gatekeeper_decision: bool,
     pub changes_execution: bool,
     pub send_path_changed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CombinedScoreTailV1Evaluation {
+    score: u8,
+    bucket: String,
+    passed_conditions: Vec<String>,
+    failed_conditions: Vec<String>,
+    missing_features: Vec<String>,
+    observation_pass: bool,
+    strict_pass: bool,
+    ultra_strict_pass: bool,
+    score_contract_hash: String,
+    changes_gatekeeper_decision: bool,
+    changes_execution: bool,
+    send_path_changed: bool,
 }
 
 /// Gatekeeper V2 Buy decision log with full phase breakdown
@@ -3237,7 +3299,183 @@ fn selector_shadow_normalized_feature(value: Option<f64>, spec: &SelectorShadowF
     normalized.clamp(0.0, 1.0)
 }
 
+fn combined_score_tail_v1_contract_hash() -> String {
+    blake3::hash(COMBINED_SCORE_TAIL_V1_CONTRACT_PAYLOAD.as_bytes())
+        .to_hex()
+        .to_string()
+}
+
+fn combined_score_tail_v1_bucket(score: u8) -> &'static str {
+    if score >= COMBINED_SCORE_TAIL_V1_ULTRA_STRICT_THRESHOLD {
+        "ultra_strict"
+    } else if score >= COMBINED_SCORE_TAIL_V1_STRICT_THRESHOLD {
+        "strict"
+    } else if score >= COMBINED_SCORE_TAIL_V1_OBSERVATION_THRESHOLD {
+        "observation"
+    } else {
+        "below_observation"
+    }
+}
+
+fn combined_score_tail_v1_finite(value: Option<f64>) -> Option<f64> {
+    value.filter(|value| value.is_finite())
+}
+
+fn combined_score_tail_v1_record_condition(
+    passed_conditions: &mut Vec<String>,
+    failed_conditions: &mut Vec<String>,
+    missing_features: &mut Vec<String>,
+    condition: &'static str,
+    feature_name: &'static str,
+    value: Option<f64>,
+    predicate: impl FnOnce(f64) -> bool,
+) {
+    let Some(value) = combined_score_tail_v1_finite(value) else {
+        missing_features.push(feature_name.to_string());
+        failed_conditions.push(condition.to_string());
+        return;
+    };
+
+    if predicate(value) {
+        passed_conditions.push(condition.to_string());
+    } else {
+        failed_conditions.push(condition.to_string());
+    }
+}
+
+fn evaluate_combined_score_tail_v1(log: &GatekeeperBuyLog) -> CombinedScoreTailV1Evaluation {
+    let mut passed_conditions = Vec::with_capacity(12);
+    let mut failed_conditions = Vec::with_capacity(12);
+    let mut missing_features = Vec::new();
+
+    combined_score_tail_v1_record_condition(
+        &mut passed_conditions,
+        &mut failed_conditions,
+        &mut missing_features,
+        "current_market_cap_sol >= 42.6",
+        "current_market_cap_sol",
+        log.current_market_cap_sol,
+        |value| value >= 42.6,
+    );
+    combined_score_tail_v1_record_condition(
+        &mut passed_conditions,
+        &mut failed_conditions,
+        &mut missing_features,
+        "bonding_progress_pct >= 42.5",
+        "bonding_progress_pct",
+        log.bonding_progress_pct,
+        |value| value >= 42.5,
+    );
+    combined_score_tail_v1_record_condition(
+        &mut passed_conditions,
+        &mut failed_conditions,
+        &mut missing_features,
+        "flipper_presence_ratio < 0.4110",
+        "flipper_presence_ratio",
+        log.flipper_presence_ratio,
+        |value| value < 0.4110,
+    );
+    combined_score_tail_v1_record_condition(
+        &mut passed_conditions,
+        &mut failed_conditions,
+        &mut missing_features,
+        "burst_ratio < 0.337",
+        "burst_ratio",
+        log.burst_ratio,
+        |value| value < 0.337,
+    );
+    combined_score_tail_v1_record_condition(
+        &mut passed_conditions,
+        &mut failed_conditions,
+        &mut missing_features,
+        "price_change_ratio >= 1.032",
+        "price_change_ratio",
+        log.price_change_ratio,
+        |value| value >= 1.032,
+    );
+    combined_score_tail_v1_record_condition(
+        &mut passed_conditions,
+        &mut failed_conditions,
+        &mut missing_features,
+        "max_single_tx_price_impact_pct_observed >= 32.3",
+        "max_single_tx_price_impact_pct_observed",
+        log.max_single_tx_price_impact_pct_observed,
+        |value| value >= 32.3,
+    );
+    combined_score_tail_v1_record_condition(
+        &mut passed_conditions,
+        &mut failed_conditions,
+        &mut missing_features,
+        "early_slot_volume_dominance_buy < 0.4152",
+        "early_slot_volume_dominance_buy",
+        log.early_slot_volume_dominance_buy,
+        |value| value < 0.4152,
+    );
+    combined_score_tail_v1_record_condition(
+        &mut passed_conditions,
+        &mut failed_conditions,
+        &mut missing_features,
+        "timing_entropy >= 1.780",
+        "timing_entropy",
+        log.timing_entropy,
+        |value| value >= 1.780,
+    );
+    combined_score_tail_v1_record_condition(
+        &mut passed_conditions,
+        &mut failed_conditions,
+        &mut missing_features,
+        "flip_ratio_10s < 0.3943",
+        "flip_ratio_10s",
+        log.flip_ratio_10s,
+        |value| value < 0.3943,
+    );
+    combined_score_tail_v1_record_condition(
+        &mut passed_conditions,
+        &mut failed_conditions,
+        &mut missing_features,
+        "dev_tx_ratio < 0.088",
+        "dev_tx_ratio",
+        log.dev_tx_ratio,
+        |value| value < 0.088,
+    );
+    combined_score_tail_v1_record_condition(
+        &mut passed_conditions,
+        &mut failed_conditions,
+        &mut missing_features,
+        "sol_buy_ratio >= 0.571",
+        "sol_buy_ratio",
+        log.sol_buy_ratio,
+        |value| value >= 0.571,
+    );
+    combined_score_tail_v1_record_condition(
+        &mut passed_conditions,
+        &mut failed_conditions,
+        &mut missing_features,
+        "buy_count >= 10",
+        "buy_count",
+        Some(log.buy_count as f64),
+        |value| value >= 10.0,
+    );
+
+    let score = passed_conditions.len() as u8;
+    CombinedScoreTailV1Evaluation {
+        score,
+        bucket: combined_score_tail_v1_bucket(score).to_string(),
+        passed_conditions,
+        failed_conditions,
+        missing_features,
+        observation_pass: score >= COMBINED_SCORE_TAIL_V1_OBSERVATION_THRESHOLD,
+        strict_pass: score >= COMBINED_SCORE_TAIL_V1_STRICT_THRESHOLD,
+        ultra_strict_pass: score >= COMBINED_SCORE_TAIL_V1_ULTRA_STRICT_THRESHOLD,
+        score_contract_hash: combined_score_tail_v1_contract_hash(),
+        changes_gatekeeper_decision: false,
+        changes_execution: false,
+        send_path_changed: false,
+    }
+}
+
 fn build_selector_shadow_score_sidecar(log: &GatekeeperBuyLog) -> SelectorShadowScoreSidecarLog {
+    let combined_score_tail_v1 = evaluate_combined_score_tail_v1(log);
     let cutoff_verified = log.observation_end_ts_ms.is_some();
     let core_curve_market_available = log.bonding_progress_pct.is_some()
         && log.current_market_cap_sol.is_some()
@@ -3404,6 +3642,18 @@ fn build_selector_shadow_score_sidecar(log: &GatekeeperBuyLog) -> SelectorShadow
             changes_execution: false,
             send_path_changed: false,
         },
+        combined_score_tail_v1_score: combined_score_tail_v1.score,
+        combined_score_tail_v1_bucket: combined_score_tail_v1.bucket,
+        combined_score_tail_v1_passed_conditions: combined_score_tail_v1.passed_conditions,
+        combined_score_tail_v1_failed_conditions: combined_score_tail_v1.failed_conditions,
+        combined_score_tail_v1_missing_features: combined_score_tail_v1.missing_features,
+        combined_score_tail_v1_observation_pass: combined_score_tail_v1.observation_pass,
+        combined_score_tail_v1_strict_pass: combined_score_tail_v1.strict_pass,
+        combined_score_tail_v1_ultra_strict_pass: combined_score_tail_v1.ultra_strict_pass,
+        score_contract_hash: combined_score_tail_v1.score_contract_hash,
+        changes_gatekeeper_decision: combined_score_tail_v1.changes_gatekeeper_decision,
+        changes_execution: combined_score_tail_v1.changes_execution,
+        send_path_changed: combined_score_tail_v1.send_path_changed,
     }
 }
 
@@ -4964,6 +5214,130 @@ mod tests {
         }
     }
 
+    fn set_combined_score_tail_v1_all_pass(log: &mut GatekeeperBuyLog) {
+        log.current_market_cap_sol = Some(42.6);
+        log.bonding_progress_pct = Some(42.5);
+        log.flipper_presence_ratio = Some(0.4109);
+        log.burst_ratio = Some(0.3369);
+        log.price_change_ratio = Some(1.032);
+        log.max_single_tx_price_impact_pct_observed = Some(32.3);
+        log.early_slot_volume_dominance_buy = Some(0.4151);
+        log.timing_entropy = Some(1.780);
+        log.flip_ratio_10s = Some(0.3942);
+        log.dev_tx_ratio = Some(0.0879);
+        log.sol_buy_ratio = Some(0.571);
+        log.buy_count = 10;
+    }
+
+    fn apply_combined_score_tail_v1_failures(log: &mut GatekeeperBuyLog, fail_count: usize) {
+        for idx in 0..fail_count {
+            match idx {
+                0 => log.current_market_cap_sol = Some(42.59),
+                1 => log.bonding_progress_pct = Some(42.49),
+                2 => log.flipper_presence_ratio = Some(0.4110),
+                3 => log.burst_ratio = Some(0.337),
+                4 => log.price_change_ratio = Some(1.0319),
+                5 => log.max_single_tx_price_impact_pct_observed = Some(32.29),
+                6 => log.early_slot_volume_dominance_buy = Some(0.4152),
+                7 => log.timing_entropy = Some(1.779),
+                8 => log.flip_ratio_10s = Some(0.3943),
+                9 => log.dev_tx_ratio = Some(0.088),
+                10 => log.sol_buy_ratio = Some(0.5709),
+                11 => log.buy_count = 9,
+                _ => {}
+            }
+        }
+    }
+
+    fn combined_score_tail_v1_log_with_score(score: u8) -> GatekeeperBuyLog {
+        assert!(score <= 12);
+        let mut log = create_test_buy_log();
+        set_combined_score_tail_v1_all_pass(&mut log);
+        apply_combined_score_tail_v1_failures(&mut log, usize::from(12 - score));
+        log
+    }
+
+    #[test]
+    fn test_combined_score_tail_v1_bucket_thresholds() {
+        for (score, bucket, observation, strict, ultra_strict) in [
+            (12, "ultra_strict", true, true, true),
+            (11, "ultra_strict", true, true, true),
+            (10, "strict", true, true, false),
+            (9, "observation", true, false, false),
+            (8, "below_observation", false, false, false),
+        ] {
+            let log = combined_score_tail_v1_log_with_score(score);
+            let evaluation = evaluate_combined_score_tail_v1(&log);
+
+            assert_eq!(evaluation.score, score);
+            assert_eq!(evaluation.bucket, bucket);
+            assert_eq!(evaluation.passed_conditions.len(), usize::from(score));
+            assert_eq!(evaluation.failed_conditions.len(), usize::from(12 - score));
+            assert!(evaluation.missing_features.is_empty());
+            assert_eq!(evaluation.observation_pass, observation);
+            assert_eq!(evaluation.strict_pass, strict);
+            assert_eq!(evaluation.ultra_strict_pass, ultra_strict);
+            assert!(!evaluation.changes_gatekeeper_decision);
+            assert!(!evaluation.changes_execution);
+            assert!(!evaluation.send_path_changed);
+        }
+    }
+
+    #[test]
+    fn test_combined_score_tail_v1_missing_feature_fails_condition() {
+        let mut log = combined_score_tail_v1_log_with_score(12);
+        log.flip_ratio_10s = None;
+
+        let evaluation = evaluate_combined_score_tail_v1(&log);
+
+        assert_eq!(evaluation.score, 11);
+        assert_eq!(evaluation.bucket, "ultra_strict");
+        assert!(evaluation
+            .missing_features
+            .iter()
+            .any(|feature| feature == "flip_ratio_10s"));
+        assert!(evaluation
+            .failed_conditions
+            .iter()
+            .any(|condition| condition == "flip_ratio_10s < 0.3943"));
+        assert!(!evaluation
+            .passed_conditions
+            .iter()
+            .any(|condition| condition == "flip_ratio_10s < 0.3943"));
+    }
+
+    #[test]
+    fn test_combined_score_tail_v1_ignores_min_phases_to_pass() {
+        let mut min_one = combined_score_tail_v1_log_with_score(12);
+        let mut min_six = min_one.clone();
+        min_one.min_phases_to_pass = 1;
+        min_six.min_phases_to_pass = 6;
+
+        assert_eq!(
+            evaluate_combined_score_tail_v1(&min_one),
+            evaluate_combined_score_tail_v1(&min_six)
+        );
+    }
+
+    #[test]
+    fn test_combined_score_tail_v1_sidecar_fields_are_emitted() {
+        let log = combined_score_tail_v1_log_with_score(12);
+        let sidecar = build_selector_shadow_score_sidecar(&log);
+
+        assert_eq!(sidecar.combined_score_tail_v1_score, 12);
+        assert_eq!(sidecar.combined_score_tail_v1_bucket, "ultra_strict");
+        assert_eq!(sidecar.combined_score_tail_v1_passed_conditions.len(), 12);
+        assert!(sidecar.combined_score_tail_v1_failed_conditions.is_empty());
+        assert!(sidecar.combined_score_tail_v1_missing_features.is_empty());
+        assert!(sidecar.combined_score_tail_v1_observation_pass);
+        assert!(sidecar.combined_score_tail_v1_strict_pass);
+        assert!(sidecar.combined_score_tail_v1_ultra_strict_pass);
+        assert_eq!(sidecar.score_contract_hash.len(), 64);
+        assert!(!sidecar.changes_gatekeeper_decision);
+        assert!(!sidecar.changes_execution);
+        assert!(!sidecar.send_path_changed);
+    }
+
     #[test]
     fn test_v3_replay_payload_fields_serialize_only_when_some() {
         let mut log = create_test_buy_log();
@@ -5387,6 +5761,24 @@ mod tests {
         assert_eq!(row["pool_id"], "pool_score_sidecar");
         assert_eq!(row["base_mint"], "mint_score_sidecar");
         assert_eq!(row["gatekeeper_verdict_type"], "BUY");
+        assert!(row.get("combined_score_tail_v1_score").is_some());
+        assert!(row.get("combined_score_tail_v1_bucket").is_some());
+        assert!(row
+            .get("combined_score_tail_v1_passed_conditions")
+            .is_some());
+        assert!(row
+            .get("combined_score_tail_v1_failed_conditions")
+            .is_some());
+        assert!(row.get("combined_score_tail_v1_missing_features").is_some());
+        assert!(row.get("combined_score_tail_v1_observation_pass").is_some());
+        assert!(row.get("combined_score_tail_v1_strict_pass").is_some());
+        assert!(row
+            .get("combined_score_tail_v1_ultra_strict_pass")
+            .is_some());
+        assert_eq!(row["changes_gatekeeper_decision"], false);
+        assert_eq!(row["changes_execution"], false);
+        assert_eq!(row["send_path_changed"], false);
+        assert_eq!(row["score_contract_hash"].as_str().unwrap().len(), 64);
 
         logger.shutdown().await;
     }
@@ -5487,6 +5879,7 @@ mod tests {
 
         let mut reject_log = create_test_buy_log();
         reject_log.pool_id = "pool_score_verdict".to_string();
+        set_combined_score_tail_v1_all_pass(&mut reject_log);
         reject_log.decision_verdict_buy = Some(false);
         reject_log.verdict_type = Some("REJECT_CORE_FAIL".to_string());
         reject_log.reason_code = Some(GatekeeperReasonCode::RejectCoreFail.as_log_str());
@@ -5509,10 +5902,16 @@ mod tests {
         assert!(decision.get("selector_shadow_score").is_none());
 
         let sidecar_rows = read_test_selector_shadow_score_rows(&log_dir).await;
+        assert_eq!(sidecar_rows[0]["combined_score_tail_v1_score"], 12);
+        assert_eq!(
+            sidecar_rows[0]["combined_score_tail_v1_bucket"],
+            "ultra_strict"
+        );
         assert_eq!(
             sidecar_rows[0]["claim_boundaries"]["changes_gatekeeper_decision"],
             false
         );
+        assert_eq!(sidecar_rows[0]["changes_gatekeeper_decision"], false);
 
         logger.shutdown().await;
     }
@@ -5525,6 +5924,7 @@ mod tests {
 
         let mut buy_log = create_test_buy_log();
         buy_log.pool_id = "pool_score_execution".to_string();
+        set_combined_score_tail_v1_all_pass(&mut buy_log);
         buy_log.shadow_trigger_eligible = Some(true);
         buy_log.shadow_execution_outcome = Some("shadow_dispatch_ready".to_string());
         buy_log.ab_record_id = Some("pool_score_execution:1000:11000:BUY".to_string());
@@ -5551,6 +5951,7 @@ mod tests {
         );
 
         let sidecar_rows = read_test_selector_shadow_score_rows(&log_dir).await;
+        assert_eq!(sidecar_rows[0]["combined_score_tail_v1_score"], 12);
         assert_eq!(
             sidecar_rows[0]["claim_boundaries"]["changes_execution"],
             false
@@ -5559,6 +5960,8 @@ mod tests {
             sidecar_rows[0]["claim_boundaries"]["send_path_changed"],
             false
         );
+        assert_eq!(sidecar_rows[0]["changes_execution"], false);
+        assert_eq!(sidecar_rows[0]["send_path_changed"], false);
 
         logger.shutdown().await;
     }
