@@ -35,6 +35,7 @@ import audit_selector_buy_simulation_coverage as simcov_audit
 import audit_selector_shadow_score_sidecar as shadow_score_sidecar_audit
 import audit_selector_shadow_score_parity as shadow_score_parity_audit
 import audit_selector_shadow_score_topk_drift as shadow_score_topk_drift
+import audit_gatekeeper_decision_vs_r2 as gk_r2_audit
 import analyze_selector_candidate_crossrun_stability as crossrun_stability
 import build_selector_model_redesign_report as model_redesign
 import build_selector_evidence_gated_candidate_redesign as evidence_gated_redesign
@@ -7952,6 +7953,241 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertEqual(report["failure_classes"]["POSITION_LIMIT_REACHED"]["count"], 1)
         self.assertEqual(samples[0]["active_positions"], 5)
         self.assertEqual(samples[0]["max_concurrent_positions"], 5)
+
+    def write_gatekeeper_r2_fixture(self, root: Path) -> tuple[str, str]:
+        runtime_scope = "runtime-gk-r2"
+        selector_scope = "selector-gk-r2"
+        dataset_dir = root / "datasets" / "selector" / selector_scope
+        decision_dir = (
+            root
+            / "logs"
+            / "rollout"
+            / runtime_scope
+            / "decisions"
+            / runtime_scope
+            / "v2.2"
+            / "legacy_live"
+            / "config"
+        )
+        candidates = [
+            {"candidate_id": "c_buy_pos", "pool_id": "pool-buy-pos", "base_mint": "mint-buy-pos", "decision_ts_ms": 1_000},
+            {"candidate_id": "c_buy_neg", "pool_id": "pool-buy-neg", "base_mint": "mint-buy-neg", "decision_ts_ms": 1_000},
+            {"candidate_id": "c_reject_pos", "pool_id": "pool-reject-pos", "base_mint": "mint-reject-pos", "decision_ts_ms": 1_000},
+            {"candidate_id": "c_reject_neg", "pool_id": "pool-reject-neg", "base_mint": "mint-reject-neg", "decision_ts_ms": 1_000},
+            {"candidate_id": "c_timeout_pos", "pool_id": "pool-timeout-pos", "base_mint": "mint-timeout-pos", "decision_ts_ms": 1_000},
+            {"candidate_id": "c_timeout_neg", "pool_id": "pool-timeout-neg", "base_mint": "mint-timeout-neg", "decision_ts_ms": 1_000},
+            {"candidate_id": "c_unresolved", "pool_id": "pool-unresolved", "base_mint": "mint-unresolved", "decision_ts_ms": 1_000},
+        ]
+        r2_rows = [
+            {"candidate_id": "c_buy_pos", "pool_id": "pool-buy-pos", "base_mint": "mint-buy-pos", "r2_label": "positive", "r2_status": "positive", "target_hit_ts_ms": 2_000, "max_favorable_pnl_pct": 60.0, "max_adverse_pnl_pct": -5.0},
+            {"candidate_id": "c_buy_neg", "pool_id": "pool-buy-neg", "base_mint": "mint-buy-neg", "r2_label": "negative", "r2_status": "negative", "max_favorable_pnl_pct": 5.0, "max_adverse_pnl_pct": -40.0},
+            {"candidate_id": "c_reject_pos", "pool_id": "pool-reject-pos", "base_mint": "mint-reject-pos", "r2_label": "positive", "r2_status": "positive", "target_hit_ts_ms": 2_100, "max_favorable_pnl_pct": 80.0, "max_adverse_pnl_pct": -2.0},
+            {"candidate_id": "c_reject_neg", "pool_id": "pool-reject-neg", "base_mint": "mint-reject-neg", "r2_label": "negative", "r2_status": "negative", "max_favorable_pnl_pct": 4.0, "max_adverse_pnl_pct": -55.0},
+            {"candidate_id": "c_timeout_pos", "pool_id": "pool-timeout-pos", "base_mint": "mint-timeout-pos", "r2_label": "positive", "r2_status": "positive", "target_hit_ts_ms": 2_200, "max_favorable_pnl_pct": 70.0, "max_adverse_pnl_pct": -7.0},
+            {"candidate_id": "c_timeout_neg", "pool_id": "pool-timeout-neg", "base_mint": "mint-timeout-neg", "r2_label": "negative", "r2_status": "negative", "max_favorable_pnl_pct": 3.0, "max_adverse_pnl_pct": -45.0},
+            {"candidate_id": "c_unresolved", "pool_id": "pool-unresolved", "base_mint": "mint-unresolved", "r2_label": None, "r2_status": "horizon_unmatured"},
+        ]
+        decisions = [
+            {"pool_id": "pool-buy-pos", "base_mint": "mint-buy-pos", "decision_ts_ms": 1_000, "decision_plane": "legacy_live", "verdict_type": "BUY", "decision_verdict_buy": True, "decision_reason": "BUY", "buy_ratio": 0.9, "flip_ratio_10s": 0.1, "tas_available": True},
+            {"pool_id": "pool-buy-neg", "base_mint": "mint-buy-neg", "decision_ts_ms": 1_000, "decision_plane": "legacy_live", "verdict_type": "BUY", "decision_verdict_buy": True, "decision_reason": "BUY", "buy_ratio": 0.8, "flip_ratio_10s": 0.2, "tas_available": True},
+            {"pool_id": "pool-reject-pos", "base_mint": "mint-reject-pos", "decision_ts_ms": 1_000, "decision_plane": "legacy_live", "verdict_type": "REJECT_CORE_FAIL", "reason_code": "REJECT_CORE_FAIL", "decision_reason": "core fail", "buy_ratio": 0.7, "flip_ratio_10s": 0.3},
+            {"pool_id": "pool-reject-neg", "base_mint": "mint-reject-neg", "decision_ts_ms": 1_000, "decision_plane": "legacy_live", "verdict_type": "REJECT_HARD_FAIL", "reason_code": "HARD_FAIL_EXTREME_TOP3", "decision_reason": "hard fail", "buy_ratio": 0.2, "flip_ratio_10s": 0.4},
+            {"pool_id": "pool-timeout-pos", "base_mint": "mint-timeout-pos", "decision_ts_ms": 1_000, "decision_plane": "legacy_live", "verdict_type": "TIMEOUT_PHASE1_NO_DATA", "decision_reason": "timeout no data", "buy_ratio": 0.6, "flip_ratio_10s": 0.5},
+            {"pool_id": "pool-timeout-neg", "base_mint": "mint-timeout-neg", "decision_ts_ms": 1_000, "decision_plane": "legacy_live", "verdict_type": "TIMEOUT_PHASE1_INSUFFICIENT", "decision_reason": "timeout insufficient", "buy_ratio": 0.1, "flip_ratio_10s": 0.6},
+            {"pool_id": "pool-unresolved", "base_mint": "mint-unresolved", "decision_ts_ms": 1_000, "decision_plane": "legacy_live", "verdict_type": "REJECT_CORE_FAIL", "reason_code": "REJECT_CORE_FAIL", "decision_reason": "core fail unresolved", "buy_ratio": 0.5},
+        ]
+        lifecycle = [
+            {
+                "candidate_id": "c_buy_neg",
+                "pool_id": "pool-buy-neg",
+                "base_mint": "mint-buy-neg",
+                "final_pnl_pct": -40.0,
+                "close_reason": "Stop",
+                "truth_status": "resolved",
+                "execution_outcome": "shadow_simulated",
+            }
+        ]
+        write_jsonl(dataset_dir / "candidate_universe_v1.jsonl", candidates)
+        write_jsonl(dataset_dir / "r2_market_paths_v1.jsonl", r2_rows)
+        write_jsonl(dataset_dir / "accepted_lifecycle_v1.jsonl", lifecycle)
+        write_jsonl(decision_dir / "gatekeeper_v2_decisions.jsonl", decisions)
+        return runtime_scope, selector_scope
+
+    def run_gatekeeper_r2_audit(self, root: Path, runtime_scope: str, selector_scope: str) -> dict:
+        return gk_r2_audit.build_report(
+            gk_r2_audit.build_parser().parse_args(
+                [
+                    "--root",
+                    str(root),
+                    "--runtime-scope",
+                    runtime_scope,
+                    "--selector-scope",
+                    selector_scope,
+                    "--decision-plane",
+                    "legacy_live",
+                ]
+            )
+        )
+
+    def test_gatekeeper_decision_vs_r2_builds_buy_reject_timeout_matrix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime_scope, selector_scope = self.write_gatekeeper_r2_fixture(root)
+            report = self.run_gatekeeper_r2_audit(root, runtime_scope, selector_scope)
+
+        self.assertEqual(report["status"], "PASS")
+        self.assertEqual(report["join_manifest"]["candidate_universe_rows"], 7)
+        self.assertEqual(report["join_manifest"]["decision_rows_joined_to_candidate"], 7)
+        self.assertEqual(report["global_metrics"]["buy_positive_rows"], 1)
+        self.assertEqual(report["global_metrics"]["buy_negative_rows"], 1)
+        self.assertEqual(report["global_metrics"]["reject_positive_rows"], 1)
+        self.assertEqual(report["global_metrics"]["reject_negative_rows"], 1)
+        self.assertEqual(report["global_metrics"]["timeout_positive_rows"], 1)
+        self.assertEqual(report["global_metrics"]["timeout_negative_rows"], 1)
+
+    def test_gatekeeper_decision_vs_r2_keeps_unresolved_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime_scope, selector_scope = self.write_gatekeeper_r2_fixture(root)
+            report = self.run_gatekeeper_r2_audit(root, runtime_scope, selector_scope)
+
+        self.assertEqual(report["join_manifest"]["r2_label_counts"]["horizon_unmatured"], 1)
+        self.assertEqual(report["global_metrics"]["resolved_decision_rows"], 6)
+
+    def test_gatekeeper_decision_vs_r2_counts_false_rejects(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime_scope, selector_scope = self.write_gatekeeper_r2_fixture(root)
+            report = self.run_gatekeeper_r2_audit(root, runtime_scope, selector_scope)
+            rows = read_jsonl(Path(report["outputs"]["false_rejects_jsonl"]))
+
+        self.assertEqual(report["global_metrics"]["nonbuy_positive_rows"], 2)
+        self.assertEqual({row["candidate_id"] for row in rows}, {"c_reject_pos", "c_timeout_pos"})
+
+    def test_gatekeeper_decision_vs_r2_counts_false_buys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime_scope, selector_scope = self.write_gatekeeper_r2_fixture(root)
+            report = self.run_gatekeeper_r2_audit(root, runtime_scope, selector_scope)
+            rows = read_jsonl(Path(report["outputs"]["false_buys_jsonl"]))
+
+        self.assertEqual(report["global_metrics"]["buy_negative_rows"], 1)
+        self.assertEqual(rows[0]["candidate_id"], "c_buy_neg")
+        self.assertEqual(rows[0]["final_pnl_pct"], -40.0)
+
+    def test_gatekeeper_decision_vs_r2_counts_timeout_opportunity_loss(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime_scope, selector_scope = self.write_gatekeeper_r2_fixture(root)
+            report = self.run_gatekeeper_r2_audit(root, runtime_scope, selector_scope)
+            rows = read_jsonl(Path(report["outputs"]["timeout_loss_jsonl"]))
+
+        self.assertEqual(report["global_metrics"]["timeout_positive_rows"], 1)
+        self.assertEqual(rows[0]["candidate_id"], "c_timeout_pos")
+
+    def test_gatekeeper_decision_vs_r2_does_not_use_lifecycle_as_denominator(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime_scope, selector_scope = self.write_gatekeeper_r2_fixture(root)
+            report = self.run_gatekeeper_r2_audit(root, runtime_scope, selector_scope)
+
+        self.assertFalse(report["lifecycle_used_as_denominator"])
+        self.assertEqual(report["join_manifest"]["accepted_lifecycle_rows"], 1)
+        self.assertEqual(report["join_manifest"]["decision_rows_loaded"], 7)
+
+    def test_gatekeeper_decision_vs_r2_exports_examples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime_scope, selector_scope = self.write_gatekeeper_r2_fixture(root)
+            report = self.run_gatekeeper_r2_audit(root, runtime_scope, selector_scope)
+
+            self.assertTrue(Path(report["outputs"]["false_rejects_jsonl"]).exists())
+            self.assertTrue(Path(report["outputs"]["false_buys_jsonl"]).exists())
+            self.assertTrue(Path(report["outputs"]["timeout_loss_jsonl"]).exists())
+            self.assertTrue(Path(report["outputs"]["confusion_csv"]).exists())
+
+    def test_gatekeeper_decision_vs_r2_enriches_xgb_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime_scope, selector_scope = self.write_gatekeeper_r2_fixture(root)
+            report = self.run_gatekeeper_r2_audit(root, runtime_scope, selector_scope)
+            csv_text = Path(report["outputs"]["xgb_metrics_csv"]).read_text(encoding="utf-8")
+
+        self.assertIn("BUY_positive,buy_ratio_mean", csv_text)
+        self.assertIn("REJECT_positive,buy_ratio_mean", csv_text)
+        self.assertIn("TIMEOUT_positive,buy_ratio_mean", csv_text)
+
+    def test_gatekeeper_decision_vs_r2_v25_does_not_use_legacy_buy_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime_scope = "runtime-gk-r2-v25"
+            selector_scope = "selector-gk-r2-v25"
+            dataset_dir = root / "datasets" / "selector" / selector_scope
+            decision_dir = (
+                root
+                / "logs"
+                / "rollout"
+                / runtime_scope
+                / "decisions"
+                / runtime_scope
+                / "v2.5"
+                / "v25_shadow"
+                / "config"
+            )
+            write_jsonl(
+                dataset_dir / "candidate_universe_v1.jsonl",
+                [
+                    {"candidate_id": "c1", "pool_id": "pool1", "base_mint": "mint1", "decision_ts_ms": 1_000},
+                    {"candidate_id": "c2", "pool_id": "pool2", "base_mint": "mint2", "decision_ts_ms": 1_000},
+                ],
+            )
+            write_jsonl(
+                dataset_dir / "r2_market_paths_v1.jsonl",
+                [
+                    {"candidate_id": "c1", "pool_id": "pool1", "base_mint": "mint1", "r2_label": "positive", "r2_status": "positive"},
+                    {"candidate_id": "c2", "pool_id": "pool2", "base_mint": "mint2", "r2_label": "negative", "r2_status": "negative"},
+                ],
+            )
+            write_jsonl(
+                decision_dir / "gatekeeper_v2_decisions.jsonl",
+                [
+                    {
+                        "pool_id": "pool1",
+                        "base_mint": "mint1",
+                        "decision_ts_ms": 1_000,
+                        "decision_plane": "v25_shadow",
+                        "verdict_type": "HARD_FAIL_EXTREME_TOP3",
+                        "legacy_live_verdict_type": "BUY",
+                    },
+                    {
+                        "pool_id": "pool2",
+                        "base_mint": "mint2",
+                        "decision_ts_ms": 1_000,
+                        "decision_plane": "v25_shadow",
+                        "verdict_type": "TIMEOUT_PHASE1_NO_DATA",
+                        "legacy_live_verdict_type": "BUY",
+                    },
+                ],
+            )
+            report = gk_r2_audit.build_report(
+                gk_r2_audit.build_parser().parse_args(
+                    [
+                        "--root",
+                        str(root),
+                        "--runtime-scope",
+                        runtime_scope,
+                        "--selector-scope",
+                        selector_scope,
+                        "--decision-plane",
+                        "v25_shadow",
+                    ]
+                )
+            )
+            confusion = Path(report["outputs"]["confusion_csv"]).read_text(encoding="utf-8")
+
+        self.assertEqual(report["global_metrics"]["buy_resolved_rows"], 0)
+        self.assertIn("REJECT_HARD_FAIL,HARD_FAIL_EXTREME_TOP3", confusion)
+        self.assertIn("TIMEOUT_PHASE1_NO_DATA,TIMEOUT_PHASE1_NO_DATA", confusion)
 
 
 if __name__ == "__main__":
