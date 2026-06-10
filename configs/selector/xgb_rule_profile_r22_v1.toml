@@ -1,0 +1,15 @@
+[profile]
+name = "xgb_rule_profile_r22_v1"
+mode = "shadow_only"
+source = "r21_xgboost_profit_loss_metric_separation"
+changes_gatekeeper_decision = false
+changes_execution = false
+production_promotion_allowed = false
+
+[rules]
+min_buy_ratio_min = 0.35
+max_flipper_presence_ratio = 0.40
+max_flip_ratio_10s = 0.40
+max_early_slot_volume_dominance_buy = 0.55
+max_hhi_delta_t2_t0 = 0.35
+min_dev_paperhand_latency_ms = 3000

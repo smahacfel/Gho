@@ -43,6 +43,8 @@ import build_selector_segment_specific_candidate as segment_specific_candidate
 import build_selector_new_signal_family_design as new_signal_family_design
 import build_selector_buyer_quality_context as buyer_quality_context
 import build_selector_funding_graph_context as funding_graph_context
+import guard_xgb_rule_profile_feature_surface as xgb_surface_guard
+import evaluate_xgb_rule_profile_shadow as xgb_rule_eval
 try:
     import build_selector_coverage_breakthrough_projection as coverage_breakthrough
 except ModuleNotFoundError:
@@ -1805,6 +1807,158 @@ class SelectorPipelineTests(unittest.TestCase):
             strict["validation"]["hard_reject_reason_counts"]["evidence_tx_count_below_3"],
             20,
         )
+
+    def test_xgb_rule_profile_feature_surface_guard_passes_with_required_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "shadow-r22-xgb-surface"
+            decision_dir = (
+                root
+                / "logs"
+                / "rollout"
+                / scope
+                / "decisions"
+                / scope
+                / "v2.5"
+                / "v25_shadow"
+                / "hash"
+            )
+            rows = [
+                {
+                    "candidate_id": f"c{idx}",
+                    "buy_ratio_min": 0.5,
+                    "flipper_presence_ratio": 0.1,
+                    "flip_ratio_10s": 0.1,
+                    "early_slot_volume_dominance_buy": 0.2,
+                    "hhi_delta_t2_t0": 0.1,
+                    "dev_paperhand_latency_ms": 5_000,
+                }
+                for idx in range(10)
+            ]
+            write_jsonl(decision_dir / "gatekeeper_v2_decisions.jsonl", rows)
+            report = xgb_surface_guard.build_report(
+                xgb_surface_guard.build_parser().parse_args(
+                    ["--root", str(root), "--scope", scope, "--min-present-rate", "0.80"]
+                )
+            )
+
+        self.assertEqual(report["status"], "PASS")
+        self.assertEqual(report["decision_rows"], 10)
+        self.assertEqual(report["field_coverage"]["buy_ratio_min"], 1.0)
+        self.assertFalse(report["non_claims"]["changes_gatekeeper_decision"])
+
+    def test_xgb_rule_profile_feature_surface_guard_fails_on_missing_metric(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "shadow-r22-xgb-surface-fail"
+            decision_dir = (
+                root
+                / "logs"
+                / "rollout"
+                / scope
+                / "decisions"
+                / scope
+                / "v2.5"
+                / "v25_shadow"
+                / "hash"
+            )
+            rows = [
+                {
+                    "candidate_id": f"c{idx}",
+                    "buy_ratio_min": 0.5,
+                    "flipper_presence_ratio": 0.1,
+                    "flip_ratio_10s": 0.1,
+                    "early_slot_volume_dominance_buy": 0.2,
+                    "hhi_delta_t2_t0": 0.1,
+                }
+                for idx in range(10)
+            ]
+            write_jsonl(decision_dir / "gatekeeper_v2_decisions.jsonl", rows)
+            report = xgb_surface_guard.build_report(
+                xgb_surface_guard.build_parser().parse_args(
+                    ["--root", str(root), "--scope", scope, "--min-present-rate", "0.80"]
+                )
+            )
+
+        self.assertEqual(report["status"], "FAIL")
+        self.assertIn(
+            "dev_paperhand_latency_ms_coverage_below_min:0.000000<0.800000",
+            report["fail_reasons"],
+        )
+
+    def test_xgb_rule_profile_shadow_eval_counts_counterfactual_rules(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            selector_scope = "selector-r22-xgb-final"
+            runtime_scope = "shadow-r22-xgb-runtime"
+            dataset_dir = root / "datasets" / "selector" / selector_scope
+            profile = root / "configs" / "selector" / "xgb_rule_profile_r22_v1.toml"
+            profile.parent.mkdir(parents=True)
+            profile.write_text(
+                "\n".join(
+                    [
+                        "[profile]",
+                        'name = "xgb_rule_profile_r22_v1"',
+                        'mode = "shadow_only"',
+                        'source = "unit_test"',
+                        "changes_gatekeeper_decision = false",
+                        "changes_execution = false",
+                        "production_promotion_allowed = false",
+                        "",
+                        "[rules]",
+                        "min_buy_ratio_min = 0.35",
+                        "max_flipper_presence_ratio = 0.40",
+                        "max_flip_ratio_10s = 0.40",
+                        "max_early_slot_volume_dominance_buy = 0.55",
+                        "max_hhi_delta_t2_t0 = 0.35",
+                        "min_dev_paperhand_latency_ms = 3000",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            rows = []
+            for idx in range(1200):
+                good = idx < 120
+                rows.append(
+                    {
+                        "candidate_id": f"c{idx}",
+                        "r2_label": "positive" if good else "negative",
+                        "buy_ratio_min": 0.60 if good else 0.20,
+                        "flipper_presence_ratio": 0.05 if good else 0.60,
+                        "flip_ratio_10s": 0.05 if good else 0.60,
+                        "early_slot_volume_dominance_buy": 0.20 if good else 0.80,
+                        "hhi_delta_t2_t0": 0.10 if good else 0.60,
+                        "dev_paperhand_latency_ms": 5_000 if good else 500,
+                    }
+                )
+            write_jsonl(dataset_dir / "selector_training_view_v1.jsonl", rows)
+            write_jsonl(dataset_dir / "buyer_quality_context_v1.jsonl", [{"candidate_id": "c0", "bq_context_status": "clean"}])
+            write_jsonl(dataset_dir / "funding_graph_context_v1.jsonl", [{"candidate_id": "c0", "fg_status": "clean"}])
+            report = xgb_rule_eval.build_report(
+                xgb_rule_eval.build_parser().parse_args(
+                    [
+                        "--root",
+                        str(root),
+                        "--scope",
+                        selector_scope,
+                        "--runtime-scope",
+                        runtime_scope,
+                        "--rule-profile",
+                        str(profile),
+                    ]
+                )
+            )
+
+        self.assertEqual(report["r2_resolved_rows"], 1200)
+        self.assertEqual(report["would_pass_count"], 120)
+        self.assertEqual(report["would_pass_precision"], 1.0)
+        self.assertEqual(
+            report["verdict"],
+            "R22_XGB_RULE_PROFILE_CONFIRMED_BUILD_OFFLINE_CANDIDATE",
+        )
+        self.assertFalse(report["non_claims"]["changes_gatekeeper_decision"])
+        self.assertFalse(report["non_claims"]["changes_execution"])
 
     def test_label_segment_diagnostics_builds_segment_lift_matrix(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
