@@ -41,6 +41,7 @@ import audit_gatekeeper_decision_vs_r2 as gk_r2_audit
 import analyze_gatekeeper_r2_policy_autopsy as policy_autopsy
 import analyze_gatekeeper_buy_false_positive_separation as buy_fp_separation
 import analyze_gatekeeper_buy_quality_candidate as buy_quality_candidate
+import ci_assert_gatekeeper_buy_quality_candidate_fresh_validation as buy_quality_fresh_gate
 import build_gatekeeper_policy_redesign_candidates as policy_redesign_candidates
 import build_gatekeeper_edge_policy_fork as gatekeeper_edge_policy_fork
 import ci_assert_gatekeeper_edge_policy_fork as edge_policy_fork_gate
@@ -9413,6 +9414,210 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertFalse(report["claim_boundaries"]["changes_runtime"])
         self.assertFalse(report["claim_boundaries"]["changes_execution"])
         self.assertFalse(report["claim_boundaries"]["thresholds_tuned"])
+
+    def buy_quality_candidate_fresh_gate_fixture(
+        self,
+        *,
+        train_scope: str = "r23-discovery",
+        validation_scope: str = "r25-fresh",
+        validation_selected_resolved_rows: int = 120,
+        validation_selected_precision: float = 0.62,
+        validation_base_positive_rate: float = 0.45,
+        validation_current_buy_precision: float = 0.35,
+        buyer_hhi_max: float = buy_quality_candidate.BUYER_HHI_MAX,
+        buy_count_min: int = buy_quality_candidate.BUY_COUNT_MIN,
+    ) -> dict:
+        validation_positive = int(round(validation_selected_resolved_rows * validation_selected_precision))
+        validation_negative = validation_selected_resolved_rows - validation_positive
+        return {
+            "artifact": buy_quality_candidate.ARTIFACT,
+            "status": "BUY_QUALITY_CANDIDATE_READY_FOR_FRESH_VALIDATION",
+            "business_decision": "FREEZE_CANDIDATE_FOR_FRESH_VALIDATION_DO_NOT_CHANGE_RUNTIME",
+            "train_scope": train_scope,
+            "validation_scope": validation_scope,
+            "candidate": {
+                "candidate_id": buy_quality_candidate.CANDIDATE_ID,
+                "candidate_status": "frozen_exploratory_hypothesis",
+                "buyer_hhi_max": buyer_hhi_max,
+                "buy_count_min": buy_count_min,
+                "input_population": "current_gatekeeper_buy_rows",
+                "decision_time_safe": True,
+                "runtime_feasible": True,
+                "threshold_origin": "post_r23_r24_exploratory_screen",
+            },
+            "acceptance": {
+                "min_lift_vs_base_pp": 0.10,
+                "min_train_resolved_rows": 75,
+                "min_validation_resolved_rows": 50,
+            },
+            "matrix": [
+                {
+                    "run": "train",
+                    "scope": train_scope,
+                    "selected_resolved_rows": 120,
+                    "selected_positive_rows": 72,
+                    "selected_negative_rows": 48,
+                    "selected_precision": 0.60,
+                    "base_positive_rate": 0.44,
+                    "current_buy_precision": 0.38,
+                    "selected_lift_vs_base_pp": 0.16,
+                    "selected_lift_vs_current_buy_pp": 0.22,
+                },
+                {
+                    "run": "validation",
+                    "scope": validation_scope,
+                    "selected_resolved_rows": validation_selected_resolved_rows,
+                    "selected_positive_rows": validation_positive,
+                    "selected_negative_rows": validation_negative,
+                    "selected_precision": validation_selected_precision,
+                    "base_positive_rate": validation_base_positive_rate,
+                    "current_buy_precision": validation_current_buy_precision,
+                    "selected_lift_vs_base_pp": validation_selected_precision - validation_base_positive_rate,
+                    "selected_lift_vs_current_buy_pp": validation_selected_precision
+                    - validation_current_buy_precision,
+                },
+            ],
+            "claim_boundaries": {
+                "offline_only": True,
+                "diagnostic_only": True,
+                "changes_runtime": False,
+                "changes_gatekeeper": False,
+                "changes_execution": False,
+                "changes_send_path": False,
+                "thresholds_tuned": False,
+                "production_promotion_allowed": False,
+                "r23_r24_are_final_holdout": False,
+                "requires_fresh_validation": True,
+            },
+            "fail_reasons": [],
+        }
+
+    def write_buy_quality_candidate_fresh_gate_report(
+        self,
+        root: Path,
+        scope: str,
+        **overrides: dict,
+    ) -> Path:
+        report = self.buy_quality_candidate_fresh_gate_fixture(validation_scope=scope, **overrides)
+        path = root / "reports" / "selector" / scope / "gatekeeper_buy_quality_candidate_v1.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(report, sort_keys=True), encoding="utf-8")
+        return path
+
+    def test_buy_quality_fresh_validation_gate_passes_distinct_fresh_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_buy_quality_candidate_fresh_gate_report(root, "r25-fresh")
+            result = buy_quality_fresh_gate.validate(
+                buy_quality_fresh_gate.build_parser().parse_args(
+                    [
+                        "--root",
+                        str(root),
+                        "--scope",
+                        "r25-fresh",
+                        "--discovery-scope",
+                        "r23-discovery",
+                        "--discovery-scope",
+                        "r24-discovery",
+                        "--fresh-validation-scope",
+                        "r25-fresh",
+                    ]
+                )
+            )
+
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(
+            result["business_decision"],
+            "BUY_QUALITY_CANDIDATE_READY_FOR_POLICY_REVIEW_AFTER_FRESH_VALIDATION",
+        )
+        self.assertEqual(result["metrics"]["fresh_selected_resolved_rows"], 120)
+        self.assertFalse(result["non_claims"]["gatekeeper_changed"])
+
+    def test_buy_quality_fresh_validation_gate_fails_low_resolved_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_buy_quality_candidate_fresh_gate_report(
+                root,
+                "r25-fresh",
+                validation_selected_resolved_rows=32,
+                validation_selected_precision=0.62,
+            )
+            result = buy_quality_fresh_gate.validate(
+                buy_quality_fresh_gate.build_parser().parse_args(
+                    [
+                        "--root",
+                        str(root),
+                        "--scope",
+                        "r25-fresh",
+                        "--discovery-scope",
+                        "r23-discovery",
+                        "--fresh-validation-scope",
+                        "r25-fresh",
+                    ]
+                )
+            )
+
+        self.assertEqual(result["status"], "FAIL")
+        self.assertIn(
+            "fresh_selected_resolved_rows_too_low:32<100",
+            result["fail_reasons"],
+        )
+
+    def test_buy_quality_fresh_validation_gate_rejects_discovery_scope_as_fresh(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_buy_quality_candidate_fresh_gate_report(
+                root,
+                "r24-discovery",
+            )
+            result = buy_quality_fresh_gate.validate(
+                buy_quality_fresh_gate.build_parser().parse_args(
+                    [
+                        "--root",
+                        str(root),
+                        "--scope",
+                        "r24-discovery",
+                        "--discovery-scope",
+                        "r23-discovery",
+                        "--discovery-scope",
+                        "r24-discovery",
+                        "--fresh-validation-scope",
+                        "r24-discovery",
+                    ]
+                )
+            )
+
+        self.assertEqual(result["status"], "FAIL")
+        self.assertIn(
+            "fresh_validation_scope_overlaps_discovery_scope:r24-discovery",
+            result["fail_reasons"],
+        )
+
+    def test_buy_quality_fresh_validation_gate_rejects_threshold_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_buy_quality_candidate_fresh_gate_report(
+                root,
+                "r25-fresh",
+                buy_count_min=68,
+            )
+            result = buy_quality_fresh_gate.validate(
+                buy_quality_fresh_gate.build_parser().parse_args(
+                    [
+                        "--root",
+                        str(root),
+                        "--scope",
+                        "r25-fresh",
+                        "--discovery-scope",
+                        "r23-discovery",
+                        "--fresh-validation-scope",
+                        "r25-fresh",
+                    ]
+                )
+            )
+
+        self.assertEqual(result["status"], "FAIL")
+        self.assertIn("unexpected_buy_count_min:68", result["fail_reasons"])
 
     def test_gatekeeper_policy_redesign_finds_offline_r2_edge_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
