@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Ghost Control Panel</title>
-    <link rel="stylesheet" href="css/style.css?v=20260312e">
+    <link rel="stylesheet" href="css/style.css?v=20260609-pet1">
 </head>
 <body>
     <div class="app-shell">
@@ -147,8 +147,29 @@
 
             </div>
         </section>
+
+        <section class="card">
+            <div class="card-head">
+                <h2>Wirtualny Pet</h2>
+            </div>
+            <p class="hint">Wybierz swojego peta i sprawdź podgląd. Ustawienie zapisuje się lokalnie w przeglądarce.</p>
+            <div class="pet-layout">
+                <div class="pet-preview-card">
+                    <div class="pet-avatar-wrap">
+                        <div id="petAvatar" class="pet-avatar pet-theme-auditron" aria-label="Podgląd peta"></div>
+                    </div>
+                    <div class="pet-meta">
+                        <h3 id="petName">Auditron</h3>
+                        <p id="petDescription">Audytor logów z intuicją, która nie przepuszcza miękkich wyjątków.</p>
+                        <p id="petTrait" class="pet-trait">Tryb: verify → change → deploy.</p>
+                    </div>
+                </div>
+
+                <div class="pet-options" id="petOptions"></div>
+            </div>
+        </section>
     </div>
 
-    <script src="js/app.js?v=20260312e"></script>
+    <script src="js/app.js?v=20260609-pet1"></script>
 </body>
 </html>

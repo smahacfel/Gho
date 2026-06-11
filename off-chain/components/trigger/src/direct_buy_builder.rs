@@ -58,22 +58,24 @@ const FEE_PROGRAM_ID: &str = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ";
 pub const TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 pub const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 const ASSOC_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
-const BUYBACK_FEE_RECIPIENTS: [&str; 8] = [
-    "5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD",
-    "9M4giFFMxmFGXtc3feFzRai56WbBqehoSeRE5GK7gf7",
-    "GXPFM2caqTtQYC2cJ5yJRi9VDkpsYZXzYdwYpGnLmtDL",
-    "3BpXnfJaUTiwXnJNe7Ej1rcbzqTTQUvLShZaWazebsVR",
-    "5cjcW9wExnJJiqgLjq7DEG75Pm6JBgE1hNv4B2vHXUW6",
-    "EHAAiTxcdDwQ3U4bU6YcMsQGaekdzLS3B5SmYo46kJtL",
-    "5eHhjP8JaYkz83CWwvGU2uMUXefd3AazWGx4gpcuEEYD",
-    "A7hAgCzFw14fejgCp387JUJRMNyz4j89JKnhtKU8piqW",
+/// Pump.fun breaking fee recipients introduced with the bonding-curve-v2
+/// buy account tail. Source: Pump.fun BREAKING_FEE_RECIPIENT.md.
+pub const BREAKING_FEE_RECIPIENTS: [Pubkey; 8] = [
+    solana_sdk::pubkey!("5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD"),
+    solana_sdk::pubkey!("9M4giFFMxmFGXtc3feFzRai56WbBqehoSeRE5GK7gf7"),
+    solana_sdk::pubkey!("GXPFM2caqTtQYC2cJ5yJRi9VDkpsYZXzYdwYpGnLmtDL"),
+    solana_sdk::pubkey!("3BpXnfJaUTiwXnJNe7Ej1rcbzqTTQUvLShZaWazebsVR"),
+    solana_sdk::pubkey!("5cjcW9wExnJJiqgLjq7DEG75Pm6JBgE1hNv4B2vHXUW6"),
+    solana_sdk::pubkey!("EHAAiTxcdDwQ3U4bU6YcMsQGaekdzLS3B5SmYo46kJtL"),
+    solana_sdk::pubkey!("5eHhjP8JaYkz83CWwvGU2uMUXefd3AazWGx4gpcuEEYD"),
+    solana_sdk::pubkey!("A7hAgCzFw14fejgCp387JUJRMNyz4j89JKnhtKU8piqW"),
 ];
 const BUY_EXACT_SOL_IN_DISCRIMINATOR: [u8; 8] = [0x38, 0xfc, 0x74, 0x08, 0x9e, 0xdf, 0xcd, 0x5f];
 const LEGACY_TRACK_VOLUME_ENABLED: u8 = 1;
 const ROUTED_TRACK_VOLUME_ENABLED: u8 = 1;
 pub const PUMPFUN_BUY_FIXED_ACCOUNT_COUNT: usize = 16;
-// Current legacy Pump.fun BUY compatibility path passes the buyback recipient
-// and its associated quote account as observed remaining accounts.
+// Current Pump.fun legacy-bonding-curve BUY compatibility path appends the
+// protocol-defined BCV2 tail: bonding_curve_v2 plus a breaking fee recipient.
 pub const PUMPFUN_BUYBACK_REMAINING_ACCOUNT_COUNT: usize = 2;
 const FEE_SEED_CONST: [u8; 32] = [
     1, 86, 224, 246, 147, 102, 90, 207, 68, 219, 21, 104, 191, 23, 91, 170, 81, 137, 203, 151, 245,
@@ -83,9 +85,8 @@ const FEE_SEED_CONST: [u8; 32] = [
 /// Legacy Pump.fun `buy` discriminator (`global:buy`).
 ///
 /// Current shadow-burnin legacy restore keeps the legacy discriminator and
-/// token-amount payload order, but mainnet buys require a buyback-fee
-/// recipient tail. Do not infer routed BCV2 requirements from the
-/// discriminator alone.
+/// token-amount payload order, but mainnet buys require the protocol BCV2
+/// tail: bonding_curve_v2 plus a breaking fee recipient.
 const LEGACY_BUY_DISCRIMINATOR: [u8; 8] = [0x66, 0x06, 0x3d, 0x12, 0x01, 0xda, 0xeb, 0xea];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +101,51 @@ impl PumpfunBuyVariant {
             Self::LegacyBuy => "legacy_buy",
             Self::RoutedExactSolIn => "routed_exact_sol_in",
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BreakingFeeRecipientStrategy {
+    FirstStatic,
+}
+
+/// Resolves the deterministic two-account tail required by Pump.fun
+/// legacy-bonding-curve buys after the bonding-curve-v2 account upgrade.
+///
+/// This resolver is protocol-schema based. It does not depend on observed
+/// prior manifests, cache hits, RPC, or Program Stream evidence.
+pub struct LegacyBondingCurveTailResolver;
+
+impl LegacyBondingCurveTailResolver {
+    pub fn breaking_fee_recipient(strategy: BreakingFeeRecipientStrategy) -> Pubkey {
+        match strategy {
+            BreakingFeeRecipientStrategy::FirstStatic => BREAKING_FEE_RECIPIENTS[0],
+        }
+    }
+
+    pub fn first_static_breaking_fee_recipient() -> Pubkey {
+        Self::breaking_fee_recipient(BreakingFeeRecipientStrategy::FirstStatic)
+    }
+
+    pub fn resolve_pubkeys(
+        mint: &Pubkey,
+        strategy: BreakingFeeRecipientStrategy,
+    ) -> [Pubkey; PUMPFUN_BUYBACK_REMAINING_ACCOUNT_COUNT] {
+        [
+            DirectBuyBuilder::derive_bonding_curve_v2(mint).0,
+            Self::breaking_fee_recipient(strategy),
+        ]
+    }
+
+    pub fn resolve_account_metas(
+        mint: &Pubkey,
+        strategy: BreakingFeeRecipientStrategy,
+    ) -> [AccountMeta; PUMPFUN_BUYBACK_REMAINING_ACCOUNT_COUNT] {
+        let [bonding_curve_v2, breaking_fee_recipient] = Self::resolve_pubkeys(mint, strategy);
+        [
+            AccountMeta::new_readonly(bonding_curve_v2, false),
+            AccountMeta::new(breaking_fee_recipient, false),
+        ]
     }
 }
 
@@ -142,8 +188,8 @@ impl DirectBuyBuilder {
     pub fn routed_buyback_fee_recipient(payer: &Pubkey, mint: &Pubkey) -> Pubkey {
         let payer_bytes = payer.to_bytes();
         let mint_bytes = mint.to_bytes();
-        let index = usize::from(payer_bytes[0] ^ mint_bytes[0]) % BUYBACK_FEE_RECIPIENTS.len();
-        Pubkey::from_str(BUYBACK_FEE_RECIPIENTS[index]).expect("Invalid BUYBACK_FEE_RECIPIENT")
+        let index = usize::from(payer_bytes[0] ^ mint_bytes[0]) % BREAKING_FEE_RECIPIENTS.len();
+        BREAKING_FEE_RECIPIENTS[index]
     }
 
     /// Builds the routed Pump.fun `buy_exact_sol_in` instruction used by live
@@ -367,9 +413,9 @@ impl DirectBuyBuilder {
             }
         };
 
-        // Build account metas. Current pump.fun legacy buys require the
-        // buyback-fee recipient as the first trailing account, while BCV2 is
-        // only part of the routed exact-sol-in layout.
+        // Build account metas. Current pump.fun legacy buys and routed
+        // exact-sol-in buys both use the 16 named accounts plus the
+        // bonding-curve-v2 tail.
         let mut accounts = vec![
             AccountMeta::new_readonly(global, false), // 0: global state
             AccountMeta::new(fee_recipient, false),   // 1: fee recipient
@@ -391,11 +437,11 @@ impl DirectBuyBuilder {
         accounts.push(AccountMeta::new_readonly(fee_program, false)); // 15
         match buy_variant {
             PumpfunBuyVariant::LegacyBuy => {
-                accounts.extend(
-                    buy_remaining_accounts
-                        .iter()
-                        .map(|pubkey| AccountMeta::new(*pubkey, false)),
-                );
+                let _observed_tail_for_diagnostics = buy_remaining_accounts;
+                accounts.extend(LegacyBondingCurveTailResolver::resolve_account_metas(
+                    mint,
+                    BreakingFeeRecipientStrategy::FirstStatic,
+                ));
             }
             PumpfunBuyVariant::RoutedExactSolIn => {
                 accounts.push(AccountMeta::new_readonly(bonding_curve_v2, false)); // 16
@@ -679,7 +725,10 @@ mod tests {
         );
 
         assert_eq!(&ix.data[0..8], &LEGACY_BUY_DISCRIMINATOR);
-        assert_eq!(ix.accounts.len(), PUMPFUN_BUY_FIXED_ACCOUNT_COUNT);
+        assert_eq!(
+            ix.accounts.len(),
+            PUMPFUN_BUY_FIXED_ACCOUNT_COUNT + PUMPFUN_BUYBACK_REMAINING_ACCOUNT_COUNT
+        );
         assert_eq!(
             ix.accounts[9].pubkey,
             Pubkey::find_program_address(
@@ -702,7 +751,19 @@ mod tests {
             DirectBuyBuilder::derive_user_volume_accumulator(&payer).0
         );
         assert_eq!(ix.accounts[15].pubkey, DirectBuyBuilder::fee_program_id());
-        assert_eq!(ix.accounts.len(), PUMPFUN_BUY_FIXED_ACCOUNT_COUNT);
+        assert_eq!(
+            ix.accounts[16].pubkey,
+            DirectBuyBuilder::derive_bonding_curve_v2(&mint).0
+        );
+        assert!(!ix.accounts[16].is_writable);
+        assert!(!ix.accounts[16].is_signer);
+        assert_eq!(
+            ix.accounts[17].pubkey,
+            LegacyBondingCurveTailResolver::first_static_breaking_fee_recipient()
+        );
+        assert!(BREAKING_FEE_RECIPIENTS.contains(&ix.accounts[17].pubkey));
+        assert!(ix.accounts[17].is_writable);
+        assert!(!ix.accounts[17].is_signer);
         assert_eq!(
             u64::from_le_bytes(ix.data[8..16].try_into().unwrap()),
             1_024_500_538_013
@@ -745,13 +806,10 @@ mod tests {
     }
 
     #[test]
-    fn legacy_buy_final_manifest_uses_buyback_tail_without_bcv2() {
+    fn legacy_buy_final_manifest_uses_protocol_bcv2_tail_without_prior_manifest() {
         let payer = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
         let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).expect("valid token program");
-        let remaining = (0..PUMPFUN_BUYBACK_REMAINING_ACCOUNT_COUNT)
-            .map(|_| Pubkey::new_unique())
-            .collect::<Vec<_>>();
 
         let ix = DirectBuyBuilder::build_buy_ix_with_accounts_and_remaining(
             &payer,
@@ -763,7 +821,7 @@ mod tests {
             Some(PumpfunBuyVariant::LegacyBuy),
             None,
             None,
-            &remaining,
+            &[],
             2_000_000,
             42,
         );
@@ -775,12 +833,38 @@ mod tests {
             ix.accounts.len(),
             PUMPFUN_BUY_FIXED_ACCOUNT_COUNT + PUMPFUN_BUYBACK_REMAINING_ACCOUNT_COUNT
         );
-        assert_eq!(ix.accounts[16].pubkey, remaining[0]);
-        assert_eq!(ix.accounts[17].pubkey, remaining[1]);
-        assert!(!ix
-            .accounts
-            .iter()
-            .any(|meta| meta.pubkey == DirectBuyBuilder::derive_bonding_curve_v2(&mint).0));
+        assert_eq!(
+            ix.accounts[16].pubkey,
+            DirectBuyBuilder::derive_bonding_curve_v2(&mint).0
+        );
+        assert_eq!(
+            ix.accounts[17].pubkey,
+            LegacyBondingCurveTailResolver::first_static_breaking_fee_recipient()
+        );
+    }
+
+    #[test]
+    fn legacy_bonding_curve_tail_resolver_derives_protocol_tail_without_manifest() {
+        let mint = Pubkey::new_unique();
+        let tail = LegacyBondingCurveTailResolver::resolve_account_metas(
+            &mint,
+            BreakingFeeRecipientStrategy::FirstStatic,
+        );
+
+        assert_eq!(
+            tail[0].pubkey,
+            Pubkey::find_program_address(
+                &[BONDING_CURVE_V2_SEED, mint.as_ref()],
+                &DirectBuyBuilder::pump_program_id(),
+            )
+            .0
+        );
+        assert!(!tail[0].is_writable);
+        assert!(!tail[0].is_signer);
+        assert!(BREAKING_FEE_RECIPIENTS.contains(&tail[1].pubkey));
+        assert_eq!(tail[1].pubkey, BREAKING_FEE_RECIPIENTS[0]);
+        assert!(tail[1].is_writable);
+        assert!(!tail[1].is_signer);
     }
 
     #[test]
@@ -812,7 +896,7 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_buy_accounts_match_shadow_burnin_buyback_layout() {
+    fn test_legacy_buy_accounts_match_protocol_bcv2_tail_layout() {
         let payer =
             Pubkey::from_str("CMFqYV58y9wk5CwRm7vf8gfeD8yRMxFn2kgv49zHdbkK").expect("valid payer");
         let mint =
@@ -849,14 +933,11 @@ mod tests {
         .map(str::to_string)
         .collect::<Vec<_>>();
         expected_accounts.extend([
-            "2gy2YHVJ3fEMh7V5y67YEV45xAJRwo4YDzKmxD3N7YnD".to_string(),
-            "HVwQxmzK2Qf6ZKu1SksTZTtFrNKr4j2MTA27v9VKuEAD".to_string(),
+            DirectBuyBuilder::derive_bonding_curve_v2(&mint)
+                .0
+                .to_string(),
+            LegacyBondingCurveTailResolver::first_static_breaking_fee_recipient().to_string(),
         ]);
-        let remaining = expected_accounts
-            .iter()
-            .skip(PUMPFUN_BUY_FIXED_ACCOUNT_COUNT)
-            .map(|value| Pubkey::from_str(value).expect("valid remaining account"))
-            .collect::<Vec<_>>();
 
         let ix = DirectBuyBuilder::build_buy_ix_with_accounts_and_remaining(
             &payer,
@@ -868,7 +949,7 @@ mod tests {
             Some(PumpfunBuyVariant::LegacyBuy),
             Some(associated_bonding_curve),
             None,
-            &remaining,
+            &[],
             422,
             9_000_000,
         );

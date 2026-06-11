@@ -921,7 +921,26 @@ fn shadow_fsc_v2_policy_counterfactual(
         };
     }
 
-    let Some(fsc_value) = evidence.hhi_norm_count else {
+    if evidence.excluded_reason.is_some() {
+        return ShadowFscV2PolicyCounterfactual {
+            policy_signal: Some(false),
+            soft_points_if_enabled: Some(0),
+            reason_if_enabled: Some(format!(
+                "FSC_V2_SHADOW_EXCLUDED:{:?}",
+                evidence.excluded_reason
+            )),
+        };
+    }
+
+    if config.fsc_require_coverage_window_for_actionability && !evidence.authoritative_buy_ready {
+        return ShadowFscV2PolicyCounterfactual {
+            policy_signal: Some(false),
+            soft_points_if_enabled: Some(0),
+            reason_if_enabled: Some("FSC_V2_SHADOW_COVERAGE_WINDOW_UNAVAILABLE".to_string()),
+        };
+    }
+
+    let Some(fsc_value) = evidence.scoring_hhi_non_neutral else {
         return ShadowFscV2PolicyCounterfactual {
             policy_signal: Some(false),
             soft_points_if_enabled: Some(0),
@@ -13853,6 +13872,10 @@ mod tests {
             fingerprint_reason: Some("TEST_REASON".into()),
         };
         let mut feature_snapshot = MaterializedFeatureSet::default();
+        let mut fsc_v2 = clean_fsc_v2_evidence(0.52);
+        fsc_v2.coverage_window_ready = true;
+        fsc_v2.authoritative_buy_ready = true;
+
         feature_snapshot.sybil_resistance = ghost_core::checkpoint::SybilResistanceFeatures {
             fee_topology_diversity_index: Some(0.42),
             dev_buyer_infrastructure_affinity: Some(0.19),
@@ -13883,7 +13906,11 @@ mod tests {
                     ..Default::default()
                 },
             ),
-            funding_source_v2: None,
+            funding_source_v2: Some(fsc_v2),
+            cpv_distinct_other_pools_mean: None,
+            cpv_other_pool_activity_count_p95: None,
+            toolchain_fingerprint_coverage: None,
+            des_valid_sequence_coverage: None,
             degraded_reasons: vec!["FTDI_INSUFFICIENT_BUYS".to_string()],
             buy_sample_count: 5,
             signer_sample_count: 5,
@@ -13990,6 +14017,13 @@ mod tests {
         assert_eq!(buy_log.funding_source_concentration, Some(0.52));
         assert_eq!(buy_log.max_funding_source_concentration, 1.0);
         assert!(buy_log.funding_source_diagnostics.is_some());
+        let fsc_v2 = buy_log
+            .funding_source_v2
+            .as_ref()
+            .expect("FSC v2 evidence should be mirrored into buy log");
+        assert!(fsc_v2.coverage_window_ready);
+        assert_eq!(fsc_v2.coverage_window_remaining_ms, 0);
+        assert!(fsc_v2.authoritative_buy_ready);
         let fsc_diagnostics = buy_log.funding_source_diagnostics.as_ref().unwrap();
         assert_eq!(fsc_diagnostics.buyer_sample_count, 5);
         assert_eq!(fsc_diagnostics.known_source_count, 2);
@@ -14024,9 +14058,29 @@ mod tests {
         assert!(json.contains("\"demand_elasticity_score\":-0.25"));
         assert!(json.contains("\"signer_cross_pool_velocity\":0.44"));
         assert!(json.contains("\"funding_source_concentration\":0.52"));
+        assert!(json.contains("\"funding_source_v2\""));
+        assert!(json.contains("\"coverage_window_ready\":true"));
+        assert!(json.contains("\"authoritative_buy_ready\":true"));
         assert!(json.contains("\"funding_source_diagnostics\""));
         assert!(json.contains("\"FSC_GLOBAL_RECIPIENT_EVICTED\""));
         assert!(json.contains("\"sybil_metric_degraded_reasons\":[\"FTDI_INSUFFICIENT_BUYS\"]"));
+        let mut legacy_json: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let legacy_fsc_v2 = legacy_json
+            .get_mut("funding_source_v2")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("funding_source_v2 should serialize as object");
+        legacy_fsc_v2.remove("coverage_window_ready");
+        legacy_fsc_v2.remove("coverage_window_remaining_ms");
+        legacy_fsc_v2.remove("authoritative_buy_ready");
+        let legacy_roundtrip: ghost_brain::oracle::GatekeeperBuyLog =
+            serde_json::from_value(legacy_json).unwrap();
+        let legacy_fsc_v2 = legacy_roundtrip
+            .funding_source_v2
+            .as_ref()
+            .expect("legacy FSC v2 should still deserialize");
+        assert!(!legacy_fsc_v2.coverage_window_ready);
+        assert_eq!(legacy_fsc_v2.coverage_window_remaining_ms, 0);
+        assert!(!legacy_fsc_v2.authoritative_buy_ready);
 
         let summary = assessment.fingerprint_summary("pool_1", "mint_1");
         assert!(summary.contains("FINGERPRINT pool=pool_1 mint=mint_1"));
@@ -14090,6 +14144,9 @@ mod tests {
             funding_lane_watermark_slot: Some(10),
             max_buy_slot: Some(11),
             funding_lane_lag_slots: Some(0),
+            coverage_window_ready: false,
+            coverage_window_remaining_ms: 0,
+            authoritative_buy_ready: false,
             stream_epoch: 1,
             gap_suspected: false,
             last_transfer_recv_ts_ms: Some(1_000),
@@ -14107,6 +14164,13 @@ mod tests {
         }
     }
 
+    fn authoritative_fsc_v2_evidence(hhi_norm_count: f64) -> FscV2Evidence {
+        let mut evidence = clean_fsc_v2_evidence(hhi_norm_count);
+        evidence.coverage_window_ready = true;
+        evidence.authoritative_buy_ready = true;
+        evidence
+    }
+
     #[test]
     fn fsc_v2_shadow_policy_counterfactual_reports_without_policy_drift() {
         let mut config = GatekeeperV2Config {
@@ -14117,7 +14181,17 @@ mod tests {
             ..GatekeeperV2Config::default()
         };
 
-        let high_fsc = clean_fsc_v2_evidence(0.90);
+        let high_fsc_not_ready = clean_fsc_v2_evidence(0.90);
+        let not_ready_counterfactual =
+            shadow_fsc_v2_policy_counterfactual(Some(&high_fsc_not_ready), Some(0.70), &config);
+        assert_eq!(not_ready_counterfactual.policy_signal, Some(false));
+        assert_eq!(not_ready_counterfactual.soft_points_if_enabled, Some(0));
+        assert_eq!(
+            not_ready_counterfactual.reason_if_enabled.as_deref(),
+            Some("FSC_V2_SHADOW_COVERAGE_WINDOW_UNAVAILABLE")
+        );
+
+        let high_fsc = authoritative_fsc_v2_evidence(0.90);
         let counterfactual =
             shadow_fsc_v2_policy_counterfactual(Some(&high_fsc), Some(0.70), &config);
         assert_eq!(counterfactual.policy_signal, Some(true));
@@ -14134,7 +14208,7 @@ mod tests {
         assert_eq!(zero_weight_counterfactual.policy_signal, Some(true));
         assert_eq!(zero_weight_counterfactual.soft_points_if_enabled, Some(0));
 
-        let below_threshold = clean_fsc_v2_evidence(0.20);
+        let below_threshold = authoritative_fsc_v2_evidence(0.20);
         let below =
             shadow_fsc_v2_policy_counterfactual(Some(&below_threshold), Some(0.70), &config);
         assert_eq!(below.policy_signal, Some(false));
@@ -14144,7 +14218,17 @@ mod tests {
             Some("FSC_V2_SHADOW_BELOW_THRESHOLD")
         );
 
-        let mut eventual = clean_fsc_v2_evidence(0.90);
+        let mut legacy_count_high = authoritative_fsc_v2_evidence(0.20);
+        legacy_count_high.hhi_norm_count = Some(0.95);
+        let legacy_count_ignored =
+            shadow_fsc_v2_policy_counterfactual(Some(&legacy_count_high), Some(0.70), &config);
+        assert_eq!(legacy_count_ignored.policy_signal, Some(false));
+        assert_eq!(
+            legacy_count_ignored.reason_if_enabled.as_deref(),
+            Some("FSC_V2_SHADOW_BELOW_THRESHOLD")
+        );
+
+        let mut eventual = authoritative_fsc_v2_evidence(0.90);
         eventual.snapshot_mode = FscSnapshotMode::EventualPostfill;
         let eventual_counterfactual =
             shadow_fsc_v2_policy_counterfactual(Some(&eventual), Some(0.70), &config);

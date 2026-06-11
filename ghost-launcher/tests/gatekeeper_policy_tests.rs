@@ -10,7 +10,9 @@ use ghost_core::checkpoint::{
 use ghost_core::session::types::{SessionId, SessionMetadata};
 use ghost_core::tx_intelligence::types::TxIntelFeatures;
 use ghost_core::tx_intelligence::types::{
-    CPV_ROLLING_STATE_UNAVAILABLE_REASON, FTDI_INSUFFICIENT_BUYS_REASON,
+    FscAttributionScope, FscEvidenceStatus, FscExcludedReason, FscSnapshotMode, FscV2Evidence,
+    FscVersion, FundingSourceKey, CPV_ROLLING_STATE_UNAVAILABLE_REASON,
+    FSC_COVERAGE_WINDOW_UNAVAILABLE, FSC_V2_STATUS_NOT_CLEAN, FTDI_INSUFFICIENT_BUYS_REASON,
     SFD_PARTIAL_BALANCE_COVERAGE_REASON,
 };
 use ghost_core::{CurveFinality, CurveFreshnessState, EventSemanticEnvelope};
@@ -323,6 +325,69 @@ fn evaluate(
     evaluate_policy(&features, config)
 }
 
+fn fsc_v2_policy_fixture(
+    status: FscEvidenceStatus,
+    excluded_reason: Option<FscExcludedReason>,
+    snapshot_mode: FscSnapshotMode,
+    scoring_hhi_non_neutral: Option<f64>,
+    authoritative_buy_ready: bool,
+) -> FscV2Evidence {
+    FscV2Evidence {
+        version: FscVersion::V2,
+        attribution_scope: FscAttributionScope::SingleHopNativeSol,
+        snapshot_mode,
+        total_buyers: 4,
+        known_buyers: 4,
+        known_non_neutral_buyers: 4,
+        unknown_count: 0,
+        neutral_count: 0,
+        low_confidence_count: 0,
+        same_slot_unorderable_count: 0,
+        known_coverage: 1.0,
+        non_neutral_known_coverage: 1.0,
+        neutral_share: 0.0,
+        top1_share_count: scoring_hhi_non_neutral,
+        top1_share_sol: scoring_hhi_non_neutral,
+        hhi_norm_count: scoring_hhi_non_neutral,
+        hhi_norm_sol_weighted_excess: scoring_hhi_non_neutral,
+        raw_hhi_including_neutral: scoring_hhi_non_neutral,
+        scoring_hhi_non_neutral,
+        top_funder: Some(FundingSourceKey::new("source")),
+        top_funder_count: 4,
+        top_funder_buy_sol: 4.0,
+        source_counts: vec![],
+        attribution_confidence_mean: Some(1.0),
+        attribution_confidence_min: Some(1.0),
+        dust_filtered_count: 0,
+        post_buy_filtered_count: 0,
+        rel_too_small_count: 0,
+        index_warm: true,
+        capture_ready: true,
+        status,
+        excluded_reason,
+        funding_lane_watermark_slot: Some(10),
+        max_buy_slot: Some(10),
+        funding_lane_lag_slots: Some(0),
+        coverage_window_ready: authoritative_buy_ready,
+        coverage_window_remaining_ms: if authoritative_buy_ready { 0 } else { 1_000 },
+        authoritative_buy_ready,
+        stream_epoch: 1,
+        gap_suspected: false,
+        last_transfer_recv_ts_ms: Some(1_000),
+        last_reconnect_ts_ms: None,
+        dropped_events: 0,
+        min_abs_store_lamports: 10_000_000,
+        min_abs_attribution_lamports: 10_000_000,
+        min_rel_to_buy: 0.2,
+        ttl_seconds: 300,
+        neutral_funder_set_version: Some("neutral_funders_v1".to_string()),
+        neutral_funder_set_hash: Some("hash".to_string()),
+        config_hash: "config_hash".to_string(),
+        provider: "NLN".to_string(),
+        source_topics: vec!["prod.rpc.solana.system.transfers".to_string()],
+    }
+}
+
 #[test]
 fn neutral_sybil_defaults_preserve_buy_and_reject_verdicts() {
     let config = policy_test_config();
@@ -356,6 +421,10 @@ fn neutral_sybil_defaults_preserve_buy_and_reject_verdicts() {
         funding_source_concentration: Some(1.0),
         funding_source_diagnostics: None,
         funding_source_v2: None,
+        cpv_distinct_other_pools_mean: None,
+        cpv_other_pool_activity_count_p95: None,
+        toolchain_fingerprint_coverage: None,
+        des_valid_sequence_coverage: None,
         degraded_reasons: vec!["FTDI_INSUFFICIENT_BUYS".to_string()],
         buy_sample_count: 24,
         signer_sample_count: 18,
@@ -419,11 +488,10 @@ fn high_dbia_with_high_ftdi_does_not_change_policy_verdict() {
     let evaluated = evaluate(features, &config);
     assert_eq!(baseline.verdict_buy, evaluated.verdict_buy);
     assert_eq!(baseline.reason_chain, evaluated.reason_chain);
-    assert_eq!(evaluated.sybil_policy.soft_points, 7);
-    assert_eq!(
-        evaluated.sybil_policy.lead_signal,
-        Some(SybilLeadSignal::HighDbia)
-    );
+    assert!(evaluated.sybil_policy.soft_signals.high_dbia);
+    assert!(!evaluated.sybil_policy.soft_signals.low_ftdi);
+    assert_eq!(evaluated.sybil_policy.soft_points, 0);
+    assert_eq!(evaluated.sybil_policy.lead_signal, None);
     assert!(!evaluated
         .sybil_policy
         .interference_patterns
@@ -513,6 +581,49 @@ fn sybil_combo_veto_requires_sybil_layer_enable() {
 }
 
 #[test]
+fn low_ftdi_without_high_dbia_cannot_generate_sybil_interference_reject() {
+    let mut config = policy_test_config();
+    config.min_fee_topology_diversity_index = 0.25;
+    config.max_dev_buyer_infrastructure_affinity = 0.60;
+    config.min_spend_fraction_divergence = 0.08;
+    config.min_demand_elasticity_score = 0.15;
+    config.soft_penalty_low_ftdi = 1;
+    config.soft_penalty_low_sfd = 2;
+    config.soft_penalty_inelastic_demand = 3;
+    config.soft_penalty_low_des_low_sfd_combo = 2;
+    config.enable_sybil_interference_layer = true;
+    config.enable_sybil_combo_veto = true;
+    config.max_sybil_soft_points = 255;
+    config.dev_unknown_max_sybil_soft_points = 255;
+
+    let mut features = base_feature_set();
+    features.sybil_resistance = SybilResistanceFeatures {
+        fee_topology_diversity_index: Some(0.01),
+        dev_buyer_infrastructure_affinity: Some(0.10),
+        spend_fraction_divergence: Some(0.01),
+        demand_elasticity_score: Some(-0.20),
+        degraded_reasons: vec![],
+        buy_sample_count: 24,
+        signer_sample_count: 18,
+        ..SybilResistanceFeatures::default()
+    };
+
+    let decision = evaluate(features, &config);
+    assert!(decision.sybil_policy.soft_signals.low_ftdi);
+    assert!(!decision.sybil_policy.soft_signals.high_dbia);
+    assert!(decision.sybil_policy.soft_signals.low_sfd);
+    assert!(decision.sybil_policy.soft_signals.low_des);
+    assert!(decision.verdict_buy);
+    assert_ne!(
+        decision.verdict_type,
+        GatekeeperVerdictType::RejectSybilInterference
+    );
+    assert!(!decision
+        .reason_chain
+        .contains("SYBIL_INTERFERENCE: pattern=LOW_DES_LOW_SFD_STRUCTURAL_SUPPORT"));
+}
+
+#[test]
 fn degraded_sybil_metrics_do_not_score_even_with_active_penalties() {
     let mut config = policy_test_config();
     config.min_fee_topology_diversity_index = 0.25;
@@ -540,6 +651,184 @@ fn degraded_sybil_metrics_do_not_score_even_with_active_penalties() {
     assert_eq!(decision.sybil_policy.soft_points, 0);
     assert_eq!(decision.sybil_policy.soft_signals.format_flags(), "none");
     assert_eq!(decision.sybil_policy.lead_signal, None);
+}
+
+#[test]
+fn degraded_fsc_v2_does_not_score_even_with_high_legacy_concentration() {
+    let mut config = policy_test_config();
+    config.max_funding_source_concentration = 0.70;
+    config.soft_penalty_high_fsc = 4;
+    config.enable_sybil_interference_layer = true;
+    config.max_sybil_soft_points = 1;
+
+    let mut features = base_feature_set();
+    features.sybil_resistance = SybilResistanceFeatures {
+        funding_source_concentration: Some(0.95),
+        funding_source_v2: Some(fsc_v2_policy_fixture(
+            FscEvidenceStatus::Degraded,
+            Some(FscExcludedReason::LowCoverage),
+            FscSnapshotMode::DecisionTime,
+            Some(0.95),
+            true,
+        )),
+        buy_sample_count: 24,
+        signer_sample_count: 18,
+        ..SybilResistanceFeatures::default()
+    };
+
+    let decision = evaluate(features, &config);
+    assert!(decision.verdict_buy);
+    assert!(!decision.sybil_policy.soft_signals.high_fsc);
+    assert_eq!(decision.sybil_policy.soft_points, 0);
+    assert_eq!(decision.sybil_policy.lead_signal, None);
+    assert!(decision.sybil_policy.interference_patterns.is_empty());
+    assert!(decision
+        .sybil_policy
+        .metric_degraded_reasons
+        .iter()
+        .any(|reason| reason == FSC_V2_STATUS_NOT_CLEAN));
+}
+
+#[test]
+fn clean_ready_fsc_v2_can_score_high_fsc_from_legacy_concentration() {
+    let mut config = policy_test_config();
+    config.max_funding_source_concentration = 0.70;
+    config.soft_penalty_high_fsc = 4;
+    config.enable_sybil_interference_layer = true;
+    config.max_sybil_soft_points = 255;
+
+    let mut features = base_feature_set();
+    features.sybil_resistance = SybilResistanceFeatures {
+        funding_source_concentration: Some(0.95),
+        funding_source_v2: Some(fsc_v2_policy_fixture(
+            FscEvidenceStatus::Clean,
+            None,
+            FscSnapshotMode::DecisionTime,
+            Some(0.95),
+            true,
+        )),
+        buy_sample_count: 24,
+        signer_sample_count: 18,
+        ..SybilResistanceFeatures::default()
+    };
+
+    let decision = evaluate(features, &config);
+    assert!(decision.verdict_buy);
+    assert!(decision.sybil_policy.soft_signals.high_fsc);
+    assert_eq!(decision.sybil_policy.soft_points, 4);
+    assert_eq!(
+        decision.sybil_policy.lead_signal,
+        Some(SybilLeadSignal::HighFsc)
+    );
+}
+
+#[test]
+fn eventual_postfill_fsc_v2_is_not_actionable() {
+    let mut config = policy_test_config();
+    config.max_funding_source_concentration = 0.70;
+    config.soft_penalty_high_fsc = 4;
+    config.enable_sybil_interference_layer = true;
+    config.max_sybil_soft_points = 1;
+
+    let mut features = base_feature_set();
+    features.sybil_resistance = SybilResistanceFeatures {
+        funding_source_concentration: Some(0.95),
+        funding_source_v2: Some(fsc_v2_policy_fixture(
+            FscEvidenceStatus::Clean,
+            None,
+            FscSnapshotMode::EventualPostfill,
+            Some(0.95),
+            true,
+        )),
+        buy_sample_count: 24,
+        signer_sample_count: 18,
+        ..SybilResistanceFeatures::default()
+    };
+
+    let decision = evaluate(features, &config);
+    assert!(decision.verdict_buy);
+    assert!(!decision.sybil_policy.soft_signals.high_fsc);
+    assert_eq!(decision.sybil_policy.soft_points, 0);
+    assert_eq!(decision.sybil_policy.lead_signal, None);
+}
+
+#[test]
+fn clean_fsc_v2_without_authoritative_coverage_is_not_actionable() {
+    let mut config = policy_test_config();
+    config.max_funding_source_concentration = 0.70;
+    config.soft_penalty_high_fsc = 4;
+    config.enable_sybil_interference_layer = true;
+    config.max_sybil_soft_points = 1;
+
+    let mut features = base_feature_set();
+    features.sybil_resistance = SybilResistanceFeatures {
+        funding_source_concentration: Some(0.95),
+        funding_source_v2: Some(fsc_v2_policy_fixture(
+            FscEvidenceStatus::Clean,
+            None,
+            FscSnapshotMode::DecisionTime,
+            Some(0.95),
+            false,
+        )),
+        buy_sample_count: 24,
+        signer_sample_count: 18,
+        ..SybilResistanceFeatures::default()
+    };
+
+    let decision = evaluate(features, &config);
+    assert!(decision.verdict_buy);
+    assert!(!decision.sybil_policy.soft_signals.high_fsc);
+    assert_eq!(decision.sybil_policy.soft_points, 0);
+    assert!(decision
+        .sybil_policy
+        .metric_degraded_reasons
+        .iter()
+        .any(|reason| reason == FSC_COVERAGE_WINDOW_UNAVAILABLE));
+}
+
+#[test]
+fn degraded_fsc_v2_is_not_actionable_even_when_clean_config_disabled() {
+    let mut config = policy_test_config();
+    config.enable_sybil_interference_layer = true;
+    config.enable_sybil_combo_veto = true;
+    config.require_ready_fsc_for_combo_veto = true;
+    config.fsc_require_clean_v2_for_actionability = false;
+    config.max_funding_source_concentration = 0.70;
+    config.max_signer_cross_pool_velocity = 0.50;
+    config.min_demand_elasticity_score = 0.15;
+
+    let mut features = base_feature_set();
+    features.sybil_resistance = SybilResistanceFeatures {
+        funding_source_concentration: Some(0.95),
+        funding_source_v2: Some(fsc_v2_policy_fixture(
+            FscEvidenceStatus::Degraded,
+            Some(FscExcludedReason::LowCoverage),
+            FscSnapshotMode::DecisionTime,
+            Some(0.95),
+            true,
+        )),
+        signer_cross_pool_velocity: Some(0.95),
+        demand_elasticity_score: Some(-0.20),
+        buy_sample_count: 24,
+        signer_sample_count: 18,
+        ..SybilResistanceFeatures::default()
+    };
+
+    let decision = evaluate(features, &config);
+    assert!(decision.verdict_buy);
+    assert_eq!(decision.verdict_type, GatekeeperVerdictType::Buy);
+    assert!(!decision.sybil_policy.soft_signals.high_fsc);
+    assert!(decision.sybil_policy.soft_signals.high_cpv);
+    assert!(decision.sybil_policy.soft_signals.low_des);
+    assert!(!decision
+        .sybil_policy
+        .interference_patterns
+        .contains(&SybilInterferencePattern::HighFscHighCpvLowDesOrLowSfd));
+    assert!(decision
+        .sybil_policy
+        .metric_degraded_reasons
+        .iter()
+        .any(|reason| reason == FSC_V2_STATUS_NOT_CLEAN));
 }
 
 #[test]
@@ -661,12 +950,11 @@ fn stage_b_config_distinguishes_high_dbia_low_ftdi_from_high_dbia_high_ftdi() {
 
     assert!(high_ftdi.verdict_buy);
     assert!(low_ftdi.verdict_buy);
-    assert_eq!(high_ftdi.sybil_policy.soft_points, 1);
+    assert_eq!(high_ftdi.sybil_policy.soft_points, 0);
     assert_eq!(low_ftdi.sybil_policy.soft_points, 4);
-    assert_eq!(
-        high_ftdi.sybil_policy.lead_signal,
-        Some(SybilLeadSignal::HighDbia)
-    );
+    assert!(high_ftdi.sybil_policy.soft_signals.high_dbia);
+    assert!(!high_ftdi.sybil_policy.soft_signals.low_ftdi);
+    assert_eq!(high_ftdi.sybil_policy.lead_signal, None);
     assert_eq!(
         low_ftdi.sybil_policy.lead_signal,
         Some(SybilLeadSignal::HighDbiaLowFtdi)

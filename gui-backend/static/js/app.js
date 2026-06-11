@@ -33,11 +33,54 @@ const SECTION_LABEL_OVERRIDES = {
     }
 };
 
+const LOCAL_STORAGE_KEYS = {
+    petProfile: "ghost_pet_profile"
+};
+
+const PET_PROFILES = [
+    {
+        id: "auditron",
+        name: "Auditron",
+        emoji: "🛡️🐱",
+        theme: "pet-theme-auditron",
+        description: "Audytor logów z intuicją, która nie przepuszcza miękkich wyjątków.",
+        trait: "Tryb: verify → change → deploy."
+    },
+    {
+        id: "foxrunner",
+        name: "FoxRunner",
+        emoji: "🦊🔥",
+        theme: "pet-theme-foxrunner",
+        description: "Szybki obserwator eventów, który zawsze patrzy, zanim ktokolwiek kliknie START.",
+        trait: "Tryb: szybki, ale z hamulcem.",
+        accent: "#f97316"
+    },
+    {
+        id: "stoic_owl",
+        name: "Stoic Owl",
+        emoji: "🦉📘",
+        theme: "pet-theme-owl",
+        description: "Cichy analityk, który widzi reguły zanim staniesz się nimi sparaliżowany.",
+        trait: "Tryb: ciche logowanie i cierpliwa obserwacja.",
+        accent: "#60a5fa"
+    },
+    {
+        id: "delta_guard",
+        name: "Delta Guard",
+        emoji: "🦾⚙️",
+        theme: "pet-theme-guard",
+        description: "Strażnik granic, który nie przepuszcza domyślnego bezpieczeństwa.",
+        trait: "Tryb: fail-closed, gdy niepewność rośnie.",
+        accent: "#34d399"
+    }
+];
+
 document.addEventListener("DOMContentLoaded", () => {
     setConnectionChip(false);
     bindActions();
     bindTabs();
     bindAppearance();
+    bindPetSelector();
     restoreAppearance();
     refreshAll();
     setInterval(() => {
@@ -106,6 +149,28 @@ function bindAppearance() {
         };
         reader.readAsDataURL(file);
     });
+}
+
+function bindPetSelector() {
+    const container = document.getElementById("petOptions");
+    if (!container) {
+        return;
+    }
+
+    renderPetOptions(container);
+    container.addEventListener("click", (event) => {
+        const button = event.target.closest("button[data-pet-id]");
+        if (!button) return;
+
+        const petId = button.dataset.petId;
+        const profile = PET_PROFILES.find((p) => p.id === petId);
+        if (!profile) return;
+
+        applyPetProfile(profile);
+        localStorage.setItem(LOCAL_STORAGE_KEYS.petProfile, petId);
+    });
+
+    restorePetProfile();
 }
 
 function restoreAppearance() {
@@ -254,6 +319,67 @@ function setConnectionChip(isConnected) {
     chip.textContent = isConnected ? "Connected" : "Disconnected";
     chip.classList.toggle("is-connected", isConnected);
     chip.classList.toggle("is-disconnected", !isConnected);
+}
+
+function restorePetProfile() {
+    const saved = localStorage.getItem(LOCAL_STORAGE_KEYS.petProfile) || "auditron";
+    const profile = PET_PROFILES.find((p) => p.id === saved) || PET_PROFILES[0];
+    applyPetProfile(profile);
+}
+
+function renderPetOptions(container) {
+    container.innerHTML = "";
+
+    const fragment = document.createDocumentFragment();
+    PET_PROFILES.forEach((profile) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "pet-option btn btn-muted";
+        button.dataset.petId = profile.id;
+
+        const label = document.createElement("span");
+        label.className = "pet-option-label";
+        label.textContent = `${profile.emoji} ${profile.name}`;
+
+        const tag = document.createElement("span");
+        tag.className = "pet-option-trait";
+        tag.textContent = profile.trait;
+
+        button.appendChild(label);
+        button.appendChild(tag);
+        fragment.appendChild(button);
+    });
+
+    container.appendChild(fragment);
+}
+
+function applyPetProfile(profile) {
+    const avatar = document.getElementById("petAvatar");
+    const name = document.getElementById("petName");
+    const description = document.getElementById("petDescription");
+    const trait = document.getElementById("petTrait");
+
+    if (!avatar || !name || !description || !trait) {
+        return;
+    }
+
+    avatar.textContent = profile.emoji;
+    avatar.className = `pet-avatar ${profile.theme}`;
+
+    const allButtons = document.querySelectorAll("#petOptions button");
+    allButtons.forEach((btn) => {
+        btn.classList.toggle("pet-option-active", btn.dataset.petId === profile.id);
+    });
+
+    name.textContent = profile.name;
+    description.textContent = profile.description;
+    trait.textContent = profile.trait;
+
+    if (profile.accent) {
+        avatar.style.borderColor = profile.accent;
+    } else {
+        avatar.style.borderColor = "";
+    }
 }
 
 async function startRun() {

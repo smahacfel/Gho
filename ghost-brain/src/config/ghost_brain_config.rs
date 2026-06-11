@@ -1567,6 +1567,26 @@ pub struct GatekeeperV2Config {
     /// Default: true
     pub require_ready_fsc_for_combo_veto: bool,
 
+    /// Minimum sample coverage required to expose FTDI/DBIA values.
+    /// Default: 0.70
+    pub min_toolchain_metric_coverage: f64,
+
+    /// Minimum comparable sequence coverage required for DES values.
+    /// Default: 0.75
+    pub min_des_valid_sequence_coverage: f64,
+
+    /// Required observed-window ratio for CPV quality gating.
+    /// Default: 1.0
+    pub cpv_min_observed_window_ratio: f64,
+
+    /// Require clean FSC-V2 evidence before FSC contributes in policy.
+    /// Default: true
+    pub fsc_require_clean_v2_for_actionability: bool,
+
+    /// Require FSC coverage-window readiness before FSC contributes in policy.
+    /// Default: true
+    pub fsc_require_coverage_window_for_actionability: bool,
+
     // ── Sybil resistance rolling-state params ──────────────────────────────
     /// TTL / lookback for CPV index in seconds.
     /// Default: 300
@@ -1836,6 +1856,11 @@ impl Default for GatekeeperV2Config {
             enable_sybil_combo_veto: false,
             emit_sybil_meta_score: false,
             require_ready_fsc_for_combo_veto: true,
+            min_toolchain_metric_coverage: 0.70,
+            min_des_valid_sequence_coverage: 0.75,
+            cpv_min_observed_window_ratio: 1.0,
+            fsc_require_clean_v2_for_actionability: true,
+            fsc_require_coverage_window_for_actionability: true,
 
             // Sybil resistance rolling-state params
             cpv_lookback_window_s: 300,
@@ -1913,6 +1938,18 @@ impl GatekeeperV2Config {
                 );
             }
         }
+        validate_unit_interval(
+            "gatekeeper_v2.min_toolchain_metric_coverage",
+            self.min_toolchain_metric_coverage,
+        )?;
+        validate_unit_interval(
+            "gatekeeper_v2.min_des_valid_sequence_coverage",
+            self.min_des_valid_sequence_coverage,
+        )?;
+        validate_unit_interval(
+            "gatekeeper_v2.cpv_min_observed_window_ratio",
+            self.cpv_min_observed_window_ratio,
+        )?;
         Ok(())
     }
 }
@@ -5172,6 +5209,28 @@ min_dev_paperhand_latency_ms = 2500
         assert_eq!(
             cfg.max_whale_reversal_ratio_top3,
             GatekeeperV2Config::default().max_whale_reversal_ratio_top3
+        );
+
+        let defaults = GatekeeperV2Config::default();
+        assert_eq!(
+            cfg.min_toolchain_metric_coverage,
+            defaults.min_toolchain_metric_coverage
+        );
+        assert_eq!(
+            cfg.min_des_valid_sequence_coverage,
+            defaults.min_des_valid_sequence_coverage,
+        );
+        assert_eq!(
+            cfg.cpv_min_observed_window_ratio,
+            defaults.cpv_min_observed_window_ratio
+        );
+        assert_eq!(
+            cfg.fsc_require_clean_v2_for_actionability,
+            defaults.fsc_require_clean_v2_for_actionability,
+        );
+        assert_eq!(
+            cfg.fsc_require_coverage_window_for_actionability,
+            defaults.fsc_require_coverage_window_for_actionability,
         );
     }
 

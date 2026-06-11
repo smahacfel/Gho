@@ -282,6 +282,15 @@ pub struct FscV2Evidence {
     pub max_buy_slot: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub funding_lane_lag_slots: Option<i64>,
+    /// Decision-wall FSC coverage readiness at materialization time.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub coverage_window_ready: bool,
+    /// Remaining wall-clock coverage warmup before FSC can be authoritative for BUY decisions.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub coverage_window_remaining_ms: u64,
+    /// True only when the funding lane is warm and the full coverage window is ready.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub authoritative_buy_ready: bool,
     pub stream_epoch: u64,
     pub gap_suspected: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -329,13 +338,23 @@ pub struct SybilResistanceFeatures {
     pub buy_sample_count: u64,
     #[serde(default)]
     pub signer_sample_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpv_distinct_other_pools_mean: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpv_other_pool_activity_count_p95: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolchain_fingerprint_coverage: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub des_valid_sequence_coverage: Option<f64>,
 }
 
 pub const FTDI_INSUFFICIENT_BUYS_REASON: &str = "FTDI_INSUFFICIENT_BUYS";
 pub const FTDI_RAW_FEE_TOPOLOGY_UNAVAILABLE_REASON: &str = "FTDI_RAW_FEE_TOPOLOGY_UNAVAILABLE";
+pub const FTDI_PARTIAL_FEE_TOPOLOGY_COVERAGE: &str = "FTDI_PARTIAL_FEE_TOPOLOGY_COVERAGE";
 pub const DBIA_NO_DEV_BUY_REASON: &str = "DBIA_NO_DEV_BUY";
 pub const DBIA_INSUFFICIENT_BUYERS_REASON: &str = "DBIA_INSUFFICIENT_BUYERS";
 pub const DBIA_RAW_FINGERPRINT_UNAVAILABLE_REASON: &str = "DBIA_RAW_FINGERPRINT_UNAVAILABLE";
+pub const DBIA_PARTIAL_FINGERPRINT_COVERAGE: &str = "DBIA_PARTIAL_FINGERPRINT_COVERAGE";
 pub const SFD_INSUFFICIENT_BUYS_REASON: &str = "SFD_INSUFFICIENT_BUYS";
 pub const SFD_ZERO_PREBALANCE_SKIPPED_REASON: &str = "SFD_ZERO_PREBALANCE_SKIPPED";
 /// Legacy hard-failure label retained for compatibility.
@@ -348,8 +367,13 @@ pub const SFD_PARTIAL_BALANCE_COVERAGE_REASON: &str = "SFD_PARTIAL_BALANCE_COVER
 pub const DES_INSUFFICIENT_BUYS_REASON: &str = "DES_INSUFFICIENT_BUYS";
 pub const DES_CURVE_DATA_UNAVAILABLE_REASON: &str = "DES_CURVE_DATA_UNAVAILABLE";
 pub const DES_SLOT_ORDER_UNAVAILABLE_REASON: &str = "DES_SLOT_ORDER_UNAVAILABLE";
+pub const DES_PARTIAL_SEQUENCE_COVERAGE: &str = "DES_PARTIAL_SEQUENCE_COVERAGE";
+pub const DES_NO_COMPARABLE_PAIRS: &str = "DES_NO_COMPARABLE_PAIRS";
 pub const CPV_ROLLING_STATE_UNAVAILABLE_REASON: &str = "CPV_ROLLING_STATE_UNAVAILABLE";
 pub const CPV_INSUFFICIENT_SIGNERS_REASON: &str = "CPV_INSUFFICIENT_SIGNERS";
+pub const CPV_COVERAGE_WINDOW_UNAVAILABLE: &str = "CPV_COVERAGE_WINDOW_UNAVAILABLE";
+pub const SFD_NEGATIVE_BALANCE_DELTA_SKIPPED: &str = "SFD_NEGATIVE_BALANCE_DELTA_SKIPPED";
+pub const SFD_BUY_AMOUNT_UNAVAILABLE: &str = "SFD_BUY_AMOUNT_UNAVAILABLE";
 pub const FSC_ROLLING_STATE_UNAVAILABLE_REASON: &str = "FSC_ROLLING_STATE_UNAVAILABLE";
 pub const FSC_INSUFFICIENT_KNOWN_SOURCES_REASON: &str = "FSC_INSUFFICIENT_KNOWN_SOURCES";
 pub const FSC_FUNDING_STREAM_UNAVAILABLE_REASON: &str = "FSC_FUNDING_STREAM_UNAVAILABLE";
@@ -364,3 +388,15 @@ pub const FSC_ABS_ATTRIBUTION_TOO_SMALL_REASON: &str = "FSC_ABS_ATTRIBUTION_TOO_
 pub const FSC_RELATIVE_FUNDING_TOO_SMALL_REASON: &str = "FSC_RELATIVE_FUNDING_TOO_SMALL";
 pub const FSC_PER_RECIPIENT_HISTORY_OVERFLOW_REASON: &str = "FSC_PER_RECIPIENT_HISTORY_OVERFLOW";
 pub const FSC_GLOBAL_RECIPIENT_EVICTED_REASON: &str = "FSC_GLOBAL_RECIPIENT_EVICTED";
+pub const FSC_V2_STATUS_NOT_CLEAN: &str = "FSC_V2_STATUS_NOT_CLEAN";
+pub const FSC_COVERAGE_WINDOW_UNAVAILABLE: &str = "FSC_COVERAGE_WINDOW_UNAVAILABLE";
+
+#[inline]
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[inline]
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}

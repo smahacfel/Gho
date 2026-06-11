@@ -7,6 +7,7 @@ use ghost_core::tx_intelligence::types::{
     SFD_PARTIAL_BALANCE_COVERAGE_REASON, SFD_POSTBALANCE_UNAVAILABLE_REASON,
     SFD_ZERO_PREBALANCE_SKIPPED_REASON,
 };
+use ghost_brain::config::GatekeeperV2Config;
 use seer::types::ToolchainFingerprintInput;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -18,6 +19,28 @@ const DBIA_CU_PRICE_WEIGHT: f64 = 0.05;
 const DBIA_INNER_GROUP_WEIGHT: f64 = 0.25;
 const DBIA_FEE_TOPOLOGY_WEIGHT: f64 = 0.20;
 const DES_SIGN_EPSILON: f64 = 1e-12;
+
+#[derive(Debug, Clone, PartialEq)]
+struct SybilMetricQualityConfig {
+    min_toolchain_metric_coverage: f64,
+    min_des_valid_sequence_coverage: f64,
+    cpv_min_observed_window_ratio: f64,
+    fsc_require_clean_v2_for_actionability: bool,
+    fsc_require_coverage_window_for_actionability: bool,
+}
+
+impl SybilMetricQualityConfig {
+    fn from_gatekeeper_config(config: &GatekeeperV2Config) -> Self {
+        Self {
+            min_toolchain_metric_coverage: config.min_toolchain_metric_coverage,
+            min_des_valid_sequence_coverage: config.min_des_valid_sequence_coverage,
+            cpv_min_observed_window_ratio: config.cpv_min_observed_window_ratio,
+            fsc_require_clean_v2_for_actionability: config.fsc_require_clean_v2_for_actionability,
+            fsc_require_coverage_window_for_actionability:
+                config.fsc_require_coverage_window_for_actionability,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FtdiComputation {
@@ -783,6 +806,25 @@ mod tests {
             "left={left} right={right} diff={}",
             (left - right).abs()
         );
+    }
+
+    #[test]
+    fn sybil_metric_quality_config_from_gatekeeper_v2_config() {
+        let config = GatekeeperV2Config {
+            min_toolchain_metric_coverage: 0.81,
+            min_des_valid_sequence_coverage: 0.82,
+            cpv_min_observed_window_ratio: 0.99,
+            fsc_require_clean_v2_for_actionability: false,
+            fsc_require_coverage_window_for_actionability: false,
+            ..GatekeeperV2Config::default()
+        };
+
+        let quality = SybilMetricQualityConfig::from_gatekeeper_config(&config);
+        assert_eq!(quality.min_toolchain_metric_coverage, 0.81);
+        assert_eq!(quality.min_des_valid_sequence_coverage, 0.82);
+        assert_eq!(quality.cpv_min_observed_window_ratio, 0.99);
+        assert!(!quality.fsc_require_clean_v2_for_actionability);
+        assert!(!quality.fsc_require_coverage_window_for_actionability);
     }
 
     #[test]

@@ -41,6 +41,7 @@ pub struct FundingSourceConfig {
     pub min_known_non_neutral_buyers: u64,
     pub min_known_coverage: f64,
     pub min_non_neutral_known_coverage: f64,
+    pub require_coverage_window_for_actionability: bool,
     neutral_funding_sources: HashSet<String>,
 }
 
@@ -66,7 +67,9 @@ impl FundingSourceConfig {
         let min_abs_attribution_lamports = fsc_v2
             .map(|fsc| fsc.min_abs_attribution_lamports)
             .unwrap_or(config.funding_dust_threshold_lamports);
-        let min_rel_to_buy = fsc_v2.map(|fsc| fsc.min_rel_to_buy).unwrap_or(0.0);
+        let min_rel_to_buy = fsc_v2
+            .map(|fsc| fsc.min_rel_to_buy)
+            .unwrap_or_else(|| FscV2Config::default().min_rel_to_buy);
         let min_attribution_confidence_bps = fsc_v2
             .map(|fsc| unit_interval_to_bps(fsc.min_attribution_confidence))
             .unwrap_or(6_000);
@@ -89,6 +92,8 @@ impl FundingSourceConfig {
             min_known_coverage: fsc_v2.map_or(0.50, |fsc| fsc.min_known_coverage),
             min_non_neutral_known_coverage: fsc_v2
                 .map_or(0.30, |fsc| fsc.min_non_neutral_known_coverage),
+            require_coverage_window_for_actionability: config
+                .fsc_require_coverage_window_for_actionability,
             neutral_funding_sources: config
                 .neutral_funding_sources
                 .iter()
@@ -376,6 +381,7 @@ fn build_fsc_v2_evidence(
     config: &FundingSourceConfig,
     max_buy_slot: Option<u64>,
     lane_health: FundingLaneHealth,
+    coverage_window_status: FundingCoverageWindowStatus,
     provider: String,
     source_topics: Vec<String>,
 ) -> FscV2Evidence {
@@ -520,6 +526,9 @@ fn build_fsc_v2_evidence(
             lane_health.funding_lane_watermark_slot,
             max_buy_slot,
         ),
+        coverage_window_ready: coverage_window_status.coverage_window_ready,
+        coverage_window_remaining_ms: coverage_window_status.coverage_window_remaining_ms,
+        authoritative_buy_ready: coverage_window_status.authoritative_buy_ready,
         stream_epoch: lane_health.stream_epoch,
         gap_suspected: lane_health.gap_suspected,
         last_transfer_recv_ts_ms: lane_health.last_transfer_recv_ts_ms,
@@ -651,6 +660,36 @@ fn fsc_v2_status(
     (FscEvidenceStatus::Clean, None)
 }
 
+fn fsc_primary_score(evidence: &FscV2Evidence) -> Option<f64> {
+    (evidence.status == FscEvidenceStatus::Clean)
+        .then_some(evidence.scoring_hhi_non_neutral)
+        .flatten()
+}
+
+fn fsc_degraded_reasons_for_primary_score(evidence: &FscV2Evidence) -> Vec<String> {
+    if fsc_primary_score(evidence).is_some() {
+        return Vec::new();
+    }
+
+    let reason = match evidence.excluded_reason {
+        Some(FscExcludedReason::FundingLaneUnavailable) => FSC_FUNDING_STREAM_UNAVAILABLE_REASON,
+        Some(FscExcludedReason::IndexCold) => FSC_ROLLING_STATE_UNAVAILABLE_REASON,
+        Some(FscExcludedReason::SameSlotOrderingUnavailable) => {
+            FSC_SAME_SLOT_ORDERING_UNAVAILABLE_REASON
+        }
+        Some(FscExcludedReason::LowAttributionConfidence) => FSC_LOW_ATTRIBUTION_CONFIDENCE_REASON,
+        Some(
+            FscExcludedReason::NoBuyerCohort
+            | FscExcludedReason::InsufficientNonNeutralSupport
+            | FscExcludedReason::LowCoverage
+            | FscExcludedReason::NeutralOnly,
+        )
+        | None => FSC_INSUFFICIENT_KNOWN_SOURCES_REASON,
+    };
+
+    vec![reason.to_string()]
+}
+
 fn normalized_hhi_from_counts(counts: &[u64]) -> Option<f64> {
     let sample_n = counts.iter().copied().sum::<u64>();
     if sample_n < 2 {
@@ -766,7 +805,7 @@ fn funding_source_config_hash(config: &FundingSourceConfig) -> String {
     neutral_sources.sort();
     stable_fnv64_hex(
         format!(
-            "lookback_window_ms={};min_abs_store_lamports={};min_abs_attribution_lamports={};min_rel_to_buy_bits={};min_attribution_confidence_bps={};per_recipient_cap={};global_recipient_cap={};min_total_buyers={};min_known_non_neutral_buyers={};min_known_coverage_bits={};min_non_neutral_known_coverage_bits={};neutral_funder_set_version={};neutral_sources={}",
+            "lookback_window_ms={};min_abs_store_lamports={};min_abs_attribution_lamports={};min_rel_to_buy_bits={};min_attribution_confidence_bps={};per_recipient_cap={};global_recipient_cap={};min_total_buyers={};min_known_non_neutral_buyers={};min_known_coverage_bits={};min_non_neutral_known_coverage_bits={};require_coverage_window_for_actionability={};neutral_funder_set_version={};neutral_sources={}",
             config.lookback_window_ms,
             config.min_abs_store_lamports,
             config.min_abs_attribution_lamports,
@@ -778,6 +817,7 @@ fn funding_source_config_hash(config: &FundingSourceConfig) -> String {
             config.min_known_non_neutral_buyers,
             config.min_known_coverage.to_bits(),
             config.min_non_neutral_known_coverage.to_bits(),
+            config.require_coverage_window_for_actionability,
             config.neutral_funder_set_version.as_deref().unwrap_or(""),
             neutral_sources.join(",")
         )
@@ -801,7 +841,10 @@ impl FundingSourceIndex {
     }
 
     pub fn set_stream_available(&self, available: bool) {
-        let now_ms = wall_clock_epoch_ms();
+        self.set_stream_available_at(available, wall_clock_epoch_ms());
+    }
+
+    pub fn set_stream_available_at(&self, available: bool, now_ms: u64) {
         let mut inner = self.inner.write();
         inner.availability_controlled = true;
         if available {
@@ -992,6 +1035,16 @@ impl FundingSourceIndex {
         transactions: impl IntoIterator<Item = &'a PoolTransaction>,
         config: &FundingSourceConfig,
     ) -> FscComputation {
+        self.compute_for_transactions_at(transactions, config, wall_clock_epoch_ms())
+    }
+
+    #[must_use]
+    pub fn compute_for_transactions_at<'a>(
+        &self,
+        transactions: impl IntoIterator<Item = &'a PoolTransaction>,
+        config: &FundingSourceConfig,
+        decision_wall_ms: u64,
+    ) -> FscComputation {
         let buyer_samples = unique_successful_buyers(transactions);
         let mut diagnostics = FundingSourceDiagnostics {
             buyer_sample_count: buyer_samples.len() as u64,
@@ -1009,6 +1062,8 @@ impl FundingSourceIndex {
         let window_start = earliest_buy_ts_ms.saturating_sub(config.lookback_window_ms);
 
         let mut inner = self.inner.write();
+        let coverage_window_status =
+            coverage_window_status_locked(&inner, config, decision_wall_ms);
 
         if !inner.stream_available {
             let (provider, source_topics) = fsc_v2_source_provenance(&inner);
@@ -1020,6 +1075,7 @@ impl FundingSourceIndex {
                 config,
                 max_buy_slot,
                 lane_health_locked(&inner),
+                coverage_window_status,
                 provider,
                 source_topics,
             );
@@ -1041,6 +1097,7 @@ impl FundingSourceIndex {
                 config,
                 max_buy_slot,
                 lane_health_locked(&inner),
+                coverage_window_status,
                 provider,
                 source_topics,
             );
@@ -1052,7 +1109,6 @@ impl FundingSourceIndex {
             };
         }
 
-        let mut known_sources = Vec::<String>::new();
         let mut lookup_hits = 0u64;
         let mut lookup_misses = 0u64;
         let mut removed_entries = 0u64;
@@ -1077,21 +1133,16 @@ impl FundingSourceIndex {
                     lookup_hits = lookup_hits.saturating_add(1);
                     diagnostics.known_source_count =
                         diagnostics.known_source_count.saturating_add(1);
-                    known_sources.push(source.clone());
                     fsc_v2_accumulator.record_concrete(
                         source,
                         tx_buy_sol(tx),
                         lookup.attribution_confidence_bps,
                     );
                 }
-                FundingSourceMatch::Neutral {
-                    source_wallet,
-                    legacy_key,
-                } => {
+                FundingSourceMatch::Neutral { source_wallet, .. } => {
                     lookup_hits = lookup_hits.saturating_add(1);
                     diagnostics.known_source_count =
                         diagnostics.known_source_count.saturating_add(1);
-                    known_sources.push(legacy_key);
                     fsc_v2_accumulator
                         .record_neutral(source_wallet, lookup.attribution_confidence_bps);
                 }
@@ -1132,26 +1183,17 @@ impl FundingSourceIndex {
             config,
             max_buy_slot,
             lane_health_locked(&inner),
+            coverage_window_status,
             provider,
             source_topics,
         );
 
-        if known_sources.len() < 2 {
-            return FscComputation {
-                funding_source_concentration: None,
-                funding_source_v2,
-                degraded_reasons: vec![FSC_INSUFFICIENT_KNOWN_SOURCES_REASON.to_string()],
-                diagnostics,
-            };
-        }
-
-        let distinct_known_sources = known_sources.iter().collect::<HashSet<_>>().len();
+        let funding_source_concentration = fsc_primary_score(&funding_source_v2);
+        let degraded_reasons = fsc_degraded_reasons_for_primary_score(&funding_source_v2);
         FscComputation {
-            funding_source_concentration: Some(
-                1.0 - (distinct_known_sources as f64 / known_sources.len() as f64),
-            ),
+            funding_source_concentration,
             funding_source_v2,
-            degraded_reasons: Vec::new(),
+            degraded_reasons,
             diagnostics,
         }
     }
@@ -2018,6 +2060,7 @@ mod tests {
         assert_eq!(config.min_known_non_neutral_buyers, 2);
         assert_eq!(config.min_known_coverage, 0.50);
         assert_eq!(config.min_non_neutral_known_coverage, 0.30);
+        assert!(config.require_coverage_window_for_actionability);
         assert_eq!(
             config.neutral_funder_set_version.as_deref(),
             Some("neutral-v-test")
@@ -2184,7 +2227,7 @@ mod tests {
             computed
                 .funding_source_concentration
                 .expect("fsc should be materialized"),
-            2.0 / 3.0,
+            1.0,
         );
         assert!(computed.degraded_reasons.is_empty());
     }
@@ -2245,8 +2288,11 @@ mod tests {
         ];
         let computed = index.compute_for_transactions(buys.iter(), &config);
 
-        assert_eq!(computed.funding_source_concentration, Some(0.0));
-        assert!(computed.degraded_reasons.is_empty());
+        assert_eq!(computed.funding_source_concentration, None);
+        assert_eq!(
+            computed.degraded_reasons,
+            vec![FSC_INSUFFICIENT_KNOWN_SOURCES_REASON.to_string()]
+        );
         assert_eq!(
             computed.funding_source_v2.status,
             FscEvidenceStatus::Degraded
@@ -2358,7 +2404,7 @@ mod tests {
         ];
         let computed = index.compute_for_transactions(buys.iter(), &config);
 
-        assert_eq!(computed.funding_source_concentration, Some(0.5));
+        assert_eq!(computed.funding_source_concentration, Some(1.0));
     }
 
     #[test]
@@ -2402,7 +2448,7 @@ mod tests {
         ];
         let computed = index.compute_for_transactions(buys.iter(), &config);
 
-        assert_eq!(computed.funding_source_concentration, Some(0.5));
+        assert_eq!(computed.funding_source_concentration, Some(1.0));
         assert_eq!(computed.diagnostics.known_source_count, 2);
         assert_eq!(computed.diagnostics.unknown_buyer_count, 0);
     }
@@ -2526,7 +2572,7 @@ mod tests {
         let buys = vec![buy_a, buy_b];
         let computed = index.compute_for_transactions(buys.iter(), &config);
 
-        assert_eq!(computed.funding_source_concentration, Some(0.5));
+        assert_eq!(computed.funding_source_concentration, Some(1.0));
         assert_eq!(computed.diagnostics.known_source_count, 2);
         assert!(computed.degraded_reasons.is_empty());
     }
@@ -2576,7 +2622,7 @@ mod tests {
         ];
         let computed = index.compute_for_transactions(buys.iter(), &config);
 
-        assert_eq!(computed.funding_source_concentration, Some(0.5));
+        assert_eq!(computed.funding_source_concentration, Some(1.0));
     }
 
     #[test]
@@ -2609,7 +2655,7 @@ mod tests {
         let buys = vec![buy_a, buy_b];
         let computed = index.compute_for_transactions(buys.iter(), &config);
 
-        assert_eq!(computed.funding_source_concentration, Some(0.5));
+        assert_eq!(computed.funding_source_concentration, Some(1.0));
         assert!(computed.degraded_reasons.is_empty());
     }
 
@@ -2651,7 +2697,7 @@ mod tests {
         let buys = vec![buy_a, buy_b];
         let computed = index.compute_for_transactions(buys.iter(), &config);
 
-        assert_eq!(computed.funding_source_concentration, Some(0.5));
+        assert_eq!(computed.funding_source_concentration, Some(1.0));
         assert!(computed.degraded_reasons.is_empty());
     }
 
@@ -2681,7 +2727,7 @@ mod tests {
         let buys = vec![buy_a, buy_b];
         let computed = index.compute_for_transactions(buys.iter(), &config);
 
-        assert_eq!(computed.funding_source_concentration, Some(0.5));
+        assert_eq!(computed.funding_source_concentration, Some(1.0));
         assert!(computed.degraded_reasons.is_empty());
     }
 
@@ -2704,7 +2750,7 @@ mod tests {
         ];
         let computed = index.compute_for_transactions(buys.iter(), &config);
 
-        assert_eq!(computed.funding_source_concentration, Some(0.5));
+        assert_eq!(computed.funding_source_concentration, Some(1.0));
         assert!(computed.degraded_reasons.is_empty());
     }
 
@@ -2749,7 +2795,7 @@ mod tests {
         ];
         let computed = index.compute_for_transactions(buys.iter(), &config);
 
-        assert_eq!(computed.funding_source_concentration, Some(0.5));
+        assert_eq!(computed.funding_source_concentration, Some(1.0));
         assert_eq!(computed.funding_source_v2.hhi_norm_count, Some(1.0));
         assert_eq!(
             computed.funding_source_v2.top_funder,
@@ -2761,9 +2807,10 @@ mod tests {
 
     #[test]
     fn fsc_v2_sample_normalized_hhi_controls_match_plan_examples() {
-        assert_eq!(normalized_hhi_from_counts(&[5]), Some(1.0));
-        assert_eq!(normalized_hhi_from_counts(&[1, 1, 1, 1, 1]), Some(0.0));
-        assert_approx_eq(normalized_hhi_from_counts(&[4, 1]).unwrap(), 0.60);
+        assert_eq!(normalized_hhi_from_counts(&[2]), Some(1.0));
+        assert_approx_eq(normalized_hhi_from_counts(&[2, 2]).unwrap(), 1.0 / 3.0);
+        assert_eq!(normalized_hhi_from_counts(&[3, 1]), Some(0.5));
+        assert_eq!(normalized_hhi_from_counts(&[1, 1, 1]), Some(0.0));
         assert_eq!(normalized_hhi_from_counts(&[1]), None);
     }
 
@@ -2803,7 +2850,7 @@ mod tests {
         ];
         let computed = index.compute_for_transactions(buys.iter(), &config);
 
-        assert_eq!(computed.funding_source_concentration, Some(0.5));
+        assert_eq!(computed.funding_source_concentration, Some(1.0));
         assert_eq!(computed.funding_source_v2.hhi_norm_count, Some(1.0));
         assert_eq!(computed.funding_source_v2.status, FscEvidenceStatus::Clean);
 
@@ -3234,6 +3281,39 @@ mod tests {
         assert!(at_window.coverage_window_ready);
         assert!(at_window.authoritative_buy_ready);
         assert_eq!(at_window.coverage_window_remaining_ms, 0);
+    }
+
+    #[test]
+    fn compute_for_transactions_at_populates_fsc_v2_coverage_readiness() {
+        let config = config();
+        let index = FundingSourceIndex::new();
+        index.set_stream_available_at(true, 1_000);
+        index.observe_transfer(
+            &funding_transfer("funder-shared", "buyer-a", "fund-a", 1_100, 50_000_000),
+            &config,
+        );
+        index.observe_transfer(
+            &funding_transfer("funder-shared", "buyer-b", "fund-b", 1_110, 50_000_000),
+            &config,
+        );
+
+        let buys = vec![
+            buy_tx("buyer-a", "buy-a", 1_200),
+            buy_tx("buyer-b", "buy-b", 1_250),
+        ];
+
+        let before_window = index.compute_for_transactions_at(buys.iter(), &config, 1_999);
+        assert!(!before_window.funding_source_v2.coverage_window_ready);
+        assert!(!before_window.funding_source_v2.authoritative_buy_ready);
+        assert_eq!(
+            before_window.funding_source_v2.coverage_window_remaining_ms,
+            1
+        );
+
+        let at_window = index.compute_for_transactions_at(buys.iter(), &config, 2_000);
+        assert!(at_window.funding_source_v2.coverage_window_ready);
+        assert!(at_window.funding_source_v2.authoritative_buy_ready);
+        assert_eq!(at_window.funding_source_v2.coverage_window_remaining_ms, 0);
     }
 
     #[test]

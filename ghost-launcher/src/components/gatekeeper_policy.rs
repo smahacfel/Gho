@@ -13,12 +13,13 @@ use ghost_core::checkpoint::{
     MaterializedFeatureSet, SybilResistanceFeatures, TrendDirection, TxSegmentSequence,
 };
 use ghost_core::tx_intelligence::types::{
-    CPV_INSUFFICIENT_SIGNERS_REASON, CPV_ROLLING_STATE_UNAVAILABLE_REASON,
-    DBIA_INSUFFICIENT_BUYERS_REASON, DBIA_NO_DEV_BUY_REASON,
+    FscEvidenceStatus, FscSnapshotMode, FscV2Evidence, CPV_INSUFFICIENT_SIGNERS_REASON,
+    CPV_ROLLING_STATE_UNAVAILABLE_REASON, DBIA_INSUFFICIENT_BUYERS_REASON, DBIA_NO_DEV_BUY_REASON,
     DBIA_RAW_FINGERPRINT_UNAVAILABLE_REASON, DES_CURVE_DATA_UNAVAILABLE_REASON,
     DES_INSUFFICIENT_BUYS_REASON, DES_SLOT_ORDER_UNAVAILABLE_REASON,
-    FSC_FUNDING_STREAM_UNAVAILABLE_REASON, FSC_INSUFFICIENT_KNOWN_SOURCES_REASON,
-    FSC_ROLLING_STATE_UNAVAILABLE_REASON, FTDI_INSUFFICIENT_BUYS_REASON,
+    FSC_COVERAGE_WINDOW_UNAVAILABLE, FSC_FUNDING_STREAM_UNAVAILABLE_REASON,
+    FSC_INSUFFICIENT_KNOWN_SOURCES_REASON, FSC_ROLLING_STATE_UNAVAILABLE_REASON,
+    FSC_V2_STATUS_NOT_CLEAN, FTDI_INSUFFICIENT_BUYS_REASON,
     FTDI_RAW_FEE_TOPOLOGY_UNAVAILABLE_REASON, SFD_INSUFFICIENT_BUYS_REASON,
 };
 use ghost_core::ShadowLedgerStaleFallback;
@@ -246,7 +247,7 @@ fn evaluate_prosperity_filter(
         curve.current_market_cap_sol >= config.prosperity_min_market_cap_sol;
     let sybil = &assessment.feature_snapshot.sybil_resistance;
     let overlay_enabled = config.enable_prosperity_overlay;
-    if !sybil_metric_is_actionable(sybil, SybilMetric::Cpv) {
+    if !sybil_metric_is_actionable(sybil, SybilMetric::Cpv, config) {
         let mut diagnostics = ProsperityFilterDiagnostics::rejected_missing(
             true,
             ProsperityRejectTrigger::MissingSignerCrossPoolVelocity,
@@ -294,7 +295,7 @@ fn evaluate_prosperity_filter(
         curve.bonding_progress_pct <= config.prosperity_overlay_max_bonding_progress_pct,
     );
     let overlay_ftdi_actionable =
-        !overlay_enabled || sybil_metric_is_actionable(sybil, SybilMetric::Ftdi);
+        !overlay_enabled || sybil_metric_is_actionable(sybil, SybilMetric::Ftdi, config);
     let overlay_fee_topology_diversity_pass = if overlay_enabled && overlay_ftdi_actionable {
         Some(fee_topology_diversity_index.is_some_and(|value| {
             value >= config.prosperity_overlay_min_fee_topology_diversity_index
@@ -1894,14 +1895,98 @@ fn has_degraded_reason(reasons: &[String], target: &str) -> bool {
     reasons.iter().any(|reason| reason == target)
 }
 
-fn sybil_metric_is_actionable(sybil: &SybilResistanceFeatures, metric: SybilMetric) -> bool {
+fn fsc_degraded_reason_blocks_policy(reason: &str) -> bool {
+    matches!(
+        reason,
+        FSC_ROLLING_STATE_UNAVAILABLE_REASON
+            | FSC_INSUFFICIENT_KNOWN_SOURCES_REASON
+            | FSC_FUNDING_STREAM_UNAVAILABLE_REASON
+            | FSC_V2_STATUS_NOT_CLEAN
+            | FSC_COVERAGE_WINDOW_UNAVAILABLE
+    )
+}
+
+fn fsc_v2_has_clean_decision_evidence(evidence: &FscV2Evidence) -> bool {
+    evidence.snapshot_mode == FscSnapshotMode::DecisionTime
+        && evidence.status == FscEvidenceStatus::Clean
+        && evidence.excluded_reason.is_none()
+        && evidence.scoring_hhi_non_neutral.is_some()
+}
+
+fn fsc_metric_is_actionable(sybil: &SybilResistanceFeatures, config: &GatekeeperV2Config) -> bool {
+    if sybil.funding_source_concentration.is_none() {
+        return false;
+    }
+    if sybil
+        .degraded_reasons
+        .iter()
+        .any(|reason| fsc_degraded_reason_blocks_policy(reason))
+    {
+        return false;
+    }
+
+    let Some(evidence) = sybil.funding_source_v2.as_ref() else {
+        return false;
+    };
+    if !fsc_v2_has_clean_decision_evidence(evidence) {
+        return false;
+    }
+    if config.fsc_require_coverage_window_for_actionability && !evidence.authoritative_buy_ready {
+        return false;
+    }
+
+    true
+}
+
+fn collect_sybil_metric_degraded_reasons(
+    sybil: &SybilResistanceFeatures,
+    config: &GatekeeperV2Config,
+) -> Vec<String> {
+    let mut reasons = sybil.degraded_reasons.clone();
+    if sybil.funding_source_concentration.is_none() {
+        return reasons;
+    }
+
+    let Some(evidence) = sybil.funding_source_v2.as_ref() else {
+        if !reasons
+            .iter()
+            .any(|reason| reason == FSC_V2_STATUS_NOT_CLEAN)
+        {
+            reasons.push(FSC_V2_STATUS_NOT_CLEAN.to_string());
+        }
+        return reasons;
+    };
+    if !fsc_v2_has_clean_decision_evidence(evidence)
+        && !reasons
+            .iter()
+            .any(|reason| reason == FSC_V2_STATUS_NOT_CLEAN)
+    {
+        reasons.push(FSC_V2_STATUS_NOT_CLEAN.to_string());
+    }
+    if config.fsc_require_coverage_window_for_actionability
+        && !evidence.authoritative_buy_ready
+        && !reasons
+            .iter()
+            .any(|reason| reason == FSC_COVERAGE_WINDOW_UNAVAILABLE)
+    {
+        reasons.push(FSC_COVERAGE_WINDOW_UNAVAILABLE.to_string());
+    }
+
+    reasons
+}
+
+fn sybil_metric_is_actionable(
+    sybil: &SybilResistanceFeatures,
+    metric: SybilMetric,
+    config: &GatekeeperV2Config,
+) -> bool {
     let value_present = match metric {
         SybilMetric::Ftdi => sybil.fee_topology_diversity_index.is_some(),
         SybilMetric::Dbia => sybil.dev_buyer_infrastructure_affinity.is_some(),
         SybilMetric::Sfd => sybil.spend_fraction_divergence.is_some(),
         SybilMetric::Des => sybil.demand_elasticity_score.is_some(),
         SybilMetric::Cpv => sybil.signer_cross_pool_velocity.is_some(),
-        SybilMetric::Fsc => sybil.funding_source_concentration.is_some(),
+        SybilMetric::Fsc => return fsc_metric_is_actionable(sybil, config),
     };
     if !value_present {
         return false;
@@ -1937,18 +2022,10 @@ fn sybil_metric_is_actionable(sybil: &SybilResistanceFeatures, metric: SybilMetr
                 CPV_ROLLING_STATE_UNAVAILABLE_REASON,
             ) || has_degraded_reason(&sybil.degraded_reasons, CPV_INSUFFICIENT_SIGNERS_REASON)
         }
-        SybilMetric::Fsc => {
-            has_degraded_reason(
-                &sybil.degraded_reasons,
-                FSC_ROLLING_STATE_UNAVAILABLE_REASON,
-            ) || has_degraded_reason(
-                &sybil.degraded_reasons,
-                FSC_INSUFFICIENT_KNOWN_SOURCES_REASON,
-            ) || has_degraded_reason(
-                &sybil.degraded_reasons,
-                FSC_FUNDING_STREAM_UNAVAILABLE_REASON,
-            )
-        }
+        SybilMetric::Fsc => sybil
+            .degraded_reasons
+            .iter()
+            .any(|reason| fsc_degraded_reason_blocks_policy(reason)),
     };
 
     !degraded
@@ -1960,32 +2037,32 @@ fn compute_sybil_soft_signals(
 ) -> SybilSoftSignals {
     let mut signals = SybilSoftSignals::default();
 
-    if sybil_metric_is_actionable(sybil, SybilMetric::Ftdi) {
+    if sybil_metric_is_actionable(sybil, SybilMetric::Ftdi, config) {
         signals.low_ftdi = sybil
             .fee_topology_diversity_index
             .is_some_and(|value| value < config.min_fee_topology_diversity_index);
     }
-    if sybil_metric_is_actionable(sybil, SybilMetric::Dbia) {
+    if sybil_metric_is_actionable(sybil, SybilMetric::Dbia, config) {
         signals.high_dbia = sybil
             .dev_buyer_infrastructure_affinity
             .is_some_and(|value| value > config.max_dev_buyer_infrastructure_affinity);
     }
-    if sybil_metric_is_actionable(sybil, SybilMetric::Sfd) {
+    if sybil_metric_is_actionable(sybil, SybilMetric::Sfd, config) {
         signals.low_sfd = sybil
             .spend_fraction_divergence
             .is_some_and(|value| value < config.min_spend_fraction_divergence);
     }
-    if sybil_metric_is_actionable(sybil, SybilMetric::Des) {
+    if sybil_metric_is_actionable(sybil, SybilMetric::Des, config) {
         signals.low_des = sybil
             .demand_elasticity_score
             .is_some_and(|value| value < config.min_demand_elasticity_score);
     }
-    if sybil_metric_is_actionable(sybil, SybilMetric::Cpv) {
+    if sybil_metric_is_actionable(sybil, SybilMetric::Cpv, config) {
         signals.high_cpv = sybil
             .signer_cross_pool_velocity
             .is_some_and(|value| value > config.max_signer_cross_pool_velocity);
     }
-    if sybil_metric_is_actionable(sybil, SybilMetric::Fsc) {
+    if sybil_metric_is_actionable(sybil, SybilMetric::Fsc, config) {
         signals.high_fsc = sybil
             .funding_source_concentration
             .is_some_and(|value| value > config.max_funding_source_concentration);
@@ -2046,7 +2123,7 @@ fn calculate_sybil_soft_points(
     if signals.low_ftdi {
         points += config.soft_penalty_low_ftdi as u16;
     }
-    if signals.high_dbia {
+    if signals.high_dbia && signals.low_ftdi {
         points += config.soft_penalty_high_dbia as u16;
     }
     if signals.low_sfd {
@@ -2090,7 +2167,7 @@ fn collect_sybil_component_activity(
             components.push((SybilLeadSignal::LowFtdi, points));
         }
     }
-    if signals.high_dbia {
+    if signals.high_dbia && signals.low_ftdi {
         let points = config.soft_penalty_high_dbia as u16;
         if points > 0 {
             components.push((SybilLeadSignal::HighDbia, points));
@@ -2218,7 +2295,7 @@ pub(crate) fn build_sybil_policy_diagnostics(
         lead_signal: select_sybil_lead_signal(&component_activity),
         interference_patterns,
         meta_score: config.emit_sybil_meta_score.then_some(soft_points),
-        metric_degraded_reasons: sybil.degraded_reasons.clone(),
+        metric_degraded_reasons: collect_sybil_metric_degraded_reasons(sybil, config),
     }
 }
 
@@ -2237,15 +2314,14 @@ pub(crate) fn sybil_combo_veto_reason(
     {
         return Some("SYBIL_INTERFERENCE: pattern=HIGH_DBIA_LOW_FTDI_LOW_SFD".to_string());
     }
-    if signals.low_des && signals.low_sfd && (signals.high_dbia || signals.low_ftdi) {
+    if signals.low_des && signals.low_sfd && signals.high_dbia && signals.low_ftdi {
         return Some("SYBIL_INTERFERENCE: pattern=LOW_DES_LOW_SFD_STRUCTURAL_SUPPORT".to_string());
     }
     let fsc_ready = !config.require_ready_fsc_for_combo_veto
-        || !diagnostics.metric_degraded_reasons.iter().any(|reason| {
-            reason == FSC_ROLLING_STATE_UNAVAILABLE_REASON
-                || reason == FSC_INSUFFICIENT_KNOWN_SOURCES_REASON
-                || reason == FSC_FUNDING_STREAM_UNAVAILABLE_REASON
-        });
+        || !diagnostics
+            .metric_degraded_reasons
+            .iter()
+            .any(|reason| fsc_degraded_reason_blocks_policy(reason));
     if fsc_ready && signals.high_fsc && signals.high_cpv && (signals.low_des || signals.low_sfd) {
         return Some(
             "SYBIL_INTERFERENCE: pattern=HIGH_FSC_HIGH_CPV_LOW_DES_OR_LOW_SFD".to_string(),
@@ -2970,6 +3046,35 @@ mod tests {
 
         assert!(!diagnostics.soft_signals.low_sfd);
         assert_eq!(diagnostics.soft_points, 0);
+    }
+
+    #[test]
+    fn fsc_combo_veto_blocks_v2_degraded_reason_when_ready_required() {
+        let mut config = GatekeeperV2Config::default();
+        config.enable_sybil_combo_veto = true;
+        config.require_ready_fsc_for_combo_veto = true;
+
+        let diagnostics = SybilPolicyDiagnostics {
+            enabled: true,
+            combo_veto_enabled: true,
+            soft_signals: SybilSoftSignals {
+                high_fsc: true,
+                high_cpv: true,
+                low_des: true,
+                ..SybilSoftSignals::default()
+            },
+            interference_patterns: vec![SybilInterferencePattern::HighFscHighCpvLowDesOrLowSfd],
+            metric_degraded_reasons: vec![FSC_V2_STATUS_NOT_CLEAN.to_string()],
+            ..SybilPolicyDiagnostics::default()
+        };
+
+        assert_eq!(sybil_combo_veto_reason(&diagnostics, &config), None);
+
+        config.require_ready_fsc_for_combo_veto = false;
+        assert_eq!(
+            sybil_combo_veto_reason(&diagnostics, &config),
+            Some("SYBIL_INTERFERENCE: pattern=HIGH_FSC_HIGH_CPV_LOW_DES_OR_LOW_SFD".to_string())
+        );
     }
 
     #[test]

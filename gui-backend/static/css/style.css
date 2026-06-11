@@ -105,6 +105,114 @@ body {
     white-space: nowrap;
 }
 
+.pet-layout {
+    display: grid;
+    gap: 12px;
+}
+
+.pet-preview-card {
+    display: grid;
+    grid-template-columns: 130px 1fr;
+    gap: 16px;
+    align-items: center;
+    background: var(--bg-elev);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 12px;
+}
+
+.pet-avatar-wrap {
+    width: 130px;
+    height: 130px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    background: linear-gradient(145deg, #151924, #293241);
+    border: 3px solid #4f8cff;
+    box-shadow: inset 0 0 0 4px rgba(3, 7, 18, 0.4);
+}
+
+.pet-avatar {
+    width: 80px;
+    height: 80px;
+    border-radius: 999px;
+    display: grid;
+    place-items: center;
+    font-size: 44px;
+    background: linear-gradient(150deg, rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.02));
+    border: 2px solid #4f8cff;
+}
+
+.pet-theme-auditron {
+    box-shadow: 0 0 0 6px rgba(14, 165, 233, 0.2);
+    background: radial-gradient(circle at 30% 25%, #60a5fa66, #0ea5e9);
+}
+
+.pet-theme-foxrunner {
+    box-shadow: 0 0 0 6px rgba(249, 115, 22, 0.2);
+    background: radial-gradient(circle at 30% 20%, #fdba74aa, #ea580c);
+}
+
+.pet-theme-owl {
+    box-shadow: 0 0 0 6px rgba(96, 165, 250, 0.2);
+    background: radial-gradient(circle at 30% 20%, #93c5fdcc, #2563eb);
+}
+
+.pet-theme-guard {
+    box-shadow: 0 0 0 6px rgba(52, 211, 153, 0.18);
+    background: radial-gradient(circle at 30% 20%, #6ee7b7aa, #059669);
+}
+
+.pet-meta h3 {
+    margin-bottom: 6px;
+    font-size: 1.05rem;
+}
+
+.pet-meta p {
+    color: var(--muted);
+    font-size: 0.9rem;
+    margin-top: 4px;
+}
+
+.pet-meta .pet-trait {
+    font-style: italic;
+    color: #f6bf6b;
+}
+
+.pet-options {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 8px;
+}
+
+.pet-option {
+    text-align: left;
+    display: grid;
+    gap: 4px;
+    align-items: flex-start;
+    justify-items: start;
+    padding: 9px 11px;
+}
+
+.pet-option-label {
+    font-size: 0.92rem;
+    font-weight: 650;
+    color: var(--text);
+}
+
+.pet-option-trait {
+    color: var(--muted);
+    font-size: 0.76rem;
+    line-height: 1.2;
+}
+
+.pet-option-active {
+    color: var(--bg-soft);
+    border-color: #4f8cff;
+    background: rgba(79, 140, 255, 0.18);
+}
+
 .banner-slot {
     position: relative;
     width: 100%;
@@ -483,6 +591,14 @@ body {
 
     .field.field-span-2 {
         grid-column: span 1;
+    }
+
+    .pet-preview-card {
+        grid-template-columns: 1fr;
+    }
+
+    .pet-avatar-wrap {
+        margin: 0 auto;
     }
 
     .tab-bar {

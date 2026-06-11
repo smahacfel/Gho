@@ -777,7 +777,12 @@ fn materialize_features_populates_fsc_from_shared_funding_source_index() {
     let buyer_b = Pubkey::new_unique();
     let buyer_c = Pubkey::new_unique();
 
-    manager.funding_source_index().set_stream_available(true);
+    let funding_config =
+        FundingSourceConfig::from_gatekeeper_config(&GatekeeperV2Config::default());
+    let decision_wall_ms = 60_500;
+    manager
+        .funding_source_index()
+        .set_stream_available_at(true, 59_500);
     manager.funding_source_index().observe_transfer(
         &funding_transfer(
             "shared-funder",
@@ -786,9 +791,7 @@ fn materialize_features_populates_fsc_from_shared_funding_source_index() {
             59_900,
             50_000_000,
         ),
-        &ghost_launcher::tx_intelligence::FundingSourceConfig::from_gatekeeper_config(
-            &GatekeeperV2Config::default(),
-        ),
+        &funding_config,
     );
     manager.funding_source_index().observe_transfer(
         &funding_transfer(
@@ -798,9 +801,7 @@ fn materialize_features_populates_fsc_from_shared_funding_source_index() {
             59_910,
             50_000_000,
         ),
-        &ghost_launcher::tx_intelligence::FundingSourceConfig::from_gatekeeper_config(
-            &GatekeeperV2Config::default(),
-        ),
+        &funding_config,
     );
     manager.funding_source_index().observe_transfer(
         &funding_transfer(
@@ -810,9 +811,7 @@ fn materialize_features_populates_fsc_from_shared_funding_source_index() {
             59_920,
             50_000_000,
         ),
-        &ghost_launcher::tx_intelligence::FundingSourceConfig::from_gatekeeper_config(
-            &GatekeeperV2Config::default(),
-        ),
+        &funding_config,
     );
     manager.funding_source_index().observe_transfer(
         &funding_transfer(
@@ -822,9 +821,7 @@ fn materialize_features_populates_fsc_from_shared_funding_source_index() {
             59_930,
             50_000_000,
         ),
-        &ghost_launcher::tx_intelligence::FundingSourceConfig::from_gatekeeper_config(
-            &GatekeeperV2Config::default(),
-        ),
+        &funding_config,
     );
 
     let features = {
@@ -869,14 +866,16 @@ fn materialize_features_populates_fsc_from_shared_funding_source_index() {
             false,
             13.0,
         ));
-        guard.materialize_features()
+        guard.materialize_features_at(decision_wall_ms)
     };
+    let expected_coverage = manager
+        .funding_source_index()
+        .coverage_window_status(&funding_config, decision_wall_ms);
 
-    let legacy_fsc = features
-        .sybil_resistance
-        .funding_source_concentration
-        .expect("legacy FSC should be materialized");
-    assert!((legacy_fsc - (1.0 / 3.0)).abs() < f64::EPSILON);
+    assert_eq!(
+        features.sybil_resistance.funding_source_concentration, None,
+        "primary FSC should stay unactionable while FSC v2 is not clean"
+    );
     let fsc_v2 = features
         .sybil_resistance
         .funding_source_v2
@@ -895,11 +894,27 @@ fn materialize_features_populates_fsc_from_shared_funding_source_index() {
             .abs()
             < f64::EPSILON
     );
+    assert_eq!(
+        fsc_v2.coverage_window_ready,
+        expected_coverage.coverage_window_ready
+    );
+    assert_eq!(
+        fsc_v2.coverage_window_remaining_ms,
+        expected_coverage.coverage_window_remaining_ms
+    );
+    assert_eq!(
+        fsc_v2.authoritative_buy_ready,
+        expected_coverage.authoritative_buy_ready
+    );
+    assert!(!fsc_v2.authoritative_buy_ready);
     assert!(!features.sybil_resistance.degraded_reasons.contains(
         &ghost_core::tx_intelligence::types::FSC_FUNDING_STREAM_UNAVAILABLE_REASON.to_string()
     ));
     assert!(!features.sybil_resistance.degraded_reasons.contains(
         &ghost_core::tx_intelligence::types::FSC_ROLLING_STATE_UNAVAILABLE_REASON.to_string()
+    ));
+    assert!(features.sybil_resistance.degraded_reasons.contains(
+        &ghost_core::tx_intelligence::types::FSC_COVERAGE_WINDOW_UNAVAILABLE.to_string()
     ));
 }
 
@@ -925,6 +940,8 @@ fn filtered_transfer_does_not_unlock_fsc_when_stream_is_only_health_ready() {
         ghost_launcher::tx_intelligence::FundingSourceConfig::from_gatekeeper_config(
             &GatekeeperV2Config::default(),
         );
+    let stream_available_since_ms = 59_500;
+    let decision_wall_ms = 60_050;
     let mut filtered_transfer = funding_transfer(
         "filtered-funder",
         &buyer_a.to_string(),
@@ -936,7 +953,9 @@ fn filtered_transfer_does_not_unlock_fsc_when_stream_is_only_health_ready() {
     filtered_transfer.provenance =
         seer::ipc::FundingTransferProvenance::funding_lane_pump_filtered_live();
 
-    manager.funding_source_index().set_stream_available(true);
+    manager
+        .funding_source_index()
+        .set_stream_available_at(true, stream_available_since_ms);
     manager
         .funding_source_index()
         .observe_transfer(&filtered_transfer, &funding_config);
@@ -983,15 +1002,35 @@ fn filtered_transfer_does_not_unlock_fsc_when_stream_is_only_health_ready() {
             false,
             13.0,
         ));
-        guard.materialize_features()
+        guard.materialize_features_at(decision_wall_ms)
     };
 
     assert_eq!(features.sybil_resistance.funding_source_concentration, None);
+    let fsc_v2 = features
+        .sybil_resistance
+        .funding_source_v2
+        .as_ref()
+        .expect("FSC v2 evidence should be materialized");
+    assert!(fsc_v2.index_warm);
+    assert!(!fsc_v2.coverage_window_ready);
+    assert!(!fsc_v2.authoritative_buy_ready);
+    assert_eq!(
+        fsc_v2.coverage_window_remaining_ms,
+        funding_config
+            .lookback_window_ms
+            .saturating_sub(decision_wall_ms.saturating_sub(stream_available_since_ms))
+    );
     assert!(!features.sybil_resistance.degraded_reasons.contains(
         &ghost_core::tx_intelligence::types::FSC_FUNDING_STREAM_UNAVAILABLE_REASON.to_string()
     ));
-    assert!(features.sybil_resistance.degraded_reasons.contains(
+    assert!(!features.sybil_resistance.degraded_reasons.contains(
         &ghost_core::tx_intelligence::types::FSC_ROLLING_STATE_UNAVAILABLE_REASON.to_string()
+    ));
+    assert!(features.sybil_resistance.degraded_reasons.contains(
+        &ghost_core::tx_intelligence::types::FSC_INSUFFICIENT_KNOWN_SOURCES_REASON.to_string()
+    ));
+    assert!(features.sybil_resistance.degraded_reasons.contains(
+        &ghost_core::tx_intelligence::types::FSC_COVERAGE_WINDOW_UNAVAILABLE.to_string()
     ));
 }
 

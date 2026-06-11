@@ -22,7 +22,9 @@ use ghost_core::session::types::{
     SessionDiagnostics, SessionId, SessionMetadata, SessionStatus, VerdictOutcome,
 };
 use ghost_core::shadow_ledger::TxKey;
-use ghost_core::tx_intelligence::types::{RiskFlag, TxIntelFeatures};
+use ghost_core::tx_intelligence::types::{
+    RiskFlag, TxIntelFeatures, FSC_COVERAGE_WINDOW_UNAVAILABLE,
+};
 use ghost_core::{CurveFreshnessState, LAMPORTS_PER_SOL};
 use parking_lot::RwLock;
 use seer::early_fingerprint::EarlyFingerprintMetrics;
@@ -32,6 +34,14 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub type SharedSession = Arc<RwLock<PoolObservationSession>>;
+
+fn wall_clock_epoch_ms() -> u64 {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    millis.min(u128::from(u64::MAX)) as u64
+}
 
 pub struct PoolObservationSession {
     pub session_id: SessionId,
@@ -831,6 +841,11 @@ impl PoolObservationSession {
 
     #[must_use]
     pub fn materialize_features(&self) -> MaterializedFeatureSet {
+        self.materialize_features_at(wall_clock_epoch_ms())
+    }
+
+    #[must_use]
+    pub fn materialize_features_at(&self, decision_wall_ms: u64) -> MaterializedFeatureSet {
         let account_features = self.current_account_features();
         let mut materialized = self.feature_builder.materialize(
             account_features.clone(),
@@ -957,9 +972,10 @@ impl PoolObservationSession {
             }
         }
 
-        let fsc = self.funding_source_index.compute_for_transactions(
+        let fsc = self.funding_source_index.compute_for_transactions_at(
             self.tx_buffer.iter().map(AsRef::as_ref),
             &self.funding_source_config,
+            decision_wall_ms,
         );
         materialized.sybil_resistance.funding_source_concentration =
             fsc.funding_source_concentration;
@@ -974,6 +990,26 @@ impl PoolObservationSession {
             {
                 materialized.sybil_resistance.degraded_reasons.push(reason);
             }
+        }
+        // Stream unavailable and index-cold already carry stronger typed reasons.
+        // This PR2 reason marks the partial-warmup state where FSC has capture
+        // evidence, but the full authoritative coverage window is not ready.
+        if self
+            .funding_source_config
+            .require_coverage_window_for_actionability
+            && !fsc.funding_source_v2.authoritative_buy_ready
+            && fsc.funding_source_v2.index_warm
+            && !fsc.funding_source_v2.coverage_window_ready
+            && !materialized
+                .sybil_resistance
+                .degraded_reasons
+                .iter()
+                .any(|existing| existing == FSC_COVERAGE_WINDOW_UNAVAILABLE)
+        {
+            materialized
+                .sybil_resistance
+                .degraded_reasons
+                .push(FSC_COVERAGE_WINDOW_UNAVAILABLE.to_string());
         }
 
         materialized.organic_broadening = self.materialize_v3_organic_broadening(&materialized);

@@ -11,7 +11,12 @@ use ghost_core::session::types::{
 };
 use ghost_core::tx_intelligence::types::{
     BurstWindow, RiskFlag, RiskSeverity, SybilResistanceFeatures, TxIntelFeatures,
-    TxIntelligenceState,
+    TxIntelligenceState, DBIA_INSUFFICIENT_BUYERS_REASON, DBIA_NO_DEV_BUY_REASON,
+    DBIA_PARTIAL_FINGERPRINT_COVERAGE, DBIA_RAW_FINGERPRINT_UNAVAILABLE_REASON,
+    CPV_COVERAGE_WINDOW_UNAVAILABLE, DES_NO_COMPARABLE_PAIRS,
+    DES_PARTIAL_SEQUENCE_COVERAGE, FTDI_PARTIAL_FEE_TOPOLOGY_COVERAGE,
+    FSC_COVERAGE_WINDOW_UNAVAILABLE, FSC_V2_STATUS_NOT_CLEAN,
+    SFD_BUY_AMOUNT_UNAVAILABLE, SFD_NEGATIVE_BALANCE_DELTA_SKIPPED,
 };
 use ghost_core::CurveFinality;
 use solana_sdk::pubkey::Pubkey;
@@ -229,6 +234,10 @@ fn materialized_feature_set_contains_complete_inputs() {
             funding_source_concentration: Some(0.27),
             funding_source_diagnostics: None,
             funding_source_v2: None,
+            cpv_distinct_other_pools_mean: None,
+            cpv_other_pool_activity_count_p95: None,
+            toolchain_fingerprint_coverage: None,
+            des_valid_sequence_coverage: None,
             degraded_reasons: vec!["DBIA_NO_DEV_BUY".to_string()],
             buy_sample_count: 9,
             signer_sample_count: 5,
@@ -286,4 +295,44 @@ fn materialized_feature_set_contains_complete_inputs() {
     assert_eq!(diagnostics.total_tx_seen, 9);
     assert_eq!(diagnostics.total_account_updates, 7);
     assert_eq!(diagnostics.checkpoint_count, 3);
+}
+
+#[test]
+fn pr1_public_quality_reason_codes_contract_is_complete() {
+    let mut expected = [
+        FTDI_PARTIAL_FEE_TOPOLOGY_COVERAGE,
+        DBIA_PARTIAL_FINGERPRINT_COVERAGE,
+        DES_PARTIAL_SEQUENCE_COVERAGE,
+        DES_NO_COMPARABLE_PAIRS,
+        SFD_NEGATIVE_BALANCE_DELTA_SKIPPED,
+        SFD_BUY_AMOUNT_UNAVAILABLE,
+        CPV_COVERAGE_WINDOW_UNAVAILABLE,
+        FSC_V2_STATUS_NOT_CLEAN,
+        FSC_COVERAGE_WINDOW_UNAVAILABLE,
+    ];
+    expected.sort_unstable();
+
+    let mut observed = [
+        DBIA_NO_DEV_BUY_REASON,
+        DBIA_INSUFFICIENT_BUYERS_REASON,
+        DBIA_RAW_FINGERPRINT_UNAVAILABLE_REASON,
+        FTDI_PARTIAL_FEE_TOPOLOGY_COVERAGE,
+        DBIA_PARTIAL_FINGERPRINT_COVERAGE,
+        DES_PARTIAL_SEQUENCE_COVERAGE,
+        DES_NO_COMPARABLE_PAIRS,
+        SFD_NEGATIVE_BALANCE_DELTA_SKIPPED,
+        SFD_BUY_AMOUNT_UNAVAILABLE,
+        CPV_COVERAGE_WINDOW_UNAVAILABLE,
+        FSC_V2_STATUS_NOT_CLEAN,
+        FSC_COVERAGE_WINDOW_UNAVAILABLE,
+    ];
+    observed.sort_unstable();
+
+    assert_eq!(expected.len(), 9);
+    assert!(expected.iter().all(|code| observed.binary_search(code).is_ok()));
+    assert_eq!(observed.len(), observed.iter().filter(|code| code.is_empty() == false).count());
+
+    for code in observed.iter() {
+        assert!(!code.is_empty(), "reason code string must be non-empty");
+    }
 }
