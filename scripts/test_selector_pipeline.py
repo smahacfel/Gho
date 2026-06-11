@@ -38,6 +38,7 @@ import audit_selector_shadow_score_parity as shadow_score_parity_audit
 import audit_selector_shadow_score_topk_drift as shadow_score_topk_drift
 import audit_gatekeeper_decision_vs_r2 as gk_r2_audit
 import analyze_gatekeeper_r2_policy_autopsy as policy_autopsy
+import build_gatekeeper_policy_redesign_candidates as policy_redesign_candidates
 import analyze_selector_candidate_crossrun_stability as crossrun_stability
 import build_selector_model_redesign_report as model_redesign
 import build_selector_evidence_gated_candidate_redesign as evidence_gated_redesign
@@ -8148,6 +8149,105 @@ class SelectorPipelineTests(unittest.TestCase):
             )
         )
 
+    def write_gatekeeper_policy_redesign_fixture(self, root: Path) -> tuple[str, str]:
+        runtime_scope = "runtime-policy-redesign-test"
+        selector_scope = "selector-policy-redesign-test"
+        dataset_dir = root / "datasets" / "selector" / selector_scope
+        decision_dir = (
+            root
+            / "logs"
+            / "rollout"
+            / runtime_scope
+            / "decisions"
+            / runtime_scope
+            / "v2.2"
+            / "legacy_live"
+            / "config"
+        )
+        candidates = []
+        r2_rows = []
+        decisions = []
+        for idx in range(8):
+            candidate_id = f"tail_pos_{idx}"
+            pool_id = f"pool-tail-pos-{idx}"
+            mint = f"mint-tail-pos-{idx}"
+            candidates.append({"candidate_id": candidate_id, "pool_id": pool_id, "base_mint": mint, "decision_ts_ms": 1_000 + idx})
+            r2_rows.append({"candidate_id": candidate_id, "pool_id": pool_id, "base_mint": mint, "r2_label": "positive", "r2_status": "positive"})
+            decisions.append(
+                {
+                    "pool_id": pool_id,
+                    "base_mint": mint,
+                    "decision_ts_ms": 1_000 + idx,
+                    "decision_plane": "legacy_live",
+                    "verdict_type": "REJECT_HARD_FAIL",
+                    "reason_code": "HARD_FAIL_EXTREME_TOP3",
+                    "price_change_ratio": -0.35 - idx * 0.01,
+                    "sell_buy_ratio": 2.5,
+                    "sell_share": 0.70,
+                    "top3_volume_pct": 1.0,
+                    "hhi": 0.92,
+                    "total_volume_sol": 2.0,
+                    "buy_ratio": 0.20,
+                    "tas_volume_score": 0.90,
+                    "tas_momentum_score": 0.85,
+                    "tas_buy_ratio_score": 0.40,
+                    "soft_score": 0.80,
+                }
+            )
+        for idx in range(8):
+            candidate_id = f"tail_neg_{idx}"
+            pool_id = f"pool-tail-neg-{idx}"
+            mint = f"mint-tail-neg-{idx}"
+            candidates.append({"candidate_id": candidate_id, "pool_id": pool_id, "base_mint": mint, "decision_ts_ms": 2_000 + idx})
+            r2_rows.append({"candidate_id": candidate_id, "pool_id": pool_id, "base_mint": mint, "r2_label": "negative", "r2_status": "negative"})
+            decisions.append(
+                {
+                    "pool_id": pool_id,
+                    "base_mint": mint,
+                    "decision_ts_ms": 2_000 + idx,
+                    "decision_plane": "legacy_live",
+                    "verdict_type": "BUY",
+                    "decision_verdict_buy": True,
+                    "price_change_ratio": 0.45 + idx * 0.01,
+                    "sell_buy_ratio": 0.10,
+                    "sell_share": 0.05,
+                    "top3_volume_pct": 0.20,
+                    "hhi": 0.20,
+                    "total_volume_sol": 0.3,
+                    "buy_ratio": 0.90,
+                    "tas_volume_score": 0.20,
+                    "tas_momentum_score": 0.25,
+                    "tas_buy_ratio_score": 0.80,
+                    "soft_score": 0.20,
+                }
+            )
+        write_jsonl(dataset_dir / "candidate_universe_v1.jsonl", candidates)
+        write_jsonl(dataset_dir / "r2_market_paths_v1.jsonl", r2_rows)
+        write_jsonl(decision_dir / "gatekeeper_v2_decisions.jsonl", decisions)
+        return runtime_scope, selector_scope
+
+    def run_gatekeeper_policy_redesign_fixture(self, root: Path, runtime_scope: str, selector_scope: str) -> dict:
+        return policy_redesign_candidates.build_report(
+            policy_redesign_candidates.build_parser().parse_args(
+                [
+                    "--root",
+                    str(root),
+                    "--runtime-scope",
+                    runtime_scope,
+                    "--selector-scope",
+                    selector_scope,
+                    "--decision-plane",
+                    "legacy_live",
+                    "--edge-k",
+                    "8",
+                    "--min-edge-resolved-rows",
+                    "4",
+                    "--min-edge-lift-pp",
+                    "0.20",
+                ]
+            )
+        )
+
     def test_gatekeeper_decision_vs_r2_builds_buy_reject_timeout_matrix(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -8356,6 +8456,28 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertEqual(report["global_metrics"]["hard_fail_extreme_top3_positive_rate"], 1.0)
         self.assertIn("POLICY_AUTOPSY_HARD_FAIL_ANTI_SIGNAL_DETECTED", report["policy_autopsy_statuses"])
         self.assertIn("POLICY_AUTOPSY_BUY_NO_EDGE", report["policy_autopsy_statuses"])
+
+    def test_gatekeeper_policy_redesign_finds_offline_r2_edge_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime_scope, selector_scope = self.write_gatekeeper_policy_redesign_fixture(root)
+            report = self.run_gatekeeper_policy_redesign_fixture(root, runtime_scope, selector_scope)
+
+        self.assertIn("POLICY_REDESIGN_EDGE_FOUND_OFFLINE_R2_OPPORTUNITY", report["policy_redesign_statuses"])
+        self.assertEqual(report["best_candidate"]["candidate_id"], "top3_pressure_salvage_candidate")
+        self.assertGreaterEqual(report["best_candidate"]["edge_k_precision"], 0.75)
+
+    def test_gatekeeper_policy_redesign_candidates_are_offline_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime_scope, selector_scope = self.write_gatekeeper_policy_redesign_fixture(root)
+            report = self.run_gatekeeper_policy_redesign_fixture(root, runtime_scope, selector_scope)
+
+        self.assertFalse(report["non_claims"]["runtime_changed"])
+        self.assertFalse(report["non_claims"]["gatekeeper_changed"])
+        self.assertFalse(report["non_claims"]["execution_changed"])
+        self.assertTrue(all(row["runtime_change_allowed"] is False for row in report["candidate_summaries"]))
+        self.assertTrue(all(row["requires_fresh_validation"] is True for row in report["candidate_summaries"]))
 
 
 if __name__ == "__main__":
