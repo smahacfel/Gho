@@ -8739,6 +8739,55 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertFalse(report["non_claims"]["gatekeeper_changed"])
         self.assertFalse(report["non_claims"]["execution_changed"])
 
+    def test_gatekeeper_edge_policy_fork_supports_per_candidate_topk(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime_scope, selector_scope = self.write_gatekeeper_policy_redesign_fixture(root)
+            report = gatekeeper_edge_policy_fork.build_report(
+                gatekeeper_edge_policy_fork.build_parser().parse_args(
+                    [
+                        "--root",
+                        str(root),
+                        "--runtime-scope",
+                        runtime_scope,
+                        "--selector-scope",
+                        selector_scope,
+                        "--decision-plane",
+                        "legacy_live",
+                        "--candidate-topk",
+                        "tas_volume_momentum_candidate=4",
+                        "--min-opportunity-resolved-rows",
+                        "4",
+                        "--min-opportunity-lift-pp",
+                        "0.20",
+                    ]
+                )
+            )
+            with Path(report["outputs"]["rows_csv"]).open(encoding="utf-8") as fh:
+                materialized = list(csv.DictReader(fh))
+
+        selected = [
+            row
+            for row in materialized
+            if row["policy_fork_verdict"] == "WOULD_ALLOW_R2_OPPORTUNITY_NOT_EXECUTION_SAFE"
+        ]
+        summary_groups = {row["group"] for row in report["summary_rows"]}
+
+        self.assertEqual(report["candidate_ids"], ["tas_volume_momentum_candidate"])
+        self.assertEqual(report["candidate_topk"], {"tas_volume_momentum_candidate": 4})
+        self.assertEqual(report["selection_contract"]["selection_mode"], "candidate_topk")
+        self.assertIn("GK_EDGE_POLICY_FORK_R2_OPPORTUNITY_CONFIRMED_OFFLINE", report["policy_fork_statuses"])
+        self.assertEqual(len(selected), 4)
+        self.assertTrue(
+            all(row["policy_fork_candidate_id"] == "tas_volume_momentum_candidate" for row in selected)
+        )
+        self.assertIn("policy_fork_would_allow:tas_volume_momentum_candidate", summary_groups)
+        self.assertNotIn("policy_fork_would_allow:tail_pressure_reversal_candidate", summary_groups)
+        self.assertNotIn("policy_fork_would_allow:top3_pressure_salvage_candidate", summary_groups)
+        self.assertFalse(report["non_claims"]["runtime_changed"])
+        self.assertFalse(report["non_claims"]["gatekeeper_changed"])
+        self.assertFalse(report["non_claims"]["execution_changed"])
+
     def test_gatekeeper_edge_policy_fork_training_view_keeps_toxic_concentration(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

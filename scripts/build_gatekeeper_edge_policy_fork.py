@@ -49,6 +49,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--nearest-tolerance-ms", type=int, default=120_000)
     parser.add_argument("--edge-k", type=int, default=1000)
     parser.add_argument("--candidate-id", action="append", default=None)
+    parser.add_argument(
+        "--candidate-topk",
+        action="append",
+        default=None,
+        metavar="CANDIDATE_ID=K",
+        help=(
+            "Select a candidate-specific TopK. When provided without --candidate-id, "
+            "the fork uses only these candidate IDs. With --candidate-id, entries add "
+            "or override the TopK for the named candidates."
+        ),
+    )
     parser.add_argument("--min-opportunity-lift-pp", type=float, default=0.10)
     parser.add_argument("--min-opportunity-resolved-rows", type=int, default=75)
     parser.add_argument("--output", default=None)
@@ -77,8 +88,36 @@ def candidate_defs_by_id() -> dict[str, dict[str, Any]]:
     return {str(candidate["candidate_id"]): candidate for candidate in redesign.candidate_defs()}
 
 
+def parse_candidate_topk(args: argparse.Namespace) -> dict[str, int]:
+    known = candidate_defs_by_id()
+    out: dict[str, int] = {}
+    for raw in args.candidate_topk or []:
+        if "=" not in raw:
+            raise SystemExit(f"invalid candidate_topk '{raw}': expected CANDIDATE_ID=K")
+        candidate_id, raw_k = raw.split("=", 1)
+        candidate_id = candidate_id.strip()
+        if candidate_id not in known:
+            raise SystemExit(f"unknown candidate_id in candidate_topk: {candidate_id}")
+        if candidate_id in out:
+            raise SystemExit(f"duplicate candidate_topk for candidate_id: {candidate_id}")
+        try:
+            k = int(raw_k)
+        except ValueError as exc:
+            raise SystemExit(f"invalid candidate_topk K for {candidate_id}: {raw_k}") from exc
+        if k <= 0:
+            raise SystemExit(f"invalid candidate_topk K for {candidate_id}: must be > 0")
+        out[candidate_id] = k
+    return out
+
+
 def requested_candidate_ids(args: argparse.Namespace) -> list[str]:
-    ids = args.candidate_id or list(DEFAULT_POLICY_CANDIDATES)
+    candidate_topk = parse_candidate_topk(args)
+    if args.candidate_id:
+        ids = [*args.candidate_id, *candidate_topk.keys()]
+    elif candidate_topk:
+        ids = list(candidate_topk.keys())
+    else:
+        ids = list(DEFAULT_POLICY_CANDIDATES)
     known = candidate_defs_by_id()
     unknown = [candidate_id for candidate_id in ids if candidate_id not in known]
     if unknown:
@@ -95,14 +134,18 @@ def current_buy(row: dict[str, Any]) -> bool:
 
 
 def selected_opportunities(
-    rows: list[dict[str, Any]], candidate_ids: list[str], edge_k: int
+    rows: list[dict[str, Any]],
+    candidate_ids: list[str],
+    edge_k: int,
+    candidate_topk: dict[str, int],
 ) -> dict[str, list[dict[str, Any]]]:
     known = candidate_defs_by_id()
     selected: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for candidate_id in candidate_ids:
         candidate = known[candidate_id]
         ranked = redesign.rank_rows(rows, candidate["score_fn"])
-        for rank, (score, row) in enumerate(ranked[: min(edge_k, len(ranked))], start=1):
+        top_k = int(candidate_topk.get(candidate_id, edge_k))
+        for rank, (score, row) in enumerate(ranked[: min(top_k, len(ranked))], start=1):
             selected[row_key(row)].append(
                 {
                     "candidate_id": candidate_id,
@@ -349,9 +392,10 @@ def write_markdown(path: Path, report: dict[str, Any]) -> None:
 def build_report(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.root)
     outputs = default_outputs(root, args.selector_scope, args)
+    candidate_topk = parse_candidate_topk(args)
     candidate_ids = requested_candidate_ids(args)
     rows, join_manifest = redesign.load_rows(args)
-    selected = selected_opportunities(rows, candidate_ids, int(args.edge_k))
+    selected = selected_opportunities(rows, candidate_ids, int(args.edge_k), candidate_topk)
     fork_rows = materialize_rows(rows, selected)
     resolved = [row for row in fork_rows if row["r2_class"] in {"positive", "negative"}]
     positives = sum(1 for row in resolved if row["r2_class"] == "positive")
@@ -397,7 +441,13 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "decision_plane": args.decision_plane,
         "input_source": args.input_source,
         "edge_k": int(args.edge_k),
+        "candidate_topk": candidate_topk,
         "candidate_ids": candidate_ids,
+        "selection_contract": {
+            "selection_mode": "candidate_topk" if candidate_topk else "global_edge_k",
+            "default_edge_k": int(args.edge_k),
+            "candidate_topk": candidate_topk,
+        },
         "join_manifest": join_manifest,
         "global_metrics": {
             "decision_rows": len(fork_rows),
