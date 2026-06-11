@@ -1,13 +1,14 @@
 use crate::events::PoolTransaction;
+use ghost_brain::config::GatekeeperV2Config;
 use ghost_core::tx_intelligence::types::{
     SybilResistanceFeatures, DBIA_INSUFFICIENT_BUYERS_REASON, DBIA_NO_DEV_BUY_REASON,
-    DBIA_RAW_FINGERPRINT_UNAVAILABLE_REASON, DES_CURVE_DATA_UNAVAILABLE_REASON,
-    DES_INSUFFICIENT_BUYS_REASON, DES_SLOT_ORDER_UNAVAILABLE_REASON, FTDI_INSUFFICIENT_BUYS_REASON,
-    FTDI_RAW_FEE_TOPOLOGY_UNAVAILABLE_REASON, SFD_INSUFFICIENT_BUYS_REASON,
-    SFD_PARTIAL_BALANCE_COVERAGE_REASON, SFD_POSTBALANCE_UNAVAILABLE_REASON,
-    SFD_ZERO_PREBALANCE_SKIPPED_REASON,
+    DBIA_PARTIAL_FINGERPRINT_COVERAGE, DBIA_RAW_FINGERPRINT_UNAVAILABLE_REASON,
+    DES_CURVE_DATA_UNAVAILABLE_REASON, DES_INSUFFICIENT_BUYS_REASON,
+    DES_SLOT_ORDER_UNAVAILABLE_REASON, FTDI_INSUFFICIENT_BUYS_REASON,
+    FTDI_PARTIAL_FEE_TOPOLOGY_COVERAGE, FTDI_RAW_FEE_TOPOLOGY_UNAVAILABLE_REASON,
+    SFD_INSUFFICIENT_BUYS_REASON, SFD_PARTIAL_BALANCE_COVERAGE_REASON,
+    SFD_POSTBALANCE_UNAVAILABLE_REASON, SFD_ZERO_PREBALANCE_SKIPPED_REASON,
 };
-use ghost_brain::config::GatekeeperV2Config;
 use seer::types::ToolchainFingerprintInput;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -18,6 +19,10 @@ const DBIA_CU_LIMIT_WEIGHT: f64 = 0.05;
 const DBIA_CU_PRICE_WEIGHT: f64 = 0.05;
 const DBIA_INNER_GROUP_WEIGHT: f64 = 0.25;
 const DBIA_FEE_TOPOLOGY_WEIGHT: f64 = 0.20;
+const DBIA_ACCOUNT_KEYS_SCALE: f64 = 8.0;
+const DBIA_OUTER_INSTRUCTION_SCALE: f64 = 4.0;
+const DBIA_INNER_GROUP_SCALE: f64 = 4.0;
+const DBIA_FEE_TOPOLOGY_SCALE: f64 = 3.0;
 const DES_SIGN_EPSILON: f64 = 1e-12;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -36,8 +41,8 @@ impl SybilMetricQualityConfig {
             min_des_valid_sequence_coverage: config.min_des_valid_sequence_coverage,
             cpv_min_observed_window_ratio: config.cpv_min_observed_window_ratio,
             fsc_require_clean_v2_for_actionability: config.fsc_require_clean_v2_for_actionability,
-            fsc_require_coverage_window_for_actionability:
-                config.fsc_require_coverage_window_for_actionability,
+            fsc_require_coverage_window_for_actionability: config
+                .fsc_require_coverage_window_for_actionability,
         }
     }
 }
@@ -48,6 +53,7 @@ pub struct FtdiComputation {
     pub degraded_reasons: Vec<String>,
     pub buy_sample_count: u64,
     pub signer_sample_count: u64,
+    pub toolchain_fingerprint_coverage: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -56,6 +62,7 @@ pub struct DbiaComputation {
     pub degraded_reasons: Vec<String>,
     pub buy_sample_count: u64,
     pub signer_sample_count: u64,
+    pub toolchain_fingerprint_coverage: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -123,6 +130,18 @@ struct SelectedSfdSample<'a> {
     coverage: SfdSampleCoverage,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolchainMetricKind {
+    Ftdi,
+    Dbia,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SelectedToolchainSample<'a> {
+    tx: &'a PoolTransaction,
+    usable: bool,
+}
+
 impl InfrastructureFingerprint {
     fn from_input(input: &ToolchainFingerprintInput) -> Option<Self> {
         Some(Self {
@@ -140,26 +159,50 @@ impl InfrastructureFingerprint {
 
     fn similarity(&self, other: &Self) -> f64 {
         let mut distance = 0.0;
-        if self.account_keys_len != other.account_keys_len {
-            distance += DBIA_ACCOUNT_KEYS_WEIGHT;
-        }
-        if self.outer_instruction_count != other.outer_instruction_count {
-            distance += DBIA_OUTER_INSTRUCTION_WEIGHT;
-        }
+        distance += normalized_u32_distance(
+            self.account_keys_len,
+            other.account_keys_len,
+            DBIA_ACCOUNT_KEYS_SCALE,
+        ) * DBIA_ACCOUNT_KEYS_WEIGHT;
+        distance += normalized_u32_distance(
+            self.outer_instruction_count,
+            other.outer_instruction_count,
+            DBIA_OUTER_INSTRUCTION_SCALE,
+        ) * DBIA_OUTER_INSTRUCTION_WEIGHT;
         if self.has_set_compute_unit_limit != other.has_set_compute_unit_limit {
             distance += DBIA_CU_LIMIT_WEIGHT;
         }
         if self.has_set_compute_unit_price != other.has_set_compute_unit_price {
             distance += DBIA_CU_PRICE_WEIGHT;
         }
-        if self.inner_instruction_group_count != other.inner_instruction_group_count {
-            distance += DBIA_INNER_GROUP_WEIGHT;
-        }
-        if self.fee_topology != other.fee_topology {
-            distance += DBIA_FEE_TOPOLOGY_WEIGHT;
-        }
-        1.0 - distance
+        distance += normalized_u32_distance(
+            self.inner_instruction_group_count,
+            other.inner_instruction_group_count,
+            DBIA_INNER_GROUP_SCALE,
+        ) * DBIA_INNER_GROUP_WEIGHT;
+        distance += self.fee_topology.distance(&other.fee_topology) * DBIA_FEE_TOPOLOGY_WEIGHT;
+        (1.0 - distance).clamp(0.0, 1.0)
     }
+}
+
+impl FeeTopology {
+    fn distance(&self, other: &Self) -> f64 {
+        let external = normalized_u32_distance(
+            self.external_fee_count,
+            other.external_fee_count,
+            DBIA_FEE_TOPOLOGY_SCALE,
+        );
+        let internal = normalized_u32_distance(
+            self.internal_fee_count,
+            other.internal_fee_count,
+            DBIA_FEE_TOPOLOGY_SCALE,
+        );
+        (external + internal) / 2.0
+    }
+}
+
+fn normalized_u32_distance(left: u32, right: u32, scale: f64) -> f64 {
+    (left.abs_diff(right) as f64 / scale).min(1.0)
 }
 
 fn successful_buy_txs<'a>(
@@ -193,15 +236,46 @@ fn buy_sample_stats(buy_txs: &[&PoolTransaction]) -> BuySampleStats {
     }
 }
 
-fn unique_buyer_samples<'a>(buy_txs: &[&'a PoolTransaction]) -> Vec<&'a PoolTransaction> {
-    let mut seen_signers = HashSet::<&str>::new();
-    let mut unique_samples = Vec::new();
-    for &tx in buy_txs {
-        if seen_signers.insert(tx.signer.as_str()) {
-            unique_samples.push(tx);
+fn toolchain_sample_usable(tx: &PoolTransaction, metric_kind: ToolchainMetricKind) -> bool {
+    match metric_kind {
+        ToolchainMetricKind::Ftdi => tx.toolchain_fingerprint.fee_topology().is_some(),
+        ToolchainMetricKind::Dbia => {
+            InfrastructureFingerprint::from_input(&tx.toolchain_fingerprint).is_some()
         }
     }
-    unique_samples
+}
+
+fn best_toolchain_sample_per_signer<'a>(
+    buy_txs: &[&'a PoolTransaction],
+    metric_kind: ToolchainMetricKind,
+) -> Vec<&'a PoolTransaction> {
+    let mut signer_order = Vec::<String>::new();
+    let mut selected = HashMap::<String, SelectedToolchainSample<'a>>::new();
+
+    for &tx in buy_txs {
+        let signer = tx.signer.clone();
+        let usable = toolchain_sample_usable(tx, metric_kind);
+        match selected.get_mut(&signer) {
+            Some(best) => {
+                if usable && !best.usable {
+                    *best = SelectedToolchainSample { tx, usable };
+                }
+            }
+            None => {
+                signer_order.push(signer.clone());
+                selected.insert(signer, SelectedToolchainSample { tx, usable });
+            }
+        }
+    }
+
+    signer_order
+        .into_iter()
+        .filter_map(|signer| selected.get(&signer).map(|sample| sample.tx))
+        .collect()
+}
+
+fn toolchain_coverage(usable_count: usize, total_count: usize) -> Option<f64> {
+    (total_count > 0).then_some(usable_count as f64 / total_count as f64)
 }
 
 fn sfd_sample_coverage(tx: &PoolTransaction) -> SfdSampleCoverage {
@@ -355,10 +429,14 @@ pub fn compute_ftdi<'a>(
     transactions: impl IntoIterator<Item = &'a PoolTransaction>,
 ) -> FtdiComputation {
     let buy_txs = successful_buy_txs(transactions);
-    compute_ftdi_from_buys(&buy_txs)
+    let quality = SybilMetricQualityConfig::from_gatekeeper_config(&GatekeeperV2Config::default());
+    compute_ftdi_from_buys(&buy_txs, &quality)
 }
 
-fn compute_ftdi_from_buys(buy_txs: &[&PoolTransaction]) -> FtdiComputation {
+fn compute_ftdi_from_buys(
+    buy_txs: &[&PoolTransaction],
+    quality: &SybilMetricQualityConfig,
+) -> FtdiComputation {
     let stats = buy_sample_stats(buy_txs);
     if stats.buy_sample_count < 3 {
         return FtdiComputation {
@@ -366,35 +444,61 @@ fn compute_ftdi_from_buys(buy_txs: &[&PoolTransaction]) -> FtdiComputation {
             degraded_reasons: vec![FTDI_INSUFFICIENT_BUYS_REASON.to_string()],
             buy_sample_count: stats.buy_sample_count,
             signer_sample_count: stats.signer_sample_count,
+            toolchain_fingerprint_coverage: None,
         };
     }
 
-    let unique_samples = unique_buyer_samples(buy_txs);
+    let unique_samples = best_toolchain_sample_per_signer(buy_txs, ToolchainMetricKind::Ftdi);
+    if unique_samples.len() < 3 {
+        return FtdiComputation {
+            fee_topology_diversity_index: None,
+            degraded_reasons: vec![FTDI_INSUFFICIENT_BUYS_REASON.to_string()],
+            buy_sample_count: stats.buy_sample_count,
+            signer_sample_count: stats.signer_sample_count,
+            toolchain_fingerprint_coverage: None,
+        };
+    }
+
     let mut unique_topologies = HashSet::<FeeTopology>::new();
+    let mut usable_count = 0usize;
     for tx in &unique_samples {
         let Some((external_fee_count, internal_fee_count)) =
             tx.toolchain_fingerprint.fee_topology()
         else {
-            return FtdiComputation {
-                fee_topology_diversity_index: None,
-                degraded_reasons: vec![FTDI_RAW_FEE_TOPOLOGY_UNAVAILABLE_REASON.to_string()],
-                buy_sample_count: stats.buy_sample_count,
-                signer_sample_count: stats.signer_sample_count,
-            };
+            continue;
         };
 
+        usable_count += 1;
         unique_topologies.insert(FeeTopology {
             external_fee_count,
             internal_fee_count,
         });
     }
 
+    let coverage = toolchain_coverage(usable_count, unique_samples.len());
+    if usable_count < 3
+        || coverage.map_or(true, |value| value < quality.min_toolchain_metric_coverage)
+    {
+        return FtdiComputation {
+            fee_topology_diversity_index: None,
+            degraded_reasons: vec![FTDI_RAW_FEE_TOPOLOGY_UNAVAILABLE_REASON.to_string()],
+            buy_sample_count: stats.buy_sample_count,
+            signer_sample_count: stats.signer_sample_count,
+            toolchain_fingerprint_coverage: coverage,
+        };
+    }
+
+    let mut degraded_reasons = Vec::new();
+    if usable_count < unique_samples.len() {
+        degraded_reasons.push(FTDI_PARTIAL_FEE_TOPOLOGY_COVERAGE.to_string());
+    }
+
     FtdiComputation {
-        fee_topology_diversity_index: (!unique_samples.is_empty())
-            .then(|| unique_topologies.len() as f64 / unique_samples.len() as f64),
-        degraded_reasons: Vec::new(),
+        fee_topology_diversity_index: Some(unique_topologies.len() as f64 / usable_count as f64),
+        degraded_reasons,
         buy_sample_count: stats.buy_sample_count,
         signer_sample_count: stats.signer_sample_count,
+        toolchain_fingerprint_coverage: coverage,
     }
 }
 
@@ -403,24 +507,27 @@ pub fn compute_dbia<'a>(
     dev_wallet: Option<&'a str>,
 ) -> DbiaComputation {
     let buy_txs = successful_buy_txs(transactions);
-    compute_dbia_from_buys(&buy_txs, dev_wallet)
+    let quality = SybilMetricQualityConfig::from_gatekeeper_config(&GatekeeperV2Config::default());
+    compute_dbia_from_buys(&buy_txs, dev_wallet, &quality)
 }
 
 fn compute_dbia_from_buys<'a>(
     buy_txs: &[&'a PoolTransaction],
     dev_wallet: Option<&'a str>,
+    quality: &SybilMetricQualityConfig,
 ) -> DbiaComputation {
     let stats = buy_sample_stats(buy_txs);
-    let unique_samples = unique_buyer_samples(buy_txs);
-    let Some(dev_wallet) = resolve_dev_wallet(&unique_samples, dev_wallet) else {
+    let selected_samples = best_toolchain_sample_per_signer(buy_txs, ToolchainMetricKind::Dbia);
+    let Some(dev_wallet) = resolve_dev_wallet(buy_txs, dev_wallet) else {
         return DbiaComputation {
             dev_buyer_infrastructure_affinity: None,
             degraded_reasons: vec![DBIA_NO_DEV_BUY_REASON.to_string()],
             buy_sample_count: stats.buy_sample_count,
             signer_sample_count: stats.signer_sample_count,
+            toolchain_fingerprint_coverage: None,
         };
     };
-    let Some(dev_tx) = unique_samples
+    let Some(dev_tx) = selected_samples
         .iter()
         .copied()
         .find(|tx| tx.signer == dev_wallet)
@@ -430,49 +537,74 @@ fn compute_dbia_from_buys<'a>(
             degraded_reasons: vec![DBIA_NO_DEV_BUY_REASON.to_string()],
             buy_sample_count: stats.buy_sample_count,
             signer_sample_count: stats.signer_sample_count,
+            toolchain_fingerprint_coverage: None,
         };
     };
+
+    let non_dev_total = selected_samples
+        .iter()
+        .filter(|tx| tx.signer != dev_wallet)
+        .count();
+    if non_dev_total < 2 {
+        return DbiaComputation {
+            dev_buyer_infrastructure_affinity: None,
+            degraded_reasons: vec![DBIA_INSUFFICIENT_BUYERS_REASON.to_string()],
+            buy_sample_count: stats.buy_sample_count,
+            signer_sample_count: stats.signer_sample_count,
+            toolchain_fingerprint_coverage: None,
+        };
+    }
+
+    let usable_count = selected_samples
+        .iter()
+        .filter(|tx| InfrastructureFingerprint::from_input(&tx.toolchain_fingerprint).is_some())
+        .count();
+    let coverage = toolchain_coverage(usable_count, selected_samples.len());
+
     let Some(dev_fp) = InfrastructureFingerprint::from_input(&dev_tx.toolchain_fingerprint) else {
         return DbiaComputation {
             dev_buyer_infrastructure_affinity: None,
             degraded_reasons: vec![DBIA_RAW_FINGERPRINT_UNAVAILABLE_REASON.to_string()],
             buy_sample_count: stats.buy_sample_count,
             signer_sample_count: stats.signer_sample_count,
+            toolchain_fingerprint_coverage: coverage,
         };
     };
 
-    let buyer_txs: Vec<&PoolTransaction> = unique_samples
-        .into_iter()
+    let buyer_fingerprints: Vec<InfrastructureFingerprint> = selected_samples
+        .iter()
         .filter(|tx| tx.signer != dev_wallet)
+        .filter_map(|tx| InfrastructureFingerprint::from_input(&tx.toolchain_fingerprint))
         .collect();
-    if buyer_txs.len() < 2 {
+
+    if buyer_fingerprints.len() < 2
+        || coverage.map_or(true, |value| value < quality.min_toolchain_metric_coverage)
+    {
         return DbiaComputation {
             dev_buyer_infrastructure_affinity: None,
-            degraded_reasons: vec![DBIA_INSUFFICIENT_BUYERS_REASON.to_string()],
+            degraded_reasons: vec![DBIA_RAW_FINGERPRINT_UNAVAILABLE_REASON.to_string()],
             buy_sample_count: stats.buy_sample_count,
             signer_sample_count: stats.signer_sample_count,
+            toolchain_fingerprint_coverage: coverage,
         };
     }
 
     let mut similarity_sum = 0.0;
-    for tx in buyer_txs.iter().copied() {
-        let Some(fingerprint) = InfrastructureFingerprint::from_input(&tx.toolchain_fingerprint)
-        else {
-            return DbiaComputation {
-                dev_buyer_infrastructure_affinity: None,
-                degraded_reasons: vec![DBIA_RAW_FINGERPRINT_UNAVAILABLE_REASON.to_string()],
-                buy_sample_count: stats.buy_sample_count,
-                signer_sample_count: stats.signer_sample_count,
-            };
-        };
-        similarity_sum += dev_fp.similarity(&fingerprint);
+    for fingerprint in &buyer_fingerprints {
+        similarity_sum += dev_fp.similarity(fingerprint);
+    }
+
+    let mut degraded_reasons = Vec::new();
+    if usable_count < selected_samples.len() {
+        degraded_reasons.push(DBIA_PARTIAL_FINGERPRINT_COVERAGE.to_string());
     }
 
     DbiaComputation {
-        dev_buyer_infrastructure_affinity: Some(similarity_sum / buyer_txs.len() as f64),
-        degraded_reasons: Vec::new(),
+        dev_buyer_infrastructure_affinity: Some(similarity_sum / buyer_fingerprints.len() as f64),
+        degraded_reasons,
         buy_sample_count: stats.buy_sample_count,
         signer_sample_count: stats.signer_sample_count,
+        toolchain_fingerprint_coverage: coverage,
     }
 }
 
@@ -621,10 +753,19 @@ pub fn compute_sybil_resistance<'a>(
     transactions: impl IntoIterator<Item = &'a PoolTransaction>,
     dev_wallet: Option<&'a str>,
 ) -> SybilResistanceFeatures {
+    compute_sybil_resistance_with_config(transactions, dev_wallet, &GatekeeperV2Config::default())
+}
+
+pub fn compute_sybil_resistance_with_config<'a>(
+    transactions: impl IntoIterator<Item = &'a PoolTransaction>,
+    dev_wallet: Option<&'a str>,
+    config: &GatekeeperV2Config,
+) -> SybilResistanceFeatures {
     let transactions: Vec<&PoolTransaction> = transactions.into_iter().collect();
     let buy_txs = successful_buy_txs(transactions.iter().copied());
-    let ftdi = compute_ftdi_from_buys(&buy_txs);
-    let dbia = compute_dbia_from_buys(&buy_txs, dev_wallet);
+    let quality = SybilMetricQualityConfig::from_gatekeeper_config(config);
+    let ftdi = compute_ftdi_from_buys(&buy_txs, &quality);
+    let dbia = compute_dbia_from_buys(&buy_txs, dev_wallet, &quality);
     let sfd = compute_sfd_from_buys(&buy_txs);
     let des = compute_des_from_transactions(&transactions);
 
@@ -649,6 +790,14 @@ pub fn compute_sybil_resistance<'a>(
         degraded_reasons,
         buy_sample_count: ftdi.buy_sample_count,
         signer_sample_count: ftdi.signer_sample_count,
+        toolchain_fingerprint_coverage: match (
+            ftdi.toolchain_fingerprint_coverage,
+            dbia.toolchain_fingerprint_coverage,
+        ) {
+            (Some(ftdi_coverage), Some(dbia_coverage)) => Some(ftdi_coverage.min(dbia_coverage)),
+            (Some(coverage), None) | (None, Some(coverage)) => Some(coverage),
+            (None, None) => None,
+        },
         ..SybilResistanceFeatures::default()
     }
 }
@@ -890,6 +1039,44 @@ mod tests {
     }
 
     #[test]
+    fn ftdi_uses_later_complete_toolchain_sample_for_same_signer() {
+        let txs = vec![
+            buy_tx("a", "sig-a-missing", ftdi_fingerprint(None)),
+            buy_tx("a", "sig-a-complete", ftdi_fingerprint(Some((0, 0)))),
+            buy_tx("b", "sig-b", ftdi_fingerprint(Some((1, 0)))),
+            buy_tx("c", "sig-c", ftdi_fingerprint(Some((2, 0)))),
+        ];
+
+        let result = compute_ftdi(txs.iter());
+
+        assert_eq!(result.fee_topology_diversity_index, Some(1.0));
+        assert!(result.degraded_reasons.is_empty());
+        assert_eq!(result.buy_sample_count, 4);
+        assert_eq!(result.signer_sample_count, 3);
+        assert_eq!(result.toolchain_fingerprint_coverage, Some(1.0));
+    }
+
+    #[test]
+    fn ftdi_partial_fee_topology_coverage_materializes_above_threshold() {
+        let txs = vec![
+            buy_tx("a", "sig-a", ftdi_fingerprint(Some((0, 0)))),
+            buy_tx("b", "sig-b", ftdi_fingerprint(Some((1, 0)))),
+            buy_tx("c", "sig-c", ftdi_fingerprint(Some((2, 0)))),
+            buy_tx("d", "sig-d", ftdi_fingerprint(Some((3, 0)))),
+            buy_tx("e", "sig-e-missing", ftdi_fingerprint(None)),
+        ];
+
+        let result = compute_ftdi(txs.iter());
+
+        assert_eq!(result.fee_topology_diversity_index, Some(1.0));
+        assert_eq!(
+            result.degraded_reasons,
+            vec![FTDI_PARTIAL_FEE_TOPOLOGY_COVERAGE.to_string()]
+        );
+        assert_eq!(result.toolchain_fingerprint_coverage, Some(0.8));
+    }
+
+    #[test]
     fn dbia_requires_dev_buy_in_window() {
         let txs = vec![
             dbia_buy_tx(
@@ -962,6 +1149,110 @@ mod tests {
         assert!(result.degraded_reasons.is_empty());
         assert_eq!(result.buy_sample_count, 3);
         assert_eq!(result.signer_sample_count, 3);
+        assert_eq!(result.toolchain_fingerprint_coverage, Some(1.0));
+    }
+
+    #[test]
+    fn dbia_uses_later_complete_toolchain_sample_for_same_signer() {
+        let shared = dbia_fingerprint(12, 3, true, true, 2, (0, 0));
+        let txs = vec![
+            dbia_buy_tx("dev", "sig-dev", true, shared.clone()),
+            dbia_buy_tx(
+                "buyer-a",
+                "sig-a-missing",
+                false,
+                ToolchainFingerprintInput::default(),
+            ),
+            dbia_buy_tx("buyer-a", "sig-a-complete", false, shared.clone()),
+            dbia_buy_tx("buyer-b", "sig-b", false, shared),
+        ];
+
+        let result = compute_dbia(txs.iter(), Some("dev"));
+
+        assert_eq!(result.dev_buyer_infrastructure_affinity, Some(1.0));
+        assert!(result.degraded_reasons.is_empty());
+        assert_eq!(result.buy_sample_count, 4);
+        assert_eq!(result.signer_sample_count, 3);
+        assert_eq!(result.toolchain_fingerprint_coverage, Some(1.0));
+    }
+
+    #[test]
+    fn dbia_uses_later_complete_dev_toolchain_sample() {
+        let shared = dbia_fingerprint(12, 3, true, true, 2, (0, 0));
+        let txs = vec![
+            dbia_buy_tx(
+                "dev",
+                "sig-dev-missing",
+                true,
+                ToolchainFingerprintInput::default(),
+            ),
+            dbia_buy_tx("dev", "sig-dev-complete", true, shared.clone()),
+            dbia_buy_tx("buyer-a", "sig-a", false, shared.clone()),
+            dbia_buy_tx("buyer-b", "sig-b", false, shared),
+        ];
+
+        let result = compute_dbia(txs.iter(), Some("dev"));
+
+        assert_eq!(result.dev_buyer_infrastructure_affinity, Some(1.0));
+        assert!(result.degraded_reasons.is_empty());
+        assert_eq!(result.buy_sample_count, 4);
+        assert_eq!(result.signer_sample_count, 3);
+        assert_eq!(result.toolchain_fingerprint_coverage, Some(1.0));
+    }
+
+    #[test]
+    fn dbia_partial_fingerprint_coverage_materializes_above_threshold() {
+        let shared = dbia_fingerprint(12, 3, true, true, 2, (0, 0));
+        let txs = vec![
+            dbia_buy_tx("dev", "sig-dev", true, shared.clone()),
+            dbia_buy_tx("buyer-a", "sig-a", false, shared.clone()),
+            dbia_buy_tx("buyer-b", "sig-b", false, shared.clone()),
+            dbia_buy_tx("buyer-c", "sig-c", false, shared),
+            dbia_buy_tx(
+                "buyer-d",
+                "sig-d-missing",
+                false,
+                ToolchainFingerprintInput::default(),
+            ),
+        ];
+
+        let result = compute_dbia(txs.iter(), Some("dev"));
+
+        assert_eq!(result.dev_buyer_infrastructure_affinity, Some(1.0));
+        assert_eq!(
+            result.degraded_reasons,
+            vec![DBIA_PARTIAL_FINGERPRINT_COVERAGE.to_string()]
+        );
+        assert_eq!(result.toolchain_fingerprint_coverage, Some(0.8));
+    }
+
+    #[test]
+    fn dbia_small_numeric_delta_uses_scaled_distance() {
+        let txs = vec![
+            dbia_buy_tx(
+                "dev",
+                "sig-dev",
+                true,
+                dbia_fingerprint(12, 7, true, true, 2, (0, 0)),
+            ),
+            dbia_buy_tx(
+                "buyer-a",
+                "sig-a",
+                false,
+                dbia_fingerprint(12, 8, true, true, 2, (0, 0)),
+            ),
+            dbia_buy_tx(
+                "buyer-b",
+                "sig-b",
+                false,
+                dbia_fingerprint(12, 8, true, true, 2, (0, 0)),
+            ),
+        ];
+
+        let result = compute_dbia(txs.iter(), Some("dev"));
+
+        assert_approx_eq(result.dev_buyer_infrastructure_affinity.unwrap(), 0.9375);
+        assert!(result.degraded_reasons.is_empty());
     }
 
     #[test]
@@ -977,13 +1268,13 @@ mod tests {
                 "buyer-a",
                 "sig-a",
                 false,
-                dbia_fingerprint(20, 6, false, false, 5, (2, 1)),
+                dbia_fingerprint(30, 10, false, false, 8, (3, 3)),
             ),
             dbia_buy_tx(
                 "buyer-b",
                 "sig-b",
                 false,
-                dbia_fingerprint(18, 5, false, false, 4, (3, 1)),
+                dbia_fingerprint(28, 9, false, false, 7, (4, 4)),
             ),
         ];
 
@@ -1023,6 +1314,7 @@ mod tests {
             result.degraded_reasons,
             vec![DBIA_RAW_FINGERPRINT_UNAVAILABLE_REASON.to_string()]
         );
+        assert_approx_eq(result.toolchain_fingerprint_coverage.unwrap(), 2.0 / 3.0);
     }
 
     #[test]

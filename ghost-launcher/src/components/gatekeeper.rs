@@ -3815,6 +3815,10 @@ pub fn compute_bonding_curve_dynamics(price_history: &[PricePoint]) -> BondingCu
 }
 
 impl GatekeeperBuffer {
+    pub const fn config(&self) -> &GatekeeperV2Config {
+        &self.config
+    }
+
     fn now_wall_ms() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)

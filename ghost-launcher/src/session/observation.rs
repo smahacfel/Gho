@@ -3,8 +3,8 @@ use crate::components::gatekeeper::GatekeeperVerdict;
 use crate::components::gatekeeper::{GatekeeperBuffer, GatekeeperIngressOutcome};
 use crate::events::PoolTransaction;
 use crate::tx_intelligence::{
-    compute_sybil_resistance, CrossPoolVelocityConfig, CrossPoolVelocityIndex, FundingSourceConfig,
-    FundingSourceIndex, TxIntelligenceConfig, TxIntelligenceEngine,
+    compute_sybil_resistance_with_config, CrossPoolVelocityConfig, CrossPoolVelocityIndex,
+    FundingSourceConfig, FundingSourceIndex, TxIntelligenceConfig, TxIntelligenceEngine,
     DEFAULT_SESSION_TX_RING_CAPACITY,
 };
 use ghost_brain::config::GatekeeperV2Config;
@@ -926,9 +926,10 @@ impl PoolObservationSession {
                 .find(|tx| tx.is_buy && tx.success && tx.is_dev_buy)
                 .map(|tx| tx.signer.clone())
         });
-        let sybil = compute_sybil_resistance(
+        let sybil = compute_sybil_resistance_with_config(
             self.tx_buffer.iter().map(AsRef::as_ref),
             sybil_dev_wallet.as_deref(),
+            self.gatekeeper_buffer.config(),
         );
         materialized.sybil_resistance.fee_topology_diversity_index =
             sybil.fee_topology_diversity_index;
@@ -940,6 +941,8 @@ impl PoolObservationSession {
         materialized.sybil_resistance.degraded_reasons = sybil.degraded_reasons;
         materialized.sybil_resistance.buy_sample_count = sybil.buy_sample_count;
         materialized.sybil_resistance.signer_sample_count = sybil.signer_sample_count;
+        materialized.sybil_resistance.toolchain_fingerprint_coverage =
+            sybil.toolchain_fingerprint_coverage;
 
         let cpv_anchor_ts_ms = self.highest_seen_ts_ms.max(
             self.tx_buffer

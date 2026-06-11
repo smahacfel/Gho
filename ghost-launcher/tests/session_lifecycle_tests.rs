@@ -424,7 +424,7 @@ fn materialize_features_populates_dbia_from_session_tx_buffer() {
             "sig-buyer-b",
             20_030,
             false,
-            dbia_fingerprint(18, 5, false, false, 4, (1, 1)),
+            dbia_fingerprint(30, 10, false, false, 8, (3, 3)),
         ));
         guard.materialize_features()
     };
@@ -446,6 +446,90 @@ fn materialize_features_populates_dbia_from_session_tx_buffer() {
             ghost_core::tx_intelligence::types::FSC_FUNDING_STREAM_UNAVAILABLE_REASON.to_string(),
         ]
     );
+}
+
+#[test]
+fn materialize_features_preserves_toolchain_partial_coverage_reasons() {
+    let manager = SessionManager::new(SessionConfig {
+        default_observation_duration_ms: 100,
+        max_sessions: 8,
+        ..SessionConfig::default()
+    });
+    let pool_id = Pubkey::new_unique();
+    let base_mint = Pubkey::new_unique();
+    let bonding_curve = Pubkey::new_unique();
+    let session = open_session(&manager, pool_id, base_mint, bonding_curve, 21_000);
+    let dev_wallet = session
+        .read()
+        .dev_wallet
+        .expect("session should know dev wallet");
+    let shared = dbia_fingerprint(12, 3, true, true, 2, (0, 0));
+
+    let features = {
+        let mut guard = session.write();
+        let _ = guard.ingest_transaction(dbia_tx(
+            pool_id,
+            dev_wallet,
+            "sig-partial-dev",
+            21_010,
+            true,
+            shared.clone(),
+        ));
+        let _ = guard.ingest_transaction(dbia_tx(
+            pool_id,
+            Pubkey::new_unique(),
+            "sig-partial-a",
+            21_020,
+            false,
+            shared.clone(),
+        ));
+        let _ = guard.ingest_transaction(dbia_tx(
+            pool_id,
+            Pubkey::new_unique(),
+            "sig-partial-b",
+            21_030,
+            false,
+            shared.clone(),
+        ));
+        let _ = guard.ingest_transaction(dbia_tx(
+            pool_id,
+            Pubkey::new_unique(),
+            "sig-partial-c",
+            21_040,
+            false,
+            shared,
+        ));
+        let _ = guard.ingest_transaction(dbia_tx(
+            pool_id,
+            Pubkey::new_unique(),
+            "sig-partial-missing",
+            21_050,
+            false,
+            seer::types::ToolchainFingerprintInput::default(),
+        ));
+        guard.materialize_features()
+    };
+
+    assert_eq!(
+        features.sybil_resistance.dev_buyer_infrastructure_affinity,
+        Some(1.0)
+    );
+    assert_eq!(
+        features.sybil_resistance.toolchain_fingerprint_coverage,
+        Some(0.8)
+    );
+    assert!(features.sybil_resistance.degraded_reasons.contains(
+        &ghost_core::tx_intelligence::types::FTDI_PARTIAL_FEE_TOPOLOGY_COVERAGE.to_string()
+    ));
+    assert!(features.sybil_resistance.degraded_reasons.contains(
+        &ghost_core::tx_intelligence::types::DBIA_PARTIAL_FINGERPRINT_COVERAGE.to_string()
+    ));
+    assert!(!features.sybil_resistance.degraded_reasons.contains(
+        &ghost_core::tx_intelligence::types::FTDI_RAW_FEE_TOPOLOGY_UNAVAILABLE_REASON.to_string()
+    ));
+    assert!(!features.sybil_resistance.degraded_reasons.contains(
+        &ghost_core::tx_intelligence::types::DBIA_RAW_FINGERPRINT_UNAVAILABLE_REASON.to_string()
+    ));
 }
 
 #[test]

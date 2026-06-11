@@ -18,5 +18,6 @@ pub use funding_source::{
 };
 pub use sybil_metrics::{
     compute_dbia, compute_des, compute_ftdi, compute_sfd, compute_sybil_resistance,
-    DbiaComputation, DesComputation, FtdiComputation, SfdComputation,
+    compute_sybil_resistance_with_config, DbiaComputation, DesComputation, FtdiComputation,
+    SfdComputation,
 };
