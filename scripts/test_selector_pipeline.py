@@ -36,6 +36,7 @@ import audit_selector_buy_simulation_coverage as simcov_audit
 import audit_selector_shadow_score_sidecar as shadow_score_sidecar_audit
 import audit_selector_shadow_score_parity as shadow_score_parity_audit
 import audit_selector_shadow_score_topk_drift as shadow_score_topk_drift
+import audit_selector_r2_tail_coverage as r2_tail_coverage_audit
 import audit_gatekeeper_decision_vs_r2 as gk_r2_audit
 import analyze_gatekeeper_r2_policy_autopsy as policy_autopsy
 import build_gatekeeper_policy_redesign_candidates as policy_redesign_candidates
@@ -83,6 +84,7 @@ class SelectorPipelineTests(unittest.TestCase):
         candidate_id: str = "c1",
         feature_row: dict | None = None,
         gk_context: dict | None = None,
+        price_path: dict | None = None,
     ) -> dict:
         candidates = root / "candidate_universe_v1.jsonl"
         lifecycle = root / "accepted_lifecycle_v1.jsonl"
@@ -150,22 +152,20 @@ class SelectorPipelineTests(unittest.TestCase):
         if gk_context:
             base_gk_context.update(gk_context)
         write_jsonl(gk_context_path, [base_gk_context])
-        write_jsonl(
-            paths,
-            [
-                {
-                    "candidate_id": candidate_id,
-                    "base_mint": f"mint-{candidate_id}",
-                    "pool_id": f"pool-{candidate_id}",
-                    "bonding_curve": f"curve-{candidate_id}",
-                    "path_source": "yellowstone_account_update",
-                    "path_status": "ok",
-                    "path_coverage_ok": True,
-                    "horizon_matured": True,
-                    "samples": [{"offset_ms": 60_000, "return_pct": 45.0}],
-                }
-            ],
-        )
+        base_path = {
+            "candidate_id": candidate_id,
+            "base_mint": f"mint-{candidate_id}",
+            "pool_id": f"pool-{candidate_id}",
+            "bonding_curve": f"curve-{candidate_id}",
+            "path_source": "yellowstone_account_update",
+            "path_status": "ok",
+            "path_coverage_ok": True,
+            "horizon_matured": True,
+            "samples": [{"offset_ms": 60_000, "return_pct": 45.0}],
+        }
+        if price_path:
+            base_path.update(price_path)
+        write_jsonl(paths, [base_path])
         training.run(
             training.build_parser().parse_args(
                 [
@@ -1420,6 +1420,44 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertFalse(row["label_resolved"])
         self.assertEqual(audit_payload["status"], "PASS")
 
+    def test_training_view_early_target_hit_enters_r2_denominator_before_horizon_maturity(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            row = self.build_training_view_fixture(
+                Path(tmp),
+                price_path={
+                    "horizon_matured": False,
+                    "samples": [{"offset_ms": 5_000, "return_pct": 45.0}],
+                },
+            )
+
+        self.assertEqual(row["r2_label"], "positive")
+        self.assertEqual(row["r2_status"], "resolved")
+        self.assertEqual(row["r2_label_reason"], "target_before_stop")
+        self.assertFalse(row["r2_horizon_matured"])
+        self.assertTrue(row["label_resolved"])
+        self.assertTrue(row["r2_only_training_denominator"])
+
+    def test_training_view_early_stop_hit_enters_r2_denominator_before_horizon_maturity(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            row = self.build_training_view_fixture(
+                Path(tmp),
+                price_path={
+                    "horizon_matured": False,
+                    "samples": [{"offset_ms": 5_000, "return_pct": -45.0}],
+                },
+            )
+
+        self.assertEqual(row["r2_label"], "negative")
+        self.assertEqual(row["r2_status"], "resolved")
+        self.assertEqual(row["r2_label_reason"], "stop_before_target")
+        self.assertFalse(row["r2_horizon_matured"])
+        self.assertTrue(row["label_resolved"])
+        self.assertTrue(row["r2_only_training_denominator"])
+
     def test_training_view_materializes_evidence_sufficiency_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             row = self.build_training_view_fixture(Path(tmp))
@@ -2201,8 +2239,30 @@ class SelectorPipelineTests(unittest.TestCase):
                     dev_ratio = 0.0
                     sufficient = True
                     sell_share = 0.05
+                elif mode == "current_regime_probe":
+                    positive = in_segment and idx < 30
+                    score = 0.95 - idx * 0.01 if in_segment else 0.30 - (idx - 40) * 0.002
+                    dev_ratio = 0.0
+                    sufficient = True
+                    sell_share = 0.05
+                elif mode == "current_regime_insufficient":
+                    positive = in_segment and idx < 30
+                    score = 0.95 - idx * 0.01 if in_segment else 0.30 - (idx - 40) * 0.002
+                    dev_ratio = 0.0
+                    sufficient = False
+                    sell_share = 0.05
                 else:
                     raise AssertionError(mode)
+                actor_evidence = (
+                    2
+                    if mode in {"current_regime_probe", "current_regime_insufficient"} and in_segment
+                    else 8
+                )
+                market_cap = (
+                    150.0
+                    if mode in {"current_regime_probe", "current_regime_insufficient"}
+                    else (20.0 if in_segment else 150.0)
+                )
                 rows.append(
                     {
                         "candidate_id": f"{scope}-c{idx}",
@@ -2222,11 +2282,15 @@ class SelectorPipelineTests(unittest.TestCase):
                         "r2_label": "positive" if positive else "negative",
                         "net_quote_in_15s": score,
                         "net_quote_in_30s": score,
-                        "unique_buyers": 6 if in_segment else 3,
+                        "unique_buyers": (
+                            actor_evidence
+                            if mode in {"current_regime_probe", "current_regime_insufficient"}
+                            else (6 if in_segment else 3)
+                        ),
                         "trade_rate": score,
                         "sell_share": sell_share,
                         "gk_bonding_progress_pct": 80.0 if in_segment else 30.0,
-                        "gk_current_market_cap_sol": 20.0 if in_segment else 150.0,
+                        "gk_current_market_cap_sol": market_cap,
                         "gk_price_change_ratio": 1.0 if in_segment else 0.1,
                         "gk_hhi": 0.30,
                         "gk_top3_volume_pct": 0.40,
@@ -2242,8 +2306,8 @@ class SelectorPipelineTests(unittest.TestCase):
                         "score_eligibility_reasons": [] if sufficient else ["diagnostic_insufficient_evidence"],
                         "evidence_tx_count": 10 if sufficient else 1,
                         "evidence_buy_count": 6 if sufficient else 1,
-                        "evidence_unique_buyers": 6 if sufficient else 1,
-                        "evidence_unique_signers": 6 if sufficient else 1,
+                        "evidence_unique_buyers": actor_evidence if sufficient else 1,
+                        "evidence_unique_signers": actor_evidence if sufficient else 1,
                         "evidence_total_volume_sol": 4.0 if sufficient else 0.05,
                         "evidence_sell_share": sell_share,
                     }
@@ -2353,6 +2417,56 @@ class SelectorPipelineTests(unittest.TestCase):
             "NO_STABLE_EDGE",
         )
 
+    def test_segment_specific_candidate_freezes_current_regime_probe_for_fresh_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            train_scope = "selector-p4e-current-regime-train"
+            validation_scope = "selector-p4e-current-regime-validation"
+            rust_source = self.write_segment_specific_fixture(
+                root,
+                train_scope,
+                validation_scope,
+                mode="current_regime_probe",
+            )
+            report = self.run_segment_specific_fixture(root, train_scope, validation_scope, rust_source)
+
+        candidate_id = "current_regime_unique_actors_q1_q2_score_probe"
+        self.assertEqual(report["status"], "P4E_CURRENT_REGIME_CANDIDATE_REQUIRES_FRESH_VALIDATION")
+        self.assertIn(candidate_id, report["fresh_validation_candidate_ids"])
+        self.assertNotIn(candidate_id, report["promotable_candidate_ids"])
+        self.assertEqual(
+            report["candidates"][candidate_id]["promotability"]["promotability_status"],
+            "FRESH_VALIDATION_REQUIRED",
+        )
+        self.assertFalse(report["claim_boundaries"]["production_promotion_allowed"])
+        self.assertFalse(report["claim_boundaries"]["changes_runtime"])
+
+    def test_segment_specific_candidate_current_regime_probe_requires_label_review_when_evidence_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            train_scope = "selector-p4e-current-regime-invalid-train"
+            validation_scope = "selector-p4e-current-regime-invalid-validation"
+            rust_source = self.write_segment_specific_fixture(
+                root,
+                train_scope,
+                validation_scope,
+                mode="current_regime_insufficient",
+            )
+            report = self.run_segment_specific_fixture(root, train_scope, validation_scope, rust_source)
+
+        candidate_id = "current_regime_unique_actors_q1_q2_score_probe"
+        self.assertEqual(report["status"], "P4E_REQUIRES_LABEL_REVIEW")
+        self.assertTrue(report["label_review_required"])
+        self.assertEqual(
+            report["candidates"][candidate_id]["promotability"]["promotability_status"],
+            "REQUIRES_LABEL_REVIEW",
+        )
+        self.assertIn(
+            "current_regime_probe_uses_insufficient_evidence_segment",
+            report["candidates"][candidate_id]["promotability"]["fail_reasons"],
+        )
+        self.assertNotIn(candidate_id, report["promotable_candidate_ids"])
+
     def test_segment_specific_candidate_reports_false_positive_risk_matrix(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2381,6 +2495,22 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertFalse(report["claim_boundaries"]["changes_gatekeeper"])
         self.assertFalse(report["claim_boundaries"]["changes_execution"])
         self.assertFalse(report["claim_boundaries"]["changes_send_path"])
+
+    def test_segment_specific_candidate_uses_leakage_audit_fallback_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            train_scope = "selector-p4e-leakage-fallback-train"
+            validation_scope = "selector-p4e-leakage-fallback-validation"
+            rust_source = self.write_segment_specific_fixture(root, train_scope, validation_scope)
+            for scope in (train_scope, validation_scope):
+                phase3 = root / "reports" / "selector" / scope / "phase3_r2only_manifest_v1.json"
+                phase3.unlink()
+                leakage = root / "reports" / "selector" / scope / "leakage_audit_v1.json"
+                leakage.write_text(json.dumps({"status": "PASS"}) + "\n", encoding="utf-8")
+            report = self.run_segment_specific_fixture(root, train_scope, validation_scope, rust_source)
+
+        self.assertEqual(report["run_quality"]["train"]["leakage_audit_status"], "PASS")
+        self.assertEqual(report["run_quality"]["validation"]["leakage_audit_status"], "PASS")
 
     def write_new_signal_family_fixture(
         self,
@@ -3105,6 +3235,45 @@ class SelectorPipelineTests(unittest.TestCase):
         r2 = common.classify_r2(path, target_net_pct=40.0, stop_net_pct=40.0, horizon_ms=60_000)
         self.assertEqual(r2["r2_label"], "negative")
         self.assertEqual(r2["r2_label_reason"], "no_target_by_horizon")
+
+    def test_training_view_r2_target_hit_resolves_before_horizon_maturity(self) -> None:
+        path = {
+            "path_source": "yellowstone_account_update",
+            "path_status": "horizon_unmatured",
+            "path_coverage_ok": True,
+            "horizon_matured": False,
+            "samples": [{"offset_ms": 8_000, "return_pct": 45.0}],
+        }
+        r2 = common.classify_r2(path, target_net_pct=40.0, stop_net_pct=40.0, horizon_ms=60_000)
+        self.assertEqual(r2["r2_label"], "positive")
+        self.assertEqual(r2["r2_label_reason"], "target_before_stop")
+        self.assertFalse(r2["r2_horizon_matured"])
+
+    def test_training_view_r2_stop_hit_resolves_before_horizon_maturity(self) -> None:
+        path = {
+            "path_source": "yellowstone_account_update",
+            "path_status": "horizon_unmatured",
+            "path_coverage_ok": True,
+            "horizon_matured": False,
+            "samples": [{"offset_ms": 8_000, "return_pct": -45.0}],
+        }
+        r2 = common.classify_r2(path, target_net_pct=40.0, stop_net_pct=40.0, horizon_ms=60_000)
+        self.assertEqual(r2["r2_label"], "negative")
+        self.assertEqual(r2["r2_label_reason"], "stop_before_target")
+        self.assertFalse(r2["r2_horizon_matured"])
+
+    def test_training_view_r2_unmatured_no_hit_stays_unresolved(self) -> None:
+        path = {
+            "path_source": "yellowstone_account_update",
+            "path_status": "horizon_unmatured",
+            "path_coverage_ok": True,
+            "horizon_matured": False,
+            "samples": [{"offset_ms": 8_000, "return_pct": 5.0}],
+        }
+        r2 = common.classify_r2(path, target_net_pct=40.0, stop_net_pct=40.0, horizon_ms=60_000)
+        self.assertIsNone(r2["r2_label"])
+        self.assertEqual(r2["r2_status"], "horizon_unmatured")
+        self.assertEqual(r2["r2_excluded_reason"], "horizon_unmatured")
 
     def test_rpc_backfill_only_is_not_r2_ssot(self) -> None:
         path = {
@@ -6383,6 +6552,69 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertIsNone(by_id["unmatured"]["r2_label"])
         self.assertEqual(by_id["unmatured"]["r2_status"], "horizon_unmatured")
 
+    def test_r2_market_paths_resolves_observed_hits_before_horizon_maturity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            candidates = root / "candidate_universe_v1.jsonl"
+            source = root / "account_updates.jsonl"
+            write_jsonl(
+                candidates,
+                [
+                    {
+                        "candidate_id": "target-unmatured",
+                        "base_mint": "mint1",
+                        "pool_id": "pool1",
+                        "bonding_curve": "curve1",
+                        "decision_ts_ms": 1_000,
+                    },
+                    {
+                        "candidate_id": "stop-unmatured",
+                        "base_mint": "mint2",
+                        "pool_id": "pool2",
+                        "bonding_curve": "curve2",
+                        "decision_ts_ms": 1_000,
+                    },
+                ],
+            )
+            write_jsonl(
+                source,
+                [
+                    {
+                        "candidate_id": "target-unmatured",
+                        "path_source": "yellowstone_account_update",
+                        "path_coverage_ok": True,
+                        "horizon_matured": False,
+                        "samples": [{"offset_ms": 5_000, "return_pct": 45.0}],
+                    },
+                    {
+                        "candidate_id": "stop-unmatured",
+                        "path_source": "DIAG_ACCOUNT_UPDATE_RELAY",
+                        "path_coverage_ok": True,
+                        "horizon_matured": False,
+                        "samples": [{"offset_ms": 5_000, "return_pct": -45.0}],
+                    },
+                ],
+            )
+            rows, coverage = r2_paths.build_r2_market_paths(
+                candidate_universe=candidates,
+                account_update_paths=[source],
+                diag_account_update_paths=[],
+                canonical_snapshot_paths=[],
+                target_net_pct=40,
+                stop_net_pct=40,
+                horizon_ms=60_000,
+            )
+
+        by_id = {row["candidate_id"]: row for row in rows}
+        self.assertEqual(by_id["target-unmatured"]["r2_label"], "positive")
+        self.assertEqual(by_id["target-unmatured"]["r2_label_reason"], "target_before_stop")
+        self.assertFalse(by_id["target-unmatured"]["horizon_matured"])
+        self.assertEqual(by_id["stop-unmatured"]["r2_label"], "negative")
+        self.assertEqual(by_id["stop-unmatured"]["r2_label_reason"], "stop_before_target")
+        self.assertFalse(by_id["stop-unmatured"]["horizon_matured"])
+        self.assertEqual(coverage["status"], "PASS")
+        self.assertEqual(coverage["r2_resolved_rows"], 2)
+
     def test_r2_market_paths_reject_nln_and_rpc_as_canonical_sources(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -8873,6 +9105,192 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertEqual(materialized["tv-toxic-neg"]["changes_gatekeeper_decision"], "False")
         self.assertEqual(materialized["tv-toxic-neg"]["changes_execution"], "False")
         self.assertIn("GK_EDGE_POLICY_FORK_R2_OPPORTUNITY_NOT_EXECUTION_SAFE", report["policy_fork_statuses"])
+
+    def write_r2_tail_coverage_fixture(self, root: Path) -> tuple[str, Path]:
+        selector_scope = "selector-r2-tail-coverage-test"
+        dataset_dir = root / "datasets" / "selector" / selector_scope
+        report_dir = root / "reports" / "selector" / selector_scope
+        candidate_rows = [
+            {
+                "candidate_id": candidate_id,
+                "pool_id": pool_id,
+                "base_mint": base_mint,
+                "bonding_curve": pool_id,
+                "decision_ts_ms": decision_ts_ms,
+            }
+            for candidate_id, pool_id, base_mint, decision_ts_ms in [
+                ("c-positive", "pool-pos", "mint-pos", 10_000),
+                ("c-negative", "pool-neg", "mint-neg", 20_000),
+                ("c-horizon", "pool-hu", "mint-hu", 30_000),
+                ("c-missing", "pool-missing", "mint-missing", 40_000),
+            ]
+        ]
+        write_jsonl(dataset_dir / "candidate_universe_v1.jsonl", candidate_rows)
+        write_jsonl(
+            dataset_dir / "canonical_r2_source_v1.jsonl",
+            [
+                {
+                    "candidate_id": "c-positive",
+                    "base_mint": "mint-pos",
+                    "bonding_curve": "pool-pos",
+                    "decision_ts_ms": 10_000,
+                    "path_status": "ok",
+                    "source_record_count": 2,
+                    "source_update_count_total_for_identity": 2,
+                    "samples": [{"offset_ms": 500}, {"offset_ms": 62_000}],
+                },
+                {
+                    "candidate_id": "c-negative",
+                    "base_mint": "mint-neg",
+                    "bonding_curve": "pool-neg",
+                    "decision_ts_ms": 20_000,
+                    "path_status": "ok",
+                    "source_record_count": 2,
+                    "source_update_count_total_for_identity": 2,
+                    "samples": [{"offset_ms": 300}, {"offset_ms": 61_000}],
+                },
+                {
+                    "candidate_id": "c-horizon",
+                    "base_mint": "mint-hu",
+                    "bonding_curve": "pool-hu",
+                    "decision_ts_ms": 30_000,
+                    "path_status": "horizon_unmatured",
+                    "source_record_count": 2,
+                    "source_update_count_total_for_identity": 5,
+                    "samples": [{"offset_ms": 250}, {"offset_ms": 12_000}],
+                },
+            ],
+        )
+        write_jsonl(
+            dataset_dir / "r2_market_paths_v1.jsonl",
+            [
+                {
+                    "candidate_id": "c-positive",
+                    "r2_status": "positive",
+                    "r2_label": "positive",
+                    "decision_ts_ms": 10_000,
+                    "path_start_ts_ms": 10_500,
+                    "path_end_ts_ms": 72_000,
+                },
+                {
+                    "candidate_id": "c-negative",
+                    "r2_status": "negative",
+                    "r2_label": "negative",
+                    "decision_ts_ms": 20_000,
+                    "path_start_ts_ms": 20_300,
+                    "path_end_ts_ms": 81_000,
+                },
+                {
+                    "candidate_id": "c-horizon",
+                    "r2_status": "horizon_unmatured",
+                    "r2_label": None,
+                    "r2_excluded_reason": "horizon_unmatured",
+                    "decision_ts_ms": 30_000,
+                    "path_start_ts_ms": 30_250,
+                    "path_end_ts_ms": 42_000,
+                },
+                {
+                    "candidate_id": "c-missing",
+                    "r2_status": "missing_path",
+                    "r2_label": None,
+                    "r2_excluded_reason": "no_canonical_market_path",
+                    "decision_ts_ms": 40_000,
+                },
+            ],
+        )
+        selected_csv = report_dir / "gatekeeper_edge_policy_fork_rows_v1.csv"
+        report_dir.mkdir(parents=True, exist_ok=True)
+        with selected_csv.open("w", encoding="utf-8", newline="") as fh:
+            writer = csv.DictWriter(
+                fh,
+                fieldnames=[
+                    "candidate_id",
+                    "pool_id",
+                    "base_mint",
+                    "decision_ts_ms",
+                    "policy_fork_verdict",
+                    "r2_label",
+                    "r2_class",
+                ],
+            )
+            writer.writeheader()
+            for row in candidate_rows:
+                writer.writerow(
+                    {
+                        "candidate_id": row["candidate_id"],
+                        "pool_id": row["pool_id"],
+                        "base_mint": row["base_mint"],
+                        "decision_ts_ms": row["decision_ts_ms"],
+                        "policy_fork_verdict": "WOULD_ALLOW_R2_OPPORTUNITY_NOT_EXECUTION_SAFE",
+                        "r2_label": "",
+                        "r2_class": "",
+                    }
+                )
+        return selector_scope, selected_csv
+
+    def test_r2_tail_coverage_audit_classifies_post_decision_tail_gaps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            selector_scope, selected_csv = self.write_r2_tail_coverage_fixture(root)
+            report = r2_tail_coverage_audit.build_audit(
+                r2_tail_coverage_audit.build_parser().parse_args(
+                    [
+                        "--root",
+                        str(root),
+                        "--selector-scope",
+                        selector_scope,
+                        "--selected-rows-csv",
+                        str(selected_csv),
+                        "--min-resolved-rows",
+                        "3",
+                    ]
+                )
+            )
+            with Path(report["outputs"]["rows_csv"]).open(encoding="utf-8") as fh:
+                rows = {row["candidate_id"]: row for row in csv.DictReader(fh)}
+
+        self.assertEqual(report["coverage_verdict"], "TAIL_COVERAGE_BLOCKED_FOR_EDGE_VALIDATION")
+        self.assertEqual(
+            report["business_decision"],
+            "DO_NOT_PROMOTE_EDGE_CANDIDATE_UNTIL_LABEL_COVERAGE_REPAIRED",
+        )
+        self.assertEqual(report["metrics"]["selected_rows"], 4)
+        self.assertEqual(report["metrics"]["selected_resolved_rows"], 2)
+        self.assertEqual(report["metrics"]["selected_resolved_rows_needed_for_guard"], 1)
+        self.assertEqual(report["r2_status_counts"]["positive"], 1)
+        self.assertEqual(report["r2_status_counts"]["negative"], 1)
+        self.assertEqual(report["gap_class_counts"]["post_decision_tail_short"], 1)
+        self.assertEqual(report["gap_class_counts"]["no_post_decision_canonical_samples"], 1)
+        self.assertEqual(rows["c-horizon"]["gap_class"], "post_decision_tail_short")
+        self.assertEqual(rows["c-horizon"]["max_post_decision_sample_offset_ms"], "12000")
+        self.assertEqual(rows["c-missing"]["gap_class"], "no_post_decision_canonical_samples")
+        self.assertFalse(report["non_claims"]["gatekeeper_changed"])
+        self.assertFalse(report["non_claims"]["candidate_changed"])
+        self.assertFalse(report["non_claims"]["labels_rebuilt"])
+
+    def test_r2_tail_coverage_audit_passes_when_selected_resolved_guard_met(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            selector_scope, selected_csv = self.write_r2_tail_coverage_fixture(root)
+            report = r2_tail_coverage_audit.build_audit(
+                r2_tail_coverage_audit.build_parser().parse_args(
+                    [
+                        "--root",
+                        str(root),
+                        "--selector-scope",
+                        selector_scope,
+                        "--selected-rows-csv",
+                        str(selected_csv),
+                        "--min-resolved-rows",
+                        "2",
+                    ]
+                )
+            )
+
+        self.assertEqual(report["coverage_verdict"], "TAIL_COVERAGE_OK_FOR_EDGE_VALIDATION")
+        self.assertEqual(report["business_decision"], "LABEL_COVERAGE_OK_FOR_EDGE_REVIEW")
+        self.assertEqual(report["metrics"]["selected_resolved_rows_needed_for_guard"], 0)
+        self.assertFalse(report["diagnosis"]["model_or_threshold_change_required"])
 
     def gatekeeper_edge_policy_fork_gate_fixture(self, **overrides: dict) -> dict:
         report = {

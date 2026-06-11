@@ -362,7 +362,6 @@ def r2_training_denominator(row: dict[str, Any]) -> bool:
         and row.get("r2_label") in {"positive", "negative"}
         and row.get("r2_status") in {"positive", "negative", "resolved"}
         and row.get("r2_path_coverage_ok") is True
-        and row.get("r2_horizon_matured") is True
     )
 
 

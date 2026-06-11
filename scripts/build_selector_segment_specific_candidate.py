@@ -61,6 +61,10 @@ def phase3_manifest_path(root: Path, scope: str) -> Path:
     return root / "reports" / "selector" / scope / "phase3_r2only_manifest_v1.json"
 
 
+def leakage_audit_path(root: Path, scope: str) -> Path:
+    return root / "reports" / "selector" / scope / "leakage_audit_v1.json"
+
+
 def report_dir(root: Path, validation_scope: str) -> Path:
     return root / "reports" / "selector" / validation_scope
 
@@ -266,6 +270,16 @@ def candidate_defs() -> list[dict[str, Any]]:
             "description": "unique_actors=q3, evidence sufficient, no extreme concentration/sell pressure",
         },
         {
+            "candidate_id": "current_regime_unique_actors_q1_q2_score_probe",
+            "kind": "current_regime_probe",
+            "description": "diagnostic current-regime probe: unique_actors=q1/q2 with sufficient evidence, rank by current score",
+        },
+        {
+            "candidate_id": "current_regime_unique_actors_q1_q2_q3_score_probe",
+            "kind": "current_regime_probe",
+            "description": "diagnostic current-regime probe: unique_actors=q1/q2/q3 with sufficient evidence, rank by current score",
+        },
+        {
             "candidate_id": "low_market_cap_unique_actors_q3_intersection",
             "kind": "promotable_probe",
             "description": "market_cap=low and unique_actors=q3 intersection with anti-junk",
@@ -333,6 +347,10 @@ def row_matches_candidate(row: dict[str, Any], rows: list[dict[str, Any]], candi
             and not sell_pressure_extreme(row)
             and not dev_toxic(row)
         )
+    if candidate_id == "current_regime_unique_actors_q1_q2_score_probe":
+        return unique_bucket in {"q1", "q2"}
+    if candidate_id == "current_regime_unique_actors_q1_q2_q3_score_probe":
+        return unique_bucket in {"q1", "q2", "q3"}
     if candidate_id == "low_market_cap_unique_actors_q3_intersection":
         return market_cap_bucket(row) == "low" and unique_bucket == "q3" and anti_junk(row)
     if candidate_id == "risky_positive_segments_diagnostic_only":
@@ -449,6 +467,38 @@ def classify_promotability(
     args: argparse.Namespace,
 ) -> dict[str, Any]:
     fail_reasons: list[str] = []
+    if candidate_kind(candidate_id) == "current_regime_probe":
+        train_top50 = train["topk"]["top50"].get("lift_vs_base_rate_pp")
+        validation_top50 = validation["topk"]["top50"].get("lift_vs_base_rate_pp")
+        if (
+            isinstance(train_top50, float)
+            and train_top50 > 0.0
+            and isinstance(validation_top50, float)
+            and validation_top50 > 0.0
+        ):
+            top25_sufficient = validation.get("top25_evidence_sufficient_rate")
+            train_top25_sufficient = train.get("top25_evidence_sufficient_rate")
+            if (
+                not isinstance(top25_sufficient, float)
+                or top25_sufficient < args.min_topk_evidence_sufficient_rate
+                or not isinstance(train_top25_sufficient, float)
+                or train_top25_sufficient < args.min_topk_evidence_sufficient_rate
+            ):
+                return {
+                    "promotability_status": "REQUIRES_LABEL_REVIEW",
+                    "label_review_required": True,
+                    "fail_reasons": ["current_regime_probe_uses_insufficient_evidence_segment"],
+                }
+            return {
+                "promotability_status": "FRESH_VALIDATION_REQUIRED",
+                "label_review_required": False,
+                "fail_reasons": ["current_regime_probe_not_promotable_without_fresh_run"],
+            }
+        return {
+            "promotability_status": "NO_STABLE_EDGE",
+            "label_review_required": False,
+            "fail_reasons": ["current_regime_probe_not_directionally_positive"],
+        }
     if candidate_kind(candidate_id) == "diagnostic_only":
         if validation["topk"]["top25"].get("lift_vs_base_rate_pp", 0.0) > 0.0:
             return {
@@ -500,6 +550,10 @@ def classify_promotability(
 def run_quality(root: Path, scope: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
     manifest_path = phase3_manifest_path(root, scope)
     manifest = read_json_object(manifest_path) if manifest_path.exists() else {}
+    leakage_status = manifest.get("leakage_audit_status")
+    leakage_path = leakage_audit_path(root, scope)
+    if leakage_status is None and leakage_path.exists():
+        leakage_status = read_json_object(leakage_path).get("status")
     positives = sum(1 for row in rows if label_positive(row))
     return {
         "scope": scope,
@@ -507,8 +561,8 @@ def run_quality(root: Path, scope: str, rows: list[dict[str, Any]]) -> dict[str,
         "positive_rows": positives,
         "negative_rows": len(rows) - positives,
         "base_positive_rate": positives / len(rows) if rows else None,
-        "leakage_audit_status": manifest.get("leakage_audit_status"),
-        "leakage_clean": manifest.get("leakage_audit_status") == "PASS",
+        "leakage_audit_status": leakage_status,
+        "leakage_clean": leakage_status == "PASS",
     }
 
 
@@ -538,7 +592,7 @@ def write_markdown(path: Path, report: dict[str, Any]) -> None:
         "",
         "## Promotability",
         "",
-        "| candidate | status | r21 top25 | r21 top50 | r21 rows |",
+        "| candidate | status | validation top25 | validation top50 | validation rows |",
         "|---|---|---:|---:|---:|",
     ]
     for candidate_id, payload in report["candidates"].items():
@@ -577,6 +631,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
     promotability_rows: list[dict[str, Any]] = []
     false_positive_rows: list[dict[str, Any]] = []
     promotable_ids: list[str] = []
+    fresh_validation_ids: list[str] = []
     label_review_required = False
 
     for definition in candidate_defs():
@@ -588,6 +643,8 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         promotability = classify_promotability(candidate_id, train_payload, validation_payload, args)
         if promotability["promotability_status"] == "PROMOTABLE_CANDIDATE":
             promotable_ids.append(candidate_id)
+        if promotability["promotability_status"] == "FRESH_VALIDATION_REQUIRED":
+            fresh_validation_ids.append(candidate_id)
         if promotability.get("label_review_required"):
             label_review_required = True
         candidates[candidate_id] = {
@@ -628,6 +685,9 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
     if promotable_ids:
         status = "P4E_PROMOTABLE_CANDIDATE_FOUND"
         business_decision = "FREEZE_SEGMENT_CANDIDATE_CONTRACT_OFFLINE"
+    elif fresh_validation_ids:
+        status = "P4E_CURRENT_REGIME_CANDIDATE_REQUIRES_FRESH_VALIDATION"
+        business_decision = "DO_NOT_RUN_RUNTIME_FREEZE_DIAGNOSTIC_PROBE"
     elif label_review_required:
         status = "P4E_REQUIRES_LABEL_REVIEW"
         business_decision = "REVIEW_R2_LABEL_OR_STRATEGY_CONTRACT"
@@ -655,6 +715,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "train_scope": args.train_scope,
         "validation_scope": args.validation_scope,
         "promotable_candidate_ids": promotable_ids,
+        "fresh_validation_candidate_ids": fresh_validation_ids,
         "label_review_required": label_review_required,
         "run_quality": {"train": train_quality, "validation": validation_quality},
         "claim_boundaries": {

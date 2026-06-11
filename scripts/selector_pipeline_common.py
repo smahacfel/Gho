@@ -1100,17 +1100,7 @@ def classify_r2(
         ]
         max_offset = max(offsets) if offsets else None
         horizon_matured = max_offset is not None and max_offset >= horizon_ms
-    if not horizon_matured:
-        return {
-            "r2_label": None,
-            "r2_status": "horizon_unmatured",
-            "r2_label_reason": None,
-            "r2_excluded_reason": "horizon_unmatured",
-            "r2_path_coverage_ok": True,
-            "r2_horizon_matured": False,
-            "r2_source_canonical": True,
-            "r2_source_provenance": source_provenance,
-        }
+
     for sample in samples:
         offset = int_or_none(sample.get("offset_ms"))
         if offset is not None and offset > horizon_ms:
@@ -1125,7 +1115,7 @@ def classify_r2(
                 "r2_label_reason": "stop_before_target",
                 "r2_excluded_reason": None,
                 "r2_path_coverage_ok": True,
-                "r2_horizon_matured": True,
+                "r2_horizon_matured": bool(horizon_matured),
                 "r2_source_canonical": True,
                 "r2_source_provenance": source_provenance,
             }
@@ -1136,10 +1126,21 @@ def classify_r2(
                 "r2_label_reason": "target_before_stop",
                 "r2_excluded_reason": None,
                 "r2_path_coverage_ok": True,
-                "r2_horizon_matured": True,
+                "r2_horizon_matured": bool(horizon_matured),
                 "r2_source_canonical": True,
                 "r2_source_provenance": source_provenance,
             }
+    if not horizon_matured:
+        return {
+            "r2_label": None,
+            "r2_status": "horizon_unmatured",
+            "r2_label_reason": None,
+            "r2_excluded_reason": "horizon_unmatured",
+            "r2_path_coverage_ok": True,
+            "r2_horizon_matured": False,
+            "r2_source_canonical": True,
+            "r2_source_provenance": source_provenance,
+        }
     return {
         "r2_label": "negative",
         "r2_status": "resolved",
