@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import csv
 import json
 import sys
 import tempfile
@@ -36,6 +37,7 @@ import audit_selector_shadow_score_sidecar as shadow_score_sidecar_audit
 import audit_selector_shadow_score_parity as shadow_score_parity_audit
 import audit_selector_shadow_score_topk_drift as shadow_score_topk_drift
 import audit_gatekeeper_decision_vs_r2 as gk_r2_audit
+import analyze_gatekeeper_r2_policy_autopsy as policy_autopsy
 import analyze_selector_candidate_crossrun_stability as crossrun_stability
 import build_selector_model_redesign_report as model_redesign
 import build_selector_evidence_gated_candidate_redesign as evidence_gated_redesign
@@ -8029,6 +8031,123 @@ class SelectorPipelineTests(unittest.TestCase):
             )
         )
 
+    def write_gatekeeper_policy_autopsy_fixture(self, root: Path) -> tuple[str, str]:
+        runtime_scope = "runtime-policy-autopsy-test"
+        selector_scope = "selector-policy-autopsy-test"
+        dataset_dir = root / "datasets" / "selector" / selector_scope
+        decision_dir = (
+            root
+            / "logs"
+            / "rollout"
+            / runtime_scope
+            / "decisions"
+            / runtime_scope
+            / "v2.2"
+            / "legacy_live"
+            / "config"
+        )
+        candidates = [
+            {"candidate_id": "c_buy_pos", "pool_id": "pool-buy-pos", "base_mint": "mint-buy-pos", "decision_ts_ms": 1_000},
+            {"candidate_id": "c_buy_neg", "pool_id": "pool-buy-neg", "base_mint": "mint-buy-neg", "decision_ts_ms": 1_000},
+            {"candidate_id": "c_top3_clean_pos", "pool_id": "pool-top3-clean", "base_mint": "mint-top3-clean", "decision_ts_ms": 1_000},
+            {"candidate_id": "c_top3_toxic_pos", "pool_id": "pool-top3-toxic", "base_mint": "mint-top3-toxic", "decision_ts_ms": 1_000},
+        ]
+        r2_rows = [
+            {"candidate_id": "c_buy_pos", "pool_id": "pool-buy-pos", "base_mint": "mint-buy-pos", "r2_label": "positive", "r2_status": "positive"},
+            {"candidate_id": "c_buy_neg", "pool_id": "pool-buy-neg", "base_mint": "mint-buy-neg", "r2_label": "negative", "r2_status": "negative"},
+            {"candidate_id": "c_top3_clean_pos", "pool_id": "pool-top3-clean", "base_mint": "mint-top3-clean", "r2_label": "positive", "r2_status": "positive"},
+            {"candidate_id": "c_top3_toxic_pos", "pool_id": "pool-top3-toxic", "base_mint": "mint-top3-toxic", "r2_label": "positive", "r2_status": "positive"},
+        ]
+        base_top3 = {
+            "decision_ts_ms": 1_000,
+            "decision_plane": "legacy_live",
+            "verdict_type": "REJECT_HARD_FAIL",
+            "reason_code": "HARD_FAIL_EXTREME_TOP3",
+            "top3_volume_pct": 1.0,
+            "early_top3_buy_volume_pct_3s": 1.0,
+            "hhi": 0.80,
+            "total_volume_sol": 1.4,
+            "ab_unique_signers_window": 3,
+            "buy_count": 3,
+            "funding_source_v2": {"status": "unavailable"},
+        }
+        decisions = [
+            {
+                "pool_id": "pool-buy-pos",
+                "base_mint": "mint-buy-pos",
+                "decision_ts_ms": 1_000,
+                "decision_plane": "legacy_live",
+                "verdict_type": "BUY",
+                "decision_verdict_buy": True,
+                "buy_ratio": 0.90,
+                "sell_share": 0.10,
+                "sell_buy_ratio": 0.10,
+                "dev_has_sold": False,
+                "flip_ratio_10s": 0.05,
+            },
+            {
+                "pool_id": "pool-buy-neg",
+                "base_mint": "mint-buy-neg",
+                "decision_ts_ms": 1_000,
+                "decision_plane": "legacy_live",
+                "verdict_type": "BUY",
+                "decision_verdict_buy": True,
+                "buy_ratio": 0.30,
+                "sell_share": 0.70,
+                "sell_buy_ratio": 1.80,
+                "dev_has_sold": True,
+                "flip_ratio_10s": 0.60,
+            },
+            {
+                **base_top3,
+                "pool_id": "pool-top3-clean",
+                "base_mint": "mint-top3-clean",
+                "buy_ratio": 0.72,
+                "early_slot_volume_dominance_buy": 0.45,
+                "sell_share": 0.10,
+                "sell_buy_ratio": 0.20,
+                "dev_has_sold": False,
+                "dev_volume_ratio": 0.10,
+                "dev_tx_ratio": 0.10,
+                "flip_ratio_10s": 0.05,
+                "flipper_presence_ratio": 0.05,
+            },
+            {
+                **base_top3,
+                "pool_id": "pool-top3-toxic",
+                "base_mint": "mint-top3-toxic",
+                "buy_ratio": 0.25,
+                "early_slot_volume_dominance_buy": 0.10,
+                "sell_share": 0.70,
+                "sell_buy_ratio": 1.60,
+                "dev_has_sold": True,
+                "dev_volume_ratio": 0.80,
+                "dev_tx_ratio": 0.70,
+                "flip_ratio_10s": 0.70,
+                "flipper_presence_ratio": 0.60,
+            },
+        ]
+        write_jsonl(dataset_dir / "candidate_universe_v1.jsonl", candidates)
+        write_jsonl(dataset_dir / "r2_market_paths_v1.jsonl", r2_rows)
+        write_jsonl(decision_dir / "gatekeeper_v2_decisions.jsonl", decisions)
+        return runtime_scope, selector_scope
+
+    def run_gatekeeper_policy_autopsy(self, root: Path, runtime_scope: str, selector_scope: str) -> dict:
+        return policy_autopsy.build_report(
+            policy_autopsy.build_parser().parse_args(
+                [
+                    "--root",
+                    str(root),
+                    "--runtime-scope",
+                    runtime_scope,
+                    "--selector-scope",
+                    selector_scope,
+                    "--decision-plane",
+                    "legacy_live",
+                ]
+            )
+        )
+
     def test_gatekeeper_decision_vs_r2_builds_buy_reject_timeout_matrix(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -8188,6 +8307,55 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertEqual(report["global_metrics"]["buy_resolved_rows"], 0)
         self.assertIn("REJECT_HARD_FAIL,HARD_FAIL_EXTREME_TOP3", confusion)
         self.assertIn("TIMEOUT_PHASE1_NO_DATA,TIMEOUT_PHASE1_NO_DATA", confusion)
+
+    def test_gatekeeper_policy_autopsy_segments_clean_top3_as_concentrated_early_demand(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime_scope, selector_scope = self.write_gatekeeper_policy_autopsy_fixture(root)
+            report = self.run_gatekeeper_policy_autopsy(root, runtime_scope, selector_scope)
+            with Path(report["outputs"]["hard_fail_extreme_top3"]).open(encoding="utf-8") as fh:
+                rows = {row["group"]: row for row in csv.DictReader(fh)}
+
+        self.assertIn("concentrated_early_demand", rows)
+        self.assertEqual(rows["concentrated_early_demand"]["r2_positive_rows"], "1")
+        self.assertEqual(rows["concentrated_early_demand"]["r2_negative_rows"], "0")
+
+    def test_gatekeeper_policy_autopsy_segments_top3_with_sell_dev_as_toxic_concentration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime_scope, selector_scope = self.write_gatekeeper_policy_autopsy_fixture(root)
+            report = self.run_gatekeeper_policy_autopsy(root, runtime_scope, selector_scope)
+            with Path(report["outputs"]["hard_fail_extreme_top3"]).open(encoding="utf-8") as fh:
+                rows = {row["group"]: row for row in csv.DictReader(fh)}
+
+        self.assertIn("toxic_concentration", rows)
+        self.assertEqual(rows["toxic_concentration"]["r2_positive_rows"], "1")
+
+    def test_gatekeeper_policy_autopsy_counterfactual_variants_are_offline_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime_scope, selector_scope = self.write_gatekeeper_policy_autopsy_fixture(root)
+            report = self.run_gatekeeper_policy_autopsy(root, runtime_scope, selector_scope)
+            with Path(report["outputs"]["counterfactual_variants"]).open(encoding="utf-8") as fh:
+                rows = list(csv.DictReader(fh))
+
+        self.assertFalse(report["non_claims"]["runtime_changed"])
+        self.assertFalse(report["non_claims"]["gatekeeper_changed"])
+        self.assertTrue(all(row["runtime_change_allowed"] == "False" for row in rows))
+        changed_variants = [row for row in rows if row["variant_id"] != "current_gatekeeper_buy"]
+        self.assertTrue(all(row["requires_fresh_validation"] == "True" for row in changed_variants))
+
+    def test_gatekeeper_policy_autopsy_detects_hard_fail_anti_signal_and_buy_no_edge(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime_scope, selector_scope = self.write_gatekeeper_policy_autopsy_fixture(root)
+            report = self.run_gatekeeper_policy_autopsy(root, runtime_scope, selector_scope)
+
+        self.assertEqual(report["global_metrics"]["buy_precision"], 0.5)
+        self.assertEqual(report["global_metrics"]["base_positive_rate"], 0.75)
+        self.assertEqual(report["global_metrics"]["hard_fail_extreme_top3_positive_rate"], 1.0)
+        self.assertIn("POLICY_AUTOPSY_HARD_FAIL_ANTI_SIGNAL_DETECTED", report["policy_autopsy_statuses"])
+        self.assertIn("POLICY_AUTOPSY_BUY_NO_EDGE", report["policy_autopsy_statuses"])
 
 
 if __name__ == "__main__":
