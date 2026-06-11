@@ -40,6 +40,7 @@ import audit_gatekeeper_decision_vs_r2 as gk_r2_audit
 import analyze_gatekeeper_r2_policy_autopsy as policy_autopsy
 import build_gatekeeper_policy_redesign_candidates as policy_redesign_candidates
 import build_gatekeeper_edge_policy_fork as gatekeeper_edge_policy_fork
+import ci_assert_gatekeeper_edge_policy_fork as edge_policy_fork_gate
 import analyze_selector_candidate_crossrun_stability as crossrun_stability
 import build_selector_model_redesign_report as model_redesign
 import build_selector_evidence_gated_candidate_redesign as evidence_gated_redesign
@@ -8822,6 +8823,116 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertEqual(materialized["tv-toxic-neg"]["changes_gatekeeper_decision"], "False")
         self.assertEqual(materialized["tv-toxic-neg"]["changes_execution"], "False")
         self.assertIn("GK_EDGE_POLICY_FORK_R2_OPPORTUNITY_NOT_EXECUTION_SAFE", report["policy_fork_statuses"])
+
+    def gatekeeper_edge_policy_fork_gate_fixture(self, **overrides: dict) -> dict:
+        report = {
+            "artifact": "gatekeeper_edge_policy_fork_v1",
+            "status": "PASS",
+            "business_decision": "OFFLINE_POLICY_FORK_EDGE_FOUND_REQUIRES_SHADOW_VALIDATION",
+            "selector_scope": "selector-edge-policy-fork-gate-test",
+            "policy_fork_statuses": [
+                "GK_EDGE_POLICY_FORK_OFFLINE_ONLY",
+                "GK_EDGE_POLICY_FORK_R2_OPPORTUNITY_CONFIRMED_OFFLINE",
+                "GK_EDGE_POLICY_FORK_LABEL_COVERAGE_WARNING",
+                "GK_EDGE_POLICY_FORK_R2_OPPORTUNITY_NOT_EXECUTION_SAFE",
+                "GK_EDGE_POLICY_FORK_REQUIRES_FRESH_VALIDATION",
+                "GK_EDGE_POLICY_FORK_NO_RUNTIME_GO",
+            ],
+            "global_metrics": {
+                "base_positive_rate": 0.45,
+                "resolved_rows": 1_000,
+                "policy_fork_would_allow_rows": 1_200,
+                "policy_fork_would_allow_resolved_rows": 125,
+                "policy_fork_would_allow_precision": 0.70,
+                "policy_fork_would_allow_lift_vs_base_rate_pp": 0.25,
+                "policy_fork_would_allow_label_coverage": 0.10,
+            },
+            "non_claims": {
+                "runtime_changed": False,
+                "gatekeeper_changed": False,
+                "execution_changed": False,
+                "send_path_changed": False,
+                "thresholds_tuned": False,
+                "production_promotion_allowed": False,
+            },
+        }
+        for key, value in overrides.items():
+            if isinstance(value, dict) and isinstance(report.get(key), dict):
+                report[key].update(value)
+            else:
+                report[key] = value
+        return report
+
+    def run_gatekeeper_edge_policy_fork_gate(self, report: dict, *extra_args: str) -> dict:
+        args = edge_policy_fork_gate.build_parser().parse_args(
+            [
+                "--scope",
+                "selector-edge-policy-fork-gate-test",
+                *extra_args,
+            ]
+        )
+        return edge_policy_fork_gate.validate_report(report, Path("/tmp/gatekeeper_edge_policy_fork_v1.json"), args)
+
+    def test_gatekeeper_edge_policy_fork_gate_passes_with_explicit_label_warning_acceptance(self) -> None:
+        report = self.gatekeeper_edge_policy_fork_gate_fixture()
+        result = self.run_gatekeeper_edge_policy_fork_gate(report, "--accept-label-coverage-warning")
+
+        self.assertEqual(result["status"], "PASS")
+        self.assertTrue(result["label_coverage_warning_accepted"])
+
+    def test_gatekeeper_edge_policy_fork_gate_requires_label_warning_acceptance(self) -> None:
+        report = self.gatekeeper_edge_policy_fork_gate_fixture()
+        result = self.run_gatekeeper_edge_policy_fork_gate(report)
+
+        self.assertEqual(result["status"], "FAIL")
+        self.assertIn("label_coverage_warning_requires_explicit_acceptance", result["fail_reasons"])
+
+    def test_gatekeeper_edge_policy_fork_gate_fails_on_non_claim_violation(self) -> None:
+        report = self.gatekeeper_edge_policy_fork_gate_fixture(
+            non_claims={"runtime_changed": True}
+        )
+        result = self.run_gatekeeper_edge_policy_fork_gate(report, "--accept-label-coverage-warning")
+
+        self.assertEqual(result["status"], "FAIL")
+        self.assertIn("non_claim_not_false:runtime_changed=True", result["fail_reasons"])
+
+    def test_gatekeeper_edge_policy_fork_gate_fails_on_join_scope_mismatch(self) -> None:
+        report = self.gatekeeper_edge_policy_fork_gate_fixture(
+            policy_fork_statuses=[
+                "GK_EDGE_POLICY_FORK_OFFLINE_ONLY",
+                "GK_EDGE_POLICY_FORK_R2_OPPORTUNITY_CONFIRMED_OFFLINE",
+                "GK_EDGE_POLICY_FORK_JOIN_SCOPE_MISMATCH_WARNING",
+                "GK_EDGE_POLICY_FORK_R2_OPPORTUNITY_NOT_EXECUTION_SAFE",
+                "GK_EDGE_POLICY_FORK_REQUIRES_FRESH_VALIDATION",
+                "GK_EDGE_POLICY_FORK_NO_RUNTIME_GO",
+            ]
+        )
+        result = self.run_gatekeeper_edge_policy_fork_gate(report, "--accept-label-coverage-warning")
+
+        self.assertEqual(result["status"], "FAIL")
+        self.assertIn(
+            "forbidden_status:GK_EDGE_POLICY_FORK_JOIN_SCOPE_MISMATCH_WARNING",
+            result["fail_reasons"],
+        )
+
+    def test_gatekeeper_edge_policy_fork_gate_fails_on_weak_edge_metrics(self) -> None:
+        report = self.gatekeeper_edge_policy_fork_gate_fixture(
+            global_metrics={
+                "policy_fork_would_allow_lift_vs_base_rate_pp": 0.03,
+                "policy_fork_would_allow_resolved_rows": 40,
+            }
+        )
+        result = self.run_gatekeeper_edge_policy_fork_gate(report, "--accept-label-coverage-warning")
+
+        self.assertEqual(result["status"], "FAIL")
+        self.assertIn(
+            "policy_fork_would_allow_lift_too_low:0.030000<0.100000",
+            result["fail_reasons"],
+        )
+        self.assertIn(
+            "policy_fork_would_allow_resolved_rows_too_low:40<100",
+            result["fail_reasons"],
+        )
 
 
 if __name__ == "__main__":
