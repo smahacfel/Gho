@@ -43,7 +43,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-top50-lift-pp", type=float, default=0.05)
     parser.add_argument("--min-candidate-rows", type=int, default=100)
     parser.add_argument("--min-topk-evidence-sufficient-rate", type=float, default=0.80)
+    parser.add_argument("--min-topk-resolved-label-rate", type=float, default=0.80)
     parser.add_argument("--max-toxic-false-positive-rate", type=float, default=0.50)
+    parser.add_argument(
+        "--ranking-population",
+        choices=["resolved", "all"],
+        default="resolved",
+        help="Rank only resolved denominator rows, or all candidate rows with precision computed on resolved selected rows.",
+    )
+    parser.add_argument(
+        "--candidate-id",
+        action="append",
+        default=None,
+        help="Optional candidate/probe id allowlist. Defaults to all built-in candidates.",
+    )
     parser.add_argument("--output", default=None)
     parser.add_argument("--md-output", default=None)
     parser.add_argument("--grid-output", default=None)
@@ -138,22 +151,36 @@ def ordered(rows: list[dict[str, Any]], scores: dict[str, float]) -> list[dict[s
     )
 
 
-def selected_metric(rows: list[dict[str, Any]], selected: list[dict[str, Any]]) -> dict[str, Any]:
-    positives = sum(1 for row in rows if label_positive(row))
-    selected_positive = sum(1 for row in selected if label_positive(row))
-    precision = selected_positive / len(selected) if selected else None
-    base_rate = positives / len(rows) if rows else None
+def selected_metric(
+    base_rows: list[dict[str, Any]],
+    ranking_rows: list[dict[str, Any]],
+    selected: list[dict[str, Any]],
+) -> dict[str, Any]:
+    positives = sum(1 for row in base_rows if label_positive(row))
+    resolved_selected = [row for row in selected if baseline.r2only_denominator(row)]
+    selected_positive = sum(1 for row in resolved_selected if label_positive(row))
+    selected_negative = len(resolved_selected) - selected_positive
+    precision = selected_positive / len(resolved_selected) if resolved_selected else None
+    base_rate = positives / len(base_rows) if base_rows else None
     return {
-        "denominator_rows": len(rows),
+        "denominator_rows": len(base_rows),
+        "base_denominator_rows": len(base_rows),
+        "ranking_population_rows": len(ranking_rows),
         "selected_count": len(selected),
+        "selected_rows": len(selected),
+        "resolved_selected_rows": len(resolved_selected),
+        "unresolved_selected_rows": len(selected) - len(resolved_selected),
         "positive_count": selected_positive,
-        "negative_count": len(selected) - selected_positive,
+        "positive_selected_rows": selected_positive,
+        "negative_count": selected_negative,
+        "negative_selected_rows": selected_negative,
         "precision": precision,
+        "resolved_label_coverage_rate": len(resolved_selected) / len(selected) if selected else None,
         "base_positive_rate": base_rate,
         "lift_vs_base_rate_pp": (
             precision - base_rate if isinstance(precision, float) and isinstance(base_rate, float) else None
         ),
-        "accept_rate": len(selected) / len(rows) if rows else None,
+        "accept_rate": len(selected) / len(ranking_rows) if ranking_rows else None,
         "ev_proxy_pct": (
             precision * TARGET_NET_PCT - (1.0 - precision) * STOP_NET_PCT
             if isinstance(precision, float)
@@ -162,9 +189,16 @@ def selected_metric(rows: list[dict[str, Any]], selected: list[dict[str, Any]]) 
     }
 
 
-def topk_metrics(rows: list[dict[str, Any]], scores: dict[str, float]) -> dict[str, Any]:
-    ranked = ordered(rows, scores)
-    return {f"top{k}": selected_metric(rows, ranked[: min(k, len(ranked))]) for k in TOP_K}
+def topk_metrics(
+    base_rows: list[dict[str, Any]],
+    ranking_rows: list[dict[str, Any]],
+    scores: dict[str, float],
+) -> dict[str, Any]:
+    ranked = ordered(ranking_rows, scores)
+    return {
+        f"top{k}": selected_metric(base_rows, ranking_rows, ranked[: min(k, len(ranked))])
+        for k in TOP_K
+    }
 
 
 def quantile(values: list[float], pct: float) -> float | None:
@@ -426,14 +460,18 @@ def false_positive_review(
 
 
 def candidate_payload(
-    rows: list[dict[str, Any]],
+    base_rows: list[dict[str, Any]],
+    ranking_rows: list[dict[str, Any]],
     scores: dict[str, float],
     candidate_id: str,
+    ranking_population: str,
 ) -> dict[str, Any]:
-    ranked = ordered(rows, scores)
+    ranked = ordered(ranking_rows, scores)
     top25 = ranked[: min(25, len(ranked))]
     top50 = ranked[: min(50, len(ranked))]
     top25_sufficient = sum(1 for row in top25 if evidence_sufficient(row))
+    top25_resolved = sum(1 for row in top25 if baseline.r2only_denominator(row))
+    top50_resolved = sum(1 for row in top50 if baseline.r2only_denominator(row))
     fp_top50 = [row for row in top50 if not label_positive(row)]
     fp_toxic = sum(1 for row in fp_top50 if risk_flags(row))
     risk_counts: Counter[str] = Counter()
@@ -442,9 +480,14 @@ def candidate_payload(
             risk_counts[flag] += 1
     return {
         "eligible_rows": len(scores),
-        "eligible_rate": len(scores) / len(rows) if rows else None,
-        "topk": topk_metrics(rows, scores),
+        "eligible_rate": len(scores) / len(ranking_rows) if ranking_rows else None,
+        "base_denominator_rows": len(base_rows),
+        "ranking_population": ranking_population,
+        "ranking_population_rows": len(ranking_rows),
+        "topk": topk_metrics(base_rows, ranking_rows, scores),
         "top25_evidence_sufficient_rate": top25_sufficient / len(top25) if top25 else None,
+        "top25_resolved_label_rate": top25_resolved / len(top25) if top25 else None,
+        "top50_resolved_label_rate": top50_resolved / len(top50) if top50 else None,
         "top50_false_positive_count": len(fp_top50),
         "top50_toxic_false_positive_count": fp_toxic,
         "top50_toxic_false_positive_rate": fp_toxic / len(fp_top50) if fp_top50 else 0.0,
@@ -489,6 +532,22 @@ def classify_promotability(
                     "label_review_required": True,
                     "fail_reasons": ["current_regime_probe_uses_insufficient_evidence_segment"],
                 }
+            top25_resolved = validation.get("top25_resolved_label_rate")
+            train_top25_resolved = train.get("top25_resolved_label_rate")
+            if (
+                args.ranking_population == "all"
+                and (
+                    not isinstance(top25_resolved, float)
+                    or top25_resolved < args.min_topk_resolved_label_rate
+                    or not isinstance(train_top25_resolved, float)
+                    or train_top25_resolved < args.min_topk_resolved_label_rate
+                )
+            ):
+                return {
+                    "promotability_status": "INSUFFICIENT_SELECTED_RESOLVED_COVERAGE",
+                    "label_review_required": False,
+                    "fail_reasons": ["topk_selected_resolved_label_coverage_too_low"],
+                }
             return {
                 "promotability_status": "FRESH_VALIDATION_REQUIRED",
                 "label_review_required": False,
@@ -528,6 +587,13 @@ def classify_promotability(
     train_top25_sufficient = train.get("top25_evidence_sufficient_rate")
     if not isinstance(train_top25_sufficient, float) or train_top25_sufficient < args.min_topk_evidence_sufficient_rate:
         fail_reasons.append("train_top25_evidence_sufficient_rate_too_low")
+    if args.ranking_population == "all":
+        top25_resolved = validation.get("top25_resolved_label_rate")
+        train_top25_resolved = train.get("top25_resolved_label_rate")
+        if not isinstance(top25_resolved, float) or top25_resolved < args.min_topk_resolved_label_rate:
+            fail_reasons.append("top25_selected_resolved_label_coverage_too_low")
+        if not isinstance(train_top25_resolved, float) or train_top25_resolved < args.min_topk_resolved_label_rate:
+            fail_reasons.append("train_top25_selected_resolved_label_coverage_too_low")
     toxic_fp_rate = validation.get("top50_toxic_false_positive_rate")
     if isinstance(toxic_fp_rate, float) and toxic_fp_rate > args.max_toxic_false_positive_rate:
         fail_reasons.append("toxic_false_positive_rate_too_high")
@@ -564,6 +630,24 @@ def run_quality(root: Path, scope: str, rows: list[dict[str, Any]]) -> dict[str,
         "leakage_audit_status": leakage_status,
         "leakage_clean": leakage_status == "PASS",
     }
+
+
+def cross_run_verdict(
+    candidates: dict[str, Any],
+    train_quality: dict[str, Any],
+    validation_quality: dict[str, Any],
+    status: str,
+) -> str:
+    if not train_quality["leakage_clean"] or not validation_quality["leakage_clean"]:
+        return "LABEL_SEMANTICS_REVIEW_REQUIRED"
+    if train_quality["denominator_rows"] <= 0 or validation_quality["denominator_rows"] <= 0:
+        return "INSUFFICIENT_RESOLVED_COVERAGE"
+    if status == "P4E_INSUFFICIENT_SELECTED_RESOLVED_COVERAGE":
+        return "INSUFFICIENT_SELECTED_RESOLVED_COVERAGE"
+    for payload in candidates.values():
+        if payload["promotability"]["promotability_status"] == "FRESH_VALIDATION_REQUIRED":
+            return "R23_R24_SEGMENT_SIGNAL_CONFIRMED"
+    return "R24_ONLY_SIGNAL_NOT_CONFIRMED_ON_R23"
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -621,10 +705,23 @@ def write_markdown(path: Path, report: dict[str, Any]) -> None:
 def build_report(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.root)
     specs, _thresholds = parity.parse_runtime_spec(root / args.rust_source)
-    train_rows = denominator_rows(list(common.iter_json_objects(training_view_path(root, args.train_scope))))
-    validation_rows = denominator_rows(list(common.iter_json_objects(training_view_path(root, args.validation_scope))))
-    train_scores_all = score_map(train_rows, specs)
-    validation_scores_all = score_map(validation_rows, specs)
+    train_all_rows = list(common.iter_json_objects(training_view_path(root, args.train_scope)))
+    validation_all_rows = list(common.iter_json_objects(training_view_path(root, args.validation_scope)))
+    train_rows = denominator_rows(train_all_rows)
+    validation_rows = denominator_rows(validation_all_rows)
+    train_ranking_rows = train_rows if args.ranking_population == "resolved" else train_all_rows
+    validation_ranking_rows = validation_rows if args.ranking_population == "resolved" else validation_all_rows
+    train_scores_all = score_map(train_ranking_rows, specs)
+    validation_scores_all = score_map(validation_ranking_rows, specs)
+    definitions = [
+        definition
+        for definition in candidate_defs()
+        if args.candidate_id is None or definition["candidate_id"] in set(args.candidate_id)
+    ]
+    if args.candidate_id and len(definitions) != len(set(args.candidate_id)):
+        known = {str(definition["candidate_id"]) for definition in candidate_defs()}
+        unknown = sorted(set(args.candidate_id).difference(known))
+        raise ValueError(f"unknown candidate ids: {', '.join(unknown)}")
 
     candidates: dict[str, Any] = {}
     grid_rows: list[dict[str, Any]] = []
@@ -634,12 +731,24 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
     fresh_validation_ids: list[str] = []
     label_review_required = False
 
-    for definition in candidate_defs():
+    for definition in definitions:
         candidate_id = str(definition["candidate_id"])
-        train_scores = candidate_scores(train_rows, train_scores_all, candidate_id)
-        validation_scores = candidate_scores(validation_rows, validation_scores_all, candidate_id)
-        train_payload = candidate_payload(train_rows, train_scores, candidate_id)
-        validation_payload = candidate_payload(validation_rows, validation_scores, candidate_id)
+        train_scores = candidate_scores(train_ranking_rows, train_scores_all, candidate_id)
+        validation_scores = candidate_scores(validation_ranking_rows, validation_scores_all, candidate_id)
+        train_payload = candidate_payload(
+            train_rows,
+            train_ranking_rows,
+            train_scores,
+            candidate_id,
+            args.ranking_population,
+        )
+        validation_payload = candidate_payload(
+            validation_rows,
+            validation_ranking_rows,
+            validation_scores,
+            candidate_id,
+            args.ranking_population,
+        )
         promotability = classify_promotability(candidate_id, train_payload, validation_payload, args)
         if promotability["promotability_status"] == "PROMOTABLE_CANDIDATE":
             promotable_ids.append(candidate_id)
@@ -677,17 +786,25 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
                 "validation_top50_toxic_false_positive_rate": validation_payload["top50_toxic_false_positive_rate"],
             }
         )
-        false_positive_rows.extend(false_positive_review(train_rows, train_scores, candidate_id, "train"))
-        false_positive_rows.extend(false_positive_review(validation_rows, validation_scores, candidate_id, "validation"))
+        false_positive_rows.extend(false_positive_review(train_ranking_rows, train_scores, candidate_id, "train"))
+        false_positive_rows.extend(false_positive_review(validation_ranking_rows, validation_scores, candidate_id, "validation"))
 
     train_quality = run_quality(root, args.train_scope, train_rows)
     validation_quality = run_quality(root, args.validation_scope, validation_rows)
+    insufficient_selected_coverage_ids = [
+        candidate_id
+        for candidate_id, payload in candidates.items()
+        if payload["promotability"]["promotability_status"] == "INSUFFICIENT_SELECTED_RESOLVED_COVERAGE"
+    ]
     if promotable_ids:
         status = "P4E_PROMOTABLE_CANDIDATE_FOUND"
         business_decision = "FREEZE_SEGMENT_CANDIDATE_CONTRACT_OFFLINE"
     elif fresh_validation_ids:
         status = "P4E_CURRENT_REGIME_CANDIDATE_REQUIRES_FRESH_VALIDATION"
         business_decision = "DO_NOT_RUN_RUNTIME_FREEZE_DIAGNOSTIC_PROBE"
+    elif insufficient_selected_coverage_ids:
+        status = "P4E_INSUFFICIENT_SELECTED_RESOLVED_COVERAGE"
+        business_decision = "CONTINUE_LABEL_MATURATION_OR_FRESH_VALIDATION_ONLY"
     elif label_review_required:
         status = "P4E_REQUIRES_LABEL_REVIEW"
         business_decision = "REVIEW_R2_LABEL_OR_STRATEGY_CONTRACT"
@@ -716,8 +833,16 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "validation_scope": args.validation_scope,
         "promotable_candidate_ids": promotable_ids,
         "fresh_validation_candidate_ids": fresh_validation_ids,
+        "insufficient_selected_resolved_coverage_candidate_ids": insufficient_selected_coverage_ids,
         "label_review_required": label_review_required,
+        "ranking_population": args.ranking_population,
         "run_quality": {"train": train_quality, "validation": validation_quality},
+        "cross_run_verdict": cross_run_verdict(
+            candidates,
+            train_quality,
+            validation_quality,
+            status,
+        ),
         "claim_boundaries": {
             "offline_only": True,
             "diagnostic_only": True,
@@ -733,6 +858,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
             "min_top50_lift_pp": args.min_top50_lift_pp,
             "min_candidate_rows": args.min_candidate_rows,
             "min_topk_evidence_sufficient_rate": args.min_topk_evidence_sufficient_rate,
+            "min_topk_resolved_label_rate": args.min_topk_resolved_label_rate,
             "max_toxic_false_positive_rate": args.max_toxic_false_positive_rate,
         },
         "candidates": candidates,

@@ -1326,7 +1326,121 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertEqual(row["feature_source_max_ts_ms"], 3_000)
         self.assertNotIn("final_pnl_pct", row)
         self.assertEqual(row["unique_buyers"], 1)
+        self.assertEqual(row["buy_count"], 1)
+        self.assertEqual(row["sell_count"], 1)
+        self.assertAlmostEqual(row["total_volume_sol"], 3.0)
+        self.assertAlmostEqual(row["buy_volume_sol"], 2.0)
+        self.assertAlmostEqual(row["sell_volume_sol"], 1.0)
         self.assertAlmostEqual(row["sell_share"], 0.5)
+
+    def test_feature_snapshot_streaming_matches_in_memory_rollup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            candidates = root / "candidate_universe_v1.jsonl"
+            events = root / "events-000.jsonl"
+            in_memory_output = root / "feature_snapshots_memory.jsonl"
+            streaming_output = root / "feature_snapshots_streaming.jsonl"
+            streaming_manifest = root / "feature_snapshots_streaming_manifest.json"
+            write_jsonl(
+                candidates,
+                [
+                    {
+                        "candidate_id": "c1",
+                        "base_mint": "mint1",
+                        "pool_id": "pool1",
+                        "bonding_curve": "curve1",
+                        "quote_mint": "SOL",
+                        "birth_ts_ms": 1_000,
+                        "decision_ts_ms": 20_000,
+                    }
+                ],
+            )
+            write_jsonl(
+                events,
+                [
+                    {
+                        "candidate_id": "c1",
+                        "timestamp_ms": 2_000,
+                        "slot": 10,
+                        "side": "buy",
+                        "success": True,
+                        "signer": "buyer1",
+                        "quote_amount_sol": 2.0,
+                        "bonding_curve_progress": 0.10,
+                    },
+                    {
+                        "candidate_id": "c1",
+                        "timestamp_ms": 3_000,
+                        "slot": 11,
+                        "side": "sell",
+                        "success": True,
+                        "signer": "seller1",
+                        "quote_amount_sol": 1.0,
+                    },
+                    {
+                        "candidate_id": "c1",
+                        "timestamp_ms": 4_000,
+                        "slot": 12,
+                        "side": "buy",
+                        "success": False,
+                        "signer": "failed-buyer",
+                        "quote_amount_sol": 10.0,
+                    },
+                    {
+                        "candidate_id": "c1",
+                        "timestamp_ms": 8_000,
+                        "slot": 13,
+                        "side": "buy",
+                        "success": True,
+                        "signer": "future-buyer",
+                        "quote_amount_sol": 7.0,
+                    },
+                ],
+            )
+
+            snapshots.run(
+                snapshots.build_parser().parse_args(
+                    [
+                        "--candidate-universe",
+                        str(candidates),
+                        "--events",
+                        str(events),
+                        "--output",
+                        str(in_memory_output),
+                        "--snapshot-kind",
+                        "birth+5s",
+                    ]
+                )
+            )
+            manifest = snapshots.run(
+                snapshots.build_parser().parse_args(
+                    [
+                        "--candidate-universe",
+                        str(candidates),
+                        "--events-glob",
+                        str(root / "events-*.jsonl"),
+                        "--output",
+                        str(streaming_output),
+                        "--manifest-output",
+                        str(streaming_manifest),
+                        "--snapshot-kind",
+                        "birth+5s",
+                        "--streaming",
+                    ]
+                )
+            )
+            streaming_rows = read_jsonl(streaming_output)
+            in_memory_rows = read_jsonl(in_memory_output)
+
+        self.assertEqual(streaming_rows, in_memory_rows)
+        self.assertTrue(manifest["streaming_mode"])
+        self.assertEqual(manifest["streaming_event_rows_scanned"], 4)
+        self.assertEqual(manifest["streaming_event_rows_matched"], 4)
+        row = streaming_rows[0]
+        self.assertEqual(row["source_event_count"], 3)
+        self.assertEqual(row["tx_event_count"], 2)
+        self.assertEqual(row["buy_count"], 1)
+        self.assertAlmostEqual(row["total_volume_sol"], 3.0)
 
     def test_training_view_keeps_unmatured_horizon_out_of_r2_negative(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2324,7 +2438,15 @@ class SelectorPipelineTests(unittest.TestCase):
         write_scope(validation_scope, validation=True)
         return rust_source
 
-    def run_segment_specific_fixture(self, root: Path, train_scope: str, validation_scope: str, rust_source: Path) -> dict:
+    def run_segment_specific_fixture(
+        self,
+        root: Path,
+        train_scope: str,
+        validation_scope: str,
+        rust_source: Path,
+        *,
+        extra_args: list[str] | None = None,
+    ) -> dict:
         return segment_specific_candidate.build_report(
             segment_specific_candidate.build_parser().parse_args(
                 [
@@ -2341,6 +2463,7 @@ class SelectorPipelineTests(unittest.TestCase):
                     "--max-toxic-false-positive-rate",
                     "1.0",
                 ]
+                + (extra_args or [])
             )
         )
 
@@ -2440,6 +2563,37 @@ class SelectorPipelineTests(unittest.TestCase):
         )
         self.assertFalse(report["claim_boundaries"]["production_promotion_allowed"])
         self.assertFalse(report["claim_boundaries"]["changes_runtime"])
+
+    def test_segment_specific_candidate_all_population_reports_selected_resolved_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            train_scope = "selector-p4e-current-regime-all-train"
+            validation_scope = "selector-p4e-current-regime-all-validation"
+            rust_source = self.write_segment_specific_fixture(
+                root,
+                train_scope,
+                validation_scope,
+                mode="current_regime_probe",
+            )
+            report = self.run_segment_specific_fixture(
+                root,
+                train_scope,
+                validation_scope,
+                rust_source,
+                extra_args=[
+                    "--ranking-population",
+                    "all",
+                    "--candidate-id",
+                    "current_regime_unique_actors_q1_q2_score_probe",
+                ],
+            )
+
+        candidate = report["candidates"]["current_regime_unique_actors_q1_q2_score_probe"]
+        top25 = candidate["validation"]["topk"]["top25"]
+        self.assertEqual(report["ranking_population"], "all")
+        self.assertEqual(top25["selected_rows"], top25["resolved_selected_rows"])
+        self.assertEqual(top25["unresolved_selected_rows"], 0)
+        self.assertEqual(report["cross_run_verdict"], "R23_R24_SEGMENT_SIGNAL_CONFIRMED")
 
     def test_segment_specific_candidate_current_regime_probe_requires_label_review_when_evidence_invalid(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3627,6 +3781,11 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertEqual(row["feature_snapshot_status"], "ok")
         self.assertEqual(row["source_event_count"], 4)
         self.assertEqual(row["tx_event_count"], 2)
+        self.assertEqual(row["buy_count"], 1)
+        self.assertEqual(row["sell_count"], 1)
+        self.assertAlmostEqual(row["total_volume_sol"], 2.0)
+        self.assertAlmostEqual(row["buy_volume_sol"], 1.5)
+        self.assertAlmostEqual(row["sell_volume_sol"], 0.5)
         self.assertEqual(row["unique_buyers"], 1)
         self.assertAlmostEqual(row["net_quote_in_15s"], 1.0)
         self.assertAlmostEqual(row["net_quote_in_30s"], 1.0)
@@ -4800,6 +4959,97 @@ class SelectorPipelineTests(unittest.TestCase):
             training_rows[0]["execution_feasibility_status"],
             "not_available_r2_only",
         )
+
+    def test_phase3_r2only_builds_from_frozen_explicit_inputs_without_phase2_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "selector-phase3-frozen-inputs-test"
+            dataset_dir = root / "datasets" / "selector" / scope
+            dataset_dir.mkdir(parents=True)
+            candidates = dataset_dir / "candidate_universe_v1.jsonl"
+            accepted_lifecycle = dataset_dir / "accepted_lifecycle_v1.jsonl"
+            features = dataset_dir / "feature_snapshots_v1.jsonl"
+            r2_paths = dataset_dir / "r2_market_paths_v1.jsonl"
+            write_jsonl(
+                candidates,
+                [
+                    {
+                        "candidate_id": "c1",
+                        "candidate_universe_status": "ok",
+                        "cohort_in_scope": True,
+                        "stream_completeness_ok": True,
+                        "base_mint": "mint1",
+                        "pool_id": "pool1",
+                        "bonding_curve": "curve1",
+                        "quote_mint": "SOL",
+                        "birth_ts_ms": 1_000,
+                        "decision_ts_ms": 2_000,
+                    }
+                ],
+            )
+            write_jsonl(accepted_lifecycle, [])
+            write_jsonl(
+                features,
+                [
+                    {
+                        "candidate_id": "c1",
+                        "snapshot_kind": "decision",
+                        "feature_cutoff_ts_ms": 2_000,
+                        "feature_cutoff_slot": 10,
+                        "feature_source": "selector_offline_event_rollup",
+                        "feature_observed_lag_ms": 0,
+                        "feature_source_max_ts_ms": 2_000,
+                        "feature_snapshot_status": "ok",
+                        "feature_time_provenance_ok": True,
+                        "unique_buyers": 2,
+                        "buy_count": 2,
+                        "total_volume_sol": 1.0,
+                    }
+                ],
+            )
+            write_jsonl(
+                r2_paths,
+                [
+                    {
+                        "candidate_id": "c1",
+                        "base_mint": "mint1",
+                        "pool_id": "pool1",
+                        "bonding_curve": "curve1",
+                        "path_source": "DIAG_ACCOUNT_UPDATE_RELAY",
+                        "path_status": "ok",
+                        "path_coverage_ok": True,
+                        "horizon_matured": True,
+                        "samples": [{"offset_ms": 60_000, "return_pct": 45.0}],
+                    }
+                ],
+            )
+
+            phase3_manifest = phase3_r2only.run(
+                phase3_r2only.build_parser().parse_args(
+                    [
+                        "--scope",
+                        scope,
+                        "--root",
+                        str(root),
+                        "--candidate-universe",
+                        str(candidates),
+                        "--accepted-lifecycle",
+                        str(accepted_lifecycle),
+                        "--feature-snapshots",
+                        str(features),
+                        "--r2-market-paths",
+                        str(r2_paths),
+                        "--frozen-explicit-inputs",
+                        "--min-resolved-rows",
+                        "1",
+                    ]
+                )
+            )
+
+        self.assertEqual(phase3_manifest["status"], "PASS_R2_ONLY_DRAFT")
+        self.assertTrue(phase3_manifest["frozen_explicit_inputs"])
+        self.assertEqual(phase3_manifest["dataset_kind"], "r2_only_frozen_explicit_inputs")
+        self.assertEqual(phase3_manifest["r2_training_denominator_rows"], 1)
 
     def test_r2only_baseline_report_is_draft_only_and_uses_resolved_denominator(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

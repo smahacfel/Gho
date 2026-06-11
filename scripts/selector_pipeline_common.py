@@ -694,6 +694,172 @@ def latest_numeric(rows: list[dict[str, Any]], fields: tuple[str, ...]) -> float
     return None
 
 
+class FeatureSnapshotAccumulator:
+    """Bounded-memory rollup for a single candidate/snapshot cutoff."""
+
+    def __init__(self, candidate: dict[str, Any], *, snapshot_kind: str, cutoff_ts_ms: int) -> None:
+        self.candidate = candidate
+        self.snapshot_kind = snapshot_kind
+        self.cutoff_ts_ms = cutoff_ts_ms
+        self.birth_ts = int_or_none(candidate.get("birth_ts_ms"))
+        self.source_event_count = 0
+        self.tx_event_count = 0
+        self.buy_count = 0
+        self.sell_count = 0
+        self.latest_ts: int | None = None
+        self.latest_slot: int | None = None
+        self.wallet_amounts: dict[str, float] = defaultdict(float)
+        self.buyer_amounts: dict[str, float] = defaultdict(float)
+        self.unique_buyers: set[str] = set()
+        self.total_abs = 0.0
+        self.total_buy = 0.0
+        self.total_sell = 0.0
+        self.net_quote_in_15s = 0.0
+        self.net_quote_in_30s = 0.0
+        self.curve_progress_pct: float | None = None
+        self.curve_progress_ts_ms: int | None = None
+        self.creator_sold_early_flag = False
+
+    def add_event(self, row: dict[str, Any]) -> bool:
+        ts = row_timestamp_ms(row)
+        if ts is None or ts > self.cutoff_ts_ms:
+            return False
+        self.source_event_count += 1
+        self.latest_ts = ts if self.latest_ts is None else max(self.latest_ts, ts)
+        slot = source_slot(row)
+        if slot is not None:
+            self.latest_slot = slot if self.latest_slot is None else max(self.latest_slot, slot)
+        curve_progress = float_or_none(
+            find_first_key(
+                row,
+                ("curve_progress_pct", "bonding_curve_progress_pct", "bonding_curve_progress"),
+            )
+        )
+        if curve_progress is not None and (
+            self.curve_progress_ts_ms is None or ts >= self.curve_progress_ts_ms
+        ):
+            self.curve_progress_pct = curve_progress
+            self.curve_progress_ts_ms = ts
+        if bool_or_none(find_first_key(row, ("creator_sold_early_flag",))) is True:
+            self.creator_sold_early_flag = True
+
+        side = event_side(row)
+        if side not in {"buy", "sell"}:
+            return True
+        self.tx_event_count += 1
+        amount = event_quote_amount(row)
+        wallet = str_or_none(find_first_key(row, ("signer", "buyer", "seller", "wallet", "owner", "trader")))
+        if wallet:
+            self.wallet_amounts[wallet] += amount
+        self.total_abs += amount
+        sign = 1.0 if side == "buy" else -1.0
+        if self.birth_ts is not None and self.birth_ts <= ts <= min(self.cutoff_ts_ms, self.birth_ts + 15_000):
+            self.net_quote_in_15s += sign * amount
+        if self.birth_ts is not None and self.birth_ts <= ts <= min(self.cutoff_ts_ms, self.birth_ts + 30_000):
+            self.net_quote_in_30s += sign * amount
+
+        if side == "buy":
+            self.buy_count += 1
+            buyer = str_or_none(find_first_key(row, ("signer", "buyer", "wallet", "owner", "trader")))
+            if buyer:
+                self.unique_buyers.add(buyer)
+                self.buyer_amounts[buyer] += amount
+            self.total_buy += amount
+        else:
+            self.sell_count += 1
+            self.total_sell += amount
+            creator = str_or_none(
+                find_first_key(self.candidate, ("creator", "creator_pubkey", "dev_pubkey", "create_user"))
+            )
+            seller = str_or_none(find_first_key(row, ("signer", "seller", "wallet", "owner", "trader")))
+            if creator and seller == creator:
+                self.creator_sold_early_flag = True
+        return True
+
+    def to_snapshot(self) -> dict[str, Any]:
+        decision_context_source = (
+            self.snapshot_kind == "decision"
+            and str_or_none(self.candidate.get("decision_context_join_key")) is not None
+        )
+        decision_cutoff_source = None
+        if self.snapshot_kind == "decision":
+            decision_cutoff_source = (
+                "candidate_universe_decision_ts_ms_context_join"
+                if decision_context_source
+                else "candidate_universe_decision_ts_ms"
+            )
+        feature_observed_lag_ms = (
+            self.cutoff_ts_ms - self.latest_ts if self.latest_ts is not None else None
+        )
+        incomplete_reasons = []
+        if self.source_event_count == 0:
+            incomplete_reasons.append("no_cutoff_events")
+        if self.latest_slot is None:
+            incomplete_reasons.append("missing_feature_cutoff_slot")
+        if feature_observed_lag_ms is None:
+            incomplete_reasons.append("missing_feature_observed_lag_ms")
+        elif feature_observed_lag_ms < 0:
+            incomplete_reasons.append("feature_source_after_cutoff")
+        snapshot_status = "feature_snapshot_incomplete" if incomplete_reasons else "ok"
+        top1_wallet_share = (
+            max(self.wallet_amounts.values()) / self.total_abs
+            if self.total_abs > 0.0 and self.wallet_amounts
+            else None
+        )
+        buyer_hhi = (
+            sum((amount / self.total_buy) ** 2 for amount in self.buyer_amounts.values())
+            if self.total_buy > 0.0 and self.buyer_amounts
+            else None
+        )
+        window_start = self.birth_ts if self.birth_ts is not None else self.cutoff_ts_ms
+        elapsed_s = max((self.cutoff_ts_ms - window_start) / 1000.0, 0.001)
+        snapshot = {
+            "selector_schema_version": SCHEMA_VERSION,
+            "feature_snapshot_schema_version": SCHEMA_VERSION,
+            "candidate_id": self.candidate.get("candidate_id"),
+            "base_mint": self.candidate.get("base_mint") or self.candidate.get("mint_id"),
+            "pool_id": self.candidate.get("pool_id"),
+            "bonding_curve": self.candidate.get("bonding_curve"),
+            "quote_mint": self.candidate.get("quote_mint"),
+            "quote_mint_is_sol": quote_mint_is_sol(str_or_none(self.candidate.get("quote_mint"))),
+            "snapshot_kind": self.snapshot_kind,
+            "feature_cutoff_ts_ms": self.cutoff_ts_ms,
+            "feature_cutoff_slot": self.latest_slot,
+            "feature_source": "selector_offline_event_rollup",
+            "feature_observed_lag_ms": feature_observed_lag_ms,
+            "feature_source_max_ts_ms": self.latest_ts,
+            "feature_source_max_slot": self.latest_slot,
+            "feature_snapshot_status": snapshot_status,
+            "feature_snapshot_incomplete_reason": "|".join(incomplete_reasons) if incomplete_reasons else None,
+            "feature_snapshot_excluded_reason": "|".join(incomplete_reasons) if incomplete_reasons else None,
+            "feature_time_provenance_ok": snapshot_status == "ok",
+            "decision_context_source": decision_context_source if self.snapshot_kind == "decision" else None,
+            "decision_context_not_denominator": decision_context_source if self.snapshot_kind == "decision" else None,
+            "decision_cutoff_source": decision_cutoff_source,
+            "source_event_count": self.source_event_count,
+            "tx_event_count": self.tx_event_count,
+            "buy_count": self.buy_count,
+            "sell_count": self.sell_count,
+            "total_volume_sol": self.total_abs,
+            "buy_volume_sol": self.total_buy,
+            "sell_volume_sol": self.total_sell,
+            "curve_progress_pct": self.curve_progress_pct,
+            "curve_progress_status": (
+                "available" if self.curve_progress_pct is not None else "unavailable_missing_curve_state_source"
+            ),
+            "net_quote_in_15s": self.net_quote_in_15s,
+            "net_quote_in_30s": self.net_quote_in_30s,
+            "trade_rate": self.tx_event_count / elapsed_s,
+            "unique_buyers": len(self.unique_buyers),
+            "sell_share": self.sell_count / self.tx_event_count if self.tx_event_count else None,
+            "top1_wallet_share": top1_wallet_share,
+            "buyer_hhi": buyer_hhi,
+            "creator_sold_early_flag": self.creator_sold_early_flag,
+        }
+        assert_no_feature_leakage(snapshot)
+        return snapshot
+
+
 def build_feature_snapshot(
     candidate: dict[str, Any],
     events: list[dict[str, Any]],
@@ -701,145 +867,14 @@ def build_feature_snapshot(
     snapshot_kind: str,
     cutoff_ts_ms: int,
 ) -> dict[str, Any]:
-    birth_ts = int_or_none(candidate.get("birth_ts_ms"))
-    cutoff_events = [
-        row
-        for row in events
-        if (row_ts := row_timestamp_ms(row)) is not None and row_ts <= cutoff_ts_ms
-    ]
-    observed_timestamps = [
-        ts for row in cutoff_events if (ts := row_timestamp_ms(row)) is not None
-    ]
-    observed_slots = [
-        slot for row in cutoff_events if (slot := source_slot(row)) is not None
-    ]
-    latest_ts = max(observed_timestamps) if observed_timestamps else None
-    latest_slot = max(observed_slots) if observed_slots else None
-    tx_events = [row for row in cutoff_events if event_side(row) in {"buy", "sell"}]
-    buys = [row for row in tx_events if event_side(row) == "buy"]
-    sells = [row for row in tx_events if event_side(row) == "sell"]
-    window_start = birth_ts if birth_ts is not None else cutoff_ts_ms
-
-    def amount_until(ms: int, *, side: str | None = None) -> float:
-        if birth_ts is None:
-            return 0.0
-        end = min(cutoff_ts_ms, birth_ts + ms)
-        total = 0.0
-        for row in tx_events:
-            ts = row_timestamp_ms(row)
-            if ts is None or ts < birth_ts or ts > end:
-                continue
-            if side is not None and event_side(row) != side:
-                continue
-            sign = 1.0 if event_side(row) == "buy" else -1.0
-            total += sign * event_quote_amount(row)
-        return total
-
-    unique_buyers = {
-        str_or_none(find_first_key(row, ("signer", "buyer", "wallet", "owner", "trader")))
-        for row in buys
-    }
-    unique_buyers.discard(None)
-    wallet_amounts: dict[str, float] = defaultdict(float)
-    buyer_amounts: dict[str, float] = defaultdict(float)
-    total_abs = 0.0
-    total_buy = 0.0
-    for row in tx_events:
-        wallet = str_or_none(find_first_key(row, ("signer", "buyer", "seller", "wallet", "owner", "trader")))
-        amount = event_quote_amount(row)
-        if wallet:
-            wallet_amounts[wallet] += amount
-        total_abs += amount
-    for row in buys:
-        buyer = str_or_none(find_first_key(row, ("signer", "buyer", "wallet", "owner", "trader")))
-        amount = event_quote_amount(row)
-        if buyer:
-            buyer_amounts[buyer] += amount
-        total_buy += amount
-    creator = str_or_none(find_first_key(candidate, ("creator", "creator_pubkey", "dev_pubkey", "create_user")))
-    creator_sold = any(
-        event_side(row) == "sell"
-        and creator
-        and str_or_none(find_first_key(row, ("signer", "seller", "wallet", "owner", "trader"))) == creator
-        for row in cutoff_events
+    accumulator = FeatureSnapshotAccumulator(
+        candidate,
+        snapshot_kind=snapshot_kind,
+        cutoff_ts_ms=cutoff_ts_ms,
     )
-    creator_sold = creator_sold or any(
-        bool_or_none(find_first_key(row, ("creator_sold_early_flag",))) is True
-        for row in cutoff_events
-    )
-    top1_wallet_share = max(wallet_amounts.values()) / total_abs if total_abs > 0.0 and wallet_amounts else None
-    buyer_hhi = (
-        sum((amount / total_buy) ** 2 for amount in buyer_amounts.values())
-        if total_buy > 0.0 and buyer_amounts
-        else None
-    )
-    elapsed_s = max((cutoff_ts_ms - window_start) / 1000.0, 0.001)
-    feature_observed_lag_ms = cutoff_ts_ms - latest_ts if latest_ts is not None else None
-    incomplete_reasons = []
-    if not cutoff_events:
-        incomplete_reasons.append("no_cutoff_events")
-    if latest_slot is None:
-        incomplete_reasons.append("missing_feature_cutoff_slot")
-    if feature_observed_lag_ms is None:
-        incomplete_reasons.append("missing_feature_observed_lag_ms")
-    elif feature_observed_lag_ms < 0:
-        incomplete_reasons.append("feature_source_after_cutoff")
-    snapshot_status = "feature_snapshot_incomplete" if incomplete_reasons else "ok"
-    decision_context_source = (
-        snapshot_kind == "decision"
-        and str_or_none(candidate.get("decision_context_join_key")) is not None
-    )
-    decision_cutoff_source = None
-    if snapshot_kind == "decision":
-        decision_cutoff_source = (
-            "candidate_universe_decision_ts_ms_context_join"
-            if decision_context_source
-            else "candidate_universe_decision_ts_ms"
-        )
-    curve_progress_pct = latest_numeric(
-        cutoff_events,
-        ("curve_progress_pct", "bonding_curve_progress_pct", "bonding_curve_progress"),
-    )
-    snapshot = {
-        "selector_schema_version": SCHEMA_VERSION,
-        "feature_snapshot_schema_version": SCHEMA_VERSION,
-        "candidate_id": candidate.get("candidate_id"),
-        "base_mint": candidate.get("base_mint") or candidate.get("mint_id"),
-        "pool_id": candidate.get("pool_id"),
-        "bonding_curve": candidate.get("bonding_curve"),
-        "quote_mint": candidate.get("quote_mint"),
-        "quote_mint_is_sol": quote_mint_is_sol(str_or_none(candidate.get("quote_mint"))),
-        "snapshot_kind": snapshot_kind,
-        "feature_cutoff_ts_ms": cutoff_ts_ms,
-        "feature_cutoff_slot": latest_slot,
-        "feature_source": "selector_offline_event_rollup",
-        "feature_observed_lag_ms": feature_observed_lag_ms,
-        "feature_source_max_ts_ms": latest_ts,
-        "feature_source_max_slot": latest_slot,
-        "feature_snapshot_status": snapshot_status,
-        "feature_snapshot_incomplete_reason": "|".join(incomplete_reasons) if incomplete_reasons else None,
-        "feature_snapshot_excluded_reason": "|".join(incomplete_reasons) if incomplete_reasons else None,
-        "feature_time_provenance_ok": snapshot_status == "ok",
-        "decision_context_source": decision_context_source if snapshot_kind == "decision" else None,
-        "decision_context_not_denominator": decision_context_source if snapshot_kind == "decision" else None,
-        "decision_cutoff_source": decision_cutoff_source,
-        "source_event_count": len(cutoff_events),
-        "tx_event_count": len(tx_events),
-        "curve_progress_pct": curve_progress_pct,
-        "curve_progress_status": (
-            "available" if curve_progress_pct is not None else "unavailable_missing_curve_state_source"
-        ),
-        "net_quote_in_15s": amount_until(15_000),
-        "net_quote_in_30s": amount_until(30_000),
-        "trade_rate": len(tx_events) / elapsed_s,
-        "unique_buyers": len(unique_buyers),
-        "sell_share": len(sells) / len(tx_events) if tx_events else None,
-        "top1_wallet_share": top1_wallet_share,
-        "buyer_hhi": buyer_hhi,
-        "creator_sold_early_flag": creator_sold,
-    }
-    assert_no_feature_leakage(snapshot)
-    return snapshot
+    for row in sorted(events, key=lambda item: row_timestamp_ms(item) or 0):
+        accumulator.add_event(row)
+    return accumulator.to_snapshot()
 
 
 def build_incomplete_feature_snapshot(
@@ -879,6 +914,11 @@ def build_incomplete_feature_snapshot(
         "decision_cutoff_source": "missing" if snapshot_kind == "decision" else None,
         "source_event_count": 0,
         "tx_event_count": 0,
+        "buy_count": None,
+        "sell_count": None,
+        "total_volume_sol": None,
+        "buy_volume_sol": None,
+        "sell_volume_sol": None,
         "curve_progress_pct": None,
         "curve_progress_status": reason,
         "net_quote_in_15s": None,

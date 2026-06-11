@@ -90,8 +90,28 @@ def build_phase3(args: argparse.Namespace) -> dict[str, Any]:
     report_dir.mkdir(parents=True, exist_ok=True)
 
     phase2_manifest_path = args.phase2_manifest or report_dir / "dataset_manifest_v1.json"
-    phase2_manifest = read_json(phase2_manifest_path)
-    require_r2_only_phase2(phase2_manifest)
+    if args.frozen_explicit_inputs:
+        missing_explicit = [
+            name
+            for name, value in (
+                ("candidate_universe", args.candidate_universe),
+                ("accepted_lifecycle", args.accepted_lifecycle),
+                ("feature_snapshots", args.feature_snapshots),
+                ("r2_market_paths", args.r2_market_paths),
+            )
+            if value is None
+        ]
+        if missing_explicit:
+            raise ValueError(
+                "--frozen-explicit-inputs requires: " + ", ".join(missing_explicit)
+            )
+        phase2_manifest = read_json(phase2_manifest_path) if phase2_manifest_path.exists() else {
+            "phase2_status": "FROZEN_EXPLICIT_INPUTS_NO_PHASE2_MANIFEST",
+            "denominator_source": "explicit_frozen_inputs",
+        }
+    else:
+        phase2_manifest = read_json(phase2_manifest_path)
+        require_r2_only_phase2(phase2_manifest)
 
     candidate_universe = args.candidate_universe or output_path_from_manifest(
         phase2_manifest,
@@ -164,7 +184,7 @@ def build_phase3(args: argparse.Namespace) -> dict[str, Any]:
         "selector_schema_version": common.SCHEMA_VERSION,
         "artifact": "selector_training_view_manifest_v1",
         "phase": "phase3",
-        "dataset_kind": "r2_only",
+        "dataset_kind": "r2_only_frozen_explicit_inputs" if args.frozen_explicit_inputs else "r2_only",
         "universe_source_class": "ghost_observed_birth_universe",
         "universe_completeness_claim": "system_observed_not_archive_complete",
         "precision_claim_scope": "observed_birth_universe_only",
@@ -203,6 +223,7 @@ def build_phase3(args: argparse.Namespace) -> dict[str, Any]:
         "snapshot_kind": args.snapshot_kind,
         "fallback_snapshot_kind": args.fallback_snapshot_kind,
         "split_denominator": "resolved_r2",
+        "frozen_explicit_inputs": args.frozen_explicit_inputs,
         "r1_lifecycle_available": False,
         "realized_pnl_available": False,
         "execution_realization_available": False,
@@ -224,7 +245,7 @@ def build_phase3(args: argparse.Namespace) -> dict[str, Any]:
         "selector_schema_version": common.SCHEMA_VERSION,
         "artifact": "phase3_r2only_manifest_v1",
         "phase": "phase3",
-        "dataset_kind": "r2_only",
+        "dataset_kind": "r2_only_frozen_explicit_inputs" if args.frozen_explicit_inputs else "r2_only",
         "universe_source_class": "ghost_observed_birth_universe",
         "universe_completeness_claim": "system_observed_not_archive_complete",
         "precision_claim_scope": "observed_birth_universe_only",
@@ -233,6 +254,7 @@ def build_phase3(args: argparse.Namespace) -> dict[str, Any]:
         "fail_reasons": fail_reasons,
         "scope": args.scope,
         "phase2_status": phase2_manifest.get("phase2_status"),
+        "frozen_explicit_inputs": args.frozen_explicit_inputs,
         "phase3_precision_readiness": "R2_ONLY_READY" if status == "PASS_R2_ONLY_DRAFT" else "NO-GO",
         "r1_lifecycle_available": False,
         "realized_pnl_available": False,
@@ -294,6 +316,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scope", required=True)
     parser.add_argument("--root", type=Path, default=Path("/root/Gho"))
     parser.add_argument("--phase2-manifest", type=Path)
+    parser.add_argument(
+        "--frozen-explicit-inputs",
+        action="store_true",
+        help="Build from explicit frozen inputs without requiring a Phase2 PASS manifest.",
+    )
     parser.add_argument("--candidate-universe", type=Path)
     parser.add_argument("--accepted-lifecycle", type=Path)
     parser.add_argument("--feature-snapshots", type=Path)

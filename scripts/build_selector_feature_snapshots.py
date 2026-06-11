@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import glob
 import json
+import resource
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -40,7 +42,49 @@ def snapshot_cutoff(candidate: dict[str, Any], snapshot_kind: str) -> int | None
     return birth_ts + offset
 
 
-def build_feature_snapshots(
+def peak_rss_mb() -> float | None:
+    try:
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    except Exception:
+        return None
+    if rss <= 0:
+        return None
+    return rss / 1024.0
+
+
+def event_paths_from_globs(patterns: list[str]) -> list[Path]:
+    paths: list[Path] = []
+    seen: set[str] = set()
+    for pattern in patterns:
+        for raw in sorted(glob.glob(pattern)):
+            path = Path(raw)
+            key = str(path)
+            if key not in seen:
+                seen.add(key)
+                paths.append(path)
+    return paths
+
+
+def build_candidate_lookup(candidates: list[dict[str, Any]]) -> dict[str, str]:
+    lookup: dict[str, str] = {}
+    for candidate in candidates:
+        candidate_id = common.str_or_none(candidate.get("candidate_id"))
+        if not candidate_id:
+            continue
+        for key in common.candidate_match_keys(candidate):
+            lookup.setdefault(key, candidate_id)
+    return lookup
+
+
+def matched_candidate_id(row: dict[str, Any], lookup: dict[str, str]) -> str | None:
+    for key in common.candidate_match_keys(row):
+        candidate_id = lookup.get(key)
+        if candidate_id:
+            return candidate_id
+    return None
+
+
+def build_feature_snapshots_streaming(
     *,
     candidate_universe: Path,
     event_paths: list[Path],
@@ -48,6 +92,187 @@ def build_feature_snapshots(
     snapshot_kinds: list[str],
     include_decision_context: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    candidates = list(common.iter_json_objects(candidate_universe))
+    lookup = build_candidate_lookup(candidates)
+    accumulators: dict[tuple[str, str], common.FeatureSnapshotAccumulator] = {}
+    row_plan: list[tuple[str, dict[str, Any] | tuple[str, str]]] = []
+    skipped = Counter()
+
+    for candidate in candidates:
+        candidate_id = common.str_or_none(candidate.get("candidate_id"))
+        if not candidate_id:
+            skipped["missing_candidate_id"] += 1
+            continue
+        for snapshot_kind in snapshot_kinds:
+            cutoff = snapshot_cutoff(candidate, snapshot_kind)
+            if cutoff is None:
+                skipped[f"missing_cutoff:{snapshot_kind}"] += 1
+                reason = "missing_decision_cutoff" if snapshot_kind == "decision" else "missing_snapshot_cutoff"
+                row_plan.append(
+                    (
+                        "incomplete",
+                        common.build_incomplete_feature_snapshot(
+                            candidate,
+                            snapshot_kind=snapshot_kind,
+                            reason=reason,
+                        ),
+                    )
+                )
+                continue
+            key = (candidate_id, snapshot_kind)
+            accumulators[key] = common.FeatureSnapshotAccumulator(
+                candidate,
+                snapshot_kind=snapshot_kind,
+                cutoff_ts_ms=cutoff,
+            )
+            row_plan.append(("accumulator", key))
+
+    scanned_event_rows = 0
+    matched_event_rows = 0
+    candidate_without_accumulator_rows = 0
+    decision_context_rows = 0
+    source_paths = list(event_paths)
+    if include_decision_context:
+        source_paths.extend(decision_paths)
+    for path in source_paths:
+        is_decision_path = path in decision_paths
+        for event in common.iter_json_objects(path):
+            scanned_event_rows += 1
+            if is_decision_path:
+                decision_context_rows += 1
+            candidate_id = matched_candidate_id(event, lookup)
+            if not candidate_id:
+                continue
+            matched_event_rows += 1
+            matched_accumulator = False
+            for snapshot_kind in snapshot_kinds:
+                accumulator = accumulators.get((candidate_id, snapshot_kind))
+                if accumulator is None:
+                    continue
+                if accumulator.add_event(event):
+                    matched_accumulator = True
+            if not matched_accumulator:
+                candidate_without_accumulator_rows += 1
+
+    rows: list[dict[str, Any]] = []
+    for kind, payload in row_plan:
+        if kind == "incomplete":
+            rows.append(payload)  # type: ignore[arg-type]
+        else:
+            rows.append(accumulators[payload].to_snapshot())  # type: ignore[index]
+
+    manifest = build_manifest(
+        rows=rows,
+        candidate_universe=candidate_universe,
+        event_paths=event_paths,
+        decision_paths=decision_paths,
+        snapshot_kinds=snapshot_kinds,
+        include_decision_context=include_decision_context,
+        candidate_rows=len(candidates),
+        source_event_rows=scanned_event_rows,
+        skipped=skipped,
+        decision_context_rows=decision_context_rows,
+        streaming_mode=True,
+        streaming_event_rows_scanned=scanned_event_rows,
+        streaming_event_rows_matched=matched_event_rows,
+        streaming_candidate_without_accumulator_rows=candidate_without_accumulator_rows,
+    )
+    return rows, manifest
+
+
+def build_manifest(
+    *,
+    rows: list[dict[str, Any]],
+    candidate_universe: Path,
+    event_paths: list[Path],
+    decision_paths: list[Path],
+    snapshot_kinds: list[str],
+    include_decision_context: bool,
+    candidate_rows: int,
+    source_event_rows: int,
+    skipped: Counter[str],
+    decision_context_rows: int,
+    streaming_mode: bool,
+    streaming_event_rows_scanned: int | None = None,
+    streaming_event_rows_matched: int | None = None,
+    streaming_candidate_without_accumulator_rows: int | None = None,
+) -> dict[str, Any]:
+    kind_counts = Counter(str(row.get("snapshot_kind")) for row in rows)
+    status_counts = Counter(str(row.get("feature_snapshot_status") or "missing") for row in rows)
+    excluded_counts = Counter(
+        str(row.get("feature_snapshot_excluded_reason") or "none") for row in rows
+    )
+    temporal_violations = common.feature_temporal_violations(rows)
+    integrity_violations = feature_integrity_violations(rows)
+    usable_feature_rows = sum(1 for row in rows if row.get("feature_snapshot_status") == "ok")
+    fail_reasons = []
+    if not rows:
+        fail_reasons.append("no_feature_snapshot_rows")
+    if integrity_violations:
+        fail_reasons.append("feature_snapshot_integrity_or_leakage_violation")
+    if include_decision_context and decision_paths:
+        fail_reasons.append("decision_logs_used_for_feature_rollup")
+    manifest = {
+        "selector_schema_version": common.SCHEMA_VERSION,
+        "artifact": "feature_snapshots_v1",
+        "status": "ok" if rows and not fail_reasons else "NO-GO",
+        "fail_reasons": fail_reasons,
+        "candidate_universe": str(candidate_universe),
+        "input_event_paths": [str(path) for path in event_paths],
+        "input_decision_paths": [str(path) for path in decision_paths],
+        "decision_context_for_features": include_decision_context,
+        "decision_context_rows_loaded": decision_context_rows,
+        "feature_source_contract": "event_artifacts_only_by_default; decision_logs_require_explicit_NO_GO_context_mode",
+        "snapshot_kinds": snapshot_kinds,
+        "candidate_rows": candidate_rows,
+        "source_event_rows": source_event_rows,
+        "rows_written": len(rows),
+        "usable_feature_snapshot_rows": usable_feature_rows,
+        "feature_snapshot_gate_status": "PASS" if usable_feature_rows > 0 else "NO-GO",
+        "snapshot_kind_counts": common.counter_dict(kind_counts),
+        "feature_snapshot_status_counts": common.counter_dict(status_counts),
+        "feature_snapshot_excluded_reason_counts": common.counter_dict(excluded_counts),
+        "skipped_counts": common.counter_dict(skipped),
+        "leakage_precheck": "PASS" if not integrity_violations else "NO-GO",
+        "leakage_guard": (
+            "feature_rows_checked_against_outcome_execution_fields_and_source-after-cutoff; "
+            "coverage gaps remain explicit feature_snapshot_incomplete rows"
+        ),
+        "temporal_violation_count": len(temporal_violations),
+        "temporal_violations_sample": temporal_violations[:50],
+        "integrity_violation_count": len(integrity_violations),
+        "integrity_violations_sample": integrity_violations[:50],
+        "streaming_mode": streaming_mode,
+        "streaming_peak_rss_mb": peak_rss_mb(),
+    }
+    if streaming_mode:
+        manifest.update(
+            {
+                "streaming_event_rows_scanned": streaming_event_rows_scanned,
+                "streaming_event_rows_matched": streaming_event_rows_matched,
+                "streaming_candidate_without_accumulator_rows": streaming_candidate_without_accumulator_rows,
+            }
+        )
+    return manifest
+
+
+def build_feature_snapshots(
+    *,
+    candidate_universe: Path,
+    event_paths: list[Path],
+    decision_paths: list[Path],
+    snapshot_kinds: list[str],
+    include_decision_context: bool = False,
+    streaming: bool = False,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if streaming:
+        return build_feature_snapshots_streaming(
+            candidate_universe=candidate_universe,
+            event_paths=event_paths,
+            decision_paths=decision_paths,
+            snapshot_kinds=snapshot_kinds,
+            include_decision_context=include_decision_context,
+        )
     candidates = list(common.iter_json_objects(candidate_universe))
     events: list[dict[str, Any]] = []
     for path in event_paths:
@@ -87,59 +312,26 @@ def build_feature_snapshots(
                     cutoff_ts_ms=cutoff,
                 )
             )
-    kind_counts = Counter(str(row.get("snapshot_kind")) for row in rows)
-    status_counts = Counter(str(row.get("feature_snapshot_status") or "missing") for row in rows)
-    excluded_counts = Counter(
-        str(row.get("feature_snapshot_excluded_reason") or "none") for row in rows
+    return rows, build_manifest(
+        rows=rows,
+        candidate_universe=candidate_universe,
+        event_paths=event_paths,
+        decision_paths=decision_paths,
+        snapshot_kinds=snapshot_kinds,
+        include_decision_context=include_decision_context,
+        candidate_rows=len(candidates),
+        source_event_rows=len(events),
+        skipped=skipped,
+        decision_context_rows=decision_context_rows,
+        streaming_mode=False,
     )
-    temporal_violations = common.feature_temporal_violations(rows)
-    integrity_violations = feature_integrity_violations(rows)
-    usable_feature_rows = sum(1 for row in rows if row.get("feature_snapshot_status") == "ok")
-    fail_reasons = []
-    if not rows:
-        fail_reasons.append("no_feature_snapshot_rows")
-    if integrity_violations:
-        fail_reasons.append("feature_snapshot_integrity_or_leakage_violation")
-    if include_decision_context and decision_paths:
-        fail_reasons.append("decision_logs_used_for_feature_rollup")
-    manifest = {
-        "selector_schema_version": common.SCHEMA_VERSION,
-        "artifact": "feature_snapshots_v1",
-        "status": "ok" if rows and not fail_reasons else "NO-GO",
-        "fail_reasons": fail_reasons,
-        "candidate_universe": str(candidate_universe),
-        "input_event_paths": [str(path) for path in event_paths],
-        "input_decision_paths": [str(path) for path in decision_paths],
-        "decision_context_for_features": include_decision_context,
-        "decision_context_rows_loaded": decision_context_rows,
-        "feature_source_contract": "event_artifacts_only_by_default; decision_logs_require_explicit_NO_GO_context_mode",
-        "snapshot_kinds": snapshot_kinds,
-        "candidate_rows": len(candidates),
-        "source_event_rows": len(events),
-        "rows_written": len(rows),
-        "usable_feature_snapshot_rows": usable_feature_rows,
-        "feature_snapshot_gate_status": "PASS" if usable_feature_rows > 0 else "NO-GO",
-        "snapshot_kind_counts": common.counter_dict(kind_counts),
-        "feature_snapshot_status_counts": common.counter_dict(status_counts),
-        "feature_snapshot_excluded_reason_counts": common.counter_dict(excluded_counts),
-        "skipped_counts": common.counter_dict(skipped),
-        "leakage_precheck": "PASS" if not integrity_violations else "NO-GO",
-        "leakage_guard": (
-            "feature_rows_checked_against_outcome_execution_fields_and_source-after-cutoff; "
-            "coverage gaps remain explicit feature_snapshot_incomplete rows"
-        ),
-        "temporal_violation_count": len(temporal_violations),
-        "temporal_violations_sample": temporal_violations[:50],
-        "integrity_violation_count": len(integrity_violations),
-        "integrity_violations_sample": integrity_violations[:50],
-    }
-    return rows, manifest
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--candidate-universe", required=True, type=Path)
     parser.add_argument("--events", type=Path, action="append", default=[])
+    parser.add_argument("--events-glob", action="append", default=[])
     parser.add_argument("--decisions", type=Path, action="append", default=[])
     parser.add_argument(
         "--include-decision-context",
@@ -148,6 +340,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--manifest-output", type=Path)
+    parser.add_argument("--streaming", action="store_true")
     parser.add_argument(
         "--snapshot-kind",
         action="append",
@@ -160,12 +353,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
     snapshot_kinds = args.snapshot_kind or ["birth+5s", "birth+15s", "birth+30s", "birth+60s", "decision"]
+    event_paths = list(args.events) + event_paths_from_globs(args.events_glob)
     rows, manifest = build_feature_snapshots(
         candidate_universe=args.candidate_universe,
-        event_paths=args.events,
+        event_paths=event_paths,
         decision_paths=args.decisions,
         snapshot_kinds=snapshot_kinds,
         include_decision_context=args.include_decision_context,
+        streaming=args.streaming,
     )
     common.write_jsonl(args.output, rows)
     if args.manifest_output:
