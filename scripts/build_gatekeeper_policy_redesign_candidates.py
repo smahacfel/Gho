@@ -344,6 +344,8 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         statuses.append("POLICY_REDESIGN_NO_STABLE_EDGE_FOUND")
     if any((row.get("edge_k_label_coverage") or 0.0) < 0.20 for row in summaries):
         statuses.append("POLICY_REDESIGN_LABEL_COVERAGE_WARNING")
+    if int(join_manifest.get("unmatched_decision_rows") or 0) > 0:
+        statuses.append("POLICY_REDESIGN_JOIN_SCOPE_MISMATCH_WARNING")
     statuses.extend(
         [
             "POLICY_REDESIGN_REQUIRES_FRESH_VALIDATION",
@@ -351,13 +353,14 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         ]
     )
 
-    best = max(
-        summaries,
-        key=lambda row: (
+    def candidate_sort_key(row: dict[str, Any]) -> tuple[float, int]:
+        return (
             -1.0 if row["edge_k_precision"] is None else float(row["edge_k_precision"]),
             int(row["edge_k_resolved_rows"]),
-        ),
-    ) if summaries else None
+        )
+
+    best_precision = max(summaries, key=candidate_sort_key) if summaries else None
+    best_edge = max(edge_candidates, key=candidate_sort_key) if edge_candidates else None
     recommended_actions = [
         "Do not change runtime, Gatekeeper, execution, send path, or thresholds from this offline report.",
         "Treat edge candidates as R2 opportunity probes, not execution-safe policy.",
@@ -383,7 +386,9 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
             "min_edge_resolved_rows": int(args.min_edge_resolved_rows),
         },
         "policy_redesign_statuses": statuses,
-        "best_candidate": best,
+        "best_candidate": best_edge or best_precision,
+        "best_edge_candidate": best_edge,
+        "best_precision_candidate": best_precision,
         "candidate_summaries": summaries,
         "recommended_actions": recommended_actions,
         "non_claims": {

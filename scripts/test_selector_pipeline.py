@@ -8467,6 +8467,152 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertEqual(report["best_candidate"]["candidate_id"], "top3_pressure_salvage_candidate")
         self.assertGreaterEqual(report["best_candidate"]["edge_k_precision"], 0.75)
 
+    def test_gatekeeper_policy_redesign_flags_join_scope_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime_scope, selector_scope = self.write_gatekeeper_policy_redesign_fixture(root)
+            decision_path = next((root / "logs" / "rollout" / runtime_scope).glob("**/gatekeeper_v2_decisions.jsonl"))
+            with decision_path.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    json.dumps(
+                        {
+                            "pool_id": "pool-unmatched",
+                            "base_mint": "mint-unmatched",
+                            "decision_ts_ms": 99_999,
+                            "decision_plane": "legacy_live",
+                            "verdict_type": "REJECT_HARD_FAIL",
+                            "reason_code": "HARD_FAIL_EXTREME_TOP3",
+                        },
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+            report = self.run_gatekeeper_policy_redesign_fixture(root, runtime_scope, selector_scope)
+
+        self.assertEqual(report["join_manifest"]["unmatched_decision_rows"], 1)
+        self.assertIn("POLICY_REDESIGN_JOIN_SCOPE_MISMATCH_WARNING", report["policy_redesign_statuses"])
+
+    def test_gatekeeper_policy_redesign_best_candidate_prefers_edge_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime_scope = "runtime-policy-redesign-best-edge-test"
+            selector_scope = "selector-policy-redesign-best-edge-test"
+            dataset_dir = root / "datasets" / "selector" / selector_scope
+            decision_dir = (
+                root
+                / "logs"
+                / "rollout"
+                / runtime_scope
+                / "decisions"
+                / runtime_scope
+                / "v2.2"
+                / "legacy_live"
+                / "config"
+            )
+            candidates = []
+            r2_rows = []
+            decisions = []
+            for idx in range(2):
+                candidate_id = f"unresolved-top3-{idx}"
+                pool_id = f"pool-unresolved-top3-{idx}"
+                mint = f"mint-unresolved-top3-{idx}"
+                candidates.append({"candidate_id": candidate_id, "pool_id": pool_id, "base_mint": mint, "decision_ts_ms": 1_000 + idx})
+                r2_rows.append({"candidate_id": candidate_id, "pool_id": pool_id, "base_mint": mint, "r2_label": "unresolved", "r2_status": "missing_path"})
+                decisions.append(
+                    {
+                        "pool_id": pool_id,
+                        "base_mint": mint,
+                        "decision_ts_ms": 1_000 + idx,
+                        "decision_plane": "legacy_live",
+                        "verdict_type": "REJECT_HARD_FAIL",
+                        "reason_code": "HARD_FAIL_EXTREME_TOP3",
+                        "price_change_ratio": 1.0,
+                        "sell_buy_ratio": 0.0,
+                        "sell_share": 0.0,
+                        "top3_volume_pct": 1.0,
+                        "early_top3_buy_volume_pct_3s": 1.0,
+                        "early_slot_volume_dominance_buy": 1.0,
+                        "hhi": 1.0,
+                        "buy_ratio": 0.0,
+                    }
+                )
+            for idx in range(7):
+                candidate_id = f"tail-edge-pos-{idx}"
+                pool_id = f"pool-tail-edge-pos-{idx}"
+                mint = f"mint-tail-edge-pos-{idx}"
+                candidates.append({"candidate_id": candidate_id, "pool_id": pool_id, "base_mint": mint, "decision_ts_ms": 2_000 + idx})
+                r2_rows.append({"candidate_id": candidate_id, "pool_id": pool_id, "base_mint": mint, "r2_label": "positive", "r2_status": "positive"})
+                decisions.append(
+                    {
+                        "pool_id": pool_id,
+                        "base_mint": mint,
+                        "decision_ts_ms": 2_000 + idx,
+                        "decision_plane": "legacy_live",
+                        "verdict_type": "REJECT_HARD_FAIL",
+                        "reason_code": "HARD_FAIL_EXTREME_TOP3",
+                        "price_change_ratio": -1.0,
+                        "sell_buy_ratio": 0.1,
+                        "sell_share": 0.05,
+                        "top3_volume_pct": 0.1,
+                        "hhi": 0.1,
+                        "total_volume_sol": 5.0,
+                        "buy_ratio": 0.0,
+                    }
+                )
+            for idx in range(5):
+                candidate_id = f"tail-edge-neg-{idx}"
+                pool_id = f"pool-tail-edge-neg-{idx}"
+                mint = f"mint-tail-edge-neg-{idx}"
+                candidates.append({"candidate_id": candidate_id, "pool_id": pool_id, "base_mint": mint, "decision_ts_ms": 3_000 + idx})
+                r2_rows.append({"candidate_id": candidate_id, "pool_id": pool_id, "base_mint": mint, "r2_label": "negative", "r2_status": "negative"})
+                decisions.append(
+                    {
+                        "pool_id": pool_id,
+                        "base_mint": mint,
+                        "decision_ts_ms": 3_000 + idx,
+                        "decision_plane": "legacy_live",
+                        "verdict_type": "BUY",
+                        "decision_verdict_buy": True,
+                        "price_change_ratio": 0.2,
+                        "sell_buy_ratio": 0.0,
+                        "sell_share": 0.0,
+                        "top3_volume_pct": 0.0,
+                        "hhi": 0.0,
+                        "total_volume_sol": 0.1,
+                        "buy_ratio": 0.9,
+                    }
+                )
+            decisions[-1].update({"price_change_ratio": -0.9, "total_volume_sol": 5.0})
+            write_jsonl(dataset_dir / "candidate_universe_v1.jsonl", candidates)
+            write_jsonl(dataset_dir / "r2_market_paths_v1.jsonl", r2_rows)
+            write_jsonl(decision_dir / "gatekeeper_v2_decisions.jsonl", decisions)
+
+            report = policy_redesign_candidates.build_report(
+                policy_redesign_candidates.build_parser().parse_args(
+                    [
+                        "--root",
+                        str(root),
+                        "--runtime-scope",
+                        runtime_scope,
+                        "--selector-scope",
+                        selector_scope,
+                        "--decision-plane",
+                        "legacy_live",
+                        "--edge-k",
+                        "8",
+                        "--min-edge-resolved-rows",
+                        "7",
+                        "--min-edge-lift-pp",
+                        "0.20",
+                    ]
+                )
+            )
+
+        self.assertEqual(report["best_precision_candidate"]["candidate_id"], "top3_pressure_salvage_candidate")
+        self.assertFalse(report["best_precision_candidate"]["edge_pass"])
+        self.assertEqual(report["best_edge_candidate"]["candidate_id"], "tail_pressure_reversal_candidate")
+        self.assertEqual(report["best_candidate"]["candidate_id"], "tail_pressure_reversal_candidate")
+
     def test_gatekeeper_policy_redesign_candidates_are_offline_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
