@@ -41,6 +41,7 @@ import analyze_gatekeeper_r2_policy_autopsy as policy_autopsy
 import build_gatekeeper_policy_redesign_candidates as policy_redesign_candidates
 import build_gatekeeper_edge_policy_fork as gatekeeper_edge_policy_fork
 import ci_assert_gatekeeper_edge_policy_fork as edge_policy_fork_gate
+import ci_assert_gatekeeper_edge_policy_fresh_validation as edge_policy_fresh_gate
 import analyze_selector_candidate_crossrun_stability as crossrun_stability
 import build_selector_model_redesign_report as model_redesign
 import build_selector_evidence_gated_candidate_redesign as evidence_gated_redesign
@@ -8931,6 +8932,116 @@ class SelectorPipelineTests(unittest.TestCase):
         )
         self.assertIn(
             "policy_fork_would_allow_resolved_rows_too_low:40<100",
+            result["fail_reasons"],
+        )
+
+    def write_gatekeeper_edge_policy_fresh_report(
+        self,
+        root: Path,
+        scope: str,
+        **overrides: dict,
+    ) -> Path:
+        report = self.gatekeeper_edge_policy_fork_gate_fixture(selector_scope=scope, **overrides)
+        path = root / "reports" / "selector" / scope / "gatekeeper_edge_policy_fork_v1.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(report, sort_keys=True), encoding="utf-8")
+        return path
+
+    def test_gatekeeper_edge_policy_fresh_validation_passes_with_distinct_fresh_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for scope in ("r19-discovery", "r21-discovery", "r24-fresh"):
+                self.write_gatekeeper_edge_policy_fresh_report(root, scope)
+            result = edge_policy_fresh_gate.validate(
+                edge_policy_fresh_gate.build_parser().parse_args(
+                    [
+                        "--root",
+                        str(root),
+                        "--scope",
+                        "r19-discovery",
+                        "--scope",
+                        "r21-discovery",
+                        "--scope",
+                        "r24-fresh",
+                        "--discovery-scope",
+                        "r19-discovery",
+                        "--discovery-scope",
+                        "r21-discovery",
+                        "--fresh-validation-scope",
+                        "r24-fresh",
+                        "--accept-label-coverage-warning",
+                    ]
+                )
+            )
+
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(result["business_decision"], "EDGE_POLICY_FORK_READY_FOR_CONFIG_GATED_POLICY_REVIEW")
+        self.assertEqual(result["pass_report_count"], 3)
+        self.assertEqual(result["supporting_pass_report_count"], 2)
+        self.assertFalse(result["non_claims"]["gatekeeper_changed"])
+
+    def test_gatekeeper_edge_policy_fresh_validation_fails_without_fresh_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for scope in ("r19-discovery", "r21-discovery", "r23-discovery"):
+                self.write_gatekeeper_edge_policy_fresh_report(root, scope)
+            result = edge_policy_fresh_gate.validate(
+                edge_policy_fresh_gate.build_parser().parse_args(
+                    [
+                        "--root",
+                        str(root),
+                        "--scope",
+                        "r19-discovery",
+                        "--scope",
+                        "r21-discovery",
+                        "--scope",
+                        "r23-discovery",
+                        "--discovery-scope",
+                        "r19-discovery",
+                        "--discovery-scope",
+                        "r21-discovery",
+                        "--discovery-scope",
+                        "r23-discovery",
+                        "--accept-label-coverage-warning",
+                    ]
+                )
+            )
+
+        self.assertEqual(result["status"], "FAIL")
+        self.assertIn("missing_fresh_validation_scope", result["fail_reasons"])
+
+    def test_gatekeeper_edge_policy_fresh_validation_rejects_discovery_scope_as_fresh(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for scope in ("r19-discovery", "r21-discovery", "r23-discovery"):
+                self.write_gatekeeper_edge_policy_fresh_report(root, scope)
+            result = edge_policy_fresh_gate.validate(
+                edge_policy_fresh_gate.build_parser().parse_args(
+                    [
+                        "--root",
+                        str(root),
+                        "--scope",
+                        "r19-discovery",
+                        "--scope",
+                        "r21-discovery",
+                        "--scope",
+                        "r23-discovery",
+                        "--discovery-scope",
+                        "r19-discovery",
+                        "--discovery-scope",
+                        "r21-discovery",
+                        "--discovery-scope",
+                        "r23-discovery",
+                        "--fresh-validation-scope",
+                        "r23-discovery",
+                        "--accept-label-coverage-warning",
+                    ]
+                )
+            )
+
+        self.assertEqual(result["status"], "FAIL")
+        self.assertIn(
+            "fresh_validation_scope_overlaps_discovery_scope:r23-discovery",
             result["fail_reasons"],
         )
 
