@@ -8942,6 +8942,126 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertIn("POLICY_AUTOPSY_HARD_FAIL_ANTI_SIGNAL_DETECTED", report["policy_autopsy_statuses"])
         self.assertIn("POLICY_AUTOPSY_BUY_NO_EDGE", report["policy_autopsy_statuses"])
 
+    def test_gatekeeper_policy_autopsy_supports_training_view_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            selector_scope = "selector-policy-autopsy-training-view-test"
+            dataset_dir = root / "datasets" / "selector" / selector_scope
+            write_jsonl(
+                dataset_dir / "selector_training_view_v1.jsonl",
+                [
+                    {
+                        "candidate_id": "tv-buy-pos",
+                        "pool_id": "pool-tv-buy-pos",
+                        "base_mint": "mint-tv-buy-pos",
+                        "decision_ts_ms": 1_000,
+                        "decision_verdict_buy": True,
+                        "gatekeeper_verdict": "BUY",
+                        "r2_label": "positive",
+                        "r2_status": "positive",
+                        "gk_buy_ratio": 0.90,
+                        "evidence_sell_share": 0.10,
+                        "gk_sell_buy_ratio": 0.10,
+                        "gk_dev_has_sold": False,
+                    },
+                    {
+                        "candidate_id": "tv-buy-neg",
+                        "pool_id": "pool-tv-buy-neg",
+                        "base_mint": "mint-tv-buy-neg",
+                        "decision_ts_ms": 2_000,
+                        "decision_verdict_buy": True,
+                        "gatekeeper_verdict": "BUY",
+                        "r2_label": "negative",
+                        "r2_status": "negative",
+                        "gk_buy_ratio": 0.30,
+                        "evidence_sell_share": 0.70,
+                        "gk_sell_buy_ratio": 1.80,
+                        "gk_dev_has_sold": True,
+                    },
+                    {
+                        "candidate_id": "tv-top3-pos",
+                        "pool_id": "pool-tv-top3-pos",
+                        "base_mint": "mint-tv-top3-pos",
+                        "decision_ts_ms": 3_000,
+                        "decision_verdict_buy": False,
+                        "gatekeeper_verdict": "REJECT_HARD_FAIL",
+                        "decision_reason": "HARD_FAIL_EXTREME_TOP3",
+                        "r2_label": "positive",
+                        "r2_status": "positive",
+                        "gk_top3_volume_pct": 1.0,
+                        "gk_early_top3_buy_volume_pct_3s": 1.0,
+                        "gk_early_slot_volume_dominance_buy": 0.50,
+                        "gk_buy_ratio": 0.75,
+                        "evidence_buy_count": 3,
+                        "evidence_unique_signers": 3,
+                        "evidence_total_volume_sol": 1.2,
+                        "evidence_sell_share": 0.10,
+                        "gk_sell_buy_ratio": 0.20,
+                        "gk_dev_has_sold": False,
+                        "gk_dev_volume_ratio": 0.10,
+                    },
+                    {
+                        "candidate_id": "tv-core-neg",
+                        "pool_id": "pool-tv-core-neg",
+                        "base_mint": "mint-tv-core-neg",
+                        "decision_ts_ms": 4_000,
+                        "decision_verdict_buy": False,
+                        "gatekeeper_verdict": "REJECT_CORE_FAIL",
+                        "decision_reason": "CORE_FAIL_CURVE",
+                        "r2_label": "negative",
+                        "r2_status": "negative",
+                        "gk_buy_ratio": 0.10,
+                        "evidence_sell_share": 0.80,
+                        "gk_sell_buy_ratio": 2.0,
+                        "gk_dev_has_sold": True,
+                    },
+                ],
+            )
+
+            report = policy_autopsy.build_report(
+                policy_autopsy.build_parser().parse_args(
+                    [
+                        "--root",
+                        str(root),
+                        "--selector-scope",
+                        selector_scope,
+                        "--runtime-scope",
+                        "runtime-unused-for-training-view",
+                        "--input-source",
+                        "training_view",
+                    ]
+                )
+            )
+            with Path(report["outputs"]["hard_fail_extreme_top3"]).open(encoding="utf-8") as fh:
+                top3_rows = {row["group"]: row for row in csv.DictReader(fh)}
+
+        self.assertEqual(report["input_source"], "training_view")
+        self.assertEqual(report["join_manifest"]["decision_rows_joined"], 4)
+        self.assertEqual(report["global_metrics"]["buy_precision"], 0.5)
+        self.assertIn("POLICY_AUTOPSY_BUY_NO_EDGE", report["policy_autopsy_statuses"])
+        self.assertIn("concentrated_early_demand", top3_rows)
+        self.assertEqual(top3_rows["concentrated_early_demand"]["r2_positive_rows"], "1")
+
+    def test_gatekeeper_policy_autopsy_missing_funding_lane_is_not_toxicity(self) -> None:
+        row = {
+            "decision": {
+                "buy_ratio": 0.90,
+                "sell_share": 0.10,
+                "sell_buy_ratio": 0.10,
+                "dev_has_sold": False,
+                "dev_volume_ratio": 0.10,
+                "dev_tx_ratio": 0.10,
+                "flip_ratio_10s": 0.05,
+                "flipper_presence_ratio": 0.05,
+                "same_ms_tx_ratio": 0.10,
+                "ab_unique_signers_window": 3,
+                "total_volume_sol": 1.0,
+                "funding_source_v2": {"status": "missing_funding_lane"},
+            }
+        }
+
+        self.assertEqual(policy_autopsy.toxicity_reasons(row), [])
+
     def test_gatekeeper_policy_redesign_finds_offline_r2_edge_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

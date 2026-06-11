@@ -36,6 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--selector-scope", default=DEFAULT_SELECTOR_SCOPE)
     parser.add_argument("--runtime-scope", default=DEFAULT_RUNTIME_SCOPE)
     parser.add_argument("--decision-plane", default="legacy_live", choices=("legacy_live", "v25_shadow"))
+    parser.add_argument("--input-source", default="decision_logs", choices=("decision_logs", "training_view"))
     parser.add_argument("--nearest-tolerance-ms", type=int, default=120_000)
     parser.add_argument("--min-anti-signal-lift-pp", type=float, default=0.05)
     parser.add_argument("--output", default=None)
@@ -183,7 +184,7 @@ def toxicity_reasons(row: dict[str, Any]) -> list[str]:
         reasons.append("low_total_volume")
     if funding_status(decision) in {"clean"}:
         pass
-    elif funding_status(decision) not in {"missing", "unavailable", "funding_lane_unavailable"}:
+    elif funding_status(decision) not in {"missing", "unavailable", "funding_lane_unavailable", "missing_funding_lane"}:
         reasons.append(f"funding_status:{funding_status(decision)}")
     return sorted(set(reasons))
 
@@ -296,6 +297,90 @@ def write_csv(path: Path, rows: list[dict[str, Any]], fieldnames: list[str] | No
             writer.writerow(row)
 
 
+def first_present(row: dict[str, Any], *fields: str) -> Any:
+    for field in fields:
+        value = row.get(field)
+        if value is not None:
+            return value
+    return None
+
+
+def training_view_decision(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "decision_ts_ms": row.get("decision_ts_ms"),
+        "decision_plane": row.get("gk_decision_plane") or row.get("decision_plane"),
+        "verdict_type": row.get("gatekeeper_verdict") or row.get("gatekeeper_legacy_verdict_context"),
+        "gatekeeper_verdict": row.get("gatekeeper_verdict") or row.get("gatekeeper_legacy_verdict_context"),
+        "reason_code": row.get("decision_reason") or row.get("gatekeeper_first_kill_reason"),
+        "decision_reason": row.get("decision_reason"),
+        "decision_verdict_buy": row.get("decision_verdict_buy"),
+        "price_change_ratio": row.get("gk_price_change_ratio"),
+        "sell_buy_ratio": row.get("gk_sell_buy_ratio"),
+        "sell_share": first_present(row, "sell_share", "evidence_sell_share"),
+        "top3_volume_pct": row.get("gk_top3_volume_pct"),
+        "hhi": row.get("gk_hhi"),
+        "total_volume_sol": first_present(row, "gk_total_volume_sol", "evidence_total_volume_sol"),
+        "buy_ratio": row.get("gk_buy_ratio"),
+        "fixed_size_buy_ratio": row.get("gk_fixed_size_buy_ratio"),
+        "buy_count": first_present(row, "evidence_buy_count", "gk_buy_count"),
+        "ab_unique_signers_window": first_present(
+            row,
+            "evidence_unique_signers",
+            "evidence_unique_buyers",
+            "unique_buyers",
+        ),
+        "early_top3_buy_volume_pct_3s": row.get("gk_early_top3_buy_volume_pct_3s"),
+        "early_slot_volume_dominance_buy": row.get("gk_early_slot_volume_dominance_buy"),
+        "dev_has_sold": row.get("gk_dev_has_sold"),
+        "dev_volume_ratio": row.get("gk_dev_volume_ratio"),
+        "dev_tx_ratio": row.get("gk_dev_tx_ratio"),
+        "flip_ratio_10s": row.get("gk_flip_ratio_10s"),
+        "flipper_presence_ratio": row.get("gk_flipper_presence_ratio"),
+        "same_ms_tx_ratio": row.get("gk_same_ms_tx_ratio"),
+        "funding_source_v2": {
+            "status": first_present(row, "fg_status", "funding_status", "funding_source_status") or "missing"
+        },
+    }
+
+
+def training_view_rows(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    root = Path(args.root)
+    path = dataset_dir(root, args.selector_scope) / "selector_training_view_v1.jsonl"
+    rows: list[dict[str, Any]] = []
+    missing_required = 0
+    for row in common.iter_json_objects(path):
+        candidate_id = common.str_or_none(row.get("candidate_id"))
+        if candidate_id is None:
+            missing_required += 1
+            continue
+        decision = training_view_decision(row)
+        rows.append(
+            {
+                "candidate_id": candidate_id,
+                "pool_id": row.get("pool_id"),
+                "base_mint": row.get("base_mint") or row.get("mint_id"),
+                "decision_bucket": gk_r2.decision_bucket(decision),
+                "verdict_type": gk_r2.raw_verdict(decision),
+                "r2_class": gk_r2.normalize_r2_class(row),
+                "decision": decision,
+                "candidate": row,
+                "r2": row,
+            }
+        )
+    manifest = {
+        "input_source": "training_view",
+        "training_view_path": str(path),
+        "training_view_rows_read": len(rows) + missing_required,
+        "decision_rows_read": len(rows),
+        "decision_rows_joined": len(rows),
+        "unmatched_decision_rows": 0,
+        "missing_candidate_id_rows": missing_required,
+        "join_method_counts": {"training_view": len(rows)},
+        "r2_rows": sum(1 for row in rows if is_resolved(row)),
+    }
+    return rows, manifest
+
+
 def join_rows(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     root = Path(args.root)
     ds_dir = dataset_dir(root, args.selector_scope)
@@ -330,6 +415,7 @@ def join_rows(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str,
                 }
             )
     manifest = {
+        "input_source": "decision_logs",
         "candidate_universe_rows": len(candidates),
         "decision_rows_read": sum(1 for path in decision_paths for _ in gk_r2.read_jsonl(path)),
         "decision_rows_joined": len(rows),
@@ -338,6 +424,12 @@ def join_rows(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str,
         "r2_rows": len(r2_by_candidate),
     }
     return rows, manifest
+
+
+def load_rows(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if args.input_source == "training_view":
+        return training_view_rows(args)
+    return join_rows(args)
 
 
 def variant_current_buy(row: dict[str, Any]) -> bool:
@@ -470,7 +562,7 @@ def write_markdown(path: Path, report: dict[str, Any]) -> None:
 def build_report(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.root)
     outputs = default_outputs(root, args.selector_scope, args)
-    rows, join_manifest = join_rows(args)
+    rows, join_manifest = load_rows(args)
     resolved = [row for row in rows if is_resolved(row)]
     positives = sum(1 for row in resolved if is_positive(row))
     negatives = sum(1 for row in resolved if is_negative(row))
@@ -572,6 +664,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "selector_scope": args.selector_scope,
         "runtime_scope": args.runtime_scope,
         "decision_plane": args.decision_plane,
+        "input_source": args.input_source,
         "join_manifest": join_manifest,
         "global_metrics": global_metrics,
         "policy_autopsy_statuses": statuses,
