@@ -228,6 +228,32 @@ def unique_actor_bucket(row: dict[str, Any], all_rows: list[dict[str, Any]]) -> 
     return "q4"
 
 
+def unique_actor_buckets(rows: list[dict[str, Any]]) -> dict[str, str]:
+    values = [current for item in rows if (current := actor_count(item)) is not None]
+    q1 = quantile(values, 0.25)
+    q2 = quantile(values, 0.50)
+    q3 = quantile(values, 0.75)
+    buckets: dict[str, str] = {}
+    for row in rows:
+        key = row_key(row)
+        if not key:
+            continue
+        value = actor_count(row)
+        if value is None:
+            buckets[key] = "missing"
+        elif q1 is None or q2 is None or q3 is None:
+            buckets[key] = "known"
+        elif value <= q1:
+            buckets[key] = "q1"
+        elif value <= q2:
+            buckets[key] = "q2"
+        elif value <= q3:
+            buckets[key] = "q3"
+        else:
+            buckets[key] = "q4"
+    return buckets
+
+
 def market_cap_bucket(row: dict[str, Any]) -> str:
     value = num(row, "gk_current_market_cap_sol")
     if value is None:
@@ -367,8 +393,17 @@ def market_segment(row: dict[str, Any], name: str) -> str:
     raise ValueError(name)
 
 
-def row_matches_candidate(row: dict[str, Any], rows: list[dict[str, Any]], candidate_id: str) -> bool:
-    unique_bucket = unique_actor_bucket(row, rows)
+def row_matches_candidate(
+    row: dict[str, Any],
+    rows: list[dict[str, Any]],
+    candidate_id: str,
+    unique_buckets: dict[str, str] | None = None,
+) -> bool:
+    unique_bucket = (
+        unique_buckets.get(row_key(row), "missing")
+        if unique_buckets is not None
+        else unique_actor_bucket(row, rows)
+    )
     if candidate_id == "low_market_cap_evidence_sufficient_antijunk":
         return market_cap_bucket(row) == "low" and anti_junk(row)
     if candidate_id == "unique_actors_q3_evidence_sufficient":
@@ -398,11 +433,12 @@ def candidate_scores(
     candidate_id: str,
 ) -> dict[str, float]:
     rows_by_id = {row_key(row): row for row in rows if row_key(row)}
+    buckets = unique_actor_buckets(rows)
     return {
         key: score
         for key, score in scores.items()
         if (row := rows_by_id.get(key)) is not None
-        and row_matches_candidate(row, rows, candidate_id)
+        and row_matches_candidate(row, rows, candidate_id, buckets)
     }
 
 
