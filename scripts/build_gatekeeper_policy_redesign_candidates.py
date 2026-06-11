@@ -34,6 +34,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--selector-scope", default=DEFAULT_SELECTOR_SCOPE)
     parser.add_argument("--runtime-scope", default=DEFAULT_RUNTIME_SCOPE)
     parser.add_argument("--decision-plane", default="legacy_live", choices=("legacy_live", "v25_shadow"))
+    parser.add_argument("--input-source", default="decision_logs", choices=("decision_logs", "training_view"))
     parser.add_argument("--nearest-tolerance-ms", type=int, default=120_000)
     parser.add_argument("--min-edge-lift-pp", type=float, default=0.10)
     parser.add_argument("--min-edge-resolved-rows", type=int, default=75)
@@ -65,6 +66,81 @@ def metric(row: dict[str, Any], *fields: str) -> float | None:
     if value is None or not math.isfinite(value):
         return None
     return value
+
+
+def dataset_dir(root: Path, selector_scope: str) -> Path:
+    return root / "datasets" / "selector" / selector_scope
+
+
+def training_view_decision(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "decision_ts_ms": row.get("decision_ts_ms"),
+        "decision_plane": row.get("gk_decision_plane") or row.get("decision_plane"),
+        "verdict_type": row.get("gatekeeper_verdict") or row.get("gatekeeper_legacy_verdict_context"),
+        "reason_code": row.get("decision_reason"),
+        "decision_verdict_buy": row.get("decision_verdict_buy"),
+        "price_change_ratio": row.get("gk_price_change_ratio"),
+        "sell_buy_ratio": row.get("gk_sell_buy_ratio"),
+        "sell_share": row.get("sell_share") if row.get("sell_share") is not None else row.get("evidence_sell_share"),
+        "top3_volume_pct": row.get("gk_top3_volume_pct"),
+        "hhi": row.get("gk_hhi"),
+        "total_volume_sol": row.get("gk_total_volume_sol")
+        if row.get("gk_total_volume_sol") is not None
+        else row.get("evidence_total_volume_sol"),
+        "buy_ratio": row.get("gk_buy_ratio"),
+        "fixed_size_buy_ratio": row.get("gk_fixed_size_buy_ratio"),
+        "early_top3_buy_volume_pct_3s": row.get("gk_early_top3_buy_volume_pct_3s"),
+        "early_slot_volume_dominance_buy": row.get("gk_early_slot_volume_dominance_buy"),
+        "dev_volume_ratio": row.get("gk_dev_volume_ratio"),
+        "max_single_sell_impact_pct_observed": row.get("gk_max_single_sell_impact_pct_observed"),
+        "whale_reversal_ratio_top3": row.get("gk_whale_reversal_ratio_top3"),
+    }
+
+
+def training_view_rows(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    root = Path(args.root)
+    path = dataset_dir(root, args.selector_scope) / "selector_training_view_v1.jsonl"
+    rows: list[dict[str, Any]] = []
+    missing_required = 0
+    for row in autopsy.common.iter_json_objects(path):
+        candidate_id = autopsy.common.str_or_none(row.get("candidate_id"))
+        if candidate_id is None:
+            missing_required += 1
+            continue
+        rows.append(
+            {
+                "candidate_id": candidate_id,
+                "pool_id": row.get("pool_id"),
+                "base_mint": row.get("base_mint") or row.get("mint_id"),
+                "decision_bucket": "BUY" if row.get("decision_verdict_buy") is True else "NOT_BUY",
+                "verdict_type": row.get("gatekeeper_verdict") or row.get("gatekeeper_legacy_verdict_context"),
+                "r2_class": "positive" if row.get("r2_label") == "positive" else "negative" if row.get("r2_label") == "negative" else str(row.get("r2_status") or "unresolved"),
+                "decision": training_view_decision(row),
+                "candidate": row,
+                "r2": row,
+            }
+        )
+    manifest = {
+        "input_source": "training_view",
+        "training_view_path": str(path),
+        "training_view_rows_read": len(rows) + missing_required,
+        "decision_rows_read": len(rows),
+        "decision_rows_joined": len(rows),
+        "unmatched_decision_rows": 0,
+        "missing_candidate_id_rows": missing_required,
+        "join_method_counts": {"training_view": len(rows)},
+        "r2_rows": sum(1 for row in rows if autopsy.is_resolved(row)),
+    }
+    return rows, manifest
+
+
+def load_rows(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if args.input_source == "training_view":
+        return training_view_rows(args)
+    rows, manifest = autopsy.join_rows(args)
+    manifest = dict(manifest)
+    manifest["input_source"] = "decision_logs"
+    return rows, manifest
 
 
 def finite_or_zero(value: float | None) -> float:
@@ -275,6 +351,7 @@ def write_markdown(path: Path, report: dict[str, Any]) -> None:
         f"Selector scope: `{report['selector_scope']}`",
         f"Runtime scope: `{report['runtime_scope']}`",
         f"Decision plane: `{report['decision_plane']}`",
+        f"Input source: `{report['input_source']}`",
         "",
         "## Global Metrics",
         "",
@@ -316,7 +393,7 @@ def write_markdown(path: Path, report: dict[str, Any]) -> None:
 def build_report(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.root)
     outputs = default_outputs(root, args.selector_scope, args)
-    rows, join_manifest = autopsy.join_rows(args)
+    rows, join_manifest = load_rows(args)
     resolved = [row for row in rows if autopsy.is_resolved(row)]
     positives = sum(1 for row in resolved if autopsy.is_positive(row))
     negatives = sum(1 for row in resolved if autopsy.is_negative(row))
@@ -374,6 +451,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "selector_scope": args.selector_scope,
         "runtime_scope": args.runtime_scope,
         "decision_plane": args.decision_plane,
+        "input_source": args.input_source,
         "join_manifest": join_manifest,
         "global_metrics": {
             "decision_rows": len(rows),

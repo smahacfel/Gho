@@ -8613,6 +8613,85 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertEqual(report["best_edge_candidate"]["candidate_id"], "tail_pressure_reversal_candidate")
         self.assertEqual(report["best_candidate"]["candidate_id"], "tail_pressure_reversal_candidate")
 
+    def test_gatekeeper_policy_redesign_supports_training_view_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            selector_scope = "selector-policy-redesign-training-view-test"
+            dataset_dir = root / "datasets" / "selector" / selector_scope
+            rows = []
+            for idx in range(8):
+                rows.append(
+                    {
+                        "candidate_id": f"tv-pos-{idx}",
+                        "pool_id": f"pool-tv-pos-{idx}",
+                        "base_mint": f"mint-tv-pos-{idx}",
+                        "decision_ts_ms": 10_000 + idx,
+                        "decision_verdict_buy": False,
+                        "gatekeeper_verdict": "REJECT_HARD_FAIL",
+                        "decision_reason": "HARD_FAIL_EXTREME_TOP3",
+                        "r2_label": "positive",
+                        "r2_status": "resolved",
+                        "gk_price_change_ratio": -0.50 - idx * 0.01,
+                        "gk_sell_buy_ratio": 2.0,
+                        "sell_share": 0.70,
+                        "gk_top3_volume_pct": 0.95,
+                        "gk_hhi": 0.90,
+                        "gk_total_volume_sol": 2.5,
+                        "gk_buy_ratio": 0.20,
+                        "gk_early_top3_buy_volume_pct_3s": 0.90,
+                        "gk_early_slot_volume_dominance_buy": 0.70,
+                    }
+                )
+            for idx in range(8):
+                rows.append(
+                    {
+                        "candidate_id": f"tv-neg-{idx}",
+                        "pool_id": f"pool-tv-neg-{idx}",
+                        "base_mint": f"mint-tv-neg-{idx}",
+                        "decision_ts_ms": 20_000 + idx,
+                        "decision_verdict_buy": True,
+                        "gatekeeper_verdict": "BUY",
+                        "r2_label": "negative",
+                        "r2_status": "resolved",
+                        "gk_price_change_ratio": 0.30 + idx * 0.01,
+                        "gk_sell_buy_ratio": 0.05,
+                        "sell_share": 0.05,
+                        "gk_top3_volume_pct": 0.10,
+                        "gk_hhi": 0.10,
+                        "gk_total_volume_sol": 0.2,
+                        "gk_buy_ratio": 0.95,
+                        "gk_early_top3_buy_volume_pct_3s": 0.10,
+                        "gk_early_slot_volume_dominance_buy": 0.10,
+                    }
+                )
+            write_jsonl(dataset_dir / "selector_training_view_v1.jsonl", rows)
+
+            report = policy_redesign_candidates.build_report(
+                policy_redesign_candidates.build_parser().parse_args(
+                    [
+                        "--root",
+                        str(root),
+                        "--selector-scope",
+                        selector_scope,
+                        "--input-source",
+                        "training_view",
+                        "--edge-k",
+                        "8",
+                        "--min-edge-resolved-rows",
+                        "4",
+                        "--min-edge-lift-pp",
+                        "0.20",
+                    ]
+                )
+            )
+
+        self.assertEqual(report["input_source"], "training_view")
+        self.assertEqual(report["join_manifest"]["unmatched_decision_rows"], 0)
+        self.assertEqual(report["join_manifest"]["training_view_rows_read"], 16)
+        self.assertIn("POLICY_REDESIGN_EDGE_FOUND_OFFLINE_R2_OPPORTUNITY", report["policy_redesign_statuses"])
+        self.assertEqual(report["best_candidate"]["candidate_id"], "top3_pressure_salvage_candidate")
+        self.assertGreaterEqual(report["best_candidate"]["edge_k_precision"], 1.0)
+
     def test_gatekeeper_policy_redesign_candidates_are_offline_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
