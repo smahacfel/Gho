@@ -39,6 +39,7 @@ import audit_selector_shadow_score_topk_drift as shadow_score_topk_drift
 import audit_selector_r2_tail_coverage as r2_tail_coverage_audit
 import audit_gatekeeper_decision_vs_r2 as gk_r2_audit
 import analyze_gatekeeper_r2_policy_autopsy as policy_autopsy
+import analyze_gatekeeper_buy_false_positive_separation as buy_fp_separation
 import build_gatekeeper_policy_redesign_candidates as policy_redesign_candidates
 import build_gatekeeper_edge_policy_fork as gatekeeper_edge_policy_fork
 import ci_assert_gatekeeper_edge_policy_fork as edge_policy_fork_gate
@@ -9061,6 +9062,146 @@ class SelectorPipelineTests(unittest.TestCase):
         }
 
         self.assertEqual(policy_autopsy.toxicity_reasons(row), [])
+
+    def write_buy_fp_separation_scope(self, root: Path, scope: str) -> None:
+        dataset_dir = root / "datasets" / "selector" / scope
+        rows = [
+            {
+                "candidate_id": f"{scope}-buy-pos-1",
+                "pool_id": f"{scope}-pool-buy-pos-1",
+                "base_mint": f"{scope}-mint-buy-pos-1",
+                "decision_verdict_buy": True,
+                "gatekeeper_verdict": "BUY",
+                "r2_label": "positive",
+                "r2_status": "positive",
+                "evidence_sell_share": 0.10,
+                "gk_sell_buy_ratio": 0.10,
+                "gk_dev_has_sold": False,
+                "gk_buy_ratio": 0.90,
+            },
+            {
+                "candidate_id": f"{scope}-buy-pos-2",
+                "pool_id": f"{scope}-pool-buy-pos-2",
+                "base_mint": f"{scope}-mint-buy-pos-2",
+                "decision_verdict_buy": True,
+                "gatekeeper_verdict": "BUY",
+                "r2_label": "positive",
+                "r2_status": "positive",
+                "evidence_sell_share": 0.20,
+                "gk_sell_buy_ratio": 0.20,
+                "gk_dev_has_sold": False,
+                "gk_buy_ratio": 0.80,
+            },
+            {
+                "candidate_id": f"{scope}-buy-neg-1",
+                "pool_id": f"{scope}-pool-buy-neg-1",
+                "base_mint": f"{scope}-mint-buy-neg-1",
+                "decision_verdict_buy": True,
+                "gatekeeper_verdict": "BUY",
+                "r2_label": "negative",
+                "r2_status": "negative",
+                "evidence_sell_share": 0.80,
+                "gk_sell_buy_ratio": 1.80,
+                "gk_dev_has_sold": True,
+                "gk_buy_ratio": 0.20,
+            },
+            {
+                "candidate_id": f"{scope}-buy-neg-2",
+                "pool_id": f"{scope}-pool-buy-neg-2",
+                "base_mint": f"{scope}-mint-buy-neg-2",
+                "decision_verdict_buy": True,
+                "gatekeeper_verdict": "BUY",
+                "r2_label": "negative",
+                "r2_status": "negative",
+                "evidence_sell_share": 0.70,
+                "gk_sell_buy_ratio": 1.50,
+                "gk_dev_has_sold": False,
+                "gk_buy_ratio": 0.30,
+            },
+            {
+                "candidate_id": f"{scope}-reject-pos",
+                "pool_id": f"{scope}-pool-reject-pos",
+                "base_mint": f"{scope}-mint-reject-pos",
+                "decision_verdict_buy": False,
+                "gatekeeper_verdict": "REJECT_CORE_FAIL",
+                "decision_reason": "CORE_FAIL_CURVE",
+                "r2_label": "positive",
+                "r2_status": "positive",
+                "evidence_sell_share": 0.10,
+            },
+            {
+                "candidate_id": f"{scope}-reject-neg",
+                "pool_id": f"{scope}-pool-reject-neg",
+                "base_mint": f"{scope}-mint-reject-neg",
+                "decision_verdict_buy": False,
+                "gatekeeper_verdict": "REJECT_CORE_FAIL",
+                "decision_reason": "CORE_FAIL_CURVE",
+                "r2_label": "negative",
+                "r2_status": "negative",
+                "evidence_sell_share": 0.10,
+            },
+        ]
+        write_jsonl(dataset_dir / "selector_training_view_v1.jsonl", rows)
+
+    def test_buy_false_positive_separation_finds_stable_offline_veto(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            train_scope = "selector-buy-fp-train-test"
+            validation_scope = "selector-buy-fp-validation-test"
+            self.write_buy_fp_separation_scope(root, train_scope)
+            self.write_buy_fp_separation_scope(root, validation_scope)
+
+            report = buy_fp_separation.build_report(
+                buy_fp_separation.build_parser().parse_args(
+                    [
+                        "--root",
+                        str(root),
+                        "--train-scope",
+                        train_scope,
+                        "--validation-scope",
+                        validation_scope,
+                        "--min-lift-vs-base-pp",
+                        "0.10",
+                        "--min-kept-resolved-rows",
+                        "2",
+                    ]
+                )
+            )
+
+        self.assertEqual(report["status"], "BUY_FP_STABLE_VETO_FOUND_OFFLINE")
+        self.assertIn("veto_high_sell_share", report["stable_pass_veto_ids"])
+        self.assertFalse(report["claim_boundaries"]["changes_gatekeeper"])
+        self.assertFalse(report["claim_boundaries"]["changes_runtime"])
+        self.assertFalse(report["claim_boundaries"]["production_promotion_allowed"])
+
+    def test_buy_false_positive_separation_has_no_runtime_claims(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            train_scope = "selector-buy-fp-noclaim-train-test"
+            validation_scope = "selector-buy-fp-noclaim-validation-test"
+            self.write_buy_fp_separation_scope(root, train_scope)
+            self.write_buy_fp_separation_scope(root, validation_scope)
+
+            report = buy_fp_separation.build_report(
+                buy_fp_separation.build_parser().parse_args(
+                    [
+                        "--root",
+                        str(root),
+                        "--train-scope",
+                        train_scope,
+                        "--validation-scope",
+                        validation_scope,
+                        "--min-kept-resolved-rows",
+                        "2",
+                    ]
+                )
+            )
+
+        self.assertTrue(report["claim_boundaries"]["offline_only"])
+        self.assertTrue(report["claim_boundaries"]["diagnostic_only"])
+        self.assertFalse(report["claim_boundaries"]["changes_execution"])
+        self.assertFalse(report["claim_boundaries"]["changes_send_path"])
+        self.assertFalse(report["claim_boundaries"]["thresholds_tuned"])
 
     def test_gatekeeper_policy_redesign_finds_offline_r2_edge_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
