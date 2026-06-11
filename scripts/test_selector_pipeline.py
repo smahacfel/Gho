@@ -40,6 +40,7 @@ import audit_selector_r2_tail_coverage as r2_tail_coverage_audit
 import audit_gatekeeper_decision_vs_r2 as gk_r2_audit
 import analyze_gatekeeper_r2_policy_autopsy as policy_autopsy
 import analyze_gatekeeper_buy_false_positive_separation as buy_fp_separation
+import analyze_gatekeeper_buy_quality_candidate as buy_quality_candidate
 import build_gatekeeper_policy_redesign_candidates as policy_redesign_candidates
 import build_gatekeeper_edge_policy_fork as gatekeeper_edge_policy_fork
 import ci_assert_gatekeeper_edge_policy_fork as edge_policy_fork_gate
@@ -9201,6 +9202,216 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertTrue(report["claim_boundaries"]["diagnostic_only"])
         self.assertFalse(report["claim_boundaries"]["changes_execution"])
         self.assertFalse(report["claim_boundaries"]["changes_send_path"])
+        self.assertFalse(report["claim_boundaries"]["thresholds_tuned"])
+
+    def write_buy_quality_candidate_scope(
+        self,
+        root: Path,
+        scope: str,
+        *,
+        positive_selected: int,
+        negative_selected: int,
+        positive_unselected_buy: int,
+        negative_unselected_buy: int,
+        rejected_positive: int,
+        rejected_negative: int,
+    ) -> None:
+        dataset_dir = root / "datasets" / "selector" / scope
+        rows = []
+        idx = 0
+        for _ in range(positive_selected):
+            rows.append(
+                {
+                    "candidate_id": f"{scope}-selected-pos-{idx}",
+                    "pool_id": f"{scope}-pool-selected-pos-{idx}",
+                    "base_mint": f"{scope}-mint-selected-pos-{idx}",
+                    "decision_verdict_buy": True,
+                    "gatekeeper_verdict": "BUY",
+                    "r2_label": "positive",
+                    "r2_status": "positive",
+                    "buyer_hhi": 0.02,
+                    "buy_count": 80,
+                    "unique_buyers": 80,
+                }
+            )
+            idx += 1
+        for _ in range(negative_selected):
+            rows.append(
+                {
+                    "candidate_id": f"{scope}-selected-neg-{idx}",
+                    "pool_id": f"{scope}-pool-selected-neg-{idx}",
+                    "base_mint": f"{scope}-mint-selected-neg-{idx}",
+                    "decision_verdict_buy": True,
+                    "gatekeeper_verdict": "BUY",
+                    "r2_label": "negative",
+                    "r2_status": "negative",
+                    "buyer_hhi": 0.02,
+                    "buy_count": 80,
+                    "unique_buyers": 80,
+                }
+            )
+            idx += 1
+        for _ in range(positive_unselected_buy):
+            rows.append(
+                {
+                    "candidate_id": f"{scope}-unselected-buy-pos-{idx}",
+                    "pool_id": f"{scope}-pool-unselected-buy-pos-{idx}",
+                    "base_mint": f"{scope}-mint-unselected-buy-pos-{idx}",
+                    "decision_verdict_buy": True,
+                    "gatekeeper_verdict": "BUY",
+                    "r2_label": "positive",
+                    "r2_status": "positive",
+                    "buyer_hhi": 0.20,
+                    "buy_count": 10,
+                }
+            )
+            idx += 1
+        for _ in range(negative_unselected_buy):
+            rows.append(
+                {
+                    "candidate_id": f"{scope}-unselected-buy-neg-{idx}",
+                    "pool_id": f"{scope}-pool-unselected-buy-neg-{idx}",
+                    "base_mint": f"{scope}-mint-unselected-buy-neg-{idx}",
+                    "decision_verdict_buy": True,
+                    "gatekeeper_verdict": "BUY",
+                    "r2_label": "negative",
+                    "r2_status": "negative",
+                    "buyer_hhi": 0.20,
+                    "buy_count": 10,
+                }
+            )
+            idx += 1
+        for _ in range(rejected_positive):
+            rows.append(
+                {
+                    "candidate_id": f"{scope}-reject-pos-{idx}",
+                    "pool_id": f"{scope}-pool-reject-pos-{idx}",
+                    "base_mint": f"{scope}-mint-reject-pos-{idx}",
+                    "decision_verdict_buy": False,
+                    "gatekeeper_verdict": "REJECT_CORE_FAIL",
+                    "decision_reason": "CORE_FAIL_CURVE",
+                    "r2_label": "positive",
+                    "r2_status": "positive",
+                    "buyer_hhi": 0.01,
+                    "buy_count": 90,
+                }
+            )
+            idx += 1
+        for _ in range(rejected_negative):
+            rows.append(
+                {
+                    "candidate_id": f"{scope}-reject-neg-{idx}",
+                    "pool_id": f"{scope}-pool-reject-neg-{idx}",
+                    "base_mint": f"{scope}-mint-reject-neg-{idx}",
+                    "decision_verdict_buy": False,
+                    "gatekeeper_verdict": "REJECT_CORE_FAIL",
+                    "decision_reason": "CORE_FAIL_CURVE",
+                    "r2_label": "negative",
+                    "r2_status": "negative",
+                    "buyer_hhi": 0.20,
+                    "buy_count": 10,
+                }
+            )
+            idx += 1
+        write_jsonl(dataset_dir / "selector_training_view_v1.jsonl", rows)
+
+    def test_buy_quality_candidate_reports_promising_low_validation_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            train_scope = "selector-buy-quality-train-test"
+            validation_scope = "selector-buy-quality-validation-test"
+            self.write_buy_quality_candidate_scope(
+                root,
+                train_scope,
+                positive_selected=80,
+                negative_selected=20,
+                positive_unselected_buy=20,
+                negative_unselected_buy=60,
+                rejected_positive=20,
+                rejected_negative=120,
+            )
+            self.write_buy_quality_candidate_scope(
+                root,
+                validation_scope,
+                positive_selected=20,
+                negative_selected=10,
+                positive_unselected_buy=5,
+                negative_unselected_buy=45,
+                rejected_positive=20,
+                rejected_negative=100,
+            )
+
+            report = buy_quality_candidate.build_report(
+                buy_quality_candidate.build_parser().parse_args(
+                    [
+                        "--root",
+                        str(root),
+                        "--train-scope",
+                        train_scope,
+                        "--validation-scope",
+                        validation_scope,
+                        "--min-train-resolved-rows",
+                        "75",
+                        "--min-validation-resolved-rows",
+                        "50",
+                        "--min-lift-vs-base-pp",
+                        "0.10",
+                    ]
+                )
+            )
+
+        self.assertEqual(report["status"], "BUY_QUALITY_CANDIDATE_PROMISING_LOW_VALIDATION_COVERAGE")
+        self.assertIn("validation_selected_resolved_below_min", report["fail_reasons"])
+        self.assertEqual(report["candidate"]["candidate_id"], "buyer_hhi_low_buy_count_high_v1")
+        self.assertTrue(report["claim_boundaries"]["requires_fresh_validation"])
+        self.assertFalse(report["claim_boundaries"]["production_promotion_allowed"])
+        self.assertFalse(report["claim_boundaries"]["changes_gatekeeper"])
+
+    def test_buy_quality_candidate_has_no_runtime_claims(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            train_scope = "selector-buy-quality-noclaim-train-test"
+            validation_scope = "selector-buy-quality-noclaim-validation-test"
+            self.write_buy_quality_candidate_scope(
+                root,
+                train_scope,
+                positive_selected=80,
+                negative_selected=20,
+                positive_unselected_buy=20,
+                negative_unselected_buy=60,
+                rejected_positive=20,
+                rejected_negative=120,
+            )
+            self.write_buy_quality_candidate_scope(
+                root,
+                validation_scope,
+                positive_selected=60,
+                negative_selected=20,
+                positive_unselected_buy=5,
+                negative_unselected_buy=45,
+                rejected_positive=20,
+                rejected_negative=100,
+            )
+
+            report = buy_quality_candidate.build_report(
+                buy_quality_candidate.build_parser().parse_args(
+                    [
+                        "--root",
+                        str(root),
+                        "--train-scope",
+                        train_scope,
+                        "--validation-scope",
+                        validation_scope,
+                        "--min-validation-resolved-rows",
+                        "50",
+                    ]
+                )
+            )
+
+        self.assertTrue(report["claim_boundaries"]["offline_only"])
+        self.assertTrue(report["claim_boundaries"]["diagnostic_only"])
+        self.assertFalse(report["claim_boundaries"]["changes_runtime"])
+        self.assertFalse(report["claim_boundaries"]["changes_execution"])
         self.assertFalse(report["claim_boundaries"]["thresholds_tuned"])
 
     def test_gatekeeper_policy_redesign_finds_offline_r2_edge_candidate(self) -> None:
