@@ -39,6 +39,7 @@ import audit_selector_shadow_score_topk_drift as shadow_score_topk_drift
 import audit_gatekeeper_decision_vs_r2 as gk_r2_audit
 import analyze_gatekeeper_r2_policy_autopsy as policy_autopsy
 import build_gatekeeper_policy_redesign_candidates as policy_redesign_candidates
+import build_gatekeeper_edge_policy_fork as gatekeeper_edge_policy_fork
 import analyze_selector_candidate_crossrun_stability as crossrun_stability
 import build_selector_model_redesign_report as model_redesign
 import build_selector_evidence_gated_candidate_redesign as evidence_gated_redesign
@@ -8703,6 +8704,124 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertFalse(report["non_claims"]["execution_changed"])
         self.assertTrue(all(row["runtime_change_allowed"] is False for row in report["candidate_summaries"]))
         self.assertTrue(all(row["requires_fresh_validation"] is True for row in report["candidate_summaries"]))
+
+    def test_gatekeeper_edge_policy_fork_materializes_offline_opportunity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime_scope, selector_scope = self.write_gatekeeper_policy_redesign_fixture(root)
+            report = gatekeeper_edge_policy_fork.build_report(
+                gatekeeper_edge_policy_fork.build_parser().parse_args(
+                    [
+                        "--root",
+                        str(root),
+                        "--runtime-scope",
+                        runtime_scope,
+                        "--selector-scope",
+                        selector_scope,
+                        "--decision-plane",
+                        "legacy_live",
+                        "--edge-k",
+                        "8",
+                        "--min-opportunity-resolved-rows",
+                        "4",
+                        "--min-opportunity-lift-pp",
+                        "0.20",
+                    ]
+                )
+            )
+        self.assertIn("GK_EDGE_POLICY_FORK_OFFLINE_ONLY", report["policy_fork_statuses"])
+        self.assertIn("GK_EDGE_POLICY_FORK_R2_OPPORTUNITY_CONFIRMED_OFFLINE", report["policy_fork_statuses"])
+        self.assertIn("GK_EDGE_POLICY_FORK_NO_RUNTIME_GO", report["policy_fork_statuses"])
+        self.assertEqual(report["global_metrics"]["policy_fork_would_allow_precision"], 1.0)
+        self.assertFalse(report["non_claims"]["runtime_changed"])
+        self.assertFalse(report["non_claims"]["gatekeeper_changed"])
+        self.assertFalse(report["non_claims"]["execution_changed"])
+
+    def test_gatekeeper_edge_policy_fork_training_view_keeps_toxic_concentration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            selector_scope = "selector-edge-policy-fork-training-view-test"
+            dataset_dir = root / "datasets" / "selector" / selector_scope
+            rows = []
+            for idx in range(8):
+                rows.append(
+                    {
+                        "candidate_id": f"tv-edge-pos-{idx}",
+                        "pool_id": f"pool-tv-edge-pos-{idx}",
+                        "base_mint": f"mint-tv-edge-pos-{idx}",
+                        "decision_ts_ms": 10_000 + idx,
+                        "decision_verdict_buy": False,
+                        "gatekeeper_verdict": "REJECT_HARD_FAIL",
+                        "decision_reason": "HARD_FAIL_EXTREME_TOP3",
+                        "r2_label": "positive",
+                        "r2_status": "resolved",
+                        "gk_price_change_ratio": -0.60 - idx * 0.01,
+                        "gk_sell_buy_ratio": 2.0,
+                        "sell_share": 0.70,
+                        "gk_top3_volume_pct": 0.95,
+                        "gk_hhi": 0.90,
+                        "gk_total_volume_sol": 2.5,
+                        "gk_buy_ratio": 0.20,
+                        "gk_early_top3_buy_volume_pct_3s": 0.90,
+                        "gk_early_slot_volume_dominance_buy": 0.70,
+                        "evidence_unique_signers": 3,
+                        "evidence_buy_count": 3,
+                    }
+                )
+            rows.append(
+                {
+                    "candidate_id": "tv-toxic-neg",
+                    "pool_id": "pool-tv-toxic-neg",
+                    "base_mint": "mint-tv-toxic-neg",
+                    "decision_ts_ms": 20_000,
+                    "decision_verdict_buy": False,
+                    "gatekeeper_verdict": "REJECT_HARD_FAIL",
+                    "decision_reason": "HARD_FAIL_EXTREME_TOP3",
+                    "r2_label": "negative",
+                    "r2_status": "resolved",
+                    "gk_price_change_ratio": 10.0,
+                    "gk_sell_buy_ratio": 2.0,
+                    "sell_share": 0.80,
+                    "gk_top3_volume_pct": 0.99,
+                    "gk_hhi": 0.95,
+                    "gk_total_volume_sol": 0.05,
+                    "gk_buy_ratio": 0.10,
+                    "gk_early_top3_buy_volume_pct_3s": 0.99,
+                    "gk_early_slot_volume_dominance_buy": 0.05,
+                    "evidence_unique_signers": 1,
+                    "evidence_buy_count": 1,
+                }
+            )
+            write_jsonl(dataset_dir / "selector_training_view_v1.jsonl", rows)
+            report = gatekeeper_edge_policy_fork.build_report(
+                gatekeeper_edge_policy_fork.build_parser().parse_args(
+                    [
+                        "--root",
+                        str(root),
+                        "--selector-scope",
+                        selector_scope,
+                        "--input-source",
+                        "training_view",
+                        "--edge-k",
+                        "8",
+                        "--min-opportunity-resolved-rows",
+                        "4",
+                        "--min-opportunity-lift-pp",
+                        "0.20",
+                    ]
+                )
+            )
+            with Path(report["outputs"]["rows_csv"]).open(encoding="utf-8") as fh:
+                materialized = {row["candidate_id"]: row for row in csv.DictReader(fh)}
+
+        self.assertEqual(report["input_source"], "training_view")
+        self.assertEqual(
+            materialized["tv-toxic-neg"]["policy_fork_verdict"],
+            "WOULD_KEEP_REJECT_TOXIC_CONCENTRATION",
+        )
+        self.assertEqual(materialized["tv-toxic-neg"]["changes_gatekeeper_decision"], "False")
+        self.assertEqual(materialized["tv-toxic-neg"]["changes_execution"], "False")
+        self.assertIn("GK_EDGE_POLICY_FORK_R2_OPPORTUNITY_NOT_EXECUTION_SAFE", report["policy_fork_statuses"])
 
 
 if __name__ == "__main__":

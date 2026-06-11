@@ -89,8 +89,15 @@ def training_view_decision(row: dict[str, Any]) -> dict[str, Any]:
         else row.get("evidence_total_volume_sol"),
         "buy_ratio": row.get("gk_buy_ratio"),
         "fixed_size_buy_ratio": row.get("gk_fixed_size_buy_ratio"),
+        "buy_count": row.get("evidence_buy_count") if row.get("evidence_buy_count") is not None else row.get("gk_buy_count"),
+        "ab_unique_signers_window": row.get("evidence_unique_signers")
+        if row.get("evidence_unique_signers") is not None
+        else row.get("evidence_unique_buyers")
+        if row.get("evidence_unique_buyers") is not None
+        else row.get("unique_buyers"),
         "early_top3_buy_volume_pct_3s": row.get("gk_early_top3_buy_volume_pct_3s"),
         "early_slot_volume_dominance_buy": row.get("gk_early_slot_volume_dominance_buy"),
+        "dev_has_sold": row.get("gk_dev_has_sold"),
         "dev_volume_ratio": row.get("gk_dev_volume_ratio"),
         "max_single_sell_impact_pct_observed": row.get("gk_max_single_sell_impact_pct_observed"),
         "whale_reversal_ratio_top3": row.get("gk_whale_reversal_ratio_top3"),
