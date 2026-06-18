@@ -20,6 +20,7 @@ use ghost_launcher::events::{
 };
 use ghost_launcher::oracle_runtime::{
     start_oracle_runtime_task, start_oracle_runtime_task_with_funding_availability, OracleRuntime,
+    OracleRuntimeConfig,
 };
 use ghost_launcher::session::observation::SharedSession;
 use seer::types::RawBytesMissingReason;
@@ -32,6 +33,7 @@ use tokio::time::sleep;
 // Default program IDs for testing
 const PUMP_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const BONK_PROGRAM_ID: &str = "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj";
+const FSC_E2E_LOOKBACK_WINDOW_MS: u64 = 150;
 
 fn detected_pool(
     pool_pubkey: Pubkey,
@@ -142,7 +144,7 @@ fn funding_transfer(
 ) -> FundingTransferObserved {
     FundingTransferObserved {
         semantic: EventSemanticEnvelope::default(),
-        slot: Some(1),
+        slot: Some(0),
         event_ordinal: None,
         tx_index: None,
         outer_instruction_index: None,
@@ -197,11 +199,17 @@ async fn spawn_runtime_for_fsc_with_optional_signal(
     let (event_tx, _event_rx) = create_event_bus();
     let snapshot_engine = Arc::new(SnapshotEngine::new(128, 200));
     let hyper_oracle = Arc::new(HyperPredictionOracle::default());
-    let oracle_runtime = Arc::new(OracleRuntime::new(
+    let mut runtime_config = OracleRuntimeConfig::default();
+    runtime_config.funding_source_config.lookback_window_ms = FSC_E2E_LOOKBACK_WINDOW_MS;
+    let oracle_runtime = Arc::new(OracleRuntime::new_with_config(
         hyper_oracle,
         PUMP_PROGRAM_ID.to_string(),
         BONK_PROGRAM_ID.to_string(),
         Arc::new(ShadowLedger::new()),
+        None,
+        None,
+        Arc::new(ghost_core::shadow_ledger::LivePipeline::new()),
+        runtime_config,
     ));
 
     let oracle_rx = event_tx.subscribe();
@@ -295,6 +303,30 @@ async fn wait_for_total_tx_seen(session: &SharedSession, expected: u64) {
     })
     .await
     .expect("runtime session should ingest expected buy count");
+}
+
+async fn wait_for_authoritative_fsc_score(
+    session: &SharedSession,
+    expected: Option<f64>,
+) -> ghost_core::checkpoint::MaterializedFeatureSet {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let features = session.write().materialize_features();
+            let authoritative_buy_ready = features
+                .sybil_resistance
+                .funding_source_v2
+                .as_ref()
+                .is_some_and(|evidence| evidence.authoritative_buy_ready);
+            if features.sybil_resistance.funding_source_concentration == expected
+                && authoritative_buy_ready
+            {
+                break features;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("authoritative FSC should become ready")
 }
 
 #[tokio::test]
@@ -891,16 +923,28 @@ async fn test_fsc_runtime_e2e_materializes_from_authoritative_funding_stream() {
 
     wait_for_total_tx_seen(&session, 4).await;
 
-    let features = session.write().materialize_features();
+    let features = wait_for_authoritative_fsc_score(&session, Some(0.5)).await;
     assert_eq!(
         features.sybil_resistance.funding_source_concentration,
         Some(0.5)
+    );
+    assert!(
+        features
+            .sybil_resistance
+            .funding_source_v2
+            .as_ref()
+            .is_some_and(
+                |evidence| evidence.coverage_window_ready && evidence.authoritative_buy_ready
+            )
     );
     assert!(!features.sybil_resistance.degraded_reasons.contains(
         &ghost_core::tx_intelligence::types::FSC_FUNDING_STREAM_UNAVAILABLE_REASON.to_string()
     ));
     assert!(!features.sybil_resistance.degraded_reasons.contains(
         &ghost_core::tx_intelligence::types::FSC_ROLLING_STATE_UNAVAILABLE_REASON.to_string()
+    ));
+    assert!(!features.sybil_resistance.degraded_reasons.contains(
+        &ghost_core::tx_intelligence::types::FSC_COVERAGE_WINDOW_UNAVAILABLE.to_string()
     ));
 }
 
@@ -1101,26 +1145,18 @@ async fn test_fsc_runtime_e2e_fail_closes_when_authoritative_lane_health_drops()
 
     wait_for_total_tx_seen(&session, 4).await;
 
-    tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            let features = session.write().materialize_features();
-            if features.sybil_resistance.funding_source_concentration == Some(0.5)
-                && !features
-                    .sybil_resistance
-                    .degraded_reasons
-                    .contains(&stream_unavailable_reason)
-                && !features
-                    .sybil_resistance
-                    .degraded_reasons
-                    .contains(&rolling_state_reason)
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("authoritative warmup should become ready");
+    let features = wait_for_authoritative_fsc_score(&session, Some(0.5)).await;
+    assert!(!features
+        .sybil_resistance
+        .degraded_reasons
+        .contains(&stream_unavailable_reason));
+    assert!(!features
+        .sybil_resistance
+        .degraded_reasons
+        .contains(&rolling_state_reason));
+    assert!(!features.sybil_resistance.degraded_reasons.contains(
+        &ghost_core::tx_intelligence::types::FSC_COVERAGE_WINDOW_UNAVAILABLE.to_string()
+    ));
 
     authoritative_funding_stream_tx
         .send(false)

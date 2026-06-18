@@ -4716,6 +4716,10 @@ impl BinaryParser {
         for trade in &mut deduped {
             enrich_trade_optional_accounts_from_source_ix(event, trade);
             populate_trade_toolchain_fingerprint_from_source_tx(event, trade);
+            crate::types::record_trade_source_coverage(
+                crate::types::SEER_BINARY_PARSER_COVERAGE_SOURCE,
+                trade,
+            );
             register_route_compatible_observed_bcv2(
                 &self.account_reg,
                 self.ipc_sender.as_ref(),
@@ -7853,6 +7857,93 @@ mod tests {
         assert_eq!(trades.len(), 1);
         assert_eq!(trades[0].signer_pre_balance_lamports, Some(1_500_000_000));
         assert_eq!(trades[0].signer_post_balance_lamports, Some(1_450_000_000));
+    }
+
+    #[test]
+    fn parse_trades_records_binary_parser_source_coverage() {
+        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        clear_recorded_counters();
+
+        let parser = BinaryParser::new(false);
+        let event = make_ftdi_buy_event(0, false);
+
+        let trades = parser
+            .parse_trades(&event)
+            .expect("binary coverage fixture should parse");
+
+        assert_eq!(trades.len(), 1);
+        assert!(trades[0].toolchain_fingerprint.coverage_complete());
+        assert!(saw_counter(
+            "seer_toolchain_fingerprint_coverage_total",
+            &[
+                ("source", crate::types::SEER_BINARY_PARSER_COVERAGE_SOURCE),
+                ("complete", "true"),
+            ],
+        ));
+        assert!(saw_counter(
+            "seer_fee_topology_coverage_total",
+            &[
+                ("source", crate::types::SEER_BINARY_PARSER_COVERAGE_SOURCE),
+                ("available", "true"),
+            ],
+        ));
+        assert!(saw_counter(
+            "seer_curve_data_coverage_total",
+            &[
+                ("source", crate::types::SEER_BINARY_PARSER_COVERAGE_SOURCE),
+                ("known", "false"),
+            ],
+        ));
+        assert!(saw_counter(
+            "seer_signer_balance_coverage_total",
+            &[
+                ("source", crate::types::SEER_BINARY_PARSER_COVERAGE_SOURCE),
+                ("pre", "true"),
+                ("post", "true"),
+            ],
+        ));
+    }
+
+    #[test]
+    fn default_fingerprint_records_missing_for_pumpportal_and_nln_sources() {
+        let _guard = metrics_test_lock().lock().expect("metrics test lock");
+        clear_recorded_counters();
+
+        let trade = sample_trade_event(
+            solana_sdk::signature::Signature::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Some(0),
+        );
+        assert!(!trade.toolchain_fingerprint.coverage_complete());
+
+        crate::types::record_trade_source_coverage(
+            crate::types::SEER_PUMPPORTAL_COVERAGE_SOURCE,
+            &trade,
+        );
+        crate::types::record_trade_source_coverage(
+            crate::types::SEER_NLN_PROGRAM_STREAMS_COVERAGE_SOURCE,
+            &trade,
+        );
+
+        for source in [
+            crate::types::SEER_PUMPPORTAL_COVERAGE_SOURCE,
+            crate::types::SEER_NLN_PROGRAM_STREAMS_COVERAGE_SOURCE,
+        ] {
+            assert!(saw_counter(
+                "seer_toolchain_fingerprint_coverage_total",
+                &[("source", source), ("complete", "false")],
+            ));
+            assert!(saw_counter(
+                "seer_fee_topology_coverage_total",
+                &[("source", source), ("available", "false")],
+            ));
+            assert!(saw_counter(
+                "seer_signer_balance_coverage_total",
+                &[("source", source), ("pre", "false"), ("post", "false")],
+            ));
+        }
     }
 
     #[test]

@@ -5,8 +5,8 @@
 
 use prometheus::{
     register_counter_vec, register_gauge, register_gauge_vec, register_histogram_vec,
-    register_int_counter_vec, register_int_gauge, register_int_gauge_vec, CounterVec, Gauge,
-    GaugeVec, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec,
+    register_int_counter, register_int_counter_vec, register_int_gauge, register_int_gauge_vec,
+    CounterVec, Gauge, GaugeVec, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec,
 };
 use std::sync::Once;
 
@@ -138,6 +138,18 @@ pub struct SeerMetrics {
     /// waiting for a curve→mint mapping (covers both buffer-enqueue eviction
     /// and replay-drain TTL expiry).
     pub pending_trade_expired_while_buffered_total: IntCounterVec,
+
+    /// Raw full-chain funding-lane transactions seen before native SOL transfer decode.
+    pub fsc_raw_fullchain_transactions_seen_total: IntCounter,
+
+    /// Raw full-chain transactions attempted for native SOL SystemProgram transfer decode.
+    pub fsc_raw_fullchain_system_transfer_decode_attempts_total: IntCounter,
+
+    /// Native SOL SystemProgram transfers decoded from raw full-chain transactions.
+    pub fsc_raw_fullchain_system_transfers_decoded_total: IntCounter,
+
+    /// Raw/native SOL transfer decode failures split by diagnostic reason.
+    pub fsc_transfer_decode_failures_total: IntCounterVec,
 }
 
 impl SeerMetrics {
@@ -727,6 +739,58 @@ impl SeerMetrics {
             .unwrap()
         });
 
+        let fsc_raw_fullchain_transactions_seen_total = register_int_counter!(
+            "fsc_raw_fullchain_transactions_seen_total",
+            "Raw full-chain funding-lane transactions seen before native SOL transfer decode"
+        )
+        .unwrap_or_else(|_| {
+            prometheus::IntCounter::new(
+                "fsc_raw_fullchain_transactions_seen_total",
+                "Raw full-chain funding-lane transactions seen before native SOL transfer decode",
+            )
+            .unwrap()
+        });
+
+        let fsc_raw_fullchain_system_transfer_decode_attempts_total = register_int_counter!(
+            "fsc_raw_fullchain_system_transfer_decode_attempts_total",
+            "Raw full-chain transactions attempted for native SOL SystemProgram transfer decode"
+        )
+        .unwrap_or_else(|_| {
+            prometheus::IntCounter::new(
+                "fsc_raw_fullchain_system_transfer_decode_attempts_total",
+                "Raw full-chain transactions attempted for native SOL SystemProgram transfer decode",
+            )
+            .unwrap()
+        });
+
+        let fsc_raw_fullchain_system_transfers_decoded_total = register_int_counter!(
+            "fsc_raw_fullchain_system_transfers_decoded_total",
+            "Native SOL SystemProgram transfers decoded from raw full-chain transactions"
+        )
+        .unwrap_or_else(|_| {
+            prometheus::IntCounter::new(
+                "fsc_raw_fullchain_system_transfers_decoded_total",
+                "Native SOL SystemProgram transfers decoded from raw full-chain transactions",
+            )
+            .unwrap()
+        });
+
+        let fsc_transfer_decode_failures_total = register_int_counter_vec!(
+            "fsc_transfer_decode_failures_total",
+            "FSC raw/native SOL transfer decode failures by diagnostic reason",
+            &["reason"]
+        )
+        .unwrap_or_else(|_| {
+            prometheus::IntCounterVec::new(
+                prometheus::Opts::new(
+                    "fsc_transfer_decode_failures_total",
+                    "FSC raw/native SOL transfer decode failures by diagnostic reason",
+                ),
+                &["reason"],
+            )
+            .unwrap()
+        });
+
         Self {
             initialize_pool_detected,
             initialize_pool_parsed_success,
@@ -766,6 +830,10 @@ impl SeerMetrics {
             curve_resolve_rpc_latency_ms,
             curve_resolve_failure_total,
             pending_trade_expired_while_buffered_total,
+            fsc_raw_fullchain_transactions_seen_total,
+            fsc_raw_fullchain_system_transfer_decode_attempts_total,
+            fsc_raw_fullchain_system_transfers_decoded_total,
+            fsc_transfer_decode_failures_total,
         }
     }
 
@@ -806,6 +874,51 @@ mod tests {
     fn test_metrics_creation() {
         let metrics = SeerMetrics::new();
         assert_eq!(metrics.calculate_land_rate("pumpfun"), 100.0);
+        let seen_before = metrics.fsc_raw_fullchain_transactions_seen_total.get();
+        let attempts_before = metrics
+            .fsc_raw_fullchain_system_transfer_decode_attempts_total
+            .get();
+        let decoded_before = metrics
+            .fsc_raw_fullchain_system_transfers_decoded_total
+            .get();
+        let failures_before = metrics
+            .fsc_transfer_decode_failures_total
+            .with_label_values(&["missing_accounts"])
+            .get();
+        metrics.fsc_raw_fullchain_transactions_seen_total.inc();
+        metrics
+            .fsc_raw_fullchain_system_transfer_decode_attempts_total
+            .inc();
+        metrics
+            .fsc_raw_fullchain_system_transfers_decoded_total
+            .inc_by(2);
+        metrics
+            .fsc_transfer_decode_failures_total
+            .with_label_values(&["missing_accounts"])
+            .inc();
+        assert_eq!(
+            metrics.fsc_raw_fullchain_transactions_seen_total.get(),
+            seen_before + 1
+        );
+        assert_eq!(
+            metrics
+                .fsc_raw_fullchain_system_transfer_decode_attempts_total
+                .get(),
+            attempts_before + 1
+        );
+        assert_eq!(
+            metrics
+                .fsc_raw_fullchain_system_transfers_decoded_total
+                .get(),
+            decoded_before + 2
+        );
+        assert_eq!(
+            metrics
+                .fsc_transfer_decode_failures_total
+                .with_label_values(&["missing_accounts"])
+                .get(),
+            failures_before + 1
+        );
     }
 
     #[test]

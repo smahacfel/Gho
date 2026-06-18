@@ -1306,8 +1306,12 @@ impl TriggerComponent {
             .ok_or_else(|| anyhow::anyhow!("missing signature status observation for {signature}"))
     }
 
-    async fn fetch_token_account_balance(&self, ata: &Pubkey) -> Result<Option<u64>> {
-        match self.primary_rpc_client.get_token_account_balance(ata).await {
+    async fn fetch_token_account_balance(
+        &self,
+        rpc: &solana_client::nonblocking::rpc_client::RpcClient,
+        ata: &Pubkey,
+    ) -> Result<Option<u64>> {
+        match rpc.get_token_account_balance(ata).await {
             Ok(response) => {
                 let amount = response.amount.parse::<u64>().map_err(|err| {
                     anyhow::anyhow!("invalid token balance response for {ata}: {err}")
@@ -1336,7 +1340,7 @@ impl TriggerComponent {
         let pre_submit_token_balance = if ata_missing_pre_submit {
             Some(0)
         } else {
-            match self.fetch_token_account_balance(&user_ata).await {
+            match self.fetch_token_account_balance(rpc, &user_ata).await {
                 Ok(balance) => balance,
                 Err(error) => {
                     warn!(
@@ -1381,7 +1385,7 @@ impl TriggerComponent {
         rpc: &solana_client::nonblocking::rpc_client::RpcClient,
     ) -> Result<UserAtaProbeResult> {
         let probe_started_at = Instant::now();
-        match self.fetch_token_account_balance(&user_ata).await {
+        match self.fetch_token_account_balance(rpc, &user_ata).await {
             Ok(Some(balance)) => Ok(UserAtaProbeResult {
                 user_ata,
                 ata_missing_pre_submit: false,
@@ -1454,7 +1458,10 @@ impl TriggerComponent {
 
         loop {
             if let Some(pre_submit_balance) = pre_submit_token_balance {
-                match self.fetch_token_account_balance(user_ata).await {
+                match self
+                    .fetch_token_account_balance(self.primary_rpc_client.as_ref(), user_ata)
+                    .await
+                {
                     Ok(Some(post_submit_balance)) if post_submit_balance > pre_submit_balance => {
                         balance_delta_observed = true;
                     }
@@ -3459,6 +3466,150 @@ impl TriggerComponent {
         Ok((current_slot, simulation))
     }
 
+    fn refresh_shadow_only_legacy_buy_request_before_simulation(
+        &self,
+        request: PreparedBuyRequest,
+    ) -> PreparedBuyRequest {
+        if !matches!(
+            request.account_overrides.buy_variant,
+            Some(trigger::PumpfunBuyVariant::LegacyBuy)
+        ) {
+            return request;
+        }
+
+        let Some(fresh_curve) = self.account_state_core.bonding_curve(&request.mint) else {
+            warn!(
+                mint = %request.mint,
+                buy_variant = "legacy_buy",
+                "Trigger: shadow-only legacy BUY refresh skipped because AccountStateCore has no canonical curve"
+            );
+            return request;
+        };
+
+        let derived_legacy_curve_pubkey = DirectBuyBuilder::derive_bonding_curve(&request.mint).0;
+        if let Some(existing_curve_pubkey) = request.account_overrides.legacy_buy_curve_pubkey {
+            if existing_curve_pubkey != derived_legacy_curve_pubkey {
+                warn!(
+                    mint = %request.mint,
+                    existing_curve_pubkey = %existing_curve_pubkey,
+                    derived_curve_pubkey = %derived_legacy_curve_pubkey,
+                    "Trigger: shadow-only legacy BUY refresh skipped because curve pubkey identity differs"
+                );
+                return request;
+            }
+        }
+
+        let ResolvedTriggerPayer {
+            payer,
+            provenance: payer_provenance,
+            ..
+        } = match self.load_payer() {
+            Ok(payer) => payer,
+            Err(err) => {
+                warn!(
+                    mint = %request.mint,
+                    error = %err,
+                    "Trigger: shadow-only legacy BUY refresh skipped because payer is unavailable"
+                );
+                return request;
+            }
+        };
+        if payer.pubkey() != request.payer_pubkey {
+            warn!(
+                mint = %request.mint,
+                request_payer = %request.payer_pubkey,
+                cached_payer = %payer.pubkey(),
+                "Trigger: shadow-only legacy BUY refresh skipped because cached payer does not match request payer"
+            );
+            return request;
+        }
+
+        let mut refreshed_overrides = request.account_overrides.clone();
+        refreshed_overrides.legacy_buy_curve = Some(fresh_curve);
+        refreshed_overrides.legacy_buy_curve_pubkey = Some(derived_legacy_curve_pubkey);
+        refreshed_overrides.legacy_buy_curve_source =
+            Some("account_state_core_pre_shadow_simulation_refresh".to_string());
+        refreshed_overrides.legacy_buy_curve_authority_status =
+            Some("authoritative_pre_shadow_simulation_refresh".to_string());
+
+        let fresh_entry_token_amount_raw = fresh_curve.simulate_buy(request.amount_lamports);
+        let build_profile = match self.create_buy_build_profile(
+            &request.payer_pubkey,
+            &request.mint,
+            &request.token_program,
+            request.attach_idempotent_ata_create,
+            &refreshed_overrides,
+            request.amount_lamports,
+            request.ata_missing_pre_submit,
+            request.pre_submit_token_balance,
+        ) {
+            Ok(profile) => profile,
+            Err(err) => {
+                warn!(
+                    mint = %request.mint,
+                    error = %err,
+                    "Trigger: shadow-only legacy BUY refresh failed while rebuilding buy profile"
+                );
+                return request;
+            }
+        };
+
+        let tip_seed = format!("{}:{}", request.mint, request.recent_blockhash);
+        let tip_account = self
+            .live_tx_sender
+            .as_ref()
+            .map(|sender| sender.select_tip_account(tip_seed.as_bytes()))
+            .unwrap_or_else(|| select_sender_tip_account(tip_seed.as_bytes()));
+        let metadata = PreparedBuyRequestBuildMetadata {
+            recent_blockhash: request.recent_blockhash,
+            blockhash_source: request.blockhash_source,
+            blockhash_age_ms: request.blockhash_age_ms,
+            blockhash_last_valid_block_height: request.blockhash_last_valid_block_height,
+            blockhash_observed_block_height: request.blockhash_observed_block_height,
+            blockhash_fetched_at: request.blockhash_fetched_at,
+            blockhash_fetch_latency_ms: request.blockhash_fetch_latency_ms,
+            post_blockhash_build_latency_ms: request.post_blockhash_build_latency_ms,
+            reserve_slot_latency_ms: request.reserve_slot_latency_ms,
+            shadow_spawn_latency_ms: request.shadow_spawn_latency_ms,
+            decision_ts_ms: request.decision_ts_ms,
+        };
+
+        let mut refreshed_request = match self.build_prepared_buy_request_from_profile(
+            &payer,
+            payer_provenance,
+            &build_profile,
+            request.tip_lamports,
+            request.priority_fee_micro_lamports,
+            &tip_account,
+            metadata,
+        ) {
+            Ok(refreshed_request) => refreshed_request,
+            Err(err) => {
+                warn!(
+                    mint = %request.mint,
+                    error = %err,
+                    "Trigger: shadow-only legacy BUY refresh failed while rebuilding signed transaction"
+                );
+                return request;
+            }
+        };
+        refreshed_request.join_metadata = request.join_metadata.clone();
+        refreshed_request.state_readiness_latch_diagnostics =
+            request.state_readiness_latch_diagnostics.clone();
+        refreshed_request.preparation_telemetry = request.preparation_telemetry.clone();
+
+        info!(
+            mint = %request.mint,
+            old_entry_token_amount_raw = ?request.entry_token_amount_raw,
+            fresh_entry_token_amount_raw,
+            old_min_tokens_out = request.min_tokens_out,
+            fresh_min_tokens_out = refreshed_request.min_tokens_out,
+            "Trigger: refreshed shadow-only legacy BUY request from AccountStateCore before simulation"
+        );
+
+        refreshed_request
+    }
+
     async fn submit_prepared_via_sender(
         &self,
         request: PreparedBuyRequest,
@@ -4465,6 +4616,7 @@ impl TriggerComponent {
         &self,
         request: PreparedBuyRequest,
     ) -> TriggerDispatchReceipt {
+        let request = self.refresh_shadow_only_legacy_buy_request_before_simulation(request);
         let request_for_error = request.clone();
         let active_position_lease = match self.try_reserve_position_slot(&request.mint, &request) {
             Ok(lease) => Some(lease),
@@ -4957,6 +5109,7 @@ impl TriggerComponent {
                 };
             }
             TriggerEntryMode::ShadowOnly => {
+                request = self.refresh_shadow_only_legacy_buy_request_before_simulation(request);
                 let request_for_error = request.clone();
                 let active_position_lease =
                     match self.try_reserve_position_slot(&request.mint, &request) {
@@ -8752,6 +8905,94 @@ mod tests {
 
         drop(active_position_lease);
         assert_eq!(trigger.active_positions(), 0);
+    }
+
+    #[tokio::test]
+    async fn dispatch_prepared_buy_shadow_only_refreshes_legacy_curve_before_simulation() {
+        let payer = Keypair::new();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let keypair_path = temp.path().join("payer.json");
+        solana_sdk::signature::write_keypair_file(&payer, &keypair_path)
+            .expect("write payer keypair");
+
+        let mint = Pubkey::new_unique();
+        let account_state_core = Arc::new(AccountStateReducer::new());
+        seed_canonical_buy_state(&account_state_core, mint);
+        let fresh_curve = account_state_core
+            .bonding_curve(&mint)
+            .expect("seeded canonical curve");
+        let stale_curve = BondingCurve {
+            discriminator: 0,
+            virtual_token_reserves: 1_000_000_000_000,
+            virtual_sol_reserves: 30_000_000_000,
+            real_token_reserves: 1_000_000_000_000,
+            real_sol_reserves: 30_000_000_000,
+            token_total_supply: 0,
+            complete: 0,
+            _padding: [0; 7],
+        };
+        let mut config = create_test_config();
+        config.entry_mode = crate::config::TriggerEntryMode::ShadowOnly;
+        config.keypair_path = Some(keypair_path.to_string_lossy().to_string());
+        config.shadow_run.enabled = true;
+        config.shadow_run.payer_strategy = TriggerShadowPayerStrategy::Configured;
+        let trigger = TriggerComponent::new_with_runtime_guards_and_runtime_state(
+            config,
+            Arc::new(MockShadowSimulator),
+            PositionLimitTracker::new(1),
+            Arc::new(ShadowLedger::new()),
+            Arc::clone(&account_state_core),
+        );
+        let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).expect("valid token program");
+        let amount_lamports = trigger
+            .configured_trade_amount_lamports()
+            .expect("configured amount");
+        let overrides = BuyAccountOverrides {
+            creator_pubkey: Some(Pubkey::new_unique()),
+            creator_pubkey_source: Some("unit_test.creator".to_string()),
+            creator_pubkey_authoritative: Some(true),
+            buy_variant: Some(trigger::PumpfunBuyVariant::LegacyBuy),
+            legacy_buy_curve: Some(stale_curve),
+            legacy_buy_curve_pubkey: Some(DirectBuyBuilder::derive_bonding_curve(&mint).0),
+            buy_remaining_accounts: vec![Pubkey::new_unique(), Pubkey::new_unique()],
+            ..BuyAccountOverrides::default()
+        };
+        let stale_entry_token_amount = stale_curve.simulate_buy(amount_lamports);
+        let fresh_entry_token_amount = fresh_curve.simulate_buy(amount_lamports);
+        assert_ne!(
+            stale_entry_token_amount, fresh_entry_token_amount,
+            "test setup must distinguish stale and fresh curves"
+        );
+        let request = trigger
+            .build_prepared_buy_request(
+                &payer,
+                &mint,
+                &token_program,
+                false,
+                &overrides,
+                amount_lamports,
+                0,
+                Hash::new_unique(),
+            )
+            .expect("legacy prepared buy request should build from stale curve");
+        assert_eq!(
+            request.entry_token_amount_raw,
+            Some(stale_entry_token_amount)
+        );
+
+        let receipt = trigger.dispatch_prepared_buy_shadow_only(request).await;
+        match receipt
+            .primary_outcome
+            .expect("shadow-only dispatch should return a simulation report")
+        {
+            TriggerBuyOutcome::ShadowSimulated { report } => {
+                assert_eq!(
+                    report.entry_token_amount_raw,
+                    Some(fresh_entry_token_amount)
+                );
+            }
+            other => panic!("expected ShadowSimulated outcome, got {other:?}"),
+        }
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Build Gatekeeper outcome labels for +40% calibration.
+Build Gatekeeper outcome labels for +50% / -50% calibration.
 
 The script joins Gatekeeper decision rows with threshold outcome rows produced by
 the offline threshold fetcher. It intentionally treats missing or non-causal
@@ -16,8 +16,8 @@ from typing import Any, Iterable
 
 
 LABEL_SCHEMA_VERSION = 1
-DEFAULT_TARGET_PCT = 40.0
-DEFAULT_STOP_PCT = 40.0
+DEFAULT_TARGET_PCT = 50.0
+DEFAULT_STOP_PCT = 50.0
 
 
 def iter_json_objects(path: Path) -> Iterable[dict[str, Any]]:

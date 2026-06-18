@@ -39,6 +39,21 @@ BAD_DELTA_MARKERS = {
 ACCEPTED_CLOSE_REASONS = {"Target", "StopLoss", "TimeStop"}
 EVENT_PASS_CLAIM = "SELECTOR_EVENT_CANARY_PASS"
 LIFECYCLE_PASS_CLAIM = "SELECTOR_LIFECYCLE_CANARY_PASS"
+PROBE_SIMULATED_OUTCOME = "counterfactual_shadow_probe_simulated"
+
+
+def resolve_probe_artifact_paths(config_path: Path, config: dict[str, Any]) -> dict[str, Path] | None:
+    probe_cfg = config.get("p37_shadow_probe") or {}
+    if probe_cfg.get("enabled") is not True:
+        return None
+    required_fields = ("transport_log_path", "entry_log_path", "lifecycle_log_path")
+    if any(not isinstance(probe_cfg.get(field), str) or not probe_cfg.get(field) for field in required_fields):
+        return None
+    return {
+        "probe_transport": restore_guard.resolve_runtime_path(config_path, probe_cfg["transport_log_path"]),
+        "probe_entries": restore_guard.resolve_runtime_path(config_path, probe_cfg["entry_log_path"]),
+        "probe_lifecycle": restore_guard.resolve_runtime_path(config_path, probe_cfg["lifecycle_log_path"]),
+    }
 
 
 def utc_timestamp() -> str:
@@ -123,9 +138,11 @@ def count_lines(path: Path) -> int:
 
 def build_snapshot(root: Path, scope: str, config: Path) -> dict[str, Any]:
     config_path, artifact_paths = restore_guard.resolve_artifact_paths(root, config)
+    config_data = restore_guard.load_toml(config_path)
+    probe_paths = resolve_probe_artifact_paths(config_path, config_data)
     runtime = restore_guard.snapshot_runtime(artifact_paths)
     event_counts, bad_json = count_event_kinds(root, scope)
-    return {
+    snapshot = {
         "schema_version": 1,
         "scope": scope,
         "config": str(config_path),
@@ -137,6 +154,15 @@ def build_snapshot(root: Path, scope: str, config: Path) -> dict[str, Any]:
         "shadow_lifecycle_lines": runtime.shadow_lifecycle_lines,
         "log_sizes": runtime.log_sizes,
     }
+    if probe_paths:
+        snapshot.update(
+            {
+                "probe_transport_lines": count_lines(probe_paths["probe_transport"]),
+                "probe_entries_lines": count_lines(probe_paths["probe_entries"]),
+                "probe_lifecycle_lines": count_lines(probe_paths["probe_lifecycle"]),
+            }
+        )
+    return snapshot
 
 
 def load_baseline(path: Path | None) -> dict[str, Any]:
@@ -180,6 +206,37 @@ def read_jsonl_since(path: Path, baseline_lines: int) -> list[dict[str, Any]]:
 
 def count_text_markers(text: str, markers: dict[str, str]) -> dict[str, int]:
     return {name: text.count(pattern) for name, pattern in markers.items()}
+
+
+def count_appended_log_markers(
+    paths: restore_guard.ArtifactPaths,
+    before: restore_guard.RuntimeSnapshots,
+    markers: dict[str, str],
+) -> dict[str, int]:
+    counts = {name: 0 for name in markers}
+    if not markers:
+        return counts
+    for path in [*restore_guard.log_family(paths.system_log), *restore_guard.log_family(paths.oracle_log)]:
+        if not path.exists():
+            continue
+        previous_size = before.log_sizes.get(str(path), 0)
+        current_size = path.stat().st_size
+        if current_size <= previous_size:
+            continue
+        with path.open("rb") as fh:
+            fh.seek(previous_size)
+            for raw_line in fh:
+                text = raw_line.decode("utf-8", errors="ignore")
+                for name, pattern in markers.items():
+                    counts[name] += text.count(pattern)
+    return counts
+
+
+def merge_marker_counts(*items: dict[str, int]) -> dict[str, int]:
+    merged: Counter[str] = Counter()
+    for item in items:
+        merged.update({str(key): int(value) for key, value in item.items()})
+    return {key: int(merged.get(key, 0)) for key in sorted(merged)}
 
 
 def row_text(rows: Iterable[dict[str, Any]]) -> str:
@@ -226,6 +283,19 @@ def summarize_lifecycle_delta(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def summarize_probe_transport_delta(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    execution_outcome = Counter(row.get("execution_outcome") for row in rows)
+    event_type = Counter(row.get("event_type") for row in rows)
+    probe_bucket = Counter(row.get("probe_bucket") for row in rows)
+    return {
+        "rows": len(rows),
+        "event_type_counts": restore_guard.counter_to_json(event_type),
+        "execution_outcome_counts": restore_guard.counter_to_json(execution_outcome),
+        "probe_bucket_counts": restore_guard.counter_to_json(probe_bucket),
+        "simulated_transport_rows": execution_outcome.get(PROBE_SIMULATED_OUTCOME, 0),
+    }
+
+
 def validate_event_canary(event_delta: dict[str, int], diag_delta: int, bad_event_json_delta: int) -> tuple[str, list[str]]:
     errors: list[str] = []
     for kind in REQUIRED_EVENT_KINDS:
@@ -269,15 +339,48 @@ def validate_lifecycle_canary(
     return (PASS_STATUS if not errors else FAIL_LIFECYCLE_PROOF), errors
 
 
+def validate_probe_lifecycle_canary(
+    artifact_deltas: dict[str, int],
+    lifecycle_summary: dict[str, Any],
+    transport_summary: dict[str, Any],
+    bad_marker_counts: dict[str, int] | None = None,
+) -> tuple[str, list[str]]:
+    errors: list[str] = []
+    for key in ("probe_transport_delta", "probe_entries_delta", "probe_lifecycle_delta"):
+        if artifact_deltas.get(key, 0) <= 0:
+            errors.append(f"{key} <= 0")
+    for marker, count in (bad_marker_counts or lifecycle_summary.get("bad_marker_counts", {})).items():
+        if count > 0:
+            errors.append(f"{marker}_delta > 0")
+    if transport_summary.get("simulated_transport_rows", 0) <= 0:
+        errors.append("probe simulated transport rows <= 0")
+    if lifecycle_summary.get("position_closed_rows", 0) <= 0:
+        errors.append("probe position_closed rows <= 0")
+    if lifecycle_summary.get("exit_filled_rows", 0) <= 0:
+        errors.append("probe exit_filled rows <= 0")
+    if lifecycle_summary.get("truth_status_resolved_rows", 0) <= 0:
+        errors.append("probe truth_status=resolved lifecycle rows <= 0")
+    if lifecycle_summary.get("truth_source_canonical_rows", 0) <= 0:
+        errors.append("probe truth_source=canonical_account_state_snapshot lifecycle rows <= 0")
+    if lifecycle_summary.get("final_pnl_pct_present_rows", 0) <= 0:
+        errors.append("probe final_pnl_pct lifecycle rows <= 0")
+    if lifecycle_summary.get("accepted_close_reason_rows", 0) <= 0:
+        errors.append("probe accepted close_reason lifecycle rows <= 0")
+    return (PASS_STATUS if not errors else FAIL_LIFECYCLE_PROOF), errors
+
+
 def run_reporter(
     *,
     root: Path,
     config_path: Path,
     output_dir: Path,
     min_rows_written: int,
+    artifact_plane: str = "shadow",
 ) -> tuple[dict[str, Any], str, list[str]]:
-    reporter_output = output_dir / "selector_lifecycle_canary_report.jsonl"
-    reporter_summary = output_dir / "selector_lifecycle_canary_summary.json"
+    probe_plane = artifact_plane == "probe"
+    reporter_prefix = "probe_selector_lifecycle_canary" if probe_plane else "selector_lifecycle_canary"
+    reporter_output = output_dir / f"{reporter_prefix}_report.jsonl"
+    reporter_summary = output_dir / f"{reporter_prefix}_summary.json"
     reporter_log = output_dir / "commands" / "reporter.log"
     reporter_log.parent.mkdir(parents=True, exist_ok=True)
     command = [
@@ -290,6 +393,8 @@ def run_reporter(
         "--outcome-summary-output",
         str(reporter_summary),
     ]
+    if probe_plane:
+        command.extend(["--artifact-plane", "probe"])
     with reporter_log.open("w", encoding="utf-8", errors="ignore") as log_fh:
         proc = subprocess.run(
             command,
@@ -319,10 +424,12 @@ def run_reporter(
         rows,
         min_rows_written=min_rows_written,
         require_resolved=True,
+        require_gatekeeper_buy_context=not probe_plane,
         reporter_stdout=reporter_log.read_text(encoding="utf-8", errors="ignore"),
     )
     payload = {
         "status": validation.status,
+        "artifact_plane": artifact_plane,
         "exit_code": proc.returncode,
         "command": command,
         "log_path": str(reporter_log),
@@ -381,6 +488,8 @@ def write_markdown(path: Path, payload: dict[str, Any]) -> None:
     lifecycle = payload.get("lifecycle_canary") or {}
     for key in (
         "status",
+        "accepted_lifecycle_plane",
+        "shadow_status",
         "shadow_buys_delta",
         "shadow_entries_delta",
         "shadow_lifecycle_delta",
@@ -395,6 +504,26 @@ def write_markdown(path: Path, payload: dict[str, Any]) -> None:
     ):
         if key in lifecycle:
             lines.append(f"- {key}: `{lifecycle[key]}`")
+    probe_lifecycle = payload.get("probe_lifecycle_canary") or {}
+    if probe_lifecycle:
+        lines.extend(["", "## Probe Lifecycle Canary", ""])
+        for key in (
+            "status",
+            "probe_transport_delta",
+            "probe_entries_delta",
+            "probe_lifecycle_delta",
+            "position_closed_rows",
+            "exit_filled_rows",
+            "truth_status_resolved_rows",
+            "truth_source_canonical_rows",
+            "final_pnl_pct_present_rows",
+            "accepted_close_reason_rows",
+        ):
+            if key in probe_lifecycle:
+                lines.append(f"- {key}: `{probe_lifecycle[key]}`")
+        transport = probe_lifecycle.get("transport")
+        if isinstance(transport, dict):
+            lines.append(f"- simulated_transport_rows: `{transport.get('simulated_transport_rows')}`")
     reporter = payload.get("reporter") or {}
     lines.extend(["", "## Reporter", ""])
     for key, value in reporter.items():
@@ -453,8 +582,14 @@ def main(argv: list[str] | None = None) -> int:
         baseline = load_baseline(resolve_repo_path(root, args.baseline) if args.baseline else None)
         current_snapshot = build_snapshot(root, args.scope, config_path)
         resolved_config, artifact_paths = restore_guard.resolve_artifact_paths(root, config_path)
+        config_data = restore_guard.load_toml(resolved_config)
+        probe_paths = resolve_probe_artifact_paths(resolved_config, config_data)
         before_runtime = runtime_snapshot_from_baseline(baseline)
-        appended_log_text = restore_guard.read_appended_log_text(artifact_paths, before_runtime)
+        log_marker_counts = count_appended_log_markers(
+            artifact_paths,
+            before_runtime,
+            {**BAD_DELTA_MARKERS, "DIAG_ACCOUNT_UPDATE_RELAY": "DIAG_ACCOUNT_UPDATE_RELAY"},
+        )
     except Exception as exc:
         report = {
             "status": INCONCLUSIVE_ENV_OR_CONFIG,
@@ -476,7 +611,6 @@ def main(argv: list[str] | None = None) -> int:
         baseline.get("event_counts") or {},
     )
     bad_event_json_delta = int(current_snapshot.get("bad_event_json", 0)) - int(baseline.get("bad_event_json", 0) or 0)
-    log_marker_counts = count_text_markers(appended_log_text, {**BAD_DELTA_MARKERS, "DIAG_ACCOUNT_UPDATE_RELAY": "DIAG_ACCOUNT_UPDATE_RELAY"})
     diag_delta = log_marker_counts.get("DIAG_ACCOUNT_UPDATE_RELAY", 0)
     event_status, event_errors = validate_event_canary(event_delta, diag_delta, bad_event_json_delta)
 
@@ -484,6 +618,14 @@ def main(argv: list[str] | None = None) -> int:
         "shadow_buys_delta": int(current_snapshot["shadow_buys_lines"]) - int(baseline.get("shadow_buys_lines", 0) or 0),
         "shadow_entries_delta": int(current_snapshot["shadow_entries_lines"]) - int(baseline.get("shadow_entries_lines", 0) or 0),
         "shadow_lifecycle_delta": int(current_snapshot["shadow_lifecycle_lines"]) - int(baseline.get("shadow_lifecycle_lines", 0) or 0),
+    }
+    probe_artifact_deltas = {
+        "probe_transport_delta": int(current_snapshot.get("probe_transport_lines", 0))
+        - int(baseline.get("probe_transport_lines", 0) or 0),
+        "probe_entries_delta": int(current_snapshot.get("probe_entries_lines", 0))
+        - int(baseline.get("probe_entries_lines", 0) or 0),
+        "probe_lifecycle_delta": int(current_snapshot.get("probe_lifecycle_lines", 0))
+        - int(baseline.get("probe_lifecycle_lines", 0) or 0),
     }
     lifecycle_rows = read_jsonl_since(
         artifact_paths.shadow_lifecycle,
@@ -498,20 +640,61 @@ def main(argv: list[str] | None = None) -> int:
         int(baseline.get("shadow_entries_lines", 0) or 0),
     )
     lifecycle_summary = summarize_lifecycle_delta(lifecycle_rows)
+    probe_transport_rows: list[dict[str, Any]] = []
+    probe_entries_rows: list[dict[str, Any]] = []
+    probe_lifecycle_rows: list[dict[str, Any]] = []
+    probe_transport_summary: dict[str, Any] = {"rows": 0, "simulated_transport_rows": 0}
+    probe_lifecycle_summary: dict[str, Any] = summarize_lifecycle_delta([])
+    if probe_paths:
+        probe_transport_rows = read_jsonl_since(
+            probe_paths["probe_transport"],
+            int(baseline.get("probe_transport_lines", 0) or 0),
+        )
+        probe_entries_rows = read_jsonl_since(
+            probe_paths["probe_entries"],
+            int(baseline.get("probe_entries_lines", 0) or 0),
+        )
+        probe_lifecycle_rows = read_jsonl_since(
+            probe_paths["probe_lifecycle"],
+            int(baseline.get("probe_lifecycle_lines", 0) or 0),
+        )
+        probe_transport_summary = summarize_probe_transport_delta(probe_transport_rows)
+        probe_lifecycle_summary = summarize_lifecycle_delta(probe_lifecycle_rows)
     runtime_delta_text = "\n".join(
         [
-            appended_log_text,
             row_text(buys_rows),
             row_text(entries_rows),
             row_text(lifecycle_rows),
+            row_text(probe_transport_rows),
+            row_text(probe_entries_rows),
+            row_text(probe_lifecycle_rows),
         ]
     )
-    runtime_bad_marker_counts = count_text_markers(runtime_delta_text, BAD_DELTA_MARKERS)
+    runtime_bad_marker_counts = merge_marker_counts(
+        {key: log_marker_counts.get(key, 0) for key in BAD_DELTA_MARKERS},
+        count_text_markers(runtime_delta_text, BAD_DELTA_MARKERS),
+    )
     lifecycle_status, lifecycle_errors = validate_lifecycle_canary(
         artifact_deltas,
         lifecycle_summary,
         runtime_bad_marker_counts,
     )
+    probe_lifecycle_status, probe_lifecycle_errors = (
+        validate_probe_lifecycle_canary(
+            probe_artifact_deltas,
+            probe_lifecycle_summary,
+            probe_transport_summary,
+            runtime_bad_marker_counts,
+        )
+        if probe_paths
+        else ("SKIPPED", ["p37_shadow_probe disabled or paths missing"])
+    )
+    accepted_lifecycle_plane = None
+    if lifecycle_status == PASS_STATUS:
+        accepted_lifecycle_plane = "shadow"
+    elif probe_lifecycle_status == PASS_STATUS:
+        accepted_lifecycle_plane = "probe"
+    overall_lifecycle_status = PASS_STATUS if accepted_lifecycle_plane else lifecycle_status
 
     report = {
         "schema_version": 1,
@@ -530,9 +713,18 @@ def main(argv: list[str] | None = None) -> int:
             "diag_account_update_relay_delta": diag_delta,
         },
         "lifecycle_canary": {
-            "status": lifecycle_status,
+            "status": overall_lifecycle_status,
+            "accepted_lifecycle_plane": accepted_lifecycle_plane,
+            "shadow_status": lifecycle_status,
             **artifact_deltas,
             **lifecycle_summary,
+            "bad_marker_counts": runtime_bad_marker_counts,
+        },
+        "probe_lifecycle_canary": {
+            "status": probe_lifecycle_status,
+            **probe_artifact_deltas,
+            **probe_lifecycle_summary,
+            "transport": probe_transport_summary,
             "bad_marker_counts": runtime_bad_marker_counts,
         },
         "reporter": {"status": "SKIPPED"},
@@ -543,6 +735,11 @@ def main(argv: list[str] | None = None) -> int:
             "shadow_lifecycle": str(artifact_paths.shadow_lifecycle),
             "system_log": str(artifact_paths.system_log),
             "oracle_log": str(artifact_paths.oracle_log),
+            **(
+                {key: str(path) for key, path in probe_paths.items()}
+                if probe_paths
+                else {}
+            ),
         },
     }
 
@@ -552,15 +749,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.phase == "event":
         return finish(report, output_dir, PASS_STATUS, json_stdout=args.json)
 
-    if lifecycle_status != PASS_STATUS:
+    if overall_lifecycle_status != PASS_STATUS:
         report["errors"].extend(lifecycle_errors)
-        return finish(report, output_dir, lifecycle_status, json_stdout=args.json)
+        if probe_paths:
+            report["errors"].extend(probe_lifecycle_errors)
+        return finish(report, output_dir, overall_lifecycle_status, json_stdout=args.json)
 
     reporter_payload, reporter_status, reporter_errors = run_reporter(
         root=root,
         config_path=config_path,
         output_dir=output_dir,
         min_rows_written=args.min_reporter_rows,
+        artifact_plane=accepted_lifecycle_plane or "shadow",
     )
     report["reporter"] = reporter_payload
     if reporter_status != PASS_STATUS:

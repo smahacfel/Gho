@@ -218,6 +218,7 @@ def build_phase2(args: argparse.Namespace) -> dict[str, Any]:
         snapshot_kinds=args.snapshot_kind
         or ["birth+5s", "birth+15s", "birth+30s", "birth+60s", "decision"],
         include_decision_context=False,
+        streaming=args.streaming_feature_snapshots,
     )
     common.write_jsonl(feature_output, feature_rows)
     common.write_json(feature_manifest_output, feature_report)
@@ -372,6 +373,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         choices=["birth+5s", "birth+15s", "birth+30s", "birth+60s", "decision"],
         default=None,
+    )
+    parser.add_argument(
+        "--streaming-feature-snapshots",
+        action="store_true",
+        help="Build feature snapshots with the bounded-memory streaming path.",
     )
     parser.add_argument("--json", action="store_true")
     return parser

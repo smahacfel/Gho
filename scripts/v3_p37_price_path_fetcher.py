@@ -29,7 +29,7 @@ import gatekeeper_outcome_labeler as v1
 PRICE_PATH_SCHEMA_VERSION = 1
 DEFAULT_WINDOW_S = 60.0
 IMPLEMENTATION_STATUS = "schema_only_no_collector"
-DEFAULT_RPC = "https://solana-mainnet.g.alchemy.com/v2/t3ipHfJnGWRbwo6i21IGu"
+DEFAULT_RPC = "https://solana-mainnet.g.alchemy.com/v2/cb8bwqpBGAvntVOBkT62O"
 DEFAULT_WORKERS = 8
 DEFAULT_MAX_RPS = 40.0
 DEFAULT_MAX_PAGES = 20

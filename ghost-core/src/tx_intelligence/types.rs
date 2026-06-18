@@ -122,6 +122,9 @@ pub struct FundingSourceDiagnostics {
     /// Aggregated miss taxonomy counts for the buyer sample.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub miss_reason_counts: Vec<FundingSourceMissReasonCount>,
+    /// Per lookup-unit diagnostics for FSC attribution autopsy.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lookup_diagnostics: Vec<FscLookupDiagnostic>,
     /// Transfer candidates below the configured absolute attribution floor.
     #[serde(default)]
     pub dust_filtered_count: u64,
@@ -131,6 +134,71 @@ pub struct FundingSourceDiagnostics {
     /// Transfer candidates below the configured transfer-to-buy ratio.
     #[serde(default)]
     pub rel_too_small_count: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FscLookupWalletCandidate {
+    /// Wallet address considered as an FSC recipient lookup key.
+    #[serde(default)]
+    pub wallet: String,
+    /// Diagnostic source of the candidate, for example owner_token_delta_positive.
+    #[serde(default)]
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FscLookupDiagnostic {
+    /// Wallet used for this lookup attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lookup_wallet: Option<String>,
+    /// Ordered candidate wallets considered before the selected lookup key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidate_wallets: Vec<FscLookupWalletCandidate>,
+    /// Selected wallet after candidate ordering/fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_lookup_wallet: Option<String>,
+    /// Source of the selected lookup wallet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lookup_wallet_source: Option<String>,
+    /// True when the signer fallback was selected instead of an owner delta.
+    #[serde(default)]
+    pub fallback_used: bool,
+    /// Decision/buy slot used when the lookup was evaluated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<u64>,
+    /// Decision/buy transaction signature used when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    /// Event timestamp of the buyer transaction used for pre-buy attribution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buy_event_ts_ms: Option<u64>,
+    /// "hit", "miss", "no_candidate", or another diagnostic-only result.
+    #[serde(default)]
+    pub lookup_result: String,
+    /// Retained recipient-history entries visible to this lookup.
+    #[serde(default)]
+    pub history_entries_found: u64,
+    /// Age of the latest retained funding transfer relative to the decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_funding_age_ms: Option<u64>,
+    /// Number of source wallets that survived attribution filters.
+    #[serde(default)]
+    pub matched_source_wallets_count: u64,
+    /// Total lamports that survived attribution filters.
+    #[serde(default)]
+    pub matched_total_lamports: u64,
+    /// Dominant source lamports when a source matched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub funding_amount_lamports: Option<u64>,
+    /// Dominant source wallet when a source matched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_wallet: Option<String>,
+    /// Existing FSC miss reason, preserved for continuity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub miss_reason: Option<String>,
+    /// More specific attribution-autopsy miss bucket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic_miss_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

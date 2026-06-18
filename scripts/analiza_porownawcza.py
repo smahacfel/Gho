@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-📊 ANALIZA PORÓWNAWCZA ZBIORÓW A vs B  (v5.0 — JSONL v7+ + Sybil Interference)
+📊 ANALIZA PORÓWNAWCZA ZBIORÓW A vs B  (v5.1 — Segment Lab discovery)
 
 Skrypt wczytuje dwa pliki JSONL (zbior_A.jsonl, zbior_B.jsonl) i przeprowadza
 wielopoziomową analizę z filtracją A/B i deduplikacją:
@@ -39,6 +39,9 @@ wielopoziomową analizę z filtracją A/B i deduplikacją:
               + sybil_soft_points, sybil_soft_flags, sybil_lead_signal,
               + degradacja coverage, korelacje z innymi cechami,
               + fingerprint z-score A vs B, syntetyczna ocena warstwy
+  ── NOWE (v5.1) — Segment Lab discovery-only ───────────────────────────────
+  SEKCJA 19 — Segmenty A/B, false positives, ablation, quartile scans.
+              SEGMENT LAB = DISCOVERY ONLY. NO OOS VALIDATION = NO DEPLOY.
 
 Uruchomienie:
   python3 analiza_porownawcza.py [ścieżka_do_A.jsonl] [ścieżka_do_B.jsonl]
@@ -48,9 +51,16 @@ Parametry (env vars):
   AB_WINDOW_MS     — oczekiwany ab_window_ms (domyślnie: 10000)
   AB_MIN_TX        — minimalne ab_tx_count_window (domyślnie: 10)
   AB_MIN_VEC_LEN   — minimalna długość wektora dla DTW/Hill (domyślnie: 20)
+  AB_SEGMENT_LAB   — 1/0, włącz/wyłącz Sekcję 19 (domyślnie: 1)
+  AB_SEGMENT_MIN_SELECTED       — min. selected_total w tabelach (domyślnie: 20)
+  AB_SEGMENT_TOP_N              — top N segmentów par semantycznych (domyślnie: 30)
+  AB_SEGMENT_FP_SAMPLE_LIMIT    — limit próbek FP per segment (domyślnie: 20)
+  AB_SEGMENT_ENABLE_ARTIFACTS   — 1/0, zapis CSV/JSON obok wejścia (domyślnie: 0)
+  AB_SEGMENT_MIN_VALID_VALUES   — min. poprawnych wartości pola (domyślnie: 50)
 """
 
 import json
+import csv
 import sys
 import math
 import os
@@ -104,6 +114,34 @@ except ImportError:
 _ENV_WINDOW_MS   = os.environ.get("AB_WINDOW_MS")    # None = autodetect
 _ENV_MIN_TX      = os.environ.get("AB_MIN_TX")        # None = autodetect (→ 0)
 _ENV_MIN_VEC_LEN = os.environ.get("AB_MIN_VEC_LEN")   # None = autodetect
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _env_int(name: str, default: int, min_value: int | None = None) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    if min_value is not None:
+        value = max(min_value, value)
+    return value
+
+
+AB_SEGMENT_LAB = _env_bool("AB_SEGMENT_LAB", True)
+AB_SEGMENT_MIN_SELECTED = _env_int("AB_SEGMENT_MIN_SELECTED", 20, 0)
+AB_SEGMENT_TOP_N = _env_int("AB_SEGMENT_TOP_N", 30, 1)
+AB_SEGMENT_FP_SAMPLE_LIMIT = _env_int("AB_SEGMENT_FP_SAMPLE_LIMIT", 20, 0)
+AB_SEGMENT_ENABLE_ARTIFACTS = _env_bool("AB_SEGMENT_ENABLE_ARTIFACTS", False)
+AB_SEGMENT_MIN_VALID_VALUES = _env_int("AB_SEGMENT_MIN_VALID_VALUES", 50, 1)
 
 @dataclass(frozen=True)
 class FilterConfig:
@@ -3414,6 +3452,1029 @@ def section_sybil_interference(rec_a, rec_b):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  SEKCJA 19 — SEGMENT LAB (DISCOVERY ONLY)
+# ══════════════════════════════════════════════════════════════════════════════
+
+SEGMENT_DISCOVERY_DISCLAIMER = (
+    "SEGMENT LAB = DISCOVERY ONLY. Wyniki tej sekcji nie są rekomendacją live. "
+    "Brak świeżej walidacji out-of-sample = NO DEPLOY."
+)
+
+EXCLUDED_SEGMENT_FIELDS = {
+    "ab_record_id",
+    "candidate_id",
+    "pool_id",
+    "mint",
+    "base_mint",
+    "decision_verdict_buy",
+    "gatekeeper_verdict_type",
+    "verdict_type",
+    "phase2_passed",
+    "phase3_passed",
+    "phase4_passed",
+    "phase5_passed",
+    "phase6_passed",
+    "phases_passed",
+    "eval_count",
+    "final_pnl_pct",
+    "r2_label",
+    "r2_outcome",
+    "final_label",
+    "outcome",
+    "target_hit",
+    "stop_hit",
+}
+
+EXCLUDED_SEGMENT_PATTERNS = (
+    "pnl",
+    "profit",
+    "loss",
+    "future",
+    "horizon",
+    "max_return",
+    "min_return",
+    "post_",
+    "after_",
+    "lifecycle_",
+    "timestamp",
+)
+
+SEGMENT_PRIORITY_FIELDS = [
+    "buyer_hhi",
+    "hhi",
+    "buy_count",
+    "unique_buyers",
+    "unique_signers_evaluated",
+    "top1_wallet_share",
+    "top3_volume_pct",
+    "sell_share",
+    "sell_buy_ratio",
+    "sol_buy_ratio",
+    "buy_ratio",
+    "total_volume_sol",
+    "dev_tx_ratio",
+    "dev_volume_ratio",
+    "dev_has_sold",
+    "flipper_presence_ratio",
+    "flip_ratio_10s",
+    "burst_ratio",
+    "timing_entropy",
+    "avg_interval_ms",
+    "current_market_cap_sol",
+    "bonding_progress_pct",
+    "price_change_ratio",
+    "max_single_tx_price_impact_pct_observed",
+    "early_slot_volume_dominance_buy",
+]
+
+SEGMENT_RISK_FIELDS = [
+    "sell_share",
+    "top1_wallet_share",
+    "buyer_hhi",
+    "buy_count",
+    "unique_buyers",
+    "unique_signers_evaluated",
+    "dev_tx_ratio",
+    "dev_volume_ratio",
+    "dev_has_sold",
+    "flipper_presence_ratio",
+    "flip_ratio_10s",
+    "sell_buy_ratio",
+    "top3_volume_pct",
+    "hhi",
+]
+
+SEGMENT_IDENTITY_FIELDS = [
+    "ab_record_id",
+    "pool_id",
+    "mint",
+    "base_mint",
+    "candidate_id",
+]
+
+SEGMENT_CONTEXT_FIELDS = [
+    "gatekeeper_verdict_type",
+    "verdict_type",
+    "decision_verdict_buy",
+]
+
+SEMANTIC_PAIR_TEMPLATES = [
+    ("buyer_hhi", "low", "buy_count", "high"),
+    ("buyer_hhi", "low", "unique_buyers", "high"),
+    ("buyer_hhi", "low", "unique_signers_evaluated", "high"),
+    ("top1_wallet_share", "low", "buy_count", "high"),
+    ("sell_share", "low", "buy_count", "high"),
+    ("dev_tx_ratio", "low", "buy_count", "high"),
+    ("dev_volume_ratio", "low", "buy_count", "high"),
+    ("flipper_presence_ratio", "low", "buy_count", "high"),
+    ("flip_ratio_10s", "low", "buy_count", "high"),
+    ("sell_buy_ratio", "low", "buy_count", "high"),
+    ("timing_entropy", "high", "burst_ratio", "low"),
+    ("timing_entropy", "high", "avg_interval_ms", "low"),
+    ("price_change_ratio", "high", "buy_count", "high"),
+    ("current_market_cap_sol", "high", "buy_count", "high"),
+]
+
+
+def _finite_float(value, allow_bool: bool = False):
+    if isinstance(value, bool):
+        if not allow_bool:
+            return None
+        return 1.0 if value else 0.0
+    if isinstance(value, (int, float)):
+        fv = float(value)
+        return fv if math.isfinite(fv) else None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            fv = float(text)
+        except ValueError:
+            return None
+        return fv if math.isfinite(fv) else None
+    return None
+
+
+def _is_missing_value(value) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, float) and not math.isfinite(value):
+        return True
+    return False
+
+
+def _segment_value(record: dict, field: str):
+    if field not in record:
+        return None
+    return _finite_float(record.get(field), allow_bool=False)
+
+
+def _field_slug(field: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9_]+", "_", str(field)).strip("_")
+    return slug or "field"
+
+
+def _condition_signature(conditions: list[dict]) -> str:
+    normalized = []
+    for condition in conditions:
+        normalized.append({
+            "field": condition.get("field"),
+            "op": condition.get("op"),
+            "value": condition.get("value"),
+        })
+    return json.dumps(normalized, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
+def _condition_to_text(condition: dict) -> str:
+    field = condition.get("field")
+    op = condition.get("op")
+    if op in ("exists", "missing"):
+        return f"{field} {op}"
+    value = condition.get("value")
+    if isinstance(value, float):
+        value_s = f"{value:.6g}"
+    else:
+        value_s = str(value)
+    return f"{field} {op} {value_s}"
+
+
+def _fmt_optional_pct(value, decimals: int = 1) -> str:
+    if value is None:
+        return "N/A"
+    return f"{value * 100:.{decimals}f}%"
+
+
+def _fmt_optional_float(value, decimals: int = 2) -> str:
+    if value is None:
+        return "N/A"
+    return f"{value:.{decimals}f}"
+
+
+def _fmt_display_value(value) -> str:
+    if _is_missing_value(value):
+        return "—"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, float):
+        return f"{value:.6g}" if math.isfinite(value) else "—"
+    return str(value)
+
+
+def is_excluded_segment_field(field: str) -> bool:
+    name = str(field or "").strip()
+    lower = name.lower()
+    if not lower:
+        return True
+    if lower in EXCLUDED_SEGMENT_FIELDS:
+        return True
+    if lower.endswith("_ts_ms"):
+        return True
+    for pattern in EXCLUDED_SEGMENT_PATTERNS:
+        if pattern in lower:
+            return True
+    return False
+
+
+def condition_eval(record: dict, condition: dict) -> dict:
+    field = condition.get("field")
+    op = condition.get("op")
+    expected = condition.get("value")
+    exists = isinstance(record, dict) and field in record
+    actual = record.get(field) if exists else None
+
+    result = {
+        "passed": False,
+        "field": field,
+        "op": op,
+        "expected": expected,
+        "actual": actual,
+        "reason": "fail",
+    }
+
+    if op == "exists":
+        passed = exists and not _is_missing_value(actual)
+        result["passed"] = passed
+        result["reason"] = "pass" if passed else "missing"
+        return result
+
+    if op == "missing":
+        passed = (not exists) or _is_missing_value(actual)
+        result["passed"] = passed
+        result["reason"] = "pass" if passed else "fail"
+        return result
+
+    if not exists or _is_missing_value(actual):
+        result["reason"] = "missing"
+        return result
+
+    if op in (">=", ">", "<=", "<"):
+        actual_num = _finite_float(actual, allow_bool=False)
+        expected_num = _finite_float(expected, allow_bool=False)
+        if actual_num is None or expected_num is None:
+            result["reason"] = "type_error"
+            return result
+        if op == ">=":
+            passed = actual_num >= expected_num
+        elif op == ">":
+            passed = actual_num > expected_num
+        elif op == "<=":
+            passed = actual_num <= expected_num
+        else:
+            passed = actual_num < expected_num
+        result["passed"] = passed
+        result["reason"] = "pass" if passed else "fail"
+        return result
+
+    if op in ("==", "!="):
+        actual_num = _finite_float(actual, allow_bool=True)
+        expected_num = _finite_float(expected, allow_bool=True)
+        if actual_num is not None and expected_num is not None:
+            equal = actual_num == expected_num
+        else:
+            equal = actual == expected
+        passed = equal if op == "==" else not equal
+        result["passed"] = passed
+        result["reason"] = "pass" if passed else "fail"
+        return result
+
+    if op in ("startswith", "not_startswith"):
+        actual_s = str(actual)
+        expected_s = str(expected)
+        starts = actual_s.startswith(expected_s)
+        passed = starts if op == "startswith" else not starts
+        result["passed"] = passed
+        result["reason"] = "pass" if passed else "fail"
+        return result
+
+    if op in ("in", "not_in"):
+        if isinstance(expected, (list, tuple, set)):
+            contains = actual in expected
+        else:
+            contains = actual == expected
+        passed = contains if op == "in" else not contains
+        result["passed"] = passed
+        result["reason"] = "pass" if passed else "fail"
+        return result
+
+    result["reason"] = "unknown_op"
+    return result
+
+
+def condition_passes(record: dict, condition: dict) -> bool:
+    return bool(condition_eval(record, condition).get("passed"))
+
+
+def record_matches_conditions(record: dict, conditions: list[dict]) -> bool:
+    return all(condition_passes(record, condition) for condition in conditions)
+
+
+def segment_verdict(result: dict, min_selected: int | None = None) -> str:
+    if min_selected is None:
+        min_selected = AB_SEGMENT_MIN_SELECTED
+    selected_total = result.get("selected_total", 0)
+    precision_ab = result.get("precision_ab")
+    base_a_rate = result.get("base_a_rate")
+    lift_pp = result.get("lift_pp")
+
+    if selected_total == 0:
+        return "EMPTY_SEGMENT"
+    if selected_total < min_selected:
+        return "TOO_SMALL"
+    if precision_ab is None:
+        return "EMPTY_SEGMENT"
+    if base_a_rate is not None and precision_ab <= base_a_rate:
+        return "BELOW_BASE"
+    if lift_pp is not None and lift_pp >= 15 and selected_total >= 50:
+        return "STRONG_DISCOVERY"
+    if lift_pp is not None and lift_pp >= 15 and selected_total < 50:
+        return "STRONG_BUT_SMALL"
+    if lift_pp is not None and lift_pp >= 10:
+        return "PROMISING"
+    return "WEAK_LIFT"
+
+
+def eval_segment(rec_a: list, rec_b: list, conditions: list[dict],
+                 segment_id: str, segment_meta: dict | None = None) -> dict:
+    selected_a = sum(1 for record in rec_a if record_matches_conditions(record, conditions))
+    selected_b = sum(1 for record in rec_b if record_matches_conditions(record, conditions))
+    selected_total = selected_a + selected_b
+    total_a = len(rec_a)
+    total_b = len(rec_b)
+    total = total_a + total_b
+    not_selected_a = total_a - selected_a
+    not_selected_b = total_b - selected_b
+    base_a_rate = (total_a / total) if total else None
+    precision_ab = (selected_a / selected_total) if selected_total else None
+    lift_pp = ((precision_ab - base_a_rate) * 100) if precision_ab is not None and base_a_rate is not None else None
+    result = {
+        "segment_id": segment_id,
+        "conditions": conditions,
+        "conditions_json": _condition_signature(conditions),
+        "segment_meta": segment_meta or {},
+        "selected_A": selected_a,
+        "selected_B": selected_b,
+        "selected_total": selected_total,
+        "not_selected_A": not_selected_a,
+        "not_selected_B": not_selected_b,
+        "base_a_rate": base_a_rate,
+        "precision_ab": precision_ab,
+        "lift_pp": lift_pp,
+        "coverage_A": (selected_a / total_a) if total_a else None,
+        "coverage_B": (selected_b / total_b) if total_b else None,
+        "selected_rate": (selected_total / total) if total else None,
+        "false_positive_count": selected_b,
+        "true_positive_count": selected_a,
+        "false_negative_count": not_selected_a,
+        "true_negative_count": not_selected_b,
+    }
+    result["verdict"] = segment_verdict(result)
+    return result
+
+
+def field_coverage(records: list[dict], field: str) -> dict:
+    values = [_segment_value(record, field) for record in records]
+    valid_values = [value for value in values if value is not None]
+    n_total = len(records)
+    n_valid = len(valid_values)
+    unique_values = set(valid_values)
+    return {
+        "field": field,
+        "total": n_total,
+        "n_valid": n_valid,
+        "coverage": (n_valid / n_total) if n_total else 0.0,
+        "n_unique_values": len(unique_values),
+        "is_bool_like": bool(unique_values) and unique_values.issubset({0.0, 1.0}),
+        "is_excluded": is_excluded_segment_field(field),
+    }
+
+
+def segment_field_status(rec_a: list[dict], rec_b: list[dict], field: str,
+                         min_valid_values: int = AB_SEGMENT_MIN_VALID_VALUES) -> tuple[bool, dict]:
+    combined = rec_a + rec_b
+    cov_all = field_coverage(combined, field)
+    cov_a = field_coverage(rec_a, field)
+    cov_b = field_coverage(rec_b, field)
+    status = {
+        "field": field,
+        "combined_valid": cov_all["n_valid"],
+        "valid_A": cov_a["n_valid"],
+        "valid_B": cov_b["n_valid"],
+        "combined_coverage": cov_all["coverage"],
+        "n_unique_values": cov_all["n_unique_values"],
+        "reason": "ok",
+    }
+
+    if cov_all["is_excluded"]:
+        status["reason"] = "excluded_field"
+        return False, status
+    if cov_all["is_bool_like"]:
+        status["reason"] = "bool_like"
+        return False, status
+    if cov_all["coverage"] < 0.30:
+        status["reason"] = "low_coverage"
+        return False, status
+    if cov_a["n_valid"] < 20 or cov_b["n_valid"] < 20:
+        status["reason"] = "insufficient_side_values"
+        return False, status
+    if cov_all["n_valid"] < min_valid_values:
+        status["reason"] = "insufficient_valid_values"
+        return False, status
+    if cov_all["n_unique_values"] < 5:
+        status["reason"] = "constant_or_low_cardinality"
+        return False, status
+    return True, status
+
+
+def segment_candidate_fields(rec_a: list[dict], rec_b: list[dict]) -> tuple[list[str], list[dict]]:
+    ordered = []
+    seen = set()
+
+    def add(field):
+        if field not in seen:
+            ordered.append(field)
+            seen.add(field)
+
+    for field in SEGMENT_PRIORITY_FIELDS:
+        add(field)
+    for field, _, _ in KEY_METRICS:
+        add(field)
+    for field in NUMERIC_FIELDS:
+        add(field)
+
+    for record in rec_a + rec_b:
+        for field, value in record.items():
+            if field in seen:
+                continue
+            if _finite_float(value, allow_bool=False) is not None:
+                add(field)
+
+    usable = []
+    skipped = []
+    for field in ordered:
+        ok_field, status = segment_field_status(rec_a, rec_b, field)
+        if ok_field:
+            usable.append(field)
+        else:
+            skipped.append(status)
+    return usable, skipped
+
+
+def quartile_thresholds(records: list[dict], field: str,
+                        min_valid_values: int = AB_SEGMENT_MIN_VALID_VALUES):
+    values = [_segment_value(record, field) for record in records]
+    values = [value for value in values if value is not None]
+    if len(values) < min_valid_values:
+        return None
+    if len(set(values)) < 5:
+        return None
+    return {
+        "field": field,
+        "n": len(values),
+        "q25": percentile(values, 25),
+        "q50": percentile(values, 50),
+        "q75": percentile(values, 75),
+        "min": min(values),
+        "max": max(values),
+    }
+
+
+def _threshold_condition(field: str, direction: str, q_name: str, thresholds: dict) -> dict:
+    if direction == "low":
+        op = "<="
+        key = "q25" if q_name == "q25" else "q50"
+    else:
+        op = ">="
+        key = "q75" if q_name == "q75" else "q50"
+    return {
+        "field": field,
+        "op": op,
+        "value": thresholds[key],
+        "threshold_label": key,
+    }
+
+
+def _segment_id_for_condition(condition: dict) -> str:
+    op_map = {"<=": "lte", ">=": "gte", "<": "lt", ">": "gt", "==": "eq", "!=": "neq"}
+    op = op_map.get(condition.get("op"), str(condition.get("op", "op")))
+    label = condition.get("threshold_label")
+    if not label:
+        label = str(condition.get("value")).replace(".", "_")
+    return f"{_field_slug(condition.get('field'))}_{op}_{label}"
+
+
+def generate_single_feature_quartile_segments(rec_a: list[dict], rec_b: list[dict], fields: list[str]) -> tuple[list[dict], list[dict]]:
+    combined = rec_a + rec_b
+    segments = []
+    skipped = []
+    seen_signatures = set()
+    for field in fields:
+        thresholds = quartile_thresholds(combined, field)
+        if not thresholds:
+            skipped.append({"field": field, "reason": "insufficient_quartile_values"})
+            continue
+        for condition in [
+            {"field": field, "op": "<=", "value": thresholds["q25"], "threshold_label": "q25"},
+            {"field": field, "op": "<=", "value": thresholds["q50"], "threshold_label": "q50"},
+            {"field": field, "op": ">=", "value": thresholds["q50"], "threshold_label": "q50"},
+            {"field": field, "op": ">=", "value": thresholds["q75"], "threshold_label": "q75"},
+        ]:
+            conditions = [condition]
+            signature = _condition_signature(conditions)
+            if signature in seen_signatures:
+                continue
+            seen_signatures.add(signature)
+            segments.append({
+                "segment_id": _segment_id_for_condition(condition),
+                "conditions": conditions,
+                "meta": {"kind": "single_quartile", "thresholds": thresholds},
+            })
+    return segments, skipped
+
+
+def generate_semantic_pair_segments(rec_a: list[dict], rec_b: list[dict]) -> tuple[list[dict], list[dict]]:
+    combined = rec_a + rec_b
+    segments = []
+    skipped = []
+    threshold_cache = {}
+    seen_signatures = set()
+
+    for field1, dir1, field2, dir2 in SEMANTIC_PAIR_TEMPLATES:
+        ok1, status1 = segment_field_status(rec_a, rec_b, field1)
+        ok2, status2 = segment_field_status(rec_a, rec_b, field2)
+        if not ok1:
+            skipped.append({**status1, "template": [field1, dir1, field2, dir2]})
+            continue
+        if not ok2:
+            skipped.append({**status2, "template": [field1, dir1, field2, dir2]})
+            continue
+
+        if field1 not in threshold_cache:
+            threshold_cache[field1] = quartile_thresholds(combined, field1)
+        if field2 not in threshold_cache:
+            threshold_cache[field2] = quartile_thresholds(combined, field2)
+        th1 = threshold_cache[field1]
+        th2 = threshold_cache[field2]
+        if not th1:
+            skipped.append({"field": field1, "reason": "insufficient_quartile_values", "template": [field1, dir1, field2, dir2]})
+            continue
+        if not th2:
+            skipped.append({"field": field2, "reason": "insufficient_quartile_values", "template": [field1, dir1, field2, dir2]})
+            continue
+
+        labels1 = ["q25", "q50"] if dir1 == "low" else ["q50", "q75"]
+        labels2 = ["q25", "q50"] if dir2 == "low" else ["q50", "q75"]
+        for label1 in labels1:
+            for label2 in labels2:
+                c1 = _threshold_condition(field1, dir1, label1, th1)
+                c2 = _threshold_condition(field2, dir2, label2, th2)
+                conditions = [c1, c2]
+                signature = _condition_signature(conditions)
+                if signature in seen_signatures:
+                    continue
+                seen_signatures.add(signature)
+                segments.append({
+                    "segment_id": f"{_segment_id_for_condition(c1)}_AND_{_segment_id_for_condition(c2)}",
+                    "conditions": conditions,
+                    "meta": {
+                        "kind": "semantic_pair",
+                        "template": [field1, dir1, field2, dir2],
+                        "thresholds": {field1: th1, field2: th2},
+                    },
+                })
+    return segments, skipped
+
+
+def eval_ablation(rec_a: list[dict], rec_b: list[dict], segment: dict) -> dict | None:
+    conditions = segment.get("conditions", [])
+    if len(conditions) < 2:
+        return None
+    full = eval_segment(rec_a, rec_b, conditions, segment.get("segment_id", "segment"), segment.get("meta"))
+    if full["selected_total"] < AB_SEGMENT_MIN_SELECTED:
+        return None
+
+    ablations = []
+    full_precision = full.get("precision_ab")
+    full_lift = full.get("lift_pp")
+    for idx, removed in enumerate(conditions):
+        reduced = [condition for j, condition in enumerate(conditions) if j != idx]
+        result = eval_segment(
+            rec_a,
+            rec_b,
+            reduced,
+            f"{segment.get('segment_id', 'segment')}__without_{idx + 1}",
+            {"kind": "ablation", "removed_condition": removed},
+        )
+        precision = result.get("precision_ab")
+        lift = result.get("lift_pp")
+        delta_precision_pp = ((precision - full_precision) * 100) if precision is not None and full_precision is not None else None
+        delta_lift_pp = (lift - full_lift) if lift is not None and full_lift is not None else None
+        delta_selected_total = result["selected_total"] - full["selected_total"]
+
+        if delta_precision_pp is None:
+            interpretation = "condition_redundant"
+        elif delta_precision_pp <= -2.0:
+            interpretation = "condition_helps"
+        elif delta_precision_pp >= 2.0:
+            interpretation = "condition_hurts"
+        elif delta_selected_total >= max(10, int(full["selected_total"] * 0.5)):
+            interpretation = "condition_mostly_reduces_coverage"
+        else:
+            interpretation = "condition_redundant"
+
+        ablations.append({
+            "removed_condition": removed,
+            "result": result,
+            "delta_precision_pp": delta_precision_pp,
+            "delta_lift_pp": delta_lift_pp,
+            "delta_selected_total": delta_selected_total,
+            "interpretation": interpretation,
+        })
+
+    return {"segment_id": segment.get("segment_id"), "full": full, "ablations": ablations}
+
+
+def false_positive_reason_tags(record: dict) -> list[str]:
+    tags = []
+
+    verdict = get_str(record, "gatekeeper_verdict_type") or get_str(record, "verdict_type") or ""
+    if verdict.startswith("HARD_FAIL"):
+        tags.append("HARD_FAIL_RISK")
+
+    sell_share = _segment_value(record, "sell_share")
+    sell_buy_ratio = _segment_value(record, "sell_buy_ratio")
+    if (sell_share is not None and sell_share >= 0.35) or (sell_buy_ratio is not None and sell_buy_ratio >= 0.75):
+        tags.append("SELL_PRESSURE")
+
+    dev_tx_ratio = _segment_value(record, "dev_tx_ratio")
+    dev_volume_ratio = _segment_value(record, "dev_volume_ratio")
+    dev_has_sold = get_bool(record, "dev_has_sold")
+    if (dev_tx_ratio is not None and dev_tx_ratio >= 0.10) or \
+       (dev_volume_ratio is not None and dev_volume_ratio >= 0.10) or dev_has_sold is True:
+        tags.append("DEV_TOXIC")
+
+    buyer_hhi = _segment_value(record, "buyer_hhi")
+    hhi = _segment_value(record, "hhi")
+    top3_volume_pct = _segment_value(record, "top3_volume_pct")
+    if (buyer_hhi is not None and buyer_hhi >= 0.25) or \
+       (hhi is not None and hhi >= 0.25) or \
+       (top3_volume_pct is not None and top3_volume_pct >= 0.60):
+        tags.append("BUYER_CONCENTRATION")
+
+    top1_wallet_share = _segment_value(record, "top1_wallet_share")
+    if top1_wallet_share is not None and top1_wallet_share >= 0.35:
+        tags.append("TOP_WALLET_DOMINANCE")
+
+    buy_count = _segment_value(record, "buy_count")
+    unique_buyers = _segment_value(record, "unique_buyers")
+    unique_signers = _segment_value(record, "unique_signers_evaluated")
+    if (buy_count is not None and buy_count < 10) or \
+       (unique_buyers is not None and unique_buyers < 5) or \
+       (unique_signers is not None and unique_signers < 5):
+        tags.append("LOW_BUY_ACTIVITY")
+
+    flipper_presence_ratio = _segment_value(record, "flipper_presence_ratio")
+    flip_ratio_10s = _segment_value(record, "flip_ratio_10s")
+    if (flipper_presence_ratio is not None and flipper_presence_ratio >= 0.25) or \
+       (flip_ratio_10s is not None and flip_ratio_10s >= 0.20):
+        tags.append("FLIPPER_HEAVY")
+
+    missing_risk = sum(1 for field in SEGMENT_RISK_FIELDS if field not in record or _is_missing_value(record.get(field)))
+    if missing_risk >= max(4, len(SEGMENT_RISK_FIELDS) // 2):
+        tags.append("MISSING_CONTEXT")
+
+    return tags or ["UNKNOWN"]
+
+
+def false_positive_sample(rec_b: list[dict], conditions: list[dict], limit: int = 20) -> list[dict]:
+    fields = [condition.get("field") for condition in conditions]
+    samples = []
+    for record in rec_b:
+        if not record_matches_conditions(record, conditions):
+            continue
+        sample = {
+            "identity": {field: record.get(field) for field in SEGMENT_IDENTITY_FIELDS},
+            "context": {field: record.get(field) for field in SEGMENT_CONTEXT_FIELDS},
+            "segment_values": {field: record.get(field) for field in fields},
+            "risk_values": {field: record.get(field) for field in SEGMENT_RISK_FIELDS},
+            "tags": false_positive_reason_tags(record),
+        }
+        samples.append(sample)
+        if len(samples) >= limit:
+            break
+    return samples
+
+
+def false_positive_tag_distribution(rec_b: list[dict], conditions: list[dict]) -> Counter:
+    tag_counter = Counter()
+    for record in rec_b:
+        if record_matches_conditions(record, conditions):
+            tag_counter.update(false_positive_reason_tags(record))
+    return tag_counter
+
+
+def _sort_segment_results(results: list[dict]) -> list[dict]:
+    return sorted(
+        results,
+        key=lambda row: (
+            row.get("lift_pp") if row.get("lift_pp") is not None else float("-inf"),
+            row.get("selected_total", 0),
+            row.get("precision_ab") if row.get("precision_ab") is not None else float("-inf"),
+        ),
+        reverse=True,
+    )
+
+
+def _print_segment_table(results: list[dict], limit: int):
+    print(f"  {C.DIM}{'#':>3} {'segment_id':<54} {'A':>5} {'B':>5} {'total':>6}"
+          f" {'precision':>10} {'base':>8} {'lift_pp':>8} {'cov_A':>8} {'cov_B':>8} {'verdict':<18}{C.RESET}")
+    print(f"  {'─'*138}")
+    for idx, result in enumerate(results[:limit], 1):
+        precision = _fmt_optional_pct(result.get("precision_ab"))
+        base = _fmt_optional_pct(result.get("base_a_rate"))
+        lift = _fmt_optional_float(result.get("lift_pp"))
+        cov_a = _fmt_optional_pct(result.get("coverage_A"))
+        cov_b = _fmt_optional_pct(result.get("coverage_B"))
+        print(f"  {idx:>3}. {C.DIM}{result['segment_id'][:53]:<54}{C.RESET}"
+              f" {result['selected_A']:>5} {result['selected_B']:>5} {result['selected_total']:>6}"
+              f" {precision:>10} {base:>8} {lift:>8} {cov_a:>8} {cov_b:>8}"
+              f" {result['verdict']:<18}")
+
+
+def _segment_row_for_csv(result: dict) -> dict:
+    return {
+        "segment_id": result.get("segment_id"),
+        "conditions_json": result.get("conditions_json") or _condition_signature(result.get("conditions", [])),
+        "selected_A": result.get("selected_A"),
+        "selected_B": result.get("selected_B"),
+        "selected_total": result.get("selected_total"),
+        "not_selected_A": result.get("not_selected_A"),
+        "not_selected_B": result.get("not_selected_B"),
+        "base_a_rate": result.get("base_a_rate"),
+        "precision_ab": result.get("precision_ab"),
+        "lift_pp": result.get("lift_pp"),
+        "coverage_A": result.get("coverage_A"),
+        "coverage_B": result.get("coverage_B"),
+        "selected_rate": result.get("selected_rate"),
+        "false_positive_count": result.get("false_positive_count"),
+        "true_positive_count": result.get("true_positive_count"),
+        "false_negative_count": result.get("false_negative_count"),
+        "true_negative_count": result.get("true_negative_count"),
+        "verdict": result.get("verdict"),
+    }
+
+
+def _write_csv(path: Path, rows: list[dict]) -> None:
+    fieldnames = [
+        "segment_id", "conditions_json", "selected_A", "selected_B", "selected_total",
+        "not_selected_A", "not_selected_B", "base_a_rate", "precision_ab", "lift_pp",
+        "coverage_A", "coverage_B", "selected_rate", "false_positive_count",
+        "true_positive_count", "false_negative_count", "true_negative_count", "verdict",
+        "removed_condition", "delta_precision_pp", "delta_lift_pp",
+        "delta_selected_total", "interpretation",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for row_data in rows:
+            writer.writerow(row_data)
+
+
+def write_segment_lab_artifacts(out_dir: Path, single_results: list[dict], pair_results: list[dict],
+                                ablation_results: list[dict], fp_samples: list[dict],
+                                summary: dict) -> dict:
+    ts_file = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    paths = {
+        "single_feature_segments": out_dir / f"segment_lab_single_feature_segments_{ts_file}.csv",
+        "pair_segments": out_dir / f"segment_lab_pair_segments_{ts_file}.csv",
+        "ablation": out_dir / f"segment_lab_ablation_{ts_file}.csv",
+        "false_positive_sample": out_dir / f"segment_lab_false_positive_sample_{ts_file}.jsonl",
+        "summary": out_dir / f"segment_lab_summary_{ts_file}.json",
+    }
+
+    _write_csv(paths["single_feature_segments"], [_segment_row_for_csv(row) for row in single_results])
+    _write_csv(paths["pair_segments"], [_segment_row_for_csv(row) for row in pair_results])
+
+    ablation_rows = []
+    for ablation in ablation_results:
+        for item in ablation.get("ablations", []):
+            row_data = _segment_row_for_csv(item["result"])
+            row_data["segment_id"] = ablation.get("segment_id")
+            row_data["removed_condition"] = json.dumps(item.get("removed_condition"), sort_keys=True, ensure_ascii=False)
+            row_data["delta_precision_pp"] = item.get("delta_precision_pp")
+            row_data["delta_lift_pp"] = item.get("delta_lift_pp")
+            row_data["delta_selected_total"] = item.get("delta_selected_total")
+            row_data["interpretation"] = item.get("interpretation")
+            ablation_rows.append(row_data)
+    _write_csv(paths["ablation"], ablation_rows)
+
+    with paths["false_positive_sample"].open("w", encoding="utf-8") as f:
+        for sample in fp_samples:
+            f.write(json.dumps(sample, ensure_ascii=False, sort_keys=True) + "\n")
+
+    summary_with_paths = {**summary, "artifact_paths": {key: str(value) for key, value in paths.items()}}
+    paths["summary"].write_text(json.dumps(summary_with_paths, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    return {key: str(value) for key, value in paths.items()}
+
+
+def section_segment_lab(rec_a: list[dict], rec_b: list[dict], path_a: str | None = None, path_b: str | None = None):
+    hdr("🧪 SEKCJA 19: SEGMENT LAB — SEGMENTY, FALSE POSITIVES, ABLATION, QUARTILE SCANS", C.CYAN)
+    warn(SEGMENT_DISCOVERY_DISCLAIMER)
+    hint("Segment Lab nie buduje runtime edge. Każdy wynik wymaga świeżej walidacji out-of-sample.")
+
+    total_a, total_b = len(rec_a), len(rec_b)
+    total = total_a + total_b
+    if total_a == 0 or total_b == 0 or total == 0:
+        bad("DATA_INSUFFICIENT_FOR_SEGMENT_LAB — pusty zbiór A lub B.")
+        return {"final_verdict": "DATA_INSUFFICIENT_FOR_SEGMENT_LAB"}
+
+    base_a_rate = total_a / total
+    sub("19.1 Baseline")
+    row("A rows", str(total_a), C.CYAN)
+    row("B rows", str(total_b), C.MAGENTA)
+    row("base A-rate", f"{base_a_rate * 100:.2f}%", C.WHITE)
+    row("min selected", str(AB_SEGMENT_MIN_SELECTED), C.WHITE)
+    row("min valid values", str(AB_SEGMENT_MIN_VALID_VALUES), C.WHITE)
+
+    fields, skipped_fields = segment_candidate_fields(rec_a, rec_b)
+    if not fields:
+        bad("DATA_INSUFFICIENT_FOR_SEGMENT_LAB — brak pól po filtrze leakage/coverage.")
+        return {"final_verdict": "DATA_INSUFFICIENT_FOR_SEGMENT_LAB"}
+
+    sub("19.2 Field safety gate")
+    row("usable segment fields", str(len(fields)), C.GREEN)
+    skipped_counter = Counter(item.get("reason", "unknown") for item in skipped_fields)
+    if skipped_counter:
+        top_skipped = ", ".join(f"{reason}={count}" for reason, count in skipped_counter.most_common(8))
+        hint(f"Skipped fields: {top_skipped}")
+    hint("Blacklist blokuje label/outcome/future/decision/identity/timestamp fields przed scanem segmentów.")
+
+    single_segments, single_skipped = generate_single_feature_quartile_segments(rec_a, rec_b, fields)
+    single_results = _sort_segment_results([
+        eval_segment(rec_a, rec_b, segment["conditions"], segment["segment_id"], segment.get("meta"))
+        for segment in single_segments
+    ])
+    visible_single = [row_data for row_data in single_results if row_data["selected_total"] >= AB_SEGMENT_MIN_SELECTED]
+
+    sub("19.3 Top single-feature quartile segments")
+    if visible_single:
+        _print_segment_table(visible_single, 20)
+    else:
+        warn("Brak single-feature segmentów spełniających min selected.")
+    if single_skipped:
+        hint(f"Single quartile skipped: {len(single_skipped)}")
+
+    pair_segments, pair_skipped = generate_semantic_pair_segments(rec_a, rec_b)
+    pair_results = _sort_segment_results([
+        eval_segment(rec_a, rec_b, segment["conditions"], segment["segment_id"], segment.get("meta"))
+        for segment in pair_segments
+    ])
+    visible_pair = [row_data for row_data in pair_results if row_data["selected_total"] >= AB_SEGMENT_MIN_SELECTED]
+
+    sub("19.4 Top semantic pair segments")
+    hint("Tylko whitelistowane pary semantyczne. Brak trójek i brak pełnego grid-fishingu.")
+    if visible_pair:
+        _print_segment_table(visible_pair, AB_SEGMENT_TOP_N)
+    else:
+        warn("Brak pair segmentów spełniających min selected.")
+    if pair_skipped:
+        skipped_pair_counter = Counter(item.get("reason", "unknown") for item in pair_skipped)
+        hint("Pair skipped: " + ", ".join(f"{reason}={count}" for reason, count in skipped_pair_counter.most_common()))
+
+    sub("19.5 Candidate watchlist do świeżej walidacji")
+    watchlist = [
+        result for result in visible_pair
+        if result["selected_total"] >= 30
+        and result.get("lift_pp") is not None and result["lift_pp"] >= 10
+        and result.get("precision_ab") is not None
+        and result.get("base_a_rate") is not None
+        and result["precision_ab"] > result["base_a_rate"]
+    ][:5]
+    if not watchlist:
+        warn("Brak kandydatów watchlist. To nie znaczy, że nie ma sygnału; ten A/B nie wspiera prostych pair segmentów.")
+    for result in watchlist:
+        print(f"\n  {C.BOLD}{result['segment_id']}{C.RESET}")
+        row("conditions", " AND ".join(_condition_to_text(c) for c in result["conditions"]), C.WHITE, indent=6)
+        row("selected_A / selected_B", f"{result['selected_A']} / {result['selected_B']}", C.WHITE, indent=6)
+        row("precision / lift", f"{_fmt_optional_pct(result['precision_ab'])} / {_fmt_optional_float(result['lift_pp'])}pp", C.WHITE, indent=6)
+        row("coverage_A / coverage_B", f"{_fmt_optional_pct(result['coverage_A'])} / {_fmt_optional_pct(result['coverage_B'])}", C.WHITE, indent=6)
+        row("verdict", result["verdict"], C.YELLOW, indent=6)
+    hint("Watchlist = hipotezy do walidacji, nie reguły bota.")
+
+    segment_lookup = {segment["segment_id"]: segment for segment in pair_segments}
+    ablation_results = []
+    sub("19.6 Ablation for top candidates")
+    print(f"  {C.DIM}{'segment_id':<44} {'removed_condition':<38} {'A':>5} {'B':>5}"
+          f" {'precision':>10} {'lift_pp':>8} {'dPrec':>8} {'dTotal':>8} {'interpretation':<32}{C.RESET}")
+    print(f"  {'─'*162}")
+    for result in watchlist[:3]:
+        segment = segment_lookup.get(result["segment_id"])
+        if not segment:
+            continue
+        ablation = eval_ablation(rec_a, rec_b, segment)
+        if not ablation:
+            continue
+        ablation_results.append(ablation)
+        for item in ablation["ablations"]:
+            removed = _condition_to_text(item["removed_condition"])
+            reduced = item["result"]
+            print(f"  {result['segment_id'][:43]:<44} {removed[:37]:<38}"
+                  f" {reduced['selected_A']:>5} {reduced['selected_B']:>5}"
+                  f" {_fmt_optional_pct(reduced.get('precision_ab')):>10}"
+                  f" {_fmt_optional_float(reduced.get('lift_pp')):>8}"
+                  f" {_fmt_optional_float(item.get('delta_precision_pp')):>8}"
+                  f" {item.get('delta_selected_total'):>8}"
+                  f" {item.get('interpretation'):<32}")
+    if not ablation_results:
+        warn("Brak ablation: top kandydaci są zbyt mali albo nie mają ≥2 warunków.")
+
+    fp_artifact_rows = []
+    sub("19.7 False positive sample")
+    hint("FP = rekord B spełniający segment. Brakujące pola pokazywane są jako —, nigdy jako 0.")
+    for result in watchlist[:3]:
+        samples = false_positive_sample(rec_b, result["conditions"], AB_SEGMENT_FP_SAMPLE_LIMIT)
+        if not samples:
+            note(f"{result['segment_id']}: brak FP w limicie próbek.")
+            continue
+        fields = [condition.get("field") for condition in result["conditions"]]
+        print(f"\n  {C.BOLD}{result['segment_id']}{C.RESET}")
+        print(f"  {C.DIM}{'record_id/pool/mint':<44} {'gatekeeper/verdict':<34} {'segment_values':<50} {'risk_tags'}{C.RESET}")
+        print(f"  {'─'*150}")
+        for sample in samples:
+            ident = sample["identity"]
+            context = sample["context"]
+            ident_s = "/".join(_fmt_display_value(ident.get(field)) for field in ["ab_record_id", "pool_id", "mint"])
+            verdict_s = f"{_fmt_display_value(context.get('gatekeeper_verdict_type'))}/{_fmt_display_value(context.get('verdict_type'))}"
+            values_s = ", ".join(f"{field}={_fmt_display_value(sample['segment_values'].get(field))}" for field in fields)
+            tags_s = ",".join(sample["tags"])
+            print(f"  {ident_s[:43]:<44} {verdict_s[:33]:<34} {values_s[:49]:<50} {tags_s}")
+            fp_artifact_rows.append({"segment_id": result["segment_id"], **sample})
+
+    sub("19.8 False positive tag distribution")
+    hint("FP tags are diagnostic heuristics, not candidate rules.")
+    for result in watchlist[:3]:
+        tag_counter = false_positive_tag_distribution(rec_b, result["conditions"])
+        if not tag_counter:
+            note(f"{result['segment_id']}: no false positives.")
+            continue
+        tags_s = "  ".join(f"{tag}: {count}" for tag, count in tag_counter.most_common())
+        print(f"  {C.DIM}{result['segment_id'][:48]:<48}{C.RESET} {tags_s}")
+
+    strong = [
+        row_data for row_data in pair_results + single_results
+        if row_data.get("lift_pp") is not None and row_data["lift_pp"] >= 15 and row_data["selected_total"] >= 50
+    ]
+    promising = [
+        row_data for row_data in pair_results + single_results
+        if row_data.get("lift_pp") is not None and row_data["lift_pp"] >= 10 and row_data["selected_total"] >= 30
+    ]
+    if strong:
+        final_verdict = "STRONG_DISCOVERY_REQUIRES_FRESH_VALIDATION"
+    elif promising:
+        final_verdict = "PROMISING_DISCOVERY_SEGMENTS_FOUND"
+    else:
+        final_verdict = "NO_PROMOTABLE_SEGMENT_FROM_THIS_A_B"
+
+    sub("19.9 Final Segment Lab verdict")
+    if final_verdict == "STRONG_DISCOVERY_REQUIRES_FRESH_VALIDATION":
+        warn(final_verdict)
+    elif final_verdict == "PROMISING_DISCOVERY_SEGMENTS_FOUND":
+        warn(final_verdict)
+    else:
+        note(final_verdict)
+    warn("NO DEPLOY WITHOUT OUT-OF-SAMPLE VALIDATION.")
+
+    summary = {
+        "final_verdict": final_verdict,
+        "disclaimer": SEGMENT_DISCOVERY_DISCLAIMER,
+        "baseline": {"A": total_a, "B": total_b, "base_a_rate": base_a_rate},
+        "env": {
+            "AB_SEGMENT_MIN_SELECTED": AB_SEGMENT_MIN_SELECTED,
+            "AB_SEGMENT_TOP_N": AB_SEGMENT_TOP_N,
+            "AB_SEGMENT_FP_SAMPLE_LIMIT": AB_SEGMENT_FP_SAMPLE_LIMIT,
+            "AB_SEGMENT_MIN_VALID_VALUES": AB_SEGMENT_MIN_VALID_VALUES,
+        },
+        "usable_fields": fields,
+        "skipped_field_reasons": dict(skipped_counter),
+        "single_skipped_count": len(single_skipped),
+        "pair_skipped_count": len(pair_skipped),
+        "watchlist": watchlist,
+    }
+
+    if AB_SEGMENT_ENABLE_ARTIFACTS:
+        out_dir = Path(path_a).parent if path_a else Path.cwd()
+        try:
+            paths = write_segment_lab_artifacts(out_dir, single_results, pair_results, ablation_results, fp_artifact_rows, summary)
+            sub("19.10 Segment Lab artifacts")
+            for key, path in paths.items():
+                row(key, path, C.CYAN)
+        except Exception as exc:
+            warn(f"Nie udało się zapisać artefaktów Segment Lab: {exc}")
+
+    return summary
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  MAIN  (na końcu pliku — wszystkie sekcje 1–18 już zdefiniowane powyżej)
 # ══════════════════════════════════════════════════════════════════════════════
 DEFAULT_DIR = Path("/root/Ghost/logs/decisions.jsonl")
@@ -3452,11 +4513,12 @@ def main():
 
     print(f"\n{C.BOLD}{C.MAGENTA}")
     print("  ╔═══════════════════════════════════════════════════════════════════════════╗")
-    print("  ║       📊 ANALIZA PORÓWNAWCZA ZBIORÓW A vs B  v5.0                        ║")
+    print("  ║       📊 ANALIZA PORÓWNAWCZA ZBIORÓW A vs B  v5.1                        ║")
     print("  ║  Spearman · Cohen d · MW-U · DTW · Causal PC · TDA · Hill · MI           ║")
     print("  ║  NEW: Youden J · KS · AUC · Bhattacharyya · LR L1 · Bootstrap CI        ║")
     print("  ║  NEW: Scoring Rule · Decision Rules · Ready-to-implement thresholds      ║")
     print("  ║  v5.0: SYBIL INTERFERENCE — FTDI/DBIA/SFD/DES/CPV/FSC analysis         ║")
+    print("  ║  v5.1: SEGMENT LAB — discovery-only segments, FP, ablation             ║")
     print("  ╚═══════════════════════════════════════════════════════════════════════════╝")
     print(C.RESET)
     note(f"Zbiór A (raw): {path_a}  ({len(rec_a_raw)} rekordów)")
@@ -3540,6 +4602,12 @@ def main():
 
     # SEKCJA 18: Sybil Interference (zawsze — czyste Python, bez dep zewnętrznych)
     section_sybil_interference(rec_a, rec_b)
+
+    # SEKCJA 19: Segment Lab (discovery-only, bez runtime edge)
+    if AB_SEGMENT_LAB:
+        section_segment_lab(rec_a, rec_b, path_a, path_b)
+    else:
+        hint("SEKCJA 19 Segment Lab wyłączona przez AB_SEGMENT_LAB=0")
 
     # SEKCJA 5: Podsumowanie (zawsze na końcu)
     section_summary(rec_a, rec_b, disc_scores)

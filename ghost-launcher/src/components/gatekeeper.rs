@@ -1,7 +1,7 @@
 use super::gatekeeper_policy::{
     build_assessment_from_features, build_sybil_policy_diagnostics, evaluate_curve_gate,
-    evaluate_policy_from_assessment, sybil_combo_veto_reason, CurveGateOutcome,
-    PolicyEvaluationContext,
+    evaluate_policy_from_assessment, strict_metric_threshold_failure_from_assessment,
+    sybil_combo_veto_reason, CurveGateOutcome, PolicyEvaluationContext,
 };
 use crate::components::gatekeeper_adaptive_prosperity::ApsDiagnostics;
 use crate::components::gatekeeper_pdd::{PddDiagnostics, PddHardFail};
@@ -3075,6 +3075,8 @@ impl GatekeeperAssessment {
             min_demand_elasticity_score: config.min_demand_elasticity_score,
             signer_cross_pool_velocity: sybil.signer_cross_pool_velocity,
             max_signer_cross_pool_velocity: config.max_signer_cross_pool_velocity,
+            cpv_distinct_other_pools_mean: sybil.cpv_distinct_other_pools_mean,
+            cpv_other_pool_activity_count_p95: sybil.cpv_other_pool_activity_count_p95,
             funding_source_concentration: sybil.funding_source_concentration,
             max_funding_source_concentration: config.max_funding_source_concentration,
             funding_source_diagnostics: sybil.funding_source_diagnostics.clone(),
@@ -3083,6 +3085,8 @@ impl GatekeeperAssessment {
             shadow_fsc_v2_soft_points_if_enabled: shadow_fsc_v2.soft_points_if_enabled,
             shadow_fsc_v2_reason_if_enabled: shadow_fsc_v2.reason_if_enabled,
             sybil_metric_degraded_reasons: sybil.degraded_reasons.clone(),
+            toolchain_fingerprint_coverage: sybil.toolchain_fingerprint_coverage,
+            des_valid_sequence_coverage: sybil.des_valid_sequence_coverage,
 
             // A/B Window – defaults; enriched by oracle_runtime before logging
             ab_window_ms: None,
@@ -5533,6 +5537,7 @@ impl GatekeeperBuffer {
                 compute_velocity_profile(&self.tx_timestamps_sorted, self.config.max_wait_time_ms);
             let phase2_passed = velocity.interval_cv >= self.config.min_interval_cv
                 && velocity.interval_cv <= self.config.max_interval_cv
+                && velocity.burst_ratio >= self.config.min_burst_ratio
                 && velocity.burst_ratio <= self.config.max_burst_ratio
                 && velocity.avg_interval_ms >= self.config.min_avg_interval_ms
                 && velocity.avg_interval_ms <= self.config.max_avg_interval_ms
@@ -5930,6 +5935,13 @@ impl GatekeeperBuffer {
         // HF-9: Extreme bot timing (machine-gun pattern)
         // Guard: only trigger hard-fail with sufficient data (min TX + min observation window).
         // With small n, timing stats are unreliable → soft flags still catch this.
+        if hard_fail_reason.is_none() {
+            if let Some(reason) = strict_metric_threshold_failure_from_assessment(assessment, cfg) {
+                hard_fail_reason = Some(reason);
+                hard_fail_reason_code = Some(GatekeeperReasonCode::HardFailStrictMetricThreshold);
+            }
+        }
+
         if hard_fail_reason.is_none() {
             if let Some(ref vel) = assessment.phase2_velocity {
                 if vel.interval_cv < 0.08
@@ -6655,6 +6667,7 @@ impl GatekeeperBuffer {
             compute_velocity_profile(&self.tx_timestamps_sorted, self.config.max_wait_time_ms);
         let phase2_passed = velocity.interval_cv >= self.config.min_interval_cv
             && velocity.interval_cv <= self.config.max_interval_cv
+            && velocity.burst_ratio >= self.config.min_burst_ratio
             && velocity.burst_ratio <= self.config.max_burst_ratio
             && velocity.avg_interval_ms >= self.config.min_avg_interval_ms
             && velocity.avg_interval_ms <= self.config.max_avg_interval_ms
@@ -8147,8 +8160,47 @@ impl GatekeeperBuffer {
             };
         }
 
-        // Phase 1 never met → Timeout
+        // Phase 1 never met. Normal profiles preserve historical TIMEOUT semantics.
+        // Strict metric probe profiles require every configured threshold to be
+        // satisfied, so count-threshold misses are terminal REJECTs.
         let mut assessment = self.build_minimal_assessment();
+        if self.config.strict_metric_threshold_gate_enabled {
+            assessment.terminal_reason_code = Some(GatekeeperReasonCode::RejectCoreFail);
+            self.rejected = true;
+            let breakdown = Self::format_phase_breakdown(&assessment);
+            let elapsed_ms = now_ms.saturating_sub(self.registered_wall_ts_ms);
+            let reason = format!(
+                "CORE_FAIL: Phase1 (tx={}/{} signers={}/{} buys={}/{})",
+                self.total_tx_count,
+                self.config.min_tx_count,
+                self.unique_signers.len(),
+                self.config.min_unique_signers,
+                self.buy_count,
+                self.config.min_buy_count,
+            );
+            tracing::info!(
+                pool = %self.pool_id,
+                tx_count = self.total_tx_count,
+                unique_signers = self.unique_signers.len(),
+                buy_count = self.buy_count,
+                elapsed_ms = elapsed_ms,
+                phases = %breakdown,
+                deadline_wall_ts_ms = self.deadline_wall_ts_ms,
+                reason = %reason,
+                "🚫 GATEKEEPER V2 REJECTED (Strict Phase 1 threshold miss) {}",
+                breakdown
+            );
+            self.record_deadline_finalize_metrics("standard", "reject", now_ms);
+            self.attach_terminal_decision_eval_snapshot(
+                &mut assessment,
+                now_ms,
+                "deadline",
+                Some("REJECT".to_string()),
+                Some(GatekeeperReasonCode::RejectCoreFail.as_log_str()),
+                Some(reason.clone()),
+            );
+            return Some(GatekeeperVerdict::Reject { assessment, reason });
+        }
         assessment.terminal_reason_code = Some(if self.total_tx_count == 0 {
             GatekeeperReasonCode::TimeoutPhase1NoData
         } else {
@@ -8215,9 +8267,48 @@ impl GatekeeperBuffer {
         let has_enough_buys = self.buy_count >= self.config.min_buy_count;
 
         if !(has_enough_tx && has_enough_signers && has_enough_buys) {
-            // Phase 1 never met → Timeout
+            // Phase 1 never met. Normal profiles preserve historical TIMEOUT
+            // semantics. Strict metric probe profiles require every configured
+            // threshold to be satisfied, so count-threshold misses are REJECTs.
             let mut assessment = self.build_minimal_assessment();
             assessment.v25_shadow_decisions = self.v25_shadow_decisions.clone();
+            if self.config.strict_metric_threshold_gate_enabled {
+                assessment.terminal_reason_code = Some(GatekeeperReasonCode::RejectCoreFail);
+                self.rejected = true;
+                let breakdown = Self::format_phase_breakdown(&assessment);
+                let reason = format!(
+                    "CORE_FAIL: Phase1 (tx={}/{} signers={}/{} buys={}/{})",
+                    self.total_tx_count,
+                    self.config.min_tx_count,
+                    self.unique_signers.len(),
+                    self.config.min_unique_signers,
+                    self.buy_count,
+                    self.config.min_buy_count,
+                );
+                tracing::info!(
+                    pool = %self.pool_id,
+                    tx_count = self.total_tx_count,
+                    unique_signers = self.unique_signers.len(),
+                    buy_count = self.buy_count,
+                    elapsed_ms = now_ms.saturating_sub(self.registered_wall_ts_ms),
+                    mode = "long",
+                    phases = %breakdown,
+                    deadline_wall_ts_ms = self.deadline_wall_ts_ms,
+                    reason = %reason,
+                    "🚫 GATEKEEPER V2 LONG REJECTED (Strict Phase 1 threshold miss) {}",
+                    breakdown
+                );
+                self.record_deadline_finalize_metrics("long", "reject", now_ms);
+                self.attach_terminal_decision_eval_snapshot(
+                    &mut assessment,
+                    now_ms,
+                    "deadline",
+                    Some("REJECT".to_string()),
+                    Some(GatekeeperReasonCode::RejectCoreFail.as_log_str()),
+                    Some(reason.clone()),
+                );
+                return GatekeeperVerdict::Reject { assessment, reason };
+            }
             assessment.terminal_reason_code = Some(if self.total_tx_count == 0 {
                 GatekeeperReasonCode::TimeoutPhase1NoData
             } else {
@@ -12505,6 +12596,70 @@ mod tests {
         );
     }
 
+    /// Long mode + strict metric gate: Phase 1 misses are REJECT, not TIMEOUT.
+    #[test]
+    fn test_long_mode_strict_metric_gate_rejects_phase1_threshold_miss() {
+        let pool_id = Pubkey::new_unique();
+        let mut cfg = long_mode_config();
+        cfg.strict_metric_threshold_gate_enabled = true;
+        cfg.min_tx_count = 20; // require 20 TX — we'll only send 5 before deadline
+        cfg.min_unique_signers = 2;
+        cfg.min_buy_count = 2;
+        let mut gk = GatekeeperBuffer::new(pool_id, &cfg);
+        gk.set_registered_wall_t0(1_000);
+
+        for i in 0..5 {
+            let tx = make_tx(
+                1000 + i * 500,
+                &format!("long_strict_to_{}", i),
+                &format!("strict_signer_{}", i),
+                true,
+                1.0,
+                None,
+                None,
+                None,
+            );
+            let v = gk.on_transaction(Arc::new(tx));
+            assert!(matches!(v, GatekeeperVerdict::Wait));
+        }
+
+        let deadline_tx = make_tx(
+            12000,
+            "long_strict_to_deadline",
+            "strict_signer_99",
+            true,
+            1.0,
+            None,
+            None,
+            None,
+        );
+        let verdict = gk.on_transaction(Arc::new(deadline_tx));
+        match verdict {
+            GatekeeperVerdict::Reject { assessment, reason } => {
+                assert!(
+                    reason.contains("CORE_FAIL: Phase1"),
+                    "unexpected strict reject reason: {}",
+                    reason
+                );
+                assert_eq!(
+                    assessment.terminal_reason_code,
+                    Some(GatekeeperReasonCode::RejectCoreFail)
+                );
+            }
+            other => panic!(
+                "Expected strict Phase 1 miss to Reject, got {:?}",
+                match &other {
+                    GatekeeperVerdict::Wait => "Wait",
+                    GatekeeperVerdict::Timeout { .. } => "Timeout",
+                    GatekeeperVerdict::Buy { .. } => "Buy",
+                    GatekeeperVerdict::ApprovedTx { .. } => "ApprovedTx",
+                    GatekeeperVerdict::Reject { .. } => "Reject",
+                    GatekeeperVerdict::PendingCurve => "PendingCurve",
+                }
+            ),
+        }
+    }
+
     /// Long mode: Reject when Phase 1 is met but not enough phases pass.
     #[test]
     fn test_long_mode_reject_insufficient_phases() {
@@ -13911,10 +14066,10 @@ mod tests {
                 },
             ),
             funding_source_v2: Some(fsc_v2),
-            cpv_distinct_other_pools_mean: None,
-            cpv_other_pool_activity_count_p95: None,
-            toolchain_fingerprint_coverage: None,
-            des_valid_sequence_coverage: None,
+            cpv_distinct_other_pools_mean: Some(1.25),
+            cpv_other_pool_activity_count_p95: Some(3.0),
+            toolchain_fingerprint_coverage: Some(0.8),
+            des_valid_sequence_coverage: Some(0.75),
             degraded_reasons: vec!["FTDI_INSUFFICIENT_BUYS".to_string()],
             buy_sample_count: 5,
             signer_sample_count: 5,
@@ -14018,6 +14173,8 @@ mod tests {
         assert_eq!(buy_log.min_demand_elasticity_score, -1.0);
         assert_eq!(buy_log.signer_cross_pool_velocity, Some(0.44));
         assert_eq!(buy_log.max_signer_cross_pool_velocity, 1.0);
+        assert_eq!(buy_log.cpv_distinct_other_pools_mean, Some(1.25));
+        assert_eq!(buy_log.cpv_other_pool_activity_count_p95, Some(3.0));
         assert_eq!(buy_log.funding_source_concentration, Some(0.52));
         assert_eq!(buy_log.max_funding_source_concentration, 1.0);
         assert!(buy_log.funding_source_diagnostics.is_some());
@@ -14040,6 +14197,8 @@ mod tests {
             buy_log.sybil_metric_degraded_reasons,
             vec!["FTDI_INSUFFICIENT_BUYS".to_string()]
         );
+        assert_eq!(buy_log.toolchain_fingerprint_coverage, Some(0.8));
+        assert_eq!(buy_log.des_valid_sequence_coverage, Some(0.75));
 
         let json = serde_json::to_string(&buy_log).unwrap();
         assert!(json.contains("\"sell_buy_ratio\":0.6"));
@@ -14061,6 +14220,8 @@ mod tests {
         assert!(json.contains("\"spend_fraction_divergence\":0.27"));
         assert!(json.contains("\"demand_elasticity_score\":-0.25"));
         assert!(json.contains("\"signer_cross_pool_velocity\":0.44"));
+        assert!(json.contains("\"cpv_distinct_other_pools_mean\":1.25"));
+        assert!(json.contains("\"cpv_other_pool_activity_count_p95\":3.0"));
         assert!(json.contains("\"funding_source_concentration\":0.52"));
         assert!(json.contains("\"funding_source_v2\""));
         assert!(json.contains("\"coverage_window_ready\":true"));
@@ -14068,6 +14229,8 @@ mod tests {
         assert!(json.contains("\"funding_source_diagnostics\""));
         assert!(json.contains("\"FSC_GLOBAL_RECIPIENT_EVICTED\""));
         assert!(json.contains("\"sybil_metric_degraded_reasons\":[\"FTDI_INSUFFICIENT_BUYS\"]"));
+        assert!(json.contains("\"toolchain_fingerprint_coverage\":0.8"));
+        assert!(json.contains("\"des_valid_sequence_coverage\":0.75"));
         let mut legacy_json: serde_json::Value = serde_json::from_str(&json).unwrap();
         let legacy_fsc_v2 = legacy_json
             .get_mut("funding_source_v2")
@@ -14076,6 +14239,12 @@ mod tests {
         legacy_fsc_v2.remove("coverage_window_ready");
         legacy_fsc_v2.remove("coverage_window_remaining_ms");
         legacy_fsc_v2.remove("authoritative_buy_ready");
+        if let Some(legacy_log) = legacy_json.as_object_mut() {
+            legacy_log.remove("cpv_distinct_other_pools_mean");
+            legacy_log.remove("cpv_other_pool_activity_count_p95");
+            legacy_log.remove("toolchain_fingerprint_coverage");
+            legacy_log.remove("des_valid_sequence_coverage");
+        }
         let legacy_roundtrip: ghost_brain::oracle::GatekeeperBuyLog =
             serde_json::from_value(legacy_json).unwrap();
         let legacy_fsc_v2 = legacy_roundtrip
@@ -14085,6 +14254,10 @@ mod tests {
         assert!(!legacy_fsc_v2.coverage_window_ready);
         assert_eq!(legacy_fsc_v2.coverage_window_remaining_ms, 0);
         assert!(!legacy_fsc_v2.authoritative_buy_ready);
+        assert_eq!(legacy_roundtrip.cpv_distinct_other_pools_mean, None);
+        assert_eq!(legacy_roundtrip.cpv_other_pool_activity_count_p95, None);
+        assert_eq!(legacy_roundtrip.toolchain_fingerprint_coverage, None);
+        assert_eq!(legacy_roundtrip.des_valid_sequence_coverage, None);
 
         let summary = assessment.fingerprint_summary("pool_1", "mint_1");
         assert!(summary.contains("FINGERPRINT pool=pool_1 mint=mint_1"));

@@ -165,6 +165,11 @@ pub fn record_trade_outcome_metric(outcome: TradeOutcome) {
     ::metrics::increment_counter!("seer_trade_outcome_total", "outcome" => outcome.as_str());
 }
 
+pub const SEER_BINARY_PARSER_COVERAGE_SOURCE: &str = "binary_parser";
+pub const SEER_PUMPPORTAL_COVERAGE_SOURCE: &str = "pumpportal";
+pub const SEER_NLN_PROGRAM_STREAMS_COVERAGE_SOURCE: &str = "nln_program_streams";
+pub const SEER_LAUNCHER_BRIDGE_COVERAGE_SOURCE: &str = "launcher_bridge";
+
 /// Represents a raw event from the Geyser/WebSocket stream
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GeyserEvent {
@@ -430,11 +435,81 @@ impl ToolchainFingerprintInput {
             && self.filtered_wsol_self_transfer_count.is_none()
     }
 
+    pub fn coverage_complete(&self) -> bool {
+        self.account_keys_len.is_some()
+            && self.outer_instruction_count.is_some()
+            && self.inner_instruction_group_count.is_some()
+            && self.has_set_compute_unit_limit.is_some()
+            && self.has_set_compute_unit_price.is_some()
+            && self.internal_fee_transfer_count.is_some()
+            && self.external_fee_transfer_count.is_some()
+            && self.filtered_wsol_self_transfer_count.is_some()
+    }
+
     pub fn fee_topology(&self) -> Option<(u32, u32)> {
         Some((
             self.external_fee_transfer_count?,
             self.internal_fee_transfer_count?,
         ))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TradeSourceCoverage {
+    pub toolchain_fingerprint_complete: bool,
+    pub fee_topology_available: bool,
+    pub curve_data_known: bool,
+    pub signer_pre_balance_available: bool,
+    pub signer_post_balance_available: bool,
+}
+
+impl TradeSourceCoverage {
+    pub fn from_trade(trade: &TradeEvent) -> Self {
+        Self {
+            toolchain_fingerprint_complete: trade.toolchain_fingerprint.coverage_complete(),
+            fee_topology_available: trade.toolchain_fingerprint.fee_topology().is_some(),
+            curve_data_known: trade.curve_data_known,
+            signer_pre_balance_available: trade.signer_pre_balance_lamports.is_some(),
+            signer_post_balance_available: trade.signer_post_balance_lamports.is_some(),
+        }
+    }
+}
+
+pub fn record_trade_source_coverage(source: &'static str, trade: &TradeEvent) {
+    let coverage = TradeSourceCoverage::from_trade(trade);
+
+    ::metrics::counter!(
+        "seer_toolchain_fingerprint_coverage_total",
+        1u64,
+        "source" => source,
+        "complete" => bool_label(coverage.toolchain_fingerprint_complete)
+    );
+    ::metrics::counter!(
+        "seer_fee_topology_coverage_total",
+        1u64,
+        "source" => source,
+        "available" => bool_label(coverage.fee_topology_available)
+    );
+    ::metrics::counter!(
+        "seer_curve_data_coverage_total",
+        1u64,
+        "source" => source,
+        "known" => bool_label(coverage.curve_data_known)
+    );
+    ::metrics::counter!(
+        "seer_signer_balance_coverage_total",
+        1u64,
+        "source" => source,
+        "pre" => bool_label(coverage.signer_pre_balance_available),
+        "post" => bool_label(coverage.signer_post_balance_available)
+    );
+}
+
+const fn bool_label(value: bool) -> &'static str {
+    if value {
+        "true"
+    } else {
+        "false"
     }
 }
 
@@ -1006,6 +1081,33 @@ mod tests {
     #[test]
     fn test_amm_program_names() {
         assert_eq!(AmmProgram::PumpFun.name(), "pumpfun");
+    }
+
+    #[test]
+    fn default_toolchain_fingerprint_is_missing_not_complete() {
+        let fingerprint = ToolchainFingerprintInput::default();
+
+        assert!(fingerprint.is_empty());
+        assert!(!fingerprint.coverage_complete());
+        assert_eq!(fingerprint.fee_topology(), None);
+    }
+
+    #[test]
+    fn populated_toolchain_fingerprint_is_complete_for_coverage() {
+        let fingerprint = ToolchainFingerprintInput {
+            account_keys_len: Some(12),
+            outer_instruction_count: Some(1),
+            inner_instruction_group_count: Some(1),
+            has_set_compute_unit_limit: Some(false),
+            has_set_compute_unit_price: Some(false),
+            internal_fee_transfer_count: Some(0),
+            external_fee_transfer_count: Some(1),
+            filtered_wsol_self_transfer_count: Some(0),
+        };
+
+        assert!(!fingerprint.is_empty());
+        assert!(fingerprint.coverage_complete());
+        assert_eq!(fingerprint.fee_topology(), Some((1, 0)));
     }
 
     #[test]

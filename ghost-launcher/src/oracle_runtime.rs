@@ -8273,11 +8273,17 @@ fn p37_shadow_probe_manifest_role_rpc_status(
     {
         return (Some("missing_on_rpc_precheck".to_string()), Some(false));
     }
-    if diagnostics
+    if let Some(entry) = diagnostics
         .manifest
         .iter()
-        .any(|entry| entry.role == role && entry.pubkey == pubkey)
+        .find(|entry| entry.role == role && entry.pubkey == pubkey)
     {
+        if let Some(status) = entry.precheck_rpc_load_status.as_ref() {
+            return (
+                Some(status.clone()),
+                entry.precheck_rpc_load_ready.or(Some(true)),
+            );
+        }
         (Some("present_on_rpc_precheck".to_string()), Some(true))
     } else {
         (Some("not_in_manifest".to_string()), Some(false))
@@ -12979,6 +12985,34 @@ async fn active_shadow_account_diagnostics_from_request_with_mode(
     )
 }
 
+fn active_shadow_success_account_diagnostics_from_request_with_mode(
+    request: &crate::components::trigger::PreparedBuyRequest,
+    working_builder_parity_mode: bool,
+) -> crate::events::ShadowSimulationAccountDiagnostics {
+    let mut diagnostics = p37_shadow_probe_account_set_diagnostics_from_request(request);
+    diagnostics.manifest_lookup_performed = true;
+    for entry in &mut diagnostics.manifest {
+        if let Some((status, ready)) = p37_shadow_probe_meta_only_protocol_status(entry, request) {
+            entry.precheck_rpc_load_status = Some(status.to_string());
+            entry.precheck_rpc_load_ready = Some(ready);
+            entry.precheck_commitment = Some("protocol_schema".to_string());
+        } else {
+            entry.precheck_rpc_load_status = Some("shadow_simulation_succeeded".to_string());
+            entry.precheck_rpc_load_ready = Some(true);
+            entry.precheck_commitment = Some("shadow_simulation".to_string());
+        }
+        entry.precheck_attempt_count = Some(0);
+        entry.precheck_latency_ms = Some(0);
+    }
+    active_shadow_account_diagnostics_from_account_set_with_mode(
+        None,
+        Some(request),
+        Some(&diagnostics),
+        "precheck_passed_shadow_simulation",
+        working_builder_parity_mode,
+    )
+}
+
 fn active_shadow_account_diagnostics_without_request(
     err: &anyhow::Error,
 ) -> crate::events::ShadowSimulationAccountDiagnostics {
@@ -16862,28 +16896,82 @@ fn evaluate_feature_driven_terminal_verdict(
             let context = buffer.policy_evaluation_context();
             let curve_t0_event_ts_ms = buffer.curve_t0_event_ts_ms();
             let curve_wait_elapsed_ms = buffer.curve_wait_elapsed_ms();
-            let mut assessment = build_timeout_assessment_from_policy_context(
-                features,
-                gatekeeper_config,
-                context,
-                curve_t0_event_ts_ms,
-                curve_wait_elapsed_ms,
-            );
+            let mut assessment = if gatekeeper_config.strict_metric_threshold_gate_enabled {
+                let mut assessment =
+                    build_assessment_from_features(features, gatekeeper_config, context);
+                assessment.curve_t0_event_ts_ms =
+                    assessment.curve_t0_event_ts_ms.or(curve_t0_event_ts_ms);
+                assessment.curve_wait_elapsed_ms =
+                    assessment.curve_wait_elapsed_ms.or(curve_wait_elapsed_ms);
+                let decision = evaluate_policy_from_assessment(&assessment, gatekeeper_config);
+                assessment.hard_reject_reason = decision.hard_fail_reason.clone();
+                assessment.decision = Some(decision);
+                assessment
+            } else {
+                build_timeout_assessment_from_policy_context(
+                    features,
+                    gatekeeper_config,
+                    context,
+                    curve_t0_event_ts_ms,
+                    curve_wait_elapsed_ms,
+                )
+            };
             assessment.cache_v25_confidence(gatekeeper_config);
             let deadline_wall_ms = session.deadline_wall_ms;
+            let strict_reject_reason = assessment
+                .decision
+                .as_ref()
+                .map(|decision| decision.reason_chain.clone())
+                .unwrap_or_else(|| {
+                    format!(
+                        "CORE_FAIL: Phase1 (tx={}/{} signers={}/{} buys={}/{})",
+                        assessment.total_tx_evaluated,
+                        gatekeeper_config.min_tx_count,
+                        assessment.unique_signers_evaluated,
+                        gatekeeper_config.min_unique_signers,
+                        assessment.buy_count,
+                        gatekeeper_config.min_buy_count,
+                    )
+                });
+            let strict_reject_reason_code = assessment
+                .decision
+                .as_ref()
+                .and_then(|decision| decision.reason_code)
+                .map(|reason_code| reason_code.as_log_str());
             session
                 .gatekeeper_buffer_mut()
                 .attach_policy_terminal_decision_eval_snapshots(
                     &mut assessment,
                     deadline_wall_ms,
                     "deadline",
-                    Some("TIMEOUT".to_string()),
                     Some(
-                        ghost_brain::oracle::reason_code::GatekeeperReasonCode::TimeoutPhase1Insufficient
-                            .as_log_str(),
+                        if gatekeeper_config.strict_metric_threshold_gate_enabled {
+                            "REJECT"
+                        } else {
+                            "TIMEOUT"
+                        }
+                        .to_string(),
                     ),
-                    Some("feature-driven deadline phase1 timeout".to_string()),
+                    Some(
+                        strict_reject_reason_code.unwrap_or_else(|| {
+                            ghost_brain::oracle::reason_code::GatekeeperReasonCode::TimeoutPhase1Insufficient
+                                .as_log_str()
+                        }),
+                    ),
+                    Some(
+                        if gatekeeper_config.strict_metric_threshold_gate_enabled {
+                            strict_reject_reason.clone()
+                        } else {
+                            "feature-driven deadline phase1 timeout".to_string()
+                        },
+                    ),
                 );
+            if gatekeeper_config.strict_metric_threshold_gate_enabled {
+                return GatekeeperVerdict::Reject {
+                    assessment,
+                    reason: strict_reject_reason,
+                };
+            }
             return GatekeeperVerdict::Timeout { assessment };
         }
     }
@@ -18709,6 +18797,13 @@ fn p37_selected_legacy_buy_fallback_overrides(
     };
     if fallback.legacy_buy_curve_pubkey.is_none() {
         fallback.legacy_buy_curve_pubkey = primary.legacy_buy_curve_pubkey;
+    }
+    let has_authoritative_creator_vault =
+        fallback.creator_vault.is_some() && fallback.creator_vault_authoritative == Some(true);
+    if !has_authoritative_creator_vault
+        && fallback.creator_pubkey_source.as_deref() == Some("detected_pool.creator")
+    {
+        fallback.creator_pubkey_authoritative = Some(false);
     }
     p37_apply_legacy_bonding_curve_v2_tail_resolver(&mut fallback, primary_request.mint);
     mark_buy_account_overrides_route_contract(&mut fallback, false, true);
@@ -22223,9 +22318,7 @@ async fn apply_trigger_buy_outcome(
     post_buy_lane: &str,
     active_position_lease: Option<crate::components::trigger::safety::ActivePositionLease>,
     min_tokens_out: Option<u64>,
-    active_shadow_report_error_diagnostics: Option<
-        crate::events::ShadowSimulationAccountDiagnostics,
-    >,
+    active_shadow_report_diagnostics: Option<crate::events::ShadowSimulationAccountDiagnostics>,
     outcome: crate::components::trigger::TriggerBuyOutcome,
 ) -> anyhow::Result<TriggerBuyOutcomeApplied> {
     match outcome {
@@ -22336,7 +22429,7 @@ async fn apply_trigger_buy_outcome(
                     &pool_data.base_mint,
                     report,
                 );
-            if let Some(diagnostics) = active_shadow_report_error_diagnostics {
+            if let Some(diagnostics) = active_shadow_report_diagnostics {
                 shadow_event.account_diagnostics = diagnostics;
             } else if let Some(error_message) = report_err {
                 let err = anyhow::anyhow!(error_message);
@@ -22585,41 +22678,42 @@ async fn apply_trigger_dispatch_receipt_with_builder_mode(
             let state_latch_diagnostics = failed_request
                 .as_ref()
                 .and_then(|request| request.state_readiness_latch_diagnostics.clone());
-            let active_shadow_report_error_diagnostics = match (&outcome, failed_request.as_ref()) {
+            let active_shadow_report_diagnostics = match (&outcome, failed_request.as_ref()) {
                 (
                     crate::components::trigger::TriggerBuyOutcome::ShadowSimulated { report },
                     Some(request),
-                ) => report
-                    .err
-                    .as_ref()
-                    .map(|error_message| (request, error_message)),
+                ) => {
+                    if let Some(error_message) = report.err.as_ref() {
+                        let err = anyhow::anyhow!(error_message.clone());
+                        Some(
+                            active_shadow_account_diagnostics_from_request_with_mode(
+                                trigger_component,
+                                request,
+                                &err,
+                                working_builder_parity_mode,
+                            )
+                            .await,
+                        )
+                    } else {
+                        Some(
+                            active_shadow_success_account_diagnostics_from_request_with_mode(
+                                request,
+                                working_builder_parity_mode,
+                            ),
+                        )
+                    }
+                }
+                (
+                    crate::components::trigger::TriggerBuyOutcome::ShadowSimulated { report },
+                    None,
+                ) => report.err.as_ref().map(|error_message| {
+                    let err = anyhow::anyhow!(error_message.clone());
+                    active_shadow_account_diagnostics_without_request(&err)
+                }),
                 _ => None,
             };
-            let active_shadow_report_error_diagnostics =
-                if let Some((request, error_message)) = active_shadow_report_error_diagnostics {
-                    let err = anyhow::anyhow!(error_message.clone());
-                    Some(
-                        active_shadow_account_diagnostics_from_request_with_mode(
-                            trigger_component,
-                            request,
-                            &err,
-                            working_builder_parity_mode,
-                        )
-                        .await,
-                    )
-                } else if let crate::components::trigger::TriggerBuyOutcome::ShadowSimulated {
-                    report,
-                } = &outcome
-                {
-                    report.err.as_ref().map(|error_message| {
-                        let err = anyhow::anyhow!(error_message.clone());
-                        active_shadow_account_diagnostics_without_request(&err)
-                    })
-                } else {
-                    None
-                };
-            let active_shadow_report_error_diagnostics = merge_optional_state_latch_diagnostics(
-                active_shadow_report_error_diagnostics,
+            let active_shadow_report_diagnostics = merge_optional_state_latch_diagnostics(
+                active_shadow_report_diagnostics,
                 state_latch_diagnostics,
             );
             if live_signature.is_some() && shadow_task.is_some() {
@@ -22642,7 +22736,7 @@ async fn apply_trigger_dispatch_receipt_with_builder_mode(
                 post_buy_lane,
                 active_position_lease.take(),
                 min_tokens_out,
-                active_shadow_report_error_diagnostics,
+                active_shadow_report_diagnostics,
                 outcome,
             )
             .await;
@@ -28967,6 +29061,38 @@ mod tests {
     #[test]
     fn selected_legacy_buy_resolves_protocol_bcv2_tail() {
         p37_selected_legacy_buy_fallback_overrides_uses_protocol_bcv2_tail();
+    }
+
+    #[test]
+    fn selected_legacy_buy_fallback_downgrades_detected_pool_creator_without_creator_vault() {
+        let request = test_working_builder_prepared_buy_request();
+
+        let fallback = p37_selected_legacy_buy_fallback_overrides(&request)
+            .expect("routed request with legacy curve should produce fallback");
+        let reason = p37_execution_account_contract_failure_tail(&fallback)
+            .expect("legacy fallback without authoritative creator_vault must fail closed");
+
+        assert_eq!(
+            fallback.creator_pubkey_source.as_deref(),
+            Some("detected_pool.creator")
+        );
+        assert_eq!(fallback.creator_pubkey_authoritative, Some(false));
+        assert!(reason.starts_with("creator_vault_source_not_authoritative:legacy_buy:"));
+    }
+
+    #[test]
+    fn selected_legacy_buy_fallback_keeps_authoritative_creator_vault_executable() {
+        let mut request = test_working_builder_prepared_buy_request();
+        request.account_overrides.creator_vault = Some(Pubkey::new_unique());
+        request.account_overrides.creator_vault_source =
+            Some("observed_pool_transaction.creator_vault".to_string());
+        request.account_overrides.creator_vault_authoritative = Some(true);
+
+        let fallback = p37_selected_legacy_buy_fallback_overrides(&request)
+            .expect("routed request with legacy curve should produce fallback");
+
+        assert_eq!(fallback.creator_vault_authoritative, Some(true));
+        assert_eq!(p37_execution_account_contract_failure_tail(&fallback), None);
     }
 
     #[test]
@@ -39877,10 +40003,20 @@ mod tests {
             crate::components::post_buy_runtime::create_direct_post_buy_handoff_channel();
         let post_buy_epoch = std::sync::atomic::AtomicU64::new(1);
         let pool_id = Pubkey::new_unique();
+        let join_metadata = ExecutionJoinMetadata {
+            ab_record_id: Some("pool:1000:11000:BUY".to_string()),
+            v3_feature_snapshot_hash: Some("feature-hash-j2b".to_string()),
+            v3_policy_config_hash: Some("policy-hash-j2b".to_string()),
+            decision_plane: Some("legacy_live".to_string()),
+            rollout_namespace: Some("r14-j2b-harness".to_string()),
+            ..Default::default()
+        };
+        let request = test_protocol_legacy_bcv2_tail_prepared_buy_request()
+            .with_join_metadata(join_metadata.clone());
         let pool = crate::events::DetectedPool {
             semantic: Default::default(),
             pool_amm_id: pool_id.to_string(),
-            base_mint: Pubkey::new_unique().to_string(),
+            base_mint: request.mint.to_string(),
             quote_mint: "SOL".to_string(),
             amm_program: "pumpfun".to_string(),
             bonding_curve: "curve".to_string(),
@@ -39893,15 +40029,6 @@ mod tests {
             initial_liquidity_sol: Some(1.0),
             signature: "sig".to_string(),
         };
-        let join_metadata = ExecutionJoinMetadata {
-            ab_record_id: Some("pool:1000:11000:BUY".to_string()),
-            v3_feature_snapshot_hash: Some("feature-hash-j2b".to_string()),
-            v3_policy_config_hash: Some("policy-hash-j2b".to_string()),
-            decision_plane: Some("legacy_live".to_string()),
-            rollout_namespace: Some("r14-j2b-harness".to_string()),
-            ..Default::default()
-        };
-        let request = test_prepared_buy_request().with_join_metadata(join_metadata.clone());
         let entry_token_amount_raw = request.entry_token_amount_raw.expect("shadow qty");
         let decision_ts_ms = request.decision_ts_ms;
         let tracker = crate::components::trigger::safety::PositionLimitTracker::new(1);
@@ -39928,7 +40055,7 @@ mod tests {
                         join_metadata: join_metadata.clone(),
                         mint: pool.base_mint.clone(),
                         live_signature: None,
-                        payer_pubkey: Pubkey::new_unique().to_string(),
+                        payer_pubkey: request.payer_pubkey.to_string(),
                         payer_provenance: request.payer_provenance.to_string(),
                         amount_lamports: request.amount_lamports,
                         entry_token_amount_raw: request.entry_token_amount_raw,
@@ -40038,6 +40165,28 @@ mod tests {
             format!("{pool_id}:{}:1000", pool.base_mint)
         );
         assert_eq!(lifecycle_row["rollout_profile"], "test-rollout");
+        assert_eq!(
+            lifecycle_row["route_resolution_status"],
+            "primary_route_ready"
+        );
+        assert_eq!(lifecycle_row["selected_route_kind"], "legacy_buy");
+        assert_eq!(
+            lifecycle_row["selected_route_reason"],
+            "primary_route_passed_simulation_load_readiness"
+        );
+        assert_eq!(lifecycle_row["execution_feasibility_status"], "executable");
+        assert_eq!(
+            lifecycle_row["execution_feasibility_reason"],
+            "primary_route_ready"
+        );
+        assert_eq!(
+            lifecycle_row["active_shadow_lifecycle_eligibility_status"],
+            "lifecycle_label_candidate"
+        );
+        assert_eq!(
+            lifecycle_row["legacy_buy_curve_rpc_load_status"],
+            "shadow_simulation_succeeded"
+        );
         let expected_idempotency_key =
             crate::components::trigger::shadow_run::make_shadow_idempotency_key(
                 &pool_id.to_string(),

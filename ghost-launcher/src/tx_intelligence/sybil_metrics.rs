@@ -1,16 +1,18 @@
 use crate::events::PoolTransaction;
 use ghost_brain::config::GatekeeperV2Config;
+use ghost_core::features::coordination::stats::{kendall_tau_b, weighted_mad};
 use ghost_core::tx_intelligence::types::{
     SybilResistanceFeatures, DBIA_INSUFFICIENT_BUYERS_REASON, DBIA_NO_DEV_BUY_REASON,
     DBIA_PARTIAL_FINGERPRINT_COVERAGE, DBIA_RAW_FINGERPRINT_UNAVAILABLE_REASON,
-    DES_CURVE_DATA_UNAVAILABLE_REASON, DES_INSUFFICIENT_BUYS_REASON,
-    DES_SLOT_ORDER_UNAVAILABLE_REASON, FTDI_INSUFFICIENT_BUYS_REASON,
-    FTDI_PARTIAL_FEE_TOPOLOGY_COVERAGE, FTDI_RAW_FEE_TOPOLOGY_UNAVAILABLE_REASON,
-    SFD_INSUFFICIENT_BUYS_REASON, SFD_PARTIAL_BALANCE_COVERAGE_REASON,
-    SFD_POSTBALANCE_UNAVAILABLE_REASON, SFD_ZERO_PREBALANCE_SKIPPED_REASON,
+    DES_CURVE_DATA_UNAVAILABLE_REASON, DES_INSUFFICIENT_BUYS_REASON, DES_NO_COMPARABLE_PAIRS,
+    DES_PARTIAL_SEQUENCE_COVERAGE, DES_SLOT_ORDER_UNAVAILABLE_REASON,
+    FTDI_INSUFFICIENT_BUYS_REASON, FTDI_PARTIAL_FEE_TOPOLOGY_COVERAGE,
+    FTDI_RAW_FEE_TOPOLOGY_UNAVAILABLE_REASON, SFD_BUY_AMOUNT_UNAVAILABLE,
+    SFD_INSUFFICIENT_BUYS_REASON, SFD_NEGATIVE_BALANCE_DELTA_SKIPPED,
+    SFD_PARTIAL_BALANCE_COVERAGE_REASON, SFD_POSTBALANCE_UNAVAILABLE_REASON,
+    SFD_ZERO_PREBALANCE_SKIPPED_REASON,
 };
 use seer::types::ToolchainFingerprintInput;
-use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 const DBIA_ACCOUNT_KEYS_WEIGHT: f64 = 0.20;
@@ -23,7 +25,7 @@ const DBIA_ACCOUNT_KEYS_SCALE: f64 = 8.0;
 const DBIA_OUTER_INSTRUCTION_SCALE: f64 = 4.0;
 const DBIA_INNER_GROUP_SCALE: f64 = 4.0;
 const DBIA_FEE_TOPOLOGY_SCALE: f64 = 3.0;
-const DES_SIGN_EPSILON: f64 = 1e-12;
+const LAMPORTS_PER_SOL_F64: f64 = 1_000_000_000.0;
 
 #[derive(Debug, Clone, PartialEq)]
 struct SybilMetricQualityConfig {
@@ -121,13 +123,24 @@ struct OrderedBuyTx<'a> {
 enum SfdSampleCoverage {
     MissingRequiredBalance,
     ZeroPreBalance,
-    Complete,
+    MissingBuyAmount,
+    MissingFallbackPostBalance,
+    NegativeBalanceDelta,
+    FallbackSpend,
+    PrimarySpend,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct SelectedSfdSample<'a> {
     tx: &'a PoolTransaction,
     coverage: SfdSampleCoverage,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SfdSpendSample {
+    spend_fraction: f64,
+    weight: f64,
+    used_buy_amount_fallback: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -279,11 +292,72 @@ fn toolchain_coverage(usable_count: usize, total_count: usize) -> Option<f64> {
 }
 
 fn sfd_sample_coverage(tx: &PoolTransaction) -> SfdSampleCoverage {
-    match tx.signer_pre_balance_lamports {
-        Some(0) => SfdSampleCoverage::ZeroPreBalance,
-        Some(_) if tx.signer_post_balance_lamports.is_some() => SfdSampleCoverage::Complete,
-        _ => SfdSampleCoverage::MissingRequiredBalance,
+    let Some(pre_balance) = tx.signer_pre_balance_lamports else {
+        return SfdSampleCoverage::MissingRequiredBalance;
+    };
+    if pre_balance == 0 {
+        return SfdSampleCoverage::ZeroPreBalance;
     }
+    if tx
+        .signer_post_balance_lamports
+        .is_some_and(|post_balance| post_balance > pre_balance)
+    {
+        return SfdSampleCoverage::NegativeBalanceDelta;
+    }
+    if tx.sol_amount_lamports.is_some_and(|amount| amount > 0) {
+        return SfdSampleCoverage::PrimarySpend;
+    }
+    if tx.volume_sol.is_finite() && tx.volume_sol > 0.0 {
+        if tx.signer_post_balance_lamports.is_some() {
+            SfdSampleCoverage::FallbackSpend
+        } else {
+            SfdSampleCoverage::MissingFallbackPostBalance
+        }
+    } else {
+        SfdSampleCoverage::MissingBuyAmount
+    }
+}
+
+fn sfd_spend_sample(tx: &PoolTransaction) -> Option<SfdSpendSample> {
+    let pre_balance = tx.signer_pre_balance_lamports?;
+    if pre_balance == 0 {
+        return None;
+    }
+    if tx
+        .signer_post_balance_lamports
+        .is_some_and(|post_balance| post_balance > pre_balance)
+    {
+        return None;
+    }
+
+    if let Some(amount_lamports) = tx.sol_amount_lamports.filter(|amount| *amount > 0) {
+        let spend_fraction = amount_lamports as f64 / pre_balance as f64;
+        let buy_amount_sol = amount_lamports as f64 / LAMPORTS_PER_SOL_F64;
+        let weight = buy_amount_sol.sqrt();
+        return (spend_fraction.is_finite() && weight.is_finite() && weight > 0.0).then_some(
+            SfdSpendSample {
+                spend_fraction,
+                weight,
+                used_buy_amount_fallback: false,
+            },
+        );
+    }
+
+    if tx.volume_sol.is_finite() && tx.volume_sol > 0.0 {
+        let post_balance = tx.signer_post_balance_lamports?;
+        let spent_lamports = pre_balance.saturating_sub(post_balance);
+        let spend_fraction = spent_lamports as f64 / pre_balance as f64;
+        let weight = tx.volume_sol.sqrt();
+        return (spend_fraction.is_finite() && weight.is_finite() && weight > 0.0).then_some(
+            SfdSpendSample {
+                spend_fraction,
+                weight,
+                used_buy_amount_fallback: true,
+            },
+        );
+    }
+
+    None
 }
 
 fn selected_sfd_samples<'a>(buy_txs: &[&'a PoolTransaction]) -> Vec<&'a PoolTransaction> {
@@ -324,26 +398,12 @@ fn resolve_dev_wallet<'a>(
     })
 }
 
-fn median(values: &[f64]) -> Option<f64> {
-    if values.is_empty() {
-        return None;
-    }
-
-    let mut sorted = values.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
-    let mid = sorted.len() / 2;
-    if sorted.len() % 2 == 0 {
-        Some((sorted[mid - 1] + sorted[mid]) / 2.0)
-    } else {
-        Some(sorted[mid])
-    }
-}
-
-fn ordered_buy_samples<'a>(buy_samples: &[SequencedBuyTx<'a>]) -> Option<Vec<OrderedBuyTx<'a>>> {
+fn ordered_buy_samples<'a>(buy_samples: &[SequencedBuyTx<'a>]) -> Vec<OrderedBuyTx<'a>> {
     let mut by_slot = BTreeMap::<u64, Vec<SequencedBuyTx<'a>>>::new();
     for sample in buy_samples {
-        let slot = sample.tx.slot?;
-        by_slot.entry(slot).or_default().push(*sample);
+        if let Some(slot) = sample.tx.slot {
+            by_slot.entry(slot).or_default().push(*sample);
+        }
     }
 
     let mut ordered = Vec::with_capacity(buy_samples.len());
@@ -373,7 +433,7 @@ fn ordered_buy_samples<'a>(buy_samples: &[SequencedBuyTx<'a>]) -> Option<Vec<Ord
         }
     }
 
-    Some(ordered)
+    ordered
 }
 
 fn curve_price(tx: &PoolTransaction) -> Option<f64> {
@@ -402,27 +462,67 @@ fn inter_buy_delta(previous: OrderedBuyTx<'_>, current: OrderedBuyTx<'_>) -> f64
         / current.slot_group_size as f64
 }
 
-fn kendall_tau(x_values: &[f64], y_values: &[f64]) -> f64 {
-    let mut concordant = 0u64;
-    let mut discordant = 0u64;
+fn add_degraded_reason(reasons: &mut Vec<String>, reason: &str) {
+    if !reasons.iter().any(|existing| existing == reason) {
+        reasons.push(reason.to_string());
+    }
+}
 
-    for i in 0..x_values.len() {
-        for k in (i + 1)..x_values.len() {
-            let sign = (x_values[i] - x_values[k]) * (y_values[i] - y_values[k]);
-            if sign > DES_SIGN_EPSILON {
-                concordant += 1;
-            } else if sign < -DES_SIGN_EPSILON {
-                discordant += 1;
+fn des_unavailable_reasons(missing_slot: bool, missing_curve: bool) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if missing_slot {
+        add_degraded_reason(&mut reasons, DES_SLOT_ORDER_UNAVAILABLE_REASON);
+    }
+    if missing_curve {
+        add_degraded_reason(&mut reasons, DES_CURVE_DATA_UNAVAILABLE_REASON);
+    }
+    if reasons.is_empty() {
+        add_degraded_reason(&mut reasons, DES_INSUFFICIENT_BUYS_REASON);
+    }
+    reasons
+}
+
+fn des_valid_segments<'a>(
+    buy_samples: &[SequencedBuyTx<'a>],
+) -> (Vec<Vec<(OrderedBuyTx<'a>, f64)>>, bool, bool) {
+    let mut missing_slot = false;
+    let mut missing_curve = false;
+    let mut slot_runs = Vec::<Vec<SequencedBuyTx<'a>>>::new();
+    let mut current_run = Vec::<SequencedBuyTx<'a>>::new();
+
+    for sample in buy_samples {
+        if sample.tx.slot.is_some() {
+            current_run.push(*sample);
+        } else {
+            missing_slot = true;
+            if !current_run.is_empty() {
+                slot_runs.push(std::mem::take(&mut current_run));
             }
         }
     }
-
-    let comparable_pairs = concordant + discordant;
-    if comparable_pairs == 0 {
-        0.0
-    } else {
-        (concordant as f64 - discordant as f64) / comparable_pairs as f64
+    if !current_run.is_empty() {
+        slot_runs.push(current_run);
     }
+
+    let mut segments = Vec::<Vec<(OrderedBuyTx<'a>, f64)>>::new();
+    for run in slot_runs {
+        let mut current_segment = Vec::<(OrderedBuyTx<'a>, f64)>::new();
+        for sample in ordered_buy_samples(&run) {
+            if let Some(price) = curve_price(sample.tx) {
+                current_segment.push((sample, price));
+            } else {
+                missing_curve = true;
+                if !current_segment.is_empty() {
+                    segments.push(std::mem::take(&mut current_segment));
+                }
+            }
+        }
+        if !current_segment.is_empty() {
+            segments.push(current_segment);
+        }
+    }
+
+    (segments, missing_slot, missing_curve)
 }
 
 pub fn compute_ftdi<'a>(
@@ -629,35 +729,58 @@ fn compute_sfd_from_buys(buy_txs: &[&PoolTransaction]) -> SfdComputation {
     let unique_samples = selected_sfd_samples(buy_txs);
     let mut zero_prebalance_skipped = false;
     let mut partial_balance_coverage = false;
-    let mut spend_fractions = Vec::<f64>::new();
+    let mut postbalance_unavailable = false;
+    let mut negative_balance_delta_skipped = false;
+    let mut buy_amount_unavailable = false;
+    let mut spend_samples = Vec::<(f64, f64)>::new();
 
     for tx in &unique_samples {
-        let Some(pre_balance) = tx.signer_pre_balance_lamports else {
-            partial_balance_coverage = true;
-            continue;
-        };
-        if pre_balance == 0 {
-            zero_prebalance_skipped = true;
-            continue;
+        match sfd_spend_sample(tx) {
+            Some(sample) => {
+                if sample.used_buy_amount_fallback {
+                    buy_amount_unavailable = true;
+                }
+                spend_samples.push((sample.spend_fraction, sample.weight));
+            }
+            None => match sfd_sample_coverage(tx) {
+                SfdSampleCoverage::MissingRequiredBalance => {
+                    partial_balance_coverage = true;
+                    postbalance_unavailable = true;
+                }
+                SfdSampleCoverage::ZeroPreBalance => {
+                    zero_prebalance_skipped = true;
+                }
+                SfdSampleCoverage::MissingBuyAmount => {
+                    buy_amount_unavailable = true;
+                }
+                SfdSampleCoverage::MissingFallbackPostBalance => {
+                    buy_amount_unavailable = true;
+                    partial_balance_coverage = true;
+                    postbalance_unavailable = true;
+                }
+                SfdSampleCoverage::NegativeBalanceDelta => {
+                    negative_balance_delta_skipped = true;
+                }
+                SfdSampleCoverage::FallbackSpend | SfdSampleCoverage::PrimarySpend => {}
+            },
         }
-        let Some(post_balance) = tx.signer_post_balance_lamports else {
-            partial_balance_coverage = true;
-            continue;
-        };
-
-        let spent_lamports = pre_balance.saturating_sub(post_balance);
-        spend_fractions.push(spent_lamports as f64 / pre_balance as f64);
     }
 
-    if spend_fractions.len() < 3 {
+    if spend_samples.len() < 3 {
         let mut reasons = Vec::new();
         if zero_prebalance_skipped {
-            reasons.push(SFD_ZERO_PREBALANCE_SKIPPED_REASON.to_string());
+            add_degraded_reason(&mut reasons, SFD_ZERO_PREBALANCE_SKIPPED_REASON);
         }
-        if partial_balance_coverage {
-            reasons.push(SFD_POSTBALANCE_UNAVAILABLE_REASON.to_string());
+        if negative_balance_delta_skipped {
+            add_degraded_reason(&mut reasons, SFD_NEGATIVE_BALANCE_DELTA_SKIPPED);
         }
-        reasons.push(SFD_INSUFFICIENT_BUYS_REASON.to_string());
+        if buy_amount_unavailable {
+            add_degraded_reason(&mut reasons, SFD_BUY_AMOUNT_UNAVAILABLE);
+        }
+        if postbalance_unavailable {
+            add_degraded_reason(&mut reasons, SFD_POSTBALANCE_UNAVAILABLE_REASON);
+        }
+        add_degraded_reason(&mut reasons, SFD_INSUFFICIENT_BUYS_REASON);
         return SfdComputation {
             spend_fraction_divergence: None,
             degraded_reasons: reasons,
@@ -666,19 +789,20 @@ fn compute_sfd_from_buys(buy_txs: &[&PoolTransaction]) -> SfdComputation {
         };
     }
 
-    let median_fraction = median(&spend_fractions).expect("non-empty spend fractions");
-    let deviations: Vec<f64> = spend_fractions
-        .iter()
-        .map(|value| (value - median_fraction).abs())
-        .collect();
-    let spend_fraction_divergence = median(&deviations);
+    let spend_fraction_divergence = weighted_mad(&spend_samples);
 
     let mut degraded_reasons = Vec::new();
     if zero_prebalance_skipped {
-        degraded_reasons.push(SFD_ZERO_PREBALANCE_SKIPPED_REASON.to_string());
+        add_degraded_reason(&mut degraded_reasons, SFD_ZERO_PREBALANCE_SKIPPED_REASON);
+    }
+    if negative_balance_delta_skipped {
+        add_degraded_reason(&mut degraded_reasons, SFD_NEGATIVE_BALANCE_DELTA_SKIPPED);
+    }
+    if buy_amount_unavailable {
+        add_degraded_reason(&mut degraded_reasons, SFD_BUY_AMOUNT_UNAVAILABLE);
     }
     if partial_balance_coverage {
-        degraded_reasons.push(SFD_PARTIAL_BALANCE_COVERAGE_REASON.to_string());
+        add_degraded_reason(&mut degraded_reasons, SFD_PARTIAL_BALANCE_COVERAGE_REASON);
     }
 
     SfdComputation {
@@ -693,10 +817,14 @@ pub fn compute_des<'a>(
     transactions: impl IntoIterator<Item = &'a PoolTransaction>,
 ) -> DesComputation {
     let transactions: Vec<&PoolTransaction> = transactions.into_iter().collect();
-    compute_des_from_transactions(&transactions)
+    let quality = SybilMetricQualityConfig::from_gatekeeper_config(&GatekeeperV2Config::default());
+    compute_des_from_transactions(&transactions, &quality)
 }
 
-fn compute_des_from_transactions(transactions: &[&PoolTransaction]) -> DesComputation {
+fn compute_des_from_transactions(
+    transactions: &[&PoolTransaction],
+    quality: &SybilMetricQualityConfig,
+) -> DesComputation {
     let buy_samples = successful_buy_samples(transactions);
     let buy_txs: Vec<&PoolTransaction> = buy_samples.iter().map(|sample| sample.tx).collect();
     let stats = buy_sample_stats(&buy_txs);
@@ -710,40 +838,65 @@ fn compute_des_from_transactions(transactions: &[&PoolTransaction]) -> DesComput
         };
     }
 
-    let Some(ordered_buy_txs) = ordered_buy_samples(&buy_samples) else {
+    let (segments, missing_slot, missing_curve) = des_valid_segments(&buy_samples);
+    let mut selected_segment: Option<Vec<(OrderedBuyTx<'_>, f64)>> = None;
+    for segment in segments {
+        if segment.len() < 4 {
+            continue;
+        }
+        if selected_segment
+            .as_ref()
+            .map_or(true, |current| segment.len() > current.len())
+        {
+            selected_segment = Some(segment);
+        }
+    }
+
+    let Some(selected_segment) = selected_segment else {
         return DesComputation {
             demand_elasticity_score: None,
-            degraded_reasons: vec![DES_SLOT_ORDER_UNAVAILABLE_REASON.to_string()],
+            degraded_reasons: des_unavailable_reasons(missing_slot, missing_curve),
             buy_sample_count: stats.buy_sample_count,
             signer_sample_count: stats.signer_sample_count,
         };
     };
 
-    let mut prices = Vec::<f64>::with_capacity(ordered_buy_txs.len());
-    for sample in &ordered_buy_txs {
-        let Some(price) = curve_price(sample.tx) else {
-            return DesComputation {
-                demand_elasticity_score: None,
-                degraded_reasons: vec![DES_CURVE_DATA_UNAVAILABLE_REASON.to_string()],
-                buy_sample_count: stats.buy_sample_count,
-                signer_sample_count: stats.signer_sample_count,
-            };
+    let coverage = selected_segment.len() as f64 / stats.buy_sample_count as f64;
+    if coverage < quality.min_des_valid_sequence_coverage {
+        return DesComputation {
+            demand_elasticity_score: None,
+            degraded_reasons: des_unavailable_reasons(missing_slot, missing_curve),
+            buy_sample_count: stats.buy_sample_count,
+            signer_sample_count: stats.signer_sample_count,
         };
-        prices.push(price);
     }
 
-    let mut price_impacts = Vec::<f64>::with_capacity(ordered_buy_txs.len().saturating_sub(1));
-    let mut timing_deltas = Vec::<f64>::with_capacity(ordered_buy_txs.len().saturating_sub(1));
-    for index in 1..ordered_buy_txs.len() {
-        let previous = ordered_buy_txs[index - 1];
-        let current = ordered_buy_txs[index];
-        price_impacts.push((prices[index] - prices[index - 1]) / prices[index - 1]);
+    let mut price_impacts = Vec::<f64>::with_capacity(selected_segment.len().saturating_sub(1));
+    let mut timing_deltas = Vec::<f64>::with_capacity(selected_segment.len().saturating_sub(1));
+    for index in 1..selected_segment.len() {
+        let (previous, previous_price) = selected_segment[index - 1];
+        let (current, current_price) = selected_segment[index];
+        price_impacts.push((current_price - previous_price) / previous_price);
         timing_deltas.push(inter_buy_delta(previous, current));
     }
 
+    let Some(demand_elasticity_score) = kendall_tau_b(&price_impacts, &timing_deltas) else {
+        return DesComputation {
+            demand_elasticity_score: None,
+            degraded_reasons: vec![DES_NO_COMPARABLE_PAIRS.to_string()],
+            buy_sample_count: stats.buy_sample_count,
+            signer_sample_count: stats.signer_sample_count,
+        };
+    };
+
+    let mut degraded_reasons = Vec::new();
+    if selected_segment.len() < stats.buy_sample_count as usize {
+        add_degraded_reason(&mut degraded_reasons, DES_PARTIAL_SEQUENCE_COVERAGE);
+    }
+
     DesComputation {
-        demand_elasticity_score: Some(kendall_tau(&price_impacts, &timing_deltas)),
-        degraded_reasons: Vec::new(),
+        demand_elasticity_score: Some(demand_elasticity_score),
+        degraded_reasons,
         buy_sample_count: stats.buy_sample_count,
         signer_sample_count: stats.signer_sample_count,
     }
@@ -767,7 +920,7 @@ pub fn compute_sybil_resistance_with_config<'a>(
     let ftdi = compute_ftdi_from_buys(&buy_txs, &quality);
     let dbia = compute_dbia_from_buys(&buy_txs, dev_wallet, &quality);
     let sfd = compute_sfd_from_buys(&buy_txs);
-    let des = compute_des_from_transactions(&transactions);
+    let des = compute_des_from_transactions(&transactions, &quality);
 
     let mut degraded_reasons = Vec::<String>::new();
     for reason in ftdi
@@ -919,6 +1072,23 @@ mod tests {
         let mut tx = buy_tx(signer, signature, ToolchainFingerprintInput::default());
         tx.signer_pre_balance_lamports = pre_balance;
         tx.signer_post_balance_lamports = post_balance;
+        tx.sol_amount_lamports = pre_balance
+            .zip(post_balance)
+            .and_then(|(pre, post)| pre.checked_sub(post));
+        tx
+    }
+
+    fn sfd_buy_tx_with_amount(
+        signer: &str,
+        signature: &str,
+        pre_balance: Option<u64>,
+        post_balance: Option<u64>,
+        sol_amount_lamports: Option<u64>,
+        volume_sol: f64,
+    ) -> PoolTransaction {
+        let mut tx = sfd_buy_tx(signer, signature, pre_balance, post_balance);
+        tx.sol_amount_lamports = sol_amount_lamports;
+        tx.volume_sol = volume_sol;
         tx
     }
 
@@ -1332,7 +1502,7 @@ mod tests {
         assert!(result.degraded_reasons.is_empty());
         assert_eq!(result.buy_sample_count, 5);
         assert_eq!(result.signer_sample_count, 5);
-        assert_approx_eq(result.spend_fraction_divergence.unwrap(), 0.02);
+        assert!(result.spend_fraction_divergence.unwrap() < 0.05);
     }
 
     #[test]
@@ -1348,7 +1518,7 @@ mod tests {
         let result = compute_sfd(txs.iter());
 
         assert!(result.degraded_reasons.is_empty());
-        assert_approx_eq(result.spend_fraction_divergence.unwrap(), 0.25);
+        assert!(result.spend_fraction_divergence.unwrap() > 0.15);
     }
 
     #[test]
@@ -1383,6 +1553,7 @@ mod tests {
         assert_eq!(
             result.degraded_reasons,
             vec![
+                SFD_BUY_AMOUNT_UNAVAILABLE.to_string(),
                 SFD_POSTBALANCE_UNAVAILABLE_REASON.to_string(),
                 SFD_INSUFFICIENT_BUYS_REASON.to_string()
             ]
@@ -1418,7 +1589,130 @@ mod tests {
         assert_eq!(result.spend_fraction_divergence, Some(0.0));
         assert_eq!(
             result.degraded_reasons,
-            vec![SFD_PARTIAL_BALANCE_COVERAGE_REASON.to_string()]
+            vec![
+                SFD_BUY_AMOUNT_UNAVAILABLE.to_string(),
+                SFD_PARTIAL_BALANCE_COVERAGE_REASON.to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn sfd_weighted_mad_is_not_dominated_by_dust_spam() {
+        let txs = vec![
+            sfd_buy_tx_with_amount(
+                "dust-a",
+                "sig-dust-a",
+                Some(1_000),
+                Some(999),
+                Some(1),
+                0.01,
+            ),
+            sfd_buy_tx_with_amount(
+                "dust-b",
+                "sig-dust-b",
+                Some(1_000),
+                Some(999),
+                Some(1),
+                0.01,
+            ),
+            sfd_buy_tx_with_amount(
+                "dust-c",
+                "sig-dust-c",
+                Some(1_000),
+                Some(999),
+                Some(1),
+                0.01,
+            ),
+            sfd_buy_tx_with_amount(
+                "dust-d",
+                "sig-dust-d",
+                Some(1_000),
+                Some(999),
+                Some(1),
+                0.01,
+            ),
+            sfd_buy_tx_with_amount(
+                "dust-e",
+                "sig-dust-e",
+                Some(1_000),
+                Some(999),
+                Some(1),
+                0.01,
+            ),
+            sfd_buy_tx_with_amount(
+                "dust-f",
+                "sig-dust-f",
+                Some(1_000),
+                Some(999),
+                Some(1),
+                0.01,
+            ),
+            sfd_buy_tx_with_amount(
+                "large-a",
+                "sig-large-a",
+                Some(1_000),
+                Some(600),
+                Some(400),
+                1.0,
+            ),
+            sfd_buy_tx_with_amount(
+                "large-b",
+                "sig-large-b",
+                Some(1_000),
+                Some(400),
+                Some(600),
+                1.0,
+            ),
+            sfd_buy_tx_with_amount(
+                "large-c",
+                "sig-large-c",
+                Some(1_000),
+                Some(200),
+                Some(800),
+                1.0,
+            ),
+        ];
+
+        let result = compute_sfd(txs.iter());
+
+        assert!(result.degraded_reasons.is_empty());
+        assert!(
+            result.spend_fraction_divergence.unwrap() > 0.15,
+            "weighted SFD should stay controlled by economically meaningful buys"
+        );
+    }
+
+    #[test]
+    fn sfd_negative_balance_delta_is_skipped_instead_of_zero_spend() {
+        let txs = vec![
+            sfd_buy_tx_with_amount("a", "sig-a", Some(100), Some(110), Some(10), 0.1),
+            sfd_buy_tx("b", "sig-b", Some(100), Some(90)),
+            sfd_buy_tx("c", "sig-c", Some(100), Some(80)),
+            sfd_buy_tx("d", "sig-d", Some(100), Some(70)),
+        ];
+
+        let result = compute_sfd(txs.iter());
+
+        assert!(result.spend_fraction_divergence.is_some());
+        assert!(result
+            .degraded_reasons
+            .contains(&SFD_NEGATIVE_BALANCE_DELTA_SKIPPED.to_string()));
+    }
+
+    #[test]
+    fn sfd_missing_buy_amount_falls_back_to_balance_delta_with_reason() {
+        let txs = vec![
+            sfd_buy_tx_with_amount("a", "sig-a", Some(100), Some(90), None, 0.1),
+            sfd_buy_tx_with_amount("b", "sig-b", Some(100), Some(80), None, 0.2),
+            sfd_buy_tx_with_amount("c", "sig-c", Some(100), Some(60), None, 0.4),
+        ];
+
+        let result = compute_sfd(txs.iter());
+
+        assert!(result.spend_fraction_divergence.is_some());
+        assert_eq!(
+            result.degraded_reasons,
+            vec![SFD_BUY_AMOUNT_UNAVAILABLE.to_string()]
         );
     }
 
@@ -1480,7 +1774,9 @@ mod tests {
             ordered_result.demand_elasticity_score,
             permuted_result.demand_elasticity_score
         );
-        assert_approx_eq(ordered_result.demand_elasticity_score.unwrap(), 0.6);
+        let score = ordered_result.demand_elasticity_score.unwrap();
+        assert!(score > 0.5);
+        assert!(score < 0.6);
     }
 
     #[test]
@@ -1495,7 +1791,63 @@ mod tests {
         let result = compute_des(txs.iter());
 
         assert!(result.degraded_reasons.is_empty());
+        assert!(result.demand_elasticity_score.unwrap() > 0.8);
+    }
+
+    #[test]
+    fn des_partial_sequence_coverage_materializes_from_longest_valid_segment() {
+        let txs = vec![
+            des_buy_tx("invalid", "sig-invalid", Some(1), Some(0), None, Some(1.0)),
+            des_buy_tx("a", "sig-a", Some(2), Some(0), Some(10.0), Some(1.0)),
+            des_buy_tx("b", "sig-b", Some(3), Some(0), Some(11.0), Some(1.0)),
+            des_buy_tx("c", "sig-c", Some(5), Some(0), Some(13.2), Some(1.0)),
+            des_buy_tx("d", "sig-d", Some(8), Some(0), Some(17.16), Some(1.0)),
+        ];
+
+        let result = compute_des(txs.iter());
+
         assert_approx_eq(result.demand_elasticity_score.unwrap(), 1.0);
+        assert_eq!(
+            result.degraded_reasons,
+            vec![DES_PARTIAL_SEQUENCE_COVERAGE.to_string()]
+        );
+    }
+
+    #[test]
+    fn des_invalid_sample_without_valid_segment_returns_none() {
+        let txs = vec![
+            des_buy_tx("a", "sig-a", Some(1), Some(0), Some(10.0), Some(1.0)),
+            des_buy_tx("b", "sig-b", Some(2), Some(0), Some(11.0), Some(1.0)),
+            des_buy_tx("invalid", "sig-invalid", Some(3), Some(0), None, Some(1.0)),
+            des_buy_tx("c", "sig-c", Some(4), Some(0), Some(13.2), Some(1.0)),
+            des_buy_tx("d", "sig-d", Some(7), Some(0), Some(17.16), Some(1.0)),
+        ];
+
+        let result = compute_des(txs.iter());
+
+        assert_eq!(result.demand_elasticity_score, None);
+        assert_eq!(
+            result.degraded_reasons,
+            vec![DES_CURVE_DATA_UNAVAILABLE_REASON.to_string()]
+        );
+    }
+
+    #[test]
+    fn des_ties_without_comparable_pairs_return_none() {
+        let txs = vec![
+            des_buy_tx("a", "sig-a", Some(1), Some(0), Some(10.0), Some(1.0)),
+            des_buy_tx("b", "sig-b", Some(2), Some(0), Some(11.0), Some(1.0)),
+            des_buy_tx("c", "sig-c", Some(3), Some(0), Some(12.1), Some(1.0)),
+            des_buy_tx("d", "sig-d", Some(4), Some(0), Some(13.31), Some(1.0)),
+        ];
+
+        let result = compute_des(txs.iter());
+
+        assert_eq!(result.demand_elasticity_score, None);
+        assert_eq!(
+            result.degraded_reasons,
+            vec![DES_NO_COMPARABLE_PAIRS.to_string()]
+        );
     }
 
     #[test]

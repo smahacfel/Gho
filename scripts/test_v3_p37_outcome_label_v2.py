@@ -38,7 +38,7 @@ def threshold(
     *,
     status: str = "ok",
     verdict: str = "OK",
-    max_return: float = 45.0,
+    max_return: float = 55.0,
     min_return: float = -10.0,
     entry_price: float | None = 1.0,
     usable: bool = True,
@@ -109,9 +109,9 @@ class P37OutcomeLabelV2Tests(unittest.TestCase):
                 decisions,
                 thresholds,
                 output,
-                target_pct=40.0,
-                stop_pct=40.0,
-                dirty_mae_pct=-40.0,
+                target_pct=label_v2.DEFAULT_TARGET_PCT,
+                stop_pct=label_v2.DEFAULT_STOP_PCT,
+                dirty_mae_pct=label_v2.DEFAULT_DIRTY_MAE_PCT,
                 price_path_samples_path=price_paths if price_path_row is not None else None,
             )
             rows = [json.loads(line) for line in output.read_text().splitlines()]
@@ -119,7 +119,12 @@ class P37OutcomeLabelV2Tests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         return rows[0]
 
-    def test_plus40_without_price_path_is_good_dirty_not_good_clean(self) -> None:
+    def test_defaults(self) -> None:
+        self.assertEqual(label_v2.DEFAULT_TARGET_PCT, 50.0)
+        self.assertEqual(label_v2.DEFAULT_STOP_PCT, 50.0)
+        self.assertEqual(label_v2.DEFAULT_DIRTY_MAE_PCT, -50.0)
+
+    def test_plus50_without_price_path_is_good_dirty_not_good_clean(self) -> None:
         row = self.build_one(threshold())
 
         self.assertEqual(row["v1_outcome_class"], "good_entry")
@@ -134,7 +139,7 @@ class P37OutcomeLabelV2Tests(unittest.TestCase):
                 samples=[
                     {"ts_ms": 2000, "return_pct": 0.0},
                     {"ts_ms": 3000, "return_pct": -8.0},
-                    {"ts_ms": 7000, "return_pct": 44.0},
+                    {"ts_ms": 7000, "return_pct": 55.0},
                     {"ts_ms": 15_000, "return_pct": 30.0},
                 ]
             )
@@ -142,7 +147,7 @@ class P37OutcomeLabelV2Tests(unittest.TestCase):
 
         self.assertEqual(row["market_outcome_class"], "good_clean")
         self.assertEqual(row["label_quality"], "clean_price_path")
-        self.assertEqual(row["mfe_pct_10s"], 44.0)
+        self.assertEqual(row["mfe_pct_10s"], 55.0)
         self.assertEqual(row["mae_pct_10s"], -8.0)
         self.assertEqual(row["drawdown_before_plus40"], -8.0)
         self.assertTrue(row["survived_10s"])
@@ -154,7 +159,7 @@ class P37OutcomeLabelV2Tests(unittest.TestCase):
                 samples=[
                     {"ts_ms": 2000, "return_pct": 0.0, "price_sol": 1.0},
                     {"ts_ms": 3000, "return_pct": -8.0, "price_sol": 0.92},
-                    {"ts_ms": 7000, "return_pct": 44.0, "price_sol": 1.44},
+                    {"ts_ms": 7000, "return_pct": 55.0, "price_sol": 1.55},
                 ]
             ),
         )
@@ -163,7 +168,7 @@ class P37OutcomeLabelV2Tests(unittest.TestCase):
         self.assertEqual(row["label_quality"], "clean_price_path")
         self.assertEqual(row["price_path_source"], "rpc_pool_signatures")
         self.assertEqual(row["price_path_status"], "ok")
-        self.assertEqual(row["mfe_pct_10s"], 44.0)
+        self.assertEqual(row["mfe_pct_10s"], 55.0)
         self.assertEqual(row["mae_pct_10s"], -8.0)
 
     def test_unavailable_external_price_path_does_not_promote_good_clean(self) -> None:
@@ -171,7 +176,7 @@ class P37OutcomeLabelV2Tests(unittest.TestCase):
             threshold(
                 samples=[
                     {"ts_ms": 2000, "return_pct": 0.0},
-                    {"ts_ms": 7000, "return_pct": 44.0},
+                    {"ts_ms": 7000, "return_pct": 55.0},
                 ]
             ),
             price_path(status="unavailable", samples=[], unknown_reason="no_post_entry_price_samples"),

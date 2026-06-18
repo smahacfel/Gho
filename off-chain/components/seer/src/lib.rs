@@ -706,6 +706,10 @@ fn parse_system_transfer_lamports(data: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(data[4..12].try_into().ok()?))
 }
 
+fn has_system_transfer_discriminator(data: &[u8]) -> bool {
+    data.get(..4) == Some(&SYSTEM_PROGRAM_TRANSFER_DISCRIMINATOR)
+}
+
 fn token_account_owner_overrides(
     accounts: &[Pubkey],
     pre_token_balances: &[types::RawTokenBalance],
@@ -774,6 +778,147 @@ fn extracted_funding_transfer_from_accounts(
         inner_group_index,
         cpi_stack_height,
     })
+}
+
+fn system_transfer_decode_failure_reasons(event: &types::GeyserEvent) -> Vec<&'static str> {
+    let types::GeyserEvent::Transaction {
+        accounts,
+        instructions,
+        inner_instructions,
+        pre_token_balances,
+        post_token_balances,
+        success,
+        ..
+    } = event
+    else {
+        return Vec::new();
+    };
+
+    if !success {
+        return vec!["transaction_failed"];
+    }
+
+    let mut reasons = Vec::new();
+    let sync_native_accounts = collect_sync_native_accounts(event);
+    let token_account_owner_overrides =
+        token_account_owner_overrides(accounts, pre_token_balances, post_token_balances);
+
+    for instruction in instructions {
+        if instruction.program_id != solana_sdk::system_program::ID
+            || !has_system_transfer_discriminator(&instruction.data)
+        {
+            continue;
+        }
+        let Some(lamports) = parse_system_transfer_lamports(&instruction.data) else {
+            reasons.push("malformed_transfer_data");
+            continue;
+        };
+        let Some(&source_index) = instruction.account_indices.first() else {
+            reasons.push("missing_source_account");
+            continue;
+        };
+        let Some(&recipient_index) = instruction.account_indices.get(1) else {
+            reasons.push("missing_recipient_account");
+            continue;
+        };
+        let Some(source_pubkey) = accounts.get(source_index as usize) else {
+            reasons.push("account_index_out_of_bounds");
+            continue;
+        };
+        let Some(recipient_pubkey) = accounts.get(recipient_index as usize) else {
+            reasons.push("account_index_out_of_bounds");
+            continue;
+        };
+        if sync_native_accounts.contains(recipient_pubkey) {
+            continue;
+        }
+        if lamports == 0 {
+            reasons.push("zero_lamports");
+            continue;
+        }
+        if source_pubkey == recipient_pubkey {
+            reasons.push("self_transfer");
+            continue;
+        }
+        if extracted_funding_transfer_from_accounts(
+            accounts,
+            &token_account_owner_overrides,
+            source_index,
+            recipient_index,
+            lamports,
+            None,
+            None,
+            None,
+            None,
+        )
+        .is_none()
+        {
+            reasons.push("wallet_canonicalization_failed");
+        }
+    }
+
+    for group in inner_instructions {
+        for instruction in &group.instructions {
+            if !has_system_transfer_discriminator(&instruction.data) {
+                continue;
+            }
+            let Some(program_id) = accounts.get(instruction.program_id_index as usize) else {
+                reasons.push("program_id_index_out_of_bounds");
+                continue;
+            };
+            if *program_id != solana_sdk::system_program::ID {
+                continue;
+            }
+            let Some(lamports) = parse_system_transfer_lamports(&instruction.data) else {
+                reasons.push("malformed_transfer_data");
+                continue;
+            };
+            let Some(&source_index) = instruction.accounts.first() else {
+                reasons.push("missing_source_account");
+                continue;
+            };
+            let Some(&recipient_index) = instruction.accounts.get(1) else {
+                reasons.push("missing_recipient_account");
+                continue;
+            };
+            let Some(source_pubkey) = accounts.get(source_index as usize) else {
+                reasons.push("account_index_out_of_bounds");
+                continue;
+            };
+            let Some(recipient_pubkey) = accounts.get(recipient_index as usize) else {
+                reasons.push("account_index_out_of_bounds");
+                continue;
+            };
+            if sync_native_accounts.contains(recipient_pubkey) {
+                continue;
+            }
+            if lamports == 0 {
+                reasons.push("zero_lamports");
+                continue;
+            }
+            if source_pubkey == recipient_pubkey {
+                reasons.push("self_transfer");
+                continue;
+            }
+            if extracted_funding_transfer_from_accounts(
+                accounts,
+                &token_account_owner_overrides,
+                source_index,
+                recipient_index,
+                lamports,
+                None,
+                None,
+                None,
+                None,
+            )
+            .is_none()
+            {
+                reasons.push("wallet_canonicalization_failed");
+            }
+        }
+    }
+
+    reasons
 }
 
 pub fn extract_funding_transfer_observations(
@@ -4934,6 +5079,13 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
             return Ok(());
         }
 
+        let raw_fullchain_capture_candidate = !is_synthetic
+            && source_label == GRPC_FUNDING_LANE_FULL_CHAIN_SOURCE_LABEL
+            && matches!(self.config.funding_lane_mode, FundingLaneMode::FullChain);
+        if raw_fullchain_capture_candidate {
+            self.metrics.fsc_raw_fullchain_transactions_seen_total.inc();
+        }
+
         let Some(ipc_sender) = &self.ipc_sender else {
             return Ok(());
         };
@@ -4955,7 +5107,23 @@ listener_fwd={} snapshot_accept={} ledger_commit={} ledger_live={} ledger_total=
             return Ok(());
         };
 
+        if raw_fullchain_capture_candidate {
+            self.metrics
+                .fsc_raw_fullchain_system_transfer_decode_attempts_total
+                .inc();
+            for reason in system_transfer_decode_failure_reasons(event) {
+                self.metrics
+                    .fsc_transfer_decode_failures_total
+                    .with_label_values(&[reason])
+                    .inc();
+            }
+        }
         let transfers = extract_funding_transfer_observations(event);
+        if full_chain_coverage && !transfers.is_empty() {
+            self.metrics
+                .fsc_raw_fullchain_system_transfers_decoded_total
+                .inc_by(transfers.len() as u64);
+        }
         if transfers.is_empty() {
             return Ok(());
         }
@@ -6193,6 +6361,15 @@ mod tests {
             "global stream transfer-only tx should emit only filtered funding events"
         );
 
+        let seen_before = seer.metrics.fsc_raw_fullchain_transactions_seen_total.get();
+        let attempts_before = seer
+            .metrics
+            .fsc_raw_fullchain_system_transfer_decode_attempts_total
+            .get();
+        let decoded_before = seer
+            .metrics
+            .fsc_raw_fullchain_system_transfers_decoded_total
+            .get();
         let (full_chain_event, expected_full_chain) =
             create_tx_with_funding_transfer_observations(GRPC_FUNDING_LANE_FULL_CHAIN_SOURCE_LABEL);
         seer.process_event(full_chain_event)
@@ -6227,6 +6404,22 @@ mod tests {
         assert!(
             ipc_receiver.try_recv().is_err(),
             "full-chain funding tx should emit only authoritative funding events"
+        );
+        assert_eq!(
+            seer.metrics.fsc_raw_fullchain_transactions_seen_total.get(),
+            seen_before + 1
+        );
+        assert_eq!(
+            seer.metrics
+                .fsc_raw_fullchain_system_transfer_decode_attempts_total
+                .get(),
+            attempts_before + 1
+        );
+        assert_eq!(
+            seer.metrics
+                .fsc_raw_fullchain_system_transfers_decoded_total
+                .get(),
+            decoded_before + 2
         );
 
         let (pump_filtered_mismatch_event, _) = create_tx_with_funding_transfer_observations(
@@ -6331,6 +6524,76 @@ mod tests {
                 .await
                 .is_err(),
             "disabled funding_lane_mode must not emit dedicated funding observations"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_raw_fullchain_malformed_system_transfer_records_decode_failure() {
+        let mut full_chain_config = SeerConfig::default();
+        full_chain_config.funding_lane_mode = FundingLaneMode::FullChain;
+        let (ipc_sender, mut ipc_receiver, _metrics) =
+            create_ipc_channel(IpcChannelConfig::default());
+        let seer = Seer::new_with_ipc(full_chain_config, ipc_sender);
+
+        let seen_before = seer.metrics.fsc_raw_fullchain_transactions_seen_total.get();
+        let attempts_before = seer
+            .metrics
+            .fsc_raw_fullchain_system_transfer_decode_attempts_total
+            .get();
+        let decoded_before = seer
+            .metrics
+            .fsc_raw_fullchain_system_transfers_decoded_total
+            .get();
+        let failures_before = seer
+            .metrics
+            .fsc_transfer_decode_failures_total
+            .with_label_values(&["malformed_transfer_data"])
+            .get();
+
+        let (mut event, _) =
+            create_tx_with_funding_transfer_observations(GRPC_FUNDING_LANE_FULL_CHAIN_SOURCE_LABEL);
+        if let types::GeyserEvent::Transaction {
+            instructions,
+            inner_instructions,
+            ..
+        } = &mut event
+        {
+            instructions[0].data = SYSTEM_PROGRAM_TRANSFER_DISCRIMINATOR.to_vec();
+            inner_instructions.clear();
+        }
+
+        seer.process_event(event)
+            .await
+            .expect("malformed raw full-chain tx must process without emitting funding evidence");
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), ipc_receiver.recv())
+                .await
+                .is_err(),
+            "malformed SystemProgram transfer must not emit funding evidence"
+        );
+        assert_eq!(
+            seer.metrics.fsc_raw_fullchain_transactions_seen_total.get(),
+            seen_before + 1
+        );
+        assert_eq!(
+            seer.metrics
+                .fsc_raw_fullchain_system_transfer_decode_attempts_total
+                .get(),
+            attempts_before + 1
+        );
+        assert_eq!(
+            seer.metrics
+                .fsc_raw_fullchain_system_transfers_decoded_total
+                .get(),
+            decoded_before
+        );
+        assert_eq!(
+            seer.metrics
+                .fsc_transfer_decode_failures_total
+                .with_label_values(&["malformed_transfer_data"])
+                .get(),
+            failures_before + 1
         );
     }
 

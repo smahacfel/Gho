@@ -538,6 +538,7 @@ def validate_reporter_rows(
     *,
     min_rows_written: int,
     require_resolved: bool,
+    require_gatekeeper_buy_context: bool = True,
     reporter_stdout: str = "",
 ) -> ReporterValidation:
     rows_written = len(rows)
@@ -563,7 +564,7 @@ def validate_reporter_rows(
         if truth_source_canonical_rows <= 0:
             status = FAIL_REPORTER_TRUTH if status == PASS_STATUS else status
             errors.append("truth_source=canonical_account_state_snapshot rows <= 0")
-        if gatekeeper_buy_context_found_rows <= 0:
+        if require_gatekeeper_buy_context and gatekeeper_buy_context_found_rows <= 0:
             status = FAIL_REPORTER_TRUTH if status == PASS_STATUS else status
             errors.append("gatekeeper_buy_context_found=true rows <= 0")
         if final_pnl_pct_present_rows <= 0:

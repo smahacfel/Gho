@@ -13,8 +13,9 @@ use ghost_core::checkpoint::{
     MaterializedFeatureSet, SybilResistanceFeatures, TrendDirection, TxSegmentSequence,
 };
 use ghost_core::tx_intelligence::types::{
-    FscEvidenceStatus, FscSnapshotMode, FscV2Evidence, CPV_INSUFFICIENT_SIGNERS_REASON,
-    CPV_ROLLING_STATE_UNAVAILABLE_REASON, DBIA_INSUFFICIENT_BUYERS_REASON, DBIA_NO_DEV_BUY_REASON,
+    FscEvidenceStatus, FscSnapshotMode, FscV2Evidence, CPV_COVERAGE_WINDOW_UNAVAILABLE,
+    CPV_INSUFFICIENT_SIGNERS_REASON, CPV_ROLLING_STATE_UNAVAILABLE_REASON,
+    DBIA_INSUFFICIENT_BUYERS_REASON, DBIA_NO_DEV_BUY_REASON,
     DBIA_RAW_FINGERPRINT_UNAVAILABLE_REASON, DES_CURVE_DATA_UNAVAILABLE_REASON,
     DES_INSUFFICIENT_BUYS_REASON, DES_SLOT_ORDER_UNAVAILABLE_REASON,
     FSC_COVERAGE_WINDOW_UNAVAILABLE, FSC_FUNDING_STREAM_UNAVAILABLE_REASON,
@@ -38,6 +39,7 @@ pub enum HardFailReason {
     ExtremeBotTiming,
     FailedTxRatio,
     SlowPool,
+    StrictMetricThreshold,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +82,9 @@ fn hard_fail_reason_code(reason: HardFailReason) -> GatekeeperReasonCode {
         HardFailReason::ExtremeBotTiming => GatekeeperReasonCode::HardFailExtremeBotTiming,
         HardFailReason::FailedTxRatio => GatekeeperReasonCode::HardFailFailedTxRatio,
         HardFailReason::SlowPool => GatekeeperReasonCode::HardFailSlowPool,
+        HardFailReason::StrictMetricThreshold => {
+            GatekeeperReasonCode::HardFailStrictMetricThreshold
+        }
     }
 }
 
@@ -433,6 +438,7 @@ pub fn build_assessment_from_features(
         .map(|velocity| {
             velocity.interval_cv >= config.min_interval_cv
                 && velocity.interval_cv <= config.max_interval_cv
+                && velocity.burst_ratio >= config.min_burst_ratio
                 && velocity.burst_ratio <= config.max_burst_ratio
                 && velocity.avg_interval_ms >= config.min_avg_interval_ms
                 && velocity.avg_interval_ms <= config.max_avg_interval_ms
@@ -1114,6 +1120,10 @@ fn evaluate_hard_filters_from_assessment(
     assessment: &GatekeeperAssessment,
     config: &GatekeeperV2Config,
 ) -> Option<(HardFailReason, String)> {
+    if let Some(reason) = strict_metric_threshold_failure_from_assessment(assessment, config) {
+        return Some((HardFailReason::StrictMetricThreshold, reason));
+    }
+
     if config.reject_on_dev_sell
         && assessment
             .phase5_dev
@@ -1260,6 +1270,87 @@ fn evaluate_hard_filters_from_assessment(
                 ));
             }
         }
+    }
+
+    None
+}
+
+pub(crate) fn strict_metric_threshold_failure_from_assessment(
+    assessment: &GatekeeperAssessment,
+    config: &GatekeeperV2Config,
+) -> Option<String> {
+    if !config.strict_metric_threshold_gate_enabled {
+        return None;
+    }
+
+    let Some(velocity) = assessment.phase2_velocity.as_ref() else {
+        return Some("HARD_FAIL: strict_metric_missing=burst_ratio".to_string());
+    };
+    if velocity.burst_ratio < config.min_burst_ratio {
+        return Some(format!(
+            "HARD_FAIL: burst_ratio={:.4} < {:.4}",
+            velocity.burst_ratio, config.min_burst_ratio
+        ));
+    }
+    if velocity.burst_ratio > config.max_burst_ratio {
+        return Some(format!(
+            "HARD_FAIL: burst_ratio={:.4} > {:.4}",
+            velocity.burst_ratio, config.max_burst_ratio
+        ));
+    }
+
+    let flipper = assessment
+        .feature_snapshot
+        .alpha_fingerprint
+        .flipper_presence_ratio;
+    let Some(flipper) = flipper else {
+        return Some("HARD_FAIL: strict_metric_missing=flipper_presence_ratio".to_string());
+    };
+    if flipper < config.min_flipper_presence_ratio {
+        return Some(format!(
+            "HARD_FAIL: flipper_presence_ratio={:.4} < {:.4}",
+            flipper, config.min_flipper_presence_ratio
+        ));
+    }
+    if flipper > config.max_flipper_presence_ratio {
+        return Some(format!(
+            "HARD_FAIL: flipper_presence_ratio={:.4} > {:.4}",
+            flipper, config.max_flipper_presence_ratio
+        ));
+    }
+
+    let jito = assessment
+        .feature_snapshot
+        .alpha_fingerprint
+        .jito_tip_intensity;
+    let Some(jito) = jito else {
+        return Some("HARD_FAIL: strict_metric_missing=jito_tip_intensity".to_string());
+    };
+    if jito < config.min_jito_tip_intensity {
+        return Some(format!(
+            "HARD_FAIL: jito_tip_intensity={:.4} < {:.4}",
+            jito, config.min_jito_tip_intensity
+        ));
+    }
+    if jito >= config.max_jito_tip_intensity {
+        return Some(format!(
+            "HARD_FAIL: jito_tip_intensity={:.4} >= {:.4}",
+            jito, config.max_jito_tip_intensity
+        ));
+    }
+
+    let cpv = assessment
+        .feature_snapshot
+        .sybil_resistance
+        .signer_cross_pool_velocity;
+    let Some(cpv) = cpv else {
+        return Some("HARD_FAIL: strict_metric_missing=signer_cross_pool_velocity".to_string());
+    };
+    if cpv >= config.max_signer_cross_pool_velocity {
+        return Some(format!(
+            "HARD_FAIL: signer_cross_pool_velocity={:.4} >= {:.4}",
+            cpv, config.max_signer_cross_pool_velocity
+        ));
     }
 
     None
@@ -2021,6 +2112,7 @@ fn sybil_metric_is_actionable(
                 &sybil.degraded_reasons,
                 CPV_ROLLING_STATE_UNAVAILABLE_REASON,
             ) || has_degraded_reason(&sybil.degraded_reasons, CPV_INSUFFICIENT_SIGNERS_REASON)
+                || has_degraded_reason(&sybil.degraded_reasons, CPV_COVERAGE_WINDOW_UNAVAILABLE)
         }
         SybilMetric::Fsc => sybil
             .degraded_reasons
@@ -2348,6 +2440,7 @@ fn phase4_fingerprint_thresholds_pass(
     compute_unit_cluster_dominance: Option<f64>,
     static_fee_profile_ratio: Option<f64>,
     fixed_size_buy_ratio: Option<f64>,
+    flipper_presence_ratio: Option<f64>,
     jito_tip_intensity: Option<f64>,
     early_slot_volume_dominance_buy: Option<f64>,
     early_top3_buy_volume_pct_3s: Option<f64>,
@@ -2364,6 +2457,8 @@ fn phase4_fingerprint_thresholds_pass(
         && static_fee_profile_ratio.map_or(true, |v| v >= config.min_static_fee_profile_ratio)
         && static_fee_profile_ratio.map_or(true, |v| v <= config.max_static_fee_profile_ratio)
         && fixed_size_buy_ratio.map_or(true, |v| v >= config.min_fixed_size_buy_ratio)
+        && flipper_presence_ratio.map_or(true, |v| v >= config.min_flipper_presence_ratio)
+        && flipper_presence_ratio.map_or(true, |v| v <= config.max_flipper_presence_ratio)
         && jito_tip_intensity.map_or(true, |v| v >= config.min_jito_tip_intensity)
         && jito_tip_intensity.map_or(true, |v| v <= config.max_jito_tip_intensity)
         && early_slot_volume_dominance_buy
@@ -2382,6 +2477,7 @@ fn alpha_fingerprint_phase4_passes(
         alpha.compute_unit_cluster_dominance,
         alpha.static_fee_profile_ratio,
         alpha.fixed_size_buy_ratio,
+        alpha.flipper_presence_ratio,
         alpha.jito_tip_intensity,
         alpha.early_slot_volume_dominance_buy,
         alpha.early_top3_buy_volume_pct_3s,
@@ -2399,6 +2495,7 @@ fn early_fingerprint_phase4_passes(
         fp.compute_unit_cluster_dominance,
         fp.static_fee_profile_ratio,
         fp.fixed_size_buy_ratio,
+        fp.flipper_presence_ratio,
         fp.jito_tip_intensity,
         fp.early_slot_volume_dominance_buy,
         fp.early_top3_buy_volume_pct_3s,
@@ -2706,6 +2803,67 @@ mod tests {
             adaptive_thresholds_applied: false,
             v25_confidence: None,
         }
+    }
+
+    fn r35_strict_metric_config() -> GatekeeperV2Config {
+        let mut config = GatekeeperV2Config::default();
+        config.strict_metric_threshold_gate_enabled = true;
+        config.min_burst_ratio = 0.27;
+        config.max_signer_cross_pool_velocity = 0.9737;
+        config.max_jito_tip_intensity = 0.3485;
+        config.min_flipper_presence_ratio = 0.19;
+        config.max_soft_points = u8::MAX;
+        config.dev_unknown_max_soft_points = u8::MAX;
+        config.max_sybil_soft_points = u8::MAX;
+        config.dev_unknown_max_sybil_soft_points = u8::MAX;
+        config
+    }
+
+    #[test]
+    fn strict_metric_threshold_gate_rejects_missing_required_metric() {
+        let config = r35_strict_metric_config();
+        let mut assessment = alpha_ready_assessment();
+        assessment
+            .feature_snapshot
+            .alpha_fingerprint
+            .flipper_presence_ratio = None;
+        assessment
+            .feature_snapshot
+            .sybil_resistance
+            .signer_cross_pool_velocity = Some(0.50);
+
+        let decision = evaluate_policy_from_assessment(&assessment, &config);
+
+        assert_eq!(decision.verdict_type, GatekeeperVerdictType::RejectHardFail);
+        assert_eq!(
+            decision.reason_code,
+            Some(GatekeeperReasonCode::HardFailStrictMetricThreshold)
+        );
+        assert!(decision
+            .reason_chain
+            .contains("strict_metric_missing=flipper_presence_ratio"));
+    }
+
+    #[test]
+    fn strict_metric_threshold_gate_allows_complete_passing_metrics() {
+        let config = r35_strict_metric_config();
+        let mut assessment = alpha_ready_assessment();
+        assessment
+            .feature_snapshot
+            .alpha_fingerprint
+            .flipper_presence_ratio = Some(0.20);
+        assessment
+            .feature_snapshot
+            .alpha_fingerprint
+            .jito_tip_intensity = Some(0.20);
+        assessment
+            .feature_snapshot
+            .sybil_resistance
+            .signer_cross_pool_velocity = Some(0.50);
+
+        let decision = evaluate_policy_from_assessment(&assessment, &config);
+
+        assert_eq!(decision.verdict_type, GatekeeperVerdictType::Buy);
     }
 
     #[test]

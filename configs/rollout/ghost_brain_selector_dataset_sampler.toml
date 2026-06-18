@@ -230,8 +230,8 @@ emit_sybil_meta_score = false
 require_ready_fsc_for_combo_veto = true
 funding_lookback_window_s = 180
 funding_dust_threshold_lamports = 1000000
-fsc_per_recipient_cap = 128
-fsc_global_recipient_cap = 13000
+fsc_per_recipient_cap = 256
+fsc_global_recipient_cap = 50000
 
 # Bot Detection guard ── AKTYWNE ─────────────────────────────────────────────────
 hard_fail_bot_min_tx = 999999          # ❄ FROZEN (HF-9 bot guard disabled)

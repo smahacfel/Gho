@@ -85,6 +85,14 @@ impl ShadowSimpleExitThresholds {
         (upper.is_finite() && lower.is_finite() && upper > 0.0 && lower >= 0.0)
             .then_some((upper, lower))
     }
+
+    fn take_profit_pnl_pct(self) -> f64 {
+        self.take_profit_pct * 100.0
+    }
+
+    fn stop_loss_pnl_pct(self) -> f64 {
+        -self.stop_loss_pct * 100.0
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3321,6 +3329,25 @@ impl MonitoringEngine {
                 return;
             }
         };
+        if !Self::shadow_simple_exit_truth_satisfies_trigger(trigger, thresholds, &truth) {
+            let evidence =
+                Self::shadow_simple_exit_threshold_miss_evidence(trigger, thresholds, &truth);
+            self.maybe_record_shadow_exit_blocked(
+                base_mint,
+                now_ms,
+                triggered_fraction_bps,
+                &evidence,
+            );
+            warn!(
+                position_id = %position_id,
+                trigger = trigger.as_label(),
+                pnl_pct = truth.pnl_pct,
+                take_profit_pnl_pct = thresholds.take_profit_pnl_pct(),
+                stop_loss_pnl_pct = thresholds.stop_loss_pnl_pct(),
+                "PostBuyGuardian: shadow simple threshold spot trigger blocked because executable PnL did not satisfy business threshold"
+            );
+            return;
+        }
 
         self.set_shadow_exit_reason_code(base_mint, trigger.reason_code());
         let exit = super::integration::ShadowExitExecution {
@@ -3373,6 +3400,43 @@ impl MonitoringEngine {
         } else {
             None
         }
+    }
+
+    fn shadow_simple_exit_truth_satisfies_trigger(
+        trigger: ShadowSimpleExitTrigger,
+        thresholds: ShadowSimpleExitThresholds,
+        truth: &ShadowExitTruth,
+    ) -> bool {
+        const EPSILON_PCT: f64 = 1e-9;
+        match trigger {
+            ShadowSimpleExitTrigger::TakeProfit => {
+                truth.pnl_pct + EPSILON_PCT >= thresholds.take_profit_pnl_pct()
+            }
+            ShadowSimpleExitTrigger::StopLoss => {
+                truth.pnl_pct - EPSILON_PCT <= thresholds.stop_loss_pnl_pct()
+            }
+            ShadowSimpleExitTrigger::TimeStop => true,
+        }
+    }
+
+    fn shadow_simple_exit_threshold_miss_evidence(
+        trigger: ShadowSimpleExitTrigger,
+        thresholds: ShadowSimpleExitThresholds,
+        truth: &ShadowExitTruth,
+    ) -> PriceTruthEvidence {
+        let mut evidence = truth.evidence.clone();
+        let required_pnl_pct = match trigger {
+            ShadowSimpleExitTrigger::TakeProfit => thresholds.take_profit_pnl_pct(),
+            ShadowSimpleExitTrigger::StopLoss => thresholds.stop_loss_pnl_pct(),
+            ShadowSimpleExitTrigger::TimeStop => truth.pnl_pct,
+        };
+        evidence.detail = Some(format!(
+            "shadow executable pnl did not satisfy {trigger_label} threshold: pnl_pct={:.9}; required_pnl_pct={:.9}",
+            truth.pnl_pct,
+            required_pnl_pct,
+            trigger_label = trigger.as_label()
+        ));
+        evidence
     }
 
     fn set_shadow_exit_reason_code(&self, base_mint: &Pubkey, reason_code: &str) {
@@ -4409,11 +4473,11 @@ mod tests {
         let snapshot = MarketSnapshot {
             slot: Some(111),
             timestamp_ms: 1_000,
-            price_sol_per_token: 1.03,
+            price_sol_per_token: 1.05,
             price_state: PriceState::Valid,
-            market_cap_sol: 1.0,
-            reserve_base: 1_000_000.0,
-            reserve_quote: 1.03,
+            market_cap_sol: 1_050_000.0,
+            reserve_base: 1_000_000_000_000.0,
+            reserve_quote: 1_050_000.0,
             ..MarketSnapshot::default()
         };
 
@@ -4443,6 +4507,91 @@ mod tests {
             row.pointer("/kind/type") == Some(&Value::String("PositionClosed".to_string()))
                 && row.pointer("/kind/payload/reason") == Some(&Value::String("Target".to_string()))
         }));
+    }
+
+    #[tokio::test]
+    async fn shadow_runtime_take_profit_requires_executable_pnl_threshold() {
+        let tmp = TempDir::new().expect("tempdir");
+        let lifecycle_log = tmp.path().join("shadow_lifecycle.jsonl");
+        let events_dir = tmp.path().join("events");
+
+        let config = PostBuyGuardianConfig::default();
+        let shadow_ledger = Arc::new(ShadowLedger::new());
+        let (tx, _rx) = mpsc::channel(16);
+        let mut engine = MonitoringEngine::new(config, Arc::clone(&shadow_ledger), tx);
+        engine.set_shadow_simple_exit_thresholds(0.50, 0.50);
+        engine.set_position_router(Arc::new(PositionRuntimeRouter::with_shadow_book(Arc::new(
+            AsyncRwLock::new(ShadowPositionBook::new()),
+        ))));
+        engine.set_shadow_lifecycle_log_path(Some(lifecycle_log.clone()));
+        let emitter = make_shadow_emitter(&events_dir);
+        engine.set_event_emitter(Arc::clone(&emitter));
+        let engine = Arc::new(engine);
+
+        let mint = Pubkey::new_unique();
+        let registered = engine.register_position_with_context(
+            Pubkey::new_unique(),
+            mint,
+            Pubkey::new_unique(),
+            Some(1.0),
+            Some(1_000_000_000),
+            Some(1_000_000),
+            Some(PositionEventContext {
+                join_metadata: PositionJoinMetadata::default(),
+                candidate_id: "cand-shadow-simple-tp-economic-guard".to_string(),
+                entry_order_id: "shadow-entry-simple-tp-economic-guard".to_string(),
+                quote_id: "shadow-quote-simple-tp-economic-guard".to_string(),
+                slot: Some(151),
+                lane: Lane::Shadow,
+                position_id: Some("shadow:test:simple-tp-economic-guard".to_string()),
+                position_epoch: Some(8),
+            }),
+        );
+        assert!(registered.is_some());
+
+        let snapshot = MarketSnapshot {
+            slot: Some(161),
+            timestamp_ms: 1_000,
+            price_sol_per_token: 1.51,
+            price_state: PriceState::Valid,
+            market_cap_sol: 1.51,
+            reserve_base: 1_000_000.0,
+            reserve_quote: 1.51,
+            ..MarketSnapshot::default()
+        };
+
+        engine
+            .run_shadow_runtime_tick(&mint, Some(&snapshot), 1_000)
+            .await;
+        emitter
+            .shared_writer()
+            .lock()
+            .expect("event writer")
+            .flush()
+            .expect("flush events");
+
+        assert_eq!(engine.active_position_count(), 1);
+        let lifecycle_rows = read_jsonl_rows(&lifecycle_log);
+        assert!(
+            lifecycle_rows.iter().any(|row| {
+                row.get("record_type") == Some(&Value::String("exit_blocked".to_string()))
+                    && row.get("truth_status") == Some(&Value::String("resolved".to_string()))
+                    && row
+                        .get("truth_detail")
+                        .and_then(Value::as_str)
+                        .is_some_and(|detail| {
+                            detail.contains("executable pnl did not satisfy take_profit threshold")
+                        })
+            }),
+            "missing executable-PnL threshold block proof: {lifecycle_rows:?}"
+        );
+        assert!(
+            !lifecycle_rows.iter().any(|row| {
+                row.get("record_type") == Some(&Value::String("position_closed".to_string()))
+                    && row.get("close_reason") == Some(&Value::String("Target".to_string()))
+            }),
+            "spot-only target must not close when executable PnL is below threshold: {lifecycle_rows:?}"
+        );
     }
 
     #[tokio::test]

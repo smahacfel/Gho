@@ -981,6 +981,10 @@ impl PumpPortalConnection {
             is_pumpswap: false,
         };
 
+        crate::types::record_trade_source_coverage(
+            crate::types::SEER_PUMPPORTAL_COVERAGE_SOURCE,
+            &trade_event,
+        );
         events.push(Self::trade_event_to_geyser_event(
             trade_event,
             pumpfun_program_id,
@@ -1145,6 +1149,10 @@ impl PumpPortalConnection {
             is_pumpswap: false,
         };
 
+        crate::types::record_trade_source_coverage(
+            crate::types::SEER_PUMPPORTAL_COVERAGE_SOURCE,
+            &trade_event,
+        );
         Ok(Some(Self::trade_event_to_geyser_event(
             trade_event,
             pumpfun_program_id,

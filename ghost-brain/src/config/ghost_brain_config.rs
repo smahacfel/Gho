@@ -1051,6 +1051,10 @@ pub struct GatekeeperV2Config {
     /// Default: 0.70
     pub max_burst_ratio: f64,
 
+    /// Minimum fraction of TX arriving in the first 20% of the observation window.
+    /// Default: 0.0 (neutral / no lower bound)
+    pub min_burst_ratio: f64,
+
     /// Minimum average interval between TX (ms).
     /// Default: 60.0
     pub min_avg_interval_ms: f64,
@@ -1258,6 +1262,13 @@ pub struct GatekeeperV2Config {
     /// Default: true
     pub use_three_layer_decision: bool,
 
+    /// Enable fail-closed hard gating for configured metric thresholds.
+    ///
+    /// When true, selected metric thresholds require present decision-time
+    /// evidence and any missing/out-of-range metric produces a hard REJECT.
+    /// Default: false (backward-compatible; missing metrics keep legacy behavior).
+    pub strict_metric_threshold_gate_enabled: bool,
+
     // ── Hard Fail extreme thresholds (kill-switches at obvious extremes) ────
     // These are HIGHER than the phase-level soft thresholds.
     // They catch only blatant manipulation, independent of phase pass/fail.
@@ -1437,6 +1448,10 @@ pub struct GatekeeperV2Config {
     /// Maximum acceptable fraction of wallets that both bought and sold early.
     /// Default: 1.0 (neutral / telemetry-only)
     pub max_flipper_presence_ratio: f64,
+
+    /// Minimum acceptable fraction of wallets that both bought and sold early.
+    /// Default: 0.0 (neutral / no lower bound)
+    pub min_flipper_presence_ratio: f64,
 
     /// Maximum acceptable fraction of tx with deterministic Jito tips.
     /// Default: 1.0 (neutral / telemetry-only)
@@ -1718,6 +1733,7 @@ impl Default for GatekeeperV2Config {
             min_interval_cv: 0.3,
             max_interval_cv: 9999.0,
             max_burst_ratio: 0.70,
+            min_burst_ratio: 0.0,
             min_avg_interval_ms: 60.0,
             max_avg_interval_ms: 600.0,
             min_timing_entropy: 1.2,
@@ -1772,6 +1788,7 @@ impl Default for GatekeeperV2Config {
 
             // Three-Layer Decision System
             use_three_layer_decision: true,
+            strict_metric_threshold_gate_enabled: false,
             hard_fail_hhi: 0.10,
             hard_fail_same_ms_tx_ratio: 0.60,
             hard_fail_top3_volume_pct: 0.70,
@@ -1821,6 +1838,7 @@ impl Default for GatekeeperV2Config {
             min_fixed_size_buy_ratio: 0.0,
             max_fixed_size_buy_ratio_1e4: 1.0,
             max_flipper_presence_ratio: 1.0,
+            min_flipper_presence_ratio: 0.0,
             max_jito_tip_intensity: 1.0,
             min_jito_tip_intensity: 0.0,
             max_early_slot_volume_dominance_buy: 1.0,

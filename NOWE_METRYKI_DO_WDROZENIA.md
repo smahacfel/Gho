@@ -654,6 +654,20 @@ FINGERPRINT pool=<...> mint=<...> ... ftdi=<...> dbia=<...> sfd=<...> fsc=<...> 
 
 Formatowanie: `null` jeśli None, 4 miejsca po przecinku dla f64.
 
+## ADR follow-up po PR10-PR12
+
+Ta sekcja utrwala rozstrzygnięcia implementacyjne po naprawie metryk, żeby kolejne iteracje nie wracały do wcześniejszych, błędnych interpretacji.
+
+- `FSC` primary score to wyłącznie normalized HHI dla clean-only FSC v2: `funding_source_v2.status == clean`, brak `excluded_reason`, snapshot `decision_time`, oraz gotowe authoritative coverage window jeśli `fsc_require_coverage_window_for_actionability=true`. Zdegradowane FSC v2 może być logowane diagnostycznie, ale nie może materializować actionable `funding_source_concentration`.
+- `DES` w v1 używa wyłącznie Kendall/Tau-b style rank correlation na porównywalnych parach. Spearman/Pearson nie są częścią v1. `DES_NO_COMPARABLE_PAIRS` oznacza `demand_elasticity_score=None`, nigdy syntetyczne `0.0`.
+- `SFD` to weighted MAD z jawną semantyką fallback/degraded. Braki pre/post balance, zerowe pre-balance i ujemne delty są klasyfikowane przez typed degraded reasons; nie wolno ich cicho mapować na neutralny wynik.
+- `FTDI` i `DBIA` mają partial coverage semantics. Brak raw toolchain fingerprintu lub częściowa coverage nie jest równoznaczna z neutralnym toolchainem; wynik może pozostać `None`, a coverage diagnostics muszą trafić do buy-logu.
+- `CPV` wymaga coverage-window readiness. Ciepły indeks z krótką historią nie wystarcza do actionable `signer_cross_pool_velocity`; w takim przypadku wynik pozostaje `None`, a degraded reasons zawierają `CPV_COVERAGE_WINDOW_UNAVAILABLE`. Diagnostyki `cpv_distinct_other_pools_mean` i `cpv_other_pool_activity_count_p95` są export-only i nie są policy inputs.
+- Buy-log musi zachowywać sześć wartości sybil, typed degraded reasons, `funding_source_v2`, `funding_source_diagnostics`, CPV diagnostics oraz coverage diagnostics (`toolchain_fingerprint_coverage`, `des_valid_sequence_coverage`) jako addytywne pola serde.
+- Neutral thresholds oraz soft-penalty tuning pozostają poza zakresem tej naprawy. PR10-PR12 naprawiają actionability, coverage, logging i walidację replay/report; nie kalibrują progów biznesowych.
+
+Acceptance guard dla replay/report: `scripts/gatekeeper_metric_repair_acceptance.py` failuje, jeśli zdegradowane FSC v2 staje się actionable, `DES_NO_COMPARABLE_PAIRS` zapisuje `0.0`, DBIA solo z wysokim FTDI generuje pattern `HIGH_DBIA_LOW_FTDI`, albo CPV działa mimo `CPV_COVERAGE_WINDOW_UNAVAILABLE`.
+
 ---
 
 ## Metryki odrzucone podczas sesji (z uzasadnieniem)

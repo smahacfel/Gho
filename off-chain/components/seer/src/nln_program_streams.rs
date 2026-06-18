@@ -7,7 +7,10 @@
 use crate::config::{ProgramStreamPayloadFormat, ProgramStreamsConfig};
 use crate::grpc_connection::PUMP_FUN_PROGRAM_ID;
 use crate::ipc::{FundingTransferCoverageClass, FundingTransferEvent, FundingTransferProvenance};
-use crate::types::{CandidatePool, RawBytesMissingReason, ToolchainFingerprintInput, TradeEvent};
+use crate::types::{
+    record_trade_source_coverage, CandidatePool, RawBytesMissingReason, ToolchainFingerprintInput,
+    TradeEvent, SEER_NLN_PROGRAM_STREAMS_COVERAGE_SOURCE,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose, Engine as _};
 use futures::Stream;
@@ -314,7 +317,7 @@ impl NlnPumpFunTradeEvent {
             .unwrap_or(self.meta.recv_ts_ms);
         let is_buy = self.side.is_buy();
 
-        TradeEvent {
+        let trade = TradeEvent {
             semantic: nln_semantic(Some(self.slot), event_time),
             slot: Some(self.slot),
             signature: self.signature,
@@ -369,7 +372,9 @@ impl NlnPumpFunTradeEvent {
                 || self.real_token_reserves.is_some(),
             curve_finality: CurveFinality::Speculative,
             is_pumpswap: false,
-        }
+        };
+        record_trade_source_coverage(SEER_NLN_PROGRAM_STREAMS_COVERAGE_SOURCE, &trade);
+        trade
     }
 }
 

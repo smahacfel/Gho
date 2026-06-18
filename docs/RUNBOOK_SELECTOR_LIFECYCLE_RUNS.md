@@ -75,7 +75,9 @@ Failure stops the run and marks the launcher report as failed.
 
 ## Lifecycle Canary
 
-Before the run can be left in the background, the launcher requires full lifecycle proof on rows appended after its baseline snapshot:
+Before the run can be left in the background, the launcher requires full lifecycle proof on rows appended after its baseline snapshot.
+
+For ordinary BUY shadow runs, the accepted plane is `shadow`:
 
 ```text
 shadow_buys_delta > 0
@@ -93,6 +95,34 @@ truth_status=resolved lifecycle rows > 0
 truth_source=canonical_account_state_snapshot lifecycle rows > 0
 final_pnl_pct lifecycle rows > 0
 close_reason in Target/StopLoss/TimeStop > 0
+```
+
+For all-decision counterfactual runs with `[p37_shadow_probe]`, the accepted
+plane may be `probe` when no active BUY shadow proof appears in the canary
+window. Probe proof requires:
+
+```text
+probe_transport_delta > 0
+probe_entries_delta > 0
+probe_lifecycle_delta > 0
+counterfactual_shadow_probe_simulated rows > 0
+position_closed rows > 0
+exit_filled rows > 0
+truth_status=resolved lifecycle rows > 0
+truth_source=canonical_account_state_snapshot lifecycle rows > 0
+final_pnl_pct lifecycle rows > 0
+close_reason in Target/StopLoss/TimeStop > 0
+```
+
+Both planes remain fail-closed on bad runtime markers:
+
+```text
+AccountNotFound_delta = 0
+ResourceExhausted_delta = 0
+unsupported_legacy_buy_layout_requires_bcv2_delta = 0
+Custom(6062)_delta = 0
+0x17ae_delta = 0
+relative URL without a base_delta = 0
 ```
 
 Then the canary runs:
@@ -115,6 +145,11 @@ final_pnl_pct present rows >= 1
 exit_fills_total >= 1
 accepted close_reason rows >= 1
 ```
+
+For probe-plane acceptance, the reporter runs with `--artifact-plane probe`.
+`gatekeeper_buy_context_found` is not required for probe rows because
+REJECT/TIMEOUT counterfactual probes are intentionally not active Gatekeeper BUY
+dispatches.
 
 ## Selector Regression Gates
 

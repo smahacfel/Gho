@@ -33,6 +33,7 @@ pub enum GatekeeperReasonCode {
     HardFailSellImpact,
     HardFailTxPriceImpact,
     HardFailPriceChange,
+    HardFailStrictMetricThreshold,
 
     // ── PDD ──
     RejectPddEntryDrift,
@@ -131,6 +132,7 @@ impl GatekeeperReasonCode {
             "SellImpact" => Some(Self::HardFailSellImpact),
             "TxPriceImpact" => Some(Self::HardFailTxPriceImpact),
             "PriceChange" => Some(Self::HardFailPriceChange),
+            "StrictMetricThreshold" => Some(Self::HardFailStrictMetricThreshold),
             _ => None,
         }
     }

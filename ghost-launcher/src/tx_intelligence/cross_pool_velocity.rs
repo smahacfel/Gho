@@ -5,14 +5,16 @@ use crate::oracle_metrics::{
 };
 use ghost_brain::config::GatekeeperV2Config;
 use ghost_core::tx_intelligence::types::{
-    CPV_INSUFFICIENT_SIGNERS_REASON, CPV_ROLLING_STATE_UNAVAILABLE_REASON,
+    CPV_COVERAGE_WINDOW_UNAVAILABLE, CPV_INSUFFICIENT_SIGNERS_REASON,
+    CPV_ROLLING_STATE_UNAVAILABLE_REASON,
 };
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet, VecDeque};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CrossPoolVelocityConfig {
     pub lookback_window_ms: u64,
+    pub min_observed_window_ratio: f64,
     pub per_signer_cap: usize,
     pub global_signer_cap: usize,
 }
@@ -22,6 +24,10 @@ impl CrossPoolVelocityConfig {
     pub fn from_gatekeeper_config(config: &GatekeeperV2Config) -> Self {
         Self {
             lookback_window_ms: config.cpv_lookback_window_s.saturating_mul(1_000),
+            min_observed_window_ratio: finite_non_negative_or_default(
+                config.cpv_min_observed_window_ratio,
+                1.0,
+            ),
             per_signer_cap: config.cpv_per_signer_cap.max(1),
             global_signer_cap: config.cpv_global_signer_cap.max(1),
         }
@@ -33,6 +39,8 @@ pub struct CpvComputation {
     pub signer_cross_pool_velocity: Option<f64>,
     pub degraded_reasons: Vec<String>,
     pub signer_sample_count: u64,
+    pub distinct_other_pools_mean: Option<f64>,
+    pub other_pool_activity_count_p95: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +60,8 @@ struct CrossPoolVelocityInner {
     histories: HashMap<String, SignerHistory>,
     signer_order: VecDeque<(u64, String)>,
     saw_activity: bool,
+    first_observed_at_ms: Option<u64>,
+    last_observed_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -130,6 +140,7 @@ impl CrossPoolVelocityIndex {
         if evictions > 0 {
             record_cpv_index_evictions(evictions);
         }
+        refresh_observed_bounds_locked(&mut inner);
         record_cpv_index_entries(inner.histories.len());
     }
 
@@ -148,14 +159,19 @@ impl CrossPoolVelocityIndex {
         let window_start = anchor_ts_ms.saturating_sub(lookback_window_ms);
 
         let mut inner = self.inner.write();
+        let stale_entries = prune_histories_locked(&mut inner, window_start);
         let evictions =
             prune_global_locked(&mut inner, window_start, config.global_signer_cap.max(1));
         if evictions > 0 {
             record_cpv_index_evictions(evictions);
         }
+        refresh_observed_bounds_locked(&mut inner);
         record_cpv_index_entries(inner.histories.len());
 
-        let ready = inner.saw_activity && !inner.histories.is_empty();
+        let ready = inner.saw_activity
+            && !inner.histories.is_empty()
+            && inner.first_observed_at_ms.is_some()
+            && inner.last_observed_at_ms.is_some();
         let mut degraded_reasons = Vec::new();
         if !ready {
             degraded_reasons.push(CPV_ROLLING_STATE_UNAVAILABLE_REASON.to_string());
@@ -168,18 +184,32 @@ impl CrossPoolVelocityIndex {
                 signer_cross_pool_velocity: None,
                 degraded_reasons,
                 signer_sample_count,
+                distinct_other_pools_mean: None,
+                other_pool_activity_count_p95: None,
             };
+        }
+
+        let required_observed_window_ms =
+            required_observed_window_ms(lookback_window_ms, config.min_observed_window_ratio);
+        let coverage_window_ready = observed_window_ms(&inner)
+            .is_some_and(|observed_window_ms| observed_window_ms >= required_observed_window_ms);
+        if !coverage_window_ready {
+            degraded_reasons.push(CPV_COVERAGE_WINDOW_UNAVAILABLE.to_string());
         }
 
         let mut cross_pool_signers = 0u64;
         let mut lookup_hits = 0u64;
         let mut lookup_misses = 0u64;
         let mut removed_entries = 0u64;
+        let mut distinct_other_pool_counts = Vec::with_capacity(unique_signers.len());
+        let mut other_pool_activity_counts = Vec::with_capacity(unique_signers.len());
 
         for signer in unique_signers {
             let mut remove_signer = false;
             let mut is_cross_pool = false;
             let mut has_history = false;
+            let mut distinct_other_pools = HashSet::new();
+            let mut other_pool_activity_count = 0u64;
 
             if let Some(history) = inner.histories.get_mut(&signer) {
                 prune_history(&mut history.activities, window_start);
@@ -191,6 +221,12 @@ impl CrossPoolVelocityIndex {
                         .activities
                         .iter()
                         .any(|activity| activity.pool_id != current_pool_id);
+                    for activity in &history.activities {
+                        if activity.pool_id != current_pool_id {
+                            distinct_other_pools.insert(activity.pool_id.clone());
+                            other_pool_activity_count = other_pool_activity_count.saturating_add(1);
+                        }
+                    }
                 }
             }
 
@@ -207,9 +243,12 @@ impl CrossPoolVelocityIndex {
             } else {
                 lookup_misses = lookup_misses.saturating_add(1);
             }
+            distinct_other_pool_counts.push(distinct_other_pools.len() as u64);
+            other_pool_activity_counts.push(other_pool_activity_count);
         }
 
-        if removed_entries > 0 {
+        if stale_entries > 0 || removed_entries > 0 {
+            refresh_observed_bounds_locked(&mut inner);
             record_cpv_index_entries(inner.histories.len());
         }
         if lookup_hits > 0 {
@@ -219,19 +258,27 @@ impl CrossPoolVelocityIndex {
             record_cpv_lookup_misses(lookup_misses);
         }
 
+        let distinct_other_pools_mean = mean_u64(&distinct_other_pool_counts);
+        let other_pool_activity_count_p95 = percentile_u64(&mut other_pool_activity_counts, 0.95);
+
         CpvComputation {
-            signer_cross_pool_velocity: Some(
-                cross_pool_signers as f64 / signer_sample_count as f64,
-            ),
-            degraded_reasons: Vec::new(),
+            signer_cross_pool_velocity: degraded_reasons
+                .is_empty()
+                .then_some(cross_pool_signers as f64 / signer_sample_count as f64),
+            degraded_reasons,
             signer_sample_count,
+            distinct_other_pools_mean,
+            other_pool_activity_count_p95,
         }
     }
 
     #[must_use]
     pub fn is_ready(&self) -> bool {
         let inner = self.inner.read();
-        inner.saw_activity && !inner.histories.is_empty()
+        inner.saw_activity
+            && !inner.histories.is_empty()
+            && inner.first_observed_at_ms.is_some()
+            && inner.last_observed_at_ms.is_some()
     }
 
     #[must_use]
@@ -247,6 +294,19 @@ fn prune_history(activities: &mut VecDeque<SignerActivity>, window_start: u64) {
     {
         activities.pop_front();
     }
+}
+
+fn prune_histories_locked(inner: &mut CrossPoolVelocityInner, window_start: u64) -> u64 {
+    let mut removed = 0u64;
+    inner.histories.retain(|_, history| {
+        prune_history(&mut history.activities, window_start);
+        let keep = !history.activities.is_empty();
+        if !keep {
+            removed = removed.saturating_add(1);
+        }
+        keep
+    });
+    removed
 }
 
 fn prune_global_locked(
@@ -273,6 +333,78 @@ fn prune_global_locked(
         }
     }
     evictions
+}
+
+fn refresh_observed_bounds_locked(inner: &mut CrossPoolVelocityInner) {
+    let mut first_observed_at_ms = None::<u64>;
+    let mut last_observed_at_ms = None::<u64>;
+
+    for history in inner.histories.values() {
+        for activity in &history.activities {
+            first_observed_at_ms = Some(
+                first_observed_at_ms.map_or(activity.observed_at_ms, |current| {
+                    current.min(activity.observed_at_ms)
+                }),
+            );
+            last_observed_at_ms = Some(
+                last_observed_at_ms.map_or(activity.observed_at_ms, |current| {
+                    current.max(activity.observed_at_ms)
+                }),
+            );
+        }
+    }
+
+    inner.first_observed_at_ms = first_observed_at_ms;
+    inner.last_observed_at_ms = last_observed_at_ms;
+}
+
+fn observed_window_ms(inner: &CrossPoolVelocityInner) -> Option<u64> {
+    Some(
+        inner
+            .last_observed_at_ms?
+            .saturating_sub(inner.first_observed_at_ms?),
+    )
+}
+
+fn required_observed_window_ms(lookback_window_ms: u64, min_observed_window_ratio: f64) -> u64 {
+    if min_observed_window_ratio <= 0.0 {
+        return 0;
+    }
+
+    let required = (lookback_window_ms as f64) * min_observed_window_ratio;
+    if !required.is_finite() {
+        return u64::MAX;
+    }
+    required.ceil().clamp(0.0, u64::MAX as f64) as u64
+}
+
+fn finite_non_negative_or_default(value: f64, fallback: f64) -> f64 {
+    if value.is_finite() {
+        value.max(0.0)
+    } else {
+        fallback
+    }
+}
+
+fn mean_u64(values: &[u64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+
+    Some(values.iter().copied().sum::<u64>() as f64 / values.len() as f64)
+}
+
+fn percentile_u64(values: &mut [u64], percentile: f64) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+
+    values.sort_unstable();
+    let rank = ((values.len() as f64) * percentile).ceil().max(1.0) as usize;
+    values
+        .get(rank.saturating_sub(1))
+        .copied()
+        .map(|value| value as f64)
 }
 
 fn unique_successful_signers<'a>(
@@ -306,6 +438,16 @@ mod tests {
     fn test_config() -> CrossPoolVelocityConfig {
         let mut gatekeeper_config = GatekeeperV2Config::default();
         gatekeeper_config.cpv_lookback_window_s = 1;
+        gatekeeper_config.cpv_min_observed_window_ratio = 0.0;
+        gatekeeper_config.cpv_per_signer_cap = 8;
+        gatekeeper_config.cpv_global_signer_cap = 8;
+        CrossPoolVelocityConfig::from_gatekeeper_config(&gatekeeper_config)
+    }
+
+    fn coverage_window_config() -> CrossPoolVelocityConfig {
+        let mut gatekeeper_config = GatekeeperV2Config::default();
+        gatekeeper_config.cpv_lookback_window_s = 1;
+        gatekeeper_config.cpv_min_observed_window_ratio = 1.0;
         gatekeeper_config.cpv_per_signer_cap = 8;
         gatekeeper_config.cpv_global_signer_cap = 8;
         CrossPoolVelocityConfig::from_gatekeeper_config(&gatekeeper_config)
@@ -390,6 +532,8 @@ mod tests {
         assert_eq!(computed.signer_cross_pool_velocity, Some(1.0 / 3.0));
         assert!(computed.degraded_reasons.is_empty());
         assert_eq!(computed.signer_sample_count, 3);
+        assert_eq!(computed.distinct_other_pools_mean, Some(1.0 / 3.0));
+        assert_eq!(computed.other_pool_activity_count_p95, Some(1.0));
     }
 
     #[test]
@@ -410,6 +554,56 @@ mod tests {
 
         assert_eq!(computed.signer_cross_pool_velocity, Some(0.0));
         assert!(computed.degraded_reasons.is_empty());
+    }
+
+    #[test]
+    fn fresh_process_with_partial_observed_window_blocks_cpv() {
+        let index = CrossPoolVelocityIndex::new();
+        let config = coverage_window_config();
+
+        index.observe_buy("pool-z", "shared", 100, &config);
+        index.observe_buy("pool-a", "local-a", 150, &config);
+        index.observe_buy("pool-a", "local-b", 200, &config);
+
+        let current = vec![
+            tx("pool-a", "shared", "sig-shared", 210),
+            tx("pool-a", "local-a", "sig-local-a", 220),
+            tx("pool-a", "local-b", "sig-local-b", 230),
+        ];
+        let computed = index.compute_for_transactions("pool-a", current.iter(), Some(230), &config);
+
+        assert_eq!(computed.signer_cross_pool_velocity, None);
+        assert_eq!(
+            computed.degraded_reasons,
+            vec![CPV_COVERAGE_WINDOW_UNAVAILABLE.to_string()]
+        );
+        assert_eq!(computed.signer_sample_count, 3);
+        assert_eq!(computed.distinct_other_pools_mean, Some(1.0 / 3.0));
+        assert_eq!(computed.other_pool_activity_count_p95, Some(1.0));
+    }
+
+    #[test]
+    fn full_observed_window_allows_cpv_score() {
+        let index = CrossPoolVelocityIndex::new();
+        let config = coverage_window_config();
+
+        index.observe_buy("pool-z", "shared", 100, &config);
+        index.observe_buy("pool-a", "local-a", 600, &config);
+        index.observe_buy("pool-a", "local-b", 1_100, &config);
+
+        let current = vec![
+            tx("pool-a", "shared", "sig-shared", 1_100),
+            tx("pool-a", "local-a", "sig-local-a", 1_110),
+            tx("pool-a", "local-b", "sig-local-b", 1_120),
+        ];
+        let computed =
+            index.compute_for_transactions("pool-a", current.iter(), Some(1_100), &config);
+
+        assert_eq!(computed.signer_cross_pool_velocity, Some(1.0 / 3.0));
+        assert!(computed.degraded_reasons.is_empty());
+        assert_eq!(computed.signer_sample_count, 3);
+        assert_eq!(computed.distinct_other_pools_mean, Some(1.0 / 3.0));
+        assert_eq!(computed.other_pool_activity_count_p95, Some(1.0));
     }
 
     #[test]

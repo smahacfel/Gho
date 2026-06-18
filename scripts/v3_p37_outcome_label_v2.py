@@ -4,7 +4,7 @@ Build P3.7 Outcome Label v2 rows.
 
 This is an additive offline labeler. It does not rewrite v1 labels, decision
 logs, runtime evidence, or Gatekeeper policy. The conservative rule is that a
-v1 +40 outcome without a real price/lifecycle path is not promoted to
+v1 +50 outcome without a real price/lifecycle path is not promoted to
 good_clean. It remains good_dirty until P3.7 can verify MFE/MAE/time-path and
 execution feasibility.
 """
@@ -21,9 +21,9 @@ import gatekeeper_outcome_labeler as v1
 
 
 LABEL_V2_SCHEMA_VERSION = 1
-DEFAULT_TARGET_PCT = 40.0
-DEFAULT_STOP_PCT = 40.0
-DEFAULT_DIRTY_MAE_PCT = -40.0
+DEFAULT_TARGET_PCT = 50.0
+DEFAULT_STOP_PCT = 50.0
+DEFAULT_DIRTY_MAE_PCT = -50.0
 PRICE_PATH_USABLE_STATUSES = {"ok", "partial"}
 
 

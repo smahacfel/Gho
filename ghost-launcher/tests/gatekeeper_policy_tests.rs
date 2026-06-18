@@ -11,9 +11,9 @@ use ghost_core::session::types::{SessionId, SessionMetadata};
 use ghost_core::tx_intelligence::types::TxIntelFeatures;
 use ghost_core::tx_intelligence::types::{
     FscAttributionScope, FscEvidenceStatus, FscExcludedReason, FscSnapshotMode, FscV2Evidence,
-    FscVersion, FundingSourceKey, CPV_ROLLING_STATE_UNAVAILABLE_REASON,
-    FSC_COVERAGE_WINDOW_UNAVAILABLE, FSC_V2_STATUS_NOT_CLEAN, FTDI_INSUFFICIENT_BUYS_REASON,
-    SFD_PARTIAL_BALANCE_COVERAGE_REASON,
+    FscVersion, FundingSourceKey, CPV_COVERAGE_WINDOW_UNAVAILABLE,
+    CPV_ROLLING_STATE_UNAVAILABLE_REASON, FSC_COVERAGE_WINDOW_UNAVAILABLE, FSC_V2_STATUS_NOT_CLEAN,
+    FTDI_INSUFFICIENT_BUYS_REASON, SFD_PARTIAL_BALANCE_COVERAGE_REASON,
 };
 use ghost_core::{CurveFinality, CurveFreshnessState, EventSemanticEnvelope};
 use ghost_launcher::components::gatekeeper::{
@@ -651,6 +651,34 @@ fn degraded_sybil_metrics_do_not_score_even_with_active_penalties() {
     assert_eq!(decision.sybil_policy.soft_points, 0);
     assert_eq!(decision.sybil_policy.soft_signals.format_flags(), "none");
     assert_eq!(decision.sybil_policy.lead_signal, None);
+}
+
+#[test]
+fn cpv_coverage_window_unavailable_blocks_high_cpv_soft_signal() {
+    let mut config = policy_test_config();
+    config.max_signer_cross_pool_velocity = 0.25;
+    config.soft_penalty_high_cpv = 5;
+    config.enable_sybil_interference_layer = true;
+    config.max_sybil_soft_points = 1;
+
+    let mut features = base_feature_set();
+    features.sybil_resistance = SybilResistanceFeatures {
+        signer_cross_pool_velocity: Some(0.90),
+        degraded_reasons: vec![CPV_COVERAGE_WINDOW_UNAVAILABLE.to_string()],
+        buy_sample_count: 24,
+        signer_sample_count: 18,
+        ..SybilResistanceFeatures::default()
+    };
+
+    let decision = evaluate(features, &config);
+    assert!(decision.verdict_buy);
+    assert!(!decision.sybil_policy.soft_signals.high_cpv);
+    assert_eq!(decision.sybil_policy.soft_points, 0);
+    assert!(decision
+        .sybil_policy
+        .metric_degraded_reasons
+        .iter()
+        .any(|reason| reason == CPV_COVERAGE_WINDOW_UNAVAILABLE));
 }
 
 #[test]

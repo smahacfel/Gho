@@ -1,0 +1,125 @@
+scope,lookback,min_abs_attribution_lamports,min_rel_to_buy,hits,total,coverage_pct,unlocked_from_current,notes
+row_raw_inbound,5m,any,any,419,2370,17.6793,323,raw inbound before thresholds
+buy_row_raw_inbound,5m,any,any,215,1178,18.2513,180,BUY-row raw inbound before thresholds
+row_attribution_scenario,5m,10000000,0.2,96,2370,4.0506,0,any qualifying inbound event in lookback
+buy_row_attribution_scenario,5m,10000000,0.2,35,1178,2.9711,0,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,5m,10000000,0.1,108,2370,4.5570,12,any qualifying inbound event in lookback
+buy_row_attribution_scenario,5m,10000000,0.1,44,1178,3.7351,9,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,5m,10000000,0.05,117,2370,4.9367,21,any qualifying inbound event in lookback
+buy_row_attribution_scenario,5m,10000000,0.05,48,1178,4.0747,13,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,5m,5000000,0.2,96,2370,4.0506,0,any qualifying inbound event in lookback
+buy_row_attribution_scenario,5m,5000000,0.2,35,1178,2.9711,0,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,5m,5000000,0.1,109,2370,4.5992,13,any qualifying inbound event in lookback
+buy_row_attribution_scenario,5m,5000000,0.1,45,1178,3.8200,10,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,5m,5000000,0.05,118,2370,4.9789,22,any qualifying inbound event in lookback
+buy_row_attribution_scenario,5m,5000000,0.05,49,1178,4.1596,14,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,5m,2000000,0.2,96,2370,4.0506,0,any qualifying inbound event in lookback
+buy_row_attribution_scenario,5m,2000000,0.2,35,1178,2.9711,0,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,5m,2000000,0.1,109,2370,4.5992,13,any qualifying inbound event in lookback
+buy_row_attribution_scenario,5m,2000000,0.1,45,1178,3.8200,10,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,5m,2000000,0.05,118,2370,4.9789,22,any qualifying inbound event in lookback
+buy_row_attribution_scenario,5m,2000000,0.05,49,1178,4.1596,14,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,5m,1000000,0.2,96,2370,4.0506,0,any qualifying inbound event in lookback
+buy_row_attribution_scenario,5m,1000000,0.2,35,1178,2.9711,0,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,5m,1000000,0.1,109,2370,4.5992,13,any qualifying inbound event in lookback
+buy_row_attribution_scenario,5m,1000000,0.1,45,1178,3.8200,10,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,5m,1000000,0.05,118,2370,4.9789,22,any qualifying inbound event in lookback
+buy_row_attribution_scenario,5m,1000000,0.05,49,1178,4.1596,14,BUY-row any qualifying inbound event in lookback
+row_raw_inbound,15m,any,any,618,2370,26.0759,522,raw inbound before thresholds
+buy_row_raw_inbound,15m,any,any,351,1178,29.7963,316,BUY-row raw inbound before thresholds
+row_attribution_scenario,15m,10000000,0.2,139,2370,5.8650,43,any qualifying inbound event in lookback
+buy_row_attribution_scenario,15m,10000000,0.2,56,1178,4.7538,21,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,15m,10000000,0.1,150,2370,6.3291,54,any qualifying inbound event in lookback
+buy_row_attribution_scenario,15m,10000000,0.1,66,1178,5.6027,31,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,15m,10000000,0.05,162,2370,6.8354,66,any qualifying inbound event in lookback
+buy_row_attribution_scenario,15m,10000000,0.05,74,1178,6.2818,39,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,15m,5000000,0.2,140,2370,5.9072,44,any qualifying inbound event in lookback
+buy_row_attribution_scenario,15m,5000000,0.2,56,1178,4.7538,21,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,15m,5000000,0.1,151,2370,6.3713,55,any qualifying inbound event in lookback
+buy_row_attribution_scenario,15m,5000000,0.1,66,1178,5.6027,31,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,15m,5000000,0.05,163,2370,6.8776,67,any qualifying inbound event in lookback
+buy_row_attribution_scenario,15m,5000000,0.05,74,1178,6.2818,39,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,15m,2000000,0.2,140,2370,5.9072,44,any qualifying inbound event in lookback
+buy_row_attribution_scenario,15m,2000000,0.2,56,1178,4.7538,21,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,15m,2000000,0.1,152,2370,6.4135,56,any qualifying inbound event in lookback
+buy_row_attribution_scenario,15m,2000000,0.1,67,1178,5.6876,32,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,15m,2000000,0.05,164,2370,6.9198,68,any qualifying inbound event in lookback
+buy_row_attribution_scenario,15m,2000000,0.05,75,1178,6.3667,40,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,15m,1000000,0.2,140,2370,5.9072,44,any qualifying inbound event in lookback
+buy_row_attribution_scenario,15m,1000000,0.2,56,1178,4.7538,21,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,15m,1000000,0.1,152,2370,6.4135,56,any qualifying inbound event in lookback
+buy_row_attribution_scenario,15m,1000000,0.1,67,1178,5.6876,32,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,15m,1000000,0.05,164,2370,6.9198,68,any qualifying inbound event in lookback
+buy_row_attribution_scenario,15m,1000000,0.05,75,1178,6.3667,40,BUY-row any qualifying inbound event in lookback
+row_raw_inbound,30m,any,any,634,2370,26.7511,538,raw inbound before thresholds
+buy_row_raw_inbound,30m,any,any,364,1178,30.8998,329,BUY-row raw inbound before thresholds
+row_attribution_scenario,30m,10000000,0.2,145,2370,6.1181,49,any qualifying inbound event in lookback
+buy_row_attribution_scenario,30m,10000000,0.2,60,1178,5.0934,25,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,30m,10000000,0.1,157,2370,6.6245,61,any qualifying inbound event in lookback
+buy_row_attribution_scenario,30m,10000000,0.1,71,1178,6.0272,36,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,30m,10000000,0.05,169,2370,7.1308,73,any qualifying inbound event in lookback
+buy_row_attribution_scenario,30m,10000000,0.05,79,1178,6.7063,44,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,30m,5000000,0.2,146,2370,6.1603,50,any qualifying inbound event in lookback
+buy_row_attribution_scenario,30m,5000000,0.2,60,1178,5.0934,25,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,30m,5000000,0.1,158,2370,6.6667,62,any qualifying inbound event in lookback
+buy_row_attribution_scenario,30m,5000000,0.1,71,1178,6.0272,36,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,30m,5000000,0.05,170,2370,7.1730,74,any qualifying inbound event in lookback
+buy_row_attribution_scenario,30m,5000000,0.05,79,1178,6.7063,44,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,30m,2000000,0.2,146,2370,6.1603,50,any qualifying inbound event in lookback
+buy_row_attribution_scenario,30m,2000000,0.2,60,1178,5.0934,25,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,30m,2000000,0.1,159,2370,6.7089,63,any qualifying inbound event in lookback
+buy_row_attribution_scenario,30m,2000000,0.1,72,1178,6.1121,37,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,30m,2000000,0.05,171,2370,7.2152,75,any qualifying inbound event in lookback
+buy_row_attribution_scenario,30m,2000000,0.05,80,1178,6.7912,45,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,30m,1000000,0.2,146,2370,6.1603,50,any qualifying inbound event in lookback
+buy_row_attribution_scenario,30m,1000000,0.2,60,1178,5.0934,25,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,30m,1000000,0.1,159,2370,6.7089,63,any qualifying inbound event in lookback
+buy_row_attribution_scenario,30m,1000000,0.1,72,1178,6.1121,37,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,30m,1000000,0.05,171,2370,7.2152,75,any qualifying inbound event in lookback
+buy_row_attribution_scenario,30m,1000000,0.05,80,1178,6.7912,45,BUY-row any qualifying inbound event in lookback
+row_raw_inbound,60m,any,any,634,2370,26.7511,538,raw inbound before thresholds
+buy_row_raw_inbound,60m,any,any,364,1178,30.8998,329,BUY-row raw inbound before thresholds
+row_attribution_scenario,60m,10000000,0.2,145,2370,6.1181,49,any qualifying inbound event in lookback
+buy_row_attribution_scenario,60m,10000000,0.2,60,1178,5.0934,25,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,60m,10000000,0.1,157,2370,6.6245,61,any qualifying inbound event in lookback
+buy_row_attribution_scenario,60m,10000000,0.1,71,1178,6.0272,36,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,60m,10000000,0.05,169,2370,7.1308,73,any qualifying inbound event in lookback
+buy_row_attribution_scenario,60m,10000000,0.05,79,1178,6.7063,44,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,60m,5000000,0.2,146,2370,6.1603,50,any qualifying inbound event in lookback
+buy_row_attribution_scenario,60m,5000000,0.2,60,1178,5.0934,25,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,60m,5000000,0.1,158,2370,6.6667,62,any qualifying inbound event in lookback
+buy_row_attribution_scenario,60m,5000000,0.1,71,1178,6.0272,36,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,60m,5000000,0.05,170,2370,7.1730,74,any qualifying inbound event in lookback
+buy_row_attribution_scenario,60m,5000000,0.05,79,1178,6.7063,44,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,60m,2000000,0.2,146,2370,6.1603,50,any qualifying inbound event in lookback
+buy_row_attribution_scenario,60m,2000000,0.2,60,1178,5.0934,25,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,60m,2000000,0.1,159,2370,6.7089,63,any qualifying inbound event in lookback
+buy_row_attribution_scenario,60m,2000000,0.1,72,1178,6.1121,37,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,60m,2000000,0.05,171,2370,7.2152,75,any qualifying inbound event in lookback
+buy_row_attribution_scenario,60m,2000000,0.05,80,1178,6.7912,45,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,60m,1000000,0.2,146,2370,6.1603,50,any qualifying inbound event in lookback
+buy_row_attribution_scenario,60m,1000000,0.2,60,1178,5.0934,25,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,60m,1000000,0.1,159,2370,6.7089,63,any qualifying inbound event in lookback
+buy_row_attribution_scenario,60m,1000000,0.1,72,1178,6.1121,37,BUY-row any qualifying inbound event in lookback
+row_attribution_scenario,60m,1000000,0.05,171,2370,7.2152,75,any qualifying inbound event in lookback
+buy_row_attribution_scenario,60m,1000000,0.05,80,1178,6.7912,45,BUY-row any qualifying inbound event in lookback
+unique_decision,mixed,mixed,mixed,77,329,23.4043,,current_hit
+unique_decision,mixed,mixed,mixed,77,329,23.4043,,base_scenario_hit
+unique_decision,mixed,mixed,mixed,86,329,26.1398,,threshold_relax_hit_5m_best
+unique_decision,mixed,mixed,mixed,9,329,2.7356,,threshold_relax_unlocked_5m
+unique_decision,mixed,mixed,mixed,106,329,32.2188,,longer_lookback_hit_60m_current_thresholds
+unique_decision,mixed,mixed,mixed,29,329,8.8146,,longer_lookback_unlocked_current_thresholds
+unique_decision,mixed,mixed,mixed,111,329,33.7386,,combined_hit_60m_best_relaxed
+unique_decision,mixed,mixed,mixed,34,329,10.3343,,combined_unlocked
+unique_decision,mixed,mixed,mixed,203,329,61.7021,,raw_inbound_60m
+unique_decision,mixed,mixed,mixed,126,329,38.2979,,still_sparse_after_60m
+buy_decision,mixed,mixed,mixed,19,63,30.1587,,current_hit
+buy_decision,mixed,mixed,mixed,19,63,30.1587,,base_scenario_hit
+buy_decision,mixed,mixed,mixed,23,63,36.5079,,threshold_relax_hit_5m_best
+buy_decision,mixed,mixed,mixed,4,63,6.3492,,threshold_relax_unlocked_5m
+buy_decision,mixed,mixed,mixed,28,63,44.4444,,longer_lookback_hit_60m_current_thresholds
+buy_decision,mixed,mixed,mixed,9,63,14.2857,,longer_lookback_unlocked_current_thresholds
+buy_decision,mixed,mixed,mixed,31,63,49.2063,,combined_hit_60m_best_relaxed
+buy_decision,mixed,mixed,mixed,12,63,19.0476,,combined_unlocked
+buy_decision,mixed,mixed,mixed,54,63,85.7143,,raw_inbound_60m
+buy_decision,mixed,mixed,mixed,9,63,14.2857,,still_sparse_after_60m

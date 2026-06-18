@@ -213,6 +213,99 @@ pub static FSC_INDEX_GLOBAL_EVICTIONS_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
     .expect("Failed to create fsc_index_global_evictions_total metric")
 });
 
+/// Counter: recipient entries removed because the global FSC recipient cap was exceeded.
+pub static FSC_INDEX_GLOBAL_CAP_EVICTIONS_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    IntCounter::new(
+        "fsc_index_global_cap_evictions_total",
+        "Total funding-source recipient entries evicted specifically by the global recipient cap",
+    )
+    .expect("Failed to create fsc_index_global_cap_evictions_total metric")
+});
+
+/// Counter: recipient entries pruned because their retained history aged out of the FSC window.
+pub static FSC_INDEX_WINDOW_PRUNES_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    IntCounter::new(
+        "fsc_index_window_prunes_total",
+        "Total funding-source recipient entries pruned because they aged out of the retention window",
+    )
+    .expect("Failed to create fsc_index_window_prunes_total metric")
+});
+
+/// Counter: recipient entries removed after lookup pruned their last retained transfer.
+pub static FSC_INDEX_LOOKUP_EMPTY_PRUNES_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    IntCounter::new(
+        "fsc_index_lookup_empty_prunes_total",
+        "Total funding-source recipient entries removed after lookup emptied their retained history",
+    )
+    .expect("Failed to create fsc_index_lookup_empty_prunes_total metric")
+});
+
+/// Gauge: current configured FSC global recipient cap.
+pub static FSC_INDEX_GLOBAL_RECIPIENT_CAP: Lazy<IntGauge> = Lazy::new(|| {
+    IntGauge::new(
+        "fsc_index_global_recipient_cap",
+        "Current configured global recipient cap for the funding-source index",
+    )
+    .expect("Failed to create fsc_index_global_recipient_cap metric")
+});
+
+/// Gauge: current configured FSC per-recipient transfer history cap.
+pub static FSC_INDEX_PER_RECIPIENT_CAP: Lazy<IntGauge> = Lazy::new(|| {
+    IntGauge::new(
+        "fsc_index_per_recipient_cap",
+        "Current configured per-recipient transfer history cap for the funding-source index",
+    )
+    .expect("Failed to create fsc_index_per_recipient_cap metric")
+});
+
+/// Gauge: current configured FSC retention window in milliseconds.
+pub static FSC_INDEX_LOOKBACK_WINDOW_MS: Lazy<IntGauge> = Lazy::new(|| {
+    IntGauge::new(
+        "fsc_index_lookback_window_ms",
+        "Current configured lookback/retention window for the funding-source index in milliseconds",
+    )
+    .expect("Failed to create fsc_index_lookback_window_ms metric")
+});
+
+/// Gauge: configured maximum retained transfer records implied by current FSC caps.
+pub static FSC_INDEX_CONFIGURED_TRANSFER_CAPACITY: Lazy<IntGauge> = Lazy::new(|| {
+    IntGauge::new(
+        "fsc_index_configured_transfer_capacity",
+        "Configured maximum retained transfer records implied by FSC global and per-recipient caps",
+    )
+    .expect("Failed to create fsc_index_configured_transfer_capacity metric")
+});
+
+/// Gauge: retained recipient tombstones used to classify cap-evicted lookup misses.
+pub static FSC_INDEX_EVICTED_RECIPIENT_ENTRIES: Lazy<IntGauge> = Lazy::new(|| {
+    IntGauge::new(
+        "fsc_index_evicted_recipient_entries",
+        "Current number of cap-evicted recipient tombstones retained for FSC miss attribution",
+    )
+    .expect("Failed to create fsc_index_evicted_recipient_entries metric")
+});
+
+/// Gauge: rough retained-memory estimate for FSC rolling state under current occupancy/caps.
+pub static FSC_INDEX_ESTIMATED_MEMORY_BYTES: Lazy<IntGauge> = Lazy::new(|| {
+    IntGauge::new(
+        "fsc_index_estimated_memory_bytes",
+        "Approximate FSC rolling-index memory footprint in bytes based on current recipients and configured history cap",
+    )
+    .expect("Failed to create fsc_index_estimated_memory_bytes metric")
+});
+
+/// Counter: FSC evidence status emitted at decision-time.
+pub static FSC_EVIDENCE_STATUS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        prometheus::opts!(
+            "fsc_evidence_status_total",
+            "Decision-time FSC evidence status counts"
+        ),
+        &["status"],
+    )
+    .expect("Failed to create fsc_evidence_status_total metric")
+});
+
 /// Counter: total number of recipient funding lookups that hit the FSC rolling index.
 pub static FSC_LOOKUP_HITS_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
     IntCounter::new(
@@ -306,6 +399,36 @@ pub static FSC_PRUNE_DURATION_MS: Lazy<Histogram> = Lazy::new(|| {
     .expect("Failed to create fsc_prune_duration_ms metric")
 });
 
+/// Counter: durable rows written to system_transfers_raw_v1.jsonl.
+pub static FSC_SYSTEM_TRANSFERS_RAW_WRITTEN_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    IntCounter::new(
+        "fsc_system_transfers_raw_written_total",
+        "Durable raw native SOL transfer rows queued for system_transfers_raw_v1.jsonl",
+    )
+    .expect("Failed to create fsc_system_transfers_raw_written_total metric")
+});
+
+/// Counter: durable rows written to funding_events_v1.jsonl.
+pub static FSC_FUNDING_EVENTS_WRITTEN_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    IntCounter::new(
+        "fsc_funding_events_written_total",
+        "Durable normalized funding-event rows queued for funding_events_v1.jsonl",
+    )
+    .expect("Failed to create fsc_funding_events_written_total metric")
+});
+
+/// Gauge: available transfer evidence sources for FSC capture (0/1).
+pub static FSC_TRANSFER_SOURCE_AVAILABLE: Lazy<IntGaugeVec> = Lazy::new(|| {
+    IntGaugeVec::new(
+        prometheus::opts!(
+            "fsc_transfer_source_available",
+            "Whether an FSC transfer evidence source is available to capture (0 or 1)"
+        ),
+        &["source"],
+    )
+    .expect("Failed to create fsc_transfer_source_available metric")
+});
+
 /// Counter for APS regime distribution (provisional until post-V2.5 outcome tracker).
 /// Labels: regime ("Normal", "HighVolatility", "LowVolatility")
 pub static GATEKEEPER_APS_REGIME_DISTRIBUTION: Lazy<IntCounterVec> = Lazy::new(|| {
@@ -360,6 +483,16 @@ pub fn register_oracle_metrics(registry: &Registry) -> Result<(), Box<dyn std::e
     registry.register(Box::new(FSC_INDEX_ENTRIES.clone()))?;
     registry.register(Box::new(FSC_INDEX_PER_RECIPIENT_OVERFLOWS_TOTAL.clone()))?;
     registry.register(Box::new(FSC_INDEX_GLOBAL_EVICTIONS_TOTAL.clone()))?;
+    registry.register(Box::new(FSC_INDEX_GLOBAL_CAP_EVICTIONS_TOTAL.clone()))?;
+    registry.register(Box::new(FSC_INDEX_WINDOW_PRUNES_TOTAL.clone()))?;
+    registry.register(Box::new(FSC_INDEX_LOOKUP_EMPTY_PRUNES_TOTAL.clone()))?;
+    registry.register(Box::new(FSC_INDEX_GLOBAL_RECIPIENT_CAP.clone()))?;
+    registry.register(Box::new(FSC_INDEX_PER_RECIPIENT_CAP.clone()))?;
+    registry.register(Box::new(FSC_INDEX_LOOKBACK_WINDOW_MS.clone()))?;
+    registry.register(Box::new(FSC_INDEX_CONFIGURED_TRANSFER_CAPACITY.clone()))?;
+    registry.register(Box::new(FSC_INDEX_EVICTED_RECIPIENT_ENTRIES.clone()))?;
+    registry.register(Box::new(FSC_INDEX_ESTIMATED_MEMORY_BYTES.clone()))?;
+    registry.register(Box::new(FSC_EVIDENCE_STATUS_TOTAL.clone()))?;
     registry.register(Box::new(FSC_LOOKUP_HITS_TOTAL.clone()))?;
     registry.register(Box::new(FSC_LOOKUP_MISSES_TOTAL.clone()))?;
     registry.register(Box::new(FSC_LOOKUP_MISS_REASON_TOTAL.clone()))?;
@@ -370,6 +503,9 @@ pub fn register_oracle_metrics(registry: &Registry) -> Result<(), Box<dyn std::e
     registry.register(Box::new(FSC_AUTHORITATIVE_BUY_GATE_OPEN.clone()))?;
     registry.register(Box::new(FSC_LOOKUP_HIT_RATE.clone()))?;
     registry.register(Box::new(FSC_PRUNE_DURATION_MS.clone()))?;
+    registry.register(Box::new(FSC_SYSTEM_TRANSFERS_RAW_WRITTEN_TOTAL.clone()))?;
+    registry.register(Box::new(FSC_FUNDING_EVENTS_WRITTEN_TOTAL.clone()))?;
+    registry.register(Box::new(FSC_TRANSFER_SOURCE_AVAILABLE.clone()))?;
     Ok(())
 }
 
@@ -510,6 +646,65 @@ pub fn record_fsc_index_global_evictions(evictions: u64) {
     }
 }
 
+pub fn record_fsc_index_global_cap_evictions(evictions: u64) {
+    if evictions > 0 {
+        FSC_INDEX_GLOBAL_CAP_EVICTIONS_TOTAL.inc_by(evictions);
+    }
+}
+
+pub fn record_fsc_index_window_prunes(prunes: u64) {
+    if prunes > 0 {
+        FSC_INDEX_WINDOW_PRUNES_TOTAL.inc_by(prunes);
+    }
+}
+
+pub fn record_fsc_index_lookup_empty_prunes(prunes: u64) {
+    if prunes > 0 {
+        FSC_INDEX_LOOKUP_EMPTY_PRUNES_TOTAL.inc_by(prunes);
+    }
+}
+
+pub fn record_fsc_retention_config(
+    global_recipient_cap: usize,
+    per_recipient_cap: usize,
+    lookback_window_ms: u64,
+) {
+    FSC_INDEX_GLOBAL_RECIPIENT_CAP.set(usize_to_i64(global_recipient_cap));
+    FSC_INDEX_PER_RECIPIENT_CAP.set(usize_to_i64(per_recipient_cap));
+    FSC_INDEX_LOOKBACK_WINDOW_MS.set(u64_to_i64(lookback_window_ms));
+    FSC_INDEX_CONFIGURED_TRANSFER_CAPACITY.set(u128_to_i64(
+        (global_recipient_cap as u128).saturating_mul(per_recipient_cap as u128),
+    ));
+}
+
+pub fn record_fsc_index_evicted_recipient_entries(entries: usize) {
+    FSC_INDEX_EVICTED_RECIPIENT_ENTRIES.set(usize_to_i64(entries));
+}
+
+pub fn record_fsc_index_estimated_memory_bytes(
+    recipient_entries: usize,
+    evicted_recipient_entries: usize,
+    per_recipient_cap: usize,
+) {
+    const RECIPIENT_HISTORY_BYTES: u128 = 256;
+    const TRANSFER_RECORD_WITH_HEAP_BYTES: u128 = 384;
+    const EVICTED_RECIPIENT_BYTES: u128 = 96;
+
+    let recipient_entries = recipient_entries as u128;
+    let evicted_recipient_entries = evicted_recipient_entries as u128;
+    let per_recipient_cap = per_recipient_cap as u128;
+    let transfer_capacity = recipient_entries.saturating_mul(per_recipient_cap);
+    let estimated_bytes = recipient_entries
+        .saturating_mul(RECIPIENT_HISTORY_BYTES)
+        .saturating_add(transfer_capacity.saturating_mul(TRANSFER_RECORD_WITH_HEAP_BYTES))
+        .saturating_add(evicted_recipient_entries.saturating_mul(EVICTED_RECIPIENT_BYTES));
+    FSC_INDEX_ESTIMATED_MEMORY_BYTES.set(u128_to_i64(estimated_bytes));
+}
+
+pub fn record_fsc_evidence_status(status: &str) {
+    FSC_EVIDENCE_STATUS_TOTAL.with_label_values(&[status]).inc();
+}
+
 pub fn record_fsc_lookup_hits(hits: u64) {
     if hits > 0 {
         FSC_LOOKUP_HITS_TOTAL.inc_by(hits);
@@ -558,6 +753,24 @@ pub fn record_fsc_prune_duration_ms(duration_ms: f64) {
     FSC_PRUNE_DURATION_MS.observe(duration_ms.max(0.0));
 }
 
+pub fn record_fsc_system_transfers_raw_written(count: u64) {
+    if count > 0 {
+        FSC_SYSTEM_TRANSFERS_RAW_WRITTEN_TOTAL.inc_by(count);
+    }
+}
+
+pub fn record_fsc_funding_events_written(count: u64) {
+    if count > 0 {
+        FSC_FUNDING_EVENTS_WRITTEN_TOTAL.inc_by(count);
+    }
+}
+
+pub fn record_fsc_transfer_source_available(source: &str, available: bool) {
+    FSC_TRANSFER_SOURCE_AVAILABLE
+        .with_label_values(&[source])
+        .set(if available { 1 } else { 0 });
+}
+
 fn refresh_fsc_lookup_hit_rate() {
     let hits = FSC_LOOKUP_HITS_ACCUM.load(Ordering::Relaxed);
     let misses = FSC_LOOKUP_MISSES_ACCUM.load(Ordering::Relaxed);
@@ -568,6 +781,18 @@ fn refresh_fsc_lookup_hit_rate() {
         hits as f64 / total as f64
     };
     FSC_LOOKUP_HIT_RATE.set(rate);
+}
+
+fn usize_to_i64(value: usize) -> i64 {
+    value.min(i64::MAX as usize) as i64
+}
+
+fn u64_to_i64(value: u64) -> i64 {
+    value.min(i64::MAX as u64) as i64
+}
+
+fn u128_to_i64(value: u128) -> i64 {
+    value.min(i64::MAX as u128) as i64
 }
 
 #[cfg(test)]
@@ -588,6 +813,13 @@ mod tests {
         record_fsc_index_entries(5);
         record_fsc_index_per_recipient_overflows(3);
         record_fsc_index_global_evictions(2);
+        record_fsc_index_global_cap_evictions(1);
+        record_fsc_index_window_prunes(1);
+        record_fsc_index_lookup_empty_prunes(1);
+        record_fsc_retention_config(50_000, 256, 300_000);
+        record_fsc_index_evicted_recipient_entries(2);
+        record_fsc_index_estimated_memory_bytes(5, 2, 256);
+        record_fsc_evidence_status("clean");
         record_fsc_lookup_hits(6);
         record_fsc_lookup_misses(1);
         record_fsc_lookup_miss_reason(
@@ -601,6 +833,10 @@ mod tests {
         record_fsc_coverage_window_remaining_ms(0);
         record_fsc_authoritative_buy_gate_open(true);
         record_fsc_prune_duration_ms(1.5);
+        record_fsc_system_transfers_raw_written(3);
+        record_fsc_funding_events_written(3);
+        record_fsc_transfer_source_available("grpc_funding_lane_full_chain", true);
+        record_fsc_transfer_source_available("program_stream_system_transfers", false);
 
         let metric_families = registry.gather();
         let names: Vec<_> = metric_families
@@ -621,6 +857,34 @@ mod tests {
         assert!(names
             .iter()
             .any(|name| name == "fsc_index_global_evictions_total"));
+        assert!(names
+            .iter()
+            .any(|name| name == "fsc_index_global_cap_evictions_total"));
+        assert!(names
+            .iter()
+            .any(|name| name == "fsc_index_window_prunes_total"));
+        assert!(names
+            .iter()
+            .any(|name| name == "fsc_index_lookup_empty_prunes_total"));
+        assert!(names
+            .iter()
+            .any(|name| name == "fsc_index_global_recipient_cap"));
+        assert!(names
+            .iter()
+            .any(|name| name == "fsc_index_per_recipient_cap"));
+        assert!(names
+            .iter()
+            .any(|name| name == "fsc_index_lookback_window_ms"));
+        assert!(names
+            .iter()
+            .any(|name| name == "fsc_index_configured_transfer_capacity"));
+        assert!(names
+            .iter()
+            .any(|name| name == "fsc_index_evicted_recipient_entries"));
+        assert!(names
+            .iter()
+            .any(|name| name == "fsc_index_estimated_memory_bytes"));
+        assert!(names.iter().any(|name| name == "fsc_evidence_status_total"));
         assert!(names.iter().any(|name| name == "fsc_lookup_hits_total"));
         assert!(names.iter().any(|name| name == "fsc_lookup_misses_total"));
         assert!(names
@@ -639,6 +903,15 @@ mod tests {
             .any(|name| name == "fsc_authoritative_buy_gate_open"));
         assert!(names.iter().any(|name| name == "fsc_lookup_hit_rate"));
         assert!(names.iter().any(|name| name == "fsc_prune_duration_ms"));
+        assert!(names
+            .iter()
+            .any(|name| name == "fsc_system_transfers_raw_written_total"));
+        assert!(names
+            .iter()
+            .any(|name| name == "fsc_funding_events_written_total"));
+        assert!(names
+            .iter()
+            .any(|name| name == "fsc_transfer_source_available"));
 
         let lag_family = metric_families
             .iter()
@@ -658,10 +931,33 @@ mod tests {
         assert_eq!(FSC_INDEX_ENTRIES.get(), 5);
         assert_eq!(FSC_INDEX_PER_RECIPIENT_OVERFLOWS_TOTAL.get(), 3);
         assert_eq!(FSC_INDEX_GLOBAL_EVICTIONS_TOTAL.get(), 2);
+        assert_eq!(FSC_INDEX_GLOBAL_CAP_EVICTIONS_TOTAL.get(), 1);
+        assert_eq!(FSC_INDEX_WINDOW_PRUNES_TOTAL.get(), 1);
+        assert_eq!(FSC_INDEX_LOOKUP_EMPTY_PRUNES_TOTAL.get(), 1);
+        assert_eq!(FSC_INDEX_GLOBAL_RECIPIENT_CAP.get(), 50_000);
+        assert_eq!(FSC_INDEX_PER_RECIPIENT_CAP.get(), 256);
+        assert_eq!(FSC_INDEX_LOOKBACK_WINDOW_MS.get(), 300_000);
+        assert_eq!(FSC_INDEX_CONFIGURED_TRANSFER_CAPACITY.get(), 50_000 * 256);
+        assert_eq!(FSC_INDEX_EVICTED_RECIPIENT_ENTRIES.get(), 2);
+        assert!(FSC_INDEX_ESTIMATED_MEMORY_BYTES.get() > 0);
         assert_eq!(FSC_LOOKUP_HITS_TOTAL.get(), 6);
         assert_eq!(FSC_LOOKUP_MISSES_TOTAL.get(), 1);
         assert_eq!(FSC_AUTHORITATIVE_FUNDING_STREAM_AVAILABLE.get(), 1);
         assert_eq!(FSC_WARMUP_READY.get(), 1);
+        assert_eq!(FSC_SYSTEM_TRANSFERS_RAW_WRITTEN_TOTAL.get(), 3);
+        assert_eq!(FSC_FUNDING_EVENTS_WRITTEN_TOTAL.get(), 3);
+        assert_eq!(
+            FSC_TRANSFER_SOURCE_AVAILABLE
+                .with_label_values(&["grpc_funding_lane_full_chain"])
+                .get(),
+            1
+        );
+        assert_eq!(
+            FSC_TRANSFER_SOURCE_AVAILABLE
+                .with_label_values(&["program_stream_system_transfers"])
+                .get(),
+            0
+        );
         assert!((FSC_LOOKUP_HIT_RATE.get() - (6.0 / 7.0)).abs() < f64::EPSILON);
     }
 }

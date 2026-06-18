@@ -11,12 +11,12 @@ use ghost_core::session::types::{
 };
 use ghost_core::tx_intelligence::types::{
     BurstWindow, RiskFlag, RiskSeverity, SybilResistanceFeatures, TxIntelFeatures,
-    TxIntelligenceState, DBIA_INSUFFICIENT_BUYERS_REASON, DBIA_NO_DEV_BUY_REASON,
-    DBIA_PARTIAL_FINGERPRINT_COVERAGE, DBIA_RAW_FINGERPRINT_UNAVAILABLE_REASON,
-    CPV_COVERAGE_WINDOW_UNAVAILABLE, DES_NO_COMPARABLE_PAIRS,
-    DES_PARTIAL_SEQUENCE_COVERAGE, FTDI_PARTIAL_FEE_TOPOLOGY_COVERAGE,
-    FSC_COVERAGE_WINDOW_UNAVAILABLE, FSC_V2_STATUS_NOT_CLEAN,
-    SFD_BUY_AMOUNT_UNAVAILABLE, SFD_NEGATIVE_BALANCE_DELTA_SKIPPED,
+    TxIntelligenceState, CPV_COVERAGE_WINDOW_UNAVAILABLE, DBIA_INSUFFICIENT_BUYERS_REASON,
+    DBIA_NO_DEV_BUY_REASON, DBIA_PARTIAL_FINGERPRINT_COVERAGE,
+    DBIA_RAW_FINGERPRINT_UNAVAILABLE_REASON, DES_NO_COMPARABLE_PAIRS,
+    DES_PARTIAL_SEQUENCE_COVERAGE, FSC_COVERAGE_WINDOW_UNAVAILABLE, FSC_V2_STATUS_NOT_CLEAN,
+    FTDI_PARTIAL_FEE_TOPOLOGY_COVERAGE, SFD_BUY_AMOUNT_UNAVAILABLE,
+    SFD_NEGATIVE_BALANCE_DELTA_SKIPPED,
 };
 use ghost_core::CurveFinality;
 use solana_sdk::pubkey::Pubkey;
@@ -329,8 +329,16 @@ fn pr1_public_quality_reason_codes_contract_is_complete() {
     observed.sort_unstable();
 
     assert_eq!(expected.len(), 9);
-    assert!(expected.iter().all(|code| observed.binary_search(code).is_ok()));
-    assert_eq!(observed.len(), observed.iter().filter(|code| code.is_empty() == false).count());
+    assert!(expected
+        .iter()
+        .all(|code| observed.binary_search(code).is_ok()));
+    assert_eq!(
+        observed.len(),
+        observed
+            .iter()
+            .filter(|code| code.is_empty() == false)
+            .count()
+    );
 
     for code in observed.iter() {
         assert!(!code.is_empty(), "reason code string must be non-empty");

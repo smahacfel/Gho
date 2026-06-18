@@ -42,6 +42,25 @@ Procedura operatorska start/stop/restart/abort jest w [`docs/RUNBOOK_PRODUCTION_
   Stan circuit-breakera providera.
   `0=closed`, `1=half_open`, `2=open`.
 
+## Seer source coverage
+
+- `seer_toolchain_fingerprint_coverage_total{source=...,complete=...}`
+  Licznik coverage parser-side fingerprintu wykorzystywanego przez FTDI/DBIA.
+  `complete=true` oznacza, że wszystkie pola `ToolchainFingerprintInput` były obecne; `ToolchainFingerprintInput::default()` musi być liczone jako `complete=false`.
+  Wymagane źródła do rozróżnienia: `binary_parser`, `pumpportal`, `nln_program_streams`; `launcher_bridge` jest dodatkowym runtime-side widokiem tego, co weszło do launchera.
+
+- `seer_fee_topology_coverage_total{source=...,available=...}`
+  Licznik dostępności `(external_fee_transfer_count, internal_fee_transfer_count)`.
+  `available=false` oznacza, że FTDI/DBIA nie mogą traktować fee topology jako neutralnego `(0,0)`.
+
+- `seer_curve_data_coverage_total{source=...,known=...}`
+  Licznik dostępności curve data przy trade eventach.
+  `known=false` jest diagnostyką coverage, nie decyzją policy.
+
+- `seer_signer_balance_coverage_total{source=...,pre=...,post=...}`
+  Licznik dostępności signer pre/post balance wykorzystywanej przez SFD.
+  Brak jednej strony balance powinien prowadzić do typed degraded semantics, nie do syntetycznej neutralizacji.
+
 ## FSC authoritative funding lane
 
 **Status 2026-05-16:** authoritative FSC lane jest wstrzymany dla bieżącej walidacji V3 przez

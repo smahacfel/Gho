@@ -584,7 +584,7 @@ def build_r2_market_paths(
         "candidate_universe_rows": len(candidates),
         "rows_written": len(rows),
         "r2_config": {
-            "profile": "r2_40_40_60s_v1",
+            "profile": f"r2_{target_net_pct:g}_{stop_net_pct:g}_{horizon_ms // 1000}s_v1",
             "target_net_pct": target_net_pct,
             "stop_net_pct": stop_net_pct,
             "horizon_ms": horizon_ms,

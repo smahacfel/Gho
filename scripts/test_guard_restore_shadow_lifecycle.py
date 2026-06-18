@@ -48,6 +48,36 @@ class RestoreShadowLifecycleGuardTests(unittest.TestCase):
         self.assertEqual(guard.FAIL_REPORTER_NO_ROWS, result.status)
         self.assertIn("rows_written=0", result.errors[0])
 
+    def test_reporter_requires_buy_context_by_default_but_not_for_probe_plane(self) -> None:
+        rows = [
+            {
+                "truth_status": "resolved",
+                "truth_source": "canonical_account_state_snapshot",
+                "close_reason": "TimeStop",
+                "timing": {"gatekeeper_buy_context_found": False},
+                "shadow": {"final_pnl_pct": -1.25},
+                "exit_fills": [{"fill_index": 1}],
+            }
+        ]
+
+        shadow_result = guard.validate_reporter_rows(
+            rows,
+            min_rows_written=1,
+            require_resolved=True,
+            reporter_stdout="close_truth_coverage=1/1",
+        )
+        probe_result = guard.validate_reporter_rows(
+            rows,
+            min_rows_written=1,
+            require_resolved=True,
+            require_gatekeeper_buy_context=False,
+            reporter_stdout="close_truth_coverage=1/1",
+        )
+
+        self.assertEqual(guard.FAIL_REPORTER_TRUTH, shadow_result.status)
+        self.assertIn("gatekeeper_buy_context_found=true rows <= 0", shadow_result.errors)
+        self.assertEqual(guard.PASS_STATUS, probe_result.status)
+
     def test_runtime_artifacts_fail_on_unsupported_legacy_marker(self) -> None:
         artifact_deltas = {
             "shadow_buys_delta": 1,

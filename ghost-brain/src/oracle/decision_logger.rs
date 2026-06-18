@@ -39,7 +39,9 @@
 use anyhow::{Context, Result};
 use ghost_core::features::coordination::CoordinationRiskEvidenceUnit;
 use ghost_core::health::RuntimeHealth;
-use ghost_core::tx_intelligence::types::{FscV2Evidence, FundingSourceDiagnostics};
+use ghost_core::tx_intelligence::types::{
+    FscLookupDiagnostic, FscV2Evidence, FundingSourceDiagnostics,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -97,6 +99,9 @@ const COORDINATION_RISK_EVIDENCE_JSONL: &str = "coordination_risk_evidence.jsonl
 /// Additive selector score sidecar. This file is diagnostic-only and must never
 /// be consumed as a Gatekeeper verdict or execution signal.
 pub const SELECTOR_SHADOW_SCORE_JSONL: &str = "selector_shadow_score_v1.jsonl";
+/// Additive FSC lookup-candidate sidecar. Diagnostic-only; not a policy,
+/// verdict, or execution input.
+pub const FSC_LOOKUP_CANDIDATES_JSONL: &str = "fsc_lookup_candidates_v1.jsonl";
 const SELECTOR_SHADOW_SCORE_SCHEMA_VERSION: &str = "selector_shadow_score_v1";
 const SELECTOR_SHADOW_SCORE_VERSION: &str = "selector_shadow_score_combined_simple_v1";
 const SELECTOR_SHADOW_SCORE_CANDIDATE_ID: &str = "combined:simple_feature_score_v1";
@@ -1863,6 +1868,10 @@ pub struct GatekeeperBuyLog {
     pub signer_cross_pool_velocity: Option<f64>,
     #[serde(default)]
     pub max_signer_cross_pool_velocity: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpv_distinct_other_pools_mean: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpv_other_pool_activity_count_p95: Option<f64>,
 
     /// Funding Source Concentration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1888,6 +1897,12 @@ pub struct GatekeeperBuyLog {
     /// Sybil metric degraded reasons from canonical feature materialization.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sybil_metric_degraded_reasons: Vec<String>,
+    /// Parser-side coverage ratio for raw toolchain fingerprint inputs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolchain_fingerprint_coverage: Option<f64>,
+    /// Coverage ratio for DES comparable sequence inputs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub des_valid_sequence_coverage: Option<f64>,
 
     // ═══════════════════════════════════════════
     // A/B Window Boundary Fields
@@ -2796,6 +2811,31 @@ impl DecisionLogger {
                                             .decision_plane
                                             .as_deref()
                                             .unwrap_or("unknown"),
+                                        e
+                                    );
+                                }
+                                if let Err(e) = write_fsc_lookup_candidates_sidecar(
+                                    &config.gatekeeper_log_dir,
+                                    &plane_log,
+                                )
+                                .await
+                                {
+                                    if is_no_space_error(e.chain()) {
+                                        logging_disabled_due_to_enospc = true;
+                                        error!(
+                                            "DecisionLogger: disabling file writes after ENOSPC on FSC lookup sidecar for {} plane={}",
+                                            plane_log.pool_id,
+                                            plane_log
+                                                .decision_plane
+                                                .as_deref()
+                                                .unwrap_or("unknown")
+                                        );
+                                        continue;
+                                    }
+                                    error!(
+                                        "Failed to write FSC lookup sidecar for {} plane={}: {}",
+                                        plane_log.pool_id,
+                                        plane_log.decision_plane.as_deref().unwrap_or("unknown"),
                                         e
                                     );
                                 }
@@ -3928,6 +3968,129 @@ async fn write_selector_shadow_score_sidecar(
     Ok(())
 }
 
+/// Write additive FSC lookup-candidate evidence next to routed decisions.
+///
+/// This sidecar is diagnostic-only. It records which wallet key FSC looked up
+/// for each buyer sample and why attribution hit/missed; it is not consumed by
+/// policy, scoring, send, or execution paths.
+async fn write_fsc_lookup_candidates_sidecar(
+    base_dir: &Path,
+    log: &GatekeeperBuyLog,
+) -> Result<()> {
+    let rows = build_fsc_lookup_candidates_sidecar_rows(log);
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let routed_dir = gatekeeper_route_dir(base_dir, log);
+    create_dir_all(&routed_dir)
+        .await
+        .context("Failed to create FSC lookup sidecar directory")?;
+
+    let path = routed_dir.join(FSC_LOOKUP_CANDIDATES_JSONL);
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .await
+        .context("Failed to open FSC lookup sidecar file")?;
+    for row in rows {
+        let json = serde_json::to_string(&row).context("Failed to serialize FSC lookup sidecar")?;
+        file.write_all(json.as_bytes()).await?;
+        file.write_all(b"\n").await?;
+    }
+    file.flush().await?;
+
+    debug!(
+        "FSC lookup-candidate sidecar written for {} to {:?}",
+        log.pool_id, path
+    );
+
+    Ok(())
+}
+
+fn build_fsc_lookup_candidates_sidecar_rows(log: &GatekeeperBuyLog) -> Vec<serde_json::Value> {
+    let Some(diagnostics) = log.funding_source_diagnostics.as_ref() else {
+        return Vec::new();
+    };
+    diagnostics
+        .lookup_diagnostics
+        .iter()
+        .map(|diagnostic| build_fsc_lookup_candidate_sidecar_row(log, diagnostic))
+        .collect()
+}
+
+fn build_fsc_lookup_candidate_sidecar_row(
+    log: &GatekeeperBuyLog,
+    diagnostic: &FscLookupDiagnostic,
+) -> serde_json::Value {
+    let candidate_wallets = diagnostic
+        .candidate_wallets
+        .iter()
+        .map(|candidate| candidate.wallet.clone())
+        .collect::<Vec<_>>();
+    let candidate_wallet_details = diagnostic
+        .candidate_wallets
+        .iter()
+        .map(|candidate| {
+            serde_json::json!({
+                "wallet": candidate.wallet,
+                "source": candidate.source,
+            })
+        })
+        .collect::<Vec<_>>();
+    let decision_ts_ms = log.observation_end_ts_ms.or(log.first_seen_ts_ms);
+    let decision_id = log
+        .ab_record_id
+        .clone()
+        .or_else(|| log.join_key.clone())
+        .unwrap_or_else(|| {
+            format!(
+                "{}:{}:{}",
+                log.pool_id,
+                log.decision_plane.as_deref().unwrap_or("unknown"),
+                decision_ts_ms.unwrap_or_default()
+            )
+        });
+
+    serde_json::json!({
+        "schema_version": "fsc_lookup_candidates_v1",
+        "decision_id": decision_id,
+        "ab_record_id": log.ab_record_id,
+        "join_key": log.join_key,
+        "pool_id": log.pool_id,
+        "mint": log.base_mint,
+        "decision_ts_ms": decision_ts_ms,
+        "slot": diagnostic.slot,
+        "signature": diagnostic.signature,
+        "buy_event_ts_ms": diagnostic.buy_event_ts_ms,
+        "candidate_wallets": candidate_wallets,
+        "candidate_wallet_details": candidate_wallet_details,
+        "selected_lookup_wallet": diagnostic.selected_lookup_wallet,
+        "lookup_wallet": diagnostic.lookup_wallet,
+        "lookup_wallet_source": diagnostic.lookup_wallet_source,
+        "fallback_used": diagnostic.fallback_used,
+        "lookup_result": diagnostic.lookup_result,
+        "history_entries_found": diagnostic.history_entries_found,
+        "latest_funding_age_ms": diagnostic.latest_funding_age_ms,
+        "matched_source_wallets_count": diagnostic.matched_source_wallets_count,
+        "matched_total_lamports": diagnostic.matched_total_lamports,
+        "funding_amount_lamports": diagnostic.funding_amount_lamports,
+        "source_wallet": diagnostic.source_wallet,
+        "miss_reason": diagnostic.miss_reason,
+        "diagnostic_miss_reason": diagnostic.diagnostic_miss_reason,
+        "decision_verdict_buy": log.decision_verdict_buy,
+        "verdict_type": log.verdict_type,
+        "reason_code": log.reason_code,
+        "decision_plane": log.decision_plane,
+        "gatekeeper_version": log.gatekeeper_version,
+        "rollout_profile": log.rollout_profile,
+        "config_hash": log.config_hash,
+        "run_id": log.run_id,
+        "session_id": log.session_id,
+    })
+}
+
 /// Write a gatekeeper V2 decision log with routing.
 ///
 /// Every plane-specific decision is appended to:
@@ -4576,6 +4739,8 @@ mod tests {
             min_demand_elasticity_score: -1.0,
             signer_cross_pool_velocity: Some(0.45),
             max_signer_cross_pool_velocity: 1.0,
+            cpv_distinct_other_pools_mean: None,
+            cpv_other_pool_activity_count_p95: None,
             funding_source_concentration: Some(0.52),
             max_funding_source_concentration: 1.0,
             funding_source_diagnostics: None,
@@ -4584,6 +4749,8 @@ mod tests {
             shadow_fsc_v2_soft_points_if_enabled: None,
             shadow_fsc_v2_reason_if_enabled: None,
             sybil_metric_degraded_reasons: vec!["DBIA_NO_DEV_BUY".to_string()],
+            toolchain_fingerprint_coverage: None,
+            des_valid_sequence_coverage: None,
             // A/B Window fields (not used in this test)
             ab_window_ms: None,
             ab_t0_event_ts_ms: None,
@@ -5086,6 +5253,8 @@ mod tests {
             min_demand_elasticity_score: -1.0,
             signer_cross_pool_velocity: Some(0.45),
             max_signer_cross_pool_velocity: 1.0,
+            cpv_distinct_other_pools_mean: None,
+            cpv_other_pool_activity_count_p95: None,
             funding_source_concentration: Some(0.52),
             max_funding_source_concentration: 1.0,
             funding_source_diagnostics: None,
@@ -5094,6 +5263,8 @@ mod tests {
             shadow_fsc_v2_soft_points_if_enabled: None,
             shadow_fsc_v2_reason_if_enabled: None,
             sybil_metric_degraded_reasons: vec!["DBIA_NO_DEV_BUY".to_string()],
+            toolchain_fingerprint_coverage: None,
+            des_valid_sequence_coverage: None,
             ab_window_ms: Some(10_000),
             ab_t0_event_ts_ms: Some(1000),
             ab_t_end_event_ts_ms: Some(11_000),
@@ -5722,6 +5893,22 @@ mod tests {
             .collect()
     }
 
+    async fn read_test_fsc_lookup_candidate_rows(log_dir: &Path) -> Vec<serde_json::Value> {
+        let sidecar_file = test_gatekeeper_route_dir(
+            log_dir,
+            LEGACY_GATEKEEPER_VERSION,
+            DECISION_PLANE_LEGACY_LIVE,
+        )
+        .join(FSC_LOOKUP_CANDIDATES_JSONL);
+        assert!(sidecar_file.exists(), "FSC lookup sidecar should exist");
+        let content = fs::read_to_string(&sidecar_file).await.unwrap();
+        content
+            .trim()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
     #[tokio::test]
     async fn test_selector_shadow_score_sidecar_writes_additive_jsonl() {
         let temp_dir = TempDir::new().unwrap();
@@ -5779,6 +5966,76 @@ mod tests {
         assert_eq!(row["changes_execution"], false);
         assert_eq!(row["send_path_changed"], false);
         assert_eq!(row["score_contract_hash"].as_str().unwrap().len(), 64);
+
+        logger.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_fsc_lookup_candidate_sidecar_writes_lookup_wallet() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().to_path_buf();
+        let logger = DecisionLogger::new(test_decision_logger_config(log_dir.clone()));
+
+        let mut buy_log = create_test_buy_log();
+        buy_log.pool_id = "pool_fsc_lookup".to_string();
+        buy_log.base_mint = Some("mint_fsc_lookup".to_string());
+        buy_log.ab_record_id = Some("pool_fsc_lookup:1000:11000:BUY".to_string());
+        buy_log.observation_end_ts_ms = Some(11_000);
+        buy_log.decision_verdict_buy = Some(true);
+        buy_log.verdict_type = Some("BUY".to_string());
+        buy_log.reason_code = Some(GatekeeperReasonCode::BuyNormal.as_log_str());
+        buy_log.funding_source_diagnostics = Some(FundingSourceDiagnostics {
+            buyer_sample_count: 1,
+            lookup_diagnostics: vec![FscLookupDiagnostic {
+                lookup_wallet: Some("buyer-wallet".to_string()),
+                candidate_wallets: vec![
+                    ghost_core::tx_intelligence::types::FscLookupWalletCandidate {
+                        wallet: "buyer-wallet".to_string(),
+                        source: "owner_token_delta_positive".to_string(),
+                    },
+                ],
+                selected_lookup_wallet: Some("buyer-wallet".to_string()),
+                lookup_wallet_source: Some("owner_token_delta_positive".to_string()),
+                fallback_used: false,
+                slot: Some(42),
+                signature: Some("buy-signature".to_string()),
+                buy_event_ts_ms: Some(10_500),
+                lookup_result: "miss".to_string(),
+                history_entries_found: 0,
+                latest_funding_age_ms: None,
+                matched_source_wallets_count: 0,
+                matched_total_lamports: 0,
+                funding_amount_lamports: None,
+                source_wallet: None,
+                miss_reason: Some("FSC_NO_RETAINED_RECIPIENT_HISTORY".to_string()),
+                diagnostic_miss_reason: Some("NO_INBOUND_TRANSFER_OBSERVED".to_string()),
+            }],
+            ..FundingSourceDiagnostics::default()
+        });
+
+        logger.log_gatekeeper_buy_decision(buy_log).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let rows = read_test_fsc_lookup_candidate_rows(&log_dir).await;
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row["schema_version"], "fsc_lookup_candidates_v1");
+        assert_eq!(row["decision_id"], "pool_fsc_lookup:1000:11000:BUY");
+        assert_eq!(row["pool_id"], "pool_fsc_lookup");
+        assert_eq!(row["mint"], "mint_fsc_lookup");
+        assert_eq!(row["decision_ts_ms"], 11_000);
+        assert_eq!(row["slot"], 42);
+        assert_eq!(row["signature"], "buy-signature");
+        assert_eq!(row["buy_event_ts_ms"], 10_500);
+        assert_eq!(row["candidate_wallets"][0], "buyer-wallet");
+        assert_eq!(row["selected_lookup_wallet"], "buyer-wallet");
+        assert_eq!(row["lookup_wallet_source"], "owner_token_delta_positive");
+        assert_eq!(row["fallback_used"], false);
+        assert_eq!(row["lookup_result"], "miss");
+        assert_eq!(
+            row["diagnostic_miss_reason"],
+            "NO_INBOUND_TRANSFER_OBSERVED"
+        );
 
         logger.shutdown().await;
     }

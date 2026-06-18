@@ -964,6 +964,10 @@ impl PoolObservationSession {
             &self.cross_pool_velocity_config,
         );
         materialized.sybil_resistance.signer_cross_pool_velocity = cpv.signer_cross_pool_velocity;
+        materialized.sybil_resistance.cpv_distinct_other_pools_mean = cpv.distinct_other_pools_mean;
+        materialized
+            .sybil_resistance
+            .cpv_other_pool_activity_count_p95 = cpv.other_pool_activity_count_p95;
         for reason in cpv.degraded_reasons {
             if !materialized
                 .sybil_resistance

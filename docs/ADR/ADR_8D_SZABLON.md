@@ -3,7 +3,6 @@
 Status:
 Typ:
 Data:
-Autor/Agent:
 Repo/branch:
 Commit/PR:
 Zakres:

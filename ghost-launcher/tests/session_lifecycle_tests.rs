@@ -165,6 +165,7 @@ fn sfd_tx(
         arrival_ts_ms: timestamp_ms,
         event_time: ghost_core::EventTimeMetadata::new(None, Some(timestamp_ms), None),
         is_dev_buy,
+        sol_amount_lamports: pre_balance.checked_sub(post_balance),
         signer_pre_balance_lamports: Some(pre_balance),
         signer_post_balance_lamports: Some(post_balance),
         toolchain_fingerprint: dbia_fingerprint(12, 3, true, true, 2, (0, 0)),
@@ -598,10 +599,11 @@ fn materialize_features_populates_sfd_from_session_tx_buffer() {
         guard.materialize_features()
     };
 
-    assert_eq!(
-        features.sybil_resistance.spend_fraction_divergence,
-        Some(0.25)
-    );
+    let sfd = features
+        .sybil_resistance
+        .spend_fraction_divergence
+        .expect("SFD should materialize from five usable buy samples");
+    assert!((sfd - 0.21).abs() <= f64::EPSILON, "sfd={sfd}");
     assert_eq!(
         features.sybil_resistance.signer_cross_pool_velocity,
         Some(0.0)
@@ -669,6 +671,7 @@ fn materialize_features_keeps_sfd_when_partial_balance_coverage_still_has_three_
             arrival_ts_ms: 31_040,
             event_time: ghost_core::EventTimeMetadata::new(None, Some(31_040), None),
             is_dev_buy: false,
+            sol_amount_lamports: None,
             signer_pre_balance_lamports: Some(100),
             signer_post_balance_lamports: None,
             toolchain_fingerprint: dbia_fingerprint(12, 3, true, true, 2, (0, 0)),
@@ -769,8 +772,27 @@ fn materialize_features_populates_cpv_from_shared_session_index() {
     let base_mint_b = Pubkey::new_unique();
     let bonding_curve_a = Pubkey::new_unique();
     let bonding_curve_b = Pubkey::new_unique();
-    let session_a = open_session(&manager, pool_a, base_mint_a, bonding_curve_a, 49_000);
-    let session_b = open_session(&manager, pool_b, base_mint_b, bonding_curve_b, 50_000);
+    let mut gatekeeper_config = GatekeeperV2Config::default();
+    gatekeeper_config.cpv_lookback_window_s = 1;
+    gatekeeper_config.cpv_min_observed_window_ratio = 1.0;
+    let session_a = open_session_with_deadline_and_gatekeeper_config(
+        &manager,
+        pool_a,
+        base_mint_a,
+        bonding_curve_a,
+        49_000,
+        49_100,
+        gatekeeper_config.clone(),
+    );
+    let session_b = open_session_with_deadline_and_gatekeeper_config(
+        &manager,
+        pool_b,
+        base_mint_b,
+        bonding_curve_b,
+        50_000,
+        50_100,
+        gatekeeper_config,
+    );
     let shared_signer = Pubkey::new_unique();
     let session_b_dev_wallet = session_b
         .read()
@@ -783,7 +805,7 @@ fn materialize_features_populates_cpv_from_shared_session_index() {
             pool_a,
             shared_signer,
             "sig-cpv-pool-a",
-            49_010,
+            49_030,
             1,
             Some(0),
             false,
@@ -830,12 +852,23 @@ fn materialize_features_populates_cpv_from_shared_session_index() {
         features.sybil_resistance.signer_cross_pool_velocity,
         Some(1.0 / 3.0)
     );
+    assert_eq!(
+        features.sybil_resistance.cpv_distinct_other_pools_mean,
+        Some(1.0 / 3.0)
+    );
+    assert_eq!(
+        features.sybil_resistance.cpv_other_pool_activity_count_p95,
+        Some(1.0)
+    );
     assert_eq!(features.sybil_resistance.funding_source_concentration, None);
     assert!(!features.sybil_resistance.degraded_reasons.contains(
         &ghost_core::tx_intelligence::types::CPV_ROLLING_STATE_UNAVAILABLE_REASON.to_string()
     ));
     assert!(!features.sybil_resistance.degraded_reasons.contains(
         &ghost_core::tx_intelligence::types::CPV_INSUFFICIENT_SIGNERS_REASON.to_string()
+    ));
+    assert!(!features.sybil_resistance.degraded_reasons.contains(
+        &ghost_core::tx_intelligence::types::CPV_COVERAGE_WINDOW_UNAVAILABLE.to_string()
     ));
     assert!(features.sybil_resistance.degraded_reasons.contains(
         &ghost_core::tx_intelligence::types::FSC_FUNDING_STREAM_UNAVAILABLE_REASON.to_string()

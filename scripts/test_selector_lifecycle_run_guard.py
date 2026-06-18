@@ -147,6 +147,117 @@ class SelectorLifecycleRunGuardTests(unittest.TestCase):
         self.assertEqual(canary.FAIL_LIFECYCLE_PROOF, status)
         self.assertIn("AccountNotFound_delta > 0", errors)
 
+    def test_probe_lifecycle_canary_passes_without_active_buy_artifacts(self) -> None:
+        lifecycle_rows = [
+            {
+                "record_type": "exit_filled",
+                "truth_status": "resolved",
+                "truth_source": "canonical_account_state_snapshot",
+                "final_pnl_pct": -3.5,
+            },
+            {
+                "record_type": "position_closed",
+                "truth_status": "resolved",
+                "truth_source": "canonical_account_state_snapshot",
+                "final_pnl_pct": -3.5,
+                "close_reason": "TimeStop",
+            },
+        ]
+        transport_rows = [
+            {
+                "event_type": "counterfactual_shadow_probe_transport",
+                "execution_outcome": "counterfactual_shadow_probe_simulated",
+            }
+        ]
+
+        status, errors = canary.validate_probe_lifecycle_canary(
+            {
+                "probe_transport_delta": 1,
+                "probe_entries_delta": 1,
+                "probe_lifecycle_delta": 2,
+            },
+            canary.summarize_lifecycle_delta(lifecycle_rows),
+            canary.summarize_probe_transport_delta(transport_rows),
+            {},
+        )
+
+        self.assertEqual(canary.PASS_STATUS, status)
+        self.assertEqual([], errors)
+
+    def test_probe_lifecycle_canary_fails_bad_marker_delta(self) -> None:
+        lifecycle_rows = [
+            {
+                "record_type": "position_closed",
+                "truth_status": "resolved",
+                "truth_source": "canonical_account_state_snapshot",
+                "final_pnl_pct": 1.0,
+                "close_reason": "StopLoss",
+            },
+            {
+                "record_type": "exit_filled",
+                "truth_status": "resolved",
+                "truth_source": "canonical_account_state_snapshot",
+                "final_pnl_pct": 1.0,
+            },
+        ]
+        transport_rows = [
+            {
+                "event_type": "counterfactual_shadow_probe_transport",
+                "execution_outcome": "counterfactual_shadow_probe_simulated",
+            }
+        ]
+
+        status, errors = canary.validate_probe_lifecycle_canary(
+            {
+                "probe_transport_delta": 1,
+                "probe_entries_delta": 1,
+                "probe_lifecycle_delta": 2,
+            },
+            canary.summarize_lifecycle_delta(lifecycle_rows),
+            canary.summarize_probe_transport_delta(transport_rows),
+            {"AccountNotFound": 1},
+        )
+
+        self.assertEqual(canary.FAIL_LIFECYCLE_PROOF, status)
+        self.assertIn("AccountNotFound_delta > 0", errors)
+
+    def test_appended_log_marker_count_streams_from_baseline_offset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            system_log = base / "system.log"
+            oracle_log = base / "oracle.log"
+            system_log.write_text("old AccountNotFound\n", encoding="utf-8")
+            baseline_size = system_log.stat().st_size
+            with system_log.open("a", encoding="utf-8") as fh:
+                fh.write("new DIAG_ACCOUNT_UPDATE_RELAY\n")
+                fh.write("new ResourceExhausted\n")
+            oracle_log.write_text("oracle DIAG_ACCOUNT_UPDATE_RELAY\n", encoding="utf-8")
+
+            counts = canary.count_appended_log_markers(
+                restore_guard.ArtifactPaths(
+                    shadow_buys=base / "buys.jsonl",
+                    shadow_entries=base / "shadow_entries.jsonl",
+                    shadow_lifecycle=base / "shadow_lifecycle.jsonl",
+                    system_log=system_log,
+                    oracle_log=oracle_log,
+                ),
+                restore_guard.RuntimeSnapshots(
+                    shadow_buys_lines=0,
+                    shadow_entries_lines=0,
+                    shadow_lifecycle_lines=0,
+                    log_sizes={str(system_log): baseline_size, str(oracle_log): 0},
+                ),
+                {
+                    "DIAG_ACCOUNT_UPDATE_RELAY": "DIAG_ACCOUNT_UPDATE_RELAY",
+                    "AccountNotFound": "AccountNotFound",
+                    "ResourceExhausted": "ResourceExhausted",
+                },
+            )
+
+        self.assertEqual(2, counts["DIAG_ACCOUNT_UPDATE_RELAY"])
+        self.assertEqual(0, counts["AccountNotFound"])
+        self.assertEqual(1, counts["ResourceExhausted"])
+
     def test_scope_contract_requires_artifact_paths_to_match_scope(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "r8.toml"

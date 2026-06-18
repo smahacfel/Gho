@@ -54,6 +54,8 @@ import build_selector_segment_specific_candidate as segment_specific_candidate
 import build_selector_new_signal_family_design as new_signal_family_design
 import build_selector_buyer_quality_context as buyer_quality_context
 import build_selector_funding_graph_context as funding_graph_context
+import audit_selector_business_target_rate as business_target_rate
+import build_selector_all_decision_counterfactual_outcome as all_decision_outcome
 import guard_xgb_rule_profile_feature_surface as xgb_surface_guard
 import evaluate_xgb_rule_profile_shadow as xgb_rule_eval
 try:
@@ -1041,6 +1043,62 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertEqual(rows[0]["candidate_id"], "inside")
         self.assertTrue(rows[0]["decision_verdict_buy"])
 
+    def test_candidate_universe_uses_ab_record_decision_ts_for_decision_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            events = root / "events.jsonl"
+            decisions = root / "decisions.jsonl"
+            output = root / "candidate_universe_v1.jsonl"
+            write_jsonl(
+                events,
+                [
+                    {
+                        "type": "NewPoolDetected",
+                        "candidate_id": "mint-r27:curve-r27:1000",
+                        "base_mint": "mint-r27",
+                        "pool_id": "pool-r27",
+                        "bonding_curve": "curve-r27",
+                        "quote_mint": "SOL",
+                        "birth_ts_ms": 1_000,
+                    }
+                ],
+            )
+            write_jsonl(
+                decisions,
+                [
+                    {
+                        "ab_record_id": "pool-r27:1000:3000:REJECT",
+                        "base_mint": "mint-r27",
+                        "pool_id": "pool-r27",
+                        "first_seen_ts_ms": 1_000,
+                        "decision_verdict_buy": False,
+                        "verdict_type": "REJECT_HARD_FAIL",
+                    }
+                ],
+            )
+            summary = universe.run(
+                universe.build_parser().parse_args(
+                    [
+                        "--events",
+                        str(events),
+                        "--decisions",
+                        str(decisions),
+                        "--output",
+                        str(output),
+                    ]
+                )
+            )
+            rows = read_jsonl(output)
+
+        self.assertEqual(summary["status"], "ok")
+        self.assertEqual(summary["decision_context_rows_joined"], 1)
+        self.assertEqual(summary["decision_logs_created_denominator_rows"], 0)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["candidate_id"], "mint-r27:curve-r27:1000")
+        self.assertEqual(rows[0]["decision_ts_ms"], 3_000)
+        self.assertEqual(rows[0]["decision_ts_source"], "ab_record_id_decision_ts_ms")
+        self.assertFalse(rows[0]["decision_verdict_buy"])
+
     def test_phase1_report_join_coverage_keeps_r2_disabled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1250,15 +1308,15 @@ class SelectorPipelineTests(unittest.TestCase):
         gray = dict(base, close_reason="Other", final_pnl_pct=5.0)
         unresolved = {"truth_status": "partial", "close_reason": "Target", "final_pnl_pct": 50.0}
 
-        self.assertEqual(common.classify_r1(target, pnl_target_net_pct=40)["r1_label"], "positive")
-        self.assertEqual(common.classify_r1(stop, pnl_target_net_pct=40)["r1_label_reason"], "stop_loss")
+        self.assertEqual(common.classify_r1(target, pnl_target_net_pct=50)["r1_label"], "positive")
+        self.assertEqual(common.classify_r1(stop, pnl_target_net_pct=50)["r1_label_reason"], "stop_loss")
         self.assertEqual(
-            common.classify_r1(non_positive, pnl_target_net_pct=40)["r1_label_reason"],
+            common.classify_r1(non_positive, pnl_target_net_pct=50)["r1_label_reason"],
             "non_positive_pnl",
         )
-        self.assertEqual(common.classify_r1(gray, pnl_target_net_pct=40)["r1_gray_reason"], "positive_below_target")
+        self.assertEqual(common.classify_r1(gray, pnl_target_net_pct=50)["r1_gray_reason"], "positive_below_target")
         self.assertEqual(
-            common.classify_r1(unresolved, pnl_target_net_pct=40)["r1_excluded_reason"],
+            common.classify_r1(unresolved, pnl_target_net_pct=50)["r1_excluded_reason"],
             "truth_status_not_resolved",
         )
 
@@ -4583,6 +4641,89 @@ class SelectorPipelineTests(unittest.TestCase):
             self.assertFalse(manifest["baseline_built"])
             self.assertFalse(manifest["shadow_only_emit"]["enabled"])
 
+    def test_phase2_orchestrator_can_use_streaming_feature_snapshots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "unit-streaming-phase2"
+            dataset_dir = root / "datasets" / "selector" / scope
+            report_dir = root / "reports" / "selector" / scope
+            dataset_dir.mkdir(parents=True)
+            report_dir.mkdir(parents=True)
+            candidates = dataset_dir / "candidate_universe_v1.jsonl"
+            events = root / "events.jsonl"
+            manifest_path = report_dir / "dataset_manifest_v1.json"
+            write_jsonl(
+                candidates,
+                [
+                    {
+                        "candidate_id": "c1",
+                        "candidate_universe_status": "ok",
+                        "cohort_in_scope": True,
+                        "stream_completeness_ok": True,
+                        "base_mint": "mint1",
+                        "pool_id": "pool1",
+                        "bonding_curve": "curve1",
+                        "quote_mint": "SOL",
+                        "birth_ts_ms": 1_000,
+                        "decision_ts_ms": 2_000,
+                    }
+                ],
+            )
+            write_jsonl(
+                events,
+                [
+                    {
+                        "candidate_id": "c1",
+                        "timestamp_ms": 1_500,
+                        "slot": 9,
+                        "type": "NewPoolDetected",
+                    }
+                ],
+            )
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "artifact": "dataset_manifest_v1",
+                        "scope": scope,
+                        "status": "PASS",
+                        "phase1_status": "PASS",
+                        "denominator_source": "event_artifact_only",
+                        "r2_labels_built": False,
+                        "outputs": {
+                            "candidate_universe_v1": {
+                                "path": str(candidates),
+                                "exists": True,
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            manifest = phase2.build_phase2(
+                phase2.build_parser().parse_args(
+                    [
+                        "--scope",
+                        scope,
+                        "--root",
+                        str(root),
+                        "--events",
+                        str(events),
+                        "--target-net-pct",
+                        "40",
+                        "--stop-net-pct",
+                        "40",
+                        "--horizon-ms",
+                        "60000",
+                        "--streaming-feature-snapshots",
+                    ]
+                )
+            )
+
+            feature_report = manifest["stage_reports"]["feature_snapshots_v1"]
+            self.assertTrue(feature_report["streaming_mode"])
+            self.assertIn("streaming_peak_rss_mb", feature_report)
+
     def test_phase2_accepts_r2_universe_only_phase1_but_keeps_phase3_no_go(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -6661,6 +6802,34 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertEqual(coverage["status"], "NO-GO/PENDING_R2_DENOMINATOR")
         self.assertEqual(coverage["r2_missing_path_rows"], 2)
         self.assertEqual(coverage["r2_resolved_rows"], 0)
+
+    def test_r2_market_paths_profile_uses_configured_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            candidates = root / "candidate_universe_v1.jsonl"
+            write_jsonl(
+                candidates,
+                [
+                    {
+                        "candidate_id": "c1",
+                        "base_mint": "mint1",
+                        "pool_id": "pool1",
+                        "bonding_curve": "curve1",
+                        "decision_ts_ms": 1_000,
+                    }
+                ],
+            )
+            _, coverage = r2_paths.build_r2_market_paths(
+                candidate_universe=candidates,
+                account_update_paths=[],
+                diag_account_update_paths=[],
+                canonical_snapshot_paths=[],
+                target_net_pct=50,
+                stop_net_pct=50,
+                horizon_ms=60_000,
+            )
+
+        self.assertEqual(coverage["r2_config"]["profile"], "r2_50_50_60s_v1")
 
     def test_r2_market_paths_target_stop_and_no_target_labels(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -10438,6 +10607,449 @@ class SelectorPipelineTests(unittest.TestCase):
             "fresh_validation_scope_overlaps_discovery_scope:r23-discovery",
             result["fail_reasons"],
         )
+
+    def test_business_target_rate_labels_timeout_as_not_target(self) -> None:
+        row = {
+            "candidate_id": "timeout",
+            "decision_ts_ms": 1_000,
+            "path_coverage_ok": True,
+            "horizon_matured": True,
+            "samples": [
+                {"offset_ms": 1_000, "return_pct": 3.0},
+                {"offset_ms": 60_000, "return_pct": -2.0},
+            ],
+        }
+
+        label = business_target_rate.first_barrier_label(
+            row,
+            target_net_pct=25.0,
+            stop_net_pct=25.0,
+            horizon_ms=60_000,
+        )
+
+        self.assertEqual(label["business_label"], "TIMEOUT")
+        self.assertTrue(label["business_label_resolved"])
+
+    def test_business_target_rate_detects_ambiguous_barrier_order(self) -> None:
+        row = {
+            "candidate_id": "ambiguous",
+            "decision_ts_ms": 1_000,
+            "path_coverage_ok": True,
+            "horizon_matured": True,
+            "samples": [
+                {"ts_ms": 2_000, "offset_ms": 1_000, "return_pct": 30.0},
+                {"ts_ms": 2_000, "offset_ms": 1_000, "return_pct": -30.0},
+            ],
+        }
+
+        label = business_target_rate.first_barrier_label(
+            row,
+            target_net_pct=25.0,
+            stop_net_pct=25.0,
+            horizon_ms=60_000,
+        )
+
+        self.assertEqual(label["business_label"], "AMBIGUOUS_BARRIER_ORDER")
+        self.assertFalse(label["business_label_resolved"])
+
+    def test_business_target_rate_reports_full_selected_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "business-scope"
+            dataset_dir = root / "datasets" / "selector" / scope
+            report_dir = root / "reports" / "selector" / "candidates"
+            dataset_dir.mkdir(parents=True)
+            write_jsonl(
+                dataset_dir / "selector_training_view_v1.jsonl",
+                [
+                    {"candidate_id": "target", "pool_id": "p1", "base_mint": "m1", "feature_x": 1.0},
+                    {"candidate_id": "stop", "pool_id": "p2", "base_mint": "m2", "feature_x": 1.0},
+                    {"candidate_id": "timeout", "pool_id": "p3", "base_mint": "m3", "feature_x": 1.0},
+                    {"candidate_id": "not-selected", "pool_id": "p4", "base_mint": "m4", "feature_x": 9.0},
+                ],
+            )
+            write_jsonl(
+                dataset_dir / "r2_market_paths_v1.jsonl",
+                [
+                    {
+                        "candidate_id": "target",
+                        "decision_ts_ms": 1_000,
+                        "path_coverage_ok": True,
+                        "horizon_matured": False,
+                        "samples": [{"offset_ms": 2_000, "return_pct": 30.0}],
+                    },
+                    {
+                        "candidate_id": "stop",
+                        "decision_ts_ms": 1_000,
+                        "path_coverage_ok": True,
+                        "horizon_matured": False,
+                        "samples": [{"offset_ms": 2_000, "return_pct": -30.0}],
+                    },
+                    {
+                        "candidate_id": "timeout",
+                        "decision_ts_ms": 1_000,
+                        "path_coverage_ok": True,
+                        "horizon_matured": True,
+                        "samples": [{"offset_ms": 60_000, "return_pct": 3.0}],
+                    },
+                    {
+                        "candidate_id": "not-selected",
+                        "decision_ts_ms": 1_000,
+                        "path_coverage_ok": True,
+                        "horizon_matured": True,
+                        "samples": [{"offset_ms": 60_000, "return_pct": 3.0}],
+                    },
+                ],
+            )
+            shortlist = report_dir / "shortlist.json"
+            shortlist.parent.mkdir(parents=True)
+            shortlist.write_text(
+                json.dumps(
+                    {
+                        "shortlist": [
+                            {
+                                "candidate_id": "feature_x_lte_1",
+                                "conditions": [{"field": "feature_x", "op": "<=", "value": 1.0}],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            report = business_target_rate.build_report(
+                business_target_rate.build_parser().parse_args(
+                    [
+                        "--root",
+                        str(root),
+                        "--scope",
+                        scope,
+                        "--candidate-shortlist",
+                        str(shortlist),
+                        "--target-net-pct",
+                        "25",
+                        "--stop-net-pct",
+                        "25",
+                    ]
+                )
+            )
+
+        candidate = report["aggregate_candidates"][0]
+        profile = candidate["profile"]
+        self.assertEqual(profile["selected_total"], 3)
+        self.assertEqual(profile["TARGET_count"], 1)
+        self.assertEqual(profile["STOP_count"], 1)
+        self.assertEqual(profile["TIMEOUT_count"], 1)
+        self.assertAlmostEqual(profile["TARGET_rate"], 1 / 3)
+        self.assertAlmostEqual(profile["STOP_rate"], 1 / 3)
+        self.assertAlmostEqual(profile["TIMEOUT_rate"], 1 / 3)
+
+    def test_business_target_rate_uses_explicit_gk_field_alias(self) -> None:
+        evaluation = business_target_rate.condition_eval(
+            {"gk_buy_ratio": 0.4},
+            {"field": "buy_ratio", "op": "<=", "value": 0.5},
+        )
+
+        self.assertTrue(evaluation["passed"])
+        self.assertEqual(evaluation["actual_field"], "gk_buy_ratio")
+        self.assertTrue(evaluation["field_alias_applied"])
+
+    def test_all_decision_counterfactual_outcome_labels_30_30_60(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "r27-scope"
+            runtime_scope = "r27-runtime"
+            dataset_dir = root / "datasets" / "selector" / scope
+            decision_dir = root / "logs" / "rollout" / runtime_scope / "decisions" / "run"
+            probe_dir = root / "logs" / "shadow_run" / runtime_scope
+            dataset_dir.mkdir(parents=True)
+            decision_dir.mkdir(parents=True)
+            probe_dir.mkdir(parents=True)
+            write_jsonl(
+                decision_dir / "gatekeeper_v2_decisions.jsonl",
+                [
+                    {
+                        "ab_record_id": "ab-target",
+                        "candidate_id": "c-target",
+                        "pool_id": "p-target",
+                        "base_mint": "m-target",
+                        "decision_ts_ms": 1_000,
+                        "verdict_type": "BUY",
+                        "decision_verdict_buy": True,
+                        "reason_code": "buy_ok",
+                    },
+                    {
+                        "ab_record_id": "ab-stop",
+                        "candidate_id": "c-stop",
+                        "pool_id": "p-stop",
+                        "base_mint": "m-stop",
+                        "decision_ts_ms": 1_000,
+                        "verdict_type": "REJECT_LOW_SIGNAL",
+                        "decision_verdict_buy": False,
+                        "reason_code": "reject_low_signal",
+                    },
+                    {
+                        "ab_record_id": "ab-timeout",
+                        "candidate_id": "c-timeout",
+                        "pool_id": "p-timeout",
+                        "base_mint": "m-timeout",
+                        "decision_ts_ms": 1_000,
+                        "verdict_type": "TIMEOUT",
+                        "decision_verdict_buy": False,
+                        "reason_code": "timeout_wait",
+                    },
+                ],
+            )
+            write_jsonl(
+                dataset_dir / "r2_market_paths_v1.jsonl",
+                [
+                    {
+                        "candidate_id": "c-target",
+                        "pool_id": "p-target",
+                        "base_mint": "m-target",
+                        "decision_ts_ms": 1_000,
+                        "path_coverage_ok": True,
+                        "horizon_matured": False,
+                        "price_at_decision": 1.0,
+                        "max_favorable_pnl_pct": 31.0,
+                        "max_adverse_pnl_pct": -2.0,
+                        "samples": [{"offset_ms": 5_000, "return_pct": 31.0}],
+                    },
+                    {
+                        "candidate_id": "c-stop",
+                        "pool_id": "p-stop",
+                        "base_mint": "m-stop",
+                        "decision_ts_ms": 1_000,
+                        "path_coverage_ok": True,
+                        "horizon_matured": False,
+                        "price_at_decision": 1.0,
+                        "max_favorable_pnl_pct": 2.0,
+                        "max_adverse_pnl_pct": -31.0,
+                        "samples": [{"offset_ms": 5_000, "return_pct": -31.0}],
+                    },
+                    {
+                        "candidate_id": "c-timeout",
+                        "pool_id": "p-timeout",
+                        "base_mint": "m-timeout",
+                        "decision_ts_ms": 1_000,
+                        "path_coverage_ok": True,
+                        "horizon_matured": True,
+                        "price_at_decision": 1.0,
+                        "max_favorable_pnl_pct": 10.0,
+                        "max_adverse_pnl_pct": -9.0,
+                        "samples": [{"offset_ms": 60_000, "return_pct": 4.0}],
+                    },
+                ],
+            )
+            write_jsonl(
+                probe_dir / "probe_selection.jsonl",
+                [
+                    {
+                        "event_type": "probe_selected",
+                        "probe_id": "probe-target",
+                        "ab_record_id": "ab-target",
+                        "candidate_id": "c-target",
+                        "pool_id": "p-target",
+                        "base_mint": "m-target",
+                        "decision_ts_ms": 1_000,
+                    },
+                    {
+                        "event_type": "probe_selected",
+                        "probe_id": "probe-stop",
+                        "ab_record_id": "ab-stop",
+                        "candidate_id": "c-stop",
+                        "pool_id": "p-stop",
+                        "base_mint": "m-stop",
+                        "decision_ts_ms": 1_000,
+                    },
+                    {
+                        "event_type": "probe_skipped",
+                        "probe_id": "probe-timeout",
+                        "ab_record_id": "ab-timeout",
+                        "candidate_id": "c-timeout",
+                        "pool_id": "p-timeout",
+                        "base_mint": "m-timeout",
+                        "decision_ts_ms": 1_000,
+                        "probe_skip_reason": "execution_account_not_ready",
+                    },
+                ],
+            )
+            write_jsonl(
+                probe_dir / "probe_shadow_entries.jsonl",
+                [
+                    {
+                        "probe_id": "probe-target",
+                        "candidate_id": "c-target",
+                        "entry_price": 1.0,
+                        "entry_value_sol": 0.007,
+                    }
+                ],
+            )
+
+            report = all_decision_outcome.build_report(
+                all_decision_outcome.build_parser().parse_args(
+                    [
+                        "--root",
+                        str(root),
+                        "--scope",
+                        scope,
+                        "--runtime-scope",
+                        runtime_scope,
+                        "--target-net-pct",
+                        "30",
+                        "--stop-net-pct",
+                        "30",
+                        "--horizon-ms",
+                        "60000",
+                    ]
+                )
+            )
+
+            rows = read_jsonl(
+                dataset_dir / "all_decision_counterfactual_outcome_v1.jsonl"
+            )
+
+        self.assertEqual(report["counts"]["output_rows"], 3)
+        self.assertEqual(
+            report["counts"]["business_label_counts"],
+            {"STOP": 1, "TARGET": 1, "TIMEOUT": 1},
+        )
+        by_candidate = {row["candidate_id"]: row for row in rows}
+        self.assertEqual(by_candidate["c-target"]["business_label"], "TARGET")
+        self.assertEqual(by_candidate["c-target"]["probe_entry_status"], "simulated_entry")
+        self.assertEqual(by_candidate["c-stop"]["original_gatekeeper_verdict_family"], "REJECT")
+        self.assertEqual(by_candidate["c-stop"]["business_label"], "STOP")
+        self.assertFalse(by_candidate["c-stop"]["original_decision_verdict_buy"])
+        self.assertEqual(by_candidate["c-timeout"]["business_label"], "TIMEOUT")
+        self.assertEqual(by_candidate["c-timeout"]["probe_entry_status"], "probe_skipped")
+        self.assertEqual(by_candidate["c-timeout"]["all_decision_id"], "ab_record_id:ab-timeout")
+        self.assertEqual(by_candidate["c-timeout"]["candidate_id_source"], "decision_candidate_id")
+
+    def test_all_decision_counterfactual_outcome_recovers_candidate_id_without_decision_candidate_id(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "r27-scope"
+            runtime_scope = "r27-runtime"
+            dataset_dir = root / "datasets" / "selector" / scope
+            decision_dir = root / "logs" / "rollout" / runtime_scope / "decisions" / "run"
+            dataset_dir.mkdir(parents=True)
+            decision_dir.mkdir(parents=True)
+            write_jsonl(
+                decision_dir / "gatekeeper_v2_decisions.jsonl",
+                [
+                    {
+                        "ab_record_id": "pool-r27:1000:3000:REJECT",
+                        "pool_id": "pool-r27",
+                        "base_mint": "mint-r27",
+                        "first_seen_ts_ms": 1_000,
+                        "verdict_type": "REJECT_HARD_FAIL",
+                        "decision_verdict_buy": False,
+                        "reason_code": "reject_hard_fail",
+                    }
+                ],
+            )
+            write_jsonl(
+                dataset_dir / "r2_market_paths_v1.jsonl",
+                [
+                    {
+                        "candidate_id": "mint-r27:pool-r27:1000",
+                        "pool_id": "pool-r27",
+                        "base_mint": "mint-r27",
+                        "decision_ts_ms": 3_000,
+                        "path_coverage_ok": True,
+                        "horizon_matured": False,
+                        "price_at_decision": 1.0,
+                        "max_favorable_pnl_pct": 35.0,
+                        "max_adverse_pnl_pct": -5.0,
+                        "samples": [{"offset_ms": 4_000, "return_pct": 35.0}],
+                    }
+                ],
+            )
+
+            report = all_decision_outcome.build_report(
+                all_decision_outcome.build_parser().parse_args(
+                    [
+                        "--root",
+                        str(root),
+                        "--scope",
+                        scope,
+                        "--runtime-scope",
+                        runtime_scope,
+                        "--target-net-pct",
+                        "30",
+                        "--stop-net-pct",
+                        "30",
+                    ]
+                )
+            )
+            rows = read_jsonl(
+                dataset_dir / "all_decision_counterfactual_outcome_v1.jsonl"
+            )
+
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["all_decision_id"], "ab_record_id:pool-r27:1000:3000:REJECT")
+        self.assertEqual(row["all_decision_id_source"], "ab_record_id")
+        self.assertEqual(row["candidate_id"], "mint-r27:pool-r27:1000")
+        self.assertEqual(row["candidate_id_source"], "r2_candidate_id")
+        self.assertEqual(row["decision_ts_ms"], 3_000)
+        self.assertEqual(row["r2_join_key"], "pool_mint_ts")
+        self.assertEqual(row["business_label"], "TARGET")
+        self.assertEqual(report["counts"]["decision_rows_missing_candidate_id"], 1)
+        self.assertEqual(report["counts"]["output_rows_with_synthesized_candidate_id"], 0)
+        self.assertEqual(report["counts"]["candidate_id_source_counts"], {"r2_candidate_id": 1})
+
+    def test_all_decision_counterfactual_outcome_missing_path_is_unresolved_not_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "r27-scope"
+            runtime_scope = "r27-runtime"
+            dataset_dir = root / "datasets" / "selector" / scope
+            decision_dir = root / "logs" / "rollout" / runtime_scope / "decisions" / "run"
+            dataset_dir.mkdir(parents=True)
+            decision_dir.mkdir(parents=True)
+            write_jsonl(
+                decision_dir / "gatekeeper_v2_decisions.jsonl",
+                [
+                    {
+                        "ab_record_id": "ab-missing",
+                        "candidate_id": "c-missing",
+                        "pool_id": "p-missing",
+                        "base_mint": "m-missing",
+                        "decision_ts_ms": 1_000,
+                        "verdict_type": "REJECT_LOW_SIGNAL",
+                        "decision_verdict_buy": False,
+                        "reason_code": "reject_low_signal",
+                    }
+                ],
+            )
+            write_jsonl(dataset_dir / "r2_market_paths_v1.jsonl", [])
+
+            report = all_decision_outcome.build_report(
+                all_decision_outcome.build_parser().parse_args(
+                    [
+                        "--root",
+                        str(root),
+                        "--scope",
+                        scope,
+                        "--runtime-scope",
+                        runtime_scope,
+                    ]
+                )
+            )
+
+            rows = read_jsonl(
+                dataset_dir / "all_decision_counterfactual_outcome_v1.jsonl"
+            )
+
+        self.assertEqual(report["counts"]["output_rows"], 1)
+        self.assertEqual(report["counts"]["business_label_counts"], {"MISSING_PATH": 1})
+        self.assertEqual(rows[0]["business_label"], "MISSING_PATH")
+        self.assertFalse(rows[0]["business_label_resolved"])
+        self.assertEqual(rows[0]["business_excluded_reason"], "missing_r2_market_path")
+        self.assertIsNone(rows[0]["final_horizon_pnl_pct"])
 
 
 if __name__ == "__main__":

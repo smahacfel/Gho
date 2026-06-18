@@ -1,22 +1,25 @@
 use crate::events::{FundingTransferObserved, PoolTransaction};
 use crate::oracle_metrics::{
-    record_fsc_authoritative_funding_stream_available, record_fsc_index_entries,
-    record_fsc_index_global_evictions, record_fsc_index_per_recipient_overflows,
+    record_fsc_authoritative_funding_stream_available, record_fsc_evidence_status,
+    record_fsc_index_entries, record_fsc_index_estimated_memory_bytes,
+    record_fsc_index_evicted_recipient_entries, record_fsc_index_global_cap_evictions,
+    record_fsc_index_global_evictions, record_fsc_index_lookup_empty_prunes,
+    record_fsc_index_per_recipient_overflows, record_fsc_index_window_prunes,
     record_fsc_lookup_hits, record_fsc_lookup_miss_reason, record_fsc_lookup_misses,
-    record_fsc_prune_duration_ms, record_fsc_warmup_ready,
+    record_fsc_prune_duration_ms, record_fsc_retention_config, record_fsc_warmup_ready,
 };
 use ghost_brain::config::{FscV2Config, GatekeeperV2Config};
 use ghost_core::tx_intelligence::types::{
-    FscAttributionScope, FscEvidenceStatus, FscExcludedReason, FscMissClass, FscSnapshotMode,
-    FscV2Evidence, FscVersion, FundingSourceCount, FundingSourceDiagnostics, FundingSourceKey,
-    FundingSourceMissReasonCount, FSC_ABS_ATTRIBUTION_TOO_SMALL_REASON,
-    FSC_BUYER_IDENTITY_UNAVAILABLE_REASON, FSC_BUY_TIMESTAMP_UNAVAILABLE_REASON,
-    FSC_FUNDING_STREAM_UNAVAILABLE_REASON, FSC_GLOBAL_RECIPIENT_EVICTED_REASON,
-    FSC_INSUFFICIENT_KNOWN_SOURCES_REASON, FSC_LOOKBACK_WINDOW_EXHAUSTED_REASON,
-    FSC_LOW_ATTRIBUTION_CONFIDENCE_REASON, FSC_NO_PREBUY_TRANSFER_IN_WINDOW_REASON,
-    FSC_NO_RETAINED_RECIPIENT_HISTORY_REASON, FSC_PER_RECIPIENT_HISTORY_OVERFLOW_REASON,
-    FSC_RELATIVE_FUNDING_TOO_SMALL_REASON, FSC_ROLLING_STATE_UNAVAILABLE_REASON,
-    FSC_SAME_SLOT_ORDERING_UNAVAILABLE_REASON,
+    FscAttributionScope, FscEvidenceStatus, FscExcludedReason, FscLookupDiagnostic,
+    FscLookupWalletCandidate, FscMissClass, FscSnapshotMode, FscV2Evidence, FscVersion,
+    FundingSourceCount, FundingSourceDiagnostics, FundingSourceKey, FundingSourceMissReasonCount,
+    FSC_ABS_ATTRIBUTION_TOO_SMALL_REASON, FSC_BUYER_IDENTITY_UNAVAILABLE_REASON,
+    FSC_BUY_TIMESTAMP_UNAVAILABLE_REASON, FSC_FUNDING_STREAM_UNAVAILABLE_REASON,
+    FSC_GLOBAL_RECIPIENT_EVICTED_REASON, FSC_INSUFFICIENT_KNOWN_SOURCES_REASON,
+    FSC_LOOKBACK_WINDOW_EXHAUSTED_REASON, FSC_LOW_ATTRIBUTION_CONFIDENCE_REASON,
+    FSC_NO_PREBUY_TRANSFER_IN_WINDOW_REASON, FSC_NO_RETAINED_RECIPIENT_HISTORY_REASON,
+    FSC_PER_RECIPIENT_HISTORY_OVERFLOW_REASON, FSC_RELATIVE_FUNDING_TOO_SMALL_REASON,
+    FSC_ROLLING_STATE_UNAVAILABLE_REASON, FSC_SAME_SLOT_ORDERING_UNAVAILABLE_REASON,
 };
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -24,8 +27,36 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const FSC_V2_PROVIDER_LEGACY_ROLLING_INDEX: &str = "ghost_legacy_rolling_funding_index";
 const FSC_V2_PROVIDER_NLN_PROGRAM_STREAMS: &str = "nln_program_streams";
+const FSC_V2_PROVIDER_GRPC_FULL_CHAIN: &str = "grpc_funding_lane_full_chain";
 const FSC_V2_TOPIC_LEGACY_FUNDING_TRANSFERS: &str = "ghost.funding_transfers";
 const FSC_V2_TOPIC_NLN_SYSTEM_TRANSFERS: &str = "prod.rpc.solana.system.transfers";
+const FSC_V2_TOPIC_GRPC_FULL_CHAIN: &str = "grpc_funding_lane_full_chain";
+const FSC_V2_LANE_AUTHORITATIVE_FULL_FEED: &str = "authoritative_full_feed";
+const FSC_V2_LANE_NLN_PROGRAM_STREAMS: &str = "nln_program_streams";
+const FSC_LOOKUP_WALLET_SOURCE_OWNER_TOKEN_DELTA_POSITIVE: &str = "owner_token_delta_positive";
+const FSC_LOOKUP_WALLET_SOURCE_SIGNER_FALLBACK: &str = "signer_fallback";
+const FSC_LOOKUP_RESULT_HIT: &str = "hit";
+const FSC_LOOKUP_RESULT_MISS: &str = "miss";
+const FSC_LOOKUP_RESULT_NO_CANDIDATE: &str = "no_candidate";
+const FSC_DIAG_NO_INBOUND_TRANSFER_OBSERVED: &str = "NO_INBOUND_TRANSFER_OBSERVED";
+const FSC_DIAG_INBOUND_EXISTS_BUT_OLDER_THAN_LOOKBACK: &str =
+    "INBOUND_EXISTS_BUT_OLDER_THAN_LOOKBACK";
+const FSC_DIAG_INBOUND_EXISTS_BUT_PRUNED_BY_WINDOW: &str = "INBOUND_EXISTS_BUT_PRUNED_BY_WINDOW";
+const FSC_DIAG_INBOUND_EXISTS_BUT_BELOW_ABS_STORE_THRESHOLD: &str =
+    "INBOUND_EXISTS_BUT_BELOW_ABS_STORE_THRESHOLD";
+const FSC_DIAG_INBOUND_EXISTS_BUT_BELOW_ABS_ATTRIBUTION_THRESHOLD: &str =
+    "INBOUND_EXISTS_BUT_BELOW_ABS_ATTRIBUTION_THRESHOLD";
+const FSC_DIAG_INBOUND_EXISTS_BUT_BELOW_REL_THRESHOLD: &str =
+    "INBOUND_EXISTS_BUT_BELOW_REL_THRESHOLD";
+const FSC_DIAG_ADDRESS_KEY_MISMATCH: &str = "ADDRESS_KEY_MISMATCH";
+const FSC_DIAG_SAME_SLOT_ORDERING: &str = "SAME_SLOT_ORDERING";
+const FSC_DIAG_TRANSFER_KIND_NOT_STORED: &str = "TRANSFER_KIND_NOT_STORED";
+const FSC_DIAG_UNKNOWN: &str = "UNKNOWN";
+
+fn normalize_wallet_key(raw: &str) -> Option<String> {
+    let wallet = raw.trim();
+    (!wallet.is_empty()).then(|| wallet.to_string())
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FundingSourceConfig {
@@ -156,9 +187,22 @@ struct RecipientHistory {
     overflowed_before_oldest_retained: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DroppedTransferSummary {
+    last_seen_ms: u64,
+    latest_lamports: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EvictedRecipientHistory {
     last_seen_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PruneStats {
+    removed_recipients: u64,
+    cap_evictions: u64,
+    window_prunes: u64,
 }
 
 #[derive(Debug, Default)]
@@ -167,6 +211,8 @@ struct FundingSourceInner {
     recipient_order: VecDeque<(u64, String)>,
     evicted_recipients: HashMap<String, EvictedRecipientHistory>,
     evicted_recipient_order: VecDeque<(u64, String)>,
+    below_store_transfers: HashMap<String, DroppedTransferSummary>,
+    below_store_order: VecDeque<(u64, String)>,
     stream_available: bool,
     stream_available_since_ms: Option<u64>,
     saw_transfer: bool,
@@ -200,6 +246,7 @@ struct LookupSourceResult {
     matched: FundingSourceMatch,
     removed: bool,
     miss: Option<LookupMiss>,
+    diagnostic: FscLookupDiagnostic,
     attribution_confidence_bps: Option<u16>,
     selected_lamports: u128,
     total_lamports: u128,
@@ -214,11 +261,20 @@ struct LookupMiss {
     class: FscMissClass,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct WalletLookupSummary {
+    history_entries_found: u64,
+    latest_funding_age_ms: Option<u64>,
+    below_store_recent: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum WalletLookupOutcome {
     Matched {
         matched: FundingSourceMatch,
         removed: bool,
+        summary: WalletLookupSummary,
+        source_wallets_count: u64,
         attribution_confidence_bps: u16,
         selected_lamports: u128,
         total_lamports: u128,
@@ -229,6 +285,7 @@ enum WalletLookupOutcome {
     ContinueMiss {
         miss: LookupMiss,
         removed: bool,
+        summary: WalletLookupSummary,
         dust_filtered_count: u64,
         post_buy_filtered_count: u64,
         rel_too_small_count: u64,
@@ -236,6 +293,7 @@ enum WalletLookupOutcome {
     TerminalMiss {
         miss: LookupMiss,
         removed: bool,
+        summary: WalletLookupSummary,
         dust_filtered_count: u64,
         post_buy_filtered_count: u64,
         rel_too_small_count: u64,
@@ -246,6 +304,7 @@ enum WalletLookupOutcome {
 struct FundingAttributionSelection {
     recipient_wallet: String,
     source_wallet: String,
+    source_wallets_count: u64,
     selected_lamports: u128,
     total_lamports: u128,
 }
@@ -580,10 +639,39 @@ fn max_option_u64(left: Option<u64>, right: Option<u64>) -> Option<u64> {
     }
 }
 
+fn record_observed_transfer_lane_state_locked(
+    inner: &mut FundingSourceInner,
+    transfer: &FundingTransferObserved,
+    observation_wall_ms: u64,
+) {
+    inner.saw_transfer = true;
+    inner.funding_lane_watermark_slot =
+        max_option_u64(inner.funding_lane_watermark_slot, transfer.slot);
+    inner.last_transfer_recv_ts_ms = Some(observation_wall_ms);
+    inner
+        .observed_funding_lane_kinds
+        .insert(transfer.provenance.lane_kind.as_str().to_string());
+    if transfer.full_chain_coverage && !inner.availability_controlled {
+        inner.stream_available = true;
+        inner
+            .stream_available_since_ms
+            .get_or_insert(observation_wall_ms);
+    }
+}
+
 fn fsc_v2_source_provenance(inner: &FundingSourceInner) -> (String, Vec<String>) {
     if inner
         .observed_funding_lane_kinds
-        .contains("nln_program_streams")
+        .contains(FSC_V2_LANE_AUTHORITATIVE_FULL_FEED)
+    {
+        return (
+            FSC_V2_PROVIDER_GRPC_FULL_CHAIN.to_string(),
+            vec![FSC_V2_TOPIC_GRPC_FULL_CHAIN.to_string()],
+        );
+    }
+    if inner
+        .observed_funding_lane_kinds
+        .contains(FSC_V2_LANE_NLN_PROGRAM_STREAMS)
     {
         return (
             FSC_V2_PROVIDER_NLN_PROGRAM_STREAMS.to_string(),
@@ -889,42 +977,39 @@ impl FundingSourceIndex {
         transfer: &FundingTransferObserved,
         config: &FundingSourceConfig,
     ) {
-        if transfer.lamports < config.min_abs_store_lamports {
-            return;
-        }
-
         let observed_at_ms = funding_transfer_event_ts_ms(transfer);
-        if observed_at_ms == 0
-            || transfer.source_wallet.is_empty()
-            || transfer.recipient_wallet.is_empty()
-            || transfer.source_wallet == transfer.recipient_wallet
-        {
+        let Some(source_wallet) = normalize_wallet_key(&transfer.source_wallet) else {
+            return;
+        };
+        let Some(recipient_wallet) = normalize_wallet_key(&transfer.recipient_wallet) else {
+            return;
+        };
+        if observed_at_ms == 0 || source_wallet == recipient_wallet {
             return;
         }
 
         let window_start = observed_at_ms.saturating_sub(config.lookback_window_ms);
-        let recipient_wallet = transfer.recipient_wallet.clone();
         let observation_wall_ms = wall_clock_epoch_ms();
-
         let prune_started_at = Instant::now();
-        let mut inner = self.inner.write();
-        // Any accepted funding transfer warms the rolling index for capture/evidence.
-        // Full-chain transfers may additionally mark availability automatically.
-        inner.saw_transfer = true;
-        inner.funding_lane_watermark_slot =
-            max_option_u64(inner.funding_lane_watermark_slot, transfer.slot);
-        inner.last_transfer_recv_ts_ms = Some(observation_wall_ms);
-        inner
-            .observed_funding_lane_kinds
-            .insert(transfer.provenance.lane_kind.as_str().to_string());
-        if transfer.full_chain_coverage {
-            if !inner.availability_controlled {
-                inner.stream_available = true;
-                inner
-                    .stream_available_since_ms
-                    .get_or_insert(observation_wall_ms);
-            }
+
+        if transfer.lamports < config.min_abs_store_lamports {
+            let mut inner = self.inner.write();
+            record_observed_transfer_lane_state_locked(&mut inner, transfer, observation_wall_ms);
+            record_below_store_transfer_locked(
+                &mut inner,
+                recipient_wallet,
+                observed_at_ms,
+                transfer.lamports,
+                window_start,
+                config.global_recipient_cap,
+            );
+            record_fsc_prune_duration_ms(prune_started_at.elapsed().as_secs_f64() * 1_000.0);
+            update_retention_metrics(&inner, config);
+            return;
         }
+
+        let mut inner = self.inner.write();
+        record_observed_transfer_lane_state_locked(&mut inner, transfer, observation_wall_ms);
 
         let mut tracked_last_seen = None;
         let mut per_recipient_overflows = 0u64;
@@ -939,7 +1024,7 @@ impl FundingSourceIndex {
             let duplicate = history.transfers.back().is_some_and(|last| {
                 last.signature == transfer.signature
                     && last.slot == transfer.slot
-                    && last.source_wallet == transfer.source_wallet
+                    && last.source_wallet == source_wallet
                     && last.lamports == transfer.lamports
                     && last.observed_at_ms == observed_at_ms
                     && last.arrival_ts_ms == transfer.arrival_ts_ms
@@ -952,7 +1037,7 @@ impl FundingSourceIndex {
             if !duplicate {
                 history.transfers.push_back(FundingTransferRecord {
                     slot: transfer.slot,
-                    source_wallet: transfer.source_wallet.clone(),
+                    source_wallet: source_wallet.clone(),
                     signature: transfer.signature.clone(),
                     lamports: transfer.lamports,
                     observed_at_ms,
@@ -983,16 +1068,14 @@ impl FundingSourceIndex {
                 .push_back((last_seen_ms, recipient_wallet));
         }
 
-        let global_evictions =
+        let prune_stats =
             prune_global_locked(&mut inner, window_start, config.global_recipient_cap);
         record_fsc_prune_duration_ms(prune_started_at.elapsed().as_secs_f64() * 1_000.0);
         if per_recipient_overflows > 0 {
             record_fsc_index_per_recipient_overflows(per_recipient_overflows);
         }
-        if global_evictions > 0 {
-            record_fsc_index_global_evictions(global_evictions);
-        }
-        update_index_metrics(&inner);
+        record_prune_stats(prune_stats);
+        update_retention_metrics(&inner, config);
     }
 
     pub fn record_stream_reconnect(&self, reconnect_ts_ms: u64) {
@@ -1066,6 +1149,16 @@ impl FundingSourceIndex {
             coverage_window_status_locked(&inner, config, decision_wall_ms);
 
         if !inner.stream_available {
+            diagnostics.lookup_diagnostics = buyer_samples
+                .iter()
+                .map(|tx| {
+                    build_unavailable_lookup_diagnostic(
+                        tx,
+                        FSC_FUNDING_STREAM_UNAVAILABLE_REASON,
+                        FSC_DIAG_TRANSFER_KIND_NOT_STORED,
+                    )
+                })
+                .collect();
             let (provider, source_topics) = fsc_v2_source_provenance(&inner);
             let funding_source_v2 = build_fsc_v2_evidence(
                 &fsc_v2_accumulator,
@@ -1079,6 +1172,8 @@ impl FundingSourceIndex {
                 provider,
                 source_topics,
             );
+            record_fsc_evidence_status(fsc_evidence_status_label(funding_source_v2.status));
+            update_retention_metrics(&inner, config);
             return FscComputation {
                 funding_source_concentration: None,
                 funding_source_v2,
@@ -1088,6 +1183,16 @@ impl FundingSourceIndex {
         }
 
         if !inner.saw_transfer {
+            diagnostics.lookup_diagnostics = buyer_samples
+                .iter()
+                .map(|tx| {
+                    build_unavailable_lookup_diagnostic(
+                        tx,
+                        FSC_ROLLING_STATE_UNAVAILABLE_REASON,
+                        FSC_DIAG_NO_INBOUND_TRANSFER_OBSERVED,
+                    )
+                })
+                .collect();
             let (provider, source_topics) = fsc_v2_source_provenance(&inner);
             let funding_source_v2 = build_fsc_v2_evidence(
                 &fsc_v2_accumulator,
@@ -1101,6 +1206,8 @@ impl FundingSourceIndex {
                 provider,
                 source_topics,
             );
+            record_fsc_evidence_status(fsc_evidence_status_label(funding_source_v2.status));
+            update_retention_metrics(&inner, config);
             return FscComputation {
                 funding_source_concentration: None,
                 funding_source_v2,
@@ -1115,6 +1222,9 @@ impl FundingSourceIndex {
 
         for tx in buyer_samples {
             let lookup = lookup_source_for_buy(&mut inner, tx, config);
+            diagnostics
+                .lookup_diagnostics
+                .push(lookup.diagnostic.clone());
             diagnostics.dust_filtered_count = diagnostics
                 .dust_filtered_count
                 .saturating_add(lookup.dust_filtered_count);
@@ -1157,16 +1267,15 @@ impl FundingSourceIndex {
         }
 
         let prune_started_at = Instant::now();
-        let global_evictions =
+        let prune_stats =
             prune_global_locked(&mut inner, window_start, config.global_recipient_cap);
         record_fsc_prune_duration_ms(prune_started_at.elapsed().as_secs_f64() * 1_000.0);
-        if global_evictions > 0 {
-            record_fsc_index_global_evictions(global_evictions);
-        }
+        record_prune_stats(prune_stats);
         if removed_entries > 0 {
             record_fsc_index_global_evictions(removed_entries);
+            record_fsc_index_lookup_empty_prunes(removed_entries);
         }
-        update_index_metrics(&inner);
+        update_retention_metrics(&inner, config);
         if lookup_hits > 0 {
             record_fsc_lookup_hits(lookup_hits);
         }
@@ -1187,6 +1296,7 @@ impl FundingSourceIndex {
             provider,
             source_topics,
         );
+        record_fsc_evidence_status(fsc_evidence_status_label(funding_source_v2.status));
 
         let funding_source_concentration = fsc_primary_score(&funding_source_v2);
         let degraded_reasons = fsc_degraded_reasons_for_primary_score(&funding_source_v2);
@@ -1201,6 +1311,7 @@ impl FundingSourceIndex {
 
 fn update_index_metrics(inner: &FundingSourceInner) {
     record_fsc_index_entries(inner.histories.len());
+    record_fsc_index_evicted_recipient_entries(inner.evicted_recipients.len());
     record_fsc_authoritative_funding_stream_available(inner.stream_available);
     record_fsc_warmup_ready(inner.stream_available && inner.saw_transfer);
     ::metrics::gauge!("funding_index_size", inner.histories.len() as f64);
@@ -1212,6 +1323,32 @@ fn update_index_metrics(inner: &FundingSourceInner) {
             0.0
         }
     );
+}
+
+fn update_retention_metrics(inner: &FundingSourceInner, config: &FundingSourceConfig) {
+    update_index_metrics(inner);
+    record_fsc_retention_config(
+        config.global_recipient_cap,
+        config.per_recipient_cap,
+        config.lookback_window_ms,
+    );
+    record_fsc_index_estimated_memory_bytes(
+        inner.histories.len(),
+        inner.evicted_recipients.len(),
+        config.per_recipient_cap,
+    );
+}
+
+fn record_prune_stats(stats: PruneStats) {
+    if stats.removed_recipients > 0 {
+        record_fsc_index_global_evictions(stats.removed_recipients);
+    }
+    if stats.cap_evictions > 0 {
+        record_fsc_index_global_cap_evictions(stats.cap_evictions);
+    }
+    if stats.window_prunes > 0 {
+        record_fsc_index_window_prunes(stats.window_prunes);
+    }
 }
 
 fn fsc_evidence_status_label(status: FscEvidenceStatus) -> &'static str {
@@ -1339,6 +1476,139 @@ fn sort_lookup_miss_counts(diagnostics: &mut FundingSourceDiagnostics) {
     });
 }
 
+fn build_unavailable_lookup_diagnostic(
+    tx: &PoolTransaction,
+    miss_reason: &'static str,
+    diagnostic_miss_reason: &'static str,
+) -> FscLookupDiagnostic {
+    let candidates = funding_lookup_wallet_candidates(tx);
+    let selected = candidates.first();
+    let miss = LookupMiss {
+        reason: miss_reason,
+        class: FscMissClass::Operational,
+    };
+    let mut diagnostic = build_lookup_diagnostic(
+        tx,
+        &candidates,
+        selected,
+        if selected.is_some() {
+            FSC_LOOKUP_RESULT_MISS
+        } else {
+            FSC_LOOKUP_RESULT_NO_CANDIDATE
+        },
+        WalletLookupSummary::default(),
+        Some(miss),
+        None,
+        0,
+        0,
+        0,
+    );
+    diagnostic.diagnostic_miss_reason = Some(diagnostic_miss_reason.to_string());
+    diagnostic
+}
+
+fn build_lookup_diagnostic(
+    tx: &PoolTransaction,
+    candidates: &[FscLookupWalletCandidate],
+    selected: Option<&FscLookupWalletCandidate>,
+    lookup_result: &'static str,
+    summary: WalletLookupSummary,
+    miss: Option<LookupMiss>,
+    source_wallet: Option<String>,
+    source_wallets_count: u64,
+    selected_lamports: u128,
+    total_lamports: u128,
+) -> FscLookupDiagnostic {
+    let miss_reason = miss.map(|miss| miss.reason.to_string());
+    let diagnostic_miss_reason = miss.map(|miss| {
+        diagnostic_lookup_miss_reason(miss, summary)
+            .unwrap_or(FSC_DIAG_UNKNOWN)
+            .to_string()
+    });
+    let buy_event_ts_ms = tx_event_ts_ms(tx);
+    FscLookupDiagnostic {
+        lookup_wallet: selected.map(|candidate| candidate.wallet.clone()),
+        candidate_wallets: candidates.to_vec(),
+        selected_lookup_wallet: selected.map(|candidate| candidate.wallet.clone()),
+        lookup_wallet_source: selected.map(|candidate| candidate.source.clone()),
+        fallback_used: selected
+            .is_some_and(|candidate| candidate.source == FSC_LOOKUP_WALLET_SOURCE_SIGNER_FALLBACK),
+        slot: tx.slot,
+        signature: (!tx.signature.trim().is_empty()).then(|| tx.signature.clone()),
+        buy_event_ts_ms: (buy_event_ts_ms > 0).then_some(buy_event_ts_ms),
+        lookup_result: lookup_result.to_string(),
+        history_entries_found: summary.history_entries_found,
+        latest_funding_age_ms: summary.latest_funding_age_ms,
+        matched_source_wallets_count: source_wallets_count,
+        matched_total_lamports: saturating_u128_to_u64(total_lamports),
+        funding_amount_lamports: (selected_lamports > 0)
+            .then(|| saturating_u128_to_u64(selected_lamports)),
+        source_wallet,
+        miss_reason,
+        diagnostic_miss_reason,
+    }
+}
+
+fn diagnostic_lookup_miss_reason(
+    miss: LookupMiss,
+    summary: WalletLookupSummary,
+) -> Option<&'static str> {
+    match miss.reason {
+        FSC_NO_RETAINED_RECIPIENT_HISTORY_REASON if summary.below_store_recent => {
+            Some(FSC_DIAG_INBOUND_EXISTS_BUT_BELOW_ABS_STORE_THRESHOLD)
+        }
+        FSC_NO_RETAINED_RECIPIENT_HISTORY_REASON => Some(FSC_DIAG_NO_INBOUND_TRANSFER_OBSERVED),
+        FSC_LOOKBACK_WINDOW_EXHAUSTED_REASON => {
+            Some(FSC_DIAG_INBOUND_EXISTS_BUT_OLDER_THAN_LOOKBACK)
+        }
+        FSC_GLOBAL_RECIPIENT_EVICTED_REASON | FSC_PER_RECIPIENT_HISTORY_OVERFLOW_REASON => {
+            Some(FSC_DIAG_INBOUND_EXISTS_BUT_PRUNED_BY_WINDOW)
+        }
+        FSC_ABS_ATTRIBUTION_TOO_SMALL_REASON => {
+            Some(FSC_DIAG_INBOUND_EXISTS_BUT_BELOW_ABS_ATTRIBUTION_THRESHOLD)
+        }
+        FSC_RELATIVE_FUNDING_TOO_SMALL_REASON => {
+            Some(FSC_DIAG_INBOUND_EXISTS_BUT_BELOW_REL_THRESHOLD)
+        }
+        FSC_BUYER_IDENTITY_UNAVAILABLE_REASON => Some(FSC_DIAG_ADDRESS_KEY_MISMATCH),
+        FSC_SAME_SLOT_ORDERING_UNAVAILABLE_REASON => Some(FSC_DIAG_SAME_SLOT_ORDERING),
+        FSC_FUNDING_STREAM_UNAVAILABLE_REASON | FSC_ROLLING_STATE_UNAVAILABLE_REASON => {
+            Some(FSC_DIAG_TRANSFER_KIND_NOT_STORED)
+        }
+        _ => None,
+    }
+}
+
+fn wallet_lookup_summary(
+    history: &RecipientHistory,
+    buy_event_ts_ms: u64,
+    below_store_recent: bool,
+) -> WalletLookupSummary {
+    let latest_funding_age_ms = history
+        .transfers
+        .iter()
+        .map(|transfer| transfer.observed_at_ms)
+        .max()
+        .map(|latest_ts_ms| buy_event_ts_ms.saturating_sub(latest_ts_ms));
+    WalletLookupSummary {
+        history_entries_found: history.transfers.len() as u64,
+        latest_funding_age_ms,
+        below_store_recent,
+    }
+}
+
+fn funding_match_source_wallet(matched: &FundingSourceMatch) -> Option<String> {
+    match matched {
+        FundingSourceMatch::Concrete(source) => Some(source.clone()),
+        FundingSourceMatch::Neutral { source_wallet, .. } => Some(source_wallet.clone()),
+        FundingSourceMatch::Unknown => None,
+    }
+}
+
+fn saturating_u128_to_u64(value: u128) -> u64 {
+    value.min(u128::from(u64::MAX)) as u64
+}
+
 fn wall_clock_epoch_ms() -> u64 {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1374,13 +1644,59 @@ fn prune_evicted_recipients_locked(inner: &mut FundingSourceInner, window_start:
     }
 }
 
+fn record_below_store_transfer_locked(
+    inner: &mut FundingSourceInner,
+    recipient_wallet: String,
+    observed_at_ms: u64,
+    lamports: u64,
+    window_start: u64,
+    global_recipient_cap: usize,
+) {
+    let summary = inner
+        .below_store_transfers
+        .entry(recipient_wallet.clone())
+        .or_default();
+    if observed_at_ms >= summary.last_seen_ms {
+        summary.last_seen_ms = observed_at_ms;
+        summary.latest_lamports = lamports;
+        inner
+            .below_store_order
+            .push_back((observed_at_ms, recipient_wallet));
+    }
+    prune_below_store_transfers_locked(inner, window_start, global_recipient_cap);
+}
+
+fn prune_below_store_transfers_locked(
+    inner: &mut FundingSourceInner,
+    window_start: u64,
+    global_recipient_cap: usize,
+) {
+    while let Some((tracked_last_seen, recipient)) = inner.below_store_order.front().cloned() {
+        let should_prune_for_window = tracked_last_seen < window_start;
+        let should_prune_for_cap = inner.below_store_transfers.len() > global_recipient_cap;
+        if !should_prune_for_window && !should_prune_for_cap {
+            break;
+        }
+
+        inner.below_store_order.pop_front();
+        let should_remove = inner
+            .below_store_transfers
+            .get(&recipient)
+            .is_some_and(|summary| summary.last_seen_ms == tracked_last_seen);
+        if should_remove {
+            inner.below_store_transfers.remove(&recipient);
+        }
+    }
+}
+
 fn prune_global_locked(
     inner: &mut FundingSourceInner,
     window_start: u64,
     global_recipient_cap: usize,
-) -> u64 {
-    let mut evictions = 0u64;
+) -> PruneStats {
+    let mut stats = PruneStats::default();
     prune_evicted_recipients_locked(inner, window_start);
+    prune_below_store_transfers_locked(inner, window_start, global_recipient_cap);
     while let Some((tracked_last_seen, recipient)) = inner.recipient_order.front().cloned() {
         let should_prune_for_window = tracked_last_seen < window_start;
         let should_prune_for_cap = inner.histories.len() > global_recipient_cap;
@@ -1407,10 +1723,15 @@ fn prune_global_locked(
                         .push_back((history.last_seen_ms, recipient.clone()));
                 }
             }
-            evictions = evictions.saturating_add(1);
+            stats.removed_recipients = stats.removed_recipients.saturating_add(1);
+            if should_prune_for_window {
+                stats.window_prunes = stats.window_prunes.saturating_add(1);
+            } else if should_prune_for_cap {
+                stats.cap_evictions = stats.cap_evictions.saturating_add(1);
+            }
         }
     }
-    evictions
+    stats
 }
 
 fn lookup_source_for_buy(
@@ -1418,15 +1739,28 @@ fn lookup_source_for_buy(
     tx: &PoolTransaction,
     config: &FundingSourceConfig,
 ) -> LookupSourceResult {
-    let lookup_wallets = funding_lookup_wallets(tx);
-    if lookup_wallets.is_empty() {
+    let lookup_candidates = funding_lookup_wallet_candidates(tx);
+    if lookup_candidates.is_empty() {
+        let miss = LookupMiss {
+            reason: FSC_BUYER_IDENTITY_UNAVAILABLE_REASON,
+            class: FscMissClass::Operational,
+        };
         return LookupSourceResult {
             matched: FundingSourceMatch::Unknown,
             removed: false,
-            miss: Some(LookupMiss {
-                reason: FSC_BUYER_IDENTITY_UNAVAILABLE_REASON,
-                class: FscMissClass::Operational,
-            }),
+            miss: Some(miss),
+            diagnostic: build_lookup_diagnostic(
+                tx,
+                &lookup_candidates,
+                None,
+                FSC_LOOKUP_RESULT_NO_CANDIDATE,
+                WalletLookupSummary::default(),
+                Some(miss),
+                None,
+                0,
+                0,
+                0,
+            ),
             attribution_confidence_bps: None,
             selected_lamports: 0,
             total_lamports: 0,
@@ -1438,13 +1772,26 @@ fn lookup_source_for_buy(
 
     let buy_event_ts_ms = tx_event_ts_ms(tx);
     if buy_event_ts_ms == 0 {
+        let miss = LookupMiss {
+            reason: FSC_BUY_TIMESTAMP_UNAVAILABLE_REASON,
+            class: FscMissClass::Operational,
+        };
         return LookupSourceResult {
             matched: FundingSourceMatch::Unknown,
             removed: false,
-            miss: Some(LookupMiss {
-                reason: FSC_BUY_TIMESTAMP_UNAVAILABLE_REASON,
-                class: FscMissClass::Operational,
-            }),
+            miss: Some(miss),
+            diagnostic: build_lookup_diagnostic(
+                tx,
+                &lookup_candidates,
+                lookup_candidates.first(),
+                FSC_LOOKUP_RESULT_MISS,
+                WalletLookupSummary::default(),
+                Some(miss),
+                None,
+                0,
+                0,
+                0,
+            ),
             attribution_confidence_bps: None,
             selected_lamports: 0,
             total_lamports: 0,
@@ -1456,12 +1803,14 @@ fn lookup_source_for_buy(
     let buy_window_start = buy_event_ts_ms.saturating_sub(config.lookback_window_ms);
 
     let mut lookup_miss = None::<LookupMiss>;
+    let mut lookup_miss_context =
+        None::<(LookupMiss, FscLookupWalletCandidate, WalletLookupSummary)>;
     let mut removed = false;
     let mut counters = LookupCounters::default();
-    for wallet in lookup_wallets {
+    for candidate in &lookup_candidates {
         match lookup_source_for_wallet(
             inner,
-            wallet.as_str(),
+            candidate.wallet.as_str(),
             tx,
             config,
             buy_event_ts_ms,
@@ -1470,6 +1819,8 @@ fn lookup_source_for_buy(
             WalletLookupOutcome::Matched {
                 matched,
                 removed: wallet_removed,
+                summary,
+                source_wallets_count,
                 attribution_confidence_bps,
                 selected_lamports,
                 total_lamports,
@@ -1483,13 +1834,26 @@ fn lookup_source_for_buy(
                     rel_too_small_count,
                 });
                 if wallet_removed {
-                    inner.histories.remove(wallet.as_str());
+                    inner.histories.remove(candidate.wallet.as_str());
                 }
                 removed |= wallet_removed;
+                let source_wallet = funding_match_source_wallet(&matched);
                 return LookupSourceResult {
                     matched,
                     removed,
                     miss: None,
+                    diagnostic: build_lookup_diagnostic(
+                        tx,
+                        &lookup_candidates,
+                        Some(candidate),
+                        FSC_LOOKUP_RESULT_HIT,
+                        summary,
+                        None,
+                        source_wallet,
+                        source_wallets_count,
+                        selected_lamports,
+                        total_lamports,
+                    ),
                     attribution_confidence_bps: Some(attribution_confidence_bps),
                     selected_lamports,
                     total_lamports,
@@ -1501,6 +1865,7 @@ fn lookup_source_for_buy(
             WalletLookupOutcome::ContinueMiss {
                 miss,
                 removed: wallet_removed,
+                summary,
                 dust_filtered_count,
                 post_buy_filtered_count,
                 rel_too_small_count,
@@ -1511,14 +1876,21 @@ fn lookup_source_for_buy(
                     rel_too_small_count,
                 });
                 if wallet_removed {
-                    inner.histories.remove(wallet.as_str());
+                    inner.histories.remove(candidate.wallet.as_str());
                 }
                 removed |= wallet_removed;
+                if lookup_miss
+                    .map(lookup_miss_rank)
+                    .is_none_or(|rank| lookup_miss_rank(miss) >= rank)
+                {
+                    lookup_miss_context = Some((miss, candidate.clone(), summary));
+                }
                 lookup_miss = Some(choose_lookup_miss(lookup_miss, miss));
             }
             WalletLookupOutcome::TerminalMiss {
                 miss,
                 removed: wallet_removed,
+                summary,
                 dust_filtered_count,
                 post_buy_filtered_count,
                 rel_too_small_count,
@@ -1529,13 +1901,45 @@ fn lookup_source_for_buy(
                     rel_too_small_count,
                 });
                 if wallet_removed {
-                    inner.histories.remove(wallet.as_str());
+                    inner.histories.remove(candidate.wallet.as_str());
                 }
                 removed |= wallet_removed;
+                let selected_miss = choose_lookup_miss(lookup_miss, miss);
+                let selected_candidate = if lookup_miss
+                    .map(lookup_miss_rank)
+                    .is_none_or(|rank| lookup_miss_rank(miss) >= rank)
+                {
+                    candidate
+                } else {
+                    lookup_miss_context
+                        .as_ref()
+                        .map(|(_, candidate, _)| candidate)
+                        .unwrap_or(candidate)
+                };
+                let selected_summary = if selected_candidate.wallet == candidate.wallet {
+                    summary
+                } else {
+                    lookup_miss_context
+                        .as_ref()
+                        .map(|(_, _, summary)| *summary)
+                        .unwrap_or(summary)
+                };
                 return LookupSourceResult {
                     matched: FundingSourceMatch::Unknown,
                     removed,
-                    miss: Some(choose_lookup_miss(lookup_miss, miss)),
+                    miss: Some(selected_miss),
+                    diagnostic: build_lookup_diagnostic(
+                        tx,
+                        &lookup_candidates,
+                        Some(selected_candidate),
+                        FSC_LOOKUP_RESULT_MISS,
+                        selected_summary,
+                        Some(selected_miss),
+                        None,
+                        0,
+                        0,
+                        0,
+                    ),
                     attribution_confidence_bps: None,
                     selected_lamports: 0,
                     total_lamports: 0,
@@ -1547,10 +1951,29 @@ fn lookup_source_for_buy(
         }
     }
 
+    let selected_context = lookup_miss_context.as_ref();
+    let selected_candidate = selected_context
+        .map(|(_, candidate, _)| candidate)
+        .or_else(|| lookup_candidates.first());
+    let selected_summary = selected_context
+        .map(|(_, _, summary)| *summary)
+        .unwrap_or_default();
     LookupSourceResult {
         matched: FundingSourceMatch::Unknown,
         removed,
         miss: lookup_miss,
+        diagnostic: build_lookup_diagnostic(
+            tx,
+            &lookup_candidates,
+            selected_candidate,
+            FSC_LOOKUP_RESULT_MISS,
+            selected_summary,
+            lookup_miss,
+            None,
+            0,
+            0,
+            0,
+        ),
         attribution_confidence_bps: None,
         selected_lamports: 0,
         total_lamports: 0,
@@ -1568,8 +1991,13 @@ fn lookup_source_for_wallet(
     buy_event_ts_ms: u64,
     buy_window_start: u64,
 ) -> WalletLookupOutcome {
+    let below_store_recent = inner
+        .below_store_transfers
+        .get(wallet)
+        .is_some_and(|summary| summary.last_seen_ms >= buy_window_start);
     if let Some(history) = inner.histories.get_mut(wallet) {
         prune_transfer_history(&mut history.transfers, buy_window_start);
+        let summary = wallet_lookup_summary(history, buy_event_ts_ms, below_store_recent);
         if history.transfers.is_empty() {
             return WalletLookupOutcome::ContinueMiss {
                 miss: LookupMiss {
@@ -1577,6 +2005,7 @@ fn lookup_source_for_wallet(
                     class: FscMissClass::Structural,
                 },
                 removed: true,
+                summary,
                 dust_filtered_count: 0,
                 post_buy_filtered_count: 0,
                 rel_too_small_count: 0,
@@ -1613,6 +2042,7 @@ fn lookup_source_for_wallet(
                                 class: FscMissClass::Indeterminate,
                             },
                             removed: false,
+                            summary,
                             dust_filtered_count: counters.dust_filtered_count,
                             post_buy_filtered_count: counters.post_buy_filtered_count,
                             rel_too_small_count: counters.rel_too_small_count,
@@ -1659,6 +2089,7 @@ fn lookup_source_for_wallet(
                         class: FscMissClass::Indeterminate,
                     },
                     removed: false,
+                    summary,
                     dust_filtered_count: counters.dust_filtered_count,
                     post_buy_filtered_count: counters.post_buy_filtered_count,
                     rel_too_small_count: counters.rel_too_small_count,
@@ -1689,6 +2120,7 @@ fn lookup_source_for_wallet(
             return WalletLookupOutcome::ContinueMiss {
                 miss,
                 removed: false,
+                summary,
                 dust_filtered_count: counters.dust_filtered_count,
                 post_buy_filtered_count: counters.post_buy_filtered_count,
                 rel_too_small_count: counters.rel_too_small_count,
@@ -1707,6 +2139,7 @@ fn lookup_source_for_wallet(
                     class: FscMissClass::Indeterminate,
                 },
                 removed: false,
+                summary,
                 dust_filtered_count: counters.dust_filtered_count,
                 post_buy_filtered_count: counters.post_buy_filtered_count,
                 rel_too_small_count: counters.rel_too_small_count,
@@ -1726,6 +2159,8 @@ fn lookup_source_for_wallet(
         return WalletLookupOutcome::Matched {
             matched,
             removed: false,
+            summary,
+            source_wallets_count: selection.source_wallets_count,
             attribution_confidence_bps,
             selected_lamports: selection.selected_lamports,
             total_lamports: selection.total_lamports,
@@ -1742,6 +2177,10 @@ fn lookup_source_for_wallet(
                 class: FscMissClass::Operational,
             },
             removed: false,
+            summary: WalletLookupSummary {
+                below_store_recent,
+                ..WalletLookupSummary::default()
+            },
             dust_filtered_count: 0,
             post_buy_filtered_count: 0,
             rel_too_small_count: 0,
@@ -1754,6 +2193,10 @@ fn lookup_source_for_wallet(
             class: FscMissClass::Indeterminate,
         },
         removed: false,
+        summary: WalletLookupSummary {
+            below_store_recent,
+            ..WalletLookupSummary::default()
+        },
         dust_filtered_count: 0,
         post_buy_filtered_count: 0,
         rel_too_small_count: 0,
@@ -1764,6 +2207,7 @@ fn select_dominant_source(
     source_accumulators: HashMap<String, SourceAccumulator>,
     total_lamports: u128,
 ) -> Option<FundingAttributionSelection> {
+    let source_wallets_count = source_accumulators.len() as u64;
     source_accumulators
         .into_values()
         .max_by(|lhs, rhs| {
@@ -1775,6 +2219,7 @@ fn select_dominant_source(
         .map(|selected| FundingAttributionSelection {
             recipient_wallet: selected.recipient_wallet,
             source_wallet: selected.source_wallet,
+            source_wallets_count,
             selected_lamports: selected.total_lamports,
             total_lamports,
         })
@@ -1968,28 +2413,43 @@ fn transfer_tie_break_key(transfer: &FundingTransferRecord) -> TransferTieBreakK
 
 #[must_use]
 pub fn funding_lookup_wallets(tx: &PoolTransaction) -> Vec<String> {
-    let mut wallets = Vec::new();
+    funding_lookup_wallet_candidates(tx)
+        .into_iter()
+        .map(|candidate| candidate.wallet)
+        .collect()
+}
+
+#[must_use]
+pub fn funding_lookup_wallet_candidates(tx: &PoolTransaction) -> Vec<FscLookupWalletCandidate> {
+    let mut candidates = Vec::new();
     let mut seen = HashSet::new();
 
     for delta in &tx.owner_token_deltas {
         if delta.delta_raw <= 0 {
             continue;
         }
-        let owner = delta.owner.trim();
-        if owner.is_empty() {
+        let Some(owner) = normalize_wallet_key(&delta.owner) else {
             continue;
-        }
-        if seen.insert(owner.to_string()) {
-            wallets.push(owner.to_string());
+        };
+        if seen.insert(owner.clone()) {
+            candidates.push(FscLookupWalletCandidate {
+                wallet: owner,
+                source: FSC_LOOKUP_WALLET_SOURCE_OWNER_TOKEN_DELTA_POSITIVE.to_string(),
+            });
         }
     }
 
-    let signer = tx.signer.trim();
-    if !signer.is_empty() && seen.insert(signer.to_string()) {
-        wallets.push(signer.to_string());
+    if let Some(signer) = normalize_wallet_key(&tx.signer) {
+        if !seen.insert(signer.clone()) {
+            return candidates;
+        }
+        candidates.push(FscLookupWalletCandidate {
+            wallet: signer,
+            source: FSC_LOOKUP_WALLET_SOURCE_SIGNER_FALLBACK.to_string(),
+        });
     }
 
-    wallets
+    candidates
 }
 
 fn canonical_buyer_identity(tx: &PoolTransaction) -> Option<String> {
@@ -2160,6 +2620,168 @@ mod tests {
             decimals: 6,
         }];
         tx
+    }
+
+    #[test]
+    fn lookup_candidate_prefers_positive_owner_token_delta_before_signer_fallback() {
+        let tx = buy_tx_with_owner("signer-wallet", "owner-wallet", "buy-owner", 400);
+
+        let candidates = funding_lookup_wallet_candidates(&tx);
+
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].wallet, "owner-wallet");
+        assert_eq!(
+            candidates[0].source,
+            FSC_LOOKUP_WALLET_SOURCE_OWNER_TOKEN_DELTA_POSITIVE
+        );
+        assert_eq!(candidates[1].wallet, "signer-wallet");
+        assert_eq!(
+            candidates[1].source,
+            FSC_LOOKUP_WALLET_SOURCE_SIGNER_FALLBACK
+        );
+        assert_eq!(
+            funding_lookup_wallets(&tx),
+            vec!["owner-wallet".to_string(), "signer-wallet".to_string()]
+        );
+    }
+
+    #[test]
+    fn lookup_candidate_uses_signer_fallback_when_owner_delta_absent() {
+        let tx = buy_tx("signer-wallet", "buy-signer", 400);
+
+        let candidates = funding_lookup_wallet_candidates(&tx);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].wallet, "signer-wallet");
+        assert_eq!(
+            candidates[0].source,
+            FSC_LOOKUP_WALLET_SOURCE_SIGNER_FALLBACK
+        );
+    }
+
+    #[test]
+    fn lookup_candidate_does_not_use_mint_pool_or_ata_accounts() {
+        let mut tx = buy_tx_with_owner("signer-wallet", "owner-wallet", "buy-accounts", 400);
+        tx.pool_amm_id = "pool-account".to_string();
+        tx.token_mint = Some("mint-account".to_string());
+        tx.associated_bonding_curve = Some("ata-account".to_string());
+        tx.creator_vault = Some("creator-vault-account".to_string());
+        tx.buy_remaining_accounts = vec![
+            "remaining-ata-account".to_string(),
+            "remaining-pool-account".to_string(),
+        ];
+
+        let wallets = funding_lookup_wallets(&tx);
+
+        assert!(wallets.contains(&"owner-wallet".to_string()));
+        assert!(wallets.contains(&"signer-wallet".to_string()));
+        assert!(!wallets.contains(&"pool-account".to_string()));
+        assert!(!wallets.contains(&"mint-account".to_string()));
+        assert!(!wallets.contains(&"ata-account".to_string()));
+        assert!(!wallets.contains(&"creator-vault-account".to_string()));
+        assert!(!wallets.contains(&"remaining-ata-account".to_string()));
+        assert!(!wallets.contains(&"remaining-pool-account".to_string()));
+    }
+
+    #[test]
+    fn missing_funding_event_is_not_treated_as_clean_fsc_evidence() {
+        let config = config();
+        let index = FundingSourceIndex::new();
+        index.set_stream_available(true);
+
+        let buys = vec![buy_tx("buyer-a", "buy-a", 400)];
+        let computed = index.compute_for_transactions(buys.iter(), &config);
+
+        assert_eq!(computed.funding_source_concentration, None);
+        assert_eq!(
+            computed.funding_source_v2.status,
+            FscEvidenceStatus::Unavailable
+        );
+        assert_eq!(
+            computed.funding_source_v2.excluded_reason,
+            Some(FscExcludedReason::IndexCold)
+        );
+        assert_eq!(
+            computed.degraded_reasons,
+            vec![FSC_ROLLING_STATE_UNAVAILABLE_REASON.to_string()]
+        );
+        assert_eq!(computed.diagnostics.lookup_diagnostics.len(), 1);
+        assert_eq!(
+            computed.diagnostics.lookup_diagnostics[0].lookup_result,
+            FSC_LOOKUP_RESULT_MISS
+        );
+    }
+
+    #[test]
+    fn store_and_lookup_use_same_wallet_key_normalization() {
+        let config = config();
+        let index = FundingSourceIndex::new();
+        index.set_stream_available(true);
+        index.observe_transfer(
+            &funding_transfer(
+                " source-wallet ",
+                " buyer-wallet ",
+                "funding-normalized",
+                200,
+                100_000_000,
+            ),
+            &config,
+        );
+
+        let buys = vec![buy_tx(" buyer-wallet ", "buy-normalized", 400)];
+        let computed = index.compute_for_transactions(buys.iter(), &config);
+        let lookup = computed
+            .diagnostics
+            .lookup_diagnostics
+            .first()
+            .expect("lookup diagnostic should be emitted");
+
+        assert_eq!(lookup.lookup_result, FSC_LOOKUP_RESULT_HIT);
+        assert_eq!(lookup.lookup_wallet.as_deref(), Some("buyer-wallet"));
+        assert_eq!(lookup.source_wallet.as_deref(), Some("source-wallet"));
+    }
+
+    #[test]
+    fn observe_transfer_indexes_history_by_recipient_wallet_not_source_wallet() {
+        let config = config();
+        let index = FundingSourceIndex::new();
+        index.observe_transfer(
+            &funding_transfer(
+                "funding-source",
+                "buyer-wallet",
+                "funding-recipient",
+                200,
+                100_000_000,
+            ),
+            &config,
+        );
+
+        let buyer_buys = vec![buy_tx("buyer-wallet", "buy-recipient", 400)];
+        let buyer_computed = index.compute_for_transactions(buyer_buys.iter(), &config);
+        let buyer_lookup = buyer_computed
+            .diagnostics
+            .lookup_diagnostics
+            .first()
+            .expect("buyer lookup diagnostic should be emitted");
+        assert_eq!(buyer_lookup.lookup_result, FSC_LOOKUP_RESULT_HIT);
+        assert_eq!(buyer_lookup.lookup_wallet.as_deref(), Some("buyer-wallet"));
+        assert_eq!(
+            buyer_lookup.source_wallet.as_deref(),
+            Some("funding-source")
+        );
+
+        let source_buys = vec![buy_tx("funding-source", "buy-source", 400)];
+        let source_computed = index.compute_for_transactions(source_buys.iter(), &config);
+        let source_lookup = source_computed
+            .diagnostics
+            .lookup_diagnostics
+            .first()
+            .expect("source lookup diagnostic should be emitted");
+        assert_eq!(source_lookup.lookup_result, FSC_LOOKUP_RESULT_MISS);
+        assert_eq!(
+            source_lookup.lookup_wallet.as_deref(),
+            Some("funding-source")
+        );
     }
 
     fn funding_transfer(
@@ -3219,6 +3841,54 @@ mod tests {
         assert_eq!(
             computed.degraded_reasons,
             vec![FSC_FUNDING_STREAM_UNAVAILABLE_REASON.to_string()]
+        );
+    }
+
+    #[test]
+    fn below_store_full_chain_transfer_marks_lane_warm_without_retained_history() {
+        let config = config();
+        let index = FundingSourceIndex::new();
+        let mut transfer = funding_transfer("funder-a", "buyer-a", "fund-a", 100, 9_999);
+        transfer.slot = Some(7);
+
+        index.observe_transfer(&transfer, &config);
+
+        assert!(index.stream_available());
+        assert!(index.warmup_ready());
+        assert_eq!(index.entry_count(), 0);
+
+        let buys = vec![
+            buy_tx("buyer-a", "buy-a", 400),
+            buy_tx("buyer-b", "buy-b", 500),
+        ];
+        let computed = index.compute_for_transactions(buys.iter(), &config);
+
+        assert_eq!(
+            computed.funding_source_v2.provider,
+            FSC_V2_PROVIDER_GRPC_FULL_CHAIN
+        );
+        assert_eq!(
+            computed.funding_source_v2.source_topics,
+            vec![FSC_V2_TOPIC_GRPC_FULL_CHAIN.to_string()]
+        );
+        assert_eq!(
+            computed.funding_source_v2.status,
+            FscEvidenceStatus::Degraded
+        );
+        assert_eq!(
+            computed.funding_source_v2.excluded_reason,
+            Some(FscExcludedReason::InsufficientNonNeutralSupport)
+        );
+        assert_eq!(computed.diagnostics.lookup_diagnostics.len(), 2);
+        let diagnostic = &computed.diagnostics.lookup_diagnostics[0];
+        assert_eq!(
+            diagnostic.selected_lookup_wallet.as_deref(),
+            Some("buyer-a")
+        );
+        assert_eq!(diagnostic.buy_event_ts_ms, Some(400));
+        assert_eq!(
+            diagnostic.diagnostic_miss_reason.as_deref(),
+            Some(FSC_DIAG_INBOUND_EXISTS_BUT_BELOW_ABS_STORE_THRESHOLD)
         );
     }
 

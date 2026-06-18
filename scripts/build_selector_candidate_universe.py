@@ -12,6 +12,38 @@ from typing import Any
 import selector_pipeline_common as common
 
 
+def parse_ab_record_id_timestamps(value: Any) -> tuple[int | None, int | None]:
+    if not isinstance(value, str) or not value:
+        return None, None
+    parts = value.rsplit(":", 3)
+    if len(parts) != 4:
+        return None, None
+    first_seen_raw, decision_raw = parts[1], parts[2]
+    if not first_seen_raw.isdigit() or not decision_raw.isdigit():
+        return None, None
+    return int(first_seen_raw), int(decision_raw)
+
+
+def decision_context_cutoff_ts_ms(row: dict[str, Any]) -> tuple[int | None, str]:
+    for field in (
+        "decision_ts_ms",
+        "feature_cutoff_ts_ms",
+        "observation_end_ts_ms",
+        "decision_timestamp_ms",
+    ):
+        value = common.int_or_none(row.get(field))
+        if value is not None:
+            return value, field
+    _first_seen_ts_ms, ab_decision_ts_ms = parse_ab_record_id_timestamps(row.get("ab_record_id"))
+    if ab_decision_ts_ms is not None:
+        return ab_decision_ts_ms, "ab_record_id_decision_ts_ms"
+    for field in ("first_seen_ts_ms", "timestamp_ms"):
+        value = common.int_or_none(row.get(field))
+        if value is not None:
+            return value, field
+    return None, "missing_decision_context_cutoff"
+
+
 def load_source_rows(
     paths: list[Path],
     *,
@@ -36,6 +68,10 @@ def load_source_rows(
                 source_path=str(path),
                 source_index=index,
             )
+            if not require_birth_event and item.get("decision_ts_ms") is None:
+                decision_ts_ms, decision_ts_source = decision_context_cutoff_ts_ms(row)
+                item["decision_ts_ms"] = decision_ts_ms
+                item["decision_ts_source"] = decision_ts_source
             window_ts = common.int_or_none(
                 item.get("birth_ts_ms") if require_birth_event else item.get("decision_ts_ms")
             )

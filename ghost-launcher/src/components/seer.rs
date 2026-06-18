@@ -134,28 +134,6 @@ impl NlnArtifactWriter {
         }
     }
 
-    fn should_capture_transfer(&self, event: &NlnTransferEvent) -> bool {
-        let rate = self.transfer_sample_rate;
-        if rate <= 1 {
-            return true;
-        }
-        let parts = vec![
-            event.signature.clone(),
-            event
-                .tx_index
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "none".to_string()),
-            event
-                .instruction_index
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "none".to_string()),
-            event.from_wallet.to_string(),
-            event.to_wallet.to_string(),
-            event.amount_lamports.to_string(),
-        ];
-        nln_stable_hash_u64(&parts) % u64::from(rate) == 0
-    }
-
     fn should_capture_raw_transfer_message(&self, message: &NlnProgramStreamMessage) -> bool {
         let rate = self.transfer_sample_rate;
         if rate <= 1 {
@@ -845,27 +823,40 @@ fn nln_funding_event_artifact_row(event: &NlnTransferEvent) -> Value {
     let event_id = nln_stable_hash(&parts);
     let event_ts_ms =
         nln_effective_event_ts_ms(event.meta.provider_ts_ms, None, event.meta.recv_ts_ms);
+    let parser_status = if missing.is_empty() {
+        "ok"
+    } else {
+        "incomplete"
+    };
 
     json!({
         "selector_schema_version": NLN_ARTIFACT_SCHEMA_VERSION,
         "artifact": "funding_events_v1",
-        "funding_event_status": if missing.is_empty() { "ok" } else { "incomplete" },
+        "funding_event_status": parser_status,
         "missing_fields": missing,
         "provider": "NLN",
         "source_topic": event.meta.topic,
         "source_kind": "nln_program_stream",
+        "source_label": "grpc_funding_lane_full_chain",
         "source_partition": event.meta.partition,
         "source_offset": event.meta.offset,
         "source_offset_raw": event.meta.offset_raw,
         "event_id": event_id,
         "signature": event.signature,
         "slot": event.slot,
+        "block_time": Option::<u64>::None,
         "tx_index": event.tx_index,
         "instruction_index": event.instruction_index,
+        "ts_ms": event_ts_ms,
         "event_ts_ms": event_ts_ms,
         "from_wallet": event.from_wallet.to_string(),
         "to_wallet": event.to_wallet.to_string(),
         "amount_lamports": event.amount_lamports,
+        "source_wallet": event.from_wallet.to_string(),
+        "recipient_wallet": event.to_wallet.to_string(),
+        "lamports": event.amount_lamports,
+        "transfer_kind": "system_transfer_native_sol",
+        "parser_status": parser_status,
         "token_address": event.token_address,
         "asset": "native_sol",
         "event_order_key": [
@@ -875,6 +866,167 @@ fn nln_funding_event_artifact_row(event: &NlnTransferEvent) -> Value {
             event.signature.clone()
         ],
     })
+}
+
+fn raw_fullchain_transfer_source_label(
+    event: &seer::ipc::FundingTransferEvent,
+) -> Option<&'static str> {
+    if event.full_chain_coverage
+        && event.provenance == seer::ipc::FundingTransferProvenance::authoritative_full_feed_live()
+    {
+        Some("grpc_funding_lane_full_chain")
+    } else {
+        None
+    }
+}
+
+fn raw_fullchain_transfer_artifact_row(
+    event: &seer::ipc::FundingTransferEvent,
+    artifact: &'static str,
+) -> Option<Value> {
+    let source_label = raw_fullchain_transfer_source_label(event)?;
+    let mut missing = Vec::new();
+    if event.slot.is_none() {
+        missing.push("slot");
+    }
+    if event.signature.trim().is_empty() {
+        missing.push("signature");
+    }
+    let instruction_index = event.outer_instruction_index.or(event.event_ordinal);
+    if instruction_index.is_none() {
+        missing.push("instruction_index");
+    }
+    if event.source_wallet.trim().is_empty() {
+        missing.push("source_wallet");
+    }
+    if event.recipient_wallet.trim().is_empty() {
+        missing.push("recipient_wallet");
+    }
+    if event.lamports == 0 {
+        missing.push("lamports");
+    }
+    let parser_status = if missing.is_empty() {
+        "ok"
+    } else {
+        "incomplete"
+    };
+    let ts_ms = event
+        .event_time
+        .effective_event_ts_ms()
+        .or_else(|| {
+            event
+                .event_time
+                .compat_event_ts_ms(Some(event.arrival_ts_ms))
+        })
+        .unwrap_or(event.arrival_ts_ms);
+    let block_time = event
+        .event_time
+        .chain_event_ts_ms
+        .map(|value| value / 1_000);
+    let parts = vec![
+        event.signature.clone(),
+        event
+            .slot
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        event
+            .tx_index
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        instruction_index
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        event.source_wallet.clone(),
+        event.recipient_wallet.clone(),
+        event.lamports.to_string(),
+    ];
+    let event_id = nln_stable_hash(&parts);
+    let replay_origin = match event.provenance.replay_origin {
+        seer::ipc::FundingTransferReplayOrigin::Live => "live",
+        seer::ipc::FundingTransferReplayOrigin::Replay => "replay",
+    };
+
+    Some(json!({
+        "selector_schema_version": NLN_ARTIFACT_SCHEMA_VERSION,
+        "artifact": artifact,
+        "funding_event_status": parser_status,
+        "system_transfer_status": parser_status,
+        "missing_fields": missing,
+        "provider": "Yellowstone",
+        "source_kind": "grpc_raw_full_chain",
+        "source_label": source_label,
+        "event_id": event_id,
+        "signature": event.signature,
+        "slot": event.slot,
+        "block_time": block_time,
+        "tx_index": event.tx_index,
+        "instruction_index": instruction_index,
+        "outer_instruction_index": event.outer_instruction_index,
+        "inner_group_index": event.inner_group_index,
+        "cpi_stack_height": event.cpi_stack_height,
+        "event_ordinal": event.event_ordinal,
+        "ts_ms": ts_ms,
+        "event_ts_ms": ts_ms,
+        "chain_event_ts_ms": event.event_time.chain_event_ts_ms,
+        "arrival_ts_ms": event.arrival_ts_ms,
+        "from_wallet": event.source_wallet,
+        "to_wallet": event.recipient_wallet,
+        "amount_lamports": event.lamports,
+        "source_wallet": event.source_wallet,
+        "recipient_wallet": event.recipient_wallet,
+        "lamports": event.lamports,
+        "transfer_kind": "system_transfer_native_sol",
+        "parser_status": parser_status,
+        "asset": "native_sol",
+        "full_chain_coverage": event.full_chain_coverage,
+        "provenance": {
+            "lane_kind": event.provenance.lane_kind.as_str(),
+            "coverage_class": event.provenance.coverage_class.as_str(),
+            "replay_origin": replay_origin,
+        },
+        "event_order_key": [
+            event.slot.map(|value| value.to_string()).unwrap_or_else(|| "none".to_string()),
+            event.tx_index.map(|value| value.to_string()).unwrap_or_else(|| "none".to_string()),
+            instruction_index.map(|value| value.to_string()).unwrap_or_else(|| "none".to_string()),
+            event.signature.clone()
+        ],
+    }))
+}
+
+async fn capture_raw_fullchain_transfer_artifacts(
+    writer: &NlnArtifactWriter,
+    event: &seer::ipc::FundingTransferEvent,
+) {
+    let Some(system_row) = raw_fullchain_transfer_artifact_row(event, "system_transfers_raw_v1")
+    else {
+        return;
+    };
+    let Some(funding_row) = raw_fullchain_transfer_artifact_row(event, "funding_events_v1") else {
+        return;
+    };
+
+    if writer
+        .send_lossless(
+            NlnArtifactRecord::SystemTransfersRaw(system_row),
+            "system_transfers_raw_v1",
+        )
+        .await
+    {
+        crate::oracle_metrics::record_fsc_system_transfers_raw_written(1);
+    }
+    if writer
+        .send_lossless(
+            NlnArtifactRecord::FundingEvent(funding_row),
+            "funding_events_v1",
+        )
+        .await
+    {
+        crate::oracle_metrics::record_fsc_funding_events_written(1);
+    }
+    crate::oracle_metrics::record_fsc_transfer_source_available(
+        "grpc_funding_lane_full_chain",
+        true,
+    );
 }
 
 async fn write_nln_artifact_line(
@@ -1231,14 +1383,11 @@ fn select_nln_program_stream_subscriptions(
     .filter(|topic| !topic.is_empty())
     .map(str::to_owned)
     .collect();
-    let legacy_enhanced_topics: HashSet<String> = [
-        config.pumpfun_trade_topic.trim(),
-        config.system_transfers_topic.trim(),
-    ]
-    .into_iter()
-    .filter(|topic| !topic.is_empty())
-    .map(str::to_owned)
-    .collect();
+    let route_incompatible_enhanced_topics: HashSet<String> = [config.pumpfun_trade_topic.trim()]
+        .into_iter()
+        .filter(|topic| !topic.is_empty())
+        .map(str::to_owned)
+        .collect();
     let mut fail_reasons = Vec::new();
     if config.quota_policy == SeerProgramStreamsQuotaPolicy::FailFast {
         if enabled_topics.len() > config.max_streams {
@@ -1290,7 +1439,7 @@ fn select_nln_program_stream_subscriptions(
             }
             let mixed_enhanced_topics: Vec<String> = enabled_topics
                 .iter()
-                .filter(|topic| legacy_enhanced_topics.contains(*topic))
+                .filter(|topic| route_incompatible_enhanced_topics.contains(*topic))
                 .cloned()
                 .collect();
             if !mixed_enhanced_topics.is_empty() {
@@ -1883,10 +2032,12 @@ async fn run_nln_program_streams_topic_capture(
                     let _ = tx.send(true);
                 }
 
-                if let Some(writer) = artifact_writer
-                    .as_ref()
-                    .filter(|writer| writer.should_capture_transfer(&transfer))
-                {
+                if let Some(writer) = artifact_writer.as_ref() {
+                    if !raw_captured {
+                        if let Some(row) = raw_row.as_ref() {
+                            capture_raw_nln_message(writer, topic_kind, &message, row, true).await;
+                        }
+                    }
                     let mut funding_row = nln_funding_event_artifact_row(&transfer);
                     add_nln_artifact_sampling(&mut funding_row, writer.transfer_sample_rate);
                     writer
@@ -3847,6 +3998,7 @@ fn emit_execution_account_evidence_to_event_bus(
 fn spawn_nln_program_streams_capture(
     config: ProgramStreamsConfig,
     artifact_config: NlnArtifactCaptureConfig,
+    artifact_writer: Option<NlnArtifactWriter>,
     event_bus_tx: Option<EventBusSender>,
     health: Option<Arc<RuntimeHealth>>,
     authoritative_funding_stream_tx: Option<watch::Sender<bool>>,
@@ -3860,7 +4012,6 @@ fn spawn_nln_program_streams_capture(
         let endpoint = redact_endpoint_for_logs(&config.endpoint);
         let artifact_capture_enabled = artifact_config.enabled;
         let artifact_capture_dir = artifact_config.capture_dir.clone();
-        let artifact_writer = spawn_nln_artifact_writer(artifact_config);
         let selection = select_nln_program_stream_subscriptions(&config);
         let started_topics: Vec<String> = selection
             .subscriptions
@@ -3934,6 +4085,10 @@ fn spawn_nln_program_streams_capture(
                 let has_transfers_topic = topics
                     .iter()
                     .any(|topic| topic.topic == config.system_transfers_topic);
+                crate::oracle_metrics::record_fsc_transfer_source_available(
+                    "program_stream_system_transfers",
+                    has_transfers_topic,
+                );
                 let listed_topics: HashSet<&str> =
                     topics.iter().map(|topic| topic.topic.as_str()).collect();
                 let missing_selected_topics: Vec<&str> = selection
@@ -4032,6 +4187,16 @@ pub async fn run(
     // Convert launcher config to Seer config
     let program_streams_artifact_config =
         NlnArtifactCaptureConfig::from_launcher(&config.program_streams);
+    let program_streams_artifact_writer =
+        spawn_nln_artifact_writer(program_streams_artifact_config.clone());
+    crate::oracle_metrics::record_fsc_transfer_source_available(
+        "grpc_funding_lane_full_chain",
+        false,
+    );
+    crate::oracle_metrics::record_fsc_transfer_source_available(
+        "program_stream_system_transfers",
+        false,
+    );
 
     // Determine source mode first, checking both specific source_mode and legacy connection_mode
     let derived_source_mode = if let Some(mode) = &config.source_mode {
@@ -4332,6 +4497,7 @@ pub async fn run(
     let nln_program_streams_handle = spawn_nln_program_streams_capture(
         program_streams_capture_config,
         program_streams_artifact_config,
+        program_streams_artifact_writer.clone(),
         event_bus_tx.clone(),
         health.clone(),
         nln_authoritative_funding_stream_tx,
@@ -4341,6 +4507,7 @@ pub async fn run(
     // Process IPC events and emit to event bus
     let health_ipc = health.clone();
     let nln_trade_pool_resolver_ipc = nln_trade_pool_resolver.clone();
+    let raw_fullchain_artifact_writer_ipc = program_streams_artifact_writer.clone();
     let ipc_handle = tokio::spawn(async move {
         let detected_pool_ttl = Duration::from_millis(seer_config.watched_pools_ttl_ms.max(1));
         let detected_pool_cap = seer_config.watched_pools_cap.max(1);
@@ -4720,6 +4887,10 @@ pub async fn run(
                 }
 
                 seer::ipc::SeerEvent::FundingTransfer(funding_event) => {
+                    if let Some(writer) = raw_fullchain_artifact_writer_ipc.as_ref() {
+                        capture_raw_fullchain_transfer_artifacts(writer, &funding_event.transfer)
+                            .await;
+                    }
                     if let Some(ref tx) = event_bus_tx {
                         emit_funding_transfer_to_event_bus(tx, &funding_event, health_ipc.as_ref());
                     }
@@ -4853,6 +5024,10 @@ pub async fn run(
 pub fn trade_event_to_pool_transaction(
     trade: &seer::types::TradeEvent,
 ) -> crate::events::PoolTransaction {
+    seer::types::record_trade_source_coverage(
+        seer::types::SEER_LAUNCHER_BRIDGE_COVERAGE_SOURCE,
+        trade,
+    );
     let sol_amount_lamports = if trade.is_buy {
         trade.max_sol_cost
     } else {
@@ -4968,10 +5143,12 @@ mod tests {
     use super::{
         detected_pool_from_candidate, detection_clock_summary,
         emit_execution_account_evidence_to_event_bus, emit_funding_transfer_to_event_bus,
-        nln_normalization_error_row, nln_route_manifest_evidence_candidate_row,
+        flush_nln_artifact_writer, nln_funding_event_artifact_row, nln_normalization_error_row,
+        nln_route_manifest_evidence_candidate_row, open_nln_artifact_file,
         process_pool_detected_event_for_session_gate, process_trade_event_for_session_gate,
-        pumpswap_program_id, select_nln_program_stream_subscriptions,
-        trade_event_to_pool_transaction, trade_has_forwardable_identity,
+        pumpswap_program_id, raw_fullchain_transfer_artifact_row,
+        raw_fullchain_transfer_source_label, select_nln_program_stream_subscriptions,
+        trade_event_to_pool_transaction, trade_has_forwardable_identity, write_nln_artifact_line,
         NlnProgramStreamCaptureTopic, NlnTradePoolIdentityResolver, NlnTradeResolveDecision,
         SessionAccountUpdateBridge, SessionAccountUpdateDecision, SessionBcv2Context,
         SessionExecutionAccountEvidenceDecision, SessionPoolTradeBridge, SessionTradeDecision,
@@ -4987,7 +5164,8 @@ mod tests {
         DetectedTradeEvent, EventPriority, FundingTransferEvent, SeerEvent,
     };
     use seer::nln_program_streams::{
-        NlnIngestMeta, NlnProgramStreamMessage, NlnPumpFunTradeEvent, PumpFunTradeSide,
+        normalize_nln_event, NlnEvent, NlnIngestMeta, NlnProgramStreamMessage,
+        NlnPumpFunTradeEvent, NlnTransferEvent, PumpFunTradeSide,
     };
     use seer::types::{
         CandidatePool, InstructionProvenance, ObservedAccountMetaProvenance, RawBytesMissingReason,
@@ -4997,6 +5175,7 @@ mod tests {
     use solana_sdk::{pubkey::Pubkey, signature::Signature};
     use std::str::FromStr;
     use std::time::{Duration, Instant, SystemTime};
+    use tempfile::TempDir;
 
     fn make_candidate(pool: Pubkey, mint: Pubkey) -> CandidatePool {
         CandidatePool {
@@ -5053,6 +5232,233 @@ mod tests {
             real_sol_reserves: None,
             real_token_reserves: None,
         }
+    }
+
+    fn make_nln_transfer(source: Pubkey, recipient: Pubkey) -> NlnTransferEvent {
+        NlnTransferEvent {
+            meta: NlnIngestMeta {
+                provider: "NLN".to_string(),
+                topic: ProgramStreamsConfig::default_system_transfers_topic(),
+                partition: 0,
+                offset_raw: "9".to_string(),
+                offset: Some(9),
+                provider_ts_ms: Some(1_780_000_000_000),
+                recv_ts_ms: 1_780_000_000_010,
+                recv_ts_ns: 1_780_000_000_010_000_000,
+                decode_ts_ms: 1_780_000_000_011,
+                slot: Some(77),
+                signature: Some("transfer-sig".to_string()),
+                tx_index: Some(4),
+                instruction_index: Some(2),
+            },
+            signature: "transfer-sig".to_string(),
+            tx_index: Some(4),
+            instruction_index: Some(2),
+            slot: 77,
+            from_wallet: source,
+            to_wallet: recipient,
+            amount_lamports: 12_345_678,
+            token_address: "solana".to_string(),
+        }
+    }
+
+    fn make_raw_fullchain_funding_transfer(
+        source: Pubkey,
+        recipient: Pubkey,
+    ) -> FundingTransferEvent {
+        FundingTransferEvent {
+            semantic: ghost_core::EventSemanticEnvelope::default(),
+            slot: Some(426_000_001),
+            event_ordinal: Some(0),
+            tx_index: Some(7),
+            outer_instruction_index: Some(2),
+            inner_group_index: None,
+            cpi_stack_height: None,
+            event_time: ghost_core::EventTimeMetadata::new(
+                Some(1_780_000_100_000),
+                Some(1_780_000_100_010),
+                None,
+            ),
+            arrival_ts_ms: 1_780_000_100_015,
+            signature: "raw-fullchain-transfer-sig".to_string(),
+            source_wallet: source.to_string(),
+            recipient_wallet: recipient.to_string(),
+            lamports: 42_000_000,
+            full_chain_coverage: true,
+            provenance: seer::ipc::FundingTransferProvenance::authoritative_full_feed_live(),
+        }
+    }
+
+    #[test]
+    fn test_funding_event_artifact_row_persists_recipient_wallet_aliases() {
+        let source = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let transfer = make_nln_transfer(source, recipient);
+
+        let row = nln_funding_event_artifact_row(&transfer);
+
+        assert_eq!(row["artifact"], json!("funding_events_v1"));
+        assert_eq!(row["source_wallet"], json!(source.to_string()));
+        assert_eq!(row["recipient_wallet"], json!(recipient.to_string()));
+        assert_eq!(row["lamports"], json!(12_345_678));
+        assert_eq!(row["transfer_kind"], json!("system_transfer_native_sol"));
+        assert_eq!(row["source_label"], json!("grpc_funding_lane_full_chain"));
+        assert_eq!(row["parser_status"], json!("ok"));
+        assert_eq!(row["ts_ms"], json!(1_780_000_000_000u64));
+    }
+
+    #[test]
+    fn test_system_transfer_parser_persists_recipient_wallet() {
+        let source = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let message = NlnProgramStreamMessage {
+            topic: ProgramStreamsConfig::default_system_transfers_topic(),
+            partition: 0,
+            offset_raw: "11".to_string(),
+            offset: Some(11),
+            provider_ts_ms: Some(1_780_000_000_000),
+            recv_ts_ms: 1_780_000_000_010,
+            recv_ts_ns: 1_780_000_000_010_000_000,
+            decode_ts_ms: 1_780_000_000_011,
+            payload_json: json!({
+                "signature": "system-transfer-sig",
+                "slot": 88,
+                "tx_index": 5,
+                "instruction_index": 1,
+                "from_wallet": source.to_string(),
+                "to_wallet": recipient.to_string(),
+                "amount_lamports": 12_345_678,
+                "token_address": "solana"
+            }),
+        };
+
+        let event = normalize_nln_event(&message, &ProgramStreamsConfig::default())
+            .expect("system transfer should normalize");
+        let NlnEvent::Transfer(transfer) = event else {
+            panic!("expected transfer event");
+        };
+        let row = nln_funding_event_artifact_row(&transfer);
+
+        assert_eq!(transfer.from_wallet, source);
+        assert_eq!(transfer.to_wallet, recipient);
+        assert_eq!(row["source_wallet"], json!(source.to_string()));
+        assert_eq!(row["recipient_wallet"], json!(recipient.to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_durable_funding_events_file_is_non_empty_for_synthetic_transfer() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let path = temp_dir.path().join("funding_events_v1.jsonl");
+        let transfer = make_nln_transfer(Pubkey::new_unique(), Pubkey::new_unique());
+        let row = nln_funding_event_artifact_row(&transfer);
+        let mut writer = open_nln_artifact_file(path.clone(), "funding_events_v1").await;
+
+        write_nln_artifact_line(&mut writer, &row, "funding_events_v1").await;
+        flush_nln_artifact_writer(&mut writer, "funding_events_v1").await;
+
+        let content = tokio::fs::read_to_string(path)
+            .await
+            .expect("funding events file should be readable");
+        assert!(!content.trim().is_empty());
+        let parsed: Value = serde_json::from_str(content.lines().next().expect("one JSONL row"))
+            .expect("valid JSONL row");
+        assert_eq!(parsed["recipient_wallet"], row["recipient_wallet"]);
+    }
+
+    #[test]
+    fn test_raw_fullchain_transfer_artifact_row_persists_required_funding_fields() {
+        let source = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let transfer = make_raw_fullchain_funding_transfer(source, recipient);
+
+        let row = raw_fullchain_transfer_artifact_row(&transfer, "funding_events_v1")
+            .expect("raw full-chain transfer should produce artifact row");
+
+        assert_eq!(row["artifact"], json!("funding_events_v1"));
+        assert_eq!(row["source_wallet"], json!(source.to_string()));
+        assert_eq!(row["recipient_wallet"], json!(recipient.to_string()));
+        assert_eq!(row["lamports"], json!(42_000_000));
+        assert_eq!(row["slot"], json!(426_000_001u64));
+        assert_eq!(row["signature"], json!("raw-fullchain-transfer-sig"));
+        assert_eq!(row["ts_ms"], json!(1_780_000_100_000u64));
+        assert_eq!(row["block_time"], json!(1_780_000_100u64));
+        assert_eq!(row["transfer_kind"], json!("system_transfer_native_sol"));
+        assert_eq!(row["source_label"], json!("grpc_funding_lane_full_chain"));
+        assert_eq!(row["parser_status"], json!("ok"));
+        assert_eq!(
+            row["provenance"]["coverage_class"],
+            json!("full_chain_coverage")
+        );
+    }
+
+    #[test]
+    fn test_missing_program_stream_system_transfers_does_not_block_raw_fullchain_capture_row() {
+        let source = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let transfer = make_raw_fullchain_funding_transfer(source, recipient);
+        let mut config = ProgramStreamsConfig::default();
+        config
+            .enabled_topics
+            .retain(|topic| topic != &ProgramStreamsConfig::default_system_transfers_topic());
+        let selection = select_nln_program_stream_subscriptions(&config);
+
+        assert!(!selection.subscriptions.iter().any(|subscription| matches!(
+            subscription.topic_kind,
+            NlnProgramStreamCaptureTopic::SystemTransfers
+        )));
+        assert_eq!(
+            raw_fullchain_transfer_source_label(&transfer),
+            Some("grpc_funding_lane_full_chain")
+        );
+        assert!(
+            raw_fullchain_transfer_artifact_row(&transfer, "system_transfers_raw_v1").is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_durable_raw_fullchain_transfer_writes_system_and_funding_sidecars() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let transfer =
+            make_raw_fullchain_funding_transfer(Pubkey::new_unique(), Pubkey::new_unique());
+        let system_row = raw_fullchain_transfer_artifact_row(&transfer, "system_transfers_raw_v1")
+            .expect("system transfer row");
+        let funding_row = raw_fullchain_transfer_artifact_row(&transfer, "funding_events_v1")
+            .expect("funding event row");
+        let system_path = temp_dir.path().join("system_transfers_raw_v1.jsonl");
+        let funding_path = temp_dir.path().join("funding_events_v1.jsonl");
+        let mut system_writer =
+            open_nln_artifact_file(system_path.clone(), "system_transfers_raw_v1").await;
+        let mut funding_writer =
+            open_nln_artifact_file(funding_path.clone(), "funding_events_v1").await;
+
+        write_nln_artifact_line(&mut system_writer, &system_row, "system_transfers_raw_v1").await;
+        write_nln_artifact_line(&mut funding_writer, &funding_row, "funding_events_v1").await;
+        flush_nln_artifact_writer(&mut system_writer, "system_transfers_raw_v1").await;
+        flush_nln_artifact_writer(&mut funding_writer, "funding_events_v1").await;
+
+        let system_content = tokio::fs::read_to_string(system_path)
+            .await
+            .expect("system sidecar readable");
+        let funding_content = tokio::fs::read_to_string(funding_path)
+            .await
+            .expect("funding sidecar readable");
+        assert!(!system_content.trim().is_empty());
+        assert!(!funding_content.trim().is_empty());
+        let system_parsed: Value =
+            serde_json::from_str(system_content.lines().next().expect("system row"))
+                .expect("valid system row");
+        let funding_parsed: Value =
+            serde_json::from_str(funding_content.lines().next().expect("funding row"))
+                .expect("valid funding row");
+        assert_eq!(
+            system_parsed["recipient_wallet"],
+            funding_parsed["recipient_wallet"]
+        );
+        assert_eq!(
+            funding_parsed["source_wallet"],
+            funding_row["source_wallet"]
+        );
+        assert_eq!(funding_parsed["lamports"], json!(42_000_000));
     }
 
     async fn recv_only_event(rx: &mut tokio::sync::broadcast::Receiver<GhostEvent>) -> GhostEvent {
@@ -5168,6 +5574,36 @@ mod tests {
             vec![
                 NlnProgramStreamCaptureTopic::PumpFunBuy,
                 NlnProgramStreamCaptureTopic::PumpFunBuyExactSolIn,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_program_stream_selection_accepts_funding_lane_plus_legacy_route_evidence() {
+        let config = ProgramStreamsConfig {
+            enabled: true,
+            max_streams: 2,
+            quota_policy: ProgramStreamsQuotaPolicy::FailFast,
+            enabled_topics: vec![
+                ProgramStreamsConfig::default_system_transfers_topic(),
+                ProgramStreamsConfig::default_pumpfun_buy_topic(),
+            ],
+            disabled_streams: vec![ProgramStreamsConfig::default_pumpfun_trade_topic()],
+            ..ProgramStreamsConfig::default()
+        };
+        let selection = select_nln_program_stream_subscriptions(&config);
+
+        assert!(!selection.quota_policy_violation);
+        assert_eq!(selection.requested_topic_count, 2);
+        assert_eq!(
+            selection
+                .subscriptions
+                .iter()
+                .map(|subscription| subscription.topic_kind)
+                .collect::<Vec<_>>(),
+            vec![
+                NlnProgramStreamCaptureTopic::SystemTransfers,
+                NlnProgramStreamCaptureTopic::PumpFunBuy,
             ]
         );
     }
