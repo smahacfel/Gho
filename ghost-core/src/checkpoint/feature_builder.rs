@@ -106,6 +106,8 @@ impl FeatureMaterializer for ObservationFeatureBuilder {
             evidence_status: Default::default(),
             organic_broadening: Default::default(),
             manipulation_contradictions: Default::default(),
+            temporal_deltas: Default::default(),
+            decision_time_series: Default::default(),
         }
     }
 }

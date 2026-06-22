@@ -226,6 +226,8 @@ fn materialized_feature_set_contains_complete_inputs() {
             spend_fraction_divergence: None,
             demand_elasticity_score: Some(0.55),
             signer_cross_pool_velocity: None,
+            cpv_other_pool_activity: None,
+            cpv_evidence: Default::default(),
             funding_source_concentration: Some(0.27),
             funding_source_diagnostics: None,
             funding_source_v2: None,

@@ -1,20 +1,26 @@
 use super::gatekeeper::{
     AlphaGateDiagnostics, AlphaRejectTrigger, BondingCurveDynamics, DevBehaviorProfile,
     GatekeeperAssessment, GatekeeperDecision, GatekeeperStrength, GatekeeperVerdictType,
-    ObservationStage, ProsperityFilterDiagnostics, ProsperityRejectTrigger, SignerDiversityProfile,
+    ObservationStage, ProsperityFilterDiagnostics, ProsperityRejectTrigger,
+    SelectorSoftScoreDiagnostics, SelectorSoftScoreRuleDiagnostic, SignerDiversityProfile,
     SoftSignals, SybilInterferencePattern, SybilLeadSignal, SybilPolicyDiagnostics,
     SybilSoftSignals, VelocityProfile, VolumeSanityProfile,
 };
 use super::gatekeeper_pdd::{PddDiagnostics, PddHardFail};
 use super::gatekeeper_pdd_sequence::{sequence_signal_availability, PddSequenceSignalKind};
-use ghost_brain::config::GatekeeperV2Config;
+use ghost_brain::config::{
+    CpvLowSamplePolicy, GatekeeperV2Config, SelectorSoftScoreConfig,
+    SelectorSoftScoreMissingPolicy, SelectorSoftScorePolicy, StrictMetricMissingPolicy,
+    TemporalCarriedForwardPolicy,
+};
 use ghost_brain::oracle::reason_code::GatekeeperReasonCode;
 use ghost_core::checkpoint::{
-    MaterializedFeatureSet, SybilResistanceFeatures, TrendDirection, TxSegmentSequence,
+    MaterializedFeatureSet, MetricEvidenceQuality, SybilResistanceFeatures,
+    TemporalMetricEvidenceContext, TemporalMetricSource, TrendDirection, TxSegmentSequence,
 };
 use ghost_core::tx_intelligence::types::{
-    CPV_INSUFFICIENT_SIGNERS_REASON, CPV_ROLLING_STATE_UNAVAILABLE_REASON,
-    DBIA_INSUFFICIENT_BUYERS_REASON, DBIA_NO_DEV_BUY_REASON,
+    CPV_INSUFFICIENT_SIGNERS_REASON, CPV_LOW_SAMPLE_DEGRADED_REASON,
+    CPV_ROLLING_STATE_UNAVAILABLE_REASON, DBIA_INSUFFICIENT_BUYERS_REASON, DBIA_NO_DEV_BUY_REASON,
     DBIA_RAW_FINGERPRINT_UNAVAILABLE_REASON, DES_CURVE_DATA_UNAVAILABLE_REASON,
     DES_INSUFFICIENT_BUYS_REASON, DES_SLOT_ORDER_UNAVAILABLE_REASON,
     FSC_FUNDING_STREAM_UNAVAILABLE_REASON, FSC_INSUFFICIENT_KNOWN_SOURCES_REASON,
@@ -37,6 +43,7 @@ pub enum HardFailReason {
     ExtremeBotTiming,
     FailedTxRatio,
     SlowPool,
+    StrictMetricThreshold,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +86,9 @@ fn hard_fail_reason_code(reason: HardFailReason) -> GatekeeperReasonCode {
         HardFailReason::ExtremeBotTiming => GatekeeperReasonCode::HardFailExtremeBotTiming,
         HardFailReason::FailedTxRatio => GatekeeperReasonCode::HardFailFailedTxRatio,
         HardFailReason::SlowPool => GatekeeperReasonCode::HardFailSlowPool,
+        HardFailReason::StrictMetricThreshold => {
+            GatekeeperReasonCode::HardFailStrictMetricThreshold
+        }
     }
 }
 
@@ -135,6 +145,993 @@ fn format_matched_branches(branches: &[&'static str]) -> String {
     } else {
         branches.join(",")
     }
+}
+
+#[derive(Debug, Default)]
+struct StrictMetricPolicyEvaluation {
+    hard_fail_reason: Option<String>,
+    annotations: Vec<String>,
+}
+
+fn strict_missing_policy_tag(policy: StrictMetricMissingPolicy) -> &'static str {
+    match policy {
+        StrictMetricMissingPolicy::HardFail => "hard_fail",
+        StrictMetricMissingPolicy::Skip => "skip",
+        StrictMetricMissingPolicy::DegradedAllowed => "degraded_allowed",
+    }
+}
+
+fn cpv_low_sample_policy_tag(policy: CpvLowSamplePolicy) -> &'static str {
+    match policy {
+        CpvLowSamplePolicy::HardFail => "hard_fail",
+        CpvLowSamplePolicy::UseDegraded => "use_degraded",
+        CpvLowSamplePolicy::ReasonOnly => "reason_only",
+    }
+}
+
+fn temporal_carried_forward_policy_tag(policy: TemporalCarriedForwardPolicy) -> &'static str {
+    match policy {
+        TemporalCarriedForwardPolicy::LogOnly => "log_only",
+        TemporalCarriedForwardPolicy::UseForSelectorOnly => "use_for_selector_only",
+        TemporalCarriedForwardPolicy::UseInPolicy => "use_in_policy",
+    }
+}
+
+fn selector_soft_score_policy_tag(policy: SelectorSoftScorePolicy) -> &'static str {
+    match policy {
+        SelectorSoftScorePolicy::LogOnly => "log_only",
+        SelectorSoftScorePolicy::CandidateOnly => "candidate_only",
+        SelectorSoftScorePolicy::BuyGate => "buy_gate",
+    }
+}
+
+fn selector_missing_policy_tag(policy: SelectorSoftScoreMissingPolicy) -> &'static str {
+    match policy {
+        SelectorSoftScoreMissingPolicy::NoPoint => "no_point",
+    }
+}
+
+fn selector_soft_score_reject_reason(
+    diagnostics: &SelectorSoftScoreDiagnostics,
+    verdict_type: GatekeeperVerdictType,
+) -> String {
+    let policy = diagnostics.policy;
+    let reason = match verdict_type {
+        GatekeeperVerdictType::RejectSelectorNotCandidate => "SELECTOR_SCORE_NOT_CANDIDATE",
+        GatekeeperVerdictType::RejectSelectorBelowBuy => "SELECTOR_SCORE_BELOW_BUY",
+        _ => "SELECTOR_SCORE_REJECT",
+    };
+    format!(
+        "{reason}: score={}/{} min_candidate={} min_buy={} present={} missing={} passed={} policy={}",
+        diagnostics.score,
+        diagnostics.max_score,
+        diagnostics.min_candidate_score,
+        diagnostics.min_buy_score,
+        diagnostics.present_rules,
+        diagnostics.missing_rules,
+        diagnostics.passed_rules,
+        policy,
+    )
+}
+
+pub(crate) fn selector_soft_score_terminal_reject(
+    diagnostics: &SelectorSoftScoreDiagnostics,
+    config: &GatekeeperV2Config,
+) -> Option<(GatekeeperVerdictType, GatekeeperReasonCode, String)> {
+    if !diagnostics.enabled {
+        return None;
+    }
+
+    let verdict_type = match config.selector_soft_score.policy {
+        SelectorSoftScorePolicy::LogOnly => return None,
+        SelectorSoftScorePolicy::CandidateOnly => {
+            if diagnostics.candidate_passed {
+                return None;
+            }
+            GatekeeperVerdictType::RejectSelectorNotCandidate
+        }
+        SelectorSoftScorePolicy::BuyGate => {
+            if !diagnostics.candidate_passed {
+                GatekeeperVerdictType::RejectSelectorNotCandidate
+            } else if !diagnostics.buy_passed {
+                GatekeeperVerdictType::RejectSelectorBelowBuy
+            } else {
+                return None;
+            }
+        }
+    };
+
+    let reason_code = match verdict_type {
+        GatekeeperVerdictType::RejectSelectorNotCandidate => {
+            GatekeeperReasonCode::RejectSelectorNotCandidate
+        }
+        GatekeeperVerdictType::RejectSelectorBelowBuy => {
+            GatekeeperReasonCode::RejectSelectorBelowBuy
+        }
+        _ => GatekeeperReasonCode::RejectCoreFail,
+    };
+
+    Some((
+        verdict_type,
+        reason_code,
+        selector_soft_score_reject_reason(diagnostics, verdict_type),
+    ))
+}
+
+fn metric_quality_tag(quality: MetricEvidenceQuality) -> &'static str {
+    match quality {
+        MetricEvidenceQuality::Clean => "clean",
+        MetricEvidenceQuality::DegradedLowSample => "degraded_low_sample",
+        MetricEvidenceQuality::CarriedForward => "carried_forward",
+        MetricEvidenceQuality::InsufficientSample => "insufficient_sample",
+        MetricEvidenceQuality::Stale => "stale",
+        MetricEvidenceQuality::NotAllowed => "not_allowed",
+        MetricEvidenceQuality::UnavailableSource => "unavailable_source",
+        MetricEvidenceQuality::Unavailable => "unavailable",
+        MetricEvidenceQuality::NotConfigured => "not_configured",
+    }
+}
+
+fn temporal_source_tag(source: TemporalMetricSource) -> &'static str {
+    match source {
+        TemporalMetricSource::Observed => "observed",
+        TemporalMetricSource::CarriedForwardNoEvent => "carried_forward_no_event",
+        TemporalMetricSource::PartialCarriedForward => "partial_carried_forward",
+        TemporalMetricSource::Stale => "stale",
+        TemporalMetricSource::NotAllowed => "not_allowed",
+        TemporalMetricSource::Unavailable => "unavailable",
+        TemporalMetricSource::NotConfigured => "not_configured",
+    }
+}
+
+fn finite_option(value: Option<f64>) -> Option<f64> {
+    value.filter(|value| value.is_finite())
+}
+
+fn finite_scalar(value: f64) -> Option<f64> {
+    value.is_finite().then_some(value)
+}
+
+fn set_strict_hard_fail(evaluation: &mut StrictMetricPolicyEvaluation, reason: impl Into<String>) {
+    if evaluation.hard_fail_reason.is_none() {
+        evaluation.hard_fail_reason = Some(reason.into());
+    }
+}
+
+fn strict_metric_value_failure(
+    metric_name: &str,
+    observed: f64,
+    operator: &str,
+    threshold: f64,
+    detail: Option<String>,
+) -> String {
+    let mut reason = format!(
+        "HARD_FAIL_STRICT_METRIC_THRESHOLD: strict_metric_value_failure={} observed={:.9} {} {:.9}",
+        metric_name, observed, operator, threshold
+    );
+    if let Some(detail) = detail {
+        reason.push(' ');
+        reason.push_str(&detail);
+    }
+    reason
+}
+
+fn handle_strict_missing_metric(
+    evaluation: &mut StrictMetricPolicyEvaluation,
+    config: &GatekeeperV2Config,
+    metric_name: &str,
+    evidence_detail: Option<String>,
+) {
+    let policy = strict_missing_policy_tag(config.strict_metric_missing_policy);
+    match config.strict_metric_missing_policy {
+        StrictMetricMissingPolicy::HardFail | StrictMetricMissingPolicy::DegradedAllowed => {
+            let mut reason = format!(
+                "HARD_FAIL_STRICT_METRIC_THRESHOLD: strict_metric_missing={} policy={}",
+                metric_name, policy
+            );
+            if let Some(detail) = evidence_detail {
+                reason.push(' ');
+                reason.push_str(&detail);
+            }
+            set_strict_hard_fail(evaluation, reason);
+        }
+        StrictMetricMissingPolicy::Skip => {
+            let mut annotation = format!(
+                "metric_skipped_missing={} policy=skip strict_metric_pass=false",
+                metric_name
+            );
+            if let Some(detail) = evidence_detail {
+                annotation.push(' ');
+                annotation.push_str(&detail);
+            }
+            evaluation.annotations.push(annotation);
+        }
+    }
+}
+
+fn check_strict_min_count(
+    evaluation: &mut StrictMetricPolicyEvaluation,
+    metric_name: &str,
+    observed: usize,
+    required: usize,
+) {
+    if evaluation.hard_fail_reason.is_none() && observed < required {
+        set_strict_hard_fail(
+            evaluation,
+            strict_metric_value_failure(
+                metric_name,
+                observed as f64,
+                "<",
+                required as f64,
+                Some("threshold_type=min_count".to_string()),
+            ),
+        );
+    }
+}
+
+fn check_strict_min_f64(
+    evaluation: &mut StrictMetricPolicyEvaluation,
+    metric_name: &str,
+    observed: f64,
+    threshold: f64,
+    detail: Option<String>,
+) {
+    if evaluation.hard_fail_reason.is_none() && observed < threshold {
+        set_strict_hard_fail(
+            evaluation,
+            strict_metric_value_failure(metric_name, observed, "<", threshold, detail),
+        );
+    }
+}
+
+fn check_strict_max_f64(
+    evaluation: &mut StrictMetricPolicyEvaluation,
+    metric_name: &str,
+    observed: f64,
+    threshold: f64,
+    detail: Option<String>,
+) {
+    if evaluation.hard_fail_reason.is_none() && observed > threshold {
+        set_strict_hard_fail(
+            evaluation,
+            strict_metric_value_failure(metric_name, observed, ">", threshold, detail),
+        );
+    }
+}
+
+fn check_strict_required_range(
+    evaluation: &mut StrictMetricPolicyEvaluation,
+    config: &GatekeeperV2Config,
+    metric_name: &str,
+    observed: Option<f64>,
+    min_threshold: Option<f64>,
+    max_threshold: Option<f64>,
+) {
+    if evaluation.hard_fail_reason.is_some() {
+        return;
+    }
+
+    let Some(observed) = observed else {
+        handle_strict_missing_metric(evaluation, config, metric_name, None);
+        return;
+    };
+
+    if let Some(min_threshold) = min_threshold {
+        check_strict_min_f64(evaluation, metric_name, observed, min_threshold, None);
+    }
+    if let Some(max_threshold) = max_threshold {
+        check_strict_max_f64(evaluation, metric_name, observed, max_threshold, None);
+    }
+}
+
+fn cpv_has_low_sample_evidence(sybil: &SybilResistanceFeatures) -> bool {
+    matches!(
+        sybil.cpv_evidence.quality,
+        MetricEvidenceQuality::DegradedLowSample | MetricEvidenceQuality::InsufficientSample
+    ) || has_degraded_reason(&sybil.degraded_reasons, CPV_LOW_SAMPLE_DEGRADED_REASON)
+        || has_degraded_reason(&sybil.degraded_reasons, CPV_INSUFFICIENT_SIGNERS_REASON)
+        || sybil.cpv_evidence.degraded_reasons.iter().any(|reason| {
+            reason == CPV_LOW_SAMPLE_DEGRADED_REASON || reason == CPV_INSUFFICIENT_SIGNERS_REASON
+        })
+}
+
+fn cpv_evidence_detail(sybil: &SybilResistanceFeatures) -> String {
+    format!(
+        "evidence_status={} cpv_sample_count={} cpv_required_clean_sample_count={} cpv_required_degraded_sample_count={}",
+        metric_quality_tag(sybil.cpv_evidence.quality),
+        sybil
+            .cpv_evidence
+            .sample_count
+            .unwrap_or(sybil.signer_sample_count),
+        sybil
+            .cpv_evidence
+            .required_clean_sample_count
+            .unwrap_or_default(),
+        sybil
+            .cpv_evidence
+            .required_degraded_sample_count
+            .unwrap_or_default(),
+    )
+}
+
+fn check_strict_cpv_metric(
+    evaluation: &mut StrictMetricPolicyEvaluation,
+    assessment: &GatekeeperAssessment,
+    config: &GatekeeperV2Config,
+) {
+    if evaluation.hard_fail_reason.is_some() {
+        return;
+    }
+
+    let sybil = &assessment.feature_snapshot.sybil_resistance;
+    let metric_name = "signer_cross_pool_velocity";
+    let observed = finite_option(sybil.signer_cross_pool_velocity);
+    let low_sample = cpv_has_low_sample_evidence(sybil);
+    let detail = cpv_evidence_detail(sybil);
+
+    if low_sample {
+        match config.cpv_low_sample_policy {
+            CpvLowSamplePolicy::HardFail => {
+                set_strict_hard_fail(
+                    evaluation,
+                    format!(
+                        "HARD_FAIL_STRICT_METRIC_THRESHOLD: strict_metric_degraded_not_allowed={} policy={} {}",
+                        metric_name,
+                        cpv_low_sample_policy_tag(config.cpv_low_sample_policy),
+                        detail
+                    ),
+                );
+                return;
+            }
+            CpvLowSamplePolicy::ReasonOnly => {
+                evaluation.annotations.push(format!(
+                    "cpv_low_sample_reason_only={} strict_metric_pass=false {}",
+                    metric_name, detail
+                ));
+                return;
+            }
+            CpvLowSamplePolicy::UseDegraded => {
+                if observed.is_none() {
+                    handle_strict_missing_metric(
+                        evaluation,
+                        config,
+                        metric_name,
+                        Some(format!(
+                            "policy=use_degraded degraded_value_missing=true {}",
+                            detail
+                        )),
+                    );
+                    return;
+                }
+                if !config.cpv_allow_degraded_in_strict_policy {
+                    set_strict_hard_fail(
+                        evaluation,
+                        format!(
+                            "HARD_FAIL_STRICT_METRIC_THRESHOLD: strict_metric_degraded_not_allowed={} policy=use_degraded cpv_allow_degraded_in_strict_policy=false {}",
+                            metric_name, detail
+                        ),
+                    );
+                    return;
+                }
+                evaluation.annotations.push(format!(
+                    "cpv_degraded_threshold_evaluated={} evidence_status=degraded_low_sample {}",
+                    metric_name, detail
+                ));
+            }
+        }
+    }
+
+    let Some(observed) = observed else {
+        handle_strict_missing_metric(evaluation, config, metric_name, Some(detail));
+        return;
+    };
+
+    check_strict_max_f64(
+        evaluation,
+        metric_name,
+        observed,
+        config.max_signer_cross_pool_velocity,
+        Some(detail),
+    );
+}
+
+fn is_temporal_carried_context(context: &TemporalMetricEvidenceContext) -> bool {
+    matches!(
+        context.quality,
+        MetricEvidenceQuality::CarriedForward | MetricEvidenceQuality::Stale
+    ) || matches!(
+        context.source,
+        TemporalMetricSource::CarriedForwardNoEvent
+            | TemporalMetricSource::PartialCarriedForward
+            | TemporalMetricSource::Stale
+    )
+}
+
+fn temporal_policy_metric_allowed(metric_name: &str, config: &GatekeeperV2Config) -> bool {
+    if !config.temporal_carry_forward_enabled {
+        return false;
+    }
+
+    let is_event_counter = metric_name.contains("buy_count")
+        || metric_name.contains("unique_signers")
+        || metric_name.contains("tx_count")
+        || metric_name.contains("net_quote_sol")
+        || metric_name.contains("total_volume_sol");
+    let is_state_metric = metric_name.contains("mcap")
+        || metric_name.contains("market_cap")
+        || metric_name.contains("price_pct");
+    let is_ratio_metric = metric_name.contains("burstratio")
+        || metric_name.contains("burst_ratio")
+        || metric_name.contains("jito_tip_intensity")
+        || metric_name.contains("flipper_presence_ratio")
+        || metric_name.contains("signer_cross_pool_velocity")
+        || metric_name.contains("cpv");
+
+    (is_event_counter && config.temporal_carry_forward_event_counters_enabled)
+        || (is_state_metric && config.temporal_carry_forward_state_metrics_enabled)
+        || (is_ratio_metric && config.temporal_carry_forward_ratio_metrics_enabled)
+}
+
+fn add_temporal_policy_annotations(
+    evaluation: &mut StrictMetricPolicyEvaluation,
+    assessment: &GatekeeperAssessment,
+    config: &GatekeeperV2Config,
+) {
+    let carried: Vec<_> = assessment
+        .feature_snapshot
+        .temporal_deltas
+        .delta_evidence
+        .iter()
+        .filter(|(_metric_name, context)| is_temporal_carried_context(context))
+        .take(8)
+        .collect();
+
+    if carried.is_empty() {
+        return;
+    }
+
+    for (metric_name, context) in carried {
+        let staleness_ok = context
+            .staleness_ms
+            .map(|staleness| staleness <= config.temporal_carry_forward_max_staleness_ms)
+            .unwrap_or(false);
+        let detail = format!(
+            "{} source={} status={} staleness_ms={} carried_from_anchor_ms={}",
+            metric_name,
+            temporal_source_tag(context.source),
+            metric_quality_tag(context.quality),
+            context.staleness_ms.unwrap_or_default(),
+            context.carried_from_anchor_ms.unwrap_or_default()
+        );
+
+        match config.temporal_carried_forward_policy {
+            TemporalCarriedForwardPolicy::LogOnly => evaluation
+                .annotations
+                .push(format!("temporal_carried_forward_log_only={detail}")),
+            TemporalCarriedForwardPolicy::UseForSelectorOnly => evaluation
+                .annotations
+                .push(format!("temporal_carried_forward_selector_only={detail}")),
+            TemporalCarriedForwardPolicy::UseInPolicy => {
+                if temporal_policy_metric_allowed(metric_name, config) && staleness_ok {
+                    evaluation
+                        .annotations
+                        .push(format!("temporal_carried_forward_policy_allowed={detail}"));
+                } else {
+                    evaluation.annotations.push(format!(
+                        "temporal_carried_forward_not_allowed={detail} policy={} max_staleness_ms={}",
+                        temporal_carried_forward_policy_tag(config.temporal_carried_forward_policy),
+                        config.temporal_carry_forward_max_staleness_ms
+                    ));
+                }
+            }
+        }
+    }
+}
+
+fn strict_metric_policy_evaluation(
+    assessment: &GatekeeperAssessment,
+    config: &GatekeeperV2Config,
+) -> StrictMetricPolicyEvaluation {
+    let mut evaluation = StrictMetricPolicyEvaluation::default();
+
+    if config.strict_metric_threshold_gate_enabled {
+        check_strict_min_count(
+            &mut evaluation,
+            "total_tx_evaluated",
+            assessment.total_tx_evaluated,
+            config.min_tx_count,
+        );
+        check_strict_min_count(
+            &mut evaluation,
+            "unique_signers_evaluated",
+            assessment.unique_signers_evaluated,
+            config.min_unique_signers,
+        );
+        check_strict_min_count(
+            &mut evaluation,
+            "buy_count",
+            assessment.buy_count,
+            config.min_buy_count,
+        );
+
+        let burst_ratio = finite_scalar(assessment.feature_snapshot.tx_intel_features.burst_ratio)
+            .or_else(|| {
+                assessment
+                    .phase2_velocity
+                    .as_ref()
+                    .and_then(|v| finite_scalar(v.burst_ratio))
+            });
+        check_strict_required_range(
+            &mut evaluation,
+            config,
+            "burst_ratio",
+            burst_ratio,
+            Some(config.min_burst_ratio),
+            Some(config.max_burst_ratio),
+        );
+
+        let alpha = &assessment.feature_snapshot.alpha_fingerprint;
+        check_strict_required_range(
+            &mut evaluation,
+            config,
+            "flipper_presence_ratio",
+            finite_option(alpha.flipper_presence_ratio),
+            Some(config.min_flipper_presence_ratio),
+            None,
+        );
+        check_strict_required_range(
+            &mut evaluation,
+            config,
+            "jito_tip_intensity",
+            finite_option(alpha.jito_tip_intensity),
+            Some(config.min_jito_tip_intensity),
+            Some(config.max_jito_tip_intensity),
+        );
+        check_strict_cpv_metric(&mut evaluation, assessment, config);
+    }
+
+    add_temporal_policy_annotations(&mut evaluation, assessment, config);
+
+    evaluation
+}
+
+pub(crate) fn strict_metric_threshold_failure_reason_from_assessment(
+    assessment: &GatekeeperAssessment,
+    config: &GatekeeperV2Config,
+) -> Option<String> {
+    strict_metric_policy_evaluation(assessment, config).hard_fail_reason
+}
+
+fn append_evidence_policy_annotations_to_reason(
+    mut reason_chain: String,
+    annotations: &[String],
+) -> String {
+    if annotations.is_empty() {
+        return reason_chain;
+    }
+
+    reason_chain.push_str(" evidence_policy=[");
+    reason_chain.push_str(&annotations.join(";"));
+    reason_chain.push(']');
+    reason_chain
+}
+
+pub(crate) fn append_evidence_policy_annotations(
+    reason_chain: String,
+    assessment: &GatekeeperAssessment,
+    config: &GatekeeperV2Config,
+) -> String {
+    let evaluation = strict_metric_policy_evaluation(assessment, config);
+    append_evidence_policy_annotations_to_reason(reason_chain, &evaluation.annotations)
+}
+
+#[derive(Debug, Clone)]
+struct SelectorMetricInput {
+    value: Option<f64>,
+    eligible: bool,
+    status: &'static str,
+    reason: Option<String>,
+}
+
+impl SelectorMetricInput {
+    fn missing(reason: impl Into<String>) -> Self {
+        Self {
+            value: None,
+            eligible: false,
+            status: "missing",
+            reason: Some(reason.into()),
+        }
+    }
+
+    fn present(value: f64, status: &'static str, reason: Option<String>) -> Self {
+        Self {
+            value: Some(value),
+            eligible: true,
+            status,
+            reason,
+        }
+    }
+
+    fn blocked(value: f64, status: &'static str, reason: impl Into<String>) -> Self {
+        Self {
+            value: Some(value),
+            eligible: false,
+            status,
+            reason: Some(reason.into()),
+        }
+    }
+}
+
+fn selector_metric_from_option(
+    value: Option<f64>,
+    missing_reason: &'static str,
+) -> SelectorMetricInput {
+    match finite_option(value) {
+        Some(value) => SelectorMetricInput::present(value, "clean", None),
+        None => SelectorMetricInput::missing(missing_reason),
+    }
+}
+
+fn selector_cpv_metric_input(
+    value: Option<f64>,
+    metric_name: &'static str,
+    assessment: &GatekeeperAssessment,
+    selector: &SelectorSoftScoreConfig,
+) -> SelectorMetricInput {
+    let sybil = &assessment.feature_snapshot.sybil_resistance;
+    let evidence = &sybil.cpv_evidence;
+    let value = finite_option(value).or_else(|| match metric_name {
+        "signer_cross_pool_velocity" => finite_option(evidence.signer_cross_pool_velocity),
+        "cpv_other_pool_activity" => finite_option(evidence.cpv_other_pool_activity),
+        _ => None,
+    });
+    let Some(value) = value else {
+        return SelectorMetricInput::missing(format!("{metric_name}_missing"));
+    };
+
+    match evidence.quality {
+        MetricEvidenceQuality::Clean => SelectorMetricInput::present(value, "clean", None),
+        MetricEvidenceQuality::DegradedLowSample => {
+            let reason = evidence
+                .degraded_reasons
+                .first()
+                .cloned()
+                .unwrap_or_else(|| CPV_LOW_SAMPLE_DEGRADED_REASON.to_string());
+            if selector.allow_degraded_cpv {
+                SelectorMetricInput::present(value, "degraded_low_sample", Some(reason))
+            } else {
+                SelectorMetricInput::blocked(value, "degraded_low_sample_not_allowed", reason)
+            }
+        }
+        MetricEvidenceQuality::Unavailable
+        | MetricEvidenceQuality::UnavailableSource
+        | MetricEvidenceQuality::NotConfigured
+            if evidence.sample_count.is_none()
+                && evidence.degraded_reasons.is_empty()
+                && sybil.degraded_reasons.is_empty() =>
+        {
+            SelectorMetricInput::present(value, "clean_legacy_no_cpv_context", None)
+        }
+        other => SelectorMetricInput::blocked(
+            value,
+            metric_quality_tag(other),
+            format!(
+                "{metric_name}_evidence_quality={}",
+                metric_quality_tag(other)
+            ),
+        ),
+    }
+}
+
+fn selector_temporal_metric_input(
+    metric_name: &'static str,
+    value: Option<f64>,
+    assessment: &GatekeeperAssessment,
+    config: &GatekeeperV2Config,
+) -> SelectorMetricInput {
+    let Some(value) = finite_option(value) else {
+        return SelectorMetricInput::missing(format!("{metric_name}_missing"));
+    };
+    let Some(context) = assessment
+        .feature_snapshot
+        .temporal_deltas
+        .delta_evidence
+        .get(metric_name)
+    else {
+        return SelectorMetricInput::present(value, "clean_legacy_no_temporal_context", None);
+    };
+
+    let reason = context.reason.clone().or_else(|| {
+        Some(format!(
+            "quality={} source={}",
+            metric_quality_tag(context.quality),
+            temporal_source_tag(context.source)
+        ))
+    });
+
+    match context.quality {
+        MetricEvidenceQuality::Clean => SelectorMetricInput::present(value, "clean", reason),
+        MetricEvidenceQuality::CarriedForward => {
+            let staleness_ok = context
+                .staleness_ms
+                .map(|staleness| staleness <= config.temporal_carry_forward_max_staleness_ms)
+                .unwrap_or(true);
+            let source_allows_selector = matches!(
+                config.temporal_carried_forward_policy,
+                TemporalCarriedForwardPolicy::UseForSelectorOnly
+                    | TemporalCarriedForwardPolicy::UseInPolicy
+            );
+            if config.selector_soft_score.allow_carried_temporal_deltas
+                && source_allows_selector
+                && staleness_ok
+            {
+                SelectorMetricInput::present(value, "carried_forward", reason)
+            } else {
+                SelectorMetricInput::blocked(
+                    value,
+                    "carried_forward_not_allowed",
+                    reason.unwrap_or_else(|| format!("{metric_name}_carried_forward_not_allowed")),
+                )
+            }
+        }
+        MetricEvidenceQuality::DegradedLowSample => SelectorMetricInput::blocked(
+            value,
+            "degraded_low_sample_not_allowed",
+            reason.unwrap_or_else(|| format!("{metric_name}_degraded_low_sample")),
+        ),
+        other => SelectorMetricInput::blocked(
+            value,
+            metric_quality_tag(other),
+            reason.unwrap_or_else(|| {
+                format!(
+                    "{metric_name}_evidence_quality={}",
+                    metric_quality_tag(other)
+                )
+            }),
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_selector_rule(
+    diagnostics: &mut SelectorSoftScoreDiagnostics,
+    rule_name: &'static str,
+    metric_name: &'static str,
+    operator: &'static str,
+    threshold: f64,
+    weight: u8,
+    input: SelectorMetricInput,
+    predicate: impl FnOnce(f64) -> bool,
+) {
+    diagnostics.max_score = diagnostics.max_score.saturating_add(u16::from(weight));
+    if input.value.is_some() {
+        diagnostics.present_rules = diagnostics.present_rules.saturating_add(1);
+    } else {
+        diagnostics.missing_rules = diagnostics.missing_rules.saturating_add(1);
+    }
+
+    let passed = input
+        .value
+        .filter(|_| input.eligible && weight > 0)
+        .is_some_and(predicate);
+    let points = if passed { weight } else { 0 };
+    if passed {
+        diagnostics.passed_rules = diagnostics.passed_rules.saturating_add(1);
+        diagnostics.score = diagnostics.score.saturating_add(u16::from(points));
+    }
+
+    diagnostics.rules.push(SelectorSoftScoreRuleDiagnostic {
+        rule_name,
+        metric_name,
+        operator,
+        threshold,
+        weight,
+        value: input.value,
+        passed,
+        points,
+        status: input.status,
+        reason: input.reason,
+    });
+}
+
+pub(crate) fn compute_selector_soft_score(
+    assessment: &GatekeeperAssessment,
+    config: &GatekeeperV2Config,
+) -> SelectorSoftScoreDiagnostics {
+    let selector = &config.selector_soft_score;
+    let mut diagnostics = SelectorSoftScoreDiagnostics {
+        enabled: selector.enabled,
+        policy: selector_soft_score_policy_tag(selector.policy),
+        missing_metric_policy: selector_missing_policy_tag(selector.missing_metric_policy),
+        min_candidate_score: selector.min_candidate_score,
+        min_buy_score: selector.min_buy_score,
+        ..SelectorSoftScoreDiagnostics::default()
+    };
+
+    let features = &assessment.feature_snapshot;
+    let alpha = &features.alpha_fingerprint;
+    let sybil = &features.sybil_resistance;
+    let temporal = &features.temporal_deltas;
+
+    push_selector_rule(
+        &mut diagnostics,
+        "jito_tip_intensity_lt",
+        "jito_tip_intensity",
+        "lt",
+        selector.jito_tip_intensity_lt,
+        selector.soft_weight_jito_tip_intensity,
+        selector_metric_from_option(alpha.jito_tip_intensity, "jito_tip_intensity_missing"),
+        |value| value < selector.jito_tip_intensity_lt,
+    );
+    push_selector_rule(
+        &mut diagnostics,
+        "unique_ratio_gte",
+        "unique_ratio",
+        "gte",
+        selector.unique_ratio_gte,
+        selector.soft_weight_unique_ratio,
+        selector_metric_from_option(
+            assessment
+                .phase3_diversity
+                .as_ref()
+                .map(|diversity| diversity.unique_ratio),
+            "unique_ratio_missing",
+        ),
+        |value| value >= selector.unique_ratio_gte,
+    );
+    push_selector_rule(
+        &mut diagnostics,
+        "cpv_other_pool_activity_lt",
+        "cpv_other_pool_activity",
+        "lt",
+        selector.cpv_other_pool_activity_lt,
+        selector.soft_weight_cpv_other_pool_activity,
+        selector_cpv_metric_input(
+            sybil.cpv_other_pool_activity,
+            "cpv_other_pool_activity",
+            assessment,
+            selector,
+        ),
+        |value| value < selector.cpv_other_pool_activity_lt,
+    );
+    push_selector_rule(
+        &mut diagnostics,
+        "max_single_sell_impact_pct_observed_lt",
+        "max_single_sell_impact_pct_observed",
+        "lt",
+        selector.max_single_sell_impact_pct_observed_lt,
+        selector.soft_weight_max_single_sell_impact_pct_observed,
+        selector_metric_from_option(
+            assessment.phase6_curve.as_ref().and_then(|curve| {
+                (curve.price_data_points >= 2).then_some(curve.max_single_sell_impact_pct)
+            }),
+            "max_single_sell_impact_pct_observed_missing",
+        ),
+        |value| value < selector.max_single_sell_impact_pct_observed_lt,
+    );
+    push_selector_rule(
+        &mut diagnostics,
+        "signer_cross_pool_velocity_lt",
+        "signer_cross_pool_velocity",
+        "lt",
+        selector.signer_cross_pool_velocity_lt,
+        selector.soft_weight_signer_cross_pool_velocity,
+        selector_cpv_metric_input(
+            sybil.signer_cross_pool_velocity,
+            "signer_cross_pool_velocity",
+            assessment,
+            selector,
+        ),
+        |value| value < selector.signer_cross_pool_velocity_lt,
+    );
+    push_selector_rule(
+        &mut diagnostics,
+        "hhi_lt",
+        "hhi",
+        "lt",
+        selector.hhi_lt,
+        selector.soft_weight_hhi,
+        selector_metric_from_option(
+            assessment
+                .phase3_diversity
+                .as_ref()
+                .map(|diversity| diversity.hhi),
+            "hhi_missing",
+        ),
+        |value| value < selector.hhi_lt,
+    );
+    push_selector_rule(
+        &mut diagnostics,
+        "avg_cpi_depth_50tx_lt",
+        "avg_cpi_depth_50tx",
+        "lt",
+        selector.avg_cpi_depth_50tx_lt,
+        selector.soft_weight_avg_cpi_depth_50tx,
+        selector_metric_from_option(alpha.avg_cpi_depth_50tx, "avg_cpi_depth_50tx_missing"),
+        |value| value < selector.avg_cpi_depth_50tx_lt,
+    );
+    push_selector_rule(
+        &mut diagnostics,
+        "top3_volume_pct_lt",
+        "top3_volume_pct",
+        "lt",
+        selector.top3_volume_pct_lt,
+        selector.soft_weight_top3_volume_pct,
+        selector_metric_from_option(
+            assessment
+                .phase3_diversity
+                .as_ref()
+                .map(|diversity| diversity.top3_volume_pct),
+            "top3_volume_pct_missing",
+        ),
+        |value| value < selector.top3_volume_pct_lt,
+    );
+    push_selector_rule(
+        &mut diagnostics,
+        "delta_jito_tip_intensity_1s_to_2s_lt",
+        "delta_jito_tip_intensity_1s_to_2s",
+        "lt",
+        selector.delta_jito_tip_intensity_1s_to_2s_lt,
+        selector.soft_weight_delta_jito_tip_intensity_1s_to_2s,
+        selector_temporal_metric_input(
+            "delta_jito_tip_intensity_1s_to_2s",
+            temporal.delta_jito_tip_intensity_1s_to_2s,
+            assessment,
+            config,
+        ),
+        |value| value < selector.delta_jito_tip_intensity_1s_to_2s_lt,
+    );
+    push_selector_rule(
+        &mut diagnostics,
+        "same_ms_tx_ratio_gte",
+        "same_ms_tx_ratio",
+        "gte",
+        selector.same_ms_tx_ratio_gte,
+        selector.soft_weight_same_ms_tx_ratio,
+        selector_metric_from_option(
+            assessment
+                .phase3_diversity
+                .as_ref()
+                .map(|diversity| diversity.same_ms_tx_ratio),
+            "same_ms_tx_ratio_missing",
+        ),
+        |value| value >= selector.same_ms_tx_ratio_gte,
+    );
+    push_selector_rule(
+        &mut diagnostics,
+        "interval_cv_gte",
+        "interval_cv",
+        "gte",
+        selector.interval_cv_gte,
+        selector.soft_weight_interval_cv,
+        selector_metric_from_option(
+            assessment
+                .phase2_velocity
+                .as_ref()
+                .map(|velocity| velocity.interval_cv),
+            "interval_cv_missing",
+        ),
+        |value| value >= selector.interval_cv_gte,
+    );
+    push_selector_rule(
+        &mut diagnostics,
+        "delta_jito_tip_intensity_1s_to_3s_lt",
+        "delta_jito_tip_intensity_1s_to_3s",
+        "lt",
+        selector.delta_jito_tip_intensity_1s_to_3s_lt,
+        selector.soft_weight_delta_jito_tip_intensity_1s_to_3s,
+        selector_temporal_metric_input(
+            "delta_jito_tip_intensity_1s_to_3s",
+            temporal.delta_jito_tip_intensity_1s_to_3s,
+            assessment,
+            config,
+        ),
+        |value| value < selector.delta_jito_tip_intensity_1s_to_3s_lt,
+    );
+
+    diagnostics.candidate_passed = diagnostics.score >= diagnostics.min_candidate_score;
+    diagnostics.buy_passed = diagnostics.score >= diagnostics.min_buy_score;
+    diagnostics
 }
 
 fn compute_momentum(features: &MaterializedFeatureSet) -> f64 {
@@ -484,7 +1481,8 @@ pub fn build_assessment_from_features(
             if curve.price_data_points < 2 {
                 true
             } else {
-                curve.price_change_ratio <= config.max_price_change_ratio
+                curve.price_change_ratio >= config.min_price_change_ratio
+                    && curve.price_change_ratio <= config.max_price_change_ratio
                     && curve.max_single_tx_price_impact_pct <= config.max_single_tx_price_impact_pct
                     && curve.max_single_sell_impact_pct <= config.max_single_sell_impact_pct
                     && if curve.curve_data_known {
@@ -1261,6 +2259,11 @@ fn evaluate_hard_filters_from_assessment(
         }
     }
 
+    if let Some(reason) = strict_metric_threshold_failure_reason_from_assessment(assessment, config)
+    {
+        return Some((HardFailReason::StrictMetricThreshold, reason));
+    }
+
     None
 }
 
@@ -1281,6 +2284,7 @@ pub fn evaluate_policy_from_assessment(
     config: &GatekeeperV2Config,
 ) -> GatekeeperDecision {
     let diagnostics = build_policy_diagnostics(assessment, config);
+    let selector_soft_score = compute_selector_soft_score(assessment, config);
     let total_soft_points = diagnostics.soft_points as u16 + diagnostics.sybil_policy.soft_points;
 
     if let Some((reason, reason_chain)) = evaluate_hard_filters_from_assessment(assessment, config)
@@ -1296,6 +2300,7 @@ pub fn evaluate_policy_from_assessment(
             effective_max_soft_points: diagnostics.effective_max_soft_points,
             dev_unknown: diagnostics.dev_unknown,
             sybil_policy: diagnostics.sybil_policy.clone(),
+            selector_soft_score: selector_soft_score.clone(),
             alpha_gate: AlphaGateDiagnostics::not_run(config.enable_alpha_gate),
             prosperity_filter: ProsperityFilterDiagnostics::not_run(
                 config.enable_prosperity_filter,
@@ -1328,6 +2333,18 @@ pub fn evaluate_policy_from_assessment(
                     // Not promoted — skip PDD in live path, continue to Core check
                     // (shadow still records the veto via try_shadow_evaluate)
                 } else {
+                    let reason_chain = append_evidence_policy_annotations(
+                        format!(
+                            "PDD_HARD_FAIL: {} drift={:?} spike={} ramping={} whale={:?}",
+                            fail.as_str(),
+                            pdd.entry_drift_pct,
+                            pdd.spike_detected,
+                            pdd.ramping_detected,
+                            pdd.whale_top3_pct,
+                        ),
+                        assessment,
+                        config,
+                    );
                     return GatekeeperDecision {
                         hard_fail_reason: Some(format!("PDD_{}", fail.as_str())),
                         core1_passed: diagnostics.core1_passed,
@@ -1339,6 +2356,7 @@ pub fn evaluate_policy_from_assessment(
                         effective_max_soft_points: diagnostics.effective_max_soft_points,
                         dev_unknown: diagnostics.dev_unknown,
                         sybil_policy: diagnostics.sybil_policy.clone(),
+                        selector_soft_score: selector_soft_score.clone(),
                         alpha_gate: AlphaGateDiagnostics::not_run(config.enable_alpha_gate),
                         prosperity_filter: ProsperityFilterDiagnostics::not_run(
                             config.enable_prosperity_filter,
@@ -1352,14 +2370,7 @@ pub fn evaluate_policy_from_assessment(
                             _ => GatekeeperVerdictType::RejectPumpAndDump,
                         },
                         verdict_buy: false,
-                        reason_chain: format!(
-                            "PDD_HARD_FAIL: {} drift={:?} spike={} ramping={} whale={:?}",
-                            fail.as_str(),
-                            pdd.entry_drift_pct,
-                            pdd.spike_detected,
-                            pdd.ramping_detected,
-                            pdd.whale_top3_pct,
-                        ),
+                        reason_chain,
                         reason_code: Some(pdd_reason_code(fail)),
                         gatekeeper_strength: None,
                     };
@@ -1420,6 +2431,16 @@ pub fn evaluate_policy_from_assessment(
                 diagnostics.effective_max_soft_points,
                 diagnostics.soft_signals.format_flags()
             ),
+            AlphaGateDiagnostics::not_run(config.enable_alpha_gate),
+            ProsperityFilterDiagnostics::not_run(config.enable_prosperity_filter),
+        )
+    } else if let Some((verdict_type, _reason_code, reason_chain)) =
+        selector_soft_score_terminal_reject(&selector_soft_score, config)
+    {
+        (
+            verdict_type,
+            false,
+            reason_chain,
             AlphaGateDiagnostics::not_run(config.enable_alpha_gate),
             ProsperityFilterDiagnostics::not_run(config.enable_prosperity_filter),
         )
@@ -1499,6 +2520,8 @@ pub fn evaluate_policy_from_assessment(
         }
     };
 
+    let reason_chain = append_evidence_policy_annotations(reason_chain, assessment, config);
+
     // ═══════════════════════════════════════════
     // V2.5 TAS: Trajectory Aware Scoring — soft modulator in policy path
     // ═══════════════════════════════════════════
@@ -1554,6 +2577,12 @@ pub fn evaluate_policy_from_assessment(
             GatekeeperVerdictType::RejectSoftExcess => GatekeeperReasonCode::RejectLegacySoftExcess,
             GatekeeperVerdictType::RejectLowAlpha => GatekeeperReasonCode::RejectLowAlpha,
             GatekeeperVerdictType::RejectLowProsperity => GatekeeperReasonCode::RejectLowProsperity,
+            GatekeeperVerdictType::RejectSelectorNotCandidate => {
+                GatekeeperReasonCode::RejectSelectorNotCandidate
+            }
+            GatekeeperVerdictType::RejectSelectorBelowBuy => {
+                GatekeeperReasonCode::RejectSelectorBelowBuy
+            }
             GatekeeperVerdictType::RejectEntryDrift => GatekeeperReasonCode::RejectPddEntryDrift,
             GatekeeperVerdictType::RejectFlashCrash => GatekeeperReasonCode::RejectPddFlashCrash,
             GatekeeperVerdictType::RejectRamping => GatekeeperReasonCode::RejectPddRamping,
@@ -1572,6 +2601,7 @@ pub fn evaluate_policy_from_assessment(
         effective_max_soft_points: diagnostics.effective_max_soft_points,
         dev_unknown: diagnostics.dev_unknown,
         sybil_policy: diagnostics.sybil_policy,
+        selector_soft_score,
         alpha_gate,
         prosperity_filter,
         total_soft_points,
@@ -1588,9 +2618,34 @@ pub fn build_timeout_decision_from_assessment(
     config: &GatekeeperV2Config,
 ) -> GatekeeperDecision {
     let diagnostics = build_policy_diagnostics(assessment, config);
+    let selector_soft_score = compute_selector_soft_score(assessment, config);
     let total_soft_points = diagnostics.soft_points as u16 + diagnostics.sybil_policy.soft_points;
-    let hard_fail_reason = evaluate_hard_filters_from_assessment(assessment, config)
-        .map(|(_reason, reason_chain)| reason_chain);
+    if let Some((reason, reason_chain)) = evaluate_hard_filters_from_assessment(assessment, config)
+    {
+        return GatekeeperDecision {
+            hard_fail_reason: Some(reason_chain.clone()),
+            core1_passed: diagnostics.core1_passed,
+            core2_passed: diagnostics.core2_passed,
+            core3_passed: diagnostics.core3_passed,
+            soft_signals: diagnostics.soft_signals,
+            soft_points: diagnostics.soft_points,
+            max_soft_points_possible: diagnostics.max_soft_points_possible,
+            effective_max_soft_points: diagnostics.effective_max_soft_points,
+            dev_unknown: diagnostics.dev_unknown,
+            sybil_policy: diagnostics.sybil_policy,
+            selector_soft_score: selector_soft_score.clone(),
+            alpha_gate: AlphaGateDiagnostics::not_run(config.enable_alpha_gate),
+            prosperity_filter: ProsperityFilterDiagnostics::not_run(
+                config.enable_prosperity_filter,
+            ),
+            total_soft_points,
+            verdict_type: GatekeeperVerdictType::RejectHardFail,
+            verdict_buy: false,
+            reason_chain,
+            reason_code: Some(hard_fail_reason_code(reason)),
+            gatekeeper_strength: None,
+        };
+    }
     let (verdict_type, reason_chain) = if assessment.total_tx_evaluated == 0 {
         (
             GatekeeperVerdictType::TimeoutNoData,
@@ -1651,7 +2706,7 @@ pub fn build_timeout_decision_from_assessment(
     };
 
     GatekeeperDecision {
-        hard_fail_reason,
+        hard_fail_reason: None,
         core1_passed,
         core2_passed,
         core3_passed,
@@ -1661,12 +2716,13 @@ pub fn build_timeout_decision_from_assessment(
         effective_max_soft_points: diagnostics.effective_max_soft_points,
         dev_unknown: diagnostics.dev_unknown,
         sybil_policy: diagnostics.sybil_policy,
+        selector_soft_score,
         alpha_gate: AlphaGateDiagnostics::not_run(config.enable_alpha_gate),
         prosperity_filter: ProsperityFilterDiagnostics::not_run(config.enable_prosperity_filter),
         total_soft_points,
         verdict_type,
         verdict_buy: false,
-        reason_chain,
+        reason_chain: append_evidence_policy_annotations(reason_chain, assessment, config),
         reason_code: Some(timeout_reason_code_for_assessment(assessment)),
         gatekeeper_strength: None,
     }
@@ -1936,6 +2992,7 @@ fn sybil_metric_is_actionable(sybil: &SybilResistanceFeatures, metric: SybilMetr
                 &sybil.degraded_reasons,
                 CPV_ROLLING_STATE_UNAVAILABLE_REASON,
             ) || has_degraded_reason(&sybil.degraded_reasons, CPV_INSUFFICIENT_SIGNERS_REASON)
+                || has_degraded_reason(&sybil.degraded_reasons, CPV_LOW_SAMPLE_DEGRADED_REASON)
         }
         SybilMetric::Fsc => {
             has_degraded_reason(
@@ -2370,7 +3427,8 @@ fn compute_core3_pass(
             return false;
         }
 
-        let price_ok = curve.price_change_ratio <= config.max_price_change_ratio
+        let price_ok = curve.price_change_ratio >= config.min_price_change_ratio
+            && curve.price_change_ratio <= config.max_price_change_ratio
             && curve.max_single_tx_price_impact_pct
                 <= config.dev_unknown_max_single_tx_price_impact_pct
             && curve.max_single_sell_impact_pct <= config.max_single_sell_impact_pct
@@ -2455,7 +3513,9 @@ fn build_policy_diagnostics(
 mod tests {
     use super::*;
     use ghost_core::checkpoint::{
-        AlphaFingerprintFeatures, TrajectorySegmentSnapshot, TxSegmentSequence,
+        AlphaFingerprintFeatures, CpvEvidenceContext, MetricEvidenceQuality,
+        TemporalMetricEvidenceContext, TemporalMetricSource, TrajectorySegmentSnapshot,
+        TxSegmentSequence,
     };
     use ghost_core::tx_intelligence::types::{
         SFD_PARTIAL_BALANCE_COVERAGE_REASON, SFD_ZERO_PREBALANCE_SKIPPED_REASON,
@@ -2533,6 +3593,7 @@ mod tests {
         feature_snapshot.tx_intel_features.burst_ratio = 0.32;
         feature_snapshot.alpha_fingerprint = AlphaFingerprintFeatures {
             avg_inner_ix_count_50tx: None,
+            avg_cpi_depth_50tx: None,
             sell_buy_ratio: None,
             compute_unit_cluster_dominance: None,
             static_fee_profile_ratio: None,
@@ -2630,6 +3691,679 @@ mod tests {
             adaptive_thresholds_applied: false,
             v25_confidence: None,
         }
+    }
+
+    fn strict_policy_config() -> GatekeeperV2Config {
+        let mut config = alpha_config();
+        config.enable_alpha_gate = false;
+        config.enable_prosperity_filter = false;
+        config.strict_metric_threshold_gate_enabled = true;
+        config.strict_metric_missing_policy = StrictMetricMissingPolicy::HardFail;
+        config.cpv_low_sample_policy = CpvLowSamplePolicy::HardFail;
+        config.cpv_allow_degraded_in_strict_policy = false;
+        config.min_tx_count = 5;
+        config.min_unique_signers = 2;
+        config.min_buy_count = 2;
+        config.min_burst_ratio = 0.27;
+        config.max_burst_ratio = 9999.0;
+        config.min_flipper_presence_ratio = 0.19;
+        config.min_jito_tip_intensity = 0.0;
+        config.max_jito_tip_intensity = 9999.0;
+        config.max_signer_cross_pool_velocity = 0.9737;
+        config.temporal_carry_forward_enabled = true;
+        config.temporal_carry_forward_event_counters_enabled = true;
+        config.temporal_carry_forward_state_metrics_enabled = false;
+        config.temporal_carry_forward_ratio_metrics_enabled = false;
+        config.temporal_carry_forward_max_staleness_ms = 1_500;
+        config
+    }
+
+    fn strict_ready_assessment() -> GatekeeperAssessment {
+        let mut assessment = alpha_ready_assessment();
+        assessment
+            .feature_snapshot
+            .alpha_fingerprint
+            .flipper_presence_ratio = Some(0.21);
+        assessment
+            .feature_snapshot
+            .alpha_fingerprint
+            .jito_tip_intensity = Some(0.10);
+        assessment.feature_snapshot.tx_intel_features.burst_ratio = 0.32;
+        assessment.feature_snapshot.sybil_resistance = SybilResistanceFeatures {
+            signer_cross_pool_velocity: Some(0.12),
+            cpv_other_pool_activity: Some(0.50),
+            cpv_evidence: CpvEvidenceContext {
+                quality: MetricEvidenceQuality::Clean,
+                signer_cross_pool_velocity: Some(0.12),
+                cpv_other_pool_activity: Some(0.50),
+                sample_count: Some(3),
+                required_clean_sample_count: Some(3),
+                required_degraded_sample_count: Some(2),
+                rolling_state_available: Some(true),
+                ..CpvEvidenceContext::default()
+            },
+            signer_sample_count: 3,
+            buy_sample_count: 3,
+            ..SybilResistanceFeatures::default()
+        };
+        assessment
+    }
+
+    fn mark_cpv_low_sample(assessment: &mut GatekeeperAssessment, value: Option<f64>) {
+        assessment
+            .feature_snapshot
+            .sybil_resistance
+            .signer_cross_pool_velocity = value;
+        assessment.feature_snapshot.sybil_resistance.cpv_evidence = CpvEvidenceContext {
+            quality: MetricEvidenceQuality::DegradedLowSample,
+            signer_cross_pool_velocity: value,
+            cpv_other_pool_activity: Some(0.40),
+            sample_count: Some(2),
+            required_clean_sample_count: Some(3),
+            required_degraded_sample_count: Some(2),
+            rolling_state_available: Some(true),
+            degraded_reasons: vec![CPV_LOW_SAMPLE_DEGRADED_REASON.to_string()],
+            ..CpvEvidenceContext::default()
+        };
+        assessment
+            .feature_snapshot
+            .sybil_resistance
+            .degraded_reasons
+            .push(CPV_LOW_SAMPLE_DEGRADED_REASON.to_string());
+        assessment
+            .feature_snapshot
+            .sybil_resistance
+            .signer_sample_count = 2;
+    }
+
+    fn add_carried_delta(assessment: &mut GatekeeperAssessment, metric_name: &str) {
+        assessment
+            .feature_snapshot
+            .temporal_deltas
+            .delta_evidence
+            .insert(
+                metric_name.to_string(),
+                TemporalMetricEvidenceContext {
+                    quality: MetricEvidenceQuality::CarriedForward,
+                    source: TemporalMetricSource::CarriedForwardNoEvent,
+                    carried_from_anchor_ms: Some(2_000),
+                    staleness_ms: Some(1_000),
+                    reason: Some("no_event_between_anchors".to_string()),
+                },
+            );
+    }
+
+    fn add_clean_delta(assessment: &mut GatekeeperAssessment, metric_name: &str) {
+        assessment
+            .feature_snapshot
+            .temporal_deltas
+            .delta_evidence
+            .insert(
+                metric_name.to_string(),
+                TemporalMetricEvidenceContext {
+                    quality: MetricEvidenceQuality::Clean,
+                    source: TemporalMetricSource::Observed,
+                    carried_from_anchor_ms: None,
+                    staleness_ms: None,
+                    reason: Some("observed".to_string()),
+                },
+            );
+    }
+
+    fn selector_policy_config(policy: SelectorSoftScorePolicy) -> GatekeeperV2Config {
+        let mut config = alpha_config();
+        config.enable_alpha_gate = false;
+        config.enable_prosperity_filter = false;
+        config.strict_metric_threshold_gate_enabled = false;
+        config.enable_sybil_interference_layer = false;
+        config.enable_sybil_combo_veto = false;
+        config.max_soft_points = 255;
+        config.dev_unknown_max_soft_points = 255;
+        config.max_sybil_soft_points = 255;
+        config.dev_unknown_max_sybil_soft_points = 255;
+        config.max_avg_interval_ms = 999_999.0;
+        config.max_price_change_ratio = 999_999.0;
+        config.max_single_tx_price_impact_pct = 999_999.0;
+        config.max_single_sell_impact_pct = 999_999.0;
+        config.min_market_cap_sol = 0.0;
+        config.hard_fail_hhi = 999_999.0;
+        config.hard_fail_same_ms_tx_ratio = 999_999.0;
+        config.hard_fail_top3_volume_pct = 999_999.0;
+        config.reject_on_dev_sell = false;
+        config.selector_soft_score.enabled = true;
+        config.selector_soft_score.policy = policy;
+        config.selector_soft_score.min_candidate_score = 2;
+        config.selector_soft_score.min_buy_score = 3;
+        config.selector_soft_score.allow_degraded_cpv = false;
+        config.selector_soft_score.allow_carried_temporal_deltas = false;
+        config
+    }
+
+    fn selector_controlled_assessment() -> GatekeeperAssessment {
+        let mut assessment = alpha_ready_assessment();
+        assessment
+            .feature_snapshot
+            .alpha_fingerprint
+            .jito_tip_intensity = Some(0.50);
+        assessment
+            .feature_snapshot
+            .alpha_fingerprint
+            .avg_cpi_depth_50tx = Some(9.0);
+        if let Some(diversity) = assessment.phase3_diversity.as_mut() {
+            diversity.unique_ratio = 0.10;
+            diversity.hhi = 0.50;
+            diversity.top3_volume_pct = 0.90;
+            diversity.same_ms_tx_ratio = 0.01;
+        }
+        if let Some(velocity) = assessment.phase2_velocity.as_mut() {
+            velocity.interval_cv = 0.10;
+        }
+        if let Some(curve) = assessment.phase6_curve.as_mut() {
+            curve.max_single_sell_impact_pct = 40.0;
+        }
+        assessment.feature_snapshot.sybil_resistance = SybilResistanceFeatures {
+            signer_cross_pool_velocity: Some(9.0),
+            cpv_other_pool_activity: Some(9.0),
+            cpv_evidence: CpvEvidenceContext {
+                quality: MetricEvidenceQuality::Clean,
+                signer_cross_pool_velocity: Some(9.0),
+                cpv_other_pool_activity: Some(9.0),
+                sample_count: Some(3),
+                required_clean_sample_count: Some(3),
+                required_degraded_sample_count: Some(2),
+                rolling_state_available: Some(true),
+                ..CpvEvidenceContext::default()
+            },
+            signer_sample_count: 3,
+            buy_sample_count: 3,
+            ..SybilResistanceFeatures::default()
+        };
+        assessment
+            .feature_snapshot
+            .temporal_deltas
+            .delta_jito_tip_intensity_1s_to_2s = Some(0.20);
+        add_clean_delta(&mut assessment, "delta_jito_tip_intensity_1s_to_2s");
+        assessment
+            .feature_snapshot
+            .temporal_deltas
+            .delta_jito_tip_intensity_1s_to_3s = Some(0.20);
+        add_clean_delta(&mut assessment, "delta_jito_tip_intensity_1s_to_3s");
+        assessment
+    }
+
+    fn selector_rule<'a>(
+        diagnostics: &'a SelectorSoftScoreDiagnostics,
+        rule_name: &str,
+    ) -> &'a SelectorSoftScoreRuleDiagnostic {
+        diagnostics
+            .rules
+            .iter()
+            .find(|rule| rule.rule_name == rule_name)
+            .unwrap_or_else(|| panic!("missing selector rule {rule_name}"))
+    }
+
+    #[test]
+    fn selector_soft_score_buy_gate_buys_at_three_of_twelve() {
+        let config = selector_policy_config(SelectorSoftScorePolicy::BuyGate);
+        let mut assessment = selector_controlled_assessment();
+        assessment
+            .feature_snapshot
+            .alpha_fingerprint
+            .jito_tip_intensity = Some(0.10);
+        if let Some(diversity) = assessment.phase3_diversity.as_mut() {
+            diversity.unique_ratio = 0.30;
+            diversity.hhi = 0.20;
+        }
+
+        let decision = evaluate_policy_from_assessment(&assessment, &config);
+
+        assert_eq!(decision.verdict_type, GatekeeperVerdictType::Buy);
+        assert_eq!(decision.selector_soft_score.score, 3);
+        assert_eq!(decision.selector_soft_score.max_score, 12);
+        assert!(decision.selector_soft_score.candidate_passed);
+        assert!(decision.selector_soft_score.buy_passed);
+    }
+
+    #[test]
+    fn selector_soft_score_buy_gate_rejects_candidate_below_buy() {
+        let config = selector_policy_config(SelectorSoftScorePolicy::BuyGate);
+        let mut assessment = selector_controlled_assessment();
+        assessment
+            .feature_snapshot
+            .alpha_fingerprint
+            .jito_tip_intensity = Some(0.10);
+        if let Some(diversity) = assessment.phase3_diversity.as_mut() {
+            diversity.unique_ratio = 0.30;
+        }
+
+        let decision = evaluate_policy_from_assessment(&assessment, &config);
+
+        assert_eq!(
+            decision.verdict_type,
+            GatekeeperVerdictType::RejectSelectorBelowBuy
+        );
+        assert_eq!(
+            decision.reason_code,
+            Some(GatekeeperReasonCode::RejectSelectorBelowBuy)
+        );
+        assert_eq!(decision.selector_soft_score.score, 2);
+        assert!(decision.selector_soft_score.candidate_passed);
+        assert!(!decision.selector_soft_score.buy_passed);
+    }
+
+    #[test]
+    fn selector_soft_score_buy_gate_rejects_not_candidate_below_two() {
+        let config = selector_policy_config(SelectorSoftScorePolicy::BuyGate);
+        let mut assessment = selector_controlled_assessment();
+        assessment
+            .feature_snapshot
+            .alpha_fingerprint
+            .jito_tip_intensity = Some(0.10);
+
+        let decision = evaluate_policy_from_assessment(&assessment, &config);
+
+        assert_eq!(
+            decision.verdict_type,
+            GatekeeperVerdictType::RejectSelectorNotCandidate
+        );
+        assert_eq!(
+            decision.reason_code,
+            Some(GatekeeperReasonCode::RejectSelectorNotCandidate)
+        );
+        assert_eq!(decision.selector_soft_score.score, 1);
+        assert!(!decision.selector_soft_score.candidate_passed);
+        assert!(!decision.selector_soft_score.buy_passed);
+    }
+
+    #[test]
+    fn selector_soft_score_missing_values_are_no_point_not_zero() {
+        let config = selector_policy_config(SelectorSoftScorePolicy::BuyGate);
+        let mut assessment = selector_controlled_assessment();
+        assessment
+            .feature_snapshot
+            .alpha_fingerprint
+            .jito_tip_intensity = None;
+        if let Some(diversity) = assessment.phase3_diversity.as_mut() {
+            diversity.unique_ratio = 0.30;
+            diversity.hhi = 0.20;
+        }
+
+        let decision = evaluate_policy_from_assessment(&assessment, &config);
+        let jito_rule = selector_rule(&decision.selector_soft_score, "jito_tip_intensity_lt");
+
+        assert_eq!(decision.selector_soft_score.score, 2);
+        assert_eq!(decision.selector_soft_score.missing_rules, 1);
+        assert_eq!(jito_rule.value, None);
+        assert_eq!(jito_rule.status, "missing");
+        assert!(!jito_rule.passed);
+        assert_eq!(jito_rule.points, 0);
+    }
+
+    #[test]
+    fn selector_soft_score_degraded_cpv_requires_allow_flag() {
+        let mut config = selector_policy_config(SelectorSoftScorePolicy::BuyGate);
+        let mut assessment = selector_controlled_assessment();
+        assessment
+            .feature_snapshot
+            .alpha_fingerprint
+            .jito_tip_intensity = Some(0.10);
+        if let Some(diversity) = assessment.phase3_diversity.as_mut() {
+            diversity.unique_ratio = 0.30;
+        }
+        mark_cpv_low_sample(&mut assessment, Some(0.12));
+
+        let rejected = evaluate_policy_from_assessment(&assessment, &config);
+        assert_eq!(
+            rejected.verdict_type,
+            GatekeeperVerdictType::RejectSelectorBelowBuy
+        );
+        assert_eq!(rejected.selector_soft_score.score, 2);
+        assert_eq!(
+            selector_rule(
+                &rejected.selector_soft_score,
+                "signer_cross_pool_velocity_lt"
+            )
+            .status,
+            "degraded_low_sample_not_allowed"
+        );
+
+        config.selector_soft_score.allow_degraded_cpv = true;
+        let buy = evaluate_policy_from_assessment(&assessment, &config);
+        assert_eq!(buy.verdict_type, GatekeeperVerdictType::Buy);
+        assert_eq!(buy.selector_soft_score.score, 3);
+        assert_eq!(
+            selector_rule(&buy.selector_soft_score, "signer_cross_pool_velocity_lt").status,
+            "degraded_low_sample"
+        );
+    }
+
+    #[test]
+    fn selector_soft_score_carried_delta_requires_selector_policy() {
+        let mut config = selector_policy_config(SelectorSoftScorePolicy::BuyGate);
+        let mut assessment = selector_controlled_assessment();
+        assessment
+            .feature_snapshot
+            .alpha_fingerprint
+            .jito_tip_intensity = Some(0.10);
+        if let Some(diversity) = assessment.phase3_diversity.as_mut() {
+            diversity.unique_ratio = 0.30;
+        }
+        assessment
+            .feature_snapshot
+            .temporal_deltas
+            .delta_jito_tip_intensity_1s_to_3s = Some(0.02);
+        add_carried_delta(&mut assessment, "delta_jito_tip_intensity_1s_to_3s");
+
+        let rejected = evaluate_policy_from_assessment(&assessment, &config);
+        assert_eq!(
+            rejected.verdict_type,
+            GatekeeperVerdictType::RejectSelectorBelowBuy
+        );
+        assert_eq!(rejected.selector_soft_score.score, 2);
+        assert_eq!(
+            selector_rule(
+                &rejected.selector_soft_score,
+                "delta_jito_tip_intensity_1s_to_3s_lt"
+            )
+            .status,
+            "carried_forward_not_allowed"
+        );
+
+        config.temporal_carried_forward_policy = TemporalCarriedForwardPolicy::UseForSelectorOnly;
+        config.selector_soft_score.allow_carried_temporal_deltas = true;
+        let buy = evaluate_policy_from_assessment(&assessment, &config);
+        assert_eq!(buy.verdict_type, GatekeeperVerdictType::Buy);
+        assert_eq!(buy.selector_soft_score.score, 3);
+        assert_eq!(
+            selector_rule(
+                &buy.selector_soft_score,
+                "delta_jito_tip_intensity_1s_to_3s_lt"
+            )
+            .status,
+            "carried_forward"
+        );
+    }
+
+    #[test]
+    fn strict_metric_missing_hard_fail_rejects_jito_flipper_and_cpv() {
+        let cases: [(&str, fn(&mut GatekeeperAssessment)); 3] = [
+            (
+                "jito_tip_intensity",
+                |assessment: &mut GatekeeperAssessment| {
+                    assessment
+                        .feature_snapshot
+                        .alpha_fingerprint
+                        .jito_tip_intensity = None;
+                },
+            ),
+            (
+                "flipper_presence_ratio",
+                |assessment: &mut GatekeeperAssessment| {
+                    assessment
+                        .feature_snapshot
+                        .alpha_fingerprint
+                        .flipper_presence_ratio = None;
+                },
+            ),
+            (
+                "signer_cross_pool_velocity",
+                |assessment: &mut GatekeeperAssessment| {
+                    assessment
+                        .feature_snapshot
+                        .sybil_resistance
+                        .signer_cross_pool_velocity = None;
+                    assessment.feature_snapshot.sybil_resistance.cpv_evidence =
+                        CpvEvidenceContext::default();
+                },
+            ),
+        ];
+
+        for (metric_name, mutate) in cases {
+            let config = strict_policy_config();
+            let mut assessment = strict_ready_assessment();
+            mutate(&mut assessment);
+
+            let decision = evaluate_policy_from_assessment(&assessment, &config);
+
+            assert_eq!(decision.verdict_type, GatekeeperVerdictType::RejectHardFail);
+            assert_eq!(
+                decision.reason_code,
+                Some(GatekeeperReasonCode::HardFailStrictMetricThreshold)
+            );
+            assert!(
+                decision
+                    .reason_chain
+                    .contains(&format!("strict_metric_missing={metric_name}")),
+                "missing metric reason not found in {}",
+                decision.reason_chain
+            );
+        }
+    }
+
+    #[test]
+    fn strict_metric_value_failure_rejects_count_shortfall() {
+        let config = strict_policy_config();
+        let mut assessment = strict_ready_assessment();
+        assessment.total_tx_evaluated = config.min_tx_count - 1;
+        assessment.feature_snapshot.tx_intel_features.tx_count =
+            assessment.total_tx_evaluated as u64;
+
+        let decision = evaluate_policy_from_assessment(&assessment, &config);
+
+        assert_eq!(decision.verdict_type, GatekeeperVerdictType::RejectHardFail);
+        assert_eq!(
+            decision.reason_code,
+            Some(GatekeeperReasonCode::HardFailStrictMetricThreshold)
+        );
+        assert!(decision
+            .reason_chain
+            .contains("strict_metric_value_failure=total_tx_evaluated"));
+    }
+
+    #[test]
+    fn strict_metric_missing_skip_is_logged_without_threshold_pass() {
+        let mut config = strict_policy_config();
+        config.strict_metric_missing_policy = StrictMetricMissingPolicy::Skip;
+        let mut assessment = strict_ready_assessment();
+        assessment
+            .feature_snapshot
+            .alpha_fingerprint
+            .jito_tip_intensity = None;
+
+        let decision = evaluate_policy_from_assessment(&assessment, &config);
+
+        assert_eq!(decision.verdict_type, GatekeeperVerdictType::Buy);
+        assert!(decision
+            .reason_chain
+            .contains("metric_skipped_missing=jito_tip_intensity"));
+        assert!(decision.reason_chain.contains("strict_metric_pass=false"));
+    }
+
+    #[test]
+    fn strict_metric_degraded_allowed_does_not_impute_null() {
+        let mut config = strict_policy_config();
+        config.strict_metric_missing_policy = StrictMetricMissingPolicy::DegradedAllowed;
+        let mut assessment = strict_ready_assessment();
+        assessment
+            .feature_snapshot
+            .alpha_fingerprint
+            .jito_tip_intensity = None;
+
+        let decision = evaluate_policy_from_assessment(&assessment, &config);
+
+        assert_eq!(decision.verdict_type, GatekeeperVerdictType::RejectHardFail);
+        assert!(decision
+            .reason_chain
+            .contains("strict_metric_missing=jito_tip_intensity"));
+        assert!(decision.reason_chain.contains("policy=degraded_allowed"));
+    }
+
+    #[test]
+    fn cpv_low_sample_policy_hard_fail_rejects_degraded_cpv() {
+        let config = strict_policy_config();
+        let mut assessment = strict_ready_assessment();
+        mark_cpv_low_sample(&mut assessment, Some(0.12));
+
+        let decision = evaluate_policy_from_assessment(&assessment, &config);
+
+        assert_eq!(decision.verdict_type, GatekeeperVerdictType::RejectHardFail);
+        assert!(decision
+            .reason_chain
+            .contains("strict_metric_degraded_not_allowed=signer_cross_pool_velocity"));
+        assert!(decision
+            .reason_chain
+            .contains("evidence_status=degraded_low_sample"));
+    }
+
+    #[test]
+    fn cpv_low_sample_policy_reason_only_logs_without_threshold_pass() {
+        let mut config = strict_policy_config();
+        config.cpv_low_sample_policy = CpvLowSamplePolicy::ReasonOnly;
+        let mut assessment = strict_ready_assessment();
+        mark_cpv_low_sample(&mut assessment, Some(9.0));
+
+        let decision = evaluate_policy_from_assessment(&assessment, &config);
+
+        assert_eq!(decision.verdict_type, GatekeeperVerdictType::Buy);
+        assert!(decision
+            .reason_chain
+            .contains("cpv_low_sample_reason_only=signer_cross_pool_velocity"));
+        assert!(decision.reason_chain.contains("strict_metric_pass=false"));
+    }
+
+    #[test]
+    fn cpv_low_sample_use_degraded_requires_policy_allow_flag() {
+        let mut config = strict_policy_config();
+        config.cpv_low_sample_policy = CpvLowSamplePolicy::UseDegraded;
+        config.cpv_allow_degraded_in_strict_policy = false;
+        let mut assessment = strict_ready_assessment();
+        mark_cpv_low_sample(&mut assessment, Some(0.12));
+
+        let decision = evaluate_policy_from_assessment(&assessment, &config);
+
+        assert_eq!(decision.verdict_type, GatekeeperVerdictType::RejectHardFail);
+        assert!(decision
+            .reason_chain
+            .contains("cpv_allow_degraded_in_strict_policy=false"));
+    }
+
+    #[test]
+    fn cpv_low_sample_use_degraded_evaluates_threshold_with_degraded_status() {
+        let mut config = strict_policy_config();
+        config.cpv_low_sample_policy = CpvLowSamplePolicy::UseDegraded;
+        config.cpv_allow_degraded_in_strict_policy = true;
+        let mut assessment = strict_ready_assessment();
+        mark_cpv_low_sample(&mut assessment, Some(9.0));
+
+        let decision = evaluate_policy_from_assessment(&assessment, &config);
+
+        assert_eq!(decision.verdict_type, GatekeeperVerdictType::RejectHardFail);
+        assert!(decision
+            .reason_chain
+            .contains("strict_metric_value_failure=signer_cross_pool_velocity"));
+        assert!(decision
+            .reason_chain
+            .contains("evidence_status=degraded_low_sample"));
+    }
+
+    #[test]
+    fn temporal_carried_forward_log_only_does_not_change_gatekeeper_verdict() {
+        let mut config = strict_policy_config();
+        config.temporal_carried_forward_policy = TemporalCarriedForwardPolicy::LogOnly;
+        let mut assessment = strict_ready_assessment();
+        add_carried_delta(&mut assessment, "delta_buy_count_1s_to_3s");
+
+        let decision = evaluate_policy_from_assessment(&assessment, &config);
+
+        assert_eq!(decision.verdict_type, GatekeeperVerdictType::Buy);
+        assert!(decision
+            .reason_chain
+            .contains("temporal_carried_forward_log_only=delta_buy_count_1s_to_3s"));
+    }
+
+    #[test]
+    fn temporal_carried_forward_selector_only_does_not_change_gatekeeper_verdict() {
+        let mut config = strict_policy_config();
+        config.temporal_carried_forward_policy = TemporalCarriedForwardPolicy::UseForSelectorOnly;
+        let mut assessment = strict_ready_assessment();
+        add_carried_delta(&mut assessment, "delta_buy_count_1s_to_3s");
+
+        let decision = evaluate_policy_from_assessment(&assessment, &config);
+
+        assert_eq!(decision.verdict_type, GatekeeperVerdictType::Buy);
+        assert!(decision
+            .reason_chain
+            .contains("temporal_carried_forward_selector_only=delta_buy_count_1s_to_3s"));
+    }
+
+    #[test]
+    fn temporal_carried_forward_use_in_policy_is_metric_class_allowlisted() {
+        let mut config = strict_policy_config();
+        config.temporal_carried_forward_policy = TemporalCarriedForwardPolicy::UseInPolicy;
+        config.temporal_carry_forward_event_counters_enabled = true;
+        config.temporal_carry_forward_ratio_metrics_enabled = false;
+        let mut assessment = strict_ready_assessment();
+        add_carried_delta(&mut assessment, "delta_buy_count_1s_to_3s");
+        add_carried_delta(&mut assessment, "delta_jito_tip_intensity_1s_to_3s");
+
+        let decision = evaluate_policy_from_assessment(&assessment, &config);
+
+        assert_eq!(decision.verdict_type, GatekeeperVerdictType::Buy);
+        assert!(decision
+            .reason_chain
+            .contains("temporal_carried_forward_policy_allowed=delta_buy_count_1s_to_3s"));
+        assert!(decision
+            .reason_chain
+            .contains("temporal_carried_forward_not_allowed=delta_jito_tip_intensity_1s_to_3s"));
+    }
+
+    #[test]
+    fn evidence_policy_context_is_emitted_in_buy_log_when_enabled() {
+        let mut config = strict_policy_config();
+        config.cpv_low_sample_policy = CpvLowSamplePolicy::UseDegraded;
+        config.cpv_allow_degraded_in_strict_policy = true;
+        config.temporal_carried_forward_policy = TemporalCarriedForwardPolicy::UseForSelectorOnly;
+        config.temporal_carry_forward_max_staleness_ms = 1_250;
+        let mut assessment = strict_ready_assessment();
+        assessment.decision = Some(evaluate_policy_from_assessment(&assessment, &config));
+
+        let log = assessment.to_buy_log(&Pubkey::new_unique(), &config);
+        let context = log
+            .evidence_policy_context
+            .expect("evidence policy context should be emitted");
+
+        assert_eq!(
+            context["strict_metric_missing_policy"].as_str(),
+            Some("hard_fail")
+        );
+        assert_eq!(
+            context["cpv_low_sample_policy"].as_str(),
+            Some("use_degraded")
+        );
+        assert_eq!(
+            context["cpv_allow_degraded_in_strict_policy"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            context["temporal_carried_forward_policy"].as_str(),
+            Some("use_for_selector_only")
+        );
+        assert_eq!(
+            context["temporal_carry_forward_max_staleness_ms"].as_u64(),
+            Some(1_250)
+        );
+        assert_eq!(
+            context["top_level_features_from_materialized_ssot"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            context["decision_time_series_tx_capacity"].as_u64(),
+            Some(config.decision_time_series_tx_capacity as u64)
+        );
+        assert_eq!(
+            context["decision_time_series_retention_policy"].as_str(),
+            Some("truncate_with_status")
+        );
     }
 
     #[test]

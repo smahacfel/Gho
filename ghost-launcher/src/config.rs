@@ -1062,14 +1062,12 @@ fn validate_selector_simcov_contract(config: &LauncherConfig) -> Result<(), Stri
 
     if latch.mode != default_selector_state_readiness_latch_mode() {
         return Err(
-            "[selector.simcov.state_readiness_latch].mode must remain \"shadow_only\""
-                .to_string(),
+            "[selector.simcov.state_readiness_latch].mode must remain \"shadow_only\"".to_string(),
         );
     }
     if latch.max_wait_ms == 0 || latch.max_wait_ms > 25 {
         return Err(
-            "[selector.simcov.state_readiness_latch].max_wait_ms must be in 1..=25"
-                .to_string(),
+            "[selector.simcov.state_readiness_latch].max_wait_ms must be in 1..=25".to_string(),
         );
     }
     if latch.poll_interval_ms == 0 || latch.poll_interval_ms > latch.max_wait_ms {
@@ -1080,14 +1078,12 @@ fn validate_selector_simcov_contract(config: &LauncherConfig) -> Result<(), Stri
     }
     if !latch.fail_closed {
         return Err(
-            "[selector.simcov.state_readiness_latch].fail_closed must remain true"
-                .to_string(),
+            "[selector.simcov.state_readiness_latch].fail_closed must remain true".to_string(),
         );
     }
     if latch.allow_rpc {
         return Err(
-            "[selector.simcov.state_readiness_latch].allow_rpc must remain false"
-                .to_string(),
+            "[selector.simcov.state_readiness_latch].allow_rpc must remain false".to_string(),
         );
     }
     Ok(())
@@ -5072,7 +5068,11 @@ artifact_transfer_sample_rate = 50
         config.trigger.shadow_run.shadow_rpc_url = "https://shadow.example.com/api-key".to_string();
         config.selector.simcov.state_readiness_latch.enabled = true;
         config.selector.simcov.state_readiness_latch.max_wait_ms = 25;
-        config.selector.simcov.state_readiness_latch.poll_interval_ms = 1;
+        config
+            .selector
+            .simcov
+            .state_readiness_latch
+            .poll_interval_ms = 1;
 
         assert!(config.validate_execution_profile().is_ok());
     }

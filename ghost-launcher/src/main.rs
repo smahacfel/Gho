@@ -1942,6 +1942,18 @@ async fn main() -> Result<()> {
         slippage_tolerance: config.trigger.slippage_tolerance,
         live_exit_take_profit_pct: config.trigger.live_exit_take_profit_pct,
         live_exit_stop_loss_pct: config.trigger.live_exit_stop_loss_pct,
+        shadow_target_threshold: ghost_brain_config
+            .as_ref()
+            .and_then(|brain| brain.post_buy_guardian.target_threshold),
+        shadow_stoploss_threshold: ghost_brain_config
+            .as_ref()
+            .and_then(|brain| brain.post_buy_guardian.stoploss_threshold),
+        shadow_wait_for_timestop: ghost_brain_config
+            .as_ref()
+            .and_then(|brain| brain.post_buy_guardian.wait_for_timestop),
+        shadow_time_stop_v2: ghost_brain_config
+            .as_ref()
+            .map(|brain| brain.post_buy_guardian.time_stop_v2.clone()),
         shadow_ledger: Some(Arc::clone(&shadow_ledger)),
         account_state_core: Some(Arc::clone(oracle_runtime.account_state_core())),
         shadow_lifecycle_log_path,

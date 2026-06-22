@@ -28,6 +28,7 @@ pub use gatekeeper_v3_config::{
 pub use ghost_brain_config::{
     BvaConfig,
     ConfidenceConfig,
+    CpvLowSamplePolicy,
     // Cycle Weights & Gunshot Thresholds (Section 10)
     CycleWeightsConfig,
     FrbConfig,
@@ -52,14 +53,19 @@ pub use ghost_brain_config::{
     QualityFullAnalysisWeights,
     ResonanceConfig,
     ScoringWeightsConfig,
+    SelectorSoftScoreConfig,
+    SelectorSoftScoreMissingPolicy,
+    SelectorSoftScorePolicy,
     SobpConfig,
     SsmiConfig,
+    StrictMetricMissingPolicy,
     SurvivalCycleWeights,
     SurvivalFinalVerdictWeights,
     // Survivor Score configuration (Section 9)
     SurvivorScoreComponentConfig,
     TcfConfig,
     TcrPhiConfig,
+    TemporalCarriedForwardPolicy,
     WeightProfile,
     WeightProfiles,
 };

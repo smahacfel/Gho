@@ -1158,6 +1158,13 @@ tick_interval_ms = 500
 max_monitored_positions = 10
 signal_channel_buffer = 256
 
+# Shadow/probe lifecycle close thresholds.
+# Values are percentages: 50.0 means +50% Target / -50% StopLoss.
+# Target can be set above 100.0; StopLoss is clamped by runtime to max 100%.
+target_threshold = 50.0
+stoploss_threshold = 50.0
+wait_for_timestop = 30000
+
 # LIGMA thresholds (liquidity depth monitoring)
 ligma_warning_impact_bps = 3500.0
 ligma_critical_impact_bps = 8000.0

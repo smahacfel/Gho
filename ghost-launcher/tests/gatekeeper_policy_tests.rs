@@ -353,6 +353,8 @@ fn neutral_sybil_defaults_preserve_buy_and_reject_verdicts() {
         spend_fraction_divergence: Some(0.0),
         demand_elasticity_score: Some(-1.0),
         signer_cross_pool_velocity: Some(1.0),
+        cpv_other_pool_activity: None,
+        cpv_evidence: Default::default(),
         funding_source_concentration: Some(1.0),
         funding_source_diagnostics: None,
         funding_source_v2: None,
@@ -528,7 +530,7 @@ fn degraded_sybil_metrics_do_not_score_even_with_active_penalties() {
         signer_cross_pool_velocity: Some(0.90),
         degraded_reasons: vec![
             FTDI_INSUFFICIENT_BUYS_REASON.to_string(),
-            CPV_ROLLING_STATE_UNAVAILABLE_REASON.to_string(),
+            ghost_core::tx_intelligence::types::CPV_LOW_SAMPLE_DEGRADED_REASON.to_string(),
         ],
         buy_sample_count: 2,
         signer_sample_count: 2,
@@ -1253,6 +1255,7 @@ fn feature_snapshot_alpha_fingerprint_can_fail_phase4_without_post_attach() {
     let mut features = base_feature_set();
     features.alpha_fingerprint = AlphaFingerprintFeatures {
         avg_inner_ix_count_50tx: None,
+        avg_cpi_depth_50tx: None,
         sell_buy_ratio: None,
         compute_unit_cluster_dominance: None,
         static_fee_profile_ratio: None,

@@ -475,6 +475,7 @@ impl E2EPipeline {
                                         .as_ref()
                                         .map(|emitter| emitter.lane())
                                         .unwrap_or(Lane::Live),
+                                    opened_at_ms: None,
                                     position_id: None,
                                     position_epoch: None,
                                 });

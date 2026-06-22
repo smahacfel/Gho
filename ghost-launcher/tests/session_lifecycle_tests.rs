@@ -370,6 +370,7 @@ fn materialize_features_populates_ftdi_from_session_tx_buffer() {
         features.sybil_resistance.degraded_reasons,
         vec![
             ghost_core::tx_intelligence::types::DBIA_NO_DEV_BUY_REASON.to_string(),
+            ghost_core::tx_intelligence::types::DES_CURVE_DATA_UNAVAILABLE_REASON.to_string(),
             ghost_core::tx_intelligence::types::DES_INSUFFICIENT_BUYS_REASON.to_string(),
             ghost_core::tx_intelligence::types::FSC_FUNDING_STREAM_UNAVAILABLE_REASON.to_string(),
         ]
@@ -442,6 +443,7 @@ fn materialize_features_populates_dbia_from_session_tx_buffer() {
     assert_eq!(
         features.sybil_resistance.degraded_reasons,
         vec![
+            ghost_core::tx_intelligence::types::DES_CURVE_DATA_UNAVAILABLE_REASON.to_string(),
             ghost_core::tx_intelligence::types::DES_INSUFFICIENT_BUYS_REASON.to_string(),
             ghost_core::tx_intelligence::types::FSC_FUNDING_STREAM_UNAVAILABLE_REASON.to_string(),
         ]
@@ -587,6 +589,8 @@ fn materialize_features_keeps_sfd_when_partial_balance_coverage_still_has_three_
             is_dev_buy: false,
             signer_pre_balance_lamports: Some(100),
             signer_post_balance_lamports: None,
+            volume_sol: 0.1,
+            sol_amount_lamports: Some(90),
             toolchain_fingerprint: dbia_fingerprint(12, 3, true, true, 2, (0, 0)),
             ..(*test_tx(pool_id, "sig-sfd-partial-missing", 31_040)).clone()
         }));
@@ -597,9 +601,14 @@ fn materialize_features_keeps_sfd_when_partial_balance_coverage_still_has_three_
         features.sybil_resistance.spend_fraction_divergence,
         Some(0.0)
     );
-    assert!(features.sybil_resistance.degraded_reasons.contains(
-        &ghost_core::tx_intelligence::types::SFD_PARTIAL_BALANCE_COVERAGE_REASON.to_string()
-    ));
+    assert_eq!(features.sybil_resistance.buy_sample_count, 4);
+    assert!(
+        features.sybil_resistance.degraded_reasons.contains(
+            &ghost_core::tx_intelligence::types::SFD_PARTIAL_BALANCE_COVERAGE_REASON.to_string()
+        ),
+        "degraded_reasons={:?}",
+        features.sybil_resistance.degraded_reasons
+    );
 }
 
 #[test]
@@ -686,7 +695,17 @@ fn materialize_features_populates_cpv_from_shared_session_index() {
     let bonding_curve_a = Pubkey::new_unique();
     let bonding_curve_b = Pubkey::new_unique();
     let session_a = open_session(&manager, pool_a, base_mint_a, bonding_curve_a, 49_000);
-    let session_b = open_session(&manager, pool_b, base_mint_b, bonding_curve_b, 50_000);
+    let mut gatekeeper_config = GatekeeperV2Config::default();
+    gatekeeper_config.max_wait_time_ms = 5_000;
+    let session_b = open_session_with_deadline_and_gatekeeper_config(
+        &manager,
+        pool_b,
+        base_mint_b,
+        bonding_curve_b,
+        50_000,
+        55_000,
+        gatekeeper_config,
+    );
     let shared_signer = Pubkey::new_unique();
     let session_b_dev_wallet = session_b
         .read()
@@ -756,6 +775,205 @@ fn materialize_features_populates_cpv_from_shared_session_index() {
     assert!(features.sybil_resistance.degraded_reasons.contains(
         &ghost_core::tx_intelligence::types::FSC_FUNDING_STREAM_UNAVAILABLE_REASON.to_string()
     ));
+}
+
+#[test]
+fn materialize_features_populates_decision_series_and_temporal_deltas_from_session_buffer() {
+    let manager = SessionManager::new(SessionConfig {
+        default_observation_duration_ms: 100,
+        max_sessions: 8,
+        ..SessionConfig::default()
+    });
+    let pool_a = Pubkey::new_unique();
+    let pool_b = Pubkey::new_unique();
+    let base_mint_a = Pubkey::new_unique();
+    let base_mint_b = Pubkey::new_unique();
+    let bonding_curve_a = Pubkey::new_unique();
+    let bonding_curve_b = Pubkey::new_unique();
+    let session_a = open_session(&manager, pool_a, base_mint_a, bonding_curve_a, 49_000);
+    let mut gatekeeper_config = GatekeeperV2Config::default();
+    gatekeeper_config.max_wait_time_ms = 5_000;
+    let session_b = open_session_with_deadline_and_gatekeeper_config(
+        &manager,
+        pool_b,
+        base_mint_b,
+        bonding_curve_b,
+        50_000,
+        55_000,
+        gatekeeper_config,
+    );
+    let cross_a = Pubkey::new_unique();
+    let cross_b = Pubkey::new_unique();
+    let local_a = Pubkey::new_unique();
+    let local_b = Pubkey::new_unique();
+    let local_c = Pubkey::new_unique();
+    let local_d = Pubkey::new_unique();
+
+    {
+        let mut guard = session_a.write();
+        let _ = guard.ingest_transaction(des_tx(
+            pool_a,
+            cross_a,
+            "sig-delta-cpv-seed-a",
+            1_050,
+            1,
+            Some(0),
+            false,
+            9.0,
+        ));
+        let _ = guard.ingest_transaction(des_tx(
+            pool_a,
+            cross_b,
+            "sig-delta-cpv-seed-b",
+            1_060,
+            2,
+            Some(0),
+            false,
+            9.5,
+        ));
+    }
+
+    let mut tx_with_side = |signer: Pubkey,
+                            signature: &str,
+                            timestamp_ms: u64,
+                            slot: u64,
+                            is_buy: bool,
+                            price: f64,
+                            jito: bool| {
+        let mut tx = (*des_tx(
+            pool_b,
+            signer,
+            signature,
+            timestamp_ms,
+            slot,
+            Some(0),
+            false,
+            price,
+        ))
+        .clone();
+        tx.is_buy = is_buy;
+        tx.jito_tip_detected = Some(jito);
+        Arc::new(tx)
+    };
+
+    let features = {
+        let mut guard = session_b.write();
+        let _ = guard.ingest_transaction(tx_with_side(
+            cross_a,
+            "sig-delta-cross-a-buy",
+            1_200,
+            3,
+            true,
+            10.0,
+            true,
+        ));
+        let _ = guard.ingest_transaction(tx_with_side(
+            local_a,
+            "sig-delta-local-a-buy",
+            1_400,
+            4,
+            true,
+            11.0,
+            false,
+        ));
+        let _ = guard.ingest_transaction(tx_with_side(
+            local_b,
+            "sig-delta-local-b-buy",
+            1_700,
+            5,
+            true,
+            12.0,
+            false,
+        ));
+        let _ = guard.ingest_transaction(tx_with_side(
+            cross_b,
+            "sig-delta-cross-b-buy",
+            2_400,
+            6,
+            true,
+            14.0,
+            true,
+        ));
+        let _ = guard.ingest_transaction(tx_with_side(
+            cross_a,
+            "sig-delta-cross-a-sell",
+            2_700,
+            7,
+            false,
+            13.0,
+            false,
+        ));
+        let _ = guard.ingest_transaction(tx_with_side(
+            local_c,
+            "sig-delta-local-c-buy",
+            3_400,
+            8,
+            true,
+            16.0,
+            true,
+        ));
+        let _ = guard.ingest_transaction(tx_with_side(
+            local_d,
+            "sig-delta-local-d-buy",
+            4_200,
+            9,
+            true,
+            17.0,
+            false,
+        ));
+        guard.materialize_features()
+    };
+
+    assert_eq!(features.decision_time_series.status, EvidenceStatus::Clean);
+    assert_eq!(features.decision_time_series.sample_count, 7);
+    assert_eq!(features.decision_time_series.finite_price_count, 7);
+    assert_eq!(features.decision_time_series.missing_price_count, 0);
+    assert_eq!(features.decision_time_series.source_counts.reserve, 7);
+    assert!(
+        (features
+            .decision_time_series
+            .price_coverage_ratio
+            .expect("price coverage should materialize")
+            - 1.0)
+            .abs()
+            < f64::EPSILON
+    );
+    assert_eq!(features.decision_time_series.prices.len(), 7);
+    assert_eq!(features.decision_time_series.d_price.len(), 6);
+
+    assert_eq!(features.temporal_deltas.status, EvidenceStatus::Clean);
+    assert!(features.temporal_deltas.anchor_1s.reached);
+    assert!(features.temporal_deltas.anchor_2s.reached);
+    assert!(features.temporal_deltas.anchor_3s.reached);
+    assert_eq!(features.temporal_deltas.delta_buy_count_1s_to_2s, Some(1));
+    assert_eq!(
+        features.temporal_deltas.delta_unique_signers_1s_to_3s,
+        Some(3)
+    );
+    assert_eq!(
+        features.temporal_deltas.delta_mcap_1s_to_2s,
+        Some(1_000_000_000.0)
+    );
+    assert_eq!(
+        features.temporal_deltas.delta_mcap_1s_to_3s,
+        Some(5_000_000_000.0)
+    );
+
+    let jito_delta = features
+        .temporal_deltas
+        .delta_jito_tip_intensity_1s_to_3s
+        .expect("jito intensity delta should materialize");
+    assert!((jito_delta - (2.0 / 21.0)).abs() < 1e-12);
+    let cpv_delta = features
+        .temporal_deltas
+        .delta_signer_cross_pool_velocity_1s_to_2s
+        .expect("CPV delta should materialize from shared session index");
+    assert!((cpv_delta - (1.0 / 6.0)).abs() < 1e-12);
+    let flipper_delta = features
+        .temporal_deltas
+        .delta_flipper_presence_ratio_1s_to_2s
+        .expect("flipper delta should materialize");
+    assert!((flipper_delta - 0.25).abs() < 1e-12);
 }
 
 #[test]

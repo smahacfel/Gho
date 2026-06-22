@@ -34,6 +34,46 @@ run_state = RUN_LEFT_RUNNING_AFTER_LIFECYCLE_PROOF
 
 If this proof does not exist, do not use the scope for R2 checkpoints, P3F/P3G, baseline decisions, or lifecycle claims.
 
+## Strict Probe / Data Collection Runs With Zero BUYs
+
+Strict threshold probes and all-decision data-collection runs can legitimately
+produce no classic Gatekeeper BUY rows during the canary window. For those runs,
+the launcher may be started with:
+
+```bash
+python3 scripts/start_selector_lifecycle_run.py \
+  --scope <scope> \
+  --config <config> \
+  --tmux-session <session> \
+  --allow-zero-buy-lifecycle-proof \
+  --event-canary-seconds 120 \
+  --min-reporter-rows 1
+```
+
+This mode still requires event-ingest proof:
+
+```text
+NewPoolDetected_delta > 0
+Candidate_delta > 0
+PoolTransaction_delta > 0
+DIAG_ACCOUNT_UPDATE_RELAY_delta > 0
+bad_event_json_delta = 0
+```
+
+When that proof passes, the launcher leaves the run in `tmux` with:
+
+```text
+status = PASS
+claim = SELECTOR_EVENT_CANARY_RUN_STARTED_ZERO_BUY_LIFECYCLE_ALLOWED
+run_state = RUN_LEFT_RUNNING_AFTER_EVENT_CANARY_ZERO_BUY_LIFECYCLE_ALLOWED
+```
+
+This is not classic BUY lifecycle proof. It must not be used as evidence that
+`shadow_buys.jsonl`, `shadow_entries.jsonl`, or `shadow_lifecycle.jsonl`
+received BUY-position lifecycle rows. It only proves the run is ingesting and
+can be left alive for strict-policy/probe/data-collection purposes where zero
+BUYs is expected.
+
 ## Static Config Contract
 
 Every lifecycle-capable selector run must pass this config contract before runtime starts:

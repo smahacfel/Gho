@@ -4,6 +4,8 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 from unittest import mock
 
@@ -234,6 +236,60 @@ class SelectorLifecycleRunGuardTests(unittest.TestCase):
         self.assertIn('export NLN_API_KEY="$GHOST_SEER_GRPC_X_TOKEN"', tmux_payload)
         self.assertIn("timeout 5400s", tmux_payload)
         self.assertNotIn("sk_live_", tmux_payload)
+
+    def test_launcher_zero_buy_lifecycle_allowance_has_distinct_pass_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            report = {
+                "run_state": launcher.RUN_STATE_EVENT_ONLY,
+                "scope": "r37",
+                "config": "/tmp/r37.toml",
+                "tmux_session": "r37",
+                "allow_zero_buy_lifecycle_proof": True,
+                "runtime_binary": "/tmp/ghost-launcher",
+                "build_release_before_start": False,
+                "build_freshness_status": "NOT_REQUESTED",
+                "git_head_at_build": None,
+                "git_head_at_launch": "abc",
+                "binary_mtime_utc": None,
+                "storage": {"status": launcher.PASS_STATUS},
+                "config_contract": {"status": launcher.PASS_STATUS},
+                "scope_contract": {"status": launcher.PASS_STATUS},
+                "static_guard": {"status": launcher.PASS_STATUS},
+                "preflight": {"status": launcher.PASS_STATUS},
+                "event_canary": {"status": launcher.PASS_STATUS},
+                "lifecycle_canary": {"status": "SKIPPED_ZERO_BUY_LIFECYCLE_ALLOWED"},
+                "errors": [],
+                "artifacts": {},
+            }
+
+            with redirect_stdout(StringIO()):
+                exit_code = launcher.finish(report, output_dir, launcher.PASS_STATUS)
+
+            self.assertEqual(0, exit_code)
+            self.assertEqual(
+                "SELECTOR_EVENT_CANARY_RUN_STARTED_ZERO_BUY_LIFECYCLE_ALLOWED",
+                report["claim"],
+            )
+            markdown = (output_dir / "RUN_LIFECYCLE_LAUNCHER_REPORT.md").read_text(encoding="utf-8")
+            self.assertIn("PASS means event-ingest proof only", markdown)
+            self.assertNotIn("SELECTOR_LIFECYCLE_RUN_STARTED_WITH_PROOF", report["claim"])
+
+    def test_launcher_parser_accepts_zero_buy_lifecycle_allowance(self) -> None:
+        parser = launcher.build_parser()
+        args = parser.parse_args(
+            [
+                "--scope",
+                "r37",
+                "--config",
+                "configs/rollout/r37.toml",
+                "--tmux-session",
+                "r37",
+                "--allow-zero-buy-lifecycle-proof",
+            ]
+        )
+
+        self.assertTrue(args.allow_zero_buy_lifecycle_proof)
 
 
 if __name__ == "__main__":

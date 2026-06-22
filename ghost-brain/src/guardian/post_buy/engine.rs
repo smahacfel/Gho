@@ -24,6 +24,8 @@ use tracing::{debug, error, info, warn};
 
 use ghost_core::account_state_core::reducer::AccountStateReducer;
 use ghost_core::account_state_core::types::CanonicalPoolState;
+#[cfg(test)]
+use ghost_core::shadow_ledger::types::PriceReason;
 use ghost_core::shadow_ledger::types::PriceState;
 use ghost_core::shadow_ledger::{MarketSnapshot, ShadowLedger};
 
@@ -49,12 +51,15 @@ use trigger::{
     ShadowExitPriceSample, ShadowExitTruth,
 };
 
-use super::config::PostBuyGuardianConfig;
-use super::integration::{
-    PositionRuntimeRouter, ShadowPositionBookAemAdapter, SHADOW_VIRTUAL_MAGAZINE_TIME_STOP_SECS,
-};
+#[cfg(test)]
+use super::config::DEFAULT_WAIT_FOR_TIMESTOP_MS;
+use super::config::{PostBuyGuardianConfig, TimeStopV2Config, TimeStopV2Mode};
+#[cfg(test)]
+use super::integration::SHADOW_VIRTUAL_MAGAZINE_TIME_STOP_SECS;
+use super::integration::{PositionRuntimeRouter, ShadowPositionBookAemAdapter};
 
-const SHADOW_POSITION_TIME_STOP_MS: u64 = SHADOW_VIRTUAL_MAGAZINE_TIME_STOP_SECS * 1000;
+#[cfg(test)]
+const SHADOW_POSITION_TIME_STOP_MS: u64 = DEFAULT_WAIT_FOR_TIMESTOP_MS;
 const SHADOW_EXIT_TRACE_FORMULA_ID: &str = "bonding_curve.calculate_sell_price.v1";
 const SHADOW_TIME_STOP_STALE_SOURCE_PATH: &str = "guardian.post_buy.shadow_time_stop_stale";
 const SHADOW_LAMPORTS_PER_SOL_F64: f64 = 1_000_000_000.0;
@@ -70,8 +75,8 @@ struct ShadowSimpleExitThresholds {
 impl ShadowSimpleExitThresholds {
     fn new(take_profit_pct: f64, stop_loss_pct: f64) -> Self {
         Self {
-            take_profit_pct: sanitize_shadow_threshold_pct(take_profit_pct),
-            stop_loss_pct: sanitize_shadow_threshold_pct(stop_loss_pct),
+            take_profit_pct: sanitize_shadow_target_threshold_pct(take_profit_pct),
+            stop_loss_pct: sanitize_shadow_stoploss_threshold_pct(stop_loss_pct),
         }
     }
 
@@ -112,7 +117,15 @@ impl ShadowSimpleExitTrigger {
     }
 }
 
-fn sanitize_shadow_threshold_pct(value: f64) -> f64 {
+fn sanitize_shadow_target_threshold_pct(value: f64) -> f64 {
+    if value.is_finite() {
+        value.max(0.0)
+    } else {
+        0.0
+    }
+}
+
+fn sanitize_shadow_stoploss_threshold_pct(value: f64) -> f64 {
     if value.is_finite() {
         value.clamp(0.0, 1.0)
     } else {
@@ -194,6 +207,294 @@ impl ShadowMarketActivityAnchor {
         self.slot = snapshot.slot;
         self.tx_count = snapshot.tx_count;
         true
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TimeStopV2WindowStatus {
+    Alive,
+    Weak,
+    Heartbeat,
+    StaleOrInsufficient,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TimeStopV2Subreason {
+    AliveMeaningfulProgress,
+    LowVitalityNoMeaningfulProgress,
+    MicroTxHeartbeatNoPriceProgress,
+    StaleOrMissingMarketSample,
+    MissingMarketSample,
+    InvalidMarketSample,
+    NoNewMarketSample,
+    MixedFailedVitalityWindows,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TimeStopV2Checkpoint {
+    slot: Option<u64>,
+    timestamp_ms: u64,
+    price_sol_per_token: f64,
+    price_state: PriceState,
+    market_cap_sol: f64,
+    bonding_progress_pct: f64,
+    tx_count: u64,
+    cum_volume_sol: f64,
+}
+
+impl TimeStopV2Checkpoint {
+    fn from_snapshot(snapshot: &MarketSnapshot) -> Self {
+        Self {
+            slot: snapshot.slot,
+            timestamp_ms: snapshot.timestamp_ms,
+            price_sol_per_token: snapshot.price_sol_per_token,
+            price_state: snapshot.price_state,
+            market_cap_sol: snapshot.market_cap_sol,
+            bonding_progress_pct: snapshot.bonding_progress_pct,
+            tx_count: snapshot.tx_count,
+            cum_volume_sol: snapshot.cum_volume_sol,
+        }
+    }
+
+    fn is_newer_than(self, previous: Self) -> bool {
+        match (previous.slot, self.slot) {
+            (Some(previous_slot), Some(current_slot)) if current_slot > previous_slot => true,
+            (None, Some(_)) => true,
+            _ => self.timestamp_ms > previous.timestamp_ms || self.tx_count > previous.tx_count,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct TimeStopV2State {
+    next_window_index: u32,
+    last_checkpoint: Option<TimeStopV2Checkpoint>,
+    failed_windows: u32,
+    failed_subreason: Option<TimeStopV2Subreason>,
+    last_status: Option<TimeStopV2WindowStatus>,
+    last_subreason: Option<TimeStopV2Subreason>,
+    candidate_emitted: bool,
+    candidate_ts_ms: Option<u64>,
+    candidate_subreason: Option<TimeStopV2Subreason>,
+}
+
+#[derive(Debug, Clone)]
+struct TimeStopV2Evaluation {
+    mode: TimeStopV2Mode,
+    window_index: u32,
+    scheduled_check_ms: u64,
+    position_age_ms: u64,
+    status: TimeStopV2WindowStatus,
+    subreason: TimeStopV2Subreason,
+    failed_windows: u32,
+    candidate: bool,
+    candidate_ts_ms: Option<u64>,
+    candidate_subreason: Option<TimeStopV2Subreason>,
+    price_delta_pct_window: Option<f64>,
+    price_delta_pct_from_entry: Option<f64>,
+    mcap_delta_pct_window: Option<f64>,
+    bonding_delta_pct_window: Option<f64>,
+    tx_delta_window: Option<u64>,
+    volume_delta_sol_window: Option<f64>,
+    avg_volume_per_tx_sol_window: Option<f64>,
+    checkpoint_slot: Option<u64>,
+    latest_slot: Option<u64>,
+    checkpoint_timestamp_ms: Option<u64>,
+    latest_timestamp_ms: Option<u64>,
+}
+
+impl TimeStopV2State {
+    fn from_registration(snapshot: Option<&MarketSnapshot>) -> Self {
+        Self {
+            last_checkpoint: snapshot.map(TimeStopV2Checkpoint::from_snapshot),
+            ..Self::default()
+        }
+    }
+
+    fn has_observed(&self) -> bool {
+        self.next_window_index > 0 || self.last_status.is_some() || self.candidate_emitted
+    }
+
+    fn next_scheduled_check_ms(&self, entry_unix_ms: u64, cfg: &TimeStopV2Config) -> u64 {
+        entry_unix_ms
+            .saturating_add(cfg.first_check_ms())
+            .saturating_add(self.next_window_index as u64 * cfg.window_ms())
+    }
+
+    fn evaluate(
+        &mut self,
+        cfg: &TimeStopV2Config,
+        entry_unix_ms: u64,
+        entry_price_sol: Option<f64>,
+        latest: Option<&MarketSnapshot>,
+        now_ms: u64,
+    ) -> Option<TimeStopV2Evaluation> {
+        let scheduled_check_ms = self.next_scheduled_check_ms(entry_unix_ms, cfg);
+        if now_ms < scheduled_check_ms {
+            return None;
+        }
+
+        let window_index = self.next_window_index;
+        let position_age_ms = now_ms.saturating_sub(entry_unix_ms);
+        let previous_checkpoint = self.last_checkpoint;
+        let latest_checkpoint = latest.map(TimeStopV2Checkpoint::from_snapshot);
+        let fresh_latest = match (previous_checkpoint, latest_checkpoint) {
+            (Some(previous), Some(current)) => current.is_newer_than(previous),
+            (None, Some(_)) => false,
+            _ => false,
+        };
+
+        let mut price_delta_pct_window = None;
+        let mut price_delta_pct_from_entry = None;
+        let mut mcap_delta_pct_window = None;
+        let mut bonding_delta_pct_window = None;
+        let mut tx_delta_window = None;
+        let mut volume_delta_sol_window = None;
+        let mut avg_volume_per_tx_sol_window = None;
+
+        let (status, subreason) = if let (Some(previous), Some(current)) =
+            (previous_checkpoint, latest_checkpoint)
+        {
+            let price_delta_pct =
+                pct_delta(current.price_sol_per_token, previous.price_sol_per_token);
+            let mcap_delta_pct = pct_delta(current.market_cap_sol, previous.market_cap_sol);
+            let bonding_delta_pct = current.bonding_progress_pct - previous.bonding_progress_pct;
+            let tx_delta = current.tx_count.saturating_sub(previous.tx_count);
+            let volume_delta_sol = (current.cum_volume_sol - previous.cum_volume_sol).max(0.0);
+            let avg_volume_per_tx_sol =
+                (tx_delta > 0).then_some(volume_delta_sol / tx_delta as f64);
+            let price_from_entry_pct = entry_price_sol
+                .filter(|price| price.is_finite() && *price > 0.0)
+                .map(|entry_price| pct_delta(current.price_sol_per_token, entry_price));
+
+            price_delta_pct_window = Some(price_delta_pct);
+            price_delta_pct_from_entry = price_from_entry_pct;
+            mcap_delta_pct_window = Some(mcap_delta_pct);
+            bonding_delta_pct_window = Some(bonding_delta_pct);
+            tx_delta_window = Some(tx_delta);
+            volume_delta_sol_window = Some(volume_delta_sol);
+            avg_volume_per_tx_sol_window = avg_volume_per_tx_sol;
+
+            if !current.price_sol_per_token.is_finite()
+                || current.price_sol_per_token <= 0.0
+                || !current.market_cap_sol.is_finite()
+                || current.market_cap_sol <= 0.0
+                || !current.price_state.is_valid()
+            {
+                (
+                    TimeStopV2WindowStatus::StaleOrInsufficient,
+                    TimeStopV2Subreason::InvalidMarketSample,
+                )
+            } else if !fresh_latest {
+                (
+                    TimeStopV2WindowStatus::Weak,
+                    TimeStopV2Subreason::NoNewMarketSample,
+                )
+            } else {
+                let meaningful_progress = price_delta_pct >= cfg.min_price_delta_pct_alive
+                    || mcap_delta_pct >= cfg.min_mcap_delta_pct_alive
+                    || bonding_delta_pct >= cfg.min_bonding_delta_pct_alive
+                    || (volume_delta_sol >= cfg.min_volume_delta_sol_alive
+                        && price_delta_pct >= cfg.min_price_delta_pct_for_volume_alive);
+
+                if meaningful_progress {
+                    (
+                        TimeStopV2WindowStatus::Alive,
+                        TimeStopV2Subreason::AliveMeaningfulProgress,
+                    )
+                } else {
+                    let heartbeat_like = tx_delta >= cfg.min_tx_delta_for_heartbeat
+                        && avg_volume_per_tx_sol
+                            .map(|avg| avg <= cfg.max_avg_volume_per_tx_sol_heartbeat)
+                            .unwrap_or(false)
+                        && price_delta_pct.abs() <= cfg.max_abs_price_delta_pct_heartbeat
+                        && mcap_delta_pct.abs() <= cfg.max_abs_mcap_delta_pct_heartbeat
+                        && bonding_delta_pct.abs() <= cfg.max_bonding_delta_pct_heartbeat;
+                    if heartbeat_like {
+                        (
+                            TimeStopV2WindowStatus::Heartbeat,
+                            TimeStopV2Subreason::MicroTxHeartbeatNoPriceProgress,
+                        )
+                    } else {
+                        (
+                            TimeStopV2WindowStatus::Weak,
+                            TimeStopV2Subreason::LowVitalityNoMeaningfulProgress,
+                        )
+                    }
+                }
+            }
+        } else {
+            (
+                TimeStopV2WindowStatus::StaleOrInsufficient,
+                if latest_checkpoint.is_some() {
+                    TimeStopV2Subreason::StaleOrMissingMarketSample
+                } else {
+                    TimeStopV2Subreason::MissingMarketSample
+                },
+            )
+        };
+
+        if matches!(status, TimeStopV2WindowStatus::Alive) {
+            self.failed_windows = 0;
+            self.failed_subreason = None;
+        } else {
+            self.failed_windows = self.failed_windows.saturating_add(1);
+            self.failed_subreason = match self.failed_subreason {
+                None => Some(subreason),
+                Some(previous) if previous == subreason => Some(previous),
+                Some(_) => Some(TimeStopV2Subreason::MixedFailedVitalityWindows),
+            };
+        }
+
+        if !self.candidate_emitted
+            && self.failed_windows >= cfg.failed_windows_to_signal()
+            && position_age_ms >= cfg.min_age_before_signal_ms()
+        {
+            self.candidate_emitted = true;
+            self.candidate_ts_ms = Some(now_ms);
+            self.candidate_subreason = self.failed_subreason;
+        }
+
+        self.last_status = Some(status);
+        self.last_subreason = Some(subreason);
+        if latest_checkpoint.is_some() && (fresh_latest || previous_checkpoint.is_none()) {
+            self.last_checkpoint = latest_checkpoint;
+        }
+        self.next_window_index = self.next_window_index.saturating_add(1);
+
+        Some(TimeStopV2Evaluation {
+            mode: cfg.mode,
+            window_index,
+            scheduled_check_ms,
+            position_age_ms,
+            status,
+            subreason,
+            failed_windows: self.failed_windows,
+            candidate: self.candidate_emitted,
+            candidate_ts_ms: self.candidate_ts_ms,
+            candidate_subreason: self.candidate_subreason,
+            price_delta_pct_window,
+            price_delta_pct_from_entry,
+            mcap_delta_pct_window,
+            bonding_delta_pct_window,
+            tx_delta_window,
+            volume_delta_sol_window,
+            avg_volume_per_tx_sol_window,
+            checkpoint_slot: previous_checkpoint.and_then(|checkpoint| checkpoint.slot),
+            latest_slot: latest_checkpoint.and_then(|checkpoint| checkpoint.slot),
+            checkpoint_timestamp_ms: previous_checkpoint.map(|checkpoint| checkpoint.timestamp_ms),
+            latest_timestamp_ms: latest_checkpoint.map(|checkpoint| checkpoint.timestamp_ms),
+        })
+    }
+}
+
+fn pct_delta(current: f64, previous: f64) -> f64 {
+    if current.is_finite() && previous.is_finite() && previous.abs() > f64::EPSILON {
+        ((current - previous) / previous) * 100.0
+    } else {
+        0.0
     }
 }
 
@@ -399,6 +700,7 @@ struct MonitoredPosition {
     last_snapshot_source: PriceTruthSource,
     last_shadow_snapshot: Option<MarketSnapshot>,
     shadow_market_activity: ShadowMarketActivityAnchor,
+    time_stop_v2: TimeStopV2State,
     snapshot_timeline: SnapshotTimeline,
 }
 
@@ -419,6 +721,7 @@ pub struct PositionEventContext {
     pub lane: Lane,
     pub position_id: Option<String>,
     pub position_epoch: Option<u64>,
+    pub opened_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -437,6 +740,12 @@ pub struct PositionJoinMetadata {
     pub session_id: Option<String>,
     pub brain_config_path: Option<String>,
     pub brain_config_hash: Option<String>,
+    pub entry_simulation_rpc_slot: Option<u64>,
+    pub entry_market_anchor_slot: Option<u64>,
+    pub entry_market_anchor_tx_signature: Option<String>,
+    pub entry_market_anchor_source: Option<String>,
+    pub entry_landed_slot: Option<u64>,
+    pub entry_landed_slot_source: Option<String>,
 }
 
 /// Minimal position identity returned after successful registration.
@@ -453,6 +762,7 @@ enum ShadowLifecycleRecordType {
     ExitFilled,
     ExitBlocked,
     PositionClosed,
+    TimeStopV2Window,
 }
 
 #[derive(Debug, Serialize)]
@@ -498,6 +808,18 @@ struct ShadowLifecycleRecord {
     quote_id: String,
     entry_slot: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    entry_simulation_rpc_slot: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    entry_market_anchor_slot: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    entry_market_anchor_tx_signature: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    entry_market_anchor_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    entry_landed_slot: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    entry_landed_slot_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     fraction_bps: Option<u16>,
     remaining_fraction_bps: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -528,6 +850,20 @@ struct ShadowLifecycleRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     truth_detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    exit_sample_slot: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exit_market_anchor_slot: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exit_market_anchor_tx_signature: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exit_market_anchor_source: Option<trigger::PriceTruthSource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exit_reason_evaluation_ts_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exit_landed_slot: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exit_landed_slot_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     sample_slot: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     sample_timestamp_ms: Option<u64>,
@@ -537,6 +873,48 @@ struct ShadowLifecycleRecord {
     sample_price_state: Option<ghost_core::shadow_ledger::types::PriceState>,
     #[serde(skip_serializing_if = "Option::is_none")]
     sample_price_reason: Option<ghost_core::shadow_ledger::types::PriceReason>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time_stop_v2_mode: Option<TimeStopV2Mode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time_stop_v2_window_index: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time_stop_v2_scheduled_check_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time_stop_v2_position_age_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time_stop_v2_status: Option<TimeStopV2WindowStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time_stop_v2_subreason: Option<TimeStopV2Subreason>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time_stop_v2_failed_windows: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time_stop_v2_candidate: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time_stop_v2_candidate_ts_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time_stop_v2_candidate_subreason: Option<TimeStopV2Subreason>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time_stop_v2_price_delta_pct_window: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time_stop_v2_price_delta_pct_from_entry: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time_stop_v2_mcap_delta_pct_window: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time_stop_v2_bonding_delta_pct_window: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time_stop_v2_tx_delta_window: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time_stop_v2_volume_delta_sol_window: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time_stop_v2_avg_volume_per_tx_sol_window: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time_stop_v2_checkpoint_slot: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time_stop_v2_latest_slot: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time_stop_v2_checkpoint_timestamp_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time_stop_v2_latest_timestamp_ms: Option<u64>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -727,7 +1105,7 @@ impl MonitoringEngine {
             .panic_rate_window_ms
             .max(self.config.signal_aggregation_window_ms.saturating_mul(2))
             .max(self.config.aem.derived_time_windows().outcome_horizon_ms)
-            .max(SHADOW_POSITION_TIME_STOP_MS)
+            .max(self.shadow_position_time_stop_ms())
             .saturating_add(self.config.tick_interval_ms.saturating_mul(2))
     }
 
@@ -738,6 +1116,10 @@ impl MonitoringEngine {
             .saturating_div(tick_ms)
             .saturating_add(8)
             .min(2_048) as usize
+    }
+
+    fn shadow_position_time_stop_ms(&self) -> u64 {
+        self.config.wait_for_timestop_ms()
     }
 
     fn default_snapshot_source(&self) -> PriceTruthSource {
@@ -1100,6 +1482,111 @@ impl MonitoringEngine {
         }
     }
 
+    fn time_stop_v2_evidence(
+        source: PriceTruthSource,
+        latest: Option<&MarketSnapshot>,
+        now_ms: u64,
+    ) -> PriceTruthEvidence {
+        match latest {
+            Some(snapshot) => PriceTruthEvidence {
+                source,
+                status: PriceTruthStatus::Resolved,
+                detail: Some("time_stop_v2_observe_only_window".to_string()),
+                slot: snapshot.slot,
+                timestamp_ms: Some(snapshot.timestamp_ms),
+                age_ms: Some(now_ms.saturating_sub(snapshot.timestamp_ms)),
+                price_state: Some(snapshot.price_state),
+                price_reason: snapshot.price_reason,
+            },
+            None => PriceTruthEvidence {
+                source,
+                status: PriceTruthStatus::Failure,
+                detail: Some("time_stop_v2_observe_only_window_without_market_sample".to_string()),
+                slot: None,
+                timestamp_ms: Some(now_ms),
+                age_ms: None,
+                price_state: None,
+                price_reason: None,
+            },
+        }
+    }
+
+    fn apply_time_stop_v2_evaluation_to_record(
+        record: &mut ShadowLifecycleRecord,
+        evaluation: &TimeStopV2Evaluation,
+    ) {
+        record.time_stop_v2_mode = Some(evaluation.mode);
+        record.time_stop_v2_window_index = Some(evaluation.window_index);
+        record.time_stop_v2_scheduled_check_ms = Some(evaluation.scheduled_check_ms);
+        record.time_stop_v2_position_age_ms = Some(evaluation.position_age_ms);
+        record.time_stop_v2_status = Some(evaluation.status);
+        record.time_stop_v2_subreason = Some(evaluation.subreason);
+        record.time_stop_v2_failed_windows = Some(evaluation.failed_windows);
+        record.time_stop_v2_candidate = Some(evaluation.candidate);
+        record.time_stop_v2_candidate_ts_ms = evaluation.candidate_ts_ms;
+        record.time_stop_v2_candidate_subreason = evaluation.candidate_subreason;
+        record.time_stop_v2_price_delta_pct_window = evaluation.price_delta_pct_window;
+        record.time_stop_v2_price_delta_pct_from_entry = evaluation.price_delta_pct_from_entry;
+        record.time_stop_v2_mcap_delta_pct_window = evaluation.mcap_delta_pct_window;
+        record.time_stop_v2_bonding_delta_pct_window = evaluation.bonding_delta_pct_window;
+        record.time_stop_v2_tx_delta_window = evaluation.tx_delta_window;
+        record.time_stop_v2_volume_delta_sol_window = evaluation.volume_delta_sol_window;
+        record.time_stop_v2_avg_volume_per_tx_sol_window = evaluation.avg_volume_per_tx_sol_window;
+        record.time_stop_v2_checkpoint_slot = evaluation.checkpoint_slot;
+        record.time_stop_v2_latest_slot = evaluation.latest_slot;
+        record.time_stop_v2_checkpoint_timestamp_ms = evaluation.checkpoint_timestamp_ms;
+        record.time_stop_v2_latest_timestamp_ms = evaluation.latest_timestamp_ms;
+    }
+
+    fn evaluate_time_stop_v2_observe_only(
+        &self,
+        base_mint: &Pubkey,
+        latest: Option<&MarketSnapshot>,
+        now_ms: u64,
+    ) {
+        let cfg = self.config.time_stop_v2.clone();
+        if !cfg.enabled {
+            return;
+        }
+
+        let mut record_to_emit = None;
+        {
+            let mut positions = self.positions.write();
+            let Some(pos) = positions.get_mut(base_mint) else {
+                return;
+            };
+            if !matches!(pos.lane, Lane::Shadow) {
+                return;
+            }
+
+            let entry_unix_ms = pos.entry_unix_ms;
+            let entry_price_sol = pos.entry_price_sol;
+            let snapshot_source = pos.last_snapshot_source;
+            let Some(evaluation) =
+                pos.time_stop_v2
+                    .evaluate(&cfg, entry_unix_ms, entry_price_sol, latest, now_ms)
+            else {
+                return;
+            };
+
+            if cfg.emit_window_records {
+                let evidence = Self::time_stop_v2_evidence(snapshot_source, latest, now_ms);
+                let mut record = self.shadow_lifecycle_record_base(
+                    pos,
+                    ShadowLifecycleRecordType::TimeStopV2Window,
+                    now_ms,
+                    &evidence,
+                );
+                Self::apply_time_stop_v2_evaluation_to_record(&mut record, &evaluation);
+                record_to_emit = Some(record);
+            }
+        }
+
+        if let Some(record) = record_to_emit {
+            self.append_shadow_lifecycle_record(&record);
+        }
+    }
+
     fn shadow_lifecycle_record_base(
         &self,
         pos: &MonitoredPosition,
@@ -1107,6 +1594,8 @@ impl MonitoringEngine {
         now_ms: u64,
         evidence: &PriceTruthEvidence,
     ) -> ShadowLifecycleRecord {
+        let exit_landed_slot = synthetic_next_slot(evidence.slot);
+        let time_stop_v2_observed = pos.time_stop_v2.has_observed();
         ShadowLifecycleRecord {
             ab_record_id: pos.join_metadata.ab_record_id.clone(),
             source_ab_record_id: pos.join_metadata.source_ab_record_id.clone(),
@@ -1134,6 +1623,15 @@ impl MonitoringEngine {
             entry_order_id: pos.entry_order_id.clone(),
             quote_id: pos.quote_id.clone(),
             entry_slot: pos.slot,
+            entry_simulation_rpc_slot: pos.join_metadata.entry_simulation_rpc_slot,
+            entry_market_anchor_slot: pos.join_metadata.entry_market_anchor_slot,
+            entry_market_anchor_tx_signature: pos
+                .join_metadata
+                .entry_market_anchor_tx_signature
+                .clone(),
+            entry_market_anchor_source: pos.join_metadata.entry_market_anchor_source.clone(),
+            entry_landed_slot: pos.join_metadata.entry_landed_slot,
+            entry_landed_slot_source: pos.join_metadata.entry_landed_slot_source.clone(),
             fraction_bps: None,
             remaining_fraction_bps: pos.remaining_fraction_bps,
             entry_price: pos.entry_price_sol,
@@ -1151,11 +1649,50 @@ impl MonitoringEngine {
             truth_source: evidence.source,
             truth_status: evidence.status,
             truth_detail: evidence.detail.clone(),
+            exit_sample_slot: evidence.slot,
+            exit_market_anchor_slot: evidence.slot,
+            exit_market_anchor_tx_signature: None,
+            exit_market_anchor_source: Some(evidence.source),
+            exit_reason_evaluation_ts_ms: Some(now_ms),
+            exit_landed_slot,
+            exit_landed_slot_source: exit_landed_slot
+                .map(|_| "synthetic_next_slot_after_exit_sample".to_string()),
             sample_slot: evidence.slot,
             sample_timestamp_ms: evidence.timestamp_ms,
             sample_age_ms: evidence.age_ms,
             sample_price_state: evidence.price_state,
             sample_price_reason: evidence.price_reason,
+            time_stop_v2_mode: None,
+            time_stop_v2_window_index: None,
+            time_stop_v2_scheduled_check_ms: None,
+            time_stop_v2_position_age_ms: None,
+            time_stop_v2_status: if time_stop_v2_observed {
+                pos.time_stop_v2.last_status
+            } else {
+                None
+            },
+            time_stop_v2_subreason: if time_stop_v2_observed {
+                pos.time_stop_v2.last_subreason
+            } else {
+                None
+            },
+            time_stop_v2_failed_windows: time_stop_v2_observed
+                .then_some(pos.time_stop_v2.failed_windows),
+            time_stop_v2_candidate: time_stop_v2_observed
+                .then_some(pos.time_stop_v2.candidate_emitted),
+            time_stop_v2_candidate_ts_ms: pos.time_stop_v2.candidate_ts_ms,
+            time_stop_v2_candidate_subreason: pos.time_stop_v2.candidate_subreason,
+            time_stop_v2_price_delta_pct_window: None,
+            time_stop_v2_price_delta_pct_from_entry: None,
+            time_stop_v2_mcap_delta_pct_window: None,
+            time_stop_v2_bonding_delta_pct_window: None,
+            time_stop_v2_tx_delta_window: None,
+            time_stop_v2_volume_delta_sol_window: None,
+            time_stop_v2_avg_volume_per_tx_sol_window: None,
+            time_stop_v2_checkpoint_slot: None,
+            time_stop_v2_latest_slot: None,
+            time_stop_v2_checkpoint_timestamp_ms: None,
+            time_stop_v2_latest_timestamp_ms: None,
         }
     }
 
@@ -1313,14 +1850,22 @@ impl MonitoringEngine {
                 .unwrap_or(Lane::Single),
             position_id: None,
             position_epoch: None,
+            opened_at_ms: None,
         });
+        let opened_at_ms = event_context
+            .opened_at_ms
+            .filter(|timestamp_ms| *timestamp_ms > 0)
+            .unwrap_or(now_ms);
         let position_id = event_context
             .position_id
             .clone()
             .unwrap_or_else(|| format!("{}:{}:{}", pool_amm_id, base_mint, now_ms));
         let position_epoch = event_context.position_epoch.unwrap_or(1_u64);
-        let shadow_market_activity =
-            ShadowMarketActivityAnchor::from_registration(now_ms, initial_shadow_snapshot.as_ref());
+        let shadow_market_activity = ShadowMarketActivityAnchor::from_registration(
+            opened_at_ms,
+            initial_shadow_snapshot.as_ref(),
+        );
+        let time_stop_v2 = TimeStopV2State::from_registration(initial_shadow_snapshot.as_ref());
         let position = MonitoredPosition {
             candidate_id: event_context.candidate_id.clone(),
             lane: event_context.lane,
@@ -1328,7 +1873,7 @@ impl MonitoringEngine {
             base_mint,
             bonding_curve,
             entry_time: Instant::now(),
-            entry_unix_ms: now_ms,
+            entry_unix_ms: opened_at_ms,
             entry_price_sol,
             entry_size_lamports: entry_amount_lamports.unwrap_or(0),
             entry_token_amount_raw: entry_token_amount_raw.unwrap_or(0),
@@ -1340,7 +1885,7 @@ impl MonitoringEngine {
             quote_id: event_context.quote_id.clone(),
             slot: event_context.slot,
             peak_since_entry: entry_price_sol.unwrap_or(0.0),
-            last_peak_unix_ms: now_ms,
+            last_peak_unix_ms: opened_at_ms,
             aem_registered: false,
             runtime_registered: false,
             last_stress_bucket: None,
@@ -1364,6 +1909,7 @@ impl MonitoringEngine {
             last_snapshot_source: self.default_snapshot_source(),
             last_shadow_snapshot: initial_shadow_snapshot,
             shadow_market_activity,
+            time_stop_v2,
             snapshot_timeline,
         };
 
@@ -1381,7 +1927,7 @@ impl MonitoringEngine {
             &event_context.quote_id,
             event_context.slot,
             entry_price_sol,
-            now_ms,
+            opened_at_ms,
             entry_token_amount_raw.unwrap_or(0),
             entry_amount_lamports.unwrap_or(0),
         );
@@ -1389,7 +1935,7 @@ impl MonitoringEngine {
         Some(RegisteredPosition {
             position_id,
             position_epoch,
-            opened_at_ms: now_ms,
+            opened_at_ms,
         })
     }
 
@@ -1401,14 +1947,14 @@ impl MonitoringEngine {
                 let mut rt = runtime.lock();
                 let _ = rt.unregister_position(&pos.position_id);
             }
-            let duration = pos.entry_time.elapsed();
-            self.emit_position_closed(&pos, duration.as_millis().min(u128::from(u64::MAX)) as u64);
+            let duration_ms = current_time_ms().saturating_sub(pos.entry_unix_ms);
             info!(
                 "🛡️ PostBuyGuardian: Stopped monitoring mint={} (held {:.1}s, signals={})",
                 base_mint,
-                duration.as_secs_f64(),
+                duration_ms as f64 / 1000.0,
                 pos.recent_signals.len()
             );
+            self.emit_position_closed(&pos, duration_ms);
         }
     }
 
@@ -1618,9 +2164,11 @@ impl MonitoringEngine {
                     let runtime_snapshot = self.current_runtime_shadow_snapshot(base_mint, now_ms);
                     if let Some(snapshot) = runtime_snapshot.as_ref() {
                         self.remember_shadow_snapshot(base_mint, snapshot);
+                        self.evaluate_time_stop_v2_observe_only(base_mint, Some(snapshot), now_ms);
                         self.run_shadow_runtime_tick(base_mint, Some(snapshot), now_ms)
                             .await;
                     } else {
+                        self.evaluate_time_stop_v2_observe_only(base_mint, None, now_ms);
                         self.run_shadow_runtime_tick(base_mint, None, now_ms).await;
                     }
                     continue;
@@ -1632,6 +2180,7 @@ impl MonitoringEngine {
                 self.refresh_shadow_time_stop_anchor(base_mint).await;
             }
             self.remember_shadow_snapshot(base_mint, latest);
+            self.evaluate_time_stop_v2_observe_only(base_mint, Some(latest), now_ms);
 
             // ── MODULE 1: LIGMA (liquidity check) ────────────────────
             self.run_ligma_check(base_mint, latest, now_ms).await;
@@ -2790,7 +3339,7 @@ impl MonitoringEngine {
         };
 
         let inactivity_elapsed_ms = now_ms.saturating_sub(last_market_activity_seen_ms);
-        let time_stop_due = inactivity_elapsed_ms >= SHADOW_POSITION_TIME_STOP_MS;
+        let time_stop_due = inactivity_elapsed_ms >= self.shadow_position_time_stop_ms();
         let latest_snapshot = latest.cloned();
         let Some(latest_snapshot) = latest_snapshot else {
             if time_stop_due {
@@ -3113,7 +3662,7 @@ impl MonitoringEngine {
         };
 
         let inactivity_elapsed_ms = now_ms.saturating_sub(last_market_activity_seen_ms);
-        let time_stop_due = inactivity_elapsed_ms >= SHADOW_POSITION_TIME_STOP_MS;
+        let time_stop_due = inactivity_elapsed_ms >= self.shadow_position_time_stop_ms();
         let latest_snapshot = latest.cloned();
         let Some(latest_snapshot) = latest_snapshot else {
             if time_stop_due {
@@ -3824,6 +4373,10 @@ fn current_time_ms() -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
+fn synthetic_next_slot(slot: Option<u64>) -> Option<u64> {
+    slot.and_then(|slot| slot.checked_add(1))
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════
@@ -4081,6 +4634,7 @@ mod tests {
                 lane: Lane::Shadow,
                 position_id: Some("shadow:test:1".to_string()),
                 position_epoch: Some(1),
+                opened_at_ms: None,
             }),
         );
         assert!(registered.is_some());
@@ -4136,6 +4690,7 @@ mod tests {
                 lane: Lane::Shadow,
                 position_id: Some("shadow:test:gap".to_string()),
                 position_epoch: Some(3),
+                opened_at_ms: None,
             }),
         );
         assert!(registered.is_some());
@@ -4199,6 +4754,7 @@ mod tests {
                 lane: Lane::Shadow,
                 position_id: Some("shadow:test:join".to_string()),
                 position_epoch: Some(5),
+                opened_at_ms: None,
             }),
         );
         assert!(registered.is_some());
@@ -4255,7 +4811,16 @@ mod tests {
             Some(1_000_000_000),
             Some(1_000_000),
             Some(PositionEventContext {
-                join_metadata: PositionJoinMetadata::default(),
+                join_metadata: PositionJoinMetadata {
+                    entry_simulation_rpc_slot: Some(77),
+                    entry_market_anchor_slot: Some(77),
+                    entry_market_anchor_source: Some("shadow_simulation_rpc_context".to_string()),
+                    entry_landed_slot: Some(78),
+                    entry_landed_slot_source: Some(
+                        "synthetic_next_slot_after_entry_simulation_rpc_slot".to_string(),
+                    ),
+                    ..Default::default()
+                },
                 candidate_id: "cand-shadow-close".to_string(),
                 entry_order_id: "shadow-entry-close".to_string(),
                 quote_id: "shadow-quote-close".to_string(),
@@ -4263,6 +4828,7 @@ mod tests {
                 lane: Lane::Shadow,
                 position_id: Some("shadow:test:close".to_string()),
                 position_epoch: Some(4),
+                opened_at_ms: None,
             }),
         );
         assert!(registered.is_some());
@@ -4290,6 +4856,40 @@ mod tests {
             .expect("flush events");
 
         let lifecycle_rows = read_jsonl_rows(&lifecycle_log);
+        let exit_filled_row = lifecycle_rows
+            .iter()
+            .find(|row| row.get("record_type") == Some(&Value::String("exit_filled".to_string())))
+            .expect("exit_filled lifecycle proof");
+        assert_eq!(exit_filled_row["entry_simulation_rpc_slot"], 77);
+        assert_eq!(exit_filled_row["entry_market_anchor_slot"], 77);
+        assert_eq!(
+            exit_filled_row["entry_market_anchor_source"],
+            "shadow_simulation_rpc_context"
+        );
+        assert!(exit_filled_row
+            .get("entry_market_anchor_tx_signature")
+            .is_none());
+        assert_eq!(exit_filled_row["entry_landed_slot"], 78);
+        assert_eq!(
+            exit_filled_row["entry_landed_slot_source"],
+            "synthetic_next_slot_after_entry_simulation_rpc_slot"
+        );
+        assert_eq!(exit_filled_row["exit_sample_slot"], 99);
+        assert_eq!(exit_filled_row["exit_market_anchor_slot"], 99);
+        assert!(exit_filled_row
+            .get("exit_market_anchor_tx_signature")
+            .is_none());
+        assert!(exit_filled_row["exit_market_anchor_source"]
+            .as_str()
+            .is_some());
+        assert!(exit_filled_row["exit_reason_evaluation_ts_ms"]
+            .as_u64()
+            .is_some());
+        assert_eq!(exit_filled_row["exit_landed_slot"], 100);
+        assert_eq!(
+            exit_filled_row["exit_landed_slot_source"],
+            "synthetic_next_slot_after_exit_sample"
+        );
         assert!(
             lifecycle_rows.iter().any(|row| {
                 row.get("record_type") == Some(&Value::String("exit_filled".to_string()))
@@ -4402,6 +5002,7 @@ mod tests {
                 lane: Lane::Shadow,
                 position_id: Some("shadow:test:simple-tp".to_string()),
                 position_epoch: Some(5),
+                opened_at_ms: None,
             }),
         );
         assert!(registered.is_some());
@@ -4478,6 +5079,7 @@ mod tests {
                 lane: Lane::Shadow,
                 position_id: Some("shadow:test:simple-sl".to_string()),
                 position_epoch: Some(6),
+                opened_at_ms: None,
             }),
         );
         assert!(registered.is_some());
@@ -4518,6 +5120,354 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn shadow_simple_exit_thresholds_allow_target_above_100_percent() {
+        let thresholds = ShadowSimpleExitThresholds::new(1.5, 0.5);
+        let (upper, lower) = thresholds
+            .prices_for_entry(1.0)
+            .expect("thresholds should produce prices");
+
+        assert_eq!(upper, 2.5);
+        assert_eq!(lower, 0.5);
+        assert_eq!(
+            MonitoringEngine::determine_shadow_simple_exit_trigger(2.4, upper, lower, true),
+            Some(ShadowSimpleExitTrigger::TimeStop)
+        );
+        assert_eq!(
+            MonitoringEngine::determine_shadow_simple_exit_trigger(2.5, upper, lower, false),
+            Some(ShadowSimpleExitTrigger::TakeProfit)
+        );
+    }
+
+    #[test]
+    fn monitoring_engine_uses_configured_timestop_ms() {
+        let mut config = PostBuyGuardianConfig::default();
+        config.wait_for_timestop = Some(12_345);
+        let shadow_ledger = Arc::new(ShadowLedger::new());
+        let (tx, _rx) = mpsc::channel(16);
+        let engine = MonitoringEngine::new(config, shadow_ledger, tx);
+
+        assert_eq!(engine.shadow_position_time_stop_ms(), 12_345);
+    }
+
+    fn time_stop_v2_test_snapshot(
+        slot: u64,
+        timestamp_ms: u64,
+        price_sol_per_token: f64,
+        market_cap_sol: f64,
+        bonding_progress_pct: f64,
+        tx_count: u64,
+        cum_volume_sol: f64,
+    ) -> MarketSnapshot {
+        MarketSnapshot {
+            slot: Some(slot),
+            timestamp_ms,
+            price_sol_per_token,
+            price_state: PriceState::Valid,
+            market_cap_sol,
+            reserve_base: 1_000_000.0,
+            reserve_quote: market_cap_sol.max(0.0),
+            bonding_progress_pct,
+            tx_count,
+            cum_volume_sol,
+            ..MarketSnapshot::default()
+        }
+    }
+
+    fn register_time_stop_v2_shadow_position(
+        engine: &MonitoringEngine,
+        mint: Pubkey,
+        opened_at_ms: u64,
+        initial_snapshot: &MarketSnapshot,
+        join_metadata: PositionJoinMetadata,
+    ) {
+        let registered = engine.register_position_with_context(
+            Pubkey::new_unique(),
+            mint,
+            Pubkey::new_unique(),
+            Some(initial_snapshot.price_sol_per_token),
+            Some(1_000_000_000),
+            Some(1_000_000),
+            Some(PositionEventContext {
+                join_metadata,
+                candidate_id: "cand-time-stop-v2".to_string(),
+                entry_order_id: "shadow-entry-time-stop-v2".to_string(),
+                quote_id: "shadow-quote-time-stop-v2".to_string(),
+                slot: initial_snapshot.slot,
+                lane: Lane::Shadow,
+                position_id: Some("shadow:test:time-stop-v2".to_string()),
+                position_epoch: Some(1),
+                opened_at_ms: Some(opened_at_ms),
+            }),
+        );
+        assert!(registered.is_some());
+
+        let mut positions = engine.positions.write();
+        let pos = positions.get_mut(&mint).expect("monitored position");
+        pos.time_stop_v2 = TimeStopV2State::from_registration(Some(initial_snapshot));
+        pos.last_snapshot_source = PriceTruthSource::ShadowLedgerSnapshot;
+    }
+
+    #[test]
+    fn time_stop_v2_default_disabled_emits_no_window_rows() {
+        let tmp = TempDir::new().expect("tempdir");
+        let lifecycle_log = tmp.path().join("shadow_lifecycle.jsonl");
+
+        let config = PostBuyGuardianConfig::default();
+        let shadow_ledger = Arc::new(ShadowLedger::new());
+        let (tx, _rx) = mpsc::channel(16);
+        let mut engine = MonitoringEngine::new(config, Arc::clone(&shadow_ledger), tx);
+        engine.set_shadow_lifecycle_log_path(Some(lifecycle_log.clone()));
+        let engine = Arc::new(engine);
+
+        let mint = Pubkey::new_unique();
+        let opened_at_ms = 1_000;
+        let initial = time_stop_v2_test_snapshot(1, opened_at_ms, 1.0, 100.0, 10.0, 0, 0.0);
+        register_time_stop_v2_shadow_position(
+            &engine,
+            mint,
+            opened_at_ms,
+            &initial,
+            PositionJoinMetadata::default(),
+        );
+
+        let latest = time_stop_v2_test_snapshot(2, 4_000, 1.001, 100.05, 10.01, 1, 0.01);
+        engine.evaluate_time_stop_v2_observe_only(&mint, Some(&latest), 4_000);
+
+        assert_eq!(engine.active_position_count(), 1);
+        assert!(
+            read_jsonl_rows(&lifecycle_log).is_empty(),
+            "disabled TimeStop V2 must not emit lifecycle rows"
+        );
+    }
+
+    #[test]
+    fn time_stop_v2_observe_only_emits_candidate_without_closing_position() {
+        let tmp = TempDir::new().expect("tempdir");
+        let lifecycle_log = tmp.path().join("shadow_lifecycle.jsonl");
+
+        let mut config = PostBuyGuardianConfig::default();
+        config.time_stop_v2.enabled = true;
+        config.time_stop_v2.first_check_ms = 3_000;
+        config.time_stop_v2.window_ms = 4_000;
+        config.time_stop_v2.failed_windows_to_signal = 3;
+        config.time_stop_v2.min_age_before_signal_ms = 11_000;
+        let shadow_ledger = Arc::new(ShadowLedger::new());
+        let (tx, _rx) = mpsc::channel(16);
+        let mut engine = MonitoringEngine::new(config, Arc::clone(&shadow_ledger), tx);
+        engine.set_shadow_lifecycle_log_path(Some(lifecycle_log.clone()));
+        let engine = Arc::new(engine);
+
+        let mint = Pubkey::new_unique();
+        let opened_at_ms = 1_000;
+        let initial = time_stop_v2_test_snapshot(1, opened_at_ms, 1.0, 100.0, 10.0, 0, 0.0);
+        register_time_stop_v2_shadow_position(
+            &engine,
+            mint,
+            opened_at_ms,
+            &initial,
+            PositionJoinMetadata {
+                probe_id: Some("probe-time-stop-v2".to_string()),
+                dispatch_source: Some("counterfactual_shadow_probe".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let heartbeat_1 = time_stop_v2_test_snapshot(2, 4_000, 1.001, 100.05, 10.01, 1, 0.01);
+        let heartbeat_2 = time_stop_v2_test_snapshot(3, 8_000, 1.002, 100.10, 10.02, 2, 0.02);
+        let heartbeat_3 = time_stop_v2_test_snapshot(4, 12_000, 1.003, 100.15, 10.03, 3, 0.03);
+
+        engine.evaluate_time_stop_v2_observe_only(&mint, Some(&heartbeat_1), 4_000);
+        engine.evaluate_time_stop_v2_observe_only(&mint, Some(&heartbeat_2), 8_000);
+        engine.evaluate_time_stop_v2_observe_only(&mint, Some(&heartbeat_3), 12_000);
+
+        assert_eq!(
+            engine.active_position_count(),
+            1,
+            "observe-only candidate must not close the monitored position"
+        );
+
+        let rows = read_jsonl_rows(&lifecycle_log);
+        let window_rows: Vec<_> = rows
+            .iter()
+            .filter(|row| {
+                row.get("record_type") == Some(&Value::String("time_stop_v2_window".to_string()))
+            })
+            .collect();
+        assert_eq!(
+            window_rows.len(),
+            3,
+            "expected three V2 window rows: {rows:?}"
+        );
+        let last = window_rows.last().expect("last V2 row");
+        assert_eq!(last["probe_id"], "probe-time-stop-v2");
+        assert_eq!(last["dispatch_source"], "counterfactual_shadow_probe");
+        assert_eq!(last["time_stop_v2_mode"], "observe_only");
+        assert_eq!(last["time_stop_v2_status"], "heartbeat");
+        assert_eq!(
+            last["time_stop_v2_subreason"],
+            "micro_tx_heartbeat_no_price_progress"
+        );
+        assert_eq!(last["time_stop_v2_failed_windows"], 3);
+        assert_eq!(last["time_stop_v2_candidate"], true);
+        assert_eq!(last["time_stop_v2_window_index"], 2);
+        assert_eq!(last["time_stop_v2_candidate_ts_ms"], 12_000);
+        assert_eq!(
+            last["time_stop_v2_candidate_subreason"],
+            "micro_tx_heartbeat_no_price_progress"
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row.get("record_type")
+                    != Some(&Value::String("position_closed".to_string()))),
+            "observe-only V2 must not emit position_closed: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn time_stop_v2_alive_window_resets_failed_windows() {
+        let tmp = TempDir::new().expect("tempdir");
+        let lifecycle_log = tmp.path().join("shadow_lifecycle.jsonl");
+
+        let mut config = PostBuyGuardianConfig::default();
+        config.time_stop_v2.enabled = true;
+        config.time_stop_v2.first_check_ms = 3_000;
+        config.time_stop_v2.window_ms = 4_000;
+        config.time_stop_v2.failed_windows_to_signal = 2;
+        config.time_stop_v2.min_age_before_signal_ms = 7_000;
+        let shadow_ledger = Arc::new(ShadowLedger::new());
+        let (tx, _rx) = mpsc::channel(16);
+        let mut engine = MonitoringEngine::new(config, Arc::clone(&shadow_ledger), tx);
+        engine.set_shadow_lifecycle_log_path(Some(lifecycle_log.clone()));
+        let engine = Arc::new(engine);
+
+        let mint = Pubkey::new_unique();
+        let opened_at_ms = 1_000;
+        let initial = time_stop_v2_test_snapshot(1, opened_at_ms, 1.0, 100.0, 10.0, 0, 0.0);
+        register_time_stop_v2_shadow_position(
+            &engine,
+            mint,
+            opened_at_ms,
+            &initial,
+            PositionJoinMetadata::default(),
+        );
+
+        let weak = time_stop_v2_test_snapshot(2, 4_000, 1.001, 100.05, 10.01, 0, 0.0);
+        let alive = time_stop_v2_test_snapshot(3, 8_000, 1.060, 106.0, 10.90, 3, 1.2);
+
+        engine.evaluate_time_stop_v2_observe_only(&mint, Some(&weak), 4_000);
+        engine.evaluate_time_stop_v2_observe_only(&mint, Some(&alive), 8_000);
+
+        let rows = read_jsonl_rows(&lifecycle_log);
+        let window_rows: Vec<_> = rows
+            .iter()
+            .filter(|row| {
+                row.get("record_type") == Some(&Value::String("time_stop_v2_window".to_string()))
+            })
+            .collect();
+        assert_eq!(
+            window_rows.len(),
+            2,
+            "expected two V2 window rows: {rows:?}"
+        );
+        assert_eq!(window_rows[0]["time_stop_v2_status"], "weak");
+        assert_eq!(window_rows[0]["time_stop_v2_failed_windows"], 1);
+        assert_eq!(window_rows[1]["time_stop_v2_status"], "alive");
+        assert_eq!(
+            window_rows[1]["time_stop_v2_subreason"],
+            "alive_meaningful_progress"
+        );
+        assert_eq!(window_rows[1]["time_stop_v2_failed_windows"], 0);
+        assert_eq!(window_rows[1]["time_stop_v2_candidate"], false);
+    }
+
+    #[test]
+    fn time_stop_v2_valid_unchanged_snapshot_emits_zero_delta_weak_window() {
+        let tmp = TempDir::new().expect("tempdir");
+        let lifecycle_log = tmp.path().join("shadow_lifecycle.jsonl");
+
+        let mut config = PostBuyGuardianConfig::default();
+        config.time_stop_v2.enabled = true;
+        config.time_stop_v2.first_check_ms = 3_000;
+        config.time_stop_v2.window_ms = 4_000;
+        let shadow_ledger = Arc::new(ShadowLedger::new());
+        let (tx, _rx) = mpsc::channel(16);
+        let mut engine = MonitoringEngine::new(config, Arc::clone(&shadow_ledger), tx);
+        engine.set_shadow_lifecycle_log_path(Some(lifecycle_log.clone()));
+        let engine = Arc::new(engine);
+
+        let mint = Pubkey::new_unique();
+        let opened_at_ms = 1_000;
+        let initial = time_stop_v2_test_snapshot(1, opened_at_ms, 1.0, 100.0, 10.0, 4, 1.5);
+        register_time_stop_v2_shadow_position(
+            &engine,
+            mint,
+            opened_at_ms,
+            &initial,
+            PositionJoinMetadata::default(),
+        );
+
+        engine.evaluate_time_stop_v2_observe_only(&mint, Some(&initial), 4_000);
+
+        let rows = read_jsonl_rows(&lifecycle_log);
+        let row = rows
+            .iter()
+            .find(|row| {
+                row.get("record_type") == Some(&Value::String("time_stop_v2_window".to_string()))
+            })
+            .expect("time_stop_v2 window row");
+        assert_eq!(row["time_stop_v2_status"], "weak");
+        assert_eq!(row["time_stop_v2_subreason"], "no_new_market_sample");
+        assert_eq!(row["time_stop_v2_tx_delta_window"], 0);
+        assert_eq!(row["time_stop_v2_volume_delta_sol_window"], 0.0);
+        assert_eq!(row["time_stop_v2_price_delta_pct_window"], 0.0);
+        assert_eq!(row["time_stop_v2_mcap_delta_pct_window"], 0.0);
+        assert_eq!(row["time_stop_v2_bonding_delta_pct_window"], 0.0);
+    }
+
+    #[test]
+    fn time_stop_v2_invalid_snapshot_remains_stale_or_insufficient() {
+        let tmp = TempDir::new().expect("tempdir");
+        let lifecycle_log = tmp.path().join("shadow_lifecycle.jsonl");
+
+        let mut config = PostBuyGuardianConfig::default();
+        config.time_stop_v2.enabled = true;
+        config.time_stop_v2.first_check_ms = 3_000;
+        config.time_stop_v2.window_ms = 4_000;
+        let shadow_ledger = Arc::new(ShadowLedger::new());
+        let (tx, _rx) = mpsc::channel(16);
+        let mut engine = MonitoringEngine::new(config, Arc::clone(&shadow_ledger), tx);
+        engine.set_shadow_lifecycle_log_path(Some(lifecycle_log.clone()));
+        let engine = Arc::new(engine);
+
+        let mint = Pubkey::new_unique();
+        let opened_at_ms = 1_000;
+        let initial = time_stop_v2_test_snapshot(1, opened_at_ms, 1.0, 100.0, 10.0, 4, 1.5);
+        register_time_stop_v2_shadow_position(
+            &engine,
+            mint,
+            opened_at_ms,
+            &initial,
+            PositionJoinMetadata::default(),
+        );
+
+        let mut invalid = time_stop_v2_test_snapshot(2, 4_000, 0.0, 0.0, 10.0, 5, 2.0);
+        invalid.price_state = PriceState::Unknown;
+        invalid.price_reason = Some(PriceReason::MissingPriceData);
+
+        engine.evaluate_time_stop_v2_observe_only(&mint, Some(&invalid), 4_000);
+
+        let rows = read_jsonl_rows(&lifecycle_log);
+        let row = rows
+            .iter()
+            .find(|row| {
+                row.get("record_type") == Some(&Value::String("time_stop_v2_window".to_string()))
+            })
+            .expect("time_stop_v2 window row");
+        assert_eq!(row["time_stop_v2_status"], "stale_or_insufficient");
+        assert_eq!(row["time_stop_v2_subreason"], "invalid_market_sample");
+    }
+
     #[tokio::test]
     async fn shadow_runtime_time_stop_closes_dead_zone_position() {
         let tmp = TempDir::new().expect("tempdir");
@@ -4553,6 +5503,7 @@ mod tests {
                 lane: Lane::Shadow,
                 position_id: Some("shadow:test:time-stop".to_string()),
                 position_epoch: Some(5),
+                opened_at_ms: None,
             }),
         );
         let registered = registered.expect("shadow registration");
@@ -4647,6 +5598,7 @@ mod tests {
                 lane: Lane::Shadow,
                 position_id: Some("shadow:test:expired-time-stop".to_string()),
                 position_epoch: Some(7),
+                opened_at_ms: None,
             }),
         );
         let registered = registered.expect("shadow registration");
@@ -4757,6 +5709,7 @@ mod tests {
                     lane: Lane::Shadow,
                     position_id: Some("shadow:test:inactivity-guard".to_string()),
                     position_epoch: Some(12),
+                    opened_at_ms: None,
                 }),
             )
             .expect("shadow registration");
@@ -4832,6 +5785,7 @@ mod tests {
                 lane: Lane::Shadow,
                 position_id: Some("shadow:test:time-stop-cached".to_string()),
                 position_epoch: Some(6),
+                opened_at_ms: None,
             }),
         );
         let registered = registered.expect("shadow registration");
@@ -4949,6 +5903,7 @@ mod tests {
                     lane: Lane::Shadow,
                     position_id: Some("shadow:test:current-curve".to_string()),
                     position_epoch: Some(8),
+                    opened_at_ms: None,
                 }),
             )
             .expect("shadow registration");
@@ -5074,6 +6029,7 @@ mod tests {
                     lane: Lane::Shadow,
                     position_id: Some("shadow:test:account-state-core".to_string()),
                     position_epoch: Some(9),
+                    opened_at_ms: None,
                 }),
             )
             .expect("shadow registration");
@@ -5203,6 +6159,7 @@ mod tests {
                     lane: Lane::Shadow,
                     position_id: Some("shadow:test:current-canonical-runtime".to_string()),
                     position_epoch: Some(10),
+                    opened_at_ms: None,
                 }),
             )
             .expect("shadow registration");
@@ -5325,6 +6282,7 @@ mod tests {
                     lane: Lane::Shadow,
                     position_id: Some("shadow:test:current-canonical-guard".to_string()),
                     position_epoch: Some(11),
+                    opened_at_ms: None,
                 }),
             )
             .expect("shadow registration");
@@ -5370,6 +6328,7 @@ mod tests {
                     lane: Lane::Shadow,
                     position_id: Some("position-outcome-timeline".to_string()),
                     position_epoch: Some(1),
+                    opened_at_ms: None,
                 }),
             )
             .expect("position registered");
@@ -5454,6 +6413,7 @@ mod tests {
                 lane: Lane::Shadow,
                 position_id: Some("shadow:test:stale-time-stop".to_string()),
                 position_epoch: Some(7),
+                opened_at_ms: None,
             }),
         );
         let registered = registered.expect("shadow registration");
@@ -5543,6 +6503,7 @@ mod tests {
                 lane: Lane::Shadow,
                 position_id: Some("shadow:test:stale".to_string()),
                 position_epoch: Some(2),
+                opened_at_ms: None,
             }),
         );
         assert!(registered.is_some());

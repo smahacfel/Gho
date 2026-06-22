@@ -39,7 +39,7 @@ use ghost_brain::execution::{CandidateRef, Lane};
 use ghost_brain::guardian::post_buy::engine::{PositionEventContext, PositionJoinMetadata};
 use ghost_brain::guardian::post_buy::{
     MonitoringEngine, PositionRuntimeRouter, PostBuyGuardianConfig, ShadowPositionBook,
-    SignalRouter,
+    SignalRouter, TimeStopV2Config,
 };
 use ghost_brain::quotes::{ExecutableQuoteProvider, QuoteProviderConfig};
 use ghost_core::account_state_core::reducer::AccountStateReducer;
@@ -70,6 +70,12 @@ use trigger::{
 const PUMP_TOKEN_DECIMAL_FACTOR: f64 = 1_000_000.0;
 const SHADOW_CANONICAL_HANDOFF_WAIT_MS: u64 = 750;
 const SHADOW_CANONICAL_HANDOFF_POLL_MS: u64 = 25;
+const ENTRY_MARKET_ANCHOR_SOURCE_SHADOW_SIMULATION_RPC_CONTEXT: &str =
+    "shadow_simulation_rpc_context";
+const ENTRY_MARKET_ANCHOR_SOURCE_BUY_LANDED_SLOT: &str = "buy_landed_slot";
+const ENTRY_LANDED_SLOT_SOURCE_SYNTHETIC_AFTER_ENTRY_SIMULATION_RPC_SLOT: &str =
+    "synthetic_next_slot_after_entry_simulation_rpc_slot";
+const ENTRY_LANDED_SLOT_SOURCE_BUY_LANDED_SLOT: &str = "buy_landed_slot";
 
 /// Resources needed for live sell execution via launcher-owned Sender submit.
 #[derive(Clone)]
@@ -169,6 +175,14 @@ pub struct PostBuyRuntimeConfig {
     pub live_exit_take_profit_pct: f64,
     /// Live stop-loss threshold as a fraction of entry price (0.02 = -2%).
     pub live_exit_stop_loss_pct: f64,
+    /// Shadow/probe target threshold from `[post_buy_guardian]` in percentage points.
+    pub shadow_target_threshold: Option<f64>,
+    /// Shadow/probe stop-loss threshold from `[post_buy_guardian]` in percentage points.
+    pub shadow_stoploss_threshold: Option<f64>,
+    /// Shadow/probe TimeStop inactivity timeout from `[post_buy_guardian]` in ms.
+    pub shadow_wait_for_timestop: Option<u64>,
+    /// Shadow/probe TimeStop V2 observe-only config from `[post_buy_guardian.time_stop_v2]`.
+    pub shadow_time_stop_v2: Option<TimeStopV2Config>,
     /// Canonical ShadowLedger shared with the shadow Guardian runtime.
     pub shadow_ledger: Option<Arc<ShadowLedger>>,
     /// Canonical account-state runtime truth shared with shadow guardian.
@@ -196,6 +210,10 @@ impl Default for PostBuyRuntimeConfig {
             slippage_tolerance: 0.20,
             live_exit_take_profit_pct: 0.02,
             live_exit_stop_loss_pct: 0.02,
+            shadow_target_threshold: None,
+            shadow_stoploss_threshold: None,
+            shadow_wait_for_timestop: None,
+            shadow_time_stop_v2: None,
             shadow_ledger: None,
             account_state_core: None,
             shadow_lifecycle_log_path: None,
@@ -216,6 +234,22 @@ impl PostBuyRuntimeConfig {
     fn live_exit_stop_loss_bps(&self) -> u16 {
         percent_fraction_to_bps(self.live_exit_stop_loss_pct)
     }
+
+    fn shadow_take_profit_fraction(&self) -> f64 {
+        percent_points_to_fraction(
+            self.shadow_target_threshold,
+            self.live_exit_take_profit_pct,
+            None,
+        )
+    }
+
+    fn shadow_stop_loss_fraction(&self) -> f64 {
+        percent_points_to_fraction(
+            self.shadow_stoploss_threshold,
+            self.live_exit_stop_loss_pct,
+            Some(100.0),
+        )
+    }
 }
 
 fn slippage_tolerance_to_bps(tolerance: f64) -> u16 {
@@ -229,6 +263,24 @@ fn percent_fraction_to_bps(value: f64) -> u16 {
         0.0
     };
     (clamped * 10_000.0).round() as u16
+}
+
+fn percent_points_to_fraction(
+    value_pct: Option<f64>,
+    fallback_fraction: f64,
+    max_pct: Option<f64>,
+) -> f64 {
+    let Some(value_pct) = value_pct else {
+        return fallback_fraction;
+    };
+    if !value_pct.is_finite() {
+        return fallback_fraction;
+    }
+    let clamped = match max_pct {
+        Some(max_pct) => value_pct.clamp(0.0, max_pct),
+        None => value_pct.max(0.0),
+    };
+    clamped / 100.0
 }
 
 fn now_ms() -> u64 {
@@ -305,11 +357,50 @@ fn shadow_entry_price_from_post_buy(
         .filter(|price| price.is_finite() && *price > 0.0)
 }
 
+fn shadow_entry_timeline_join_metadata(
+    mut metadata: PositionJoinMetadata,
+    entry_simulation_rpc_slot: Option<u64>,
+    buy_landed_slot: Option<u64>,
+) -> PositionJoinMetadata {
+    let entry_simulation_rpc_slot =
+        entry_simulation_rpc_slot.or(metadata.entry_simulation_rpc_slot);
+
+    if let Some(slot) = entry_simulation_rpc_slot {
+        metadata.entry_simulation_rpc_slot = Some(slot);
+        metadata.entry_market_anchor_slot = Some(slot);
+        metadata.entry_market_anchor_tx_signature = None;
+        metadata.entry_market_anchor_source =
+            Some(ENTRY_MARKET_ANCHOR_SOURCE_SHADOW_SIMULATION_RPC_CONTEXT.to_string());
+        metadata.entry_landed_slot = slot.checked_add(1);
+        metadata.entry_landed_slot_source = metadata.entry_landed_slot.map(|_| {
+            ENTRY_LANDED_SLOT_SOURCE_SYNTHETIC_AFTER_ENTRY_SIMULATION_RPC_SLOT.to_string()
+        });
+        return metadata;
+    }
+
+    if let Some(slot) = buy_landed_slot {
+        metadata.entry_market_anchor_slot = Some(slot);
+        metadata.entry_market_anchor_source =
+            Some(ENTRY_MARKET_ANCHOR_SOURCE_BUY_LANDED_SLOT.to_string());
+        metadata.entry_landed_slot = Some(slot);
+        metadata.entry_landed_slot_source =
+            Some(ENTRY_LANDED_SLOT_SOURCE_BUY_LANDED_SLOT.to_string());
+    }
+
+    metadata
+}
+
 fn build_shadow_guardian_config(config: &PostBuyRuntimeConfig) -> PostBuyGuardianConfig {
     let mut guardian = PostBuyGuardianConfig::default();
     guardian.tick_interval_ms = config.tick_interval_ms;
     guardian.max_monitored_positions = config.max_concurrent_positions;
     guardian.aem.t_s = config.aem_t_s;
+    guardian.target_threshold = config.shadow_target_threshold;
+    guardian.stoploss_threshold = config.shadow_stoploss_threshold;
+    guardian.wait_for_timestop = config.shadow_wait_for_timestop;
+    if let Some(time_stop_v2) = config.shadow_time_stop_v2.clone() {
+        guardian.time_stop_v2 = time_stop_v2;
+    }
     guardian
 }
 
@@ -1728,16 +1819,24 @@ pub async fn run(
         match config.shadow_ledger.clone() {
             Some(shadow_ledger) => {
                 let guardian_config = build_shadow_guardian_config(&config);
+                let wait_for_timestop_ms = guardian_config.wait_for_timestop_ms();
                 let (signal_tx, signal_rx) =
                     mpsc::channel(guardian_config.signal_channel_buffer.max(1));
                 let runtime_router = Arc::new(PositionRuntimeRouter::with_shadow_book(Arc::new(
-                    RwLock::new(ShadowPositionBook::new()),
+                    RwLock::new(ShadowPositionBook::with_time_stop_ms(wait_for_timestop_ms)),
                 )));
                 let mut monitoring_engine =
                     MonitoringEngine::new(guardian_config, shadow_ledger, signal_tx);
                 monitoring_engine.set_shadow_simple_exit_thresholds(
-                    config.live_exit_take_profit_pct,
-                    config.live_exit_stop_loss_pct,
+                    config.shadow_take_profit_fraction(),
+                    config.shadow_stop_loss_fraction(),
+                );
+                info!(
+                    runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+                    target_threshold_pct = ?config.shadow_target_threshold,
+                    stoploss_threshold_pct = ?config.shadow_stoploss_threshold,
+                    wait_for_timestop_ms,
+                    "PostBuyRuntime: configured shadow lifecycle close thresholds"
                 );
                 if let Some(account_state_core) = config.account_state_core.clone() {
                     monitoring_engine.set_account_state_core(account_state_core);
@@ -1773,16 +1872,24 @@ pub async fn run(
         ) {
             (Some(shadow_ledger), Some(probe_lifecycle_log_path)) => {
                 let guardian_config = build_shadow_guardian_config(&config);
+                let wait_for_timestop_ms = guardian_config.wait_for_timestop_ms();
                 let (signal_tx, signal_rx) =
                     mpsc::channel(guardian_config.signal_channel_buffer.max(1));
                 let runtime_router = Arc::new(PositionRuntimeRouter::with_shadow_book(Arc::new(
-                    RwLock::new(ShadowPositionBook::new()),
+                    RwLock::new(ShadowPositionBook::with_time_stop_ms(wait_for_timestop_ms)),
                 )));
                 let mut monitoring_engine =
                     MonitoringEngine::new(guardian_config, shadow_ledger, signal_tx);
                 monitoring_engine.set_shadow_simple_exit_thresholds(
-                    config.live_exit_take_profit_pct,
-                    config.live_exit_stop_loss_pct,
+                    config.shadow_take_profit_fraction(),
+                    config.shadow_stop_loss_fraction(),
+                );
+                info!(
+                    runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+                    target_threshold_pct = ?config.shadow_target_threshold,
+                    stoploss_threshold_pct = ?config.shadow_stoploss_threshold,
+                    wait_for_timestop_ms,
+                    "PostBuyRuntime: configured probe lifecycle close thresholds"
                 );
                 if let Some(account_state_core) = config.account_state_core.clone() {
                     monitoring_engine.set_account_state_core(account_state_core);
@@ -2044,6 +2151,8 @@ async fn handle_post_buy_event(
         min_tokens_out,
         entry_token_amount_raw,
         buy_landed_slot,
+        entry_simulation_rpc_slot,
+        entry_opened_at_ms,
         creator_pubkey,
         join_metadata,
     } = event
@@ -2075,6 +2184,7 @@ async fn handle_post_buy_event(
         min_tokens_out = ?min_tokens_out,
         entry_token_amount_raw = ?entry_token_amount_raw,
         buy_landed_slot = ?buy_landed_slot,
+        entry_simulation_rpc_slot = ?entry_simulation_rpc_slot,
         "PostBuyRuntime: received PostBuySubmitted"
     );
 
@@ -2242,6 +2352,8 @@ async fn handle_post_buy_event(
             amount_sol,
             entry_token_amount_raw,
             buy_landed_slot,
+            entry_simulation_rpc_slot,
+            entry_opened_at_ms,
             epoch,
             PositionJoinMetadata {
                 ab_record_id: join_metadata.ab_record_id.clone(),
@@ -2258,6 +2370,7 @@ async fn handle_post_buy_event(
                 session_id: join_metadata.session_id.clone(),
                 brain_config_path: join_metadata.brain_config_path.clone(),
                 brain_config_hash: join_metadata.brain_config_hash.clone(),
+                ..Default::default()
             },
         )
         .await;
@@ -2296,6 +2409,8 @@ async fn handle_post_buy_event(
             amount_sol,
             entry_token_amount_raw,
             buy_landed_slot,
+            entry_simulation_rpc_slot,
+            entry_opened_at_ms,
             epoch,
             PositionJoinMetadata {
                 ab_record_id: join_metadata.ab_record_id.clone(),
@@ -2312,6 +2427,7 @@ async fn handle_post_buy_event(
                 session_id: join_metadata.session_id.clone(),
                 brain_config_path: join_metadata.brain_config_path.clone(),
                 brain_config_hash: join_metadata.brain_config_hash.clone(),
+                ..Default::default()
             },
         )
         .await;
@@ -2397,6 +2513,8 @@ async fn handle_shadow_post_buy_handoff(
     amount_sol: f64,
     entry_token_amount_raw: Option<u64>,
     buy_landed_slot: Option<u64>,
+    entry_simulation_rpc_slot: Option<u64>,
+    entry_opened_at_ms: Option<u64>,
     epoch: u64,
     join_metadata: PositionJoinMetadata,
 ) -> ShadowPostBuyHandoffResult {
@@ -2492,10 +2610,16 @@ async fn handle_shadow_post_buy_handoff(
             candidate_id,
             base_mint,
             buy_landed_slot = ?buy_landed_slot,
+            entry_simulation_rpc_slot = ?entry_simulation_rpc_slot,
             wait_ms = SHADOW_CANONICAL_HANDOFF_WAIT_MS,
             "PostBuyRuntime: shadow handoff timed out waiting for canonical post-buy snapshot; proceeding fail-closed if guardian still cannot seed truth"
         );
     }
+    let join_metadata = shadow_entry_timeline_join_metadata(
+        join_metadata,
+        entry_simulation_rpc_slot,
+        buy_landed_slot,
+    );
     let context = PositionEventContext {
         join_metadata,
         candidate_id: candidate_id.to_string(),
@@ -2505,6 +2629,7 @@ async fn handle_shadow_post_buy_handoff(
         lane: Lane::Shadow,
         position_id: probe_position_id,
         position_epoch: Some(epoch),
+        opened_at_ms: entry_opened_at_ms,
     };
     let registered = shadow_monitor.register_position_with_context(
         pool_pubkey,
@@ -4277,6 +4402,36 @@ mod tests {
     }
 
     #[test]
+    fn shadow_exit_thresholds_use_post_buy_guardian_percent_fields() {
+        let config = PostBuyRuntimeConfig {
+            live_exit_take_profit_pct: 0.02,
+            live_exit_stop_loss_pct: 0.02,
+            shadow_target_threshold: Some(150.0),
+            shadow_stoploss_threshold: Some(50.0),
+            shadow_wait_for_timestop: Some(45_000),
+            ..PostBuyRuntimeConfig::default()
+        };
+
+        assert_eq!(config.shadow_take_profit_fraction(), 1.5);
+        assert_eq!(config.shadow_stop_loss_fraction(), 0.5);
+        let guardian_config = build_shadow_guardian_config(&config);
+        assert_eq!(guardian_config.target_threshold, Some(150.0));
+        assert_eq!(guardian_config.stoploss_threshold, Some(50.0));
+        assert_eq!(guardian_config.wait_for_timestop_ms(), 45_000);
+    }
+
+    #[test]
+    fn shadow_stoploss_percent_is_clamped_to_full_position_loss() {
+        let config = PostBuyRuntimeConfig {
+            live_exit_stop_loss_pct: 0.02,
+            shadow_stoploss_threshold: Some(250.0),
+            ..PostBuyRuntimeConfig::default()
+        };
+
+        assert_eq!(config.shadow_stop_loss_fraction(), 1.0);
+    }
+
+    #[test]
     fn live_exit_trigger_matches_stage1_plus_minus_2_contract() {
         let mint = Pubkey::new_unique();
         let session = seeded_live_exit_session(mint, 10_000_000, 1_500_000);
@@ -4944,6 +5099,10 @@ mod tests {
             slippage_tolerance: 0.20,
             live_exit_take_profit_pct: 0.02,
             live_exit_stop_loss_pct: 0.02,
+            shadow_target_threshold: None,
+            shadow_stoploss_threshold: None,
+            shadow_wait_for_timestop: None,
+            shadow_time_stop_v2: None,
             shadow_ledger: None,
             account_state_core: None,
             shadow_lifecycle_log_path: None,
@@ -5042,6 +5201,10 @@ mod tests {
             slippage_tolerance: 0.20,
             live_exit_take_profit_pct: 0.02,
             live_exit_stop_loss_pct: 0.02,
+            shadow_target_threshold: None,
+            shadow_stoploss_threshold: None,
+            shadow_wait_for_timestop: None,
+            shadow_time_stop_v2: None,
             shadow_ledger: None,
             account_state_core: None,
             shadow_lifecycle_log_path: None,
@@ -5151,6 +5314,10 @@ mod tests {
             slippage_tolerance: 0.20,
             live_exit_take_profit_pct: 0.02,
             live_exit_stop_loss_pct: 0.02,
+            shadow_target_threshold: None,
+            shadow_stoploss_threshold: None,
+            shadow_wait_for_timestop: None,
+            shadow_time_stop_v2: None,
             shadow_ledger: None,
             account_state_core: None,
             shadow_lifecycle_log_path: None,
@@ -5269,6 +5436,7 @@ mod tests {
         let pool_amm_id = Pubkey::new_unique().to_string();
         let base_mint = Pubkey::new_unique().to_string();
         let candidate_id = format!("{}_{}_{}", base_mint, pool_amm_id, 1234);
+        let opened_at_ms = now_ms().saturating_sub(42_000);
         let handoff = handle_shadow_post_buy_handoff(
             Some(&monitoring_engine),
             &candidate_id,
@@ -5277,6 +5445,8 @@ mod tests {
             0.25,
             Some(250_000),
             Some(777),
+            Some(777),
+            Some(opened_at_ms),
             9,
             PositionJoinMetadata::default(),
         )
@@ -5294,10 +5464,12 @@ mod tests {
                     if let Ok(content) = std::fs::read_to_string(&path) {
                         for line in content.lines() {
                             if let Ok(event) = serde_json::from_str::<ExecutionEvent>(line) {
-                                if event.envelope.candidate_id == candidate_id
-                                    && matches!(event.kind, EventKind::PositionOpened(_))
-                                {
-                                    saw_position_opened = true;
+                                if event.envelope.candidate_id == candidate_id {
+                                    if let EventKind::PositionOpened(payload) = event.kind {
+                                        assert_eq!(event.envelope.event_time_ms, opened_at_ms);
+                                        assert_eq!(payload.entry_time_ms, opened_at_ms);
+                                        saw_position_opened = true;
+                                    }
                                 }
                             }
                         }
@@ -5414,7 +5586,8 @@ mod tests {
             Some(777),
             None,
         )
-        .with_execution_join_metadata(join_metadata);
+        .with_execution_join_metadata(join_metadata)
+        .with_entry_simulation_rpc_slot(Some(777));
 
         let mut epoch_counter = 1;
         let mut lifecycle_handles = Vec::new();
@@ -5446,6 +5619,27 @@ mod tests {
                 .expect("valid probe lifecycle json");
         assert_eq!(first_row["probe_id"], probe_id);
         assert_eq!(first_row["dispatch_source"], "counterfactual_shadow_probe");
+        assert_eq!(first_row["entry_simulation_rpc_slot"], 777);
+        assert_eq!(first_row["entry_market_anchor_slot"], 777);
+        assert_eq!(
+            first_row["entry_market_anchor_source"],
+            "shadow_simulation_rpc_context"
+        );
+        assert!(first_row.get("entry_market_anchor_tx_signature").is_none());
+        assert_eq!(first_row["entry_landed_slot"], 778);
+        assert_eq!(
+            first_row["entry_landed_slot_source"],
+            "synthetic_next_slot_after_entry_simulation_rpc_slot"
+        );
+        assert_eq!(first_row["exit_sample_slot"], 777);
+        assert_eq!(first_row["exit_market_anchor_slot"], 777);
+        assert!(first_row.get("exit_market_anchor_tx_signature").is_none());
+        assert!(first_row["exit_reason_evaluation_ts_ms"].as_u64().is_some());
+        assert_eq!(first_row["exit_landed_slot"], 778);
+        assert_eq!(
+            first_row["exit_landed_slot_source"],
+            "synthetic_next_slot_after_exit_sample"
+        );
         assert_eq!(
             first_row["position_id"],
             format!("probe-position:{probe_id}")
@@ -5495,6 +5689,8 @@ mod tests {
             0.25,
             Some(250_000),
             Some(111),
+            Some(111),
+            None,
             1,
             PositionJoinMetadata::default(),
         )
@@ -5512,6 +5708,8 @@ mod tests {
             0.50,
             Some(500_000),
             Some(222),
+            Some(222),
+            None,
             2,
             PositionJoinMetadata::default(),
         )
@@ -5559,6 +5757,8 @@ mod tests {
             0.25,
             Some(250_000),
             Some(777),
+            Some(777),
+            None,
             9,
             PositionJoinMetadata::default(),
         )
@@ -5648,6 +5848,8 @@ mod tests {
             0.25,
             Some(250_000),
             Some(landed_slot),
+            Some(landed_slot),
+            None,
             9,
             PositionJoinMetadata::default(),
         )

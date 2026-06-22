@@ -3,6 +3,7 @@ use crate::session::types::SessionMetadata;
 use crate::tx_intelligence::types::{RiskFlag, SybilResistanceFeatures, TxIntelFeatures};
 use crate::{CurveFinality, CurveFreshnessState};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -102,6 +103,8 @@ impl Default for CurveReadinessFeatures {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AlphaFingerprintFeatures {
     pub avg_inner_ix_count_50tx: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avg_cpi_depth_50tx: Option<f64>,
     pub sell_buy_ratio: Option<f64>,
     pub compute_unit_cluster_dominance: Option<f64>,
     pub static_fee_profile_ratio: Option<f64>,
@@ -150,6 +153,8 @@ pub enum EvidenceDegradedReason {
     FscEvidencePartial,
     OrganicBroadeningInsufficient,
     ManipulationContradictionPartial,
+    DecisionTimeSeriesPricePartial,
+    DecisionTimeSeriesTruncated,
     EvidenceStale,
 }
 
@@ -174,6 +179,439 @@ pub enum EvidenceUnavailableReason {
     ManipulationContradictionMissing,
     ExecutionNotRun,
     NotConfigured,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricEvidenceQuality {
+    Clean,
+    DegradedLowSample,
+    CarriedForward,
+    InsufficientSample,
+    Stale,
+    NotAllowed,
+    UnavailableSource,
+    Unavailable,
+    NotConfigured,
+}
+
+impl Default for MetricEvidenceQuality {
+    fn default() -> Self {
+        Self::Unavailable
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CpvMetricSource {
+    SuccessfulBuyRollingIndex,
+    Unavailable,
+    NotConfigured,
+}
+
+impl Default for CpvMetricSource {
+    fn default() -> Self {
+        Self::Unavailable
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TemporalMetricSource {
+    Observed,
+    CarriedForwardNoEvent,
+    PartialCarriedForward,
+    Stale,
+    NotAllowed,
+    Unavailable,
+    NotConfigured,
+}
+
+impl Default for TemporalMetricSource {
+    fn default() -> Self {
+        Self::Unavailable
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TemporalAnchorReachedBy {
+    Event,
+    ObservationElapsed,
+    Deadline,
+    NotReached,
+}
+
+impl Default for TemporalAnchorReachedBy {
+    fn default() -> Self {
+        Self::NotReached
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionTimeSeriesPriceSource {
+    Reserve,
+    Quote,
+    MarketCap,
+    AccountState,
+    History,
+    CarryForward,
+    Missing,
+}
+
+impl Default for DecisionTimeSeriesPriceSource {
+    fn default() -> Self {
+        Self::Missing
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionTimeSeriesRetentionStatus {
+    Clean,
+    Truncated,
+    Unavailable,
+}
+
+impl Default for DecisionTimeSeriesRetentionStatus {
+    fn default() -> Self {
+        Self::Unavailable
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionTimeSeriesRetentionPolicy {
+    TruncateWithStatus,
+}
+
+impl Default for DecisionTimeSeriesRetentionPolicy {
+    fn default() -> Self {
+        Self::TruncateWithStatus
+    }
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecisionTimeSeriesSourceCounts {
+    #[serde(default)]
+    pub reserve: u64,
+    #[serde(default)]
+    pub quote: u64,
+    #[serde(default)]
+    pub market_cap: u64,
+    #[serde(default)]
+    pub account_state: u64,
+    #[serde(default)]
+    pub history: u64,
+    #[serde(default)]
+    pub carry_forward: u64,
+    #[serde(default)]
+    pub missing: u64,
+}
+
+impl DecisionTimeSeriesSourceCounts {
+    pub fn increment(&mut self, source: DecisionTimeSeriesPriceSource) {
+        match source {
+            DecisionTimeSeriesPriceSource::Reserve => self.reserve = self.reserve.saturating_add(1),
+            DecisionTimeSeriesPriceSource::Quote => self.quote = self.quote.saturating_add(1),
+            DecisionTimeSeriesPriceSource::MarketCap => {
+                self.market_cap = self.market_cap.saturating_add(1)
+            }
+            DecisionTimeSeriesPriceSource::AccountState => {
+                self.account_state = self.account_state.saturating_add(1)
+            }
+            DecisionTimeSeriesPriceSource::History => self.history = self.history.saturating_add(1),
+            DecisionTimeSeriesPriceSource::CarryForward => {
+                self.carry_forward = self.carry_forward.saturating_add(1)
+            }
+            DecisionTimeSeriesPriceSource::Missing => self.missing = self.missing.saturating_add(1),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DecisionTimeSeriesFeatures {
+    #[serde(default)]
+    pub status: EvidenceStatus,
+    #[serde(default)]
+    pub retention_status: DecisionTimeSeriesRetentionStatus,
+    #[serde(default)]
+    pub retention_policy: DecisionTimeSeriesRetentionPolicy,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub retention_capacity: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub retained_sample_count: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub total_tx_count: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub dropped_oldest_count: u64,
+    #[serde(default)]
+    pub sample_count: u64,
+    #[serde(default)]
+    pub finite_price_count: u64,
+    #[serde(default)]
+    pub missing_price_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_coverage_ratio: Option<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ts_offsets_ms: Vec<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sol_amounts: Vec<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prices: Vec<Option<f64>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub price_sources: Vec<DecisionTimeSeriesPriceSource>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interval_ms: Vec<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub d_price: Vec<Option<f64>>,
+    #[serde(default)]
+    pub source_counts: DecisionTimeSeriesSourceCounts,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub degraded_reasons: Vec<EvidenceDegradedReason>,
+}
+
+impl Default for DecisionTimeSeriesFeatures {
+    fn default() -> Self {
+        Self {
+            status: EvidenceStatus::Unavailable,
+            retention_status: DecisionTimeSeriesRetentionStatus::Unavailable,
+            retention_policy: DecisionTimeSeriesRetentionPolicy::TruncateWithStatus,
+            retention_capacity: 0,
+            retained_sample_count: 0,
+            total_tx_count: 0,
+            dropped_oldest_count: 0,
+            sample_count: 0,
+            finite_price_count: 0,
+            missing_price_count: 0,
+            price_coverage_ratio: None,
+            ts_offsets_ms: Vec::new(),
+            sol_amounts: Vec::new(),
+            prices: Vec::new(),
+            price_sources: Vec::new(),
+            interval_ms: Vec::new(),
+            d_price: Vec::new(),
+            source_counts: DecisionTimeSeriesSourceCounts::default(),
+            degraded_reasons: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CpvEvidenceContext {
+    #[serde(default)]
+    pub quality: MetricEvidenceQuality,
+    #[serde(default)]
+    pub source: CpvMetricSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer_cross_pool_velocity: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpv_other_pool_activity: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_clean_sample_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_degraded_sample_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rolling_state_available: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub degraded_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TemporalMetricEvidenceContext {
+    #[serde(default)]
+    pub quality: MetricEvidenceQuality,
+    #[serde(default)]
+    pub source: TemporalMetricSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carried_from_anchor_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staleness_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TemporalAnchorSnapshot {
+    #[serde(default)]
+    pub anchor_ms: u64,
+    #[serde(default)]
+    pub reached: bool,
+    #[serde(default)]
+    pub reached_by: TemporalAnchorReachedBy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_observation_elapsed_ms: Option<u64>,
+    #[serde(default)]
+    pub status: MetricEvidenceQuality,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buy_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unique_signers: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub net_quote_sol: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_volume_sol: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub market_cap_sol: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_pct: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub burst_ratio: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jito_tip_intensity: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer_cross_pool_velocity: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flipper_presence_ratio: Option<f64>,
+    #[serde(default)]
+    pub event_counters_evidence: TemporalMetricEvidenceContext,
+    #[serde(default)]
+    pub state_metrics_evidence: TemporalMetricEvidenceContext,
+    #[serde(default)]
+    pub ratio_metrics_evidence: TemporalMetricEvidenceContext,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TemporalDeltaFeatures {
+    #[serde(default)]
+    pub status: EvidenceStatus,
+    #[serde(default)]
+    pub anchor_1s: TemporalAnchorSnapshot,
+    #[serde(default)]
+    pub anchor_2s: TemporalAnchorSnapshot,
+    #[serde(default)]
+    pub anchor_3s: TemporalAnchorSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_mcap_1s_to_2s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_mcap_1s_to_3s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_mcap_2s_to_3s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_price_pct_1s_to_2s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_price_pct_1s_to_3s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_price_pct_2s_to_3s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_burstratio_1s_to_2s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_burstratio_1s_to_3s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_burstratio_2s_to_3s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_buy_count_1s_to_2s: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_buy_count_1s_to_3s: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_buy_count_2s_to_3s: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_unique_signers_1s_to_2s: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_unique_signers_1s_to_3s: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_unique_signers_2s_to_3s: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_tx_count_1s_to_2s: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_tx_count_1s_to_3s: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_tx_count_2s_to_3s: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_net_quote_sol_1s_to_2s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_net_quote_sol_1s_to_3s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_net_quote_sol_2s_to_3s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_jito_tip_intensity_1s_to_2s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_jito_tip_intensity_1s_to_3s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_signer_cross_pool_velocity_1s_to_2s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_signer_cross_pool_velocity_1s_to_3s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_flipper_presence_ratio_1s_to_2s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_flipper_presence_ratio_1s_to_3s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_mcap_sol_per_s_1s_to_2s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_mcap_sol_per_s_1s_to_3s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_mcap_sol_per_s_2s_to_3s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_buy_count_per_s_1s_to_2s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_buy_count_per_s_1s_to_3s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_unique_signers_per_s_1s_to_2s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_unique_signers_per_s_1s_to_3s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_net_quote_sol_per_s_1s_to_2s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_net_quote_sol_per_s_1s_to_3s: Option<f64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub delta_evidence: BTreeMap<String, TemporalMetricEvidenceContext>,
+}
+
+impl Default for TemporalDeltaFeatures {
+    fn default() -> Self {
+        Self {
+            status: EvidenceStatus::Unavailable,
+            anchor_1s: TemporalAnchorSnapshot::default(),
+            anchor_2s: TemporalAnchorSnapshot::default(),
+            anchor_3s: TemporalAnchorSnapshot::default(),
+            delta_mcap_1s_to_2s: None,
+            delta_mcap_1s_to_3s: None,
+            delta_mcap_2s_to_3s: None,
+            delta_price_pct_1s_to_2s: None,
+            delta_price_pct_1s_to_3s: None,
+            delta_price_pct_2s_to_3s: None,
+            delta_burstratio_1s_to_2s: None,
+            delta_burstratio_1s_to_3s: None,
+            delta_burstratio_2s_to_3s: None,
+            delta_buy_count_1s_to_2s: None,
+            delta_buy_count_1s_to_3s: None,
+            delta_buy_count_2s_to_3s: None,
+            delta_unique_signers_1s_to_2s: None,
+            delta_unique_signers_1s_to_3s: None,
+            delta_unique_signers_2s_to_3s: None,
+            delta_tx_count_1s_to_2s: None,
+            delta_tx_count_1s_to_3s: None,
+            delta_tx_count_2s_to_3s: None,
+            delta_net_quote_sol_1s_to_2s: None,
+            delta_net_quote_sol_1s_to_3s: None,
+            delta_net_quote_sol_2s_to_3s: None,
+            delta_jito_tip_intensity_1s_to_2s: None,
+            delta_jito_tip_intensity_1s_to_3s: None,
+            delta_signer_cross_pool_velocity_1s_to_2s: None,
+            delta_signer_cross_pool_velocity_1s_to_3s: None,
+            delta_flipper_presence_ratio_1s_to_2s: None,
+            delta_flipper_presence_ratio_1s_to_3s: None,
+            rate_mcap_sol_per_s_1s_to_2s: None,
+            rate_mcap_sol_per_s_1s_to_3s: None,
+            rate_mcap_sol_per_s_2s_to_3s: None,
+            rate_buy_count_per_s_1s_to_2s: None,
+            rate_buy_count_per_s_1s_to_3s: None,
+            rate_unique_signers_per_s_1s_to_2s: None,
+            rate_unique_signers_per_s_1s_to_3s: None,
+            rate_net_quote_sol_per_s_1s_to_2s: None,
+            rate_net_quote_sol_per_s_1s_to_3s: None,
+            delta_evidence: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -400,6 +838,12 @@ pub struct MaterializedFeatureSet {
     /// evaluation.
     #[serde(default)]
     pub manipulation_contradictions: ManipulationContradictionFeatures,
+    /// V3 evidence-plane temporal anchor and delta snapshot.
+    #[serde(default)]
+    pub temporal_deltas: TemporalDeltaFeatures,
+    /// V3 evidence-plane full decision-time tick series for DTW/shape audit.
+    #[serde(default)]
+    pub decision_time_series: DecisionTimeSeriesFeatures,
 }
 
 /// Per-segment trajectory snapshot used by Path B to compute TAS and PDD

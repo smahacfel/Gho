@@ -1,11 +1,13 @@
 #[cfg(test)]
 use crate::components::gatekeeper::GatekeeperVerdict;
-use crate::components::gatekeeper::{GatekeeperBuffer, GatekeeperIngressOutcome};
+use crate::components::gatekeeper::{
+    GatekeeperBuffer, GatekeeperIngressOutcome, PUMP_TOKEN_TOTAL_SUPPLY,
+};
 use crate::events::PoolTransaction;
 use crate::tx_intelligence::{
-    compute_sybil_resistance, CrossPoolVelocityConfig, CrossPoolVelocityIndex, FundingSourceConfig,
-    FundingSourceIndex, TxIntelligenceConfig, TxIntelligenceEngine,
-    DEFAULT_SESSION_TX_RING_CAPACITY,
+    compute_sybil_resistance, compute_velocity_profile, CrossPoolVelocityConfig,
+    CrossPoolVelocityIndex, FundingSourceConfig, FundingSourceIndex, TxIntelligenceConfig,
+    TxIntelligenceEngine,
 };
 use ghost_brain::config::GatekeeperV2Config;
 use ghost_brain::fast_pipeline::EnhancedCandidate;
@@ -14,9 +16,13 @@ use ghost_core::account_state_core::types::{AccountStateFeatures, AccountStateUp
 use ghost_core::checkpoint::FeatureMaterializer;
 use ghost_core::checkpoint::{
     AlphaFingerprintFeatures, CheckpointEngine, CheckpointProducer, CurveReadinessFeatures,
-    EvidenceDegradedReason, EvidenceStatus, EvidenceUnavailableReason, FeatureEvidenceStatus,
+    DecisionTimeSeriesFeatures, DecisionTimeSeriesPriceSource, DecisionTimeSeriesRetentionPolicy,
+    DecisionTimeSeriesRetentionStatus, DecisionTimeSeriesSourceCounts, EvidenceDegradedReason,
+    EvidenceStatus, EvidenceUnavailableReason, FeatureEvidenceStatus,
     ManipulationContradictionFeatures, MaterializedEvidenceStatus, MaterializedFeatureSet,
-    ObservationFeatureBuilder, OrganicBroadeningFeatures, SessionCheckpoint, TxSegmentSequence,
+    MetricEvidenceQuality, ObservationFeatureBuilder, OrganicBroadeningFeatures, SessionCheckpoint,
+    TemporalAnchorReachedBy, TemporalAnchorSnapshot, TemporalDeltaFeatures,
+    TemporalMetricEvidenceContext, TemporalMetricSource, TxSegmentSequence,
 };
 use ghost_core::session::types::{
     SessionDiagnostics, SessionId, SessionMetadata, SessionStatus, VerdictOutcome,
@@ -32,6 +38,48 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub type SharedSession = Arc<RwLock<PoolObservationSession>>;
+
+#[derive(Debug, Clone, Copy)]
+struct TemporalCarryForwardRuntimeConfig {
+    enabled: bool,
+    max_staleness_ms: u64,
+    event_counters_enabled: bool,
+    state_metrics_enabled: bool,
+    ratio_metrics_enabled: bool,
+}
+
+impl TemporalCarryForwardRuntimeConfig {
+    fn from_gatekeeper_config(config: &GatekeeperV2Config) -> Self {
+        Self {
+            enabled: config.temporal_carry_forward_enabled,
+            max_staleness_ms: config.temporal_carry_forward_max_staleness_ms.max(1),
+            event_counters_enabled: config.temporal_carry_forward_event_counters_enabled,
+            state_metrics_enabled: config.temporal_carry_forward_state_metrics_enabled,
+            ratio_metrics_enabled: config.temporal_carry_forward_ratio_metrics_enabled,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct TemporalAnchorRawValues {
+    tx_count: Option<u64>,
+    buy_count: Option<u64>,
+    unique_signers: Option<u64>,
+    net_quote_sol: Option<f64>,
+    total_volume_sol: Option<f64>,
+    market_cap_sol: Option<f64>,
+    price_pct: Option<f64>,
+    burst_ratio: Option<f64>,
+    jito_tip_intensity: Option<f64>,
+    signer_cross_pool_velocity: Option<f64>,
+    flipper_presence_ratio: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DecisionSeriesAccountPriceObservation {
+    ts_ms: u64,
+    price_sol: f64,
+}
 
 pub struct PoolObservationSession {
     pub session_id: SessionId,
@@ -56,6 +104,10 @@ pub struct PoolObservationSession {
     pub cross_pool_velocity_config: CrossPoolVelocityConfig,
     pub funding_source_index: Arc<FundingSourceIndex>,
     pub funding_source_config: FundingSourceConfig,
+    temporal_carry_forward_config: TemporalCarryForwardRuntimeConfig,
+    decision_time_series_tx_capacity: usize,
+    decision_time_series_retention_policy: DecisionTimeSeriesRetentionPolicy,
+    decision_series_account_price_observations: Vec<DecisionSeriesAccountPriceObservation>,
     pub checkpoint_engine: CheckpointEngine,
     pub feature_builder: ObservationFeatureBuilder,
     pub checkpoints: Vec<SessionCheckpoint>,
@@ -120,6 +172,8 @@ impl PoolObservationSession {
         gatekeeper_buffer.set_curve_t0_with_source(curve_t0, curve_t0_source);
         let tx_intelligence =
             TxIntelligenceEngine::new(tx_intelligence_config, &candidate_snapshot, dev_wallet);
+        let decision_time_series_tx_capacity =
+            gatekeeper_config.decision_time_series_tx_capacity.max(1);
 
         let mut session = Self {
             session_id,
@@ -132,7 +186,7 @@ impl PoolObservationSession {
             created_at_instant: Instant::now(),
             deadline_wall_ms,
             status: SessionStatus::Created,
-            tx_buffer: VecDeque::with_capacity(DEFAULT_SESSION_TX_RING_CAPACITY),
+            tx_buffer: VecDeque::with_capacity(decision_time_series_tx_capacity),
             tx_keys_seen: HashSet::new(),
             highest_seen_ts_ms: 0,
             account_state_core,
@@ -146,6 +200,12 @@ impl PoolObservationSession {
             ),
             funding_source_index: Arc::new(FundingSourceIndex::new()),
             funding_source_config: FundingSourceConfig::from_gatekeeper_config(gatekeeper_config),
+            temporal_carry_forward_config:
+                TemporalCarryForwardRuntimeConfig::from_gatekeeper_config(gatekeeper_config),
+            decision_time_series_tx_capacity,
+            decision_time_series_retention_policy: gatekeeper_config
+                .decision_time_series_retention_policy,
+            decision_series_account_price_observations: Vec::new(),
             checkpoint_engine: CheckpointEngine::default(),
             feature_builder: ObservationFeatureBuilder,
             checkpoints: Vec::new(),
@@ -156,6 +216,13 @@ impl PoolObservationSession {
         session.refresh_from_gatekeeper();
         session.sync_from_account_state_core_on_open();
         session
+    }
+
+    fn retain_decision_series_tx(&mut self, tx: Arc<PoolTransaction>) {
+        while self.tx_buffer.len() >= self.decision_time_series_tx_capacity {
+            self.tx_buffer.pop_front();
+        }
+        self.tx_buffer.push_back(tx);
     }
 
     /// Test-only helper retained for in-crate suites that still assert
@@ -172,11 +239,11 @@ impl PoolObservationSession {
         self.tx_intelligence.on_transaction(tx.as_ref());
         self.refresh_tx_intelligence_snapshot();
 
-        let prior_unique = self.gatekeeper_buffer.unique_tx_key_count();
+        let prior_total_tx_count = self.gatekeeper_buffer.total_tx_count();
         let verdict = self
             .gatekeeper_buffer
             .legacy_test_verdict_from_transaction(tx.clone());
-        let accepted_unique = self.gatekeeper_buffer.unique_tx_key_count() > prior_unique;
+        let accepted_unique = self.gatekeeper_buffer.total_tx_count() > prior_total_tx_count;
 
         if accepted_unique {
             let pool_id = self.pool_amm_id.to_string();
@@ -188,10 +255,7 @@ impl PoolObservationSession {
             if let Some(tx_key) = GatekeeperBuffer::tx_key_for(tx.as_ref()) {
                 self.tx_keys_seen.insert(tx_key);
             }
-            if self.tx_buffer.len() == DEFAULT_SESSION_TX_RING_CAPACITY {
-                self.tx_buffer.pop_front();
-            }
-            self.tx_buffer.push_back(tx);
+            self.retain_decision_series_tx(tx);
             self.diagnostics.total_tx_seen = self.diagnostics.total_tx_seen.saturating_add(1);
             if matches!(self.status, SessionStatus::Created) {
                 self.status = SessionStatus::Accumulating;
@@ -214,11 +278,11 @@ impl PoolObservationSession {
         self.tx_intelligence.on_transaction(tx.as_ref());
         self.refresh_tx_intelligence_snapshot();
 
-        let prior_unique = self.gatekeeper_buffer.unique_tx_key_count();
+        let prior_total_tx_count = self.gatekeeper_buffer.total_tx_count();
         let outcome = self
             .gatekeeper_buffer
             .ingest_transaction_tracking_only(tx.clone());
-        let accepted_unique = self.gatekeeper_buffer.unique_tx_key_count() > prior_unique;
+        let accepted_unique = self.gatekeeper_buffer.total_tx_count() > prior_total_tx_count;
 
         if accepted_unique {
             let pool_id = self.pool_amm_id.to_string();
@@ -230,10 +294,7 @@ impl PoolObservationSession {
             if let Some(tx_key) = GatekeeperBuffer::tx_key_for(tx.as_ref()) {
                 self.tx_keys_seen.insert(tx_key);
             }
-            if self.tx_buffer.len() == DEFAULT_SESSION_TX_RING_CAPACITY {
-                self.tx_buffer.pop_front();
-            }
-            self.tx_buffer.push_back(tx);
+            self.retain_decision_series_tx(tx);
             self.diagnostics.total_tx_seen = self.diagnostics.total_tx_seen.saturating_add(1);
             if matches!(self.status, SessionStatus::Created) {
                 self.status = SessionStatus::Accumulating;
@@ -247,10 +308,18 @@ impl PoolObservationSession {
 
     pub fn on_account_update(&mut self, update: &AccountStateUpdate) {
         let _ = self.account_state_core.apply_account_update(update.clone());
-        self.on_account_state_core_updated();
+        self.on_account_state_core_updated_at(Some(update.receive_ts_ms));
     }
 
     pub fn on_account_state_core_updated(&mut self) {
+        self.on_account_state_core_updated_at(None);
+    }
+
+    pub fn on_account_state_core_updated_from_update(&mut self, update: &AccountStateUpdate) {
+        self.on_account_state_core_updated_at(Some(update.receive_ts_ms));
+    }
+
+    fn on_account_state_core_updated_at(&mut self, account_update_ts_ms: Option<u64>) {
         if let Some(features) = self.account_state_core.get_features(&self.base_mint) {
             tracing::info!(
                 pool = %self.pool_amm_id,
@@ -272,6 +341,7 @@ impl PoolObservationSession {
                 ::metrics::histogram!("canonical_first_update_latency_ms", latency_ms as f64);
             }
             self.account_features = features;
+            self.record_decision_series_account_price_observation(account_update_ts_ms);
         } else {
             tracing::warn!(
                 pool = %self.pool_amm_id,
@@ -283,6 +353,29 @@ impl PoolObservationSession {
             self.diagnostics.total_account_updates.saturating_add(1);
         if matches!(self.status, SessionStatus::Created) {
             self.status = SessionStatus::Accumulating;
+        }
+    }
+
+    fn record_decision_series_account_price_observation(&mut self, ts_ms: Option<u64>) {
+        let Some(ts_ms) = ts_ms else {
+            return;
+        };
+        let price_sol = self.account_features.price_sol;
+        if !(price_sol.is_finite() && price_sol > 0.0) {
+            return;
+        }
+        self.decision_series_account_price_observations
+            .push(DecisionSeriesAccountPriceObservation { ts_ms, price_sol });
+        self.decision_series_account_price_observations
+            .sort_by_key(|observation| observation.ts_ms);
+        const MAX_DECISION_SERIES_ACCOUNT_PRICE_OBSERVATIONS: usize = 512;
+        let excess = self
+            .decision_series_account_price_observations
+            .len()
+            .saturating_sub(MAX_DECISION_SERIES_ACCOUNT_PRICE_OBSERVATIONS);
+        if excess > 0 {
+            self.decision_series_account_price_observations
+                .drain(0..excess);
         }
     }
 
@@ -660,9 +753,13 @@ impl PoolObservationSession {
                 .is_some()
             || materialized
                 .sybil_resistance
+                .cpv_other_pool_activity
+                .is_some()
+            || materialized
+                .sybil_resistance
                 .funding_source_concentration
                 .is_some();
-        let sybil_available_count = [
+        let sybil_available_metrics = [
             materialized
                 .sybil_resistance
                 .fee_topology_diversity_index
@@ -685,36 +782,64 @@ impl PoolObservationSession {
                 .is_some(),
             materialized
                 .sybil_resistance
+                .cpv_other_pool_activity
+                .is_some(),
+            materialized
+                .sybil_resistance
                 .funding_source_concentration
                 .is_some(),
-        ]
-        .into_iter()
-        .filter(|available| *available)
-        .count();
+        ];
+        let sybil_available_count = sybil_available_metrics
+            .iter()
+            .filter(|available| **available)
+            .count();
         let sybil = if !materialized.sybil_resistance.degraded_reasons.is_empty() {
             evidence_degraded(vec![EvidenceDegradedReason::SybilEvidencePartial])
-        } else if sybil_available_count > 0 && sybil_available_count < 6 {
+        } else if sybil_available_count > 0 && sybil_available_count < sybil_available_metrics.len()
+        {
             evidence_degraded(vec![EvidenceDegradedReason::SybilEvidencePartial])
         } else if sybil_metric_available {
             evidence_clean()
         } else {
             evidence_unavailable(vec![EvidenceUnavailableReason::SybilMetricsMissing])
         };
-        let cpv = if materialized
-            .sybil_resistance
-            .signer_cross_pool_velocity
-            .is_some()
-        {
-            evidence_clean()
-        } else if materialized
-            .sybil_resistance
-            .degraded_reasons
-            .iter()
-            .any(|reason| reason.starts_with("CPV_"))
-        {
-            evidence_degraded(vec![EvidenceDegradedReason::CpvEvidencePartial])
-        } else {
-            evidence_unavailable(vec![EvidenceUnavailableReason::CpvMetricsMissing])
+        let cpv = match materialized.sybil_resistance.cpv_evidence.quality {
+            MetricEvidenceQuality::Clean => evidence_clean(),
+            MetricEvidenceQuality::DegradedLowSample => {
+                evidence_degraded(vec![EvidenceDegradedReason::CpvEvidencePartial])
+            }
+            MetricEvidenceQuality::InsufficientSample => {
+                evidence_insufficient_sample(vec![EvidenceDegradedReason::CpvEvidencePartial])
+            }
+            MetricEvidenceQuality::Stale => {
+                evidence_degraded(vec![EvidenceDegradedReason::EvidenceStale])
+            }
+            MetricEvidenceQuality::NotAllowed => {
+                evidence_unavailable(vec![EvidenceUnavailableReason::CpvMetricsMissing])
+            }
+            MetricEvidenceQuality::UnavailableSource
+            | MetricEvidenceQuality::Unavailable
+            | MetricEvidenceQuality::NotConfigured => {
+                if materialized
+                    .sybil_resistance
+                    .signer_cross_pool_velocity
+                    .is_some()
+                {
+                    evidence_degraded(vec![EvidenceDegradedReason::CpvEvidencePartial])
+                } else if materialized
+                    .sybil_resistance
+                    .degraded_reasons
+                    .iter()
+                    .any(|reason| reason.starts_with("CPV_"))
+                {
+                    evidence_unavailable(vec![EvidenceUnavailableReason::CpvMetricsMissing])
+                } else {
+                    evidence_unavailable(vec![EvidenceUnavailableReason::CpvMetricsMissing])
+                }
+            }
+            MetricEvidenceQuality::CarriedForward => {
+                evidence_degraded(vec![EvidenceDegradedReason::CpvEvidencePartial])
+            }
         };
         let fsc = if materialized
             .sybil_resistance
@@ -830,6 +955,1283 @@ impl PoolObservationSession {
     }
 
     #[must_use]
+    fn materialize_v3_temporal_deltas(&self) -> TemporalDeltaFeatures {
+        const ANCHORS_MS: [u64; 3] = [1_000, 2_000, 3_000];
+
+        let sorted_txs = self.temporal_sorted_transactions();
+        if sorted_txs.is_empty() {
+            return TemporalDeltaFeatures {
+                anchor_1s: Self::empty_temporal_anchor(ANCHORS_MS[0]),
+                anchor_2s: Self::empty_temporal_anchor(ANCHORS_MS[1]),
+                anchor_3s: Self::empty_temporal_anchor(ANCHORS_MS[2]),
+                ..TemporalDeltaFeatures::default()
+            };
+        }
+
+        let first_event_ts_ms = sorted_txs[0].2;
+        let observed_end_event_elapsed_ms = sorted_txs
+            .last()
+            .map(|(_, _, ts)| ts.saturating_sub(first_event_ts_ms))
+            .unwrap_or_default();
+        let observation_elapsed_ms = self.temporal_observation_elapsed_ms();
+        let configured_window_ms = self
+            .deadline_wall_ms
+            .saturating_sub(self.created_at_wall_ms);
+        let first_price = sorted_txs
+            .iter()
+            .find_map(|(_, tx, _)| Self::temporal_price_value(tx));
+
+        let mut previous_event_anchor: Option<TemporalAnchorSnapshot> = None;
+        let mut previous_state_anchor: Option<TemporalAnchorSnapshot> = None;
+        let mut previous_ratio_anchor: Option<TemporalAnchorSnapshot> = None;
+        let mut anchors = Vec::with_capacity(ANCHORS_MS.len());
+
+        for anchor_ms in ANCHORS_MS {
+            let reached_by = Self::temporal_anchor_reached_by(
+                anchor_ms,
+                observed_end_event_elapsed_ms,
+                observation_elapsed_ms,
+                configured_window_ms,
+            );
+            let cutoff_ts_ms = first_event_ts_ms.saturating_add(anchor_ms);
+            let raw_values =
+                self.temporal_anchor_raw_values(&sorted_txs, cutoff_ts_ms, anchor_ms, first_price);
+            let anchor = self.build_temporal_anchor(
+                anchor_ms,
+                reached_by,
+                observation_elapsed_ms,
+                raw_values,
+                previous_event_anchor.as_ref(),
+                previous_state_anchor.as_ref(),
+                previous_ratio_anchor.as_ref(),
+            );
+
+            if anchor.tx_count.is_some() {
+                previous_event_anchor = Some(anchor.clone());
+            }
+            if anchor.market_cap_sol.is_some() || anchor.price_pct.is_some() {
+                previous_state_anchor = Some(anchor.clone());
+            }
+            if anchor.burst_ratio.is_some()
+                || anchor.jito_tip_intensity.is_some()
+                || anchor.signer_cross_pool_velocity.is_some()
+                || anchor.flipper_presence_ratio.is_some()
+            {
+                previous_ratio_anchor = Some(anchor.clone());
+            }
+            anchors.push(anchor);
+        }
+
+        let mut features = TemporalDeltaFeatures {
+            anchor_1s: anchors[0].clone(),
+            anchor_2s: anchors[1].clone(),
+            anchor_3s: anchors[2].clone(),
+            ..TemporalDeltaFeatures::default()
+        };
+        self.populate_temporal_delta_pairs(&mut features);
+        features.status = Self::temporal_delta_status(&features);
+        features
+    }
+
+    fn empty_temporal_anchor(anchor_ms: u64) -> TemporalAnchorSnapshot {
+        let unavailable = Self::temporal_context(
+            MetricEvidenceQuality::Unavailable,
+            TemporalMetricSource::Unavailable,
+            None,
+            None,
+            Some("anchor_not_reached"),
+        );
+        TemporalAnchorSnapshot {
+            anchor_ms,
+            reached: false,
+            reached_by: TemporalAnchorReachedBy::NotReached,
+            status: MetricEvidenceQuality::Unavailable,
+            event_counters_evidence: unavailable.clone(),
+            state_metrics_evidence: unavailable.clone(),
+            ratio_metrics_evidence: unavailable,
+            ..TemporalAnchorSnapshot::default()
+        }
+    }
+
+    fn temporal_observation_elapsed_ms(&self) -> u64 {
+        let configured_window_ms = self
+            .deadline_wall_ms
+            .saturating_sub(self.created_at_wall_ms);
+        let elapsed_ms = self.elapsed_ms();
+        if configured_window_ms > 0 {
+            elapsed_ms.min(configured_window_ms)
+        } else {
+            elapsed_ms
+        }
+    }
+
+    fn temporal_anchor_reached_by(
+        anchor_ms: u64,
+        observed_end_event_elapsed_ms: u64,
+        observation_elapsed_ms: u64,
+        configured_window_ms: u64,
+    ) -> TemporalAnchorReachedBy {
+        if observed_end_event_elapsed_ms >= anchor_ms {
+            TemporalAnchorReachedBy::Event
+        } else if observation_elapsed_ms >= anchor_ms {
+            if configured_window_ms > 0 && observation_elapsed_ms >= configured_window_ms {
+                TemporalAnchorReachedBy::Deadline
+            } else {
+                TemporalAnchorReachedBy::ObservationElapsed
+            }
+        } else {
+            TemporalAnchorReachedBy::NotReached
+        }
+    }
+
+    fn temporal_sorted_transactions(&self) -> Vec<(usize, &PoolTransaction, u64)> {
+        let mut txs: Vec<(usize, &PoolTransaction, u64)> = self
+            .tx_buffer
+            .iter()
+            .enumerate()
+            .map(|(idx, tx)| (idx, tx.as_ref(), Self::temporal_tx_event_ts_ms(tx.as_ref())))
+            .collect();
+        txs.sort_by_key(|(idx, tx, ts)| {
+            (
+                *ts,
+                tx.slot.unwrap_or_default(),
+                tx.tx_index.unwrap_or(u32::MAX),
+                tx.event_ordinal.unwrap_or(u32::MAX),
+                *idx,
+            )
+        });
+        txs
+    }
+
+    fn temporal_tx_event_ts_ms(tx: &PoolTransaction) -> u64 {
+        tx.event_time
+            .compat_event_ts_ms(Some(tx.timestamp_ms))
+            .unwrap_or(tx.timestamp_ms)
+    }
+
+    fn temporal_market_cap_value(tx: &PoolTransaction) -> Option<f64> {
+        tx.market_cap_sol
+            .filter(|value| value.is_finite() && *value > 0.0)
+    }
+
+    fn temporal_price_value(tx: &PoolTransaction) -> Option<f64> {
+        if let Some(price) = tx
+            .price_quote
+            .filter(|value| value.is_finite() && *value > 0.0)
+        {
+            return Some(price);
+        }
+        match (
+            tx.reserve_quote.or(tx.v_sol_in_bonding_curve),
+            tx.reserve_base.or(tx.v_tokens_in_bonding_curve),
+        ) {
+            (Some(quote), Some(base)) if quote.is_finite() && base.is_finite() && base > 0.0 => {
+                Some(quote / base)
+            }
+            _ => None,
+        }
+    }
+
+    fn decision_series_tx_price(
+        tx: &PoolTransaction,
+    ) -> (Option<f64>, DecisionTimeSeriesPriceSource) {
+        match (
+            tx.reserve_quote.or(tx.v_sol_in_bonding_curve),
+            tx.reserve_base.or(tx.v_tokens_in_bonding_curve),
+        ) {
+            (Some(quote), Some(base)) if quote.is_finite() && base.is_finite() && base > 0.0 => {
+                return (Some(quote / base), DecisionTimeSeriesPriceSource::Reserve);
+            }
+            _ => {}
+        }
+
+        if let Some(price) = tx
+            .price_quote
+            .filter(|value| value.is_finite() && *value > 0.0)
+        {
+            return (Some(price), DecisionTimeSeriesPriceSource::Quote);
+        }
+
+        if let Some(market_cap_sol) = tx
+            .market_cap_sol
+            .filter(|value| value.is_finite() && *value > 0.0)
+        {
+            return (
+                Some(market_cap_sol / PUMP_TOKEN_TOTAL_SUPPLY),
+                DecisionTimeSeriesPriceSource::MarketCap,
+            );
+        }
+
+        (None, DecisionTimeSeriesPriceSource::Missing)
+    }
+
+    fn decision_series_account_price_at_or_before(&self, ts_ms: u64) -> Option<f64> {
+        self.decision_series_account_price_observations
+            .iter()
+            .rev()
+            .find(|observation| observation.ts_ms <= ts_ms)
+            .map(|observation| observation.price_sol)
+            .filter(|value| value.is_finite() && *value > 0.0)
+    }
+
+    fn decision_series_price_for_tx(
+        &self,
+        tx: &PoolTransaction,
+        ts_ms: u64,
+    ) -> (Option<f64>, DecisionTimeSeriesPriceSource) {
+        let (price, source) = Self::decision_series_tx_price(tx);
+        if price.is_some() {
+            return (price, source);
+        }
+        if let Some(account_state_price) = self.decision_series_account_price_at_or_before(ts_ms) {
+            return (
+                Some(account_state_price),
+                DecisionTimeSeriesPriceSource::AccountState,
+            );
+        }
+        (None, DecisionTimeSeriesPriceSource::Missing)
+    }
+
+    #[must_use]
+    fn materialize_decision_time_series(&self) -> DecisionTimeSeriesFeatures {
+        let sorted_txs = self.temporal_sorted_transactions();
+        if sorted_txs.is_empty() {
+            return DecisionTimeSeriesFeatures::default();
+        }
+
+        let first_event_ts_ms = sorted_txs[0].2;
+        let retained_sample_count = sorted_txs.len() as u64;
+        let total_tx_count = self.tx_intel_features.tx_count.max(retained_sample_count);
+        let dropped_oldest_count = total_tx_count.saturating_sub(retained_sample_count);
+        let mut features = DecisionTimeSeriesFeatures {
+            status: EvidenceStatus::Clean,
+            retention_status: if dropped_oldest_count > 0 {
+                DecisionTimeSeriesRetentionStatus::Truncated
+            } else {
+                DecisionTimeSeriesRetentionStatus::Clean
+            },
+            retention_policy: self.decision_time_series_retention_policy,
+            retention_capacity: self.decision_time_series_tx_capacity as u64,
+            retained_sample_count,
+            total_tx_count,
+            dropped_oldest_count,
+            sample_count: retained_sample_count,
+            ..DecisionTimeSeriesFeatures::default()
+        };
+        let mut source_counts = DecisionTimeSeriesSourceCounts::default();
+
+        for (_, tx, ts_ms) in sorted_txs {
+            let offset_ms = ts_ms.saturating_sub(first_event_ts_ms).min(i64::MAX as u64) as i64;
+            features.ts_offsets_ms.push(offset_ms);
+            features.sol_amounts.push(if tx.volume_sol.is_finite() {
+                tx.volume_sol
+            } else {
+                0.0
+            });
+
+            let (price, source) = self.decision_series_price_for_tx(tx, ts_ms);
+            if price.is_some() {
+                features.finite_price_count = features.finite_price_count.saturating_add(1);
+            } else {
+                features.missing_price_count = features.missing_price_count.saturating_add(1);
+            }
+            source_counts.increment(source);
+            features.prices.push(price);
+            features.price_sources.push(source);
+        }
+
+        features.interval_ms = features
+            .ts_offsets_ms
+            .windows(2)
+            .map(|pair| pair[1].saturating_sub(pair[0]).max(0) as f64)
+            .collect();
+        features.d_price = features
+            .prices
+            .windows(2)
+            .map(|pair| match (pair[0], pair[1]) {
+                (Some(previous), Some(current)) => Some(current - previous),
+                _ => None,
+            })
+            .collect();
+        features.price_coverage_ratio = (features.sample_count > 0)
+            .then_some(features.finite_price_count as f64 / features.sample_count as f64);
+        features.source_counts = source_counts;
+        if features.dropped_oldest_count > 0 {
+            features.status = EvidenceStatus::Degraded;
+            features
+                .degraded_reasons
+                .push(EvidenceDegradedReason::DecisionTimeSeriesTruncated);
+        }
+        if features.missing_price_count > 0 {
+            features.status = EvidenceStatus::Degraded;
+            features
+                .degraded_reasons
+                .push(EvidenceDegradedReason::DecisionTimeSeriesPricePartial);
+        }
+
+        features
+    }
+
+    fn temporal_anchor_raw_values<'a>(
+        &self,
+        sorted_txs: &[(usize, &'a PoolTransaction, u64)],
+        cutoff_ts_ms: u64,
+        anchor_ms: u64,
+        first_price: Option<f64>,
+    ) -> TemporalAnchorRawValues {
+        let mut tx_count = 0u64;
+        let mut buy_count = 0u64;
+        let mut unique_signers = HashSet::new();
+        let mut net_quote_sol = 0.0;
+        let mut total_volume_sol = 0.0;
+        let mut timestamps = Vec::new();
+        let mut market_cap_sol = None;
+        let mut price_value = None;
+        let mut jito_known_count = 0u64;
+        let mut jito_tip_count = 0u64;
+        let mut anchor_txs = Vec::new();
+
+        for (_, tx, ts_ms) in sorted_txs {
+            if *ts_ms > cutoff_ts_ms {
+                break;
+            }
+            anchor_txs.push(*tx);
+            tx_count = tx_count.saturating_add(1);
+            timestamps.push(*ts_ms);
+            if tx.is_buy {
+                buy_count = buy_count.saturating_add(1);
+            }
+            if !tx.signer.is_empty() {
+                unique_signers.insert(tx.signer.as_str());
+            }
+            if tx.volume_sol.is_finite() {
+                let signed = if tx.is_buy {
+                    tx.volume_sol
+                } else {
+                    -tx.volume_sol
+                };
+                net_quote_sol += signed;
+                total_volume_sol += tx.volume_sol.abs();
+            }
+            if let Some(value) = Self::temporal_market_cap_value(tx) {
+                market_cap_sol = Some(value);
+            }
+            if let Some(value) = Self::temporal_price_value(tx) {
+                price_value = Some(value);
+            }
+            if let Some(jito_tip_detected) = tx.jito_tip_detected {
+                jito_known_count = jito_known_count.saturating_add(1);
+                if jito_tip_detected {
+                    jito_tip_count = jito_tip_count.saturating_add(1);
+                }
+            }
+        }
+
+        if tx_count == 0 {
+            return TemporalAnchorRawValues::default();
+        }
+
+        let burst_ratio = Some(compute_velocity_profile(&timestamps, anchor_ms.max(1)).burst_ratio);
+        let price_pct = match (first_price, price_value) {
+            (Some(first), Some(current)) if first.is_finite() && first > 0.0 => {
+                Some(((current - first) / first) * 100.0)
+            }
+            _ => None,
+        };
+
+        TemporalAnchorRawValues {
+            tx_count: Some(tx_count),
+            buy_count: Some(buy_count),
+            unique_signers: Some(unique_signers.len() as u64),
+            net_quote_sol: Some(net_quote_sol),
+            total_volume_sol: Some(total_volume_sol),
+            market_cap_sol,
+            price_pct,
+            burst_ratio,
+            jito_tip_intensity: (jito_known_count > 0)
+                .then_some(jito_tip_count as f64 / jito_known_count as f64),
+            signer_cross_pool_velocity: self.temporal_anchor_cpv(&anchor_txs, cutoff_ts_ms),
+            flipper_presence_ratio: Self::temporal_flipper_presence_ratio(&anchor_txs),
+        }
+    }
+
+    fn temporal_anchor_cpv(
+        &self,
+        anchor_txs: &[&PoolTransaction],
+        anchor_ts_ms: u64,
+    ) -> Option<f64> {
+        let pool_id = self.pool_amm_id.to_string();
+        let cpv = self.cross_pool_velocity_index.compute_for_transactions(
+            pool_id.as_str(),
+            anchor_txs.iter().copied(),
+            Some(anchor_ts_ms),
+            &self.cross_pool_velocity_config,
+        );
+        (cpv.status == MetricEvidenceQuality::Clean)
+            .then_some(cpv.signer_cross_pool_velocity)
+            .flatten()
+    }
+
+    fn temporal_flipper_presence_ratio(anchor_txs: &[&PoolTransaction]) -> Option<f64> {
+        let mut buyers = HashSet::new();
+        let mut sellers = HashSet::new();
+
+        for tx in anchor_txs {
+            if !tx.success {
+                continue;
+            }
+            if tx.owner_token_deltas.is_empty() {
+                if tx.signer.is_empty() {
+                    continue;
+                }
+                if tx.is_buy {
+                    buyers.insert(tx.signer.clone());
+                } else {
+                    sellers.insert(tx.signer.clone());
+                }
+                continue;
+            }
+
+            for delta in &tx.owner_token_deltas {
+                if delta.owner.is_empty() {
+                    continue;
+                }
+                if delta.delta_raw > 0 {
+                    buyers.insert(delta.owner.clone());
+                } else if delta.delta_raw < 0 {
+                    sellers.insert(delta.owner.clone());
+                }
+            }
+        }
+
+        if buyers.is_empty() {
+            return None;
+        }
+
+        let flipper_count = buyers.intersection(&sellers).count();
+        Some(flipper_count as f64 / buyers.len() as f64)
+    }
+
+    fn build_temporal_anchor(
+        &self,
+        anchor_ms: u64,
+        reached_by: TemporalAnchorReachedBy,
+        observation_elapsed_ms: u64,
+        raw_values: TemporalAnchorRawValues,
+        previous_event_anchor: Option<&TemporalAnchorSnapshot>,
+        previous_state_anchor: Option<&TemporalAnchorSnapshot>,
+        previous_ratio_anchor: Option<&TemporalAnchorSnapshot>,
+    ) -> TemporalAnchorSnapshot {
+        let reached = reached_by != TemporalAnchorReachedBy::NotReached;
+        let mut anchor = TemporalAnchorSnapshot {
+            anchor_ms,
+            reached,
+            reached_by,
+            anchor_observation_elapsed_ms: reached.then_some(observation_elapsed_ms),
+            ..TemporalAnchorSnapshot::default()
+        };
+
+        if !reached {
+            let unavailable = Self::temporal_context(
+                MetricEvidenceQuality::Unavailable,
+                TemporalMetricSource::Unavailable,
+                None,
+                None,
+                Some("anchor_not_reached"),
+            );
+            anchor.status = MetricEvidenceQuality::Unavailable;
+            anchor.event_counters_evidence = unavailable.clone();
+            anchor.state_metrics_evidence = unavailable.clone();
+            anchor.ratio_metrics_evidence = unavailable;
+            return anchor;
+        }
+
+        if reached_by == TemporalAnchorReachedBy::Event {
+            anchor.tx_count = raw_values.tx_count;
+            anchor.buy_count = raw_values.buy_count;
+            anchor.unique_signers = raw_values.unique_signers;
+            anchor.net_quote_sol = raw_values.net_quote_sol;
+            anchor.total_volume_sol = raw_values.total_volume_sol;
+            anchor.event_counters_evidence = Self::temporal_context(
+                MetricEvidenceQuality::Clean,
+                TemporalMetricSource::Observed,
+                None,
+                None,
+                None,
+            );
+        } else {
+            self.apply_temporal_event_counter_carry(anchor_ms, previous_event_anchor, &mut anchor);
+        }
+
+        if reached_by == TemporalAnchorReachedBy::Event {
+            anchor.market_cap_sol = raw_values.market_cap_sol;
+            anchor.price_pct = raw_values.price_pct;
+            anchor.state_metrics_evidence =
+                if anchor.market_cap_sol.is_some() || anchor.price_pct.is_some() {
+                    Self::temporal_context(
+                        MetricEvidenceQuality::Clean,
+                        TemporalMetricSource::Observed,
+                        None,
+                        None,
+                        None,
+                    )
+                } else {
+                    Self::temporal_context(
+                        MetricEvidenceQuality::Unavailable,
+                        TemporalMetricSource::Unavailable,
+                        None,
+                        None,
+                        Some("state_value_unavailable"),
+                    )
+                };
+        } else {
+            self.apply_temporal_state_carry(anchor_ms, previous_state_anchor, &mut anchor);
+        }
+
+        if reached_by == TemporalAnchorReachedBy::Event {
+            anchor.burst_ratio = raw_values.burst_ratio;
+            anchor.jito_tip_intensity = raw_values.jito_tip_intensity;
+            anchor.signer_cross_pool_velocity = raw_values.signer_cross_pool_velocity;
+            anchor.flipper_presence_ratio = raw_values.flipper_presence_ratio;
+            anchor.ratio_metrics_evidence = if anchor.burst_ratio.is_some()
+                || anchor.jito_tip_intensity.is_some()
+                || anchor.signer_cross_pool_velocity.is_some()
+                || anchor.flipper_presence_ratio.is_some()
+            {
+                Self::temporal_context(
+                    MetricEvidenceQuality::Clean,
+                    TemporalMetricSource::Observed,
+                    None,
+                    None,
+                    None,
+                )
+            } else {
+                Self::temporal_context(
+                    MetricEvidenceQuality::Unavailable,
+                    TemporalMetricSource::Unavailable,
+                    None,
+                    None,
+                    Some("ratio_value_unavailable"),
+                )
+            };
+        } else {
+            self.apply_temporal_ratio_carry(anchor_ms, previous_ratio_anchor, &mut anchor);
+        }
+
+        anchor.status = Self::temporal_anchor_status(&anchor);
+        anchor
+    }
+
+    fn apply_temporal_event_counter_carry(
+        &self,
+        anchor_ms: u64,
+        previous_anchor: Option<&TemporalAnchorSnapshot>,
+        anchor: &mut TemporalAnchorSnapshot,
+    ) {
+        if !self.temporal_carry_forward_config.enabled
+            || !self.temporal_carry_forward_config.event_counters_enabled
+        {
+            anchor.event_counters_evidence = Self::temporal_context(
+                MetricEvidenceQuality::NotAllowed,
+                TemporalMetricSource::NotAllowed,
+                None,
+                None,
+                Some("event_counter_carry_forward_not_allowed"),
+            );
+            return;
+        }
+
+        let Some(previous) = previous_anchor else {
+            anchor.event_counters_evidence = Self::temporal_context(
+                MetricEvidenceQuality::Unavailable,
+                TemporalMetricSource::Unavailable,
+                None,
+                None,
+                Some("event_counter_prior_anchor_unavailable"),
+            );
+            return;
+        };
+        let staleness_ms = anchor_ms.saturating_sub(previous.anchor_ms);
+        if staleness_ms > self.temporal_carry_forward_config.max_staleness_ms {
+            anchor.event_counters_evidence = Self::temporal_context(
+                MetricEvidenceQuality::Stale,
+                TemporalMetricSource::Stale,
+                Some(previous.anchor_ms),
+                Some(staleness_ms),
+                Some("stale"),
+            );
+            return;
+        }
+
+        anchor.tx_count = previous.tx_count;
+        anchor.buy_count = previous.buy_count;
+        anchor.unique_signers = previous.unique_signers;
+        anchor.net_quote_sol = previous.net_quote_sol;
+        anchor.total_volume_sol = previous.total_volume_sol;
+        anchor.event_counters_evidence = Self::temporal_context(
+            MetricEvidenceQuality::CarriedForward,
+            TemporalMetricSource::CarriedForwardNoEvent,
+            Some(previous.anchor_ms),
+            Some(staleness_ms),
+            None,
+        );
+    }
+
+    fn apply_temporal_state_carry(
+        &self,
+        anchor_ms: u64,
+        previous_anchor: Option<&TemporalAnchorSnapshot>,
+        anchor: &mut TemporalAnchorSnapshot,
+    ) {
+        if !self.temporal_carry_forward_config.enabled
+            || !self.temporal_carry_forward_config.state_metrics_enabled
+        {
+            anchor.state_metrics_evidence = Self::temporal_context(
+                MetricEvidenceQuality::NotAllowed,
+                TemporalMetricSource::NotAllowed,
+                None,
+                None,
+                Some("state_carry_forward_not_allowed"),
+            );
+            return;
+        }
+        let Some(previous) = previous_anchor else {
+            anchor.state_metrics_evidence = Self::temporal_context(
+                MetricEvidenceQuality::Unavailable,
+                TemporalMetricSource::Unavailable,
+                None,
+                None,
+                Some("state_prior_anchor_unavailable"),
+            );
+            return;
+        };
+        let staleness_ms = anchor_ms.saturating_sub(previous.anchor_ms);
+        if staleness_ms > self.temporal_carry_forward_config.max_staleness_ms {
+            anchor.state_metrics_evidence = Self::temporal_context(
+                MetricEvidenceQuality::Stale,
+                TemporalMetricSource::Stale,
+                Some(previous.anchor_ms),
+                Some(staleness_ms),
+                Some("stale"),
+            );
+            return;
+        }
+        anchor.market_cap_sol = previous.market_cap_sol;
+        anchor.price_pct = previous.price_pct;
+        anchor.state_metrics_evidence = Self::temporal_context(
+            MetricEvidenceQuality::CarriedForward,
+            TemporalMetricSource::CarriedForwardNoEvent,
+            Some(previous.anchor_ms),
+            Some(staleness_ms),
+            None,
+        );
+    }
+
+    fn apply_temporal_ratio_carry(
+        &self,
+        anchor_ms: u64,
+        previous_anchor: Option<&TemporalAnchorSnapshot>,
+        anchor: &mut TemporalAnchorSnapshot,
+    ) {
+        if !self.temporal_carry_forward_config.enabled
+            || !self.temporal_carry_forward_config.ratio_metrics_enabled
+        {
+            anchor.ratio_metrics_evidence = Self::temporal_context(
+                MetricEvidenceQuality::NotAllowed,
+                TemporalMetricSource::NotAllowed,
+                None,
+                None,
+                Some("ratio_carry_forward_not_allowed"),
+            );
+            return;
+        }
+        let Some(previous) = previous_anchor else {
+            anchor.ratio_metrics_evidence = Self::temporal_context(
+                MetricEvidenceQuality::Unavailable,
+                TemporalMetricSource::Unavailable,
+                None,
+                None,
+                Some("ratio_prior_anchor_unavailable"),
+            );
+            return;
+        };
+        let staleness_ms = anchor_ms.saturating_sub(previous.anchor_ms);
+        if staleness_ms > self.temporal_carry_forward_config.max_staleness_ms {
+            anchor.ratio_metrics_evidence = Self::temporal_context(
+                MetricEvidenceQuality::Stale,
+                TemporalMetricSource::Stale,
+                Some(previous.anchor_ms),
+                Some(staleness_ms),
+                Some("stale"),
+            );
+            return;
+        }
+        anchor.burst_ratio = previous.burst_ratio;
+        anchor.jito_tip_intensity = previous.jito_tip_intensity;
+        anchor.signer_cross_pool_velocity = previous.signer_cross_pool_velocity;
+        anchor.flipper_presence_ratio = previous.flipper_presence_ratio;
+        anchor.ratio_metrics_evidence = Self::temporal_context(
+            MetricEvidenceQuality::CarriedForward,
+            TemporalMetricSource::CarriedForwardNoEvent,
+            Some(previous.anchor_ms),
+            Some(staleness_ms),
+            None,
+        );
+    }
+
+    fn temporal_anchor_status(anchor: &TemporalAnchorSnapshot) -> MetricEvidenceQuality {
+        let qualities = [
+            anchor.event_counters_evidence.quality,
+            anchor.state_metrics_evidence.quality,
+            anchor.ratio_metrics_evidence.quality,
+        ];
+        if qualities.contains(&MetricEvidenceQuality::CarriedForward) {
+            MetricEvidenceQuality::CarriedForward
+        } else if qualities.contains(&MetricEvidenceQuality::Clean) {
+            MetricEvidenceQuality::Clean
+        } else if qualities.contains(&MetricEvidenceQuality::Stale) {
+            MetricEvidenceQuality::Stale
+        } else if qualities.contains(&MetricEvidenceQuality::NotAllowed) {
+            MetricEvidenceQuality::NotAllowed
+        } else {
+            MetricEvidenceQuality::Unavailable
+        }
+    }
+
+    fn temporal_context(
+        quality: MetricEvidenceQuality,
+        source: TemporalMetricSource,
+        carried_from_anchor_ms: Option<u64>,
+        staleness_ms: Option<u64>,
+        reason: Option<&str>,
+    ) -> TemporalMetricEvidenceContext {
+        TemporalMetricEvidenceContext {
+            quality,
+            source,
+            carried_from_anchor_ms,
+            staleness_ms,
+            reason: reason.map(str::to_string),
+        }
+    }
+
+    fn populate_temporal_delta_pairs(&self, features: &mut TemporalDeltaFeatures) {
+        let a1 = features.anchor_1s.clone();
+        let a2 = features.anchor_2s.clone();
+        let a3 = features.anchor_3s.clone();
+
+        Self::set_temporal_i64_delta(
+            features,
+            "delta_buy_count_1s_to_2s",
+            a1.buy_count,
+            a2.buy_count,
+            &a1.event_counters_evidence,
+            &a2.event_counters_evidence,
+            1_000,
+            |features, value| features.delta_buy_count_1s_to_2s = value,
+        );
+        Self::set_temporal_i64_delta(
+            features,
+            "delta_buy_count_1s_to_3s",
+            a1.buy_count,
+            a3.buy_count,
+            &a1.event_counters_evidence,
+            &a3.event_counters_evidence,
+            2_000,
+            |features, value| features.delta_buy_count_1s_to_3s = value,
+        );
+        Self::set_temporal_i64_delta(
+            features,
+            "delta_buy_count_2s_to_3s",
+            a2.buy_count,
+            a3.buy_count,
+            &a2.event_counters_evidence,
+            &a3.event_counters_evidence,
+            1_000,
+            |features, value| features.delta_buy_count_2s_to_3s = value,
+        );
+        Self::set_temporal_i64_delta(
+            features,
+            "delta_unique_signers_1s_to_2s",
+            a1.unique_signers,
+            a2.unique_signers,
+            &a1.event_counters_evidence,
+            &a2.event_counters_evidence,
+            1_000,
+            |features, value| features.delta_unique_signers_1s_to_2s = value,
+        );
+        Self::set_temporal_i64_delta(
+            features,
+            "delta_unique_signers_1s_to_3s",
+            a1.unique_signers,
+            a3.unique_signers,
+            &a1.event_counters_evidence,
+            &a3.event_counters_evidence,
+            2_000,
+            |features, value| features.delta_unique_signers_1s_to_3s = value,
+        );
+        Self::set_temporal_i64_delta(
+            features,
+            "delta_unique_signers_2s_to_3s",
+            a2.unique_signers,
+            a3.unique_signers,
+            &a2.event_counters_evidence,
+            &a3.event_counters_evidence,
+            1_000,
+            |features, value| features.delta_unique_signers_2s_to_3s = value,
+        );
+        Self::set_temporal_i64_delta(
+            features,
+            "delta_tx_count_1s_to_2s",
+            a1.tx_count,
+            a2.tx_count,
+            &a1.event_counters_evidence,
+            &a2.event_counters_evidence,
+            1_000,
+            |features, value| features.delta_tx_count_1s_to_2s = value,
+        );
+        Self::set_temporal_i64_delta(
+            features,
+            "delta_tx_count_1s_to_3s",
+            a1.tx_count,
+            a3.tx_count,
+            &a1.event_counters_evidence,
+            &a3.event_counters_evidence,
+            2_000,
+            |features, value| features.delta_tx_count_1s_to_3s = value,
+        );
+        Self::set_temporal_i64_delta(
+            features,
+            "delta_tx_count_2s_to_3s",
+            a2.tx_count,
+            a3.tx_count,
+            &a2.event_counters_evidence,
+            &a3.event_counters_evidence,
+            1_000,
+            |features, value| features.delta_tx_count_2s_to_3s = value,
+        );
+        Self::set_temporal_f64_delta(
+            features,
+            "delta_net_quote_sol_1s_to_2s",
+            a1.net_quote_sol,
+            a2.net_quote_sol,
+            &a1.event_counters_evidence,
+            &a2.event_counters_evidence,
+            1_000,
+            |features, value| features.delta_net_quote_sol_1s_to_2s = value,
+        );
+        Self::set_temporal_f64_delta(
+            features,
+            "delta_net_quote_sol_1s_to_3s",
+            a1.net_quote_sol,
+            a3.net_quote_sol,
+            &a1.event_counters_evidence,
+            &a3.event_counters_evidence,
+            2_000,
+            |features, value| features.delta_net_quote_sol_1s_to_3s = value,
+        );
+        Self::set_temporal_f64_delta(
+            features,
+            "delta_net_quote_sol_2s_to_3s",
+            a2.net_quote_sol,
+            a3.net_quote_sol,
+            &a2.event_counters_evidence,
+            &a3.event_counters_evidence,
+            1_000,
+            |features, value| features.delta_net_quote_sol_2s_to_3s = value,
+        );
+
+        Self::set_temporal_f64_delta(
+            features,
+            "delta_mcap_1s_to_2s",
+            a1.market_cap_sol,
+            a2.market_cap_sol,
+            &a1.state_metrics_evidence,
+            &a2.state_metrics_evidence,
+            1_000,
+            |features, value| features.delta_mcap_1s_to_2s = value,
+        );
+        Self::set_temporal_f64_delta(
+            features,
+            "delta_mcap_1s_to_3s",
+            a1.market_cap_sol,
+            a3.market_cap_sol,
+            &a1.state_metrics_evidence,
+            &a3.state_metrics_evidence,
+            2_000,
+            |features, value| features.delta_mcap_1s_to_3s = value,
+        );
+        Self::set_temporal_f64_delta(
+            features,
+            "delta_mcap_2s_to_3s",
+            a2.market_cap_sol,
+            a3.market_cap_sol,
+            &a2.state_metrics_evidence,
+            &a3.state_metrics_evidence,
+            1_000,
+            |features, value| features.delta_mcap_2s_to_3s = value,
+        );
+        Self::set_temporal_f64_delta(
+            features,
+            "delta_price_pct_1s_to_2s",
+            a1.price_pct,
+            a2.price_pct,
+            &a1.state_metrics_evidence,
+            &a2.state_metrics_evidence,
+            1_000,
+            |features, value| features.delta_price_pct_1s_to_2s = value,
+        );
+        Self::set_temporal_f64_delta(
+            features,
+            "delta_price_pct_1s_to_3s",
+            a1.price_pct,
+            a3.price_pct,
+            &a1.state_metrics_evidence,
+            &a3.state_metrics_evidence,
+            2_000,
+            |features, value| features.delta_price_pct_1s_to_3s = value,
+        );
+        Self::set_temporal_f64_delta(
+            features,
+            "delta_price_pct_2s_to_3s",
+            a2.price_pct,
+            a3.price_pct,
+            &a2.state_metrics_evidence,
+            &a3.state_metrics_evidence,
+            1_000,
+            |features, value| features.delta_price_pct_2s_to_3s = value,
+        );
+
+        Self::set_temporal_f64_delta(
+            features,
+            "delta_burstratio_1s_to_2s",
+            a1.burst_ratio,
+            a2.burst_ratio,
+            &a1.ratio_metrics_evidence,
+            &a2.ratio_metrics_evidence,
+            1_000,
+            |features, value| features.delta_burstratio_1s_to_2s = value,
+        );
+        Self::set_temporal_f64_delta(
+            features,
+            "delta_burstratio_1s_to_3s",
+            a1.burst_ratio,
+            a3.burst_ratio,
+            &a1.ratio_metrics_evidence,
+            &a3.ratio_metrics_evidence,
+            2_000,
+            |features, value| features.delta_burstratio_1s_to_3s = value,
+        );
+        Self::set_temporal_f64_delta(
+            features,
+            "delta_burstratio_2s_to_3s",
+            a2.burst_ratio,
+            a3.burst_ratio,
+            &a2.ratio_metrics_evidence,
+            &a3.ratio_metrics_evidence,
+            1_000,
+            |features, value| features.delta_burstratio_2s_to_3s = value,
+        );
+        Self::set_temporal_f64_delta(
+            features,
+            "delta_jito_tip_intensity_1s_to_2s",
+            a1.jito_tip_intensity,
+            a2.jito_tip_intensity,
+            &a1.ratio_metrics_evidence,
+            &a2.ratio_metrics_evidence,
+            1_000,
+            |features, value| features.delta_jito_tip_intensity_1s_to_2s = value,
+        );
+        Self::set_temporal_f64_delta(
+            features,
+            "delta_jito_tip_intensity_1s_to_3s",
+            a1.jito_tip_intensity,
+            a3.jito_tip_intensity,
+            &a1.ratio_metrics_evidence,
+            &a3.ratio_metrics_evidence,
+            2_000,
+            |features, value| features.delta_jito_tip_intensity_1s_to_3s = value,
+        );
+        Self::set_temporal_f64_delta(
+            features,
+            "delta_signer_cross_pool_velocity_1s_to_2s",
+            a1.signer_cross_pool_velocity,
+            a2.signer_cross_pool_velocity,
+            &a1.ratio_metrics_evidence,
+            &a2.ratio_metrics_evidence,
+            1_000,
+            |features, value| features.delta_signer_cross_pool_velocity_1s_to_2s = value,
+        );
+        Self::set_temporal_f64_delta(
+            features,
+            "delta_signer_cross_pool_velocity_1s_to_3s",
+            a1.signer_cross_pool_velocity,
+            a3.signer_cross_pool_velocity,
+            &a1.ratio_metrics_evidence,
+            &a3.ratio_metrics_evidence,
+            2_000,
+            |features, value| features.delta_signer_cross_pool_velocity_1s_to_3s = value,
+        );
+        Self::set_temporal_f64_delta(
+            features,
+            "delta_flipper_presence_ratio_1s_to_2s",
+            a1.flipper_presence_ratio,
+            a2.flipper_presence_ratio,
+            &a1.ratio_metrics_evidence,
+            &a2.ratio_metrics_evidence,
+            1_000,
+            |features, value| features.delta_flipper_presence_ratio_1s_to_2s = value,
+        );
+        Self::set_temporal_f64_delta(
+            features,
+            "delta_flipper_presence_ratio_1s_to_3s",
+            a1.flipper_presence_ratio,
+            a3.flipper_presence_ratio,
+            &a1.ratio_metrics_evidence,
+            &a3.ratio_metrics_evidence,
+            2_000,
+            |features, value| features.delta_flipper_presence_ratio_1s_to_3s = value,
+        );
+
+        Self::set_temporal_rate_from_f64_delta(
+            features,
+            "rate_mcap_sol_per_s_1s_to_2s",
+            "delta_mcap_1s_to_2s",
+            features.delta_mcap_1s_to_2s,
+            1_000,
+            |features, value| features.rate_mcap_sol_per_s_1s_to_2s = value,
+        );
+        Self::set_temporal_rate_from_f64_delta(
+            features,
+            "rate_mcap_sol_per_s_1s_to_3s",
+            "delta_mcap_1s_to_3s",
+            features.delta_mcap_1s_to_3s,
+            2_000,
+            |features, value| features.rate_mcap_sol_per_s_1s_to_3s = value,
+        );
+        Self::set_temporal_rate_from_f64_delta(
+            features,
+            "rate_mcap_sol_per_s_2s_to_3s",
+            "delta_mcap_2s_to_3s",
+            features.delta_mcap_2s_to_3s,
+            1_000,
+            |features, value| features.rate_mcap_sol_per_s_2s_to_3s = value,
+        );
+        Self::set_temporal_rate_from_i64_delta(
+            features,
+            "rate_buy_count_per_s_1s_to_2s",
+            "delta_buy_count_1s_to_2s",
+            features.delta_buy_count_1s_to_2s,
+            1_000,
+            |features, value| features.rate_buy_count_per_s_1s_to_2s = value,
+        );
+        Self::set_temporal_rate_from_i64_delta(
+            features,
+            "rate_buy_count_per_s_1s_to_3s",
+            "delta_buy_count_1s_to_3s",
+            features.delta_buy_count_1s_to_3s,
+            2_000,
+            |features, value| features.rate_buy_count_per_s_1s_to_3s = value,
+        );
+        Self::set_temporal_rate_from_i64_delta(
+            features,
+            "rate_unique_signers_per_s_1s_to_2s",
+            "delta_unique_signers_1s_to_2s",
+            features.delta_unique_signers_1s_to_2s,
+            1_000,
+            |features, value| features.rate_unique_signers_per_s_1s_to_2s = value,
+        );
+        Self::set_temporal_rate_from_i64_delta(
+            features,
+            "rate_unique_signers_per_s_1s_to_3s",
+            "delta_unique_signers_1s_to_3s",
+            features.delta_unique_signers_1s_to_3s,
+            2_000,
+            |features, value| features.rate_unique_signers_per_s_1s_to_3s = value,
+        );
+        Self::set_temporal_rate_from_f64_delta(
+            features,
+            "rate_net_quote_sol_per_s_1s_to_2s",
+            "delta_net_quote_sol_1s_to_2s",
+            features.delta_net_quote_sol_1s_to_2s,
+            1_000,
+            |features, value| features.rate_net_quote_sol_per_s_1s_to_2s = value,
+        );
+        Self::set_temporal_rate_from_f64_delta(
+            features,
+            "rate_net_quote_sol_per_s_1s_to_3s",
+            "delta_net_quote_sol_1s_to_3s",
+            features.delta_net_quote_sol_1s_to_3s,
+            2_000,
+            |features, value| features.rate_net_quote_sol_per_s_1s_to_3s = value,
+        );
+    }
+
+    fn set_temporal_i64_delta(
+        features: &mut TemporalDeltaFeatures,
+        field: &'static str,
+        from: Option<u64>,
+        to: Option<u64>,
+        from_evidence: &TemporalMetricEvidenceContext,
+        to_evidence: &TemporalMetricEvidenceContext,
+        _span_ms: u64,
+        assign: impl FnOnce(&mut TemporalDeltaFeatures, Option<i64>),
+    ) {
+        let (value, evidence) = match (from, to) {
+            (Some(from), Some(to)) => (
+                Some(to as i64 - from as i64),
+                Self::temporal_delta_evidence(from_evidence, to_evidence),
+            ),
+            _ => (
+                None,
+                Self::temporal_missing_delta_evidence(from_evidence, to_evidence),
+            ),
+        };
+        assign(features, value);
+        features.delta_evidence.insert(field.to_string(), evidence);
+    }
+
+    fn set_temporal_f64_delta(
+        features: &mut TemporalDeltaFeatures,
+        field: &'static str,
+        from: Option<f64>,
+        to: Option<f64>,
+        from_evidence: &TemporalMetricEvidenceContext,
+        to_evidence: &TemporalMetricEvidenceContext,
+        _span_ms: u64,
+        assign: impl FnOnce(&mut TemporalDeltaFeatures, Option<f64>),
+    ) {
+        let (value, evidence) = match (from, to) {
+            (Some(from), Some(to)) if from.is_finite() && to.is_finite() => (
+                Some(to - from),
+                Self::temporal_delta_evidence(from_evidence, to_evidence),
+            ),
+            _ => (
+                None,
+                Self::temporal_missing_delta_evidence(from_evidence, to_evidence),
+            ),
+        };
+        assign(features, value);
+        features.delta_evidence.insert(field.to_string(), evidence);
+    }
+
+    fn set_temporal_rate_from_f64_delta(
+        features: &mut TemporalDeltaFeatures,
+        rate_field: &'static str,
+        delta_field: &'static str,
+        delta: Option<f64>,
+        span_ms: u64,
+        assign: impl FnOnce(&mut TemporalDeltaFeatures, Option<f64>),
+    ) {
+        let rate = delta.map(|value| value / (span_ms as f64 / 1_000.0));
+        assign(features, rate);
+        if let Some(evidence) = features.delta_evidence.get(delta_field).cloned() {
+            features
+                .delta_evidence
+                .insert(rate_field.to_string(), evidence);
+        }
+    }
+
+    fn set_temporal_rate_from_i64_delta(
+        features: &mut TemporalDeltaFeatures,
+        rate_field: &'static str,
+        delta_field: &'static str,
+        delta: Option<i64>,
+        span_ms: u64,
+        assign: impl FnOnce(&mut TemporalDeltaFeatures, Option<f64>),
+    ) {
+        let rate = delta.map(|value| value as f64 / (span_ms as f64 / 1_000.0));
+        assign(features, rate);
+        if let Some(evidence) = features.delta_evidence.get(delta_field).cloned() {
+            features
+                .delta_evidence
+                .insert(rate_field.to_string(), evidence);
+        }
+    }
+
+    fn temporal_delta_evidence(
+        from_evidence: &TemporalMetricEvidenceContext,
+        to_evidence: &TemporalMetricEvidenceContext,
+    ) -> TemporalMetricEvidenceContext {
+        if to_evidence.source == TemporalMetricSource::CarriedForwardNoEvent {
+            return Self::temporal_context(
+                MetricEvidenceQuality::CarriedForward,
+                TemporalMetricSource::CarriedForwardNoEvent,
+                to_evidence.carried_from_anchor_ms,
+                to_evidence.staleness_ms,
+                None,
+            );
+        }
+        if from_evidence.quality == MetricEvidenceQuality::CarriedForward
+            || to_evidence.quality == MetricEvidenceQuality::CarriedForward
+        {
+            return Self::temporal_context(
+                MetricEvidenceQuality::CarriedForward,
+                TemporalMetricSource::PartialCarriedForward,
+                to_evidence
+                    .carried_from_anchor_ms
+                    .or(from_evidence.carried_from_anchor_ms),
+                to_evidence.staleness_ms.or(from_evidence.staleness_ms),
+                None,
+            );
+        }
+        Self::temporal_context(
+            MetricEvidenceQuality::Clean,
+            TemporalMetricSource::Observed,
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn temporal_missing_delta_evidence(
+        from_evidence: &TemporalMetricEvidenceContext,
+        to_evidence: &TemporalMetricEvidenceContext,
+    ) -> TemporalMetricEvidenceContext {
+        if matches!(to_evidence.quality, MetricEvidenceQuality::Stale) {
+            return to_evidence.clone();
+        }
+        if matches!(to_evidence.quality, MetricEvidenceQuality::NotAllowed) {
+            return to_evidence.clone();
+        }
+        if matches!(from_evidence.quality, MetricEvidenceQuality::Stale) {
+            return from_evidence.clone();
+        }
+        if matches!(from_evidence.quality, MetricEvidenceQuality::NotAllowed) {
+            return from_evidence.clone();
+        }
+        Self::temporal_context(
+            MetricEvidenceQuality::Unavailable,
+            TemporalMetricSource::Unavailable,
+            None,
+            None,
+            Some("anchor_value_unavailable"),
+        )
+    }
+
+    fn temporal_delta_status(features: &TemporalDeltaFeatures) -> EvidenceStatus {
+        if features.delta_evidence.values().any(|evidence| {
+            evidence.quality == MetricEvidenceQuality::CarriedForward
+                || evidence.source == TemporalMetricSource::CarriedForwardNoEvent
+                || evidence.source == TemporalMetricSource::PartialCarriedForward
+        }) {
+            EvidenceStatus::Degraded
+        } else if features
+            .delta_evidence
+            .values()
+            .any(|evidence| evidence.quality == MetricEvidenceQuality::Clean)
+        {
+            EvidenceStatus::Clean
+        } else if features.anchor_1s.reached
+            || features.anchor_2s.reached
+            || features.anchor_3s.reached
+        {
+            EvidenceStatus::InsufficientSample
+        } else {
+            EvidenceStatus::Unavailable
+        }
+    }
+
+    #[must_use]
     pub fn materialize_features(&self) -> MaterializedFeatureSet {
         let account_features = self.current_account_features();
         let mut materialized = self.feature_builder.materialize(
@@ -894,6 +2296,7 @@ impl PoolObservationSession {
         if let Some(fingerprint) = self.fingerprint_metrics() {
             materialized.alpha_fingerprint = AlphaFingerprintFeatures {
                 avg_inner_ix_count_50tx: fingerprint.avg_inner_ix_count_50tx,
+                avg_cpi_depth_50tx: fingerprint.avg_cpi_depth_50tx,
                 sell_buy_ratio: fingerprint.sell_buy_ratio,
                 compute_unit_cluster_dominance: fingerprint.compute_unit_cluster_dominance,
                 static_fee_profile_ratio: fingerprint.static_fee_profile_ratio,
@@ -945,7 +2348,24 @@ impl PoolObservationSession {
             Some(cpv_anchor_ts_ms),
             &self.cross_pool_velocity_config,
         );
-        materialized.sybil_resistance.signer_cross_pool_velocity = cpv.signer_cross_pool_velocity;
+        let cpv_can_emit_value = match cpv.status {
+            MetricEvidenceQuality::Clean => true,
+            MetricEvidenceQuality::DegradedLowSample => {
+                self.cross_pool_velocity_config.emit_degraded_low_sample
+            }
+            _ => false,
+        };
+        materialized.sybil_resistance.signer_cross_pool_velocity = if cpv_can_emit_value {
+            cpv.signer_cross_pool_velocity
+        } else {
+            None
+        };
+        materialized.sybil_resistance.cpv_other_pool_activity = if cpv_can_emit_value {
+            cpv.cpv_other_pool_activity
+        } else {
+            None
+        };
+        materialized.sybil_resistance.cpv_evidence = cpv.evidence_context();
         for reason in cpv.degraded_reasons {
             if !materialized
                 .sybil_resistance
@@ -979,6 +2399,8 @@ impl PoolObservationSession {
         materialized.organic_broadening = self.materialize_v3_organic_broadening(&materialized);
         materialized.manipulation_contradictions =
             self.materialize_v3_manipulation_contradictions(&materialized);
+        materialized.temporal_deltas = self.materialize_v3_temporal_deltas();
+        materialized.decision_time_series = self.materialize_decision_time_series();
         materialized.evidence_status = self.materialize_v3_evidence_status(&materialized);
 
         materialized

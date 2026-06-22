@@ -1,2 +1,0 @@
-    PID ELAPSED   RSS %CPU %MEM STAT COMMAND
-  93158    4301 1256004 183  7.8 Ssl+ ghost-launcher

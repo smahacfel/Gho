@@ -21,6 +21,7 @@ import selector_pipeline_common as common
 
 
 SCHEMA_VERSION = "gatekeeper_feature_context_v1"
+EVIDENCE_CONTRACT_VERSION = "gatekeeper_feature_context_evidence_v1"
 SOURCE = "gatekeeper_v2_decision_log"
 DECISION_PLANES = ("v25_shadow", "legacy_live", "auto")
 OBSERVATION_PROFILES = ("observation_8s_10s", "observation_60s", "all")
@@ -69,6 +70,7 @@ RAW_FEATURES = (
     "unique_tx_evaluated",
     "unique_signers_evaluated",
     "buy_count",
+    "burst_ratio",
     "buy_ratio",
     "sell_buy_ratio",
     "sol_buy_ratio",
@@ -98,6 +100,7 @@ RAW_FEATURES = (
     "spend_fraction_divergence",
     "demand_elasticity_score",
     "signer_cross_pool_velocity",
+    "cpv_other_pool_activity",
     "funding_source_concentration",
     "compute_unit_cluster_dominance",
     "static_fee_profile_ratio",
@@ -112,6 +115,52 @@ RAW_FEATURES = (
     "iwim_rug_threat_score",
     "iwim_sybil_score",
     "iwim_organic_score",
+    "vectors_price_finite_count",
+    "vectors_price_missing_count",
+    "vectors_price_coverage_ratio",
+    "vectors_price_source_reserve_count",
+    "vectors_price_source_quote_count",
+    "vectors_price_source_market_cap_count",
+    "vectors_price_source_history_count",
+    "vectors_price_source_account_state_count",
+    "vectors_price_source_carry_forward_count",
+    "vectors_price_source_missing_count",
+    "delta_mcap_1s_to_2s",
+    "delta_mcap_1s_to_3s",
+    "delta_mcap_2s_to_3s",
+    "delta_price_pct_1s_to_2s",
+    "delta_price_pct_1s_to_3s",
+    "delta_price_pct_2s_to_3s",
+    "delta_burstratio_1s_to_2s",
+    "delta_burstratio_1s_to_3s",
+    "delta_burstratio_2s_to_3s",
+    "delta_buy_count_1s_to_2s",
+    "delta_buy_count_1s_to_3s",
+    "delta_buy_count_2s_to_3s",
+    "delta_unique_signers_1s_to_2s",
+    "delta_unique_signers_1s_to_3s",
+    "delta_unique_signers_2s_to_3s",
+    "delta_tx_count_1s_to_2s",
+    "delta_tx_count_1s_to_3s",
+    "delta_tx_count_2s_to_3s",
+    "delta_net_quote_sol_1s_to_2s",
+    "delta_net_quote_sol_1s_to_3s",
+    "delta_net_quote_sol_2s_to_3s",
+    "delta_jito_tip_intensity_1s_to_2s",
+    "delta_jito_tip_intensity_1s_to_3s",
+    "delta_signer_cross_pool_velocity_1s_to_2s",
+    "delta_signer_cross_pool_velocity_1s_to_3s",
+    "delta_flipper_presence_ratio_1s_to_2s",
+    "delta_flipper_presence_ratio_1s_to_3s",
+    "rate_mcap_sol_per_s_1s_to_2s",
+    "rate_mcap_sol_per_s_1s_to_3s",
+    "rate_mcap_sol_per_s_2s_to_3s",
+    "rate_buy_count_per_s_1s_to_2s",
+    "rate_buy_count_per_s_1s_to_3s",
+    "rate_unique_signers_per_s_1s_to_2s",
+    "rate_unique_signers_per_s_1s_to_3s",
+    "rate_net_quote_sol_per_s_1s_to_2s",
+    "rate_net_quote_sol_per_s_1s_to_3s",
 )
 
 FSC_FEATURES = (
@@ -140,6 +189,91 @@ VECTOR_FEATURES = (
 MODEL_FEATURE_COLUMNS = tuple(
     f"gk_{field}" for field in RAW_FEATURES
 ) + FSC_FEATURES + VECTOR_FEATURES
+
+TEMPORAL_EVIDENCE_FIELDS = tuple(
+    field for field in RAW_FEATURES if field.startswith(("delta_", "rate_"))
+)
+
+CPV_EVIDENCE_FIELDS = (
+    "signer_cross_pool_velocity",
+    "cpv_other_pool_activity",
+)
+
+BASE_EVIDENCE_FIELDS = (
+    "total_tx_evaluated",
+    "unique_tx_evaluated",
+    "unique_signers_evaluated",
+    "buy_count",
+    "burst_ratio",
+    "flipper_presence_ratio",
+    "jito_tip_intensity",
+)
+
+EVIDENCE_VALUE_FIELDS = tuple(
+    dict.fromkeys(BASE_EVIDENCE_FIELDS + CPV_EVIDENCE_FIELDS + TEMPORAL_EVIDENCE_FIELDS)
+)
+
+EVIDENCE_POLICY_CONTEXT_FIELDS = (
+    "strict_metric_threshold_gate_enabled",
+    "strict_metric_missing_policy",
+    "cpv_low_sample_policy",
+    "cpv_min_successful_buy_signers_clean",
+    "cpv_min_successful_buy_signers_degraded",
+    "cpv_emit_degraded_low_sample",
+    "cpv_allow_degraded_in_strict_policy",
+    "temporal_carried_forward_policy",
+    "temporal_carry_forward_enabled",
+    "temporal_carry_forward_max_staleness_ms",
+    "temporal_carry_forward_event_counters_enabled",
+    "temporal_carry_forward_state_metrics_enabled",
+    "temporal_carry_forward_ratio_metrics_enabled",
+    "top_level_features_from_materialized_ssot",
+    "decision_time_series_tx_capacity",
+    "decision_time_series_retention_policy",
+)
+
+EVIDENCE_COLUMN_SUFFIXES = (
+    "_present",
+    "_status",
+    "_source",
+    "_sample_count",
+    "_required_sample_count",
+    "_required_clean_sample_count",
+    "_required_degraded_sample_count",
+    "_rolling_state_available",
+    "_degraded_reason",
+    "_reason",
+    "_staleness_ms",
+    "_carried_from_anchor_ms",
+)
+
+EVIDENCE_POLICY_GK_COLUMNS = ("gk_evidence_policy_context_present",) + tuple(
+    f"gk_{field}" for field in EVIDENCE_POLICY_CONTEXT_FIELDS
+)
+
+DECISION_TIME_SERIES_EVIDENCE_GK_COLUMNS = (
+    "gk_decision_time_series_present",
+    "gk_decision_time_series_source",
+    "gk_decision_time_series_evidence_status",
+    "gk_decision_time_series_retention_status",
+    "gk_decision_time_series_retention_policy",
+    "gk_decision_time_series_retention_capacity",
+    "gk_decision_time_series_retained_sample_count",
+    "gk_decision_time_series_total_tx_count",
+    "gk_decision_time_series_dropped_oldest_sample_count",
+    "gk_decision_time_series_price_finite_sample_count",
+    "gk_decision_time_series_price_missing_sample_count",
+)
+
+EMBEDDED_RAW_VALUE_PATHS = {
+    "total_tx_evaluated": ("tx_intel_features", "tx_count"),
+    "unique_tx_evaluated": ("tx_intel_features", "tx_count"),
+    "unique_signers_evaluated": ("tx_intel_features", "unique_signers"),
+    "buy_count": ("tx_intel_features", "buy_count"),
+    "burst_ratio": ("tx_intel_features", "burst_ratio"),
+    "flipper_presence_ratio": ("alpha_fingerprint", "flipper_presence_ratio"),
+    "jito_tip_intensity": ("alpha_fingerprint", "jito_tip_intensity"),
+}
 
 FORBIDDEN_FIELDS = {
     "decision_verdict_buy",
@@ -177,6 +311,81 @@ def number_or_bool(value: Any) -> Any:
     if isinstance(value, (int, float)) and math.isfinite(float(value)):
         return value
     return None
+
+
+def primitive_value(value: Any) -> Any:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        return value
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
+def first_string(value: Any) -> str | None:
+    if isinstance(value, str) and value:
+        return value
+    if isinstance(value, list):
+        for item in value:
+            if isinstance(item, str) and item:
+                return item
+    return None
+
+
+def nested_dict(row: dict[str, Any], *keys: str) -> dict[str, Any]:
+    current: Any = row
+    for key in keys:
+        if not isinstance(current, dict):
+            return {}
+        current = current.get(key)
+    return current if isinstance(current, dict) else {}
+
+
+def materialized_snapshot(row: dict[str, Any]) -> dict[str, Any]:
+    return (
+        nested_dict(row, "v3_materialized_feature_snapshot")
+        or nested_dict(row, "materialized_feature_snapshot")
+    )
+
+
+def embedded_raw_value(row: dict[str, Any], raw_field: str) -> Any:
+    snapshot = materialized_snapshot(row)
+    if raw_field in CPV_EVIDENCE_FIELDS:
+        return number_or_bool(
+            nested_dict(snapshot, "sybil_resistance", "cpv_evidence").get(raw_field)
+        )
+    if raw_field in TEMPORAL_EVIDENCE_FIELDS:
+        temporal = nested_dict(snapshot, "temporal_deltas")
+        for key in temporal_evidence_key_candidates(raw_field):
+            value = number_or_bool(temporal.get(key))
+            if value is not None:
+                return value
+        return None
+    path = EMBEDDED_RAW_VALUE_PATHS.get(raw_field)
+    if not path:
+        return None
+    current: Any = snapshot
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return number_or_bool(current)
+
+
+def raw_metric_value(row: dict[str, Any], raw_field: str) -> tuple[Any, str | None]:
+    value = number_or_bool(row.get(raw_field))
+    if value is not None:
+        return value, "top_level_decision_log"
+    value = embedded_raw_value(row, raw_field)
+    if value is not None:
+        return value, "embedded_materialized_snapshot"
+    return None, None
+
+
+def metric_present(row: dict[str, Any], raw_field: str) -> bool:
+    value, _source = raw_metric_value(row, raw_field)
+    return value is not None
 
 
 def numeric_list(value: Any) -> list[float]:
@@ -408,9 +617,201 @@ def match_decision_to_candidates(
 def extract_raw_features(row: dict[str, Any]) -> dict[str, Any]:
     features: dict[str, Any] = {}
     for raw_field in RAW_FEATURES:
-        value = number_or_bool(row.get(raw_field))
+        value, _source = raw_metric_value(row, raw_field)
         if value is not None:
             features[f"gk_{raw_field}"] = value
+    return features
+
+
+def extract_raw_evidence_presence(row: dict[str, Any]) -> dict[str, Any]:
+    features: dict[str, Any] = {}
+    for raw_field in EVIDENCE_VALUE_FIELDS:
+        value, source = raw_metric_value(row, raw_field)
+        present = value is not None
+        prefix = f"gk_{raw_field}"
+        features[f"{prefix}_present"] = present
+        if present:
+            features[f"{prefix}_status"] = "observed"
+            features[f"{prefix}_source"] = source
+    return features
+
+
+def extract_evidence_policy_context(row: dict[str, Any]) -> dict[str, Any]:
+    context = row.get("evidence_policy_context")
+    features: dict[str, Any] = {
+        "gk_evidence_policy_context_present": isinstance(context, dict)
+    }
+    if not isinstance(context, dict):
+        return features
+    for field in EVIDENCE_POLICY_CONTEXT_FIELDS:
+        value = primitive_value(context.get(field))
+        if value is not None:
+            features[f"gk_{field}"] = value
+    return features
+
+
+def extract_cpv_evidence(row: dict[str, Any]) -> dict[str, Any]:
+    snapshot = materialized_snapshot(row)
+    evidence = nested_dict(snapshot, "sybil_resistance", "cpv_evidence")
+    if not evidence:
+        return {}
+
+    features: dict[str, Any] = {}
+    quality = primitive_value(evidence.get("quality"))
+    source = primitive_value(evidence.get("source"))
+    sample_count = primitive_value(evidence.get("sample_count"))
+    required_clean = primitive_value(evidence.get("required_clean_sample_count"))
+    required_degraded = primitive_value(evidence.get("required_degraded_sample_count"))
+    rolling_available = primitive_value(evidence.get("rolling_state_available"))
+    degraded_reason = first_string(evidence.get("degraded_reasons")) or first_string(
+        evidence.get("degraded_reason")
+    )
+
+    for raw_field in CPV_EVIDENCE_FIELDS:
+        prefix = f"gk_{raw_field}"
+        embedded_value_present = number_or_bool(evidence.get(raw_field)) is not None
+        features[f"{prefix}_present"] = metric_present(row, raw_field) or embedded_value_present
+        if quality is not None:
+            features[f"{prefix}_status"] = quality
+        if source is not None:
+            features[f"{prefix}_source"] = source
+        if sample_count is not None:
+            features[f"{prefix}_sample_count"] = sample_count
+        if required_clean is not None:
+            features[f"{prefix}_required_clean_sample_count"] = required_clean
+            features[f"{prefix}_required_sample_count"] = required_clean
+        if required_degraded is not None:
+            features[f"{prefix}_required_degraded_sample_count"] = required_degraded
+        if rolling_available is not None:
+            features[f"{prefix}_rolling_state_available"] = rolling_available
+        if degraded_reason is not None:
+            features[f"{prefix}_degraded_reason"] = degraded_reason
+    return features
+
+
+def temporal_evidence_key_candidates(raw_field: str) -> list[str]:
+    candidates = [raw_field]
+    if raw_field.startswith("delta_burstratio_"):
+        candidates.append(raw_field.replace("delta_burstratio_", "delta_burst_ratio_", 1))
+    elif raw_field.startswith("delta_burst_ratio_"):
+        candidates.append(raw_field.replace("delta_burst_ratio_", "delta_burstratio_", 1))
+    return list(dict.fromkeys(candidates))
+
+
+def temporal_evidence_for(row: dict[str, Any], raw_field: str) -> dict[str, Any]:
+    snapshot = materialized_snapshot(row)
+    evidence_map = nested_dict(snapshot, "temporal_deltas", "delta_evidence")
+    if not evidence_map:
+        return {}
+    for key in temporal_evidence_key_candidates(raw_field):
+        evidence = evidence_map.get(key)
+        if isinstance(evidence, dict):
+            return evidence
+    return {}
+
+
+def extract_temporal_evidence(row: dict[str, Any]) -> dict[str, Any]:
+    features: dict[str, Any] = {}
+    for raw_field in TEMPORAL_EVIDENCE_FIELDS:
+        evidence = temporal_evidence_for(row, raw_field)
+        if not evidence:
+            continue
+        prefix = f"gk_{raw_field}"
+        features[f"{prefix}_present"] = metric_present(row, raw_field)
+        quality = primitive_value(evidence.get("quality"))
+        source = primitive_value(evidence.get("source"))
+        reason = primitive_value(evidence.get("reason"))
+        staleness_ms = primitive_value(evidence.get("staleness_ms"))
+        carried_from_anchor_ms = primitive_value(evidence.get("carried_from_anchor_ms"))
+        if quality is not None:
+            features[f"{prefix}_status"] = quality
+        if source is not None:
+            features[f"{prefix}_source"] = source
+        if reason is not None:
+            features[f"{prefix}_reason"] = reason
+        if staleness_ms is not None:
+            features[f"{prefix}_staleness_ms"] = staleness_ms
+        if carried_from_anchor_ms is not None:
+            features[f"{prefix}_carried_from_anchor_ms"] = carried_from_anchor_ms
+    return features
+
+
+def dts_value(row: dict[str, Any], dts: dict[str, Any], top_level_field: str, embedded_field: str) -> Any:
+    value = primitive_value(row.get(top_level_field))
+    if value is not None:
+        return value
+    return primitive_value(dts.get(embedded_field))
+
+
+def extract_decision_time_series_evidence(row: dict[str, Any]) -> dict[str, Any]:
+    snapshot = materialized_snapshot(row)
+    dts = nested_dict(snapshot, "decision_time_series")
+    top_vector_present = any(
+        isinstance(row.get(field), list) and len(row.get(field) or []) > 0
+        for field in ("vectors_prices", "vectors_ts_offsets_ms", "vectors_sol_amounts")
+    )
+    present = bool(dts) or top_vector_present
+    features: dict[str, Any] = {
+        "gk_decision_time_series_present": present,
+    }
+    if not present:
+        return features
+
+    features["gk_decision_time_series_source"] = (
+        "embedded_materialized_snapshot" if dts else "top_level_decision_log"
+    )
+
+    evidence_status = primitive_value(dts.get("status"))
+    if evidence_status is not None:
+        features["gk_decision_time_series_evidence_status"] = evidence_status
+
+    mapped_fields = {
+        "retention_status": (
+            "decision_time_series_retention_status",
+            "gk_decision_time_series_retention_status",
+        ),
+        "retention_policy": (
+            "decision_time_series_retention_policy",
+            "gk_decision_time_series_retention_policy",
+        ),
+        "retention_capacity": (
+            "decision_time_series_retention_capacity",
+            "gk_decision_time_series_retention_capacity",
+        ),
+        "retained_sample_count": (
+            "decision_time_series_retained_sample_count",
+            "gk_decision_time_series_retained_sample_count",
+        ),
+        "total_tx_count": (
+            "decision_time_series_total_tx_count",
+            "gk_decision_time_series_total_tx_count",
+        ),
+        "dropped_oldest_count": (
+            "decision_time_series_dropped_oldest_count",
+            "gk_decision_time_series_dropped_oldest_sample_count",
+        ),
+        "finite_price_count": (
+            "vectors_price_finite_count",
+            "gk_decision_time_series_price_finite_sample_count",
+        ),
+        "missing_price_count": (
+            "vectors_price_missing_count",
+            "gk_decision_time_series_price_missing_sample_count",
+        ),
+    }
+    for embedded_field, (top_level_field, output_field) in mapped_fields.items():
+        value = dts_value(row, dts, top_level_field, embedded_field)
+        if value is not None:
+            features[output_field] = value
+    return features
+
+
+def extract_evidence_features(row: dict[str, Any]) -> dict[str, Any]:
+    features = extract_raw_evidence_presence(row)
+    features.update(extract_evidence_policy_context(row))
+    features.update(extract_cpv_evidence(row))
+    features.update(extract_temporal_evidence(row))
+    features.update(extract_decision_time_series_evidence(row))
     return features
 
 
@@ -498,6 +899,7 @@ def extract_features(row: dict[str, Any]) -> dict[str, Any]:
     features = extract_raw_features(row)
     features.update(extract_fsc_features(row))
     features.update(extract_vector_features(row))
+    features.update(extract_evidence_features(row))
     return features
 
 
@@ -512,6 +914,14 @@ def forbidden_output_fields(row: dict[str, Any]) -> list[str]:
         if raw.startswith("max_") and "threshold" in raw:
             detected.append(key)
     return sorted(set(detected))
+
+
+def is_evidence_column(column: str) -> bool:
+    return (
+        column in EVIDENCE_POLICY_GK_COLUMNS
+        or column in DECISION_TIME_SERIES_EVIDENCE_GK_COLUMNS
+        or column.endswith(EVIDENCE_COLUMN_SUFFIXES)
+    )
 
 
 def build_output_row(
@@ -594,6 +1004,20 @@ def feature_presence(rows: list[dict[str, Any]], columns: list[str]) -> dict[str
     for column in columns:
         present = sum(1 for row in denominator if row.get(column) not in (None, "", []))
         out[column] = {
+            "present_rows": present,
+            "denominator_rows": len(denominator),
+            "present_rate": present / len(denominator) if denominator else 0.0,
+        }
+    return out
+
+
+def evidence_value_present_rates(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    denominator = [row for row in rows if row.get("gk_context_status") == MODEL_ALLOWED_CONTEXT_STATUS]
+    out: dict[str, dict[str, Any]] = {}
+    for raw_field in EVIDENCE_VALUE_FIELDS:
+        column = f"gk_{raw_field}_present"
+        present = sum(1 for row in denominator if row.get(column) is True)
+        out[raw_field] = {
             "present_rows": present,
             "denominator_rows": len(denominator),
             "present_rate": present / len(denominator) if denominator else 0.0,
@@ -707,7 +1131,12 @@ def build_context(
         for column in MODEL_FEATURE_COLUMNS
         if column in emitted_gk_columns and column not in PROVENANCE_GK_COLUMNS
     ]
+    evidence_feature_columns = [
+        column for column in emitted_gk_columns if is_evidence_column(column)
+    ]
     presence = feature_presence(rows, model_feature_columns)
+    evidence_presence = feature_presence(rows, evidence_feature_columns)
+    evidence_value_presence = evidence_value_present_rates(rows)
     gate_feature_presence = feature_presence(
         rows,
         sorted(set(CORE_MARKET_CURVE_FEATURES) | set(CONCENTRATION_SUPPORT_FEATURES)),
@@ -773,6 +1202,8 @@ def build_context(
         "core_feature_surface_status": core_feature_surface_status,
         "concentration_feature_surface_status": concentration_feature_surface_status,
         "model_policy": "missing_not_zero",
+        "evidence_contract_version": EVIDENCE_CONTRACT_VERSION,
+        "evidence_policy": "value_present_status_source_no_silent_imputation",
         "selector_schema_version": common.SCHEMA_VERSION,
         "artifact": "gatekeeper_feature_context_manifest_v1",
         "schema_version": SCHEMA_VERSION,
@@ -798,9 +1229,14 @@ def build_context(
         "cutoff_status_counts": common.counter_dict(cutoff_status_counts),
         "observation_profile_counts": common.counter_dict(observation_profile_counts),
         "feature_presence": presence,
+        "evidence_feature_presence": evidence_presence,
+        "evidence_value_present_rates": evidence_value_presence,
         "gate_feature_presence": gate_feature_presence,
         "feature_present_rates": {
             column: payload.get("present_rate") for column, payload in presence.items()
+        },
+        "evidence_feature_present_rates": {
+            column: payload.get("present_rate") for column, payload in evidence_presence.items()
         },
         "gate_feature_present_rates": {
             column: payload.get("present_rate") for column, payload in gate_feature_presence.items()
@@ -812,6 +1248,9 @@ def build_context(
         },
         "feature_columns": emitted_gk_columns,
         "model_feature_columns": model_feature_columns,
+        "evidence_feature_columns": evidence_feature_columns,
+        "evidence_value_fields": list(EVIDENCE_VALUE_FIELDS),
+        "evidence_policy_context_fields": list(EVIDENCE_POLICY_CONTEXT_FIELDS),
         "provenance_columns_not_model_features": sorted(PROVENANCE_GK_COLUMNS),
         "forbidden_fields_detected": forbidden,
         "denominator_created_rows": 0,

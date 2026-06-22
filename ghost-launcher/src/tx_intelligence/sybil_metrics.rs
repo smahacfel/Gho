@@ -18,6 +18,12 @@ const DBIA_CU_PRICE_WEIGHT: f64 = 0.05;
 const DBIA_INNER_GROUP_WEIGHT: f64 = 0.25;
 const DBIA_FEE_TOPOLOGY_WEIGHT: f64 = 0.20;
 const DES_SIGN_EPSILON: f64 = 1e-12;
+const MIN_DIAGNOSTIC_SAMPLE_COUNT: usize = 2;
+const MIN_CLEAN_BUY_SAMPLE_COUNT: u64 = 3;
+const MIN_CLEAN_DBIA_BUYER_COUNT: usize = 2;
+const MIN_DES_BUY_SAMPLE_COUNT: u64 = 3;
+const MIN_CLEAN_DES_BUY_SAMPLE_COUNT: u64 = 4;
+const LAMPORTS_PER_SOL_F64: f64 = 1_000_000_000.0;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FtdiComputation {
@@ -91,6 +97,7 @@ struct OrderedBuyTx<'a> {
 enum SfdSampleCoverage {
     MissingRequiredBalance,
     ZeroPreBalance,
+    BuyAmountFallback,
     Complete,
 }
 
@@ -185,6 +192,7 @@ fn sfd_sample_coverage(tx: &PoolTransaction) -> SfdSampleCoverage {
     match tx.signer_pre_balance_lamports {
         Some(0) => SfdSampleCoverage::ZeroPreBalance,
         Some(_) if tx.signer_post_balance_lamports.is_some() => SfdSampleCoverage::Complete,
+        Some(_) if tx_buy_amount_lamports(tx).is_some() => SfdSampleCoverage::BuyAmountFallback,
         _ => SfdSampleCoverage::MissingRequiredBalance,
     }
 }
@@ -280,18 +288,21 @@ fn ordered_buy_samples<'a>(buy_samples: &[SequencedBuyTx<'a>]) -> Option<Vec<Ord
 }
 
 fn curve_price(tx: &PoolTransaction) -> Option<f64> {
-    if !tx.curve_data_known {
-        return None;
+    if tx.curve_data_known {
+        if let (Some(v_sol), Some(v_tokens)) =
+            (tx.v_sol_in_bonding_curve, tx.v_tokens_in_bonding_curve)
+        {
+            if v_sol.is_finite() && v_tokens.is_finite() && v_tokens > 0.0 {
+                let price = v_sol / v_tokens;
+                if price.is_finite() && price > 0.0 {
+                    return Some(price);
+                }
+            }
+        }
     }
 
-    let v_sol = tx.v_sol_in_bonding_curve?;
-    let v_tokens = tx.v_tokens_in_bonding_curve?;
-    if !v_sol.is_finite() || !v_tokens.is_finite() || v_tokens <= 0.0 {
-        return None;
-    }
-
-    let price = v_sol / v_tokens;
-    (price.is_finite() && price > 0.0).then_some(price)
+    tx.price_quote
+        .filter(|price| price.is_finite() && *price > 0.0)
 }
 
 fn inter_buy_delta(previous: OrderedBuyTx<'_>, current: OrderedBuyTx<'_>) -> f64 {
@@ -337,7 +348,8 @@ pub fn compute_ftdi<'a>(
 
 fn compute_ftdi_from_buys(buy_txs: &[&PoolTransaction]) -> FtdiComputation {
     let stats = buy_sample_stats(buy_txs);
-    if stats.buy_sample_count < 3 {
+    let unique_samples = unique_buyer_samples(buy_txs);
+    if unique_samples.len() < MIN_DIAGNOSTIC_SAMPLE_COUNT {
         return FtdiComputation {
             fee_topology_diversity_index: None,
             degraded_reasons: vec![FTDI_INSUFFICIENT_BUYS_REASON.to_string()],
@@ -346,7 +358,11 @@ fn compute_ftdi_from_buys(buy_txs: &[&PoolTransaction]) -> FtdiComputation {
         };
     }
 
-    let unique_samples = unique_buyer_samples(buy_txs);
+    let mut degraded_reasons = Vec::new();
+    if stats.buy_sample_count < MIN_CLEAN_BUY_SAMPLE_COUNT {
+        degraded_reasons.push(FTDI_INSUFFICIENT_BUYS_REASON.to_string());
+    }
+
     let mut unique_topologies = HashSet::<FeeTopology>::new();
     for tx in &unique_samples {
         let Some((external_fee_count, internal_fee_count)) =
@@ -369,7 +385,7 @@ fn compute_ftdi_from_buys(buy_txs: &[&PoolTransaction]) -> FtdiComputation {
     FtdiComputation {
         fee_topology_diversity_index: (!unique_samples.is_empty())
             .then(|| unique_topologies.len() as f64 / unique_samples.len() as f64),
-        degraded_reasons: Vec::new(),
+        degraded_reasons,
         buy_sample_count: stats.buy_sample_count,
         signer_sample_count: stats.signer_sample_count,
     }
@@ -422,13 +438,17 @@ fn compute_dbia_from_buys<'a>(
         .into_iter()
         .filter(|tx| tx.signer != dev_wallet)
         .collect();
-    if buyer_txs.len() < 2 {
+    if buyer_txs.is_empty() {
         return DbiaComputation {
             dev_buyer_infrastructure_affinity: None,
             degraded_reasons: vec![DBIA_INSUFFICIENT_BUYERS_REASON.to_string()],
             buy_sample_count: stats.buy_sample_count,
             signer_sample_count: stats.signer_sample_count,
         };
+    }
+    let mut degraded_reasons = Vec::new();
+    if buyer_txs.len() < MIN_CLEAN_DBIA_BUYER_COUNT {
+        degraded_reasons.push(DBIA_INSUFFICIENT_BUYERS_REASON.to_string());
     }
 
     let mut similarity_sum = 0.0;
@@ -447,7 +467,7 @@ fn compute_dbia_from_buys<'a>(
 
     DbiaComputation {
         dev_buyer_infrastructure_affinity: Some(similarity_sum / buyer_txs.len() as f64),
-        degraded_reasons: Vec::new(),
+        degraded_reasons,
         buy_sample_count: stats.buy_sample_count,
         signer_sample_count: stats.signer_sample_count,
     }
@@ -462,7 +482,7 @@ pub fn compute_sfd<'a>(
 
 fn compute_sfd_from_buys(buy_txs: &[&PoolTransaction]) -> SfdComputation {
     let stats = buy_sample_stats(buy_txs);
-    if stats.buy_sample_count < 3 {
+    if stats.buy_sample_count < MIN_DIAGNOSTIC_SAMPLE_COUNT as u64 {
         return SfdComputation {
             spend_fraction_divergence: None,
             degraded_reasons: vec![SFD_INSUFFICIENT_BUYS_REASON.to_string()],
@@ -485,16 +505,22 @@ fn compute_sfd_from_buys(buy_txs: &[&PoolTransaction]) -> SfdComputation {
             zero_prebalance_skipped = true;
             continue;
         }
-        let Some(post_balance) = tx.signer_post_balance_lamports else {
-            partial_balance_coverage = true;
-            continue;
+
+        let spent_lamports = match tx.signer_post_balance_lamports {
+            Some(post_balance) if pre_balance >= post_balance => pre_balance - post_balance,
+            _ => {
+                partial_balance_coverage = true;
+                let Some(buy_amount_lamports) = tx_buy_amount_lamports(tx) else {
+                    continue;
+                };
+                buy_amount_lamports
+            }
         };
 
-        let spent_lamports = pre_balance.saturating_sub(post_balance);
         spend_fractions.push(spent_lamports as f64 / pre_balance as f64);
     }
 
-    if spend_fractions.len() < 3 {
+    if spend_fractions.len() < MIN_DIAGNOSTIC_SAMPLE_COUNT {
         let mut reasons = Vec::new();
         if zero_prebalance_skipped {
             reasons.push(SFD_ZERO_PREBALANCE_SKIPPED_REASON.to_string());
@@ -525,6 +551,9 @@ fn compute_sfd_from_buys(buy_txs: &[&PoolTransaction]) -> SfdComputation {
     if partial_balance_coverage {
         degraded_reasons.push(SFD_PARTIAL_BALANCE_COVERAGE_REASON.to_string());
     }
+    if spend_fractions.len() < MIN_CLEAN_BUY_SAMPLE_COUNT as usize {
+        degraded_reasons.push(SFD_INSUFFICIENT_BUYS_REASON.to_string());
+    }
 
     SfdComputation {
         spend_fraction_divergence,
@@ -546,7 +575,7 @@ fn compute_des_from_transactions(transactions: &[&PoolTransaction]) -> DesComput
     let buy_txs: Vec<&PoolTransaction> = buy_samples.iter().map(|sample| sample.tx).collect();
     let stats = buy_sample_stats(&buy_txs);
 
-    if stats.buy_sample_count < 4 {
+    if stats.buy_sample_count < MIN_DES_BUY_SAMPLE_COUNT {
         return DesComputation {
             demand_elasticity_score: None,
             degraded_reasons: vec![DES_INSUFFICIENT_BUYS_REASON.to_string()],
@@ -564,34 +593,72 @@ fn compute_des_from_transactions(transactions: &[&PoolTransaction]) -> DesComput
         };
     };
 
-    let mut prices = Vec::<f64>::with_capacity(ordered_buy_txs.len());
-    for sample in &ordered_buy_txs {
-        let Some(price) = curve_price(sample.tx) else {
-            return DesComputation {
-                demand_elasticity_score: None,
-                degraded_reasons: vec![DES_CURVE_DATA_UNAVAILABLE_REASON.to_string()],
-                buy_sample_count: stats.buy_sample_count,
-                signer_sample_count: stats.signer_sample_count,
-            };
-        };
-        prices.push(price);
-    }
+    let prices: Vec<Option<f64>> = ordered_buy_txs
+        .iter()
+        .map(|sample| curve_price(sample.tx))
+        .collect();
 
     let mut price_impacts = Vec::<f64>::with_capacity(ordered_buy_txs.len().saturating_sub(1));
     let mut timing_deltas = Vec::<f64>::with_capacity(ordered_buy_txs.len().saturating_sub(1));
+    let mut partial_curve_coverage = false;
     for index in 1..ordered_buy_txs.len() {
         let previous = ordered_buy_txs[index - 1];
         let current = ordered_buy_txs[index];
-        price_impacts.push((prices[index] - prices[index - 1]) / prices[index - 1]);
+        let (Some(previous_price), Some(current_price)) = (prices[index - 1], prices[index]) else {
+            partial_curve_coverage = true;
+            continue;
+        };
+        if previous_price <= 0.0 {
+            partial_curve_coverage = true;
+            continue;
+        }
+
+        price_impacts.push((current_price - previous_price) / previous_price);
         timing_deltas.push(inter_buy_delta(previous, current));
+    }
+
+    if price_impacts.len() < MIN_DIAGNOSTIC_SAMPLE_COUNT {
+        let mut reasons = Vec::new();
+        if partial_curve_coverage {
+            reasons.push(DES_CURVE_DATA_UNAVAILABLE_REASON.to_string());
+        }
+        if stats.buy_sample_count < MIN_CLEAN_DES_BUY_SAMPLE_COUNT {
+            reasons.push(DES_INSUFFICIENT_BUYS_REASON.to_string());
+        }
+        return DesComputation {
+            demand_elasticity_score: None,
+            degraded_reasons: reasons,
+            buy_sample_count: stats.buy_sample_count,
+            signer_sample_count: stats.signer_sample_count,
+        };
+    }
+
+    let mut degraded_reasons = Vec::new();
+    if partial_curve_coverage {
+        degraded_reasons.push(DES_CURVE_DATA_UNAVAILABLE_REASON.to_string());
+    }
+    if stats.buy_sample_count < MIN_CLEAN_DES_BUY_SAMPLE_COUNT {
+        degraded_reasons.push(DES_INSUFFICIENT_BUYS_REASON.to_string());
     }
 
     DesComputation {
         demand_elasticity_score: Some(kendall_tau(&price_impacts, &timing_deltas)),
-        degraded_reasons: Vec::new(),
+        degraded_reasons,
         buy_sample_count: stats.buy_sample_count,
         signer_sample_count: stats.signer_sample_count,
     }
+}
+
+fn tx_buy_amount_lamports(tx: &PoolTransaction) -> Option<u64> {
+    tx.sol_amount_lamports
+        .filter(|lamports| *lamports > 0)
+        .or_else(|| {
+            (tx.volume_sol.is_finite() && tx.volume_sol > 0.0)
+                .then(|| tx.volume_sol * LAMPORTS_PER_SOL_F64)
+                .filter(|lamports| lamports.is_finite() && *lamports > 0.0)
+                .filter(|lamports| *lamports <= u64::MAX as f64)
+                .map(|lamports| lamports.round() as u64)
+        })
 }
 
 pub fn compute_sybil_resistance<'a>(
@@ -747,6 +814,22 @@ mod tests {
         let mut tx = buy_tx(signer, signature, ToolchainFingerprintInput::default());
         tx.signer_pre_balance_lamports = pre_balance;
         tx.signer_post_balance_lamports = post_balance;
+        tx.sol_amount_lamports = None;
+        tx.volume_sol = 0.0;
+        tx
+    }
+
+    fn sfd_buy_tx_with_amount(
+        signer: &str,
+        signature: &str,
+        pre_balance: Option<u64>,
+        post_balance: Option<u64>,
+        buy_amount_lamports: Option<u64>,
+    ) -> PoolTransaction {
+        let mut tx = sfd_buy_tx(signer, signature, pre_balance, post_balance);
+        tx.sol_amount_lamports = buy_amount_lamports;
+        tx.volume_sol =
+            buy_amount_lamports.map_or(0.0, |lamports| lamports as f64 / LAMPORTS_PER_SOL_F64);
         tx
     }
 
@@ -813,7 +896,7 @@ mod tests {
     }
 
     #[test]
-    fn insufficient_buys_returns_none_and_reason() {
+    fn ftdi_two_buy_sample_exports_degraded_diagnostic_value() {
         let txs = vec![
             buy_tx("a", "sig-a", ftdi_fingerprint(Some((0, 0)))),
             buy_tx("b", "sig-b", ftdi_fingerprint(Some((1, 0)))),
@@ -821,7 +904,7 @@ mod tests {
 
         let result = compute_ftdi(txs.iter());
 
-        assert_eq!(result.fee_topology_diversity_index, None);
+        assert_eq!(result.fee_topology_diversity_index, Some(1.0));
         assert_eq!(
             result.degraded_reasons,
             vec![FTDI_INSUFFICIENT_BUYS_REASON.to_string()]
@@ -880,7 +963,7 @@ mod tests {
     }
 
     #[test]
-    fn dbia_requires_two_non_dev_buyers() {
+    fn dbia_single_non_dev_buyer_exports_degraded_diagnostic_value() {
         let txs = vec![
             dbia_buy_tx(
                 "dev",
@@ -898,7 +981,7 @@ mod tests {
 
         let result = compute_dbia(txs.iter(), Some("dev"));
 
-        assert_eq!(result.dev_buyer_infrastructure_affinity, None);
+        assert_eq!(result.dev_buyer_infrastructure_affinity, Some(1.0));
         assert_eq!(
             result.degraded_reasons,
             vec![DBIA_INSUFFICIENT_BUYERS_REASON.to_string()]
@@ -1036,22 +1119,39 @@ mod tests {
     }
 
     #[test]
-    fn sfd_missing_postbalance_returns_none_and_reason() {
+    fn sfd_two_usable_samples_materialize_degraded_diagnostic_value() {
         let txs = vec![
             sfd_buy_tx("a", "sig-a", Some(100), Some(10)),
-            sfd_buy_tx("b", "sig-b", Some(100), None),
+            sfd_buy_tx_with_amount("b", "sig-b", Some(100), None, None),
             sfd_buy_tx("c", "sig-c", Some(100), Some(20)),
         ];
 
         let result = compute_sfd(txs.iter());
 
-        assert_eq!(result.spend_fraction_divergence, None);
+        assert_approx_eq(result.spend_fraction_divergence.unwrap(), 0.05);
         assert_eq!(
             result.degraded_reasons,
             vec![
-                SFD_POSTBALANCE_UNAVAILABLE_REASON.to_string(),
+                SFD_PARTIAL_BALANCE_COVERAGE_REASON.to_string(),
                 SFD_INSUFFICIENT_BUYS_REASON.to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn sfd_missing_postbalance_uses_buy_amount_fallback() {
+        let txs = vec![
+            sfd_buy_tx("a", "sig-a", Some(100), Some(10)),
+            sfd_buy_tx_with_amount("b", "sig-b", Some(100), None, Some(20)),
+            sfd_buy_tx("c", "sig-c", Some(100), Some(20)),
+        ];
+
+        let result = compute_sfd(txs.iter());
+
+        assert_approx_eq(result.spend_fraction_divergence.unwrap(), 0.10);
+        assert_eq!(
+            result.degraded_reasons,
+            vec![SFD_PARTIAL_BALANCE_COVERAGE_REASON.to_string()]
         );
     }
 
@@ -1076,7 +1176,7 @@ mod tests {
             sfd_buy_tx("a", "sig-a", Some(100), Some(10)),
             sfd_buy_tx("b", "sig-b", Some(100), Some(10)),
             sfd_buy_tx("c", "sig-c", Some(100), Some(10)),
-            sfd_buy_tx("d", "sig-d", Some(100), None),
+            sfd_buy_tx_with_amount("d", "sig-d", Some(100), None, None),
         ];
 
         let result = compute_sfd(txs.iter());
@@ -1179,6 +1279,26 @@ mod tests {
         assert_eq!(
             result.degraded_reasons,
             vec![DES_CURVE_DATA_UNAVAILABLE_REASON.to_string()]
+        );
+    }
+
+    #[test]
+    fn des_uses_price_quote_when_curve_state_is_missing() {
+        let mut txs = vec![
+            des_buy_tx("a", "sig-a", Some(1), Some(0), None, None),
+            des_buy_tx("b", "sig-b", Some(2), Some(0), None, None),
+            des_buy_tx("c", "sig-c", Some(4), Some(0), None, None),
+        ];
+        txs[0].price_quote = Some(10.0);
+        txs[1].price_quote = Some(11.0);
+        txs[2].price_quote = Some(13.2);
+
+        let result = compute_des(txs.iter());
+
+        assert_eq!(result.demand_elasticity_score, Some(1.0));
+        assert_eq!(
+            result.degraded_reasons,
+            vec![DES_INSUFFICIENT_BUYS_REASON.to_string()]
         );
     }
 

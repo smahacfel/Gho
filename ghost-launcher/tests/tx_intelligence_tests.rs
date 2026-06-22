@@ -1,5 +1,8 @@
 use ghost_brain::config::GatekeeperV2Config;
 use ghost_brain::fast_pipeline::EnhancedCandidate;
+use ghost_core::checkpoint::{
+    DecisionTimeSeriesRetentionStatus, EvidenceDegradedReason, EvidenceStatus,
+};
 use ghost_core::session::types::SessionStatus;
 use ghost_core::{CurveFinality, EventSemanticEnvelope};
 use ghost_launcher::events::{PoolTransaction, RawBytesMissingReason};
@@ -330,6 +333,198 @@ fn session_tx_buffer_is_bounded() {
         guard.tx_buffer.front().map(|tx| tx.signature.as_str()),
         Some("sig-buffer-5")
     );
+    let features = guard.materialize_features();
+    assert_eq!(
+        features.decision_time_series.retention_status,
+        DecisionTimeSeriesRetentionStatus::Truncated
+    );
+    assert_eq!(
+        features.decision_time_series.status,
+        EvidenceStatus::Degraded
+    );
+    assert_eq!(
+        features.decision_time_series.sample_count,
+        DEFAULT_SESSION_TX_RING_CAPACITY as u64
+    );
+    assert_eq!(
+        features.decision_time_series.retained_sample_count,
+        DEFAULT_SESSION_TX_RING_CAPACITY as u64
+    );
+    assert_eq!(
+        features.decision_time_series.total_tx_count,
+        (DEFAULT_SESSION_TX_RING_CAPACITY + 5) as u64
+    );
+    assert_eq!(features.decision_time_series.dropped_oldest_count, 5);
+    assert!(features
+        .decision_time_series
+        .degraded_reasons
+        .contains(&EvidenceDegradedReason::DecisionTimeSeriesTruncated));
+}
+
+#[test]
+fn session_decision_time_series_capacity_is_configurable() {
+    let manager = SessionManager::new(SessionConfig {
+        default_observation_duration_ms: 100,
+        max_sessions: 8,
+        ..SessionConfig::default()
+    });
+    let pool_id = Pubkey::new_unique();
+    let base_mint = Pubkey::new_unique();
+    let bonding_curve = Pubkey::new_unique();
+    let mut gatekeeper_config = GatekeeperV2Config::default();
+    gatekeeper_config.decision_time_series_tx_capacity = DEFAULT_SESSION_TX_RING_CAPACITY + 16;
+    gatekeeper_config.min_tx_count = DEFAULT_SESSION_TX_RING_CAPACITY * 2;
+    gatekeeper_config.min_unique_signers = DEFAULT_SESSION_TX_RING_CAPACITY * 2;
+    gatekeeper_config.min_buy_count = DEFAULT_SESSION_TX_RING_CAPACITY * 2;
+    gatekeeper_config.max_wait_time_ms = 10_000;
+    let funding_source_config = FundingSourceConfig::from_gatekeeper_config(&gatekeeper_config);
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock should be after unix epoch")
+        .as_millis() as u64;
+
+    manager
+        .open_session(OpenSessionRequest {
+            pool_amm_id: pool_id,
+            base_mint,
+            bonding_curve,
+            dev_wallet: Some(Pubkey::new_unique()),
+            candidate_snapshot: candidate(pool_id, base_mint, bonding_curve),
+            created_at_wall_ms: now_ms,
+            deadline_wall_ms: Some(now_ms + 10_000),
+            gatekeeper_config,
+            funding_source_config,
+            fingerprint_config: EarlyFingerprintConfig::default(),
+        })
+        .expect("session should open");
+    let session = manager
+        .get_session(&pool_id)
+        .expect("session should be retrievable");
+
+    for i in 0..(DEFAULT_SESSION_TX_RING_CAPACITY + 5) as u32 {
+        let signer = Pubkey::new_unique();
+        let mut tx = test_tx(
+            pool_id,
+            signer,
+            &format!("sig-config-buffer-{i}"),
+            i,
+            now_ms + u64::from(i),
+            true,
+            0.2,
+            false,
+        );
+        tx.reserve_quote = Some(1_000.0 + f64::from(i));
+        tx.reserve_base = Some(1_000_000.0);
+        let tx = Arc::new(tx);
+        let _ = session.write().ingest_transaction(tx);
+    }
+
+    let guard = session.read();
+    assert_eq!(guard.tx_buffer.len(), DEFAULT_SESSION_TX_RING_CAPACITY + 5);
+    assert_eq!(
+        guard.tx_buffer.front().map(|tx| tx.signature.as_str()),
+        Some("sig-config-buffer-0")
+    );
+    let features = guard.materialize_features();
+    assert_eq!(
+        features.decision_time_series.retention_status,
+        DecisionTimeSeriesRetentionStatus::Clean
+    );
+    assert_eq!(features.decision_time_series.status, EvidenceStatus::Clean);
+    assert_eq!(
+        features.decision_time_series.sample_count,
+        (DEFAULT_SESSION_TX_RING_CAPACITY + 5) as u64
+    );
+    assert_eq!(
+        features.decision_time_series.retained_sample_count,
+        (DEFAULT_SESSION_TX_RING_CAPACITY + 5) as u64
+    );
+    assert_eq!(
+        features.decision_time_series.total_tx_count,
+        (DEFAULT_SESSION_TX_RING_CAPACITY + 5) as u64
+    );
+    assert_eq!(features.decision_time_series.dropped_oldest_count, 0);
+}
+
+#[test]
+fn session_decision_time_series_retains_beyond_gatekeeper_dedupe_fifo_capacity() {
+    let manager = SessionManager::new(SessionConfig {
+        default_observation_duration_ms: 100,
+        max_sessions: 8,
+        ..SessionConfig::default()
+    });
+    let pool_id = Pubkey::new_unique();
+    let base_mint = Pubkey::new_unique();
+    let bonding_curve = Pubkey::new_unique();
+    let mut gatekeeper_config = GatekeeperV2Config::default();
+    gatekeeper_config.decision_time_series_tx_capacity = 512;
+    gatekeeper_config.max_wait_time_ms = 10_000;
+    let funding_source_config = FundingSourceConfig::from_gatekeeper_config(&gatekeeper_config);
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock should be after unix epoch")
+        .as_millis() as u64;
+
+    manager
+        .open_session(OpenSessionRequest {
+            pool_amm_id: pool_id,
+            base_mint,
+            bonding_curve,
+            dev_wallet: Some(Pubkey::new_unique()),
+            candidate_snapshot: candidate(pool_id, base_mint, bonding_curve),
+            created_at_wall_ms: now_ms,
+            deadline_wall_ms: Some(now_ms + 10_000),
+            gatekeeper_config,
+            funding_source_config,
+            fingerprint_config: EarlyFingerprintConfig::default(),
+        })
+        .expect("session should open");
+    let session = manager
+        .get_session(&pool_id)
+        .expect("session should be retrievable");
+
+    let tx_count = 300usize;
+    for i in 0..tx_count as u32 {
+        let signer = Pubkey::new_unique();
+        let mut tx = test_tx(
+            pool_id,
+            signer,
+            &format!("sig-dedupe-fifo-buffer-{i}"),
+            i,
+            now_ms + u64::from(i),
+            true,
+            0.2,
+            false,
+        );
+        tx.reserve_quote = Some(1_000.0 + f64::from(i));
+        tx.reserve_base = Some(1_000_000.0);
+        let _ = session.write().ingest_transaction(Arc::new(tx));
+    }
+
+    let guard = session.read();
+    assert_eq!(
+        guard.tx_buffer.len(),
+        tx_count,
+        "decision series must retain accepted unique tx beyond GatekeeperBuffer's 256-key FIFO"
+    );
+    let features = guard.materialize_features();
+    assert_eq!(
+        features.decision_time_series.retention_status,
+        DecisionTimeSeriesRetentionStatus::Clean
+    );
+    assert_eq!(features.decision_time_series.status, EvidenceStatus::Clean);
+    assert_eq!(features.decision_time_series.sample_count, tx_count as u64);
+    assert_eq!(
+        features.decision_time_series.retained_sample_count,
+        tx_count as u64
+    );
+    assert_eq!(
+        features.decision_time_series.total_tx_count,
+        tx_count as u64
+    );
+    assert_eq!(features.decision_time_series.dropped_oldest_count, 0);
 }
 
 #[test]

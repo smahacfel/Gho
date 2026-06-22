@@ -33,6 +33,7 @@ pub enum GatekeeperReasonCode {
     HardFailSellImpact,
     HardFailTxPriceImpact,
     HardFailPriceChange,
+    HardFailStrictMetricThreshold,
 
     // ── PDD ──
     RejectPddEntryDrift,
@@ -48,6 +49,8 @@ pub enum GatekeeperReasonCode {
     RejectSybilInterference,
     RejectSybilSoftExcess,
     RejectLegacySoftExcess,
+    RejectSelectorNotCandidate,
+    RejectSelectorBelowBuy,
     RejectLowAlpha,
     RejectLowProsperity,
 
@@ -131,6 +134,7 @@ impl GatekeeperReasonCode {
             "SellImpact" => Some(Self::HardFailSellImpact),
             "TxPriceImpact" => Some(Self::HardFailTxPriceImpact),
             "PriceChange" => Some(Self::HardFailPriceChange),
+            "StrictMetricThreshold" => Some(Self::HardFailStrictMetricThreshold),
             _ => None,
         }
     }
@@ -147,6 +151,8 @@ impl GatekeeperReasonCode {
             "REJECT_CORE_FAIL" => Self::RejectCoreFail,
             "REJECT_SOFT_EXCESS" => Self::RejectLegacySoftExcess,
             "REJECT_SYBIL_SOFT_EXCESS" => Self::RejectSybilSoftExcess,
+            "REJECT_SELECTOR_NOT_CANDIDATE" => Self::RejectSelectorNotCandidate,
+            "REJECT_SELECTOR_BELOW_BUY" => Self::RejectSelectorBelowBuy,
             "REJECT_SYBIL_INTERFERENCE" => Self::RejectSybilInterference,
             "REJECT_LOW_ALPHA" => Self::RejectLowAlpha,
             "REJECT_LOW_PROSPERITY" => Self::RejectLowProsperity,
@@ -200,6 +206,7 @@ mod tests {
     fn test_reason_code_serialization_roundtrip() {
         let codes = [
             GatekeeperReasonCode::BuyNormal,
+            GatekeeperReasonCode::HardFailStrictMetricThreshold,
             GatekeeperReasonCode::RejectPddEntryDrift,
             GatekeeperReasonCode::TimeoutPhase1NoData,
             GatekeeperReasonCode::ShadowInsufficientData,
@@ -218,6 +225,10 @@ mod tests {
 
         let json = serde_json::to_string(&GatekeeperReasonCode::RejectPddEntryDrift).unwrap();
         assert_eq!(json, "\"REJECT_PDD_ENTRY_DRIFT\"");
+
+        let json =
+            serde_json::to_string(&GatekeeperReasonCode::HardFailStrictMetricThreshold).unwrap();
+        assert_eq!(json, "\"HARD_FAIL_STRICT_METRIC_THRESHOLD\"");
     }
 
     #[test]

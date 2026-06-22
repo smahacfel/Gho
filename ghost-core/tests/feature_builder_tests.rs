@@ -1,8 +1,9 @@
 use ghost_core::account_state_core::types::{AccountStateFeatures, StatePhase};
 use ghost_core::checkpoint::{
-    CheckpointDerivedFeatures, CheckpointTrigger, EvidenceStatus, EvidenceUnavailableReason,
-    FeatureMaterializer, MaterializedFeatureSet, ObservationFeatureBuilder, SessionCheckpoint,
-    TrendDirection,
+    CheckpointDerivedFeatures, CheckpointTrigger, CpvEvidenceContext, CpvMetricSource,
+    EvidenceStatus, EvidenceUnavailableReason, FeatureMaterializer, MaterializedFeatureSet,
+    MetricEvidenceQuality, ObservationFeatureBuilder, SessionCheckpoint, TemporalAnchorReachedBy,
+    TemporalMetricEvidenceContext, TemporalMetricSource, TrendDirection,
 };
 use ghost_core::session::types::{SessionId, SessionMetadata};
 use ghost_core::tx_intelligence::types::{RiskFlag, RiskSeverity, TxIntelFeatures};
@@ -310,4 +311,41 @@ fn feature_builder_returns_insufficient_trends_without_checkpoint_history() {
             trajectory_assessment: None,
         }
     );
+}
+
+#[test]
+fn evidence_foundation_shell_types_serialize_in_snake_case() {
+    let temporal = TemporalMetricEvidenceContext {
+        quality: MetricEvidenceQuality::CarriedForward,
+        source: TemporalMetricSource::CarriedForwardNoEvent,
+        carried_from_anchor_ms: Some(1_000),
+        staleness_ms: Some(250),
+        reason: Some("no_event_after_anchor".to_string()),
+    };
+    let cpv = CpvEvidenceContext {
+        quality: MetricEvidenceQuality::DegradedLowSample,
+        source: CpvMetricSource::SuccessfulBuyRollingIndex,
+        signer_cross_pool_velocity: Some(0.5),
+        cpv_other_pool_activity: Some(0.5),
+        sample_count: Some(2),
+        required_clean_sample_count: Some(3),
+        required_degraded_sample_count: Some(2),
+        rolling_state_available: Some(true),
+        degraded_reasons: vec!["CPV_LOW_SAMPLE_DEGRADED".to_string()],
+    };
+
+    let temporal_json = serde_json::to_value(&temporal).expect("serialize temporal shell");
+    let cpv_json = serde_json::to_value(&cpv).expect("serialize cpv shell");
+    let anchor_json =
+        serde_json::to_value(TemporalAnchorReachedBy::ObservationElapsed).expect("serialize enum");
+
+    assert_eq!(temporal_json["quality"], "carried_forward");
+    assert_eq!(temporal_json["source"], "carried_forward_no_event");
+    assert_eq!(temporal_json["reason"], "no_event_after_anchor");
+    assert_eq!(cpv_json["quality"], "degraded_low_sample");
+    assert_eq!(cpv_json["source"], "successful_buy_rolling_index");
+    assert_eq!(cpv_json["signer_cross_pool_velocity"], 0.5);
+    assert_eq!(cpv_json["cpv_other_pool_activity"], 0.5);
+    assert_eq!(cpv_json["degraded_reasons"][0], "CPV_LOW_SAMPLE_DEGRADED");
+    assert_eq!(anchor_json, "observation_elapsed");
 }

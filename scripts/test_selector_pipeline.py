@@ -490,6 +490,171 @@ class SelectorPipelineTests(unittest.TestCase):
         self.assertEqual(rows[0]["gk_fsc_known_source_rate"], 0.3)
         self.assertEqual(rows[0]["gk_vector_event_count"], 3)
 
+    def test_gatekeeper_feature_context_exports_evidence_without_imputation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = "selector-gk-evidence-context-test"
+            source_scope = "source-gk-evidence-context-test"
+            _candidate_path, decision_path = self.write_gatekeeper_context_fixture(
+                root, scope=scope, source_scope=source_scope
+            )
+            decision = read_jsonl(decision_path)[0]
+            decision.update(
+                {
+                    "log_schema_version": 29,
+                    "burst_ratio": 0.75,
+                    "total_tx_evaluated": 4,
+                    "unique_signers_evaluated": 3,
+                    "buy_count": 2,
+                    "signer_cross_pool_velocity": 0.5,
+                    "delta_buy_count_1s_to_3s": 0,
+                    "delta_jito_tip_intensity_1s_to_3s": None,
+                    "decision_time_series_retention_status": "clean",
+                    "decision_time_series_retention_policy": "truncate_with_status",
+                    "decision_time_series_retention_capacity": 4096,
+                    "decision_time_series_retained_sample_count": 4,
+                    "decision_time_series_total_tx_count": 4,
+                    "decision_time_series_dropped_oldest_count": 0,
+                    "vectors_price_finite_count": 4,
+                    "vectors_price_missing_count": 0,
+                    "evidence_policy_context": {
+                        "strict_metric_threshold_gate_enabled": True,
+                        "strict_metric_missing_policy": "hard_fail",
+                        "cpv_low_sample_policy": "reason_only",
+                        "cpv_min_successful_buy_signers_clean": 3,
+                        "cpv_min_successful_buy_signers_degraded": 2,
+                        "cpv_emit_degraded_low_sample": True,
+                        "cpv_allow_degraded_in_strict_policy": False,
+                        "temporal_carried_forward_policy": "use_for_selector_only",
+                        "temporal_carry_forward_enabled": True,
+                        "temporal_carry_forward_max_staleness_ms": 1_000,
+                        "temporal_carry_forward_event_counters_enabled": True,
+                        "temporal_carry_forward_state_metrics_enabled": False,
+                        "temporal_carry_forward_ratio_metrics_enabled": False,
+                        "top_level_features_from_materialized_ssot": True,
+                        "decision_time_series_tx_capacity": 4096,
+                        "decision_time_series_retention_policy": "truncate_with_status",
+                    },
+                    "v3_materialized_feature_snapshot": {
+                        "decision_time_series": {
+                            "status": "clean",
+                            "retention_status": "clean",
+                            "retention_policy": "truncate_with_status",
+                            "retention_capacity": 4096,
+                            "retained_sample_count": 4,
+                            "total_tx_count": 4,
+                            "dropped_oldest_count": 0,
+                            "finite_price_count": 4,
+                            "missing_price_count": 0,
+                        },
+                        "sybil_resistance": {
+                            "cpv_evidence": {
+                                "quality": "degraded_low_sample",
+                                "source": "successful_buy_rolling_index",
+                                "signer_cross_pool_velocity": 0.5,
+                                "cpv_other_pool_activity": 1.25,
+                                "sample_count": 2,
+                                "required_clean_sample_count": 3,
+                                "required_degraded_sample_count": 2,
+                                "rolling_state_available": True,
+                                "degraded_reasons": ["CPV_LOW_SAMPLE_DEGRADED"],
+                            }
+                        },
+                        "temporal_deltas": {
+                            "delta_evidence": {
+                                "delta_buy_count_1s_to_3s": {
+                                    "quality": "carried_forward",
+                                    "source": "carried_forward_no_event",
+                                    "carried_from_anchor_ms": 2_000,
+                                    "staleness_ms": 1_000,
+                                },
+                                "delta_jito_tip_intensity_1s_to_3s": {
+                                    "quality": "not_allowed",
+                                    "source": "not_allowed",
+                                    "reason": "ratio_carry_forward_not_allowed",
+                                },
+                            }
+                        },
+                    },
+                }
+            )
+            write_jsonl(decision_path, [decision])
+
+            summary = gk_context.run(
+                gk_context.build_parser().parse_args(
+                    [
+                        "--root",
+                        str(root),
+                        "--scope",
+                        scope,
+                        "--source-scope",
+                        source_scope,
+                        "--decision-plane",
+                        "v25_shadow",
+                        "--observation-profile",
+                        "observation_8s_10s",
+                    ]
+                )
+            )
+            rows = read_jsonl(Path(summary["outputs"]["gatekeeper_feature_context_v1"]))
+
+        row = rows[0]
+        manifest = summary["manifest"]
+        self.assertEqual(row["gk_burst_ratio"], 0.75)
+        self.assertTrue(row["gk_burst_ratio_present"])
+        self.assertEqual(row["gk_burst_ratio_status"], "observed")
+        self.assertEqual(row["gk_evidence_policy_context_present"], True)
+        self.assertEqual(row["gk_strict_metric_missing_policy"], "hard_fail")
+        self.assertEqual(row["gk_cpv_low_sample_policy"], "reason_only")
+        self.assertEqual(row["gk_temporal_carried_forward_policy"], "use_for_selector_only")
+        self.assertEqual(row["gk_decision_time_series_tx_capacity"], 4096)
+        self.assertEqual(row["gk_decision_time_series_retention_policy"], "truncate_with_status")
+
+        self.assertTrue(row["gk_decision_time_series_present"])
+        self.assertEqual(row["gk_decision_time_series_evidence_status"], "clean")
+        self.assertEqual(row["gk_decision_time_series_retention_status"], "clean")
+        self.assertEqual(row["gk_decision_time_series_retention_policy"], "truncate_with_status")
+        self.assertEqual(row["gk_decision_time_series_retention_capacity"], 4096)
+        self.assertEqual(row["gk_decision_time_series_retained_sample_count"], 4)
+        self.assertEqual(row["gk_decision_time_series_total_tx_count"], 4)
+        self.assertEqual(row["gk_decision_time_series_dropped_oldest_sample_count"], 0)
+        self.assertEqual(row["gk_decision_time_series_price_finite_sample_count"], 4)
+        self.assertEqual(row["gk_decision_time_series_price_missing_sample_count"], 0)
+
+        self.assertEqual(row["gk_signer_cross_pool_velocity"], 0.5)
+        self.assertTrue(row["gk_signer_cross_pool_velocity_present"])
+        self.assertEqual(row["gk_signer_cross_pool_velocity_status"], "degraded_low_sample")
+        self.assertEqual(row["gk_signer_cross_pool_velocity_source"], "successful_buy_rolling_index")
+        self.assertEqual(row["gk_signer_cross_pool_velocity_sample_count"], 2)
+        self.assertEqual(row["gk_signer_cross_pool_velocity_required_clean_sample_count"], 3)
+        self.assertEqual(row["gk_signer_cross_pool_velocity_required_degraded_sample_count"], 2)
+        self.assertEqual(row["gk_signer_cross_pool_velocity_degraded_reason"], "CPV_LOW_SAMPLE_DEGRADED")
+        self.assertEqual(row["gk_cpv_other_pool_activity"], 1.25)
+        self.assertEqual(row["gk_cpv_other_pool_activity_status"], "degraded_low_sample")
+
+        self.assertEqual(row["gk_delta_buy_count_1s_to_3s"], 0)
+        self.assertTrue(row["gk_delta_buy_count_1s_to_3s_present"])
+        self.assertEqual(row["gk_delta_buy_count_1s_to_3s_status"], "carried_forward")
+        self.assertEqual(row["gk_delta_buy_count_1s_to_3s_source"], "carried_forward_no_event")
+        self.assertEqual(row["gk_delta_buy_count_1s_to_3s_carried_from_anchor_ms"], 2_000)
+        self.assertEqual(row["gk_delta_buy_count_1s_to_3s_staleness_ms"], 1_000)
+
+        self.assertNotIn("gk_delta_jito_tip_intensity_1s_to_3s", row)
+        self.assertFalse(row["gk_delta_jito_tip_intensity_1s_to_3s_present"])
+        self.assertEqual(row["gk_delta_jito_tip_intensity_1s_to_3s_status"], "not_allowed")
+        self.assertEqual(row["gk_delta_jito_tip_intensity_1s_to_3s_source"], "not_allowed")
+        self.assertEqual(
+            row["gk_delta_jito_tip_intensity_1s_to_3s_reason"],
+            "ratio_carry_forward_not_allowed",
+        )
+
+        self.assertEqual(manifest["evidence_contract_version"], "gatekeeper_feature_context_evidence_v1")
+        self.assertEqual(manifest["evidence_policy"], "value_present_status_source_no_silent_imputation")
+        self.assertIn("gk_delta_buy_count_1s_to_3s_status", manifest["evidence_feature_columns"])
+        self.assertIn("gk_signer_cross_pool_velocity_status", manifest["evidence_feature_columns"])
+        self.assertIn("gk_decision_time_series_retention_status", manifest["evidence_feature_columns"])
+        self.assertIn("gk_burst_ratio", manifest["model_feature_columns"])
+
     def test_gatekeeper_feature_context_rejects_forbidden_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -731,6 +896,11 @@ class SelectorPipelineTests(unittest.TestCase):
                         "gk_cutoff_status": "same_decision_time",
                         "gk_observation_profile": "observation_8s_10s",
                         "gk_bonding_progress_pct": 46.0,
+                        "gk_delta_buy_count_1s_to_3s_status": "carried_forward",
+                        "gk_delta_buy_count_1s_to_3s_source": "carried_forward_no_event",
+                        "gk_delta_buy_count_1s_to_3s_present": True,
+                        "gk_decision_time_series_retention_status": "clean",
+                        "gk_decision_time_series_retained_sample_count": 4,
                     }
                 ],
             )
@@ -750,9 +920,27 @@ class SelectorPipelineTests(unittest.TestCase):
 
         self.assertEqual(rows[0]["gk_bonding_progress_pct"], 46.0)
         self.assertEqual(rows[0]["gk_cutoff_status"], "same_decision_time")
+        self.assertEqual(rows[0]["gk_delta_buy_count_1s_to_3s_status"], "carried_forward")
+        self.assertEqual(rows[0]["gk_decision_time_series_retention_status"], "clean")
         self.assertTrue(rows[0]["gatekeeper_feature_context_joined"])
         self.assertTrue(coverage["gatekeeper_feature_context"]["enabled"])
         self.assertEqual(coverage["gatekeeper_feature_context"]["training_rows_joined"], 1)
+        self.assertNotIn(
+            "gk_delta_buy_count_1s_to_3s_status",
+            coverage["gatekeeper_feature_context"]["model_feature_columns"],
+        )
+        self.assertNotIn(
+            "gk_decision_time_series_retention_status",
+            coverage["gatekeeper_feature_context"]["model_feature_columns"],
+        )
+        self.assertIn(
+            "gk_delta_buy_count_1s_to_3s_status",
+            coverage["gatekeeper_feature_context"]["evidence_feature_columns"],
+        )
+        self.assertIn(
+            "gk_decision_time_series_retention_status",
+            coverage["gatekeeper_feature_context"]["evidence_feature_columns"],
+        )
 
     def test_phase3_r2only_passes_gatekeeper_feature_context_to_training_view(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

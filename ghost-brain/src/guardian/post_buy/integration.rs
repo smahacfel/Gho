@@ -18,6 +18,7 @@ use tracing::{debug, error, info, warn};
 
 use trigger::{create_virtual_magazine, DirectBuyBuilder, MagazineConfig, Revolver, TokenRevolver};
 
+use super::config::DEFAULT_WAIT_FOR_TIMESTOP_MS;
 use crate::aem::{
     CommandApplyResult, CommandDirective, CommandPriority, ControlCommand, ExecutionStressSnapshot,
     TriggerControlAdapter,
@@ -27,7 +28,8 @@ use crate::execution::backend::Lane;
 use super::signals::{GuardianSignal, RecommendedAction, SignalSeverity};
 
 const SHADOW_PRICE_SCALE: f64 = 1_000_000_000_000_000.0;
-pub(crate) const SHADOW_VIRTUAL_MAGAZINE_TIME_STOP_SECS: u64 = 30;
+#[cfg(test)]
+pub(crate) const SHADOW_VIRTUAL_MAGAZINE_TIME_STOP_SECS: u64 = DEFAULT_WAIT_FOR_TIMESTOP_MS / 1000;
 
 fn scale_price_to_target_key(price: f64) -> Option<u64> {
     if !price.is_finite() || price <= 0.0 {
@@ -40,9 +42,13 @@ fn scale_price_to_target_key(price: f64) -> Option<u64> {
     Some(scaled.clamp(1.0, u64::MAX as f64) as u64)
 }
 
-fn shadow_magazine_config() -> MagazineConfig {
+fn shadow_time_stop_secs_from_ms(wait_for_timestop_ms: u64) -> u64 {
+    wait_for_timestop_ms.max(1).saturating_add(999) / 1000
+}
+
+fn shadow_magazine_config(time_stop_secs: u64) -> MagazineConfig {
     let mut config = MagazineConfig::default_targets(DirectBuyBuilder::pump_program_id());
-    config.time_stop_secs = Some(SHADOW_VIRTUAL_MAGAZINE_TIME_STOP_SECS);
+    config.time_stop_secs = Some(time_stop_secs.max(1));
     config
 }
 
@@ -75,15 +81,30 @@ pub struct ShadowExitPreview {
     pub has_time_stop_trigger: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ShadowPositionBook {
+    time_stop_secs: u64,
     tokens: HashMap<Pubkey, TokenRevolver>,
     position_mints: HashMap<String, Pubkey>,
+}
+
+impl Default for ShadowPositionBook {
+    fn default() -> Self {
+        Self::with_time_stop_ms(DEFAULT_WAIT_FOR_TIMESTOP_MS)
+    }
 }
 
 impl ShadowPositionBook {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_time_stop_ms(wait_for_timestop_ms: u64) -> Self {
+        Self {
+            time_stop_secs: shadow_time_stop_secs_from_ms(wait_for_timestop_ms),
+            tokens: HashMap::new(),
+            position_mints: HashMap::new(),
+        }
     }
 
     pub fn position_count(&self) -> usize {
@@ -110,8 +131,11 @@ impl ShadowPositionBook {
             }
         }
 
-        let bullets = create_virtual_magazine(entry_price_key, &shadow_magazine_config())
-            .map_err(|e| e.to_string())?;
+        let bullets = create_virtual_magazine(
+            entry_price_key,
+            &shadow_magazine_config(self.time_stop_secs),
+        )
+        .map_err(|e| e.to_string())?;
 
         if let Some(old) = self
             .tokens

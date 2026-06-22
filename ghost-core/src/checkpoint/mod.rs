@@ -8,9 +8,14 @@ pub use engine::{CheckpointConfig, CheckpointEngine, EventCheckpointTrigger};
 pub use feature_builder::ObservationFeatureBuilder;
 pub use traits::{CheckpointProducer, FeatureMaterializer};
 pub use types::{
-    AlphaFingerprintFeatures, CheckpointDerivedFeatures, CheckpointTrigger, CurveReadinessFeatures,
-    EvidenceDegradedReason, EvidenceStatus, EvidenceUnavailableReason, FeatureEvidenceStatus,
+    AlphaFingerprintFeatures, CheckpointDerivedFeatures, CheckpointTrigger, CpvEvidenceContext,
+    CpvMetricSource, CurveReadinessFeatures, DecisionTimeSeriesFeatures,
+    DecisionTimeSeriesPriceSource, DecisionTimeSeriesRetentionPolicy,
+    DecisionTimeSeriesRetentionStatus, DecisionTimeSeriesSourceCounts, EvidenceDegradedReason,
+    EvidenceStatus, EvidenceUnavailableReason, FeatureEvidenceStatus,
     ManipulationContradictionFeatures, MaterializedEvidenceStatus, MaterializedFeatureSet,
-    MaterializedTrajectoryAssessment, OrganicBroadeningFeatures, SessionCheckpoint,
-    TrajectorySegmentSnapshot, TrendDirection, TxSegmentSequence,
+    MaterializedTrajectoryAssessment, MetricEvidenceQuality, OrganicBroadeningFeatures,
+    SessionCheckpoint, TemporalAnchorReachedBy, TemporalAnchorSnapshot, TemporalDeltaFeatures,
+    TemporalMetricEvidenceContext, TemporalMetricSource, TrajectorySegmentSnapshot, TrendDirection,
+    TxSegmentSequence,
 };

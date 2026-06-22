@@ -4517,8 +4517,8 @@ impl TriggerComponent {
             return false;
         }
         let Some(remaining_index) = (match role {
-            "buyback_fee_recipient" => Some(0usize),
-            "buyback_quote_account" => Some(1usize),
+            "bonding_curve_v2" | "buyback_fee_recipient" => Some(0usize),
+            "breaking_fee_recipient" | "buyback_quote_account" => Some(1usize),
             _ => None,
         }) else {
             return false;
@@ -4567,8 +4567,8 @@ impl TriggerComponent {
             (_, 13) => "user_volume_accumulator",
             (_, 14) => "fee_config",
             (_, 15) => "fee_program",
-            (trigger::PumpfunBuyVariant::LegacyBuy, 16) => "buyback_fee_recipient",
-            (trigger::PumpfunBuyVariant::LegacyBuy, 17) => "buyback_quote_account",
+            (trigger::PumpfunBuyVariant::LegacyBuy, 16) => "bonding_curve_v2",
+            (trigger::PumpfunBuyVariant::LegacyBuy, 17) => "breaking_fee_recipient",
             (trigger::PumpfunBuyVariant::RoutedExactSolIn, 16) => "bonding_curve_v2",
             (trigger::PumpfunBuyVariant::RoutedExactSolIn, 17) => "buyback_fee_recipient",
             (trigger::PumpfunBuyVariant::LegacyBuy, _) => "legacy_buy_instruction_account",
@@ -9072,8 +9072,8 @@ mod tests {
             complete: 0,
             _padding: [0; 7],
         };
-        let buyback_fee_recipient = Pubkey::new_unique();
-        let buyback_quote_account = Pubkey::new_unique();
+        let observed_bonding_curve_v2 = Pubkey::new_unique();
+        let observed_breaking_fee_recipient = Pubkey::new_unique();
         let request = trigger
             .build_prepared_buy_request(
                 &payer,
@@ -9086,7 +9086,10 @@ mod tests {
                     associated_bonding_curve: Some(
                         DirectBuyBuilder::canonical_associated_bonding_curve(&mint, &token_program),
                     ),
-                    buy_remaining_accounts: vec![buyback_fee_recipient, buyback_quote_account],
+                    buy_remaining_accounts: vec![
+                        observed_bonding_curve_v2,
+                        observed_breaking_fee_recipient,
+                    ],
                     ..valid_buy_account_overrides()
                 },
                 amount_lamports,
@@ -9106,45 +9109,50 @@ mod tests {
             trigger::PUMPFUN_BUY_FIXED_ACCOUNT_COUNT
                 + trigger::PUMPFUN_BUYBACK_REMAINING_ACCOUNT_COUNT
         );
+        let [expected_bonding_curve_v2, expected_breaking_fee_recipient] =
+            trigger::LegacyBondingCurveTailResolver::resolve_pubkeys(
+                &mint,
+                trigger::BreakingFeeRecipientStrategy::FirstStatic,
+            );
         assert_eq!(
             buy_accounts[trigger::PUMPFUN_BUY_FIXED_ACCOUNT_COUNT].pubkey,
-            buyback_fee_recipient
+            expected_bonding_curve_v2
         );
         assert_eq!(
             buy_accounts[trigger::PUMPFUN_BUY_FIXED_ACCOUNT_COUNT + 1].pubkey,
-            buyback_quote_account
+            expected_breaking_fee_recipient
         );
         assert_eq!(
             TriggerComponent::counterfactual_probe_account_role_for(
                 &request,
-                &buyback_fee_recipient,
+                &expected_bonding_curve_v2,
             ),
-            "buyback_fee_recipient"
+            "bonding_curve_v2"
         );
         assert_eq!(
             TriggerComponent::counterfactual_probe_account_role_for(
                 &request,
-                &buyback_quote_account,
+                &expected_breaking_fee_recipient,
             ),
-            "buyback_quote_account"
+            "breaking_fee_recipient"
         );
 
         let roles = TriggerComponent::counterfactual_probe_required_account_roles(&request);
 
+        assert!(!roles.iter().any(
+            |(pubkey, role)| *pubkey == expected_bonding_curve_v2 && role == "bonding_curve_v2"
+        ));
         assert!(!roles
             .iter()
-            .any(|(pubkey, role)| *pubkey == buyback_fee_recipient
-                && role == "buyback_fee_recipient"));
-        assert!(!roles
-            .iter()
-            .any(|(pubkey, role)| *pubkey == buyback_quote_account
-                && role == "buyback_quote_account"));
+            .any(|(pubkey, role)| *pubkey == expected_breaking_fee_recipient
+                && role == "breaking_fee_recipient"));
         assert!(roles.iter().any(|(_, role)| role == "bonding_curve"));
         assert!(roles.iter().any(|(_, role)| role == "creator_vault"));
     }
 
     #[test]
-    fn e5a_prepared_legacy_buy_final_manifest_with_observed_remaining_accounts_has_no_bcv2() {
+    fn e5a_prepared_legacy_buy_final_manifest_with_observed_remaining_accounts_uses_protocol_tail()
+    {
         let config = create_test_config();
         let trigger =
             TriggerComponent::new_with_shadow_simulator(config, Arc::new(MockShadowSimulator));
@@ -9203,15 +9211,42 @@ mod tests {
             trigger::PUMPFUN_BUY_FIXED_ACCOUNT_COUNT
                 + trigger::PUMPFUN_BUYBACK_REMAINING_ACCOUNT_COUNT
         );
-        assert!(!buy_accounts
-            .iter()
-            .any(|account| account.pubkey == DirectBuyBuilder::derive_bonding_curve_v2(&mint).0));
+        let [expected_bonding_curve_v2, expected_breaking_fee_recipient] =
+            trigger::LegacyBondingCurveTailResolver::resolve_pubkeys(
+                &mint,
+                trigger::BreakingFeeRecipientStrategy::FirstStatic,
+            );
+        assert_eq!(
+            buy_accounts[trigger::PUMPFUN_BUY_FIXED_ACCOUNT_COUNT].pubkey,
+            expected_bonding_curve_v2
+        );
+        assert_eq!(
+            buy_accounts[trigger::PUMPFUN_BUY_FIXED_ACCOUNT_COUNT + 1].pubkey,
+            expected_breaking_fee_recipient
+        );
+        assert_eq!(
+            TriggerComponent::counterfactual_probe_account_role_for(
+                &request,
+                &expected_bonding_curve_v2,
+            ),
+            "bonding_curve_v2"
+        );
+        assert_eq!(
+            TriggerComponent::counterfactual_probe_account_role_for(
+                &request,
+                &expected_breaking_fee_recipient,
+            ),
+            "breaking_fee_recipient"
+        );
 
         let required_roles =
             TriggerComponent::counterfactual_probe_required_account_roles(&request);
         assert!(!required_roles
             .iter()
             .any(|(_, role)| role == "bonding_curve_v2"));
+        assert!(!required_roles
+            .iter()
+            .any(|(_, role)| role == "breaking_fee_recipient"));
     }
 
     #[test]

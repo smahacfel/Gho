@@ -624,6 +624,15 @@ lifecycle_log_path = "../../logs/shadow_run/r15-probe/probe_lifecycle.jsonl"
             materialization["reason_counts"]["routed_exact_sol_in_entry_token_amount_raw_null"],
             1,
         )
+        self.assertEqual(materialization["simulation_coverage_guard_status"], "pass")
+        self.assertEqual(
+            materialization["custom_2006_creator_vault_source_not_authoritative_rows"],
+            0,
+        )
+        self.assertGreaterEqual(
+            materialization["selected_simulation_coverage_excluding_inflight"],
+            materialization["simulation_coverage_min"],
+        )
 
     def test_probe_transport_simulation_error_without_entry_is_classified(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -767,7 +776,7 @@ lifecycle_log_path = "../../logs/shadow_run/r15-probe/probe_lifecycle.jsonl"
                 "collection_plane": "counterfactual_shadow_probe",
                 "probe_plane": "p37_shadow_probe",
                 "event_type": "probe_skipped",
-                "probe_skip_reason": "creator_vault_source_not_authoritative",
+                "probe_skip_reason": "route_identity_unavailable",
                 "precheck_failure_reason": (
                     "creator_vault_source_not_authoritative:"
                     "pumpfun_legacy_extended_buy_accounts:"
@@ -824,11 +833,20 @@ lifecycle_log_path = "../../logs/shadow_run/r15-probe/probe_lifecycle.jsonl"
             1,
         )
         self.assertEqual(
+            materialization["custom_2006_creator_vault_source_not_authoritative_rows"],
+            1,
+        )
+        self.assertEqual(materialization["simulation_coverage_guard_status"], "fail")
+        self.assertIn(
+            "custom_2006_creator_vault_source_not_authoritative_gt_0",
+            materialization["simulation_coverage_guard_reasons"],
+        )
+        self.assertEqual(
             materialization["simulation_error_custom_code_counts"]["custom_6002"],
             1,
         )
         self.assertEqual(
-            materialization["skip_reason_counts"]["creator_vault_source_not_authoritative"],
+            materialization["skip_reason_counts"]["route_identity_unavailable"],
             1,
         )
         self.assertEqual(
@@ -845,6 +863,19 @@ lifecycle_log_path = "../../logs/shadow_run/r15-probe/probe_lifecycle.jsonl"
         )
         self.assertEqual(
             materialization["skip_creator_identity_source_counts"]["detected_pool.creator"],
+            1,
+        )
+        feasibility = report["probe_entry_materialization"]
+        self.assertEqual(
+            feasibility["execution_feasibility_status_counts"][
+                "not_executable_route_identity"
+            ],
+            1,
+        )
+        self.assertEqual(
+            feasibility["execution_feasibility_reason_counts"][
+                "route_identity_unavailable"
+            ],
             1,
         )
 
