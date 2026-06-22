@@ -1,3 +1,4 @@
+use crate::checkpoint::CpvEvidenceContext;
 use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
 use std::borrow::Cow;
@@ -318,6 +319,12 @@ pub struct SybilResistanceFeatures {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signer_cross_pool_velocity: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpv_other_pool_activity: Option<f64>,
+    /// Shared evidence context for CPV-family metrics:
+    /// `signer_cross_pool_velocity` and `cpv_other_pool_activity`.
+    #[serde(default)]
+    pub cpv_evidence: CpvEvidenceContext,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub funding_source_concentration: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub funding_source_diagnostics: Option<FundingSourceDiagnostics>,
@@ -349,7 +356,11 @@ pub const DES_INSUFFICIENT_BUYS_REASON: &str = "DES_INSUFFICIENT_BUYS";
 pub const DES_CURVE_DATA_UNAVAILABLE_REASON: &str = "DES_CURVE_DATA_UNAVAILABLE";
 pub const DES_SLOT_ORDER_UNAVAILABLE_REASON: &str = "DES_SLOT_ORDER_UNAVAILABLE";
 pub const CPV_ROLLING_STATE_UNAVAILABLE_REASON: &str = "CPV_ROLLING_STATE_UNAVAILABLE";
-pub const CPV_INSUFFICIENT_SIGNERS_REASON: &str = "CPV_INSUFFICIENT_SIGNERS";
+pub const CPV_INSUFFICIENT_SUCCESSFUL_BUY_SIGNERS_REASON: &str =
+    "CPV_INSUFFICIENT_SUCCESSFUL_BUY_SIGNERS";
+pub const CPV_INSUFFICIENT_SIGNERS_REASON: &str = CPV_INSUFFICIENT_SUCCESSFUL_BUY_SIGNERS_REASON;
+pub const CPV_LOW_SAMPLE_DEGRADED_REASON: &str = "CPV_LOW_SAMPLE_DEGRADED";
+pub const CPV_DISABLED_BY_CONFIG_REASON: &str = "CPV_DISABLED_BY_CONFIG";
 pub const FSC_ROLLING_STATE_UNAVAILABLE_REASON: &str = "FSC_ROLLING_STATE_UNAVAILABLE";
 pub const FSC_INSUFFICIENT_KNOWN_SOURCES_REASON: &str = "FSC_INSUFFICIENT_KNOWN_SOURCES";
 pub const FSC_FUNDING_STREAM_UNAVAILABLE_REASON: &str = "FSC_FUNDING_STREAM_UNAVAILABLE";

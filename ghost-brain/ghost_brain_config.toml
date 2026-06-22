@@ -104,6 +104,22 @@ min_market_cap_sol = 5.0
 min_phases_to_pass = 1
 re_eval_tx_interval = 1
 use_three_layer_decision = true
+strict_metric_missing_policy = "hard_fail"
+cpv_low_sample_policy = "hard_fail"
+cpv_min_successful_buy_signers_clean = 3
+cpv_min_successful_buy_signers_degraded = 2
+cpv_emit_degraded_low_sample = false
+cpv_allow_degraded_in_strict_policy = false
+temporal_carried_forward_policy = "log_only"
+temporal_carry_forward_enabled = false
+temporal_carry_forward_max_staleness_ms = 1000
+temporal_carry_forward_event_counters_enabled = true
+temporal_carry_forward_state_metrics_enabled = false
+temporal_carry_forward_ratio_metrics_enabled = false
+top_level_features_from_materialized_ssot = true
+decision_time_series_tx_capacity = 128
+decision_time_series_retention_policy = "truncate_with_status"
+emit_evidence_policy_context = true
 
 # Hard Fails ────────────────────────────────────────────────────────────────────
 # Tylko skrajna koncentracja ma prawo ubić BUY na hard-fail.
@@ -217,6 +233,39 @@ hard_fail_bot_min_observation_ms = 1500
 # use_slot_ordering = false
 # min_failed_tx_ratio_for_bot_flag = 0.5
 
+
+[gatekeeper_v2.selector_soft_score]
+enabled = false
+policy = "log_only"
+min_candidate_score = 2
+min_buy_score = 3
+missing_metric_policy = "no_point"
+allow_degraded_cpv = false
+allow_carried_temporal_deltas = false
+jito_tip_intensity_lt = 0.4132
+unique_ratio_gte = 0.243
+cpv_other_pool_activity_lt = 2.2111
+max_single_sell_impact_pct_observed_lt = 31.4
+signer_cross_pool_velocity_lt = 0.6631
+hhi_lt = 0.2300
+avg_cpi_depth_50tx_lt = 2.84
+top3_volume_pct_lt = 0.749
+delta_jito_tip_intensity_1s_to_2s_lt = 0.0931
+same_ms_tx_ratio_gte = 0.049
+interval_cv_gte = 0.904
+delta_jito_tip_intensity_1s_to_3s_lt = 0.1615
+soft_weight_jito_tip_intensity = 1
+soft_weight_unique_ratio = 1
+soft_weight_cpv_other_pool_activity = 1
+soft_weight_max_single_sell_impact_pct_observed = 1
+soft_weight_signer_cross_pool_velocity = 1
+soft_weight_hhi = 1
+soft_weight_avg_cpi_depth_50tx = 1
+soft_weight_top3_volume_pct = 1
+soft_weight_delta_jito_tip_intensity_1s_to_2s = 1
+soft_weight_same_ms_tx_ratio = 1
+soft_weight_interval_cv = 1
+soft_weight_delta_jito_tip_intensity_1s_to_3s = 1
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1134,6 +1183,13 @@ tick_interval_ms = 500
 max_monitored_positions = 10
 signal_channel_buffer = 256
 
+# Shadow/probe lifecycle close thresholds.
+# Values are percentages: 50.0 means +50% Target / -50% StopLoss.
+# Target can be set above 100.0; StopLoss is clamped by runtime to max 100%.
+target_threshold = 50.0
+stoploss_threshold = 50.0
+wait_for_timestop = 30000
+
 # LIGMA thresholds (liquidity depth monitoring)
 ligma_warning_impact_bps = 3500.0
 ligma_critical_impact_bps = 8000.0
@@ -1166,6 +1222,28 @@ escalation_warning_count = 3
 escalation_critical_count = 1
 signal_aggregation_window_ms = 5000
 max_signals_per_position = 200
+
+# TimeStop V2 vitality telemetry.
+# Disabled by default. Observe-only mode emits counterfactual lifecycle rows and
+# does not change Target/StopLoss/legacy TimeStop close decisions.
+[post_buy_guardian.time_stop_v2]
+enabled = false
+mode = "observe_only"
+first_check_ms = 3000
+window_ms = 4000
+failed_windows_to_signal = 3
+min_age_before_signal_ms = 11000
+min_price_delta_pct_alive = 3.0
+min_mcap_delta_pct_alive = 3.0
+min_bonding_delta_pct_alive = 0.75
+min_volume_delta_sol_alive = 1.0
+min_price_delta_pct_for_volume_alive = 1.0
+min_tx_delta_for_heartbeat = 1
+max_avg_volume_per_tx_sol_heartbeat = 0.05
+max_abs_price_delta_pct_heartbeat = 1.0
+max_abs_mcap_delta_pct_heartbeat = 1.0
+max_bonding_delta_pct_heartbeat = 0.25
+emit_window_records = true
 
 [post_buy_guardian.aem]
 enabled = true

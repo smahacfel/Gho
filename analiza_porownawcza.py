@@ -48,12 +48,18 @@ Parametry (env vars):
   AB_WINDOW_MS     — oczekiwany ab_window_ms (domyślnie: 10000)
   AB_MIN_TX        — minimalne ab_tx_count_window (domyślnie: 10)
   AB_MIN_VEC_LEN   — minimalna długość wektora dla DTW/Hill (domyślnie: 20)
+  AB_ENABLE_DTW    — 1/0, włącz/wyłącz Sekcję 6 (domyślnie: 1)
+  AB_DTW_MAX_SERIES_PER_SET — maks. liczba serii na zbiór w DTW (domyślnie: 80)
+  AB_DTW_MAX_PAIRS — maks. par DTW per koszyk A/A, B/B, A/B (domyślnie: 40)
+  AB_DTW_MAX_VECTOR_LEN — maks. długość serii po downsamplingu DTW (domyślnie: 256)
+  AB_DTW_TIME_BUDGET_SEC — budżet czasu Sekcji 6 w sekundach (domyślnie: 30)
 """
 
 import json
 import sys
 import math
 import os
+import time
 import io
 import re
 import datetime
@@ -104,6 +110,46 @@ except ImportError:
 _ENV_WINDOW_MS   = os.environ.get("AB_WINDOW_MS")    # None = autodetect
 _ENV_MIN_TX      = os.environ.get("AB_MIN_TX")        # None = autodetect (→ 0)
 _ENV_MIN_VEC_LEN = os.environ.get("AB_MIN_VEC_LEN")   # None = autodetect
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _env_int(name: str, default: int, min_value: int | None = None) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    if min_value is not None:
+        value = max(min_value, value)
+    return value
+
+
+def _env_float(name: str, default: float, min_value: float | None = None) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if min_value is not None:
+        value = max(min_value, value)
+    return value
+
+
+AB_ENABLE_DTW = _env_bool("AB_ENABLE_DTW", True)
+AB_DTW_MAX_SERIES_PER_SET = _env_int("AB_DTW_MAX_SERIES_PER_SET", 80, 2)
+AB_DTW_MAX_PAIRS = _env_int("AB_DTW_MAX_PAIRS", 40, 1)
+AB_DTW_MAX_VECTOR_LEN = _env_int("AB_DTW_MAX_VECTOR_LEN", 256, 8)
+AB_DTW_TIME_BUDGET_SEC = _env_float("AB_DTW_TIME_BUDGET_SEC", 30.0, 1.0)
 
 @dataclass(frozen=True)
 class FilterConfig:
@@ -183,8 +229,10 @@ def autodetect_filter_params(rec_a_raw: list, rec_b_raw: list) -> tuple[FilterCo
     if not _ENV_MIN_VEC_LEN:
         vec_lens = []
         for r in all_raw:
-            v = r.get("vectors_d_price")
-            if isinstance(v, list) and len(v) > 0:
+            v = get_vector(r, "vectors_d_price")
+            if not v:
+                v = get_vector(r, "vectors_prices")
+            if v:
                 vec_lens.append(len(v))
 
         if vec_lens:
@@ -196,14 +244,14 @@ def autodetect_filter_params(rec_a_raw: list, rec_b_raw: list) -> tuple[FilterCo
             # Aktywuj: AB_MIN_VEC_LEN=<liczba> (np. AB_MIN_VEC_LEN=5)
             min_vector_len = 0
             notes.append(
-                f"vectors_d_price: {len(vec_lens)}/{len(all_raw)} rekordów ({pct_have_vecs:.0f}%) "
+                f"decision vectors: {len(vec_lens)}/{len(all_raw)} rekordów ({pct_have_vecs:.0f}%) "
                 f"ma wektory | min={min(vec_lens)} max={max(vec_lens)} p25={p25_len} "
                 f"→ MIN_VECTOR_LEN=0 (WYŁĄCZONY — ustaw AB_MIN_VEC_LEN=N aby aktywować)"
             )
         else:
             min_vector_len = 0
             notes.append(
-                "vectors_d_price: BRAK w danych → warunek długości wektora wyłączony"
+                "decision vectors: BRAK w danych → warunek długości wektora wyłączony"
             )
     return FilterConfig(
         expected_window_ms=expected_window_ms,
@@ -498,12 +546,148 @@ def corr_label(r):
 # ══════════════════════════════════════════════════════════════════════════════
 #  EKSTRAKTORY
 # ══════════════════════════════════════════════════════════════════════════════
+def _number_or_bool(value):
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+    if isinstance(value, (int, float)):
+        fv = float(value)
+        if math.isfinite(fv):
+            return fv
+    return None
+
+
+def _primitive_value(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        fv = float(value)
+        if math.isfinite(fv):
+            return fv
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
+def _nested_dict(row, *keys):
+    current = row
+    for key in keys:
+        if not isinstance(current, dict):
+            return {}
+        current = current.get(key)
+    return current if isinstance(current, dict) else {}
+
+
+def _nested_value(row, *keys):
+    current = row
+    for key in keys:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def _materialized_snapshot(row):
+    return (
+        _nested_dict(row, "v3_materialized_feature_snapshot")
+        or _nested_dict(row, "materialized_feature_snapshot")
+    )
+
+
+def _decision_time_series(row):
+    return _nested_dict(_materialized_snapshot(row), "decision_time_series")
+
+
+def _temporal_deltas(row):
+    return _nested_dict(_materialized_snapshot(row), "temporal_deltas")
+
+
+def _field_candidates(field):
+    return list(dict.fromkeys([field] + FIELD_ALIASES.get(field, [])))
+
+
+def _temporal_key_candidates(field):
+    candidates = _field_candidates(field)
+    if field.startswith("delta_burstratio_"):
+        candidates.append(field.replace("delta_burstratio_", "delta_burst_ratio_", 1))
+    elif field.startswith("delta_burst_ratio_"):
+        candidates.append(field.replace("delta_burst_ratio_", "delta_burstratio_", 1))
+    return list(dict.fromkeys(candidates))
+
+
+def _embedded_raw_value(row, field):
+    snapshot = _materialized_snapshot(row)
+    if not snapshot:
+        return None
+
+    if field in TEMPORAL_FIELD_SET:
+        temporal = _nested_dict(snapshot, "temporal_deltas")
+        for key in _temporal_key_candidates(field):
+            value = _number_or_bool(temporal.get(key))
+            if value is not None:
+                return value
+        return None
+
+    if field in CPV_EVIDENCE_FIELDS:
+        evidence = _nested_dict(snapshot, "sybil_resistance", "cpv_evidence")
+        value = _number_or_bool(evidence.get(field))
+        if value is not None:
+            return value
+
+    if field in VECTOR_SOURCE_COUNT_MAP:
+        dts = _decision_time_series(row)
+        source_counts = _nested_dict(dts, "source_counts")
+        for source_key in VECTOR_SOURCE_COUNT_MAP[field]:
+            value = _number_or_bool(source_counts.get(source_key))
+            if value is not None:
+                return value
+
+    dts_field = DECISION_TIME_SERIES_VALUE_MAP.get(field)
+    if dts_field:
+        value = _number_or_bool(_decision_time_series(row).get(dts_field))
+        if value is not None:
+            return value
+
+    path = EMBEDDED_RAW_VALUE_PATHS.get(field)
+    if path:
+        value = _nested_value(snapshot, *path)
+        return _number_or_bool(value)
+
+    return None
+
+
 def get_val(r, field):
-    v = r.get(field)
-    if isinstance(v, bool): return 1.0 if v else 0.0
-    if isinstance(v, (int, float)):
-        fv = float(v)
-        if math.isfinite(fv): return fv
+    for candidate in _field_candidates(field):
+        value = _number_or_bool(r.get(candidate))
+        if value is not None:
+            return value
+
+    context = _nested_dict(r, "evidence_policy_context")
+    if context:
+        value = _number_or_bool(context.get(field))
+        if value is not None:
+            return value
+
+    value = _embedded_raw_value(r, field)
+    if value is not None:
+        return value
+
+    if field == "vectors_price_finite_count":
+        prices = get_vector_raw(r, "vectors_prices")
+        finite = sum(1 for value in prices if _number_or_bool(value) is not None)
+        return float(finite) if prices else None
+    if field == "vectors_price_missing_count":
+        prices = get_vector_raw(r, "vectors_prices")
+        if not prices:
+            return None
+        missing = sum(1 for value in prices if _number_or_bool(value) is None)
+        return float(missing)
+    if field == "vectors_price_coverage_ratio":
+        prices = get_vector_raw(r, "vectors_prices")
+        if not prices:
+            return None
+        finite = sum(1 for value in prices if _number_or_bool(value) is not None)
+        return finite / len(prices)
+
     return None
 
 def iter_pairs(records, f1, f2):
@@ -522,28 +706,120 @@ def build_field_cache(records, fields):
 
 def get_bool(r, field):
     """Return bool value from record, or None if missing."""
-    v = r.get(field)
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, (int, float)):
-        return bool(v)
-    if isinstance(v, str):
-        return v.lower() in ("true", "1")
+    for candidate in _field_candidates(field):
+        v = r.get(candidate)
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, (int, float)) and math.isfinite(float(v)):
+            return bool(v)
+        if isinstance(v, str):
+            lower = v.strip().lower()
+            if lower in ("true", "1", "yes", "y"):
+                return True
+            if lower in ("false", "0", "no", "n"):
+                return False
+    context = _nested_dict(r, "evidence_policy_context")
+    if context:
+        v = context.get(field)
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, (int, float)) and math.isfinite(float(v)):
+            return bool(v)
+        if isinstance(v, str):
+            lower = v.strip().lower()
+            if lower in ("true", "1", "yes", "y"):
+                return True
+            if lower in ("false", "0", "no", "n"):
+                return False
     return None
 
 def get_str(r, field):
     """Return string value from record, or None if missing."""
-    v = r.get(field)
-    if v is None:
-        return None
-    return str(v)
+    for candidate in _field_candidates(field):
+        v = _primitive_value(r.get(candidate))
+        if v is not None:
+            return str(v)
+
+    context = _nested_dict(r, "evidence_policy_context")
+    if context:
+        v = _primitive_value(context.get(field))
+        if v is not None:
+            return str(v)
+
+    dts_field = DECISION_TIME_SERIES_STRING_MAP.get(field)
+    if dts_field:
+        v = _primitive_value(_decision_time_series(r).get(dts_field))
+        if v is not None:
+            return str(v)
+
+    temporal_field = TEMPORAL_STATUS_FIELD_MAP.get(field)
+    if temporal_field:
+        v = _primitive_value(_temporal_deltas(r).get(temporal_field))
+        if v is not None:
+            return str(v)
+
+    return None
+
+
+def get_vector_raw(r, field):
+    """Return raw vector/list, preserving None entries for nullable price vectors."""
+    for candidate in _field_candidates(field):
+        v = r.get(candidate)
+        if isinstance(v, list):
+            return v
+
+    dts = _decision_time_series(r)
+    dts_field = DECISION_TIME_SERIES_VECTOR_MAP.get(field)
+    if dts_field:
+        v = dts.get(dts_field)
+        if isinstance(v, list):
+            return v
+
+    if field == "vectors_d_price":
+        v = dts.get("d_price")
+        if isinstance(v, list):
+            return v
+        return _derive_price_deltas(get_vector_raw(r, "vectors_prices"))
+
+    if field == "vectors_interval_ms":
+        v = dts.get("interval_ms")
+        if isinstance(v, list):
+            return v
+        return _derive_intervals(get_vector_raw(r, "vectors_ts_offsets_ms"))
+
+    return []
+
+
+def _derive_price_deltas(prices):
+    deltas = []
+    previous = None
+    for value in prices:
+        current = _number_or_bool(value)
+        if current is not None and previous is not None:
+            deltas.append(current - previous)
+        previous = current
+    return deltas
+
+
+def _derive_intervals(offsets):
+    intervals = []
+    previous = None
+    for value in offsets:
+        current = _number_or_bool(value)
+        if current is not None and previous is not None:
+            intervals.append(max(0.0, current - previous))
+        previous = current
+    return intervals
 
 def get_vector(r, field):
     """Return list/vector from record, filtering NaN values. Returns empty list if missing."""
-    v = r.get(field)
-    if not isinstance(v, list):
-        return []
-    return [x for x in v if isinstance(x, (int, float)) and math.isfinite(x)]
+    raw = get_vector_raw(r, field)
+    out = []
+    for value in raw:
+        numeric = _number_or_bool(value)
+        if numeric is not None:
+            out.append(numeric)
+    return out
 
 def vector_features(r):
     """Extract scalar features from vector fields for MI analysis."""
@@ -551,6 +827,7 @@ def vector_features(r):
         return {}
     feats = {}
     dp = get_vector(r, "vectors_d_price")
+    pr = get_vector(r, "vectors_prices")
     iv = get_vector(r, "vectors_interval_ms")
     if len(dp) >= 5:
         arr = np.array(dp, dtype=float)
@@ -565,7 +842,31 @@ def vector_features(r):
         s_iv = float(np.std(arr_iv, ddof=1)) if len(arr_iv) > 1 else 0.0
         feats["vf_interval_p95"] = float(np.percentile(arr_iv, 95))
         feats["vf_interval_cv"] = s_iv / m_iv if m_iv > 1e-9 else 0.0
+    if len(pr) >= 2:
+        arr_pr = np.array(pr, dtype=float)
+        first = float(arr_pr[0])
+        last = float(arr_pr[-1])
+        if abs(first) > 1e-18:
+            feats["vf_price_return"] = (last - first) / abs(first)
+            feats["vf_price_range_pct"] = (float(np.max(arr_pr)) - float(np.min(arr_pr))) / abs(first)
+        coverage = get_val(r, "vectors_price_coverage_ratio")
+        if coverage is not None:
+            feats["vf_price_coverage_ratio"] = coverage
     return feats
+
+
+def _record_identity(r):
+    for field in ("ab_record_id", "join_key", "decision_id", "candidate_id"):
+        value = get_str(r, field)
+        if value:
+            return f"{field}:{value}"
+    pool_id = get_str(r, "pool_id") or get_str(r, "pool")
+    mint = get_str(r, "base_mint") or get_str(r, "mint_id")
+    ts = get_str(r, "decision_ts_ms") or get_str(r, "observation_end_ts_ms")
+    if pool_id or mint or ts:
+        return f"fallback:{pool_id or ''}:{mint or ''}:{ts or ''}"
+    return None
+
 
 def filter_ab_records(records, name, config: FilterConfig):
     """
@@ -611,15 +912,18 @@ def filter_ab_records(records, name, config: FilterConfig):
         #    Domyślnie MIN_TX_IN_WINDOW=0, więc warunek jest de facto wyłączony.
         #    Aktywuje się tylko gdy użytkownik ustawi AB_MIN_TX > 0.
         if config.min_tx_in_window > 0:
-            txc = r.get("ab_tx_count_window")
+            txc = get_val(r, "ab_tx_count_window")
+            if txc is None:
+                txc = get_val(r, "total_tx_evaluated")
             if txc is not None:
-                if isinstance(txc, (int, float)) and int(txc) < config.min_tx_in_window:
+                if int(txc) < config.min_tx_in_window:
                     stats["dropped_low_tx_in_window"] += 1
                     continue
 
-        # 5. Dedup by ab_record_id
+        # 5. Dedup by stable record id. Nowe decision logi mają join_key nawet
+        #    kiedy ab_record_id nie jest dostępny.
         if config.dedup_by_record_id:
-            rid = get_str(r, "ab_record_id")
+            rid = _record_identity(r)
             if not rid:
                 stats["dropped_missing_record_id"] += 1
                 continue
@@ -632,7 +936,8 @@ def filter_ab_records(records, name, config: FilterConfig):
         #    (autodetect ustawia 0 gdy wektory nie istnieją w danych)
         if config.min_vector_len > 0:
             dp = get_vector(r, "vectors_d_price")
-            if len(dp) < config.min_vector_len:
+            pr = get_vector(r, "vectors_prices")
+            if max(len(dp), len(pr)) < config.min_vector_len:
                 stats["dropped_missing_vectors"] += 1
                 continue
 
@@ -657,7 +962,7 @@ def _print_filter_report(name, stats, color, config: FilterConfig):
     if config.min_tx_in_window == 0:
         hint("    dropped_low_tx_in_window: WYŁĄCZONY (MIN_TX=0 — ustaw AB_MIN_TX=N aby aktywować)")
     if config.min_vector_len == 0:
-        hint("    dropped_missing_vectors: WYŁĄCZONY (brak wektorów w danych)")
+        hint("    dropped_missing_vectors: WYŁĄCZONY (MIN_VEC_LEN=0 — DTW/Hill filtrują wektory lokalnie)")
     total_dropped = stats["input"] - stats["kept"]
     if total_dropped > 0:
         pct = total_dropped / stats["input"] * 100 if stats["input"] > 0 else 0
@@ -721,6 +1026,129 @@ BOOL_FIELDS = [
     "sybil_interference_layer_enabled", "sybil_combo_veto_enabled",
 ]
 
+TEMPORAL_DELTA_FIELDS = [
+    "delta_mcap_1s_to_2s",
+    "delta_mcap_1s_to_3s",
+    "delta_mcap_2s_to_3s",
+    "delta_price_pct_1s_to_2s",
+    "delta_price_pct_1s_to_3s",
+    "delta_price_pct_2s_to_3s",
+    "delta_burstratio_1s_to_2s",
+    "delta_burstratio_1s_to_3s",
+    "delta_burstratio_2s_to_3s",
+    "delta_buy_count_1s_to_2s",
+    "delta_buy_count_1s_to_3s",
+    "delta_buy_count_2s_to_3s",
+    "delta_unique_signers_1s_to_2s",
+    "delta_unique_signers_1s_to_3s",
+    "delta_unique_signers_2s_to_3s",
+    "delta_tx_count_1s_to_2s",
+    "delta_tx_count_1s_to_3s",
+    "delta_tx_count_2s_to_3s",
+    "delta_net_quote_sol_1s_to_2s",
+    "delta_net_quote_sol_1s_to_3s",
+    "delta_net_quote_sol_2s_to_3s",
+    "delta_jito_tip_intensity_1s_to_2s",
+    "delta_jito_tip_intensity_1s_to_3s",
+    "delta_signer_cross_pool_velocity_1s_to_2s",
+    "delta_signer_cross_pool_velocity_1s_to_3s",
+    "delta_flipper_presence_ratio_1s_to_2s",
+    "delta_flipper_presence_ratio_1s_to_3s",
+]
+
+TEMPORAL_RATE_FIELDS = [
+    "rate_mcap_sol_per_s_1s_to_2s",
+    "rate_mcap_sol_per_s_1s_to_3s",
+    "rate_mcap_sol_per_s_2s_to_3s",
+    "rate_buy_count_per_s_1s_to_2s",
+    "rate_buy_count_per_s_1s_to_3s",
+    "rate_unique_signers_per_s_1s_to_2s",
+    "rate_unique_signers_per_s_1s_to_3s",
+    "rate_net_quote_sol_per_s_1s_to_2s",
+    "rate_net_quote_sol_per_s_1s_to_3s",
+]
+
+VECTOR_PRICE_SOURCE_FIELDS = [
+    "vectors_price_source_reserve_count",
+    "vectors_price_source_quote_count",
+    "vectors_price_source_market_cap_count",
+    "vectors_price_source_history_count",
+    "vectors_price_source_account_state_count",
+    "vectors_price_source_carry_forward_count",
+    "vectors_price_source_missing_count",
+]
+
+DECISION_TIME_SERIES_NUMERIC_FIELDS = [
+    "vectors_price_finite_count",
+    "vectors_price_missing_count",
+    "vectors_price_coverage_ratio",
+    "decision_time_series_retention_capacity",
+    "decision_time_series_retained_sample_count",
+    "decision_time_series_total_tx_count",
+    "decision_time_series_dropped_oldest_count",
+    "decision_time_series_sample_count",
+    "decision_time_series_price_finite_sample_count",
+    "decision_time_series_price_missing_sample_count",
+]
+
+EVIDENCE_POLICY_NUMERIC_FIELDS = [
+    "cpv_min_successful_buy_signers_clean",
+    "cpv_min_successful_buy_signers_degraded",
+    "temporal_carry_forward_max_staleness_ms",
+    "decision_time_series_tx_capacity",
+]
+
+EVIDENCE_POLICY_BOOL_FIELDS = [
+    "strict_metric_threshold_gate_enabled",
+    "cpv_emit_degraded_low_sample",
+    "cpv_allow_degraded_in_strict_policy",
+    "temporal_carry_forward_enabled",
+    "temporal_carry_forward_event_counters_enabled",
+    "temporal_carry_forward_state_metrics_enabled",
+    "temporal_carry_forward_ratio_metrics_enabled",
+    "top_level_features_from_materialized_ssot",
+    "emit_evidence_policy_context",
+]
+
+NEW_RUNTIME_NUMERIC_FIELDS = [
+    "cpv_other_pool_activity",
+    "early_top3_buy_volume_pct_3s",
+    "iwim_confidence",
+    "iwim_rug_threat_score",
+    "iwim_sybil_score",
+    "iwim_organic_score",
+    *VECTOR_PRICE_SOURCE_FIELDS,
+    *DECISION_TIME_SERIES_NUMERIC_FIELDS,
+    *TEMPORAL_DELTA_FIELDS,
+    *TEMPORAL_RATE_FIELDS,
+    *EVIDENCE_POLICY_NUMERIC_FIELDS,
+]
+
+NUMERIC_FIELDS = list(dict.fromkeys(NUMERIC_FIELDS + NEW_RUNTIME_NUMERIC_FIELDS))
+BOOL_FIELDS = list(dict.fromkeys(BOOL_FIELDS + EVIDENCE_POLICY_BOOL_FIELDS))
+
+NEW_RUNTIME_KEY_METRICS = [
+    ("cpv_other_pool_activity", "", 4),
+    ("early_top3_buy_volume_pct_3s", "", 4),
+    ("vectors_price_finite_count", "", 0),
+    ("vectors_price_missing_count", "", 0),
+    ("vectors_price_coverage_ratio", "", 3),
+    ("vectors_price_source_reserve_count", "", 0),
+    ("vectors_price_source_quote_count", "", 0),
+    ("vectors_price_source_market_cap_count", "", 0),
+    ("vectors_price_source_history_count", "", 0),
+    ("vectors_price_source_account_state_count", "", 0),
+    ("vectors_price_source_carry_forward_count", "", 0),
+    ("vectors_price_source_missing_count", "", 0),
+    ("decision_time_series_retention_capacity", "", 0),
+    ("decision_time_series_retained_sample_count", "", 0),
+    ("decision_time_series_total_tx_count", "", 0),
+    ("decision_time_series_dropped_oldest_count", "", 0),
+    ("decision_time_series_sample_count", "", 0),
+    *[(field, "", 4) for field in TEMPORAL_DELTA_FIELDS],
+    *[(field, "", 4) for field in TEMPORAL_RATE_FIELDS],
+]
+
 # Nowe metryki rankingowe — jawnie wydzielone, aby zawsze trafiały do
 # wszystkich rankingów opartych o KEY_METRICS.
 RANKING_EXTENSION_KEY_METRICS = [
@@ -749,6 +1177,7 @@ RANKING_EXTENSION_KEY_METRICS = [
     ("signer_cross_pool_velocity",         "",   4),
     ("funding_source_concentration",       "",   4),
     ("sybil_soft_points",                  "",   0),
+    *NEW_RUNTIME_KEY_METRICS,
 ]
 
 # Kluczowe metryki obserwowane (nie-config)
@@ -793,6 +1222,136 @@ KEY_METRICS = [
     ("ab_fail_count_window",                     "",    0),
 ]
 
+
+def _dedup_metric_defs(metric_defs):
+    out = []
+    seen = set()
+    for item in metric_defs:
+        field = item[0]
+        if field in seen:
+            continue
+        seen.add(field)
+        out.append(item)
+    return out
+
+
+KEY_METRICS = _dedup_metric_defs(KEY_METRICS)
+
+FIELD_ALIASES = {}
+for _field in TEMPORAL_DELTA_FIELDS:
+    if _field.startswith("delta_burstratio_"):
+        _alias = _field.replace("delta_burstratio_", "delta_burst_ratio_", 1)
+        FIELD_ALIASES[_field] = [_alias]
+        FIELD_ALIASES[_alias] = [_field]
+
+TEMPORAL_FIELD_SET = set(TEMPORAL_DELTA_FIELDS) | set(TEMPORAL_RATE_FIELDS) | {
+    alias
+    for aliases in FIELD_ALIASES.values()
+    for alias in aliases
+}
+
+CPV_EVIDENCE_FIELDS = {
+    "signer_cross_pool_velocity",
+    "cpv_other_pool_activity",
+}
+
+VECTOR_SOURCE_COUNT_MAP = {
+    "vectors_price_source_reserve_count": ("reserve",),
+    "vectors_price_source_quote_count": ("quote", "price_quote"),
+    "vectors_price_source_market_cap_count": ("market_cap",),
+    "vectors_price_source_history_count": ("history", "price_history"),
+    "vectors_price_source_account_state_count": ("account_state",),
+    "vectors_price_source_carry_forward_count": ("carry_forward",),
+    "vectors_price_source_missing_count": ("missing",),
+}
+
+DECISION_TIME_SERIES_VALUE_MAP = {
+    "vectors_price_finite_count": "finite_price_count",
+    "vectors_price_missing_count": "missing_price_count",
+    "vectors_price_coverage_ratio": "price_coverage_ratio",
+    "decision_time_series_retention_capacity": "retention_capacity",
+    "decision_time_series_retained_sample_count": "retained_sample_count",
+    "decision_time_series_total_tx_count": "total_tx_count",
+    "decision_time_series_dropped_oldest_count": "dropped_oldest_count",
+    "decision_time_series_sample_count": "sample_count",
+    "decision_time_series_price_finite_sample_count": "finite_price_count",
+    "decision_time_series_price_missing_sample_count": "missing_price_count",
+}
+
+DECISION_TIME_SERIES_STRING_MAP = {
+    "decision_time_series_status": "status",
+    "decision_time_series_retention_status": "retention_status",
+    "decision_time_series_retention_policy": "retention_policy",
+}
+
+DECISION_TIME_SERIES_VECTOR_MAP = {
+    "vectors_prices": "prices",
+    "vectors_ts_offsets_ms": "ts_offsets_ms",
+    "vectors_sol_amounts": "sol_amounts",
+    "vectors_d_price": "d_price",
+    "vectors_interval_ms": "interval_ms",
+    "vectors_market_caps_sol": "market_caps_sol",
+}
+
+TEMPORAL_STATUS_FIELD_MAP = {
+    "temporal_delta_status": "status",
+}
+
+EMBEDDED_RAW_VALUE_PATHS = {
+    # Tx intelligence canonical snapshot.
+    "total_tx": ("tx_intel_features", "tx_count"),
+    "total_tx_evaluated": ("tx_intel_features", "tx_count"),
+    "unique_tx_evaluated": ("tx_intel_features", "tx_count"),
+    "unique_signers_evaluated": ("tx_intel_features", "unique_signers"),
+    "buy_count": ("tx_intel_features", "buy_count"),
+    "buy_ratio": ("tx_intel_features", "buy_ratio"),
+    "sell_buy_ratio": ("tx_intel_features", "sell_buy_ratio"),
+    "sol_buy_ratio": ("tx_intel_features", "sol_buy_ratio"),
+    "total_volume_sol": ("tx_intel_features", "total_volume_sol"),
+    "avg_tx_sol": ("tx_intel_features", "avg_tx_sol"),
+    "volume_cv": ("tx_intel_features", "volume_cv"),
+    "volume_gini": ("tx_intel_features", "volume_gini"),
+    "hhi": ("tx_intel_features", "hhi"),
+    "top3_volume_pct": ("tx_intel_features", "top3_volume_pct"),
+    "same_ms_tx_ratio": ("tx_intel_features", "same_ms_tx_ratio"),
+    "max_consecutive_buys_observed": ("tx_intel_features", "max_consecutive_buys"),
+    "max_tx_per_signer_observed": ("tx_intel_features", "max_tx_per_signer"),
+    "avg_interval_ms": ("tx_intel_features", "avg_interval_ms"),
+    "interval_cv": ("tx_intel_features", "interval_cv"),
+    "timing_entropy": ("tx_intel_features", "timing_entropy"),
+    "burst_ratio": ("tx_intel_features", "burst_ratio"),
+    "unique_ratio": ("tx_intel_features", "unique_signer_ratio"),
+    "dev_wallet_known": ("tx_intel_features", "dev_wallet_known"),
+    "dev_has_sold": ("tx_intel_features", "dev_has_sold"),
+    "dev_buy_total_sol": ("tx_intel_features", "dev_buy_sol"),
+    "dev_tx_ratio": ("tx_intel_features", "dev_tx_ratio"),
+    "dev_volume_ratio": ("tx_intel_features", "dev_volume_ratio"),
+    "current_market_cap_sol": ("account_features", "market_cap_sol"),
+    "max_single_tx_price_impact_pct_observed": ("checkpoint_features", "single_tx_max_price_impact_pct"),
+    "max_single_sell_impact_pct_observed": ("checkpoint_features", "max_single_sell_impact_pct"),
+    "observation_duration_ms": ("session_metadata", "observation_duration_ms"),
+
+    # Alpha fingerprint / non-FSC Sybil-adjacent metrics.
+    "compute_unit_cluster_dominance": ("alpha_fingerprint", "compute_unit_cluster_dominance"),
+    "static_fee_profile_ratio": ("alpha_fingerprint", "static_fee_profile_ratio"),
+    "fixed_size_buy_ratio": ("alpha_fingerprint", "fixed_size_buy_ratio"),
+    "flipper_presence_ratio": ("alpha_fingerprint", "flipper_presence_ratio"),
+    "jito_tip_intensity": ("alpha_fingerprint", "jito_tip_intensity"),
+    "early_slot_volume_dominance_buy": ("alpha_fingerprint", "early_slot_volume_dominance_buy"),
+    "early_top3_buy_volume_pct_3s": ("alpha_fingerprint", "early_top3_buy_volume_pct_3s"),
+    "avg_inner_ix_count_50tx": ("alpha_fingerprint", "avg_inner_ix_count_50tx"),
+    "avg_cpi_depth_50tx": ("alpha_fingerprint", "avg_cpi_depth_50tx"),
+
+    # Sybil resistance.
+    "fee_topology_diversity_index": ("sybil_resistance", "fee_topology_diversity_index"),
+    "dev_buyer_infrastructure_affinity": ("sybil_resistance", "dev_buyer_infrastructure_affinity"),
+    "spend_fraction_divergence": ("sybil_resistance", "spend_fraction_divergence"),
+    "demand_elasticity_score": ("sybil_resistance", "demand_elasticity_score"),
+    "signer_cross_pool_velocity": ("sybil_resistance", "signer_cross_pool_velocity"),
+    "cpv_other_pool_activity": ("sybil_resistance", "cpv_other_pool_activity"),
+    "funding_source_concentration": ("sybil_resistance", "funding_source_concentration"),
+}
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  IO
 # ══════════════════════════════════════════════════════════════════════════════
@@ -827,6 +1386,191 @@ def delta_arrow(delta_pct):
     if delta_pct > 15:   return f"{C.GREEN}▲ +{delta_pct:.1f}%{C.RESET}"
     if delta_pct < -15:  return f"{C.RED}▼ {delta_pct:.1f}%{C.RESET}"
     return f"{C.DIM}≈ {delta_pct:+.1f}%{C.RESET}"
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SEKCJA 0B — NOWE LOGI: DECISION SERIES / AB TX / DELTY / EVIDENCE
+# ══════════════════════════════════════════════════════════════════════════════
+def _presence_count(records, field):
+    return sum(1 for r in records if get_val(r, field) is not None)
+
+
+def _pct(count, total):
+    return count / total * 100 if total else 0.0
+
+
+def _fmt_count(count, total):
+    return f"{count}/{total} ({_pct(count, total):.0f}%)"
+
+
+def _has_decision_time_series(r):
+    if _decision_time_series(r):
+        return True
+    return any(len(get_vector_raw(r, field)) > 0 for field in (
+        "vectors_prices",
+        "vectors_ts_offsets_ms",
+        "vectors_sol_amounts",
+    ))
+
+
+def _decision_series_interval_quality(records):
+    negative_records = 0
+    zero_interval_records = 0
+    mismatched_len_records = 0
+    for r in records:
+        offsets = get_vector(r, "vectors_ts_offsets_ms")
+        prices = get_vector_raw(r, "vectors_prices")
+        sol_amounts = get_vector_raw(r, "vectors_sol_amounts")
+        if offsets and ((prices and len(prices) != len(offsets)) or (sol_amounts and len(sol_amounts) != len(offsets))):
+            mismatched_len_records += 1
+        if len(offsets) < 2:
+            continue
+        intervals = [b - a for a, b in zip(offsets, offsets[1:])]
+        if any(delta < 0 for delta in intervals):
+            negative_records += 1
+        if any(delta == 0 for delta in intervals):
+            zero_interval_records += 1
+    return negative_records, zero_interval_records, mismatched_len_records
+
+
+def _print_coverage_rows(records, fields, title, color):
+    n = len(records)
+    sub(title, color)
+    print(f"  {C.DIM}{'Pole':<48} {'present':>13} {'nonzero':>13}{C.RESET}")
+    print(f"  {'─'*80}")
+    for field in fields:
+        values = [get_val(r, field) for r in records]
+        present = [v for v in values if v is not None]
+        nonzero = [v for v in present if abs(v) > 1e-12]
+        col = C.GREEN if _pct(len(present), n) >= 80 else C.YELLOW if present else C.RED
+        print(f"  {C.DIM}{field[:47]:<48}{C.RESET}"
+              f" {col}{_fmt_count(len(present), n):>13}{C.RESET}"
+              f" {len(nonzero):>13}")
+
+
+def _count_nested_status(records, *path):
+    counter = Counter()
+    for r in records:
+        value = _nested_value(_materialized_snapshot(r), *path)
+        if isinstance(value, str) and value:
+            counter[value] += 1
+    return counter
+
+
+def _count_temporal_delta_evidence(records):
+    quality = Counter()
+    source = Counter()
+    for r in records:
+        evidence_map = _nested_dict(_materialized_snapshot(r), "temporal_deltas", "delta_evidence")
+        for evidence in evidence_map.values():
+            if not isinstance(evidence, dict):
+                continue
+            q = _primitive_value(evidence.get("quality"))
+            s = _primitive_value(evidence.get("source"))
+            if q is not None:
+                quality[str(q)] += 1
+            if s is not None:
+                source[str(s)] += 1
+    return quality, source
+
+
+def section_new_log_integrity(rec_a, rec_b):
+    """Sanity check dla nowych logów: wektory, AB tx, delty, evidence."""
+    hdr("🧾 SEKCJA 0B: NOWE LOGI — DECISION SERIES / AB TX / DELTY / EVIDENCE", C.CYAN)
+    hint("Ta sekcja nie imputuje wartości. Liczba jest liczona tylko gdy top-level lub embedded snapshot ją zawiera.")
+    hint("Embedded fallback: v3_materialized_feature_snapshot.decision_time_series / temporal_deltas / alpha_fingerprint / sybil_resistance.")
+
+    for name_s, recs, col in [("A", rec_a, C.CYAN), ("B", rec_b, C.MAGENTA)]:
+        n = len(recs)
+        sub(f"0B.1 Decision time series [{name_s}]", col)
+        dts_present = sum(1 for r in recs if _has_decision_time_series(r))
+        dts_clean = sum(1 for r in recs if get_str(r, "decision_time_series_status") == "clean")
+        retained = extract(recs, "decision_time_series_retained_sample_count")
+        total_tx = extract(recs, "decision_time_series_total_tx_count")
+        dropped = extract(recs, "decision_time_series_dropped_oldest_count")
+        finite = extract(recs, "vectors_price_finite_count")
+        missing = extract(recs, "vectors_price_missing_count")
+        coverage = extract(recs, "vectors_price_coverage_ratio")
+        neg, zero, mismatch = _decision_series_interval_quality(recs)
+
+        row("decision_time_series present", _fmt_count(dts_present, n), col)
+        row("decision_time_series status=clean", _fmt_count(dts_clean, n), C.GREEN if dts_clean == dts_present else C.YELLOW)
+        if retained:
+            row("retained_sample_count", f"μ={mean(retained):.1f}  max={max(retained):.0f}", col)
+        if total_tx:
+            row("total_tx_count", f"μ={mean(total_tx):.1f}  max={max(total_tx):.0f}", col)
+        if dropped:
+            row("dropped_oldest_count", f"Σ={sum(dropped):.0f}  max={max(dropped):.0f}", C.YELLOW if sum(dropped) > 0 else C.DIM)
+        if finite or missing:
+            row("price finite/missing samples", f"finiteΣ={sum(finite):.0f}  missingΣ={sum(missing):.0f}", col)
+        if coverage:
+            row("price_coverage_ratio", f"μ={mean(coverage):.3f}  med={median_val(coverage):.3f}", col)
+        row("negative interval records", f"{neg}", C.RED if neg else C.GREEN)
+        row("zero interval records", f"{zero}", C.YELLOW if zero else C.DIM)
+        row("vector length mismatch records", f"{mismatch}", C.RED if mismatch else C.GREEN)
+
+        source_parts = []
+        for field in VECTOR_PRICE_SOURCE_FIELDS:
+            vals = extract(recs, field)
+            if vals:
+                source_parts.append(f"{field.replace('vectors_price_source_', '').replace('_count', '')}={sum(vals):.0f}")
+        if source_parts:
+            row("price source counts", "  ".join(source_parts), col)
+
+        sub(f"0B.2 AB tx fields [{name_s}]", col)
+        for field in ["ab_record_id", "join_key", "ab_tx_count_window", "ab_unique_signers_window", "ab_fail_count_window"]:
+            if field in ("ab_record_id", "join_key"):
+                present = sum(1 for r in recs if get_str(r, field))
+            else:
+                present = _presence_count(recs, field)
+            row(field, _fmt_count(present, n), C.GREEN if present else C.RED)
+
+    _print_coverage_rows(
+        rec_a + rec_b,
+        TEMPORAL_DELTA_FIELDS,
+        "0B.3 Coverage delt temporalnych [A+B]",
+        C.YELLOW,
+    )
+    _print_coverage_rows(
+        rec_a + rec_b,
+        TEMPORAL_RATE_FIELDS,
+        "0B.4 Coverage rate fields [A+B]",
+        C.YELLOW,
+    )
+    _print_coverage_rows(
+        rec_a + rec_b,
+        [
+            "signer_cross_pool_velocity",
+            "cpv_other_pool_activity",
+            "flipper_presence_ratio",
+            "jito_tip_intensity",
+            "burst_ratio",
+            "fee_topology_diversity_index",
+            "dev_buyer_infrastructure_affinity",
+            "spend_fraction_divergence",
+            "demand_elasticity_score",
+        ],
+        "0B.5 Coverage nowych metryk alpha/sybil [A+B]",
+        C.YELLOW,
+    )
+
+    all_recs = rec_a + rec_b
+    temporal_status = _count_nested_status(all_recs, "temporal_deltas", "status")
+    dts_status = _count_nested_status(all_recs, "decision_time_series", "status")
+    cpv_status = _count_nested_status(all_recs, "sybil_resistance", "cpv_evidence", "quality")
+    delta_quality, delta_source = _count_temporal_delta_evidence(all_recs)
+
+    sub("0B.6 Evidence status counters [A+B]", C.BLUE)
+    for label, counter in [
+        ("decision_time_series.status", dts_status),
+        ("temporal_deltas.status", temporal_status),
+        ("cpv_evidence.quality", cpv_status),
+        ("temporal_delta_evidence.quality", delta_quality),
+        ("temporal_delta_evidence.source", delta_source),
+    ]:
+        if counter:
+            row(label, ", ".join(f"{k}={v}" for k, v in counter.most_common()), C.CYAN)
+        else:
+            note(f"{label}: brak w tych logach")
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  SEKCJA 1 & 2 — PROFIL WEWNĘTRZNY ZBIORU
@@ -1278,15 +2022,44 @@ def section_summary(rec_a, rec_b, disc_scores):
         n_recs = len(recs)
         if n_recs == 0:
             continue
-        has_dp = sum(1 for r in recs if isinstance(r.get("vectors_d_price"), list) and len(r["vectors_d_price"]) > 0)
-        has_pr = sum(1 for r in recs if isinstance(r.get("vectors_prices"), list) and len(r["vectors_prices"]) > 0)
-        nan_pr = sum(1 for r in recs if isinstance(r.get("vectors_prices"), list)
-                     and any(isinstance(x, (int, float)) and not math.isfinite(x) for x in r["vectors_prices"]))
+        has_dp = sum(1 for r in recs if len(get_vector(r, "vectors_d_price")) > 0)
+        has_pr = sum(1 for r in recs if len(get_vector_raw(r, "vectors_prices")) > 0)
+        null_pr = sum(1 for r in recs if any(_number_or_bool(x) is None for x in get_vector_raw(r, "vectors_prices")))
+        nan_pr = sum(1 for r in recs if any(
+            isinstance(x, (int, float)) and not math.isfinite(float(x))
+            for x in get_vector_raw(r, "vectors_prices")
+        ))
         row(f"Wektory niepuste [{name_s}]",
             f"d_price: {has_dp}/{n_recs} ({has_dp/n_recs*100:.0f}%)  "
             f"prices: {has_pr}/{n_recs} ({has_pr/n_recs*100:.0f}%)", col)
         if has_pr > 0:
-            row(f"  prices z NaN [{name_s}]", f"{nan_pr}/{has_pr}", C.YELLOW if nan_pr > 0 else C.DIM)
+            row(
+                f"  prices null/NaN [{name_s}]",
+                f"null={null_pr}/{has_pr}  nan={nan_pr}/{has_pr}",
+                C.YELLOW if (null_pr > 0 or nan_pr > 0) else C.DIM,
+            )
+        coverage_values = [
+            get_val(r, "vectors_price_coverage_ratio")
+            for r in recs
+            if get_val(r, "vectors_price_coverage_ratio") is not None
+        ]
+        finite_counts = [
+            get_val(r, "vectors_price_finite_count")
+            for r in recs
+            if get_val(r, "vectors_price_finite_count") is not None
+        ]
+        missing_counts = [
+            get_val(r, "vectors_price_missing_count")
+            for r in recs
+            if get_val(r, "vectors_price_missing_count") is not None
+        ]
+        if coverage_values:
+            row(
+                f"  coverage ceny DTW [{name_s}]",
+                f"μ={mean(coverage_values):.2f}  med={median_val(coverage_values):.2f}  "
+                f"finiteΣ={sum(finite_counts):.0f}  missingΣ={sum(missing_counts):.0f}",
+                col,
+            )
 
     # Fingerprint presence check
     sub("Fingerprint presence check")
@@ -1303,7 +2076,17 @@ def section_summary(rec_a, rec_b, disc_scores):
                  "fee_topology_diversity_index", "dev_buyer_infrastructure_affinity",
                  "spend_fraction_divergence", "demand_elasticity_score",
                  "signer_cross_pool_velocity", "funding_source_concentration",
-                 "sybil_soft_points", "sybil_interference_layer_enabled"]
+                 "cpv_other_pool_activity",
+                 "sybil_soft_points", "sybil_interference_layer_enabled",
+                 "vectors_price_finite_count", "vectors_price_missing_count",
+                 "vectors_price_coverage_ratio",
+                 "vectors_price_source_reserve_count",
+                 "vectors_price_source_account_state_count",
+                 "vectors_price_source_carry_forward_count",
+                 "decision_time_series_retained_sample_count",
+                 "decision_time_series_total_tx_count",
+                 *TEMPORAL_DELTA_FIELDS,
+                 *TEMPORAL_RATE_FIELDS]
     all_recs = rec_a + rec_b
     n_all = len(all_recs)
     missing_most = False
@@ -1400,6 +2183,77 @@ def section_summary(rec_a, rec_b, disc_scores):
 # ══════════════════════════════════════════════════════════════════════════════
 #  SEKCJA 6 — KSZTAŁT CZASU (DYNAMIC TIME WARPING)
 # ══════════════════════════════════════════════════════════════════════════════
+class _DtwBudgetExceeded(RuntimeError):
+    pass
+
+
+def _dtw_deadline():
+    return time.monotonic() + AB_DTW_TIME_BUDGET_SEC
+
+
+def _dtw_check_budget(deadline):
+    if deadline is not None and time.monotonic() >= deadline:
+        raise _DtwBudgetExceeded
+
+
+def _downsample_even(values, max_len):
+    """Deterministycznie ogranicza długość serii bez losowej próbki."""
+    if len(values) <= max_len:
+        return values
+    if max_len <= 1:
+        return [values[0]]
+    last = len(values) - 1
+    return [values[round(i * last / (max_len - 1))] for i in range(max_len)]
+
+
+def _select_evenly_spaced(items, max_items):
+    """Deterministycznie ogranicza liczbę serii używanych przez DTW."""
+    if len(items) <= max_items:
+        return items
+    if max_items <= 1:
+        return [items[0]]
+    last = len(items) - 1
+    return [items[round(i * last / (max_items - 1))] for i in range(max_items)]
+
+
+def _bounded_within_pairs(n, max_pairs):
+    emitted = 0
+    for gap in range(1, n):
+        for i in range(0, n - gap):
+            yield i, i + gap
+            emitted += 1
+            if emitted >= max_pairs:
+                return
+
+
+def _bounded_cross_pairs(n_a, n_b, max_pairs):
+    total = n_a * n_b
+    if total <= max_pairs:
+        for i in range(n_a):
+            for j in range(n_b):
+                yield i, j
+        return
+
+    if max_pairs <= 1:
+        yield 0, 0
+        return
+
+    last = total - 1
+    seen = set()
+    for k in range(max_pairs):
+        idx = round(k * last / (max_pairs - 1))
+        i = idx // n_b
+        j = idx % n_b
+        if (i, j) in seen:
+            continue
+        seen.add((i, j))
+        yield i, j
+
+
+def _fmt_dtw(value):
+    return f"{value:.4f}" if isinstance(value, (int, float)) and math.isfinite(value) else "N/A"
+
+
 def _zscore_normalize(series):
     """Z-Score normalizacja szeregu (średnia 0, odchylenie 1).
 
@@ -1446,7 +2300,8 @@ def _extract_interval_series(records, field="avg_interval_ms", min_len=5):
         win = max(min_len, len(all_vals) // 4)
         for i in range(0, len(all_vals) - win + 1, win):
             series_list.append(all_vals[i:i + win])
-    return series_list
+    bounded = [_downsample_even(s, AB_DTW_MAX_VECTOR_LEN) for s in series_list]
+    return _select_evenly_spaced(bounded, AB_DTW_MAX_SERIES_PER_SET)
 
 
 def _extract_series_list(records, vector_field, min_len=0):
@@ -1474,12 +2329,13 @@ def _extract_series_list(records, vector_field, min_len=0):
                 cleaned.append(fx)
 
         if len(cleaned) >= req_len:
-            series_list.append(cleaned)
-    return series_list
+            series_list.append(_downsample_even(cleaned, AB_DTW_MAX_VECTOR_LEN))
+    return _select_evenly_spaced(series_list, AB_DTW_MAX_SERIES_PER_SET)
 
 
-def _dtw_distance(s1, s2):
+def _dtw_distance(s1, s2, deadline=None):
     """Oblicza DTW między dwoma znormalizowanymi szeregami."""
+    _dtw_check_budget(deadline)
     n1 = _zscore_normalize(s1)
     n2 = _zscore_normalize(s2)
 
@@ -1492,50 +2348,60 @@ def _dtw_distance(s1, s2):
     return float(dist / denom) if denom else float('nan')
 
 
-def _mean_dtw(series_list):
+def _mean_dtw(series_list, deadline=None):
     """Średni dystans DTW wewnątrz listy szeregów."""
     if len(series_list) < 2:
-        return float('nan')
+        return float('nan'), 0
     dists = []
-    for i in range(len(series_list)):
-        for j in range(i + 1, len(series_list)):
-            d = _dtw_distance(series_list[i], series_list[j])
-            if math.isfinite(d):
-                dists.append(d)
-    return float(np.mean(dists)) if dists else float('nan')
+    for i, j in _bounded_within_pairs(len(series_list), AB_DTW_MAX_PAIRS):
+        d = _dtw_distance(series_list[i], series_list[j], deadline=deadline)
+        if math.isfinite(d):
+            dists.append(d)
+    return (float(np.mean(dists)) if dists else float('nan')), len(dists)
 
 
-def _cross_dtw(series_a, series_b, max_pairs=50):
+def _cross_dtw(series_a, series_b, deadline=None, max_pairs=None):
     """Średni dystans DTW między dwoma zbiorami szeregów."""
     dists = []
-    count = 0
-    for sa in series_a:
-        for sb in series_b:
-            d = _dtw_distance(sa, sb)
-            if math.isfinite(d):
-                dists.append(d)
-            count += 1
-            if count >= max_pairs:
-                break
-        if count >= max_pairs:
-            break
-    return float(np.mean(dists)) if dists else float('nan')
+    pair_limit = AB_DTW_MAX_PAIRS if max_pairs is None else max_pairs
+    for i, j in _bounded_cross_pairs(len(series_a), len(series_b), pair_limit):
+        d = _dtw_distance(series_a[i], series_b[j], deadline=deadline)
+        if math.isfinite(d):
+            dists.append(d)
+    return (float(np.mean(dists)) if dists else float('nan')), len(dists)
 
 
 def section_dtw(rec_a, rec_b, config: FilterConfig):
     """SEKCJA 6: Kształt Czasu — Dynamic Time Warping (vectors v3)."""
     hdr("⏱️  SEKCJA 6: KSZTAŁT CZASU (DYNAMIC TIME WARPING)", C.CYAN)
 
+    if not AB_ENABLE_DTW:
+        warn("SEKCJA 6 DTW wyłączona przez AB_ENABLE_DTW=0.")
+        return
+
     if not _HAS_DTW:
         warn("Brak bibliotek fastdtw/scipy — pomiń SEKCJA 6.")
         hint("Zainstaluj: pip install fastdtw scipy")
         return
 
-    hint("DTW porównuje kształt sekwencji w oknie A/B (wektory v3).")
-    hint("Niski dystans A↔B = ten sam wzorzec algorytmu.")
+    if not _HAS_NUMPY:
+        warn("Brak numpy — pomiń SEKCJA 6.")
+        return
 
-    dtw_vector_fields = ["vectors_d_price", "vectors_interval_ms"]
+    hint("DTW porównuje kształt sekwencji w oknie A/B albo pełnej decision_time_series.")
+    hint("Niski dystans A↔B = ten sam wzorzec algorytmu.")
+    hint(
+        "Limity DTW: "
+        f"series_per_set≤{AB_DTW_MAX_SERIES_PER_SET}, "
+        f"pairs_bucket≤{AB_DTW_MAX_PAIRS}, "
+        f"vector_len≤{AB_DTW_MAX_VECTOR_LEN}, "
+        f"time_budget≈{AB_DTW_TIME_BUDGET_SEC:.0f}s"
+    )
+    hint("Null/NaN w vectors_prices są pomijane tylko dla DTW; coverage cen jest oceniany w sekcji 0B.")
+
+    dtw_vector_fields = ["vectors_d_price", "vectors_prices", "vectors_interval_ms"]
     has_any_vectors = False
+    deadline = _dtw_deadline()
 
     for vfield in dtw_vector_fields:
         series_a = _extract_series_list(rec_a, vfield, config.min_vector_len)
@@ -1551,13 +2417,17 @@ def section_dtw(rec_a, rec_b, config: FilterConfig):
 
         sub(f"DTW — {vfield} (A: {len(series_a)} serii, B: {len(series_b)} serii)")
 
-        dtw_aa = _mean_dtw(series_a)
-        dtw_bb = _mean_dtw(series_b)
-        dtw_ab = _cross_dtw(series_a, series_b)
+        try:
+            dtw_aa, pairs_aa = _mean_dtw(series_a, deadline=deadline)
+            dtw_bb, pairs_bb = _mean_dtw(series_b, deadline=deadline)
+            dtw_ab, pairs_ab = _cross_dtw(series_a, series_b, deadline=deadline)
+        except _DtwBudgetExceeded:
+            warn(f"Budżet czasu DTW przekroczony przy '{vfield}' — kończę sekcję 6 bez zawieszania skryptu.")
+            return
 
-        row("DTW wewnątrz A", f"{dtw_aa:.4f}", C.CYAN)
-        row("DTW wewnątrz B", f"{dtw_bb:.4f}", C.MAGENTA)
-        row("DTW między A↔B", f"{dtw_ab:.4f}", C.YELLOW)
+        row("DTW wewnątrz A", f"{_fmt_dtw(dtw_aa)}  (par={pairs_aa})", C.CYAN)
+        row("DTW wewnątrz B", f"{_fmt_dtw(dtw_bb)}  (par={pairs_bb})", C.MAGENTA)
+        row("DTW między A↔B", f"{_fmt_dtw(dtw_ab)}  (par={pairs_ab})", C.YELLOW)
 
         intra_vals = [v for v in (dtw_aa, dtw_bb) if math.isfinite(v)]
         intra_avg = float(np.mean(intra_vals)) if intra_vals else float('nan')
@@ -1572,7 +2442,7 @@ def section_dtw(rec_a, rec_b, config: FilterConfig):
                 ok(f"Różne sygnatury (DTW A↔B znacząco wyższy niż wewnętrzny).")
 
     if not has_any_vectors:
-        warn("Brak wektorów v3 (vectors_d_price / vectors_interval_ms) — DTW na wektorach niedostępne.")
+        warn("Brak wektorów v3/decision_time_series — DTW na wektorach niedostępne.")
         hint("Fallback: DTW na agregatach (legacy).")
         # Legacy DTW on aggregates
         dtw_fields = ["avg_interval_ms", "interval_cv", "burst_ratio"]
@@ -1582,12 +2452,16 @@ def section_dtw(rec_a, rec_b, config: FilterConfig):
             if not series_a or not series_b:
                 continue
             sub(f"DTW legacy — {field} (A: {len(series_a)} seg., B: {len(series_b)} seg.)")
-            dtw_aa = _mean_dtw(series_a)
-            dtw_bb = _mean_dtw(series_b)
-            dtw_ab = _cross_dtw(series_a, series_b)
-            row("DTW wewnątrz A", f"{dtw_aa:.4f}", C.CYAN)
-            row("DTW wewnątrz B", f"{dtw_bb:.4f}", C.MAGENTA)
-            row("DTW między A↔B", f"{dtw_ab:.4f}", C.YELLOW)
+            try:
+                dtw_aa, pairs_aa = _mean_dtw(series_a, deadline=deadline)
+                dtw_bb, pairs_bb = _mean_dtw(series_b, deadline=deadline)
+                dtw_ab, pairs_ab = _cross_dtw(series_a, series_b, deadline=deadline)
+            except _DtwBudgetExceeded:
+                warn("Budżet czasu DTW przekroczony w fallback legacy — kończę sekcję 6.")
+                return
+            row("DTW wewnątrz A", f"{_fmt_dtw(dtw_aa)}  (par={pairs_aa})", C.CYAN)
+            row("DTW wewnątrz B", f"{_fmt_dtw(dtw_bb)}  (par={pairs_bb})", C.MAGENTA)
+            row("DTW między A↔B", f"{_fmt_dtw(dtw_ab)}  (par={pairs_ab})", C.YELLOW)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1605,6 +2479,18 @@ CAUSAL_METRICS = [
     "fee_topology_diversity_index",
     "dev_buyer_infrastructure_affinity",
     "signer_cross_pool_velocity",
+    "cpv_other_pool_activity",
+    "delta_mcap_1s_to_2s",
+    "delta_mcap_1s_to_3s",
+    "delta_buy_count_1s_to_2s",
+    "delta_unique_signers_1s_to_2s",
+    "delta_tx_count_1s_to_2s",
+    "delta_net_quote_sol_1s_to_2s",
+    "delta_jito_tip_intensity_1s_to_2s",
+    "delta_flipper_presence_ratio_1s_to_2s",
+    "delta_signer_cross_pool_velocity_1s_to_2s",
+    "rate_mcap_sol_per_s_1s_to_2s",
+    "rate_net_quote_sol_per_s_1s_to_2s",
 ]
 
 
@@ -1750,6 +2636,13 @@ TDA_DIMS = [
     "fixed_size_buy_ratio",
     "compute_unit_cluster_dominance",
     "whale_reversal_ratio_top3",
+    "vectors_price_coverage_ratio",
+    "delta_mcap_1s_to_3s",
+    "delta_buy_count_1s_to_3s",
+    "delta_net_quote_sol_1s_to_3s",
+    "delta_jito_tip_intensity_1s_to_3s",
+    "delta_flipper_presence_ratio_1s_to_3s",
+    "delta_signer_cross_pool_velocity_1s_to_3s",
 ]
 
 
@@ -1891,7 +2784,8 @@ def section_mutual_info(rec_a, rec_b):
 
     # Enrich records with vector-derived scalar features
     vf_fields = ["vf_d_price_std", "vf_abs_d_price_p95", "vf_d_price_skew_proxy",
-                 "vf_interval_p95", "vf_interval_cv"]
+                 "vf_interval_p95", "vf_interval_cv",
+                 "vf_price_return", "vf_price_range_pct", "vf_price_coverage_ratio"]
     for r in rec_a + rec_b:
         feats = vector_features(r)
         for k, v in feats.items():
@@ -1984,6 +2878,11 @@ HILL_METRICS = [
     "volume_cv",
     "burst_ratio",
     "max_consecutive_buys_observed",
+    "delta_mcap_1s_to_3s",
+    "delta_price_pct_1s_to_3s",
+    "delta_net_quote_sol_1s_to_3s",
+    "rate_mcap_sol_per_s_1s_to_3s",
+    "rate_net_quote_sol_per_s_1s_to_3s",
 ]
 
 
@@ -2108,6 +3007,7 @@ def section_hill(rec_a, rec_b):
     # ── Vector-based Hill analysis (v3) ──
     sub("Hill Estimator na wektorach v3")
     for vfield, vlabel in [("vectors_d_price", "abs(d_price)"),
+                           ("vectors_prices", "prices"),
                            ("vectors_sol_amounts", "sol_amounts")]:
         all_a = []
         all_b = []
@@ -3145,8 +4045,8 @@ def section_sybil_interference(rec_a, rec_b):
     print(f"  {'─'*70}")
 
     for field, cfg in _SYBIL_METRICS_CONFIG.items():
-        n_a_with = sum(1 for r in rec_a if r.get(field) is not None)
-        n_b_with = sum(1 for r in rec_b if r.get(field) is not None)
+        n_a_with = sum(1 for r in rec_a if get_val(r, field) is not None)
+        n_b_with = sum(1 for r in rec_b if get_val(r, field) is not None)
         n_all_with = n_a_with + n_b_with
         pct_cov_a = n_a_with / na * 100 if na > 0 else 0.0
         pct_cov_b = n_b_with / nb * 100 if nb > 0 else 0.0
@@ -3167,6 +4067,8 @@ def section_sybil_interference(rec_a, rec_b):
         counter: dict = defaultdict(int)
         for r in records:
             reasons = r.get("sybil_metric_degraded_reasons")
+            if not isinstance(reasons, list):
+                reasons = _nested_value(_materialized_snapshot(r), "sybil_resistance", "degraded_reasons")
             if isinstance(reasons, list):
                 for reason in reasons:
                     if isinstance(reason, str):
@@ -3490,12 +4392,12 @@ def main():
     sub("Vector integrity check (sample)")
     for name_s, recs, col in [("A", rec_a, C.CYAN), ("B", rec_b, C.MAGENTA)]:
         for idx, r in enumerate(recs[:3]):
-            ts = r.get("vectors_ts_offsets_ms")
-            pr = r.get("vectors_prices")
-            sa = r.get("vectors_sol_amounts")
-            iv = r.get("vectors_interval_ms")
-            dp = r.get("vectors_d_price")
-            if isinstance(ts, list) and isinstance(pr, list) and isinstance(sa, list):
+            ts = get_vector_raw(r, "vectors_ts_offsets_ms")
+            pr = get_vector_raw(r, "vectors_prices")
+            sa = get_vector_raw(r, "vectors_sol_amounts")
+            iv = get_vector_raw(r, "vectors_interval_ms")
+            dp = get_vector_raw(r, "vectors_d_price")
+            if isinstance(ts, list) and isinstance(pr, list) and isinstance(sa, list) and ts and pr and sa:
                 ok_len = len(ts) == len(pr) == len(sa)
                 ok_d   = True
                 if isinstance(iv, list): ok_d = ok_d and (len(iv) == len(ts) - 1)
@@ -3510,6 +4412,9 @@ def main():
 
     ok(f"Zbiór A po filtrze: {len(rec_a)} rekordów")
     ok(f"Zbiór B po filtrze: {len(rec_b)} rekordów")
+
+    # SEKCJA 0B: Nowe logi — decision_time_series / AB tx / temporal deltas
+    section_new_log_integrity(rec_a, rec_b)
 
     # SEKCJA 1 & 2: Profile
     corrs_a = section_profile(rec_a, "A", C.CYAN)

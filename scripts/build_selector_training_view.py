@@ -12,6 +12,72 @@ from typing import Any
 import selector_pipeline_common as common
 
 
+GK_PROVENANCE_COLUMNS = {
+    "gk_log_schema_version",
+    "gk_decision_plane",
+    "gk_observation_profile",
+    "gk_context_status",
+    "gk_cutoff_status",
+}
+
+GK_EVIDENCE_COLUMN_SUFFIXES = (
+    "_present",
+    "_status",
+    "_source",
+    "_sample_count",
+    "_required_sample_count",
+    "_required_clean_sample_count",
+    "_required_degraded_sample_count",
+    "_rolling_state_available",
+    "_degraded_reason",
+    "_reason",
+    "_staleness_ms",
+    "_carried_from_anchor_ms",
+)
+
+GK_EVIDENCE_POLICY_COLUMNS = {
+    "gk_evidence_policy_context_present",
+    "gk_strict_metric_threshold_gate_enabled",
+    "gk_strict_metric_missing_policy",
+    "gk_cpv_low_sample_policy",
+    "gk_cpv_min_successful_buy_signers_clean",
+    "gk_cpv_min_successful_buy_signers_degraded",
+    "gk_cpv_emit_degraded_low_sample",
+    "gk_cpv_allow_degraded_in_strict_policy",
+    "gk_temporal_carried_forward_policy",
+    "gk_temporal_carry_forward_enabled",
+    "gk_temporal_carry_forward_max_staleness_ms",
+    "gk_temporal_carry_forward_event_counters_enabled",
+    "gk_temporal_carry_forward_state_metrics_enabled",
+    "gk_temporal_carry_forward_ratio_metrics_enabled",
+    "gk_top_level_features_from_materialized_ssot",
+    "gk_decision_time_series_tx_capacity",
+    "gk_decision_time_series_retention_policy",
+}
+
+GK_DECISION_TIME_SERIES_EVIDENCE_COLUMNS = {
+    "gk_decision_time_series_present",
+    "gk_decision_time_series_source",
+    "gk_decision_time_series_evidence_status",
+    "gk_decision_time_series_retention_status",
+    "gk_decision_time_series_retention_policy",
+    "gk_decision_time_series_retention_capacity",
+    "gk_decision_time_series_retained_sample_count",
+    "gk_decision_time_series_total_tx_count",
+    "gk_decision_time_series_dropped_oldest_sample_count",
+    "gk_decision_time_series_price_finite_sample_count",
+    "gk_decision_time_series_price_missing_sample_count",
+}
+
+
+def is_gatekeeper_evidence_column(column: str) -> bool:
+    return (
+        column in GK_EVIDENCE_POLICY_COLUMNS
+        or column in GK_DECISION_TIME_SERIES_EVIDENCE_COLUMNS
+        or column.endswith(GK_EVIDENCE_COLUMN_SUFFIXES)
+    )
+
+
 def index_feature_rows(rows: list[dict[str, Any]]) -> dict[tuple[str, str], dict[str, Any]]:
     indexed: dict[tuple[str, str], dict[str, Any]] = {}
     for row in rows:
@@ -47,6 +113,7 @@ def load_gatekeeper_feature_context(
             "cutoff_status_counts": {},
             "feature_columns": [],
             "model_feature_columns": [],
+            "evidence_feature_columns": [],
         }
     if not path.exists():
         raise FileNotFoundError(path)
@@ -55,17 +122,13 @@ def load_gatekeeper_feature_context(
     status_counts: Counter[str] = Counter()
     cutoff_counts: Counter[str] = Counter()
     feature_columns = sorted({key for row in rows for key in row if key.startswith("gk_")})
+    evidence_feature_columns = [
+        column for column in feature_columns if is_gatekeeper_evidence_column(column)
+    ]
     model_feature_columns = [
         column
         for column in feature_columns
-        if column
-        not in {
-            "gk_log_schema_version",
-            "gk_decision_plane",
-            "gk_observation_profile",
-            "gk_context_status",
-            "gk_cutoff_status",
-        }
+        if column not in GK_PROVENANCE_COLUMNS and not is_gatekeeper_evidence_column(column)
     ]
     valid_for_model_rows = 0
     for row in rows:
@@ -90,6 +153,7 @@ def load_gatekeeper_feature_context(
         "cutoff_status_counts": common.counter_dict(cutoff_counts),
         "feature_columns": feature_columns,
         "model_feature_columns": model_feature_columns,
+        "evidence_feature_columns": evidence_feature_columns,
     }
 
 

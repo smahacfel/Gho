@@ -144,9 +144,7 @@ impl ShadowDispatchLifecycleRecord {
             idempotency_key,
             dispatch_status: status,
             classification: match status {
-                ShadowDispatchStatus::NotDispatched => {
-                    "precheck_failed_not_dispatched".to_string()
-                }
+                ShadowDispatchStatus::NotDispatched => "precheck_failed_not_dispatched".to_string(),
                 ShadowDispatchStatus::Submitted => "dispatch_submitted".to_string(),
                 ShadowDispatchStatus::Closed => "simulation_completed".to_string(),
                 ShadowDispatchStatus::Failed | ShadowDispatchStatus::Abandoned => {

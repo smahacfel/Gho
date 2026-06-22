@@ -32,6 +32,7 @@ FAIL_TMUX = "FAIL_TMUX"
 INCONCLUSIVE_ENV_OR_CONFIG = "INCONCLUSIVE_ENV_OR_CONFIG"
 
 RUN_STATE_RUNNING = "RUN_LEFT_RUNNING_AFTER_LIFECYCLE_PROOF"
+RUN_STATE_EVENT_ONLY = "RUN_LEFT_RUNNING_AFTER_EVENT_CANARY_ZERO_BUY_LIFECYCLE_ALLOWED"
 RUN_STATE_KILLED = "RUN_KILLED_AFTER_FAILED_CANARY"
 
 
@@ -288,6 +289,7 @@ def write_markdown(path: Path, payload: dict[str, Any]) -> None:
         f"- scope: `{payload.get('scope')}`",
         f"- config: `{payload.get('config')}`",
         f"- tmux_session: `{payload.get('tmux_session')}`",
+        f"- allow_zero_buy_lifecycle_proof: `{payload.get('allow_zero_buy_lifecycle_proof')}`",
         "",
         "## Gates",
         "",
@@ -323,6 +325,14 @@ def write_markdown(path: Path, payload: dict[str, Any]) -> None:
             "Manual tmux starts are not accepted for lifecycle-capable selector runs.",
         ]
     )
+    if payload.get("run_state") == RUN_STATE_EVENT_ONLY:
+        lines.extend(
+            [
+                "",
+                "This run used zero-BUY lifecycle allowance.",
+                "PASS means event-ingest proof only; it does not claim classic BUY lifecycle proof.",
+            ]
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -332,6 +342,8 @@ def finish(report: dict[str, Any], output_dir: Path, status: str) -> int:
     if status == PASS_STATUS:
         if report.get("run_state") == "DRY_RUN_NOT_STARTED":
             report["claim"] = "SELECTOR_LIFECYCLE_RUN_STATIC_PREFLIGHT_PASS"
+        elif report.get("run_state") == RUN_STATE_EVENT_ONLY:
+            report["claim"] = "SELECTOR_EVENT_CANARY_RUN_STARTED_ZERO_BUY_LIFECYCLE_ALLOWED"
         else:
             report["claim"] = "SELECTOR_LIFECYCLE_RUN_STARTED_WITH_PROOF"
     else:
@@ -367,6 +379,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--min-reporter-rows", type=int, default=1)
     parser.add_argument("--allow-existing-session", action="store_true")
+    parser.add_argument(
+        "--allow-zero-buy-lifecycle-proof",
+        action="store_true",
+        help=(
+            "After event canary PASS, leave the run running without requiring classic BUY "
+            "shadow_buys/shadow_lifecycle proof. Use only for strict threshold probes or "
+            "data-collection runs where zero BUYs is an expected outcome."
+        ),
+    )
     parser.add_argument("--skip-static-tests", action="store_true")
     parser.add_argument(
         "--build-release-before-start",
@@ -397,6 +418,7 @@ def main(argv: list[str] | None = None) -> int:
         "config": str(config_path),
         "tmux_session": args.tmux_session,
         "runtime_timeout_seconds": args.runtime_timeout_seconds,
+        "allow_zero_buy_lifecycle_proof": args.allow_zero_buy_lifecycle_proof,
         "output_dir": str(output_dir),
         "runtime_binary": str(launcher),
         "build_release_before_start": args.build_release_before_start,
@@ -580,6 +602,17 @@ def main(argv: list[str] | None = None) -> int:
         report["run_state"] = RUN_STATE_KILLED
         report["errors"].append("event canary failed")
         return finish(report, output_dir, FAIL_EVENT_CANARY)
+
+    if args.allow_zero_buy_lifecycle_proof:
+        report["run_state"] = RUN_STATE_EVENT_ONLY
+        report["lifecycle_canary"] = {
+            "status": "SKIPPED_ZERO_BUY_LIFECYCLE_ALLOWED",
+            "reason": (
+                "event canary passed; classic BUY lifecycle proof is not required for this "
+                "strict probe/data-collection run"
+            ),
+        }
+        return finish(report, output_dir, PASS_STATUS)
 
     report["run_state"] = "RUNNING_AWAITING_LIFECYCLE_PROOF"
     deadline = time.monotonic() + args.lifecycle_proof_timeout_seconds

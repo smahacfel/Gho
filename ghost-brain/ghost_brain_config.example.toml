@@ -332,3 +332,39 @@ s9 = 86.0
 s10 = 85.0  # Silne potwierdzenie trendu
 s11 = 83.5
 s12 = 82.0  # Final Stand
+
+# ==============================================================================
+# POST-BUY GUARDIAN SHADOW LIFECYCLE
+# ==============================================================================
+# Progi zamykania shadow/probe po pozycji. Wartosci sa procentami:
+# target_threshold = 50.0 oznacza Target po +50%.
+# stoploss_threshold = 50.0 oznacza StopLoss po -50%.
+# Target moze byc ustawiony powyzej 100.0; StopLoss jest ograniczany do 100%.
+# wait_for_timestop jest podawany w milisekundach.
+
+[post_buy_guardian]
+target_threshold = 50.0
+stoploss_threshold = 50.0
+wait_for_timestop = 30000
+
+# TimeStop V2 vitality telemetry.
+# Default is observe-only and disabled; enabling this block emits counterfactual
+# time_stop_v2_window rows without changing Target/StopLoss/legacy TimeStop exits.
+[post_buy_guardian.time_stop_v2]
+enabled = false
+mode = "observe_only"
+first_check_ms = 3000
+window_ms = 4000
+failed_windows_to_signal = 3
+min_age_before_signal_ms = 11000
+min_price_delta_pct_alive = 3.0
+min_mcap_delta_pct_alive = 3.0
+min_bonding_delta_pct_alive = 0.75
+min_volume_delta_sol_alive = 1.0
+min_price_delta_pct_for_volume_alive = 1.0
+min_tx_delta_for_heartbeat = 1
+max_avg_volume_per_tx_sol_heartbeat = 0.05
+max_abs_price_delta_pct_heartbeat = 1.0
+max_abs_mcap_delta_pct_heartbeat = 1.0
+max_bonding_delta_pct_heartbeat = 0.25
+emit_window_records = true

@@ -16,6 +16,7 @@ from shadow_run_report import load_toml, resolve_config_path, resolve_runtime_pa
 
 SCHEMA_VERSION = 6
 DECISION_FILE_NAMES = ("gatekeeper_v2_decisions.jsonl", "gatekeeper_v2_buys.jsonl")
+P37_PROBE_SIMULATION_COVERAGE_MIN = 0.90
 BCV2_TERMINAL_ROUTE_EXCLUSION_REASON = "bcv2_not_persistent_or_not_loadable"
 BCV2_MARKERS = (
     "BCV2_EXACT_WATCH_REGISTERED",
@@ -3041,10 +3042,9 @@ def execution_feasibility_status_for_row(row: dict[str, Any]) -> str:
     route_status = row_string(row, "route_resolution_status")
     if route_status in EXECUTABLE_ROUTE_STATUSES or row_string(row, "selected_route_kind"):
         return "executable"
-    if is_no_executable_route_row(row):
-        return "not_executable_route"
     probe_skip_reason = row_string(row, "probe_skip_reason")
     if probe_skip_reason in {
+        "route_identity_unavailable",
         "creator_vault_source_not_authoritative",
         "bonding_curve_v2_source_not_authoritative",
         "route_account_source_not_authoritative",
@@ -3055,8 +3055,11 @@ def execution_feasibility_status_for_row(row: dict[str, Any]) -> str:
     if (
         "creator_vault_source_not_authoritative" in precheck_reason
         or "source_not_authoritative" in precheck_reason
+        or "missing_execution_route_identity" in precheck_reason
     ):
         return "not_executable_route_identity"
+    if is_no_executable_route_row(row):
+        return "not_executable_route"
     if (
         "execution_account_not_ready" in precheck_reason
         or row_string(row, "execution_account_readiness_status") == "not_ready"
@@ -3071,6 +3074,22 @@ def execution_feasibility_reason_for_row(row: dict[str, Any]) -> str:
     explicit = row_string(row, "execution_feasibility_reason")
     if explicit:
         return explicit
+    probe_skip_reason = row_string(row, "probe_skip_reason")
+    precheck_reason = row_string(row, "precheck_failure_reason") or ""
+    if (
+        probe_skip_reason == "route_identity_unavailable"
+        or probe_skip_reason
+        in {
+            "creator_vault_source_not_authoritative",
+            "bonding_curve_v2_source_not_authoritative",
+            "route_account_source_not_authoritative",
+            "missing_execution_route_identity",
+        }
+        or "creator_vault_source_not_authoritative" in precheck_reason
+        or "source_not_authoritative" in precheck_reason
+        or "missing_execution_route_identity" in precheck_reason
+    ):
+        return "route_identity_unavailable"
     if row_has_bcv2_terminal_route_exclusion(row):
         return BCV2_TERMINAL_ROUTE_EXCLUSION_REASON
     if is_no_executable_route_row(row):
@@ -3195,12 +3214,34 @@ def classify_probe_transport_materialization(row: dict[str, Any], entry_probe_id
 
 
 def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
+    decision_rows = artifact_rows(paths, "decision")
     selection_rows = artifact_rows(paths, "probe_selection")
     transport_rows = artifact_rows(paths, "probe_transport")
     entry_rows = artifact_rows(paths, "probe_entry")
     skip_rows = artifact_rows(paths, "probe_skip")
     lifecycle_rows = artifact_rows(paths, "probe_lifecycle")
+    decision_probe_ids = {row_probe_id(row) for row in decision_rows if row_probe_id(row)}
+    selection_probe_ids = {row_probe_id(row) for row in selection_rows if row_probe_id(row)}
+    transport_probe_ids = {row_probe_id(row) for row in transport_rows if row_probe_id(row)}
+    skip_probe_ids = {row_probe_id(row) for row in skip_rows if row_probe_id(row)}
     entry_probe_ids = {probe_id for row in entry_rows if (probe_id := row_probe_id(row))}
+    lifecycle_closed_probe_ids = {
+        probe_id
+        for row in lifecycle_rows
+        if row_string(row, "record_type") == "position_closed"
+        and (probe_id := row_probe_id(row))
+    }
+    lifecycle_inflight_probe_ids = entry_probe_ids - lifecycle_closed_probe_ids
+    simulated_ok_probe_ids = {
+        probe_id
+        for row in transport_rows
+        if row_string(row, "execution_outcome") == "counterfactual_shadow_probe_simulated"
+        and (probe_id := row_probe_id(row))
+    }
+    selected_after_inflight_probe_ids = selection_probe_ids - lifecycle_inflight_probe_ids
+    selected_simulated_after_inflight_probe_ids = (
+        selected_after_inflight_probe_ids & simulated_ok_probe_ids
+    )
 
     status_counts: Counter[str] = Counter()
     reason_counts: Counter[str] = Counter()
@@ -3564,6 +3605,40 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
         if route_fallback_status:
             skip_route_fallback_status_counts[route_fallback_status] += 1
 
+    creator_vault_source_not_authoritative_custom_2006_rows = [
+        row
+        for row in transport_rows
+        if row_string(row, "simulation_error_custom_code") == "2006"
+        and (
+            row_string(row, "creator_vault_authority_status")
+            == "creator_vault_source_not_authoritative"
+            or "creator_vault_source_not_authoritative"
+            in (
+                row_string(row, "precheck_failure_reason")
+                or row_string(row, "execution_account_readiness_reason")
+                or row_string(row, "simulation_error_message")
+                or ""
+            )
+        )
+    ]
+    selected_simulation_coverage_excluding_inflight = (
+        len(selected_simulated_after_inflight_probe_ids) / len(selected_after_inflight_probe_ids)
+        if selected_after_inflight_probe_ids
+        else 0.0
+    )
+    simulation_coverage_guard_reasons: list[str] = []
+    if creator_vault_source_not_authoritative_custom_2006_rows:
+        simulation_coverage_guard_reasons.append(
+            "custom_2006_creator_vault_source_not_authoritative_gt_0"
+        )
+    if selected_simulation_coverage_excluding_inflight < P37_PROBE_SIMULATION_COVERAGE_MIN:
+        simulation_coverage_guard_reasons.append(
+            "selected_simulation_coverage_excluding_inflight_below_min"
+        )
+    simulation_coverage_guard_status = (
+        "pass" if not simulation_coverage_guard_reasons else "fail"
+    )
+
     transport_rows_total = len(transport_rows)
     entry_rows_total = len(entry_rows)
     account_not_found_rows = [row for row in transport_rows if is_account_not_found_row(row)]
@@ -3798,6 +3873,27 @@ def probe_entry_materialization(paths: dict[str, list[Path]]) -> dict[str, Any]:
     return {
         "transport_rows": transport_rows_total,
         "probe_selected_rows": len(selection_rows),
+        "decision_probe_id_rows": len(decision_probe_ids),
+        "probe_selected_unique_rows": len(selection_probe_ids),
+        "probe_skip_unique_rows": len(skip_probe_ids),
+        "probe_transport_unique_rows": len(transport_probe_ids),
+        "probe_entry_unique_rows": len(entry_probe_ids),
+        "probe_lifecycle_closed_unique_rows": len(lifecycle_closed_probe_ids),
+        "probe_lifecycle_inflight_unique_rows": len(lifecycle_inflight_probe_ids),
+        "probe_simulated_ok_unique_rows": len(simulated_ok_probe_ids),
+        "selected_simulation_denominator_excluding_inflight": (
+            len(selected_after_inflight_probe_ids)
+        ),
+        "selected_simulation_coverage_excluding_inflight": round(
+            selected_simulation_coverage_excluding_inflight,
+            6,
+        ),
+        "simulation_coverage_min": P37_PROBE_SIMULATION_COVERAGE_MIN,
+        "simulation_coverage_guard_status": simulation_coverage_guard_status,
+        "simulation_coverage_guard_reasons": simulation_coverage_guard_reasons,
+        "custom_2006_creator_vault_source_not_authoritative_rows": len(
+            creator_vault_source_not_authoritative_custom_2006_rows
+        ),
         "entry_rows": entry_rows_total,
         "transport_without_entry_rows": max(transport_rows_total - entry_rows_total, 0),
         "status_counts": dict(sorted(status_counts.items())),
@@ -5392,6 +5488,19 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"- transport_rows: `{materialization['transport_rows']}`",
             f"- entry_rows: `{materialization['entry_rows']}`",
             f"- transport_without_entry_rows: `{materialization['transport_without_entry_rows']}`",
+            f"- simulation_coverage_guard_status: `{materialization['simulation_coverage_guard_status']}`",
+            f"- simulation_coverage_guard_reasons: `{json.dumps(materialization['simulation_coverage_guard_reasons'], ensure_ascii=False, sort_keys=True)}`",
+            f"- simulation_coverage_min: `{materialization['simulation_coverage_min']}`",
+            f"- selected_simulation_denominator_excluding_inflight: `{materialization['selected_simulation_denominator_excluding_inflight']}`",
+            f"- selected_simulation_coverage_excluding_inflight: `{materialization['selected_simulation_coverage_excluding_inflight']}`",
+            f"- custom_2006_creator_vault_source_not_authoritative_rows: `{materialization['custom_2006_creator_vault_source_not_authoritative_rows']}`",
+            f"- probe_selected_unique_rows: `{materialization['probe_selected_unique_rows']}`",
+            f"- probe_skip_unique_rows: `{materialization['probe_skip_unique_rows']}`",
+            f"- probe_transport_unique_rows: `{materialization['probe_transport_unique_rows']}`",
+            f"- probe_entry_unique_rows: `{materialization['probe_entry_unique_rows']}`",
+            f"- probe_lifecycle_closed_unique_rows: `{materialization['probe_lifecycle_closed_unique_rows']}`",
+            f"- probe_lifecycle_inflight_unique_rows: `{materialization['probe_lifecycle_inflight_unique_rows']}`",
+            f"- probe_simulated_ok_unique_rows: `{materialization['probe_simulated_ok_unique_rows']}`",
             f"- status_counts: `{json.dumps(materialization['status_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- reason_counts: `{json.dumps(materialization['reason_counts'], ensure_ascii=False, sort_keys=True)}`",
             f"- buy_variant_counts: `{json.dumps(materialization['buy_variant_counts'], ensure_ascii=False, sort_keys=True)}`",

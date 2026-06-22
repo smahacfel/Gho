@@ -3014,7 +3014,9 @@ impl OracleRuntime {
                 base_mint = %update.base_mint,
                 "DIAG_ACCOUNT_UPDATE_SESSION_FOUND"
             );
-            session.write().on_account_state_core_updated();
+            session
+                .write()
+                .on_account_state_core_updated_from_update(update);
         } else {
             let deferred_session_refresh = self.lookup_pool_identity(&update.pool_amm_id).is_some()
                 || self
@@ -5773,8 +5775,8 @@ impl P37ShadowProbeCandidate {
             pool_id: log.pool_id.clone(),
             base_mint: log.base_mint.clone(),
             decision_ts_ms: log
-                .ab_t_end_event_ts_ms
-                .or(log.observation_end_ts_ms)
+                .observation_end_ts_ms
+                .or(log.ab_t_end_event_ts_ms)
                 .or(log.first_seen_ts_ms),
             observation_start_ts_ms: log.observation_start_ts_ms.or(log.ab_t0_event_ts_ms),
             observation_end_ts_ms: log.observation_end_ts_ms.or(log.ab_t_end_event_ts_ms),
@@ -6564,6 +6566,30 @@ fn p37_shadow_probe_skip_reason(
         return Some("critical_curve_unavailable".to_string());
     }
     None
+}
+
+fn p37_shadow_probe_max_entry_age_ms(record: &P37ShadowProbeSelectionRecord) -> u64 {
+    record
+        .probe_quote_age_max_ms
+        .min(record.probe_curve_age_max_ms)
+}
+
+fn p37_shadow_probe_age_status(
+    record: &P37ShadowProbeSelectionRecord,
+    decision_ts_ms: u64,
+    observed_ts_ms: u64,
+) -> (u64, String) {
+    let age_ms = observed_ts_ms.saturating_sub(decision_ts_ms);
+    let max_age_ms = p37_shadow_probe_max_entry_age_ms(record);
+    let status = if age_ms <= max_age_ms {
+        "fresh"
+    } else {
+        "delayed"
+    };
+    (
+        age_ms,
+        format!("{status}:age_ms={age_ms}:max_age_ms={max_age_ms}"),
+    )
 }
 
 fn p37_shadow_probe_selection_record(
@@ -14743,6 +14769,8 @@ fn p37_shadow_probe_transport_from_event(
     let entry_token_amount_raw = event
         .entry_token_amount_raw
         .or(request_token_params.entry_token_amount_raw);
+    let (probe_age_ms, probe_age_status) =
+        p37_shadow_probe_age_status(record, event.decision_ts_ms, event.simulation_started_ts_ms);
     P37ShadowProbeTransportRecord {
         join_metadata,
         schema_version: 1,
@@ -14776,9 +14804,9 @@ fn p37_shadow_probe_transport_from_event(
         probe_curve_age_max_ms: record.probe_curve_age_max_ms,
         probe_execution_account_wait_ms: record.probe_execution_account_wait_ms,
         probe_execution_account_wait_result: record.probe_execution_account_wait_result.clone(),
-        quote_age_ms: None,
-        curve_age_ms: None,
-        probe_age_status: Some("age_not_available_from_shadow_sim_report".to_string()),
+        quote_age_ms: Some(probe_age_ms),
+        curve_age_ms: Some(probe_age_ms),
+        probe_age_status: Some(probe_age_status),
         source_v3_feature_snapshot_hash: record.source_v3_feature_snapshot_hash.clone(),
         source_v3_policy_config_hash: record.source_v3_policy_config_hash.clone(),
         transport_v3_feature_snapshot_hash: record.v3_feature_snapshot_hash.clone(),
@@ -15120,6 +15148,8 @@ fn p37_shadow_probe_transport_from_error(
         &[],
     );
     let request_token_params = p37_shadow_probe_request_token_params(request);
+    let (probe_age_ms, probe_age_status) =
+        p37_shadow_probe_age_status(record, request.decision_ts_ms, dispatch_ts_ms);
     P37ShadowProbeTransportRecord {
         join_metadata: request.join_metadata.clone(),
         schema_version: 1,
@@ -15151,9 +15181,9 @@ fn p37_shadow_probe_transport_from_error(
         probe_curve_age_max_ms: record.probe_curve_age_max_ms,
         probe_execution_account_wait_ms: record.probe_execution_account_wait_ms,
         probe_execution_account_wait_result: record.probe_execution_account_wait_result.clone(),
-        quote_age_ms: None,
-        curve_age_ms: None,
-        probe_age_status: Some("age_not_available_simulation_failed".to_string()),
+        quote_age_ms: Some(probe_age_ms),
+        curve_age_ms: Some(probe_age_ms),
+        probe_age_status: Some(probe_age_status),
         source_v3_feature_snapshot_hash: record.source_v3_feature_snapshot_hash.clone(),
         source_v3_policy_config_hash: record.source_v3_policy_config_hash.clone(),
         transport_v3_feature_snapshot_hash: record.v3_feature_snapshot_hash.clone(),
@@ -15508,9 +15538,9 @@ fn enrich_probe_shadow_entry(
     entry.probe_amount_lamports = Some(request.amount_lamports);
     entry.probe_amount_source = Some(record.probe_amount_source.clone());
     entry.probe_slippage_bps = Some(record.probe_slippage_bps);
-    entry.quote_age_ms = None;
-    entry.curve_age_ms = None;
-    entry.probe_age_status = Some("age_not_available_from_shadow_sim_report".to_string());
+    entry.quote_age_ms = transport.quote_age_ms;
+    entry.curve_age_ms = transport.curve_age_ms;
+    entry.probe_age_status = transport.probe_age_status.clone();
     entry.simulation_error_account_pubkey = transport.simulation_error_account_pubkey.clone();
     entry.simulation_error_account_role = transport.simulation_error_account_role.clone();
     entry.simulation_error_account_source = transport.simulation_error_account_source.clone();
@@ -16398,6 +16428,20 @@ fn none_if_empty_i64(v: Vec<i64>) -> Option<Vec<i64>> {
     }
 }
 
+/// Convert an empty Vec<f64> to None and preserve non-finite price samples as
+/// nullable JSON values instead of serializing invalid floats or dropping shape.
+fn nullable_f64_vec(v: Vec<f64>) -> Option<Vec<Option<f64>>> {
+    if v.is_empty() {
+        None
+    } else {
+        Some(
+            v.into_iter()
+                .map(|value| value.is_finite().then_some(value))
+                .collect(),
+        )
+    }
+}
+
 /// Enrich a buy log with deterministic window vectors extracted from the
 /// gatekeeper buffer.  Vectors are empty (None) when the buffer has no data
 /// in the window `[t0, t_end]`.
@@ -16415,12 +16459,34 @@ fn enrich_buy_log_with_vectors(
     log.sell_share = flow.sell_share;
     log.top1_wallet_share = flow.top1_wallet_share;
     log.buyer_hhi = flow.buyer_hhi;
-    log.vectors_max_len = Some(vecs.max_len);
-    log.vectors_ts_offsets_ms = none_if_empty_i64(vecs.ts_offsets_ms);
-    log.vectors_sol_amounts = none_if_empty(vecs.sol_amounts);
-    log.vectors_prices = none_if_empty(vecs.prices);
-    log.vectors_interval_ms = none_if_empty(vecs.interval_ms);
-    log.vectors_d_price = none_if_empty(vecs.d_price);
+    if log.vectors_max_len.is_none() {
+        log.vectors_max_len = Some(vecs.max_len);
+    }
+    if log.vectors_ts_offsets_ms.is_none() {
+        log.vectors_ts_offsets_ms = none_if_empty_i64(vecs.ts_offsets_ms);
+    }
+    if log.vectors_sol_amounts.is_none() {
+        log.vectors_sol_amounts = none_if_empty(vecs.sol_amounts);
+    }
+    if log.vectors_prices.is_none() {
+        log.vectors_prices = nullable_f64_vec(vecs.prices);
+        if let Some(prices) = log.vectors_prices.as_ref() {
+            let finite_count = prices.iter().filter(|price| price.is_some()).count() as u64;
+            let missing_count = prices.len() as u64 - finite_count;
+            log.vectors_price_finite_count = Some(finite_count);
+            log.vectors_price_missing_count = Some(missing_count);
+            log.vectors_price_coverage_ratio =
+                (!prices.is_empty()).then_some(finite_count as f64 / prices.len() as f64);
+            log.vectors_price_source_history_count = Some(finite_count);
+            log.vectors_price_source_missing_count = Some(missing_count);
+        }
+    }
+    if log.vectors_interval_ms.is_none() {
+        log.vectors_interval_ms = none_if_empty(vecs.interval_ms);
+    }
+    if log.vectors_d_price.is_none() {
+        log.vectors_d_price = nullable_f64_vec(vecs.d_price);
+    }
 }
 
 fn enrich_buy_log_with_runtime_identity(
@@ -19814,11 +19880,7 @@ fn shadow_entry_record_from_event(
     event: &crate::events::ShadowBuySimulationEvent,
     execution_outcome: &str,
 ) -> Option<ShadowEntryRecord> {
-    let entry_execution_ts_ms = if event.simulation_finished_ts_ms > 0 {
-        event.simulation_finished_ts_ms
-    } else {
-        event.decision_ts_ms
-    };
+    let entry_execution_ts_ms = event.decision_ts_ms;
     let mut entry = ShadowEntryRecord {
         join_metadata: event.join_metadata.clone(),
         schema_version: 1,
@@ -20299,7 +20361,7 @@ fn shadow_entry_record_from_event(
         candidate_id: Some(event.candidate_id.clone()),
         order_id: None,
         quote_id: None,
-        timing_source: None,
+        timing_source: Some("decision_ts_ms".to_string()),
         execution_outcome: execution_outcome.to_string(),
     };
     enrich_active_shadow_entry_with_account_diagnostics(&mut entry, &event.account_diagnostics);
@@ -20543,7 +20605,7 @@ fn shadow_entry_record_from_request(
         )),
         order_id: None,
         quote_id: None,
-        timing_source: None,
+        timing_source: Some("decision_ts_ms".to_string()),
         execution_outcome: execution_outcome.to_string(),
     })
 }
@@ -21898,6 +21960,8 @@ fn build_post_buy_handoff_event(
     min_tokens_out: Option<u64>,
     entry_token_amount_raw: Option<u64>,
     buy_landed_slot: Option<u64>,
+    entry_simulation_rpc_slot: Option<u64>,
+    entry_opened_at_ms: Option<u64>,
     join_metadata: ExecutionJoinMetadata,
 ) -> GhostEvent {
     let creator_pubkey = Pubkey::from_str(&pool_data.creator)
@@ -21919,6 +21983,8 @@ fn build_post_buy_handoff_event(
         creator_pubkey,
     )
     .with_execution_join_metadata(join_metadata)
+    .with_entry_simulation_rpc_slot(entry_simulation_rpc_slot)
+    .with_entry_opened_at_ms(entry_opened_at_ms)
 }
 
 fn send_direct_post_buy_handoff(
@@ -22105,6 +22171,8 @@ async fn send_post_buy_handoff(
         min_tokens_out,
         None,
         buy_landed_slot,
+        None,
+        None,
         join_metadata,
     );
     send_direct_post_buy_handoff(post_buy_tx, &handoff_event, pool_amm_id, post_buy_lane)?;
@@ -22132,6 +22200,8 @@ async fn send_shadow_post_buy_handoff(
     position_slot_id: Option<PositionSlotId>,
     min_tokens_out: Option<u64>,
     entry_token_amount_raw: Option<u64>,
+    entry_simulation_rpc_slot: Option<u64>,
+    entry_opened_at_ms: Option<u64>,
     join_metadata: ExecutionJoinMetadata,
 ) -> anyhow::Result<Option<DirectPostBuyHandoffAck>> {
     let handoff_event = build_post_buy_handoff_event(
@@ -22146,6 +22216,8 @@ async fn send_shadow_post_buy_handoff(
         min_tokens_out,
         entry_token_amount_raw,
         None,
+        entry_simulation_rpc_slot,
+        entry_opened_at_ms,
         join_metadata,
     );
     let ack = send_direct_shadow_post_buy_handoff(
@@ -22200,6 +22272,8 @@ async fn send_probe_post_buy_handoff(
             .entry_token_amount_raw
             .or(request.entry_token_amount_raw),
         buy_landed_slot: Some(shadow_event.rpc_slot),
+        entry_simulation_rpc_slot: Some(shadow_event.rpc_slot),
+        entry_opened_at_ms: Some(shadow_event.decision_ts_ms),
         creator_pubkey,
         join_metadata,
     };
@@ -22376,6 +22450,8 @@ async fn apply_trigger_buy_outcome(
                         position_slot_id,
                         min_tokens_out,
                         shadow_entry_token_amount_raw,
+                        Some(shadow_event.rpc_slot),
+                        Some(shadow_event.decision_ts_ms),
                         shadow_event.join_metadata.clone(),
                     )
                     .await
@@ -25680,6 +25756,44 @@ mod tests {
         assert_eq!(
             candidate.source_v3_feature_snapshot_hash.as_deref(),
             Some(serialized_hash.as_str())
+        );
+    }
+
+    #[test]
+    fn p37_shadow_probe_candidate_prefers_terminal_observation_end_over_ab_alias() {
+        let active_config = review_test_gatekeeper_config();
+        let pool_id = Pubkey::new_unique();
+        let assessment = test_gatekeeper_buy_assessment(6);
+        let mut log = assessment.to_buy_log(&pool_id, &active_config);
+        log.first_seen_ts_ms = Some(1_000);
+        log.ab_t_end_event_ts_ms = Some(2_000);
+        log.observation_end_ts_ms = Some(31_100);
+
+        let candidate = P37ShadowProbeCandidate::from_gatekeeper_log(&log, "r38-threshold-probe");
+
+        assert_eq!(candidate.decision_ts_ms, Some(31_100));
+        assert_eq!(candidate.observation_end_ts_ms, Some(31_100));
+    }
+
+    #[test]
+    fn p37_shadow_probe_delayed_decision_age_is_diagnostic_only() {
+        let config = P37ShadowProbeConfig {
+            enabled: true,
+            sample_threshold: 100,
+            probe_quote_age_max_ms: 1_500,
+            probe_curve_age_max_ms: 1_500,
+            ..Default::default()
+        };
+        let candidate = p37_shadow_probe_test_candidate();
+        let record = p37_shadow_probe_selection_record(&config, &candidate, 2_100);
+
+        assert_eq!(
+            p37_shadow_probe_age_status(&record, 2_000, 3_500),
+            (1_500, "fresh:age_ms=1500:max_age_ms=1500".to_string())
+        );
+        assert_eq!(
+            p37_shadow_probe_age_status(&record, 2_000, 3_501),
+            (1_501, "delayed:age_ms=1501:max_age_ms=1500".to_string())
         );
     }
 
@@ -31129,6 +31243,12 @@ mod tests {
         assert_eq!(
             entry.probe_lifecycle_eligibility_status.as_deref(),
             Some("not_lifecycle_eligible")
+        );
+        assert_eq!(transport.quote_age_ms, Some(1));
+        assert_eq!(transport.curve_age_ms, Some(1));
+        assert_eq!(
+            entry.probe_age_status.as_deref(),
+            Some("fresh:age_ms=1:max_age_ms=1500")
         );
         assert_eq!(
             entry.simulation_error_account_role.as_deref(),
@@ -39993,7 +40113,8 @@ mod tests {
         assert_eq!(record.pool_id, pool_id.to_string());
         assert_eq!(record.mint_id, pool.base_mint);
         assert_eq!(record.slot, Some(777));
-        assert_eq!(record.timestamp_ms, decision_ts_ms.saturating_add(6));
+        assert_eq!(record.timestamp_ms, decision_ts_ms);
+        assert_eq!(record.timing_source.as_deref(), Some("decision_ts_ms"));
         assert_eq!(record.execution_outcome, "shadow_simulated");
         assert_eq!(entry_row["ab_record_id"], "pool:1000:11000:BUY");
         assert_eq!(entry_row["v3_feature_snapshot_hash"], "feature-hash-j2b");

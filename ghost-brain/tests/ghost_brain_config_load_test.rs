@@ -8,6 +8,28 @@ fn test_production_toml_loads() {
 }
 
 #[test]
+fn post_buy_guardian_lifecycle_thresholds_load_from_production_toml() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("ghost_brain_config.toml");
+    let config = GhostBrainConfig::from_toml_file(&path).expect("production config should load");
+
+    assert_eq!(config.post_buy_guardian.target_threshold, Some(50.0));
+    assert_eq!(config.post_buy_guardian.stoploss_threshold, Some(50.0));
+    assert_eq!(config.post_buy_guardian.wait_for_timestop, Some(30_000));
+    assert_eq!(config.post_buy_guardian.wait_for_timestop_ms(), 30_000);
+}
+
+#[test]
+fn post_buy_guardian_lifecycle_thresholds_load_from_r41_selector_config() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../configs/rollout/ghost_brain_selector_dataset_sampler_r41_score12_median_timeout_filters_maxwait31100_fsc_off.toml");
+    let config = GhostBrainConfig::from_toml_file(&path).expect("R41 config should load");
+
+    assert_eq!(config.post_buy_guardian.target_threshold, Some(50.0));
+    assert_eq!(config.post_buy_guardian.stoploss_threshold, Some(50.0));
+    assert_eq!(config.post_buy_guardian.wait_for_timestop, Some(30_000));
+}
+
+#[test]
 fn gatekeeper_v3_config_loads_from_production_toml() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("ghost_brain_config.toml");
     let config = GhostBrainConfig::from_toml_file(&path).expect("production config should load");

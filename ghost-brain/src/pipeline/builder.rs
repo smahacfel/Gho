@@ -351,7 +351,9 @@ impl E2EPipeline {
                 let position_router =
                     if matches!(config.execution.execution_mode, ExecutionMode::Shadow) {
                         Arc::new(PositionRuntimeRouter::with_shadow_book(Arc::new(
-                            RwLock::new(ShadowPositionBook::new()),
+                            RwLock::new(ShadowPositionBook::with_time_stop_ms(
+                                guardian_config.wait_for_timestop_ms(),
+                            )),
                         )))
                     } else {
                         Arc::new(PositionRuntimeRouter::with_live_revolver(Arc::clone(

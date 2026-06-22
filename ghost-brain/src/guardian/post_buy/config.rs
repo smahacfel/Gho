@@ -7,6 +7,106 @@
 use crate::aem::config::AemConfig;
 use serde::{Deserialize, Serialize};
 
+pub const DEFAULT_WAIT_FOR_TIMESTOP_MS: u64 = 30_000;
+pub const DEFAULT_TIME_STOP_V2_FIRST_CHECK_MS: u64 = 3_000;
+pub const DEFAULT_TIME_STOP_V2_WINDOW_MS: u64 = 4_000;
+pub const DEFAULT_TIME_STOP_V2_FAILED_WINDOWS_TO_SIGNAL: u32 = 3;
+pub const DEFAULT_TIME_STOP_V2_MIN_AGE_BEFORE_SIGNAL_MS: u64 = 11_000;
+pub const DEFAULT_TIME_STOP_V2_MIN_PRICE_DELTA_PCT_ALIVE: f64 = 3.0;
+pub const DEFAULT_TIME_STOP_V2_MIN_MCAP_DELTA_PCT_ALIVE: f64 = 3.0;
+pub const DEFAULT_TIME_STOP_V2_MIN_BONDING_DELTA_PCT_ALIVE: f64 = 0.75;
+pub const DEFAULT_TIME_STOP_V2_MIN_VOLUME_DELTA_SOL_ALIVE: f64 = 1.0;
+pub const DEFAULT_TIME_STOP_V2_MIN_PRICE_DELTA_PCT_FOR_VOLUME_ALIVE: f64 = 1.0;
+pub const DEFAULT_TIME_STOP_V2_MIN_TX_DELTA_FOR_HEARTBEAT: u64 = 1;
+pub const DEFAULT_TIME_STOP_V2_MAX_AVG_VOLUME_PER_TX_SOL_HEARTBEAT: f64 = 0.05;
+pub const DEFAULT_TIME_STOP_V2_MAX_ABS_PRICE_DELTA_PCT_HEARTBEAT: f64 = 1.0;
+pub const DEFAULT_TIME_STOP_V2_MAX_ABS_MCAP_DELTA_PCT_HEARTBEAT: f64 = 1.0;
+pub const DEFAULT_TIME_STOP_V2_MAX_BONDING_DELTA_PCT_HEARTBEAT: f64 = 0.25;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimeStopV2Mode {
+    ObserveOnly,
+}
+
+impl Default for TimeStopV2Mode {
+    fn default() -> Self {
+        Self::ObserveOnly
+    }
+}
+
+/// Observe-only vitality checks for the post-buy TimeStop V2 experiment.
+///
+/// The config is intentionally nested under `[post_buy_guardian.time_stop_v2]`
+/// and defaults to disabled. When enabled in this phase, it only emits
+/// counterfactual lifecycle evidence and does not close positions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TimeStopV2Config {
+    pub enabled: bool,
+    pub mode: TimeStopV2Mode,
+    pub first_check_ms: u64,
+    pub window_ms: u64,
+    pub failed_windows_to_signal: u32,
+    pub min_age_before_signal_ms: u64,
+    pub min_price_delta_pct_alive: f64,
+    pub min_mcap_delta_pct_alive: f64,
+    pub min_bonding_delta_pct_alive: f64,
+    pub min_volume_delta_sol_alive: f64,
+    pub min_price_delta_pct_for_volume_alive: f64,
+    pub min_tx_delta_for_heartbeat: u64,
+    pub max_avg_volume_per_tx_sol_heartbeat: f64,
+    pub max_abs_price_delta_pct_heartbeat: f64,
+    pub max_abs_mcap_delta_pct_heartbeat: f64,
+    pub max_bonding_delta_pct_heartbeat: f64,
+    pub emit_window_records: bool,
+}
+
+impl Default for TimeStopV2Config {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: TimeStopV2Mode::ObserveOnly,
+            first_check_ms: DEFAULT_TIME_STOP_V2_FIRST_CHECK_MS,
+            window_ms: DEFAULT_TIME_STOP_V2_WINDOW_MS,
+            failed_windows_to_signal: DEFAULT_TIME_STOP_V2_FAILED_WINDOWS_TO_SIGNAL,
+            min_age_before_signal_ms: DEFAULT_TIME_STOP_V2_MIN_AGE_BEFORE_SIGNAL_MS,
+            min_price_delta_pct_alive: DEFAULT_TIME_STOP_V2_MIN_PRICE_DELTA_PCT_ALIVE,
+            min_mcap_delta_pct_alive: DEFAULT_TIME_STOP_V2_MIN_MCAP_DELTA_PCT_ALIVE,
+            min_bonding_delta_pct_alive: DEFAULT_TIME_STOP_V2_MIN_BONDING_DELTA_PCT_ALIVE,
+            min_volume_delta_sol_alive: DEFAULT_TIME_STOP_V2_MIN_VOLUME_DELTA_SOL_ALIVE,
+            min_price_delta_pct_for_volume_alive:
+                DEFAULT_TIME_STOP_V2_MIN_PRICE_DELTA_PCT_FOR_VOLUME_ALIVE,
+            min_tx_delta_for_heartbeat: DEFAULT_TIME_STOP_V2_MIN_TX_DELTA_FOR_HEARTBEAT,
+            max_avg_volume_per_tx_sol_heartbeat:
+                DEFAULT_TIME_STOP_V2_MAX_AVG_VOLUME_PER_TX_SOL_HEARTBEAT,
+            max_abs_price_delta_pct_heartbeat:
+                DEFAULT_TIME_STOP_V2_MAX_ABS_PRICE_DELTA_PCT_HEARTBEAT,
+            max_abs_mcap_delta_pct_heartbeat: DEFAULT_TIME_STOP_V2_MAX_ABS_MCAP_DELTA_PCT_HEARTBEAT,
+            max_bonding_delta_pct_heartbeat: DEFAULT_TIME_STOP_V2_MAX_BONDING_DELTA_PCT_HEARTBEAT,
+            emit_window_records: true,
+        }
+    }
+}
+
+impl TimeStopV2Config {
+    pub fn first_check_ms(&self) -> u64 {
+        self.first_check_ms.max(1)
+    }
+
+    pub fn window_ms(&self) -> u64 {
+        self.window_ms.max(1)
+    }
+
+    pub fn failed_windows_to_signal(&self) -> u32 {
+        self.failed_windows_to_signal.max(1)
+    }
+
+    pub fn min_age_before_signal_ms(&self) -> u64 {
+        self.min_age_before_signal_ms.max(self.first_check_ms())
+    }
+}
+
 /// Configuration for PostBuy Guardian real-time position monitoring.
 ///
 /// Controls tick frequency, per-module thresholds, and signal aggregation.
@@ -27,6 +127,29 @@ pub struct PostBuyGuardianConfig {
 
     /// Channel buffer size for GuardianSignal sender.
     pub signal_channel_buffer: usize,
+
+    // -- Shadow lifecycle exit thresholds -----------------------------------
+    /// Shadow/probe target threshold in percentage points (50.0 = +50%).
+    ///
+    /// This is optional for backward compatibility. When absent, launchers may
+    /// fall back to their legacy `live_exit_take_profit_pct` fraction.
+    #[serde(default)]
+    pub target_threshold: Option<f64>,
+
+    /// Shadow/probe stop-loss threshold in percentage points (50.0 = -50%).
+    ///
+    /// Values above 100 are clamped by the consumer because stop-loss cannot
+    /// move below zero price.
+    #[serde(default)]
+    pub stoploss_threshold: Option<f64>,
+
+    /// Shadow/probe inactivity timeout in milliseconds before TimeStop close.
+    #[serde(default)]
+    pub wait_for_timestop: Option<u64>,
+
+    /// Observe-only TimeStop V2 vitality telemetry.
+    #[serde(default)]
+    pub time_stop_v2: TimeStopV2Config,
 
     // ── LIGMA thresholds ────────────────────────────────────────────────
     /// Retail impact (bps) above which we emit Warning.
@@ -114,6 +237,10 @@ impl Default for PostBuyGuardianConfig {
             tick_interval_ms: 500,
             max_monitored_positions: 10,
             signal_channel_buffer: 256,
+            target_threshold: None,
+            stoploss_threshold: None,
+            wait_for_timestop: None,
+            time_stop_v2: TimeStopV2Config::default(),
 
             // LIGMA
             ligma_warning_impact_bps: 3500.0,
@@ -149,6 +276,14 @@ impl Default for PostBuyGuardianConfig {
             max_signals_per_position: 200,
             aem: AemConfig::default(),
         }
+    }
+}
+
+impl PostBuyGuardianConfig {
+    pub fn wait_for_timestop_ms(&self) -> u64 {
+        self.wait_for_timestop
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_WAIT_FOR_TIMESTOP_MS)
     }
 }
 
@@ -188,5 +323,89 @@ mod tests {
         assert_eq!(cfg.tick_interval_ms, 250);
         // Other fields should be default
         assert_eq!(cfg.max_monitored_positions, 10);
+    }
+
+    #[test]
+    fn deserialize_shadow_lifecycle_thresholds_from_percent_and_ms() {
+        let toml_str = r#"
+            target_threshold = 150.0
+            stoploss_threshold = 50.0
+            wait_for_timestop = 45000
+        "#;
+        let cfg: PostBuyGuardianConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.target_threshold, Some(150.0));
+        assert_eq!(cfg.stoploss_threshold, Some(50.0));
+        assert_eq!(cfg.wait_for_timestop, Some(45_000));
+        assert_eq!(cfg.wait_for_timestop_ms(), 45_000);
+    }
+
+    #[test]
+    fn default_timestop_preserves_legacy_thirty_seconds() {
+        let cfg = PostBuyGuardianConfig::default();
+        assert_eq!(cfg.target_threshold, None);
+        assert_eq!(cfg.stoploss_threshold, None);
+        assert_eq!(cfg.wait_for_timestop, None);
+        assert_eq!(cfg.wait_for_timestop_ms(), DEFAULT_WAIT_FOR_TIMESTOP_MS);
+    }
+
+    #[test]
+    fn default_time_stop_v2_is_disabled_observe_only() {
+        let cfg = PostBuyGuardianConfig::default();
+
+        assert!(!cfg.time_stop_v2.enabled);
+        assert_eq!(cfg.time_stop_v2.mode, TimeStopV2Mode::ObserveOnly);
+        assert_eq!(
+            cfg.time_stop_v2.first_check_ms(),
+            DEFAULT_TIME_STOP_V2_FIRST_CHECK_MS
+        );
+        assert_eq!(cfg.time_stop_v2.window_ms(), DEFAULT_TIME_STOP_V2_WINDOW_MS);
+        assert_eq!(
+            cfg.time_stop_v2.failed_windows_to_signal(),
+            DEFAULT_TIME_STOP_V2_FAILED_WINDOWS_TO_SIGNAL
+        );
+    }
+
+    #[test]
+    fn deserialize_time_stop_v2_nested_config() {
+        let toml_str = r#"
+            [time_stop_v2]
+            enabled = true
+            mode = "observe_only"
+            first_check_ms = 3000
+            window_ms = 4000
+            failed_windows_to_signal = 2
+            min_age_before_signal_ms = 7000
+            min_price_delta_pct_alive = 2.5
+            min_mcap_delta_pct_alive = 2.0
+            min_bonding_delta_pct_alive = 0.5
+            min_volume_delta_sol_alive = 0.75
+            min_price_delta_pct_for_volume_alive = 0.8
+            min_tx_delta_for_heartbeat = 2
+            max_avg_volume_per_tx_sol_heartbeat = 0.03
+            max_abs_price_delta_pct_heartbeat = 0.7
+            max_abs_mcap_delta_pct_heartbeat = 0.9
+            max_bonding_delta_pct_heartbeat = 0.2
+            emit_window_records = false
+        "#;
+
+        let cfg: PostBuyGuardianConfig = toml::from_str(toml_str).unwrap();
+
+        assert!(cfg.time_stop_v2.enabled);
+        assert_eq!(cfg.time_stop_v2.mode, TimeStopV2Mode::ObserveOnly);
+        assert_eq!(cfg.time_stop_v2.first_check_ms(), 3_000);
+        assert_eq!(cfg.time_stop_v2.window_ms(), 4_000);
+        assert_eq!(cfg.time_stop_v2.failed_windows_to_signal(), 2);
+        assert_eq!(cfg.time_stop_v2.min_age_before_signal_ms(), 7_000);
+        assert_eq!(cfg.time_stop_v2.min_price_delta_pct_alive, 2.5);
+        assert_eq!(cfg.time_stop_v2.min_mcap_delta_pct_alive, 2.0);
+        assert_eq!(cfg.time_stop_v2.min_bonding_delta_pct_alive, 0.5);
+        assert_eq!(cfg.time_stop_v2.min_volume_delta_sol_alive, 0.75);
+        assert_eq!(cfg.time_stop_v2.min_price_delta_pct_for_volume_alive, 0.8);
+        assert_eq!(cfg.time_stop_v2.min_tx_delta_for_heartbeat, 2);
+        assert_eq!(cfg.time_stop_v2.max_avg_volume_per_tx_sol_heartbeat, 0.03);
+        assert_eq!(cfg.time_stop_v2.max_abs_price_delta_pct_heartbeat, 0.7);
+        assert_eq!(cfg.time_stop_v2.max_abs_mcap_delta_pct_heartbeat, 0.9);
+        assert_eq!(cfg.time_stop_v2.max_bonding_delta_pct_heartbeat, 0.2);
+        assert!(!cfg.time_stop_v2.emit_window_records);
     }
 }

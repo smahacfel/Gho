@@ -4,8 +4,10 @@ use crate::oracle_metrics::{
     record_cpv_lookup_misses,
 };
 use ghost_brain::config::GatekeeperV2Config;
+use ghost_core::checkpoint::{CpvEvidenceContext, CpvMetricSource, MetricEvidenceQuality};
 use ghost_core::tx_intelligence::types::{
-    CPV_INSUFFICIENT_SIGNERS_REASON, CPV_ROLLING_STATE_UNAVAILABLE_REASON,
+    CPV_INSUFFICIENT_SIGNERS_REASON, CPV_LOW_SAMPLE_DEGRADED_REASON,
+    CPV_ROLLING_STATE_UNAVAILABLE_REASON,
 };
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -15,6 +17,9 @@ pub struct CrossPoolVelocityConfig {
     pub lookback_window_ms: u64,
     pub per_signer_cap: usize,
     pub global_signer_cap: usize,
+    pub min_successful_buy_signers_clean: u64,
+    pub min_successful_buy_signers_degraded: u64,
+    pub emit_degraded_low_sample: bool,
 }
 
 impl CrossPoolVelocityConfig {
@@ -24,6 +29,12 @@ impl CrossPoolVelocityConfig {
             lookback_window_ms: config.cpv_lookback_window_s.saturating_mul(1_000),
             per_signer_cap: config.cpv_per_signer_cap.max(1),
             global_signer_cap: config.cpv_global_signer_cap.max(1),
+            min_successful_buy_signers_clean: config.cpv_min_successful_buy_signers_clean.max(1),
+            min_successful_buy_signers_degraded: config
+                .cpv_min_successful_buy_signers_degraded
+                .max(1)
+                .min(config.cpv_min_successful_buy_signers_clean.max(1)),
+            emit_degraded_low_sample: config.cpv_emit_degraded_low_sample,
         }
     }
 }
@@ -31,8 +42,31 @@ impl CrossPoolVelocityConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CpvComputation {
     pub signer_cross_pool_velocity: Option<f64>,
+    pub cpv_other_pool_activity: Option<f64>,
     pub degraded_reasons: Vec<String>,
     pub signer_sample_count: u64,
+    pub required_clean_sample_count: u64,
+    pub required_degraded_sample_count: u64,
+    pub value_source: CpvMetricSource,
+    pub status: MetricEvidenceQuality,
+    pub rolling_state_available: bool,
+}
+
+impl CpvComputation {
+    #[must_use]
+    pub fn evidence_context(&self) -> CpvEvidenceContext {
+        CpvEvidenceContext {
+            quality: self.status,
+            source: self.value_source,
+            signer_cross_pool_velocity: self.signer_cross_pool_velocity,
+            cpv_other_pool_activity: self.cpv_other_pool_activity,
+            sample_count: Some(self.signer_sample_count),
+            required_clean_sample_count: Some(self.required_clean_sample_count),
+            required_degraded_sample_count: Some(self.required_degraded_sample_count),
+            rolling_state_available: Some(self.rolling_state_available),
+            degraded_reasons: self.degraded_reasons.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,6 +177,11 @@ impl CrossPoolVelocityIndex {
     ) -> CpvComputation {
         let unique_signers = unique_successful_signers(transactions);
         let signer_sample_count = unique_signers.len() as u64;
+        let required_clean_sample_count = config.min_successful_buy_signers_clean.max(1);
+        let required_degraded_sample_count = config
+            .min_successful_buy_signers_degraded
+            .max(1)
+            .min(required_clean_sample_count);
         let lookback_window_ms = config.lookback_window_ms.max(1);
         let anchor_ts_ms = anchor_ts_ms.unwrap_or_default();
         let window_start = anchor_ts_ms.saturating_sub(lookback_window_ms);
@@ -156,22 +195,59 @@ impl CrossPoolVelocityIndex {
         record_cpv_index_entries(inner.histories.len());
 
         let ready = inner.saw_activity && !inner.histories.is_empty();
+        let clean_sample = signer_sample_count >= required_clean_sample_count;
+        let degraded_low_sample = !clean_sample
+            && config.emit_degraded_low_sample
+            && signer_sample_count >= required_degraded_sample_count;
         let mut degraded_reasons = Vec::new();
         if !ready {
             degraded_reasons.push(CPV_ROLLING_STATE_UNAVAILABLE_REASON.to_string());
         }
-        if signer_sample_count < 3 {
-            degraded_reasons.push(CPV_INSUFFICIENT_SIGNERS_REASON.to_string());
+        if !clean_sample {
+            degraded_reasons.push(
+                if ready && degraded_low_sample {
+                    CPV_LOW_SAMPLE_DEGRADED_REASON
+                } else {
+                    CPV_INSUFFICIENT_SIGNERS_REASON
+                }
+                .to_string(),
+            );
         }
-        if !degraded_reasons.is_empty() {
+        if !ready || (!clean_sample && !degraded_low_sample) {
+            let status = if !ready {
+                MetricEvidenceQuality::UnavailableSource
+            } else {
+                MetricEvidenceQuality::InsufficientSample
+            };
             return CpvComputation {
                 signer_cross_pool_velocity: None,
+                cpv_other_pool_activity: None,
                 degraded_reasons,
                 signer_sample_count,
+                required_clean_sample_count,
+                required_degraded_sample_count,
+                value_source: CpvMetricSource::Unavailable,
+                status,
+                rolling_state_available: ready,
+            };
+        }
+        if signer_sample_count == 0 {
+            degraded_reasons.push(CPV_INSUFFICIENT_SIGNERS_REASON.to_string());
+            return CpvComputation {
+                signer_cross_pool_velocity: None,
+                cpv_other_pool_activity: None,
+                degraded_reasons,
+                signer_sample_count,
+                required_clean_sample_count,
+                required_degraded_sample_count,
+                value_source: CpvMetricSource::Unavailable,
+                status: MetricEvidenceQuality::InsufficientSample,
+                rolling_state_available: ready,
             };
         }
 
         let mut cross_pool_signers = 0u64;
+        let mut total_other_pool_activity = 0u64;
         let mut lookup_hits = 0u64;
         let mut lookup_misses = 0u64;
         let mut removed_entries = 0u64;
@@ -187,10 +263,24 @@ impl CrossPoolVelocityIndex {
                     remove_signer = true;
                 } else {
                     has_history = true;
-                    is_cross_pool = history
-                        .activities
-                        .iter()
-                        .any(|activity| activity.pool_id != current_pool_id);
+                    let mut other_pools = HashSet::new();
+                    let mut has_eligible_activity = false;
+                    for activity in &history.activities {
+                        if activity.observed_at_ms > anchor_ts_ms {
+                            continue;
+                        }
+                        has_eligible_activity = true;
+                        if activity.pool_id != current_pool_id {
+                            other_pools.insert(activity.pool_id.as_str());
+                        }
+                    }
+                    if !has_eligible_activity {
+                        continue;
+                    }
+                    let other_pool_count = other_pools.len() as u64;
+                    is_cross_pool = other_pool_count > 0;
+                    total_other_pool_activity =
+                        total_other_pool_activity.saturating_add(other_pool_count);
                 }
             }
 
@@ -223,8 +313,20 @@ impl CrossPoolVelocityIndex {
             signer_cross_pool_velocity: Some(
                 cross_pool_signers as f64 / signer_sample_count as f64,
             ),
-            degraded_reasons: Vec::new(),
+            cpv_other_pool_activity: Some(
+                total_other_pool_activity as f64 / signer_sample_count as f64,
+            ),
+            degraded_reasons,
             signer_sample_count,
+            required_clean_sample_count,
+            required_degraded_sample_count,
+            value_source: CpvMetricSource::SuccessfulBuyRollingIndex,
+            status: if clean_sample {
+                MetricEvidenceQuality::Clean
+            } else {
+                MetricEvidenceQuality::DegradedLowSample
+            },
+            rolling_state_available: ready,
         }
     }
 
@@ -370,6 +472,34 @@ mod tests {
         }
     }
 
+    fn tx_with_flags(
+        pool_id: &str,
+        signer: &str,
+        signature: &str,
+        timestamp_ms: u64,
+        is_buy: bool,
+        success: bool,
+    ) -> PoolTransaction {
+        let mut tx = tx(pool_id, signer, signature, timestamp_ms);
+        tx.is_buy = is_buy;
+        tx.success = success;
+        tx
+    }
+
+    #[test]
+    fn from_gatekeeper_config_maps_successful_buy_sample_policy() {
+        let mut gatekeeper_config = GatekeeperV2Config::default();
+        gatekeeper_config.cpv_min_successful_buy_signers_clean = 4;
+        gatekeeper_config.cpv_min_successful_buy_signers_degraded = 2;
+        gatekeeper_config.cpv_emit_degraded_low_sample = true;
+
+        let config = CrossPoolVelocityConfig::from_gatekeeper_config(&gatekeeper_config);
+
+        assert_eq!(config.min_successful_buy_signers_clean, 4);
+        assert_eq!(config.min_successful_buy_signers_degraded, 2);
+        assert!(config.emit_degraded_low_sample);
+    }
+
     #[test]
     fn cross_pool_signer_raises_cpv() {
         let index = CrossPoolVelocityIndex::new();
@@ -388,8 +518,11 @@ mod tests {
         let computed = index.compute_for_transactions("pool-b", current.iter(), Some(240), &config);
 
         assert_eq!(computed.signer_cross_pool_velocity, Some(1.0 / 3.0));
+        assert_eq!(computed.cpv_other_pool_activity, Some(1.0 / 3.0));
         assert!(computed.degraded_reasons.is_empty());
         assert_eq!(computed.signer_sample_count, 3);
+        assert_eq!(computed.status, MetricEvidenceQuality::Clean);
+        assert_eq!(computed.required_clean_sample_count, 3);
     }
 
     #[test]
@@ -409,7 +542,9 @@ mod tests {
         let computed = index.compute_for_transactions("pool-a", current.iter(), Some(330), &config);
 
         assert_eq!(computed.signer_cross_pool_velocity, Some(0.0));
+        assert_eq!(computed.cpv_other_pool_activity, Some(0.0));
         assert!(computed.degraded_reasons.is_empty());
+        assert_eq!(computed.status, MetricEvidenceQuality::Clean);
     }
 
     #[test]
@@ -432,6 +567,7 @@ mod tests {
 
         assert_eq!(computed.signer_cross_pool_velocity, Some(0.0));
         assert!(computed.degraded_reasons.is_empty());
+        assert_eq!(computed.status, MetricEvidenceQuality::Clean);
     }
 
     #[test]
@@ -464,6 +600,8 @@ mod tests {
         let computed = index.compute_for_transactions("pool-a", current.iter(), Some(120), &config);
 
         assert_eq!(computed.signer_cross_pool_velocity, None);
+        assert_eq!(computed.status, MetricEvidenceQuality::UnavailableSource);
+        assert_eq!(computed.rolling_state_available, false);
         assert_eq!(
             computed.degraded_reasons,
             vec![CPV_ROLLING_STATE_UNAVAILABLE_REASON.to_string()]
@@ -484,10 +622,158 @@ mod tests {
         let computed = index.compute_for_transactions("pool-a", current.iter(), Some(120), &config);
 
         assert_eq!(computed.signer_cross_pool_velocity, None);
+        assert_eq!(computed.status, MetricEvidenceQuality::InsufficientSample);
+        assert_eq!(computed.signer_sample_count, 2);
         assert_eq!(
             computed.degraded_reasons,
             vec![CPV_INSUFFICIENT_SIGNERS_REASON.to_string()]
         );
+    }
+
+    #[test]
+    fn one_successful_buy_signer_is_insufficient_sample() {
+        let index = CrossPoolVelocityIndex::new();
+        let config = test_config();
+
+        index.observe_buy("pool-z", "shared", 100, &config);
+        index.observe_buy("pool-a", "shared", 110, &config);
+
+        let current = vec![tx("pool-a", "shared", "sig-shared", 120)];
+        let computed = index.compute_for_transactions("pool-a", current.iter(), Some(120), &config);
+
+        assert_eq!(computed.signer_cross_pool_velocity, None);
+        assert_eq!(computed.cpv_other_pool_activity, None);
+        assert_eq!(computed.signer_sample_count, 1);
+        assert_eq!(computed.status, MetricEvidenceQuality::InsufficientSample);
+        assert_eq!(
+            computed.degraded_reasons,
+            vec![CPV_INSUFFICIENT_SIGNERS_REASON.to_string()]
+        );
+    }
+
+    #[test]
+    fn two_successful_buy_signers_do_not_emit_degraded_by_default() {
+        let index = CrossPoolVelocityIndex::new();
+        let config = test_config();
+
+        index.observe_buy("pool-z", "shared", 100, &config);
+        index.observe_buy("pool-a", "shared", 110, &config);
+        index.observe_buy("pool-a", "local", 115, &config);
+
+        let current = vec![
+            tx("pool-a", "shared", "sig-shared", 120),
+            tx("pool-a", "local", "sig-local", 121),
+        ];
+        let computed = index.compute_for_transactions("pool-a", current.iter(), Some(121), &config);
+
+        assert_eq!(computed.signer_cross_pool_velocity, None);
+        assert_eq!(computed.cpv_other_pool_activity, None);
+        assert_eq!(computed.signer_sample_count, 2);
+        assert_eq!(computed.status, MetricEvidenceQuality::InsufficientSample);
+        assert_eq!(computed.required_clean_sample_count, 3);
+        assert_eq!(computed.required_degraded_sample_count, 2);
+        assert_eq!(
+            computed.degraded_reasons,
+            vec![CPV_INSUFFICIENT_SIGNERS_REASON.to_string()]
+        );
+    }
+
+    #[test]
+    fn two_successful_buy_signers_emit_degraded_when_config_allows() {
+        let index = CrossPoolVelocityIndex::new();
+        let mut config = test_config();
+        config.emit_degraded_low_sample = true;
+
+        index.observe_buy("pool-z", "shared", 100, &config);
+        index.observe_buy("pool-a", "shared", 110, &config);
+        index.observe_buy("pool-a", "local", 115, &config);
+
+        let current = vec![
+            tx("pool-a", "shared", "sig-shared", 120),
+            tx("pool-a", "local", "sig-local", 121),
+        ];
+        let computed = index.compute_for_transactions("pool-a", current.iter(), Some(121), &config);
+
+        assert_eq!(computed.signer_cross_pool_velocity, Some(0.5));
+        assert_eq!(computed.cpv_other_pool_activity, Some(0.5));
+        assert_eq!(computed.signer_sample_count, 2);
+        assert_eq!(computed.status, MetricEvidenceQuality::DegradedLowSample);
+        assert_eq!(
+            computed.value_source,
+            CpvMetricSource::SuccessfulBuyRollingIndex
+        );
+        assert_eq!(
+            computed.degraded_reasons,
+            vec![CPV_LOW_SAMPLE_DEGRADED_REASON.to_string()]
+        );
+
+        let evidence = computed.evidence_context();
+        assert_eq!(evidence.quality, MetricEvidenceQuality::DegradedLowSample);
+        assert_eq!(evidence.sample_count, Some(2));
+        assert_eq!(evidence.required_clean_sample_count, Some(3));
+        assert_eq!(evidence.required_degraded_sample_count, Some(2));
+        assert_eq!(evidence.rolling_state_available, Some(true));
+    }
+
+    #[test]
+    fn failed_and_sell_only_transactions_do_not_increase_cpv_sample() {
+        let index = CrossPoolVelocityIndex::new();
+        let config = test_config();
+
+        index.observe_buy("pool-z", "successful", 100, &config);
+        index.observe_buy("pool-a", "successful", 110, &config);
+        let failed_buy = tx_with_flags("pool-a", "failed-buy", "sig-failed-buy", 121, true, false);
+        let sell_only = tx_with_flags("pool-a", "sell-only", "sig-sell", 122, false, true);
+        let failed_sell = tx_with_flags(
+            "pool-a",
+            "failed-sell",
+            "sig-failed-sell",
+            123,
+            false,
+            false,
+        );
+        index.observe_transaction("pool-a", &failed_buy, &config);
+        index.observe_transaction("pool-a", &sell_only, &config);
+        index.observe_transaction("pool-a", &failed_sell, &config);
+
+        let current = vec![
+            tx("pool-a", "successful", "sig-success", 120),
+            failed_buy,
+            sell_only,
+            failed_sell,
+        ];
+        let computed = index.compute_for_transactions("pool-a", current.iter(), Some(123), &config);
+
+        assert_eq!(computed.signer_sample_count, 1);
+        assert_eq!(computed.signer_cross_pool_velocity, None);
+        assert_eq!(computed.status, MetricEvidenceQuality::InsufficientSample);
+        assert_eq!(
+            computed.degraded_reasons,
+            vec![CPV_INSUFFICIENT_SIGNERS_REASON.to_string()]
+        );
+    }
+
+    #[test]
+    fn future_other_pool_activity_does_not_leak_into_anchor_cpv() {
+        let index = CrossPoolVelocityIndex::new();
+        let config = test_config();
+
+        index.observe_buy("pool-a", "shared", 100, &config);
+        index.observe_buy("pool-a", "local-a", 110, &config);
+        index.observe_buy("pool-a", "local-b", 120, &config);
+        index.observe_buy("pool-z", "shared", 200, &config);
+
+        let current = vec![
+            tx("pool-a", "shared", "sig-shared", 100),
+            tx("pool-a", "local-a", "sig-local-a", 110),
+            tx("pool-a", "local-b", "sig-local-b", 120),
+        ];
+        let computed = index.compute_for_transactions("pool-a", current.iter(), Some(120), &config);
+
+        assert_eq!(computed.signer_sample_count, 3);
+        assert_eq!(computed.signer_cross_pool_velocity, Some(0.0));
+        assert_eq!(computed.cpv_other_pool_activity, Some(0.0));
+        assert_eq!(computed.status, MetricEvidenceQuality::Clean);
     }
 
     #[test]
@@ -509,6 +795,8 @@ mod tests {
         let computed = index.compute_for_transactions("pool-a", current.iter(), Some(170), &config);
 
         assert_eq!(computed.signer_cross_pool_velocity, Some(1.0 / 3.0));
+        assert_eq!(computed.cpv_other_pool_activity, Some(1.0 / 3.0));
         assert_eq!(computed.signer_sample_count, 3);
+        assert_eq!(computed.status, MetricEvidenceQuality::Clean);
     }
 }

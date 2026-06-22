@@ -37,7 +37,9 @@
 //! config.sobp.hyper_pump_threshold = 3.5;
 //! ```
 
-use ghost_core::shadow_ledger::ShadowLedgerStaleFallback;
+use ghost_core::{
+    checkpoint::DecisionTimeSeriesRetentionPolicy, shadow_ledger::ShadowLedgerStaleFallback,
+};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
@@ -840,6 +842,230 @@ impl std::fmt::Display for GatekeeperMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StrictMetricMissingPolicy {
+    HardFail,
+    Skip,
+    DegradedAllowed,
+}
+
+impl Default for StrictMetricMissingPolicy {
+    fn default() -> Self {
+        Self::HardFail
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CpvLowSamplePolicy {
+    HardFail,
+    UseDegraded,
+    ReasonOnly,
+}
+
+impl Default for CpvLowSamplePolicy {
+    fn default() -> Self {
+        Self::HardFail
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TemporalCarriedForwardPolicy {
+    LogOnly,
+    UseForSelectorOnly,
+    UseInPolicy,
+}
+
+impl Default for TemporalCarriedForwardPolicy {
+    fn default() -> Self {
+        Self::LogOnly
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectorSoftScorePolicy {
+    /// Compute and log selector score only. Verdict behavior is unchanged.
+    LogOnly,
+    /// Require the candidate threshold, then leave the remaining Gatekeeper path unchanged.
+    CandidateOnly,
+    /// Require the BUY threshold. Scores below candidate/buy thresholds produce typed rejects.
+    BuyGate,
+}
+
+impl Default for SelectorSoftScorePolicy {
+    fn default() -> Self {
+        Self::LogOnly
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectorSoftScoreMissingPolicy {
+    /// Missing/invalid evidence awards no point and is reported in diagnostics.
+    NoPoint,
+}
+
+impl Default for SelectorSoftScoreMissingPolicy {
+    fn default() -> Self {
+        Self::NoPoint
+    }
+}
+
+/// Positive selector score model used to test threshold combinations without
+/// turning every individual metric into a hard reject.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SelectorSoftScoreConfig {
+    pub enabled: bool,
+    pub policy: SelectorSoftScorePolicy,
+    pub min_candidate_score: u16,
+    pub min_buy_score: u16,
+    pub missing_metric_policy: SelectorSoftScoreMissingPolicy,
+    pub allow_degraded_cpv: bool,
+    pub allow_carried_temporal_deltas: bool,
+
+    pub jito_tip_intensity_lt: f64,
+    pub unique_ratio_gte: f64,
+    pub cpv_other_pool_activity_lt: f64,
+    pub max_single_sell_impact_pct_observed_lt: f64,
+    pub signer_cross_pool_velocity_lt: f64,
+    pub hhi_lt: f64,
+    pub avg_cpi_depth_50tx_lt: f64,
+    pub top3_volume_pct_lt: f64,
+    pub delta_jito_tip_intensity_1s_to_2s_lt: f64,
+    pub same_ms_tx_ratio_gte: f64,
+    pub interval_cv_gte: f64,
+    pub delta_jito_tip_intensity_1s_to_3s_lt: f64,
+
+    pub soft_weight_jito_tip_intensity: u8,
+    pub soft_weight_unique_ratio: u8,
+    pub soft_weight_cpv_other_pool_activity: u8,
+    pub soft_weight_max_single_sell_impact_pct_observed: u8,
+    pub soft_weight_signer_cross_pool_velocity: u8,
+    pub soft_weight_hhi: u8,
+    pub soft_weight_avg_cpi_depth_50tx: u8,
+    pub soft_weight_top3_volume_pct: u8,
+    pub soft_weight_delta_jito_tip_intensity_1s_to_2s: u8,
+    pub soft_weight_same_ms_tx_ratio: u8,
+    pub soft_weight_interval_cv: u8,
+    pub soft_weight_delta_jito_tip_intensity_1s_to_3s: u8,
+}
+
+impl Default for SelectorSoftScoreConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            policy: SelectorSoftScorePolicy::LogOnly,
+            min_candidate_score: 2,
+            min_buy_score: 3,
+            missing_metric_policy: SelectorSoftScoreMissingPolicy::NoPoint,
+            allow_degraded_cpv: false,
+            allow_carried_temporal_deltas: false,
+            jito_tip_intensity_lt: 0.4132,
+            unique_ratio_gte: 0.243,
+            cpv_other_pool_activity_lt: 2.2111,
+            max_single_sell_impact_pct_observed_lt: 31.4,
+            signer_cross_pool_velocity_lt: 0.6631,
+            hhi_lt: 0.2300,
+            avg_cpi_depth_50tx_lt: 2.84,
+            top3_volume_pct_lt: 0.749,
+            delta_jito_tip_intensity_1s_to_2s_lt: 0.0931,
+            same_ms_tx_ratio_gte: 0.049,
+            interval_cv_gte: 0.904,
+            delta_jito_tip_intensity_1s_to_3s_lt: 0.1615,
+            soft_weight_jito_tip_intensity: 1,
+            soft_weight_unique_ratio: 1,
+            soft_weight_cpv_other_pool_activity: 1,
+            soft_weight_max_single_sell_impact_pct_observed: 1,
+            soft_weight_signer_cross_pool_velocity: 1,
+            soft_weight_hhi: 1,
+            soft_weight_avg_cpi_depth_50tx: 1,
+            soft_weight_top3_volume_pct: 1,
+            soft_weight_delta_jito_tip_intensity_1s_to_2s: 1,
+            soft_weight_same_ms_tx_ratio: 1,
+            soft_weight_interval_cv: 1,
+            soft_weight_delta_jito_tip_intensity_1s_to_3s: 1,
+        }
+    }
+}
+
+impl SelectorSoftScoreConfig {
+    pub fn max_score(&self) -> u16 {
+        [
+            self.soft_weight_jito_tip_intensity,
+            self.soft_weight_unique_ratio,
+            self.soft_weight_cpv_other_pool_activity,
+            self.soft_weight_max_single_sell_impact_pct_observed,
+            self.soft_weight_signer_cross_pool_velocity,
+            self.soft_weight_hhi,
+            self.soft_weight_avg_cpi_depth_50tx,
+            self.soft_weight_top3_volume_pct,
+            self.soft_weight_delta_jito_tip_intensity_1s_to_2s,
+            self.soft_weight_same_ms_tx_ratio,
+            self.soft_weight_interval_cv,
+            self.soft_weight_delta_jito_tip_intensity_1s_to_3s,
+        ]
+        .into_iter()
+        .map(u16::from)
+        .sum()
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.min_candidate_score > self.min_buy_score {
+            anyhow::bail!(
+                "gatekeeper_v2.selector_soft_score.min_candidate_score must be <= min_buy_score"
+            );
+        }
+        if self.enabled && self.max_score() == 0 {
+            anyhow::bail!("gatekeeper_v2.selector_soft_score enabled with zero total soft weight");
+        }
+        if self.enabled && self.min_buy_score > self.max_score() {
+            anyhow::bail!(
+                "gatekeeper_v2.selector_soft_score.min_buy_score ({}) exceeds max_score ({})",
+                self.min_buy_score,
+                self.max_score()
+            );
+        }
+        for (name, value) in [
+            ("jito_tip_intensity_lt", self.jito_tip_intensity_lt),
+            ("unique_ratio_gte", self.unique_ratio_gte),
+            (
+                "cpv_other_pool_activity_lt",
+                self.cpv_other_pool_activity_lt,
+            ),
+            (
+                "max_single_sell_impact_pct_observed_lt",
+                self.max_single_sell_impact_pct_observed_lt,
+            ),
+            (
+                "signer_cross_pool_velocity_lt",
+                self.signer_cross_pool_velocity_lt,
+            ),
+            ("hhi_lt", self.hhi_lt),
+            ("avg_cpi_depth_50tx_lt", self.avg_cpi_depth_50tx_lt),
+            ("top3_volume_pct_lt", self.top3_volume_pct_lt),
+            (
+                "delta_jito_tip_intensity_1s_to_2s_lt",
+                self.delta_jito_tip_intensity_1s_to_2s_lt,
+            ),
+            ("same_ms_tx_ratio_gte", self.same_ms_tx_ratio_gte),
+            ("interval_cv_gte", self.interval_cv_gte),
+            (
+                "delta_jito_tip_intensity_1s_to_3s_lt",
+                self.delta_jito_tip_intensity_1s_to_3s_lt,
+            ),
+        ] {
+            if !value.is_finite() {
+                anyhow::bail!("gatekeeper_v2.selector_soft_score.{name} must be finite");
+            }
+        }
+        Ok(())
+    }
+}
+
 /// FSC v2 capture/evidence configuration.
 ///
 /// PR-FSC1 only introduces an inert config surface. Active decision use remains
@@ -1051,6 +1277,11 @@ pub struct GatekeeperV2Config {
     /// Default: 0.70
     pub max_burst_ratio: f64,
 
+    /// Minimum fraction of TX arriving in the first 20% of the observation window.
+    /// Default: 0.0 (neutral / no lower bound)
+    #[serde(default)]
+    pub min_burst_ratio: f64,
+
     /// Minimum average interval between TX (ms).
     /// Default: 60.0
     pub min_avg_interval_ms: f64,
@@ -1258,6 +1489,85 @@ pub struct GatekeeperV2Config {
     /// Default: true
     pub use_three_layer_decision: bool,
 
+    /// Reserved strict-threshold gate switch. PR1 keeps this config-only and
+    /// does not introduce any new policy consumer.
+    #[serde(default)]
+    pub strict_metric_threshold_gate_enabled: bool,
+
+    /// How strict threshold gates should interpret missing metrics once later
+    /// PRs wire the policy surface.
+    #[serde(default)]
+    pub strict_metric_missing_policy: StrictMetricMissingPolicy,
+
+    /// How CPV low-sample evidence should be classified once later PRs wire
+    /// CPV evidence into policy or dataset consumers.
+    #[serde(default)]
+    pub cpv_low_sample_policy: CpvLowSamplePolicy,
+
+    /// Minimum count of unique successful-buy signers required for clean CPV.
+    #[serde(default = "default_cpv_min_successful_buy_signers_clean")]
+    pub cpv_min_successful_buy_signers_clean: u64,
+
+    /// Minimum count of unique successful-buy signers required before degraded
+    /// CPV evidence may exist under later rollout wiring.
+    #[serde(default = "default_cpv_min_successful_buy_signers_degraded")]
+    pub cpv_min_successful_buy_signers_degraded: u64,
+
+    /// Reserved evidence-emission switch for degraded low-sample CPV.
+    #[serde(default)]
+    pub cpv_emit_degraded_low_sample: bool,
+
+    /// Reserved policy switch for degraded low-sample CPV.
+    #[serde(default)]
+    pub cpv_allow_degraded_in_strict_policy: bool,
+
+    /// How carried-forward temporal evidence may be interpreted once a later
+    /// PR wires temporal evidence into selector or policy consumers.
+    #[serde(default)]
+    pub temporal_carried_forward_policy: TemporalCarriedForwardPolicy,
+
+    /// Master switch for future temporal carry-forward evidence emission.
+    #[serde(default)]
+    pub temporal_carry_forward_enabled: bool,
+
+    /// Maximum allowed staleness for carried-forward temporal evidence.
+    #[serde(default = "default_temporal_carry_forward_max_staleness_ms")]
+    pub temporal_carry_forward_max_staleness_ms: u64,
+
+    /// Allow carry-forward shells for event-counter temporal metrics.
+    #[serde(default = "default_temporal_carry_forward_event_counters_enabled")]
+    pub temporal_carry_forward_event_counters_enabled: bool,
+
+    /// Allow carry-forward shells for state-like temporal metrics.
+    #[serde(default)]
+    pub temporal_carry_forward_state_metrics_enabled: bool,
+
+    /// Allow carry-forward shells for ratio-like temporal metrics.
+    #[serde(default)]
+    pub temporal_carry_forward_ratio_metrics_enabled: bool,
+
+    /// Require any exported top-level feature mirrors to remain aligned with
+    /// the canonical materialized SSOT snapshot.
+    #[serde(default = "default_top_level_features_from_materialized_ssot")]
+    pub top_level_features_from_materialized_ssot: bool,
+
+    /// Number of accepted TX samples retained in the per-session decision-time
+    /// series buffer. Older samples are not silently treated as present; when
+    /// this capacity is exceeded the materialized series is explicitly marked
+    /// as truncated.
+    #[serde(default = "default_decision_time_series_tx_capacity")]
+    pub decision_time_series_tx_capacity: usize,
+
+    /// Retention policy used when the decision-time series buffer capacity is
+    /// exceeded. Current runtime policy is explicit truncation with status.
+    #[serde(default)]
+    pub decision_time_series_retention_policy: DecisionTimeSeriesRetentionPolicy,
+
+    /// Emit policy context needed to interpret additive evidence safely across
+    /// runs. Existing decision logging already serializes the full config.
+    #[serde(default = "default_emit_evidence_policy_context")]
+    pub emit_evidence_policy_context: bool,
+
     // ── Hard Fail extreme thresholds (kill-switches at obvious extremes) ────
     // These are HIGHER than the phase-level soft thresholds.
     // They catch only blatant manipulation, independent of phase pass/fail.
@@ -1301,6 +1611,12 @@ pub struct GatekeeperV2Config {
     /// DEPRECATED — kept for deserialization compat. Use max_soft_points instead.
     #[serde(default)]
     pub max_soft_score: u8,
+
+    /// Optional positive selector score model. This is distinct from legacy
+    /// soft-risk points: rules award positive points for matching the configured
+    /// selector hypothesis and never impute missing evidence as zero.
+    #[serde(default)]
+    pub selector_soft_score: SelectorSoftScoreConfig,
 
     // ── Alpha gate ────────────────────────────────────────────────────────────
     /// Enable deterministic alpha gate after hard/core/legacy-soft/sybil and before provisional BUY.
@@ -1438,6 +1754,11 @@ pub struct GatekeeperV2Config {
     /// Default: 1.0 (neutral / telemetry-only)
     pub max_flipper_presence_ratio: f64,
 
+    /// Minimum acceptable fraction of wallets that both bought and sold early.
+    /// Default: 0.0 (neutral / no lower bound)
+    #[serde(default)]
+    pub min_flipper_presence_ratio: f64,
+
     /// Maximum acceptable fraction of tx with deterministic Jito tips.
     /// Default: 1.0 (neutral / telemetry-only)
     pub max_jito_tip_intensity: f64,
@@ -1495,6 +1816,11 @@ pub struct GatekeeperV2Config {
     /// Maximum acceptable signer cross-pool velocity.
     /// Default: 1.0 (neutral / telemetry-only)
     pub max_signer_cross_pool_velocity: f64,
+
+    /// Minimum acceptable mean count of distinct other pools seen for current
+    /// pool signers in the CPV rolling index.
+    #[serde(default)]
+    pub min_cpv_other_pool_activity: f64,
 
     /// Maximum acceptable funding source concentration.
     /// Default: 1.0 (neutral / telemetry-only)
@@ -1698,6 +2024,7 @@ impl Default for GatekeeperV2Config {
             min_interval_cv: 0.3,
             max_interval_cv: 9999.0,
             max_burst_ratio: 0.70,
+            min_burst_ratio: 0.0,
             min_avg_interval_ms: 60.0,
             max_avg_interval_ms: 600.0,
             min_timing_entropy: 1.2,
@@ -1752,6 +2079,28 @@ impl Default for GatekeeperV2Config {
 
             // Three-Layer Decision System
             use_three_layer_decision: true,
+            strict_metric_threshold_gate_enabled: false,
+            strict_metric_missing_policy: StrictMetricMissingPolicy::HardFail,
+            cpv_low_sample_policy: CpvLowSamplePolicy::HardFail,
+            cpv_min_successful_buy_signers_clean: default_cpv_min_successful_buy_signers_clean(),
+            cpv_min_successful_buy_signers_degraded:
+                default_cpv_min_successful_buy_signers_degraded(),
+            cpv_emit_degraded_low_sample: false,
+            cpv_allow_degraded_in_strict_policy: false,
+            temporal_carried_forward_policy: TemporalCarriedForwardPolicy::LogOnly,
+            temporal_carry_forward_enabled: false,
+            temporal_carry_forward_max_staleness_ms:
+                default_temporal_carry_forward_max_staleness_ms(),
+            temporal_carry_forward_event_counters_enabled:
+                default_temporal_carry_forward_event_counters_enabled(),
+            temporal_carry_forward_state_metrics_enabled: false,
+            temporal_carry_forward_ratio_metrics_enabled: false,
+            top_level_features_from_materialized_ssot:
+                default_top_level_features_from_materialized_ssot(),
+            decision_time_series_tx_capacity: default_decision_time_series_tx_capacity(),
+            decision_time_series_retention_policy:
+                DecisionTimeSeriesRetentionPolicy::TruncateWithStatus,
+            emit_evidence_policy_context: default_emit_evidence_policy_context(),
             hard_fail_hhi: 0.10,
             hard_fail_same_ms_tx_ratio: 0.60,
             hard_fail_top3_volume_pct: 0.70,
@@ -1763,6 +2112,7 @@ impl Default for GatekeeperV2Config {
             soft_weight_diversity: 2,
             soft_weight_ecosystem: 1,
             max_soft_score: 6, // deprecated compat
+            selector_soft_score: SelectorSoftScoreConfig::default(),
             enable_alpha_gate: false,
             min_momentum: 0.55,
             min_demand: 0.55,
@@ -1801,6 +2151,7 @@ impl Default for GatekeeperV2Config {
             min_fixed_size_buy_ratio: 0.0,
             max_fixed_size_buy_ratio_1e4: 1.0,
             max_flipper_presence_ratio: 1.0,
+            min_flipper_presence_ratio: 0.0,
             max_jito_tip_intensity: 1.0,
             min_jito_tip_intensity: 0.0,
             max_early_slot_volume_dominance_buy: 1.0,
@@ -1817,6 +2168,7 @@ impl Default for GatekeeperV2Config {
             min_spend_fraction_divergence: 0.0,
             min_demand_elasticity_score: -1.0,
             max_signer_cross_pool_velocity: 1.0,
+            min_cpv_other_pool_activity: 0.0,
             max_funding_source_concentration: 1.0,
 
             // Sybil resistance soft penalties
@@ -1888,6 +2240,25 @@ impl GatekeeperV2Config {
                 "P0 invariant violated: [gatekeeper_v2.dow].tick_interval_ms must be > 0 when DOW is enabled"
             );
         }
+        if self.cpv_min_successful_buy_signers_clean == 0 {
+            anyhow::bail!("gatekeeper_v2.cpv_min_successful_buy_signers_clean must be positive");
+        }
+        if self.cpv_min_successful_buy_signers_degraded == 0 {
+            anyhow::bail!("gatekeeper_v2.cpv_min_successful_buy_signers_degraded must be positive");
+        }
+        if self.cpv_min_successful_buy_signers_degraded > self.cpv_min_successful_buy_signers_clean
+        {
+            anyhow::bail!(
+                "gatekeeper_v2.cpv_min_successful_buy_signers_degraded must be <= cpv_min_successful_buy_signers_clean"
+            );
+        }
+        if self.temporal_carry_forward_max_staleness_ms == 0 {
+            anyhow::bail!("gatekeeper_v2.temporal_carry_forward_max_staleness_ms must be positive");
+        }
+        if self.decision_time_series_tx_capacity == 0 {
+            anyhow::bail!("gatekeeper_v2.decision_time_series_tx_capacity must be positive");
+        }
+        self.selector_soft_score.validate()?;
         if self.pdd.entry_drift_elapsed_scaling_enabled {
             for (name, value) in [
                 (
@@ -1915,6 +2286,34 @@ impl GatekeeperV2Config {
         }
         Ok(())
     }
+}
+
+const fn default_cpv_min_successful_buy_signers_clean() -> u64 {
+    3
+}
+
+const fn default_cpv_min_successful_buy_signers_degraded() -> u64 {
+    2
+}
+
+const fn default_temporal_carry_forward_max_staleness_ms() -> u64 {
+    1_000
+}
+
+const fn default_temporal_carry_forward_event_counters_enabled() -> bool {
+    true
+}
+
+const fn default_top_level_features_from_materialized_ssot() -> bool {
+    true
+}
+
+const fn default_decision_time_series_tx_capacity() -> usize {
+    128
+}
+
+const fn default_emit_evidence_policy_context() -> bool {
+    true
 }
 
 /// IWIM (Initial Wallet Intent Mapping) Configuration
@@ -5173,6 +5572,137 @@ min_dev_paperhand_latency_ms = 2500
             cfg.max_whale_reversal_ratio_top3,
             GatekeeperV2Config::default().max_whale_reversal_ratio_top3
         );
+        assert_eq!(
+            cfg.strict_metric_missing_policy,
+            GatekeeperV2Config::default().strict_metric_missing_policy
+        );
+        assert_eq!(
+            cfg.cpv_low_sample_policy,
+            GatekeeperV2Config::default().cpv_low_sample_policy
+        );
+        assert_eq!(
+            cfg.cpv_min_successful_buy_signers_clean,
+            GatekeeperV2Config::default().cpv_min_successful_buy_signers_clean
+        );
+        assert_eq!(
+            cfg.cpv_min_successful_buy_signers_degraded,
+            GatekeeperV2Config::default().cpv_min_successful_buy_signers_degraded
+        );
+        assert_eq!(
+            cfg.cpv_emit_degraded_low_sample,
+            GatekeeperV2Config::default().cpv_emit_degraded_low_sample
+        );
+        assert_eq!(
+            cfg.cpv_allow_degraded_in_strict_policy,
+            GatekeeperV2Config::default().cpv_allow_degraded_in_strict_policy
+        );
+        assert_eq!(
+            cfg.temporal_carried_forward_policy,
+            GatekeeperV2Config::default().temporal_carried_forward_policy
+        );
+        assert_eq!(
+            cfg.temporal_carry_forward_enabled,
+            GatekeeperV2Config::default().temporal_carry_forward_enabled
+        );
+        assert_eq!(
+            cfg.temporal_carry_forward_max_staleness_ms,
+            GatekeeperV2Config::default().temporal_carry_forward_max_staleness_ms
+        );
+        assert_eq!(
+            cfg.top_level_features_from_materialized_ssot,
+            GatekeeperV2Config::default().top_level_features_from_materialized_ssot
+        );
+        assert_eq!(
+            cfg.decision_time_series_tx_capacity,
+            GatekeeperV2Config::default().decision_time_series_tx_capacity
+        );
+        assert_eq!(
+            cfg.decision_time_series_retention_policy,
+            GatekeeperV2Config::default().decision_time_series_retention_policy
+        );
+        assert_eq!(
+            cfg.emit_evidence_policy_context,
+            GatekeeperV2Config::default().emit_evidence_policy_context
+        );
+        assert_eq!(
+            cfg.selector_soft_score,
+            GatekeeperV2Config::default().selector_soft_score
+        );
+    }
+
+    #[test]
+    fn test_gatekeeper_v2_evidence_policy_enums_deserialize_all_values() {
+        let strict_values = [
+            ("hard_fail", StrictMetricMissingPolicy::HardFail),
+            ("skip", StrictMetricMissingPolicy::Skip),
+            (
+                "degraded_allowed",
+                StrictMetricMissingPolicy::DegradedAllowed,
+            ),
+        ];
+        for (raw, expected) in strict_values {
+            let config: GatekeeperV2Config =
+                toml::from_str(&format!("strict_metric_missing_policy = \"{raw}\""))
+                    .expect("strict metric missing policy should deserialize");
+            assert_eq!(config.strict_metric_missing_policy, expected);
+        }
+
+        let cpv_values = [
+            ("hard_fail", CpvLowSamplePolicy::HardFail),
+            ("use_degraded", CpvLowSamplePolicy::UseDegraded),
+            ("reason_only", CpvLowSamplePolicy::ReasonOnly),
+        ];
+        for (raw, expected) in cpv_values {
+            let config: GatekeeperV2Config =
+                toml::from_str(&format!("cpv_low_sample_policy = \"{raw}\""))
+                    .expect("cpv low sample policy should deserialize");
+            assert_eq!(config.cpv_low_sample_policy, expected);
+        }
+
+        let temporal_values = [
+            ("log_only", TemporalCarriedForwardPolicy::LogOnly),
+            (
+                "use_for_selector_only",
+                TemporalCarriedForwardPolicy::UseForSelectorOnly,
+            ),
+            ("use_in_policy", TemporalCarriedForwardPolicy::UseInPolicy),
+        ];
+        for (raw, expected) in temporal_values {
+            let config: GatekeeperV2Config =
+                toml::from_str(&format!("temporal_carried_forward_policy = \"{raw}\""))
+                    .expect("temporal carried-forward policy should deserialize");
+            assert_eq!(config.temporal_carried_forward_policy, expected);
+        }
+
+        let config: GatekeeperV2Config =
+            toml::from_str("decision_time_series_retention_policy = \"truncate_with_status\"")
+                .expect("decision time-series retention policy should deserialize");
+        assert_eq!(
+            config.decision_time_series_retention_policy,
+            DecisionTimeSeriesRetentionPolicy::TruncateWithStatus
+        );
+
+        let selector_policy_values = [
+            ("log_only", SelectorSoftScorePolicy::LogOnly),
+            ("candidate_only", SelectorSoftScorePolicy::CandidateOnly),
+            ("buy_gate", SelectorSoftScorePolicy::BuyGate),
+        ];
+        for (raw, expected) in selector_policy_values {
+            let config: GatekeeperV2Config = toml::from_str(&format!(
+                "[selector_soft_score]\nenabled = true\npolicy = \"{raw}\"\n"
+            ))
+            .expect("selector soft-score policy should deserialize");
+            assert_eq!(config.selector_soft_score.policy, expected);
+        }
+    }
+
+    #[test]
+    fn test_gatekeeper_v2_unknown_evidence_policy_enum_is_rejected() {
+        let err = toml::from_str::<GatekeeperV2Config>(
+            r#"strict_metric_missing_policy = "totally_unknown""#,
+        )
+        .expect_err("unknown evidence policy enum must fail loudly");
+        assert!(err.to_string().contains("strict_metric_missing_policy"));
     }
 
     #[test]
@@ -5298,6 +5828,39 @@ include_spl = false
         assert_eq!(config.aps.adaptation_interval_buys, 50);
         // Legacy fields must still deserialize
         assert!(config.use_three_layer_decision);
+        assert_eq!(
+            config.strict_metric_missing_policy,
+            StrictMetricMissingPolicy::HardFail
+        );
+        assert_eq!(config.cpv_low_sample_policy, CpvLowSamplePolicy::HardFail);
+        assert_eq!(config.cpv_min_successful_buy_signers_clean, 3);
+        assert_eq!(config.cpv_min_successful_buy_signers_degraded, 2);
+        assert!(!config.cpv_emit_degraded_low_sample);
+        assert!(!config.cpv_allow_degraded_in_strict_policy);
+        assert_eq!(
+            config.temporal_carried_forward_policy,
+            TemporalCarriedForwardPolicy::LogOnly
+        );
+        assert!(!config.temporal_carry_forward_enabled);
+        assert_eq!(config.temporal_carry_forward_max_staleness_ms, 1000);
+        assert!(config.temporal_carry_forward_event_counters_enabled);
+        assert!(!config.temporal_carry_forward_state_metrics_enabled);
+        assert!(!config.temporal_carry_forward_ratio_metrics_enabled);
+        assert!(config.top_level_features_from_materialized_ssot);
+        assert_eq!(config.decision_time_series_tx_capacity, 128);
+        assert_eq!(
+            config.decision_time_series_retention_policy,
+            DecisionTimeSeriesRetentionPolicy::TruncateWithStatus
+        );
+        assert!(config.emit_evidence_policy_context);
+        assert!(!config.selector_soft_score.enabled);
+        assert_eq!(
+            config.selector_soft_score.policy,
+            SelectorSoftScorePolicy::LogOnly
+        );
+        assert_eq!(config.selector_soft_score.min_candidate_score, 2);
+        assert_eq!(config.selector_soft_score.min_buy_score, 3);
+        assert_eq!(config.selector_soft_score.max_score(), 12);
         assert_eq!(config.mode, GatekeeperMode::Long);
         // Collector profile keeps the legacy cap permissive for wide evidence gathering.
         assert!(
@@ -5305,6 +5868,104 @@ include_spl = false
             "max_price_change_ratio must be 9.50 in the collector profile, got {}",
             config.max_price_change_ratio,
         );
+    }
+
+    #[test]
+    fn gatekeeper_v2_r37_and_r38_profiles_define_pr1_evidence_foundation_fields() {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let load = |name: &str| {
+            let path = manifest_dir.join("../configs/rollout").join(name);
+            GhostBrainConfig::from_toml_file(&path)
+                .unwrap_or_else(|err| panic!("failed to load {}: {err}", path.display()))
+        };
+
+        let r37 = load(
+            "ghost_brain_selector_dataset_sampler_r37_threshold_probe_maxwait3789_fsc_off.toml",
+        );
+        let r37_cfg = r37.gatekeeper_v2.expect("r37 must contain gatekeeper_v2");
+        assert!(!r37_cfg.strict_metric_threshold_gate_enabled);
+        assert_eq!(
+            r37_cfg.strict_metric_missing_policy,
+            StrictMetricMissingPolicy::HardFail
+        );
+        assert_eq!(
+            r37_cfg.cpv_low_sample_policy,
+            CpvLowSamplePolicy::ReasonOnly
+        );
+        assert_eq!(r37_cfg.cpv_min_successful_buy_signers_clean, 3);
+        assert_eq!(r37_cfg.cpv_min_successful_buy_signers_degraded, 2);
+        assert!(r37_cfg.cpv_emit_degraded_low_sample);
+        assert!(!r37_cfg.cpv_allow_degraded_in_strict_policy);
+        assert_eq!(
+            r37_cfg.temporal_carried_forward_policy,
+            TemporalCarriedForwardPolicy::UseForSelectorOnly
+        );
+        assert!(r37_cfg.temporal_carry_forward_enabled);
+        assert_eq!(r37_cfg.temporal_carry_forward_max_staleness_ms, 1000);
+        assert!(r37_cfg.temporal_carry_forward_event_counters_enabled);
+        assert!(!r37_cfg.temporal_carry_forward_state_metrics_enabled);
+        assert!(!r37_cfg.temporal_carry_forward_ratio_metrics_enabled);
+        assert!(r37_cfg.top_level_features_from_materialized_ssot);
+        assert_eq!(r37_cfg.decision_time_series_tx_capacity, 4096);
+        assert_eq!(
+            r37_cfg.decision_time_series_retention_policy,
+            DecisionTimeSeriesRetentionPolicy::TruncateWithStatus
+        );
+        assert!(r37_cfg.emit_evidence_policy_context);
+        assert!(r37_cfg.selector_soft_score.enabled);
+        assert_eq!(
+            r37_cfg.selector_soft_score.policy,
+            SelectorSoftScorePolicy::BuyGate
+        );
+        assert_eq!(r37_cfg.selector_soft_score.min_candidate_score, 2);
+        assert_eq!(r37_cfg.selector_soft_score.min_buy_score, 3);
+        assert_eq!(r37_cfg.selector_soft_score.max_score(), 12);
+        assert!(r37_cfg.selector_soft_score.allow_degraded_cpv);
+        assert!(r37_cfg.selector_soft_score.allow_carried_temporal_deltas);
+
+        let r38 = load(
+            "ghost_brain_selector_dataset_sampler_r38_threshold_probe_maxwait31100_fsc_off.toml",
+        );
+        let r38_cfg = r38.gatekeeper_v2.expect("r38 must contain gatekeeper_v2");
+        assert!(!r38_cfg.strict_metric_threshold_gate_enabled);
+        assert_eq!(
+            r38_cfg.strict_metric_missing_policy,
+            StrictMetricMissingPolicy::HardFail
+        );
+        assert_eq!(
+            r38_cfg.cpv_low_sample_policy,
+            CpvLowSamplePolicy::ReasonOnly
+        );
+        assert_eq!(r38_cfg.cpv_min_successful_buy_signers_clean, 3);
+        assert_eq!(r38_cfg.cpv_min_successful_buy_signers_degraded, 2);
+        assert!(r38_cfg.cpv_emit_degraded_low_sample);
+        assert!(!r38_cfg.cpv_allow_degraded_in_strict_policy);
+        assert_eq!(
+            r38_cfg.temporal_carried_forward_policy,
+            TemporalCarriedForwardPolicy::UseForSelectorOnly
+        );
+        assert!(r38_cfg.temporal_carry_forward_enabled);
+        assert_eq!(r38_cfg.temporal_carry_forward_max_staleness_ms, 1000);
+        assert!(r38_cfg.temporal_carry_forward_event_counters_enabled);
+        assert!(!r38_cfg.temporal_carry_forward_state_metrics_enabled);
+        assert!(!r38_cfg.temporal_carry_forward_ratio_metrics_enabled);
+        assert!(r38_cfg.top_level_features_from_materialized_ssot);
+        assert_eq!(r38_cfg.decision_time_series_tx_capacity, 4096);
+        assert_eq!(
+            r38_cfg.decision_time_series_retention_policy,
+            DecisionTimeSeriesRetentionPolicy::TruncateWithStatus
+        );
+        assert!(r38_cfg.emit_evidence_policy_context);
+        assert!(r38_cfg.selector_soft_score.enabled);
+        assert_eq!(
+            r38_cfg.selector_soft_score.policy,
+            SelectorSoftScorePolicy::BuyGate
+        );
+        assert_eq!(r38_cfg.selector_soft_score.min_candidate_score, 2);
+        assert_eq!(r38_cfg.selector_soft_score.min_buy_score, 3);
+        assert_eq!(r38_cfg.selector_soft_score.max_score(), 12);
+        assert!(r38_cfg.selector_soft_score.allow_degraded_cpv);
+        assert!(r38_cfg.selector_soft_score.allow_carried_temporal_deltas);
     }
 
     #[test]

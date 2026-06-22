@@ -88,7 +88,9 @@ pub const CYCLIC_LOG_SCHEMA_VERSION: u32 = 1;
 /// v23 adds additive replay payload hash fields for V3 shadow-sidecar parity.
 /// v24 adds additive FSC v2 evidence capture fields without policy activation.
 /// v25 adds additive FSC v2 shadow-policy counterfactual fields without verdict impact.
-pub const GATEKEEPER_BUY_LOG_SCHEMA_VERSION: u32 = 25;
+/// v29 adds decision_time_series retention metadata so truncated DTW vectors
+/// cannot be mistaken for full-window clean evidence.
+pub const GATEKEEPER_BUY_LOG_SCHEMA_VERSION: u32 = 30;
 /// Gatekeeper version string embedded in every V2.5 shadow BUY log for traceability.
 pub const GATEKEEPER_VERSION: &str = "v2.5";
 /// Legacy Gatekeeper version string for pre-V2.5 live-plane semantics.
@@ -1069,6 +1071,10 @@ pub struct GatekeeperBuyLog {
     pub max_interval_cv: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub burst_ratio: Option<f64>,
+    /// Phase-2-only velocity burst ratio preserved for diagnostics. The
+    /// top-level `burst_ratio` remains the canonical tx-intel SSOT projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase2_burst_ratio: Option<f64>,
     pub max_burst_ratio: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub avg_interval_ms: Option<f64>,
@@ -1285,6 +1291,58 @@ pub struct GatekeeperBuyLog {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_soft_points: Option<u16>,
 
+    /// Positive selector score model enable flag for this decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector_soft_score_enabled: Option<bool>,
+
+    /// Selector soft-score policy (`log_only`, `candidate_only`, `buy_gate`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector_soft_score_policy: Option<String>,
+
+    /// Missing metric policy used by selector scoring.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector_soft_score_missing_policy: Option<String>,
+
+    /// Points earned by the positive selector score model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector_soft_score: Option<u16>,
+
+    /// Maximum available selector score points under the active weights.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector_soft_score_max: Option<u16>,
+
+    /// Number of selector rules with finite evidence values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector_soft_score_present_rules: Option<u16>,
+
+    /// Number of selector rules that passed and awarded points.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector_soft_score_passed_rules: Option<u16>,
+
+    /// Number of selector rules missing finite evidence values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector_soft_score_missing_rules: Option<u16>,
+
+    /// Candidate threshold used by the selector score.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector_soft_score_min_candidate: Option<u16>,
+
+    /// BUY threshold used by the selector score.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector_soft_score_min_buy: Option<u16>,
+
+    /// Whether the selector candidate threshold was met.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector_soft_score_candidate_passed: Option<bool>,
+
+    /// Whether the selector BUY threshold was met.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector_soft_score_buy_passed: Option<bool>,
+
+    /// Per-rule selector diagnostics with value/status/source reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector_soft_score_rules: Option<serde_json::Value>,
+
     /// Comma-separated sybil soft signal flag names.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sybil_soft_flags: Option<String>,
@@ -1318,6 +1376,13 @@ pub struct GatekeeperBuyLog {
     /// Replaces the legacy free-form `decision_reason` for machine auditability.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason_code: Option<String>,
+
+    /// Additive PR5 context describing how missing/degraded/carry-forward
+    /// evidence was allowed to affect this decision. The full config payload
+    /// remains the replay source of truth; this compact object is for fast
+    /// JSONL audits and cross-run comparisons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_policy_context: Option<serde_json::Value>,
 
     /// Active reason code taxonomy version (2 = V2.5 active verdict contract).
     /// V3 P0 sidecar codes are versioned by `v3_shadow_schema_version`.
@@ -1864,6 +1929,10 @@ pub struct GatekeeperBuyLog {
     #[serde(default)]
     pub max_signer_cross_pool_velocity: f64,
 
+    /// Cross-pool activity of successful-buy signers, mirrored from CPV evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpv_other_pool_activity: Option<f64>,
+
     /// Funding Source Concentration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub funding_source_concentration: Option<f64>,
@@ -1954,6 +2023,84 @@ pub struct GatekeeperBuyLog {
     pub buyer_hhi: Option<f64>,
 
     // ═══════════════════════════════════════════
+    // V3 Temporal Delta Convenience Fields
+    // Mirrored from `v3_materialized_feature_snapshot.temporal_deltas`.
+    // Missing evidence stays absent/null and is not imputed as zero.
+    // ═══════════════════════════════════════════
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_mcap_1s_to_2s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_mcap_1s_to_3s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_mcap_2s_to_3s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_price_pct_1s_to_2s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_price_pct_1s_to_3s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_price_pct_2s_to_3s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_burstratio_1s_to_2s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_burstratio_1s_to_3s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_burstratio_2s_to_3s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_buy_count_1s_to_2s: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_buy_count_1s_to_3s: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_buy_count_2s_to_3s: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_unique_signers_1s_to_2s: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_unique_signers_1s_to_3s: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_unique_signers_2s_to_3s: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_tx_count_1s_to_2s: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_tx_count_1s_to_3s: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_tx_count_2s_to_3s: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_net_quote_sol_1s_to_2s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_net_quote_sol_1s_to_3s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_net_quote_sol_2s_to_3s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_jito_tip_intensity_1s_to_2s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_jito_tip_intensity_1s_to_3s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_signer_cross_pool_velocity_1s_to_2s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_signer_cross_pool_velocity_1s_to_3s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_flipper_presence_ratio_1s_to_2s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_flipper_presence_ratio_1s_to_3s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_mcap_sol_per_s_1s_to_2s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_mcap_sol_per_s_1s_to_3s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_mcap_sol_per_s_2s_to_3s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_buy_count_per_s_1s_to_2s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_buy_count_per_s_1s_to_3s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_unique_signers_per_s_1s_to_2s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_unique_signers_per_s_1s_to_3s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_net_quote_sol_per_s_1s_to_2s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_net_quote_sol_per_s_1s_to_3s: Option<f64>,
+
+    // ═══════════════════════════════════════════
     // Window Vectors (v3: DTW/Hill/MI/TDA analysis)
     // Deterministic sequences from [t0, t_end], length-bounded.
     // All vectors aligned to the same tx-event axis.
@@ -1970,17 +2117,51 @@ pub struct GatekeeperBuyLog {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vectors_sol_amounts: Option<Vec<f64>>,
 
-    /// Price (SOL/token) at each tx in the window (looked up from price_history).
+    /// Price (SOL/token) at each tx in the window. `null` preserves tick alignment
+    /// when price evidence is unavailable for a sample.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub vectors_prices: Option<Vec<f64>>,
+    pub vectors_prices: Option<Vec<Option<f64>>>,
 
     /// Inter-event intervals in ms (diff of ts_offsets); length = N−1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vectors_interval_ms: Option<Vec<f64>>,
 
-    /// Price change between consecutive tx (diff of prices); length = N−1.
+    /// Price change between consecutive tx; `null` when either side has no price.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub vectors_d_price: Option<Vec<f64>>,
+    pub vectors_d_price: Option<Vec<Option<f64>>>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vectors_price_finite_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vectors_price_missing_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vectors_price_coverage_ratio: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vectors_price_source_reserve_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vectors_price_source_quote_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vectors_price_source_market_cap_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vectors_price_source_account_state_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vectors_price_source_history_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vectors_price_source_carry_forward_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vectors_price_source_missing_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_time_series_retention_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_time_series_retention_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_time_series_retention_capacity: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_time_series_retained_sample_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_time_series_total_tx_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_time_series_dropped_oldest_count: Option<u64>,
 
     // ═══════════════════════════════════════════
     // V2.5 Shadow Decision Fields (v16)
@@ -3112,17 +3293,41 @@ fn selector_shadow_vector_event_count(log: &GatekeeperBuyLog) -> Option<f64> {
     }
 }
 
-fn selector_shadow_price_return(prices: &[f64]) -> Option<f64> {
-    let first = *prices.first()?;
+fn selector_shadow_finite_prices(prices: &[Option<f64>]) -> Vec<f64> {
+    prices
+        .iter()
+        .filter_map(|price| price.filter(|value| value.is_finite()))
+        .collect()
+}
+
+fn selector_shadow_price_first(prices: &[Option<f64>]) -> Option<f64> {
+    prices
+        .iter()
+        .filter_map(|price| price.filter(|value| value.is_finite()))
+        .next()
+}
+
+fn selector_shadow_price_last(prices: &[Option<f64>]) -> Option<f64> {
+    prices
+        .iter()
+        .rev()
+        .filter_map(|price| price.filter(|value| value.is_finite()))
+        .next()
+}
+
+fn selector_shadow_price_return(prices: &[Option<f64>]) -> Option<f64> {
+    let finite_prices = selector_shadow_finite_prices(prices);
+    let first = *finite_prices.first()?;
     if first == 0.0 {
         return None;
     }
-    let last = *prices.last()?;
+    let last = *finite_prices.last()?;
     Some((last / first) - 1.0)
 }
 
-fn selector_shadow_price_drawdown(prices: &[f64]) -> Option<f64> {
-    let mut iter = prices.iter().copied();
+fn selector_shadow_price_drawdown(prices: &[Option<f64>]) -> Option<f64> {
+    let finite_prices = selector_shadow_finite_prices(prices);
+    let mut iter = finite_prices.iter().copied();
     let mut peak = iter.next()?;
     let mut max_drawdown = 0.0;
     for price in std::iter::once(peak).chain(iter) {
@@ -3232,23 +3437,25 @@ fn selector_shadow_runtime_feature_value(log: &GatekeeperBuyLog, feature: &str) 
         "gk_vector_price_first" => log
             .vectors_prices
             .as_ref()
-            .and_then(|prices| prices.first().copied()),
+            .and_then(|prices| selector_shadow_price_first(prices)),
         "gk_vector_price_last" => log
             .vectors_prices
             .as_ref()
-            .and_then(|prices| prices.last().copied()),
+            .and_then(|prices| selector_shadow_price_last(prices)),
         "gk_vector_price_return" => log
             .vectors_prices
             .as_ref()
             .and_then(|prices| selector_shadow_price_return(prices)),
-        "gk_vector_price_max" => log
-            .vectors_prices
-            .as_ref()
-            .and_then(|prices| prices.iter().copied().reduce(f64::max)),
-        "gk_vector_price_min" => log
-            .vectors_prices
-            .as_ref()
-            .and_then(|prices| prices.iter().copied().reduce(f64::min)),
+        "gk_vector_price_max" => log.vectors_prices.as_ref().and_then(|prices| {
+            selector_shadow_finite_prices(prices)
+                .into_iter()
+                .reduce(f64::max)
+        }),
+        "gk_vector_price_min" => log.vectors_prices.as_ref().and_then(|prices| {
+            selector_shadow_finite_prices(prices)
+                .into_iter()
+                .reduce(f64::min)
+        }),
         "gk_vector_price_drawdown" => log
             .vectors_prices
             .as_ref()
@@ -4313,6 +4520,7 @@ mod tests {
             min_interval_cv: 0.30,
             max_interval_cv: 9999.0,
             burst_ratio: Some(0.65),
+            phase2_burst_ratio: None,
             max_burst_ratio: 0.70,
             avg_interval_ms: Some(120.0),
             min_avg_interval_ms: 60.0,
@@ -4412,6 +4620,19 @@ mod tests {
             sybil_soft_points: None,
             sybil_soft_threshold: None,
             total_soft_points: None,
+            selector_soft_score_enabled: None,
+            selector_soft_score_policy: None,
+            selector_soft_score_missing_policy: None,
+            selector_soft_score: None,
+            selector_soft_score_max: None,
+            selector_soft_score_present_rules: None,
+            selector_soft_score_passed_rules: None,
+            selector_soft_score_missing_rules: None,
+            selector_soft_score_min_candidate: None,
+            selector_soft_score_min_buy: None,
+            selector_soft_score_candidate_passed: None,
+            selector_soft_score_buy_passed: None,
+            selector_soft_score_rules: None,
             sybil_soft_flags: None,
             sybil_lead_signal: None,
             sybil_interference_patterns: vec![],
@@ -4576,6 +4797,7 @@ mod tests {
             min_demand_elasticity_score: -1.0,
             signer_cross_pool_velocity: Some(0.45),
             max_signer_cross_pool_velocity: 1.0,
+            cpv_other_pool_activity: None,
             funding_source_concentration: Some(0.52),
             max_funding_source_concentration: 1.0,
             funding_source_diagnostics: None,
@@ -4602,6 +4824,42 @@ mod tests {
             sell_share: Some(0.2),
             top1_wallet_share: Some(0.35),
             buyer_hhi: Some(0.18),
+            delta_mcap_1s_to_2s: None,
+            delta_mcap_1s_to_3s: None,
+            delta_mcap_2s_to_3s: None,
+            delta_price_pct_1s_to_2s: None,
+            delta_price_pct_1s_to_3s: None,
+            delta_price_pct_2s_to_3s: None,
+            delta_burstratio_1s_to_2s: None,
+            delta_burstratio_1s_to_3s: None,
+            delta_burstratio_2s_to_3s: None,
+            delta_buy_count_1s_to_2s: None,
+            delta_buy_count_1s_to_3s: None,
+            delta_buy_count_2s_to_3s: None,
+            delta_unique_signers_1s_to_2s: None,
+            delta_unique_signers_1s_to_3s: None,
+            delta_unique_signers_2s_to_3s: None,
+            delta_tx_count_1s_to_2s: None,
+            delta_tx_count_1s_to_3s: None,
+            delta_tx_count_2s_to_3s: None,
+            delta_net_quote_sol_1s_to_2s: None,
+            delta_net_quote_sol_1s_to_3s: None,
+            delta_net_quote_sol_2s_to_3s: None,
+            delta_jito_tip_intensity_1s_to_2s: None,
+            delta_jito_tip_intensity_1s_to_3s: None,
+            delta_signer_cross_pool_velocity_1s_to_2s: None,
+            delta_signer_cross_pool_velocity_1s_to_3s: None,
+            delta_flipper_presence_ratio_1s_to_2s: None,
+            delta_flipper_presence_ratio_1s_to_3s: None,
+            rate_mcap_sol_per_s_1s_to_2s: None,
+            rate_mcap_sol_per_s_1s_to_3s: None,
+            rate_mcap_sol_per_s_2s_to_3s: None,
+            rate_buy_count_per_s_1s_to_2s: None,
+            rate_buy_count_per_s_1s_to_3s: None,
+            rate_unique_signers_per_s_1s_to_2s: None,
+            rate_unique_signers_per_s_1s_to_3s: None,
+            rate_net_quote_sol_per_s_1s_to_2s: None,
+            rate_net_quote_sol_per_s_1s_to_3s: None,
             // Window vectors (not used in this test)
             vectors_max_len: None,
             vectors_ts_offsets_ms: None,
@@ -4609,6 +4867,22 @@ mod tests {
             vectors_prices: None,
             vectors_interval_ms: None,
             vectors_d_price: None,
+            vectors_price_finite_count: None,
+            vectors_price_missing_count: None,
+            vectors_price_coverage_ratio: None,
+            vectors_price_source_reserve_count: None,
+            vectors_price_source_quote_count: None,
+            vectors_price_source_market_cap_count: None,
+            vectors_price_source_account_state_count: None,
+            vectors_price_source_history_count: None,
+            vectors_price_source_carry_forward_count: None,
+            vectors_price_source_missing_count: None,
+            decision_time_series_retention_status: None,
+            decision_time_series_retention_policy: None,
+            decision_time_series_retention_capacity: None,
+            decision_time_series_retained_sample_count: None,
+            decision_time_series_total_tx_count: None,
+            decision_time_series_dropped_oldest_count: None,
             // V2.5 Shadow fields (not used in this test)
             shadow_extended_verdict: None,
             shadow_extended_elapsed_ms: None,
@@ -4701,6 +4975,7 @@ mod tests {
             pdd_soft_flags: None,
             shadow_pdd_reject_reason: None,
             reason_code: Some(GatekeeperReasonCode::BuyNormal.as_log_str()),
+            evidence_policy_context: None,
             reason_code_version: GatekeeperReasonCode::version(),
             pdd_sequence_signals_unavailable_reason: None,
         };
@@ -4829,6 +5104,7 @@ mod tests {
             min_interval_cv: 0.30,
             max_interval_cv: 9999.0,
             burst_ratio: Some(0.65),
+            phase2_burst_ratio: None,
             max_burst_ratio: 0.70,
             avg_interval_ms: Some(120.0),
             min_avg_interval_ms: 60.0,
@@ -4924,6 +5200,19 @@ mod tests {
             sybil_soft_points: None,
             sybil_soft_threshold: None,
             total_soft_points: None,
+            selector_soft_score_enabled: None,
+            selector_soft_score_policy: None,
+            selector_soft_score_missing_policy: None,
+            selector_soft_score: None,
+            selector_soft_score_max: None,
+            selector_soft_score_present_rules: None,
+            selector_soft_score_passed_rules: None,
+            selector_soft_score_missing_rules: None,
+            selector_soft_score_min_candidate: None,
+            selector_soft_score_min_buy: None,
+            selector_soft_score_candidate_passed: None,
+            selector_soft_score_buy_passed: None,
+            selector_soft_score_rules: None,
             sybil_soft_flags: None,
             sybil_lead_signal: None,
             sybil_interference_patterns: vec![],
@@ -5086,6 +5375,7 @@ mod tests {
             min_demand_elasticity_score: -1.0,
             signer_cross_pool_velocity: Some(0.45),
             max_signer_cross_pool_velocity: 1.0,
+            cpv_other_pool_activity: None,
             funding_source_concentration: Some(0.52),
             max_funding_source_concentration: 1.0,
             funding_source_diagnostics: None,
@@ -5111,12 +5401,64 @@ mod tests {
             sell_share: Some(0.2),
             top1_wallet_share: Some(0.35),
             buyer_hhi: Some(0.18),
+            delta_mcap_1s_to_2s: None,
+            delta_mcap_1s_to_3s: None,
+            delta_mcap_2s_to_3s: None,
+            delta_price_pct_1s_to_2s: None,
+            delta_price_pct_1s_to_3s: None,
+            delta_price_pct_2s_to_3s: None,
+            delta_burstratio_1s_to_2s: None,
+            delta_burstratio_1s_to_3s: None,
+            delta_burstratio_2s_to_3s: None,
+            delta_buy_count_1s_to_2s: None,
+            delta_buy_count_1s_to_3s: None,
+            delta_buy_count_2s_to_3s: None,
+            delta_unique_signers_1s_to_2s: None,
+            delta_unique_signers_1s_to_3s: None,
+            delta_unique_signers_2s_to_3s: None,
+            delta_tx_count_1s_to_2s: None,
+            delta_tx_count_1s_to_3s: None,
+            delta_tx_count_2s_to_3s: None,
+            delta_net_quote_sol_1s_to_2s: None,
+            delta_net_quote_sol_1s_to_3s: None,
+            delta_net_quote_sol_2s_to_3s: None,
+            delta_jito_tip_intensity_1s_to_2s: None,
+            delta_jito_tip_intensity_1s_to_3s: None,
+            delta_signer_cross_pool_velocity_1s_to_2s: None,
+            delta_signer_cross_pool_velocity_1s_to_3s: None,
+            delta_flipper_presence_ratio_1s_to_2s: None,
+            delta_flipper_presence_ratio_1s_to_3s: None,
+            rate_mcap_sol_per_s_1s_to_2s: None,
+            rate_mcap_sol_per_s_1s_to_3s: None,
+            rate_mcap_sol_per_s_2s_to_3s: None,
+            rate_buy_count_per_s_1s_to_2s: None,
+            rate_buy_count_per_s_1s_to_3s: None,
+            rate_unique_signers_per_s_1s_to_2s: None,
+            rate_unique_signers_per_s_1s_to_3s: None,
+            rate_net_quote_sol_per_s_1s_to_2s: None,
+            rate_net_quote_sol_per_s_1s_to_3s: None,
             vectors_max_len: None,
             vectors_ts_offsets_ms: None,
             vectors_sol_amounts: None,
             vectors_prices: None,
             vectors_interval_ms: None,
             vectors_d_price: None,
+            vectors_price_finite_count: None,
+            vectors_price_missing_count: None,
+            vectors_price_coverage_ratio: None,
+            vectors_price_source_reserve_count: None,
+            vectors_price_source_quote_count: None,
+            vectors_price_source_market_cap_count: None,
+            vectors_price_source_account_state_count: None,
+            vectors_price_source_history_count: None,
+            vectors_price_source_carry_forward_count: None,
+            vectors_price_source_missing_count: None,
+            decision_time_series_retention_status: None,
+            decision_time_series_retention_policy: None,
+            decision_time_series_retention_capacity: None,
+            decision_time_series_retained_sample_count: None,
+            decision_time_series_total_tx_count: None,
+            decision_time_series_dropped_oldest_count: None,
             // V2.5 Shadow fields (not used in this test)
             shadow_extended_verdict: None,
             shadow_extended_elapsed_ms: None,
@@ -5209,6 +5551,7 @@ mod tests {
             pdd_soft_flags: None,
             shadow_pdd_reject_reason: None,
             reason_code: Some(GatekeeperReasonCode::RejectCoreFail.as_log_str()),
+            evidence_policy_context: None,
             reason_code_version: GatekeeperReasonCode::version(),
             pdd_sequence_signals_unavailable_reason: None,
         }
@@ -5978,7 +6321,12 @@ mod tests {
         buy_log.curve_wait_elapsed_ms = Some(10_010);
         buy_log.vectors_ts_offsets_ms = Some(vec![0, 250, 1000, 1800]);
         buy_log.vectors_sol_amounts = Some(vec![0.5, 1.0, 2.0, 0.75]);
-        buy_log.vectors_prices = Some(vec![0.00000003, 0.00000004, 0.00000005, 0.000000045]);
+        buy_log.vectors_prices = Some(vec![
+            Some(0.00000003),
+            Some(0.00000004),
+            Some(0.00000005),
+            Some(0.000000045),
+        ]);
         buy_log.ab_record_id = Some("pool_score_numeric:1000:11000:BUY".to_string());
 
         logger.log_gatekeeper_buy_decision(buy_log).await;
@@ -6027,7 +6375,7 @@ mod tests {
         let mut buy_log = create_test_buy_log();
         buy_log.pool_id = "pool_score_non_finite".to_string();
         buy_log.observation_end_ts_ms = Some(11_000);
-        buy_log.vectors_prices = Some(vec![f64::NAN, 0.00000004, 0.00000005]);
+        buy_log.vectors_prices = Some(vec![None, Some(0.00000004), Some(0.00000005)]);
         buy_log.vectors_sol_amounts = Some(vec![0.5, 1.0, 2.0]);
         buy_log.vectors_ts_offsets_ms = Some(vec![0, 250, 1000]);
         buy_log.ab_record_id = Some("pool_score_non_finite:1000:11000:REJECT".to_string());

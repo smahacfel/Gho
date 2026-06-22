@@ -941,6 +941,7 @@ impl E2EPipeline {
                                     quote_id: fill.quote_id_used.clone(),
                                     slot: prepared_attempt.attempt.prepared.quote.slot,
                                     lane: Lane::Shadow,
+                                    opened_at_ms: None,
                                     position_id: Some(position_id.clone()),
                                     position_epoch: Some(position_epoch),
                                 }),
@@ -1153,6 +1154,7 @@ impl E2EPipeline {
                                     .as_ref()
                                     .map(|emitter| emitter.lane())
                                     .unwrap_or(Lane::Paper),
+                                opened_at_ms: None,
                                 position_id: fill.position_id.clone(),
                                 position_epoch: Some(position_epoch),
                             }),

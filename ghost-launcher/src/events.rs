@@ -1310,6 +1310,16 @@ pub enum GhostEvent {
         /// Confirmed slot where the BUY landed.
         /// Populated on live lane from Sender/Yellowstone confirmation; None for paper/dry-run lanes.
         buy_landed_slot: Option<u64>,
+        /// RPC context slot returned by shadow/probe BUY simulation.
+        ///
+        /// This is not a live landed slot. It anchors the simulated entry to the
+        /// market state used by the simulation.
+        entry_simulation_rpc_slot: Option<u64>,
+        /// Optional wall-clock entry anchor for shadow/probe lifecycle accounting.
+        ///
+        /// When present, PostBuyRuntime uses this as the synthetic position
+        /// open time instead of runtime registration time.
+        entry_opened_at_ms: Option<u64>,
         /// Canonical creator pubkey string used to derive Pump.fun creator_vault for live SELL.
         creator_pubkey: Option<String>,
         /// Optional decision/shadow join metadata for audit-only correlation.
@@ -1444,6 +1454,8 @@ impl GhostEvent {
             min_tokens_out,
             entry_token_amount_raw,
             buy_landed_slot,
+            entry_simulation_rpc_slot: None,
+            entry_opened_at_ms: None,
             creator_pubkey,
             join_metadata: ExecutionJoinMetadata::default(),
         }
@@ -1452,6 +1464,27 @@ impl GhostEvent {
     pub fn with_execution_join_metadata(mut self, metadata: ExecutionJoinMetadata) -> Self {
         if let GhostEvent::PostBuySubmitted { join_metadata, .. } = &mut self {
             *join_metadata = metadata;
+        }
+        self
+    }
+
+    pub fn with_entry_opened_at_ms(mut self, opened_at_ms: Option<u64>) -> Self {
+        if let GhostEvent::PostBuySubmitted {
+            entry_opened_at_ms, ..
+        } = &mut self
+        {
+            *entry_opened_at_ms = opened_at_ms;
+        }
+        self
+    }
+
+    pub fn with_entry_simulation_rpc_slot(mut self, slot: Option<u64>) -> Self {
+        if let GhostEvent::PostBuySubmitted {
+            entry_simulation_rpc_slot,
+            ..
+        } = &mut self
+        {
+            *entry_simulation_rpc_slot = slot;
         }
         self
     }

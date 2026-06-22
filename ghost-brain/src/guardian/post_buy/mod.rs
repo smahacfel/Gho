@@ -28,7 +28,7 @@ pub mod engine;
 pub mod integration;
 pub mod signals;
 
-pub use config::PostBuyGuardianConfig;
+pub use config::{PostBuyGuardianConfig, TimeStopV2Config};
 pub use engine::MonitoringEngine;
 pub use integration::{PositionRuntimeRouter, ShadowPositionBook, SignalRouter};
 pub use signals::{

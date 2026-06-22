@@ -3,7 +3,8 @@ use ghost_core::EventSemanticEnvelope;
 use ghost_launcher::components::gatekeeper::{
     AlphaGateDiagnostics, GatekeeperAssessment, GatekeeperBuffer, GatekeeperDecision,
     GatekeeperVerdict, GatekeeperVerdictType, ObservationStage, ProsperityFilterDiagnostics,
-    ShadowCheckpointSource, ShadowDecisionKind, SoftSignals, SybilPolicyDiagnostics,
+    SelectorSoftScoreDiagnostics, ShadowCheckpointSource, ShadowDecisionKind, SoftSignals,
+    SybilPolicyDiagnostics,
 };
 use ghost_launcher::components::gatekeeper_pdd::evaluate_pdd;
 use ghost_launcher::events::PoolTransaction;
@@ -2035,6 +2036,7 @@ fn p4_to_buy_log_reads_decision_reason_code_not_text() {
         core2_passed: false,
         core3_passed: false,
         soft_signals: SoftSignals::default(),
+        selector_soft_score: SelectorSoftScoreDiagnostics::default(),
         soft_points: 0,
         max_soft_points_possible: 0,
         effective_max_soft_points: 0,
@@ -2107,6 +2109,7 @@ fn p4_decision_without_reason_code_does_not_get_timeout_fallback() {
         core2_passed: true,
         core3_passed: true,
         soft_signals: SoftSignals::default(),
+        selector_soft_score: SelectorSoftScoreDiagnostics::default(),
         soft_points: 0,
         max_soft_points_possible: 0,
         effective_max_soft_points: 0,
@@ -2137,6 +2140,7 @@ fn p4_reject_sybil_interference_has_reason_code() {
         core2_passed: true,
         core3_passed: true,
         soft_signals: SoftSignals::default(),
+        selector_soft_score: SelectorSoftScoreDiagnostics::default(),
         soft_points: 0,
         max_soft_points_possible: 0,
         effective_max_soft_points: 0,
@@ -2172,6 +2176,7 @@ fn p4_iwim_buy_to_reject_mutates_reason_code() {
         core2_passed: true,
         core3_passed: true,
         soft_signals: SoftSignals::default(),
+        selector_soft_score: SelectorSoftScoreDiagnostics::default(),
         soft_points: 0,
         max_soft_points_possible: 0,
         effective_max_soft_points: 0,
