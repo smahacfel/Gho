@@ -254,6 +254,7 @@ fn base_feature_set() -> MaterializedFeatureSet {
             avg_tx_per_signer: 1.33,
             same_ms_tx_ratio: 0.05,
             bundle_suspicion_ratio: 0.02,
+            top3_signer_volume_ratio: Some(0.44),
             top3_volume_pct: 0.44,
             dev_buy_sol: 0.5,
             dev_volume_ratio: 0.08,
@@ -1017,8 +1018,9 @@ fn hard_filters_reject_every_supported_condition() {
         (
             "top3",
             Box::new(|mut features| {
-                features.tx_intel_features.top3_volume_pct =
-                    config.hard_fail_top3_volume_pct + 0.01;
+                let top3_ratio = config.hard_fail_top3_volume_pct + 0.01;
+                features.tx_intel_features.top3_signer_volume_ratio = Some(top3_ratio);
+                features.tx_intel_features.top3_volume_pct = top3_ratio;
                 features
             }),
         ),
@@ -1057,6 +1059,57 @@ fn hard_filters_reject_every_supported_condition() {
         );
         assert!(!decision.verdict_buy, "case={label} should reject");
     }
+}
+
+#[test]
+fn top3_signer_volume_ratio_converts_to_pdd_percent_without_alias_scale_drift() {
+    let mut config = policy_test_config();
+    config.pdd.enabled = true;
+    config.pdd.entry_drift_max_pct = 100.0;
+    config.pdd.entry_drift_soft_max_pct = 100.0;
+    config.pdd.whale_top3_max_pct = 60.0;
+
+    let mut features = base_feature_set();
+    features.tx_intel_features.top3_signer_volume_ratio = Some(0.60);
+    features.tx_intel_features.top3_volume_pct = 0.10;
+
+    let assessment =
+        build_assessment_from_features(features, &config, PolicyEvaluationContext::default());
+    let diversity = assessment
+        .phase3_diversity
+        .as_ref()
+        .expect("phase3 diversity should be materialized");
+    let pdd = assessment
+        .pdd_assessment
+        .as_ref()
+        .expect("PDD diagnostics should be materialized");
+
+    assert!((diversity.effective_top3_signer_volume_ratio() - 0.60).abs() < f64::EPSILON);
+    assert_eq!(diversity.top3_volume_pct, 0.60);
+    assert_eq!(diversity.top3_signer_volume_ratio, Some(0.60));
+    assert_eq!(pdd.whale_top3_pct, Some(60.0));
+    assert!(
+        pdd.hard_fail.is_none(),
+        "PDD threshold is percent-scale and uses strict > comparison"
+    );
+}
+
+#[test]
+fn top3_legacy_payload_missing_new_field_falls_back_to_compatibility_alias() {
+    let config = policy_test_config();
+    let mut features = base_feature_set();
+    features.tx_intel_features.top3_signer_volume_ratio = None;
+    features.tx_intel_features.top3_volume_pct = 0.67;
+
+    let assessment =
+        build_assessment_from_features(features, &config, PolicyEvaluationContext::default());
+    let diversity = assessment
+        .phase3_diversity
+        .as_ref()
+        .expect("phase3 diversity should be materialized");
+
+    assert_eq!(diversity.top3_signer_volume_ratio, None);
+    assert!((diversity.effective_top3_signer_volume_ratio() - 0.67).abs() < f64::EPSILON);
 }
 
 #[test]
@@ -2019,6 +2072,7 @@ fn hard_filter_features_api_matches_assessment_snapshot() {
         },
     );
     let hard_filter = evaluate_hard_filters(&features, &config);
+    let decision = evaluate_policy_from_assessment(&assessment, &config);
 
     assert_eq!(
         hard_filter.as_ref().map(|(reason, _)| *reason),
@@ -2026,7 +2080,11 @@ fn hard_filter_features_api_matches_assessment_snapshot() {
     );
     assert_eq!(
         hard_filter.as_ref().map(|(_, reason)| reason.as_str()),
-        assessment.hard_reject_reason.as_deref()
+        decision.hard_fail_reason.as_deref()
+    );
+    assert!(
+        assessment.hard_reject_reason.is_none(),
+        "build_assessment_from_features must stay evidence-only"
     );
 }
 

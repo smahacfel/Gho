@@ -93,7 +93,7 @@
 //! ledger.insert(mint, curve);
 //!
 //! // Simulate a buy BEFORE sending transaction
-//! if let Ok(sim) = ledger.simulate_buy(&mint, 1_000_000_000, 1000) {
+//! if let Ok(sim) = ledger.simulate_buy(&mint, 1_000_000_000, Some(1000)) {
 //!     println!("Expected tokens: {}", sim.tokens_out);
 //!     println!("Price impact: {}%", sim.price_impact_percent);
 //!     println!("Min tokens out (with slippage): {}", sim.min_tokens_out);

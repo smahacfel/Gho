@@ -9,6 +9,7 @@
 use ghost_brain::config::gatekeeper_v25_config::AdaptiveProsperityConfig;
 
 use crate::components::gatekeeper::GatekeeperAssessment;
+use crate::components::gatekeeper_pdd_sequence::PddSignalObservation;
 
 /// Market regime classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,10 +53,16 @@ pub struct ApsDiagnostics {
     pub shadow_branch3_hhi_max: f64,
     /// Contrafactual: would the prosperity filter have passed with APS thresholds?
     pub shadow_prosperity_would_pass: Option<bool>,
+    pub pdd_spike_signal_status: &'static str,
+    pub pdd_spike_unavailable_reason: Option<&'static str>,
 }
 
 impl ApsDiagnostics {
     pub fn not_run() -> Self {
+        Self::not_run_with_pdd_signal(PddSignalObservation::not_applicable())
+    }
+
+    fn not_run_with_pdd_signal(pdd_spike_signal: PddSignalObservation) -> Self {
         Self {
             enabled: false,
             adaptive_enabled: false,
@@ -67,6 +74,8 @@ impl ApsDiagnostics {
             shadow_branch1_sniped_pct: 0.28,
             shadow_branch3_hhi_max: 0.0416,
             shadow_prosperity_would_pass: None,
+            pdd_spike_signal_status: pdd_spike_signal.status_label(),
+            pdd_spike_unavailable_reason: pdd_spike_signal.unavailable_reason_label(),
         }
     }
 }
@@ -85,10 +94,10 @@ impl ApsDiagnostics {
 pub fn evaluate_aps(
     assessment: &GatekeeperAssessment,
     config: &AdaptiveProsperityConfig,
-    pdd_spike_detected: bool,
+    pdd_spike_signal: PddSignalObservation,
 ) -> ApsDiagnostics {
     if !config.enabled || !config.shadow_suggestions_enabled {
-        return ApsDiagnostics::not_run();
+        return ApsDiagnostics::not_run_with_pdd_signal(pdd_spike_signal);
     }
 
     // ── Calibration guard ──
@@ -98,7 +107,7 @@ pub fn evaluate_aps(
         config.regime_local_heuristic_enabled || config.cross_pool_outcome_tracker_available;
     let sample_adequate = assessment.total_tx_evaluated as usize >= config.min_calibration_samples;
     let regime = if has_sufficient_history && sample_adequate {
-        detect_regime(assessment, config, pdd_spike_detected)
+        detect_regime(assessment, config, pdd_spike_signal)
     } else {
         MarketRegime::Normal
     };
@@ -148,6 +157,8 @@ pub fn evaluate_aps(
         shadow_branch1_sniped_pct: branch1,
         shadow_branch3_hhi_max: branch3_hhi,
         shadow_prosperity_would_pass: Some(shadow_would_pass),
+        pdd_spike_signal_status: pdd_spike_signal.status_label(),
+        pdd_spike_unavailable_reason: pdd_spike_signal.unavailable_reason_label(),
     }
 }
 
@@ -169,7 +180,7 @@ pub fn evaluate_aps(
 fn detect_regime(
     assessment: &GatekeeperAssessment,
     config: &AdaptiveProsperityConfig,
-    pdd_spike_detected: bool,
+    pdd_spike_signal: PddSignalObservation,
 ) -> MarketRegime {
     if !config.regime_detection_enabled {
         return MarketRegime::Normal;
@@ -204,7 +215,7 @@ fn detect_regime(
     }
 
     // Volume spike — PDD already detected anomalous volume pattern
-    if pdd_spike_detected {
+    if pdd_spike_signal.is_available_detected() {
         high_vol_signals += 1;
     }
 
@@ -297,6 +308,9 @@ mod tests {
     use crate::components::gatekeeper::{
         BondingCurveDynamics, GatekeeperAssessment, SignerDiversityProfile,
     };
+    use crate::components::gatekeeper_pdd_sequence::{
+        PddSequenceUnavailableReason, PddSignalObservation,
+    };
     use ghost_brain::config::GatekeeperV2Config;
     use ghost_core::checkpoint::MaterializedFeatureSet;
 
@@ -359,20 +373,23 @@ mod tests {
         let mut config = aps_test_config();
         config.enabled = false;
         let assessment = empty_assessment();
-        let result = evaluate_aps(&assessment, &config, false);
+        let result = evaluate_aps(&assessment, &config, PddSignalObservation::not_applicable());
         assert!(!result.enabled);
         assert!(!result.adaptive_thresholds_applied);
+        assert_eq!(result.pdd_spike_signal_status, "not_applicable");
     }
 
     #[test]
     fn test_regime_normal_by_default() {
         let config = aps_test_config();
         let assessment = empty_assessment();
-        let result = evaluate_aps(&assessment, &config, false);
+        let result = evaluate_aps(&assessment, &config, PddSignalObservation::available(false));
         assert_eq!(result.regime, MarketRegime::Normal);
         assert!((result.shadow_entry_drift_max_pct - 5.0).abs() < f64::EPSILON);
         assert!((result.shadow_confidence_min - 0.60).abs() < f64::EPSILON);
         assert!((result.shadow_prosperity_mcap_sol - 35.0).abs() < f64::EPSILON);
+        assert_eq!(result.pdd_spike_signal_status, "available");
+        assert_eq!(result.pdd_spike_unavailable_reason, None);
     }
 
     #[test]
@@ -380,11 +397,12 @@ mod tests {
         let config = aps_test_config();
         let assessment = empty_assessment();
         // evaluate_aps always returns Normal until calibration guard passes
-        let result = evaluate_aps(&assessment, &config, true);
+        let result = evaluate_aps(&assessment, &config, PddSignalObservation::available(true));
         // With insufficient history, returns Normal (calibration guard)
         assert_eq!(result.regime, MarketRegime::Normal);
         assert!((result.shadow_entry_drift_max_pct - 5.0).abs() < f64::EPSILON);
         assert!((result.shadow_confidence_min - 0.60).abs() < f64::EPSILON);
+        assert_eq!(result.pdd_spike_signal_status, "available");
     }
 
     #[test]
@@ -397,11 +415,12 @@ mod tests {
             hhi: 0.75,
             max_tx_per_signer: 10,
             volume_gini: 0.4,
+            top3_signer_volume_ratio: Some(0.5),
             top3_volume_pct: 0.5,
             same_ms_tx_ratio: 0.1,
         });
         assessment.total_tx_evaluated = 30;
-        let regime = detect_regime(&assessment, &config, false);
+        let regime = detect_regime(&assessment, &config, PddSignalObservation::available(false));
         assert_eq!(regime, MarketRegime::HighVolatility);
     }
 
@@ -424,8 +443,68 @@ mod tests {
             curve_finality: ghost_core::CurveFinality::Provisional,
             price_data_points: 5,
         });
-        let regime = detect_regime(&assessment, &config, false);
+        let regime = detect_regime(&assessment, &config, PddSignalObservation::available(false));
         assert_eq!(regime, MarketRegime::HighVolatility);
+    }
+
+    #[test]
+    fn test_detect_regime_pdd_spike_requires_available_true() {
+        let config = aps_test_config();
+        let mut assessment = empty_assessment();
+        assessment.total_tx_evaluated = 30;
+
+        let unavailable = detect_regime(
+            &assessment,
+            &config,
+            PddSignalObservation::unavailable(PddSequenceUnavailableReason::MissingSequence),
+        );
+        assert_eq!(unavailable, MarketRegime::Normal);
+
+        let available = detect_regime(&assessment, &config, PddSignalObservation::available(true));
+        assert_eq!(available, MarketRegime::HighVolatility);
+    }
+
+    #[test]
+    fn test_aps_diagnostics_distinguish_unavailable_from_not_applicable_pdd_spike() {
+        let config = aps_test_config();
+        let assessment = empty_assessment();
+
+        let not_applicable =
+            evaluate_aps(&assessment, &config, PddSignalObservation::not_applicable());
+        assert_eq!(not_applicable.pdd_spike_signal_status, "not_applicable");
+        assert_eq!(not_applicable.pdd_spike_unavailable_reason, None);
+
+        let unavailable = evaluate_aps(
+            &assessment,
+            &config,
+            PddSignalObservation::unavailable(PddSequenceUnavailableReason::MissingSequence),
+        );
+        assert_eq!(unavailable.pdd_spike_signal_status, "unavailable");
+        assert_eq!(
+            unavailable.pdd_spike_unavailable_reason,
+            Some("missing_sequence")
+        );
+    }
+
+    #[test]
+    fn test_aps_disabled_preserves_pdd_spike_availability_diagnostics() {
+        let mut config = aps_test_config();
+        config.enabled = false;
+        let assessment = empty_assessment();
+
+        let result = evaluate_aps(
+            &assessment,
+            &config,
+            PddSignalObservation::unavailable(PddSequenceUnavailableReason::MissingSequence),
+        );
+
+        assert!(!result.enabled);
+        assert_eq!(result.pdd_spike_signal_status, "unavailable");
+        assert_eq!(
+            result.pdd_spike_unavailable_reason,
+            Some("missing_sequence")
+        );
+        assert_eq!(result.shadow_prosperity_would_pass, None);
     }
 
     #[test]
@@ -439,7 +518,7 @@ mod tests {
     fn test_aps_five_thresholds_all_populated() {
         let config = aps_test_config();
         let assessment = empty_assessment();
-        let result = evaluate_aps(&assessment, &config, false);
+        let result = evaluate_aps(&assessment, &config, PddSignalObservation::available(false));
         assert!(result.shadow_entry_drift_max_pct > 0.0);
         assert!(result.shadow_confidence_min > 0.0);
         assert!(result.shadow_prosperity_mcap_sol > 0.0);

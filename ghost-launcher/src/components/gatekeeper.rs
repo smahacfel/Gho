@@ -9,7 +9,7 @@ use crate::components::gatekeeper_adaptive_prosperity::ApsDiagnostics;
 use crate::components::gatekeeper_pdd::{PddDiagnostics, PddHardFail};
 use crate::components::gatekeeper_pdd_sequence::{
     any_sequence_signal_enabled, sequence_signal_availability, PddSequenceSignalKind,
-    PDD_INSUFFICIENT_DURATION_REASON, PDD_INSUFFICIENT_TX_PER_SEGMENT_REASON,
+    PddSignalObservation, PDD_INSUFFICIENT_DURATION_REASON, PDD_INSUFFICIENT_TX_PER_SEGMENT_REASON,
     PDD_MISSING_SEQUENCE_REASON,
 };
 use crate::components::gatekeeper_trajectory::TrajectoryAssessment;
@@ -1373,6 +1373,8 @@ pub struct GatekeeperAssessment {
     pub phase6_curve: Option<BondingCurveDynamics>,
     pub phase6_passed: bool,
     pub phases_passed: u8,
+    /// Compatibility/export field populated only after a typed decision exists.
+    /// Never use this as an active policy input.
     pub hard_reject_reason: Option<String>,
     pub total_tx_evaluated: usize,
     pub unique_tx_evaluated: usize,
@@ -1445,6 +1447,8 @@ pub struct GatekeeperAssessment {
 pub struct V25ConfidenceBreakdown {
     pub base_quality: f64,
     pub alpha_quality: f64,
+    pub alpha_status: &'static str,
+    pub alpha_unavailable_reason: Option<&'static str>,
     pub pdd_modulator: f64,
     pub tas_modulator: f64,
     pub sybil_modulator: f64,
@@ -1452,6 +1456,51 @@ pub struct V25ConfidenceBreakdown {
     pub final_confidence: f64,
     pub zeroed_by_pdd_hard_fail: bool,
     pub zeroed_by_tas_hard_reject: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum AlphaConfidenceInput {
+    NeutralDisabled,
+    Available { quality: f64 },
+    Unavailable { reason: &'static str },
+}
+
+impl AlphaConfidenceInput {
+    const fn status(self) -> &'static str {
+        match self {
+            Self::NeutralDisabled => "neutral_disabled",
+            Self::Available { .. } => "available",
+            Self::Unavailable { .. } => "unavailable",
+        }
+    }
+
+    const fn unavailable_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Unavailable { reason } => Some(reason),
+            Self::NeutralDisabled | Self::Available { .. } => None,
+        }
+    }
+
+    fn quality_multiplier(self) -> Option<f64> {
+        match self {
+            Self::NeutralDisabled => Some(1.0),
+            Self::Available { quality } => Some(quality.clamp(0.0, 1.0)),
+            Self::Unavailable { .. } => None,
+        }
+    }
+}
+
+const ALPHA_CONFIDENCE_NOT_RUN_REASON: &str = "alpha_not_run";
+const ALPHA_CONFIDENCE_INSUFFICIENT_SAMPLE_REASON: &str = "alpha_insufficient_sample";
+const ALPHA_CONFIDENCE_MISSING_INPUTS_REASON: &str = "alpha_missing_inputs";
+
+fn alpha_confidence_skip_reason(alpha: &AlphaGateDiagnostics) -> &'static str {
+    match alpha.skip_reason {
+        Some("insufficient_sample") => ALPHA_CONFIDENCE_INSUFFICIENT_SAMPLE_REASON,
+        Some("missing_alpha_inputs") => ALPHA_CONFIDENCE_MISSING_INPUTS_REASON,
+        Some(reason) => reason,
+        None => ALPHA_CONFIDENCE_NOT_RUN_REASON,
+    }
 }
 
 impl GatekeeperAssessment {
@@ -1497,6 +1546,7 @@ impl GatekeeperAssessment {
         ));
 
         if let Some(diversity) = &self.phase3_diversity {
+            let top3_signer_volume_ratio = diversity.effective_top3_signer_volume_ratio();
             trace.push(Self::gate_trace_entry(
                 10,
                 "diversity_hhi_hard_fail",
@@ -1516,17 +1566,17 @@ impl GatekeeperAssessment {
             trace.push(Self::gate_trace_entry(
                 11,
                 "diversity_top3_hard_fail",
-                if diversity.top3_volume_pct > config.hard_fail_top3_volume_pct {
+                if top3_signer_volume_ratio > config.hard_fail_top3_volume_pct {
                     "fail"
                 } else {
                     "pass"
                 },
                 "hard",
-                Some("top3_volume_pct"),
-                Some(diversity.top3_volume_pct),
+                Some("top3_signer_volume_ratio"),
+                Some(top3_signer_volume_ratio),
                 Some(config.hard_fail_top3_volume_pct),
                 Some("gatekeeper_v2.hard_fail_top3_volume_pct"),
-                (diversity.top3_volume_pct > config.hard_fail_top3_volume_pct)
+                (top3_signer_volume_ratio > config.hard_fail_top3_volume_pct)
                     .then_some(GatekeeperReasonCode::HardFailExtremeTop3),
             ));
         }
@@ -1863,12 +1913,43 @@ impl GatekeeperAssessment {
             })
     }
 
+    fn alpha_confidence_input(&self, config: &GatekeeperV2Config) -> Option<AlphaConfidenceInput> {
+        let decision = self.decision.as_ref()?;
+        if !config.enable_alpha_gate {
+            return Some(AlphaConfidenceInput::NeutralDisabled);
+        }
+
+        let alpha = &decision.alpha_gate;
+        if !alpha.enabled || !alpha.actionable {
+            return Some(AlphaConfidenceInput::Unavailable {
+                reason: alpha_confidence_skip_reason(alpha),
+            });
+        }
+
+        let (Some(momentum), Some(demand), Some(joint)) =
+            (alpha.momentum, alpha.demand, alpha.joint)
+        else {
+            return Some(AlphaConfidenceInput::Unavailable {
+                reason: ALPHA_CONFIDENCE_MISSING_INPUTS_REASON,
+            });
+        };
+        if !(momentum.is_finite() && demand.is_finite() && joint.is_finite()) {
+            return Some(AlphaConfidenceInput::Unavailable {
+                reason: ALPHA_CONFIDENCE_MISSING_INPUTS_REASON,
+            });
+        }
+
+        Some(AlphaConfidenceInput::Available {
+            quality: (momentum * 0.4 + demand * 0.35 + joint * 0.25).clamp(0.0, 1.0),
+        })
+    }
+
     /// V2.5 confidence score — 5-component multiplicative model.
     ///
     /// ```text
     /// confidence = clamp01(
     ///     base_quality    // phases_passed / 6
-    ///   * alpha_quality   // momentum*0.4 + demand*0.35 + joint*0.25
+    ///   * alpha_quality   // disabled=neutral; available=momentum*0.4 + demand*0.35 + joint*0.25
     ///   * pdd_modulator   // 0.7 + 0.3*pdd_score
     ///   * tas_modulator   // [0.75, 1.25] based on trajectory
     ///   * sybil_modulator // 1.0 - 0.20*(sybil_points/max_sybil_points)
@@ -1905,13 +1986,9 @@ impl GatekeeperAssessment {
         // 1. base_quality: fraction of phases passed
         let base_quality = (self.phases_passed.min(6) as f64) / 6.0;
 
-        // 2. alpha_quality: weighted alpha gate scalars
-        let alpha_quality = {
-            let momentum = decision.alpha_gate.momentum.unwrap_or(0.0);
-            let demand = decision.alpha_gate.demand.unwrap_or(0.0);
-            let joint = momentum * demand;
-            (momentum * 0.4 + demand * 0.35 + joint * 0.25).clamp(0.0, 1.0)
-        };
+        // 2. alpha_quality: disabled alpha is neutral; enabled-but-unavailable is not 0.0.
+        let alpha_input = self.alpha_confidence_input(config)?;
+        let alpha_quality = alpha_input.quality_multiplier()?;
 
         // 3. pdd_modulator: PDD cleanliness, range [0.7, 1.0]
         let (pdd_modulator, zeroed_by_pdd_hard_fail) = if let Some(ref pdd) = self.pdd_assessment {
@@ -1955,6 +2032,8 @@ impl GatekeeperAssessment {
         Some(V25ConfidenceBreakdown {
             base_quality,
             alpha_quality,
+            alpha_status: alpha_input.status(),
+            alpha_unavailable_reason: alpha_input.unavailable_reason(),
             pdd_modulator,
             tas_modulator,
             sybil_modulator,
@@ -2088,6 +2167,10 @@ impl GatekeeperAssessment {
 
         let reason = if self.decision.is_none() {
             "missing_decision".to_string()
+        } else if let Some(AlphaConfidenceInput::Unavailable { reason }) =
+            self.alpha_confidence_input(config)
+        {
+            reason.to_string()
         } else if self.uses_materialized_feature_path() {
             if config.tas.enabled && self.trajectory.is_none() {
                 let (_, tas_reason) = self.tas_availability(config);
@@ -2383,7 +2466,11 @@ impl GatekeeperAssessment {
         serde_json::json!({
             "decision_present": self.decision.is_some(),
             "terminal_reason_code": self.terminal_reason_code.map(GatekeeperReasonCode::as_log_str),
-            "hard_reject_reason": self.hard_reject_reason.clone(),
+            "hard_reject_reason": self
+                .decision
+                .as_ref()
+                .and_then(|decision| decision.hard_fail_reason.clone())
+                .or_else(|| self.hard_reject_reason.clone()),
             "phase_pass_vector": {
                 "phase1": self.phase1_passed,
                 "phase2": self.phase2_passed,
@@ -2610,6 +2697,7 @@ impl GatekeeperAssessment {
             (None, None)
         };
         let v25_terminal_shadow = self.v25_shadow_decisions.last();
+        let alpha_confidence_input = self.alpha_confidence_input(config);
         let v25_confidence_breakdown = self.v25_confidence_breakdown(config);
         let v25_model_confidence = self
             .v25_confidence
@@ -2650,11 +2738,11 @@ impl GatekeeperAssessment {
             "phases_passed": self.phases_passed,
             "min_phases_to_pass": config.min_phases_to_pass,
         }));
-        let hard_reject_reason = self.hard_reject_reason.clone().or_else(|| {
-            self.decision
-                .as_ref()
-                .and_then(|d| d.hard_fail_reason.clone())
-        });
+        let hard_reject_reason = self
+            .decision
+            .as_ref()
+            .and_then(|d| d.hard_fail_reason.clone())
+            .or_else(|| self.hard_reject_reason.clone());
         let mut gatekeeper_v2_replay_missing_fields = Vec::new();
         if gatekeeper_gate_trace.is_empty() {
             gatekeeper_v2_replay_missing_fields
@@ -2772,7 +2860,14 @@ impl GatekeeperAssessment {
             volume_gini: self.phase3_diversity.as_ref().map(|p| p.volume_gini),
             min_volume_gini: config.min_volume_gini,
             max_volume_gini: config.max_volume_gini,
-            top3_volume_pct: self.phase3_diversity.as_ref().map(|p| p.top3_volume_pct),
+            top3_signer_volume_ratio: self
+                .phase3_diversity
+                .as_ref()
+                .and_then(|p| p.top3_signer_volume_ratio),
+            top3_volume_pct: self
+                .phase3_diversity
+                .as_ref()
+                .map(|p| p.effective_top3_signer_volume_ratio()),
             max_top3_volume_pct: config.max_top3_volume_pct,
             same_ms_tx_ratio: self.phase3_diversity.as_ref().map(|p| p.same_ms_tx_ratio),
             max_same_ms_tx_ratio: config.max_same_ms_tx_ratio,
@@ -3498,6 +3593,10 @@ impl GatekeeperAssessment {
                 .map(|breakdown| breakdown.base_quality),
             v25_confidence_alpha_quality: v25_confidence_breakdown
                 .map(|breakdown| breakdown.alpha_quality),
+            v25_confidence_alpha_status: alpha_confidence_input
+                .map(|input| input.status().to_string()),
+            v25_confidence_alpha_unavailable_reason: alpha_confidence_input
+                .and_then(|input| input.unavailable_reason().map(str::to_string)),
             v25_confidence_pdd_modulator: v25_confidence_breakdown
                 .map(|breakdown| breakdown.pdd_modulator),
             v25_confidence_tas_modulator: v25_confidence_breakdown
@@ -3578,6 +3677,15 @@ impl GatekeeperAssessment {
                 .as_ref()
                 .and_then(|p| p.entry_drift_anchor_quality.map(|s| s.to_string())),
             pdd_spike_detected: self.pdd_assessment.as_ref().map(|p| p.spike_detected),
+            pdd_spike_signal_status: self
+                .pdd_assessment
+                .as_ref()
+                .map(|p| p.spike_signal.status_label().to_string()),
+            pdd_spike_unavailable_reason: self.pdd_assessment.as_ref().and_then(|p| {
+                p.spike_signal
+                    .unavailable_reason_label()
+                    .map(str::to_string)
+            }),
             pdd_spike_ratio: self.pdd_assessment.as_ref().and_then(|p| p.spike_ratio),
             pdd_spike_ratio_quality: self
                 .pdd_assessment
@@ -3592,12 +3700,30 @@ impl GatekeeperAssessment {
                 .as_ref()
                 .and_then(|p| p.spike_earlier_rate),
             pdd_ramping_detected: self.pdd_assessment.as_ref().map(|p| p.ramping_detected),
+            pdd_ramping_signal_status: self
+                .pdd_assessment
+                .as_ref()
+                .map(|p| p.ramping_signal.status_label().to_string()),
+            pdd_ramping_unavailable_reason: self.pdd_assessment.as_ref().and_then(|p| {
+                p.ramping_signal
+                    .unavailable_reason_label()
+                    .map(str::to_string)
+            }),
             pdd_whale_top3_pct: self.pdd_assessment.as_ref().and_then(|p| p.whale_top3_pct),
             pdd_whale_single_max_pct: self
                 .pdd_assessment
                 .as_ref()
                 .and_then(|p| p.whale_single_max_pct),
             pdd_flash_crash_risk: self.pdd_assessment.as_ref().map(|p| p.flash_crash_risk),
+            pdd_flash_crash_signal_status: self
+                .pdd_assessment
+                .as_ref()
+                .map(|p| p.flash_crash_signal.status_label().to_string()),
+            pdd_flash_crash_unavailable_reason: self.pdd_assessment.as_ref().and_then(|p| {
+                p.flash_crash_signal
+                    .unavailable_reason_label()
+                    .map(str::to_string)
+            }),
             pdd_score: self.pdd_assessment.as_ref().map(|p| p.pdd_score),
             gatekeeper_first_kill_gate,
             gatekeeper_first_kill_reason,
@@ -4152,6 +4278,16 @@ pub fn compute_bonding_curve_dynamics(price_history: &[PricePoint]) -> BondingCu
     }
 }
 
+fn attach_policy_decision_compat_fields(
+    assessment: &mut GatekeeperAssessment,
+    decision: GatekeeperDecision,
+    config: &GatekeeperV2Config,
+) {
+    assessment.hard_reject_reason = decision.hard_fail_reason.clone();
+    assessment.decision = Some(decision);
+    assessment.cache_v25_confidence(config);
+}
+
 impl GatekeeperBuffer {
     fn now_wall_ms() -> u64 {
         SystemTime::now()
@@ -4357,10 +4493,16 @@ impl GatekeeperBuffer {
             "entry_drift_anchor_source": pdd.and_then(|p| p.entry_drift_anchor_source),
             "entry_drift_anchor_quality": pdd.and_then(|p| p.entry_drift_anchor_quality),
             "spike_detected": pdd.map(|p| p.spike_detected),
+            "spike_signal_status": pdd.map(|p| p.spike_signal.status_label()),
+            "spike_unavailable_reason": pdd.and_then(|p| p.spike_signal.unavailable_reason_label()),
             "ramping_detected": pdd.map(|p| p.ramping_detected),
+            "ramping_signal_status": pdd.map(|p| p.ramping_signal.status_label()),
+            "ramping_unavailable_reason": pdd.and_then(|p| p.ramping_signal.unavailable_reason_label()),
             "whale_top3_pct": pdd.and_then(|p| p.whale_top3_pct),
             "reserve_health_pass": pdd.map(|p| p.reserve_health_pass),
             "flash_crash_risk": pdd.map(|p| p.flash_crash_risk),
+            "flash_crash_signal_status": pdd.map(|p| p.flash_crash_signal.status_label()),
+            "flash_crash_unavailable_reason": pdd.and_then(|p| p.flash_crash_signal.unavailable_reason_label()),
             "pdd_score": pdd.map(|p| p.pdd_score),
         })
     }
@@ -4380,6 +4522,8 @@ impl GatekeeperBuffer {
             "aps_adaptive_thresholds_applied": aps.map(|a| a.adaptive_thresholds_applied),
             "aps_regime": aps.map(|a| a.regime.as_str()),
             "aps_shadow_prosperity_would_pass": aps.and_then(|a| a.shadow_prosperity_would_pass),
+            "pdd_spike_signal_status": aps.map(|a| a.pdd_spike_signal_status),
+            "pdd_spike_unavailable_reason": aps.and_then(|a| a.pdd_spike_unavailable_reason),
         })
     }
 
@@ -4389,7 +4533,14 @@ impl GatekeeperBuffer {
             "hard_fail_hhi_threshold": self.config.hard_fail_hhi,
             "max_hhi_threshold": self.config.max_hhi,
             "phase3_passed": assessment.phase3_passed,
-            "top3_volume_pct": assessment.phase3_diversity.as_ref().map(|d| d.top3_volume_pct),
+            "top3_signer_volume_ratio": assessment
+                .phase3_diversity
+                .as_ref()
+                .and_then(|d| d.top3_signer_volume_ratio),
+            "top3_volume_pct": assessment
+                .phase3_diversity
+                .as_ref()
+                .map(|d| d.effective_top3_signer_volume_ratio()),
             "same_ms_tx_ratio": assessment.phase3_diversity.as_ref().map(|d| d.same_ms_tx_ratio),
             "unique_ratio": assessment.phase3_diversity.as_ref().map(|d| d.unique_ratio),
         })
@@ -4430,6 +4581,8 @@ impl GatekeeperBuffer {
             assessment.aps_diagnostics.as_ref(),
         );
         let hhi_diversity_diagnostics = self.compact_hhi_snapshot(assessment);
+        let (v25_confidence_available, v25_confidence_unavailable_reason) =
+            assessment.v25_confidence_availability(&self.config);
         let compact_payload = serde_json::json!({
             "phase_pass_vector": phase_pass_vector,
             "pdd_diagnostics": pdd_diagnostics,
@@ -4437,6 +4590,9 @@ impl GatekeeperBuffer {
             "hhi_diversity_diagnostics": hhi_diversity_diagnostics,
             "soft_points": assessment.decision.as_ref().map(|d| d.soft_points),
             "max_soft_points": assessment.decision.as_ref().map(|d| d.effective_max_soft_points),
+            "v25_confidence": assessment.v25_confidence,
+            "v25_confidence_available": v25_confidence_available,
+            "v25_confidence_unavailable_reason": v25_confidence_unavailable_reason.clone(),
             "verdict_if_evaluated": verdict_if_evaluated,
             "reason_code_if_evaluated": reason_code_if_evaluated,
         });
@@ -4472,11 +4628,15 @@ impl GatekeeperBuffer {
             "gatekeeper_gate_trace": assessment.gatekeeper_gate_trace(&self.config),
             "phase_pass_vector": self.phase_pass_vector_json(assessment),
             "hard_reject_reason": assessment
-                .hard_reject_reason
-                .clone()
-                .or_else(|| assessment.decision.as_ref().and_then(|d| d.hard_fail_reason.clone())),
+                .decision
+                .as_ref()
+                .and_then(|d| d.hard_fail_reason.clone())
+                .or_else(|| assessment.hard_reject_reason.clone()),
             "soft_points": assessment.decision.as_ref().map(|d| d.soft_points),
             "max_soft_points": assessment.decision.as_ref().map(|d| d.effective_max_soft_points),
+            "v25_confidence": assessment.v25_confidence,
+            "v25_confidence_available": v25_confidence_available,
+            "v25_confidence_unavailable_reason": v25_confidence_unavailable_reason,
             "pdd_diagnostics": Self::compact_pdd_snapshot(assessment.pdd_assessment.as_ref()),
             "prosperity_diagnostics": Self::compact_prosperity_snapshot(
                 assessment.decision.as_ref(),
@@ -4553,9 +4713,7 @@ impl GatekeeperBuffer {
             self.build_minimal_assessment()
         };
         let decision = self.compute_decision(&assessment);
-        assessment.hard_reject_reason = decision.hard_fail_reason.clone();
-        assessment.decision = Some(decision);
-        assessment.cache_v25_confidence(&self.config);
+        attach_policy_decision_compat_fields(&mut assessment, decision, &self.config);
         assessment.v25_shadow_decisions = self.v25_shadow_decisions.clone();
         assessment
     }
@@ -4937,7 +5095,7 @@ impl GatekeeperBuffer {
         self.record_pending_curve_terminal(terminal_outcome);
         self.rejected = true;
         let mut assessment = self.run_assessment();
-        assessment.decision = Some(GatekeeperDecision {
+        let decision = GatekeeperDecision {
             hard_fail_reason: Some(reason.clone()),
             core1_passed: false,
             core2_passed: false,
@@ -4959,7 +5117,8 @@ impl GatekeeperBuffer {
             reason_chain: reason.clone(),
             reason_code: Some(GatekeeperReasonCode::RejectCoreFail),
             gatekeeper_strength: None,
-        });
+        };
+        attach_policy_decision_compat_fields(&mut assessment, decision, &self.config);
         GatekeeperVerdict::Reject { assessment, reason }
     }
 
@@ -5210,16 +5369,36 @@ impl GatekeeperBuffer {
         let verdict_tag = decision.verdict_type.tag();
         let soft_pts = decision.soft_points;
         let max_pts = decision.max_soft_points_possible;
-        assessment.decision = Some(decision);
-        assessment.cache_v25_confidence(config);
+        attach_policy_decision_compat_fields(&mut assessment, decision, config);
         // Transfer V2.5 shadow decisions from buffer to terminal assessment
         assessment.v25_shadow_decisions = self.v25_shadow_decisions.clone();
-        assessment.hard_reject_reason = assessment
-            .decision
-            .as_ref()
-            .and_then(|decision| decision.hard_fail_reason.clone());
         let now_wall_ms = Self::now_wall_ms();
         let breakdown = Self::format_phase_breakdown(&assessment);
+
+        if !verdict_buy {
+            self.rejected = true;
+            tracing::info!(
+                pool = %self.pool_id,
+                reason = %reason_chain,
+                phases = %breakdown,
+                soft_pts = soft_pts,
+                verdict = verdict_tag,
+                eval_count = self.eval_count,
+                "🚫 GATEKEEPER POLICY REJECTED {} soft_pts={}/{}", breakdown, soft_pts, max_pts
+            );
+            self.attach_policy_terminal_decision_eval_snapshots(
+                &mut assessment,
+                now_wall_ms,
+                "feature_evaluation",
+                Some(verdict_tag.to_string()),
+                None,
+                Some(reason_chain.clone()),
+            );
+            return GatekeeperVerdict::Reject {
+                assessment,
+                reason: reason_chain,
+            };
+        }
 
         match evaluate_curve_gate(&assessment.feature_snapshot, config) {
             CurveGateOutcome::Ready => {}
@@ -5247,31 +5426,6 @@ impl GatekeeperBuffer {
                     reason: reason.to_string(),
                 };
             }
-        }
-
-        if !verdict_buy {
-            self.rejected = true;
-            tracing::info!(
-                pool = %self.pool_id,
-                reason = %reason_chain,
-                phases = %breakdown,
-                soft_pts = soft_pts,
-                verdict = verdict_tag,
-                eval_count = self.eval_count,
-                "🚫 GATEKEEPER POLICY REJECTED {} soft_pts={}/{}", breakdown, soft_pts, max_pts
-            );
-            self.attach_policy_terminal_decision_eval_snapshots(
-                &mut assessment,
-                now_wall_ms,
-                "feature_evaluation",
-                Some(verdict_tag.to_string()),
-                None,
-                Some(reason_chain.clone()),
-            );
-            return GatekeeperVerdict::Reject {
-                assessment,
-                reason: reason_chain,
-            };
         }
 
         self.state = PoolState::Approved;
@@ -5316,13 +5470,15 @@ impl GatekeeperBuffer {
         let decision = evaluate_policy_from_assessment(&assessment, config);
         let reason_chain = decision.reason_chain.clone();
         let verdict_buy = decision.verdict_buy;
-        assessment.decision = Some(decision);
-        assessment.hard_reject_reason = assessment
-            .decision
-            .as_ref()
-            .and_then(|decision| decision.hard_fail_reason.clone());
+        let decision_verdict_type = decision.verdict_type;
+        attach_policy_decision_compat_fields(&mut assessment, decision, config);
 
-        if let Some(reason) = assessment.hard_reject_reason.clone() {
+        if matches!(decision_verdict_type, GatekeeperVerdictType::RejectHardFail) {
+            let reason = assessment
+                .decision
+                .as_ref()
+                .map(|decision| decision.reason_chain.clone())
+                .unwrap_or(reason_chain.clone());
             self.rejected = true;
             return GatekeeperVerdict::Reject { assessment, reason };
         }
@@ -5373,9 +5529,7 @@ impl GatekeeperBuffer {
                 &assessment,
                 config,
             );
-            assessment.hard_reject_reason = timeout_decision.hard_fail_reason.clone();
-            assessment.decision = Some(timeout_decision);
-            assessment.cache_v25_confidence(config);
+            attach_policy_decision_compat_fields(&mut assessment, timeout_decision, config);
             self.rejected = true;
             return GatekeeperVerdict::Timeout { assessment };
         }
@@ -5892,7 +6046,8 @@ impl GatekeeperBuffer {
                 && diversity.max_tx_per_signer <= self.config.max_tx_per_signer
                 && diversity.volume_gini >= self.config.min_volume_gini
                 && diversity.volume_gini <= self.config.max_volume_gini
-                && diversity.top3_volume_pct <= self.config.max_top3_volume_pct
+                && diversity.effective_top3_signer_volume_ratio()
+                    <= self.config.max_top3_volume_pct
                 && diversity.same_ms_tx_ratio <= self.config.max_same_ms_tx_ratio;
 
             let volume = compute_volume_sanity(
@@ -6126,7 +6281,7 @@ impl GatekeeperBuffer {
         if let Some(ref div) = assessment.phase3_diversity {
             ss.bundle_suspicion = div.same_ms_tx_ratio > cfg.max_same_ms_tx_ratio;
             ss.cabal_suspicion = div.hhi > cfg.max_hhi;
-            ss.top3_dominance = div.top3_volume_pct > cfg.max_top3_volume_pct;
+            ss.top3_dominance = div.effective_top3_signer_volume_ratio() > cfg.max_top3_volume_pct;
             ss.high_volume_gini = div.volume_gini > cfg.max_volume_gini;
             ss.unique_ratio_out_of_range =
                 div.unique_ratio < cfg.min_unique_ratio || div.unique_ratio > cfg.max_unique_ratio;
@@ -6258,10 +6413,11 @@ impl GatekeeperBuffer {
         // HF-8: Extreme top3 dominance (at hard_fail threshold)
         if hard_fail_reason.is_none() {
             if let Some(ref div) = assessment.phase3_diversity {
-                if div.top3_volume_pct > cfg.hard_fail_top3_volume_pct {
+                let top3_signer_volume_ratio = div.effective_top3_signer_volume_ratio();
+                if top3_signer_volume_ratio > cfg.hard_fail_top3_volume_pct {
                     hard_fail_reason = Some(format!(
                         "HARD_FAIL: top3_vol={:.2} > {:.2} (extreme whale dominance)",
-                        div.top3_volume_pct, cfg.hard_fail_top3_volume_pct
+                        top3_signer_volume_ratio, cfg.hard_fail_top3_volume_pct
                     ));
                     hard_fail_reason_code = Some(GatekeeperReasonCode::HardFailExtremeTop3);
                 }
@@ -6690,8 +6846,8 @@ impl GatekeeperBuffer {
             let verdict_buy = decision.verdict_buy;
             let verdict_tag = decision.verdict_type.tag();
             let reason_chain = decision.reason_chain.clone();
-            assessment.decision = Some(decision);
-            assessment.cache_v25_confidence(&self.config);
+            let reason_code = decision.reason_code;
+            attach_policy_decision_compat_fields(&mut assessment, decision, &self.config);
 
             if !verdict_buy {
                 self.rejected = true;
@@ -6709,7 +6865,7 @@ impl GatekeeperBuffer {
                     Self::now_wall_ms(),
                     "terminal_decision",
                     Some(verdict_tag.to_string()),
-                    None,
+                    reason_code.map(GatekeeperReasonCode::as_log_str),
                     Some(reason_chain.clone()),
                 );
                 return GatekeeperVerdict::Reject {
@@ -6761,10 +6917,17 @@ impl GatekeeperBuffer {
         }
 
         // ── Legacy Decision System (phases_passed) ──
-        // Hard reject triggered?
-        if assessment.hard_reject_reason.is_some() {
+        // Hard-fail parity stays delegated to the typed policy decision.
+        let hard_fail_decision = self.compute_decision(&assessment);
+        if matches!(
+            hard_fail_decision.verdict_type,
+            GatekeeperVerdictType::RejectHardFail
+        ) {
+            let verdict_tag = hard_fail_decision.verdict_type.tag();
+            let reason = hard_fail_decision.reason_chain.clone();
+            let reason_code = hard_fail_decision.reason_code;
+            attach_policy_decision_compat_fields(&mut assessment, hard_fail_decision, &self.config);
             self.rejected = true;
-            let reason = assessment.hard_reject_reason.clone().unwrap();
             tracing::info!(
                 pool = %self.pool_id,
                 reason = %reason,
@@ -6776,8 +6939,8 @@ impl GatekeeperBuffer {
                 &mut assessment,
                 Self::now_wall_ms(),
                 "terminal_decision",
-                Some("REJECT".to_string()),
-                None,
+                Some(verdict_tag.to_string()),
+                reason_code.map(GatekeeperReasonCode::as_log_str),
                 Some(reason.clone()),
             );
             return GatekeeperVerdict::Reject { assessment, reason };
@@ -6829,17 +6992,10 @@ impl GatekeeperBuffer {
 
     /// Run the full 6-phase assessment and return the result.
     ///
-    /// All phases are always computed to completion, even when a hard-reject
-    /// condition is detected.  The `hard_reject_reason` field on the returned
-    /// assessment signals that the pool should be rejected, but the phase
-    /// profiles are fully populated so that diagnostic metrics always appear
-    /// in decision logs (gatekeeper_v2_buys.jsonl).
-    ///
-    /// Previous behaviour: hard-reject checks caused an early return via
-    /// `build_hard_reject()` which left all phase profiles as `None`.  In long
-    /// mode this led to Buy verdicts with empty metrics because
-    /// `check_long_deadline` intentionally ignores hard-reject reasons and
-    /// only checks `phases_passed >= min_phases_to_pass`.
+    /// All phases are always computed to completion. The returned assessment is
+    /// evidence-only: it never carries an active hard-fail verdict. Typed
+    /// reject reasons are attached only after a downstream decision exists, so
+    /// policy remains the single owner of terminal hard-fail semantics.
 
     /// Extract deterministic, length-bounded, **aligned** vectors from the
     /// observation window `[t0, t_end]`.
@@ -6980,21 +7136,10 @@ impl GatekeeperBuffer {
     }
 
     pub fn run_assessment(&self) -> GatekeeperAssessment {
-        let window_ms = self
-            .highest_seen_ts
-            .saturating_sub(self.first_tx_ts.unwrap_or(self.highest_seen_ts));
+        self.run_assessment_at(Self::now_wall_ms())
+    }
 
-        // Collect the first hard-reject reason encountered (if any).
-        // We do NOT return early — all phases are computed regardless.
-        let mut hard_reject_reason: Option<String> = None;
-
-        // ═══════════════════════════════════════
-        // HARD REJECT CHECK: Dev sold (Phase 5, checked early)
-        // ═══════════════════════════════════════
-        if self.config.reject_on_dev_sell && self.dev_has_sold {
-            hard_reject_reason = Some("Dev wallet sold during observation window".to_string());
-        }
-
+    fn run_assessment_at(&self, now_wall_ms: u64) -> GatekeeperAssessment {
         // ═══════════════════════════════════════
         // PHASE 2: Velocity
         // ═══════════════════════════════════════
@@ -7008,17 +7153,6 @@ impl GatekeeperBuffer {
             && velocity.timing_entropy >= self.config.min_timing_entropy
             && velocity.timing_entropy <= self.config.max_timing_entropy
             && self.dust_filtered_count >= self.config.min_dust_filtered_count;
-
-        // Hard reject: extreme bot (very low CoV + very fast)
-        if hard_reject_reason.is_none()
-            && velocity.interval_cv < 0.08
-            && velocity.avg_interval_ms < 30.0
-        {
-            hard_reject_reason = Some(format!(
-                "Extreme bot timing: CoV={:.3} avg={:.0}ms",
-                velocity.interval_cv, velocity.avg_interval_ms
-            ));
-        }
 
         // ═══════════════════════════════════════
         // PHASE 3: Signer Diversity
@@ -7035,16 +7169,8 @@ impl GatekeeperBuffer {
             && diversity.max_tx_per_signer <= self.config.max_tx_per_signer
             && diversity.volume_gini >= self.config.min_volume_gini
             && diversity.volume_gini <= self.config.max_volume_gini
-            && diversity.top3_volume_pct <= self.config.max_top3_volume_pct
+            && diversity.effective_top3_signer_volume_ratio() <= self.config.max_top3_volume_pct
             && diversity.same_ms_tx_ratio <= self.config.max_same_ms_tx_ratio;
-
-        // Hard reject: extreme concentration
-        if hard_reject_reason.is_none() && diversity.hhi > 0.5 {
-            hard_reject_reason = Some(format!(
-                "Extreme signer concentration: HHI={:.3}",
-                diversity.hhi
-            ));
-        }
 
         // ═══════════════════════════════════════
         // PHASE 4: Volume Sanity
@@ -7127,35 +7253,6 @@ impl GatekeeperBuffer {
             price_ok && bonding_ok
         };
 
-        // Hard reject: extreme price manipulation
-        if hard_reject_reason.is_none()
-            && curve.price_data_points >= 2
-            && curve.max_single_tx_price_impact_pct > 50.0
-        {
-            hard_reject_reason = Some(format!(
-                "Extreme price manipulation: single TX moved price {:.1}%",
-                curve.max_single_tx_price_impact_pct
-            ));
-        }
-
-        // ═══════════════════════════════════════
-        // Yellowstone-only: Failed TX ratio check
-        // ═══════════════════════════════════════
-        if hard_reject_reason.is_none() {
-            if let Some(threshold) = self.config.min_failed_tx_ratio_for_bot_flag {
-                let total_with_failed = self.total_tx_count + self.failed_tx_count;
-                if total_with_failed > 5 {
-                    let failed_ratio = self.failed_tx_count as f64 / total_with_failed as f64;
-                    if failed_ratio > threshold {
-                        hard_reject_reason = Some(format!(
-                            "High failed TX ratio: {:.2} (bot spam, Yellowstone)",
-                            failed_ratio
-                        ));
-                    }
-                }
-            }
-        }
-
         // ═══════════════════════════════════════
         // COMPOSITE DECISION
         // ═══════════════════════════════════════
@@ -7187,12 +7284,12 @@ impl GatekeeperBuffer {
             phase6_curve: Some(curve),
             phase6_passed,
             phases_passed,
-            hard_reject_reason,
+            hard_reject_reason: None,
             total_tx_evaluated: self.total_tx_count,
             unique_tx_evaluated: self.unique_signature_count(),
             unique_signers_evaluated: self.unique_signers.len(),
-            observation_duration_ms: self.wall_observation_duration_ms(Self::now_wall_ms()),
-            finalize_lag_ms: self.finalize_lag_ms(Self::now_wall_ms()),
+            observation_duration_ms: self.wall_observation_duration_ms(now_wall_ms),
+            finalize_lag_ms: self.finalize_lag_ms(now_wall_ms),
             dust_filtered_count: self.dust_filtered_count,
             eval_count: self.eval_count,
             buy_count: self.buy_count,
@@ -7239,65 +7336,6 @@ impl GatekeeperBuffer {
                 aps.adaptive_thresholds_applied && !self.config.v25.live_execution_enabled;
         }
 
-        assessment
-    }
-
-    /// Build a hard reject assessment with the given reason.
-    /// NOTE: This is kept for backward compatibility but `run_assessment()`
-    /// no longer calls it — it computes all phases inline and sets
-    /// `hard_reject_reason` without early return.
-    #[allow(dead_code)]
-    fn build_hard_reject(&self, reason: &str) -> GatekeeperAssessment {
-        let mut assessment = GatekeeperAssessment {
-            phase1_passed: self.phase1_passed,
-            phase2_velocity: None,
-            phase2_passed: false,
-            phase3_diversity: None,
-            phase3_passed: false,
-            phase4_volume: None,
-            phase4_passed: false,
-            phase5_dev: None,
-            phase5_passed: false,
-            phase6_curve: None,
-            phase6_passed: false,
-            phases_passed: if self.phase1_passed { 1 } else { 0 },
-            hard_reject_reason: Some(reason.to_string()),
-            total_tx_evaluated: self.total_tx_count,
-            unique_tx_evaluated: self.unique_signature_count(),
-            unique_signers_evaluated: self.unique_signers.len(),
-            observation_duration_ms: self.wall_observation_duration_ms(Self::now_wall_ms()),
-            finalize_lag_ms: self.finalize_lag_ms(Self::now_wall_ms()),
-            dust_filtered_count: self.dust_filtered_count,
-            eval_count: self.eval_count,
-            buy_count: self.buy_count,
-            decision: None,
-            terminal_reason_code: None,
-            early_fingerprint: None,
-            curve_t0_event_ts_ms: self.curve_t0_event_ts_ms,
-            curve_t0_clock_source: self.curve_t0_clock_source,
-            curve_wait_elapsed_ms: self
-                .curve_t0_event_ts_ms
-                .map(|t0| self.highest_seen_ts.saturating_sub(t0)),
-            feature_snapshot: MaterializedFeatureSet::default(),
-            checkpoint_count: 0,
-            trajectory_available: false,
-            v25_shadow_decisions: Vec::new(),
-            decision_eval_snapshots: self.decision_eval_snapshots.clone(),
-            trajectory: None,
-            pdd_assessment: None,
-            aps_diagnostics: None,
-            observation_stage: None,
-            entry_drift_pct: None,
-            entry_drift_anchor_quality: None,
-            adaptive_thresholds_applied: false,
-            v25_confidence: None,
-        };
-        assessment.trajectory = self.materialize_trajectory(&self.config.tas);
-        assessment.pdd_assessment = Some(crate::components::gatekeeper_pdd::evaluate_pdd(
-            self,
-            &self.config.pdd,
-            None,
-        ));
         assessment
     }
 
@@ -7502,20 +7540,20 @@ impl GatekeeperBuffer {
         self.phase1_passed = true;
 
         // Run assessment + three-layer decision
-        let mut assessment = self.run_assessment();
+        let mut assessment = self.run_assessment_at(watch_now_wall_ms);
         let decision = self.compute_decision(&assessment);
-        assessment.decision = Some(decision.clone());
+        attach_policy_decision_compat_fields(&mut assessment, decision.clone(), &self.config);
 
         // ── V2.5 APS: Adaptive Prosperity diagnostics ──
-        let spike_flag = assessment
+        let spike_signal = assessment
             .pdd_assessment
             .as_ref()
-            .map_or(false, |p| p.spike_detected);
+            .map_or(PddSignalObservation::not_applicable(), |p| p.spike_signal);
         assessment.aps_diagnostics = Some(
             crate::components::gatekeeper_adaptive_prosperity::evaluate_aps(
                 &assessment,
                 &self.config.aps,
-                spike_flag,
+                spike_signal,
             ),
         );
 
@@ -7596,54 +7634,67 @@ impl GatekeeperBuffer {
         let phases_passed = assessment.phases_passed.min(6);
 
         // ── V2.5 PDD: Pump & Dump hard veto (shadow) ──
-        if let Some(ref pdd) = assessment.pdd_assessment {
-            if pdd.hard_fail.is_some() {
-                let fail_tag = pdd.hard_fail.as_ref().unwrap().as_str();
-                confidence = 0.0;
-                assessment.v25_confidence = Some(0.0);
-                let shadow = ShadowV25Decision {
-                    kind: ShadowDecisionKind::RejectPumpAndDump,
-                    window: stage,
-                    elapsed_ms,
-                    confidence,
-                    phases_passed,
-                    reason_code: pdd.hard_fail.as_ref().map(|fail| match fail {
-                        PddHardFail::EntryDrift => GatekeeperReasonCode::RejectPddEntryDrift,
-                        PddHardFail::Spike => GatekeeperReasonCode::RejectPddSpike,
-                        PddHardFail::Ramping => GatekeeperReasonCode::RejectPddRamping,
-                        PddHardFail::Whale => GatekeeperReasonCode::RejectPddWhale,
-                        PddHardFail::Reserve => GatekeeperReasonCode::RejectPddReserve,
-                        PddHardFail::FlashCrash => GatekeeperReasonCode::RejectPddFlashCrash,
-                    }),
-                    reason: format!(
+        if let Some(pdd_hard_fail) = assessment
+            .pdd_assessment
+            .as_ref()
+            .and_then(|pdd| pdd.hard_fail.clone())
+        {
+            let pdd_reason = assessment
+                .pdd_assessment
+                .as_ref()
+                .map(|pdd| {
+                    format!(
                         "PDD_{}: drift={:?} spike={} ramping={} whale={:?} reserve={} flash={}",
-                        fail_tag,
+                        pdd_hard_fail.as_str(),
                         pdd.entry_drift_pct,
                         pdd.spike_detected,
                         pdd.ramping_detected,
                         pdd.whale_top3_pct,
                         pdd.reserve_health_pass,
                         pdd.flash_crash_risk
-                    ),
-                };
-                self.record_shadow_decision_eval_snapshot(
-                    &assessment,
-                    stage,
-                    source,
-                    elapsed_ms,
-                    &shadow,
-                );
-                self.upsert_shadow_decision(shadow);
-                return ShadowCheckpointOutcome::Finalized;
-            }
+                    )
+                })
+                .unwrap_or_else(|| format!("PDD_{}", pdd_hard_fail.as_str()));
+
+            confidence = 0.0;
+            assessment.cache_v25_confidence(&self.config);
+            let shadow = ShadowV25Decision {
+                kind: ShadowDecisionKind::RejectPumpAndDump,
+                window: stage,
+                elapsed_ms,
+                confidence,
+                phases_passed,
+                reason_code: Some(match pdd_hard_fail {
+                    PddHardFail::EntryDrift => GatekeeperReasonCode::RejectPddEntryDrift,
+                    PddHardFail::Spike => GatekeeperReasonCode::RejectPddSpike,
+                    PddHardFail::Ramping => GatekeeperReasonCode::RejectPddRamping,
+                    PddHardFail::Whale => GatekeeperReasonCode::RejectPddWhale,
+                    PddHardFail::Reserve => GatekeeperReasonCode::RejectPddReserve,
+                    PddHardFail::FlashCrash => GatekeeperReasonCode::RejectPddFlashCrash,
+                }),
+                reason: pdd_reason,
+            };
+            self.record_shadow_decision_eval_snapshot(
+                &assessment,
+                stage,
+                source,
+                elapsed_ms,
+                &shadow,
+            );
+            self.upsert_shadow_decision(shadow);
+            return ShadowCheckpointOutcome::Finalized;
+        }
+        if let Some(ref pdd) = assessment.pdd_assessment {
             if stage != ObservationStage::Extended {
                 // Soft penalty: reduce legacy Early/Normal confidence proportionally to pdd_score.
                 confidence *= pdd.pdd_score;
             }
         }
 
-        // Cache final confidence on assessment for JSONL telemetry
-        assessment.v25_confidence = Some(confidence);
+        // Cache only the canonical V2.5 confidence on the assessment. Early/Normal
+        // keep using the local legacy stage confidence for DOW thresholds, but that
+        // score must not masquerade as canonical `v25_confidence` telemetry.
+        assessment.cache_v25_confidence(&self.config);
 
         // ── Stage-specific criteria ──
         let (kind, reason, reason_code) = match stage {
@@ -8361,7 +8412,7 @@ impl GatekeeperBuffer {
     pub fn reject_hard_fail(&mut self, reason: String) -> GatekeeperVerdict {
         self.rejected = true;
         let mut assessment = self.run_assessment();
-        assessment.decision = Some(GatekeeperDecision {
+        let decision = GatekeeperDecision {
             hard_fail_reason: Some(reason.clone()),
             core1_passed: false,
             core2_passed: false,
@@ -8383,7 +8434,8 @@ impl GatekeeperBuffer {
             reason_chain: reason.clone(),
             reason_code: Some(GatekeeperReasonCode::RejectCoreFail),
             gatekeeper_strength: None,
-        });
+        };
+        attach_policy_decision_compat_fields(&mut assessment, decision, &self.config);
         GatekeeperVerdict::Reject { assessment, reason }
     }
 
@@ -8399,8 +8451,13 @@ impl GatekeeperBuffer {
         }
 
         if self.config.mode != GatekeeperMode::Long {
-            let now_ms = wall_clock_ms.max(self.highest_seen_ts);
-            self.highest_seen_ts = now_ms;
+            let now_ms = wall_clock_ms;
+            let now_event_ms = if self.highest_seen_ts == 0 {
+                self.highest_seen_ts = wall_clock_ms;
+                wall_clock_ms
+            } else {
+                self.highest_seen_ts
+            };
 
             if let Some(v) = self.check_standard_deadline(now_ms) {
                 return v;
@@ -8409,7 +8466,7 @@ impl GatekeeperBuffer {
             // In standard mode, honour the curve deadline during sweep.
             // Use highest_seen_ts (event-time) for the comparison — wall_clock_ms
             // is only a fallback when no events have been ingested yet.
-            let now_event = now_ms;
+            let now_event = now_event_ms;
             if !self.rejected && !self.curve_ready {
                 if let Some(v) = self.check_curve_latch(now_event) {
                     match &v {
@@ -8423,8 +8480,10 @@ impl GatekeeperBuffer {
             }
             return GatekeeperVerdict::Wait;
         }
-        let now_ms = wall_clock_ms.max(self.highest_seen_ts);
-        self.highest_seen_ts = now_ms;
+        let now_ms = wall_clock_ms;
+        if self.highest_seen_ts == 0 {
+            self.highest_seen_ts = wall_clock_ms;
+        }
         self.check_long_deadline(now_ms)
     }
 
@@ -8467,7 +8526,7 @@ impl GatekeeperBuffer {
                 }
                 _ => {
                     // evaluate_phases returned Wait (not enough phases) → Reject at deadline
-                    let mut assessment = self.run_assessment();
+                    let mut assessment = self.run_assessment_at(now_ms);
                     let breakdown = Self::format_phase_breakdown(&assessment);
                     let reason = format!(
                         "TIMEOUT: {}/{} phases {}",
@@ -8506,9 +8565,7 @@ impl GatekeeperBuffer {
         let decision_reason_chain = timeout_decision.reason_chain.clone();
         let decision_reason_code = timeout_decision.reason_code;
         assessment.terminal_reason_code = decision_reason_code;
-        assessment.hard_reject_reason = timeout_decision.hard_fail_reason.clone();
-        assessment.decision = Some(timeout_decision);
-        assessment.cache_v25_confidence(&self.config);
+        attach_policy_decision_compat_fields(&mut assessment, timeout_decision, &self.config);
         self.rejected = true;
         let breakdown = Self::format_phase_breakdown(&assessment);
         let elapsed_ms = now_ms.saturating_sub(self.registered_wall_ts_ms);
@@ -8608,9 +8665,7 @@ impl GatekeeperBuffer {
             let decision_reason_chain = timeout_decision.reason_chain.clone();
             let decision_reason_code = timeout_decision.reason_code;
             assessment.terminal_reason_code = decision_reason_code;
-            assessment.hard_reject_reason = timeout_decision.hard_fail_reason.clone();
-            assessment.decision = Some(timeout_decision);
-            assessment.cache_v25_confidence(&self.config);
+            attach_policy_decision_compat_fields(&mut assessment, timeout_decision, &self.config);
             self.rejected = true;
             let breakdown = Self::format_phase_breakdown(&assessment);
             if matches!(decision_verdict_type, GatekeeperVerdictType::RejectHardFail) {
@@ -8676,7 +8731,7 @@ impl GatekeeperBuffer {
         self.eval_count += 1;
         self.last_eval_at_count = Some(self.total_tx_count);
 
-        let mut assessment = self.run_assessment();
+        let mut assessment = self.run_assessment_at(now_ms);
         let breakdown = Self::format_phase_breakdown(&assessment);
 
         // ── Three-Layer Decision System ──
@@ -8687,8 +8742,8 @@ impl GatekeeperBuffer {
             let verdict_buy = decision.verdict_buy;
             let verdict_tag = decision.verdict_type.tag();
             let reason_chain = decision.reason_chain.clone();
-            assessment.decision = Some(decision);
-            assessment.cache_v25_confidence(&self.config);
+            let reason_code = decision.reason_code;
+            attach_policy_decision_compat_fields(&mut assessment, decision, &self.config);
 
             // ── V2.5 Extended shadow verdict (terminal deadline, 7-10s) ──
             // Timer-aware: if the DOW timer already fired Extended, we skip.
@@ -8863,15 +8918,46 @@ impl GatekeeperBuffer {
                 now_ms,
                 "deadline",
                 Some(verdict_tag.to_string()),
-                None,
+                reason_code.map(GatekeeperReasonCode::as_log_str),
                 Some(reason.clone()),
             );
             return GatekeeperVerdict::Reject { assessment, reason };
         }
 
         // ── Legacy Decision System (phases_passed) ──
-        // In long mode we do NOT honour hard-rejects — we simply check phase count
-        // (the hard-reject data is still in the assessment for logging).
+        let hard_fail_decision = self.compute_decision(&assessment);
+        if matches!(
+            hard_fail_decision.verdict_type,
+            GatekeeperVerdictType::RejectHardFail
+        ) {
+            let verdict_tag = hard_fail_decision.verdict_type.tag();
+            let reason = format!(
+                "LONG DEADLINE: {} {}",
+                hard_fail_decision.reason_chain, breakdown
+            );
+            let reason_code = hard_fail_decision.reason_code;
+            attach_policy_decision_compat_fields(&mut assessment, hard_fail_decision, &self.config);
+            self.rejected = true;
+            tracing::info!(
+                pool = %self.pool_id,
+                reason = %reason,
+                phases = %breakdown,
+                mode = "long",
+                "🚫 GATEKEEPER V2 LONG REJECTED (Hard Reject) {}",
+                breakdown
+            );
+            self.record_deadline_finalize_metrics("long", "reject", now_ms);
+            self.attach_terminal_decision_eval_snapshot(
+                &mut assessment,
+                now_ms,
+                "deadline",
+                Some(verdict_tag.to_string()),
+                reason_code.map(GatekeeperReasonCode::as_log_str),
+                Some(reason.clone()),
+            );
+            return GatekeeperVerdict::Reject { assessment, reason };
+        }
+
         if assessment.phases_passed >= self.config.min_phases_to_pass {
             // Curve readiness latch (long mode, legacy)
             if let Some(curve_v) = self.check_curve_latch(now_ms) {
@@ -8937,7 +9023,14 @@ impl GatekeeperBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ghost_brain::config::GatekeeperV2Config;
+    use ghost_brain::config::{GatekeeperMode, GatekeeperV2Config};
+    use ghost_core::account_state_core::types::{AccountStateFeatures, StatePhase};
+    use ghost_core::checkpoint::{
+        CheckpointDerivedFeatures, CurveReadinessFeatures, MaterializedFeatureSet, TrendDirection,
+    };
+    use ghost_core::session::types::{SessionId, SessionMetadata};
+    use ghost_core::tx_intelligence::types::TxIntelFeatures;
+    use ghost_core::{CurveFinality, CurveFreshnessState};
     use seer::types::RawBytesMissingReason;
 
     fn create_v2_mock_tx(timestamp_ms: u64, signature: &str) -> PoolTransaction {
@@ -10505,14 +10598,20 @@ mod tests {
 
         let assessment = gk.run_assessment();
         assert!(
-            assessment.hard_reject_reason.is_some(),
-            "Dev sell should trigger hard reject"
+            assessment.hard_reject_reason.is_none(),
+            "run_assessment() must stay evidence-only for dev-sell case"
         );
-        assert!(assessment
-            .hard_reject_reason
-            .as_ref()
-            .unwrap()
-            .contains("Dev wallet sold"));
+        let decision = gk.compute_decision(&assessment);
+        assert_eq!(decision.verdict_type, GatekeeperVerdictType::RejectHardFail);
+        assert_eq!(
+            decision.reason_code,
+            Some(GatekeeperReasonCode::HardFailDevSold)
+        );
+        assert!(decision
+            .hard_fail_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("dev_has_sold"));
     }
 
     #[test]
@@ -10537,14 +10636,20 @@ mod tests {
 
         let assessment = gk.run_assessment();
         assert!(
-            assessment.hard_reject_reason.is_some(),
-            "HHI=1.0 should trigger hard reject"
+            assessment.hard_reject_reason.is_none(),
+            "run_assessment() must stay evidence-only for HHI hard-fail"
         );
-        assert!(assessment
-            .hard_reject_reason
-            .as_ref()
-            .unwrap()
-            .contains("Extreme signer concentration"));
+        let decision = gk.compute_decision(&assessment);
+        assert_eq!(decision.verdict_type, GatekeeperVerdictType::RejectHardFail);
+        assert_eq!(
+            decision.reason_code,
+            Some(GatekeeperReasonCode::HardFailExtremeHhi)
+        );
+        assert!(decision
+            .hard_fail_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("hhi="));
     }
 
     #[test]
@@ -10556,7 +10661,13 @@ mod tests {
         cfg.min_buy_count = 5;
         cfg.max_wait_time_ms = 30_000;
         cfg.reject_on_dev_sell = false;
+        cfg.hard_fail_hhi = 1.0; // isolate extreme-bot timing from unrelated HHI hard-fail
+        cfg.hard_fail_same_ms_tx_ratio = 1.0; // isolate extreme-bot timing from bundling hard-fail
+        cfg.hard_fail_top3_volume_pct = 1.0; // isolate extreme-bot timing from whale-dominance hard-fail
+        cfg.hard_fail_bot_min_tx = 10; // align fixture with bot hard-fail contract
+        cfg.hard_fail_bot_min_observation_ms = 100; // 10 tx @ 20ms spans 180ms
         let mut gk = GatekeeperBuffer::new(pool_id, &cfg);
+        gk.set_registered_wall_t0(1_000);
 
         // 10 TX at 20ms intervals from unique signers → CoV≈0, avg=20ms < 30ms
         for i in 0..10 {
@@ -10568,14 +10679,20 @@ mod tests {
 
         let assessment = gk.run_assessment();
         assert!(
-            assessment.hard_reject_reason.is_some(),
-            "Extreme bot timing should trigger hard reject"
+            assessment.hard_reject_reason.is_none(),
+            "run_assessment() must stay evidence-only for extreme bot timing"
         );
-        assert!(assessment
-            .hard_reject_reason
-            .as_ref()
-            .unwrap()
-            .contains("Extreme bot timing"));
+        let decision = gk.compute_decision(&assessment);
+        assert_eq!(decision.verdict_type, GatekeeperVerdictType::RejectHardFail);
+        assert_eq!(
+            decision.reason_code,
+            Some(GatekeeperReasonCode::HardFailExtremeBotTiming)
+        );
+        assert!(decision
+            .hard_fail_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("extreme_bot"));
     }
 
     #[test]
@@ -10608,21 +10725,20 @@ mod tests {
 
         let assessment = gk.run_assessment();
         assert!(
-            assessment.hard_reject_reason.is_some(),
-            "Price manipulation >50% should trigger hard reject"
+            assessment.hard_reject_reason.is_none(),
+            "run_assessment() must stay evidence-only for price-manipulation hard-fail"
         );
-        assert!(
-            assessment
-                .hard_reject_reason
-                .as_ref()
-                .unwrap()
-                .contains("price manipulation")
-                || assessment
-                    .hard_reject_reason
-                    .as_ref()
-                    .unwrap()
-                    .contains("Extreme")
+        let decision = gk.compute_decision(&assessment);
+        assert_eq!(decision.verdict_type, GatekeeperVerdictType::RejectHardFail);
+        assert_eq!(
+            decision.reason_code,
+            Some(GatekeeperReasonCode::HardFailTxPriceImpact)
         );
+        assert!(decision
+            .hard_fail_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("tx_price_impact"));
     }
 
     #[test]
@@ -10795,6 +10911,520 @@ mod tests {
         tx.market_cap_sol = market_cap;
         tx.curve_data_known = v_tokens.is_some() && v_sol.is_some();
         tx
+    }
+
+    fn ingest_tracking(buf: &mut GatekeeperBuffer, tx: PoolTransaction) {
+        let _ = buf.ingest_transaction_tracking_only(Arc::new(tx));
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum HardFailSsotCase {
+        DevSold,
+        Hhi,
+        BotTiming,
+        SlowPool,
+        TxPriceImpact,
+        FailedTxRatio,
+    }
+
+    impl HardFailSsotCase {
+        const ALL: [Self; 6] = [
+            Self::DevSold,
+            Self::Hhi,
+            Self::BotTiming,
+            Self::SlowPool,
+            Self::TxPriceImpact,
+            Self::FailedTxRatio,
+        ];
+
+        fn reason_code(self) -> GatekeeperReasonCode {
+            match self {
+                Self::DevSold => GatekeeperReasonCode::HardFailDevSold,
+                Self::Hhi => GatekeeperReasonCode::HardFailExtremeHhi,
+                Self::BotTiming => GatekeeperReasonCode::HardFailExtremeBotTiming,
+                Self::SlowPool => GatekeeperReasonCode::HardFailSlowPool,
+                Self::TxPriceImpact => GatekeeperReasonCode::HardFailTxPriceImpact,
+                Self::FailedTxRatio => GatekeeperReasonCode::HardFailFailedTxRatio,
+            }
+        }
+
+        fn reason_fragment(self) -> &'static str {
+            match self {
+                Self::DevSold => "dev_has_sold",
+                Self::Hhi => "hhi=1.000",
+                Self::BotTiming => "extreme_bot",
+                Self::SlowPool => "avg_interval=1500ms",
+                Self::TxPriceImpact => "tx_price_impact=102.0%",
+                Self::FailedTxRatio => "failed_tx_ratio=0.33",
+            }
+        }
+    }
+
+    fn hard_fail_ssot_config(
+        use_three_layer_decision: bool,
+        mode: GatekeeperMode,
+    ) -> GatekeeperV2Config {
+        let mut cfg = GatekeeperV2Config::default();
+        cfg.mode = mode;
+        cfg.use_three_layer_decision = use_three_layer_decision;
+        cfg.min_tx_count = 6;
+        cfg.min_unique_signers = 1;
+        cfg.min_buy_count = 1;
+        cfg.max_wait_time_ms = 20_000;
+        cfg.min_phases_to_pass = 4;
+        cfg.min_sol_threshold = 0.005;
+        cfg.min_interval_cv = 0.05;
+        cfg.max_interval_cv = 9999.0;
+        cfg.max_burst_ratio = 0.95;
+        cfg.min_avg_interval_ms = 1.0;
+        cfg.max_avg_interval_ms = 1_000.0;
+        cfg.min_timing_entropy = 0.1;
+        cfg.max_timing_entropy = 9999.0;
+        cfg.min_dust_filtered_count = 0;
+        cfg.min_unique_ratio = 0.0;
+        cfg.max_unique_ratio = 1.0;
+        cfg.max_hhi = 0.99;
+        cfg.max_tx_per_signer = 10;
+        cfg.min_volume_gini = 0.0;
+        cfg.max_volume_gini = 1.0;
+        cfg.max_top3_volume_pct = 1.0;
+        cfg.max_same_ms_tx_ratio = 1.0;
+        cfg.min_buy_ratio = 0.0;
+        cfg.max_buy_ratio = 1.0;
+        cfg.min_avg_tx_sol = 0.01;
+        cfg.max_avg_tx_sol = 100.0;
+        cfg.min_volume_cv = 0.0;
+        cfg.max_volume_cv = 9999.0;
+        cfg.min_total_volume_sol = 0.1;
+        cfg.max_total_volume_sol = 9999.0;
+        cfg.min_sol_buy_ratio = 0.0;
+        cfg.min_consecutive_buys = 0;
+        cfg.max_dev_buy_sol = 20.0;
+        cfg.min_dev_buy_sol = 0.0;
+        cfg.max_dev_tx_ratio = 1.0;
+        cfg.min_dev_tx_ratio = 0.0;
+        cfg.max_dev_volume_ratio = 1.0;
+        cfg.min_dev_volume_ratio = 0.0;
+        cfg.reject_on_dev_sell = true;
+        cfg.max_price_change_ratio = 10.0;
+        cfg.max_single_tx_price_impact_pct = 40.0;
+        cfg.max_single_sell_impact_pct = 100.0;
+        cfg.max_bonding_progress_pct = 100.0;
+        cfg.min_bonding_progress_pct = 0.0;
+        cfg.min_market_cap_sol = 5.0;
+        cfg.hard_fail_hhi = 0.50;
+        cfg.hard_fail_same_ms_tx_ratio = 0.90;
+        cfg.hard_fail_top3_volume_pct = 0.95;
+        cfg.hard_fail_bot_min_tx = 6;
+        cfg.hard_fail_bot_min_observation_ms = 500;
+        cfg.min_failed_tx_ratio_for_bot_flag = Some(0.30);
+        cfg.curve_wait_ms = 0;
+        cfg.curve_require_for_buy = false;
+        cfg
+    }
+
+    fn base_hard_fail_feature_set() -> MaterializedFeatureSet {
+        MaterializedFeatureSet {
+            account_features: AccountStateFeatures {
+                current_reserves: (40_000_000_000, 1_000_000_000),
+                price_sol: 0.00004,
+                market_cap_sol: 25.0,
+                bonding_progress: 0.20,
+                price_change_since_t0_pct: 8.0,
+                reserve_velocity_sol_per_sec: 1.2,
+                is_bootstrap: false,
+                curve_finality: CurveFinality::Finalized,
+                state_phase: StatePhase::Canonical,
+                update_count: 4,
+            },
+            tx_intel_features: TxIntelFeatures {
+                tx_count: 8,
+                buy_count: 7,
+                sell_count: 1,
+                unique_signers: 8,
+                buy_ratio: 0.875,
+                sol_buy_ratio: 0.88,
+                avg_tx_sol: 1.0,
+                volume_cv: 0.20,
+                hhi: 0.20,
+                volume_gini: 0.25,
+                unique_signer_ratio: 1.0,
+                avg_tx_per_signer: 1.0,
+                same_ms_tx_ratio: 0.05,
+                bundle_suspicion_ratio: 0.0,
+                top3_signer_volume_ratio: Some(0.45),
+                top3_volume_pct: 0.45,
+                dev_buy_sol: 0.5,
+                dev_volume_ratio: 0.08,
+                dev_tx_ratio: 0.12,
+                dev_has_sold: false,
+                interval_cv: 0.40,
+                timing_entropy: 1.5,
+                avg_interval_ms: 160.0,
+                burst_ratio: 0.10,
+                dust_ratio: 0.0,
+                max_tx_per_signer: 1,
+                total_volume_sol: 8.0,
+                min_tx_sol: 0.2,
+                max_tx_sol: 1.5,
+                max_consecutive_buys: 4,
+                dev_wallet_known: true,
+                dev_initial_buy_tokens: Some(100_000.0),
+                dev_tx_count: 1,
+                dev_is_first_buyer: true,
+                dust_tx_count: 0,
+                failed_tx_count: 0,
+            },
+            checkpoint_features: CheckpointDerivedFeatures {
+                price_trajectory: vec![0.00004, 0.000042, 0.000044],
+                reserve_trajectory: vec![
+                    (38_000_000_000, 1_050_000_000),
+                    (39_000_000_000, 1_020_000_000),
+                    (40_000_000_000, 1_000_000_000),
+                ],
+                buy_pressure_trend: TrendDirection::Rising,
+                signer_diversity_trend: TrendDirection::Stable,
+                risk_flag_count_trend: TrendDirection::Stable,
+                trajectory_checkpoint_count: 3,
+                price_change_from_first_checkpoint_pct: 8.0,
+                single_tx_max_price_impact_pct: 12.0,
+                max_single_sell_impact_pct: 8.0,
+                bonding_progress: 0.20,
+                trajectory_assessment: None,
+            },
+            session_metadata: SessionMetadata {
+                session_id: SessionId(99),
+                pool_amm_id: Pubkey::new_unique(),
+                base_mint: Pubkey::new_unique(),
+                observation_duration_ms: 2_000,
+                is_dev_known: true,
+            },
+            curve_readiness: CurveReadinessFeatures {
+                is_ready: true,
+                freshness: CurveFreshnessState::Fresh,
+                finality: CurveFinality::Finalized,
+                curve_data_known: true,
+                price_sample_count: 3,
+                t0_event_ts_ms: Some(1_000),
+                wait_elapsed_ms: Some(2_000),
+            },
+            ..Default::default()
+        }
+    }
+
+    fn feature_case(case: HardFailSsotCase) -> MaterializedFeatureSet {
+        let mut features = base_hard_fail_feature_set();
+        match case {
+            HardFailSsotCase::DevSold => {
+                features.tx_intel_features.dev_has_sold = true;
+            }
+            HardFailSsotCase::Hhi => {
+                features.tx_intel_features.hhi = 1.0;
+                features.tx_intel_features.unique_signers = 1;
+                features.tx_intel_features.unique_signer_ratio = 0.125;
+                features.tx_intel_features.avg_tx_per_signer = 8.0;
+                features.tx_intel_features.max_tx_per_signer = 8;
+            }
+            HardFailSsotCase::BotTiming => {
+                features.tx_intel_features.interval_cv = 0.0;
+                features.tx_intel_features.avg_interval_ms = 20.0;
+                features.session_metadata.observation_duration_ms = 20_000;
+            }
+            HardFailSsotCase::SlowPool => {
+                features.tx_intel_features.avg_interval_ms = 1_500.0;
+            }
+            HardFailSsotCase::TxPriceImpact => {
+                features.checkpoint_features.single_tx_max_price_impact_pct = 102.0;
+                features.checkpoint_features.price_trajectory = vec![0.00004, 0.00004, 0.00008];
+                features
+                    .checkpoint_features
+                    .price_change_from_first_checkpoint_pct = 100.0;
+                features.curve_readiness.price_sample_count = 3;
+                features.curve_readiness.curve_data_known = true;
+            }
+            HardFailSsotCase::FailedTxRatio => {
+                features.tx_intel_features.failed_tx_count = 4;
+            }
+        }
+        features
+    }
+
+    fn build_runtime_hard_fail_case(
+        case: HardFailSsotCase,
+        use_three_layer_decision: bool,
+        mode: GatekeeperMode,
+    ) -> GatekeeperBuffer {
+        let cfg = hard_fail_ssot_config(use_three_layer_decision, mode);
+        let mut gk = GatekeeperBuffer::new(Pubkey::new_unique(), &cfg);
+        gk.set_registered_wall_t0(1_000);
+
+        match case {
+            HardFailSsotCase::DevSold => {
+                let mut dev_buy = make_tx(
+                    1_000,
+                    "dev_buy",
+                    "dev_wallet",
+                    true,
+                    0.5,
+                    Some(1_000_000_000.0),
+                    Some(40_000.0),
+                    Some(20.0),
+                );
+                dev_buy.is_dev_buy = true;
+                ingest_tracking(&mut gk, dev_buy);
+
+                let dev_sell = make_tx(
+                    1_200,
+                    "dev_sell",
+                    "dev_wallet",
+                    false,
+                    0.3,
+                    Some(999_000_000.0),
+                    Some(40_500.0),
+                    Some(20.0),
+                );
+                ingest_tracking(&mut gk, dev_sell);
+
+                for (idx, ts) in [1_500_u64, 1_800, 2_100, 2_400, 2_700, 3_000]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let tx = make_tx(
+                        ts,
+                        &format!("dev_ok_{idx}"),
+                        &format!("buyer_{idx}"),
+                        true,
+                        0.7,
+                        Some(998_000_000.0 - idx as f64 * 1_000_000.0),
+                        Some(41_000.0 + idx as f64 * 250.0),
+                        Some(20.0),
+                    );
+                    ingest_tracking(&mut gk, tx);
+                }
+            }
+            HardFailSsotCase::Hhi => {
+                for idx in 0..8 {
+                    let tx = make_tx(
+                        1_000 + idx as u64 * 300,
+                        &format!("hhi_{idx}"),
+                        "mono",
+                        true,
+                        1.0,
+                        Some(1_000_000_000.0 - idx as f64 * 1_000_000.0),
+                        Some(40_000.0 + idx as f64 * 500.0),
+                        Some(20.0),
+                    );
+                    ingest_tracking(&mut gk, tx);
+                }
+            }
+            HardFailSsotCase::BotTiming => {
+                for idx in 0..8 {
+                    let tx = make_tx(
+                        1_000 + idx as u64 * 20,
+                        &format!("bot_{idx}"),
+                        &format!("bot_signer_{idx}"),
+                        true,
+                        0.5 + idx as f64 * 0.05,
+                        Some(1_000_000_000.0 - idx as f64 * 500_000.0),
+                        Some(40_000.0 + idx as f64 * 100.0),
+                        Some(20.0),
+                    );
+                    ingest_tracking(&mut gk, tx);
+                }
+            }
+            HardFailSsotCase::SlowPool => {
+                for idx in 0..8 {
+                    let tx = make_tx(
+                        1_000 + idx as u64 * 1_500,
+                        &format!("slow_{idx}"),
+                        &format!("slow_signer_{idx}"),
+                        true,
+                        0.8,
+                        Some(1_000_000_000.0 - idx as f64 * 1_000_000.0),
+                        Some(40_000.0 + idx as f64 * 400.0),
+                        Some(20.0),
+                    );
+                    ingest_tracking(&mut gk, tx);
+                }
+            }
+            HardFailSsotCase::TxPriceImpact => {
+                let prices = [40_000.0, 40_000.0, 80_000.0, 80_500.0, 81_000.0, 81_500.0];
+                for (idx, price) in prices.into_iter().enumerate() {
+                    let tx = make_tx(
+                        1_000 + idx as u64 * 300,
+                        &format!("impact_{idx}"),
+                        &format!("impact_signer_{idx}"),
+                        true,
+                        1.0 + idx as f64 * 0.1,
+                        Some(1_000_000_000.0 - idx as f64 * 10_000_000.0),
+                        Some(price),
+                        Some(20.0),
+                    );
+                    ingest_tracking(&mut gk, tx);
+                }
+            }
+            HardFailSsotCase::FailedTxRatio => {
+                for idx in 0..4 {
+                    let tx = make_tx(
+                        1_000 + idx as u64 * 250,
+                        &format!("ok_{idx}"),
+                        &format!("ok_signer_{idx}"),
+                        true,
+                        0.7,
+                        Some(1_000_000_000.0 - idx as f64 * 1_000_000.0),
+                        Some(40_000.0 + idx as f64 * 200.0),
+                        Some(20.0),
+                    );
+                    ingest_tracking(&mut gk, tx);
+                }
+                for idx in 0..4 {
+                    let mut tx = make_tx(
+                        2_100 + idx as u64 * 250,
+                        &format!("failed_{idx}"),
+                        &format!("failed_signer_{idx}"),
+                        true,
+                        0.4,
+                        Some(995_000_000.0 - idx as f64 * 1_000_000.0),
+                        Some(41_000.0 + idx as f64 * 150.0),
+                        Some(20.0),
+                    );
+                    tx.success = false;
+                    ingest_tracking(&mut gk, tx);
+                }
+            }
+        }
+
+        gk
+    }
+
+    fn terminal_assessment(verdict: GatekeeperVerdict) -> GatekeeperAssessment {
+        match verdict {
+            GatekeeperVerdict::Buy { assessment, .. }
+            | GatekeeperVerdict::Reject { assessment, .. }
+            | GatekeeperVerdict::Timeout { assessment } => assessment,
+            other => panic!(
+                "expected terminal verdict, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn hard_fail_ssot_parity_across_runtime_legacy_and_feature_paths() {
+        let feature_config = hard_fail_ssot_config(true, GatekeeperMode::Standard);
+
+        for case in HardFailSsotCase::ALL {
+            let runtime_buffer = build_runtime_hard_fail_case(case, true, GatekeeperMode::Standard);
+            let runtime_assessment = runtime_buffer.run_assessment();
+            assert!(
+                runtime_assessment.hard_reject_reason.is_none(),
+                "run_assessment() must stay evidence-only; case={case:?}"
+            );
+            let runtime_decision = runtime_buffer.compute_decision(&runtime_assessment);
+            assert_eq!(
+                runtime_decision.verdict_type,
+                GatekeeperVerdictType::RejectHardFail,
+                "three-layer runtime must hard-fail; case={case:?}"
+            );
+            assert_eq!(
+                runtime_decision.reason_code,
+                Some(case.reason_code()),
+                "three-layer runtime reason_code mismatch; case={case:?}"
+            );
+            assert!(
+                runtime_decision
+                    .hard_fail_reason
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains(case.reason_fragment()),
+                "three-layer runtime reason mismatch; case={case:?} reason={:?}",
+                runtime_decision.hard_fail_reason
+            );
+
+            // PR1 parity is defined on the typed policy decision fields, not
+            // on terminally decorated legacy strings such as
+            // `LONG DEADLINE: ...`.
+            for legacy_mode in [GatekeeperMode::Standard, GatekeeperMode::Long] {
+                let mut legacy_buffer = build_runtime_hard_fail_case(case, false, legacy_mode);
+                let legacy_assessment =
+                    terminal_assessment(legacy_buffer.force_check_deadline(25_000));
+                let legacy_decision = legacy_assessment
+                    .decision
+                    .clone()
+                    .expect("legacy hard-fail path must attach typed decision");
+                assert_eq!(
+                    legacy_decision.verdict_type,
+                    GatekeeperVerdictType::RejectHardFail,
+                    "legacy path must hard-fail; case={case:?} mode={legacy_mode:?}"
+                );
+                assert_eq!(
+                    legacy_decision.reason_code, runtime_decision.reason_code,
+                    "legacy reason_code drift; case={case:?} mode={legacy_mode:?}"
+                );
+                assert_eq!(
+                    legacy_decision.hard_fail_reason, runtime_decision.hard_fail_reason,
+                    "legacy hard_fail_reason drift; case={case:?} mode={legacy_mode:?}"
+                );
+                assert_eq!(
+                    legacy_assessment.hard_reject_reason,
+                    runtime_decision.hard_fail_reason,
+                    "legacy compat field must be attached after decision; case={case:?} mode={legacy_mode:?}"
+                );
+            }
+
+            let features = feature_case(case);
+            let feature_assessment = build_assessment_from_features(
+                features.clone(),
+                &feature_config,
+                PolicyEvaluationContext::default(),
+            );
+            assert!(
+                feature_assessment.hard_reject_reason.is_none(),
+                "feature assessment must stay evidence-only; case={case:?}"
+            );
+            let feature_decision =
+                evaluate_policy_from_assessment(&feature_assessment, &feature_config);
+            assert_eq!(
+                feature_decision.verdict_type,
+                GatekeeperVerdictType::RejectHardFail,
+                "feature policy path must hard-fail; case={case:?}"
+            );
+            assert_eq!(
+                feature_decision.reason_code, runtime_decision.reason_code,
+                "feature reason_code drift; case={case:?}"
+            );
+            assert_eq!(
+                feature_decision.hard_fail_reason, runtime_decision.hard_fail_reason,
+                "feature hard_fail_reason drift; case={case:?}"
+            );
+
+            let mut compat_buffer = GatekeeperBuffer::new(Pubkey::new_unique(), &feature_config);
+            compat_buffer.set_registered_wall_t0(1_000);
+            let compat_assessment = terminal_assessment(
+                compat_buffer.evaluate_compat_from_features(features, &feature_config, true),
+            );
+            let compat_decision = compat_assessment
+                .decision
+                .clone()
+                .expect("compat path must attach typed decision");
+            assert_eq!(
+                compat_decision.verdict_type,
+                GatekeeperVerdictType::RejectHardFail,
+                "compat path must hard-fail; case={case:?}"
+            );
+            assert_eq!(
+                compat_decision.reason_code, feature_decision.reason_code,
+                "compat reason_code drift; case={case:?}"
+            );
+            assert_eq!(
+                compat_decision.hard_fail_reason, feature_decision.hard_fail_reason,
+                "compat hard_fail_reason drift; case={case:?}"
+            );
+            assert_eq!(
+                compat_assessment.hard_reject_reason, feature_decision.hard_fail_reason,
+                "compat compat-field drift; case={case:?}"
+            );
+        }
     }
 
     #[test]
@@ -11700,6 +12330,7 @@ mod tests {
                 hhi: 0.08,
                 max_tx_per_signer: 2,
                 volume_gini: 0.42,
+                top3_signer_volume_ratio: Some(0.65),
                 top3_volume_pct: 0.65,
                 same_ms_tx_ratio: 0.05,
             }),
@@ -11817,6 +12448,8 @@ mod tests {
         assert_eq!(buy_log.hhi, Some(0.08));
         assert_eq!(buy_log.max_tx_per_signer_observed, Some(2));
         assert_eq!(buy_log.volume_gini, Some(0.42));
+        assert_eq!(buy_log.top3_signer_volume_ratio, Some(0.65));
+        assert_eq!(buy_log.top3_volume_pct, Some(0.65));
 
         // Verify phase 4 measured values
         assert_eq!(buy_log.buy_ratio, Some(0.73));
@@ -12084,6 +12717,7 @@ mod tests {
                 hhi: 0.2,
                 max_tx_per_signer: 3,
                 volume_gini: 0.6,
+                top3_signer_volume_ratio: Some(0.7),
                 top3_volume_pct: 0.7,
                 same_ms_tx_ratio: 0.1,
             }),
@@ -12514,10 +13148,16 @@ mod tests {
         // Total 8 TX, 4 failed → failed_ratio = 4/8 = 0.5 > 0.3
         let assessment = gk.run_assessment();
         assert!(
-            assessment.hard_reject_reason.is_some(),
-            "Should hard reject due to high failed TX ratio (Yellowstone)"
+            assessment.hard_reject_reason.is_none(),
+            "run_assessment() must stay evidence-only for failed-tx-ratio hard-fail"
         );
-        let reason = assessment.hard_reject_reason.unwrap();
+        let decision = gk.compute_decision(&assessment);
+        assert_eq!(decision.verdict_type, GatekeeperVerdictType::RejectHardFail);
+        assert_eq!(
+            decision.reason_code,
+            Some(GatekeeperReasonCode::HardFailFailedTxRatio)
+        );
+        let reason = decision.hard_fail_reason.unwrap();
         assert!(
             reason.contains("failed TX ratio"),
             "Reason should mention failed TX ratio, got: {}",
@@ -14976,6 +15616,107 @@ mod tests {
         assert_eq!(buf.v25_shadow_decisions[1].window, ObservationStage::Normal);
     }
 
+    fn v25_confidence_test_decision(alpha_gate: AlphaGateDiagnostics) -> GatekeeperDecision {
+        GatekeeperDecision {
+            hard_fail_reason: None,
+            core1_passed: true,
+            core2_passed: true,
+            core3_passed: true,
+            soft_signals: SoftSignals {
+                low_interval_cv: false,
+                high_interval_cv: false,
+                low_timing_entropy: false,
+                high_timing_entropy: false,
+                avg_interval_out_of_range: false,
+                high_burst_ratio: false,
+                bundle_suspicion: false,
+                cabal_suspicion: false,
+                top3_dominance: false,
+                high_volume_gini: false,
+                unique_ratio_out_of_range: false,
+                high_tx_per_signer: false,
+                low_dust_count: false,
+            },
+            soft_points: 0,
+            max_soft_points_possible: 10,
+            effective_max_soft_points: 10,
+            dev_unknown: false,
+            sybil_policy: SybilPolicyDiagnostics {
+                enabled: false,
+                combo_veto_enabled: false,
+                soft_signals: SybilSoftSignals {
+                    low_ftdi: false,
+                    high_dbia: false,
+                    low_sfd: false,
+                    low_des: false,
+                    high_cpv: false,
+                    high_fsc: false,
+                },
+                soft_points: 0,
+                max_soft_points_possible: 255,
+                effective_max_soft_points: 255,
+                lead_signal: None,
+                interference_patterns: vec![],
+                meta_score: None,
+                metric_degraded_reasons: vec![],
+            },
+            selector_soft_score: SelectorSoftScoreDiagnostics::default(),
+            alpha_gate,
+            prosperity_filter: ProsperityFilterDiagnostics::not_run(false),
+            total_soft_points: 0,
+            verdict_type: GatekeeperVerdictType::Buy,
+            verdict_buy: true,
+            reason_chain: "clean_core".to_string(),
+            reason_code: None,
+            gatekeeper_strength: None,
+        }
+    }
+
+    fn v25_confidence_test_assessment(alpha_gate: AlphaGateDiagnostics) -> GatekeeperAssessment {
+        GatekeeperAssessment {
+            phase1_passed: true,
+            phase2_velocity: None,
+            phase2_passed: true,
+            phase3_diversity: None,
+            phase3_passed: true,
+            phase4_volume: None,
+            phase4_passed: true,
+            phase5_dev: None,
+            phase5_passed: true,
+            phase6_curve: None,
+            phase6_passed: true,
+            phases_passed: 6,
+            hard_reject_reason: None,
+            total_tx_evaluated: 30,
+            unique_tx_evaluated: 30,
+            unique_signers_evaluated: 20,
+            observation_duration_ms: 5000,
+            finalize_lag_ms: 0,
+            dust_filtered_count: 0,
+            eval_count: 1,
+            buy_count: 15,
+            decision: Some(v25_confidence_test_decision(alpha_gate)),
+            terminal_reason_code: None,
+            early_fingerprint: None,
+            curve_t0_event_ts_ms: None,
+            curve_t0_clock_source: None,
+            curve_wait_elapsed_ms: None,
+            feature_snapshot: MaterializedFeatureSet::default(),
+            checkpoint_count: 0,
+            trajectory_available: false,
+            v25_shadow_decisions: Vec::new(),
+            decision_eval_snapshots: Vec::new(),
+            trajectory: None,
+            pdd_assessment: None,
+            aps_diagnostics: None,
+            observation_stage: None,
+            entry_drift_pct: None,
+            entry_drift_anchor_quality: None,
+            adaptive_thresholds_applied: false,
+            v25_confidence: None,
+        }
+    }
+
     #[test]
     fn test_v25_confidence_computation() {
         let test_config = GatekeeperV2Config::default();
@@ -15095,6 +15836,10 @@ mod tests {
         let conf = assessment.v25_confidence(&test_config).unwrap();
         // base_quality=1.0 * alpha_quality=1.0 * pdd=1.0 * tas=1.0 * sybil=1.0 = 1.0
         assert!(conf > 0.95, "Expected confidence > 0.95, got {:.4}", conf);
+        let breakdown = assessment.v25_confidence_breakdown(&test_config).unwrap();
+        assert_eq!(breakdown.alpha_quality, 1.0);
+        assert_eq!(breakdown.alpha_status, "neutral_disabled");
+        assert_eq!(breakdown.alpha_unavailable_reason, None);
 
         // Lower phases_passed reduces base_quality → lower confidence
         assessment.phases_passed = 3; // base_quality = 3/6 = 0.5
@@ -15129,6 +15874,195 @@ mod tests {
             (conf3 - 0.0).abs() < f64::EPSILON,
             "TAS extreme → 0.0, got {:.4}",
             conf3
+        );
+    }
+
+    #[test]
+    fn test_v25_confidence_alpha_disabled_is_neutral_not_real_quality() {
+        let mut cfg = GatekeeperV2Config::default();
+        cfg.enable_alpha_gate = false;
+        cfg.v25.shadow_enabled = true;
+
+        let mut assessment = v25_confidence_test_assessment(AlphaGateDiagnostics::not_run(false));
+        assessment.cache_v25_confidence(&cfg);
+
+        assert_eq!(assessment.v25_confidence, Some(1.0));
+        assert_eq!(
+            assessment.v25_confidence_availability(&cfg),
+            (Some(true), None)
+        );
+        let breakdown = assessment.v25_confidence_breakdown(&cfg).unwrap();
+        assert_eq!(breakdown.alpha_quality, 1.0);
+        assert_eq!(breakdown.alpha_status, "neutral_disabled");
+        assert_eq!(breakdown.alpha_unavailable_reason, None);
+
+        let buy_log = assessment.to_buy_log(&Pubkey::new_unique(), &cfg);
+        assert_eq!(buy_log.v25_confidence_alpha_quality, Some(1.0));
+        assert_eq!(
+            buy_log.v25_confidence_alpha_status.as_deref(),
+            Some("neutral_disabled")
+        );
+        assert_eq!(buy_log.v25_confidence_alpha_unavailable_reason, None);
+    }
+
+    #[test]
+    fn test_v25_confidence_alpha_insufficient_sample_is_unavailable_not_zero() {
+        let mut cfg = GatekeeperV2Config::default();
+        cfg.enable_alpha_gate = true;
+        cfg.v25.shadow_enabled = true;
+
+        let mut assessment = v25_confidence_test_assessment(AlphaGateDiagnostics::skipped(
+            true,
+            "insufficient_sample",
+        ));
+        assessment.cache_v25_confidence(&cfg);
+
+        assert_eq!(assessment.v25_confidence, None);
+        assert_eq!(assessment.v25_confidence_breakdown(&cfg), None);
+        assert_eq!(
+            assessment.v25_confidence_availability(&cfg),
+            (
+                Some(false),
+                Some(ALPHA_CONFIDENCE_INSUFFICIENT_SAMPLE_REASON.to_string())
+            )
+        );
+
+        let buy_log = assessment.to_buy_log(&Pubkey::new_unique(), &cfg);
+        assert_eq!(buy_log.v25_confidence, None);
+        assert_eq!(buy_log.v25_confidence_available, Some(false));
+        assert_eq!(
+            buy_log.v25_confidence_unavailable_reason.as_deref(),
+            Some(ALPHA_CONFIDENCE_INSUFFICIENT_SAMPLE_REASON)
+        );
+        assert_eq!(buy_log.v25_confidence_alpha_quality, None);
+        assert_eq!(
+            buy_log.v25_confidence_alpha_status.as_deref(),
+            Some("unavailable")
+        );
+        assert_eq!(
+            buy_log.v25_confidence_alpha_unavailable_reason.as_deref(),
+            Some(ALPHA_CONFIDENCE_INSUFFICIENT_SAMPLE_REASON)
+        );
+    }
+
+    #[test]
+    fn test_v25_confidence_alpha_missing_inputs_is_unavailable_not_zero() {
+        let mut cfg = GatekeeperV2Config::default();
+        cfg.enable_alpha_gate = true;
+        cfg.v25.shadow_enabled = true;
+
+        let mut assessment = v25_confidence_test_assessment(AlphaGateDiagnostics::skipped(
+            true,
+            "missing_alpha_inputs",
+        ));
+        assessment.cache_v25_confidence(&cfg);
+
+        assert_eq!(assessment.v25_confidence, None);
+        assert_eq!(
+            assessment.v25_confidence_availability(&cfg),
+            (
+                Some(false),
+                Some(ALPHA_CONFIDENCE_MISSING_INPUTS_REASON.to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn test_v25_confidence_alpha_actionable_uses_measured_quality() {
+        let mut cfg = GatekeeperV2Config::default();
+        cfg.enable_alpha_gate = true;
+        cfg.v25.shadow_enabled = true;
+
+        let assessment = v25_confidence_test_assessment(AlphaGateDiagnostics::evaluated(
+            true, 0.80, 0.70, 0.56, true, None,
+        ));
+
+        let breakdown = assessment.v25_confidence_breakdown(&cfg).unwrap();
+        let expected_alpha_quality = 0.80 * 0.40 + 0.70 * 0.35 + 0.56 * 0.25;
+        assert!((breakdown.alpha_quality - expected_alpha_quality).abs() < f64::EPSILON);
+        assert_eq!(breakdown.alpha_status, "available");
+        assert_eq!(breakdown.alpha_unavailable_reason, None);
+        assert_eq!(
+            assessment.v25_confidence_availability(&cfg),
+            (Some(true), None)
+        );
+    }
+
+    #[test]
+    fn test_early_shadow_stage_confidence_does_not_populate_canonical_v25_confidence() {
+        let mut cfg = organic_flow_config();
+        cfg.v25.shadow_enabled = true;
+        cfg.dow.enabled = true;
+        cfg.dow.early_entry_min_ms = 2_000;
+        cfg.dow.early_entry_max_ms = 5_000;
+        cfg.dow.early_entry_min_tx_count = 5;
+        cfg.dow.early_entry_min_confidence = 0.0;
+        cfg.enable_alpha_gate = true;
+        cfg.min_alpha_sample = 999;
+        cfg.pdd.enabled = false;
+        cfg.tas.enabled = false;
+
+        let mut buf = GatekeeperBuffer::new(Pubkey::new_unique(), &cfg);
+        buf.set_registered_wall_t0(1_000);
+
+        for i in 0..10 {
+            let tx = make_tx(
+                1_000 + i as u64 * 250,
+                &format!("alpha_skip_stage_{}", i),
+                &format!("alpha_skip_signer_{}", i),
+                true,
+                0.6 + (i as f64) * 0.05,
+                Some(1_073_000_000.0 - (i as f64) * 1_000_000.0),
+                Some(30.0 + (i as f64) * 0.4),
+                Some(30.0 + (i as f64) * 0.4),
+            );
+            let _ = buf.on_transaction(Arc::new(tx));
+        }
+
+        let outcome = buf.try_shadow_evaluate(
+            4_000,
+            ObservationStage::Early,
+            ShadowCheckpointSource::Timer,
+        );
+        assert_eq!(outcome, ShadowCheckpointOutcome::Finalized);
+
+        let early_shadow = buf
+            .v25_shadow_decisions()
+            .iter()
+            .find(|decision| decision.window == ObservationStage::Early)
+            .expect("early shadow decision should be recorded");
+        assert!(
+            early_shadow.confidence > 0.0,
+            "legacy stage confidence should still be computed for DOW thresholds"
+        );
+
+        let early_snapshot = buf
+            .decision_eval_snapshots()
+            .iter()
+            .find(|snapshot| {
+                snapshot
+                    .get("observation_stage")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("Early")
+            })
+            .expect("early temporal snapshot should be recorded");
+        assert!(
+            early_snapshot
+                .get("v25_confidence")
+                .is_some_and(serde_json::Value::is_null),
+            "canonical v25_confidence must stay unavailable when alpha is skipped"
+        );
+        assert_eq!(
+            early_snapshot
+                .get("v25_confidence_available")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            early_snapshot
+                .get("v25_confidence_unavailable_reason")
+                .and_then(serde_json::Value::as_str),
+            Some(ALPHA_CONFIDENCE_NOT_RUN_REASON)
         );
     }
 

@@ -136,6 +136,73 @@ fn engine_computes_hhi_gini_and_volume_cv() {
 }
 
 #[test]
+fn tx_intelligence_engine_materializes_top3_signer_volume_ratio_by_signer_volume_not_tx_count() {
+    let pool_id = Pubkey::new_unique();
+    let many_small = Pubkey::new_unique();
+    let large_a = Pubkey::new_unique();
+    let large_b = Pubkey::new_unique();
+    let large_c = Pubkey::new_unique();
+    let mut engine = make_engine(GatekeeperV2Config::default(), None);
+
+    for i in 0..4u32 {
+        engine.on_transaction(&test_tx(
+            pool_id,
+            many_small,
+            &format!("sig-small-{i}"),
+            i,
+            1_000 + u64::from(i) * 100,
+            true,
+            0.1,
+            false,
+        ));
+    }
+    engine.on_transaction(&test_tx(
+        pool_id,
+        large_a,
+        "sig-large-a",
+        10,
+        2_000,
+        true,
+        5.0,
+        false,
+    ));
+    engine.on_transaction(&test_tx(
+        pool_id,
+        large_b,
+        "sig-large-b",
+        11,
+        2_100,
+        true,
+        3.0,
+        false,
+    ));
+    engine.on_transaction(&test_tx(
+        pool_id,
+        large_c,
+        "sig-large-c",
+        12,
+        2_200,
+        true,
+        1.6,
+        false,
+    ));
+
+    let features = engine.compute_features();
+
+    assert!((features.total_volume_sol - 10.0).abs() < 1e-9);
+    assert!(
+        (features
+            .top3_signer_volume_ratio
+            .expect("top3 signer-volume ratio should be materialized")
+            - 0.96)
+            .abs()
+            < 1e-9
+    );
+    assert!((features.top3_volume_pct - 0.96).abs() < 1e-9);
+    assert!((features.effective_top3_signer_volume_ratio() - 0.96).abs() < 1e-9);
+}
+
+#[test]
 fn engine_sets_dev_sell_hard_flag() {
     let pool_id = Pubkey::new_unique();
     let dev_wallet = Pubkey::new_unique();

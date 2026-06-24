@@ -29,8 +29,19 @@ pub struct SignerDiversityProfile {
     pub hhi: f64,
     pub max_tx_per_signer: usize,
     pub volume_gini: f64,
+    /// Preferred top3 signer-volume concentration metric in ratio scale `0.0..1.0`.
+    pub top3_signer_volume_ratio: Option<f64>,
+    /// Compatibility alias for older Gatekeeper/JSONL surfaces.
     pub top3_volume_pct: f64,
     pub same_ms_tx_ratio: f64,
+}
+
+impl SignerDiversityProfile {
+    #[must_use]
+    pub fn effective_top3_signer_volume_ratio(&self) -> f64 {
+        self.top3_signer_volume_ratio
+            .unwrap_or(self.top3_volume_pct)
+    }
 }
 
 /// Phase 4: Volume sanity profile.
@@ -172,6 +183,7 @@ pub fn compute_signer_diversity(
             hhi: 0.0,
             max_tx_per_signer: 0,
             volume_gini: 0.0,
+            top3_signer_volume_ratio: None,
             top3_volume_pct: 0.0,
             same_ms_tx_ratio: 0.0,
         };
@@ -202,6 +214,7 @@ pub fn compute_signer_diversity(
     } else {
         0.0
     };
+    let top3_signer_volume_ratio = (total_volume > 0.0).then_some(top3_volume_pct);
 
     let same_ms_tx_ratio = if sorted_timestamps.len() >= 2 {
         let mut clustered_count = 0usize;
@@ -220,6 +233,7 @@ pub fn compute_signer_diversity(
         hhi,
         max_tx_per_signer,
         volume_gini,
+        top3_signer_volume_ratio,
         top3_volume_pct,
         same_ms_tx_ratio,
     }

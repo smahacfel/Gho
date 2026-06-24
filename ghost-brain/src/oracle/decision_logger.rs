@@ -90,7 +90,13 @@ pub const CYCLIC_LOG_SCHEMA_VERSION: u32 = 1;
 /// v25 adds additive FSC v2 shadow-policy counterfactual fields without verdict impact.
 /// v29 adds decision_time_series retention metadata so truncated DTW vectors
 /// cannot be mistaken for full-window clean evidence.
-pub const GATEKEEPER_BUY_LOG_SCHEMA_VERSION: u32 = 30;
+/// v31 adds typed per-signal PDD availability status/reason fields while
+/// preserving legacy bool aliases.
+/// v32 adds alpha confidence availability status/reason fields so disabled
+/// neutral alpha cannot be mistaken for measured alpha quality.
+/// v33 adds `top3_signer_volume_ratio` while preserving legacy
+/// `top3_volume_pct` as a ratio-scale compatibility alias.
+pub const GATEKEEPER_BUY_LOG_SCHEMA_VERSION: u32 = 33;
 /// Gatekeeper version string embedded in every V2.5 shadow BUY log for traceability.
 pub const GATEKEEPER_VERSION: &str = "v2.5";
 /// Legacy Gatekeeper version string for pre-V2.5 live-plane semantics.
@@ -1104,6 +1110,11 @@ pub struct GatekeeperBuyLog {
     #[serde(default)]
     pub min_volume_gini: f64,
     pub max_volume_gini: f64,
+    /// Preferred top3 concentration metric: signer-volume ratio in `0.0..1.0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top3_signer_volume_ratio: Option<f64>,
+    /// Legacy compatibility alias. Despite the historical `_pct` name, this is
+    /// ratio-scale `0.0..1.0`; PDD `pdd_whale_top3_pct` is percent-scale.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top3_volume_pct: Option<f64>,
     pub max_top3_volume_pct: f64,
@@ -2205,6 +2216,12 @@ pub struct GatekeeperBuyLog {
     /// Alpha-quality component of the V2.5 confidence model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub v25_confidence_alpha_quality: Option<f64>,
+    /// Alpha component status in the V2.5 confidence model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v25_confidence_alpha_status: Option<String>,
+    /// Why the alpha component could not be used when alpha was enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v25_confidence_alpha_unavailable_reason: Option<String>,
     /// PDD cleanliness modulator of the V2.5 confidence model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub v25_confidence_pdd_modulator: Option<f64>,
@@ -2314,6 +2331,12 @@ pub struct GatekeeperBuyLog {
     /// Volume spike pattern detected
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pdd_spike_detected: Option<bool>,
+    /// Per-signal PDD spike availability: not_applicable / available / unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdd_spike_signal_status: Option<String>,
+    /// Stable reason when PDD spike is unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdd_spike_unavailable_reason: Option<String>,
     /// Recent-vs-earlier volume-rate ratio used for spike detection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pdd_spike_ratio: Option<f64>,
@@ -2328,6 +2351,12 @@ pub struct GatekeeperBuyLog {
     /// Consecutive same-size buy ramping detected
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pdd_ramping_detected: Option<bool>,
+    /// Per-signal PDD ramping availability: not_applicable / available / unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdd_ramping_signal_status: Option<String>,
+    /// Stable reason when PDD ramping is unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdd_ramping_unavailable_reason: Option<String>,
     /// Top-3 whale volume concentration percentage
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pdd_whale_top3_pct: Option<f64>,
@@ -2337,6 +2366,12 @@ pub struct GatekeeperBuyLog {
     /// Flash crash sell cluster risk detected
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pdd_flash_crash_risk: Option<bool>,
+    /// Per-signal PDD flash-crash availability: not_applicable / available / unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdd_flash_crash_signal_status: Option<String>,
+    /// Stable reason when PDD flash-crash evaluation is unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdd_flash_crash_unavailable_reason: Option<String>,
     /// Overall PDD cleanliness score (1.0 = clean, 0.0 = hard fail)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pdd_score: Option<f64>,
@@ -4540,6 +4575,7 @@ mod tests {
             volume_gini: Some(0.45),
             min_volume_gini: 0.0,
             max_volume_gini: 0.70,
+            top3_signer_volume_ratio: Some(0.60),
             top3_volume_pct: Some(0.60),
             max_top3_volume_pct: 0.75,
             same_ms_tx_ratio: Some(0.10),
@@ -4897,6 +4933,8 @@ mod tests {
             v25_confidence_pre_veto: None,
             v25_confidence_base_quality: None,
             v25_confidence_alpha_quality: None,
+            v25_confidence_alpha_status: None,
+            v25_confidence_alpha_unavailable_reason: None,
             v25_confidence_pdd_modulator: None,
             v25_confidence_tas_modulator: None,
             v25_confidence_sybil_modulator: None,
@@ -4905,6 +4943,7 @@ mod tests {
             tas_available: None,
             tas_unavailable_reason: None,
             pdd_sequence_signals_available: None,
+            pdd_sequence_signals_unavailable_reason: None,
             pdd_price_anchor_available: None,
             v25_confidence_available: None,
             v25_confidence_unavailable_reason: None,
@@ -4929,14 +4968,20 @@ mod tests {
             pdd_entry_drift_anchor_source: None,
             pdd_entry_drift_anchor_quality: None,
             pdd_spike_detected: None,
+            pdd_spike_signal_status: None,
+            pdd_spike_unavailable_reason: None,
             pdd_spike_ratio: None,
             pdd_spike_ratio_quality: None,
             pdd_spike_recent_rate: None,
             pdd_spike_earlier_rate: None,
             pdd_ramping_detected: None,
+            pdd_ramping_signal_status: None,
+            pdd_ramping_unavailable_reason: None,
             pdd_whale_top3_pct: None,
             pdd_whale_single_max_pct: None,
             pdd_flash_crash_risk: None,
+            pdd_flash_crash_signal_status: None,
+            pdd_flash_crash_unavailable_reason: None,
             pdd_score: None,
             gatekeeper_first_kill_gate: None,
             gatekeeper_first_kill_reason: None,
@@ -4977,7 +5022,6 @@ mod tests {
             reason_code: Some(GatekeeperReasonCode::BuyNormal.as_log_str()),
             evidence_policy_context: None,
             reason_code_version: GatekeeperReasonCode::version(),
-            pdd_sequence_signals_unavailable_reason: None,
         };
 
         // Initialize the logger
@@ -5039,6 +5083,8 @@ mod tests {
         assert!(parsed.get("buy_ratio").is_some());
         assert!(parsed.get("dev_wallet_known").is_some());
         assert!(parsed.get("price_change_ratio").is_some());
+        assert_eq!(parsed["top3_signer_volume_ratio"], 0.60);
+        assert_eq!(parsed["top3_volume_pct"], 0.60);
         assert_eq!(parsed["fee_topology_diversity_index"], 0.42);
         assert_eq!(parsed["dev_buyer_infrastructure_affinity"], 0.31);
         assert_eq!(
@@ -5124,6 +5170,7 @@ mod tests {
             volume_gini: Some(0.45),
             min_volume_gini: 0.0,
             max_volume_gini: 0.70,
+            top3_signer_volume_ratio: Some(0.60),
             top3_volume_pct: Some(0.60),
             max_top3_volume_pct: 0.75,
             same_ms_tx_ratio: Some(0.10),
@@ -5473,6 +5520,8 @@ mod tests {
             v25_confidence_pre_veto: None,
             v25_confidence_base_quality: None,
             v25_confidence_alpha_quality: None,
+            v25_confidence_alpha_status: None,
+            v25_confidence_alpha_unavailable_reason: None,
             v25_confidence_pdd_modulator: None,
             v25_confidence_tas_modulator: None,
             v25_confidence_sybil_modulator: None,
@@ -5481,6 +5530,7 @@ mod tests {
             tas_available: None,
             tas_unavailable_reason: None,
             pdd_sequence_signals_available: None,
+            pdd_sequence_signals_unavailable_reason: None,
             pdd_price_anchor_available: None,
             v25_confidence_available: None,
             v25_confidence_unavailable_reason: None,
@@ -5505,14 +5555,20 @@ mod tests {
             pdd_entry_drift_anchor_source: None,
             pdd_entry_drift_anchor_quality: None,
             pdd_spike_detected: None,
+            pdd_spike_signal_status: None,
+            pdd_spike_unavailable_reason: None,
             pdd_spike_ratio: None,
             pdd_spike_ratio_quality: None,
             pdd_spike_recent_rate: None,
             pdd_spike_earlier_rate: None,
             pdd_ramping_detected: None,
+            pdd_ramping_signal_status: None,
+            pdd_ramping_unavailable_reason: None,
             pdd_whale_top3_pct: None,
             pdd_whale_single_max_pct: None,
             pdd_flash_crash_risk: None,
+            pdd_flash_crash_signal_status: None,
+            pdd_flash_crash_unavailable_reason: None,
             pdd_score: None,
             gatekeeper_first_kill_gate: None,
             gatekeeper_first_kill_reason: None,
@@ -5553,7 +5609,6 @@ mod tests {
             reason_code: Some(GatekeeperReasonCode::RejectCoreFail.as_log_str()),
             evidence_policy_context: None,
             reason_code_version: GatekeeperReasonCode::version(),
-            pdd_sequence_signals_unavailable_reason: None,
         }
     }
 
@@ -6410,6 +6465,7 @@ mod tests {
         buy_log.pool_id = "pool_score_degraded_concentration".to_string();
         buy_log.observation_end_ts_ms = Some(11_000);
         buy_log.hhi = None;
+        buy_log.top3_signer_volume_ratio = None;
         buy_log.top3_volume_pct = None;
         buy_log.ab_record_id =
             Some("pool_score_degraded_concentration:1000:11000:REJECT".to_string());
@@ -6453,6 +6509,7 @@ mod tests {
         buy_log.price_change_ratio = None;
         buy_log.curve_data_known = Some(false);
         buy_log.hhi = None;
+        buy_log.top3_signer_volume_ratio = None;
         buy_log.top3_volume_pct = None;
         buy_log.ab_record_id = Some("pool_score_invalid_core:1000:11000:REJECT".to_string());
 

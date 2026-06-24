@@ -62,6 +62,11 @@ pub struct TxIntelFeatures {
     pub avg_tx_per_signer: f64,
     pub same_ms_tx_ratio: f64,
     pub bundle_suspicion_ratio: f64,
+    /// Preferred signer-volume concentration metric in ratio scale `0.0..1.0`.
+    ///
+    /// `top3_volume_pct` is retained as a compatibility alias for older payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top3_signer_volume_ratio: Option<f64>,
     pub top3_volume_pct: f64,
     pub dev_buy_sol: f64,
     pub dev_volume_ratio: f64,
@@ -94,6 +99,19 @@ pub struct TxIntelFeatures {
     pub dust_tx_count: u64,
     #[serde(default)]
     pub failed_tx_count: u64,
+}
+
+impl TxIntelFeatures {
+    /// Preferred top3 signer-volume concentration read path.
+    ///
+    /// New payloads should set `top3_signer_volume_ratio`; old payloads fallback
+    /// to the legacy `top3_volume_pct` alias, which already carried ratio-scale
+    /// values despite its name.
+    #[must_use]
+    pub fn effective_top3_signer_volume_ratio(&self) -> f64 {
+        self.top3_signer_volume_ratio
+            .unwrap_or(self.top3_volume_pct)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

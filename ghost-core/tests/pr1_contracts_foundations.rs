@@ -171,6 +171,7 @@ fn materialized_feature_set_contains_complete_inputs() {
             avg_tx_per_signer: 1.8,
             same_ms_tx_ratio: 0.1,
             bundle_suspicion_ratio: 0.05,
+            top3_signer_volume_ratio: Some(0.67),
             top3_volume_pct: 0.67,
             dev_buy_sol: 0.75,
             dev_volume_ratio: 0.2,

@@ -27,6 +27,14 @@ const FSC_V2_PROVIDER_NLN_PROGRAM_STREAMS: &str = "nln_program_streams";
 const FSC_V2_TOPIC_LEGACY_FUNDING_TRANSFERS: &str = "ghost.funding_transfers";
 const FSC_V2_TOPIC_NLN_SYSTEM_TRANSFERS: &str = "prod.rpc.solana.system.transfers";
 
+fn funding_transfer_can_feed_capture_index(transfer: &FundingTransferObserved) -> bool {
+    transfer.full_chain_coverage
+        || matches!(
+            transfer.provenance.lane_kind,
+            seer::ipc::FundingTransferLaneKind::NlnProgramStreams
+        )
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct FundingSourceConfig {
     pub lookback_window_ms: u64,
@@ -863,14 +871,7 @@ impl FundingSourceIndex {
         let recipient_wallet = transfer.recipient_wallet.clone();
         let observation_wall_ms = wall_clock_epoch_ms();
 
-        let prune_started_at = Instant::now();
         let mut inner = self.inner.write();
-        // Any accepted funding transfer warms the rolling index for capture/evidence.
-        // Full-chain transfers may additionally mark availability automatically.
-        inner.saw_transfer = true;
-        inner.funding_lane_watermark_slot =
-            max_option_u64(inner.funding_lane_watermark_slot, transfer.slot);
-        inner.last_transfer_recv_ts_ms = Some(observation_wall_ms);
         inner
             .observed_funding_lane_kinds
             .insert(transfer.provenance.lane_kind.as_str().to_string());
@@ -883,6 +884,19 @@ impl FundingSourceIndex {
             }
         }
 
+        if !funding_transfer_can_feed_capture_index(transfer) {
+            update_index_metrics(&inner);
+            return;
+        }
+
+        // Only capture-eligible transfers warm the rolling index. Health-only
+        // filtered lanes may prove transport liveness but not usable FSC state.
+        inner.saw_transfer = true;
+        inner.funding_lane_watermark_slot =
+            max_option_u64(inner.funding_lane_watermark_slot, transfer.slot);
+        inner.last_transfer_recv_ts_ms = Some(observation_wall_ms);
+
+        let prune_started_at = Instant::now();
         let mut tracked_last_seen = None;
         let mut per_recipient_overflows = 0u64;
         {
@@ -3172,6 +3186,32 @@ mod tests {
         assert_eq!(
             computed.degraded_reasons,
             vec![FSC_FUNDING_STREAM_UNAVAILABLE_REASON.to_string()]
+        );
+    }
+
+    #[test]
+    fn pump_filtered_transfer_does_not_warm_capture_index_when_stream_is_health_ready() {
+        let config = config();
+        let index = FundingSourceIndex::new();
+        index.set_stream_available(true);
+
+        let mut transfer = funding_transfer("funder-a", "buyer-a", "fund-a", 100, 50_000_000);
+        transfer.full_chain_coverage = false;
+        transfer.provenance =
+            seer::ipc::FundingTransferProvenance::funding_lane_pump_filtered_live();
+        index.observe_transfer(&transfer, &config);
+
+        let buys = vec![
+            buy_tx("buyer-a", "buy-a", 400),
+            buy_tx("buyer-b", "buy-b", 500),
+        ];
+        let computed = index.compute_for_transactions(buys.iter(), &config);
+
+        assert!(!index.warmup_ready());
+        assert_eq!(computed.funding_source_concentration, None);
+        assert_eq!(
+            computed.degraded_reasons,
+            vec![FSC_ROLLING_STATE_UNAVAILABLE_REASON.to_string()]
         );
     }
 

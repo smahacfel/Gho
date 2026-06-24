@@ -5,9 +5,10 @@
 //! signals from the 3-segment trajectory snapshot (`TxSegmentSequence`) carried
 //! in `MaterializedFeatureSet`.
 //!
-//! When the sequence is absent or `min_tx_per_segment_satisfied` is false,
-//! callers receive `(false, None)` — honest unavailability, consistent with
-//! SSOT contract N14 (no synthetic backfill).
+//! Missing or insufficient sequence data is reported as typed unavailability,
+//! not as a clean negative signal. The legacy `(bool, reason)` helper remains
+//! for aggregate availability telemetry, but per-signal diagnostics use
+//! `PddSignalObservation`.
 
 use ghost_brain::config::gatekeeper_v25_config::PumpAndDumpDetectorConfig;
 use ghost_brain::config::GatekeeperV2Config;
@@ -17,6 +18,92 @@ pub const PDD_MISSING_SEQUENCE_REASON: &str = "missing_sequence";
 pub const PDD_INSUFFICIENT_DURATION_REASON: &str = "insufficient_duration";
 pub const PDD_INSUFFICIENT_TX_PER_SEGMENT_REASON: &str = "insufficient_tx_per_segment";
 pub const PDD_FLASH_CRASH_UNAVAILABLE_REASON: &str = "pdd_flash_crash_unavailable";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PddSequenceUnavailableReason {
+    MissingSequence,
+    InsufficientDuration,
+    InsufficientTxPerSegment,
+    FlashCrashUnavailable,
+}
+
+impl PddSequenceUnavailableReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingSequence => PDD_MISSING_SEQUENCE_REASON,
+            Self::InsufficientDuration => PDD_INSUFFICIENT_DURATION_REASON,
+            Self::InsufficientTxPerSegment => PDD_INSUFFICIENT_TX_PER_SEGMENT_REASON,
+            Self::FlashCrashUnavailable => PDD_FLASH_CRASH_UNAVAILABLE_REASON,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PddSignalStatus {
+    NotApplicable,
+    Available,
+    Unavailable(PddSequenceUnavailableReason),
+}
+
+impl PddSignalStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotApplicable => "not_applicable",
+            Self::Available => "available",
+            Self::Unavailable(_) => "unavailable",
+        }
+    }
+
+    pub fn unavailable_reason(self) -> Option<PddSequenceUnavailableReason> {
+        match self {
+            Self::Unavailable(reason) => Some(reason),
+            Self::NotApplicable | Self::Available => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PddSignalObservation {
+    pub detected: bool,
+    pub status: PddSignalStatus,
+}
+
+impl PddSignalObservation {
+    pub fn not_applicable() -> Self {
+        Self {
+            detected: false,
+            status: PddSignalStatus::NotApplicable,
+        }
+    }
+
+    pub fn available(detected: bool) -> Self {
+        Self {
+            detected,
+            status: PddSignalStatus::Available,
+        }
+    }
+
+    pub fn unavailable(reason: PddSequenceUnavailableReason) -> Self {
+        Self {
+            detected: false,
+            status: PddSignalStatus::Unavailable(reason),
+        }
+    }
+
+    pub fn status_label(self) -> &'static str {
+        self.status.as_str()
+    }
+
+    pub fn unavailable_reason_label(self) -> Option<&'static str> {
+        self.status
+            .unavailable_reason()
+            .map(|reason| reason.as_str())
+    }
+
+    pub fn is_available_detected(self) -> bool {
+        matches!(self.status, PddSignalStatus::Available) && self.detected
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PddSequenceSignalKind {
@@ -48,19 +135,37 @@ pub fn sequence_signal_availability(
     seq: &TxSegmentSequence,
     config: &GatekeeperV2Config,
 ) -> (bool, Option<&'static str>) {
-    if !signal.is_enabled(config) {
-        return (true, None);
+    match sequence_signal_status(signal, Some(seq), config) {
+        PddSignalStatus::NotApplicable | PddSignalStatus::Available => (true, None),
+        PddSignalStatus::Unavailable(reason) => (false, Some(reason.as_str())),
     }
+}
+
+pub fn sequence_signal_status(
+    signal: PddSequenceSignalKind,
+    seq: Option<&TxSegmentSequence>,
+    config: &GatekeeperV2Config,
+) -> PddSignalStatus {
+    if !signal.is_enabled(config) {
+        return PddSignalStatus::NotApplicable;
+    }
+    let Some(seq) = seq else {
+        return PddSignalStatus::Unavailable(PddSequenceUnavailableReason::MissingSequence);
+    };
     if seq.total_duration_ms < config.tas.tas_min_total_duration_ms {
-        return (false, Some(PDD_INSUFFICIENT_DURATION_REASON));
+        return PddSignalStatus::Unavailable(PddSequenceUnavailableReason::InsufficientDuration);
     }
     if !seq.min_tx_per_segment_satisfied {
-        return (false, Some(PDD_INSUFFICIENT_TX_PER_SEGMENT_REASON));
+        return PddSignalStatus::Unavailable(
+            PddSequenceUnavailableReason::InsufficientTxPerSegment,
+        );
     }
 
     match signal {
-        PddSequenceSignalKind::Spike | PddSequenceSignalKind::Ramping => (true, None),
-        PddSequenceSignalKind::FlashCrash => (false, Some(PDD_FLASH_CRASH_UNAVAILABLE_REASON)),
+        PddSequenceSignalKind::Spike | PddSequenceSignalKind::Ramping => PddSignalStatus::Available,
+        PddSequenceSignalKind::FlashCrash => {
+            PddSignalStatus::Unavailable(PddSequenceUnavailableReason::FlashCrashUnavailable)
+        }
     }
 }
 
@@ -270,6 +375,40 @@ mod tests {
         );
         assert!(!available);
         assert_eq!(reason, Some(PDD_FLASH_CRASH_UNAVAILABLE_REASON));
+    }
+
+    #[test]
+    fn test_sequence_signal_status_marks_missing_sequence_unavailable() {
+        let status =
+            sequence_signal_status(PddSequenceSignalKind::Spike, None, &gatekeeper_config());
+        assert_eq!(
+            status,
+            PddSignalStatus::Unavailable(PddSequenceUnavailableReason::MissingSequence)
+        );
+    }
+
+    #[test]
+    fn test_sequence_signal_status_marks_valid_spike_available() {
+        let seq = test_seq(1.0, 1.0, 1.5, 5, 5, 5, 0, 0, 1.0);
+        let status = sequence_signal_status(
+            PddSequenceSignalKind::Spike,
+            Some(&seq),
+            &gatekeeper_config(),
+        );
+        assert_eq!(status, PddSignalStatus::Available);
+    }
+
+    #[test]
+    fn test_signal_observation_serial_labels_are_stable() {
+        let missing =
+            PddSignalObservation::unavailable(PddSequenceUnavailableReason::MissingSequence);
+        assert_eq!(missing.detected, false);
+        assert_eq!(missing.status_label(), "unavailable");
+        assert_eq!(missing.unavailable_reason_label(), Some("missing_sequence"));
+
+        let clean = PddSignalObservation::available(false);
+        assert_eq!(clean.status_label(), "available");
+        assert_eq!(clean.unavailable_reason_label(), None);
     }
 
     #[test]
