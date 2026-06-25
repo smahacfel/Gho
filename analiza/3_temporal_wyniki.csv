@@ -1,0 +1,2 @@
+roc_auc,pr_auc,train_threshold_f1,n_features,n_train,n_test
+0.8009118541033434,0.7996941785743199,0.5605441331863403,96,1366,342
