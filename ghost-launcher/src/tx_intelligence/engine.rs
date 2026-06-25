@@ -282,7 +282,6 @@ impl TxIntelligenceEngine {
         let tx_count = self.state.total_tx;
         let unique_signers = self.state.unique_signers.len() as u64;
         let total_tx_f64 = tx_count.max(1) as f64;
-        let total_volume = self.total_volume_sol;
         let dust_denominator = tx_count.saturating_add(self.state.dust_tx_count).max(1) as f64;
 
         TxIntelFeatures {
@@ -308,11 +307,8 @@ impl TxIntelligenceEngine {
             },
             same_ms_tx_ratio: self.state.same_ms_tx_count as f64 / total_tx_f64,
             bundle_suspicion_ratio: self.state.bundle_suspicion_count as f64 / total_tx_f64,
-            top3_volume_pct: if total_volume > 0.0 {
-                diversity.top3_volume_pct
-            } else {
-                0.0
-            },
+            top3_signer_volume_ratio: diversity.top3_signer_volume_ratio,
+            top3_volume_pct: diversity.effective_top3_signer_volume_ratio(),
             dev_buy_sol: dev.dev_buy_total_sol,
             dev_volume_ratio: dev.dev_volume_ratio,
             dev_tx_ratio: dev.dev_tx_ratio,
@@ -539,14 +535,15 @@ impl TxIntelligenceEngine {
             ));
         }
 
-        if features.top3_volume_pct > self.config.max_top3_volume_pct {
+        let top3_signer_volume_ratio = features.effective_top3_signer_volume_ratio();
+        if top3_signer_volume_ratio > self.config.max_top3_volume_pct {
             flags.push(risk_flag(
                 "top3_volume_dominance",
                 RiskSeverity::Soft(2),
                 detected_at_ms,
                 format!(
-                    "top3_volume_pct={:.3} > {:.3}",
-                    features.top3_volume_pct, self.config.max_top3_volume_pct
+                    "top3_signer_volume_ratio={:.3} > {:.3}",
+                    top3_signer_volume_ratio, self.config.max_top3_volume_pct
                 ),
             ));
         }

@@ -7,7 +7,11 @@ use super::gatekeeper::{
     SybilSoftSignals, VelocityProfile, VolumeSanityProfile,
 };
 use super::gatekeeper_pdd::{PddDiagnostics, PddHardFail};
-use super::gatekeeper_pdd_sequence::{sequence_signal_availability, PddSequenceSignalKind};
+use super::gatekeeper_pdd_sequence::{
+    detect_flash_crash_from_segments, detect_ramping_from_segments, sequence_signal_status,
+    PddSequenceSignalKind, PddSequenceUnavailableReason, PddSignalObservation, PddSignalStatus,
+    PDD_MISSING_SEQUENCE_REASON,
+};
 use ghost_brain::config::{
     CpvLowSamplePolicy, GatekeeperV2Config, SelectorSoftScoreConfig,
     SelectorSoftScoreMissingPolicy, SelectorSoftScorePolicy, StrictMetricMissingPolicy,
@@ -1061,7 +1065,7 @@ pub(crate) fn compute_selector_soft_score(
             assessment
                 .phase3_diversity
                 .as_ref()
-                .map(|diversity| diversity.top3_volume_pct),
+                .map(|diversity| diversity.effective_top3_signer_volume_ratio()),
             "top3_volume_pct_missing",
         ),
         |value| value < selector.top3_volume_pct_lt,
@@ -1614,76 +1618,11 @@ pub fn build_assessment_from_features(
 
     // ── PDD sequence signals from segment_sequence (Path B) ──
     // The feature-driven PDD diagnostics from `materialize_pdd_diagnostics_from_features`
-    // only cover drift, whale, and reserve (3/6 signals). When the segment sequence
-    // is available, supplement with spike, ramping, and flash crash signals.
-    if let Some(ref seq) = assessment.feature_snapshot.tx_segment_sequence {
-        if let Some(ref mut pdd) = assessment.pdd_assessment {
-            let spike_available =
-                sequence_signal_availability(PddSequenceSignalKind::Spike, seq, config).0;
-            let spike_diagnostics =
-                materialized_spike_from_segments(seq, &config.pdd, spike_available);
-            let spike = spike_diagnostics.detected;
-            let ramping =
-                if sequence_signal_availability(PddSequenceSignalKind::Ramping, seq, config).0 {
-                    crate::components::gatekeeper_pdd_sequence::detect_ramping_from_segments(
-                        seq,
-                        &config.pdd,
-                    )
-                    .0
-                } else {
-                    false
-                };
-            let flash =
-                if sequence_signal_availability(PddSequenceSignalKind::FlashCrash, seq, config).0 {
-                    crate::components::gatekeeper_pdd_sequence::detect_flash_crash_from_segments(
-                        seq,
-                        &config.pdd,
-                    )
-                    .0
-                } else {
-                    false
-                };
-
-            pdd.spike_detected = spike;
-            pdd.spike_ratio = spike_diagnostics.ratio;
-            pdd.spike_ratio_quality = spike_diagnostics.ratio_quality;
-            pdd.spike_recent_rate = spike_diagnostics.recent_rate;
-            pdd.spike_earlier_rate = spike_diagnostics.earlier_rate;
-            pdd.ramping_detected = ramping;
-            pdd.flash_crash_risk = flash;
-
-            // Only override hard_fail if no earlier signal already vetoed
-            // (drift/whale/reserve run first and take priority).
-            if pdd.hard_fail.is_none() {
-                if spike && config.pdd.spike_hard_veto {
-                    pdd.hard_fail = Some(PddHardFail::Spike);
-                    pdd.pdd_score = 0.0;
-                } else if ramping && config.pdd.ramping_hard_veto {
-                    pdd.hard_fail = Some(PddHardFail::Ramping);
-                    pdd.pdd_score = 0.0;
-                } else if flash {
-                    pdd.hard_fail = Some(PddHardFail::FlashCrash);
-                    pdd.pdd_score = 0.0;
-                }
-            }
-
-            // Soft penalties for non-hard-fail signals
-            if pdd.hard_fail.is_none() {
-                if spike && !config.pdd.spike_hard_veto {
-                    pdd.soft_penalty_points = pdd
-                        .soft_penalty_points
-                        .saturating_add(config.pdd.spike_soft_penalty);
-                }
-                // Ramping and flash crash are hard-veto only in this design;
-                // their soft-penalty equivalents are not yet plumbed.
-            }
-
-            // Recompute pdd_score after soft penalties
-            if pdd.hard_fail.is_none() && (spike || ramping || flash) {
-                let penalty = (pdd.soft_penalty_points as f64 * 0.05).min(0.3);
-                pdd.pdd_score = 1.0 - penalty;
-            }
-        }
+    // only cover drift, whale, and reserve. Supplement spike/ramping/flash with
+    // typed availability so missing sequence data cannot look like checked-clean false.
+    let tx_segment_sequence = assessment.feature_snapshot.tx_segment_sequence.as_ref();
+    if let Some(ref mut pdd) = assessment.pdd_assessment {
+        apply_pdd_sequence_signals_from_features(pdd, tx_segment_sequence, config);
     }
     assessment.aps_diagnostics = Some(
         crate::components::gatekeeper_adaptive_prosperity::evaluate_aps(
@@ -1692,7 +1631,9 @@ pub fn build_assessment_from_features(
             assessment
                 .pdd_assessment
                 .as_ref()
-                .is_some_and(|pdd| pdd.spike_detected),
+                .map_or(PddSignalObservation::not_applicable(), |pdd| {
+                    pdd.spike_signal
+                }),
         ),
     );
     assessment.adaptive_thresholds_applied = assessment
@@ -1723,8 +1664,6 @@ pub fn build_assessment_from_features(
             }
         }
     }
-    assessment.hard_reject_reason = evaluate_hard_filters_from_assessment(&assessment, config)
-        .map(|(_reason, reason_chain)| reason_chain);
     assessment
 }
 
@@ -1896,30 +1835,12 @@ struct MaterializedSpikeDiagnostics {
 fn materialized_spike_from_segments(
     seq: &TxSegmentSequence,
     config: &ghost_brain::config::gatekeeper_v25_config::PumpAndDumpDetectorConfig,
-    available: bool,
 ) -> MaterializedSpikeDiagnostics {
     if !config.spike_detection_enabled {
         return MaterializedSpikeDiagnostics {
             detected: false,
             ratio: None,
             ratio_quality: None,
-            recent_rate: None,
-            earlier_rate: None,
-        };
-    }
-
-    if !available {
-        let quality = if seq.t2_segment.tx_count == 0 {
-            "insufficient_recent_window"
-        } else if seq.t0_segment.tx_count == 0 || seq.t1_segment.tx_count == 0 {
-            "insufficient_earlier_window"
-        } else {
-            "unavailable"
-        };
-        return MaterializedSpikeDiagnostics {
-            detected: false,
-            ratio: None,
-            ratio_quality: Some(quality),
             recent_rate: None,
             earlier_rate: None,
         };
@@ -1981,6 +1902,130 @@ fn materialized_spike_from_segments(
     }
 }
 
+fn unavailable_spike_ratio_quality(
+    seq: Option<&TxSegmentSequence>,
+    reason: PddSequenceUnavailableReason,
+) -> &'static str {
+    if matches!(reason, PddSequenceUnavailableReason::MissingSequence) {
+        return reason.as_str();
+    }
+    let Some(seq) = seq else {
+        return reason.as_str();
+    };
+    if seq.t2_segment.tx_count == 0 {
+        "insufficient_recent_window"
+    } else if seq.t0_segment.tx_count == 0 || seq.t1_segment.tx_count == 0 {
+        "insufficient_earlier_window"
+    } else {
+        reason.as_str()
+    }
+}
+
+fn apply_pdd_sequence_signals_from_features(
+    pdd: &mut PddDiagnostics,
+    seq: Option<&TxSegmentSequence>,
+    config: &GatekeeperV2Config,
+) {
+    if !config.pdd.enabled {
+        return;
+    }
+
+    let spike_status = sequence_signal_status(PddSequenceSignalKind::Spike, seq, config);
+    match spike_status {
+        PddSignalStatus::Available => {
+            if let Some(seq) = seq {
+                let spike_diagnostics = materialized_spike_from_segments(seq, &config.pdd);
+                pdd.spike_signal = PddSignalObservation::available(spike_diagnostics.detected);
+                pdd.spike_detected = spike_diagnostics.detected;
+                pdd.spike_ratio = spike_diagnostics.ratio;
+                pdd.spike_ratio_quality = spike_diagnostics.ratio_quality;
+                pdd.spike_recent_rate = spike_diagnostics.recent_rate;
+                pdd.spike_earlier_rate = spike_diagnostics.earlier_rate;
+            } else {
+                pdd.spike_signal = PddSignalObservation::unavailable(
+                    PddSequenceUnavailableReason::MissingSequence,
+                );
+                pdd.spike_detected = false;
+                pdd.spike_ratio = None;
+                pdd.spike_ratio_quality = Some(PDD_MISSING_SEQUENCE_REASON);
+                pdd.spike_recent_rate = None;
+                pdd.spike_earlier_rate = None;
+            }
+        }
+        PddSignalStatus::Unavailable(reason) => {
+            pdd.spike_signal = PddSignalObservation::unavailable(reason);
+            pdd.spike_detected = false;
+            pdd.spike_ratio = None;
+            pdd.spike_ratio_quality = Some(unavailable_spike_ratio_quality(seq, reason));
+            pdd.spike_recent_rate = None;
+            pdd.spike_earlier_rate = None;
+        }
+        PddSignalStatus::NotApplicable => {
+            pdd.spike_signal = PddSignalObservation::not_applicable();
+            pdd.spike_detected = false;
+        }
+    }
+
+    let ramping_status = sequence_signal_status(PddSequenceSignalKind::Ramping, seq, config);
+    pdd.ramping_signal = match ramping_status {
+        PddSignalStatus::Available => seq.map_or_else(
+            || PddSignalObservation::unavailable(PddSequenceUnavailableReason::MissingSequence),
+            |seq| PddSignalObservation::available(detect_ramping_from_segments(seq, &config.pdd).0),
+        ),
+        PddSignalStatus::Unavailable(reason) => PddSignalObservation::unavailable(reason),
+        PddSignalStatus::NotApplicable => PddSignalObservation::not_applicable(),
+    };
+    pdd.ramping_detected = pdd.ramping_signal.detected;
+
+    let flash_status = sequence_signal_status(PddSequenceSignalKind::FlashCrash, seq, config);
+    pdd.flash_crash_signal = match flash_status {
+        PddSignalStatus::Available => seq.map_or_else(
+            || PddSignalObservation::unavailable(PddSequenceUnavailableReason::MissingSequence),
+            |seq| {
+                PddSignalObservation::available(
+                    detect_flash_crash_from_segments(seq, &config.pdd).0,
+                )
+            },
+        ),
+        PddSignalStatus::Unavailable(reason) => PddSignalObservation::unavailable(reason),
+        PddSignalStatus::NotApplicable => PddSignalObservation::not_applicable(),
+    };
+    pdd.flash_crash_risk = pdd.flash_crash_signal.detected;
+
+    // Only override hard_fail if no earlier signal already vetoed
+    // (drift/whale/reserve run first and take priority).
+    if pdd.hard_fail.is_none() {
+        if pdd.spike_signal.is_available_detected() && config.pdd.spike_hard_veto {
+            pdd.hard_fail = Some(PddHardFail::Spike);
+            pdd.pdd_score = 0.0;
+        } else if pdd.ramping_signal.is_available_detected() && config.pdd.ramping_hard_veto {
+            pdd.hard_fail = Some(PddHardFail::Ramping);
+            pdd.pdd_score = 0.0;
+        } else if pdd.flash_crash_signal.is_available_detected() {
+            pdd.hard_fail = Some(PddHardFail::FlashCrash);
+            pdd.pdd_score = 0.0;
+        }
+    }
+
+    if pdd.hard_fail.is_none()
+        && pdd.spike_signal.is_available_detected()
+        && !config.pdd.spike_hard_veto
+    {
+        pdd.soft_penalty_points = pdd
+            .soft_penalty_points
+            .saturating_add(config.pdd.spike_soft_penalty);
+    }
+
+    if pdd.hard_fail.is_none()
+        && (pdd.spike_signal.is_available_detected()
+            || pdd.ramping_signal.is_available_detected()
+            || pdd.flash_crash_signal.is_available_detected())
+    {
+        let penalty = (pdd.soft_penalty_points as f64 * 0.05).min(0.3);
+        pdd.pdd_score = 1.0 - penalty;
+    }
+}
+
 fn materialize_pdd_diagnostics_from_features(
     features: &MaterializedFeatureSet,
     config: &ghost_brain::config::gatekeeper_v25_config::PumpAndDumpDetectorConfig,
@@ -2022,7 +2067,12 @@ fn materialize_pdd_diagnostics_from_features(
     }
 
     if features.tx_intel_features.tx_count > 0 {
-        let whale_top3_pct = features.tx_intel_features.top3_volume_pct * 100.0;
+        // Gatekeeper diversity thresholds use ratio scale `0.0..1.0`; PDD
+        // whale thresholds are percent-scale `0.0..100.0`.
+        let whale_top3_pct = features
+            .tx_intel_features
+            .effective_top3_signer_volume_ratio()
+            * 100.0;
         diag.whale_top3_pct = Some(whale_top3_pct);
         if features.tx_intel_features.total_volume_sol.is_finite()
             && features.tx_intel_features.total_volume_sol > f64::EPSILON
@@ -2091,8 +2141,6 @@ pub fn refresh_assessment_thresholds(
     .into_iter()
     .filter(|passed| *passed)
     .count() as u8;
-    assessment.hard_reject_reason = evaluate_hard_filters_from_assessment(assessment, config)
-        .map(|(_reason, reason_chain)| reason_chain);
 }
 
 pub fn evaluate_hard_filters(
@@ -2195,12 +2243,13 @@ fn evaluate_hard_filters_from_assessment(
             ));
         }
 
-        if diversity.top3_volume_pct > config.hard_fail_top3_volume_pct {
+        let top3_signer_volume_ratio = diversity.effective_top3_signer_volume_ratio();
+        if top3_signer_volume_ratio > config.hard_fail_top3_volume_pct {
             return Some((
                 HardFailReason::ExtremeTop3Dominance,
                 format!(
                     "HARD_FAIL: top3_vol={:.2} > {:.2} (extreme whale dominance)",
-                    diversity.top3_volume_pct, config.hard_fail_top3_volume_pct
+                    top3_signer_volume_ratio, config.hard_fail_top3_volume_pct
                 ),
             ));
         }
@@ -2831,12 +2880,17 @@ fn velocity_profile_from_features(features: &MaterializedFeatureSet) -> Option<V
 fn signer_diversity_from_features(
     features: &MaterializedFeatureSet,
 ) -> Option<SignerDiversityProfile> {
+    let top3_signer_volume_ratio = features.tx_intel_features.top3_signer_volume_ratio;
+    let top3_volume_pct = features
+        .tx_intel_features
+        .effective_top3_signer_volume_ratio();
     (features.tx_intel_features.tx_count >= 2).then(|| SignerDiversityProfile {
         unique_ratio: features.tx_intel_features.unique_signer_ratio,
         hhi: features.tx_intel_features.hhi,
         max_tx_per_signer: features.tx_intel_features.max_tx_per_signer as usize,
         volume_gini: features.tx_intel_features.volume_gini,
-        top3_volume_pct: features.tx_intel_features.top3_volume_pct,
+        top3_signer_volume_ratio,
+        top3_volume_pct,
         same_ms_tx_ratio: features.tx_intel_features.same_ms_tx_ratio,
     })
 }
@@ -2934,7 +2988,8 @@ fn compute_soft_signals(
     if let Some(diversity) = assessment.phase3_diversity.as_ref() {
         signals.bundle_suspicion = diversity.same_ms_tx_ratio > config.max_same_ms_tx_ratio;
         signals.cabal_suspicion = diversity.hhi > config.max_hhi;
-        signals.top3_dominance = diversity.top3_volume_pct > config.max_top3_volume_pct;
+        signals.top3_dominance =
+            diversity.effective_top3_signer_volume_ratio() > config.max_top3_volume_pct;
         signals.high_volume_gini = diversity.volume_gini > config.max_volume_gini;
         signals.unique_ratio_out_of_range = diversity.unique_ratio < config.min_unique_ratio
             || diversity.unique_ratio > config.max_unique_ratio;
@@ -3319,7 +3374,7 @@ fn diversity_phase_passes(diversity: &SignerDiversityProfile, config: &Gatekeepe
         && diversity.max_tx_per_signer as u64 <= config.max_tx_per_signer as u64
         && diversity.volume_gini >= config.min_volume_gini
         && diversity.volume_gini <= config.max_volume_gini
-        && diversity.top3_volume_pct <= config.max_top3_volume_pct
+        && diversity.effective_top3_signer_volume_ratio() <= config.max_top3_volume_pct
         && diversity.same_ms_tx_ratio <= config.max_same_ms_tx_ratio
 }
 
@@ -3620,6 +3675,7 @@ mod tests {
                 hhi: 0.08,
                 max_tx_per_signer: 2,
                 volume_gini: 0.34,
+                top3_signer_volume_ratio: Some(0.42),
                 top3_volume_pct: 0.42,
                 same_ms_tx_ratio: 0.08,
             }),
@@ -3852,6 +3908,7 @@ mod tests {
         if let Some(diversity) = assessment.phase3_diversity.as_mut() {
             diversity.unique_ratio = 0.10;
             diversity.hhi = 0.50;
+            diversity.top3_signer_volume_ratio = Some(0.90);
             diversity.top3_volume_pct = 0.90;
             diversity.same_ms_tx_ratio = 0.01;
         }
@@ -4425,11 +4482,20 @@ mod tests {
         assert_eq!(pdd.entry_drift_pct, Some(4.0));
         assert_eq!(pdd.entry_drift_anchor_quality, Some("strong"));
         assert!(!pdd.spike_detected);
+        assert_eq!(
+            pdd.spike_signal.status,
+            PddSignalStatus::Unavailable(PddSequenceUnavailableReason::MissingSequence)
+        );
         assert!(!pdd.ramping_detected);
         assert!(!pdd.flash_crash_risk);
         assert!(pdd.reserve_health_pass);
 
-        assert!(assessment.aps_diagnostics.is_some());
+        let aps = assessment
+            .aps_diagnostics
+            .as_ref()
+            .expect("aps diagnostics should be present");
+        assert_eq!(aps.pdd_spike_signal_status, "unavailable");
+        assert_eq!(aps.pdd_spike_unavailable_reason, Some("missing_sequence"));
 
         let decision = evaluate_policy_from_assessment(&assessment, &config);
         assessment.decision = Some(decision);
@@ -4440,6 +4506,14 @@ mod tests {
             Some("missing_sequence")
         );
         assert_eq!(buy_log.pdd_sequence_signals_available, Some(false));
+        assert_eq!(
+            buy_log.pdd_spike_signal_status.as_deref(),
+            Some("unavailable")
+        );
+        assert_eq!(
+            buy_log.pdd_spike_unavailable_reason.as_deref(),
+            Some("missing_sequence")
+        );
         assert_eq!(buy_log.pdd_price_anchor_available, Some(true));
         assert_eq!(buy_log.v25_confidence, None);
         assert_eq!(buy_log.v25_confidence_available, Some(false));
@@ -4532,6 +4606,7 @@ mod tests {
         assert_eq!(pdd.spike_earlier_rate, Some(0.25));
         assert_eq!(pdd.spike_ratio, Some(4.0));
         assert!(pdd.spike_detected);
+        assert_eq!(pdd.spike_signal.status, PddSignalStatus::Available);
         assert_eq!(pdd.whale_single_max_pct, Some(15.0));
     }
 

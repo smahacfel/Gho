@@ -42,6 +42,7 @@ fn tx_features(tx_count: u64, buy_ratio: f64, unique_ratio: f64) -> TxIntelFeatu
         avg_tx_per_signer: 1.3,
         same_ms_tx_ratio: 0.05,
         bundle_suspicion_ratio: 0.01,
+        top3_signer_volume_ratio: Some(0.4),
         top3_volume_pct: 0.4,
         dev_buy_sol: 0.0,
         dev_volume_ratio: 0.0,

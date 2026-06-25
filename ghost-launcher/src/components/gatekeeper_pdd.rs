@@ -8,6 +8,7 @@
 use ghost_brain::config::gatekeeper_v25_config::PumpAndDumpDetectorConfig;
 
 use crate::components::gatekeeper::GatekeeperBuffer;
+use crate::components::gatekeeper_pdd_sequence::PddSignalObservation;
 
 /// Type of PDD hard fail. Each maps to a specific pump & dump signature.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,11 +56,14 @@ pub struct PddDiagnostics {
     pub spike_ratio_quality: Option<&'static str>,
     pub spike_recent_rate: Option<f64>,
     pub spike_earlier_rate: Option<f64>,
+    pub spike_signal: PddSignalObservation,
     pub ramping_detected: bool,
+    pub ramping_signal: PddSignalObservation,
     pub whale_top3_pct: Option<f64>,
     pub whale_single_max_pct: Option<f64>,
     pub reserve_health_pass: bool,
     pub flash_crash_risk: bool,
+    pub flash_crash_signal: PddSignalObservation,
     /// 1.0 = completely clean, 0.0 = hard fail
     pub pdd_score: f64,
     pub soft_penalty_points: u8,
@@ -87,11 +91,14 @@ impl PddDiagnostics {
             spike_ratio_quality: None,
             spike_recent_rate: None,
             spike_earlier_rate: None,
+            spike_signal: PddSignalObservation::not_applicable(),
             ramping_detected: false,
+            ramping_signal: PddSignalObservation::not_applicable(),
             whale_top3_pct: None,
             whale_single_max_pct: None,
             reserve_health_pass: true,
             flash_crash_risk: false,
+            flash_crash_signal: PddSignalObservation::not_applicable(),
             pdd_score: 1.0,
             soft_penalty_points: 0,
         }
@@ -148,6 +155,7 @@ pub fn evaluate_pdd(
     if config.spike_detection_enabled {
         let spike = detect_spike(buffer, config);
         diag.spike_detected = spike.detected;
+        diag.spike_signal = PddSignalObservation::available(spike.detected);
         diag.spike_ratio = spike.ratio;
         diag.spike_ratio_quality = Some(spike.ratio_quality);
         diag.spike_recent_rate = spike.recent_rate;
@@ -168,6 +176,7 @@ pub fn evaluate_pdd(
     if config.ramping_detection_enabled {
         let ramping = detect_ramping(buffer, config);
         diag.ramping_detected = ramping;
+        diag.ramping_signal = PddSignalObservation::available(ramping);
         if ramping && config.ramping_hard_veto {
             diag.hard_fail = Some(PddHardFail::Ramping);
             diag.pdd_score = 0.0;
@@ -211,6 +220,7 @@ pub fn evaluate_pdd(
     if config.flash_crash_protection_enabled {
         let flash = detect_flash_crash(buffer, config);
         diag.flash_crash_risk = flash;
+        diag.flash_crash_signal = PddSignalObservation::available(flash);
         if flash {
             diag.hard_fail = Some(PddHardFail::FlashCrash);
             diag.pdd_score = 0.0;

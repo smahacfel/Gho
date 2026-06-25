@@ -7,6 +7,10 @@ use ghost_launcher::components::gatekeeper::{
     SybilPolicyDiagnostics,
 };
 use ghost_launcher::components::gatekeeper_pdd::evaluate_pdd;
+use ghost_launcher::components::gatekeeper_pdd_sequence::{
+    PddSequenceUnavailableReason, PddSignalStatus,
+};
+use ghost_launcher::components::gatekeeper_policy::evaluate_policy_from_assessment;
 use ghost_launcher::events::PoolTransaction;
 use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
@@ -1159,10 +1163,44 @@ fn p1_path_b_marks_unavailable_instead_of_guessing_sequence_features() {
 
     let pdd_seq = assessment.pdd_sequence_signals_available(&config);
     assert_eq!(pdd_seq, Some(false));
+    let pdd = assessment
+        .pdd_assessment
+        .as_ref()
+        .expect("pdd diagnostics must be present");
+    assert_eq!(pdd.spike_detected, false);
+    assert_eq!(
+        pdd.spike_signal.status,
+        PddSignalStatus::Unavailable(PddSequenceUnavailableReason::MissingSequence)
+    );
+    let aps = assessment
+        .aps_diagnostics
+        .as_ref()
+        .expect("aps diagnostics must be present");
+    assert_eq!(aps.pdd_spike_signal_status, "unavailable");
+    assert_eq!(aps.pdd_spike_unavailable_reason, Some("missing_sequence"));
 
     // P1: pdd_sequence_signals_unavailable_reason must be logged.
     let buy_log = assessment.to_buy_log(&Pubkey::new_unique(), &config);
     assert_eq!(buy_log.pdd_sequence_signals_available, Some(false));
+    assert_eq!(buy_log.pdd_spike_detected, Some(false));
+    assert_eq!(
+        buy_log.pdd_spike_signal_status.as_deref(),
+        Some("unavailable")
+    );
+    assert_eq!(
+        buy_log.pdd_spike_unavailable_reason.as_deref(),
+        Some("missing_sequence")
+    );
+    let serialized = serde_json::to_value(&buy_log).expect("buy log serializes");
+    assert_eq!(serialized["pdd_spike_detected"].as_bool(), Some(false));
+    assert_eq!(
+        serialized["pdd_spike_signal_status"].as_str(),
+        Some("unavailable")
+    );
+    assert_eq!(
+        serialized["pdd_spike_unavailable_reason"].as_str(),
+        Some("missing_sequence")
+    );
     assert!(
         buy_log.pdd_sequence_signals_unavailable_reason.is_some(),
         "pdd_sequence_signals_unavailable_reason must be logged when unavailable"
@@ -1288,6 +1326,18 @@ fn p1_flash_enabled_marks_path_b_sequence_as_unavailable() {
     let assessment =
         build_assessment_from_features(features, &config, PolicyEvaluationContext::default());
 
+    let pdd = assessment
+        .pdd_assessment
+        .as_ref()
+        .expect("pdd diagnostics must be present");
+    assert_eq!(pdd.spike_detected, false);
+    assert_eq!(pdd.spike_signal.status, PddSignalStatus::Available);
+    assert_eq!(pdd.flash_crash_risk, false);
+    assert_eq!(
+        pdd.flash_crash_signal.status,
+        PddSignalStatus::Unavailable(PddSequenceUnavailableReason::FlashCrashUnavailable)
+    );
+
     assert_eq!(
         assessment.pdd_sequence_signals_available(&config),
         Some(false)
@@ -1302,6 +1352,21 @@ fn p1_flash_enabled_marks_path_b_sequence_as_unavailable() {
 
     let buy_log = assessment.to_buy_log(&Pubkey::new_unique(), &config);
     assert_eq!(buy_log.pdd_sequence_signals_available, Some(false));
+    assert_eq!(buy_log.pdd_spike_detected, Some(false));
+    assert_eq!(
+        buy_log.pdd_spike_signal_status.as_deref(),
+        Some("available")
+    );
+    assert_eq!(buy_log.pdd_spike_unavailable_reason, None);
+    assert_eq!(buy_log.pdd_flash_crash_risk, Some(false));
+    assert_eq!(
+        buy_log.pdd_flash_crash_signal_status.as_deref(),
+        Some("unavailable")
+    );
+    assert_eq!(
+        buy_log.pdd_flash_crash_unavailable_reason.as_deref(),
+        Some("pdd_flash_crash_unavailable")
+    );
     assert_eq!(
         buy_log.pdd_sequence_signals_unavailable_reason.as_deref(),
         Some("pdd_flash_crash_unavailable")
@@ -1882,6 +1947,55 @@ fn p2_aps_drift_override_only_in_shadow_plane() {
     assert_eq!(live_pdd.hard_fail, None);
 }
 
+#[test]
+fn p4_top3_signer_ratio_uses_ratio_and_pdd_percent_scale() {
+    use ghost_launcher::components::gatekeeper_policy::{
+        build_assessment_from_features, PolicyEvaluationContext,
+    };
+
+    let mut config = v25_enabled_config();
+    config.pdd.whale_top3_max_pct = 60.0;
+    config.pdd.whale_single_max_pct = 95.0;
+
+    let mut features = ghost_core::checkpoint::MaterializedFeatureSet::default();
+    features.tx_intel_features.tx_count = 12;
+    features.tx_intel_features.buy_count = 10;
+    features.tx_intel_features.unique_signers = 8;
+    features.tx_intel_features.buy_ratio = 0.83;
+    features.tx_intel_features.total_volume_sol = 10.0;
+    features.tx_intel_features.max_tx_sol = 2.0;
+    features.tx_intel_features.top3_signer_volume_ratio = Some(0.60);
+    features.tx_intel_features.top3_volume_pct = 0.12;
+    features.tx_intel_features.avg_interval_ms = 300.0;
+    features.tx_intel_features.interval_cv = 0.5;
+    features.tx_intel_features.timing_entropy = 2.0;
+    features.tx_intel_features.volume_gini = 0.40;
+    features.tx_intel_features.hhi = 0.08;
+    features.tx_intel_features.same_ms_tx_ratio = 0.1;
+    features.tx_intel_features.max_tx_per_signer = 3;
+    features.account_features.market_cap_sol = 50.0;
+    features.account_features.bonding_progress = 0.20;
+    features.account_features.price_sol = 1.0;
+    features.account_features.current_reserves = (50_000_000_000, 900_000_000);
+    features.session_metadata.observation_duration_ms = 7_000;
+
+    let assessment =
+        build_assessment_from_features(features, &config, PolicyEvaluationContext::default());
+    let diversity = assessment
+        .phase3_diversity
+        .as_ref()
+        .expect("phase3 diversity should be materialized");
+    let pdd = assessment
+        .pdd_assessment
+        .as_ref()
+        .expect("PDD diagnostics should be materialized");
+
+    assert!((diversity.effective_top3_signer_volume_ratio() - 0.60).abs() < f64::EPSILON);
+    assert_eq!(diversity.top3_volume_pct, 0.60);
+    assert_eq!(pdd.whale_top3_pct, Some(60.0));
+    assert_eq!(pdd.hard_fail, None);
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // P3 — Legacy drift cap test
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1937,16 +2051,21 @@ fn p3_legacy_drift_cap_blocks_extreme_pump() {
 
     let assessment =
         build_assessment_from_features(features, &config, PolicyEvaluationContext::default());
+    let decision = evaluate_policy_from_assessment(&assessment, &config);
 
     // HF-4 (price_change_ratio > max_price_change_ratio) should fire.
     assert!(
-        assessment.hard_reject_reason.is_some(),
+        decision.hard_fail_reason.is_some(),
         "HF-4 must trigger hard reject for price_change_ratio > 1.50. \
-         phase6_curve={:?}, hard_reject_reason={:?}",
+         phase6_curve={:?}, hard_fail_reason={:?}",
         assessment.phase6_curve,
-        assessment.hard_reject_reason,
+        decision.hard_fail_reason,
     );
-    let reason = assessment.hard_reject_reason.as_ref().unwrap();
+    assert!(
+        assessment.hard_reject_reason.is_none(),
+        "build_assessment_from_features must stay evidence-only for HF-4 regression case"
+    );
+    let reason = decision.hard_fail_reason.as_ref().unwrap();
     assert!(
         reason.contains("price_change_ratio") || reason.contains("HARD_FAIL"),
         "HF-4 reason must mention price_change_ratio, got: {}",
@@ -1954,10 +2073,11 @@ fn p3_legacy_drift_cap_blocks_extreme_pump() {
     );
 }
 
-/// P3: Verify `max_price_change_ratio = 1.50` is set in the config.
+/// P3 collector profile: verify the root config keeps the current permissive
+/// drift cap used for wide evidence gathering.
 #[test]
-fn p3_config_has_legacy_drift_cap_1_50() {
-    // Verify the TOML file has max_price_change_ratio = 1.50 (not 9999.0).
+fn p3_collector_profile_keeps_permissive_drift_cap_9_50() {
+    // Current branch policy keeps the collector profile permissive here.
     let contents = include_str!("../../ghost-brain/ghost_brain_config.toml");
     let doc: toml::Value = toml::from_str(contents).expect("valid TOML");
     let gk = doc.get("gatekeeper_v2").expect("has gatekeeper_v2 section");
@@ -1967,8 +2087,8 @@ fn p3_config_has_legacy_drift_cap_1_50() {
         .as_float()
         .expect("is float");
     assert!(
-        (max_pcr - 1.50).abs() < f64::EPSILON,
-        "max_price_change_ratio must be 1.50 (not 9999.0), got {}",
+        (max_pcr - 9.50).abs() < f64::EPSILON,
+        "max_price_change_ratio must be 9.50 in the collector profile, got {}",
         max_pcr,
     );
 }
@@ -2270,6 +2390,7 @@ fn p4_timeout_decision_reason_is_never_null() {
     cfg.min_tx_count = 12;
     cfg.min_unique_signers = 8;
     cfg.min_buy_count = 6;
+    cfg.hard_fail_hhi = 1.0; // isolate TIMEOUT taxonomy from unrelated low-sample HHI hard-fail
 
     let mut buf = GatekeeperBuffer::new(Pubkey::new_unique(), &cfg);
     buf.set_registered_wall_t0(1000);
@@ -2307,7 +2428,10 @@ fn p4_timeout_decision_reason_is_never_null() {
                 vtype
             );
             assert!(
-                log.decision_reason.as_ref().unwrap().contains("Phase 1"),
+                log.decision_reason
+                    .as_ref()
+                    .unwrap()
+                    .contains("TIMEOUT_PHASE1_NO_DATA"),
                 "decision_reason must explain timeout cause"
             );
         }
@@ -2367,6 +2491,8 @@ fn p4_timeout_deadline_low_phases_subtype() {
     cfg.min_unique_signers = 2;
     cfg.min_buy_count = 2;
     cfg.min_phases_to_pass = 6; // require all 6 → will fail
+    cfg.hard_fail_hhi = 1.0; // isolate low-phases timeout from unrelated hard-fail parity
+    cfg.min_volume_cv = 999.0; // force one non-hard-fail phase miss so legacy path lands on TIMEOUT
 
     let mut buf = GatekeeperBuffer::new(Pubkey::new_unique(), &cfg);
     buf.set_registered_wall_t0(1000);
