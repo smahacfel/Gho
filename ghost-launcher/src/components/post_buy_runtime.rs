@@ -38,8 +38,8 @@ use ghost_brain::execution::paper_lifecycle::{PaperLifecycleConfig, PaperPositio
 use ghost_brain::execution::{CandidateRef, Lane};
 use ghost_brain::guardian::post_buy::engine::{PositionEventContext, PositionJoinMetadata};
 use ghost_brain::guardian::post_buy::{
-    MonitoringEngine, PositionRuntimeRouter, PostBuyGuardianConfig, ShadowPositionBook,
-    SignalRouter, TimeStopV2Config,
+    MonitoringEngine, PositionRuntimeRouter, PostBuyGuardianConfig, ShadowExitReplayConfig,
+    ShadowPositionBook, SignalRouter, TimeStopV2Config,
 };
 use ghost_brain::quotes::{ExecutableQuoteProvider, QuoteProviderConfig};
 use ghost_core::account_state_core::reducer::AccountStateReducer;
@@ -54,7 +54,7 @@ use solana_sdk::signature::{Keypair, Signature};
 use solana_sdk::signer::Signer;
 use solana_sdk::transaction::VersionedTransaction;
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -183,6 +183,8 @@ pub struct PostBuyRuntimeConfig {
     pub shadow_wait_for_timestop: Option<u64>,
     /// Shadow/probe TimeStop V2 observe-only config from `[post_buy_guardian.time_stop_v2]`.
     pub shadow_time_stop_v2: Option<TimeStopV2Config>,
+    /// Shadow-only compact exit replay config from `[post_buy_guardian.exit_replay_v1]`.
+    pub shadow_exit_replay_v1: Option<ShadowExitReplayConfig>,
     /// Canonical ShadowLedger shared with the shadow Guardian runtime.
     pub shadow_ledger: Option<Arc<ShadowLedger>>,
     /// Canonical account-state runtime truth shared with shadow guardian.
@@ -214,6 +216,7 @@ impl Default for PostBuyRuntimeConfig {
             shadow_stoploss_threshold: None,
             shadow_wait_for_timestop: None,
             shadow_time_stop_v2: None,
+            shadow_exit_replay_v1: None,
             shadow_ledger: None,
             account_state_core: None,
             shadow_lifecycle_log_path: None,
@@ -401,7 +404,14 @@ fn build_shadow_guardian_config(config: &PostBuyRuntimeConfig) -> PostBuyGuardia
     if let Some(time_stop_v2) = config.shadow_time_stop_v2.clone() {
         guardian.time_stop_v2 = time_stop_v2;
     }
+    if let Some(exit_replay_v1) = config.shadow_exit_replay_v1.clone() {
+        guardian.exit_replay_v1 = exit_replay_v1;
+    }
     guardian
+}
+
+fn derive_shadow_exit_replay_log_path(lifecycle_log_path: &Path) -> PathBuf {
+    lifecycle_log_path.with_file_name("shadow_exit_replay_v1.jsonl")
 }
 
 fn record_live_sell_rpc_latency(stage: &'static str, latency_ms: u64, outcome: &'static str) {
@@ -1820,6 +1830,7 @@ pub async fn run(
             Some(shadow_ledger) => {
                 let guardian_config = build_shadow_guardian_config(&config);
                 let wait_for_timestop_ms = guardian_config.wait_for_timestop_ms();
+                let exit_replay_enabled = guardian_config.exit_replay_v1.enabled;
                 let (signal_tx, signal_rx) =
                     mpsc::channel(guardian_config.signal_channel_buffer.max(1));
                 let runtime_router = Arc::new(PositionRuntimeRouter::with_shadow_book(Arc::new(
@@ -1845,6 +1856,15 @@ pub async fn run(
                 monitoring_engine.set_event_emitter(emitter.clone());
                 monitoring_engine
                     .set_shadow_lifecycle_log_path(config.shadow_lifecycle_log_path.clone());
+                let exit_replay_log_path = if exit_replay_enabled {
+                    config
+                        .shadow_lifecycle_log_path
+                        .as_deref()
+                        .map(derive_shadow_exit_replay_log_path)
+                } else {
+                    None
+                };
+                monitoring_engine.set_shadow_exit_replay_log_path(exit_replay_log_path);
                 let monitoring_engine = Arc::new(monitoring_engine);
                 shadow_signal_router_handle = Some(tokio::spawn(
                     SignalRouter::new(signal_rx, runtime_router).run(),
@@ -2100,6 +2120,9 @@ pub async fn run(
     if let Some(handle) = shadow_runtime_handle.take() {
         handle.abort();
         let _ = handle.await;
+    }
+    if let Some(monitor) = shadow_monitor.as_ref() {
+        monitor.flush_exit_replay_for_shutdown().await;
     }
     if let Some(handle) = shadow_signal_router_handle.take() {
         handle.abort();
@@ -5103,6 +5126,7 @@ mod tests {
             shadow_stoploss_threshold: None,
             shadow_wait_for_timestop: None,
             shadow_time_stop_v2: None,
+            shadow_exit_replay_v1: None,
             shadow_ledger: None,
             account_state_core: None,
             shadow_lifecycle_log_path: None,
@@ -5205,6 +5229,7 @@ mod tests {
             shadow_stoploss_threshold: None,
             shadow_wait_for_timestop: None,
             shadow_time_stop_v2: None,
+            shadow_exit_replay_v1: None,
             shadow_ledger: None,
             account_state_core: None,
             shadow_lifecycle_log_path: None,
@@ -5318,6 +5343,7 @@ mod tests {
             shadow_stoploss_threshold: None,
             shadow_wait_for_timestop: None,
             shadow_time_stop_v2: None,
+            shadow_exit_replay_v1: None,
             shadow_ledger: None,
             account_state_core: None,
             shadow_lifecycle_log_path: None,

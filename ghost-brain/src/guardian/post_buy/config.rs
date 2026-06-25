@@ -22,6 +22,15 @@ pub const DEFAULT_TIME_STOP_V2_MAX_AVG_VOLUME_PER_TX_SOL_HEARTBEAT: f64 = 0.05;
 pub const DEFAULT_TIME_STOP_V2_MAX_ABS_PRICE_DELTA_PCT_HEARTBEAT: f64 = 1.0;
 pub const DEFAULT_TIME_STOP_V2_MAX_ABS_MCAP_DELTA_PCT_HEARTBEAT: f64 = 1.0;
 pub const DEFAULT_TIME_STOP_V2_MAX_BONDING_DELTA_PCT_HEARTBEAT: f64 = 0.25;
+pub const DEFAULT_EXIT_REPLAY_HORIZON_MS: u64 = 120_000;
+pub const DEFAULT_EXIT_REPLAY_PNL_STEP_BPS: i32 = 25;
+pub const DEFAULT_EXIT_REPLAY_HEARTBEAT_MS: u64 = 1_000;
+pub const DEFAULT_EXIT_REPLAY_MAX_PATH_POINTS: usize = 512;
+pub const DEFAULT_EXIT_REPLAY_SHUTDOWN_FLUSH_BUDGET_MS: u64 = 3_000;
+pub const DEFAULT_EXIT_REPLAY_LEVELS_BPS: [i32; 23] = [
+    -5000, -3000, -2000, -1500, -1000, -700, -500, -300, -200, -100, 100, 200, 300, 400, 500, 700,
+    1000, 1500, 2000, 3000, 5000, 7500, 10000,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -107,6 +116,76 @@ impl TimeStopV2Config {
     }
 }
 
+/// Compact, shadow-only post-buy price path evidence for offline exit replay.
+///
+/// This is a research sidecar. It must never influence BUY/REJECT, live exits,
+/// selector scoring, alpha scoring, or canonical V2.5 confidence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ShadowExitReplayConfig {
+    pub enabled: bool,
+    pub horizon_ms: u64,
+    pub pnl_step_bps: i32,
+    pub heartbeat_ms: u64,
+    pub max_path_points: usize,
+    pub levels_bps: Vec<i32>,
+    pub flush_on_shutdown: bool,
+    pub shutdown_flush_budget_ms: u64,
+}
+
+impl Default for ShadowExitReplayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            horizon_ms: DEFAULT_EXIT_REPLAY_HORIZON_MS,
+            pnl_step_bps: DEFAULT_EXIT_REPLAY_PNL_STEP_BPS,
+            heartbeat_ms: DEFAULT_EXIT_REPLAY_HEARTBEAT_MS,
+            max_path_points: DEFAULT_EXIT_REPLAY_MAX_PATH_POINTS,
+            levels_bps: DEFAULT_EXIT_REPLAY_LEVELS_BPS.to_vec(),
+            flush_on_shutdown: false,
+            shutdown_flush_budget_ms: DEFAULT_EXIT_REPLAY_SHUTDOWN_FLUSH_BUDGET_MS,
+        }
+    }
+}
+
+impl ShadowExitReplayConfig {
+    pub fn horizon_ms(&self) -> u64 {
+        self.horizon_ms.max(1)
+    }
+
+    pub fn pnl_step_bps(&self) -> i32 {
+        if self.pnl_step_bps > 0 {
+            self.pnl_step_bps
+        } else {
+            DEFAULT_EXIT_REPLAY_PNL_STEP_BPS
+        }
+    }
+
+    pub fn heartbeat_ms(&self) -> u64 {
+        self.heartbeat_ms.max(1)
+    }
+
+    pub fn max_path_points(&self) -> usize {
+        self.max_path_points.max(2)
+    }
+
+    pub fn shutdown_flush_budget_ms(&self) -> u64 {
+        self.shutdown_flush_budget_ms
+    }
+
+    pub fn sanitized_levels_bps(&self) -> Vec<i32> {
+        let mut levels = if self.levels_bps.is_empty() {
+            DEFAULT_EXIT_REPLAY_LEVELS_BPS.to_vec()
+        } else {
+            self.levels_bps.clone()
+        };
+        levels.retain(|level| *level != 0);
+        levels.sort_unstable();
+        levels.dedup();
+        levels
+    }
+}
+
 /// Configuration for PostBuy Guardian real-time position monitoring.
 ///
 /// Controls tick frequency, per-module thresholds, and signal aggregation.
@@ -150,6 +229,10 @@ pub struct PostBuyGuardianConfig {
     /// Observe-only TimeStop V2 vitality telemetry.
     #[serde(default)]
     pub time_stop_v2: TimeStopV2Config,
+
+    /// Shadow-only compact exit path replay evidence.
+    #[serde(default)]
+    pub exit_replay_v1: ShadowExitReplayConfig,
 
     // ── LIGMA thresholds ────────────────────────────────────────────────
     /// Retail impact (bps) above which we emit Warning.
@@ -241,6 +324,7 @@ impl Default for PostBuyGuardianConfig {
             stoploss_threshold: None,
             wait_for_timestop: None,
             time_stop_v2: TimeStopV2Config::default(),
+            exit_replay_v1: ShadowExitReplayConfig::default(),
 
             // LIGMA
             ligma_warning_impact_bps: 3500.0,
@@ -337,6 +421,36 @@ mod tests {
         assert_eq!(cfg.stoploss_threshold, Some(50.0));
         assert_eq!(cfg.wait_for_timestop, Some(45_000));
         assert_eq!(cfg.wait_for_timestop_ms(), 45_000);
+    }
+
+    #[test]
+    fn deserialize_exit_replay_v1_defaults_and_overrides() {
+        let cfg: PostBuyGuardianConfig = toml::from_str(
+            r#"
+            [exit_replay_v1]
+            enabled = true
+            horizon_ms = 90000
+            pnl_step_bps = 10
+            heartbeat_ms = 500
+            max_path_points = 128
+            flush_on_shutdown = true
+            shutdown_flush_budget_ms = 2500
+            levels_bps = [-300, 100, 300]
+            "#,
+        )
+        .unwrap();
+
+        assert!(cfg.exit_replay_v1.enabled);
+        assert_eq!(cfg.exit_replay_v1.horizon_ms(), 90_000);
+        assert_eq!(cfg.exit_replay_v1.pnl_step_bps(), 10);
+        assert_eq!(cfg.exit_replay_v1.heartbeat_ms(), 500);
+        assert_eq!(cfg.exit_replay_v1.max_path_points(), 128);
+        assert!(cfg.exit_replay_v1.flush_on_shutdown);
+        assert_eq!(cfg.exit_replay_v1.shutdown_flush_budget_ms(), 2_500);
+        assert_eq!(
+            cfg.exit_replay_v1.sanitized_levels_bps(),
+            vec![-300, 100, 300]
+        );
     }
 
     #[test]

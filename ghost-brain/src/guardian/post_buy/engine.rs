@@ -54,6 +54,10 @@ use trigger::{
 #[cfg(test)]
 use super::config::DEFAULT_WAIT_FOR_TIMESTOP_MS;
 use super::config::{PostBuyGuardianConfig, TimeStopV2Config, TimeStopV2Mode};
+use super::exit_replay::{
+    ShadowExitReplayIdentity, ShadowExitReplayRecord, ShadowExitReplayTracker,
+    REASON_SHUTDOWN_BEFORE_HORIZON,
+};
 #[cfg(test)]
 use super::integration::SHADOW_VIRTUAL_MAGAZINE_TIME_STOP_SECS;
 use super::integration::{PositionRuntimeRouter, ShadowPositionBookAemAdapter};
@@ -949,6 +953,10 @@ pub struct MonitoringEngine {
     event_emitter_secondary: Option<Arc<EventEmitter>>,
     /// Canonical shadow lifecycle/PnL proof log.
     shadow_lifecycle_log_path: Option<PathBuf>,
+    /// Compact research-only exit replay sidecar log.
+    shadow_exit_replay_log_path: Option<PathBuf>,
+    /// Passive replay trackers keyed by mint; independent from active position lifecycle.
+    exit_replay_trackers: Arc<RwLock<HashMap<Pubkey, Vec<ShadowExitReplayTracker>>>>,
 }
 
 impl MonitoringEngine {
@@ -977,6 +985,8 @@ impl MonitoringEngine {
             event_emitter: None,
             event_emitter_secondary: None,
             shadow_lifecycle_log_path: None,
+            shadow_exit_replay_log_path: None,
+            exit_replay_trackers: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -1043,6 +1053,13 @@ impl MonitoringEngine {
 
     pub fn set_shadow_lifecycle_log_path(&mut self, shadow_lifecycle_log_path: Option<PathBuf>) {
         self.shadow_lifecycle_log_path = shadow_lifecycle_log_path;
+    }
+
+    pub fn set_shadow_exit_replay_log_path(
+        &mut self,
+        shadow_exit_replay_log_path: Option<PathBuf>,
+    ) {
+        self.shadow_exit_replay_log_path = shadow_exit_replay_log_path;
     }
 
     pub fn set_aem(
@@ -1186,6 +1203,14 @@ impl MonitoringEngine {
     }
 
     fn current_shadow_curve_snapshot(&self, base_mint: &Pubkey) -> Option<MarketSnapshot> {
+        self.current_shadow_curve_snapshot_with_curve(base_mint, None)
+    }
+
+    fn current_shadow_curve_snapshot_with_curve(
+        &self,
+        base_mint: &Pubkey,
+        bonding_curve_override: Option<Pubkey>,
+    ) -> Option<MarketSnapshot> {
         if let Some(canonical_state) = self.current_canonical_state(base_mint) {
             return Some(SnapshotTimeline::materialize_canonical_snapshot(
                 &canonical_state,
@@ -1198,7 +1223,7 @@ impl MonitoringEngine {
             return None;
         }
 
-        self.legacy_shadow_curve_snapshot(base_mint)
+        self.legacy_shadow_curve_snapshot_with_curve(base_mint, bonding_curve_override)
     }
 
     fn current_runtime_shadow_snapshot(
@@ -1206,7 +1231,17 @@ impl MonitoringEngine {
         base_mint: &Pubkey,
         observed_at_ms: u64,
     ) -> Option<MarketSnapshot> {
-        let mut snapshot = self.current_shadow_curve_snapshot(base_mint)?;
+        self.current_runtime_shadow_snapshot_with_curve(base_mint, observed_at_ms, None)
+    }
+
+    fn current_runtime_shadow_snapshot_with_curve(
+        &self,
+        base_mint: &Pubkey,
+        observed_at_ms: u64,
+        bonding_curve_override: Option<Pubkey>,
+    ) -> Option<MarketSnapshot> {
+        let mut snapshot =
+            self.current_shadow_curve_snapshot_with_curve(base_mint, bonding_curve_override)?;
         let Some(account_state_core) = self.account_state_core.as_ref() else {
             return Some(snapshot);
         };
@@ -1236,11 +1271,20 @@ impl MonitoringEngine {
     }
 
     fn legacy_shadow_curve_snapshot(&self, base_mint: &Pubkey) -> Option<MarketSnapshot> {
+        self.legacy_shadow_curve_snapshot_with_curve(base_mint, None)
+    }
+
+    fn legacy_shadow_curve_snapshot_with_curve(
+        &self,
+        base_mint: &Pubkey,
+        bonding_curve_override: Option<Pubkey>,
+    ) -> Option<MarketSnapshot> {
         let position_bonding_curve = {
             let positions = self.positions.read();
             positions.get(base_mint).map(|pos| pos.bonding_curve)
         };
-        let curve_key = position_bonding_curve
+        let curve_key = bonding_curve_override
+            .or(position_bonding_curve)
             .or_else(|| self.shadow_ledger.resolve_curve_key(base_mint))
             .unwrap_or(*base_mint);
         let curve_state = self.shadow_ledger.get_old(&curve_key).or_else(|| {
@@ -1480,6 +1524,181 @@ impl MonitoringEngine {
                 "PostBuyGuardian: failed to append shadow lifecycle proof"
             );
         }
+    }
+
+    fn append_shadow_exit_replay_record(&self, record: &ShadowExitReplayRecord) {
+        let Some(path) = self.shadow_exit_replay_log_path.as_deref() else {
+            return;
+        };
+        if let Err(error) = Self::append_jsonl_record(path, record) {
+            error!(
+                path = %path.display(),
+                position_id = %record.position_id,
+                error = %error,
+                "PostBuyGuardian: failed to append shadow exit replay proof"
+            );
+        }
+    }
+
+    fn build_exit_replay_tracker(
+        &self,
+        pos: &MonitoredPosition,
+    ) -> Option<ShadowExitReplayTracker> {
+        if !self.config.exit_replay_v1.enabled
+            || self.shadow_exit_replay_log_path.is_none()
+            || !matches!(pos.lane, Lane::Shadow)
+        {
+            return None;
+        }
+
+        let identity = ShadowExitReplayIdentity {
+            run_id: pos.join_metadata.run_id.clone(),
+            session_id: pos.join_metadata.session_id.clone(),
+            candidate_id: pos.candidate_id.clone(),
+            position_id: pos.position_id.clone(),
+            pool_id: pos.pool_amm_id.to_string(),
+            base_mint: pos.base_mint.to_string(),
+            bonding_curve: pos.bonding_curve,
+            entry_ts_ms: pos.entry_unix_ms,
+            entry_price: pos.entry_price_sol.unwrap_or(0.0),
+            entry_source: "shadow_simulated".to_string(),
+        };
+        Some(ShadowExitReplayTracker::new(
+            identity,
+            &self.config.exit_replay_v1,
+        ))
+    }
+
+    fn register_exit_replay_tracker(&self, base_mint: Pubkey, tracker: ShadowExitReplayTracker) {
+        if !tracker.has_valid_entry_price() {
+            let record = tracker.finalize(current_time_ms(), None);
+            self.append_shadow_exit_replay_record(&record);
+            return;
+        }
+
+        let mut trackers = self.exit_replay_trackers.write();
+        trackers.entry(base_mint).or_default().push(tracker);
+    }
+
+    fn active_exit_replay_mints(&self) -> Vec<Pubkey> {
+        self.exit_replay_trackers
+            .read()
+            .iter()
+            .filter_map(|(mint, trackers)| (!trackers.is_empty()).then_some(*mint))
+            .collect()
+    }
+
+    pub fn active_exit_replay_tracker_count(&self) -> usize {
+        self.exit_replay_trackers
+            .read()
+            .values()
+            .map(Vec::len)
+            .sum()
+    }
+
+    fn exit_replay_bonding_curve(&self, base_mint: &Pubkey) -> Option<Pubkey> {
+        self.exit_replay_trackers
+            .read()
+            .get(base_mint)
+            .and_then(|trackers| trackers.first().map(ShadowExitReplayTracker::bonding_curve))
+    }
+
+    fn observe_exit_replay_snapshot(&self, base_mint: &Pubkey, snapshot: &MarketSnapshot) {
+        if !self.config.exit_replay_v1.enabled {
+            return;
+        }
+        let Some(current_price_sol) =
+            PriceTruthResolver::normalize_shadow_snapshot_price_sol(snapshot)
+        else {
+            return;
+        };
+
+        let mut trackers = self.exit_replay_trackers.write();
+        let Some(trackers_for_mint) = trackers.get_mut(base_mint) else {
+            return;
+        };
+        for tracker in trackers_for_mint {
+            tracker.observe_price_sample(snapshot.timestamp_ms, current_price_sol);
+        }
+    }
+
+    fn observe_exit_replay_current_snapshot(&self, base_mint: &Pubkey, now_ms: u64) {
+        let bonding_curve = self.exit_replay_bonding_curve(base_mint);
+        if let Some(snapshot) =
+            self.current_runtime_shadow_snapshot_with_curve(base_mint, now_ms, bonding_curve)
+        {
+            self.observe_exit_replay_snapshot(base_mint, &snapshot);
+        }
+    }
+
+    fn flush_due_exit_replay_trackers(&self, now_ms: u64, forced_reason: Option<&str>) {
+        if !self.config.exit_replay_v1.enabled {
+            return;
+        }
+
+        let mut records = Vec::new();
+        let mut empty_mints = Vec::new();
+        {
+            let mut trackers = self.exit_replay_trackers.write();
+            for (mint, trackers_for_mint) in trackers.iter_mut() {
+                let mut idx = 0;
+                while idx < trackers_for_mint.len() {
+                    let should_finalize = forced_reason.is_some()
+                        || trackers_for_mint[idx].is_horizon_reached(now_ms);
+                    if should_finalize {
+                        let tracker = trackers_for_mint.remove(idx);
+                        records.push(tracker.finalize(now_ms, forced_reason));
+                    } else {
+                        idx += 1;
+                    }
+                }
+                if trackers_for_mint.is_empty() {
+                    empty_mints.push(*mint);
+                }
+            }
+            for mint in empty_mints {
+                trackers.remove(&mint);
+            }
+        }
+
+        for record in records {
+            self.append_shadow_exit_replay_record(&record);
+        }
+    }
+
+    fn observe_all_exit_replay_current_snapshots(&self, now_ms: u64) {
+        for mint in self.active_exit_replay_mints() {
+            self.observe_exit_replay_current_snapshot(&mint, now_ms);
+        }
+    }
+
+    pub async fn flush_exit_replay_for_shutdown(&self) {
+        if !self.config.exit_replay_v1.enabled {
+            return;
+        }
+
+        if self.config.exit_replay_v1.flush_on_shutdown {
+            let deadline = Instant::now()
+                + Duration::from_millis(self.config.exit_replay_v1.shutdown_flush_budget_ms());
+            while self.active_exit_replay_tracker_count() > 0 && Instant::now() < deadline {
+                let now_ms = current_time_ms();
+                self.observe_all_exit_replay_current_snapshots(now_ms);
+                self.flush_due_exit_replay_trackers(now_ms, None);
+                if self.active_exit_replay_tracker_count() == 0 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(self.config.tick_interval_ms.max(50)))
+                    .await;
+            }
+        }
+
+        let now_ms = current_time_ms();
+        self.observe_all_exit_replay_current_snapshots(now_ms);
+        self.flush_due_exit_replay_trackers(now_ms, None);
+        if self.active_exit_replay_tracker_count() == 0 {
+            return;
+        }
+        self.flush_due_exit_replay_trackers(now_ms, Some(REASON_SHUTDOWN_BEFORE_HORIZON));
     }
 
     fn time_stop_v2_evidence(
@@ -1913,7 +2132,12 @@ impl MonitoringEngine {
             snapshot_timeline,
         };
 
+        let exit_replay_tracker = self.build_exit_replay_tracker(&position);
         positions.insert(base_mint, position);
+        drop(positions);
+        if let Some(tracker) = exit_replay_tracker {
+            self.register_exit_replay_tracker(base_mint, tracker);
+        }
         info!(
             "🛡️ PostBuyGuardian: Monitoring started — mint={} pool={} entry_price={:?} SOL",
             base_mint, pool_amm_id, entry_price_sol
@@ -2139,18 +2363,19 @@ impl MonitoringEngine {
 
     /// Single monitoring tick — runs all modules against all positions.
     async fn tick(&self) {
-        let mint_keys: Vec<Pubkey> = {
+        let active_mint_keys: Vec<Pubkey> = {
             let positions = self.positions.read();
-            if positions.is_empty() {
-                return;
-            }
             positions.keys().cloned().collect()
         };
+        let replay_mint_keys = self.active_exit_replay_mints();
+        if active_mint_keys.is_empty() && replay_mint_keys.is_empty() {
+            return;
+        }
 
         let tick_start = Instant::now();
         let now_ms = current_time_ms();
 
-        for base_mint in &mint_keys {
+        for base_mint in &active_mint_keys {
             // Shadow positions must join the managed runtime before the first market
             // snapshot arrives; otherwise the sync step can misclassify "not yet seeded"
             // as "already closed" and emit a bogus PositionClosed without economics.
@@ -2163,6 +2388,7 @@ impl MonitoringEngine {
                     self.cleanup_old_signals(base_mint, now_ms);
                     let runtime_snapshot = self.current_runtime_shadow_snapshot(base_mint, now_ms);
                     if let Some(snapshot) = runtime_snapshot.as_ref() {
+                        self.observe_exit_replay_snapshot(base_mint, snapshot);
                         self.remember_shadow_snapshot(base_mint, snapshot);
                         self.evaluate_time_stop_v2_observe_only(base_mint, Some(snapshot), now_ms);
                         self.run_shadow_runtime_tick(base_mint, Some(snapshot), now_ms)
@@ -2175,6 +2401,9 @@ impl MonitoringEngine {
                 }
             };
 
+            for snapshot in &snapshots {
+                self.observe_exit_replay_snapshot(base_mint, snapshot);
+            }
             let latest = &snapshots[snapshots.len() - 1];
             if self.note_shadow_market_activity(base_mint, latest, now_ms) {
                 self.refresh_shadow_time_stop_anchor(base_mint).await;
@@ -2203,14 +2432,22 @@ impl MonitoringEngine {
             // ── Shadow virtual magazine / exit runtime ─────────────
             let runtime_snapshot = self.current_runtime_shadow_snapshot(base_mint, now_ms);
             let runtime_snapshot = runtime_snapshot.as_ref().unwrap_or(latest);
+            self.observe_exit_replay_snapshot(base_mint, runtime_snapshot);
             self.run_shadow_runtime_tick(base_mint, Some(runtime_snapshot), now_ms)
                 .await;
         }
 
+        for base_mint in replay_mint_keys {
+            if !active_mint_keys.contains(&base_mint) {
+                self.observe_exit_replay_current_snapshot(&base_mint, now_ms);
+            }
+        }
+        self.flush_due_exit_replay_trackers(now_ms, None);
+
         self.flush_aem_outcomes(now_ms);
 
         // ── Auto-unregister: sync with managed position runtime ──
-        self.sync_with_position_runtime(&mint_keys).await;
+        self.sync_with_position_runtime(&active_mint_keys).await;
 
         let tick_elapsed = tick_start.elapsed();
         if tick_elapsed.as_millis() > self.config.tick_interval_ms as u128 {
@@ -2218,7 +2455,7 @@ impl MonitoringEngine {
                 "🛡️ PostBuyGuardian: Tick overrun! Took {}ms (budget={}ms, positions={})",
                 tick_elapsed.as_millis(),
                 self.config.tick_interval_ms,
-                mint_keys.len()
+                active_mint_keys.len()
             );
         }
     }
