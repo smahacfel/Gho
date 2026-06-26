@@ -10,6 +10,7 @@ runtime log directories and must not be imported by runtime decision code.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import statistics
@@ -41,6 +42,15 @@ RECOMMEND_PROMISING = "TIMESTOP_V2_COUNTERFACTUAL_PROMISING"
 RECOMMEND_TOO_MANY_CUTS = "TIMESTOP_V2_TOO_MANY_TARGET_CUTS"
 RECOMMEND_NO_BENEFIT = "TIMESTOP_V2_NO_ECONOMIC_BENEFIT"
 RECOMMEND_NEEDS_MORE_DATA = "TIMESTOP_V2_NEEDS_MORE_DATA"
+
+VERDICT_REJECTED_FOR_RUNTIME = "REJECTED_FOR_RUNTIME"
+VERDICT_INCONCLUSIVE_RESEARCH = "INCONCLUSIVE_RESEARCH"
+VERDICT_PROMISING_OFFLINE_ONLY = "PROMISING_OFFLINE_ONLY"
+VERDICT_ELIGIBLE_FOR_SHADOW_CLOSE_ONLY_PLAN = "ELIGIBLE_FOR_SHADOW_CLOSE_ONLY_PLAN"
+
+DEFAULT_COST_BPS = [0, 50, 100, 150, 200]
+DEFAULT_NEGATIVE_CONTROL_SCOPE = "shadow-burnin-v3-r48-r38-repeat-threshold-probe-target60-stop60-exit-replay-r2"
+NOHARM_SELECTION_COST_BPS = 100
 
 
 @dataclass(frozen=True)
@@ -203,6 +213,20 @@ def mean_int(values: list[int]) -> float:
     return float(sum(values) / len(values)) if values else 0.0
 
 
+def safe_div(numerator: float, denominator: float) -> float:
+    return numerator / denominator if denominator else 0.0
+
+
+def wilson_lower_bound(successes: int, total: int, z: float = 1.959963984540054) -> float:
+    if total <= 0:
+        return 0.0
+    phat = successes / total
+    denom = 1.0 + (z * z / total)
+    center = phat + (z * z / (2.0 * total))
+    margin = z * math.sqrt((phat * (1.0 - phat) + z * z / (4.0 * total)) / total)
+    return max(0.0, (center - margin) / denom)
+
+
 def read_jsonl(path: Path) -> tuple[list[dict[str, Any]], LoadStats]:
     stats = LoadStats(str(path))
     rows: list[dict[str, Any]] = []
@@ -229,25 +253,39 @@ def read_json_objects(path: Path) -> tuple[list[dict[str, Any]], LoadStats]:
     rows: list[dict[str, Any]] = []
     if not path.exists():
         return rows, stats
-    text = path.read_text(encoding="utf-8", errors="ignore")
     decoder = json.JSONDecoder()
-    index = 0
-    length = len(text)
-    while index < length:
-        while index < length and text[index].isspace():
-            index += 1
-        if index >= length:
-            break
-        try:
-            row, next_index = decoder.raw_decode(text, index)
-        except json.JSONDecodeError as exc:
-            stats.add_malformed(f"offset={index} error={exc}")
-            index += 1
-            continue
-        index = next_index
-        if isinstance(row, dict):
-            stats.rows += 1
-            rows.append(row)
+    with path.open("r", encoding="utf-8", errors="ignore") as handle:
+        for line_no, line in enumerate(handle, start=1):
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                row = json.loads(text)
+            except json.JSONDecodeError:
+                index = 0
+                length = len(text)
+                decoded_any = False
+                while index < length:
+                    while index < length and text[index].isspace():
+                        index += 1
+                    if index >= length:
+                        break
+                    try:
+                        row, next_index = decoder.raw_decode(text, index)
+                    except json.JSONDecodeError as exc:
+                        stats.add_malformed(f"line={line_no} offset={index} error={exc}")
+                        break
+                    index = next_index
+                    decoded_any = True
+                    if isinstance(row, dict):
+                        stats.rows += 1
+                        rows.append(row)
+                if not decoded_any:
+                    continue
+                continue
+            if isinstance(row, dict):
+                stats.rows += 1
+                rows.append(row)
     return rows, stats
 
 
@@ -476,6 +514,9 @@ def terminal_context(pos: LifecyclePosition | None) -> dict[str, Any]:
 
 
 def path_points(row: dict[str, Any]) -> list[tuple[int, int]]:
+    cached = row.get("_path_points_cache")
+    if isinstance(cached, list):
+        return cached
     points: list[tuple[int, int]] = []
     raw = row.get("path_bps")
     if not isinstance(raw, list):
@@ -488,6 +529,7 @@ def path_points(row: dict[str, Any]) -> list[tuple[int, int]]:
         if age_ms is not None and pnl_bps is not None:
             points.append((age_ms, pnl_bps))
     points.sort(key=lambda item: item[0])
+    row["_path_points_cache"] = points
     return points
 
 
@@ -559,6 +601,22 @@ def simulate_baseline(
     if pnl_at_hold is None:
         return None
     return BaselineResult(TIMEOUT, max_hold_ms, pnl_at_hold, quality, pnl_quality)
+
+
+def simulate_baseline_cached(
+    row: dict[str, Any],
+    target_bps: int,
+    stop_bps: int,
+    max_hold_ms: int,
+) -> BaselineResult | None:
+    cache = row.setdefault("_baseline_result_cache", {})
+    if not isinstance(cache, dict):
+        cache = {}
+        row["_baseline_result_cache"] = cache
+    key = (target_bps, stop_bps, max_hold_ms)
+    if key not in cache:
+        cache[key] = simulate_baseline(row, target_bps, stop_bps, max_hold_ms)
+    return cache[key]
 
 
 def candidate_pnl(
@@ -710,7 +768,7 @@ def matrix_row(
         replay = pos.get("_exit_replay_row")
         if not isinstance(replay, dict):
             continue
-        baseline = simulate_baseline(replay, target_bps, stop_bps, max_hold_ms)
+        baseline = simulate_baseline_cached(replay, target_bps, stop_bps, max_hold_ms)
         if baseline is None:
             counters["unsupported_rows"] += 1
             continue
@@ -785,6 +843,419 @@ def matrix_row(
     }
 
 
+def assign_chronological_terciles(records: list[dict[str, Any]]) -> None:
+    replay_records = [
+        row for row in records
+        if row.get("has_exit_replay") and row.get("entry_ts_ms") is not None
+    ]
+    replay_records.sort(
+        key=lambda row: (
+            int_or_none(row.get("entry_ts_ms")) or 0,
+            str(row.get("run_id") or ""),
+            str(row.get("session_id") or ""),
+            str(row.get("pool_id") or ""),
+            str(row.get("base_mint") or ""),
+        )
+    )
+    total = len(replay_records)
+    for index, row in enumerate(replay_records):
+        ratio = index / total if total else 0.0
+        if ratio < 1 / 3:
+            split = "train"
+        elif ratio < 2 / 3:
+            split = "validation"
+        else:
+            split = "holdout"
+        row["_chronological_split"] = split
+
+
+def action_class_for_delta(baseline: BaselineResult, delta_bps: int) -> str:
+    if baseline.result == STOP and delta_bps > 0:
+        return "saved_stop"
+    if baseline.result == TARGET:
+        return "cut_target"
+    if baseline.result == TIMEOUT and delta_bps > 0:
+        return "timeout_improved"
+    if delta_bps < 0:
+        return "harmful_exit"
+    if delta_bps > 0:
+        return "beneficial_exit"
+    return "neutral_exit"
+
+
+def cell_action_rows(
+    records: list[dict[str, Any]],
+    target_bps: int,
+    stop_bps: int,
+    max_hold_ms: int,
+    *,
+    roundtrip_cost_bps: int = 0,
+) -> list[dict[str, Any]]:
+    actions: list[dict[str, Any]] = []
+    for row in records:
+        replay = row.get("_exit_replay_row")
+        join_quality = str(row.get("join_quality") or "missing")
+        candidate_class = str(row.get("candidate_class") or "missing")
+        base = {
+            "run_id": row.get("run_id"),
+            "session_id": row.get("session_id"),
+            "pool_id": row.get("pool_id"),
+            "base_mint": row.get("base_mint"),
+            "entry_ts_ms": row.get("entry_ts_ms"),
+            "segment": row.get("_chronological_split") or "unassigned",
+            "target_bps": target_bps,
+            "stop_bps": stop_bps,
+            "max_hold_ms": max_hold_ms,
+            "roundtrip_cost_bps": roundtrip_cost_bps,
+            "join_quality": join_quality,
+            "candidate_class": candidate_class,
+            "has_exit_replay": bool(row.get("has_exit_replay")),
+            "has_tsv2_windows": bool(row.get("has_tsv2_windows")),
+            "has_candidate": bool(row.get("has_candidate")),
+            "active_exit_eligible_lifecycle": bool(row.get("active_exit_eligible")),
+        }
+        if not isinstance(replay, dict):
+            actions.append(
+                {
+                    **base,
+                    "supported": False,
+                    "action_taken": False,
+                    "classification": "no_exit_replay",
+                    "exclusion_reason": "lifecycle_without_exit_replay",
+                    "baseline_result": UNKNOWN,
+                    "baseline_result_quality": "unavailable",
+                    "baseline_pnl_bps": None,
+                    "tsv2_pnl_bps": None,
+                    "delta_bps": None,
+                    "baseline_pnl_after_cost_bps": None,
+                    "tsv2_pnl_after_cost_bps": None,
+                    "delta_after_cost_bps": None,
+                }
+            )
+            continue
+
+        baseline = simulate_baseline_cached(replay, target_bps, stop_bps, max_hold_ms)
+        if baseline is None:
+            actions.append(
+                {
+                    **base,
+                    "supported": False,
+                    "action_taken": False,
+                    "classification": "unsupported_replay",
+                    "exclusion_reason": "baseline_unavailable",
+                    "baseline_result": UNKNOWN,
+                    "baseline_result_quality": "unavailable",
+                    "baseline_pnl_bps": None,
+                    "tsv2_pnl_bps": None,
+                    "delta_bps": None,
+                    "baseline_pnl_after_cost_bps": None,
+                    "tsv2_pnl_after_cost_bps": None,
+                    "delta_after_cost_bps": None,
+                }
+            )
+            continue
+
+        candidate_age = int_or_none(row.get("first_candidate_age_ms"))
+        candidate_pnl_bps = int_or_none(row.get("candidate_pnl_bps"))
+        candidate_before_baseline = (
+            bool(row.get("active_exit_eligible"))
+            and candidate_age is not None
+            and candidate_pnl_bps is not None
+            and candidate_age <= baseline.exit_age_ms
+            and candidate_age <= max_hold_ms
+        )
+
+        action_taken = False
+        exclusion_reason = ""
+        if candidate_class == "stale_data_no_action":
+            exclusion_reason = "stale_data_no_action"
+        elif join_quality in {"fallback_duplicate_ambiguous", "unmatched_exit_replay"}:
+            exclusion_reason = join_quality
+        elif not row.get("has_tsv2_windows"):
+            exclusion_reason = "no_tsv2_windows"
+        elif not row.get("has_candidate"):
+            exclusion_reason = "no_candidate"
+        elif not row.get("active_exit_eligible"):
+            exclusion_reason = "not_active_exit_eligible"
+        elif candidate_age is None:
+            exclusion_reason = "missing_candidate_age"
+        elif candidate_pnl_bps is None:
+            exclusion_reason = "missing_candidate_pnl"
+        elif candidate_age > max_hold_ms:
+            exclusion_reason = "candidate_after_max_hold"
+        elif candidate_age > baseline.exit_age_ms:
+            exclusion_reason = "candidate_after_baseline_exit"
+        elif candidate_before_baseline:
+            action_taken = True
+        else:
+            exclusion_reason = "not_active_exit_eligible"
+
+        if action_taken:
+            tsv2_pnl = candidate_pnl_bps if candidate_pnl_bps is not None else baseline.pnl_bps
+            delta = int(tsv2_pnl - baseline.pnl_bps)
+            classification = action_class_for_delta(baseline, delta)
+        else:
+            tsv2_pnl = baseline.pnl_bps
+            delta = 0
+            classification = "no_active_exit"
+
+        actions.append(
+            {
+                **base,
+                "supported": True,
+                "action_taken": action_taken,
+                "classification": classification,
+                "exclusion_reason": exclusion_reason,
+                "baseline_result": baseline.result,
+                "baseline_exit_age_ms": baseline.exit_age_ms,
+                "baseline_result_quality": baseline.result_quality,
+                "baseline_pnl_quality": baseline.pnl_quality,
+                "baseline_pnl_bps": baseline.pnl_bps,
+                "tsv2_pnl_bps": tsv2_pnl,
+                "delta_bps": delta,
+                "baseline_pnl_after_cost_bps": baseline.pnl_bps - roundtrip_cost_bps,
+                "tsv2_pnl_after_cost_bps": tsv2_pnl - roundtrip_cost_bps,
+                "delta_after_cost_bps": delta,
+                "candidate_age_ms": candidate_age,
+                "candidate_pnl_bps": candidate_pnl_bps,
+                "candidate_before_baseline_exit": candidate_before_baseline,
+            }
+        )
+    return actions
+
+
+def max_consecutive_harmful_actions(actions: list[dict[str, Any]]) -> int:
+    ordered = sorted(
+        [row for row in actions if row.get("action_taken")],
+        key=lambda row: (
+            int_or_none(row.get("entry_ts_ms")) or 0,
+            str(row.get("run_id") or ""),
+            str(row.get("session_id") or ""),
+            str(row.get("pool_id") or ""),
+            str(row.get("base_mint") or ""),
+        ),
+    )
+    best = 0
+    current = 0
+    for row in ordered:
+        if row.get("classification") in {"cut_target", "harmful_exit"}:
+            current += 1
+            best = max(best, current)
+        else:
+            current = 0
+    return best
+
+
+def summarize_action_rows(actions: list[dict[str, Any]], *, prefix: str = "") -> dict[str, Any]:
+    supported = [row for row in actions if row.get("supported")]
+    deltas = [int(row.get("delta_after_cost_bps") or 0) for row in supported]
+    baseline_pnls = [int(row.get("baseline_pnl_after_cost_bps") or 0) for row in supported]
+    tsv2_pnls = [int(row.get("tsv2_pnl_after_cost_bps") or 0) for row in supported]
+    counts = Counter(str(row.get("classification") or "missing") for row in actions)
+    baseline_counts = Counter(str(row.get("baseline_result") or UNKNOWN) for row in supported)
+    exclusion_counts = Counter(str(row.get("exclusion_reason") or "none") for row in actions)
+    quality_counts = Counter(str(row.get("baseline_result_quality") or "unavailable") for row in supported)
+
+    beneficial_classes = {"saved_stop", "timeout_improved", "beneficial_exit"}
+    harmful_classes = {"cut_target", "harmful_exit"}
+    beneficial_rows = [row for row in supported if row.get("classification") in beneficial_classes]
+    harmful_rows = [row for row in supported if row.get("classification") in harmful_classes]
+    neutral_rows = [row for row in supported if row.get("classification") == "neutral_exit"]
+    action_rows = [row for row in supported if row.get("action_taken")]
+
+    saved_stop_rows = [row for row in supported if row.get("classification") == "saved_stop"]
+    target_cut_rows = [row for row in supported if row.get("classification") == "cut_target"]
+    timeout_improved_rows = [row for row in supported if row.get("classification") == "timeout_improved"]
+    generic_beneficial_rows = [row for row in supported if row.get("classification") == "beneficial_exit"]
+
+    beneficial_count = len(beneficial_rows)
+    harmful_count = len(harmful_rows)
+    precision_denominator = beneficial_count + harmful_count
+    saved_stop_bps = sum(max(0, int(row.get("delta_after_cost_bps") or 0)) for row in saved_stop_rows)
+    timeout_improved_bps = sum(max(0, int(row.get("delta_after_cost_bps") or 0)) for row in timeout_improved_rows)
+    generic_beneficial_bps = sum(max(0, int(row.get("delta_after_cost_bps") or 0)) for row in generic_beneficial_rows)
+    target_cut_damage_bps = sum(max(0, -int(row.get("delta_after_cost_bps") or 0)) for row in target_cut_rows)
+    harmful_damage_bps = sum(max(0, -int(row.get("delta_after_cost_bps") or 0)) for row in harmful_rows)
+    gross_saved_damage_bps = saved_stop_bps + timeout_improved_bps + generic_beneficial_bps
+    target_cut_count_guard_limit = len(saved_stop_rows) + 0.10 * len(timeout_improved_rows)
+    target_cut_damage_guard_pass = target_cut_damage_bps <= 0.25 * gross_saved_damage_bps if gross_saved_damage_bps else target_cut_damage_bps == 0
+    target_cut_count_guard_pass = len(target_cut_rows) <= target_cut_count_guard_limit
+
+    out = {
+        "supported_rows": len(supported),
+        "unsupported_rows": len(actions) - len(supported),
+        "action_taken_count": len(action_rows),
+        "no_action_count": len(supported) - len(action_rows),
+        "baseline_target_count": baseline_counts[TARGET],
+        "baseline_stop_count": baseline_counts[STOP],
+        "baseline_timeout_count": baseline_counts[TIMEOUT],
+        "baseline_sum_after_cost_bps": sum(baseline_pnls),
+        "baseline_avg_after_cost_bps": mean_int(baseline_pnls),
+        "baseline_median_after_cost_bps": median_int(baseline_pnls),
+        "tsv2_sum_after_cost_bps": sum(tsv2_pnls),
+        "tsv2_avg_after_cost_bps": mean_int(tsv2_pnls),
+        "tsv2_median_after_cost_bps": median_int(tsv2_pnls),
+        "delta_sum_bps": sum(deltas),
+        "delta_avg_bps": mean_int(deltas),
+        "delta_median_bps": median_int(deltas),
+        "action_delta_avg_bps": mean_int([int(row.get("delta_after_cost_bps") or 0) for row in action_rows]),
+        "action_delta_median_bps": median_int([int(row.get("delta_after_cost_bps") or 0) for row in action_rows]),
+        "beneficial_exit_count": beneficial_count,
+        "harmful_exit_count": harmful_count,
+        "neutral_exit_count": len(neutral_rows),
+        "exit_action_precision": safe_div(beneficial_count, precision_denominator),
+        "exit_action_precision_denominator": precision_denominator,
+        "exit_action_precision_wilson95_lower": wilson_lower_bound(beneficial_count, precision_denominator),
+        "saved_stop_count": len(saved_stop_rows),
+        "saved_stop_damage_bps": saved_stop_bps,
+        "target_cut_count": len(target_cut_rows),
+        "target_cut_damage_bps": target_cut_damage_bps,
+        "timeout_improved_count": len(timeout_improved_rows),
+        "timeout_improved_bps": timeout_improved_bps,
+        "generic_beneficial_count": len(generic_beneficial_rows),
+        "generic_beneficial_bps": generic_beneficial_bps,
+        "gross_saved_damage_bps": gross_saved_damage_bps,
+        "harmful_damage_bps": harmful_damage_bps,
+        "target_cut_damage_guard_pass": target_cut_damage_guard_pass,
+        "target_cut_count_guard_pass": target_cut_count_guard_pass,
+        "target_cut_count_guard_limit": target_cut_count_guard_limit,
+        "stale_no_action_exclusions": exclusion_counts["stale_data_no_action"],
+        "no_candidate_exclusions": exclusion_counts["no_candidate"],
+        "not_active_exit_eligible_exclusions": exclusion_counts["not_active_exit_eligible"],
+        "candidate_after_baseline_exclusions": exclusion_counts["candidate_after_baseline_exit"],
+        "candidate_after_max_hold_exclusions": exclusion_counts["candidate_after_max_hold"],
+        "ambiguous_unjoined_exclusions": exclusion_counts["fallback_duplicate_ambiguous"] + exclusion_counts["unmatched_exit_replay"],
+        "lifecycle_without_exit_replay_exclusions": counts["no_exit_replay"],
+        "exact_rows": quality_counts[EXACT_LEVELS],
+        "path_approx_rows": quality_counts[PATH_APPROX],
+        "baseline_unavailable_rows": counts["unsupported_replay"],
+        "max_consecutive_harmful_actions": max_consecutive_harmful_actions(actions),
+        "classification_counts": json.dumps(dict(sorted(counts.items())), sort_keys=True),
+        "exclusion_counts": json.dumps(dict(sorted(exclusion_counts.items())), sort_keys=True),
+    }
+    if prefix:
+        return {f"{prefix}{key}": value for key, value in out.items()}
+    return out
+
+
+def build_noharm_tables(
+    records: list[dict[str, Any]],
+    targets_bps: list[int],
+    stops_bps: list[int],
+    max_hold_values: list[int],
+    costs_bps: list[int],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    summary_rows: list[dict[str, Any]] = []
+    cost_rows: list[dict[str, Any]] = []
+    stability_rows: list[dict[str, Any]] = []
+    for target_bps in targets_bps:
+        for stop_bps in stops_bps:
+            for max_hold_ms in max_hold_values:
+                cost100_actions = cell_action_rows(
+                    records,
+                    target_bps,
+                    stop_bps,
+                    max_hold_ms,
+                    roundtrip_cost_bps=NOHARM_SELECTION_COST_BPS,
+                )
+                cost100_summary = summarize_action_rows(cost100_actions)
+                base_keys = {
+                    "target_bps": target_bps,
+                    "stop_bps": stop_bps,
+                    "max_hold_ms": max_hold_ms,
+                }
+                summary_rows.append(
+                    {
+                        **base_keys,
+                        **{f"cost100_{key}": value for key, value in cost100_summary.items()},
+                    }
+                )
+                for cost in costs_bps:
+                    actions = cell_action_rows(records, target_bps, stop_bps, max_hold_ms, roundtrip_cost_bps=cost)
+                    metrics = summarize_action_rows(actions)
+                    cost_rows.append(
+                        {
+                            **base_keys,
+                            "roundtrip_cost_bps": cost,
+                            **metrics,
+                        }
+                    )
+                for segment in ("train", "validation", "holdout"):
+                    segment_actions = [row for row in cost100_actions if row.get("segment") == segment]
+                    metrics = summarize_action_rows(segment_actions)
+                    stability_rows.append(
+                        {
+                            **base_keys,
+                            "segment": segment,
+                            "roundtrip_cost_bps": NOHARM_SELECTION_COST_BPS,
+                            **metrics,
+                        }
+                    )
+    return summary_rows, cost_rows, stability_rows
+
+
+def choose_noharm_best(summary_rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not summary_rows:
+        return None
+    return max(
+        summary_rows,
+        key=lambda row: (
+            float(row.get("cost100_delta_sum_bps") or 0.0),
+            float(row.get("cost100_exit_action_precision_wilson95_lower") or 0.0),
+            float(row.get("cost100_exit_action_precision") or 0.0),
+            -float(row.get("cost100_target_cut_damage_bps") or 0.0),
+            int(row.get("target_bps") or 0),
+            int(row.get("stop_bps") or 0),
+            int(row.get("max_hold_ms") or 0),
+        ),
+    )
+
+
+def build_grid_neighborhood(
+    summary_rows: list[dict[str, Any]],
+    targets_bps: list[int],
+    stops_bps: list[int],
+    max_hold_values: list[int],
+    best: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    if best is None:
+        return []
+    by_key = {
+        (int(row["target_bps"]), int(row["stop_bps"]), int(row["max_hold_ms"])): row
+        for row in summary_rows
+    }
+    target_idx = targets_bps.index(int(best["target_bps"]))
+    stop_idx = stops_bps.index(int(best["stop_bps"]))
+    hold_idx = max_hold_values.index(int(best["max_hold_ms"]))
+    output: list[dict[str, Any]] = []
+    for ti in range(max(0, target_idx - 1), min(len(targets_bps), target_idx + 2)):
+        for si in range(max(0, stop_idx - 1), min(len(stops_bps), stop_idx + 2)):
+            for hi in range(max(0, hold_idx - 1), min(len(max_hold_values), hold_idx + 2)):
+                key = (targets_bps[ti], stops_bps[si], max_hold_values[hi])
+                row = by_key.get(key)
+                if row is None:
+                    continue
+                output.append(
+                    {
+                        "target_bps": key[0],
+                        "stop_bps": key[1],
+                        "max_hold_ms": key[2],
+                        "is_best": key == (int(best["target_bps"]), int(best["stop_bps"]), int(best["max_hold_ms"])),
+                        "cost100_delta_sum_bps": row.get("cost100_delta_sum_bps"),
+                        "cost100_delta_avg_bps": row.get("cost100_delta_avg_bps"),
+                        "cost100_delta_median_bps": row.get("cost100_delta_median_bps"),
+                        "cost100_exit_action_precision": row.get("cost100_exit_action_precision"),
+                        "cost100_exit_action_precision_wilson95_lower": row.get("cost100_exit_action_precision_wilson95_lower"),
+                        "cost100_beneficial_exit_count": row.get("cost100_beneficial_exit_count"),
+                        "cost100_harmful_exit_count": row.get("cost100_harmful_exit_count"),
+                        "cost100_target_cut_damage_bps": row.get("cost100_target_cut_damage_bps"),
+                        "cost100_gross_saved_damage_bps": row.get("cost100_gross_saved_damage_bps"),
+                        "positive_delta": float(row.get("cost100_delta_sum_bps") or 0.0) > 0,
+                    }
+                )
+    return output
+
+
 def build_position_records(
     replay_positions: list[ExitReplayPosition],
     lifecycle_positions: list[LifecyclePosition],
@@ -815,7 +1286,7 @@ def build_position_records(
             and candidate_before_lifecycle is True
             and tsv2.candidate_class != "stale_data_no_action"
         )
-        baseline = simulate_baseline(replay.row, target_bps, stop_bps, max_hold_ms)
+        baseline = simulate_baseline_cached(replay.row, target_bps, stop_bps, max_hold_ms)
         candidate_before_baseline = (
             baseline is not None
             and tsv2.first_candidate_age_ms is not None
@@ -1101,6 +1572,21 @@ def write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
             handle.write("\n")
 
 
+def write_csv(path: Path, rows: list[dict[str, Any]], fieldnames: list[str] | None = None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if fieldnames is None:
+        fieldnames = []
+        for row in rows:
+            for key in row:
+                if key not in fieldnames:
+                    fieldnames.append(key)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
 def pct(value: float) -> str:
     return f"{value * 100.0:.2f}%"
 
@@ -1196,6 +1682,383 @@ def write_markdown(path: Path, report: dict[str, Any]) -> None:
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def inspect_scope_coverage(root: Path, scope: str, resurrection_windows_ms: list[int]) -> dict[str, Any]:
+    base = root / "logs" / "shadow_run" / scope
+    paths = {
+        "shadow_exit_replay": base / "shadow_exit_replay_v1.jsonl",
+        "shadow_lifecycle": base / "shadow_lifecycle.jsonl",
+        "probe_shadow_lifecycle": base / "probe_shadow_lifecycle.jsonl",
+    }
+    replay_positions, replay_stats = load_exit_replay_positions(paths["shadow_exit_replay"])
+    lifecycle_positions, lifecycle_stats = load_lifecycle_positions(
+        paths["shadow_lifecycle"],
+        paths["probe_shadow_lifecycle"],
+    )
+    joined, join_quality = join_lifecycle(replay_positions, lifecycle_positions)
+    records = build_position_records(
+        replay_positions,
+        lifecycle_positions,
+        joined,
+        6000,
+        -6000,
+        120000,
+        resurrection_windows_ms,
+    )
+    return {
+        "scope": scope,
+        "input_paths": {key: str(value) for key, value in paths.items()},
+        "positions": len(records),
+        "positions_with_exit_replay": sum(1 for row in records if row.get("has_exit_replay")),
+        "positions_with_tsv2_windows": sum(1 for row in records if row.get("has_tsv2_windows")),
+        "candidate_positions": sum(1 for row in records if row.get("has_candidate")),
+        "stale_data_no_action_candidates": sum(1 for row in records if row.get("candidate_class") == "stale_data_no_action"),
+        "join_quality": join_quality,
+        "load_stats": [
+            {
+                "path": stat.path,
+                "rows": stat.rows,
+                "malformed_rows": stat.malformed_rows,
+            }
+            for stat in [replay_stats, *lifecycle_stats]
+        ],
+    }
+
+
+def row_for_cost(
+    cost_rows: list[dict[str, Any]],
+    target_bps: int,
+    stop_bps: int,
+    max_hold_ms: int,
+    cost_bps: int,
+) -> dict[str, Any] | None:
+    for row in cost_rows:
+        if (
+            int(row["target_bps"]) == target_bps
+            and int(row["stop_bps"]) == stop_bps
+            and int(row["max_hold_ms"]) == max_hold_ms
+            and int(row["roundtrip_cost_bps"]) == cost_bps
+        ):
+            return row
+    return None
+
+
+def rows_for_variant(rows: list[dict[str, Any]], target_bps: int, stop_bps: int, max_hold_ms: int) -> list[dict[str, Any]]:
+    return [
+        row for row in rows
+        if int(row["target_bps"]) == target_bps
+        and int(row["stop_bps"]) == stop_bps
+        and int(row["max_hold_ms"]) == max_hold_ms
+    ]
+
+
+def evaluate_noharm_verdict(
+    best: dict[str, Any] | None,
+    cost_rows: list[dict[str, Any]],
+    stability_rows: list[dict[str, Any]],
+    neighborhood_rows: list[dict[str, Any]],
+    coverage: dict[str, Any],
+    negative_control: dict[str, Any] | None,
+) -> tuple[str, list[str], list[str]]:
+    blockers: list[str] = []
+    shadow_close_blockers: list[str] = ["requires minimum two independent TSV2 scopes; only one full TSV2-window scope is available"]
+    if best is None:
+        return VERDICT_REJECTED_FOR_RUNTIME, ["no grid rows"], shadow_close_blockers
+
+    target_bps = int(best["target_bps"])
+    stop_bps = int(best["stop_bps"])
+    max_hold_ms = int(best["max_hold_ms"])
+    cost100 = row_for_cost(cost_rows, target_bps, stop_bps, max_hold_ms, 100)
+    cost200 = row_for_cost(cost_rows, target_bps, stop_bps, max_hold_ms, 200)
+    if coverage.get("positions_with_tsv2_windows", 0) <= 0:
+        blockers.append("main scope has no TimeStop V2 windows")
+    if coverage.get("positions_with_exit_replay", 0) <= 0:
+        blockers.append("main scope has no exit replay rows")
+    if negative_control and negative_control.get("positions_with_tsv2_windows", 0) != 0:
+        blockers.append("R48/R2 negative control unexpectedly has TSV2 windows")
+    if cost100 is None or cost200 is None:
+        blockers.append("cost100/cost200 rows missing")
+    else:
+        if float(cost100["delta_sum_bps"]) <= 0:
+            blockers.append("cost100_delta_sum_bps <= 0")
+        if float(cost200["delta_sum_bps"]) <= 0:
+            blockers.append("cost200_delta_sum_bps <= 0")
+        if float(cost100["delta_avg_bps"]) <= 0:
+            blockers.append("cost100_delta_avg_bps <= 0")
+        if float(cost100["delta_median_bps"]) < 0:
+            blockers.append("cost100_delta_median_bps < 0")
+        if float(cost100["exit_action_precision"]) < 0.70:
+            blockers.append("exit_action_precision < 0.70")
+        if float(cost100["exit_action_precision_wilson95_lower"]) < 0.65:
+            blockers.append("Wilson lower bound 95% < 0.65")
+        if not bool(cost100["target_cut_damage_guard_pass"]):
+            blockers.append("target_cut_damage_bps > 25% gross_saved_damage_bps")
+        if not bool(cost100["target_cut_count_guard_pass"]):
+            blockers.append("target_cut_count exceeds saved_stop_count + 10% timeout_improved_count")
+        denominator = float(cost100["exit_action_precision_denominator"] or 0.0)
+        stale_exclusions = float(cost100["stale_no_action_exclusions"] or 0.0)
+        ambiguous = float(cost100["ambiguous_unjoined_exclusions"] or 0.0)
+        if denominator and stale_exclusions / denominator > 0.05:
+            blockers.append("stale/no-action exclusions are too large relative to precision denominator")
+        if ambiguous > 0:
+            blockers.append("ambiguous/unjoined exclusions are non-zero")
+
+    selected_stability = rows_for_variant(stability_rows, target_bps, stop_bps, max_hold_ms)
+    positive_segment_sum = 0.0
+    total_positive_delta = 0.0
+    max_segment_positive = 0.0
+    for row in selected_stability:
+        segment = row["segment"]
+        delta_sum = float(row["delta_sum_bps"])
+        precision = float(row["exit_action_precision"])
+        harmful = int(row["harmful_exit_count"])
+        if precision < 0.60:
+            blockers.append(f"{segment}: action precision < 0.60")
+        if delta_sum <= 0:
+            blockers.append(f"{segment}: delta_sum_bps <= 0")
+        if harmful <= 0:
+            pass
+        positive_segment_sum += max(0.0, delta_sum)
+        max_segment_positive = max(max_segment_positive, max(0.0, delta_sum))
+    if cost100 is not None:
+        total_positive_delta = max(0.0, float(cost100["delta_sum_bps"]))
+    if total_positive_delta > 0 and max_segment_positive / total_positive_delta > 0.60:
+        blockers.append("one chronological tercile contributes >60% of total positive delta")
+    if positive_segment_sum <= 0:
+        blockers.append("no positive chronological segment contribution")
+
+    if neighborhood_rows and not all(bool(row.get("positive_delta")) for row in neighborhood_rows):
+        blockers.append("grid-neighborhood contains non-positive adjacent variants")
+    if not neighborhood_rows:
+        blockers.append("grid-neighborhood rows missing")
+
+    if blockers:
+        if cost100 is None or float(cost100.get("delta_sum_bps", 0.0)) <= 0:
+            return VERDICT_REJECTED_FOR_RUNTIME, blockers, shadow_close_blockers
+        return VERDICT_INCONCLUSIVE_RESEARCH, blockers, shadow_close_blockers
+    return VERDICT_PROMISING_OFFLINE_ONLY, blockers, shadow_close_blockers
+
+
+def markdown_table(rows: list[dict[str, Any]], columns: list[str], limit: int | None = None) -> str:
+    selected = rows[:limit] if limit is not None else rows
+    lines = ["| " + " | ".join(columns) + " |", "| " + " | ".join("---" for _ in columns) + " |"]
+    for row in selected:
+        values = []
+        for column in columns:
+            value = row.get(column, "")
+            if isinstance(value, float):
+                value = f"{value:.6g}"
+            values.append(str(value))
+        lines.append("| " + " | ".join(values) + " |")
+    return "\n".join(lines)
+
+
+def write_noharm_markdown(
+    path: Path,
+    *,
+    scope: str,
+    input_paths: dict[str, str],
+    coverage: dict[str, Any],
+    negative_control: dict[str, Any] | None,
+    resurrection_summary: dict[str, Any],
+    best: dict[str, Any] | None,
+    cost_rows: list[dict[str, Any]],
+    stability_rows: list[dict[str, Any]],
+    neighborhood_rows: list[dict[str, Any]],
+    verdict_value: str,
+    blockers: list[str],
+    shadow_close_blockers: list[str],
+    output_files: dict[str, Path],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    display_verdict = verdict_value
+    if verdict_value == VERDICT_INCONCLUSIVE_RESEARCH:
+        display_verdict = "INCONCLUSIVE_RESEARCH / REJECTED_FOR_RUNTIME"
+    lines = [
+        "# TimeStop V2 No-Harm / Action-Precision Proof A1",
+        "",
+        f"Generated UTC: `{utc_now_iso()}`",
+        f"Scope: `{scope}`",
+        f"Final verdict: `{display_verdict}`",
+        "No basis for runtime change.",
+        "No basis for shadow_close_only plan.",
+        "Positive action precision is blocked by target-cut guard.",
+        "",
+        "## PR-ORG-A0 Closure",
+        "",
+        "`DONE / REJECTED_FOR_RUNTIME / INCONCLUSIVE_RESEARCH / KEEP_AS_NEGATIVE_EVIDENCE`",
+        "",
+        "Do not continue ORG-A0 as PR-ORG-A0b, C6/C7/C8, more R48/R2 threshold tuning, organic hard gates, selector reranker, `alpha_31100`, XGBoost, Gatekeeper BUY/REJECT change, or `shadow_close_only` based on ORG-A0.",
+        "",
+        "Reason: ORG-A0 showed that the F5/C1 positive avg came from a sparse right tail, not a stable organic edge. After removing top 5%, S1_F5 and C1 are negative; C1 does not beat F5 on holdout; C2-C5 have 0% Target on holdout; all cost-adjusted medians are negative.",
+        "",
+        "## Scope Boundaries",
+        "",
+        "- Offline/read-only proof only.",
+        "- No Gatekeeper runtime change.",
+        "- No BUY/REJECT change.",
+        "- No `v25_confidence`, V3, selector runtime, `alpha_31100`, TX builder, sender, Jito path, live execution, or existing log mutation.",
+        "- This proof evaluates only `exit_action_precision = beneficial_exit / (beneficial_exit + harmful_exit)`.",
+        "- It does not use or report entry target precision as an acceptance metric.",
+        "",
+        "## Inputs",
+        "",
+        "```json",
+        json.dumps(input_paths, indent=2, sort_keys=True),
+        "```",
+        "",
+        "## Coverage and Join Quality",
+        "",
+        "```json",
+        json.dumps(coverage, indent=2, sort_keys=True, default=str),
+        "```",
+        "",
+        "## R48/R2 Negative Coverage Control",
+        "",
+        "R48/R2 is used only as a no-window coverage control.",
+        "",
+        "```json",
+        json.dumps(negative_control or {}, indent=2, sort_keys=True, default=str),
+        "```",
+        "",
+        "## Resurrection Checks",
+        "",
+        "```json",
+        json.dumps(resurrection_summary, indent=2, sort_keys=True, default=str),
+        "```",
+        "",
+    ]
+    if best is None:
+        lines.extend(["## Best Variant", "", "No grid variant available.", ""])
+    else:
+        target_bps = int(best["target_bps"])
+        stop_bps = int(best["stop_bps"])
+        max_hold_ms = int(best["max_hold_ms"])
+        selected_costs = [
+            row for row in cost_rows
+            if int(row["target_bps"]) == target_bps
+            and int(row["stop_bps"]) == stop_bps
+            and int(row["max_hold_ms"]) == max_hold_ms
+        ]
+        selected_stability = [
+            row for row in stability_rows
+            if int(row["target_bps"]) == target_bps
+            and int(row["stop_bps"]) == stop_bps
+            and int(row["max_hold_ms"]) == max_hold_ms
+        ]
+        lines.extend(
+            [
+                "## Best Variant",
+                "",
+                f"- target_bps: `{target_bps}`",
+                f"- stop_bps: `{stop_bps}`",
+                f"- max_hold_ms: `{max_hold_ms}`",
+                f"- selection: max `cost100_delta_sum_bps`, then Wilson lower bound, action precision, and lower target-cut damage.",
+                "",
+                "## Cost Sensitivity for Best Variant",
+                "",
+                markdown_table(
+                    selected_costs,
+                    [
+                        "roundtrip_cost_bps",
+                        "supported_rows",
+                        "action_taken_count",
+                        "delta_sum_bps",
+                        "delta_avg_bps",
+                        "delta_median_bps",
+                        "exit_action_precision",
+                        "exit_action_precision_wilson95_lower",
+                        "beneficial_exit_count",
+                        "harmful_exit_count",
+                        "target_cut_count",
+                        "target_cut_damage_bps",
+                        "saved_stop_count",
+                        "saved_stop_damage_bps",
+                        "timeout_improved_count",
+                        "timeout_improved_bps",
+                        "stale_no_action_exclusions",
+                        "no_candidate_exclusions",
+                        "ambiguous_unjoined_exclusions",
+                        "exact_rows",
+                        "path_approx_rows",
+                    ],
+                ),
+                "",
+                "## Chronological Stability for Best Variant",
+                "",
+                markdown_table(
+                    selected_stability,
+                    [
+                        "segment",
+                        "supported_rows",
+                        "action_taken_count",
+                        "delta_sum_bps",
+                        "delta_avg_bps",
+                        "exit_action_precision",
+                        "exit_action_precision_wilson95_lower",
+                        "beneficial_exit_count",
+                        "harmful_exit_count",
+                        "max_consecutive_harmful_actions",
+                    ],
+                ),
+                "",
+                "## Grid-Neighborhood Stability",
+                "",
+                markdown_table(
+                    neighborhood_rows,
+                    [
+                        "target_bps",
+                        "stop_bps",
+                        "max_hold_ms",
+                        "is_best",
+                        "cost100_delta_sum_bps",
+                        "cost100_delta_avg_bps",
+                        "cost100_exit_action_precision",
+                        "cost100_exit_action_precision_wilson95_lower",
+                        "positive_delta",
+                    ],
+                ),
+                "",
+            ]
+        )
+    lines.extend(
+        [
+            "## Verdict",
+            "",
+            f"`{display_verdict}`",
+            "",
+            "No basis for runtime change.",
+            "No basis for shadow_close_only plan.",
+            "Positive action precision is blocked by target-cut guard.",
+            "",
+            "Runtime blockers:",
+        ]
+    )
+    if blockers:
+        lines.extend(f"- {blocker}" for blocker in blockers)
+    else:
+        lines.append("- none for `PROMISING_OFFLINE_ONLY`; this is still not runtime approval.")
+    lines.extend(
+        [
+            "",
+            "Shadow-close-only blockers:",
+        ]
+    )
+    lines.extend(f"- {blocker}" for blocker in shadow_close_blockers)
+    lines.extend(
+        [
+            "",
+            "## Output Files",
+            "",
+            markdown_table(
+                [{"artifact": key, "path": str(value)} for key, value in output_files.items()],
+                ["artifact", "path"],
+            ),
+            "",
+        ]
+    )
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
 def resolve_paths(args: argparse.Namespace) -> tuple[str, dict[str, Path], Path]:
     root = args.root.resolve()
     scope = args.scope or "explicit_paths"
@@ -1232,6 +2095,7 @@ def run_lab(args: argparse.Namespace) -> dict[str, Any]:
         default_max_hold,
         args.resurrection_windows_ms,
     )
+    assign_chronological_terciles(records)
     matrix = [
         matrix_row(records, target_bps, stop_bps, max_hold_ms)
         for target_bps in target_bps_values
@@ -1250,9 +2114,84 @@ def run_lab(args: argparse.Namespace) -> dict[str, Any]:
         default_max_hold,
         args.resurrection_windows_ms,
     )
+    noharm_summary_rows, noharm_cost_rows, noharm_stability_rows = build_noharm_tables(
+        records,
+        target_bps_values,
+        stop_bps_values,
+        max_hold_values,
+        args.roundtrip_cost_bps,
+    )
+    noharm_best = choose_noharm_best(noharm_summary_rows)
+    noharm_neighborhood_rows = build_grid_neighborhood(
+        noharm_summary_rows,
+        target_bps_values,
+        stop_bps_values,
+        max_hold_values,
+        noharm_best,
+    )
+    negative_control = (
+        inspect_scope_coverage(args.root.resolve(), args.negative_control_scope, args.resurrection_windows_ms)
+        if args.negative_control_scope
+        else None
+    )
+    noharm_coverage = {
+        "scope": scope,
+        "positions": report["coverage"]["simulated_positions"],
+        "positions_with_exit_replay": report["coverage"]["positions_with_exit_replay"],
+        "positions_with_tsv2_windows": report["coverage"]["positions_with_tsv2_windows"],
+        "candidate_positions": report["coverage"]["candidate_positions"],
+        "stale_data_no_action_candidates": sum(1 for row in records if row.get("candidate_class") == "stale_data_no_action"),
+        "join_quality": join_quality,
+        "exact_join_rate_over_exit_replay": safe_div(
+            float(join_quality.get("exact_join_count", 0)),
+            float(report["coverage"]["positions_with_exit_replay"]),
+        ),
+    }
+    noharm_verdict, noharm_blockers, shadow_close_blockers = evaluate_noharm_verdict(
+        noharm_best,
+        noharm_cost_rows,
+        noharm_stability_rows,
+        noharm_neighborhood_rows,
+        noharm_coverage,
+        negative_control,
+    )
+    report["noharm_proof_a1"] = {
+        "verdict": noharm_verdict,
+        "blockers": noharm_blockers,
+        "shadow_close_blockers": shadow_close_blockers,
+        "best_variant": noharm_best,
+        "negative_control": negative_control,
+    }
     write_jsonl(output_dir / "time_stop_v2_counterfactual_exit_v1.jsonl", records)
     write_json(output_dir / "time_stop_v2_counterfactual_report_v1.json", report)
     write_markdown(output_dir / "TIME_STOP_V2_COUNTERFACTUAL_REPORT.md", report)
+    noharm_output_files = {
+        "summary": output_dir / "time_stop_v2_noharm_summary_v1.csv",
+        "cost_sensitivity": output_dir / "time_stop_v2_noharm_cost_sensitivity_v1.csv",
+        "stability": output_dir / "time_stop_v2_noharm_stability_v1.csv",
+        "grid_neighborhood": output_dir / "time_stop_v2_noharm_grid_neighborhood_v1.csv",
+        "report": output_dir / "TIME_STOP_V2_NOHARM_PROOF_A1.md",
+    }
+    write_csv(noharm_output_files["summary"], noharm_summary_rows)
+    write_csv(noharm_output_files["cost_sensitivity"], noharm_cost_rows)
+    write_csv(noharm_output_files["stability"], noharm_stability_rows)
+    write_csv(noharm_output_files["grid_neighborhood"], noharm_neighborhood_rows)
+    write_noharm_markdown(
+        noharm_output_files["report"],
+        scope=scope,
+        input_paths={name: str(path) for name, path in paths.items()},
+        coverage=noharm_coverage,
+        negative_control=negative_control,
+        resurrection_summary=report["resurrection_summary"],
+        best=noharm_best,
+        cost_rows=noharm_cost_rows,
+        stability_rows=noharm_stability_rows,
+        neighborhood_rows=noharm_neighborhood_rows,
+        verdict_value=noharm_verdict,
+        blockers=noharm_blockers,
+        shadow_close_blockers=shadow_close_blockers,
+        output_files=noharm_output_files,
+    )
     return report
 
 
@@ -1264,6 +2203,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shadow-lifecycle", type=Path)
     parser.add_argument("--probe-shadow-lifecycle", type=Path)
     parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--negative-control-scope", default=DEFAULT_NEGATIVE_CONTROL_SCOPE)
     target_group = parser.add_mutually_exclusive_group(required=True)
     target_group.add_argument("--target-bps", type=int)
     target_group.add_argument("--targets-bps", type=parse_int_list)
@@ -1271,7 +2211,8 @@ def build_parser() -> argparse.ArgumentParser:
     stop_group.add_argument("--stop-bps", type=int)
     stop_group.add_argument("--stops-bps", type=parse_int_list)
     parser.add_argument("--max-hold-ms", type=parse_int_list, required=True)
-    parser.add_argument("--resurrection-windows-ms", type=parse_int_list, default=[4000, 8000])
+    parser.add_argument("--roundtrip-cost-bps", type=parse_int_list, default=DEFAULT_COST_BPS)
+    parser.add_argument("--resurrection-windows-ms", type=parse_int_list, default=[4000, 8000, 12000])
     return parser
 
 
@@ -1286,6 +2227,7 @@ def main(argv: list[str] | None = None) -> int:
                 "positions_with_exit_replay": report["coverage"]["positions_with_exit_replay"],
                 "positions_with_tsv2_windows": report["coverage"]["positions_with_tsv2_windows"],
                 "candidate_positions": report["coverage"]["candidate_positions"],
+                "noharm_verdict": report.get("noharm_proof_a1", {}).get("verdict"),
             },
             sort_keys=True,
         )

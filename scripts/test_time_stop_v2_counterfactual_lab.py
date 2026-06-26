@@ -312,6 +312,51 @@ class TimeStopV2CounterfactualLabTests(unittest.TestCase):
         )
         self.assertEqual(report["recommendation"], lab.RECOMMEND_NO_WINDOWS)
 
+    def test_noharm_action_precision_excludes_no_actions(self) -> None:
+        actions = [
+            {
+                "supported": True,
+                "action_taken": True,
+                "classification": "saved_stop",
+                "delta_after_cost_bps": 100,
+                "baseline_pnl_after_cost_bps": -200,
+                "tsv2_pnl_after_cost_bps": -100,
+                "baseline_result": lab.STOP,
+                "baseline_result_quality": lab.EXACT_LEVELS,
+                "exclusion_reason": "",
+            },
+            {
+                "supported": True,
+                "action_taken": True,
+                "classification": "cut_target",
+                "delta_after_cost_bps": -40,
+                "baseline_pnl_after_cost_bps": 200,
+                "tsv2_pnl_after_cost_bps": 160,
+                "baseline_result": lab.TARGET,
+                "baseline_result_quality": lab.EXACT_LEVELS,
+                "exclusion_reason": "",
+            },
+            {
+                "supported": True,
+                "action_taken": False,
+                "classification": "no_active_exit",
+                "delta_after_cost_bps": 0,
+                "baseline_pnl_after_cost_bps": 10,
+                "tsv2_pnl_after_cost_bps": 10,
+                "baseline_result": lab.TIMEOUT,
+                "baseline_result_quality": lab.EXACT_LEVELS,
+                "exclusion_reason": "no_candidate",
+            },
+        ]
+        summary = lab.summarize_action_rows(actions)
+        self.assertEqual(summary["beneficial_exit_count"], 1)
+        self.assertEqual(summary["harmful_exit_count"], 1)
+        self.assertEqual(summary["no_action_count"], 1)
+        self.assertEqual(summary["exit_action_precision_denominator"], 2)
+        self.assertEqual(summary["exit_action_precision"], 0.5)
+        self.assertEqual(summary["target_cut_damage_bps"], 40)
+        self.assertEqual(summary["saved_stop_damage_bps"], 100)
+
 
 if __name__ == "__main__":
     unittest.main()
