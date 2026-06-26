@@ -1,0 +1,16 @@
+field,stage,direction,profile,quantile,threshold,train_s1_count,train_s1_finite_count,train_s1_coverage,used,required,source
+current_market_cap_sol,C1,cap,medium,0.75,78.026285883,297,297,1.0,True,True,train_s1_distribution_cut
+bonding_progress_pct,C1,cap,medium,0.75,60.0,297,297,1.0,True,True,train_s1_distribution_cut
+price_change_ratio,C1,cap,medium,0.75,1.8295869672926404,297,297,1.0,True,True,train_s1_distribution_cut
+avg_cpi_depth_50tx,C2,cap,medium,0.75,2.627906976744186,297,297,1.0,True,True,train_s1_distribution_cut
+max_single_tx_price_impact_pct_observed,C2,cap,medium,0.75,66.50471802361244,297,297,1.0,True,True,train_s1_distribution_cut
+compute_unit_cluster_dominance,C2,cap,medium,0.75,0.4453125,297,264,0.8888888888888888,True,False,train_s1_distribution_cut
+unique_ratio,C3,floor,medium,0.25,0.5,297,297,1.0,True,True,train_s1_distribution_cut
+hhi,C4,cap,medium,0.75,0.06198347107438017,297,297,1.0,True,True,train_s1_distribution_cut
+top3_signer_volume_ratio,C4,cap,medium,0.75,0.5368185671073352,297,297,1.0,True,False,train_s1_distribution_cut
+top3_volume_pct,C4,cap,medium,0.75,0.5368185671073352,297,297,1.0,False,False,train_s1_distribution_cut
+dev_tx_ratio,C5,cap,medium,0.75,0.05263157894736842,297,297,1.0,True,False,train_s1_distribution_cut
+dev_volume_ratio,C5,cap,medium,0.75,0.1658519678828838,297,297,1.0,True,False,train_s1_distribution_cut
+signer_cross_pool_velocity,C5,cap,medium,0.75,0.5522388059701493,297,297,1.0,True,False,train_s1_distribution_cut
+cpv_other_pool_activity,C5,cap,medium,0.75,1.6296296296296295,297,297,1.0,True,False,train_s1_distribution_cut
+flipper_presence_ratio,C5,cap,medium,0.75,0.41379310344827586,297,257,0.8653198653198653,True,False,train_s1_distribution_cut
