@@ -357,6 +357,112 @@ class TimeStopV2CounterfactualLabTests(unittest.TestCase):
         self.assertEqual(summary["target_cut_damage_bps"], 40)
         self.assertEqual(summary["saved_stop_damage_bps"], 100)
 
+    def test_a2_masks_are_candidate_time_safe(self) -> None:
+        replay = replay_row(
+            first_hit_ms={"6000": 50_000},
+            path_bps=[[0, 0], [12_000, 500], [16_000, 200], [50_000, 6000]],
+            last_pnl_bps=6000,
+        )
+        record = {
+            "_exit_replay_row": replay,
+            "run_id": RUN_ID,
+            "session_id": SESSION_ID,
+            "pool_id": "pool",
+            "base_mint": "mint",
+            "entry_ts_ms": 1_000,
+            "join_quality": "exact",
+            "has_exit_replay": True,
+            "has_tsv2_windows": True,
+            "has_candidate": True,
+            "active_exit_eligible": True,
+            "candidate_class": "mixed_failed_vitality_candidate",
+            "first_candidate_age_ms": 12_000,
+            "candidate_pnl_bps": 500,
+            "actual_close_age_ms": 60_000,
+            "candidate_window_count_before_action": 3,
+            "heartbeat_only_flag": False,
+            "stale_flag": False,
+            "candidate_source_reason": "weak:no_progress",
+            "alive_within_4000ms_after_candidate": False,
+        }
+
+        m0 = lab.cell_action_rows([record], 6000, -6000, 120_000, mask_name="M0_ALL")[0]
+        self.assertTrue(m0["action_taken"])
+        self.assertEqual(m0["classification"], "cut_target")
+
+        m1 = lab.cell_action_rows([record], 6000, -6000, 120_000, mask_name="M1_NEGATIVE_OR_FLAT_ONLY")[0]
+        self.assertFalse(m1["action_taken"])
+        self.assertEqual(m1["exclusion_reason"], "mask_excluded_positive_candidate_pnl")
+
+        m5 = lab.cell_action_rows([record], 6000, -6000, 120_000, mask_name="M5_DELAY_4000MS_CONFIRM")[0]
+        self.assertTrue(m5["action_taken"])
+        self.assertEqual(m5["candidate_age_ms"], 16_000)
+        self.assertEqual(m5["candidate_pnl_bps"], 200)
+        self.assertEqual(m5["mask_action_source"], "delay_4000ms_path_prev")
+
+    def test_segment_target_cut_failure_blocks_promising_offline_only(self) -> None:
+        summary = {
+            "mask_name": "M4_CONFIRM_2_WINDOWS",
+            "target_bps": 10_000,
+            "stop_bps": -6_000,
+            "max_hold_ms": 120_000,
+            "cost100_action_taken_count": 1_500,
+            "cost100_ambiguous_unjoined_exclusions": 0,
+            "cost100_exit_action_precision": 0.72,
+            "cost100_exit_action_precision_wilson95_lower": 0.66,
+            "cost100_delta_sum_bps": 270_000,
+            "cost100_delta_avg_bps": 180.0,
+            "cost100_delta_median_bps": 0.0,
+            "cost100_target_cut_damage_guard_pass": True,
+            "cost100_target_cut_count_guard_pass": True,
+        }
+        selected = {
+            "selection_passed_train_gate": True,
+            "summary_row": summary,
+            "train_failures": [],
+        }
+        stability_rows = [
+            {
+                "mask_name": "M4_CONFIRM_2_WINDOWS",
+                "target_bps": 10_000,
+                "stop_bps": -6_000,
+                "max_hold_ms": 120_000,
+                "segment": "train",
+                "delta_sum_bps": 100_000,
+                "exit_action_precision": 0.72,
+                "target_cut_damage_ratio": 0.20,
+            },
+            {
+                "mask_name": "M4_CONFIRM_2_WINDOWS",
+                "target_bps": 10_000,
+                "stop_bps": -6_000,
+                "max_hold_ms": 120_000,
+                "segment": "validation",
+                "delta_sum_bps": 90_000,
+                "exit_action_precision": 0.71,
+                "target_cut_damage_ratio": 0.24,
+            },
+            {
+                "mask_name": "M4_CONFIRM_2_WINDOWS",
+                "target_bps": 10_000,
+                "stop_bps": -6_000,
+                "max_hold_ms": 120_000,
+                "segment": "holdout",
+                "delta_sum_bps": 80_000,
+                "exit_action_precision": 0.73,
+                "target_cut_damage_ratio": 0.31,
+            },
+        ]
+        verdict, blockers, warnings = lab.evaluate_a2_verdict(
+            selected,
+            stability_rows,
+            [{"positive_delta": True}],
+            {"exact_join_rate_over_exit_replay": 1.0},
+        )
+        self.assertEqual(verdict, lab.VERDICT_TARGET_CUT_RISK_UNRESOLVED)
+        self.assertIn("holdout: target_cut_damage_ratio > 0.25", blockers)
+        self.assertEqual(warnings, [])
+
 
 if __name__ == "__main__":
     unittest.main()
