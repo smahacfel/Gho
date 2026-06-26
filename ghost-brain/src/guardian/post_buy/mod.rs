@@ -25,10 +25,11 @@
 
 pub mod config;
 pub mod engine;
+pub mod exit_replay;
 pub mod integration;
 pub mod signals;
 
-pub use config::{PostBuyGuardianConfig, TimeStopV2Config};
+pub use config::{PostBuyGuardianConfig, ShadowExitReplayConfig, TimeStopV2Config};
 pub use engine::MonitoringEngine;
 pub use integration::{PositionRuntimeRouter, ShadowPositionBook, SignalRouter};
 pub use signals::{

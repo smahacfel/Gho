@@ -1954,6 +1954,9 @@ async fn main() -> Result<()> {
         shadow_time_stop_v2: ghost_brain_config
             .as_ref()
             .map(|brain| brain.post_buy_guardian.time_stop_v2.clone()),
+        shadow_exit_replay_v1: ghost_brain_config
+            .as_ref()
+            .map(|brain| brain.post_buy_guardian.exit_replay_v1.clone()),
         shadow_ledger: Some(Arc::clone(&shadow_ledger)),
         account_state_core: Some(Arc::clone(oracle_runtime.account_state_core())),
         shadow_lifecycle_log_path,
