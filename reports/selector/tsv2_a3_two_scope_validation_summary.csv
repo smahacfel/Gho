@@ -1,0 +1,16 @@
+metric,value
+r49_scope,shadow-burnin-v3-r49-r48-target60-stop60-exit-replay-timestop-v2-maxwait66000-r1
+r50_scope,shadow-burnin-v3-r50-tsv2-logging-only-target60-stop60-exit-replay-maxwait66000-r1
+fixed_cell_passing_both_count,0
+canonical_cell_passing_both,false
+R49_selected_cell_validated_by_R50,false
+R49_selected_cell_passing_both,false
+R50_selected_cell_validated_by_R49,false
+R50_selected_cell_passing_both,false
+absolute_profitability_proven,false
+runtime_approval,false
+shadow_close_only_approval,false
+final_verdict,NO_TWO_SCOPE_FIXED_POLICY / INCONCLUSIVE_RESEARCH / NO_RUNTIME
+intersection_csv,reports/selector/tsv2_a3_two_scope_fixed_cell_intersection.csv
+report_md,PLANS/AUDYT/RAPORT_TSV2_A3_TWO_SCOPE_VALIDATION_20260628.md
+adr_md,docs/ADR/ADR_8D_TSV2_A3_TWO_SCOPE_VALIDATION_20260628.md
