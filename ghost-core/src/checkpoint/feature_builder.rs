@@ -108,6 +108,8 @@ impl FeatureMaterializer for ObservationFeatureBuilder {
             manipulation_contradictions: Default::default(),
             temporal_deltas: Default::default(),
             decision_time_series: Default::default(),
+            pre_entry_path_summary_v1: Default::default(),
+            session_regime_snapshot_v1: Default::default(),
         }
     }
 }

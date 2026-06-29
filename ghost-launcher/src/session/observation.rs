@@ -20,9 +20,10 @@ use ghost_core::checkpoint::{
     DecisionTimeSeriesRetentionStatus, DecisionTimeSeriesSourceCounts, EvidenceDegradedReason,
     EvidenceStatus, EvidenceUnavailableReason, FeatureEvidenceStatus,
     ManipulationContradictionFeatures, MaterializedEvidenceStatus, MaterializedFeatureSet,
-    MetricEvidenceQuality, ObservationFeatureBuilder, OrganicBroadeningFeatures, SessionCheckpoint,
-    TemporalAnchorReachedBy, TemporalAnchorSnapshot, TemporalDeltaFeatures,
-    TemporalMetricEvidenceContext, TemporalMetricSource, TxSegmentSequence,
+    MetricEvidenceQuality, ObservationFeatureBuilder, OrganicBroadeningFeatures,
+    PreEntryPathSummaryV1, SessionCheckpoint, SessionRegimeSnapshotV1, TemporalAnchorReachedBy,
+    TemporalAnchorSnapshot, TemporalDeltaFeatures, TemporalMetricEvidenceContext,
+    TemporalMetricSource, TxSegmentSequence,
 };
 use ghost_core::session::types::{
     SessionDiagnostics, SessionId, SessionMetadata, SessionStatus, VerdictOutcome,
@@ -33,7 +34,7 @@ use ghost_core::{CurveFreshnessState, LAMPORTS_PER_SOL};
 use parking_lot::RwLock;
 use seer::early_fingerprint::EarlyFingerprintMetrics;
 use solana_sdk::pubkey::Pubkey;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -73,6 +74,15 @@ struct TemporalAnchorRawValues {
     jito_tip_intensity: Option<f64>,
     signer_cross_pool_velocity: Option<f64>,
     flipper_presence_ratio: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RceWindowStats {
+    same_ms_tx_ratio: Option<f64>,
+    burst_ratio: Option<f64>,
+    unique_ratio: Option<f64>,
+    top3_signer_volume_ratio: Option<f64>,
+    buy_sell_ratio: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1272,6 +1282,280 @@ impl PoolObservationSession {
         features
     }
 
+    fn rce_decision_path_points(series: &DecisionTimeSeriesFeatures) -> Vec<(u64, f64)> {
+        series
+            .ts_offsets_ms
+            .iter()
+            .zip(series.prices.iter())
+            .filter_map(|(offset_ms, price)| {
+                let offset_ms = (*offset_ms >= 0).then_some(*offset_ms as u64)?;
+                let price = (*price).filter(|value| value.is_finite() && *value > 0.0)?;
+                Some((offset_ms, price))
+            })
+            .collect()
+    }
+
+    fn rce_ret_bps(first_price: f64, current_price: f64) -> Option<f64> {
+        (first_price.is_finite() && first_price > 0.0 && current_price.is_finite())
+            .then_some(((current_price - first_price) / first_price) * 10_000.0)
+    }
+
+    fn rce_path_stats(
+        points: &[(u64, f64)],
+        horizon_ms: u64,
+    ) -> (Option<f64>, Option<f64>, Option<f64>) {
+        let first_price = points.first().map(|(_, price)| *price);
+        let Some(first_price) = first_price else {
+            return (None, None, None);
+        };
+        let returns: Vec<f64> = points
+            .iter()
+            .take_while(|(offset_ms, _)| *offset_ms <= horizon_ms)
+            .filter_map(|(_, price)| Self::rce_ret_bps(first_price, *price))
+            .collect();
+        if returns.is_empty() {
+            return (None, None, None);
+        }
+        let ret = returns.last().copied();
+        let mfe = returns.iter().copied().reduce(f64::max);
+        let mae = returns.iter().copied().reduce(f64::min);
+        (ret, mfe, mae)
+    }
+
+    fn rce_return_points(points: &[(u64, f64)]) -> Vec<(u64, f64)> {
+        let Some((_, first_price)) = points.first().copied() else {
+            return Vec::new();
+        };
+        points
+            .iter()
+            .filter_map(|(offset_ms, price)| {
+                Self::rce_ret_bps(first_price, *price).map(|ret_bps| (*offset_ms, ret_bps))
+            })
+            .collect()
+    }
+
+    fn rce_dwell_ms(return_points: &[(u64, f64)], threshold_bps: f64) -> u64 {
+        return_points
+            .windows(2)
+            .filter_map(|pair| {
+                let (start_ms, start_ret) = pair[0];
+                let (end_ms, _) = pair[1];
+                (start_ret >= threshold_bps).then_some(end_ms.saturating_sub(start_ms))
+            })
+            .sum()
+    }
+
+    fn rce_pullback_reclaim(
+        return_points: &[(u64, f64)],
+    ) -> (Option<f64>, Option<f64>, Option<f64>) {
+        let Some((_, first_ret)) = return_points.first().copied() else {
+            return (None, None, None);
+        };
+        let mut peak_ret = first_ret;
+        let mut max_pullback = 0.0;
+        let mut trough_at_max_pullback = first_ret;
+        for (_, ret_bps) in return_points {
+            if *ret_bps > peak_ret {
+                peak_ret = *ret_bps;
+            }
+            let pullback = peak_ret - *ret_bps;
+            if pullback > max_pullback {
+                max_pullback = pullback;
+                trough_at_max_pullback = *ret_bps;
+            }
+        }
+        let current_ret = return_points
+            .last()
+            .map(|(_, ret)| *ret)
+            .unwrap_or(first_ret);
+        let reclaim = (current_ret - trough_at_max_pullback).max(0.0);
+        let reclaim_fraction = (max_pullback > f64::EPSILON).then_some(reclaim / max_pullback);
+        (
+            Some(max_pullback),
+            Some(reclaim),
+            reclaim_fraction.map(|value| value.clamp(0.0, 1.0)),
+        )
+    }
+
+    fn rce_higher_low_count(return_points: &[(u64, f64)]) -> u64 {
+        let lows: Vec<f64> = return_points
+            .windows(3)
+            .filter_map(|triple| {
+                let prev = triple[0].1;
+                let current = triple[1].1;
+                let next = triple[2].1;
+                (current <= prev && current <= next).then_some(current)
+            })
+            .collect();
+        lows.windows(2).filter(|pair| pair[1] > pair[0]).count() as u64
+    }
+
+    fn materialize_rce_pre_entry_path_summary(
+        &self,
+        series: &DecisionTimeSeriesFeatures,
+    ) -> PreEntryPathSummaryV1 {
+        let points = Self::rce_decision_path_points(series);
+        if points.is_empty() {
+            return PreEntryPathSummaryV1::default();
+        }
+        let (ret_5s, _, _) = Self::rce_path_stats(&points, 5_000);
+        let (ret_10s, mfe_10s, mae_10s) = Self::rce_path_stats(&points, 10_000);
+        let (ret_20s, mfe_20s, mae_20s) = Self::rce_path_stats(&points, 20_000);
+        let (ret_30s, mfe_30s, mae_30s) = Self::rce_path_stats(&points, 30_000);
+        let (ret_45s, mfe_45s, mae_45s) = Self::rce_path_stats(&points, 45_000);
+        let return_points = Self::rce_return_points(&points);
+        let (pullback_depth_bps, reclaim_bps, reclaim_fraction) =
+            Self::rce_pullback_reclaim(&return_points);
+
+        PreEntryPathSummaryV1 {
+            pre_entry_ret_5s: ret_5s,
+            pre_entry_ret_10s: ret_10s,
+            pre_entry_ret_20s: ret_20s,
+            pre_entry_ret_30s: ret_30s,
+            pre_entry_ret_45s: ret_45s,
+            pre_entry_mfe_10s: mfe_10s,
+            pre_entry_mfe_20s: mfe_20s,
+            pre_entry_mfe_30s: mfe_30s,
+            pre_entry_mfe_45s: mfe_45s,
+            pre_entry_mae_10s: mae_10s,
+            pre_entry_mae_20s: mae_20s,
+            pre_entry_mae_30s: mae_30s,
+            pre_entry_mae_45s: mae_45s,
+            pullback_depth_bps,
+            reclaim_bps,
+            reclaim_fraction,
+            higher_low_count: Some(Self::rce_higher_low_count(&return_points)),
+            above_0bps_dwell_ms: Some(Self::rce_dwell_ms(&return_points, 0.0)),
+            above_300bps_dwell_ms: Some(Self::rce_dwell_ms(&return_points, 300.0)),
+            above_600bps_dwell_ms: Some(Self::rce_dwell_ms(&return_points, 600.0)),
+        }
+    }
+
+    fn rce_window_stats(
+        sorted_txs: &[(usize, &PoolTransaction, u64)],
+        start_ts_ms: u64,
+        end_ts_ms: u64,
+    ) -> RceWindowStats {
+        if start_ts_ms >= end_ts_ms {
+            return RceWindowStats::default();
+        }
+        let mut timestamps = Vec::new();
+        let mut timestamp_counts: HashMap<u64, u64> = HashMap::new();
+        let mut signer_volume: HashMap<&str, f64> = HashMap::new();
+        let mut unique_signers = HashSet::new();
+        let mut tx_count = 0u64;
+        let mut buy_count = 0u64;
+        let mut sell_count = 0u64;
+        let mut total_volume_sol = 0.0;
+
+        for (_, tx, ts_ms) in sorted_txs {
+            if *ts_ms < start_ts_ms || *ts_ms > end_ts_ms || !tx.success {
+                continue;
+            }
+            tx_count = tx_count.saturating_add(1);
+            timestamps.push(*ts_ms);
+            *timestamp_counts.entry(*ts_ms).or_insert(0) += 1;
+            if tx.is_buy {
+                buy_count = buy_count.saturating_add(1);
+            } else {
+                sell_count = sell_count.saturating_add(1);
+            }
+            if !tx.signer.is_empty() {
+                unique_signers.insert(tx.signer.as_str());
+                if tx.volume_sol.is_finite() {
+                    *signer_volume.entry(tx.signer.as_str()).or_insert(0.0) += tx.volume_sol.abs();
+                }
+            }
+            if tx.volume_sol.is_finite() {
+                total_volume_sol += tx.volume_sol.abs();
+            }
+        }
+
+        if tx_count == 0 {
+            return RceWindowStats::default();
+        }
+        let same_ms_extra_count: u64 = timestamp_counts
+            .values()
+            .map(|count| count.saturating_sub(1))
+            .sum();
+        let burst_ratio = Some(
+            compute_velocity_profile(&timestamps, end_ts_ms.saturating_sub(start_ts_ms).max(1))
+                .burst_ratio,
+        );
+        let mut volumes: Vec<f64> = signer_volume
+            .values()
+            .copied()
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .collect();
+        volumes.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        let top3_sum: f64 = volumes.iter().take(3).sum();
+        RceWindowStats {
+            same_ms_tx_ratio: Some(same_ms_extra_count as f64 / tx_count as f64),
+            burst_ratio,
+            unique_ratio: Some(unique_signers.len() as f64 / tx_count as f64),
+            top3_signer_volume_ratio: (total_volume_sol > f64::EPSILON)
+                .then_some(top3_sum / total_volume_sol),
+            buy_sell_ratio: Some(if sell_count > 0 {
+                buy_count as f64 / sell_count as f64
+            } else {
+                buy_count as f64
+            }),
+        }
+    }
+
+    fn subtract_optional(current: Option<f64>, previous: Option<f64>) -> Option<f64> {
+        match (current, previous) {
+            (Some(current), Some(previous)) => Some(current - previous),
+            _ => None,
+        }
+    }
+
+    fn decay_optional(previous: Option<f64>, current: Option<f64>) -> Option<f64> {
+        match (previous, current) {
+            (Some(previous), Some(current)) => Some(previous - current),
+            _ => None,
+        }
+    }
+
+    fn materialize_rce_session_regime_snapshot(&self) -> SessionRegimeSnapshotV1 {
+        let sorted_txs = self.temporal_sorted_transactions();
+        let (Some((_, _, first_ts_ms)), Some((_, _, last_ts_ms))) =
+            (sorted_txs.first(), sorted_txs.last())
+        else {
+            return SessionRegimeSnapshotV1 {
+                template_reason_code: Some("rce_a0_not_evaluated_logging_only".to_string()),
+                ..SessionRegimeSnapshotV1::default()
+            };
+        };
+        let recent_start = last_ts_ms.saturating_sub(10_000).max(*first_ts_ms);
+        let previous_start = recent_start.saturating_sub(10_000).max(*first_ts_ms);
+        let previous = Self::rce_window_stats(&sorted_txs, previous_start, recent_start);
+        let recent = Self::rce_window_stats(&sorted_txs, recent_start, *last_ts_ms);
+
+        SessionRegimeSnapshotV1 {
+            same_ms_tx_ratio_recent: recent.same_ms_tx_ratio,
+            same_ms_tx_ratio_decay: Self::decay_optional(
+                previous.same_ms_tx_ratio,
+                recent.same_ms_tx_ratio,
+            ),
+            burst_ratio_recent: recent.burst_ratio,
+            burst_ratio_decay: Self::decay_optional(previous.burst_ratio, recent.burst_ratio),
+            unique_ratio_recent: recent.unique_ratio,
+            unique_ratio_drift: Self::subtract_optional(recent.unique_ratio, previous.unique_ratio),
+            top3_signer_volume_ratio_recent: recent.top3_signer_volume_ratio,
+            top3_signer_volume_ratio_drift: Self::subtract_optional(
+                recent.top3_signer_volume_ratio,
+                previous.top3_signer_volume_ratio,
+            ),
+            buy_sell_ratio_recent: recent.buy_sell_ratio,
+            session_pool_rate_5m: None,
+            session_pool_rate_10m: None,
+            session_followthrough_rate_10m_optional: None,
+            template_reason_code: Some("rce_a0_not_evaluated_logging_only".to_string()),
+            veto_reason_code: None,
+        }
+    }
+
     fn temporal_anchor_raw_values<'a>(
         &self,
         sorted_txs: &[(usize, &'a PoolTransaction, u64)],
@@ -2401,6 +2685,9 @@ impl PoolObservationSession {
             self.materialize_v3_manipulation_contradictions(&materialized);
         materialized.temporal_deltas = self.materialize_v3_temporal_deltas();
         materialized.decision_time_series = self.materialize_decision_time_series();
+        materialized.pre_entry_path_summary_v1 =
+            self.materialize_rce_pre_entry_path_summary(&materialized.decision_time_series);
+        materialized.session_regime_snapshot_v1 = self.materialize_rce_session_regime_snapshot();
         materialized.evidence_status = self.materialize_v3_evidence_status(&materialized);
 
         materialized

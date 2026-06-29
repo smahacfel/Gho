@@ -15,7 +15,7 @@ pub use types::{
     EvidenceStatus, EvidenceUnavailableReason, FeatureEvidenceStatus,
     ManipulationContradictionFeatures, MaterializedEvidenceStatus, MaterializedFeatureSet,
     MaterializedTrajectoryAssessment, MetricEvidenceQuality, OrganicBroadeningFeatures,
-    SessionCheckpoint, TemporalAnchorReachedBy, TemporalAnchorSnapshot, TemporalDeltaFeatures,
-    TemporalMetricEvidenceContext, TemporalMetricSource, TrajectorySegmentSnapshot, TrendDirection,
-    TxSegmentSequence,
+    PreEntryPathSummaryV1, SessionCheckpoint, SessionRegimeSnapshotV1, TemporalAnchorReachedBy,
+    TemporalAnchorSnapshot, TemporalDeltaFeatures, TemporalMetricEvidenceContext,
+    TemporalMetricSource, TrajectorySegmentSnapshot, TrendDirection, TxSegmentSequence,
 };

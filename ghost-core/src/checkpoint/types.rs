@@ -809,6 +809,82 @@ pub struct ManipulationContradictionFeatures {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PreEntryPathSummaryV1 {
+    #[serde(default)]
+    pub pre_entry_ret_5s: Option<f64>,
+    #[serde(default)]
+    pub pre_entry_ret_10s: Option<f64>,
+    #[serde(default)]
+    pub pre_entry_ret_20s: Option<f64>,
+    #[serde(default)]
+    pub pre_entry_ret_30s: Option<f64>,
+    #[serde(default)]
+    pub pre_entry_ret_45s: Option<f64>,
+    #[serde(default)]
+    pub pre_entry_mfe_10s: Option<f64>,
+    #[serde(default)]
+    pub pre_entry_mfe_20s: Option<f64>,
+    #[serde(default)]
+    pub pre_entry_mfe_30s: Option<f64>,
+    #[serde(default)]
+    pub pre_entry_mfe_45s: Option<f64>,
+    #[serde(default)]
+    pub pre_entry_mae_10s: Option<f64>,
+    #[serde(default)]
+    pub pre_entry_mae_20s: Option<f64>,
+    #[serde(default)]
+    pub pre_entry_mae_30s: Option<f64>,
+    #[serde(default)]
+    pub pre_entry_mae_45s: Option<f64>,
+    #[serde(default)]
+    pub pullback_depth_bps: Option<f64>,
+    #[serde(default)]
+    pub reclaim_bps: Option<f64>,
+    #[serde(default)]
+    pub reclaim_fraction: Option<f64>,
+    #[serde(default)]
+    pub higher_low_count: Option<u64>,
+    #[serde(default)]
+    pub above_0bps_dwell_ms: Option<u64>,
+    #[serde(default)]
+    pub above_300bps_dwell_ms: Option<u64>,
+    #[serde(default)]
+    pub above_600bps_dwell_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SessionRegimeSnapshotV1 {
+    #[serde(default)]
+    pub same_ms_tx_ratio_recent: Option<f64>,
+    #[serde(default)]
+    pub same_ms_tx_ratio_decay: Option<f64>,
+    #[serde(default)]
+    pub burst_ratio_recent: Option<f64>,
+    #[serde(default)]
+    pub burst_ratio_decay: Option<f64>,
+    #[serde(default)]
+    pub unique_ratio_recent: Option<f64>,
+    #[serde(default)]
+    pub unique_ratio_drift: Option<f64>,
+    #[serde(default)]
+    pub top3_signer_volume_ratio_recent: Option<f64>,
+    #[serde(default)]
+    pub top3_signer_volume_ratio_drift: Option<f64>,
+    #[serde(default)]
+    pub buy_sell_ratio_recent: Option<f64>,
+    #[serde(default)]
+    pub session_pool_rate_5m: Option<f64>,
+    #[serde(default)]
+    pub session_pool_rate_10m: Option<f64>,
+    #[serde(default)]
+    pub session_followthrough_rate_10m_optional: Option<f64>,
+    #[serde(default)]
+    pub template_reason_code: Option<String>,
+    #[serde(default)]
+    pub veto_reason_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MaterializedFeatureSet {
     pub account_features: AccountStateFeatures,
     pub tx_intel_features: TxIntelFeatures,
@@ -844,6 +920,15 @@ pub struct MaterializedFeatureSet {
     /// V3 evidence-plane full decision-time tick series for DTW/shape audit.
     #[serde(default)]
     pub decision_time_series: DecisionTimeSeriesFeatures,
+    /// PR-RCE-A0: decision-time-safe pre-entry path summary for offline
+    /// regime-confirmed entry proof. This is logging-only evidence and is not
+    /// consumed by Gatekeeper policy.
+    #[serde(default)]
+    pub pre_entry_path_summary_v1: PreEntryPathSummaryV1,
+    /// PR-RCE-A0: session-level regime summary for offline proof. Unknown
+    /// global/session context remains nullable rather than imputed.
+    #[serde(default)]
+    pub session_regime_snapshot_v1: SessionRegimeSnapshotV1,
 }
 
 /// Per-segment trajectory snapshot used by Path B to compute TAS and PDD

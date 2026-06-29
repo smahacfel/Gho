@@ -974,6 +974,51 @@ fn materialize_features_populates_decision_series_and_temporal_deltas_from_sessi
         .delta_flipper_presence_ratio_1s_to_2s
         .expect("flipper delta should materialize");
     assert!((flipper_delta - 0.25).abs() < 1e-12);
+
+    assert_eq!(
+        features.pre_entry_path_summary_v1.pre_entry_ret_5s,
+        Some(7_000.0)
+    );
+    assert_eq!(
+        features.pre_entry_path_summary_v1.pre_entry_mfe_10s,
+        Some(7_000.0)
+    );
+    assert_eq!(
+        features.pre_entry_path_summary_v1.pre_entry_mae_10s,
+        Some(0.0)
+    );
+    assert_eq!(
+        features.pre_entry_path_summary_v1.pullback_depth_bps,
+        Some(1_000.0)
+    );
+    assert_eq!(
+        features.pre_entry_path_summary_v1.above_300bps_dwell_ms,
+        Some(2_800)
+    );
+    assert_eq!(
+        features.session_regime_snapshot_v1.same_ms_tx_ratio_recent,
+        Some(0.0)
+    );
+    assert!(
+        (features
+            .session_regime_snapshot_v1
+            .unique_ratio_recent
+            .expect("recent unique ratio should materialize")
+            - (6.0 / 7.0))
+            .abs()
+            < 1e-12
+    );
+    assert_eq!(
+        features.session_regime_snapshot_v1.buy_sell_ratio_recent,
+        Some(6.0)
+    );
+    assert_eq!(
+        features
+            .session_regime_snapshot_v1
+            .template_reason_code
+            .as_deref(),
+        Some("rce_a0_not_evaluated_logging_only")
+    );
 }
 
 #[test]
