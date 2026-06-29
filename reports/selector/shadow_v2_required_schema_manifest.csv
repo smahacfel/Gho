@@ -1,0 +1,83 @@
+record_name,field_name,type,required_for_mark,required_for_research_grade,required_for_live_equivalence,simulation_level,measurement_grade,temporal_class,clock_domain,source_owner,nullable,quality_rule,notes
+common_envelope,schema,string,true,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,wall_clock_ms,shadow_v2_contract,false,must match record kind,common to every V2 record
+common_envelope,schema_version,u32,true,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,wall_clock_ms,shadow_v2_contract,false,must be additive,version starts at 1
+common_envelope,simulation_contract_version,string,true,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,wall_clock_ms,shadow_v2_contract,false,must equal shadow_burnin_simulation_v2_20260629,contract identity
+common_envelope,simulation_level,enum,true,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,wall_clock_ms,shadow_v2_contract,false,must be explicit,MARK_ONLY|FILL_MODEL_STATIC|FILL_MODEL_CALIBRATED|LIVE_CONFIRMED
+common_envelope,measurement_grade,enum,true,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,wall_clock_ms,shadow_v2_contract,false,must be explicit,diagnostic and acceptance grade
+common_envelope,run_id,string,true,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,wall_clock_ms,runtime_context,false,non_empty,run identity
+common_envelope,session_id,string,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,AT_DECISION,wall_clock_ms,oracle_runtime,true,required for research joins,session identity
+common_envelope,candidate_id,string,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,AT_DECISION,wall_clock_ms,oracle_runtime,true,required when available,candidate identity
+common_envelope,position_id,string,true,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,AT_DECISION,wall_clock_ms,shadow_v2_contract,false,stable and unique,canonical position identity
+common_envelope,event_id,string,true,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,wall_clock_ms,shadow_v2_contract,false,stable and unique,canonical event identity
+common_envelope,parent_event_id,string,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,wall_clock_ms,shadow_v2_contract,true,must not create cycles,parent event reference
+common_envelope,source_event_id,string,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,wall_clock_ms,shadow_v2_contract,true,points to source evidence,source event reference
+common_envelope,pool_id,string,true,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,PRE_DECISION,chain_slot,oracle_runtime,false,non_empty,pool identity
+common_envelope,base_mint,string,true,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,PRE_DECISION,chain_slot,oracle_runtime,false,non_empty,base mint identity
+common_envelope,bonding_curve,string,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,PRE_DECISION,chain_slot,oracle_runtime,true,required when known,bonding curve address
+common_envelope,produced_at_ms,u64,true,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,wall_clock_ms,writer,false,clock domain required,record production wall clock
+common_envelope,produced_at_slot,u64,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,chain_slot,writer,true,required if chain sourced,record production slot
+common_envelope,temporal_class,enum,true,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,wall_clock_ms,shadow_v2_contract,false,no UNKNOWN for strategy features,temporal availability
+common_envelope,clock_domain,enum,true,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,wall_clock_ms,shadow_v2_contract,false,must be explicit,record primary clock domain
+common_envelope,source_refs,list,true,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,wall_clock_ms,writer,false,must identify evidence,source artifact references
+common_envelope,quality,string,true,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,wall_clock_ms,writer,false,must be typed,quality label
+common_envelope,limitations,list,true,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,wall_clock_ms,writer,false,must list gaps,limitations and blockers
+event_order_key,slot,u64,true,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,chain_slot,stream_or_rpc,true,UNKNOWN must be explicit,chain slot
+event_order_key,block_time,i64,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,block_time,stream_or_rpc,true,coarse optional,chain block time
+event_order_key,signature,string,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,chain_slot,stream_or_rpc,true,required when event tx backed,transaction signature
+event_order_key,transaction_index_or_unknown,u32,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,chain_slot,stream_or_rpc,true,UNKNOWN blocks exact intra slot order,transaction index
+event_order_key,instruction_index_or_unknown,u32,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,chain_slot,stream_or_rpc,true,UNKNOWN blocks exact instruction order,instruction index
+event_order_key,inner_instruction_index_or_unknown,u32,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,chain_slot,stream_or_rpc,true,UNKNOWN blocks exact inner order,inner instruction index
+event_order_key,log_index_or_unknown,u32,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,chain_slot,stream_or_rpc,true,UNKNOWN blocks exact log order,log index
+event_order_key,event_seq_in_process,u64,true,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,monotonic_process_ms,process,false,must be monotonic,local process ordering
+event_order_key,observed_at_wall_ms,u64,true,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,stream_observed_ms,process,false,must be present,local observation time
+pool_state_sample_v2,source,enum,true,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,PRE_DECISION,chain_slot,account_state_core,false,must identify source,YELLOWSTONE_EVENT|ACCOUNT_STATE_CORE|RPC_FALLBACK|SHADOW_LEDGER_DIAGNOSTIC|RECONSTRUCTED_FROM_TRADE_EVENT|UNKNOWN
+pool_state_sample_v2,commitment,string,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,rpc_observed_ms,rpc,true,required for RPC fallback,account commitment
+pool_state_sample_v2,account_data_hash,string,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,chain_slot,account_state_core,true,required when account backed,raw account data hash
+pool_state_sample_v2,virtual_sol_reserves,u64,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,PRE_DECISION,chain_slot,account_state_core,true,blocks price reconstruction if missing,virtual SOL reserves
+pool_state_sample_v2,virtual_token_reserves,u64,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,PRE_DECISION,chain_slot,account_state_core,true,blocks price reconstruction if missing,virtual token reserves
+pool_state_sample_v2,real_sol_reserves,u64,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,PRE_DECISION,chain_slot,account_state_core,true,required when formula uses it,real SOL reserves
+pool_state_sample_v2,real_token_reserves,u64,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,PRE_DECISION,chain_slot,account_state_core,true,required when formula uses it,real token reserves
+pool_state_sample_v2,token_decimals,u8,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,PRE_DECISION,chain_slot,account_state_core,true,blocks normalized price if missing,token decimals
+pool_state_sample_v2,sol_lamports,u64,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,PRE_DECISION,chain_slot,account_state_core,true,blocks normalized price if missing,SOL lamports normalization
+pool_state_sample_v2,price_sol_per_token,f64,true,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,PRE_DECISION,chain_slot,account_state_core,true,must point to reserves or blocked,mark price
+pool_state_sample_v2,market_cap_sol,f64,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,PRE_DECISION,chain_slot,account_state_core,true,source required,market cap
+pool_state_sample_v2,bonding_progress_pct,f64,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,PRE_DECISION,chain_slot,account_state_core,true,source required,bonding progress
+pool_state_sample_v2,staleness_ms,u64,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,wall_clock_ms,writer,true,must be explicit,wall clock staleness
+pool_state_sample_v2,staleness_slots,u64,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,chain_slot,writer,true,must be explicit,slot staleness
+shadow_entry_decision_v2,decision_ts_ms,clocked_timestamp,true,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,AT_DECISION,decision_ts_ms,oracle_runtime,false,clock domain required,decision timestamp
+shadow_entry_decision_v2,decision_slot,u64,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,AT_DECISION,chain_slot,oracle_runtime,true,required when chain available,decision slot
+shadow_entry_decision_v2,feature_timestamps,list,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,PRE_DECISION,wall_clock_ms,materialized_feature_set,false,no UNKNOWN for strategy fields,feature timestamp registry
+shadow_entry_decision_v2,selected,bool,true,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,AT_DECISION,decision_ts_ms,gatekeeper,false,must match decision,selected or rejected
+shadow_entry_decision_v2,reason_or_veto,string,true,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,AT_DECISION,decision_ts_ms,gatekeeper,false,typed reason required,reason or veto
+shadow_entry_attempt_v2,intended_entry_ts_ms,clocked_timestamp,true,true,true,FILL_MODEL_STATIC,RESEARCH_GRADE_CANDIDATE,AT_DECISION,decision_ts_ms,shadow_v2,false,clock domain required,intended entry time
+shadow_entry_attempt_v2,simulated_submit_ts_ms,clocked_timestamp,false,true,true,FILL_MODEL_STATIC,RESEARCH_GRADE_CANDIDATE,POST_ENTRY,submit_ts_ms,fill_model,true,required for live-equivalence,simulated submit time
+shadow_entry_attempt_v2,simulated_landing_slot,u64,false,true,true,FILL_MODEL_STATIC,RESEARCH_GRADE_CANDIDATE,POST_ENTRY,chain_slot,fill_model,true,required for live-equivalence,simulated landing slot
+shadow_entry_attempt_v2,simulated_landing_delay_ms,u64,false,true,true,FILL_MODEL_STATIC,RESEARCH_GRADE_CANDIDATE,POST_ENTRY,monotonic_process_ms,fill_model,true,required for live-equivalence,landing delay
+shadow_entry_attempt_v2,entry_failure_mode,string,false,true,true,FILL_MODEL_STATIC,RESEARCH_GRADE_CANDIDATE,POST_ENTRY,submit_ts_ms,fill_model,true,required if failed,entry failure class
+shadow_entry_fill_v2,fill_status,enum,false,true,true,FILL_MODEL_STATIC,RESEARCH_GRADE_CANDIDATE,POST_ENTRY,landing_ts_ms,fill_model,false,must be explicit,FILLED|NO_FILL|FAILED|BLOCKED_BY_DATA
+shadow_entry_fill_v2,fill_price,f64,false,true,true,FILL_MODEL_STATIC,RESEARCH_GRADE_CANDIDATE,POST_ENTRY,landing_ts_ms,fill_model,true,blocked if missing on filled,entry fill price
+shadow_entry_fill_v2,slippage_bps,i32,false,true,true,FILL_MODEL_STATIC,RESEARCH_GRADE_CANDIDATE,POST_ENTRY,landing_ts_ms,fill_model,true,required for live-equivalence,entry slippage
+shadow_entry_fill_v2,own_impact_bps,i32,false,true,true,FILL_MODEL_STATIC,RESEARCH_GRADE_CANDIDATE,POST_ENTRY,landing_ts_ms,fill_model,true,required for live-equivalence,own buy impact
+shadow_entry_fill_v2,fee_bps,i32,false,true,true,FILL_MODEL_STATIC,RESEARCH_GRADE_CANDIDATE,POST_ENTRY,landing_ts_ms,fill_model,true,required for live-equivalence,entry fee
+shadow_entry_fill_v2,pool_state_before,string,false,true,true,FILL_MODEL_STATIC,RESEARCH_GRADE_CANDIDATE,POST_ENTRY,chain_slot,pool_state_sample_v2,true,required for filled,pool state ref before fill
+shadow_entry_fill_v2,pool_state_after,string,false,true,true,FILL_MODEL_STATIC,RESEARCH_GRADE_CANDIDATE,POST_ENTRY,chain_slot,pool_state_sample_v2,true,required for live-equivalence,pool state ref after fill
+shadow_path_sample_v2,sample_ts_ms,clocked_timestamp,true,true,true,MARK_ONLY,MARK_PRICE_REPLAY,POST_ENTRY,stream_observed_ms,path_sampler,false,clock domain required,path sample time
+shadow_path_sample_v2,pool_state_ref,string,true,true,true,MARK_ONLY,MARK_PRICE_REPLAY,POST_ENTRY,chain_slot,pool_state_sample_v2,false,must resolve,pool state reference
+shadow_path_sample_v2,mark_price,f64,true,true,true,MARK_ONLY,MARK_PRICE_REPLAY,POST_ENTRY,chain_slot,path_sampler,true,blocked if missing,mark price
+shadow_path_sample_v2,executable_exit_quote,f64,false,true,true,FILL_MODEL_STATIC,RESEARCH_GRADE_CANDIDATE,POST_ENTRY,chain_slot,fill_model,true,required for executable exit,exit quote
+shadow_path_sample_v2,pnl_mark_bps,i32,true,true,true,MARK_ONLY,MARK_PRICE_REPLAY,POST_ENTRY,stream_observed_ms,path_sampler,true,required for mark replay,path mark PnL
+shadow_exit_attempt_v2,exit_trigger,string,true,true,true,MARK_ONLY,MARK_PRICE_REPLAY,POST_ENTRY,stream_observed_ms,path_sampler,false,typed trigger required,target stop timeout
+shadow_exit_attempt_v2,trigger_ts_ms,clocked_timestamp,true,true,true,MARK_ONLY,MARK_PRICE_REPLAY,POST_ENTRY,stream_observed_ms,path_sampler,false,clock domain required,trigger timestamp
+shadow_exit_attempt_v2,tie_break_policy,string,false,true,true,MARK_ONLY,MARK_PRICE_REPLAY,POST_ENTRY,stream_observed_ms,path_sampler,true,required for same slot ambiguity,target stop tie break
+shadow_exit_attempt_v2,same_slot_ambiguity,bool,true,true,true,MARK_ONLY,MARK_PRICE_REPLAY,POST_ENTRY,chain_slot,path_sampler,false,must be explicit,same slot ambiguity flag
+shadow_exit_fill_v2,fill_status,enum,false,true,true,FILL_MODEL_STATIC,RESEARCH_GRADE_CANDIDATE,POST_EXIT,landing_ts_ms,fill_model,false,must be explicit,FILLED|NO_FILL|FAILED|BLOCKED_BY_DATA
+shadow_exit_fill_v2,fill_price,f64,false,true,true,FILL_MODEL_STATIC,RESEARCH_GRADE_CANDIDATE,POST_EXIT,landing_ts_ms,fill_model,true,blocked if missing on filled,exit fill price
+shadow_exit_fill_v2,slippage_bps,i32,false,true,true,FILL_MODEL_STATIC,RESEARCH_GRADE_CANDIDATE,POST_EXIT,landing_ts_ms,fill_model,true,required for live-equivalence,exit slippage
+shadow_exit_fill_v2,own_impact_bps,i32,false,true,true,FILL_MODEL_STATIC,RESEARCH_GRADE_CANDIDATE,POST_EXIT,landing_ts_ms,fill_model,true,required for live-equivalence,own sell impact
+shadow_exit_fill_v2,fee_bps,i32,false,true,true,FILL_MODEL_STATIC,RESEARCH_GRADE_CANDIDATE,POST_EXIT,landing_ts_ms,fill_model,true,required for live-equivalence,exit fee
+shadow_terminal_truth_v2,terminal_reason,enum,true,true,true,MARK_ONLY,MARK_PRICE_REPLAY,POST_EXIT,stream_observed_ms,canonical_event_stream,false,exactly one per position,terminal reason
+shadow_terminal_truth_v2,final_pnl_mark_bps,i32,true,true,true,MARK_ONLY,MARK_PRICE_REPLAY,POST_EXIT,stream_observed_ms,canonical_event_stream,true,source required,mark final PnL
+shadow_terminal_truth_v2,final_pnl_executable_bps,i32,false,true,true,FILL_MODEL_STATIC,RESEARCH_GRADE_CANDIDATE,POST_EXIT,landing_ts_ms,fill_model,true,required for executable claim,executable final PnL
+shadow_terminal_truth_v2,reconciliation_status,string,true,true,true,MARK_ONLY,MARK_PRICE_REPLAY,POST_EXIT,stream_observed_ms,canonical_event_stream,false,must be explicit,reconciliation status
+shadow_replay_v2,canonical_event_stream_ref,string,true,true,true,MARK_ONLY,MARK_PRICE_REPLAY,UNKNOWN,wall_clock_ms,replay_v2,false,must resolve,canonical stream reference
+shadow_replay_v2,derived_from_canonical_stream,bool,true,true,true,MARK_ONLY,MARK_PRICE_REPLAY,UNKNOWN,wall_clock_ms,replay_v2,false,must be true,replay is derived not competing truth

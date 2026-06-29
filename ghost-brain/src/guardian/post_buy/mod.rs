@@ -27,6 +27,7 @@ pub mod config;
 pub mod engine;
 pub mod exit_replay;
 pub mod integration;
+pub mod shadow_v2;
 pub mod signals;
 
 pub use config::{PostBuyGuardianConfig, ShadowExitReplayConfig, TimeStopV2Config};

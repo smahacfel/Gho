@@ -1,0 +1,13 @@
+risk_id,risk,severity,impacted_pr,mitigation,acceptance_gate,residual_status
+RISK_V1_COMPETING_TRUTH,Replay or lifecycle V1 remains treated as canonical,HIGH,PR8|PR9,derive V2 replay and lifecycle from canonical stream,GATE_TERMINAL_RECONCILIATION,OPEN
+RISK_CLOCK_DOMAIN_MIX,Wall clock chain slot block time or process monotonic time compared silently,HIGH,PR1|PR3|PR5|PR6,require clock-domain declarations and audit,GATE_CLOCK_DOMAIN,OPEN
+RISK_EVENT_ORDER_AMBIGUITY,Same-slot target stop order inferred without chain order,CRITICAL,PR1|PR6|PR7,require event_order_key and same_slot_ambiguity,GATE_EVENT_ORDER_KEY,OPEN
+RISK_ENTRY_FILL_FALSE_EQUIVALENCE,Entry mark price interpreted as executable fill,CRITICAL,PR5,separate decision quote and fill with fill status,GATE_ENTRY_RECON_COVERAGE,OPEN
+RISK_EXIT_FILL_FALSE_EQUIVALENCE,Target stop hit interpreted as executable sell fill,CRITICAL,PR6,separate mark exit and executable fill,GATE_EXIT_RECON_COVERAGE,OPEN
+RISK_SHADOW_LEDGER_PROMOTION,ShadowLedger diagnostic state promoted to live truth,HIGH,PR3,mark source as SHADOW_LEDGER_DIAGNOSTIC and block live-equivalence,GATE_PR1_SCHEMA_MANIFEST,OPEN
+RISK_TEMPORAL_LEAKAGE,Outcome or post-entry fields used as selection features,CRITICAL,PR1|PR5|PR6,field registry and temporal audit,GATE_TEMPORAL_LEAKAGE,OPEN
+RISK_LONG_HORIZON_OVERCLAIM,300s or 500s conclusions inferred without coverage,HIGH,PR7,explicit horizon verdicts and storage budget,GATE_DENSITY_300S_500S,OPEN
+RISK_STATIC_MODEL_OVERCLAIM,Static fill assumptions called live-equivalent,CRITICAL,PR14,require live-confirmed calibration dataset,GATE_PR14_CALIBRATION,OPEN
+RISK_RUNTIME_BEHAVIOR_DRIFT,Schema work accidentally changes runtime semantics,CRITICAL,PR1,keep PR1 inert and disabled with tests and diff review,GATE_PR1_SCHEMA_SERIALIZATION,OPEN
+RISK_RAW_LOG_STAGING,Raw JSONL logs or R51 artifacts committed accidentally,HIGH,ALL,allowlist-only staging and forbidden staged guard,GATE_MANIFESTS,OPEN
+RISK_CONFIG_COMPAT,Future V2 config breaks old TOML load,MEDIUM,PR11,use serde defaults and config tests,GATE_FIXTURES,OPEN
