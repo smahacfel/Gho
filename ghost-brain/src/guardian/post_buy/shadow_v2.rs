@@ -21,6 +21,8 @@ use serde::{Deserialize, Serialize};
 pub const SHADOW_V2_SIMULATION_CONTRACT_VERSION: &str = "shadow_burnin_simulation_v2_20260629";
 pub const SHADOW_V2_ENTRY_FILL_MODEL_VERSION: &str =
     "shadow_v2_entry_fill_static_constant_product_v1";
+pub const SHADOW_V2_EXIT_FILL_MODEL_VERSION: &str =
+    "shadow_v2_exit_fill_static_constant_product_v1";
 pub const EVENT_ORDER_UNKNOWN_INDEX: u32 = u32::MAX;
 pub const EVENT_ORDER_UNKNOWN_SIGNATURE: &str = "UNKNOWN";
 
@@ -80,6 +82,67 @@ pub enum FillStatus {
     NoFill,
     Failed,
     BlockedByData,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ShadowExitFillFailureModeV2 {
+    NoFill,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ShadowPathSamplingModeV2 {
+    Dense3s,
+    Standard120s,
+    Long500s,
+}
+
+impl ShadowPathSamplingModeV2 {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Dense3s => "shadow_path_dense_3s",
+            Self::Standard120s => "shadow_path_standard_120s",
+            Self::Long500s => "shadow_path_long_500s",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ShadowPathSamplingReasonV2 {
+    EventSample,
+    Heartbeat,
+    LevelHit,
+    LargePriceDelta,
+    Terminal,
+}
+
+impl ShadowPathSamplingReasonV2 {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::EventSample => "EVENT_SAMPLE",
+            Self::Heartbeat => "HEARTBEAT",
+            Self::LevelHit => "LEVEL_HIT",
+            Self::LargePriceDelta => "LARGE_PRICE_DELTA",
+            Self::Terminal => "TERMINAL",
+        }
+    }
+
+    pub const fn is_must_keep(self) -> bool {
+        matches!(self, Self::LevelHit | Self::Terminal)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ShadowPathHorizonVerdictV2 {
+    EvaluableExact,
+    EvaluableApprox,
+    SparseApproxOnly,
+    NotEvaluableNoCoverage,
+    NotEvaluableHorizonExceedsReplay,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1487,10 +1550,29 @@ fn normalized_token_amount(raw_tokens: u64, token_decimals: u8) -> f64 {
     raw_tokens as f64 / 10_f64.powi(token_decimals as i32)
 }
 
+fn pnl_bps_from_prices(
+    entry_price_sol_per_token: f64,
+    current_price_sol_per_token: f64,
+) -> Option<i32> {
+    if !entry_price_sol_per_token.is_finite()
+        || !current_price_sol_per_token.is_finite()
+        || entry_price_sol_per_token <= 0.0
+    {
+        return None;
+    }
+    Some(
+        (((current_price_sol_per_token - entry_price_sol_per_token) / entry_price_sol_per_token)
+            * SHADOW_V2_BPS_DENOMINATOR as f64)
+            .round() as i32,
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ShadowPathSampleV2 {
     pub envelope: ShadowV2Envelope,
     pub event_order_key: EventOrderKey,
+    pub sampling_mode: ShadowPathSamplingModeV2,
+    pub path_horizon_ms: u64,
     pub sample_ts_ms: ClockedTimestamp,
     pub sample_slot: Option<u64>,
     pub age_ms: u64,
@@ -1504,6 +1586,110 @@ pub struct ShadowPathSampleV2 {
     pub source_quality: String,
     pub sampling_reason: String,
     pub exact_or_approx: String,
+    pub truncated: bool,
+}
+
+impl ShadowPathSampleV2 {
+    pub fn from_pool_state_mark(
+        mut envelope: ShadowV2Envelope,
+        event_order_key: EventOrderKey,
+        sample_ts_ms: ClockedTimestamp,
+        age_ms: u64,
+        pool_state: &PoolStateSampleV2,
+        pool_phase: ShadowV2PoolPhase,
+        entry_mark_price_sol_per_token: Option<f64>,
+        sampling_mode: ShadowPathSamplingModeV2,
+        sampling_reason: ShadowPathSamplingReasonV2,
+    ) -> Self {
+        envelope.schema = "shadow_path_sample_v2".to_string();
+        envelope.simulation_level = SimulationLevel::MarkOnly;
+        envelope.measurement_grade = MeasurementGrade::MarkPriceReplay;
+        envelope.temporal_class = TemporalClass::PostEntry;
+        envelope.clock_domain = ClockDomain::StreamObservedMs;
+        envelope.source_refs.push(format!(
+            "pool_state_sample_v2:{}",
+            pool_state.envelope.event_id
+        ));
+
+        let mut limitations = vec![
+            format!("PATH_SAMPLING_MODE={}", sampling_mode.label()),
+            format!("PATH_SAMPLING_REASON={}", sampling_reason.label()),
+            "MARK_PRICE_REPLAY_NOT_EXECUTABLE_FILL".to_string(),
+        ];
+        limitations.extend(pool_state.ambiguity_labels());
+
+        let blockers = pool_state.research_blockers();
+        let mark_price = reserves_from_pool_state(pool_state, pool_phase)
+            .and_then(|reserves| reserves.mark_price_sol_per_token().ok())
+            .or(pool_state.price_sol_per_token);
+        if mark_price.is_none() {
+            limitations.push("PATH_SAMPLE_MARK_PRICE_MISSING_OR_UNRECONSTRUCTABLE".to_string());
+        }
+        limitations.extend(blockers.clone());
+
+        let pnl_mark_bps = mark_price
+            .and_then(|price| pnl_bps_from_prices(entry_mark_price_sol_per_token?, price));
+        let exact_or_approx = if mark_price.is_none() || !blockers.is_empty() {
+            "BLOCKED_BY_DATA".to_string()
+        } else if event_order_key.has_complete_chain_order() {
+            "EXACT_EVENT_ORDER".to_string()
+        } else {
+            "APPROX_AMBIGUOUS_EVENT_ORDER".to_string()
+        };
+        let quality = if mark_price.is_some() && blockers.is_empty() {
+            "MARK_PRICE_REPLAY_SAMPLE".to_string()
+        } else {
+            "BLOCKED_BY_DATA".to_string()
+        };
+        envelope.quality = quality.clone();
+        envelope.limitations.extend(limitations.clone());
+
+        Self {
+            envelope,
+            event_order_key,
+            sampling_mode,
+            path_horizon_ms: ShadowPathSamplerConfigV2::for_mode(sampling_mode).max_horizon_ms,
+            sample_ts_ms,
+            sample_slot: pool_state
+                .event_order_key
+                .slot
+                .as_known()
+                .copied()
+                .or(pool_state.observed_slot),
+            age_ms,
+            pool_state_ref: pool_state.envelope.event_id.clone(),
+            mark_price,
+            executable_exit_quote: None,
+            pnl_mark_bps,
+            pnl_executable_bps: None,
+            mfe_mark_bps: pnl_mark_bps,
+            mae_mark_bps: pnl_mark_bps,
+            source_quality: pool_state.source_quality.clone(),
+            sampling_reason: sampling_reason.label().to_string(),
+            exact_or_approx,
+            truncated: false,
+        }
+    }
+
+    pub fn attach_static_exit_quote(
+        &mut self,
+        quote: &ShadowV2Quote,
+        entry_fill_price_sol_per_token: Option<f64>,
+    ) {
+        self.envelope.simulation_level = SimulationLevel::FillModelStatic;
+        self.envelope.measurement_grade = MeasurementGrade::ResearchGradeCandidate;
+        self.executable_exit_quote = Some(quote.fill_price_sol_per_token);
+        self.pnl_executable_bps = entry_fill_price_sol_per_token
+            .and_then(|entry| pnl_bps_from_prices(entry, quote.fill_price_sol_per_token));
+        self.envelope.source_refs.push(format!(
+            "shadow_v2_price_quote:{}:{}",
+            quote.formula_version,
+            quote.price_source_label()
+        ));
+        self.envelope
+            .limitations
+            .push("EXECUTABLE_EXIT_QUOTE_IS_STATIC_MODEL_NOT_LIVE_FILL".to_string());
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1522,12 +1708,116 @@ pub struct ShadowExitAttemptV2 {
     pub executable_fill_model_version: Option<String>,
 }
 
+impl ShadowExitAttemptV2 {
+    pub fn from_mark_path_trigger(
+        mut envelope: ShadowV2Envelope,
+        event_order_key: EventOrderKey,
+        exit_trigger: impl Into<String>,
+        trigger_ts_ms: ClockedTimestamp,
+        trigger_slot: Option<u64>,
+        trigger_source: impl Into<String>,
+        target_bps: Option<i32>,
+        stop_bps: Option<i32>,
+        max_hold_ms: Option<u64>,
+        same_slot_ambiguity: bool,
+        tie_break_policy: Option<String>,
+    ) -> Self {
+        envelope.schema = "shadow_exit_attempt_v2".to_string();
+        envelope.simulation_level = SimulationLevel::MarkOnly;
+        envelope.measurement_grade = MeasurementGrade::MarkPriceReplay;
+        envelope.temporal_class = TemporalClass::PostEntry;
+        envelope.clock_domain = ClockDomain::StreamObservedMs;
+        if same_slot_ambiguity {
+            envelope
+                .limitations
+                .push("EXIT_ATTEMPT_SAME_SLOT_AMBIGUITY_REQUIRES_TIE_BREAK".to_string());
+        }
+
+        Self {
+            envelope,
+            event_order_key,
+            exit_trigger: exit_trigger.into(),
+            trigger_ts_ms,
+            trigger_slot,
+            trigger_source: trigger_source.into(),
+            target_bps,
+            stop_bps,
+            max_hold_ms,
+            tie_break_policy,
+            same_slot_ambiguity,
+            executable_fill_model_version: None,
+        }
+    }
+
+    pub fn attach_static_exit_model(&mut self, model_version: impl Into<String>) {
+        self.executable_fill_model_version = Some(model_version.into());
+    }
+
+    pub fn research_blockers(&self) -> Vec<String> {
+        let mut blockers = Vec::new();
+        if self.exit_trigger.trim().is_empty() {
+            blockers.push("EXIT_ATTEMPT_TRIGGER_MISSING".to_string());
+        }
+        if self.trigger_ts_ms.value.is_none() {
+            blockers.push("EXIT_ATTEMPT_TRIGGER_TS_MISSING".to_string());
+        }
+        if self.event_order_key.slot.is_unknown() {
+            blockers.push("EXIT_ATTEMPT_EVENT_ORDER_SLOT_UNKNOWN".to_string());
+        }
+        if self.same_slot_ambiguity
+            && self
+                .tie_break_policy
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default()
+                .is_empty()
+        {
+            blockers.push("EXIT_ATTEMPT_TIE_BREAK_POLICY_MISSING".to_string());
+        }
+        blockers
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShadowExitFillModelConfig {
+    pub pool_phase: ShadowV2PoolPhase,
+    pub input_token_raw: u64,
+    pub slippage_bps: u16,
+    pub fee_bps: u16,
+    pub executable_fill_model_version: String,
+    pub modeled_failure_mode: Option<ShadowExitFillFailureModeV2>,
+}
+
+impl ShadowExitFillModelConfig {
+    pub fn bonding_curve(
+        input_token_raw: u64,
+        slippage_bps: u16,
+        fee_bps: u16,
+        executable_fill_model_version: impl Into<String>,
+    ) -> Self {
+        Self {
+            pool_phase: ShadowV2PoolPhase::BondingCurve,
+            input_token_raw,
+            slippage_bps,
+            fee_bps,
+            executable_fill_model_version: executable_fill_model_version.into(),
+            modeled_failure_mode: None,
+        }
+    }
+
+    pub fn with_modeled_failure(mut self, failure_mode: ShadowExitFillFailureModeV2) -> Self {
+        self.modeled_failure_mode = Some(failure_mode);
+        self
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ShadowExitFillV2 {
     pub envelope: ShadowV2Envelope,
     pub event_order_key: EventOrderKey,
     pub fill_status: FillStatus,
     pub fill_price: Option<f64>,
+    pub fill_price_source: Option<String>,
     pub fill_amount_sol: Option<f64>,
     pub fill_amount_tokens: Option<f64>,
     pub slippage_bps: Option<i32>,
@@ -1539,6 +1829,534 @@ pub struct ShadowExitFillV2 {
     pub reconstruction_status: String,
     pub quality: String,
     pub limitations: Vec<String>,
+}
+
+impl ShadowExitFillV2 {
+    pub fn from_static_sell_model(
+        mut envelope: ShadowV2Envelope,
+        event_order_key: EventOrderKey,
+        pool_state_before: &PoolStateSampleV2,
+        config: &ShadowExitFillModelConfig,
+    ) -> Self {
+        envelope.schema = "shadow_exit_fill_v2".to_string();
+        envelope.simulation_level = SimulationLevel::FillModelStatic;
+        envelope.measurement_grade = MeasurementGrade::ResearchGradeCandidate;
+        envelope.temporal_class = TemporalClass::PostExit;
+        envelope.clock_domain = ClockDomain::LandingTsMs;
+        envelope.source_refs.push(format!(
+            "pool_state_sample_v2:{}",
+            pool_state_before.envelope.event_id
+        ));
+
+        let blockers = exit_fill_research_blockers(pool_state_before, &event_order_key, config);
+        if !blockers.is_empty() {
+            return Self::blocked_by_data(envelope, event_order_key, pool_state_before, blockers);
+        }
+
+        if let Some(failure_mode) = config.modeled_failure_mode {
+            return Self::modeled_failure(
+                envelope,
+                event_order_key,
+                pool_state_before,
+                config,
+                failure_mode,
+            );
+        }
+
+        let Some(reserves) = reserves_from_pool_state(pool_state_before, config.pool_phase) else {
+            return Self::blocked_by_data(
+                envelope,
+                event_order_key,
+                pool_state_before,
+                vec!["EXIT_FILL_RESERVE_PROVENANCE_MISSING_FOR_PHASE".to_string()],
+            );
+        };
+
+        match quote_constant_product(
+            config.pool_phase,
+            ShadowV2QuoteSide::Sell,
+            reserves,
+            config.input_token_raw,
+            config.fee_bps,
+            config.slippage_bps,
+        ) {
+            Ok(quote) => Self::filled_from_quote(
+                envelope,
+                event_order_key,
+                pool_state_before,
+                config,
+                reserves,
+                quote,
+            ),
+            Err(error) => Self::blocked_by_data(
+                envelope,
+                event_order_key,
+                pool_state_before,
+                vec![format!("EXIT_FILL_QUOTE_RECONSTRUCTION_ERROR={error}")],
+            ),
+        }
+    }
+
+    fn filled_from_quote(
+        mut envelope: ShadowV2Envelope,
+        event_order_key: EventOrderKey,
+        pool_state_before: &PoolStateSampleV2,
+        config: &ShadowExitFillModelConfig,
+        reserves: ShadowV2Reserves,
+        quote: ShadowV2Quote,
+    ) -> Self {
+        let mut limitations = vec![
+            "FILL_MODEL_STATIC_NOT_LIVE_CONFIRMED".to_string(),
+            "NO_LIVE_EXIT_TRANSACTION_OR_FAILED_TX_TELEMETRY".to_string(),
+            "EXIT_SLIPPAGE_IS_CONFIGURED_TOLERANCE_NOT_REALIZED".to_string(),
+            "POOL_STATE_AFTER_IS_DETERMINISTIC_DERIVED_STATE_NOT_OBSERVED_ACCOUNT".to_string(),
+            "STATIC_EXIT_FILL_DOES_NOT_ENABLE_ACTIVE_CLOSE".to_string(),
+            format!("EXIT_FILL_POOL_PHASE={:?}", config.pool_phase),
+            format!("EXIT_FILL_FORMULA_VERSION={SHADOW_V2_PRICE_FORMULA_VERSION}"),
+        ];
+        limitations.extend(pool_state_before.ambiguity_labels());
+        envelope.limitations.extend(limitations.clone());
+        envelope.quality = "FILL_MODEL_STATIC_EXIT_RESEARCH_CANDIDATE".to_string();
+
+        Self {
+            envelope,
+            event_order_key,
+            fill_status: FillStatus::Filled,
+            fill_price: Some(quote.fill_price_sol_per_token),
+            fill_price_source: Some(quote.price_source_label().to_string()),
+            fill_amount_sol: Some(
+                quote.expected_output_amount as f64 / reserves.sol_lamports as f64,
+            ),
+            fill_amount_tokens: Some(normalized_token_amount(
+                config.input_token_raw,
+                reserves.token_decimals,
+            )),
+            slippage_bps: Some(config.slippage_bps as i32),
+            own_impact_bps: Some(quote.own_impact_bps),
+            fee_bps: Some(config.fee_bps as i32),
+            min_out: Some(quote.min_output_amount),
+            pool_state_before: Some(pool_state_before.envelope.event_id.clone()),
+            pool_state_after: Some(format!(
+                "derived_after:{}:{}:{}:{}",
+                pool_state_before.envelope.event_id,
+                quote.post_sol_reserves_lamports,
+                quote.post_token_reserves_raw,
+                quote.formula_version
+            )),
+            reconstruction_status: "EXIT_FILL_RECONSTRUCTED_FROM_POOL_STATE".to_string(),
+            quality: "FILL_MODEL_STATIC_EXIT_RESEARCH_CANDIDATE".to_string(),
+            limitations,
+        }
+    }
+
+    fn modeled_failure(
+        mut envelope: ShadowV2Envelope,
+        event_order_key: EventOrderKey,
+        pool_state_before: &PoolStateSampleV2,
+        config: &ShadowExitFillModelConfig,
+        failure_mode: ShadowExitFillFailureModeV2,
+    ) -> Self {
+        let (fill_status, reconstruction_status, quality, limitation) = match failure_mode {
+            ShadowExitFillFailureModeV2::NoFill => (
+                FillStatus::NoFill,
+                "EXIT_FILL_MODELED_NO_FILL",
+                "FILL_MODEL_STATIC_EXIT_NO_FILL",
+                "EXIT_FILL_MODELED_NO_FILL_NOT_LIVE_CONFIRMED",
+            ),
+            ShadowExitFillFailureModeV2::Failed => (
+                FillStatus::Failed,
+                "EXIT_FILL_MODELED_FAILED",
+                "FILL_MODEL_STATIC_EXIT_FAILED",
+                "EXIT_FILL_MODELED_FAILURE_NOT_LIVE_CONFIRMED",
+            ),
+        };
+        let limitations = vec![
+            limitation.to_string(),
+            "FILL_MODEL_STATIC_NOT_LIVE_CONFIRMED".to_string(),
+            "STATIC_EXIT_FILL_DOES_NOT_ENABLE_ACTIVE_CLOSE".to_string(),
+            format!(
+                "EXIT_FILL_MODEL_VERSION={}",
+                config.executable_fill_model_version
+            ),
+        ];
+        envelope.quality = quality.to_string();
+        envelope.limitations.extend(limitations.clone());
+
+        Self {
+            envelope,
+            event_order_key,
+            fill_status,
+            fill_price: None,
+            fill_price_source: None,
+            fill_amount_sol: None,
+            fill_amount_tokens: None,
+            slippage_bps: Some(config.slippage_bps as i32),
+            own_impact_bps: None,
+            fee_bps: Some(config.fee_bps as i32),
+            min_out: None,
+            pool_state_before: Some(pool_state_before.envelope.event_id.clone()),
+            pool_state_after: None,
+            reconstruction_status: reconstruction_status.to_string(),
+            quality: quality.to_string(),
+            limitations,
+        }
+    }
+
+    fn blocked_by_data(
+        mut envelope: ShadowV2Envelope,
+        event_order_key: EventOrderKey,
+        pool_state_before: &PoolStateSampleV2,
+        blockers: Vec<String>,
+    ) -> Self {
+        envelope.measurement_grade = MeasurementGrade::BlockedByData;
+        envelope.quality = "BLOCKED_BY_DATA".to_string();
+        envelope.limitations.extend(blockers.clone());
+
+        Self {
+            envelope,
+            event_order_key,
+            fill_status: FillStatus::BlockedByData,
+            fill_price: None,
+            fill_price_source: None,
+            fill_amount_sol: None,
+            fill_amount_tokens: None,
+            slippage_bps: None,
+            own_impact_bps: None,
+            fee_bps: None,
+            min_out: None,
+            pool_state_before: Some(pool_state_before.envelope.event_id.clone()),
+            pool_state_after: None,
+            reconstruction_status: "EXIT_FILL_BLOCKED_BY_DATA".to_string(),
+            quality: "BLOCKED_BY_DATA".to_string(),
+            limitations: blockers,
+        }
+    }
+}
+
+fn exit_fill_research_blockers(
+    pool_state_before: &PoolStateSampleV2,
+    fill_event_order_key: &EventOrderKey,
+    config: &ShadowExitFillModelConfig,
+) -> Vec<String> {
+    let mut blockers = pool_state_before.research_blockers();
+    blockers.extend(exit_fill_causal_boundary_blockers(
+        &pool_state_before.event_order_key,
+        fill_event_order_key,
+    ));
+    if pool_state_before.envelope.temporal_class != TemporalClass::PostEntry {
+        blockers.push(
+            "EXIT_FILL_POOL_STATE_TEMPORAL_CLASS_NOT_POST_ENTRY_FOR_EXIT_BOUNDARY".to_string(),
+        );
+    }
+    if config.input_token_raw == 0 {
+        blockers.push("EXIT_FILL_INPUT_TOKEN_RAW_ZERO".to_string());
+    }
+    if config.fee_bps as u64 > SHADOW_V2_BPS_DENOMINATOR {
+        blockers.push("EXIT_FILL_FEE_BPS_INVALID".to_string());
+    }
+    if config.slippage_bps as u64 > SHADOW_V2_BPS_DENOMINATOR {
+        blockers.push("EXIT_FILL_SLIPPAGE_BPS_INVALID".to_string());
+    }
+    if reserves_from_pool_state(pool_state_before, config.pool_phase).is_none() {
+        blockers.push("EXIT_FILL_RESERVE_PROVENANCE_MISSING_FOR_PHASE".to_string());
+    }
+    blockers
+}
+
+fn exit_fill_causal_boundary_blockers(
+    pool_state_order: &EventOrderKey,
+    fill_event_order: &EventOrderKey,
+) -> Vec<String> {
+    let mut blockers = Vec::new();
+    if fill_event_order.observed_at_wall_ms == 0 {
+        push_blocker_once(
+            &mut blockers,
+            "EXIT_FILL_EVENT_ORDER_OBSERVED_AT_WALL_MS_MISSING",
+        );
+    }
+    if fill_event_order.slot.is_unknown() {
+        push_blocker_once(&mut blockers, "EXIT_FILL_EVENT_ORDER_SLOT_UNKNOWN");
+    }
+    if pool_state_order.event_seq_in_process > fill_event_order.event_seq_in_process {
+        push_blocker_once(
+            &mut blockers,
+            "EXIT_FILL_POOL_STATE_AFTER_EXIT_FILL_BOUNDARY",
+        );
+    } else if pool_state_order.event_seq_in_process == fill_event_order.event_seq_in_process {
+        push_blocker_once(
+            &mut blockers,
+            "EXIT_FILL_POOL_STATE_NOT_STRICTLY_BEFORE_EXIT_FILL_BOUNDARY",
+        );
+    }
+
+    match (
+        pool_state_order.slot.as_known(),
+        fill_event_order.slot.as_known(),
+    ) {
+        (Some(pool_slot), Some(fill_slot)) if pool_slot > fill_slot => {
+            push_blocker_once(
+                &mut blockers,
+                "EXIT_FILL_POOL_STATE_AFTER_EXIT_FILL_BOUNDARY",
+            );
+        }
+        (Some(pool_slot), Some(fill_slot)) if pool_slot == fill_slot => {
+            if pool_state_order.same_slot_ambiguous_with(fill_event_order) {
+                push_blocker_once(
+                    &mut blockers,
+                    "EXIT_FILL_POOL_STATE_SAME_SLOT_ORDER_AMBIGUOUS",
+                );
+            } else if let (Some(pool_tuple), Some(fill_tuple)) = (
+                chain_order_tuple(pool_state_order),
+                chain_order_tuple(fill_event_order),
+            ) {
+                if pool_tuple >= fill_tuple {
+                    push_blocker_once(
+                        &mut blockers,
+                        "EXIT_FILL_POOL_STATE_AFTER_EXIT_FILL_BOUNDARY",
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+
+    blockers
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShadowPathSamplerConfigV2 {
+    pub mode: ShadowPathSamplingModeV2,
+    pub max_horizon_ms: u64,
+    pub heartbeat_ms: u64,
+    pub exact_interval_ms: u64,
+    pub approx_interval_ms: u64,
+    pub large_price_delta_bps: i32,
+    pub max_path_points: usize,
+}
+
+impl ShadowPathSamplerConfigV2 {
+    pub const fn for_mode(mode: ShadowPathSamplingModeV2) -> Self {
+        match mode {
+            ShadowPathSamplingModeV2::Dense3s => Self::dense_3s(),
+            ShadowPathSamplingModeV2::Standard120s => Self::standard_120s(),
+            ShadowPathSamplingModeV2::Long500s => Self::long_500s(),
+        }
+    }
+
+    pub const fn dense_3s() -> Self {
+        Self {
+            mode: ShadowPathSamplingModeV2::Dense3s,
+            max_horizon_ms: 3_000,
+            heartbeat_ms: 250,
+            exact_interval_ms: 1_000,
+            approx_interval_ms: 1_500,
+            large_price_delta_bps: 50,
+            max_path_points: 512,
+        }
+    }
+
+    pub const fn standard_120s() -> Self {
+        Self {
+            mode: ShadowPathSamplingModeV2::Standard120s,
+            max_horizon_ms: 120_000,
+            heartbeat_ms: 1_000,
+            exact_interval_ms: 1_000,
+            approx_interval_ms: 5_000,
+            large_price_delta_bps: 100,
+            max_path_points: 4_096,
+        }
+    }
+
+    pub const fn long_500s() -> Self {
+        Self {
+            mode: ShadowPathSamplingModeV2::Long500s,
+            max_horizon_ms: 500_000,
+            heartbeat_ms: 5_000,
+            exact_interval_ms: 5_000,
+            approx_interval_ms: 30_000,
+            large_price_delta_bps: 250,
+            max_path_points: 8_192,
+        }
+    }
+
+    pub fn should_keep_sample(
+        &self,
+        age_ms: u64,
+        pnl_bps: i32,
+        reason: ShadowPathSamplingReasonV2,
+        previous_kept_age_ms: Option<u64>,
+        previous_kept_pnl_bps: Option<i32>,
+    ) -> bool {
+        if reason.is_must_keep() || previous_kept_age_ms.is_none() {
+            return true;
+        }
+        let age_delta = age_ms.saturating_sub(previous_kept_age_ms.unwrap_or_default());
+        if age_delta >= self.heartbeat_ms {
+            return true;
+        }
+        if let Some(previous_pnl) = previous_kept_pnl_bps {
+            (pnl_bps - previous_pnl).abs() >= self.large_price_delta_bps
+        } else {
+            false
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShadowPathHorizonEvaluationV2 {
+    pub horizon_ms: u64,
+    pub verdict: ShadowPathHorizonVerdictV2,
+    pub path_points: usize,
+    pub coverage_points: usize,
+    pub replay_horizon_ms: Option<u64>,
+    pub first_path_point_age_ms: Option<u64>,
+    pub median_interval_ms: Option<u64>,
+    pub p90_interval_ms: Option<u64>,
+    pub max_interval_ms: Option<u64>,
+    pub limitations: Vec<String>,
+}
+
+pub fn evaluate_path_density_v2(
+    samples: &[ShadowPathSampleV2],
+    config: &ShadowPathSamplerConfigV2,
+    horizons_ms: &[u64],
+) -> Vec<ShadowPathHorizonEvaluationV2> {
+    let mut ages: Vec<u64> = samples.iter().map(|sample| sample.age_ms).collect();
+    ages.sort_unstable();
+    ages.dedup();
+    let replay_horizon_ms = ages.last().copied();
+    horizons_ms
+        .iter()
+        .map(|horizon_ms| {
+            evaluate_single_horizon_density(&ages, replay_horizon_ms, config, *horizon_ms)
+        })
+        .collect()
+}
+
+fn evaluate_single_horizon_density(
+    ages: &[u64],
+    replay_horizon_ms: Option<u64>,
+    config: &ShadowPathSamplerConfigV2,
+    horizon_ms: u64,
+) -> ShadowPathHorizonEvaluationV2 {
+    let mut limitations = vec![format!("PATH_SAMPLING_MODE={}", config.mode.label())];
+    if ages.is_empty() {
+        limitations.push("PATH_DENSITY_NO_PATH_POINTS".to_string());
+        return ShadowPathHorizonEvaluationV2 {
+            horizon_ms,
+            verdict: ShadowPathHorizonVerdictV2::NotEvaluableNoCoverage,
+            path_points: 0,
+            coverage_points: 0,
+            replay_horizon_ms,
+            first_path_point_age_ms: None,
+            median_interval_ms: None,
+            p90_interval_ms: None,
+            max_interval_ms: None,
+            limitations,
+        };
+    }
+
+    if horizon_ms > config.max_horizon_ms {
+        limitations.push("HORIZON_EXCEEDS_CONFIGURED_PATH_MODE".to_string());
+        return horizon_not_evaluable(ages, replay_horizon_ms, horizon_ms, limitations);
+    }
+
+    if replay_horizon_ms.is_some_and(|replay_horizon| horizon_ms > replay_horizon) {
+        limitations.push("HORIZON_EXCEEDS_REPLAY_COVERAGE".to_string());
+        return horizon_not_evaluable(ages, replay_horizon_ms, horizon_ms, limitations);
+    }
+
+    let covered: Vec<u64> = ages
+        .iter()
+        .copied()
+        .filter(|age_ms| *age_ms <= horizon_ms)
+        .collect();
+    if covered.is_empty() {
+        limitations.push("PATH_DENSITY_NO_POINT_AT_OR_BEFORE_HORIZON".to_string());
+        return ShadowPathHorizonEvaluationV2 {
+            horizon_ms,
+            verdict: ShadowPathHorizonVerdictV2::NotEvaluableNoCoverage,
+            path_points: ages.len(),
+            coverage_points: 0,
+            replay_horizon_ms,
+            first_path_point_age_ms: None,
+            median_interval_ms: None,
+            p90_interval_ms: None,
+            max_interval_ms: None,
+            limitations,
+        };
+    }
+
+    let intervals = path_intervals_with_origin(&covered);
+    let median_interval_ms = percentile_from_sorted(&intervals, 50);
+    let p90_interval_ms = percentile_from_sorted(&intervals, 90);
+    let max_interval_ms = intervals.iter().copied().max();
+    let verdict = match max_interval_ms {
+        Some(max_interval) if max_interval <= config.exact_interval_ms => {
+            ShadowPathHorizonVerdictV2::EvaluableExact
+        }
+        Some(max_interval) if max_interval <= config.approx_interval_ms => {
+            ShadowPathHorizonVerdictV2::EvaluableApprox
+        }
+        Some(_) => {
+            limitations.push("PATH_DENSITY_INTERVAL_TOO_SPARSE_FOR_APPROX".to_string());
+            ShadowPathHorizonVerdictV2::SparseApproxOnly
+        }
+        None => ShadowPathHorizonVerdictV2::NotEvaluableNoCoverage,
+    };
+
+    ShadowPathHorizonEvaluationV2 {
+        horizon_ms,
+        verdict,
+        path_points: ages.len(),
+        coverage_points: covered.len(),
+        replay_horizon_ms,
+        first_path_point_age_ms: covered.first().copied(),
+        median_interval_ms,
+        p90_interval_ms,
+        max_interval_ms,
+        limitations,
+    }
+}
+
+fn horizon_not_evaluable(
+    ages: &[u64],
+    replay_horizon_ms: Option<u64>,
+    horizon_ms: u64,
+    limitations: Vec<String>,
+) -> ShadowPathHorizonEvaluationV2 {
+    ShadowPathHorizonEvaluationV2 {
+        horizon_ms,
+        verdict: ShadowPathHorizonVerdictV2::NotEvaluableHorizonExceedsReplay,
+        path_points: ages.len(),
+        coverage_points: ages.iter().filter(|age_ms| **age_ms <= horizon_ms).count(),
+        replay_horizon_ms,
+        first_path_point_age_ms: ages.first().copied(),
+        median_interval_ms: None,
+        p90_interval_ms: None,
+        max_interval_ms: None,
+        limitations,
+    }
+}
+
+fn path_intervals_with_origin(sorted_ages: &[u64]) -> Vec<u64> {
+    let mut previous = 0;
+    let mut intervals = Vec::with_capacity(sorted_ages.len());
+    for age in sorted_ages {
+        intervals.push(age.saturating_sub(previous));
+        previous = *age;
+    }
+    intervals
+}
+
+fn percentile_from_sorted(values: &[u64], percentile: u64) -> Option<u64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let index = ((sorted.len() - 1) as u64 * percentile / 100) as usize;
+    sorted.get(index).copied()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1709,6 +2527,23 @@ mod tests {
             ClockDomain::StreamObservedMs,
             6,
         )
+    }
+
+    fn post_entry_pool_sample(
+        event_id: &str,
+        seq: u64,
+        slot: u64,
+        tx_index: u32,
+    ) -> PoolStateSampleV2 {
+        let mut sample = account_state_pool_sample(event_id, seq);
+        sample.envelope.temporal_class = TemporalClass::PostEntry;
+        sample.envelope.clock_domain = ClockDomain::StreamObservedMs;
+        sample.event_order_key.slot = EventOrderComponent::known(slot);
+        sample.event_order_key.transaction_index_or_unknown = EventOrderComponent::known(tx_index);
+        sample.event_order_key.event_seq_in_process = seq;
+        sample.observed_slot = Some(slot.saturating_sub(1));
+        sample.staleness_slots = Some(1);
+        sample
     }
 
     #[test]
@@ -2424,5 +3259,394 @@ mod tests {
             Some(SHADOW_V2_ENTRY_FILL_MODEL_VERSION)
         );
         assert_ne!(attempt.decision_mark_price, attempt.entry_quote_price);
+    }
+
+    #[test]
+    fn shadow_v2_exit_fill_static_model_reconstructs_sell_fill_from_pool_state() {
+        let pool_state = post_entry_pool_sample("pool-event-exit", 2, 44, 1);
+        let mut fill_order = event_order_key(Some(45), Some(2));
+        fill_order.event_seq_in_process = 3;
+        let config = ShadowExitFillModelConfig::bonding_curve(
+            10_000_000_000,
+            150,
+            100,
+            SHADOW_V2_EXIT_FILL_MODEL_VERSION,
+        );
+
+        let fill = ShadowExitFillV2::from_static_sell_model(
+            test_envelope("shadow_exit_fill_v2", "pos-a", "exit-fill-a"),
+            fill_order,
+            &pool_state,
+            &config,
+        );
+
+        let reserves =
+            reserves_from_pool_state(&pool_state, ShadowV2PoolPhase::BondingCurve).unwrap();
+        let quote = quote_constant_product(
+            ShadowV2PoolPhase::BondingCurve,
+            ShadowV2QuoteSide::Sell,
+            reserves,
+            config.input_token_raw,
+            config.fee_bps,
+            config.slippage_bps,
+        )
+        .unwrap();
+
+        assert_eq!(fill.fill_status, FillStatus::Filled);
+        assert_eq!(
+            fill.envelope.simulation_level,
+            SimulationLevel::FillModelStatic
+        );
+        assert_eq!(
+            fill.envelope.measurement_grade,
+            MeasurementGrade::ResearchGradeCandidate
+        );
+        assert_eq!(fill.envelope.temporal_class, TemporalClass::PostExit);
+        assert_eq!(fill.envelope.clock_domain, ClockDomain::LandingTsMs);
+        assert_eq!(fill.fill_price, Some(quote.fill_price_sol_per_token));
+        assert_eq!(
+            fill.fill_price_source.as_deref(),
+            Some(quote.price_source_label())
+        );
+        assert_eq!(fill.min_out, Some(quote.min_output_amount));
+        assert_eq!(fill.own_impact_bps, Some(quote.own_impact_bps));
+        assert_eq!(fill.fee_bps, Some(100));
+        assert_eq!(fill.slippage_bps, Some(150));
+        assert_eq!(
+            fill.pool_state_before.as_deref(),
+            Some(pool_state.envelope.event_id.as_str())
+        );
+        assert!(fill
+            .pool_state_after
+            .as_deref()
+            .unwrap()
+            .contains(SHADOW_V2_PRICE_FORMULA_VERSION));
+        assert!(fill
+            .limitations
+            .contains(&"STATIC_EXIT_FILL_DOES_NOT_ENABLE_ACTIVE_CLOSE".to_string()));
+        assert!(fill
+            .limitations
+            .contains(&"EXIT_SLIPPAGE_IS_CONFIGURED_TOLERANCE_NOT_REALIZED".to_string()));
+    }
+
+    #[test]
+    fn shadow_v2_exit_fill_blocks_future_pool_state_and_same_slot_ambiguity() {
+        let future_pool_state = post_entry_pool_sample("pool-event-exit-future", 4, 45, 1);
+        let mut fill_order = event_order_key(Some(45), Some(2));
+        fill_order.event_seq_in_process = 3;
+        let config = ShadowExitFillModelConfig::bonding_curve(
+            10_000_000_000,
+            100,
+            100,
+            SHADOW_V2_EXIT_FILL_MODEL_VERSION,
+        );
+
+        let future_fill = ShadowExitFillV2::from_static_sell_model(
+            test_envelope("shadow_exit_fill_v2", "pos-a", "exit-fill-future"),
+            fill_order.clone(),
+            &future_pool_state,
+            &config,
+        );
+
+        assert_eq!(future_fill.fill_status, FillStatus::BlockedByData);
+        assert!(future_fill
+            .limitations
+            .contains(&"EXIT_FILL_POOL_STATE_AFTER_EXIT_FILL_BOUNDARY".to_string()));
+
+        let mut ambiguous_pool_state =
+            post_entry_pool_sample("pool-event-exit-ambiguous", 2, 45, 1);
+        ambiguous_pool_state
+            .event_order_key
+            .transaction_index_or_unknown = EventOrderComponent::unknown();
+        let ambiguous_fill = ShadowExitFillV2::from_static_sell_model(
+            test_envelope("shadow_exit_fill_v2", "pos-a", "exit-fill-ambiguous"),
+            fill_order,
+            &ambiguous_pool_state,
+            &config,
+        );
+
+        assert_eq!(ambiguous_fill.fill_status, FillStatus::BlockedByData);
+        assert!(ambiguous_fill
+            .limitations
+            .contains(&"EXIT_FILL_POOL_STATE_SAME_SLOT_ORDER_AMBIGUOUS".to_string()));
+        assert!(ambiguous_fill.fill_price.is_none());
+        assert!(ambiguous_fill.pool_state_after.is_none());
+    }
+
+    #[test]
+    fn shadow_v2_exit_fill_can_emit_explicit_no_fill_or_failure_without_price_claim() {
+        let pool_state = post_entry_pool_sample("pool-event-exit-no-fill", 2, 44, 1);
+        let mut fill_order = event_order_key(Some(45), Some(2));
+        fill_order.event_seq_in_process = 3;
+        let no_fill_config = ShadowExitFillModelConfig::bonding_curve(
+            10_000_000_000,
+            100,
+            100,
+            SHADOW_V2_EXIT_FILL_MODEL_VERSION,
+        )
+        .with_modeled_failure(ShadowExitFillFailureModeV2::NoFill);
+
+        let no_fill = ShadowExitFillV2::from_static_sell_model(
+            test_envelope("shadow_exit_fill_v2", "pos-a", "exit-fill-no-fill"),
+            fill_order.clone(),
+            &pool_state,
+            &no_fill_config,
+        );
+
+        assert_eq!(no_fill.fill_status, FillStatus::NoFill);
+        assert_eq!(no_fill.reconstruction_status, "EXIT_FILL_MODELED_NO_FILL");
+        assert!(no_fill.fill_price.is_none());
+        assert!(no_fill.pool_state_after.is_none());
+        assert!(no_fill
+            .limitations
+            .contains(&"EXIT_FILL_MODELED_NO_FILL_NOT_LIVE_CONFIRMED".to_string()));
+
+        let failed_config = ShadowExitFillModelConfig::bonding_curve(
+            10_000_000_000,
+            100,
+            100,
+            SHADOW_V2_EXIT_FILL_MODEL_VERSION,
+        )
+        .with_modeled_failure(ShadowExitFillFailureModeV2::Failed);
+        let failed = ShadowExitFillV2::from_static_sell_model(
+            test_envelope("shadow_exit_fill_v2", "pos-a", "exit-fill-failed"),
+            fill_order,
+            &pool_state,
+            &failed_config,
+        );
+
+        assert_eq!(failed.fill_status, FillStatus::Failed);
+        assert_eq!(failed.reconstruction_status, "EXIT_FILL_MODELED_FAILED");
+        assert!(failed.fill_price.is_none());
+    }
+
+    #[test]
+    fn shadow_v2_exit_attempt_requires_tie_break_for_same_slot_ambiguity() {
+        let mut attempt = ShadowExitAttemptV2::from_mark_path_trigger(
+            test_envelope("shadow_exit_attempt_v2", "pos-a", "exit-attempt-a"),
+            explicit_unknown_event_order_key(),
+            "TARGET_OR_STOP",
+            clocked(
+                "trigger_ts_ms",
+                1_785_000_001_000,
+                ClockDomain::StreamObservedMs,
+            ),
+            Some(45),
+            "path_sampler_v2",
+            Some(1_200),
+            Some(-600),
+            Some(45_000),
+            true,
+            None,
+        );
+
+        let blockers = attempt.research_blockers();
+        assert!(blockers.contains(&"EXIT_ATTEMPT_TIE_BREAK_POLICY_MISSING".to_string()));
+        assert!(attempt
+            .envelope
+            .limitations
+            .contains(&"EXIT_ATTEMPT_SAME_SLOT_AMBIGUITY_REQUIRES_TIE_BREAK".to_string()));
+
+        attempt.tie_break_policy = Some("BLOCK_AMBIGUOUS".to_string());
+        attempt.attach_static_exit_model(SHADOW_V2_EXIT_FILL_MODEL_VERSION);
+        assert!(!attempt
+            .research_blockers()
+            .contains(&"EXIT_ATTEMPT_TIE_BREAK_POLICY_MISSING".to_string()));
+        assert_eq!(
+            attempt.executable_fill_model_version.as_deref(),
+            Some(SHADOW_V2_EXIT_FILL_MODEL_VERSION)
+        );
+    }
+
+    #[test]
+    fn shadow_v2_path_sample_reconstructs_mark_pnl_and_attaches_static_exit_quote() {
+        let pool_state = post_entry_pool_sample("pool-event-path", 2, 44, 1);
+        let reserves =
+            reserves_from_pool_state(&pool_state, ShadowV2PoolPhase::BondingCurve).unwrap();
+        let quote = quote_constant_product(
+            ShadowV2PoolPhase::BondingCurve,
+            ShadowV2QuoteSide::Sell,
+            reserves,
+            10_000_000_000,
+            100,
+            100,
+        )
+        .unwrap();
+        let entry_mark = pool_state.price_sol_per_token.unwrap() * 0.95;
+        let mut sample = ShadowPathSampleV2::from_pool_state_mark(
+            test_envelope("shadow_path_sample_v2", "pos-a", "path-sample-a"),
+            pool_state.event_order_key.clone(),
+            clocked(
+                "sample_ts_ms",
+                1_785_000_001_000,
+                ClockDomain::StreamObservedMs,
+            ),
+            1_000,
+            &pool_state,
+            ShadowV2PoolPhase::BondingCurve,
+            Some(entry_mark),
+            ShadowPathSamplingModeV2::Dense3s,
+            ShadowPathSamplingReasonV2::EventSample,
+        );
+
+        assert_eq!(sample.envelope.schema, "shadow_path_sample_v2");
+        assert_eq!(sample.envelope.simulation_level, SimulationLevel::MarkOnly);
+        assert_eq!(
+            sample.envelope.measurement_grade,
+            MeasurementGrade::MarkPriceReplay
+        );
+        assert_eq!(sample.sampling_mode, ShadowPathSamplingModeV2::Dense3s);
+        assert_eq!(sample.path_horizon_ms, 3_000);
+        assert_eq!(sample.pool_state_ref, pool_state.envelope.event_id);
+        assert!(sample.mark_price.is_some());
+        assert!(sample.pnl_mark_bps.unwrap() > 0);
+        assert_eq!(sample.exact_or_approx, "EXACT_EVENT_ORDER");
+
+        sample.attach_static_exit_quote(&quote, Some(entry_mark));
+
+        assert_eq!(
+            sample.envelope.simulation_level,
+            SimulationLevel::FillModelStatic
+        );
+        assert_eq!(
+            sample.envelope.measurement_grade,
+            MeasurementGrade::ResearchGradeCandidate
+        );
+        assert_eq!(
+            sample.executable_exit_quote,
+            Some(quote.fill_price_sol_per_token)
+        );
+        assert!(sample.pnl_executable_bps.is_some());
+        assert!(sample
+            .envelope
+            .limitations
+            .contains(&"EXECUTABLE_EXIT_QUOTE_IS_STATIC_MODEL_NOT_LIVE_FILL".to_string()));
+    }
+
+    #[test]
+    fn shadow_v2_path_density_supports_dense_2s_3s_and_blocks_unsupported_long_horizons() {
+        let config = ShadowPathSamplerConfigV2::dense_3s();
+        let pool_state = post_entry_pool_sample("pool-event-density", 2, 44, 1);
+        let mut samples = Vec::new();
+        for (idx, age_ms) in [0_u64, 1_000, 2_000, 3_000].into_iter().enumerate() {
+            let mut order = pool_state.event_order_key.clone();
+            order.event_seq_in_process = 2 + idx as u64;
+            let event_id = format!("path-sample-{idx}");
+            samples.push(ShadowPathSampleV2::from_pool_state_mark(
+                test_envelope("shadow_path_sample_v2", "pos-a", &event_id),
+                order,
+                clocked(
+                    "sample_ts_ms",
+                    1_785_000_001_000 + age_ms as i64,
+                    ClockDomain::StreamObservedMs,
+                ),
+                age_ms,
+                &pool_state,
+                ShadowV2PoolPhase::BondingCurve,
+                Some(0.00003),
+                ShadowPathSamplingModeV2::Dense3s,
+                ShadowPathSamplingReasonV2::EventSample,
+            ));
+        }
+
+        let evaluations = evaluate_path_density_v2(&samples, &config, &[2_000, 3_000, 300_000]);
+
+        assert_eq!(
+            evaluations[0].verdict,
+            ShadowPathHorizonVerdictV2::EvaluableExact
+        );
+        assert_eq!(
+            evaluations[1].verdict,
+            ShadowPathHorizonVerdictV2::EvaluableExact
+        );
+        assert_eq!(
+            evaluations[2].verdict,
+            ShadowPathHorizonVerdictV2::NotEvaluableHorizonExceedsReplay
+        );
+        assert!(evaluations[2]
+            .limitations
+            .contains(&"HORIZON_EXCEEDS_CONFIGURED_PATH_MODE".to_string()));
+    }
+
+    #[test]
+    fn shadow_v2_path_density_marks_sparse_and_no_coverage_explicitly() {
+        let config = ShadowPathSamplerConfigV2::standard_120s();
+        let pool_state = post_entry_pool_sample("pool-event-density-sparse", 2, 44, 1);
+        let samples = [10_000_u64, 30_000]
+            .into_iter()
+            .enumerate()
+            .map(|(idx, age_ms)| {
+                let event_id = format!("path-sparse-{idx}");
+                ShadowPathSampleV2::from_pool_state_mark(
+                    test_envelope("shadow_path_sample_v2", "pos-a", &event_id),
+                    pool_state.event_order_key.clone(),
+                    clocked(
+                        "sample_ts_ms",
+                        1_785_000_001_000 + age_ms as i64,
+                        ClockDomain::StreamObservedMs,
+                    ),
+                    age_ms,
+                    &pool_state,
+                    ShadowV2PoolPhase::BondingCurve,
+                    Some(0.00003),
+                    ShadowPathSamplingModeV2::Standard120s,
+                    ShadowPathSamplingReasonV2::Heartbeat,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let evaluations = evaluate_path_density_v2(&samples, &config, &[3_000, 20_000, 500_000]);
+
+        assert_eq!(
+            evaluations[0].verdict,
+            ShadowPathHorizonVerdictV2::NotEvaluableNoCoverage
+        );
+        assert_eq!(
+            evaluations[1].verdict,
+            ShadowPathHorizonVerdictV2::SparseApproxOnly
+        );
+        assert_eq!(
+            evaluations[2].verdict,
+            ShadowPathHorizonVerdictV2::NotEvaluableHorizonExceedsReplay
+        );
+    }
+
+    #[test]
+    fn shadow_v2_path_sampler_modes_define_sampling_policy() {
+        let dense = ShadowPathSamplerConfigV2::dense_3s();
+        let standard = ShadowPathSamplerConfigV2::standard_120s();
+        let long = ShadowPathSamplerConfigV2::long_500s();
+
+        assert_eq!(dense.max_horizon_ms, 3_000);
+        assert_eq!(standard.max_horizon_ms, 120_000);
+        assert_eq!(long.max_horizon_ms, 500_000);
+        assert!(dense.should_keep_sample(
+            100,
+            10,
+            ShadowPathSamplingReasonV2::EventSample,
+            None,
+            None
+        ));
+        assert!(standard.should_keep_sample(
+            500,
+            250,
+            ShadowPathSamplingReasonV2::LargePriceDelta,
+            Some(100),
+            Some(0)
+        ));
+        assert!(long.should_keep_sample(
+            100,
+            0,
+            ShadowPathSamplingReasonV2::Terminal,
+            Some(90),
+            Some(0)
+        ));
+        assert!(!standard.should_keep_sample(
+            500,
+            10,
+            ShadowPathSamplingReasonV2::Heartbeat,
+            Some(100),
+            Some(0)
+        ));
     }
 }

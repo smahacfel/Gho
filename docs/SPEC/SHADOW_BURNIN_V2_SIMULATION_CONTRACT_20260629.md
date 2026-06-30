@@ -3,7 +3,7 @@
 ## Status
 
 ```text
-PR1_CONTRACT_DEFINED
+PR6_PR7_IMPLEMENTED_ON_PR_BRANCH_PENDING_REVIEW
 ```
 
 Ten dokument definiuje kontrakt Shadow Burnin Simulation V2. Nie aktywuje runtime, nie zmienia BUY/REJECT, nie zmienia Gatekeeper policy, nie zmienia selector runtime, nie zmienia TX/Jito/live path, nie włącza `shadow_close_only` i nie włącza active close.
@@ -395,6 +395,134 @@ Exit fill is not live-equivalent unless it includes:
 
 Same-slot target/stop ambiguity must be explicitly represented.
 
+### PR6 Static Exit Fill Contract
+
+PR6 introduces an inert static exit fill model in:
+
+```text
+ghost-brain/src/guardian/post_buy/shadow_v2.rs
+```
+
+Model version:
+
+```text
+shadow_v2_exit_fill_static_constant_product_v1
+```
+
+The model may emit `FILLED` only when:
+
+- the referenced `pool_state_sample_v2` is research-ready;
+- the pool-state temporal class is allowed for the exit causal boundary;
+- `pool_state_sample_v2.event_order_key` is strictly before the exit fill
+  event boundary;
+- future pool state, equal process sequence, unknown fill slot, missing fill
+  wall-clock observation, or incomplete same-slot order emits
+  `BLOCKED_BY_DATA`;
+- reserve provenance exists for the selected pool phase;
+- token decimals and lamports normalization are explicit;
+- input token raw amount is non-zero;
+- fee and slippage bps are valid;
+- deterministic SELL quote reconstruction succeeds.
+
+Otherwise it must emit:
+
+```text
+fill_status = BLOCKED_BY_DATA
+reconstruction_status = EXIT_FILL_BLOCKED_BY_DATA
+```
+
+with explicit blockers in `limitations`.
+
+PR6 static exit fill is:
+
+- `simulation_level = FILL_MODEL_STATIC`;
+- `measurement_grade = RESEARCH_GRADE_CANDIDATE` only for filled static model records;
+- `measurement_grade = BLOCKED_BY_DATA` for blocked records;
+- not `LIVE_CONFIRMED`;
+- not live-equivalent without PR14 live-confirmed calibration;
+- not active close;
+- not `shadow_close_only`;
+- not an executable sell transaction.
+
+PR6 can also emit explicit modeled failure records:
+
+```text
+fill_status = NO_FILL
+fill_status = FAILED
+```
+
+These records are useful as typed simulation outcomes only. They do not prove
+failed live landing, no-fill, Jito behavior or sell execution without
+live-confirmed telemetry.
+
+PR6 intentionally records limitations such as:
+
+- no live exit transaction confirmation;
+- no failed transaction/no-fill telemetry;
+- slippage is configured tolerance, not realized live slippage;
+- pool state after fill is deterministic derived state, not observed account state;
+- static exit fill does not enable active close.
+
+## Path Density Contract
+
+Path V2 must separate:
+
+- mark price path samples,
+- executable exit quote attachment,
+- path sampling mode,
+- sampling reason,
+- horizon coverage verdict.
+
+PR7 introduces three sampling modes:
+
+```text
+shadow_path_dense_3s
+shadow_path_standard_120s
+shadow_path_long_500s
+```
+
+Mode intent:
+
+- `shadow_path_dense_3s`: high-density short horizon for 2s/3s research;
+- `shadow_path_standard_120s`: standard path evidence up to 120s;
+- `shadow_path_long_500s`: long horizon evidence up to 500s, requiring an
+  explicit storage budget before use in a validation burnin.
+
+Sampling reasons are typed:
+
+```text
+EVENT_SAMPLE
+HEARTBEAT
+LEVEL_HIT
+LARGE_PRICE_DELTA
+TERMINAL
+```
+
+`LEVEL_HIT` and `TERMINAL` are must-keep samples.
+
+Horizon verdicts are:
+
+```text
+EVALUABLE_EXACT
+EVALUABLE_APPROX
+SPARSE_APPROX_ONLY
+NOT_EVALUABLE_NO_COVERAGE
+NOT_EVALUABLE_HORIZON_EXCEEDS_REPLAY
+```
+
+Rules:
+
+- Unsupported horizons must be reported as `NOT_EVALUABLE_*`, never inferred.
+- 2s/3s research requires dense-mode coverage or an explicit approximation
+  label.
+- 300s/500s research requires long-mode horizon coverage and generated density
+  evidence.
+- Same-slot incomplete ordering can remain ambiguous evidence only. It must not
+  resolve target/stop or win/loss without an explicit tie-break policy.
+- Mark path samples use `MARK_PRICE_REPLAY` until a static executable quote is
+  attached.
+- Static executable exit quote remains `FILL_MODEL_STATIC`, not live fill.
+
 ## Terminal Truth Contract
 
 Each `position_id` may have exactly one canonical terminal event.
@@ -475,9 +603,9 @@ SHADOW_V2_RESEARCH_GRADE_ONLY
 
 ## Runtime Boundary
 
-PR1 is schema and contract only.
+PR6/PR7 remain side-by-side Shadow V2 simulation contracts and fixtures only.
 
-Forbidden in PR1:
+Forbidden in PR6/PR7:
 
 - runtime writer activation,
 - lifecycle behavior change,
