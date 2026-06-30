@@ -33,6 +33,7 @@ pub mod pipeline_coverage;
 pub mod pool_identity;
 pub mod session;
 pub mod shadow_ledger;
+pub mod shadow_v2_price;
 pub mod swap_plan;
 pub mod trading_constraints;
 pub mod transaction_parser;
@@ -168,6 +169,11 @@ pub use shadow_ledger::{
     FEE_BPS,
     LAMPORTS_PER_SOL,
     PROTOCOL_GENESIS_TOKEN_TOTAL_SUPPLY,
+};
+pub use shadow_v2_price::{
+    apply_slippage_bps_floor, mark_price_sol_per_token, quote_constant_product, ShadowV2PoolPhase,
+    ShadowV2PriceError, ShadowV2Quote, ShadowV2QuoteSide, ShadowV2Reserves,
+    SHADOW_V2_BPS_DENOMINATOR, SHADOW_V2_PRICE_FORMULA_VERSION, SHADOW_V2_SOL_LAMPORTS,
 };
 pub use swap_plan::{SwapPlan, SwapPlanBuilder};
 pub use trading_constraints::TradingConstraints;
