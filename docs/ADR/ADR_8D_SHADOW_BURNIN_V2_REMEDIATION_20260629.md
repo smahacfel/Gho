@@ -5,7 +5,7 @@ Data: 2026-06-29
 Status:
 
 ```text
-ACCEPTED_FOR_PR1_CONTRACT
+PR1_CONDITIONAL_ACCEPT_FIX_READY_PENDING_MAIN_MERGE
 ```
 
 ## D1. Problem
@@ -59,7 +59,8 @@ PR1 ustanawia:
 - common V2 envelope,
 - `simulation_level`,
 - `measurement_grade`,
-- `event_order_key`,
+- `ShadowPositionV2` as a PR1-level Rust schema type,
+- typed `event_order_key` with `EventOrderComponent<T> = KNOWN(T) | UNKNOWN`,
 - clock-domain contract,
 - temporal class contract,
 - canonical record set,
@@ -104,14 +105,33 @@ SHADOW_V2_RESEARCH_GRADE_ONLY
 PR1 verification:
 
 - Rust contract serialization tests,
+- `ShadowPositionV2` schema type present in Rust,
+- typed `EventOrderComponent<T>` serializes unknown chain-order as literal `UNKNOWN`,
+- missing JSON chain-order fields fail deserialization instead of becoming implicit `None`,
+- schema manifest includes literal clock-domain columns from the remediation plan,
 - schema manifest presence,
 - acceptance gates manifest presence,
 - downgrade matrix presence,
 - risk register presence,
+- `cargo test -p ghost-brain shadow_v2`,
+- `cargo fmt --check`,
 - `git diff --check`,
 - forbidden staged file guard,
 - no runtime run,
 - no R51 touch.
+
+Visible PR1 fix validation result, 2026-06-30:
+
+```text
+cargo test -p ghost-brain shadow_v2 -- --nocapture
+result: ok; 20 passed; 0 failed; 0 ignored; 1681 filtered out
+
+cargo fmt --check
+result: ok
+
+git diff --check
+result: ok
+```
 
 Runtime boundary:
 

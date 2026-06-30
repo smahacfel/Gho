@@ -100,15 +100,55 @@ pub enum TerminalReasonV2 {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum EventOrderUnknown {
+    Unknown,
+}
+
+/// Typed chain-order component used by `EventOrderKey`.
+///
+/// Serialization intentionally preserves the schema contract shape: known
+/// numeric/string components serialize as their raw value, and missing chain
+/// ordering serializes as the literal `UNKNOWN`. A missing JSON field is a
+/// schema error instead of an implicit unknown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum EventOrderComponent<T> {
+    Unknown(EventOrderUnknown),
+    Known(T),
+}
+
+impl<T> EventOrderComponent<T> {
+    pub fn known(value: T) -> Self {
+        Self::Known(value)
+    }
+
+    pub fn unknown() -> Self {
+        Self::Unknown(EventOrderUnknown::Unknown)
+    }
+
+    pub fn as_known(&self) -> Option<&T> {
+        match self {
+            Self::Known(value) => Some(value),
+            Self::Unknown(_) => None,
+        }
+    }
+
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, Self::Unknown(_))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventOrderKey {
-    pub slot: Option<u64>,
-    pub block_time: Option<i64>,
-    pub signature: Option<String>,
-    pub transaction_index_or_unknown: Option<u32>,
-    pub instruction_index_or_unknown: Option<u32>,
-    pub inner_instruction_index_or_unknown: Option<u32>,
-    pub log_index_or_unknown: Option<u32>,
+    pub slot: EventOrderComponent<u64>,
+    pub block_time: EventOrderComponent<i64>,
+    pub signature: EventOrderComponent<String>,
+    pub transaction_index_or_unknown: EventOrderComponent<u32>,
+    pub instruction_index_or_unknown: EventOrderComponent<u32>,
+    pub inner_instruction_index_or_unknown: EventOrderComponent<u32>,
+    pub log_index_or_unknown: EventOrderComponent<u32>,
     pub event_seq_in_process: u64,
     pub observed_at_wall_ms: u64,
 }
@@ -116,62 +156,34 @@ pub struct EventOrderKey {
 impl EventOrderKey {
     pub fn missing_chain_order_components(&self) -> Vec<&'static str> {
         let mut missing = Vec::new();
-        if self.slot.is_none() {
-            missing.push("slot");
-        }
-        if self
-            .signature
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or_default()
-            .is_empty()
+        if matches!(&self.signature, EventOrderComponent::Known(signature) if signature.trim().is_empty())
         {
             missing.push("signature");
-        }
-        if self.transaction_index_or_unknown.is_none() {
-            missing.push("transaction_index_or_unknown");
-        }
-        if self.instruction_index_or_unknown.is_none() {
-            missing.push("instruction_index_or_unknown");
-        }
-        if self.inner_instruction_index_or_unknown.is_none() {
-            missing.push("inner_instruction_index_or_unknown");
-        }
-        if self.log_index_or_unknown.is_none() {
-            missing.push("log_index_or_unknown");
         }
         missing
     }
 
     pub fn explicit_unknown_chain_order_components(&self) -> Vec<&'static str> {
         let mut unknown = Vec::new();
-        if self
-            .signature
-            .as_deref()
-            .map(|signature| signature == EVENT_ORDER_UNKNOWN_SIGNATURE)
-            .unwrap_or(false)
-        {
+        if self.slot.is_unknown() {
+            unknown.push("slot");
+        }
+        if self.block_time.is_unknown() {
+            unknown.push("block_time");
+        }
+        if self.signature.is_unknown() {
             unknown.push("signature");
         }
-        if matches!(
-            self.transaction_index_or_unknown,
-            Some(EVENT_ORDER_UNKNOWN_INDEX)
-        ) {
+        if self.transaction_index_or_unknown.is_unknown() {
             unknown.push("transaction_index_or_unknown");
         }
-        if matches!(
-            self.instruction_index_or_unknown,
-            Some(EVENT_ORDER_UNKNOWN_INDEX)
-        ) {
+        if self.instruction_index_or_unknown.is_unknown() {
             unknown.push("instruction_index_or_unknown");
         }
-        if matches!(
-            self.inner_instruction_index_or_unknown,
-            Some(EVENT_ORDER_UNKNOWN_INDEX)
-        ) {
+        if self.inner_instruction_index_or_unknown.is_unknown() {
             unknown.push("inner_instruction_index_or_unknown");
         }
-        if matches!(self.log_index_or_unknown, Some(EVENT_ORDER_UNKNOWN_INDEX)) {
+        if self.log_index_or_unknown.is_unknown() {
             unknown.push("log_index_or_unknown");
         }
         unknown
@@ -194,24 +206,19 @@ impl EventOrderKey {
     }
 
     pub fn has_complete_chain_order(&self) -> bool {
-        self.slot.is_some()
-            && self
-                .signature
-                .as_deref()
-                .map(|signature| {
-                    !signature.trim().is_empty() && signature != EVENT_ORDER_UNKNOWN_SIGNATURE
-                })
-                .unwrap_or(false)
-            && matches!(self.transaction_index_or_unknown, Some(value) if value != EVENT_ORDER_UNKNOWN_INDEX)
-            && matches!(self.instruction_index_or_unknown, Some(value) if value != EVENT_ORDER_UNKNOWN_INDEX)
-            && matches!(self.inner_instruction_index_or_unknown, Some(value) if value != EVENT_ORDER_UNKNOWN_INDEX)
-            && matches!(self.log_index_or_unknown, Some(value) if value != EVENT_ORDER_UNKNOWN_INDEX)
+        self.slot.as_known().is_some()
+            && matches!(&self.signature, EventOrderComponent::Known(signature) if !signature.trim().is_empty())
+            && self.transaction_index_or_unknown.as_known().is_some()
+            && self.instruction_index_or_unknown.as_known().is_some()
+            && self.inner_instruction_index_or_unknown.as_known().is_some()
+            && self.log_index_or_unknown.as_known().is_some()
     }
 
     pub fn same_slot_ambiguous_with(&self, other: &Self) -> bool {
-        self.slot.is_some()
-            && self.slot == other.slot
-            && (!self.has_complete_chain_order() || !other.has_complete_chain_order())
+        matches!(
+            (self.slot.as_known(), other.slot.as_known()),
+            (Some(lhs), Some(rhs)) if lhs == rhs
+        ) && (!self.has_complete_chain_order() || !other.has_complete_chain_order())
     }
 
     pub fn is_after_process_seq(&self, previous_seq: u64) -> bool {
@@ -895,6 +902,7 @@ impl PoolStateSampleV2 {
         let staleness_ms = observed_at_wall_ms.checked_sub(state.last_update_ts_ms);
         let staleness_slots = event_order_key
             .slot
+            .as_known()
             .and_then(|slot| slot.checked_sub(state.last_update_slot));
         for label in event_order_key.ambiguity_labels() {
             envelope.limitations.push(label);
@@ -930,11 +938,17 @@ impl PoolStateSampleV2 {
             envelope,
             observed_at_wall_ms,
             observed_slot: Some(state.last_update_slot),
-            block_time: event_order_key.block_time,
+            block_time: event_order_key.block_time.as_known().copied(),
             source: PoolStateSource::AccountStateCore,
             commitment: None,
-            event_signature: event_order_key.signature.clone(),
-            event_index: event_order_key.log_index_or_unknown,
+            event_signature: match &event_order_key.signature {
+                EventOrderComponent::Known(signature) => Some(signature.clone()),
+                EventOrderComponent::Unknown(_) => Some(EVENT_ORDER_UNKNOWN_SIGNATURE.to_string()),
+            },
+            event_index: match &event_order_key.log_index_or_unknown {
+                EventOrderComponent::Known(index) => Some(*index),
+                EventOrderComponent::Unknown(_) => Some(EVENT_ORDER_UNKNOWN_INDEX),
+            },
             account_data_hash,
             virtual_sol_reserves: Some(state.virtual_sol_reserves),
             virtual_token_reserves: Some(state.virtual_token_reserves),
@@ -967,8 +981,8 @@ impl PoolStateSampleV2 {
         if self.event_order_key.observed_at_wall_ms == 0 {
             blockers.push("EVENT_ORDER_OBSERVED_AT_WALL_MS_MISSING".to_string());
         }
-        if self.event_order_key.slot.is_none() {
-            blockers.push("EVENT_ORDER_SLOT_MISSING".to_string());
+        if self.event_order_key.slot.is_unknown() {
+            blockers.push("EVENT_ORDER_SLOT_UNKNOWN".to_string());
         }
         for component in self.event_order_key.missing_chain_order_components() {
             match component {
@@ -1237,18 +1251,22 @@ mod tests {
     use super::*;
     use ghost_core::account_state_core::types::StatePhase;
     use ghost_core::CurveFinality;
-    use serde_json::Value;
+    use serde_json::{json, Value};
     use solana_sdk::pubkey::Pubkey;
 
     fn event_order_key(slot: Option<u64>, tx_index: Option<u32>) -> EventOrderKey {
         EventOrderKey {
-            slot,
-            block_time: Some(1_785_000_000),
-            signature: Some("sig".to_string()),
-            transaction_index_or_unknown: tx_index,
-            instruction_index_or_unknown: Some(0),
-            inner_instruction_index_or_unknown: Some(0),
-            log_index_or_unknown: Some(0),
+            slot: slot
+                .map(EventOrderComponent::known)
+                .unwrap_or_else(EventOrderComponent::unknown),
+            block_time: EventOrderComponent::known(1_785_000_000),
+            signature: EventOrderComponent::known("sig".to_string()),
+            transaction_index_or_unknown: tx_index
+                .map(EventOrderComponent::known)
+                .unwrap_or_else(EventOrderComponent::unknown),
+            instruction_index_or_unknown: EventOrderComponent::known(0),
+            inner_instruction_index_or_unknown: EventOrderComponent::known(0),
+            log_index_or_unknown: EventOrderComponent::known(0),
             event_seq_in_process: 7,
             observed_at_wall_ms: 1_785_000_000_123,
         }
@@ -1256,13 +1274,13 @@ mod tests {
 
     fn explicit_unknown_event_order_key() -> EventOrderKey {
         EventOrderKey {
-            slot: Some(42),
-            block_time: Some(1_785_000_000),
-            signature: Some(EVENT_ORDER_UNKNOWN_SIGNATURE.to_string()),
-            transaction_index_or_unknown: Some(EVENT_ORDER_UNKNOWN_INDEX),
-            instruction_index_or_unknown: Some(EVENT_ORDER_UNKNOWN_INDEX),
-            inner_instruction_index_or_unknown: Some(EVENT_ORDER_UNKNOWN_INDEX),
-            log_index_or_unknown: Some(EVENT_ORDER_UNKNOWN_INDEX),
+            slot: EventOrderComponent::known(42),
+            block_time: EventOrderComponent::known(1_785_000_000),
+            signature: EventOrderComponent::unknown(),
+            transaction_index_or_unknown: EventOrderComponent::unknown(),
+            instruction_index_or_unknown: EventOrderComponent::unknown(),
+            inner_instruction_index_or_unknown: EventOrderComponent::unknown(),
+            log_index_or_unknown: EventOrderComponent::unknown(),
             event_seq_in_process: 7,
             observed_at_wall_ms: 1_785_000_000_123,
         }
@@ -1403,9 +1421,39 @@ mod tests {
         assert!(!explicit_unknown_event_order_key().has_complete_chain_order());
         assert!(explicit_unknown_event_order_key().has_explicit_unknown_chain_order());
         assert_eq!(
-            event_order_key(Some(42), None).missing_chain_order_components(),
+            event_order_key(Some(42), None).explicit_unknown_chain_order_components(),
             vec!["transaction_index_or_unknown"]
         );
+    }
+
+    #[test]
+    fn event_order_key_serializes_typed_unknown_and_rejects_missing_schema_fields() {
+        let unknown = explicit_unknown_event_order_key();
+        let serialized = serde_json::to_value(&unknown).unwrap();
+
+        assert_eq!(serialized["signature"], "UNKNOWN");
+        assert_eq!(serialized["transaction_index_or_unknown"], "UNKNOWN");
+        assert_eq!(serialized["instruction_index_or_unknown"], "UNKNOWN");
+        assert_eq!(serialized["inner_instruction_index_or_unknown"], "UNKNOWN");
+        assert_eq!(serialized["log_index_or_unknown"], "UNKNOWN");
+
+        let parsed: EventOrderKey = serde_json::from_value(serialized).unwrap();
+        assert!(parsed.has_explicit_unknown_chain_order());
+        assert!(parsed
+            .explicit_unknown_chain_order_components()
+            .contains(&"signature"));
+
+        let missing_required_component = json!({
+            "slot": 42,
+            "block_time": 1_785_000_000,
+            "signature": "sig",
+            "instruction_index_or_unknown": 0,
+            "inner_instruction_index_or_unknown": 0,
+            "log_index_or_unknown": 0,
+            "event_seq_in_process": 7,
+            "observed_at_wall_ms": 1_785_000_000_123_u64
+        });
+        assert!(serde_json::from_value::<EventOrderKey>(missing_required_component).is_err());
     }
 
     #[test]
@@ -1677,7 +1725,7 @@ mod tests {
         assert_eq!(sample.envelope.schema, "pool_state_sample_v2");
         assert_eq!(sample.source, PoolStateSource::AccountStateCore);
         assert_eq!(sample.observed_slot, Some(41));
-        assert_eq!(sample.event_order_key.slot, Some(42));
+        assert_eq!(sample.event_order_key.slot.as_known(), Some(&42));
         assert_eq!(sample.staleness_ms, Some(250));
         assert_eq!(sample.staleness_slots, Some(1));
         assert_eq!(sample.envelope.temporal_class, TemporalClass::PreDecision);
@@ -1716,11 +1764,7 @@ mod tests {
         sample.account_data_hash = None;
         sample.staleness_ms = None;
         sample.staleness_slots = None;
-        sample.event_order_key.signature = None;
-        sample.event_order_key.transaction_index_or_unknown = None;
-        sample.event_order_key.instruction_index_or_unknown = None;
-        sample.event_order_key.inner_instruction_index_or_unknown = None;
-        sample.event_order_key.log_index_or_unknown = None;
+        sample.event_order_key.signature = EventOrderComponent::known("".to_string());
 
         let blockers = sample.research_blockers();
 
@@ -1729,10 +1773,6 @@ mod tests {
             "POOL_STATE_STALENESS_MS_MISSING_OR_REVERSED",
             "POOL_STATE_STALENESS_SLOTS_MISSING_OR_REVERSED",
             "EVENT_ORDER_SIGNATURE_MISSING",
-            "EVENT_ORDER_TRANSACTION_INDEX_MISSING",
-            "EVENT_ORDER_INSTRUCTION_INDEX_MISSING",
-            "EVENT_ORDER_INNER_INSTRUCTION_INDEX_MISSING",
-            "EVENT_ORDER_LOG_INDEX_MISSING",
         ] {
             assert!(
                 blockers.contains(&expected.to_string()),
@@ -1777,7 +1817,7 @@ mod tests {
     fn shadow_v2_pool_state_research_sample_blocks_missing_slot_or_unknown_source() {
         let mut sample = account_state_pool_sample("pool-event-a", 1);
         sample.observed_slot = None;
-        sample.event_order_key.slot = None;
+        sample.event_order_key.slot = EventOrderComponent::unknown();
         sample.source = PoolStateSource::Unknown;
 
         let mut recorder = PoolStateProvenanceRecorder::default();
@@ -1787,7 +1827,7 @@ mod tests {
             error,
             ShadowV2Error::PoolStateBlocked { blockers, .. }
                 if blockers.contains(&"POOL_STATE_SLOT_MISSING".to_string())
-                    && blockers.contains(&"EVENT_ORDER_SLOT_MISSING".to_string())
+                    && blockers.contains(&"EVENT_ORDER_SLOT_UNKNOWN".to_string())
                     && blockers.contains(&"POOL_STATE_SOURCE_UNKNOWN".to_string())
         ));
     }
