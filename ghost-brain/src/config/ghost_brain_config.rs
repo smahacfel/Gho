@@ -85,6 +85,13 @@ pub struct GhostBrainConfig {
     #[serde(default)]
     pub fsc_v2: FscV2Config,
 
+    /// Shadow Burnin Simulation V2 validation configuration.
+    ///
+    /// PR11 keeps this config inert: it documents a logging-only validation
+    /// profile and manifest requirements, but no runtime writer consumes it.
+    #[serde(default)]
+    pub shadow_v2_burnin: ShadowV2BurninConfig,
+
     /// MPCF (Micro-Payload Cognitive Fingerprint) configuration
     pub mpcf: MpcfConfig,
 
@@ -187,6 +194,230 @@ pub struct GhostBrainConfig {
     /// IWIM Veto Gate configuration (post-Gatekeeper dev history check)
     #[serde(default)]
     pub iwim_veto_gate: IwimVetoGateConfig,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Shadow Burnin Simulation V2 Configuration
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShadowV2BurninMode {
+    Disabled,
+    LoggingOnlyValidation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ShadowV2BurninConfig {
+    /// Inert feature flag for future Shadow V2 validation runs.
+    pub enabled: bool,
+    /// PR11 only permits logging-only validation.
+    pub mode: ShadowV2BurninMode,
+    /// Must match the Shadow V2 simulation contract version.
+    pub simulation_contract_version: String,
+    /// Human-readable validation profile.
+    pub validation_profile: String,
+    /// Optional run namespace for future PR12 validation burnin.
+    pub run_namespace: Option<String>,
+    /// Required pre-run manifest destination for future validation.
+    pub pre_run_manifest_path: Option<String>,
+    /// Required post-run manifest destination for future validation.
+    pub post_run_manifest_path: Option<String>,
+    /// Offline manifest audit script; not invoked by runtime.
+    pub manifest_audit_script: String,
+    /// Schema manifest used by manifest/schema coverage checks.
+    pub required_schema_manifest_path: String,
+    /// Acceptance gates manifest used by validation checks.
+    pub acceptance_gates_path: String,
+    /// Future canonical V2 stream path. This is not a V1 lifecycle path.
+    pub canonical_event_stream_path: Option<String>,
+    /// Future replay V2 path. Must remain derived from canonical stream.
+    pub replay_v2_path: Option<String>,
+    /// Future lifecycle V2 path. Must remain derived from canonical stream.
+    pub lifecycle_v2_path: Option<String>,
+    /// Raw evidence manifests are mandatory before research-grade use.
+    pub evidence_manifest_required: bool,
+    /// Artifact sha256 coverage requirement.
+    pub sha256_required: bool,
+    /// JSONL row-count coverage requirement.
+    pub row_counts_required: bool,
+    /// Schema coverage requirement for JSONL evidence.
+    pub schema_coverage_required: bool,
+    /// Guardrail that raw JSONL/logs are not staged in Git.
+    pub no_raw_jsonl_git_staging: bool,
+    /// PR11 validation profile must be logging-only.
+    pub logging_only: bool,
+    /// Explicitly false until a later approval phase.
+    pub runtime_approval: bool,
+    /// Explicitly false until a later approval phase.
+    pub shadow_close_only_approval: bool,
+    /// Explicitly false until a later approval phase.
+    pub active_close_approval: bool,
+    /// Strategy proof must remain disabled for PR11.
+    pub strategy_proof_enabled: bool,
+    /// RCE proof must remain disabled for PR11.
+    pub rce_proof_enabled: bool,
+    /// Selector proof must remain disabled for PR11.
+    pub selector_proof_enabled: bool,
+    /// Edge proof must remain disabled for PR11.
+    pub edge_proof_enabled: bool,
+    /// R51 remains diagnostic-only under this contract.
+    pub r51_diagnostic_only: bool,
+    /// Without PR14 live-confirmed calibration, max verdict is research-grade only.
+    pub max_verdict_without_live_calibration: String,
+    /// Retention policy label for future evidence cleanup.
+    pub raw_evidence_retention_policy: String,
+}
+
+impl Default for ShadowV2BurninMode {
+    fn default() -> Self {
+        Self::Disabled
+    }
+}
+
+impl Default for ShadowV2BurninConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: ShadowV2BurninMode::Disabled,
+            simulation_contract_version: "shadow_burnin_simulation_v2_20260629".to_string(),
+            validation_profile: "disabled".to_string(),
+            run_namespace: None,
+            pre_run_manifest_path: None,
+            post_run_manifest_path: None,
+            manifest_audit_script: "scripts/shadow_v2_manifest_audit.py".to_string(),
+            required_schema_manifest_path:
+                "reports/selector/shadow_v2_required_schema_manifest.csv".to_string(),
+            acceptance_gates_path: "reports/selector/shadow_v2_acceptance_gates.csv".to_string(),
+            canonical_event_stream_path: None,
+            replay_v2_path: None,
+            lifecycle_v2_path: None,
+            evidence_manifest_required: true,
+            sha256_required: true,
+            row_counts_required: true,
+            schema_coverage_required: true,
+            no_raw_jsonl_git_staging: true,
+            logging_only: true,
+            runtime_approval: false,
+            shadow_close_only_approval: false,
+            active_close_approval: false,
+            strategy_proof_enabled: false,
+            rce_proof_enabled: false,
+            selector_proof_enabled: false,
+            edge_proof_enabled: false,
+            r51_diagnostic_only: true,
+            max_verdict_without_live_calibration: "SHADOW_V2_RESEARCH_GRADE_ONLY".to_string(),
+            raw_evidence_retention_policy: "manifest_before_cleanup_required".to_string(),
+        }
+    }
+}
+
+impl ShadowV2BurninConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.simulation_contract_version != "shadow_burnin_simulation_v2_20260629" {
+            anyhow::bail!(
+                "Shadow V2 simulation_contract_version must be shadow_burnin_simulation_v2_20260629"
+            );
+        }
+        if !self.no_raw_jsonl_git_staging {
+            anyhow::bail!("Shadow V2 config must keep no_raw_jsonl_git_staging=true");
+        }
+        if self.runtime_approval {
+            anyhow::bail!("Shadow V2 PR11 cannot set runtime_approval=true");
+        }
+        if self.shadow_close_only_approval {
+            anyhow::bail!("Shadow V2 PR11 cannot set shadow_close_only_approval=true");
+        }
+        if self.active_close_approval {
+            anyhow::bail!("Shadow V2 PR11 cannot set active_close_approval=true");
+        }
+        if self.strategy_proof_enabled
+            || self.rce_proof_enabled
+            || self.selector_proof_enabled
+            || self.edge_proof_enabled
+        {
+            anyhow::bail!("Shadow V2 PR11 config must not enable strategy/RCE/selector/edge proof");
+        }
+        if self.max_verdict_without_live_calibration != "SHADOW_V2_RESEARCH_GRADE_ONLY" {
+            anyhow::bail!(
+                "Shadow V2 max verdict without live calibration must remain SHADOW_V2_RESEARCH_GRADE_ONLY"
+            );
+        }
+        if self.raw_evidence_retention_policy.trim().is_empty() {
+            anyhow::bail!("Shadow V2 raw_evidence_retention_policy must be non-empty");
+        }
+        if self.enabled {
+            if self.mode != ShadowV2BurninMode::LoggingOnlyValidation {
+                anyhow::bail!("Shadow V2 enabled profile must use logging_only_validation mode");
+            }
+            if !self.logging_only {
+                anyhow::bail!("Shadow V2 PR11 enabled profile must remain logging_only=true");
+            }
+            if !self.evidence_manifest_required
+                || !self.sha256_required
+                || !self.row_counts_required
+                || !self.schema_coverage_required
+            {
+                anyhow::bail!("Shadow V2 enabled profile requires manifests sha256 row counts and schema coverage");
+            }
+            if self
+                .run_namespace
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+            {
+                anyhow::bail!("Shadow V2 enabled profile requires run_namespace");
+            }
+            if self
+                .pre_run_manifest_path
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+            {
+                anyhow::bail!("Shadow V2 enabled profile requires pre_run_manifest_path");
+            }
+            if self
+                .post_run_manifest_path
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+            {
+                anyhow::bail!("Shadow V2 enabled profile requires post_run_manifest_path");
+            }
+            if self
+                .canonical_event_stream_path
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+            {
+                anyhow::bail!("Shadow V2 enabled profile requires canonical_event_stream_path");
+            }
+            if self
+                .replay_v2_path
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+            {
+                anyhow::bail!("Shadow V2 enabled profile requires replay_v2_path");
+            }
+            if self
+                .lifecycle_v2_path
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+            {
+                anyhow::bail!("Shadow V2 enabled profile requires lifecycle_v2_path");
+            }
+        }
+        Ok(())
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -4418,6 +4649,7 @@ impl Default for GhostBrainConfig {
             gatekeeper_v2: None,
             gatekeeper_v3: GatekeeperV3Config::default(),
             fsc_v2: FscV2Config::default(),
+            shadow_v2_burnin: ShadowV2BurninConfig::default(),
             mpcf: MpcfConfig::default(),
             ssmi: SsmiConfig::default(),
             iwim: IwimConfig::default(),
@@ -4812,6 +5044,25 @@ impl GhostBrainConfig {
         Ok(Some(config))
     }
 
+    /// Load ONLY `[shadow_v2_burnin]` from TOML without validating full GhostBrain config.
+    ///
+    /// PR11 uses this for static validation of an inert logging-only Shadow V2
+    /// burnin profile. The runtime does not consume this loader.
+    pub fn shadow_v2_burnin_from_toml_file<P: AsRef<Path>>(
+        path: P,
+    ) -> anyhow::Result<ShadowV2BurninConfig> {
+        let contents = fs::read_to_string(path)?;
+        let doc: toml::Value = toml::from_str(&contents)?;
+
+        let Some(shadow_v2_burnin) = doc.get("shadow_v2_burnin") else {
+            return Ok(ShadowV2BurninConfig::default());
+        };
+
+        let config: ShadowV2BurninConfig = shadow_v2_burnin.clone().try_into()?;
+        config.validate()?;
+        Ok(config)
+    }
+
     /// Save configuration to JSON file
     ///
     /// # Arguments
@@ -4900,6 +5151,7 @@ impl GhostBrainConfig {
         }
         self.gatekeeper_v3.validate()?;
         self.fsc_v2.validate()?;
+        self.shadow_v2_burnin.validate()?;
 
         // Validate QASS
         if self.qass.collapse_threshold < 0.0 || self.qass.collapse_threshold > 1.0 {
@@ -5763,6 +6015,86 @@ include_spl = false
             .validate()
             .expect_err("PR-FSC1 must reject active FSC v2 decision enablement");
         assert!(err.to_string().contains("fsc_v2.decision_enabled"));
+    }
+
+    #[test]
+    fn shadow_v2_config_defaults_disabled() {
+        let config = GhostBrainConfig::default();
+
+        assert!(!config.shadow_v2_burnin.enabled);
+        assert_eq!(config.shadow_v2_burnin.mode, ShadowV2BurninMode::Disabled);
+        assert!(config.shadow_v2_burnin.logging_only);
+        assert!(!config.shadow_v2_burnin.runtime_approval);
+        assert!(!config.shadow_v2_burnin.shadow_close_only_approval);
+        assert!(!config.shadow_v2_burnin.active_close_approval);
+        assert_eq!(
+            config.shadow_v2_burnin.max_verdict_without_live_calibration,
+            "SHADOW_V2_RESEARCH_GRADE_ONLY"
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn shadow_v2_config_partial_loader_defaults_when_section_missing() {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("ghost_shadow_v2_missing_{ts}.toml"));
+
+        std::fs::write(&path, "version = 11\n").unwrap();
+        let parsed = GhostBrainConfig::shadow_v2_burnin_from_toml_file(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(parsed, ShadowV2BurninConfig::default());
+        assert!(!parsed.enabled);
+    }
+
+    #[test]
+    fn shadow_v2_config_rejects_runtime_approval() {
+        let mut config = ShadowV2BurninConfig::default();
+        config.runtime_approval = true;
+
+        let err = config
+            .validate()
+            .expect_err("PR11 must reject Shadow V2 runtime approval");
+
+        assert!(err.to_string().contains("runtime_approval"));
+    }
+
+    #[test]
+    fn shadow_v2_config_loads_logging_only_rollout_contract() {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let path = manifest_dir
+            .join("../configs/rollout")
+            .join("ghost_brain_shadow_v2_validation_logging_only.toml");
+
+        let config = GhostBrainConfig::shadow_v2_burnin_from_toml_file(&path)
+            .unwrap_or_else(|err| panic!("failed to load {}: {err}", path.display()));
+
+        assert!(config.enabled);
+        assert_eq!(config.mode, ShadowV2BurninMode::LoggingOnlyValidation);
+        assert!(config.logging_only);
+        assert!(config.evidence_manifest_required);
+        assert!(config.sha256_required);
+        assert!(config.row_counts_required);
+        assert!(config.schema_coverage_required);
+        assert!(config.no_raw_jsonl_git_staging);
+        assert!(!config.runtime_approval);
+        assert!(!config.shadow_close_only_approval);
+        assert!(!config.active_close_approval);
+        assert!(!config.strategy_proof_enabled);
+        assert!(!config.rce_proof_enabled);
+        assert!(!config.selector_proof_enabled);
+        assert!(!config.edge_proof_enabled);
+        assert_eq!(
+            config.max_verdict_without_live_calibration,
+            "SHADOW_V2_RESEARCH_GRADE_ONLY"
+        );
+        assert_eq!(
+            config.canonical_event_stream_path.as_deref(),
+            Some("logs/shadow_v2/shadow-burnin-v2-fidelity-validation-logging-only/shadow_position_event_v2.jsonl")
+        );
     }
 
     #[test]

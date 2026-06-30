@@ -3,7 +3,7 @@
 ## Status
 
 ```text
-PR8_PR9_COMPLETED_ON_PR_BRANCH_PENDING_REVIEW
+PR10_PR11_COMPLETED_ON_PR_BRANCH_PENDING_REVIEW
 ```
 
 Ten dokument definiuje kontrakt Shadow Burnin Simulation V2. Nie aktywuje runtime, nie zmienia BUY/REJECT, nie zmienia Gatekeeper policy, nie zmienia selector runtime, nie zmienia TX/Jito/live path, nie włącza `shadow_close_only` i nie włącza active close.
@@ -647,6 +647,91 @@ Required PR9 invariants:
 PR9 does not activate shadow close, active close, live sell, runtime lifecycle
 behavior or any strategy proof.
 
+## PR10 Evidence Manifest and Retention Contract
+
+PR10 defines an offline evidence manifest contract for future Shadow V2 validation
+burnins. It does not collect evidence, start a run, stop a run, clean artifacts
+or stage raw logs.
+
+Required PR10 manifest records:
+
+- `shadow_v2_evidence_manifest_v1`
+- `shadow_v2_artifact_manifest_entry_v1`
+
+Required PR10 manifest fields:
+
+- `manifest_phase`
+- `run_id`
+- `scope_root`
+- `artifact_count`
+- `total_size_bytes`
+- `schema_coverage`
+- `required_artifacts_missing`
+- `retention_policy`
+- `raw_jsonl_git_staging_allowed`
+- `artifacts`
+
+Required PR10 artifact entry fields:
+
+- `relative_path`
+- `size_bytes`
+- `line_count`
+- `sha256`
+- `sha256_status`
+- `jsonl_rows`
+- `malformed_jsonl_rows`
+- `schema_counts`
+- `is_symlink`
+- `status`
+
+Required PR10 properties:
+
+- `raw_jsonl_git_staging_allowed=false`;
+- sha256 is recorded for feasible files or explicitly marked
+  `SKIPPED_TOO_LARGE`;
+- JSONL malformed rows are counted and block strict manifest acceptance;
+- symlinks are not followed silently and are reported as `BLOCKED_SYMLINK`;
+- required post-run artifacts are defined in
+  `reports/selector/shadow_v2_manifest_artifact_contract.csv`;
+- no cleanup is allowed before pre/post manifest evidence exists.
+
+PR10 acceptance is limited to manifest contract readiness and deterministic
+fixture coverage. It is not research-grade proof by itself because no validation
+burnin evidence is collected in PR10.
+
+## PR11 Logging-Only Burnin Config Contract
+
+PR11 defines an inert configuration surface for a future Shadow V2 fidelity
+validation burnin. The config is allowed to describe a logging-only validation
+profile, but it must not enable any runtime behavior.
+
+Required PR11 config record:
+
+```text
+shadow_v2_burnin
+```
+
+Required PR11 invariants:
+
+- default config is disabled;
+- enabled profiles must use `mode=logging_only_validation`;
+- `logging_only=true`;
+- `runtime_approval=false`;
+- `shadow_close_only_approval=false`;
+- `active_close_approval=false`;
+- `strategy_proof_enabled=false`;
+- `rce_proof_enabled=false`;
+- `selector_proof_enabled=false`;
+- `edge_proof_enabled=false`;
+- `no_raw_jsonl_git_staging=true`;
+- evidence manifest, sha256, row count and schema coverage requirements stay
+  enabled;
+- without PR14 live-confirmed calibration dataset, max verdict remains
+  `SHADOW_V2_RESEARCH_GRADE_ONLY`.
+
+PR11 does not connect the config to BUY/REJECT, Gatekeeper policy, selector
+runtime, TX/Jito/live path, shadow close or active close.
+
 ## PR12 Boundary
 
 PR12 is:
@@ -721,13 +806,16 @@ SHADOW_V2_RESEARCH_GRADE_ONLY
 
 ## Runtime Boundary
 
-PR8/PR9 remain side-by-side Shadow V2 simulation contracts and fixtures only.
+PR10/PR11 remain side-by-side Shadow V2 manifest/config contracts and fixtures
+only.
 
-Forbidden in PR8/PR9:
+Forbidden in PR10/PR11:
 
 - runtime writer activation,
+- runtime config consumption for execution,
 - lifecycle behavior change,
 - replay behavior change,
+- manifest cleanup,
 - BUY/REJECT change,
 - selector runtime change,
 - TX/Jito/live path change,
