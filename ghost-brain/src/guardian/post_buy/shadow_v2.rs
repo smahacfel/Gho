@@ -5,6 +5,13 @@
 //! policy, selector, TX/Jito path, shadow_close_only path, or active close path
 //! consumes these records yet.
 
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::fs::OpenOptions;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+
+use ghost_core::account_state_core::types::CanonicalPoolState;
 use serde::{Deserialize, Serialize};
 
 pub const SHADOW_V2_SIMULATION_CONTRACT_VERSION: &str = "shadow_burnin_simulation_v2_20260629";
@@ -105,6 +112,29 @@ pub struct EventOrderKey {
 }
 
 impl EventOrderKey {
+    pub fn missing_chain_order_components(&self) -> Vec<&'static str> {
+        let mut missing = Vec::new();
+        if self.slot.is_none() {
+            missing.push("slot");
+        }
+        if self.signature.is_none() {
+            missing.push("signature");
+        }
+        if self.transaction_index_or_unknown.is_none() {
+            missing.push("transaction_index_or_unknown");
+        }
+        if self.instruction_index_or_unknown.is_none() {
+            missing.push("instruction_index_or_unknown");
+        }
+        if self.inner_instruction_index_or_unknown.is_none() {
+            missing.push("inner_instruction_index_or_unknown");
+        }
+        if self.log_index_or_unknown.is_none() {
+            missing.push("log_index_or_unknown");
+        }
+        missing
+    }
+
     pub fn has_complete_chain_order(&self) -> bool {
         self.slot.is_some()
             && self.signature.is_some()
@@ -118,6 +148,10 @@ impl EventOrderKey {
         self.slot.is_some()
             && self.slot == other.slot
             && (!self.has_complete_chain_order() || !other.has_complete_chain_order())
+    }
+
+    pub fn is_after_process_seq(&self, previous_seq: u64) -> bool {
+        self.event_seq_in_process > previous_seq
     }
 }
 
@@ -190,6 +224,457 @@ impl ShadowV2Envelope {
             limitations: Vec::new(),
         }
     }
+
+    pub fn exact_join_key(&self) -> Result<ShadowV2ExactJoinKey, ShadowV2Error> {
+        let session_id =
+            self.session_id
+                .clone()
+                .ok_or_else(|| ShadowV2Error::MissingExactJoinKey {
+                    event_id: self.event_id.clone(),
+                    missing_field: "session_id",
+                })?;
+        ShadowV2ExactJoinKey::new(
+            self.run_id.clone(),
+            session_id,
+            self.position_id.clone(),
+            self.pool_id.clone(),
+            self.base_mint.clone(),
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShadowPositionV2 {
+    pub envelope: ShadowV2Envelope,
+    pub created_at_wall_ms: ClockedTimestamp,
+    pub created_at_slot: Option<u64>,
+    pub decision_id: Option<String>,
+    pub strategy_context: Option<String>,
+    pub lane: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ShadowPositionEventKindV2 {
+    PositionCreated,
+    PoolStateSample,
+    EntryDecision,
+    EntryAttempt,
+    EntryFill,
+    PathSample,
+    ExitAttempt,
+    ExitFill,
+    TerminalTruth,
+    ReplayDerived,
+    LifecycleSubEvent,
+}
+
+impl ShadowPositionEventKindV2 {
+    pub const fn is_canonical_terminal(self) -> bool {
+        matches!(self, Self::TerminalTruth)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShadowPositionEventV2 {
+    pub envelope: ShadowV2Envelope,
+    pub event_kind: ShadowPositionEventKindV2,
+    pub event_order_key: Option<EventOrderKey>,
+    pub canonical_payload_schema: String,
+    pub canonical_payload_event_id: String,
+    pub canonical_terminal_event_id: Option<String>,
+    pub payload: serde_json::Value,
+}
+
+impl ShadowPositionEventV2 {
+    pub fn from_record(record: ShadowV2Record) -> Result<Self, ShadowV2Error> {
+        let envelope = record.envelope().clone();
+        let event_kind = record.event_kind();
+        let canonical_payload_schema = envelope.schema.clone();
+        let canonical_payload_event_id = envelope.event_id.clone();
+        let event_order_key = record.event_order_key().cloned();
+        let canonical_terminal_event_id = event_kind
+            .is_canonical_terminal()
+            .then(|| envelope.event_id.clone());
+        let payload = serde_json::to_value(&record).map_err(ShadowV2Error::from)?;
+
+        Ok(Self {
+            envelope,
+            event_kind,
+            event_order_key,
+            canonical_payload_schema,
+            canonical_payload_event_id,
+            canonical_terminal_event_id,
+            payload,
+        })
+    }
+
+    pub fn is_canonical_terminal(&self) -> bool {
+        self.event_kind.is_canonical_terminal()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "record_type", content = "record", rename_all = "snake_case")]
+pub enum ShadowV2Record {
+    ShadowPositionV2(ShadowPositionV2),
+    PoolStateSampleV2(PoolStateSampleV2),
+    ShadowEntryDecisionV2(ShadowEntryDecisionV2),
+    ShadowEntryAttemptV2(ShadowEntryAttemptV2),
+    ShadowEntryFillV2(ShadowEntryFillV2),
+    ShadowPathSampleV2(ShadowPathSampleV2),
+    ShadowExitAttemptV2(ShadowExitAttemptV2),
+    ShadowExitFillV2(ShadowExitFillV2),
+    ShadowTerminalTruthV2(ShadowTerminalTruthV2),
+    ShadowReplayV2(ShadowReplayV2),
+}
+
+impl ShadowV2Record {
+    pub fn envelope(&self) -> &ShadowV2Envelope {
+        match self {
+            Self::ShadowPositionV2(record) => &record.envelope,
+            Self::PoolStateSampleV2(record) => &record.envelope,
+            Self::ShadowEntryDecisionV2(record) => &record.envelope,
+            Self::ShadowEntryAttemptV2(record) => &record.envelope,
+            Self::ShadowEntryFillV2(record) => &record.envelope,
+            Self::ShadowPathSampleV2(record) => &record.envelope,
+            Self::ShadowExitAttemptV2(record) => &record.envelope,
+            Self::ShadowExitFillV2(record) => &record.envelope,
+            Self::ShadowTerminalTruthV2(record) => &record.envelope,
+            Self::ShadowReplayV2(record) => &record.envelope,
+        }
+    }
+
+    pub fn event_kind(&self) -> ShadowPositionEventKindV2 {
+        match self {
+            Self::ShadowPositionV2(_) => ShadowPositionEventKindV2::PositionCreated,
+            Self::PoolStateSampleV2(_) => ShadowPositionEventKindV2::PoolStateSample,
+            Self::ShadowEntryDecisionV2(_) => ShadowPositionEventKindV2::EntryDecision,
+            Self::ShadowEntryAttemptV2(_) => ShadowPositionEventKindV2::EntryAttempt,
+            Self::ShadowEntryFillV2(_) => ShadowPositionEventKindV2::EntryFill,
+            Self::ShadowPathSampleV2(_) => ShadowPositionEventKindV2::PathSample,
+            Self::ShadowExitAttemptV2(_) => ShadowPositionEventKindV2::ExitAttempt,
+            Self::ShadowExitFillV2(_) => ShadowPositionEventKindV2::ExitFill,
+            Self::ShadowTerminalTruthV2(_) => ShadowPositionEventKindV2::TerminalTruth,
+            Self::ShadowReplayV2(_) => ShadowPositionEventKindV2::ReplayDerived,
+        }
+    }
+
+    pub fn event_order_key(&self) -> Option<&EventOrderKey> {
+        match self {
+            Self::PoolStateSampleV2(record) => Some(&record.event_order_key),
+            Self::ShadowEntryAttemptV2(record) => Some(&record.event_order_key),
+            Self::ShadowEntryFillV2(record) => Some(&record.event_order_key),
+            Self::ShadowPathSampleV2(record) => Some(&record.event_order_key),
+            Self::ShadowExitAttemptV2(record) => Some(&record.event_order_key),
+            Self::ShadowExitFillV2(record) => Some(&record.event_order_key),
+            Self::ShadowPositionV2(_)
+            | Self::ShadowEntryDecisionV2(_)
+            | Self::ShadowTerminalTruthV2(_)
+            | Self::ShadowReplayV2(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShadowV2Error {
+    EmptyPositionId {
+        event_id: String,
+    },
+    EmptyEventId {
+        position_id: String,
+    },
+    DuplicateEventId {
+        event_id: String,
+    },
+    DuplicateTerminalTruth {
+        position_id: String,
+        existing_terminal_event_id: String,
+        attempted_terminal_event_id: String,
+    },
+    NonMonotonicEventSequence {
+        run_id: String,
+        previous_seq: u64,
+        attempted_seq: u64,
+    },
+    MissingExactJoinKey {
+        event_id: String,
+        missing_field: &'static str,
+    },
+    AmbiguousExactJoinKey {
+        key: ShadowV2ExactJoinKey,
+        existing_event_id: String,
+        attempted_event_id: String,
+    },
+    FallbackJoinDisallowed {
+        reason: String,
+    },
+    PoolStateBlocked {
+        event_id: String,
+        blockers: Vec<String>,
+    },
+    Io(String),
+    Serialization(String),
+}
+
+impl fmt::Display for ShadowV2Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyPositionId { event_id } => {
+                write!(f, "shadow v2 event {event_id} has empty position_id")
+            }
+            Self::EmptyEventId { position_id } => {
+                write!(f, "shadow v2 position {position_id} has empty event_id")
+            }
+            Self::DuplicateEventId { event_id } => {
+                write!(f, "shadow v2 duplicate event_id {event_id}")
+            }
+            Self::DuplicateTerminalTruth {
+                position_id,
+                existing_terminal_event_id,
+                attempted_terminal_event_id,
+            } => write!(
+                f,
+                "shadow v2 position {position_id} already has terminal event {existing_terminal_event_id}; attempted {attempted_terminal_event_id}"
+            ),
+            Self::NonMonotonicEventSequence {
+                run_id,
+                previous_seq,
+                attempted_seq,
+            } => write!(
+                f,
+                "shadow v2 run {run_id} non-monotonic event_seq_in_process: previous={previous_seq}, attempted={attempted_seq}"
+            ),
+            Self::MissingExactJoinKey {
+                event_id,
+                missing_field,
+            } => write!(
+                f,
+                "shadow v2 event {event_id} missing exact join key field {missing_field}"
+            ),
+            Self::AmbiguousExactJoinKey {
+                key,
+                existing_event_id,
+                attempted_event_id,
+            } => write!(
+                f,
+                "shadow v2 ambiguous exact join key {key:?}: existing={existing_event_id}, attempted={attempted_event_id}"
+            ),
+            Self::FallbackJoinDisallowed { reason } => {
+                write!(f, "shadow v2 fallback join disallowed: {reason}")
+            }
+            Self::PoolStateBlocked { event_id, blockers } => {
+                write!(f, "shadow v2 pool state sample {event_id} blocked: {blockers:?}")
+            }
+            Self::Io(error) => write!(f, "shadow v2 io error: {error}"),
+            Self::Serialization(error) => write!(f, "shadow v2 serialization error: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ShadowV2Error {}
+
+impl From<io::Error> for ShadowV2Error {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error.to_string())
+    }
+}
+
+impl From<serde_json::Error> for ShadowV2Error {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Serialization(error.to_string())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ShadowV2ExactJoinKey {
+    pub run_id: String,
+    pub session_id: String,
+    pub position_id: String,
+    pub pool_id: String,
+    pub base_mint: String,
+}
+
+impl ShadowV2ExactJoinKey {
+    pub fn new(
+        run_id: impl Into<String>,
+        session_id: impl Into<String>,
+        position_id: impl Into<String>,
+        pool_id: impl Into<String>,
+        base_mint: impl Into<String>,
+    ) -> Result<Self, ShadowV2Error> {
+        let key = Self {
+            run_id: run_id.into(),
+            session_id: session_id.into(),
+            position_id: position_id.into(),
+            pool_id: pool_id.into(),
+            base_mint: base_mint.into(),
+        };
+        if key.position_id.is_empty() {
+            return Err(ShadowV2Error::EmptyPositionId {
+                event_id: "exact_join_key".to_string(),
+            });
+        }
+        Ok(key)
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ShadowV2ExactJoinIndex {
+    event_id_by_key: HashMap<ShadowV2ExactJoinKey, String>,
+}
+
+impl ShadowV2ExactJoinIndex {
+    pub fn insert(&mut self, envelope: &ShadowV2Envelope) -> Result<(), ShadowV2Error> {
+        let key = envelope.exact_join_key()?;
+        if let Some(existing_event_id) = self.event_id_by_key.get(&key) {
+            return Err(ShadowV2Error::AmbiguousExactJoinKey {
+                key,
+                existing_event_id: existing_event_id.clone(),
+                attempted_event_id: envelope.event_id.clone(),
+            });
+        }
+        self.event_id_by_key.insert(key, envelope.event_id.clone());
+        Ok(())
+    }
+
+    pub fn fallback_join_disallowed(reason: impl Into<String>) -> ShadowV2Error {
+        ShadowV2Error::FallbackJoinDisallowed {
+            reason: reason.into(),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ShadowV2CanonicalEventStream {
+    events: Vec<ShadowPositionEventV2>,
+    seen_event_ids: HashSet<String>,
+    terminal_event_by_position: HashMap<String, String>,
+    last_process_seq_by_run: HashMap<String, u64>,
+}
+
+impl ShadowV2CanonicalEventStream {
+    pub fn append_record(
+        &mut self,
+        record: ShadowV2Record,
+    ) -> Result<&ShadowPositionEventV2, ShadowV2Error> {
+        let event = ShadowPositionEventV2::from_record(record)?;
+        self.validate_event(&event)?;
+        self.commit_event(event);
+        self.events.last().ok_or_else(|| {
+            ShadowV2Error::Io(
+                "shadow v2 invariant violation: committed stream has no last event".to_string(),
+            )
+        })
+    }
+
+    pub fn events(&self) -> &[ShadowPositionEventV2] {
+        &self.events
+    }
+
+    pub fn terminal_event_id(&self, position_id: &str) -> Option<&str> {
+        self.terminal_event_by_position
+            .get(position_id)
+            .map(String::as_str)
+    }
+
+    fn validate_event(&self, event: &ShadowPositionEventV2) -> Result<(), ShadowV2Error> {
+        if event.envelope.position_id.is_empty() {
+            return Err(ShadowV2Error::EmptyPositionId {
+                event_id: event.envelope.event_id.clone(),
+            });
+        }
+        if event.envelope.event_id.is_empty() {
+            return Err(ShadowV2Error::EmptyEventId {
+                position_id: event.envelope.position_id.clone(),
+            });
+        }
+        if self.seen_event_ids.contains(&event.envelope.event_id) {
+            return Err(ShadowV2Error::DuplicateEventId {
+                event_id: event.envelope.event_id.clone(),
+            });
+        }
+        if event.is_canonical_terminal() {
+            if let Some(existing_terminal_event_id) = self
+                .terminal_event_by_position
+                .get(&event.envelope.position_id)
+            {
+                return Err(ShadowV2Error::DuplicateTerminalTruth {
+                    position_id: event.envelope.position_id.clone(),
+                    existing_terminal_event_id: existing_terminal_event_id.clone(),
+                    attempted_terminal_event_id: event.envelope.event_id.clone(),
+                });
+            }
+        }
+        if let Some(order_key) = event.event_order_key.as_ref() {
+            if let Some(previous_seq) = self.last_process_seq_by_run.get(&event.envelope.run_id) {
+                if !order_key.is_after_process_seq(*previous_seq) {
+                    return Err(ShadowV2Error::NonMonotonicEventSequence {
+                        run_id: event.envelope.run_id.clone(),
+                        previous_seq: *previous_seq,
+                        attempted_seq: order_key.event_seq_in_process,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn commit_event(&mut self, event: ShadowPositionEventV2) {
+        if let Some(order_key) = event.event_order_key.as_ref() {
+            self.last_process_seq_by_run.insert(
+                event.envelope.run_id.clone(),
+                order_key.event_seq_in_process,
+            );
+        }
+        if event.is_canonical_terminal() {
+            self.terminal_event_by_position.insert(
+                event.envelope.position_id.clone(),
+                event.envelope.event_id.clone(),
+            );
+        }
+        self.seen_event_ids.insert(event.envelope.event_id.clone());
+        self.events.push(event);
+    }
+}
+
+#[derive(Debug)]
+pub struct JsonlShadowV2CanonicalWriter {
+    path: PathBuf,
+    stream: ShadowV2CanonicalEventStream,
+}
+
+impl JsonlShadowV2CanonicalWriter {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            stream: ShadowV2CanonicalEventStream::default(),
+        }
+    }
+
+    pub fn append_record(&mut self, record: ShadowV2Record) -> Result<(), ShadowV2Error> {
+        let event = self.stream.append_record(record)?.clone();
+        append_jsonl_record(&self.path, &event)
+    }
+
+    pub fn stream(&self) -> &ShadowV2CanonicalEventStream {
+        &self.stream
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+fn append_jsonl_record(path: &Path, value: &impl Serialize) -> Result<(), ShadowV2Error> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    serde_json::to_writer(&mut file, value)?;
+    file.write_all(b"\n")?;
+    file.flush()?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -216,6 +701,163 @@ pub struct PoolStateSampleV2 {
     pub source_quality: String,
     pub staleness_ms: Option<u64>,
     pub staleness_slots: Option<u64>,
+}
+
+impl PoolStateSampleV2 {
+    pub fn from_account_state_core(
+        mut envelope: ShadowV2Envelope,
+        event_order_key: EventOrderKey,
+        state: &CanonicalPoolState,
+        observed_at_wall_ms: u64,
+        account_data_hash: Option<String>,
+    ) -> Self {
+        envelope.schema = "pool_state_sample_v2".to_string();
+        envelope.produced_at_ms = observed_at_wall_ms;
+        envelope.produced_at_slot = Some(state.last_update_slot);
+        envelope.temporal_class = TemporalClass::PreDecision;
+        envelope.clock_domain = ClockDomain::StreamObservedMs;
+        envelope.simulation_level = SimulationLevel::MarkOnly;
+        envelope.measurement_grade = MeasurementGrade::DiagnosticOnly;
+
+        let staleness_ms = observed_at_wall_ms.checked_sub(state.last_update_ts_ms);
+        let staleness_slots = event_order_key
+            .slot
+            .and_then(|slot| slot.checked_sub(state.last_update_slot));
+
+        Self {
+            envelope,
+            observed_at_wall_ms,
+            observed_slot: Some(state.last_update_slot),
+            block_time: event_order_key.block_time,
+            source: PoolStateSource::AccountStateCore,
+            commitment: None,
+            event_signature: event_order_key.signature.clone(),
+            event_index: event_order_key.log_index_or_unknown,
+            account_data_hash,
+            virtual_sol_reserves: Some(state.virtual_sol_reserves),
+            virtual_token_reserves: Some(state.virtual_token_reserves),
+            real_sol_reserves: Some(state.real_sol_reserves),
+            real_token_reserves: Some(state.real_token_reserves),
+            token_decimals: Some(6),
+            sol_lamports: Some(1_000_000_000),
+            price_sol_per_token: Some(state.price_sol),
+            market_cap_sol: Some(state.market_cap_sol),
+            bonding_progress_pct: Some(state.bonding_curve_progress),
+            source_quality: "ACCOUNT_STATE_CORE_CANONICAL".to_string(),
+            staleness_ms,
+            staleness_slots,
+            event_order_key,
+        }
+    }
+
+    pub fn research_blockers(&self) -> Vec<String> {
+        let mut blockers = Vec::new();
+        if self.observed_at_wall_ms == 0 {
+            blockers.push("POOL_STATE_OBSERVED_AT_WALL_MS_MISSING".to_string());
+        }
+        if self.observed_slot.is_none() {
+            blockers.push("POOL_STATE_SLOT_MISSING".to_string());
+        }
+        if self.event_order_key.observed_at_wall_ms == 0 {
+            blockers.push("EVENT_ORDER_OBSERVED_AT_WALL_MS_MISSING".to_string());
+        }
+        if self.event_order_key.slot.is_none() {
+            blockers.push("EVENT_ORDER_SLOT_MISSING".to_string());
+        }
+        match self.source {
+            PoolStateSource::Unknown => {
+                blockers.push("POOL_STATE_SOURCE_UNKNOWN".to_string());
+            }
+            PoolStateSource::ShadowLedgerDiagnostic => {
+                blockers.push("SHADOW_LEDGER_DIAGNOSTIC_NOT_LIVE_TRUTH".to_string());
+            }
+            PoolStateSource::RpcFallback if self.commitment.is_none() => {
+                blockers.push("RPC_FALLBACK_COMMITMENT_MISSING".to_string());
+            }
+            _ => {}
+        }
+        if self.price_sol_per_token.is_some()
+            && !has_reserve_pair(self.virtual_sol_reserves, self.virtual_token_reserves)
+            && !has_reserve_pair(self.real_sol_reserves, self.real_token_reserves)
+        {
+            blockers.push("POOL_STATE_PRICE_WITHOUT_RESERVE_PROVENANCE".to_string());
+        }
+        if self.token_decimals.is_none() {
+            blockers.push("TOKEN_DECIMALS_MISSING".to_string());
+        }
+        if self.sol_lamports.is_none() {
+            blockers.push("SOL_LAMPORTS_NORMALIZATION_MISSING".to_string());
+        }
+        blockers
+    }
+
+    pub fn is_research_ready(&self) -> bool {
+        self.research_blockers().is_empty()
+    }
+}
+
+fn has_reserve_pair(sol_reserves: Option<u64>, token_reserves: Option<u64>) -> bool {
+    matches!((sol_reserves, token_reserves), (Some(sol), Some(tokens)) if sol > 0 && tokens > 0)
+}
+
+pub fn account_data_hash_blake3(raw_account_data: &[u8]) -> String {
+    blake3::hash(raw_account_data).to_hex().to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolStateSampleValidation {
+    pub event_id: String,
+    pub research_ready: bool,
+    pub blockers: Vec<String>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct PoolStateProvenanceRecorder {
+    samples_by_event_id: HashMap<String, PoolStateSampleV2>,
+    canonical_stream: ShadowV2CanonicalEventStream,
+}
+
+impl PoolStateProvenanceRecorder {
+    pub fn record_sample(
+        &mut self,
+        sample: PoolStateSampleV2,
+    ) -> Result<PoolStateSampleValidation, ShadowV2Error> {
+        let event_id = sample.envelope.event_id.clone();
+        if self.samples_by_event_id.contains_key(&event_id) {
+            return Err(ShadowV2Error::DuplicateEventId { event_id });
+        }
+        let validation = PoolStateSampleValidation {
+            event_id: event_id.clone(),
+            research_ready: sample.is_research_ready(),
+            blockers: sample.research_blockers(),
+        };
+        self.canonical_stream
+            .append_record(ShadowV2Record::PoolStateSampleV2(sample.clone()))?;
+        self.samples_by_event_id.insert(event_id, sample);
+        Ok(validation)
+    }
+
+    pub fn record_research_sample(
+        &mut self,
+        sample: PoolStateSampleV2,
+    ) -> Result<PoolStateSampleValidation, ShadowV2Error> {
+        let blockers = sample.research_blockers();
+        if !blockers.is_empty() {
+            return Err(ShadowV2Error::PoolStateBlocked {
+                event_id: sample.envelope.event_id.clone(),
+                blockers,
+            });
+        }
+        self.record_sample(sample)
+    }
+
+    pub fn sample(&self, event_id: &str) -> Option<&PoolStateSampleV2> {
+        self.samples_by_event_id.get(event_id)
+    }
+
+    pub fn canonical_stream(&self) -> &ShadowV2CanonicalEventStream {
+        &self.canonical_stream
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -348,6 +990,10 @@ pub struct ShadowReplayV2 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ghost_core::account_state_core::types::StatePhase;
+    use ghost_core::CurveFinality;
+    use serde_json::Value;
+    use solana_sdk::pubkey::Pubkey;
 
     fn event_order_key(slot: Option<u64>, tx_index: Option<u32>) -> EventOrderKey {
         EventOrderKey {
@@ -361,6 +1007,107 @@ mod tests {
             event_seq_in_process: 7,
             observed_at_wall_ms: 1_785_000_000_123,
         }
+    }
+
+    fn test_envelope(schema: &str, position_id: &str, event_id: &str) -> ShadowV2Envelope {
+        let mut envelope = ShadowV2Envelope::contract_header(
+            schema,
+            "run-a",
+            position_id,
+            event_id,
+            "pool-a",
+            "mint-a",
+        );
+        envelope.session_id = Some("session-a".to_string());
+        envelope.produced_at_ms = 1_785_000_000_123;
+        envelope.temporal_class = TemporalClass::AtDecision;
+        envelope
+    }
+
+    fn clocked(field_name: &str, value: i64, domain: ClockDomain) -> ClockedTimestamp {
+        ClockedTimestamp {
+            field_name: field_name.to_string(),
+            value: Some(value),
+            clock_domain: domain,
+            clock_source: "shadow_v2_test".to_string(),
+            causal_boundary: "AT_DECISION".to_string(),
+        }
+    }
+
+    fn position_record(position_id: &str, event_id: &str) -> ShadowPositionV2 {
+        ShadowPositionV2 {
+            envelope: test_envelope("shadow_position_v2", position_id, event_id),
+            created_at_wall_ms: clocked(
+                "created_at_wall_ms",
+                1_785_000_000_123,
+                ClockDomain::WallClockMs,
+            ),
+            created_at_slot: Some(42),
+            decision_id: Some("decision-a".to_string()),
+            strategy_context: Some("shadow_v2_fixture".to_string()),
+            lane: "shadow".to_string(),
+        }
+    }
+
+    fn terminal_record(position_id: &str, event_id: &str) -> ShadowTerminalTruthV2 {
+        let mut envelope = test_envelope("shadow_terminal_truth_v2", position_id, event_id);
+        envelope.temporal_class = TemporalClass::PostExit;
+        ShadowTerminalTruthV2 {
+            envelope,
+            terminal_reason: TerminalReasonV2::Timeout,
+            terminal_ts_ms: clocked(
+                "terminal_ts_ms",
+                1_785_000_003_123,
+                ClockDomain::StreamObservedMs,
+            ),
+            terminal_slot: Some(45),
+            terminal_source: "canonical_event_stream".to_string(),
+            final_pnl_mark_bps: Some(12),
+            final_pnl_executable_bps: None,
+            close_age_ms: Some(3_000),
+            linked_entry_fill: None,
+            linked_exit_fill: None,
+            reconciliation_status: "CANONICAL_TERMINAL".to_string(),
+            duplicate_terminal_handling: "REJECT_DUPLICATE_TERMINAL_TRUTH".to_string(),
+        }
+    }
+
+    fn canonical_pool_state() -> CanonicalPoolState {
+        CanonicalPoolState {
+            pool_amm_id: Pubkey::new_unique(),
+            base_mint: Pubkey::new_unique(),
+            bonding_curve: Pubkey::new_unique(),
+            virtual_sol_reserves: 30_000_000_000,
+            virtual_token_reserves: 1_000_000_000_000,
+            real_sol_reserves: 7_000_000_000,
+            real_token_reserves: 500_000_000_000,
+            bonding_curve_progress: 42.5,
+            price_sol: 0.00003,
+            market_cap_sol: 30.0,
+            token_total_supply: 1_000_000_000_000,
+            is_complete: false,
+            last_update_slot: 41,
+            last_update_ts_ms: 1_785_000_000_000,
+            curve_finality: CurveFinality::Provisional,
+            state_phase: StatePhase::Canonical,
+            update_count: 3,
+            initial_price_sol: 0.00001,
+            price_change_since_t0_pct: 200.0,
+            reserve_velocity_sol_per_sec: 0.5,
+        }
+    }
+
+    fn account_state_pool_sample(event_id: &str, seq: u64) -> PoolStateSampleV2 {
+        let mut order_key = event_order_key(Some(42), Some(1));
+        order_key.event_seq_in_process = seq;
+        order_key.observed_at_wall_ms = 1_785_000_000_250;
+        PoolStateSampleV2::from_account_state_core(
+            test_envelope("pool_state_sample_v2", "pos-a", event_id),
+            order_key,
+            &canonical_pool_state(),
+            1_785_000_000_250,
+            Some(account_data_hash_blake3(b"account-data")),
+        )
     }
 
     #[test]
@@ -391,6 +1138,10 @@ mod tests {
         assert!(event_order_key(Some(42), Some(1)).has_complete_chain_order());
         assert!(!event_order_key(Some(42), None).has_complete_chain_order());
         assert!(!event_order_key(None, Some(1)).has_complete_chain_order());
+        assert_eq!(
+            event_order_key(Some(42), None).missing_chain_order_components(),
+            vec!["transaction_index_or_unknown"]
+        );
     }
 
     #[test]
@@ -439,5 +1190,193 @@ mod tests {
         };
 
         assert!(replay.derived_from_canonical_stream);
+    }
+
+    #[test]
+    fn shadow_v2_terminal_stream_rejects_duplicate_terminal_truth() {
+        let mut stream = ShadowV2CanonicalEventStream::default();
+        stream
+            .append_record(ShadowV2Record::ShadowPositionV2(position_record(
+                "pos-a",
+                "event-position",
+            )))
+            .unwrap();
+        stream
+            .append_record(ShadowV2Record::ShadowTerminalTruthV2(terminal_record(
+                "pos-a",
+                "event-terminal-a",
+            )))
+            .unwrap();
+
+        let error = stream
+            .append_record(ShadowV2Record::ShadowTerminalTruthV2(terminal_record(
+                "pos-a",
+                "event-terminal-b",
+            )))
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ShadowV2Error::DuplicateTerminalTruth {
+                ref position_id,
+                ref existing_terminal_event_id,
+                ref attempted_terminal_event_id,
+            } if position_id == "pos-a"
+                && existing_terminal_event_id == "event-terminal-a"
+                && attempted_terminal_event_id == "event-terminal-b"
+        ));
+        assert_eq!(stream.terminal_event_id("pos-a"), Some("event-terminal-a"));
+    }
+
+    #[test]
+    fn shadow_v2_terminal_stream_rejects_duplicate_event_id() {
+        let mut stream = ShadowV2CanonicalEventStream::default();
+        stream
+            .append_record(ShadowV2Record::ShadowPositionV2(position_record(
+                "pos-a",
+                "event-position",
+            )))
+            .unwrap();
+
+        let error = stream
+            .append_record(ShadowV2Record::ShadowPositionV2(position_record(
+                "pos-b",
+                "event-position",
+            )))
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ShadowV2Error::DuplicateEventId { ref event_id } if event_id == "event-position"
+        ));
+    }
+
+    #[test]
+    fn shadow_v2_terminal_exact_join_index_rejects_ambiguous_key() {
+        let mut index = ShadowV2ExactJoinIndex::default();
+        let first = test_envelope("shadow_position_v2", "pos-a", "event-a");
+        let mut second = first.clone();
+        second.event_id = "event-b".to_string();
+
+        index.insert(&first).unwrap();
+        let error = index.insert(&second).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ShadowV2Error::AmbiguousExactJoinKey {
+                ref existing_event_id,
+                ref attempted_event_id,
+                ..
+            } if existing_event_id == "event-a" && attempted_event_id == "event-b"
+        ));
+        assert!(matches!(
+            ShadowV2ExactJoinIndex::fallback_join_disallowed("pool_id/base_mint fallback"),
+            ShadowV2Error::FallbackJoinDisallowed { .. }
+        ));
+    }
+
+    #[test]
+    fn shadow_v2_terminal_jsonl_writer_emits_canonical_event_stream() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("shadow_position_event_v2.jsonl");
+        let mut writer = JsonlShadowV2CanonicalWriter::new(&path);
+
+        writer
+            .append_record(ShadowV2Record::ShadowPositionV2(position_record(
+                "pos-a",
+                "event-position",
+            )))
+            .unwrap();
+
+        let line = std::fs::read_to_string(path).unwrap();
+        let json: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(json["event_kind"], "POSITION_CREATED");
+        assert_eq!(json["envelope"]["position_id"], "pos-a");
+        assert_eq!(json["canonical_payload_schema"], "shadow_position_v2");
+        assert_eq!(writer.stream().events().len(), 1);
+    }
+
+    #[test]
+    fn shadow_v2_pool_state_from_account_state_core_carries_provenance() {
+        let sample = account_state_pool_sample("pool-event-a", 1);
+
+        assert_eq!(sample.envelope.schema, "pool_state_sample_v2");
+        assert_eq!(sample.source, PoolStateSource::AccountStateCore);
+        assert_eq!(sample.observed_slot, Some(41));
+        assert_eq!(sample.event_order_key.slot, Some(42));
+        assert_eq!(sample.staleness_ms, Some(250));
+        assert_eq!(sample.staleness_slots, Some(1));
+        assert_eq!(sample.virtual_sol_reserves, Some(30_000_000_000));
+        assert_eq!(sample.token_decimals, Some(6));
+        assert_eq!(sample.sol_lamports, Some(1_000_000_000));
+        assert_eq!(
+            sample.account_data_hash.as_deref(),
+            Some(account_data_hash_blake3(b"account-data").as_str())
+        );
+        assert!(sample.is_research_ready());
+    }
+
+    #[test]
+    fn shadow_v2_pool_state_research_sample_blocks_missing_slot_or_unknown_source() {
+        let mut sample = account_state_pool_sample("pool-event-a", 1);
+        sample.observed_slot = None;
+        sample.event_order_key.slot = None;
+        sample.source = PoolStateSource::Unknown;
+
+        let mut recorder = PoolStateProvenanceRecorder::default();
+        let error = recorder.record_research_sample(sample).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ShadowV2Error::PoolStateBlocked { blockers, .. }
+                if blockers.contains(&"POOL_STATE_SLOT_MISSING".to_string())
+                    && blockers.contains(&"EVENT_ORDER_SLOT_MISSING".to_string())
+                    && blockers.contains(&"POOL_STATE_SOURCE_UNKNOWN".to_string())
+        ));
+    }
+
+    #[test]
+    fn shadow_v2_pool_state_shadowledger_source_is_diagnostic_only() {
+        let mut sample = account_state_pool_sample("pool-event-a", 1);
+        sample.source = PoolStateSource::ShadowLedgerDiagnostic;
+        sample.source_quality = "SHADOW_LEDGER_DIAGNOSTIC_ONLY".to_string();
+
+        let mut recorder = PoolStateProvenanceRecorder::default();
+        let validation = recorder.record_sample(sample.clone()).unwrap();
+        assert!(!validation.research_ready);
+        assert!(validation
+            .blockers
+            .contains(&"SHADOW_LEDGER_DIAGNOSTIC_NOT_LIVE_TRUTH".to_string()));
+
+        let mut research_recorder = PoolStateProvenanceRecorder::default();
+        let error = research_recorder
+            .record_research_sample(sample)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ShadowV2Error::PoolStateBlocked { blockers, .. }
+                if blockers.contains(&"SHADOW_LEDGER_DIAGNOSTIC_NOT_LIVE_TRUTH".to_string())
+        ));
+    }
+
+    #[test]
+    fn shadow_v2_pool_state_recorder_enforces_monotonic_event_sequence() {
+        let mut recorder = PoolStateProvenanceRecorder::default();
+        recorder
+            .record_sample(account_state_pool_sample("pool-event-a", 2))
+            .unwrap();
+
+        let error = recorder
+            .record_sample(account_state_pool_sample("pool-event-b", 1))
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ShadowV2Error::NonMonotonicEventSequence {
+                previous_seq: 2,
+                attempted_seq: 1,
+                ..
+            }
+        ));
     }
 }
