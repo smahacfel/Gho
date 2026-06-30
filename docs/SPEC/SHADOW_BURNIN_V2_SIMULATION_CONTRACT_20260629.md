@@ -3,7 +3,7 @@
 ## Status
 
 ```text
-PR10_PR11_COMPLETED_ON_PR_BRANCH_PENDING_REVIEW
+PR12_PR13_READY_FOR_REVIEW
 ```
 
 Ten dokument definiuje kontrakt Shadow Burnin Simulation V2. Nie aktywuje runtime, nie zmienia BUY/REJECT, nie zmienia Gatekeeper policy, nie zmienia selector runtime, nie zmienia TX/Jito/live path, nie włącza `shadow_close_only` i nie włącza active close.
@@ -749,6 +749,66 @@ PR12 is not:
 - runtime approval proof.
 
 Success criteria are fidelity/reconciliation/density/manifest gates only.
+
+PR12 does not start a validation burnin. It defines the static plan, required
+artifacts, required horizons and required gates for a future fidelity-only
+burnin. Any actual run requires separate operator approval after review.
+
+Required PR12 static artifacts:
+
+- `PLANS/AUDYT/PLAN_SHADOW_V2_FIDELITY_VALIDATION_BURNIN_PR12_20260630.md`
+- `configs/rollout/shadow_v2_fidelity_validation_burnin_plan.toml`
+- `scripts/shadow_v2_validation_burnin_plan_audit.py`
+- `scripts/test_shadow_v2_validation_burnin_plan_audit.py`
+
+PR12 plan invariants:
+
+- `plan_status=PLAN_ONLY`;
+- `validation_mode=FIDELITY_ONLY`;
+- `run_start_allowed=false`;
+- `runtime_approval=false`;
+- `shadow_close_only_approval=false`;
+- `active_close_approval=false`;
+- strategy/RCE/selector/edge proof flags remain false;
+- R51 touch is not allowed;
+- raw JSONL staging is not allowed;
+- PR14 live-confirmed calibration is required before any live-equivalence grade.
+
+## PR13 Boundary
+
+PR13 is:
+
+```text
+Legacy adapter and downgrade enforcement
+```
+
+PR13 is not:
+
+- deletion of V1 evidence,
+- runtime migration,
+- strategy proof,
+- live-equivalence upgrade,
+- RCE approval,
+- selector approval,
+- active close approval.
+
+Required PR13 static artifacts:
+
+- `PLANS/AUDYT/RAPORT_SHADOW_V2_LEGACY_DOWNGRADE_ENFORCEMENT_PR13_20260630.md`
+- `reports/selector/shadow_v2_legacy_downgrade_matrix.csv`
+- `scripts/shadow_v2_legacy_downgrade_audit.py`
+- `scripts/test_shadow_v2_legacy_downgrade_audit.py`
+
+PR13 downgrade invariants:
+
+- V1 reports remain available only as downgraded evidence;
+- V1 never live-equivalent;
+- `shadow_exit_replay_v1` remains `MARK_PRICE_REPLAY_ONLY`;
+- Shadow V1 lifecycle remains `LIFECYCLE_V1_NOT_CANONICAL`;
+- R51 remains `ACTIVE_PARTIAL_DIAGNOSTIC_ONLY`;
+- previous reports must not be cited as proof of live PnL, executable fills,
+  live slippage behavior, real landing outcome, runtime approval, RCE approval,
+  selector proof, `shadow_close_only` approval or active close approval.
 
 ## PR14 Boundary
 

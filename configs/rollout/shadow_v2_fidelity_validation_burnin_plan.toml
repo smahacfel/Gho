@@ -1,0 +1,111 @@
+# Shadow V2 PR12 fidelity validation burnin plan.
+# This is a static plan artifact, not a runtime approval config and not a run command.
+
+version = 12
+
+[shadow_v2_validation_burnin_plan]
+schema = "shadow_v2_validation_burnin_plan_v1"
+plan_id = "shadow-v2-fidelity-validation-burnin-pr12"
+plan_status = "PLAN_ONLY"
+simulation_contract_version = "shadow_burnin_simulation_v2_20260629"
+validation_mode = "FIDELITY_ONLY"
+validation_profile = "shadow_v2_fidelity_validation_logging_only"
+run_namespace = "shadow-burnin-v2-fidelity-validation-logging-only"
+
+# PR12 is only a plan. A later explicit operator step must start any burnin.
+enabled = false
+run_start_allowed = false
+plan_only = true
+logging_only = true
+
+runtime_approval = false
+shadow_close_only_approval = false
+active_close_approval = false
+strategy_proof_enabled = false
+rce_proof_enabled = false
+selector_proof_enabled = false
+edge_proof_enabled = false
+r51_touch_allowed = false
+cleanup_allowed_before_manifest = false
+raw_jsonl_git_staging_allowed = false
+
+max_verdict_without_live_calibration = "SHADOW_V2_RESEARCH_GRADE_ONLY"
+required_pr14_for_live_equivalence = true
+
+pre_run_manifest_path = "reports/selector/shadow-v2-fidelity-validation/pre_run_manifest.json"
+post_run_manifest_path = "reports/selector/shadow-v2-fidelity-validation/post_run_manifest.json"
+manifest_audit_script = "scripts/shadow_v2_manifest_audit.py"
+validation_plan_audit_script = "scripts/shadow_v2_validation_burnin_plan_audit.py"
+legacy_downgrade_audit_script = "scripts/shadow_v2_legacy_downgrade_audit.py"
+required_schema_manifest_path = "reports/selector/shadow_v2_required_schema_manifest.csv"
+acceptance_gates_path = "reports/selector/shadow_v2_acceptance_gates.csv"
+artifact_contract_path = "reports/selector/shadow_v2_manifest_artifact_contract.csv"
+downgrade_matrix_path = "reports/selector/shadow_v2_legacy_downgrade_matrix.csv"
+
+required_path_modes = [
+  "shadow_path_dense_3s",
+  "shadow_path_standard_120s",
+  "shadow_path_long_500s",
+]
+
+required_horizons_ms = [
+  2000,
+  3000,
+  10000,
+  30000,
+  120000,
+  300000,
+  500000,
+]
+
+required_artifacts = [
+  "pre_run_manifest.json",
+  "post_run_manifest.json",
+  "shadow_position_event_v2.jsonl",
+  "shadow_replay_v2.jsonl",
+  "shadow_lifecycle_v2.jsonl",
+  "shadow_path_density_v2.jsonl",
+  "shadow_v2_manifest_report.csv",
+  "shadow_v2_fidelity_validation_report.md",
+  "shadow_v2_golden_traces_manifest.csv",
+]
+
+required_research_grade_gates = [
+  "GATE_ENTRY_RECON_COVERAGE",
+  "GATE_EXIT_RECON_COVERAGE",
+  "GATE_TERMINAL_RECONCILIATION",
+  "GATE_DUPLICATE_TERMINALS",
+  "GATE_AMBIGUOUS_FALLBACK",
+  "GATE_TEMPORAL_LEAKAGE",
+  "GATE_CLOCK_DOMAIN",
+  "GATE_EVENT_ORDER_KEY",
+  "GATE_DENSITY_2S_3S",
+  "GATE_DENSITY_300S_500S",
+  "GATE_FIXTURES",
+  "GATE_MANIFESTS",
+]
+
+success_criteria = [
+  "entry_reconstruction_coverage_ge_99pct",
+  "exit_reconstruction_coverage_ge_99pct",
+  "terminal_reconciliation_ge_99pct",
+  "duplicate_terminal_records_zero_or_typed_subevents",
+  "silent_ambiguous_fallback_joins_zero",
+  "critical_temporal_leakage_zero",
+  "research_timestamp_unknown_clock_domain_zero",
+  "density_report_for_every_required_horizon",
+  "unsupported_horizons_marked_not_evaluable",
+  "field_registry_complete",
+  "simulator_fixtures_pass",
+  "golden_traces_inspectable",
+  "pre_and_post_manifests_complete",
+]
+
+forbidden_proof_types = [
+  "strategy_proof",
+  "rce_proof",
+  "selector_proof",
+  "edge_proof",
+  "runtime_approval_proof",
+  "live_equivalence_proof",
+]
