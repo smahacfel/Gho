@@ -296,6 +296,17 @@ The library reconstructs:
 - own impact bps separated from fee bps;
 - post-trade deterministic reserve state.
 
+Rounding contract:
+
+- BUY output must be computed as
+  `floor(token_reserves_raw * effective_sol_in / (sol_reserves_lamports + effective_sol_in))`;
+- SELL output must be computed as
+  `floor(sol_reserves_lamports * token_in_raw / (token_reserves_raw + token_in_raw))`;
+- the implementation must not compute output as
+  `reserve_before - floor(k / post_reserve)`, because that can overstate output
+  by one raw unit;
+- off-by-one rounding fixtures are required for BUY and SELL.
+
 The formula library must reject:
 
 - zero SOL reserves;
@@ -329,6 +340,11 @@ The model may emit `FILLED` only when:
 
 - the referenced `pool_state_sample_v2` is research-ready;
 - the pool-state temporal class is allowed for the entry causal boundary;
+- `pool_state_sample_v2.event_order_key` is strictly before the entry fill
+  event boundary;
+- future pool state, equal process sequence, unknown fill slot, missing fill
+  wall-clock observation, or incomplete same-slot order emits
+  `BLOCKED_BY_DATA`;
 - reserve provenance exists for the selected pool phase;
 - token decimals and lamports normalization are explicit;
 - input SOL lamports are non-zero;

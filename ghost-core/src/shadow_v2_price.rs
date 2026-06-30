@@ -193,16 +193,22 @@ fn quote_buy_constant_product(
         return Err(ShadowV2PriceError::OutputWouldBeZero);
     }
 
-    let k = invariant(reserves)?;
     let post_sol = reserves
         .sol_reserves_lamports
         .checked_add(effective_sol_in)
         .ok_or(ShadowV2PriceError::ArithmeticOverflow)?;
-    let post_token = div_u128_to_u64(k, post_sol as u128)?;
-    let tokens_out = reserves.token_reserves_raw.saturating_sub(post_token);
+    let tokens_out = floor_constant_product_output(
+        reserves.sol_reserves_lamports,
+        reserves.token_reserves_raw,
+        effective_sol_in,
+    )?;
     if tokens_out == 0 {
         return Err(ShadowV2PriceError::OutputWouldBeZero);
     }
+    let post_token = reserves
+        .token_reserves_raw
+        .checked_sub(tokens_out)
+        .ok_or(ShadowV2PriceError::ArithmeticOverflow)?;
 
     let mark = reserves.mark_price_sol_per_token()?;
     let impact_price = normalized_sol(effective_sol_in, reserves.sol_lamports)
@@ -244,16 +250,22 @@ fn quote_sell_constant_product(
     fee_bps: u16,
     slippage_bps: u16,
 ) -> Result<ShadowV2Quote, ShadowV2PriceError> {
-    let k = invariant(reserves)?;
     let post_token = reserves
         .token_reserves_raw
         .checked_add(token_in_raw)
         .ok_or(ShadowV2PriceError::ArithmeticOverflow)?;
-    let post_sol = div_u128_to_u64(k, post_token as u128)?;
-    let gross_sol_out = reserves.sol_reserves_lamports.saturating_sub(post_sol);
+    let gross_sol_out = floor_constant_product_output(
+        reserves.token_reserves_raw,
+        reserves.sol_reserves_lamports,
+        token_in_raw,
+    )?;
     if gross_sol_out == 0 {
         return Err(ShadowV2PriceError::OutputWouldBeZero);
     }
+    let post_sol = reserves
+        .sol_reserves_lamports
+        .checked_sub(gross_sol_out)
+        .ok_or(ShadowV2PriceError::ArithmeticOverflow)?;
     let fee_lamports = fee_amount_floor(gross_sol_out, fee_bps)?;
     let net_sol_out = gross_sol_out.saturating_sub(fee_lamports);
     if net_sol_out == 0 {
@@ -303,10 +315,18 @@ fn validate_bps(fee_bps: u16, slippage_bps: u16) -> Result<(), ShadowV2PriceErro
     Ok(())
 }
 
-fn invariant(reserves: ShadowV2Reserves) -> Result<u128, ShadowV2PriceError> {
-    (reserves.sol_reserves_lamports as u128)
-        .checked_mul(reserves.token_reserves_raw as u128)
-        .ok_or(ShadowV2PriceError::ArithmeticOverflow)
+fn floor_constant_product_output(
+    input_reserve: u64,
+    output_reserve: u64,
+    input_amount: u64,
+) -> Result<u64, ShadowV2PriceError> {
+    let numerator = (output_reserve as u128)
+        .checked_mul(input_amount as u128)
+        .ok_or(ShadowV2PriceError::ArithmeticOverflow)?;
+    let denominator = (input_reserve as u128)
+        .checked_add(input_amount as u128)
+        .ok_or(ShadowV2PriceError::ArithmeticOverflow)?;
+    div_u128_to_u64(numerator, denominator)
 }
 
 fn div_u128_to_u64(numerator: u128, denominator: u128) -> Result<u64, ShadowV2PriceError> {
@@ -384,10 +404,9 @@ mod tests {
         .unwrap();
 
         let sol_after_fee = 990_000_000_u64;
-        let k = 30_000_000_000_u128 * 1_000_000_000_000_u128;
         let post_sol = 30_000_000_000_u64 + sol_after_fee;
-        let post_token = (k / post_sol as u128) as u64;
-        let tokens_out = 1_000_000_000_000_u64 - post_token;
+        let tokens_out = (1_000_000_000_000_u128 * sol_after_fee as u128 / post_sol as u128) as u64;
+        let post_token = 1_000_000_000_000_u64 - tokens_out;
 
         assert_eq!(quote.formula_version, SHADOW_V2_PRICE_FORMULA_VERSION);
         assert_eq!(quote.pool_phase, ShadowV2PoolPhase::BondingCurve);
@@ -414,10 +433,9 @@ mod tests {
         )
         .unwrap();
 
-        let k = 30_000_000_000_u128 * 1_000_000_000_000_u128;
         let post_token = 1_010_000_000_000_u64;
-        let post_sol = (k / post_token as u128) as u64;
-        let gross_sol_out = 30_000_000_000_u64 - post_sol;
+        let gross_sol_out = (30_000_000_000_u128 * 10_000_000_000_u128 / post_token as u128) as u64;
+        let post_sol = 30_000_000_000_u64 - gross_sol_out;
         let net_sol_out = gross_sol_out - gross_sol_out / 100;
 
         assert_eq!(quote.expected_output_amount, net_sol_out);
@@ -428,6 +446,56 @@ mod tests {
         assert!(quote.fill_price_sol_per_token < quote.impact_price_sol_per_token);
         assert!(quote.impact_price_sol_per_token < quote.mark_price_sol_per_token);
         assert!(quote.own_impact_bps > 0);
+    }
+
+    #[test]
+    fn shadow_v2_price_buy_rounding_does_not_overstate_output_by_one() {
+        let quote = quote_constant_product(
+            ShadowV2PoolPhase::BondingCurve,
+            ShadowV2QuoteSide::Buy,
+            reserves(),
+            1_000_000_000,
+            100,
+            250,
+        )
+        .unwrap();
+
+        let effective_sol_in = 990_000_000_u64;
+        let safe_floor_output = 1_000_000_000_000_u128 * effective_sol_in as u128
+            / (30_000_000_000_u128 + effective_sol_in as u128);
+        let legacy_post_reserve_floor = 30_000_000_000_u128 * 1_000_000_000_000_u128
+            / (30_000_000_000_u128 + effective_sol_in as u128);
+        let legacy_overstated_output = 1_000_000_000_000_u128 - legacy_post_reserve_floor;
+
+        assert_eq!(safe_floor_output, 31_945_788_964);
+        assert_eq!(legacy_overstated_output, safe_floor_output + 1);
+        assert_eq!(quote.expected_output_amount as u128, safe_floor_output);
+        assert_eq!(quote.post_token_reserves_raw, 968_054_211_036);
+    }
+
+    #[test]
+    fn shadow_v2_price_sell_rounding_does_not_overstate_output_by_one() {
+        let quote = quote_constant_product(
+            ShadowV2PoolPhase::BondingCurve,
+            ShadowV2QuoteSide::Sell,
+            reserves(),
+            10_000_000_000,
+            100,
+            100,
+        )
+        .unwrap();
+
+        let safe_gross_sol_out = 30_000_000_000_u128 * 10_000_000_000_u128
+            / (1_000_000_000_000_u128 + 10_000_000_000_u128);
+        let legacy_post_reserve_floor = 30_000_000_000_u128 * 1_000_000_000_000_u128
+            / (1_000_000_000_000_u128 + 10_000_000_000_u128);
+        let legacy_overstated_gross = 30_000_000_000_u128 - legacy_post_reserve_floor;
+
+        assert_eq!(safe_gross_sol_out, 297_029_702);
+        assert_eq!(legacy_overstated_gross, safe_gross_sol_out + 1);
+        assert_eq!(quote.fee_amount_lamports, 2_970_297);
+        assert_eq!(quote.expected_output_amount, 294_059_405);
+        assert_eq!(quote.post_sol_reserves_lamports, 29_702_970_298);
     }
 
     #[test]

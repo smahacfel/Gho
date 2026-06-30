@@ -62,6 +62,17 @@ PR4 liczy jawnie:
 - own impact bps oddzielony od fee;
 - deterministyczne post-trade reserves.
 
+Review-fix dla `review_id=4597701109` domyka rounding contract:
+
+- BUY output jest liczony jako
+  `floor(token_reserves_raw * effective_sol_in / (sol_reserves_lamports + effective_sol_in))`;
+- SELL output jest liczony jako
+  `floor(sol_reserves_lamports * token_in_raw / (token_reserves_raw + token_in_raw))`;
+- wariant `reserve_before - floor(k / post_reserve)` jest zakazany dla output,
+  bo może zawyżyć wynik o jeden raw unit;
+- fixtures sprawdzają adversarial off-by-one dla BUY i SELL niezależnie od
+  implementacji.
+
 Wprowadzono PR5 jako inercyjny static entry fill model w:
 
 ```text
@@ -87,8 +98,11 @@ PR5 dodaje:
 
 Static entry fill może zwrócić `FILLED` tylko wtedy, gdy `pool_state_sample_v2`
 jest research-ready, temporal class jest dozwolona dla entry causal boundary,
-reserve provenance istnieje, normalizacja decimals/lamports jest jawna, a quote
-rekonstrukcja przechodzi.
+`pool_state_sample_v2.event_order_key` jest ściśle przed fill boundary, reserve
+provenance istnieje, normalizacja decimals/lamports jest jawna, a quote
+rekonstrukcja przechodzi. Future pool state, równy process sequence, unknown fill
+slot, brak observed wall-clock dla fill eventu albo niepełny same-slot order
+blokują `FILLED` i dają `BLOCKED_BY_DATA`.
 
 W przeciwnym razie zwraca:
 
@@ -120,6 +134,8 @@ Testy PR4:
 - `shadow_v2_price_mark_price_normalizes_reserves_and_decimals`
 - `shadow_v2_price_buy_quote_applies_fee_impact_and_min_out`
 - `shadow_v2_price_sell_quote_applies_output_fee_and_min_out`
+- `shadow_v2_price_buy_rounding_does_not_overstate_output_by_one`
+- `shadow_v2_price_sell_rounding_does_not_overstate_output_by_one`
 - `shadow_v2_price_amm_quote_uses_real_reserve_formula_label`
 - `shadow_v2_price_rejects_invalid_inputs`
 
@@ -127,6 +143,8 @@ Testy PR5:
 
 - `shadow_v2_entry_fill_static_model_reconstructs_buy_fill_from_pool_state`
 - `shadow_v2_entry_fill_blocks_missing_reserves_hash_and_bad_temporal_class`
+- `shadow_v2_entry_fill_blocks_future_pool_state_by_process_sequence`
+- `shadow_v2_entry_fill_blocks_same_slot_incomplete_order`
 - `shadow_v2_entry_attempt_keeps_decision_mark_quote_and_min_out_separate`
 
 ## D4. Root Cause
@@ -165,6 +183,9 @@ pool_state_sample_v2 + explicit fill config -> FILLED or BLOCKED_BY_DATA
 ```
 
 `FILLED` oznacza tylko static executable-fill simulation candidate, nie live fill.
+`pool_state_sample_v2` musi być przyczynowo wcześniejszy niż entry fill event.
+Stan z przyszłości albo same-slot order bez wystarczających komponentów
+chain-order nie może zostać użyty jako exact fill evidence.
 Rekord `FILLED` zapisuje:
 
 - `fill_price`;
@@ -229,6 +250,10 @@ Wykonane komendy:
 ```text
 cargo test -q -p ghost-core shadow_v2_price
 cargo test -q -p ghost-brain shadow_v2 -- --nocapture
+cargo test -q -p ghost-launcher --lib restore_legacy_buy
+python3 -m py_compile scripts/guard_restore_shadow_lifecycle.py scripts/test_guard_restore_shadow_lifecycle.py
+python3 -m unittest scripts.test_guard_restore_shadow_lifecycle -v
+python3 scripts/guard_restore_shadow_lifecycle.py --skip-runtime --output-dir /tmp/restore_guard_static --json
 cargo fmt --check
 git diff --check
 git diff --cached --check
@@ -237,8 +262,10 @@ git diff --cached --check
 Wyniki:
 
 ```text
-ghost-core shadow_v2_price: 5 passed; 0 failed
-ghost-brain shadow_v2: 23 passed; 0 failed
+ghost-core shadow_v2_price: 7 passed; 0 failed
+ghost-brain shadow_v2: 25 passed; 0 failed
+ghost-launcher restore_legacy_buy: 2 passed; 0 failed
+guard_restore_shadow_lifecycle.py --skip-runtime: PASS
 cargo fmt --check: OK
 git diff --check: OK
 git diff --cached --check: OK

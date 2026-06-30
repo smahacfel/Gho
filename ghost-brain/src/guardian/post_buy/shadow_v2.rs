@@ -1234,7 +1234,7 @@ impl ShadowEntryFillV2 {
             pool_state_before.envelope.event_id
         ));
 
-        let blockers = entry_fill_research_blockers(pool_state_before, config);
+        let blockers = entry_fill_research_blockers(pool_state_before, &event_order_key, config);
         if !blockers.is_empty() {
             return Self::blocked_by_data(envelope, event_order_key, pool_state_before, blockers);
         }
@@ -1353,9 +1353,14 @@ impl ShadowEntryFillV2 {
 
 fn entry_fill_research_blockers(
     pool_state_before: &PoolStateSampleV2,
+    fill_event_order_key: &EventOrderKey,
     config: &ShadowEntryFillModelConfig,
 ) -> Vec<String> {
     let mut blockers = pool_state_before.research_blockers();
+    blockers.extend(entry_fill_causal_boundary_blockers(
+        &pool_state_before.event_order_key,
+        fill_event_order_key,
+    ));
     match pool_state_before.envelope.temporal_class {
         TemporalClass::PreDecision | TemporalClass::AtDecision | TemporalClass::PostEntry => {}
         TemporalClass::PreDetection
@@ -1379,6 +1384,81 @@ fn entry_fill_research_blockers(
         blockers.push("ENTRY_FILL_RESERVE_PROVENANCE_MISSING_FOR_PHASE".to_string());
     }
     blockers
+}
+
+fn entry_fill_causal_boundary_blockers(
+    pool_state_order: &EventOrderKey,
+    fill_event_order: &EventOrderKey,
+) -> Vec<String> {
+    let mut blockers = Vec::new();
+    if fill_event_order.observed_at_wall_ms == 0 {
+        push_blocker_once(
+            &mut blockers,
+            "ENTRY_FILL_EVENT_ORDER_OBSERVED_AT_WALL_MS_MISSING",
+        );
+    }
+    if fill_event_order.slot.is_unknown() {
+        push_blocker_once(&mut blockers, "ENTRY_FILL_EVENT_ORDER_SLOT_UNKNOWN");
+    }
+    if pool_state_order.event_seq_in_process > fill_event_order.event_seq_in_process {
+        push_blocker_once(
+            &mut blockers,
+            "ENTRY_FILL_POOL_STATE_AFTER_ENTRY_FILL_BOUNDARY",
+        );
+    } else if pool_state_order.event_seq_in_process == fill_event_order.event_seq_in_process {
+        push_blocker_once(
+            &mut blockers,
+            "ENTRY_FILL_POOL_STATE_NOT_STRICTLY_BEFORE_ENTRY_FILL_BOUNDARY",
+        );
+    }
+
+    match (
+        pool_state_order.slot.as_known(),
+        fill_event_order.slot.as_known(),
+    ) {
+        (Some(pool_slot), Some(fill_slot)) if pool_slot > fill_slot => {
+            push_blocker_once(
+                &mut blockers,
+                "ENTRY_FILL_POOL_STATE_AFTER_ENTRY_FILL_BOUNDARY",
+            );
+        }
+        (Some(pool_slot), Some(fill_slot)) if pool_slot == fill_slot => {
+            if pool_state_order.same_slot_ambiguous_with(fill_event_order) {
+                push_blocker_once(
+                    &mut blockers,
+                    "ENTRY_FILL_POOL_STATE_SAME_SLOT_ORDER_AMBIGUOUS",
+                );
+            } else if let (Some(pool_tuple), Some(fill_tuple)) = (
+                chain_order_tuple(pool_state_order),
+                chain_order_tuple(fill_event_order),
+            ) {
+                if pool_tuple >= fill_tuple {
+                    push_blocker_once(
+                        &mut blockers,
+                        "ENTRY_FILL_POOL_STATE_AFTER_ENTRY_FILL_BOUNDARY",
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+
+    blockers
+}
+
+fn chain_order_tuple(order: &EventOrderKey) -> Option<(u32, u32, u32, u32)> {
+    Some((
+        *order.transaction_index_or_unknown.as_known()?,
+        *order.instruction_index_or_unknown.as_known()?,
+        *order.inner_instruction_index_or_unknown.as_known()?,
+        *order.log_index_or_unknown.as_known()?,
+    ))
+}
+
+fn push_blocker_once(blockers: &mut Vec<String>, blocker: &'static str) {
+    if !blockers.iter().any(|existing| existing == blocker) {
+        blockers.push(blocker.to_string());
+    }
 }
 
 fn reserves_from_pool_state(
@@ -2224,6 +2304,65 @@ mod tests {
                 fill.limitations
             );
         }
+        assert!(fill.fill_price.is_none());
+        assert!(fill.pool_state_after.is_none());
+    }
+
+    #[test]
+    fn shadow_v2_entry_fill_blocks_future_pool_state_by_process_sequence() {
+        let pool_state = account_state_pool_sample("pool-event-future", 3);
+        let mut fill_order = event_order_key(Some(43), Some(2));
+        fill_order.event_seq_in_process = 2;
+        let config = ShadowEntryFillModelConfig::bonding_curve(
+            1_000_000_000,
+            100,
+            100,
+            SHADOW_V2_ENTRY_FILL_MODEL_VERSION,
+        );
+
+        let fill = ShadowEntryFillV2::from_static_buy_model(
+            test_envelope("shadow_entry_fill_v2", "pos-a", "entry-fill-future"),
+            fill_order,
+            &pool_state,
+            &config,
+        );
+
+        assert_eq!(fill.fill_status, FillStatus::BlockedByData);
+        assert!(fill
+            .limitations
+            .contains(&"ENTRY_FILL_POOL_STATE_AFTER_ENTRY_FILL_BOUNDARY".to_string()));
+        assert!(fill.fill_price.is_none());
+        assert!(fill.pool_state_after.is_none());
+    }
+
+    #[test]
+    fn shadow_v2_entry_fill_blocks_same_slot_incomplete_order() {
+        let mut pool_state = account_state_pool_sample("pool-event-same-slot-ambiguous", 1);
+        pool_state.event_order_key.transaction_index_or_unknown = EventOrderComponent::unknown();
+        let mut fill_order = event_order_key(Some(42), Some(2));
+        fill_order.event_seq_in_process = 2;
+        let config = ShadowEntryFillModelConfig::bonding_curve(
+            1_000_000_000,
+            100,
+            100,
+            SHADOW_V2_ENTRY_FILL_MODEL_VERSION,
+        );
+
+        let fill = ShadowEntryFillV2::from_static_buy_model(
+            test_envelope(
+                "shadow_entry_fill_v2",
+                "pos-a",
+                "entry-fill-same-slot-ambiguous",
+            ),
+            fill_order,
+            &pool_state,
+            &config,
+        );
+
+        assert_eq!(fill.fill_status, FillStatus::BlockedByData);
+        assert!(fill
+            .limitations
+            .contains(&"ENTRY_FILL_POOL_STATE_SAME_SLOT_ORDER_AMBIGUOUS".to_string()));
         assert!(fill.fill_price.is_none());
         assert!(fill.pool_state_after.is_none());
     }
