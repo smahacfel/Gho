@@ -1,0 +1,35 @@
+# Shadow V2 PR11 logging-only validation contract.
+# This is not runtime approval, RCE proof, selector proof, edge proof, or strategy proof.
+
+version = 11
+
+[shadow_v2_burnin]
+enabled = true
+mode = "logging_only_validation"
+simulation_contract_version = "shadow_burnin_simulation_v2_20260629"
+validation_profile = "shadow_v2_fidelity_validation_logging_only"
+run_namespace = "shadow-burnin-v2-fidelity-validation-logging-only"
+pre_run_manifest_path = "reports/selector/shadow-v2-fidelity-validation/pre_run_manifest.json"
+post_run_manifest_path = "reports/selector/shadow-v2-fidelity-validation/post_run_manifest.json"
+manifest_audit_script = "scripts/shadow_v2_manifest_audit.py"
+required_schema_manifest_path = "reports/selector/shadow_v2_required_schema_manifest.csv"
+acceptance_gates_path = "reports/selector/shadow_v2_acceptance_gates.csv"
+canonical_event_stream_path = "logs/shadow_v2/shadow-burnin-v2-fidelity-validation-logging-only/shadow_position_event_v2.jsonl"
+replay_v2_path = "logs/shadow_v2/shadow-burnin-v2-fidelity-validation-logging-only/shadow_replay_v2.jsonl"
+lifecycle_v2_path = "logs/shadow_v2/shadow-burnin-v2-fidelity-validation-logging-only/shadow_lifecycle_v2.jsonl"
+evidence_manifest_required = true
+sha256_required = true
+row_counts_required = true
+schema_coverage_required = true
+no_raw_jsonl_git_staging = true
+logging_only = true
+runtime_approval = false
+shadow_close_only_approval = false
+active_close_approval = false
+strategy_proof_enabled = false
+rce_proof_enabled = false
+selector_proof_enabled = false
+edge_proof_enabled = false
+r51_diagnostic_only = true
+max_verdict_without_live_calibration = "SHADOW_V2_RESEARCH_GRADE_ONLY"
+raw_evidence_retention_policy = "manifest_before_cleanup_required"
