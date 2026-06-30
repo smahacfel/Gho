@@ -5,7 +5,7 @@ Data: 2026-06-30
 Status:
 
 ```text
-PR6_PR7_IMPLEMENTED_LOCAL_PENDING_REVIEW
+PR6_PR7_COMPLETED_ON_PR_BRANCH_PENDING_REVIEW
 ```
 
 ## D1. Problem
@@ -17,6 +17,8 @@ Plan `PLAN_SHADOW_BURNIN_V2_REMEDIATION_20260629.md` wymaga rozdzielenia mark/pa
 - causal-boundary guard dla `pool_state_before`,
 - jawnego rozdzielenia mark exit od executable sell fill,
 - density/horizon contract dla 2s/3s, 120s oraz 300s/500s.
+- deterministycznego mark/path replay dla target/stop/timeout, który nie miesza
+  sampled-path hit, exact-level hit i executable sell fill.
 
 Bez tego target/stop/timeout mógłby zostać błędnie odczytany jako live sell fill albo jako wystarczające pokrycie długiego horyzontu.
 
@@ -37,12 +39,22 @@ PR6:
 - blokuje future/equal-boundary pool state oraz incomplete same-slot order,
 - emituje typed `NO_FILL` / `FAILED` bez ceny fill,
 - nie aktywuje active close ani `shadow_close_only`.
+- dodaje `replay_exit_from_path_v2`, który separuje `exact_level_hit`,
+  `sampled_path_hit`, `timeout_path_point`, `selected_exit`, MFE/MAE i terminal
+  mark PnL;
+- blokuje target/stop same-slot ambiguity bez jawnej polityki tie-break;
+- pozwala jawnie wskazać tie-break policy, ale wynik pozostaje mark/path
+  evidence, nie executable sell fill.
 
 PR7:
 
 - wprowadza `ShadowPathSamplingModeV2`,
 - definiuje tryby `shadow_path_dense_3s`, `shadow_path_standard_120s`, `shadow_path_long_500s`,
 - wprowadza `ShadowPathSamplingReasonV2`,
+- dodaje `select_path_samples_v2`,
+- wymusza, że dense 3s zachowuje każdy `EVENT_SAMPLE`,
+- oznacza tryby wymagające storage budget przed validation burnin,
+- raportuje duplicate-age i non-monotonic input metadata w density evaluator,
 - dodaje horizon verdicts `EVALUABLE_EXACT`, `EVALUABLE_APPROX`, `SPARSE_APPROX_ONLY`, `NOT_EVALUABLE_NO_COVERAGE`, `NOT_EVALUABLE_HORIZON_EXCEEDS_REPLAY`,
 - pozwala oddzielić mark PnL od static executable quote PnL.
 
@@ -63,10 +75,15 @@ Fixture evidence w Rust:
 - `shadow_v2_exit_fill_blocks_future_pool_state_and_same_slot_ambiguity`
 - `shadow_v2_exit_fill_can_emit_explicit_no_fill_or_failure_without_price_claim`
 - `shadow_v2_exit_attempt_requires_tie_break_for_same_slot_ambiguity`
+- `shadow_v2_exit_path_replay_separates_sampled_and_exact_level_hits`
+- `shadow_v2_exit_path_replay_blocks_or_tie_breaks_ambiguous_target_stop`
+- `shadow_v2_exit_path_replay_timeout_requires_path_coverage`
 - `shadow_v2_path_sample_reconstructs_mark_pnl_and_attaches_static_exit_quote`
 - `shadow_v2_path_density_supports_dense_2s_3s_and_blocks_unsupported_long_horizons`
 - `shadow_v2_path_density_marks_sparse_and_no_coverage_explicitly`
+- `shadow_v2_path_density_reports_duplicate_and_non_monotonic_input`
 - `shadow_v2_path_sampler_modes_define_sampling_policy`
+- `shadow_v2_path_sampler_dense_keeps_all_event_samples_and_marks_truncation`
 
 ## D4. Root Cause
 
@@ -80,9 +97,13 @@ W PR6/PR7:
 - fill może być `FILLED` tylko przy causal-safe `pool_state_before`,
 - brak danych lub niejednoznaczność same-slot blokuje exact fill reconstruction,
 - modeled `NO_FILL` i `FAILED` nie dostają `fill_price`,
+- path replay zapisuje exact-level i sampled-path evidence niezależnie,
+- timeout wskazuje realny punkt ścieżki albo jawny stale/blocked label,
 - mark path sample pozostaje `MARK_PRICE_REPLAY`,
 - static executable quote zmienia sample na `FILL_MODEL_STATIC`, ale nadal nie jest live fill,
 - każdy horizon dostaje jawny verdict i limitations,
+- dense 3s utrzymuje wszystkie event samples,
+- duplicate/non-monotonic path input jest raportowany jako limitation,
 - unsupported horizon nie jest inferowany.
 
 ## D6. Rejected Alternatives
@@ -94,6 +115,8 @@ Odrzucono:
 - akceptowanie future pool state względem exit fill boundary,
 - silent same-slot target/stop resolution,
 - traktowanie sparse path jako exact 2s/3s proof,
+- ignorowanie późniejszego exact-level hit po wcześniejszym sampled hit,
+- ukrywanie duplicate/non-monotonic path input,
 - inferowanie 300s/500s bez long-mode coverage,
 - podpinanie PR6 do active close.
 
@@ -125,19 +148,28 @@ SHADOW_V2_LIVE_EQUIVALENCE_GRADE=false
 Lokalne testy przed finalnym commitem:
 
 ```text
-cargo test -q -p ghost-brain shadow_v2_exit -- --nocapture
-result: ok; 4 passed; 0 failed
+cargo test -q -p ghost-brain shadow_v2_exit
+result: ok; 7 passed; 0 failed
 
-cargo test -q -p ghost-brain shadow_v2_path -- --nocapture
-result: ok; 4 passed; 0 failed
+cargo test -q -p ghost-brain shadow_v2_path
+result: ok; 6 passed; 0 failed
+
+cargo test -q -p ghost-brain shadow_v2
+result: ok; 38 passed; 0 failed
+
+cargo test -q -p ghost-core shadow_v2_price
+result: ok; 7 passed; 0 failed
+
+cargo fmt
+result: ok
+
+cargo fmt --check
+result: ok
 ```
 
-Do finalnej walidacji PR branch wymagane są jeszcze:
+Finalne guardy przed staging/commitem:
 
 ```text
-cargo fmt --check
-cargo test -q -p ghost-brain shadow_v2 -- --nocapture
-cargo test -q -p ghost-core shadow_v2_price
 git diff --check
 git diff --cached --name-only
 forbidden staged-file guard

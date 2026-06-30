@@ -1,7 +1,9 @@
 //! Shadow Burnin Simulation V2 contract types.
 //!
-//! These types are intentionally inert. PR1 defines the schema and validation
-//! vocabulary only; no runtime writer, lifecycle path, replay path, BUY/REJECT
+//! These types are intentionally inert. The Shadow V2 PR1-PR7 foundation defines
+//! schema, validation vocabulary, canonical event guards, pool-state provenance,
+//! deterministic price/fill formulas, exit fill simulation, and path sampling
+//! helpers only. No runtime writer, lifecycle path, replay path, BUY/REJECT
 //! policy, selector, TX/Jito path, shadow_close_only path, or active close path
 //! consumes these records yet.
 
@@ -130,6 +132,17 @@ impl ShadowPathSamplingReasonV2 {
         }
     }
 
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "EVENT_SAMPLE" => Some(Self::EventSample),
+            "HEARTBEAT" => Some(Self::Heartbeat),
+            "LEVEL_HIT" => Some(Self::LevelHit),
+            "LARGE_PRICE_DELTA" => Some(Self::LargePriceDelta),
+            "TERMINAL" => Some(Self::Terminal),
+            _ => None,
+        }
+    }
+
     pub const fn is_must_keep(self) -> bool {
         matches!(self, Self::LevelHit | Self::Terminal)
     }
@@ -143,6 +156,46 @@ pub enum ShadowPathHorizonVerdictV2 {
     SparseApproxOnly,
     NotEvaluableNoCoverage,
     NotEvaluableHorizonExceedsReplay,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ShadowExitTieBreakPolicyV2 {
+    BlockAmbiguous,
+    TargetFirst,
+    StopFirst,
+    EarliestEventOrder,
+}
+
+impl ShadowExitTieBreakPolicyV2 {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::BlockAmbiguous => "BLOCK_AMBIGUOUS",
+            Self::TargetFirst => "TARGET_FIRST",
+            Self::StopFirst => "STOP_FIRST",
+            Self::EarliestEventOrder => "EARLIEST_EVENT_ORDER",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ShadowExitHitSourceV2 {
+    ExactLevel,
+    SampledPath,
+    TimeoutPathPoint,
+    BlockedByData,
+}
+
+impl ShadowExitHitSourceV2 {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ExactLevel => "EXACT_LEVEL",
+            Self::SampledPath => "SAMPLED_PATH",
+            Self::TimeoutPathPoint => "TIMEOUT_PATH_POINT",
+            Self::BlockedByData => "BLOCKED_BY_DATA",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1779,6 +1832,419 @@ impl ShadowExitAttemptV2 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShadowExitPathReplayConfigV2 {
+    pub target_bps: Option<i32>,
+    pub stop_bps: Option<i32>,
+    pub max_hold_ms: u64,
+    pub tie_break_policy: ShadowExitTieBreakPolicyV2,
+}
+
+impl ShadowExitPathReplayConfigV2 {
+    pub const fn new(
+        target_bps: Option<i32>,
+        stop_bps: Option<i32>,
+        max_hold_ms: u64,
+        tie_break_policy: ShadowExitTieBreakPolicyV2,
+    ) -> Self {
+        Self {
+            target_bps,
+            stop_bps,
+            max_hold_ms,
+            tie_break_policy,
+        }
+    }
+
+    pub fn research_blockers(&self) -> Vec<String> {
+        let mut blockers = Vec::new();
+        if self.max_hold_ms == 0 {
+            blockers.push("EXIT_PATH_REPLAY_MAX_HOLD_MS_ZERO".to_string());
+        }
+        if self.target_bps.is_none() && self.stop_bps.is_none() && self.max_hold_ms == 0 {
+            blockers.push("EXIT_PATH_REPLAY_NO_TARGET_STOP_OR_TIMEOUT_CONFIG".to_string());
+        }
+        if self.target_bps.is_some_and(|target| target <= 0) {
+            blockers.push("EXIT_PATH_REPLAY_TARGET_BPS_NOT_POSITIVE".to_string());
+        }
+        if self.stop_bps.is_some_and(|stop| stop >= 0) {
+            blockers.push("EXIT_PATH_REPLAY_STOP_BPS_NOT_NEGATIVE".to_string());
+        }
+        blockers
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShadowExitPathHitV2 {
+    pub terminal_reason: TerminalReasonV2,
+    pub hit_source: ShadowExitHitSourceV2,
+    pub age_ms: Option<u64>,
+    pub event_order_key: Option<EventOrderKey>,
+    pub path_sample_ref: Option<String>,
+    pub pnl_mark_bps: Option<i32>,
+    pub same_slot_ambiguity: bool,
+    pub limitations: Vec<String>,
+}
+
+impl ShadowExitPathHitV2 {
+    fn from_sample(
+        terminal_reason: TerminalReasonV2,
+        hit_source: ShadowExitHitSourceV2,
+        sample: &ShadowPathSampleV2,
+        limitations: Vec<String>,
+    ) -> Self {
+        Self {
+            terminal_reason,
+            hit_source,
+            age_ms: Some(sample.age_ms),
+            event_order_key: Some(sample.event_order_key.clone()),
+            path_sample_ref: Some(sample.envelope.event_id.clone()),
+            pnl_mark_bps: sample.pnl_mark_bps,
+            same_slot_ambiguity: false,
+            limitations,
+        }
+    }
+
+    fn blocked(limitations: Vec<String>) -> Self {
+        Self {
+            terminal_reason: TerminalReasonV2::BlockedByData,
+            hit_source: ShadowExitHitSourceV2::BlockedByData,
+            age_ms: None,
+            event_order_key: None,
+            path_sample_ref: None,
+            pnl_mark_bps: None,
+            same_slot_ambiguity: true,
+            limitations,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShadowExitPathReplayResultV2 {
+    pub exact_level_hit: Option<ShadowExitPathHitV2>,
+    pub sampled_path_hit: Option<ShadowExitPathHitV2>,
+    pub timeout_path_point: Option<ShadowExitPathHitV2>,
+    pub selected_exit: ShadowExitPathHitV2,
+    pub mfe_mark_bps: Option<i32>,
+    pub mae_mark_bps: Option<i32>,
+    pub terminal_pnl_mark_bps: Option<i32>,
+    pub quality: String,
+    pub limitations: Vec<String>,
+}
+
+pub fn replay_exit_from_path_v2(
+    samples: &[ShadowPathSampleV2],
+    config: &ShadowExitPathReplayConfigV2,
+) -> ShadowExitPathReplayResultV2 {
+    let mut limitations = config.research_blockers();
+    let has_config_blockers = !limitations.is_empty();
+    let input_stats = path_density_input_stats(samples);
+    if input_stats.non_monotonic_input {
+        limitations.push("EXIT_PATH_REPLAY_INPUT_NON_MONOTONIC".to_string());
+    }
+    if input_stats.duplicate_age_count > 0 {
+        limitations.push(format!(
+            "EXIT_PATH_REPLAY_DUPLICATE_AGE_COUNT={}",
+            input_stats.duplicate_age_count
+        ));
+    }
+    if has_config_blockers {
+        let selected_exit = ShadowExitPathHitV2::blocked(limitations.clone());
+        return ShadowExitPathReplayResultV2 {
+            exact_level_hit: None,
+            sampled_path_hit: None,
+            timeout_path_point: None,
+            selected_exit,
+            mfe_mark_bps: None,
+            mae_mark_bps: None,
+            terminal_pnl_mark_bps: None,
+            quality: "BLOCKED_BY_DATA".to_string(),
+            limitations,
+        };
+    }
+
+    let mut ordered = samples.iter().collect::<Vec<_>>();
+    ordered.sort_by(|lhs, rhs| compare_samples_for_replay(lhs, rhs));
+
+    if ordered.is_empty() {
+        limitations.push("EXIT_PATH_REPLAY_NO_PATH_POINTS".to_string());
+        let selected_exit =
+            ShadowExitPathHitV2::blocked(vec!["EXIT_PATH_REPLAY_NO_PATH_POINTS".to_string()]);
+        return ShadowExitPathReplayResultV2 {
+            exact_level_hit: None,
+            sampled_path_hit: None,
+            timeout_path_point: None,
+            selected_exit,
+            mfe_mark_bps: None,
+            mae_mark_bps: None,
+            terminal_pnl_mark_bps: None,
+            quality: "BLOCKED_BY_DATA".to_string(),
+            limitations,
+        };
+    }
+
+    let replay_horizon_ms = ordered.last().map(|sample| sample.age_ms);
+    let mut first_target: Option<ShadowExitPathHitV2> = None;
+    let mut first_stop: Option<ShadowExitPathHitV2> = None;
+    let mut exact_level_hit: Option<ShadowExitPathHitV2> = None;
+    let mut sampled_path_hit: Option<ShadowExitPathHitV2> = None;
+
+    for sample in ordered
+        .iter()
+        .copied()
+        .filter(|sample| sample.age_ms <= config.max_hold_ms)
+    {
+        let Some(pnl_bps) = sample.pnl_mark_bps else {
+            limitations.push(format!(
+                "EXIT_PATH_SAMPLE_PNL_MARK_MISSING={}",
+                sample.envelope.event_id
+            ));
+            continue;
+        };
+        if config
+            .target_bps
+            .is_some_and(|target_bps| pnl_bps >= target_bps)
+        {
+            let hit = path_hit_from_sample(TerminalReasonV2::Target, sample);
+            record_hit_source(&hit, &mut exact_level_hit, &mut sampled_path_hit);
+            if first_target.is_none() {
+                first_target = Some(hit);
+            }
+        }
+        if config.stop_bps.is_some_and(|stop_bps| pnl_bps <= stop_bps) {
+            let hit = path_hit_from_sample(TerminalReasonV2::Stop, sample);
+            record_hit_source(&hit, &mut exact_level_hit, &mut sampled_path_hit);
+            if first_stop.is_none() {
+                first_stop = Some(hit);
+            }
+        }
+    }
+
+    let selected_exit = choose_target_stop_hit(
+        first_target.as_ref(),
+        first_stop.as_ref(),
+        config.tie_break_policy,
+        &mut limitations,
+    )
+    .unwrap_or_else(|| {
+        timeout_hit_from_path(
+            &ordered,
+            config.max_hold_ms,
+            replay_horizon_ms,
+            &mut limitations,
+        )
+    });
+
+    let terminal_age_ms = selected_exit.age_ms.unwrap_or(config.max_hold_ms);
+    let path_until_terminal = ordered
+        .iter()
+        .copied()
+        .filter(|sample| sample.age_ms <= terminal_age_ms)
+        .collect::<Vec<_>>();
+    let mfe_mark_bps = path_until_terminal
+        .iter()
+        .filter_map(|sample| sample.pnl_mark_bps)
+        .max();
+    let mae_mark_bps = path_until_terminal
+        .iter()
+        .filter_map(|sample| sample.pnl_mark_bps)
+        .min();
+    let terminal_pnl_mark_bps = selected_exit.pnl_mark_bps;
+    let timeout_path_point = if selected_exit.terminal_reason == TerminalReasonV2::Timeout {
+        Some(selected_exit.clone())
+    } else {
+        timeout_candidate_from_path(&ordered, config.max_hold_ms, &mut Vec::new())
+    };
+    let quality = if selected_exit.terminal_reason == TerminalReasonV2::BlockedByData {
+        "BLOCKED_BY_DATA"
+    } else if selected_exit.hit_source == ShadowExitHitSourceV2::ExactLevel {
+        "EXIT_PATH_REPLAY_EXACT_LEVEL"
+    } else if selected_exit
+        .limitations
+        .iter()
+        .any(|item| item.contains("USES_LAST_KNOWN_PATH_POINT"))
+    {
+        "EXIT_PATH_REPLAY_APPROX_TIMEOUT"
+    } else {
+        "EXIT_PATH_REPLAY_SAMPLED_PATH"
+    }
+    .to_string();
+
+    ShadowExitPathReplayResultV2 {
+        exact_level_hit,
+        sampled_path_hit,
+        timeout_path_point,
+        selected_exit,
+        mfe_mark_bps,
+        mae_mark_bps,
+        terminal_pnl_mark_bps,
+        quality,
+        limitations,
+    }
+}
+
+fn path_hit_from_sample(
+    terminal_reason: TerminalReasonV2,
+    sample: &ShadowPathSampleV2,
+) -> ShadowExitPathHitV2 {
+    let hit_source = if sample.sampling_reason == ShadowPathSamplingReasonV2::LevelHit.label()
+        && sample.exact_or_approx == "EXACT_EVENT_ORDER"
+    {
+        ShadowExitHitSourceV2::ExactLevel
+    } else {
+        ShadowExitHitSourceV2::SampledPath
+    };
+    let mut limitations = vec![format!("EXIT_HIT_SOURCE={}", hit_source.label())];
+    if hit_source == ShadowExitHitSourceV2::SampledPath {
+        limitations.push("TARGET_STOP_HIT_IS_SAMPLED_PATH_APPROXIMATION".to_string());
+    }
+    ShadowExitPathHitV2::from_sample(terminal_reason, hit_source, sample, limitations)
+}
+
+fn record_hit_source(
+    hit: &ShadowExitPathHitV2,
+    exact_level_hit: &mut Option<ShadowExitPathHitV2>,
+    sampled_path_hit: &mut Option<ShadowExitPathHitV2>,
+) {
+    match hit.hit_source {
+        ShadowExitHitSourceV2::ExactLevel if exact_level_hit.is_none() => {
+            *exact_level_hit = Some(hit.clone());
+        }
+        ShadowExitHitSourceV2::SampledPath if sampled_path_hit.is_none() => {
+            *sampled_path_hit = Some(hit.clone());
+        }
+        _ => {}
+    }
+}
+
+fn choose_target_stop_hit(
+    target_hit: Option<&ShadowExitPathHitV2>,
+    stop_hit: Option<&ShadowExitPathHitV2>,
+    tie_break_policy: ShadowExitTieBreakPolicyV2,
+    limitations: &mut Vec<String>,
+) -> Option<ShadowExitPathHitV2> {
+    match (target_hit, stop_hit) {
+        (Some(target), None) => Some(target.clone()),
+        (None, Some(stop)) => Some(stop.clone()),
+        (Some(target), Some(stop)) => match compare_exit_hits(target, stop) {
+            Some(std::cmp::Ordering::Less) => Some(target.clone()),
+            Some(std::cmp::Ordering::Greater) => Some(stop.clone()),
+            Some(std::cmp::Ordering::Equal) | None => {
+                limitations.push("EXIT_PATH_TARGET_STOP_ORDER_AMBIGUOUS".to_string());
+                match tie_break_policy {
+                    ShadowExitTieBreakPolicyV2::BlockAmbiguous
+                    | ShadowExitTieBreakPolicyV2::EarliestEventOrder => {
+                        let mut blocked = ShadowExitPathHitV2::blocked(vec![format!(
+                            "EXIT_PATH_TARGET_STOP_AMBIGUOUS_TIE_BREAK={}",
+                            tie_break_policy.label()
+                        )]);
+                        blocked.same_slot_ambiguity = true;
+                        Some(blocked)
+                    }
+                    ShadowExitTieBreakPolicyV2::TargetFirst => {
+                        let mut hit = target.clone();
+                        hit.same_slot_ambiguity = true;
+                        hit.limitations.push(
+                            "EXIT_PATH_TARGET_STOP_AMBIGUITY_RESOLVED_TARGET_FIRST".to_string(),
+                        );
+                        Some(hit)
+                    }
+                    ShadowExitTieBreakPolicyV2::StopFirst => {
+                        let mut hit = stop.clone();
+                        hit.same_slot_ambiguity = true;
+                        hit.limitations.push(
+                            "EXIT_PATH_TARGET_STOP_AMBIGUITY_RESOLVED_STOP_FIRST".to_string(),
+                        );
+                        Some(hit)
+                    }
+                }
+            }
+        },
+        (None, None) => None,
+    }
+}
+
+fn compare_exit_hits(
+    lhs: &ShadowExitPathHitV2,
+    rhs: &ShadowExitPathHitV2,
+) -> Option<std::cmp::Ordering> {
+    match (lhs.age_ms, rhs.age_ms) {
+        (Some(lhs_age), Some(rhs_age)) if lhs_age != rhs_age => Some(lhs_age.cmp(&rhs_age)),
+        (Some(_), Some(_)) => {
+            compare_event_order_keys(lhs.event_order_key.as_ref()?, rhs.event_order_key.as_ref()?)
+        }
+        _ => None,
+    }
+}
+
+fn compare_event_order_keys(
+    lhs: &EventOrderKey,
+    rhs: &EventOrderKey,
+) -> Option<std::cmp::Ordering> {
+    match (lhs.slot.as_known(), rhs.slot.as_known()) {
+        (Some(lhs_slot), Some(rhs_slot)) if lhs_slot != rhs_slot => Some(lhs_slot.cmp(rhs_slot)),
+        (Some(_), Some(_)) => {
+            if lhs.same_slot_ambiguous_with(rhs) {
+                return None;
+            }
+            Some(chain_order_tuple(lhs)?.cmp(&chain_order_tuple(rhs)?))
+        }
+        _ => None,
+    }
+}
+
+fn timeout_hit_from_path(
+    ordered_samples: &[&ShadowPathSampleV2],
+    max_hold_ms: u64,
+    replay_horizon_ms: Option<u64>,
+    limitations: &mut Vec<String>,
+) -> ShadowExitPathHitV2 {
+    if replay_horizon_ms.is_none_or(|horizon| horizon < max_hold_ms) {
+        limitations.push("TIMEOUT_MAX_HOLD_EXCEEDS_REPLAY_HORIZON".to_string());
+        return ShadowExitPathHitV2::blocked(vec![
+            "TIMEOUT_PNL_BLOCKED_BY_INSUFFICIENT_REPLAY_HORIZON".to_string(),
+        ]);
+    }
+    timeout_candidate_from_path(ordered_samples, max_hold_ms, limitations).unwrap_or_else(|| {
+        ShadowExitPathHitV2::blocked(vec![
+            "TIMEOUT_PNL_NO_PATH_POINT_AT_OR_BEFORE_MAX_HOLD".to_string()
+        ])
+    })
+}
+
+fn timeout_candidate_from_path(
+    ordered_samples: &[&ShadowPathSampleV2],
+    max_hold_ms: u64,
+    limitations: &mut Vec<String>,
+) -> Option<ShadowExitPathHitV2> {
+    let sample = ordered_samples
+        .iter()
+        .copied()
+        .filter(|sample| sample.age_ms <= max_hold_ms)
+        .max_by(|lhs, rhs| compare_samples_for_replay(lhs, rhs))?;
+    let mut hit_limitations = vec!["TIMEOUT_PNL_USES_REAL_PATH_POINT".to_string()];
+    if sample.age_ms < max_hold_ms {
+        hit_limitations.push("TIMEOUT_PNL_USES_LAST_KNOWN_PATH_POINT_BEFORE_MAX_HOLD".to_string());
+        limitations.push("TIMEOUT_PNL_STALE_BEFORE_MAX_HOLD".to_string());
+    }
+    Some(ShadowExitPathHitV2::from_sample(
+        TerminalReasonV2::Timeout,
+        ShadowExitHitSourceV2::TimeoutPathPoint,
+        sample,
+        hit_limitations,
+    ))
+}
+
+fn compare_samples_for_replay(
+    lhs: &ShadowPathSampleV2,
+    rhs: &ShadowPathSampleV2,
+) -> std::cmp::Ordering {
+    lhs.age_ms.cmp(&rhs.age_ms).then_with(|| {
+        lhs.event_order_key
+            .event_seq_in_process
+            .cmp(&rhs.event_order_key.event_seq_in_process)
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShadowExitFillModelConfig {
     pub pool_phase: ShadowV2PoolPhase,
     pub input_token_raw: u64,
@@ -2132,6 +2598,8 @@ pub struct ShadowPathSamplerConfigV2 {
     pub approx_interval_ms: u64,
     pub large_price_delta_bps: i32,
     pub max_path_points: usize,
+    pub keep_every_event_sample: bool,
+    pub requires_storage_budget: bool,
 }
 
 impl ShadowPathSamplerConfigV2 {
@@ -2152,6 +2620,8 @@ impl ShadowPathSamplerConfigV2 {
             approx_interval_ms: 1_500,
             large_price_delta_bps: 50,
             max_path_points: 512,
+            keep_every_event_sample: true,
+            requires_storage_budget: true,
         }
     }
 
@@ -2164,6 +2634,8 @@ impl ShadowPathSamplerConfigV2 {
             approx_interval_ms: 5_000,
             large_price_delta_bps: 100,
             max_path_points: 4_096,
+            keep_every_event_sample: false,
+            requires_storage_budget: false,
         }
     }
 
@@ -2176,6 +2648,8 @@ impl ShadowPathSamplerConfigV2 {
             approx_interval_ms: 30_000,
             large_price_delta_bps: 250,
             max_path_points: 8_192,
+            keep_every_event_sample: false,
+            requires_storage_budget: true,
         }
     }
 
@@ -2188,6 +2662,9 @@ impl ShadowPathSamplerConfigV2 {
         previous_kept_pnl_bps: Option<i32>,
     ) -> bool {
         if reason.is_must_keep() || previous_kept_age_ms.is_none() {
+            return true;
+        }
+        if self.keep_every_event_sample && reason == ShadowPathSamplingReasonV2::EventSample {
             return true;
         }
         let age_delta = age_ms.saturating_sub(previous_kept_age_ms.unwrap_or_default());
@@ -2213,6 +2690,8 @@ pub struct ShadowPathHorizonEvaluationV2 {
     pub median_interval_ms: Option<u64>,
     pub p90_interval_ms: Option<u64>,
     pub max_interval_ms: Option<u64>,
+    pub duplicate_age_count: usize,
+    pub non_monotonic_input: bool,
     pub limitations: Vec<String>,
 }
 
@@ -2221,6 +2700,7 @@ pub fn evaluate_path_density_v2(
     config: &ShadowPathSamplerConfigV2,
     horizons_ms: &[u64],
 ) -> Vec<ShadowPathHorizonEvaluationV2> {
+    let input_stats = path_density_input_stats(samples);
     let mut ages: Vec<u64> = samples.iter().map(|sample| sample.age_ms).collect();
     ages.sort_unstable();
     ages.dedup();
@@ -2228,9 +2708,84 @@ pub fn evaluate_path_density_v2(
     horizons_ms
         .iter()
         .map(|horizon_ms| {
-            evaluate_single_horizon_density(&ages, replay_horizon_ms, config, *horizon_ms)
+            evaluate_single_horizon_density(
+                &ages,
+                replay_horizon_ms,
+                config,
+                *horizon_ms,
+                input_stats,
+            )
         })
         .collect()
+}
+
+pub fn select_path_samples_v2(
+    samples: &[ShadowPathSampleV2],
+    config: &ShadowPathSamplerConfigV2,
+) -> Vec<ShadowPathSampleV2> {
+    let mut ordered = samples.to_vec();
+    ordered.sort_by(compare_samples_for_replay);
+
+    let mut kept = Vec::new();
+    let mut dropped_for_horizon = false;
+    for sample in ordered {
+        if sample.age_ms > config.max_horizon_ms {
+            dropped_for_horizon = true;
+            continue;
+        }
+        let reason = ShadowPathSamplingReasonV2::from_label(&sample.sampling_reason)
+            .unwrap_or(ShadowPathSamplingReasonV2::EventSample);
+        let previous_kept_age_ms = kept.last().map(|sample: &ShadowPathSampleV2| sample.age_ms);
+        let previous_kept_pnl_bps = kept
+            .last()
+            .and_then(|sample: &ShadowPathSampleV2| sample.pnl_mark_bps);
+        if config.should_keep_sample(
+            sample.age_ms,
+            sample.pnl_mark_bps.unwrap_or_default(),
+            reason,
+            previous_kept_age_ms,
+            previous_kept_pnl_bps,
+        ) {
+            kept.push(sample);
+        }
+    }
+
+    let max_points_truncated = kept.len() > config.max_path_points;
+    if max_points_truncated {
+        kept.truncate(config.max_path_points);
+    }
+    if (dropped_for_horizon || max_points_truncated) && !kept.is_empty() {
+        if let Some(last) = kept.last_mut() {
+            last.truncated = true;
+            last.envelope
+                .limitations
+                .push("PATH_SAMPLER_TRUNCATED_BY_HORIZON_OR_MAX_POINTS".to_string());
+        }
+    }
+    kept
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PathDensityInputStats {
+    duplicate_age_count: usize,
+    non_monotonic_input: bool,
+}
+
+fn path_density_input_stats(samples: &[ShadowPathSampleV2]) -> PathDensityInputStats {
+    let non_monotonic_input = samples
+        .windows(2)
+        .any(|pair| pair[1].age_ms < pair[0].age_ms);
+    let mut ages = samples
+        .iter()
+        .map(|sample| sample.age_ms)
+        .collect::<Vec<_>>();
+    let original_len = ages.len();
+    ages.sort_unstable();
+    ages.dedup();
+    PathDensityInputStats {
+        duplicate_age_count: original_len.saturating_sub(ages.len()),
+        non_monotonic_input,
+    }
 }
 
 fn evaluate_single_horizon_density(
@@ -2238,8 +2793,21 @@ fn evaluate_single_horizon_density(
     replay_horizon_ms: Option<u64>,
     config: &ShadowPathSamplerConfigV2,
     horizon_ms: u64,
+    input_stats: PathDensityInputStats,
 ) -> ShadowPathHorizonEvaluationV2 {
     let mut limitations = vec![format!("PATH_SAMPLING_MODE={}", config.mode.label())];
+    if config.requires_storage_budget {
+        limitations.push("PATH_MODE_REQUIRES_STORAGE_BUDGET_BEFORE_VALIDATION_RUN".to_string());
+    }
+    if input_stats.duplicate_age_count > 0 {
+        limitations.push(format!(
+            "PATH_DENSITY_DUPLICATE_AGE_COUNT={}",
+            input_stats.duplicate_age_count
+        ));
+    }
+    if input_stats.non_monotonic_input {
+        limitations.push("PATH_DENSITY_INPUT_NON_MONOTONIC".to_string());
+    }
     if ages.is_empty() {
         limitations.push("PATH_DENSITY_NO_PATH_POINTS".to_string());
         return ShadowPathHorizonEvaluationV2 {
@@ -2252,18 +2820,32 @@ fn evaluate_single_horizon_density(
             median_interval_ms: None,
             p90_interval_ms: None,
             max_interval_ms: None,
+            duplicate_age_count: input_stats.duplicate_age_count,
+            non_monotonic_input: input_stats.non_monotonic_input,
             limitations,
         };
     }
 
     if horizon_ms > config.max_horizon_ms {
         limitations.push("HORIZON_EXCEEDS_CONFIGURED_PATH_MODE".to_string());
-        return horizon_not_evaluable(ages, replay_horizon_ms, horizon_ms, limitations);
+        return horizon_not_evaluable(
+            ages,
+            replay_horizon_ms,
+            horizon_ms,
+            input_stats,
+            limitations,
+        );
     }
 
     if replay_horizon_ms.is_some_and(|replay_horizon| horizon_ms > replay_horizon) {
         limitations.push("HORIZON_EXCEEDS_REPLAY_COVERAGE".to_string());
-        return horizon_not_evaluable(ages, replay_horizon_ms, horizon_ms, limitations);
+        return horizon_not_evaluable(
+            ages,
+            replay_horizon_ms,
+            horizon_ms,
+            input_stats,
+            limitations,
+        );
     }
 
     let covered: Vec<u64> = ages
@@ -2283,6 +2865,8 @@ fn evaluate_single_horizon_density(
             median_interval_ms: None,
             p90_interval_ms: None,
             max_interval_ms: None,
+            duplicate_age_count: input_stats.duplicate_age_count,
+            non_monotonic_input: input_stats.non_monotonic_input,
             limitations,
         };
     }
@@ -2315,6 +2899,8 @@ fn evaluate_single_horizon_density(
         median_interval_ms,
         p90_interval_ms,
         max_interval_ms,
+        duplicate_age_count: input_stats.duplicate_age_count,
+        non_monotonic_input: input_stats.non_monotonic_input,
         limitations,
     }
 }
@@ -2323,6 +2909,7 @@ fn horizon_not_evaluable(
     ages: &[u64],
     replay_horizon_ms: Option<u64>,
     horizon_ms: u64,
+    input_stats: PathDensityInputStats,
     limitations: Vec<String>,
 ) -> ShadowPathHorizonEvaluationV2 {
     ShadowPathHorizonEvaluationV2 {
@@ -2335,6 +2922,8 @@ fn horizon_not_evaluable(
         median_interval_ms: None,
         p90_interval_ms: None,
         max_interval_ms: None,
+        duplicate_age_count: input_stats.duplicate_age_count,
+        non_monotonic_input: input_stats.non_monotonic_input,
         limitations,
     }
 }
@@ -2544,6 +3133,41 @@ mod tests {
         sample.observed_slot = Some(slot.saturating_sub(1));
         sample.staleness_slots = Some(1);
         sample
+    }
+
+    fn path_sample_with_pnl(
+        event_id: &str,
+        age_ms: u64,
+        pnl_mark_bps: i32,
+        sampling_mode: ShadowPathSamplingModeV2,
+        sampling_reason: ShadowPathSamplingReasonV2,
+        mut event_order_key: EventOrderKey,
+    ) -> ShadowPathSampleV2 {
+        event_order_key.observed_at_wall_ms = 1_785_000_000_123_u64.saturating_add(age_ms);
+        ShadowPathSampleV2 {
+            envelope: test_envelope("shadow_path_sample_v2", "pos-a", event_id),
+            event_order_key,
+            sampling_mode,
+            path_horizon_ms: ShadowPathSamplerConfigV2::for_mode(sampling_mode).max_horizon_ms,
+            sample_ts_ms: clocked(
+                "sample_ts_ms",
+                1_785_000_000_123_i64.saturating_add(age_ms as i64),
+                ClockDomain::StreamObservedMs,
+            ),
+            sample_slot: Some(45),
+            age_ms,
+            pool_state_ref: "pool-event-path".to_string(),
+            mark_price: Some(0.00003),
+            executable_exit_quote: None,
+            pnl_mark_bps: Some(pnl_mark_bps),
+            pnl_executable_bps: None,
+            mfe_mark_bps: Some(pnl_mark_bps),
+            mae_mark_bps: Some(pnl_mark_bps),
+            source_quality: "RESEARCH_READY".to_string(),
+            sampling_reason: sampling_reason.label().to_string(),
+            exact_or_approx: "EXACT_EVENT_ORDER".to_string(),
+            truncated: false,
+        }
     }
 
     #[test]
@@ -3459,6 +4083,226 @@ mod tests {
     }
 
     #[test]
+    fn shadow_v2_exit_path_replay_separates_sampled_and_exact_level_hits() {
+        let mut order_a = event_order_key(Some(45), Some(1));
+        order_a.event_seq_in_process = 10;
+        let mut order_b = event_order_key(Some(45), Some(2));
+        order_b.event_seq_in_process = 11;
+        let mut order_c = event_order_key(Some(46), Some(0));
+        order_c.event_seq_in_process = 12;
+        let samples = vec![
+            path_sample_with_pnl(
+                "path-pre-hit",
+                1_000,
+                200,
+                ShadowPathSamplingModeV2::Dense3s,
+                ShadowPathSamplingReasonV2::EventSample,
+                order_a,
+            ),
+            path_sample_with_pnl(
+                "path-sampled-target",
+                2_000,
+                650,
+                ShadowPathSamplingModeV2::Dense3s,
+                ShadowPathSamplingReasonV2::EventSample,
+                order_b,
+            ),
+            path_sample_with_pnl(
+                "path-exact-target",
+                2_500,
+                700,
+                ShadowPathSamplingModeV2::Dense3s,
+                ShadowPathSamplingReasonV2::LevelHit,
+                order_c,
+            ),
+        ];
+        let config = ShadowExitPathReplayConfigV2::new(
+            Some(600),
+            Some(-500),
+            3_000,
+            ShadowExitTieBreakPolicyV2::BlockAmbiguous,
+        );
+
+        let result = replay_exit_from_path_v2(&samples, &config);
+
+        assert_eq!(
+            result.selected_exit.terminal_reason,
+            TerminalReasonV2::Target
+        );
+        assert_eq!(
+            result.selected_exit.hit_source,
+            ShadowExitHitSourceV2::SampledPath
+        );
+        assert_eq!(result.selected_exit.age_ms, Some(2_000));
+        assert_eq!(
+            result
+                .sampled_path_hit
+                .as_ref()
+                .unwrap()
+                .path_sample_ref
+                .as_deref(),
+            Some("path-sampled-target")
+        );
+        assert_eq!(
+            result
+                .exact_level_hit
+                .as_ref()
+                .unwrap()
+                .path_sample_ref
+                .as_deref(),
+            Some("path-exact-target")
+        );
+        assert_eq!(result.mfe_mark_bps, Some(650));
+        assert_eq!(result.mae_mark_bps, Some(200));
+        assert_eq!(result.terminal_pnl_mark_bps, Some(650));
+    }
+
+    #[test]
+    fn shadow_v2_exit_path_replay_blocks_or_tie_breaks_ambiguous_target_stop() {
+        let mut target_order = event_order_key(Some(45), Some(1));
+        target_order.event_seq_in_process = 10;
+        target_order.transaction_index_or_unknown = EventOrderComponent::unknown();
+        let mut stop_order = event_order_key(Some(45), Some(2));
+        stop_order.event_seq_in_process = 11;
+        stop_order.transaction_index_or_unknown = EventOrderComponent::unknown();
+        let samples = vec![
+            path_sample_with_pnl(
+                "path-target-ambiguous",
+                2_000,
+                700,
+                ShadowPathSamplingModeV2::Dense3s,
+                ShadowPathSamplingReasonV2::EventSample,
+                target_order,
+            ),
+            path_sample_with_pnl(
+                "path-stop-ambiguous",
+                2_000,
+                -700,
+                ShadowPathSamplingModeV2::Dense3s,
+                ShadowPathSamplingReasonV2::EventSample,
+                stop_order,
+            ),
+        ];
+        let blocked_config = ShadowExitPathReplayConfigV2::new(
+            Some(600),
+            Some(-600),
+            3_000,
+            ShadowExitTieBreakPolicyV2::BlockAmbiguous,
+        );
+        let blocked = replay_exit_from_path_v2(&samples, &blocked_config);
+
+        assert_eq!(
+            blocked.selected_exit.terminal_reason,
+            TerminalReasonV2::BlockedByData
+        );
+        assert!(blocked
+            .limitations
+            .contains(&"EXIT_PATH_TARGET_STOP_ORDER_AMBIGUOUS".to_string()));
+        assert!(blocked.selected_exit.same_slot_ambiguity);
+
+        let stop_first_config = ShadowExitPathReplayConfigV2::new(
+            Some(600),
+            Some(-600),
+            3_000,
+            ShadowExitTieBreakPolicyV2::StopFirst,
+        );
+        let stop_first = replay_exit_from_path_v2(&samples, &stop_first_config);
+
+        assert_eq!(
+            stop_first.selected_exit.terminal_reason,
+            TerminalReasonV2::Stop
+        );
+        assert!(stop_first.selected_exit.same_slot_ambiguity);
+        assert!(stop_first
+            .selected_exit
+            .limitations
+            .contains(&"EXIT_PATH_TARGET_STOP_AMBIGUITY_RESOLVED_STOP_FIRST".to_string()));
+    }
+
+    #[test]
+    fn shadow_v2_exit_path_replay_timeout_requires_path_coverage() {
+        let mut order_a = event_order_key(Some(45), Some(1));
+        order_a.event_seq_in_process = 10;
+        let mut order_b = event_order_key(Some(45), Some(2));
+        order_b.event_seq_in_process = 11;
+        let sparse_samples = vec![
+            path_sample_with_pnl(
+                "path-timeout-a",
+                1_000,
+                100,
+                ShadowPathSamplingModeV2::Standard120s,
+                ShadowPathSamplingReasonV2::Heartbeat,
+                order_a.clone(),
+            ),
+            path_sample_with_pnl(
+                "path-timeout-b",
+                2_000,
+                150,
+                ShadowPathSamplingModeV2::Standard120s,
+                ShadowPathSamplingReasonV2::Heartbeat,
+                order_b.clone(),
+            ),
+        ];
+        let config = ShadowExitPathReplayConfigV2::new(
+            Some(600),
+            Some(-600),
+            3_000,
+            ShadowExitTieBreakPolicyV2::BlockAmbiguous,
+        );
+        let blocked = replay_exit_from_path_v2(&sparse_samples, &config);
+
+        assert_eq!(
+            blocked.selected_exit.terminal_reason,
+            TerminalReasonV2::BlockedByData
+        );
+        assert!(blocked
+            .limitations
+            .contains(&"TIMEOUT_MAX_HOLD_EXCEEDS_REPLAY_HORIZON".to_string()));
+
+        let mut covered_samples = sparse_samples;
+        let mut order_c = event_order_key(Some(46), Some(0));
+        order_c.event_seq_in_process = 12;
+        covered_samples.push(path_sample_with_pnl(
+            "path-timeout-c",
+            3_000,
+            125,
+            ShadowPathSamplingModeV2::Standard120s,
+            ShadowPathSamplingReasonV2::Terminal,
+            order_c,
+        ));
+        let timeout = replay_exit_from_path_v2(&covered_samples, &config);
+
+        assert_eq!(
+            timeout.selected_exit.terminal_reason,
+            TerminalReasonV2::Timeout
+        );
+        assert_eq!(
+            timeout.selected_exit.hit_source,
+            ShadowExitHitSourceV2::TimeoutPathPoint
+        );
+        assert_eq!(timeout.terminal_pnl_mark_bps, Some(125));
+        assert!(timeout
+            .selected_exit
+            .limitations
+            .contains(&"TIMEOUT_PNL_USES_REAL_PATH_POINT".to_string()));
+
+        let zero_horizon_config = ShadowExitPathReplayConfigV2::new(
+            Some(600),
+            Some(-600),
+            0,
+            ShadowExitTieBreakPolicyV2::BlockAmbiguous,
+        );
+        let zero_horizon = replay_exit_from_path_v2(&covered_samples, &zero_horizon_config);
+        assert_eq!(
+            zero_horizon.selected_exit.terminal_reason,
+            TerminalReasonV2::BlockedByData
+        );
+        assert!(zero_horizon
+            .limitations
+            .contains(&"EXIT_PATH_REPLAY_MAX_HOLD_MS_ZERO".to_string()));
+    }
+
+    #[test]
     fn shadow_v2_path_sample_reconstructs_mark_pnl_and_attaches_static_exit_quote() {
         let pool_state = post_entry_pool_sample("pool-event-path", 2, 44, 1);
         let reserves =
@@ -3612,6 +4456,89 @@ mod tests {
     }
 
     #[test]
+    fn shadow_v2_path_density_reports_duplicate_and_non_monotonic_input() {
+        let config = ShadowPathSamplerConfigV2::standard_120s();
+        let mut order_a = event_order_key(Some(45), Some(1));
+        order_a.event_seq_in_process = 10;
+        let mut order_b = event_order_key(Some(45), Some(2));
+        order_b.event_seq_in_process = 11;
+        let mut order_c = event_order_key(Some(45), Some(3));
+        order_c.event_seq_in_process = 12;
+        let samples = vec![
+            path_sample_with_pnl(
+                "path-density-nonmono-a",
+                30_000,
+                10,
+                ShadowPathSamplingModeV2::Standard120s,
+                ShadowPathSamplingReasonV2::Heartbeat,
+                order_a,
+            ),
+            path_sample_with_pnl(
+                "path-density-nonmono-b",
+                10_000,
+                20,
+                ShadowPathSamplingModeV2::Standard120s,
+                ShadowPathSamplingReasonV2::Heartbeat,
+                order_b,
+            ),
+            path_sample_with_pnl(
+                "path-density-duplicate",
+                10_000,
+                25,
+                ShadowPathSamplingModeV2::Standard120s,
+                ShadowPathSamplingReasonV2::Heartbeat,
+                order_c,
+            ),
+        ];
+
+        let evaluations = evaluate_path_density_v2(&samples, &config, &[30_000]);
+
+        assert_eq!(evaluations[0].duplicate_age_count, 1);
+        assert!(evaluations[0].non_monotonic_input);
+        assert!(evaluations[0]
+            .limitations
+            .contains(&"PATH_DENSITY_INPUT_NON_MONOTONIC".to_string()));
+        assert!(evaluations[0]
+            .limitations
+            .contains(&"PATH_DENSITY_DUPLICATE_AGE_COUNT=1".to_string()));
+    }
+
+    #[test]
+    fn shadow_v2_path_sampler_dense_keeps_all_event_samples_and_marks_truncation() {
+        let dense = ShadowPathSamplerConfigV2 {
+            max_path_points: 3,
+            ..ShadowPathSamplerConfigV2::dense_3s()
+        };
+        let standard = ShadowPathSamplerConfigV2::standard_120s();
+        let mut samples = Vec::new();
+        for idx in 0..5 {
+            let mut order = event_order_key(Some(45), Some(idx));
+            order.event_seq_in_process = 10 + idx as u64;
+            samples.push(path_sample_with_pnl(
+                &format!("path-dense-event-{idx}"),
+                100 + idx as u64,
+                idx as i32,
+                ShadowPathSamplingModeV2::Dense3s,
+                ShadowPathSamplingReasonV2::EventSample,
+                order,
+            ));
+        }
+
+        let dense_selected = select_path_samples_v2(&samples, &dense);
+        let standard_selected = select_path_samples_v2(&samples, &standard);
+
+        assert_eq!(dense_selected.len(), 3);
+        assert!(dense_selected.last().unwrap().truncated);
+        assert!(dense_selected
+            .last()
+            .unwrap()
+            .envelope
+            .limitations
+            .contains(&"PATH_SAMPLER_TRUNCATED_BY_HORIZON_OR_MAX_POINTS".to_string()));
+        assert_eq!(standard_selected.len(), 1);
+    }
+
+    #[test]
     fn shadow_v2_path_sampler_modes_define_sampling_policy() {
         let dense = ShadowPathSamplerConfigV2::dense_3s();
         let standard = ShadowPathSamplerConfigV2::standard_120s();
@@ -3620,6 +4547,11 @@ mod tests {
         assert_eq!(dense.max_horizon_ms, 3_000);
         assert_eq!(standard.max_horizon_ms, 120_000);
         assert_eq!(long.max_horizon_ms, 500_000);
+        assert!(dense.keep_every_event_sample);
+        assert!(!standard.keep_every_event_sample);
+        assert!(dense.requires_storage_budget);
+        assert!(!standard.requires_storage_budget);
+        assert!(long.requires_storage_budget);
         assert!(dense.should_keep_sample(
             100,
             10,

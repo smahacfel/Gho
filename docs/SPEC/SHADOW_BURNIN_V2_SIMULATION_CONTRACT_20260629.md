@@ -3,7 +3,7 @@
 ## Status
 
 ```text
-PR6_PR7_IMPLEMENTED_ON_PR_BRANCH_PENDING_REVIEW
+PR6_PR7_COMPLETED_ON_PR_BRANCH_PENDING_REVIEW
 ```
 
 Ten dokument definiuje kontrakt Shadow Burnin Simulation V2. Nie aktywuje runtime, nie zmienia BUY/REJECT, nie zmienia Gatekeeper policy, nie zmienia selector runtime, nie zmienia TX/Jito/live path, nie włącza `shadow_close_only` i nie włącza active close.
@@ -463,6 +463,40 @@ PR6 intentionally records limitations such as:
 - pool state after fill is deterministic derived state, not observed account state;
 - static exit fill does not enable active close.
 
+### PR6 Exit Path Replay Contract
+
+PR6 also defines an inert path replay helper:
+
+```text
+replay_exit_from_path_v2
+```
+
+The helper is a deterministic mark/path replay contract. It is not an
+executable sell fill and it must not be treated as active close evidence.
+
+`shadow_exit_path_replay_v2` separates:
+
+- `exact_level_hit`: first target/stop evidence from `LEVEL_HIT` samples;
+- `sampled_path_hit`: first target/stop evidence from sampled path points;
+- `timeout_path_point`: actual path point used for timeout evidence, or an
+  explicit stale/blocked limitation;
+- `selected_exit`: selected mark/path exit after target/stop/timeout logic;
+- `mfe_mark_bps`, `mae_mark_bps`, `terminal_pnl_mark_bps`.
+
+Target and stop detection rules:
+
+- target and stop are evaluated only on samples with `age_ms <= max_hold_ms`;
+- exact-level and sampled-path evidence are recorded independently, even when
+  a sampled hit appears before a later exact-level marker;
+- exact-level evidence does not become executable sell fill evidence;
+- if target and stop have incomplete same-slot order and policy is
+  `BLOCK_AMBIGUOUS`, `selected_exit` becomes `BLOCKED_BY_DATA`;
+- if a tie-break policy is explicitly configured, the selected path result must
+  carry `SAME_SLOT_TIE_BREAK_*` limitations;
+- timeout uses a real path point at or before `max_hold_ms`; if only an older
+  last-known point exists, it is labeled as stale approximation;
+- if no path point exists before timeout, timeout is blocked by data.
+
 ## Path Density Contract
 
 Path V2 must separate:
@@ -500,6 +534,14 @@ TERMINAL
 
 `LEVEL_HIT` and `TERMINAL` are must-keep samples.
 
+`shadow_path_dense_3s` additionally keeps every `EVENT_SAMPLE`. This is the
+only PR7 mode intended for 2s/3s fidelity research. It requires an explicit
+storage budget before a validation burnin.
+
+`shadow_path_long_500s` also requires an explicit storage budget before a
+validation burnin. It is the only PR7 mode intended to make 300s/500s horizons
+evaluable, and only when actual coverage exists.
+
 Horizon verdicts are:
 
 ```text
@@ -522,6 +564,11 @@ Rules:
 - Mark path samples use `MARK_PRICE_REPLAY` until a static executable quote is
   attached.
 - Static executable exit quote remains `FILL_MODEL_STATIC`, not live fill.
+- Density evaluation must emit duplicate-age and non-monotonic input metadata.
+  These labels do not rewrite the path; they make ordering defects visible to
+  downstream fidelity gates.
+- Sampler output may be truncated only with an explicit truncation flag and
+  limitation.
 
 ## Terminal Truth Contract
 
