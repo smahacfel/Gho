@@ -5,7 +5,7 @@ Data: 2026-06-30
 Status:
 
 ```text
-IMPLEMENTED_LOCAL_PENDING_CI
+IMPLEMENTED_LOCAL_PENDING_GITHUB_RECHECK
 ```
 
 ## D1. Problem
@@ -105,6 +105,17 @@ CI diagnostics:
 - zmiana dotyczy tylko widoczności błędów CI i nie zmienia listy guard tests,
   skryptu guard ani runtime semantics.
 
+CI dependency:
+
+- GitHub Actions head `84092e1` ujawnił, że `cargo test -q -p ghost-launcher
+  --lib restore_legacy_buy` padał na runnerze przed wykonaniem testów, ponieważ
+  custom build script `off-chain/components/trigger/build.rs` nie znalazł
+  `protoc`;
+- `Restore Lifecycle Guard` instaluje teraz `protobuf-compiler` w jobie Level 1
+  i Level 2 przed uruchomieniem guard tests;
+- to jest zależność buildowa CI, nie zmiana runtime, skryptu guard, BUY/REJECT
+  ani TX/Jito/live path.
+
 ## D6. Rejected Alternatives
 
 Odrzucono:
@@ -164,7 +175,8 @@ previous PR head d450cae4 failed Restore Lifecycle Guard
 local targeted restore command and local static guard no longer reproduce the failure
 PR head 0b2b758 still failed Restore Lifecycle Guard on GitHub merge ref 63341b40
 local merge-ref guard for 63341b40 passed
-next PR head must expose failed command log tail if GitHub runner still fails
+PR head 84092e1 exposed GitHub runner failure: missing protoc for trigger build.rs
+workflow now installs protobuf-compiler; next PR head must re-run Restore Lifecycle Guard
 ```
 
 Runtime boundary:

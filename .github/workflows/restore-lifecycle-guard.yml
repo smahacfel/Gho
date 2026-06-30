@@ -23,6 +23,10 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
       - name: Python syntax and unit tests
         run: |
           python3 -m py_compile scripts/guard_restore_shadow_lifecycle.py scripts/test_guard_restore_shadow_lifecycle.py
@@ -53,6 +57,10 @@ jobs:
       GHOST_TRIGGER_KEYPAIR_PATH: ${{ secrets.GHOST_TRIGGER_KEYPAIR_PATH }}
     steps:
       - uses: actions/checkout@v4
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
       - name: Full restore runtime guard
         run: |
           OUT_DIR="reports/selector/restore_lifecycle_guard_$(date -u +%Y%m%dT%H%M%SZ)"
