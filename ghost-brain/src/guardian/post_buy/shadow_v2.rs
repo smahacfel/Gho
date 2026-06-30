@@ -1,11 +1,12 @@
 //! Shadow Burnin Simulation V2 contract types.
 //!
-//! These types are intentionally inert. The Shadow V2 PR1-PR7 foundation defines
+//! These types are intentionally inert. The Shadow V2 PR1-PR9 foundation defines
 //! schema, validation vocabulary, canonical event guards, pool-state provenance,
 //! deterministic price/fill formulas, exit fill simulation, and path sampling
-//! helpers only. No runtime writer, lifecycle path, replay path, BUY/REJECT
-//! policy, selector, TX/Jito path, shadow_close_only path, or active close path
-//! consumes these records yet.
+//! helpers plus pure derived replay/lifecycle projections only. No runtime
+//! writer, lifecycle runtime path, replay runtime path, BUY/REJECT policy,
+//! selector, TX/Jito path, shadow_close_only path, or active close path consumes
+//! these records yet.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -25,6 +26,10 @@ pub const SHADOW_V2_ENTRY_FILL_MODEL_VERSION: &str =
     "shadow_v2_entry_fill_static_constant_product_v1";
 pub const SHADOW_V2_EXIT_FILL_MODEL_VERSION: &str =
     "shadow_v2_exit_fill_static_constant_product_v1";
+pub const SHADOW_V2_REPLAY_DERIVATION_VERSION: &str =
+    "shadow_v2_replay_derived_from_canonical_stream_v1";
+pub const SHADOW_V2_LIFECYCLE_DERIVATION_VERSION: &str =
+    "shadow_v2_lifecycle_derived_from_canonical_stream_v1";
 pub const EVENT_ORDER_UNKNOWN_INDEX: u32 = u32::MAX;
 pub const EVENT_ORDER_UNKNOWN_SIGNATURE: &str = "UNKNOWN";
 
@@ -220,6 +225,14 @@ pub enum TerminalReasonV2 {
     BlockedByData,
     ManualDiagnosticClose,
     Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ShadowLifecycleEventTypeV2 {
+    PositionOpen,
+    PositionClosed,
+    TerminalBlocked,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -520,6 +533,7 @@ pub enum ShadowV2Record {
     ShadowExitFillV2(ShadowExitFillV2),
     ShadowTerminalTruthV2(ShadowTerminalTruthV2),
     ShadowReplayV2(ShadowReplayV2),
+    ShadowLifecycleV2(ShadowLifecycleV2),
 }
 
 impl ShadowV2Record {
@@ -535,6 +549,7 @@ impl ShadowV2Record {
             Self::ShadowExitFillV2(record) => &record.envelope,
             Self::ShadowTerminalTruthV2(record) => &record.envelope,
             Self::ShadowReplayV2(record) => &record.envelope,
+            Self::ShadowLifecycleV2(record) => &record.envelope,
         }
     }
 
@@ -550,6 +565,7 @@ impl ShadowV2Record {
             Self::ShadowExitFillV2(_) => ShadowPositionEventKindV2::ExitFill,
             Self::ShadowTerminalTruthV2(_) => ShadowPositionEventKindV2::TerminalTruth,
             Self::ShadowReplayV2(_) => ShadowPositionEventKindV2::ReplayDerived,
+            Self::ShadowLifecycleV2(_) => ShadowPositionEventKindV2::LifecycleSubEvent,
         }
     }
 
@@ -564,7 +580,8 @@ impl ShadowV2Record {
             Self::ShadowPositionV2(_)
             | Self::ShadowEntryDecisionV2(_)
             | Self::ShadowTerminalTruthV2(_)
-            | Self::ShadowReplayV2(_) => None,
+            | Self::ShadowReplayV2(_)
+            | Self::ShadowLifecycleV2(_) => None,
         }
     }
 }
@@ -605,6 +622,9 @@ pub enum ShadowV2Error {
     PoolStateBlocked {
         event_id: String,
         blockers: Vec<String>,
+    },
+    MissingCanonicalPositionEvents {
+        position_id: String,
     },
     JsonlIndex {
         path: String,
@@ -664,6 +684,10 @@ impl fmt::Display for ShadowV2Error {
             Self::PoolStateBlocked { event_id, blockers } => {
                 write!(f, "shadow v2 pool state sample {event_id} blocked: {blockers:?}")
             }
+            Self::MissingCanonicalPositionEvents { position_id } => write!(
+                f,
+                "shadow v2 canonical stream has no events for position {position_id}"
+            ),
             Self::JsonlIndex {
                 path,
                 line_number,
@@ -829,10 +853,24 @@ impl ShadowV2CanonicalEventStream {
         &self.events
     }
 
+    pub fn events_for_position(&self, position_id: &str) -> Vec<&ShadowPositionEventV2> {
+        self.events
+            .iter()
+            .filter(|event| event.envelope.position_id == position_id)
+            .collect()
+    }
+
     pub fn terminal_event_id(&self, position_id: &str) -> Option<&str> {
         self.terminal_event_by_position
             .get(position_id)
             .map(String::as_str)
+    }
+
+    pub fn canonical_terminal_event(&self, position_id: &str) -> Option<&ShadowPositionEventV2> {
+        let terminal_event_id = self.terminal_event_id(position_id)?;
+        self.events
+            .iter()
+            .find(|event| event.envelope.event_id == terminal_event_id)
     }
 
     fn validate_event(&self, event: &ShadowPositionEventV2) -> Result<(), ShadowV2Error> {
@@ -3012,6 +3050,453 @@ pub struct ShadowReplayV2 {
     pub executable_replay_ref: Option<String>,
     pub coverage_metadata_ref: String,
     pub derived_from_canonical_stream: bool,
+    pub canonical_terminal_event_id: Option<String>,
+    pub source_event_ids: Vec<String>,
+    pub path_sample_event_ids: Vec<String>,
+    pub entry_fill_event_id: Option<String>,
+    pub exit_attempt_event_id: Option<String>,
+    pub exit_fill_event_id: Option<String>,
+    pub terminal_truth_event_id: Option<String>,
+    pub mark_path_sample_count: usize,
+    pub executable_quote_sample_count: usize,
+    pub blocked_path_sample_count: usize,
+    pub terminal_reason: Option<TerminalReasonV2>,
+    pub terminal_pnl_mark_bps: Option<i32>,
+    pub terminal_pnl_executable_bps: Option<i32>,
+    pub close_age_ms: Option<u64>,
+    pub replay_derivation_status: String,
+}
+
+impl ShadowReplayV2 {
+    pub fn derive_from_canonical_stream(
+        mut envelope: ShadowV2Envelope,
+        stream: &ShadowV2CanonicalEventStream,
+        position_id: &str,
+        canonical_event_stream_ref: impl Into<String>,
+    ) -> Result<Self, ShadowV2Error> {
+        let canonical_event_stream_ref = canonical_event_stream_ref.into();
+        let position_events: Vec<_> = stream
+            .events_for_position(position_id)
+            .into_iter()
+            .filter(|event| {
+                !matches!(
+                    event.event_kind,
+                    ShadowPositionEventKindV2::ReplayDerived
+                        | ShadowPositionEventKindV2::LifecycleSubEvent
+                )
+            })
+            .collect();
+        if position_events.is_empty() {
+            return Err(ShadowV2Error::MissingCanonicalPositionEvents {
+                position_id: position_id.to_string(),
+            });
+        }
+
+        let mut source_event_ids = Vec::with_capacity(position_events.len());
+        let mut path_sample_event_ids = Vec::new();
+        let mut entry_fill_event_id = None;
+        let mut exit_attempt_event_id = None;
+        let mut exit_fill_event_id = None;
+        let mut mark_path_sample_count = 0usize;
+        let mut executable_quote_sample_count = 0usize;
+        let mut blocked_path_sample_count = 0usize;
+
+        for event in &position_events {
+            source_event_ids.push(event.envelope.event_id.clone());
+            match event.event_kind {
+                ShadowPositionEventKindV2::EntryFill if entry_fill_event_id.is_none() => {
+                    entry_fill_event_id = Some(event.envelope.event_id.clone());
+                }
+                ShadowPositionEventKindV2::PathSample => {
+                    path_sample_event_ids.push(event.envelope.event_id.clone());
+                    if let ShadowV2Record::ShadowPathSampleV2(sample) =
+                        shadow_v2_record_from_event(event)?
+                    {
+                        if sample.pnl_mark_bps.is_some() {
+                            mark_path_sample_count += 1;
+                        }
+                        if sample.executable_exit_quote.is_some()
+                            || sample.pnl_executable_bps.is_some()
+                        {
+                            executable_quote_sample_count += 1;
+                        }
+                        if sample.exact_or_approx == "BLOCKED_BY_DATA" {
+                            blocked_path_sample_count += 1;
+                        }
+                    }
+                }
+                ShadowPositionEventKindV2::ExitAttempt if exit_attempt_event_id.is_none() => {
+                    exit_attempt_event_id = Some(event.envelope.event_id.clone());
+                }
+                ShadowPositionEventKindV2::ExitFill if exit_fill_event_id.is_none() => {
+                    exit_fill_event_id = Some(event.envelope.event_id.clone());
+                }
+                _ => {}
+            }
+        }
+
+        let terminal = stream.canonical_terminal_event(position_id);
+        let terminal_truth = terminal
+            .map(|event| match shadow_v2_record_from_event(event)? {
+                ShadowV2Record::ShadowTerminalTruthV2(record) => Ok(record),
+                _ => Err(ShadowV2Error::Serialization(format!(
+                    "canonical terminal event {} did not contain shadow_terminal_truth_v2 payload",
+                    event.envelope.event_id
+                ))),
+            })
+            .transpose()?;
+        let canonical_terminal_event_id = terminal_truth
+            .as_ref()
+            .map(|record| record.envelope.event_id.clone());
+
+        envelope.schema = "shadow_replay_v2".to_string();
+        envelope.simulation_level = SimulationLevel::MarkOnly;
+        envelope.measurement_grade = MeasurementGrade::MarkPriceReplay;
+        envelope.temporal_class = if terminal_truth.is_some() {
+            TemporalClass::PostExit
+        } else {
+            TemporalClass::PostEntry
+        };
+        envelope.clock_domain = ClockDomain::WallClockMs;
+        envelope.source_event_id = canonical_terminal_event_id.clone();
+        envelope.source_refs.push(format!(
+            "canonical_event_stream:{canonical_event_stream_ref}"
+        ));
+        envelope.source_refs.extend(
+            source_event_ids
+                .iter()
+                .map(|event_id| format!("canonical_event:{event_id}")),
+        );
+        envelope
+            .limitations
+            .push("REPLAY_V2_DERIVED_VIEW_NOT_CANONICAL_TRUTH".to_string());
+        envelope
+            .limitations
+            .push("MARK_REPLAY_NOT_EXECUTABLE_FILL".to_string());
+        if executable_quote_sample_count > 0 || exit_fill_event_id.is_some() {
+            envelope
+                .limitations
+                .push("EXECUTABLE_REPLAY_LANE_IS_STATIC_MODEL_NOT_LIVE_CONFIRMED".to_string());
+        }
+
+        let replay_derivation_status = if terminal_truth.is_some() {
+            "REPLAY_DERIVED_FROM_CANONICAL_TERMINAL".to_string()
+        } else {
+            envelope
+                .limitations
+                .push("REPLAY_DERIVED_WITHOUT_CANONICAL_TERMINAL_TRUTH".to_string());
+            "REPLAY_DERIVED_OPEN_OR_BLOCKED".to_string()
+        };
+        envelope.quality = replay_derivation_status.clone();
+
+        Ok(Self {
+            envelope,
+            canonical_event_stream_ref: canonical_event_stream_ref.clone(),
+            mark_replay_ref: (!path_sample_event_ids.is_empty()).then(|| {
+                format!(
+                    "{canonical_event_stream_ref}#mark_path_samples:{}",
+                    position_id
+                )
+            }),
+            executable_replay_ref: (executable_quote_sample_count > 0
+                || exit_fill_event_id.is_some())
+            .then(|| {
+                format!(
+                    "{canonical_event_stream_ref}#static_executable_lane:{}",
+                    position_id
+                )
+            }),
+            coverage_metadata_ref: format!("{canonical_event_stream_ref}#coverage:{position_id}"),
+            derived_from_canonical_stream: true,
+            canonical_terminal_event_id: canonical_terminal_event_id.clone(),
+            source_event_ids,
+            path_sample_event_ids,
+            entry_fill_event_id,
+            exit_attempt_event_id,
+            exit_fill_event_id,
+            terminal_truth_event_id: canonical_terminal_event_id,
+            mark_path_sample_count,
+            executable_quote_sample_count,
+            blocked_path_sample_count,
+            terminal_reason: terminal_truth.as_ref().map(|record| record.terminal_reason),
+            terminal_pnl_mark_bps: terminal_truth
+                .as_ref()
+                .and_then(|record| record.final_pnl_mark_bps),
+            terminal_pnl_executable_bps: terminal_truth
+                .as_ref()
+                .and_then(|record| record.final_pnl_executable_bps),
+            close_age_ms: terminal_truth
+                .as_ref()
+                .and_then(|record| record.close_age_ms),
+            replay_derivation_status,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShadowLifecycleV2 {
+    pub envelope: ShadowV2Envelope,
+    pub canonical_event_stream_ref: String,
+    pub derived_from_canonical_stream: bool,
+    pub lifecycle_event_type: ShadowLifecycleEventTypeV2,
+    pub canonical_position_event_id: Option<String>,
+    pub entry_fill_event_id: Option<String>,
+    pub exit_attempt_event_id: Option<String>,
+    pub exit_fill_event_id: Option<String>,
+    pub canonical_terminal_event_id: Option<String>,
+    pub terminal_reason: Option<TerminalReasonV2>,
+    pub terminal_ts_ms: Option<ClockedTimestamp>,
+    pub terminal_slot: Option<u64>,
+    pub final_pnl_mark_bps: Option<i32>,
+    pub final_pnl_executable_bps: Option<i32>,
+    pub close_age_ms: Option<u64>,
+    pub duplicate_terminal_handling: String,
+    pub reconciliation_status: String,
+    pub source_event_ids: Vec<String>,
+    pub derived_view_not_canonical_terminal: bool,
+}
+
+impl ShadowLifecycleV2 {
+    pub fn derive_from_canonical_stream(
+        mut envelope: ShadowV2Envelope,
+        stream: &ShadowV2CanonicalEventStream,
+        position_id: &str,
+        canonical_event_stream_ref: impl Into<String>,
+    ) -> Result<Self, ShadowV2Error> {
+        let canonical_event_stream_ref = canonical_event_stream_ref.into();
+        let position_events: Vec<_> = stream
+            .events_for_position(position_id)
+            .into_iter()
+            .filter(|event| {
+                !matches!(
+                    event.event_kind,
+                    ShadowPositionEventKindV2::ReplayDerived
+                        | ShadowPositionEventKindV2::LifecycleSubEvent
+                )
+            })
+            .collect();
+        if position_events.is_empty() {
+            return Err(ShadowV2Error::MissingCanonicalPositionEvents {
+                position_id: position_id.to_string(),
+            });
+        }
+
+        let mut source_event_ids = Vec::with_capacity(position_events.len());
+        let mut canonical_position_event_id = None;
+        let mut entry_fill_event_id = None;
+        let mut exit_attempt_event_id = None;
+        let mut exit_fill_event_id = None;
+
+        for event in &position_events {
+            source_event_ids.push(event.envelope.event_id.clone());
+            match event.event_kind {
+                ShadowPositionEventKindV2::PositionCreated
+                    if canonical_position_event_id.is_none() =>
+                {
+                    canonical_position_event_id = Some(event.envelope.event_id.clone());
+                }
+                ShadowPositionEventKindV2::EntryFill if entry_fill_event_id.is_none() => {
+                    entry_fill_event_id = Some(event.envelope.event_id.clone());
+                }
+                ShadowPositionEventKindV2::ExitAttempt if exit_attempt_event_id.is_none() => {
+                    exit_attempt_event_id = Some(event.envelope.event_id.clone());
+                }
+                ShadowPositionEventKindV2::ExitFill if exit_fill_event_id.is_none() => {
+                    exit_fill_event_id = Some(event.envelope.event_id.clone());
+                }
+                _ => {}
+            }
+        }
+
+        let terminal = stream.canonical_terminal_event(position_id);
+        let terminal_truth = terminal
+            .map(|event| match shadow_v2_record_from_event(event)? {
+                ShadowV2Record::ShadowTerminalTruthV2(record) => Ok(record),
+                _ => Err(ShadowV2Error::Serialization(format!(
+                    "canonical terminal event {} did not contain shadow_terminal_truth_v2 payload",
+                    event.envelope.event_id
+                ))),
+            })
+            .transpose()?;
+        let canonical_terminal_event_id = terminal_truth
+            .as_ref()
+            .map(|record| record.envelope.event_id.clone());
+        let lifecycle_event_type =
+            match terminal_truth.as_ref().map(|record| record.terminal_reason) {
+                Some(
+                    TerminalReasonV2::BlockedByData
+                    | TerminalReasonV2::Failed
+                    | TerminalReasonV2::NoFill,
+                ) => ShadowLifecycleEventTypeV2::TerminalBlocked,
+                Some(_) => ShadowLifecycleEventTypeV2::PositionClosed,
+                None => ShadowLifecycleEventTypeV2::PositionOpen,
+            };
+
+        envelope.schema = "shadow_lifecycle_v2".to_string();
+        envelope.simulation_level = SimulationLevel::MarkOnly;
+        envelope.measurement_grade = if terminal_truth.is_some() {
+            MeasurementGrade::MarkPriceReplay
+        } else {
+            MeasurementGrade::DiagnosticOnly
+        };
+        envelope.temporal_class = if terminal_truth.is_some() {
+            TemporalClass::PostExit
+        } else {
+            TemporalClass::PostEntry
+        };
+        envelope.clock_domain = ClockDomain::WallClockMs;
+        envelope.source_event_id = canonical_terminal_event_id.clone();
+        envelope.source_refs.push(format!(
+            "canonical_event_stream:{canonical_event_stream_ref}"
+        ));
+        envelope.source_refs.extend(
+            source_event_ids
+                .iter()
+                .map(|event_id| format!("canonical_event:{event_id}")),
+        );
+        envelope
+            .limitations
+            .push("LIFECYCLE_V2_DERIVED_VIEW_NOT_CANONICAL_TERMINAL_TRUTH".to_string());
+        envelope
+            .limitations
+            .push("LIFECYCLE_V2_DOES_NOT_IMPLY_LIVE_POSITION_STATE".to_string());
+        if terminal_truth.is_none() {
+            envelope
+                .limitations
+                .push("LIFECYCLE_DERIVED_WITHOUT_CANONICAL_TERMINAL_TRUTH".to_string());
+        }
+
+        let reconciliation_status = if terminal_truth.is_some() {
+            "LIFECYCLE_DERIVED_FROM_CANONICAL_TERMINAL".to_string()
+        } else {
+            "LIFECYCLE_DERIVED_OPEN_OR_BLOCKED".to_string()
+        };
+        envelope.quality = reconciliation_status.clone();
+
+        Ok(Self {
+            envelope,
+            canonical_event_stream_ref,
+            derived_from_canonical_stream: true,
+            lifecycle_event_type,
+            canonical_position_event_id,
+            entry_fill_event_id,
+            exit_attempt_event_id,
+            exit_fill_event_id,
+            canonical_terminal_event_id,
+            terminal_reason: terminal_truth.as_ref().map(|record| record.terminal_reason),
+            terminal_ts_ms: terminal_truth
+                .as_ref()
+                .map(|record| record.terminal_ts_ms.clone()),
+            terminal_slot: terminal_truth
+                .as_ref()
+                .and_then(|record| record.terminal_slot),
+            final_pnl_mark_bps: terminal_truth
+                .as_ref()
+                .and_then(|record| record.final_pnl_mark_bps),
+            final_pnl_executable_bps: terminal_truth
+                .as_ref()
+                .and_then(|record| record.final_pnl_executable_bps),
+            close_age_ms: terminal_truth
+                .as_ref()
+                .and_then(|record| record.close_age_ms),
+            duplicate_terminal_handling:
+                "DERIVED_LIFECYCLE_VIEW_DOES_NOT_CREATE_CANONICAL_TERMINAL_TRUTH".to_string(),
+            reconciliation_status,
+            source_event_ids,
+            derived_view_not_canonical_terminal: true,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShadowReplayLifecycleReconciliationV2 {
+    pub replay_event_id: String,
+    pub lifecycle_event_id: String,
+    pub position_id: String,
+    pub exact_join: bool,
+    pub fallback_join_used: bool,
+    pub ambiguous_join: bool,
+    pub canonical_terminal_event_id_match: bool,
+    pub terminal_reason_match: bool,
+    pub final_pnl_mark_match: bool,
+    pub final_pnl_executable_match: bool,
+    pub close_age_match: bool,
+    pub reconciliation_status: String,
+    pub limitations: Vec<String>,
+}
+
+pub fn reconcile_replay_lifecycle_v2(
+    replay: &ShadowReplayV2,
+    lifecycle: &ShadowLifecycleV2,
+) -> Result<ShadowReplayLifecycleReconciliationV2, ShadowV2Error> {
+    let replay_key = replay.envelope.exact_join_key()?;
+    let lifecycle_key = lifecycle.envelope.exact_join_key()?;
+    let exact_join = replay_key == lifecycle_key;
+    let mut limitations = vec![
+        "REPLAY_LIFECYCLE_RECONCILIATION_EXACT_KEY_ONLY".to_string(),
+        "NO_FALLBACK_JOIN_ACCEPTED".to_string(),
+    ];
+
+    if !exact_join {
+        limitations.push("REPLAY_LIFECYCLE_EXACT_JOIN_KEY_MISMATCH".to_string());
+        return Ok(ShadowReplayLifecycleReconciliationV2 {
+            replay_event_id: replay.envelope.event_id.clone(),
+            lifecycle_event_id: lifecycle.envelope.event_id.clone(),
+            position_id: replay.envelope.position_id.clone(),
+            exact_join: false,
+            fallback_join_used: false,
+            ambiguous_join: false,
+            canonical_terminal_event_id_match: false,
+            terminal_reason_match: false,
+            final_pnl_mark_match: false,
+            final_pnl_executable_match: false,
+            close_age_match: false,
+            reconciliation_status: "REPLAY_LIFECYCLE_EXACT_JOIN_KEY_MISMATCH".to_string(),
+            limitations,
+        });
+    }
+
+    let canonical_terminal_event_id_match = replay.canonical_terminal_event_id.is_some()
+        && replay.canonical_terminal_event_id == lifecycle.canonical_terminal_event_id;
+    let terminal_reason_match = replay.terminal_reason == lifecycle.terminal_reason;
+    let final_pnl_mark_match = replay.terminal_pnl_mark_bps == lifecycle.final_pnl_mark_bps;
+    let final_pnl_executable_match =
+        replay.terminal_pnl_executable_bps == lifecycle.final_pnl_executable_bps;
+    let close_age_match = replay.close_age_ms == lifecycle.close_age_ms;
+    let all_match = canonical_terminal_event_id_match
+        && terminal_reason_match
+        && final_pnl_mark_match
+        && final_pnl_executable_match
+        && close_age_match;
+    if !all_match {
+        limitations.push("REPLAY_LIFECYCLE_DERIVED_FIELD_MISMATCH".to_string());
+    }
+
+    Ok(ShadowReplayLifecycleReconciliationV2 {
+        replay_event_id: replay.envelope.event_id.clone(),
+        lifecycle_event_id: lifecycle.envelope.event_id.clone(),
+        position_id: replay.envelope.position_id.clone(),
+        exact_join: true,
+        fallback_join_used: false,
+        ambiguous_join: false,
+        canonical_terminal_event_id_match,
+        terminal_reason_match,
+        final_pnl_mark_match,
+        final_pnl_executable_match,
+        close_age_match,
+        reconciliation_status: if all_match {
+            "REPLAY_LIFECYCLE_RECONCILED_FROM_CANONICAL_STREAM".to_string()
+        } else {
+            "REPLAY_LIFECYCLE_MISMATCH".to_string()
+        },
+        limitations,
+    })
+}
+
+fn shadow_v2_record_from_event(
+    event: &ShadowPositionEventV2,
+) -> Result<ShadowV2Record, ShadowV2Error> {
+    serde_json::from_value(event.payload.clone()).map_err(ShadowV2Error::from)
 }
 
 #[cfg(test)]
@@ -3115,6 +3600,146 @@ mod tests {
             reconciliation_status: "CANONICAL_TERMINAL".to_string(),
             duplicate_terminal_handling: "REJECT_DUPLICATE_TERMINAL_TRUTH".to_string(),
         }
+    }
+
+    fn closed_canonical_stream_for_pr8_pr9() -> ShadowV2CanonicalEventStream {
+        let mut stream = ShadowV2CanonicalEventStream::default();
+        stream
+            .append_record(ShadowV2Record::ShadowPositionV2(position_record(
+                "pos-a",
+                "event-position",
+            )))
+            .unwrap();
+
+        let pool_entry = account_state_pool_sample("pool-event-entry", 1);
+        stream
+            .append_record(ShadowV2Record::PoolStateSampleV2(pool_entry.clone()))
+            .unwrap();
+
+        let mut entry_fill_order = event_order_key(Some(43), Some(2));
+        entry_fill_order.event_seq_in_process = 2;
+        let entry_config = ShadowEntryFillModelConfig::bonding_curve(
+            1_000_000_000,
+            250,
+            100,
+            SHADOW_V2_ENTRY_FILL_MODEL_VERSION,
+        );
+        let entry_fill = ShadowEntryFillV2::from_static_buy_model(
+            test_envelope("shadow_entry_fill_v2", "pos-a", "entry-fill-a"),
+            entry_fill_order,
+            &pool_entry,
+            &entry_config,
+        );
+        assert_eq!(entry_fill.fill_status, FillStatus::Filled);
+        stream
+            .append_record(ShadowV2Record::ShadowEntryFillV2(entry_fill))
+            .unwrap();
+
+        let pool_path = post_entry_pool_sample("pool-event-path", 3, 44, 1);
+        stream
+            .append_record(ShadowV2Record::PoolStateSampleV2(pool_path.clone()))
+            .unwrap();
+
+        let mut path_order_a = event_order_key(Some(45), Some(1));
+        path_order_a.event_seq_in_process = 4;
+        let path_a = path_sample_with_pnl(
+            "path-sample-a",
+            1_000,
+            200,
+            ShadowPathSamplingModeV2::Dense3s,
+            ShadowPathSamplingReasonV2::EventSample,
+            path_order_a,
+        );
+        stream
+            .append_record(ShadowV2Record::ShadowPathSampleV2(path_a))
+            .unwrap();
+
+        let reserves =
+            reserves_from_pool_state(&pool_path, ShadowV2PoolPhase::BondingCurve).unwrap();
+        let exit_quote = quote_constant_product(
+            ShadowV2PoolPhase::BondingCurve,
+            ShadowV2QuoteSide::Sell,
+            reserves,
+            10_000_000_000,
+            100,
+            100,
+        )
+        .unwrap();
+        let mut path_order_b = event_order_key(Some(45), Some(2));
+        path_order_b.event_seq_in_process = 5;
+        let mut path_b = path_sample_with_pnl(
+            "path-sample-b",
+            2_000,
+            650,
+            ShadowPathSamplingModeV2::Dense3s,
+            ShadowPathSamplingReasonV2::EventSample,
+            path_order_b,
+        );
+        path_b.attach_static_exit_quote(&exit_quote, pool_path.price_sol_per_token);
+        stream
+            .append_record(ShadowV2Record::ShadowPathSampleV2(path_b))
+            .unwrap();
+
+        let mut exit_attempt_order = event_order_key(Some(46), Some(1));
+        exit_attempt_order.event_seq_in_process = 6;
+        let mut exit_attempt = ShadowExitAttemptV2::from_mark_path_trigger(
+            test_envelope("shadow_exit_attempt_v2", "pos-a", "exit-attempt-a"),
+            exit_attempt_order,
+            "TARGET",
+            clocked(
+                "trigger_ts_ms",
+                1_785_000_002_123,
+                ClockDomain::StreamObservedMs,
+            ),
+            Some(46),
+            "shadow_exit_path_replay_v2",
+            Some(600),
+            Some(-600),
+            Some(3_000),
+            false,
+            Some("BLOCK_AMBIGUOUS".to_string()),
+        );
+        exit_attempt.attach_static_exit_model(SHADOW_V2_EXIT_FILL_MODEL_VERSION);
+        stream
+            .append_record(ShadowV2Record::ShadowExitAttemptV2(exit_attempt))
+            .unwrap();
+
+        let pool_exit = post_entry_pool_sample("pool-event-exit", 7, 46, 2);
+        stream
+            .append_record(ShadowV2Record::PoolStateSampleV2(pool_exit.clone()))
+            .unwrap();
+
+        let mut exit_fill_order = event_order_key(Some(47), Some(0));
+        exit_fill_order.event_seq_in_process = 8;
+        let exit_config = ShadowExitFillModelConfig::bonding_curve(
+            10_000_000_000,
+            150,
+            100,
+            SHADOW_V2_EXIT_FILL_MODEL_VERSION,
+        );
+        let exit_fill = ShadowExitFillV2::from_static_sell_model(
+            test_envelope("shadow_exit_fill_v2", "pos-a", "exit-fill-a"),
+            exit_fill_order,
+            &pool_exit,
+            &exit_config,
+        );
+        assert_eq!(exit_fill.fill_status, FillStatus::Filled);
+        stream
+            .append_record(ShadowV2Record::ShadowExitFillV2(exit_fill))
+            .unwrap();
+
+        let mut terminal = terminal_record("pos-a", "event-terminal-a");
+        terminal.terminal_reason = TerminalReasonV2::Target;
+        terminal.final_pnl_mark_bps = Some(650);
+        terminal.final_pnl_executable_bps = Some(580);
+        terminal.close_age_ms = Some(2_000);
+        terminal.linked_entry_fill = Some("entry-fill-a".to_string());
+        terminal.linked_exit_fill = Some("exit-fill-a".to_string());
+        stream
+            .append_record(ShadowV2Record::ShadowTerminalTruthV2(terminal))
+            .unwrap();
+
+        stream
     }
 
     fn canonical_pool_state() -> CanonicalPoolState {
@@ -3304,24 +3929,197 @@ mod tests {
     }
 
     #[test]
-    fn replay_v2_is_marked_as_derived_from_canonical_stream() {
-        let replay = ShadowReplayV2 {
-            envelope: ShadowV2Envelope::contract_header(
-                "shadow_replay_v2",
-                "run",
-                "pos",
-                "event",
-                "pool",
-                "mint",
-            ),
-            canonical_event_stream_ref: "shadow_position_event_v2.jsonl#event".to_string(),
-            mark_replay_ref: Some("shadow_replay_v2.jsonl#mark".to_string()),
-            executable_replay_ref: None,
-            coverage_metadata_ref: "coverage.json#pos".to_string(),
-            derived_from_canonical_stream: true,
-        };
+    fn shadow_v2_replay_derive_from_canonical_stream_separates_lanes() {
+        let stream = closed_canonical_stream_for_pr8_pr9();
+        let replay = ShadowReplayV2::derive_from_canonical_stream(
+            test_envelope("shadow_replay_v2", "pos-a", "replay-derived-a"),
+            &stream,
+            "pos-a",
+            "shadow_position_event_v2.jsonl",
+        )
+        .unwrap();
 
         assert!(replay.derived_from_canonical_stream);
+        assert_eq!(replay.envelope.schema, "shadow_replay_v2");
+        assert_eq!(replay.envelope.simulation_level, SimulationLevel::MarkOnly);
+        assert_eq!(
+            replay.envelope.measurement_grade,
+            MeasurementGrade::MarkPriceReplay
+        );
+        assert_eq!(
+            replay.replay_derivation_status,
+            "REPLAY_DERIVED_FROM_CANONICAL_TERMINAL"
+        );
+        assert_eq!(
+            replay.canonical_terminal_event_id.as_deref(),
+            Some("event-terminal-a")
+        );
+        assert_eq!(
+            replay.terminal_truth_event_id.as_deref(),
+            Some("event-terminal-a")
+        );
+        assert_eq!(replay.entry_fill_event_id.as_deref(), Some("entry-fill-a"));
+        assert_eq!(
+            replay.exit_attempt_event_id.as_deref(),
+            Some("exit-attempt-a")
+        );
+        assert_eq!(replay.exit_fill_event_id.as_deref(), Some("exit-fill-a"));
+        assert_eq!(replay.path_sample_event_ids.len(), 2);
+        assert_eq!(replay.mark_path_sample_count, 2);
+        assert_eq!(replay.executable_quote_sample_count, 1);
+        assert_eq!(replay.blocked_path_sample_count, 0);
+        assert_eq!(replay.terminal_reason, Some(TerminalReasonV2::Target));
+        assert_eq!(replay.terminal_pnl_mark_bps, Some(650));
+        assert_eq!(replay.terminal_pnl_executable_bps, Some(580));
+        assert_eq!(replay.close_age_ms, Some(2_000));
+        assert!(replay.mark_replay_ref.is_some());
+        assert!(replay.executable_replay_ref.is_some());
+        assert!(replay
+            .envelope
+            .limitations
+            .contains(&"REPLAY_V2_DERIVED_VIEW_NOT_CANONICAL_TRUTH".to_string()));
+        assert!(replay
+            .envelope
+            .limitations
+            .contains(&"MARK_REPLAY_NOT_EXECUTABLE_FILL".to_string()));
+    }
+
+    #[test]
+    fn shadow_v2_lifecycle_derive_from_same_canonical_terminal_truth() {
+        let stream = closed_canonical_stream_for_pr8_pr9();
+        let lifecycle = ShadowLifecycleV2::derive_from_canonical_stream(
+            test_envelope("shadow_lifecycle_v2", "pos-a", "lifecycle-derived-a"),
+            &stream,
+            "pos-a",
+            "shadow_position_event_v2.jsonl",
+        )
+        .unwrap();
+
+        assert!(lifecycle.derived_from_canonical_stream);
+        assert!(lifecycle.derived_view_not_canonical_terminal);
+        assert_eq!(lifecycle.envelope.schema, "shadow_lifecycle_v2");
+        assert_eq!(
+            lifecycle.lifecycle_event_type,
+            ShadowLifecycleEventTypeV2::PositionClosed
+        );
+        assert_eq!(
+            lifecycle.canonical_position_event_id.as_deref(),
+            Some("event-position")
+        );
+        assert_eq!(
+            lifecycle.canonical_terminal_event_id.as_deref(),
+            Some("event-terminal-a")
+        );
+        assert_eq!(
+            lifecycle.entry_fill_event_id.as_deref(),
+            Some("entry-fill-a")
+        );
+        assert_eq!(
+            lifecycle.exit_attempt_event_id.as_deref(),
+            Some("exit-attempt-a")
+        );
+        assert_eq!(lifecycle.exit_fill_event_id.as_deref(), Some("exit-fill-a"));
+        assert_eq!(lifecycle.terminal_reason, Some(TerminalReasonV2::Target));
+        assert_eq!(lifecycle.final_pnl_mark_bps, Some(650));
+        assert_eq!(lifecycle.final_pnl_executable_bps, Some(580));
+        assert_eq!(lifecycle.close_age_ms, Some(2_000));
+        assert_eq!(
+            lifecycle.duplicate_terminal_handling,
+            "DERIVED_LIFECYCLE_VIEW_DOES_NOT_CREATE_CANONICAL_TERMINAL_TRUTH"
+        );
+        assert_eq!(
+            lifecycle.reconciliation_status,
+            "LIFECYCLE_DERIVED_FROM_CANONICAL_TERMINAL"
+        );
+        assert!(lifecycle
+            .envelope
+            .limitations
+            .contains(&"LIFECYCLE_V2_DERIVED_VIEW_NOT_CANONICAL_TERMINAL_TRUTH".to_string()));
+    }
+
+    #[test]
+    fn shadow_v2_lifecycle_sub_event_does_not_create_duplicate_terminal_truth() {
+        let mut stream = closed_canonical_stream_for_pr8_pr9();
+        let lifecycle = ShadowLifecycleV2::derive_from_canonical_stream(
+            test_envelope("shadow_lifecycle_v2", "pos-a", "lifecycle-derived-a"),
+            &stream,
+            "pos-a",
+            "shadow_position_event_v2.jsonl",
+        )
+        .unwrap();
+
+        let lifecycle_event = stream
+            .append_record(ShadowV2Record::ShadowLifecycleV2(lifecycle))
+            .unwrap();
+
+        assert_eq!(
+            lifecycle_event.event_kind,
+            ShadowPositionEventKindV2::LifecycleSubEvent
+        );
+        assert!(!lifecycle_event.is_canonical_terminal());
+        assert!(lifecycle_event.canonical_terminal_event_id.is_none());
+        assert_eq!(stream.terminal_event_id("pos-a"), Some("event-terminal-a"));
+
+        let duplicate_terminal = stream
+            .append_record(ShadowV2Record::ShadowTerminalTruthV2(terminal_record(
+                "pos-a",
+                "event-terminal-b",
+            )))
+            .unwrap_err();
+        assert!(matches!(
+            duplicate_terminal,
+            ShadowV2Error::DuplicateTerminalTruth {
+                ref existing_terminal_event_id,
+                ref attempted_terminal_event_id,
+                ..
+            } if existing_terminal_event_id == "event-terminal-a"
+                && attempted_terminal_event_id == "event-terminal-b"
+        ));
+    }
+
+    #[test]
+    fn shadow_v2_replay_lifecycle_reconciliation_uses_exact_join_only() {
+        let stream = closed_canonical_stream_for_pr8_pr9();
+        let replay = ShadowReplayV2::derive_from_canonical_stream(
+            test_envelope("shadow_replay_v2", "pos-a", "replay-derived-a"),
+            &stream,
+            "pos-a",
+            "shadow_position_event_v2.jsonl",
+        )
+        .unwrap();
+        let mut lifecycle = ShadowLifecycleV2::derive_from_canonical_stream(
+            test_envelope("shadow_lifecycle_v2", "pos-a", "lifecycle-derived-a"),
+            &stream,
+            "pos-a",
+            "shadow_position_event_v2.jsonl",
+        )
+        .unwrap();
+
+        let reconciled = reconcile_replay_lifecycle_v2(&replay, &lifecycle).unwrap();
+        assert!(reconciled.exact_join);
+        assert!(!reconciled.fallback_join_used);
+        assert!(!reconciled.ambiguous_join);
+        assert!(reconciled.canonical_terminal_event_id_match);
+        assert!(reconciled.terminal_reason_match);
+        assert!(reconciled.final_pnl_mark_match);
+        assert!(reconciled.final_pnl_executable_match);
+        assert!(reconciled.close_age_match);
+        assert_eq!(
+            reconciled.reconciliation_status,
+            "REPLAY_LIFECYCLE_RECONCILED_FROM_CANONICAL_STREAM"
+        );
+
+        lifecycle.envelope.pool_id = "other-pool".to_string();
+        let mismatch = reconcile_replay_lifecycle_v2(&replay, &lifecycle).unwrap();
+        assert!(!mismatch.exact_join);
+        assert!(!mismatch.fallback_join_used);
+        assert_eq!(
+            mismatch.reconciliation_status,
+            "REPLAY_LIFECYCLE_EXACT_JOIN_KEY_MISMATCH"
+        );
+        assert!(mismatch
+            .limitations
+            .contains(&"NO_FALLBACK_JOIN_ACCEPTED".to_string()));
     }
 
     #[test]
