@@ -23,13 +23,25 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
       - name: Python syntax and unit tests
         run: |
           python3 -m py_compile scripts/guard_restore_shadow_lifecycle.py scripts/test_guard_restore_shadow_lifecycle.py
           python3 -m unittest scripts.test_guard_restore_shadow_lifecycle -v
       - name: Restore guard without runtime smoke
         run: |
-          python3 scripts/guard_restore_shadow_lifecycle.py --skip-runtime --output-dir /tmp/restore_guard_static --json
+          python3 scripts/guard_restore_shadow_lifecycle.py --skip-runtime --output-dir /tmp/restore_guard_static --json || {
+            status=$?
+            for log in /tmp/restore_guard_static/commands/*.log; do
+              echo "::group::${log}"
+              tail -n 160 "${log}" || true
+              echo "::endgroup::"
+            done
+            exit "${status}"
+          }
 
   level2-runtime:
     name: Level 2 runtime restore guard
@@ -45,6 +57,10 @@ jobs:
       GHOST_TRIGGER_KEYPAIR_PATH: ${{ secrets.GHOST_TRIGGER_KEYPAIR_PATH }}
     steps:
       - uses: actions/checkout@v4
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
       - name: Full restore runtime guard
         run: |
           OUT_DIR="reports/selector/restore_lifecycle_guard_$(date -u +%Y%m%dT%H%M%SZ)"

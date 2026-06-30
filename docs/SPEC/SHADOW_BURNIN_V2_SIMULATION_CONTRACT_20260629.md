@@ -240,6 +240,21 @@ Entry V2 must separate:
 - `entry_quote_price`
 - `entry_fill_price`
 
+PR5-level schema fields:
+
+- `shadow_entry_attempt_v2.decision_mark_price`
+- `shadow_entry_attempt_v2.entry_quote_price`
+- `shadow_entry_attempt_v2.entry_quote_tokens_out`
+- `shadow_entry_attempt_v2.entry_quote_min_out`
+- `shadow_entry_fill_v2.fill_price`
+- `shadow_entry_fill_v2.fill_price_source`
+- `shadow_entry_fill_v2.fill_amount_sol`
+- `shadow_entry_fill_v2.fill_amount_tokens`
+- `shadow_entry_fill_v2.slippage_bps`
+- `shadow_entry_fill_v2.own_impact_bps`
+- `shadow_entry_fill_v2.fee_bps`
+- `shadow_entry_fill_v2.min_out`
+
 Entry fill status:
 
 - `FILLED`
@@ -256,6 +271,109 @@ Entry fill is not live-equivalent unless it includes:
 - min-out,
 - latency/landing model,
 - failure/no-fill model.
+
+### PR4 Deterministic Price Reconstruction Contract
+
+PR4 introduces an inert formula library:
+
+```text
+ghost-core/src/shadow_v2_price.rs
+```
+
+Formula version:
+
+```text
+shadow_v2_constant_product_price_v1
+```
+
+The library reconstructs:
+
+- normalized mark price from reserves, token decimals and lamports-per-SOL;
+- constant-product BUY quote;
+- constant-product SELL quote;
+- fee amount in bps;
+- configured slippage tolerance and `min_out`;
+- own impact bps separated from fee bps;
+- post-trade deterministic reserve state.
+
+Rounding contract:
+
+- BUY output must be computed as
+  `floor(token_reserves_raw * effective_sol_in / (sol_reserves_lamports + effective_sol_in))`;
+- SELL output must be computed as
+  `floor(sol_reserves_lamports * token_in_raw / (token_reserves_raw + token_in_raw))`;
+- the implementation must not compute output as
+  `reserve_before - floor(k / post_reserve)`, because that can overstate output
+  by one raw unit;
+- off-by-one rounding fixtures are required for BUY and SELL.
+
+The formula library must reject:
+
+- zero SOL reserves;
+- zero token reserves;
+- zero input amount;
+- invalid fee bps;
+- invalid slippage bps;
+- missing SOL lamports normalization;
+- unsupported token decimals;
+- zero-output quotes.
+
+PR4 is not runtime execution. It does not read live state, submit transactions,
+change BUY/REJECT, change Gatekeeper policy, change selector runtime, change
+TX/Jito path, enable `shadow_close_only`, or enable active close.
+
+### PR5 Static Entry Fill Contract
+
+PR5 introduces an inert static entry fill model in:
+
+```text
+ghost-brain/src/guardian/post_buy/shadow_v2.rs
+```
+
+Model version:
+
+```text
+shadow_v2_entry_fill_static_constant_product_v1
+```
+
+The model may emit `FILLED` only when:
+
+- the referenced `pool_state_sample_v2` is research-ready;
+- the pool-state temporal class is allowed for the entry causal boundary;
+- `pool_state_sample_v2.event_order_key` is strictly before the entry fill
+  event boundary;
+- future pool state, equal process sequence, unknown fill slot, missing fill
+  wall-clock observation, or incomplete same-slot order emits
+  `BLOCKED_BY_DATA`;
+- reserve provenance exists for the selected pool phase;
+- token decimals and lamports normalization are explicit;
+- input SOL lamports are non-zero;
+- fee and slippage bps are valid;
+- deterministic quote reconstruction succeeds.
+
+Otherwise it must emit:
+
+```text
+fill_status = BLOCKED_BY_DATA
+reconstruction_status = ENTRY_FILL_BLOCKED_BY_DATA
+```
+
+with explicit blockers in `limitations`.
+
+PR5 static entry fill is:
+
+- `simulation_level = FILL_MODEL_STATIC`;
+- `measurement_grade = RESEARCH_GRADE_CANDIDATE` only for filled static model records;
+- `measurement_grade = BLOCKED_BY_DATA` for blocked records;
+- not `LIVE_CONFIRMED`;
+- not live-equivalent without PR14 live-confirmed calibration.
+
+PR5 intentionally records limitations such as:
+
+- no live landing confirmation;
+- no failed transaction/no-fill telemetry;
+- slippage is configured tolerance, not realized live slippage;
+- pool state after fill is deterministic derived state, not observed account state.
 
 ## Exit Contract
 
