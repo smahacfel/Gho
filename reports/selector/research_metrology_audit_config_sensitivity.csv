@@ -1,0 +1,6 @@
+family,source_file,rows,pass_count,positive_count,negative_count,sign_flip_count,robust_negative_conclusion,status,notes
+TSV2_A3,reports/selector/tsv2_a3_two_scope_fixed_cell_intersection.csv,2160,0,,,665,True,PASS,fixed_cell_passing_both_count_zero
+RUG_MARKUP_A0,reports/selector/rug_markup_a0_summary.csv,240,0,0,240,,True,PASS,no_promising_row_under_fixed_grid
+RTP_A0,reports/selector/rtp_a0_guard_summary.csv,144,0,0,144,,True,PASS,no_guard_pass
+ORG_A0,reports/selector/shadow-burnin-v3-r48-r38-repeat-threshold-probe-target60-stop60-exit-replay-r2/organic_candidate_policy_summary.csv,13,0,12,1,,True,PASS,median_gate_blocks_positive_tail_rows
+RCE_A0,reports/selector/rce_a0_summary.csv,1,0,0,0,,True,PASS,RCE_BLOCKED_BY_DATA

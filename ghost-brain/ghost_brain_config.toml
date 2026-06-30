@@ -24,14 +24,14 @@ min_sol_threshold = 0.001
 # ── Phase 1: Quantity Gate ─────────────────────────────────────────────────────
 # Dataset collector: celowo niskie minima, żeby zbierać szeroki universe
 # terminalnych rows/counterfactual candidates w godzinach, nie tygodniach.
-min_tx_count = 3
-min_unique_signers = 2
-min_buy_count = 2
+min_tx_count = 55
+min_unique_signers = 41
+min_buy_count = 39
 
 
 # Finalna ewaluacja nadal zbiera wczesne okno; nie wydłużamy go agresywnie.
 # P0: Extended window needs 10s; invariant extended_window_ms <= max_wait_time_ms.
-max_wait_time_ms = 10000
+max_wait_time_ms = 11111
 
 # ── Phase 2: Velocity Profile ──────────────────────────────────────────────────
 # SURVIVAL FILTER: avg_interval_ms ≤ 400 is the PRIMARY momentum detector
@@ -40,7 +40,7 @@ max_wait_time_ms = 10000
 min_interval_cv = 0.0
 max_burst_ratio = 9999.0
 min_avg_interval_ms = 0.0
-max_avg_interval_ms = 950.0
+max_avg_interval_ms = 222.0
 min_timing_entropy = 0.0
 min_dust_filtered_count = 0
 max_interval_cv = 9.3
@@ -64,11 +64,11 @@ max_same_ms_tx_ratio = 0.99
 min_buy_ratio = 0.50
 max_buy_ratio = 1.0
 min_sol_buy_ratio = 0.0
-max_sol_buy_ratio = 0.96
+max_sol_buy_ratio = 0.99
 min_avg_tx_sol = 0.01
 max_avg_tx_sol = 9999.0
 min_volume_cv = 0.01
-min_total_volume_sol = 0.25
+min_total_volume_sol = 70
 max_volume_cv = 9999.0
 max_total_volume_sol = 999999.0
 min_consecutive_buys = 2
@@ -79,7 +79,7 @@ min_consecutive_buys = 2
 min_dev_buy_sol = 0.0
 max_dev_buy_sol = 10.0
 max_dev_tx_ratio = 0.99
-max_dev_volume_ratio = 0.93
+max_dev_volume_ratio = 0.2
 min_dev_volume_ratio = 0.0
 min_dev_tx_ratio = 0.0
 reject_on_dev_sell = false
@@ -94,9 +94,9 @@ max_price_change_ratio = 9.50
 max_single_tx_price_impact_pct = 9999.0
 min_single_sell_impact_pct = 0.0
 max_single_sell_impact_pct = 9999.0
-max_bonding_progress_pct = 99.0
-min_bonding_progress_pct = 4.0
-min_market_cap_sol = 5.0
+max_bonding_progress_pct = 70.0
+min_bonding_progress_pct = 30.0
+min_market_cap_sol = 115.0
 
 # ── Decision ────────────────────────────────────────────────────────────────────
 # 3-layer decision ON: tokeny nie giną od razu przy lekkim przekroczeniu progów —
