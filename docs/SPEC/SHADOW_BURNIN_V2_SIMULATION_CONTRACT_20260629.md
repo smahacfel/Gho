@@ -3,7 +3,7 @@
 ## Status
 
 ```text
-PR6_PR7_COMPLETED_ON_PR_BRANCH_PENDING_REVIEW
+PR8_PR9_COMPLETED_ON_PR_BRANCH_PENDING_REVIEW
 ```
 
 Ten dokument definiuje kontrakt Shadow Burnin Simulation V2. Nie aktywuje runtime, nie zmienia BUY/REJECT, nie zmienia Gatekeeper policy, nie zmienia selector runtime, nie zmienia TX/Jito/live path, nie włącza `shadow_close_only` i nie włącza active close.
@@ -131,6 +131,7 @@ Minimum required records:
 - `shadow_exit_fill_v2`
 - `shadow_terminal_truth_v2`
 - `shadow_replay_v2`
+- `shadow_lifecycle_v2`
 
 PR1-level Rust contract types include `ShadowPositionV2` and the schema vocabulary for all records above. PR2 owns durable canonical writer/indexing invariants for `shadow_position_event_v2.jsonl`, including duplicate event and duplicate terminal rejection.
 
@@ -141,6 +142,14 @@ shadow_position_event_v2.jsonl
 ```
 
 Derived outputs must point back to canonical `event_id` and must not become competing truths.
+
+PR8/PR9-level Rust contract types add pure derived projections for:
+
+- `shadow_replay_v2`
+- `shadow_lifecycle_v2`
+
+These projections are generated from `shadow_position_event_v2` in memory in
+the current PR branch. They do not activate a runtime writer.
 
 ## Event Order Key
 
@@ -588,6 +597,56 @@ Each `position_id` may have exactly one canonical terminal event.
 
 Duplicate terminal lifecycle rows are allowed only as typed sub-events or derived views. Silent duplicate terminal truth is invalid.
 
+## PR8 Replay V2 Derived View Contract
+
+PR8 defines `shadow_replay_v2` as a derived view from the canonical event
+stream, not a second position truth.
+
+Required PR8 invariants:
+
+- replay is derived from `shadow_position_event_v2`;
+- replay carries `canonical_event_stream_ref`;
+- replay carries the canonical terminal event id when terminal truth exists;
+- replay carries source canonical event ids;
+- replay separates mark path samples from static executable quote/fill lane;
+- replay emits mark path counts and static executable lane counts;
+- replay limitations must include `REPLAY_V2_DERIVED_VIEW_NOT_CANONICAL_TRUTH`;
+- replay limitations must include `MARK_REPLAY_NOT_EXECUTABLE_FILL`;
+- static executable lane remains `FILL_MODEL_STATIC`, not `LIVE_CONFIRMED`;
+- missing canonical position events are an error, not an empty success.
+
+PR8 does not write V1 `shadow_exit_replay_v1`, does not change the old replay
+writer and does not make mark/path evidence live-equivalent.
+
+## PR9 Lifecycle V2 Derived View Contract
+
+PR9 defines `shadow_lifecycle_v2` as a lifecycle projection from the same
+canonical event stream.
+
+Required PR9 invariants:
+
+- lifecycle is derived from `shadow_position_event_v2`;
+- lifecycle carries `canonical_event_stream_ref`;
+- lifecycle carries source canonical event ids;
+- lifecycle references the canonical position event and canonical terminal
+  event when present;
+- lifecycle event type is a typed sub-event such as `POSITION_OPEN`,
+  `POSITION_CLOSED` or `TERMINAL_BLOCKED`;
+- lifecycle sub-events are not canonical terminal truth;
+- appending a lifecycle sub-event must not consume the one-terminal invariant;
+- lifecycle limitations must include
+  `LIFECYCLE_V2_DERIVED_VIEW_NOT_CANONICAL_TERMINAL_TRUTH`;
+- lifecycle limitations must include
+  `LIFECYCLE_V2_DOES_NOT_IMPLY_LIVE_POSITION_STATE`;
+- replay/lifecycle reconciliation must use exact join key only:
+  `run_id`, `session_id`, `position_id`, `pool_id`, `base_mint`;
+- fallback joins are not accepted;
+- exact join mismatch is reported as
+  `REPLAY_LIFECYCLE_EXACT_JOIN_KEY_MISMATCH`, not silently repaired.
+
+PR9 does not activate shadow close, active close, live sell, runtime lifecycle
+behavior or any strategy proof.
+
 ## PR12 Boundary
 
 PR12 is:
@@ -662,9 +721,9 @@ SHADOW_V2_RESEARCH_GRADE_ONLY
 
 ## Runtime Boundary
 
-PR6/PR7 remain side-by-side Shadow V2 simulation contracts and fixtures only.
+PR8/PR9 remain side-by-side Shadow V2 simulation contracts and fixtures only.
 
-Forbidden in PR6/PR7:
+Forbidden in PR8/PR9:
 
 - runtime writer activation,
 - lifecycle behavior change,
