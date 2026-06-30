@@ -3,7 +3,7 @@
 ## Status
 
 ```text
-PR1_CONTRACT_DEFINED
+PR6_PR7_COMPLETED_ON_PR_BRANCH_PENDING_REVIEW
 ```
 
 Ten dokument definiuje kontrakt Shadow Burnin Simulation V2. Nie aktywuje runtime, nie zmienia BUY/REJECT, nie zmienia Gatekeeper policy, nie zmienia selector runtime, nie zmienia TX/Jito/live path, nie włącza `shadow_close_only` i nie włącza active close.
@@ -395,6 +395,193 @@ Exit fill is not live-equivalent unless it includes:
 
 Same-slot target/stop ambiguity must be explicitly represented.
 
+### PR6 Static Exit Fill Contract
+
+PR6 introduces an inert static exit fill model in:
+
+```text
+ghost-brain/src/guardian/post_buy/shadow_v2.rs
+```
+
+Model version:
+
+```text
+shadow_v2_exit_fill_static_constant_product_v1
+```
+
+The model may emit `FILLED` only when:
+
+- the referenced `pool_state_sample_v2` is research-ready;
+- the pool-state temporal class is allowed for the exit causal boundary;
+- `pool_state_sample_v2.event_order_key` is strictly before the exit fill
+  event boundary;
+- future pool state, equal process sequence, unknown fill slot, missing fill
+  wall-clock observation, or incomplete same-slot order emits
+  `BLOCKED_BY_DATA`;
+- reserve provenance exists for the selected pool phase;
+- token decimals and lamports normalization are explicit;
+- input token raw amount is non-zero;
+- fee and slippage bps are valid;
+- deterministic SELL quote reconstruction succeeds.
+
+Otherwise it must emit:
+
+```text
+fill_status = BLOCKED_BY_DATA
+reconstruction_status = EXIT_FILL_BLOCKED_BY_DATA
+```
+
+with explicit blockers in `limitations`.
+
+PR6 static exit fill is:
+
+- `simulation_level = FILL_MODEL_STATIC`;
+- `measurement_grade = RESEARCH_GRADE_CANDIDATE` only for filled static model records;
+- `measurement_grade = BLOCKED_BY_DATA` for blocked records;
+- not `LIVE_CONFIRMED`;
+- not live-equivalent without PR14 live-confirmed calibration;
+- not active close;
+- not `shadow_close_only`;
+- not an executable sell transaction.
+
+PR6 can also emit explicit modeled failure records:
+
+```text
+fill_status = NO_FILL
+fill_status = FAILED
+```
+
+These records are useful as typed simulation outcomes only. They do not prove
+failed live landing, no-fill, Jito behavior or sell execution without
+live-confirmed telemetry.
+
+PR6 intentionally records limitations such as:
+
+- no live exit transaction confirmation;
+- no failed transaction/no-fill telemetry;
+- slippage is configured tolerance, not realized live slippage;
+- pool state after fill is deterministic derived state, not observed account state;
+- static exit fill does not enable active close.
+
+### PR6 Exit Path Replay Contract
+
+PR6 also defines an inert path replay helper:
+
+```text
+replay_exit_from_path_v2
+```
+
+The helper is a deterministic mark/path replay contract. It is not an
+executable sell fill and it must not be treated as active close evidence.
+
+`shadow_exit_path_replay_v2` separates:
+
+- `exact_level_hit`: first target/stop evidence from `LEVEL_HIT` samples;
+- `sampled_path_hit`: first target/stop evidence from sampled path points;
+- `timeout_path_point`: actual path point used for timeout evidence, or an
+  explicit stale/blocked limitation;
+- `selected_exit`: selected mark/path exit after target/stop/timeout logic;
+- `mfe_mark_bps`, `mae_mark_bps`, `terminal_pnl_mark_bps`.
+
+Target and stop detection rules:
+
+- target and stop are evaluated only on samples with `age_ms <= max_hold_ms`;
+- exact-level and sampled-path evidence are recorded independently, even when
+  a sampled hit appears before a later exact-level marker;
+- exact-level evidence does not become executable sell fill evidence;
+- if target and stop have incomplete same-slot order and policy is
+  `BLOCK_AMBIGUOUS`, `selected_exit` becomes `BLOCKED_BY_DATA`;
+- if a tie-break policy is explicitly configured, the selected path result must
+  carry `SAME_SLOT_TIE_BREAK_*` limitations;
+- timeout uses a real path point at or before `max_hold_ms`; if only an older
+  last-known point exists, it is labeled as stale approximation;
+- if no path point exists before timeout, timeout is blocked by data.
+
+## Path Density Contract
+
+Path V2 must separate:
+
+- mark price path samples,
+- executable exit quote attachment,
+- path sampling mode,
+- sampling reason,
+- horizon coverage verdict.
+
+PR7 introduces three sampling modes:
+
+```text
+shadow_path_dense_3s
+shadow_path_standard_120s
+shadow_path_long_500s
+```
+
+Mode intent:
+
+- `shadow_path_dense_3s`: high-density short horizon for 2s/3s research;
+- `shadow_path_standard_120s`: standard path evidence up to 120s;
+- `shadow_path_long_500s`: long horizon evidence up to 500s, requiring an
+  explicit storage budget before use in a validation burnin.
+
+Sampling reasons are typed:
+
+```text
+EVENT_SAMPLE
+HEARTBEAT
+LEVEL_HIT
+LARGE_PRICE_DELTA
+TERMINAL
+```
+
+`LEVEL_HIT` and `TERMINAL` are must-keep samples.
+
+`shadow_path_dense_3s` additionally keeps every `EVENT_SAMPLE`. This is the
+only PR7 mode intended for 2s/3s fidelity research. It requires an explicit
+storage budget before a validation burnin.
+
+`max_path_points` is a storage cap for optional samples. It must not drop
+protected samples:
+
+- `LEVEL_HIT`;
+- `TERMINAL`;
+- `EVENT_SAMPLE` when `keep_every_event_sample = true`.
+
+If protected dense samples exceed `max_path_points`, the sampler must retain
+them and emit a storage-budget limitation instead of silently truncating the
+path. Optional samples may be truncated only with an explicit truncation flag
+and limitation.
+
+`shadow_path_long_500s` also requires an explicit storage budget before a
+validation burnin. It is the only PR7 mode intended to make 300s/500s horizons
+evaluable, and only when actual coverage exists.
+
+Horizon verdicts are:
+
+```text
+EVALUABLE_EXACT
+EVALUABLE_APPROX
+SPARSE_APPROX_ONLY
+NOT_EVALUABLE_NO_COVERAGE
+NOT_EVALUABLE_HORIZON_EXCEEDS_REPLAY
+```
+
+Rules:
+
+- Unsupported horizons must be reported as `NOT_EVALUABLE_*`, never inferred.
+- 2s/3s research requires dense-mode coverage or an explicit approximation
+  label.
+- 300s/500s research requires long-mode horizon coverage and generated density
+  evidence.
+- Same-slot incomplete ordering can remain ambiguous evidence only. It must not
+  resolve target/stop or win/loss without an explicit tie-break policy.
+- Mark path samples use `MARK_PRICE_REPLAY` until a static executable quote is
+  attached.
+- Static executable exit quote remains `FILL_MODEL_STATIC`, not live fill.
+- Density evaluation must emit duplicate-age and non-monotonic input metadata.
+  These labels do not rewrite the path; they make ordering defects visible to
+  downstream fidelity gates.
+- Sampler output may be truncated only for non-protected samples, and only with
+  an explicit truncation flag and limitation.
+
 ## Terminal Truth Contract
 
 Each `position_id` may have exactly one canonical terminal event.
@@ -475,9 +662,9 @@ SHADOW_V2_RESEARCH_GRADE_ONLY
 
 ## Runtime Boundary
 
-PR1 is schema and contract only.
+PR6/PR7 remain side-by-side Shadow V2 simulation contracts and fixtures only.
 
-Forbidden in PR1:
+Forbidden in PR6/PR7:
 
 - runtime writer activation,
 - lifecycle behavior change,
