@@ -52,6 +52,7 @@ Artefakty kontraktowe:
 
 - `docs/SPEC/SHADOW_BURNIN_V2_SIMULATION_CONTRACT_20260629.md`
 - `docs/ADR/ADR_8D_SHADOW_BURNIN_V2_PR4_PR5_PRICE_ENTRY_FILL_20260630.md`
+- `.github/workflows/restore-lifecycle-guard.yml`
 - `reports/selector/shadow_v2_acceptance_gates.csv`
 - `reports/selector/shadow_v2_remediation_workbreakdown.csv`
 - `reports/selector/shadow_v2_risk_register.csv`
@@ -95,6 +96,14 @@ PR5:
 - nie używa same-slot incomplete order jako exact fill evidence;
 - zwraca `BLOCKED_BY_DATA` zamiast syntetycznego `FILLED` dla future albo
   ambiguous state.
+
+CI diagnostics:
+
+- `Restore Lifecycle Guard` wypisuje `tail -n 160` z
+  `/tmp/restore_guard_static/commands/*.log`, jeżeli static guard step zwróci
+  failure;
+- zmiana dotyczy tylko widoczności błędów CI i nie zmienia listy guard tests,
+  skryptu guard ani runtime semantics.
 
 ## D6. Rejected Alternatives
 
@@ -153,7 +162,9 @@ GitHub Actions:
 ```text
 previous PR head d450cae4 failed Restore Lifecycle Guard
 local targeted restore command and local static guard no longer reproduce the failure
-new PR head must be checked after push
+PR head 0b2b758 still failed Restore Lifecycle Guard on GitHub merge ref 63341b40
+local merge-ref guard for 63341b40 passed
+next PR head must expose failed command log tail if GitHub runner still fails
 ```
 
 Runtime boundary:
