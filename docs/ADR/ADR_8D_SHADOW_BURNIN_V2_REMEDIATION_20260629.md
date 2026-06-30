@@ -133,6 +133,14 @@ git diff --check
 result: ok
 ```
 
+PR3 event-order clarification, 2026-06-30:
+
+```text
+slot=UNKNOWN blocks pool-state research-ready.
+non-slot UNKNOWN chain-order components are allowed only as ambiguous/non-exact evidence.
+non-slot UNKNOWN must not resolve target/stop or win/loss without an explicit tie-break policy.
+```
+
 Runtime boundary:
 
 ```text
