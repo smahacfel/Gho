@@ -25,6 +25,7 @@
 //! running on 12-hour cycles for long-term parameter optimization.
 
 use anyhow::{bail, Context, Result};
+use ghost_brain::config::ghost_brain_config::ShadowV2BurninConfig;
 use ghost_brain::config::{GatekeeperV2Config, GhostBrainConfig};
 use ghost_brain::oracle::SnapshotEngine;
 use ghost_brain::tuning::{BanditAlgorithm, TuningMessage, TuningService, TuningServiceConfig};
@@ -58,6 +59,7 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{read_keypair_file, Signer};
 use std::env;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
@@ -310,6 +312,91 @@ fn ensure_directory_writable(path: &Path, label: &str) -> Result<()> {
 fn ensure_parent_directory_writable(path: &Path, label: &str) -> Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     ensure_directory_writable(parent, label)
+}
+
+fn shadow_v2_required_config_path<'a>(
+    value: Option<&'a str>,
+    field_name: &'static str,
+) -> Result<&'a str> {
+    value
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Shadow V2 validation preflight missing {field_name}"))
+}
+
+fn run_shadow_v2_manifest_audit_command(
+    config: &ShadowV2BurninConfig,
+    args: &[String],
+) -> Result<()> {
+    let script = config.manifest_audit_script.trim();
+    if script.is_empty() {
+        bail!("Shadow V2 validation preflight missing manifest_audit_script");
+    }
+    let output = Command::new("python3")
+        .arg(script)
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to run Shadow V2 manifest audit script {script}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    bail!(
+        "Shadow V2 manifest audit failed status={} stdout={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+fn run_shadow_v2_validation_preflight_if_enabled(config: &ShadowV2BurninConfig) -> Result<()> {
+    if !config.enabled {
+        return Ok(());
+    }
+    config
+        .validate()
+        .context("SHADOW_V2_VALIDATION_PREFLIGHT_FAILED: invalid shadow_v2_burnin config")?;
+    let scope_root =
+        shadow_v2_required_config_path(config.scope_root_path.as_deref(), "scope_root_path")?;
+    let pre_run_manifest_path = shadow_v2_required_config_path(
+        config.pre_run_manifest_path.as_deref(),
+        "pre_run_manifest_path",
+    )?;
+    if !Path::new(pre_run_manifest_path).is_file() {
+        bail!(
+            "SHADOW_V2_VALIDATION_PREFLIGHT_FAILED: pre_run_manifest_path does not exist: {}",
+            pre_run_manifest_path
+        );
+    }
+    for (field_name, raw_path) in [
+        (
+            "canonical_event_stream_path",
+            config.canonical_event_stream_path.as_deref(),
+        ),
+        ("replay_v2_path", config.replay_v2_path.as_deref()),
+        ("lifecycle_v2_path", config.lifecycle_v2_path.as_deref()),
+        (
+            "path_density_v2_path",
+            config.path_density_v2_path.as_deref(),
+        ),
+    ] {
+        let path = shadow_v2_required_config_path(raw_path, field_name)?;
+        ensure_parent_directory_writable(Path::new(path), field_name)
+            .with_context(|| format!("SHADOW_V2_VALIDATION_PREFLIGHT_FAILED: {field_name}"))?;
+    }
+
+    let args = vec![
+        "--scope-root".to_string(),
+        scope_root.to_string(),
+        "--manifest-phase".to_string(),
+        "pre_run".to_string(),
+        "--schema-manifest".to_string(),
+        config.required_schema_manifest_path.clone(),
+        "--acceptance-gates".to_string(),
+        config.acceptance_gates_path.clone(),
+        "--strict".to_string(),
+    ];
+    run_shadow_v2_manifest_audit_command(config, &args)
+        .context("SHADOW_V2_VALIDATION_PREFLIGHT_FAILED: strict pre-run manifest audit failed")
 }
 
 fn derive_shadow_lifecycle_log_path(entry_log_path: &str) -> PathBuf {
@@ -1522,6 +1609,10 @@ async fn main() -> Result<()> {
         }
     };
 
+    if let Some(cfg) = ghost_brain_config.as_ref() {
+        run_shadow_v2_validation_preflight_if_enabled(&cfg.shadow_v2_burnin)?;
+    }
+
     // Re-load gatekeeper_v2_config now that ghost_brain_config is available (fallback path).
     gatekeeper_v2_config =
         load_gatekeeper_v2_config(&config.ghost_brain_config_path, ghost_brain_config.as_ref())?;
@@ -1961,6 +2052,9 @@ async fn main() -> Result<()> {
         account_state_core: Some(Arc::clone(oracle_runtime.account_state_core())),
         shadow_lifecycle_log_path,
         probe_lifecycle_log_path,
+        shadow_v2_burnin: ghost_brain_config
+            .as_ref()
+            .map(|brain| brain.shadow_v2_burnin.clone()),
     };
     let hydration_live_sell_handle = post_buy_config.live_sell.clone();
     let post_buy_handle = tokio::spawn(async move {

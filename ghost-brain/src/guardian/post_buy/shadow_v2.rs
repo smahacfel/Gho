@@ -1,18 +1,18 @@
 //! Shadow Burnin Simulation V2 contract types.
 //!
-//! These types are intentionally inert. The Shadow V2 PR1-PR9 foundation defines
-//! schema, validation vocabulary, canonical event guards, pool-state provenance,
-//! deterministic price/fill formulas, exit fill simulation, and path sampling
-//! helpers plus pure derived replay/lifecycle projections only. No runtime
-//! writer, lifecycle runtime path, replay runtime path, BUY/REJECT policy,
-//! selector, TX/Jito path, shadow_close_only path, or active close path consumes
-//! these records yet.
+//! These types remain decision-inert. The Shadow V2 foundation defines schema,
+//! validation vocabulary, canonical event guards, pool-state provenance,
+//! deterministic price/fill formulas, exit fill simulation, path sampling, and
+//! logging-only validation harness helpers. No BUY/REJECT policy, selector,
+//! TX/Jito path, shadow_close_only path, or active close path consumes these
+//! records.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use ghost_core::account_state_core::types::CanonicalPoolState;
 use ghost_core::{
@@ -30,6 +30,8 @@ pub const SHADOW_V2_REPLAY_DERIVATION_VERSION: &str =
     "shadow_v2_replay_derived_from_canonical_stream_v1";
 pub const SHADOW_V2_LIFECYCLE_DERIVATION_VERSION: &str =
     "shadow_v2_lifecycle_derived_from_canonical_stream_v1";
+pub const SHADOW_V2_VALIDATION_HARNESS_VERSION: &str =
+    "shadow_v2_validation_harness_logging_only_v1";
 pub const EVENT_ORDER_UNKNOWN_INDEX: u32 = u32::MAX;
 pub const EVENT_ORDER_UNKNOWN_SIGNATURE: &str = "UNKNOWN";
 
@@ -626,6 +628,9 @@ pub enum ShadowV2Error {
     MissingCanonicalPositionEvents {
         position_id: String,
     },
+    HarnessConfig {
+        reason: String,
+    },
     JsonlIndex {
         path: String,
         line_number: usize,
@@ -688,6 +693,9 @@ impl fmt::Display for ShadowV2Error {
                 f,
                 "shadow v2 canonical stream has no events for position {position_id}"
             ),
+            Self::HarnessConfig { reason } => {
+                write!(f, "shadow v2 validation harness config error: {reason}")
+            }
             Self::JsonlIndex {
                 path,
                 line_number,
@@ -2733,6 +2741,73 @@ pub struct ShadowPathHorizonEvaluationV2 {
     pub limitations: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShadowPathDensityV2 {
+    pub schema: String,
+    pub schema_version: u32,
+    pub run_id: String,
+    pub session_id: Option<String>,
+    pub position_id: String,
+    pub pool_id: String,
+    pub base_mint: String,
+    pub canonical_event_stream_ref: String,
+    pub source_path_sample_event_ids: Vec<String>,
+    pub source_canonical_high_watermark: String,
+    pub horizon_ms: u64,
+    pub verdict: ShadowPathHorizonVerdictV2,
+    pub path_points: usize,
+    pub coverage_points: usize,
+    pub replay_horizon_ms: Option<u64>,
+    pub first_path_point_age_ms: Option<u64>,
+    pub median_interval_ms: Option<u64>,
+    pub p90_interval_ms: Option<u64>,
+    pub max_interval_ms: Option<u64>,
+    pub duplicate_age_count: usize,
+    pub non_monotonic_input: bool,
+    pub truncated: bool,
+    pub limitations: Vec<String>,
+    pub created_at_wall_ms: u64,
+}
+
+impl ShadowPathDensityV2 {
+    pub fn from_evaluation(
+        high_watermark_event: &ShadowPositionEventV2,
+        canonical_event_stream_ref: impl Into<String>,
+        source_path_sample_event_ids: Vec<String>,
+        truncated: bool,
+        evaluation: ShadowPathHorizonEvaluationV2,
+        created_at_wall_ms: u64,
+    ) -> Self {
+        let canonical_event_stream_ref = canonical_event_stream_ref.into();
+        Self {
+            schema: "shadow_path_density_v2".to_string(),
+            schema_version: 1,
+            run_id: high_watermark_event.envelope.run_id.clone(),
+            session_id: high_watermark_event.envelope.session_id.clone(),
+            position_id: high_watermark_event.envelope.position_id.clone(),
+            pool_id: high_watermark_event.envelope.pool_id.clone(),
+            base_mint: high_watermark_event.envelope.base_mint.clone(),
+            canonical_event_stream_ref,
+            source_path_sample_event_ids,
+            source_canonical_high_watermark: high_watermark_event.envelope.event_id.clone(),
+            horizon_ms: evaluation.horizon_ms,
+            verdict: evaluation.verdict,
+            path_points: evaluation.path_points,
+            coverage_points: evaluation.coverage_points,
+            replay_horizon_ms: evaluation.replay_horizon_ms,
+            first_path_point_age_ms: evaluation.first_path_point_age_ms,
+            median_interval_ms: evaluation.median_interval_ms,
+            p90_interval_ms: evaluation.p90_interval_ms,
+            max_interval_ms: evaluation.max_interval_ms,
+            duplicate_age_count: evaluation.duplicate_age_count,
+            non_monotonic_input: evaluation.non_monotonic_input,
+            truncated,
+            limitations: evaluation.limitations,
+            created_at_wall_ms,
+        }
+    }
+}
+
 pub fn evaluate_path_density_v2(
     samples: &[ShadowPathSampleV2],
     config: &ShadowPathSamplerConfigV2,
@@ -3046,6 +3121,7 @@ pub struct ShadowTerminalTruthV2 {
 pub struct ShadowReplayV2 {
     pub envelope: ShadowV2Envelope,
     pub canonical_event_stream_ref: String,
+    pub source_canonical_high_watermark: String,
     pub mark_replay_ref: Option<String>,
     pub executable_replay_ref: Option<String>,
     pub coverage_metadata_ref: String,
@@ -3148,6 +3224,7 @@ impl ShadowReplayV2 {
         let canonical_terminal_event_id = terminal_truth
             .as_ref()
             .map(|record| record.envelope.event_id.clone());
+        let source_canonical_high_watermark = source_event_ids.last().cloned().unwrap_or_default();
 
         envelope.schema = "shadow_replay_v2".to_string();
         envelope.simulation_level = SimulationLevel::MarkOnly;
@@ -3192,6 +3269,7 @@ impl ShadowReplayV2 {
         Ok(Self {
             envelope,
             canonical_event_stream_ref: canonical_event_stream_ref.clone(),
+            source_canonical_high_watermark,
             mark_replay_ref: (!path_sample_event_ids.is_empty()).then(|| {
                 format!(
                     "{canonical_event_stream_ref}#mark_path_samples:{}",
@@ -3237,6 +3315,7 @@ impl ShadowReplayV2 {
 pub struct ShadowLifecycleV2 {
     pub envelope: ShadowV2Envelope,
     pub canonical_event_stream_ref: String,
+    pub source_canonical_high_watermark: String,
     pub derived_from_canonical_stream: bool,
     pub lifecycle_event_type: ShadowLifecycleEventTypeV2,
     pub canonical_position_event_id: Option<String>,
@@ -3321,6 +3400,7 @@ impl ShadowLifecycleV2 {
         let canonical_terminal_event_id = terminal_truth
             .as_ref()
             .map(|record| record.envelope.event_id.clone());
+        let source_canonical_high_watermark = source_event_ids.last().cloned().unwrap_or_default();
         let lifecycle_event_type =
             match terminal_truth.as_ref().map(|record| record.terminal_reason) {
                 Some(
@@ -3376,6 +3456,7 @@ impl ShadowLifecycleV2 {
         Ok(Self {
             envelope,
             canonical_event_stream_ref,
+            source_canonical_high_watermark,
             derived_from_canonical_stream: true,
             lifecycle_event_type,
             canonical_position_event_id,
@@ -3493,6 +3574,335 @@ pub fn reconcile_replay_lifecycle_v2(
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShadowV2WriteStatus {
+    Ok,
+    Err(String),
+    Skipped(String),
+}
+
+impl ShadowV2WriteStatus {
+    pub fn is_err(&self) -> bool {
+        matches!(self, Self::Err(_))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShadowV2ValidationEvidenceStatus {
+    Complete,
+    CanonicalWriteFailed,
+    DerivedArtifactWriteFailed,
+    DensityWriteFailed,
+    BlockedByData,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShadowV2HarnessAppendOutcome {
+    pub canonical_write: ShadowV2WriteStatus,
+    pub replay_write: ShadowV2WriteStatus,
+    pub lifecycle_write: ShadowV2WriteStatus,
+    pub density_write: ShadowV2WriteStatus,
+    pub validation_evidence_status: ShadowV2ValidationEvidenceStatus,
+}
+
+impl ShadowV2HarnessAppendOutcome {
+    fn canonical_failed(error: impl ToString) -> Self {
+        Self {
+            canonical_write: ShadowV2WriteStatus::Err(error.to_string()),
+            replay_write: ShadowV2WriteStatus::Skipped(
+                "CANONICAL_WRITE_FAILED_NO_DERIVED_REPLAY".to_string(),
+            ),
+            lifecycle_write: ShadowV2WriteStatus::Skipped(
+                "CANONICAL_WRITE_FAILED_NO_DERIVED_LIFECYCLE".to_string(),
+            ),
+            density_write: ShadowV2WriteStatus::Skipped(
+                "CANONICAL_WRITE_FAILED_NO_DENSITY".to_string(),
+            ),
+            validation_evidence_status: ShadowV2ValidationEvidenceStatus::CanonicalWriteFailed,
+        }
+    }
+
+    fn from_writes(
+        replay_write: ShadowV2WriteStatus,
+        lifecycle_write: ShadowV2WriteStatus,
+        density_write: ShadowV2WriteStatus,
+    ) -> Self {
+        let validation_evidence_status = if replay_write.is_err() || lifecycle_write.is_err() {
+            ShadowV2ValidationEvidenceStatus::DerivedArtifactWriteFailed
+        } else if density_write.is_err() {
+            ShadowV2ValidationEvidenceStatus::DensityWriteFailed
+        } else {
+            ShadowV2ValidationEvidenceStatus::Complete
+        };
+        Self {
+            canonical_write: ShadowV2WriteStatus::Ok,
+            replay_write,
+            lifecycle_write,
+            density_write,
+            validation_evidence_status,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ShadowV2ValidationHarnessConfig {
+    pub run_id: String,
+    pub canonical_event_stream_path: PathBuf,
+    pub replay_v2_path: PathBuf,
+    pub lifecycle_v2_path: PathBuf,
+    pub path_density_v2_path: PathBuf,
+    pub canonical_event_stream_ref: String,
+    pub path_sampler_config: ShadowPathSamplerConfigV2,
+    pub density_horizons_ms: Vec<u64>,
+}
+
+impl ShadowV2ValidationHarnessConfig {
+    pub fn new(
+        run_id: impl Into<String>,
+        canonical_event_stream_path: impl Into<PathBuf>,
+        replay_v2_path: impl Into<PathBuf>,
+        lifecycle_v2_path: impl Into<PathBuf>,
+        path_density_v2_path: impl Into<PathBuf>,
+    ) -> Self {
+        let canonical_event_stream_path = canonical_event_stream_path.into();
+        let canonical_event_stream_ref = canonical_event_stream_path.display().to_string();
+        Self {
+            run_id: run_id.into(),
+            canonical_event_stream_path,
+            replay_v2_path: replay_v2_path.into(),
+            lifecycle_v2_path: lifecycle_v2_path.into(),
+            path_density_v2_path: path_density_v2_path.into(),
+            canonical_event_stream_ref,
+            path_sampler_config: ShadowPathSamplerConfigV2::standard_120s(),
+            density_horizons_ms: vec![2_000, 3_000, 10_000, 30_000, 120_000, 300_000, 500_000],
+        }
+    }
+
+    pub fn from_burnin_config(
+        config: &crate::config::ghost_brain_config::ShadowV2BurninConfig,
+    ) -> Result<Option<Self>, ShadowV2Error> {
+        if !config.enabled {
+            return Ok(None);
+        }
+        config
+            .validate()
+            .map_err(|error| ShadowV2Error::HarnessConfig {
+                reason: error.to_string(),
+            })?;
+        let run_id = required_shadow_v2_burnin_path_component(
+            config.run_namespace.as_deref(),
+            "run_namespace",
+        )?;
+        let canonical_event_stream_path = required_shadow_v2_burnin_path_component(
+            config.canonical_event_stream_path.as_deref(),
+            "canonical_event_stream_path",
+        )?;
+        let replay_v2_path = required_shadow_v2_burnin_path_component(
+            config.replay_v2_path.as_deref(),
+            "replay_v2_path",
+        )?;
+        let lifecycle_v2_path = required_shadow_v2_burnin_path_component(
+            config.lifecycle_v2_path.as_deref(),
+            "lifecycle_v2_path",
+        )?;
+        let path_density_v2_path = required_shadow_v2_burnin_path_component(
+            config.path_density_v2_path.as_deref(),
+            "path_density_v2_path",
+        )?;
+        Ok(Some(Self::new(
+            run_id,
+            canonical_event_stream_path,
+            replay_v2_path,
+            lifecycle_v2_path,
+            path_density_v2_path,
+        )))
+    }
+}
+
+fn required_shadow_v2_burnin_path_component(
+    value: Option<&str>,
+    field_name: &'static str,
+) -> Result<String, ShadowV2Error> {
+    let trimmed = value.unwrap_or_default().trim();
+    if trimmed.is_empty() {
+        return Err(ShadowV2Error::HarnessConfig {
+            reason: format!("missing {field_name}"),
+        });
+    }
+    Ok(trimmed.to_string())
+}
+
+#[derive(Debug)]
+pub struct ShadowV2ValidationHarness {
+    config: ShadowV2ValidationHarnessConfig,
+    canonical_writer: JsonlShadowV2CanonicalWriter,
+}
+
+impl ShadowV2ValidationHarness {
+    pub fn new(config: ShadowV2ValidationHarnessConfig) -> Result<Self, ShadowV2Error> {
+        let canonical_writer =
+            JsonlShadowV2CanonicalWriter::new(config.canonical_event_stream_path.clone())?;
+        Ok(Self {
+            config,
+            canonical_writer,
+        })
+    }
+
+    pub fn append_record(&mut self, record: ShadowV2Record) -> ShadowV2HarnessAppendOutcome {
+        if matches!(
+            record,
+            ShadowV2Record::ShadowReplayV2(_) | ShadowV2Record::ShadowLifecycleV2(_)
+        ) {
+            return ShadowV2HarnessAppendOutcome::canonical_failed(
+                "HARNESS_REJECTS_DERIVED_RECORD_AS_CANONICAL_INPUT",
+            );
+        }
+
+        let position_id = record.envelope().position_id.clone();
+        if let Err(error) = self.canonical_writer.append_record(record) {
+            return ShadowV2HarnessAppendOutcome::canonical_failed(error);
+        }
+
+        let replay_write = self.write_replay_snapshot(&position_id);
+        let lifecycle_write = self.write_lifecycle_snapshot(&position_id);
+        let density_write = self.write_path_density_snapshots(&position_id);
+        ShadowV2HarnessAppendOutcome::from_writes(replay_write, lifecycle_write, density_write)
+    }
+
+    pub fn canonical_stream(&self) -> &ShadowV2CanonicalEventStream {
+        self.canonical_writer.stream()
+    }
+
+    pub fn canonical_event_stream_path(&self) -> &Path {
+        self.canonical_writer.path()
+    }
+
+    fn write_replay_snapshot(&self, position_id: &str) -> ShadowV2WriteStatus {
+        let Some(high_watermark) = self.high_watermark_for_position(position_id) else {
+            return ShadowV2WriteStatus::Skipped("NO_CANONICAL_HIGH_WATERMARK".to_string());
+        };
+        let envelope = derived_snapshot_envelope("shadow_replay_v2", "replay_v2", high_watermark);
+        match ShadowReplayV2::derive_from_canonical_stream(
+            envelope,
+            self.canonical_writer.stream(),
+            position_id,
+            self.config.canonical_event_stream_ref.clone(),
+        )
+        .and_then(|replay| append_jsonl_record(&self.config.replay_v2_path, &replay))
+        {
+            Ok(()) => ShadowV2WriteStatus::Ok,
+            Err(error) => ShadowV2WriteStatus::Err(error.to_string()),
+        }
+    }
+
+    fn write_lifecycle_snapshot(&self, position_id: &str) -> ShadowV2WriteStatus {
+        let Some(high_watermark) = self.high_watermark_for_position(position_id) else {
+            return ShadowV2WriteStatus::Skipped("NO_CANONICAL_HIGH_WATERMARK".to_string());
+        };
+        let envelope =
+            derived_snapshot_envelope("shadow_lifecycle_v2", "lifecycle_v2", high_watermark);
+        match ShadowLifecycleV2::derive_from_canonical_stream(
+            envelope,
+            self.canonical_writer.stream(),
+            position_id,
+            self.config.canonical_event_stream_ref.clone(),
+        )
+        .and_then(|lifecycle| append_jsonl_record(&self.config.lifecycle_v2_path, &lifecycle))
+        {
+            Ok(()) => ShadowV2WriteStatus::Ok,
+            Err(error) => ShadowV2WriteStatus::Err(error.to_string()),
+        }
+    }
+
+    fn write_path_density_snapshots(&self, position_id: &str) -> ShadowV2WriteStatus {
+        let Some(high_watermark) = self.high_watermark_for_position(position_id) else {
+            return ShadowV2WriteStatus::Skipped("NO_CANONICAL_HIGH_WATERMARK".to_string());
+        };
+        let path_samples = self.path_samples_for_position(position_id);
+        let selected_samples =
+            select_path_samples_v2(&path_samples, &self.config.path_sampler_config);
+        let source_path_sample_event_ids = selected_samples
+            .iter()
+            .map(|sample| sample.envelope.event_id.clone())
+            .collect::<Vec<_>>();
+        let truncated = selected_samples.iter().any(|sample| sample.truncated);
+        let evaluations = evaluate_path_density_v2(
+            &selected_samples,
+            &self.config.path_sampler_config,
+            &self.config.density_horizons_ms,
+        );
+        let created_at_wall_ms = shadow_v2_now_ms();
+        for evaluation in evaluations {
+            let row = ShadowPathDensityV2::from_evaluation(
+                high_watermark,
+                self.config.canonical_event_stream_ref.clone(),
+                source_path_sample_event_ids.clone(),
+                truncated,
+                evaluation,
+                created_at_wall_ms,
+            );
+            if let Err(error) = append_jsonl_record(&self.config.path_density_v2_path, &row) {
+                return ShadowV2WriteStatus::Err(error.to_string());
+            }
+        }
+        ShadowV2WriteStatus::Ok
+    }
+
+    fn high_watermark_for_position(&self, position_id: &str) -> Option<&ShadowPositionEventV2> {
+        self.canonical_writer
+            .stream()
+            .events()
+            .iter()
+            .rev()
+            .find(|event| event.envelope.position_id == position_id)
+    }
+
+    fn path_samples_for_position(&self, position_id: &str) -> Vec<ShadowPathSampleV2> {
+        self.canonical_writer
+            .stream()
+            .events_for_position(position_id)
+            .into_iter()
+            .filter(|event| event.event_kind == ShadowPositionEventKindV2::PathSample)
+            .filter_map(|event| match shadow_v2_record_from_event(event) {
+                Ok(ShadowV2Record::ShadowPathSampleV2(sample)) => Some(sample),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+fn derived_snapshot_envelope(
+    schema: &str,
+    id_prefix: &str,
+    high_watermark_event: &ShadowPositionEventV2,
+) -> ShadowV2Envelope {
+    let mut envelope = high_watermark_event.envelope.clone();
+    envelope.schema = schema.to_string();
+    envelope.parent_event_id = Some(high_watermark_event.envelope.event_id.clone());
+    envelope.source_event_id = Some(high_watermark_event.envelope.event_id.clone());
+    envelope.event_id = format!(
+        "{id_prefix}:{}:{}",
+        high_watermark_event.envelope.position_id, high_watermark_event.envelope.event_id
+    );
+    envelope.produced_at_ms = shadow_v2_now_ms();
+    envelope.produced_at_slot = high_watermark_event.envelope.produced_at_slot;
+    envelope.source_refs.push(format!(
+        "canonical_high_watermark:{}",
+        high_watermark_event.envelope.event_id
+    ));
+    envelope
+        .limitations
+        .push("DERIVED_SNAPSHOT_KEYED_BY_CANONICAL_HIGH_WATERMARK".to_string());
+    envelope
+}
+
+fn shadow_v2_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or_default()
+}
+
 fn shadow_v2_record_from_event(
     event: &ShadowPositionEventV2,
 ) -> Result<ShadowV2Record, ShadowV2Error> {
@@ -3600,6 +4010,16 @@ mod tests {
             reconciliation_status: "CANONICAL_TERMINAL".to_string(),
             duplicate_terminal_handling: "REJECT_DUPLICATE_TERMINAL_TRUTH".to_string(),
         }
+    }
+
+    fn harness_config_for_dir(path: &Path) -> ShadowV2ValidationHarnessConfig {
+        ShadowV2ValidationHarnessConfig::new(
+            "run-a",
+            path.join("shadow_position_event_v2.jsonl"),
+            path.join("shadow_replay_v2.jsonl"),
+            path.join("shadow_lifecycle_v2.jsonl"),
+            path.join("shadow_path_density_v2.jsonl"),
+        )
     }
 
     fn closed_canonical_stream_for_pr8_pr9() -> ShadowV2CanonicalEventStream {
@@ -4334,6 +4754,126 @@ mod tests {
         assert!(matches!(error, ShadowV2Error::Io(_)));
         assert!(writer.stream().events().is_empty());
         assert!(writer.stream().terminal_event_id("pos-a").is_none());
+    }
+
+    #[test]
+    fn shadow_v2_validation_harness_writes_canonical_derived_and_density_snapshots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = harness_config_for_dir(tmp.path());
+        let mut harness = ShadowV2ValidationHarness::new(config).unwrap();
+
+        let outcome = harness.append_record(ShadowV2Record::ShadowPositionV2(position_record(
+            "pos-a",
+            "event-position",
+        )));
+
+        assert_eq!(outcome.canonical_write, ShadowV2WriteStatus::Ok);
+        assert_eq!(outcome.replay_write, ShadowV2WriteStatus::Ok);
+        assert_eq!(outcome.lifecycle_write, ShadowV2WriteStatus::Ok);
+        assert_eq!(outcome.density_write, ShadowV2WriteStatus::Ok);
+        assert_eq!(
+            outcome.validation_evidence_status,
+            ShadowV2ValidationEvidenceStatus::Complete
+        );
+        assert_eq!(harness.canonical_stream().events().len(), 1);
+
+        let replay_line =
+            std::fs::read_to_string(tmp.path().join("shadow_replay_v2.jsonl")).unwrap();
+        let replay: Value = serde_json::from_str(replay_line.lines().next().unwrap()).unwrap();
+        assert_eq!(replay["envelope"]["schema"], "shadow_replay_v2");
+        assert_eq!(
+            replay["envelope"]["event_id"],
+            "replay_v2:pos-a:event-position"
+        );
+        assert_eq!(replay["source_canonical_high_watermark"], "event-position");
+        assert_eq!(replay["derived_from_canonical_stream"], true);
+
+        let lifecycle_line =
+            std::fs::read_to_string(tmp.path().join("shadow_lifecycle_v2.jsonl")).unwrap();
+        let lifecycle: Value =
+            serde_json::from_str(lifecycle_line.lines().next().unwrap()).unwrap();
+        assert_eq!(lifecycle["envelope"]["schema"], "shadow_lifecycle_v2");
+        assert_eq!(
+            lifecycle["envelope"]["event_id"],
+            "lifecycle_v2:pos-a:event-position"
+        );
+        assert_eq!(
+            lifecycle["source_canonical_high_watermark"],
+            "event-position"
+        );
+
+        let density_lines =
+            std::fs::read_to_string(tmp.path().join("shadow_path_density_v2.jsonl")).unwrap();
+        let density: Vec<Value> = density_lines
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(density.len(), 7);
+        assert!(density
+            .iter()
+            .all(|row| row["schema"] == "shadow_path_density_v2"));
+        assert!(density.iter().all(|row| row["position_id"] == "pos-a"
+            && row["source_canonical_high_watermark"] == "event-position"));
+        assert!(density
+            .iter()
+            .all(|row| row["verdict"] == "NOT_EVALUABLE_NO_COVERAGE"));
+        assert!(density.iter().all(|row| row["source_path_sample_event_ids"]
+            .as_array()
+            .unwrap()
+            .is_empty()));
+    }
+
+    #[test]
+    fn shadow_v2_validation_harness_keeps_canonical_after_derived_write_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let replay_path = tmp.path().join("shadow_replay_v2.jsonl");
+        std::fs::create_dir_all(&replay_path).unwrap();
+        let config = ShadowV2ValidationHarnessConfig::new(
+            "run-a",
+            tmp.path().join("shadow_position_event_v2.jsonl"),
+            replay_path,
+            tmp.path().join("shadow_lifecycle_v2.jsonl"),
+            tmp.path().join("shadow_path_density_v2.jsonl"),
+        );
+        let mut harness = ShadowV2ValidationHarness::new(config).unwrap();
+
+        let outcome = harness.append_record(ShadowV2Record::ShadowPositionV2(position_record(
+            "pos-a",
+            "event-position",
+        )));
+
+        assert_eq!(outcome.canonical_write, ShadowV2WriteStatus::Ok);
+        assert!(outcome.replay_write.is_err());
+        assert_eq!(
+            outcome.validation_evidence_status,
+            ShadowV2ValidationEvidenceStatus::DerivedArtifactWriteFailed
+        );
+        assert_eq!(harness.canonical_stream().events().len(), 1);
+        assert!(tmp.path().join("shadow_position_event_v2.jsonl").is_file());
+    }
+
+    #[test]
+    fn shadow_v2_validation_harness_rejects_derived_records_as_canonical_input() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = harness_config_for_dir(tmp.path());
+        let mut harness = ShadowV2ValidationHarness::new(config).unwrap();
+        let stream = closed_canonical_stream_for_pr8_pr9();
+        let replay = ShadowReplayV2::derive_from_canonical_stream(
+            test_envelope("shadow_replay_v2", "pos-a", "replay-derived-a"),
+            &stream,
+            "pos-a",
+            "canonical-ref",
+        )
+        .unwrap();
+
+        let outcome = harness.append_record(ShadowV2Record::ShadowReplayV2(replay));
+
+        assert!(outcome.canonical_write.is_err());
+        assert_eq!(
+            outcome.validation_evidence_status,
+            ShadowV2ValidationEvidenceStatus::CanonicalWriteFailed
+        );
+        assert!(harness.canonical_stream().events().is_empty());
     }
 
     #[test]
