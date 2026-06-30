@@ -16,34 +16,34 @@ common_envelope,base_mint,string,true,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,PRE_DE
 common_envelope,bonding_curve,string,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,PRE_DECISION,chain_slot,oracle_runtime,true,required when known,bonding curve address
 common_envelope,produced_at_ms,u64,true,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,wall_clock_ms,writer,false,clock domain required,record production wall clock
 common_envelope,produced_at_slot,u64,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,chain_slot,writer,true,required if chain sourced,record production slot
-common_envelope,temporal_class,enum,true,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,wall_clock_ms,shadow_v2_contract,false,no UNKNOWN for strategy features,temporal availability
-common_envelope,clock_domain,enum,true,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,wall_clock_ms,shadow_v2_contract,false,must be explicit,record primary clock domain
+common_envelope,temporal_class,enum,true,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,wall_clock_ms,shadow_v2_contract,false,no UNKNOWN for strategy features and constructors must not silently overwrite,temporal availability
+common_envelope,clock_domain,enum,true,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,wall_clock_ms,shadow_v2_contract,false,must be explicit and constructors must not silently overwrite,record primary clock domain
 common_envelope,source_refs,list,true,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,wall_clock_ms,writer,false,must identify evidence,source artifact references
 common_envelope,quality,string,true,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,wall_clock_ms,writer,false,must be typed,quality label
 common_envelope,limitations,list,true,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,wall_clock_ms,writer,false,must list gaps,limitations and blockers
-event_order_key,slot,u64,true,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,chain_slot,stream_or_rpc,true,UNKNOWN must be explicit,chain slot
+event_order_key,slot,u64,true,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,chain_slot,stream_or_rpc,true,Some(slot) required for research-ready and UNKNOWN must be explicit,chain slot
 event_order_key,block_time,i64,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,block_time,stream_or_rpc,true,coarse optional,chain block time
-event_order_key,signature,string,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,chain_slot,stream_or_rpc,true,required when event tx backed,transaction signature
-event_order_key,transaction_index_or_unknown,u32,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,chain_slot,stream_or_rpc,true,UNKNOWN blocks exact intra slot order,transaction index
-event_order_key,instruction_index_or_unknown,u32,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,chain_slot,stream_or_rpc,true,UNKNOWN blocks exact instruction order,instruction index
-event_order_key,inner_instruction_index_or_unknown,u32,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,chain_slot,stream_or_rpc,true,UNKNOWN blocks exact inner order,inner instruction index
-event_order_key,log_index_or_unknown,u32,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,chain_slot,stream_or_rpc,true,UNKNOWN blocks exact log order,log index
+event_order_key,signature,string,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,chain_slot,stream_or_rpc,true,non_empty signature or explicit UNKNOWN and None blocks research-ready,transaction signature
+event_order_key,transaction_index_or_unknown,u32,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,chain_slot,stream_or_rpc,true,Some(index) or explicit UNKNOWN sentinel and None blocks research-ready,transaction index
+event_order_key,instruction_index_or_unknown,u32,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,chain_slot,stream_or_rpc,true,Some(index) or explicit UNKNOWN sentinel and None blocks research-ready,instruction index
+event_order_key,inner_instruction_index_or_unknown,u32,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,chain_slot,stream_or_rpc,true,Some(index) or explicit UNKNOWN sentinel and None blocks research-ready,inner instruction index
+event_order_key,log_index_or_unknown,u32,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,chain_slot,stream_or_rpc,true,Some(index) or explicit UNKNOWN sentinel and None blocks research-ready,log index
 event_order_key,event_seq_in_process,u64,true,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,monotonic_process_ms,process,false,must be monotonic,local process ordering
 event_order_key,observed_at_wall_ms,u64,true,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,stream_observed_ms,process,false,must be present,local observation time
 pool_state_sample_v2,source,enum,true,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,PRE_DECISION,chain_slot,account_state_core,false,must identify source,YELLOWSTONE_EVENT|ACCOUNT_STATE_CORE|RPC_FALLBACK|SHADOW_LEDGER_DIAGNOSTIC|RECONSTRUCTED_FROM_TRADE_EVENT|UNKNOWN
 pool_state_sample_v2,commitment,string,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,rpc_observed_ms,rpc,true,required for RPC fallback,account commitment
-pool_state_sample_v2,account_data_hash,string,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,chain_slot,account_state_core,true,required when account backed,raw account data hash
+pool_state_sample_v2,account_data_hash,string,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,chain_slot,account_state_core,true,required when account backed and missing blocks research-ready,raw account data hash
 pool_state_sample_v2,virtual_sol_reserves,u64,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,PRE_DECISION,chain_slot,account_state_core,true,blocks price reconstruction if missing,virtual SOL reserves
 pool_state_sample_v2,virtual_token_reserves,u64,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,PRE_DECISION,chain_slot,account_state_core,true,blocks price reconstruction if missing,virtual token reserves
 pool_state_sample_v2,real_sol_reserves,u64,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,PRE_DECISION,chain_slot,account_state_core,true,required when formula uses it,real SOL reserves
 pool_state_sample_v2,real_token_reserves,u64,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,PRE_DECISION,chain_slot,account_state_core,true,required when formula uses it,real token reserves
-pool_state_sample_v2,token_decimals,u8,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,PRE_DECISION,chain_slot,account_state_core,true,blocks normalized price if missing,token decimals
+pool_state_sample_v2,token_decimals,u8,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,PRE_DECISION,chain_slot,account_state_core,true,caller supplied and blocks normalized price if missing,token decimals
 pool_state_sample_v2,sol_lamports,u64,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,PRE_DECISION,chain_slot,account_state_core,true,blocks normalized price if missing,SOL lamports normalization
 pool_state_sample_v2,price_sol_per_token,f64,true,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,PRE_DECISION,chain_slot,account_state_core,true,must point to reserves or blocked,mark price
 pool_state_sample_v2,market_cap_sol,f64,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,PRE_DECISION,chain_slot,account_state_core,true,source required,market cap
 pool_state_sample_v2,bonding_progress_pct,f64,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,PRE_DECISION,chain_slot,account_state_core,true,source required,bonding progress
-pool_state_sample_v2,staleness_ms,u64,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,wall_clock_ms,writer,true,must be explicit,wall clock staleness
-pool_state_sample_v2,staleness_slots,u64,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,chain_slot,writer,true,must be explicit,slot staleness
+pool_state_sample_v2,staleness_ms,u64,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,wall_clock_ms,writer,true,must be explicit and None blocks research-ready as missing or reversed,wall clock staleness
+pool_state_sample_v2,staleness_slots,u64,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,UNKNOWN,chain_slot,writer,true,must be explicit and None blocks research-ready as missing or reversed,slot staleness
 shadow_entry_decision_v2,decision_ts_ms,clocked_timestamp,true,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,AT_DECISION,decision_ts_ms,oracle_runtime,false,clock domain required,decision timestamp
 shadow_entry_decision_v2,decision_slot,u64,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,AT_DECISION,chain_slot,oracle_runtime,true,required when chain available,decision slot
 shadow_entry_decision_v2,feature_timestamps,list,false,true,true,MARK_ONLY,DIAGNOSTIC_ONLY,PRE_DECISION,wall_clock_ms,materialized_feature_set,false,no UNKNOWN for strategy fields,feature timestamp registry
