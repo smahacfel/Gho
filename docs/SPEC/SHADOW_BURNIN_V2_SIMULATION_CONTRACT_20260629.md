@@ -1016,6 +1016,26 @@ handoff. Such a record must stay:
 - limitation `NO_ENTRY_FILL_EXIT_FILL_OR_PATH_INFERENCE_IN_PR15`;
 - limitation `SHADOW_V2_RECORD_NOT_CONSUMED_BY_DECISIONS`.
 
+PR16A may emit one deterministic logging-only validation smoke marker at
+Shadow V2 harness startup. This marker exists only to prove canonical writer,
+derived replay/lifecycle, density rows and manifest wiring without waiting for a
+random BUY / accepted shadow handoff. The marker must stay:
+
+- active only when `shadow_v2_burnin.enabled=true`;
+- active only when `shadow_v2_burnin.logging_only=true`;
+- `simulation_level=MARK_ONLY`;
+- `measurement_grade=DIAGNOSTIC_ONLY`;
+- `temporal_class=UNKNOWN`;
+- limitation `VALIDATION_SMOKE_MARKER_V2`;
+- limitation `DIAGNOSTIC_ONLY_NOT_STRATEGY_POSITION`;
+- limitation `BLOCKED_BY_DATA_NO_ENTRY_FILL_EXIT_FILL_OR_PATH`;
+- limitation `NOT_CONSUMED_BY_DECISIONS`;
+- limitation `NOT_STRATEGY_EVIDENCE`;
+- limitation `NOT_LIVE_EQUIVALENT`.
+
+The marker must not be consumed by Gatekeeper, selector, BUY/REJECT,
+TX/Jito/live path, `shadow_close_only` or active close.
+
 ## Research-Grade Gates
 
 `SHADOW_V2_RESEARCH_GRADE` requires:

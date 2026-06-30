@@ -2082,6 +2082,7 @@ pub async fn run(
         shadow_monitor.is_some(),
         probe_monitor.is_some(),
     );
+    maybe_emit_shadow_v2_validation_smoke_marker(&mut shadow_v2_harness, &config);
 
     let mut epoch_counter: u64 = 1;
     let mut lifecycle_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
@@ -2804,6 +2805,105 @@ fn maybe_emit_shadow_v2_position_created(
             lifecycle_write = ?outcome.lifecycle_write,
             density_write = ?outcome.density_write,
             "PostBuyRuntime: Shadow V2 validation evidence append incomplete"
+        );
+    }
+}
+
+fn maybe_emit_shadow_v2_validation_smoke_marker(
+    harness: &mut Option<ShadowV2ValidationHarness>,
+    config: &PostBuyRuntimeConfig,
+) {
+    let Some(harness) = harness.as_mut() else {
+        return;
+    };
+    let Some(shadow_v2_config) = config
+        .shadow_v2_burnin
+        .as_ref()
+        .filter(|config| config.enabled && config.logging_only)
+    else {
+        return;
+    };
+
+    let created_at_ms = now_ms();
+    let run_id = shadow_v2_config
+        .run_namespace
+        .as_deref()
+        .unwrap_or("UNKNOWN_RUN")
+        .to_string();
+    let position_id = format!("validation-smoke-marker:{run_id}:{created_at_ms}");
+    let mut envelope = ShadowV2Envelope::contract_header(
+        "shadow_position_v2",
+        run_id,
+        position_id.clone(),
+        format!("validation_smoke_marker_v2:{position_id}"),
+        "VALIDATION_SMOKE_POOL_UNKNOWN",
+        "VALIDATION_SMOKE_BASE_MINT_UNKNOWN",
+    );
+    envelope.session_id = Some(format!("validation-smoke-session:{created_at_ms}"));
+    envelope.candidate_id = Some("VALIDATION_SMOKE_MARKER".to_string());
+    envelope.produced_at_ms = created_at_ms;
+    envelope.produced_at_slot = None;
+    envelope.temporal_class = TemporalClass::Unknown;
+    envelope.clock_domain = ClockDomain::WallClockMs;
+    envelope.simulation_level = SimulationLevel::MarkOnly;
+    envelope.measurement_grade = MeasurementGrade::DiagnosticOnly;
+    envelope.quality = "VALIDATION_SMOKE_MARKER_BLOCKED_BY_DATA".to_string();
+    envelope
+        .source_refs
+        .push("post_buy_runtime:shadow_v2_validation_harness_startup".to_string());
+    envelope
+        .source_refs
+        .push("shadow_v2_burnin:logging_only_validation".to_string());
+    envelope
+        .limitations
+        .push("VALIDATION_SMOKE_MARKER_V2".to_string());
+    envelope
+        .limitations
+        .push("DIAGNOSTIC_ONLY_NOT_STRATEGY_POSITION".to_string());
+    envelope
+        .limitations
+        .push("BLOCKED_BY_DATA_NO_ENTRY_FILL_EXIT_FILL_OR_PATH".to_string());
+    envelope
+        .limitations
+        .push("NOT_CONSUMED_BY_DECISIONS".to_string());
+    envelope
+        .limitations
+        .push("NOT_STRATEGY_EVIDENCE".to_string());
+    envelope.limitations.push("NOT_LIVE_EQUIVALENT".to_string());
+    envelope
+        .limitations
+        .push("NO_BUY_REJECT_CHANGE".to_string());
+    let record = ShadowPositionV2 {
+        envelope,
+        created_at_wall_ms: ClockedTimestamp {
+            field_name: "created_at_wall_ms".to_string(),
+            value: Some(created_at_ms as i64),
+            clock_domain: ClockDomain::WallClockMs,
+            clock_source: "post_buy_runtime".to_string(),
+            causal_boundary: "VALIDATION_HARNESS_STARTUP".to_string(),
+        },
+        created_at_slot: None,
+        decision_id: None,
+        strategy_context: Some("validation_smoke_marker_v2".to_string()),
+        lane: "diagnostic".to_string(),
+    };
+
+    let outcome = harness.append_record(ShadowV2Record::ShadowPositionV2(record));
+    if outcome.validation_evidence_status == ShadowV2ValidationEvidenceStatus::Complete {
+        info!(
+            runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+            position_id, "PostBuyRuntime: Shadow V2 validation smoke marker emitted"
+        );
+    } else {
+        warn!(
+            runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+            position_id,
+            status = ?outcome.validation_evidence_status,
+            canonical_write = ?outcome.canonical_write,
+            replay_write = ?outcome.replay_write,
+            lifecycle_write = ?outcome.lifecycle_write,
+            density_write = ?outcome.density_write,
+            "PostBuyRuntime: Shadow V2 validation smoke marker incomplete"
         );
     }
 }
@@ -4074,6 +4174,29 @@ mod tests {
         }
     }
 
+    fn shadow_v2_burnin_config_for_temp_scope(root: &Path) -> ShadowV2BurninConfig {
+        let mut config = complete_shadow_v2_burnin_config_for_test();
+        config.scope_root_path = Some(root.display().to_string());
+        config.pre_run_manifest_path =
+            Some(root.join("pre_run_manifest.json").display().to_string());
+        config.post_run_manifest_path =
+            Some(root.join("post_run_manifest.json").display().to_string());
+        config.canonical_event_stream_path = Some(
+            root.join("shadow_position_event_v2.jsonl")
+                .display()
+                .to_string(),
+        );
+        config.replay_v2_path = Some(root.join("shadow_replay_v2.jsonl").display().to_string());
+        config.lifecycle_v2_path =
+            Some(root.join("shadow_lifecycle_v2.jsonl").display().to_string());
+        config.path_density_v2_path = Some(
+            root.join("shadow_path_density_v2.jsonl")
+                .display()
+                .to_string(),
+        );
+        config
+    }
+
     #[test]
     fn shadow_v2_post_run_manifest_uses_generate_then_strict_verify() {
         let config = complete_shadow_v2_burnin_config_for_test();
@@ -4087,6 +4210,71 @@ mod tests {
         assert!(verification.contains(&"--strict".to_string()));
         assert!(!verification.contains(&"--write-manifest".to_string()));
         assert!(!verification.contains(&"--write-report-csv".to_string()));
+    }
+
+    #[test]
+    fn shadow_v2_validation_smoke_marker_writes_required_artifacts_without_handoff() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let burnin = shadow_v2_burnin_config_for_temp_scope(tmp.path());
+        let runtime_config = PostBuyRuntimeConfig {
+            shadow_v2_burnin: Some(burnin),
+            ..PostBuyRuntimeConfig::default()
+        };
+        let mut harness =
+            init_shadow_v2_validation_harness(runtime_config.shadow_v2_burnin.as_ref())
+                .expect("harness init");
+
+        assert!(harness.is_some());
+        maybe_emit_shadow_v2_validation_smoke_marker(&mut harness, &runtime_config);
+
+        let canonical_path = tmp.path().join("shadow_position_event_v2.jsonl");
+        let canonical = std::fs::read_to_string(&canonical_path).expect("canonical jsonl");
+        let canonical_rows: Vec<_> = canonical.lines().collect();
+        assert_eq!(canonical_rows.len(), 1);
+        let canonical_event: serde_json::Value =
+            serde_json::from_str(canonical_rows[0]).expect("canonical event json");
+        assert_eq!(canonical_event["event_kind"], "POSITION_CREATED");
+        assert_eq!(
+            canonical_event["payload"]["record_type"],
+            "shadow_position_v2"
+        );
+        assert_eq!(
+            canonical_event["payload"]["record"]["envelope"]["measurement_grade"],
+            "DIAGNOSTIC_ONLY"
+        );
+        assert_eq!(
+            canonical_event["payload"]["record"]["envelope"]["quality"],
+            "VALIDATION_SMOKE_MARKER_BLOCKED_BY_DATA"
+        );
+        let limitations = canonical_event["payload"]["record"]["envelope"]["limitations"]
+            .as_array()
+            .expect("limitations");
+        assert!(limitations
+            .iter()
+            .any(|value| value == "VALIDATION_SMOKE_MARKER_V2"));
+        assert!(limitations
+            .iter()
+            .any(|value| value == "NOT_CONSUMED_BY_DECISIONS"));
+
+        let replay = std::fs::read_to_string(tmp.path().join("shadow_replay_v2.jsonl"))
+            .expect("replay jsonl");
+        assert_eq!(replay.lines().count(), 1);
+        let lifecycle = std::fs::read_to_string(tmp.path().join("shadow_lifecycle_v2.jsonl"))
+            .expect("lifecycle jsonl");
+        assert_eq!(lifecycle.lines().count(), 1);
+        let density = std::fs::read_to_string(tmp.path().join("shadow_path_density_v2.jsonl"))
+            .expect("density jsonl");
+        let density_rows: Vec<serde_json::Value> = density
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("density row"))
+            .collect();
+        assert_eq!(density_rows.len(), 7);
+        assert!(density_rows
+            .iter()
+            .all(|row| row["schema"] == "shadow_path_density_v2"));
+        assert!(density_rows
+            .iter()
+            .all(|row| row["verdict"] == "NOT_EVALUABLE_NO_COVERAGE"));
     }
 
     #[test]
