@@ -830,6 +830,66 @@ Without PR14, max verdict is:
 SHADOW_V2_RESEARCH_GRADE_ONLY
 ```
 
+PR14 contract artifacts are:
+
+```text
+configs/rollout/shadow_v2_live_confirmed_calibration_contract.toml
+reports/selector/shadow_v2_live_calibration_schema_manifest.csv
+reports/selector/shadow_v2_live_calibration_gap_matrix.csv
+scripts/shadow_v2_live_calibration_audit.py
+scripts/test_shadow_v2_live_calibration_audit.py
+```
+
+PR14 required dataset files are:
+
+```text
+live_calibration_manifest.json
+live_transaction_attempts.jsonl
+live_confirmed_entry_fills.jsonl
+live_confirmed_exit_fills.jsonl
+live_calibration_comparison.jsonl
+```
+
+PR14 required schemas are:
+
+- `live_calibration_manifest_v1`;
+- `live_transaction_attempt_v1`;
+- `live_confirmed_entry_fill_v1`;
+- `live_confirmed_exit_fill_v1`;
+- `live_calibration_comparison_v1`.
+
+PR14 required telemetry includes:
+
+- `decision_ts_ms`;
+- `submit_ts_ms`;
+- `landing_ts_ms`;
+- `decision_to_submit_ms`;
+- `submit_to_land_ms`;
+- `landing_slot`;
+- `fill_status`;
+- `failure_mode`;
+- `quote_price`;
+- `fill_price`;
+- `realized_slippage_bps`;
+- `quote_fill_diff_bps`;
+- `own_impact_bps`;
+- `fee_bps`;
+- `priority_fee_lamports`;
+- `jito_tip_lamports`;
+- `account_state_delay_ms`;
+- `stream_delay_ms`;
+- calibrated `model_error_bps`.
+
+PR14 audit semantics:
+
+- default audit validates contract readiness only;
+- default audit must not read raw run JSONL or start runs;
+- `--dataset-root <path> --require-dataset` is required for the real
+  live-confirmed calibration gate;
+- fixture datasets are not live-confirmed calibration evidence;
+- `CONTRACT_READY` is not `SHADOW_V2_LIVE_EQUIVALENCE_GRADE`;
+- real dataset absence keeps max verdict at `SHADOW_V2_RESEARCH_GRADE_ONLY`.
+
 ## Research-Grade Gates
 
 `SHADOW_V2_RESEARCH_GRADE` requires:

@@ -1,0 +1,98 @@
+# Shadow V2 PR14 live-confirmed calibration contract.
+# Static contract only. This file does not enable collection, execution or runs.
+
+version = 14
+
+[shadow_v2_live_confirmed_calibration]
+schema = "shadow_v2_live_confirmed_calibration_contract_v1"
+contract_id = "shadow-v2-live-confirmed-calibration-pr14"
+contract_status = "CONTRACT_ONLY"
+simulation_contract_version = "shadow_burnin_simulation_v2_20260629"
+
+enabled = false
+run_start_allowed = false
+contract_only = true
+live_collection_enabled = false
+tx_path_changes_allowed = false
+
+runtime_approval = false
+shadow_close_only_approval = false
+active_close_approval = false
+strategy_proof_enabled = false
+rce_proof_enabled = false
+selector_proof_enabled = false
+edge_proof_enabled = false
+r51_touch_allowed = false
+cleanup_allowed_before_manifest = false
+raw_jsonl_git_staging_allowed = false
+
+required_for_live_equivalence = true
+no_shadow_assumption_as_live = true
+max_verdict_without_dataset = "SHADOW_V2_RESEARCH_GRADE_ONLY"
+
+audit_script = "scripts/shadow_v2_live_calibration_audit.py"
+schema_manifest_path = "reports/selector/shadow_v2_live_calibration_schema_manifest.csv"
+acceptance_gates_path = "reports/selector/shadow_v2_acceptance_gates.csv"
+gap_matrix_path = "reports/selector/shadow_v2_live_calibration_gap_matrix.csv"
+
+required_record_schemas = [
+  "live_calibration_manifest_v1",
+  "live_transaction_attempt_v1",
+  "live_confirmed_entry_fill_v1",
+  "live_confirmed_exit_fill_v1",
+  "live_calibration_comparison_v1",
+]
+
+required_dataset_files = [
+  "live_calibration_manifest.json",
+  "live_transaction_attempts.jsonl",
+  "live_confirmed_entry_fills.jsonl",
+  "live_confirmed_exit_fills.jsonl",
+  "live_calibration_comparison.jsonl",
+]
+
+required_telemetry_fields = [
+  "decision_ts_ms",
+  "submit_ts_ms",
+  "landing_ts_ms",
+  "decision_to_submit_ms",
+  "submit_to_land_ms",
+  "landing_slot",
+  "fill_status",
+  "failure_mode",
+  "quote_price",
+  "fill_price",
+  "realized_slippage_bps",
+  "quote_fill_diff_bps",
+  "own_impact_bps",
+  "fee_bps",
+  "priority_fee_lamports",
+  "jito_tip_lamports",
+  "account_state_delay_ms",
+  "stream_delay_ms",
+]
+
+required_status_coverage = [
+  "FILLED",
+  "NO_FILL_OR_FAILED",
+]
+
+required_model_error_fields = [
+  "model_version",
+  "simulated_fill_price",
+  "live_fill_price",
+  "model_error_bps",
+  "latency_bucket_ms",
+  "slippage_error_bps",
+  "outcome_match",
+]
+
+blocked_until_dataset_exists = [
+  "SHADOW_V2_LIVE_EQUIVALENCE_GRADE",
+  "live PnL proof",
+  "executable fill proof",
+  "real landing outcome proof",
+  "runtime approval",
+  "shadow_close_only approval",
+  "active close approval",
+]
