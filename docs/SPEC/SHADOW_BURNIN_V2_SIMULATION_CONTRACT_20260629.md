@@ -132,6 +132,8 @@ Minimum required records:
 - `shadow_terminal_truth_v2`
 - `shadow_replay_v2`
 
+PR1-level Rust contract types include `ShadowPositionV2` and the schema vocabulary for all records above. PR2 owns durable canonical writer/indexing invariants for `shadow_position_event_v2.jsonl`, including duplicate event and duplicate terminal rejection.
+
 The canonical event stream is:
 
 ```text
@@ -153,19 +155,26 @@ Required on:
 
 Fields:
 
-- `slot`
-- `block_time`
-- `signature`
-- `transaction_index_or_unknown`
-- `instruction_index_or_unknown`
-- `inner_instruction_index_or_unknown`
-- `log_index_or_unknown`
+- `slot: EventOrderComponent<u64>`
+- `block_time: EventOrderComponent<i64>`
+- `signature: EventOrderComponent<string>`
+- `transaction_index_or_unknown: EventOrderComponent<u32>`
+- `instruction_index_or_unknown: EventOrderComponent<u32>`
+- `inner_instruction_index_or_unknown: EventOrderComponent<u32>`
+- `log_index_or_unknown: EventOrderComponent<u32>`
 - `event_seq_in_process`
 - `observed_at_wall_ms`
 
+`EventOrderComponent<T>` values are:
+
+- `KNOWN(T)`
+- `UNKNOWN`
+
 Rules:
 
-- Missing chain-order component must be explicit `UNKNOWN`.
+- Missing JSON chain-order field is schema-invalid.
+- Unknown chain-order component must be explicit `UNKNOWN`.
+- `slot=UNKNOWN` blocks research-ready pool-state provenance.
 - `event_seq_in_process` must be monotonic per process/run.
 - Same-slot incomplete ordering must produce ambiguity metadata.
 - Ambiguity cannot silently resolve target/stop or win/loss.
