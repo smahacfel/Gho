@@ -538,6 +538,18 @@ TERMINAL
 only PR7 mode intended for 2s/3s fidelity research. It requires an explicit
 storage budget before a validation burnin.
 
+`max_path_points` is a storage cap for optional samples. It must not drop
+protected samples:
+
+- `LEVEL_HIT`;
+- `TERMINAL`;
+- `EVENT_SAMPLE` when `keep_every_event_sample = true`.
+
+If protected dense samples exceed `max_path_points`, the sampler must retain
+them and emit a storage-budget limitation instead of silently truncating the
+path. Optional samples may be truncated only with an explicit truncation flag
+and limitation.
+
 `shadow_path_long_500s` also requires an explicit storage budget before a
 validation burnin. It is the only PR7 mode intended to make 300s/500s horizons
 evaluable, and only when actual coverage exists.
@@ -567,8 +579,8 @@ Rules:
 - Density evaluation must emit duplicate-age and non-monotonic input metadata.
   These labels do not rewrite the path; they make ordering defects visible to
   downstream fidelity gates.
-- Sampler output may be truncated only with an explicit truncation flag and
-  limitation.
+- Sampler output may be truncated only for non-protected samples, and only with
+  an explicit truncation flag and limitation.
 
 ## Terminal Truth Contract
 

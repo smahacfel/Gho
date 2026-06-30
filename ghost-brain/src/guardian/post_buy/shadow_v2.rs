@@ -2750,19 +2750,59 @@ pub fn select_path_samples_v2(
         }
     }
 
-    let max_points_truncated = kept.len() > config.max_path_points;
-    if max_points_truncated {
-        kept.truncate(config.max_path_points);
+    let mut max_points_truncated = false;
+    let mut storage_budget_exceeded_for_protected = false;
+    if kept.len() > config.max_path_points {
+        let protected_count = kept
+            .iter()
+            .filter(|sample| sample_protected_from_path_cap(sample, config))
+            .count();
+        let optional_budget = config.max_path_points.saturating_sub(protected_count);
+        let mut optional_kept = 0usize;
+        let mut capped = Vec::with_capacity(config.max_path_points.max(protected_count));
+
+        for sample in kept {
+            if sample_protected_from_path_cap(&sample, config) {
+                capped.push(sample);
+            } else if optional_kept < optional_budget {
+                optional_kept += 1;
+                capped.push(sample);
+            } else {
+                max_points_truncated = true;
+            }
+        }
+
+        storage_budget_exceeded_for_protected = capped.len() > config.max_path_points;
+        kept = capped;
     }
-    if (dropped_for_horizon || max_points_truncated) && !kept.is_empty() {
+    if (dropped_for_horizon || max_points_truncated || storage_budget_exceeded_for_protected)
+        && !kept.is_empty()
+    {
         if let Some(last) = kept.last_mut() {
-            last.truncated = true;
-            last.envelope
-                .limitations
-                .push("PATH_SAMPLER_TRUNCATED_BY_HORIZON_OR_MAX_POINTS".to_string());
+            if dropped_for_horizon || max_points_truncated {
+                last.truncated = true;
+                last.envelope
+                    .limitations
+                    .push("PATH_SAMPLER_TRUNCATED_BY_HORIZON_OR_OPTIONAL_MAX_POINTS".to_string());
+            }
+            if storage_budget_exceeded_for_protected {
+                last.envelope.limitations.push(
+                    "PATH_SAMPLER_STORAGE_BUDGET_EXCEEDED_PROTECTED_SAMPLES_RETAINED".to_string(),
+                );
+            }
         }
     }
     kept
+}
+
+fn sample_protected_from_path_cap(
+    sample: &ShadowPathSampleV2,
+    config: &ShadowPathSamplerConfigV2,
+) -> bool {
+    let reason = ShadowPathSamplingReasonV2::from_label(&sample.sampling_reason)
+        .unwrap_or(ShadowPathSamplingReasonV2::EventSample);
+    reason.is_must_keep()
+        || (config.keep_every_event_sample && reason == ShadowPathSamplingReasonV2::EventSample)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4504,7 +4544,7 @@ mod tests {
     }
 
     #[test]
-    fn shadow_v2_path_sampler_dense_keeps_all_event_samples_and_marks_truncation() {
+    fn shadow_v2_path_sampler_dense_keeps_all_event_samples_over_max_points_cap() {
         let dense = ShadowPathSamplerConfigV2 {
             max_path_points: 3,
             ..ShadowPathSamplerConfigV2::dense_3s()
@@ -4527,14 +4567,16 @@ mod tests {
         let dense_selected = select_path_samples_v2(&samples, &dense);
         let standard_selected = select_path_samples_v2(&samples, &standard);
 
-        assert_eq!(dense_selected.len(), 3);
-        assert!(dense_selected.last().unwrap().truncated);
+        assert_eq!(dense_selected.len(), 5);
+        assert!(!dense_selected.last().unwrap().truncated);
         assert!(dense_selected
             .last()
             .unwrap()
             .envelope
             .limitations
-            .contains(&"PATH_SAMPLER_TRUNCATED_BY_HORIZON_OR_MAX_POINTS".to_string()));
+            .contains(
+                &"PATH_SAMPLER_STORAGE_BUDGET_EXCEEDED_PROTECTED_SAMPLES_RETAINED".to_string()
+            ));
         assert_eq!(standard_selected.len(), 1);
     }
 

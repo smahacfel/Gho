@@ -53,6 +53,8 @@ PR7:
 - wprowadza `ShadowPathSamplingReasonV2`,
 - dodaje `select_path_samples_v2`,
 - wymusza, że dense 3s zachowuje każdy `EVENT_SAMPLE`,
+- traktuje `max_path_points` jako cap dla próbek opcjonalnych, nie jako prawo
+  do usunięcia dense `EVENT_SAMPLE`, `LEVEL_HIT` albo `TERMINAL`,
 - oznacza tryby wymagające storage budget przed validation burnin,
 - raportuje duplicate-age i non-monotonic input metadata w density evaluator,
 - dodaje horizon verdicts `EVALUABLE_EXACT`, `EVALUABLE_APPROX`, `SPARSE_APPROX_ONLY`, `NOT_EVALUABLE_NO_COVERAGE`, `NOT_EVALUABLE_HORIZON_EXCEEDS_REPLAY`,
@@ -83,7 +85,7 @@ Fixture evidence w Rust:
 - `shadow_v2_path_density_marks_sparse_and_no_coverage_explicitly`
 - `shadow_v2_path_density_reports_duplicate_and_non_monotonic_input`
 - `shadow_v2_path_sampler_modes_define_sampling_policy`
-- `shadow_v2_path_sampler_dense_keeps_all_event_samples_and_marks_truncation`
+- `shadow_v2_path_sampler_dense_keeps_all_event_samples_over_max_points_cap`
 
 ## D4. Root Cause
 
@@ -103,6 +105,9 @@ W PR6/PR7:
 - static executable quote zmienia sample na `FILL_MODEL_STATIC`, ale nadal nie jest live fill,
 - każdy horizon dostaje jawny verdict i limitations,
 - dense 3s utrzymuje wszystkie event samples,
+- protected samples przekraczające `max_path_points` są zachowane z limitation
+  `PATH_SAMPLER_STORAGE_BUDGET_EXCEEDED_PROTECTED_SAMPLES_RETAINED`,
+- tylko próbki opcjonalne mogą zostać przycięte przez `max_path_points`,
 - duplicate/non-monotonic path input jest raportowany jako limitation,
 - unsupported horizon nie jest inferowany.
 
