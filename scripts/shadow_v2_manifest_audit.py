@@ -240,9 +240,13 @@ def find_missing_required_artifacts(
     artifact_entries: list[dict[str, Any]],
     contract_rows: list[ArtifactContractRow],
     manifest_phase: str,
+    generated_artifacts: set[str] | None = None,
 ) -> list[str]:
     present_names = {Path(entry["relative_path"]).name for entry in artifact_entries}
     present_paths = {entry["relative_path"] for entry in artifact_entries}
+    if generated_artifacts:
+        present_names.update(Path(artifact).name for artifact in generated_artifacts)
+        present_paths.update(generated_artifacts)
     missing: list[str] = []
 
     for row in contract_rows:
@@ -296,6 +300,22 @@ def validate_artifact_requirements(
     return blockers
 
 
+def generated_artifact_idents(scope_root: Path, paths: Iterable[Path | None]) -> set[str]:
+    idents: set[str] = set()
+    scope_root_resolved = scope_root.resolve()
+    for path in paths:
+        if path is None:
+            continue
+        try:
+            relative = path.resolve().relative_to(scope_root_resolved)
+        except ValueError:
+            continue
+        relative_str = str(relative)
+        idents.add(relative_str)
+        idents.add(relative.name)
+    return idents
+
+
 def aggregate_schema_coverage(entries: list[dict[str, Any]]) -> dict[str, int]:
     total: Counter[str] = Counter()
     for entry in entries:
@@ -310,10 +330,17 @@ def build_manifest(
     run_id: str,
     artifact_contract: Path,
     max_sha_bytes: int,
+    generated_artifact_paths: Iterable[Path | None] = (),
 ) -> tuple[dict[str, Any], list[str]]:
     contract_rows, contract_errors = load_artifact_contract(artifact_contract)
     entries = [artifact_entry(path, scope_root, max_sha_bytes) for path in iter_scope_files(scope_root)]
-    missing_required = find_missing_required_artifacts(entries, contract_rows, manifest_phase)
+    generated_artifacts = generated_artifact_idents(scope_root, generated_artifact_paths)
+    missing_required = find_missing_required_artifacts(
+        entries,
+        contract_rows,
+        manifest_phase,
+        generated_artifacts,
+    )
 
     blockers = list(contract_errors)
     blockers.extend(f"missing required artifact: {name}" for name in missing_required)
@@ -481,6 +508,7 @@ def main(argv: list[str] | None = None) -> int:
         run_id=args.run_id,
         artifact_contract=args.artifact_contract,
         max_sha_bytes=args.max_sha_bytes,
+        generated_artifact_paths=[args.write_manifest, args.write_report_csv],
     )
 
     if args.write_manifest:

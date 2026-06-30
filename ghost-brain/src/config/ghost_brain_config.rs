@@ -220,6 +220,8 @@ pub struct ShadowV2BurninConfig {
     pub validation_profile: String,
     /// Optional run namespace for future PR12 validation burnin.
     pub run_namespace: Option<String>,
+    /// Scope root scanned by the Shadow V2 manifest auditor when validation is enabled.
+    pub scope_root_path: Option<String>,
     /// Required pre-run manifest destination for future validation.
     pub pre_run_manifest_path: Option<String>,
     /// Required post-run manifest destination for future validation.
@@ -236,6 +238,8 @@ pub struct ShadowV2BurninConfig {
     pub replay_v2_path: Option<String>,
     /// Future lifecycle V2 path. Must remain derived from canonical stream.
     pub lifecycle_v2_path: Option<String>,
+    /// Future path-density V2 path. Must remain derived from canonical path samples.
+    pub path_density_v2_path: Option<String>,
     /// Raw evidence manifests are mandatory before research-grade use.
     pub evidence_manifest_required: bool,
     /// Artifact sha256 coverage requirement.
@@ -284,6 +288,7 @@ impl Default for ShadowV2BurninConfig {
             simulation_contract_version: "shadow_burnin_simulation_v2_20260629".to_string(),
             validation_profile: "disabled".to_string(),
             run_namespace: None,
+            scope_root_path: None,
             pre_run_manifest_path: None,
             post_run_manifest_path: None,
             manifest_audit_script: "scripts/shadow_v2_manifest_audit.py".to_string(),
@@ -293,6 +298,7 @@ impl Default for ShadowV2BurninConfig {
             canonical_event_stream_path: None,
             replay_v2_path: None,
             lifecycle_v2_path: None,
+            path_density_v2_path: None,
             evidence_manifest_required: true,
             sha256_required: true,
             row_counts_required: true,
@@ -371,6 +377,15 @@ impl ShadowV2BurninConfig {
                 anyhow::bail!("Shadow V2 enabled profile requires run_namespace");
             }
             if self
+                .scope_root_path
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+            {
+                anyhow::bail!("Shadow V2 enabled profile requires scope_root_path");
+            }
+            if self
                 .pre_run_manifest_path
                 .as_deref()
                 .unwrap_or("")
@@ -414,6 +429,15 @@ impl ShadowV2BurninConfig {
                 .is_empty()
             {
                 anyhow::bail!("Shadow V2 enabled profile requires lifecycle_v2_path");
+            }
+            if self
+                .path_density_v2_path
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+            {
+                anyhow::bail!("Shadow V2 enabled profile requires path_density_v2_path");
             }
         }
         Ok(())
@@ -5047,7 +5071,8 @@ impl GhostBrainConfig {
     /// Load ONLY `[shadow_v2_burnin]` from TOML without validating full GhostBrain config.
     ///
     /// PR11 uses this for static validation of an inert logging-only Shadow V2
-    /// burnin profile. The runtime does not consume this loader.
+    /// burnin profile. PR15 also uses it at launcher startup so enabled Shadow
+    /// V2 validation cannot be silently skipped by unrelated full-config errors.
     pub fn shadow_v2_burnin_from_toml_file<P: AsRef<Path>>(
         path: P,
     ) -> anyhow::Result<ShadowV2BurninConfig> {
@@ -6027,6 +6052,8 @@ include_spl = false
         assert!(!config.shadow_v2_burnin.runtime_approval);
         assert!(!config.shadow_v2_burnin.shadow_close_only_approval);
         assert!(!config.shadow_v2_burnin.active_close_approval);
+        assert!(config.shadow_v2_burnin.scope_root_path.is_none());
+        assert!(config.shadow_v2_burnin.path_density_v2_path.is_none());
         assert_eq!(
             config.shadow_v2_burnin.max_verdict_without_live_calibration,
             "SHADOW_V2_RESEARCH_GRADE_ONLY"
@@ -6062,6 +6089,58 @@ include_spl = false
         assert!(err.to_string().contains("runtime_approval"));
     }
 
+    fn shadow_v2_complete_enabled_config() -> ShadowV2BurninConfig {
+        ShadowV2BurninConfig {
+            enabled: true,
+            mode: ShadowV2BurninMode::LoggingOnlyValidation,
+            validation_profile: "shadow_v2_fidelity_validation_logging_only".to_string(),
+            run_namespace: Some("shadow-burnin-v2-fidelity-validation-logging-only".to_string()),
+            scope_root_path: Some("reports/selector/shadow-v2-fidelity-validation".to_string()),
+            pre_run_manifest_path: Some(
+                "reports/selector/shadow-v2-fidelity-validation/pre_run_manifest.json".to_string(),
+            ),
+            post_run_manifest_path: Some(
+                "reports/selector/shadow-v2-fidelity-validation/post_run_manifest.json".to_string(),
+            ),
+            canonical_event_stream_path: Some(
+                "reports/selector/shadow-v2-fidelity-validation/shadow_position_event_v2.jsonl"
+                    .to_string(),
+            ),
+            replay_v2_path: Some(
+                "reports/selector/shadow-v2-fidelity-validation/shadow_replay_v2.jsonl".to_string(),
+            ),
+            lifecycle_v2_path: Some(
+                "reports/selector/shadow-v2-fidelity-validation/shadow_lifecycle_v2.jsonl"
+                    .to_string(),
+            ),
+            path_density_v2_path: Some(
+                "reports/selector/shadow-v2-fidelity-validation/shadow_path_density_v2.jsonl"
+                    .to_string(),
+            ),
+            ..ShadowV2BurninConfig::default()
+        }
+    }
+
+    #[test]
+    fn shadow_v2_config_enabled_requires_scope_root_and_path_density_path() {
+        let complete = shadow_v2_complete_enabled_config();
+        complete.validate().unwrap();
+
+        let mut missing_scope_root = complete.clone();
+        missing_scope_root.scope_root_path = None;
+        let err = missing_scope_root
+            .validate()
+            .expect_err("enabled profile must require scope_root_path");
+        assert!(err.to_string().contains("scope_root_path"));
+
+        let mut missing_density = complete;
+        missing_density.path_density_v2_path = None;
+        let err = missing_density
+            .validate()
+            .expect_err("enabled profile must require path_density_v2_path");
+        assert!(err.to_string().contains("path_density_v2_path"));
+    }
+
     #[test]
     fn shadow_v2_config_loads_logging_only_rollout_contract() {
         let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -6093,7 +6172,23 @@ include_spl = false
         );
         assert_eq!(
             config.canonical_event_stream_path.as_deref(),
-            Some("logs/shadow_v2/shadow-burnin-v2-fidelity-validation-logging-only/shadow_position_event_v2.jsonl")
+            Some("reports/selector/shadow-v2-fidelity-validation/shadow_position_event_v2.jsonl")
+        );
+        assert_eq!(
+            config.scope_root_path.as_deref(),
+            Some("reports/selector/shadow-v2-fidelity-validation")
+        );
+        assert_eq!(
+            config.replay_v2_path.as_deref(),
+            Some("reports/selector/shadow-v2-fidelity-validation/shadow_replay_v2.jsonl")
+        );
+        assert_eq!(
+            config.lifecycle_v2_path.as_deref(),
+            Some("reports/selector/shadow-v2-fidelity-validation/shadow_lifecycle_v2.jsonl")
+        );
+        assert_eq!(
+            config.path_density_v2_path.as_deref(),
+            Some("reports/selector/shadow-v2-fidelity-validation/shadow_path_density_v2.jsonl")
         );
     }
 

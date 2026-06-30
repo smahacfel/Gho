@@ -25,6 +25,7 @@
 //! running on 12-hour cycles for long-term parameter optimization.
 
 use anyhow::{bail, Context, Result};
+use ghost_brain::config::ghost_brain_config::ShadowV2BurninConfig;
 use ghost_brain::config::{GatekeeperV2Config, GhostBrainConfig};
 use ghost_brain::oracle::SnapshotEngine;
 use ghost_brain::tuning::{BanditAlgorithm, TuningMessage, TuningService, TuningServiceConfig};
@@ -58,6 +59,7 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{read_keypair_file, Signer};
 use std::env;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
@@ -310,6 +312,104 @@ fn ensure_directory_writable(path: &Path, label: &str) -> Result<()> {
 fn ensure_parent_directory_writable(path: &Path, label: &str) -> Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     ensure_directory_writable(parent, label)
+}
+
+fn shadow_v2_required_config_path<'a>(
+    value: Option<&'a str>,
+    field_name: &'static str,
+) -> Result<&'a str> {
+    value
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Shadow V2 validation preflight missing {field_name}"))
+}
+
+fn run_shadow_v2_manifest_audit_command(
+    config: &ShadowV2BurninConfig,
+    args: &[String],
+) -> Result<()> {
+    let script = config.manifest_audit_script.trim();
+    if script.is_empty() {
+        bail!("Shadow V2 validation preflight missing manifest_audit_script");
+    }
+    let output = Command::new("python3")
+        .arg(script)
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to run Shadow V2 manifest audit script {script}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    bail!(
+        "Shadow V2 manifest audit failed status={} stdout={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+fn load_shadow_v2_burnin_runtime_config(config_path: &Path) -> Result<ShadowV2BurninConfig> {
+    if !config_path.exists() {
+        return Ok(ShadowV2BurninConfig::default());
+    }
+
+    GhostBrainConfig::shadow_v2_burnin_from_toml_file(config_path).with_context(|| {
+        format!(
+            "SHADOW_V2_VALIDATION_PREFLIGHT_FAILED: failed to load [shadow_v2_burnin] from {}",
+            config_path.display()
+        )
+    })
+}
+
+fn run_shadow_v2_validation_preflight_if_enabled(config: &ShadowV2BurninConfig) -> Result<()> {
+    if !config.enabled {
+        return Ok(());
+    }
+    config
+        .validate()
+        .context("SHADOW_V2_VALIDATION_PREFLIGHT_FAILED: invalid shadow_v2_burnin config")?;
+    let scope_root =
+        shadow_v2_required_config_path(config.scope_root_path.as_deref(), "scope_root_path")?;
+    let pre_run_manifest_path = shadow_v2_required_config_path(
+        config.pre_run_manifest_path.as_deref(),
+        "pre_run_manifest_path",
+    )?;
+    if !Path::new(pre_run_manifest_path).is_file() {
+        bail!(
+            "SHADOW_V2_VALIDATION_PREFLIGHT_FAILED: pre_run_manifest_path does not exist: {}",
+            pre_run_manifest_path
+        );
+    }
+    for (field_name, raw_path) in [
+        (
+            "canonical_event_stream_path",
+            config.canonical_event_stream_path.as_deref(),
+        ),
+        ("replay_v2_path", config.replay_v2_path.as_deref()),
+        ("lifecycle_v2_path", config.lifecycle_v2_path.as_deref()),
+        (
+            "path_density_v2_path",
+            config.path_density_v2_path.as_deref(),
+        ),
+    ] {
+        let path = shadow_v2_required_config_path(raw_path, field_name)?;
+        ensure_parent_directory_writable(Path::new(path), field_name)
+            .with_context(|| format!("SHADOW_V2_VALIDATION_PREFLIGHT_FAILED: {field_name}"))?;
+    }
+
+    let args = vec![
+        "--scope-root".to_string(),
+        scope_root.to_string(),
+        "--manifest-phase".to_string(),
+        "pre_run".to_string(),
+        "--schema-manifest".to_string(),
+        config.required_schema_manifest_path.clone(),
+        "--acceptance-gates".to_string(),
+        config.acceptance_gates_path.clone(),
+        "--strict".to_string(),
+    ];
+    run_shadow_v2_manifest_audit_command(config, &args)
+        .context("SHADOW_V2_VALIDATION_PREFLIGHT_FAILED: strict pre-run manifest audit failed")
 }
 
 fn derive_shadow_lifecycle_log_path(entry_log_path: &str) -> PathBuf {
@@ -1476,14 +1576,20 @@ async fn main() -> Result<()> {
     });
     handles.push(("ShadowLedger", shadow_handle));
 
+    let ghost_brain_config_path = Path::new(&config.ghost_brain_config_path);
+    let shadow_v2_burnin_config = load_shadow_v2_burnin_runtime_config(ghost_brain_config_path)?;
+    run_shadow_v2_validation_preflight_if_enabled(&shadow_v2_burnin_config)?;
+
     // Load Ghost Brain configuration from TOML file
     // This config controls all analytical modules (SSMI, QASS, QEDD, MCI, etc.)
     let ghost_brain_config = {
-        let config_path = std::path::Path::new(&config.ghost_brain_config_path);
-        if config_path.exists() {
-            match ghost_brain::config::GhostBrainConfig::from_toml_file(config_path) {
+        if ghost_brain_config_path.exists() {
+            match ghost_brain::config::GhostBrainConfig::from_toml_file(ghost_brain_config_path) {
                 Ok(cfg) => {
-                    info!("🧠 Ghost Brain config loaded from: {:?}", config_path);
+                    info!(
+                        "🧠 Ghost Brain config loaded from: {:?}",
+                        ghost_brain_config_path
+                    );
                     info!(
                         "   QEDD: lambda_base={}, abort_threshold={}",
                         cfg.qedd.lambda_base, cfg.qedd.lambda_abort_threshold
@@ -1507,7 +1613,7 @@ async fn main() -> Result<()> {
                 Err(e) => {
                     warn!(
                         "⚠️  Failed to load full Ghost Brain config from {:?}: {}. Gatekeeper V2 will still use direct [gatekeeper_v2] loading; other modules use defaults.",
-                        config_path,
+                        ghost_brain_config_path,
                         e
                     );
                     None
@@ -1516,7 +1622,7 @@ async fn main() -> Result<()> {
         } else {
             warn!(
                 "⚠️  Ghost Brain config not found at {:?}. Using defaults.",
-                config_path
+                ghost_brain_config_path
             );
             None
         }
@@ -1961,6 +2067,9 @@ async fn main() -> Result<()> {
         account_state_core: Some(Arc::clone(oracle_runtime.account_state_core())),
         shadow_lifecycle_log_path,
         probe_lifecycle_log_path,
+        shadow_v2_burnin: shadow_v2_burnin_config
+            .enabled
+            .then(|| shadow_v2_burnin_config.clone()),
     };
     let hydration_live_sell_handle = post_buy_config.live_sell.clone();
     let post_buy_handle = tokio::spawn(async move {
@@ -2939,6 +3048,47 @@ min_consecutive_buys = 1.0
             .to_string()
             .contains("refusing to start Gatekeeper V2 with built-in defaults"));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_shadow_v2_burnin_partial_loader_survives_unrelated_full_config_error() {
+        let tmp = tempdir().expect("temp dir");
+        let path = tmp.path().join("ghost_brain_shadow_v2_partial.toml");
+        let toml = r#"
+[confidence]
+threshold_high = 0.1
+threshold_medium = 0.2
+threshold_low = 0.3
+
+[shadow_v2_burnin]
+enabled = true
+mode = "logging_only_validation"
+simulation_contract_version = "shadow_burnin_simulation_v2_20260629"
+validation_profile = "shadow_v2_fidelity_validation_logging_only"
+run_namespace = "shadow-burnin-v2-fidelity-validation-logging-only"
+scope_root_path = "reports/selector/shadow-v2-fidelity-validation"
+pre_run_manifest_path = "reports/selector/shadow-v2-fidelity-validation/pre_run_manifest.json"
+post_run_manifest_path = "reports/selector/shadow-v2-fidelity-validation/post_run_manifest.json"
+manifest_audit_script = "scripts/shadow_v2_manifest_audit.py"
+required_schema_manifest_path = "reports/selector/shadow_v2_required_schema_manifest.csv"
+acceptance_gates_path = "reports/selector/shadow_v2_acceptance_gates.csv"
+canonical_event_stream_path = "reports/selector/shadow-v2-fidelity-validation/shadow_position_event_v2.jsonl"
+replay_v2_path = "reports/selector/shadow-v2-fidelity-validation/shadow_replay_v2.jsonl"
+lifecycle_v2_path = "reports/selector/shadow-v2-fidelity-validation/shadow_lifecycle_v2.jsonl"
+path_density_v2_path = "reports/selector/shadow-v2-fidelity-validation/shadow_path_density_v2.jsonl"
+"#;
+        std::fs::write(&path, toml).expect("write shadow v2 partial config");
+
+        let _full_error = GhostBrainConfig::from_toml_file(&path)
+            .expect_err("unrelated confidence validation must break full config");
+
+        let shadow_v2 = load_shadow_v2_burnin_runtime_config(&path)
+            .expect("shadow_v2_burnin partial loader must still succeed");
+        assert!(shadow_v2.enabled);
+        assert_eq!(
+            shadow_v2.run_namespace.as_deref(),
+            Some("shadow-burnin-v2-fidelity-validation-logging-only")
+        );
     }
 
     #[test]

@@ -890,6 +890,132 @@ PR14 audit semantics:
 - `CONTRACT_READY` is not `SHADOW_V2_LIVE_EQUIVALENCE_GRADE`;
 - real dataset absence keeps max verdict at `SHADOW_V2_RESEARCH_GRADE_ONLY`.
 
+## PR15 Boundary
+
+PR15 is:
+
+```text
+Shadow V2 Validation Execution Harness
+```
+
+PR15 is the first runtime-adjacent logging-only evidence producer for Shadow V2.
+It remains disabled by default and must not change decision or execution
+semantics.
+
+PR15 is not:
+
+- validation burnin execution;
+- strategy proof;
+- RCE proof;
+- selector proof;
+- edge proof;
+- runtime approval;
+- `shadow_close_only` approval;
+- active close approval.
+
+Required PR15 config fields when `shadow_v2_burnin.enabled=true`:
+
+- `scope_root_path`;
+- `pre_run_manifest_path`;
+- `post_run_manifest_path`;
+- `canonical_event_stream_path`;
+- `replay_v2_path`;
+- `lifecycle_v2_path`;
+- `path_density_v2_path`.
+
+Disabled behavior:
+
+- `shadow_v2_burnin.enabled=false` preserves process startup and runtime
+  behavior;
+- no Shadow V2 validation harness is initialized;
+- no manifest audit is invoked;
+- no Shadow V2 artifact is consumed by decision or execution paths.
+
+Enabled behavior:
+
+- `[shadow_v2_burnin]` must be loaded by a partial Shadow V2 burnin config
+  loader before the full Ghost Brain config fallback path;
+- an unrelated full Ghost Brain config error must not silently turn
+  `shadow_v2_burnin.enabled=true` into disabled/no harness;
+- the validation harness may fail startup only as
+  `SHADOW_V2_VALIDATION_PREFLIGHT_FAILED`;
+- this failure is not a Gatekeeper failure, BUY/REJECT failure or selector
+  failure;
+- pre-run manifest audit runs with `--strict`;
+- post-run manifest audit runs as a generation pass without `--strict`, followed
+  by a separate strict verification pass.
+- post-run generation writes both `post_run_manifest.json` and
+  `shadow_v2_manifest_report.csv`;
+- generation targets passed by `--write-manifest` and `--write-report-csv` are
+  treated as artifacts produced in the same pass and must not create a
+  self-blocked manifest.
+
+Python manifest audit is allowed only at harness start and shutdown/post-run.
+Python manifest audit must not run per event, per slot, per tx, per position
+update or in the hot decision path.
+
+PR15 canonical artifact:
+
+```text
+shadow_position_event_v2.jsonl
+```
+
+PR15 derived artifacts:
+
+```text
+shadow_replay_v2.jsonl
+shadow_lifecycle_v2.jsonl
+shadow_path_density_v2.jsonl
+```
+
+Derived replay/lifecycle rows are append-only snapshots keyed by canonical
+high-watermark:
+
+```text
+replay_v2:{position_id}:{source_canonical_high_watermark}
+lifecycle_v2:{position_id}:{source_canonical_high_watermark}
+```
+
+Derived artifacts are not canonical terminal truth and must include canonical
+source refs.
+
+`shadow_path_density_v2` rows must use a concrete wrapper schema with:
+
+- schema identity;
+- run/session/position/pool/mint identity;
+- canonical event stream ref;
+- source path sample event ids;
+- source canonical high-watermark;
+- horizon verdict;
+- path point and coverage counts;
+- interval and horizon metadata;
+- duplicate/non-monotonic/truncation flags;
+- limitations;
+- creation wall-clock timestamp.
+
+Bare `ShadowPathHorizonEvaluationV2` rows are not valid
+`shadow_path_density_v2` JSONL records.
+
+PR15 write outcome must distinguish:
+
+- canonical durable write success/failure;
+- replay derived write success/failure/skipped;
+- lifecycle derived write success/failure/skipped;
+- density write success/failure/skipped.
+
+Canonical durable success must not be rolled back when a derived artifact write
+fails. Instead the harness must emit a validation evidence status such as
+`DERIVED_ARTIFACT_WRITE_FAILED` or `DENSITY_WRITE_FAILED`.
+
+PR15 may emit a minimal diagnostic `shadow_position_v2` after accepted shadow
+handoff. Such a record must stay:
+
+- `simulation_level=MARK_ONLY`;
+- `measurement_grade=DIAGNOSTIC_ONLY`;
+- limitation `PR15_MINIMAL_POSITION_CREATED_ONLY`;
+- limitation `NO_ENTRY_FILL_EXIT_FILL_OR_PATH_INFERENCE_IN_PR15`;
+- limitation `SHADOW_V2_RECORD_NOT_CONSUMED_BY_DECISIONS`.
+
 ## Research-Grade Gates
 
 `SHADOW_V2_RESEARCH_GRADE` requires:
@@ -927,11 +1053,14 @@ PR14 audit semantics:
 ## Runtime Boundary
 
 PR10/PR11 remain side-by-side Shadow V2 manifest/config contracts and fixtures
-only.
+only. PR15 adds a disabled-by-default logging-only validation harness, but does
+not grant strategy, research-grade or live-equivalence proof.
 
-Forbidden in PR10/PR11:
+Forbidden in PR10/PR11/PR15:
 
-- runtime writer activation,
+- non-logging-only writer activation,
+- any writer activation that affects BUY/REJECT, Gatekeeper, selector or
+  execution behavior,
 - runtime config consumption for execution,
 - lifecycle behavior change,
 - replay behavior change,
