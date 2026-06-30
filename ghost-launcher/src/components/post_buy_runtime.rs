@@ -368,6 +368,7 @@ fn shadow_v2_post_run_generation_args(
         .map(str::trim)
         .filter(|run_id| !run_id.is_empty())
         .ok_or_else(|| "missing run_namespace".to_string())?;
+    let report_path = Path::new(scope_root).join("shadow_v2_manifest_report.csv");
     Ok(vec![
         "--scope-root".to_string(),
         scope_root.to_string(),
@@ -377,6 +378,8 @@ fn shadow_v2_post_run_generation_args(
         run_id.to_string(),
         "--write-manifest".to_string(),
         post_run_manifest_path.to_string(),
+        "--write-report-csv".to_string(),
+        report_path.to_string_lossy().to_string(),
         "--schema-manifest".to_string(),
         config.required_schema_manifest_path.clone(),
         "--acceptance-gates".to_string(),
@@ -4077,11 +4080,13 @@ mod tests {
 
         let generation = shadow_v2_post_run_generation_args(&config).unwrap();
         assert!(generation.contains(&"--write-manifest".to_string()));
+        assert!(generation.contains(&"--write-report-csv".to_string()));
         assert!(!generation.contains(&"--strict".to_string()));
 
         let verification = shadow_v2_post_run_verification_args(&config).unwrap();
         assert!(verification.contains(&"--strict".to_string()));
         assert!(!verification.contains(&"--write-manifest".to_string()));
+        assert!(!verification.contains(&"--write-report-csv".to_string()));
     }
 
     #[test]

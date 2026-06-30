@@ -5071,7 +5071,8 @@ impl GhostBrainConfig {
     /// Load ONLY `[shadow_v2_burnin]` from TOML without validating full GhostBrain config.
     ///
     /// PR11 uses this for static validation of an inert logging-only Shadow V2
-    /// burnin profile. The runtime does not consume this loader.
+    /// burnin profile. PR15 also uses it at launcher startup so enabled Shadow
+    /// V2 validation cannot be silently skipped by unrelated full-config errors.
     pub fn shadow_v2_burnin_from_toml_file<P: AsRef<Path>>(
         path: P,
     ) -> anyhow::Result<ShadowV2BurninConfig> {

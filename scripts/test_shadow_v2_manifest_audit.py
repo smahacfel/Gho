@@ -99,6 +99,57 @@ def test_missing_required_artifact_blocks_manifest() -> None:
         assert any("missing required artifact" in blocker for blocker in blockers)
 
 
+def test_post_run_generation_does_not_self_block_manifest() -> None:
+    module = load_module()
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        write_fixture_scope(root)
+        (root / "post_run_manifest.json").unlink()
+        (root / "shadow_v2_manifest_report.csv").unlink()
+
+        manifest_path = root / "post_run_manifest.json"
+        report_path = root / "shadow_v2_manifest_report.csv"
+        generation_status = module.main(
+            [
+                "--scope-root",
+                str(root),
+                "--manifest-phase",
+                "post_run",
+                "--run-id",
+                "fixture-run",
+                "--write-manifest",
+                str(manifest_path),
+                "--write-report-csv",
+                str(report_path),
+                "--artifact-contract",
+                str(ARTIFACT_CONTRACT),
+            ]
+        )
+        assert generation_status == 0
+        generated = module.json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert generated["status"] == "PASS"
+        assert "post_run_manifest.json" not in generated["required_artifacts_missing"]
+        assert "shadow_v2_manifest_report.csv" not in generated["required_artifacts_missing"]
+        assert not any(
+            "missing required artifact: post_run_manifest.json" in blocker
+            for blocker in generated["blockers"]
+        )
+        assert report_path.exists()
+
+        strict_status = module.main(
+            [
+                "--scope-root",
+                str(root),
+                "--manifest-phase",
+                "post_run",
+                "--artifact-contract",
+                str(ARTIFACT_CONTRACT),
+                "--strict",
+            ]
+        )
+        assert strict_status == 0
+
+
 def test_malformed_jsonl_blocks_manifest() -> None:
     module = load_module()
     with tempfile.TemporaryDirectory() as tmp:
@@ -128,5 +179,6 @@ def test_malformed_jsonl_blocks_manifest() -> None:
 if __name__ == "__main__":
     test_complete_manifest_passes()
     test_missing_required_artifact_blocks_manifest()
+    test_post_run_generation_does_not_self_block_manifest()
     test_malformed_jsonl_blocks_manifest()
     print("shadow_v2_manifest_audit fixtures: PASS")

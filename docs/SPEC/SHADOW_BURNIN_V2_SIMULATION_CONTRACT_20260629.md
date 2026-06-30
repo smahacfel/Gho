@@ -933,6 +933,10 @@ Disabled behavior:
 
 Enabled behavior:
 
+- `[shadow_v2_burnin]` must be loaded by a partial Shadow V2 burnin config
+  loader before the full Ghost Brain config fallback path;
+- an unrelated full Ghost Brain config error must not silently turn
+  `shadow_v2_burnin.enabled=true` into disabled/no harness;
 - the validation harness may fail startup only as
   `SHADOW_V2_VALIDATION_PREFLIGHT_FAILED`;
 - this failure is not a Gatekeeper failure, BUY/REJECT failure or selector
@@ -940,6 +944,11 @@ Enabled behavior:
 - pre-run manifest audit runs with `--strict`;
 - post-run manifest audit runs as a generation pass without `--strict`, followed
   by a separate strict verification pass.
+- post-run generation writes both `post_run_manifest.json` and
+  `shadow_v2_manifest_report.csv`;
+- generation targets passed by `--write-manifest` and `--write-report-csv` are
+  treated as artifacts produced in the same pass and must not create a
+  self-blocked manifest.
 
 Python manifest audit is allowed only at harness start and shutdown/post-run.
 Python manifest audit must not run per event, per slot, per tx, per position

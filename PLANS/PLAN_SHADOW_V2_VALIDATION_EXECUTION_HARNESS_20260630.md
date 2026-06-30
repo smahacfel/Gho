@@ -75,6 +75,10 @@ Gdy `shadow_v2_burnin.enabled=false`:
 
 Gdy `shadow_v2_burnin.enabled=true`:
 
+- sekcja `[shadow_v2_burnin]` musi byc ladowana partial loaderem niezaleznie
+  od pelnego `GhostBrainConfig::from_toml_file`;
+- unrelated full-config error nie moze cicho wylaczyc harnessu, jezeli
+  `[shadow_v2_burnin].enabled=true`;
 - config musi miec `mode=logging_only_validation`;
 - config musi miec `logging_only=true`;
 - config musi miec `runtime_approval=false`;
@@ -211,9 +215,14 @@ python3 scripts/shadow_v2_manifest_audit.py \
   --manifest-phase post_run \
   --run-id <run_namespace_or_session_id> \
   --write-manifest <post_run_manifest_path> \
+  --write-report-csv <scope_root>/shadow_v2_manifest_report.csv \
   --schema-manifest reports/selector/shadow_v2_required_schema_manifest.csv \
   --acceptance-gates reports/selector/shadow_v2_acceptance_gates.csv
 ```
+
+Generation pass musi traktowac `--write-manifest` i `--write-report-csv` jako
+artefakty generowane w tym samym przebiegu. Brak tych plikow przed zapisem nie
+moze stworzyc self-blocked manifestu z `status=BLOCKED`.
 
 Verification pass:
 
@@ -247,6 +256,7 @@ Wymagane bramki:
 
 - `GATE_PR15_ENABLED_FALSE_NO_BEHAVIOR_CHANGE`;
 - `GATE_PR15_ENABLED_TRUE_PREFLIGHT_FAIL_CLOSED`;
+- `GATE_PR15_PARTIAL_CONFIG_FAIL_CLOSED`;
 - `GATE_PR15_NO_DECISION_CONSUMPTION`;
 - `GATE_PR15_NO_HOT_PATH_PYTHON`;
 - `GATE_PR15_CANONICAL_WRITER_DURABILITY`;
@@ -255,6 +265,7 @@ Wymagane bramki:
 - `GATE_PR15_LIFECYCLE_DERIVED_FROM_CANONICAL`;
 - `GATE_PR15_PATH_DENSITY_ROW_SCHEMA`;
 - `GATE_PR15_POST_RUN_GENERATE_THEN_STRICT_VERIFY`;
+- `GATE_PR15_POST_RUN_SELF_GENERATED_MANIFEST_PASS`;
 - `GATE_PR15_NO_RAW_JSONL_OR_LOG_STAGED`.
 
 ## 10. Verification

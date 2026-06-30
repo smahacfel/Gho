@@ -28,11 +28,14 @@ Wprowadzono minimalny Shadow V2 validation execution harness:
 - dozwolony tylko dla `mode=logging_only_validation`;
 - logging-only;
 - bez konsumpcji przez decision/execution path;
+- z partial loaderem `[shadow_v2_burnin]`, ktory nie zalezy od sukcesu pelnego
+  `GhostBrainConfig`;
 - z pre-run strict manifest preflight;
 - z canonical writer wrapperem;
 - z derived replay/lifecycle snapshots;
 - z concrete `shadow_path_density_v2` row wrapper;
-- z post-run generation pass bez `--strict` i osobnym strict verification pass.
+- z post-run generation pass bez `--strict`, report CSV generation i osobnym
+  strict verification pass.
 
 `shadow_v2_burnin.enabled=false` zachowuje dotychczasowe zachowanie procesu.
 `shadow_v2_burnin.enabled=true` moze fail-closed tylko jako
@@ -79,7 +82,12 @@ Zaimplementowano:
 
 - wymagane config fields `scope_root_path` i `path_density_v2_path`;
 - validation preflight w launcher main tylko dla enabled Shadow V2 burnin;
+- niezalezne ladowanie `[shadow_v2_burnin]`, dzieki ktoremu unrelated full
+  config error nie moze cicho pominac `enabled=true`;
 - manifest audit przez Python tylko przy start/shutdown;
+- manifest generation traktuje `--write-manifest` i `--write-report-csv` jako
+  artefakty generowane w tym samym przebiegu, wiec manifest nie moze sam siebie
+  zapisac jako `BLOCKED` przez brak `post_run_manifest.json`;
 - canonical append z derived replay/lifecycle/density writes;
 - outcome oddzielajacy canonical durable success od derived artifact failure;
 - minimalne runtime wiring emitujace tylko diagnostic `shadow_position_v2` po
