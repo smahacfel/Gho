@@ -121,7 +121,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{watch, Mutex as TokioMutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{broadcast, watch, Mutex as TokioMutex, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, info, trace, warn};
 
 // =============================================================================
@@ -24569,6 +24569,7 @@ pub async fn start_oracle_runtime_task(
         authoritative_funding_stream_available,
         false,
         None,
+        None,
     )
     .await;
 }
@@ -24595,6 +24596,7 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
     authoritative_funding_stream_available: bool,
     authoritative_funding_coverage_gate_enabled: bool,
     mut authoritative_funding_stream_availability_rx: Option<watch::Receiver<bool>>,
+    mut shutdown_rx: Option<broadcast::Receiver<()>>,
 ) {
     info!(
         "🔮 RUSZA WATEK Oracle Runtime (OKNO: {}ms, execution_mode: {:?}, dry_run: {}, iwim_veto: {})",
@@ -24863,6 +24865,22 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
 
     loop {
         tokio::select! {
+            shutdown = async {
+                match shutdown_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending::<Result<(), broadcast::error::RecvError>>().await,
+                }
+            }, if shutdown_rx.is_some() => {
+                match shutdown {
+                    Ok(()) => info!("OracleRuntime shutdown signal received; stopping event loop"),
+                    Err(error) => warn!(
+                        error = %error,
+                        "OracleRuntime shutdown receiver closed; stopping event loop"
+                    ),
+                }
+                break;
+            }
+
             availability_changed = async {
                 match authoritative_funding_stream_availability_rx.as_mut() {
                     Some(rx) => rx.changed().await,
@@ -47134,6 +47152,66 @@ mod tests {
             detected_at: std::time::SystemTime::now(),
             sequence_number,
         }
+    }
+
+    #[tokio::test]
+    async fn oracle_runtime_stops_on_shutdown_receiver() {
+        use ghost_brain::config::IwimVetoGateConfig;
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let ledger = Arc::new(ShadowLedger::new());
+        let oracle_runtime = Arc::new(OracleRuntime::new(
+            Arc::new(HyperPredictionOracle::default()),
+            "pump_program".to_string(),
+            "bonk_program".to_string(),
+            Arc::clone(&ledger),
+        ));
+        let snapshot_engine = Arc::new(SnapshotEngine::new(16, 0));
+        let (event_tx, event_rx) = crate::events::create_event_bus();
+        let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
+
+        let task_handle = tokio::spawn(start_oracle_runtime_task_with_funding_availability(
+            event_rx,
+            Arc::clone(&oracle_runtime),
+            Arc::clone(&snapshot_engine),
+            event_tx.clone(),
+            None,
+            8_000,
+            GatekeeperV2Config::default(),
+            GatekeeperV3Config::default(),
+            IwimVetoGateConfig::default(),
+            ExecutionMode::Shadow,
+            true,
+            temp.path().join("decisions").display().to_string(),
+            temp.path()
+                .join("shadow_entries.jsonl")
+                .display()
+                .to_string(),
+            Some(
+                temp.path()
+                    .join("shadow_lifecycle.jsonl")
+                    .display()
+                    .to_string(),
+            ),
+            None,
+            temp.path().join("events").display().to_string(),
+            None,
+            true,
+            false,
+            false,
+            None,
+            Some(shutdown_rx),
+        ));
+
+        shutdown_tx
+            .send(())
+            .expect("shutdown receiver should be subscribed");
+
+        tokio::time::timeout(Duration::from_secs(1), task_handle)
+            .await
+            .expect("OracleRuntime should stop after shutdown signal")
+            .expect("OracleRuntime task should not panic");
     }
 
     #[tokio::test]

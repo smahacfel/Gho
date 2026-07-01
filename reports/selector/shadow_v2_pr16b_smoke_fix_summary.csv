@@ -1,0 +1,12 @@
+metric,value,status,notes
+fix_id,PR16B_SMOKE_FIXES_20260701,INFO,fixes blockers from PR16A smoke r2
+schema_contract_fix,top_level_shadow_position_event_v2_schema,PASS,ShadowPositionEventV2 emits artifact schema while keeping payload schema shadow_position_v2
+shutdown_fix,oracle_runtime_shutdown_receiver,PASS,OracleRuntime receives global shutdown and exits event loop
+ghost_brain_schema_test,PASS,PASS,cargo test -p ghost-brain shadow_v2_terminal_jsonl_writer_emits_canonical_event_stream -- --nocapture
+ghost_launcher_shutdown_test,PASS,PASS,cargo test -p ghost-launcher oracle_runtime_stops_on_shutdown_receiver -- --nocapture
+manifest_audit_fixture_test,PASS,PASS,PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_shadow_v2_manifest_audit.py
+runtime_approval,false,PASS,no runtime approval granted
+shadow_close_only_approval,false,PASS,no shadow_close_only approval granted
+active_close_approval,false,PASS,no active close approval granted
+strategy_research_unblocked,false,PASS,PR17 remains blocked until repeated smoke PASS
+live_equivalence,NOT_GRANTED,PASS,no live equivalence claim

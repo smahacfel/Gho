@@ -2216,6 +2216,7 @@ async fn main() -> Result<()> {
     let oracle_events_output_dir = config.execution.events.output_dir.clone();
     let oracle_health = Arc::clone(&health);
     let oracle_authoritative_funding_stream_rx = authoritative_funding_stream_rx;
+    let oracle_shutdown_rx = shutdown_tx.subscribe();
     let oracle_authoritative_funding_coverage_gate_enabled =
         config.seer.enabled && matches!(config.seer.funding_lane_mode.as_str(), "full_chain");
 
@@ -2253,6 +2254,7 @@ async fn main() -> Result<()> {
             initial_authoritative_funding_stream_available,
             oracle_authoritative_funding_coverage_gate_enabled,
             oracle_authoritative_funding_stream_rx,
+            Some(oracle_shutdown_rx),
         )
         .await;
     });
