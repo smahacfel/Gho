@@ -1,0 +1,38 @@
+metric,value,status,notes
+smoke_id,shadow-burnin-v2-fidelity-validation-logging-only-smoke-r4,INFO,logging-only smoke after PR16C merge
+pr17_head,eaf9cc91de83652550d36400b372aac2163f775a,INFO,requested PR17 head confirmed and already merged
+main_head,5359a6c2e1622823fc09d7b2f1506fff3360d21d,INFO,local main after PR17 merge
+pre_run_manifest,PASS,PASS,generated fresh for smoke r4
+pre_run_strict_audit,PASS,PASS,no blockers
+launcher_preflight,PASS,PASS,Gatekeeper contract NLN gRPC app probe RPC balance and metrics passed after local smoke config/env correction
+runtime_stream_established,true,PASS,log contained Stream established
+all_components_started,true,PASS,log contained All components started
+smoke_marker_emitted,true,PASS,PostBuyRuntime emitted Shadow V2 validation smoke marker
+shadow_position_event_v2_rows,1,PASS,canonical evidence exists
+shadow_replay_v2_rows,1,PASS,derived replay row exists
+shadow_lifecycle_v2_rows,1,PASS,derived lifecycle row exists
+shadow_path_density_v2_rows,7,PASS,density rows exist with no path coverage marker semantics
+post_run_manifest_status,PASS,PASS,post_run_manifest blockers empty
+post_run_strict_audit,PASS,PASS,manifest strict audit passed
+validation_burnin_plan_audit,PASS,PASS,python3 scripts/shadow_v2_validation_burnin_plan_audit.py --strict
+legacy_downgrade_audit,PASS,PASS,python3 scripts/shadow_v2_legacy_downgrade_audit.py --strict
+oracle_runtime_shutdown_success,true,PASS,log contained Oracle Runtime shut down successfully
+post_buy_runtime_shutdown_success,true,PASS,log contained PostBuyRuntime shut down successfully
+seer_shutdown_signal_received,true,PASS,log contained Seer Shutdown signal received
+seer_component_stopped,true,PASS,log contained Seer Component stopped
+seer_shutdown_success,true,PASS,log contained Seer shut down successfully
+transport_channel_disconnected_count,0,PASS,PR16C fixed r3 reconnect/disconnect flood
+sigterm_used,false,PASS,no SIGTERM was sent or observed in log
+watchdog_shutdown_success,false,FAIL,log did not contain Watchdog shut down successfully
+all_components_shutdown_logged,false,FAIL,log did not contain final all-components shutdown line
+reconciliation_runtime_health_after_watchdog_wait,2,FAIL,ReconciliationRuntime health continued after launcher logged Waiting for Watchdog to shut down
+clean_shutdown_proven,false,FAIL,process did not produce final clean shutdown evidence within bounded wait
+forced_stop_used,NONE,PASS,no SIGTERM was used during smoke r4
+nln_grpc_auth_or_endpoint_issue,false,PASS,preflight and stream established passed no PermissionDenied or Account disabled
+runtime_approval,false,PASS,no runtime approval granted
+shadow_close_only_approval,false,PASS,no shadow_close_only approval granted
+active_close_approval,false,PASS,no active close approval granted
+strategy_research_unblocked,false,PASS,PR17 remains blocked
+research_grade,NOT_GRANTED,PASS,smoke is not research-grade burnin
+live_equivalence,NOT_GRANTED,PASS,no live-equivalence claim
+final_verdict,FAIL_BLOCKED_LAUNCHER_WATCHDOG_RECONCILIATION_SHUTDOWN_WAIT,FAIL,PR16C fixed Seer gRPC shutdown loop but full launcher clean shutdown remains unproven
