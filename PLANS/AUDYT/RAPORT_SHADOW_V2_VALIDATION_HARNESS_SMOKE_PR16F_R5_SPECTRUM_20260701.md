@@ -2,11 +2,15 @@
 
 ## 1. Werdykt wykonawczy
 
-Werdykt smoke r5-spectrum po merge PR16E oraz PR20 operator defaults:
+Werdykt po powtorzonym logging-only smoke r5-spectrum wykonanym po podniesieniu limitu NLN Program Streams:
 
-`CORE_HARNESS_SMOKE_PASS_PROGRAM_STREAMS_PARTIAL_FAILURE`
+`SHADOW_V2_LOGGING_ONLY_SMOKE_PASS`
 
-Rdzen Shadow V2 logging-only harness przeszedl:
+Aktualny smoke potwierdzil kompletna sciezke Shadow V2 validation harness:
+
+`pre_run_manifest -> launcher preflight -> canonical JSONL -> derived replay/lifecycle -> density rows -> post_run_manifest PASS -> clean shutdown`
+
+Najwazniejsze bramki:
 
 - `shadow_position_event_v2.jsonl` rows: `1`;
 - `shadow_replay_v2.jsonl` rows: `1`;
@@ -17,23 +21,45 @@ Rdzen Shadow V2 logging-only harness przeszedl:
 - clean shutdown: `PASS`;
 - `SIGTERM`: `0`;
 - `Transport channel disconnected`: `0`;
+- `NLN Subscribe request failed`: `0` w aktualnym oknie smoke;
+- `solana.pump_fun.buy`: first message received;
+- `solana.pump_fun.buy_exact_sol_in`: first message received;
 - final runtime line: `Ghost Launcher shutdown complete`.
 
-Pelna konfiguracja ingestu nie jest jeszcze gotowa do PR17 fidelity validation burnin, poniewaz jeden z dwoch wymaganych NLN Program Streams topic-ow nie dostarczyl danych:
+To nadal nie jest PR17 fidelity validation burnin, nie jest strategy proof i nie jest research-grade evidence. Jest to pozytywne domkniecie operacyjnego smoke writer/materializer/manifest/shutdown oraz Program Streams coverage dla dwoch wymaganych topicow.
 
-- `solana.pump_fun.buy_exact_sol_in`: `PASS`, pierwszy message odebrany;
-- `solana.pump_fun.buy`: `FAIL`, lane zakonczyl sie po `NLN Subscribe request failed`.
+## 2. Aktualne miejsce w procesie
 
-To nie jest PR17 fidelity validation burnin, nie jest strategy proof i nie jest research-grade evidence.
+Jestesmy po:
 
-## 2. Zakres operacyjny
+- PR15: logging-only Shadow V2 harness;
+- PR16A: deterministic smoke marker;
+- PR16B/PR16C/PR16E: schema/shutdown fixes;
+- PR20: jawne operator defaults dla NLN + Spectrum;
+- PR16F r5-spectrum smoke repeat po zwiekszeniu limitu Program Streams przez providera.
+
+Aktualny wynik oznacza:
+
+- blocker `FAIL_BLOCKED_NO_CANONICAL_V2_EVIDENCE`: zamkniety;
+- blocker schema/manifest: zamkniety;
+- blocker Seer/gRPC disconnect flood: zamkniety;
+- blocker Watchdog/Reconciliation shutdown wait: zamkniety;
+- blocker Program Streams partial coverage dla `solana.pump_fun.buy`: zamkniety w aktualnym smoke.
+
+Nastepny etap moze byc dopiero PR17 fidelity validation burnin, ale wymaga osobnej dyspozycji. PR17 nie zostal uruchomiony w ramach tego zadania.
+
+## 3. Zakres operacyjny smoke
 
 Zakres wykonany:
 
-- lokalny `main` po merge PR20 operator defaults:
+- branch raportowy: `codex/shadow-v2-pr16f-r5-spectrum-smoke-report`;
+- commit bazowy raportowego PR przed aktualizacja: `704110409b50c846a31f74af67e3e8e8cb1b1f58`;
+- lokalny main po merge PR20 operator defaults:
   `7bb558fbad66e0974b363bd564b46f922b7becb9`;
 - przygotowano swiezy scope:
   `reports/selector/shadow-v2-fidelity-validation-r5-spectrum`;
+- poprzedni lokalny scope r5 przeniesiono do lokalnego backupu:
+  `reports/selector/_local_smoke_backups/`;
 - wygenerowano swiezy `pre_run_manifest.json` dla:
   `shadow-burnin-v2-fidelity-validation-logging-only-smoke-r5-spectrum`;
 - uruchomiono wylacznie logging-only smoke z:
@@ -42,10 +68,7 @@ Zakres wykonany:
 - NLN zostal uzyty dla:
   - glownego gRPC ingestu: `grpc.nln.clr3.org:443`;
   - Program Streams: `events.nln.clr3.org:443`;
-- Spectrum zostal uzyty jako RPC endpoint dla shadow burnin smoke:
-  - `GHOST_SEER_RPC_ENDPOINT`;
-  - `GHOST_TRIGGER_RPC_URL`;
-  - `GHOST_TRIGGER_SHADOW_RPC_URL`.
+- Spectrum zostal uzyty jako RPC endpoint dla shadow burnin smoke.
 
 Zakres wykluczony:
 
@@ -62,7 +85,7 @@ Zakres wykluczony:
 - brak active close;
 - brak ingerencji w R51.
 
-## 3. Lokalny smoke config
+## 4. Lokalny smoke config
 
 Do smoke r5-spectrum uzyto lokalnych, niestage'owanych plikow `*.local.toml`:
 
@@ -77,11 +100,12 @@ Lokalny launcher config zachowal:
 - NLN Program Streams z dwoma topicami:
   - `solana.pump_fun.buy`;
   - `solana.pump_fun.buy_exact_sol_in`;
+- Program Streams `max_streams=2`;
 - osobny smoke scope i osobne porty dla r5-spectrum.
 
-Sekrety zostaly zaladowane wylacznie z lokalnego srodowiska procesu. Sekrety nie sa zapisane w tym raporcie.
+Sekrety nie sa zapisane w tym raporcie.
 
-## 4. Pre-run i preflight
+## 5. Pre-run i preflight
 
 Pre-run manifest generation:
 
@@ -97,21 +121,22 @@ Pre-run strict audit:
 Build/preflight:
 
 - `cargo build -p ghost-launcher --bin ghost-launcher --release`: `PASS`;
-- launcher preflight: `PASS`;
+- launcher start: `PASS`;
 - execution mode: `Shadow`;
 - entry mode: `shadow_only`;
-- Gatekeeper contract: `PASS`;
-- NLN gRPC app probe: `PASS`;
-- Spectrum RPC `getVersion`: `PASS`, `4.1.0`;
-- trigger balance: `PASS`;
-- metrics port: `PASS`.
+- NLN gRPC endpoint widoczny w runtime: `grpc.nln.clr3.org:443`;
+- Spectrum RPC endpoint widoczny w runtime configu.
 
-## 5. Runtime evidence
+## 6. Runtime evidence
 
-Runtime smoke potwierdzil:
+Aktualne okno smoke zaczelo sie o:
+
+`2026-07-01T22:50:33+00:00`
+
+W logu z tego okna potwierdzono:
 
 - `All components started successfully`: `1`;
-- primary gRPC stream established: `PASS`;
+- primary gRPC ingest emitowal transakcje: `PASS`;
 - `PostBuyRuntime: Shadow V2 validation smoke marker emitted`: `1`;
 - `Oracle Runtime shut down successfully`: `1`;
 - `PostBuyRuntime shut down successfully`: `1`;
@@ -130,36 +155,34 @@ Rzeczywiste artefakty Shadow V2:
 | `shadow_path_density_v2.jsonl` | 7 | PASS |
 | `post_run_manifest.json` | n/a | PASS |
 
-## 6. Post-run manifest
+## 7. Post-run manifest
 
-Post-run manifest:
+Post-run manifest zapisany przez harness:
 
 - status: `PASS`;
 - blockers: `[]`;
+- artifact_count: `5`;
 - schema coverage:
   - `shadow_position_event_v2`: `1`;
   - `shadow_replay_v2`: `1`;
   - `shadow_lifecycle_v2`: `1`;
   - `shadow_path_density_v2`: `7`.
 
-Post-run strict audit:
+Niezalezny post-run strict audit:
 
+- command:
+  `python3 scripts/shadow_v2_manifest_audit.py --scope-root reports/selector/shadow-v2-fidelity-validation-r5-spectrum --manifest-phase post_run --schema-manifest reports/selector/shadow_v2_required_schema_manifest.csv --acceptance-gates reports/selector/shadow_v2_acceptance_gates.csv --strict`;
 - status: `PASS`;
-- blockers: `[]`.
+- blockers: `[]`;
+- schema coverage zgodne z artefaktami.
 
-Static guards:
-
-- `python3 scripts/shadow_v2_validation_burnin_plan_audit.py --strict`: `PASS`;
-- `python3 scripts/shadow_v2_legacy_downgrade_audit.py --strict`: `PASS`.
-
-## 7. Clean shutdown
+## 8. Clean shutdown
 
 Clean shutdown zostal udowodniony.
 
 Chronologia:
 
 - wyslano jeden `SIGINT`;
-- proces `ghost-launcher` zakonczyl sie po okolo `10.2s` od sygnalu shutdown;
 - `SIGTERM`: `0`;
 - `Transport channel disconnected`: `0`;
 - `Watchdog shut down successfully`: `1`;
@@ -168,37 +191,53 @@ Chronologia:
 
 Wniosek:
 
-PR16E domknal residual shutdown blocker z r4. Dla r5-spectrum nie ma juz blockera Watchdog/Reconciliation/final launcher join.
+Nie ma juz blockera Watchdog/Reconciliation/final launcher join w aktualnym smoke.
 
-## 8. NLN gRPC i Program Streams
+## 9. NLN gRPC i Program Streams
 
 NLN gRPC ingest dzialal:
 
 - `seer.grpc_endpoint`: `grpc.nln.clr3.org:443`;
 - runtime stream established: `PASS`;
+- emitowal `PoolTransaction` przez `grpc_global_stream`;
 - `PermissionDenied`: `0`;
 - `Account disabled`: `0`;
 - `Transport channel disconnected`: `0`.
 
-NLN Program Streams endpoint `events.nln.clr3.org:443` nie wykazuje juz starego problemu typu 502/ListTopics/provisioning:
+NLN Program Streams endpoint:
 
-- Program Streams started topic count: `2`;
+- endpoint: `events.nln.clr3.org:443`;
+- requested topics: `2`;
+- allowed stream count: `2`;
+- started topics:
+  - `solana.pump_fun.buy`;
+  - `solana.pump_fun.buy_exact_sol_in`;
 - `ListTopics`: `PASS`;
 - `topic_count`: `1074`;
 - `missing_selected_topics=[]`.
 
-Jednoczesnie pelna dwutopic coverage nie jest potwierdzona:
+Dwutopic coverage w aktualnym smoke:
 
 | Topic | Evidence | Status |
 |---|---|---|
+| `solana.pump_fun.buy` | first message received | PASS |
 | `solana.pump_fun.buy_exact_sol_in` | first message received | PASS |
-| `solana.pump_fun.buy` | `NLN Subscribe request failed`, lane exited | FAIL |
 
-Nie mozna na podstawie tego smoke przesadzic, czy przyczyna `solana.pump_fun.buy` lezy po stronie providera, sposobu subscribe requestu, czy szczegolowej semantyki topicu. Mozna natomiast powiedziec, ze nie jest to juz ten sam globalny problem z endpointem `events.nln.clr3.org:443`, bo `ListTopics` dziala, topic-i sa widoczne, a drugi topic odbiera dane.
+Negatywne sygnaly w aktualnym oknie smoke:
 
-## 9. Znaczenie dla PR17
+| Pattern | Count |
+|---|---:|
+| `NLN Subscribe request failed` | 0 |
+| `Transport channel disconnected` | 0 |
+| `status: 502` | 0 |
+| `Bad Gateway` | 0 |
+| `http2` | 0 |
 
-Rdzen Shadow V2 logging-only harness spelnil bramki smoke:
+W tym samym datowanym pliku logu nadal istnieje starszy wpis z poprzedniego smoke o `2026-07-01T18:54`, gdzie `solana.pump_fun.buy` failowal. Ten starszy wpis nie nalezy do aktualnego okna smoke. Dla aktualnego okna od `2026-07-01T22:50:33` liczba `NLN Subscribe request failed` wynosi `0`.
+
+## 10. Znaczenie dla PR17
+
+Pozytywny smoke r5-spectrum zamyka warunek operacyjny wymagany przed PR17:
 
 - canonical rows > 0;
 - replay rows > 0;
@@ -208,20 +247,21 @@ Rdzen Shadow V2 logging-only harness spelnil bramki smoke:
 - post-run strict audit PASS;
 - clean shutdown proven;
 - no SIGTERM;
-- no reconnect/disconnect flood.
+- no reconnect/disconnect flood;
+- `solana.pump_fun.buy` first message received;
+- `solana.pump_fun.buy_exact_sol_in` first message received.
 
-Mimo tego PR17 fidelity validation burnin pozostaje zablokowany do czasu rozstrzygniecia Program Streams coverage dla `solana.pump_fun.buy`.
+To nie oznacza, ze PR17 zostal wykonany. Oznacza tylko, ze smoke harness i Program Streams coverage nie blokuja juz samego przygotowania PR17.
 
-Powod:
+PR17 powinien pozostac osobnym, kontrolowanym etapem fidelity validation burnin. Nie wolno interpretowac tego smoke jako:
 
-pelna konfiguracja burnin dla maksymalnej coverage BCV wymaga obu topicow:
+- research-grade validation;
+- strategy proof;
+- RCE proof;
+- live-equivalent evidence;
+- approval do runtime.
 
-- `solana.pump_fun.buy`;
-- `solana.pump_fun.buy_exact_sol_in`.
-
-Smoke r5-spectrum udowodnil tylko jeden z nich jako live-receiving.
-
-## 10. Guard rails
+## 11. Guard rails
 
 Status approval pozostaje:
 
@@ -230,8 +270,7 @@ Status approval pozostaje:
 - `active_close_approval=false`;
 - `strategy_research_unblocked=false`;
 - `research_grade=NOT_GRANTED`;
-- `live_equivalence=NOT_GRANTED`;
-- `PR17 fidelity validation burnin=BLOCKED_BY_PROGRAM_STREAMS_PARTIAL_COVERAGE`.
+- `live_equivalence=NOT_GRANTED`.
 
 Raw evidence:
 
@@ -239,25 +278,30 @@ Raw evidence:
 - nie jest przeznaczone do commita;
 - nie powinno byc stage'owane.
 
+Lokalne backupy:
+
+- istnieja lokalnie w `reports/selector/_local_smoke_backups/`;
+- nie sa przeznaczone do commita.
+
 Lokalne smoke configi:
 
 - istnieja lokalnie jako `*.local.toml`;
 - nie sa przeznaczone do commita jako runtime rollout;
 - sluzyly wylacznie do tej operacyjnej proby smoke.
 
-## 11. Wymagane follow-up
+## 12. Wymagane follow-up
 
-Przed PR17 nalezy wykonac jeden z ponizszych krokow:
+Najblizszy sensowny krok po merge raportu PR16F:
 
-1. powtorzyc krotki Program Streams smoke po stronie `events.nln.clr3.org:443` i potwierdzic pierwszy message dla obu topicow; albo
-2. eskalowac do NLN konkretny przypadek:
-   - endpoint: `events.nln.clr3.org:443`;
-   - topic: `solana.pump_fun.buy`;
-   - symptom: topic widoczny w `ListTopics`, ale `Subscribe` konczy sie `NLN Subscribe request failed`;
-   - kontrast: `solana.pump_fun.buy_exact_sol_in` odbiera pierwszy message w tej samej konfiguracji.
+1. nie uruchamiac strategii;
+2. nie nadawac runtime approval;
+3. przygotowac osobna decyzje operatora dla PR17 fidelity validation burnin;
+4. PR17 powinien nadal byc validation burnin, nie strategy proof;
+5. po PR17 dopiero uruchomic rekonstrukcje/reconciliation/density audit reports.
 
-Do czasu tego rozstrzygniecia:
+Do czasu PR17:
 
-- nie uruchamiac PR17;
-- nie traktowac r5-spectrum jako pelnego validation burnin;
-- nie odblokowywac strategy research.
+- Shadow V2 ma pozytywny logging-only harness smoke;
+- Shadow V2 nie ma jeszcze research-grade verdict;
+- Shadow V2 nie ma live-equivalence verdict;
+- stare raporty nadal nie moga byc cytowane jako proof live PnL, executable fills, live slippage behavior ani landing outcome.
