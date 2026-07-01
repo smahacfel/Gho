@@ -485,6 +485,8 @@ impl ShadowPositionEventKindV2 {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ShadowPositionEventV2 {
+    #[serde(default = "shadow_position_event_v2_schema")]
+    pub schema: String,
     pub envelope: ShadowV2Envelope,
     pub event_kind: ShadowPositionEventKindV2,
     pub event_order_key: Option<EventOrderKey>,
@@ -507,6 +509,7 @@ impl ShadowPositionEventV2 {
         let payload = serde_json::to_value(&record).map_err(ShadowV2Error::from)?;
 
         Ok(Self {
+            schema: shadow_position_event_v2_schema(),
             envelope,
             event_kind,
             event_order_key,
@@ -520,6 +523,10 @@ impl ShadowPositionEventV2 {
     pub fn is_canonical_terminal(&self) -> bool {
         self.event_kind.is_canonical_terminal()
     }
+}
+
+fn shadow_position_event_v2_schema() -> String {
+    "shadow_position_event_v2".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -4673,6 +4680,7 @@ mod tests {
 
         let line = std::fs::read_to_string(path).unwrap();
         let json: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(json["schema"], "shadow_position_event_v2");
         assert_eq!(json["event_kind"], "POSITION_CREATED");
         assert_eq!(json["envelope"]["position_id"], "pos-a");
         assert_eq!(json["canonical_payload_schema"], "shadow_position_v2");

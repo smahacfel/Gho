@@ -240,6 +240,7 @@ async fn spawn_runtime_for_fsc_with_optional_signal(
                 authoritative_funding_stream_available,
                 false,
                 Some(authoritative_funding_stream_availability_rx),
+                None,
             )
             .await;
         } else {
