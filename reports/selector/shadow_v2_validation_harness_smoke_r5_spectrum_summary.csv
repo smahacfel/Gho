@@ -1,0 +1,46 @@
+metric,value,status,notes
+smoke_id,shadow-burnin-v2-fidelity-validation-logging-only-smoke-r5-spectrum,INFO,logging-only smoke after PR16E and PR20 operator defaults with Spectrum RPC and NLN gRPC/program streams
+main_head,7bb558fbad66e0974b363bd564b46f922b7becb9,INFO,local main after PR20 operator defaults merge
+scope_root,reports/selector/shadow-v2-fidelity-validation-r5-spectrum,INFO,raw local evidence scope not staged
+pre_run_manifest,PASS,PASS,generated fresh for smoke r5-spectrum
+pre_run_strict_audit,PASS,PASS,no blockers
+cargo_build_ghost_launcher_release,PASS,PASS,cargo build -p ghost-launcher --bin ghost-launcher --release
+launcher_preflight,PASS,PASS,Gatekeeper contract NLN gRPC app probe Spectrum RPC balance and metrics passed
+rpc_provider,Spectrum,PASS,used for GHOST_SEER_RPC_ENDPOINT GHOST_TRIGGER_RPC_URL GHOST_TRIGGER_SHADOW_RPC_URL
+spectrum_rpc_get_version,4.1.0,PASS,launcher preflight getVersion passed
+nln_grpc_endpoint,grpc.nln.clr3.org:443,PASS,primary ingest stream established
+nln_program_stream_endpoint,events.nln.clr3.org:443,INFO,Program Streams endpoint used for two pump_fun topics
+runtime_stream_established,true,PASS,primary gRPC stream established
+all_components_started,true,PASS,log contained All components started successfully
+smoke_marker_emitted,true,PASS,PostBuyRuntime emitted Shadow V2 validation smoke marker
+shadow_position_event_v2_rows,1,PASS,canonical evidence exists
+shadow_replay_v2_rows,1,PASS,derived replay row exists
+shadow_lifecycle_v2_rows,1,PASS,derived lifecycle row exists
+shadow_path_density_v2_rows,7,PASS,density rows exist with no path coverage marker semantics
+post_run_manifest_status,PASS,PASS,post_run_manifest blockers empty
+post_run_strict_audit,PASS,PASS,manifest strict audit passed
+validation_burnin_plan_audit,PASS,PASS,python3 scripts/shadow_v2_validation_burnin_plan_audit.py --strict
+legacy_downgrade_audit,PASS,PASS,python3 scripts/shadow_v2_legacy_downgrade_audit.py --strict
+oracle_runtime_shutdown_success,true,PASS,log contained Oracle Runtime shut down successfully
+post_buy_runtime_shutdown_success,true,PASS,log contained PostBuyRuntime shut down successfully
+seer_shutdown_success,true,PASS,log contained Seer shut down successfully
+watchdog_shutdown_success,true,PASS,log contained Watchdog shut down successfully
+all_components_shutdown_logged,true,PASS,log contained All components shut down successfully
+ghost_launcher_shutdown_complete,true,PASS,log contained Ghost Launcher shutdown complete
+process_exit_after_sigint_seconds,10.2,PASS,one SIGINT used cleanly
+transport_channel_disconnected_count,0,PASS,no reconnect/disconnect flood after shutdown
+sigterm_used,false,PASS,no SIGTERM was sent or observed in log
+program_streams_started_topic_count,2,PASS,both requested topics started
+program_streams_listtopics_topic_count,1074,PASS,ListTopics succeeded on events.nln.clr3.org:443
+program_streams_missing_selected_topics,0,PASS,missing_selected_topics=[]
+program_stream_buy_exact_sol_in_first_message,true,PASS,first message received
+program_stream_buy_first_message,false,FAIL,no first message observed for solana.pump_fun.buy
+program_stream_buy_subscribe_failed,true,FAIL,solana.pump_fun.buy lane exited after NLN Subscribe request failed
+program_streams_full_coverage,false,FAIL,one of two required topics did not deliver data
+runtime_approval,false,PASS,no runtime approval granted
+shadow_close_only_approval,false,PASS,no shadow_close_only approval granted
+active_close_approval,false,PASS,no active close approval granted
+strategy_research_unblocked,false,PASS,PR17 remains blocked
+research_grade,NOT_GRANTED,PASS,smoke is not research-grade burnin
+live_equivalence,NOT_GRANTED,PASS,no live-equivalence claim
+final_verdict,CORE_HARNESS_SMOKE_PASS_PROGRAM_STREAMS_PARTIAL_FAILURE,FAIL,core harness passed but full Program Streams coverage is blocked on solana.pump_fun.buy
