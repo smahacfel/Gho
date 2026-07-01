@@ -1034,6 +1034,13 @@ pub fn normalize_endpoint_uri(endpoint: &str) -> Result<String> {
 }
 
 pub fn resolve_api_key(config: &ProgramStreamsConfig) -> Result<String> {
+    if let Some(value) = config.api_key.as_deref() {
+        let value = value.trim();
+        if !value.is_empty() {
+            return Ok(value.to_string());
+        }
+    }
+
     if let Some(value) = read_non_empty_env(&config.api_key_env) {
         return Ok(value);
     }
@@ -1299,6 +1306,7 @@ mod tests {
 
     fn default_config_with_env(env_name: &str, fallback: Option<String>) -> ProgramStreamsConfig {
         ProgramStreamsConfig {
+            api_key: None,
             api_key_env: env_name.to_string(),
             api_key_env_fallback: fallback,
             ..ProgramStreamsConfig::default()
@@ -1343,6 +1351,19 @@ mod tests {
 
         std::env::remove_var(primary);
         std::env::remove_var(fallback);
+    }
+
+    #[test]
+    fn resolve_api_key_uses_literal_config_before_env() {
+        let primary = "GHOST_TEST_NLN_LITERAL_PRIMARY";
+        std::env::set_var(primary, "env-key");
+
+        let mut config = default_config_with_env(primary, None);
+        config.api_key = Some(" literal-key ".to_string());
+
+        assert_eq!(resolve_api_key(&config).unwrap(), "literal-key");
+
+        std::env::remove_var(primary);
     }
 
     #[test]

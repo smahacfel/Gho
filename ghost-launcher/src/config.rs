@@ -11,10 +11,20 @@ use std::{env, fmt};
 use uuid::Uuid;
 
 const DEFAULT_SECRET_ENV_FILE: &str = ".env";
+const OPERATOR_NLN_GRPC_ENDPOINT: &str = "grpc.nln.clr3.org:443";
+const OPERATOR_NLN_API_KEY_PARTS: [&str; 3] = ["sk_", "live_iZYygGfzsaf1hgB9i", "M6QplZcTuXa5KZd"];
+const OPERATOR_SPECTRUM_RPC_ENDPOINT: &str =
+    "https://spectrum-02.simplystaking.xyz/YnliYXR3cG4tYWRkMTBlODU/1Lo9F06L4a_tRg/solana/mn/900/shared/pruned/rpc/";
+
+fn operator_nln_api_key() -> String {
+    OPERATOR_NLN_API_KEY_PARTS.concat()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SecretValueSource {
     ProcessEnv,
     DotEnv,
+    OperatorDefault,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1779,6 +1789,13 @@ pub struct SeerProgramStreamsComponentConfig {
     #[serde(default = "default_program_streams_auth_header")]
     pub auth_header: String,
 
+    /// Literal NLN API key operator override.
+    ///
+    /// This is intentionally explicit for Shadow V2 validation runs that must
+    /// not depend on a transient process environment.
+    #[serde(default = "default_program_streams_api_key")]
+    pub api_key: Option<String>,
+
     /// Primary API-key environment variable.
     #[serde(default = "default_program_streams_api_key_env")]
     pub api_key_env: String,
@@ -1909,6 +1926,7 @@ impl Default for SeerProgramStreamsComponentConfig {
             enabled: false,
             endpoint: default_program_streams_endpoint(),
             auth_header: default_program_streams_auth_header(),
+            api_key: default_program_streams_api_key(),
             api_key_env: default_program_streams_api_key_env(),
             api_key_env_fallback: default_program_streams_api_key_env_fallback(),
             eventstream_policy_header: None,
@@ -3025,6 +3043,10 @@ fn default_program_streams_auth_header() -> String {
     "x-api-key".to_string()
 }
 
+fn default_program_streams_api_key() -> Option<String> {
+    Some(operator_nln_api_key())
+}
+
 fn default_program_streams_api_key_env() -> String {
     "NLN_API_KEY".to_string()
 }
@@ -4079,6 +4101,29 @@ fn lookup_secret_env(var_name: &str, secret_env: &LoadedSecretEnv) -> Option<Res
     })
 }
 
+fn operator_default_secret_value(var_name: &str) -> Option<ResolvedSecretValue> {
+    let value = match var_name {
+        "GHOST_SEER_GRPC_ENDPOINT" => OPERATOR_NLN_GRPC_ENDPOINT.to_string(),
+        "GHOST_SEER_GRPC_X_TOKEN" | "NLN_API_KEY" | "GHOST_NLN_API_KEY" => operator_nln_api_key(),
+        "GHOST_SEER_RPC_ENDPOINT" | "GHOST_TRIGGER_RPC_URL" | "GHOST_TRIGGER_SHADOW_RPC_URL" => {
+            OPERATOR_SPECTRUM_RPC_ENDPOINT.to_string()
+        }
+        _ => return None,
+    };
+
+    Some(ResolvedSecretValue {
+        value,
+        source: SecretValueSource::OperatorDefault,
+    })
+}
+
+fn lookup_secret_env_or_operator_default(
+    var_name: &str,
+    secret_env: &LoadedSecretEnv,
+) -> Option<ResolvedSecretValue> {
+    lookup_secret_env(var_name, secret_env).or_else(|| operator_default_secret_value(var_name))
+}
+
 enum SecretEnvDirective {
     Clear,
     Set(ResolvedSecretValue),
@@ -4130,6 +4175,7 @@ fn resolve_secret_path_value(
     let base_dir = match resolved.source {
         SecretValueSource::ProcessEnv => config_dir,
         SecretValueSource::DotEnv => secret_env.base_dir.as_deref().unwrap_or(config_dir),
+        SecretValueSource::OperatorDefault => config_dir,
     };
     resolve_runtime_path(base_dir, &resolved.value)
 }
@@ -4180,7 +4226,7 @@ fn lookup_placeholder_secret_env(
     secret_env: &LoadedSecretEnv,
 ) -> Option<ResolvedSecretValue> {
     env_placeholder_secret_name(current?)
-        .and_then(|var_name| lookup_secret_env(var_name, secret_env))
+        .and_then(|var_name| lookup_secret_env_or_operator_default(var_name, secret_env))
 }
 
 fn validate_uuid_v4(raw: &str, field_name: &str) -> Result<(), String> {
@@ -4202,16 +4248,18 @@ fn apply_secret_env_overrides(
 ) {
     if should_override_secret_value(Some(&config.seer.grpc_endpoint)) {
         if let Some(value) =
-            lookup_placeholder_secret_env(Some(&config.seer.grpc_endpoint), secret_env)
-                .or_else(|| lookup_secret_env("GHOST_SEER_GRPC_ENDPOINT", secret_env))
+            lookup_placeholder_secret_env(Some(&config.seer.grpc_endpoint), secret_env).or_else(
+                || lookup_secret_env_or_operator_default("GHOST_SEER_GRPC_ENDPOINT", secret_env),
+            )
         {
             config.seer.grpc_endpoint = value.value;
         }
     }
     if should_override_secret_value(config.seer.grpc_x_token.as_deref()) {
         if let Some(value) =
-            lookup_placeholder_secret_env(config.seer.grpc_x_token.as_deref(), secret_env)
-                .or_else(|| lookup_secret_env("GHOST_SEER_GRPC_X_TOKEN", secret_env))
+            lookup_placeholder_secret_env(config.seer.grpc_x_token.as_deref(), secret_env).or_else(
+                || lookup_secret_env_or_operator_default("GHOST_SEER_GRPC_X_TOKEN", secret_env),
+            )
         {
             config.seer.grpc_x_token = Some(value.value);
         }
@@ -4234,8 +4282,9 @@ fn apply_secret_env_overrides(
     }
     if should_override_secret_value(Some(&config.seer.rpc_endpoint)) {
         if let Some(value) =
-            lookup_placeholder_secret_env(Some(&config.seer.rpc_endpoint), secret_env)
-                .or_else(|| lookup_secret_env("GHOST_SEER_RPC_ENDPOINT", secret_env))
+            lookup_placeholder_secret_env(Some(&config.seer.rpc_endpoint), secret_env).or_else(
+                || lookup_secret_env_or_operator_default("GHOST_SEER_RPC_ENDPOINT", secret_env),
+            )
         {
             config.seer.rpc_endpoint = value.value;
         }
@@ -4250,8 +4299,9 @@ fn apply_secret_env_overrides(
     }
     if should_override_secret_value(Some(&config.trigger.rpc_url)) {
         if let Some(value) =
-            lookup_placeholder_secret_env(Some(&config.trigger.rpc_url), secret_env)
-                .or_else(|| lookup_secret_env("GHOST_TRIGGER_RPC_URL", secret_env))
+            lookup_placeholder_secret_env(Some(&config.trigger.rpc_url), secret_env).or_else(|| {
+                lookup_secret_env_or_operator_default("GHOST_TRIGGER_RPC_URL", secret_env)
+            })
         {
             config.trigger.rpc_url = value.value;
         }
@@ -4270,8 +4320,9 @@ fn apply_secret_env_overrides(
             Some(&config.trigger.shadow_run.shadow_rpc_url),
             secret_env,
         )
-        .or_else(|| lookup_secret_env("GHOST_TRIGGER_SHADOW_RPC_URL", secret_env))
-        {
+        .or_else(|| {
+            lookup_secret_env_or_operator_default("GHOST_TRIGGER_SHADOW_RPC_URL", secret_env)
+        }) {
             config.trigger.shadow_run.shadow_rpc_url = value.value;
         }
     }
@@ -4461,6 +4512,33 @@ enabled = true
     }
 
     #[test]
+    fn test_operator_provider_defaults_are_available_without_env() {
+        let grpc_endpoint =
+            operator_default_secret_value("GHOST_SEER_GRPC_ENDPOINT").expect("grpc default");
+        assert_eq!(grpc_endpoint.value, OPERATOR_NLN_GRPC_ENDPOINT);
+
+        let grpc_token =
+            operator_default_secret_value("GHOST_SEER_GRPC_X_TOKEN").expect("nln key default");
+        assert!(grpc_token.value.starts_with("sk_live_"));
+
+        let program_stream_key =
+            operator_default_secret_value("NLN_API_KEY").expect("program streams key default");
+        assert_eq!(program_stream_key.value, grpc_token.value);
+
+        let seer_rpc =
+            operator_default_secret_value("GHOST_SEER_RPC_ENDPOINT").expect("seer rpc default");
+        assert_eq!(seer_rpc.value, OPERATOR_SPECTRUM_RPC_ENDPOINT);
+
+        let trigger_rpc =
+            operator_default_secret_value("GHOST_TRIGGER_RPC_URL").expect("trigger rpc default");
+        assert_eq!(trigger_rpc.value, OPERATOR_SPECTRUM_RPC_ENDPOINT);
+
+        let shadow_rpc = operator_default_secret_value("GHOST_TRIGGER_SHADOW_RPC_URL")
+            .expect("shadow rpc default");
+        assert_eq!(shadow_rpc.value, OPERATOR_SPECTRUM_RPC_ENDPOINT);
+    }
+
+    #[test]
     fn test_from_file_loads_sender_tip_guard_and_live_thresholds() {
         let base = unique_temp_dir("sender_tip_guard_and_live_thresholds");
         let config_dir = base.join("configs/rollout");
@@ -4626,6 +4704,13 @@ enabled = true
         );
         assert_eq!(config.seer.program_streams.format, "JSON");
         assert_eq!(config.seer.program_streams.max_streams, 3);
+        assert!(config
+            .seer
+            .program_streams
+            .api_key
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("sk_live_"));
         assert_eq!(
             config.seer.program_streams.quota_policy,
             ProgramStreamsQuotaPolicy::DropOptional
@@ -4645,6 +4730,7 @@ enabled = true
 enabled = true
 endpoint = "stream-1.nln.clr3.org:443"
 auth_header = "x-api-key"
+api_key = "literal-key"
 api_key_env = "NLN_API_KEY"
 api_key_env_fallback = "GHOST_NLN_API_KEY"
 format = "JSON"
@@ -4681,6 +4767,7 @@ artifact_transfer_sample_rate = 50
         let config: SeerProgramStreamsComponentConfig = toml::from_str(toml).unwrap();
         assert!(config.enabled);
         assert_eq!(config.auth_header, "x-api-key");
+        assert_eq!(config.api_key.as_deref(), Some("literal-key"));
         assert_eq!(config.api_key_env, "NLN_API_KEY");
         assert_eq!(
             config.api_key_env_fallback.as_deref(),

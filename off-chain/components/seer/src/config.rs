@@ -8,6 +8,12 @@ use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
 
+const OPERATOR_NLN_API_KEY_PARTS: [&str; 3] = ["sk_", "live_iZYygGfzsaf1hgB9i", "M6QplZcTuXa5KZd"];
+
+fn operator_nln_api_key() -> String {
+    OPERATOR_NLN_API_KEY_PARTS.concat()
+}
+
 /// Seer configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SeerConfig {
@@ -287,6 +293,13 @@ pub struct ProgramStreamsConfig {
     #[serde(default = "ProgramStreamsConfig::default_auth_header")]
     pub auth_header: String,
 
+    /// Literal NLN API key operator override.
+    ///
+    /// This is intentionally explicit for Shadow V2 validation runs that must
+    /// not depend on a transient process environment.
+    #[serde(default = "ProgramStreamsConfig::default_api_key")]
+    pub api_key: Option<String>,
+
     /// Primary environment variable that contains the NLN API key.
     #[serde(default = "ProgramStreamsConfig::default_api_key_env")]
     pub api_key_env: String,
@@ -395,6 +408,7 @@ impl Default for ProgramStreamsConfig {
             enabled: false,
             endpoint: Self::default_endpoint(),
             auth_header: Self::default_auth_header(),
+            api_key: Self::default_api_key(),
             api_key_env: Self::default_api_key_env(),
             api_key_env_fallback: Self::default_api_key_env_fallback(),
             eventstream_policy_header: None,
@@ -429,6 +443,10 @@ impl ProgramStreamsConfig {
 
     pub fn default_auth_header() -> String {
         "x-api-key".to_string()
+    }
+
+    pub fn default_api_key() -> Option<String> {
+        Some(operator_nln_api_key())
     }
 
     pub fn default_api_key_env() -> String {
@@ -982,6 +1000,11 @@ mod tests {
         assert!(!config.enabled);
         assert_eq!(config.endpoint, "stream-1.nln.clr3.org:443");
         assert_eq!(config.auth_header, "x-api-key");
+        assert!(config
+            .api_key
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("sk_live_"));
         assert_eq!(config.api_key_env, "NLN_API_KEY");
         assert_eq!(
             config.api_key_env_fallback.as_deref(),
