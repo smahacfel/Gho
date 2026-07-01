@@ -45,11 +45,12 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use backoff::{future::retry, ExponentialBackoffBuilder};
+use backoff::{backoff::Backoff, ExponentialBackoffBuilder};
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError, TrySendError};
 use dashmap::{DashMap, DashSet};
 use futures::{Sink, SinkExt, StreamExt};
 use parking_lot::Mutex;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::rpc_http_client::new_async_rpc_client;
@@ -1185,6 +1186,7 @@ impl ProviderCircuitBreaker {
     async fn acquire_attempt_permit(
         &self,
         shutdown: &Arc<AtomicBool>,
+        shutdown_token: &Arc<CancellationToken>,
     ) -> Option<ProviderAttemptPermit> {
         loop {
             if shutdown.load(Ordering::Relaxed) {
@@ -1221,10 +1223,13 @@ impl ProviderCircuitBreaker {
                 }
             };
 
-            tokio::time::sleep(Duration::from_millis(
-                wait_ms.min(PROVIDER_CIRCUIT_BREAKER_WAIT_POLL_MS),
-            ))
-            .await;
+            tokio::select! {
+                biased;
+                _ = shutdown_token.cancelled() => return None,
+                _ = tokio::time::sleep(Duration::from_millis(
+                    wait_ms.min(PROVIDER_CIRCUIT_BREAKER_WAIT_POLL_MS),
+                )) => {}
+            }
         }
     }
 
@@ -1609,6 +1614,7 @@ struct YellowstoneConnector {
     channel: DualLaneChannel,
     stats: Arc<TransportStats>,
     shutdown: Arc<AtomicBool>,
+    shutdown_token: Arc<CancellationToken>,
     registry: AccountRegistry,
     gap_tx: tokio::sync::mpsc::UnboundedSender<SlotGap>,
     health: Option<Arc<RuntimeHealth>>,
@@ -1699,6 +1705,7 @@ impl YellowstoneConnector {
             channel: ch,
             stats: Arc::new(TransportStats::default()),
             shutdown: Arc::new(AtomicBool::new(false)),
+            shutdown_token: Arc::new(CancellationToken::new()),
             registry: AccountRegistry::new(),
             gap_tx,
             health: None,
@@ -1718,6 +1725,9 @@ impl YellowstoneConnector {
     }
     fn shutdown_handle(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.shutdown)
+    }
+    fn shutdown_token_handle(&self) -> Arc<CancellationToken> {
+        Arc::clone(&self.shutdown_token)
     }
     fn registry(&self) -> AccountRegistry {
         self.registry.clone()
@@ -1797,6 +1807,7 @@ impl YellowstoneConnector {
                 let channel = self.channel.clone();
                 let stats = Arc::clone(&self.stats);
                 let shutdown = Arc::clone(&self.shutdown);
+                let shutdown_token = Arc::clone(&self.shutdown_token);
                 let registry = self.registry.clone();
                 let slots = Arc::clone(&slots);
                 let delayed_queue = Arc::clone(&self.delayed_queue); // [FIX-5]
@@ -1821,6 +1832,7 @@ impl YellowstoneConnector {
                         health,
                         availability_tracker,
                         shutdown,
+                        shutdown_token,
                         latest_block_time_secs,
                     )
                     .await;
@@ -1856,131 +1868,153 @@ async fn connection_loop(
     health: Option<Arc<RuntimeHealth>>,
     availability_tracker: Arc<LaneAvailabilityTracker>,
     shutdown: Arc<AtomicBool>,
+    shutdown_token: Arc<CancellationToken>,
     latest_block_time_secs: Arc<AtomicI64>,
 ) {
-    let backoff = ExponentialBackoffBuilder::new()
+    let mut backoff = ExponentialBackoffBuilder::new()
         .with_initial_interval(Duration::from_millis(BACKOFF_INIT_MS))
         .with_max_interval(Duration::from_millis(BACKOFF_MAX_MS))
         .with_max_elapsed_time(None)
         .build();
 
     let mut first_attempt = true;
-    let op = || {
-        let id = id.clone();
-        let prov = prov.clone();
-        let cfg = cfg.clone();
-        let channel = channel.clone();
-        let stats = Arc::clone(&stats);
-        let slots = Arc::clone(&slots);
-        let registry = registry.clone();
-        let gap_tx = gap_tx.clone();
-        let delayed_queue = Arc::clone(&delayed_queue);
-        let breaker = Arc::clone(&breaker);
-        let shutdown = Arc::clone(&shutdown);
-        let health = health.clone();
-        let availability_tracker = Arc::clone(&availability_tracker);
-        let latest_block_time_secs = Arc::clone(&latest_block_time_secs);
-        let is_first_attempt = std::mem::replace(&mut first_attempt, false);
-        async move {
-            if shutdown.load(Ordering::Relaxed) {
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            if let Some(ref h) = health {
+                h.set_grpc_state(GRPC_STATE_DISCONNECTED);
+            }
+            break;
+        }
+
+        let Some(permit) = breaker
+            .acquire_attempt_permit(&shutdown, &shutdown_token)
+            .await
+        else {
+            break;
+        };
+        if permit.half_open_probe {
+            info!(
+                provider = %prov.label,
+                "[{id}] Provider circuit granted half-open probe"
+            );
+        }
+
+        if let Some(ref h) = health {
+            if first_attempt {
+                h.set_grpc_state(GRPC_STATE_CONNECTING);
+            } else {
+                h.inc_grpc_reconnects();
+                h.set_grpc_state(GRPC_STATE_RECONNECTING);
+            }
+        }
+        first_attempt = false;
+
+        stats.bump_recon_with_source(cfg.subscription_profile.source_label());
+        // `from_slot` is tracked for diagnostics. Current proto 1.14 request
+        // shape does not encode replay from this value.
+        let from_slot = slots.last_slot();
+        info!(
+            "[{id}] Connecting → {} (from_slot={from_slot})",
+            prov.endpoint
+        );
+
+        let client = tokio::select! {
+            biased;
+            _ = shutdown_token.cancelled() => {
                 if let Some(ref h) = health {
                     h.set_grpc_state(GRPC_STATE_DISCONNECTED);
                 }
-                return Err(backoff::Error::Permanent(anyhow::anyhow!("shutdown")));
+                break;
             }
-
-            let Some(permit) = breaker.acquire_attempt_permit(&shutdown).await else {
-                return Err(backoff::Error::Permanent(anyhow::anyhow!("shutdown")));
-            };
-            if permit.half_open_probe {
-                info!(
-                    provider = %prov.label,
-                    "[{id}] Provider circuit granted half-open probe"
-                );
-            }
-
-            if let Some(ref h) = health {
-                if is_first_attempt {
-                    h.set_grpc_state(GRPC_STATE_CONNECTING);
-                } else {
-                    h.inc_grpc_reconnects();
-                    h.set_grpc_state(GRPC_STATE_RECONNECTING);
+            result = build_client(&prov) => {
+                match result {
+                    Ok(client) => client,
+                    Err(e) => {
+                        if permit.half_open_probe {
+                            breaker.record_probe_failure("build_client");
+                        }
+                        if let Some(ref h) = health {
+                            h.set_grpc_state(GRPC_STATE_FAILED);
+                        }
+                        error!("[{id}] build_client: {e:#}");
+                        if !sleep_before_reconnect(&id, &mut backoff, &shutdown, &shutdown_token).await {
+                            break;
+                        }
+                        continue;
+                    }
                 }
             }
+        };
 
-            stats.bump_recon_with_source(cfg.subscription_profile.source_label());
-            // `from_slot` is tracked for diagnostics. Current proto 1.14 request
-            // shape does not encode replay from this value.
-            let from_slot = slots.last_slot();
-            info!(
-                "[{id}] Connecting → {} (from_slot={from_slot})",
-                prov.endpoint
-            );
+        let result = stream_loop(
+            &id,
+            client,
+            &cfg,
+            from_slot,
+            &channel,
+            &stats,
+            &slots,
+            &registry,
+            &gap_tx,
+            &delayed_queue,
+            &breaker,
+            permit,
+            health.clone(),
+            &availability_tracker,
+            &shutdown,
+            &shutdown_token,
+            &latest_block_time_secs,
+        )
+        .await;
 
-            let client = build_client(&prov).await.map_err(|e| {
-                if permit.half_open_probe {
-                    breaker.record_probe_failure("build_client");
-                }
-                if let Some(ref h) = health {
-                    h.set_grpc_state(GRPC_STATE_FAILED);
-                }
-                error!("[{id}] build_client: {e:#}");
-                backoff::Error::Transient {
-                    err: e,
-                    retry_after: None,
-                }
-            })?;
-
-            let result = stream_loop(
-                &id,
-                client,
-                &cfg,
-                from_slot,
-                &channel,
-                &stats,
-                &slots,
-                &registry,
-                &gap_tx,
-                &delayed_queue,
-                &breaker,
-                permit,
-                health.clone(),
-                &availability_tracker,
-                &shutdown,
-                &latest_block_time_secs,
-            )
-            .await;
-
-            if let Err(ref err) = result {
+        match result {
+            Ok(()) => break,
+            Err(err) if shutdown.load(Ordering::Relaxed) => {
+                debug!("[{id}] stream ended during shutdown: {err:#}");
+                break;
+            }
+            Err(err) => {
                 if permit.half_open_probe
                     && breaker.snapshot().state == ProviderCircuitState::HalfOpen
                 {
                     breaker.record_probe_failure(&err.to_string());
                 }
-            }
-
-            result.map_err(|e| {
                 if let Some(ref h) = health {
                     h.set_grpc_state(GRPC_STATE_DISCONNECTED);
                 }
-                warn!("[{id}] stream ended: {e:#}");
-                backoff::Error::Transient {
-                    err: e,
-                    retry_after: None,
+                warn!("[{id}] stream ended: {err:#}");
+                if !sleep_before_reconnect(&id, &mut backoff, &shutdown, &shutdown_token).await {
+                    break;
                 }
-            })
+            }
         }
+    }
+
+    if let Some(ref h) = health {
+        h.set_grpc_state(if shutdown.load(Ordering::Relaxed) {
+            GRPC_STATE_DISCONNECTED
+        } else {
+            GRPC_STATE_FAILED
+        });
+    }
+}
+
+async fn sleep_before_reconnect(
+    id: &str,
+    backoff: &mut backoff::ExponentialBackoff,
+    shutdown: &Arc<AtomicBool>,
+    shutdown_token: &Arc<CancellationToken>,
+) -> bool {
+    let Some(delay) = backoff.next_backoff() else {
+        error!("[{id}] fatal: reconnect backoff exhausted");
+        return false;
     };
 
-    if let Err(e) = retry(backoff, op).await {
-        if let Some(ref h) = health {
-            h.set_grpc_state(if shutdown.load(Ordering::Relaxed) {
-                GRPC_STATE_DISCONNECTED
-            } else {
-                GRPC_STATE_FAILED
-            });
-        }
-        error!("[{id}] fatal: {e}");
+    tokio::select! {
+        biased;
+        _ = shutdown_token.cancelled() => false,
+        _ = tokio::time::sleep(delay), if !shutdown.load(Ordering::Relaxed) => true,
+        else => false,
     }
 }
 
@@ -2538,6 +2572,7 @@ async fn stream_loop(
     health: Option<Arc<RuntimeHealth>>,
     availability_tracker: &Arc<LaneAvailabilityTracker>,
     shutdown: &Arc<AtomicBool>,
+    shutdown_token: &Arc<CancellationToken>,
     latest_block_time_secs: &Arc<AtomicI64>,
 ) -> Result<()> {
     let req = build_subscribe_request_for_profile(
@@ -2550,17 +2585,24 @@ async fn stream_loop(
         h.set_grpc_state(GRPC_STATE_SUBSCRIBING);
         h.mark_grpc_subscribe_sent();
     }
-    let subscribe_result = tokio::time::timeout(
-        Duration::from_secs(SUBSCRIBE_REQUEST_TIMEOUT_SECS),
-        client.subscribe_with_request(Some(req)),
-    )
-    .await
-    .map_err(|_| {
-        anyhow::anyhow!(
-            "subscribe_with_request timed out after {}s",
-            SUBSCRIBE_REQUEST_TIMEOUT_SECS
-        )
-    })?;
+    let subscribe_result = tokio::select! {
+        biased;
+        _ = shutdown_token.cancelled() => {
+            info!("[{id}] Shutdown before subscribe completed");
+            return Ok(());
+        }
+        result = tokio::time::timeout(
+            Duration::from_secs(SUBSCRIBE_REQUEST_TIMEOUT_SECS),
+            client.subscribe_with_request(Some(req)),
+        ) => {
+            result.map_err(|_| {
+                anyhow::anyhow!(
+                    "subscribe_with_request timed out after {}s",
+                    SUBSCRIBE_REQUEST_TIMEOUT_SECS
+                )
+            })?
+        }
+    };
     let (mut sink, mut stream) = subscribe_result.context("subscribe_with_request")?;
 
     if let Some(ref h) = health {
@@ -2596,7 +2638,12 @@ async fn stream_loop(
         }
 
         tokio::select! {
-            biased; // stream is highest-priority arm
+            biased;
+
+            _ = shutdown_token.cancelled() => {
+                info!("[{id}] Shutdown");
+                return Ok(());
+            }
 
             // ── Incoming gRPC message ─────────────────────────────────────
             maybe = stream.next() => {
@@ -3098,6 +3145,7 @@ pub struct GrpcConnection {
     delayed_queue: Arc<DelayedAccountQueue>,
     stats: Arc<TransportStats>,
     shutdown: Arc<AtomicBool>,
+    shutdown_token: Arc<CancellationToken>,
     availability_tracker: Arc<LaneAvailabilityTracker>,
     manual_backfill_cfg: Option<ManualBackfillConfig>,
     manual_backfill_enabled: bool,
@@ -3108,9 +3156,6 @@ pub struct GrpcConnection {
     watched_pools_ttl_ms: u64,
     watched_pools_cap: usize,
     dedup_dropped: Arc<AtomicU64>,
-    /// Shared with YellowstoneConnector workers. Updated by BlockMeta events.
-    /// Used in connect_geyser stream to anchor event_ts_ms to on-chain block time.
-    latest_block_time_secs: Arc<AtomicI64>,
     // Config carried for connect_geyser
     #[allow(dead_code)]
     config: GrpcConfig,
@@ -3315,7 +3360,7 @@ impl GrpcConnection {
         let delayed_queue = connector.delayed_queue();
         let stats = connector.stats();
         let shutdown = connector.shutdown_handle();
-        let latest_block_time_secs = Arc::clone(&connector.latest_block_time_secs);
+        let shutdown_token = connector.shutdown_token_handle();
 
         Self {
             connector: Mutex::new(Some(connector)),
@@ -3326,8 +3371,8 @@ impl GrpcConnection {
             delayed_queue,
             stats,
             shutdown,
+            shutdown_token,
             availability_tracker,
-            latest_block_time_secs,
             manual_backfill_cfg: rpc_endpoint.map(|rpc_endpoint| ManualBackfillConfig {
                 rpc_endpoint,
                 max_slots: MANUAL_BACKFILL_MAX_SLOTS,
@@ -3439,6 +3484,21 @@ impl GrpcConnection {
         self.availability_tracker.set_sender(tx);
     }
 
+    /// Request a graceful stop of all Yellowstone gRPC workers owned by this connection.
+    ///
+    /// Launcher shutdown must stop reconnect/read/subscribe loops before receivers disappear.
+    /// Otherwise workers can continue trying to forward into closed channels and flood
+    /// disconnect logs after global shutdown has already started.
+    pub fn request_shutdown(&self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        self.shutdown_token.cancel();
+        self.availability_tracker.publish(false);
+    }
+
+    pub fn is_shutdown_requested(&self) -> bool {
+        self.shutdown.load(Ordering::Relaxed)
+    }
+
     /// Connect and return an async event stream yielding `GeyserEvent` items.
     ///
     /// Internally spawns the YellowstoneConnector as a background task and
@@ -3459,13 +3519,14 @@ impl GrpcConnection {
                 SeerError::GrpcError("connect_geyser already called (gap_rx)".into())
             })?;
         let dedup_dropped = Arc::clone(&self.dedup_dropped);
-        let latest_block_time_secs = Arc::clone(&self.latest_block_time_secs);
+        let shutdown = Arc::clone(&self.shutdown);
+        let shutdown_token = Arc::clone(&self.shutdown_token);
 
         // Spawn the connector — it runs all provider workers until shutdown.
-        let shutdown = Arc::clone(&self.shutdown);
+        let connector_shutdown = Arc::clone(&self.shutdown);
         tokio::spawn(async move {
             if let Err(e) = connector.run().await {
-                if !shutdown.load(Ordering::Relaxed) {
+                if !connector_shutdown.load(Ordering::Relaxed) {
                     error!("YellowstoneConnector terminated: {e}");
                 }
             }
@@ -3556,6 +3617,10 @@ impl GrpcConnection {
             let mut seen_sigs: HashSet<String> = HashSet::with_capacity(2048);
             let mut sig_order: VecDeque<String> = VecDeque::with_capacity(2048);
             loop {
+                if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+
                 // Fair drain policy:
                 //   - prioritize fast lane for low latency
                 //   - force periodic overflow checks so spilled events never starve
@@ -3570,7 +3635,11 @@ impl GrpcConnection {
                         ev
                     }
                     DrainPick::Empty => {
-                        tokio::time::sleep(Duration::from_micros(DRAIN_IDLE_SLEEP_US)).await;
+                        tokio::select! {
+                            biased;
+                            _ = shutdown_token.cancelled() => break,
+                            _ = tokio::time::sleep(Duration::from_micros(DRAIN_IDLE_SLEEP_US)) => {}
+                        }
                         continue;
                     }
                     DrainPick::Disconnected => break,
@@ -4502,8 +4571,10 @@ mod tests {
         assert_eq!(breaker.snapshot().state, ProviderCircuitState::Open);
 
         tokio::time::sleep(Duration::from_millis(10)).await;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_token = Arc::new(CancellationToken::new());
         let permit = breaker
-            .acquire_attempt_permit(&Arc::new(AtomicBool::new(false)))
+            .acquire_attempt_permit(&shutdown, &shutdown_token)
             .await
             .expect("permit");
         assert!(permit.half_open_probe);
@@ -5626,6 +5697,69 @@ mod tests {
 
         assert!(conn.manual_backfill_cfg.is_some());
         assert!(!conn.manual_backfill_enabled);
+    }
+
+    #[tokio::test]
+    async fn grpc_connection_request_shutdown_wakes_idle_event_stream() {
+        let conn = GrpcConnection::new(
+            "http://127.0.0.1:10000".to_string(),
+            None,
+            None,
+            Arc::new(crate::metrics::SeerMetrics::new()),
+            1,
+            1,
+            1,
+            false,
+            crate::config::CommitmentLevel::Confirmed,
+            None,
+        )
+        .with_manual_backfill_enabled(false);
+
+        let mut stream = conn.connect_geyser().await.expect("stream");
+        conn.request_shutdown();
+        assert!(conn.is_shutdown_requested());
+
+        let next = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("shutdown should wake idle stream drain");
+        assert!(next.is_none(), "stream must end after shutdown request");
+    }
+
+    #[tokio::test]
+    async fn provider_circuit_breaker_wait_exits_on_shutdown_token() {
+        let breaker = ProviderCircuitBreaker::new(
+            "provider-shutdown",
+            "test_source",
+            ProviderCircuitBreakerConfig {
+                max_stalls_before_open: 1,
+                cooldown_ms: 30_000,
+            },
+        );
+        breaker.record_stall();
+        assert_eq!(breaker.snapshot().state, ProviderCircuitState::Open);
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_token = Arc::new(CancellationToken::new());
+        let waiter = {
+            let breaker = Arc::clone(&breaker);
+            let shutdown = Arc::clone(&shutdown);
+            let shutdown_token = Arc::clone(&shutdown_token);
+            tokio::spawn(async move {
+                breaker
+                    .acquire_attempt_permit(&shutdown, &shutdown_token)
+                    .await
+            })
+        };
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        shutdown.store(true, Ordering::Relaxed);
+        shutdown_token.cancel();
+
+        let permit = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("shutdown should wake circuit-breaker wait")
+            .expect("waiter join");
+        assert!(permit.is_none(), "shutdown must not grant reconnect permit");
     }
 
     #[tokio::test]

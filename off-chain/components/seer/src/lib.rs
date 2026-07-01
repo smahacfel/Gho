@@ -1995,6 +1995,32 @@ impl Seer {
         true
     }
 
+    /// Request graceful shutdown for Seer-owned transport loops.
+    ///
+    /// This does not alter ingest semantics during normal operation. It only marks
+    /// active gRPC workers as shutting down so reconnect/read/subscribe loops stop
+    /// before launcher receivers disappear.
+    pub fn request_shutdown(&self) {
+        if let Some(connection) = self.grpc_connection.as_ref() {
+            connection.request_shutdown();
+        }
+        if let Some(connection) = self.funding_grpc_connection.as_ref() {
+            connection.request_shutdown();
+        }
+    }
+
+    pub fn is_shutdown_requested(&self) -> bool {
+        let primary_shutdown = self
+            .grpc_connection
+            .as_ref()
+            .is_none_or(GrpcConnection::is_shutdown_requested);
+        let funding_shutdown = self
+            .funding_grpc_connection
+            .as_ref()
+            .is_none_or(GrpcConnection::is_shutdown_requested);
+        primary_shutdown && funding_shutdown
+    }
+
     fn append_wal_record(&self, record: WalRecord, record_kind: &'static str) {
         self.append_wal_record_with_clock(record, record_kind, WalRecordClock::default());
     }
@@ -5123,6 +5149,37 @@ mod tests {
     fn coverage_test_lock() -> &'static tokio::sync::Mutex<()> {
         static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
         LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    #[test]
+    fn seer_request_shutdown_marks_primary_and_funding_grpc_lanes() {
+        let (ipc_sender, _ipc_receiver, _metrics) = create_ipc_channel(IpcChannelConfig::default());
+        let mut config = SeerConfig::default();
+        config.funding_lane_mode = FundingLaneMode::FullChain;
+        let seer = Seer::new_with_ipc(config, ipc_sender);
+
+        assert!(
+            !seer.is_shutdown_requested(),
+            "fresh Seer must not start in shutdown state"
+        );
+        assert!(
+            seer.funding_grpc_connection.is_some(),
+            "full-chain funding lane must create a dedicated gRPC connection"
+        );
+
+        seer.request_shutdown();
+
+        assert!(seer.is_shutdown_requested());
+        assert!(seer
+            .grpc_connection
+            .as_ref()
+            .expect("primary gRPC")
+            .is_shutdown_requested());
+        assert!(seer
+            .funding_grpc_connection
+            .as_ref()
+            .expect("funding gRPC")
+            .is_shutdown_requested());
     }
 
     const TRADE_FORWARD_TIMEOUT_MS: u64 = 200;
