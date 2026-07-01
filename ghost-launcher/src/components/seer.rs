@@ -4143,6 +4143,7 @@ pub async fn run(
             enabled: config.program_streams.enabled,
             endpoint: resolve_program_streams_endpoint(&config.program_streams.endpoint),
             auth_header: config.program_streams.auth_header.clone(),
+            api_key: config.program_streams.api_key.clone(),
             api_key_env: config.program_streams.api_key_env.clone(),
             api_key_env_fallback: config.program_streams.api_key_env_fallback.clone(),
             eventstream_policy_header: config.program_streams.eventstream_policy_header.clone(),
