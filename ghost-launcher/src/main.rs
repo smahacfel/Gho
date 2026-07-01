@@ -2473,8 +2473,14 @@ async fn main() -> Result<()> {
         })
         .unwrap_or(false);
     let watchdog_health = Arc::clone(&health);
+    let watchdog_shutdown_rx = shutdown_tx.subscribe();
     let watchdog_handle = tokio::spawn(async move {
-        ghost_launcher::components::watchdog::run(watchdog_health, is_grpc_mode).await;
+        ghost_launcher::components::watchdog::run_with_shutdown(
+            watchdog_health,
+            is_grpc_mode,
+            Some(watchdog_shutdown_rx),
+        )
+        .await;
     });
     handles.push(("Watchdog", watchdog_handle));
 
@@ -2548,16 +2554,43 @@ async fn main() -> Result<()> {
         info!("Oracle Runtime shut down successfully");
     }
 
-    // Wait for all components to shut down
+    const COMPONENT_SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+    // Wait for all components to shut down. The timeout is a shutdown-only
+    // circuit breaker: a stuck diagnostics task must not keep the launcher
+    // alive indefinitely after global shutdown has been requested.
+    let mut component_shutdown_failures = 0usize;
     for (name, handle) in handles {
         info!("Waiting for {} to shut down...", name);
-        if let Err(e) = handle.await {
-            error!("{} shutdown error: {}", name, e);
-        } else {
-            info!("{} shut down successfully", name);
+        let abort_handle = handle.abort_handle();
+        match tokio::time::timeout(COMPONENT_SHUTDOWN_JOIN_TIMEOUT, handle).await {
+            Ok(Ok(())) => {
+                info!("{} shut down successfully", name);
+            }
+            Ok(Err(e)) => {
+                component_shutdown_failures += 1;
+                error!("{} shutdown error: {}", name, e);
+            }
+            Err(_) => {
+                component_shutdown_failures += 1;
+                error!(
+                    "{} shutdown join timed out after {}s; aborting task",
+                    name,
+                    COMPONENT_SHUTDOWN_JOIN_TIMEOUT.as_secs()
+                );
+                abort_handle.abort();
+            }
         }
     }
 
+    if component_shutdown_failures == 0 {
+        info!("All components shut down successfully");
+    } else {
+        error!(
+            "Component shutdown completed with {} failure(s) or forced abort(s)",
+            component_shutdown_failures
+        );
+    }
     info!("Ghost Launcher shutdown complete");
     Ok(())
 }

@@ -20,6 +20,7 @@ use ghost_core::health::{
 };
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
 /// Threshold (ms) after which a gRPC stall is logged as ERROR.
@@ -101,6 +102,19 @@ fn grpc_transport_has_recent_progress(progress_age: Option<u64>, threshold_ms: u
 /// |---|---|---|
 /// | `GHOST_WATCHDOG_FATAL_EXIT` | `1` | Set to `0` / `false` to log stalls as ERROR without calling `process::exit()`. Useful when connecting via SSH/phone where a brief disconnect should not terminate the launcher. |
 pub async fn run(health: Arc<RuntimeHealth>, is_grpc_mode: bool) {
+    run_with_shutdown(health, is_grpc_mode, None).await;
+}
+
+/// Run the watchdog with an optional global shutdown receiver.
+///
+/// The original `run` entrypoint intentionally remains available for callers
+/// that do not own launcher lifecycle state. Launcher-owned runtime paths must
+/// pass a receiver so the watchdog cannot keep the process alive after SIGINT.
+pub async fn run_with_shutdown(
+    health: Arc<RuntimeHealth>,
+    is_grpc_mode: bool,
+    mut shutdown_rx: Option<broadcast::Receiver<()>>,
+) {
     // Allow disabling fatal exits via environment variable so that SSH
     // disconnects or brief stalls do not terminate the launcher.
     let fatal_exit_enabled = std::env::var("GHOST_WATCHDOG_FATAL_EXIT")
@@ -119,7 +133,24 @@ pub async fn run(health: Arc<RuntimeHealth>, is_grpc_mode: bool) {
     );
 
     loop {
-        interval.tick().await;
+        tokio::select! {
+            _ = interval.tick() => {}
+            shutdown = async {
+                match shutdown_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending::<Result<(), broadcast::error::RecvError>>().await,
+                }
+            }, if shutdown_rx.is_some() => {
+                match shutdown {
+                    Ok(()) => info!("Watchdog shutdown signal received; stopping health loop"),
+                    Err(error) => warn!(
+                        error = %error,
+                        "Watchdog shutdown receiver closed; stopping health loop"
+                    ),
+                }
+                break;
+            }
+        }
 
         let grpc_ts = health.last_grpc_msg_ts_ms.load(Ordering::Relaxed);
         let grpc_progress_ts = health.last_grpc_progress_ts_ms.load(Ordering::Relaxed);
@@ -278,6 +309,8 @@ pub async fn run(health: Arc<RuntimeHealth>, is_grpc_mode: bool) {
             }
         }
     }
+
+    info!("Watchdog stopped");
 }
 
 #[cfg(test)]
@@ -350,5 +383,21 @@ mod tests {
             None,
             GRPC_STALL_EXIT_MS
         ));
+    }
+
+    #[tokio::test]
+    async fn watchdog_stops_on_shutdown_receiver() {
+        let health = RuntimeHealth::new();
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let handle = tokio::spawn(run_with_shutdown(health, true, Some(shutdown_rx)));
+
+        shutdown_tx
+            .send(())
+            .expect("watchdog shutdown receiver should be subscribed");
+
+        tokio::time::timeout(std::time::Duration::from_millis(500), handle)
+            .await
+            .expect("watchdog should stop promptly after shutdown")
+            .expect("watchdog task should not panic");
     }
 }
