@@ -24735,8 +24735,12 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
     //
     // Lifecycle: runs until the oracle_runtime Arc is dropped or the process
     // exits.  `MissedTickBehavior::Skip` prevents burst logging on stalls.
+    let mut reconciliation_health_shutdown_rx =
+        shutdown_rx.as_ref().map(broadcast::Receiver::resubscribe);
+    let reconciliation_health_shutdown_enabled = reconciliation_health_shutdown_rx.is_some();
+    let (reconciliation_health_stop_tx, mut reconciliation_health_stop_rx) = watch::channel(false);
     let oracle_runtime_recon = oracle_runtime.clone();
-    tokio::spawn(async move {
+    let reconciliation_health_handle = tokio::spawn(async move {
         /// Interval between health-status log emissions.
         const RECONCILIATION_HEALTH_LOG_INTERVAL_SECS: u64 = 30;
 
@@ -24750,7 +24754,40 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
         );
 
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {}
+                shutdown = async {
+                    match reconciliation_health_shutdown_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending::<Result<(), broadcast::error::RecvError>>().await,
+                    }
+                }, if reconciliation_health_shutdown_rx.is_some() => {
+                    match shutdown {
+                        Ok(()) => info!("🔄 ReconciliationRuntime health reporter shutdown signal received"),
+                        Err(error) => warn!(
+                            error = %error,
+                            "🔄 ReconciliationRuntime health reporter shutdown receiver closed"
+                        ),
+                    }
+                    break;
+                }
+                stop_changed = reconciliation_health_stop_rx.changed() => {
+                    match stop_changed {
+                        Ok(()) if *reconciliation_health_stop_rx.borrow_and_update() => {
+                            info!("🔄 ReconciliationRuntime health reporter local stop signal received");
+                            break;
+                        }
+                        Ok(()) => continue,
+                        Err(error) => {
+                            warn!(
+                                error = %error,
+                                "🔄 ReconciliationRuntime health reporter local stop receiver closed"
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
 
             let status = oracle_runtime_recon.reconciliation_status();
             info!(
@@ -24763,6 +24800,8 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                 status.cycle_count,
             );
         }
+
+        info!("🔄 ReconciliationRuntime health reporter stopped");
     });
 
     // ── Shadow Ledger health metrics reporter ────────────────────────────
@@ -25300,6 +25339,35 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
             }
         }
     } // loop
+
+    let _ = reconciliation_health_stop_tx.send(true);
+
+    const RECONCILIATION_HEALTH_JOIN_TIMEOUT: Duration = Duration::from_millis(500);
+    if reconciliation_health_shutdown_enabled {
+        let abort_handle = reconciliation_health_handle.abort_handle();
+        match tokio::time::timeout(
+            RECONCILIATION_HEALTH_JOIN_TIMEOUT,
+            reconciliation_health_handle,
+        )
+        .await
+        {
+            Ok(Ok(())) => info!("🔄 ReconciliationRuntime health reporter shut down successfully"),
+            Ok(Err(error)) => warn!(
+                error = %error,
+                "🔄 ReconciliationRuntime health reporter join failed during shutdown"
+            ),
+            Err(_) => {
+                warn!(
+                    "🔄 ReconciliationRuntime health reporter shutdown timed out after {}ms; aborting reporter",
+                    RECONCILIATION_HEALTH_JOIN_TIMEOUT.as_millis()
+                );
+                abort_handle.abort();
+            }
+        }
+    } else {
+        reconciliation_health_handle.abort();
+        let _ = reconciliation_health_handle.await;
+    }
 }
 
 fn map_amm_program_string_to_pubkey(
