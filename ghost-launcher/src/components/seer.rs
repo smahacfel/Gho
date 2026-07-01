@@ -58,6 +58,7 @@ const SESSION_ACCOUNT_UPDATE_BUFFER_PER_KEY_CAP: usize = 8;
 const SESSION_ACCOUNT_UPDATE_BUFFER_GLOBAL_CAP: usize = 4_096;
 const SESSION_POOL_REGISTRY_FALLBACK_TTL: Duration = Duration::from_secs(30 * 60);
 const SESSION_POOL_REGISTRY_FALLBACK_CAP: usize = 16_384;
+const SEER_CORE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const SESSION_POOL_BRIDGE_PRUNE_INTERVAL: Duration = Duration::from_millis(250);
 const NLN_ARTIFACT_SCHEMA_VERSION: u32 = 1;
 
@@ -4307,7 +4308,7 @@ pub async fn run(
     }
 
     // Start Seer event loop
-    let seer_handle = {
+    let mut seer_handle = {
         let seer = Arc::clone(&seer);
         tokio::spawn(async move {
             loop {
@@ -4810,9 +4811,36 @@ pub async fn run(
     // Wait for shutdown signal
     let _ = shutdown_rx.recv().await;
     info!("Seer: Shutdown signal received");
+    seer.request_shutdown();
 
     // Cancel tasks
-    seer_handle.abort();
+    match tokio::time::timeout(SEER_CORE_SHUTDOWN_TIMEOUT, &mut seer_handle).await {
+        Ok(Ok(())) => {
+            info!("Seer: Core event loop stopped after shutdown request");
+        }
+        Ok(Err(join_err)) => {
+            if join_err.is_cancelled() {
+                warn!("Seer: Core event loop was cancelled during shutdown");
+            } else {
+                error!(
+                    "Seer: Core event loop join failed during shutdown: {}",
+                    join_err
+                );
+            }
+        }
+        Err(_) => {
+            warn!(
+                "Seer: Core event loop did not stop within {:?}; aborting bounded shutdown fallback",
+                SEER_CORE_SHUTDOWN_TIMEOUT
+            );
+            seer_handle.abort();
+            if let Err(join_err) = seer_handle.await {
+                if !join_err.is_cancelled() {
+                    error!("Seer: Core event loop abort join failed: {}", join_err);
+                }
+            }
+        }
+    }
     ipc_handle.abort();
     if let Some(handle) = nln_program_streams_handle {
         handle.abort();
@@ -4997,6 +5025,43 @@ mod tests {
     use solana_sdk::{pubkey::Pubkey, signature::Signature};
     use std::str::FromStr;
     use std::time::{Duration, Instant, SystemTime};
+    use tokio::sync::broadcast;
+
+    #[tokio::test]
+    async fn seer_component_returns_after_global_shutdown_signal() {
+        let mut config = crate::config::LauncherConfig::default().seer;
+        config.source_mode = Some("grpc".to_string());
+        config.connection_mode = "grpc".to_string();
+        config.grpc_endpoint = "http://127.0.0.1:9".to_string();
+        config.grpc_manual_backfill_enabled = false;
+        config.program_streams.enabled = false;
+        config.funding_lane_mode = "disabled".to_string();
+
+        let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
+        let handle = tokio::spawn(super::run(
+            config,
+            shutdown_rx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        shutdown_tx
+            .send(())
+            .expect("Seer component should be subscribed to shutdown");
+
+        let result = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("Seer component should return after shutdown")
+            .expect("Seer component join should not panic");
+        assert!(result.is_ok(), "Seer component shutdown should be clean");
+    }
 
     fn make_candidate(pool: Pubkey, mint: Pubkey) -> CandidatePool {
         CandidatePool {
