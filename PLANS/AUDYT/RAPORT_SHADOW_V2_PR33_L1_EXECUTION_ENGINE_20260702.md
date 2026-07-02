@@ -241,7 +241,24 @@ Wymagane intencje testowe PR33:
 - L1 nie wypelnia `quote_fill_divergence_bps`;
 - existing Shadow V2 test surface nadal przechodzi.
 
-## 12. Wniosek
+## 12. Review fixes
+
+Po review PR33 poprawiono dwa kontraktowe ryzyka:
+
+1. `research_provenance_ready` jest teraz oparte o pelny canonical
+   `PoolStateSampleV2::research_blockers()`, a nie o reczny subset checkow.
+   Blockery research provenance nie blokuja diagnostic deterministic fill, ale
+   uniemozliwiaja `RESEARCH_CANDIDATE`.
+2. `ShadowExitFillV2::modeled_failure()` nie oznacza juz modeled no-fill jako
+   L1 execution-ready i nie przypisuje arbitralnego
+   `NO_FILL_MIN_OUT_NOT_MET` bez formuly oraz bez `min_out` evidence.
+
+Dodany test potwierdza, ze brak `observed_slot`, pusta signature, zerowy
+observed wall time, `PoolStateSource::Unknown` i
+`PoolStateSource::ShadowLedgerDiagnostic` nadal moga dac diagnostic fill, ale
+nie moga dac research provenance.
+
+## 13. Wniosek
 
 PR33 jest gotowy jako implementation PR dla L1 core engine.
 

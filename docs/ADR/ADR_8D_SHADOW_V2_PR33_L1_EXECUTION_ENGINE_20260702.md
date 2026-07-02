@@ -160,3 +160,15 @@ entry_fill = FILLED
 exit_fill = FILLED
 terminal final_pnl_executable_bps != null
 ```
+
+## D9. Review fixes
+
+Po review PR33 doprecyzowano dwa invariants:
+
+1. Research provenance korzysta z canonical
+   `PoolStateSampleV2::research_blockers()`. Engine moze nadal policzyc
+   diagnostic fill, ale kazdy canonical pool-state research blocker degraduje
+   wynik do `DIAGNOSTIC_SIM` / `DiagnosticOnly`.
+2. Modeled exit no-fill/failure nie jest L1 execution simulation. Taki rekord
+   ma `execution_simulation_ready = false`, `research_provenance_ready = false`
+   i nie dostaje `NO_FILL_MIN_OUT_NOT_MET` bez deterministycznej formuly.

@@ -2696,11 +2696,13 @@ impl ShadowExitFillV2 {
             limitation.to_string(),
             "FILL_MODEL_STATIC_NOT_LIVE_CONFIRMED".to_string(),
             "STATIC_EXIT_FILL_DOES_NOT_ENABLE_ACTIVE_CLOSE".to_string(),
+            "MODELED_EXIT_FAILURE_NOT_L1_EXECUTION_SIM".to_string(),
             format!(
                 "EXIT_FILL_MODEL_VERSION={}",
                 config.executable_fill_model_version
             ),
         ];
+        envelope.measurement_grade = MeasurementGrade::DiagnosticOnly;
         envelope.quality = quality.to_string();
         envelope.limitations.extend(limitations.clone());
 
@@ -2721,21 +2723,17 @@ impl ShadowExitFillV2 {
             reconstruction_status: reconstruction_status.to_string(),
             quality: quality.to_string(),
             limitations,
-            execution_simulation_ready: Some(true),
+            execution_simulation_ready: Some(false),
             research_provenance_ready: Some(false),
             execution_label_grade: Some(ShadowV2ExecutionLabelGrade::DiagnosticSim),
             provenance_ready: Some(false),
             provenance_blockers: Vec::new(),
             blocked_reasons: Vec::new(),
-            no_fill_reason: if fill_status == FillStatus::NoFill {
-                Some(ShadowV2NoFillReason::MinOutNotMet)
-            } else {
-                None
-            },
-            fail_reason: if fill_status == FillStatus::Failed {
-                Some("MODELED_EXIT_FAILURE".to_string())
-            } else {
-                None
+            no_fill_reason: None,
+            fail_reason: match fill_status {
+                FillStatus::NoFill => Some("MODELED_EXIT_NO_FILL_NOT_L1_EXECUTION_SIM".to_string()),
+                FillStatus::Failed => Some("MODELED_EXIT_FAILURE".to_string()),
+                _ => None,
             },
             expected_output_raw: None,
             output_amount_raw: None,
@@ -4335,6 +4333,45 @@ mod tests {
         )
     }
 
+    fn assert_entry_fill_diagnostic_for_pool_research_blocker(
+        pool_state: PoolStateSampleV2,
+        event_id: &str,
+        expected_blocker: &str,
+    ) {
+        let mut fill_order = event_order_key(Some(43), Some(2));
+        fill_order.event_seq_in_process = pool_state.event_order_key.event_seq_in_process + 1;
+        let fill = ShadowEntryFillV2::from_static_buy_model(
+            test_envelope("shadow_entry_fill_v2", "pos-a", event_id),
+            fill_order,
+            &pool_state,
+            &ShadowEntryFillModelConfig::bonding_curve(
+                1_000_000_000,
+                250,
+                100,
+                SHADOW_V2_ENTRY_FILL_MODEL_VERSION,
+            ),
+        );
+
+        assert_eq!(fill.fill_status, FillStatus::Filled);
+        assert_eq!(fill.execution_simulation_ready, Some(true));
+        assert_eq!(fill.research_provenance_ready, Some(false));
+        assert_eq!(
+            fill.execution_label_grade,
+            Some(ShadowV2ExecutionLabelGrade::DiagnosticSim)
+        );
+        assert_eq!(
+            fill.envelope.measurement_grade,
+            MeasurementGrade::DiagnosticOnly
+        );
+        assert!(fill.fill_price.is_some());
+        assert!(
+            fill.provenance_blockers
+                .contains(&expected_blocker.to_string()),
+            "expected provenance blocker {expected_blocker}, got {:?}",
+            fill.provenance_blockers
+        );
+    }
+
     fn post_entry_pool_sample(
         event_id: &str,
         seq: u64,
@@ -5418,6 +5455,63 @@ mod tests {
     }
 
     #[test]
+    fn shadow_v2_execution_pool_research_blockers_downgrade_to_diagnostic_fill() {
+        let mut missing_observed_slot =
+            account_state_pool_sample("pool-event-missing-observed-slot", 1);
+        missing_observed_slot.observed_slot = None;
+        assert_entry_fill_diagnostic_for_pool_research_blocker(
+            missing_observed_slot,
+            "entry-fill-missing-observed-slot",
+            "POOL_STATE_SLOT_MISSING",
+        );
+
+        let mut empty_signature = account_state_pool_sample("pool-event-empty-signature", 1);
+        empty_signature.event_order_key.signature = EventOrderComponent::known(String::new());
+        assert_entry_fill_diagnostic_for_pool_research_blocker(
+            empty_signature,
+            "entry-fill-empty-signature",
+            "EVENT_ORDER_SIGNATURE_MISSING",
+        );
+
+        let mut missing_pool_observed_time =
+            account_state_pool_sample("pool-event-missing-observed-time", 1);
+        missing_pool_observed_time.observed_at_wall_ms = 0;
+        assert_entry_fill_diagnostic_for_pool_research_blocker(
+            missing_pool_observed_time,
+            "entry-fill-missing-observed-time",
+            "POOL_STATE_OBSERVED_AT_WALL_MS_MISSING",
+        );
+
+        let mut missing_order_observed_time =
+            account_state_pool_sample("pool-event-missing-order-observed-time", 1);
+        missing_order_observed_time
+            .event_order_key
+            .observed_at_wall_ms = 0;
+        assert_entry_fill_diagnostic_for_pool_research_blocker(
+            missing_order_observed_time,
+            "entry-fill-missing-order-observed-time",
+            "EVENT_ORDER_OBSERVED_AT_WALL_MS_MISSING",
+        );
+
+        let mut unknown_source = account_state_pool_sample("pool-event-unknown-source", 1);
+        unknown_source.source = PoolStateSource::Unknown;
+        assert_entry_fill_diagnostic_for_pool_research_blocker(
+            unknown_source,
+            "entry-fill-unknown-source",
+            "POOL_STATE_SOURCE_UNKNOWN",
+        );
+
+        let mut diagnostic_source =
+            account_state_pool_sample("pool-event-shadowledger-diagnostic", 1);
+        diagnostic_source.source = PoolStateSource::ShadowLedgerDiagnostic;
+        assert_entry_fill_diagnostic_for_pool_research_blocker(
+            diagnostic_source,
+            "entry-fill-shadowledger-diagnostic",
+            "SHADOW_LEDGER_DIAGNOSTIC_NOT_LIVE_TRUTH",
+        );
+    }
+
+    #[test]
     fn shadow_v2_execution_min_out_returns_no_fill_without_fill_price() {
         let pool_state = account_state_pool_sample("pool-event-entry-min-out", 1);
         let reserves =
@@ -5901,9 +5995,26 @@ mod tests {
         assert_eq!(no_fill.reconstruction_status, "EXIT_FILL_MODELED_NO_FILL");
         assert!(no_fill.fill_price.is_none());
         assert!(no_fill.pool_state_after.is_none());
+        assert_eq!(no_fill.execution_simulation_ready, Some(false));
+        assert_eq!(no_fill.research_provenance_ready, Some(false));
+        assert_eq!(no_fill.no_fill_reason, None);
+        assert_eq!(
+            no_fill.fail_reason.as_deref(),
+            Some("MODELED_EXIT_NO_FILL_NOT_L1_EXECUTION_SIM")
+        );
+        assert_eq!(no_fill.expected_output_raw, None);
+        assert_eq!(no_fill.output_amount_raw, None);
+        assert_eq!(no_fill.deterministic_price_impact_bps, None);
+        assert_eq!(
+            no_fill.envelope.measurement_grade,
+            MeasurementGrade::DiagnosticOnly
+        );
         assert!(no_fill
             .limitations
             .contains(&"EXIT_FILL_MODELED_NO_FILL_NOT_LIVE_CONFIRMED".to_string()));
+        assert!(no_fill
+            .limitations
+            .contains(&"MODELED_EXIT_FAILURE_NOT_L1_EXECUTION_SIM".to_string()));
 
         let failed_config = ShadowExitFillModelConfig::bonding_curve(
             10_000_000_000,
@@ -5922,6 +6033,7 @@ mod tests {
         assert_eq!(failed.fill_status, FillStatus::Failed);
         assert_eq!(failed.reconstruction_status, "EXIT_FILL_MODELED_FAILED");
         assert!(failed.fill_price.is_none());
+        assert_eq!(failed.execution_simulation_ready, Some(false));
     }
 
     #[test]

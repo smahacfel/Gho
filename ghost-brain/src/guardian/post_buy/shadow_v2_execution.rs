@@ -12,8 +12,7 @@ use ghost_core::{
 use serde::{Deserialize, Serialize};
 
 use super::shadow_v2::{
-    chain_order_tuple_for_execution, EventOrderKey, FillStatus, PoolStateSampleV2, PoolStateSource,
-    TemporalClass,
+    chain_order_tuple_for_execution, EventOrderKey, FillStatus, PoolStateSampleV2, TemporalClass,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -332,23 +331,14 @@ impl<'a> ShadowV2ExecutionContext<'a> {
     }
 
     fn collect_provenance_blockers(&mut self, pool_state: &PoolStateSampleV2) {
-        if pool_state
-            .account_data_hash
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or_default()
-            .is_empty()
-        {
-            self.provenance(ShadowV2BlockedReason::PoolStateHashMissing);
-        }
-        if pool_state.staleness_ms.is_none() || pool_state.staleness_slots.is_none() {
-            self.provenance(ShadowV2BlockedReason::PoolStateStalenessUnknownOrReversed);
+        for blocker in pool_state.research_blockers() {
+            self.provenance_label(normalize_pool_state_research_blocker(&blocker));
         }
         if pool_state
             .event_order_key
             .has_explicit_unknown_chain_order()
         {
-            self.provenance(ShadowV2BlockedReason::OrderingAmbiguity);
+            self.provenance_label(ShadowV2BlockedReason::OrderingAmbiguity.label().to_string());
             self.provenance_blockers.extend(
                 pool_state
                     .event_order_key
@@ -362,7 +352,7 @@ impl<'a> ShadowV2ExecutionContext<'a> {
             .event_order_key
             .has_explicit_unknown_chain_order()
         {
-            self.provenance(ShadowV2BlockedReason::OrderingAmbiguity);
+            self.provenance_label(ShadowV2BlockedReason::OrderingAmbiguity.label().to_string());
             self.provenance_blockers.extend(
                 self.input
                     .event_order_key
@@ -370,18 +360,6 @@ impl<'a> ShadowV2ExecutionContext<'a> {
                     .into_iter()
                     .map(|label| format!("FILL_EVENT_{label}")),
             );
-        }
-        match pool_state.source {
-            PoolStateSource::Unknown => self
-                .provenance_blockers
-                .push("POOL_STATE_SOURCE_UNKNOWN".to_string()),
-            PoolStateSource::ShadowLedgerDiagnostic => self
-                .provenance_blockers
-                .push("SHADOW_LEDGER_DIAGNOSTIC_NOT_LIVE_TRUTH".to_string()),
-            PoolStateSource::RpcFallback if pool_state.commitment.is_none() => self
-                .provenance_blockers
-                .push("RPC_FALLBACK_COMMITMENT_MISSING".to_string()),
-            _ => {}
         }
     }
 
@@ -707,7 +685,13 @@ impl<'a> ShadowV2ExecutionContext<'a> {
     }
 
     fn provenance(&mut self, reason: ShadowV2BlockedReason) {
-        self.provenance_blockers.push(reason.label().to_string());
+        self.provenance_label(reason.label().to_string());
+    }
+
+    fn provenance_label(&mut self, label: String) {
+        if !self.provenance_blockers.contains(&label) {
+            self.provenance_blockers.push(label);
+        }
     }
 
     fn no_fill_blocker(&mut self, reason: ShadowV2NoFillReason) {
@@ -723,4 +707,19 @@ fn sorted_unique(mut values: Vec<String>) -> Vec<String> {
     values.sort();
     values.dedup();
     values
+}
+
+fn normalize_pool_state_research_blocker(blocker: &str) -> String {
+    match blocker {
+        "POOL_STATE_ACCOUNT_DATA_HASH_MISSING" => ShadowV2BlockedReason::PoolStateHashMissing
+            .label()
+            .to_string(),
+        "POOL_STATE_STALENESS_MS_MISSING_OR_REVERSED"
+        | "POOL_STATE_STALENESS_SLOTS_MISSING_OR_REVERSED" => {
+            ShadowV2BlockedReason::PoolStateStalenessUnknownOrReversed
+                .label()
+                .to_string()
+        }
+        _ => blocker.to_string(),
+    }
 }
