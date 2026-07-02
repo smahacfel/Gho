@@ -1,0 +1,65 @@
+metric,value,status,notes
+run_id,shadow-burnin-v2-fidelity-validation-pr17-r1,INFO,PR17 validation/fidelity-only burnin
+final_verdict,BLOCKED_NO_REAL_SHADOW_V2_POSITION_EVIDENCE,BLOCKED,infrastructure passed but only diagnostic marker evidence was produced
+main_head,286a1f76f5c5fd632800f60afa6b4be98066eec7,PASS,main baseline satisfied user requirement
+scope_root,reports/selector/shadow-v2-fidelity-validation-pr17-r1,INFO,raw local scope not staged
+local_configs_used,true,INFO,*.local.toml files used and not staged
+shadow_v2_burnin_enabled,true,PASS,enabled in local brain config
+shadow_v2_burnin_logging_only,true,PASS,logging_only in local brain config
+runtime_approval,false,PASS,no runtime approval granted
+shadow_close_only_approval,false,PASS,no shadow_close_only approval granted
+active_close_approval,false,PASS,no active close approval granted
+strategy_research_unblocked,false,PASS,no strategy proof or promotion
+live_equivalence,NOT_GRANTED,PASS,no live-equivalence claim
+pre_run_manifest_status,PASS,PASS,pre_run_manifest blockers empty
+pre_run_strict_audit,PASS,PASS,no blockers
+validation_burnin_plan_audit,PASS,PASS,validation_mode=FIDELITY_ONLY and strategy_proof_enabled=false
+legacy_downgrade_audit,PASS,PASS,v1_live_equivalent_allowed=false
+cargo_build_ghost_launcher_release,PASS,PASS,cargo build -p ghost-launcher --bin ghost-launcher --release
+launcher_preflight,PASS,PASS,Spectrum RPC and NLN primary gRPC probe passed
+run_start_utc,2026-07-01T23:18:35.652Z,INFO,All components started successfully
+shutdown_signal_utc,2026-07-01T23:24:38.679Z,INFO,SIGINT only
+final_shutdown_utc,2026-07-01T23:24:48.840Z,PASS,Ghost Launcher shutdown complete
+process_exit_code,0,PASS,launcher exited cleanly
+nln_grpc_endpoint,grpc.nln.clr3.org:443,PASS,primary gRPC ingest stream established
+nln_program_stream_endpoint,events.nln.clr3.org:443,PASS,Program Streams started for required topics
+spectrum_rpc_used,true,PASS,Spectrum RPC used for validation config
+new_pool_detected_count,420,INFO,system log count
+detected_new_pool_count,210,INFO,system log count
+runtime_shadow_buy_submitted_count,0,BLOCKED,no accepted shadow handoff generated real position evidence
+shadow_v2_smoke_marker_emitted_count,1,PASS,diagnostic marker emitted by harness startup
+gatekeeper_decision_rows,286,INFO,local logs only not staged
+gatekeeper_decision_malformed_rows,0,PASS,local logs only not staged
+gatekeeper_decision_buy_true,0,BLOCKED,no BUY decision for real Shadow V2 position
+selector_shadow_score_rows,286,INFO,local logs only not staged
+shadow_position_event_v2_rows,1,PASS_INFRA,canonical writer produced marker row
+shadow_replay_v2_rows,1,PASS_INFRA,derived replay snapshot produced
+shadow_lifecycle_v2_rows,1,PASS_INFRA,derived lifecycle snapshot produced
+shadow_path_density_v2_rows,7,PASS_INFRA,density rows produced
+shadow_path_density_not_evaluable_no_coverage,7,BLOCKED,no real path points
+post_run_manifest_status,PASS,PASS,post_run_manifest blockers empty
+post_run_manifest_blockers,0,PASS,blockers=[]
+post_run_manifest_file_artifact_count,6,PASS,artifact count in written manifest
+post_run_strict_audit,PASS,PASS,strict scan artifact_count=7 and blockers=[]
+post_run_schema_shadow_position_event_v2,1,PASS,schema coverage from post_run_manifest
+post_run_schema_shadow_replay_v2,1,PASS,schema coverage from post_run_manifest
+post_run_schema_shadow_lifecycle_v2,1,PASS,schema coverage from post_run_manifest
+post_run_schema_shadow_path_density_v2,7,PASS,schema coverage from post_run_manifest
+clean_shutdown_proven,true,PASS,All components shut down successfully and Ghost Launcher shutdown complete
+sigterm_used,false,PASS,no SIGTERM sent or observed
+transport_channel_disconnected_count,0,PASS,no reconnect disconnect flood
+nln_subscribe_request_failed_count,0,PASS,no Program Streams subscribe failure
+bad_gateway_count,0,PASS,no 502 Bad Gateway observed
+canonical_record_type,VALIDATION_SMOKE_MARKER,BLOCKED,diagnostic marker only not strategy evidence
+canonical_measurement_grade,DIAGNOSTIC_ONLY,BLOCKED,not research-grade evidence
+canonical_temporal_class,UNKNOWN,BLOCKED,marker cannot prove temporal safety for real fields
+real_shadow_v2_positions,0,BLOCKED,no real position evidence generated
+entry_price_fidelity,BLOCKED_NO_REAL_ENTRY_FILL,BLOCKED,no entry attempt or fill record
+exit_price_fidelity,BLOCKED_NO_REAL_EXIT_FILL,BLOCKED,no exit attempt or fill record
+replay_lifecycle_fidelity,BLOCKED_MARKER_ONLY,BLOCKED,replay and lifecycle only materialized marker-derived snapshots
+temporal_no_lookahead,BLOCKED_NO_REAL_POSITION_FIELDS,BLOCKED,no real fields available for temporal classification
+reconstruction_ready,false,BLOCKED,no real fills pool-state samples or path coverage
+raw_jsonl_staged,false,PASS,raw scope artifacts not staged
+logs_staged,false,PASS,logs not staged
+r51_touched,false,PASS,R51 not touched
+pr17_status,BLOCKED,BLOCKED,requires real Shadow V2 position evidence before fidelity validation can pass
