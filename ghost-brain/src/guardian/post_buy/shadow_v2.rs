@@ -1479,6 +1479,48 @@ impl ShadowEntryFillV2 {
         }
     }
 
+    pub fn blocked_with_pool_state(
+        mut envelope: ShadowV2Envelope,
+        event_order_key: EventOrderKey,
+        pool_state_before: &PoolStateSampleV2,
+        mut blockers: Vec<String>,
+    ) -> Self {
+        envelope.schema = "shadow_entry_fill_v2".to_string();
+        envelope.simulation_level = SimulationLevel::FillModelStatic;
+        envelope.measurement_grade = MeasurementGrade::BlockedByData;
+        envelope.temporal_class = TemporalClass::PostEntry;
+        envelope.clock_domain = ClockDomain::LandingTsMs;
+        envelope.quality = "BLOCKED_BY_DATA".to_string();
+        envelope.source_refs.push(format!(
+            "pool_state_sample_v2:{}",
+            pool_state_before.envelope.event_id
+        ));
+        blockers.extend(pool_state_before.research_blockers());
+        blockers.push("ENTRY_FILL_STATIC_MODEL_NOT_LIVE_CONFIRMED".to_string());
+        blockers.sort();
+        blockers.dedup();
+        envelope.limitations.extend(blockers.clone());
+
+        Self {
+            envelope,
+            event_order_key,
+            fill_status: FillStatus::BlockedByData,
+            fill_price: None,
+            fill_price_source: None,
+            fill_amount_sol: None,
+            fill_amount_tokens: None,
+            slippage_bps: None,
+            own_impact_bps: None,
+            fee_bps: None,
+            min_out: None,
+            pool_state_before: Some(pool_state_before.envelope.event_id.clone()),
+            pool_state_after: None,
+            reconstruction_status: "ENTRY_FILL_BLOCKED_BY_DATA_WITH_POOL_STATE_REF".to_string(),
+            quality: "BLOCKED_BY_DATA".to_string(),
+            limitations: blockers,
+        }
+    }
+
     fn filled_from_quote(
         mut envelope: ShadowV2Envelope,
         event_order_key: EventOrderKey,
@@ -2559,6 +2601,49 @@ impl ShadowExitFillV2 {
         }
     }
 
+    pub fn blocked_with_pool_state(
+        mut envelope: ShadowV2Envelope,
+        event_order_key: EventOrderKey,
+        pool_state_before: &PoolStateSampleV2,
+        mut blockers: Vec<String>,
+    ) -> Self {
+        envelope.schema = "shadow_exit_fill_v2".to_string();
+        envelope.simulation_level = SimulationLevel::FillModelStatic;
+        envelope.measurement_grade = MeasurementGrade::BlockedByData;
+        envelope.temporal_class = TemporalClass::PostExit;
+        envelope.clock_domain = ClockDomain::LandingTsMs;
+        envelope.quality = "BLOCKED_BY_DATA".to_string();
+        envelope.source_refs.push(format!(
+            "pool_state_sample_v2:{}",
+            pool_state_before.envelope.event_id
+        ));
+        blockers.extend(pool_state_before.research_blockers());
+        blockers.push("EXIT_FILL_STATIC_MODEL_NOT_LIVE_CONFIRMED".to_string());
+        blockers.push("STATIC_EXIT_FILL_DOES_NOT_ENABLE_ACTIVE_CLOSE".to_string());
+        blockers.sort();
+        blockers.dedup();
+        envelope.limitations.extend(blockers.clone());
+
+        Self {
+            envelope,
+            event_order_key,
+            fill_status: FillStatus::BlockedByData,
+            fill_price: None,
+            fill_price_source: None,
+            fill_amount_sol: None,
+            fill_amount_tokens: None,
+            slippage_bps: None,
+            own_impact_bps: None,
+            fee_bps: None,
+            min_out: None,
+            pool_state_before: Some(pool_state_before.envelope.event_id.clone()),
+            pool_state_after: None,
+            reconstruction_status: "EXIT_FILL_BLOCKED_BY_DATA_WITH_POOL_STATE_REF".to_string(),
+            quality: "BLOCKED_BY_DATA".to_string(),
+            limitations: blockers,
+        }
+    }
+
     fn filled_from_quote(
         mut envelope: ShadowV2Envelope,
         event_order_key: EventOrderKey,
@@ -3265,6 +3350,22 @@ pub struct ShadowTerminalTruthV2 {
     pub linked_exit_fill: Option<String>,
     pub reconciliation_status: String,
     pub duplicate_terminal_handling: String,
+}
+
+pub fn executable_pnl_bps_from_entry_exit_fills(
+    entry_fill: &ShadowEntryFillV2,
+    exit_fill: &ShadowExitFillV2,
+) -> Option<i32> {
+    if entry_fill.fill_status != FillStatus::Filled || exit_fill.fill_status != FillStatus::Filled {
+        return None;
+    }
+    let entry_sol = entry_fill.fill_amount_sol?;
+    let exit_sol = exit_fill.fill_amount_sol?;
+    if !entry_sol.is_finite() || !exit_sol.is_finite() || entry_sol <= 0.0 {
+        return None;
+    }
+    let pnl_bps = ((exit_sol - entry_sol) / entry_sol) * SHADOW_V2_BPS_DENOMINATOR as f64;
+    pnl_bps.is_finite().then_some(pnl_bps.round() as i32)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -5255,6 +5356,43 @@ mod tests {
     }
 
     #[test]
+    fn shadow_v2_entry_fill_links_pool_state_when_available() {
+        let pool_state = account_state_pool_sample("pool-event-entry-linked", 1);
+        let mut fill_order = event_order_key(Some(43), Some(2));
+        fill_order.event_seq_in_process = 2;
+        let config = ShadowEntryFillModelConfig::bonding_curve(
+            1_000_000_000,
+            250,
+            100,
+            SHADOW_V2_ENTRY_FILL_MODEL_VERSION,
+        );
+
+        let fill = ShadowEntryFillV2::from_static_buy_model(
+            test_envelope("shadow_entry_fill_v2", "pos-a", "entry-fill-linked"),
+            fill_order,
+            &pool_state,
+            &config,
+        );
+
+        assert_eq!(fill.fill_status, FillStatus::Filled);
+        assert_eq!(
+            fill.pool_state_before.as_deref(),
+            Some(pool_state.envelope.event_id.as_str())
+        );
+        assert!(fill.pool_state_after.is_some());
+        assert!(fill.fill_price.is_some());
+        assert!(fill.fill_amount_sol.is_some());
+        assert!(fill.fill_amount_tokens.is_some());
+        assert!(fill.slippage_bps.is_some());
+        assert!(fill.own_impact_bps.is_some());
+        assert!(fill.fee_bps.is_some());
+        assert_eq!(
+            fill.reconstruction_status,
+            "ENTRY_FILL_RECONSTRUCTED_FROM_POOL_STATE"
+        );
+    }
+
+    #[test]
     fn shadow_v2_entry_fill_blocks_missing_reserves_hash_and_bad_temporal_class() {
         let mut pool_state = account_state_pool_sample("pool-event-blocked", 1);
         pool_state.account_data_hash = None;
@@ -5483,6 +5621,43 @@ mod tests {
     }
 
     #[test]
+    fn shadow_v2_exit_fill_links_pool_state_when_available() {
+        let pool_state = post_entry_pool_sample("pool-event-exit-linked", 2, 44, 1);
+        let mut fill_order = event_order_key(Some(45), Some(2));
+        fill_order.event_seq_in_process = 3;
+        let config = ShadowExitFillModelConfig::bonding_curve(
+            10_000_000_000,
+            150,
+            100,
+            SHADOW_V2_EXIT_FILL_MODEL_VERSION,
+        );
+
+        let fill = ShadowExitFillV2::from_static_sell_model(
+            test_envelope("shadow_exit_fill_v2", "pos-a", "exit-fill-linked"),
+            fill_order,
+            &pool_state,
+            &config,
+        );
+
+        assert_eq!(fill.fill_status, FillStatus::Filled);
+        assert_eq!(
+            fill.pool_state_before.as_deref(),
+            Some(pool_state.envelope.event_id.as_str())
+        );
+        assert!(fill.pool_state_after.is_some());
+        assert!(fill.fill_price.is_some());
+        assert!(fill.fill_amount_sol.is_some());
+        assert!(fill.fill_amount_tokens.is_some());
+        assert!(fill.slippage_bps.is_some());
+        assert!(fill.own_impact_bps.is_some());
+        assert!(fill.fee_bps.is_some());
+        assert_eq!(
+            fill.reconstruction_status,
+            "EXIT_FILL_RECONSTRUCTED_FROM_POOL_STATE"
+        );
+    }
+
+    #[test]
     fn shadow_v2_exit_fill_blocks_future_pool_state_and_same_slot_ambiguity() {
         let future_pool_state = post_entry_pool_sample("pool-event-exit-future", 4, 45, 1);
         let mut fill_order = event_order_key(Some(45), Some(2));
@@ -5571,6 +5746,110 @@ mod tests {
         assert_eq!(failed.fill_status, FillStatus::Failed);
         assert_eq!(failed.reconstruction_status, "EXIT_FILL_MODELED_FAILED");
         assert!(failed.fill_price.is_none());
+    }
+
+    #[test]
+    fn shadow_v2_terminal_truth_sets_executable_pnl_only_when_exit_fill_executable() {
+        let entry_pool_state = account_state_pool_sample("pool-event-entry-terminal", 1);
+        let mut entry_fill_order = event_order_key(Some(43), Some(2));
+        entry_fill_order.event_seq_in_process = 2;
+        let entry_fill = ShadowEntryFillV2::from_static_buy_model(
+            test_envelope("shadow_entry_fill_v2", "pos-a", "entry-fill-terminal"),
+            entry_fill_order,
+            &entry_pool_state,
+            &ShadowEntryFillModelConfig::bonding_curve(
+                1_000_000_000,
+                250,
+                100,
+                SHADOW_V2_ENTRY_FILL_MODEL_VERSION,
+            ),
+        );
+
+        let exit_pool_state = post_entry_pool_sample("pool-event-exit-terminal", 3, 44, 1);
+        let mut exit_fill_order = event_order_key(Some(45), Some(2));
+        exit_fill_order.event_seq_in_process = 4;
+        let exit_fill = ShadowExitFillV2::from_static_sell_model(
+            test_envelope("shadow_exit_fill_v2", "pos-a", "exit-fill-terminal"),
+            exit_fill_order.clone(),
+            &exit_pool_state,
+            &ShadowExitFillModelConfig::bonding_curve(
+                10_000_000_000,
+                150,
+                100,
+                SHADOW_V2_EXIT_FILL_MODEL_VERSION,
+            ),
+        );
+        assert_eq!(entry_fill.fill_status, FillStatus::Filled);
+        assert_eq!(exit_fill.fill_status, FillStatus::Filled);
+
+        let executable_pnl = executable_pnl_bps_from_entry_exit_fills(&entry_fill, &exit_fill);
+        assert!(executable_pnl.is_some());
+
+        let blocked_exit = ShadowExitFillV2::blocked_without_pool_state(
+            test_envelope("shadow_exit_fill_v2", "pos-a", "exit-fill-terminal-blocked"),
+            exit_fill_order,
+            vec!["EXIT_POOL_STATE_BEFORE_UNAVAILABLE".to_string()],
+        );
+        assert_eq!(
+            executable_pnl_bps_from_entry_exit_fills(&entry_fill, &blocked_exit),
+            None
+        );
+
+        let mut terminal = terminal_record("pos-a", "terminal-with-executable-pnl");
+        terminal.final_pnl_executable_bps = executable_pnl;
+        assert!(terminal.final_pnl_executable_bps.is_some());
+
+        let mut blocked_terminal = terminal_record("pos-a", "terminal-without-executable-pnl");
+        blocked_terminal.final_pnl_executable_bps =
+            executable_pnl_bps_from_entry_exit_fills(&entry_fill, &blocked_exit);
+        assert!(blocked_terminal.final_pnl_executable_bps.is_none());
+    }
+
+    #[test]
+    fn shadow_v2_fill_remains_blocked_when_pool_state_missing() {
+        let mut entry_fill_order = event_order_key(Some(43), Some(2));
+        entry_fill_order.event_seq_in_process = 2;
+        let entry_fill = ShadowEntryFillV2::blocked_without_pool_state(
+            test_envelope(
+                "shadow_entry_fill_v2",
+                "pos-a",
+                "entry-fill-missing-pool-state",
+            ),
+            entry_fill_order,
+            vec![
+                "ENTRY_POOL_STATE_BEFORE_UNAVAILABLE".to_string(),
+                "FILL_PRICE_UNAVAILABLE".to_string(),
+            ],
+        );
+
+        assert_eq!(entry_fill.fill_status, FillStatus::BlockedByData);
+        assert!(entry_fill.pool_state_before.is_none());
+        assert!(entry_fill.fill_price.is_none());
+        assert!(entry_fill
+            .limitations
+            .contains(&"ENTRY_POOL_STATE_BEFORE_UNAVAILABLE".to_string()));
+
+        let mut exit_fill_order = event_order_key(Some(45), Some(2));
+        exit_fill_order.event_seq_in_process = 3;
+        let exit_fill = ShadowExitFillV2::blocked_without_pool_state(
+            test_envelope(
+                "shadow_exit_fill_v2",
+                "pos-a",
+                "exit-fill-missing-pool-state",
+            ),
+            exit_fill_order,
+            vec![
+                "EXIT_POOL_STATE_BEFORE_UNAVAILABLE".to_string(),
+                "FILL_PRICE_UNAVAILABLE".to_string(),
+            ],
+        );
+
+        assert_eq!(exit_fill.fill_status, FillStatus::BlockedByData);
+        assert!(exit_fill.pool_state_before.is_none());
+        assert!(exit_fill.fill_price.is_none());
+        assert!(exit_fill
+            .limitations
+            .contains(&"EXIT_POOL_STATE_BEFORE_UNAVAILABLE".to_string()));
     }
 
     #[test]

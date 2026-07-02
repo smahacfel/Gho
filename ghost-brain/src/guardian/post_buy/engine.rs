@@ -65,10 +65,10 @@ use super::integration::{PositionRuntimeRouter, ShadowPositionBookAemAdapter};
 use super::shadow_v2::ShadowV2ValidationHarnessConfig;
 use super::shadow_v2::{
     ClockDomain, ClockedTimestamp, EventOrderComponent, EventOrderKey, MeasurementGrade,
-    ShadowExitAttemptV2, ShadowExitFillV2, ShadowPathSampleV2, ShadowPathSamplingModeV2,
-    ShadowPathSamplingReasonV2, ShadowTerminalTruthV2, ShadowV2Envelope, ShadowV2Record,
-    ShadowV2ValidationEvidenceStatus, ShadowV2ValidationHarness, SimulationLevel, TemporalClass,
-    TerminalReasonV2, SHADOW_V2_EXIT_FILL_MODEL_VERSION,
+    PoolStateSampleV2, ShadowExitAttemptV2, ShadowExitFillV2, ShadowPathSampleV2,
+    ShadowPathSamplingModeV2, ShadowPathSamplingReasonV2, ShadowTerminalTruthV2, ShadowV2Envelope,
+    ShadowV2Record, ShadowV2ValidationEvidenceStatus, ShadowV2ValidationHarness, SimulationLevel,
+    TemporalClass, TerminalReasonV2, SHADOW_V2_EXIT_FILL_MODEL_VERSION,
 };
 
 #[cfg(test)]
@@ -843,6 +843,8 @@ struct ShadowLifecycleRecord {
     entry_value_sol: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     exit_value_sol: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exit_token_amount_raw: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     gross_pnl_sol: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1672,8 +1674,12 @@ impl MonitoringEngine {
             records.push(ShadowV2Record::ShadowExitAttemptV2(
                 self.shadow_v2_exit_attempt_from_lifecycle(record),
             ));
+            let exit_pool_state = self.shadow_v2_exit_pool_state_sample_from_lifecycle(record);
+            if let Some(pool_state) = exit_pool_state.as_ref() {
+                records.push(ShadowV2Record::PoolStateSampleV2(pool_state.clone()));
+            }
             records.push(ShadowV2Record::ShadowExitFillV2(
-                self.shadow_v2_exit_fill_from_lifecycle(record),
+                self.shadow_v2_exit_fill_from_lifecycle(record, exit_pool_state.as_ref()),
             ));
         }
 
@@ -1685,8 +1691,12 @@ impl MonitoringEngine {
                 records.push(ShadowV2Record::ShadowExitAttemptV2(
                     self.shadow_v2_exit_attempt_from_lifecycle(record),
                 ));
+                let exit_pool_state = self.shadow_v2_exit_pool_state_sample_from_lifecycle(record);
+                if let Some(pool_state) = exit_pool_state.as_ref() {
+                    records.push(ShadowV2Record::PoolStateSampleV2(pool_state.clone()));
+                }
                 records.push(ShadowV2Record::ShadowExitFillV2(
-                    self.shadow_v2_exit_fill_from_lifecycle(record),
+                    self.shadow_v2_exit_fill_from_lifecycle(record, exit_pool_state.as_ref()),
                 ));
             }
             records.push(ShadowV2Record::ShadowTerminalTruthV2(
@@ -1849,9 +1859,68 @@ impl MonitoringEngine {
         attempt
     }
 
+    fn shadow_v2_exit_pool_state_sample_from_lifecycle(
+        &self,
+        record: &ShadowLifecycleRecord,
+    ) -> Option<PoolStateSampleV2> {
+        let base_mint = record.mint_id.parse::<Pubkey>().ok()?;
+        let state = self.current_canonical_state(&base_mint)?;
+        let sample_ts = record
+            .exit_reason_evaluation_ts_ms
+            .or(record.sample_timestamp_ms)
+            .unwrap_or(record.timestamp_ms);
+        let mut envelope = self.shadow_v2_lifecycle_envelope(
+            record,
+            "pool_state_sample_v2",
+            format!(
+                "shadow_v2_pool_state_exit_before:{}:{}:{}",
+                record.position_id,
+                sample_ts,
+                shadow_lifecycle_record_type_label(record.record_type)
+            ),
+            TemporalClass::PostEntry,
+            ClockDomain::StreamObservedMs,
+        );
+        envelope.source_refs.push(format!(
+            "shadow_lifecycle:{}",
+            shadow_lifecycle_record_type_label(record.record_type)
+        ));
+        envelope
+            .source_refs
+            .push("account_state_core:get_canonical_state".to_string());
+        envelope
+            .limitations
+            .push("POOL_STATE_SAMPLE_FROM_ACCOUNT_STATE_CORE_WITHOUT_RAW_ACCOUNT_HASH".to_string());
+        envelope
+            .limitations
+            .push("POOL_STATE_ACCOUNT_DATA_HASH_UNAVAILABLE_IN_RUNTIME".to_string());
+        envelope
+            .limitations
+            .push("TOKEN_DECIMALS_ASSUMED_PUMPFUN_6".to_string());
+
+        let mut sample = PoolStateSampleV2::from_account_state_core(
+            envelope,
+            shadow_v2_event_order_key(
+                Some(state.last_update_slot),
+                record.exit_market_anchor_tx_signature.as_deref(),
+                shadow_v2_event_seq(sample_ts, 3),
+                sample_ts,
+            ),
+            &state,
+            sample_ts,
+            None,
+            TemporalClass::PostEntry,
+            ClockDomain::StreamObservedMs,
+            6,
+        );
+        sample.event_order_key.slot = EventOrderComponent::known(state.last_update_slot);
+        Some(sample)
+    }
+
     fn shadow_v2_exit_fill_from_lifecycle(
         &self,
         record: &ShadowLifecycleRecord,
+        pool_state_before: Option<&PoolStateSampleV2>,
     ) -> ShadowExitFillV2 {
         let fill_ts = record
             .exit_reason_evaluation_ts_ms
@@ -1875,25 +1944,63 @@ impl MonitoringEngine {
         ));
         let mut blockers = vec![
             "EXIT_FILL_DERIVED_FROM_LEGACY_LIFECYCLE_EVIDENCE".to_string(),
-            "EXIT_FILL_POOL_STATE_SAMPLE_NOT_AVAILABLE_IN_PR18_ADAPTER".to_string(),
-            "EXIT_FILL_QUOTE_FILL_DIVERGENCE_NOT_MEASURED".to_string(),
+            "EXIT_POOL_STATE_AFTER_UNAVAILABLE".to_string(),
+            "FILL_PRICE_UNAVAILABLE".to_string(),
+            "SLIPPAGE_BPS_UNAVAILABLE".to_string(),
+            "OWN_IMPACT_BPS_UNAVAILABLE".to_string(),
+            "FEE_BPS_UNAVAILABLE".to_string(),
+            "LANDING_TELEMETRY_UNAVAILABLE".to_string(),
+            "QUOTE_FILL_DIVERGENCE_UNAVAILABLE".to_string(),
         ];
+        if pool_state_before.is_none() {
+            blockers.push("EXIT_POOL_STATE_BEFORE_UNAVAILABLE".to_string());
+            blockers.push("EXIT_FILL_POOL_STATE_SAMPLE_NOT_AVAILABLE_IN_RUNTIME".to_string());
+        }
         if matches!(record.record_type, ShadowLifecycleRecordType::ExitBlocked) {
             blockers.push("EXIT_FILL_LEGACY_LIFECYCLE_EXIT_BLOCKED".to_string());
         }
         if record.exit_price.is_none() {
             blockers.push("EXIT_FILL_LEGACY_EXIT_PRICE_MISSING".to_string());
         }
-        ShadowExitFillV2::blocked_without_pool_state(
-            envelope,
-            shadow_v2_event_order_key(
-                record.exit_landed_slot.or(record.exit_sample_slot),
-                record.exit_market_anchor_tx_signature.as_deref(),
-                shadow_v2_event_seq(fill_ts, 3),
-                fill_ts,
-            ),
-            blockers,
-        )
+        if record.exit_token_amount_raw.is_none() {
+            blockers.push("EXIT_FILL_TOKEN_AMOUNT_RAW_UNAVAILABLE".to_string());
+        }
+        let fill_order_key = shadow_v2_event_order_key(
+            record.exit_landed_slot.or(record.exit_sample_slot),
+            record.exit_market_anchor_tx_signature.as_deref(),
+            shadow_v2_event_seq(fill_ts, 4),
+            fill_ts,
+        );
+        if let Some(pool_state) = pool_state_before {
+            if pool_state.observed_at_wall_ms > fill_ts {
+                blockers.push("EXIT_FILL_POOL_STATE_AFTER_EXIT_FILL_BOUNDARY".to_string());
+            }
+            match (
+                pool_state.event_order_key.slot.as_known(),
+                fill_order_key.slot.as_known(),
+            ) {
+                (Some(pool_slot), Some(fill_slot)) if pool_slot > fill_slot => {
+                    blockers.push("EXIT_FILL_POOL_STATE_AFTER_EXIT_FILL_BOUNDARY".to_string());
+                }
+                (Some(pool_slot), Some(fill_slot)) if pool_slot == fill_slot => {
+                    if pool_state
+                        .event_order_key
+                        .same_slot_ambiguous_with(&fill_order_key)
+                    {
+                        blockers.push("EXIT_FILL_POOL_STATE_SAME_SLOT_ORDER_AMBIGUOUS".to_string());
+                    }
+                }
+                _ => {}
+            }
+            ShadowExitFillV2::blocked_with_pool_state(
+                envelope,
+                fill_order_key,
+                pool_state,
+                blockers,
+            )
+        } else {
+            ShadowExitFillV2::blocked_without_pool_state(envelope, fill_order_key, blockers)
+        }
     }
 
     fn shadow_v2_terminal_truth_from_lifecycle(
@@ -1925,6 +2032,9 @@ impl MonitoringEngine {
         envelope
             .limitations
             .push("TERMINAL_TRUTH_MARK_PATH_ONLY_NOT_EXECUTABLE_FILL".to_string());
+        envelope
+            .limitations
+            .push("TERMINAL_EXECUTABLE_PNL_BLOCKED_BY_EXIT_FILL_PROVENANCE".to_string());
         envelope
             .limitations
             .push("TERMINAL_TRUTH_DERIVED_FROM_LEGACY_LIFECYCLE_RECORD".to_string());
@@ -2364,6 +2474,7 @@ impl MonitoringEngine {
             exit_price: None,
             entry_value_sol: None,
             exit_value_sol: None,
+            exit_token_amount_raw: None,
             gross_pnl_sol: None,
             net_pnl_sol: None,
             estimated_costs_sol: None,
@@ -4821,6 +4932,7 @@ impl MonitoringEngine {
             record.exit_price = Some(truth.exit_price_sol);
             record.entry_value_sol = Some(truth.entry_value_sol);
             record.exit_value_sol = Some(truth.exit_value_sol);
+            record.exit_token_amount_raw = Some(truth.exit_token_amount_raw);
             record.gross_pnl_sol = Some(truth.gross_pnl_sol);
             record.net_pnl_sol = Some(truth.net_pnl_sol);
             record.estimated_costs_sol = Some(truth.estimated_costs_sol);
