@@ -481,6 +481,19 @@ impl ShadowPositionEventKindV2 {
     pub const fn is_canonical_terminal(self) -> bool {
         matches!(self, Self::TerminalTruth)
     }
+
+    pub const fn requires_event_ordering(self) -> bool {
+        matches!(
+            self,
+            Self::PoolStateSample
+                | Self::EntryAttempt
+                | Self::EntryFill
+                | Self::PathSample
+                | Self::ExitAttempt
+                | Self::ExitFill
+                | Self::TerminalTruth
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -490,6 +503,8 @@ pub struct ShadowPositionEventV2 {
     pub envelope: ShadowV2Envelope,
     pub event_kind: ShadowPositionEventKindV2,
     pub event_order_key: Option<EventOrderKey>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ordering_exemption: Option<String>,
     pub canonical_payload_schema: String,
     pub canonical_payload_event_id: String,
     pub canonical_terminal_event_id: Option<String>,
@@ -503,6 +518,7 @@ impl ShadowPositionEventV2 {
         let canonical_payload_schema = envelope.schema.clone();
         let canonical_payload_event_id = envelope.event_id.clone();
         let event_order_key = record.event_order_key().cloned();
+        let ordering_exemption = record.ordering_exemption();
         let canonical_terminal_event_id = event_kind
             .is_canonical_terminal()
             .then(|| envelope.event_id.clone());
@@ -513,6 +529,7 @@ impl ShadowPositionEventV2 {
             envelope,
             event_kind,
             event_order_key,
+            ordering_exemption,
             canonical_payload_schema,
             canonical_payload_event_id,
             canonical_terminal_event_id,
@@ -522,6 +539,18 @@ impl ShadowPositionEventV2 {
 
     pub fn is_canonical_terminal(&self) -> bool {
         self.event_kind.is_canonical_terminal()
+    }
+
+    pub fn has_explicit_ordering_exemption(&self) -> bool {
+        matches!(
+            (self.event_kind, self.ordering_exemption.as_deref()),
+            (
+                ShadowPositionEventKindV2::PositionCreated,
+                Some(
+                    "ORDERING_EXEMPT_POSITION_CREATED" | "ORDERING_EXEMPT_VALIDATION_SMOKE_MARKER"
+                )
+            )
+        )
     }
 }
 
@@ -586,11 +615,35 @@ impl ShadowV2Record {
             Self::ShadowPathSampleV2(record) => Some(&record.event_order_key),
             Self::ShadowExitAttemptV2(record) => Some(&record.event_order_key),
             Self::ShadowExitFillV2(record) => Some(&record.event_order_key),
+            Self::ShadowTerminalTruthV2(record) => Some(&record.event_order_key),
             Self::ShadowPositionV2(_)
             | Self::ShadowEntryDecisionV2(_)
-            | Self::ShadowTerminalTruthV2(_)
             | Self::ShadowReplayV2(_)
             | Self::ShadowLifecycleV2(_) => None,
+        }
+    }
+
+    pub fn ordering_exemption(&self) -> Option<String> {
+        match self {
+            Self::ShadowPositionV2(record) => {
+                let is_smoke_marker = matches!(
+                    record.envelope.candidate_id.as_deref(),
+                    Some("VALIDATION_SMOKE_MARKER")
+                ) || record
+                    .envelope
+                    .limitations
+                    .iter()
+                    .any(|limitation| limitation == "VALIDATION_SMOKE_MARKER_V2");
+                Some(
+                    if is_smoke_marker {
+                        "ORDERING_EXEMPT_VALIDATION_SMOKE_MARKER"
+                    } else {
+                        "ORDERING_EXEMPT_POSITION_CREATED"
+                    }
+                    .to_string(),
+                )
+            }
+            _ => None,
         }
     }
 }
@@ -613,8 +666,13 @@ pub enum ShadowV2Error {
     },
     NonMonotonicEventSequence {
         run_id: String,
+        position_id: String,
         previous_seq: u64,
         attempted_seq: u64,
+    },
+    MissingRequiredEventOrderKey {
+        event_id: String,
+        event_kind: ShadowPositionEventKindV2,
     },
     MissingExactJoinKey {
         event_id: String,
@@ -669,11 +727,19 @@ impl fmt::Display for ShadowV2Error {
             ),
             Self::NonMonotonicEventSequence {
                 run_id,
+                position_id,
                 previous_seq,
                 attempted_seq,
             } => write!(
                 f,
-                "shadow v2 run {run_id} non-monotonic event_seq_in_process: previous={previous_seq}, attempted={attempted_seq}"
+                "shadow v2 run {run_id} position {position_id} non-monotonic event_seq_in_process: previous={previous_seq}, attempted={attempted_seq}"
+            ),
+            Self::MissingRequiredEventOrderKey {
+                event_id,
+                event_kind,
+            } => write!(
+                f,
+                "shadow v2 event {event_id} kind {event_kind:?} missing required event_order_key"
             ),
             Self::MissingExactJoinKey {
                 event_id,
@@ -823,7 +889,7 @@ pub struct ShadowV2CanonicalEventStream {
     events: Vec<ShadowPositionEventV2>,
     seen_event_ids: HashSet<String>,
     terminal_event_by_position: HashMap<String, String>,
-    last_process_seq_by_run: HashMap<String, u64>,
+    last_process_seq_by_position: HashMap<(String, String), u64>,
 }
 
 impl ShadowV2CanonicalEventStream {
@@ -839,7 +905,8 @@ impl ShadowV2CanonicalEventStream {
         &self,
         record: ShadowV2Record,
     ) -> Result<ShadowPositionEventV2, ShadowV2Error> {
-        let event = ShadowPositionEventV2::from_record(record)?;
+        let mut event = ShadowPositionEventV2::from_record(record)?;
+        self.canonicalize_event_order_for_position(&mut event);
         self.validate_event(&event)?;
         Ok(event)
     }
@@ -916,11 +983,19 @@ impl ShadowV2CanonicalEventStream {
                 });
             }
         }
+        if event.event_kind.requires_event_ordering() && event.event_order_key.is_none() {
+            return Err(ShadowV2Error::MissingRequiredEventOrderKey {
+                event_id: event.envelope.event_id.clone(),
+                event_kind: event.event_kind,
+            });
+        }
         if let Some(order_key) = event.event_order_key.as_ref() {
-            if let Some(previous_seq) = self.last_process_seq_by_run.get(&event.envelope.run_id) {
+            let sequence_key = shadow_v2_position_sequence_key(event);
+            if let Some(previous_seq) = self.last_process_seq_by_position.get(&sequence_key) {
                 if !order_key.is_after_process_seq(*previous_seq) {
                     return Err(ShadowV2Error::NonMonotonicEventSequence {
                         run_id: event.envelope.run_id.clone(),
+                        position_id: event.envelope.position_id.clone(),
                         previous_seq: *previous_seq,
                         attempted_seq: order_key.event_seq_in_process,
                     });
@@ -930,10 +1005,27 @@ impl ShadowV2CanonicalEventStream {
         Ok(())
     }
 
+    fn canonicalize_event_order_for_position(&self, event: &mut ShadowPositionEventV2) {
+        let sequence_key = shadow_v2_position_sequence_key(event);
+        let Some(order_key) = event.event_order_key.as_mut() else {
+            return;
+        };
+        let canonical_seq = shadow_v2_event_seq_for_position(
+            self.last_process_seq_by_position
+                .get(&sequence_key)
+                .copied(),
+            order_key.event_seq_in_process,
+        );
+        if canonical_seq != order_key.event_seq_in_process {
+            order_key.event_seq_in_process = canonical_seq;
+            set_payload_event_seq_in_process(&mut event.payload, canonical_seq);
+        }
+    }
+
     fn commit_event(&mut self, event: ShadowPositionEventV2) {
         if let Some(order_key) = event.event_order_key.as_ref() {
-            self.last_process_seq_by_run.insert(
-                event.envelope.run_id.clone(),
+            self.last_process_seq_by_position.insert(
+                shadow_v2_position_sequence_key(&event),
                 order_key.event_seq_in_process,
             );
         }
@@ -945,6 +1037,34 @@ impl ShadowV2CanonicalEventStream {
         }
         self.seen_event_ids.insert(event.envelope.event_id.clone());
         self.events.push(event);
+    }
+}
+
+fn shadow_v2_position_sequence_key(event: &ShadowPositionEventV2) -> (String, String) {
+    (
+        event.envelope.run_id.clone(),
+        event.envelope.position_id.clone(),
+    )
+}
+
+pub fn shadow_v2_event_seq_for_position(previous_seq: Option<u64>, attempted_seq: u64) -> u64 {
+    previous_seq.map_or(attempted_seq, |previous| {
+        attempted_seq.max(previous.saturating_add(1))
+    })
+}
+
+fn set_payload_event_seq_in_process(payload: &mut serde_json::Value, event_seq_in_process: u64) {
+    let Some(record) = payload.get_mut("record") else {
+        return;
+    };
+    let Some(event_order_key) = record.get_mut("event_order_key") else {
+        return;
+    };
+    if let Some(object) = event_order_key.as_object_mut() {
+        object.insert(
+            "event_seq_in_process".to_string(),
+            serde_json::Value::from(event_seq_in_process),
+        );
     }
 }
 
@@ -3339,6 +3459,7 @@ fn percentile_from_sorted(values: &[u64], percentile: u64) -> Option<u64> {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ShadowTerminalTruthV2 {
     pub envelope: ShadowV2Envelope,
+    pub event_order_key: EventOrderKey,
     pub terminal_reason: TerminalReasonV2,
     pub terminal_ts_ms: ClockedTimestamp,
     pub terminal_slot: Option<u64>,
@@ -4243,8 +4364,11 @@ mod tests {
     fn terminal_record(position_id: &str, event_id: &str) -> ShadowTerminalTruthV2 {
         let mut envelope = test_envelope("shadow_terminal_truth_v2", position_id, event_id);
         envelope.temporal_class = TemporalClass::PostExit;
+        let mut terminal_order = event_order_key(Some(45), Some(3));
+        terminal_order.event_seq_in_process = 9;
         ShadowTerminalTruthV2 {
             envelope,
+            event_order_key: terminal_order,
             terminal_reason: TerminalReasonV2::Timeout,
             terminal_ts_ms: clocked(
                 "terminal_ts_ms",
@@ -4928,7 +5052,147 @@ mod tests {
         assert_eq!(json["event_kind"], "POSITION_CREATED");
         assert_eq!(json["envelope"]["position_id"], "pos-a");
         assert_eq!(json["canonical_payload_schema"], "shadow_position_v2");
+        assert_eq!(
+            json["ordering_exemption"],
+            "ORDERING_EXEMPT_POSITION_CREATED"
+        );
         assert_eq!(writer.stream().events().len(), 1);
+    }
+
+    #[test]
+    fn shadow_v2_terminal_truth_has_event_order_key() {
+        let terminal = terminal_record("pos-a", "event-terminal");
+        let record = ShadowV2Record::ShadowTerminalTruthV2(terminal);
+        assert!(record.event_order_key().is_some());
+
+        let event = ShadowPositionEventV2::from_record(record).unwrap();
+        assert_eq!(event.event_kind, ShadowPositionEventKindV2::TerminalTruth);
+        assert!(event.event_kind.requires_event_ordering());
+        assert!(event.event_order_key.is_some());
+        assert!(event.ordering_exemption.is_none());
+        assert_eq!(
+            event
+                .payload
+                .get("record")
+                .and_then(|record| record.get("event_order_key"))
+                .and_then(|value| value.get("event_seq_in_process"))
+                .and_then(Value::as_u64),
+            Some(9)
+        );
+    }
+
+    #[test]
+    fn shadow_v2_position_created_ordering_exemption_is_explicit() {
+        let event = ShadowPositionEventV2::from_record(ShadowV2Record::ShadowPositionV2(
+            position_record("pos-a", "event-position"),
+        ))
+        .unwrap();
+
+        assert_eq!(event.event_kind, ShadowPositionEventKindV2::PositionCreated);
+        assert!(event.event_order_key.is_none());
+        assert_eq!(
+            event.ordering_exemption.as_deref(),
+            Some("ORDERING_EXEMPT_POSITION_CREATED")
+        );
+        assert!(event.has_explicit_ordering_exemption());
+        assert!(!event.event_kind.requires_event_ordering());
+
+        let mut smoke_marker = position_record("pos-smoke", "event-position-smoke");
+        smoke_marker.envelope.candidate_id = Some("VALIDATION_SMOKE_MARKER".to_string());
+        smoke_marker
+            .envelope
+            .limitations
+            .push("VALIDATION_SMOKE_MARKER_V2".to_string());
+        let smoke_event =
+            ShadowPositionEventV2::from_record(ShadowV2Record::ShadowPositionV2(smoke_marker))
+                .unwrap();
+        assert_eq!(
+            smoke_event.ordering_exemption.as_deref(),
+            Some("ORDERING_EXEMPT_VALIDATION_SMOKE_MARKER")
+        );
+        assert!(smoke_event.has_explicit_ordering_exemption());
+    }
+
+    #[test]
+    fn shadow_v2_temporal_audit_fails_missing_required_event_order_key() {
+        let mut event = ShadowPositionEventV2::from_record(ShadowV2Record::ShadowTerminalTruthV2(
+            terminal_record("pos-a", "event-terminal"),
+        ))
+        .unwrap();
+        event.event_order_key = None;
+
+        assert!(event.event_kind.requires_event_ordering());
+        assert!(event.event_order_key.is_none());
+        assert!(!event.has_explicit_ordering_exemption());
+
+        let err = ShadowV2CanonicalEventStream::default()
+            .commit_prepared_event(event)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ShadowV2Error::MissingRequiredEventOrderKey {
+                event_kind: ShadowPositionEventKindV2::TerminalTruth,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn shadow_v2_temporal_audit_allows_explicit_position_created_exemption() {
+        let event = ShadowPositionEventV2::from_record(ShadowV2Record::ShadowPositionV2(
+            position_record("pos-a", "event-position"),
+        ))
+        .unwrap();
+
+        assert!(!event.event_kind.requires_event_ordering());
+        assert!(event.event_order_key.is_none());
+        assert!(event.has_explicit_ordering_exemption());
+    }
+
+    #[test]
+    fn shadow_v2_event_seq_is_monotonic_per_position() {
+        let mut stream = ShadowV2CanonicalEventStream::default();
+
+        let mut first = account_state_pool_sample("pool-event-a", 10);
+        first.envelope.position_id = "pos-a".to_string();
+        stream
+            .append_record(ShadowV2Record::PoolStateSampleV2(first))
+            .unwrap();
+
+        let mut second = account_state_pool_sample("pool-event-b", 5);
+        second.envelope.position_id = "pos-a".to_string();
+        let second_event = stream
+            .append_record(ShadowV2Record::PoolStateSampleV2(second))
+            .unwrap();
+        assert_eq!(
+            second_event
+                .event_order_key
+                .as_ref()
+                .map(|order| order.event_seq_in_process),
+            Some(11)
+        );
+        assert_eq!(
+            second_event
+                .payload
+                .get("record")
+                .and_then(|record| record.get("event_order_key"))
+                .and_then(|value| value.get("event_seq_in_process"))
+                .and_then(Value::as_u64),
+            Some(11)
+        );
+
+        let mut other_position = account_state_pool_sample("pool-event-c", 1);
+        other_position.envelope.position_id = "pos-b".to_string();
+        let other_event = stream
+            .append_record(ShadowV2Record::PoolStateSampleV2(other_position))
+            .unwrap();
+        assert_eq!(
+            other_event
+                .event_order_key
+                .as_ref()
+                .map(|order| order.event_seq_in_process),
+            Some(1)
+        );
     }
 
     #[test]
@@ -5267,24 +5531,30 @@ mod tests {
     }
 
     #[test]
-    fn shadow_v2_pool_state_recorder_enforces_monotonic_event_sequence() {
+    fn shadow_v2_pool_state_recorder_canonicalizes_monotonic_event_sequence() {
         let mut recorder = PoolStateProvenanceRecorder::default();
         recorder
             .record_sample(account_state_pool_sample("pool-event-a", 2))
             .unwrap();
 
-        let error = recorder
+        let validation = recorder
             .record_sample(account_state_pool_sample("pool-event-b", 1))
-            .unwrap_err();
+            .unwrap();
 
-        assert!(matches!(
-            error,
-            ShadowV2Error::NonMonotonicEventSequence {
-                previous_seq: 2,
-                attempted_seq: 1,
-                ..
-            }
-        ));
+        assert!(validation.research_ready);
+        let event = recorder
+            .canonical_stream
+            .events()
+            .iter()
+            .find(|event| event.envelope.event_id == "pool-event-b")
+            .unwrap();
+        assert_eq!(
+            event
+                .event_order_key
+                .as_ref()
+                .map(|order| order.event_seq_in_process),
+            Some(3)
+        );
     }
 
     #[test]

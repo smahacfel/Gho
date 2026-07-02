@@ -2059,6 +2059,12 @@ impl MonitoringEngine {
 
         ShadowTerminalTruthV2 {
             envelope,
+            event_order_key: shadow_v2_event_order_key(
+                record.exit_landed_slot.or(record.exit_sample_slot),
+                record.exit_market_anchor_tx_signature.as_deref(),
+                shadow_v2_event_seq(terminal_ts, 5),
+                terminal_ts,
+            ),
             terminal_reason: shadow_v2_terminal_reason(record.close_reason),
             terminal_ts_ms: ClockedTimestamp {
                 field_name: "terminal_ts_ms".to_string(),
