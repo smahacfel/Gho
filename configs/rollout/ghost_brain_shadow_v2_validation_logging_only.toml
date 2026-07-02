@@ -12,6 +12,7 @@ run_namespace = "shadow-burnin-v2-fidelity-validation-logging-only"
 scope_root_path = "reports/selector/shadow-v2-fidelity-validation"
 pre_run_manifest_path = "reports/selector/shadow-v2-fidelity-validation/pre_run_manifest.json"
 post_run_manifest_path = "reports/selector/shadow-v2-fidelity-validation/post_run_manifest.json"
+post_run_manifest_drain_timeout_ms = 180000
 manifest_audit_script = "scripts/shadow_v2_manifest_audit.py"
 required_schema_manifest_path = "reports/selector/shadow_v2_required_schema_manifest.csv"
 acceptance_gates_path = "reports/selector/shadow_v2_acceptance_gates.csv"

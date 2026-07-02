@@ -207,6 +207,8 @@ pub enum ShadowV2BurninMode {
     LoggingOnlyValidation,
 }
 
+pub const DEFAULT_SHADOW_V2_POST_RUN_MANIFEST_DRAIN_TIMEOUT_MS: u64 = 180_000;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ShadowV2BurninConfig {
@@ -226,6 +228,8 @@ pub struct ShadowV2BurninConfig {
     pub pre_run_manifest_path: Option<String>,
     /// Required post-run manifest destination for future validation.
     pub post_run_manifest_path: Option<String>,
+    /// Dedicated shutdown budget for runtime post-run manifest generation and strict audit.
+    pub post_run_manifest_drain_timeout_ms: u64,
     /// Offline manifest audit script; not invoked by runtime.
     pub manifest_audit_script: String,
     /// Schema manifest used by manifest/schema coverage checks.
@@ -291,6 +295,8 @@ impl Default for ShadowV2BurninConfig {
             scope_root_path: None,
             pre_run_manifest_path: None,
             post_run_manifest_path: None,
+            post_run_manifest_drain_timeout_ms:
+                DEFAULT_SHADOW_V2_POST_RUN_MANIFEST_DRAIN_TIMEOUT_MS,
             manifest_audit_script: "scripts/shadow_v2_manifest_audit.py".to_string(),
             required_schema_manifest_path:
                 "reports/selector/shadow_v2_required_schema_manifest.csv".to_string(),
@@ -402,6 +408,11 @@ impl ShadowV2BurninConfig {
                 .is_empty()
             {
                 anyhow::bail!("Shadow V2 enabled profile requires post_run_manifest_path");
+            }
+            if self.post_run_manifest_drain_timeout_ms < 30_000 {
+                anyhow::bail!(
+                    "Shadow V2 enabled profile requires post_run_manifest_drain_timeout_ms >= 30000"
+                );
             }
             if self
                 .canonical_event_stream_path
@@ -5472,6 +5483,10 @@ mod tests {
         let config = GhostBrainConfig::default();
         assert_eq!(config.version, 1);
         assert!(config.validate().is_ok());
+        assert_eq!(
+            config.shadow_v2_burnin.post_run_manifest_drain_timeout_ms,
+            DEFAULT_SHADOW_V2_POST_RUN_MANIFEST_DRAIN_TIMEOUT_MS
+        );
     }
 
     #[test]
@@ -6190,6 +6205,7 @@ include_spl = false
             config.path_density_v2_path.as_deref(),
             Some("reports/selector/shadow-v2-fidelity-validation/shadow_path_density_v2.jsonl")
         );
+        assert_eq!(config.post_run_manifest_drain_timeout_ms, 180_000);
     }
 
     #[test]
