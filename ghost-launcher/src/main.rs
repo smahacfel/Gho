@@ -84,6 +84,8 @@ const EXIT_GRPC_SUBSCRIBE_TIMEOUT: i32 = 5;
 const EXIT_ORACLE_RUNTIME_STOPPED: i32 = 6;
 const STARTUP_HYDRATION_TIMEOUT_SECS: u64 = 15;
 const STARTUP_HYDRATION_IGNORE_MINTS_ENV: &str = "GHOST_STARTUP_HYDRATION_IGNORE_MINTS";
+const COMPONENT_SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
+const SHADOW_V2_POST_BUY_JOIN_MARGIN: Duration = Duration::from_secs(30);
 
 fn load_startup_hydration_ignore_mints(config_path: &Path) -> Result<Vec<Pubkey>> {
     let Some(raw) = LauncherConfig::lookup_secret_value_for_config_path(
@@ -221,6 +223,34 @@ fn runtime_oracle_dry_run(config: &LauncherConfig) -> bool {
             ghost_launcher::config::ExecutionMode::Paper
                 | ghost_launcher::config::ExecutionMode::Shadow
         )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComponentShutdownSummary {
+    Clean,
+    ForcedAbortOrFailure,
+}
+
+fn component_shutdown_summary(component_shutdown_failures: usize) -> ComponentShutdownSummary {
+    if component_shutdown_failures == 0 {
+        ComponentShutdownSummary::Clean
+    } else {
+        ComponentShutdownSummary::ForcedAbortOrFailure
+    }
+}
+
+fn component_shutdown_join_timeout(
+    component_name: &str,
+    shadow_v2_burnin_config: &ShadowV2BurninConfig,
+) -> Duration {
+    if component_name == "PostBuyRuntime"
+        && shadow_v2_burnin_config.enabled
+        && shadow_v2_burnin_config.logging_only
+    {
+        return Duration::from_millis(shadow_v2_burnin_config.post_run_manifest_drain_timeout_ms)
+            .saturating_add(SHADOW_V2_POST_BUY_JOIN_MARGIN);
+    }
+    COMPONENT_SHUTDOWN_JOIN_TIMEOUT
 }
 
 fn print_usage() {
@@ -2554,8 +2584,6 @@ async fn main() -> Result<()> {
         info!("Oracle Runtime shut down successfully");
     }
 
-    const COMPONENT_SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
-
     // Wait for all components to shut down. The timeout is a shutdown-only
     // circuit breaker: a stuck diagnostics task must not keep the launcher
     // alive indefinitely after global shutdown has been requested.
@@ -2563,7 +2591,8 @@ async fn main() -> Result<()> {
     for (name, handle) in handles {
         info!("Waiting for {} to shut down...", name);
         let abort_handle = handle.abort_handle();
-        match tokio::time::timeout(COMPONENT_SHUTDOWN_JOIN_TIMEOUT, handle).await {
+        let join_timeout = component_shutdown_join_timeout(name, &shadow_v2_burnin_config);
+        match tokio::time::timeout(join_timeout, handle).await {
             Ok(Ok(())) => {
                 info!("{} shut down successfully", name);
             }
@@ -2576,20 +2605,23 @@ async fn main() -> Result<()> {
                 error!(
                     "{} shutdown join timed out after {}s; aborting task",
                     name,
-                    COMPONENT_SHUTDOWN_JOIN_TIMEOUT.as_secs()
+                    join_timeout.as_secs()
                 );
                 abort_handle.abort();
             }
         }
     }
 
-    if component_shutdown_failures == 0 {
-        info!("All components shut down successfully");
-    } else {
-        error!(
-            "Component shutdown completed with {} failure(s) or forced abort(s)",
-            component_shutdown_failures
-        );
+    match component_shutdown_summary(component_shutdown_failures) {
+        ComponentShutdownSummary::Clean => {
+            info!("All components shut down successfully");
+        }
+        ComponentShutdownSummary::ForcedAbortOrFailure => {
+            error!(
+                "Component shutdown completed with {} failure(s) or forced abort(s)",
+                component_shutdown_failures
+            );
+        }
     }
     info!("Ghost Launcher shutdown complete");
     Ok(())
@@ -3123,6 +3155,43 @@ path_density_v2_path = "reports/selector/shadow-v2-fidelity-validation/shadow_pa
         assert_eq!(
             shadow_v2.run_namespace.as_deref(),
             Some("shadow-burnin-v2-fidelity-validation-logging-only")
+        );
+    }
+
+    #[test]
+    fn test_post_buy_runtime_gets_shadow_v2_manifest_drain_join_budget() {
+        let mut shadow_v2 = ShadowV2BurninConfig {
+            enabled: true,
+            logging_only: true,
+            post_run_manifest_drain_timeout_ms: 180_000,
+            ..ShadowV2BurninConfig::default()
+        };
+
+        assert_eq!(
+            component_shutdown_join_timeout("Seer", &shadow_v2),
+            COMPONENT_SHUTDOWN_JOIN_TIMEOUT
+        );
+        assert_eq!(
+            component_shutdown_join_timeout("PostBuyRuntime", &shadow_v2),
+            Duration::from_secs(210)
+        );
+
+        shadow_v2.enabled = false;
+        assert_eq!(
+            component_shutdown_join_timeout("PostBuyRuntime", &shadow_v2),
+            COMPONENT_SHUTDOWN_JOIN_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn test_forced_abort_is_not_clean_component_shutdown() {
+        assert_eq!(
+            component_shutdown_summary(0),
+            ComponentShutdownSummary::Clean
+        );
+        assert_eq!(
+            component_shutdown_summary(1),
+            ComponentShutdownSummary::ForcedAbortOrFailure
         );
     }
 

@@ -63,7 +63,6 @@ use solana_sdk::signer::Signer;
 use solana_sdk::transaction::VersionedTransaction;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -330,7 +329,7 @@ fn shadow_v2_scope_root(config: &ShadowV2BurninConfig) -> Result<&str, String> {
         .ok_or_else(|| "missing scope_root_path".to_string())
 }
 
-fn run_shadow_v2_manifest_command(
+async fn run_shadow_v2_manifest_command(
     config: &ShadowV2BurninConfig,
     args: &[String],
 ) -> Result<(), String> {
@@ -338,10 +337,12 @@ fn run_shadow_v2_manifest_command(
     if script.is_empty() {
         return Err("missing manifest_audit_script".to_string());
     }
-    let output = Command::new("python3")
+    let output = tokio::process::Command::new("python3")
         .arg(script)
         .args(args)
+        .kill_on_drop(true)
         .output()
+        .await
         .map_err(|error| format!("failed to run {script}: {error}"))?;
     if output.status.success() {
         return Ok(());
@@ -406,17 +407,35 @@ fn shadow_v2_post_run_verification_args(
     ])
 }
 
-fn run_shadow_v2_post_run_manifest_generation_and_audit(
+async fn run_shadow_v2_post_run_manifest_generation_and_audit(
     config: &ShadowV2BurninConfig,
 ) -> Result<(), String> {
     if !config.enabled {
         return Ok(());
     }
     let generation_args = shadow_v2_post_run_generation_args(config)?;
-    run_shadow_v2_manifest_command(config, &generation_args)?;
+    run_shadow_v2_manifest_command(config, &generation_args).await?;
 
     let verification_args = shadow_v2_post_run_verification_args(config)?;
-    run_shadow_v2_manifest_command(config, &verification_args)
+    run_shadow_v2_manifest_command(config, &verification_args).await
+}
+
+async fn run_shadow_v2_post_run_manifest_generation_and_audit_with_timeout(
+    config: &ShadowV2BurninConfig,
+) -> Result<(), String> {
+    let budget = Duration::from_millis(config.post_run_manifest_drain_timeout_ms.max(1));
+    match tokio::time::timeout(
+        budget,
+        run_shadow_v2_post_run_manifest_generation_and_audit(config),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "SHADOW_V2_POST_RUN_MANIFEST_DRAIN_TIMEOUT: exceeded {}ms",
+            config.post_run_manifest_drain_timeout_ms
+        )),
+    }
 }
 
 /// Grace window after shutdown during which late `PostBuySubmitted` events are still accepted.
@@ -2322,12 +2341,22 @@ pub async fn run(
         .as_ref()
         .filter(|shadow_v2_burnin| shadow_v2_burnin.enabled)
     {
-        match run_shadow_v2_post_run_manifest_generation_and_audit(shadow_v2_burnin) {
+        match run_shadow_v2_post_run_manifest_generation_and_audit_with_timeout(shadow_v2_burnin)
+            .await
+        {
             Ok(()) => info!(
                 runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
                 validation_harness_status = "POST_RUN_MANIFEST_AUDIT_PASS",
                 "PostBuyRuntime: Shadow V2 post-run manifest generated and strict-verified"
             ),
+            Err(error) if error.contains("SHADOW_V2_POST_RUN_MANIFEST_DRAIN_TIMEOUT") => {
+                warn!(
+                    runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+                    validation_harness_status = "FAILED",
+                    error = %error,
+                    "PostBuyRuntime: SHADOW_V2_POST_RUN_MANIFEST_DRAIN_TIMEOUT"
+                )
+            }
             Err(error) => warn!(
                 runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
                 validation_harness_status = "FAILED",
@@ -4441,6 +4470,30 @@ mod tests {
         config
     }
 
+    fn write_fake_shadow_v2_manifest_audit_script(root: &Path) -> PathBuf {
+        let script_path = root.join("fake_shadow_v2_manifest_audit.py");
+        std::fs::write(
+            &script_path,
+            r#"import json
+import pathlib
+import sys
+
+args = sys.argv[1:]
+if "--write-manifest" in args:
+    manifest_path = pathlib.Path(args[args.index("--write-manifest") + 1])
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps({"status": "PASS", "blockers": []}))
+if "--write-report-csv" in args:
+    report_path = pathlib.Path(args[args.index("--write-report-csv") + 1])
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text("artifact,status\npost_run_manifest.json,PASS\n")
+sys.exit(0)
+"#,
+        )
+        .expect("write fake manifest audit script");
+        script_path
+    }
+
     #[test]
     fn shadow_v2_post_run_manifest_uses_generate_then_strict_verify() {
         let config = complete_shadow_v2_burnin_config_for_test();
@@ -4454,6 +4507,44 @@ mod tests {
         assert!(verification.contains(&"--strict".to_string()));
         assert!(!verification.contains(&"--write-manifest".to_string()));
         assert!(!verification.contains(&"--write-report-csv".to_string()));
+    }
+
+    #[tokio::test]
+    async fn post_buy_runtime_shutdown_waits_for_shadow_v2_post_run_manifest() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let events_dir = tmp.path().join("events");
+        std::fs::create_dir_all(&events_dir).expect("create events dir");
+        let script_path = write_fake_shadow_v2_manifest_audit_script(tmp.path());
+
+        let mut burnin = shadow_v2_burnin_config_for_temp_scope(tmp.path());
+        burnin.manifest_audit_script = script_path.display().to_string();
+        burnin.post_run_manifest_drain_timeout_ms = 30_000;
+
+        let (event_tx, event_rx) = create_event_bus();
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let runtime_config = PostBuyRuntimeConfig {
+            events_output_path: events_dir,
+            shadow_v2_burnin: Some(burnin),
+            ..PostBuyRuntimeConfig::default()
+        };
+
+        let runtime_handle = tokio::spawn(run(event_rx, shutdown_rx, None, runtime_config));
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let _ = shutdown_tx.send(());
+        drop(event_tx);
+
+        tokio::time::timeout(Duration::from_secs(15), runtime_handle)
+            .await
+            .expect("PostBuyRuntime should join before launcher timeout")
+            .expect("PostBuyRuntime task should not panic");
+
+        let post_run_manifest_path = tmp.path().join("post_run_manifest.json");
+        let manifest =
+            std::fs::read_to_string(&post_run_manifest_path).expect("post_run_manifest.json");
+        assert!(
+            manifest.contains("\"status\":\"PASS\"") || manifest.contains("\"status\": \"PASS\""),
+            "post-run manifest must be generated before PostBuyRuntime returns: {manifest}"
+        );
     }
 
     #[test]
