@@ -1441,6 +1441,44 @@ impl ShadowEntryFillV2 {
         }
     }
 
+    pub fn blocked_without_pool_state(
+        mut envelope: ShadowV2Envelope,
+        event_order_key: EventOrderKey,
+        mut blockers: Vec<String>,
+    ) -> Self {
+        envelope.schema = "shadow_entry_fill_v2".to_string();
+        envelope.simulation_level = SimulationLevel::FillModelStatic;
+        envelope.measurement_grade = MeasurementGrade::BlockedByData;
+        envelope.temporal_class = TemporalClass::PostEntry;
+        envelope.clock_domain = ClockDomain::LandingTsMs;
+        envelope.quality = "BLOCKED_BY_DATA".to_string();
+        blockers.push("ENTRY_FILL_POOL_STATE_SAMPLE_MISSING".to_string());
+        blockers.push("ENTRY_FILL_NOT_EXECUTABLE_WITHOUT_POOL_STATE_PROVENANCE".to_string());
+        blockers.push("ENTRY_FILL_STATIC_MODEL_NOT_LIVE_CONFIRMED".to_string());
+        blockers.sort();
+        blockers.dedup();
+        envelope.limitations.extend(blockers.clone());
+
+        Self {
+            envelope,
+            event_order_key,
+            fill_status: FillStatus::BlockedByData,
+            fill_price: None,
+            fill_price_source: None,
+            fill_amount_sol: None,
+            fill_amount_tokens: None,
+            slippage_bps: None,
+            own_impact_bps: None,
+            fee_bps: None,
+            min_out: None,
+            pool_state_before: None,
+            pool_state_after: None,
+            reconstruction_status: "ENTRY_FILL_BLOCKED_BY_MISSING_POOL_STATE".to_string(),
+            quality: "BLOCKED_BY_DATA".to_string(),
+            limitations: blockers,
+        }
+    }
+
     fn filled_from_quote(
         mut envelope: ShadowV2Envelope,
         event_order_key: EventOrderKey,
@@ -1771,6 +1809,72 @@ impl ShadowPathSampleV2 {
             mfe_mark_bps: pnl_mark_bps,
             mae_mark_bps: pnl_mark_bps,
             source_quality: pool_state.source_quality.clone(),
+            sampling_reason: sampling_reason.label().to_string(),
+            exact_or_approx,
+            truncated: false,
+        }
+    }
+
+    pub fn from_legacy_lifecycle_mark(
+        mut envelope: ShadowV2Envelope,
+        event_order_key: EventOrderKey,
+        sample_ts_ms: ClockedTimestamp,
+        sample_slot: Option<u64>,
+        age_ms: u64,
+        mark_price: Option<f64>,
+        pnl_mark_bps: Option<i32>,
+        sampling_mode: ShadowPathSamplingModeV2,
+        sampling_reason: ShadowPathSamplingReasonV2,
+        source_quality: impl Into<String>,
+        mut limitations: Vec<String>,
+    ) -> Self {
+        envelope.schema = "shadow_path_sample_v2".to_string();
+        envelope.simulation_level = SimulationLevel::MarkOnly;
+        envelope.measurement_grade = if mark_price.is_some() || pnl_mark_bps.is_some() {
+            MeasurementGrade::MarkPriceReplay
+        } else {
+            MeasurementGrade::BlockedByData
+        };
+        envelope.temporal_class = TemporalClass::PostEntry;
+        envelope.clock_domain = ClockDomain::StreamObservedMs;
+        envelope.quality = if mark_price.is_some() || pnl_mark_bps.is_some() {
+            "LEGACY_LIFECYCLE_MARK_PATH_SAMPLE".to_string()
+        } else {
+            "BLOCKED_BY_DATA".to_string()
+        };
+        limitations.push("LEGACY_LIFECYCLE_PRICE_TRUTH_NOT_POOL_STATE_SAMPLE".to_string());
+        limitations.push("PATH_SAMPLE_POOL_STATE_PROVENANCE_MISSING".to_string());
+        limitations.push("MARK_PRICE_REPLAY_NOT_EXECUTABLE_FILL".to_string());
+        limitations.extend(event_order_key.ambiguity_labels());
+        limitations.sort();
+        limitations.dedup();
+        envelope.limitations.extend(limitations.clone());
+
+        let exact_or_approx = if mark_price.is_none() && pnl_mark_bps.is_none() {
+            "BLOCKED_BY_DATA".to_string()
+        } else if event_order_key.has_complete_chain_order() {
+            "EXACT_EVENT_ORDER".to_string()
+        } else {
+            "APPROX_AMBIGUOUS_EVENT_ORDER".to_string()
+        };
+
+        Self {
+            envelope,
+            event_order_key,
+            sampling_mode,
+            path_horizon_ms: ShadowPathSamplerConfigV2::for_mode(sampling_mode).max_horizon_ms,
+            sample_ts_ms,
+            sample_slot,
+            age_ms,
+            pool_state_ref: "MISSING_POOL_STATE_SAMPLE_LEGACY_LIFECYCLE_PRICE_TRUTH_ONLY"
+                .to_string(),
+            mark_price,
+            executable_exit_quote: None,
+            pnl_mark_bps,
+            pnl_executable_bps: None,
+            mfe_mark_bps: pnl_mark_bps,
+            mae_mark_bps: pnl_mark_bps,
+            source_quality: source_quality.into(),
             sampling_reason: sampling_reason.label().to_string(),
             exact_or_approx,
             truncated: false,
@@ -2413,6 +2517,45 @@ impl ShadowExitFillV2 {
                 pool_state_before,
                 vec![format!("EXIT_FILL_QUOTE_RECONSTRUCTION_ERROR={error}")],
             ),
+        }
+    }
+
+    pub fn blocked_without_pool_state(
+        mut envelope: ShadowV2Envelope,
+        event_order_key: EventOrderKey,
+        mut blockers: Vec<String>,
+    ) -> Self {
+        envelope.schema = "shadow_exit_fill_v2".to_string();
+        envelope.simulation_level = SimulationLevel::FillModelStatic;
+        envelope.measurement_grade = MeasurementGrade::BlockedByData;
+        envelope.temporal_class = TemporalClass::PostExit;
+        envelope.clock_domain = ClockDomain::LandingTsMs;
+        envelope.quality = "BLOCKED_BY_DATA".to_string();
+        blockers.push("EXIT_FILL_POOL_STATE_SAMPLE_MISSING".to_string());
+        blockers.push("EXIT_FILL_NOT_EXECUTABLE_WITHOUT_POOL_STATE_PROVENANCE".to_string());
+        blockers.push("EXIT_FILL_STATIC_MODEL_NOT_LIVE_CONFIRMED".to_string());
+        blockers.push("STATIC_EXIT_FILL_DOES_NOT_ENABLE_ACTIVE_CLOSE".to_string());
+        blockers.sort();
+        blockers.dedup();
+        envelope.limitations.extend(blockers.clone());
+
+        Self {
+            envelope,
+            event_order_key,
+            fill_status: FillStatus::BlockedByData,
+            fill_price: None,
+            fill_price_source: None,
+            fill_amount_sol: None,
+            fill_amount_tokens: None,
+            slippage_bps: None,
+            own_impact_bps: None,
+            fee_bps: None,
+            min_out: None,
+            pool_state_before: None,
+            pool_state_after: None,
+            reconstruction_status: "EXIT_FILL_BLOCKED_BY_MISSING_POOL_STATE".to_string(),
+            quality: "BLOCKED_BY_DATA".to_string(),
+            limitations: blockers,
         }
     }
 

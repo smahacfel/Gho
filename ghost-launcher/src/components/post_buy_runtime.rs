@@ -39,9 +39,10 @@ use ghost_brain::execution::paper_lifecycle::{PaperLifecycleConfig, PaperPositio
 use ghost_brain::execution::{CandidateRef, Lane};
 use ghost_brain::guardian::post_buy::engine::{PositionEventContext, PositionJoinMetadata};
 use ghost_brain::guardian::post_buy::shadow_v2::{
-    ClockDomain, ClockedTimestamp, MeasurementGrade, ShadowPositionV2, ShadowV2Envelope,
-    ShadowV2Record, ShadowV2ValidationEvidenceStatus, ShadowV2ValidationHarness,
-    ShadowV2ValidationHarnessConfig, SimulationLevel, TemporalClass,
+    ClockDomain, ClockedTimestamp, EventOrderComponent, EventOrderKey, MeasurementGrade,
+    ShadowEntryAttemptV2, ShadowEntryFillV2, ShadowPositionV2, ShadowV2Envelope, ShadowV2Record,
+    ShadowV2ValidationEvidenceStatus, ShadowV2ValidationHarness, ShadowV2ValidationHarnessConfig,
+    SimulationLevel, TemporalClass, SHADOW_V2_ENTRY_FILL_MODEL_VERSION,
 };
 use ghost_brain::guardian::post_buy::{
     MonitoringEngine, PositionRuntimeRouter, PostBuyGuardianConfig, ShadowExitReplayConfig,
@@ -51,6 +52,7 @@ use ghost_brain::quotes::{ExecutableQuoteProvider, QuoteProviderConfig};
 use ghost_core::account_state_core::reducer::AccountStateReducer;
 use ghost_core::shadow_ledger::ShadowLedger;
 use ghost_core::{BondingCurve, LAMPORTS_PER_SOL};
+use parking_lot::Mutex as ParkingMutex;
 use seer::parse_curve_from_account;
 use solana_client::client_error::ClientError;
 use solana_client::nonblocking::rpc_client::RpcClient as AsyncRpcClient;
@@ -515,6 +517,34 @@ fn shadow_entry_timeline_join_metadata(
     }
 
     metadata
+}
+
+fn shadow_v2_post_buy_event_order_key(
+    slot: Option<u64>,
+    signature: Option<&str>,
+    event_seq_in_process: u64,
+    observed_at_wall_ms: u64,
+) -> EventOrderKey {
+    EventOrderKey {
+        slot: slot
+            .map(EventOrderComponent::known)
+            .unwrap_or_else(EventOrderComponent::unknown),
+        block_time: EventOrderComponent::unknown(),
+        signature: signature
+            .filter(|signature| !signature.trim().is_empty())
+            .map(|signature| EventOrderComponent::known(signature.to_string()))
+            .unwrap_or_else(EventOrderComponent::unknown),
+        transaction_index_or_unknown: EventOrderComponent::unknown(),
+        instruction_index_or_unknown: EventOrderComponent::unknown(),
+        inner_instruction_index_or_unknown: EventOrderComponent::unknown(),
+        log_index_or_unknown: EventOrderComponent::unknown(),
+        event_seq_in_process,
+        observed_at_wall_ms,
+    }
+}
+
+fn shadow_v2_post_buy_event_seq(timestamp_ms: u64, offset: u64) -> u64 {
+    timestamp_ms.saturating_mul(10).saturating_add(offset)
 }
 
 fn build_shadow_guardian_config(config: &PostBuyRuntimeConfig) -> PostBuyGuardianConfig {
@@ -1920,9 +1950,9 @@ pub async fn run(
             return;
         }
     };
-    let mut shadow_v2_harness =
+    let shadow_v2_harness =
         match init_shadow_v2_validation_harness(config.shadow_v2_burnin.as_ref()) {
-            Ok(harness) => harness,
+            Ok(harness) => harness.map(|harness| Arc::new(ParkingMutex::new(harness))),
             Err(error) => {
                 warn!(
                     runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
@@ -1988,6 +2018,10 @@ pub async fn run(
                 );
                 if let Some(account_state_core) = config.account_state_core.clone() {
                     monitoring_engine.set_account_state_core(account_state_core);
+                }
+                if let Some(shadow_v2_harness) = shadow_v2_harness.as_ref() {
+                    monitoring_engine
+                        .set_shadow_v2_validation_harness(Arc::clone(shadow_v2_harness));
                 }
                 monitoring_engine.set_position_router(Arc::clone(&runtime_router));
                 monitoring_engine.set_event_emitter(emitter.clone());
@@ -2082,7 +2116,7 @@ pub async fn run(
         shadow_monitor.is_some(),
         probe_monitor.is_some(),
     );
-    maybe_emit_shadow_v2_validation_smoke_marker(&mut shadow_v2_harness, &config);
+    maybe_emit_shadow_v2_validation_smoke_marker(&shadow_v2_harness, &config);
 
     let mut epoch_counter: u64 = 1;
     let mut lifecycle_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
@@ -2152,7 +2186,7 @@ pub async fn run(
                             &mut epoch_counter,
                             &mut lifecycle_handles,
                             &mut recent_handoffs,
-                            &mut shadow_v2_harness,
+                            &shadow_v2_harness,
                         )
                         .await;
                     }
@@ -2193,7 +2227,7 @@ pub async fn run(
                             &mut epoch_counter,
                             &mut lifecycle_handles,
                             &mut recent_handoffs,
-                            &mut shadow_v2_harness,
+                            &shadow_v2_harness,
                         )
                         .await;
                         if let Some(ack_tx) = ack_tx {
@@ -2318,7 +2352,7 @@ async fn handle_post_buy_event(
     epoch_counter: &mut u64,
     lifecycle_handles: &mut Vec<tokio::task::JoinHandle<()>>,
     recent_handoffs: &mut RecentPostBuyCache,
-    shadow_v2_harness: &mut Option<ShadowV2ValidationHarness>,
+    shadow_v2_harness: &Option<Arc<ParkingMutex<ShadowV2ValidationHarness>>>,
 ) -> DirectPostBuyHandoffAck {
     let GhostEvent::PostBuySubmitted {
         candidate_id,
@@ -2571,6 +2605,22 @@ async fn handle_post_buy_event(
                 entry_opened_at_ms,
                 &position_join_metadata,
             );
+            maybe_emit_shadow_v2_entry_evidence(
+                shadow_v2_harness,
+                config,
+                &candidate_id,
+                &pool_amm_id,
+                &base_mint,
+                handoff.position_id.as_deref(),
+                &signature,
+                amount_sol,
+                min_tokens_out,
+                entry_token_amount_raw,
+                buy_landed_slot,
+                entry_simulation_rpc_slot,
+                entry_opened_at_ms,
+                &position_join_metadata,
+            );
             if let (Some(tracker), Some(slot_id), Some(mint_pubkey), Some(shadow_monitor)) = (
                 config.position_limit_tracker.clone(),
                 position_slot_id,
@@ -2697,7 +2747,7 @@ async fn handle_post_buy_event(
 }
 
 fn maybe_emit_shadow_v2_position_created(
-    harness: &mut Option<ShadowV2ValidationHarness>,
+    harness: &Option<Arc<ParkingMutex<ShadowV2ValidationHarness>>>,
     config: &PostBuyRuntimeConfig,
     candidate_id: &str,
     pool_amm_id: &str,
@@ -2708,7 +2758,7 @@ fn maybe_emit_shadow_v2_position_created(
     entry_opened_at_ms: Option<u64>,
     join_metadata: &PositionJoinMetadata,
 ) {
-    let Some(harness) = harness.as_mut() else {
+    let Some(harness) = harness.as_ref() else {
         return;
     };
     let Some(position_id) = position_id.filter(|value| !value.trim().is_empty()) else {
@@ -2786,7 +2836,9 @@ fn maybe_emit_shadow_v2_position_created(
             .or_else(|| join_metadata.dispatch_source.clone()),
         lane: "shadow".to_string(),
     };
-    let outcome = harness.append_record(ShadowV2Record::ShadowPositionV2(record));
+    let outcome = harness
+        .lock()
+        .append_record(ShadowV2Record::ShadowPositionV2(record));
     if outcome.validation_evidence_status == ShadowV2ValidationEvidenceStatus::Complete {
         debug!(
             runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
@@ -2809,11 +2861,201 @@ fn maybe_emit_shadow_v2_position_created(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn maybe_emit_shadow_v2_entry_evidence(
+    harness: &Option<Arc<ParkingMutex<ShadowV2ValidationHarness>>>,
+    config: &PostBuyRuntimeConfig,
+    candidate_id: &str,
+    pool_amm_id: &str,
+    base_mint: &str,
+    position_id: Option<&str>,
+    signature: &str,
+    amount_sol: f64,
+    min_tokens_out: Option<u64>,
+    entry_token_amount_raw: Option<u64>,
+    buy_landed_slot: Option<u64>,
+    entry_simulation_rpc_slot: Option<u64>,
+    entry_opened_at_ms: Option<u64>,
+    join_metadata: &PositionJoinMetadata,
+) {
+    let Some(harness) = harness.as_ref() else {
+        return;
+    };
+    let Some(position_id) = position_id.filter(|value| !value.trim().is_empty()) else {
+        return;
+    };
+    let Some(shadow_v2_config) = config.shadow_v2_burnin.as_ref() else {
+        return;
+    };
+
+    let run_id = shadow_v2_config
+        .run_namespace
+        .as_deref()
+        .unwrap_or("UNKNOWN_RUN")
+        .to_string();
+    let entry_ts_ms = entry_opened_at_ms.unwrap_or_else(now_ms);
+    let entry_slot = entry_simulation_rpc_slot.or(buy_landed_slot);
+    let entry_price = shadow_entry_price_from_post_buy(amount_sol, entry_token_amount_raw);
+    let event_order_key = shadow_v2_post_buy_event_order_key(
+        entry_slot,
+        Some(signature),
+        shadow_v2_post_buy_event_seq(entry_ts_ms, 1),
+        entry_ts_ms,
+    );
+
+    let mut attempt_envelope = ShadowV2Envelope::contract_header(
+        "shadow_entry_attempt_v2",
+        run_id.clone(),
+        position_id.to_string(),
+        format!("shadow_v2_entry_attempt:{position_id}:{entry_ts_ms}"),
+        pool_amm_id.to_string(),
+        base_mint.to_string(),
+    );
+    attempt_envelope.session_id = join_metadata
+        .session_id
+        .clone()
+        .or_else(|| Some("UNKNOWN_SESSION".to_string()));
+    attempt_envelope.candidate_id = Some(candidate_id.to_string());
+    attempt_envelope.produced_at_ms = entry_ts_ms;
+    attempt_envelope.produced_at_slot = entry_slot;
+    attempt_envelope.temporal_class = TemporalClass::PostEntry;
+    attempt_envelope.clock_domain = ClockDomain::SubmitTsMs;
+    attempt_envelope.simulation_level = SimulationLevel::MarkOnly;
+    attempt_envelope.measurement_grade = MeasurementGrade::MarkPriceReplay;
+    attempt_envelope.quality = "ENTRY_ATTEMPT_FROM_POST_BUY_HANDOFF".to_string();
+    attempt_envelope
+        .source_refs
+        .push("post_buy_runtime:accepted_shadow_handoff".to_string());
+    attempt_envelope
+        .source_refs
+        .push("post_buy_submitted:shadow_simulation".to_string());
+    attempt_envelope
+        .limitations
+        .push("ENTRY_ATTEMPT_NOT_LIVE_SUBMIT".to_string());
+    attempt_envelope
+        .limitations
+        .push("ENTRY_ATTEMPT_DERIVED_FROM_SHADOW_POST_BUY_HANDOFF".to_string());
+    attempt_envelope
+        .limitations
+        .push("SHADOW_V2_RECORD_NOT_CONSUMED_BY_DECISIONS".to_string());
+    if entry_price.is_none() {
+        attempt_envelope
+            .limitations
+            .push("ENTRY_ATTEMPT_QUOTE_PRICE_MISSING".to_string());
+    }
+    if min_tokens_out.is_none() {
+        attempt_envelope
+            .limitations
+            .push("ENTRY_ATTEMPT_MIN_OUT_MISSING".to_string());
+    }
+    if entry_slot.is_none() {
+        attempt_envelope
+            .limitations
+            .push("ENTRY_ATTEMPT_SLOT_UNKNOWN".to_string());
+    }
+
+    let attempt = ShadowEntryAttemptV2 {
+        envelope: attempt_envelope,
+        event_order_key: event_order_key.clone(),
+        intended_entry_ts_ms: ClockedTimestamp {
+            field_name: "intended_entry_ts_ms".to_string(),
+            value: Some(entry_ts_ms as i64),
+            clock_domain: ClockDomain::SubmitTsMs,
+            clock_source: "post_buy_runtime.entry_opened_at_ms".to_string(),
+            causal_boundary: "POST_ENTRY_SHADOW_SIMULATION_HANDOFF".to_string(),
+        },
+        intended_entry_slot: entry_slot,
+        intended_price_source: "post_buy_shadow_entry_price_from_amount_and_tokens".to_string(),
+        intended_quote: entry_price,
+        decision_mark_price: entry_price,
+        entry_quote_price: entry_price,
+        entry_quote_tokens_out: entry_token_amount_raw,
+        entry_quote_min_out: min_tokens_out,
+        simulated_submit_ts_ms: Some(ClockedTimestamp {
+            field_name: "simulated_submit_ts_ms".to_string(),
+            value: Some(entry_ts_ms as i64),
+            clock_domain: ClockDomain::SubmitTsMs,
+            clock_source: "post_buy_runtime.entry_opened_at_ms".to_string(),
+            causal_boundary: "POST_ENTRY_SHADOW_SIMULATION_HANDOFF".to_string(),
+        }),
+        simulated_landing_slot: buy_landed_slot
+            .or_else(|| entry_simulation_rpc_slot.and_then(|slot| slot.checked_add(1))),
+        simulated_landing_delay_ms: None,
+        entry_failure_mode: None,
+        executable_fill_model_version: Some(SHADOW_V2_ENTRY_FILL_MODEL_VERSION.to_string()),
+    };
+
+    let mut fill_envelope = ShadowV2Envelope::contract_header(
+        "shadow_entry_fill_v2",
+        run_id,
+        position_id.to_string(),
+        format!("shadow_v2_entry_fill:{position_id}:{entry_ts_ms}"),
+        pool_amm_id.to_string(),
+        base_mint.to_string(),
+    );
+    fill_envelope.session_id = join_metadata
+        .session_id
+        .clone()
+        .or_else(|| Some("UNKNOWN_SESSION".to_string()));
+    fill_envelope.candidate_id = Some(candidate_id.to_string());
+    fill_envelope.produced_at_ms = entry_ts_ms;
+    fill_envelope.produced_at_slot = entry_slot;
+    fill_envelope.source_refs.push(format!(
+        "shadow_entry_attempt_v2:shadow_v2_entry_attempt:{position_id}:{entry_ts_ms}"
+    ));
+    fill_envelope
+        .source_refs
+        .push("post_buy_runtime:accepted_shadow_handoff".to_string());
+
+    let mut blockers = vec![
+        "ENTRY_FILL_DERIVED_FROM_SHADOW_SIMULATION_HANDOFF".to_string(),
+        "ENTRY_FILL_POOL_STATE_SAMPLE_NOT_AVAILABLE_IN_PR18_ADAPTER".to_string(),
+        "ENTRY_FILL_LATENCY_AND_LANDING_TELEMETRY_NOT_MEASURED".to_string(),
+        "ENTRY_FILL_QUOTE_FILL_DIVERGENCE_NOT_MEASURED".to_string(),
+    ];
+    if entry_price.is_none() {
+        blockers.push("ENTRY_FILL_ENTRY_PRICE_MISSING".to_string());
+    }
+    if entry_token_amount_raw.is_none() {
+        blockers.push("ENTRY_FILL_TOKEN_AMOUNT_RAW_MISSING".to_string());
+    }
+    let mut fill_order = event_order_key;
+    fill_order.event_seq_in_process = shadow_v2_post_buy_event_seq(entry_ts_ms, 2);
+    let fill = ShadowEntryFillV2::blocked_without_pool_state(fill_envelope, fill_order, blockers);
+
+    let mut harness = harness.lock();
+    for record in [
+        ShadowV2Record::ShadowEntryAttemptV2(attempt),
+        ShadowV2Record::ShadowEntryFillV2(fill),
+    ] {
+        let event_id = record.envelope().event_id.clone();
+        let outcome = harness.append_record(record);
+        if outcome.validation_evidence_status == ShadowV2ValidationEvidenceStatus::Complete {
+            debug!(
+                runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+                event_id, position_id, "PostBuyRuntime: Shadow V2 entry evidence emitted"
+            );
+        } else {
+            warn!(
+                runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+                event_id,
+                position_id,
+                status = ?outcome.validation_evidence_status,
+                canonical_write = ?outcome.canonical_write,
+                replay_write = ?outcome.replay_write,
+                lifecycle_write = ?outcome.lifecycle_write,
+                density_write = ?outcome.density_write,
+                "PostBuyRuntime: Shadow V2 entry evidence append incomplete"
+            );
+        }
+    }
+}
+
 fn maybe_emit_shadow_v2_validation_smoke_marker(
-    harness: &mut Option<ShadowV2ValidationHarness>,
+    harness: &Option<Arc<ParkingMutex<ShadowV2ValidationHarness>>>,
     config: &PostBuyRuntimeConfig,
 ) {
-    let Some(harness) = harness.as_mut() else {
+    let Some(harness) = harness.as_ref() else {
         return;
     };
     let Some(shadow_v2_config) = config
@@ -2888,7 +3130,9 @@ fn maybe_emit_shadow_v2_validation_smoke_marker(
         lane: "diagnostic".to_string(),
     };
 
-    let outcome = harness.append_record(ShadowV2Record::ShadowPositionV2(record));
+    let outcome = harness
+        .lock()
+        .append_record(ShadowV2Record::ShadowPositionV2(record));
     if outcome.validation_evidence_status == ShadowV2ValidationEvidenceStatus::Complete {
         info!(
             runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
@@ -4220,12 +4464,12 @@ mod tests {
             shadow_v2_burnin: Some(burnin),
             ..PostBuyRuntimeConfig::default()
         };
-        let mut harness =
-            init_shadow_v2_validation_harness(runtime_config.shadow_v2_burnin.as_ref())
-                .expect("harness init");
+        let harness = init_shadow_v2_validation_harness(runtime_config.shadow_v2_burnin.as_ref())
+            .expect("harness init")
+            .map(|harness| Arc::new(ParkingMutex::new(harness)));
 
         assert!(harness.is_some());
-        maybe_emit_shadow_v2_validation_smoke_marker(&mut harness, &runtime_config);
+        maybe_emit_shadow_v2_validation_smoke_marker(&harness, &runtime_config);
 
         let canonical_path = tmp.path().join("shadow_position_event_v2.jsonl");
         let canonical = std::fs::read_to_string(&canonical_path).expect("canonical jsonl");
@@ -4275,6 +4519,65 @@ mod tests {
         assert!(density_rows
             .iter()
             .all(|row| row["verdict"] == "NOT_EVALUABLE_NO_COVERAGE"));
+    }
+
+    #[test]
+    fn shadow_v2_entry_evidence_writes_attempt_and_blocked_fill() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let burnin = shadow_v2_burnin_config_for_temp_scope(tmp.path());
+        let runtime_config = PostBuyRuntimeConfig {
+            shadow_v2_burnin: Some(burnin),
+            ..PostBuyRuntimeConfig::default()
+        };
+        let harness = init_shadow_v2_validation_harness(runtime_config.shadow_v2_burnin.as_ref())
+            .expect("harness init")
+            .map(|harness| Arc::new(ParkingMutex::new(harness)));
+        let join_metadata = PositionJoinMetadata {
+            session_id: Some("session-entry-test".to_string()),
+            decision_plane: Some("shadow_v2_pr18_test".to_string()),
+            ..Default::default()
+        };
+
+        maybe_emit_shadow_v2_entry_evidence(
+            &harness,
+            &runtime_config,
+            "candidate-entry-test",
+            "pool-entry-test",
+            "mint-entry-test",
+            Some("position-entry-test"),
+            "signature-entry-test",
+            0.007,
+            Some(1_000_000),
+            Some(7_000_000_000),
+            Some(430_000_011),
+            Some(430_000_010),
+            Some(1_785_000_100_000),
+            &join_metadata,
+        );
+
+        let canonical_path = tmp.path().join("shadow_position_event_v2.jsonl");
+        let canonical = std::fs::read_to_string(&canonical_path).expect("canonical jsonl");
+        let rows: Vec<serde_json::Value> = canonical
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("canonical row"))
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["event_kind"], "ENTRY_ATTEMPT");
+        assert_eq!(rows[1]["event_kind"], "ENTRY_FILL");
+        assert_eq!(
+            rows[1]["payload"]["record"]["fill_status"],
+            "BLOCKED_BY_DATA"
+        );
+        assert_eq!(
+            rows[1]["payload"]["record"]["envelope"]["measurement_grade"],
+            "BLOCKED_BY_DATA"
+        );
+        let limitations = rows[1]["payload"]["record"]["limitations"]
+            .as_array()
+            .expect("limitations array");
+        assert!(limitations
+            .iter()
+            .any(|value| value == "ENTRY_FILL_POOL_STATE_SAMPLE_MISSING"));
     }
 
     #[test]
@@ -6190,7 +6493,7 @@ mod tests {
         let mut epoch_counter = 1;
         let mut lifecycle_handles = Vec::new();
         let mut recent_handoffs = RecentPostBuyCache::default();
-        let mut shadow_v2_harness = None;
+        let shadow_v2_harness: Option<Arc<ParkingMutex<ShadowV2ValidationHarness>>> = None;
         let ack = handle_post_buy_event(
             event,
             &config,
@@ -6200,7 +6503,7 @@ mod tests {
             &mut epoch_counter,
             &mut lifecycle_handles,
             &mut recent_handoffs,
-            &mut shadow_v2_harness,
+            &shadow_v2_harness,
         )
         .await;
 

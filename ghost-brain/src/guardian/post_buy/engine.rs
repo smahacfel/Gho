@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use solana_sdk::pubkey::Pubkey;
 use tokio::sync::mpsc;
@@ -61,6 +61,15 @@ use super::exit_replay::{
 #[cfg(test)]
 use super::integration::SHADOW_VIRTUAL_MAGAZINE_TIME_STOP_SECS;
 use super::integration::{PositionRuntimeRouter, ShadowPositionBookAemAdapter};
+#[cfg(test)]
+use super::shadow_v2::ShadowV2ValidationHarnessConfig;
+use super::shadow_v2::{
+    ClockDomain, ClockedTimestamp, EventOrderComponent, EventOrderKey, MeasurementGrade,
+    ShadowExitAttemptV2, ShadowExitFillV2, ShadowPathSampleV2, ShadowPathSamplingModeV2,
+    ShadowPathSamplingReasonV2, ShadowTerminalTruthV2, ShadowV2Envelope, ShadowV2Record,
+    ShadowV2ValidationEvidenceStatus, ShadowV2ValidationHarness, SimulationLevel, TemporalClass,
+    TerminalReasonV2, SHADOW_V2_EXIT_FILL_MODEL_VERSION,
+};
 
 #[cfg(test)]
 const SHADOW_POSITION_TIME_STOP_MS: u64 = DEFAULT_WAIT_FOR_TIMESTOP_MS;
@@ -921,6 +930,104 @@ struct ShadowLifecycleRecord {
     time_stop_v2_latest_timestamp_ms: Option<u64>,
 }
 
+impl ShadowLifecycleRecord {
+    fn entry_timestamp_ms(&self) -> u64 {
+        self.sample_timestamp_ms
+            .and_then(|sample_ts_ms| {
+                self.sample_age_ms
+                    .map(|age_ms| sample_ts_ms.saturating_sub(age_ms))
+            })
+            .or_else(|| {
+                self.duration_ms
+                    .map(|duration_ms| self.timestamp_ms.saturating_sub(duration_ms))
+            })
+            .unwrap_or(self.timestamp_ms)
+    }
+}
+
+fn shadow_lifecycle_record_type_label(record_type: ShadowLifecycleRecordType) -> &'static str {
+    match record_type {
+        ShadowLifecycleRecordType::ExitFilled => "exit_filled",
+        ShadowLifecycleRecordType::ExitBlocked => "exit_blocked",
+        ShadowLifecycleRecordType::PositionClosed => "position_closed",
+        ShadowLifecycleRecordType::TimeStopV2Window => "time_stop_v2_window",
+    }
+}
+
+fn shadow_v2_event_order_key(
+    slot: Option<u64>,
+    signature: Option<&str>,
+    event_seq_in_process: u64,
+    observed_at_wall_ms: u64,
+) -> EventOrderKey {
+    EventOrderKey {
+        slot: slot
+            .map(EventOrderComponent::known)
+            .unwrap_or_else(EventOrderComponent::unknown),
+        block_time: EventOrderComponent::unknown(),
+        signature: signature
+            .filter(|signature| !signature.trim().is_empty())
+            .map(|signature| EventOrderComponent::known(signature.to_string()))
+            .unwrap_or_else(EventOrderComponent::unknown),
+        transaction_index_or_unknown: EventOrderComponent::unknown(),
+        instruction_index_or_unknown: EventOrderComponent::unknown(),
+        inner_instruction_index_or_unknown: EventOrderComponent::unknown(),
+        log_index_or_unknown: EventOrderComponent::unknown(),
+        event_seq_in_process,
+        observed_at_wall_ms,
+    }
+}
+
+fn shadow_v2_event_seq(timestamp_ms: u64, offset: u64) -> u64 {
+    timestamp_ms.saturating_mul(10).saturating_add(offset)
+}
+
+fn shadow_v2_exit_trigger_label(record: &ShadowLifecycleRecord) -> String {
+    match record.close_reason {
+        Some(CloseReason::Target) => "TARGET".to_string(),
+        Some(CloseReason::StopLoss) => "STOP".to_string(),
+        Some(CloseReason::TimeStop) => "TIMEOUT".to_string(),
+        Some(CloseReason::Panic) => "PANIC".to_string(),
+        Some(CloseReason::Manual) => "MANUAL".to_string(),
+        Some(CloseReason::HardSafety) => "HARD_SAFETY".to_string(),
+        Some(CloseReason::Default) => "DEFAULT_CLOSE".to_string(),
+        None => shadow_lifecycle_record_type_label(record.record_type)
+            .to_ascii_uppercase()
+            .replace('-', "_"),
+    }
+}
+
+fn shadow_v2_terminal_reason(close_reason: Option<CloseReason>) -> TerminalReasonV2 {
+    match close_reason {
+        Some(CloseReason::Target) => TerminalReasonV2::Target,
+        Some(CloseReason::StopLoss | CloseReason::Panic | CloseReason::HardSafety) => {
+            TerminalReasonV2::Stop
+        }
+        Some(CloseReason::TimeStop) => TerminalReasonV2::Timeout,
+        Some(CloseReason::Manual) => TerminalReasonV2::ManualDiagnosticClose,
+        Some(CloseReason::Default) | None => TerminalReasonV2::Unknown,
+    }
+}
+
+fn shadow_v2_pnl_bps_from_lifecycle(record: &ShadowLifecycleRecord) -> Option<i32> {
+    record
+        .final_pnl_pct
+        .filter(|value| value.is_finite())
+        .map(|pct| (pct * 100.0).round() as i32)
+        .or_else(|| {
+            let entry_price = record.entry_price?;
+            let exit_price = record.exit_price?;
+            if !entry_price.is_finite()
+                || !exit_price.is_finite()
+                || entry_price <= 0.0
+                || exit_price <= 0.0
+            {
+                return None;
+            }
+            Some((((exit_price - entry_price) / entry_price) * 10_000.0).round() as i32)
+        })
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // MonitoringEngine
 // ═══════════════════════════════════════════════════════════════════════
@@ -955,6 +1062,8 @@ pub struct MonitoringEngine {
     shadow_lifecycle_log_path: Option<PathBuf>,
     /// Compact research-only exit replay sidecar log.
     shadow_exit_replay_log_path: Option<PathBuf>,
+    /// Optional Shadow V2 validation harness. Logging-only evidence sink; never consumed by policy.
+    shadow_v2_validation_harness: Option<Arc<Mutex<ShadowV2ValidationHarness>>>,
     /// Passive replay trackers keyed by mint; independent from active position lifecycle.
     exit_replay_trackers: Arc<RwLock<HashMap<Pubkey, Vec<ShadowExitReplayTracker>>>>,
 }
@@ -986,6 +1095,7 @@ impl MonitoringEngine {
             event_emitter_secondary: None,
             shadow_lifecycle_log_path: None,
             shadow_exit_replay_log_path: None,
+            shadow_v2_validation_harness: None,
             exit_replay_trackers: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -1060,6 +1170,13 @@ impl MonitoringEngine {
         shadow_exit_replay_log_path: Option<PathBuf>,
     ) {
         self.shadow_exit_replay_log_path = shadow_exit_replay_log_path;
+    }
+
+    pub fn set_shadow_v2_validation_harness(
+        &mut self,
+        shadow_v2_validation_harness: Arc<Mutex<ShadowV2ValidationHarness>>,
+    ) {
+        self.shadow_v2_validation_harness = Some(shadow_v2_validation_harness);
     }
 
     pub fn set_aem(
@@ -1514,6 +1631,7 @@ impl MonitoringEngine {
 
     fn append_shadow_lifecycle_record(&self, record: &ShadowLifecycleRecord) {
         let Some(path) = self.shadow_lifecycle_log_path.as_deref() else {
+            self.append_shadow_v2_lifecycle_record(record);
             return;
         };
         if let Err(error) = Self::append_jsonl_record(path, record) {
@@ -1524,6 +1642,395 @@ impl MonitoringEngine {
                 "PostBuyGuardian: failed to append shadow lifecycle proof"
             );
         }
+        self.append_shadow_v2_lifecycle_record(record);
+    }
+
+    fn append_shadow_v2_lifecycle_record(&self, record: &ShadowLifecycleRecord) {
+        let Some(harness) = self.shadow_v2_validation_harness.as_ref() else {
+            return;
+        };
+        if !matches!(record.lane, Lane::Shadow) {
+            return;
+        }
+
+        let mut records = Vec::new();
+        if matches!(
+            record.record_type,
+            ShadowLifecycleRecordType::ExitFilled
+                | ShadowLifecycleRecordType::ExitBlocked
+                | ShadowLifecycleRecordType::PositionClosed
+        ) {
+            records.push(ShadowV2Record::ShadowPathSampleV2(
+                self.shadow_v2_path_sample_from_lifecycle(record),
+            ));
+        }
+
+        if matches!(
+            record.record_type,
+            ShadowLifecycleRecordType::ExitFilled | ShadowLifecycleRecordType::ExitBlocked
+        ) {
+            records.push(ShadowV2Record::ShadowExitAttemptV2(
+                self.shadow_v2_exit_attempt_from_lifecycle(record),
+            ));
+            records.push(ShadowV2Record::ShadowExitFillV2(
+                self.shadow_v2_exit_fill_from_lifecycle(record),
+            ));
+        }
+
+        if matches!(
+            record.record_type,
+            ShadowLifecycleRecordType::PositionClosed
+        ) {
+            if record.total_exits == 0 {
+                records.push(ShadowV2Record::ShadowExitAttemptV2(
+                    self.shadow_v2_exit_attempt_from_lifecycle(record),
+                ));
+                records.push(ShadowV2Record::ShadowExitFillV2(
+                    self.shadow_v2_exit_fill_from_lifecycle(record),
+                ));
+            }
+            records.push(ShadowV2Record::ShadowTerminalTruthV2(
+                self.shadow_v2_terminal_truth_from_lifecycle(record),
+            ));
+        }
+
+        let mut harness = harness.lock();
+        for record in records {
+            let event_id = record.envelope().event_id.clone();
+            let outcome = harness.append_record(record);
+            if outcome.validation_evidence_status == ShadowV2ValidationEvidenceStatus::Complete {
+                debug!(
+                    position_id = %event_id,
+                    "PostBuyGuardian: Shadow V2 lifecycle evidence emitted"
+                );
+            } else {
+                warn!(
+                    event_id = %event_id,
+                    status = ?outcome.validation_evidence_status,
+                    canonical_write = ?outcome.canonical_write,
+                    replay_write = ?outcome.replay_write,
+                    lifecycle_write = ?outcome.lifecycle_write,
+                    density_write = ?outcome.density_write,
+                    "PostBuyGuardian: Shadow V2 lifecycle evidence append incomplete"
+                );
+            }
+        }
+    }
+
+    fn shadow_v2_path_sample_from_lifecycle(
+        &self,
+        record: &ShadowLifecycleRecord,
+    ) -> ShadowPathSampleV2 {
+        let event_id = format!(
+            "shadow_v2_path_sample:{}:{}:{}",
+            record.position_id,
+            record.timestamp_ms,
+            shadow_lifecycle_record_type_label(record.record_type)
+        );
+        let mut envelope = self.shadow_v2_lifecycle_envelope(
+            record,
+            "shadow_path_sample_v2",
+            event_id,
+            TemporalClass::PostEntry,
+            ClockDomain::StreamObservedMs,
+        );
+        envelope.source_refs.push(format!(
+            "shadow_lifecycle:{}",
+            shadow_lifecycle_record_type_label(record.record_type)
+        ));
+        let sample_ts = record.sample_timestamp_ms.unwrap_or(record.timestamp_ms);
+        let age_ms = record
+            .sample_timestamp_ms
+            .map(|sample_ts_ms| sample_ts_ms.saturating_sub(record.entry_timestamp_ms()))
+            .or(record.sample_age_ms)
+            .or(record.duration_ms)
+            .unwrap_or_default();
+        let pnl_mark_bps = shadow_v2_pnl_bps_from_lifecycle(record);
+        let mut limitations = Vec::new();
+        if record.sample_timestamp_ms.is_none() {
+            limitations.push("PATH_SAMPLE_TIMESTAMP_MISSING_USED_RECORD_TIMESTAMP".to_string());
+        }
+        if record.exit_price.is_none() {
+            limitations.push("PATH_SAMPLE_EXIT_PRICE_MISSING".to_string());
+        }
+        if record.sample_price_state.is_none() {
+            limitations.push("PATH_SAMPLE_PRICE_STATE_MISSING".to_string());
+        }
+
+        ShadowPathSampleV2::from_legacy_lifecycle_mark(
+            envelope,
+            shadow_v2_event_order_key(
+                record.sample_slot.or(record.exit_sample_slot),
+                record.exit_market_anchor_tx_signature.as_deref(),
+                shadow_v2_event_seq(record.timestamp_ms, 1),
+                sample_ts,
+            ),
+            ClockedTimestamp {
+                field_name: "sample_ts_ms".to_string(),
+                value: Some(sample_ts as i64),
+                clock_domain: ClockDomain::StreamObservedMs,
+                clock_source: "shadow_lifecycle.price_truth_evidence".to_string(),
+                causal_boundary: "POST_ENTRY_MONITORING_SAMPLE".to_string(),
+            },
+            record.sample_slot.or(record.exit_sample_slot),
+            age_ms,
+            record.exit_price,
+            pnl_mark_bps,
+            ShadowPathSamplingModeV2::Standard120s,
+            if matches!(
+                record.record_type,
+                ShadowLifecycleRecordType::PositionClosed
+            ) {
+                ShadowPathSamplingReasonV2::Terminal
+            } else {
+                ShadowPathSamplingReasonV2::EventSample
+            },
+            format!("{:?}", record.truth_status),
+            limitations,
+        )
+    }
+
+    fn shadow_v2_exit_attempt_from_lifecycle(
+        &self,
+        record: &ShadowLifecycleRecord,
+    ) -> ShadowExitAttemptV2 {
+        let trigger_ts = record
+            .exit_reason_evaluation_ts_ms
+            .or(record.sample_timestamp_ms)
+            .unwrap_or(record.timestamp_ms);
+        let exit_trigger = shadow_v2_exit_trigger_label(record);
+        let mut envelope = self.shadow_v2_lifecycle_envelope(
+            record,
+            "shadow_exit_attempt_v2",
+            format!(
+                "shadow_v2_exit_attempt:{}:{}:{}",
+                record.position_id, trigger_ts, exit_trigger
+            ),
+            TemporalClass::PostEntry,
+            ClockDomain::StreamObservedMs,
+        );
+        envelope.source_refs.push(format!(
+            "shadow_lifecycle:{}",
+            shadow_lifecycle_record_type_label(record.record_type)
+        ));
+        if matches!(record.record_type, ShadowLifecycleRecordType::ExitBlocked) {
+            envelope
+                .limitations
+                .push("EXIT_ATTEMPT_LEGACY_LIFECYCLE_BLOCKED".to_string());
+        }
+
+        let mut attempt = ShadowExitAttemptV2::from_mark_path_trigger(
+            envelope,
+            shadow_v2_event_order_key(
+                record.exit_sample_slot.or(record.sample_slot),
+                record.exit_market_anchor_tx_signature.as_deref(),
+                shadow_v2_event_seq(trigger_ts, 2),
+                trigger_ts,
+            ),
+            exit_trigger,
+            ClockedTimestamp {
+                field_name: "trigger_ts_ms".to_string(),
+                value: Some(trigger_ts as i64),
+                clock_domain: ClockDomain::StreamObservedMs,
+                clock_source: "shadow_lifecycle.exit_reason_evaluation_ts_ms".to_string(),
+                causal_boundary: "POST_ENTRY_EXIT_TRIGGER".to_string(),
+            },
+            record.exit_sample_slot.or(record.sample_slot),
+            format!("{:?}", record.truth_source),
+            self.shadow_simple_exit_thresholds
+                .map(|thresholds| (thresholds.take_profit_pct * 100.0).round() as i32),
+            self.shadow_simple_exit_thresholds
+                .map(|thresholds| -((thresholds.stop_loss_pct * 100.0).round() as i32)),
+            Some(self.config.wait_for_timestop_ms()),
+            false,
+            Some("BLOCK_AMBIGUOUS".to_string()),
+        );
+        attempt.attach_static_exit_model(SHADOW_V2_EXIT_FILL_MODEL_VERSION);
+        attempt
+    }
+
+    fn shadow_v2_exit_fill_from_lifecycle(
+        &self,
+        record: &ShadowLifecycleRecord,
+    ) -> ShadowExitFillV2 {
+        let fill_ts = record
+            .exit_reason_evaluation_ts_ms
+            .or(record.sample_timestamp_ms)
+            .unwrap_or(record.timestamp_ms);
+        let mut envelope = self.shadow_v2_lifecycle_envelope(
+            record,
+            "shadow_exit_fill_v2",
+            format!(
+                "shadow_v2_exit_fill:{}:{}:{}",
+                record.position_id,
+                fill_ts,
+                shadow_lifecycle_record_type_label(record.record_type)
+            ),
+            TemporalClass::PostExit,
+            ClockDomain::LandingTsMs,
+        );
+        envelope.source_refs.push(format!(
+            "shadow_lifecycle:{}",
+            shadow_lifecycle_record_type_label(record.record_type)
+        ));
+        let mut blockers = vec![
+            "EXIT_FILL_DERIVED_FROM_LEGACY_LIFECYCLE_EVIDENCE".to_string(),
+            "EXIT_FILL_POOL_STATE_SAMPLE_NOT_AVAILABLE_IN_PR18_ADAPTER".to_string(),
+            "EXIT_FILL_QUOTE_FILL_DIVERGENCE_NOT_MEASURED".to_string(),
+        ];
+        if matches!(record.record_type, ShadowLifecycleRecordType::ExitBlocked) {
+            blockers.push("EXIT_FILL_LEGACY_LIFECYCLE_EXIT_BLOCKED".to_string());
+        }
+        if record.exit_price.is_none() {
+            blockers.push("EXIT_FILL_LEGACY_EXIT_PRICE_MISSING".to_string());
+        }
+        ShadowExitFillV2::blocked_without_pool_state(
+            envelope,
+            shadow_v2_event_order_key(
+                record.exit_landed_slot.or(record.exit_sample_slot),
+                record.exit_market_anchor_tx_signature.as_deref(),
+                shadow_v2_event_seq(fill_ts, 3),
+                fill_ts,
+            ),
+            blockers,
+        )
+    }
+
+    fn shadow_v2_terminal_truth_from_lifecycle(
+        &self,
+        record: &ShadowLifecycleRecord,
+    ) -> ShadowTerminalTruthV2 {
+        let terminal_ts = record
+            .exit_reason_evaluation_ts_ms
+            .or(record.sample_timestamp_ms)
+            .unwrap_or(record.timestamp_ms);
+        let mut envelope = self.shadow_v2_lifecycle_envelope(
+            record,
+            "shadow_terminal_truth_v2",
+            format!(
+                "shadow_v2_terminal_truth:{}:{}:{}",
+                record.position_id,
+                terminal_ts,
+                shadow_v2_exit_trigger_label(record)
+            ),
+            TemporalClass::PostExit,
+            ClockDomain::StreamObservedMs,
+        );
+        envelope.simulation_level = SimulationLevel::MarkOnly;
+        envelope.measurement_grade = MeasurementGrade::MarkPriceReplay;
+        envelope.quality = "TERMINAL_TRUTH_DERIVED_FROM_LEGACY_LIFECYCLE".to_string();
+        envelope
+            .source_refs
+            .push("shadow_lifecycle:position_closed".to_string());
+        envelope
+            .limitations
+            .push("TERMINAL_TRUTH_MARK_PATH_ONLY_NOT_EXECUTABLE_FILL".to_string());
+        envelope
+            .limitations
+            .push("TERMINAL_TRUTH_DERIVED_FROM_LEGACY_LIFECYCLE_RECORD".to_string());
+        envelope
+            .limitations
+            .push("TERMINAL_ENTRY_FILL_LINK_BEST_EFFORT_FROM_LEGACY_TIMELINE".to_string());
+
+        let linked_exit_fill = if record.total_exits == 0 {
+            Some(format!(
+                "shadow_v2_exit_fill:{}:{}:{}",
+                record.position_id,
+                terminal_ts,
+                shadow_lifecycle_record_type_label(ShadowLifecycleRecordType::PositionClosed)
+            ))
+        } else {
+            envelope.limitations.push(
+                "TERMINAL_EXIT_FILL_LINK_BLOCKED_BY_LEGACY_EXIT_TIMESTAMP_MISMATCH_RISK"
+                    .to_string(),
+            );
+            None
+        };
+
+        ShadowTerminalTruthV2 {
+            envelope,
+            terminal_reason: shadow_v2_terminal_reason(record.close_reason),
+            terminal_ts_ms: ClockedTimestamp {
+                field_name: "terminal_ts_ms".to_string(),
+                value: Some(terminal_ts as i64),
+                clock_domain: ClockDomain::StreamObservedMs,
+                clock_source: "shadow_lifecycle.position_closed".to_string(),
+                causal_boundary: "POST_EXIT_TERMINAL_TRUTH".to_string(),
+            },
+            terminal_slot: record.exit_landed_slot.or(record.exit_sample_slot),
+            terminal_source: "shadow_lifecycle.position_closed".to_string(),
+            final_pnl_mark_bps: shadow_v2_pnl_bps_from_lifecycle(record),
+            final_pnl_executable_bps: None,
+            close_age_ms: record.duration_ms,
+            linked_entry_fill: Some(format!(
+                "shadow_v2_entry_fill:{}:{}",
+                record.position_id,
+                record.entry_timestamp_ms()
+            )),
+            linked_exit_fill,
+            reconciliation_status: "TERMINAL_TRUTH_FROM_LEGACY_LIFECYCLE_MARK_ONLY".to_string(),
+            duplicate_terminal_handling: "CANONICAL_STREAM_REJECTS_DUPLICATE_TERMINAL_TRUTH"
+                .to_string(),
+        }
+    }
+
+    fn shadow_v2_lifecycle_envelope(
+        &self,
+        record: &ShadowLifecycleRecord,
+        schema: &str,
+        event_id: String,
+        temporal_class: TemporalClass,
+        clock_domain: ClockDomain,
+    ) -> ShadowV2Envelope {
+        let run_id = record
+            .run_id
+            .clone()
+            .or_else(|| record.rollout_namespace.clone())
+            .unwrap_or_else(|| "UNKNOWN_RUN".to_string());
+        let mut envelope = ShadowV2Envelope::contract_header(
+            schema,
+            run_id,
+            record.position_id.clone(),
+            event_id,
+            record.pool_id.clone(),
+            record.mint_id.clone(),
+        );
+        envelope.session_id = record
+            .session_id
+            .clone()
+            .or_else(|| Some("UNKNOWN_SESSION".to_string()));
+        envelope.candidate_id = Some(record.candidate_id.clone());
+        envelope.produced_at_ms = record.timestamp_ms;
+        envelope.produced_at_slot = record
+            .exit_landed_slot
+            .or(record.exit_sample_slot)
+            .or(record.sample_slot)
+            .or(record.entry_landed_slot)
+            .or(record.entry_slot);
+        envelope.temporal_class = temporal_class;
+        envelope.clock_domain = clock_domain;
+        envelope
+            .source_refs
+            .push("post_buy_guardian:shadow_lifecycle_record".to_string());
+        envelope
+            .source_refs
+            .push(format!("position_epoch:{}", record.position_epoch));
+        envelope
+            .source_refs
+            .push(format!("entry_order_id:{}", record.entry_order_id));
+        envelope
+            .source_refs
+            .push(format!("quote_id:{}", record.quote_id));
+        envelope
+            .limitations
+            .push("SHADOW_V2_RECORD_NOT_CONSUMED_BY_DECISIONS".to_string());
+        envelope.limitations.push("NOT_LIVE_EQUIVALENT".to_string());
+        if record.session_id.is_none() {
+            envelope
+                .limitations
+                .push("SESSION_ID_MISSING_FROM_LIFECYCLE_EXPLICIT_UNKNOWN".to_string());
+        }
+        envelope
     }
 
     fn append_shadow_exit_replay_record(&self, record: &ShadowExitReplayRecord) {
@@ -4646,6 +5153,16 @@ mod tests {
             .collect()
     }
 
+    fn shadow_v2_harness_config_for_dir(path: &Path) -> ShadowV2ValidationHarnessConfig {
+        ShadowV2ValidationHarnessConfig::new(
+            "shadow-v2-pr18-test",
+            path.join("shadow_position_event_v2.jsonl"),
+            path.join("shadow_replay_v2.jsonl"),
+            path.join("shadow_lifecycle_v2.jsonl"),
+            path.join("shadow_path_density_v2.jsonl"),
+        )
+    }
+
     fn read_event_rows(dir: &Path) -> Vec<Value> {
         let mut rows = Vec::new();
         let mut stack = vec![dir.to_path_buf()];
@@ -5018,6 +5535,131 @@ mod tests {
             "configs/rollout/ghost_brain_r16.toml"
         );
         assert_eq!(row["brain_config_hash"], "brain-hash");
+    }
+
+    #[test]
+    fn shadow_v2_lifecycle_close_emits_path_exit_terminal_records() {
+        let tmp = TempDir::new().expect("tempdir");
+        let harness = Arc::new(Mutex::new(
+            ShadowV2ValidationHarness::new(shadow_v2_harness_config_for_dir(tmp.path()))
+                .expect("shadow v2 harness"),
+        ));
+
+        let config = PostBuyGuardianConfig::default();
+        let shadow_ledger = Arc::new(ShadowLedger::new());
+        let (tx, _rx) = mpsc::channel(16);
+        let mut engine = MonitoringEngine::new(config, Arc::clone(&shadow_ledger), tx);
+        engine.set_shadow_v2_validation_harness(Arc::clone(&harness));
+        let engine = Arc::new(engine);
+
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let bonding_curve = Pubkey::new_unique();
+        let opened_at_ms = 1_785_000_200_000;
+        let position_id = "shadow-v2-terminal-test-position".to_string();
+        let registered = engine.register_position_with_context(
+            pool,
+            mint,
+            bonding_curve,
+            Some(0.0000001),
+            Some(7_000_000),
+            Some(7_000_000_000),
+            Some(PositionEventContext {
+                join_metadata: PositionJoinMetadata {
+                    run_id: Some("shadow-v2-pr18-test".to_string()),
+                    session_id: Some("session-terminal-test".to_string()),
+                    decision_plane: Some("pr18-test".to_string()),
+                    ..Default::default()
+                },
+                candidate_id: "candidate-terminal-test".to_string(),
+                entry_order_id: "entry-order-terminal-test".to_string(),
+                quote_id: "quote-terminal-test".to_string(),
+                slot: Some(430_000_020),
+                lane: Lane::Shadow,
+                position_id: Some(position_id.clone()),
+                position_epoch: Some(7),
+                opened_at_ms: Some(opened_at_ms),
+            }),
+        );
+        assert!(registered.is_some());
+
+        engine.unregister_position(&mint);
+
+        let canonical_rows = read_jsonl_rows(&tmp.path().join("shadow_position_event_v2.jsonl"));
+        let event_kinds: Vec<_> = canonical_rows
+            .iter()
+            .filter_map(|row| row["event_kind"].as_str())
+            .collect();
+        assert!(
+            event_kinds.contains(&"PATH_SAMPLE"),
+            "missing PATH_SAMPLE in canonical rows: {canonical_rows:?}"
+        );
+        assert!(
+            event_kinds.contains(&"EXIT_ATTEMPT"),
+            "missing EXIT_ATTEMPT in canonical rows: {canonical_rows:?}"
+        );
+        assert!(
+            event_kinds.contains(&"EXIT_FILL"),
+            "missing EXIT_FILL in canonical rows: {canonical_rows:?}"
+        );
+        assert!(
+            event_kinds.contains(&"TERMINAL_TRUTH"),
+            "missing TERMINAL_TRUTH in canonical rows: {canonical_rows:?}"
+        );
+
+        let exit_fill = canonical_rows
+            .iter()
+            .find(|row| row["event_kind"] == "EXIT_FILL")
+            .expect("exit fill row");
+        assert_eq!(
+            exit_fill["payload"]["record"]["fill_status"],
+            "BLOCKED_BY_DATA"
+        );
+        let exit_fill_limitations = exit_fill["payload"]["record"]["limitations"]
+            .as_array()
+            .expect("exit fill limitations");
+        assert!(exit_fill_limitations
+            .iter()
+            .any(|value| value == "EXIT_FILL_POOL_STATE_SAMPLE_MISSING"));
+
+        let terminal = canonical_rows
+            .iter()
+            .find(|row| row["event_kind"] == "TERMINAL_TRUTH")
+            .expect("terminal truth row");
+        assert_eq!(
+            terminal["payload"]["record"]["terminal_source"],
+            "shadow_lifecycle.position_closed"
+        );
+        assert_eq!(
+            terminal["payload"]["record"]["final_pnl_executable_bps"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            terminal["payload"]["record"]["linked_exit_fill"],
+            exit_fill["envelope"]["event_id"]
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("shadow_replay_v2.jsonl"))
+                .expect("replay jsonl")
+                .lines()
+                .count(),
+            canonical_rows.len()
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("shadow_lifecycle_v2.jsonl"))
+                .expect("lifecycle jsonl")
+                .lines()
+                .count(),
+            canonical_rows.len()
+        );
+        assert!(
+            std::fs::read_to_string(tmp.path().join("shadow_path_density_v2.jsonl"))
+                .expect("density jsonl")
+                .lines()
+                .count()
+                > 0
+        );
     }
 
     #[tokio::test]
