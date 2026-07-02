@@ -14,11 +14,12 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ghost_core::account_state_core::types::CanonicalPoolState;
-use ghost_core::{
-    quote_constant_product, ShadowV2PoolPhase, ShadowV2Quote, ShadowV2QuoteSide, ShadowV2Reserves,
-    SHADOW_V2_BPS_DENOMINATOR, SHADOW_V2_PRICE_FORMULA_VERSION,
+use super::shadow_v2_execution::{
+    ShadowV2BoundaryKind, ShadowV2ExecutionInput, ShadowV2ExecutionLabelGrade,
+    ShadowV2ExecutionOutcome, ShadowV2ExecutionSide, ShadowV2FillEngine, ShadowV2NoFillReason,
 };
+use ghost_core::account_state_core::types::CanonicalPoolState;
+use ghost_core::{ShadowV2PoolPhase, ShadowV2Quote, ShadowV2Reserves, SHADOW_V2_BPS_DENOMINATOR};
 use serde::{Deserialize, Serialize};
 
 pub const SHADOW_V2_SIMULATION_CONTRACT_VERSION: &str = "shadow_burnin_simulation_v2_20260629";
@@ -1384,6 +1385,38 @@ pub struct ShadowEntryFillV2 {
     pub reconstruction_status: String,
     pub quality: String,
     pub limitations: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_simulation_ready: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub research_provenance_ready: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_label_grade: Option<ShadowV2ExecutionLabelGrade>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance_ready: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provenance_blockers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_reasons: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_fill_reason: Option<ShadowV2NoFillReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fail_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_output_raw: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_amount_raw: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slippage_tolerance_bps: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deterministic_price_impact_bps: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realized_slippage_bps: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quote_fill_divergence_bps: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_state_after_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_model_version: Option<String>,
 }
 
 impl ShadowEntryFillV2 {
@@ -1403,41 +1436,71 @@ impl ShadowEntryFillV2 {
             pool_state_before.envelope.event_id
         ));
 
-        let blockers = entry_fill_research_blockers(pool_state_before, &event_order_key, config);
-        if !blockers.is_empty() {
-            return Self::blocked_by_data(envelope, event_order_key, pool_state_before, blockers);
-        }
+        let outcome = ShadowV2FillEngine::simulate(ShadowV2ExecutionInput {
+            side: ShadowV2ExecutionSide::Buy,
+            pool_phase: config.pool_phase,
+            pool_state_before: Some(pool_state_before),
+            boundary_kind: ShadowV2BoundaryKind::EntryBefore,
+            event_order_key: event_order_key.clone(),
+            input_amount_raw: Some(config.input_sol_lamports),
+            min_out_raw: None,
+            fee_bps: Some(config.fee_bps),
+            slippage_tolerance_bps: Some(config.slippage_bps),
+            model_version: config.executable_fill_model_version.clone(),
+        });
+        Self::from_execution_outcome(envelope, event_order_key, outcome)
+    }
 
-        let Some(reserves) = reserves_from_pool_state(pool_state_before, config.pool_phase) else {
-            return Self::blocked_by_data(
-                envelope,
-                event_order_key,
-                pool_state_before,
-                vec!["ENTRY_FILL_RESERVE_PROVENANCE_MISSING_FOR_PHASE".to_string()],
-            );
-        };
-        match quote_constant_product(
-            config.pool_phase,
-            ShadowV2QuoteSide::Buy,
-            reserves,
-            config.input_sol_lamports,
-            config.fee_bps,
-            config.slippage_bps,
-        ) {
-            Ok(quote) => Self::filled_from_quote(
-                envelope,
-                event_order_key,
-                pool_state_before,
-                config,
-                reserves,
-                quote,
-            ),
-            Err(error) => Self::blocked_by_data(
-                envelope,
-                event_order_key,
-                pool_state_before,
-                vec![format!("ENTRY_FILL_QUOTE_RECONSTRUCTION_ERROR={error}")],
-            ),
+    pub fn from_execution_outcome(
+        mut envelope: ShadowV2Envelope,
+        event_order_key: EventOrderKey,
+        outcome: ShadowV2ExecutionOutcome,
+    ) -> Self {
+        envelope.schema = "shadow_entry_fill_v2".to_string();
+        envelope.simulation_level = SimulationLevel::FillModelStatic;
+        envelope.measurement_grade = measurement_grade_for_execution_outcome(&outcome);
+        envelope.temporal_class = TemporalClass::PostEntry;
+        envelope.clock_domain = ClockDomain::LandingTsMs;
+        envelope.quality = outcome.quality.clone();
+        envelope.limitations.extend(outcome.limitations.clone());
+
+        let pool_state_after = outcome
+            .pool_state_after_derived
+            .as_ref()
+            .map(|derived| derived.ref_label());
+        Self {
+            envelope,
+            event_order_key,
+            fill_status: outcome.fill_status,
+            fill_price: outcome.fill_price,
+            fill_price_source: outcome.fill_price_source,
+            fill_amount_sol: outcome.fill_amount_sol,
+            fill_amount_tokens: outcome.fill_amount_tokens,
+            slippage_bps: outcome.slippage_tolerance_bps,
+            own_impact_bps: outcome.own_impact_bps,
+            fee_bps: outcome.fee_bps,
+            min_out: outcome.min_out_raw,
+            pool_state_before: outcome.pool_state_before_ref,
+            pool_state_after,
+            reconstruction_status: outcome.reconstruction_status,
+            quality: outcome.quality,
+            limitations: outcome.limitations,
+            execution_simulation_ready: Some(outcome.execution_simulation_ready),
+            research_provenance_ready: Some(outcome.research_provenance_ready),
+            execution_label_grade: Some(outcome.execution_label_grade),
+            provenance_ready: Some(outcome.provenance_ready),
+            provenance_blockers: outcome.provenance_blockers,
+            blocked_reasons: outcome.blocked_reasons,
+            no_fill_reason: outcome.no_fill_reason,
+            fail_reason: outcome.fail_reason,
+            expected_output_raw: outcome.expected_output_raw,
+            output_amount_raw: outcome.output_amount_raw,
+            slippage_tolerance_bps: outcome.slippage_tolerance_bps,
+            deterministic_price_impact_bps: outcome.deterministic_price_impact_bps,
+            realized_slippage_bps: outcome.realized_slippage_bps,
+            quote_fill_divergence_bps: outcome.quote_fill_divergence_bps,
+            pool_state_after_source: outcome.pool_state_after_source,
+            execution_model_version: Some(outcome.model_version),
         }
     }
 
@@ -1476,6 +1539,22 @@ impl ShadowEntryFillV2 {
             reconstruction_status: "ENTRY_FILL_BLOCKED_BY_MISSING_POOL_STATE".to_string(),
             quality: "BLOCKED_BY_DATA".to_string(),
             limitations: blockers,
+            execution_simulation_ready: Some(false),
+            research_provenance_ready: Some(false),
+            execution_label_grade: Some(ShadowV2ExecutionLabelGrade::DiagnosticSim),
+            provenance_ready: Some(false),
+            provenance_blockers: Vec::new(),
+            blocked_reasons: vec!["BLOCKED_POOL_STATE_MISSING".to_string()],
+            no_fill_reason: None,
+            fail_reason: None,
+            expected_output_raw: None,
+            output_amount_raw: None,
+            slippage_tolerance_bps: None,
+            deterministic_price_impact_bps: None,
+            realized_slippage_bps: None,
+            quote_fill_divergence_bps: None,
+            pool_state_after_source: None,
+            execution_model_version: None,
         }
     }
 
@@ -1518,184 +1597,45 @@ impl ShadowEntryFillV2 {
             reconstruction_status: "ENTRY_FILL_BLOCKED_BY_DATA_WITH_POOL_STATE_REF".to_string(),
             quality: "BLOCKED_BY_DATA".to_string(),
             limitations: blockers,
-        }
-    }
-
-    fn filled_from_quote(
-        mut envelope: ShadowV2Envelope,
-        event_order_key: EventOrderKey,
-        pool_state_before: &PoolStateSampleV2,
-        config: &ShadowEntryFillModelConfig,
-        reserves: ShadowV2Reserves,
-        quote: ShadowV2Quote,
-    ) -> Self {
-        let mut limitations = vec![
-            "FILL_MODEL_STATIC_NOT_LIVE_CONFIRMED".to_string(),
-            "NO_LIVE_LANDING_OR_FAILED_TX_TELEMETRY".to_string(),
-            "SLIPPAGE_IS_CONFIGURED_TOLERANCE_NOT_REALIZED".to_string(),
-            "POOL_STATE_AFTER_IS_DETERMINISTIC_DERIVED_STATE_NOT_OBSERVED_ACCOUNT".to_string(),
-            format!("ENTRY_FILL_POOL_PHASE={:?}", config.pool_phase),
-            format!("ENTRY_FILL_FORMULA_VERSION={SHADOW_V2_PRICE_FORMULA_VERSION}"),
-        ];
-        limitations.extend(pool_state_before.ambiguity_labels());
-        envelope.limitations.extend(limitations.clone());
-        envelope.quality = "FILL_MODEL_STATIC_RESEARCH_CANDIDATE".to_string();
-
-        Self {
-            envelope,
-            event_order_key,
-            fill_status: FillStatus::Filled,
-            fill_price: Some(quote.fill_price_sol_per_token),
-            fill_price_source: Some(quote.price_source_label().to_string()),
-            fill_amount_sol: Some(config.input_sol_lamports as f64 / reserves.sol_lamports as f64),
-            fill_amount_tokens: Some(normalized_token_amount(
-                quote.expected_output_amount,
-                reserves.token_decimals,
-            )),
-            slippage_bps: Some(config.slippage_bps as i32),
-            own_impact_bps: Some(quote.own_impact_bps),
-            fee_bps: Some(config.fee_bps as i32),
-            min_out: Some(quote.min_output_amount),
-            pool_state_before: Some(pool_state_before.envelope.event_id.clone()),
-            pool_state_after: Some(format!(
-                "derived_after:{}:{}:{}:{}",
-                pool_state_before.envelope.event_id,
-                quote.post_sol_reserves_lamports,
-                quote.post_token_reserves_raw,
-                quote.formula_version
-            )),
-            reconstruction_status: "ENTRY_FILL_RECONSTRUCTED_FROM_POOL_STATE".to_string(),
-            quality: "FILL_MODEL_STATIC_RESEARCH_CANDIDATE".to_string(),
-            limitations,
-        }
-    }
-
-    fn blocked_by_data(
-        mut envelope: ShadowV2Envelope,
-        event_order_key: EventOrderKey,
-        pool_state_before: &PoolStateSampleV2,
-        blockers: Vec<String>,
-    ) -> Self {
-        envelope.measurement_grade = MeasurementGrade::BlockedByData;
-        envelope.quality = "BLOCKED_BY_DATA".to_string();
-        envelope.limitations.extend(blockers.clone());
-        Self {
-            envelope,
-            event_order_key,
-            fill_status: FillStatus::BlockedByData,
-            fill_price: None,
-            fill_price_source: None,
-            fill_amount_sol: None,
-            fill_amount_tokens: None,
-            slippage_bps: None,
-            own_impact_bps: None,
-            fee_bps: None,
-            min_out: None,
-            pool_state_before: Some(pool_state_before.envelope.event_id.clone()),
-            pool_state_after: None,
-            reconstruction_status: "ENTRY_FILL_BLOCKED_BY_DATA".to_string(),
-            quality: "BLOCKED_BY_DATA".to_string(),
-            limitations: blockers,
+            execution_simulation_ready: Some(false),
+            research_provenance_ready: Some(false),
+            execution_label_grade: Some(ShadowV2ExecutionLabelGrade::DiagnosticSim),
+            provenance_ready: Some(false),
+            provenance_blockers: Vec::new(),
+            blocked_reasons: vec!["BLOCKED_BY_DATA_WITH_POOL_STATE_REF".to_string()],
+            no_fill_reason: None,
+            fail_reason: None,
+            expected_output_raw: None,
+            output_amount_raw: None,
+            slippage_tolerance_bps: None,
+            deterministic_price_impact_bps: None,
+            realized_slippage_bps: None,
+            quote_fill_divergence_bps: None,
+            pool_state_after_source: None,
+            execution_model_version: None,
         }
     }
 }
 
-fn entry_fill_research_blockers(
-    pool_state_before: &PoolStateSampleV2,
-    fill_event_order_key: &EventOrderKey,
-    config: &ShadowEntryFillModelConfig,
-) -> Vec<String> {
-    let mut blockers = pool_state_before.research_blockers();
-    blockers.extend(entry_fill_causal_boundary_blockers(
-        &pool_state_before.event_order_key,
-        fill_event_order_key,
-    ));
-    match pool_state_before.envelope.temporal_class {
-        TemporalClass::PreDecision | TemporalClass::AtDecision | TemporalClass::PostEntry => {}
-        TemporalClass::PreDetection
-        | TemporalClass::PostExit
-        | TemporalClass::Outcome
-        | TemporalClass::Unknown => blockers.push(
-            "ENTRY_FILL_POOL_STATE_TEMPORAL_CLASS_NOT_ALLOWED_FOR_ENTRY_CAUSAL_BOUNDARY"
-                .to_string(),
-        ),
-    }
-    if config.input_sol_lamports == 0 {
-        blockers.push("ENTRY_FILL_INPUT_SOL_LAMPORTS_ZERO".to_string());
-    }
-    if config.fee_bps as u64 > SHADOW_V2_BPS_DENOMINATOR {
-        blockers.push("ENTRY_FILL_FEE_BPS_INVALID".to_string());
-    }
-    if config.slippage_bps as u64 > SHADOW_V2_BPS_DENOMINATOR {
-        blockers.push("ENTRY_FILL_SLIPPAGE_BPS_INVALID".to_string());
-    }
-    if reserves_from_pool_state(pool_state_before, config.pool_phase).is_none() {
-        blockers.push("ENTRY_FILL_RESERVE_PROVENANCE_MISSING_FOR_PHASE".to_string());
-    }
-    blockers
-}
-
-fn entry_fill_causal_boundary_blockers(
-    pool_state_order: &EventOrderKey,
-    fill_event_order: &EventOrderKey,
-) -> Vec<String> {
-    let mut blockers = Vec::new();
-    if fill_event_order.observed_at_wall_ms == 0 {
-        push_blocker_once(
-            &mut blockers,
-            "ENTRY_FILL_EVENT_ORDER_OBSERVED_AT_WALL_MS_MISSING",
-        );
-    }
-    if fill_event_order.slot.is_unknown() {
-        push_blocker_once(&mut blockers, "ENTRY_FILL_EVENT_ORDER_SLOT_UNKNOWN");
-    }
-    if pool_state_order.event_seq_in_process > fill_event_order.event_seq_in_process {
-        push_blocker_once(
-            &mut blockers,
-            "ENTRY_FILL_POOL_STATE_AFTER_ENTRY_FILL_BOUNDARY",
-        );
-    } else if pool_state_order.event_seq_in_process == fill_event_order.event_seq_in_process {
-        push_blocker_once(
-            &mut blockers,
-            "ENTRY_FILL_POOL_STATE_NOT_STRICTLY_BEFORE_ENTRY_FILL_BOUNDARY",
-        );
-    }
-
-    match (
-        pool_state_order.slot.as_known(),
-        fill_event_order.slot.as_known(),
-    ) {
-        (Some(pool_slot), Some(fill_slot)) if pool_slot > fill_slot => {
-            push_blocker_once(
-                &mut blockers,
-                "ENTRY_FILL_POOL_STATE_AFTER_ENTRY_FILL_BOUNDARY",
-            );
-        }
-        (Some(pool_slot), Some(fill_slot)) if pool_slot == fill_slot => {
-            if pool_state_order.same_slot_ambiguous_with(fill_event_order) {
-                push_blocker_once(
-                    &mut blockers,
-                    "ENTRY_FILL_POOL_STATE_SAME_SLOT_ORDER_AMBIGUOUS",
-                );
-            } else if let (Some(pool_tuple), Some(fill_tuple)) = (
-                chain_order_tuple(pool_state_order),
-                chain_order_tuple(fill_event_order),
-            ) {
-                if pool_tuple >= fill_tuple {
-                    push_blocker_once(
-                        &mut blockers,
-                        "ENTRY_FILL_POOL_STATE_AFTER_ENTRY_FILL_BOUNDARY",
-                    );
-                }
+fn measurement_grade_for_execution_outcome(outcome: &ShadowV2ExecutionOutcome) -> MeasurementGrade {
+    match outcome.fill_status {
+        FillStatus::BlockedByData => MeasurementGrade::BlockedByData,
+        FillStatus::Filled | FillStatus::NoFill => {
+            if outcome.research_provenance_ready
+                && outcome.execution_label_grade == ShadowV2ExecutionLabelGrade::ResearchCandidate
+            {
+                MeasurementGrade::ResearchGradeCandidate
+            } else {
+                MeasurementGrade::DiagnosticOnly
             }
         }
-        _ => {}
+        FillStatus::Failed => MeasurementGrade::DiagnosticOnly,
     }
-
-    blockers
 }
 
-fn chain_order_tuple(order: &EventOrderKey) -> Option<(u32, u32, u32, u32)> {
+pub(crate) fn chain_order_tuple_for_execution(
+    order: &EventOrderKey,
+) -> Option<(u32, u32, u32, u32)> {
     Some((
         *order.transaction_index_or_unknown.as_known()?,
         *order.instruction_index_or_unknown.as_known()?,
@@ -1704,10 +1644,8 @@ fn chain_order_tuple(order: &EventOrderKey) -> Option<(u32, u32, u32, u32)> {
     ))
 }
 
-fn push_blocker_once(blockers: &mut Vec<String>, blocker: &'static str) {
-    if !blockers.iter().any(|existing| existing == blocker) {
-        blockers.push(blocker.to_string());
-    }
+fn chain_order_tuple(order: &EventOrderKey) -> Option<(u32, u32, u32, u32)> {
+    chain_order_tuple_for_execution(order)
 }
 
 fn reserves_from_pool_state(
@@ -1730,10 +1668,6 @@ fn reserves_from_pool_state(
         pool_state.token_decimals?,
         pool_state.sol_lamports?,
     ))
-}
-
-fn normalized_token_amount(raw_tokens: u64, token_decimals: u8) -> f64 {
-    raw_tokens as f64 / 10_f64.powi(token_decimals as i32)
 }
 
 fn pnl_bps_from_prices(
@@ -2494,6 +2428,38 @@ pub struct ShadowExitFillV2 {
     pub reconstruction_status: String,
     pub quality: String,
     pub limitations: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_simulation_ready: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub research_provenance_ready: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_label_grade: Option<ShadowV2ExecutionLabelGrade>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance_ready: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provenance_blockers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_reasons: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_fill_reason: Option<ShadowV2NoFillReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fail_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_output_raw: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_amount_raw: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slippage_tolerance_bps: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deterministic_price_impact_bps: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realized_slippage_bps: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quote_fill_divergence_bps: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_state_after_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_model_version: Option<String>,
 }
 
 impl ShadowExitFillV2 {
@@ -2513,11 +2479,6 @@ impl ShadowExitFillV2 {
             pool_state_before.envelope.event_id
         ));
 
-        let blockers = exit_fill_research_blockers(pool_state_before, &event_order_key, config);
-        if !blockers.is_empty() {
-            return Self::blocked_by_data(envelope, event_order_key, pool_state_before, blockers);
-        }
-
         if let Some(failure_mode) = config.modeled_failure_mode {
             return Self::modeled_failure(
                 envelope,
@@ -2528,37 +2489,71 @@ impl ShadowExitFillV2 {
             );
         }
 
-        let Some(reserves) = reserves_from_pool_state(pool_state_before, config.pool_phase) else {
-            return Self::blocked_by_data(
-                envelope,
-                event_order_key,
-                pool_state_before,
-                vec!["EXIT_FILL_RESERVE_PROVENANCE_MISSING_FOR_PHASE".to_string()],
-            );
-        };
+        let outcome = ShadowV2FillEngine::simulate(ShadowV2ExecutionInput {
+            side: ShadowV2ExecutionSide::Sell,
+            pool_phase: config.pool_phase,
+            pool_state_before: Some(pool_state_before),
+            boundary_kind: ShadowV2BoundaryKind::ExitBefore,
+            event_order_key: event_order_key.clone(),
+            input_amount_raw: Some(config.input_token_raw),
+            min_out_raw: None,
+            fee_bps: Some(config.fee_bps),
+            slippage_tolerance_bps: Some(config.slippage_bps),
+            model_version: config.executable_fill_model_version.clone(),
+        });
+        Self::from_execution_outcome(envelope, event_order_key, outcome)
+    }
 
-        match quote_constant_product(
-            config.pool_phase,
-            ShadowV2QuoteSide::Sell,
-            reserves,
-            config.input_token_raw,
-            config.fee_bps,
-            config.slippage_bps,
-        ) {
-            Ok(quote) => Self::filled_from_quote(
-                envelope,
-                event_order_key,
-                pool_state_before,
-                config,
-                reserves,
-                quote,
-            ),
-            Err(error) => Self::blocked_by_data(
-                envelope,
-                event_order_key,
-                pool_state_before,
-                vec![format!("EXIT_FILL_QUOTE_RECONSTRUCTION_ERROR={error}")],
-            ),
+    pub fn from_execution_outcome(
+        mut envelope: ShadowV2Envelope,
+        event_order_key: EventOrderKey,
+        outcome: ShadowV2ExecutionOutcome,
+    ) -> Self {
+        envelope.schema = "shadow_exit_fill_v2".to_string();
+        envelope.simulation_level = SimulationLevel::FillModelStatic;
+        envelope.measurement_grade = measurement_grade_for_execution_outcome(&outcome);
+        envelope.temporal_class = TemporalClass::PostExit;
+        envelope.clock_domain = ClockDomain::LandingTsMs;
+        envelope.quality = outcome.quality.clone();
+        envelope.limitations.extend(outcome.limitations.clone());
+
+        let pool_state_after = outcome
+            .pool_state_after_derived
+            .as_ref()
+            .map(|derived| derived.ref_label());
+        Self {
+            envelope,
+            event_order_key,
+            fill_status: outcome.fill_status,
+            fill_price: outcome.fill_price,
+            fill_price_source: outcome.fill_price_source,
+            fill_amount_sol: outcome.fill_amount_sol,
+            fill_amount_tokens: outcome.fill_amount_tokens,
+            slippage_bps: outcome.slippage_tolerance_bps,
+            own_impact_bps: outcome.own_impact_bps,
+            fee_bps: outcome.fee_bps,
+            min_out: outcome.min_out_raw,
+            pool_state_before: outcome.pool_state_before_ref,
+            pool_state_after,
+            reconstruction_status: outcome.reconstruction_status,
+            quality: outcome.quality,
+            limitations: outcome.limitations,
+            execution_simulation_ready: Some(outcome.execution_simulation_ready),
+            research_provenance_ready: Some(outcome.research_provenance_ready),
+            execution_label_grade: Some(outcome.execution_label_grade),
+            provenance_ready: Some(outcome.provenance_ready),
+            provenance_blockers: outcome.provenance_blockers,
+            blocked_reasons: outcome.blocked_reasons,
+            no_fill_reason: outcome.no_fill_reason,
+            fail_reason: outcome.fail_reason,
+            expected_output_raw: outcome.expected_output_raw,
+            output_amount_raw: outcome.output_amount_raw,
+            slippage_tolerance_bps: outcome.slippage_tolerance_bps,
+            deterministic_price_impact_bps: outcome.deterministic_price_impact_bps,
+            realized_slippage_bps: outcome.realized_slippage_bps,
+            quote_fill_divergence_bps: outcome.quote_fill_divergence_bps,
+            pool_state_after_source: outcome.pool_state_after_source,
+            execution_model_version: Some(outcome.model_version),
         }
     }
 
@@ -2598,6 +2593,22 @@ impl ShadowExitFillV2 {
             reconstruction_status: "EXIT_FILL_BLOCKED_BY_MISSING_POOL_STATE".to_string(),
             quality: "BLOCKED_BY_DATA".to_string(),
             limitations: blockers,
+            execution_simulation_ready: Some(false),
+            research_provenance_ready: Some(false),
+            execution_label_grade: Some(ShadowV2ExecutionLabelGrade::DiagnosticSim),
+            provenance_ready: Some(false),
+            provenance_blockers: Vec::new(),
+            blocked_reasons: vec!["BLOCKED_POOL_STATE_MISSING".to_string()],
+            no_fill_reason: None,
+            fail_reason: None,
+            expected_output_raw: None,
+            output_amount_raw: None,
+            slippage_tolerance_bps: None,
+            deterministic_price_impact_bps: None,
+            realized_slippage_bps: None,
+            quote_fill_divergence_bps: None,
+            pool_state_after_source: None,
+            execution_model_version: None,
         }
     }
 
@@ -2641,58 +2652,22 @@ impl ShadowExitFillV2 {
             reconstruction_status: "EXIT_FILL_BLOCKED_BY_DATA_WITH_POOL_STATE_REF".to_string(),
             quality: "BLOCKED_BY_DATA".to_string(),
             limitations: blockers,
-        }
-    }
-
-    fn filled_from_quote(
-        mut envelope: ShadowV2Envelope,
-        event_order_key: EventOrderKey,
-        pool_state_before: &PoolStateSampleV2,
-        config: &ShadowExitFillModelConfig,
-        reserves: ShadowV2Reserves,
-        quote: ShadowV2Quote,
-    ) -> Self {
-        let mut limitations = vec![
-            "FILL_MODEL_STATIC_NOT_LIVE_CONFIRMED".to_string(),
-            "NO_LIVE_EXIT_TRANSACTION_OR_FAILED_TX_TELEMETRY".to_string(),
-            "EXIT_SLIPPAGE_IS_CONFIGURED_TOLERANCE_NOT_REALIZED".to_string(),
-            "POOL_STATE_AFTER_IS_DETERMINISTIC_DERIVED_STATE_NOT_OBSERVED_ACCOUNT".to_string(),
-            "STATIC_EXIT_FILL_DOES_NOT_ENABLE_ACTIVE_CLOSE".to_string(),
-            format!("EXIT_FILL_POOL_PHASE={:?}", config.pool_phase),
-            format!("EXIT_FILL_FORMULA_VERSION={SHADOW_V2_PRICE_FORMULA_VERSION}"),
-        ];
-        limitations.extend(pool_state_before.ambiguity_labels());
-        envelope.limitations.extend(limitations.clone());
-        envelope.quality = "FILL_MODEL_STATIC_EXIT_RESEARCH_CANDIDATE".to_string();
-
-        Self {
-            envelope,
-            event_order_key,
-            fill_status: FillStatus::Filled,
-            fill_price: Some(quote.fill_price_sol_per_token),
-            fill_price_source: Some(quote.price_source_label().to_string()),
-            fill_amount_sol: Some(
-                quote.expected_output_amount as f64 / reserves.sol_lamports as f64,
-            ),
-            fill_amount_tokens: Some(normalized_token_amount(
-                config.input_token_raw,
-                reserves.token_decimals,
-            )),
-            slippage_bps: Some(config.slippage_bps as i32),
-            own_impact_bps: Some(quote.own_impact_bps),
-            fee_bps: Some(config.fee_bps as i32),
-            min_out: Some(quote.min_output_amount),
-            pool_state_before: Some(pool_state_before.envelope.event_id.clone()),
-            pool_state_after: Some(format!(
-                "derived_after:{}:{}:{}:{}",
-                pool_state_before.envelope.event_id,
-                quote.post_sol_reserves_lamports,
-                quote.post_token_reserves_raw,
-                quote.formula_version
-            )),
-            reconstruction_status: "EXIT_FILL_RECONSTRUCTED_FROM_POOL_STATE".to_string(),
-            quality: "FILL_MODEL_STATIC_EXIT_RESEARCH_CANDIDATE".to_string(),
-            limitations,
+            execution_simulation_ready: Some(false),
+            research_provenance_ready: Some(false),
+            execution_label_grade: Some(ShadowV2ExecutionLabelGrade::DiagnosticSim),
+            provenance_ready: Some(false),
+            provenance_blockers: Vec::new(),
+            blocked_reasons: vec!["BLOCKED_BY_DATA_WITH_POOL_STATE_REF".to_string()],
+            no_fill_reason: None,
+            fail_reason: None,
+            expected_output_raw: None,
+            output_amount_raw: None,
+            slippage_tolerance_bps: None,
+            deterministic_price_impact_bps: None,
+            realized_slippage_bps: None,
+            quote_fill_divergence_bps: None,
+            pool_state_after_source: None,
+            execution_model_version: None,
         }
     }
 
@@ -2746,128 +2721,32 @@ impl ShadowExitFillV2 {
             reconstruction_status: reconstruction_status.to_string(),
             quality: quality.to_string(),
             limitations,
+            execution_simulation_ready: Some(true),
+            research_provenance_ready: Some(false),
+            execution_label_grade: Some(ShadowV2ExecutionLabelGrade::DiagnosticSim),
+            provenance_ready: Some(false),
+            provenance_blockers: Vec::new(),
+            blocked_reasons: Vec::new(),
+            no_fill_reason: if fill_status == FillStatus::NoFill {
+                Some(ShadowV2NoFillReason::MinOutNotMet)
+            } else {
+                None
+            },
+            fail_reason: if fill_status == FillStatus::Failed {
+                Some("MODELED_EXIT_FAILURE".to_string())
+            } else {
+                None
+            },
+            expected_output_raw: None,
+            output_amount_raw: None,
+            slippage_tolerance_bps: Some(config.slippage_bps as i32),
+            deterministic_price_impact_bps: None,
+            realized_slippage_bps: None,
+            quote_fill_divergence_bps: None,
+            pool_state_after_source: None,
+            execution_model_version: Some(config.executable_fill_model_version.clone()),
         }
     }
-
-    fn blocked_by_data(
-        mut envelope: ShadowV2Envelope,
-        event_order_key: EventOrderKey,
-        pool_state_before: &PoolStateSampleV2,
-        blockers: Vec<String>,
-    ) -> Self {
-        envelope.measurement_grade = MeasurementGrade::BlockedByData;
-        envelope.quality = "BLOCKED_BY_DATA".to_string();
-        envelope.limitations.extend(blockers.clone());
-
-        Self {
-            envelope,
-            event_order_key,
-            fill_status: FillStatus::BlockedByData,
-            fill_price: None,
-            fill_price_source: None,
-            fill_amount_sol: None,
-            fill_amount_tokens: None,
-            slippage_bps: None,
-            own_impact_bps: None,
-            fee_bps: None,
-            min_out: None,
-            pool_state_before: Some(pool_state_before.envelope.event_id.clone()),
-            pool_state_after: None,
-            reconstruction_status: "EXIT_FILL_BLOCKED_BY_DATA".to_string(),
-            quality: "BLOCKED_BY_DATA".to_string(),
-            limitations: blockers,
-        }
-    }
-}
-
-fn exit_fill_research_blockers(
-    pool_state_before: &PoolStateSampleV2,
-    fill_event_order_key: &EventOrderKey,
-    config: &ShadowExitFillModelConfig,
-) -> Vec<String> {
-    let mut blockers = pool_state_before.research_blockers();
-    blockers.extend(exit_fill_causal_boundary_blockers(
-        &pool_state_before.event_order_key,
-        fill_event_order_key,
-    ));
-    if pool_state_before.envelope.temporal_class != TemporalClass::PostEntry {
-        blockers.push(
-            "EXIT_FILL_POOL_STATE_TEMPORAL_CLASS_NOT_POST_ENTRY_FOR_EXIT_BOUNDARY".to_string(),
-        );
-    }
-    if config.input_token_raw == 0 {
-        blockers.push("EXIT_FILL_INPUT_TOKEN_RAW_ZERO".to_string());
-    }
-    if config.fee_bps as u64 > SHADOW_V2_BPS_DENOMINATOR {
-        blockers.push("EXIT_FILL_FEE_BPS_INVALID".to_string());
-    }
-    if config.slippage_bps as u64 > SHADOW_V2_BPS_DENOMINATOR {
-        blockers.push("EXIT_FILL_SLIPPAGE_BPS_INVALID".to_string());
-    }
-    if reserves_from_pool_state(pool_state_before, config.pool_phase).is_none() {
-        blockers.push("EXIT_FILL_RESERVE_PROVENANCE_MISSING_FOR_PHASE".to_string());
-    }
-    blockers
-}
-
-fn exit_fill_causal_boundary_blockers(
-    pool_state_order: &EventOrderKey,
-    fill_event_order: &EventOrderKey,
-) -> Vec<String> {
-    let mut blockers = Vec::new();
-    if fill_event_order.observed_at_wall_ms == 0 {
-        push_blocker_once(
-            &mut blockers,
-            "EXIT_FILL_EVENT_ORDER_OBSERVED_AT_WALL_MS_MISSING",
-        );
-    }
-    if fill_event_order.slot.is_unknown() {
-        push_blocker_once(&mut blockers, "EXIT_FILL_EVENT_ORDER_SLOT_UNKNOWN");
-    }
-    if pool_state_order.event_seq_in_process > fill_event_order.event_seq_in_process {
-        push_blocker_once(
-            &mut blockers,
-            "EXIT_FILL_POOL_STATE_AFTER_EXIT_FILL_BOUNDARY",
-        );
-    } else if pool_state_order.event_seq_in_process == fill_event_order.event_seq_in_process {
-        push_blocker_once(
-            &mut blockers,
-            "EXIT_FILL_POOL_STATE_NOT_STRICTLY_BEFORE_EXIT_FILL_BOUNDARY",
-        );
-    }
-
-    match (
-        pool_state_order.slot.as_known(),
-        fill_event_order.slot.as_known(),
-    ) {
-        (Some(pool_slot), Some(fill_slot)) if pool_slot > fill_slot => {
-            push_blocker_once(
-                &mut blockers,
-                "EXIT_FILL_POOL_STATE_AFTER_EXIT_FILL_BOUNDARY",
-            );
-        }
-        (Some(pool_slot), Some(fill_slot)) if pool_slot == fill_slot => {
-            if pool_state_order.same_slot_ambiguous_with(fill_event_order) {
-                push_blocker_once(
-                    &mut blockers,
-                    "EXIT_FILL_POOL_STATE_SAME_SLOT_ORDER_AMBIGUOUS",
-                );
-            } else if let (Some(pool_tuple), Some(fill_tuple)) = (
-                chain_order_tuple(pool_state_order),
-                chain_order_tuple(fill_event_order),
-            ) {
-                if pool_tuple >= fill_tuple {
-                    push_blocker_once(
-                        &mut blockers,
-                        "EXIT_FILL_POOL_STATE_AFTER_EXIT_FILL_BOUNDARY",
-                    );
-                }
-            }
-        }
-        _ => {}
-    }
-
-    blockers
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4164,7 +4043,9 @@ fn shadow_v2_record_from_event(
 mod tests {
     use super::*;
     use ghost_core::account_state_core::types::StatePhase;
-    use ghost_core::CurveFinality;
+    use ghost_core::{
+        quote_constant_product, CurveFinality, ShadowV2QuoteSide, SHADOW_V2_PRICE_FORMULA_VERSION,
+    };
     use serde_json::{json, Value};
     use solana_sdk::pubkey::Pubkey;
 
@@ -5352,7 +5233,111 @@ mod tests {
             .contains(&"FILL_MODEL_STATIC_NOT_LIVE_CONFIRMED".to_string()));
         assert!(fill
             .limitations
-            .contains(&"SLIPPAGE_IS_CONFIGURED_TOLERANCE_NOT_REALIZED".to_string()));
+            .contains(&"REALIZED_SLIPPAGE_BPS_UNAVAILABLE_IN_L1".to_string()));
+        assert_eq!(fill.execution_simulation_ready, Some(true));
+        assert_eq!(fill.research_provenance_ready, Some(true));
+        assert_eq!(
+            fill.execution_label_grade,
+            Some(ShadowV2ExecutionLabelGrade::ResearchCandidate)
+        );
+        assert_eq!(fill.slippage_tolerance_bps, Some(250));
+        assert_eq!(
+            fill.deterministic_price_impact_bps,
+            Some(quote.own_impact_bps)
+        );
+        assert_eq!(fill.realized_slippage_bps, None);
+        assert_eq!(fill.quote_fill_divergence_bps, None);
+    }
+
+    #[test]
+    fn shadow_v2_execution_buy_filled_research_candidate_with_hash() {
+        let pool_state = account_state_pool_sample("pool-event-entry-research", 1);
+        let mut fill_order = event_order_key(Some(43), Some(2));
+        fill_order.event_seq_in_process = 2;
+
+        let fill = ShadowEntryFillV2::from_static_buy_model(
+            test_envelope("shadow_entry_fill_v2", "pos-a", "entry-fill-research"),
+            fill_order,
+            &pool_state,
+            &ShadowEntryFillModelConfig::bonding_curve(
+                1_000_000_000,
+                250,
+                100,
+                SHADOW_V2_ENTRY_FILL_MODEL_VERSION,
+            ),
+        );
+
+        assert_eq!(fill.fill_status, FillStatus::Filled);
+        assert_eq!(fill.execution_simulation_ready, Some(true));
+        assert_eq!(fill.research_provenance_ready, Some(true));
+        assert_eq!(
+            fill.execution_label_grade,
+            Some(ShadowV2ExecutionLabelGrade::ResearchCandidate)
+        );
+        assert_eq!(
+            fill.envelope.measurement_grade,
+            MeasurementGrade::ResearchGradeCandidate
+        );
+        assert!(fill.provenance_blockers.is_empty());
+    }
+
+    #[test]
+    fn shadow_v2_execution_quote_fill_divergence_is_none_in_l1() {
+        let pool_state = account_state_pool_sample("pool-event-entry-quote-divergence", 1);
+        let mut fill_order = event_order_key(Some(43), Some(2));
+        fill_order.event_seq_in_process = 2;
+
+        let fill = ShadowEntryFillV2::from_static_buy_model(
+            test_envelope(
+                "shadow_entry_fill_v2",
+                "pos-a",
+                "entry-fill-quote-divergence",
+            ),
+            fill_order,
+            &pool_state,
+            &ShadowEntryFillModelConfig::bonding_curve(
+                1_000_000_000,
+                250,
+                100,
+                SHADOW_V2_ENTRY_FILL_MODEL_VERSION,
+            ),
+        );
+
+        assert_eq!(fill.fill_status, FillStatus::Filled);
+        assert_eq!(fill.quote_fill_divergence_bps, None);
+        assert!(fill
+            .limitations
+            .contains(&"QUOTE_FILL_DIVERGENCE_UNAVAILABLE_IN_L1".to_string()));
+    }
+
+    #[test]
+    fn shadow_v2_execution_realized_slippage_is_none_in_l1() {
+        let pool_state = account_state_pool_sample("pool-event-entry-realized-slippage", 1);
+        let mut fill_order = event_order_key(Some(43), Some(2));
+        fill_order.event_seq_in_process = 2;
+
+        let fill = ShadowEntryFillV2::from_static_buy_model(
+            test_envelope(
+                "shadow_entry_fill_v2",
+                "pos-a",
+                "entry-fill-realized-slippage",
+            ),
+            fill_order,
+            &pool_state,
+            &ShadowEntryFillModelConfig::bonding_curve(
+                1_000_000_000,
+                250,
+                100,
+                SHADOW_V2_ENTRY_FILL_MODEL_VERSION,
+            ),
+        );
+
+        assert_eq!(fill.fill_status, FillStatus::Filled);
+        assert_eq!(fill.slippage_tolerance_bps, Some(250));
+        assert_eq!(fill.realized_slippage_bps, None);
+        assert!(fill
+            .limitations
+            .contains(&"REALIZED_SLIPPAGE_BPS_UNAVAILABLE_IN_L1".to_string()));
     }
 
     #[test]
@@ -5388,8 +5373,115 @@ mod tests {
         assert!(fill.fee_bps.is_some());
         assert_eq!(
             fill.reconstruction_status,
-            "ENTRY_FILL_RECONSTRUCTED_FROM_POOL_STATE"
+            "BUY_FILL_RECONSTRUCTED_BY_L1_EXECUTION_ENGINE"
         );
+    }
+
+    #[test]
+    fn shadow_v2_execution_buy_filled_diagnostic_without_hash() {
+        let mut pool_state = account_state_pool_sample("pool-event-entry-no-hash", 1);
+        pool_state.account_data_hash = None;
+        let mut fill_order = event_order_key(Some(43), Some(2));
+        fill_order.event_seq_in_process = 2;
+        let config = ShadowEntryFillModelConfig::bonding_curve(
+            1_000_000_000,
+            250,
+            100,
+            SHADOW_V2_ENTRY_FILL_MODEL_VERSION,
+        );
+
+        let fill = ShadowEntryFillV2::from_static_buy_model(
+            test_envelope("shadow_entry_fill_v2", "pos-a", "entry-fill-no-hash"),
+            fill_order,
+            &pool_state,
+            &config,
+        );
+
+        assert_eq!(fill.fill_status, FillStatus::Filled);
+        assert_eq!(
+            fill.envelope.measurement_grade,
+            MeasurementGrade::DiagnosticOnly
+        );
+        assert_eq!(fill.execution_simulation_ready, Some(true));
+        assert_eq!(fill.research_provenance_ready, Some(false));
+        assert_eq!(
+            fill.execution_label_grade,
+            Some(ShadowV2ExecutionLabelGrade::DiagnosticSim)
+        );
+        assert!(fill.fill_price.is_some());
+        assert!(fill.pool_state_after.is_some());
+        assert!(fill
+            .provenance_blockers
+            .contains(&"POOL_STATE_ACCOUNT_DATA_HASH_UNAVAILABLE_IN_RUNTIME".to_string()));
+        assert_eq!(fill.realized_slippage_bps, None);
+        assert_eq!(fill.quote_fill_divergence_bps, None);
+    }
+
+    #[test]
+    fn shadow_v2_execution_min_out_returns_no_fill_without_fill_price() {
+        let pool_state = account_state_pool_sample("pool-event-entry-min-out", 1);
+        let reserves =
+            reserves_from_pool_state(&pool_state, ShadowV2PoolPhase::BondingCurve).unwrap();
+        let quote = quote_constant_product(
+            ShadowV2PoolPhase::BondingCurve,
+            ShadowV2QuoteSide::Buy,
+            reserves,
+            1_000_000_000,
+            100,
+            250,
+        )
+        .unwrap();
+        let mut fill_order = event_order_key(Some(43), Some(2));
+        fill_order.event_seq_in_process = 2;
+
+        let outcome = ShadowV2FillEngine::simulate(ShadowV2ExecutionInput {
+            side: ShadowV2ExecutionSide::Buy,
+            pool_phase: ShadowV2PoolPhase::BondingCurve,
+            pool_state_before: Some(&pool_state),
+            boundary_kind: ShadowV2BoundaryKind::EntryBefore,
+            event_order_key: fill_order,
+            input_amount_raw: Some(1_000_000_000),
+            min_out_raw: Some(quote.expected_output_amount + 1),
+            fee_bps: Some(100),
+            slippage_tolerance_bps: Some(250),
+            model_version: SHADOW_V2_ENTRY_FILL_MODEL_VERSION.to_string(),
+        });
+
+        assert_eq!(outcome.fill_status, FillStatus::NoFill);
+        assert_eq!(
+            outcome.no_fill_reason,
+            Some(ShadowV2NoFillReason::MinOutNotMet)
+        );
+        assert_eq!(outcome.fill_price, None);
+        assert_eq!(outcome.pool_state_after_derived, None);
+        assert_eq!(
+            outcome.expected_output_raw,
+            Some(quote.expected_output_amount)
+        );
+        assert_eq!(outcome.min_out_raw, Some(quote.expected_output_amount + 1));
+    }
+
+    #[test]
+    fn shadow_v2_execution_missing_pool_state_blocks() {
+        let outcome = ShadowV2FillEngine::simulate(ShadowV2ExecutionInput {
+            side: ShadowV2ExecutionSide::Buy,
+            pool_phase: ShadowV2PoolPhase::BondingCurve,
+            pool_state_before: None,
+            boundary_kind: ShadowV2BoundaryKind::EntryBefore,
+            event_order_key: event_order_key(Some(43), Some(2)),
+            input_amount_raw: Some(1_000_000_000),
+            min_out_raw: None,
+            fee_bps: Some(100),
+            slippage_tolerance_bps: Some(250),
+            model_version: SHADOW_V2_ENTRY_FILL_MODEL_VERSION.to_string(),
+        });
+
+        assert_eq!(outcome.fill_status, FillStatus::BlockedByData);
+        assert_eq!(outcome.execution_simulation_ready, false);
+        assert!(outcome
+            .blocked_reasons
+            .contains(&"BLOCKED_POOL_STATE_MISSING".to_string()));
+        assert!(outcome.fill_price.is_none());
     }
 
     #[test]
@@ -5420,9 +5512,9 @@ mod tests {
             MeasurementGrade::BlockedByData
         );
         for expected in [
-            "POOL_STATE_ACCOUNT_DATA_HASH_MISSING",
-            "ENTRY_FILL_RESERVE_PROVENANCE_MISSING_FOR_PHASE",
-            "ENTRY_FILL_POOL_STATE_TEMPORAL_CLASS_NOT_ALLOWED_FOR_ENTRY_CAUSAL_BOUNDARY",
+            "POOL_STATE_ACCOUNT_DATA_HASH_UNAVAILABLE_IN_RUNTIME",
+            "BLOCKED_POOL_STATE_INCOMPLETE",
+            "BUY_POOL_STATE_TEMPORAL_CLASS_NOT_ALLOWED=Outcome",
         ] {
             assert!(
                 fill.limitations.contains(&expected.to_string()),
@@ -5456,7 +5548,7 @@ mod tests {
         assert_eq!(fill.fill_status, FillStatus::BlockedByData);
         assert!(fill
             .limitations
-            .contains(&"ENTRY_FILL_POOL_STATE_AFTER_ENTRY_FILL_BOUNDARY".to_string()));
+            .contains(&"ENTRY_FILL_POOL_STATE_NOT_STRICTLY_BEFORE_FILL_BOUNDARY".to_string()));
         assert!(fill.fill_price.is_none());
         assert!(fill.pool_state_after.is_none());
     }
@@ -5491,6 +5583,34 @@ mod tests {
             .contains(&"ENTRY_FILL_POOL_STATE_SAME_SLOT_ORDER_AMBIGUOUS".to_string()));
         assert!(fill.fill_price.is_none());
         assert!(fill.pool_state_after.is_none());
+    }
+
+    #[test]
+    fn shadow_v2_execution_same_slot_ambiguity_blocks() {
+        let mut pool_state = account_state_pool_sample("pool-event-execution-same-slot", 1);
+        pool_state.event_order_key.transaction_index_or_unknown = EventOrderComponent::unknown();
+        let mut fill_order = event_order_key(Some(42), Some(2));
+        fill_order.event_seq_in_process = 2;
+
+        let outcome = ShadowV2FillEngine::simulate(ShadowV2ExecutionInput {
+            side: ShadowV2ExecutionSide::Buy,
+            pool_phase: ShadowV2PoolPhase::BondingCurve,
+            pool_state_before: Some(&pool_state),
+            boundary_kind: ShadowV2BoundaryKind::EntryBefore,
+            event_order_key: fill_order,
+            input_amount_raw: Some(1_000_000_000),
+            min_out_raw: None,
+            fee_bps: Some(100),
+            slippage_tolerance_bps: Some(250),
+            model_version: SHADOW_V2_ENTRY_FILL_MODEL_VERSION.to_string(),
+        });
+
+        assert_eq!(outcome.fill_status, FillStatus::BlockedByData);
+        assert_eq!(outcome.execution_simulation_ready, false);
+        assert!(outcome
+            .blocked_reasons
+            .contains(&"ENTRY_FILL_POOL_STATE_SAME_SLOT_ORDER_AMBIGUOUS".to_string()));
+        assert!(outcome.fill_price.is_none());
     }
 
     #[test]
@@ -5617,7 +5737,20 @@ mod tests {
             .contains(&"STATIC_EXIT_FILL_DOES_NOT_ENABLE_ACTIVE_CLOSE".to_string()));
         assert!(fill
             .limitations
-            .contains(&"EXIT_SLIPPAGE_IS_CONFIGURED_TOLERANCE_NOT_REALIZED".to_string()));
+            .contains(&"REALIZED_SLIPPAGE_BPS_UNAVAILABLE_IN_L1".to_string()));
+        assert_eq!(fill.execution_simulation_ready, Some(true));
+        assert_eq!(fill.research_provenance_ready, Some(true));
+        assert_eq!(
+            fill.execution_label_grade,
+            Some(ShadowV2ExecutionLabelGrade::ResearchCandidate)
+        );
+        assert_eq!(fill.slippage_tolerance_bps, Some(150));
+        assert_eq!(
+            fill.deterministic_price_impact_bps,
+            Some(quote.own_impact_bps)
+        );
+        assert_eq!(fill.realized_slippage_bps, None);
+        assert_eq!(fill.quote_fill_divergence_bps, None);
     }
 
     #[test]
@@ -5653,8 +5786,51 @@ mod tests {
         assert!(fill.fee_bps.is_some());
         assert_eq!(
             fill.reconstruction_status,
-            "EXIT_FILL_RECONSTRUCTED_FROM_POOL_STATE"
+            "SELL_FILL_RECONSTRUCTED_BY_L1_EXECUTION_ENGINE"
         );
+    }
+
+    #[test]
+    fn shadow_v2_execution_sell_filled_diagnostic_without_hash() {
+        let mut pool_state = post_entry_pool_sample("pool-event-exit-no-hash", 2, 44, 1);
+        pool_state.account_data_hash = None;
+        let mut fill_order = event_order_key(Some(45), Some(2));
+        fill_order.event_seq_in_process = 3;
+        let config = ShadowExitFillModelConfig::bonding_curve(
+            10_000_000_000,
+            150,
+            100,
+            SHADOW_V2_EXIT_FILL_MODEL_VERSION,
+        );
+
+        let fill = ShadowExitFillV2::from_static_sell_model(
+            test_envelope("shadow_exit_fill_v2", "pos-a", "exit-fill-no-hash"),
+            fill_order,
+            &pool_state,
+            &config,
+        );
+
+        assert_eq!(fill.fill_status, FillStatus::Filled);
+        assert_eq!(
+            fill.envelope.measurement_grade,
+            MeasurementGrade::DiagnosticOnly
+        );
+        assert_eq!(fill.execution_simulation_ready, Some(true));
+        assert_eq!(fill.research_provenance_ready, Some(false));
+        assert_eq!(
+            fill.execution_label_grade,
+            Some(ShadowV2ExecutionLabelGrade::DiagnosticSim)
+        );
+        assert!(fill.fill_price.is_some());
+        assert!(fill.pool_state_after.is_some());
+        assert!(fill
+            .provenance_blockers
+            .contains(&"POOL_STATE_ACCOUNT_DATA_HASH_UNAVAILABLE_IN_RUNTIME".to_string()));
+        assert!(fill
+            .limitations
+            .contains(&"STATIC_EXIT_FILL_DOES_NOT_ENABLE_ACTIVE_CLOSE".to_string()));
+        assert_eq!(fill.realized_slippage_bps, None);
+        assert_eq!(fill.quote_fill_divergence_bps, None);
     }
 
     #[test]
@@ -5679,7 +5855,7 @@ mod tests {
         assert_eq!(future_fill.fill_status, FillStatus::BlockedByData);
         assert!(future_fill
             .limitations
-            .contains(&"EXIT_FILL_POOL_STATE_AFTER_EXIT_FILL_BOUNDARY".to_string()));
+            .contains(&"EXIT_FILL_POOL_STATE_NOT_STRICTLY_BEFORE_FILL_BOUNDARY".to_string()));
 
         let mut ambiguous_pool_state =
             post_entry_pool_sample("pool-event-exit-ambiguous", 2, 45, 1);
