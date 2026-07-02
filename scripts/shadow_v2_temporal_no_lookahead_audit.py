@@ -27,6 +27,30 @@ CHAIN_COMPONENTS = [
     "observed_at_wall_ms",
 ]
 
+ORDERING_REQUIRED_SCHEMAS = {
+    "pool_state_sample_v2",
+    "shadow_entry_attempt_v2",
+    "shadow_entry_fill_v2",
+    "shadow_path_sample_v2",
+    "shadow_exit_attempt_v2",
+    "shadow_exit_fill_v2",
+    "shadow_terminal_truth_v2",
+}
+
+ORDERING_EXEMPTIONS_BY_SCHEMA = {
+    "shadow_position_v2": {
+        "ORDERING_EXEMPT_POSITION_CREATED",
+        "ORDERING_EXEMPT_VALIDATION_SMOKE_MARKER",
+    }
+}
+
+
+def ordering_exemption(row: dict) -> str | None:
+    value = row.get("ordering_exemption")
+    if isinstance(value, str) and value:
+        return value
+    return None
+
 
 def main() -> int:
     args = parser("Offline Shadow V2 temporal/no-lookahead audit").parse_args()
@@ -36,8 +60,12 @@ def main() -> int:
     temporal_by_schema: dict[str, Counter[str]] = defaultdict(Counter)
     clock_by_schema: dict[str, Counter[str]] = defaultdict(Counter)
     event_order_present = 0
-    event_order_missing = 0
+    event_order_exempt = 0
+    event_order_missing_required = 0
+    event_order_missing_unclassified = 0
     unknown_components: Counter[str] = Counter()
+    ordering_exemption_counts: Counter[str] = Counter()
+    missing_required_examples: list[dict[str, str | None]] = []
     seq_by_position: dict[str, list[int]] = defaultdict(list)
     non_monotonic = 0
     post_entry_pre_decision_violation = 0
@@ -58,7 +86,31 @@ def main() -> int:
             if isinstance(seq, int) and pos:
                 seq_by_position[pos].append(seq)
         else:
-            event_order_missing += 1
+            exemption = ordering_exemption(row)
+            allowed_exemptions = ORDERING_EXEMPTIONS_BY_SCHEMA.get(schema, set())
+            if exemption in allowed_exemptions:
+                event_order_exempt += 1
+                ordering_exemption_counts[exemption] += 1
+            elif schema in ORDERING_REQUIRED_SCHEMAS:
+                event_order_missing_required += 1
+                if len(missing_required_examples) < 10:
+                    missing_required_examples.append(
+                        {
+                            "schema": schema,
+                            "event_id": str(env.get("event_id") or ""),
+                            "position_id": position_id(row),
+                        }
+                    )
+            else:
+                event_order_missing_unclassified += 1
+                if len(missing_required_examples) < 10:
+                    missing_required_examples.append(
+                        {
+                            "schema": schema,
+                            "event_id": str(env.get("event_id") or ""),
+                            "position_id": position_id(row),
+                        }
+                    )
         if schema in {"shadow_entry_attempt_v2", "shadow_entry_fill_v2"}:
             if env.get("temporal_class") in {"PRE_DETECTION", "PRE_DECISION", "AT_DECISION"}:
                 post_entry_pre_decision_violation += 1
@@ -74,9 +126,19 @@ def main() -> int:
         refs = envelope(row).get("source_refs") or []
         if any(str(ref).startswith("shadow_replay_v2:") or str(ref).startswith("shadow_lifecycle_v2:") for ref in refs):
             derived_as_canonical_input += 1
-    if malformed or replay_malformed or lifecycle_malformed or post_entry_pre_decision_violation or terminal_pre_entry_violation or non_monotonic or derived_as_canonical_input:
+    if (
+        malformed
+        or replay_malformed
+        or lifecycle_malformed
+        or event_order_missing_required
+        or event_order_missing_unclassified
+        or post_entry_pre_decision_violation
+        or terminal_pre_entry_violation
+        or non_monotonic
+        or derived_as_canonical_input
+    ):
         verdict = "FAIL_LOOKAHEAD_OR_ORDERING_VIOLATION"
-    elif unknown_components or event_order_missing:
+    elif unknown_components:
         verdict = "BLOCKED_TEMPORAL_AMBIGUITY_REMAINS"
     else:
         verdict = "PASS_TEMPORAL_NO_LOOKAHEAD_AUDIT"
@@ -89,7 +151,13 @@ def main() -> int:
         "temporal_class_values_per_event_family": {k: dict(v) for k, v in temporal_by_schema.items()},
         "clock_domain_values_per_event_family": {k: dict(v) for k, v in clock_by_schema.items()},
         "event_order_key_present_rows": event_order_present,
-        "event_order_key_missing_rows": event_order_missing,
+        "event_order_key_exempt_rows": event_order_exempt,
+        "event_order_key_missing_required_rows": event_order_missing_required,
+        "event_order_key_missing_unclassified_rows": event_order_missing_unclassified,
+        "event_order_key_missing_rows": event_order_missing_required
+        + event_order_missing_unclassified,
+        "ordering_exemption_counts": dict(ordering_exemption_counts),
+        "missing_required_event_order_examples": missing_required_examples,
         "explicit_unknown_chain_order_components": dict(unknown_components),
         "non_monotonic_event_seq_in_process": non_monotonic,
         "post_entry_fields_used_in_pre_decision_context": post_entry_pre_decision_violation,
