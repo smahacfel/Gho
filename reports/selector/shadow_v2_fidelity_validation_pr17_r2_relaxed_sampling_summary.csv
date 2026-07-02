@@ -1,0 +1,98 @@
+metric,value,status,notes
+run_id,shadow-burnin-v2-fidelity-validation-pr17-r2-relaxed-sampling,INFO,relaxed validation sampling burnin
+final_verdict,PASS_REAL_SHADOW_V2_POSITION_EVIDENCE_PRESENT_WITH_LIMITATIONS,PASS,primary success condition real_shadow_v2_positions > 0 satisfied
+profile_label,RELAXED_VALIDATION_SAMPLING_PROFILE,PASS,local validation config only
+not_production_policy,true,PASS,NOT_PRODUCTION_POLICY
+not_strategy_evidence,true,PASS,NOT_STRATEGY_EVIDENCE
+not_edge_proof,true,PASS,NOT_EDGE_PROOF
+not_runtime_approval,true,PASS,NOT_RUNTIME_APPROVAL
+not_live_equivalent,true,PASS,NOT_LIVE_EQUIVALENT
+main_head,286a1f76f5c5fd632800f60afa6b4be98066eec7,PASS,baseline requirement satisfied
+scope_root,reports/selector/shadow-v2-fidelity-validation-pr17-r2-relaxed-sampling,INFO,raw local scope not staged
+local_configs_used,true,INFO,*.local.toml files used and not staged
+ghost_brain_config_path,/root/Gho/configs/rollout/ghost_brain_shadow_v2_fidelity_validation_pr17_r2_relaxed_sampling.local.toml,INFO,from runtime evidence
+brain_config_hash,059f8a837ac33f9ad3f8d637b700482f0155d1a0258d0b6cebf6f2df04f8ae54,INFO,from shadow logs
+min_tx_count,10,PASS,relaxed validation sampling threshold
+min_unique_signers,6,PASS,relaxed validation sampling threshold
+min_buy_count,5,PASS,relaxed validation sampling threshold
+max_wait_time_ms,10000,PASS,relaxed validation sampling threshold
+min_market_cap_sol,10.0,PASS,relaxed validation sampling threshold
+min_bonding_progress_pct,10.0,PASS,relaxed validation sampling threshold
+max_bonding_progress_pct,100.0,PASS,relaxed validation sampling threshold
+min_total_volume_sol,0.0,PASS,additional sampling relaxation
+min_consecutive_buys,1,PASS,additional sampling relaxation
+shadow_v2_burnin_enabled,true,PASS,enabled in local brain config
+shadow_v2_burnin_logging_only,true,PASS,logging_only in local brain config
+runtime_approval,false,PASS,no runtime approval granted
+shadow_close_only_approval,false,PASS,no shadow_close_only approval granted
+active_close_approval,false,PASS,no active close approval granted
+strategy_research_unblocked,false,PASS,no strategy proof or promotion
+live_equivalence,NOT_GRANTED,PASS,no live-equivalence claim
+pre_run_manifest_status,PASS,PASS,pre_run_manifest blockers empty
+pre_run_strict_audit,PASS,PASS,no blockers
+validation_burnin_plan_audit,PASS,PASS,validation_mode=FIDELITY_ONLY and strategy_proof_enabled=false
+legacy_downgrade_audit,PASS,PASS,v1_live_equivalent_allowed=false
+cargo_build_ghost_launcher_release,PASS,PASS,cargo build -p ghost-launcher --bin ghost-launcher --release
+launcher_preflight,PASS,PASS,Spectrum RPC and NLN primary gRPC probe passed
+run_start_utc,2026-07-01T23:50:13.944Z,INFO,All components started successfully
+shutdown_signal_utc,2026-07-01T23:51:49.772Z,INFO,SIGINT only
+final_shutdown_utc,2026-07-01T23:52:12.684Z,PASS,Ghost Launcher shutdown complete
+process_exit_code,0,PASS,launcher exited cleanly
+nln_grpc_endpoint,grpc.nln.clr3.org:443,PASS,primary gRPC ingest stream established
+nln_program_stream_endpoint,events.nln.clr3.org:443,PASS,Program Streams no subscribe failure observed
+spectrum_rpc_used,true,PASS,Spectrum RPC used for validation config
+gatekeeper_decision_rows,114,INFO,local logs only not staged
+gatekeeper_decision_malformed_rows,0,PASS,local logs only not staged
+gatekeeper_decision_buy_true,1,PASS,real accepted shadow handoff generated
+decision_plane_legacy_live_rows,74,INFO,local decision logs
+decision_plane_v25_shadow_rows,40,INFO,local decision logs
+shadow_position_event_v2_rows,2,PASS,marker plus real position
+shadow_replay_v2_rows,2,PASS,marker plus real position derived replay
+shadow_lifecycle_v2_rows,2,PASS,marker plus real position derived lifecycle
+shadow_path_density_v2_rows,14,PASS_INFRA,density rows produced
+shadow_path_density_not_evaluable_no_coverage,14,LIMITATION,no real V2 path samples
+shadow_path_density_path_points_sum,0,LIMITATION,path samples not emitted in V2
+post_run_manifest_status,PASS,PASS,post_run_manifest blockers empty
+post_run_manifest_blockers,0,PASS,blockers=[]
+post_run_manifest_file_artifact_count,6,PASS,artifact count in written manifest
+post_run_strict_audit,PASS,PASS,strict scan artifact_count=7 and blockers=[]
+post_run_schema_shadow_position_event_v2,2,PASS,schema coverage from post_run_manifest
+post_run_schema_shadow_replay_v2,2,PASS,schema coverage from post_run_manifest
+post_run_schema_shadow_lifecycle_v2,2,PASS,schema coverage from post_run_manifest
+post_run_schema_shadow_path_density_v2,14,PASS,schema coverage from post_run_manifest
+clean_shutdown_proven,true,PASS,All components shut down successfully and Ghost Launcher shutdown complete
+sigterm_used,false,PASS,no SIGTERM sent or observed
+transport_channel_disconnected_count,0,PASS,no reconnect disconnect flood
+nln_subscribe_request_failed_count,0,PASS,no Program Streams subscribe failure
+bad_gateway_count,0,PASS,no 502 Bad Gateway observed
+diagnostic_marker_positions,1,INFO,VALIDATION_SMOKE_MARKER
+real_shadow_v2_positions,1,PASS,primary success condition satisfied
+real_position_pool_id,2ttPHhPR7rF98eug3F9rjaNR96fsDU2AEArGK5q78Une,INFO,real accepted shadow handoff
+real_position_base_mint,HhCYSPYhNWmYkzpcjdWnVoDfgPbuHGVGSyomeei4pump,INFO,real accepted shadow handoff
+real_position_measurement_grade,DIAGNOSTIC_ONLY,LIMITATION,canonical V2 position is not research-grade fill evidence
+real_position_quality,VALIDATION_HARNESS_POSITION_CREATED,PASS,real position_created V2 row exists
+entry_evidence_present,true,PASS,legacy shadow_entries.jsonl row exists
+entry_evidence_source,legacy_shadow_entries_jsonl,LIMITATION,not canonical shadow_entry_fill_v2
+entry_price,7.541744196631089e-08,INFO,from legacy shadow entry log
+entry_simulation_present,true,PASS,buys.jsonl row exists with err=null
+decision_to_sim_start_ms,8170,INFO,from buys.jsonl
+shadow_duration_ms,262,INFO,from buys.jsonl
+entry_token_amount_raw,92816725382,INFO,from buys.jsonl
+entry_simulation_rpc_slot,430194027,INFO,from buys.jsonl/lifecycle
+canonical_v2_entry_fill_present,false,LIMITATION,shadow_entry_fill_v2 not emitted
+exit_evidence_present,true,PASS,legacy shadow_lifecycle.jsonl exit_filled and position_closed rows exist
+exit_evidence_source,legacy_shadow_lifecycle_jsonl,LIMITATION,not canonical shadow_exit_fill_v2
+close_reason,TimeStop,INFO,legacy shadow lifecycle
+duration_ms,30375,INFO,legacy shadow lifecycle
+final_pnl_pct,-17.154999999999998,INFO,legacy shadow lifecycle
+truth_source,canonical_account_state_snapshot,INFO,legacy shadow lifecycle
+truth_status,resolved,INFO,legacy shadow lifecycle
+sample_age_ms,0,INFO,legacy shadow lifecycle
+canonical_v2_exit_fill_present,false,LIMITATION,shadow_exit_fill_v2 not emitted
+canonical_v2_terminal_truth_present,false,LIMITATION,shadow_terminal_truth_v2 not emitted
+replay_lifecycle_tied_to_real_position,true,PASS,derived replay/lifecycle high-watermark points to real position_created row
+replay_lifecycle_terminal_complete,false,LIMITATION,derived open-only no canonical terminal truth
+raw_jsonl_staged,false,PASS,raw scope artifacts not staged
+logs_staged,false,PASS,logs not staged
+r51_touched,false,PASS,R51 not touched
+pr17_r2_status,PASS_WITH_LIMITATIONS,PASS,real position evidence present but full V2 fill/path terminal contract still missing
