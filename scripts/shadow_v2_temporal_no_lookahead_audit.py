@@ -27,6 +27,13 @@ CHAIN_COMPONENTS = [
     "observed_at_wall_ms",
 ]
 
+CHAIN_ORDER_VALUE_CLASSIFICATIONS = {
+    "UNKNOWN",
+    "NOT_APPLICABLE",
+    "DERIVED",
+    "RUNTIME_LOCAL",
+}
+
 ORDERING_REQUIRED_SCHEMAS = {
     "pool_state_sample_v2",
     "shadow_entry_attempt_v2",
@@ -64,6 +71,9 @@ def main() -> int:
     event_order_missing_required = 0
     event_order_missing_unclassified = 0
     unknown_components: Counter[str] = Counter()
+    not_applicable_components: Counter[str] = Counter()
+    derived_components: Counter[str] = Counter()
+    runtime_local_components: Counter[str] = Counter()
     ordering_exemption_counts: Counter[str] = Counter()
     missing_required_examples: list[dict[str, str | None]] = []
     seq_by_position: dict[str, list[int]] = defaultdict(list)
@@ -79,8 +89,15 @@ def main() -> int:
         if eok:
             event_order_present += 1
             for component in CHAIN_COMPONENTS:
-                if eok.get(component) == "UNKNOWN" or eok.get(component) is None:
+                value = eok.get(component)
+                if value == "UNKNOWN" or value is None:
                     unknown_components[component] += 1
+                elif value == "NOT_APPLICABLE":
+                    not_applicable_components[component] += 1
+                elif value == "DERIVED":
+                    derived_components[component] += 1
+                elif value == "RUNTIME_LOCAL":
+                    runtime_local_components[component] += 1
             seq = eok.get("event_seq_in_process")
             pos = position_id(row)
             if isinstance(seq, int) and pos:
@@ -142,6 +159,11 @@ def main() -> int:
         verdict = "BLOCKED_TEMPORAL_AMBIGUITY_REMAINS"
     else:
         verdict = "PASS_TEMPORAL_NO_LOOKAHEAD_AUDIT"
+    not_applicable_or_derived_count = (
+        sum(not_applicable_components.values())
+        + sum(derived_components.values())
+        + sum(runtime_local_components.values())
+    )
     result = {
         "audit": "temporal_no_lookahead",
         "scope_root": args.scope_root,
@@ -159,6 +181,11 @@ def main() -> int:
         "ordering_exemption_counts": dict(ordering_exemption_counts),
         "missing_required_event_order_examples": missing_required_examples,
         "explicit_unknown_chain_order_components": dict(unknown_components),
+        "unknown_but_required_for_research_count": sum(unknown_components.values()),
+        "not_applicable_chain_order_components": dict(not_applicable_components),
+        "derived_chain_order_components": dict(derived_components),
+        "runtime_local_chain_order_components": dict(runtime_local_components),
+        "not_applicable_or_derived_chain_components_count": not_applicable_or_derived_count,
         "non_monotonic_event_seq_in_process": non_monotonic,
         "post_entry_fields_used_in_pre_decision_context": post_entry_pre_decision_violation,
         "terminal_truth_used_as_pre_entry_evidence": terminal_pre_entry_violation,

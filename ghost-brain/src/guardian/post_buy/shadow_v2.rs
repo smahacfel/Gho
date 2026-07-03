@@ -242,14 +242,19 @@ pub enum ShadowLifecycleEventTypeV2 {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum EventOrderUnknown {
     Unknown,
+    NotApplicable,
+    Derived,
+    RuntimeLocal,
 }
 
 /// Typed chain-order component used by `EventOrderKey`.
 ///
 /// Serialization intentionally preserves the schema contract shape: known
-/// numeric/string components serialize as their raw value, and missing chain
-/// ordering serializes as the literal `UNKNOWN`. A missing JSON field is a
-/// schema error instead of an implicit unknown.
+/// numeric/string components serialize as their raw value. Missing chain
+/// ordering serializes as the literal `UNKNOWN`. Non-chain-observed components
+/// may be explicitly classified as `NOT_APPLICABLE`, `DERIVED`, or
+/// `RUNTIME_LOCAL`; those values are never treated as known chain order. A
+/// missing JSON field is a schema error instead of an implicit unknown.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum EventOrderComponent<T> {
@@ -266,6 +271,18 @@ impl<T> EventOrderComponent<T> {
         Self::Unknown(EventOrderUnknown::Unknown)
     }
 
+    pub fn not_applicable() -> Self {
+        Self::Unknown(EventOrderUnknown::NotApplicable)
+    }
+
+    pub fn derived() -> Self {
+        Self::Unknown(EventOrderUnknown::Derived)
+    }
+
+    pub fn runtime_local() -> Self {
+        Self::Unknown(EventOrderUnknown::RuntimeLocal)
+    }
+
     pub fn as_known(&self) -> Option<&T> {
         match self {
             Self::Known(value) => Some(value),
@@ -274,7 +291,17 @@ impl<T> EventOrderComponent<T> {
     }
 
     pub fn is_unknown(&self) -> bool {
-        matches!(self, Self::Unknown(_))
+        matches!(self, Self::Unknown(EventOrderUnknown::Unknown))
+    }
+
+    pub fn non_known_classification(&self) -> Option<&'static str> {
+        match self {
+            Self::Known(_) => None,
+            Self::Unknown(EventOrderUnknown::Unknown) => Some("UNKNOWN"),
+            Self::Unknown(EventOrderUnknown::NotApplicable) => Some("NOT_APPLICABLE"),
+            Self::Unknown(EventOrderUnknown::Derived) => Some("DERIVED"),
+            Self::Unknown(EventOrderUnknown::RuntimeLocal) => Some("RUNTIME_LOCAL"),
+        }
     }
 }
 
@@ -327,20 +354,64 @@ impl EventOrderKey {
         unknown
     }
 
+    pub fn not_applicable_or_derived_chain_order_components(&self) -> Vec<String> {
+        let mut classified = Vec::new();
+        for (name, classification) in [
+            ("slot", self.slot.non_known_classification()),
+            ("block_time", self.block_time.non_known_classification()),
+            ("signature", self.signature.non_known_classification()),
+            (
+                "transaction_index_or_unknown",
+                self.transaction_index_or_unknown.non_known_classification(),
+            ),
+            (
+                "instruction_index_or_unknown",
+                self.instruction_index_or_unknown.non_known_classification(),
+            ),
+            (
+                "inner_instruction_index_or_unknown",
+                self.inner_instruction_index_or_unknown
+                    .non_known_classification(),
+            ),
+            (
+                "log_index_or_unknown",
+                self.log_index_or_unknown.non_known_classification(),
+            ),
+        ] {
+            if let Some(classification @ ("NOT_APPLICABLE" | "DERIVED" | "RUNTIME_LOCAL")) =
+                classification
+            {
+                classified.push(format!("{name}:{classification}"));
+            }
+        }
+        classified
+    }
+
     pub fn has_explicit_unknown_chain_order(&self) -> bool {
         !self.explicit_unknown_chain_order_components().is_empty()
     }
 
     pub fn ambiguity_labels(&self) -> Vec<String> {
         let unknown = self.explicit_unknown_chain_order_components();
-        if unknown.is_empty() {
-            return Vec::new();
+        let classified = self.not_applicable_or_derived_chain_order_components();
+        let mut labels = Vec::new();
+        if !unknown.is_empty() {
+            labels.push("EVENT_ORDER_EXPLICIT_UNKNOWN_CHAIN_COMPONENT".to_string());
+            labels.push(format!(
+                "EVENT_ORDER_UNKNOWN_COMPONENTS={}",
+                unknown.join("|")
+            ));
+            labels.push("EVENT_ORDER_UNKNOWN_BUT_REQUIRED_FOR_RESEARCH".to_string());
+            labels.push("EVENT_ORDER_INTRA_SLOT_AMBIGUITY_REQUIRES_TIE_BREAK".to_string());
         }
-        vec![
-            "EVENT_ORDER_EXPLICIT_UNKNOWN_CHAIN_COMPONENT".to_string(),
-            format!("EVENT_ORDER_UNKNOWN_COMPONENTS={}", unknown.join("|")),
-            "EVENT_ORDER_INTRA_SLOT_AMBIGUITY_REQUIRES_TIE_BREAK".to_string(),
-        ]
+        if !classified.is_empty() {
+            labels.push("EVENT_ORDER_CHAIN_COMPONENT_CLASSIFIED_NOT_CHAIN_OBSERVED".to_string());
+            labels.push(format!(
+                "EVENT_ORDER_NON_CHAIN_COMPONENTS={}",
+                classified.join("|")
+            ));
+        }
+        labels
     }
 
     pub fn has_complete_chain_order(&self) -> bool {
@@ -1279,6 +1350,37 @@ impl PoolStateSampleV2 {
         }
         if self.event_order_key.slot.is_unknown() {
             blockers.push("EVENT_ORDER_SLOT_UNKNOWN".to_string());
+        }
+        for component in self
+            .event_order_key
+            .explicit_unknown_chain_order_components()
+        {
+            match component {
+                "slot" => {}
+                "block_time" => blockers.push("EVENT_ORDER_BLOCK_TIME_UNKNOWN".to_string()),
+                "signature" => blockers.push("EVENT_ORDER_SIGNATURE_UNKNOWN".to_string()),
+                "transaction_index_or_unknown" => {
+                    blockers.push("EVENT_ORDER_TRANSACTION_INDEX_UNKNOWN".to_string())
+                }
+                "instruction_index_or_unknown" => {
+                    blockers.push("EVENT_ORDER_INSTRUCTION_INDEX_UNKNOWN".to_string())
+                }
+                "inner_instruction_index_or_unknown" => {
+                    blockers.push("EVENT_ORDER_INNER_INSTRUCTION_INDEX_UNKNOWN".to_string())
+                }
+                "log_index_or_unknown" => {
+                    blockers.push("EVENT_ORDER_LOG_INDEX_UNKNOWN".to_string())
+                }
+                _ => blockers.push(format!("EVENT_ORDER_COMPONENT_UNKNOWN:{component}")),
+            }
+        }
+        for component in self
+            .event_order_key
+            .not_applicable_or_derived_chain_order_components()
+        {
+            blockers.push(format!(
+                "EVENT_ORDER_COMPONENT_NOT_CHAIN_OBSERVED:{component}"
+            ));
         }
         for component in self.event_order_key.missing_chain_order_components() {
             match component {
@@ -4687,6 +4789,23 @@ mod tests {
     }
 
     #[test]
+    fn shadow_v2_event_order_seq_alone_is_not_l2_chain_order() {
+        let mut lhs = event_order_key(Some(42), None);
+        let mut rhs = event_order_key(Some(42), None);
+        lhs.event_seq_in_process = 10;
+        rhs.event_seq_in_process = 11;
+
+        assert!(lhs.is_after_process_seq(9));
+        assert!(rhs.is_after_process_seq(lhs.event_seq_in_process));
+        assert!(!lhs.has_complete_chain_order());
+        assert!(!rhs.has_complete_chain_order());
+        assert!(lhs.same_slot_ambiguous_with(&rhs));
+        assert!(lhs
+            .ambiguity_labels()
+            .contains(&"EVENT_ORDER_UNKNOWN_BUT_REQUIRED_FOR_RESEARCH".to_string()));
+    }
+
+    #[test]
     fn clocked_timestamp_preserves_domain_and_boundary() {
         let ts = ClockedTimestamp {
             field_name: "decision_ts_ms".to_string(),
@@ -5450,21 +5569,68 @@ mod tests {
             6,
         );
 
-        assert!(sample.research_blockers().is_empty());
+        let blockers = sample.research_blockers();
+        for expected in [
+            "EVENT_ORDER_SIGNATURE_UNKNOWN",
+            "EVENT_ORDER_TRANSACTION_INDEX_UNKNOWN",
+            "EVENT_ORDER_INSTRUCTION_INDEX_UNKNOWN",
+            "EVENT_ORDER_INNER_INSTRUCTION_INDEX_UNKNOWN",
+            "EVENT_ORDER_LOG_INDEX_UNKNOWN",
+        ] {
+            assert!(
+                blockers.contains(&expected.to_string()),
+                "expected blocker {expected}, got {blockers:?}"
+            );
+        }
         assert!(sample
             .ambiguity_labels()
             .contains(&"EVENT_ORDER_EXPLICIT_UNKNOWN_CHAIN_COMPONENT".to_string()));
+        assert!(sample
+            .ambiguity_labels()
+            .contains(&"EVENT_ORDER_UNKNOWN_BUT_REQUIRED_FOR_RESEARCH".to_string()));
         assert!(sample
             .envelope
             .limitations
             .contains(&"EVENT_ORDER_INTRA_SLOT_AMBIGUITY_REQUIRES_TIE_BREAK".to_string()));
 
         let mut recorder = PoolStateProvenanceRecorder::default();
-        let validation = recorder.record_research_sample(sample).unwrap();
-        assert!(validation.research_ready);
-        assert!(validation
-            .ambiguity_labels
-            .contains(&"EVENT_ORDER_EXPLICIT_UNKNOWN_CHAIN_COMPONENT".to_string()));
+        let error = recorder.record_research_sample(sample).unwrap_err();
+        assert!(matches!(
+            error,
+            ShadowV2Error::PoolStateBlocked { blockers, .. }
+                if blockers.contains(&"EVENT_ORDER_SIGNATURE_UNKNOWN".to_string())
+                    && blockers.contains(&"EVENT_ORDER_TRANSACTION_INDEX_UNKNOWN".to_string())
+        ));
+    }
+
+    #[test]
+    fn shadow_v2_event_order_classifies_non_chain_observed_components() {
+        let mut derived = event_order_key(Some(42), Some(1));
+        derived.signature = EventOrderComponent::derived();
+        derived.transaction_index_or_unknown = EventOrderComponent::not_applicable();
+        derived.instruction_index_or_unknown = EventOrderComponent::runtime_local();
+
+        assert!(!derived.has_complete_chain_order());
+        assert_eq!(
+            derived.explicit_unknown_chain_order_components(),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            derived.not_applicable_or_derived_chain_order_components(),
+            vec![
+                "signature:DERIVED".to_string(),
+                "transaction_index_or_unknown:NOT_APPLICABLE".to_string(),
+                "instruction_index_or_unknown:RUNTIME_LOCAL".to_string(),
+            ]
+        );
+
+        let serialized = serde_json::to_value(&derived).unwrap();
+        assert_eq!(serialized["signature"], "DERIVED");
+        assert_eq!(serialized["transaction_index_or_unknown"], "NOT_APPLICABLE");
+        assert_eq!(serialized["instruction_index_or_unknown"], "RUNTIME_LOCAL");
+        assert!(derived
+            .ambiguity_labels()
+            .contains(&"EVENT_ORDER_CHAIN_COMPONENT_CLASSIFIED_NOT_CHAIN_OBSERVED".to_string()));
     }
 
     #[test]

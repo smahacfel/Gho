@@ -548,19 +548,54 @@ fn shadow_v2_post_buy_event_order_key(
     event_seq_in_process: u64,
     observed_at_wall_ms: u64,
 ) -> EventOrderKey {
+    shadow_v2_post_buy_event_order_key_with_components(
+        slot,
+        None,
+        signature,
+        None,
+        None,
+        None,
+        None,
+        event_seq_in_process,
+        observed_at_wall_ms,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn shadow_v2_post_buy_event_order_key_with_components(
+    slot: Option<u64>,
+    block_time: Option<i64>,
+    signature: Option<&str>,
+    transaction_index: Option<u32>,
+    instruction_index: Option<u32>,
+    inner_instruction_index: Option<u32>,
+    log_index: Option<u32>,
+    event_seq_in_process: u64,
+    observed_at_wall_ms: u64,
+) -> EventOrderKey {
     EventOrderKey {
         slot: slot
             .map(EventOrderComponent::known)
             .unwrap_or_else(EventOrderComponent::unknown),
-        block_time: EventOrderComponent::unknown(),
+        block_time: block_time
+            .map(EventOrderComponent::known)
+            .unwrap_or_else(EventOrderComponent::unknown),
         signature: signature
             .filter(|signature| !signature.trim().is_empty())
             .map(|signature| EventOrderComponent::known(signature.to_string()))
             .unwrap_or_else(EventOrderComponent::unknown),
-        transaction_index_or_unknown: EventOrderComponent::unknown(),
-        instruction_index_or_unknown: EventOrderComponent::unknown(),
-        inner_instruction_index_or_unknown: EventOrderComponent::unknown(),
-        log_index_or_unknown: EventOrderComponent::unknown(),
+        transaction_index_or_unknown: transaction_index
+            .map(EventOrderComponent::known)
+            .unwrap_or_else(EventOrderComponent::unknown),
+        instruction_index_or_unknown: instruction_index
+            .map(EventOrderComponent::known)
+            .unwrap_or_else(EventOrderComponent::unknown),
+        inner_instruction_index_or_unknown: inner_instruction_index
+            .map(EventOrderComponent::known)
+            .unwrap_or_else(EventOrderComponent::unknown),
+        log_index_or_unknown: log_index
+            .map(EventOrderComponent::known)
+            .unwrap_or_else(EventOrderComponent::unknown),
         event_seq_in_process,
         observed_at_wall_ms,
     }
@@ -2940,7 +2975,6 @@ fn maybe_emit_shadow_v2_entry_evidence(
                 pool_amm_id,
                 base_mint,
                 entry_ts_ms,
-                signature,
                 boundary,
             ))
         });
@@ -2995,7 +3029,6 @@ fn shadow_v2_entry_pool_state_from_boundary(
     pool_amm_id: &str,
     base_mint: &str,
     entry_ts_ms: u64,
-    signature: &str,
     boundary: &ShadowV2EntryBoundaryPayload,
 ) -> PoolStateSampleV2 {
     let event_id = format!("pool_state_sample_v2:{position_id}:{entry_ts_ms}:entry_before");
@@ -3032,12 +3065,48 @@ fn shadow_v2_entry_pool_state_from_boundary(
         .limitations
         .push("SHADOW_V2_RECORD_NOT_CONSUMED_BY_DECISIONS".to_string());
     envelope.limitations.extend(boundary.limitations.clone());
+    if boundary
+        .source_tx_signature
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default()
+        .is_empty()
+    {
+        envelope
+            .limitations
+            .push("ENTRY_BOUNDARY_SOURCE_SIGNATURE_UNAVAILABLE".to_string());
+    }
+    if boundary.source_transaction_index.is_none() {
+        envelope
+            .limitations
+            .push("ENTRY_BOUNDARY_SOURCE_TRANSACTION_INDEX_UNAVAILABLE".to_string());
+    }
+    if boundary.source_instruction_index.is_none() {
+        envelope
+            .limitations
+            .push("ENTRY_BOUNDARY_SOURCE_INSTRUCTION_INDEX_UNAVAILABLE".to_string());
+    }
+    if boundary.source_inner_instruction_index.is_none() {
+        envelope
+            .limitations
+            .push("ENTRY_BOUNDARY_SOURCE_INNER_INSTRUCTION_INDEX_UNAVAILABLE".to_string());
+    }
+    if boundary.source_log_index.is_none() {
+        envelope
+            .limitations
+            .push("ENTRY_BOUNDARY_SOURCE_LOG_INDEX_UNAVAILABLE".to_string());
+    }
 
     PoolStateSampleV2::from_account_state_core(
         envelope,
-        shadow_v2_post_buy_event_order_key(
+        shadow_v2_post_buy_event_order_key_with_components(
             Some(boundary.state_slot),
-            Some(signature),
+            boundary.source_block_time,
+            boundary.source_tx_signature.as_deref(),
+            boundary.source_transaction_index,
+            boundary.source_instruction_index,
+            boundary.source_inner_instruction_index,
+            boundary.source_log_index,
             shadow_v2_post_buy_event_seq(entry_ts_ms, 2),
             boundary.captured_at_wall_ms,
         ),
@@ -4741,9 +4810,77 @@ mod tests {
             token_decimals: 6,
             sol_lamports: 1_000_000_000,
             account_data_hash: None,
+            source_block_time: None,
+            source_tx_signature: None,
+            source_transaction_index: None,
+            source_instruction_index: None,
+            source_inner_instruction_index: None,
+            source_log_index: None,
             canonical_pool_state: state,
             limitations: vec!["ACCOUNT_DATA_HASH_UNAVAILABLE_IN_RUNTIME".to_string()],
         }
+    }
+
+    #[test]
+    fn shadow_v2_event_order_available_source_components_are_propagated() {
+        let order = shadow_v2_post_buy_event_order_key_with_components(
+            Some(430_000_010),
+            Some(1_785_000_000),
+            Some("source-signature"),
+            Some(7),
+            Some(3),
+            Some(2),
+            Some(11),
+            42,
+            1_785_000_000_123,
+        );
+
+        assert_eq!(order.slot.as_known(), Some(&430_000_010));
+        assert_eq!(order.block_time.as_known(), Some(&1_785_000_000));
+        assert_eq!(
+            order.signature.as_known().map(String::as_str),
+            Some("source-signature")
+        );
+        assert_eq!(order.transaction_index_or_unknown.as_known(), Some(&7));
+        assert_eq!(order.instruction_index_or_unknown.as_known(), Some(&3));
+        assert_eq!(
+            order.inner_instruction_index_or_unknown.as_known(),
+            Some(&2)
+        );
+        assert_eq!(order.log_index_or_unknown.as_known(), Some(&11));
+        assert_eq!(order.event_seq_in_process, 42);
+        assert_eq!(order.observed_at_wall_ms, 1_785_000_000_123);
+        assert!(order.has_complete_chain_order());
+        assert!(order.explicit_unknown_chain_order_components().is_empty());
+    }
+
+    #[test]
+    fn shadow_v2_event_order_missing_source_components_remain_explicit_unknown() {
+        let order = shadow_v2_post_buy_event_order_key(
+            Some(430_000_010),
+            Some("entry-handoff-signature"),
+            42,
+            1_785_000_000_123,
+        );
+
+        assert_eq!(
+            order.signature.as_known().map(String::as_str),
+            Some("entry-handoff-signature")
+        );
+        assert_eq!(
+            order.explicit_unknown_chain_order_components(),
+            vec![
+                "block_time",
+                "transaction_index_or_unknown",
+                "instruction_index_or_unknown",
+                "inner_instruction_index_or_unknown",
+                "log_index_or_unknown",
+            ]
+        );
+        assert!(!order.has_complete_chain_order());
+        assert!(order
+            .ambiguity_labels()
+            .contains(&"EVENT_ORDER_UNKNOWN_BUT_REQUIRED_FOR_RESEARCH".to_string()));
     }
 
     fn write_fake_shadow_v2_manifest_audit_script(root: &Path) -> PathBuf {
@@ -5134,6 +5271,12 @@ sys.exit(0)
             token_decimals: 6,
             sol_lamports: 1_000_000_000,
             account_data_hash: None,
+            source_block_time: None,
+            source_tx_signature: None,
+            source_transaction_index: None,
+            source_instruction_index: None,
+            source_inner_instruction_index: None,
+            source_log_index: None,
             canonical_pool_state: state,
             limitations: vec!["ACCOUNT_DATA_HASH_UNAVAILABLE_IN_RUNTIME".to_string()],
         };
@@ -5165,6 +5308,17 @@ sys.exit(0)
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[1]["event_kind"], "POOL_STATE_SAMPLE");
         assert_eq!(rows[2]["event_kind"], "ENTRY_FILL");
+        assert_eq!(
+            rows[1]["payload"]["record"]["event_order_key"]["signature"],
+            "UNKNOWN"
+        );
+        assert_eq!(rows[1]["payload"]["record"]["event_signature"], "UNKNOWN");
+        let pool_state_limitations = rows[1]["envelope"]["limitations"]
+            .as_array()
+            .expect("pool state limitations");
+        assert!(pool_state_limitations
+            .iter()
+            .any(|value| value == "ENTRY_BOUNDARY_SOURCE_SIGNATURE_UNAVAILABLE"));
         let fill = &rows[2]["payload"]["record"];
         assert_eq!(fill["fill_status"], "FILLED");
         assert_eq!(fill["execution_simulation_ready"], true);
@@ -5182,6 +5336,76 @@ sys.exit(0)
         assert!(provenance_blockers
             .iter()
             .any(|value| value == "POOL_STATE_ACCOUNT_DATA_HASH_UNAVAILABLE_IN_RUNTIME"));
+    }
+
+    #[test]
+    fn shadow_v2_postbuy_entry_boundary_source_order_components_reach_pool_state_sample() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let burnin = shadow_v2_burnin_config_for_temp_scope(tmp.path());
+        let runtime_config = PostBuyRuntimeConfig {
+            shadow_v2_burnin: Some(burnin),
+            ..PostBuyRuntimeConfig::default()
+        };
+        let harness = init_shadow_v2_validation_harness(runtime_config.shadow_v2_burnin.as_ref())
+            .expect("harness init")
+            .map(|harness| Arc::new(ParkingMutex::new(harness)));
+        let join_metadata = PositionJoinMetadata {
+            session_id: Some("session-entry-boundary-order-test".to_string()),
+            decision_plane: Some("shadow_v2_pr43b_test".to_string()),
+            ..Default::default()
+        };
+        let entry_ts_ms = 1_785_000_205_000;
+        let state = shadow_v2_entry_boundary_test_state(entry_ts_ms, 430_000_010);
+        let pool_amm_id = state.pool_amm_id.to_string();
+        let base_mint = state.base_mint.to_string();
+        let mut boundary = shadow_v2_entry_boundary_test_payload(entry_ts_ms, state);
+        boundary.source_block_time = Some(1_785_000_000);
+        boundary.source_tx_signature = Some("entry-boundary-source-signature".to_string());
+        boundary.source_transaction_index = Some(9);
+        boundary.source_instruction_index = Some(4);
+        boundary.source_inner_instruction_index = Some(2);
+        boundary.source_log_index = Some(17);
+
+        maybe_emit_shadow_v2_entry_evidence(
+            &harness,
+            &runtime_config,
+            "candidate-entry-boundary-order-test",
+            &pool_amm_id,
+            &base_mint,
+            Some("position-entry-boundary-order-test"),
+            "entry-handoff-signature-not-used-for-pool-state",
+            0.007,
+            Some(1),
+            Some(7_000_000_000),
+            Some(430_000_012),
+            Some(430_000_011),
+            Some(entry_ts_ms),
+            &join_metadata,
+            Some(boundary),
+        );
+
+        let canonical = std::fs::read_to_string(tmp.path().join("shadow_position_event_v2.jsonl"))
+            .expect("canonical jsonl");
+        let rows: Vec<serde_json::Value> = canonical
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("canonical row"))
+            .collect();
+        let pool_state = rows
+            .iter()
+            .find(|row| row["event_kind"] == "POOL_STATE_SAMPLE")
+            .expect("pool state sample");
+        let order = &pool_state["payload"]["record"]["event_order_key"];
+        assert_eq!(order["block_time"], 1_785_000_000);
+        assert_eq!(order["signature"], "entry-boundary-source-signature");
+        assert_eq!(order["transaction_index_or_unknown"], 9);
+        assert_eq!(order["instruction_index_or_unknown"], 4);
+        assert_eq!(order["inner_instruction_index_or_unknown"], 2);
+        assert_eq!(order["log_index_or_unknown"], 17);
+        assert_eq!(
+            pool_state["payload"]["record"]["event_signature"],
+            "entry-boundary-source-signature"
+        );
+        assert_eq!(pool_state["payload"]["record"]["event_index"], 17);
     }
 
     #[test]

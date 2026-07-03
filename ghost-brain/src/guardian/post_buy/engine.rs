@@ -983,6 +983,22 @@ fn shadow_v2_event_order_key(
     }
 }
 
+fn shadow_v2_derived_event_order_key(
+    slot: Option<u64>,
+    event_seq_in_process: u64,
+    observed_at_wall_ms: u64,
+) -> EventOrderKey {
+    let mut order_key =
+        shadow_v2_event_order_key(slot, None, event_seq_in_process, observed_at_wall_ms);
+    order_key.block_time = EventOrderComponent::derived();
+    order_key.signature = EventOrderComponent::derived();
+    order_key.transaction_index_or_unknown = EventOrderComponent::derived();
+    order_key.instruction_index_or_unknown = EventOrderComponent::derived();
+    order_key.inner_instruction_index_or_unknown = EventOrderComponent::derived();
+    order_key.log_index_or_unknown = EventOrderComponent::derived();
+    order_key
+}
+
 fn shadow_v2_event_seq(timestamp_ms: u64, offset: u64) -> u64 {
     timestamp_ms.saturating_mul(10).saturating_add(offset)
 }
@@ -2118,9 +2134,8 @@ impl MonitoringEngine {
 
         ShadowTerminalTruthV2 {
             envelope,
-            event_order_key: shadow_v2_event_order_key(
+            event_order_key: shadow_v2_derived_event_order_key(
                 record.exit_landed_slot.or(record.exit_sample_slot),
-                record.exit_market_anchor_tx_signature.as_deref(),
                 shadow_v2_event_seq(terminal_ts, 5),
                 terminal_ts,
             ),
@@ -6042,6 +6057,42 @@ mod tests {
             .any(
                 |value| value == "TERMINAL_EXECUTABLE_PNL_FROM_CANONICAL_ENTRY_EXIT_FILLED_EVENTS"
             ));
+    }
+
+    #[test]
+    fn shadow_v2_event_order_terminal_truth_marks_chain_components_as_derived() {
+        let state_ts_ms = 1_785_000_320_000;
+        let (engine, _account_state_core, mint, _bonding_curve) =
+            make_shadow_v2_exit_test_engine(430_000_044, state_ts_ms);
+        let record = shadow_v2_exit_test_record(
+            &engine,
+            &mint,
+            ShadowLifecycleRecordType::PositionClosed,
+            state_ts_ms + 1_100,
+            Some(430_000_046),
+            Some(1_000_000_000),
+        );
+
+        let terminal = engine.shadow_v2_terminal_truth_from_lifecycle(&record, None);
+
+        assert_eq!(
+            terminal
+                .event_order_key
+                .not_applicable_or_derived_chain_order_components(),
+            vec![
+                "block_time:DERIVED".to_string(),
+                "signature:DERIVED".to_string(),
+                "transaction_index_or_unknown:DERIVED".to_string(),
+                "instruction_index_or_unknown:DERIVED".to_string(),
+                "inner_instruction_index_or_unknown:DERIVED".to_string(),
+                "log_index_or_unknown:DERIVED".to_string(),
+            ]
+        );
+        assert!(!terminal.event_order_key.has_complete_chain_order());
+        assert!(terminal
+            .event_order_key
+            .explicit_unknown_chain_order_components()
+            .is_empty());
     }
 
     #[test]

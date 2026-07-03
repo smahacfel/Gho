@@ -549,6 +549,18 @@ pub struct ShadowV2EntryBoundaryPayload {
     pub sol_lamports: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_data_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_block_time: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_tx_signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_transaction_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_instruction_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_inner_instruction_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_log_index: Option<u32>,
     pub canonical_pool_state: CanonicalPoolState,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub limitations: Vec<String>,
