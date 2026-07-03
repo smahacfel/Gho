@@ -21963,6 +21963,7 @@ fn build_post_buy_handoff_event(
     entry_simulation_rpc_slot: Option<u64>,
     entry_opened_at_ms: Option<u64>,
     join_metadata: ExecutionJoinMetadata,
+    shadow_v2_entry_boundary: Option<crate::events::ShadowV2EntryBoundaryPayload>,
 ) -> GhostEvent {
     let creator_pubkey = Pubkey::from_str(&pool_data.creator)
         .ok()
@@ -21985,6 +21986,7 @@ fn build_post_buy_handoff_event(
     .with_execution_join_metadata(join_metadata)
     .with_entry_simulation_rpc_slot(entry_simulation_rpc_slot)
     .with_entry_opened_at_ms(entry_opened_at_ms)
+    .with_shadow_v2_entry_boundary(shadow_v2_entry_boundary)
 }
 
 fn send_direct_post_buy_handoff(
@@ -22174,6 +22176,7 @@ async fn send_post_buy_handoff(
         None,
         None,
         join_metadata,
+        None,
     );
     send_direct_post_buy_handoff(post_buy_tx, &handoff_event, pool_amm_id, post_buy_lane)?;
     send_broadcast_post_buy_handoff(
@@ -22203,6 +22206,7 @@ async fn send_shadow_post_buy_handoff(
     entry_simulation_rpc_slot: Option<u64>,
     entry_opened_at_ms: Option<u64>,
     join_metadata: ExecutionJoinMetadata,
+    shadow_v2_entry_boundary: Option<crate::events::ShadowV2EntryBoundaryPayload>,
 ) -> anyhow::Result<Option<DirectPostBuyHandoffAck>> {
     let handoff_event = build_post_buy_handoff_event(
         pool_amm_id,
@@ -22219,6 +22223,7 @@ async fn send_shadow_post_buy_handoff(
         entry_simulation_rpc_slot,
         entry_opened_at_ms,
         join_metadata,
+        shadow_v2_entry_boundary,
     );
     let ack = send_direct_shadow_post_buy_handoff(
         post_buy_tx,
@@ -22276,6 +22281,7 @@ async fn send_probe_post_buy_handoff(
         entry_opened_at_ms: Some(shadow_event.decision_ts_ms),
         creator_pubkey,
         join_metadata,
+        shadow_v2_entry_boundary: request.shadow_v2_entry_boundary.clone(),
     };
     send_direct_shadow_post_buy_handoff(post_buy_tx, &handoff_event, pool_amm_id, "probe").await
 }
@@ -22397,6 +22403,7 @@ async fn apply_trigger_buy_outcome(
         crate::components::trigger::TriggerBuyOutcome::ShadowSimulated { report } => {
             let mut active_position_lease = active_position_lease;
             let shadow_entry_token_amount_raw = report.entry_token_amount_raw;
+            let shadow_v2_entry_boundary = report.shadow_v2_entry_boundary.clone();
             let report_err = report.err.clone();
             let mut retain_runtime_pool = false;
             let mut shadow_execution_outcome = report
@@ -22453,6 +22460,7 @@ async fn apply_trigger_buy_outcome(
                         Some(shadow_event.rpc_slot),
                         Some(shadow_event.decision_ts_ms),
                         shadow_event.join_metadata.clone(),
+                        shadow_v2_entry_boundary.clone(),
                     )
                     .await
                     {
@@ -25498,6 +25506,7 @@ mod tests {
         ) -> anyhow::Result<crate::components::trigger::ShadowBuySimulationReport> {
             Ok(crate::components::trigger::ShadowBuySimulationReport {
                 join_metadata: ExecutionJoinMetadata::default(),
+                shadow_v2_entry_boundary: request.shadow_v2_entry_boundary.clone(),
                 mint: request.mint.to_string(),
                 live_signature: None,
                 payer_pubkey: request.payer_pubkey.to_string(),
@@ -26631,6 +26640,7 @@ mod tests {
         request.account_overrides.buy_variant = Some(trigger::PumpfunBuyVariant::RoutedExactSolIn);
         let report = crate::components::trigger::ShadowBuySimulationReport {
             join_metadata: request.join_metadata.clone(),
+            shadow_v2_entry_boundary: request.shadow_v2_entry_boundary.clone(),
             mint: record.base_mint.clone().expect("base mint"),
             live_signature: None,
             payer_pubkey: request.payer_pubkey.to_string(),
@@ -30599,6 +30609,7 @@ mod tests {
             crate::components::trigger::TriggerBuyOutcome::ShadowSimulated {
                 report: crate::components::trigger::ShadowBuySimulationReport {
                     join_metadata: ExecutionJoinMetadata::default(),
+                    shadow_v2_entry_boundary: None,
                     mint: pool.base_mint.clone(),
                     live_signature: None,
                     payer_pubkey: Pubkey::new_unique().to_string(),
@@ -30999,6 +31010,7 @@ mod tests {
             crate::components::trigger::TriggerBuyOutcome::ShadowSimulated {
                 report: crate::components::trigger::ShadowBuySimulationReport {
                     join_metadata: ExecutionJoinMetadata::default(),
+                    shadow_v2_entry_boundary: None,
                     mint: pool.base_mint.clone(),
                     live_signature: None,
                     payer_pubkey: Pubkey::new_unique().to_string(),
@@ -31275,6 +31287,7 @@ mod tests {
         };
         let report = crate::components::trigger::ShadowBuySimulationReport {
             join_metadata: request.join_metadata.clone(),
+            shadow_v2_entry_boundary: request.shadow_v2_entry_boundary.clone(),
             mint: record.base_mint.clone().expect("base mint"),
             live_signature: None,
             payer_pubkey: request.payer_pubkey.to_string(),
@@ -31931,6 +31944,7 @@ mod tests {
         crate::components::trigger::PendingShadowSimulation {
             request: crate::components::trigger::PreparedBuyRequest {
                 join_metadata: ExecutionJoinMetadata::default(),
+                shadow_v2_entry_boundary: None,
                 state_readiness_latch_diagnostics: None,
                 mint: Pubkey::new_unique(),
                 payer_pubkey: payer.pubkey(),
@@ -31996,6 +32010,7 @@ mod tests {
 
         crate::components::trigger::PreparedBuyRequest {
             join_metadata: ExecutionJoinMetadata::default(),
+            shadow_v2_entry_boundary: None,
             state_readiness_latch_diagnostics: None,
             mint: Pubkey::new_unique(),
             payer_pubkey: payer.pubkey(),
@@ -32134,6 +32149,7 @@ mod tests {
 
         crate::components::trigger::PreparedBuyRequest {
             join_metadata: ExecutionJoinMetadata::default(),
+            shadow_v2_entry_boundary: None,
             state_readiness_latch_diagnostics: None,
             mint,
             payer_pubkey: payer.pubkey(),
@@ -32271,6 +32287,7 @@ mod tests {
 
         crate::components::trigger::PreparedBuyRequest {
             join_metadata: ExecutionJoinMetadata::default(),
+            shadow_v2_entry_boundary: None,
             state_readiness_latch_diagnostics: None,
             mint,
             payer_pubkey: payer.pubkey(),
@@ -35310,6 +35327,7 @@ mod tests {
             crate::components::trigger::TriggerBuyOutcome::ShadowSimulated {
                 report: crate::components::trigger::ShadowBuySimulationReport {
                     join_metadata: ExecutionJoinMetadata::default(),
+                    shadow_v2_entry_boundary: None,
                     mint: resolved_pool.base_mint.clone(),
                     live_signature: None,
                     payer_pubkey: Pubkey::new_unique().to_string(),
@@ -37108,6 +37126,7 @@ mod tests {
         let outcome = crate::components::trigger::TriggerBuyOutcome::ShadowSimulated {
             report: crate::components::trigger::ShadowBuySimulationReport {
                 join_metadata: ExecutionJoinMetadata::default(),
+                shadow_v2_entry_boundary: None,
                 mint: pool.base_mint.clone(),
                 live_signature: None,
                 payer_pubkey: Pubkey::new_unique().to_string(),
@@ -37223,6 +37242,7 @@ mod tests {
         let outcome = crate::components::trigger::TriggerBuyOutcome::ShadowSimulated {
             report: crate::components::trigger::ShadowBuySimulationReport {
                 join_metadata: ExecutionJoinMetadata::default(),
+                shadow_v2_entry_boundary: None,
                 mint: pool.base_mint.clone(),
                 live_signature: None,
                 payer_pubkey: Pubkey::new_unique().to_string(),
@@ -37340,6 +37360,7 @@ mod tests {
         let outcome = crate::components::trigger::TriggerBuyOutcome::ShadowSimulated {
             report: crate::components::trigger::ShadowBuySimulationReport {
                 join_metadata: ExecutionJoinMetadata::default(),
+                shadow_v2_entry_boundary: None,
                 mint: pool.base_mint.clone(),
                 live_signature: None,
                 payer_pubkey: Pubkey::new_unique().to_string(),
@@ -37481,6 +37502,7 @@ mod tests {
         let outcome = crate::components::trigger::TriggerBuyOutcome::ShadowSimulated {
             report: crate::components::trigger::ShadowBuySimulationReport {
                 join_metadata: ExecutionJoinMetadata::default(),
+                shadow_v2_entry_boundary: None,
                 mint: pool.base_mint.clone(),
                 live_signature: None,
                 payer_pubkey: Pubkey::new_unique().to_string(),
@@ -37629,6 +37651,7 @@ mod tests {
             crate::components::trigger::TriggerBuyOutcome::ShadowSimulated {
                 report: crate::components::trigger::ShadowBuySimulationReport {
                     join_metadata: ExecutionJoinMetadata::default(),
+                    shadow_v2_entry_boundary: None,
                     mint: pool.base_mint.clone(),
                     live_signature: None,
                     payer_pubkey: Pubkey::new_unique().to_string(),
@@ -37813,6 +37836,7 @@ mod tests {
             crate::components::trigger::TriggerBuyOutcome::ShadowSimulated {
                 report: crate::components::trigger::ShadowBuySimulationReport {
                     join_metadata: ExecutionJoinMetadata::default(),
+                    shadow_v2_entry_boundary: None,
                     mint: pool.base_mint.clone(),
                     live_signature: None,
                     payer_pubkey: Pubkey::new_unique().to_string(),
@@ -37917,6 +37941,7 @@ mod tests {
                     tokio::time::sleep(Duration::from_millis(250)).await;
                     Ok(crate::components::trigger::ShadowBuySimulationReport {
                         join_metadata: ExecutionJoinMetadata::default(),
+                        shadow_v2_entry_boundary: None,
                         mint: base_mint,
                         live_signature: None,
                         payer_pubkey: Pubkey::new_unique().to_string(),
@@ -38602,6 +38627,7 @@ mod tests {
                 async move {
                     Ok(crate::components::trigger::ShadowBuySimulationReport {
                         join_metadata: ExecutionJoinMetadata::default(),
+                        shadow_v2_entry_boundary: None,
                         mint: base_mint,
                         live_signature: None,
                         payer_pubkey: Pubkey::new_unique().to_string(),
@@ -40134,6 +40160,7 @@ mod tests {
                 crate::components::trigger::TriggerBuyOutcome::ShadowSimulated {
                     report: crate::components::trigger::ShadowBuySimulationReport {
                         join_metadata: join_metadata.clone(),
+                        shadow_v2_entry_boundary: request.shadow_v2_entry_boundary.clone(),
                         mint: pool.base_mint.clone(),
                         live_signature: None,
                         payer_pubkey: Pubkey::new_unique().to_string(),
@@ -40315,6 +40342,7 @@ mod tests {
                 async move {
                     Ok(crate::components::trigger::ShadowBuySimulationReport {
                         join_metadata: ExecutionJoinMetadata::default(),
+                        shadow_v2_entry_boundary: None,
                         mint: base_mint,
                         live_signature: None,
                         payer_pubkey: Pubkey::new_unique().to_string(),
@@ -40447,6 +40475,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 Ok(crate::components::trigger::ShadowBuySimulationReport {
                     join_metadata: ExecutionJoinMetadata::default(),
+                    shadow_v2_entry_boundary: None,
                     mint: Pubkey::new_unique().to_string(),
                     live_signature: None,
                     payer_pubkey: Pubkey::new_unique().to_string(),
@@ -40576,6 +40605,7 @@ mod tests {
                 #[allow(unreachable_code)]
                 Ok(crate::components::trigger::ShadowBuySimulationReport {
                     join_metadata: ExecutionJoinMetadata::default(),
+                    shadow_v2_entry_boundary: None,
                     mint: Pubkey::new_unique().to_string(),
                     live_signature: None,
                     payer_pubkey: Pubkey::new_unique().to_string(),
@@ -40724,6 +40754,7 @@ mod tests {
                 crate::components::trigger::TriggerBuyOutcome::ShadowSimulated {
                     report: crate::components::trigger::ShadowBuySimulationReport {
                         join_metadata: ExecutionJoinMetadata::default(),
+                        shadow_v2_entry_boundary: request.shadow_v2_entry_boundary.clone(),
                         mint: pool.base_mint.clone(),
                         live_signature: None,
                         payer_pubkey: Pubkey::new_unique().to_string(),

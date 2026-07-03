@@ -1465,6 +1465,8 @@ impl ShadowEntryAttemptV2 {
 pub struct ShadowEntryFillModelConfig {
     pub pool_phase: ShadowV2PoolPhase,
     pub input_sol_lamports: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_out_raw: Option<u64>,
     pub slippage_bps: u16,
     pub fee_bps: u16,
     pub executable_fill_model_version: String,
@@ -1480,10 +1482,16 @@ impl ShadowEntryFillModelConfig {
         Self {
             pool_phase: ShadowV2PoolPhase::BondingCurve,
             input_sol_lamports,
+            min_out_raw: None,
             slippage_bps,
             fee_bps,
             executable_fill_model_version: executable_fill_model_version.into(),
         }
+    }
+
+    pub fn with_min_out_raw(mut self, min_out_raw: Option<u64>) -> Self {
+        self.min_out_raw = min_out_raw;
+        self
     }
 }
 
@@ -1563,7 +1571,7 @@ impl ShadowEntryFillV2 {
             boundary_kind: ShadowV2BoundaryKind::EntryBefore,
             event_order_key: event_order_key.clone(),
             input_amount_raw: Some(config.input_sol_lamports),
-            min_out_raw: None,
+            min_out_raw: config.min_out_raw,
             fee_bps: Some(config.fee_bps),
             slippage_tolerance_bps: Some(config.slippage_bps),
             model_version: config.executable_fill_model_version.clone(),

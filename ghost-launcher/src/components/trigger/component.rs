@@ -34,7 +34,7 @@ use crate::config::{
 };
 use crate::events::{
     EventBusReceiver, EventBusSender, ExecutionJoinMetadata, GhostEvent, LegacyPathClassification,
-    LegacyPathDescriptor, RuntimePlane,
+    LegacyPathDescriptor, RuntimePlane, ShadowV2EntryBoundaryPayload,
 };
 use anyhow::{bail, Result};
 use ghost_core::{
@@ -86,6 +86,9 @@ const BUY_RETRY_RESEND_CONFIRM_WAIT_MS: u64 = 300;
 const BUY_RETRY_MAX_ATTEMPTS: usize = 3;
 const BUY_RETRY_PRIORITY_FEE_INCREMENT_MICRO_LAMPORTS: u64 = 10_000;
 const BUY_RETRY_TIP_INCREMENT_LAMPORTS: u64 = 300_000;
+const SHADOW_V2_ENTRY_BONDING_FEE_BPS: u16 = 100;
+const SHADOW_V2_ENTRY_TOKEN_DECIMALS: u8 = 6;
+const SHADOW_V2_ENTRY_SOL_LAMPORTS: u64 = 1_000_000_000;
 const KNOWN_BAD_LEGACY_FEE_RECIPIENT: &str = "CebN5WGQ4jvEPvsVU4EoHEpgznyQQNDGNesDwrFs8YWj";
 const TRIGGER_POOL_SCORED_OBSERVER_PATH: LegacyPathDescriptor = LegacyPathDescriptor::new(
     "trigger_pool_scored_observer",
@@ -340,6 +343,7 @@ impl PreparedBuyRequestBuildMetadata {
 #[derive(Debug, Clone)]
 pub struct PreparedBuyRequest {
     pub join_metadata: ExecutionJoinMetadata,
+    pub shadow_v2_entry_boundary: Option<ShadowV2EntryBoundaryPayload>,
     pub state_readiness_latch_diagnostics:
         Option<crate::events::ShadowSimulationAccountDiagnostics>,
     pub mint: Pubkey,
@@ -2374,6 +2378,45 @@ impl TriggerComponent {
         (tolerance * 10_000.0).round() as u64
     }
 
+    fn capture_shadow_v2_entry_boundary(
+        &self,
+        build_profile: &BuyBuildProfile,
+    ) -> Option<ShadowV2EntryBoundaryPayload> {
+        let captured_at_wall_ms = Self::now_ms();
+        let canonical_pool_state = self
+            .account_state_core
+            .get_canonical_state(&build_profile.mint)?;
+        let latest_observed_slot = self.account_state_core.latest_observed_slot();
+        let slippage_tolerance_bps = self.configured_buy_slippage_bps().min(10_000) as u16;
+        let mut limitations = vec![
+            "ENTRY_BEFORE_CAPTURED_AT_TRIGGER_BOUNDARY".to_string(),
+            "SHADOW_V2_DIAGNOSTIC_ONLY_NOT_DECISION_INPUT".to_string(),
+            "ACCOUNT_DATA_HASH_UNAVAILABLE_IN_RUNTIME".to_string(),
+            "CHAIN_ORDER_COMPONENTS_EXPLICIT_UNKNOWN_UNLESS_CARRIED_DOWNSTREAM".to_string(),
+            "FEE_MODEL_ASSUMPTION_BONDING_CURVE_DEFAULT_100BPS".to_string(),
+        ];
+        if latest_observed_slot.is_none() {
+            limitations.push("LATEST_OBSERVED_SLOT_UNAVAILABLE".to_string());
+        }
+        Some(ShadowV2EntryBoundaryPayload {
+            boundary_kind: "ENTRY_BEFORE".to_string(),
+            source: "TRIGGER_ACCOUNT_STATE_CORE_CANONICAL_STATE".to_string(),
+            captured_at_wall_ms,
+            latest_observed_slot,
+            state_slot: canonical_pool_state.last_update_slot,
+            state_ts_ms: canonical_pool_state.last_update_ts_ms,
+            amount_lamports: build_profile.amount_lamports,
+            min_tokens_out: build_profile.min_tokens_out,
+            fee_bps: Some(SHADOW_V2_ENTRY_BONDING_FEE_BPS),
+            slippage_tolerance_bps: Some(slippage_tolerance_bps),
+            token_decimals: SHADOW_V2_ENTRY_TOKEN_DECIMALS,
+            sol_lamports: SHADOW_V2_ENTRY_SOL_LAMPORTS,
+            account_data_hash: None,
+            canonical_pool_state,
+            limitations,
+        })
+    }
+
     fn safety_config(&self) -> SafetyConfig {
         SafetyConfig {
             emergency_floor_sol: self.config.emergency_floor_sol.max(0.0),
@@ -2966,8 +3009,10 @@ impl TriggerComponent {
         rpc_buy_tx: Transaction,
         buy_tx: VersionedTransaction,
     ) -> PreparedBuyRequest {
+        let shadow_v2_entry_boundary = self.capture_shadow_v2_entry_boundary(build_profile);
         PreparedBuyRequest {
             join_metadata: ExecutionJoinMetadata::default(),
+            shadow_v2_entry_boundary,
             state_readiness_latch_diagnostics: None,
             mint: build_profile.mint,
             payer_pubkey: build_profile.payer_pubkey,
@@ -6493,6 +6538,7 @@ mod tests {
             Ok(
                 crate::components::trigger::shadow_run::ShadowBuySimulationReport {
                     join_metadata: request.join_metadata.clone(),
+                    shadow_v2_entry_boundary: request.shadow_v2_entry_boundary.clone(),
                     mint: request.mint.to_string(),
                     live_signature: None,
                     payer_pubkey: request.payer_pubkey.to_string(),
@@ -6544,6 +6590,7 @@ mod tests {
             Ok(
                 crate::components::trigger::shadow_run::ShadowBuySimulationReport {
                     join_metadata: request.join_metadata.clone(),
+                    shadow_v2_entry_boundary: request.shadow_v2_entry_boundary.clone(),
                     mint: request.mint.to_string(),
                     live_signature: None,
                     payer_pubkey: request.payer_pubkey.to_string(),
@@ -7194,6 +7241,71 @@ mod tests {
             u64::from_le_bytes(buy_ix.data[16..24].try_into().unwrap()),
             expected_min_tokens_out
         );
+    }
+
+    #[test]
+    fn shadow_v2_prepared_buy_request_captures_entry_boundary_before_shadow_simulation() {
+        let mint = Pubkey::new_unique();
+        let account_state_core = Arc::new(AccountStateReducer::new());
+        seed_canonical_buy_state(&account_state_core, mint);
+        let trigger = TriggerComponent::new_with_position_limit_tracker_and_runtime_state(
+            create_test_config(),
+            PositionLimitTracker::new(1),
+            Arc::new(ShadowLedger::new()),
+            Arc::clone(&account_state_core),
+        );
+        let payer = Keypair::new();
+        let recent_blockhash = Hash::new_unique();
+        let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).expect("valid token program");
+        let overrides = valid_buy_account_overrides();
+        let expected_amount = trigger
+            .configured_trade_amount_lamports()
+            .expect("configured amount");
+
+        let request = trigger
+            .build_prepared_buy_request(
+                &payer,
+                &mint,
+                &token_program,
+                false,
+                &overrides,
+                expected_amount,
+                0,
+                recent_blockhash,
+            )
+            .expect("routed prepared buy request should build");
+
+        let boundary = request
+            .shadow_v2_entry_boundary
+            .as_ref()
+            .expect("entry boundary should be captured before shadow simulation");
+        assert_eq!(boundary.boundary_kind, "ENTRY_BEFORE");
+        assert_eq!(
+            boundary.source,
+            "TRIGGER_ACCOUNT_STATE_CORE_CANONICAL_STATE"
+        );
+        assert_eq!(boundary.amount_lamports, expected_amount);
+        assert_eq!(boundary.min_tokens_out, request.min_tokens_out);
+        assert_eq!(boundary.token_decimals, SHADOW_V2_ENTRY_TOKEN_DECIMALS);
+        assert_eq!(boundary.sol_lamports, SHADOW_V2_ENTRY_SOL_LAMPORTS);
+        assert!(boundary.account_data_hash.is_none());
+        assert_eq!(
+            boundary.state_slot,
+            boundary.canonical_pool_state.last_update_slot
+        );
+        assert_eq!(
+            boundary.state_ts_ms,
+            boundary.canonical_pool_state.last_update_ts_ms
+        );
+        assert_eq!(boundary.canonical_pool_state.base_mint, mint);
+        assert!(boundary
+            .limitations
+            .iter()
+            .any(|value| value == "ACCOUNT_DATA_HASH_UNAVAILABLE_IN_RUNTIME"));
+        assert!(boundary
+            .limitations
+            .iter()
+            .any(|value| value == "ENTRY_BEFORE_CAPTURED_AT_TRIGGER_BOUNDARY"));
     }
 
     #[test]
