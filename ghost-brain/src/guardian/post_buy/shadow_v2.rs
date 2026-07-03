@@ -3374,6 +3374,60 @@ pub fn executable_pnl_bps_from_entry_exit_fills(
     pnl_bps.is_finite().then_some(pnl_bps.round() as i32)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShadowV2ExecutablePnlLink {
+    pub final_pnl_executable_bps: i32,
+    pub linked_entry_fill: String,
+    pub linked_exit_fill: String,
+}
+
+pub fn executable_pnl_link_from_canonical_position_fills(
+    stream: &ShadowV2CanonicalEventStream,
+    position_id: &str,
+    pending_exit_fill: Option<&ShadowExitFillV2>,
+) -> Option<ShadowV2ExecutablePnlLink> {
+    let entry = stream
+        .events_for_position(position_id)
+        .into_iter()
+        .rev()
+        .find_map(|event| match shadow_v2_record_from_event(event) {
+            Ok(ShadowV2Record::ShadowEntryFillV2(fill))
+                if fill.fill_status == FillStatus::Filled =>
+            {
+                Some((event.envelope.event_id.clone(), fill))
+            }
+            _ => None,
+        })?;
+
+    let pending_exit = pending_exit_fill
+        .filter(|fill| {
+            fill.envelope.position_id == position_id && fill.fill_status == FillStatus::Filled
+        })
+        .map(|fill| (fill.envelope.event_id.clone(), fill.clone()));
+
+    let exit = pending_exit.or_else(|| {
+        stream
+            .events_for_position(position_id)
+            .into_iter()
+            .rev()
+            .find_map(|event| match shadow_v2_record_from_event(event) {
+                Ok(ShadowV2Record::ShadowExitFillV2(fill))
+                    if fill.fill_status == FillStatus::Filled =>
+                {
+                    Some((event.envelope.event_id.clone(), fill))
+                }
+                _ => None,
+            })
+    })?;
+
+    let final_pnl_executable_bps = executable_pnl_bps_from_entry_exit_fills(&entry.1, &exit.1)?;
+    Some(ShadowV2ExecutablePnlLink {
+        final_pnl_executable_bps,
+        linked_entry_fill: entry.0,
+        linked_exit_fill: exit.0,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ShadowReplayV2 {
     pub envelope: ShadowV2Envelope,
@@ -6369,6 +6423,94 @@ mod tests {
         blocked_terminal.final_pnl_executable_bps =
             executable_pnl_bps_from_entry_exit_fills(&entry_fill, &blocked_exit);
         assert!(blocked_terminal.final_pnl_executable_bps.is_none());
+    }
+
+    #[test]
+    fn shadow_v2_executable_pnl_link_requires_same_position_filled_entry_and_exit() {
+        let entry_pool_state = account_state_pool_sample("pool-event-entry-link", 1);
+        let mut entry_fill_order = event_order_key(Some(43), Some(2));
+        entry_fill_order.event_seq_in_process = 2;
+        let entry_fill = ShadowEntryFillV2::from_static_buy_model(
+            test_envelope("shadow_entry_fill_v2", "pos-link-a", "entry-fill-link"),
+            entry_fill_order,
+            &entry_pool_state,
+            &ShadowEntryFillModelConfig::bonding_curve(
+                1_000_000_000,
+                250,
+                100,
+                SHADOW_V2_ENTRY_FILL_MODEL_VERSION,
+            ),
+        );
+
+        let exit_pool_state = post_entry_pool_sample("pool-event-exit-link", 3, 44, 1);
+        let mut exit_fill_order = event_order_key(Some(45), Some(2));
+        exit_fill_order.event_seq_in_process = 4;
+        let exit_fill = ShadowExitFillV2::from_static_sell_model(
+            test_envelope("shadow_exit_fill_v2", "pos-link-a", "exit-fill-link"),
+            exit_fill_order.clone(),
+            &exit_pool_state,
+            &ShadowExitFillModelConfig::bonding_curve(
+                10_000_000_000,
+                150,
+                100,
+                SHADOW_V2_EXIT_FILL_MODEL_VERSION,
+            ),
+        );
+
+        let mut stream = ShadowV2CanonicalEventStream::default();
+        stream
+            .append_record(ShadowV2Record::ShadowEntryFillV2(entry_fill.clone()))
+            .expect("append entry fill");
+        let link = executable_pnl_link_from_canonical_position_fills(
+            &stream,
+            "pos-link-a",
+            Some(&exit_fill),
+        )
+        .expect("executable pnl link");
+        assert_eq!(link.linked_entry_fill, "entry-fill-link");
+        assert_eq!(link.linked_exit_fill, "exit-fill-link");
+        assert_eq!(
+            Some(link.final_pnl_executable_bps),
+            executable_pnl_bps_from_entry_exit_fills(&entry_fill, &exit_fill)
+        );
+
+        let blocked_exit = ShadowExitFillV2::blocked_without_pool_state(
+            test_envelope(
+                "shadow_exit_fill_v2",
+                "pos-link-a",
+                "exit-fill-link-blocked",
+            ),
+            exit_fill_order.clone(),
+            vec!["EXIT_POOL_STATE_BEFORE_UNAVAILABLE".to_string()],
+        );
+        assert!(executable_pnl_link_from_canonical_position_fills(
+            &stream,
+            "pos-link-a",
+            Some(&blocked_exit)
+        )
+        .is_none());
+
+        let other_position_exit = ShadowExitFillV2::from_static_sell_model(
+            test_envelope(
+                "shadow_exit_fill_v2",
+                "pos-link-b",
+                "exit-fill-other-position",
+            ),
+            exit_fill_order,
+            &exit_pool_state,
+            &ShadowExitFillModelConfig::bonding_curve(
+                10_000_000_000,
+                150,
+                100,
+                SHADOW_V2_EXIT_FILL_MODEL_VERSION,
+            ),
+        );
+        assert!(executable_pnl_link_from_canonical_position_fills(
+            &stream,
+            "pos-link-a",
+            Some(&other_position_exit)
+        )
+        .is_none());
     }
 
     #[test]
