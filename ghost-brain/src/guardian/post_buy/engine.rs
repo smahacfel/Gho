@@ -65,10 +65,11 @@ use super::integration::{PositionRuntimeRouter, ShadowPositionBookAemAdapter};
 use super::shadow_v2::ShadowV2ValidationHarnessConfig;
 use super::shadow_v2::{
     ClockDomain, ClockedTimestamp, EventOrderComponent, EventOrderKey, MeasurementGrade,
-    PoolStateSampleV2, ShadowExitAttemptV2, ShadowExitFillV2, ShadowPathSampleV2,
-    ShadowPathSamplingModeV2, ShadowPathSamplingReasonV2, ShadowTerminalTruthV2, ShadowV2Envelope,
-    ShadowV2Record, ShadowV2ValidationEvidenceStatus, ShadowV2ValidationHarness, SimulationLevel,
-    TemporalClass, TerminalReasonV2, SHADOW_V2_EXIT_FILL_MODEL_VERSION,
+    PoolStateSampleV2, ShadowExitAttemptV2, ShadowExitFillModelConfig, ShadowExitFillV2,
+    ShadowPathSampleV2, ShadowPathSamplingModeV2, ShadowPathSamplingReasonV2,
+    ShadowTerminalTruthV2, ShadowV2Envelope, ShadowV2Record, ShadowV2ValidationEvidenceStatus,
+    ShadowV2ValidationHarness, SimulationLevel, TemporalClass, TerminalReasonV2,
+    SHADOW_V2_EXIT_FILL_MODEL_VERSION,
 };
 
 #[cfg(test)]
@@ -77,6 +78,8 @@ const SHADOW_EXIT_TRACE_FORMULA_ID: &str = "bonding_curve.calculate_sell_price.v
 const SHADOW_TIME_STOP_STALE_SOURCE_PATH: &str = "guardian.post_buy.shadow_time_stop_stale";
 const SHADOW_LAMPORTS_PER_SOL_F64: f64 = 1_000_000_000.0;
 const SHADOW_TOKEN_DECIMAL_FACTOR_F64: f64 = 1_000_000.0;
+const SHADOW_V2_EXIT_FEE_BPS_DIAGNOSTIC_MODEL: u16 = 100;
+const SHADOW_V2_EXIT_SLIPPAGE_BPS_DIAGNOSTIC_MODEL: u16 = 150;
 use super::signals::*;
 
 #[derive(Debug, Clone, Copy)]
@@ -1971,6 +1974,33 @@ impl MonitoringEngine {
             shadow_v2_event_seq(fill_ts, 4),
             fill_ts,
         );
+        if matches!(record.record_type, ShadowLifecycleRecordType::ExitFilled) {
+            if let (Some(pool_state), Some(exit_token_amount_raw)) =
+                (pool_state_before, record.exit_token_amount_raw)
+            {
+                envelope
+                    .limitations
+                    .push("EXIT_FILL_L1_SELL_MODEL_FROM_LIFECYCLE_EXIT_BOUNDARY".to_string());
+                envelope.limitations.push(format!(
+                    "EXIT_FILL_MODEL_FEE_BPS_ASSUMPTION={SHADOW_V2_EXIT_FEE_BPS_DIAGNOSTIC_MODEL}"
+                ));
+                envelope.limitations.push(format!(
+                    "EXIT_FILL_MODEL_SLIPPAGE_BPS_ASSUMPTION={SHADOW_V2_EXIT_SLIPPAGE_BPS_DIAGNOSTIC_MODEL}"
+                ));
+                let config = ShadowExitFillModelConfig::bonding_curve(
+                    exit_token_amount_raw,
+                    SHADOW_V2_EXIT_SLIPPAGE_BPS_DIAGNOSTIC_MODEL,
+                    SHADOW_V2_EXIT_FEE_BPS_DIAGNOSTIC_MODEL,
+                    SHADOW_V2_EXIT_FILL_MODEL_VERSION,
+                );
+                return ShadowExitFillV2::from_static_sell_model(
+                    envelope,
+                    fill_order_key,
+                    pool_state,
+                    &config,
+                );
+            }
+        }
         if let Some(pool_state) = pool_state_before {
             if pool_state.observed_at_wall_ms > fill_ts {
                 blockers.push("EXIT_FILL_POOL_STATE_AFTER_EXIT_FILL_BOUNDARY".to_string());
@@ -5248,6 +5278,8 @@ mod tests {
     use super::*;
     use crate::events::{EventEmitter, EventWriterConfig};
     use crate::guardian::post_buy::integration::{PositionRuntimeRouter, ShadowPositionBook};
+    use crate::guardian::post_buy::shadow_v2::FillStatus;
+    use crate::guardian::post_buy::shadow_v2_execution::ShadowV2ExecutionLabelGrade;
     use ghost_core::account_state_core::reducer::AccountStateReducer;
     use ghost_core::account_state_core::types::{AccountStateUpdate, UpdateSource};
     use ghost_core::market_state::BondingCurve;
@@ -5354,6 +5386,93 @@ mod tests {
             ghost_core::account_state_core::types::AccountUpdateResult::Applied
                 | ghost_core::account_state_core::types::AccountUpdateResult::PromotedFromBootstrap
         ));
+    }
+
+    fn make_shadow_v2_exit_test_engine(
+        state_slot: u64,
+        state_ts_ms: u64,
+    ) -> (MonitoringEngine, Arc<AccountStateReducer>, Pubkey, Pubkey) {
+        let config = PostBuyGuardianConfig::default();
+        let shadow_ledger = Arc::new(ShadowLedger::new());
+        let account_state_core = Arc::new(AccountStateReducer::new());
+        let (tx, _rx) = mpsc::channel(16);
+        let mut engine = MonitoringEngine::new(config, shadow_ledger, tx);
+        engine.set_account_state_core(Arc::clone(&account_state_core));
+
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let bonding_curve = Pubkey::new_unique();
+        apply_test_canonical_update_with_receive_ts(
+            &account_state_core,
+            mint,
+            bonding_curve,
+            state_slot,
+            state_ts_ms,
+        );
+        let registered = engine.register_position_with_context(
+            pool,
+            mint,
+            bonding_curve,
+            Some(0.0000001),
+            Some(2_000_000_000),
+            Some(10_000_000_000),
+            Some(PositionEventContext {
+                join_metadata: PositionJoinMetadata {
+                    run_id: Some("shadow-v2-pr38b-test".to_string()),
+                    session_id: Some("session-pr38b-test".to_string()),
+                    decision_plane: Some("pr38b-test".to_string()),
+                    ..Default::default()
+                },
+                candidate_id: "candidate-pr38b-test".to_string(),
+                entry_order_id: "entry-order-pr38b-test".to_string(),
+                quote_id: "quote-pr38b-test".to_string(),
+                slot: Some(state_slot.saturating_sub(1)),
+                lane: Lane::Shadow,
+                position_id: Some("shadow-v2-pr38b-position".to_string()),
+                position_epoch: Some(9),
+                opened_at_ms: Some(state_ts_ms.saturating_sub(1_000)),
+            }),
+        );
+        assert!(registered.is_some());
+
+        (engine, account_state_core, mint, bonding_curve)
+    }
+
+    fn shadow_v2_exit_test_record(
+        engine: &MonitoringEngine,
+        mint: &Pubkey,
+        record_type: ShadowLifecycleRecordType,
+        fill_ts_ms: u64,
+        fill_slot: Option<u64>,
+        exit_token_amount_raw: Option<u64>,
+    ) -> ShadowLifecycleRecord {
+        let evidence = PriceTruthEvidence {
+            source: PriceTruthSource::CanonicalAccountStateSnapshot,
+            status: PriceTruthStatus::Resolved,
+            detail: None,
+            slot: fill_slot,
+            timestamp_ms: Some(fill_ts_ms),
+            age_ms: Some(0),
+            price_state: Some(PriceState::Valid),
+            price_reason: None,
+        };
+        let positions = engine.positions.read();
+        let pos = positions.get(mint).expect("registered position");
+        let mut record =
+            engine.shadow_lifecycle_record_base(pos, record_type, fill_ts_ms, &evidence);
+        record.fraction_bps = Some(10_000);
+        record.remaining_fraction_bps = 0;
+        record.exit_price = Some(0.00000012);
+        record.exit_token_amount_raw = exit_token_amount_raw;
+        record.exit_sample_slot = fill_slot;
+        record.exit_market_anchor_slot = fill_slot;
+        record.exit_reason_evaluation_ts_ms = Some(fill_ts_ms);
+        record.exit_landed_slot = fill_slot;
+        record.exit_landed_slot_source = fill_slot.map(|_| "test_exit_boundary_slot".to_string());
+        record.sample_slot = fill_slot;
+        record.sample_timestamp_ms = Some(fill_ts_ms);
+        record.close_reason = Some(CloseReason::Target);
+        record
     }
 
     #[test]
@@ -5778,6 +5897,177 @@ mod tests {
                 .count()
                 > 0
         );
+    }
+
+    #[test]
+    fn shadow_v2_exit_fill_uses_lifecycle_pool_state_sell_engine_when_available() {
+        let state_ts_ms = 1_785_000_300_000;
+        let (engine, _account_state_core, mint, _bonding_curve) =
+            make_shadow_v2_exit_test_engine(430_000_044, state_ts_ms);
+        let record = shadow_v2_exit_test_record(
+            &engine,
+            &mint,
+            ShadowLifecycleRecordType::ExitFilled,
+            state_ts_ms + 1_000,
+            Some(430_000_045),
+            Some(1_000_000_000),
+        );
+        let pool_state = engine
+            .shadow_v2_exit_pool_state_sample_from_lifecycle(&record)
+            .expect("lifecycle exit pool state");
+
+        let fill = engine.shadow_v2_exit_fill_from_lifecycle(&record, Some(&pool_state));
+
+        assert_eq!(fill.fill_status, FillStatus::Filled);
+        assert_eq!(fill.execution_simulation_ready, Some(true));
+        assert_eq!(
+            fill.execution_label_grade,
+            Some(ShadowV2ExecutionLabelGrade::DiagnosticSim)
+        );
+        assert_eq!(fill.research_provenance_ready, Some(false));
+        assert_eq!(
+            fill.envelope.measurement_grade,
+            MeasurementGrade::DiagnosticOnly
+        );
+        assert_eq!(
+            fill.execution_model_version.as_deref(),
+            Some(SHADOW_V2_EXIT_FILL_MODEL_VERSION)
+        );
+        assert!(fill.fill_price.is_some());
+        assert!(fill.fill_amount_sol.is_some());
+        assert!(fill.fill_amount_tokens.is_some());
+        assert_eq!(fill.slippage_tolerance_bps, Some(150));
+        assert_eq!(fill.fee_bps, Some(100));
+        assert!(fill.own_impact_bps.is_some());
+        assert!(fill.pool_state_before.is_some());
+        assert!(fill.pool_state_after.is_some());
+        assert!(fill.realized_slippage_bps.is_none());
+        assert!(fill.quote_fill_divergence_bps.is_none());
+        assert!(fill
+            .provenance_blockers
+            .contains(&"POOL_STATE_ACCOUNT_DATA_HASH_UNAVAILABLE_IN_RUNTIME".to_string()));
+        assert!(fill
+            .envelope
+            .limitations
+            .contains(&"EXIT_FILL_L1_SELL_MODEL_FROM_LIFECYCLE_EXIT_BOUNDARY".to_string()));
+    }
+
+    #[test]
+    fn shadow_v2_exit_fill_blocks_without_lifecycle_pool_state() {
+        let state_ts_ms = 1_785_000_300_000;
+        let (engine, _account_state_core, mint, _bonding_curve) =
+            make_shadow_v2_exit_test_engine(430_000_044, state_ts_ms);
+        let record = shadow_v2_exit_test_record(
+            &engine,
+            &mint,
+            ShadowLifecycleRecordType::ExitFilled,
+            state_ts_ms + 1_000,
+            Some(430_000_045),
+            Some(1_000_000_000),
+        );
+
+        let fill = engine.shadow_v2_exit_fill_from_lifecycle(&record, None);
+
+        assert_eq!(fill.fill_status, FillStatus::BlockedByData);
+        assert_eq!(fill.execution_simulation_ready, Some(false));
+        assert!(fill.pool_state_before.is_none());
+        assert!(fill.fill_price.is_none());
+        assert!(fill
+            .limitations
+            .contains(&"EXIT_FILL_POOL_STATE_SAMPLE_MISSING".to_string()));
+        assert!(fill
+            .limitations
+            .contains(&"EXIT_POOL_STATE_BEFORE_UNAVAILABLE".to_string()));
+        assert!(fill
+            .limitations
+            .contains(&"EXIT_FILL_POOL_STATE_SAMPLE_NOT_AVAILABLE_IN_RUNTIME".to_string()));
+    }
+
+    #[test]
+    fn shadow_v2_exit_fill_blocks_without_exit_token_amount_raw() {
+        let state_ts_ms = 1_785_000_300_000;
+        let (engine, _account_state_core, mint, _bonding_curve) =
+            make_shadow_v2_exit_test_engine(430_000_044, state_ts_ms);
+        let record = shadow_v2_exit_test_record(
+            &engine,
+            &mint,
+            ShadowLifecycleRecordType::ExitFilled,
+            state_ts_ms + 1_000,
+            Some(430_000_045),
+            None,
+        );
+        let pool_state = engine
+            .shadow_v2_exit_pool_state_sample_from_lifecycle(&record)
+            .expect("lifecycle exit pool state");
+
+        let fill = engine.shadow_v2_exit_fill_from_lifecycle(&record, Some(&pool_state));
+
+        assert_eq!(fill.fill_status, FillStatus::BlockedByData);
+        assert_eq!(fill.execution_simulation_ready, Some(false));
+        assert!(fill.pool_state_before.is_some());
+        assert!(fill.pool_state_after.is_none());
+        assert!(fill.fill_price.is_none());
+        assert!(fill
+            .limitations
+            .contains(&"EXIT_FILL_TOKEN_AMOUNT_RAW_UNAVAILABLE".to_string()));
+        assert!(!fill
+            .envelope
+            .limitations
+            .contains(&"EXIT_FILL_L1_SELL_MODEL_FROM_LIFECYCLE_EXIT_BOUNDARY".to_string()));
+    }
+
+    #[test]
+    fn shadow_v2_exit_fill_preserves_same_slot_ordering_blocker() {
+        let state_ts_ms = 1_785_000_300_000;
+        let (engine, _account_state_core, mint, _bonding_curve) =
+            make_shadow_v2_exit_test_engine(430_000_045, state_ts_ms);
+        let record = shadow_v2_exit_test_record(
+            &engine,
+            &mint,
+            ShadowLifecycleRecordType::ExitFilled,
+            state_ts_ms + 1_000,
+            Some(430_000_045),
+            Some(1_000_000_000),
+        );
+        let pool_state = engine
+            .shadow_v2_exit_pool_state_sample_from_lifecycle(&record)
+            .expect("lifecycle exit pool state");
+
+        let fill = engine.shadow_v2_exit_fill_from_lifecycle(&record, Some(&pool_state));
+
+        assert_eq!(fill.fill_status, FillStatus::BlockedByData);
+        assert_eq!(fill.execution_simulation_ready, Some(false));
+        assert!(fill
+            .limitations
+            .contains(&"EXIT_FILL_POOL_STATE_SAME_SLOT_ORDER_AMBIGUOUS".to_string()));
+        assert!(fill.pool_state_after.is_none());
+    }
+
+    #[test]
+    fn shadow_v2_exit_fill_preserves_future_pool_state_blocker() {
+        let state_ts_ms = 1_785_000_300_000;
+        let (engine, _account_state_core, mint, _bonding_curve) =
+            make_shadow_v2_exit_test_engine(430_000_046, state_ts_ms + 2_000);
+        let record = shadow_v2_exit_test_record(
+            &engine,
+            &mint,
+            ShadowLifecycleRecordType::ExitFilled,
+            state_ts_ms + 1_000,
+            Some(430_000_045),
+            Some(1_000_000_000),
+        );
+        let pool_state = engine
+            .shadow_v2_exit_pool_state_sample_from_lifecycle(&record)
+            .expect("lifecycle exit pool state");
+
+        let fill = engine.shadow_v2_exit_fill_from_lifecycle(&record, Some(&pool_state));
+
+        assert_eq!(fill.fill_status, FillStatus::BlockedByData);
+        assert_eq!(fill.execution_simulation_ready, Some(false));
+        assert!(fill
+            .limitations
+            .contains(&"EXIT_FILL_POOL_STATE_AFTER_FILL_BOUNDARY".to_string()));
+        assert!(fill.pool_state_after.is_none());
     }
 
     #[tokio::test]
