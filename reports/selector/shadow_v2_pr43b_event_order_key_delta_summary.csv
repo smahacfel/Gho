@@ -1,0 +1,30 @@
+metric,value,notes
+final_verdict,PR43B_EVENTORDERKEY_PROVENANCE_IMPROVED,EventOrderKey provenance and classification improved but L2 is not granted.
+pr43a_baseline_verdict,L2_RESEARCH_GRADE_PATH_PRESENT,Accepted PR43-A0 baseline.
+baseline_temporal_audit_verdict,BLOCKED_TEMPORAL_AMBIGUITY_REMAINS,PR43-A0 temporal baseline.
+baseline_event_order_key_missing_required_rows,0,PR43-A0 had no missing required event_order_key rows.
+baseline_non_monotonic_event_seq_in_process,0,PR43-A0 did not show non-monotonic process sequence.
+baseline_block_time_unknown_rows,252,PR43-A0 explicit UNKNOWN chain-order baseline.
+baseline_signature_unknown_rows,168,PR43-A0 explicit UNKNOWN chain-order baseline.
+baseline_transaction_index_unknown_rows,252,PR43-A0 explicit UNKNOWN chain-order baseline.
+baseline_instruction_index_unknown_rows,252,PR43-A0 explicit UNKNOWN chain-order baseline.
+baseline_inner_instruction_index_unknown_rows,252,PR43-A0 explicit UNKNOWN chain-order baseline.
+baseline_log_index_unknown_rows,252,PR43-A0 explicit UNKNOWN chain-order baseline.
+event_order_schema_classification_added,true,EventOrderUnknown now distinguishes UNKNOWN NOT_APPLICABLE DERIVED RUNTIME_LOCAL.
+available_source_components_propagated_fixture,pass,Known block_time signature tx index instruction index inner index and log index propagate into PoolStateSampleV2.
+missing_source_components_explicit_unknown_fixture,pass,Missing boundary source components remain explicit UNKNOWN and emit typed limitations.
+terminal_truth_chain_components_classified_derived_fixture,pass,Derived terminal truth uses DERIVED chain classifications instead of fake chain-observed values.
+event_seq_l2_substitute_guard,pass,event_seq_in_process alone remains insufficient for L2 chain-order proof.
+same_slot_ambiguity_research_safe,false,Same-slot ambiguity remains blocked unless chain tie-breaker evidence is known.
+not_applicable_or_derived_chain_components_count_fixture,6,Terminal truth fixture classifies block_time signature tx index instruction index inner index and log index as DERIVED.
+unknown_but_required_for_research_count_fixture,1,Missing boundary source components produce EVENT_ORDER_UNKNOWN_BUT_REQUIRED_FOR_RESEARCH in fixture coverage.
+runtime_temporal_delta_not_measured_in_PR43B,true,No burnin or runtime validation run was allowed in PR43-B.
+requires_next_15min_smoke_after_merge,true,Needed to measure runtime delta after PR43-B merge.
+account_data_hash_solved,false,Out of scope for PR43-B and still an L2 blocker.
+path_density_solved,false,Out of scope for PR43-B and still an L2 blocker.
+sample_size_solved,false,Out of scope for PR43-B and still an L2 blocker.
+research_grade_granted,false,PR43-B does not grant L2 research-grade.
+live_equivalence_granted,false,PR43-B does not grant live-equivalence.
+runtime_approval,false,Runtime approval remains false.
+shadow_close_only_approval,false,shadow_close_only approval remains false.
+active_close_approval,false,active close approval remains false.

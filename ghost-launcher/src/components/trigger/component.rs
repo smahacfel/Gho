@@ -2412,6 +2412,12 @@ impl TriggerComponent {
             token_decimals: SHADOW_V2_ENTRY_TOKEN_DECIMALS,
             sol_lamports: SHADOW_V2_ENTRY_SOL_LAMPORTS,
             account_data_hash: None,
+            source_block_time: None,
+            source_tx_signature: None,
+            source_transaction_index: None,
+            source_instruction_index: None,
+            source_inner_instruction_index: None,
+            source_log_index: None,
             canonical_pool_state,
             limitations,
         })
