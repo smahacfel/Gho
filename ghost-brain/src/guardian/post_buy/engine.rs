@@ -64,12 +64,12 @@ use super::integration::{PositionRuntimeRouter, ShadowPositionBookAemAdapter};
 #[cfg(test)]
 use super::shadow_v2::ShadowV2ValidationHarnessConfig;
 use super::shadow_v2::{
-    ClockDomain, ClockedTimestamp, EventOrderComponent, EventOrderKey, MeasurementGrade,
-    PoolStateSampleV2, ShadowExitAttemptV2, ShadowExitFillModelConfig, ShadowExitFillV2,
-    ShadowPathSampleV2, ShadowPathSamplingModeV2, ShadowPathSamplingReasonV2,
-    ShadowTerminalTruthV2, ShadowV2Envelope, ShadowV2Record, ShadowV2ValidationEvidenceStatus,
-    ShadowV2ValidationHarness, SimulationLevel, TemporalClass, TerminalReasonV2,
-    SHADOW_V2_EXIT_FILL_MODEL_VERSION,
+    executable_pnl_link_from_canonical_position_fills, ClockDomain, ClockedTimestamp,
+    EventOrderComponent, EventOrderKey, MeasurementGrade, PoolStateSampleV2, ShadowExitAttemptV2,
+    ShadowExitFillModelConfig, ShadowExitFillV2, ShadowPathSampleV2, ShadowPathSamplingModeV2,
+    ShadowPathSamplingReasonV2, ShadowTerminalTruthV2, ShadowV2Envelope, ShadowV2ExecutablePnlLink,
+    ShadowV2Record, ShadowV2ValidationEvidenceStatus, ShadowV2ValidationHarness, SimulationLevel,
+    TemporalClass, TerminalReasonV2, SHADOW_V2_EXIT_FILL_MODEL_VERSION,
 };
 
 #[cfg(test)]
@@ -1659,6 +1659,8 @@ impl MonitoringEngine {
         }
 
         let mut records = Vec::new();
+        let mut terminal_truth_requested = false;
+        let mut pending_exit_fill_for_terminal: Option<ShadowExitFillV2> = None;
         if matches!(
             record.record_type,
             ShadowLifecycleRecordType::ExitFilled
@@ -1681,9 +1683,10 @@ impl MonitoringEngine {
             if let Some(pool_state) = exit_pool_state.as_ref() {
                 records.push(ShadowV2Record::PoolStateSampleV2(pool_state.clone()));
             }
-            records.push(ShadowV2Record::ShadowExitFillV2(
-                self.shadow_v2_exit_fill_from_lifecycle(record, exit_pool_state.as_ref()),
-            ));
+            let exit_fill =
+                self.shadow_v2_exit_fill_from_lifecycle(record, exit_pool_state.as_ref());
+            pending_exit_fill_for_terminal = Some(exit_fill.clone());
+            records.push(ShadowV2Record::ShadowExitFillV2(exit_fill));
         }
 
         if matches!(
@@ -1698,16 +1701,25 @@ impl MonitoringEngine {
                 if let Some(pool_state) = exit_pool_state.as_ref() {
                     records.push(ShadowV2Record::PoolStateSampleV2(pool_state.clone()));
                 }
-                records.push(ShadowV2Record::ShadowExitFillV2(
-                    self.shadow_v2_exit_fill_from_lifecycle(record, exit_pool_state.as_ref()),
-                ));
+                let exit_fill =
+                    self.shadow_v2_exit_fill_from_lifecycle(record, exit_pool_state.as_ref());
+                pending_exit_fill_for_terminal = Some(exit_fill.clone());
+                records.push(ShadowV2Record::ShadowExitFillV2(exit_fill));
             }
-            records.push(ShadowV2Record::ShadowTerminalTruthV2(
-                self.shadow_v2_terminal_truth_from_lifecycle(record),
-            ));
+            terminal_truth_requested = true;
         }
 
         let mut harness = harness.lock();
+        if terminal_truth_requested {
+            let executable_pnl_link = executable_pnl_link_from_canonical_position_fills(
+                harness.canonical_stream(),
+                &record.position_id,
+                pending_exit_fill_for_terminal.as_ref(),
+            );
+            records.push(ShadowV2Record::ShadowTerminalTruthV2(
+                self.shadow_v2_terminal_truth_from_lifecycle(record, executable_pnl_link),
+            ));
+        }
         for record in records {
             let event_id = record.envelope().event_id.clone();
             let outcome = harness.append_record(record);
@@ -2036,6 +2048,7 @@ impl MonitoringEngine {
     fn shadow_v2_terminal_truth_from_lifecycle(
         &self,
         record: &ShadowLifecycleRecord,
+        executable_pnl_link: Option<ShadowV2ExecutablePnlLink>,
     ) -> ShadowTerminalTruthV2 {
         let terminal_ts = record
             .exit_reason_evaluation_ts_ms
@@ -2064,28 +2077,44 @@ impl MonitoringEngine {
             .push("TERMINAL_TRUTH_MARK_PATH_ONLY_NOT_EXECUTABLE_FILL".to_string());
         envelope
             .limitations
-            .push("TERMINAL_EXECUTABLE_PNL_BLOCKED_BY_EXIT_FILL_PROVENANCE".to_string());
-        envelope
-            .limitations
             .push("TERMINAL_TRUTH_DERIVED_FROM_LEGACY_LIFECYCLE_RECORD".to_string());
-        envelope
-            .limitations
-            .push("TERMINAL_ENTRY_FILL_LINK_BEST_EFFORT_FROM_LEGACY_TIMELINE".to_string());
 
-        let linked_exit_fill = if record.total_exits == 0 {
-            Some(format!(
-                "shadow_v2_exit_fill:{}:{}:{}",
-                record.position_id,
-                terminal_ts,
-                shadow_lifecycle_record_type_label(ShadowLifecycleRecordType::PositionClosed)
-            ))
-        } else {
-            envelope.limitations.push(
-                "TERMINAL_EXIT_FILL_LINK_BLOCKED_BY_LEGACY_EXIT_TIMESTAMP_MISMATCH_RISK"
-                    .to_string(),
-            );
-            None
-        };
+        let (final_pnl_executable_bps, linked_entry_fill, linked_exit_fill, reconciliation_status) =
+            if let Some(link) = executable_pnl_link {
+                envelope.simulation_level = SimulationLevel::FillModelStatic;
+                envelope.measurement_grade = MeasurementGrade::DiagnosticOnly;
+                envelope.quality =
+                    "TERMINAL_TRUTH_WITH_DIAGNOSTIC_EXECUTABLE_PNL_FROM_CANONICAL_FILLS"
+                        .to_string();
+                envelope.limitations.push(
+                    "TERMINAL_EXECUTABLE_PNL_FROM_CANONICAL_ENTRY_EXIT_FILLED_EVENTS".to_string(),
+                );
+                envelope
+                    .limitations
+                    .push("TERMINAL_EXECUTABLE_PNL_DIAGNOSTIC_ONLY_NOT_LIVE_CONFIRMED".to_string());
+                (
+                    Some(link.final_pnl_executable_bps),
+                    Some(link.linked_entry_fill),
+                    Some(link.linked_exit_fill),
+                    "TERMINAL_TRUTH_WITH_DIAGNOSTIC_EXECUTABLE_PNL".to_string(),
+                )
+            } else {
+                envelope
+                    .limitations
+                    .push("TERMINAL_EXECUTABLE_PNL_BLOCKED_BY_ENTRY_EXIT_FILL_LINK".to_string());
+                envelope
+                    .limitations
+                    .push("TERMINAL_ENTRY_FILL_LINK_BLOCKED_BY_CANONICAL_FILL_JOIN".to_string());
+                envelope
+                    .limitations
+                    .push("TERMINAL_EXIT_FILL_LINK_BLOCKED_BY_CANONICAL_FILL_JOIN".to_string());
+                (
+                    None,
+                    None,
+                    None,
+                    "TERMINAL_TRUTH_FROM_LEGACY_LIFECYCLE_MARK_ONLY".to_string(),
+                )
+            };
 
         ShadowTerminalTruthV2 {
             envelope,
@@ -2106,15 +2135,11 @@ impl MonitoringEngine {
             terminal_slot: record.exit_landed_slot.or(record.exit_sample_slot),
             terminal_source: "shadow_lifecycle.position_closed".to_string(),
             final_pnl_mark_bps: shadow_v2_pnl_bps_from_lifecycle(record),
-            final_pnl_executable_bps: None,
+            final_pnl_executable_bps,
             close_age_ms: record.duration_ms,
-            linked_entry_fill: Some(format!(
-                "shadow_v2_entry_fill:{}:{}",
-                record.position_id,
-                record.entry_timestamp_ms()
-            )),
+            linked_entry_fill,
             linked_exit_fill,
-            reconciliation_status: "TERMINAL_TRUTH_FROM_LEGACY_LIFECYCLE_MARK_ONLY".to_string(),
+            reconciliation_status,
             duplicate_terminal_handling: "CANONICAL_STREAM_REJECTS_DUPLICATE_TERMINAL_TRUTH"
                 .to_string(),
         }
@@ -5278,7 +5303,10 @@ mod tests {
     use super::*;
     use crate::events::{EventEmitter, EventWriterConfig};
     use crate::guardian::post_buy::integration::{PositionRuntimeRouter, ShadowPositionBook};
-    use crate::guardian::post_buy::shadow_v2::FillStatus;
+    use crate::guardian::post_buy::shadow_v2::{
+        FillStatus, ShadowEntryFillModelConfig, ShadowEntryFillV2, ShadowV2WriteStatus,
+        SHADOW_V2_ENTRY_FILL_MODEL_VERSION,
+    };
     use crate::guardian::post_buy::shadow_v2_execution::ShadowV2ExecutionLabelGrade;
     use ghost_core::account_state_core::reducer::AccountStateReducer;
     use ghost_core::account_state_core::types::{AccountStateUpdate, UpdateSource};
@@ -5873,7 +5901,17 @@ mod tests {
         );
         assert_eq!(
             terminal["payload"]["record"]["linked_exit_fill"],
-            exit_fill["envelope"]["event_id"]
+            serde_json::Value::Null
+        );
+        assert!(terminal["envelope"]["limitations"]
+            .as_array()
+            .expect("terminal limitations")
+            .iter()
+            .any(|value| value == "TERMINAL_EXECUTABLE_PNL_BLOCKED_BY_ENTRY_EXIT_FILL_LINK"));
+
+        assert_eq!(
+            exit_fill["payload"]["record"]["fill_status"],
+            "BLOCKED_BY_DATA"
         );
 
         assert_eq!(
@@ -5897,6 +5935,113 @@ mod tests {
                 .count()
                 > 0
         );
+    }
+
+    #[test]
+    fn shadow_v2_terminal_truth_sets_executable_pnl_from_canonical_filled_entry_and_exit() {
+        let tmp = TempDir::new().expect("tempdir");
+        let harness = Arc::new(Mutex::new(
+            ShadowV2ValidationHarness::new(shadow_v2_harness_config_for_dir(tmp.path()))
+                .expect("shadow v2 harness"),
+        ));
+        let state_ts_ms = 1_785_000_300_000;
+        let (mut engine, _account_state_core, mint, _bonding_curve) =
+            make_shadow_v2_exit_test_engine(430_000_044, state_ts_ms);
+        engine.set_shadow_v2_validation_harness(Arc::clone(&harness));
+
+        let exit_record = shadow_v2_exit_test_record(
+            &engine,
+            &mint,
+            ShadowLifecycleRecordType::ExitFilled,
+            state_ts_ms + 1_000,
+            Some(430_000_045),
+            Some(1_000_000_000),
+        );
+        let mut pool_state = engine
+            .shadow_v2_exit_pool_state_sample_from_lifecycle(&exit_record)
+            .expect("lifecycle exit pool state");
+        pool_state.event_order_key.event_seq_in_process = 1;
+        let mut entry_order_key = shadow_v2_event_order_key(
+            Some(430_000_045),
+            None,
+            shadow_v2_event_seq(state_ts_ms + 500, 2),
+            state_ts_ms + 500,
+        );
+        entry_order_key.event_seq_in_process = 2;
+        let entry_fill = ShadowEntryFillV2::from_static_buy_model(
+            engine.shadow_v2_lifecycle_envelope(
+                &exit_record,
+                "shadow_entry_fill_v2",
+                "shadow_v2_entry_fill:terminal-pnl-test".to_string(),
+                TemporalClass::PostEntry,
+                ClockDomain::LandingTsMs,
+            ),
+            entry_order_key,
+            &pool_state,
+            &ShadowEntryFillModelConfig::bonding_curve(
+                7_000_000,
+                2_000,
+                100,
+                SHADOW_V2_ENTRY_FILL_MODEL_VERSION,
+            ),
+        );
+        assert_eq!(entry_fill.fill_status, FillStatus::Filled);
+        let append_outcome = harness
+            .lock()
+            .append_record(ShadowV2Record::ShadowEntryFillV2(entry_fill));
+        assert_eq!(append_outcome.canonical_write, ShadowV2WriteStatus::Ok);
+
+        engine.append_shadow_v2_lifecycle_record(&exit_record);
+
+        let mut close_record = shadow_v2_exit_test_record(
+            &engine,
+            &mint,
+            ShadowLifecycleRecordType::PositionClosed,
+            state_ts_ms + 1_100,
+            Some(430_000_046),
+            Some(1_000_000_000),
+        );
+        close_record.total_exits = 1;
+        engine.append_shadow_v2_lifecycle_record(&close_record);
+
+        let canonical_rows = read_jsonl_rows(&tmp.path().join("shadow_position_event_v2.jsonl"));
+        let entry_fill_row = canonical_rows
+            .iter()
+            .find(|row| row["event_kind"] == "ENTRY_FILL")
+            .expect("entry fill row");
+        let exit_fill_row = canonical_rows
+            .iter()
+            .find(|row| row["event_kind"] == "EXIT_FILL")
+            .expect("exit fill row");
+        assert_eq!(exit_fill_row["payload"]["record"]["fill_status"], "FILLED");
+
+        let terminal = canonical_rows
+            .iter()
+            .find(|row| row["event_kind"] == "TERMINAL_TRUTH")
+            .expect("terminal truth row");
+        assert!(
+            terminal["payload"]["record"]["final_pnl_executable_bps"].is_i64(),
+            "terminal executable pnl missing: {terminal:?}"
+        );
+        assert_eq!(
+            terminal["payload"]["record"]["linked_entry_fill"],
+            entry_fill_row["envelope"]["event_id"]
+        );
+        assert_eq!(
+            terminal["payload"]["record"]["linked_exit_fill"],
+            exit_fill_row["envelope"]["event_id"]
+        );
+        assert_eq!(
+            terminal["payload"]["record"]["reconciliation_status"],
+            "TERMINAL_TRUTH_WITH_DIAGNOSTIC_EXECUTABLE_PNL"
+        );
+        assert!(terminal["envelope"]["limitations"]
+            .as_array()
+            .expect("terminal limitations")
+            .iter()
+            .any(
+                |value| value == "TERMINAL_EXECUTABLE_PNL_FROM_CANONICAL_ENTRY_EXIT_FILLED_EVENTS"
+            ));
     }
 
     #[test]

@@ -1,0 +1,20 @@
+metric,value,notes
+final_verdict,PR41_IMPLEMENTATION_READY_FOR_REVIEW,implementation-only pending review and runtime validation
+base_main_head,8b2723b085e02066a69ca82ab4ef626a8f69aeb9,PR40 merge commit observed before PR41 work
+root_cause,terminal_truth_always_null_executable_pnl,MonitoringEngine terminal truth did not exact-link canonical FILLED entry and exit fills
+helper_added,executable_pnl_link_from_canonical_position_fills,requires same position_id and FILLED entry plus FILLED exit
+terminal_source_allowed,canonical_shadow_entry_fill_v2_and_shadow_exit_fill_v2_only,no mark price replay selected point terminal mark pnl or blocked fills
+pending_exit_fill_supported,true,only same position_id and fill_status FILLED
+diagnostic_only,true,measurement_grade remains DiagnosticOnly
+runtime_approval,false,not granted
+shadow_close_only_approval,false,not granted
+active_close_approval,false,not granted
+research_grade,false,not granted
+live_equivalence,false,not granted
+strategy_research_unblocked,false,not granted
+burnin_run_started,false,no burnin or validation run in PR41
+test_shadow_v2_executable_pnl_link_requires_same_position_filled_entry_and_exit,PASS,targeted cargo test
+test_shadow_v2_terminal_truth_sets_executable_pnl_from_canonical_filled_entry_and_exit,PASS,targeted cargo test
+test_shadow_v2_lifecycle_close_emits_path_exit_terminal_records,PASS,targeted cargo test
+cargo_check_ghost_brain,PASS,existing repo warnings only
+cargo_check_ghost_launcher,PASS,existing repo warnings only
