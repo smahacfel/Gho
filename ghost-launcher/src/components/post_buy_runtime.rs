@@ -2921,11 +2921,18 @@ fn maybe_emit_shadow_v2_entry_evidence(
         .as_ref()
         .and_then(|burnin| burnin.run_namespace.clone())
         .unwrap_or_else(|| "UNKNOWN_RUN".to_string());
+    let mut entry_boundary_blockers = Vec::new();
     let entry_pool_state_before = position_id_value
         .as_deref()
         .zip(entry_boundary.as_ref())
-        .map(|(position_id, boundary)| {
-            shadow_v2_entry_pool_state_from_boundary(
+        .and_then(|(position_id, boundary)| {
+            let blockers =
+                shadow_v2_entry_boundary_handoff_blockers(pool_amm_id, base_mint, boundary);
+            if !blockers.is_empty() {
+                entry_boundary_blockers = blockers;
+                return None;
+            }
+            Some(shadow_v2_entry_pool_state_from_boundary(
                 &run_id,
                 join_metadata.session_id.clone(),
                 candidate_id,
@@ -2935,7 +2942,7 @@ fn maybe_emit_shadow_v2_entry_evidence(
                 entry_ts_ms,
                 signature,
                 boundary,
-            )
+            ))
         });
     maybe_emit_shadow_v2_entry_evidence_with_pool_state(
         harness,
@@ -2954,7 +2961,29 @@ fn maybe_emit_shadow_v2_entry_evidence(
         join_metadata,
         entry_pool_state_before,
         entry_boundary.as_ref(),
+        &entry_boundary_blockers,
     );
+}
+
+fn shadow_v2_entry_boundary_handoff_blockers(
+    pool_amm_id: &str,
+    base_mint: &str,
+    boundary: &ShadowV2EntryBoundaryPayload,
+) -> Vec<String> {
+    let mut blockers = Vec::new();
+    let boundary_base_mint = boundary.canonical_pool_state.base_mint.to_string();
+    if boundary_base_mint != base_mint {
+        blockers.push("ENTRY_BOUNDARY_BASE_MINT_MISMATCH".to_string());
+    }
+    let boundary_pool_amm_id = boundary.canonical_pool_state.pool_amm_id.to_string();
+    if boundary_pool_amm_id != pool_amm_id {
+        blockers.push("ENTRY_BOUNDARY_POOL_ID_MISMATCH".to_string());
+    }
+    if !blockers.is_empty() {
+        blockers.push("ENTRY_BOUNDARY_HANDOFF_VALIDATION_FAILED".to_string());
+        blockers.push("ENTRY_POOL_STATE_BEFORE_REJECTED_BY_BOUNDARY_VALIDATION".to_string());
+    }
+    blockers
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3039,6 +3068,7 @@ fn maybe_emit_shadow_v2_entry_evidence_with_pool_state(
     join_metadata: &PositionJoinMetadata,
     entry_pool_state_before: Option<PoolStateSampleV2>,
     entry_boundary: Option<&ShadowV2EntryBoundaryPayload>,
+    entry_boundary_blockers: &[String],
 ) {
     let Some(harness) = harness.as_ref() else {
         return;
@@ -3232,6 +3262,7 @@ fn maybe_emit_shadow_v2_entry_evidence_with_pool_state(
             "LANDING_TELEMETRY_UNAVAILABLE".to_string(),
             "QUOTE_FILL_DIVERGENCE_UNAVAILABLE".to_string(),
         ];
+        blockers.extend(entry_boundary_blockers.iter().cloned());
         if entry_price.is_none() {
             blockers.push("ENTRY_FILL_ENTRY_PRICE_MISSING".to_string());
         }
@@ -4664,6 +4695,57 @@ mod tests {
         config
     }
 
+    fn shadow_v2_entry_boundary_test_state(
+        entry_ts_ms: u64,
+        last_update_slot: u64,
+    ) -> CanonicalPoolState {
+        CanonicalPoolState {
+            pool_amm_id: Pubkey::new_unique(),
+            base_mint: Pubkey::new_unique(),
+            bonding_curve: Pubkey::new_unique(),
+            virtual_sol_reserves: 30_000_000_000,
+            virtual_token_reserves: 1_000_000_000_000,
+            real_sol_reserves: 7_000_000_000,
+            real_token_reserves: 500_000_000_000,
+            bonding_curve_progress: 42.5,
+            price_sol: 0.00003,
+            market_cap_sol: 30.0,
+            token_total_supply: 1_000_000_000_000,
+            is_complete: false,
+            last_update_slot,
+            last_update_ts_ms: entry_ts_ms,
+            curve_finality: CurveFinality::Provisional,
+            state_phase: StatePhase::Canonical,
+            update_count: 3,
+            initial_price_sol: 0.00001,
+            price_change_since_t0_pct: 200.0,
+            reserve_velocity_sol_per_sec: 0.5,
+        }
+    }
+
+    fn shadow_v2_entry_boundary_test_payload(
+        entry_ts_ms: u64,
+        state: CanonicalPoolState,
+    ) -> ShadowV2EntryBoundaryPayload {
+        ShadowV2EntryBoundaryPayload {
+            boundary_kind: "ENTRY_BEFORE".to_string(),
+            source: "TRIGGER_ACCOUNT_STATE_CORE_CANONICAL_STATE".to_string(),
+            captured_at_wall_ms: entry_ts_ms,
+            latest_observed_slot: state.last_update_slot.checked_add(1),
+            state_slot: state.last_update_slot,
+            state_ts_ms: state.last_update_ts_ms,
+            amount_lamports: 7_000_000,
+            min_tokens_out: 1,
+            fee_bps: Some(100),
+            slippage_tolerance_bps: Some(500),
+            token_decimals: 6,
+            sol_lamports: 1_000_000_000,
+            account_data_hash: None,
+            canonical_pool_state: state,
+            limitations: vec!["ACCOUNT_DATA_HASH_UNAVAILABLE_IN_RUNTIME".to_string()],
+        }
+    }
+
     fn write_fake_shadow_v2_manifest_audit_script(root: &Path) -> PathBuf {
         let script_path = root.join("fake_shadow_v2_manifest_audit.py");
         std::fs::write(
@@ -4959,6 +5041,7 @@ sys.exit(0)
             &join_metadata,
             Some(pool_state),
             None,
+            &[],
         );
 
         let canonical_path = tmp.path().join("shadow_position_event_v2.jsonl");
@@ -5035,6 +5118,8 @@ sys.exit(0)
             price_change_since_t0_pct: 200.0,
             reserve_velocity_sol_per_sec: 0.5,
         };
+        let pool_amm_id = state.pool_amm_id.to_string();
+        let base_mint = state.base_mint.to_string();
         let boundary = ShadowV2EntryBoundaryPayload {
             boundary_kind: "ENTRY_BEFORE".to_string(),
             source: "TRIGGER_ACCOUNT_STATE_CORE_CANONICAL_STATE".to_string(),
@@ -5057,8 +5142,8 @@ sys.exit(0)
             &harness,
             &runtime_config,
             "candidate-entry-boundary-test",
-            "pool-entry-boundary-test",
-            "mint-entry-boundary-test",
+            &pool_amm_id,
+            &base_mint,
             Some("position-entry-boundary-test"),
             "signature-entry-boundary-test",
             0.007,
@@ -5097,6 +5182,205 @@ sys.exit(0)
         assert!(provenance_blockers
             .iter()
             .any(|value| value == "POOL_STATE_ACCOUNT_DATA_HASH_UNAVAILABLE_IN_RUNTIME"));
+    }
+
+    #[test]
+    fn shadow_v2_postbuy_entry_boundary_blocks_base_mint_mismatch() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let burnin = shadow_v2_burnin_config_for_temp_scope(tmp.path());
+        let runtime_config = PostBuyRuntimeConfig {
+            shadow_v2_burnin: Some(burnin),
+            ..PostBuyRuntimeConfig::default()
+        };
+        let harness = init_shadow_v2_validation_harness(runtime_config.shadow_v2_burnin.as_ref())
+            .expect("harness init")
+            .map(|harness| Arc::new(ParkingMutex::new(harness)));
+        let join_metadata = PositionJoinMetadata {
+            session_id: Some("session-entry-boundary-base-mismatch-test".to_string()),
+            decision_plane: Some("shadow_v2_pr34c_test".to_string()),
+            ..Default::default()
+        };
+        let entry_ts_ms = 1_785_000_210_000;
+        let state = shadow_v2_entry_boundary_test_state(entry_ts_ms, 430_000_010);
+        let pool_amm_id = state.pool_amm_id.to_string();
+        let boundary = shadow_v2_entry_boundary_test_payload(entry_ts_ms, state);
+
+        maybe_emit_shadow_v2_entry_evidence(
+            &harness,
+            &runtime_config,
+            "candidate-entry-boundary-base-mismatch-test",
+            &pool_amm_id,
+            &Pubkey::new_unique().to_string(),
+            Some("position-entry-boundary-base-mismatch-test"),
+            "signature-entry-boundary-base-mismatch-test",
+            0.007,
+            Some(1),
+            Some(7_000_000_000),
+            Some(430_000_012),
+            Some(430_000_011),
+            Some(entry_ts_ms),
+            &join_metadata,
+            Some(boundary),
+        );
+
+        let canonical = std::fs::read_to_string(tmp.path().join("shadow_position_event_v2.jsonl"))
+            .expect("canonical jsonl");
+        let rows: Vec<serde_json::Value> = canonical
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("canonical row"))
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert!(rows
+            .iter()
+            .all(|row| row["event_kind"] != "POOL_STATE_SAMPLE"));
+        assert_eq!(rows[1]["event_kind"], "ENTRY_FILL");
+        assert_eq!(
+            rows[1]["payload"]["record"]["fill_status"],
+            "BLOCKED_BY_DATA"
+        );
+        let limitations = rows[1]["payload"]["record"]["limitations"]
+            .as_array()
+            .expect("limitations array");
+        for expected in [
+            "ENTRY_BOUNDARY_BASE_MINT_MISMATCH",
+            "ENTRY_BOUNDARY_HANDOFF_VALIDATION_FAILED",
+            "ENTRY_POOL_STATE_BEFORE_REJECTED_BY_BOUNDARY_VALIDATION",
+        ] {
+            assert!(
+                limitations.iter().any(|value| value == expected),
+                "expected limitation {expected}, got {limitations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shadow_v2_postbuy_entry_boundary_blocks_pool_id_mismatch() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let burnin = shadow_v2_burnin_config_for_temp_scope(tmp.path());
+        let runtime_config = PostBuyRuntimeConfig {
+            shadow_v2_burnin: Some(burnin),
+            ..PostBuyRuntimeConfig::default()
+        };
+        let harness = init_shadow_v2_validation_harness(runtime_config.shadow_v2_burnin.as_ref())
+            .expect("harness init")
+            .map(|harness| Arc::new(ParkingMutex::new(harness)));
+        let join_metadata = PositionJoinMetadata {
+            session_id: Some("session-entry-boundary-pool-mismatch-test".to_string()),
+            decision_plane: Some("shadow_v2_pr34c_test".to_string()),
+            ..Default::default()
+        };
+        let entry_ts_ms = 1_785_000_220_000;
+        let state = shadow_v2_entry_boundary_test_state(entry_ts_ms, 430_000_010);
+        let base_mint = state.base_mint.to_string();
+        let boundary = shadow_v2_entry_boundary_test_payload(entry_ts_ms, state);
+
+        maybe_emit_shadow_v2_entry_evidence(
+            &harness,
+            &runtime_config,
+            "candidate-entry-boundary-pool-mismatch-test",
+            &Pubkey::new_unique().to_string(),
+            &base_mint,
+            Some("position-entry-boundary-pool-mismatch-test"),
+            "signature-entry-boundary-pool-mismatch-test",
+            0.007,
+            Some(1),
+            Some(7_000_000_000),
+            Some(430_000_012),
+            Some(430_000_011),
+            Some(entry_ts_ms),
+            &join_metadata,
+            Some(boundary),
+        );
+
+        let canonical = std::fs::read_to_string(tmp.path().join("shadow_position_event_v2.jsonl"))
+            .expect("canonical jsonl");
+        let rows: Vec<serde_json::Value> = canonical
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("canonical row"))
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert!(rows
+            .iter()
+            .all(|row| row["event_kind"] != "POOL_STATE_SAMPLE"));
+        assert_eq!(rows[1]["event_kind"], "ENTRY_FILL");
+        assert_eq!(
+            rows[1]["payload"]["record"]["fill_status"],
+            "BLOCKED_BY_DATA"
+        );
+        let limitations = rows[1]["payload"]["record"]["limitations"]
+            .as_array()
+            .expect("limitations array");
+        for expected in [
+            "ENTRY_BOUNDARY_POOL_ID_MISMATCH",
+            "ENTRY_BOUNDARY_HANDOFF_VALIDATION_FAILED",
+            "ENTRY_POOL_STATE_BEFORE_REJECTED_BY_BOUNDARY_VALIDATION",
+        ] {
+            assert!(
+                limitations.iter().any(|value| value == expected),
+                "expected limitation {expected}, got {limitations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shadow_v2_postbuy_entry_boundary_preserves_same_slot_ordering_blocker() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let burnin = shadow_v2_burnin_config_for_temp_scope(tmp.path());
+        let runtime_config = PostBuyRuntimeConfig {
+            shadow_v2_burnin: Some(burnin),
+            ..PostBuyRuntimeConfig::default()
+        };
+        let harness = init_shadow_v2_validation_harness(runtime_config.shadow_v2_burnin.as_ref())
+            .expect("harness init")
+            .map(|harness| Arc::new(ParkingMutex::new(harness)));
+        let join_metadata = PositionJoinMetadata {
+            session_id: Some("session-entry-boundary-same-slot-test".to_string()),
+            decision_plane: Some("shadow_v2_pr34c_test".to_string()),
+            ..Default::default()
+        };
+        let entry_ts_ms = 1_785_000_230_000;
+        let state = shadow_v2_entry_boundary_test_state(entry_ts_ms, 430_000_011);
+        let pool_amm_id = state.pool_amm_id.to_string();
+        let base_mint = state.base_mint.to_string();
+        let boundary = shadow_v2_entry_boundary_test_payload(entry_ts_ms, state);
+
+        maybe_emit_shadow_v2_entry_evidence(
+            &harness,
+            &runtime_config,
+            "candidate-entry-boundary-same-slot-test",
+            &pool_amm_id,
+            &base_mint,
+            Some("position-entry-boundary-same-slot-test"),
+            "signature-entry-boundary-same-slot-test",
+            0.007,
+            Some(1),
+            Some(7_000_000_000),
+            Some(430_000_011),
+            Some(430_000_011),
+            Some(entry_ts_ms),
+            &join_metadata,
+            Some(boundary),
+        );
+
+        let canonical = std::fs::read_to_string(tmp.path().join("shadow_position_event_v2.jsonl"))
+            .expect("canonical jsonl");
+        let rows: Vec<serde_json::Value> = canonical
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("canonical row"))
+            .collect();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[1]["event_kind"], "POOL_STATE_SAMPLE");
+        assert_eq!(rows[2]["event_kind"], "ENTRY_FILL");
+        assert_eq!(
+            rows[2]["payload"]["record"]["fill_status"],
+            "BLOCKED_BY_DATA"
+        );
+        let limitations = rows[2]["payload"]["record"]["limitations"]
+            .as_array()
+            .expect("limitations array");
+        assert!(limitations
+            .iter()
+            .any(|value| { value == "ENTRY_FILL_POOL_STATE_SAME_SLOT_ORDER_AMBIGUOUS" }));
     }
 
     #[test]
