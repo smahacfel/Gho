@@ -521,13 +521,38 @@ use crate::components::trigger::safety::PositionSlotId;
 use tokio::sync::broadcast;
 
 use ghost_core::{
-    CurveFinality, EventSemanticEnvelope, EventTimeMetadata, ExecutionAccountEvidence,
+    account_state_core::types::CanonicalPoolState, CurveFinality, EventSemanticEnvelope,
+    EventTimeMetadata, ExecutionAccountEvidence,
 };
 use seer::ipc::{AccountUpdateReplayOrigin, FundingLaneRuntimeHealth, FundingTransferProvenance};
 
 // Re-export RawBytesMissingReason from seer for use in events
 pub use seer::types::RawBytesMissingReason;
 use seer::types::{TokenDelta, ToolchainFingerprintInput};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ShadowV2EntryBoundaryPayload {
+    pub boundary_kind: String,
+    pub source: String,
+    pub captured_at_wall_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_observed_slot: Option<u64>,
+    pub state_slot: u64,
+    pub state_ts_ms: u64,
+    pub amount_lamports: u64,
+    pub min_tokens_out: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_bps: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slippage_tolerance_bps: Option<u16>,
+    pub token_decimals: u8,
+    pub sol_lamports: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_data_hash: Option<String>,
+    pub canonical_pool_state: CanonicalPoolState,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub limitations: Vec<String>,
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ObservedAccountMetaProvenance {
@@ -1324,6 +1349,10 @@ pub enum GhostEvent {
         creator_pubkey: Option<String>,
         /// Optional decision/shadow join metadata for audit-only correlation.
         join_metadata: ExecutionJoinMetadata,
+        /// Shadow V2 diagnostic-only ENTRY_BEFORE pool-state boundary captured upstream.
+        ///
+        /// This is not consumed by BUY/REJECT, Gatekeeper, selector, TX/Jito, or live path.
+        shadow_v2_entry_boundary: Option<ShadowV2EntryBoundaryPayload>,
     },
 
     /// A compare-only shadow buy simulation finished without sending a real TX.
@@ -1458,12 +1487,27 @@ impl GhostEvent {
             entry_opened_at_ms: None,
             creator_pubkey,
             join_metadata: ExecutionJoinMetadata::default(),
+            shadow_v2_entry_boundary: None,
         }
     }
 
     pub fn with_execution_join_metadata(mut self, metadata: ExecutionJoinMetadata) -> Self {
         if let GhostEvent::PostBuySubmitted { join_metadata, .. } = &mut self {
             *join_metadata = metadata;
+        }
+        self
+    }
+
+    pub fn with_shadow_v2_entry_boundary(
+        mut self,
+        boundary: Option<ShadowV2EntryBoundaryPayload>,
+    ) -> Self {
+        if let GhostEvent::PostBuySubmitted {
+            shadow_v2_entry_boundary,
+            ..
+        } = &mut self
+        {
+            *shadow_v2_entry_boundary = boundary;
         }
         self
     }

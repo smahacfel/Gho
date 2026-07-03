@@ -3,7 +3,7 @@ use crate::components::trigger::component::TriggerDispatchFailureContext;
 use crate::config::{ShadowRunCommitment, TriggerEntryMode, TriggerShadowRunConfig};
 use crate::events::{
     build_execution_candidate_id, ExecutionJoinMetadata, ShadowBuySimulationEvent,
-    ShadowSimulationAccountDiagnostics,
+    ShadowSimulationAccountDiagnostics, ShadowV2EntryBoundaryPayload,
 };
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -266,6 +266,8 @@ impl ShadowDispatchLifecycleRecord {
 pub struct ShadowBuySimulationReport {
     #[serde(default, flatten)]
     pub join_metadata: ExecutionJoinMetadata,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_v2_entry_boundary: Option<ShadowV2EntryBoundaryPayload>,
     pub mint: String,
     pub live_signature: Option<String>,
     pub payer_pubkey: String,
@@ -655,6 +657,7 @@ pub(crate) fn shadow_buy_event_from_report(
 ) -> ShadowBuySimulationEvent {
     let ShadowBuySimulationReport {
         join_metadata,
+        shadow_v2_entry_boundary: _,
         mint,
         live_signature,
         payer_pubkey,
@@ -1210,6 +1213,7 @@ impl ShadowSimulator for RpcShadowSimulator {
                     };
                     return Ok(ShadowBuySimulationReport {
                         join_metadata: request.join_metadata.clone(),
+                        shadow_v2_entry_boundary: request.shadow_v2_entry_boundary.clone(),
                         mint: request.mint.to_string(),
                         live_signature: None,
                         payer_pubkey: request.payer_pubkey.to_string(),
@@ -1321,6 +1325,7 @@ mod tests {
         );
         PreparedBuyRequest {
             join_metadata: ExecutionJoinMetadata::default(),
+            shadow_v2_entry_boundary: None,
             state_readiness_latch_diagnostics: None,
             mint: solana_sdk::pubkey::Pubkey::new_unique(),
             payer_pubkey: payer.pubkey(),
@@ -1652,6 +1657,7 @@ mod tests {
         );
         let request = PreparedBuyRequest {
             join_metadata: ExecutionJoinMetadata::default(),
+            shadow_v2_entry_boundary: None,
             state_readiness_latch_diagnostics: None,
             mint: solana_sdk::pubkey::Pubkey::new_unique(),
             payer_pubkey: payer.pubkey(),
