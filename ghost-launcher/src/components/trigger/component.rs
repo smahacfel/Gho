@@ -2393,6 +2393,10 @@ impl TriggerComponent {
             "SHADOW_V2_DIAGNOSTIC_ONLY_NOT_DECISION_INPUT".to_string(),
             "ACCOUNT_DATA_HASH_UNAVAILABLE_IN_RUNTIME".to_string(),
             "CHAIN_ORDER_COMPONENTS_EXPLICIT_UNKNOWN_UNLESS_CARRIED_DOWNSTREAM".to_string(),
+            "ENTRY_BOUNDARY_SOURCE_JOIN_NOT_PROVEN".to_string(),
+            "INNER_GROUP_INDEX_NOT_EXACT_INNER_INSTRUCTION_INDEX".to_string(),
+            "SOLANA_NATIVE_LOG_INDEX_NOT_APPLICABLE".to_string(),
+            "LOG_MESSAGE_INDEX_INTERNAL_UNAVAILABLE".to_string(),
             "FEE_MODEL_ASSUMPTION_BONDING_CURVE_DEFAULT_100BPS".to_string(),
         ];
         if latest_observed_slot.is_none() {

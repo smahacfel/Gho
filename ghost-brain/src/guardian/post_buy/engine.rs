@@ -876,6 +876,14 @@ struct ShadowLifecycleRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     exit_market_anchor_source: Option<trigger::PriceTruthSource>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    source_block_time: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_tx_signature: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_transaction_index: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_instruction_index: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     exit_reason_evaluation_ts_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     exit_landed_slot: Option<u64>,
@@ -965,22 +973,122 @@ fn shadow_v2_event_order_key(
     event_seq_in_process: u64,
     observed_at_wall_ms: u64,
 ) -> EventOrderKey {
+    shadow_v2_event_order_key_with_components(
+        slot,
+        None,
+        signature,
+        None,
+        None,
+        None,
+        None,
+        event_seq_in_process,
+        observed_at_wall_ms,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn shadow_v2_event_order_key_with_components(
+    slot: Option<u64>,
+    block_time: Option<i64>,
+    signature: Option<&str>,
+    transaction_index: Option<u32>,
+    instruction_index: Option<u32>,
+    inner_instruction_index: Option<u32>,
+    log_message_index_internal: Option<u32>,
+    event_seq_in_process: u64,
+    observed_at_wall_ms: u64,
+) -> EventOrderKey {
     EventOrderKey {
         slot: slot
             .map(EventOrderComponent::known)
             .unwrap_or_else(EventOrderComponent::unknown),
-        block_time: EventOrderComponent::unknown(),
+        block_time: block_time
+            .map(EventOrderComponent::known)
+            .unwrap_or_else(EventOrderComponent::unknown),
         signature: signature
             .filter(|signature| !signature.trim().is_empty())
             .map(|signature| EventOrderComponent::known(signature.to_string()))
             .unwrap_or_else(EventOrderComponent::unknown),
-        transaction_index_or_unknown: EventOrderComponent::unknown(),
-        instruction_index_or_unknown: EventOrderComponent::unknown(),
-        inner_instruction_index_or_unknown: EventOrderComponent::unknown(),
-        log_index_or_unknown: EventOrderComponent::unknown(),
+        transaction_index_or_unknown: transaction_index
+            .map(EventOrderComponent::known)
+            .unwrap_or_else(EventOrderComponent::unknown),
+        instruction_index_or_unknown: instruction_index
+            .map(EventOrderComponent::known)
+            .unwrap_or_else(EventOrderComponent::unknown),
+        inner_instruction_index_or_unknown: inner_instruction_index
+            .map(EventOrderComponent::known)
+            .unwrap_or_else(EventOrderComponent::unknown),
+        // Solana has no native EVM-style logIndex. A known value here is
+        // reserved for an internal ordinal produced by enumerating
+        // meta.logMessages, not for provider-native chain order.
+        log_index_or_unknown: log_message_index_internal
+            .map(EventOrderComponent::known)
+            .unwrap_or_else(EventOrderComponent::not_applicable),
         event_seq_in_process,
         observed_at_wall_ms,
     }
+}
+
+fn shadow_v2_lifecycle_has_exact_source_join(record: &ShadowLifecycleRecord) -> bool {
+    record
+        .source_tx_signature
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|signature| !signature.is_empty())
+}
+
+fn shadow_v2_lifecycle_source_order_key(
+    record: &ShadowLifecycleRecord,
+    slot: Option<u64>,
+    event_seq_in_process: u64,
+    observed_at_wall_ms: u64,
+) -> EventOrderKey {
+    let has_exact_source_join = shadow_v2_lifecycle_has_exact_source_join(record);
+    shadow_v2_event_order_key_with_components(
+        slot,
+        has_exact_source_join
+            .then_some(record.source_block_time)
+            .flatten(),
+        has_exact_source_join
+            .then_some(record.source_tx_signature.as_deref())
+            .flatten(),
+        has_exact_source_join
+            .then_some(record.source_transaction_index)
+            .flatten(),
+        has_exact_source_join
+            .then_some(record.source_instruction_index)
+            .flatten(),
+        None,
+        None,
+        event_seq_in_process,
+        observed_at_wall_ms,
+    )
+}
+
+fn shadow_v2_lifecycle_source_order_limitations(record: &ShadowLifecycleRecord) -> Vec<String> {
+    let mut limitations = Vec::new();
+    if record
+        .source_tx_signature
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default()
+        .is_empty()
+    {
+        limitations.push("EXIT_PATH_SOURCE_JOIN_NOT_PROVEN".to_string());
+    }
+    if record.source_block_time.is_none() {
+        limitations.push("EXIT_PATH_SOURCE_BLOCK_TIME_UNAVAILABLE".to_string());
+    }
+    if record.source_transaction_index.is_none() {
+        limitations.push("EXIT_PATH_SOURCE_TRANSACTION_INDEX_UNAVAILABLE".to_string());
+    }
+    if record.source_instruction_index.is_none() {
+        limitations.push("EXIT_PATH_SOURCE_INSTRUCTION_INDEX_UNAVAILABLE".to_string());
+    }
+    limitations.push("INNER_GROUP_INDEX_NOT_EXACT_INNER_INSTRUCTION_INDEX".to_string());
+    limitations.push("SOLANA_NATIVE_LOG_INDEX_NOT_APPLICABLE".to_string());
+    limitations.push("LOG_MESSAGE_INDEX_INTERNAL_UNAVAILABLE".to_string());
+    limitations
 }
 
 fn shadow_v2_derived_event_order_key(
@@ -1797,12 +1905,13 @@ impl MonitoringEngine {
         if record.sample_price_state.is_none() {
             limitations.push("PATH_SAMPLE_PRICE_STATE_MISSING".to_string());
         }
+        limitations.extend(shadow_v2_lifecycle_source_order_limitations(record));
 
         ShadowPathSampleV2::from_legacy_lifecycle_mark(
             envelope,
-            shadow_v2_event_order_key(
+            shadow_v2_lifecycle_source_order_key(
+                record,
                 record.sample_slot.or(record.exit_sample_slot),
-                record.exit_market_anchor_tx_signature.as_deref(),
                 shadow_v2_event_seq(record.timestamp_ms, 1),
                 sample_ts,
             ),
@@ -1859,12 +1968,15 @@ impl MonitoringEngine {
                 .limitations
                 .push("EXIT_ATTEMPT_LEGACY_LIFECYCLE_BLOCKED".to_string());
         }
+        envelope
+            .limitations
+            .extend(shadow_v2_lifecycle_source_order_limitations(record));
 
         let mut attempt = ShadowExitAttemptV2::from_mark_path_trigger(
             envelope,
-            shadow_v2_event_order_key(
+            shadow_v2_lifecycle_source_order_key(
+                record,
                 record.exit_sample_slot.or(record.sample_slot),
-                record.exit_market_anchor_tx_signature.as_deref(),
                 shadow_v2_event_seq(trigger_ts, 2),
                 trigger_ts,
             ),
@@ -1928,12 +2040,15 @@ impl MonitoringEngine {
         envelope
             .limitations
             .push("TOKEN_DECIMALS_ASSUMED_PUMPFUN_6".to_string());
+        envelope
+            .limitations
+            .extend(shadow_v2_lifecycle_source_order_limitations(record));
 
         let mut sample = PoolStateSampleV2::from_account_state_core(
             envelope,
-            shadow_v2_event_order_key(
+            shadow_v2_lifecycle_source_order_key(
+                record,
                 Some(state.last_update_slot),
-                record.exit_market_anchor_tx_signature.as_deref(),
                 shadow_v2_event_seq(sample_ts, 3),
                 sample_ts,
             ),
@@ -1996,9 +2111,12 @@ impl MonitoringEngine {
         if record.exit_token_amount_raw.is_none() {
             blockers.push("EXIT_FILL_TOKEN_AMOUNT_RAW_UNAVAILABLE".to_string());
         }
-        let fill_order_key = shadow_v2_event_order_key(
+        envelope
+            .limitations
+            .extend(shadow_v2_lifecycle_source_order_limitations(record));
+        let fill_order_key = shadow_v2_lifecycle_source_order_key(
+            record,
             record.exit_landed_slot.or(record.exit_sample_slot),
-            record.exit_market_anchor_tx_signature.as_deref(),
             shadow_v2_event_seq(fill_ts, 4),
             fill_ts,
         );
@@ -2566,6 +2684,10 @@ impl MonitoringEngine {
             exit_market_anchor_slot: evidence.slot,
             exit_market_anchor_tx_signature: None,
             exit_market_anchor_source: Some(evidence.source),
+            source_block_time: None,
+            source_tx_signature: None,
+            source_transaction_index: None,
+            source_instruction_index: None,
             exit_reason_evaluation_ts_ms: Some(now_ms),
             exit_landed_slot,
             exit_landed_slot_source: exit_landed_slot
@@ -6093,6 +6215,97 @@ mod tests {
             .event_order_key
             .explicit_unknown_chain_order_components()
             .is_empty());
+    }
+
+    #[test]
+    fn shadow_v2_event_order_lifecycle_source_components_propagate_without_inner_or_log() {
+        let state_ts_ms = 1_785_000_321_000;
+        let (engine, _account_state_core, mint, _bonding_curve) =
+            make_shadow_v2_exit_test_engine(430_000_050, state_ts_ms);
+        let mut record = shadow_v2_exit_test_record(
+            &engine,
+            &mint,
+            ShadowLifecycleRecordType::ExitFilled,
+            state_ts_ms + 1_000,
+            Some(430_000_051),
+            Some(1_000_000_000),
+        );
+        record.source_block_time = Some(1_785_000_300);
+        record.source_tx_signature = Some("exit-source-signature".to_string());
+        record.source_transaction_index = Some(12);
+        record.source_instruction_index = Some(5);
+        record.exit_market_anchor_tx_signature = Some("legacy-anchor-not-source".to_string());
+
+        let path = engine.shadow_v2_path_sample_from_lifecycle(&record);
+        let attempt = engine.shadow_v2_exit_attempt_from_lifecycle(&record);
+        let pool_state = engine
+            .shadow_v2_exit_pool_state_sample_from_lifecycle(&record)
+            .expect("exit pool state");
+        let fill = engine.shadow_v2_exit_fill_from_lifecycle(&record, Some(&pool_state));
+
+        for order in [
+            &path.event_order_key,
+            &attempt.event_order_key,
+            &pool_state.event_order_key,
+            &fill.event_order_key,
+        ] {
+            assert_eq!(order.block_time.as_known(), Some(&1_785_000_300));
+            assert_eq!(
+                order.signature.as_known().map(String::as_str),
+                Some("exit-source-signature")
+            );
+            assert_eq!(order.transaction_index_or_unknown.as_known(), Some(&12));
+            assert_eq!(order.instruction_index_or_unknown.as_known(), Some(&5));
+            assert!(order.inner_instruction_index_or_unknown.is_unknown());
+            assert_eq!(
+                order.log_index_or_unknown.non_known_classification(),
+                Some("NOT_APPLICABLE")
+            );
+            assert!(!order.has_complete_chain_order());
+        }
+    }
+
+    #[test]
+    fn shadow_v2_event_order_lifecycle_partial_source_without_signature_stays_unknown() {
+        let state_ts_ms = 1_785_000_322_000;
+        let (engine, _account_state_core, mint, _bonding_curve) =
+            make_shadow_v2_exit_test_engine(430_000_060, state_ts_ms);
+        let mut record = shadow_v2_exit_test_record(
+            &engine,
+            &mint,
+            ShadowLifecycleRecordType::ExitFilled,
+            state_ts_ms + 1_000,
+            Some(430_000_061),
+            Some(1_000_000_000),
+        );
+        record.source_block_time = Some(1_785_000_301);
+        record.source_transaction_index = Some(13);
+        record.source_instruction_index = Some(6);
+
+        let path = engine.shadow_v2_path_sample_from_lifecycle(&record);
+        let attempt = engine.shadow_v2_exit_attempt_from_lifecycle(&record);
+        let pool_state = engine
+            .shadow_v2_exit_pool_state_sample_from_lifecycle(&record)
+            .expect("exit pool state");
+        let fill = engine.shadow_v2_exit_fill_from_lifecycle(&record, Some(&pool_state));
+
+        for order in [
+            &path.event_order_key,
+            &attempt.event_order_key,
+            &pool_state.event_order_key,
+            &fill.event_order_key,
+        ] {
+            assert!(order.block_time.is_unknown());
+            assert!(order.signature.is_unknown());
+            assert!(order.transaction_index_or_unknown.is_unknown());
+            assert!(order.instruction_index_or_unknown.is_unknown());
+            assert!(order.inner_instruction_index_or_unknown.is_unknown());
+            assert_eq!(
+                order.log_index_or_unknown.non_known_classification(),
+                Some("NOT_APPLICABLE")
+            );
+            assert!(!order.has_complete_chain_order());
+        }
     }
 
     #[test]
