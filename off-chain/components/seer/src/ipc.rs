@@ -363,6 +363,22 @@ pub struct DetectedAccountUpdateEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_version: Option<u64>,
 
+    /// BLAKE3 hash of the original raw account update bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_data_hash: Option<String>,
+
+    /// Length of the original raw account update bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_data_len: Option<u64>,
+
+    /// Account pubkey whose raw bytes were hashed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_account_pubkey: Option<Pubkey>,
+
+    /// Owner/program for the account bytes used as hash source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_account_owner_or_program: Option<Pubkey>,
+
     /// Origin of this canonical account update relative to the curve->mint mapping race window.
     #[serde(default)]
     pub replay_origin: AccountUpdateReplayOrigin,
@@ -811,6 +827,10 @@ impl IpcSender {
         complete: u8,
         slot: u64,
         write_version: Option<u64>,
+        account_data_hash: Option<String>,
+        account_data_len: Option<u64>,
+        source_account_pubkey: Option<Pubkey>,
+        source_account_owner_or_program: Option<Pubkey>,
         replay_origin: AccountUpdateReplayOrigin,
         replay_buffer_dwell_ms: Option<u64>,
     ) -> Result<(), IpcError> {
@@ -829,6 +849,10 @@ impl IpcSender {
             complete,
             slot,
             write_version,
+            account_data_hash,
+            account_data_len,
+            source_account_pubkey,
+            source_account_owner_or_program,
             replay_origin,
             replay_buffer_dwell_ms,
             detected_at: std::time::SystemTime::now(),
@@ -1111,6 +1135,85 @@ mod tests {
         }
         assert_eq!(metrics.events_sent.get(), 1);
         assert_eq!(metrics.events_received.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn send_account_update_carries_account_data_hash_metadata() {
+        let config = IpcChannelConfig::default();
+        let (sender, mut receiver, _metrics) = create_ipc_channel(config);
+        let base_mint = Pubkey::new_unique();
+        let bonding_curve = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+
+        sender
+            .send_account_update(
+                ghost_core::EventSemanticEnvelope::default(),
+                ghost_core::EventTimeMetadata::default(),
+                base_mint,
+                bonding_curve,
+                ghost_core::CurveFinality::Provisional,
+                1_000,
+                2_000,
+                0,
+                123,
+                Some(7),
+                Some("raw-blake3".to_string()),
+                Some(56),
+                Some(bonding_curve),
+                Some(owner),
+                AccountUpdateReplayOrigin::Live,
+                None,
+            )
+            .await
+            .expect("account update should send");
+
+        let Some(SeerEvent::AccountUpdate(event)) = receiver.recv().await else {
+            panic!("expected account update event");
+        };
+        assert_eq!(event.account_data_hash.as_deref(), Some("raw-blake3"));
+        assert_eq!(event.account_data_len, Some(56));
+        assert_eq!(event.source_account_pubkey, Some(bonding_curve));
+        assert_eq!(event.source_account_owner_or_program, Some(owner));
+        assert_eq!(event.write_version, Some(7));
+    }
+
+    #[test]
+    fn detected_account_update_event_old_json_defaults_hash_metadata_to_none() {
+        let event = DetectedAccountUpdateEvent {
+            semantic: ghost_core::EventSemanticEnvelope::default(),
+            event_time: ghost_core::EventTimeMetadata::default(),
+            base_mint: Pubkey::new_unique(),
+            bonding_curve: Pubkey::new_unique(),
+            curve_finality: ghost_core::CurveFinality::Provisional,
+            sol_reserves: 1_000,
+            token_reserves: 2_000,
+            complete: 0,
+            slot: 123,
+            write_version: Some(7),
+            account_data_hash: Some("raw-blake3".to_string()),
+            account_data_len: Some(56),
+            source_account_pubkey: Some(Pubkey::new_unique()),
+            source_account_owner_or_program: Some(Pubkey::new_unique()),
+            replay_origin: AccountUpdateReplayOrigin::Live,
+            replay_buffer_dwell_ms: None,
+            detected_at: std::time::SystemTime::now(),
+            sequence_number: 1,
+        };
+        let mut value = serde_json::to_value(event).expect("serialize event");
+        let object = value
+            .as_object_mut()
+            .expect("account update should serialize as object");
+        object.remove("account_data_hash");
+        object.remove("account_data_len");
+        object.remove("source_account_pubkey");
+        object.remove("source_account_owner_or_program");
+
+        let decoded: DetectedAccountUpdateEvent =
+            serde_json::from_value(value).expect("deserialize old account update shape");
+        assert_eq!(decoded.account_data_hash, None);
+        assert_eq!(decoded.account_data_len, None);
+        assert_eq!(decoded.source_account_pubkey, None);
+        assert_eq!(decoded.source_account_owner_or_program, None);
     }
 
     #[tokio::test]

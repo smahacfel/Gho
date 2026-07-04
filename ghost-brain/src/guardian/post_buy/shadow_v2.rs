@@ -1233,6 +1233,16 @@ pub struct PoolStateSampleV2 {
     pub event_signature: Option<String>,
     pub event_index: Option<u32>,
     pub account_data_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_data_len: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_account_pubkey: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_account_owner_or_program: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_account_slot: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_write_version: Option<u64>,
     pub virtual_sol_reserves: Option<u64>,
     pub virtual_token_reserves: Option<u64>,
     pub real_sol_reserves: Option<u64>,
@@ -1300,6 +1310,7 @@ impl PoolStateSampleV2 {
             _ => "ACCOUNT_STATE_CORE_CANONICAL_STALENESS_BLOCKED",
         }
         .to_string();
+        let account_data_hash = account_data_hash.or_else(|| state.account_data_hash.clone());
 
         Self {
             envelope,
@@ -1317,6 +1328,13 @@ impl PoolStateSampleV2 {
                 EventOrderComponent::Unknown(_) => Some(EVENT_ORDER_UNKNOWN_INDEX),
             },
             account_data_hash,
+            account_data_len: state.account_data_len,
+            source_account_pubkey: state.source_account_pubkey.map(|pubkey| pubkey.to_string()),
+            source_account_owner_or_program: state
+                .source_account_owner_or_program
+                .map(|pubkey| pubkey.to_string()),
+            source_account_slot: Some(state.last_update_slot),
+            source_write_version: state.source_write_version,
             virtual_sol_reserves: Some(state.virtual_sol_reserves),
             virtual_token_reserves: Some(state.virtual_token_reserves),
             real_sol_reserves: Some(state.real_sol_reserves),
@@ -1409,6 +1427,33 @@ impl PoolStateSampleV2 {
             .is_empty()
         {
             blockers.push("POOL_STATE_ACCOUNT_DATA_HASH_MISSING".to_string());
+        }
+        if self.account_data_len.is_none() {
+            blockers.push("POOL_STATE_ACCOUNT_DATA_LEN_MISSING".to_string());
+        }
+        if self
+            .source_account_pubkey
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .is_empty()
+        {
+            blockers.push("POOL_STATE_SOURCE_ACCOUNT_PUBKEY_MISSING".to_string());
+        }
+        if self
+            .source_account_owner_or_program
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .is_empty()
+        {
+            blockers.push("POOL_STATE_SOURCE_ACCOUNT_OWNER_MISSING".to_string());
+        }
+        if self.source_account_slot.is_none() {
+            blockers.push("POOL_STATE_SOURCE_ACCOUNT_SLOT_MISSING".to_string());
+        }
+        if self.source_write_version.is_none() {
+            blockers.push("POOL_STATE_SOURCE_WRITE_VERSION_MISSING".to_string());
         }
         if self.staleness_ms.is_none() {
             blockers.push("POOL_STATE_STALENESS_MS_MISSING_OR_REVERSED".to_string());
@@ -4596,6 +4641,11 @@ mod tests {
             is_complete: false,
             last_update_slot: 41,
             last_update_ts_ms: 1_785_000_000_000,
+            source_write_version: Some(7),
+            source_account_pubkey: Some(Pubkey::new_unique()),
+            source_account_owner_or_program: Some(Pubkey::new_unique()),
+            account_data_len: Some(b"account-data".len() as u64),
+            account_data_hash: Some(account_data_hash_blake3(b"account-data")),
             curve_finality: CurveFinality::Provisional,
             state_phase: StatePhase::Canonical,
             update_count: 3,
@@ -5510,6 +5560,11 @@ mod tests {
             sample.account_data_hash.as_deref(),
             Some(account_data_hash_blake3(b"account-data").as_str())
         );
+        assert_eq!(sample.account_data_len, Some(b"account-data".len() as u64));
+        assert!(sample.source_account_pubkey.is_some());
+        assert!(sample.source_account_owner_or_program.is_some());
+        assert_eq!(sample.source_account_slot, Some(41));
+        assert_eq!(sample.source_write_version, Some(7));
         assert!(sample.is_research_ready());
     }
 

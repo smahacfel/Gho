@@ -145,6 +145,11 @@ impl AccountStateReducer {
                 is_complete,
                 last_update_slot: update.slot,
                 last_update_ts_ms: update.receive_ts_ms,
+                source_write_version: update.write_version,
+                source_account_pubkey: update.source_account_pubkey,
+                source_account_owner_or_program: update.source_account_owner_or_program,
+                account_data_len: update.account_data_len,
+                account_data_hash: update.account_data_hash,
                 curve_finality: update.curve_finality,
                 state_phase,
                 update_count,
@@ -273,6 +278,10 @@ mod tests {
             is_complete: 0,
             slot,
             write_version: Some(slot),
+            source_account_pubkey: None,
+            source_account_owner_or_program: None,
+            account_data_len: None,
+            account_data_hash: None,
             receive_ts_ms: slot.saturating_mul(1000),
             receive_seq,
             curve_finality: CurveFinality::Provisional,
@@ -316,6 +325,85 @@ mod tests {
             AccountUpdateResult::Applied
         );
         assert_eq!(reducer.latest_observed_slot(), Some(105));
+    }
+
+    #[test]
+    fn account_data_hash_metadata_propagates_to_canonical_state() {
+        let reducer = AccountStateReducer::new();
+        let source_account_pubkey = Pubkey::new_unique();
+        let source_owner = Pubkey::new_unique();
+        let mut update = sample_update(123, 1);
+        update.source_account_pubkey = Some(source_account_pubkey);
+        update.source_account_owner_or_program = Some(source_owner);
+        update.account_data_len = Some(56);
+        update.account_data_hash = Some("blake3-raw-account-bytes".to_string());
+
+        assert_eq!(
+            reducer.apply_account_update(update.clone()),
+            AccountUpdateResult::Applied
+        );
+
+        let state = reducer
+            .get_canonical_state(&update.base_mint)
+            .expect("canonical state should exist after update");
+        assert_eq!(state.source_write_version, update.write_version);
+        assert_eq!(state.source_account_pubkey, Some(source_account_pubkey));
+        assert_eq!(state.source_account_owner_or_program, Some(source_owner));
+        assert_eq!(state.account_data_len, Some(56));
+        assert_eq!(
+            state.account_data_hash.as_deref(),
+            Some("blake3-raw-account-bytes")
+        );
+    }
+
+    #[test]
+    fn account_data_hash_metadata_tracks_latest_applied_update() {
+        let reducer = AccountStateReducer::new();
+        let mint = Pubkey::new_unique();
+        let bonding_curve = Pubkey::new_unique();
+        let pool_amm_id = Pubkey::new_unique();
+        let source_account_pubkey_a = Pubkey::new_unique();
+        let source_owner_a = Pubkey::new_unique();
+        let source_account_pubkey_b = Pubkey::new_unique();
+        let source_owner_b = Pubkey::new_unique();
+
+        let mut first = sample_update(200, 1);
+        first.base_mint = mint;
+        first.bonding_curve = bonding_curve;
+        first.pool_amm_id = pool_amm_id;
+        first.write_version = Some(7);
+        first.source_account_pubkey = Some(source_account_pubkey_a);
+        first.source_account_owner_or_program = Some(source_owner_a);
+        first.account_data_len = Some(111);
+        first.account_data_hash = Some("blake3-hash-a".to_string());
+        assert_eq!(
+            reducer.apply_account_update(first),
+            AccountUpdateResult::Applied
+        );
+
+        let mut second = sample_update(201, 2);
+        second.base_mint = mint;
+        second.bonding_curve = bonding_curve;
+        second.pool_amm_id = pool_amm_id;
+        second.write_version = Some(9);
+        second.source_account_pubkey = Some(source_account_pubkey_b);
+        second.source_account_owner_or_program = Some(source_owner_b);
+        second.account_data_len = Some(222);
+        second.account_data_hash = Some("blake3-hash-b".to_string());
+        assert_eq!(
+            reducer.apply_account_update(second),
+            AccountUpdateResult::Applied
+        );
+
+        let state = reducer
+            .get_canonical_state(&mint)
+            .expect("canonical state should exist after latest update");
+        assert_eq!(state.last_update_slot, 201);
+        assert_eq!(state.source_write_version, Some(9));
+        assert_eq!(state.source_account_pubkey, Some(source_account_pubkey_b));
+        assert_eq!(state.source_account_owner_or_program, Some(source_owner_b));
+        assert_eq!(state.account_data_len, Some(222));
+        assert_eq!(state.account_data_hash.as_deref(), Some("blake3-hash-b"));
     }
 }
 

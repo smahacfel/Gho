@@ -2388,10 +2388,10 @@ impl TriggerComponent {
             .get_canonical_state(&build_profile.mint)?;
         let latest_observed_slot = self.account_state_core.latest_observed_slot();
         let slippage_tolerance_bps = self.configured_buy_slippage_bps().min(10_000) as u16;
+        let account_data_hash = canonical_pool_state.account_data_hash.clone();
         let mut limitations = vec![
             "ENTRY_BEFORE_CAPTURED_AT_TRIGGER_BOUNDARY".to_string(),
             "SHADOW_V2_DIAGNOSTIC_ONLY_NOT_DECISION_INPUT".to_string(),
-            "ACCOUNT_DATA_HASH_UNAVAILABLE_IN_RUNTIME".to_string(),
             "CHAIN_ORDER_COMPONENTS_EXPLICIT_UNKNOWN_UNLESS_CARRIED_DOWNSTREAM".to_string(),
             "ENTRY_BOUNDARY_SOURCE_JOIN_NOT_PROVEN".to_string(),
             "INNER_GROUP_INDEX_NOT_EXACT_INNER_INSTRUCTION_INDEX".to_string(),
@@ -2401,6 +2401,14 @@ impl TriggerComponent {
         ];
         if latest_observed_slot.is_none() {
             limitations.push("LATEST_OBSERVED_SLOT_UNAVAILABLE".to_string());
+        }
+        if account_data_hash
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .is_empty()
+        {
+            limitations.push("ACCOUNT_DATA_HASH_UNAVAILABLE_IN_RUNTIME".to_string());
         }
         Some(ShadowV2EntryBoundaryPayload {
             boundary_kind: "ENTRY_BEFORE".to_string(),
@@ -2415,7 +2423,11 @@ impl TriggerComponent {
             slippage_tolerance_bps: Some(slippage_tolerance_bps),
             token_decimals: SHADOW_V2_ENTRY_TOKEN_DECIMALS,
             sol_lamports: SHADOW_V2_ENTRY_SOL_LAMPORTS,
-            account_data_hash: None,
+            account_data_hash,
+            account_data_len: canonical_pool_state.account_data_len,
+            source_account_pubkey: canonical_pool_state.source_account_pubkey,
+            source_account_owner_or_program: canonical_pool_state.source_account_owner_or_program,
+            source_write_version: canonical_pool_state.source_write_version,
             source_block_time: None,
             source_tx_signature: None,
             source_transaction_index: None,
@@ -5779,6 +5791,10 @@ mod tests {
             is_complete: 0,
             slot: 100,
             write_version: Some(1),
+            source_account_pubkey: None,
+            source_account_owner_or_program: None,
+            account_data_len: None,
+            account_data_hash: None,
             receive_ts_ms: 1_000,
             receive_seq: 1,
             curve_finality: ghost_core::CurveFinality::Provisional,
@@ -7316,6 +7332,76 @@ mod tests {
             .limitations
             .iter()
             .any(|value| value == "ENTRY_BEFORE_CAPTURED_AT_TRIGGER_BOUNDARY"));
+    }
+
+    #[test]
+    fn shadow_v2_entry_boundary_carries_account_data_hash_from_canonical_state() {
+        let mint = Pubkey::new_unique();
+        let account_state_core = Arc::new(AccountStateReducer::new());
+        let source_account_pubkey = Pubkey::new_unique();
+        let source_owner = Pubkey::new_unique();
+        let update = ghost_core::account_state_core::types::AccountStateUpdate {
+            pool_amm_id: Pubkey::new_unique(),
+            base_mint: mint,
+            bonding_curve: source_account_pubkey,
+            sol_reserves: 30_000_000_000,
+            token_reserves: 1_073_000_000_000_000,
+            is_complete: 0,
+            slot: 100,
+            write_version: Some(9),
+            source_account_pubkey: Some(source_account_pubkey),
+            source_account_owner_or_program: Some(source_owner),
+            account_data_len: Some(56),
+            account_data_hash: Some("raw-blake3".to_string()),
+            receive_ts_ms: 1_000,
+            receive_seq: 1,
+            curve_finality: ghost_core::CurveFinality::Provisional,
+            source: ghost_core::account_state_core::types::UpdateSource::GeyserAccountUpdate,
+        };
+        assert!(matches!(
+            account_state_core.apply_account_update(update),
+            ghost_core::account_state_core::types::AccountUpdateResult::Applied
+        ));
+        let trigger = TriggerComponent::new_with_position_limit_tracker_and_runtime_state(
+            create_test_config(),
+            PositionLimitTracker::new(1),
+            Arc::new(ShadowLedger::new()),
+            Arc::clone(&account_state_core),
+        );
+        let payer = Keypair::new();
+        let recent_blockhash = Hash::new_unique();
+        let token_program = Pubkey::from_str(TOKEN_PROGRAM_ID).expect("valid token program");
+        let overrides = valid_buy_account_overrides();
+        let expected_amount = trigger
+            .configured_trade_amount_lamports()
+            .expect("configured amount");
+
+        let request = trigger
+            .build_prepared_buy_request(
+                &payer,
+                &mint,
+                &token_program,
+                false,
+                &overrides,
+                expected_amount,
+                0,
+                recent_blockhash,
+            )
+            .expect("routed prepared buy request should build");
+
+        let boundary = request
+            .shadow_v2_entry_boundary
+            .as_ref()
+            .expect("entry boundary should be captured before shadow simulation");
+        assert_eq!(boundary.account_data_hash.as_deref(), Some("raw-blake3"));
+        assert_eq!(boundary.account_data_len, Some(56));
+        assert_eq!(boundary.source_account_pubkey, Some(source_account_pubkey));
+        assert_eq!(boundary.source_account_owner_or_program, Some(source_owner));
+        assert_eq!(boundary.source_write_version, Some(9));
+        assert!(!boundary
+            .limitations
+            .iter()
+            .any(|value| value == "ACCOUNT_DATA_HASH_UNAVAILABLE_IN_RUNTIME"));
     }
 
     #[test]
