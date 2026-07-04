@@ -3759,6 +3759,10 @@ fn emit_account_update_to_event_bus(
         complete: update.complete,
         slot: update.slot,
         write_version: update.write_version,
+        account_data_hash: update.account_data_hash.clone(),
+        account_data_len: update.account_data_len,
+        source_account_pubkey: update.source_account_pubkey,
+        source_account_owner_or_program: update.source_account_owner_or_program,
         replay_origin: update.replay_origin,
         replay_buffer_dwell_ms: update.replay_buffer_dwell_ms,
         detected_at: update.detected_at,
@@ -4995,7 +4999,7 @@ pub fn trade_event_to_pool_transaction(
 #[cfg(test)]
 mod tests {
     use super::{
-        detected_pool_from_candidate, detection_clock_summary,
+        detected_pool_from_candidate, detection_clock_summary, emit_account_update_to_event_bus,
         emit_execution_account_evidence_to_event_bus, emit_funding_transfer_to_event_bus,
         nln_normalization_error_row, nln_route_manifest_evidence_candidate_row,
         process_pool_detected_event_for_session_gate, process_trade_event_for_session_gate,
@@ -5893,6 +5897,10 @@ mod tests {
             complete: 0,
             slot: 42,
             write_version: Some(7),
+            account_data_hash: None,
+            account_data_len: None,
+            source_account_pubkey: None,
+            source_account_owner_or_program: None,
             replay_origin: AccountUpdateReplayOrigin::Live,
             replay_buffer_dwell_ms: None,
             detected_at: SystemTime::now(),
@@ -6344,6 +6352,30 @@ mod tests {
         assert_eq!(flush.replay_ready.len(), 1);
         assert_eq!(flush.replay_ready[0].base_mint, mint);
         assert_eq!(bridge.pending_total(), 0);
+    }
+
+    #[tokio::test]
+    async fn emit_account_update_to_event_bus_preserves_account_data_hash_metadata() {
+        let (tx, mut rx) = create_event_bus();
+        let mint = Pubkey::new_unique();
+        let curve = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let mut update = make_account_update(mint, curve);
+        update.account_data_hash = Some("raw-blake3".to_string());
+        update.account_data_len = Some(56);
+        update.source_account_pubkey = Some(curve);
+        update.source_account_owner_or_program = Some(owner);
+
+        emit_account_update_to_event_bus(&tx, &update, None, false);
+
+        let Ok(GhostEvent::AccountUpdate(event)) = rx.recv().await else {
+            panic!("expected account update event");
+        };
+        assert_eq!(event.account_data_hash.as_deref(), Some("raw-blake3"));
+        assert_eq!(event.account_data_len, Some(56));
+        assert_eq!(event.source_account_pubkey, Some(curve));
+        assert_eq!(event.source_account_owner_or_program, Some(owner));
+        assert_eq!(event.write_version, Some(7));
     }
 
     #[test]

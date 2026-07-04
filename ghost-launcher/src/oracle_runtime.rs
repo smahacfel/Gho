@@ -2903,6 +2903,10 @@ impl OracleRuntime {
         on_chain_complete: u8,
         slot: u64,
         write_version: Option<u64>,
+        account_data_hash: Option<String>,
+        account_data_len: Option<u64>,
+        source_account_pubkey: Option<Pubkey>,
+        source_account_owner_or_program: Option<Pubkey>,
         curve_finality: CurveFinality,
         source: UpdateSource,
         bonding_curve_hint: Option<&Pubkey>,
@@ -2940,6 +2944,10 @@ impl OracleRuntime {
             is_complete: on_chain_complete,
             slot,
             write_version,
+            source_account_pubkey,
+            source_account_owner_or_program,
+            account_data_len,
+            account_data_hash,
             receive_ts_ms: current_time_ms(),
             receive_seq: self.account_state_core.next_recv_seq(),
             curve_finality,
@@ -3273,6 +3281,10 @@ impl OracleRuntime {
             on_chain_complete,
             slot,
             event.and_then(|event| event.write_version),
+            event.and_then(|event| event.account_data_hash.clone()),
+            event.and_then(|event| event.account_data_len),
+            event.and_then(|event| event.source_account_pubkey),
+            event.and_then(|event| event.source_account_owner_or_program),
             curve_finality,
             source,
             event.map(|event| &event.bonding_curve),
@@ -3361,6 +3373,10 @@ impl OracleRuntime {
             0,
             slot,
             Some(0),
+            None,
+            None,
+            None,
+            None,
             tx.curve_finality,
             UpdateSource::TxObservedBootstrap,
             Some(identity.bonding_curve.as_ref()),
@@ -30782,6 +30798,10 @@ mod tests {
             is_complete: 0,
             slot: 100,
             write_version: Some(1),
+            source_account_pubkey: None,
+            source_account_owner_or_program: None,
+            account_data_len: None,
+            account_data_hash: None,
             receive_ts_ms: 1_000,
             receive_seq: 1,
             curve_finality: ghost_core::CurveFinality::Provisional,
@@ -41773,6 +41793,10 @@ mod tests {
             is_complete: 0,
             slot: 7,
             write_version: None,
+            source_account_pubkey: None,
+            source_account_owner_or_program: None,
+            account_data_len: None,
+            account_data_hash: None,
             receive_ts_ms: ghost_core::shadow_ledger::current_time_ms(),
             receive_seq: account_state_core.next_recv_seq(),
             curve_finality: CurveFinality::Speculative,
@@ -42150,6 +42174,10 @@ mod tests {
                 0,
                 2,
                 None,
+                None,
+                None,
+                None,
+                None,
                 CurveFinality::Speculative,
                 UpdateSource::GeyserAccountUpdate,
                 None,
@@ -42182,6 +42210,59 @@ mod tests {
             materialized.curve_readiness.is_ready,
             "active session should observe canonical curve readiness from account updates"
         );
+    }
+
+    #[test]
+    fn test_build_account_state_update_preserves_account_data_hash_metadata() {
+        let hyper_oracle = Arc::new(HyperPredictionOracle::default());
+        let shadow_ledger = Arc::new(ShadowLedger::new());
+        let runtime = OracleRuntime::new(
+            hyper_oracle,
+            "pump_program".to_string(),
+            "bonk_program".to_string(),
+            shadow_ledger,
+        );
+
+        let pool_id = Pubkey::new_unique();
+        let base_mint = Pubkey::new_unique();
+        let bonding_curve = Pubkey::new_unique();
+        let source_account_pubkey = Pubkey::new_unique();
+        let source_owner = Pubkey::new_unique();
+        let candidate = EnhancedCandidate {
+            pool_amm_id: pool_id,
+            base_mint,
+            bonding_curve,
+            initial_liquidity_sol: 8.0,
+            bonding_curve_progress: Some(0.03),
+            token_total_supply: Some(900_000_000_000_000),
+            virtual_sol_reserves: Some(8_000_000_000),
+            ..Default::default()
+        };
+        assert!(runtime.register_new_pool(pool_id, base_mint, candidate, None));
+
+        let update = runtime
+            .build_account_state_update(
+                &base_mint,
+                9_000_000_000,
+                888_000_000_000_000,
+                0,
+                2,
+                Some(17),
+                Some("raw-blake3".to_string()),
+                Some(56),
+                Some(source_account_pubkey),
+                Some(source_owner),
+                CurveFinality::Speculative,
+                UpdateSource::GeyserAccountUpdate,
+                Some(&bonding_curve),
+            )
+            .expect("tracked mint should build canonical account-state update");
+
+        assert_eq!(update.write_version, Some(17));
+        assert_eq!(update.account_data_hash.as_deref(), Some("raw-blake3"));
+        assert_eq!(update.account_data_len, Some(56));
+        assert_eq!(update.source_account_pubkey, Some(source_account_pubkey));
+        assert_eq!(update.source_account_owner_or_program, Some(source_owner));
     }
 
     #[test]
@@ -42445,6 +42526,10 @@ mod tests {
                 0,
                 2,
                 None,
+                None,
+                None,
+                None,
+                None,
                 CurveFinality::Speculative,
                 UpdateSource::GeyserAccountUpdate,
                 None,
@@ -42493,6 +42578,10 @@ mod tests {
                 888_000_000_000_000,
                 0,
                 2,
+                None,
+                None,
+                None,
+                None,
                 None,
                 CurveFinality::Speculative,
                 UpdateSource::GeyserAccountUpdate,
@@ -43016,6 +43105,10 @@ mod tests {
                 0,
                 22,
                 Some(1),
+                None,
+                None,
+                None,
+                None,
                 CurveFinality::Finalized,
                 UpdateSource::GeyserAccountUpdate,
                 Some(&bonding_curve),
@@ -43114,6 +43207,10 @@ mod tests {
                 complete: 0,
                 slot: 2,
                 write_version: Some(1),
+                account_data_hash: None,
+                account_data_len: None,
+                source_account_pubkey: None,
+                source_account_owner_or_program: None,
                 replay_origin: seer::ipc::AccountUpdateReplayOrigin::Live,
                 replay_buffer_dwell_ms: None,
                 detected_at: SystemTime::now(),
@@ -43192,6 +43289,10 @@ mod tests {
             complete: 0,
             slot: 2,
             write_version: Some(7),
+            account_data_hash: None,
+            account_data_len: None,
+            source_account_pubkey: None,
+            source_account_owner_or_program: None,
             replay_origin: seer::ipc::AccountUpdateReplayOrigin::PendingReplay,
             replay_buffer_dwell_ms: Some(10),
             detected_at: SystemTime::now(),
@@ -44617,6 +44718,10 @@ mod tests {
             complete: 0,
             slot: 42,
             write_version: Some(7),
+            account_data_hash: None,
+            account_data_len: None,
+            source_account_pubkey: None,
+            source_account_owner_or_program: None,
             replay_origin: seer::ipc::AccountUpdateReplayOrigin::Live,
             replay_buffer_dwell_ms: None,
             detected_at: std::time::SystemTime::now(),
@@ -46330,6 +46435,10 @@ mod tests {
             complete: 0,
             slot: 51,
             write_version: None,
+            account_data_hash: None,
+            account_data_len: None,
+            source_account_pubkey: None,
+            source_account_owner_or_program: None,
             replay_origin: seer::ipc::AccountUpdateReplayOrigin::Live,
             replay_buffer_dwell_ms: None,
             detected_at: std::time::SystemTime::now(),
@@ -47246,6 +47355,10 @@ mod tests {
             complete: 0,
             slot,
             write_version,
+            account_data_hash: None,
+            account_data_len: None,
+            source_account_pubkey: None,
+            source_account_owner_or_program: None,
             replay_origin: seer::ipc::AccountUpdateReplayOrigin::Live,
             replay_buffer_dwell_ms: None,
             detected_at: std::time::SystemTime::now(),
@@ -47482,6 +47595,10 @@ mod tests {
                     complete: 0,
                     slot: 101,
                     write_version: None,
+                    account_data_hash: None,
+                    account_data_len: None,
+                    source_account_pubkey: None,
+                    source_account_owner_or_program: None,
                     replay_origin: seer::ipc::AccountUpdateReplayOrigin::Live,
                     replay_buffer_dwell_ms: None,
                     detected_at: std::time::SystemTime::now(),

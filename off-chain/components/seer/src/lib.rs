@@ -1217,6 +1217,11 @@ pub fn decode_canonical_account_update(
 }
 
 #[inline]
+fn account_data_hash_blake3(data: &[u8]) -> String {
+    blake3::hash(data).to_hex().to_string()
+}
+
+#[inline]
 fn account_update_write_version_key(write_version: Option<u64>) -> u64 {
     write_version.unwrap_or(u64::MAX)
 }
@@ -3029,6 +3034,8 @@ impl Seer {
                 false,
             );
 
+            let account_data_hash = account_data_hash_blake3(&replay.data);
+            let account_data_len = replay.data.len() as u64;
             if let Ok(update_payload) = decode_canonical_account_update(replay.owner, &replay.data)
             {
                 let semantic = normalize_account_update_semantics(
@@ -3048,6 +3055,10 @@ impl Seer {
                         update_payload.complete,
                         replay.slot,
                         replay.write_version,
+                        Some(account_data_hash),
+                        Some(account_data_len),
+                        Some(curve),
+                        Some(replay.owner),
                         AccountUpdateReplayOrigin::PendingReplay,
                         Some(dwell_ms.max(0.0).round() as u64),
                     )
@@ -3254,6 +3265,8 @@ impl Seer {
                 .await;
         }
 
+        let account_data_hash = account_data_hash_blake3(data);
+        let account_data_len = data.len() as u64;
         let update_payload = match decode_canonical_account_update(owner, data) {
             Ok(payload) => payload,
             Err(err) => {
@@ -3362,6 +3375,10 @@ impl Seer {
                     update_payload.complete,
                     slot,
                     write_version,
+                    Some(account_data_hash),
+                    Some(account_data_len),
+                    Some(pubkey),
+                    Some(owner),
                     AccountUpdateReplayOrigin::Live,
                     None,
                 )
@@ -6923,6 +6940,8 @@ mod tests {
 
         let owner = Pubkey::from_str("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
             .expect("valid pumpfun id");
+        let expected_hash = account_data_hash_blake3(&data);
+        let expected_len = data.len() as u64;
         seer.process_event(types::GeyserEvent::AccountUpdate {
             slot: 42,
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -6947,6 +6966,37 @@ mod tests {
         assert_eq!(event.slot, 42);
         assert_eq!(event.token_reserves, 500);
         assert_eq!(event.sol_reserves, 1_000);
+        assert_eq!(
+            event.account_data_hash.as_deref(),
+            Some(expected_hash.as_str())
+        );
+        assert_eq!(event.account_data_len, Some(expected_len));
+        assert_eq!(event.source_account_pubkey, Some(bonding_curve));
+        assert_eq!(event.source_account_owner_or_program, Some(owner));
+    }
+
+    #[test]
+    fn account_data_hash_uses_raw_bytes_not_decoded_reserves() {
+        let mut first = vec![0u8; 56];
+        first[0..8].copy_from_slice(&500u64.to_le_bytes());
+        first[8..16].copy_from_slice(&1_000u64.to_le_bytes());
+
+        let mut second = first.clone();
+        second[55] = 1;
+
+        let owner = Pubkey::from_str("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
+            .expect("valid pumpfun id");
+        let first_payload = decode_canonical_account_update(owner, &first)
+            .expect("first raw account update decodes");
+        let second_payload = decode_canonical_account_update(owner, &second)
+            .expect("second raw account update decodes");
+
+        assert_eq!(first_payload.token_reserves, second_payload.token_reserves);
+        assert_eq!(first_payload.sol_reserves, second_payload.sol_reserves);
+        assert_ne!(
+            account_data_hash_blake3(&first),
+            account_data_hash_blake3(&second)
+        );
     }
 
     #[tokio::test]
@@ -7320,14 +7370,17 @@ mod tests {
         data.extend_from_slice(&state.base_amount.to_le_bytes());
         data.extend_from_slice(&state.quote_amount.to_le_bytes());
 
+        let expected_hash = account_data_hash_blake3(&data);
+        let expected_len = data.len() as u64;
+        let owner = Pubkey::from_str("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA")
+            .expect("valid pumpswap program");
         seer.process_event(types::GeyserEvent::AccountUpdate {
             slot: 43,
             event_time: ghost_core::EventTimeMetadata::default(),
             write_version: Some(1),
             pubkey: pool,
             data,
-            owner: Pubkey::from_str("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA")
-                .expect("valid pumpswap program"),
+            owner,
         })
         .await
         .unwrap();
@@ -7347,6 +7400,13 @@ mod tests {
         assert_eq!(event.complete, 1);
         assert_eq!(event.slot, 43);
         assert_eq!(event.write_version, Some(1));
+        assert_eq!(
+            event.account_data_hash.as_deref(),
+            Some(expected_hash.as_str())
+        );
+        assert_eq!(event.account_data_len, Some(expected_len));
+        assert_eq!(event.source_account_pubkey, Some(pool));
+        assert_eq!(event.source_account_owner_or_program, Some(owner));
     }
 
     #[tokio::test]
@@ -7384,6 +7444,8 @@ mod tests {
         let pump_program = Pubkey::from_str("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
             .expect("valid pump.fun program");
 
+        let expected_hash = account_data_hash_blake3(&data);
+        let expected_len = data.len() as u64;
         seer.process_event(types::GeyserEvent::AccountUpdate {
             slot: 55,
             event_time: ghost_core::EventTimeMetadata::default(),
@@ -7413,6 +7475,14 @@ mod tests {
         assert_eq!(event.sol_reserves, virtual_sol);
         assert_eq!(event.token_reserves, virtual_token);
         assert_eq!(event.complete, complete);
+        assert_eq!(event.write_version, Some(2));
+        assert_eq!(
+            event.account_data_hash.as_deref(),
+            Some(expected_hash.as_str())
+        );
+        assert_eq!(event.account_data_len, Some(expected_len));
+        assert_eq!(event.source_account_pubkey, Some(curve_pubkey));
+        assert_eq!(event.source_account_owner_or_program, Some(pump_program));
         assert_eq!(
             event.replay_origin,
             AccountUpdateReplayOrigin::PendingReplay

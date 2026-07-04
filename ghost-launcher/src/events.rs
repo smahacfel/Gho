@@ -550,6 +550,14 @@ pub struct ShadowV2EntryBoundaryPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_data_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_data_len: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_account_pubkey: Option<solana_sdk::pubkey::Pubkey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_account_owner_or_program: Option<solana_sdk::pubkey::Pubkey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_write_version: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_block_time: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_tx_signature: Option<String>,
@@ -1038,6 +1046,18 @@ pub struct AccountUpdateEvent {
     /// Optional Solana account write-version from Yellowstone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_version: Option<u64>,
+    /// BLAKE3 hash of the original raw account update bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_data_hash: Option<String>,
+    /// Length of the original raw account update bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_data_len: Option<u64>,
+    /// Account pubkey whose raw bytes were hashed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_account_pubkey: Option<solana_sdk::pubkey::Pubkey>,
+    /// Owner/program for the account bytes used as hash source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_account_owner_or_program: Option<solana_sdk::pubkey::Pubkey>,
     /// Whether this update came live or from a pending pre-mapping replay path.
     #[serde(default)]
     pub replay_origin: AccountUpdateReplayOrigin,
@@ -1895,6 +1915,10 @@ mod tests {
             complete: 0,
             slot: 42,
             write_version: Some(7),
+            account_data_hash: None,
+            account_data_len: None,
+            source_account_pubkey: None,
+            source_account_owner_or_program: None,
             replay_origin: AccountUpdateReplayOrigin::Live,
             replay_buffer_dwell_ms: None,
             detected_at: std::time::SystemTime::now(),
@@ -1912,6 +1936,13 @@ mod tests {
         assert!(!object.contains_key("account_pubkey"));
         assert!(!object.contains_key("role"));
         assert!(!object.contains_key("bonding_curve_v2"));
+
+        let decoded: AccountUpdateEvent =
+            serde_json::from_value(serialized).expect("deserialize old-compatible account update");
+        assert_eq!(decoded.account_data_hash, None);
+        assert_eq!(decoded.account_data_len, None);
+        assert_eq!(decoded.source_account_pubkey, None);
+        assert_eq!(decoded.source_account_owner_or_program, None);
     }
 
     #[test]

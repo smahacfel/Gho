@@ -123,6 +123,16 @@ pub struct CanonicalPoolState {
     pub is_complete: bool,
     pub last_update_slot: u64,
     pub last_update_ts_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_write_version: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_account_pubkey: Option<Pubkey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_account_owner_or_program: Option<Pubkey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_data_len: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_data_hash: Option<String>,
     pub curve_finality: CurveFinality,
     pub state_phase: StatePhase,
     pub update_count: u64,
@@ -150,6 +160,14 @@ pub struct AccountStateUpdate {
     pub slot: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_version: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_account_pubkey: Option<Pubkey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_account_owner_or_program: Option<Pubkey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_data_len: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_data_hash: Option<String>,
     pub receive_ts_ms: u64,
     pub receive_seq: u64,
     pub curve_finality: CurveFinality,

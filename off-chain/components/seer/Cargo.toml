@@ -39,6 +39,7 @@ metrics = "0.21"
 
 # Utilities
 base64 = "0.21"
+blake3 = "1.5"
 bytemuck = "1.14"
 bs58 = "0.5"
 parking_lot = "0.12"
