@@ -47,8 +47,15 @@ def canonical_row(
     position_id: str = "pos-a",
     event_order_key: dict | None = None,
     ordering_exemption: str | None = None,
+    record_fields: dict | None = None,
+    exact_or_approx: str | None = None,
 ) -> dict:
     env = envelope(schema, event_id, position_id)
+    record = {"envelope": env}
+    if record_fields:
+        record.update(record_fields)
+    if exact_or_approx is not None:
+        record["exact_or_approx"] = exact_or_approx
     row = {
         "schema": "shadow_position_event_v2",
         "envelope": env,
@@ -57,11 +64,60 @@ def canonical_row(
         "canonical_payload_schema": schema,
         "canonical_payload_event_id": event_id,
         "canonical_terminal_event_id": event_id if event_kind == "TERMINAL_TRUTH" else None,
-        "payload": {"record_type": schema, "record": {"envelope": env}},
+        "payload": {"record_type": schema, "record": record},
     }
     if ordering_exemption is not None:
         row["ordering_exemption"] = ordering_exemption
     return row
+
+
+def transaction_source_event_order_key(
+    *,
+    slot: int | str = 42,
+    block_time: int | str = 1_785_000_000,
+    signature: str = "source-sig",
+    transaction_index: int | str = 1,
+    instruction_index: int | str = 0,
+    inner_instruction_index: int | str = "UNKNOWN",
+    log_index: int | str = "NOT_APPLICABLE",
+    event_seq: int = 7,
+) -> dict:
+    return {
+        "slot": slot,
+        "block_time": block_time,
+        "signature": signature,
+        "transaction_index_or_unknown": transaction_index,
+        "instruction_index_or_unknown": instruction_index,
+        "inner_instruction_index_or_unknown": inner_instruction_index,
+        "log_index_or_unknown": log_index,
+        "event_seq_in_process": event_seq,
+        "observed_at_wall_ms": 1_785_000_000_123,
+    }
+
+
+def unknown_transaction_source_event_order_key() -> dict:
+    return transaction_source_event_order_key(
+        block_time="UNKNOWN",
+        signature="UNKNOWN",
+        transaction_index="UNKNOWN",
+        instruction_index="UNKNOWN",
+        inner_instruction_index="UNKNOWN",
+        event_seq=9,
+    )
+
+
+def derived_terminal_event_order_key() -> dict:
+    return {
+        "slot": "DERIVED",
+        "block_time": "DERIVED",
+        "signature": "DERIVED",
+        "transaction_index_or_unknown": "DERIVED",
+        "instruction_index_or_unknown": "DERIVED",
+        "inner_instruction_index_or_unknown": "DERIVED",
+        "log_index_or_unknown": "DERIVED",
+        "event_seq_in_process": 10,
+        "observed_at_wall_ms": 1_785_000_000_555,
+    }
 
 
 class ShadowV2TemporalAuditTest(unittest.TestCase):
@@ -117,6 +173,80 @@ class ShadowV2TemporalAuditTest(unittest.TestCase):
             result["ordering_exemption_counts"]["ORDERING_EXEMPT_POSITION_CREATED"],
             1,
         )
+
+    def test_shadow_v2_temporal_audit_separates_account_state_proof_from_tx_order(self) -> None:
+        result = self.run_audit(
+            [
+                canonical_row(
+                    "pool_state_sample_v2",
+                    "POOL_STATE_SAMPLE",
+                    "pool-state-a",
+                    event_order_key=unknown_transaction_source_event_order_key(),
+                    record_fields={
+                        "account_data_hash": "hash-a",
+                        "source_account_pubkey": "account-a",
+                        "source_account_slot": 42,
+                        "source_write_version": 7,
+                    },
+                )
+            ]
+        )
+
+        self.assertEqual(result["verdict"], "PASS_TEMPORAL_NO_LOOKAHEAD_AUDIT")
+        self.assertEqual(result["account_state_source_proof_complete_count"], 1)
+        self.assertEqual(result["transaction_source_proof_complete_count"], 0)
+        self.assertEqual(result["unknown_required_source_count"], 0)
+        self.assertGreater(result["raw_unknown_chain_order_component_count"], 0)
+        self.assertEqual(result["not_applicable_accepted_count"], 1)
+
+    def test_shadow_v2_temporal_audit_blocks_transaction_like_missing_source(self) -> None:
+        result = self.run_audit(
+            [
+                canonical_row(
+                    "shadow_entry_fill_v2",
+                    "ENTRY_FILL",
+                    "entry-fill-a",
+                    event_order_key=unknown_transaction_source_event_order_key(),
+                )
+            ]
+        )
+
+        self.assertEqual(result["verdict"], "BLOCKED_TEMPORAL_TRANSACTION_SOURCE_JOIN")
+        self.assertEqual(result["transaction_source_proof_missing_rows"], 1)
+        self.assertEqual(result["unknown_required_source_rows"], 1)
+        self.assertGreater(result["unknown_required_source_count"], 0)
+
+    def test_shadow_v2_temporal_audit_rejects_event_seq_as_exact_order_substitute(self) -> None:
+        result = self.run_audit(
+            [
+                canonical_row(
+                    "shadow_path_sample_v2",
+                    "PATH_SAMPLE",
+                    "path-sample-a",
+                    event_order_key=unknown_transaction_source_event_order_key(),
+                    exact_or_approx="EXACT_EVENT_ORDER",
+                )
+            ]
+        )
+
+        self.assertEqual(result["verdict"], "FAIL_LOOKAHEAD_OR_ORDERING_VIOLATION")
+        self.assertEqual(result["event_seq_chain_order_substitute_count"], 1)
+
+    def test_shadow_v2_temporal_audit_counts_terminal_truth_derived_order(self) -> None:
+        result = self.run_audit(
+            [
+                canonical_row(
+                    "shadow_terminal_truth_v2",
+                    "TERMINAL_TRUTH",
+                    "terminal-a",
+                    event_order_key=derived_terminal_event_order_key(),
+                )
+            ]
+        )
+
+        self.assertEqual(result["verdict"], "PASS_TEMPORAL_NO_LOOKAHEAD_AUDIT")
+        self.assertEqual(result["terminal_truth_derived_count"], 1)
+        self.assertEqual(result["terminal_truth_not_derived_count"], 0)
 
 
 if __name__ == "__main__":

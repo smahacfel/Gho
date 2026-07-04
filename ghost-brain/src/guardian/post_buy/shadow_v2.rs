@@ -423,6 +423,42 @@ impl EventOrderKey {
             && self.log_index_or_unknown.as_known().is_some()
     }
 
+    pub fn solana_transaction_source_proof_blockers(&self) -> Vec<String> {
+        let mut blockers = Vec::new();
+        push_missing_source_component(&mut blockers, &self.slot, "TRANSACTION_SOURCE_SLOT");
+        push_missing_source_component(
+            &mut blockers,
+            &self.block_time,
+            "TRANSACTION_SOURCE_BLOCK_TIME",
+        );
+        match &self.signature {
+            EventOrderComponent::Known(signature) if !signature.trim().is_empty() => {}
+            EventOrderComponent::Known(_) => {
+                blockers.push("TRANSACTION_SOURCE_SIGNATURE_EMPTY".to_string())
+            }
+            EventOrderComponent::Unknown(_) => push_missing_source_component(
+                &mut blockers,
+                &self.signature,
+                "TRANSACTION_SOURCE_SIGNATURE",
+            ),
+        }
+        push_missing_source_component(
+            &mut blockers,
+            &self.transaction_index_or_unknown,
+            "TRANSACTION_SOURCE_TRANSACTION_INDEX",
+        );
+        push_missing_source_component(
+            &mut blockers,
+            &self.instruction_index_or_unknown,
+            "TRANSACTION_SOURCE_INSTRUCTION_INDEX",
+        );
+        blockers
+    }
+
+    pub fn has_complete_solana_transaction_source_proof(&self) -> bool {
+        self.solana_transaction_source_proof_blockers().is_empty()
+    }
+
     pub fn same_slot_ambiguous_with(&self, other: &Self) -> bool {
         matches!(
             (self.slot.as_known(), other.slot.as_known()),
@@ -433,6 +469,18 @@ impl EventOrderKey {
     pub fn is_after_process_seq(&self, previous_seq: u64) -> bool {
         self.event_seq_in_process > previous_seq
     }
+}
+
+fn push_missing_source_component<T>(
+    blockers: &mut Vec<String>,
+    component: &EventOrderComponent<T>,
+    label: &str,
+) {
+    if component.as_known().is_some() {
+        return;
+    }
+    let classification = component.non_known_classification().unwrap_or("UNKNOWN");
+    blockers.push(format!("{label}_{classification}"));
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1353,6 +1401,39 @@ impl PoolStateSampleV2 {
 
     pub fn ambiguity_labels(&self) -> Vec<String> {
         self.event_order_key.ambiguity_labels()
+    }
+
+    pub fn account_state_source_proof_blockers(&self) -> Vec<String> {
+        let mut blockers = Vec::new();
+        if self
+            .account_data_hash
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .is_empty()
+        {
+            blockers.push("ACCOUNT_STATE_SOURCE_HASH_MISSING".to_string());
+        }
+        if self
+            .source_account_pubkey
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .is_empty()
+        {
+            blockers.push("ACCOUNT_STATE_SOURCE_PUBKEY_MISSING".to_string());
+        }
+        if self.source_account_slot.is_none() {
+            blockers.push("ACCOUNT_STATE_SOURCE_SLOT_MISSING".to_string());
+        }
+        if self.source_write_version.is_none() {
+            blockers.push("ACCOUNT_STATE_SOURCE_WRITE_VERSION_MISSING".to_string());
+        }
+        blockers
+    }
+
+    pub fn has_complete_account_state_source_proof(&self) -> bool {
+        self.account_state_source_proof_blockers().is_empty()
     }
 
     pub fn research_blockers(&self) -> Vec<String> {
@@ -4409,6 +4490,20 @@ mod tests {
         }
     }
 
+    fn solana_transaction_source_event_order_key() -> EventOrderKey {
+        EventOrderKey {
+            slot: EventOrderComponent::known(42),
+            block_time: EventOrderComponent::known(1_785_000_000),
+            signature: EventOrderComponent::known("source-tx-sig".to_string()),
+            transaction_index_or_unknown: EventOrderComponent::known(2),
+            instruction_index_or_unknown: EventOrderComponent::known(1),
+            inner_instruction_index_or_unknown: EventOrderComponent::unknown(),
+            log_index_or_unknown: EventOrderComponent::not_applicable(),
+            event_seq_in_process: 7,
+            observed_at_wall_ms: 1_785_000_000_123,
+        }
+    }
+
     fn test_envelope(schema: &str, position_id: &str, event_id: &str) -> ShadowV2Envelope {
         let mut envelope = ShadowV2Envelope::contract_header(
             schema,
@@ -4796,6 +4891,44 @@ mod tests {
             event_order_key(Some(42), None).explicit_unknown_chain_order_components(),
             vec!["transaction_index_or_unknown"]
         );
+    }
+
+    #[test]
+    fn shadow_v2_solana_transaction_source_proof_is_not_complete_chain_order() {
+        let order = solana_transaction_source_event_order_key();
+
+        assert!(order.has_complete_solana_transaction_source_proof());
+        assert!(order.solana_transaction_source_proof_blockers().is_empty());
+        assert!(!order.has_complete_chain_order());
+        assert_eq!(
+            order.explicit_unknown_chain_order_components(),
+            vec!["inner_instruction_index_or_unknown"]
+        );
+        assert_eq!(
+            order.not_applicable_or_derived_chain_order_components(),
+            vec!["log_index_or_unknown:NOT_APPLICABLE".to_string()]
+        );
+    }
+
+    #[test]
+    fn shadow_v2_event_seq_does_not_complete_solana_transaction_source_proof() {
+        let mut order = explicit_unknown_event_order_key();
+        order.event_seq_in_process = 99;
+
+        assert!(order.is_after_process_seq(98));
+        assert!(!order.has_complete_solana_transaction_source_proof());
+        assert!(!order.has_complete_chain_order());
+        let blockers = order.solana_transaction_source_proof_blockers();
+        for expected in [
+            "TRANSACTION_SOURCE_SIGNATURE_UNKNOWN",
+            "TRANSACTION_SOURCE_TRANSACTION_INDEX_UNKNOWN",
+            "TRANSACTION_SOURCE_INSTRUCTION_INDEX_UNKNOWN",
+        ] {
+            assert!(
+                blockers.contains(&expected.to_string()),
+                "expected blocker {expected}, got {blockers:?}"
+            );
+        }
     }
 
     #[test]
@@ -5565,7 +5698,34 @@ mod tests {
         assert!(sample.source_account_owner_or_program.is_some());
         assert_eq!(sample.source_account_slot, Some(41));
         assert_eq!(sample.source_write_version, Some(7));
+        assert!(sample.has_complete_account_state_source_proof());
         assert!(sample.is_research_ready());
+    }
+
+    #[test]
+    fn shadow_v2_account_state_source_proof_is_separate_from_transaction_order() {
+        let mut order_key = explicit_unknown_event_order_key();
+        order_key.event_seq_in_process = 1;
+        let sample = PoolStateSampleV2::from_account_state_core(
+            test_envelope("pool_state_sample_v2", "pos-a", "pool-event-account-proof"),
+            order_key,
+            &canonical_pool_state(),
+            1_785_000_000_250,
+            Some(account_data_hash_blake3(b"account-data")),
+            TemporalClass::PreDecision,
+            ClockDomain::StreamObservedMs,
+            6,
+        );
+
+        assert!(sample.has_complete_account_state_source_proof());
+        assert!(sample.account_state_source_proof_blockers().is_empty());
+        assert!(!sample
+            .event_order_key
+            .has_complete_solana_transaction_source_proof());
+        assert!(!sample.event_order_key.has_complete_chain_order());
+        let blockers = sample.research_blockers();
+        assert!(blockers.contains(&"EVENT_ORDER_SIGNATURE_UNKNOWN".to_string()));
+        assert!(blockers.contains(&"EVENT_ORDER_TRANSACTION_INDEX_UNKNOWN".to_string()));
     }
 
     #[test]
