@@ -355,6 +355,56 @@ mod tests {
             Some("blake3-raw-account-bytes")
         );
     }
+
+    #[test]
+    fn account_data_hash_metadata_tracks_latest_applied_update() {
+        let reducer = AccountStateReducer::new();
+        let mint = Pubkey::new_unique();
+        let bonding_curve = Pubkey::new_unique();
+        let pool_amm_id = Pubkey::new_unique();
+        let source_account_pubkey_a = Pubkey::new_unique();
+        let source_owner_a = Pubkey::new_unique();
+        let source_account_pubkey_b = Pubkey::new_unique();
+        let source_owner_b = Pubkey::new_unique();
+
+        let mut first = sample_update(200, 1);
+        first.base_mint = mint;
+        first.bonding_curve = bonding_curve;
+        first.pool_amm_id = pool_amm_id;
+        first.write_version = Some(7);
+        first.source_account_pubkey = Some(source_account_pubkey_a);
+        first.source_account_owner_or_program = Some(source_owner_a);
+        first.account_data_len = Some(111);
+        first.account_data_hash = Some("blake3-hash-a".to_string());
+        assert_eq!(
+            reducer.apply_account_update(first),
+            AccountUpdateResult::Applied
+        );
+
+        let mut second = sample_update(201, 2);
+        second.base_mint = mint;
+        second.bonding_curve = bonding_curve;
+        second.pool_amm_id = pool_amm_id;
+        second.write_version = Some(9);
+        second.source_account_pubkey = Some(source_account_pubkey_b);
+        second.source_account_owner_or_program = Some(source_owner_b);
+        second.account_data_len = Some(222);
+        second.account_data_hash = Some("blake3-hash-b".to_string());
+        assert_eq!(
+            reducer.apply_account_update(second),
+            AccountUpdateResult::Applied
+        );
+
+        let state = reducer
+            .get_canonical_state(&mint)
+            .expect("canonical state should exist after latest update");
+        assert_eq!(state.last_update_slot, 201);
+        assert_eq!(state.source_write_version, Some(9));
+        assert_eq!(state.source_account_pubkey, Some(source_account_pubkey_b));
+        assert_eq!(state.source_account_owner_or_program, Some(source_owner_b));
+        assert_eq!(state.account_data_len, Some(222));
+        assert_eq!(state.account_data_hash.as_deref(), Some("blake3-hash-b"));
+    }
 }
 
 fn bonding_curve_from_update(update: &AccountStateUpdate, token_total_supply: u64) -> BondingCurve {
