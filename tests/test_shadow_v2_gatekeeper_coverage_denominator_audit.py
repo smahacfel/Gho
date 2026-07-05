@@ -195,6 +195,55 @@ class ShadowV2GatekeeperCoverageDenominatorAuditTest(unittest.TestCase):
         self.assertEqual(result["unknown_reason_count"], 1)
         self.assertEqual(result["unknown_reason_samples"][0]["bucket"], "REJECT_OTHER")
 
+    def test_shadow_insufficient_data_is_typed_timeout_bucket(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            candidates = root / "candidate_universe_v1.jsonl"
+            manifest_path = root / "candidate_universe_manifest_v1.json"
+            decisions = root / "gatekeeper_v2_decisions.jsonl"
+            write_jsonl(
+                candidates,
+                [
+                    candidate("c-buy", "mint-buy", "pool-buy"),
+                    candidate("c-shadow", "mint-shadow", "pool-shadow"),
+                ],
+            )
+            write_json(manifest_path, manifest())
+            write_jsonl(
+                decisions,
+                [
+                    {
+                        "candidate_id": "c-buy",
+                        "base_mint": "mint-buy",
+                        "pool_id": "pool-buy",
+                        "verdict_type": "BUY",
+                        "decision_verdict_buy": True,
+                    },
+                    {
+                        "candidate_id": "c-shadow",
+                        "base_mint": "mint-shadow",
+                        "pool_id": "pool-shadow",
+                        "verdict_type": "SHADOW_INSUFFICIENT_DATA",
+                        "reason_code": "SHADOW_INSUFFICIENT_DATA",
+                        "decision_reason": "TIMER_FIRED_INSUFFICIENT_DATA: tx=2/3 elapsed_ms=9750",
+                    },
+                ],
+            )
+
+            result = self.run_audit(
+                root,
+                candidate_universe=candidates,
+                candidate_manifest=manifest_path,
+                decision_jsonl=decisions,
+            )
+
+        self.assertEqual(result["final_verdict"], "GATEKEEPER_DENOMINATOR_COVERAGE_KNOWN")
+        self.assertEqual(result["unknown_reason_count"], 0)
+        self.assertEqual(
+            result["gatekeeper_decision_bucket_counts"]["TIMEOUT_SHADOW_INSUFFICIENT_DATA"],
+            1,
+        )
+
     def test_typed_rejects_without_buy_are_classified_as_threshold_starvation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
