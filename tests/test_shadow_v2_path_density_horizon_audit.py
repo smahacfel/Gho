@@ -241,6 +241,67 @@ class ShadowV2PathDensityHorizonAuditTest(unittest.TestCase):
         self.assertEqual(result["next_stage"], "L2_D3B_RUNTIME_HARNESS_DENSITY_EMISSION_PROOF")
         self.assertFalse(result["l2_f_allowed_next"])
 
+    def test_d3b_runtime_harness_pass_allows_l2_f_next_without_approval_flags(self) -> None:
+        rows = [density_row(horizon) for horizon in DECLARED_HORIZONS]
+
+        result = self.run_audit(
+            rows,
+            "--pass-verdict",
+            "L2_D3B_RUNTIME_HARNESS_DENSITY_EMISSION_READY_FOR_L2_F",
+        )
+
+        self.assertEqual(
+            result["verdict"],
+            "L2_D3B_RUNTIME_HARNESS_DENSITY_EMISSION_READY_FOR_L2_F",
+        )
+        self.assertFalse(result["density_contract_fixture_pass"])
+        self.assertTrue(result["runtime_harness_density_emission_proof"])
+        self.assertTrue(result["density_derivation_from_canonical_rows"])
+        self.assertTrue(result["runtime_density_emission_proof"])
+        self.assertFalse(result["live_runtime_density_emission_proof"])
+        self.assertEqual(result["next_stage"], "L2_F_RESEARCH_VALIDATION_RUN")
+        self.assertTrue(result["l2_f_allowed_next"])
+        self.assertFalse(result["runtime_approval"])
+        self.assertFalse(result["research_grade"])
+        self.assertFalse(result["live_equivalence"])
+        self.assertFalse(result["strategy_research_unblocked"])
+        self.assertFalse(result["shadow_close_only"])
+        self.assertFalse(result["active_close"])
+
+    def test_latest_density_snapshot_mode_ignores_immature_prior_snapshots(self) -> None:
+        rows = []
+        for horizon in DECLARED_HORIZONS:
+            rows.append(
+                density_row(
+                    horizon,
+                    verdict="NOT_EVALUABLE_HORIZON_EXCEEDS_REPLAY",
+                    replay_horizon_ms=0,
+                    path_points=1,
+                    coverage_points=1,
+                    max_interval_ms=None,
+                    limitations=["HORIZON_EXCEEDS_REPLAY_COVERAGE"],
+                )
+            )
+            rows.append(density_row(horizon, replay_horizon_ms=121_000, path_points=122))
+
+        result = self.run_audit(
+            rows,
+            "--latest-density-per-position-horizon",
+            "--pass-verdict",
+            "L2_D3B_RUNTIME_HARNESS_DENSITY_EMISSION_READY_FOR_L2_F",
+        )
+
+        self.assertEqual(result["density_rows_input"], len(rows))
+        self.assertEqual(result["density_rows_evaluated"], len(DECLARED_HORIZONS))
+        self.assertTrue(result["latest_density_per_position_horizon"])
+        self.assertEqual(
+            result["verdict"],
+            "L2_D3B_RUNTIME_HARNESS_DENSITY_EMISSION_READY_FOR_L2_F",
+        )
+        self.assertEqual(result["declared_horizon_path_coverage_blocker_count"], 0)
+        self.assertEqual(result["declared_horizon_retention_blocker_count"], 0)
+        self.assertTrue(result["l2_f_allowed_next"])
+
 
 if __name__ == "__main__":
     unittest.main()
