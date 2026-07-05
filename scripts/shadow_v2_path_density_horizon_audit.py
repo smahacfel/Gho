@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import csv
+import json
 from collections import Counter, defaultdict
+from pathlib import Path
 from typing import Any, Iterable
 
 from shadow_v2_offline_audit_common import density_rows, emit, parser, position_id
@@ -10,6 +13,7 @@ from shadow_v2_offline_audit_common import density_rows, emit, parser, position_
 DECLARED_L2_BASELINE_HORIZONS_MS = [2_000, 3_000, 10_000, 30_000, 120_000]
 UNDECLARED_LONG_HORIZONS_MS = [300_000, 500_000]
 DEFAULT_RETENTION_MARGIN_MS = 1_000
+L2_D2_PASS_VERDICT = "L2_D2_DENSITY_RETENTION_READY_FOR_L2_F"
 
 
 VERDICTS = [
@@ -74,6 +78,14 @@ def has_limitation(row: dict[str, Any], needle: str) -> bool:
     return any(needle in value for value in row_limitations(row))
 
 
+def csv_value(value: Any) -> str:
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, sort_keys=True)
+    if value is None:
+        return ""
+    return str(value)
+
+
 def horizon_metrics(
     horizon: int,
     group: list[dict[str, Any]],
@@ -110,14 +122,22 @@ def horizon_metrics(
 
     declared = horizon in declared_horizons
     undeclared = horizon in undeclared_horizons or not declared
-    not_evaluable_count = sum(counts[value] for value in NON_EVALUABLE_VERDICTS) + counts["UNKNOWN"]
+    path_coverage_gap_count = (
+        counts["NOT_EVALUABLE_NO_COVERAGE"]
+        + counts["NOT_EVALUABLE_HORIZON_EXCEEDS_REPLAY"]
+    )
+    sparse_or_unknown_count = counts["SPARSE_APPROX_ONLY"] + counts["UNKNOWN"]
     if declared:
-        if retention_gap_count:
-            horizon_verdict = "FAILED_RETENTION_GAP"
+        if path_coverage_gap_count:
+            horizon_verdict = "FAILED_PATH_SAMPLE_COVERAGE_INSUFFICIENT"
             l2_baseline_blocker = True
             positive_claim_allowed = False
-        elif not_evaluable_count:
+        elif sparse_or_unknown_count:
             horizon_verdict = "FAILED_DECLARED_HORIZON_INCOMPLETE"
+            l2_baseline_blocker = True
+            positive_claim_allowed = False
+        elif retention_gap_count:
+            horizon_verdict = "FAILED_RETENTION_GAP"
             l2_baseline_blocker = True
             positive_claim_allowed = False
         else:
@@ -170,6 +190,8 @@ def horizon_metrics(
         "censored_count": censored_count,
         "horizon_unmatured_count": horizon_unmatured_count,
         "retention_gap_count": retention_gap_count,
+        "path_sample_coverage_gap_count": path_coverage_gap_count,
+        "sparse_or_unknown_count": sparse_or_unknown_count,
         "positive_research_claim_allowed": positive_claim_allowed,
         "l2_baseline_blocker": l2_baseline_blocker,
         "verdict": horizon_verdict,
@@ -202,6 +224,8 @@ def missing_declared_horizon_metrics(horizon: int) -> dict[str, Any]:
         "censored_count": 0,
         "horizon_unmatured_count": 0,
         "retention_gap_count": 0,
+        "path_sample_coverage_gap_count": 0,
+        "sparse_or_unknown_count": 0,
         "positive_research_claim_allowed": False,
         "l2_baseline_blocker": True,
         "verdict": "FAILED_MISSING_DECLARED_HORIZON",
@@ -227,6 +251,10 @@ def main() -> int:
         default=DEFAULT_RETENTION_MARGIN_MS,
         help="Required replay/retention margin beyond the max declared horizon.",
     )
+    p.add_argument(
+        "--output-csv",
+        help="Optional metric,value,notes summary CSV path for L2-D2 artifacts.",
+    )
     args = p.parse_args()
     declared_horizons = set(int_csv(args.declared_horizons_ms))
     undeclared_horizons = set(int_csv(args.undeclared_horizons_ms)) - declared_horizons
@@ -247,6 +275,7 @@ def main() -> int:
     missing_declared_horizons = sorted(declared_horizons - set(by_horizon))
     retention_blockers = 0
     density_blockers = 0
+    path_coverage_blockers = 0
     for horizon in sorted(by_horizon):
         item = horizon_metrics(
             horizon,
@@ -256,7 +285,9 @@ def main() -> int:
             required_replay_horizon_ms=required_replay_horizon_ms,
         )
         if horizon in declared_horizons:
-            if item["retention_gap_count"]:
+            if item["path_sample_coverage_gap_count"]:
+                path_coverage_blockers += 1
+            elif item["retention_gap_count"]:
                 retention_blockers += 1
             elif item["l2_baseline_blocker"]:
                 density_blockers += 1
@@ -273,18 +304,23 @@ def main() -> int:
         verdict = "BLOCKED_DENSITY_DECLARED_HORIZON_INCOMPLETE"
     elif missing_declared_horizons or density_blockers:
         verdict = "BLOCKED_DENSITY_DECLARED_HORIZON_INCOMPLETE"
+    elif path_coverage_blockers:
+        verdict = "BLOCKED_PATH_SAMPLE_COVERAGE_INSUFFICIENT"
     elif retention_blockers:
         verdict = "BLOCKED_RETENTION_CONTRACT_INSUFFICIENT"
     else:
-        verdict = "L2_D_DENSITY_HORIZON_CONTRACT_PASS_FOR_DECLARED_HORIZONS"
+        verdict = L2_D2_PASS_VERDICT
 
     result = {
-        "audit": "path_density_horizon_retention_contract",
+        "audit": "path_density_horizon_retention_repair",
         "scope_root": args.scope_root,
         "declared_supported_horizons_ms": sorted(declared_horizons),
         "undeclared_horizons_ms": sorted(undeclared_horizons),
+        "unsupported_horizons_ms": sorted(undeclared_horizons),
         "max_declared_horizon_ms": max_declared_horizon_ms,
         "retention_margin_ms": retention_margin_ms,
+        "retention_contract_ms": required_replay_horizon_ms,
+        "required_replay_coverage_ms": required_replay_horizon_ms,
         "required_replay_horizon_ms": required_replay_horizon_ms,
         "density_rows": len(rows),
         "malformed_density_rows": malformed,
@@ -295,6 +331,7 @@ def main() -> int:
         "declared_horizon_missing_count": len(missing_declared_horizons),
         "missing_declared_horizons_ms": missing_declared_horizons,
         "declared_horizon_density_blocker_count": density_blockers,
+        "declared_horizon_path_coverage_blocker_count": path_coverage_blockers,
         "declared_horizon_retention_blocker_count": retention_blockers,
         "undeclared_horizon_present_count": undeclared_present_count,
         "undeclared_horizons_block_l2_baseline": False,
@@ -302,13 +339,84 @@ def main() -> int:
         "per_horizon": per_horizon,
         "density_audit_verdict": verdict,
         "verdict": verdict,
+        "l2_f_allowed_next": verdict == L2_D2_PASS_VERDICT,
+        "runtime_decision_behavior_changes": False,
+        "runtime_evidence_schema_changes": False,
+        "new_provider_streams": "NONE",
         "runtime_approval": False,
         "research_grade": False,
         "live_equivalence": False,
         "strategy_research_unblocked": False,
+        "shadow_close_only": False,
+        "active_close": False,
     }
+    if args.output_csv:
+        write_summary_csv(result, Path(args.output_csv))
     emit(result, args.pretty)
     return 0
+
+
+def write_summary_csv(result: dict[str, Any], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows: list[dict[str, str]] = []
+
+    def add(metric: str, value: Any, notes: str = "") -> None:
+        rows.append({"metric": metric, "value": csv_value(value), "notes": notes})
+
+    for metric in [
+        "density_audit_verdict",
+        "declared_supported_horizons_ms",
+        "unsupported_horizons_ms",
+        "retention_contract_ms",
+        "required_replay_coverage_ms",
+        "required_replay_horizon_ms",
+        "retention_margin_ms",
+        "density_rows",
+        "malformed_density_rows",
+        "unknown_horizon_rows",
+        "declared_horizon_present_count",
+        "declared_horizon_missing_count",
+        "declared_horizon_density_blocker_count",
+        "declared_horizon_path_coverage_blocker_count",
+        "declared_horizon_retention_blocker_count",
+        "l2_f_allowed_next",
+        "runtime_approval",
+        "research_grade",
+        "live_equivalence",
+        "strategy_research_unblocked",
+        "shadow_close_only",
+        "active_close",
+    ]:
+        add(metric, result.get(metric), "aggregate")
+
+    for horizon in result.get("per_horizon", []):
+        horizon_ms = horizon.get("horizon_ms")
+        notes = f"horizon_ms={horizon_ms};scope={horizon.get('horizon_scope')}"
+        for metric in [
+            "horizon_ms",
+            "eligible_positions",
+            "evaluable_positions",
+            "coverage_ratio",
+            "samples_per_position_p50",
+            "samples_per_position_p90",
+            "max_gap_ms_p90",
+            "max_gap_ms_max",
+            "duplicate_sample_count",
+            "non_monotonic_sample_count",
+            "censored_count",
+            "horizon_unmatured_count",
+            "retention_gap_count",
+            "path_sample_coverage_gap_count",
+            "verdict",
+            "positive_research_claim_allowed",
+            "l2_baseline_blocker",
+        ]:
+            add(f"horizon_{horizon_ms}_{metric}", horizon.get(metric), notes)
+
+    with path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=["metric", "value", "notes"])
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 if __name__ == "__main__":
