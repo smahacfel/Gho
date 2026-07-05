@@ -17,11 +17,12 @@ DEFAULT_POSITION_COUNT = 25
 DEFAULT_DURATION_MS = 121_000
 DEFAULT_SAMPLE_INTERVAL_MS = 1_000
 CREATED_AT_WALL_MS = 1_785_000_000_000
+L2_D3B_NEXT_STAGE = "L2_D3B_RUNTIME_HARNESS_DENSITY_EMISSION_PROOF"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate a deterministic Shadow V2 L2-D3 density-ready validation scope."
+        description="Generate a deterministic Shadow V2 L2-D3 density contract fixture scope."
     )
     parser.add_argument("--scope-root", default=DEFAULT_SCOPE_ROOT)
     parser.add_argument("--run-id", default=DEFAULT_RUN_ID)
@@ -183,7 +184,7 @@ def lifecycle_row(run_id: str, idx: int, duration_ms: int) -> dict[str, Any]:
 
 def manifest(run_id: str, positions: int, duration_ms: int, sample_interval_ms: int) -> dict[str, Any]:
     return {
-        "schema": "shadow_v2_l2_d3_density_ready_validation_manifest",
+        "schema": "shadow_v2_l2_d3_density_contract_fixture_manifest",
         "schema_version": 1,
         "run_id": run_id,
         "position_count": positions,
@@ -194,7 +195,12 @@ def manifest(run_id: str, positions: int, duration_ms: int, sample_interval_ms: 
         "unsupported_horizons_ms": UNDECLARED_LONG_HORIZONS_MS,
         "retention_contract_ms": duration_ms,
         "required_replay_coverage_ms": duration_ms,
+        "density_contract_fixture_pass": True,
+        "density_fixture_l2_f_allowed_next": False,
+        "runtime_density_emission_proof": False,
+        "next_stage": L2_D3B_NEXT_STAGE,
         "l2_f_research_validation_run": False,
+        "l2_f_allowed_next": False,
         "runtime_approval": False,
         "research_grade": False,
         "live_equivalence": False,

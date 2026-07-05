@@ -1,32 +1,44 @@
-# Raport Shadow V2 L2-D3: density-ready validation scope 20260705
+# Raport Shadow V2 L2-D3: density contract fixture scope 20260705
 
 ## Status
 
 ```text
-final_verdict=L2_D3_DENSITY_READY_FOR_L2_F
-stage=L2-D3_DENSITY_READY_VALIDATION_SCOPE
+final_verdict=L2_D3_DENSITY_CONTRACT_FIXTURE_ACCEPTED
+pr55_contract_fixture_verdict=PR55_AS_L2_D3_CONTRACT_FIXTURE_ACCEPTED
+pr55_runtime_density_verdict=PR55_AS_RUNTIME_DENSITY_EMISSION_PROOF_NOT_ACCEPTED
+runtime_density_emission_proof=false
+stage=L2-D3_DENSITY_CONTRACT_FIXTURE_SCOPE
 base_after_pr54=7c522f39fc405cf8a3ae12ffb9b8df828f412bf6
 run_id=shadow-v2-l2-d3-density-ready-validation-20260705-r1
 configured_run_seconds=121
 scope_root=reports/selector/shadow-v2-l2-d3-density-ready-validation-20260705-r1
-l2_f_allowed_next=true
+density_contract_fixture_pass=true
+density_fixture_l2_f_allowed_next=false
+l2_f_allowed_next=false
+L2_F_ALLOWED_NEXT=false
+next_stage=L2_D3B_RUNTIME_HARNESS_DENSITY_EMISSION_PROOF
 approval_flags=false
 ```
 
-L2-D3 generuje waski, deterministyczny density-validation scope. To nie jest
-L2-F research validation run i nie jest strategy/research-grade claim. Celem
-jest tylko potwierdzenie, ze po PR54 naprawiony standardowy `120s` path sampler
-i D2/D3 audit contract potrafia przejsc declared baseline horizons przy
-wystarczajacej retencji i gestosci path samples.
+L2-D3 generuje waski, deterministyczny density contract fixture. To nie jest
+runtime/harness density emission proof, L2-F research validation run ani
+strategy/research-grade claim. Celem jest tylko potwierdzenie, ze D2/D3 audit
+contract potrafi przejsc declared baseline horizons przy syntetycznie
+przygotowanych density rows o wystarczajacej retencji i gestosci path samples.
+
+Ten PR nie dowodzi, ze realny runtime albo harness emituje path samples przez
+`121000ms`, ani ze realny pipeline wyprowadza `shadow_path_density_v2` z
+kanonicznych `shadow_position_event_v2` rows. To musi dowiezc osobny etap
+`L2-D3B`.
 
 ## Zakres
 
 W zakresie:
 
-- wygenerowanie swiezego density-only validation scope;
+- wygenerowanie swiezego density-only contract fixture scope;
 - uzycie retention contract `121000ms`;
 - uzycie path samples co `1000ms` do `121000ms`;
-- uruchomienie `shadow_v2_path_density_horizon_audit.py`;
+- uruchomienie `shadow_v2_path_density_horizon_audit.py` na fixture rows;
 - wygenerowanie summary CSV;
 - utrzymanie 300s/500s jako undeclared long horizons.
 
@@ -41,6 +53,8 @@ Poza zakresem:
 - brak nowych provider streams;
 - brak `runtime_approval`, `research_grade`, `live_equivalence`,
   `strategy_research_unblocked`, `shadow_close_only`, `active_close`.
+- brak zgody na L2-F bez `L2-D3B`;
+- brak runtime/harness density emission proof.
 
 ## Run Configuration
 
@@ -102,7 +116,7 @@ Audit command:
 ```bash
 python3 scripts/shadow_v2_path_density_horizon_audit.py \
   --scope-root reports/selector/shadow-v2-l2-d3-density-ready-validation-20260705-r1 \
-  --pass-verdict L2_D3_DENSITY_READY_FOR_L2_F \
+  --pass-verdict L2_D3_DENSITY_CONTRACT_FIXTURE_ACCEPTED \
   --output-csv reports/selector/shadow_v2_l2_d3_density_ready_validation_summary.csv \
   --pretty
 ```
@@ -110,7 +124,7 @@ python3 scripts/shadow_v2_path_density_horizon_audit.py \
 Aggregate result:
 
 ```text
-density_audit_verdict=L2_D3_DENSITY_READY_FOR_L2_F
+density_audit_verdict=L2_D3_DENSITY_CONTRACT_FIXTURE_ACCEPTED
 density_rows=175
 horizon_count=7
 declared_horizon_present_count=5
@@ -118,7 +132,11 @@ declared_horizon_missing_count=0
 declared_horizon_density_blocker_count=0
 declared_horizon_path_coverage_blocker_count=0
 declared_horizon_retention_blocker_count=0
-l2_f_allowed_next=true
+density_contract_fixture_pass=true
+density_fixture_l2_f_allowed_next=false
+runtime_density_emission_proof=false
+l2_f_allowed_next=false
+next_stage=L2_D3B_RUNTIME_HARNESS_DENSITY_EMISSION_PROOF
 ```
 
 Per declared horizon:
@@ -146,14 +164,20 @@ reports/selector/shadow_v2_l2_d3_density_ready_validation_summary.csv
 
 ## Interpretation
 
-L2-D3 passes the density/retention readiness gate for declared horizons. This
-means L2-F is allowed as the next stage from density readiness perspective.
-This does not grant L2, research grade, live equivalence, strategy unlock, or
-runtime approval.
+L2-D3 passes only the deterministic density contract fixture gate for declared
+horizons. It does not prove runtime/harness path-sample emission and does not
+prove density derivation from canonical path sample rows.
 
-L2-F still needs its own dedicated validation run and must pass the remaining
-research gates: temporal, manifest, replay/lifecycle, Gatekeeper denominator,
-sample size, malformed rows, and unknown/untyped blockers.
+L2-F is not allowed as the next stage from this PR alone. The required next
+stage is:
+
+```text
+next_stage=L2_D3B_RUNTIME_HARNESS_DENSITY_EMISSION_PROOF
+```
+
+L2-D3B must feed path samples through the real validation/harness path, derive
+density rows from canonical `shadow_position_event_v2` rows, prove `standard_120s`
+retention through `121000ms`, and keep all approval flags false.
 
 ## Verification
 
@@ -162,16 +186,22 @@ python3 -m py_compile scripts/shadow_v2_path_density_horizon_audit.py scripts/sh
 python3 tests/test_shadow_v2_path_density_horizon_audit.py
 python3 tests/test_shadow_v2_l2_d3_density_ready_scope.py
 python3 scripts/shadow_v2_l2_d3_density_ready_scope.py --scope-root reports/selector/shadow-v2-l2-d3-density-ready-validation-20260705-r1 --run-id shadow-v2-l2-d3-density-ready-validation-20260705-r1 --positions 25 --duration-ms 121000 --sample-interval-ms 1000
-python3 scripts/shadow_v2_path_density_horizon_audit.py --scope-root reports/selector/shadow-v2-l2-d3-density-ready-validation-20260705-r1 --pass-verdict L2_D3_DENSITY_READY_FOR_L2_F --output-csv reports/selector/shadow_v2_l2_d3_density_ready_validation_summary.csv --pretty
+python3 scripts/shadow_v2_path_density_horizon_audit.py --scope-root reports/selector/shadow-v2-l2-d3-density-ready-validation-20260705-r1 --pass-verdict L2_D3_DENSITY_CONTRACT_FIXTURE_ACCEPTED --output-csv reports/selector/shadow_v2_l2_d3_density_ready_validation_summary.csv --pretty
 CSV parser check for reports/selector/shadow_v2_l2_d3_density_ready_validation_summary.csv
 ```
 
 ## Final Verdict
 
 ```text
-final_verdict=L2_D3_DENSITY_READY_FOR_L2_F
-density_verdict=L2_D3_DENSITY_READY_FOR_L2_F
-l2_f_allowed_next=true
+final_verdict=PR55_AS_L2_D3_CONTRACT_FIXTURE_ACCEPTED
+runtime_density_verdict=PR55_AS_RUNTIME_DENSITY_EMISSION_PROOF_NOT_ACCEPTED
+density_verdict=L2_D3_DENSITY_CONTRACT_FIXTURE_ACCEPTED
+runtime_density_emission_proof=false
+density_contract_fixture_pass=true
+density_fixture_l2_f_allowed_next=false
+l2_f_allowed_next=false
+L2_F_ALLOWED_NEXT=false
+next_stage=L2_D3B_RUNTIME_HARNESS_DENSITY_EMISSION_PROOF
 runtime_approval=false
 research_grade=false
 live_equivalence=false

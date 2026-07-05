@@ -220,14 +220,26 @@ class ShadowV2PathDensityHorizonAuditTest(unittest.TestCase):
         self.assertEqual(metrics["horizon_120000_verdict"], "PASS")
         self.assertIn("300000", metrics["unsupported_horizons_ms"])
 
-    def test_pass_verdict_can_be_stage_specific(self) -> None:
+    def test_d3_contract_fixture_pass_does_not_allow_l2_f(self) -> None:
         rows = [density_row(horizon) for horizon in DECLARED_HORIZONS]
 
-        result = self.run_audit(rows, "--pass-verdict", "L2_D3_DENSITY_READY_FOR_L2_F")
+        result = self.run_audit(rows, "--pass-verdict", "L2_D3_DENSITY_CONTRACT_FIXTURE_ACCEPTED")
 
-        self.assertEqual(result["verdict"], "L2_D3_DENSITY_READY_FOR_L2_F")
-        self.assertEqual(result["pass_verdict"], "L2_D3_DENSITY_READY_FOR_L2_F")
-        self.assertTrue(result["l2_f_allowed_next"])
+        self.assertEqual(result["verdict"], "L2_D3_DENSITY_CONTRACT_FIXTURE_ACCEPTED")
+        self.assertEqual(result["pass_verdict"], "L2_D3_DENSITY_CONTRACT_FIXTURE_ACCEPTED")
+        self.assertTrue(result["density_contract_fixture_pass"])
+        self.assertEqual(
+            result["pr55_contract_fixture_verdict"],
+            "PR55_AS_L2_D3_CONTRACT_FIXTURE_ACCEPTED",
+        )
+        self.assertEqual(
+            result["pr55_runtime_density_verdict"],
+            "PR55_AS_RUNTIME_DENSITY_EMISSION_PROOF_NOT_ACCEPTED",
+        )
+        self.assertFalse(result["density_fixture_l2_f_allowed_next"])
+        self.assertFalse(result["runtime_density_emission_proof"])
+        self.assertEqual(result["next_stage"], "L2_D3B_RUNTIME_HARNESS_DENSITY_EMISSION_PROOF")
+        self.assertFalse(result["l2_f_allowed_next"])
 
 
 if __name__ == "__main__":

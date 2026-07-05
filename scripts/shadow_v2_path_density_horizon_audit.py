@@ -14,6 +14,10 @@ DECLARED_L2_BASELINE_HORIZONS_MS = [2_000, 3_000, 10_000, 30_000, 120_000]
 UNDECLARED_LONG_HORIZONS_MS = [300_000, 500_000]
 DEFAULT_RETENTION_MARGIN_MS = 1_000
 L2_D2_PASS_VERDICT = "L2_D2_DENSITY_RETENTION_READY_FOR_L2_F"
+L2_D3_CONTRACT_FIXTURE_PASS_VERDICT = "L2_D3_DENSITY_CONTRACT_FIXTURE_ACCEPTED"
+PR55_CONTRACT_FIXTURE_VERDICT = "PR55_AS_L2_D3_CONTRACT_FIXTURE_ACCEPTED"
+PR55_RUNTIME_DENSITY_NOT_ACCEPTED_VERDICT = "PR55_AS_RUNTIME_DENSITY_EMISSION_PROOF_NOT_ACCEPTED"
+L2_D3B_NEXT_STAGE = "L2_D3B_RUNTIME_HARNESS_DENSITY_EMISSION_PROOF"
 
 
 VERDICTS = [
@@ -316,6 +320,10 @@ def main() -> int:
     else:
         verdict = args.pass_verdict
 
+    density_contract_fixture_pass = verdict == L2_D3_CONTRACT_FIXTURE_PASS_VERDICT
+    if density_contract_fixture_pass:
+        for item in per_horizon:
+            item["positive_research_claim_allowed"] = False
     result = {
         "audit": "path_density_horizon_retention_repair",
         "scope_root": args.scope_root,
@@ -345,7 +353,17 @@ def main() -> int:
         "density_audit_verdict": verdict,
         "verdict": verdict,
         "pass_verdict": args.pass_verdict,
-        "l2_f_allowed_next": verdict == args.pass_verdict,
+        "density_contract_fixture_pass": density_contract_fixture_pass,
+        "pr55_contract_fixture_verdict": (
+            PR55_CONTRACT_FIXTURE_VERDICT if density_contract_fixture_pass else None
+        ),
+        "pr55_runtime_density_verdict": (
+            PR55_RUNTIME_DENSITY_NOT_ACCEPTED_VERDICT if density_contract_fixture_pass else None
+        ),
+        "density_fixture_l2_f_allowed_next": False,
+        "runtime_density_emission_proof": False,
+        "next_stage": L2_D3B_NEXT_STAGE if density_contract_fixture_pass else None,
+        "l2_f_allowed_next": verdict == args.pass_verdict and not density_contract_fixture_pass,
         "runtime_decision_behavior_changes": False,
         "runtime_evidence_schema_changes": False,
         "new_provider_streams": "NONE",
@@ -386,7 +404,12 @@ def write_summary_csv(result: dict[str, Any], path: Path) -> None:
         "declared_horizon_density_blocker_count",
         "declared_horizon_path_coverage_blocker_count",
         "declared_horizon_retention_blocker_count",
-        "l2_f_allowed_next",
+        "density_contract_fixture_pass",
+        "pr55_contract_fixture_verdict",
+        "pr55_runtime_density_verdict",
+        "density_fixture_l2_f_allowed_next",
+        "runtime_density_emission_proof",
+        "next_stage",
         "runtime_approval",
         "research_grade",
         "live_equivalence",

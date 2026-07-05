@@ -1,21 +1,29 @@
-# ADR-8D: Shadow V2 L2-D3 Density Ready Validation Scope 20260705
+# ADR-8D: Shadow V2 L2-D3 Density Contract Fixture Scope 20260705
 
 ## Status
 
-Accepted implementation stage.
+Accepted fixture-only implementation stage.
 
 ## Decision
 
-Dodajemy L2-D3 jako waski density-ready validation scope:
+Dodajemy L2-D3 jako waski density contract fixture scope:
 
 ```text
-final_verdict=L2_D3_DENSITY_READY_FOR_L2_F
+final_verdict=L2_D3_DENSITY_CONTRACT_FIXTURE_ACCEPTED
+pr55_contract_fixture_verdict=PR55_AS_L2_D3_CONTRACT_FIXTURE_ACCEPTED
+pr55_runtime_density_verdict=PR55_AS_RUNTIME_DENSITY_EMISSION_PROOF_NOT_ACCEPTED
+runtime_density_emission_proof=false
+l2_f_allowed_next=false
+L2_F_ALLOWED_NEXT=false
+next_stage=L2_D3B_RUNTIME_HARNESS_DENSITY_EMISSION_PROOF
 ```
 
 L2-D3 nie jest L2-F i nie jest research validation run. Ten stage potwierdza
-tylko, ze po PR54 naprawiona retencja `standard_120s` i audit density/retention
-moga przejsc declared baseline horizons przy path samples emitowanych do
-`121000ms`.
+tylko, ze audit density/retention moze przejsc declared baseline horizons na
+deterministycznie przygotowanych fixture rows. Ten stage nie dowodzi, ze realny
+runtime albo validation harness emituje path samples do `121000ms`, ani ze
+runtime/harness wyprowadza `shadow_path_density_v2` z kanonicznych
+`shadow_position_event_v2` rows.
 
 ## Context
 
@@ -31,8 +39,8 @@ oraz rozdzielil:
 - path sample coverage insufficiency.
 
 Historyczny scope nadal byl zablokowany przez coverage. L2-D3 tworzy nowy,
-kontrolowany density-validation scope, aby sprawdzic mechanike density-ready
-przed uruchamianiem pelnego L2-F.
+kontrolowany density contract fixture, aby sprawdzic mechanike audit contract
+bez uruchamiania pelnego L2-F i bez claimu runtime emission proof.
 
 ## Implemented Contract
 
@@ -65,17 +73,17 @@ Long horizons:
 500000 = NOT_EVALUABLE_UNDECLARED_FOR_L2_BASELINE
 ```
 
-Final D3 verdict:
+Final D3 fixture verdict:
 
 ```text
-L2_D3_DENSITY_READY_FOR_L2_F
+L2_D3_DENSITY_CONTRACT_FIXTURE_ACCEPTED
 ```
 
 ## Code-Level Changes
 
 ### `scripts/shadow_v2_l2_d3_density_ready_scope.py`
 
-New deterministic generator for a density-only validation scope. It writes:
+New deterministic generator for a density-only contract fixture scope. It writes:
 
 - `shadow_position_event_v2.jsonl`;
 - `shadow_path_density_v2.jsonl`;
@@ -83,8 +91,8 @@ New deterministic generator for a density-only validation scope. It writes:
 - `shadow_lifecycle_v2.jsonl`;
 - `density_ready_validation_manifest.json`.
 
-The generated raw JSONL scope is not a positive research sample. It is a
-controlled density contract validation scope.
+The generated raw JSONL scope is not a positive research sample and is not
+runtime density emission proof. It is a controlled density contract fixture.
 
 ### `scripts/shadow_v2_path_density_horizon_audit.py`
 
@@ -94,10 +102,20 @@ The audit now accepts:
 --pass-verdict
 ```
 
-This keeps the D2 default verdict intact while allowing D3 to emit:
+This keeps the D2 default verdict intact while allowing D3 fixture to emit:
 
 ```text
-L2_D3_DENSITY_READY_FOR_L2_F
+L2_D3_DENSITY_CONTRACT_FIXTURE_ACCEPTED
+```
+
+For the D3 fixture verdict, the audit emits:
+
+```text
+density_contract_fixture_pass=true
+density_fixture_l2_f_allowed_next=false
+runtime_density_emission_proof=false
+next_stage=L2_D3B_RUNTIME_HARNESS_DENSITY_EMISSION_PROOF
+l2_f_allowed_next=false
 ```
 
 ### Tests
@@ -134,11 +152,12 @@ Rejected. Density readiness is independent from policy tuning.
 
 ## Consequences
 
-1. L2-F is allowed next from density readiness perspective.
-2. L2 is still not granted.
-3. Research grade, live equivalence, strategy unlock, runtime approval,
+1. L2-D3 is accepted only as deterministic density contract fixture.
+2. L2-F is not allowed next without L2-D3B runtime/harness density emission proof.
+3. L2 is still not granted.
+4. Research grade, live equivalence, strategy unlock, runtime approval,
    shadow close and active close remain false.
-4. Full L2-F must still prove temporal, manifest, replay/lifecycle,
+5. Full L2-F must still prove temporal, manifest, replay/lifecycle,
    Gatekeeper denominator, sample size, malformed-row, and unknown-blocker gates.
 
 ## Verification
@@ -148,7 +167,7 @@ python3 -m py_compile scripts/shadow_v2_path_density_horizon_audit.py scripts/sh
 python3 tests/test_shadow_v2_path_density_horizon_audit.py
 python3 tests/test_shadow_v2_l2_d3_density_ready_scope.py
 python3 scripts/shadow_v2_l2_d3_density_ready_scope.py --scope-root reports/selector/shadow-v2-l2-d3-density-ready-validation-20260705-r1 --run-id shadow-v2-l2-d3-density-ready-validation-20260705-r1 --positions 25 --duration-ms 121000 --sample-interval-ms 1000
-python3 scripts/shadow_v2_path_density_horizon_audit.py --scope-root reports/selector/shadow-v2-l2-d3-density-ready-validation-20260705-r1 --pass-verdict L2_D3_DENSITY_READY_FOR_L2_F --output-csv reports/selector/shadow_v2_l2_d3_density_ready_validation_summary.csv --pretty
+python3 scripts/shadow_v2_path_density_horizon_audit.py --scope-root reports/selector/shadow-v2-l2-d3-density-ready-validation-20260705-r1 --pass-verdict L2_D3_DENSITY_CONTRACT_FIXTURE_ACCEPTED --output-csv reports/selector/shadow_v2_l2_d3_density_ready_validation_summary.csv --pretty
 CSV parser check for reports/selector/shadow_v2_l2_d3_density_ready_validation_summary.csv
 ```
 
@@ -161,5 +180,10 @@ live_equivalence=false
 strategy_research_unblocked=false
 shadow_close_only=false
 active_close=false
-l2_f_allowed_next=true
+runtime_density_emission_proof=false
+density_contract_fixture_pass=true
+density_fixture_l2_f_allowed_next=false
+l2_f_allowed_next=false
+L2_F_ALLOWED_NEXT=false
+next_stage=L2_D3B_RUNTIME_HARNESS_DENSITY_EMISSION_PROOF
 ```

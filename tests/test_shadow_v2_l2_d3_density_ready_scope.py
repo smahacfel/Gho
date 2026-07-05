@@ -50,7 +50,7 @@ class ShadowV2L2D3DensityReadyScopeTest(unittest.TestCase):
                     "--scope-root",
                     str(scope),
                     "--pass-verdict",
-                    "L2_D3_DENSITY_READY_FOR_L2_F",
+                    "L2_D3_DENSITY_CONTRACT_FIXTURE_ACCEPTED",
                 ],
                 cwd=REPO_ROOT,
                 check=True,
@@ -59,8 +59,20 @@ class ShadowV2L2D3DensityReadyScopeTest(unittest.TestCase):
             )
             result = json.loads(audit.stdout)
 
-        self.assertEqual(result["verdict"], "L2_D3_DENSITY_READY_FOR_L2_F")
-        self.assertTrue(result["l2_f_allowed_next"])
+        self.assertEqual(result["verdict"], "L2_D3_DENSITY_CONTRACT_FIXTURE_ACCEPTED")
+        self.assertTrue(result["density_contract_fixture_pass"])
+        self.assertEqual(
+            result["pr55_contract_fixture_verdict"],
+            "PR55_AS_L2_D3_CONTRACT_FIXTURE_ACCEPTED",
+        )
+        self.assertEqual(
+            result["pr55_runtime_density_verdict"],
+            "PR55_AS_RUNTIME_DENSITY_EMISSION_PROOF_NOT_ACCEPTED",
+        )
+        self.assertFalse(result["density_fixture_l2_f_allowed_next"])
+        self.assertFalse(result["runtime_density_emission_proof"])
+        self.assertEqual(result["next_stage"], "L2_D3B_RUNTIME_HARNESS_DENSITY_EMISSION_PROOF")
+        self.assertFalse(result["l2_f_allowed_next"])
         self.assertEqual(result["declared_horizon_present_count"], 5)
         self.assertEqual(result["declared_horizon_path_coverage_blocker_count"], 0)
         self.assertEqual(result["declared_horizon_retention_blocker_count"], 0)
@@ -68,6 +80,7 @@ class ShadowV2L2D3DensityReadyScopeTest(unittest.TestCase):
         self.assertEqual(by_horizon[120_000]["evaluable_positions"], 3)
         self.assertEqual(by_horizon[120_000]["coverage_ratio"], 1.0)
         self.assertEqual(by_horizon[120_000]["max_gap_ms_max"], 1_000)
+        self.assertFalse(by_horizon[120_000]["positive_research_claim_allowed"])
         self.assertEqual(
             by_horizon[300_000]["verdict"],
             "NOT_EVALUABLE_UNDECLARED_FOR_L2_BASELINE",
