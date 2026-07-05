@@ -220,6 +220,15 @@ class ShadowV2PathDensityHorizonAuditTest(unittest.TestCase):
         self.assertEqual(metrics["horizon_120000_verdict"], "PASS")
         self.assertIn("300000", metrics["unsupported_horizons_ms"])
 
+    def test_pass_verdict_can_be_stage_specific(self) -> None:
+        rows = [density_row(horizon) for horizon in DECLARED_HORIZONS]
+
+        result = self.run_audit(rows, "--pass-verdict", "L2_D3_DENSITY_READY_FOR_L2_F")
+
+        self.assertEqual(result["verdict"], "L2_D3_DENSITY_READY_FOR_L2_F")
+        self.assertEqual(result["pass_verdict"], "L2_D3_DENSITY_READY_FOR_L2_F")
+        self.assertTrue(result["l2_f_allowed_next"])
+
 
 if __name__ == "__main__":
     unittest.main()

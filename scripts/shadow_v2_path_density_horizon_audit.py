@@ -255,6 +255,11 @@ def main() -> int:
         "--output-csv",
         help="Optional metric,value,notes summary CSV path for L2-D2 artifacts.",
     )
+    p.add_argument(
+        "--pass-verdict",
+        default=L2_D2_PASS_VERDICT,
+        help="Final verdict to emit when all declared density/retention gates pass.",
+    )
     args = p.parse_args()
     declared_horizons = set(int_csv(args.declared_horizons_ms))
     undeclared_horizons = set(int_csv(args.undeclared_horizons_ms)) - declared_horizons
@@ -309,7 +314,7 @@ def main() -> int:
     elif retention_blockers:
         verdict = "BLOCKED_RETENTION_CONTRACT_INSUFFICIENT"
     else:
-        verdict = L2_D2_PASS_VERDICT
+        verdict = args.pass_verdict
 
     result = {
         "audit": "path_density_horizon_retention_repair",
@@ -339,7 +344,8 @@ def main() -> int:
         "per_horizon": per_horizon,
         "density_audit_verdict": verdict,
         "verdict": verdict,
-        "l2_f_allowed_next": verdict == L2_D2_PASS_VERDICT,
+        "pass_verdict": args.pass_verdict,
+        "l2_f_allowed_next": verdict == args.pass_verdict,
         "runtime_decision_behavior_changes": False,
         "runtime_evidence_schema_changes": False,
         "new_provider_streams": "NONE",
@@ -370,6 +376,7 @@ def write_summary_csv(result: dict[str, Any], path: Path) -> None:
         "retention_contract_ms",
         "required_replay_coverage_ms",
         "required_replay_horizon_ms",
+        "pass_verdict",
         "retention_margin_ms",
         "density_rows",
         "malformed_density_rows",
