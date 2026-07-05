@@ -5622,6 +5622,93 @@ mod tests {
     }
 
     #[test]
+    fn shadow_v2_l2_d3b_harness_derives_density_from_canonical_path_samples() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = harness_config_for_dir(tmp.path());
+        assert_eq!(
+            config.path_sampler_config,
+            ShadowPathSamplerConfigV2::standard_120s()
+        );
+        assert_eq!(config.path_sampler_config.max_horizon_ms, 121_000);
+        let mut harness = ShadowV2ValidationHarness::new(config).unwrap();
+
+        for idx in 0..=121 {
+            let age_ms = idx as u64 * 1_000;
+            let mut order = event_order_key(Some(45), Some(idx as u32));
+            order.event_seq_in_process = 10 + idx as u64;
+            let sample = path_sample_with_pnl(
+                &format!("d3b-path-sample-{idx:03}"),
+                age_ms,
+                idx,
+                ShadowPathSamplingModeV2::Standard120s,
+                ShadowPathSamplingReasonV2::Heartbeat,
+                order,
+            );
+            let outcome = harness.append_record(ShadowV2Record::ShadowPathSampleV2(sample));
+            assert_eq!(outcome.canonical_write, ShadowV2WriteStatus::Ok);
+            assert_eq!(outcome.density_write, ShadowV2WriteStatus::Ok);
+        }
+
+        let canonical =
+            std::fs::read_to_string(tmp.path().join("shadow_position_event_v2.jsonl")).unwrap();
+        let canonical_rows: Vec<Value> = canonical
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(canonical_rows.len(), 122);
+        assert!(canonical_rows
+            .iter()
+            .all(|row| row["schema"] == "shadow_position_event_v2"));
+        assert!(canonical_rows
+            .iter()
+            .all(|row| row["event_kind"] == "PATH_SAMPLE"));
+
+        let density =
+            std::fs::read_to_string(tmp.path().join("shadow_path_density_v2.jsonl")).unwrap();
+        let density_rows: Vec<Value> = density
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(density_rows.len(), 122 * 7);
+
+        let final_high_watermark = "d3b-path-sample-121";
+        let final_rows: Vec<&Value> = density_rows
+            .iter()
+            .filter(|row| row["source_canonical_high_watermark"] == final_high_watermark)
+            .collect();
+        assert_eq!(final_rows.len(), 7);
+
+        let by_horizon = final_rows
+            .iter()
+            .map(|row| (row["horizon_ms"].as_u64().unwrap(), *row))
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        for horizon in [2_000_u64, 3_000, 10_000, 30_000, 120_000] {
+            let row = by_horizon.get(&horizon).unwrap();
+            assert_eq!(row["schema"], "shadow_path_density_v2");
+            assert_eq!(row["verdict"], "EVALUABLE_EXACT");
+            assert_eq!(row["path_points"], 122);
+            assert_eq!(row["replay_horizon_ms"], 121_000);
+            assert_eq!(row["max_interval_ms"], 1_000);
+            let source_ids = row["source_path_sample_event_ids"].as_array().unwrap();
+            assert_eq!(source_ids.len(), 122);
+            assert_eq!(source_ids.first().unwrap(), "d3b-path-sample-000");
+            assert_eq!(source_ids.last().unwrap(), final_high_watermark);
+        }
+
+        for horizon in [300_000_u64, 500_000] {
+            let row = by_horizon.get(&horizon).unwrap();
+            assert_eq!(row["verdict"], "NOT_EVALUABLE_HORIZON_EXCEEDS_REPLAY");
+            assert_eq!(row["replay_horizon_ms"], 121_000);
+            assert!(row["limitations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "HORIZON_EXCEEDS_CONFIGURED_PATH_MODE"));
+        }
+    }
+
+    #[test]
     fn shadow_v2_validation_harness_keeps_canonical_after_derived_write_failure() {
         let tmp = tempfile::tempdir().unwrap();
         let replay_path = tmp.path().join("shadow_replay_v2.jsonl");

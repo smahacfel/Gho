@@ -15,9 +15,13 @@ UNDECLARED_LONG_HORIZONS_MS = [300_000, 500_000]
 DEFAULT_RETENTION_MARGIN_MS = 1_000
 L2_D2_PASS_VERDICT = "L2_D2_DENSITY_RETENTION_READY_FOR_L2_F"
 L2_D3_CONTRACT_FIXTURE_PASS_VERDICT = "L2_D3_DENSITY_CONTRACT_FIXTURE_ACCEPTED"
+L2_D3B_RUNTIME_HARNESS_PASS_VERDICT = (
+    "L2_D3B_RUNTIME_HARNESS_DENSITY_EMISSION_READY_FOR_L2_F"
+)
 PR55_CONTRACT_FIXTURE_VERDICT = "PR55_AS_L2_D3_CONTRACT_FIXTURE_ACCEPTED"
 PR55_RUNTIME_DENSITY_NOT_ACCEPTED_VERDICT = "PR55_AS_RUNTIME_DENSITY_EMISSION_PROOF_NOT_ACCEPTED"
 L2_D3B_NEXT_STAGE = "L2_D3B_RUNTIME_HARNESS_DENSITY_EMISSION_PROOF"
+L2_F_NEXT_STAGE = "L2_F_RESEARCH_VALIDATION_RUN"
 
 
 VERDICTS = [
@@ -80,6 +84,27 @@ def row_identity(row: dict[str, Any], idx: int) -> str:
 
 def has_limitation(row: dict[str, Any], needle: str) -> bool:
     return any(needle in value for value in row_limitations(row))
+
+
+def latest_density_snapshot_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    latest: dict[tuple[str, int], dict[str, Any]] = {}
+    for idx, row in enumerate(rows):
+        horizon = finite_int(row.get("horizon_ms"))
+        if horizon is None:
+            continue
+        key = (row_identity(row, idx), horizon)
+        current = latest.get(key)
+        if current is None or density_snapshot_sort_key(row) > density_snapshot_sort_key(current):
+            latest[key] = row
+    return list(latest.values())
+
+
+def density_snapshot_sort_key(row: dict[str, Any]) -> tuple[int, int, str]:
+    return (
+        finite_int(row.get("replay_horizon_ms")) or -1,
+        finite_int(row.get("created_at_wall_ms")) or -1,
+        str(row.get("source_canonical_high_watermark") or ""),
+    )
 
 
 def csv_value(value: Any) -> str:
@@ -264,6 +289,14 @@ def main() -> int:
         default=L2_D2_PASS_VERDICT,
         help="Final verdict to emit when all declared density/retention gates pass.",
     )
+    p.add_argument(
+        "--latest-density-per-position-horizon",
+        action="store_true",
+        help=(
+            "Evaluate only the latest density snapshot per position+horizon. "
+            "Use for runtime/harness snapshot streams; default preserves D2 row-level audit semantics."
+        ),
+    )
     args = p.parse_args()
     declared_horizons = set(int_csv(args.declared_horizons_ms))
     undeclared_horizons = set(int_csv(args.undeclared_horizons_ms)) - declared_horizons
@@ -271,7 +304,12 @@ def main() -> int:
     retention_margin_ms = max(args.retention_margin_ms, 0)
     required_replay_horizon_ms = max_declared_horizon_ms + retention_margin_ms
 
-    rows, malformed = density_rows(args.scope_root)
+    input_rows, malformed = density_rows(args.scope_root)
+    rows = (
+        latest_density_snapshot_rows(input_rows)
+        if args.latest_density_per_position_horizon
+        else input_rows
+    )
     by_horizon: dict[int, list[dict]] = defaultdict(list)
     unknown_horizon = 0
     for row in rows:
@@ -321,7 +359,8 @@ def main() -> int:
         verdict = args.pass_verdict
 
     density_contract_fixture_pass = verdict == L2_D3_CONTRACT_FIXTURE_PASS_VERDICT
-    if density_contract_fixture_pass:
+    runtime_harness_density_pass = verdict == L2_D3B_RUNTIME_HARNESS_PASS_VERDICT
+    if density_contract_fixture_pass or runtime_harness_density_pass:
         for item in per_horizon:
             item["positive_research_claim_allowed"] = False
     result = {
@@ -335,6 +374,9 @@ def main() -> int:
         "retention_contract_ms": required_replay_horizon_ms,
         "required_replay_coverage_ms": required_replay_horizon_ms,
         "required_replay_horizon_ms": required_replay_horizon_ms,
+        "density_rows_input": len(input_rows),
+        "density_rows_evaluated": len(rows),
+        "latest_density_per_position_horizon": args.latest_density_per_position_horizon,
         "density_rows": len(rows),
         "malformed_density_rows": malformed,
         "unknown_horizon_rows": unknown_horizon,
@@ -354,6 +396,9 @@ def main() -> int:
         "verdict": verdict,
         "pass_verdict": args.pass_verdict,
         "density_contract_fixture_pass": density_contract_fixture_pass,
+        "runtime_harness_density_emission_proof": runtime_harness_density_pass,
+        "density_derivation_from_canonical_rows": runtime_harness_density_pass,
+        "live_runtime_density_emission_proof": False,
         "pr55_contract_fixture_verdict": (
             PR55_CONTRACT_FIXTURE_VERDICT if density_contract_fixture_pass else None
         ),
@@ -361,9 +406,17 @@ def main() -> int:
             PR55_RUNTIME_DENSITY_NOT_ACCEPTED_VERDICT if density_contract_fixture_pass else None
         ),
         "density_fixture_l2_f_allowed_next": False,
-        "runtime_density_emission_proof": False,
-        "next_stage": L2_D3B_NEXT_STAGE if density_contract_fixture_pass else None,
-        "l2_f_allowed_next": verdict == args.pass_verdict and not density_contract_fixture_pass,
+        "runtime_density_emission_proof": runtime_harness_density_pass,
+        "next_stage": (
+            L2_D3B_NEXT_STAGE
+            if density_contract_fixture_pass
+            else L2_F_NEXT_STAGE
+            if runtime_harness_density_pass
+            else None
+        ),
+        "l2_f_allowed_next": (
+            verdict == args.pass_verdict and not density_contract_fixture_pass
+        ),
         "runtime_decision_behavior_changes": False,
         "runtime_evidence_schema_changes": False,
         "new_provider_streams": "NONE",
@@ -396,6 +449,9 @@ def write_summary_csv(result: dict[str, Any], path: Path) -> None:
         "required_replay_horizon_ms",
         "pass_verdict",
         "retention_margin_ms",
+        "density_rows_input",
+        "density_rows_evaluated",
+        "latest_density_per_position_horizon",
         "density_rows",
         "malformed_density_rows",
         "unknown_horizon_rows",
@@ -405,11 +461,15 @@ def write_summary_csv(result: dict[str, Any], path: Path) -> None:
         "declared_horizon_path_coverage_blocker_count",
         "declared_horizon_retention_blocker_count",
         "density_contract_fixture_pass",
+        "runtime_harness_density_emission_proof",
+        "density_derivation_from_canonical_rows",
+        "live_runtime_density_emission_proof",
         "pr55_contract_fixture_verdict",
         "pr55_runtime_density_verdict",
         "density_fixture_l2_f_allowed_next",
         "runtime_density_emission_proof",
         "next_stage",
+        "l2_f_allowed_next",
         "runtime_approval",
         "research_grade",
         "live_equivalence",
