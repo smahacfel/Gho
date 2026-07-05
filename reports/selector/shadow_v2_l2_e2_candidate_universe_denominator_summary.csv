@@ -1,0 +1,33 @@
+metric,value,notes
+final_verdict,CANDIDATE_UNIVERSE_DENOMINATOR_READY_FOR_L2_E,L2-E2 verdict only; not L2 approval
+l2_e_verdict,GATEKEEPER_DENOMINATOR_COVERAGE_KNOWN,underlying L2-E audit verdict
+candidate_universe_v1,datasets/selector/shadow-v2-l2-e2/candidate_universe_v1.jsonl,
+candidate_universe_manifest_v1,reports/selector/shadow-v2-l2-e2/candidate_universe_manifest_v1.json,
+gatekeeper_decision_path_count,2,
+gatekeeper_decision_paths,"[""logs/decisions/unknown_rollout/v2.5/v25_shadow/e68ffb83c97d478e47528848c81acdeff7472c08a928e1b1d0201641ba1ded42/gatekeeper_v2_decisions.jsonl"",""logs/decisions/unknown_rollout/v2.2/legacy_live/e68ffb83c97d478e47528848c81acdeff7472c08a928e1b1d0201641ba1ded42/gatekeeper_v2_decisions.jsonl""]",
+event_source_path_count,22,
+candidate_universe_count,1368,
+eligible_denominator_count,1368,
+denominator_invariant_status,PASS,
+decision_logs_created_denominator_rows,0,
+candidate_ids_from_decision_only,0,
+decision_only_rows_skipped,0,
+decision_context_rows_joined,2584,
+gatekeeper_decision_count,2584,
+gatekeeper_decision_joined_to_candidate_count,2584,
+gatekeeper_decision_unmatched_count,0,
+checkpoint_reach_count,1363,
+gatekeeper_buy_count,152,
+gatekeeper_reject_count,1678,
+gatekeeper_timeout_count,754,
+unknown_reason_count,0,
+threshold_starvation_verdict,NO_GATEKEEPER_THRESHOLD_STARVATION_OBSERVED,
+runtime_decision_behavior_changes,False,offline-only
+runtime_evidence_schema_changes,False,no runtime schema change
+runtime_approval,False,not granted
+research_grade,False,not granted
+live_equivalence,False,not granted
+strategy_research_unblocked,False,not granted
+shadow_close_only,False,not enabled
+active_close,False,not enabled
+recommended_next_stage,return_to_L2_E_gate_then_L2_F_only_after_temporal_density_and_research_gates,

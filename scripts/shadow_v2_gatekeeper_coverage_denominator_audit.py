@@ -233,9 +233,17 @@ def decision_bucket(decision: dict[str, Any]) -> str:
     verdict = raw_verdict(decision)
     reason = reason_key(decision).upper()
     combined = f"{verdict} {reason}"
+    if "SHADOW_INSUFFICIENT_DATA" in combined or verdict == "INSUFFICIENT_DATA":
+        return "TIMEOUT_SHADOW_INSUFFICIENT_DATA"
     if "TIMEOUT_PHASE1_NO_DATA" in combined:
         return "TIMEOUT_PHASE1_NO_DATA"
     if "TIMEOUT_PHASE1_INSUFFICIENT" in combined:
+        return "TIMEOUT_PHASE1_INSUFFICIENT"
+    if "TIMER_FIRED_INSUFFICIENT_DATA" in combined:
+        return "TIMEOUT_PHASE1_INSUFFICIENT"
+    if "TX_FIRED_INSUFFICIENT_DATA" in combined:
+        return "TIMEOUT_PHASE1_INSUFFICIENT"
+    if "DEADLINE_FALLBACK_INSUFFICIENT_DATA" in combined:
         return "TIMEOUT_PHASE1_INSUFFICIENT"
     if "TIMEOUT" in combined:
         return "TIMEOUT_OTHER"
