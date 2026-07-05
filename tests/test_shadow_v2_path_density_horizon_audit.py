@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import csv
 import subprocess
 import sys
 import tempfile
@@ -91,8 +92,9 @@ class ShadowV2PathDensityHorizonAuditTest(unittest.TestCase):
 
         self.assertEqual(
             result["verdict"],
-            "L2_D_DENSITY_HORIZON_CONTRACT_PASS_FOR_DECLARED_HORIZONS",
+            "L2_D2_DENSITY_RETENTION_READY_FOR_L2_F",
         )
+        self.assertTrue(result["l2_f_allowed_next"])
         self.assertFalse(result["undeclared_horizons_block_l2_baseline"])
         by_horizon = {row["horizon_ms"]: row for row in result["per_horizon"]}
         self.assertEqual(by_horizon[300_000]["verdict"], "NOT_EVALUABLE_UNDECLARED_FOR_L2_BASELINE")
@@ -142,6 +144,81 @@ class ShadowV2PathDensityHorizonAuditTest(unittest.TestCase):
         self.assertEqual(result["declared_horizon_retention_blocker_count"], len(DECLARED_HORIZONS))
         by_horizon = {row["horizon_ms"]: row for row in result["per_horizon"]}
         self.assertEqual(by_horizon[2_000]["verdict"], "FAILED_RETENTION_GAP")
+
+    def test_no_path_coverage_blocks_even_when_declared_horizon_rows_exist(self) -> None:
+        rows = [
+            density_row(
+                horizon,
+                verdict="NOT_EVALUABLE_NO_COVERAGE",
+                replay_horizon_ms=121_000,
+                path_points=0,
+                coverage_points=0,
+                max_interval_ms=None,
+                limitations=["PATH_DENSITY_NO_PATH_POINTS"],
+            )
+            for horizon in DECLARED_HORIZONS
+        ]
+
+        result = self.run_audit(rows)
+
+        self.assertEqual(result["verdict"], "BLOCKED_PATH_SAMPLE_COVERAGE_INSUFFICIENT")
+        self.assertFalse(result["l2_f_allowed_next"])
+        self.assertEqual(
+            result["declared_horizon_path_coverage_blocker_count"],
+            len(DECLARED_HORIZONS),
+        )
+        by_horizon = {row["horizon_ms"]: row for row in result["per_horizon"]}
+        self.assertEqual(
+            by_horizon[120_000]["verdict"],
+            "FAILED_PATH_SAMPLE_COVERAGE_INSUFFICIENT",
+        )
+
+    def test_output_csv_contains_l2_d2_required_metrics(self) -> None:
+        rows = [density_row(horizon) for horizon in DECLARED_HORIZONS]
+        rows.extend(
+            density_row(
+                horizon,
+                verdict="NOT_EVALUABLE_HORIZON_EXCEEDS_REPLAY",
+                coverage_points=0,
+                max_interval_ms=None,
+                limitations=["HORIZON_EXCEEDS_REPLAY_COVERAGE"],
+            )
+            for horizon in UNDECLARED_LONG_HORIZONS
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            scope = Path(tmp) / "scope"
+            scope.mkdir()
+            csv_path = Path(tmp) / "summary.csv"
+            with (scope / "shadow_path_density_v2.jsonl").open("w", encoding="utf-8") as fh:
+                for row in rows:
+                    fh.write(json.dumps(row, sort_keys=True))
+                    fh.write("\n")
+
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(AUDIT_SCRIPT),
+                    "--scope-root",
+                    str(scope),
+                    "--output-csv",
+                    str(csv_path),
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+
+            with csv_path.open("r", encoding="utf-8", newline="") as fh:
+                csv_rows = list(csv.DictReader(fh))
+
+        metrics = {row["metric"]: row["value"] for row in csv_rows}
+        self.assertEqual(metrics["density_audit_verdict"], "L2_D2_DENSITY_RETENTION_READY_FOR_L2_F")
+        self.assertEqual(metrics["retention_contract_ms"], "121000")
+        self.assertEqual(metrics["required_replay_coverage_ms"], "121000")
+        self.assertEqual(metrics["horizon_120000_eligible_positions"], "1")
+        self.assertEqual(metrics["horizon_120000_verdict"], "PASS")
+        self.assertIn("300000", metrics["unsupported_horizons_ms"])
 
 
 if __name__ == "__main__":

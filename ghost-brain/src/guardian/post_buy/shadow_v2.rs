@@ -3142,7 +3142,7 @@ impl ShadowPathSamplerConfigV2 {
     pub const fn standard_120s() -> Self {
         Self {
             mode: ShadowPathSamplingModeV2::Standard120s,
-            max_horizon_ms: 120_000,
+            max_horizon_ms: 121_000,
             heartbeat_ms: 1_000,
             exact_interval_ms: 1_000,
             approx_interval_ms: 5_000,
@@ -7401,6 +7401,42 @@ mod tests {
     }
 
     #[test]
+    fn shadow_v2_standard_120s_sampler_retains_l2_baseline_margin_sample() {
+        let config = ShadowPathSamplerConfigV2::standard_120s();
+        let mut samples = Vec::new();
+        for idx in 0..=121 {
+            let mut order = event_order_key(Some(45), Some(idx as u32));
+            order.event_seq_in_process = 10 + idx as u64;
+            samples.push(path_sample_with_pnl(
+                &format!("path-standard-margin-{idx}"),
+                idx as u64 * 1_000,
+                idx as i32,
+                ShadowPathSamplingModeV2::Standard120s,
+                ShadowPathSamplingReasonV2::Heartbeat,
+                order,
+            ));
+        }
+
+        let selected = select_path_samples_v2(&samples, &config);
+        let evaluations = evaluate_path_density_v2(&selected, &config, &[120_000, 300_000]);
+
+        assert_eq!(config.max_horizon_ms, 121_000);
+        assert_eq!(selected.last().map(|sample| sample.age_ms), Some(121_000));
+        assert_eq!(
+            evaluations[0].verdict,
+            ShadowPathHorizonVerdictV2::EvaluableExact
+        );
+        assert_eq!(evaluations[0].replay_horizon_ms, Some(121_000));
+        assert_eq!(
+            evaluations[1].verdict,
+            ShadowPathHorizonVerdictV2::NotEvaluableHorizonExceedsReplay
+        );
+        assert!(evaluations[1]
+            .limitations
+            .contains(&"HORIZON_EXCEEDS_CONFIGURED_PATH_MODE".to_string()));
+    }
+
+    #[test]
     fn shadow_v2_path_sampler_dense_keeps_all_event_samples_over_max_points_cap() {
         let dense = ShadowPathSamplerConfigV2 {
             max_path_points: 3,
@@ -7444,7 +7480,7 @@ mod tests {
         let long = ShadowPathSamplerConfigV2::long_500s();
 
         assert_eq!(dense.max_horizon_ms, 3_000);
-        assert_eq!(standard.max_horizon_ms, 120_000);
+        assert_eq!(standard.max_horizon_ms, 121_000);
         assert_eq!(long.max_horizon_ms, 500_000);
         assert!(dense.keep_every_event_sample);
         assert!(!standard.keep_every_event_sample);
