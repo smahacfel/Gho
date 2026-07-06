@@ -1,21 +1,21 @@
 relative_path,size_bytes,line_count,sha256,sha256_status,jsonl_rows,malformed_jsonl_rows,schema_counts,is_symlink,status
 candidate_universe_denominator_summary.csv,1965,33,eb0fe4ce38c23083a20cb825ebc6afb8b55acc791ab7099926ae47bc6b86e3ba,OK,0,0,{},False,OK
 candidate_universe_denominator_summary.json,29290,473,6737f6fe99a9d1f88b65c216bcc4e56f0b439856b8cd4093044bd6d9a8969d5e,OK,0,0,{},False,OK
-candidate_universe_manifest_v1.json,16990,272,a4e11fa595413e71e69450607c607da4b930a4386f25da944c5e2681dea1b0d1,OK,0,0,{},False,OK
-candidate_universe_v1.jsonl,4592092,2272,90c69a9960d049de9e87820fd7cb382ab428e5f6a9b99b60bcbb033eef706506,OK,2272,0,"{""NewPoolDetected"": 2272}",False,OK
+candidate_universe_manifest_v1.json,7890,126,2497ca2992ccb30a5ef9d93c87f628dad1e5a4e112430db9890495a98b36c58c,OK,0,0,{},False,OK
+candidate_universe_v1.jsonl,3936376,2272,c6553ba5807645db91001d256882a0a376c47e5541ab4a4d76a5c3248b1a3336,OK,2272,0,"{""NewPoolDetected"": 2272}",False,OK
 gatekeeper_decision_root_evidence.json,841,14,24c5ab6222d93fde35f167e2d03ee87e6f19ed6fa707e7728e2bc4c3152d4337,OK,0,0,{},False,OK
 l2_f_density_excluded_positions_v1.jsonl,14353,19,5a20985743edc1eaf0e42d2e8cd30e1d5acc4c5383e7f13fadd19148a6787958,OK,19,0,"{""shadow_v2_l2_f_density_excluded_position_v1"": 19}",False,OK
 l2_f_evidence_complete_density_audit_summary.csv,12089,161,80a9e57e95f86aaeb60de85de257dba3c4bf78d89991d57b1862c87e7f387747,OK,0,0,{},False,OK
 l2_f_evidence_complete_position_scope_v1.jsonl,169417,750,59d835c98ed338180f85c5467a227068ec5050e5691dce027f9d25209a54622b,OK,750,0,"{""shadow_v2_l2_f_evidence_complete_position_scope_v1"": 750}",False,OK
 launcher.stderr.log,0,0,e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855,OK,0,0,{},False,OK
 launcher.stdout.log,22398783,121807,0b3ebc0b2e5f127139999c1f6d54f6264e4647635382a229c10bc6a9970f7326,OK,0,0,{},False,OK
-post_run_manifest.json,9852,302,6ce0362a8743c129a1e1a9733027ef9cbca1e37b0c66bd6da58a2e2cc66683a3,OK,0,0,{},False,OK
+post_run_manifest.json,9852,302,6453086e559f5877427c210c8b957641560ee803c36e5ef48a5d16d7bcfa05ca,OK,0,0,{},False,OK
 pre_run_manifest.json,675,19,26cbf1d25ad561f804b435dbd07c294676ebd7fa8c2380a1257066f245f725fa,OK,0,0,{},False,OK
 pre_run_manifest_artifacts.csv,122,1,1bbadfa19eb3450d934604c5651f745a2c25236fd41fe96885efed6678973dfa,OK,0,0,{},False,OK
-runtime_post_run_manifest.json,3371,97,b7f20b9c14bc8d22bf79b2b181c3b463dfe31972c738a947842073d2930986ca,OK,0,0,{},False,OK
+runtime_post_run_manifest.json,3365,97,841cb6788ba2bbbf4cc66cefc78b78375f499901d20ecf62920e391d087459ba,OK,0,0,{},False,OK
 shadow_lifecycle_v2.jsonl,6535724424,169474,d73ad2f1e1eb253dea5b7111ff6e4674ca16fdf53c3762fdfdc6ea5ee1b08f7a,OK,169474,0,"{""shadow_lifecycle_v2"": 169474}",False,OK
 shadow_path_density_v2.jsonl,10683588759,1186315,135b3b4130f2726adad9b00e20551ae857b0b1747d3aece70bab1b9d8c69dce0,OK,1186315,0,"{""shadow_path_density_v2"": 1186315}",False,OK
 shadow_position_event_v2.jsonl,1017601618,169474,581f3e40378715be695219737502dc99cc8c27943e3707c796064a4dee955df0,OK,169474,0,"{""shadow_position_event_v2"": 169474}",False,OK
 shadow_replay_v2.jsonl,7910728358,169474,a94e74665246360ab38f122f6bd80a4e750e7a5d81748d774888e260a97a4201,OK,169474,0,"{""shadow_replay_v2"": 169474}",False,OK
-shadow_v2_manifest_report.csv,2986,21,20f253a0adfb895e4b568a665a0fcc52fedbeb4530783944eb31b1080c133ac8,OK,0,0,{},False,OK
-strict_audit_summary.json,8437,209,9fa541a5d6df54b1789d418b39353f0f61bafefc2562640822d4ee46a2e0f21f,OK,0,0,{},False,OK
+shadow_v2_manifest_report.csv,2986,21,3dc0dfc83f09ce74b192eeceb57ac10a9081158daa0333b9a6459af340b74feb,OK,0,0,{},False,OK
+strict_audit_summary.json,9887,236,eefdff696750c317c9e0604e175f54d9d4eb4562bf658512854f30469c0e786a,OK,0,0,{},False,OK

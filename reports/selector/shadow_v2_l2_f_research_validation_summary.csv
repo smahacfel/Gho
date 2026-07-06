@@ -37,6 +37,14 @@ event_seq_chain_order_substitute_count,0,
 terminal_truth_not_derived_count,0,
 terminal_truth_derived_count,801,
 density_excluded_positions_path,reports/selector/shadow-v2-l2-f-collection-20260705-r16/l2_f_density_excluded_positions_v1.jsonl,typed fail-closed excluded-position evidence
+selector_gatekeeper_contract_reuse_status,PASS,L2-F must reuse Selector/Gatekeeper candidate-universe and denominator contracts
+candidate_universe_builder_source,scripts/build_selector_candidate_universe.py,existing Selector builder/contract owner
+candidate_universe_adapter_only,True,launcher log path is an event-source adapter only
+candidate_universe_parallel_model_detected,False,must remain false
+decision_logs_created_denominator_rows,0,decision logs are context only
+candidate_ids_from_decision_only,0,must remain zero
+denominator_invariant_status,PASS,candidate_universe_manifest_v1 invariant
+selector_contract_equivalence_tests,"[""test_launcher_log_adapter_uses_existing_selector_candidate_universe_contract"",""test_decision_only_rows_do_not_create_l2_f_candidate_universe_denominator"",""test_summary_csv_exposes_required_l2_f_metric_names""]",tests proving adapter equivalence and decision-only fail-closed behavior
 declared_supported_horizons_ms,"[2000,3000,10000,30000,120000]",
 unsupported_horizons_ms,"[300000,500000]",not accepted for positive L2 baseline claims
 l2_f_positive_verdict_allowed,True,

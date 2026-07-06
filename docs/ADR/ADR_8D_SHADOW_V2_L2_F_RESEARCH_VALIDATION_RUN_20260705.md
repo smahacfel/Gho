@@ -124,6 +124,47 @@ samples_with_account_data_hash=81883
 missing_account_data_hash_count=0
 ```
 
+## Selector/Gatekeeper Contract Reuse Matrix
+
+Decyzja architektoniczna: L2-F nie tworzy rownoleglego subsystemu
+candidate-universe/denominator. L2-F uzywa istniejacego Selector/Gatekeeper
+contractu:
+
+```text
+selector_gatekeeper_contract_reuse_status=PASS
+candidate_universe_builder_source=scripts/build_selector_candidate_universe.py
+candidate_universe_adapter_only=True
+candidate_universe_parallel_model_detected=False
+decision_logs_created_denominator_rows=0
+candidate_ids_from_decision_only=0
+denominator_invariant_status=PASS
+```
+
+R16 korzysta z istniejacych event-level Selector artifacts:
+
+```text
+datasets/events/shadow-v2-l2-f-collection-20260705-r16/*.jsonl
+```
+
+i odbudowuje `candidate_universe_v1` przez
+`scripts/build_selector_candidate_universe.py`. Launcher-log `NewPoolDetected`
+path w L2-F jest tylko adapterem do event-level inputu tego samego buildera,
+a nie alternatywnym denominator builderem.
+
+| concept | existing Selector/Gatekeeper source/tool/contract | L2-F implementation path | reuse/direct adapter/new code | equivalence proof | tests covering it |
+|---|---|---|---|---|---|
+| `candidate_universe_v1` | `scripts/build_selector_candidate_universe.py`, `selector_pipeline_common.candidate_universe_row` | `collect_selector_event_artifact_paths(run_id)` -> `build_selector_candidate_universe_from_event_artifacts(...)` -> `candidate_builder.run(...)` | reuse | 2272 rows, required Selector fields present, `status_counts.ok=2272` | `test_launcher_log_adapter_uses_existing_selector_candidate_universe_contract` |
+| `candidate_universe_manifest_v1` | `build_selector_candidate_universe.py` manifest contract | `candidate_builder.run(..., manifest_output=...)` | reuse | `status=ok`, `denominator_source=event_artifact_only`, `denominator_invariant_status=PASS` | `test_launcher_log_adapter_uses_existing_selector_candidate_universe_contract` |
+| `denominator_invariant_status` | Selector manifest invariant | strict summary/CSV copies value from `candidate_universe_manifest_v1.json` | reuse | `denominator_invariant_status=PASS` | `test_summary_csv_exposes_required_l2_f_metric_names` |
+| `decision_logs_created_denominator_rows` | Selector manifest invariant and L2-E denominator audit | decision JSONL is context only and never passed as denominator source | reuse | value `0` | `test_decision_only_rows_do_not_create_l2_f_candidate_universe_denominator` |
+| `candidate_ids_from_decision_only` | Selector manifest invariant | L2-F contract gate requires zero | reuse | value `0` | `test_decision_only_rows_do_not_create_l2_f_candidate_universe_denominator` |
+| `decision_context_join_key` | `selector_pipeline_common.identity_join_keys`, Gatekeeper audit `match_candidate` | Gatekeeper decisions join by candidate_id, exact join key, or unambiguous `base_mint+pool_id`; decisions remain context only | reuse | `decision_context_join_key_semantics=Selector identity_join_keys mint_pool/base_mint+pool_id; Gatekeeper decisions are context only` | `test_launcher_log_adapter_uses_existing_selector_candidate_universe_contract` |
+| Gatekeeper decision join | `scripts/shadow_v2_gatekeeper_coverage_denominator_audit.py` | `run_gatekeeper_audit(...)` over candidate universe + decision root | reuse | `gatekeeper_decision_joined_to_candidate_count=4535`, unmatched `0` | `test_shadow_v2_gatekeeper_coverage_denominator_audit.py` |
+| unknown/generic reject reason taxonomy | L2-E Gatekeeper denominator audit reason taxonomy | L2-F consumes `unknown_reason_count` and `unknown_untyped_blockers` as hard gates | reuse | both `0` | `test_shadow_v2_gatekeeper_coverage_denominator_audit.py` |
+| threshold starvation verdict | L2-E Gatekeeper denominator audit | L2-F consumes `threshold_starvation_verdict` | reuse | `NO_GATEKEEPER_THRESHOLD_STARVATION_OBSERVED` | `test_shadow_v2_gatekeeper_coverage_denominator_audit.py` |
+| selector schema version | `selector_pipeline_common.SCHEMA_VERSION` | emitted by existing builder and copied into strict summary | reuse | `selector_schema_version=1` | `test_launcher_log_adapter_uses_existing_selector_candidate_universe_contract` |
+| manifest/status summary | manifest audit and L2-F strict summary | tracked manifests record path, size, rows, SHA and audit consumption | reuse | `manifest_status=PASS` | `test_summary_csv_exposes_required_l2_f_metric_names` |
+
 Position-level density/retention:
 
 ```text

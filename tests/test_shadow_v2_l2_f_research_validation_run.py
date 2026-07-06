@@ -173,6 +173,7 @@ class ShadowV2L2FResearchValidationRunTest(unittest.TestCase):
                     "denominator_invariant_status": "PASS",
                     "decision_logs_created_denominator_rows": 0,
                     "candidate_ids_from_decision_only": 0,
+                    "status_counts": {"ok": 1},
                 },
             )
             write_jsonl(
@@ -259,6 +260,10 @@ class ShadowV2L2FResearchValidationRunTest(unittest.TestCase):
             ]:
                 (scope_root / name).parent.mkdir(parents=True, exist_ok=True)
                 (scope_root / name).write_text("", encoding="utf-8")
+            (scope_root / "launcher.stdout.log").write_text(
+                "2026-07-05T22:06:11.611278Z INFO no candidate birth event here\n",
+                encoding="utf-8",
+            )
 
             stale_summary.write_text(
                 "\n".join(
@@ -293,6 +298,7 @@ class ShadowV2L2FResearchValidationRunTest(unittest.TestCase):
                     "denominator_invariant_status": "PASS",
                     "decision_logs_created_denominator_rows": 0,
                     "candidate_ids_from_decision_only": 0,
+                    "status_counts": {"ok": 1},
                 },
             )
             write_jsonl(
@@ -423,6 +429,7 @@ class ShadowV2L2FResearchValidationRunTest(unittest.TestCase):
                     "denominator_invariant_status": "PASS",
                     "decision_logs_created_denominator_rows": 0,
                     "candidate_ids_from_decision_only": 0,
+                    "status_counts": {"ok": 1},
                 },
             )
             write_jsonl(
@@ -519,6 +526,7 @@ class ShadowV2L2FResearchValidationRunTest(unittest.TestCase):
                     "denominator_invariant_status": "PASS",
                     "decision_logs_created_denominator_rows": 0,
                     "candidate_ids_from_decision_only": 0,
+                    "status_counts": {"ok": 1},
                 },
             )
             write_jsonl(
@@ -570,7 +578,7 @@ class ShadowV2L2FResearchValidationRunTest(unittest.TestCase):
         self.assertTrue(copied_candidate_universe)
         self.assertTrue(copied_candidate_manifest)
 
-    def test_derives_run_local_candidate_universe_from_launcher_new_pool_events(self) -> None:
+    def test_launcher_log_adapter_uses_existing_selector_candidate_universe_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             scope_root = root / "dedicated-scope"
@@ -630,18 +638,147 @@ class ShadowV2L2FResearchValidationRunTest(unittest.TestCase):
                 capture_output=True,
             )
             payload = json.loads(result.stdout)
-            candidate_rows = (output_root / "candidate_universe_v1.jsonl").read_text(encoding="utf-8").splitlines()
+            candidate_rows = [
+                json.loads(line)
+                for line in (output_root / "candidate_universe_v1.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+                if line.strip()
+            ]
             candidate_manifest = json.loads((output_root / "candidate_universe_manifest_v1.json").read_text())
+            adapter_rows = [
+                json.loads(line)
+                for line in (output_root / "l2_f_launcher_new_pool_detected_event_adapter_v1.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+                if line.strip()
+            ]
+            summary_metrics = {}
+            with output_csv.open("r", encoding="utf-8", newline="") as fh:
+                for row in csv.DictReader(fh):
+                    summary_metrics[row["metric"]] = row["value"]
 
         self.assertEqual(len(candidate_rows), 1)
-        self.assertEqual(candidate_manifest["denominator_source"], "launcher_stdout_new_pool_detected")
+        self.assertEqual(len(adapter_rows), 1)
+        self.assertEqual(adapter_rows[0]["adapter_schema"], l2_f.L2_F_LAUNCHER_LOG_ADAPTER_EVENT_SOURCE)
+        self.assertEqual(candidate_manifest["denominator_source"], "event_artifact_only")
+        self.assertEqual(
+            candidate_manifest["input_event_paths"],
+            [str(output_root / "l2_f_launcher_new_pool_detected_event_adapter_v1.jsonl")],
+        )
         self.assertEqual(candidate_manifest["decision_logs_created_denominator_rows"], 0)
         self.assertEqual(candidate_manifest["candidate_ids_from_decision_only"], 0)
+        self.assertEqual(candidate_manifest["denominator_invariant_status"], "PASS")
+        self.assertEqual(candidate_manifest["status_counts"], {"ok": 1})
+        self.assertEqual(candidate_rows[0]["candidate_universe_status"], "ok")
+        self.assertEqual(candidate_rows[0]["selector_schema_version"], 1)
+        self.assertEqual(candidate_rows[0]["candidate_id_source"], "mint_bonding_curve_birth_ts")
+        self.assertEqual(candidate_rows[0]["event_source"], str(output_root / "l2_f_launcher_new_pool_detected_event_adapter_v1.jsonl"))
+        self.assertEqual(candidate_rows[0]["raw_source_kind"], "launcher_stdout_new_pool_detected_adapter")
+        self.assertEqual(
+            payload["selector_gatekeeper_contract_reuse"]["status"],
+            "PASS",
+        )
+        self.assertEqual(
+            summary_metrics["selector_gatekeeper_contract_reuse_status"],
+            "PASS",
+        )
+        self.assertEqual(
+            summary_metrics["candidate_universe_builder_source"],
+            l2_f.SELECTOR_CANDIDATE_BUILDER_SOURCE,
+        )
+        self.assertEqual(summary_metrics["candidate_universe_adapter_only"], "True")
+        self.assertEqual(summary_metrics["candidate_universe_parallel_model_detected"], "False")
+        self.assertEqual(summary_metrics["decision_logs_created_denominator_rows"], "0")
+        self.assertEqual(summary_metrics["candidate_ids_from_decision_only"], "0")
+        self.assertEqual(summary_metrics["denominator_invariant_status"], "PASS")
         self.assertEqual(
             payload["gatekeeper_denominator"]["verdict"],
             "GATEKEEPER_DENOMINATOR_COVERAGE_KNOWN",
         )
         self.assertEqual(payload["gatekeeper_denominator"]["gatekeeper_decision_joined_to_candidate_count"], 1)
+
+    def test_decision_only_rows_do_not_create_l2_f_candidate_universe_denominator(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope_root = root / "dedicated-scope"
+            output_root = root / "l2-f-output"
+            decisions = root / "gatekeeper_v2_decisions.jsonl"
+            missing_history = root / "missing_history.csv"
+            output_csv = root / "summary.csv"
+
+            for name in [
+                "shadow_position_event_v2.jsonl",
+                "shadow_replay_v2.jsonl",
+                "shadow_lifecycle_v2.jsonl",
+                "shadow_path_density_v2.jsonl",
+            ]:
+                (scope_root / name).parent.mkdir(parents=True, exist_ok=True)
+                (scope_root / name).write_text("", encoding="utf-8")
+            (scope_root / "launcher.stdout.log").write_text(
+                "2026-07-05T22:06:11.611278Z INFO gatekeeper decision context only\n",
+                encoding="utf-8",
+            )
+            write_jsonl(
+                decisions,
+                [
+                    {
+                        "base_mint": "mint-a",
+                        "pool_id": "pool-a",
+                        "verdict_type": "BUY",
+                        "decision_verdict_buy": True,
+                    }
+                ],
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--run-id",
+                    "fixture-l2-f-decision-only",
+                    "--scope-root",
+                    str(scope_root),
+                    "--output-root",
+                    str(output_root),
+                    "--decision-root",
+                    str(decisions),
+                    "--historical-summary-csv",
+                    str(missing_history),
+                    "--precondition-density-summary",
+                    str(missing_history),
+                    "--output-csv",
+                    str(output_csv),
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            payload = json.loads(result.stdout)
+
+        self.assertFalse((output_root / "candidate_universe_v1.jsonl").exists())
+        self.assertFalse((output_root / "candidate_universe_manifest_v1.json").exists())
+        self.assertEqual(payload["final_verdict"], l2_f.VERDICT_GATEKEEPER)
+        self.assertEqual(
+            payload["selector_gatekeeper_contract_reuse"]["candidate_universe_adapter_status"],
+            "BLOCKED_NO_EVENT_LEVEL_CANDIDATE_OBSERVATIONS",
+        )
+        self.assertTrue(
+            payload["selector_gatekeeper_contract_reuse"][
+                "candidate_universe_adapter_only"
+            ]
+        )
+        self.assertEqual(
+            payload["selector_gatekeeper_contract_reuse"][
+                "candidate_universe_parallel_model_detected"
+            ],
+            False,
+        )
+        self.assertEqual(
+            payload["gatekeeper_denominator"]["verdict"],
+            "BLOCKED_CANDIDATE_UNIVERSE_DENOMINATOR_UNKNOWN",
+        )
 
     def test_summary_csv_exposes_required_l2_f_metric_names(self) -> None:
         report = {
@@ -681,6 +818,19 @@ class ShadowV2L2FResearchValidationRunTest(unittest.TestCase):
                 "threshold_starvation_verdict": "NO_GATEKEEPER_THRESHOLD_STARVATION_OBSERVED",
                 "unknown_reason_count": 0,
             },
+            "selector_gatekeeper_contract_reuse": {
+                "status": "PASS",
+                "candidate_universe_builder_source": l2_f.SELECTOR_CANDIDATE_BUILDER_SOURCE,
+                "candidate_universe_adapter_only": True,
+                "candidate_universe_parallel_model_detected": False,
+                "decision_logs_created_denominator_rows": 0,
+                "candidate_ids_from_decision_only": 0,
+                "denominator_invariant_status": "PASS",
+                "selector_contract_equivalence_tests": [
+                    "test_launcher_log_adapter_uses_existing_selector_candidate_universe_contract",
+                    "test_decision_only_rows_do_not_create_l2_f_candidate_universe_denominator",
+                ],
+            },
             "malformed_rows": 0,
             "unknown_untyped_blockers": 0,
             "manifest_audit": {"status": "PASS"},
@@ -702,6 +852,14 @@ class ShadowV2L2FResearchValidationRunTest(unittest.TestCase):
             "account_data_hash_coverage_status",
             "terminal_truth_derived_count",
             "density_excluded_positions_path",
+            "selector_gatekeeper_contract_reuse_status",
+            "candidate_universe_builder_source",
+            "candidate_universe_adapter_only",
+            "candidate_universe_parallel_model_detected",
+            "decision_logs_created_denominator_rows",
+            "candidate_ids_from_decision_only",
+            "denominator_invariant_status",
+            "selector_contract_equivalence_tests",
         ]:
             self.assertIn(metric, metrics)
         self.assertEqual(
@@ -709,6 +867,16 @@ class ShadowV2L2FResearchValidationRunTest(unittest.TestCase):
             "L2_F_DENSITY_RETENTION_PASS",
         )
         self.assertEqual(metrics["terminal_truth_derived_count"], "500")
+        self.assertEqual(metrics["selector_gatekeeper_contract_reuse_status"], "PASS")
+        self.assertEqual(
+            metrics["candidate_universe_builder_source"],
+            l2_f.SELECTOR_CANDIDATE_BUILDER_SOURCE,
+        )
+        self.assertEqual(metrics["candidate_universe_adapter_only"], "True")
+        self.assertEqual(metrics["candidate_universe_parallel_model_detected"], "False")
+        self.assertEqual(metrics["decision_logs_created_denominator_rows"], "0")
+        self.assertEqual(metrics["candidate_ids_from_decision_only"], "0")
+        self.assertEqual(metrics["denominator_invariant_status"], "PASS")
 
 
 if __name__ == "__main__":

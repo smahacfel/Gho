@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import hashlib
 import json
 import re
 import shutil
@@ -23,6 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import build_selector_candidate_universe as candidate_builder
 import shadow_v2_gatekeeper_coverage_denominator_audit as gatekeeper_audit
 import shadow_v2_path_density_horizon_audit as density_horizon_audit
 from shadow_v2_offline_audit_common import (
@@ -45,6 +45,8 @@ DECLARED_HORIZONS_MS = [2_000, 3_000, 10_000, 30_000, 120_000]
 UNDECLARED_HORIZONS_MS = [300_000, 500_000]
 DEFAULT_CANDIDATE_UNIVERSE = Path("datasets/selector/shadow-v2-l2-e2/candidate_universe_v1.jsonl")
 DEFAULT_CANDIDATE_MANIFEST = Path("reports/selector/shadow-v2-l2-e2/candidate_universe_manifest_v1.json")
+SELECTOR_CANDIDATE_BUILDER_SOURCE = "scripts/build_selector_candidate_universe.py"
+L2_F_LAUNCHER_LOG_ADAPTER_EVENT_SOURCE = "l2_f_launcher_new_pool_detected_event_adapter_v1"
 L2_DENSITY_PASS_VERDICTS = {
     "L2_D2_DENSITY_RETENTION_READY_FOR_L2_F",
     "L2_F_DENSITY_RETENTION_PASS",
@@ -208,15 +210,80 @@ def parse_log_ts_ms(value: str) -> int | None:
     return int(parsed.timestamp() * 1000)
 
 
-def derive_candidate_universe_from_launcher_log(
+def launcher_new_pool_event_adapter_row(
+    *,
+    launcher_log: Path,
+    run_id: str,
+    line_index: int,
+    match: re.Match[str],
+) -> dict[str, Any]:
+    """Convert launcher NewPoolDetected text into Selector event-level input.
+
+    This is intentionally an adapter, not a denominator builder. The output
+    shape is consumed by build_selector_candidate_universe.py, which remains the
+    owner of candidate_universe_v1 normalization, dedupe, invariant checks, and
+    manifest generation.
+    """
+    pool_id = match.group("pool")
+    base_mint = match.group("mint")
+    birth_slot = int(match.group("slot"))
+    birth_ts_ms = parse_log_ts_ms(match.group("ts")) or 0
+    return {
+        "adapter_schema": L2_F_LAUNCHER_LOG_ADAPTER_EVENT_SOURCE,
+        "run_id": run_id,
+        "event_type": "NewPoolDetected",
+        "is_birth_event": True,
+        "base_mint": base_mint,
+        "mint_id": base_mint,
+        "pool_id": pool_id,
+        "bonding_curve": pool_id,
+        "birth_ts_ms": birth_ts_ms,
+        "timestamp_ms": birth_ts_ms,
+        "slot": birth_slot,
+        "quote_mint": "So11111111111111111111111111111111111111112",
+        "raw_source_kind": "launcher_stdout_new_pool_detected",
+        "launcher_log_path": str(launcher_log),
+        "launcher_log_line_index": line_index,
+        "payload": {
+            "source": "launcher_stdout_new_pool_detected_adapter",
+            "selector_builder_contract": "event_artifact_birth_observation",
+        },
+    }
+
+
+def adapt_launcher_log_to_selector_candidate_universe(
     *,
     launcher_log: Path,
     run_id: str,
     candidate_universe: Path,
     candidate_manifest: Path,
-) -> bool:
+) -> dict[str, Any]:
+    """Build candidate_universe_v1 through the existing Selector builder.
+
+    L2-F does not introduce an independent denominator model. Launcher stdout
+    is only converted into event-level NewPoolDetected observations, then
+    build_selector_candidate_universe.py owns candidate_universe_v1 output and
+    candidate_universe_manifest_v1 invariants.
+    """
+    adapter_events = candidate_universe.with_name(
+        "l2_f_launcher_new_pool_detected_event_adapter_v1.jsonl"
+    )
+    report: dict[str, Any] = {
+        "status": "NOT_RUN",
+        "adapter_only": True,
+        "parallel_denominator_model_detected": False,
+        "builder_source": SELECTOR_CANDIDATE_BUILDER_SOURCE,
+        "adapter_event_path": str(adapter_events),
+        "launcher_log_path": str(launcher_log),
+        "launcher_log_rows_read": 0,
+        "new_pool_detected_rows": 0,
+        "deduped_event_rows": 0,
+        "candidate_universe_path": str(candidate_universe),
+        "candidate_manifest_path": str(candidate_manifest),
+    }
     if not launcher_log.exists():
-        return False
+        report["status"] = "BLOCKED_LAUNCHER_LOG_MISSING"
+        return report
 
     rows_by_key: dict[tuple[str, str], dict[str, Any]] = {}
     rows_read = 0
@@ -230,86 +297,129 @@ def derive_candidate_universe_from_launcher_log(
             matched += 1
             pool_id = match.group("pool")
             base_mint = match.group("mint")
-            birth_slot = int(match.group("slot"))
-            birth_ts_ms = parse_log_ts_ms(match.group("ts")) or 0
             key = (base_mint, pool_id)
             if key in rows_by_key:
                 continue
-            candidate_id = f"{base_mint}:{pool_id}:{birth_ts_ms}"
-            identity = hashlib.sha256(candidate_id.encode("utf-8")).hexdigest()
-            rows_by_key[key] = {
-                "candidate_id": candidate_id,
-                "candidate_id_source": "launcher_stdout_new_pool_detected",
-                "candidate_identity_hash": identity,
-                "candidate_identity_missing_fields": [],
-                "candidate_universe_status": "ok",
-                "cohort": "pumpfun_bonding_curve_sol_v1",
-                "cohort_in_scope": True,
-                "stream_completeness_ok": True,
-                "run_id": run_id,
-                "event_type": "NewPoolDetected",
-                "raw_source_kind": "launcher_stdout_new_pool_detected",
-                "universe_source_kind": "event_artifact",
-                "event_source": str(launcher_log),
-                "event_source_index": idx,
-                "base_mint": base_mint,
-                "mint_id": base_mint,
-                "pool_id": pool_id,
-                "bonding_curve": pool_id,
-                "birth_slot": birth_slot,
-                "birth_ts_ms": birth_ts_ms,
-                "birth_create_event_verified": True,
-                "decision_context_join_key": f"mint_pool:{base_mint}:{pool_id}",
-                "quote_mint": "So11111111111111111111111111111111111111112",
-                "quote_mint_is_sol": True,
-                "selector_schema_version": 1,
-            }
+            rows_by_key[key] = launcher_new_pool_event_adapter_row(
+                launcher_log=launcher_log,
+                run_id=run_id,
+                line_index=idx,
+                match=match,
+            )
 
+    report["launcher_log_rows_read"] = rows_read
+    report["new_pool_detected_rows"] = matched
+    report["deduped_event_rows"] = len(rows_by_key)
     if not rows_by_key:
-        return False
+        report["status"] = "BLOCKED_NO_EVENT_LEVEL_CANDIDATE_OBSERVATIONS"
+        return report
 
     rows = list(rows_by_key.values())
-    candidate_universe.parent.mkdir(parents=True, exist_ok=True)
-    with candidate_universe.open("w", encoding="utf-8") as fh:
+    adapter_events.parent.mkdir(parents=True, exist_ok=True)
+    with adapter_events.open("w", encoding="utf-8") as fh:
         for row in rows:
             fh.write(json.dumps(row, sort_keys=True, separators=(",", ":")))
             fh.write("\n")
 
-    write_json(
-        candidate_manifest,
-        {
-            "artifact": "candidate_universe_v1",
-            "status": "ok",
-            "scope_kind": "l2_f_runtime_launcher_log",
-            "denominator_source": "launcher_stdout_new_pool_detected",
-            "denominator_invariant_status": "PASS",
-            "decision_logs_created_denominator_rows": 0,
-            "candidate_ids_from_decision_only": 0,
-            "decision_only_rows_skipped": 0,
-            "event_denominator_rows_after_dedupe": len(rows),
-            "rows_written": len(rows),
-            "event_load": {
-                "rows_read": rows_read,
-                "rows_loaded": matched,
-                "skipped_counts": {"non_new_pool_detected_log_line": max(rows_read - matched, 0)},
-            },
-            "decision_context_join_key_counts": {"mint_pool": len(rows)},
-            "decision_context_rows_joined": len(rows),
-            "decision_context_rows_ambiguous": 0,
-            "duplicates": max(matched - len(rows), 0),
-            "input_event_paths": [str(launcher_log)],
-            "input_decision_paths": [],
-            "status_counts": {"ok": len(rows)},
-            "universe_contract": {
-                "cohort": "SOL-paired pump.fun NewPoolDetected launcher event observations",
-                "decision_logs": "context_only_not_denominator_by_default",
-            },
-        },
+    manifest = candidate_builder.run(
+        argparse.Namespace(
+            events=[adapter_events],
+            decisions=[],
+            output=candidate_universe,
+            manifest_output=candidate_manifest,
+            allow_degraded_events=False,
+            allow_decision_universe=False,
+            allow_incomplete_universe=False,
+            window_start_ms=None,
+            window_end_ms=None,
+            json=False,
+        )
     )
-    return True
+    report["status"] = "PASS" if manifest.get("status") == "ok" else "BLOCKED_SELECTOR_BUILDER_MANIFEST"
+    report["selector_builder_manifest_status"] = manifest.get("status")
+    report["selector_schema_version"] = manifest.get("selector_schema_version")
+    report["denominator_invariant_status"] = manifest.get("denominator_invariant_status")
+    report["decision_logs_created_denominator_rows"] = manifest.get(
+        "decision_logs_created_denominator_rows"
+    )
+    report["candidate_ids_from_decision_only"] = manifest.get("candidate_ids_from_decision_only")
+    report["candidate_universe_status_counts"] = manifest.get("status_counts", {})
+    report["selector_builder_input_event_paths"] = manifest.get("input_event_paths", [])
+    return report
+
+
+def collect_selector_event_artifact_paths(run_id: str) -> list[Path]:
+    event_root = Path("datasets") / "events" / run_id
+    if not event_root.exists():
+        return []
+    return sorted(path for path in event_root.glob("*.jsonl") if path.is_file())
+
+
+def build_selector_candidate_universe_from_event_artifacts(
+    *,
+    event_paths: list[Path],
+    candidate_universe: Path,
+    candidate_manifest: Path,
+) -> dict[str, Any]:
+    report: dict[str, Any] = {
+        "status": "NOT_RUN",
+        "adapter_only": True,
+        "parallel_denominator_model_detected": False,
+        "builder_source": SELECTOR_CANDIDATE_BUILDER_SOURCE,
+        "adapter_event_path": None,
+        "selector_event_artifact_paths": [str(path) for path in event_paths],
+        "selector_event_artifact_path_count": len(event_paths),
+        "candidate_universe_path": str(candidate_universe),
+        "candidate_manifest_path": str(candidate_manifest),
+    }
+    if not event_paths:
+        report["status"] = "BLOCKED_SELECTOR_EVENT_ARTIFACTS_MISSING"
+        return report
+    manifest = candidate_builder.run(
+        argparse.Namespace(
+            events=event_paths,
+            decisions=[],
+            output=candidate_universe,
+            manifest_output=candidate_manifest,
+            allow_degraded_events=False,
+            allow_decision_universe=False,
+            allow_incomplete_universe=False,
+            window_start_ms=None,
+            window_end_ms=None,
+            json=False,
+        )
+    )
+    report["status"] = "PASS" if manifest.get("status") == "ok" else "BLOCKED_SELECTOR_BUILDER_MANIFEST"
+    report["selector_builder_manifest_status"] = manifest.get("status")
+    report["selector_schema_version"] = manifest.get("selector_schema_version")
+    report["denominator_invariant_status"] = manifest.get("denominator_invariant_status")
+    report["decision_logs_created_denominator_rows"] = manifest.get(
+        "decision_logs_created_denominator_rows"
+    )
+    report["candidate_ids_from_decision_only"] = manifest.get("candidate_ids_from_decision_only")
+    report["candidate_universe_status_counts"] = manifest.get("status_counts", {})
+    report["selector_builder_input_event_paths"] = manifest.get("input_event_paths", [])
+    return report
+
+
+def derive_candidate_universe_from_launcher_log(
+    *,
+    launcher_log: Path,
+    run_id: str,
+    candidate_universe: Path,
+    candidate_manifest: Path,
+) -> dict[str, Any]:
+    """Backward-compatible name for the L2-F launcher-log adapter path."""
+    return adapt_launcher_log_to_selector_candidate_universe(
+        launcher_log=launcher_log,
+        run_id=run_id,
+        candidate_universe=candidate_universe,
+        candidate_manifest=candidate_manifest,
+    )
 
 
 def write_summary_csv(path: Path, report: dict[str, Any]) -> None:
+    reuse = report.get("selector_gatekeeper_contract_reuse", {})
     rows = [
         ("final_verdict", report["final_verdict"], "maximum positive verdict remains offline-only"),
         ("run_id", report["run_id"], ""),
@@ -389,6 +499,46 @@ def write_summary_csv(path: Path, report: dict[str, Any]) -> None:
             report["position_level_density_gate"].get("density_excluded_positions_path"),
             "typed fail-closed excluded-position evidence",
         ),
+        (
+            "selector_gatekeeper_contract_reuse_status",
+            reuse.get("status"),
+            "L2-F must reuse Selector/Gatekeeper candidate-universe and denominator contracts",
+        ),
+        (
+            "candidate_universe_builder_source",
+            reuse.get("candidate_universe_builder_source"),
+            "existing Selector builder/contract owner",
+        ),
+        (
+            "candidate_universe_adapter_only",
+            reuse.get("candidate_universe_adapter_only"),
+            "launcher log path is an event-source adapter only",
+        ),
+        (
+            "candidate_universe_parallel_model_detected",
+            reuse.get("candidate_universe_parallel_model_detected"),
+            "must remain false",
+        ),
+        (
+            "decision_logs_created_denominator_rows",
+            reuse.get("decision_logs_created_denominator_rows"),
+            "decision logs are context only",
+        ),
+        (
+            "candidate_ids_from_decision_only",
+            reuse.get("candidate_ids_from_decision_only"),
+            "must remain zero",
+        ),
+        (
+            "denominator_invariant_status",
+            reuse.get("denominator_invariant_status"),
+            "candidate_universe_manifest_v1 invariant",
+        ),
+        (
+            "selector_contract_equivalence_tests",
+            reuse.get("selector_contract_equivalence_tests"),
+            "tests proving adapter equivalence and decision-only fail-closed behavior",
+        ),
         ("declared_supported_horizons_ms", DECLARED_HORIZONS_MS, ""),
         ("unsupported_horizons_ms", UNDECLARED_HORIZONS_MS, "not accepted for positive L2 baseline claims"),
         ("l2_f_positive_verdict_allowed", report["final_verdict"] == VERDICT_PASS, ""),
@@ -415,6 +565,21 @@ def copy_if_exists(src: Path, dst: Path) -> bool:
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(src, dst)
     return True
+
+
+def intish(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            return int(float(value.strip()))
+        except ValueError:
+            return None
+    return None
 
 
 def collect_decision_paths(decision_roots: list[Path]) -> list[Path]:
@@ -455,6 +620,15 @@ def run_gatekeeper_audit(args: argparse.Namespace, decision_paths: list[Path]) -
         "verdict": report.get("final_verdict"),
         "candidate_universe_count": report.get("candidate_universe_count"),
         "eligible_denominator_count": report.get("eligible_denominator_count"),
+        "candidate_manifest_denominator_invariant_status": report.get(
+            "candidate_manifest_denominator_invariant_status"
+        ),
+        "candidate_manifest_decision_logs_created_denominator_rows": report.get(
+            "candidate_manifest_decision_logs_created_denominator_rows"
+        ),
+        "candidate_manifest_candidate_ids_from_decision_only": report.get(
+            "candidate_manifest_candidate_ids_from_decision_only"
+        ),
         "denominator_contract_failures": report.get("denominator_contract_failures", []),
         "gatekeeper_decision_count": report.get("gatekeeper_decision_count"),
         "gatekeeper_decision_joined_to_candidate_count": report.get("gatekeeper_decision_joined_to_candidate_count"),
@@ -466,6 +640,67 @@ def run_gatekeeper_audit(args: argparse.Namespace, decision_paths: list[Path]) -
         "unknown_reason_count": report.get("unknown_reason_count") or 0,
         "threshold_starvation_verdict": report.get("threshold_starvation_verdict"),
         "decision_paths": [str(path) for path in decision_paths],
+    }
+
+
+def selector_gatekeeper_contract_reuse_report(
+    *,
+    candidate_manifest: dict[str, Any],
+    adapter_report: dict[str, Any],
+    gatekeeper_report: dict[str, Any],
+) -> dict[str, Any]:
+    decision_created = intish(candidate_manifest.get("decision_logs_created_denominator_rows"))
+    decision_only = intish(candidate_manifest.get("candidate_ids_from_decision_only"))
+    invariant = str(candidate_manifest.get("denominator_invariant_status") or "")
+    status = str(candidate_manifest.get("status") or "")
+    builder_source = adapter_report.get("builder_source") or SELECTOR_CANDIDATE_BUILDER_SOURCE
+    adapter_only = bool(adapter_report.get("adapter_only"))
+    parallel_model = bool(adapter_report.get("parallel_denominator_model_detected"))
+    adapter_status = str(adapter_report.get("status") or "")
+    status_counts = candidate_manifest.get("status_counts") if isinstance(candidate_manifest, dict) else {}
+    ok_rows = intish(status_counts.get("ok")) if isinstance(status_counts, dict) else None
+    failures: list[str] = []
+    if adapter_status not in {"PASS", "NOT_USED_EXPLICIT_CANDIDATE_UNIVERSE"}:
+        failures.append(f"candidate_universe_adapter_status_{adapter_status or 'missing'}")
+    if status != "ok":
+        failures.append(f"candidate_universe_manifest_status_{status or 'missing'}")
+    if invariant != "PASS":
+        failures.append(f"denominator_invariant_status_{invariant or 'missing'}")
+    if decision_created != 0:
+        failures.append("decision_logs_created_denominator_rows_nonzero")
+    if decision_only != 0:
+        failures.append("candidate_ids_from_decision_only_nonzero")
+    if not adapter_only:
+        failures.append("candidate_universe_adapter_only_false")
+    if parallel_model:
+        failures.append("candidate_universe_parallel_model_detected")
+    if ok_rows is None or ok_rows <= 0:
+        failures.append("candidate_universe_status_ok_missing")
+    if gatekeeper_report.get("verdict") == gatekeeper_audit.VERDICT_DENOMINATOR_UNKNOWN:
+        failures.append("gatekeeper_denominator_unknown")
+    return {
+        "status": "PASS" if not failures else "FAIL",
+        "failures": failures,
+        "candidate_universe_builder_source": builder_source,
+        "candidate_universe_adapter_only": adapter_only,
+        "candidate_universe_parallel_model_detected": parallel_model,
+        "candidate_universe_adapter_status": adapter_status,
+        "candidate_universe_adapter_event_path": adapter_report.get("adapter_event_path"),
+        "candidate_universe_manifest_status": status,
+        "candidate_universe_status_ok_count": ok_rows,
+        "decision_logs_created_denominator_rows": decision_created,
+        "candidate_ids_from_decision_only": decision_only,
+        "denominator_invariant_status": invariant,
+        "decision_context_join_key_semantics": "Selector identity_join_keys mint_pool/base_mint+pool_id; Gatekeeper decisions are context only",
+        "gatekeeper_decision_join": gatekeeper_report.get("verdict"),
+        "threshold_starvation_verdict": gatekeeper_report.get("threshold_starvation_verdict"),
+        "selector_schema_version": candidate_manifest.get("selector_schema_version"),
+        "manifest_status_summary": candidate_manifest.get("status"),
+        "selector_contract_equivalence_tests": [
+            "test_launcher_log_adapter_uses_existing_selector_candidate_universe_contract",
+            "test_decision_only_rows_do_not_create_l2_f_candidate_universe_denominator",
+            "test_summary_csv_exposes_required_l2_f_metric_names",
+        ],
     }
 
 
@@ -874,7 +1109,7 @@ def raw_artifact_audit_consumption(scope_root: Path | None) -> list[dict[str, An
             "path": f"{root}/launcher.stdout.log" if root else "launcher.stdout.log",
             "tracked_in_git": False,
             "consumed_by": [
-                "candidate_universe_v1 derivation when no explicit candidate universe is supplied",
+                "L2-F NewPoolDetected event adapter to build_selector_candidate_universe.py",
                 "shadow_v2_manifest_audit.py",
             ],
         },
@@ -975,6 +1210,13 @@ def build_manifest(
 
 def choose_final_verdict(report: dict[str, Any]) -> tuple[str, list[str]]:
     blockers: list[str] = []
+    reuse = report.get("selector_gatekeeper_contract_reuse", {})
+    if reuse.get("status") != "PASS":
+        blockers.append(
+            "Selector/Gatekeeper candidate universe contract reuse not proven: "
+            + ",".join(str(item) for item in reuse.get("failures", []))
+        )
+        return VERDICT_GATEKEEPER, blockers
     gatekeeper = report["gatekeeper_denominator"]
     if gatekeeper["verdict"] == gatekeeper_audit.VERDICT_DENOMINATOR_UNKNOWN:
         blockers.append("gatekeeper candidate denominator is unknown")
@@ -1052,24 +1294,43 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
     output_root = args.output_root or Path("reports") / "selector" / args.run_id
     output_root.mkdir(parents=True, exist_ok=True)
 
+    candidate_adapter_report: dict[str, Any] = {
+        "status": "NOT_USED_EXPLICIT_CANDIDATE_UNIVERSE",
+        "adapter_only": True,
+        "parallel_denominator_model_detected": False,
+        "builder_source": SELECTOR_CANDIDATE_BUILDER_SOURCE,
+    }
     if (
         args.scope_root
         and args.candidate_universe == DEFAULT_CANDIDATE_UNIVERSE
         and args.candidate_manifest == DEFAULT_CANDIDATE_MANIFEST
     ):
-        derive_candidate_universe_from_launcher_log(
-            launcher_log=args.scope_root / "launcher.stdout.log",
-            run_id=args.run_id,
-            candidate_universe=output_root / "candidate_universe_v1.jsonl",
-            candidate_manifest=output_root / "candidate_universe_manifest_v1.json",
-        )
+        selector_event_paths = collect_selector_event_artifact_paths(args.run_id)
+        if selector_event_paths:
+            candidate_adapter_report = build_selector_candidate_universe_from_event_artifacts(
+                event_paths=selector_event_paths,
+                candidate_universe=output_root / "candidate_universe_v1.jsonl",
+                candidate_manifest=output_root / "candidate_universe_manifest_v1.json",
+            )
+        else:
+            candidate_adapter_report = derive_candidate_universe_from_launcher_log(
+                launcher_log=args.scope_root / "launcher.stdout.log",
+                run_id=args.run_id,
+                candidate_universe=output_root / "candidate_universe_v1.jsonl",
+                candidate_manifest=output_root / "candidate_universe_manifest_v1.json",
+            )
         if (output_root / "candidate_universe_v1.jsonl").exists():
             args.candidate_universe = output_root / "candidate_universe_v1.jsonl"
         if (output_root / "candidate_universe_manifest_v1.json").exists():
             args.candidate_manifest = output_root / "candidate_universe_manifest_v1.json"
+        if not (output_root / "candidate_universe_v1.jsonl").exists():
+            args.candidate_universe = output_root / "candidate_universe_v1.jsonl"
+        if not (output_root / "candidate_universe_manifest_v1.json").exists():
+            args.candidate_manifest = output_root / "candidate_universe_manifest_v1.json"
 
     copy_if_exists(args.candidate_universe, output_root / "candidate_universe_v1.jsonl")
     copy_if_exists(args.candidate_manifest, output_root / "candidate_universe_manifest_v1.json")
+    candidate_manifest_payload = read_json(output_root / "candidate_universe_manifest_v1.json")
 
     decision_paths = collect_decision_paths(args.decision_root)
     decision_evidence = {
@@ -1093,6 +1354,11 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
     dedicated_scope_present, missing_scope_files = status_from_required_files(required_files)
 
     gatekeeper_report = run_gatekeeper_audit(args, decision_paths)
+    selector_contract_reuse = selector_gatekeeper_contract_reuse_report(
+        candidate_manifest=candidate_manifest_payload,
+        adapter_report=candidate_adapter_report,
+        gatekeeper_report=gatekeeper_report,
+    )
 
     if dedicated_scope_present and args.scope_root:
         position_sets, _position_set_malformed = collect_roundtrip_position_sets(args.scope_root)
@@ -1238,6 +1504,29 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
             "accepted_as_l2_f_research_sample": False,
         },
         "gatekeeper_denominator": gatekeeper_report,
+        "selector_gatekeeper_contract_reuse": selector_contract_reuse,
+        "selector_gatekeeper_contract_reuse_status": selector_contract_reuse.get("status"),
+        "candidate_universe_builder_source": selector_contract_reuse.get(
+            "candidate_universe_builder_source"
+        ),
+        "candidate_universe_adapter_only": selector_contract_reuse.get(
+            "candidate_universe_adapter_only"
+        ),
+        "candidate_universe_parallel_model_detected": selector_contract_reuse.get(
+            "candidate_universe_parallel_model_detected"
+        ),
+        "decision_logs_created_denominator_rows": selector_contract_reuse.get(
+            "decision_logs_created_denominator_rows"
+        ),
+        "candidate_ids_from_decision_only": selector_contract_reuse.get(
+            "candidate_ids_from_decision_only"
+        ),
+        "denominator_invariant_status": selector_contract_reuse.get(
+            "denominator_invariant_status"
+        ),
+        "selector_contract_equivalence_tests": selector_contract_reuse.get(
+            "selector_contract_equivalence_tests"
+        ),
         "manifest_audit": {
             "status": manifest_report.get("status") or manifest_report.get("verdict"),
             "blockers": manifest_report.get("blockers", []),

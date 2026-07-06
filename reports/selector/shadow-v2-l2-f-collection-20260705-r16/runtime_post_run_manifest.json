@@ -67,7 +67,7 @@
     },
     {
       "consumed_by": [
-        "candidate_universe_v1 derivation when no explicit candidate universe is supplied",
+        "L2-F NewPoolDetected event adapter to build_selector_candidate_universe.py",
         "shadow_v2_manifest_audit.py"
       ],
       "path": "reports/selector/shadow-v2-l2-f-collection-20260705-r16/launcher.stdout.log",

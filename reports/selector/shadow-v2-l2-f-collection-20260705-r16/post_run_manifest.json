@@ -30,14 +30,14 @@
     {
       "is_symlink": false,
       "jsonl_rows": 0,
-      "line_count": 272,
+      "line_count": 126,
       "malformed_jsonl_rows": 0,
       "relative_path": "candidate_universe_manifest_v1.json",
       "schema": "shadow_v2_artifact_manifest_entry_v1",
       "schema_counts": {},
-      "sha256": "a4e11fa595413e71e69450607c607da4b930a4386f25da944c5e2681dea1b0d1",
+      "sha256": "2497ca2992ccb30a5ef9d93c87f628dad1e5a4e112430db9890495a98b36c58c",
       "sha256_status": "OK",
-      "size_bytes": 16990,
+      "size_bytes": 7890,
       "status": "OK"
     },
     {
@@ -50,9 +50,9 @@
       "schema_counts": {
         "NewPoolDetected": 2272
       },
-      "sha256": "90c69a9960d049de9e87820fd7cb382ab428e5f6a9b99b60bcbb033eef706506",
+      "sha256": "c6553ba5807645db91001d256882a0a376c47e5541ab4a4d76a5c3248b1a3336",
       "sha256_status": "OK",
-      "size_bytes": 4592092,
+      "size_bytes": 3936376,
       "status": "OK"
     },
     {
@@ -145,7 +145,7 @@
       "relative_path": "post_run_manifest.json",
       "schema": "shadow_v2_artifact_manifest_entry_v1",
       "schema_counts": {},
-      "sha256": "6ce0362a8743c129a1e1a9733027ef9cbca1e37b0c66bd6da58a2e2cc66683a3",
+      "sha256": "6453086e559f5877427c210c8b957641560ee803c36e5ef48a5d16d7bcfa05ca",
       "sha256_status": "OK",
       "size_bytes": 9852,
       "status": "OK"
@@ -184,9 +184,9 @@
       "relative_path": "runtime_post_run_manifest.json",
       "schema": "shadow_v2_artifact_manifest_entry_v1",
       "schema_counts": {},
-      "sha256": "b7f20b9c14bc8d22bf79b2b181c3b463dfe31972c738a947842073d2930986ca",
+      "sha256": "841cb6788ba2bbbf4cc66cefc78b78375f499901d20ecf62920e391d087459ba",
       "sha256_status": "OK",
-      "size_bytes": 3371,
+      "size_bytes": 3365,
       "status": "OK"
     },
     {
@@ -257,7 +257,7 @@
       "relative_path": "shadow_v2_manifest_report.csv",
       "schema": "shadow_v2_artifact_manifest_entry_v1",
       "schema_counts": {},
-      "sha256": "20f253a0adfb895e4b568a665a0fcc52fedbeb4530783944eb31b1080c133ac8",
+      "sha256": "3dc0dfc83f09ce74b192eeceb57ac10a9081158daa0333b9a6459af340b74feb",
       "sha256_status": "OK",
       "size_bytes": 2986,
       "status": "OK"
@@ -265,19 +265,19 @@
     {
       "is_symlink": false,
       "jsonl_rows": 0,
-      "line_count": 209,
+      "line_count": 236,
       "malformed_jsonl_rows": 0,
       "relative_path": "strict_audit_summary.json",
       "schema": "shadow_v2_artifact_manifest_entry_v1",
       "schema_counts": {},
-      "sha256": "9fa541a5d6df54b1789d418b39353f0f61bafefc2562640822d4ee46a2e0f21f",
+      "sha256": "eefdff696750c317c9e0604e175f54d9d4eb4562bf658512854f30469c0e786a",
       "sha256_status": "OK",
-      "size_bytes": 8437,
+      "size_bytes": 9887,
       "status": "OK"
     }
   ],
   "blockers": [],
-  "created_at": "2026-07-06T11:44:56+00:00",
+  "created_at": "2026-07-06T13:12:43+00:00",
   "manifest_audit_version": "shadow_v2_manifest_audit_v1",
   "manifest_phase": "post_run",
   "raw_jsonl_git_staging_allowed": false,
@@ -298,5 +298,5 @@
   "scope_root": "reports/selector/shadow-v2-l2-f-collection-20260705-r16",
   "simulation_contract_version": "shadow_burnin_simulation_v2_20260629",
   "status": "PASS",
-  "total_size_bytes": 26174904422
+  "total_size_bytes": 26174241050
 }
