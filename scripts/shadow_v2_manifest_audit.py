@@ -165,6 +165,49 @@ def jsonl_stats(path: Path) -> tuple[int, int, Counter[str]]:
     return rows, malformed, schema_counts
 
 
+def streamed_file_stats(
+    path: Path,
+    max_sha_bytes: int,
+) -> tuple[int, str, str, int, int, Counter[str]]:
+    size = path.stat().st_size
+    sha_enabled = size <= max_sha_bytes
+    digest = hashlib.sha256() if sha_enabled else None
+    sha_status = "OK" if sha_enabled else "SKIPPED_TOO_LARGE"
+    line_count = 0
+    jsonl_rows = 0
+    malformed_jsonl_rows = 0
+    schema_counts: Counter[str] = Counter()
+    inspect_jsonl = path.suffix == ".jsonl"
+
+    with path.open("rb") as handle:
+        for raw_line in handle:
+            line_count += 1
+            if digest is not None:
+                digest.update(raw_line)
+            if not inspect_jsonl:
+                continue
+            line = raw_line.strip()
+            if not line:
+                continue
+            jsonl_rows += 1
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                malformed_jsonl_rows += 1
+                continue
+            if isinstance(value, dict):
+                schema = extract_schema(value)
+                if schema:
+                    schema_counts[schema] += 1
+                else:
+                    schema_counts["UNKNOWN_SCHEMA"] += 1
+            else:
+                schema_counts["NON_OBJECT_JSON"] += 1
+
+    sha = digest.hexdigest() if digest is not None else ""
+    return line_count, sha, sha_status, jsonl_rows, malformed_jsonl_rows, schema_counts
+
+
 def count_lines(path: Path) -> int:
     lines = 0
     with path.open("rb") as handle:
@@ -192,14 +235,14 @@ def artifact_entry(path: Path, scope_root: Path, max_sha_bytes: int) -> dict[str
             "status": "BLOCKED_SYMLINK",
         }
 
-    sha, sha_status = sha256_file(path, max_sha_bytes)
-    line_count = count_lines(path)
-    jsonl_rows = 0
-    malformed_jsonl_rows = 0
-    schema_counts: Counter[str] = Counter()
-
-    if path.suffix == ".jsonl":
-        jsonl_rows, malformed_jsonl_rows, schema_counts = jsonl_stats(path)
+    (
+        line_count,
+        sha,
+        sha_status,
+        jsonl_rows,
+        malformed_jsonl_rows,
+        schema_counts,
+    ) = streamed_file_stats(path, max_sha_bytes)
 
     status = "OK"
     if malformed_jsonl_rows > 0:

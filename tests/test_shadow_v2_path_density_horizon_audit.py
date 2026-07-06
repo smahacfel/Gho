@@ -302,6 +302,106 @@ class ShadowV2PathDensityHorizonAuditTest(unittest.TestCase):
         self.assertEqual(result["declared_horizon_retention_blocker_count"], 0)
         self.assertTrue(result["l2_f_allowed_next"])
 
+    def test_validation_smoke_marker_rows_are_excluded_from_l2_density_scope(self) -> None:
+        rows = [density_row(horizon) for horizon in DECLARED_HORIZONS]
+        for horizon in DECLARED_HORIZONS:
+            marker = density_row(
+                horizon,
+                position_id=f"validation-smoke-marker:fixture-run:{horizon}",
+                verdict="NOT_EVALUABLE_NO_COVERAGE",
+                replay_horizon_ms=121_000,
+                path_points=0,
+                coverage_points=0,
+                max_interval_ms=None,
+                limitations=["PATH_DENSITY_NO_PATH_POINTS"],
+            )
+            marker["session_id"] = f"validation-smoke-session:{horizon}"
+            marker["source_canonical_high_watermark"] = (
+                f"validation_smoke_marker_v2:fixture-run:{horizon}"
+            )
+            rows.append(marker)
+
+        result = self.run_audit(
+            rows,
+            "--latest-density-per-position-horizon",
+            "--pass-verdict",
+            "L2_F_DENSITY_RETENTION_PASS",
+        )
+
+        self.assertEqual(result["density_rows_input"], len(rows))
+        self.assertEqual(result["density_rows_candidate_scope"], len(DECLARED_HORIZONS))
+        self.assertEqual(
+            result["excluded_validation_smoke_density_rows"],
+            len(DECLARED_HORIZONS),
+        )
+        self.assertEqual(result["density_rows_evaluated"], len(DECLARED_HORIZONS))
+        self.assertEqual(result["verdict"], "L2_F_DENSITY_RETENTION_PASS")
+        self.assertEqual(result["declared_horizon_path_coverage_blocker_count"], 0)
+        by_horizon = {row["horizon_ms"]: row for row in result["per_horizon"]}
+        self.assertEqual(by_horizon[120_000]["verdict"], "PASS")
+
+    def test_position_scope_jsonl_filters_density_rows_deterministically(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scope = root / "scope"
+            scope.mkdir()
+            position_scope = root / "position_scope.jsonl"
+            position_scope.write_text(
+                json.dumps(
+                    {
+                        "schema": "shadow_v2_l2_f_evidence_complete_position_scope_v1",
+                        "position_id": "pos-good",
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            rows = []
+            for horizon in DECLARED_HORIZONS:
+                rows.append(density_row(horizon, position_id="pos-good"))
+                rows.append(
+                    density_row(
+                        horizon,
+                        position_id="pos-bad",
+                        verdict="SPARSE_APPROX_ONLY",
+                        max_interval_ms=9_000,
+                        limitations=["PATH_DENSITY_INTERVAL_TOO_SPARSE_FOR_APPROX"],
+                    )
+                )
+            with (scope / "shadow_path_density_v2.jsonl").open("w", encoding="utf-8") as fh:
+                for row in rows:
+                    fh.write(json.dumps(row, sort_keys=True))
+                    fh.write("\n")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(AUDIT_SCRIPT),
+                    "--scope-root",
+                    str(scope),
+                    "--latest-density-per-position-horizon",
+                    "--position-scope-jsonl",
+                    str(position_scope),
+                    "--pass-verdict",
+                    "L2_F_DENSITY_RETENTION_PASS",
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            payload = json.loads(result.stdout)
+
+        self.assertEqual(payload["verdict"], "L2_F_DENSITY_RETENTION_PASS")
+        self.assertTrue(payload["position_scope_filter_present"])
+        self.assertEqual(payload["position_scope_position_count"], 1)
+        self.assertEqual(
+            payload["density_rows_excluded_outside_position_scope"],
+            len(DECLARED_HORIZONS),
+        )
+        self.assertEqual(payload["declared_horizon_path_coverage_blocker_count"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

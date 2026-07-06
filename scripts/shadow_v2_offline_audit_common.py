@@ -35,20 +35,33 @@ def read_json(path: Path) -> dict[str, Any]:
         return json.load(fh)
 
 
-def read_jsonl(path: Path) -> tuple[list[dict[str, Any]], int]:
-    rows: list[dict[str, Any]] = []
-    malformed = 0
+def iter_jsonl(path: Path) -> Iterable[tuple[dict[str, Any] | None, bool]]:
     if not path.exists():
-        return rows, 0
+        return
     with path.open("r", encoding="utf-8") as fh:
         for line in fh:
             line = line.strip()
             if not line:
                 continue
             try:
-                rows.append(json.loads(line))
+                row = json.loads(line)
             except json.JSONDecodeError:
-                malformed += 1
+                yield None, True
+                continue
+            if isinstance(row, dict):
+                yield row, False
+            else:
+                yield None, True
+
+
+def read_jsonl(path: Path) -> tuple[list[dict[str, Any]], int]:
+    rows: list[dict[str, Any]] = []
+    malformed = 0
+    for row, row_malformed in iter_jsonl(path) or ():
+        if row_malformed or row is None:
+            malformed += 1
+            continue
+        rows.append(row)
     return rows, malformed
 
 
@@ -141,6 +154,22 @@ def lifecycle_rows(scope_root: str | Path) -> tuple[list[dict[str, Any]], int]:
 
 def density_rows(scope_root: str | Path) -> tuple[list[dict[str, Any]], int]:
     return read_jsonl(scope_path(scope_root, "shadow_path_density_v2.jsonl"))
+
+
+def iter_canonical_rows(scope_root: str | Path) -> Iterable[tuple[dict[str, Any] | None, bool]]:
+    return iter_jsonl(scope_path(scope_root, "shadow_position_event_v2.jsonl"))
+
+
+def iter_replay_rows(scope_root: str | Path) -> Iterable[tuple[dict[str, Any] | None, bool]]:
+    return iter_jsonl(scope_path(scope_root, "shadow_replay_v2.jsonl"))
+
+
+def iter_lifecycle_rows(scope_root: str | Path) -> Iterable[tuple[dict[str, Any] | None, bool]]:
+    return iter_jsonl(scope_path(scope_root, "shadow_lifecycle_v2.jsonl"))
+
+
+def iter_density_rows(scope_root: str | Path) -> Iterable[tuple[dict[str, Any] | None, bool]]:
+    return iter_jsonl(scope_path(scope_root, "shadow_path_density_v2.jsonl"))
 
 
 def filter_schema(rows: Iterable[dict[str, Any]], schema: str) -> list[dict[str, Any]]:

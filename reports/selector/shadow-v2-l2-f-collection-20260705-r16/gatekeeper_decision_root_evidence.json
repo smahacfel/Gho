@@ -1,0 +1,14 @@
+{
+  "decision_logs_created_denominator_rows": 0,
+  "decision_root_inputs": [
+    "logs/rollout/shadow-v2-l2-f-collection-20260705-r16/decisions"
+  ],
+  "gatekeeper_decision_path_count": 2,
+  "gatekeeper_decision_paths": [
+    "logs/rollout/shadow-v2-l2-f-collection-20260705-r16/decisions/shadow-v2-l2-f-collection-20260705-r16/v2.2/legacy_live/6908b0214a021b9c9f72025b08431585ae410c147cb2d06b9b89fd67b6de3356/gatekeeper_v2_decisions.jsonl",
+    "logs/rollout/shadow-v2-l2-f-collection-20260705-r16/decisions/shadow-v2-l2-f-collection-20260705-r16/v2.5/v25_shadow/6908b0214a021b9c9f72025b08431585ae410c147cb2d06b9b89fd67b6de3356/gatekeeper_v2_decisions.jsonl"
+  ],
+  "raw_decision_jsonl_copied_into_l2_f_scope": false,
+  "run_id": "shadow-v2-l2-f-collection-20260705-r16",
+  "schema": "shadow_v2_l2_f_gatekeeper_decision_root_evidence_v1"
+}
