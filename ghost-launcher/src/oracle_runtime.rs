@@ -22460,6 +22460,7 @@ async fn apply_trigger_buy_outcome(
                     .clone()
                     .unwrap_or_else(|| shadow_event.decision_ts_ms.to_string());
                 if post_buy_lane == "shadow" {
+                    let shadow_runtime_opened_at_ms = current_time_ms();
                     match send_shadow_post_buy_handoff(
                         event_tx,
                         post_buy_tx,
@@ -22474,7 +22475,7 @@ async fn apply_trigger_buy_outcome(
                         min_tokens_out,
                         shadow_entry_token_amount_raw,
                         Some(shadow_event.rpc_slot),
-                        Some(shadow_event.decision_ts_ms),
+                        Some(shadow_runtime_opened_at_ms),
                         shadow_event.join_metadata.clone(),
                         shadow_v2_entry_boundary.clone(),
                     )

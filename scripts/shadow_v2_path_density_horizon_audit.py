@@ -7,7 +7,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Iterable
 
-from shadow_v2_offline_audit_common import density_rows, emit, parser, position_id
+from shadow_v2_offline_audit_common import emit, parser, position_id
 
 
 DECLARED_L2_BASELINE_HORIZONS_MS = [2_000, 3_000, 10_000, 30_000, 120_000]
@@ -80,6 +80,41 @@ def row_limitations(row: dict[str, Any]) -> list[str]:
 
 def row_identity(row: dict[str, Any], idx: int) -> str:
     return position_id(row) or str(row.get("position_id") or f"row:{idx}")
+
+
+def is_validation_smoke_density_row(row: dict[str, Any]) -> bool:
+    position = str(row.get("position_id") or "")
+    session = str(row.get("session_id") or "")
+    high_watermark = str(row.get("source_canonical_high_watermark") or "")
+    return (
+        position.startswith("validation-smoke-marker:")
+        or session.startswith("validation-smoke-session:")
+        or high_watermark.startswith("validation_smoke_marker_v2:")
+    )
+
+
+def load_position_scope(path: str | Path | None) -> set[str] | None:
+    if not path:
+        return None
+    scope_path = Path(path)
+    if not scope_path.exists():
+        return set()
+    positions: set[str] = set()
+    with scope_path.open("r", encoding="utf-8") as fh:
+        for raw_line in fh:
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(row, dict):
+                continue
+            position = str(row.get("position_id") or "")
+            if position:
+                positions.add(position)
+    return positions
 
 
 def has_limitation(row: dict[str, Any], needle: str) -> bool:
@@ -262,6 +297,217 @@ def missing_declared_horizon_metrics(horizon: int) -> dict[str, Any]:
     }
 
 
+class HorizonAccumulator:
+    def __init__(self, horizon: int) -> None:
+        self.horizon = horizon
+        self.counts: Counter[str] = Counter()
+        self.eligible_positions: set[str] = set()
+        self.evaluable_positions: set[str] = set()
+        self.path_points: list[Any] = []
+        self.coverage_points: list[Any] = []
+        self.max_interval_ms: list[Any] = []
+        self.replay_horizon_ms: list[Any] = []
+        self.total_density_rows = 0
+        self.retention_gap_count = 0
+        self.censored_count = 0
+        self.horizon_unmatured_count = 0
+        self.duplicate_sample_count = 0
+        self.non_monotonic_sample_count = 0
+
+    def add(self, row: dict[str, Any], idx: int, *, required_replay_horizon_ms: int) -> None:
+        self.total_density_rows += 1
+        verdict = str(row.get("verdict") or "UNKNOWN")
+        self.counts[verdict] += 1
+        identity = row_identity(row, idx)
+        self.eligible_positions.add(identity)
+        if verdict in EVALUABLE_VERDICTS:
+            self.evaluable_positions.add(identity)
+
+        self.path_points.append(row.get("path_points"))
+        self.coverage_points.append(row.get("coverage_points"))
+        self.max_interval_ms.append(row.get("max_interval_ms"))
+        self.replay_horizon_ms.append(row.get("replay_horizon_ms"))
+
+        replay_horizon = finite_int(row.get("replay_horizon_ms"))
+        if replay_horizon is None or replay_horizon < required_replay_horizon_ms:
+            self.retention_gap_count += 1
+        if (
+            row.get("truncated") is True
+            or has_limitation(row, "TRUNCATED")
+            or has_limitation(row, "CENSORED")
+        ):
+            self.censored_count += 1
+        if has_limitation(row, "HORIZON_UNMATURED"):
+            self.horizon_unmatured_count += 1
+        self.duplicate_sample_count += finite_int(row.get("duplicate_age_count")) or 0
+        if row.get("non_monotonic_input") is True:
+            self.non_monotonic_sample_count += 1
+
+    def to_metrics(
+        self,
+        *,
+        declared_horizons: set[int],
+        undeclared_horizons: set[int],
+    ) -> dict[str, Any]:
+        declared = self.horizon in declared_horizons
+        undeclared = self.horizon in undeclared_horizons or not declared
+        path_coverage_gap_count = (
+            self.counts["NOT_EVALUABLE_NO_COVERAGE"]
+            + self.counts["NOT_EVALUABLE_HORIZON_EXCEEDS_REPLAY"]
+        )
+        sparse_or_unknown_count = self.counts["SPARSE_APPROX_ONLY"] + self.counts["UNKNOWN"]
+        if declared:
+            if path_coverage_gap_count:
+                horizon_verdict = "FAILED_PATH_SAMPLE_COVERAGE_INSUFFICIENT"
+                l2_baseline_blocker = True
+                positive_claim_allowed = False
+            elif sparse_or_unknown_count:
+                horizon_verdict = "FAILED_DECLARED_HORIZON_INCOMPLETE"
+                l2_baseline_blocker = True
+                positive_claim_allowed = False
+            elif self.retention_gap_count:
+                horizon_verdict = "FAILED_RETENTION_GAP"
+                l2_baseline_blocker = True
+                positive_claim_allowed = False
+            else:
+                horizon_verdict = "PASS"
+                l2_baseline_blocker = False
+                positive_claim_allowed = True
+        else:
+            horizon_verdict = "NOT_EVALUABLE_UNDECLARED_FOR_L2_BASELINE"
+            l2_baseline_blocker = False
+            positive_claim_allowed = False
+
+        coverage_ratio = (
+            len(self.evaluable_positions) / len(self.eligible_positions)
+            if self.eligible_positions
+            else 0.0
+        )
+        return {
+            "horizon_ms": self.horizon,
+            "horizon_scope": "DECLARED_L2_BASELINE" if declared else "UNDECLARED_FOR_L2_BASELINE",
+            "total_density_rows": self.total_density_rows,
+            "eligible_positions": len(self.eligible_positions),
+            "evaluable_positions": len(self.evaluable_positions),
+            "coverage_ratio": coverage_ratio,
+            **{f"{value}_count": self.counts[value] for value in VERDICTS},
+            "UNKNOWN_count": self.counts["UNKNOWN"],
+            "samples_per_position_p50": percentile(self.path_points, 50),
+            "samples_per_position_p90": percentile(self.path_points, 90),
+            "coverage_points_p50": percentile(self.coverage_points, 50),
+            "coverage_points_p90": percentile(self.coverage_points, 90),
+            "max_gap_ms_p90": percentile(self.max_interval_ms, 90),
+            "max_gap_ms_max": max(
+                (
+                    value
+                    for value in (finite_int(v) for v in self.max_interval_ms)
+                    if value is not None
+                ),
+                default=None,
+            ),
+            "replay_horizon_ms_min": min(
+                (
+                    value
+                    for value in (finite_int(v) for v in self.replay_horizon_ms)
+                    if value is not None
+                ),
+                default=None,
+            ),
+            "replay_horizon_ms_p50": percentile(self.replay_horizon_ms, 50),
+            "duplicate_sample_count": self.duplicate_sample_count,
+            "non_monotonic_sample_count": self.non_monotonic_sample_count,
+            "censored_count": self.censored_count,
+            "horizon_unmatured_count": self.horizon_unmatured_count,
+            "retention_gap_count": self.retention_gap_count,
+            "path_sample_coverage_gap_count": path_coverage_gap_count,
+            "sparse_or_unknown_count": sparse_or_unknown_count,
+            "positive_research_claim_allowed": positive_claim_allowed,
+            "l2_baseline_blocker": l2_baseline_blocker,
+            "verdict": horizon_verdict,
+            "undeclared_default_status": (
+                "NOT_EVALUABLE_UNDECLARED_FOR_L2_BASELINE" if undeclared else None
+            ),
+        }
+
+
+def iter_density_jsonl(path: Path):
+    if not path.exists():
+        return
+    with path.open("r", encoding="utf-8") as fh:
+        for idx, raw_line in enumerate(fh):
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                yield idx, None, True
+                continue
+            if isinstance(row, dict):
+                yield idx, row, False
+            else:
+                yield idx, None, True
+
+
+def density_snapshot_scan(
+    *,
+    scope_root: str | Path,
+    latest_density_per_position_horizon: bool,
+    required_replay_horizon_ms: int,
+    position_scope: set[str] | None = None,
+) -> tuple[dict[int, HorizonAccumulator], dict[str, int]]:
+    path = Path(scope_root) / "shadow_path_density_v2.jsonl"
+    counters = {
+        "density_rows_input": 0,
+        "malformed_density_rows": 0,
+        "density_rows_candidate_scope": 0,
+        "density_rows_excluded_outside_position_scope": 0,
+        "excluded_validation_smoke_density_rows": 0,
+        "density_rows_evaluated": 0,
+        "unknown_horizon_rows": 0,
+    }
+    latest: dict[tuple[str, int], tuple[int, dict[str, Any]]] = {}
+    accumulators: dict[int, HorizonAccumulator] = {}
+
+    for idx, row, malformed in iter_density_jsonl(path) or ():
+        if malformed or row is None:
+            counters["malformed_density_rows"] += 1
+            continue
+        counters["density_rows_input"] += 1
+        if is_validation_smoke_density_row(row):
+            counters["excluded_validation_smoke_density_rows"] += 1
+            continue
+        identity = row_identity(row, idx)
+        if position_scope is not None and identity not in position_scope:
+            counters["density_rows_excluded_outside_position_scope"] += 1
+            continue
+        counters["density_rows_candidate_scope"] += 1
+        horizon = finite_int(row.get("horizon_ms"))
+        if horizon is None:
+            counters["unknown_horizon_rows"] += 1
+            continue
+        if latest_density_per_position_horizon:
+            key = (identity, horizon)
+            current = latest.get(key)
+            if current is None or density_snapshot_sort_key(row) > density_snapshot_sort_key(current[1]):
+                latest[key] = (idx, row)
+            continue
+        counters["density_rows_evaluated"] += 1
+        accumulator = accumulators.setdefault(horizon, HorizonAccumulator(horizon))
+        accumulator.add(row, idx, required_replay_horizon_ms=required_replay_horizon_ms)
+
+    if latest_density_per_position_horizon:
+        for evaluated_idx, (idx, row) in enumerate(latest.values()):
+            horizon = finite_int(row.get("horizon_ms"))
+            if horizon is None:
+                continue
+            counters["density_rows_evaluated"] += 1
+            accumulator = accumulators.setdefault(horizon, HorizonAccumulator(horizon))
+            accumulator.add(row, evaluated_idx if idx is None else idx, required_replay_horizon_ms=required_replay_horizon_ms)
+
+    return accumulators, counters
+
+
 def main() -> int:
     p = parser("Offline Shadow V2 path density horizon retention audit")
     p.add_argument(
@@ -297,6 +543,15 @@ def main() -> int:
             "Use for runtime/harness snapshot streams; default preserves D2 row-level audit semantics."
         ),
     )
+    p.add_argument(
+        "--position-scope-jsonl",
+        default=None,
+        help=(
+            "Optional JSONL allowlist containing position_id rows. When set, "
+            "density rows outside this deterministic position scope are excluded "
+            "from the candidate density denominator and counted separately."
+        ),
+    )
     args = p.parse_args()
     declared_horizons = set(int_csv(args.declared_horizons_ms))
     undeclared_horizons = set(int_csv(args.undeclared_horizons_ms)) - declared_horizons
@@ -304,32 +559,22 @@ def main() -> int:
     retention_margin_ms = max(args.retention_margin_ms, 0)
     required_replay_horizon_ms = max_declared_horizon_ms + retention_margin_ms
 
-    input_rows, malformed = density_rows(args.scope_root)
-    rows = (
-        latest_density_snapshot_rows(input_rows)
-        if args.latest_density_per_position_horizon
-        else input_rows
+    position_scope = load_position_scope(args.position_scope_jsonl)
+    by_horizon, density_counters = density_snapshot_scan(
+        scope_root=args.scope_root,
+        latest_density_per_position_horizon=args.latest_density_per_position_horizon,
+        required_replay_horizon_ms=required_replay_horizon_ms,
+        position_scope=position_scope,
     )
-    by_horizon: dict[int, list[dict]] = defaultdict(list)
-    unknown_horizon = 0
-    for row in rows:
-        horizon = row.get("horizon_ms")
-        if isinstance(horizon, int):
-            by_horizon[horizon].append(row)
-        else:
-            unknown_horizon += 1
     per_horizon = []
     missing_declared_horizons = sorted(declared_horizons - set(by_horizon))
     retention_blockers = 0
     density_blockers = 0
     path_coverage_blockers = 0
-    for horizon in sorted(by_horizon):
-        item = horizon_metrics(
-            horizon,
-            by_horizon[horizon],
+    for horizon, accumulator in sorted(by_horizon.items()):
+        item = accumulator.to_metrics(
             declared_horizons=declared_horizons,
             undeclared_horizons=undeclared_horizons,
-            required_replay_horizon_ms=required_replay_horizon_ms,
         )
         if horizon in declared_horizons:
             if item["path_sample_coverage_gap_count"]:
@@ -347,6 +592,8 @@ def main() -> int:
 
     declared_present_count = len(declared_horizons & set(by_horizon))
     undeclared_present_count = len(set(by_horizon) - declared_horizons)
+    malformed = density_counters["malformed_density_rows"]
+    unknown_horizon = density_counters["unknown_horizon_rows"]
     if malformed or unknown_horizon:
         verdict = "BLOCKED_DENSITY_DECLARED_HORIZON_INCOMPLETE"
     elif missing_declared_horizons or density_blockers:
@@ -374,10 +621,18 @@ def main() -> int:
         "retention_contract_ms": required_replay_horizon_ms,
         "required_replay_coverage_ms": required_replay_horizon_ms,
         "required_replay_horizon_ms": required_replay_horizon_ms,
-        "density_rows_input": len(input_rows),
-        "density_rows_evaluated": len(rows),
+        "density_rows_input": density_counters["density_rows_input"],
+        "position_scope_jsonl": args.position_scope_jsonl,
+        "position_scope_filter_present": position_scope is not None,
+        "position_scope_position_count": len(position_scope) if position_scope is not None else None,
+        "density_rows_candidate_scope": density_counters["density_rows_candidate_scope"],
+        "density_rows_excluded_outside_position_scope": density_counters[
+            "density_rows_excluded_outside_position_scope"
+        ],
+        "excluded_validation_smoke_density_rows": density_counters["excluded_validation_smoke_density_rows"],
+        "density_rows_evaluated": density_counters["density_rows_evaluated"],
         "latest_density_per_position_horizon": args.latest_density_per_position_horizon,
-        "density_rows": len(rows),
+        "density_rows": density_counters["density_rows_evaluated"],
         "malformed_density_rows": malformed,
         "unknown_horizon_rows": unknown_horizon,
         "horizon_count": len(by_horizon),
@@ -450,6 +705,12 @@ def write_summary_csv(result: dict[str, Any], path: Path) -> None:
         "pass_verdict",
         "retention_margin_ms",
         "density_rows_input",
+        "density_rows_candidate_scope",
+        "position_scope_jsonl",
+        "position_scope_filter_present",
+        "position_scope_position_count",
+        "density_rows_excluded_outside_position_scope",
+        "excluded_validation_smoke_density_rows",
         "density_rows_evaluated",
         "latest_density_per_position_horizon",
         "density_rows",
@@ -504,7 +765,11 @@ def write_summary_csv(result: dict[str, Any], path: Path) -> None:
             add(f"horizon_{horizon_ms}_{metric}", horizon.get(metric), notes)
 
     with path.open("w", encoding="utf-8", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=["metric", "value", "notes"])
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=["metric", "value", "notes"],
+            lineterminator="\n",
+        )
         writer.writeheader()
         writer.writerows(rows)
 

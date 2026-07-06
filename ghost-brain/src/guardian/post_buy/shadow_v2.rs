@@ -1492,54 +1492,58 @@ impl PoolStateSampleV2 {
         if self.event_order_key.slot.is_unknown() {
             blockers.push("EVENT_ORDER_SLOT_UNKNOWN".to_string());
         }
-        for component in self
-            .event_order_key
-            .explicit_unknown_chain_order_components()
-        {
-            match component {
-                "slot" => {}
-                "block_time" => blockers.push("EVENT_ORDER_BLOCK_TIME_UNKNOWN".to_string()),
-                "signature" => blockers.push("EVENT_ORDER_SIGNATURE_UNKNOWN".to_string()),
-                "transaction_index_or_unknown" => {
-                    blockers.push("EVENT_ORDER_TRANSACTION_INDEX_UNKNOWN".to_string())
+        let account_state_proof_complete = self.source == PoolStateSource::AccountStateCore
+            && self.has_complete_account_state_source_proof();
+        if !account_state_proof_complete {
+            for component in self
+                .event_order_key
+                .explicit_unknown_chain_order_components()
+            {
+                match component {
+                    "slot" => {}
+                    "block_time" => blockers.push("EVENT_ORDER_BLOCK_TIME_UNKNOWN".to_string()),
+                    "signature" => blockers.push("EVENT_ORDER_SIGNATURE_UNKNOWN".to_string()),
+                    "transaction_index_or_unknown" => {
+                        blockers.push("EVENT_ORDER_TRANSACTION_INDEX_UNKNOWN".to_string())
+                    }
+                    "instruction_index_or_unknown" => {
+                        blockers.push("EVENT_ORDER_INSTRUCTION_INDEX_UNKNOWN".to_string())
+                    }
+                    "inner_instruction_index_or_unknown" => {
+                        blockers.push("EVENT_ORDER_INNER_INSTRUCTION_INDEX_UNKNOWN".to_string())
+                    }
+                    "log_index_or_unknown" => {
+                        blockers.push("EVENT_ORDER_LOG_INDEX_UNKNOWN".to_string())
+                    }
+                    _ => blockers.push(format!("EVENT_ORDER_COMPONENT_UNKNOWN:{component}")),
                 }
-                "instruction_index_or_unknown" => {
-                    blockers.push("EVENT_ORDER_INSTRUCTION_INDEX_UNKNOWN".to_string())
-                }
-                "inner_instruction_index_or_unknown" => {
-                    blockers.push("EVENT_ORDER_INNER_INSTRUCTION_INDEX_UNKNOWN".to_string())
-                }
-                "log_index_or_unknown" => {
-                    blockers.push("EVENT_ORDER_LOG_INDEX_UNKNOWN".to_string())
-                }
-                _ => blockers.push(format!("EVENT_ORDER_COMPONENT_UNKNOWN:{component}")),
             }
-        }
-        for component in self
-            .event_order_key
-            .not_applicable_or_derived_chain_order_components()
-        {
-            blockers.push(format!(
-                "EVENT_ORDER_COMPONENT_NOT_CHAIN_OBSERVED:{component}"
-            ));
-        }
-        for component in self.event_order_key.missing_chain_order_components() {
-            match component {
-                "slot" => {}
-                "signature" => blockers.push("EVENT_ORDER_SIGNATURE_MISSING".to_string()),
-                "transaction_index_or_unknown" => {
-                    blockers.push("EVENT_ORDER_TRANSACTION_INDEX_MISSING".to_string())
+            for component in self
+                .event_order_key
+                .not_applicable_or_derived_chain_order_components()
+            {
+                blockers.push(format!(
+                    "EVENT_ORDER_COMPONENT_NOT_CHAIN_OBSERVED:{component}"
+                ));
+            }
+            for component in self.event_order_key.missing_chain_order_components() {
+                match component {
+                    "slot" => {}
+                    "signature" => blockers.push("EVENT_ORDER_SIGNATURE_MISSING".to_string()),
+                    "transaction_index_or_unknown" => {
+                        blockers.push("EVENT_ORDER_TRANSACTION_INDEX_MISSING".to_string())
+                    }
+                    "instruction_index_or_unknown" => {
+                        blockers.push("EVENT_ORDER_INSTRUCTION_INDEX_MISSING".to_string())
+                    }
+                    "inner_instruction_index_or_unknown" => {
+                        blockers.push("EVENT_ORDER_INNER_INSTRUCTION_INDEX_MISSING".to_string())
+                    }
+                    "log_index_or_unknown" => {
+                        blockers.push("EVENT_ORDER_LOG_INDEX_MISSING".to_string())
+                    }
+                    _ => blockers.push(format!("EVENT_ORDER_COMPONENT_MISSING:{component}")),
                 }
-                "instruction_index_or_unknown" => {
-                    blockers.push("EVENT_ORDER_INSTRUCTION_INDEX_MISSING".to_string())
-                }
-                "inner_instruction_index_or_unknown" => {
-                    blockers.push("EVENT_ORDER_INNER_INSTRUCTION_INDEX_MISSING".to_string())
-                }
-                "log_index_or_unknown" => {
-                    blockers.push("EVENT_ORDER_LOG_INDEX_MISSING".to_string())
-                }
-                _ => blockers.push(format!("EVENT_ORDER_COMPONENT_MISSING:{component}")),
             }
         }
         if self
@@ -3184,7 +3188,10 @@ impl ShadowPathSamplerConfigV2 {
     pub const fn standard_120s() -> Self {
         Self {
             mode: ShadowPathSamplingModeV2::Standard120s,
-            max_horizon_ms: 121_000,
+            // L2 baseline requires 120s + 1s replay coverage. Runtime heartbeats
+            // are not phase-locked to the horizon boundary, so keep an extra
+            // 2s buffer to guarantee emitted density snapshots can prove 121s.
+            max_horizon_ms: 123_000,
             heartbeat_ms: 1_000,
             exact_interval_ms: 1_000,
             approx_interval_ms: 5_000,
@@ -6320,10 +6327,10 @@ mod tests {
             config.path_sampler_config,
             ShadowPathSamplerConfigV2::standard_120s()
         );
-        assert_eq!(config.path_sampler_config.max_horizon_ms, 121_000);
+        assert_eq!(config.path_sampler_config.max_horizon_ms, 123_000);
         let mut harness = ShadowV2ValidationHarness::new(config).unwrap();
 
-        for idx in 0..=121 {
+        for idx in 0..=123 {
             let age_ms = idx as u64 * 1_000;
             let mut order = event_order_key(Some(45), Some(idx as u32));
             order.event_seq_in_process = 10 + idx as u64;
@@ -6356,13 +6363,13 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        assert_eq!(canonical_rows.len(), 123);
+        assert_eq!(canonical_rows.len(), 125);
         assert!(canonical_rows
             .iter()
             .all(|row| row["schema"] == "shadow_position_event_v2"));
         assert!(canonical_rows
             .iter()
-            .take(122)
+            .take(124)
             .all(|row| row["event_kind"] == "PATH_SAMPLE"));
 
         let density =
@@ -6374,7 +6381,7 @@ mod tests {
         assert_eq!(density_rows.len(), 5);
 
         let final_high_watermark = "event-terminal-compact";
-        let final_path_sample_id = "d3b-path-sample-121";
+        let final_path_sample_id = "d3b-path-sample-123";
         let final_rows: Vec<&Value> = density_rows.iter().collect();
 
         let by_horizon = final_rows
@@ -6387,11 +6394,11 @@ mod tests {
             assert_eq!(row["schema"], "shadow_path_density_v2");
             assert_eq!(row["source_canonical_high_watermark"], final_high_watermark);
             assert_eq!(row["verdict"], "EVALUABLE_EXACT");
-            assert_eq!(row["path_points"], 122);
-            assert_eq!(row["replay_horizon_ms"], 121_000);
+            assert_eq!(row["path_points"], 124);
+            assert_eq!(row["replay_horizon_ms"], 123_000);
             assert_eq!(row["max_interval_ms"], 1_000);
             let source_ids = row["source_path_sample_event_ids"].as_array().unwrap();
-            assert_eq!(source_ids.len(), 122);
+            assert_eq!(source_ids.len(), 124);
             assert_eq!(source_ids.first().unwrap(), "d3b-path-sample-000");
             assert_eq!(source_ids.last().unwrap(), final_path_sample_id);
         }
@@ -6731,8 +6738,8 @@ mod tests {
             .has_complete_solana_transaction_source_proof());
         assert!(!sample.event_order_key.has_complete_chain_order());
         let blockers = sample.research_blockers();
-        assert!(blockers.contains(&"EVENT_ORDER_SIGNATURE_UNKNOWN".to_string()));
-        assert!(blockers.contains(&"EVENT_ORDER_TRANSACTION_INDEX_UNKNOWN".to_string()));
+        assert!(!blockers.contains(&"EVENT_ORDER_SIGNATURE_UNKNOWN".to_string()));
+        assert!(!blockers.contains(&"EVENT_ORDER_TRANSACTION_INDEX_UNKNOWN".to_string()));
     }
 
     #[test]
@@ -6780,7 +6787,7 @@ mod tests {
     fn shadow_v2_pool_state_explicit_unknown_chain_order_is_labeled_not_silent() {
         let mut order_key = explicit_unknown_event_order_key();
         order_key.event_seq_in_process = 1;
-        let sample = PoolStateSampleV2::from_account_state_core(
+        let mut sample = PoolStateSampleV2::from_account_state_core(
             test_envelope("pool_state_sample_v2", "pos-a", "pool-event-unknown-order"),
             order_key,
             &canonical_pool_state(),
@@ -6790,6 +6797,7 @@ mod tests {
             ClockDomain::StreamObservedMs,
             6,
         );
+        sample.source = PoolStateSource::YellowstoneEvent;
 
         let blockers = sample.research_blockers();
         for expected in [
@@ -7185,12 +7193,13 @@ mod tests {
             "POOL_STATE_SLOT_MISSING",
         );
 
-        let mut empty_signature = account_state_pool_sample("pool-event-empty-signature", 1);
-        empty_signature.event_order_key.signature = EventOrderComponent::known(String::new());
+        let mut missing_account_hash =
+            account_state_pool_sample("pool-event-missing-account-hash", 1);
+        missing_account_hash.account_data_hash = None;
         assert_entry_fill_diagnostic_for_pool_research_blocker(
-            empty_signature,
-            "entry-fill-empty-signature",
-            "EVENT_ORDER_SIGNATURE_MISSING",
+            missing_account_hash,
+            "entry-fill-missing-account-hash",
+            "POOL_STATE_ACCOUNT_DATA_HASH_UNAVAILABLE_IN_RUNTIME",
         );
 
         let mut missing_pool_observed_time =
@@ -7368,7 +7377,7 @@ mod tests {
     }
 
     #[test]
-    fn shadow_v2_entry_fill_blocks_same_slot_incomplete_order() {
+    fn shadow_v2_entry_fill_account_state_boundary_proof_handles_same_slot_tx_unknown() {
         let mut pool_state = account_state_pool_sample("pool-event-same-slot-ambiguous", 1);
         pool_state.event_order_key.transaction_index_or_unknown = EventOrderComponent::unknown();
         let mut fill_order = event_order_key(Some(42), Some(2));
@@ -7391,16 +7400,33 @@ mod tests {
             &config,
         );
 
-        assert_eq!(fill.fill_status, FillStatus::BlockedByData);
-        assert!(fill
+        assert_eq!(fill.fill_status, FillStatus::Filled);
+        assert_eq!(
+            fill.envelope.measurement_grade,
+            MeasurementGrade::ResearchGradeCandidate
+        );
+        assert_eq!(fill.execution_simulation_ready, Some(true));
+        assert_eq!(fill.research_provenance_ready, Some(true));
+        assert_eq!(
+            fill.execution_label_grade,
+            Some(ShadowV2ExecutionLabelGrade::ResearchCandidate)
+        );
+        assert!(!pool_state.event_order_key.has_complete_chain_order());
+        assert!(!fill
             .limitations
             .contains(&"ENTRY_FILL_POOL_STATE_SAME_SLOT_ORDER_AMBIGUOUS".to_string()));
-        assert!(fill.fill_price.is_none());
-        assert!(fill.pool_state_after.is_none());
+        assert!(!fill
+            .provenance_blockers
+            .contains(&"ENTRY_FILL_POOL_STATE_SAME_SLOT_ORDER_AMBIGUOUS".to_string()));
+        assert!(!fill
+            .blocked_reasons
+            .contains(&"ENTRY_FILL_POOL_STATE_SAME_SLOT_ORDER_AMBIGUOUS".to_string()));
+        assert!(fill.fill_price.is_some());
+        assert!(fill.pool_state_after.is_some());
     }
 
     #[test]
-    fn shadow_v2_execution_same_slot_ambiguity_blocks() {
+    fn shadow_v2_execution_account_state_boundary_proof_suppresses_same_slot_tx_ambiguity() {
         let mut pool_state = account_state_pool_sample("pool-event-execution-same-slot", 1);
         pool_state.event_order_key.transaction_index_or_unknown = EventOrderComponent::unknown();
         let mut fill_order = event_order_key(Some(42), Some(2));
@@ -7419,12 +7445,57 @@ mod tests {
             model_version: SHADOW_V2_ENTRY_FILL_MODEL_VERSION.to_string(),
         });
 
-        assert_eq!(outcome.fill_status, FillStatus::BlockedByData);
-        assert_eq!(outcome.execution_simulation_ready, false);
-        assert!(outcome
+        assert_eq!(outcome.fill_status, FillStatus::Filled);
+        assert_eq!(outcome.execution_simulation_ready, true);
+        assert_eq!(outcome.research_provenance_ready, true);
+        assert_eq!(
+            outcome.execution_label_grade,
+            ShadowV2ExecutionLabelGrade::ResearchCandidate
+        );
+        assert!(!outcome
             .blocked_reasons
             .contains(&"ENTRY_FILL_POOL_STATE_SAME_SLOT_ORDER_AMBIGUOUS".to_string()));
-        assert!(outcome.fill_price.is_none());
+        assert!(!outcome
+            .provenance_blockers
+            .contains(&"ENTRY_FILL_POOL_STATE_SAME_SLOT_ORDER_AMBIGUOUS".to_string()));
+        assert!(outcome.fill_price.is_some());
+    }
+
+    #[test]
+    fn shadow_v2_execution_tx_source_same_slot_ambiguity_stays_diagnostic() {
+        let mut pool_state = account_state_pool_sample("pool-event-tx-source-same-slot", 1);
+        pool_state.source = PoolStateSource::YellowstoneEvent;
+        pool_state.event_order_key.transaction_index_or_unknown = EventOrderComponent::unknown();
+        let mut fill_order = event_order_key(Some(42), Some(2));
+        fill_order.event_seq_in_process = 2;
+
+        let outcome = ShadowV2FillEngine::simulate(ShadowV2ExecutionInput {
+            side: ShadowV2ExecutionSide::Buy,
+            pool_phase: ShadowV2PoolPhase::BondingCurve,
+            pool_state_before: Some(&pool_state),
+            boundary_kind: ShadowV2BoundaryKind::EntryBefore,
+            event_order_key: fill_order,
+            input_amount_raw: Some(1_000_000_000),
+            min_out_raw: None,
+            fee_bps: Some(100),
+            slippage_tolerance_bps: Some(250),
+            model_version: SHADOW_V2_ENTRY_FILL_MODEL_VERSION.to_string(),
+        });
+
+        assert_eq!(outcome.fill_status, FillStatus::Filled);
+        assert_eq!(outcome.execution_simulation_ready, true);
+        assert_eq!(outcome.research_provenance_ready, false);
+        assert_eq!(
+            outcome.execution_label_grade,
+            ShadowV2ExecutionLabelGrade::DiagnosticSim
+        );
+        assert!(outcome
+            .provenance_blockers
+            .contains(&"ENTRY_FILL_POOL_STATE_SAME_SLOT_ORDER_AMBIGUOUS".to_string()));
+        assert!(outcome
+            .provenance_blockers
+            .contains(&"EVENT_ORDER_TRANSACTION_INDEX_UNKNOWN".to_string()));
+        assert!(outcome.fill_price.is_some());
     }
 
     #[test]
@@ -7673,6 +7744,7 @@ mod tests {
 
         let mut ambiguous_pool_state =
             post_entry_pool_sample("pool-event-exit-ambiguous", 2, 45, 1);
+        ambiguous_pool_state.source = PoolStateSource::YellowstoneEvent;
         ambiguous_pool_state
             .event_order_key
             .transaction_index_or_unknown = EventOrderComponent::unknown();
@@ -7683,12 +7755,26 @@ mod tests {
             &config,
         );
 
-        assert_eq!(ambiguous_fill.fill_status, FillStatus::BlockedByData);
+        assert_eq!(ambiguous_fill.fill_status, FillStatus::Filled);
+        assert_eq!(
+            ambiguous_fill.envelope.measurement_grade,
+            MeasurementGrade::DiagnosticOnly
+        );
+        assert_eq!(
+            ambiguous_fill.execution_label_grade,
+            Some(ShadowV2ExecutionLabelGrade::DiagnosticSim)
+        );
         assert!(ambiguous_fill
             .limitations
             .contains(&"EXIT_FILL_POOL_STATE_SAME_SLOT_ORDER_AMBIGUOUS".to_string()));
-        assert!(ambiguous_fill.fill_price.is_none());
-        assert!(ambiguous_fill.pool_state_after.is_none());
+        assert!(ambiguous_fill
+            .provenance_blockers
+            .contains(&"EXIT_FILL_POOL_STATE_SAME_SLOT_ORDER_AMBIGUOUS".to_string()));
+        assert!(!ambiguous_fill
+            .blocked_reasons
+            .contains(&"EXIT_FILL_POOL_STATE_SAME_SLOT_ORDER_AMBIGUOUS".to_string()));
+        assert!(ambiguous_fill.fill_price.is_some());
+        assert!(ambiguous_fill.pool_state_after.is_some());
     }
 
     #[test]
@@ -8411,7 +8497,7 @@ mod tests {
     fn shadow_v2_standard_120s_sampler_retains_l2_baseline_margin_sample() {
         let config = ShadowPathSamplerConfigV2::standard_120s();
         let mut samples = Vec::new();
-        for idx in 0..=121 {
+        for idx in 0..=123 {
             let mut order = event_order_key(Some(45), Some(idx as u32));
             order.event_seq_in_process = 10 + idx as u64;
             samples.push(path_sample_with_pnl(
@@ -8427,13 +8513,13 @@ mod tests {
         let selected = select_path_samples_v2(&samples, &config);
         let evaluations = evaluate_path_density_v2(&selected, &config, &[120_000, 300_000]);
 
-        assert_eq!(config.max_horizon_ms, 121_000);
-        assert_eq!(selected.last().map(|sample| sample.age_ms), Some(121_000));
+        assert_eq!(config.max_horizon_ms, 123_000);
+        assert_eq!(selected.last().map(|sample| sample.age_ms), Some(123_000));
         assert_eq!(
             evaluations[0].verdict,
             ShadowPathHorizonVerdictV2::EvaluableExact
         );
-        assert_eq!(evaluations[0].replay_horizon_ms, Some(121_000));
+        assert_eq!(evaluations[0].replay_horizon_ms, Some(123_000));
         assert_eq!(
             evaluations[1].verdict,
             ShadowPathHorizonVerdictV2::NotEvaluableHorizonExceedsReplay
@@ -8487,7 +8573,7 @@ mod tests {
         let long = ShadowPathSamplerConfigV2::long_500s();
 
         assert_eq!(dense.max_horizon_ms, 3_000);
-        assert_eq!(standard.max_horizon_ms, 121_000);
+        assert_eq!(standard.max_horizon_ms, 123_000);
         assert_eq!(long.max_horizon_ms, 500_000);
         assert!(dense.keep_every_event_sample);
         assert!(!standard.keep_every_event_sample);

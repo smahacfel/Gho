@@ -62,9 +62,9 @@ fn main() -> Result<()> {
     if config.path_sampler_config != ShadowPathSamplerConfigV2::standard_120s() {
         bail!("validation harness is not using standard_120s sampler");
     }
-    if config.path_sampler_config.max_horizon_ms != 121_000 {
+    if config.path_sampler_config.max_horizon_ms != 123_000 {
         bail!(
-            "standard_120s max_horizon_ms is {}, expected 121000",
+            "standard_120s max_horizon_ms is {}, expected 123000",
             config.path_sampler_config.max_horizon_ms
         );
     }
@@ -113,7 +113,7 @@ fn main() -> Result<()> {
         "density_schema": "shadow_path_density_v2",
         "declared_supported_horizons_ms": [2000, 3000, 10000, 30000, 120000],
         "unsupported_horizons_ms": [300000, 500000],
-        "retention_contract_ms": 121000,
+        "retention_contract_ms": 123000,
         "required_replay_coverage_ms": 121000,
         "runtime_harness_density_emission_proof": true,
         "live_runtime_density_emission_proof": false,
