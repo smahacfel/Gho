@@ -421,8 +421,16 @@ fn run_shadow_v2_validation_preflight_if_enabled(config: &ShadowV2BurninConfig) 
             "path_density_v2_path",
             config.path_density_v2_path.as_deref(),
         ),
+        (
+            "source_ref_manifest_v2_path",
+            config.source_ref_manifest_v2_path.as_deref(),
+        ),
     ] {
-        let path = shadow_v2_required_config_path(raw_path, field_name)?;
+        let path = match (field_name, raw_path) {
+            ("source_ref_manifest_v2_path", None) => continue,
+            ("source_ref_manifest_v2_path", Some(raw)) if raw.trim().is_empty() => continue,
+            _ => shadow_v2_required_config_path(raw_path, field_name)?,
+        };
         ensure_parent_directory_writable(Path::new(path), field_name)
             .with_context(|| format!("SHADOW_V2_VALIDATION_PREFLIGHT_FAILED: {field_name}"))?;
     }
@@ -2846,22 +2854,37 @@ fn init_logging(
     config: &LauncherConfig,
 ) -> Result<Vec<tracing_appender::non_blocking::WorkerGuard>> {
     let log_level = config.logging.level.as_str();
+    let log_profile = std::env::var("SHADOW_V2_LOG_PROFILE").ok();
+    let compact_log_profile = matches!(
+        log_profile.as_deref().map(str::trim),
+        Some("l2_research_compact")
+    );
+    let effective_base_filter =
+        shadow_v2_logging_filter_for_profile(log_profile.as_deref(), log_level);
 
     // Base environment filter for all logs
-    let base_filter = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new(log_level))
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let base_filter = if compact_log_profile {
+        EnvFilter::try_new(effective_base_filter.as_str())
+            .unwrap_or_else(|_| EnvFilter::new("warn"))
+    } else {
+        EnvFilter::try_from_default_env()
+            .or_else(|_| EnvFilter::try_new(effective_base_filter.as_str()))
+            .unwrap_or_else(|_| EnvFilter::new("info"))
+    };
 
     // Create filters for different targets
     // Oracle filter: only ghost_brain::oracle and ghost_launcher::oracle_runtime targets
-    let oracle_filter = EnvFilter::try_from_default_env()
-        .or_else(|_| {
+    let oracle_filter = if compact_log_profile {
+        EnvFilter::try_new("ghost_brain=warn,ghost_launcher::oracle_runtime=warn")
+    } else {
+        EnvFilter::try_from_default_env().or_else(|_| {
             EnvFilter::try_new(format!(
                 "ghost_brain={},ghost_launcher::oracle_runtime={}",
                 log_level, log_level
             ))
         })
-        .unwrap_or_else(|_| EnvFilter::new("ghost_brain=info,ghost_launcher::oracle_runtime=info"));
+    }
+    .unwrap_or_else(|_| EnvFilter::new("ghost_brain=info,ghost_launcher::oracle_runtime=info"));
 
     // System filter: Use a FilterFn to exclude Oracle targets
     // This is a proper exclusion filter that checks the target name
@@ -2976,6 +2999,21 @@ fn init_logging(
     tracing_subscriber::registry().with(layers).init();
 
     Ok(guards)
+}
+
+fn shadow_v2_logging_filter_for_profile(profile: Option<&str>, default_log_level: &str) -> String {
+    match profile.map(str::trim) {
+        Some("l2_research_compact") => [
+            "warn",
+            "ghost_launcher::components::seer=warn",
+            "ghost_launcher::components::post_buy_runtime=warn",
+            "ghost_launcher::components::trigger=warn",
+            "ghost_launcher::oracle_runtime=warn",
+            "ghost_brain=warn",
+        ]
+        .join(","),
+        _ => default_log_level.to_string(),
+    }
 }
 
 /// Print startup banner
@@ -3156,6 +3194,18 @@ path_density_v2_path = "reports/selector/shadow-v2-fidelity-validation/shadow_pa
             shadow_v2.run_namespace.as_deref(),
             Some("shadow-burnin-v2-fidelity-validation-logging-only")
         );
+    }
+
+    #[test]
+    fn test_shadow_v2_l2_research_compact_log_profile_suppresses_verbose_targets() {
+        let filter = shadow_v2_logging_filter_for_profile(Some("l2_research_compact"), "info");
+        assert!(filter.contains("ghost_launcher::components::seer=warn"));
+        assert!(filter.contains("ghost_launcher::components::post_buy_runtime=warn"));
+        assert!(filter.contains("ghost_launcher::components::trigger=warn"));
+        assert!(filter.contains("ghost_brain=warn"));
+
+        let default_filter = shadow_v2_logging_filter_for_profile(None, "debug");
+        assert_eq!(default_filter, "debug");
     }
 
     #[test]

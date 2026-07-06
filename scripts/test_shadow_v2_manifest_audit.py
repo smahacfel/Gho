@@ -46,6 +46,10 @@ def write_fixture_scope(root: Path) -> None:
         '{"schema":"shadow_lifecycle_v2","position_id":"pos-1"}\n',
         encoding="utf-8",
     )
+    (root / "shadow_source_ref_manifest_v2.jsonl").write_text(
+        '{"schema":"shadow_source_ref_manifest_v2","position_id":"pos-1"}\n',
+        encoding="utf-8",
+    )
     (root / "shadow_path_density_v2.jsonl").write_text(
         '{"schema":"shadow_path_density_v2","position_id":"pos-1"}\n',
         encoding="utf-8",
@@ -72,7 +76,7 @@ def test_complete_manifest_passes() -> None:
 
         assert blockers == []
         assert manifest["status"] == "PASS"
-        assert manifest["artifact_count"] == 7
+        assert manifest["artifact_count"] == 8
         assert manifest["required_artifacts_missing"] == []
         assert manifest["raw_jsonl_git_staging_allowed"] is False
         assert manifest["schema_coverage"]["shadow_position_event_v2"] == 2

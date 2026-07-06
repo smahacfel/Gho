@@ -208,6 +208,12 @@ pub enum ShadowV2BurninMode {
 }
 
 pub const DEFAULT_SHADOW_V2_POST_RUN_MANIFEST_DRAIN_TIMEOUT_MS: u64 = 180_000;
+pub const DEFAULT_SHADOW_V2_L2_MAX_TOTAL_ARTIFACT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+pub const DEFAULT_SHADOW_V2_L2_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub const DEFAULT_SHADOW_V2_L2_MAX_ROWS_PER_FILE: u64 = 2_000_000;
+pub const DEFAULT_SHADOW_V2_L2_MAX_DENSITY_ROWS: u64 = 250_000;
+pub const DEFAULT_SHADOW_V2_L2_MAX_STDOUT_BYTES: u64 = 256 * 1024 * 1024;
+pub const DEFAULT_SHADOW_V2_L2_MAX_SYSTEM_LOG_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -244,6 +250,32 @@ pub struct ShadowV2BurninConfig {
     pub lifecycle_v2_path: Option<String>,
     /// Future path-density V2 path. Must remain derived from canonical path samples.
     pub path_density_v2_path: Option<String>,
+    /// Compact source reference manifest for replay/lifecycle provenance ranges.
+    pub source_ref_manifest_v2_path: Option<String>,
+    /// L2 compact density output writes final/latest declared-horizon rows by default.
+    pub compact_density_enabled: bool,
+    /// Full density stream is opt-in only for diagnostics.
+    pub density_full_stream_enabled: bool,
+    /// Replay/lifecycle rows carry compact manifest refs instead of repeated full ID arrays.
+    pub replay_lifecycle_compact_refs_enabled: bool,
+    /// Fail-closed artifact budget guard for L2 research runs.
+    pub artifact_budget_enabled: bool,
+    /// Rotate large Shadow V2 artifact JSONL files before budget failure.
+    pub artifact_rotation_enabled: bool,
+    /// Maximum total bytes across Shadow V2 L2 artifacts before fail-closed blocking.
+    pub max_total_artifact_bytes: u64,
+    /// Maximum bytes per Shadow V2 L2 artifact file before fail-closed blocking.
+    pub max_file_bytes: u64,
+    /// Maximum rows per Shadow V2 L2 artifact file before fail-closed blocking.
+    pub max_rows_per_file: u64,
+    /// Maximum density rows in default L2 compact profile.
+    pub max_density_rows: u64,
+    /// Maximum stdout bytes expected for L2 compact research profile.
+    pub max_stdout_bytes: u64,
+    /// Maximum system log bytes expected for L2 compact research profile.
+    pub max_system_log_bytes: u64,
+    /// L2 research logging profile label. Runtime decisions do not consume it.
+    pub log_profile: String,
     /// Raw evidence manifests are mandatory before research-grade use.
     pub evidence_manifest_required: bool,
     /// Artifact sha256 coverage requirement.
@@ -305,6 +337,19 @@ impl Default for ShadowV2BurninConfig {
             replay_v2_path: None,
             lifecycle_v2_path: None,
             path_density_v2_path: None,
+            source_ref_manifest_v2_path: None,
+            compact_density_enabled: true,
+            density_full_stream_enabled: false,
+            replay_lifecycle_compact_refs_enabled: true,
+            artifact_budget_enabled: true,
+            artifact_rotation_enabled: true,
+            max_total_artifact_bytes: DEFAULT_SHADOW_V2_L2_MAX_TOTAL_ARTIFACT_BYTES,
+            max_file_bytes: DEFAULT_SHADOW_V2_L2_MAX_FILE_BYTES,
+            max_rows_per_file: DEFAULT_SHADOW_V2_L2_MAX_ROWS_PER_FILE,
+            max_density_rows: DEFAULT_SHADOW_V2_L2_MAX_DENSITY_ROWS,
+            max_stdout_bytes: DEFAULT_SHADOW_V2_L2_MAX_STDOUT_BYTES,
+            max_system_log_bytes: DEFAULT_SHADOW_V2_L2_MAX_SYSTEM_LOG_BYTES,
+            log_profile: "l2_research_compact".to_string(),
             evidence_manifest_required: true,
             sha256_required: true,
             row_counts_required: true,
@@ -358,6 +403,30 @@ impl ShadowV2BurninConfig {
         }
         if self.raw_evidence_retention_policy.trim().is_empty() {
             anyhow::bail!("Shadow V2 raw_evidence_retention_policy must be non-empty");
+        }
+        if self.artifact_budget_enabled {
+            if self.max_total_artifact_bytes == 0
+                || self.max_file_bytes == 0
+                || self.max_rows_per_file == 0
+                || self.max_density_rows == 0
+                || self.max_stdout_bytes == 0
+                || self.max_system_log_bytes == 0
+            {
+                anyhow::bail!("Shadow V2 artifact budget limits must be positive when enabled");
+            }
+            if !self.artifact_rotation_enabled {
+                anyhow::bail!(
+                    "Shadow V2 L2 artifact_rotation_enabled must remain true for profile runs"
+                );
+            }
+        }
+        if self.density_full_stream_enabled && self.compact_density_enabled {
+            anyhow::bail!(
+                "Shadow V2 density_full_stream_enabled cannot be combined with compact_density_enabled"
+            );
+        }
+        if self.log_profile.trim().is_empty() {
+            anyhow::bail!("Shadow V2 log_profile must be non-empty");
         }
         if self.enabled {
             if self.mode != ShadowV2BurninMode::LoggingOnlyValidation {
