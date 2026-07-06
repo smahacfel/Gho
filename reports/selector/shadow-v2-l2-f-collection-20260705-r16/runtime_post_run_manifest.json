@@ -25,6 +25,55 @@
   "output_root": "reports/selector/shadow-v2-l2-f-collection-20260705-r16",
   "positive_claims_from_undeclared_horizons_allowed": false,
   "provider_stream_changes": false,
+  "raw_artifact_audit_consumption": [
+    {
+      "consumed_by": [
+        "sample_gate_canonical_roundtrip_counter",
+        "shadow_v2_temporal_no_lookahead_audit.py",
+        "shadow_v2_replay_lifecycle_terminal_reconciliation_audit.py",
+        "account_data_hash_coverage",
+        "shadow_v2_manifest_audit.py"
+      ],
+      "path": "reports/selector/shadow-v2-l2-f-collection-20260705-r16/shadow_position_event_v2.jsonl",
+      "tracked_in_git": false
+    },
+    {
+      "consumed_by": [
+        "shadow_v2_temporal_no_lookahead_audit.py",
+        "shadow_v2_replay_lifecycle_terminal_reconciliation_audit.py",
+        "shadow_v2_manifest_audit.py"
+      ],
+      "path": "reports/selector/shadow-v2-l2-f-collection-20260705-r16/shadow_replay_v2.jsonl",
+      "tracked_in_git": false
+    },
+    {
+      "consumed_by": [
+        "shadow_v2_temporal_no_lookahead_audit.py",
+        "shadow_v2_replay_lifecycle_terminal_reconciliation_audit.py",
+        "shadow_v2_manifest_audit.py"
+      ],
+      "path": "reports/selector/shadow-v2-l2-f-collection-20260705-r16/shadow_lifecycle_v2.jsonl",
+      "tracked_in_git": false
+    },
+    {
+      "consumed_by": [
+        "shadow_v2_path_density_horizon_audit.py raw scope",
+        "shadow_v2_path_density_horizon_audit.py evidence-complete position scope",
+        "position_level_density_retention_gate",
+        "shadow_v2_manifest_audit.py"
+      ],
+      "path": "reports/selector/shadow-v2-l2-f-collection-20260705-r16/shadow_path_density_v2.jsonl",
+      "tracked_in_git": false
+    },
+    {
+      "consumed_by": [
+        "candidate_universe_v1 derivation when no explicit candidate universe is supplied",
+        "shadow_v2_manifest_audit.py"
+      ],
+      "path": "reports/selector/shadow-v2-l2-f-collection-20260705-r16/launcher.stdout.log",
+      "tracked_in_git": false
+    }
+  ],
   "required_scope_files": {
     "shadow_lifecycle_v2.jsonl": true,
     "shadow_path_density_v2.jsonl": true,

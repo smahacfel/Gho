@@ -1,5 +1,5 @@
 {
-  "artifact_count": 18,
+  "artifact_count": 20,
   "artifacts": [
     {
       "is_symlink": false,
@@ -70,6 +70,34 @@
     },
     {
       "is_symlink": false,
+      "jsonl_rows": 19,
+      "line_count": 19,
+      "malformed_jsonl_rows": 0,
+      "relative_path": "l2_f_density_excluded_positions_v1.jsonl",
+      "schema": "shadow_v2_artifact_manifest_entry_v1",
+      "schema_counts": {
+        "shadow_v2_l2_f_density_excluded_position_v1": 19
+      },
+      "sha256": "5a20985743edc1eaf0e42d2e8cd30e1d5acc4c5383e7f13fadd19148a6787958",
+      "sha256_status": "OK",
+      "size_bytes": 14353,
+      "status": "OK"
+    },
+    {
+      "is_symlink": false,
+      "jsonl_rows": 0,
+      "line_count": 161,
+      "malformed_jsonl_rows": 0,
+      "relative_path": "l2_f_evidence_complete_density_audit_summary.csv",
+      "schema": "shadow_v2_artifact_manifest_entry_v1",
+      "schema_counts": {},
+      "sha256": "80a9e57e95f86aaeb60de85de257dba3c4bf78d89991d57b1862c87e7f387747",
+      "sha256_status": "OK",
+      "size_bytes": 12089,
+      "status": "OK"
+    },
+    {
+      "is_symlink": false,
       "jsonl_rows": 750,
       "line_count": 750,
       "malformed_jsonl_rows": 0,
@@ -112,14 +140,14 @@
     {
       "is_symlink": false,
       "jsonl_rows": 0,
-      "line_count": 231,
+      "line_count": 302,
       "malformed_jsonl_rows": 0,
       "relative_path": "post_run_manifest.json",
       "schema": "shadow_v2_artifact_manifest_entry_v1",
       "schema_counts": {},
-      "sha256": "85fb5d53aa20e6b55bdf99afab314d9e213c11f7f3a84129bbd69a39f5b5ca86",
+      "sha256": "6ce0362a8743c129a1e1a9733027ef9cbca1e37b0c66bd6da58a2e2cc66683a3",
       "sha256_status": "OK",
-      "size_bytes": 7447,
+      "size_bytes": 9852,
       "status": "OK"
     },
     {
@@ -151,14 +179,14 @@
     {
       "is_symlink": false,
       "jsonl_rows": 0,
-      "line_count": 50,
+      "line_count": 97,
       "malformed_jsonl_rows": 0,
       "relative_path": "runtime_post_run_manifest.json",
       "schema": "shadow_v2_artifact_manifest_entry_v1",
       "schema_counts": {},
-      "sha256": "6fed0be0d893bd668063d7c735883039fa501a9a9b478ad865bd4ae3a9bf134b",
+      "sha256": "b7f20b9c14bc8d22bf79b2b181c3b463dfe31972c738a947842073d2930986ca",
       "sha256_status": "OK",
-      "size_bytes": 1605,
+      "size_bytes": 3371,
       "status": "OK"
     },
     {
@@ -224,32 +252,32 @@
     {
       "is_symlink": false,
       "jsonl_rows": 0,
-      "line_count": 16,
+      "line_count": 21,
       "malformed_jsonl_rows": 0,
       "relative_path": "shadow_v2_manifest_report.csv",
       "schema": "shadow_v2_artifact_manifest_entry_v1",
       "schema_counts": {},
-      "sha256": "45893a8e13ad97c0788ad753c8077c95e21f7b1a4219ca11dd2d145a5ed376e7",
+      "sha256": "20f253a0adfb895e4b568a665a0fcc52fedbeb4530783944eb31b1080c133ac8",
       "sha256_status": "OK",
-      "size_bytes": 2203,
+      "size_bytes": 2986,
       "status": "OK"
     },
     {
       "is_symlink": false,
       "jsonl_rows": 0,
-      "line_count": 107,
+      "line_count": 209,
       "malformed_jsonl_rows": 0,
       "relative_path": "strict_audit_summary.json",
       "schema": "shadow_v2_artifact_manifest_entry_v1",
       "schema_counts": {},
-      "sha256": "67449c765c7218546e6cc76c79f6f3116a8b10ff59d5ad3e75646928eea02e89",
+      "sha256": "9fa541a5d6df54b1789d418b39353f0f61bafefc2562640822d4ee46a2e0f21f",
       "sha256_status": "OK",
-      "size_bytes": 4121,
+      "size_bytes": 8437,
       "status": "OK"
     }
   ],
   "blockers": [],
-  "created_at": "2026-07-06T10:29:13+00:00",
+  "created_at": "2026-07-06T11:44:56+00:00",
   "manifest_audit_version": "shadow_v2_manifest_audit_v1",
   "manifest_phase": "post_run",
   "raw_jsonl_git_staging_allowed": false,
@@ -263,11 +291,12 @@
     "shadow_path_density_v2": 1186315,
     "shadow_position_event_v2": 169474,
     "shadow_replay_v2": 169474,
+    "shadow_v2_l2_f_density_excluded_position_v1": 19,
     "shadow_v2_l2_f_evidence_complete_position_scope_v1": 750
   },
   "schema_version": 1,
   "scope_root": "reports/selector/shadow-v2-l2-f-collection-20260705-r16",
   "simulation_contract_version": "shadow_burnin_simulation_v2_20260629",
   "status": "PASS",
-  "total_size_bytes": 26174868710
+  "total_size_bytes": 26174904422
 }

@@ -52,6 +52,8 @@ strict_audit_summary.json
 post_run_manifest.json
 shadow_v2_manifest_report.csv
 l2_f_evidence_complete_position_scope_v1.jsonl
+l2_f_density_excluded_positions_v1.jsonl
+l2_f_evidence_complete_density_audit_summary.csv
 ```
 
 Row counts z `post_run_manifest.json`:
@@ -100,16 +102,28 @@ poziomie wszystkich wymaganych dowodow:
 
 ```text
 position_level_density_retention_verdict=PASS_L2_F_POSITION_LEVEL_DENSITY_RETENTION
+density_retention_verdict_raw_scope=BLOCKED_PATH_SAMPLE_COVERAGE_INSUFFICIENT
+density_retention_verdict_evidence_complete_scope=L2_F_DENSITY_RETENTION_PASS
 l2_research_evidence_complete_roundtrip_positions=750
 required_roundtrips=500
 density_excluded_roundtrip_positions=19
 non_evaluable_positions_excluded_from_positive_claim=true
 evidence_complete_position_scope=reports/selector/shadow-v2-l2-f-collection-20260705-r16/l2_f_evidence_complete_position_scope_v1.jsonl
+density_excluded_positions=reports/selector/shadow-v2-l2-f-collection-20260705-r16/l2_f_density_excluded_positions_v1.jsonl
+evidence_complete_density_audit=reports/selector/shadow-v2-l2-f-collection-20260705-r16/l2_f_evidence_complete_density_audit_summary.csv
 ```
 
 Interpretacja: w R16 jest 769 kompletnych research-candidate roundtripow, ale
 19 z nich ma typed density/retention exclusions. One nie wspieraja pozytywnego
 claimu. Finalne L2-F opiera sie wylacznie na 750 pozycjach z pelnym evidence.
+Excluded positions sa jawnie wypisane w `l2_f_density_excluded_positions_v1.jsonl`;
+kazdy rekord ma typed reason (`SPARSE_APPROX_ONLY` albo `RETENTION_GAP`),
+`positive_claim_supported=false` oraz flagi:
+
+```text
+selection_inputs_exclude_pnl=true
+selection_inputs_exclude_terminal_outcome_quality=true
+```
 
 ## Gates That Passed
 
@@ -119,6 +133,7 @@ claimu. Finalne L2-F opiera sie wylacznie na 750 pozycjach z pelnym evidence.
 temporal_audit_verdict=PASS_TEMPORAL_NO_LOOKAHEAD_AUDIT
 fake_handoff_signature_count=0
 event_seq_chain_order_substitute_count=0
+terminal_truth_derived_count=801
 terminal_truth_not_derived_count=0
 ```
 
@@ -191,7 +206,7 @@ positive_claims_from_undeclared_horizons_allowed=false
 Broad density audit on the full raw density surface still reports:
 
 ```text
-density_retention_verdict=BLOCKED_PATH_SAMPLE_COVERAGE_INSUFFICIENT
+density_retention_verdict_raw_scope=BLOCKED_PATH_SAMPLE_COVERAGE_INSUFFICIENT
 declared_horizon_present_count=5
 declared_horizon_missing_count=0
 declared_horizon_path_coverage_blocker_count=5
@@ -215,6 +230,8 @@ path_sample_coverage_gap_position_count=0
 unknown_or_untyped_density_verdict_position_count=0
 malformed_density_rows=0
 unknown_horizon_rows=0
+selection_inputs_exclude_pnl=true
+selection_inputs_exclude_terminal_outcome_quality=true
 ```
 
 Horizon blocker context for excluded positions:
@@ -231,6 +248,51 @@ Horizon blocker context for excluded positions:
 
 The 19 excluded positions are typed, counted, and excluded from positive claims.
 They are not silently promoted to PASS.
+
+Evidence-complete density audit was rerun with an explicit position scope:
+
+```text
+position_scope_jsonl=reports/selector/shadow-v2-l2-f-collection-20260705-r16/l2_f_evidence_complete_position_scope_v1.jsonl
+position_scope_position_count=750
+density_retention_verdict_evidence_complete_scope=L2_F_DENSITY_RETENTION_PASS
+declared_horizon_present_count=5
+declared_horizon_missing_count=0
+declared_horizon_path_coverage_blocker_count=0
+declared_horizon_retention_blocker_count=0
+density_rows_excluded_outside_position_scope=98382
+```
+
+This is the density PASS used by the L2-F positive verdict. The broad raw
+density failure is preserved as context and does not become a blocker because
+the positive research claim is explicitly scoped to the deterministic
+evidence-complete position set.
+
+## Raw Artifact Integrity and Consumption
+
+Large raw artifacts are intentionally not tracked in git, but
+`post_run_manifest.json` records their relative path, size, line count,
+JSONL row count, malformed row count and SHA256. The L2-F runtime manifest and
+strict summary also record which audit consumed each raw artifact.
+
+Examples from `post_run_manifest.json`:
+
+```text
+shadow_position_event_v2.jsonl rows=169474 sha256=581f3e40378715be695219737502dc99cc8c27943e3707c796064a4dee955df0
+shadow_replay_v2.jsonl rows=169474 sha256=a94e74665246360ab38f122f6bd80a4e750e7a5d81748d774888e260a97a4201
+shadow_lifecycle_v2.jsonl rows=169474 sha256=d73ad2f1e1eb253dea5b7111ff6e4674ca16fdf53c3762fdfdc6ea5ee1b08f7a
+shadow_path_density_v2.jsonl rows=1186315 sha256=135b3b4130f2726adad9b00e20551ae857b0b1747d3aece70bab1b9d8c69dce0
+launcher.stdout.log rows=121807 sha256=0b3ebc0b2e5f127139999c1f6d54f6264e4647635382a229c10bc6a9970f7326
+```
+
+Audit consumption:
+
+```text
+shadow_position_event_v2.jsonl -> sample_gate_canonical_roundtrip_counter, temporal audit, replay/lifecycle audit, account_data_hash coverage, manifest audit
+shadow_replay_v2.jsonl -> temporal audit, replay/lifecycle audit, manifest audit
+shadow_lifecycle_v2.jsonl -> temporal audit, replay/lifecycle audit, manifest audit
+shadow_path_density_v2.jsonl -> raw density audit, evidence-complete density audit, position-level density gate, manifest audit
+launcher.stdout.log -> candidate universe derivation when needed, manifest audit
+```
 
 ## Tooling Memory Hardening
 
@@ -266,8 +328,8 @@ scripts/shadow_v2_l2_f_research_validation_run.py
 Memory proof z finalnej walidacji R16:
 
 ```text
-full_l2_f_wrapper_max_rss_kb=164732
-full_l2_f_wrapper_elapsed=5:27.01
+full_l2_f_wrapper_max_rss_kb=164864
+full_l2_f_wrapper_elapsed=6:16.80
 full_l2_f_wrapper_swaps=0
 ```
 

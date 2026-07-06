@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import csv
 import json
 import subprocess
 import sys
@@ -91,12 +92,25 @@ class ShadowV2L2FResearchValidationRunTest(unittest.TestCase):
                 positions,
                 required_roundtrips=2,
             )
+            excluded_path = scope / "l2_f_density_excluded_positions_v1.jsonl"
+            l2_f.write_density_excluded_positions(excluded_path, result)
+            excluded_rows = [
+                json.loads(line)
+                for line in excluded_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
 
         self.assertEqual(result["verdict"], l2_f.POSITION_LEVEL_DENSITY_PASS_VERDICT)
         self.assertEqual(result["l2_research_evidence_complete_roundtrip_positions"], 2)
         self.assertEqual(result["density_excluded_roundtrip_positions"], 1)
         self.assertEqual(result["sparse_approx_only_position_count"], 1)
         self.assertEqual(result["retention_gap_position_count"], 0)
+        self.assertEqual(len(excluded_rows), 1)
+        self.assertEqual(excluded_rows[0]["position_id"], "pos-c")
+        self.assertEqual(excluded_rows[0]["typed_exclusion_reasons"], ["SPARSE_APPROX_ONLY"])
+        self.assertTrue(excluded_rows[0]["selection_inputs_exclude_pnl"])
+        self.assertTrue(excluded_rows[0]["selection_inputs_exclude_terminal_outcome_quality"])
+        self.assertFalse(excluded_rows[0]["positive_claim_supported"])
 
     def test_position_level_density_gate_blocks_when_complete_density_scope_is_too_small(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -628,6 +642,73 @@ class ShadowV2L2FResearchValidationRunTest(unittest.TestCase):
             "GATEKEEPER_DENOMINATOR_COVERAGE_KNOWN",
         )
         self.assertEqual(payload["gatekeeper_denominator"]["gatekeeper_decision_joined_to_candidate_count"], 1)
+
+    def test_summary_csv_exposes_required_l2_f_metric_names(self) -> None:
+        report = {
+            "final_verdict": l2_f.VERDICT_PASS,
+            "run_id": "fixture-run",
+            "expected_main": l2_f.EXPECTED_MAIN,
+            "dedicated_l2_f_scope_present": True,
+            "validation_run_executed": True,
+            "sample_gates": {
+                "complete_executable_roundtrip_positions": 500,
+                "research_candidate_roundtrip_count": 500,
+                "entry_execution_label_grade_RESEARCH_CANDIDATE_count": 500,
+                "exit_execution_label_grade_RESEARCH_CANDIDATE_count": 500,
+                "status": "PASS",
+            },
+            "temporal_audit": {
+                "verdict": "PASS_TEMPORAL_NO_LOOKAHEAD_AUDIT",
+                "fake_handoff_signature_count": 0,
+                "event_seq_chain_order_substitute_count": 0,
+                "terminal_truth_not_derived_count": 0,
+                "terminal_truth_derived_count": 500,
+            },
+            "density_audit": {"verdict": "BLOCKED_PATH_SAMPLE_COVERAGE_INSUFFICIENT"},
+            "evidence_complete_density_audit": {"verdict": "L2_F_DENSITY_RETENTION_PASS"},
+            "position_level_density_gate": {
+                "verdict": l2_f.POSITION_LEVEL_DENSITY_PASS_VERDICT,
+                "l2_research_evidence_complete_roundtrip_positions": 500,
+                "density_excluded_roundtrip_positions": 3,
+                "sparse_approx_only_position_count": 2,
+                "retention_gap_position_count": 1,
+                "missing_declared_horizon_position_count": 0,
+                "evidence_complete_position_scope_path": "scope.jsonl",
+                "density_excluded_positions_path": "excluded.jsonl",
+            },
+            "gatekeeper_denominator": {
+                "verdict": "GATEKEEPER_DENOMINATOR_COVERAGE_KNOWN",
+                "threshold_starvation_verdict": "NO_GATEKEEPER_THRESHOLD_STARVATION_OBSERVED",
+                "unknown_reason_count": 0,
+            },
+            "malformed_rows": 0,
+            "unknown_untyped_blockers": 0,
+            "manifest_audit": {"status": "PASS"},
+            "replay_lifecycle_audit": {"verdict": "PASS_REPLAY_LIFECYCLE_RECONCILED"},
+            "account_data_hash_coverage": {"verdict": "PASS_ACCOUNT_DATA_HASH_COVERAGE"},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = Path(tmp) / "summary.csv"
+            l2_f.write_summary_csv(csv_path, report)
+            with csv_path.open("r", encoding="utf-8") as fh:
+                rows = list(csv.DictReader(fh))
+
+        metrics = {row["metric"]: row["value"] for row in rows}
+        for metric in [
+            "density_retention_verdict_raw_scope",
+            "density_retention_verdict_evidence_complete_scope",
+            "unknown_untyped_blocker_count",
+            "replay_lifecycle_status",
+            "account_data_hash_coverage_status",
+            "terminal_truth_derived_count",
+            "density_excluded_positions_path",
+        ]:
+            self.assertIn(metric, metrics)
+        self.assertEqual(
+            metrics["density_retention_verdict_evidence_complete_scope"],
+            "L2_F_DENSITY_RETENTION_PASS",
+        )
+        self.assertEqual(metrics["terminal_truth_derived_count"], "500")
 
 
 if __name__ == "__main__":

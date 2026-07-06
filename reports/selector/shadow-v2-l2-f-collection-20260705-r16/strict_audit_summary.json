@@ -32,6 +32,16 @@
     "l2_f_allowed_next": false,
     "verdict": "BLOCKED_PATH_SAMPLE_COVERAGE_INSUFFICIENT"
   },
+  "evidence_complete_density_audit": {
+    "declared_horizon_missing_count": 0,
+    "declared_horizon_path_coverage_blocker_count": 0,
+    "declared_horizon_present_count": 5,
+    "declared_horizon_retention_blocker_count": 0,
+    "density_rows_excluded_outside_position_scope": 98382,
+    "position_scope_jsonl": "reports/selector/shadow-v2-l2-f-collection-20260705-r16/l2_f_evidence_complete_position_scope_v1.jsonl",
+    "position_scope_position_count": 750,
+    "verdict": "L2_F_DENSITY_RETENTION_PASS"
+  },
   "expected_main": "5e6d839984cf38ecb65a0540b0adfabfcead9f23",
   "final_verdict": "L2_RESEARCH_GRADE_CANDIDATE_OFFLINE_ONLY",
   "gatekeeper_denominator": {
@@ -69,7 +79,9 @@
       30000,
       120000
     ],
+    "density_excluded_positions_path": "reports/selector/shadow-v2-l2-f-collection-20260705-r16/l2_f_density_excluded_positions_v1.jsonl",
     "density_excluded_roundtrip_positions": 19,
+    "density_exclusion_policy": "fail_closed_declared_density_retention_gate",
     "density_rows_excluded_outside_research_roundtrip_scope": 75275,
     "density_rows_input": 1186315,
     "density_rows_research_roundtrip_scope": 1111033,
@@ -95,6 +107,8 @@
     "required_roundtrips": 500,
     "research_candidate_roundtrip_count": 769,
     "retention_gap_position_count": 2,
+    "selection_inputs_exclude_pnl": true,
+    "selection_inputs_exclude_terminal_outcome_quality": true,
     "sparse_approx_only_position_count": 17,
     "undeclared_horizon_rows_in_research_scope": 317438,
     "unknown_horizon_rows": 0,
@@ -110,6 +124,55 @@
     "summary_csv": "reports/selector/shadow_v2_l2_d3b_runtime_harness_density_emission_summary.csv"
   },
   "provider_stream_changes": false,
+  "raw_artifact_audit_consumption": [
+    {
+      "consumed_by": [
+        "sample_gate_canonical_roundtrip_counter",
+        "shadow_v2_temporal_no_lookahead_audit.py",
+        "shadow_v2_replay_lifecycle_terminal_reconciliation_audit.py",
+        "account_data_hash_coverage",
+        "shadow_v2_manifest_audit.py"
+      ],
+      "path": "reports/selector/shadow-v2-l2-f-collection-20260705-r16/shadow_position_event_v2.jsonl",
+      "tracked_in_git": false
+    },
+    {
+      "consumed_by": [
+        "shadow_v2_temporal_no_lookahead_audit.py",
+        "shadow_v2_replay_lifecycle_terminal_reconciliation_audit.py",
+        "shadow_v2_manifest_audit.py"
+      ],
+      "path": "reports/selector/shadow-v2-l2-f-collection-20260705-r16/shadow_replay_v2.jsonl",
+      "tracked_in_git": false
+    },
+    {
+      "consumed_by": [
+        "shadow_v2_temporal_no_lookahead_audit.py",
+        "shadow_v2_replay_lifecycle_terminal_reconciliation_audit.py",
+        "shadow_v2_manifest_audit.py"
+      ],
+      "path": "reports/selector/shadow-v2-l2-f-collection-20260705-r16/shadow_lifecycle_v2.jsonl",
+      "tracked_in_git": false
+    },
+    {
+      "consumed_by": [
+        "shadow_v2_path_density_horizon_audit.py raw scope",
+        "shadow_v2_path_density_horizon_audit.py evidence-complete position scope",
+        "position_level_density_retention_gate",
+        "shadow_v2_manifest_audit.py"
+      ],
+      "path": "reports/selector/shadow-v2-l2-f-collection-20260705-r16/shadow_path_density_v2.jsonl",
+      "tracked_in_git": false
+    },
+    {
+      "consumed_by": [
+        "candidate_universe_v1 derivation when no explicit candidate universe is supplied",
+        "shadow_v2_manifest_audit.py"
+      ],
+      "path": "reports/selector/shadow-v2-l2-f-collection-20260705-r16/launcher.stdout.log",
+      "tracked_in_git": false
+    }
+  ],
   "replay_lifecycle_audit": {
     "verdict": "PASS_REPLAY_LIFECYCLE_RECONCILED"
   },
@@ -131,6 +194,7 @@
   "temporal_audit": {
     "event_seq_chain_order_substitute_count": 0,
     "fake_handoff_signature_count": 0,
+    "terminal_truth_derived_count": 801,
     "terminal_truth_not_derived_count": 0,
     "verdict": "PASS_TEMPORAL_NO_LOOKAHEAD_AUDIT"
   },

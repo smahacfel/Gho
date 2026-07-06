@@ -323,7 +323,13 @@ def write_summary_csv(path: Path, report: dict[str, Any]) -> None:
         ("exit_execution_label_grade_RESEARCH_CANDIDATE_count", report["sample_gates"]["exit_execution_label_grade_RESEARCH_CANDIDATE_count"], ""),
         ("sample_size_gate", report["sample_gates"]["status"], ""),
         ("temporal_audit_verdict", report["temporal_audit"]["verdict"], ""),
-        ("density_retention_verdict", report["density_audit"]["verdict"], ""),
+        ("density_retention_verdict", report["density_audit"]["verdict"], "backward-compatible raw scope metric"),
+        ("density_retention_verdict_raw_scope", report["density_audit"]["verdict"], "full raw density stream context"),
+        (
+            "density_retention_verdict_evidence_complete_scope",
+            report["evidence_complete_density_audit"]["verdict"],
+            "density audit rerun with position-scope-jsonl over evidence-complete positions",
+        ),
         (
             "position_level_density_retention_verdict",
             report["position_level_density_gate"]["verdict"],
@@ -367,13 +373,22 @@ def write_summary_csv(path: Path, report: dict[str, Any]) -> None:
         ("threshold_starvation_verdict", report["gatekeeper_denominator"]["threshold_starvation_verdict"], ""),
         ("unknown_reason_count", report["gatekeeper_denominator"]["unknown_reason_count"], ""),
         ("malformed_rows", report["malformed_rows"], ""),
-        ("unknown_untyped_blockers", report["unknown_untyped_blockers"], ""),
+        ("unknown_untyped_blockers", report["unknown_untyped_blockers"], "backward-compatible metric"),
+        ("unknown_untyped_blocker_count", report["unknown_untyped_blockers"], ""),
         ("manifest_status", report["manifest_audit"]["status"], ""),
-        ("replay_lifecycle_verdict", report["replay_lifecycle_audit"]["verdict"], ""),
-        ("account_data_hash_coverage_verdict", report["account_data_hash_coverage"]["verdict"], ""),
+        ("replay_lifecycle_verdict", report["replay_lifecycle_audit"]["verdict"], "backward-compatible metric"),
+        ("replay_lifecycle_status", report["replay_lifecycle_audit"]["verdict"], ""),
+        ("account_data_hash_coverage_verdict", report["account_data_hash_coverage"]["verdict"], "backward-compatible metric"),
+        ("account_data_hash_coverage_status", report["account_data_hash_coverage"]["verdict"], ""),
         ("fake_handoff_signature_count", report["temporal_audit"].get("fake_handoff_signature_count"), ""),
         ("event_seq_chain_order_substitute_count", report["temporal_audit"].get("event_seq_chain_order_substitute_count"), ""),
         ("terminal_truth_not_derived_count", report["temporal_audit"].get("terminal_truth_not_derived_count"), ""),
+        ("terminal_truth_derived_count", report["temporal_audit"].get("terminal_truth_derived_count"), ""),
+        (
+            "density_excluded_positions_path",
+            report["position_level_density_gate"].get("density_excluded_positions_path"),
+            "typed fail-closed excluded-position evidence",
+        ),
         ("declared_supported_horizons_ms", DECLARED_HORIZONS_MS, ""),
         ("unsupported_horizons_ms", UNDECLARED_HORIZONS_MS, "not accepted for positive L2 baseline claims"),
         ("l2_f_positive_verdict_allowed", report["final_verdict"] == VERDICT_PASS, ""),
@@ -630,6 +645,32 @@ def classify_density_row(row: dict[str, Any], required_replay_horizon_ms: int) -
     return "UNKNOWN_OR_UNTYPED_DENSITY_VERDICT"
 
 
+def density_exclusion_row(
+    position: str,
+    blockers: dict[int, str],
+) -> dict[str, Any]:
+    return {
+        "schema": "shadow_v2_l2_f_density_excluded_position_v1",
+        "position_id": position,
+        "scope": "L2_F_OFFLINE_RESEARCH_CANDIDATE",
+        "exclusion_policy": "fail_closed_declared_density_retention_gate",
+        "exclusion_reason_kind": "TYPED_DENSITY_RETENTION_BLOCKER",
+        "typed_exclusion_reasons": sorted(set(blockers.values())),
+        "horizon_blockers": [
+            {"horizon_ms": horizon, "reason": reason}
+            for horizon, reason in sorted(blockers.items())
+        ],
+        "selection_inputs": [
+            "research_candidate_roundtrip_membership",
+            "declared_horizon_density_verdict",
+            "declared_horizon_replay_retention",
+        ],
+        "selection_inputs_exclude_pnl": True,
+        "selection_inputs_exclude_terminal_outcome_quality": True,
+        "positive_claim_supported": False,
+    }
+
+
 def position_level_density_retention_gate(
     scope_root: Path | None,
     research_roundtrip_positions: set[str],
@@ -680,12 +721,12 @@ def position_level_density_retention_gate(
 
     complete_positions: set[str] = set()
     blocked_positions: set[str] = set()
-    position_blockers: dict[str, set[str]] = {}
+    position_blockers: dict[str, dict[int, str]] = {}
     horizon_blocker_counts: Counter[str] = Counter()
     blocker_counts = Counter()
 
     for position in sorted(research_roundtrip_positions):
-        blockers: set[str] = set()
+        blockers: dict[int, str] = {}
         for horizon in sorted(declared_horizons):
             item = latest.get((position, horizon))
             if item is None:
@@ -694,12 +735,12 @@ def position_level_density_retention_gate(
                 _idx, row = item
                 blocker = classify_density_row(row, required_replay_horizon_ms)
             if blocker is not None:
-                blockers.add(blocker)
+                blockers[horizon] = blocker
                 horizon_blocker_counts[f"{horizon}:{blocker}"] += 1
         if blockers:
             blocked_positions.add(position)
             position_blockers[position] = blockers
-            blocker_counts.update(blockers)
+            blocker_counts.update(set(blockers.values()))
         else:
             complete_positions.add(position)
 
@@ -745,6 +786,10 @@ def position_level_density_retention_gate(
             "research_candidate_roundtrips_with_all_declared_density_retention_gates"
         ),
         "non_evaluable_positions_excluded_from_positive_claim": True,
+        "density_excluded_positions": [
+            density_exclusion_row(position, blockers)
+            for position, blockers in sorted(position_blockers.items())
+        ],
         "evidence_complete_position_ids": sorted(complete_positions),
     }
 
@@ -768,6 +813,72 @@ def write_evidence_complete_position_scope(path: Path, gate: dict[str, Any]) -> 
                 )
             )
             fh.write("\n")
+
+
+def write_density_excluded_positions(path: Path, gate: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows = gate.get("density_excluded_positions")
+    if not isinstance(rows, list):
+        rows = []
+    with path.open("w", encoding="utf-8") as fh:
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            fh.write(json.dumps(row, sort_keys=True, separators=(",", ":")))
+            fh.write("\n")
+
+
+def raw_artifact_audit_consumption(scope_root: Path | None) -> list[dict[str, Any]]:
+    root = str(scope_root) if scope_root else None
+    return [
+        {
+            "path": f"{root}/shadow_position_event_v2.jsonl" if root else "shadow_position_event_v2.jsonl",
+            "tracked_in_git": False,
+            "consumed_by": [
+                "sample_gate_canonical_roundtrip_counter",
+                "shadow_v2_temporal_no_lookahead_audit.py",
+                "shadow_v2_replay_lifecycle_terminal_reconciliation_audit.py",
+                "account_data_hash_coverage",
+                "shadow_v2_manifest_audit.py",
+            ],
+        },
+        {
+            "path": f"{root}/shadow_replay_v2.jsonl" if root else "shadow_replay_v2.jsonl",
+            "tracked_in_git": False,
+            "consumed_by": [
+                "shadow_v2_temporal_no_lookahead_audit.py",
+                "shadow_v2_replay_lifecycle_terminal_reconciliation_audit.py",
+                "shadow_v2_manifest_audit.py",
+            ],
+        },
+        {
+            "path": f"{root}/shadow_lifecycle_v2.jsonl" if root else "shadow_lifecycle_v2.jsonl",
+            "tracked_in_git": False,
+            "consumed_by": [
+                "shadow_v2_temporal_no_lookahead_audit.py",
+                "shadow_v2_replay_lifecycle_terminal_reconciliation_audit.py",
+                "shadow_v2_manifest_audit.py",
+            ],
+        },
+        {
+            "path": f"{root}/shadow_path_density_v2.jsonl" if root else "shadow_path_density_v2.jsonl",
+            "tracked_in_git": False,
+            "consumed_by": [
+                "shadow_v2_path_density_horizon_audit.py raw scope",
+                "shadow_v2_path_density_horizon_audit.py evidence-complete position scope",
+                "position_level_density_retention_gate",
+                "shadow_v2_manifest_audit.py",
+            ],
+        },
+        {
+            "path": f"{root}/launcher.stdout.log" if root else "launcher.stdout.log",
+            "tracked_in_git": False,
+            "consumed_by": [
+                "candidate_universe_v1 derivation when no explicit candidate universe is supplied",
+                "shadow_v2_manifest_audit.py",
+            ],
+        },
+    ]
 
 
 def account_data_hash_coverage(scope_root: Path | None) -> dict[str, Any]:
@@ -850,6 +961,7 @@ def build_manifest(
         "declared_supported_horizons_ms": DECLARED_HORIZONS_MS,
         "unsupported_horizons_ms": UNDECLARED_HORIZONS_MS,
         "positive_claims_from_undeclared_horizons_allowed": False,
+        "raw_artifact_audit_consumption": raw_artifact_audit_consumption(args.scope_root),
         "approval_flags": APPROVAL_FLAGS_FALSE,
         "runtime_decision_behavior_changes": False,
         "gatekeeper_policy_changes": False,
@@ -895,14 +1007,20 @@ def choose_final_verdict(report: dict[str, Any]) -> tuple[str, list[str]]:
 
     position_density_gate = report.get("position_level_density_gate") or {}
     position_density_verdict = position_density_gate.get("verdict")
+    evidence_complete_density = report.get("evidence_complete_density_audit") or {}
+    evidence_complete_density_verdict = evidence_complete_density.get("verdict")
     if (
         report["density_audit"]["verdict"] not in L2_DENSITY_PASS_VERDICTS
-        and position_density_verdict != POSITION_LEVEL_DENSITY_PASS_VERDICT
+        and (
+            position_density_verdict != POSITION_LEVEL_DENSITY_PASS_VERDICT
+            or evidence_complete_density_verdict != "L2_F_DENSITY_RETENTION_PASS"
+        )
     ):
         blockers.append(
             "density/retention audit did not pass: "
             f"{report['density_audit']['verdict']}; "
-            f"position-level gate: {position_density_verdict}"
+            f"position-level gate: {position_density_verdict}; "
+            f"evidence-complete density audit: {evidence_complete_density_verdict}"
         )
         return VERDICT_DENSITY, blockers
     if position_density_verdict == POSITION_LEVEL_DENSITY_PASS_VERDICT:
@@ -987,7 +1105,18 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         position_density_gate["evidence_complete_position_scope_path"] = str(
             evidence_complete_scope_path
         )
+        density_excluded_positions_path = output_root / "l2_f_density_excluded_positions_v1.jsonl"
+        write_density_excluded_positions(density_excluded_positions_path, position_density_gate)
+        position_density_gate["density_excluded_positions_path"] = str(
+            density_excluded_positions_path
+        )
+        position_density_gate["density_exclusion_policy"] = (
+            "fail_closed_declared_density_retention_gate"
+        )
+        position_density_gate["selection_inputs_exclude_pnl"] = True
+        position_density_gate["selection_inputs_exclude_terminal_outcome_quality"] = True
         position_density_gate.pop("evidence_complete_position_ids", None)
+        position_density_gate.pop("density_excluded_positions", None)
         temporal_report = run_json_audit(
             "shadow_v2_temporal_no_lookahead_audit.py",
             ["--scope-root", str(args.scope_root)],
@@ -1000,6 +1129,20 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
                 "--latest-density-per-position-horizon",
                 "--pass-verdict",
                 "L2_F_DENSITY_RETENTION_PASS",
+            ],
+        )
+        evidence_complete_density_report = run_json_audit(
+            "shadow_v2_path_density_horizon_audit.py",
+            [
+                "--scope-root",
+                str(args.scope_root),
+                "--latest-density-per-position-horizon",
+                "--position-scope-jsonl",
+                str(evidence_complete_scope_path),
+                "--pass-verdict",
+                "L2_F_DENSITY_RETENTION_PASS",
+                "--output-csv",
+                str(output_root / "l2_f_evidence_complete_density_audit_summary.csv"),
             ],
         )
         replay_report = run_json_audit(
@@ -1036,6 +1179,9 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
             "terminal_truth_not_derived_count": None,
         }
         density_report = {"verdict": "SKIPPED_DEDICATED_L2_F_SCOPE_MISSING"}
+        evidence_complete_density_report = {
+            "verdict": "SKIPPED_DEDICATED_L2_F_SCOPE_MISSING"
+        }
         replay_report = {"verdict": "SKIPPED_DEDICATED_L2_F_SCOPE_MISSING"}
         manifest_report = {
             "status": "BLOCKED",
@@ -1059,6 +1205,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
             "verdict": temporal_report.get("temporal_audit_verdict") or temporal_report.get("verdict"),
             "fake_handoff_signature_count": temporal_report.get("fake_handoff_signature_count"),
             "event_seq_chain_order_substitute_count": temporal_report.get("event_seq_chain_order_substitute_count"),
+            "terminal_truth_derived_count": temporal_report.get("terminal_truth_derived_count"),
             "terminal_truth_not_derived_count": temporal_report.get("terminal_truth_not_derived_count"),
         },
         "density_audit": {
@@ -1068,6 +1215,16 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
             "declared_horizon_path_coverage_blocker_count": density_report.get("declared_horizon_path_coverage_blocker_count"),
             "declared_horizon_retention_blocker_count": density_report.get("declared_horizon_retention_blocker_count"),
             "l2_f_allowed_next": density_report.get("l2_f_allowed_next"),
+        },
+        "evidence_complete_density_audit": {
+            "verdict": evidence_complete_density_report.get("verdict"),
+            "declared_horizon_present_count": evidence_complete_density_report.get("declared_horizon_present_count"),
+            "declared_horizon_missing_count": evidence_complete_density_report.get("declared_horizon_missing_count"),
+            "declared_horizon_path_coverage_blocker_count": evidence_complete_density_report.get("declared_horizon_path_coverage_blocker_count"),
+            "declared_horizon_retention_blocker_count": evidence_complete_density_report.get("declared_horizon_retention_blocker_count"),
+            "position_scope_jsonl": evidence_complete_density_report.get("position_scope_jsonl"),
+            "position_scope_position_count": evidence_complete_density_report.get("position_scope_position_count"),
+            "density_rows_excluded_outside_position_scope": evidence_complete_density_report.get("density_rows_excluded_outside_position_scope"),
         },
         "position_level_density_gate": position_density_gate,
         "precondition_density_stage": {
@@ -1092,6 +1249,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "declared_supported_horizons_ms": DECLARED_HORIZONS_MS,
         "unsupported_horizons_ms": UNDECLARED_HORIZONS_MS,
         "positive_claims_from_undeclared_horizons_allowed": False,
+        "raw_artifact_audit_consumption": raw_artifact_audit_consumption(args.scope_root),
         "approval_flags": APPROVAL_FLAGS_FALSE,
         "runtime_decision_behavior_changes": False,
         "gatekeeper_policy_changes": False,

@@ -73,6 +73,8 @@ reports/selector/shadow-v2-l2-f-collection-20260705-r16/runtime_post_run_manifes
 reports/selector/shadow-v2-l2-f-collection-20260705-r16/strict_audit_summary.json
 reports/selector/shadow_v2_l2_f_research_validation_summary.csv
 reports/selector/shadow-v2-l2-f-collection-20260705-r16/l2_f_evidence_complete_position_scope_v1.jsonl
+reports/selector/shadow-v2-l2-f-collection-20260705-r16/l2_f_density_excluded_positions_v1.jsonl
+reports/selector/shadow-v2-l2-f-collection-20260705-r16/l2_f_evidence_complete_density_audit_summary.csv
 reports/selector/shadow-v2-l2-f-collection-20260705-r16/post_run_manifest.json
 reports/selector/shadow-v2-l2-f-collection-20260705-r16/shadow_v2_manifest_report.csv
 reports/selector/shadow-v2-l2-f-collection-20260705-r16/candidate_universe_v1.jsonl
@@ -97,6 +99,7 @@ Passing gates:
 temporal_audit_verdict=PASS_TEMPORAL_NO_LOOKAHEAD_AUDIT
 fake_handoff_signature_count=0
 event_seq_chain_order_substitute_count=0
+terminal_truth_derived_count=801
 terminal_truth_not_derived_count=0
 
 gatekeeper_denominator_verdict=GATEKEEPER_DENOMINATOR_COVERAGE_KNOWN
@@ -125,6 +128,8 @@ Position-level density/retention:
 
 ```text
 position_level_density_retention_verdict=PASS_L2_F_POSITION_LEVEL_DENSITY_RETENTION
+density_retention_verdict_evidence_complete_scope=L2_F_DENSITY_RETENTION_PASS
+density_retention_verdict_raw_scope=BLOCKED_PATH_SAMPLE_COVERAGE_INSUFFICIENT
 l2_research_evidence_complete_roundtrip_positions=750
 density_excluded_roundtrip_positions=19
 missing_declared_horizon_position_count=0
@@ -134,12 +139,41 @@ retention_gap_position_count=2
 unknown_or_untyped_density_verdict_position_count=0
 malformed_density_rows=0
 unknown_horizon_rows=0
+selection_inputs_exclude_pnl=true
+selection_inputs_exclude_terminal_outcome_quality=true
+```
+
+Excluded positions are listed in:
+
+```text
+reports/selector/shadow-v2-l2-f-collection-20260705-r16/l2_f_density_excluded_positions_v1.jsonl
+```
+
+Each excluded-position row has predefined typed reasons, horizon-level
+blockers, `positive_claim_supported=false`, and explicit flags proving that
+PnL/outcome quality is not used as a selection input.
+
+Evidence-complete density audit was rerun with:
+
+```text
+--position-scope-jsonl reports/selector/shadow-v2-l2-f-collection-20260705-r16/l2_f_evidence_complete_position_scope_v1.jsonl
+```
+
+Result:
+
+```text
+density_retention_verdict_evidence_complete_scope=L2_F_DENSITY_RETENTION_PASS
+position_scope_position_count=750
+declared_horizon_present_count=5
+declared_horizon_missing_count=0
+declared_horizon_path_coverage_blocker_count=0
+declared_horizon_retention_blocker_count=0
 ```
 
 Broad density context:
 
 ```text
-density_retention_verdict=BLOCKED_PATH_SAMPLE_COVERAGE_INSUFFICIENT
+density_retention_verdict_raw_scope=BLOCKED_PATH_SAMPLE_COVERAGE_INSUFFICIENT
 declared_horizon_present_count=5
 declared_horizon_missing_count=0
 declared_horizon_path_coverage_blocker_count=5
@@ -154,6 +188,10 @@ L2-F claim is scoped to the 750 positions listed in:
 ```text
 reports/selector/shadow-v2-l2-f-collection-20260705-r16/l2_f_evidence_complete_position_scope_v1.jsonl
 ```
+
+The raw-scope failure remains visible and is not reclassified as PASS. It is
+acceptable only because the positive L2-F claim is restricted to the
+deterministic evidence-complete scope and that scoped density audit passes.
 
 Declared L2 baseline horizons:
 
@@ -172,6 +210,31 @@ research claims:
 300000=NOT_EVALUABLE_UNDECLARED_FOR_L2_BASELINE
 500000=NOT_EVALUABLE_UNDECLARED_FOR_L2_BASELINE
 positive_claims_from_undeclared_horizons_allowed=false
+```
+
+## Raw Artifact Integrity
+
+Large raw artifacts are intentionally not tracked in git. `post_run_manifest.json`
+records their relative path, size, line count, JSONL row count, malformed row
+count and SHA256. `runtime_post_run_manifest.json` and
+`strict_audit_summary.json` record which audit consumed each raw artifact.
+
+Required raw artifact evidence:
+
+```text
+shadow_position_event_v2.jsonl rows=169474 sha256=581f3e40378715be695219737502dc99cc8c27943e3707c796064a4dee955df0
+shadow_replay_v2.jsonl rows=169474 sha256=a94e74665246360ab38f122f6bd80a4e750e7a5d81748d774888e260a97a4201
+shadow_lifecycle_v2.jsonl rows=169474 sha256=d73ad2f1e1eb253dea5b7111ff6e4674ca16fdf53c3762fdfdc6ea5ee1b08f7a
+shadow_path_density_v2.jsonl rows=1186315 sha256=135b3b4130f2726adad9b00e20551ae857b0b1747d3aece70bab1b9d8c69dce0
+```
+
+Audit consumption:
+
+```text
+shadow_position_event_v2.jsonl -> sample gates, temporal audit, replay/lifecycle audit, account hash coverage, manifest audit
+shadow_replay_v2.jsonl -> temporal audit, replay/lifecycle audit, manifest audit
+shadow_lifecycle_v2.jsonl -> temporal audit, replay/lifecycle audit, manifest audit
+shadow_path_density_v2.jsonl -> raw density audit, evidence-complete density audit, position-level density gate, manifest audit
 ```
 
 ## Why This Is L2 But Not L3
@@ -238,8 +301,8 @@ scripts/shadow_v2_l2_f_research_validation_run.py
 Memory proof from final R16 validation:
 
 ```text
-full_l2_f_wrapper_max_rss_kb=164732
-full_l2_f_wrapper_elapsed=5:27.01
+full_l2_f_wrapper_max_rss_kb=164864
+full_l2_f_wrapper_elapsed=6:16.80
 full_l2_f_wrapper_swaps=0
 ```
 
