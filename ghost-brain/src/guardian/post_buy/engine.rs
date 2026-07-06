@@ -28,6 +28,7 @@ use ghost_core::account_state_core::types::CanonicalPoolState;
 use ghost_core::shadow_ledger::types::PriceReason;
 use ghost_core::shadow_ledger::types::PriceState;
 use ghost_core::shadow_ledger::{MarketSnapshot, ShadowLedger};
+use ghost_core::ShadowV2PoolPhase;
 
 use crate::aem::{
     AemLedgerWriter, AemRuntime, JsonlAemLedger, ManagementDecisionEvent, ManagementOutcomeEvent,
@@ -66,10 +67,11 @@ use super::shadow_v2::ShadowV2ValidationHarnessConfig;
 use super::shadow_v2::{
     executable_pnl_link_from_canonical_position_fills, ClockDomain, ClockedTimestamp,
     EventOrderComponent, EventOrderKey, MeasurementGrade, PoolStateSampleV2, ShadowExitAttemptV2,
-    ShadowExitFillModelConfig, ShadowExitFillV2, ShadowPathSampleV2, ShadowPathSamplingModeV2,
-    ShadowPathSamplingReasonV2, ShadowTerminalTruthV2, ShadowV2Envelope, ShadowV2ExecutablePnlLink,
-    ShadowV2Record, ShadowV2ValidationEvidenceStatus, ShadowV2ValidationHarness, SimulationLevel,
-    TemporalClass, TerminalReasonV2, SHADOW_V2_EXIT_FILL_MODEL_VERSION,
+    ShadowExitFillModelConfig, ShadowExitFillV2, ShadowPathSampleV2, ShadowPathSamplerConfigV2,
+    ShadowPathSamplingModeV2, ShadowPathSamplingReasonV2, ShadowTerminalTruthV2, ShadowV2Envelope,
+    ShadowV2ExecutablePnlLink, ShadowV2Record, ShadowV2ValidationEvidenceStatus,
+    ShadowV2ValidationHarness, SimulationLevel, TemporalClass, TerminalReasonV2,
+    SHADOW_V2_EXIT_FILL_MODEL_VERSION,
 };
 
 #[cfg(test)]
@@ -715,6 +717,7 @@ struct MonitoredPosition {
     last_blocked_truth_timestamp_ms: Option<u64>,
     last_snapshot_source: PriceTruthSource,
     last_shadow_snapshot: Option<MarketSnapshot>,
+    last_shadow_v2_path_sample_age_ms: Option<u64>,
     shadow_market_activity: ShadowMarketActivityAnchor,
     time_stop_v2: TimeStopV2State,
     snapshot_timeline: SnapshotTimeline,
@@ -1092,12 +1095,13 @@ fn shadow_v2_lifecycle_source_order_limitations(record: &ShadowLifecycleRecord) 
 }
 
 fn shadow_v2_derived_event_order_key(
-    slot: Option<u64>,
+    _slot: Option<u64>,
     event_seq_in_process: u64,
     observed_at_wall_ms: u64,
 ) -> EventOrderKey {
     let mut order_key =
-        shadow_v2_event_order_key(slot, None, event_seq_in_process, observed_at_wall_ms);
+        shadow_v2_event_order_key(None, None, event_seq_in_process, observed_at_wall_ms);
+    order_key.slot = EventOrderComponent::derived();
     order_key.block_time = EventOrderComponent::derived();
     order_key.signature = EventOrderComponent::derived();
     order_key.transaction_index_or_unknown = EventOrderComponent::derived();
@@ -1863,6 +1867,196 @@ impl MonitoringEngine {
                     "PostBuyGuardian: Shadow V2 lifecycle evidence append incomplete"
                 );
             }
+        }
+    }
+
+    fn maybe_emit_shadow_v2_runtime_path_sample(&self, base_mint: &Pubkey, sample_ts_ms: u64) {
+        let Some(harness) = self.shadow_v2_validation_harness.as_ref() else {
+            return;
+        };
+        let Some(state) = self.current_canonical_state(base_mint) else {
+            return;
+        };
+        let sampler_config = ShadowPathSamplerConfigV2::standard_120s();
+        let (
+            candidate_id,
+            position_id,
+            pool_id,
+            bonding_curve,
+            entry_price_sol,
+            run_id,
+            session_id,
+            position_epoch,
+            age_ms,
+        ) = {
+            let positions = self.positions.read();
+            let Some(pos) = positions.get(base_mint) else {
+                return;
+            };
+            if !matches!(pos.lane, Lane::Shadow) {
+                return;
+            }
+            let age_ms = sample_ts_ms.saturating_sub(pos.entry_unix_ms);
+            if age_ms > sampler_config.max_horizon_ms {
+                return;
+            }
+            if pos.last_shadow_v2_path_sample_age_ms.is_none()
+                && age_ms < sampler_config.heartbeat_ms
+            {
+                return;
+            }
+            if let Some(previous_age_ms) = pos.last_shadow_v2_path_sample_age_ms {
+                if age_ms <= previous_age_ms {
+                    return;
+                }
+                if age_ms.saturating_sub(previous_age_ms) < sampler_config.heartbeat_ms {
+                    return;
+                }
+            }
+            (
+                pos.candidate_id.clone(),
+                pos.position_id.clone(),
+                pos.pool_amm_id,
+                pos.bonding_curve,
+                pos.entry_price_sol,
+                pos.join_metadata
+                    .run_id
+                    .clone()
+                    .or_else(|| pos.join_metadata.rollout_namespace.clone())
+                    .unwrap_or_else(|| "UNKNOWN_SHADOW_V2_RUN".to_string()),
+                pos.join_metadata.session_id.clone(),
+                pos.position_epoch,
+                age_ms,
+            )
+        };
+
+        let source_write_version = state
+            .source_write_version
+            .map(|write_version| write_version.to_string())
+            .unwrap_or_else(|| "none".to_string());
+        let pool_state_event_id = format!(
+            "shadow_v2_pool_state_runtime_path:{position_id}:{age_ms}:{}:{source_write_version}",
+            state.last_update_slot
+        );
+        let path_event_id = format!(
+            "shadow_v2_runtime_path_sample:{position_id}:{age_ms}:{}:{source_write_version}",
+            state.last_update_slot
+        );
+
+        let mut pool_envelope = ShadowV2Envelope::contract_header(
+            "pool_state_sample_v2",
+            run_id.clone(),
+            position_id.clone(),
+            pool_state_event_id,
+            pool_id.to_string(),
+            base_mint.to_string(),
+        );
+        pool_envelope.session_id = session_id.clone();
+        pool_envelope.candidate_id = Some(candidate_id.clone());
+        pool_envelope.bonding_curve = Some(bonding_curve.to_string());
+        pool_envelope.parent_event_id = Some(format!("position_epoch:{position_epoch}"));
+        pool_envelope
+            .source_refs
+            .push("post_buy_guardian:runtime_path_sample_tick".to_string());
+        pool_envelope
+            .source_refs
+            .push("account_state_core:get_canonical_state".to_string());
+        pool_envelope
+            .limitations
+            .push("RUNTIME_PATH_SAMPLE_FROM_ACCOUNT_STATE_CORE".to_string());
+        pool_envelope
+            .limitations
+            .push("TOKEN_DECIMALS_ASSUMED_PUMPFUN_6".to_string());
+        pool_envelope
+            .limitations
+            .push("TRANSACTION_SOURCE_PROOF_NOT_REQUIRED_FOR_ACCOUNT_STATE_BOUNDARY".to_string());
+
+        let pool_event_order_key = shadow_v2_event_order_key(
+            Some(state.last_update_slot),
+            None,
+            shadow_v2_event_seq(sample_ts_ms, 4),
+            sample_ts_ms,
+        );
+        let pool_state = PoolStateSampleV2::from_account_state_core(
+            pool_envelope,
+            pool_event_order_key.clone(),
+            &state,
+            sample_ts_ms,
+            state.account_data_hash.clone(),
+            TemporalClass::PostEntry,
+            ClockDomain::StreamObservedMs,
+            6,
+        );
+
+        let mut path_envelope = ShadowV2Envelope::contract_header(
+            "shadow_path_sample_v2",
+            run_id,
+            position_id.clone(),
+            path_event_id,
+            pool_id.to_string(),
+            base_mint.to_string(),
+        );
+        path_envelope.session_id = session_id;
+        path_envelope.candidate_id = Some(candidate_id);
+        path_envelope.bonding_curve = Some(bonding_curve.to_string());
+        path_envelope.parent_event_id = Some(pool_state.envelope.event_id.clone());
+        path_envelope.produced_at_ms = sample_ts_ms;
+        path_envelope.produced_at_slot = Some(state.last_update_slot);
+        path_envelope
+            .source_refs
+            .push("post_buy_guardian:runtime_path_sample_tick".to_string());
+        path_envelope.source_refs.push(format!(
+            "pool_state_sample_v2:{}",
+            pool_state.envelope.event_id
+        ));
+        path_envelope
+            .limitations
+            .push("RUNTIME_PATH_SAMPLE_FROM_ACCOUNT_STATE_CORE".to_string());
+
+        let path_sample = ShadowPathSampleV2::from_pool_state_mark(
+            path_envelope,
+            pool_event_order_key,
+            ClockedTimestamp {
+                field_name: "sample_ts_ms".to_string(),
+                value: Some(sample_ts_ms as i64),
+                clock_domain: ClockDomain::StreamObservedMs,
+                clock_source: "post_buy_guardian.runtime_path_sample_tick".to_string(),
+                causal_boundary: "POST_ENTRY_RUNTIME_PATH_SAMPLE".to_string(),
+            },
+            age_ms,
+            &pool_state,
+            ShadowV2PoolPhase::BondingCurve,
+            entry_price_sol,
+            ShadowPathSamplingModeV2::Standard120s,
+            ShadowPathSamplingReasonV2::Heartbeat,
+        );
+
+        let mut harness = harness.lock();
+        let pool_outcome = harness.append_record(ShadowV2Record::PoolStateSampleV2(pool_state));
+        let path_outcome = harness.append_record(ShadowV2Record::ShadowPathSampleV2(path_sample));
+        if pool_outcome.validation_evidence_status == ShadowV2ValidationEvidenceStatus::Complete
+            && path_outcome.validation_evidence_status == ShadowV2ValidationEvidenceStatus::Complete
+        {
+            debug!(
+                %position_id,
+                age_ms,
+                slot = state.last_update_slot,
+                "PostBuyGuardian: Shadow V2 runtime path sample emitted"
+            );
+        } else {
+            warn!(
+                %position_id,
+                age_ms,
+                pool_status = ?pool_outcome.validation_evidence_status,
+                path_status = ?path_outcome.validation_evidence_status,
+                "PostBuyGuardian: Shadow V2 runtime path sample append incomplete"
+            );
+        }
+        drop(harness);
+
+        let mut positions = self.positions.write();
+        if let Some(pos) = positions.get_mut(base_mint) {
+            pos.last_shadow_v2_path_sample_age_ms = Some(age_ms);
         }
     }
 
@@ -2943,6 +3137,7 @@ impl MonitoringEngine {
             last_blocked_truth_timestamp_ms: None,
             last_snapshot_source: self.default_snapshot_source(),
             last_shadow_snapshot: initial_shadow_snapshot,
+            last_shadow_v2_path_sample_age_ms: None,
             shadow_market_activity,
             time_stop_v2,
             snapshot_timeline,
@@ -3207,6 +3402,7 @@ impl MonitoringEngine {
                         self.observe_exit_replay_snapshot(base_mint, snapshot);
                         self.remember_shadow_snapshot(base_mint, snapshot);
                         self.evaluate_time_stop_v2_observe_only(base_mint, Some(snapshot), now_ms);
+                        self.maybe_emit_shadow_v2_runtime_path_sample(base_mint, now_ms);
                         self.run_shadow_runtime_tick(base_mint, Some(snapshot), now_ms)
                             .await;
                     } else {
@@ -3249,6 +3445,7 @@ impl MonitoringEngine {
             let runtime_snapshot = self.current_runtime_shadow_snapshot(base_mint, now_ms);
             let runtime_snapshot = runtime_snapshot.as_ref().unwrap_or(latest);
             self.observe_exit_replay_snapshot(base_mint, runtime_snapshot);
+            self.maybe_emit_shadow_v2_runtime_path_sample(base_mint, now_ms);
             self.run_shadow_runtime_tick(base_mint, Some(runtime_snapshot), now_ms)
                 .await;
         }
@@ -5557,6 +5754,40 @@ mod tests {
         ));
     }
 
+    fn apply_test_canonical_update_with_account_proof(
+        account_state_core: &AccountStateReducer,
+        mint: Pubkey,
+        bonding_curve: Pubkey,
+        slot: u64,
+        receive_ts_ms: u64,
+    ) {
+        let source_account_pubkey = Pubkey::new_unique();
+        let source_owner = Pubkey::new_unique();
+        let apply_result = account_state_core.apply_account_update(AccountStateUpdate {
+            pool_amm_id: Pubkey::new_unique(),
+            base_mint: mint,
+            bonding_curve,
+            sol_reserves: 210_000_000_000,
+            token_reserves: 760_000_000_000_000,
+            is_complete: 0,
+            slot,
+            write_version: Some(17),
+            source_account_pubkey: Some(source_account_pubkey),
+            source_account_owner_or_program: Some(source_owner),
+            account_data_len: Some(512),
+            account_data_hash: Some("test-blake3-account-data-hash".to_string()),
+            receive_ts_ms,
+            receive_seq: 1,
+            curve_finality: CurveFinality::Provisional,
+            source: UpdateSource::GeyserAccountUpdate,
+        });
+        assert!(matches!(
+            apply_result,
+            ghost_core::account_state_core::types::AccountUpdateResult::Applied
+                | ghost_core::account_state_core::types::AccountUpdateResult::PromotedFromBootstrap
+        ));
+    }
+
     fn make_shadow_v2_exit_test_engine(
         state_slot: u64,
         state_ts_ms: u64,
@@ -5865,6 +6096,103 @@ mod tests {
         assert!(
             lifecycle_rows.is_empty(),
             "unexpected lifecycle rows before first shadow snapshot: {lifecycle_rows:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shadow_tick_emits_runtime_account_state_path_sample() {
+        let tmp = TempDir::new().expect("tempdir");
+        let harness = Arc::new(Mutex::new(
+            ShadowV2ValidationHarness::new(shadow_v2_harness_config_for_dir(tmp.path()))
+                .expect("shadow v2 harness"),
+        ));
+        let account_state_core = Arc::new(AccountStateReducer::new());
+        let config = PostBuyGuardianConfig::default();
+        let shadow_ledger = Arc::new(ShadowLedger::new());
+        let (tx, _rx) = mpsc::channel(16);
+        let mut engine = MonitoringEngine::new(config, Arc::clone(&shadow_ledger), tx);
+        engine.set_shadow_v2_validation_harness(Arc::clone(&harness));
+        engine.set_account_state_core(Arc::clone(&account_state_core));
+        engine.set_position_router(Arc::new(PositionRuntimeRouter::with_shadow_book(Arc::new(
+            AsyncRwLock::new(ShadowPositionBook::new()),
+        ))));
+        let engine = Arc::new(engine);
+
+        let pool = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let bonding_curve = Pubkey::new_unique();
+        let now_ms = current_time_ms();
+        apply_test_canonical_update_with_account_proof(
+            &account_state_core,
+            mint,
+            bonding_curve,
+            430_000_120,
+            now_ms.saturating_sub(1_000),
+        );
+        let registered = engine.register_position_with_context(
+            pool,
+            mint,
+            bonding_curve,
+            Some(0.0000001),
+            Some(7_000_000),
+            Some(7_000_000_000),
+            Some(PositionEventContext {
+                join_metadata: PositionJoinMetadata {
+                    run_id: Some("shadow-v2-runtime-path-test".to_string()),
+                    session_id: Some("session-runtime-path-test".to_string()),
+                    decision_plane: Some("l2-f-runtime-path-test".to_string()),
+                    ..Default::default()
+                },
+                candidate_id: "candidate-runtime-path-test".to_string(),
+                entry_order_id: "entry-order-runtime-path-test".to_string(),
+                quote_id: "quote-runtime-path-test".to_string(),
+                slot: Some(430_000_119),
+                lane: Lane::Shadow,
+                position_id: Some("shadow-v2-runtime-path-position".to_string()),
+                position_epoch: Some(11),
+                opened_at_ms: Some(now_ms.saturating_sub(2_000)),
+            }),
+        );
+        assert!(registered.is_some());
+
+        engine.tick().await;
+
+        let canonical_rows = read_jsonl_rows(&tmp.path().join("shadow_position_event_v2.jsonl"));
+        let pool_state_row = canonical_rows
+            .iter()
+            .find(|row| row["event_kind"] == "POOL_STATE_SAMPLE")
+            .expect("runtime pool state sample row");
+        assert_eq!(
+            pool_state_row["payload"]["record"]["account_data_hash"],
+            "test-blake3-account-data-hash"
+        );
+        assert_eq!(
+            pool_state_row["payload"]["record"]["source_account_slot"],
+            430_000_120
+        );
+        assert_eq!(
+            pool_state_row["payload"]["record"]["source_write_version"],
+            17
+        );
+
+        let path_row = canonical_rows
+            .iter()
+            .find(|row| row["event_kind"] == "PATH_SAMPLE")
+            .expect("runtime path sample row");
+        let pool_state_ref = path_row["payload"]["record"]["pool_state_ref"]
+            .as_str()
+            .expect("path pool_state_ref");
+        assert!(
+            !pool_state_ref.starts_with("MISSING_POOL_STATE_SAMPLE"),
+            "runtime path sample must point at a real pool-state sample: {path_row:?}"
+        );
+        assert_eq!(
+            path_row["payload"]["record"]["sampling_reason"],
+            "HEARTBEAT"
+        );
+        assert_eq!(
+            path_row["payload"]["record"]["source_quality"],
+            "ACCOUNT_STATE_CORE_CANONICAL_STALENESS_MARKED"
         );
     }
 
@@ -6206,6 +6534,7 @@ mod tests {
                 .event_order_key
                 .not_applicable_or_derived_chain_order_components(),
             vec![
+                "slot:DERIVED".to_string(),
                 "block_time:DERIVED".to_string(),
                 "signature:DERIVED".to_string(),
                 "transaction_index_or_unknown:DERIVED".to_string(),
@@ -6214,6 +6543,7 @@ mod tests {
                 "log_index_or_unknown:DERIVED".to_string(),
             ]
         );
+        assert_eq!(terminal.terminal_slot, Some(430_000_046));
         assert!(!terminal.event_order_key.has_complete_chain_order());
         assert!(terminal
             .event_order_key
@@ -6430,7 +6760,7 @@ mod tests {
     }
 
     #[test]
-    fn shadow_v2_exit_fill_preserves_same_slot_ordering_blocker() {
+    fn shadow_v2_exit_fill_preserves_same_slot_ordering_provenance_blocker() {
         let state_ts_ms = 1_785_000_300_000;
         let (engine, _account_state_core, mint, _bonding_curve) =
             make_shadow_v2_exit_test_engine(430_000_045, state_ts_ms);
@@ -6448,12 +6778,23 @@ mod tests {
 
         let fill = engine.shadow_v2_exit_fill_from_lifecycle(&record, Some(&pool_state));
 
-        assert_eq!(fill.fill_status, FillStatus::BlockedByData);
-        assert_eq!(fill.execution_simulation_ready, Some(false));
+        assert_eq!(fill.fill_status, FillStatus::Filled);
+        assert_eq!(fill.execution_simulation_ready, Some(true));
+        assert_eq!(fill.research_provenance_ready, Some(false));
+        assert_eq!(
+            fill.execution_label_grade,
+            Some(ShadowV2ExecutionLabelGrade::DiagnosticSim)
+        );
         assert!(fill
             .limitations
             .contains(&"EXIT_FILL_POOL_STATE_SAME_SLOT_ORDER_AMBIGUOUS".to_string()));
-        assert!(fill.pool_state_after.is_none());
+        assert!(fill
+            .provenance_blockers
+            .contains(&"EXIT_FILL_POOL_STATE_SAME_SLOT_ORDER_AMBIGUOUS".to_string()));
+        assert!(!fill
+            .blocked_reasons
+            .contains(&"EXIT_FILL_POOL_STATE_SAME_SLOT_ORDER_AMBIGUOUS".to_string()));
+        assert!(fill.pool_state_after.is_some());
     }
 
     #[test]

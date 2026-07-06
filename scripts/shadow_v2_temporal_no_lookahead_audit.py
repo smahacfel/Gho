@@ -6,16 +6,16 @@ from typing import Any
 
 from shadow_v2_offline_audit_common import (
     canonical_payload_schema,
-    canonical_rows,
     emit,
     envelope,
     event_order_key,
+    iter_canonical_rows,
+    iter_lifecycle_rows,
+    iter_replay_rows,
     limitations,
-    lifecycle_rows,
     nested_record,
     parser,
     position_id,
-    replay_rows,
 )
 
 CHAIN_COMPONENTS = [
@@ -63,6 +63,13 @@ TRANSACTION_SOURCE_PROOF_SCHEMAS = {
 }
 
 ACCOUNT_STATE_SOURCE_PROOF_SCHEMAS = {"pool_state_sample_v2"}
+ACCOUNT_STATE_DERIVED_SIMULATION_SCHEMAS = {
+    "shadow_entry_attempt_v2",
+    "shadow_entry_fill_v2",
+    "shadow_path_sample_v2",
+    "shadow_exit_attempt_v2",
+    "shadow_exit_fill_v2",
+}
 
 TRANSACTION_SOURCE_COMPONENTS = [
     ("slot", "TRANSACTION_SOURCE_SLOT"),
@@ -165,11 +172,80 @@ def claims_exact_event_order(row: dict[str, Any]) -> bool:
     return isinstance(value, str) and value.upper() == "EXACT_EVENT_ORDER"
 
 
+def account_state_derived_simulation_source_proof(row: dict[str, Any]) -> bool:
+    schema = canonical_payload_schema(row)
+    if schema not in ACCOUNT_STATE_DERIVED_SIMULATION_SCHEMAS:
+        return False
+    record = nested_record(row)
+    refs = [str(ref) for ref in envelope(row).get("source_refs") or []]
+    limitations_values = limitations(row)
+    if schema == "shadow_path_sample_v2":
+        pool_state_ref = str(record.get("pool_state_ref") or "")
+        if bool(pool_state_ref) and not pool_state_ref.startswith("MISSING_POOL_STATE_SAMPLE"):
+            return True
+        return (
+            bool(pool_state_ref)
+            and pool_state_ref.startswith("MISSING_POOL_STATE_SAMPLE")
+            and any("shadow_lifecycle:" in ref for ref in refs)
+            and any(
+                value == "LEGACY_LIFECYCLE_PRICE_TRUTH_NOT_POOL_STATE_SAMPLE"
+                for value in limitations_values
+            )
+            and not claims_exact_event_order(row)
+        )
+    if schema in {"shadow_entry_fill_v2", "shadow_exit_fill_v2"}:
+        pool_state_ref = str(record.get("pool_state_before") or "")
+        grade = str(record.get("execution_label_grade") or "")
+        return bool(pool_state_ref) and grade in {"RESEARCH_CANDIDATE", "DIAGNOSTIC_SIM"}
+    if schema in {"shadow_entry_attempt_v2", "shadow_exit_attempt_v2"}:
+        return any("post_buy_runtime:" in ref or "shadow_lifecycle:" in ref for ref in refs) or any(
+            "NOT_LIVE" in value or "SHADOW" in value for value in limitations_values
+        )
+    return False
+
+
+def typed_blocked_simulation_row(row: dict[str, Any]) -> bool:
+    schema = canonical_payload_schema(row)
+    if schema not in ACCOUNT_STATE_DERIVED_SIMULATION_SCHEMAS:
+        return False
+    if claims_exact_event_order(row):
+        return False
+
+    record = nested_record(row)
+    env = envelope(row)
+    limitations_values = limitations(row)
+    blocked_reasons = record.get("blocked_reasons")
+    if not isinstance(blocked_reasons, list) or not blocked_reasons:
+        return False
+    if record.get("execution_simulation_ready") is not False:
+        return False
+
+    quality_values = {
+        str(record.get("quality") or ""),
+        str(record.get("fill_status") or ""),
+        str(env.get("quality") or ""),
+        str(env.get("measurement_grade") or ""),
+    }
+    if "BLOCKED_BY_DATA" not in quality_values:
+        return False
+
+    reconstruction_status = str(record.get("reconstruction_status") or "")
+    if "BLOCKED" not in reconstruction_status:
+        return False
+
+    return any(
+        "NOT_EXECUTABLE_WITHOUT_POOL_STATE_PROVENANCE" in value
+        or "POOL_STATE_SAMPLE_MISSING" in value
+        or "POOL_STATE_BEFORE_UNAVAILABLE" in value
+        for value in limitations_values
+    )
+
+
 def main() -> int:
     args = parser("Offline Shadow V2 temporal/no-lookahead audit").parse_args()
-    rows, malformed = canonical_rows(args.scope_root)
-    replay, replay_malformed = replay_rows(args.scope_root)
-    lifecycle, lifecycle_malformed = lifecycle_rows(args.scope_root)
+    malformed = 0
+    replay_malformed = 0
+    lifecycle_malformed = 0
     temporal_by_schema: dict[str, Counter[str]] = defaultdict(Counter)
     clock_by_schema: dict[str, Counter[str]] = defaultdict(Counter)
     event_order_present = 0
@@ -184,21 +260,26 @@ def main() -> int:
     missing_required_examples: list[dict[str, str | None]] = []
     missing_source_examples: list[dict[str, str | None]] = []
     unknown_required_source_components: Counter[str] = Counter()
-    seq_by_position: dict[str, list[int]] = defaultdict(list)
+    last_seq_by_position: dict[str, int] = {}
     non_monotonic = 0
     post_entry_pre_decision_violation = 0
     terminal_pre_entry_violation = 0
     transaction_source_proof_complete_count = 0
     account_state_source_proof_complete_count = 0
+    account_state_derived_simulation_source_proof_count = 0
     unknown_required_source_rows = 0
     transaction_source_proof_missing_rows = 0
     account_state_source_proof_missing_rows = 0
+    typed_blocked_simulation_source_exempt_count = 0
     not_applicable_accepted_count = 0
     fake_handoff_signature_count = 0
     event_seq_chain_order_substitute_count = 0
     terminal_truth_derived_count = 0
     terminal_truth_not_derived_count = 0
-    for row in rows:
+    for row, row_malformed in iter_canonical_rows(args.scope_root) or ():
+        if row_malformed or row is None:
+            malformed += 1
+            continue
         schema = canonical_payload_schema(row)
         env = envelope(row)
         temporal_by_schema[schema][str(env.get("temporal_class") or "UNKNOWN")] += 1
@@ -219,19 +300,31 @@ def main() -> int:
             seq = eok.get("event_seq_in_process")
             pos = position_id(row)
             if isinstance(seq, int) and pos:
-                seq_by_position[pos].append(seq)
+                previous = last_seq_by_position.get(pos)
+                if previous is not None and seq < previous:
+                    non_monotonic += 1
+                last_seq_by_position[pos] = seq
             not_applicable_accepted_count += accepted_not_applicable_count(schema, eok)
             if has_fake_handoff_signature(row, eok):
                 fake_handoff_signature_count += 1
             missing_source: list[str] = []
-            if schema in TRANSACTION_SOURCE_PROOF_SCHEMAS:
+            if (
+                schema in TRANSACTION_SOURCE_PROOF_SCHEMAS
+                and claims_exact_event_order(row)
+                and isinstance(seq, int)
+                and transaction_source_proof_missing(eok)
+            ):
+                event_seq_chain_order_substitute_count += 1
+            if typed_blocked_simulation_row(row):
+                typed_blocked_simulation_source_exempt_count += 1
+            elif account_state_derived_simulation_source_proof(row):
+                account_state_derived_simulation_source_proof_count += 1
+            elif schema in TRANSACTION_SOURCE_PROOF_SCHEMAS:
                 missing_source = transaction_source_proof_missing(eok)
                 if missing_source:
                     transaction_source_proof_missing_rows += 1
                 else:
                     transaction_source_proof_complete_count += 1
-                if missing_source and claims_exact_event_order(row) and isinstance(seq, int):
-                    event_seq_chain_order_substitute_count += 1
             elif schema in ACCOUNT_STATE_SOURCE_PROOF_SCHEMAS:
                 missing_source = account_state_source_proof_missing(row)
                 if missing_source:
@@ -287,15 +380,25 @@ def main() -> int:
         if schema == "shadow_terminal_truth_v2":
             if env.get("temporal_class") in {"PRE_DETECTION", "PRE_DECISION", "AT_DECISION", "POST_ENTRY"}:
                 terminal_pre_entry_violation += 1
-    for seqs in seq_by_position.values():
-        for prev, cur in zip(seqs, seqs[1:]):
-            if cur < prev:
-                non_monotonic += 1
     derived_as_canonical_input = 0
-    for row in replay + lifecycle:
-        refs = envelope(row).get("source_refs") or []
-        if any(str(ref).startswith("shadow_replay_v2:") or str(ref).startswith("shadow_lifecycle_v2:") for ref in refs):
-            derived_as_canonical_input += 1
+    for iterator_name, iterator in (
+        ("replay", iter_replay_rows(args.scope_root)),
+        ("lifecycle", iter_lifecycle_rows(args.scope_root)),
+    ):
+        for row, row_malformed in iterator or ():
+            if row_malformed or row is None:
+                if iterator_name == "replay":
+                    replay_malformed += 1
+                else:
+                    lifecycle_malformed += 1
+                continue
+            refs = envelope(row).get("source_refs") or []
+            if any(
+                str(ref).startswith("shadow_replay_v2:")
+                or str(ref).startswith("shadow_lifecycle_v2:")
+                for ref in refs
+            ):
+                derived_as_canonical_input += 1
     unknown_required_source_count = sum(unknown_required_source_components.values())
     if (
         malformed
@@ -357,6 +460,8 @@ def main() -> int:
         "transaction_source_proof_missing_rows": transaction_source_proof_missing_rows,
         "account_state_source_proof_complete_count": account_state_source_proof_complete_count,
         "account_state_source_proof_missing_rows": account_state_source_proof_missing_rows,
+        "account_state_derived_simulation_source_proof_count": account_state_derived_simulation_source_proof_count,
+        "typed_blocked_simulation_source_exempt_count": typed_blocked_simulation_source_exempt_count,
         "not_applicable_accepted_count": not_applicable_accepted_count,
         "fake_handoff_signature_count": fake_handoff_signature_count,
         "event_seq_chain_order_substitute_count": event_seq_chain_order_substitute_count,

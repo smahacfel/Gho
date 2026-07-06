@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-from shadow_v2_offline_audit_common import emit, envelope, lifecycle_rows, parser, position_id, replay_rows
+from shadow_v2_offline_audit_common import (
+    emit,
+    envelope,
+    iter_lifecycle_rows,
+    iter_replay_rows,
+    parser,
+    position_id,
+)
 
 
 def terminal_key(row: dict) -> str | None:
@@ -10,15 +17,30 @@ def terminal_key(row: dict) -> str | None:
 
 def main() -> int:
     args = parser("Offline Shadow V2 replay/lifecycle terminal reconciliation audit").parse_args()
-    replay, replay_malformed = replay_rows(args.scope_root)
-    lifecycle, lifecycle_malformed = lifecycle_rows(args.scope_root)
-    replay_terminal = [r for r in replay if envelope(r).get("quality") == "REPLAY_DERIVED_FROM_CANONICAL_TERMINAL"]
-    lifecycle_terminal = [
-        r for r in lifecycle if envelope(r).get("quality") == "LIFECYCLE_DERIVED_FROM_CANONICAL_TERMINAL"
-    ]
-    replay_open = [r for r in replay if envelope(r).get("quality") == "REPLAY_DERIVED_OPEN_OR_BLOCKED"]
-    lifecycle_open = [r for r in lifecycle if envelope(r).get("quality") == "LIFECYCLE_DERIVED_OPEN_OR_BLOCKED"]
-    lifecycle_by_position = {position_id(r): r for r in lifecycle_terminal if position_id(r)}
+    replay_rows_seen = 0
+    lifecycle_rows_seen = 0
+    replay_malformed = 0
+    lifecycle_malformed = 0
+    replay_terminal_count = 0
+    lifecycle_terminal_count = 0
+    replay_open_count = 0
+    lifecycle_open_count = 0
+    lifecycle_by_position: dict[str, dict] = {}
+
+    for row, row_malformed in iter_lifecycle_rows(args.scope_root) or ():
+        if row_malformed or row is None:
+            lifecycle_malformed += 1
+            continue
+        lifecycle_rows_seen += 1
+        quality = envelope(row).get("quality")
+        if quality == "LIFECYCLE_DERIVED_FROM_CANONICAL_TERMINAL":
+            lifecycle_terminal_count += 1
+            pos = position_id(row)
+            if pos:
+                lifecycle_by_position[pos] = row
+        elif quality == "LIFECYCLE_DERIVED_OPEN_OR_BLOCKED":
+            lifecycle_open_count += 1
+
     exact_join = 0
     terminal_event_match = 0
     terminal_reason_match = 0
@@ -27,7 +49,18 @@ def main() -> int:
     close_age_match = 0
     mismatch = 0
     missing_terminal_link = 0
-    for r in replay_terminal:
+    for r, row_malformed in iter_replay_rows(args.scope_root) or ():
+        if row_malformed or r is None:
+            replay_malformed += 1
+            continue
+        replay_rows_seen += 1
+        quality = envelope(r).get("quality")
+        if quality == "REPLAY_DERIVED_OPEN_OR_BLOCKED":
+            replay_open_count += 1
+            continue
+        if quality != "REPLAY_DERIVED_FROM_CANONICAL_TERMINAL":
+            continue
+        replay_terminal_count += 1
         pos = position_id(r)
         l = lifecycle_by_position.get(pos)
         if not l:
@@ -60,21 +93,21 @@ def main() -> int:
         verdict = "FAIL_REPLAY_LIFECYCLE_MISMATCH"
     elif mismatch or missing_terminal_link:
         verdict = "FAIL_REPLAY_LIFECYCLE_MISMATCH"
-    elif replay_terminal and exact_join == len(replay_terminal):
+    elif replay_terminal_count and exact_join == replay_terminal_count:
         verdict = "PASS_REPLAY_LIFECYCLE_RECONCILED"
     else:
         verdict = "BLOCKED_REPLAY_LIFECYCLE_TERMINAL_INCOMPLETE"
     result = {
         "audit": "replay_lifecycle_terminal_reconciliation",
         "scope_root": args.scope_root,
-        "shadow_replay_v2_rows": len(replay),
-        "shadow_lifecycle_v2_rows": len(lifecycle),
+        "shadow_replay_v2_rows": replay_rows_seen,
+        "shadow_lifecycle_v2_rows": lifecycle_rows_seen,
         "replay_malformed_rows": replay_malformed,
         "lifecycle_malformed_rows": lifecycle_malformed,
-        "replay_rows_derived_from_canonical_terminal": len(replay_terminal),
-        "lifecycle_rows_derived_from_canonical_terminal": len(lifecycle_terminal),
-        "replay_rows_open_or_blocked": len(replay_open),
-        "lifecycle_rows_open_or_blocked": len(lifecycle_open),
+        "replay_rows_derived_from_canonical_terminal": replay_terminal_count,
+        "lifecycle_rows_derived_from_canonical_terminal": lifecycle_terminal_count,
+        "replay_rows_open_or_blocked": replay_open_count,
+        "lifecycle_rows_open_or_blocked": lifecycle_open_count,
         "exact_join_match_count": exact_join,
         "terminal_event_id_match_count": terminal_event_match,
         "terminal_reason_match_count": terminal_reason_match,

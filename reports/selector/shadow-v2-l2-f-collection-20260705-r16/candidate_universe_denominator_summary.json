@@ -1,0 +1,473 @@
+{
+  "approval_flags": {
+    "active_close": false,
+    "live_equivalence": false,
+    "research_grade": false,
+    "runtime_approval": false,
+    "shadow_close_only": false,
+    "strategy_research_unblocked": false
+  },
+  "artifact": "shadow_v2_l2_e2_candidate_universe_denominator_repair",
+  "candidate_manifest_path": "reports/selector/shadow-v2-l2-f-collection-20260705-r16/candidate_universe_manifest_v1.json",
+  "candidate_universe_manifest": {
+    "artifact": "candidate_universe_v1",
+    "candidate_ids_from_decision_only": 0,
+    "decision_context_join_key_counts": {
+      "mint_pool": 4535
+    },
+    "decision_context_join_samples": [
+      {
+        "base_mint": "3wzr2YQXFDuyDG6U4pYrHhmGAw3zhtm9UE5FDe3Gpump",
+        "candidate_id": "3wzr2YQXFDuyDG6U4pYrHhmGAw3zhtm9UE5FDe3Gpump:86JvXzpuikvTo7rPKb4nKNn1MSijtWCpQPLoEwEw3VH4:1783295700606",
+        "decision_candidate_id": null,
+        "join_key": "mint_pool:3wzr2YQXFDuyDG6U4pYrHhmGAw3zhtm9UE5FDe3Gpump:86JvXzpuikvTo7rPKb4nKNn1MSijtWCpQPLoEwEw3VH4",
+        "pool_id": "86JvXzpuikvTo7rPKb4nKNn1MSijtWCpQPLoEwEw3VH4"
+      },
+      {
+        "base_mint": "4nFn1MfF5tQqjytTN7Gc5L7C9U56MeAVPdpR5159pump",
+        "candidate_id": "4nFn1MfF5tQqjytTN7Gc5L7C9U56MeAVPdpR5159pump:BASTXxG3QmAmhon2Kt4fN2bGoj3DHLdmE3tz2pD4eJQU:1783295700993",
+        "decision_candidate_id": null,
+        "join_key": "mint_pool:4nFn1MfF5tQqjytTN7Gc5L7C9U56MeAVPdpR5159pump:BASTXxG3QmAmhon2Kt4fN2bGoj3DHLdmE3tz2pD4eJQU",
+        "pool_id": "BASTXxG3QmAmhon2Kt4fN2bGoj3DHLdmE3tz2pD4eJQU"
+      },
+      {
+        "base_mint": "DzQkQx6ihazsfizQyimcvTqbfq5nsEdCzFzQdMEwpump",
+        "candidate_id": "DzQkQx6ihazsfizQyimcvTqbfq5nsEdCzFzQdMEwpump:8qcg21NUcRofJH1DhYT6y2WQRRcrXqzobe7GFvKFeYyC:1783295702738",
+        "decision_candidate_id": null,
+        "join_key": "mint_pool:DzQkQx6ihazsfizQyimcvTqbfq5nsEdCzFzQdMEwpump:8qcg21NUcRofJH1DhYT6y2WQRRcrXqzobe7GFvKFeYyC",
+        "pool_id": "8qcg21NUcRofJH1DhYT6y2WQRRcrXqzobe7GFvKFeYyC"
+      },
+      {
+        "base_mint": "DtJrXZrY6w3rxtGVenRhNifwAfvVLH63hhU1iLxDnzRt",
+        "candidate_id": "DtJrXZrY6w3rxtGVenRhNifwAfvVLH63hhU1iLxDnzRt:AghSU465M39sY3cn1snCy6dxcmQub5nce5fRRv4zafBp:1783295706027",
+        "decision_candidate_id": null,
+        "join_key": "mint_pool:DtJrXZrY6w3rxtGVenRhNifwAfvVLH63hhU1iLxDnzRt:AghSU465M39sY3cn1snCy6dxcmQub5nce5fRRv4zafBp",
+        "pool_id": "AghSU465M39sY3cn1snCy6dxcmQub5nce5fRRv4zafBp"
+      },
+      {
+        "base_mint": "CQsicQXrbNxfPUEnMU5uCD7Rs1BaSBWv4q9poSQfpump",
+        "candidate_id": "CQsicQXrbNxfPUEnMU5uCD7Rs1BaSBWv4q9poSQfpump:2tvcicHnYXaQytmTeAF6NCauQrFGhFFvGQjXEKuWRNdH:1783295707251",
+        "decision_candidate_id": null,
+        "join_key": "mint_pool:CQsicQXrbNxfPUEnMU5uCD7Rs1BaSBWv4q9poSQfpump:2tvcicHnYXaQytmTeAF6NCauQrFGhFFvGQjXEKuWRNdH",
+        "pool_id": "2tvcicHnYXaQytmTeAF6NCauQrFGhFFvGQjXEKuWRNdH"
+      },
+      {
+        "base_mint": "67GTthkaha8DQVSTkJt5kb2oGkDMwnn1468RyJo8pump",
+        "candidate_id": "67GTthkaha8DQVSTkJt5kb2oGkDMwnn1468RyJo8pump:9qryVDHTfetzkKy2uWdT75ovHk17QpcDA59Pen7ANd9q:1783295720998",
+        "decision_candidate_id": null,
+        "join_key": "mint_pool:67GTthkaha8DQVSTkJt5kb2oGkDMwnn1468RyJo8pump:9qryVDHTfetzkKy2uWdT75ovHk17QpcDA59Pen7ANd9q",
+        "pool_id": "9qryVDHTfetzkKy2uWdT75ovHk17QpcDA59Pen7ANd9q"
+      },
+      {
+        "base_mint": "AjvAcdGiLgzBKJXjf7mH5d7ttPmZaG8QmHt7BrFppump",
+        "candidate_id": "AjvAcdGiLgzBKJXjf7mH5d7ttPmZaG8QmHt7BrFppump:56bPyfQPqWBZ6srT7cp6sdyQmxfUbjSjDFenxxWEPj6f:1783295725391",
+        "decision_candidate_id": null,
+        "join_key": "mint_pool:AjvAcdGiLgzBKJXjf7mH5d7ttPmZaG8QmHt7BrFppump:56bPyfQPqWBZ6srT7cp6sdyQmxfUbjSjDFenxxWEPj6f",
+        "pool_id": "56bPyfQPqWBZ6srT7cp6sdyQmxfUbjSjDFenxxWEPj6f"
+      },
+      {
+        "base_mint": "FSEkxsY6Cpnm1WvevoJqbUpGcRmtYQzijY7GEdQ8pump",
+        "candidate_id": "FSEkxsY6Cpnm1WvevoJqbUpGcRmtYQzijY7GEdQ8pump:BZDpFDwKXxpxGi6ecM8BojkcVY5ZY7mtPnpBVVbMx9rM:1783295718378",
+        "decision_candidate_id": null,
+        "join_key": "mint_pool:FSEkxsY6Cpnm1WvevoJqbUpGcRmtYQzijY7GEdQ8pump:BZDpFDwKXxpxGi6ecM8BojkcVY5ZY7mtPnpBVVbMx9rM",
+        "pool_id": "BZDpFDwKXxpxGi6ecM8BojkcVY5ZY7mtPnpBVVbMx9rM"
+      },
+      {
+        "base_mint": "B8uLbXR6dvvaCjYgnG7HXN5gmUiYcN4HEoAH65Hipump",
+        "candidate_id": "B8uLbXR6dvvaCjYgnG7HXN5gmUiYcN4HEoAH65Hipump:GqZkfHsYa175DFsqJ32FnffowdQWzgpjs5WpoFHsyBsJ:1783295727533",
+        "decision_candidate_id": null,
+        "join_key": "mint_pool:B8uLbXR6dvvaCjYgnG7HXN5gmUiYcN4HEoAH65Hipump:GqZkfHsYa175DFsqJ32FnffowdQWzgpjs5WpoFHsyBsJ",
+        "pool_id": "GqZkfHsYa175DFsqJ32FnffowdQWzgpjs5WpoFHsyBsJ"
+      },
+      {
+        "base_mint": "4PtbSbRiZ9CJCJKWyQsgc76rmSHEEC7ps9G57fXapump",
+        "candidate_id": "4PtbSbRiZ9CJCJKWyQsgc76rmSHEEC7ps9G57fXapump:3rdRm9REkaay8gYjkzJPMhVfjsi3t2QKdJjAKMkpVALc:1783295727359",
+        "decision_candidate_id": null,
+        "join_key": "mint_pool:4PtbSbRiZ9CJCJKWyQsgc76rmSHEEC7ps9G57fXapump:3rdRm9REkaay8gYjkzJPMhVfjsi3t2QKdJjAKMkpVALc",
+        "pool_id": "3rdRm9REkaay8gYjkzJPMhVfjsi3t2QKdJjAKMkpVALc"
+      },
+      {
+        "base_mint": "52xKfwigjJ9h9ivFVzwiJRSv4hk53WhAoxxfVoUMpump",
+        "candidate_id": "52xKfwigjJ9h9ivFVzwiJRSv4hk53WhAoxxfVoUMpump:HEVSm8hqxVT7bXSYEpU9yBZrzxZ94oGcui8bQLQPEUsN:1783295720401",
+        "decision_candidate_id": null,
+        "join_key": "mint_pool:52xKfwigjJ9h9ivFVzwiJRSv4hk53WhAoxxfVoUMpump:HEVSm8hqxVT7bXSYEpU9yBZrzxZ94oGcui8bQLQPEUsN",
+        "pool_id": "HEVSm8hqxVT7bXSYEpU9yBZrzxZ94oGcui8bQLQPEUsN"
+      },
+      {
+        "base_mint": "4fDjX41LL7DHddwdm9VzKk88nWUgN8aKzRARnWJzpump",
+        "candidate_id": "4fDjX41LL7DHddwdm9VzKk88nWUgN8aKzRARnWJzpump:HHJtMK6ohYorJHAchMxJMu6tygqLvPypwBddA5ec5QL3:1783295730228",
+        "decision_candidate_id": null,
+        "join_key": "mint_pool:4fDjX41LL7DHddwdm9VzKk88nWUgN8aKzRARnWJzpump:HHJtMK6ohYorJHAchMxJMu6tygqLvPypwBddA5ec5QL3",
+        "pool_id": "HHJtMK6ohYorJHAchMxJMu6tygqLvPypwBddA5ec5QL3"
+      },
+      {
+        "base_mint": "C6Crz9CXipFSQuT1R5HeUarvCnnvuJTSMAeWkxfJpump",
+        "candidate_id": "C6Crz9CXipFSQuT1R5HeUarvCnnvuJTSMAeWkxfJpump:6NxyQS1ivK7sHMRmCCUQJH1ZJwpiWyfvLQbnWbXdsjMD:1783295725782",
+        "decision_candidate_id": null,
+        "join_key": "mint_pool:C6Crz9CXipFSQuT1R5HeUarvCnnvuJTSMAeWkxfJpump:6NxyQS1ivK7sHMRmCCUQJH1ZJwpiWyfvLQbnWbXdsjMD",
+        "pool_id": "6NxyQS1ivK7sHMRmCCUQJH1ZJwpiWyfvLQbnWbXdsjMD"
+      },
+      {
+        "base_mint": "ETh2TLGUfDj4zZy5kXWVgHm3biXdCTqV4dZ5rk3zpump",
+        "candidate_id": "ETh2TLGUfDj4zZy5kXWVgHm3biXdCTqV4dZ5rk3zpump:7sGpCkXTQg5J198wTZhMQkz6fD1iu5stC6rjiYTgQK3B:1783295742813",
+        "decision_candidate_id": null,
+        "join_key": "mint_pool:ETh2TLGUfDj4zZy5kXWVgHm3biXdCTqV4dZ5rk3zpump:7sGpCkXTQg5J198wTZhMQkz6fD1iu5stC6rjiYTgQK3B",
+        "pool_id": "7sGpCkXTQg5J198wTZhMQkz6fD1iu5stC6rjiYTgQK3B"
+      },
+      {
+        "base_mint": "5DvV2Kvq9z8vWvzbsa2hmrtYdTcn6pwqMpqHMFMCpump",
+        "candidate_id": "5DvV2Kvq9z8vWvzbsa2hmrtYdTcn6pwqMpqHMFMCpump:9Sok7G3RfvpjS6s5qAtwjh78cJu1Q3CJeVrx4RHugTrM:1783295745965",
+        "decision_candidate_id": null,
+        "join_key": "mint_pool:5DvV2Kvq9z8vWvzbsa2hmrtYdTcn6pwqMpqHMFMCpump:9Sok7G3RfvpjS6s5qAtwjh78cJu1Q3CJeVrx4RHugTrM",
+        "pool_id": "9Sok7G3RfvpjS6s5qAtwjh78cJu1Q3CJeVrx4RHugTrM"
+      },
+      {
+        "base_mint": "FSyNv8MmGx6JnDSjzK4zJyFxQJrePowVyPJYjNRhpump",
+        "candidate_id": "FSyNv8MmGx6JnDSjzK4zJyFxQJrePowVyPJYjNRhpump:2NHH4EAFZwVc8RLi4UntiniWyFEKCBRbDkmoYUBBgah4:1783295747812",
+        "decision_candidate_id": null,
+        "join_key": "mint_pool:FSyNv8MmGx6JnDSjzK4zJyFxQJrePowVyPJYjNRhpump:2NHH4EAFZwVc8RLi4UntiniWyFEKCBRbDkmoYUBBgah4",
+        "pool_id": "2NHH4EAFZwVc8RLi4UntiniWyFEKCBRbDkmoYUBBgah4"
+      },
+      {
+        "base_mint": "6QNsZCrf1gGx4kX1yTNi69ftynM12eATHtwZZQuUqcVe",
+        "candidate_id": "6QNsZCrf1gGx4kX1yTNi69ftynM12eATHtwZZQuUqcVe:4jgqXidhkYasEmWzdw29nDQwJtRJBYbSnPhouVEtJ213:1783295748720",
+        "decision_candidate_id": null,
+        "join_key": "mint_pool:6QNsZCrf1gGx4kX1yTNi69ftynM12eATHtwZZQuUqcVe:4jgqXidhkYasEmWzdw29nDQwJtRJBYbSnPhouVEtJ213",
+        "pool_id": "4jgqXidhkYasEmWzdw29nDQwJtRJBYbSnPhouVEtJ213"
+      },
+      {
+        "base_mint": "CKnUTvCFAkzS8sMR6uiJbQvw2Tqwq8NYY1CUG1Ajpump",
+        "candidate_id": "CKnUTvCFAkzS8sMR6uiJbQvw2Tqwq8NYY1CUG1Ajpump:8SA6h3rkxkA4RNvtnK5X3ycweGngPu2E9mFT8Moj6YSy:1783295750123",
+        "decision_candidate_id": null,
+        "join_key": "mint_pool:CKnUTvCFAkzS8sMR6uiJbQvw2Tqwq8NYY1CUG1Ajpump:8SA6h3rkxkA4RNvtnK5X3ycweGngPu2E9mFT8Moj6YSy",
+        "pool_id": "8SA6h3rkxkA4RNvtnK5X3ycweGngPu2E9mFT8Moj6YSy"
+      },
+      {
+        "base_mint": "9gsaJedgMs8eq6C2Qo4N56s8pKT7QYquBZoigX24pump",
+        "candidate_id": "9gsaJedgMs8eq6C2Qo4N56s8pKT7QYquBZoigX24pump:3vexr9MtGzB6p3SXNipGXeA1es7kzKETdkuAgVR7mSaL:1783295750771",
+        "decision_candidate_id": null,
+        "join_key": "mint_pool:9gsaJedgMs8eq6C2Qo4N56s8pKT7QYquBZoigX24pump:3vexr9MtGzB6p3SXNipGXeA1es7kzKETdkuAgVR7mSaL",
+        "pool_id": "3vexr9MtGzB6p3SXNipGXeA1es7kzKETdkuAgVR7mSaL"
+      },
+      {
+        "base_mint": "EMZCenCv2bgkTVwC9zZXouPDGWLuiaeXNfR4JteCpump",
+        "candidate_id": "EMZCenCv2bgkTVwC9zZXouPDGWLuiaeXNfR4JteCpump:9D1cHwZNkvR8SQHBWvGcs6CjZcbmgU8H5tB121Jypgie:1783295750775",
+        "decision_candidate_id": null,
+        "join_key": "mint_pool:EMZCenCv2bgkTVwC9zZXouPDGWLuiaeXNfR4JteCpump:9D1cHwZNkvR8SQHBWvGcs6CjZcbmgU8H5tB121Jypgie",
+        "pool_id": "9D1cHwZNkvR8SQHBWvGcs6CjZcbmgU8H5tB121Jypgie"
+      }
+    ],
+    "decision_context_rows_ambiguous": 0,
+    "decision_context_rows_joined": 4535,
+    "decision_load": {
+      "rows_loaded": 4535,
+      "rows_read": 4535,
+      "skipped_counts": {}
+    },
+    "decision_logs_created_denominator_rows": 0,
+    "decision_only_rows_skipped": 0,
+    "denominator_invariant_status": "PASS",
+    "denominator_source": "event_artifact_only",
+    "duplicates": 4535,
+    "event_denominator_rows_after_dedupe": 2272,
+    "event_load": {
+      "rows_loaded": 2272,
+      "rows_read": 237569,
+      "skipped_counts": {
+        "non_birth_create_event": 235297
+      }
+    },
+    "fail_reasons": [],
+    "identity_collisions": [],
+    "input_decision_paths": [
+      "logs/rollout/shadow-v2-l2-f-collection-20260705-r16/decisions/shadow-v2-l2-f-collection-20260705-r16/v2.2/legacy_live/6908b0214a021b9c9f72025b08431585ae410c147cb2d06b9b89fd67b6de3356/gatekeeper_v2_decisions.jsonl",
+      "logs/rollout/shadow-v2-l2-f-collection-20260705-r16/decisions/shadow-v2-l2-f-collection-20260705-r16/v2.5/v25_shadow/6908b0214a021b9c9f72025b08431585ae410c147cb2d06b9b89fd67b6de3356/gatekeeper_v2_decisions.jsonl"
+    ],
+    "input_event_paths": [
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260705_235500_0000.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_000001_0001.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_000511_0002.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_001017_0003.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_001519_0004.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_002024_0005.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_002532_0006.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_003035_0007.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_003541_0008.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_004048_0009.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_004552_0010.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_005055_0011.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_005600_0012.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_010108_0013.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_010610_0014.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_011113_0015.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_011619_0016.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_012121_0017.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_012631_0018.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_013134_0019.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_013636_0020.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_014138_0021.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_014642_0022.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_015146_0023.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260705_235500_0000.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_000000_0001.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_000501_0002.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_001002_0003.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_001503_0004.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_002003_0005.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_002504_0006.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_003004_0007.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_003505_0008.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_004006_0009.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_004506_0010.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_005006_0011.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_005506_0012.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_010007_0013.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_010507_0014.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_011008_0015.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_011508_0016.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_012009_0017.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_012509_0018.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_013010_0019.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_013510_0020.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_014011_0021.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_014512_0022.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_015012_0023.jsonl",
+      "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_015512_0024.jsonl"
+    ],
+    "quote_mint_counts": {
+      "So11111111111111111111111111111111111111112": 2272
+    },
+    "r2_ssot_contract": {
+      "canonical_sources": [
+        "Yellowstone/Geyser AccountUpdates",
+        "DIAG_ACCOUNT_UPDATE_RELAY",
+        "canonical account-state snapshots"
+      ],
+      "rpc_policy": "rpc_is_backfill_or_enrichment_only_with_provenance_flag"
+    },
+    "rows_loaded_for_merge": 6807,
+    "rows_written": 2272,
+    "scope_kind": "full",
+    "selector_schema_version": 1,
+    "status": "ok",
+    "status_counts": {
+      "ok": 2272
+    },
+    "universe_contract": {
+      "birth_create_event_filter": [
+        "bonding_curve_birth",
+        "bondingcurvebirth",
+        "create_pool",
+        "createpool",
+        "new_pool_detected",
+        "newpooldetected",
+        "pool_birth",
+        "pool_created",
+        "poolbirth",
+        "poolcreated",
+        "pump_fun_create",
+        "pumpfun_create",
+        "pumpfuncreate"
+      ],
+      "cohort": "SOL-paired pump.fun bonding-curve birth/create events",
+      "decision_logs": "context_only_not_denominator_by_default",
+      "missing_birth_quote_or_timestamp": "universe_incomplete_fail_closed"
+    },
+    "window_end_ts_ms": null,
+    "window_filter": {
+      "decision_context_timestamp": "decision_ts_ms",
+      "event_artifact_timestamp": "birth_ts_ms",
+      "missing_timestamp": "skipped_not_denominator"
+    },
+    "window_start_ts_ms": null
+  },
+  "candidate_universe_path": "reports/selector/shadow-v2-l2-f-collection-20260705-r16/candidate_universe_v1.jsonl",
+  "decision_jsonl_paths": [
+    "logs/rollout/shadow-v2-l2-f-collection-20260705-r16/decisions/shadow-v2-l2-f-collection-20260705-r16/v2.2/legacy_live/6908b0214a021b9c9f72025b08431585ae410c147cb2d06b9b89fd67b6de3356/gatekeeper_v2_decisions.jsonl",
+    "logs/rollout/shadow-v2-l2-f-collection-20260705-r16/decisions/shadow-v2-l2-f-collection-20260705-r16/v2.5/v25_shadow/6908b0214a021b9c9f72025b08431585ae410c147cb2d06b9b89fd67b6de3356/gatekeeper_v2_decisions.jsonl"
+  ],
+  "decision_root_scope": [
+    "logs/rollout/shadow-v2-l2-f-collection-20260705-r16/decisions"
+  ],
+  "denominator_contract": {
+    "candidate_ids_from_decision_only_required": 0,
+    "candidate_universe_source": "event_level_candidate_observations_only",
+    "decision_logs": "context_only_not_denominator",
+    "decision_logs_created_denominator_rows_required": 0
+  },
+  "event_source_paths": [
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260705_235500_0000.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_000001_0001.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_000511_0002.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_001017_0003.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_001519_0004.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_002024_0005.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_002532_0006.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_003035_0007.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_003541_0008.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_004048_0009.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_004552_0010.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_005055_0011.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_005600_0012.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_010108_0013.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_010610_0014.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_011113_0015.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_011619_0016.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_012121_0017.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_012631_0018.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_013134_0019.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_013636_0020.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_014138_0021.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_014642_0022.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700144_20260706_015146_0023.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260705_235500_0000.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_000000_0001.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_000501_0002.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_001002_0003.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_001503_0004.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_002003_0005.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_002504_0006.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_003004_0007.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_003505_0008.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_004006_0009.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_004506_0010.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_005006_0011.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_005506_0012.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_010007_0013.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_010507_0014.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_011008_0015.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_011508_0016.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_012009_0017.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_012509_0018.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_013010_0019.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_013510_0020.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_014011_0021.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_014512_0022.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_015012_0023.jsonl",
+    "datasets/events/shadow-v2-l2-f-collection-20260705-r16/exec_launcher-1783295700184_20260706_015512_0024.jsonl"
+  ],
+  "final_verdict": "CANDIDATE_UNIVERSE_DENOMINATOR_READY_FOR_L2_E",
+  "l2_e_audit": {
+    "approval_flags": {
+      "active_close": false,
+      "live_equivalence": false,
+      "research_grade": false,
+      "runtime_approval": false,
+      "shadow_close_only": false,
+      "strategy_research_unblocked": false
+    },
+    "artifact": "shadow_v2_l2_e_gatekeeper_coverage_denominator_audit",
+    "candidate_manifest_decision_logs_created_denominator_rows": 0,
+    "candidate_manifest_denominator_invariant_status": "PASS",
+    "candidate_manifest_path": "reports/selector/shadow-v2-l2-f-collection-20260705-r16/candidate_universe_manifest_v1.json",
+    "candidate_manifest_status": "ok",
+    "candidate_universe_count": 2272,
+    "candidate_universe_path": "reports/selector/shadow-v2-l2-f-collection-20260705-r16/candidate_universe_v1.jsonl",
+    "candidate_universe_status_counts": {
+      "ok": 2272
+    },
+    "checkpoint_reach_count": 2268,
+    "checkpoint_reach_definition": "unique eligible candidate_id with a joined gatekeeper_v2_decisions row",
+    "complete_executable_roundtrip_positions": 295,
+    "denominator_contract_failures": [],
+    "eligible_denominator_count": 2272,
+    "entry_research_candidate_count": 315,
+    "exit_research_candidate_count": 302,
+    "final_verdict": "GATEKEEPER_DENOMINATOR_COVERAGE_KNOWN",
+    "gatekeeper_buy_count": 2041,
+    "gatekeeper_decision_bucket_counts": {
+      "BUY": 2041,
+      "REJECT_CORE_FAIL": 30,
+      "REJECT_HARD_FAIL": 127,
+      "REJECT_IWIM_LOW_CONF": 26,
+      "REJECT_IWIM_UNKNOWN_STRICT": 13,
+      "REJECT_OTHER": 9,
+      "REJECT_PDD_RAMPING": 23,
+      "REJECT_PDD_WHALE": 92,
+      "TIMEOUT_PHASE1_INSUFFICIENT": 1350,
+      "TIMEOUT_PHASE1_NO_DATA": 824
+    },
+    "gatekeeper_decision_count": 4535,
+    "gatekeeper_decision_joined_to_candidate_count": 4535,
+    "gatekeeper_decision_path_count": 2,
+    "gatekeeper_decision_paths": [
+      "logs/rollout/shadow-v2-l2-f-collection-20260705-r16/decisions/shadow-v2-l2-f-collection-20260705-r16/v2.2/legacy_live/6908b0214a021b9c9f72025b08431585ae410c147cb2d06b9b89fd67b6de3356/gatekeeper_v2_decisions.jsonl",
+      "logs/rollout/shadow-v2-l2-f-collection-20260705-r16/decisions/shadow-v2-l2-f-collection-20260705-r16/v2.5/v25_shadow/6908b0214a021b9c9f72025b08431585ae410c147cb2d06b9b89fd67b6de3356/gatekeeper_v2_decisions.jsonl"
+    ],
+    "gatekeeper_decision_unmatched_count": 0,
+    "gatekeeper_join_method_counts": {
+      "base_mint_pool_id": 4535
+    },
+    "gatekeeper_reject_count": 320,
+    "gatekeeper_reject_reason_top_n": [
+      {
+        "count": 1350,
+        "reason": "TIMEOUT_PHASE1_INSUFFICIENT"
+      },
+      {
+        "count": 824,
+        "reason": "TIMEOUT_PHASE1_NO_DATA"
+      },
+      {
+        "count": 127,
+        "reason": "HARD_FAIL_EXTREME_TOP3"
+      },
+      {
+        "count": 92,
+        "reason": "REJECT_PDD_WHALE"
+      },
+      {
+        "count": 30,
+        "reason": "REJECT_CORE_FAIL"
+      },
+      {
+        "count": 26,
+        "reason": "REJECT_IWIM_LOW_CONF"
+      },
+      {
+        "count": 23,
+        "reason": "REJECT_PDD_RAMPING"
+      },
+      {
+        "count": 13,
+        "reason": "REJECT_IWIM_UNKNOWN_STRICT"
+      },
+      {
+        "count": 9,
+        "reason": "REJECT_INSUFFICIENT_CONFIDENCE"
+      }
+    ],
+    "gatekeeper_timeout_count": 2174,
+    "non_goals": [
+      "no_threshold_tuning",
+      "no_gatekeeper_policy_change",
+      "no_buy_reject_change",
+      "no_selector_runtime_change",
+      "no_tx_jito_live_path_change",
+      "no_l2_research_grade_grant"
+    ],
+    "recommended_next_stage": "L2-F_DEDICATED_RESEARCH_VALIDATION_RUN_AFTER_L2_D_PASS",
+    "research_candidate_roundtrip_count": 295,
+    "runtime_decision_behavior_changes": false,
+    "runtime_evidence_schema_changes": false,
+    "schema_version": 1,
+    "summary_csv_paths": [
+      "reports/selector/shadow_v2_l2_f_research_validation_summary.csv"
+    ],
+    "threshold_starvation_verdict": "NO_GATEKEEPER_THRESHOLD_STARVATION_OBSERVED",
+    "unknown_reason_count": 0,
+    "unknown_reason_samples": []
+  },
+  "non_goals": [
+    "no_threshold_tuning",
+    "no_gatekeeper_policy_change",
+    "no_buy_reject_change",
+    "no_selector_runtime_change",
+    "no_tx_jito_live_path_change",
+    "no_l2_f_research_validation_run",
+    "no_l2_research_grade_grant"
+  ],
+  "recommended_next_stage": "return_to_L2_E_gate_then_L2_F_only_after_temporal_density_and_research_gates",
+  "schema_version": 1,
+  "summary_csv_path": "reports/selector/shadow-v2-l2-f-collection-20260705-r16/candidate_universe_denominator_summary.csv"
+}

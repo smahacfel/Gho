@@ -1,0 +1,41 @@
+metric,value,notes
+final_verdict,L2_RESEARCH_GRADE_CANDIDATE_OFFLINE_ONLY,maximum positive verdict remains offline-only
+run_id,shadow-v2-l2-f-collection-20260705-r16,
+expected_main,5e6d839984cf38ecb65a0540b0adfabfcead9f23,
+dedicated_l2_f_scope_present,True,
+validation_run_executed,True,
+complete_executable_roundtrip_positions,769,
+complete_executable_roundtrip_required,500,
+research_candidate_roundtrip_count,769,
+entry_execution_label_grade_RESEARCH_CANDIDATE_count,811,
+exit_execution_label_grade_RESEARCH_CANDIDATE_count,784,
+sample_size_gate,PASS,
+temporal_audit_verdict,PASS_TEMPORAL_NO_LOOKAHEAD_AUDIT,
+density_retention_verdict,BLOCKED_PATH_SAMPLE_COVERAGE_INSUFFICIENT,
+position_level_density_retention_verdict,PASS_L2_F_POSITION_LEVEL_DENSITY_RETENTION,L2-F positive claims use only evidence-complete roundtrip positions
+l2_research_evidence_complete_roundtrip_positions,750,"roundtrips with entry/exit research candidate, terminal executable truth, and all declared density horizons pass"
+density_excluded_roundtrip_positions,19,typed sparse/retention/missing density blockers excluded from positive L2 claim
+density_sparse_approx_only_position_count,17,
+density_retention_gap_position_count,2,
+density_missing_declared_horizon_position_count,0,
+density_evidence_complete_position_scope_path,reports/selector/shadow-v2-l2-f-collection-20260705-r16/l2_f_evidence_complete_position_scope_v1.jsonl,
+gatekeeper_denominator_verdict,GATEKEEPER_DENOMINATOR_COVERAGE_KNOWN,
+threshold_starvation_verdict,NO_GATEKEEPER_THRESHOLD_STARVATION_OBSERVED,
+unknown_reason_count,0,
+malformed_rows,0,
+unknown_untyped_blockers,0,
+manifest_status,PASS,
+replay_lifecycle_verdict,PASS_REPLAY_LIFECYCLE_RECONCILED,
+account_data_hash_coverage_verdict,PASS_ACCOUNT_DATA_HASH_COVERAGE,
+fake_handoff_signature_count,0,
+event_seq_chain_order_substitute_count,0,
+terminal_truth_not_derived_count,0,
+declared_supported_horizons_ms,"[2000,3000,10000,30000,120000]",
+unsupported_horizons_ms,"[300000,500000]",not accepted for positive L2 baseline claims
+l2_f_positive_verdict_allowed,True,
+runtime_approval,False,not granted
+research_grade,False,not granted
+live_equivalence,False,not granted
+strategy_research_unblocked,False,not granted
+shadow_close_only,False,not enabled
+active_close,False,not enabled

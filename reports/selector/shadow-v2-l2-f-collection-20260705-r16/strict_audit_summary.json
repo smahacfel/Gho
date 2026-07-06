@@ -1,0 +1,145 @@
+{
+  "account_data_hash_coverage": {
+    "missing_account_data_hash_count": 0,
+    "observed_account_state_boundary_samples": 81883,
+    "samples_with_account_data_hash": 81883,
+    "verdict": "PASS_ACCOUNT_DATA_HASH_COVERAGE"
+  },
+  "approval_flags": {
+    "active_close": false,
+    "live_equivalence": false,
+    "research_grade": false,
+    "runtime_approval": false,
+    "shadow_close_only": false,
+    "strategy_research_unblocked": false
+  },
+  "artifact": "shadow_v2_l2_f_research_validation_run",
+  "blockers": [],
+  "buy_reject_logic_changes": false,
+  "declared_supported_horizons_ms": [
+    2000,
+    3000,
+    10000,
+    30000,
+    120000
+  ],
+  "dedicated_l2_f_scope_present": true,
+  "density_audit": {
+    "declared_horizon_missing_count": 0,
+    "declared_horizon_path_coverage_blocker_count": 5,
+    "declared_horizon_present_count": 5,
+    "declared_horizon_retention_blocker_count": 0,
+    "l2_f_allowed_next": false,
+    "verdict": "BLOCKED_PATH_SAMPLE_COVERAGE_INSUFFICIENT"
+  },
+  "expected_main": "5e6d839984cf38ecb65a0540b0adfabfcead9f23",
+  "final_verdict": "L2_RESEARCH_GRADE_CANDIDATE_OFFLINE_ONLY",
+  "gatekeeper_denominator": {
+    "candidate_universe_count": 2272,
+    "checkpoint_reach_count": 2268,
+    "decision_paths": [
+      "logs/rollout/shadow-v2-l2-f-collection-20260705-r16/decisions/shadow-v2-l2-f-collection-20260705-r16/v2.2/legacy_live/6908b0214a021b9c9f72025b08431585ae410c147cb2d06b9b89fd67b6de3356/gatekeeper_v2_decisions.jsonl",
+      "logs/rollout/shadow-v2-l2-f-collection-20260705-r16/decisions/shadow-v2-l2-f-collection-20260705-r16/v2.5/v25_shadow/6908b0214a021b9c9f72025b08431585ae410c147cb2d06b9b89fd67b6de3356/gatekeeper_v2_decisions.jsonl"
+    ],
+    "denominator_contract_failures": [],
+    "eligible_denominator_count": 2272,
+    "gatekeeper_buy_count": 2041,
+    "gatekeeper_decision_count": 4535,
+    "gatekeeper_decision_joined_to_candidate_count": 4535,
+    "gatekeeper_decision_unmatched_count": 0,
+    "gatekeeper_reject_count": 320,
+    "gatekeeper_timeout_count": 2174,
+    "threshold_starvation_verdict": "NO_GATEKEEPER_THRESHOLD_STARVATION_OBSERVED",
+    "unknown_reason_count": 0,
+    "verdict": "GATEKEEPER_DENOMINATOR_COVERAGE_KNOWN"
+  },
+  "gatekeeper_policy_changes": false,
+  "malformed_rows": 0,
+  "manifest_audit": {
+    "blockers": [],
+    "status": "PASS"
+  },
+  "missing_scope_files": [],
+  "output_root": "reports/selector/shadow-v2-l2-f-collection-20260705-r16",
+  "position_level_density_gate": {
+    "declared_supported_horizons_ms": [
+      2000,
+      3000,
+      10000,
+      30000,
+      120000
+    ],
+    "density_excluded_roundtrip_positions": 19,
+    "density_rows_excluded_outside_research_roundtrip_scope": 75275,
+    "density_rows_input": 1186315,
+    "density_rows_research_roundtrip_scope": 1111033,
+    "evidence_complete_position_scope_path": "reports/selector/shadow-v2-l2-f-collection-20260705-r16/l2_f_evidence_complete_position_scope_v1.jsonl",
+    "excluded_validation_smoke_density_rows": 7,
+    "horizon_blocker_counts": {
+      "10000:RETENTION_GAP": 2,
+      "120000:RETENTION_GAP": 2,
+      "120000:SPARSE_APPROX_ONLY": 17,
+      "2000:RETENTION_GAP": 2,
+      "30000:RETENTION_GAP": 2,
+      "30000:SPARSE_APPROX_ONLY": 5,
+      "3000:RETENTION_GAP": 2
+    },
+    "l2_research_evidence_complete_roundtrip_positions": 750,
+    "latest_declared_density_snapshots_in_scope": 3845,
+    "malformed_density_rows": 0,
+    "missing_declared_horizon_position_count": 0,
+    "non_evaluable_positions_excluded_from_positive_claim": true,
+    "path_sample_coverage_gap_position_count": 0,
+    "positive_l2_claim_position_scope": "research_candidate_roundtrips_with_all_declared_density_retention_gates",
+    "required_replay_horizon_ms": 121000,
+    "required_roundtrips": 500,
+    "research_candidate_roundtrip_count": 769,
+    "retention_gap_position_count": 2,
+    "sparse_approx_only_position_count": 17,
+    "undeclared_horizon_rows_in_research_scope": 317438,
+    "unknown_horizon_rows": 0,
+    "unknown_or_untyped_density_verdict_position_count": 0,
+    "verdict": "PASS_L2_F_POSITION_LEVEL_DENSITY_RETENTION"
+  },
+  "positive_claims_from_undeclared_horizons_allowed": false,
+  "precondition_density_stage": {
+    "accepted_as_l2_f_research_sample": false,
+    "density_audit_verdict": "L2_D3B_RUNTIME_HARNESS_DENSITY_EMISSION_READY_FOR_L2_F",
+    "l2_f_allowed_next": true,
+    "runtime_harness_density_emission_proof": true,
+    "summary_csv": "reports/selector/shadow_v2_l2_d3b_runtime_harness_density_emission_summary.csv"
+  },
+  "provider_stream_changes": false,
+  "replay_lifecycle_audit": {
+    "verdict": "PASS_REPLAY_LIFECYCLE_RECONCILED"
+  },
+  "run_id": "shadow-v2-l2-f-collection-20260705-r16",
+  "runtime_decision_behavior_changes": false,
+  "sample_gates": {
+    "complete_executable_roundtrip_positions": 769,
+    "entry_execution_label_grade_RESEARCH_CANDIDATE_count": 811,
+    "exit_execution_label_grade_RESEARCH_CANDIDATE_count": 784,
+    "malformed_canonical_rows": 0,
+    "research_candidate_roundtrip_count": 769,
+    "source": "dedicated_scope_canonical_stream",
+    "status": "PASS"
+  },
+  "schema": "shadow_v2_l2_f_research_validation_summary_v1",
+  "schema_version": 1,
+  "scope_root": "reports/selector/shadow-v2-l2-f-collection-20260705-r16",
+  "selector_runtime_changes": false,
+  "temporal_audit": {
+    "event_seq_chain_order_substitute_count": 0,
+    "fake_handoff_signature_count": 0,
+    "terminal_truth_not_derived_count": 0,
+    "verdict": "PASS_TEMPORAL_NO_LOOKAHEAD_AUDIT"
+  },
+  "threshold_changes": false,
+  "tx_jito_live_path_changes": false,
+  "unknown_untyped_blockers": 0,
+  "unsupported_horizons_ms": [
+    300000,
+    500000
+  ],
+  "validation_run_executed": true
+}

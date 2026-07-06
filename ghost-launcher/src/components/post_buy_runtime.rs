@@ -43,8 +43,9 @@ use ghost_brain::guardian::post_buy::engine::{PositionEventContext, PositionJoin
 use ghost_brain::guardian::post_buy::shadow_v2::{
     ClockDomain, ClockedTimestamp, EventOrderComponent, EventOrderKey, MeasurementGrade,
     PoolStateSampleV2, ShadowEntryAttemptV2, ShadowEntryFillModelConfig, ShadowEntryFillV2,
-    ShadowPositionV2, ShadowV2Envelope, ShadowV2Record, ShadowV2ValidationEvidenceStatus,
-    ShadowV2ValidationHarness, ShadowV2ValidationHarnessConfig, SimulationLevel, TemporalClass,
+    ShadowPathSampleV2, ShadowPathSamplingModeV2, ShadowPathSamplingReasonV2, ShadowPositionV2,
+    ShadowV2Envelope, ShadowV2Record, ShadowV2ValidationEvidenceStatus, ShadowV2ValidationHarness,
+    ShadowV2ValidationHarnessConfig, SimulationLevel, TemporalClass,
     SHADOW_V2_ENTRY_FILL_MODEL_VERSION,
 };
 use ghost_brain::guardian::post_buy::{
@@ -54,7 +55,7 @@ use ghost_brain::guardian::post_buy::{
 use ghost_brain::quotes::{ExecutableQuoteProvider, QuoteProviderConfig};
 use ghost_core::account_state_core::reducer::AccountStateReducer;
 use ghost_core::shadow_ledger::ShadowLedger;
-use ghost_core::LAMPORTS_PER_SOL;
+use ghost_core::{ShadowV2PoolPhase, LAMPORTS_PER_SOL};
 use parking_lot::Mutex as ParkingMutex;
 use seer::parse_curve_from_account;
 use solana_client::client_error::ClientError;
@@ -3316,7 +3317,7 @@ fn maybe_emit_shadow_v2_entry_evidence_with_pool_state(
 
     let mut fill_envelope = ShadowV2Envelope::contract_header(
         "shadow_entry_fill_v2",
-        run_id,
+        run_id.clone(),
         position_id.to_string(),
         format!("shadow_v2_entry_fill:{position_id}:{entry_ts_ms}"),
         pool_amm_id.to_string(),
@@ -3412,7 +3413,55 @@ fn maybe_emit_shadow_v2_entry_evidence_with_pool_state(
     let mut harness = harness.lock();
     let mut records = vec![ShadowV2Record::ShadowEntryAttemptV2(attempt)];
     if let Some(pool_state_before) = entry_pool_state_before {
+        let mut path_envelope = ShadowV2Envelope::contract_header(
+            "shadow_path_sample_v2",
+            run_id.clone(),
+            position_id.to_string(),
+            format!("shadow_v2_entry_path_sample:{position_id}:{entry_ts_ms}:age0"),
+            pool_amm_id.to_string(),
+            base_mint.to_string(),
+        );
+        path_envelope.session_id = join_metadata
+            .session_id
+            .clone()
+            .or_else(|| Some("UNKNOWN_SESSION".to_string()));
+        path_envelope.candidate_id = Some(candidate_id.to_string());
+        path_envelope.parent_event_id = Some(pool_state_before.envelope.event_id.clone());
+        path_envelope.produced_at_ms = entry_ts_ms;
+        path_envelope.produced_at_slot = entry_slot;
+        path_envelope
+            .source_refs
+            .push("post_buy_runtime:entry_boundary_path_sample".to_string());
+        path_envelope.source_refs.push(format!(
+            "pool_state_sample_v2:{}",
+            pool_state_before.envelope.event_id
+        ));
+        path_envelope
+            .limitations
+            .push("ENTRY_PATH_SAMPLE_FROM_ENTRY_BOUNDARY_POOL_STATE".to_string());
+        path_envelope
+            .limitations
+            .push("SHADOW_V2_RECORD_NOT_CONSUMED_BY_DECISIONS".to_string());
+
+        let path_sample = ShadowPathSampleV2::from_pool_state_mark(
+            path_envelope,
+            pool_state_before.event_order_key.clone(),
+            ClockedTimestamp {
+                field_name: "sample_ts_ms".to_string(),
+                value: Some(entry_ts_ms as i64),
+                clock_domain: ClockDomain::StreamObservedMs,
+                clock_source: "post_buy_runtime.entry_boundary_pool_state".to_string(),
+                causal_boundary: "POST_ENTRY_BOUNDARY_PATH_SAMPLE".to_string(),
+            },
+            0,
+            &pool_state_before,
+            ShadowV2PoolPhase::BondingCurve,
+            entry_price,
+            ShadowPathSamplingModeV2::Standard120s,
+            ShadowPathSamplingReasonV2::EventSample,
+        );
         records.push(ShadowV2Record::PoolStateSampleV2(pool_state_before));
+        records.push(ShadowV2Record::ShadowPathSampleV2(path_sample));
     }
     records.push(ShadowV2Record::ShadowEntryFillV2(fill));
 
@@ -5243,11 +5292,15 @@ sys.exit(0)
             is_complete: false,
             last_update_slot: 430_000_010,
             last_update_ts_ms: entry_ts_ms,
-            source_write_version: None,
-            source_account_pubkey: None,
-            source_account_owner_or_program: None,
-            account_data_len: None,
-            account_data_hash: None,
+            source_write_version: Some(11),
+            source_account_pubkey: Some(Pubkey::new_unique()),
+            source_account_owner_or_program: Some(Pubkey::new_unique()),
+            account_data_len: Some(b"entry-pool-state-test".len() as u64),
+            account_data_hash: Some(
+                ghost_brain::guardian::post_buy::shadow_v2::account_data_hash_blake3(
+                    b"entry-pool-state-test",
+                ),
+            ),
             curve_finality: CurveFinality::Provisional,
             state_phase: StatePhase::Canonical,
             update_count: 3,
@@ -5301,33 +5354,51 @@ sys.exit(0)
             .lines()
             .map(|line| serde_json::from_str(line).expect("canonical row"))
             .collect();
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), 4);
         assert_eq!(rows[0]["event_kind"], "ENTRY_ATTEMPT");
         assert_eq!(rows[1]["event_kind"], "POOL_STATE_SAMPLE");
-        assert_eq!(rows[2]["event_kind"], "ENTRY_FILL");
+        assert_eq!(rows[2]["event_kind"], "PATH_SAMPLE");
+        assert_eq!(rows[3]["event_kind"], "ENTRY_FILL");
+        assert_eq!(rows[2]["payload"]["record"]["age_ms"], 0);
         assert_eq!(
-            rows[2]["payload"]["record"]["pool_state_before"].as_str(),
+            rows[2]["payload"]["record"]["pool_state_ref"].as_str(),
             Some(pool_state_event_id.as_str())
         );
-        assert_eq!(rows[2]["payload"]["record"]["fill_status"], "FILLED");
         assert_eq!(
-            rows[2]["payload"]["record"]["execution_simulation_ready"],
+            rows[2]["payload"]["record"]["sampling_reason"].as_str(),
+            Some("EVENT_SAMPLE")
+        );
+        let path_limitations = rows[2]["payload"]["record"]["envelope"]["limitations"]
+            .as_array()
+            .expect("path limitations");
+        assert!(path_limitations
+            .iter()
+            .any(|value| value == "ENTRY_PATH_SAMPLE_FROM_ENTRY_BOUNDARY_POOL_STATE"));
+        assert_eq!(
+            rows[3]["payload"]["record"]["pool_state_before"].as_str(),
+            Some(pool_state_event_id.as_str())
+        );
+        assert_eq!(rows[3]["payload"]["record"]["fill_status"], "FILLED");
+        assert_eq!(
+            rows[3]["payload"]["record"]["execution_simulation_ready"],
             true
         );
         assert_eq!(
-            rows[2]["payload"]["record"]["execution_label_grade"],
-            "DIAGNOSTIC_SIM"
+            rows[3]["payload"]["record"]["execution_label_grade"],
+            "RESEARCH_CANDIDATE"
         );
-        assert!(rows[2]["payload"]["record"]["fill_price"].is_number());
-        assert!(rows[2]["payload"]["record"]["pool_state_after"]
+        assert_eq!(
+            rows[3]["payload"]["record"]["research_provenance_ready"],
+            true
+        );
+        assert!(rows[3]["payload"]["record"]["fill_price"].is_number());
+        assert!(rows[3]["payload"]["record"]["pool_state_after"]
             .as_str()
             .is_some());
-        let provenance_blockers = rows[2]["payload"]["record"]["provenance_blockers"]
-            .as_array()
-            .expect("provenance blockers");
-        assert!(provenance_blockers
-            .iter()
-            .any(|value| value == "BLOCKED_ORDERING_AMBIGUITY"));
+        assert!(rows[3]["payload"]["record"]
+            .get("provenance_blockers")
+            .and_then(|value| value.as_array())
+            .map_or(true, |blockers| blockers.is_empty()));
     }
 
     #[test]
@@ -5428,21 +5499,38 @@ sys.exit(0)
             .lines()
             .map(|line| serde_json::from_str(line).expect("canonical row"))
             .collect();
-        assert_eq!(rows.len(), 3);
-        assert_eq!(rows[1]["event_kind"], "POOL_STATE_SAMPLE");
-        assert_eq!(rows[2]["event_kind"], "ENTRY_FILL");
+        assert_eq!(rows.len(), 4);
+        let pool_state = rows
+            .iter()
+            .find(|row| row["event_kind"] == "POOL_STATE_SAMPLE")
+            .expect("pool state sample");
+        let path_sample = rows
+            .iter()
+            .find(|row| row["event_kind"] == "PATH_SAMPLE")
+            .expect("entry path sample");
+        let fill = rows
+            .iter()
+            .find(|row| row["event_kind"] == "ENTRY_FILL")
+            .expect("entry fill");
         assert_eq!(
-            rows[1]["payload"]["record"]["event_order_key"]["signature"],
+            pool_state["payload"]["record"]["event_order_key"]["signature"],
             "UNKNOWN"
         );
-        assert_eq!(rows[1]["payload"]["record"]["event_signature"], "UNKNOWN");
-        let pool_state_limitations = rows[1]["envelope"]["limitations"]
+        assert_eq!(
+            pool_state["payload"]["record"]["event_signature"],
+            "UNKNOWN"
+        );
+        assert_eq!(
+            path_sample["payload"]["record"]["pool_state_ref"],
+            pool_state["envelope"]["event_id"]
+        );
+        let pool_state_limitations = pool_state["envelope"]["limitations"]
             .as_array()
             .expect("pool state limitations");
         assert!(pool_state_limitations
             .iter()
             .any(|value| value == "ENTRY_BOUNDARY_SOURCE_SIGNATURE_UNAVAILABLE"));
-        let fill = &rows[2]["payload"]["record"];
+        let fill = &fill["payload"]["record"];
         assert_eq!(fill["fill_status"], "FILLED");
         assert_eq!(fill["execution_simulation_ready"], true);
         assert_eq!(fill["execution_label_grade"], "DIAGNOSTIC_SIM");
@@ -5526,7 +5614,10 @@ sys.exit(0)
             pool_state["payload"]["record"]["event_signature"],
             "entry-boundary-source-signature"
         );
-        assert_eq!(pool_state["payload"]["record"]["event_index"], -1);
+        assert_eq!(
+            pool_state["payload"]["record"]["event_index"].as_u64(),
+            Some(u32::MAX as u64)
+        );
 
         let entry_attempt = rows
             .iter()
@@ -5778,7 +5869,7 @@ sys.exit(0)
     }
 
     #[test]
-    fn shadow_v2_postbuy_entry_boundary_preserves_same_slot_ordering_blocker() {
+    fn shadow_v2_postbuy_entry_boundary_preserves_same_slot_ordering_provenance_blocker() {
         let tmp = tempfile::tempdir().expect("temp dir");
         let burnin = shadow_v2_burnin_config_for_temp_scope(tmp.path());
         let runtime_config = PostBuyRuntimeConfig {
@@ -5823,19 +5914,46 @@ sys.exit(0)
             .lines()
             .map(|line| serde_json::from_str(line).expect("canonical row"))
             .collect();
-        assert_eq!(rows.len(), 3);
-        assert_eq!(rows[1]["event_kind"], "POOL_STATE_SAMPLE");
-        assert_eq!(rows[2]["event_kind"], "ENTRY_FILL");
+        assert_eq!(rows.len(), 4);
+        assert!(rows.iter().any(|row| row["event_kind"] == "PATH_SAMPLE"));
+        let fill = rows
+            .iter()
+            .find(|row| row["event_kind"] == "ENTRY_FILL")
+            .expect("entry fill");
+        assert_eq!(fill["payload"]["record"]["fill_status"], "FILLED");
         assert_eq!(
-            rows[2]["payload"]["record"]["fill_status"],
-            "BLOCKED_BY_DATA"
+            fill["payload"]["record"]["execution_label_grade"],
+            "DIAGNOSTIC_SIM"
         );
-        let limitations = rows[2]["payload"]["record"]["limitations"]
+        assert_eq!(
+            fill["payload"]["record"]["execution_simulation_ready"],
+            true
+        );
+        assert_eq!(
+            fill["payload"]["record"]["research_provenance_ready"],
+            false
+        );
+        let limitations = fill["payload"]["record"]["limitations"]
             .as_array()
             .expect("limitations array");
         assert!(limitations
             .iter()
             .any(|value| { value == "ENTRY_FILL_POOL_STATE_SAME_SLOT_ORDER_AMBIGUOUS" }));
+        let provenance_blockers = fill["payload"]["record"]["provenance_blockers"]
+            .as_array()
+            .expect("provenance blockers array");
+        assert!(provenance_blockers
+            .iter()
+            .any(|value| { value == "ENTRY_FILL_POOL_STATE_SAME_SLOT_ORDER_AMBIGUOUS" }));
+        let blocked_reasons_contains_same_slot = fill["payload"]["record"]
+            .get("blocked_reasons")
+            .and_then(|value| value.as_array())
+            .is_some_and(|blocked_reasons| {
+                blocked_reasons
+                    .iter()
+                    .any(|value| value == "ENTRY_FILL_POOL_STATE_SAME_SLOT_ORDER_AMBIGUOUS")
+            });
+        assert!(!blocked_reasons_contains_same_slot);
     }
 
     #[test]

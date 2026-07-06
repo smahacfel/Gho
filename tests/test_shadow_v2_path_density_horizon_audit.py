@@ -302,6 +302,44 @@ class ShadowV2PathDensityHorizonAuditTest(unittest.TestCase):
         self.assertEqual(result["declared_horizon_retention_blocker_count"], 0)
         self.assertTrue(result["l2_f_allowed_next"])
 
+    def test_validation_smoke_marker_rows_are_excluded_from_l2_density_scope(self) -> None:
+        rows = [density_row(horizon) for horizon in DECLARED_HORIZONS]
+        for horizon in DECLARED_HORIZONS:
+            marker = density_row(
+                horizon,
+                position_id=f"validation-smoke-marker:fixture-run:{horizon}",
+                verdict="NOT_EVALUABLE_NO_COVERAGE",
+                replay_horizon_ms=121_000,
+                path_points=0,
+                coverage_points=0,
+                max_interval_ms=None,
+                limitations=["PATH_DENSITY_NO_PATH_POINTS"],
+            )
+            marker["session_id"] = f"validation-smoke-session:{horizon}"
+            marker["source_canonical_high_watermark"] = (
+                f"validation_smoke_marker_v2:fixture-run:{horizon}"
+            )
+            rows.append(marker)
+
+        result = self.run_audit(
+            rows,
+            "--latest-density-per-position-horizon",
+            "--pass-verdict",
+            "L2_F_DENSITY_RETENTION_PASS",
+        )
+
+        self.assertEqual(result["density_rows_input"], len(rows))
+        self.assertEqual(result["density_rows_candidate_scope"], len(DECLARED_HORIZONS))
+        self.assertEqual(
+            result["excluded_validation_smoke_density_rows"],
+            len(DECLARED_HORIZONS),
+        )
+        self.assertEqual(result["density_rows_evaluated"], len(DECLARED_HORIZONS))
+        self.assertEqual(result["verdict"], "L2_F_DENSITY_RETENTION_PASS")
+        self.assertEqual(result["declared_horizon_path_coverage_blocker_count"], 0)
+        by_horizon = {row["horizon_ms"]: row for row in result["per_horizon"]}
+        self.assertEqual(by_horizon[120_000]["verdict"], "PASS")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -12,7 +12,8 @@ use ghost_core::{
 use serde::{Deserialize, Serialize};
 
 use super::shadow_v2::{
-    chain_order_tuple_for_execution, EventOrderKey, FillStatus, PoolStateSampleV2, TemporalClass,
+    chain_order_tuple_for_execution, EventOrderKey, FillStatus, PoolStateSampleV2, PoolStateSource,
+    TemporalClass,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -334,9 +335,13 @@ impl<'a> ShadowV2ExecutionContext<'a> {
         for blocker in pool_state.research_blockers() {
             self.provenance_label(normalize_pool_state_research_blocker(&blocker));
         }
+        let account_state_source_proof = has_account_state_source_proof(pool_state);
+        let simulated_fill_boundary_proof =
+            self.has_account_state_boundary_proof_for_simulated_fill(pool_state);
         if pool_state
             .event_order_key
             .has_explicit_unknown_chain_order()
+            && !account_state_source_proof
         {
             self.provenance_label(ShadowV2BlockedReason::OrderingAmbiguity.label().to_string());
             self.provenance_blockers.extend(
@@ -351,6 +356,7 @@ impl<'a> ShadowV2ExecutionContext<'a> {
             .input
             .event_order_key
             .has_explicit_unknown_chain_order()
+            && !simulated_fill_boundary_proof
         {
             self.provenance_label(ShadowV2BlockedReason::OrderingAmbiguity.label().to_string());
             self.provenance_blockers.extend(
@@ -361,16 +367,21 @@ impl<'a> ShadowV2ExecutionContext<'a> {
                     .map(|label| format!("FILL_EVENT_{label}")),
             );
         }
+        if self.pool_state_same_slot_ambiguous_with_fill(pool_state)
+            && !simulated_fill_boundary_proof
+        {
+            self.provenance_label(format!(
+                "{}_POOL_STATE_SAME_SLOT_ORDER_AMBIGUOUS",
+                self.fill_prefix()
+            ));
+        }
     }
 
     fn ordering_blockers(&self, pool_state: &PoolStateSampleV2) -> Vec<String> {
         let mut blockers = Vec::new();
         let pool_order = &pool_state.event_order_key;
         let fill_order = &self.input.event_order_key;
-        let prefix = match self.input.side {
-            ShadowV2ExecutionSide::Buy => "ENTRY_FILL",
-            ShadowV2ExecutionSide::Sell => "EXIT_FILL",
-        };
+        let prefix = self.fill_prefix();
         if fill_order.observed_at_wall_ms == 0 {
             blockers.push(format!("{prefix}_EVENT_ORDER_OBSERVED_AT_WALL_MS_MISSING"));
         }
@@ -387,20 +398,47 @@ impl<'a> ShadowV2ExecutionContext<'a> {
                 blockers.push(format!("{prefix}_POOL_STATE_AFTER_FILL_BOUNDARY"));
             }
             (Some(pool_slot), Some(fill_slot)) if pool_slot == fill_slot => {
-                if pool_order.same_slot_ambiguous_with(fill_order) {
-                    blockers.push(format!("{prefix}_POOL_STATE_SAME_SLOT_ORDER_AMBIGUOUS"));
-                } else if let (Some(pool_tuple), Some(fill_tuple)) = (
-                    chain_order_tuple_for_execution(pool_order),
-                    chain_order_tuple_for_execution(fill_order),
-                ) {
-                    if pool_tuple >= fill_tuple {
-                        blockers.push(format!("{prefix}_POOL_STATE_AFTER_FILL_BOUNDARY"));
+                if !pool_order.same_slot_ambiguous_with(fill_order) {
+                    if let (Some(pool_tuple), Some(fill_tuple)) = (
+                        chain_order_tuple_for_execution(pool_order),
+                        chain_order_tuple_for_execution(fill_order),
+                    ) {
+                        if pool_tuple >= fill_tuple {
+                            blockers.push(format!("{prefix}_POOL_STATE_AFTER_FILL_BOUNDARY"));
+                        }
                     }
                 }
             }
             _ => {}
         }
         blockers
+    }
+
+    fn pool_state_same_slot_ambiguous_with_fill(&self, pool_state: &PoolStateSampleV2) -> bool {
+        pool_state
+            .event_order_key
+            .same_slot_ambiguous_with(&self.input.event_order_key)
+    }
+
+    fn has_account_state_boundary_proof_for_simulated_fill(
+        &self,
+        pool_state: &PoolStateSampleV2,
+    ) -> bool {
+        matches!(
+            self.input.boundary_kind,
+            ShadowV2BoundaryKind::EntryBefore | ShadowV2BoundaryKind::ExitBefore
+        ) && has_account_state_source_proof(pool_state)
+            && pool_state.event_order_key.slot.as_known().is_some()
+            && self.input.event_order_key.slot.as_known().is_some()
+            && pool_state.event_order_key.event_seq_in_process
+                < self.input.event_order_key.event_seq_in_process
+    }
+
+    fn fill_prefix(&self) -> &'static str {
+        match self.input.side {
+            ShadowV2ExecutionSide::Buy => "ENTRY_FILL",
+            ShadowV2ExecutionSide::Sell => "EXIT_FILL",
+        }
     }
 
     fn temporal_class_allowed(&self, temporal_class: TemporalClass) -> bool {
@@ -722,4 +760,9 @@ fn normalize_pool_state_research_blocker(blocker: &str) -> String {
         }
         _ => blocker.to_string(),
     }
+}
+
+fn has_account_state_source_proof(pool_state: &PoolStateSampleV2) -> bool {
+    pool_state.source == PoolStateSource::AccountStateCore
+        && pool_state.has_complete_account_state_source_proof()
 }

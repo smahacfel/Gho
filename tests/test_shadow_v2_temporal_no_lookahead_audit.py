@@ -49,8 +49,14 @@ def canonical_row(
     ordering_exemption: str | None = None,
     record_fields: dict | None = None,
     exact_or_approx: str | None = None,
+    source_refs: list[str] | None = None,
+    envelope_limitations: list[str] | None = None,
 ) -> dict:
     env = envelope(schema, event_id, position_id)
+    if source_refs is not None:
+        env["source_refs"] = source_refs
+    if envelope_limitations is not None:
+        env["limitations"] = envelope_limitations
     record = {"envelope": env}
     if record_fields:
         record.update(record_fields)
@@ -215,6 +221,90 @@ class ShadowV2TemporalAuditTest(unittest.TestCase):
         self.assertEqual(result["transaction_source_proof_missing_rows"], 1)
         self.assertEqual(result["unknown_required_source_rows"], 1)
         self.assertGreater(result["unknown_required_source_count"], 0)
+
+    def test_shadow_v2_temporal_audit_allows_account_state_derived_fill_without_tx_source(
+        self,
+    ) -> None:
+        result = self.run_audit(
+            [
+                canonical_row(
+                    "shadow_entry_fill_v2",
+                    "ENTRY_FILL",
+                    "entry-fill-account-state-derived",
+                    event_order_key=unknown_transaction_source_event_order_key(),
+                    record_fields={
+                        "pool_state_before": "pool-state-before-a",
+                        "execution_label_grade": "RESEARCH_CANDIDATE",
+                    },
+                )
+            ]
+        )
+
+        self.assertEqual(result["verdict"], "PASS_TEMPORAL_NO_LOOKAHEAD_AUDIT")
+        self.assertEqual(result["account_state_derived_simulation_source_proof_count"], 1)
+        self.assertEqual(result["transaction_source_proof_missing_rows"], 0)
+        self.assertEqual(result["unknown_required_source_rows"], 0)
+
+    def test_shadow_v2_temporal_audit_allows_typed_blocked_exit_fill_without_tx_source(
+        self,
+    ) -> None:
+        result = self.run_audit(
+            [
+                canonical_row(
+                    "shadow_exit_fill_v2",
+                    "EXIT_FILL",
+                    "exit-fill-blocked-by-data",
+                    event_order_key=unknown_transaction_source_event_order_key(),
+                    record_fields={
+                        "blocked_reasons": ["BLOCKED_POOL_STATE_MISSING"],
+                        "execution_label_grade": "DIAGNOSTIC_SIM",
+                        "execution_simulation_ready": False,
+                        "fill_status": "BLOCKED_BY_DATA",
+                        "quality": "BLOCKED_BY_DATA",
+                        "reconstruction_status": "EXIT_FILL_BLOCKED_BY_MISSING_POOL_STATE",
+                    },
+                    envelope_limitations=[
+                        "EXIT_FILL_NOT_EXECUTABLE_WITHOUT_POOL_STATE_PROVENANCE",
+                        "EXIT_FILL_POOL_STATE_SAMPLE_MISSING",
+                        "EXIT_POOL_STATE_BEFORE_UNAVAILABLE",
+                        "EXIT_FILL_STATIC_MODEL_NOT_LIVE_CONFIRMED",
+                    ],
+                )
+            ]
+        )
+
+        self.assertEqual(result["verdict"], "PASS_TEMPORAL_NO_LOOKAHEAD_AUDIT")
+        self.assertEqual(result["typed_blocked_simulation_source_exempt_count"], 1)
+        self.assertEqual(result["transaction_source_proof_missing_rows"], 0)
+        self.assertEqual(result["unknown_required_source_rows"], 0)
+
+    def test_shadow_v2_temporal_audit_allows_legacy_diagnostic_path_sample_without_tx_source(
+        self,
+    ) -> None:
+        result = self.run_audit(
+            [
+                canonical_row(
+                    "shadow_path_sample_v2",
+                    "PATH_SAMPLE",
+                    "legacy-path-sample-a",
+                    event_order_key=unknown_transaction_source_event_order_key(),
+                    record_fields={
+                        "pool_state_ref": "MISSING_POOL_STATE_SAMPLE_LEGACY_LIFECYCLE_PRICE_TRUTH_ONLY",
+                        "exact_or_approx": "APPROX_AMBIGUOUS_EVENT_ORDER",
+                    },
+                    source_refs=["shadow_lifecycle:position_closed"],
+                    envelope_limitations=[
+                        "LEGACY_LIFECYCLE_PRICE_TRUTH_NOT_POOL_STATE_SAMPLE",
+                        "PATH_SAMPLE_POOL_STATE_PROVENANCE_MISSING",
+                    ],
+                )
+            ]
+        )
+
+        self.assertEqual(result["verdict"], "PASS_TEMPORAL_NO_LOOKAHEAD_AUDIT")
+        self.assertEqual(result["account_state_derived_simulation_source_proof_count"], 1)
+        self.assertEqual(result["transaction_source_proof_missing_rows"], 0)
+        self.assertEqual(result["unknown_required_source_rows"], 0)
 
     def test_shadow_v2_temporal_audit_rejects_event_seq_as_exact_order_substitute(self) -> None:
         result = self.run_audit(
