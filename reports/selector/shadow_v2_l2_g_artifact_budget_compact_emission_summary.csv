@@ -20,6 +20,13 @@ compression_enabled,false,no runtime zst writer added in L2-G; rotation+compact+
 rotation_enabled,true,large JSONL artifacts rotate to .part-000001.jsonl with shadow_artifact_rotation_manifest_v2 rows before budget failure
 rotation_manifest_enabled,true,shadow_artifact_rotation_manifest_v2.jsonl records rotated path/size/row_count/blake3 hash
 max_total_artifact_bytes,5368709120,default 5 GiB L2 profile budget
+artifact_budget_disk_headroom_enabled,true,enabled in long compact research profile so run is limited by real filesystem headroom instead of static 5 GiB cap
+long_research_profile_max_total_artifact_bytes,0,0 disables fixed total cap only when disk-headroom budget is enabled
+min_free_disk_bytes,3221225472,long research profile preserves 3 GiB free filesystem space
+long_research_profile_max_density_rows,0,0 disables fixed density row cap only when disk-headroom budget is enabled
+artifact_budget_free_space_probe,statvfs,Shadow V2 harness checks filesystem free bytes before artifact writes in disk-headroom mode
+artifact_budget_shutdown_guard_enabled,true,launcher requests controlled shutdown after typed Shadow V2 budget breach
+target_research_run_duration_seconds,43200,12h operator target; no hidden 2h cap found in compact rollout profile
 max_file_bytes,2147483648,default 2 GiB per-file budget
 max_rows_per_file,2000000,default per-file row budget
 max_density_rows,250000,default density row budget
@@ -27,6 +34,16 @@ max_stdout_bytes,268435456,default compact research stdout budget expectation
 max_system_log_bytes,536870912,default compact research system log budget expectation
 budget_breach_verdict,BLOCKED_L2_ARTIFACT_BUDGET_EXCEEDED,harness returns fail-closed write status when budgets are exceeded
 l2_audit_compatibility_verdict,PASS_COMPACT_ARTIFACTS_KEEP_L2_AUDIT_INPUTS,canonical stream unchanged; density audit reads compact latest rows; replay/lifecycle audit uses terminal fields; manifest audit requires source ref manifest
+memory_retention_root_cause,UNBOUNDED_CANONICAL_EVENT_STREAM_RETENTION,compact disk emission still retained all canonical events in ShadowV2CanonicalEventStream.events for process lifetime
+paused_memory_run_id,shadow-v2-l2-f-research-codex-20260707-r4-compact-headroom-12h,run paused with SIGSTOP before memory hardening
+paused_memory_pid,1935151,old release binary remains paused and does not include this fix
+paused_vm_rss_kb,10908396,observed after SIGSTOP
+paused_rss_anon_kb,10900104,anonymous heap dominates RSS; not filesystem cache
+paused_vm_swap_kb,0,no swap use at pause
+terminal_flush_memory_eviction_enabled,true,closed position canonical events are evicted from in-memory stream after complete terminal evidence flush
+terminal_flush_memory_eviction_gate,"compact_density_enabled && replay_lifecycle_compact_refs_enabled && !density_full_stream_enabled",full-density diagnostic stream keeps full in-memory behavior
+late_post_terminal_event_policy,HARNESS_POSITION_EVICTED_AFTER_TERMINAL_FLUSH,late post-terminal appends for evicted positions fail closed
+memory_hardening_artifact_quality_impact,NONE,durable canonical/replay/lifecycle/density/source-ref artifacts remain complete before memory eviction
 runtime_decision_behavior_changes,NONE,no Gatekeeper/BUY/REJECT/selector/TX/Jito/live path change
 gatekeeper_policy_changes,NONE,hard boundary preserved
 provider_stream_changes,NONE,hard boundary preserved

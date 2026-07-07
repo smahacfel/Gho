@@ -8,10 +8,15 @@
 //! records.
 
 use std::collections::{HashMap, HashSet};
+#[cfg(unix)]
+use std::ffi::CString;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::shadow_v2_execution::{
@@ -38,11 +43,23 @@ pub const SHADOW_V2_L2_DECLARED_DENSITY_HORIZONS_MS: [u64; 5] =
 pub const SHADOW_V2_L2_UNDECLARED_LONG_HORIZONS_MS: [u64; 2] = [300_000, 500_000];
 pub const SHADOW_V2_DENSITY_FULL_STREAM_ENV: &str = "SHADOW_V2_DENSITY_FULL_STREAM";
 pub const SHADOW_V2_ARTIFACT_BUDGET_BLOCKER: &str = "BLOCKED_L2_ARTIFACT_BUDGET_EXCEEDED";
+pub const SHADOW_V2_DEFAULT_MIN_FREE_DISK_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 pub const SHADOW_V2_SOURCE_REF_MANIFEST_SCHEMA: &str = "shadow_source_ref_manifest_v2";
 pub const SHADOW_V2_ARTIFACT_ROTATION_MANIFEST_SCHEMA: &str =
     "shadow_artifact_rotation_manifest_v2";
 pub const EVENT_ORDER_UNKNOWN_INDEX: u32 = u32::MAX;
 pub const EVENT_ORDER_UNKNOWN_SIGNATURE: &str = "UNKNOWN";
+
+static SHADOW_V2_ARTIFACT_BUDGET_EXCEEDED: AtomicBool = AtomicBool::new(false);
+
+pub fn shadow_v2_artifact_budget_exceeded() -> bool {
+    SHADOW_V2_ARTIFACT_BUDGET_EXCEEDED.load(Ordering::SeqCst)
+}
+
+#[cfg(test)]
+fn reset_shadow_v2_artifact_budget_exceeded_for_tests() {
+    SHADOW_V2_ARTIFACT_BUDGET_EXCEEDED.store(false, Ordering::SeqCst);
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -1068,6 +1085,13 @@ impl ShadowV2CanonicalEventStream {
             .iter()
             .filter(|event| event.envelope.position_id == position_id)
             .collect()
+    }
+
+    fn evict_position_events_after_terminal_flush(&mut self, position_id: &str) -> usize {
+        let before = self.events.len();
+        self.events
+            .retain(|event| event.envelope.position_id != position_id);
+        before.saturating_sub(self.events.len())
     }
 
     pub fn terminal_event_id(&self, position_id: &str) -> Option<&str> {
@@ -3439,7 +3463,9 @@ fn sample_protected_from_path_cap(
 pub struct ShadowV2ArtifactBudgetConfig {
     pub enabled: bool,
     pub rotation_enabled: bool,
+    pub disk_headroom_enabled: bool,
     pub max_total_artifact_bytes: u64,
+    pub min_free_disk_bytes: u64,
     pub max_file_bytes: u64,
     pub max_rows_per_file: u64,
     pub max_density_rows: u64,
@@ -3454,7 +3480,9 @@ impl Default for ShadowV2ArtifactBudgetConfig {
         Self {
             enabled: true,
             rotation_enabled: true,
+            disk_headroom_enabled: false,
             max_total_artifact_bytes: 5 * GIB,
+            min_free_disk_bytes: SHADOW_V2_DEFAULT_MIN_FREE_DISK_BYTES,
             max_file_bytes: 2 * GIB,
             max_rows_per_file: 2_000_000,
             max_density_rows: 250_000,
@@ -4619,7 +4647,9 @@ impl ShadowV2ValidationHarnessConfig {
         harness_config.artifact_budget = ShadowV2ArtifactBudgetConfig {
             enabled: config.artifact_budget_enabled,
             rotation_enabled: config.artifact_rotation_enabled,
+            disk_headroom_enabled: config.artifact_budget_disk_headroom_enabled,
             max_total_artifact_bytes: config.max_total_artifact_bytes,
+            min_free_disk_bytes: config.min_free_disk_bytes,
             max_file_bytes: config.max_file_bytes,
             max_rows_per_file: config.max_rows_per_file,
             max_density_rows: config.max_density_rows,
@@ -4654,9 +4684,59 @@ fn shadow_v2_density_compact_flush_event(event_kind: ShadowPositionEventKindV2) 
 }
 
 fn shadow_v2_artifact_budget_error(reason: impl Into<String>) -> ShadowV2Error {
+    SHADOW_V2_ARTIFACT_BUDGET_EXCEEDED.store(true, Ordering::SeqCst);
     ShadowV2Error::Io(format!(
         "{SHADOW_V2_ARTIFACT_BUDGET_BLOCKER}: {}",
         reason.into()
+    ))
+}
+
+#[cfg(unix)]
+fn shadow_v2_existing_filesystem_probe_path(path: &Path) -> PathBuf {
+    let mut probe = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| path.to_path_buf())
+    };
+    while !probe.exists() {
+        if !probe.pop() {
+            return PathBuf::from(".");
+        }
+    }
+    probe
+}
+
+#[cfg(unix)]
+fn shadow_v2_filesystem_available_bytes(path: &Path) -> io::Result<u64> {
+    let probe = shadow_v2_existing_filesystem_probe_path(path);
+    let c_path = CString::new(probe.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "cannot probe filesystem free bytes for path with interior nul: {}",
+                probe.display()
+            ),
+        )
+    })?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // Safety: c_path is a valid NUL-terminated path and stat points to writable memory
+    // for libc::statvfs to initialize before we read it on a zero return code.
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // Safety: statvfs returned success, so stat has been fully initialized by libc.
+    let stat = unsafe { stat.assume_init() };
+    Ok((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
+}
+
+#[cfg(not(unix))]
+fn shadow_v2_filesystem_available_bytes(_path: &Path) -> io::Result<u64> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Shadow V2 disk-headroom artifact budget requires unix statvfs support",
     ))
 }
 
@@ -4690,6 +4770,8 @@ pub struct ShadowV2ValidationHarness {
     artifact_rotation_manifest_rows_written: u64,
     rotated_artifact_bytes: u64,
     source_ref_manifest_keys: HashSet<String>,
+    terminal_flushed_positions_evicted_from_memory: HashSet<String>,
+    terminal_flushed_canonical_events_evicted_from_memory: u64,
 }
 
 impl ShadowV2ValidationHarness {
@@ -4712,6 +4794,8 @@ impl ShadowV2ValidationHarness {
             artifact_rotation_manifest_rows_written: 0,
             rotated_artifact_bytes: 0,
             source_ref_manifest_keys: HashSet::new(),
+            terminal_flushed_positions_evicted_from_memory: HashSet::new(),
+            terminal_flushed_canonical_events_evicted_from_memory: 0,
         })
     }
 
@@ -4726,10 +4810,19 @@ impl ShadowV2ValidationHarness {
         }
 
         let position_id = record.envelope().position_id.clone();
+        if self
+            .terminal_flushed_positions_evicted_from_memory
+            .contains(&position_id)
+        {
+            return ShadowV2HarnessAppendOutcome::canonical_failed(
+                "HARNESS_POSITION_EVICTED_AFTER_TERMINAL_FLUSH",
+            );
+        }
         let event = match self.canonical_writer.stream.prepare_record(record) {
             Ok(event) => event,
             Err(error) => return ShadowV2HarnessAppendOutcome::canonical_failed(error),
         };
+        let is_terminal_event = event.is_canonical_terminal();
         let canonical_path = self.config.canonical_event_stream_path.clone();
         let active_rows = match self.rotate_artifact_if_needed(
             &canonical_path,
@@ -4758,7 +4851,14 @@ impl ShadowV2ValidationHarness {
         let replay_write = self.write_replay_snapshot(&position_id);
         let lifecycle_write = self.write_lifecycle_snapshot(&position_id);
         let density_write = self.write_path_density_snapshots(&position_id);
-        ShadowV2HarnessAppendOutcome::from_writes(replay_write, lifecycle_write, density_write)
+        let outcome =
+            ShadowV2HarnessAppendOutcome::from_writes(replay_write, lifecycle_write, density_write);
+        if is_terminal_event
+            && outcome.validation_evidence_status == ShadowV2ValidationEvidenceStatus::Complete
+        {
+            self.evict_terminal_position_from_memory(&position_id);
+        }
+        outcome
     }
 
     pub fn canonical_stream(&self) -> &ShadowV2CanonicalEventStream {
@@ -4767,6 +4867,26 @@ impl ShadowV2ValidationHarness {
 
     pub fn canonical_event_stream_path(&self) -> &Path {
         self.canonical_writer.path()
+    }
+
+    fn evict_terminal_position_from_memory(&mut self, position_id: &str) {
+        if !(self.config.compact_density_enabled
+            && self.config.replay_lifecycle_compact_refs_enabled
+            && !self.config.density_full_stream_enabled)
+        {
+            return;
+        }
+        let evicted = self
+            .canonical_writer
+            .stream
+            .evict_position_events_after_terminal_flush(position_id);
+        if evicted > 0 {
+            self.terminal_flushed_canonical_events_evicted_from_memory = self
+                .terminal_flushed_canonical_events_evicted_from_memory
+                .saturating_add(evicted as u64);
+            self.terminal_flushed_positions_evicted_from_memory
+                .insert(position_id.to_string());
+        }
     }
 
     fn write_replay_snapshot(&mut self, position_id: &str) -> ShadowV2WriteStatus {
@@ -4909,12 +5029,16 @@ impl ShadowV2ValidationHarness {
                 created_at_wall_ms,
             );
             if self.config.artifact_budget.enabled
+                && self.config.artifact_budget.max_density_rows > 0
                 && self.density_rows_written >= self.config.artifact_budget.max_density_rows
             {
-                return ShadowV2WriteStatus::Err(format!(
-                    "{SHADOW_V2_ARTIFACT_BUDGET_BLOCKER}: shadow_path_density_v2 max_density_rows={} reached",
-                    self.config.artifact_budget.max_density_rows
-                ));
+                return ShadowV2WriteStatus::Err(
+                    shadow_v2_artifact_budget_error(format!(
+                        "shadow_path_density_v2 max_density_rows={} reached",
+                        self.config.artifact_budget.max_density_rows
+                    ))
+                    .to_string(),
+                );
             }
             let density_path = self.config.path_density_v2_path.clone();
             let active_rows = match self.rotate_artifact_if_needed(
@@ -5052,8 +5176,25 @@ impl ShadowV2ValidationHarness {
                 )));
             }
         }
+        if budget.disk_headroom_enabled {
+            let available_bytes = shadow_v2_filesystem_available_bytes(path).map_err(|error| {
+                ShadowV2Error::Io(format!(
+                    "failed to check filesystem free bytes for {}: {}",
+                    path.display(),
+                    error
+                ))
+            })?;
+            if available_bytes <= budget.min_free_disk_bytes {
+                return Err(shadow_v2_artifact_budget_error(format!(
+                    "{artifact} filesystem free bytes {} at or below min_free_disk_bytes={} path={}",
+                    available_bytes,
+                    budget.min_free_disk_bytes,
+                    path.display()
+                )));
+            }
+        }
         let total_bytes = self.configured_artifact_size_bytes();
-        if total_bytes >= budget.max_total_artifact_bytes {
+        if budget.max_total_artifact_bytes > 0 && total_bytes >= budget.max_total_artifact_bytes {
             return Err(shadow_v2_artifact_budget_error(format!(
                 "configured artifact bytes {} exceed max_total_artifact_bytes={}",
                 total_bytes, budget.max_total_artifact_bytes
@@ -6549,7 +6690,106 @@ mod tests {
     }
 
     #[test]
+    fn shadow_v2_l2_g_terminal_flush_evicts_closed_position_events_from_memory_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = harness_config_for_dir(tmp.path());
+        let mut harness = ShadowV2ValidationHarness::new(config).unwrap();
+
+        for idx in 0..=123 {
+            let age_ms = idx as u64 * 1_000;
+            let mut order = event_order_key(Some(45), Some(idx as u32));
+            order.event_seq_in_process = 10 + idx as u64;
+            let outcome =
+                harness.append_record(ShadowV2Record::ShadowPathSampleV2(path_sample_with_pnl(
+                    &format!("memory-compact-path-sample-{idx:03}"),
+                    age_ms,
+                    idx,
+                    ShadowPathSamplingModeV2::Standard120s,
+                    ShadowPathSamplingReasonV2::Heartbeat,
+                    order,
+                )));
+            assert_eq!(outcome.canonical_write, ShadowV2WriteStatus::Ok);
+        }
+        assert_eq!(
+            harness
+                .canonical_stream()
+                .events_for_position("pos-a")
+                .len(),
+            124
+        );
+
+        let terminal_outcome = harness.append_record(ShadowV2Record::ShadowTerminalTruthV2(
+            terminal_record("pos-a", "event-terminal-memory-compact"),
+        ));
+
+        assert_eq!(terminal_outcome.canonical_write, ShadowV2WriteStatus::Ok);
+        assert_eq!(terminal_outcome.replay_write, ShadowV2WriteStatus::Ok);
+        assert_eq!(terminal_outcome.lifecycle_write, ShadowV2WriteStatus::Ok);
+        assert_eq!(terminal_outcome.density_write, ShadowV2WriteStatus::Ok);
+        assert_eq!(
+            terminal_outcome.validation_evidence_status,
+            ShadowV2ValidationEvidenceStatus::Complete
+        );
+        assert!(harness
+            .canonical_stream()
+            .events_for_position("pos-a")
+            .is_empty());
+        assert_eq!(
+            harness.canonical_stream().terminal_event_id("pos-a"),
+            Some("event-terminal-memory-compact")
+        );
+
+        let canonical =
+            std::fs::read_to_string(tmp.path().join("shadow_position_event_v2.jsonl")).unwrap();
+        assert_eq!(canonical.lines().count(), 125);
+        let replay = std::fs::read_to_string(tmp.path().join("shadow_replay_v2.jsonl")).unwrap();
+        let replay_last: Value = serde_json::from_str(replay.lines().last().unwrap()).unwrap();
+        assert_eq!(replay_last["source_event_count"], 125);
+        assert_eq!(
+            replay_last["source_event_last_id"],
+            "event-terminal-memory-compact"
+        );
+        assert!(replay_last["source_event_ids"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let lifecycle =
+            std::fs::read_to_string(tmp.path().join("shadow_lifecycle_v2.jsonl")).unwrap();
+        let lifecycle_last: Value =
+            serde_json::from_str(lifecycle.lines().last().unwrap()).unwrap();
+        assert_eq!(lifecycle_last["source_event_count"], 125);
+        assert!(lifecycle_last["source_event_ids"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let density =
+            std::fs::read_to_string(tmp.path().join("shadow_path_density_v2.jsonl")).unwrap();
+        assert_eq!(density.lines().count(), 5);
+
+        let mut late_order = event_order_key(Some(46), Some(124));
+        late_order.event_seq_in_process = 1_000;
+        let late_outcome =
+            harness.append_record(ShadowV2Record::ShadowPathSampleV2(path_sample_with_pnl(
+                "late-after-terminal-memory-compact",
+                124_000,
+                124,
+                ShadowPathSamplingModeV2::Standard120s,
+                ShadowPathSamplingReasonV2::Heartbeat,
+                late_order,
+            )));
+        match late_outcome.canonical_write {
+            ShadowV2WriteStatus::Err(error) => {
+                assert!(error.contains("HARNESS_POSITION_EVICTED_AFTER_TERMINAL_FLUSH"));
+            }
+            other => {
+                panic!("expected fail-closed late event after terminal eviction, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
     fn shadow_v2_l2_g_artifact_budget_breach_fails_closed() {
+        reset_shadow_v2_artifact_budget_exceeded_for_tests();
         let tmp = tempfile::tempdir().unwrap();
         let mut config = harness_config_for_dir(tmp.path());
         config.artifact_budget.max_density_rows = 1;
@@ -6583,6 +6823,91 @@ mod tests {
             outcome.validation_evidence_status,
             ShadowV2ValidationEvidenceStatus::DensityWriteFailed
         );
+        assert!(shadow_v2_artifact_budget_exceeded());
+        reset_shadow_v2_artifact_budget_exceeded_for_tests();
+    }
+
+    #[test]
+    fn shadow_v2_l2_g_disk_headroom_budget_fails_closed() {
+        reset_shadow_v2_artifact_budget_exceeded_for_tests();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = harness_config_for_dir(tmp.path());
+        config.artifact_budget.disk_headroom_enabled = true;
+        config.artifact_budget.min_free_disk_bytes = u64::MAX;
+        let mut harness = ShadowV2ValidationHarness::new(config).unwrap();
+
+        let outcome = harness.append_record(ShadowV2Record::ShadowPositionV2(position_record(
+            "pos-a",
+            "event-position-disk-headroom",
+        )));
+
+        match outcome.canonical_write {
+            ShadowV2WriteStatus::Err(error) => {
+                assert!(error.contains(SHADOW_V2_ARTIFACT_BUDGET_BLOCKER));
+                assert!(error.contains("min_free_disk_bytes"));
+            }
+            other => panic!("expected disk-headroom budget error, got {other:?}"),
+        }
+        assert_eq!(
+            outcome.validation_evidence_status,
+            ShadowV2ValidationEvidenceStatus::CanonicalWriteFailed
+        );
+        assert!(shadow_v2_artifact_budget_exceeded());
+        reset_shadow_v2_artifact_budget_exceeded_for_tests();
+    }
+
+    #[test]
+    fn shadow_v2_l2_g_disk_headroom_allows_zero_fixed_total_cap() {
+        reset_shadow_v2_artifact_budget_exceeded_for_tests();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = harness_config_for_dir(tmp.path());
+        config.artifact_budget.disk_headroom_enabled = true;
+        config.artifact_budget.min_free_disk_bytes = 1;
+        config.artifact_budget.max_total_artifact_bytes = 0;
+        let mut harness = ShadowV2ValidationHarness::new(config).unwrap();
+
+        let outcome = harness.append_record(ShadowV2Record::ShadowPositionV2(position_record(
+            "pos-a",
+            "event-position-zero-total-cap",
+        )));
+
+        assert_eq!(outcome.canonical_write, ShadowV2WriteStatus::Ok);
+        assert!(!shadow_v2_artifact_budget_exceeded());
+    }
+
+    #[test]
+    fn shadow_v2_l2_g_disk_headroom_allows_zero_density_row_cap() {
+        reset_shadow_v2_artifact_budget_exceeded_for_tests();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = harness_config_for_dir(tmp.path());
+        config.artifact_budget.disk_headroom_enabled = true;
+        config.artifact_budget.min_free_disk_bytes = 1;
+        config.artifact_budget.max_total_artifact_bytes = 0;
+        config.artifact_budget.max_density_rows = 0;
+        let mut harness = ShadowV2ValidationHarness::new(config).unwrap();
+
+        let sample = path_sample_with_pnl(
+            "zero-density-cap-path-sample",
+            1_000,
+            10,
+            ShadowPathSamplingModeV2::Standard120s,
+            ShadowPathSamplingReasonV2::Heartbeat,
+            event_order_key(Some(45), Some(1)),
+        );
+        assert_eq!(
+            harness
+                .append_record(ShadowV2Record::ShadowPathSampleV2(sample))
+                .canonical_write,
+            ShadowV2WriteStatus::Ok
+        );
+
+        let outcome = harness.append_record(ShadowV2Record::ShadowTerminalTruthV2(
+            terminal_record("pos-a", "event-terminal-zero-density-cap"),
+        ));
+        assert_eq!(outcome.canonical_write, ShadowV2WriteStatus::Ok);
+        assert_eq!(outcome.density_write, ShadowV2WriteStatus::Ok);
+        assert!(harness.density_rows_written > 0);
+        assert!(!shadow_v2_artifact_budget_exceeded());
     }
 
     #[test]

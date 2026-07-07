@@ -174,6 +174,117 @@ BLOCKED_L2_ARTIFACT_BUDGET_EXCEEDED
 The harness checks configured Shadow V2 artifacts before writes and returns a
 typed write failure instead of continuing unbounded artifact emission.
 
+### 3B. Disk-headroom profile budget for long research runs
+
+R2 compact research run exposed a second budget bug: the original
+`max_total_artifact_bytes=5368709120` stopped Shadow V2 writes while the
+filesystem still had tens of GB free. That is correct for a small iterative
+budget, but wrong for a deliberate 12h research profile.
+
+L2-G now supports disk-headroom budgeting:
+
+```text
+artifact_budget_disk_headroom_enabled=true
+max_total_artifact_bytes=0
+min_free_disk_bytes=3221225472
+max_density_rows=0
+```
+
+In this mode `max_total_artifact_bytes=0` means "no fixed configured-artifact
+cap", and `max_density_rows=0` means "no fixed density row cap". Both zero
+values are legal only when disk-headroom budgeting is enabled. The harness
+checks real filesystem free space via `statvfs` before each Shadow V2 artifact
+write and fails closed only when available bytes are at or below the configured
+free-space margin.
+
+The local 12h compact research profile was updated at:
+
+```text
+configs/rollout/ghost_brain_shadow_v2_l2_f_research_codex_20260706_r2_compact.local.toml
+```
+
+with:
+
+```text
+artifact_budget_disk_headroom_enabled=true
+max_total_artifact_bytes=0
+min_free_disk_bytes=3221225472
+max_density_rows=0
+```
+
+This preserves simulation quality: declared L2 density horizons remain
+`2000,3000,10000,30000,120000`, full density stream remains opt-in only, and no
+Gatekeeper/BUY/REJECT/selector/TX/Jito/live path is changed.
+
+### 3C. Controlled shutdown on budget breach
+
+Before this fix, a budget breach could make canonical Shadow V2 writes fail
+while the process kept running and emitted repeated `CanonicalWriteFailed`
+warnings. L2-G now marks the typed artifact-budget blocker globally and the
+launcher has a Shadow V2 artifact-budget guard that requests controlled global
+shutdown when:
+
+```text
+BLOCKED_L2_ARTIFACT_BUDGET_EXCEEDED
+```
+
+is observed.
+
+This prevents half-dead runs: the process no longer keeps collecting after the
+Shadow V2 evidence surface has become incomplete due to resource exhaustion.
+
+### 3D. Memory-bounded compact validation harness
+
+The 12h compact-headroom research run exposed a separate RAM problem: compact
+disk emission did not compact the in-memory canonical event stream. The paused
+process showed:
+
+```text
+run_id=shadow-v2-l2-f-research-codex-20260707-r4-compact-headroom-12h
+pid=1935151
+state=T (stopped)
+VmRSS=10908396 kB
+RssAnon=10900104 kB
+VmSwap=0 kB
+```
+
+The root cause was lifetime retention of all canonical events in:
+
+```text
+ShadowV2ValidationHarness
+  -> JsonlShadowV2CanonicalWriter
+  -> ShadowV2CanonicalEventStream.events
+```
+
+L2-G now evicts a closed position's canonical events from RAM after terminal
+truth and all derived compact evidence have been durably written:
+
+```text
+canonical_write=Ok
+replay_write=Ok
+lifecycle_write=Ok
+density_write=Ok
+validation_evidence_status=Complete
+```
+
+The eviction is enabled only for compact evidence mode:
+
+```text
+compact_density_enabled=true
+replay_lifecycle_compact_refs_enabled=true
+density_full_stream_enabled=false
+```
+
+Durable artifacts are preserved. Late post-terminal appends for an evicted
+position fail closed with:
+
+```text
+HARNESS_POSITION_EVICTED_AFTER_TERMINAL_FLUSH
+```
+
+This bounds RAM primarily by currently open positions plus guard maps, without
+weakening Shadow V2 evidence quality.
+
 ### 4. JSONL rotation manifest
 
 Large Shadow V2 JSONL artifacts now rotate before a per-file budget breach.
@@ -260,6 +371,8 @@ Compact mode preserves L2-F audit inputs:
 - replay/lifecycle audit: terminal fields and canonical joins remain present;
 - account data hash coverage: unchanged canonical evidence path;
 - evidence-complete scope: compact density is still per position/horizon.
+- memory-bounded harness: evicts only after complete terminal evidence flush,
+  so audits consume durable artifacts rather than hot in-memory history.
 
 Compact mode removes repeated history payloads, not the proof surface.
 

@@ -29,6 +29,13 @@ Decyzja:
    `shadow_artifact_rotation_manifest_v2.jsonl`.
 6. `SHADOW_V2_LOG_PROFILE=l2_research_compact` ogranicza verbose stdout/system
    logging dla research runow.
+7. Dlugie profile research moga uzyc disk-headroom budget zamiast stalego
+   `max_total_artifact_bytes`, zachowujac skonfigurowany margines wolnego
+   miejsca na filesystemie.
+8. Artifact-budget breach jest globalnym fail-closed shutdown reason dla
+   launchera, zeby runtime nie kontynuowal po utracie kompletnego evidence.
+9. Compact validation harness usuwa z RAM closed-position canonical events
+   dopiero po kompletnym terminal evidence flush, zachowujac durable artifacts.
 
 ## Context
 
@@ -47,6 +54,11 @@ system.log.*
 Najwiekszy mechanizm wzrostu byl deterministyczny: harness emitowal derived
 snapshots po kazdym canonical append, density robilo to dla 7 horyzontow, a
 replay/lifecycle powtarzaly narastajace historie ID.
+
+Kolejny 12h compact-headroom run pokazal osobny problem RAM: mimo compact disk
+emission harness nadal trzymal wszystkie canonical events w
+`ShadowV2CanonicalEventStream.events` przez caly czas zycia procesu. Wzrost RSS
+byl prawie calkowicie anonymous heap, nie filesystem cache.
 
 ## Implemented Contract
 
@@ -76,6 +88,22 @@ max_density_rows=250000
 max_stdout_bytes=268435456
 max_system_log_bytes=536870912
 ```
+
+Disk-headroom research profile:
+
+```text
+artifact_budget_disk_headroom_enabled=true
+max_total_artifact_bytes=0
+min_free_disk_bytes=3221225472
+max_density_rows=0
+```
+
+`max_total_artifact_bytes=0` jest dozwolone tylko z
+`artifact_budget_disk_headroom_enabled=true`. `max_density_rows=0` rowniez jest
+dozwolone tylko w tym trybie i oznacza brak stalego limitu liczby density rows.
+Wtedy stale 5 GiB ani licznik density rows nie zatrzymuja dlugiego runa; harness
+sprawdza realne wolne miejsce przez `statvfs` i blokuje dopiero, gdy filesystem
+osiaga skonfigurowany margines wolnego miejsca.
 
 Compact replay/lifecycle fields:
 
@@ -129,13 +157,26 @@ than `.jsonl.zst`.
 - Changes default density to compact terminal-only emission.
 - Rotates large JSONL artifacts before per-file budget breach.
 - Adds fail-closed budget checks before Shadow V2 artifact writes.
+- Adds disk-headroom artifact budget checks via filesystem free-space probing.
+- Marks `BLOCKED_L2_ARTIFACT_BUDGET_EXCEEDED` as a process-visible shutdown
+  signal.
 - Compacts replay/lifecycle source refs under default harness config.
+- Evicts closed-position canonical events from in-memory stream after complete
+  terminal compact evidence flush.
+- Fails closed late post-terminal appends for evicted positions with
+  `HARNESS_POSITION_EVICTED_AFTER_TERMINAL_FLUSH`.
 
 ### `ghost-brain/src/config/ghost_brain_config.rs`
 
 - Adds backward-compatible `#[serde(default)]` fields for compact density,
   compact replay/lifecycle refs, artifact budgets, artifact rotation and log
   profile.
+- Adds backward-compatible disk-headroom budget fields:
+  `artifact_budget_disk_headroom_enabled` and `min_free_disk_bytes`.
+- Validates that `max_total_artifact_bytes=0` is legal only with disk-headroom
+  budget enabled.
+- Validates that `max_density_rows=0` is legal only with disk-headroom budget
+  enabled.
 - Validates incompatible `density_full_stream_enabled` +
   `compact_density_enabled`.
 
@@ -144,6 +185,9 @@ than `.jsonl.zst`.
 - Adds `SHADOW_V2_LOG_PROFILE=l2_research_compact` logging filter.
 - Preserves warnings/errors and suppresses broad info/debug spam for compact
   research runs.
+- Adds a Shadow V2 artifact-budget guard that requests controlled global
+  shutdown after a typed budget breach, preventing a process that keeps running
+  while canonical Shadow V2 evidence writes are already incomplete.
 
 ### Manifest contracts
 
@@ -186,7 +230,14 @@ avoid disk exhaustion.
 3. Artifact budgets fail closed before disk exhaustion.
 4. Large JSONL artifacts rotate with BLAKE3 integrity metadata.
 5. Compact logging profile reduces stdout/system log growth.
-6. No trading decision behavior changes.
+6. Long L2 research profiles can use disk-headroom budgeting to run until the
+   filesystem reaches the explicit reserve margin rather than a static 5 GiB
+   cap.
+7. Budget breach now stops the launcher through controlled shutdown instead of
+   allowing repeated incomplete evidence writes.
+8. Long compact runs no longer retain every closed-position canonical event in
+   RAM after terminal evidence is durably flushed.
+9. No trading decision behavior changes.
 
 ## Compatibility
 

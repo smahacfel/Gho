@@ -209,6 +209,7 @@ pub enum ShadowV2BurninMode {
 
 pub const DEFAULT_SHADOW_V2_POST_RUN_MANIFEST_DRAIN_TIMEOUT_MS: u64 = 180_000;
 pub const DEFAULT_SHADOW_V2_L2_MAX_TOTAL_ARTIFACT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+pub const DEFAULT_SHADOW_V2_L2_MIN_FREE_DISK_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 pub const DEFAULT_SHADOW_V2_L2_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const DEFAULT_SHADOW_V2_L2_MAX_ROWS_PER_FILE: u64 = 2_000_000;
 pub const DEFAULT_SHADOW_V2_L2_MAX_DENSITY_ROWS: u64 = 250_000;
@@ -262,8 +263,13 @@ pub struct ShadowV2BurninConfig {
     pub artifact_budget_enabled: bool,
     /// Rotate large Shadow V2 artifact JSONL files before budget failure.
     pub artifact_rotation_enabled: bool,
+    /// When enabled, artifact writes continue until filesystem free space reaches min_free_disk_bytes.
+    pub artifact_budget_disk_headroom_enabled: bool,
     /// Maximum total bytes across Shadow V2 L2 artifacts before fail-closed blocking.
+    /// A value of 0 disables the fixed total cap only when disk-headroom budget is enabled.
     pub max_total_artifact_bytes: u64,
+    /// Minimum filesystem free bytes to preserve for disk-headroom artifact budgeting.
+    pub min_free_disk_bytes: u64,
     /// Maximum bytes per Shadow V2 L2 artifact file before fail-closed blocking.
     pub max_file_bytes: u64,
     /// Maximum rows per Shadow V2 L2 artifact file before fail-closed blocking.
@@ -343,7 +349,9 @@ impl Default for ShadowV2BurninConfig {
             replay_lifecycle_compact_refs_enabled: true,
             artifact_budget_enabled: true,
             artifact_rotation_enabled: true,
+            artifact_budget_disk_headroom_enabled: false,
             max_total_artifact_bytes: DEFAULT_SHADOW_V2_L2_MAX_TOTAL_ARTIFACT_BYTES,
+            min_free_disk_bytes: DEFAULT_SHADOW_V2_L2_MIN_FREE_DISK_BYTES,
             max_file_bytes: DEFAULT_SHADOW_V2_L2_MAX_FILE_BYTES,
             max_rows_per_file: DEFAULT_SHADOW_V2_L2_MAX_ROWS_PER_FILE,
             max_density_rows: DEFAULT_SHADOW_V2_L2_MAX_DENSITY_ROWS,
@@ -405,10 +413,23 @@ impl ShadowV2BurninConfig {
             anyhow::bail!("Shadow V2 raw_evidence_retention_policy must be non-empty");
         }
         if self.artifact_budget_enabled {
-            if self.max_total_artifact_bytes == 0
-                || self.max_file_bytes == 0
+            if self.max_total_artifact_bytes == 0 && !self.artifact_budget_disk_headroom_enabled {
+                anyhow::bail!(
+                    "Shadow V2 max_total_artifact_bytes=0 requires artifact_budget_disk_headroom_enabled=true"
+                );
+            }
+            if self.artifact_budget_disk_headroom_enabled && self.min_free_disk_bytes == 0 {
+                anyhow::bail!(
+                    "Shadow V2 min_free_disk_bytes must be positive when disk-headroom budget is enabled"
+                );
+            }
+            if self.max_density_rows == 0 && !self.artifact_budget_disk_headroom_enabled {
+                anyhow::bail!(
+                    "Shadow V2 max_density_rows=0 requires artifact_budget_disk_headroom_enabled=true"
+                );
+            }
+            if self.max_file_bytes == 0
                 || self.max_rows_per_file == 0
-                || self.max_density_rows == 0
                 || self.max_stdout_bytes == 0
                 || self.max_system_log_bytes == 0
             {
@@ -6171,6 +6192,53 @@ include_spl = false
             .expect_err("PR11 must reject Shadow V2 runtime approval");
 
         assert!(err.to_string().contains("runtime_approval"));
+    }
+
+    #[test]
+    fn shadow_v2_config_allows_zero_total_artifact_cap_only_with_disk_headroom() {
+        let mut fixed_cap = ShadowV2BurninConfig::default();
+        fixed_cap.max_total_artifact_bytes = 0;
+        let err = fixed_cap
+            .validate()
+            .expect_err("fixed-cap artifact budget must reject zero max_total_artifact_bytes");
+        assert!(err
+            .to_string()
+            .contains("artifact_budget_disk_headroom_enabled"));
+
+        let mut disk_headroom = fixed_cap;
+        disk_headroom.artifact_budget_disk_headroom_enabled = true;
+        disk_headroom.min_free_disk_bytes = DEFAULT_SHADOW_V2_L2_MIN_FREE_DISK_BYTES;
+        assert!(disk_headroom.validate().is_ok());
+    }
+
+    #[test]
+    fn shadow_v2_config_allows_zero_density_row_cap_only_with_disk_headroom() {
+        let mut fixed_cap = ShadowV2BurninConfig::default();
+        fixed_cap.max_density_rows = 0;
+        let err = fixed_cap
+            .validate()
+            .expect_err("fixed-cap artifact budget must reject zero max_density_rows");
+        assert!(err
+            .to_string()
+            .contains("artifact_budget_disk_headroom_enabled"));
+
+        let mut disk_headroom = fixed_cap;
+        disk_headroom.artifact_budget_disk_headroom_enabled = true;
+        disk_headroom.min_free_disk_bytes = DEFAULT_SHADOW_V2_L2_MIN_FREE_DISK_BYTES;
+        assert!(disk_headroom.validate().is_ok());
+    }
+
+    #[test]
+    fn shadow_v2_config_rejects_zero_min_free_disk_bytes_when_disk_headroom_enabled() {
+        let mut config = ShadowV2BurninConfig::default();
+        config.artifact_budget_disk_headroom_enabled = true;
+        config.min_free_disk_bytes = 0;
+
+        let err = config
+            .validate()
+            .expect_err("disk-headroom budget must preserve a positive free-space margin");
+
+        assert!(err.to_string().contains("min_free_disk_bytes"));
     }
 
     fn shadow_v2_complete_enabled_config() -> ShadowV2BurninConfig {

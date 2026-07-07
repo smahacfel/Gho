@@ -27,6 +27,7 @@
 use anyhow::{bail, Context, Result};
 use ghost_brain::config::ghost_brain_config::ShadowV2BurninConfig;
 use ghost_brain::config::{GatekeeperV2Config, GhostBrainConfig};
+use ghost_brain::guardian::post_buy::shadow_v2::shadow_v2_artifact_budget_exceeded;
 use ghost_brain::oracle::SnapshotEngine;
 use ghost_brain::tuning::{BanditAlgorithm, TuningMessage, TuningService, TuningServiceConfig};
 use ghost_core::health::RuntimeHealth;
@@ -2522,6 +2523,35 @@ async fn main() -> Result<()> {
     });
     handles.push(("Watchdog", watchdog_handle));
 
+    let shadow_v2_artifact_budget_guard_enabled =
+        shadow_v2_burnin_config.enabled && shadow_v2_burnin_config.artifact_budget_enabled;
+    let mut shadow_v2_artifact_budget_shutdown_rx = shutdown_tx.subscribe();
+    if shadow_v2_artifact_budget_guard_enabled {
+        let shadow_v2_artifact_budget_shutdown_tx = shutdown_tx.clone();
+        let mut shadow_v2_artifact_budget_guard_shutdown_rx = shutdown_tx.subscribe();
+        let shadow_v2_artifact_budget_guard_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    _ = shadow_v2_artifact_budget_guard_shutdown_rx.recv() => break,
+                    _ = interval.tick() => {
+                        if shadow_v2_artifact_budget_exceeded() {
+                            error!(
+                                "Shadow V2 artifact budget exceeded; requesting controlled launcher shutdown"
+                            );
+                            let _ = shadow_v2_artifact_budget_shutdown_tx.send(());
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        handles.push((
+            "ShadowV2ArtifactBudgetGuard",
+            shadow_v2_artifact_budget_guard_handle,
+        ));
+    }
+
     // ── STARTUP GUARD: gRPC subscribe-proof within 5 s ──────────────
     if is_grpc_mode {
         let guard_health = Arc::clone(&health);
@@ -2554,6 +2584,11 @@ async fn main() -> Result<()> {
                     error!("Error listening for shutdown signal: {}", err);
                 }
             }
+        }
+        _ = shadow_v2_artifact_budget_shutdown_rx.recv(), if shadow_v2_artifact_budget_guard_enabled => {
+            error!(
+                "Shadow V2 artifact budget guard requested shutdown; stopping all components..."
+            );
         }
         oracle_result = &mut oracle_handle => {
             match oracle_result {
