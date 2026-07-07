@@ -764,6 +764,13 @@ def execution_grade(row: dict[str, Any]) -> str:
     return str(value or "").upper()
 
 
+def is_research_candidate_grade(value: str) -> bool:
+    return str(value or "").upper() in {
+        "RESEARCH_CANDIDATE",
+        "RESEARCH_GRADE_CANDIDATE",
+    }
+
+
 def collect_roundtrip_position_sets(scope_root: Path) -> tuple[dict[str, set[str]], int]:
     malformed = 0
     entry_research_positions: set[str] = set()
@@ -782,11 +789,11 @@ def collect_roundtrip_position_sets(scope_root: Path) -> tuple[dict[str, set[str
             continue
         if schema == "shadow_entry_fill_v2" and fill_status(row) == "FILLED":
             entry_filled_positions.add(pos)
-            if execution_grade(row) == "RESEARCH_CANDIDATE":
+            if is_research_candidate_grade(execution_grade(row)):
                 entry_research_positions.add(pos)
         elif schema == "shadow_exit_fill_v2" and fill_status(row) == "FILLED":
             exit_filled_positions.add(pos)
-            if execution_grade(row) == "RESEARCH_CANDIDATE":
+            if is_research_candidate_grade(execution_grade(row)):
                 exit_research_positions.add(pos)
         elif (
             schema == "shadow_terminal_truth_v2"

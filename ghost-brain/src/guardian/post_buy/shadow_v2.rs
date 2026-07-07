@@ -8,10 +8,15 @@
 //! records.
 
 use std::collections::{HashMap, HashSet};
+#[cfg(unix)]
+use std::ffi::CString;
 use std::fmt;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::shadow_v2_execution::{
@@ -33,8 +38,28 @@ pub const SHADOW_V2_LIFECYCLE_DERIVATION_VERSION: &str =
     "shadow_v2_lifecycle_derived_from_canonical_stream_v1";
 pub const SHADOW_V2_VALIDATION_HARNESS_VERSION: &str =
     "shadow_v2_validation_harness_logging_only_v1";
+pub const SHADOW_V2_L2_DECLARED_DENSITY_HORIZONS_MS: [u64; 5] =
+    [2_000, 3_000, 10_000, 30_000, 120_000];
+pub const SHADOW_V2_L2_UNDECLARED_LONG_HORIZONS_MS: [u64; 2] = [300_000, 500_000];
+pub const SHADOW_V2_DENSITY_FULL_STREAM_ENV: &str = "SHADOW_V2_DENSITY_FULL_STREAM";
+pub const SHADOW_V2_ARTIFACT_BUDGET_BLOCKER: &str = "BLOCKED_L2_ARTIFACT_BUDGET_EXCEEDED";
+pub const SHADOW_V2_DEFAULT_MIN_FREE_DISK_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+pub const SHADOW_V2_SOURCE_REF_MANIFEST_SCHEMA: &str = "shadow_source_ref_manifest_v2";
+pub const SHADOW_V2_ARTIFACT_ROTATION_MANIFEST_SCHEMA: &str =
+    "shadow_artifact_rotation_manifest_v2";
 pub const EVENT_ORDER_UNKNOWN_INDEX: u32 = u32::MAX;
 pub const EVENT_ORDER_UNKNOWN_SIGNATURE: &str = "UNKNOWN";
+
+static SHADOW_V2_ARTIFACT_BUDGET_EXCEEDED: AtomicBool = AtomicBool::new(false);
+
+pub fn shadow_v2_artifact_budget_exceeded() -> bool {
+    SHADOW_V2_ARTIFACT_BUDGET_EXCEEDED.load(Ordering::SeqCst)
+}
+
+#[cfg(test)]
+fn reset_shadow_v2_artifact_budget_exceeded_for_tests() {
+    SHADOW_V2_ARTIFACT_BUDGET_EXCEEDED.store(false, Ordering::SeqCst);
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -1062,6 +1087,13 @@ impl ShadowV2CanonicalEventStream {
             .collect()
     }
 
+    fn evict_position_events_after_terminal_flush(&mut self, position_id: &str) -> usize {
+        let before = self.events.len();
+        self.events
+            .retain(|event| event.envelope.position_id != position_id);
+        before.saturating_sub(self.events.len())
+    }
+
     pub fn terminal_event_id(&self, position_id: &str) -> Option<&str> {
         self.terminal_event_by_position
             .get(position_id)
@@ -1267,6 +1299,40 @@ fn append_jsonl_record(path: &Path, value: &impl Serialize) -> Result<(), Shadow
     file.flush()?;
     file.sync_data()?;
     Ok(())
+}
+
+fn blake3_file_hex(path: &Path) -> Result<String, ShadowV2Error> {
+    let mut file = File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn shadow_v2_rotated_jsonl_part_path(path: &Path, rotation_index: u64) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("shadow_v2_artifact.jsonl");
+    let base = file_name.strip_suffix(".jsonl").unwrap_or(file_name);
+    let rotated_name = format!("{base}.part-{rotation_index:06}.jsonl");
+    path.with_file_name(rotated_name)
+}
+
+fn next_shadow_v2_rotated_jsonl_part_path(path: &Path) -> (PathBuf, u64) {
+    for rotation_index in 1..=u64::MAX {
+        let candidate = shadow_v2_rotated_jsonl_part_path(path, rotation_index);
+        if !candidate.exists() {
+            return (candidate, rotation_index);
+        }
+    }
+    unreachable!("u64 rotation index space exhausted")
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3393,6 +3459,181 @@ fn sample_protected_from_path_cap(
         || (config.keep_every_event_sample && reason == ShadowPathSamplingReasonV2::EventSample)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShadowV2ArtifactBudgetConfig {
+    pub enabled: bool,
+    pub rotation_enabled: bool,
+    pub disk_headroom_enabled: bool,
+    pub max_total_artifact_bytes: u64,
+    pub min_free_disk_bytes: u64,
+    pub max_file_bytes: u64,
+    pub max_rows_per_file: u64,
+    pub max_density_rows: u64,
+    pub max_stdout_bytes: u64,
+    pub max_system_log_bytes: u64,
+}
+
+impl Default for ShadowV2ArtifactBudgetConfig {
+    fn default() -> Self {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const MIB: u64 = 1024 * 1024;
+        Self {
+            enabled: true,
+            rotation_enabled: true,
+            disk_headroom_enabled: false,
+            max_total_artifact_bytes: 5 * GIB,
+            min_free_disk_bytes: SHADOW_V2_DEFAULT_MIN_FREE_DISK_BYTES,
+            max_file_bytes: 2 * GIB,
+            max_rows_per_file: 2_000_000,
+            max_density_rows: 250_000,
+            max_stdout_bytes: 256 * MIB,
+            max_system_log_bytes: 512 * MIB,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShadowV2ArtifactRotationManifestRow {
+    pub schema: String,
+    pub schema_version: u32,
+    pub run_id: String,
+    pub artifact: String,
+    pub logical_path: String,
+    pub rotated_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compressed_path: Option<String>,
+    pub uncompressed_size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compressed_size_bytes: Option<u64>,
+    pub row_count: u64,
+    pub hash_algorithm: String,
+    pub hash_uncompressed: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash_compressed: Option<String>,
+    pub rotation_index: u64,
+    pub rotated_at_wall_ms: u64,
+}
+
+impl ShadowV2ArtifactRotationManifestRow {
+    fn new(
+        run_id: impl Into<String>,
+        artifact: impl Into<String>,
+        logical_path: &Path,
+        rotated_path: &Path,
+        uncompressed_size_bytes: u64,
+        row_count: u64,
+        rotation_index: u64,
+        hash_uncompressed: impl Into<String>,
+    ) -> Self {
+        Self {
+            schema: SHADOW_V2_ARTIFACT_ROTATION_MANIFEST_SCHEMA.to_string(),
+            schema_version: 1,
+            run_id: run_id.into(),
+            artifact: artifact.into(),
+            logical_path: logical_path.display().to_string(),
+            rotated_path: rotated_path.display().to_string(),
+            compressed_path: None,
+            uncompressed_size_bytes,
+            compressed_size_bytes: None,
+            row_count,
+            hash_algorithm: "blake3".to_string(),
+            hash_uncompressed: hash_uncompressed.into(),
+            hash_compressed: None,
+            rotation_index,
+            rotated_at_wall_ms: shadow_v2_now_ms(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShadowV2SourceRefSummary {
+    pub count: usize,
+    pub first_id: Option<String>,
+    pub last_id: Option<String>,
+    pub range_hash: Option<String>,
+    pub manifest_ref: Option<String>,
+}
+
+impl ShadowV2SourceRefSummary {
+    fn from_ids(ids: &[String], manifest_ref: Option<String>) -> Self {
+        Self {
+            count: ids.len(),
+            first_id: ids.first().cloned(),
+            last_id: ids.last().cloned(),
+            range_hash: (!ids.is_empty()).then(|| shadow_v2_source_ref_range_hash(ids)),
+            manifest_ref,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShadowV2SourceRefManifestRow {
+    pub schema: String,
+    pub schema_version: u32,
+    pub run_id: String,
+    pub position_id: String,
+    pub source_canonical_high_watermark: String,
+    pub canonical_event_stream_ref: String,
+    pub source_event_count: usize,
+    pub source_event_first_id: Option<String>,
+    pub source_event_last_id: Option<String>,
+    pub source_event_range_hash: Option<String>,
+    pub path_sample_count: usize,
+    pub path_sample_first_id: Option<String>,
+    pub path_sample_last_id: Option<String>,
+    pub path_sample_range_hash: Option<String>,
+    pub compact_ref_policy: String,
+    pub created_at_wall_ms: u64,
+}
+
+impl ShadowV2SourceRefManifestRow {
+    fn new(
+        high_watermark: &ShadowPositionEventV2,
+        canonical_event_stream_ref: impl Into<String>,
+        source_event_ids: &[String],
+        path_sample_event_ids: &[String],
+    ) -> Self {
+        let source_summary = ShadowV2SourceRefSummary::from_ids(source_event_ids, None);
+        let path_summary = ShadowV2SourceRefSummary::from_ids(path_sample_event_ids, None);
+        Self {
+            schema: SHADOW_V2_SOURCE_REF_MANIFEST_SCHEMA.to_string(),
+            schema_version: 1,
+            run_id: high_watermark.envelope.run_id.clone(),
+            position_id: high_watermark.envelope.position_id.clone(),
+            source_canonical_high_watermark: high_watermark.envelope.event_id.clone(),
+            canonical_event_stream_ref: canonical_event_stream_ref.into(),
+            source_event_count: source_summary.count,
+            source_event_first_id: source_summary.first_id,
+            source_event_last_id: source_summary.last_id,
+            source_event_range_hash: source_summary.range_hash,
+            path_sample_count: path_summary.count,
+            path_sample_first_id: path_summary.first_id,
+            path_sample_last_id: path_summary.last_id,
+            path_sample_range_hash: path_summary.range_hash,
+            compact_ref_policy: "COMPACT_RANGE_HASH_NO_REPEATED_FULL_ARRAYS".to_string(),
+            created_at_wall_ms: shadow_v2_now_ms(),
+        }
+    }
+
+    fn manifest_ref(&self) -> String {
+        format!(
+            "{}:{}:{}",
+            SHADOW_V2_SOURCE_REF_MANIFEST_SCHEMA,
+            self.position_id,
+            self.source_canonical_high_watermark
+        )
+    }
+}
+
+fn shadow_v2_source_ref_range_hash(ids: &[String]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for id in ids {
+        hasher.update(id.as_bytes());
+        hasher.update(b"\0");
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PathDensityInputStats {
     duplicate_age_count: usize,
@@ -3675,6 +3916,26 @@ pub struct ShadowReplayV2 {
     pub canonical_terminal_event_id: Option<String>,
     pub source_event_ids: Vec<String>,
     pub path_sample_event_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_event_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_event_first_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_event_last_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_event_range_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_event_manifest_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_sample_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_sample_first_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_sample_last_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_sample_range_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_sample_manifest_ref: Option<String>,
     pub entry_fill_event_id: Option<String>,
     pub exit_attempt_event_id: Option<String>,
     pub exit_fill_event_id: Option<String>,
@@ -3835,6 +4096,16 @@ impl ShadowReplayV2 {
             canonical_terminal_event_id: canonical_terminal_event_id.clone(),
             source_event_ids,
             path_sample_event_ids,
+            source_event_count: None,
+            source_event_first_id: None,
+            source_event_last_id: None,
+            source_event_range_hash: None,
+            source_event_manifest_ref: None,
+            path_sample_count: None,
+            path_sample_first_id: None,
+            path_sample_last_id: None,
+            path_sample_range_hash: None,
+            path_sample_manifest_ref: None,
             entry_fill_event_id,
             exit_attempt_event_id,
             exit_fill_event_id,
@@ -3854,6 +4125,38 @@ impl ShadowReplayV2 {
                 .and_then(|record| record.close_age_ms),
             replay_derivation_status,
         })
+    }
+
+    fn compact_source_refs(&mut self, manifest_ref: String) {
+        let source_summary =
+            ShadowV2SourceRefSummary::from_ids(&self.source_event_ids, Some(manifest_ref.clone()));
+        let path_summary =
+            ShadowV2SourceRefSummary::from_ids(&self.path_sample_event_ids, Some(manifest_ref));
+
+        self.source_event_count = Some(source_summary.count);
+        self.source_event_first_id = source_summary.first_id;
+        self.source_event_last_id = source_summary.last_id;
+        self.source_event_range_hash = source_summary.range_hash;
+        self.source_event_manifest_ref = source_summary.manifest_ref;
+        self.path_sample_count = Some(path_summary.count);
+        self.path_sample_first_id = path_summary.first_id;
+        self.path_sample_last_id = path_summary.last_id;
+        self.path_sample_range_hash = path_summary.range_hash;
+        self.path_sample_manifest_ref = path_summary.manifest_ref;
+        self.source_event_ids.clear();
+        self.path_sample_event_ids.clear();
+        self.envelope
+            .source_refs
+            .retain(|source_ref| !source_ref.starts_with("canonical_event:"));
+        self.envelope.source_refs.push(format!(
+            "source_ref_manifest:{}",
+            self.source_event_manifest_ref
+                .as_deref()
+                .unwrap_or("UNKNOWN")
+        ));
+        self.envelope
+            .limitations
+            .push("SOURCE_REFS_COMPACTED_TO_MANIFEST_RANGE_HASH".to_string());
     }
 }
 
@@ -3878,6 +4181,16 @@ pub struct ShadowLifecycleV2 {
     pub duplicate_terminal_handling: String,
     pub reconciliation_status: String,
     pub source_event_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_event_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_event_first_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_event_last_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_event_range_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_event_manifest_ref: Option<String>,
     pub derived_view_not_canonical_terminal: bool,
 }
 
@@ -4030,8 +4343,36 @@ impl ShadowLifecycleV2 {
                 "DERIVED_LIFECYCLE_VIEW_DOES_NOT_CREATE_CANONICAL_TERMINAL_TRUTH".to_string(),
             reconciliation_status,
             source_event_ids,
+            source_event_count: None,
+            source_event_first_id: None,
+            source_event_last_id: None,
+            source_event_range_hash: None,
+            source_event_manifest_ref: None,
             derived_view_not_canonical_terminal: true,
         })
+    }
+
+    fn compact_source_refs(&mut self, manifest_ref: String) {
+        let source_summary =
+            ShadowV2SourceRefSummary::from_ids(&self.source_event_ids, Some(manifest_ref));
+        self.source_event_count = Some(source_summary.count);
+        self.source_event_first_id = source_summary.first_id;
+        self.source_event_last_id = source_summary.last_id;
+        self.source_event_range_hash = source_summary.range_hash;
+        self.source_event_manifest_ref = source_summary.manifest_ref;
+        self.source_event_ids.clear();
+        self.envelope
+            .source_refs
+            .retain(|source_ref| !source_ref.starts_with("canonical_event:"));
+        self.envelope.source_refs.push(format!(
+            "source_ref_manifest:{}",
+            self.source_event_manifest_ref
+                .as_deref()
+                .unwrap_or("UNKNOWN")
+        ));
+        self.envelope
+            .limitations
+            .push("SOURCE_REFS_COMPACTED_TO_MANIFEST_RANGE_HASH".to_string());
     }
 }
 
@@ -4197,9 +4538,15 @@ pub struct ShadowV2ValidationHarnessConfig {
     pub replay_v2_path: PathBuf,
     pub lifecycle_v2_path: PathBuf,
     pub path_density_v2_path: PathBuf,
+    pub source_ref_manifest_v2_path: PathBuf,
+    pub artifact_rotation_manifest_v2_path: PathBuf,
     pub canonical_event_stream_ref: String,
     pub path_sampler_config: ShadowPathSamplerConfigV2,
     pub density_horizons_ms: Vec<u64>,
+    pub compact_density_enabled: bool,
+    pub density_full_stream_enabled: bool,
+    pub replay_lifecycle_compact_refs_enabled: bool,
+    pub artifact_budget: ShadowV2ArtifactBudgetConfig,
 }
 
 impl ShadowV2ValidationHarnessConfig {
@@ -4212,15 +4559,32 @@ impl ShadowV2ValidationHarnessConfig {
     ) -> Self {
         let canonical_event_stream_path = canonical_event_stream_path.into();
         let canonical_event_stream_ref = canonical_event_stream_path.display().to_string();
+        let replay_v2_path = replay_v2_path.into();
+        let density_full_stream_enabled = shadow_v2_density_full_stream_enabled_from_env();
+        let density_horizons_ms = if density_full_stream_enabled {
+            shadow_v2_full_density_horizons_ms()
+        } else {
+            shadow_v2_l2_declared_density_horizons_ms()
+        };
+        let source_ref_manifest_v2_path =
+            replay_v2_path.with_file_name("shadow_source_ref_manifest_v2.jsonl");
+        let artifact_rotation_manifest_v2_path =
+            replay_v2_path.with_file_name("shadow_artifact_rotation_manifest_v2.jsonl");
         Self {
             run_id: run_id.into(),
             canonical_event_stream_path,
-            replay_v2_path: replay_v2_path.into(),
+            replay_v2_path,
             lifecycle_v2_path: lifecycle_v2_path.into(),
             path_density_v2_path: path_density_v2_path.into(),
+            source_ref_manifest_v2_path,
+            artifact_rotation_manifest_v2_path,
             canonical_event_stream_ref,
             path_sampler_config: ShadowPathSamplerConfigV2::standard_120s(),
-            density_horizons_ms: vec![2_000, 3_000, 10_000, 30_000, 120_000, 300_000, 500_000],
+            density_horizons_ms,
+            compact_density_enabled: !density_full_stream_enabled,
+            density_full_stream_enabled,
+            replay_lifecycle_compact_refs_enabled: true,
+            artifact_budget: ShadowV2ArtifactBudgetConfig::default(),
         }
     }
 
@@ -4255,14 +4619,125 @@ impl ShadowV2ValidationHarnessConfig {
             config.path_density_v2_path.as_deref(),
             "path_density_v2_path",
         )?;
-        Ok(Some(Self::new(
+        let mut harness_config = Self::new(
             run_id,
             canonical_event_stream_path,
             replay_v2_path,
             lifecycle_v2_path,
             path_density_v2_path,
-        )))
+        );
+        harness_config.source_ref_manifest_v2_path = config
+            .source_ref_manifest_v2_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| harness_config.source_ref_manifest_v2_path.clone());
+        harness_config.compact_density_enabled = config.compact_density_enabled;
+        harness_config.density_full_stream_enabled =
+            config.density_full_stream_enabled || shadow_v2_density_full_stream_enabled_from_env();
+        if harness_config.density_full_stream_enabled {
+            harness_config.compact_density_enabled = false;
+            harness_config.density_horizons_ms = shadow_v2_full_density_horizons_ms();
+        } else {
+            harness_config.density_horizons_ms = shadow_v2_l2_declared_density_horizons_ms();
+        }
+        harness_config.replay_lifecycle_compact_refs_enabled =
+            config.replay_lifecycle_compact_refs_enabled;
+        harness_config.artifact_budget = ShadowV2ArtifactBudgetConfig {
+            enabled: config.artifact_budget_enabled,
+            rotation_enabled: config.artifact_rotation_enabled,
+            disk_headroom_enabled: config.artifact_budget_disk_headroom_enabled,
+            max_total_artifact_bytes: config.max_total_artifact_bytes,
+            min_free_disk_bytes: config.min_free_disk_bytes,
+            max_file_bytes: config.max_file_bytes,
+            max_rows_per_file: config.max_rows_per_file,
+            max_density_rows: config.max_density_rows,
+            max_stdout_bytes: config.max_stdout_bytes,
+            max_system_log_bytes: config.max_system_log_bytes,
+        };
+        Ok(Some(harness_config))
     }
+}
+
+pub fn shadow_v2_l2_declared_density_horizons_ms() -> Vec<u64> {
+    SHADOW_V2_L2_DECLARED_DENSITY_HORIZONS_MS.to_vec()
+}
+
+pub fn shadow_v2_full_density_horizons_ms() -> Vec<u64> {
+    SHADOW_V2_L2_DECLARED_DENSITY_HORIZONS_MS
+        .iter()
+        .chain(SHADOW_V2_L2_UNDECLARED_LONG_HORIZONS_MS.iter())
+        .copied()
+        .collect()
+}
+
+fn shadow_v2_density_full_stream_enabled_from_env() -> bool {
+    matches!(
+        std::env::var(SHADOW_V2_DENSITY_FULL_STREAM_ENV).as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
+}
+
+fn shadow_v2_density_compact_flush_event(event_kind: ShadowPositionEventKindV2) -> bool {
+    matches!(event_kind, ShadowPositionEventKindV2::TerminalTruth)
+}
+
+fn shadow_v2_artifact_budget_error(reason: impl Into<String>) -> ShadowV2Error {
+    SHADOW_V2_ARTIFACT_BUDGET_EXCEEDED.store(true, Ordering::SeqCst);
+    ShadowV2Error::Io(format!(
+        "{SHADOW_V2_ARTIFACT_BUDGET_BLOCKER}: {}",
+        reason.into()
+    ))
+}
+
+#[cfg(unix)]
+fn shadow_v2_existing_filesystem_probe_path(path: &Path) -> PathBuf {
+    let mut probe = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| path.to_path_buf())
+    };
+    while !probe.exists() {
+        if !probe.pop() {
+            return PathBuf::from(".");
+        }
+    }
+    probe
+}
+
+#[cfg(unix)]
+fn shadow_v2_filesystem_available_bytes(path: &Path) -> io::Result<u64> {
+    let probe = shadow_v2_existing_filesystem_probe_path(path);
+    let c_path = CString::new(probe.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "cannot probe filesystem free bytes for path with interior nul: {}",
+                probe.display()
+            ),
+        )
+    })?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // Safety: c_path is a valid NUL-terminated path and stat points to writable memory
+    // for libc::statvfs to initialize before we read it on a zero return code.
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // Safety: statvfs returned success, so stat has been fully initialized by libc.
+    let stat = unsafe { stat.assume_init() };
+    Ok((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
+}
+
+#[cfg(not(unix))]
+fn shadow_v2_filesystem_available_bytes(_path: &Path) -> io::Result<u64> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Shadow V2 disk-headroom artifact budget requires unix statvfs support",
+    ))
 }
 
 fn required_shadow_v2_burnin_path_component(
@@ -4282,6 +4757,21 @@ fn required_shadow_v2_burnin_path_component(
 pub struct ShadowV2ValidationHarness {
     config: ShadowV2ValidationHarnessConfig,
     canonical_writer: JsonlShadowV2CanonicalWriter,
+    canonical_rows_written: u64,
+    canonical_active_rows_written: u64,
+    replay_rows_written: u64,
+    replay_active_rows_written: u64,
+    lifecycle_rows_written: u64,
+    lifecycle_active_rows_written: u64,
+    density_rows_written: u64,
+    density_active_rows_written: u64,
+    source_ref_manifest_rows_written: u64,
+    source_ref_manifest_active_rows_written: u64,
+    artifact_rotation_manifest_rows_written: u64,
+    rotated_artifact_bytes: u64,
+    source_ref_manifest_keys: HashSet<String>,
+    terminal_flushed_positions_evicted_from_memory: HashSet<String>,
+    terminal_flushed_canonical_events_evicted_from_memory: u64,
 }
 
 impl ShadowV2ValidationHarness {
@@ -4291,6 +4781,21 @@ impl ShadowV2ValidationHarness {
         Ok(Self {
             config,
             canonical_writer,
+            canonical_rows_written: 0,
+            canonical_active_rows_written: 0,
+            replay_rows_written: 0,
+            replay_active_rows_written: 0,
+            lifecycle_rows_written: 0,
+            lifecycle_active_rows_written: 0,
+            density_rows_written: 0,
+            density_active_rows_written: 0,
+            source_ref_manifest_rows_written: 0,
+            source_ref_manifest_active_rows_written: 0,
+            artifact_rotation_manifest_rows_written: 0,
+            rotated_artifact_bytes: 0,
+            source_ref_manifest_keys: HashSet::new(),
+            terminal_flushed_positions_evicted_from_memory: HashSet::new(),
+            terminal_flushed_canonical_events_evicted_from_memory: 0,
         })
     }
 
@@ -4305,14 +4810,55 @@ impl ShadowV2ValidationHarness {
         }
 
         let position_id = record.envelope().position_id.clone();
-        if let Err(error) = self.canonical_writer.append_record(record) {
+        if self
+            .terminal_flushed_positions_evicted_from_memory
+            .contains(&position_id)
+        {
+            return ShadowV2HarnessAppendOutcome::canonical_failed(
+                "HARNESS_POSITION_EVICTED_AFTER_TERMINAL_FLUSH",
+            );
+        }
+        let event = match self.canonical_writer.stream.prepare_record(record) {
+            Ok(event) => event,
+            Err(error) => return ShadowV2HarnessAppendOutcome::canonical_failed(error),
+        };
+        let is_terminal_event = event.is_canonical_terminal();
+        let canonical_path = self.config.canonical_event_stream_path.clone();
+        let active_rows = match self.rotate_artifact_if_needed(
+            &canonical_path,
+            "shadow_position_event_v2",
+            self.canonical_active_rows_written,
+        ) {
+            Ok(active_rows) => active_rows,
+            Err(error) => return ShadowV2HarnessAppendOutcome::canonical_failed(error),
+        };
+        if let Err(error) = self.ensure_artifact_budget_before_write(
+            &canonical_path,
+            "shadow_position_event_v2",
+            active_rows.saturating_add(1),
+        ) {
             return ShadowV2HarnessAppendOutcome::canonical_failed(error);
         }
+        if let Err(error) = append_jsonl_record(&canonical_path, &event) {
+            return ShadowV2HarnessAppendOutcome::canonical_failed(error);
+        }
+        if let Err(error) = self.canonical_writer.stream.commit_prepared_event(event) {
+            return ShadowV2HarnessAppendOutcome::canonical_failed(error);
+        }
+        self.canonical_rows_written = self.canonical_rows_written.saturating_add(1);
+        self.canonical_active_rows_written = active_rows.saturating_add(1);
 
         let replay_write = self.write_replay_snapshot(&position_id);
         let lifecycle_write = self.write_lifecycle_snapshot(&position_id);
         let density_write = self.write_path_density_snapshots(&position_id);
-        ShadowV2HarnessAppendOutcome::from_writes(replay_write, lifecycle_write, density_write)
+        let outcome =
+            ShadowV2HarnessAppendOutcome::from_writes(replay_write, lifecycle_write, density_write);
+        if is_terminal_event
+            && outcome.validation_evidence_status == ShadowV2ValidationEvidenceStatus::Complete
+        {
+            self.evict_terminal_position_from_memory(&position_id);
+        }
+        outcome
     }
 
     pub fn canonical_stream(&self) -> &ShadowV2CanonicalEventStream {
@@ -4323,47 +4869,142 @@ impl ShadowV2ValidationHarness {
         self.canonical_writer.path()
     }
 
-    fn write_replay_snapshot(&self, position_id: &str) -> ShadowV2WriteStatus {
-        let Some(high_watermark) = self.high_watermark_for_position(position_id) else {
+    fn evict_terminal_position_from_memory(&mut self, position_id: &str) {
+        if !(self.config.compact_density_enabled
+            && self.config.replay_lifecycle_compact_refs_enabled
+            && !self.config.density_full_stream_enabled)
+        {
+            return;
+        }
+        let evicted = self
+            .canonical_writer
+            .stream
+            .evict_position_events_after_terminal_flush(position_id);
+        if evicted > 0 {
+            self.terminal_flushed_canonical_events_evicted_from_memory = self
+                .terminal_flushed_canonical_events_evicted_from_memory
+                .saturating_add(evicted as u64);
+            self.terminal_flushed_positions_evicted_from_memory
+                .insert(position_id.to_string());
+        }
+    }
+
+    fn write_replay_snapshot(&mut self, position_id: &str) -> ShadowV2WriteStatus {
+        let Some(high_watermark) = self.high_watermark_for_position(position_id).cloned() else {
             return ShadowV2WriteStatus::Skipped("NO_CANONICAL_HIGH_WATERMARK".to_string());
         };
-        let envelope = derived_snapshot_envelope("shadow_replay_v2", "replay_v2", high_watermark);
+        let envelope = derived_snapshot_envelope("shadow_replay_v2", "replay_v2", &high_watermark);
         match ShadowReplayV2::derive_from_canonical_stream(
             envelope,
             self.canonical_writer.stream(),
             position_id,
             self.config.canonical_event_stream_ref.clone(),
-        )
-        .and_then(|replay| append_jsonl_record(&self.config.replay_v2_path, &replay))
-        {
-            Ok(()) => ShadowV2WriteStatus::Ok,
+        ) {
+            Ok(mut replay) => {
+                if self.config.replay_lifecycle_compact_refs_enabled {
+                    match self.write_source_ref_manifest_snapshot(
+                        &high_watermark,
+                        &replay.source_event_ids,
+                        &replay.path_sample_event_ids,
+                    ) {
+                        Ok(manifest_ref) => replay.compact_source_refs(manifest_ref),
+                        Err(error) => return ShadowV2WriteStatus::Err(error.to_string()),
+                    }
+                }
+                let replay_path = self.config.replay_v2_path.clone();
+                let active_rows = match self.rotate_artifact_if_needed(
+                    &replay_path,
+                    "shadow_replay_v2",
+                    self.replay_active_rows_written,
+                ) {
+                    Ok(active_rows) => active_rows,
+                    Err(error) => return ShadowV2WriteStatus::Err(error.to_string()),
+                };
+                if let Err(error) = self.ensure_artifact_budget_before_write(
+                    &replay_path,
+                    "shadow_replay_v2",
+                    active_rows.saturating_add(1),
+                ) {
+                    return ShadowV2WriteStatus::Err(error.to_string());
+                }
+                match append_jsonl_record(&replay_path, &replay) {
+                    Ok(()) => {
+                        self.replay_rows_written = self.replay_rows_written.saturating_add(1);
+                        self.replay_active_rows_written = active_rows.saturating_add(1);
+                        ShadowV2WriteStatus::Ok
+                    }
+                    Err(error) => ShadowV2WriteStatus::Err(error.to_string()),
+                }
+            }
             Err(error) => ShadowV2WriteStatus::Err(error.to_string()),
         }
     }
 
-    fn write_lifecycle_snapshot(&self, position_id: &str) -> ShadowV2WriteStatus {
-        let Some(high_watermark) = self.high_watermark_for_position(position_id) else {
+    fn write_lifecycle_snapshot(&mut self, position_id: &str) -> ShadowV2WriteStatus {
+        let Some(high_watermark) = self.high_watermark_for_position(position_id).cloned() else {
             return ShadowV2WriteStatus::Skipped("NO_CANONICAL_HIGH_WATERMARK".to_string());
         };
         let envelope =
-            derived_snapshot_envelope("shadow_lifecycle_v2", "lifecycle_v2", high_watermark);
+            derived_snapshot_envelope("shadow_lifecycle_v2", "lifecycle_v2", &high_watermark);
         match ShadowLifecycleV2::derive_from_canonical_stream(
             envelope,
             self.canonical_writer.stream(),
             position_id,
             self.config.canonical_event_stream_ref.clone(),
-        )
-        .and_then(|lifecycle| append_jsonl_record(&self.config.lifecycle_v2_path, &lifecycle))
-        {
-            Ok(()) => ShadowV2WriteStatus::Ok,
+        ) {
+            Ok(mut lifecycle) => {
+                if self.config.replay_lifecycle_compact_refs_enabled {
+                    let (source_event_ids, path_sample_event_ids) =
+                        self.canonical_ref_ids_for_position(position_id);
+                    match self.write_source_ref_manifest_snapshot(
+                        &high_watermark,
+                        &source_event_ids,
+                        &path_sample_event_ids,
+                    ) {
+                        Ok(manifest_ref) => lifecycle.compact_source_refs(manifest_ref),
+                        Err(error) => return ShadowV2WriteStatus::Err(error.to_string()),
+                    }
+                }
+                let lifecycle_path = self.config.lifecycle_v2_path.clone();
+                let active_rows = match self.rotate_artifact_if_needed(
+                    &lifecycle_path,
+                    "shadow_lifecycle_v2",
+                    self.lifecycle_active_rows_written,
+                ) {
+                    Ok(active_rows) => active_rows,
+                    Err(error) => return ShadowV2WriteStatus::Err(error.to_string()),
+                };
+                if let Err(error) = self.ensure_artifact_budget_before_write(
+                    &lifecycle_path,
+                    "shadow_lifecycle_v2",
+                    active_rows.saturating_add(1),
+                ) {
+                    return ShadowV2WriteStatus::Err(error.to_string());
+                }
+                match append_jsonl_record(&lifecycle_path, &lifecycle) {
+                    Ok(()) => {
+                        self.lifecycle_rows_written = self.lifecycle_rows_written.saturating_add(1);
+                        self.lifecycle_active_rows_written = active_rows.saturating_add(1);
+                        ShadowV2WriteStatus::Ok
+                    }
+                    Err(error) => ShadowV2WriteStatus::Err(error.to_string()),
+                }
+            }
             Err(error) => ShadowV2WriteStatus::Err(error.to_string()),
         }
     }
 
-    fn write_path_density_snapshots(&self, position_id: &str) -> ShadowV2WriteStatus {
-        let Some(high_watermark) = self.high_watermark_for_position(position_id) else {
+    fn write_path_density_snapshots(&mut self, position_id: &str) -> ShadowV2WriteStatus {
+        let Some(high_watermark) = self.high_watermark_for_position(position_id).cloned() else {
             return ShadowV2WriteStatus::Skipped("NO_CANONICAL_HIGH_WATERMARK".to_string());
         };
+        if self.config.compact_density_enabled
+            && !shadow_v2_density_compact_flush_event(high_watermark.event_kind)
+        {
+            return ShadowV2WriteStatus::Skipped(
+                "DENSITY_COMPACT_WAITING_FOR_FINAL_SNAPSHOT".to_string(),
+            );
+        }
         let path_samples = self.path_samples_for_position(position_id);
         let selected_samples =
             select_path_samples_v2(&path_samples, &self.config.path_sampler_config);
@@ -4380,18 +5021,224 @@ impl ShadowV2ValidationHarness {
         let created_at_wall_ms = shadow_v2_now_ms();
         for evaluation in evaluations {
             let row = ShadowPathDensityV2::from_evaluation(
-                high_watermark,
+                &high_watermark,
                 self.config.canonical_event_stream_ref.clone(),
                 source_path_sample_event_ids.clone(),
                 truncated,
                 evaluation,
                 created_at_wall_ms,
             );
-            if let Err(error) = append_jsonl_record(&self.config.path_density_v2_path, &row) {
+            if self.config.artifact_budget.enabled
+                && self.config.artifact_budget.max_density_rows > 0
+                && self.density_rows_written >= self.config.artifact_budget.max_density_rows
+            {
+                return ShadowV2WriteStatus::Err(
+                    shadow_v2_artifact_budget_error(format!(
+                        "shadow_path_density_v2 max_density_rows={} reached",
+                        self.config.artifact_budget.max_density_rows
+                    ))
+                    .to_string(),
+                );
+            }
+            let density_path = self.config.path_density_v2_path.clone();
+            let active_rows = match self.rotate_artifact_if_needed(
+                &density_path,
+                "shadow_path_density_v2",
+                self.density_active_rows_written,
+            ) {
+                Ok(active_rows) => active_rows,
+                Err(error) => return ShadowV2WriteStatus::Err(error.to_string()),
+            };
+            if let Err(error) = self.ensure_artifact_budget_before_write(
+                &density_path,
+                "shadow_path_density_v2",
+                active_rows.saturating_add(1),
+            ) {
                 return ShadowV2WriteStatus::Err(error.to_string());
             }
+            if let Err(error) = append_jsonl_record(&density_path, &row) {
+                return ShadowV2WriteStatus::Err(error.to_string());
+            }
+            self.density_rows_written = self.density_rows_written.saturating_add(1);
+            self.density_active_rows_written = active_rows.saturating_add(1);
         }
         ShadowV2WriteStatus::Ok
+    }
+
+    fn write_source_ref_manifest_snapshot(
+        &mut self,
+        high_watermark: &ShadowPositionEventV2,
+        source_event_ids: &[String],
+        path_sample_event_ids: &[String],
+    ) -> Result<String, ShadowV2Error> {
+        let row = ShadowV2SourceRefManifestRow::new(
+            high_watermark,
+            self.config.canonical_event_stream_ref.clone(),
+            source_event_ids,
+            path_sample_event_ids,
+        );
+        let manifest_ref = row.manifest_ref();
+        if self.source_ref_manifest_keys.insert(manifest_ref.clone()) {
+            let manifest_path = self.config.source_ref_manifest_v2_path.clone();
+            let active_rows = self.rotate_artifact_if_needed(
+                &manifest_path,
+                SHADOW_V2_SOURCE_REF_MANIFEST_SCHEMA,
+                self.source_ref_manifest_active_rows_written,
+            )?;
+            self.ensure_artifact_budget_before_write(
+                &manifest_path,
+                SHADOW_V2_SOURCE_REF_MANIFEST_SCHEMA,
+                active_rows.saturating_add(1),
+            )?;
+            append_jsonl_record(&manifest_path, &row)?;
+            self.source_ref_manifest_rows_written =
+                self.source_ref_manifest_rows_written.saturating_add(1);
+            self.source_ref_manifest_active_rows_written = active_rows.saturating_add(1);
+        }
+        Ok(manifest_ref)
+    }
+
+    fn rotate_artifact_if_needed(
+        &mut self,
+        path: &Path,
+        artifact: &str,
+        active_rows: u64,
+    ) -> Result<u64, ShadowV2Error> {
+        if !self.config.artifact_budget.enabled || !self.config.artifact_budget.rotation_enabled {
+            return Ok(active_rows);
+        }
+        let metadata = match std::fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(active_rows),
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.len() < self.config.artifact_budget.max_file_bytes
+            && active_rows < self.config.artifact_budget.max_rows_per_file
+        {
+            return Ok(active_rows);
+        }
+        let (rotated_path, rotation_index) = next_shadow_v2_rotated_jsonl_part_path(path);
+        if let Some(parent) = rotated_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::rename(path, &rotated_path)?;
+        let hash_uncompressed = blake3_file_hex(&rotated_path)?;
+        let row = ShadowV2ArtifactRotationManifestRow::new(
+            self.config.run_id.clone(),
+            artifact,
+            path,
+            &rotated_path,
+            metadata.len(),
+            active_rows,
+            rotation_index,
+            hash_uncompressed,
+        );
+        append_jsonl_record(&self.config.artifact_rotation_manifest_v2_path, &row)?;
+        self.artifact_rotation_manifest_rows_written = self
+            .artifact_rotation_manifest_rows_written
+            .saturating_add(1);
+        self.rotated_artifact_bytes = self.rotated_artifact_bytes.saturating_add(metadata.len());
+        Ok(0)
+    }
+
+    fn ensure_artifact_budget_before_write(
+        &self,
+        path: &Path,
+        artifact: &str,
+        next_rows_for_file: u64,
+    ) -> Result<(), ShadowV2Error> {
+        if !self.config.artifact_budget.enabled {
+            return Ok(());
+        }
+        let budget = &self.config.artifact_budget;
+        if next_rows_for_file > budget.max_rows_per_file {
+            if budget.rotation_enabled {
+                return Err(shadow_v2_artifact_budget_error(format!(
+                    "{artifact} rows would exceed max_rows_per_file={} after rotation path={}",
+                    budget.max_rows_per_file,
+                    path.display()
+                )));
+            } else {
+                return Err(shadow_v2_artifact_budget_error(format!(
+                    "{artifact} rows would exceed max_rows_per_file={} path={}",
+                    budget.max_rows_per_file,
+                    path.display()
+                )));
+            }
+        }
+        if let Ok(metadata) = std::fs::metadata(path) {
+            if metadata.len() >= budget.max_file_bytes {
+                return Err(shadow_v2_artifact_budget_error(format!(
+                    "{artifact} size_bytes={} exceeds max_file_bytes={} path={}",
+                    metadata.len(),
+                    budget.max_file_bytes,
+                    path.display()
+                )));
+            }
+        }
+        if budget.disk_headroom_enabled {
+            let available_bytes = shadow_v2_filesystem_available_bytes(path).map_err(|error| {
+                ShadowV2Error::Io(format!(
+                    "failed to check filesystem free bytes for {}: {}",
+                    path.display(),
+                    error
+                ))
+            })?;
+            if available_bytes <= budget.min_free_disk_bytes {
+                return Err(shadow_v2_artifact_budget_error(format!(
+                    "{artifact} filesystem free bytes {} at or below min_free_disk_bytes={} path={}",
+                    available_bytes,
+                    budget.min_free_disk_bytes,
+                    path.display()
+                )));
+            }
+        }
+        let total_bytes = self.configured_artifact_size_bytes();
+        if budget.max_total_artifact_bytes > 0 && total_bytes >= budget.max_total_artifact_bytes {
+            return Err(shadow_v2_artifact_budget_error(format!(
+                "configured artifact bytes {} exceed max_total_artifact_bytes={}",
+                total_bytes, budget.max_total_artifact_bytes
+            )));
+        }
+        Ok(())
+    }
+
+    fn configured_artifact_size_bytes(&self) -> u64 {
+        [
+            self.config.canonical_event_stream_path.as_path(),
+            self.config.replay_v2_path.as_path(),
+            self.config.lifecycle_v2_path.as_path(),
+            self.config.path_density_v2_path.as_path(),
+            self.config.source_ref_manifest_v2_path.as_path(),
+            self.config.artifact_rotation_manifest_v2_path.as_path(),
+        ]
+        .iter()
+        .filter_map(|path| std::fs::metadata(path).ok().map(|metadata| metadata.len()))
+        .sum::<u64>()
+        .saturating_add(self.rotated_artifact_bytes)
+    }
+
+    fn canonical_ref_ids_for_position(&self, position_id: &str) -> (Vec<String>, Vec<String>) {
+        let mut source_event_ids = Vec::new();
+        let mut path_sample_event_ids = Vec::new();
+        for event in self
+            .canonical_writer
+            .stream()
+            .events_for_position(position_id)
+        {
+            if matches!(
+                event.event_kind,
+                ShadowPositionEventKindV2::ReplayDerived
+                    | ShadowPositionEventKindV2::LifecycleSubEvent
+            ) {
+                continue;
+            }
+            source_event_ids.push(event.envelope.event_id.clone());
+            if event.event_kind == ShadowPositionEventKindV2::PathSample {
+                path_sample_event_ids.push(event.envelope.event_id.clone());
+            }
+        }
+        (source_event_ids, path_sample_event_ids)
     }
 
     fn high_watermark_for_position(&self, position_id: &str) -> Option<&ShadowPositionEventV2> {
@@ -5575,7 +6422,10 @@ mod tests {
         assert_eq!(outcome.canonical_write, ShadowV2WriteStatus::Ok);
         assert_eq!(outcome.replay_write, ShadowV2WriteStatus::Ok);
         assert_eq!(outcome.lifecycle_write, ShadowV2WriteStatus::Ok);
-        assert_eq!(outcome.density_write, ShadowV2WriteStatus::Ok);
+        assert_eq!(
+            outcome.density_write,
+            ShadowV2WriteStatus::Skipped("DENSITY_COMPACT_WAITING_FOR_FINAL_SNAPSHOT".to_string())
+        );
         assert_eq!(
             outcome.validation_evidence_status,
             ShadowV2ValidationEvidenceStatus::Complete
@@ -5607,29 +6457,11 @@ mod tests {
             "event-position"
         );
 
-        let density_lines =
-            std::fs::read_to_string(tmp.path().join("shadow_path_density_v2.jsonl")).unwrap();
-        let density: Vec<Value> = density_lines
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        assert_eq!(density.len(), 7);
-        assert!(density
-            .iter()
-            .all(|row| row["schema"] == "shadow_path_density_v2"));
-        assert!(density.iter().all(|row| row["position_id"] == "pos-a"
-            && row["source_canonical_high_watermark"] == "event-position"));
-        assert!(density
-            .iter()
-            .all(|row| row["verdict"] == "NOT_EVALUABLE_NO_COVERAGE"));
-        assert!(density.iter().all(|row| row["source_path_sample_event_ids"]
-            .as_array()
-            .unwrap()
-            .is_empty()));
+        assert!(!tmp.path().join("shadow_path_density_v2.jsonl").exists());
     }
 
     #[test]
-    fn shadow_v2_l2_d3b_harness_derives_density_from_canonical_path_samples() {
+    fn shadow_v2_l2_g_compact_density_emits_latest_declared_horizons_only_on_final() {
         let tmp = tempfile::tempdir().unwrap();
         let config = harness_config_for_dir(tmp.path());
         assert_eq!(
@@ -5653,8 +6485,18 @@ mod tests {
             );
             let outcome = harness.append_record(ShadowV2Record::ShadowPathSampleV2(sample));
             assert_eq!(outcome.canonical_write, ShadowV2WriteStatus::Ok);
-            assert_eq!(outcome.density_write, ShadowV2WriteStatus::Ok);
+            assert_eq!(
+                outcome.density_write,
+                ShadowV2WriteStatus::Skipped(
+                    "DENSITY_COMPACT_WAITING_FOR_FINAL_SNAPSHOT".to_string()
+                )
+            );
         }
+        let outcome = harness.append_record(ShadowV2Record::ShadowTerminalTruthV2(
+            terminal_record("pos-a", "event-terminal-compact"),
+        ));
+        assert_eq!(outcome.canonical_write, ShadowV2WriteStatus::Ok);
+        assert_eq!(outcome.density_write, ShadowV2WriteStatus::Ok);
 
         let canonical =
             std::fs::read_to_string(tmp.path().join("shadow_position_event_v2.jsonl")).unwrap();
@@ -5662,12 +6504,13 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        assert_eq!(canonical_rows.len(), 124);
+        assert_eq!(canonical_rows.len(), 125);
         assert!(canonical_rows
             .iter()
             .all(|row| row["schema"] == "shadow_position_event_v2"));
         assert!(canonical_rows
             .iter()
+            .take(124)
             .all(|row| row["event_kind"] == "PATH_SAMPLE"));
 
         let density =
@@ -5676,14 +6519,11 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        assert_eq!(density_rows.len(), 124 * 7);
+        assert_eq!(density_rows.len(), 5);
 
-        let final_high_watermark = "d3b-path-sample-123";
-        let final_rows: Vec<&Value> = density_rows
-            .iter()
-            .filter(|row| row["source_canonical_high_watermark"] == final_high_watermark)
-            .collect();
-        assert_eq!(final_rows.len(), 7);
+        let final_high_watermark = "event-terminal-compact";
+        let final_path_sample_id = "d3b-path-sample-123";
+        let final_rows: Vec<&Value> = density_rows.iter().collect();
 
         let by_horizon = final_rows
             .iter()
@@ -5693,6 +6533,7 @@ mod tests {
         for horizon in [2_000_u64, 3_000, 10_000, 30_000, 120_000] {
             let row = by_horizon.get(&horizon).unwrap();
             assert_eq!(row["schema"], "shadow_path_density_v2");
+            assert_eq!(row["source_canonical_high_watermark"], final_high_watermark);
             assert_eq!(row["verdict"], "EVALUABLE_EXACT");
             assert_eq!(row["path_points"], 124);
             assert_eq!(row["replay_horizon_ms"], 123_000);
@@ -5700,19 +6541,423 @@ mod tests {
             let source_ids = row["source_path_sample_event_ids"].as_array().unwrap();
             assert_eq!(source_ids.len(), 124);
             assert_eq!(source_ids.first().unwrap(), "d3b-path-sample-000");
-            assert_eq!(source_ids.last().unwrap(), final_high_watermark);
+            assert_eq!(source_ids.last().unwrap(), final_path_sample_id);
         }
 
         for horizon in [300_000_u64, 500_000] {
-            let row = by_horizon.get(&horizon).unwrap();
-            assert_eq!(row["verdict"], "NOT_EVALUABLE_HORIZON_EXCEEDS_REPLAY");
-            assert_eq!(row["replay_horizon_ms"], 123_000);
-            assert!(row["limitations"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|value| value == "HORIZON_EXCEEDS_CONFIGURED_PATH_MODE"));
+            assert!(!by_horizon.contains_key(&horizon));
         }
+    }
+
+    #[test]
+    fn shadow_v2_l2_g_compact_density_does_not_flush_on_exit_fill() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = harness_config_for_dir(tmp.path());
+        let mut harness = ShadowV2ValidationHarness::new(config).unwrap();
+
+        let sample = path_sample_with_pnl(
+            "compact-exit-path-sample",
+            1_000,
+            10,
+            ShadowPathSamplingModeV2::Standard120s,
+            ShadowPathSamplingReasonV2::Heartbeat,
+            event_order_key(Some(45), Some(1)),
+        );
+        let sample_outcome = harness.append_record(ShadowV2Record::ShadowPathSampleV2(sample));
+        assert_eq!(sample_outcome.canonical_write, ShadowV2WriteStatus::Ok);
+        assert_eq!(
+            sample_outcome.density_write,
+            ShadowV2WriteStatus::Skipped("DENSITY_COMPACT_WAITING_FOR_FINAL_SNAPSHOT".to_string())
+        );
+
+        let pool_exit = post_entry_pool_sample("pool-event-exit-compact", 7, 46, 2);
+        let exit_fill = ShadowExitFillV2::from_static_sell_model(
+            test_envelope("shadow_exit_fill_v2", "pos-a", "exit-fill-compact"),
+            event_order_key(Some(47), Some(0)),
+            &pool_exit,
+            &ShadowExitFillModelConfig::bonding_curve(
+                10_000_000_000,
+                150,
+                100,
+                SHADOW_V2_EXIT_FILL_MODEL_VERSION,
+            ),
+        );
+        let exit_outcome = harness.append_record(ShadowV2Record::ShadowExitFillV2(exit_fill));
+        assert_eq!(exit_outcome.canonical_write, ShadowV2WriteStatus::Ok);
+        assert_eq!(
+            exit_outcome.density_write,
+            ShadowV2WriteStatus::Skipped("DENSITY_COMPACT_WAITING_FOR_FINAL_SNAPSHOT".to_string())
+        );
+        assert!(!tmp.path().join("shadow_path_density_v2.jsonl").exists());
+
+        let terminal_outcome = harness.append_record(ShadowV2Record::ShadowTerminalTruthV2(
+            terminal_record("pos-a", "event-terminal-compact-exit"),
+        ));
+        assert_eq!(terminal_outcome.canonical_write, ShadowV2WriteStatus::Ok);
+        assert_eq!(terminal_outcome.density_write, ShadowV2WriteStatus::Ok);
+
+        let density =
+            std::fs::read_to_string(tmp.path().join("shadow_path_density_v2.jsonl")).unwrap();
+        assert_eq!(density.lines().count(), 5);
+    }
+
+    #[test]
+    fn shadow_v2_l2_g_full_density_stream_requires_explicit_opt_in_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = harness_config_for_dir(tmp.path());
+        config.compact_density_enabled = false;
+        config.density_full_stream_enabled = true;
+        config.density_horizons_ms = shadow_v2_full_density_horizons_ms();
+        let mut harness = ShadowV2ValidationHarness::new(config).unwrap();
+
+        let sample = path_sample_with_pnl(
+            "full-stream-path-sample",
+            1_000,
+            10,
+            ShadowPathSamplingModeV2::Standard120s,
+            ShadowPathSamplingReasonV2::Heartbeat,
+            event_order_key(Some(45), Some(1)),
+        );
+        let outcome = harness.append_record(ShadowV2Record::ShadowPathSampleV2(sample));
+        assert_eq!(outcome.canonical_write, ShadowV2WriteStatus::Ok);
+        assert_eq!(outcome.density_write, ShadowV2WriteStatus::Ok);
+
+        let density =
+            std::fs::read_to_string(tmp.path().join("shadow_path_density_v2.jsonl")).unwrap();
+        let density_rows: Vec<Value> = density
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(density_rows.len(), 7);
+        let horizons = density_rows
+            .iter()
+            .map(|row| row["horizon_ms"].as_u64().unwrap())
+            .collect::<HashSet<_>>();
+        assert!(horizons.contains(&300_000));
+        assert!(horizons.contains(&500_000));
+    }
+
+    #[test]
+    fn shadow_v2_l2_g_replay_lifecycle_compact_refs_use_manifest_hashes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = harness_config_for_dir(tmp.path());
+        let mut harness = ShadowV2ValidationHarness::new(config).unwrap();
+
+        for record in [
+            ShadowV2Record::ShadowPositionV2(position_record("pos-a", "event-position")),
+            ShadowV2Record::ShadowTerminalTruthV2(terminal_record("pos-a", "event-terminal")),
+        ] {
+            let outcome = harness.append_record(record);
+            assert_eq!(outcome.canonical_write, ShadowV2WriteStatus::Ok);
+        }
+
+        let replay_lines =
+            std::fs::read_to_string(tmp.path().join("shadow_replay_v2.jsonl")).unwrap();
+        let replay: Value = serde_json::from_str(replay_lines.lines().last().unwrap()).unwrap();
+        assert!(replay["source_event_ids"].as_array().unwrap().is_empty());
+        assert!(replay["path_sample_event_ids"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert_eq!(replay["source_event_count"], 2);
+        assert_eq!(replay["source_event_first_id"], "event-position");
+        assert_eq!(replay["source_event_last_id"], "event-terminal");
+        assert!(replay["source_event_range_hash"].as_str().is_some());
+        assert!(replay["source_event_manifest_ref"].as_str().is_some());
+
+        let lifecycle_lines =
+            std::fs::read_to_string(tmp.path().join("shadow_lifecycle_v2.jsonl")).unwrap();
+        let lifecycle: Value =
+            serde_json::from_str(lifecycle_lines.lines().last().unwrap()).unwrap();
+        assert!(lifecycle["source_event_ids"].as_array().unwrap().is_empty());
+        assert_eq!(lifecycle["source_event_count"], 2);
+        assert!(lifecycle["source_event_range_hash"].as_str().is_some());
+
+        let manifest_lines =
+            std::fs::read_to_string(tmp.path().join("shadow_source_ref_manifest_v2.jsonl"))
+                .unwrap();
+        let manifest_rows: Vec<Value> = manifest_lines
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(manifest_rows.iter().any(|row| {
+            row["source_canonical_high_watermark"] == "event-terminal"
+                && row["source_event_count"] == 2
+                && row["source_event_first_id"] == "event-position"
+                && row["source_event_last_id"] == "event-terminal"
+                && row["source_event_range_hash"].as_str().is_some()
+        }));
+    }
+
+    #[test]
+    fn shadow_v2_l2_g_terminal_flush_evicts_closed_position_events_from_memory_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = harness_config_for_dir(tmp.path());
+        let mut harness = ShadowV2ValidationHarness::new(config).unwrap();
+
+        for idx in 0..=123 {
+            let age_ms = idx as u64 * 1_000;
+            let mut order = event_order_key(Some(45), Some(idx as u32));
+            order.event_seq_in_process = 10 + idx as u64;
+            let outcome =
+                harness.append_record(ShadowV2Record::ShadowPathSampleV2(path_sample_with_pnl(
+                    &format!("memory-compact-path-sample-{idx:03}"),
+                    age_ms,
+                    idx,
+                    ShadowPathSamplingModeV2::Standard120s,
+                    ShadowPathSamplingReasonV2::Heartbeat,
+                    order,
+                )));
+            assert_eq!(outcome.canonical_write, ShadowV2WriteStatus::Ok);
+        }
+        assert_eq!(
+            harness
+                .canonical_stream()
+                .events_for_position("pos-a")
+                .len(),
+            124
+        );
+
+        let terminal_outcome = harness.append_record(ShadowV2Record::ShadowTerminalTruthV2(
+            terminal_record("pos-a", "event-terminal-memory-compact"),
+        ));
+
+        assert_eq!(terminal_outcome.canonical_write, ShadowV2WriteStatus::Ok);
+        assert_eq!(terminal_outcome.replay_write, ShadowV2WriteStatus::Ok);
+        assert_eq!(terminal_outcome.lifecycle_write, ShadowV2WriteStatus::Ok);
+        assert_eq!(terminal_outcome.density_write, ShadowV2WriteStatus::Ok);
+        assert_eq!(
+            terminal_outcome.validation_evidence_status,
+            ShadowV2ValidationEvidenceStatus::Complete
+        );
+        assert!(harness
+            .canonical_stream()
+            .events_for_position("pos-a")
+            .is_empty());
+        assert_eq!(
+            harness.canonical_stream().terminal_event_id("pos-a"),
+            Some("event-terminal-memory-compact")
+        );
+
+        let canonical =
+            std::fs::read_to_string(tmp.path().join("shadow_position_event_v2.jsonl")).unwrap();
+        assert_eq!(canonical.lines().count(), 125);
+        let replay = std::fs::read_to_string(tmp.path().join("shadow_replay_v2.jsonl")).unwrap();
+        let replay_last: Value = serde_json::from_str(replay.lines().last().unwrap()).unwrap();
+        assert_eq!(replay_last["source_event_count"], 125);
+        assert_eq!(
+            replay_last["source_event_last_id"],
+            "event-terminal-memory-compact"
+        );
+        assert!(replay_last["source_event_ids"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let lifecycle =
+            std::fs::read_to_string(tmp.path().join("shadow_lifecycle_v2.jsonl")).unwrap();
+        let lifecycle_last: Value =
+            serde_json::from_str(lifecycle.lines().last().unwrap()).unwrap();
+        assert_eq!(lifecycle_last["source_event_count"], 125);
+        assert!(lifecycle_last["source_event_ids"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let density =
+            std::fs::read_to_string(tmp.path().join("shadow_path_density_v2.jsonl")).unwrap();
+        assert_eq!(density.lines().count(), 5);
+
+        let mut late_order = event_order_key(Some(46), Some(124));
+        late_order.event_seq_in_process = 1_000;
+        let late_outcome =
+            harness.append_record(ShadowV2Record::ShadowPathSampleV2(path_sample_with_pnl(
+                "late-after-terminal-memory-compact",
+                124_000,
+                124,
+                ShadowPathSamplingModeV2::Standard120s,
+                ShadowPathSamplingReasonV2::Heartbeat,
+                late_order,
+            )));
+        match late_outcome.canonical_write {
+            ShadowV2WriteStatus::Err(error) => {
+                assert!(error.contains("HARNESS_POSITION_EVICTED_AFTER_TERMINAL_FLUSH"));
+            }
+            other => {
+                panic!("expected fail-closed late event after terminal eviction, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn shadow_v2_l2_g_artifact_budget_breach_fails_closed() {
+        reset_shadow_v2_artifact_budget_exceeded_for_tests();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = harness_config_for_dir(tmp.path());
+        config.artifact_budget.max_density_rows = 1;
+        let mut harness = ShadowV2ValidationHarness::new(config).unwrap();
+
+        let sample = path_sample_with_pnl(
+            "budget-path-sample",
+            1_000,
+            10,
+            ShadowPathSamplingModeV2::Standard120s,
+            ShadowPathSamplingReasonV2::Heartbeat,
+            event_order_key(Some(45), Some(1)),
+        );
+        assert_eq!(
+            harness
+                .append_record(ShadowV2Record::ShadowPathSampleV2(sample))
+                .canonical_write,
+            ShadowV2WriteStatus::Ok
+        );
+        let outcome = harness.append_record(ShadowV2Record::ShadowTerminalTruthV2(
+            terminal_record("pos-a", "event-terminal-budget"),
+        ));
+        assert_eq!(outcome.canonical_write, ShadowV2WriteStatus::Ok);
+        match outcome.density_write {
+            ShadowV2WriteStatus::Err(error) => {
+                assert!(error.contains(SHADOW_V2_ARTIFACT_BUDGET_BLOCKER));
+            }
+            other => panic!("expected density budget error, got {other:?}"),
+        }
+        assert_eq!(
+            outcome.validation_evidence_status,
+            ShadowV2ValidationEvidenceStatus::DensityWriteFailed
+        );
+        assert!(shadow_v2_artifact_budget_exceeded());
+        reset_shadow_v2_artifact_budget_exceeded_for_tests();
+    }
+
+    #[test]
+    fn shadow_v2_l2_g_disk_headroom_budget_fails_closed() {
+        reset_shadow_v2_artifact_budget_exceeded_for_tests();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = harness_config_for_dir(tmp.path());
+        config.artifact_budget.disk_headroom_enabled = true;
+        config.artifact_budget.min_free_disk_bytes = u64::MAX;
+        let mut harness = ShadowV2ValidationHarness::new(config).unwrap();
+
+        let outcome = harness.append_record(ShadowV2Record::ShadowPositionV2(position_record(
+            "pos-a",
+            "event-position-disk-headroom",
+        )));
+
+        match outcome.canonical_write {
+            ShadowV2WriteStatus::Err(error) => {
+                assert!(error.contains(SHADOW_V2_ARTIFACT_BUDGET_BLOCKER));
+                assert!(error.contains("min_free_disk_bytes"));
+            }
+            other => panic!("expected disk-headroom budget error, got {other:?}"),
+        }
+        assert_eq!(
+            outcome.validation_evidence_status,
+            ShadowV2ValidationEvidenceStatus::CanonicalWriteFailed
+        );
+        assert!(shadow_v2_artifact_budget_exceeded());
+        reset_shadow_v2_artifact_budget_exceeded_for_tests();
+    }
+
+    #[test]
+    fn shadow_v2_l2_g_disk_headroom_allows_zero_fixed_total_cap() {
+        reset_shadow_v2_artifact_budget_exceeded_for_tests();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = harness_config_for_dir(tmp.path());
+        config.artifact_budget.disk_headroom_enabled = true;
+        config.artifact_budget.min_free_disk_bytes = 1;
+        config.artifact_budget.max_total_artifact_bytes = 0;
+        let mut harness = ShadowV2ValidationHarness::new(config).unwrap();
+
+        let outcome = harness.append_record(ShadowV2Record::ShadowPositionV2(position_record(
+            "pos-a",
+            "event-position-zero-total-cap",
+        )));
+
+        assert_eq!(outcome.canonical_write, ShadowV2WriteStatus::Ok);
+        assert!(!shadow_v2_artifact_budget_exceeded());
+    }
+
+    #[test]
+    fn shadow_v2_l2_g_disk_headroom_allows_zero_density_row_cap() {
+        reset_shadow_v2_artifact_budget_exceeded_for_tests();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = harness_config_for_dir(tmp.path());
+        config.artifact_budget.disk_headroom_enabled = true;
+        config.artifact_budget.min_free_disk_bytes = 1;
+        config.artifact_budget.max_total_artifact_bytes = 0;
+        config.artifact_budget.max_density_rows = 0;
+        let mut harness = ShadowV2ValidationHarness::new(config).unwrap();
+
+        let sample = path_sample_with_pnl(
+            "zero-density-cap-path-sample",
+            1_000,
+            10,
+            ShadowPathSamplingModeV2::Standard120s,
+            ShadowPathSamplingReasonV2::Heartbeat,
+            event_order_key(Some(45), Some(1)),
+        );
+        assert_eq!(
+            harness
+                .append_record(ShadowV2Record::ShadowPathSampleV2(sample))
+                .canonical_write,
+            ShadowV2WriteStatus::Ok
+        );
+
+        let outcome = harness.append_record(ShadowV2Record::ShadowTerminalTruthV2(
+            terminal_record("pos-a", "event-terminal-zero-density-cap"),
+        ));
+        assert_eq!(outcome.canonical_write, ShadowV2WriteStatus::Ok);
+        assert_eq!(outcome.density_write, ShadowV2WriteStatus::Ok);
+        assert!(harness.density_rows_written > 0);
+        assert!(!shadow_v2_artifact_budget_exceeded());
+    }
+
+    #[test]
+    fn shadow_v2_l2_g_rotates_jsonl_artifacts_and_records_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = harness_config_for_dir(tmp.path());
+        config.artifact_budget.max_file_bytes = 1;
+        config.artifact_budget.max_rows_per_file = 1_000;
+        let mut harness = ShadowV2ValidationHarness::new(config).unwrap();
+
+        let first = harness.append_record(ShadowV2Record::ShadowPositionV2(position_record(
+            "pos-a",
+            "event-position-a",
+        )));
+        assert_eq!(first.canonical_write, ShadowV2WriteStatus::Ok);
+
+        let second = harness.append_record(ShadowV2Record::ShadowPositionV2(position_record(
+            "pos-b",
+            "event-position-b",
+        )));
+        assert_eq!(second.canonical_write, ShadowV2WriteStatus::Ok);
+        assert_eq!(harness.canonical_stream().events().len(), 2);
+
+        let rotated = tmp
+            .path()
+            .join("shadow_position_event_v2.part-000001.jsonl");
+        assert!(rotated.is_file());
+        let active = tmp.path().join("shadow_position_event_v2.jsonl");
+        assert!(active.is_file());
+
+        let manifest_lines = std::fs::read_to_string(
+            tmp.path()
+                .join("shadow_artifact_rotation_manifest_v2.jsonl"),
+        )
+        .unwrap();
+        let rows: Vec<Value> = manifest_lines
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(rows.iter().any(|row| {
+            row["schema"] == SHADOW_V2_ARTIFACT_ROTATION_MANIFEST_SCHEMA
+                && row["artifact"] == "shadow_position_event_v2"
+                && row["rotated_path"].as_str().is_some_and(|path| {
+                    path.ends_with("shadow_position_event_v2.part-000001.jsonl")
+                })
+                && row["row_count"] == 1
+                && row["hash_algorithm"] == "blake3"
+                && row["hash_uncompressed"].as_str().is_some()
+                && row["compressed_path"].is_null()
+        }));
     }
 
     #[test]

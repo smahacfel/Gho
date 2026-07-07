@@ -487,6 +487,78 @@ class ShadowV2L2FResearchValidationRunTest(unittest.TestCase):
         self.assertIn("complete_executable_roundtrip_positions,1,", summary)
         self.assertIn("research_candidate_roundtrip_count,0,", summary)
 
+    def test_research_grade_candidate_enum_counts_as_l2_research_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            scope_root = Path(tmp) / "dedicated-scope"
+            research_grade_position = "position-a"
+            legacy_research_position = "position-b"
+            write_jsonl(
+                scope_root / "shadow_position_event_v2.jsonl",
+                [
+                    canonical_row(
+                        "shadow_entry_fill_v2",
+                        research_grade_position,
+                        {
+                            "fill_status": "FILLED",
+                            "execution_label_grade": "RESEARCH_GRADE_CANDIDATE",
+                        },
+                    ),
+                    canonical_row(
+                        "shadow_exit_fill_v2",
+                        research_grade_position,
+                        {
+                            "fill_status": "FILLED",
+                            "execution_label_grade": "RESEARCH_GRADE_CANDIDATE",
+                        },
+                    ),
+                    canonical_row(
+                        "shadow_terminal_truth_v2",
+                        research_grade_position,
+                        {"final_pnl_executable_bps": 42},
+                    ),
+                    canonical_row(
+                        "shadow_entry_fill_v2",
+                        legacy_research_position,
+                        {
+                            "fill_status": "FILLED",
+                            "execution_label_grade": "RESEARCH_CANDIDATE",
+                        },
+                    ),
+                    canonical_row(
+                        "shadow_exit_fill_v2",
+                        legacy_research_position,
+                        {
+                            "fill_status": "FILLED",
+                            "execution_label_grade": "RESEARCH_CANDIDATE",
+                        },
+                    ),
+                    canonical_row(
+                        "shadow_terminal_truth_v2",
+                        legacy_research_position,
+                        {"final_pnl_executable_bps": 42},
+                    ),
+                ],
+            )
+            for name in [
+                "shadow_replay_v2.jsonl",
+                "shadow_lifecycle_v2.jsonl",
+                "shadow_path_density_v2.jsonl",
+            ]:
+                (scope_root / name).write_text("", encoding="utf-8")
+
+            sample = l2_f.scope_sample_metrics(scope_root, {})
+
+        self.assertEqual(sample["complete_executable_roundtrip_positions"], 2)
+        self.assertEqual(sample["research_candidate_roundtrip_count"], 2)
+        self.assertEqual(
+            sample["entry_execution_label_grade_RESEARCH_CANDIDATE_count"],
+            2,
+        )
+        self.assertEqual(
+            sample["exit_execution_label_grade_RESEARCH_CANDIDATE_count"],
+            2,
+        )
+
     def test_candidate_artifacts_already_in_output_root_are_not_copied_over_themselves(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
