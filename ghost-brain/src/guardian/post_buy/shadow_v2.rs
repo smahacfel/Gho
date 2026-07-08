@@ -24,7 +24,10 @@ use super::shadow_v2_execution::{
     ShadowV2ExecutionOutcome, ShadowV2ExecutionSide, ShadowV2FillEngine, ShadowV2NoFillReason,
 };
 use ghost_core::account_state_core::types::CanonicalPoolState;
-use ghost_core::{ShadowV2PoolPhase, ShadowV2Quote, ShadowV2Reserves, SHADOW_V2_BPS_DENOMINATOR};
+use ghost_core::{
+    quote_constant_product, ShadowV2PoolPhase, ShadowV2Quote, ShadowV2QuoteSide, ShadowV2Reserves,
+    SHADOW_V2_BPS_DENOMINATOR,
+};
 use serde::{Deserialize, Serialize};
 
 pub const SHADOW_V2_SIMULATION_CONTRACT_VERSION: &str = "shadow_burnin_simulation_v2_20260629";
@@ -47,6 +50,12 @@ pub const SHADOW_V2_DEFAULT_MIN_FREE_DISK_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 pub const SHADOW_V2_SOURCE_REF_MANIFEST_SCHEMA: &str = "shadow_source_ref_manifest_v2";
 pub const SHADOW_V2_ARTIFACT_ROTATION_MANIFEST_SCHEMA: &str =
     "shadow_artifact_rotation_manifest_v2";
+pub const EXECUTABLE_DYNAMIC_EXIT_EVIDENCE_SCHEMA_V1: &str = "executable_dynamic_exit_evidence_v1";
+pub const EXECUTABLE_DYNAMIC_EXIT_POLICY_VERSION_V1: &str = "executable_dynamic_exit_policy_v1";
+pub const EXECUTABLE_DYNAMIC_EXIT_STATIC_QUOTE_MODEL_VERSION_V1: &str =
+    "shadow_v2_exit_static_quote_model_v1";
+pub const MAYHEM_MODE_BLOCKED_MISSING_PRE_ENTRY_FIELDS: &str =
+    "MAYHEM_MODE_BLOCKED_MISSING_PRE_ENTRY_FIELDS";
 pub const EVENT_ORDER_UNKNOWN_INDEX: u32 = u32::MAX;
 pub const EVENT_ORDER_UNKNOWN_SIGNATURE: &str = "UNKNOWN";
 
@@ -2304,6 +2313,640 @@ impl ShadowPathSampleV2 {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExecutableDynamicExitCandidatePolicyV1 {
+    FixedExit2s,
+    FixedExit3s,
+    FixedExit5s,
+    FixedExit10s,
+    Tp500Sl500Max30s,
+    Tp1000Sl700Max30s,
+    Tp2000Sl1000Max60s,
+    TrailingAfter1000Trail500,
+    TrailingAfter2000Trail1000,
+}
+
+impl ExecutableDynamicExitCandidatePolicyV1 {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::FixedExit2s => "fixed_exit_2s",
+            Self::FixedExit3s => "fixed_exit_3s",
+            Self::FixedExit5s => "fixed_exit_5s",
+            Self::FixedExit10s => "fixed_exit_10s",
+            Self::Tp500Sl500Max30s => "tp500_sl500_max30s",
+            Self::Tp1000Sl700Max30s => "tp1000_sl700_max30s",
+            Self::Tp2000Sl1000Max60s => "tp2000_sl1000_max60s",
+            Self::TrailingAfter1000Trail500 => "trailing_after_1000_trail_500",
+            Self::TrailingAfter2000Trail1000 => "trailing_after_2000_trail_1000",
+        }
+    }
+
+    pub fn from_label(value: &str) -> Option<Self> {
+        match value.trim() {
+            "fixed_exit_2s" => Some(Self::FixedExit2s),
+            "fixed_exit_3s" => Some(Self::FixedExit3s),
+            "fixed_exit_5s" => Some(Self::FixedExit5s),
+            "fixed_exit_10s" => Some(Self::FixedExit10s),
+            "tp500_sl500_max30s" => Some(Self::Tp500Sl500Max30s),
+            "tp1000_sl700_max30s" => Some(Self::Tp1000Sl700Max30s),
+            "tp2000_sl1000_max60s" => Some(Self::Tp2000Sl1000Max60s),
+            "trailing_after_1000_trail_500" => Some(Self::TrailingAfter1000Trail500),
+            "trailing_after_2000_trail_1000" => Some(Self::TrailingAfter2000Trail1000),
+            _ => None,
+        }
+    }
+
+    fn fixed_age_ms(self) -> Option<u64> {
+        match self {
+            Self::FixedExit2s => Some(2_000),
+            Self::FixedExit3s => Some(3_000),
+            Self::FixedExit5s => Some(5_000),
+            Self::FixedExit10s => Some(10_000),
+            _ => None,
+        }
+    }
+
+    fn tp_sl_max_hold(self) -> Option<(i32, i32, u64)> {
+        match self {
+            Self::Tp500Sl500Max30s => Some((500, -500, 30_000)),
+            Self::Tp1000Sl700Max30s => Some((1_000, -700, 30_000)),
+            Self::Tp2000Sl1000Max60s => Some((2_000, -1_000, 60_000)),
+            _ => None,
+        }
+    }
+
+    fn trailing_config(self) -> Option<(i32, i32, u64)> {
+        match self {
+            Self::TrailingAfter1000Trail500 => Some((1_000, 500, 120_000)),
+            Self::TrailingAfter2000Trail1000 => Some((2_000, 1_000, 120_000)),
+            _ => None,
+        }
+    }
+}
+
+pub fn executable_dynamic_exit_default_candidate_policies_v1(
+) -> Vec<ExecutableDynamicExitCandidatePolicyV1> {
+    vec![
+        ExecutableDynamicExitCandidatePolicyV1::FixedExit2s,
+        ExecutableDynamicExitCandidatePolicyV1::FixedExit3s,
+        ExecutableDynamicExitCandidatePolicyV1::FixedExit5s,
+        ExecutableDynamicExitCandidatePolicyV1::FixedExit10s,
+        ExecutableDynamicExitCandidatePolicyV1::Tp500Sl500Max30s,
+        ExecutableDynamicExitCandidatePolicyV1::Tp1000Sl700Max30s,
+        ExecutableDynamicExitCandidatePolicyV1::Tp2000Sl1000Max60s,
+        ExecutableDynamicExitCandidatePolicyV1::TrailingAfter1000Trail500,
+        ExecutableDynamicExitCandidatePolicyV1::TrailingAfter2000Trail1000,
+    ]
+}
+
+pub fn executable_dynamic_exit_candidate_policies_from_labels_v1(
+    labels: &[String],
+) -> Result<Vec<ExecutableDynamicExitCandidatePolicyV1>, String> {
+    if labels.is_empty() {
+        return Ok(executable_dynamic_exit_default_candidate_policies_v1());
+    }
+    let mut policies = Vec::with_capacity(labels.len());
+    for label in labels {
+        let Some(policy) = ExecutableDynamicExitCandidatePolicyV1::from_label(label) else {
+            return Err(format!(
+                "unknown executable dynamic exit candidate policy: {label}"
+            ));
+        };
+        if !policies.contains(&policy) {
+            policies.push(policy);
+        }
+    }
+    Ok(policies)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ExecutableDynamicExitTriggerReasonV1 {
+    FixedAge,
+    TakeProfit,
+    StopLoss,
+    MaxHold,
+    TrailingStop,
+    NoTriggerByDeclaredHorizon,
+}
+
+impl ExecutableDynamicExitTriggerReasonV1 {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::FixedAge => "FIXED_AGE",
+            Self::TakeProfit => "TAKE_PROFIT",
+            Self::StopLoss => "STOP_LOSS",
+            Self::MaxHold => "MAX_HOLD",
+            Self::TrailingStop => "TRAILING_STOP",
+            Self::NoTriggerByDeclaredHorizon => "NO_TRIGGER_BY_DECLARED_HORIZON",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ExecutableDynamicExitEvidenceQualityV1 {
+    StaticQuoteAvailable,
+    BlockedByPoolStateProvenance,
+    BlockedByStalePoolState,
+    BlockedByMissingEntryFill,
+    BlockedByMissingTokenAmount,
+    BlockedByQuoteModel,
+    MarkOnlyNoExecutableQuote,
+    NoTriggerByDeclaredHorizon,
+}
+
+impl ExecutableDynamicExitEvidenceQualityV1 {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::StaticQuoteAvailable => "STATIC_QUOTE_AVAILABLE",
+            Self::BlockedByPoolStateProvenance => "BLOCKED_BY_POOL_STATE_PROVENANCE",
+            Self::BlockedByStalePoolState => "BLOCKED_BY_STALE_POOL_STATE",
+            Self::BlockedByMissingEntryFill => "BLOCKED_BY_MISSING_ENTRY_FILL",
+            Self::BlockedByMissingTokenAmount => "BLOCKED_BY_MISSING_TOKEN_AMOUNT",
+            Self::BlockedByQuoteModel => "BLOCKED_BY_QUOTE_MODEL",
+            Self::MarkOnlyNoExecutableQuote => "MARK_ONLY_NO_EXECUTABLE_QUOTE",
+            Self::NoTriggerByDeclaredHorizon => "NO_TRIGGER_BY_DECLARED_HORIZON",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExecutableDynamicExitEvidenceV1 {
+    pub schema: String,
+    pub schema_version: u32,
+    pub run_id: String,
+    pub position_id: String,
+    pub candidate_id: Option<String>,
+    pub pool_id: String,
+    pub base_mint: String,
+    pub entry_fill_event_id: String,
+    pub candidate_exit_policy: String,
+    pub candidate_exit_policy_version: String,
+    pub candidate_exit_policy_hash: String,
+    pub candidate_exit_age_ms: u64,
+    pub candidate_exit_trigger_reason: String,
+    pub mark_pnl_bps_at_trigger: Option<i32>,
+    pub pool_state_ref_at_trigger: String,
+    pub quote_source: String,
+    pub executable_exit_quote_available: bool,
+    pub estimated_executable_pnl_bps: Option<i32>,
+    pub estimated_slippage_bps: Option<i32>,
+    pub quote_fill_divergence_bps: Option<i32>,
+    pub pool_state_staleness_ms: Option<u64>,
+    pub pool_state_staleness_slots: Option<u64>,
+    pub evidence_quality: String,
+    pub limitations: Vec<String>,
+    pub static_exit_quote_model_version: String,
+    pub trigger_sample_event_id: String,
+    pub trigger_pool_state_event_id: String,
+    pub trigger_observed_at_ms: u64,
+    pub trigger_age_ms: u64,
+    pub trigger_eval_seq: u64,
+    pub entry_fill_amount_tokens: Option<f64>,
+    pub entry_fill_amount_sol: Option<f64>,
+    pub entry_fill_price: Option<f64>,
+    pub position_token_amount_source: String,
+    pub estimated_output_sol: Option<f64>,
+    pub estimated_output_tokens_sold: Option<f64>,
+    pub estimated_fee_bps: Option<i32>,
+    pub own_impact_bps: Option<i32>,
+    pub slippage_tolerance_bps: Option<i32>,
+    pub min_out_if_available: Option<u64>,
+    pub pool_state_source_quality: String,
+    pub decision_neutral: bool,
+    pub runtime_close_triggered: bool,
+    pub changes_gatekeeper_decision: bool,
+    pub changes_execution: bool,
+    pub static_model_only: bool,
+    pub not_live_fill: bool,
+    pub not_canonical_exit: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExecutableDynamicExitQuoteEstimateV1 {
+    pub quote_source: String,
+    pub executable_exit_quote_available: bool,
+    pub estimated_executable_pnl_bps: Option<i32>,
+    pub estimated_slippage_bps: Option<i32>,
+    pub quote_fill_divergence_bps: Option<i32>,
+    pub evidence_quality: ExecutableDynamicExitEvidenceQualityV1,
+    pub limitations: Vec<String>,
+    pub estimated_output_sol: Option<f64>,
+    pub estimated_output_tokens_sold: Option<f64>,
+    pub estimated_fee_bps: Option<i32>,
+    pub own_impact_bps: Option<i32>,
+    pub slippage_tolerance_bps: Option<i32>,
+    pub min_out_if_available: Option<u64>,
+}
+
+pub fn estimate_static_exit_quote_v1(
+    pool_state: &PoolStateSampleV2,
+    input_token_amount_raw: Option<u64>,
+    entry_fill_amount_tokens: Option<f64>,
+    entry_fill_price: Option<f64>,
+    slippage_bps: u16,
+    fee_bps: u16,
+) -> ExecutableDynamicExitQuoteEstimateV1 {
+    let Some(input_token_amount_raw) = input_token_amount_raw.filter(|amount| *amount > 0) else {
+        return ExecutableDynamicExitQuoteEstimateV1 {
+            quote_source: "static_exit_quote:blocked_missing_token_amount".to_string(),
+            executable_exit_quote_available: false,
+            estimated_executable_pnl_bps: None,
+            estimated_slippage_bps: None,
+            quote_fill_divergence_bps: None,
+            evidence_quality: ExecutableDynamicExitEvidenceQualityV1::BlockedByMissingTokenAmount,
+            limitations: vec!["BLOCKED_BY_MISSING_TOKEN_AMOUNT".to_string()],
+            estimated_output_sol: None,
+            estimated_output_tokens_sold: None,
+            estimated_fee_bps: None,
+            own_impact_bps: None,
+            slippage_tolerance_bps: Some(slippage_bps as i32),
+            min_out_if_available: None,
+        };
+    };
+    let account_state_blockers = pool_state.account_state_source_proof_blockers();
+    if !account_state_blockers.is_empty() {
+        return ExecutableDynamicExitQuoteEstimateV1 {
+            quote_source: "static_exit_quote:blocked_pool_state_provenance".to_string(),
+            executable_exit_quote_available: false,
+            estimated_executable_pnl_bps: None,
+            estimated_slippage_bps: None,
+            quote_fill_divergence_bps: None,
+            evidence_quality: ExecutableDynamicExitEvidenceQualityV1::BlockedByPoolStateProvenance,
+            limitations: account_state_blockers,
+            estimated_output_sol: None,
+            estimated_output_tokens_sold: entry_fill_amount_tokens,
+            estimated_fee_bps: Some(fee_bps as i32),
+            own_impact_bps: None,
+            slippage_tolerance_bps: Some(slippage_bps as i32),
+            min_out_if_available: None,
+        };
+    }
+    if pool_state.staleness_ms.is_none() || pool_state.staleness_slots.is_none() {
+        return ExecutableDynamicExitQuoteEstimateV1 {
+            quote_source: "static_exit_quote:blocked_stale_or_unknown_pool_state".to_string(),
+            executable_exit_quote_available: false,
+            estimated_executable_pnl_bps: None,
+            estimated_slippage_bps: None,
+            quote_fill_divergence_bps: None,
+            evidence_quality: ExecutableDynamicExitEvidenceQualityV1::BlockedByStalePoolState,
+            limitations: vec!["BLOCKED_BY_STALE_POOL_STATE".to_string()],
+            estimated_output_sol: None,
+            estimated_output_tokens_sold: entry_fill_amount_tokens,
+            estimated_fee_bps: Some(fee_bps as i32),
+            own_impact_bps: None,
+            slippage_tolerance_bps: Some(slippage_bps as i32),
+            min_out_if_available: None,
+        };
+    }
+
+    let quote_result = reserves_from_pool_state(pool_state, ShadowV2PoolPhase::BondingCurve)
+        .ok_or_else(|| "POOL_STATE_RESERVES_UNAVAILABLE".to_string())
+        .and_then(|reserves| {
+            quote_constant_product(
+                ShadowV2PoolPhase::BondingCurve,
+                ShadowV2QuoteSide::Sell,
+                reserves,
+                input_token_amount_raw,
+                fee_bps,
+                slippage_bps,
+            )
+            .map_err(|error| error.to_string())
+        });
+    let quote = match quote_result {
+        Ok(quote) => quote,
+        Err(error) => {
+            return ExecutableDynamicExitQuoteEstimateV1 {
+                quote_source: "static_exit_quote:blocked_quote_model".to_string(),
+                executable_exit_quote_available: false,
+                estimated_executable_pnl_bps: None,
+                estimated_slippage_bps: None,
+                quote_fill_divergence_bps: None,
+                evidence_quality: ExecutableDynamicExitEvidenceQualityV1::BlockedByQuoteModel,
+                limitations: vec![format!("BLOCKED_BY_QUOTE_MODEL:{error}")],
+                estimated_output_sol: None,
+                estimated_output_tokens_sold: entry_fill_amount_tokens,
+                estimated_fee_bps: Some(fee_bps as i32),
+                own_impact_bps: None,
+                slippage_tolerance_bps: Some(slippage_bps as i32),
+                min_out_if_available: None,
+            };
+        }
+    };
+
+    let estimated_output_sol = if pool_state.sol_lamports.unwrap_or_default() > 0 {
+        Some(quote.expected_output_amount as f64 / pool_state.sol_lamports.unwrap() as f64)
+    } else {
+        None
+    };
+    let estimated_output_tokens_sold = entry_fill_amount_tokens.or_else(|| {
+        pool_state
+            .token_decimals
+            .map(|decimals| input_token_amount_raw as f64 / 10f64.powi(i32::from(decimals)))
+    });
+
+    ExecutableDynamicExitQuoteEstimateV1 {
+        quote_source: format!(
+            "shadow_v2_static_exit_quote:{}:{}",
+            quote.formula_version,
+            quote.price_source_label()
+        ),
+        executable_exit_quote_available: true,
+        estimated_executable_pnl_bps: entry_fill_price
+            .and_then(|entry| pnl_bps_from_prices(entry, quote.fill_price_sol_per_token)),
+        estimated_slippage_bps: Some(quote.own_impact_bps),
+        quote_fill_divergence_bps: None,
+        evidence_quality: ExecutableDynamicExitEvidenceQualityV1::StaticQuoteAvailable,
+        limitations: vec![
+            "STATIC_MODEL_ONLY_NOT_LIVE_FILL".to_string(),
+            "QUOTE_FILL_DIVERGENCE_UNAVAILABLE_STATIC_MODEL_ONLY".to_string(),
+        ],
+        estimated_output_sol,
+        estimated_output_tokens_sold,
+        estimated_fee_bps: Some(quote.fee_bps as i32),
+        own_impact_bps: Some(quote.own_impact_bps),
+        slippage_tolerance_bps: Some(quote.slippage_tolerance_bps as i32),
+        min_out_if_available: Some(quote.min_output_amount),
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecutableDynamicExitPolicyStateV1 {
+    pub policy: ExecutableDynamicExitCandidatePolicyV1,
+    pub activated: bool,
+    pub peak_pnl_bps: Option<i32>,
+    pub emitted: bool,
+}
+
+impl ExecutableDynamicExitPolicyStateV1 {
+    fn new(policy: ExecutableDynamicExitCandidatePolicyV1) -> Self {
+        Self {
+            policy,
+            activated: false,
+            peak_pnl_bps: None,
+            emitted: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecutableDynamicExitObservationV1<'a> {
+    pub run_id: &'a str,
+    pub candidate_id: Option<&'a str>,
+    pub pool_id: &'a str,
+    pub base_mint: &'a str,
+    pub path_sample: &'a ShadowPathSampleV2,
+    pub pool_state: &'a PoolStateSampleV2,
+    pub trigger_observed_at_ms: u64,
+    pub slippage_bps: u16,
+    pub fee_bps: u16,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecutableDynamicExitPolicyEvaluatorV1 {
+    position_id: String,
+    entry_fill_event_id: String,
+    entry_fill_amount_tokens_raw: Option<u64>,
+    entry_fill_amount_tokens: Option<f64>,
+    entry_fill_amount_sol: Option<f64>,
+    entry_fill_price: Option<f64>,
+    position_token_amount_source: String,
+    states: Vec<ExecutableDynamicExitPolicyStateV1>,
+    trigger_eval_seq: u64,
+    emitted: HashSet<String>,
+}
+
+impl ExecutableDynamicExitPolicyEvaluatorV1 {
+    pub fn new(
+        position_id: impl Into<String>,
+        entry_fill_event_id: impl Into<String>,
+        entry_fill_amount_tokens_raw: Option<u64>,
+        entry_fill_amount_tokens: Option<f64>,
+        entry_fill_amount_sol: Option<f64>,
+        entry_fill_price: Option<f64>,
+        position_token_amount_source: impl Into<String>,
+        policies: Vec<ExecutableDynamicExitCandidatePolicyV1>,
+    ) -> Self {
+        Self {
+            position_id: position_id.into(),
+            entry_fill_event_id: entry_fill_event_id.into(),
+            entry_fill_amount_tokens_raw,
+            entry_fill_amount_tokens,
+            entry_fill_amount_sol,
+            entry_fill_price,
+            position_token_amount_source: position_token_amount_source.into(),
+            states: policies
+                .into_iter()
+                .map(ExecutableDynamicExitPolicyStateV1::new)
+                .collect(),
+            trigger_eval_seq: 0,
+            emitted: HashSet::new(),
+        }
+    }
+
+    pub fn observe_path_sample(
+        &mut self,
+        observation: ExecutableDynamicExitObservationV1<'_>,
+    ) -> Vec<ExecutableDynamicExitEvidenceV1> {
+        self.trigger_eval_seq = self.trigger_eval_seq.saturating_add(1);
+        let mut rows = Vec::new();
+        for state in &mut self.states {
+            if state.emitted || self.emitted.contains(state.policy.label()) {
+                continue;
+            }
+            let Some(reason) = policy_trigger_reason_for_observed_sample(
+                state,
+                observation.path_sample.age_ms,
+                observation.path_sample.pnl_mark_bps,
+            ) else {
+                continue;
+            };
+
+            let mut row = build_executable_dynamic_exit_evidence_row_v1(
+                &self.position_id,
+                &self.entry_fill_event_id,
+                self.entry_fill_amount_tokens_raw,
+                self.entry_fill_amount_tokens,
+                self.entry_fill_amount_sol,
+                self.entry_fill_price,
+                &self.position_token_amount_source,
+                self.trigger_eval_seq,
+                state.policy,
+                reason,
+                &observation,
+            );
+            if reason == ExecutableDynamicExitTriggerReasonV1::NoTriggerByDeclaredHorizon {
+                row.evidence_quality =
+                    ExecutableDynamicExitEvidenceQualityV1::NoTriggerByDeclaredHorizon
+                        .label()
+                        .to_string();
+            }
+            state.emitted = true;
+            self.emitted.insert(state.policy.label().to_string());
+            rows.push(row);
+        }
+        rows
+    }
+}
+
+fn policy_trigger_reason_for_observed_sample(
+    state: &mut ExecutableDynamicExitPolicyStateV1,
+    age_ms: u64,
+    pnl_mark_bps: Option<i32>,
+) -> Option<ExecutableDynamicExitTriggerReasonV1> {
+    if let Some(fixed_age_ms) = state.policy.fixed_age_ms() {
+        return (age_ms >= fixed_age_ms).then_some(ExecutableDynamicExitTriggerReasonV1::FixedAge);
+    }
+    if let Some((tp_bps, sl_bps, max_hold_ms)) = state.policy.tp_sl_max_hold() {
+        if let Some(pnl_mark_bps) = pnl_mark_bps {
+            if pnl_mark_bps >= tp_bps {
+                return Some(ExecutableDynamicExitTriggerReasonV1::TakeProfit);
+            }
+            if pnl_mark_bps <= sl_bps {
+                return Some(ExecutableDynamicExitTriggerReasonV1::StopLoss);
+            }
+        }
+        return (age_ms >= max_hold_ms).then_some(ExecutableDynamicExitTriggerReasonV1::MaxHold);
+    }
+    if let Some((activation_bps, trail_bps, horizon_ms)) = state.policy.trailing_config() {
+        if let Some(pnl_mark_bps) = pnl_mark_bps {
+            if !state.activated && pnl_mark_bps >= activation_bps {
+                state.activated = true;
+                state.peak_pnl_bps = Some(pnl_mark_bps);
+                return None;
+            }
+            if state.activated {
+                let peak = state.peak_pnl_bps.unwrap_or(pnl_mark_bps).max(pnl_mark_bps);
+                state.peak_pnl_bps = Some(peak);
+                if peak.saturating_sub(pnl_mark_bps) >= trail_bps {
+                    return Some(ExecutableDynamicExitTriggerReasonV1::TrailingStop);
+                }
+            }
+        }
+        if age_ms >= horizon_ms {
+            return Some(ExecutableDynamicExitTriggerReasonV1::NoTriggerByDeclaredHorizon);
+        }
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_executable_dynamic_exit_evidence_row_v1(
+    position_id: &str,
+    entry_fill_event_id: &str,
+    entry_fill_amount_tokens_raw: Option<u64>,
+    entry_fill_amount_tokens: Option<f64>,
+    entry_fill_amount_sol: Option<f64>,
+    entry_fill_price: Option<f64>,
+    position_token_amount_source: &str,
+    trigger_eval_seq: u64,
+    policy: ExecutableDynamicExitCandidatePolicyV1,
+    reason: ExecutableDynamicExitTriggerReasonV1,
+    observation: &ExecutableDynamicExitObservationV1<'_>,
+) -> ExecutableDynamicExitEvidenceV1 {
+    let mut estimate = estimate_static_exit_quote_v1(
+        observation.pool_state,
+        entry_fill_amount_tokens_raw,
+        entry_fill_amount_tokens,
+        entry_fill_price,
+        observation.slippage_bps,
+        observation.fee_bps,
+    );
+    if entry_fill_event_id.trim().is_empty() {
+        estimate.executable_exit_quote_available = false;
+        estimate.evidence_quality =
+            ExecutableDynamicExitEvidenceQualityV1::BlockedByMissingEntryFill;
+        estimate
+            .limitations
+            .push("BLOCKED_BY_MISSING_ENTRY_FILL".to_string());
+    }
+    let candidate_exit_policy = policy.label().to_string();
+    let candidate_exit_policy_hash = blake3::hash(
+        format!("{EXECUTABLE_DYNAMIC_EXIT_POLICY_VERSION_V1}:{candidate_exit_policy}").as_bytes(),
+    )
+    .to_hex()
+    .to_string();
+
+    ExecutableDynamicExitEvidenceV1 {
+        schema: EXECUTABLE_DYNAMIC_EXIT_EVIDENCE_SCHEMA_V1.to_string(),
+        schema_version: 1,
+        run_id: observation.run_id.to_string(),
+        position_id: position_id.to_string(),
+        candidate_id: observation.candidate_id.map(str::to_string),
+        pool_id: observation.pool_id.to_string(),
+        base_mint: observation.base_mint.to_string(),
+        entry_fill_event_id: entry_fill_event_id.to_string(),
+        candidate_exit_policy,
+        candidate_exit_policy_version: EXECUTABLE_DYNAMIC_EXIT_POLICY_VERSION_V1.to_string(),
+        candidate_exit_policy_hash,
+        candidate_exit_age_ms: observation.path_sample.age_ms,
+        candidate_exit_trigger_reason: reason.label().to_string(),
+        mark_pnl_bps_at_trigger: observation.path_sample.pnl_mark_bps,
+        pool_state_ref_at_trigger: observation.path_sample.pool_state_ref.clone(),
+        quote_source: estimate.quote_source,
+        executable_exit_quote_available: estimate.executable_exit_quote_available,
+        estimated_executable_pnl_bps: estimate.estimated_executable_pnl_bps,
+        estimated_slippage_bps: estimate.estimated_slippage_bps,
+        quote_fill_divergence_bps: estimate.quote_fill_divergence_bps,
+        pool_state_staleness_ms: observation.pool_state.staleness_ms,
+        pool_state_staleness_slots: observation.pool_state.staleness_slots,
+        evidence_quality: estimate.evidence_quality.label().to_string(),
+        limitations: estimate.limitations,
+        static_exit_quote_model_version: EXECUTABLE_DYNAMIC_EXIT_STATIC_QUOTE_MODEL_VERSION_V1
+            .to_string(),
+        trigger_sample_event_id: observation.path_sample.envelope.event_id.clone(),
+        trigger_pool_state_event_id: observation.pool_state.envelope.event_id.clone(),
+        trigger_observed_at_ms: observation.trigger_observed_at_ms,
+        trigger_age_ms: observation.path_sample.age_ms,
+        trigger_eval_seq,
+        entry_fill_amount_tokens,
+        entry_fill_amount_sol,
+        entry_fill_price,
+        position_token_amount_source: position_token_amount_source.to_string(),
+        estimated_output_sol: estimate.estimated_output_sol,
+        estimated_output_tokens_sold: estimate.estimated_output_tokens_sold,
+        estimated_fee_bps: estimate.estimated_fee_bps,
+        own_impact_bps: estimate.own_impact_bps,
+        slippage_tolerance_bps: estimate.slippage_tolerance_bps,
+        min_out_if_available: estimate.min_out_if_available,
+        pool_state_source_quality: observation.pool_state.source_quality.clone(),
+        decision_neutral: true,
+        runtime_close_triggered: false,
+        changes_gatekeeper_decision: false,
+        changes_execution: false,
+        static_model_only: true,
+        not_live_fill: true,
+        not_canonical_exit: true,
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct MayhemModePreEntryFieldAvailabilityV1 {
+    pub explicit_mode_field_present: bool,
+    pub total_supply_present: bool,
+    pub mint_supply_present: bool,
+    pub initial_curve_token_amount_present: bool,
+    pub bot_allocation_amount_present: bool,
+}
+
+pub fn mayhem_mode_availability_verdict_v1(
+    fields: &MayhemModePreEntryFieldAvailabilityV1,
+) -> &'static str {
+    if fields.explicit_mode_field_present
+        || (fields.total_supply_present
+            && fields.initial_curve_token_amount_present
+            && fields.bot_allocation_amount_present)
+        || (fields.mint_supply_present
+            && fields.initial_curve_token_amount_present
+            && fields.bot_allocation_amount_present)
+    {
+        "MAYHEM_MODE_PRE_ENTRY_FIELDS_AVAILABLE"
+    } else {
+        MAYHEM_MODE_BLOCKED_MISSING_PRE_ENTRY_FIELDS
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ShadowExitAttemptV2 {
     pub envelope: ShadowV2Envelope,
@@ -4547,6 +5190,9 @@ pub struct ShadowV2ValidationHarnessConfig {
     pub density_full_stream_enabled: bool,
     pub replay_lifecycle_compact_refs_enabled: bool,
     pub artifact_budget: ShadowV2ArtifactBudgetConfig,
+    pub executable_dynamic_exit_evidence_enabled: bool,
+    pub executable_dynamic_exit_evidence_path: Option<PathBuf>,
+    pub executable_dynamic_exit_candidate_policies: Vec<String>,
 }
 
 impl ShadowV2ValidationHarnessConfig {
@@ -4585,6 +5231,9 @@ impl ShadowV2ValidationHarnessConfig {
             density_full_stream_enabled,
             replay_lifecycle_compact_refs_enabled: true,
             artifact_budget: ShadowV2ArtifactBudgetConfig::default(),
+            executable_dynamic_exit_evidence_enabled: false,
+            executable_dynamic_exit_evidence_path: None,
+            executable_dynamic_exit_candidate_policies: Vec::new(),
         }
     }
 
@@ -4656,6 +5305,16 @@ impl ShadowV2ValidationHarnessConfig {
             max_stdout_bytes: config.max_stdout_bytes,
             max_system_log_bytes: config.max_system_log_bytes,
         };
+        harness_config.executable_dynamic_exit_evidence_enabled =
+            config.executable_dynamic_exit_evidence_enabled;
+        harness_config.executable_dynamic_exit_evidence_path = config
+            .executable_dynamic_exit_evidence_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from);
+        harness_config.executable_dynamic_exit_candidate_policies =
+            config.executable_dynamic_exit_candidate_policies.clone();
         Ok(Some(harness_config))
     }
 }
@@ -4867,6 +5526,38 @@ impl ShadowV2ValidationHarness {
 
     pub fn canonical_event_stream_path(&self) -> &Path {
         self.canonical_writer.path()
+    }
+
+    pub fn executable_dynamic_exit_sidecar_settings(
+        &self,
+    ) -> Option<(PathBuf, Vec<ExecutableDynamicExitCandidatePolicyV1>)> {
+        if !self.config.executable_dynamic_exit_evidence_enabled {
+            return None;
+        }
+        let path = self
+            .config
+            .executable_dynamic_exit_evidence_path
+            .clone()
+            .unwrap_or_else(|| {
+                self.config
+                    .canonical_event_stream_path
+                    .with_file_name("executable_dynamic_exit_evidence_v1.jsonl")
+            });
+        let policies = if self
+            .config
+            .executable_dynamic_exit_candidate_policies
+            .is_empty()
+        {
+            executable_dynamic_exit_default_candidate_policies_v1()
+        } else {
+            match executable_dynamic_exit_candidate_policies_from_labels_v1(
+                &self.config.executable_dynamic_exit_candidate_policies,
+            ) {
+                Ok(policies) => policies,
+                Err(_) => return None,
+            }
+        };
+        Some((path, policies))
     }
 
     fn evict_terminal_position_from_memory(&mut self, position_id: &str) {
@@ -5709,6 +6400,320 @@ mod tests {
             exact_or_approx: "EXACT_EVENT_ORDER".to_string(),
             truncated: false,
         }
+    }
+
+    fn executable_dynamic_exit_test_evaluator(
+        policies: Vec<ExecutableDynamicExitCandidatePolicyV1>,
+    ) -> ExecutableDynamicExitPolicyEvaluatorV1 {
+        ExecutableDynamicExitPolicyEvaluatorV1::new(
+            "pos-a",
+            "entry-fill-a",
+            Some(1_000_000_000),
+            Some(1_000.0),
+            Some(1.0),
+            Some(0.001),
+            "shadow_entry_fill_v2.output_amount_raw",
+            policies,
+        )
+    }
+
+    fn executable_dynamic_exit_observation<'a>(
+        path_sample: &'a ShadowPathSampleV2,
+        pool_state: &'a PoolStateSampleV2,
+    ) -> ExecutableDynamicExitObservationV1<'a> {
+        ExecutableDynamicExitObservationV1 {
+            run_id: "run-a",
+            candidate_id: Some("candidate-a"),
+            pool_id: "pool-a",
+            base_mint: "mint-a",
+            path_sample,
+            pool_state,
+            trigger_observed_at_ms: path_sample.event_order_key.observed_at_wall_ms,
+            slippage_bps: 250,
+            fee_bps: 100,
+        }
+    }
+
+    #[test]
+    fn executable_dynamic_exit_fixed_2s_row_emitted() {
+        let pool_state = post_entry_pool_sample("pool-event-path", 10, 45, 2);
+        let before_2s = path_sample_with_pnl(
+            "path-before-2s",
+            1_999,
+            100,
+            ShadowPathSamplingModeV2::Standard120s,
+            ShadowPathSamplingReasonV2::EventSample,
+            event_order_key(Some(45), Some(2)),
+        );
+        let at_2s = path_sample_with_pnl(
+            "path-at-2s",
+            2_000,
+            150,
+            ShadowPathSamplingModeV2::Standard120s,
+            ShadowPathSamplingReasonV2::EventSample,
+            event_order_key(Some(45), Some(3)),
+        );
+        let mut evaluator = executable_dynamic_exit_test_evaluator(vec![
+            ExecutableDynamicExitCandidatePolicyV1::FixedExit2s,
+        ]);
+
+        assert!(evaluator
+            .observe_path_sample(executable_dynamic_exit_observation(&before_2s, &pool_state))
+            .is_empty());
+        let rows =
+            evaluator.observe_path_sample(executable_dynamic_exit_observation(&at_2s, &pool_state));
+
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.schema, EXECUTABLE_DYNAMIC_EXIT_EVIDENCE_SCHEMA_V1);
+        assert_eq!(row.candidate_exit_policy, "fixed_exit_2s");
+        assert_eq!(row.candidate_exit_trigger_reason, "FIXED_AGE");
+        assert_eq!(row.trigger_sample_event_id, "path-at-2s");
+        assert_eq!(row.evidence_quality, "STATIC_QUOTE_AVAILABLE");
+        assert!(row.executable_exit_quote_available);
+        assert!(row.decision_neutral);
+        assert!(!row.runtime_close_triggered);
+        assert!(!row.changes_gatekeeper_decision);
+        assert!(!row.changes_execution);
+        assert!(row.static_model_only);
+        assert!(row.not_live_fill);
+        assert!(row.not_canonical_exit);
+    }
+
+    #[test]
+    fn executable_dynamic_exit_tp_sl_row_emitted() {
+        let pool_state = post_entry_pool_sample("pool-event-path", 11, 45, 2);
+        let tp_sample = path_sample_with_pnl(
+            "path-tp",
+            10_000,
+            500,
+            ShadowPathSamplingModeV2::Standard120s,
+            ShadowPathSamplingReasonV2::EventSample,
+            event_order_key(Some(45), Some(2)),
+        );
+        let mut evaluator = executable_dynamic_exit_test_evaluator(vec![
+            ExecutableDynamicExitCandidatePolicyV1::Tp500Sl500Max30s,
+        ]);
+        let rows = evaluator
+            .observe_path_sample(executable_dynamic_exit_observation(&tp_sample, &pool_state));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].candidate_exit_policy, "tp500_sl500_max30s");
+        assert_eq!(rows[0].candidate_exit_trigger_reason, "TAKE_PROFIT");
+        assert_eq!(rows[0].trigger_age_ms, 10_000);
+    }
+
+    #[test]
+    fn executable_dynamic_exit_trailing_uses_observed_path_only() {
+        let pool_state = post_entry_pool_sample("pool-event-path", 12, 45, 2);
+        let samples = [
+            path_sample_with_pnl(
+                "path-500",
+                1_000,
+                500,
+                ShadowPathSamplingModeV2::Standard120s,
+                ShadowPathSamplingReasonV2::EventSample,
+                event_order_key(Some(45), Some(2)),
+            ),
+            path_sample_with_pnl(
+                "path-1200",
+                2_000,
+                1_200,
+                ShadowPathSamplingModeV2::Standard120s,
+                ShadowPathSamplingReasonV2::EventSample,
+                event_order_key(Some(45), Some(3)),
+            ),
+            path_sample_with_pnl(
+                "path-700",
+                3_000,
+                700,
+                ShadowPathSamplingModeV2::Standard120s,
+                ShadowPathSamplingReasonV2::EventSample,
+                event_order_key(Some(45), Some(4)),
+            ),
+        ];
+        let mut evaluator = executable_dynamic_exit_test_evaluator(vec![
+            ExecutableDynamicExitCandidatePolicyV1::TrailingAfter1000Trail500,
+        ]);
+
+        assert!(evaluator
+            .observe_path_sample(executable_dynamic_exit_observation(
+                &samples[0],
+                &pool_state
+            ))
+            .is_empty());
+        assert!(evaluator
+            .observe_path_sample(executable_dynamic_exit_observation(
+                &samples[1],
+                &pool_state
+            ))
+            .is_empty());
+        let rows = evaluator.observe_path_sample(executable_dynamic_exit_observation(
+            &samples[2],
+            &pool_state,
+        ));
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].candidate_exit_policy,
+            "trailing_after_1000_trail_500"
+        );
+        assert_eq!(rows[0].candidate_exit_trigger_reason, "TRAILING_STOP");
+        assert_eq!(rows[0].trigger_sample_event_id, "path-700");
+        assert_eq!(rows[0].trigger_eval_seq, 3);
+    }
+
+    #[test]
+    fn executable_dynamic_exit_no_trigger_emits_final_no_trigger_row() {
+        let pool_state = post_entry_pool_sample("pool-event-path", 13, 45, 2);
+        let horizon_sample = path_sample_with_pnl(
+            "path-horizon",
+            120_000,
+            100,
+            ShadowPathSamplingModeV2::Standard120s,
+            ShadowPathSamplingReasonV2::EventSample,
+            event_order_key(Some(45), Some(2)),
+        );
+        let mut evaluator = executable_dynamic_exit_test_evaluator(vec![
+            ExecutableDynamicExitCandidatePolicyV1::TrailingAfter2000Trail1000,
+        ]);
+        let rows = evaluator.observe_path_sample(executable_dynamic_exit_observation(
+            &horizon_sample,
+            &pool_state,
+        ));
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].candidate_exit_trigger_reason,
+            "NO_TRIGGER_BY_DECLARED_HORIZON"
+        );
+        assert_eq!(rows[0].evidence_quality, "NO_TRIGGER_BY_DECLARED_HORIZON");
+    }
+
+    #[test]
+    fn executable_dynamic_exit_rows_are_decision_neutral() {
+        let pool_state = post_entry_pool_sample("pool-event-path", 14, 45, 2);
+        let sample = path_sample_with_pnl(
+            "path-neutral",
+            2_000,
+            100,
+            ShadowPathSamplingModeV2::Standard120s,
+            ShadowPathSamplingReasonV2::EventSample,
+            event_order_key(Some(45), Some(2)),
+        );
+        let mut evaluator = executable_dynamic_exit_test_evaluator(vec![
+            ExecutableDynamicExitCandidatePolicyV1::FixedExit2s,
+        ]);
+        let rows = evaluator
+            .observe_path_sample(executable_dynamic_exit_observation(&sample, &pool_state));
+
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert!(row.decision_neutral);
+        assert!(!row.runtime_close_triggered);
+        assert!(!row.changes_gatekeeper_decision);
+        assert!(!row.changes_execution);
+        assert!(row.static_model_only);
+        assert!(row.not_live_fill);
+        assert!(row.not_canonical_exit);
+    }
+
+    #[test]
+    fn executable_dynamic_exit_does_not_emit_shadow_exit_fill() {
+        let row = serde_json::to_value(ExecutableDynamicExitEvidenceV1 {
+            schema: EXECUTABLE_DYNAMIC_EXIT_EVIDENCE_SCHEMA_V1.to_string(),
+            schema_version: 1,
+            run_id: "run-a".to_string(),
+            position_id: "pos-a".to_string(),
+            candidate_id: None,
+            pool_id: "pool-a".to_string(),
+            base_mint: "mint-a".to_string(),
+            entry_fill_event_id: "entry-fill-a".to_string(),
+            candidate_exit_policy: "fixed_exit_2s".to_string(),
+            candidate_exit_policy_version: EXECUTABLE_DYNAMIC_EXIT_POLICY_VERSION_V1.to_string(),
+            candidate_exit_policy_hash: "hash-a".to_string(),
+            candidate_exit_age_ms: 2_000,
+            candidate_exit_trigger_reason: "FIXED_AGE".to_string(),
+            mark_pnl_bps_at_trigger: Some(1),
+            pool_state_ref_at_trigger: "pool-state-a".to_string(),
+            quote_source: "static".to_string(),
+            executable_exit_quote_available: false,
+            estimated_executable_pnl_bps: None,
+            estimated_slippage_bps: None,
+            quote_fill_divergence_bps: None,
+            pool_state_staleness_ms: None,
+            pool_state_staleness_slots: None,
+            evidence_quality: "MARK_ONLY_NO_EXECUTABLE_QUOTE".to_string(),
+            limitations: vec!["TEST".to_string()],
+            static_exit_quote_model_version: EXECUTABLE_DYNAMIC_EXIT_STATIC_QUOTE_MODEL_VERSION_V1
+                .to_string(),
+            trigger_sample_event_id: "path-a".to_string(),
+            trigger_pool_state_event_id: "pool-a".to_string(),
+            trigger_observed_at_ms: 1,
+            trigger_age_ms: 2_000,
+            trigger_eval_seq: 1,
+            entry_fill_amount_tokens: None,
+            entry_fill_amount_sol: None,
+            entry_fill_price: None,
+            position_token_amount_source: "missing".to_string(),
+            estimated_output_sol: None,
+            estimated_output_tokens_sold: None,
+            estimated_fee_bps: None,
+            own_impact_bps: None,
+            slippage_tolerance_bps: None,
+            min_out_if_available: None,
+            pool_state_source_quality: "test".to_string(),
+            decision_neutral: true,
+            runtime_close_triggered: false,
+            changes_gatekeeper_decision: false,
+            changes_execution: false,
+            static_model_only: true,
+            not_live_fill: true,
+            not_canonical_exit: true,
+        })
+        .unwrap();
+
+        assert_eq!(row["schema"], EXECUTABLE_DYNAMIC_EXIT_EVIDENCE_SCHEMA_V1);
+        assert_ne!(row["schema"], "shadow_exit_fill_v2");
+    }
+
+    #[test]
+    fn executable_dynamic_exit_does_not_use_terminal_truth_or_lifecycle_outcome() {
+        let source = include_str!("shadow_v2.rs");
+        let start = source
+            .find("pub struct ExecutableDynamicExitPolicyEvaluatorV1")
+            .expect("dynamic exit evaluator should be present");
+        let end = source[start..]
+            .find("#[derive(Debug, Default, Clone, PartialEq, Eq)]")
+            .map(|offset| start + offset)
+            .expect("mayhem availability block should follow evaluator");
+        let evaluator_source = &source[start..end];
+        for forbidden in [
+            "ShadowTerminalTruthV2",
+            "ShadowLifecycleV2",
+            "final_pnl",
+            "terminal_reason",
+            "lifecycle",
+        ] {
+            assert!(
+                !evaluator_source.contains(forbidden),
+                "dynamic-exit evaluator must not consume {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn mayhem_availability_does_not_infer_from_pnl() {
+        let fields = MayhemModePreEntryFieldAvailabilityV1::default();
+        assert_eq!(
+            mayhem_mode_availability_verdict_v1(&fields),
+            MAYHEM_MODE_BLOCKED_MISSING_PRE_ENTRY_FIELDS
+        );
+        let mut explicit = fields.clone();
+        explicit.explicit_mode_field_present = true;
+        assert_eq!(
+            mayhem_mode_availability_verdict_v1(&explicit),
+            "MAYHEM_MODE_PRE_ENTRY_FIELDS_AVAILABLE"
+        );
     }
 
     #[test]

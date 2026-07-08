@@ -41,7 +41,9 @@ use ghost_brain::execution::paper_lifecycle::{PaperLifecycleConfig, PaperPositio
 use ghost_brain::execution::{CandidateRef, Lane};
 use ghost_brain::guardian::post_buy::engine::{PositionEventContext, PositionJoinMetadata};
 use ghost_brain::guardian::post_buy::shadow_v2::{
-    ClockDomain, ClockedTimestamp, EventOrderComponent, EventOrderKey, MeasurementGrade,
+    executable_dynamic_exit_candidate_policies_from_labels_v1, ClockDomain, ClockedTimestamp,
+    EventOrderComponent, EventOrderKey, ExecutableDynamicExitEvidenceV1,
+    ExecutableDynamicExitObservationV1, ExecutableDynamicExitPolicyEvaluatorV1, MeasurementGrade,
     PoolStateSampleV2, ShadowEntryAttemptV2, ShadowEntryFillModelConfig, ShadowEntryFillV2,
     ShadowPathSampleV2, ShadowPathSamplingModeV2, ShadowPathSamplingReasonV2, ShadowPositionV2,
     ShadowV2Envelope, ShadowV2Record, ShadowV2ValidationEvidenceStatus, ShadowV2ValidationHarness,
@@ -66,6 +68,8 @@ use solana_sdk::signature::{Keypair, Signature};
 use solana_sdk::signer::Signer;
 use solana_sdk::transaction::VersionedTransaction;
 use std::collections::{HashMap, VecDeque};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -334,6 +338,151 @@ fn shadow_v2_scope_root(config: &ShadowV2BurninConfig) -> Result<&str, String> {
         .ok_or_else(|| "missing scope_root_path".to_string())
 }
 
+fn executable_dynamic_exit_evidence_path(
+    config: &ShadowV2BurninConfig,
+) -> Result<Option<PathBuf>, String> {
+    if !config.executable_dynamic_exit_evidence_enabled {
+        return Ok(None);
+    }
+    if let Some(path) = config
+        .executable_dynamic_exit_evidence_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        return Ok(Some(PathBuf::from(path)));
+    }
+    Ok(Some(
+        Path::new(shadow_v2_scope_root(config)?).join("executable_dynamic_exit_evidence_v1.jsonl"),
+    ))
+}
+
+fn append_executable_dynamic_exit_sidecar_row(
+    path: &Path,
+    row: &ExecutableDynamicExitEvidenceV1,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "failed to create sidecar parent {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| format!("failed to open sidecar {}: {error}", path.display()))?;
+    serde_json::to_writer(&mut file, row)
+        .map_err(|error| format!("failed to serialize dynamic-exit sidecar row: {error}"))?;
+    file.write_all(b"\n")
+        .map_err(|error| format!("failed to write dynamic-exit sidecar newline: {error}"))?;
+    file.flush()
+        .map_err(|error| format!("failed to flush dynamic-exit sidecar: {error}"))?;
+    Ok(())
+}
+
+fn emit_executable_dynamic_exit_sidecar_rows(
+    config: &ShadowV2BurninConfig,
+    position_id: &str,
+    candidate_id: &str,
+    pool_amm_id: &str,
+    base_mint: &str,
+    entry_fill: &ShadowEntryFillV2,
+    entry_token_amount_raw: Option<u64>,
+    path_sample: &ShadowPathSampleV2,
+    pool_state: &PoolStateSampleV2,
+) {
+    let path = match executable_dynamic_exit_evidence_path(config) {
+        Ok(Some(path)) => path,
+        Ok(None) => return,
+        Err(error) => {
+            ::metrics::counter!(
+                "executable_dynamic_exit_evidence_write_failed_total",
+                1u64,
+                "reason" => "path_resolution"
+            );
+            warn!(
+                runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+                position_id,
+                error,
+                "PostBuyRuntime: dynamic-exit evidence sidecar path resolution failed; runtime continues"
+            );
+            return;
+        }
+    };
+    let policies = match executable_dynamic_exit_candidate_policies_from_labels_v1(
+        &config.executable_dynamic_exit_candidate_policies,
+    ) {
+        Ok(policies) => policies,
+        Err(error) => {
+            ::metrics::counter!(
+                "executable_dynamic_exit_evidence_write_failed_total",
+                1u64,
+                "reason" => "policy_parse"
+            );
+            warn!(
+                runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+                position_id,
+                error,
+                "PostBuyRuntime: dynamic-exit evidence sidecar policy parse failed; runtime continues"
+            );
+            return;
+        }
+    };
+    let token_amount_source = if entry_fill.output_amount_raw.is_some() {
+        "shadow_entry_fill_v2.output_amount_raw"
+    } else if entry_token_amount_raw.is_some() {
+        "post_buy_handoff.entry_token_amount_raw"
+    } else {
+        "MISSING_TOKEN_AMOUNT"
+    };
+    let mut evaluator = ExecutableDynamicExitPolicyEvaluatorV1::new(
+        position_id,
+        entry_fill.envelope.event_id.clone(),
+        entry_fill.output_amount_raw.or(entry_token_amount_raw),
+        entry_fill.fill_amount_tokens,
+        entry_fill.fill_amount_sol,
+        entry_fill.fill_price,
+        token_amount_source,
+        policies,
+    );
+    let rows = evaluator.observe_path_sample(ExecutableDynamicExitObservationV1 {
+        run_id: config.run_namespace.as_deref().unwrap_or("UNKNOWN_RUN"),
+        candidate_id: Some(candidate_id),
+        pool_id: pool_amm_id,
+        base_mint,
+        path_sample,
+        pool_state,
+        trigger_observed_at_ms: path_sample.event_order_key.observed_at_wall_ms,
+        slippage_bps: entry_fill
+            .slippage_tolerance_bps
+            .and_then(|value| u16::try_from(value.max(0)).ok())
+            .unwrap_or_else(|| slippage_tolerance_to_bps(0.05)),
+        fee_bps: entry_fill
+            .fee_bps
+            .and_then(|value| u16::try_from(value.max(0)).ok())
+            .unwrap_or(SHADOW_V2_ENTRY_FEE_BPS_FALLBACK),
+    });
+    for row in rows {
+        if let Err(error) = append_executable_dynamic_exit_sidecar_row(&path, &row) {
+            ::metrics::counter!(
+                "executable_dynamic_exit_evidence_write_failed_total",
+                1u64,
+                "reason" => "write"
+            );
+            warn!(
+                runtime_plane = RuntimePlane::PostBuyMonitoring.as_str(),
+                position_id,
+                error,
+                "PostBuyRuntime: dynamic-exit evidence sidecar write failed; runtime continues"
+            );
+            return;
+        }
+    }
+}
+
 async fn run_shadow_v2_manifest_command(
     config: &ShadowV2BurninConfig,
     args: &[String],
@@ -392,6 +541,8 @@ fn shadow_v2_post_run_generation_args(
         config.required_schema_manifest_path.clone(),
         "--acceptance-gates".to_string(),
         config.acceptance_gates_path.clone(),
+        "--executable-dynamic-exit-evidence-enabled".to_string(),
+        config.executable_dynamic_exit_evidence_enabled.to_string(),
     ])
 }
 
@@ -408,6 +559,8 @@ fn shadow_v2_post_run_verification_args(
         config.required_schema_manifest_path.clone(),
         "--acceptance-gates".to_string(),
         config.acceptance_gates_path.clone(),
+        "--executable-dynamic-exit-evidence-enabled".to_string(),
+        config.executable_dynamic_exit_evidence_enabled.to_string(),
         "--strict".to_string(),
     ])
 }
@@ -3460,6 +3613,17 @@ fn maybe_emit_shadow_v2_entry_evidence_with_pool_state(
             ShadowPathSamplingModeV2::Standard120s,
             ShadowPathSamplingReasonV2::EventSample,
         );
+        emit_executable_dynamic_exit_sidecar_rows(
+            shadow_v2_config,
+            position_id,
+            candidate_id,
+            pool_amm_id,
+            base_mint,
+            &fill,
+            entry_token_amount_raw,
+            &path_sample,
+            &pool_state_before,
+        );
         records.push(ShadowV2Record::PoolStateSampleV2(pool_state_before));
         records.push(ShadowV2Record::ShadowPathSampleV2(path_sample));
     }
@@ -5993,6 +6157,9 @@ sys.exit(0)
             "shadow_v2_burnin",
             "ShadowV2ValidationHarness",
             "ShadowV2Record",
+            "ExecutableDynamicExitEvidenceV1",
+            "ExecutableDynamicExitPolicyEvaluatorV1",
+            "executable_dynamic_exit_evidence_v1",
             "shadow_position_event_v2",
             "shadow_replay_v2",
             "shadow_lifecycle_v2",
@@ -6010,6 +6177,98 @@ sys.exit(0)
                 );
             }
         }
+    }
+
+    #[test]
+    fn executable_dynamic_exit_sidecar_does_not_change_decisions() {
+        let source = include_str!("post_buy_runtime.rs");
+        let start = source
+            .find("fn emit_executable_dynamic_exit_sidecar_rows")
+            .expect("dynamic exit sidecar helper should exist");
+        let end = source[start..]
+            .find("async fn run_shadow_v2_manifest_command")
+            .map(|offset| start + offset)
+            .expect("manifest command should follow sidecar helper");
+        let helper_body = &source[start..end];
+
+        for forbidden in [
+            "Gatekeeper",
+            "BUY",
+            "REJECT",
+            "ShadowV2Record::ShadowExitFillV2",
+            "LiveTxSender",
+            "shadow_close_only",
+            "active_close",
+        ] {
+            assert!(
+                !helper_body.contains(forbidden),
+                "dynamic-exit sidecar helper must not consume or change {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn executable_dynamic_exit_write_failure_does_not_change_execution_eligibility() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let directory_path = tmp.path().join("sidecar-as-directory.jsonl");
+        std::fs::create_dir(&directory_path).expect("sidecar directory");
+        let row = ExecutableDynamicExitEvidenceV1 {
+            schema: "executable_dynamic_exit_evidence_v1".to_string(),
+            schema_version: 1,
+            run_id: "run-a".to_string(),
+            position_id: "pos-a".to_string(),
+            candidate_id: None,
+            pool_id: "pool-a".to_string(),
+            base_mint: "mint-a".to_string(),
+            entry_fill_event_id: "entry-fill-a".to_string(),
+            candidate_exit_policy: "fixed_exit_2s".to_string(),
+            candidate_exit_policy_version: "executable_dynamic_exit_policy_v1".to_string(),
+            candidate_exit_policy_hash: "hash-a".to_string(),
+            candidate_exit_age_ms: 2_000,
+            candidate_exit_trigger_reason: "FIXED_AGE".to_string(),
+            mark_pnl_bps_at_trigger: Some(100),
+            pool_state_ref_at_trigger: "pool-state-a".to_string(),
+            quote_source: "static".to_string(),
+            executable_exit_quote_available: false,
+            estimated_executable_pnl_bps: None,
+            estimated_slippage_bps: None,
+            quote_fill_divergence_bps: None,
+            pool_state_staleness_ms: None,
+            pool_state_staleness_slots: None,
+            evidence_quality: "MARK_ONLY_NO_EXECUTABLE_QUOTE".to_string(),
+            limitations: vec!["TEST_WRITE_FAILURE".to_string()],
+            static_exit_quote_model_version: "shadow_v2_exit_static_quote_model_v1".to_string(),
+            trigger_sample_event_id: "path-a".to_string(),
+            trigger_pool_state_event_id: "pool-a".to_string(),
+            trigger_observed_at_ms: 1,
+            trigger_age_ms: 2_000,
+            trigger_eval_seq: 1,
+            entry_fill_amount_tokens: None,
+            entry_fill_amount_sol: None,
+            entry_fill_price: None,
+            position_token_amount_source: "missing".to_string(),
+            estimated_output_sol: None,
+            estimated_output_tokens_sold: None,
+            estimated_fee_bps: None,
+            own_impact_bps: None,
+            slippage_tolerance_bps: None,
+            min_out_if_available: None,
+            pool_state_source_quality: "test".to_string(),
+            decision_neutral: true,
+            runtime_close_triggered: false,
+            changes_gatekeeper_decision: false,
+            changes_execution: false,
+            static_model_only: true,
+            not_live_fill: true,
+            not_canonical_exit: true,
+        };
+
+        let error = append_executable_dynamic_exit_sidecar_row(&directory_path, &row)
+            .expect_err("directory path should fail sidecar append");
+        assert!(error.contains("failed to open sidecar"));
+        assert!(row.decision_neutral);
+        assert!(!row.changes_execution);
+        assert!(!row.runtime_close_triggered);
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
