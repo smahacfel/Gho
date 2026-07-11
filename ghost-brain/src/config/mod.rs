@@ -12,6 +12,11 @@ pub mod qedd_config;
 pub use mci_config::{MciConfig, MciInitialState};
 pub use qedd_config::QeddConfig;
 
+// Shared metric-contract rollout/profile foundation.
+pub use ghost_core::metric_contracts::{
+    MetricContractFoundationConfigV1, MetricContractProfileIdV1, MetricContractRolloutMode,
+};
+
 // Re-export E2E pipeline configs
 pub use e2e_config::*;
 

@@ -27,6 +27,84 @@ fn gatekeeper_policy_stays_feature_only() {
 }
 
 #[test]
+fn active_top3_consumers_use_the_single_effective_selector() {
+    let observation_src = include_str!("../src/session/observation.rs");
+    let observation_impl = observation_src
+        .split("fn materialize_v3_manipulation_contradictions")
+        .nth(1)
+        .and_then(|source| source.split("fn materialize_v3_evidence_status").next())
+        .expect("materialization contradiction implementation section");
+    let policy_src = include_str!("../src/components/gatekeeper_policy.rs");
+    let policy_impl = policy_src
+        .split("#[cfg(test)]")
+        .next()
+        .expect("gatekeeper policy implementation section");
+    let gatekeeper_src = include_str!("../src/components/gatekeeper.rs");
+    let gatekeeper_impl = gatekeeper_src
+        .split("#[cfg(test)]")
+        .next()
+        .expect("gatekeeper implementation section");
+
+    for (name, source) in [
+        ("session/observation.rs", observation_impl),
+        ("components/gatekeeper_policy.rs", policy_impl),
+        ("components/gatekeeper.rs", gatekeeper_impl),
+    ] {
+        assert!(
+            !source.contains("tx_intel_features.top3_volume_pct"),
+            "{name} must not read the legacy TxIntel alias directly"
+        );
+        assert!(
+            !source.contains("tx.top3_volume_pct"),
+            "{name} must not read a TxIntel top3 legacy alias directly"
+        );
+        assert!(
+            !source.contains("diversity.top3_volume_pct"),
+            "{name} must not read the legacy diversity alias directly"
+        );
+    }
+
+    assert!(
+        observation_impl.contains("effective_top3_signer_volume_ratio()"),
+        "materialization adapter must use the existing preferred-plus-fallback helper"
+    );
+    assert!(
+        policy_impl.contains("effective_top3_signer_volume_ratio()"),
+        "Gatekeeper policy must use the existing preferred-plus-fallback helper"
+    );
+    assert!(
+        gatekeeper_impl.contains("effective_top3_signer_volume_ratio()"),
+        "Gatekeeper assessment/log adapters must use the existing helper"
+    );
+}
+
+#[test]
+fn metric_contract_pr1_keeps_v33_and_v3_v1_emission_frozen() {
+    assert_eq!(
+        ghost_brain::oracle::GATEKEEPER_BUY_LOG_SCHEMA_VERSION,
+        ghost_core::metric_contracts::LEGACY_GATEKEEPER_DECISION_SCHEMA_VERSION_V33
+    );
+    assert_eq!(
+        ghost_launcher::components::gatekeeper_v3::V3_SHADOW_SCHEMA_VERSION,
+        u32::from(ghost_core::metric_contracts::LEGACY_V3_REPLAY_PAYLOAD_SCHEMA_VERSION_V1)
+    );
+
+    let decision_logger = include_str!("../../ghost-brain/src/oracle/decision_logger.rs");
+    assert!(decision_logger.contains("pub const GATEKEEPER_BUY_LOG_SCHEMA_VERSION: u32 = 33;"));
+    assert!(
+        !decision_logger.contains("MetricContractDecisionSummaryV1"),
+        "PR1 must not attach the reserved v34 summary to DecisionLogger"
+    );
+
+    let replay = include_str!("../src/bin/v3_replay.rs");
+    assert!(replay.contains("const SUPPORTED_REPLAY_PAYLOAD_SCHEMA_VERSION: u64 = 1;"));
+    assert!(
+        !replay.contains("MetricContractEvidenceTransportV1"),
+        "PR1 must not activate replay v2 or metric evidence joins"
+    );
+}
+
+#[test]
 fn oracle_runtime_keeps_early_fingerprint_post_verdict_only() {
     let runtime_src = include_str!("../src/oracle_runtime.rs");
     let attachments: Vec<usize> = runtime_src

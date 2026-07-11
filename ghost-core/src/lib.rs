@@ -29,6 +29,7 @@ pub mod features;
 pub mod health;
 pub mod init_pool_parser;
 pub mod market_state;
+pub mod metric_contracts;
 pub mod pipeline_coverage;
 pub mod pool_identity;
 pub mod session;
