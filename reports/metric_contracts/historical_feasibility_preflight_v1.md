@@ -7,12 +7,20 @@ FEASIBILITY_PREFLIGHT_COMPLETE
 FEASIBILITY_ONLY
 V2_DIMENSIONS_NOT_MEASURABLE_PRE_IMPLEMENTATION
 NOT_VALIDATION_EVIDENCE
+PROVENANCE_AND_REPRODUCIBILITY_PASS
 ```
 
 Data audytu: 2026-07-11
 
 Audytowany code commit:
 `f3318f3a71a9202ced7af9cf43c064fa9f2f0c4a`
+
+Base i merge-base PR #60:
+`f1e3292aae935d1b43e2c265c078f9ec74a62563`
+
+Tree obu commitów:
+`92e97058349157b591a24f11da3bec0642051cd7`
+(`TREE_EQUIVALENCE_PASS`; exact commands w `pr0_reproduction_v1.md`).
 
 Plan normatywny:
 `PLANS/DO_REALIZACJI/PLAN_KOREKTY_KONTRAKTOW_INTERPRETACJI_METRYK_V1_20260710.md`
@@ -71,8 +79,11 @@ gatekeeper_v2_decisions.jsonl
 
 W każdym runie wszystkie rows mają `log_schema_version=33`,
 `decision_plane=legacy_live` i powyższy wspólny Gatekeeper `config_hash`.
-`brain_config_hash` różni się per run, zgodnie z różnymi research overlays; te
-runy nie spełniłyby wymogu jednego config hash dla przyszłego burn-in bundle.
+`brain_config_hash` różni się per run, zgodnie z różnymi research overlays.
+Sama ta różnica nie dyskwalifikuje bundle. Historyczne rows nie emitują jednak
+`metric_contract_effective_config_hash`, więc nie da się ustalić, czy wszystkie
+resolved producer/population/dedupe/dust/window/status/comparator settings były
+identyczne. Config equivalence ma status `NOT_MEASURABLE_PRE_IMPLEMENTATION`.
 
 ## 4. Aggregate stable feasibility set
 
@@ -81,10 +92,12 @@ runy nie spełniłyby wymogu jednego config hash dla przyszłego burn-in bundle.
 | Run count | 4 |
 | Sum observed duration | 36.2505 h |
 | Decision rows | 31,266 |
-| Unique join keys | 31,266 |
-| Missing join keys | 0 |
-| Duplicate join keys within runs | 0 |
-| Cross-run duplicate join keys | 0 |
+| Unique record identities `(run_id, join_key, decision_plane)` | 31,266 |
+| Missing record identity rows | 0 |
+| Duplicate record identities within/across inputs | 0 / 0 |
+| Cross-run join-key collisions observed, diagnostic only | 0 |
+| Stable underlying-event identity rows | 0 |
+| Cross-run underlying-event collision gate | `NOT_MEASURABLE_PRE_IMPLEMENTATION` |
 | Malformed/truncated JSON rows | 0 |
 | Dev-known rows | 28,489 (91.12%) |
 | Legacy `flip_ratio_10s` present | 28,443 (90.97%) |
@@ -140,7 +153,7 @@ ale typed/string reason nie wyjaśnia dlaczego. Historyczne runy nie spełniają
 planowanego 100% full Gatekeeper V2 replay gate i nie mogą zostać uznane za
 validation bundle. PR2C musi wymagać jawnego incomplete reason i fail closed.
 
-## 7. Manifest i immutability audit
+## 7. Manifest, reprodukcja i immutability audit
 
 Istniejące `reports/selector/<run>/pre_run_manifest.json` są manifestami fazy
 `pre_run`, a nie końcowymi manifestami decision logs:
@@ -150,10 +163,25 @@ Istniejące `reports/selector/<run>/pre_run_manifest.json` są manifestami fazy
 - żaden nie zawiera SHA, row count, rotated parts ani schema coverage badanego
   `gatekeeper_v2_decisions.jsonl`.
 
-SHA w tym raporcie zostały policzone przez PR0 bezpośrednio po stabilnych
-plikach i umożliwiają powtórzenie feasibility scan, ale nie zastępują
-post-run manifestu wygenerowanego przez runtime/audit CLI. Historyczne inputs
-pozostają `FEASIBILITY_ONLY`.
+PR0 uzupełnia tę historyczną lukę trzema repo artifacts:
+
+```text
+reports/metric_contracts/pr0_input_manifest_v1.json
+reports/metric_contracts/pr0_feasibility_summary_v1.json
+reports/metric_contracts/pr0_reproduction_v1.md
+```
+
+Manifest utrwala path/basename, SHA-256, bytes, rows, min/max timestamp, schema,
+run ID, Gatekeeper/brain hashes i immutable/mutable classification. Summary jest
+bezpośrednim wynikiem wersjonowanego skanera. Reproduction doc zawiera pełne
+źródło skanera, jego SHA, wersje narzędzi i exact commands.
+
+Skaner ponownie odczytał wszystkie 3.220 GB i zwrócił
+`input_validation.status=PASS`, bez mismatchów. Exact generated JSON jest
+identyczny z checked summary. Surowych plików nie dodano do Git, więc reprodukcja
+wymaga tych samych content-addressed inputs. Te artifacts nie zastępują
+runtime-generated post-run manifestu i nie promują danych ponad
+`FEASIBILITY_ONLY`.
 
 ## 8. Czy obecny payload odtwarza dev-primary i flip-v2?
 
@@ -197,8 +225,9 @@ Początkowa hipoteza z planu:
 | 30 real dev divergences | nie | brak create signature/raw order | `NOT_MEASURABLE_PRE_IMPLEMENTATION` |
 
 Warunek co najmniej trzech runów i dwóch UTC 4h buckets jest historycznie
-osiągalny ilościowo. Nie oznacza PASS bundle: runy mają różne brain config
-hashes, brak final manifests i niepełny Gatekeeper V2 replay.
+osiągalny ilościowo. Nie oznacza PASS bundle: brak effective-config hash i final
+manifests, stable event identity jest nieobecne, a Gatekeeper V2 replay jest
+niepełny. Różne pełne brain config hashes są provenance, nie samodzielnym FAIL.
 
 ## 10. Wniosek dla `BURN_IN_CONTRACT_V1`
 
@@ -230,6 +259,11 @@ Audit CLI musi przed freeze wygenerować co najmniej:
 - coverage wszystkich 10 contracts i status/reason distributions;
 - full replay completeness oraz dokładne incomplete reasons;
 - build/profile/config/schema hashes;
+- `metric_contract_effective_config_hash` obejmujący wszystkie resolved settings
+  wpływające na producer/population/dedupe/dust/window/status/comparator;
+- pełny `brain_config_hash` jako provenance bez automatycznego equality gate;
+- duplicate full record identity oraz osobny stable underlying-event collision
+  result;
 - p50/p95/p99 bytes per compact decision i full evidence record;
 - GB/hour delta względem tego v33 baseline;
 - serialization/build/enqueue p99, queue high-water, dropped rows, writer
@@ -243,6 +277,7 @@ FEASIBILITY_PREFLIGHT_COMPLETE
 FEASIBILITY_ONLY
 V2_DIMENSIONS_NOT_MEASURABLE_PRE_IMPLEMENTATION
 NOT_VALIDATION_EVIDENCE
+PROVENANCE_AND_REPRODUCIBILITY_PASS
 ```
 
 Ten wynik jest pozytywnym zakończeniem PR0, ponieważ brakujące wymiary zostały

@@ -4,8 +4,11 @@ Status:
 
 ```text
 PLAN_V1_1_ACCEPTED
-PR0_BASELINE_RECONCILIATION_ALLOWED
-RUNTIME_IMPLEMENTATION_BLOCKED_UNTIL_PR0_PASS
+PR0_SEMANTIC_CONTENT_PASS
+PR0_PROVENANCE_AND_REPRODUCIBILITY_PASS
+BASELINE_RECONCILIATION_PASS
+PR1_FOUNDATION_ALLOWED
+PR2_PLUS_BLOCKED_UNTIL_SEQUENTIAL_ACCEPTANCE
 ```
 
 Wersja kontraktu: `metric_contracts_v1_1`
@@ -13,6 +16,10 @@ Wersja kontraktu: `metric_contracts_v1_1`
 Data źródłowego audytu: 2026-07-10
 
 Data rewizji V1.1: 2026-07-11
+
+Korekta PR0 provenance/reproducibility: 2026-07-11. Nie zmienia dziesięciu
+kontraktów semantycznych; domyka przed PR1 canonical hashing, effective config
+hash oraz record/event identity.
 
 Dokument źródłowy:
 `PLANS/AUDYT/RAPORT_AUDYT_KOREKTY_INTERPRETACJI_METRYK_20260710.md`
@@ -165,10 +172,45 @@ matrix. Wymagania:
 - serde default mode: `Legacy`;
 - serde default profile: `metric_contracts_v1_1_profile_a`;
 - unknown mode/profile: startup failure;
-- canonical JSON profilu jest hashowany SHA-256;
+- canonical profile payload jest hashowany według `CanonicalHashV1` poniżej;
 - mode/profile ID/hash są w decision summary, sidecarze i replayu;
 - hash mismatch jest błędem schema/replay;
 - nowy profil wymaga nowego ID, testów i ADR.
+
+#### 2.1.1 `CanonicalHashV1` — normatywny algorytm
+
+Każdy profile/config/evidence hash w `metric_contracts_v1_1` używa:
+
+```text
+canonicalization = RFC 8785 JSON Canonicalization Scheme (JCS)
+encoding = UTF-8
+algorithm = SHA-256
+digest_encoding = lowercase hexadecimal, dokładnie 64 znaki
+non_finite_numbers = forbidden
+trailing_newline_in_hash_input = false
+```
+
+Hash nie jest liczony z dowolnego transportowego JSON. Każdy typ ma osobny,
+schema-defined semantic hash payload:
+
+- `MetricContractProfileHashPayloadV1` nie zawiera `profile_hash`;
+- `MetricContractEffectiveConfigHashPayloadV1` nie zawiera własnego digestu;
+- `MetricContractEvidenceHashPayloadV1` nie zawiera `evidence_sha256`, writer
+  timestamp, rotation/part metadata ani transport envelope.
+
+Pola wyłączone z hasha są rozdzielone typem, nie filtrowane dynamicznie po
+nazwie. Wszystkie klucze zdefiniowane przez semantic payload schema są
+obowiązkowe. Optional unavailable jest serializowane jako jawne `null`; omitted
+key i explicit `null` nie są równoważne. `skip_serializing_if` jest zakazane w
+hash payloadach. Kolejność kluczy i reprezentacja liczb wynikają wyłącznie z
+RFC 8785 JCS; nie implementujemy własnego sortowania ani formatowania floatów.
+Integers mieszczące się w interoperacyjnym zakresie I-JSON są JSON numbers.
+Szersze `u64/i64` są schema-typed canonical base-10 strings bez `+` i leading
+zeros; konwersja nie może zależeć od runtime serializer coercion.
+
+Hash input to dokładne JCS bytes bez BOM i bez końcowego LF. Test vectors muszą
+obejmować key order, Unicode, safe/wide integer i float boundaries, `-0`, null
+kontra omitted, zakaz NaN/Inf oraz self-hash exclusion.
 
 ### 2.2 Authority classes
 
@@ -270,6 +312,39 @@ legacy string degraded reasons → typed per-contract reasons
 ```
 
 Istniejące enumy nie są usuwane; otrzymują jawne adaptery i testy.
+
+### 2.5 `metric_contract_effective_config_hash`
+
+Pełny `brain_config_hash` pozostaje provenance, ale nie jest automatycznym
+warunkiem równości bundle. `Gatekeeper config hash` chroni policy parity, lecz
+sam nie obejmuje wszystkich producer settings. Dlatego PR1 definiuje
+`ResolvedMetricContractEffectiveConfigV1` i jego hash według
+`CanonicalHashV1`.
+
+Payload zawiera wszystkie rozstrzygnięte wartości — także serde defaults i
+stałe kontraktowe — wpływające na dziesięć rodzin:
+
+- population/eligibility, success/failure i identity rules;
+- dedupe key, capacity, eviction i reconnect/gap behavior;
+- dust/min-volume filters oraz denominator rules;
+- wall-clock/slot windows, anchors i ordering policy;
+- bounded-state limits i degradation thresholds;
+- FSC coverage/readiness, manipulation presence i reserve validity rules;
+- comparator normalization, equivalence lane i status/actionability mapping.
+
+Nie zawiera unrelated selector, exit, sender ani execution settings, o ile kod
+nie może przez nie zmienić evidence plane. Każda konfiguracja faktycznie
+wpływająca na producenta, populację, status lub comparator, a nieobecna w tym
+payloadzie, jest błędem kontraktu. Exhaustive mutation test wymaga, aby zmiana
+każdego pola payloadu zmieniała hash.
+
+Decision summary, sidecar, replay, manifest i bundle zapisują jednocześnie:
+
+```text
+brain_config_hash                         provenance only
+gatekeeper_config_hash                    policy parity
+metric_contract_effective_config_hash     metric evidence equivalence
+```
 
 ## 3. Normatywne kontrakty wymagające doprecyzowania
 
@@ -516,6 +591,7 @@ Decision v34 zawiera tylko compact summary:
 metric_contract_schema_version
 rollout_mode
 profile_id/profile_hash
+metric_contract_effective_config_hash
 evidence_record_id/evidence_sha256/evidence_schema
 authoritative/comparator contract sets
 equivalence verdict/reason/phase/soft-point deltas
@@ -527,15 +603,26 @@ measured_fields_mask
 
 Pełny payload trafia do `metric_contract_evidence_v1.jsonl`.
 
-Join identity:
+Record identity:
 
 ```text
 (run_id, join_key, decision_plane)
 ```
 
+Duplicate record oznacza wyłącznie powtórzenie pełnej powyższej krotki. Ten sam
+`join_key` w dwóch różnych runach nie jest automatycznie duplicate record.
+
+Cross-run underlying-event collision używa osobnego
+`stable_event_identity: Option<StableEventIdentityV1>`, wyprowadzanego ze
+stabilnej source identity/order, gdy źródło ją udostępnia. Kolizja tego identity
+w niepokrywających się runach dyskwalifikuje bundle. Brak pola nie może być
+raportowany jako zero collisions: gate ma status unavailable/not-evaluable,
+chyba że odrębny, zahashowany partition contract formalnie dowodzi rozłączności
+źródeł i przedziałów.
+
 Sidecar zawiera wszystkie 10 typed contracts, profile/config/schema versions,
 authoritative result, equivalence candidate, semantic counterfactual i payload
-SHA-256.
+SHA-256 liczony przez `CanonicalHashV1`.
 
 Decision summary i sidecar row są przekazywane jednym logicznym commandem do
 bounded queue. Zapis do dwóch plików nie jest udawany jako atomowy; orphan/missing
@@ -578,6 +665,9 @@ Dokumentacyjny PR bez kodu runtime. Tworzy:
 ```text
 reports/metric_contracts/baseline_reconciliation_v1.md
 reports/metric_contracts/historical_feasibility_preflight_v1.md
+reports/metric_contracts/pr0_input_manifest_v1.json
+reports/metric_contracts/pr0_feasibility_summary_v1.json
+reports/metric_contracts/pr0_reproduction_v1.md
 ```
 
 Dla każdego kontraktu raportuje requirement, current definition/producer/MFS,
@@ -614,7 +704,10 @@ PR1 jest zablokowany do PASS.
 ### 5.2 PR1 — registry/profile/status foundation
 
 - normatywny `METRIC_CONTRACTS_V1_1`;
-- rollout/profile/authority types i hash;
+- rollout/profile/authority types i `CanonicalHashV1`;
+- `ResolvedMetricContractEffectiveConfigV1` i
+  `metric_contract_effective_config_hash`;
+- record identity kontra stable underlying-event identity types;
 - canonical status envelope i typed reasons;
 - exhaustive legacy adapters;
 - serde-compatible shared evidence structs;
@@ -696,10 +789,17 @@ Burn-in startuje dopiero po zamrożeniu contractu. Niezmienna struktura:
 - co najmniej 3 immutable, niepokrywające się runy;
 - każdy run minimum 1 h;
 - co najmniej dwa `utc_4h_bucket = floor(run_start_ms / 14_400_000)`;
-- ten sam build commit, profile ID/hash, metric schema i Gatekeeper config hash;
+- ten sam build commit, profile ID/hash, metric schema, Gatekeeper config hash
+  oraz `metric_contract_effective_config_hash`;
+- `brain_config_hash` jest zachowany dla provenance, ale jego pełna równość nie
+  jest wymagana, jeśli effective hash i pozostałe bundle hashes są identyczne;
 - każdy run osobno przechodzi full replay/schema/hash/resource gates;
 - minima agregowane dopiero po per-run PASS;
-- duplicate join key w runie lub bundle dyskwalifikuje bundle;
+- duplicate record identity `(run_id, join_key, decision_plane)` w runie lub
+  bundle dyskwalifikuje bundle;
+- cross-run `join_key` collision jest diagnostyką, nie duplicate record;
+- underlying-event collision używa `stable_event_identity`; brak identity daje
+  unavailable/not-evaluable zamiast fałszywego clean zero;
 - feasibility data nie wchodzą do validation counts.
 
 ### 5.7 PR3 — equivalence-only cutover
@@ -767,9 +867,9 @@ Implementator nie może sam zatwierdzić minimów.
 ## 7. Replay/comparator acceptance
 
 Każdy run wymaga wszystkich terminal rows i rotowanych parts, 100% full replay,
-zero malformed/truncated/duplicate/missing identity, zero schema/deser/MFS/config/
-profile hash mismatch, zero runtime-replay mismatch, zero candidate error oraz
-komplet summary-sidecar pairs.
+zero malformed/truncated/duplicate record identity/missing identity, zero
+schema/deser/MFS/Gatekeeper/effective-config/profile hash mismatch, zero
+runtime-replay mismatch, zero candidate error oraz komplet summary-sidecar pairs.
 
 Equivalence lane wymaga exact zero drift:
 
@@ -815,6 +915,10 @@ i equivalence lane pozostają niezmienione.
 
 - old TOML; unknown mode/profile; deterministic profile hash;
 - każda authority entry zmienia hash;
+- RFC 8785 JCS vectors: key order, Unicode, number boundaries, `-0`, explicit
+  null, omitted rejection, NaN/Inf rejection i self-hash exclusion;
+- każda effective-config entry zmienia `metric_contract_effective_config_hash`,
+  a unrelated config nie zmienia go;
 - exhaustive status adapters i invalid combinations;
 - v33/V3 v1 nie dostają optymistycznego Measured.
 
@@ -859,7 +963,9 @@ i equivalence lane pozostają niezmienione.
 - v33 read/v34 round-trip;
 - hash mismatch, missing pair, orphan, truncated line, rotated parts;
 - mixed profile/config/run, queue pressure, ENOSPC/writer disable;
-- per-run PASS before aggregate, cross-run duplicate;
+- per-run PASS before aggregate, duplicate pełnego record identity;
+- cross-run join-key collision nie jest record duplicate; stable-event collision
+  i missing stable identity mają osobne statusy;
 - mniej niż 3 runs/2 buckets;
 - row przed `frozen_at` i gate-change invalidation;
 - equivalence drift failuje, counterfactual drift nie zmienia authority.
@@ -907,6 +1013,12 @@ Plan jest wykonany dopiero, gdy:
 16. Old TOML/v33/V3 v1 są replayable.
 17. Rollback do DualCompute jest przetestowany.
 18. Final scope audit nie wykazuje zmian poza planem.
+19. Wszystkie profile/config/evidence digests używają `CanonicalHashV1`.
+20. Bundle ma identyczny `metric_contract_effective_config_hash`; pełny
+    `brain_config_hash` pozostaje provenance-only.
+21. Record identity i cross-run underlying-event identity nie są zlewane.
+22. PR0 manifest, summary i reproduction contract są machine-readable oraz
+    przechodzą input-hash i exact-output comparison.
 
 ```yaml
 task_classification: cross-cutting metric-contract architecture and guarded rollout

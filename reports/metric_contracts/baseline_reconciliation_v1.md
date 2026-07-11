@@ -12,10 +12,18 @@ Data audytu: 2026-07-11
 
 Repozytorium: `/root/Gho_dynamic_exit_v1`
 
-Branch: `codex/executable-dynamic-exit-sidecar-v1`
+PR branch: `agent/metric-contract-pr0-baseline`
 
-Audytowany commit i merge-base z upstream:
+Audytowany code commit:
 `f3318f3a71a9202ced7af9cf43c064fa9f2f0c4a`
+
+Base i merge-base PR #60:
+`f1e3292aae935d1b43e2c265c078f9ec74a62563`
+
+Oba commity mają tree OID
+`92e97058349157b591a24f11da3bec0642051cd7`; exact tree diff zwrócił 0
+(`TREE_EQUIVALENCE_PASS`). Komendy i wynik utrwala
+`reports/metric_contracts/pr0_reproduction_v1.md`.
 
 Plan normatywny:
 `PLANS/DO_REALIZACJI/PLAN_KOREKTY_KONTRAKTOW_INTERPRETACJI_METRYK_V1_20260710.md`
@@ -62,10 +70,24 @@ Kod dowodzi definicji i ścieżki wykonania. Test dowodzi zachowania objętego
 fixture'em. Obecność pola w logu nie dowodzi poprawności semantyki producenta.
 Historyczny brak delty nie jest formalnym dowodem równoważności.
 
+Machine-readable provenance i dokładna procedura są częścią PR0:
+
+- `reports/metric_contracts/pr0_input_manifest_v1.json` — path/SHA/bytes/rows/
+  timestamps/schema/run/config dla każdego stabilnego inputu i jawnie wykluczony
+  mutable r5;
+- `reports/metric_contracts/pr0_feasibility_summary_v1.json` — wynik skanera;
+- `reports/metric_contracts/pr0_reproduction_v1.md` — wersje narzędzi, exact
+  nearest-rank/duration/identity algorithms, pełne źródło skanera i komendy
+  exact-output comparison.
+
+Surowe 3.220 GB JSONL nie są przechowywane w Git. GitHub-only review nie może
+ich przeliczyć bez content-addressed inputs; ta granica jest jawna, a każdy
+input mismatch kończy reprodukcję FAIL.
+
 Worktree był przed PR0 nieczysty. Wszystkie zastane zmiany użytkownika pozostają
-poza zakresem; commit i merge-base są równe, więc baseline źródłowy odnosi się do
-tego samego commita, a stan untracked został potraktowany tylko jako jawnie
-wskazane dokumenty i artefakty wejściowe.
+poza zakresem. Audytowany head PR #59 i merge commit/base PR #60 mają różne SHA i
+role provenance, ale identyczne drzewa. Stan untracked został potraktowany tylko
+jako jawnie wskazane dokumenty i artefakty wejściowe.
 
 ## 3. Macierz reconciliation
 
@@ -443,9 +465,22 @@ jeszcze paired metric-contract summary/sidecar, jego join completeness,
 drop/failure counters ani resource acceptance wymagane przez V1.1.
 
 Wniosek dla PR2C: v34 musi być addytywny i compact; pełne typed payloady mają
-trafić do osobnego `metric_contract_evidence_v1.jsonl`, spiętego canonical
-`(run_id, join_key, decision_plane)` oraz hash/ref. Frozen v33 i V3 v1 muszą
-pozostać replayable.
+trafić do osobnego `metric_contract_evidence_v1.jsonl`, spiętego record identity
+`(run_id, join_key, decision_plane)` oraz hash/ref. Duplicate dotyczy pełnej
+krotki; sam cross-run `join_key` jest diagnostyką. Underlying-event collision
+wymaga osobnego `stable_event_identity`; jego brak nie może udawać clean zero.
+Frozen v33 i V3 v1 muszą pozostać replayable.
+
+Profile, effective-config i evidence hashes używają normatywnego
+`CanonicalHashV1`: RFC 8785 JCS, UTF-8, SHA-256 lowercase hex, bez newline,
+bez self-hash/transport fields i z zakazem non-finite floats. Optional fields w
+semantic hash payloadach są jawnie `null`; omitted key nie jest równoważny null.
+
+Historyczne runy emitują wspólny Gatekeeper config hash i różne pełne
+`brain_config_hash`, ale nie emitują `metric_contract_effective_config_hash`.
+Równoważność producer/evidence config jest więc
+`NOT_MEASURABLE_PRE_IMPLEMENTATION`, a nie FAIL wynikający z różnicy całego brain
+config.
 
 ## 8. Active, compat, shadow, logging i export classification
 
@@ -465,6 +500,8 @@ pozostać replayable.
 ### PR1
 
 - dodać registry `METRIC_CONTRACTS_V1_1`, rollout ceiling i hashowany Profile A;
+- wdrożyć `CanonicalHashV1` oraz `ResolvedMetricContractEffectiveConfigV1`;
+- rozdzielić record identity od stable underlying-event identity;
 - dodać canonical envelope i exhaustive legacy adapters;
 - rozdzielić dev surfaces w registry;
 - zinwentaryzować top3 readers i dodać static guard bez duplikowania helpera;
@@ -542,6 +579,10 @@ Spełnione:
 - FSC/status/manipulation/reserve/RCE boundaries są jawne;
 - schema/logger/replay baseline jest jawny;
 - historyczne runy i ich ograniczenia opisuje osobny preflight;
+- manifest wejść, machine-readable summary i exact scanner reproduction
+  przechodzą bez mismatchów;
+- audited code commit i PR base/merge-base są rozdzielone, z dowodem identycznego
+  tree;
 - nie dokonano zmian runtime/policy/config.
 
 Niespełnione celowo na etapie PR0:

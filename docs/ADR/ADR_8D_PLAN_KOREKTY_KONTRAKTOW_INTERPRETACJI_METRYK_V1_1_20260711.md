@@ -11,6 +11,12 @@ Repo: `/root/Gho_dynamic_exit_v1`
 Plan:
 `PLANS/DO_REALIZACJI/PLAN_KOREKTY_KONTRAKTOW_INTERPRETACJI_METRYK_V1_20260710.md`
 
+Amendment po PR0 review:
+`docs/ADR/ADR_8D_PR0_PROVENANCE_AND_REPRODUCIBILITY_CORRECTIONS_20260711.md`.
+Niniejszy ADR zachowuje status planu w chwili zapisu; amendment normatywnie
+domyka RFC 8785 hashing, effective config hash i record/event identity przed
+PR1 oraz aktualizuje status PR0 do PASS.
+
 Raport źródłowy:
 `PLANS/AUDYT/RAPORT_AUDYT_KOREKTY_INTERPRETACJI_METRYK_20260710.md`
 
@@ -53,7 +59,8 @@ Dodatkowy code reconnaissance potwierdził:
 Zastąpiono treść planu V1 wersją V1.1 pod tą samą ścieżką, zgodnie z decyzją
 właściciela planu. Nie utworzono drugiego pliku planu.
 
-Status wykonawczy po zapisie:
+Historyczny status wykonawczy w chwili zapisu, zastąpiony po PR0 przez amendment
+wskazany wyżej:
 
 ```text
 PLAN_V1_1_ACCEPTED

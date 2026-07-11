@@ -1,0 +1,191 @@
+{
+  "$schema": "ghost/pr0_input_manifest_v1",
+  "schema_version": 1,
+  "manifest_id": "metric_contract_pr0_feasibility_inputs_v1",
+  "artifact_path": "reports/metric_contracts/pr0_input_manifest_v1.json",
+  "classification": "FEASIBILITY_ONLY",
+  "created_at": "2026-07-11T10:59:30Z",
+  "scanner": {
+    "version": "pr0_feasibility_scanner_v1",
+    "source_container": "reports/metric_contracts/pr0_reproduction_v1.md",
+    "source_extraction_contract": "UTF-8 bytes between PR0_SCANNER_SOURCE_BEGIN and PR0_SCANNER_SOURCE_END, excluding markers and Markdown fences, including one final LF",
+    "source_sha256": "c7d38911e20b214f39eac8bceab6a138034058d9d72185a34ee576422a5c52ab"
+  },
+  "provenance": {
+    "audited_code_commit": "f3318f3a71a9202ced7af9cf43c064fa9f2f0c4a",
+    "audited_code_tree_oid": "92e97058349157b591a24f11da3bec0642051cd7",
+    "pr60_base_and_merge_base": "f1e3292aae935d1b43e2c265c078f9ec74a62563",
+    "pr60_base_tree_oid": "92e97058349157b591a24f11da3bec0642051cd7",
+    "tree_equivalence_check": {
+      "command": "git diff --quiet f3318f3a71a9202ced7af9cf43c064fa9f2f0c4a f1e3292aae935d1b43e2c265c078f9ec74a62563 -- .",
+      "exit_code": 0,
+      "status": "PASS"
+    }
+  },
+  "identity_contract": {
+    "record_identity": [
+      "run_id",
+      "join_key",
+      "decision_plane"
+    ],
+    "cross_run_join_key_collision_is_record_duplicate": false,
+    "underlying_event_identity_field": "stable_event_identity",
+    "underlying_event_identity_availability": "NOT_EMITTED_PRE_IMPLEMENTATION"
+  },
+  "inputs": [
+    {
+      "input_id": "r2_human_ab_stage2_exec_exit_8h",
+      "classification": "STABLE_FEASIBILITY_INPUT",
+      "path": "logs/rollout/shadow-v2-l2-human-ab-stage2-exec-exit-15s-20260708-r2-8h/decisions/shadow-v2-l2-human-ab-stage2-exec-exit-15s-20260708-r2-8h/v2.2/legacy_live/d0480c9b7b3c26e42918c60833d34c016d2b0188182754ba9a64f52086d80c22/gatekeeper_v2_decisions.jsonl",
+      "basename": "gatekeeper_v2_decisions.jsonl",
+      "immutable_observation": {
+        "status": "OBSERVED_STABLE_DURING_PR0",
+        "runtime_final_manifest_available": false,
+        "validation_eligible": false
+      },
+      "metric_contract_effective_config_hash": null,
+      "expected": {
+        "sha256": "231ed686ae3e113aea28486cafa94bc9118c9186df28e2422068dfbf9165d444",
+        "byte_count": 851829798,
+        "row_count": 8316,
+        "min_timestamp": "2026-07-08T21:25:12.799298+00:00",
+        "max_timestamp": "2026-07-09T05:24:47.708750+00:00",
+        "schema_counts": {
+          "33": 8316
+        },
+        "run_id_counts": {
+          "shadow-v2-l2-human-ab-stage2-exec-exit-15s-20260708-r2-8h": 8316
+        },
+        "decision_plane_counts": {
+          "legacy_live": 8316
+        },
+        "config_hash_counts": {
+          "d0480c9b7b3c26e42918c60833d34c016d2b0188182754ba9a64f52086d80c22": 8316
+        },
+        "brain_config_hash_counts": {
+          "7ec5b68b8524b1f62340c5c285132f373bd52d4ba2fd6e0471d3eb9cbf074687": 8316
+        }
+      }
+    },
+    {
+      "input_id": "r1_human_ab_thresholds_named_4h",
+      "classification": "STABLE_FEASIBILITY_INPUT",
+      "path": "logs/rollout/shadow-v2-l2-human-ab-thresholds-15s-20260708-r1-4h/decisions/shadow-v2-l2-human-ab-thresholds-15s-20260708-r1-4h/v2.2/legacy_live/d0480c9b7b3c26e42918c60833d34c016d2b0188182754ba9a64f52086d80c22/gatekeeper_v2_decisions.jsonl",
+      "basename": "gatekeeper_v2_decisions.jsonl",
+      "immutable_observation": {
+        "status": "OBSERVED_STABLE_DURING_PR0",
+        "runtime_final_manifest_available": false,
+        "validation_eligible": false
+      },
+      "metric_contract_effective_config_hash": null,
+      "expected": {
+        "sha256": "0264a0f9db9faf8943a9aa48f5185211f1ccba4daaef8bbbca35494f61728302",
+        "byte_count": 1078037357,
+        "row_count": 10459,
+        "min_timestamp": "2026-07-08T03:43:07.416286+00:00",
+        "max_timestamp": "2026-07-08T19:46:59.952349+00:00",
+        "schema_counts": {
+          "33": 10459
+        },
+        "run_id_counts": {
+          "shadow-v2-l2-human-ab-thresholds-15s-20260708-r1-4h": 10459
+        },
+        "decision_plane_counts": {
+          "legacy_live": 10459
+        },
+        "config_hash_counts": {
+          "d0480c9b7b3c26e42918c60833d34c016d2b0188182754ba9a64f52086d80c22": 10459
+        },
+        "brain_config_hash_counts": {
+          "a4a4fac92ea6429df0542804099a5972c30383fc1f02755499c1bb5dfcd36ad4": 10459
+        }
+      }
+    },
+    {
+      "input_id": "r4_regime_depth_oos_named_6h",
+      "classification": "STABLE_FEASIBILITY_INPUT",
+      "path": "logs/rollout/shadow-v2-l2-regime-depth-oos-15s-20260710-r4-6h/decisions/shadow-v2-l2-regime-depth-oos-15s-20260710-r4-6h/v2.2/legacy_live/d0480c9b7b3c26e42918c60833d34c016d2b0188182754ba9a64f52086d80c22/gatekeeper_v2_decisions.jsonl",
+      "basename": "gatekeeper_v2_decisions.jsonl",
+      "immutable_observation": {
+        "status": "OBSERVED_STABLE_DURING_PR0",
+        "runtime_final_manifest_available": false,
+        "validation_eligible": false
+      },
+      "metric_contract_effective_config_hash": null,
+      "expected": {
+        "sha256": "54f73953cb1ffa650f57adf5423bc41887b61d49a7e3547cbc8af50c2b1cacba",
+        "byte_count": 593150549,
+        "row_count": 5797,
+        "min_timestamp": "2026-07-10T00:50:55.818010+00:00",
+        "max_timestamp": "2026-07-10T08:40:17.736359+00:00",
+        "schema_counts": {
+          "33": 5797
+        },
+        "run_id_counts": {
+          "shadow-v2-l2-regime-depth-oos-15s-20260710-r4-6h": 5797
+        },
+        "decision_plane_counts": {
+          "legacy_live": 5797
+        },
+        "config_hash_counts": {
+          "d0480c9b7b3c26e42918c60833d34c016d2b0188182754ba9a64f52086d80c22": 5797
+        },
+        "brain_config_hash_counts": {
+          "5df7fd692d982ca38f73a31a621f130e80b2c59a06eb3f7b71400c1985f8c2fe": 5797
+        }
+      }
+    },
+    {
+      "input_id": "r3_stage1_buylike_replication_named_6h",
+      "classification": "STABLE_FEASIBILITY_INPUT",
+      "path": "logs/rollout/shadow-v2-l2-stage1-buylike-smallnotional-replication-15s-20260709-r3-6h/decisions/shadow-v2-l2-stage1-buylike-smallnotional-replication-15s-20260709-r3-6h/v2.2/legacy_live/d0480c9b7b3c26e42918c60833d34c016d2b0188182754ba9a64f52086d80c22/gatekeeper_v2_decisions.jsonl",
+      "basename": "gatekeeper_v2_decisions.jsonl",
+      "immutable_observation": {
+        "status": "OBSERVED_STABLE_DURING_PR0",
+        "runtime_final_manifest_available": false,
+        "validation_eligible": false
+      },
+      "metric_contract_effective_config_hash": null,
+      "expected": {
+        "sha256": "b6ec3b1ffc0583b9fd4b59ebc4ee241119ef53023813fba3e43ef8dd8e500238",
+        "byte_count": 697297228,
+        "row_count": 6694,
+        "min_timestamp": "2026-07-09T16:33:26.028716+00:00",
+        "max_timestamp": "2026-07-09T20:55:38.538291+00:00",
+        "schema_counts": {
+          "33": 6694
+        },
+        "run_id_counts": {
+          "shadow-v2-l2-stage1-buylike-smallnotional-replication-15s-20260709-r3-6h": 6694
+        },
+        "decision_plane_counts": {
+          "legacy_live": 6694
+        },
+        "config_hash_counts": {
+          "d0480c9b7b3c26e42918c60833d34c016d2b0188182754ba9a64f52086d80c22": 6694
+        },
+        "brain_config_hash_counts": {
+          "ce1a46ef2b03dab8ea2c0fb8a3718d0be2c9cc4a040eea595e077f21644f8e80": 6694
+        }
+      }
+    }
+  ],
+  "excluded_inputs": [
+    {
+      "input_id": "r5_cpv_gate_oos_active",
+      "path": "logs/rollout/shadow-v2-l2-cpv-gate-oos-15s-20260710-r5-12h/decisions/shadow-v2-l2-cpv-gate-oos-15s-20260710-r5-12h/v2.2/legacy_live/d0480c9b7b3c26e42918c60833d34c016d2b0188182754ba9a64f52086d80c22/gatekeeper_v2_decisions.jsonl",
+      "classification": "ACTIVE_MUTABLE_NOT_IMMUTABLE",
+      "sha256": null,
+      "byte_count": null,
+      "row_count": null,
+      "min_timestamp": null,
+      "max_timestamp": null,
+      "schema": 33,
+      "run_id": "shadow-v2-l2-cpv-gate-oos-15s-20260710-r5-12h",
+      "config_hash": "d0480c9b7b3c26e42918c60833d34c016d2b0188182754ba9a64f52086d80c22",
+      "brain_config_hash": null,
+      "metric_contract_effective_config_hash": null,
+      "reason": "File changed between PR0 reconnaissance scans while its launcher process was alive; no mutable snapshot is admitted as a frozen input."
+    }
+  ]
+}
