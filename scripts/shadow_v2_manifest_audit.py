@@ -31,6 +31,7 @@ RETENTION_POLICY = "manifest_before_cleanup_required"
 DEFAULT_SCHEMA_MANIFEST = Path("reports/selector/shadow_v2_required_schema_manifest.csv")
 DEFAULT_ACCEPTANCE_GATES = Path("reports/selector/shadow_v2_acceptance_gates.csv")
 DEFAULT_ARTIFACT_CONTRACT = Path("reports/selector/shadow_v2_manifest_artifact_contract.csv")
+EXECUTABLE_DYNAMIC_EXIT_EVIDENCE_ARTIFACT = "executable_dynamic_exit_evidence_v1.jsonl"
 
 REQUIRED_CONTRACT_COLUMNS = {
     "artifact_name",
@@ -284,6 +285,7 @@ def find_missing_required_artifacts(
     contract_rows: list[ArtifactContractRow],
     manifest_phase: str,
     generated_artifacts: set[str] | None = None,
+    executable_dynamic_exit_evidence_enabled: bool = False,
 ) -> list[str]:
     present_names = {Path(entry["relative_path"]).name for entry in artifact_entries}
     present_paths = {entry["relative_path"] for entry in artifact_entries}
@@ -294,6 +296,11 @@ def find_missing_required_artifacts(
 
     for row in contract_rows:
         if not contract_applies(row, manifest_phase):
+            continue
+        if (
+            row.artifact_name == EXECUTABLE_DYNAMIC_EXIT_EVIDENCE_ARTIFACT
+            and not executable_dynamic_exit_evidence_enabled
+        ):
             continue
         if row.artifact_name in present_names or row.artifact_name in present_paths:
             continue
@@ -317,11 +324,17 @@ def validate_artifact_requirements(
     artifact_entries: list[dict[str, Any]],
     contract_rows: list[ArtifactContractRow],
     manifest_phase: str,
+    executable_dynamic_exit_evidence_enabled: bool = False,
 ) -> list[str]:
     blockers: list[str] = []
 
     for row in contract_rows:
         if not contract_applies(row, manifest_phase):
+            continue
+        if (
+            row.artifact_name == EXECUTABLE_DYNAMIC_EXIT_EVIDENCE_ARTIFACT
+            and not executable_dynamic_exit_evidence_enabled
+        ):
             continue
 
         entry = find_entry_for_contract(artifact_entries, row)
@@ -374,6 +387,7 @@ def build_manifest(
     artifact_contract: Path,
     max_sha_bytes: int,
     generated_artifact_paths: Iterable[Path | None] = (),
+    executable_dynamic_exit_evidence_enabled: bool = False,
 ) -> tuple[dict[str, Any], list[str]]:
     contract_rows, contract_errors = load_artifact_contract(artifact_contract)
     entries = [artifact_entry(path, scope_root, max_sha_bytes) for path in iter_scope_files(scope_root)]
@@ -383,11 +397,19 @@ def build_manifest(
         contract_rows,
         manifest_phase,
         generated_artifacts,
+        executable_dynamic_exit_evidence_enabled=executable_dynamic_exit_evidence_enabled,
     )
 
     blockers = list(contract_errors)
     blockers.extend(f"missing required artifact: {name}" for name in missing_required)
-    blockers.extend(validate_artifact_requirements(entries, contract_rows, manifest_phase))
+    blockers.extend(
+        validate_artifact_requirements(
+            entries,
+            contract_rows,
+            manifest_phase,
+            executable_dynamic_exit_evidence_enabled=executable_dynamic_exit_evidence_enabled,
+        )
+    )
     for entry in entries:
         if entry["status"] != "OK":
             blockers.append(f"{entry['relative_path']}: {entry['status']}")
@@ -405,6 +427,12 @@ def build_manifest(
         "total_size_bytes": sum(int(entry["size_bytes"]) for entry in entries),
         "schema_coverage": aggregate_schema_coverage(entries),
         "required_artifacts_missing": missing_required,
+        "executable_dynamic_exit_evidence_enabled": executable_dynamic_exit_evidence_enabled,
+        "executable_dynamic_exit_evidence_status": (
+            "REQUIRED_ENABLED"
+            if executable_dynamic_exit_evidence_enabled
+            else "NOT_REQUIRED_DISABLED"
+        ),
         "retention_policy": RETENTION_POLICY,
         "raw_jsonl_git_staging_allowed": False,
         "artifacts": entries,
@@ -519,6 +547,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Exit non-zero when required artifacts or contract files are missing.",
     )
+    parser.add_argument(
+        "--executable-dynamic-exit-evidence-enabled",
+        default="false",
+        help="Treat executable_dynamic_exit_evidence_v1.jsonl as a required sidecar artifact.",
+    )
     return parser
 
 
@@ -552,6 +585,9 @@ def main(argv: list[str] | None = None) -> int:
         artifact_contract=args.artifact_contract,
         max_sha_bytes=args.max_sha_bytes,
         generated_artifact_paths=[args.write_manifest, args.write_report_csv],
+        executable_dynamic_exit_evidence_enabled=parse_bool(
+            args.executable_dynamic_exit_evidence_enabled
+        ),
     )
 
     if args.write_manifest:

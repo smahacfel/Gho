@@ -253,6 +253,12 @@ pub struct ShadowV2BurninConfig {
     pub path_density_v2_path: Option<String>,
     /// Compact source reference manifest for replay/lifecycle provenance ranges.
     pub source_ref_manifest_v2_path: Option<String>,
+    /// Observe-only sidecar for static dynamic-exit quote evidence. Disabled by default.
+    pub executable_dynamic_exit_evidence_enabled: bool,
+    /// Optional explicit sidecar path. Defaults under scope_root_path when enabled.
+    pub executable_dynamic_exit_evidence_path: Option<String>,
+    /// Frozen candidate policy labels for dynamic-exit evidence. Empty means baseline policies.
+    pub executable_dynamic_exit_candidate_policies: Vec<String>,
     /// L2 compact density output writes final/latest declared-horizon rows by default.
     pub compact_density_enabled: bool,
     /// Full density stream is opt-in only for diagnostics.
@@ -344,6 +350,9 @@ impl Default for ShadowV2BurninConfig {
             lifecycle_v2_path: None,
             path_density_v2_path: None,
             source_ref_manifest_v2_path: None,
+            executable_dynamic_exit_evidence_enabled: false,
+            executable_dynamic_exit_evidence_path: None,
+            executable_dynamic_exit_candidate_policies: Vec::new(),
             compact_density_enabled: true,
             density_full_stream_enabled: false,
             replay_lifecycle_compact_refs_enabled: true,
@@ -6159,6 +6168,19 @@ include_spl = false
         assert!(!config.shadow_v2_burnin.active_close_approval);
         assert!(config.shadow_v2_burnin.scope_root_path.is_none());
         assert!(config.shadow_v2_burnin.path_density_v2_path.is_none());
+        assert!(
+            !config
+                .shadow_v2_burnin
+                .executable_dynamic_exit_evidence_enabled
+        );
+        assert!(config
+            .shadow_v2_burnin
+            .executable_dynamic_exit_evidence_path
+            .is_none());
+        assert!(config
+            .shadow_v2_burnin
+            .executable_dynamic_exit_candidate_policies
+            .is_empty());
         assert_eq!(
             config.shadow_v2_burnin.max_verdict_without_live_calibration,
             "SHADOW_V2_RESEARCH_GRADE_ONLY"

@@ -66,12 +66,14 @@ use super::integration::{PositionRuntimeRouter, ShadowPositionBookAemAdapter};
 use super::shadow_v2::ShadowV2ValidationHarnessConfig;
 use super::shadow_v2::{
     executable_pnl_link_from_canonical_position_fills, ClockDomain, ClockedTimestamp,
-    EventOrderComponent, EventOrderKey, MeasurementGrade, PoolStateSampleV2, ShadowExitAttemptV2,
-    ShadowExitFillModelConfig, ShadowExitFillV2, ShadowPathSampleV2, ShadowPathSamplerConfigV2,
-    ShadowPathSamplingModeV2, ShadowPathSamplingReasonV2, ShadowTerminalTruthV2, ShadowV2Envelope,
-    ShadowV2ExecutablePnlLink, ShadowV2Record, ShadowV2ValidationEvidenceStatus,
-    ShadowV2ValidationHarness, SimulationLevel, TemporalClass, TerminalReasonV2,
-    SHADOW_V2_EXIT_FILL_MODEL_VERSION,
+    EventOrderComponent, EventOrderKey, ExecutableDynamicExitCandidatePolicyV1,
+    ExecutableDynamicExitEvidenceV1, ExecutableDynamicExitObservationV1,
+    ExecutableDynamicExitPolicyEvaluatorV1, MeasurementGrade, PoolStateSampleV2,
+    ShadowExitAttemptV2, ShadowExitFillModelConfig, ShadowExitFillV2, ShadowPathSampleV2,
+    ShadowPathSamplerConfigV2, ShadowPathSamplingModeV2, ShadowPathSamplingReasonV2,
+    ShadowTerminalTruthV2, ShadowV2Envelope, ShadowV2ExecutablePnlLink, ShadowV2Record,
+    ShadowV2ValidationEvidenceStatus, ShadowV2ValidationHarness, SimulationLevel, TemporalClass,
+    TerminalReasonV2, SHADOW_V2_EXIT_FILL_MODEL_VERSION,
 };
 
 #[cfg(test)]
@@ -718,6 +720,7 @@ struct MonitoredPosition {
     last_snapshot_source: PriceTruthSource,
     last_shadow_snapshot: Option<MarketSnapshot>,
     last_shadow_v2_path_sample_age_ms: Option<u64>,
+    executable_dynamic_exit_evaluator: Option<ExecutableDynamicExitPolicyEvaluatorV1>,
     shadow_market_activity: ShadowMarketActivityAnchor,
     time_stop_v2: TimeStopV2State,
     snapshot_timeline: SnapshotTimeline,
@@ -1762,6 +1765,113 @@ impl MonitoringEngine {
         file.flush()
     }
 
+    fn executable_dynamic_exit_sidecar_settings(
+        &self,
+    ) -> Option<(PathBuf, Vec<ExecutableDynamicExitCandidatePolicyV1>)> {
+        self.shadow_v2_validation_harness
+            .as_ref()
+            .and_then(|harness| harness.lock().executable_dynamic_exit_sidecar_settings())
+    }
+
+    fn executable_dynamic_exit_evaluator_for_position(
+        position_id: &str,
+        entry_fill_event_id: &str,
+        entry_token_amount_raw: u64,
+        entry_amount_lamports: u64,
+        entry_price_sol: Option<f64>,
+        policies: Vec<ExecutableDynamicExitCandidatePolicyV1>,
+    ) -> ExecutableDynamicExitPolicyEvaluatorV1 {
+        let entry_fill_amount_tokens_raw =
+            (entry_token_amount_raw > 0).then_some(entry_token_amount_raw);
+        let entry_fill_amount_tokens =
+            entry_fill_amount_tokens_raw.map(|raw| raw as f64 / SHADOW_TOKEN_DECIMAL_FACTOR_F64);
+        let entry_fill_amount_sol =
+            (entry_amount_lamports > 0).then_some(entry_amount_lamports as f64 / 1_000_000_000.0);
+        ExecutableDynamicExitPolicyEvaluatorV1::new(
+            position_id,
+            entry_fill_event_id,
+            entry_fill_amount_tokens_raw,
+            entry_fill_amount_tokens,
+            entry_fill_amount_sol,
+            entry_price_sol,
+            "post_buy_guardian.entry_fill_context",
+            policies,
+        )
+    }
+
+    fn append_executable_dynamic_exit_sidecar_rows(
+        &self,
+        path: &Path,
+        position_id: &str,
+        rows: Vec<ExecutableDynamicExitEvidenceV1>,
+    ) {
+        for row in rows {
+            if let Err(error) = Self::append_jsonl_record(path, &row) {
+                warn!(
+                    path = %path.display(),
+                    %position_id,
+                    error = %error,
+                    "PostBuyGuardian: executable dynamic exit sidecar write failed; runtime remains fail-open"
+                );
+                return;
+            }
+        }
+    }
+
+    fn maybe_emit_executable_dynamic_exit_sidecar_from_runtime_path(
+        &self,
+        base_mint: &Pubkey,
+        path_sample: &ShadowPathSampleV2,
+        pool_state: &PoolStateSampleV2,
+    ) {
+        let Some((path, policies)) = self.executable_dynamic_exit_sidecar_settings() else {
+            return;
+        };
+        let (position_id, rows) = {
+            let mut positions = self.positions.write();
+            let Some(pos) = positions.get_mut(base_mint) else {
+                return;
+            };
+            if pos.executable_dynamic_exit_evaluator.is_none() {
+                let entry_fill_amount_tokens_raw =
+                    (pos.entry_token_amount_raw > 0).then_some(pos.entry_token_amount_raw);
+                let entry_fill_amount_tokens = entry_fill_amount_tokens_raw
+                    .map(|raw| raw as f64 / SHADOW_TOKEN_DECIMAL_FACTOR_F64);
+                let entry_fill_amount_sol = (pos.entry_size_lamports > 0)
+                    .then_some(pos.entry_size_lamports as f64 / 1_000_000_000.0);
+                pos.executable_dynamic_exit_evaluator =
+                    Some(ExecutableDynamicExitPolicyEvaluatorV1::new(
+                        pos.position_id.clone(),
+                        pos.entry_order_id.clone(),
+                        entry_fill_amount_tokens_raw,
+                        entry_fill_amount_tokens,
+                        entry_fill_amount_sol,
+                        pos.entry_price_sol,
+                        "post_buy_guardian.entry_fill_context",
+                        policies,
+                    ));
+            }
+            let Some(evaluator) = pos.executable_dynamic_exit_evaluator.as_mut() else {
+                return;
+            };
+            let rows = evaluator.observe_path_sample(ExecutableDynamicExitObservationV1 {
+                run_id: &path_sample.envelope.run_id,
+                candidate_id: path_sample.envelope.candidate_id.as_deref(),
+                pool_id: &path_sample.envelope.pool_id,
+                base_mint: &path_sample.envelope.base_mint,
+                path_sample,
+                pool_state,
+                trigger_observed_at_ms: path_sample.event_order_key.observed_at_wall_ms,
+                slippage_bps: SHADOW_V2_EXIT_SLIPPAGE_BPS_DIAGNOSTIC_MODEL,
+                fee_bps: SHADOW_V2_EXIT_FEE_BPS_DIAGNOSTIC_MODEL,
+            });
+            (pos.position_id.clone(), rows)
+        };
+        if !rows.is_empty() {
+            self.append_executable_dynamic_exit_sidecar_rows(&path, &position_id, rows);
+        }
+    }
+
     fn append_shadow_lifecycle_record(&self, record: &ShadowLifecycleRecord) {
         let Some(path) = self.shadow_lifecycle_log_path.as_deref() else {
             self.append_shadow_v2_lifecycle_record(record);
@@ -2031,11 +2141,15 @@ impl MonitoringEngine {
             ShadowPathSamplingReasonV2::Heartbeat,
         );
 
+        let sidecar_pool_state = pool_state.clone();
+        let sidecar_path_sample = path_sample.clone();
         let mut harness = harness.lock();
         let pool_outcome = harness.append_record(ShadowV2Record::PoolStateSampleV2(pool_state));
         let path_outcome = harness.append_record(ShadowV2Record::ShadowPathSampleV2(path_sample));
+        let path_sample_complete =
+            path_outcome.validation_evidence_status == ShadowV2ValidationEvidenceStatus::Complete;
         if pool_outcome.validation_evidence_status == ShadowV2ValidationEvidenceStatus::Complete
-            && path_outcome.validation_evidence_status == ShadowV2ValidationEvidenceStatus::Complete
+            && path_sample_complete
         {
             debug!(
                 %position_id,
@@ -2053,6 +2167,13 @@ impl MonitoringEngine {
             );
         }
         drop(harness);
+        if path_sample_complete {
+            self.maybe_emit_executable_dynamic_exit_sidecar_from_runtime_path(
+                base_mint,
+                &sidecar_path_sample,
+                &sidecar_pool_state,
+            );
+        }
 
         let mut positions = self.positions.write();
         if let Some(pos) = positions.get_mut(base_mint) {
@@ -3047,6 +3168,9 @@ impl MonitoringEngine {
                 self.snapshot_history_retention_ms(),
             );
         }
+        let executable_dynamic_exit_policies = self
+            .executable_dynamic_exit_sidecar_settings()
+            .map(|(_, policies)| policies);
         let mut positions = self.positions.write();
 
         if positions.len() >= self.config.max_monitored_positions {
@@ -3138,6 +3262,16 @@ impl MonitoringEngine {
             last_snapshot_source: self.default_snapshot_source(),
             last_shadow_snapshot: initial_shadow_snapshot,
             last_shadow_v2_path_sample_age_ms: None,
+            executable_dynamic_exit_evaluator: executable_dynamic_exit_policies.map(|policies| {
+                Self::executable_dynamic_exit_evaluator_for_position(
+                    &position_id,
+                    &event_context.entry_order_id,
+                    entry_token_amount_raw.unwrap_or(0),
+                    entry_amount_lamports.unwrap_or(0),
+                    entry_price_sol,
+                    policies,
+                )
+            }),
             shadow_market_activity,
             time_stop_v2,
             snapshot_timeline,
