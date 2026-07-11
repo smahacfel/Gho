@@ -37,6 +37,9 @@
 //! config.sobp.hyper_pump_threshold = 3.5;
 //! ```
 
+use ghost_core::metric_contracts::{
+    MetricContractFoundationConfigV1, MetricContractProfileIdV1, MetricContractRolloutMode,
+};
 use ghost_core::{
     checkpoint::DecisionTimeSeriesRetentionPolicy, shadow_ledger::ShadowLedgerStaleFallback,
 };
@@ -60,6 +63,15 @@ use crate::oracle::hyper_prediction::HyperPredictionConfig;
 pub struct GhostBrainConfig {
     /// Configuration version for API compatibility
     pub version: u8,
+
+    /// Global ceiling for metric-contract authority. PR1 defaults to Legacy and
+    /// does not activate dual compute or schema v34.
+    #[serde(default)]
+    pub metric_contract_rollout_mode: MetricContractRolloutMode,
+
+    /// Known, compiled authority profile. Unknown values fail deserialization.
+    #[serde(default)]
+    pub metric_contract_profile: MetricContractProfileIdV1,
 
     /// Engine configuration (cycle timing, etc.)
     #[serde(default)]
@@ -4778,6 +4790,8 @@ impl Default for GhostBrainConfig {
     fn default() -> Self {
         Self {
             version: 1,
+            metric_contract_rollout_mode: MetricContractRolloutMode::Legacy,
+            metric_contract_profile: MetricContractProfileIdV1::MetricContractsV1_1ProfileA,
             engine: EngineConfig::default(),
             gatekeeper: GatekeeperConfig::default(),
             gatekeeper_v2: None,
@@ -5159,6 +5173,40 @@ impl GhostBrainConfig {
         Ok(config)
     }
 
+    /// Load only the two top-level metric-contract foundation fields.
+    ///
+    /// Launcher calls this fail-closed before its historical full-config
+    /// fallback. Consequently an unknown rollout mode/profile cannot be hidden
+    /// by falling back to defaults for unrelated analytical modules.
+    pub fn metric_contract_foundation_from_toml_file<P: AsRef<Path>>(
+        path: P,
+    ) -> anyhow::Result<MetricContractFoundationConfigV1> {
+        #[derive(Deserialize, Default)]
+        struct FoundationDocumentV1 {
+            #[serde(default)]
+            metric_contract_rollout_mode: MetricContractRolloutMode,
+            #[serde(default)]
+            metric_contract_profile: MetricContractProfileIdV1,
+        }
+
+        let contents = fs::read_to_string(path)?;
+        let document: FoundationDocumentV1 = toml::from_str(&contents)?;
+        let foundation = MetricContractFoundationConfigV1 {
+            metric_contract_rollout_mode: document.metric_contract_rollout_mode,
+            metric_contract_profile: document.metric_contract_profile,
+        };
+        foundation.resolve_profile()?;
+        Ok(foundation)
+    }
+
+    #[must_use]
+    pub const fn metric_contract_foundation(&self) -> MetricContractFoundationConfigV1 {
+        MetricContractFoundationConfigV1 {
+            metric_contract_rollout_mode: self.metric_contract_rollout_mode,
+            metric_contract_profile: self.metric_contract_profile,
+        }
+    }
+
     /// Load ONLY `[gatekeeper_v2]` from TOML without validating the full GhostBrain config.
     ///
     /// This is used by launcher runtime to ensure Gatekeeper V2 thresholds remain
@@ -5231,6 +5279,8 @@ impl GhostBrainConfig {
     /// # Returns
     /// * `Result<()>` - Success if valid, error otherwise
     pub fn validate(&self) -> anyhow::Result<()> {
+        self.metric_contract_foundation().resolve_profile()?;
+
         // Validate MPCF
         if self.mpcf.bot_entropy_threshold < 0.0 || self.mpcf.bot_entropy_threshold > 10.0 {
             anyhow::bail!("MPCF bot_entropy_threshold must be in range [0.0, 10.0]");
@@ -5583,9 +5633,76 @@ mod tests {
         assert_eq!(config.version, 1);
         assert!(config.validate().is_ok());
         assert_eq!(
+            config.metric_contract_rollout_mode,
+            MetricContractRolloutMode::Legacy
+        );
+        assert_eq!(
+            config.metric_contract_profile,
+            MetricContractProfileIdV1::MetricContractsV1_1ProfileA
+        );
+        assert_eq!(
             config.shadow_v2_burnin.post_run_manifest_drain_timeout_ms,
             DEFAULT_SHADOW_V2_POST_RUN_MANIFEST_DRAIN_TIMEOUT_MS
         );
+    }
+
+    #[test]
+    fn metric_contract_foundation_old_toml_defaults_to_legacy_profile_a() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("legacy.toml");
+        std::fs::write(
+            &path,
+            "version = 1\n[unrelated_legacy_section]\nvalue = true\n",
+        )
+        .expect("write legacy TOML");
+
+        let foundation = GhostBrainConfig::metric_contract_foundation_from_toml_file(&path)
+            .expect("legacy TOML must resolve safe defaults");
+        assert_eq!(
+            foundation.metric_contract_rollout_mode,
+            MetricContractRolloutMode::Legacy
+        );
+        assert_eq!(
+            foundation.metric_contract_profile,
+            MetricContractProfileIdV1::MetricContractsV1_1ProfileA
+        );
+        let first_hash = foundation
+            .resolve_profile()
+            .unwrap()
+            .canonical_hash()
+            .unwrap();
+        let second_hash = foundation
+            .resolve_profile()
+            .unwrap()
+            .canonical_hash()
+            .unwrap();
+        assert_eq!(first_hash, second_hash);
+    }
+
+    #[test]
+    fn metric_contract_foundation_rejects_unknown_mode_and_profile() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mode_path = dir.path().join("unknown_mode.toml");
+        std::fs::write(&mode_path, "metric_contract_rollout_mode = \"future\"\n").unwrap();
+        assert!(GhostBrainConfig::metric_contract_foundation_from_toml_file(&mode_path).is_err());
+
+        let profile_path = dir.path().join("unknown_profile.toml");
+        std::fs::write(
+            &profile_path,
+            "metric_contract_profile = \"metric_contracts_v1_1_profile_unknown\"\n",
+        )
+        .unwrap();
+        assert!(
+            GhostBrainConfig::metric_contract_foundation_from_toml_file(&profile_path).is_err()
+        );
+    }
+
+    #[test]
+    fn current_repository_toml_resolves_legacy_profile_a_without_edit() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("ghost_brain_config.toml");
+        let foundation = GhostBrainConfig::metric_contract_foundation_from_toml_file(path)
+            .expect("current old TOML must remain compatible");
+        assert_eq!(foundation, MetricContractFoundationConfigV1::default());
     }
 
     #[test]

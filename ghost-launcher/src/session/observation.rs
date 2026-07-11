@@ -595,6 +595,7 @@ impl PoolObservationSession {
         let sybil = &materialized.sybil_resistance;
         let organic = &materialized.organic_broadening;
         let alpha = &materialized.alpha_fingerprint;
+        let top3_signer_volume_ratio = tx.effective_top3_signer_volume_ratio();
 
         let momentum_without_broadening = organic.sequence_available
             && organic.tx_count_growth_ratio > 0.0
@@ -607,7 +608,8 @@ impl PoolObservationSession {
                     > sequence.t0_segment.total_volume_sol.max(0.000_001) * 1.5
                     && organic.new_signer_ratio_t2 <= 0.10
             });
-        let high_buy_pressure_with_high_top3 = tx.buy_ratio >= 0.80 && tx.top3_volume_pct >= 0.50;
+        let high_buy_pressure_with_high_top3 =
+            tx.buy_ratio >= 0.80 && top3_signer_volume_ratio >= 0.50;
         let fixed_size_or_ramping_pattern = alpha
             .fixed_size_buy_ratio
             .is_some_and(|ratio| ratio >= 0.50)
@@ -663,7 +665,7 @@ impl PoolObservationSession {
         ManipulationContradictionFeatures {
             same_ms_tx_ratio: tx.same_ms_tx_ratio,
             bundle_suspicion_ratio: tx.bundle_suspicion_ratio,
-            top3_volume_pct: tx.top3_volume_pct,
+            top3_volume_pct: top3_signer_volume_ratio,
             hhi: tx.hhi,
             max_tx_per_signer: tx.max_tx_per_signer,
             dev_volume_ratio: tx.dev_volume_ratio,

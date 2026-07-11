@@ -26,7 +26,10 @@
 
 use anyhow::{bail, Context, Result};
 use ghost_brain::config::ghost_brain_config::ShadowV2BurninConfig;
-use ghost_brain::config::{GatekeeperV2Config, GhostBrainConfig};
+use ghost_brain::config::{
+    GatekeeperV2Config, GhostBrainConfig, MetricContractFoundationConfigV1,
+    MetricContractRolloutMode,
+};
 use ghost_brain::guardian::post_buy::shadow_v2::shadow_v2_artifact_budget_exceeded;
 use ghost_brain::oracle::SnapshotEngine;
 use ghost_brain::tuning::{BanditAlgorithm, TuningMessage, TuningService, TuningServiceConfig};
@@ -392,6 +395,32 @@ fn load_shadow_v2_burnin_runtime_config(config_path: &Path) -> Result<ShadowV2Bu
     })
 }
 
+fn load_metric_contract_foundation_config(
+    config_path: &Path,
+) -> Result<MetricContractFoundationConfigV1> {
+    let foundation = if config_path.exists() {
+        GhostBrainConfig::metric_contract_foundation_from_toml_file(config_path).with_context(
+            || {
+                format!(
+                    "METRIC_CONTRACT_FOUNDATION_CONFIG_INVALID: failed to load rollout/profile from {}",
+                    config_path.display()
+                )
+            },
+        )?
+    } else {
+        MetricContractFoundationConfigV1::default()
+    };
+
+    foundation.resolve_profile()?;
+    if foundation.metric_contract_rollout_mode != MetricContractRolloutMode::Legacy {
+        bail!(
+            "METRIC_CONTRACT_ROLLOUT_MODE_NOT_ACTIVE_IN_PR1: {:?} is a known schema value, but PR1 foundation permits only legacy runtime authority",
+            foundation.metric_contract_rollout_mode
+        );
+    }
+    Ok(foundation)
+}
+
 fn run_shadow_v2_validation_preflight_if_enabled(config: &ShadowV2BurninConfig) -> Result<()> {
     if !config.enabled {
         return Ok(());
@@ -688,8 +717,20 @@ fn log_runtime_durability(durability: &ResolvedDurabilityConfig) {
     );
 }
 
-async fn run_preflight(config: &LauncherConfig, config_path: &Path) -> Result<()> {
+async fn run_preflight(
+    config: &LauncherConfig,
+    config_path: &Path,
+    metric_contract_foundation: &MetricContractFoundationConfigV1,
+) -> Result<()> {
     let mut failures = Vec::new();
+
+    let profile = metric_contract_foundation.resolve_profile()?;
+    println!(
+        "[ok] metric_contract.foundation: mode={:?} profile={} hash={}",
+        metric_contract_foundation.metric_contract_rollout_mode,
+        metric_contract_foundation.metric_contract_profile.as_str(),
+        profile.canonical_hash()?
+    );
 
     let execution_result = config
         .validate_execution_profile()
@@ -1245,6 +1286,20 @@ async fn main() -> Result<()> {
     // ── CONFIG FINGERPRINT (always, single INFO line) ───────────────
     config.log_config_fingerprint();
 
+    // Validate metric-contract authority separately and fail closed. The
+    // historical full GhostBrain loader may fall back for unrelated analytical
+    // modules, but it must never hide an unknown rollout mode or profile.
+    let metric_contract_foundation =
+        load_metric_contract_foundation_config(Path::new(&config.ghost_brain_config_path))?;
+    let metric_contract_profile = metric_contract_foundation.resolve_profile()?;
+    info!(
+        rollout_mode = ?metric_contract_foundation.metric_contract_rollout_mode,
+        profile_id = metric_contract_foundation.metric_contract_profile.as_str(),
+        profile_hash = %metric_contract_profile.canonical_hash()?,
+        activation = "foundation_only_legacy_authority",
+        "Metric-contract registry/profile foundation validated"
+    );
+
     let startup_hydration_ignore_mints = load_startup_hydration_ignore_mints(&config_path)?;
     if !startup_hydration_ignore_mints.is_empty() {
         let ignored_mints = startup_hydration_ignore_mints
@@ -1261,7 +1316,7 @@ async fn main() -> Result<()> {
     }
 
     if cli.command == StartupCommand::Preflight {
-        run_preflight(&config, &config_path).await?;
+        run_preflight(&config, &config_path, &metric_contract_foundation).await?;
         return Ok(());
     }
 
@@ -3139,6 +3194,32 @@ mod tests {
     }
 
     #[test]
+    fn metric_contract_pr1_startup_defaults_to_legacy_and_rejects_known_nonlegacy_modes() {
+        let tmp = tempdir().expect("temp dir");
+        let missing = tmp.path().join("missing.toml");
+        assert_eq!(
+            load_metric_contract_foundation_config(&missing).expect("missing config defaults"),
+            MetricContractFoundationConfigV1::default()
+        );
+
+        for mode in ["dual_compute", "v2"] {
+            let path = tmp.path().join(format!("metric_contract_{mode}.toml"));
+            std::fs::write(
+                &path,
+                format!(
+                    "metric_contract_rollout_mode = \"{mode}\"\nmetric_contract_profile = \"metric_contracts_v1_1_profile_a\"\n"
+                ),
+            )
+            .expect("write metric-contract config");
+            let error = load_metric_contract_foundation_config(&path)
+                .expect_err("PR1 must not silently accept an inactive rollout mode");
+            assert!(error
+                .to_string()
+                .contains("METRIC_CONTRACT_ROLLOUT_MODE_NOT_ACTIVE_IN_PR1"));
+        }
+    }
+
+    #[test]
     fn test_load_gatekeeper_v2_config_prefers_gatekeeper_v2() {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3957,6 +4038,10 @@ path_density_v2_path = "reports/selector/shadow-v2-fidelity-validation/shadow_pa
         )
     }
 
+    fn pr1_metric_contract_foundation() -> MetricContractFoundationConfigV1 {
+        MetricContractFoundationConfigV1::default()
+    }
+
     #[tokio::test]
     async fn test_run_preflight_reports_missing_keypair() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -3966,9 +4051,13 @@ path_density_v2_path = "reports/selector/shadow-v2-fidelity-validation/shadow_pa
         let base_dir = tempdir().expect("base dir");
         let config = base_preflight_config(rpc_url, base_dir.path());
 
-        let err = run_preflight(&config, Path::new("test-config.toml"))
-            .await
-            .unwrap_err();
+        let err = run_preflight(
+            &config,
+            Path::new("test-config.toml"),
+            &pr1_metric_contract_foundation(),
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("trigger.keypair"));
     }
 
@@ -3987,9 +4076,13 @@ path_density_v2_path = "reports/selector/shadow-v2-fidelity-validation/shadow_pa
         write_test_keypair(&keypair_path);
         config.trigger.keypair_path = Some(keypair_path.to_string_lossy().into_owned());
 
-        let err = run_preflight(&config, Path::new("test-config.toml"))
-            .await
-            .unwrap_err();
+        let err = run_preflight(
+            &config,
+            Path::new("test-config.toml"),
+            &pr1_metric_contract_foundation(),
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("seer.helius_endpoint"));
     }
 
@@ -4008,9 +4101,13 @@ path_density_v2_path = "reports/selector/shadow-v2-fidelity-validation/shadow_pa
         write_test_keypair(&keypair_path);
         config.trigger.keypair_path = Some(keypair_path.to_string_lossy().into_owned());
 
-        let err = run_preflight(&config, Path::new("test-config.toml"))
-            .await
-            .expect_err("missing Yellowstone x-token must fail preflight");
+        let err = run_preflight(
+            &config,
+            Path::new("test-config.toml"),
+            &pr1_metric_contract_foundation(),
+        )
+        .await
+        .expect_err("missing Yellowstone x-token must fail preflight");
         assert!(err.to_string().contains("grpc_x_token"));
     }
 
@@ -4028,9 +4125,13 @@ path_density_v2_path = "reports/selector/shadow-v2-fidelity-validation/shadow_pa
         config.durability.wal_dir = Some(file.path().to_path_buf());
         config.durability.snapshot_dir = Some(snapshot_dir.path().to_path_buf());
 
-        let err = run_preflight(&config, Path::new("test-config.toml"))
-            .await
-            .unwrap_err();
+        let err = run_preflight(
+            &config,
+            Path::new("test-config.toml"),
+            &pr1_metric_contract_foundation(),
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("durability.wal_dir"));
     }
 
@@ -4058,9 +4159,13 @@ path_density_v2_path = "reports/selector/shadow-v2-fidelity-validation/shadow_pa
             .to_string_lossy()
             .into_owned();
 
-        let err = run_preflight(&config, Path::new("artifact-config.toml"))
-            .await
-            .unwrap_err();
+        let err = run_preflight(
+            &config,
+            Path::new("artifact-config.toml"),
+            &pr1_metric_contract_foundation(),
+        )
+        .await
+        .unwrap_err();
         let message = err.to_string();
         assert!(message.contains("oracle.decision_log_dir"));
         assert!(message.contains("execution.shadow.entry_log_dir"));
@@ -4080,9 +4185,13 @@ path_density_v2_path = "reports/selector/shadow-v2-fidelity-validation/shadow_pa
         config.trigger.emergency_floor_sol = 0.05;
         config.trigger.position_size_buffer_sol = 0.02;
 
-        run_preflight(&config, Path::new("happy-config.toml"))
-            .await
-            .expect("happy-path preflight should pass");
+        run_preflight(
+            &config,
+            Path::new("happy-config.toml"),
+            &pr1_metric_contract_foundation(),
+        )
+        .await
+        .expect("happy-path preflight should pass");
     }
 
     #[tokio::test]
@@ -4098,9 +4207,13 @@ path_density_v2_path = "reports/selector/shadow-v2-fidelity-validation/shadow_pa
         config.trigger.emergency_floor_sol = 0.05;
         config.trigger.position_size_buffer_sol = 0.02;
 
-        run_preflight(&config, Path::new("sender-ok.toml"))
-            .await
-            .expect("reachable Sender endpoint should pass preflight");
+        run_preflight(
+            &config,
+            Path::new("sender-ok.toml"),
+            &pr1_metric_contract_foundation(),
+        )
+        .await
+        .expect("reachable Sender endpoint should pass preflight");
     }
 
     #[tokio::test]
@@ -4114,9 +4227,13 @@ path_density_v2_path = "reports/selector/shadow-v2-fidelity-validation/shadow_pa
         config.execution.execution_mode = ghost_launcher::config::ExecutionMode::Paper;
         config.trigger.entry_mode = ghost_launcher::config::TriggerEntryMode::Live;
 
-        let err = run_preflight(&config, Path::new("invalid-config.toml"))
-            .await
-            .unwrap_err();
+        let err = run_preflight(
+            &config,
+            Path::new("invalid-config.toml"),
+            &pr1_metric_contract_foundation(),
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("execution_profile"));
     }
 }
