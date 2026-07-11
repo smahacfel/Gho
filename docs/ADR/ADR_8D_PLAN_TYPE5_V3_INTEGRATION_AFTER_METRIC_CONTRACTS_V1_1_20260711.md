@@ -31,6 +31,9 @@ Branch: `agent/type5-metric-contract-integration-reconciliation-t0`
 Base i merge-base z `origin/main`:
 `f904d5a02283126c599822c8839fdcd5ff1de901`
 
+Baseline durable/replay follow-up amendmentu:
+`625f265b4da7a280c9d61524aa48e0c53d7946c6`
+
 Plan wykonawczy:
 `PLANS/DO_REALIZACJI/PLAN_TYPE5_V3_INTEGRATION_AFTER_METRIC_CONTRACTS_V1_1_20260711.md`
 
@@ -86,7 +89,7 @@ Finalny amendment domyka:
 
 - compact `MetricContractDecisionEvidenceProjectionV1` kontra pełny evidence
   set/transport;
-- typed `Type5ResolvedInputEvidenceV1` bez reflection/downcastu;
+- typed `Type5ResolvedInputEvidenceRecordV1` bez reflection/downcastu;
 - `Type5ProducerConfigRefV1` dla Metric Contracts i component producers;
 - creation no-clamp i whale unbounded semantics;
 - lookback/eviction/checked-arithmetic semantics CrossPoolCohortReuse;
@@ -94,6 +97,18 @@ Finalny amendment domyka:
 - pre-PR2A parent-plan amendment jako twardy prerequisite.
 
 Nie zmienia to Rust, TOML, MFS, loggera, replayu, Gatekeepera ani runtime.
+
+### T0 durable/replay contract closure — follow-up
+
+Wąski follow-up domyka dwie ostatnie luki planu: oddziela runtime-only
+`Type5InputBindingDefinitionV1` od owned, serializowalnego
+`Type5ResolvedInputEvidenceRecordV1` oraz ustanawia durable, content-addressed
+manifest pełnych typed component resolved configs. Przyjmuje też jednoznaczną
+nazwę przyszłego pola MFS:
+`MaterializedFeatureSet.metric_contract_decision_projection_v1`.
+
+Follow-up nie wykonuje pre-PR2A amendmentu ani żadnej zmiany runtime. Wszystkie
+dotychczasowe blokady pozostają aktywne.
 
 ## 1. Kontekst i problem
 
@@ -192,6 +207,7 @@ metric_contracts_v1_1
   + CoordinationPatternAssessmentV1
 → istniejący Gatekeeper V3
 → compact decision v35 + type5_shadow_assessment_v1.jsonl
+  + type5_component_resolved_config_manifest_v1.jsonl
 → T5A discovery/feasibility
 → FREEZE calibration/outcome contracts
 → T5B prospective shadow validation + untouched holdout
@@ -219,13 +235,17 @@ compile-time accessora zwracającego typed evidence.
 
 ### 3.2 MFS otrzymuje wyłącznie kompaktową projekcję decision-time
 
-`MaterializedFeatureSet.metric_contract_evidence_v1` jest nazwą planowanej
-granicy logicznej:
+`MaterializedFeatureSet.metric_contract_decision_projection_v1` jest nazwą
+planowanej granicy logicznej:
 
 ```text
-MaterializedFeatureSet.metric_contract_evidence_v1
+MaterializedFeatureSet.metric_contract_decision_projection_v1
   = PROPOSED_PENDING_METRIC_CONTRACT_PLAN_AMENDMENT
 ```
+
+Wybrano nazwę `decision_projection`, aby typ pola nie mógł zostać pomylony z
+pełnym audit evidence ani transportem. Nazwa pełnego sidecara pozostaje
+`metric_contract_evidence_v1.jsonl`.
 
 Nie oznacza pełnego `MetricContractsEvidenceSetV1` ani
 `MetricContractEvidenceTransportV1`; nie jest ich aliasem, wrapperem ani kopią
@@ -301,35 +321,100 @@ Pre-PR2A parent-plan amendment jest twardym prerequisite i musi zatwierdzić:
 
 Ten ADR nie wykonuje amendmentu nadrzędnego planu Metric Contracts.
 
-### 3.3 Każdy accessor zwraca typed resolved evidence
+### 3.3 Static binding definition i durable record są osobnymi typami
 
-Normatywny wynik accessora:
+Runtime-only registry używa:
 
 ```rust
-pub struct Type5ResolvedInputEvidenceV1 {
+pub enum Type5InputRefV1 {
+    MetricContractSurface {
+        contract_id: MetricContractId,
+        surface_id: MetricSurfaceId,
+    },
+    CanonicalMfsInput {
+        input_id: Type5InputIdV1,
+        semantics_version: u16,
+    },
+    MissingPrimitive {
+        primitive_id: Type5PrimitiveIdV1,
+        semantics_version: u16,
+    },
+}
+
+pub struct Type5InputBindingDefinitionV1 {
+    pub input_id: Type5InputIdV1,
+    pub input_ref: Type5InputRefV1,
+    pub producer_id: Type5ProducerIdV1,
+    pub mfs_path: Option<&'static str>,
+    pub producer_debug_name: &'static str,
+    pub evidence_status_path: Option<&'static str>,
+    pub intended_semantics: &'static str,
+    pub allowed_type5_use: Type5InputUseV1,
+    pub recompute_forbidden: bool,
+}
+```
+
+`Type5InputBindingDefinitionV1` jest compile-time i runtime-only. Nie jest
+durable DTO, nie implementuje transportowego `Serialize/Deserialize`, nie jest
+emitowany do JSONL ani bezpośrednio deserializowany w replayu. Pola
+`mfs_path`, `producer_debug_name`, `evidence_status_path` i
+`intended_semantics` są wyłącznie metadata/debugging; nie są durable source of
+truth i nie wchodzą do canonical registry hash.
+
+Registry hash obejmuje uporządkowaną po `Type5InputIdV1` listę zamkniętych
+canonical entries: `input_id`, `input_ref`, `producer_id`,
+`allowed_type5_use`, `recompute_forbidden`. Runtime nadal rozwiązuje input przez
+exhaustive match po `Type5InputIdV1`, bez reflection i dynamicznego lookupu.
+
+Owned wynik accessora i jedyny durable input DTO to:
+
+```rust
+pub struct Type5ResolvedInputEvidenceRecordV1 {
+    pub record_schema_version: u16,
     pub input_id: Type5InputIdV1,
     pub input_ref: Type5InputRefV1,
     pub value: CanonicalNullableV1<Type5ResolvedInputValueV1>,
     pub availability: MetricAvailabilityV1,
     pub measurement_quality: MetricMeasurementQualityV1,
-    pub reason_codes: Vec<Type5InputReasonCodeV1>,
+    pub reason_codes: Type5BoundedInputReasonCodesV1,
     pub producer_id: Type5ProducerIdV1,
     pub producer_config_ref: Type5ProducerConfigRefV1,
     pub source_cutoff: Type5SourceCutoffV1,
     pub authority_or_use_class: Type5AuthorityOrUseClassV1,
+    pub binding_registry_id: Type5InputBindingRegistryIdV1,
+    pub binding_registry_hash: CanonicalHashV1,
 }
 ```
 
-`Type5ResolvedInputValueV1` jest zamkniętym input-specific enumem. Zakazane są
-`serde_json::Value`, dynamiczny downcast i string reflection. Runtime używa
-exhaustive match po `Type5InputIdV1`; `mfs_path` jest tylko
-metadata/debugging stringiem. Reason list ma schema-bounded limit.
+`Type5ResolvedInputEvidenceRecordV1` nie zawiera żadnego `&'static`, nie osadza
+całej definition ani debug strings. Używa wyłącznie zamkniętych enumów/ID,
+schema versions, owned values, quality/availability, bounded reasons oraz
+producer/config/cutoff/authority refs. `serde_json::Value`, dynamiczny downcast
+i string reflection są zakazane.
+Durable record i jego enumy są closed oraz `deny_unknown_fields`; unknown field
+lub variant jest błędem schema, nie fallbackiem.
 
-Dla Metric Contracts wynik zachowuje exact `MetricContractId`, exact
+Mapowanie `DefinitionV1 → RecordV1` jest normatywne: exhaustive match wybiera
+jedną definition; typed accessor czyta immutable MFS; resolver waliduje source,
+producer, use/authority, config i cutoff wobec canonical registry entry; do
+rekordu kopiuje tylko owned semantic fields i registry ID/hash. Debug metadata
+nie przechodzi do rekordu.
+
+Replay czyta `Type5ResolvedInputEvidenceRecordV1` i waliduje record schema,
+znany input ID, binding registry ID/hash oraz zgodność source/producer/use z
+canonical entry. Nieznany input ID, schema version, registry ID/hash albo
+binding mismatch dyskwalifikuje run. Replay nie deserializuje static definition
+i nie używa `mfs_path`, producer string ani intended-semantics text jako źródła
+prawdy.
+Wszystkie records assessmentu muszą dzielić registry ID/hash zgodny z Type-5
+sidecar hash payloadem oraz v35 `type5_input_bindings_id/hash`; rozjazd jest
+run-disqualifying.
+
+Dla Metric Contracts rekord zachowuje exact `MetricContractId`, exact
 `MetricSurfaceId`, `MetricAuthorityClass`, bieżący `MetricRolloutRoleV1`,
-`policy_actionable`, profile ID/hash i effective-config provenance. Dla
-non-metric inputs zachowuje exact `Type5InputIdV1`, `Type5InputUseV1`,
-field-level quality/reasons/config/cutoff bez fikcyjnego `MetricContractId`.
+`policy_actionable`, profile/effective-config provenance. Dla non-metric inputs
+zachowuje exact `Type5InputIdV1`, `Type5InputUseV1`, field-level
+quality/reasons/config/cutoff bez fikcyjnego `MetricContractId`.
 
 Wspólny group-level status, serde-default scalar albo legacy aggregate string
 nie wystarczają do uznania konkretnego pola za evaluable. Non-clean group nie
@@ -361,6 +446,14 @@ pub enum Type5ProducerConfigRefV1 {
         schema_version: u16,
         hash: CanonicalHashV1,
     },
+    UnknownLegacyConfig {
+        reason: Type5ConfigUnavailableReasonV1,
+    },
+}
+
+pub enum Type5ConfigUnavailableReasonV1 {
+    NotRecordedLegacySchema,
+    NotCapturedBeforeType5ComponentConfigManifestV1,
 }
 ```
 
@@ -404,7 +497,75 @@ OrganicBroadeningResolvedConfigV1
 `type5_assessment_effective_config_hash` referuje używane config refs, lecz nie
 kopiuje payloadów ani nie miesza producer settings z assessment thresholds.
 
-### 3.5 Canonical fingerprint producer jest jednoznaczny
+`UnknownLegacyConfig` jest dozwolone tylko dla znanej historycznej schema
+sprzed manifestu. Zawsze oznacza non-evaluable input. Nie może zamienić błędu
+T4 manifestu w degraded success. Zero/pusty hash, hash aktualnego configu,
+`brain_config_hash`, aktualny TOML i zgadywane defaults są zakazane.
+
+Historyczny brak mapuje się dokładnie na `UnknownLegacyConfig { typed reason }`,
+`value=null`, `availability=NotRecordedLegacySchema`,
+`measurement_quality=NotApplicable` i brak assessment contribution.
+
+### 3.5 Component resolved configs mają własny durable manifest
+
+T1 definiuje pełne typed payloads i canonical hash semantics:
+
+```rust
+pub enum Type5ComponentResolvedConfigPayloadV1 {
+    Fingerprint(FingerprintResolvedConfigV1),
+    CrossPool(CrossPoolResolvedConfigV1),
+    Sybil(SybilResolvedConfigV1),
+    OrganicBroadening(OrganicBroadeningResolvedConfigV1),
+}
+
+pub struct Type5ComponentResolvedConfigManifestRecordV1 {
+    pub record_schema_version: u16,
+    pub run_id: String,
+    pub producer_id: Type5ProducerIdV1,
+    pub payload_schema_version: u16,
+    pub payload_hash: CanonicalHashV1,
+    pub payload: Type5ComponentResolvedConfigPayloadV1,
+}
+```
+
+T4 emituje:
+
+```text
+type5_component_resolved_config_manifest_v1.jsonl
+```
+
+Content address jest tuple:
+
+```text
+(producer_id, payload_schema_version, payload_hash)
+```
+
+Hash obejmuje domain tag `type5_component_resolved_config_v1`, producer ID,
+payload schema version i pełny typed payload. Wyklucza run/writer/rotation
+metadata i własny hash. Payload variant musi odpowiadać producerowi i schema;
+dynamiczny JSON payload jest zakazany.
+Manifest record i payload enum są closed oraz `deny_unknown_fields`.
+
+T4 Type-5 durable-evidence writer jest ownerem artefaktu, deduplikuje ten sam
+content key w całym runie i emituje dokładnie jeden row per key, również przez
+granice rotated parts. Rotation manifest obejmuje uporządkowane parts/SHA,
+counts, unique-key count i `CanonicalHashV1` zamkniętego manifest payloadu.
+
+Każdy `ComponentResolvedConfig` ref w Type-5 sidecarze musi rozwiązać się do
+dokładnie jednego row tego samego runu. Ref
+`(producer_id, schema_version, hash)` musi być field-for-field równy manifest
+key `(producer_id, payload_schema_version, payload_hash)`. Missing payload,
+hash/schema mismatch,
+producer/payload mismatch, duplicate key albo dwa różne payloads pod tym samym
+key dyskwalifikują run. Identyczny powtórzony row także narusza exactly-once;
+writer powinien usunąć go przez pre-emission dedupe.
+
+T1 definiuje payload families/hash, T2 przenosi refs w pure assessments, T3
+używa payloadów wyłącznie in-memory i niczego nie emituje, a T4 emituje manifest
+i durable join. Replay jest obowiązkowo manifest-backed; nie może rekonstruować
+payloadu z bieżącego TOML ani aktualnie skompilowanych defaults.
+
+### 3.6 Canonical fingerprint producer jest jednoznaczny
 
 Normatywny binding brzmi:
 
@@ -422,7 +583,7 @@ TxIntelligenceEngine::fingerprint_metrics()
 Inne runtime-local aggregatory pozostają compatibility/logging-only i nie mogą
 stać się źródłem Type-5.
 
-### 3.6 T1 nie implementuje ponownie istniejących algorytmów
+### 3.7 T1 nie implementuje ponownie istniejących algorytmów
 
 Klasyfikacja jest zamrożona:
 
@@ -448,7 +609,7 @@ Dla pierwszych dwóch T1 dodaje wyłącznie:
 
 Nie wolno przepisać ich algorytmów.
 
-### 3.7 Creation-slot supply ratio nie jest clampowane
+### 3.8 Creation-slot supply ratio nie jest clampowane
 
 Normatywny binding:
 
@@ -478,7 +639,7 @@ inwariantu i łamie parity. Zakazane są `clamp`, `min(1.0)`, saturating
 conversion i error-to-zero. Non-finite diagnostic zapisuje raw IEEE-754 bits
 jako integer/string field, nigdy jako nielegalny JSON float.
 
-### 3.8 Whale reversal pozostaje istniejącą, unbounded projection
+### 3.9 Whale reversal pozostaje istniejącą, unbounded projection
 
 Normatywne bindingi:
 
@@ -498,7 +659,7 @@ daje typed `Unavailable`; wallet-cap degradation daje co najmniej `Degraded`.
 T1 kopiuje canonical output i dowodzi source-to-MFS parity, bez zmiany
 `ingest()`, `finalize()` lub tworzenia nowego aggregatora.
 
-### 3.9 CrossPoolCohortReuse ma coverage-aware denominator
+### 3.10 CrossPoolCohortReuse ma coverage-aware denominator
 
 `CrossPoolCohortReuse` nie jest aliasem CPV. Normatywny typ
 `CohortSignerHistoryStateV1` nadaje historii każdego current successful BUY
@@ -563,7 +724,7 @@ index jest zakazany. Tombstones mają TTL/cap/overflow behavior zapisane w
 `UnavailableHistory`. MFS zachowuje tylko bounded
 `CrossPoolCohortReuseEvidenceV1`, nigdy pełną listę par ani prior-pool sets.
 
-### 3.10 MFS, assessment i policy pozostają oddzielne
+### 3.11 MFS, assessment i policy pozostają oddzielne
 
 Przyjęto bez wyjątku:
 
@@ -594,7 +755,7 @@ Do MFS nie mogą wejść sniping score, weighted score, final severity,
 threshold-dependent taxonomy, policy-profile-dependent class, final confidence,
 Type-5 verdict ani coordination penalty.
 
-### 3.11 Istniejący Gatekeeper V3 pozostaje jedynym arbitrem
+### 3.12 Istniejący Gatekeeper V3 pozostaje jedynym arbitrem
 
 T3 może addytywnie rozszerzyć istniejący V3 o in-memory assessment context, ale
 nie tworzy nowych odpowiedników:
@@ -620,7 +781,7 @@ T3 ma udowodnić bit-for-bit parity wszystkich istniejących pól V3 i zapewnia:
 - zero wpływu Type-5 na risk, opportunity, confidence, reason chain i verdict;
 - zero wpływu na aktywny Gatekeeper V2/V2.5.
 
-### 3.12 Frozen v34 pozostaje bez zmian, Type-5 używa v35
+### 3.13 Frozen v34 pozostaje bez zmian, Type-5 używa v35
 
 Metric-contract burn-in zachowuje frozen compact v34. Type-5 nie dodaje do v34
 żadnych pól ani optional extensions po zamrożeniu schema.
@@ -638,6 +799,10 @@ type5_shadow_assessment_v1.jsonl
   = pełne pattern assessments, component breakdown,
     exact input IDs/surfaces, authority/use classes, quality,
     reason chain, profile/config/calibration/outcome refs
+
+type5_component_resolved_config_manifest_v1.jsonl
+  = pełne typed resolved component config payloads,
+    content-addressed i deduplicated per run
 ```
 
 Pełny payload Type-5 nie trafia do decision row. v35, metric-contract sidecar i
@@ -651,10 +816,21 @@ Type-5 sidecar są łączone przez record identity:
 nie zastępuje record identity. Hash/ref mismatch, orphan, truncated row albo
 paired-writer failure dyskwalifikuje run.
 
-Replay dispatchuje v33, v34 i v35 osobno. Historyczny v34 nigdy nie oczekuje
-Type-5 fields, a resource sizing T4 porównuje v35 z frozen v34.
+Compact v35 zachowuje także
+`type5_component_config_manifest_schema` i
+`type5_component_config_manifest_sha256`.
+Decision-plane join pozostaje `v35 + metric-contract sidecar + Type-5
+sidecar`, a każdy `ComponentResolvedConfig` wykonuje dodatkowy run-local join z
+Type-5 sidecara do manifestu.
 
-### 3.13 Type-5 config hash referuje producer hashes, lecz ich nie dubluje
+Replay dispatchuje v33, v34 i v35 osobno. Historyczny v34 nigdy nie oczekuje
+Type-5 fields, a resource sizing T4 porównuje v35 z frozen v34. Replay v35
+waliduje durable input record schema, binding registry ID/hash i wszystkie
+component config refs. Nieznany input/schema/binding hash, missing config
+payload, hash/schema mismatch albo duplicate/conflict dyskwalifikuje run.
+Aktualny TOML i bieżące compiled defaults nie uczestniczą w replayu.
+
+### 3.14 Type-5 config hash referuje producer hashes, lecz ich nie dubluje
 
 `type5_assessment_effective_config_hash` obejmuje wyłącznie:
 
@@ -673,7 +849,7 @@ Type-5 fields, a resource sizing T4 porównuje v35 z frozen v34.
 Nie kopiuje producer windows, dedupe, dust, retention ani całych configów. Nie
 obejmuje run/writer metadata ani własnego digestu.
 
-### 3.14 Kalibracja ma sekwencję T5A → FREEZE → T5B
+### 3.15 Kalibracja ma sekwencję T5A → FREEZE → T5B
 
 Definition parameters pozostają oddzielone od policy/calibration parameters.
 Wszystkie progi, sample minima, taxonomy cutoffs, contributions, weights,
@@ -749,6 +925,7 @@ T3 in-memory V3 hooks, no emission, zero influence                 │
    └───────────────────────────────────────────────────────────────┤
                                                                    ▼
                                                         T4 v35 durable shadow
+                                                           + config manifest
                                                                    │
                                                                    ▼
                                                         T5A discovery/proposal
@@ -774,13 +951,17 @@ PR2A/PR2B runtime implementation pozostaje zablokowana.
 Entry T1 jest koniunkcją: T0 accepted, pre-PR2A MFS projection amendment
 accepted, PR2A PASS i PR2B PASS. T1 zapewnia source-to-MFS parity dla dwóch
 istniejących fingerprint projections, dokładnie jeden truly missing primitive,
-typed resolver/config refs i zero wpływu na V2/V2.5/V3.
+runtime-only binding definitions, owned durable input records, typed config
+payload families/refs i zero wpływu na V2/V2.5/V3.
 
 T3 nie wymaga PR2C ani PR3: działa tylko in-memory `ObserveOnly`, dopuszcza
-test-only serialization fixtures, nie emituje JSONL ani durable decision fields
-i zachowuje pełną V3 parity. T4 wymaga T3 PASS i PR2C PASS; dopiero ono tworzy
-v35, Type-5 sidecar oraz bounded three-way writer/join dla `v35 decision +
-metric-contract evidence + Type-5 evidence`. T4 nadal pozostaje `ObserveOnly`.
+test-only serialization fixtures, używa resolved config payloads tylko
+in-memory, nie emituje JSONL, config manifestu ani durable decision fields i
+zachowuje pełną V3 parity. T4 wymaga T3 PASS i PR2C PASS; dopiero ono tworzy
+v35, Type-5 sidecar i `type5_component_resolved_config_manifest_v1.jsonl`.
+Decision-plane join obejmuje `v35 decision + metric-contract evidence + Type-5
+evidence`, a component refs mają osobny manifest join. T4 nadal pozostaje
+`ObserveOnly`.
 
 ## 5. Świadome non-decisions i blokady
 
@@ -864,6 +1045,20 @@ obciążania głównego rekordu pełnym payloadem.
 Odrzucone. Parametry policy pozostają `UNFROZEN_PENDING_CALIBRATION`, a
 walidacja po FREEZE jest prospective i używa untouched holdout.
 
+### 6.12 Serializowanie compile-time binding definition
+
+Odrzucone. `&'static` debug metadata nie jest stabilnym durable API, a replay
+nie może zależeć od string paths lub tekstowego opisu semantyki. Durable record
+przechowuje zamknięte IDs/enums i binding registry ID/hash.
+
+### 6.13 Odtwarzanie component configu z bieżącego środowiska
+
+Odrzucone. Aktualny TOML, aktualne defaults lub nowy build mogą różnić się od
+resolved ustawień decyzji historycznej. Replay musi rozwiązać config ref przez
+content-addressed T4 manifest. Tylko rekord o znanej schema, która jawnie
+poprzedza manifest, może mieć typed, non-evaluable `UnknownLegacyConfig`;
+missing manifest w schema T4 nigdy nie jest degradowany do tego wariantu.
+
 ## 7. Konsekwencje i ryzyka
 
 Pozytywne konsekwencje:
@@ -876,6 +1071,8 @@ Pozytywne konsekwencje:
 - ponowne użycie istniejącego V3;
 - deterministyczne assessmenty;
 - zamrożone v34 i jawnie wersjonowane v35;
+- rozdzielone static registry i durable replay DTO;
+- content-addressed, typed component-config payloads dla replayu;
 - prospective calibration z untouched holdout;
 - osobna bramka policy promotion.
 
@@ -888,6 +1085,7 @@ Koszty i ryzyka przyszłej implementacji:
   status;
 - T3 musi udowodnić bit-for-bit parity bez durable emission;
 - T4 wymaga v35, paired-writer integrity, replay i resource sizing;
+- T4 musi utrzymać run-wide config dedupe i rotation-aware conflict detection;
 - zmiana bindingu, producer config, assessment config albo calibration hash
   unieważnia porównywalność runów;
 - brak execution-grade outcome contractu blokuje wnioski o edge.
@@ -920,14 +1118,19 @@ Weryfikacja T0 obejmuje:
 8. no-clamp creation-slot invariant;
 9. coverage-aware, checked cohort denominator;
 10. typed resolved input i producer config refs;
-11. brak drugiego scoring stacku;
-12. istniejący V3 jako jedyny arbiter;
-13. T3 in-memory i T4 durable boundary;
-14. frozen v34 i osobne v35;
-15. T5A → FREEZE → T5B bez cyklu;
-16. brak wykonawczych przykładowych progów;
-17. brak zmian poza trzema allowlist documents;
-18. whitespace i Markdown sanity.
+11. static `Type5InputBindingDefinitionV1` kontra durable
+    `Type5ResolvedInputEvidenceRecordV1` bez `&'static`;
+12. binding ID/hash validation i fail-closed unknown schema/input/hash;
+13. typed `UnknownLegacyConfig` bez hash/default fallbacku;
+14. component-config manifest, exact content key i replay join;
+15. brak drugiego scoring stacku;
+16. istniejący V3 jako jedyny arbiter;
+17. T3 in-memory i T4 durable boundary;
+18. frozen v34 i osobne v35;
+19. T5A → FREEZE → T5B bez cyklu;
+20. brak wykonawczych przykładowych progów;
+21. brak zmian poza trzema allowlist documents;
+22. whitespace i Markdown sanity.
 
 Ponieważ zmiana jest dokumentacyjna, testy Rust nie są dowodem tego T0.
 Obowiązują statyczne kontrole zakresu, spójności i provenance.
@@ -953,6 +1156,15 @@ TYPE5_RUNTIME_IMPLEMENTATION_BLOCKED
 TYPE5_POLICY_PROMOTION_BLOCKED
 ```
 
+Closure markers tego follow-up amendmentu:
+
+```text
+TYPE5_STATIC_REGISTRY_DURABLE_RECORD_SPLIT
+TYPE5_COMPONENT_CONFIG_MANIFEST_CONTRACT
+TYPE5_UNKNOWN_LEGACY_CONFIG_FAIL_CLOSED
+TYPE5_MFS_PROJECTION_NAME_UNAMBIGUOUS
+```
+
 Marker `EXACT_BINDINGS_REVIEWABLE` oznacza, że każdy istotny input ma jawnego
 ownera, exact surface albo typed MFS input i milestone w macierzy. Nie jest to
 approval implementacji ani policy promotion.
@@ -969,7 +1181,8 @@ Kolejność następnych decyzji:
 5. dopiero wtedy rozważyć osobno ograniczony T1;
 6. wykonać T2 i T3 z zerowym pre-calibration influence i zerową durable emisją
    w T3;
-7. po PR2C wykonać T4 jako v35 + paired Type-5 sidecar;
+7. po PR2C wykonać T4 jako v35 + paired Type-5 sidecar +
+   `type5_component_resolved_config_manifest_v1.jsonl`;
 8. wykonać T5A, owner-approved FREEZE i dopiero T5B na prospective rows;
 9. użyć untouched holdout;
 10. przygotować osobny T6 policy-promotion plan.
