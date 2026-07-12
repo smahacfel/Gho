@@ -52,8 +52,12 @@ use ghost_launcher::{
     events::create_event_bus,
     events::{GhostEvent, PostBuySource},
     logging::{OracleDecisionFormatter, StandardFormatter},
-    oracle_metrics, oracle_runtime, wal_recovery,
+    metric_contracts::resolve_metric_contract_effective_config_v1,
+    oracle_metrics, oracle_runtime,
+    tx_intelligence::TxIntelligenceConfig,
+    wal_recovery,
 };
+use seer::early_fingerprint::EarlyFingerprintConfig;
 use seer::{
     configure_rpc_http_auth, new_async_rpc_client, new_async_rpc_client_with_timeout,
     rpc_http_auth_applies_to_url, DEFAULT_RPC_AUTH_HEADER, LEGACY_PROVIDER_AUTH_HEADER_ENV,
@@ -1923,14 +1927,38 @@ async fn main() -> Result<()> {
         oracle_runtime::OracleRuntimeConfig::from_shadow_ledger_config(&config.shadow_ledger);
     oracle_runtime_config.session = config.session.clone();
     oracle_runtime_config.tx_intelligence = config.tx_intelligence.clone();
+    let fsc_v2_runtime_config = ghost_brain_config.as_ref().and_then(|brain| {
+        (brain.fsc_v2.capture_enabled || brain.fsc_v2.feature_emit_enabled).then_some(&brain.fsc_v2)
+    });
     oracle_runtime_config.funding_source_config =
         ghost_launcher::tx_intelligence::FundingSourceConfig::from_configs(
             &gatekeeper_v2_config,
-            ghost_brain_config.as_ref().and_then(|brain| {
-                (brain.fsc_v2.capture_enabled || brain.fsc_v2.feature_emit_enabled)
-                    .then_some(&brain.fsc_v2)
-            }),
+            fsc_v2_runtime_config,
         );
+    let fingerprint_config = EarlyFingerprintConfig::default();
+    let tx_intelligence_resolved = TxIntelligenceConfig::from_gatekeeper_config(
+        &gatekeeper_v2_config,
+        fingerprint_config.clone(),
+    )
+    .apply_runtime_defaults(&config.tx_intelligence);
+    let metric_contract_effective_config = resolve_metric_contract_effective_config_v1(
+        metric_contract_foundation,
+        &gatekeeper_v2_config,
+        &tx_intelligence_resolved,
+        &fingerprint_config,
+        &oracle_runtime_config.funding_source_config,
+        fsc_v2_runtime_config,
+    )
+    .context("METRIC_CONTRACT_EFFECTIVE_CONFIG_INVALID")?;
+    info!(
+        rollout_mode = ?metric_contract_effective_config.payload.rollout_mode,
+        profile_id = metric_contract_effective_config.payload.profile_id.as_str(),
+        metric_contract_effective_config_hash = %metric_contract_effective_config.metric_contract_effective_config_hash,
+        activation = "pr2a_producers_legacy_authority",
+        "Metric-contract resolved producer settings validated"
+    );
+    oracle_runtime_config.metric_contract_effective_config =
+        Some(Arc::new(metric_contract_effective_config));
     oracle_runtime_config.p37_shadow_probe = config.p37_shadow_probe.clone();
     oracle_runtime_config.selector = config.selector.clone();
     oracle_runtime_config.run_id = (!config.p37_shadow_probe.run_id.trim().is_empty())

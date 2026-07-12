@@ -337,6 +337,7 @@ fn complete_contract_evidence() -> MetricContractsEvidenceSetV1 {
             known_coverage: CanonicalNullableV1::Value(1.0),
             non_neutral_known_coverage: CanonicalNullableV1::Value(1.0),
             known_buyer_count: 2,
+            known_non_neutral_buyer_count: 2,
             total_buyer_count: 2,
             provider: CanonicalNullableV1::Value("yellowstone".to_string()),
             config_hash: CanonicalNullableV1::Value(
@@ -834,17 +835,11 @@ fn record_identity_and_underlying_event_identity_are_separate_contracts() {
     assert!(StableEventIdentityV1::try_from_signature("source", "").is_err());
 }
 
-#[test]
-fn full_evidence_transport_validates_every_surface_profile_schema_and_hash() {
+fn complete_transport_payload() -> MetricContractEvidenceHashPayloadV1 {
     let foundation = MetricContractFoundationConfigV1::default();
     let profile = foundation.resolve_profile().expect("Profile A");
     let resolved_config = complete_effective_config();
-    let contracts = complete_contract_evidence();
-    contracts
-        .validate_for_profile(&profile, MetricContractRolloutMode::Legacy)
-        .expect("all 32 evidence surface slots match Profile A");
-
-    let payload = MetricContractEvidenceHashPayloadV1 {
+    MetricContractEvidenceHashPayloadV1 {
         evidence_schema_version: METRIC_CONTRACT_EVIDENCE_SCHEMA_VERSION_V1,
         record_identity: MetricEvidenceRecordIdentityV1::try_new("run-a", "join-a", "legacy_live")
             .unwrap(),
@@ -857,8 +852,19 @@ fn full_evidence_transport_validates_every_surface_profile_schema_and_hash() {
         metric_contract_effective_config_hash: resolved_config
             .metric_contract_effective_config_hash
             .clone(),
-        contracts,
-    };
+        contracts: complete_contract_evidence(),
+    }
+}
+
+#[test]
+fn full_evidence_transport_validates_every_surface_profile_schema_and_hash() {
+    let foundation = MetricContractFoundationConfigV1::default();
+    let profile = foundation.resolve_profile().expect("Profile A");
+    let payload = complete_transport_payload();
+    payload
+        .contracts
+        .validate_for_profile(&profile, MetricContractRolloutMode::Legacy)
+        .expect("all 32 evidence surface slots match Profile A");
     let transport =
         MetricContractEvidenceTransportV1::try_new(payload, 123, 4).expect("valid transport");
     transport.validate_hash().expect("hash validation");
@@ -957,6 +963,192 @@ fn full_evidence_transport_validates_every_surface_profile_schema_and_hash() {
         incomplete_flip.validate_semantics(),
         Err(MetricContractEvidenceSemanticErrorV1::FlipOwnerInvariant)
     ));
+}
+
+fn set_fsc_v2_unavailable(payload: &mut MetricContractEvidenceHashPayloadV1, total_buyers: u32) {
+    let funding = &mut payload.contracts.funding_source_concentration;
+    funding.v2_status = FscEvidenceStatus::Unavailable;
+    funding.v2_envelope.availability = MetricAvailabilityV1::Unavailable;
+    funding.v2_envelope.measurement_quality = MetricMeasurementQualityV1::NotApplicable;
+    funding.known_coverage = CanonicalNullableV1::Null;
+    funding.non_neutral_known_coverage = CanonicalNullableV1::Null;
+    funding.known_buyer_count = 0;
+    funding.known_non_neutral_buyer_count = 0;
+    funding.total_buyer_count = total_buyers;
+    payload.contracts.fsc_evidence_status.fsc_v2_status =
+        CanonicalNullableV1::Value(FscEvidenceStatus::Unavailable);
+    payload.contracts.fsc_evidence_status.fsc_v2_coverage = CanonicalNullableV1::Null;
+}
+
+fn assert_fsc_transport_semantic_rejected(
+    payload: MetricContractEvidenceHashPayloadV1,
+    invariant: &'static str,
+) {
+    assert!(matches!(
+        MetricContractEvidenceTransportV1::try_new(payload.clone(), 123, 4),
+        Err(MetricContractEvidenceTransportErrorV1::Semantic(
+            MetricContractEvidenceSemanticErrorV1::FscV2Invariant(actual)
+        )) if actual == invariant
+    ));
+
+    let correct_hash = payload.canonical_hash().unwrap();
+    let encoded = json!({
+        "payload": payload,
+        "evidence_sha256": correct_hash,
+        "writer_timestamp_ms": 123,
+        "rotation_part_index": 4,
+    });
+    let error = serde_json::from_value::<MetricContractEvidenceTransportV1>(encoded).unwrap_err();
+    assert!(
+        error.to_string().contains(invariant),
+        "serde must reject the same semantic invariant after a correct rehash: {error}"
+    );
+}
+
+#[test]
+fn full_evidence_transport_accepts_unavailable_fsc_with_non_empty_buyer_cohort() {
+    let mut payload = complete_transport_payload();
+    set_fsc_v2_unavailable(&mut payload, 2);
+    payload.contracts.validate_semantics().unwrap();
+
+    let transport = MetricContractEvidenceTransportV1::try_new(payload, 123, 4).unwrap();
+    let encoded = serde_json::to_value(&transport).unwrap();
+    let decoded: MetricContractEvidenceTransportV1 = serde_json::from_value(encoded).unwrap();
+    assert_eq!(decoded, transport);
+    assert_eq!(
+        decoded
+            .payload
+            .contracts
+            .funding_source_concentration
+            .total_buyer_count,
+        2
+    );
+}
+
+#[test]
+fn full_evidence_transport_rejects_fsc_v2_count_ordering() {
+    let mut non_neutral_exceeds_known = complete_transport_payload();
+    non_neutral_exceeds_known
+        .contracts
+        .funding_source_concentration
+        .known_buyer_count = 1;
+    assert_fsc_transport_semantic_rejected(
+        non_neutral_exceeds_known,
+        "known non-neutral buyers exceed known buyers",
+    );
+
+    let mut known_exceeds_total = complete_transport_payload();
+    known_exceeds_total
+        .contracts
+        .funding_source_concentration
+        .total_buyer_count = 1;
+    assert_fsc_transport_semantic_rejected(known_exceeds_total, "known buyers exceed total buyers");
+}
+
+#[test]
+fn full_evidence_transport_rejects_fsc_v2_count_coverage_drift() {
+    let mut non_neutral_drift = complete_transport_payload();
+    non_neutral_drift
+        .contracts
+        .funding_source_concentration
+        .known_non_neutral_buyer_count = 1;
+    assert_fsc_transport_semantic_rejected(
+        non_neutral_drift,
+        "non-neutral known coverage does not match buyer counts",
+    );
+
+    let mut known_drift = complete_transport_payload();
+    let funding = &mut known_drift.contracts.funding_source_concentration;
+    funding.known_buyer_count = 1;
+    funding.known_non_neutral_buyer_count = 1;
+    funding.non_neutral_known_coverage = CanonicalNullableV1::Value(0.5);
+    assert_fsc_transport_semantic_rejected(
+        known_drift,
+        "known coverage does not match buyer counts",
+    );
+}
+
+#[test]
+fn full_evidence_transport_rejects_fsc_v2_status_presence_drift() {
+    let mut unavailable_coverage = complete_transport_payload();
+    set_fsc_v2_unavailable(&mut unavailable_coverage, 2);
+    unavailable_coverage
+        .contracts
+        .funding_source_concentration
+        .known_coverage = CanonicalNullableV1::Value(0.0);
+    assert_fsc_transport_semantic_rejected(
+        unavailable_coverage,
+        "unavailable status cannot expose known counts or coverage",
+    );
+
+    let mut unavailable_non_neutral_coverage = complete_transport_payload();
+    set_fsc_v2_unavailable(&mut unavailable_non_neutral_coverage, 2);
+    unavailable_non_neutral_coverage
+        .contracts
+        .funding_source_concentration
+        .non_neutral_known_coverage = CanonicalNullableV1::Value(0.0);
+    assert_fsc_transport_semantic_rejected(
+        unavailable_non_neutral_coverage,
+        "unavailable status cannot expose known counts or coverage",
+    );
+
+    let mut unavailable_known = complete_transport_payload();
+    set_fsc_v2_unavailable(&mut unavailable_known, 2);
+    unavailable_known
+        .contracts
+        .funding_source_concentration
+        .known_buyer_count = 1;
+    assert_fsc_transport_semantic_rejected(
+        unavailable_known,
+        "unavailable status cannot expose known counts or coverage",
+    );
+
+    for status in [FscEvidenceStatus::Clean, FscEvidenceStatus::Degraded] {
+        let mut missing_coverage = complete_transport_payload();
+        let funding = &mut missing_coverage.contracts.funding_source_concentration;
+        funding.v2_status = status;
+        funding.known_coverage = CanonicalNullableV1::Null;
+        missing_coverage.contracts.fsc_evidence_status.fsc_v2_status =
+            CanonicalNullableV1::Value(status);
+        missing_coverage
+            .contracts
+            .fsc_evidence_status
+            .fsc_v2_coverage = CanonicalNullableV1::Null;
+        assert_fsc_transport_semantic_rejected(
+            missing_coverage,
+            "available status requires known coverage",
+        );
+
+        let mut missing_non_neutral_coverage = complete_transport_payload();
+        let funding = &mut missing_non_neutral_coverage
+            .contracts
+            .funding_source_concentration;
+        funding.v2_status = status;
+        funding.non_neutral_known_coverage = CanonicalNullableV1::Null;
+        missing_non_neutral_coverage
+            .contracts
+            .fsc_evidence_status
+            .fsc_v2_status = CanonicalNullableV1::Value(status);
+        assert_fsc_transport_semantic_rejected(
+            missing_non_neutral_coverage,
+            "available status requires non-neutral known coverage",
+        );
+
+        let mut zero_total = complete_transport_payload();
+        let funding = &mut zero_total.contracts.funding_source_concentration;
+        funding.v2_status = status;
+        funding.known_buyer_count = 0;
+        funding.known_non_neutral_buyer_count = 0;
+        funding.total_buyer_count = 0;
+        funding.known_coverage = CanonicalNullableV1::Value(0.0);
+        funding.non_neutral_known_coverage = CanonicalNullableV1::Value(0.0);
+        zero_total.contracts.fsc_evidence_status.fsc_v2_status = CanonicalNullableV1::Value(status);
+        zero_total.contracts.fsc_evidence_status.fsc_v2_coverage = CanonicalNullableV1::Value(0.0);
+        assert_fsc_transport_semantic_rejected(
+            zero_total,
+            "available status requires a non-empty buyer cohort",
+        );
+    }
 }
 
 #[test]

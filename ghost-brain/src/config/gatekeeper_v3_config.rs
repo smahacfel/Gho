@@ -346,6 +346,9 @@ pub struct GatekeeperV3EvidenceRequirements {
     pub cpv: bool,
     #[serde(default = "default_required")]
     pub fsc: bool,
+    /// FSC v2 is evidence-only until a separate policy-promotion plan.
+    #[serde(default)]
+    pub fsc_v2: bool,
     #[serde(default = "default_required")]
     pub alpha: bool,
     #[serde(default = "default_required")]
@@ -372,6 +375,7 @@ impl Default for GatekeeperV3EvidenceRequirements {
             sybil: true,
             cpv: true,
             fsc: true,
+            fsc_v2: false,
             alpha: true,
             manipulation: true,
             organic_broadening: true,
@@ -395,6 +399,7 @@ impl GatekeeperV3EvidenceRequirements {
             "sybil" => self.sybil,
             "cpv" => self.cpv,
             "fsc" => self.fsc,
+            "fsc_v2" => self.fsc_v2,
             "alpha" => self.alpha,
             "manipulation" => self.manipulation,
             "organic_broadening" => self.organic_broadening,
@@ -417,6 +422,7 @@ impl GatekeeperV3EvidenceRequirements {
             "sybil": self.sybil,
             "cpv": self.cpv,
             "fsc": self.fsc,
+            "fsc_v2": self.fsc_v2,
             "alpha": self.alpha,
             "manipulation": self.manipulation,
             "organic_broadening": self.organic_broadening,
@@ -724,6 +730,7 @@ mod tests {
         assert_eq!(config.early_window_ms, 2_000);
         assert!(!config.promotion.enabled);
         assert!(!config.evidence_requirements.execution);
+        assert!(!config.evidence_requirements.fsc_v2);
         assert_eq!(config.confidence_caps.execution_not_run, 0.80);
         assert_eq!(config.component_weights.max_risk_penalty, 0.85);
     }
@@ -774,6 +781,19 @@ materialization_version = 1
         assert!(!config.replay_payload_enabled);
         assert_eq!(config.policy_version, 1);
         assert_eq!(config.materialization_version, 1);
+    }
+
+    #[test]
+    fn legacy_evidence_requirements_load_with_fsc_v2_disabled() {
+        let requirements: GatekeeperV3EvidenceRequirements = toml::from_str(
+            r#"
+fsc = true
+"#,
+        )
+        .unwrap();
+
+        assert!(requirements.fsc);
+        assert!(!requirements.fsc_v2);
     }
 
     #[test]

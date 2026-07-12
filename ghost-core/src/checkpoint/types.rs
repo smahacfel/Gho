@@ -657,6 +657,12 @@ pub struct MaterializedEvidenceStatus {
     pub cpv: FeatureEvidenceStatus,
     #[serde(default)]
     pub fsc: FeatureEvidenceStatus,
+    /// Legacy FSC scalar availability. `fsc` remains its compatibility alias.
+    #[serde(default)]
+    pub fsc_legacy: FeatureEvidenceStatus,
+    /// FSC v2 readiness/coverage status. Evidence-only in PR2A.
+    #[serde(default)]
+    pub fsc_v2: FeatureEvidenceStatus,
     #[serde(default)]
     pub alpha: FeatureEvidenceStatus,
     #[serde(default)]
@@ -683,6 +689,8 @@ impl Default for MaterializedEvidenceStatus {
             sybil: FeatureEvidenceStatus::default(),
             cpv: FeatureEvidenceStatus::default(),
             fsc: FeatureEvidenceStatus::default(),
+            fsc_legacy: FeatureEvidenceStatus::default(),
+            fsc_v2: FeatureEvidenceStatus::default(),
             alpha: FeatureEvidenceStatus::default(),
             manipulation: FeatureEvidenceStatus::default(),
             organic_broadening: FeatureEvidenceStatus::default(),

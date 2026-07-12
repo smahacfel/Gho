@@ -39,6 +39,7 @@ pub mod components;
 pub mod config;
 pub mod events;
 pub mod logging;
+pub mod metric_contracts;
 pub mod oracle_metrics;
 pub mod oracle_runtime;
 pub mod session;

@@ -1841,6 +1841,10 @@ pub struct OracleRuntimeConfig {
     pub session: SessionRuntimeConfig,
     pub tx_intelligence: TxIntelligenceRuntimeConfig,
     pub funding_source_config: FundingSourceConfig,
+    /// Frozen startup-resolved metric-contract settings. PR2A validates and
+    /// retains this value for PR2B; it does not materialize the MFS root.
+    pub metric_contract_effective_config:
+        Option<Arc<ghost_core::metric_contracts::ResolvedMetricContractEffectiveConfigV1>>,
     pub p37_shadow_probe: P37ShadowProbeConfig,
     pub selector: SelectorRuntimeConfig,
     pub run_id: Option<String>,
@@ -1889,6 +1893,7 @@ impl OracleRuntimeConfig {
             funding_source_config: FundingSourceConfig::from_gatekeeper_config(
                 &GatekeeperV2Config::default(),
             ),
+            metric_contract_effective_config: None,
             p37_shadow_probe: P37ShadowProbeConfig::default(),
             selector: SelectorRuntimeConfig::default(),
             run_id: None,
@@ -1908,6 +1913,7 @@ impl OracleRuntimeConfig {
             funding_source_config: FundingSourceConfig::from_gatekeeper_config(
                 &GatekeeperV2Config::default(),
             ),
+            metric_contract_effective_config: None,
             p37_shadow_probe: P37ShadowProbeConfig::default(),
             selector: SelectorRuntimeConfig::default(),
             run_id: None,
@@ -1968,6 +1974,7 @@ impl Default for OracleRuntimeConfig {
             funding_source_config: FundingSourceConfig::from_gatekeeper_config(
                 &GatekeeperV2Config::default(),
             ),
+            metric_contract_effective_config: None,
             p37_shadow_probe: P37ShadowProbeConfig::default(),
             selector: SelectorRuntimeConfig::default(),
             run_id: None,
@@ -23604,7 +23611,10 @@ async fn pool_observation_task(
                             if let Ok(dev_wallet) = Pubkey::try_from(pd.creator.as_str()) {
                                 let mut session = session.write();
                                 session.dev_wallet = Some(dev_wallet);
-                                session.update_tx_intelligence_dev_wallet(Some(dev_wallet));
+                                session.update_tx_intelligence_dev_identity(
+                                    Some(dev_wallet),
+                                    Some(pd.signature.as_str()),
+                                );
                                 session.update_tx_intelligence_fingerprint_anchor(
                                     pd.slot,
                                     detected_pool_epoch_like_ts_ms(&pd),
@@ -32724,6 +32734,10 @@ mod tests {
             sybil: review_clean_evidence_status(),
             cpv: review_clean_evidence_status(),
             fsc: review_clean_evidence_status(),
+            fsc_legacy: review_clean_evidence_status(),
+            fsc_v2: review_unavailable_evidence_status(
+                EvidenceUnavailableReason::FscMetricsMissing,
+            ),
             alpha: review_clean_evidence_status(),
             manipulation: review_clean_evidence_status(),
             organic_broadening: review_clean_evidence_status(),

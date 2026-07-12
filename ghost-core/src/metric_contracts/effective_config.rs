@@ -30,16 +30,23 @@ pub enum MetricEffectiveConfigKeyV1 {
     DevPrimarySuccessRequired,
     DevPrimaryDustThresholdSol,
     DevPrimaryDedupeKey,
+    DevPrimaryDedupeCapacity,
     DevPrimaryAnchorRule,
     DevMissingCreatorBehavior,
 
     SameMsExactDeltaMs,
     SameMsLegacyPopulation,
     SameMsLegacyDenominatorRule,
+    SameMsLegacyDustThresholdSol,
+    SameMsLegacyDedupeKey,
+    SameMsLegacyDedupeCapacity,
     SameMsClusterUpperBoundExclusiveMs,
     SameMsRecentWindowMs,
     SameMsRecentPopulation,
     SameMsRecentDenominatorRule,
+    SameMsRecentDedupeKey,
+    SameMsRecentRetentionCapacity,
+    SameMsRecentRetentionPolicy,
 
     Top3PreferredField,
     Top3FallbackAlias,
@@ -61,6 +68,7 @@ pub enum MetricEffectiveConfigKeyV1 {
     FlipCandidateReconnectBehavior,
 
     FscLegacyFormula,
+    FscLegacyMinKnownSourceSamples,
     FscFundingLookbackWindowMs,
     FscMinAbsStoreLamports,
     FscMinAbsAttributionLamports,
@@ -132,15 +140,22 @@ pub const METRIC_EFFECTIVE_CONFIG_KEYS_V1: &[MetricEffectiveConfigKeyV1] = &[
     MetricEffectiveConfigKeyV1::DevPrimarySuccessRequired,
     MetricEffectiveConfigKeyV1::DevPrimaryDustThresholdSol,
     MetricEffectiveConfigKeyV1::DevPrimaryDedupeKey,
+    MetricEffectiveConfigKeyV1::DevPrimaryDedupeCapacity,
     MetricEffectiveConfigKeyV1::DevPrimaryAnchorRule,
     MetricEffectiveConfigKeyV1::DevMissingCreatorBehavior,
     MetricEffectiveConfigKeyV1::SameMsExactDeltaMs,
     MetricEffectiveConfigKeyV1::SameMsLegacyPopulation,
     MetricEffectiveConfigKeyV1::SameMsLegacyDenominatorRule,
+    MetricEffectiveConfigKeyV1::SameMsLegacyDustThresholdSol,
+    MetricEffectiveConfigKeyV1::SameMsLegacyDedupeKey,
+    MetricEffectiveConfigKeyV1::SameMsLegacyDedupeCapacity,
     MetricEffectiveConfigKeyV1::SameMsClusterUpperBoundExclusiveMs,
     MetricEffectiveConfigKeyV1::SameMsRecentWindowMs,
     MetricEffectiveConfigKeyV1::SameMsRecentPopulation,
     MetricEffectiveConfigKeyV1::SameMsRecentDenominatorRule,
+    MetricEffectiveConfigKeyV1::SameMsRecentDedupeKey,
+    MetricEffectiveConfigKeyV1::SameMsRecentRetentionCapacity,
+    MetricEffectiveConfigKeyV1::SameMsRecentRetentionPolicy,
     MetricEffectiveConfigKeyV1::Top3PreferredField,
     MetricEffectiveConfigKeyV1::Top3FallbackAlias,
     MetricEffectiveConfigKeyV1::Top3Scale,
@@ -159,6 +174,7 @@ pub const METRIC_EFFECTIVE_CONFIG_KEYS_V1: &[MetricEffectiveConfigKeyV1] = &[
     MetricEffectiveConfigKeyV1::FlipCandidateMaxWallets,
     MetricEffectiveConfigKeyV1::FlipCandidateReconnectBehavior,
     MetricEffectiveConfigKeyV1::FscLegacyFormula,
+    MetricEffectiveConfigKeyV1::FscLegacyMinKnownSourceSamples,
     MetricEffectiveConfigKeyV1::FscFundingLookbackWindowMs,
     MetricEffectiveConfigKeyV1::FscMinAbsStoreLamports,
     MetricEffectiveConfigKeyV1::FscMinAbsAttributionLamports,
@@ -230,15 +246,22 @@ impl MetricEffectiveConfigKeyV1 {
             | Key::DevPrimarySuccessRequired
             | Key::DevPrimaryDustThresholdSol
             | Key::DevPrimaryDedupeKey
+            | Key::DevPrimaryDedupeCapacity
             | Key::DevPrimaryAnchorRule
             | Key::DevMissingCreatorBehavior => Some(MetricContractId::DevBuy),
             Key::SameMsExactDeltaMs
             | Key::SameMsLegacyPopulation
             | Key::SameMsLegacyDenominatorRule
+            | Key::SameMsLegacyDustThresholdSol
+            | Key::SameMsLegacyDedupeKey
+            | Key::SameMsLegacyDedupeCapacity
             | Key::SameMsClusterUpperBoundExclusiveMs
             | Key::SameMsRecentWindowMs
             | Key::SameMsRecentPopulation
-            | Key::SameMsRecentDenominatorRule => Some(MetricContractId::SameMsTxRatio),
+            | Key::SameMsRecentDenominatorRule
+            | Key::SameMsRecentDedupeKey
+            | Key::SameMsRecentRetentionCapacity
+            | Key::SameMsRecentRetentionPolicy => Some(MetricContractId::SameMsTxRatio),
             Key::Top3PreferredField
             | Key::Top3FallbackAlias
             | Key::Top3Scale
@@ -257,6 +280,7 @@ impl MetricEffectiveConfigKeyV1 {
             | Key::FlipCandidateMaxWallets
             | Key::FlipCandidateReconnectBehavior => Some(MetricContractId::FlipRatio),
             Key::FscLegacyFormula
+            | Key::FscLegacyMinKnownSourceSamples
             | Key::FscFundingLookbackWindowMs
             | Key::FscMinAbsStoreLamports
             | Key::FscMinAbsAttributionLamports
@@ -324,9 +348,10 @@ impl MetricEffectiveConfigKeyV1 {
 
             Key::FscMinAttributionConfidenceBps => MetricEffectiveConfigValueKindV1::Unsigned,
 
-            Key::DevTxIntelDustThresholdSol | Key::DevPrimaryDustThresholdSol => {
-                MetricEffectiveConfigValueKindV1::FiniteNumber
-            }
+            Key::DevTxIntelDustThresholdSol
+            | Key::DevPrimaryDustThresholdSol
+            | Key::SameMsLegacyDustThresholdSol
+            | Key::FlipCandidateDustThresholdSol => MetricEffectiveConfigValueKindV1::FiniteNumber,
 
             Key::FlipCandidateDumpRatio
             | Key::FscMinRelativeToBuy
@@ -344,13 +369,17 @@ impl MetricEffectiveConfigKeyV1 {
             | Key::FtdiLegacyCleanMinBuyTransactions
             | Key::FtdiCandidateCleanMinUniqueBuyers
             | Key::DevTxIntelDedupeCapacity
+            | Key::DevPrimaryDedupeCapacity
             | Key::SameMsExactDeltaMs
+            | Key::SameMsLegacyDedupeCapacity
             | Key::SameMsClusterUpperBoundExclusiveMs
             | Key::SameMsRecentWindowMs
+            | Key::SameMsRecentRetentionCapacity
             | Key::FlipCandidateWallClockWindowMs
             | Key::FlipCandidateMaxSlotGap
             | Key::FlipCandidateDedupeCapacity
             | Key::FlipCandidateMaxWallets
+            | Key::FscLegacyMinKnownSourceSamples
             | Key::FscFundingLookbackWindowMs
             | Key::FscMinAbsStoreLamports
             | Key::FscMinAbsAttributionLamports
@@ -503,6 +532,15 @@ impl ResolvedMetricContractEffectiveConfigV1 {
             return Err(MetricContractEffectiveConfigErrorV1::HashMismatch);
         }
         Ok(())
+    }
+
+    #[must_use]
+    pub fn value(&self, key: MetricEffectiveConfigKeyV1) -> Option<&MetricEffectiveConfigValueV1> {
+        self.payload
+            .entries
+            .binary_search_by_key(&key, |entry| entry.key)
+            .ok()
+            .map(|index| &self.payload.entries[index].value)
     }
 }
 

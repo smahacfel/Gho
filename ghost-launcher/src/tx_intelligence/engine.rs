@@ -5,6 +5,7 @@ use crate::tx_intelligence::{
     compute_volume_sanity, SignerStats,
 };
 use ghost_brain::fast_pipeline::EnhancedCandidate;
+use ghost_core::metric_contracts::DevBuySelectionModeV1;
 use ghost_core::shadow_ledger::TxKey;
 use ghost_core::tx_intelligence::types::{
     BurstWindow, RiskFlag, RiskSeverity, TxIntelFeatures, TxIntelligenceState,
@@ -24,7 +25,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
 const PUMPFUN_TOKEN_DECIMALS: u8 = 6;
 const GENESIS_TOKEN_RESERVES_RAW: u128 = 1_073_000_000_000_000;
-const BUNDLE_CLUSTER_THRESHOLD_MS: u64 = 50;
+pub(crate) const BUNDLE_CLUSTER_THRESHOLD_MS: u64 = 50;
 
 #[derive(Debug, Clone, Default)]
 struct SignerBehaviorStats {
@@ -36,6 +37,67 @@ struct SignerBehaviorStats {
     sell_volume_sol: f64,
     first_buy_volume_sol: Option<f64>,
     first_buy_tokens: Option<f64>,
+    first_buy_record: Option<DevBuyCandidateV1>,
+}
+
+#[derive(Debug, Clone)]
+struct DevBuyCandidateV1 {
+    tx_key: Option<TxKey>,
+    signer: String,
+    signature: String,
+    slot: Option<u64>,
+    transaction_index: Option<u32>,
+    amount_sol: f64,
+    success: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DevBuyProducerSnapshotV1 {
+    pub amount_sol: Option<f64>,
+    pub creator_known: bool,
+    pub create_signature: Option<String>,
+    pub create_signature_matched: bool,
+    pub selection_mode: DevBuySelectionModeV1,
+    pub selected_signature: Option<String>,
+    pub selected_slot: Option<u64>,
+    pub selected_transaction_index: Option<u32>,
+    pub eligible_buy_count: u64,
+    pub selected_success: Option<bool>,
+    pub selection_complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TxTimingProducerSnapshotV1 {
+    pub numerator: u64,
+    pub denominator: u64,
+    pub ratio: Option<f64>,
+    pub canonical_dedupe_applied: bool,
+    pub dust_filter_sol: Option<f64>,
+    pub window_ms: Option<u64>,
+    pub fallback_timestamp_count: u64,
+    pub fallback_ordering_count: u64,
+    pub source_complete: bool,
+    pub source_state_capacity: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Top3ProducerSnapshotV1 {
+    pub preferred_ratio: Option<f64>,
+    pub compatibility_alias_ratio: Option<f64>,
+    pub effective_ratio: Option<f64>,
+    pub preferred_alias_bitwise_equal: Option<bool>,
+    pub used_compatibility_fallback: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TxIntelligenceMetricContractSnapshotV1 {
+    pub producer_dust_filter_sol: f64,
+    pub producer_dedupe_capacity: u64,
+    pub dev_first_observed: DevBuyProducerSnapshotV1,
+    pub dev_primary_v1: DevBuyProducerSnapshotV1,
+    pub exact_same_ms: TxTimingProducerSnapshotV1,
+    pub cluster_lt_50ms: TxTimingProducerSnapshotV1,
+    pub top3: Top3ProducerSnapshotV1,
 }
 
 impl SignerBehaviorStats {
@@ -60,6 +122,7 @@ pub struct TxIntelligenceEngine {
     current_consecutive_buys: usize,
     max_consecutive_buys: usize,
     dev_wallet: Option<String>,
+    pool_create_signature: Option<String>,
     first_signer: Option<String>,
     dev_buy_total_sol: f64,
     dev_buy_volume_total_sol: f64,
@@ -67,6 +130,11 @@ pub struct TxIntelligenceEngine {
     dev_initial_buy_tokens: Option<f64>,
     tx_keys_seen: HashSet<TxKey>,
     tx_keys_fifo: VecDeque<TxKey>,
+    tx_key_history_truncated: bool,
+    dev_primary_candidates: VecDeque<DevBuyCandidateV1>,
+    dev_primary_candidates_truncated: bool,
+    timing_fallback_timestamp_count: u64,
+    timing_fallback_ordering_count: u64,
     fingerprint_agg: Option<FingerprintAggregator>,
     fingerprint_slot: Option<u64>,
     fingerprint_t0_ms: u64,
@@ -89,6 +157,7 @@ impl TxIntelligenceEngine {
             current_consecutive_buys: 0,
             max_consecutive_buys: 0,
             dev_wallet: dev_wallet.map(|value| value.to_string()),
+            pool_create_signature: non_blank(candidate_snapshot.signature.as_str()),
             first_signer: None,
             dev_buy_total_sol: 0.0,
             dev_buy_volume_total_sol: 0.0,
@@ -96,6 +165,11 @@ impl TxIntelligenceEngine {
             dev_initial_buy_tokens: None,
             tx_keys_seen: HashSet::new(),
             tx_keys_fifo: VecDeque::new(),
+            tx_key_history_truncated: false,
+            dev_primary_candidates: VecDeque::new(),
+            dev_primary_candidates_truncated: false,
+            timing_fallback_timestamp_count: 0,
+            timing_fallback_ordering_count: 0,
             fingerprint_agg: None,
             fingerprint_slot: candidate_snapshot.slot,
             fingerprint_t0_ms: candidate_snapshot.timestamp,
@@ -126,6 +200,13 @@ impl TxIntelligenceEngine {
 
     pub fn set_dev_wallet(&mut self, dev_wallet: Option<Pubkey>) {
         self.dev_wallet = dev_wallet.map(|value| value.to_string());
+        self.refresh_dev_metrics_from_signer_stats();
+        self.rebuild_fingerprint_aggregator();
+    }
+
+    pub fn set_dev_identity(&mut self, dev_wallet: Option<Pubkey>, create_signature: Option<&str>) {
+        self.dev_wallet = dev_wallet.map(|value| value.to_string());
+        self.pool_create_signature = create_signature.and_then(non_blank);
         self.refresh_dev_metrics_from_signer_stats();
         self.rebuild_fingerprint_aggregator();
     }
@@ -162,11 +243,19 @@ impl TxIntelligenceEngine {
             return;
         }
 
-        if let Some(tx_key) = tx_key {
+        if let Some(tx_key) = tx_key.clone() {
             self.track_tx_key(tx_key);
         }
 
         let event_ts_ms = tx_epoch_like_event_ts_ms(tx);
+        if tx.compat_event_ts_ms().is_none() {
+            self.timing_fallback_timestamp_count =
+                self.timing_fallback_timestamp_count.saturating_add(1);
+        }
+        if !tx_has_stable_timing_order_identity(tx) {
+            self.timing_fallback_ordering_count =
+                self.timing_fallback_ordering_count.saturating_add(1);
+        }
         if self.first_signer.is_none() {
             self.first_signer = Some(tx.signer.clone());
         }
@@ -213,6 +302,9 @@ impl TxIntelligenceEngine {
             if signer_stats.first_buy_tokens.is_none() {
                 signer_stats.first_buy_tokens = tx.token_amount_units.map(|value| value as f64);
             }
+            if signer_stats.first_buy_record.is_none() {
+                signer_stats.first_buy_record = Some(dev_buy_candidate(tx, tx_key.clone()));
+            }
         } else {
             signer_stats.sell_count += 1;
             signer_stats.sell_volume_sol += tx.volume_sol;
@@ -233,6 +325,17 @@ impl TxIntelligenceEngine {
                 .saturating_add(tx.dev_buy_lamports);
             if self.dev_wallet.is_none() {
                 self.dev_wallet = Some(tx.signer.clone());
+            }
+        }
+
+        if tx.is_buy && tx.success {
+            if let Some(tx_key) = tx_key {
+                self.dev_primary_candidates
+                    .push_back(dev_buy_candidate(tx, Some(tx_key)));
+                while self.dev_primary_candidates.len() > self.config.tx_key_capacity {
+                    self.dev_primary_candidates.pop_front();
+                    self.dev_primary_candidates_truncated = true;
+                }
             }
         }
 
@@ -350,6 +453,141 @@ impl TxIntelligenceEngine {
         self.fingerprint_agg
             .as_ref()
             .map(FingerprintAggregator::finalize)
+    }
+
+    #[must_use]
+    pub fn metric_contract_snapshot(
+        &self,
+        features: &TxIntelFeatures,
+    ) -> TxIntelligenceMetricContractSnapshotV1 {
+        let dev_first_observed = self.dev_first_observed_snapshot();
+        let dev_primary_v1 = self.dev_primary_snapshot();
+        let denominator = self.state.total_tx;
+        let exact_ratio = (denominator > 0).then_some(features.same_ms_tx_ratio);
+        let cluster_ratio = (denominator > 0).then_some(features.bundle_suspicion_ratio);
+        let preferred = features.top3_signer_volume_ratio;
+        let alias = (features.tx_count > 0 && features.total_volume_sol > 0.0)
+            .then_some(features.top3_volume_pct);
+        let effective = preferred.or(alias);
+
+        TxIntelligenceMetricContractSnapshotV1 {
+            producer_dust_filter_sol: self.config.min_sol_threshold,
+            producer_dedupe_capacity: u64::try_from(self.config.tx_key_capacity)
+                .unwrap_or(u64::MAX),
+            dev_first_observed,
+            dev_primary_v1,
+            exact_same_ms: TxTimingProducerSnapshotV1 {
+                numerator: self.state.same_ms_tx_count,
+                denominator,
+                ratio: exact_ratio,
+                canonical_dedupe_applied: true,
+                dust_filter_sol: Some(self.config.min_sol_threshold),
+                window_ms: None,
+                fallback_timestamp_count: self.timing_fallback_timestamp_count,
+                fallback_ordering_count: self.timing_fallback_ordering_count,
+                source_complete: !self.tx_key_history_truncated,
+                source_state_capacity: Some(
+                    u64::try_from(self.config.tx_key_capacity).unwrap_or(u64::MAX),
+                ),
+            },
+            cluster_lt_50ms: TxTimingProducerSnapshotV1 {
+                numerator: self.state.bundle_suspicion_count,
+                denominator,
+                ratio: cluster_ratio,
+                canonical_dedupe_applied: true,
+                dust_filter_sol: Some(self.config.min_sol_threshold),
+                window_ms: None,
+                fallback_timestamp_count: self.timing_fallback_timestamp_count,
+                fallback_ordering_count: self.timing_fallback_ordering_count,
+                source_complete: !self.tx_key_history_truncated,
+                source_state_capacity: Some(
+                    u64::try_from(self.config.tx_key_capacity).unwrap_or(u64::MAX),
+                ),
+            },
+            top3: Top3ProducerSnapshotV1 {
+                preferred_ratio: preferred,
+                compatibility_alias_ratio: alias,
+                effective_ratio: effective,
+                preferred_alias_bitwise_equal: match (preferred, alias) {
+                    (Some(left), Some(right)) => Some(left.to_bits() == right.to_bits()),
+                    _ => None,
+                },
+                used_compatibility_fallback: preferred.is_none() && alias.is_some(),
+            },
+        }
+    }
+
+    fn dev_first_observed_snapshot(&self) -> DevBuyProducerSnapshotV1 {
+        let creator_known = self.dev_wallet.is_some();
+        let selected = self
+            .dev_wallet
+            .as_ref()
+            .and_then(|creator| self.signer_stats.get(creator))
+            .and_then(|stats| stats.first_buy_record.as_ref());
+        dev_snapshot_from_candidate(
+            selected,
+            creator_known,
+            self.pool_create_signature.clone(),
+            false,
+            if selected.is_some() {
+                DevBuySelectionModeV1::LegacyFirstObserved
+            } else {
+                DevBuySelectionModeV1::NoEligibleBuy
+            },
+            u64::from(selected.is_some()),
+            true,
+        )
+    }
+
+    fn dev_primary_snapshot(&self) -> DevBuyProducerSnapshotV1 {
+        let Some(creator) = self.dev_wallet.as_deref() else {
+            return dev_snapshot_from_candidate(
+                None,
+                false,
+                self.pool_create_signature.clone(),
+                false,
+                DevBuySelectionModeV1::NoEligibleBuy,
+                0,
+                !self.dev_primary_candidates_truncated,
+            );
+        };
+        let eligible = self
+            .dev_primary_candidates
+            .iter()
+            .filter(|candidate| candidate.signer == creator)
+            .collect::<Vec<_>>();
+        let signature_match = self
+            .pool_create_signature
+            .as_deref()
+            .and_then(|create_signature| {
+                eligible
+                    .iter()
+                    .copied()
+                    .filter(|candidate| candidate.signature == create_signature)
+                    .min_by(|left, right| left.tx_key.cmp(&right.tx_key))
+            });
+        let selected = signature_match.or_else(|| {
+            eligible
+                .iter()
+                .copied()
+                .min_by(|left, right| left.tx_key.cmp(&right.tx_key))
+        });
+        let selection_mode = if signature_match.is_some() {
+            DevBuySelectionModeV1::CreateSignatureMatch
+        } else if selected.is_some() {
+            DevBuySelectionModeV1::EarliestEligibleCreatorBuy
+        } else {
+            DevBuySelectionModeV1::NoEligibleBuy
+        };
+        dev_snapshot_from_candidate(
+            selected,
+            true,
+            self.pool_create_signature.clone(),
+            signature_match.is_some(),
+            selection_mode,
+            eligible.len() as u64,
+            !self.dev_primary_candidates_truncated,
+        )
     }
 
     fn risk_flags_for_features(&self, features: &TxIntelFeatures) -> Vec<RiskFlag> {
@@ -729,6 +967,7 @@ impl TxIntelligenceEngine {
         while self.tx_keys_fifo.len() > self.config.tx_key_capacity {
             if let Some(oldest) = self.tx_keys_fifo.pop_front() {
                 self.tx_keys_seen.remove(&oldest);
+                self.tx_key_history_truncated = true;
             }
         }
     }
@@ -745,6 +984,48 @@ fn risk_flag(
         severity,
         detected_at_ms,
         detail,
+    }
+}
+
+fn non_blank(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty() && value != "unknown").then(|| value.to_string())
+}
+
+fn dev_buy_candidate(tx: &PoolTransaction, tx_key: Option<TxKey>) -> DevBuyCandidateV1 {
+    DevBuyCandidateV1 {
+        tx_key,
+        signer: tx.signer.clone(),
+        signature: tx.signature.clone(),
+        slot: tx.slot,
+        transaction_index: tx.tx_index.or(tx.event_ordinal),
+        amount_sol: tx.volume_sol,
+        success: tx.success,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dev_snapshot_from_candidate(
+    candidate: Option<&DevBuyCandidateV1>,
+    creator_known: bool,
+    create_signature: Option<String>,
+    create_signature_matched: bool,
+    selection_mode: DevBuySelectionModeV1,
+    eligible_buy_count: u64,
+    selection_complete: bool,
+) -> DevBuyProducerSnapshotV1 {
+    DevBuyProducerSnapshotV1 {
+        amount_sol: candidate.map(|value| value.amount_sol),
+        creator_known,
+        create_signature,
+        create_signature_matched,
+        selection_mode,
+        selected_signature: candidate.map(|value| value.signature.clone()),
+        selected_slot: candidate.and_then(|value| value.slot),
+        selected_transaction_index: candidate.and_then(|value| value.transaction_index),
+        eligible_buy_count,
+        selected_success: candidate.map(|value| value.success),
+        selection_complete,
     }
 }
 
@@ -798,6 +1079,12 @@ fn tx_key_for(tx: &PoolTransaction) -> Option<TxKey> {
         fallback_counter,
     )
     .ok()
+}
+
+pub(crate) fn tx_has_stable_timing_order_identity(tx: &PoolTransaction) -> bool {
+    (!tx.signature.trim().is_empty() && Signature::from_str(&tx.signature).is_ok())
+        || tx.event_ordinal.is_some()
+        || tx.tx_index.is_some()
 }
 
 fn fallback_counter_for_tx(tx: &PoolTransaction, event_ts_ms: u64) -> u64 {

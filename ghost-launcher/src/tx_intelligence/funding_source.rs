@@ -6,6 +6,7 @@ use crate::oracle_metrics::{
     record_fsc_prune_duration_ms, record_fsc_warmup_ready,
 };
 use ghost_brain::config::{FscV2Config, GatekeeperV2Config};
+use ghost_core::metric_contracts::{CanonicalHashErrorV1, CanonicalHashV1};
 use ghost_core::tx_intelligence::types::{
     FscAttributionScope, FscEvidenceStatus, FscExcludedReason, FscMissClass, FscSnapshotMode,
     FscV2Evidence, FscVersion, FundingSourceCount, FundingSourceDiagnostics, FundingSourceKey,
@@ -26,6 +27,7 @@ const FSC_V2_PROVIDER_LEGACY_ROLLING_INDEX: &str = "ghost_legacy_rolling_funding
 const FSC_V2_PROVIDER_NLN_PROGRAM_STREAMS: &str = "nln_program_streams";
 const FSC_V2_TOPIC_LEGACY_FUNDING_TRANSFERS: &str = "ghost.funding_transfers";
 const FSC_V2_TOPIC_NLN_SYSTEM_TRANSFERS: &str = "prod.rpc.solana.system.transfers";
+pub(crate) const FSC_LEGACY_MIN_KNOWN_SOURCE_SAMPLES_V1: u64 = 2;
 
 fn funding_transfer_can_feed_capture_index(transfer: &FundingTransferObserved) -> bool {
     transfer.full_chain_coverage
@@ -50,6 +52,49 @@ pub struct FundingSourceConfig {
     pub min_known_coverage: f64,
     pub min_non_neutral_known_coverage: f64,
     neutral_funding_sources: HashSet<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FundingSourceSameSlotOrderingPolicyV1 {
+    RequireTxIndex,
+    RequireTxIndexElseUnavailable,
+}
+
+impl FundingSourceSameSlotOrderingPolicyV1 {
+    #[must_use]
+    pub const fn metric_contract_value(self) -> &'static str {
+        match self {
+            Self::RequireTxIndex => "require_tx_index",
+            Self::RequireTxIndexElseUnavailable => "require_tx_index_else_unavailable",
+        }
+    }
+}
+
+/// Minimal frozen settings snapshot carried from the actual FSC runtime owners
+/// to the PR2A evidence boundary. The producer fingerprint remains owned by
+/// this module; callers must not reconstruct it from ad-hoc strings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FundingSourceProducerConfigSnapshotV1 {
+    producer_config_hash: String,
+    warmup_window_ms: u64,
+    same_slot_ordering_policy: FundingSourceSameSlotOrderingPolicyV1,
+}
+
+impl FundingSourceProducerConfigSnapshotV1 {
+    #[must_use]
+    pub fn producer_config_hash(&self) -> &str {
+        &self.producer_config_hash
+    }
+
+    #[must_use]
+    pub const fn warmup_window_ms(&self) -> u64 {
+        self.warmup_window_ms
+    }
+
+    #[must_use]
+    pub const fn same_slot_ordering_policy(&self) -> FundingSourceSameSlotOrderingPolicyV1 {
+        self.same_slot_ordering_policy
+    }
 }
 
 impl FundingSourceConfig {
@@ -111,6 +156,60 @@ impl FundingSourceConfig {
     fn is_neutral_source(&self, wallet: &str) -> bool {
         self.neutral_funding_sources.contains(wallet)
     }
+
+    pub fn metric_contract_neutral_funder_set_hash(
+        &self,
+    ) -> Result<Option<CanonicalHashV1>, CanonicalHashErrorV1> {
+        if self.neutral_funding_sources.is_empty() {
+            return Ok(None);
+        }
+        let mut sources = self
+            .neutral_funding_sources
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        sources.sort();
+        CanonicalHashV1::digest(&sources).map(Some)
+    }
+
+    #[must_use]
+    pub fn metric_contract_producer_config_hash(&self) -> String {
+        funding_source_config_hash(self)
+    }
+
+    #[must_use]
+    pub fn metric_contract_neutral_funder_set_producer_hash(&self) -> Option<String> {
+        neutral_funder_set_hash(self)
+    }
+
+    pub fn metric_contract_producer_config_snapshot(
+        &self,
+        fsc_v2: Option<&FscV2Config>,
+    ) -> anyhow::Result<FundingSourceProducerConfigSnapshotV1> {
+        let (warmup_window_ms, same_slot_ordering_policy) = match fsc_v2 {
+            Some(config) => {
+                let warmup_window_ms =
+                    config.warmup_window_s.checked_mul(1_000).ok_or_else(|| {
+                        anyhow::anyhow!("fsc_v2.warmup_window_s overflows milliseconds")
+                    })?;
+                let same_slot_ordering_policy =
+                    match config.same_slot_cross_signature_policy.as_str() {
+                        "require_tx_index" => FundingSourceSameSlotOrderingPolicyV1::RequireTxIndex,
+                        _ => anyhow::bail!("unsupported fsc_v2.same_slot_cross_signature_policy"),
+                    };
+                (warmup_window_ms, same_slot_ordering_policy)
+            }
+            None => (
+                0,
+                FundingSourceSameSlotOrderingPolicyV1::RequireTxIndexElseUnavailable,
+            ),
+        };
+        Ok(FundingSourceProducerConfigSnapshotV1 {
+            producer_config_hash: self.metric_contract_producer_config_hash(),
+            warmup_window_ms,
+            same_slot_ordering_policy,
+        })
+    }
 }
 
 fn unit_interval_to_bps(value: f64) -> u16 {
@@ -123,6 +222,8 @@ fn unit_interval_to_bps(value: f64) -> u16 {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FscComputation {
     pub funding_source_concentration: Option<f64>,
+    pub distinct_known_source_count: u64,
+    pub known_source_sample_count: u64,
     pub funding_source_v2: FscV2Evidence,
     pub degraded_reasons: Vec<String>,
     pub diagnostics: FundingSourceDiagnostics,
@@ -1039,6 +1140,8 @@ impl FundingSourceIndex {
             );
             return FscComputation {
                 funding_source_concentration: None,
+                distinct_known_source_count: 0,
+                known_source_sample_count: 0,
                 funding_source_v2,
                 degraded_reasons: vec![FSC_FUNDING_STREAM_UNAVAILABLE_REASON.to_string()],
                 diagnostics,
@@ -1060,6 +1163,8 @@ impl FundingSourceIndex {
             );
             return FscComputation {
                 funding_source_concentration: None,
+                distinct_known_source_count: 0,
+                known_source_sample_count: 0,
                 funding_source_v2,
                 degraded_reasons: vec![FSC_ROLLING_STATE_UNAVAILABLE_REASON.to_string()],
                 diagnostics,
@@ -1150,20 +1255,27 @@ impl FundingSourceIndex {
             source_topics,
         );
 
-        if known_sources.len() < 2 {
+        let distinct_known_sources = known_sources.iter().collect::<HashSet<_>>().len();
+        let distinct_known_source_count = distinct_known_sources as u64;
+        let known_source_sample_count = known_sources.len() as u64;
+
+        if known_source_sample_count < FSC_LEGACY_MIN_KNOWN_SOURCE_SAMPLES_V1 {
             return FscComputation {
                 funding_source_concentration: None,
+                distinct_known_source_count,
+                known_source_sample_count,
                 funding_source_v2,
                 degraded_reasons: vec![FSC_INSUFFICIENT_KNOWN_SOURCES_REASON.to_string()],
                 diagnostics,
             };
         }
 
-        let distinct_known_sources = known_sources.iter().collect::<HashSet<_>>().len();
         FscComputation {
             funding_source_concentration: Some(
                 1.0 - (distinct_known_sources as f64 / known_sources.len() as f64),
             ),
+            distinct_known_source_count,
+            known_source_sample_count,
             funding_source_v2,
             degraded_reasons: Vec::new(),
             diagnostics,
@@ -2059,6 +2171,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn metric_contract_producer_fingerprint_is_sensitive_to_every_owned_setting() {
+        let base = config();
+        let base_hash = base.metric_contract_producer_config_hash();
+        let mut variants = Vec::new();
+
+        let mut changed = base.clone();
+        changed.lookback_window_ms += 1;
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.min_abs_store_lamports += 1;
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.min_abs_attribution_lamports += 1;
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.min_rel_to_buy = 0.25;
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.min_attribution_confidence_bps += 1;
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.per_recipient_cap += 1;
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.global_recipient_cap += 1;
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.neutral_funder_set_version = Some("v2".to_string());
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.min_total_buyers += 1;
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.min_known_non_neutral_buyers += 1;
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.min_known_coverage = 0.75;
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.min_non_neutral_known_coverage = 0.75;
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed
+            .neutral_funding_sources
+            .insert("neutral-source-a".to_string());
+        variants.push(changed);
+
+        for changed in variants {
+            assert_ne!(changed.metric_contract_producer_config_hash(), base_hash);
+        }
+    }
+
     fn buy_tx(signer: &str, signature: &str, timestamp_ms: u64) -> PoolTransaction {
         PoolTransaction {
             semantic: EventSemanticEnvelope::default(),
@@ -2200,6 +2365,8 @@ mod tests {
                 .expect("fsc should be materialized"),
             2.0 / 3.0,
         );
+        assert_eq!(computed.distinct_known_source_count, 1);
+        assert_eq!(computed.known_source_sample_count, 3);
         assert!(computed.degraded_reasons.is_empty());
     }
 
@@ -2329,6 +2496,8 @@ mod tests {
         let computed = index.compute_for_transactions(buys.iter(), &config);
 
         assert_eq!(computed.funding_source_concentration, None);
+        assert_eq!(computed.distinct_known_source_count, 1);
+        assert_eq!(computed.known_source_sample_count, 1);
         assert_eq!(
             computed.degraded_reasons,
             vec![FSC_INSUFFICIENT_KNOWN_SOURCES_REASON.to_string()]
