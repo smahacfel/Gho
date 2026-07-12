@@ -2,6 +2,7 @@ pub mod analysis;
 pub mod config;
 pub mod cross_pool_velocity;
 pub mod engine;
+pub mod flip_v2;
 pub mod funding_source;
 pub mod sybil_metrics;
 
@@ -17,6 +18,7 @@ pub use engine::{
     DevBuyProducerSnapshotV1, Top3ProducerSnapshotV1, TxIntelligenceEngine,
     TxIntelligenceMetricContractSnapshotV1, TxTimingProducerSnapshotV1,
 };
+pub use flip_v2::{FlipV2ProducerConfigSnapshotV1, FlipV2ProducerSnapshotV1, FlipV2StateMachineV1};
 pub(crate) use funding_source::FSC_LEGACY_MIN_KNOWN_SOURCE_SAMPLES_V1;
 pub use funding_source::{
     funding_lookup_wallets, FscComputation, FundingSourceConfig, FundingSourceIndex,
@@ -24,7 +26,8 @@ pub use funding_source::{
 };
 pub use sybil_metrics::{
     compute_dbia, compute_des, compute_ftdi, compute_sfd, compute_sybil_resistance,
-    DbiaComputation, DesComputation, FtdiComputation, SfdComputation,
+    compute_sybil_resistance_with_ftdi, DbiaComputation, DesComputation, FtdiComputation,
+    SfdComputation, SybilResistanceComputationV1,
 };
 pub(crate) use sybil_metrics::{
     MIN_CLEAN_BUY_SAMPLE_COUNT, MIN_CLEAN_UNIQUE_BUYER_SAMPLE_COUNT_V2, MIN_DIAGNOSTIC_SAMPLE_COUNT,

@@ -5,9 +5,10 @@ use crate::components::gatekeeper::{
 };
 use crate::events::PoolTransaction;
 use crate::tx_intelligence::{
-    compute_sybil_resistance, compute_velocity_profile, CrossPoolVelocityConfig,
-    CrossPoolVelocityIndex, FundingSourceConfig, FundingSourceIndex, TxIntelligenceConfig,
-    TxIntelligenceEngine, TxTimingProducerSnapshotV1,
+    compute_sybil_resistance_with_ftdi, compute_velocity_profile, CrossPoolVelocityConfig,
+    CrossPoolVelocityIndex, FundingSourceConfig, FundingSourceIndex,
+    FundingSourceProducerConfigSnapshotV1, TxIntelligenceConfig, TxIntelligenceEngine,
+    TxTimingProducerSnapshotV1,
 };
 use ghost_brain::config::GatekeeperV2Config;
 use ghost_brain::fast_pipeline::EnhancedCandidate;
@@ -25,6 +26,10 @@ use ghost_core::checkpoint::{
     TemporalAnchorSnapshot, TemporalDeltaFeatures, TemporalMetricEvidenceContext,
     TemporalMetricSource, TxSegmentSequence,
 };
+use ghost_core::metric_contracts::{
+    MetricContractDecisionSourceCutoffV1, MetricContractProfileErrorV1, MetricContractProfileV1,
+    MetricContractProjectionErrorV1, ResolvedMetricContractEffectiveConfigV1,
+};
 use ghost_core::session::types::{
     SessionDiagnostics, SessionId, SessionMetadata, SessionStatus, VerdictOutcome,
 };
@@ -37,9 +42,22 @@ use solana_sdk::pubkey::Pubkey;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use thiserror::Error;
 
 pub type SharedSession = Arc<RwLock<PoolObservationSession>>;
 pub(crate) const RCE_RECENT_WINDOW_MS_V1: u64 = 10_000;
+
+#[derive(Debug, Error)]
+pub enum MetricContractMaterializationErrorV1 {
+    #[error("metric-contract materialization context is unavailable: {0}")]
+    MissingContext(&'static str),
+    #[error(transparent)]
+    Profile(#[from] MetricContractProfileErrorV1),
+    #[error(transparent)]
+    Projection(#[from] MetricContractProjectionErrorV1),
+    #[error(transparent)]
+    Producer(#[from] crate::metric_contracts::Pr2bProducerErrorV1),
+}
 
 #[derive(Debug, Clone, Copy)]
 struct TemporalCarryForwardRuntimeConfig {
@@ -86,6 +104,8 @@ struct RceWindowStats {
     unique_ratio: Option<f64>,
     top3_signer_volume_ratio: Option<f64>,
     buy_sell_ratio: Option<f64>,
+    buy_count: u64,
+    sell_count: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -117,6 +137,9 @@ pub struct PoolObservationSession {
     pub cross_pool_velocity_config: CrossPoolVelocityConfig,
     pub funding_source_index: Arc<FundingSourceIndex>,
     pub funding_source_config: FundingSourceConfig,
+    metric_contract_effective_config: Option<Arc<ResolvedMetricContractEffectiveConfigV1>>,
+    metric_contract_funding_source_producer_config:
+        Option<Arc<FundingSourceProducerConfigSnapshotV1>>,
     temporal_carry_forward_config: TemporalCarryForwardRuntimeConfig,
     decision_time_series_tx_capacity: usize,
     decision_time_series_retention_policy: DecisionTimeSeriesRetentionPolicy,
@@ -183,6 +206,24 @@ impl PoolObservationSession {
             (created_at_wall_ms, "registered_wall")
         };
         gatekeeper_buffer.set_curve_t0_with_source(curve_t0, curve_t0_source);
+        let default_funding_source_config =
+            FundingSourceConfig::from_gatekeeper_config(gatekeeper_config);
+        let local_metric_contract_context =
+            crate::metric_contracts::resolve_metric_contract_effective_config_v1(
+                ghost_core::metric_contracts::MetricContractFoundationConfigV1::default(),
+                gatekeeper_config,
+                &tx_intelligence_config,
+                &tx_intelligence_config.fingerprint,
+                &default_funding_source_config,
+                None,
+            )
+            .ok()
+            .and_then(|effective_config| {
+                default_funding_source_config
+                    .metric_contract_producer_config_snapshot(None)
+                    .ok()
+                    .map(|producer_config| (Arc::new(effective_config), Arc::new(producer_config)))
+            });
         let tx_intelligence =
             TxIntelligenceEngine::new(tx_intelligence_config, &candidate_snapshot, dev_wallet);
         let decision_time_series_tx_capacity =
@@ -212,7 +253,12 @@ impl PoolObservationSession {
                 gatekeeper_config,
             ),
             funding_source_index: Arc::new(FundingSourceIndex::new()),
-            funding_source_config: FundingSourceConfig::from_gatekeeper_config(gatekeeper_config),
+            funding_source_config: default_funding_source_config,
+            metric_contract_effective_config: local_metric_contract_context
+                .as_ref()
+                .map(|(effective_config, _)| Arc::clone(effective_config)),
+            metric_contract_funding_source_producer_config: local_metric_contract_context
+                .map(|(_, producer_config)| producer_config),
             temporal_carry_forward_config:
                 TemporalCarryForwardRuntimeConfig::from_gatekeeper_config(gatekeeper_config),
             decision_time_series_tx_capacity,
@@ -1526,6 +1572,8 @@ impl PoolObservationSession {
             } else {
                 buy_count as f64
             }),
+            buy_count,
+            sell_count,
         }
     }
 
@@ -1644,6 +1692,54 @@ impl PoolObservationSession {
                 u64::try_from(self.decision_time_series_tx_capacity).unwrap_or(u64::MAX),
             ),
         }
+    }
+
+    pub fn metric_contract_recent_buy_sell_snapshot(
+        &self,
+    ) -> Result<
+        crate::metric_contracts::RecentBuySellProducerSnapshotV1,
+        MetricContractMaterializationErrorV1,
+    > {
+        let sorted_txs = self.temporal_sorted_transactions();
+        let source_complete = u64::try_from(self.tx_buffer.len())
+            .is_ok_and(|retained| retained == self.diagnostics.total_tx_seen);
+        let (Some((_, _, first_ts_ms)), Some((_, _, last_ts_ms))) =
+            (sorted_txs.first(), sorted_txs.last())
+        else {
+            return Ok(crate::metric_contracts::RecentBuySellProducerSnapshotV1 {
+                window_ms: RCE_RECENT_WINDOW_MS_V1,
+                buy_count: 0,
+                sell_count: 0,
+                transaction_count: 0,
+                failed_transaction_count: 0,
+                source_complete,
+            });
+        };
+        let recent_start = last_ts_ms
+            .saturating_sub(RCE_RECENT_WINDOW_MS_V1)
+            .max(*first_ts_ms);
+        let recent = Self::rce_window_stats(&sorted_txs, recent_start, *last_ts_ms);
+        let failed_transaction_count = u64::try_from(
+            sorted_txs
+                .iter()
+                .filter(|(_, tx, ts_ms)| {
+                    !tx.success && *ts_ms >= recent_start && *ts_ms <= *last_ts_ms
+                })
+                .count(),
+        )
+        .map_err(|_| {
+            crate::metric_contracts::Pr2bProducerErrorV1::CountOverflow(
+                "recent failed transactions",
+            )
+        })?;
+        Ok(crate::metric_contracts::RecentBuySellProducerSnapshotV1 {
+            window_ms: RCE_RECENT_WINDOW_MS_V1,
+            buy_count: recent.buy_count,
+            sell_count: recent.sell_count,
+            transaction_count: recent.tx_count,
+            failed_transaction_count,
+            source_complete,
+        })
     }
 
     fn temporal_anchor_raw_values<'a>(
@@ -2605,8 +2701,9 @@ impl PoolObservationSession {
         }
     }
 
-    #[must_use]
-    pub fn materialize_features(&self) -> MaterializedFeatureSet {
+    pub fn try_materialize_features(
+        &self,
+    ) -> Result<MaterializedFeatureSet, MetricContractMaterializationErrorV1> {
         let account_features = self.current_account_features();
         let mut materialized = self.feature_builder.materialize(
             account_features.clone(),
@@ -2667,7 +2764,8 @@ impl PoolObservationSession {
             materialized.checkpoint_features.bonding_progress = fallback_bonding_progress;
         }
 
-        if let Some(fingerprint) = self.fingerprint_metrics() {
+        let fingerprint_metrics = self.fingerprint_metrics();
+        if let Some(fingerprint) = fingerprint_metrics.as_ref() {
             materialized.alpha_fingerprint = AlphaFingerprintFeatures {
                 avg_inner_ix_count_50tx: fingerprint.avg_inner_ix_count_50tx,
                 avg_cpi_depth_50tx: fingerprint.avg_cpi_depth_50tx,
@@ -2688,10 +2786,11 @@ impl PoolObservationSession {
                 .find(|tx| tx.is_buy && tx.success && tx.is_dev_buy)
                 .map(|tx| tx.signer.clone())
         });
-        let sybil = compute_sybil_resistance(
+        let sybil_computation = compute_sybil_resistance_with_ftdi(
             self.tx_buffer.iter().map(AsRef::as_ref),
             sybil_dev_wallet.as_deref(),
         );
+        let sybil = &sybil_computation.features;
         materialized.sybil_resistance.fee_topology_diversity_index =
             sybil.fee_topology_diversity_index;
         materialized
@@ -2699,7 +2798,7 @@ impl PoolObservationSession {
             .dev_buyer_infrastructure_affinity = sybil.dev_buyer_infrastructure_affinity;
         materialized.sybil_resistance.spend_fraction_divergence = sybil.spend_fraction_divergence;
         materialized.sybil_resistance.demand_elasticity_score = sybil.demand_elasticity_score;
-        materialized.sybil_resistance.degraded_reasons = sybil.degraded_reasons;
+        materialized.sybil_resistance.degraded_reasons = sybil.degraded_reasons.clone();
         materialized.sybil_resistance.buy_sample_count = sybil.buy_sample_count;
         materialized.sybil_resistance.signer_sample_count = sybil.signer_sample_count;
 
@@ -2759,14 +2858,17 @@ impl PoolObservationSession {
             fsc.funding_source_concentration;
         materialized.sybil_resistance.funding_source_diagnostics = Some(fsc.diagnostics.clone());
         materialized.sybil_resistance.funding_source_v2 = Some(fsc.funding_source_v2.clone());
-        for reason in fsc.degraded_reasons {
+        for reason in &fsc.degraded_reasons {
             if !materialized
                 .sybil_resistance
                 .degraded_reasons
                 .iter()
-                .any(|existing| existing == &reason)
+                .any(|existing| existing == reason)
             {
-                materialized.sybil_resistance.degraded_reasons.push(reason);
+                materialized
+                    .sybil_resistance
+                    .degraded_reasons
+                    .push(reason.clone());
             }
         }
 
@@ -2780,7 +2882,85 @@ impl PoolObservationSession {
         materialized.session_regime_snapshot_v1 = self.materialize_rce_session_regime_snapshot();
         materialized.evidence_status = self.materialize_v3_evidence_status(&materialized);
 
-        materialized
+        let effective_config = self.metric_contract_effective_config.as_deref().ok_or(
+            MetricContractMaterializationErrorV1::MissingContext("effective config"),
+        )?;
+        let funding_source_producer_config = self
+            .metric_contract_funding_source_producer_config
+            .as_deref()
+            .ok_or(MetricContractMaterializationErrorV1::MissingContext(
+                "FSC producer config",
+            ))?;
+        let profile = MetricContractProfileV1::profile_a()?;
+        let source_cutoff = MetricContractDecisionSourceCutoffV1::try_new(
+            self.highest_seen_ts_ms
+                .max(self.candidate_snapshot.timestamp)
+                .max(self.created_at_wall_ms),
+            self.tx_buffer
+                .iter()
+                .filter_map(|tx| tx.slot)
+                .max()
+                .or(self.candidate_snapshot.slot),
+        )?;
+        let tx_intelligence = self
+            .tx_intelligence
+            .metric_contract_snapshot(&materialized.tx_intel_features);
+        let gatekeeper_dev_primary = self
+            .gatekeeper_buffer
+            .metric_contract_dev_primary_compatibility_snapshot();
+        let recent_exact_timing = self.metric_contract_recent_exact_timing_snapshot();
+        let recent_buy_sell = self.metric_contract_recent_buy_sell_snapshot()?;
+        let decision_timestamp_ms = source_cutoff.decision_timestamp_ms.get();
+        let decision_slot = match &source_cutoff.decision_slot {
+            ghost_core::metric_contracts::CanonicalNullableV1::Value(value) => Some(value.get()),
+            ghost_core::metric_contracts::CanonicalNullableV1::Null => None,
+        };
+        let flip_v2 = self
+            .tx_intelligence
+            .flip_v2_snapshot(decision_timestamp_ms, decision_slot);
+        let reserve_velocity = self
+            .account_state_core
+            .metric_contract_reserve_velocity_snapshot(&self.base_mint);
+        let legacy_flip_ratio = fingerprint_metrics
+            .as_ref()
+            .and_then(|fingerprint| fingerprint.flipper_presence_ratio);
+        let complete = crate::metric_contracts::build_pr2b_complete_metric_contract_snapshot_v1(
+            crate::metric_contracts::Pr2bFrozenProducerInputsV1 {
+                pr2a: crate::metric_contracts::Pr2aFrozenProducerInputsV1 {
+                    ftdi: &sybil_computation.ftdi,
+                    tx_intelligence: &tx_intelligence,
+                    gatekeeper_dev_primary: &gatekeeper_dev_primary,
+                    recent_exact_timing: &recent_exact_timing,
+                    fsc: &fsc,
+                    funding_source_config: &self.funding_source_config,
+                    funding_source_producer_config,
+                },
+                legacy_flip_ratio,
+                flip_v2: &flip_v2,
+                manipulation: &materialized.manipulation_contradictions,
+                reserve_velocity: &reserve_velocity,
+                recent_buy_sell: &recent_buy_sell,
+            },
+            &crate::metric_contracts::Pr2bBuildContextV1 {
+                rollout_mode: effective_config.payload.rollout_mode,
+                profile: &profile,
+                effective_config,
+                source_cutoff,
+            },
+        )?;
+        materialized.metric_contract_decision_projection_v1 = Some(complete.compact_projection);
+
+        Ok(materialized)
+    }
+
+    /// Compatibility facade for existing callers. Active terminal runtime
+    /// paths use `try_materialize_features` and propagate its typed error.
+    #[must_use]
+    pub fn materialize_features(&self) -> MaterializedFeatureSet {
+        match self.try_materialize_features() {
+            Ok(features) => features,
+            Err(error) => panic!("metric-contract materialization failed closed: {error}"),
+        }
     }
 
     #[must_use]
@@ -2889,6 +3069,19 @@ impl PoolObservationSession {
 
     pub fn set_funding_source_config(&mut self, config: FundingSourceConfig) {
         self.funding_source_config = config;
+    }
+
+    pub fn set_metric_contract_context(
+        &mut self,
+        effective_config: Arc<ResolvedMetricContractEffectiveConfigV1>,
+        funding_source_producer_config: Arc<FundingSourceProducerConfigSnapshotV1>,
+    ) {
+        self.metric_contract_effective_config = Some(effective_config);
+        self.metric_contract_funding_source_producer_config = Some(funding_source_producer_config);
+    }
+
+    pub fn mark_metric_contract_stream_gap(&mut self) {
+        self.tx_intelligence.mark_flip_v2_reconnect_gap();
     }
 
     #[must_use]

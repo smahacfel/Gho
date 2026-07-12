@@ -1,9 +1,12 @@
 use super::{
     CanonicalHashErrorV1, CanonicalHashV1, CanonicalMetricEnvelopeV1, CanonicalNullableV1,
-    CanonicalU64StringV1, DevBuyContractEvidenceV1, DevBuySelectionModeV1, FscStatusEvidenceV1,
-    FtdiEvidenceV1, FundingSourceContractEvidenceV1, ManipulationComparatorV1,
-    MetricAuthorityClass, MetricContractEffectiveConfigErrorV1, MetricContractId,
-    MetricContractProfileIdV1, MetricContractProfileV1, MetricContractRolloutMode,
+    CanonicalU64StringV1, DevBuyContractEvidenceV1, DevBuySelectionModeV1,
+    FlipRatioContractEvidenceV1, FscStatusEvidenceV1, FtdiEvidenceV1,
+    FundingSourceContractEvidenceV1, ManipulationComparatorV1, ManipulationNumericEvidenceV2,
+    ManipulationNumericFieldEvidenceV2, ManipulationNumericFieldIdV2, MetricAuthorityClass,
+    MetricAvailabilityV1, MetricContractEffectiveConfigErrorV1,
+    MetricContractEvidenceSemanticErrorV1, MetricContractId, MetricContractProfileIdV1,
+    MetricContractProfileV1, MetricContractRolloutMode, MetricContractsEvidenceSetV1,
     MetricEffectiveConfigKeyV1, MetricEffectiveConfigValueV1, MetricEvidenceEnvelopeErrorV1,
     MetricEvidenceReasonV1, MetricMeasurementQualityV1, MetricRolloutRoleV1, MetricSurfaceId,
     RecentBuySellEvidenceV1, ReserveVelocitySourceClockV1, ReserveVelocityStatusV1,
@@ -19,6 +22,8 @@ use thiserror::Error;
 pub const METRIC_CONTRACT_DECISION_PROJECTION_SCHEMA_VERSION_V1: u16 = 1;
 pub const METRIC_DECISION_MAX_REASON_CODES_PER_VALUE_V1: usize = 8;
 pub const METRIC_CONTRACT_PRODUCER_SCHEMA_VERSION_V1: u16 = 1;
+pub const METRIC_CONTRACT_PROJECTION_SERIALIZED_HARD_MAX_BYTES_V1: usize = 16 * 1024;
+pub const METRIC_CONTRACT_PROJECTION_SERIALIZED_P95_TARGET_BYTES_V1: usize = 12 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -217,8 +222,8 @@ pub struct FscStatusDecisionProjectionV1 {
     pub fsc_v2_coverage: CanonicalNullableV1<f64>,
 }
 
-// PR2B projection schema slots are defined here so the root is closed. PR2A
-// intentionally provides no producers or family builders for these types.
+// PR2B compact family schemas. Full owner/event collections stay in durable
+// evidence; these closed types contain only decision-time aggregates.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FlipDecisionProjectionV1 {
@@ -302,14 +307,37 @@ impl MetricContractDecisionEvidenceProjectionV1 {
         context: &MetricDecisionProjectionBuildContextV1<'_>,
     ) -> Result<CanonicalHashV1, MetricContractProjectionErrorV1> {
         self.validate_context(context)?;
+        let serialized_bytes = self.deterministic_serialized_size_bytes()?;
+        if serialized_bytes > METRIC_CONTRACT_PROJECTION_SERIALIZED_HARD_MAX_BYTES_V1 {
+            return Err(MetricContractProjectionErrorV1::ProjectionTooLarge {
+                actual_bytes: serialized_bytes,
+                hard_max_bytes: METRIC_CONTRACT_PROJECTION_SERIALIZED_HARD_MAX_BYTES_V1,
+            });
+        }
         CanonicalHashV1::digest(self).map_err(MetricContractProjectionErrorV1::Hash)
+    }
+
+    pub fn deterministic_serialized_size_bytes(
+        &self,
+    ) -> Result<usize, MetricContractProjectionErrorV1> {
+        bincode::serialize(self)
+            .map(|bytes| bytes.len())
+            .map_err(|_| MetricContractProjectionErrorV1::ProjectionSerialization)
     }
 
     pub fn validate_context(
         &self,
         context: &MetricDecisionProjectionBuildContextV1<'_>,
     ) -> Result<(), MetricContractProjectionErrorV1> {
-        context.validate()?;
+        let profile_hash = context.validate_and_profile_hash()?;
+        self.validate_context_with_validated_context(context, &profile_hash)
+    }
+
+    fn validate_context_with_validated_context(
+        &self,
+        context: &MetricDecisionProjectionBuildContextV1<'_>,
+        profile_hash: &CanonicalHashV1,
+    ) -> Result<(), MetricContractProjectionErrorV1> {
         if self.schema_version != METRIC_CONTRACT_DECISION_PROJECTION_SCHEMA_VERSION_V1 {
             return Err(
                 MetricContractProjectionErrorV1::UnsupportedProjectionSchema(self.schema_version),
@@ -317,7 +345,7 @@ impl MetricContractDecisionEvidenceProjectionV1 {
         }
         if self.rollout_mode != context.rollout_mode
             || self.profile_id != context.profile.payload().profile_id
-            || self.profile_hash != context.profile.canonical_hash()?
+            || self.profile_hash != *profile_hash
             || self.metric_contract_effective_config_hash
                 != context
                     .effective_config
@@ -456,6 +484,16 @@ impl MetricContractDecisionEvidenceProjectionV1 {
             MetricContractProducerIdV1::MaterializedFscStatusAdapter,
             context,
         )?;
+        self.flip_ratio.legacy_slot_gap_ratio.validate(
+            MetricSurfaceId::EarlyFingerprintFlipRatioLegacySlotGap,
+            MetricContractProducerIdV1::TxIntelligenceFingerprintAggregator,
+            context,
+        )?;
+        self.flip_ratio.hybrid_v2_ratio.validate(
+            MetricSurfaceId::FlipRatioHybridEvidenceV2,
+            MetricContractProducerIdV1::TxIntelligenceFingerprintAggregator,
+            context,
+        )?;
         self.reserve_velocity.legacy_velocity.validate(
             MetricSurfaceId::AccountStateReserveVelocityScalarLegacy,
             MetricContractProducerIdV1::AccountStateCore,
@@ -515,6 +553,11 @@ impl MetricContractDecisionEvidenceProjectionV1 {
             .validate_semantics(context)?;
         self.fsc_evidence_status
             .validate_semantics(&self.funding_source_concentration, context)?;
+        self.flip_ratio.validate_semantics(context)?;
+        self.manipulation_contradiction
+            .validate_semantics(context)?;
+        self.reserve_velocity.validate_semantics(context)?;
+        self.recent_buy_sell.validate_semantics(context)?;
         Ok(())
     }
 }
@@ -603,18 +646,25 @@ pub struct MetricDecisionProjectionBuildContextV1<'a> {
 
 impl MetricDecisionProjectionBuildContextV1<'_> {
     pub fn validate(&self) -> Result<(), MetricContractProjectionErrorV1> {
+        self.validate_and_profile_hash().map(|_| ())
+    }
+
+    fn validate_and_profile_hash(
+        &self,
+    ) -> Result<CanonicalHashV1, MetricContractProjectionErrorV1> {
         self.effective_config.validate_hash()?;
+        let profile_hash = self.profile.canonical_hash()?;
         let payload = &self.effective_config.payload;
         if payload.rollout_mode != self.rollout_mode
             || payload.profile_id != self.profile.payload().profile_id
-            || payload.profile_hash != self.profile.canonical_hash()?
+            || payload.profile_hash != profile_hash
         {
             return Err(MetricContractProjectionErrorV1::ProjectionContextMismatch);
         }
         if self.source_cutoff.decision_timestamp_ms.get() == 0 {
             return Err(MetricContractProjectionErrorV1::MissingSourceCutoff);
         }
-        Ok(())
+        Ok(profile_hash)
     }
 }
 
@@ -626,6 +676,10 @@ pub enum MetricContractProjectionErrorV1 {
     EffectiveConfig(#[from] MetricContractEffectiveConfigErrorV1),
     #[error(transparent)]
     Envelope(#[from] MetricEvidenceEnvelopeErrorV1),
+    #[error(transparent)]
+    EvidenceSemantics(#[from] MetricContractEvidenceSemanticErrorV1),
+    #[error("compact projection deterministic serialization failed")]
+    ProjectionSerialization,
     #[error("duplicate reason code in compact projection input")]
     DuplicateReasonCode,
     #[error("omitted reason count exceeds u16")]
@@ -653,6 +707,11 @@ pub enum MetricContractProjectionErrorV1 {
         key: MetricEffectiveConfigKeyV1,
         invariant: &'static str,
     },
+    #[error("compact projection serialized size {actual_bytes} exceeds hard max {hard_max_bytes}")]
+    ProjectionTooLarge {
+        actual_bytes: usize,
+        hard_max_bytes: usize,
+    },
 }
 
 fn compact_envelope(
@@ -660,7 +719,6 @@ fn compact_envelope(
     expected_surface: MetricSurfaceId,
     context: &MetricDecisionProjectionBuildContextV1<'_>,
 ) -> Result<MetricDecisionEnvelopeV1, MetricContractProjectionErrorV1> {
-    context.validate()?;
     if source.surface_id != expected_surface {
         return Err(
             MetricEvidenceEnvelopeErrorV1::UnexpectedSurfaceForEvidenceField {
@@ -692,7 +750,6 @@ fn validate_compact_envelope(
     expected_surface: MetricSurfaceId,
     context: &MetricDecisionProjectionBuildContextV1<'_>,
 ) -> Result<(), MetricContractProjectionErrorV1> {
-    context.validate()?;
     if envelope.surface_id != expected_surface {
         return Err(
             MetricEvidenceEnvelopeErrorV1::UnexpectedSurfaceForEvidenceField {
@@ -1011,6 +1068,14 @@ impl FtdiDecisionProjectionV1 {
         evidence: &FtdiEvidenceV1,
         context: &MetricDecisionProjectionBuildContextV1<'_>,
     ) -> Result<Self, MetricContractProjectionErrorV1> {
+        context.validate()?;
+        Self::try_from_evidence_with_validated_context(evidence, context)
+    }
+
+    fn try_from_evidence_with_validated_context(
+        evidence: &FtdiEvidenceV1,
+        context: &MetricDecisionProjectionBuildContextV1<'_>,
+    ) -> Result<Self, MetricContractProjectionErrorV1> {
         if evidence.legacy_value.unique_topology_count != evidence.value_v1.unique_topology_count
             || evidence.legacy_value.unique_buyer_sample_count
                 != evidence.value_v1.unique_buyer_sample_count
@@ -1164,6 +1229,14 @@ impl DevBuyDecisionProjectionV1 {
     }
 
     pub fn try_from_evidence(
+        evidence: &DevBuyContractEvidenceV1,
+        context: &MetricDecisionProjectionBuildContextV1<'_>,
+    ) -> Result<Self, MetricContractProjectionErrorV1> {
+        context.validate()?;
+        Self::try_from_evidence_with_validated_context(evidence, context)
+    }
+
+    fn try_from_evidence_with_validated_context(
         evidence: &DevBuyContractEvidenceV1,
         context: &MetricDecisionProjectionBuildContextV1<'_>,
     ) -> Result<Self, MetricContractProjectionErrorV1> {
@@ -1380,6 +1453,14 @@ impl TxTimingDecisionProjectionV1 {
         evidence: &TxTimingEvidenceV1,
         context: &MetricDecisionProjectionBuildContextV1<'_>,
     ) -> Result<Self, MetricContractProjectionErrorV1> {
+        context.validate()?;
+        Self::try_from_evidence_with_validated_context(evidence, context)
+    }
+
+    fn try_from_evidence_with_validated_context(
+        evidence: &TxTimingEvidenceV1,
+        context: &MetricDecisionProjectionBuildContextV1<'_>,
+    ) -> Result<Self, MetricContractProjectionErrorV1> {
         if evidence.legacy_exact.numerator != evidence.exact_v1.numerator
             || evidence.legacy_exact.denominator != evidence.exact_v1.denominator
             || !nullable_f64_bits_equal(&evidence.legacy_exact.ratio, &evidence.exact_v1.ratio)
@@ -1482,6 +1563,14 @@ impl Top3DecisionProjectionV1 {
         evidence: &Top3SignerVolumeEvidenceV1,
         context: &MetricDecisionProjectionBuildContextV1<'_>,
     ) -> Result<Self, MetricContractProjectionErrorV1> {
+        context.validate()?;
+        Self::try_from_evidence_with_validated_context(evidence, context)
+    }
+
+    fn try_from_evidence_with_validated_context(
+        evidence: &Top3SignerVolumeEvidenceV1,
+        context: &MetricDecisionProjectionBuildContextV1<'_>,
+    ) -> Result<Self, MetricContractProjectionErrorV1> {
         let expected_equal = match (
             &evidence.preferred_ratio,
             &evidence.compatibility_alias_ratio,
@@ -1553,6 +1642,29 @@ fn field_value_from_envelope<T: Clone>(
         value: value.clone(),
         availability: envelope.availability,
         measurement_quality: envelope.measurement_quality,
+        reasons: MetricDecisionReasonSummaryV1::try_from_codes(&envelope.reason_codes)?,
+    };
+    field.validate()?;
+    Ok(field)
+}
+
+fn presence_aware_field_value<T: Clone>(
+    value: &CanonicalNullableV1<T>,
+    envelope: &CanonicalMetricEnvelopeV1,
+    present_quality: MetricMeasurementQualityV1,
+) -> Result<MetricDecisionFieldValueV1<T>, MetricContractProjectionErrorV1> {
+    let (availability, measurement_quality) = if value.is_null() {
+        (
+            super::MetricAvailabilityV1::Unavailable,
+            MetricMeasurementQualityV1::NotApplicable,
+        )
+    } else {
+        (super::MetricAvailabilityV1::Available, present_quality)
+    };
+    let field = MetricDecisionFieldValueV1 {
+        value: value.clone(),
+        availability,
+        measurement_quality,
         reasons: MetricDecisionReasonSummaryV1::try_from_codes(&envelope.reason_codes)?,
     };
     field.validate()?;
@@ -1723,6 +1835,14 @@ impl FundingDecisionProjectionV1 {
         evidence: &FundingSourceContractEvidenceV1,
         context: &MetricDecisionProjectionBuildContextV1<'_>,
     ) -> Result<Self, MetricContractProjectionErrorV1> {
+        context.validate()?;
+        Self::try_from_evidence_with_validated_context(evidence, context)
+    }
+
+    fn try_from_evidence_with_validated_context(
+        evidence: &FundingSourceContractEvidenceV1,
+        context: &MetricDecisionProjectionBuildContextV1<'_>,
+    ) -> Result<Self, MetricContractProjectionErrorV1> {
         if evidence.legacy_source.distinct_known_source_count
             != evidence.legacy_v1.distinct_known_source_count
             || evidence.legacy_source.known_source_sample_count
@@ -1876,6 +1996,14 @@ impl FscStatusDecisionProjectionV1 {
         evidence: &FscStatusEvidenceV1,
         context: &MetricDecisionProjectionBuildContextV1<'_>,
     ) -> Result<Self, MetricContractProjectionErrorV1> {
+        context.validate()?;
+        Self::try_from_evidence_with_validated_context(evidence, context)
+    }
+
+    fn try_from_evidence_with_validated_context(
+        evidence: &FscStatusEvidenceV1,
+        context: &MetricDecisionProjectionBuildContextV1<'_>,
+    ) -> Result<Self, MetricContractProjectionErrorV1> {
         Ok(Self {
             compatibility_status: surface_value(
                 &evidence.envelope,
@@ -1892,7 +2020,797 @@ impl FscStatusDecisionProjectionV1 {
     }
 }
 
-// Keep these imports exercised by the closed schema without introducing PR2B
-// builders in PR2A.
-const _: Option<ManipulationComparatorV1> = None;
-const _: Option<RecentBuySellEvidenceV1> = None;
+impl FlipDecisionProjectionV1 {
+    pub fn validate_semantics(
+        &self,
+        context: &MetricDecisionProjectionBuildContextV1<'_>,
+    ) -> Result<(), MetricContractProjectionErrorV1> {
+        for (key, expected, invariant) in [
+            (
+                MetricEffectiveConfigKeyV1::FlipLegacyWindowSemantics,
+                "first_buy_slot_to_last_sell_slot_gap",
+                "legacy flip semantics",
+            ),
+            (
+                MetricEffectiveConfigKeyV1::FlipCandidateAnchorRule,
+                "first_eligible_buy",
+                "flip anchor rule",
+            ),
+            (
+                MetricEffectiveConfigKeyV1::FlipCandidateOrderPolicy,
+                "stable_tx_key",
+                "flip order policy",
+            ),
+        ] {
+            effective_config_enum_matches(context, key, expected, invariant)?;
+        }
+        effective_config_boolean_matches(
+            context,
+            MetricEffectiveConfigKeyV1::FlipCandidateSuccessRequired,
+            true,
+            "flip success requirement",
+        )?;
+        let configured_window = effective_config_wide_unsigned(
+            context,
+            MetricEffectiveConfigKeyV1::FlipCandidateWallClockWindowMs,
+            "flip wall-clock window",
+        )?;
+        let configured_slot_gap = effective_config_wide_unsigned(
+            context,
+            MetricEffectiveConfigKeyV1::FlipCandidateMaxSlotGap,
+            "flip slot-gap window",
+        )?;
+        let configured_dump_ratio = effective_config_ratio(
+            context,
+            MetricEffectiveConfigKeyV1::FlipCandidateDumpRatio,
+            "flip dump ratio",
+        )?;
+        if u64::from(self.wall_clock_window_ms) != configured_window
+            || u64::from(self.max_slot_gap) != configured_slot_gap
+            || self.dump_ratio.to_bits() != configured_dump_ratio.to_bits()
+        {
+            return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                "flip aggregate/config parity",
+            ));
+        }
+        validate_optional_unit_ratio(&self.legacy_slot_gap_ratio.value, "legacy flip ratio range")?;
+        let ratio =
+            validate_optional_unit_ratio(&self.hybrid_v2_ratio.value, "hybrid flip ratio range")?;
+        if self.flipper_count > self.eligible_buyer_count {
+            return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                "flip aggregate count ordering",
+            ));
+        }
+        match (self.eligible_buyer_count, ratio) {
+            (0, None) => {}
+            (0, Some(_)) | (_, None) => {
+                return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                    "flip denominator/value presence",
+                ));
+            }
+            (denominator, Some(value)) => {
+                let expected = f64::from(self.flipper_count) / f64::from(denominator);
+                if value.to_bits() != expected.to_bits() {
+                    return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                        "flip aggregate ratio parity",
+                    ));
+                }
+            }
+        }
+        if self.hybrid_v2_ratio.envelope.policy_actionable
+            || self.hybrid_v2_ratio.envelope.authority_class != MetricAuthorityClass::EvidenceOnly
+            || self.hybrid_v2_ratio.envelope.rollout_role != MetricRolloutRoleV1::NonPolicy
+        {
+            return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                "flip v2 must remain evidence-only",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn try_from_evidence(
+        evidence: &FlipRatioContractEvidenceV1,
+        context: &MetricDecisionProjectionBuildContextV1<'_>,
+    ) -> Result<Self, MetricContractProjectionErrorV1> {
+        context.validate()?;
+        Self::try_from_evidence_with_validated_context(evidence, context)
+    }
+
+    fn try_from_evidence_with_validated_context(
+        evidence: &FlipRatioContractEvidenceV1,
+        context: &MetricDecisionProjectionBuildContextV1<'_>,
+    ) -> Result<Self, MetricContractProjectionErrorV1> {
+        let projection = Self {
+            legacy_slot_gap_ratio: surface_value(
+                &evidence.legacy_envelope,
+                MetricSurfaceId::EarlyFingerprintFlipRatioLegacySlotGap,
+                &evidence.legacy_slot_gap_ratio,
+                MetricContractProducerIdV1::TxIntelligenceFingerprintAggregator,
+                context,
+            )?,
+            hybrid_v2_ratio: surface_value(
+                &evidence.hybrid_v2.envelope,
+                MetricSurfaceId::FlipRatioHybridEvidenceV2,
+                &evidence.hybrid_v2.ratio,
+                MetricContractProducerIdV1::TxIntelligenceFingerprintAggregator,
+                context,
+            )?,
+            eligible_buyer_count: evidence.hybrid_v2.eligible_buyer_count,
+            flipper_count: evidence.hybrid_v2.flipper_count,
+            wall_clock_window_ms: evidence.hybrid_v2.wall_clock_window_ms,
+            max_slot_gap: evidence.hybrid_v2.max_slot_gap,
+            dump_ratio: evidence.hybrid_v2.dump_ratio,
+        };
+        projection.validate_semantics(context)?;
+        Ok(projection)
+    }
+}
+
+const MANIPULATION_COMPACT_FIELDS_V2: [ManipulationNumericFieldIdV2; 7] = [
+    ManipulationNumericFieldIdV2::SameMsTxRatio,
+    ManipulationNumericFieldIdV2::BundleSuspicionRatio,
+    ManipulationNumericFieldIdV2::Top3SignerVolumeRatio,
+    ManipulationNumericFieldIdV2::Hhi,
+    ManipulationNumericFieldIdV2::MaxTxPerSigner,
+    ManipulationNumericFieldIdV2::DevVolumeRatio,
+    ManipulationNumericFieldIdV2::ContradictionScore,
+];
+
+fn manipulation_field_value(
+    field: &ManipulationNumericFieldEvidenceV2,
+) -> Result<MetricDecisionFieldValueV1<f64>, MetricContractProjectionErrorV1> {
+    let value = MetricDecisionFieldValueV1 {
+        value: field.value.clone(),
+        availability: field.availability,
+        measurement_quality: field.measurement_quality,
+        reasons: MetricDecisionReasonSummaryV1::try_from_codes(&field.reason_codes)?,
+    };
+    value.validate()?;
+    Ok(value)
+}
+
+impl ManipulationDecisionProjectionV1 {
+    fn field(&self, id: ManipulationNumericFieldIdV2) -> &MetricDecisionFieldValueV1<f64> {
+        match id {
+            ManipulationNumericFieldIdV2::SameMsTxRatio => &self.same_ms_tx_ratio,
+            ManipulationNumericFieldIdV2::BundleSuspicionRatio => &self.bundle_suspicion_ratio,
+            ManipulationNumericFieldIdV2::Top3SignerVolumeRatio => &self.top3_signer_volume_ratio,
+            ManipulationNumericFieldIdV2::Hhi => &self.hhi,
+            ManipulationNumericFieldIdV2::MaxTxPerSigner => &self.max_tx_per_signer,
+            ManipulationNumericFieldIdV2::DevVolumeRatio => &self.dev_volume_ratio,
+            ManipulationNumericFieldIdV2::ContradictionScore => &self.contradiction_score,
+        }
+    }
+
+    fn threshold(
+        context: &MetricDecisionProjectionBuildContextV1<'_>,
+        id: ManipulationNumericFieldIdV2,
+    ) -> Result<Option<f64>, MetricContractProjectionErrorV1> {
+        let threshold = match id {
+            ManipulationNumericFieldIdV2::SameMsTxRatio => effective_config_ratio(
+                context,
+                MetricEffectiveConfigKeyV1::ManipulationHighSameMsThreshold,
+                "manipulation same-ms threshold",
+            )?,
+            ManipulationNumericFieldIdV2::BundleSuspicionRatio => effective_config_ratio(
+                context,
+                MetricEffectiveConfigKeyV1::ManipulationHighBundleThreshold,
+                "manipulation bundle threshold",
+            )?,
+            ManipulationNumericFieldIdV2::Top3SignerVolumeRatio => effective_config_ratio(
+                context,
+                MetricEffectiveConfigKeyV1::ManipulationHighTop3Threshold,
+                "manipulation top3 threshold",
+            )?,
+            ManipulationNumericFieldIdV2::Hhi => effective_config_ratio(
+                context,
+                MetricEffectiveConfigKeyV1::ManipulationHighHhiThreshold,
+                "manipulation HHI threshold",
+            )?,
+            ManipulationNumericFieldIdV2::MaxTxPerSigner => {
+                let value = effective_config_wide_unsigned(
+                    context,
+                    MetricEffectiveConfigKeyV1::ManipulationHighSignerCountThreshold,
+                    "manipulation signer-count threshold",
+                )?;
+                if value > (1_u64 << 53) {
+                    return Err(MetricContractProjectionErrorV1::EffectiveConfigParity {
+                        key: MetricEffectiveConfigKeyV1::ManipulationHighSignerCountThreshold,
+                        invariant: "manipulation signer threshold is not exactly representable",
+                    });
+                }
+                value as f64
+            }
+            ManipulationNumericFieldIdV2::DevVolumeRatio => effective_config_ratio(
+                context,
+                MetricEffectiveConfigKeyV1::ManipulationHighDevConcentrationThreshold,
+                "manipulation dev threshold",
+            )?,
+            ManipulationNumericFieldIdV2::ContradictionScore => return Ok(None),
+        };
+        Ok(Some(threshold))
+    }
+
+    pub fn validate_semantics(
+        &self,
+        context: &MetricDecisionProjectionBuildContextV1<'_>,
+    ) -> Result<(), MetricContractProjectionErrorV1> {
+        for (key, expected, invariant) in [
+            (
+                MetricEffectiveConfigKeyV1::ManipulationNumericPresenceVersion,
+                "v2_field_presence",
+                "manipulation numeric presence version",
+            ),
+            (
+                MetricEffectiveConfigKeyV1::ManipulationBooleanPresenceVersion,
+                "v2_field_presence",
+                "manipulation boolean presence version",
+            ),
+            (
+                MetricEffectiveConfigKeyV1::ManipulationHighFlagDerivationVersion,
+                "policy_stage_v1",
+                "manipulation derivation version",
+            ),
+            (
+                MetricEffectiveConfigKeyV1::ManipulationMissingRawBehavior,
+                "unavailable_not_false",
+                "manipulation missing raw behavior",
+            ),
+            (
+                MetricEffectiveConfigKeyV1::ManipulationMeasuredFieldsMaskVersion,
+                "v1_u16",
+                "manipulation measured mask version",
+            ),
+        ] {
+            effective_config_enum_matches(context, key, expected, invariant)?;
+        }
+        let mut expected_measured = 0_u16;
+        let mut expected_evaluable = 0_u16;
+        let mut expected_true = 0_u16;
+        for id in MANIPULATION_COMPACT_FIELDS_V2 {
+            let field = self.field(id);
+            field.validate()?;
+            if let CanonicalNullableV1::Value(value) = field.value {
+                if !matches!(
+                    field.measurement_quality,
+                    MetricMeasurementQualityV1::Measured | MetricMeasurementQualityV1::Degraded
+                ) {
+                    return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                        "manipulation compact measured-field quality",
+                    ));
+                }
+                if self.numeric_v2_envelope.measurement_quality
+                    == MetricMeasurementQualityV1::Degraded
+                    && field.measurement_quality != MetricMeasurementQualityV1::Degraded
+                {
+                    return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                        "manipulation group quality upper bound",
+                    ));
+                }
+                if !value.is_finite()
+                    || (id != ManipulationNumericFieldIdV2::MaxTxPerSigner
+                        && !(0.0..=1.0).contains(&value))
+                    || (id == ManipulationNumericFieldIdV2::MaxTxPerSigner && value < 0.0)
+                {
+                    return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                        "manipulation compact field range",
+                    ));
+                }
+                expected_measured |= id.measured_mask_bit();
+                if let Some(threshold) = Self::threshold(context, id)? {
+                    expected_evaluable |= id.measured_mask_bit();
+                    if value > threshold {
+                        expected_true |= id.measured_mask_bit();
+                    }
+                }
+            }
+        }
+        if self.measured_fields_mask != expected_measured
+            || self.derived_high_evaluable_mask != expected_evaluable
+            || self.derived_high_true_mask != expected_true
+            || self.legacy_high_true_mask & !self.legacy_high_recorded_mask != 0
+        {
+            return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                "manipulation field/mask parity",
+            ));
+        }
+        if self.numeric_v2_envelope.availability != MetricAvailabilityV1::Available
+            && expected_measured != 0
+        {
+            return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                "manipulation unavailable group cannot contain measured fields",
+            ));
+        }
+        if self.numeric_v2_envelope.policy_actionable
+            || self.numeric_v2_envelope.authority_class != MetricAuthorityClass::EquivalentCutover
+            || self.numeric_v2_envelope.rollout_role != MetricRolloutRoleV1::NonPolicy
+        {
+            return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                "manipulation v2 must remain evidence-only",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn try_from_evidence(
+        evidence: &ManipulationNumericEvidenceV2,
+        context: &MetricDecisionProjectionBuildContextV1<'_>,
+    ) -> Result<Self, MetricContractProjectionErrorV1> {
+        context.validate()?;
+        Self::try_from_evidence_with_validated_context(evidence, context)
+    }
+
+    fn try_from_evidence_with_validated_context(
+        evidence: &ManipulationNumericEvidenceV2,
+        context: &MetricDecisionProjectionBuildContextV1<'_>,
+    ) -> Result<Self, MetricContractProjectionErrorV1> {
+        let find = |id| {
+            evidence
+                .fields
+                .iter()
+                .find(|field| field.field_id == id)
+                .ok_or(MetricContractProjectionErrorV1::FamilyInvariant(
+                    "missing manipulation field",
+                ))
+        };
+        let mut legacy_recorded = 0_u16;
+        let mut legacy_true = 0_u16;
+        for flag in &evidence.legacy_high_flags {
+            if flag.field_recorded {
+                legacy_recorded |= flag.field_id.measured_mask_bit();
+                if flag.value {
+                    legacy_true |= flag.field_id.measured_mask_bit();
+                }
+            }
+        }
+        let mut derived_evaluable = 0_u16;
+        let mut derived_true = 0_u16;
+        for flag in &evidence.derived_high_flags {
+            if flag.config_hash
+                != context
+                    .effective_config
+                    .metric_contract_effective_config_hash
+                || flag.comparator != ManipulationComparatorV1::GreaterThan
+                || flag.policy_stage != super::MANIPULATION_DERIVED_POLICY_STAGE_V1
+                || flag.policy_version != super::MANIPULATION_DERIVED_POLICY_VERSION_V1
+            {
+                return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                    "manipulation derived provenance",
+                ));
+            }
+            let expected_threshold = Self::threshold(context, flag.field_id)?;
+            if expected_threshold.map(f64::to_bits)
+                != match flag.threshold {
+                    CanonicalNullableV1::Value(value) => Some(value.to_bits()),
+                    CanonicalNullableV1::Null => None,
+                }
+            {
+                return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                    "manipulation derived threshold/config parity",
+                ));
+            }
+            if let CanonicalNullableV1::Value(value) = flag.derived_value {
+                derived_evaluable |= flag.field_id.measured_mask_bit();
+                if value {
+                    derived_true |= flag.field_id.measured_mask_bit();
+                }
+            }
+        }
+        let projection = Self {
+            legacy_numeric_envelope: compact_envelope(
+                &evidence.legacy_numeric_envelope,
+                MetricSurfaceId::MfsManipulationNumericLegacyDefaults,
+                context,
+            )?,
+            numeric_v2_envelope: compact_envelope(
+                &evidence.numeric_v2_envelope,
+                MetricSurfaceId::ManipulationNumericEvidenceV2,
+                context,
+            )?,
+            measured_fields_mask: evidence.measured_fields_mask,
+            same_ms_tx_ratio: manipulation_field_value(find(
+                ManipulationNumericFieldIdV2::SameMsTxRatio,
+            )?)?,
+            bundle_suspicion_ratio: manipulation_field_value(find(
+                ManipulationNumericFieldIdV2::BundleSuspicionRatio,
+            )?)?,
+            top3_signer_volume_ratio: manipulation_field_value(find(
+                ManipulationNumericFieldIdV2::Top3SignerVolumeRatio,
+            )?)?,
+            hhi: manipulation_field_value(find(ManipulationNumericFieldIdV2::Hhi)?)?,
+            max_tx_per_signer: manipulation_field_value(find(
+                ManipulationNumericFieldIdV2::MaxTxPerSigner,
+            )?)?,
+            dev_volume_ratio: manipulation_field_value(find(
+                ManipulationNumericFieldIdV2::DevVolumeRatio,
+            )?)?,
+            contradiction_score: manipulation_field_value(find(
+                ManipulationNumericFieldIdV2::ContradictionScore,
+            )?)?,
+            legacy_high_recorded_mask: legacy_recorded,
+            legacy_high_true_mask: legacy_true,
+            derived_high_evaluable_mask: derived_evaluable,
+            derived_high_true_mask: derived_true,
+        };
+        projection.validate_semantics(context)?;
+        Ok(projection)
+    }
+}
+
+impl ReserveVelocityDecisionProjectionV1 {
+    pub fn validate_semantics(
+        &self,
+        context: &MetricDecisionProjectionBuildContextV1<'_>,
+    ) -> Result<(), MetricContractProjectionErrorV1> {
+        for (key, expected, invariant) in [
+            (
+                MetricEffectiveConfigKeyV1::ReserveVelocitySourceClock,
+                "receive_time",
+                "reserve source clock",
+            ),
+            (
+                MetricEffectiveConfigKeyV1::ReserveVelocityFirstUpdateBehavior,
+                "typed_first_update",
+                "reserve first-update behavior",
+            ),
+            (
+                MetricEffectiveConfigKeyV1::ReserveVelocityZeroDeltaTimeBehavior,
+                "unavailable",
+                "reserve zero-delta behavior",
+            ),
+            (
+                MetricEffectiveConfigKeyV1::ReserveVelocityFallbackBehavior,
+                "typed_fallback_not_zero",
+                "reserve fallback behavior",
+            ),
+            (
+                MetricEffectiveConfigKeyV1::ReserveVelocityUnit,
+                "sol_per_second",
+                "reserve velocity unit",
+            ),
+        ] {
+            effective_config_enum_matches(context, key, expected, invariant)?;
+        }
+        if self.source_clock != ReserveVelocitySourceClockV1::ReceiveTime {
+            return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                "reserve source clock",
+            ));
+        }
+        if nullable_f64_value(&self.legacy_velocity.value).is_some_and(|value| !value.is_finite()) {
+            return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                "legacy reserve velocity finite",
+            ));
+        }
+        let valid = match self.status {
+            ReserveVelocityStatusV1::Measured => {
+                let (
+                    CanonicalNullableV1::Value(previous),
+                    CanonicalNullableV1::Value(current),
+                    CanonicalNullableV1::Value(interval_ms),
+                    CanonicalNullableV1::Value(velocity),
+                ) = (
+                    &self.previous_real_sol_reserves_lamports.value,
+                    &self.current_real_sol_reserves_lamports.value,
+                    &self.interval_ms.value,
+                    &self.velocity_v1.value,
+                )
+                else {
+                    return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                        "measured reserve velocity presence",
+                    ));
+                };
+                if *interval_ms == 0 || self.accepted_update_count < 2 || !velocity.is_finite() {
+                    false
+                } else {
+                    let delta_sol =
+                        (current.get() as f64 - previous.get() as f64) / 1_000_000_000.0;
+                    let expected = delta_sol / (f64::from(*interval_ms) / 1_000.0);
+                    velocity.to_bits() == expected.to_bits()
+                        && nullable_f64_value(&self.legacy_velocity.value)
+                            .is_some_and(|legacy| legacy.to_bits() == velocity.to_bits())
+                }
+            }
+            ReserveVelocityStatusV1::FirstUpdate => {
+                self.accepted_update_count == 1
+                    && self.previous_real_sol_reserves_lamports.value.is_null()
+                    && !self.current_real_sol_reserves_lamports.value.is_null()
+                    && self.velocity_v1.value.is_null()
+                    && self.interval_ms.value.is_null()
+            }
+            ReserveVelocityStatusV1::ZeroDeltaTime => {
+                self.accepted_update_count >= 2
+                    && self.velocity_v1.value.is_null()
+                    && matches!(self.interval_ms.value, CanonicalNullableV1::Value(0))
+            }
+            ReserveVelocityStatusV1::BootstrapFallback => {
+                self.accepted_update_count == 0
+                    && self.velocity_v1.value.is_null()
+                    && self.interval_ms.value.is_null()
+            }
+            ReserveVelocityStatusV1::Unavailable => self.velocity_v1.value.is_null(),
+        };
+        if !valid {
+            return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                "reserve velocity status/count/value parity",
+            ));
+        }
+        if self.velocity_v1.envelope.policy_actionable
+            || self.velocity_v1.envelope.rollout_role != MetricRolloutRoleV1::NonPolicy
+        {
+            return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                "reserve velocity v1 must remain non-policy",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn try_from_evidence(
+        evidence: &super::ReserveVelocityEvidenceV1,
+        context: &MetricDecisionProjectionBuildContextV1<'_>,
+    ) -> Result<Self, MetricContractProjectionErrorV1> {
+        context.validate()?;
+        Self::try_from_evidence_with_validated_context(evidence, context)
+    }
+
+    fn try_from_evidence_with_validated_context(
+        evidence: &super::ReserveVelocityEvidenceV1,
+        context: &MetricDecisionProjectionBuildContextV1<'_>,
+    ) -> Result<Self, MetricContractProjectionErrorV1> {
+        let legacy = CanonicalNullableV1::Value(evidence.legacy_velocity_sol_per_sec);
+        let projection = Self {
+            legacy_velocity: surface_value(
+                &evidence.legacy_envelope,
+                MetricSurfaceId::AccountStateReserveVelocityScalarLegacy,
+                &legacy,
+                MetricContractProducerIdV1::AccountStateCore,
+                context,
+            )?,
+            velocity_v1: surface_value(
+                &evidence.v1_envelope,
+                MetricSurfaceId::ReserveVelocityEvidenceV1,
+                &evidence.velocity_sol_per_sec,
+                MetricContractProducerIdV1::AccountStateCore,
+                context,
+            )?,
+            previous_real_sol_reserves_lamports: presence_aware_field_value(
+                &evidence.previous_real_sol_reserves_lamports,
+                &evidence.v1_envelope,
+                MetricMeasurementQualityV1::Measured,
+            )?,
+            current_real_sol_reserves_lamports: presence_aware_field_value(
+                &evidence.current_real_sol_reserves_lamports,
+                &evidence.v1_envelope,
+                MetricMeasurementQualityV1::Measured,
+            )?,
+            interval_ms: presence_aware_field_value(
+                &evidence.interval_ms,
+                &evidence.v1_envelope,
+                if evidence.status == ReserveVelocityStatusV1::Measured {
+                    MetricMeasurementQualityV1::Measured
+                } else {
+                    MetricMeasurementQualityV1::Degraded
+                },
+            )?,
+            accepted_update_count: evidence.accepted_update_count,
+            source_clock: evidence.source_clock,
+            status: evidence.status,
+        };
+        projection.validate_semantics(context)?;
+        Ok(projection)
+    }
+}
+
+impl RecentBuySellDecisionProjectionV1 {
+    pub fn validate_semantics(
+        &self,
+        context: &MetricDecisionProjectionBuildContextV1<'_>,
+    ) -> Result<(), MetricContractProjectionErrorV1> {
+        effective_config_boolean_matches(
+            context,
+            MetricEffectiveConfigKeyV1::RecentBuySellSuccessfulOnly,
+            true,
+            "recent buy/sell population",
+        )?;
+        for (key, expected, invariant) in [
+            (
+                MetricEffectiveConfigKeyV1::RecentBuySellBoundaryPolicy,
+                "inclusive_start_and_end",
+                "recent boundary policy",
+            ),
+            (
+                MetricEffectiveConfigKeyV1::RecentBuySellSameMsNumeratorRule,
+                "sum_timestamp_multiplicity_minus_one",
+                "recent same-ms rule",
+            ),
+            (
+                MetricEffectiveConfigKeyV1::RecentBuySellLegacyRatioRule,
+                "sell_zero_returns_buy_count",
+                "recent legacy ratio rule",
+            ),
+            (
+                MetricEffectiveConfigKeyV1::RecentBuySellUnboundedRatioRule,
+                "buy_count_over_sell_count_or_null",
+                "recent unbounded ratio rule",
+            ),
+            (
+                MetricEffectiveConfigKeyV1::RecentBuySellBoundedShareRule,
+                "buy_count_over_transaction_count",
+                "recent bounded share rule",
+            ),
+            (
+                MetricEffectiveConfigKeyV1::RecentBuySellZeroDenominatorBehavior,
+                "null_unavailable",
+                "recent zero-denominator rule",
+            ),
+        ] {
+            effective_config_enum_matches(context, key, expected, invariant)?;
+        }
+        let window = effective_config_wide_unsigned(
+            context,
+            MetricEffectiveConfigKeyV1::RecentBuySellWindowMs,
+            "recent buy/sell window",
+        )?;
+        if u64::from(self.window_ms) != window
+            || self.buy_count.checked_add(self.sell_count) != Some(self.transaction_count)
+        {
+            return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                "recent window/count parity",
+            ));
+        }
+        let expected_legacy = if self.transaction_count == 0 {
+            None
+        } else if self.sell_count == 0 {
+            Some(f64::from(self.buy_count))
+        } else {
+            Some(f64::from(self.buy_count) / f64::from(self.sell_count))
+        };
+        if nullable_f64_value(&self.legacy_scalar.value).map(f64::to_bits)
+            != expected_legacy.map(f64::to_bits)
+        {
+            return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                "recent legacy scalar reconstruction",
+            ));
+        }
+        let expected_unbounded =
+            (self.sell_count > 0).then(|| f64::from(self.buy_count) / f64::from(self.sell_count));
+        if nullable_f64_value(&self.buy_to_sell_ratio.value).map(f64::to_bits)
+            != expected_unbounded.map(f64::to_bits)
+        {
+            return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                "recent unbounded ratio reconstruction",
+            ));
+        }
+        let expected_share = (self.transaction_count > 0)
+            .then(|| f64::from(self.buy_count) / f64::from(self.transaction_count));
+        if nullable_f64_value(&self.buy_share.value).map(f64::to_bits)
+            != expected_share.map(f64::to_bits)
+        {
+            return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                "recent bounded share reconstruction",
+            ));
+        }
+        if self.v1_envelope.policy_actionable
+            || self.v1_envelope.authority_class != MetricAuthorityClass::LoggingOnly
+            || self.v1_envelope.rollout_role != MetricRolloutRoleV1::NonPolicy
+        {
+            return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                "recent buy/sell must remain logging-only non-policy",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn try_from_evidence(
+        evidence: &RecentBuySellEvidenceV1,
+        context: &MetricDecisionProjectionBuildContextV1<'_>,
+    ) -> Result<Self, MetricContractProjectionErrorV1> {
+        context.validate()?;
+        Self::try_from_evidence_with_validated_context(evidence, context)
+    }
+
+    fn try_from_evidence_with_validated_context(
+        evidence: &RecentBuySellEvidenceV1,
+        context: &MetricDecisionProjectionBuildContextV1<'_>,
+    ) -> Result<Self, MetricContractProjectionErrorV1> {
+        let projection = Self {
+            legacy_scalar: surface_value(
+                &evidence.legacy_envelope,
+                MetricSurfaceId::RceBuySellRatioRecentLegacy,
+                &evidence.legacy_buy_sell_scalar,
+                MetricContractProducerIdV1::RecentBuySellWindowProducer,
+                context,
+            )?,
+            v1_envelope: compact_envelope(
+                &evidence.v1_envelope,
+                MetricSurfaceId::RecentBuySellEvidenceV1,
+                context,
+            )?,
+            window_ms: evidence.window_ms,
+            buy_count: evidence.buy_count,
+            sell_count: evidence.sell_count,
+            transaction_count: evidence.transaction_count,
+            buy_to_sell_ratio: presence_aware_field_value(
+                &evidence.buy_to_sell_ratio,
+                &evidence.v1_envelope,
+                MetricMeasurementQualityV1::Measured,
+            )?,
+            buy_share: presence_aware_field_value(
+                &evidence.buy_share,
+                &evidence.v1_envelope,
+                MetricMeasurementQualityV1::Measured,
+            )?,
+        };
+        projection.validate_semantics(context)?;
+        Ok(projection)
+    }
+}
+
+impl MetricContractDecisionEvidenceProjectionV1 {
+    pub fn try_from_evidence(
+        evidence: &MetricContractsEvidenceSetV1,
+        context: &MetricDecisionProjectionBuildContextV1<'_>,
+    ) -> Result<Self, MetricContractProjectionErrorV1> {
+        let profile_hash = context.validate_and_profile_hash()?;
+        evidence.validate_semantics()?;
+        let projection = Self {
+            schema_version: METRIC_CONTRACT_DECISION_PROJECTION_SCHEMA_VERSION_V1,
+            rollout_mode: context.rollout_mode,
+            profile_id: context.profile.payload().profile_id.clone(),
+            profile_hash: profile_hash.clone(),
+            metric_contract_effective_config_hash: context
+                .effective_config
+                .metric_contract_effective_config_hash
+                .clone(),
+            fee_topology_diversity_index:
+                FtdiDecisionProjectionV1::try_from_evidence_with_validated_context(
+                    &evidence.fee_topology_diversity_index,
+                    context,
+                )?,
+            dev_buy: DevBuyDecisionProjectionV1::try_from_evidence_with_validated_context(
+                &evidence.dev_buy,
+                context,
+            )?,
+            same_ms_tx_ratio:
+                TxTimingDecisionProjectionV1::try_from_evidence_with_validated_context(
+                    &evidence.same_ms_tx_ratio,
+                    context,
+                )?,
+            top3_signer_volume_ratio:
+                Top3DecisionProjectionV1::try_from_evidence_with_validated_context(
+                    &evidence.top3_signer_volume_ratio,
+                    context,
+                )?,
+            flip_ratio: FlipDecisionProjectionV1::try_from_evidence_with_validated_context(
+                &evidence.flip_ratio,
+                context,
+            )?,
+            funding_source_concentration:
+                FundingDecisionProjectionV1::try_from_evidence_with_validated_context(
+                    &evidence.funding_source_concentration,
+                    context,
+                )?,
+            fsc_evidence_status:
+                FscStatusDecisionProjectionV1::try_from_evidence_with_validated_context(
+                    &evidence.fsc_evidence_status,
+                    context,
+                )?,
+            manipulation_contradiction:
+                ManipulationDecisionProjectionV1::try_from_evidence_with_validated_context(
+                    &evidence.manipulation_contradiction,
+                    context,
+                )?,
+            reserve_velocity:
+                ReserveVelocityDecisionProjectionV1::try_from_evidence_with_validated_context(
+                    &evidence.reserve_velocity,
+                    context,
+                )?,
+            recent_buy_sell:
+                RecentBuySellDecisionProjectionV1::try_from_evidence_with_validated_context(
+                    &evidence.recent_buy_sell,
+                    context,
+                )?,
+        };
+        projection.validate_context_with_validated_context(context, &profile_hash)?;
+        Ok(projection)
+    }
+}

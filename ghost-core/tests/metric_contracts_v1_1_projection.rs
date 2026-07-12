@@ -22,6 +22,9 @@ fn value_for_key(key: MetricEffectiveConfigKeyV1) -> MetricEffectiveConfigValueV
         MetricEffectiveConfigKeyV1::SameMsClusterUpperBoundExclusiveMs => {
             return MetricEffectiveConfigValueV1::WideUnsigned(CanonicalU64StringV1::new(50));
         }
+        MetricEffectiveConfigKeyV1::FlipCandidateMaxSlotGap => {
+            return MetricEffectiveConfigValueV1::WideUnsigned(CanonicalU64StringV1::new(20));
+        }
         MetricEffectiveConfigKeyV1::FscMinTotalBuyers
         | MetricEffectiveConfigKeyV1::FscMinKnownNonNeutralBuyers => {
             return MetricEffectiveConfigValueV1::WideUnsigned(CanonicalU64StringV1::new(2));
@@ -109,6 +112,69 @@ fn value_for_key(key: MetricEffectiveConfigKeyV1) -> MetricEffectiveConfigValueV
             return MetricEffectiveConfigValueV1::Enum(
                 "decision_time_status_coverage_lane_health".to_string(),
             );
+        }
+        MetricEffectiveConfigKeyV1::FlipLegacyWindowSemantics => {
+            return MetricEffectiveConfigValueV1::Enum(
+                "first_buy_slot_to_last_sell_slot_gap".to_string(),
+            );
+        }
+        MetricEffectiveConfigKeyV1::FlipCandidateAnchorRule => {
+            return MetricEffectiveConfigValueV1::Enum("first_eligible_buy".to_string());
+        }
+        MetricEffectiveConfigKeyV1::FlipCandidateOrderPolicy => {
+            return MetricEffectiveConfigValueV1::Enum("stable_tx_key".to_string());
+        }
+        MetricEffectiveConfigKeyV1::ManipulationNumericPresenceVersion
+        | MetricEffectiveConfigKeyV1::ManipulationBooleanPresenceVersion => {
+            return MetricEffectiveConfigValueV1::Enum("v2_field_presence".to_string());
+        }
+        MetricEffectiveConfigKeyV1::ManipulationHighFlagDerivationVersion => {
+            return MetricEffectiveConfigValueV1::Enum("policy_stage_v1".to_string());
+        }
+        MetricEffectiveConfigKeyV1::ManipulationMissingRawBehavior => {
+            return MetricEffectiveConfigValueV1::Enum("unavailable_not_false".to_string());
+        }
+        MetricEffectiveConfigKeyV1::ManipulationMeasuredFieldsMaskVersion => {
+            return MetricEffectiveConfigValueV1::Enum("v1_u16".to_string());
+        }
+        MetricEffectiveConfigKeyV1::ReserveVelocitySourceClock => {
+            return MetricEffectiveConfigValueV1::Enum("receive_time".to_string());
+        }
+        MetricEffectiveConfigKeyV1::ReserveVelocityFirstUpdateBehavior => {
+            return MetricEffectiveConfigValueV1::Enum("typed_first_update".to_string());
+        }
+        MetricEffectiveConfigKeyV1::ReserveVelocityZeroDeltaTimeBehavior => {
+            return MetricEffectiveConfigValueV1::Enum("unavailable".to_string());
+        }
+        MetricEffectiveConfigKeyV1::ReserveVelocityFallbackBehavior => {
+            return MetricEffectiveConfigValueV1::Enum("typed_fallback_not_zero".to_string());
+        }
+        MetricEffectiveConfigKeyV1::ReserveVelocityUnit => {
+            return MetricEffectiveConfigValueV1::Enum("sol_per_second".to_string());
+        }
+        MetricEffectiveConfigKeyV1::RecentBuySellBoundaryPolicy => {
+            return MetricEffectiveConfigValueV1::Enum("inclusive_start_and_end".to_string());
+        }
+        MetricEffectiveConfigKeyV1::RecentBuySellSameMsNumeratorRule => {
+            return MetricEffectiveConfigValueV1::Enum(
+                "sum_timestamp_multiplicity_minus_one".to_string(),
+            );
+        }
+        MetricEffectiveConfigKeyV1::RecentBuySellLegacyRatioRule => {
+            return MetricEffectiveConfigValueV1::Enum("sell_zero_returns_buy_count".to_string());
+        }
+        MetricEffectiveConfigKeyV1::RecentBuySellUnboundedRatioRule => {
+            return MetricEffectiveConfigValueV1::Enum(
+                "buy_count_over_sell_count_or_null".to_string(),
+            );
+        }
+        MetricEffectiveConfigKeyV1::RecentBuySellBoundedShareRule => {
+            return MetricEffectiveConfigValueV1::Enum(
+                "buy_count_over_transaction_count".to_string(),
+            );
+        }
+        MetricEffectiveConfigKeyV1::RecentBuySellZeroDenominatorBehavior => {
+            return MetricEffectiveConfigValueV1::Enum("null_unavailable".to_string());
         }
         _ => {}
     }
@@ -502,7 +568,7 @@ fn complete_projection() -> MetricContractDecisionEvidenceProjectionV1 {
                 &profile,
             ),
             previous_real_sol_reserves_lamports: field(CanonicalU64StringV1::new(1)),
-            current_real_sol_reserves_lamports: field(CanonicalU64StringV1::new(2)),
+            current_real_sol_reserves_lamports: field(CanonicalU64StringV1::new(1_000_000_001)),
             interval_ms: field(1_000),
             accepted_update_count: 2,
             source_clock: ReserveVelocitySourceClockV1::ReceiveTime,
@@ -633,6 +699,103 @@ fn projection_schema_is_closed_and_partial_root_is_rejected() {
         .unwrap()
         .insert("unknown".to_string(), json!(1));
     assert!(serde_json::from_value::<FtdiDecisionProjectionV1>(family).is_err());
+}
+
+#[test]
+fn pr2b_compact_family_field_sets_are_exact_and_exclude_heavy_details() {
+    fn keys<T: serde::Serialize>(value: &T) -> BTreeSet<String> {
+        serde_json::to_value(value)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect()
+    }
+    let projection = complete_projection();
+    assert_eq!(
+        keys(&projection.flip_ratio),
+        [
+            "legacy_slot_gap_ratio",
+            "hybrid_v2_ratio",
+            "eligible_buyer_count",
+            "flipper_count",
+            "wall_clock_window_ms",
+            "max_slot_gap",
+            "dump_ratio",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    );
+    assert_eq!(
+        keys(&projection.manipulation_contradiction),
+        [
+            "legacy_numeric_envelope",
+            "numeric_v2_envelope",
+            "measured_fields_mask",
+            "same_ms_tx_ratio",
+            "bundle_suspicion_ratio",
+            "top3_signer_volume_ratio",
+            "hhi",
+            "max_tx_per_signer",
+            "dev_volume_ratio",
+            "contradiction_score",
+            "legacy_high_recorded_mask",
+            "legacy_high_true_mask",
+            "derived_high_evaluable_mask",
+            "derived_high_true_mask",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    );
+    assert_eq!(
+        keys(&projection.reserve_velocity),
+        [
+            "legacy_velocity",
+            "velocity_v1",
+            "previous_real_sol_reserves_lamports",
+            "current_real_sol_reserves_lamports",
+            "interval_ms",
+            "accepted_update_count",
+            "source_clock",
+            "status",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    );
+    assert_eq!(
+        keys(&projection.recent_buy_sell),
+        [
+            "legacy_scalar",
+            "v1_envelope",
+            "window_ms",
+            "buy_count",
+            "sell_count",
+            "transaction_count",
+            "buy_to_sell_ratio",
+            "buy_share",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    );
+    let json = serde_json::to_string(&projection).unwrap();
+    for forbidden in [
+        "owners",
+        "owner_id",
+        "anchor_event_identity",
+        "qualifying_sell_event_identity",
+        "legacy_fields",
+        "derived_high_flags",
+    ] {
+        assert!(
+            !json.contains(forbidden),
+            "forbidden compact detail {forbidden}"
+        );
+    }
 }
 
 #[test]

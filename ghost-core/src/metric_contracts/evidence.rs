@@ -293,13 +293,14 @@ pub struct ManipulationNumericEvidenceV2 {
     pub derived_high_flags: Vec<ManipulationDerivedFlagEvidenceV2>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReserveVelocityStatusV1 {
     FirstUpdate,
     Measured,
     ZeroDeltaTime,
     BootstrapFallback,
+    #[default]
     Unavailable,
 }
 
@@ -452,6 +453,15 @@ fn validate_ftdi_measurement(
 ) -> Result<(), MetricContractEvidenceSemanticErrorV1> {
     if evidence.unique_buyer_sample_count > evidence.buy_transaction_sample_count {
         return Err(MetricContractEvidenceSemanticErrorV1::CountInvariant(field));
+    }
+    if evidence.unique_buyer_sample_count < 2 || evidence.unique_topology_count == 0 {
+        return if evidence.unique_topology_count == 0 && evidence.value.is_null() {
+            Ok(())
+        } else {
+            Err(MetricContractEvidenceSemanticErrorV1::DerivedRatioMismatch(
+                field,
+            ))
+        };
     }
     count_ratio(
         field,
@@ -631,6 +641,7 @@ fn validate_flip_owner(
     owner: &FlipOwnerEvidenceV2,
     wall_clock_window_ms: u32,
     max_slot_gap: u32,
+    dump_ratio: f64,
 ) -> Result<(), MetricContractEvidenceSemanticErrorV1> {
     if owner.owner_id.trim().is_empty() {
         return Err(MetricContractEvidenceSemanticErrorV1::FlipOwnerInvariant);
@@ -697,6 +708,8 @@ fn validate_flip_owner(
             anchor_complete
                 && qualifying_complete
                 && owner.cumulative_eligible_buy_tokens.get() > 0
+                && (owner.cumulative_eligible_sell_tokens.get() as f64)
+                    >= (owner.cumulative_eligible_buy_tokens.get() as f64 * dump_ratio)
                 && order_and_window_valid
         }
     };
@@ -715,6 +728,9 @@ const MANIPULATION_NUMERIC_FIELDS_V2: [ManipulationNumericFieldIdV2; 7] = [
     ManipulationNumericFieldIdV2::DevVolumeRatio,
     ManipulationNumericFieldIdV2::ContradictionScore,
 ];
+
+pub const MANIPULATION_DERIVED_POLICY_STAGE_V1: &str = "gatekeeper_v3_shadow_evidence";
+pub const MANIPULATION_DERIVED_POLICY_VERSION_V1: &str = "v1";
 
 fn nullable_f64_bits_equal(
     left: &CanonicalNullableV1<f64>,
@@ -756,7 +772,12 @@ fn validate_manipulation_field_set(
                         "manipulation_numeric",
                     ));
                 }
-                measured_mask |= field.field_id.measured_mask_bit();
+                if matches!(
+                    quality,
+                    MetricMeasurementQualityV1::Measured | MetricMeasurementQualityV1::Degraded
+                ) {
+                    measured_mask |= field.field_id.measured_mask_bit();
+                }
             }
             (
                 availability,
@@ -882,7 +903,12 @@ impl MetricContractsEvidenceSetV1 {
             if !owners.insert(owner.owner_id.as_str()) {
                 return Err(MetricContractEvidenceSemanticErrorV1::FlipOwnerInvariant);
             }
-            validate_flip_owner(owner, flip.wall_clock_window_ms, flip.max_slot_gap)?;
+            validate_flip_owner(
+                owner,
+                flip.wall_clock_window_ms,
+                flip.max_slot_gap,
+                flip.dump_ratio,
+            )?;
             if owner.status != FlipOwnerStatusV2::NoAnchor {
                 anchored_owner_count = anchored_owner_count
                     .checked_add(1)
@@ -923,6 +949,30 @@ impl MetricContractsEvidenceSetV1 {
         let manipulation = &self.manipulation_contradiction;
         validate_manipulation_field_set(&manipulation.legacy_fields)?;
         let measured_mask = validate_manipulation_field_set(&manipulation.fields)?;
+        match (
+            manipulation.numeric_v2_envelope.availability,
+            manipulation.numeric_v2_envelope.measurement_quality,
+        ) {
+            (MetricAvailabilityV1::Available, MetricMeasurementQualityV1::Measured)
+                if manipulation.fields.iter().all(|field| {
+                    field.value.is_null()
+                        || field.measurement_quality == MetricMeasurementQualityV1::Measured
+                }) => {}
+            (MetricAvailabilityV1::Available, MetricMeasurementQualityV1::Degraded)
+                if manipulation.fields.iter().all(|field| {
+                    field.value.is_null()
+                        || field.measurement_quality == MetricMeasurementQualityV1::Degraded
+                }) => {}
+            (availability, MetricMeasurementQualityV1::NotApplicable)
+                if availability != MetricAvailabilityV1::Available
+                    && manipulation
+                        .fields
+                        .iter()
+                        .all(|field| field.value.is_null()) => {}
+            _ => {
+                return Err(MetricContractEvidenceSemanticErrorV1::ManipulationMeasuredMaskMismatch)
+            }
+        }
         if manipulation.measured_fields_mask != measured_mask {
             return Err(MetricContractEvidenceSemanticErrorV1::ManipulationMeasuredMaskMismatch);
         }
@@ -1018,7 +1068,9 @@ impl MetricContractsEvidenceSetV1 {
                     )
                 }
             }
-            if flag.policy_stage.trim().is_empty() || flag.policy_version.trim().is_empty() {
+            if flag.policy_stage != MANIPULATION_DERIVED_POLICY_STAGE_V1
+                || flag.policy_version != MANIPULATION_DERIVED_POLICY_VERSION_V1
+            {
                 return Err(
                     MetricContractEvidenceSemanticErrorV1::ManipulationFieldStatus(flag.field_id),
                 );
@@ -1043,10 +1095,55 @@ impl MetricContractsEvidenceSetV1 {
         if let CanonicalNullableV1::Value(value) = reserve.velocity_sol_per_sec {
             finite_value("reserve_velocity_v1", value)?;
         }
+        if reserve.source_clock != ReserveVelocitySourceClockV1::ReceiveTime {
+            return Err(MetricContractEvidenceSemanticErrorV1::ReserveVelocityInvariant);
+        }
         let reserve_valid = match reserve.status {
             ReserveVelocityStatusV1::Measured => {
+                match (
+                    &reserve.previous_real_sol_reserves_lamports,
+                    &reserve.current_real_sol_reserves_lamports,
+                    &reserve.interval_ms,
+                    &reserve.velocity_sol_per_sec,
+                ) {
+                    (
+                        CanonicalNullableV1::Value(previous),
+                        CanonicalNullableV1::Value(current),
+                        CanonicalNullableV1::Value(interval_ms),
+                        CanonicalNullableV1::Value(velocity),
+                    ) if *interval_ms > 0 && reserve.accepted_update_count >= 2 => {
+                        let delta_sol =
+                            (current.get() as f64 - previous.get() as f64) / 1_000_000_000.0;
+                        let expected = delta_sol / (f64::from(*interval_ms) / 1_000.0);
+                        velocity.to_bits() == expected.to_bits()
+                            && reserve.legacy_velocity_sol_per_sec.to_bits() == velocity.to_bits()
+                    }
+                    _ => false,
+                }
+            }
+            ReserveVelocityStatusV1::FirstUpdate => {
+                reserve.accepted_update_count == 1
+                    && matches!(
+                        reserve.previous_real_sol_reserves_lamports,
+                        CanonicalNullableV1::Null
+                    )
+                    && matches!(
+                        reserve.current_real_sol_reserves_lamports,
+                        CanonicalNullableV1::Value(_)
+                    )
+                    && matches!(reserve.interval_ms, CanonicalNullableV1::Null)
+                    && matches!(reserve.velocity_sol_per_sec, CanonicalNullableV1::Null)
+            }
+            ReserveVelocityStatusV1::BootstrapFallback => {
+                reserve.accepted_update_count == 0
+                    && matches!(reserve.interval_ms, CanonicalNullableV1::Null)
+                    && matches!(reserve.velocity_sol_per_sec, CanonicalNullableV1::Null)
+            }
+            ReserveVelocityStatusV1::Unavailable => {
+                matches!(reserve.velocity_sol_per_sec, CanonicalNullableV1::Null)
+            }
+            ReserveVelocityStatusV1::ZeroDeltaTime => {
                 reserve.accepted_update_count >= 2
-                    && matches!(reserve.interval_ms, CanonicalNullableV1::Value(value) if value > 0)
                     && matches!(
                         reserve.previous_real_sol_reserves_lamports,
                         CanonicalNullableV1::Value(_)
@@ -1055,18 +1152,6 @@ impl MetricContractsEvidenceSetV1 {
                         reserve.current_real_sol_reserves_lamports,
                         CanonicalNullableV1::Value(_)
                     )
-                    && matches!(reserve.velocity_sol_per_sec, CanonicalNullableV1::Value(_))
-            }
-            ReserveVelocityStatusV1::FirstUpdate => {
-                reserve.accepted_update_count == 1
-                    && matches!(reserve.interval_ms, CanonicalNullableV1::Null)
-                    && matches!(reserve.velocity_sol_per_sec, CanonicalNullableV1::Null)
-            }
-            ReserveVelocityStatusV1::BootstrapFallback | ReserveVelocityStatusV1::Unavailable => {
-                matches!(reserve.velocity_sol_per_sec, CanonicalNullableV1::Null)
-            }
-            ReserveVelocityStatusV1::ZeroDeltaTime => {
-                reserve.accepted_update_count >= 2
                     && matches!(reserve.interval_ms, CanonicalNullableV1::Value(0))
                     && matches!(reserve.velocity_sol_per_sec, CanonicalNullableV1::Null)
             }

@@ -2,7 +2,7 @@ use crate::events::PoolTransaction;
 use crate::tx_intelligence::config::TxIntelligenceConfig;
 use crate::tx_intelligence::{
     compute_dev_behavior, compute_signer_diversity, compute_velocity_profile,
-    compute_volume_sanity, SignerStats,
+    compute_volume_sanity, FlipV2ProducerSnapshotV1, FlipV2StateMachineV1, SignerStats,
 };
 use ghost_brain::fast_pipeline::EnhancedCandidate;
 use ghost_core::metric_contracts::DevBuySelectionModeV1;
@@ -138,6 +138,7 @@ pub struct TxIntelligenceEngine {
     fingerprint_agg: Option<FingerprintAggregator>,
     fingerprint_slot: Option<u64>,
     fingerprint_t0_ms: u64,
+    flip_v2: FlipV2StateMachineV1,
 }
 
 impl TxIntelligenceEngine {
@@ -147,6 +148,12 @@ impl TxIntelligenceEngine {
         candidate_snapshot: &EnhancedCandidate,
         dev_wallet: Option<Pubkey>,
     ) -> Self {
+        let flip_v2 = FlipV2StateMachineV1::new(
+            &config.fingerprint,
+            config.min_sol_threshold,
+            config.tx_key_capacity,
+            candidate_snapshot.timestamp,
+        );
         let mut engine = Self {
             state: TxIntelligenceState::default(),
             config,
@@ -173,6 +180,7 @@ impl TxIntelligenceEngine {
             fingerprint_agg: None,
             fingerprint_slot: candidate_snapshot.slot,
             fingerprint_t0_ms: candidate_snapshot.timestamp,
+            flip_v2,
         };
         engine.rebuild_fingerprint_aggregator();
         engine
@@ -229,6 +237,7 @@ impl TxIntelligenceEngine {
     }
 
     pub fn on_transaction(&mut self, tx: &PoolTransaction) {
+        self.flip_v2.on_transaction(tx);
         self.ingest_fingerprint(tx);
 
         let tx_key = tx_key_for(tx);
@@ -453,6 +462,19 @@ impl TxIntelligenceEngine {
         self.fingerprint_agg
             .as_ref()
             .map(FingerprintAggregator::finalize)
+    }
+
+    #[must_use]
+    pub fn flip_v2_snapshot(
+        &self,
+        decision_timestamp_ms: u64,
+        decision_slot: Option<u64>,
+    ) -> FlipV2ProducerSnapshotV1 {
+        self.flip_v2.snapshot(decision_timestamp_ms, decision_slot)
+    }
+
+    pub fn mark_flip_v2_reconnect_gap(&mut self) {
+        self.flip_v2.mark_reconnect_gap();
     }
 
     #[must_use]

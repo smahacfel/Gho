@@ -1,7 +1,8 @@
 use super::monotonic_guard::MonotonicUpdateGuard;
 use super::types::{
-    AccountStateFeatures, AccountStateUpdate, AccountUpdateRejectReason, AccountUpdateResult,
-    BootstrapHints, BootstrapPoolState, CanonicalPoolState, StatePhase,
+    AccountStateFeatures, AccountStateReserveVelocitySnapshotV1, AccountStateUpdate,
+    AccountUpdateRejectReason, AccountUpdateResult, BootstrapHints, BootstrapPoolState,
+    CanonicalPoolState, StatePhase,
 };
 use crate::market_state::BondingCurve;
 use crate::PROTOCOL_GENESIS_TOKEN_TOTAL_SUPPLY;
@@ -18,6 +19,7 @@ pub struct AccountStateReducer {
     states: DashMap<Pubkey, CanonicalPoolState>,
     update_guards: DashMap<Pubkey, MonotonicUpdateGuard>,
     bootstrap_states: DashMap<Pubkey, BootstrapPoolState>,
+    reserve_velocity_evidence: DashMap<Pubkey, AccountStateReserveVelocitySnapshotV1>,
     recv_seq_counter: AtomicU64,
     latest_observed_slot: AtomicU64,
 }
@@ -100,6 +102,9 @@ impl AccountStateReducer {
             price_change_since_t0_pct,
             reserve_velocity_sol_per_sec,
             update_count,
+            reserve_velocity_previous_real_sol_reserves_lamports,
+            reserve_velocity_interval_ms,
+            reserve_velocity_status,
         ) = if let Some(previous) = previous_state.as_ref() {
             let initial_price_sol =
                 normalize_initial_price(previous.initial_price_sol, previous.price_sol);
@@ -109,14 +114,38 @@ impl AccountStateReducer {
                 previous.last_update_ts_ms,
                 update.receive_ts_ms,
             );
+            let interval_ms = update.receive_ts_ms.checked_sub(previous.last_update_ts_ms);
+            let status = match interval_ms {
+                Some(0) => crate::metric_contracts::ReserveVelocityStatusV1::ZeroDeltaTime,
+                Some(_) => crate::metric_contracts::ReserveVelocityStatusV1::Measured,
+                None => crate::metric_contracts::ReserveVelocityStatusV1::Unavailable,
+            };
+            let (update_count, status) = match previous.update_count.checked_add(1) {
+                Some(update_count) => (update_count, status),
+                None => (
+                    previous.update_count,
+                    crate::metric_contracts::ReserveVelocityStatusV1::Unavailable,
+                ),
+            };
             (
                 initial_price_sol,
                 compute_price_change_pct(initial_price_sol, price_sol),
                 reserve_velocity_sol_per_sec,
-                previous.update_count.saturating_add(1),
+                update_count,
+                Some(previous.real_sol_reserves),
+                interval_ms,
+                status,
             )
         } else {
-            (price_sol, 0.0, 0.0, 1)
+            (
+                price_sol,
+                0.0,
+                0.0,
+                1,
+                None,
+                None,
+                crate::metric_contracts::ReserveVelocityStatusV1::FirstUpdate,
+            )
         };
 
         let pool_amm_id = bootstrap
@@ -158,6 +187,18 @@ impl AccountStateReducer {
                 reserve_velocity_sol_per_sec,
             },
         );
+        self.reserve_velocity_evidence.insert(
+            update.base_mint,
+            AccountStateReserveVelocitySnapshotV1 {
+                legacy_velocity_sol_per_sec: reserve_velocity_sol_per_sec,
+                previous_real_sol_reserves_lamports:
+                    reserve_velocity_previous_real_sol_reserves_lamports,
+                current_real_sol_reserves_lamports: Some(curve.real_sol_reserves),
+                interval_ms: reserve_velocity_interval_ms,
+                accepted_update_count: update_count,
+                status: reserve_velocity_status,
+            },
+        );
         self.latest_observed_slot
             .fetch_max(update.slot, Ordering::Relaxed);
 
@@ -172,6 +213,47 @@ impl AccountStateReducer {
     #[must_use]
     pub fn get_canonical_state(&self, mint: &Pubkey) -> Option<CanonicalPoolState> {
         self.states.get(mint).map(|entry| entry.clone())
+    }
+
+    #[must_use]
+    pub fn get_reserve_velocity_snapshot(
+        &self,
+        mint: &Pubkey,
+    ) -> Option<crate::account_state_core::types::AccountStateReserveVelocitySnapshotV1> {
+        self.reserve_velocity_evidence
+            .get(mint)
+            .map(|entry| entry.clone())
+    }
+
+    /// Frozen metric-contract view owned by AccountStateCore. Bootstrap and
+    /// absent states are represented explicitly so downstream materialization
+    /// never fabricates reserve evidence from an MFS compatibility scalar.
+    #[must_use]
+    pub fn metric_contract_reserve_velocity_snapshot(
+        &self,
+        mint: &Pubkey,
+    ) -> AccountStateReserveVelocitySnapshotV1 {
+        if let Some(snapshot) = self.get_reserve_velocity_snapshot(mint) {
+            return snapshot;
+        }
+        if self.bootstrap_states.contains_key(mint) {
+            return AccountStateReserveVelocitySnapshotV1 {
+                legacy_velocity_sol_per_sec: 0.0,
+                previous_real_sol_reserves_lamports: None,
+                current_real_sol_reserves_lamports: None,
+                interval_ms: None,
+                accepted_update_count: 0,
+                status: crate::metric_contracts::ReserveVelocityStatusV1::BootstrapFallback,
+            };
+        }
+        AccountStateReserveVelocitySnapshotV1 {
+            legacy_velocity_sol_per_sec: 0.0,
+            previous_real_sol_reserves_lamports: None,
+            current_real_sol_reserves_lamports: None,
+            interval_ms: None,
+            accepted_update_count: 0,
+            status: crate::metric_contracts::ReserveVelocityStatusV1::Unavailable,
+        }
     }
 
     #[must_use]
@@ -404,6 +486,105 @@ mod tests {
         assert_eq!(state.source_account_owner_or_program, Some(source_owner_b));
         assert_eq!(state.account_data_len, Some(222));
         assert_eq!(state.account_data_hash.as_deref(), Some("blake3-hash-b"));
+    }
+
+    #[test]
+    fn metric_contract_reserve_velocity_distinguishes_first_measured_zero_and_zero_delta() {
+        let reducer = AccountStateReducer::new();
+        let mint = Pubkey::new_unique();
+        let pool = Pubkey::new_unique();
+        let curve = Pubkey::new_unique();
+        let mut first = sample_update(1, 1);
+        first.base_mint = mint;
+        first.pool_amm_id = pool;
+        first.bonding_curve = curve;
+        first.receive_ts_ms = 1_000;
+        first.sol_reserves = 1_000_000_000;
+        let _ = reducer.apply_account_update(first);
+        let first = reducer.metric_contract_reserve_velocity_snapshot(&mint);
+        assert_eq!(
+            first.status,
+            crate::metric_contracts::ReserveVelocityStatusV1::FirstUpdate
+        );
+        assert_eq!(first.accepted_update_count, 1);
+        assert_eq!(
+            first.current_real_sol_reserves_lamports,
+            Some(1_000_000_000)
+        );
+        assert_eq!(first.interval_ms, None);
+
+        let mut measured = sample_update(2, 2);
+        measured.base_mint = mint;
+        measured.pool_amm_id = pool;
+        measured.bonding_curve = curve;
+        measured.receive_ts_ms = 2_000;
+        measured.sol_reserves = 2_000_000_000;
+        let _ = reducer.apply_account_update(measured);
+        let measured = reducer.metric_contract_reserve_velocity_snapshot(&mint);
+        assert_eq!(
+            measured.status,
+            crate::metric_contracts::ReserveVelocityStatusV1::Measured
+        );
+        assert_eq!(
+            measured.legacy_velocity_sol_per_sec.to_bits(),
+            1.0_f64.to_bits()
+        );
+
+        let mut measured_zero = sample_update(3, 3);
+        measured_zero.base_mint = mint;
+        measured_zero.pool_amm_id = pool;
+        measured_zero.bonding_curve = curve;
+        measured_zero.receive_ts_ms = 3_000;
+        measured_zero.sol_reserves = 2_000_000_000;
+        let _ = reducer.apply_account_update(measured_zero);
+        let measured_zero = reducer.metric_contract_reserve_velocity_snapshot(&mint);
+        assert_eq!(
+            measured_zero.status,
+            crate::metric_contracts::ReserveVelocityStatusV1::Measured
+        );
+        assert_eq!(
+            measured_zero.legacy_velocity_sol_per_sec.to_bits(),
+            0.0_f64.to_bits()
+        );
+
+        let mut zero_delta = sample_update(4, 4);
+        zero_delta.base_mint = mint;
+        zero_delta.pool_amm_id = pool;
+        zero_delta.bonding_curve = curve;
+        zero_delta.receive_ts_ms = 3_000;
+        zero_delta.sol_reserves = 3_000_000_000;
+        let _ = reducer.apply_account_update(zero_delta);
+        let zero_delta = reducer.metric_contract_reserve_velocity_snapshot(&mint);
+        assert_eq!(
+            zero_delta.status,
+            crate::metric_contracts::ReserveVelocityStatusV1::ZeroDeltaTime
+        );
+        assert_eq!(zero_delta.interval_ms, Some(0));
+    }
+
+    #[test]
+    fn metric_contract_reserve_velocity_keeps_bootstrap_and_absent_unavailable_nonmeasured() {
+        let reducer = AccountStateReducer::new();
+        let bootstrap_mint = Pubkey::new_unique();
+        reducer.register_pool_from_bootstrap(
+            Pubkey::new_unique(),
+            bootstrap_mint,
+            Pubkey::new_unique(),
+            BootstrapHints::default(),
+        );
+        let bootstrap = reducer.metric_contract_reserve_velocity_snapshot(&bootstrap_mint);
+        assert_eq!(
+            bootstrap.status,
+            crate::metric_contracts::ReserveVelocityStatusV1::BootstrapFallback
+        );
+        assert_eq!(bootstrap.accepted_update_count, 0);
+
+        let absent = reducer.metric_contract_reserve_velocity_snapshot(&Pubkey::new_unique());
+        assert_eq!(
+            absent.status,
+            crate::metric_contracts::ReserveVelocityStatusV1::Unavailable
+        );
+        assert_eq!(absent.accepted_update_count, 0);
     }
 }
 

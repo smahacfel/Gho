@@ -1126,8 +1126,12 @@ fn assert_real_unavailable_fsc_cohort_path(stream_available: bool) {
                 MetricContractProducerIdV1::AccountStateCore,
                 &profile,
             ),
-            previous_real_sol_reserves_lamports: compact_test_field(CanonicalU64StringV1::new(1)),
-            current_real_sol_reserves_lamports: compact_test_field(CanonicalU64StringV1::new(2)),
+            previous_real_sol_reserves_lamports: compact_test_field(CanonicalU64StringV1::new(
+                1_000_000_000,
+            )),
+            current_real_sol_reserves_lamports: compact_test_field(CanonicalU64StringV1::new(
+                2_000_000_000,
+            )),
             interval_ms: compact_test_field(1_000),
             accepted_update_count: 2,
             source_clock: ReserveVelocitySourceClockV1::ReceiveTime,
