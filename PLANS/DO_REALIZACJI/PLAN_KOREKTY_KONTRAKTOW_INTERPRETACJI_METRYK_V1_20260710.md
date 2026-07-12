@@ -7,8 +7,10 @@ PLAN_V1_1_ACCEPTED
 PR0_SEMANTIC_CONTENT_PASS
 PR0_PROVENANCE_AND_REPRODUCIBILITY_PASS
 BASELINE_RECONCILIATION_PASS
-PR1_FOUNDATION_ALLOWED
-PR2_PLUS_BLOCKED_UNTIL_SEQUENTIAL_ACCEPTANCE
+PR1_FOUNDATION_COMPLETE
+PRE_PR2A_MFS_PROJECTION_AMENDMENT_ACCEPTED
+PR2A_ALLOWED_AFTER_DOCUMENTATION_PR_MERGE
+PR2B_PLUS_BLOCKED_UNTIL_SEQUENTIAL_ACCEPTANCE
 ```
 
 Wersja kontraktu: `metric_contracts_v1_1`
@@ -20,6 +22,11 @@ Data rewizji V1.1: 2026-07-11
 Korekta PR0 provenance/reproducibility: 2026-07-11. Nie zmienia dziesięciu
 kontraktów semantycznych; domyka przed PR1 canonical hashing, effective config
 hash oraz record/event identity.
+
+Pre-PR2A amendment kompaktowej projekcji MFS: 2026-07-12. Zatwierdza wyłącznie
+decision-time projection dziesięciu istniejących rodzin, jej granicę względem
+pełnego sidecara oraz podział dostarczenia między PR2A/PR2B/PR2C. Nie dodaje
+metryki, producenta, authority ani wpływu na policy.
 
 Dokument źródłowy:
 `PLANS/AUDYT/RAPORT_AUDYT_KOREKTY_INTERPRETACJI_METRYK_20260710.md`
@@ -63,7 +70,7 @@ kontrakt
 → wyłącznie równoważny cutover
 ```
 
-Wprowadza siedem obowiązkowych uzupełnień:
+Wprowadza osiem obowiązkowych uzupełnień:
 
 1. Baseline reconciliation względem aktualnego target branch i merge-base.
 2. Globalny rollout mode jako ceiling oraz osobny, wersjonowany authority profile.
@@ -73,6 +80,8 @@ Wprowadza siedem obowiązkowych uzupełnień:
 6. Compact decision v34 oraz pełny evidence sidecar z budżetem zasobów.
 7. Wielorunowy burn-in bundle i zamrożenie minimów przed zebraniem danych
    walidacyjnych.
+8. Kompaktową, presence-aware projekcję decision-time w MFS, oddzieloną od
+   pełnego audit transportu i budowaną z tego samego frozen producer snapshotu.
 
 Plan ma trzy główne milestones, ale sześć rzeczywistych PR-ów:
 
@@ -345,6 +354,218 @@ brain_config_hash                         provenance only
 gatekeeper_config_hash                    policy parity
 metric_contract_effective_config_hash     metric evidence equivalence
 ```
+
+### 2.6 Kompaktowa projekcja decision-time w MFS — pre-PR2A amendment
+
+Niniejsza sekcja zamyka prerequisite wskazany przez zamrożony etap Type-5 T0.
+Normatywna nazwa przyszłego pola to:
+
+```rust
+#[serde(default)]
+pub metric_contract_decision_projection_v1:
+    Option<MetricContractDecisionEvidenceProjectionV1>
+```
+
+`Option` jest wyłącznie storage/migration wrapperem. Obecny rekord utworzony po
+pełnej aktywacji PR2B musi mieć `Some`. Historyczny brak pola deserializuje się
+do `None` i mapuje na `MetricAvailabilityV1::NotRecordedLegacySchema` oraz
+`MetricMeasurementQualityV1::NotApplicable`; nigdy na measured zero, pusty hash
+ani bieżący default. Logiczny payload pola ma dokładnie typ:
+
+```rust
+#[serde(deny_unknown_fields)]
+pub struct MetricContractDecisionEvidenceProjectionV1 {
+    pub schema_version: u16,
+    pub rollout_mode: MetricContractRolloutMode,
+    pub profile_id: MetricContractProfileIdV1,
+    pub profile_hash: CanonicalHashV1,
+    pub metric_contract_effective_config_hash: CanonicalHashV1,
+    pub fee_topology_diversity_index: FtdiDecisionProjectionV1,
+    pub dev_buy: DevBuyDecisionProjectionV1,
+    pub same_ms_tx_ratio: TxTimingDecisionProjectionV1,
+    pub top3_signer_volume_ratio: Top3DecisionProjectionV1,
+    pub flip_ratio: FlipDecisionProjectionV1,
+    pub funding_source_concentration: FundingDecisionProjectionV1,
+    pub fsc_evidence_status: FscStatusDecisionProjectionV1,
+    pub manipulation_contradiction: ManipulationDecisionProjectionV1,
+    pub reserve_velocity: ReserveVelocityDecisionProjectionV1,
+    pub recent_buy_sell: RecentBuySellDecisionProjectionV1,
+}
+```
+
+To nie jest `MetricContractsEvidenceSetV1` ani
+`MetricContractEvidenceTransportV1`; pole nie może być ich aliasem, wrapperem,
+kopią ani miejscem przechowywania transport metadata. Pełny payload pozostaje
+wyłącznie w `metric_contract_evidence_v1.jsonl`.
+
+#### 2.6.1 Wspólny compact envelope i provenance
+
+Każda surface w projection używa zamkniętego, walidowanego kontraktu:
+
+```rust
+pub const METRIC_CONTRACT_DECISION_PROJECTION_SCHEMA_VERSION_V1: u16 = 1;
+pub const METRIC_DECISION_MAX_REASON_CODES_PER_VALUE_V1: usize = 8;
+
+#[serde(deny_unknown_fields)]
+pub struct MetricDecisionReasonSummaryV1 {
+    pub codes: Vec<MetricEvidenceReasonV1>,
+    pub omitted_count: u16,
+}
+
+#[serde(deny_unknown_fields)]
+pub struct MetricDecisionEnvelopeV1 {
+    pub contract_id: MetricContractId,
+    pub contract_version: u16,
+    pub surface_id: MetricSurfaceId,
+    pub authority_class: MetricAuthorityClass,
+    pub rollout_role: MetricRolloutRoleV1,
+    pub availability: MetricAvailabilityV1,
+    pub measurement_quality: MetricMeasurementQualityV1,
+    pub policy_actionable: bool,
+    pub reasons: MetricDecisionReasonSummaryV1,
+}
+
+pub enum MetricContractProducerIdV1 {
+    FeeTopologyDiversityProducer,
+    TxIntelligenceEngine,
+    TxIntelEffectiveTop3Selector,
+    TxIntelligenceFingerprintAggregator,
+    FundingSourceIndex,
+    MaterializedFscStatusAdapter,
+    ManipulationEvidenceAdapter,
+    ManipulationPolicyDerivation,
+    AccountStateCore,
+    RecentBuySellWindowProducer,
+}
+
+#[serde(deny_unknown_fields)]
+pub struct MetricContractDecisionSourceCutoffV1 {
+    pub decision_timestamp_ms: CanonicalU64StringV1,
+    pub decision_slot: CanonicalNullableV1<CanonicalU64StringV1>,
+}
+
+#[serde(deny_unknown_fields)]
+pub struct MetricDecisionSurfaceValueV1<T> {
+    pub envelope: MetricDecisionEnvelopeV1,
+    pub value: CanonicalNullableV1<T>,
+    pub producer_id: MetricContractProducerIdV1,
+    pub producer_schema_version: u16,
+    pub source_cutoff: MetricContractDecisionSourceCutoffV1,
+}
+
+#[serde(deny_unknown_fields)]
+pub struct MetricDecisionFieldValueV1<T> {
+    pub value: CanonicalNullableV1<T>,
+    pub availability: MetricAvailabilityV1,
+    pub measurement_quality: MetricMeasurementQualityV1,
+    pub reasons: MetricDecisionReasonSummaryV1,
+}
+```
+
+`codes.len() <= 8`; reasons zachowują canonical producer order, duplikaty są
+zakazane, a nadmiar zwiększa `omitted_count`. Brak poprawnego producer ID,
+schema version, cutoff, profile hash lub effective-config hash czyni wartość
+non-evaluable. `rollout_role` jest wynikiem exact profile assignment dla
+bieżącego mode; nie wolno wybierać pierwszej surface o pasującej authority.
+
+#### 2.6.2 Exact per-family projection fields
+
+Nazwy poniżej są normatywne. `MetricDecisionRatioV1` zawiera
+`surface: MetricDecisionSurfaceValueV1<f64>`, `numerator: u32`,
+`denominator: u32`, source-qualified population i optional `window_ms`.
+
+| Projection | Dokładne compact fields |
+| --- | --- |
+| `FtdiDecisionProjectionV1` | `legacy_value`, `value_v1`, `unique_topology_count`, `unique_buyer_sample_count`, `buy_transaction_sample_count`, `legacy_buy_tx_actionability`, `unique_buyer_actionability_v2`; coordination HHI jest sidecar-only. |
+| `DevBuyDecisionProjectionV1` | `tx_intel_first_observed`, `mfs_first_observed`, `mfs_primary_v1`, `effective_policy`, `creator_known`, `create_signature_matched`, `primary_selection_mode`, `primary_eligible_buy_count`; signatures/order keys i GatekeeperBuffer compatibility detail są sidecar-only. |
+| `TxTimingDecisionProjectionV1` | `legacy_exact`, `exact_v1`, `cluster_lt_50ms`, `recent_exact`, każdy jako `MetricDecisionRatioV1`. |
+| `Top3DecisionProjectionV1` | `preferred`, `compatibility_alias`, `effective`, `preferred_alias_bitwise_equal`, `used_compatibility_fallback`. Wszystkie ratios mają skalę `0..1`. |
+| `FlipDecisionProjectionV1` | `legacy_slot_gap_ratio`, `hybrid_v2_ratio`, `eligible_buyer_count`, `flipper_count`, `wall_clock_window_ms`, `max_slot_gap`, `dump_ratio`; brak owner/event collections. |
+| `FundingDecisionProjectionV1` | `legacy_source`, `legacy_v1`, `distinct_known_source_count`, `known_source_sample_count`, `fsc_v2`, `known_coverage`, `non_neutral_known_coverage`, `known_buyer_count`, `total_buyer_count`; provider candidates i coordination HHI są sidecar-only. |
+| `FscStatusDecisionProjectionV1` | `compatibility_status`, `legacy_scalar_present`, `legacy_feature_status`, `fsc_v2_status`, `fsc_v2_coverage`. |
+| `ManipulationDecisionProjectionV1` | `legacy_numeric_envelope`, `numeric_v2_envelope`, `measured_fields_mask`, siedem nazwanych `MetricDecisionFieldValueV1<f64>`: `same_ms_tx_ratio`, `bundle_suspicion_ratio`, `top3_signer_volume_ratio`, `hhi`, `max_tx_per_signer`, `dev_volume_ratio`, `contradiction_score`; ponadto `legacy_high_recorded_mask`, `legacy_high_true_mask`, `derived_high_evaluable_mask`, `derived_high_true_mask`. Brak vectors zależnych od inputu. |
+| `ReserveVelocityDecisionProjectionV1` | `legacy_velocity`, `velocity_v1`, `previous_real_sol_reserves_lamports`, `current_real_sol_reserves_lamports`, `interval_ms`, `accepted_update_count`, `source_clock`, `status`. |
+| `RecentBuySellDecisionProjectionV1` | `legacy_scalar`, `v1_envelope`, `window_ms`, `buy_count`, `sell_count`, `transaction_count`, `buy_to_sell_ratio`, `buy_share`. |
+
+Każda scalar/status surface w tabeli jest `MetricDecisionSurfaceValueV1<T>` albo
+ma jawny family envelope o tych samych polach authority/quality/provenance.
+Wszystkie rodziny są required keys, gdy root projection jest `Some`; partial
+projection jest błędem budowy i replayu.
+
+#### 2.6.3 Jeden producer snapshot, dwie reprezentacje
+
+PR2A/PR2B ustanawiają jeden builder boundary:
+
+```text
+canonical per-family producers
+→ immutable MetricContractsEvidenceSetV1 snapshot
+→ (a) lossless full evidence dla PR2C sidecara
+→ (b) pure bounded MetricContractDecisionEvidenceProjectionV1
+```
+
+Projection jest wyłącznie `TryFrom<&MetricContractsEvidenceSetV1>` plus frozen
+mode/profile/effective-config/cutoff. Nie odpytuje producentów, raw events,
+GatekeeperBuffer ani live state i nie liczy żadnej metryki ponownie. Ten sam
+snapshot instance zasila obie reprezentacje; test spy/call-count musi wykazać
+jeden producer invocation per family.
+
+Konwersja jest celowo jednokierunkowa i stratna. Zakazane jest rekonstruowanie z
+projection pełnego evidence setu, w szczególności:
+
+- `FlipRatioEvidenceV2.owners`, anchors, sell identities i cumulative flows;
+- per-event lists oraz pełnych FSC transfer candidates;
+- selected signatures/order keys niewymaganych przez decyzję;
+- writer timestamp, rotation metadata i transport wrappera.
+
+#### 2.6.4 Serde, hash i replay
+
+- projection i wszystkie family types używają `deny_unknown_fields`;
+- historyczny brak root pola daje `None/NotRecordedLegacySchema`, nie syntetyczny
+  projection;
+- unknown projection schema, profile/hash/effective-config mismatch, partial
+  family albo invalid envelope failują replay;
+- projection ma osobny semantic `CanonicalHashV1` liczony nad pełnym root
+  payloadem bez self-hash; nie zastępuje `evidence_sha256` pełnego sidecara;
+- PR2C replay buduje projection ponownie z zahashowanego full evidence snapshotu
+  i wymaga exact equality z decision-time projection;
+- v33 zachowuje frozen replay bez oczekiwania pola; v34 wymaga go tylko dla
+  rekordów utworzonych przez schema/build, który deklaruje projection V1;
+- full sidecar pozostaje jedynym źródłem owner/event audit detail.
+
+#### 2.6.5 Boundedness i resource gate
+
+Projection nie zawiera nieograniczonych kolekcji poza reason vectors o stałym
+limicie. PR2B acceptance wymaga jednocześnie:
+
+```text
+metric_contract_projection_build_and_validate_us p99 <= 1_000 us
+metric_contract_projection_serialized_bytes p95 <= 12 KiB
+metric_contract_projection_serialized_bytes hard max <= 16 KiB
+projection build failures = 0
+projection/full-snapshot parity failures = 0
+```
+
+Build/validation time wchodzi także do istniejącego
+`metric_contract_build_and_serialize_us`; limity nie sumują osobnych budżetów.
+Przekroczenie hard max lub utrata detail przez próbę zmieszczenia pełnego
+sidecara daje `FAIL_RESOURCE_BUDGET`, nie silent truncation. Wyjątkiem są tylko
+reason codes z jawnym `omitted_count`.
+
+#### 2.6.6 Podział dostarczenia
+
+- **PR2A:** definiuje common projection types i buildery rodzin FTDI, dev,
+  same-ms, top3, legacy FSC/FSC status; nie aktywuje częściowo wypełnionego pola
+  MFS.
+- **PR2B:** dodaje flip, manipulation, reserve i recent families, po czym
+  atomowo materializuje kompletne optional storage field w MFS; current build
+  musi emitować `Some` dla każdego terminalnego decision snapshotu.
+- **PR2C:** zapisuje full evidence sidecar z tego samego snapshotu, wykonuje
+  projection/full equality replay, paired join i resource telemetry. v34
+  pozostaje compact summary, a nie kopią projection ani sidecara.
+
+Do merge dokumentacyjnego PR zawierającego tę sekcję PR2A pozostaje
+zablokowany. Po merge status przechodzi na `PR2A_ALLOWED`; PR2B, PR2C, PR3 oraz
+Type-5 T1 nadal wymagają własnych sequential acceptance gates.
 
 ## 3. Normatywne kontrakty wymagające doprecyzowania
 
@@ -636,6 +857,7 @@ Wszystkie rotowane parts mają row/byte counts i SHA-256 w manifeście. Replay v
 ```text
 comparator_elapsed_us p99 <= 1_000 us
 metric_contract_build_and_serialize_us p99 <= 1_000 us
+metric_contract_projection_build_and_validate_us p99 <= 1_000 us
 logger_enqueue_wait_us p99 <= 1_000 us
 writer_queue_high_water < 80% capacity
 dropped rows = 0
@@ -648,6 +870,7 @@ Rozmiar:
 ```text
 compact v34 p95 increase <= 8 KiB względem paired v33
 compact v34 p95 increase <= 10% względem paired v33
+MFS projection p95 <= 12 KiB i hard max <= 16 KiB
 sidecar p95 <= 24 KiB
 sidecar p99 <= 48 KiB
 combined GB/hour delta <= 25% względem paired v33 plane
@@ -726,6 +949,8 @@ muszą pozostać identyczne.
 
 ### 5.3 PR2A — active/parity-sensitive producers
 
+- common compact projection schema/envelopes oraz family builders dla zakresu
+  PR2A, bez częściowej aktywacji pola MFS;
 - FTDI typed value + oddzielne legacy/V2 actionability;
 - surface-qualified dev first-observed i primary evidence;
 - MFS dev-primary counterfactual;
@@ -750,7 +975,10 @@ METRIC_CONTRACTS_V1_1_PARITY_SENSITIVE_PRODUCERS_READY
 - reserve velocity evidence;
 - recent buy/sell evidence;
 - manipulation numeric presence i derived flags;
-- bounded state/dedupe/order/reconnect diagnostics.
+- bounded state/dedupe/order/reconnect diagnostics;
+- family builders zakresu PR2B oraz atomowa materializacja kompletnego
+  `MaterializedFeatureSet.metric_contract_decision_projection_v1`;
+- one-producer/two-representations parity i projection resource gate z §2.6.
 
 Acceptance:
 
@@ -764,8 +992,11 @@ candidate, no live reads, no unbounded state, no saturating order concealment.
 ### 5.5 PR2C — v34, sidecar, comparator, replay i audit CLI
 
 - compact v34 i pełny sidecar;
+- pełny sidecar i MFS projection z tego samego frozen producer snapshotu;
 - paired writer i health counters;
 - v1/v2 replay;
+- exact projection/full-snapshot replay equality oraz rejection unknown/partial
+  projection schema;
 - equivalence i semantic-counterfactual comparators;
 - single-run i bundle audit CLI;
 - manifests/rotation/SHA/resource telemetry;
@@ -920,7 +1151,12 @@ i equivalence lane pozostają niezmienione.
 - każda effective-config entry zmienia `metric_contract_effective_config_hash`,
   a unrelated config nie zmienia go;
 - exhaustive status adapters i invalid combinations;
-- v33/V3 v1 nie dostają optymistycznego Measured.
+- v33/V3 v1 nie dostają optymistycznego Measured;
+- absent optional MFS projection mapuje się na `NotRecordedLegacySchema`;
+- complete required-family round-trip, unknown/partial schema rejection;
+- bounded reason summary, hard serialized-size cap i deterministic projection
+  hash;
+- producer call-count = 1 oraz exact projection z tego samego full snapshotu.
 
 ### FTDI/dev
 
@@ -961,6 +1197,8 @@ i equivalence lane pozostają niezmienione.
 ### Logger/replay/bundle
 
 - v33 read/v34 round-trip;
+- full evidence → projection equality i dowód, że projection nie pozwala
+  odtworzyć owner/event audit detail;
 - hash mismatch, missing pair, orphan, truncated line, rotated parts;
 - mixed profile/config/run, queue pressure, ENOSPC/writer disable;
 - per-run PASS before aggregate, duplicate pełnego record identity;
@@ -1019,6 +1257,14 @@ Plan jest wykonany dopiero, gdy:
 21. Record identity i cross-run underlying-event identity nie są zlewane.
 22. PR0 manifest, summary i reproduction contract są machine-readable oraz
     przechodzą input-hash i exact-output comparison.
+23. MFS zawiera wyłącznie compact
+    `MetricContractDecisionEvidenceProjectionV1`, nigdy pełny evidence set lub
+    transport.
+24. Wszystkie 10 projection families powstaje z jednego frozen producer
+    snapshotu bez metric recompute.
+25. Historyczny brak projection pozostaje typed `NotRecordedLegacySchema`, a
+    obecny partial/invalid projection failuje zamknięcie.
+26. Projection resource gate i exact full-snapshot replay parity przechodzą.
 
 ```yaml
 task_classification: cross-cutting metric-contract architecture and guarded rollout
