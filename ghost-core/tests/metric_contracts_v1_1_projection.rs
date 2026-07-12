@@ -2,6 +2,7 @@ use ghost_core::checkpoint::{EvidenceStatus, MaterializedEvidenceStatus};
 use ghost_core::metric_contracts::*;
 use ghost_core::tx_intelligence::types::FscEvidenceStatus;
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 
 fn value_for_key(key: MetricEffectiveConfigKeyV1) -> MetricEffectiveConfigValueV1 {
     match key {
@@ -840,6 +841,29 @@ fn timing_exact_and_cluster_schema_semantics_reject_rehashed_config_drift() {
 }
 
 #[test]
+fn funding_compact_projection_has_exact_normative_field_set() {
+    let funding = serde_json::to_value(complete_projection().funding_source_concentration).unwrap();
+    let object = funding.as_object().unwrap();
+    let actual = object.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    let expected = [
+        "legacy_source",
+        "legacy_v1",
+        "distinct_known_source_count",
+        "known_source_sample_count",
+        "fsc_v2",
+        "known_coverage",
+        "non_neutral_known_coverage",
+        "known_buyer_count",
+        "total_buyer_count",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+
+    assert_eq!(actual, expected);
+    assert!(!object.contains_key("known_non_neutral_buyer_count"));
+}
+
+#[test]
 fn compact_fsc_counts_coverage_and_clean_thresholds_fail_closed() {
     let profile = MetricContractProfileV1::profile_a().unwrap();
     let config = effective_config();
@@ -850,26 +874,12 @@ fn compact_fsc_counts_coverage_and_clean_thresholds_fail_closed() {
     assert!(matches!(
         projection.validate_context(&context),
         Err(MetricContractProjectionErrorV1::FamilyInvariant(
-            "FSC v2 counts/coverage parity"
-        ))
-    ));
-
-    let mut projection = complete_projection();
-    projection
-        .funding_source_concentration
-        .known_non_neutral_buyer_count = 1;
-    assert!(matches!(
-        projection.validated_canonical_hash(&context),
-        Err(MetricContractProjectionErrorV1::FamilyInvariant(
-            "FSC v2 counts/coverage parity"
+            "FSC v2 known count/coverage parity"
         ))
     ));
 
     let mut projection = complete_projection();
     projection.funding_source_concentration.known_buyer_count = 0;
-    projection
-        .funding_source_concentration
-        .known_non_neutral_buyer_count = 0;
     projection.funding_source_concentration.total_buyer_count = 0;
     assert!(matches!(
         projection.validate_context(&context),
@@ -878,48 +888,36 @@ fn compact_fsc_counts_coverage_and_clean_thresholds_fail_closed() {
         ))
     ));
 
-    for replacements in [
-        vec![(
-            MetricEffectiveConfigKeyV1::FscMinTotalBuyers,
-            MetricEffectiveConfigValueV1::WideUnsigned(CanonicalU64StringV1::new(3)),
-        )],
-        vec![(
-            MetricEffectiveConfigKeyV1::FscMinKnownNonNeutralBuyers,
-            MetricEffectiveConfigValueV1::WideUnsigned(CanonicalU64StringV1::new(3)),
-        )],
-    ] {
-        let config = effective_config_with_values(&replacements);
-        let context = projection_context(&profile, &config);
-        let mut projection = complete_projection();
-        projection.metric_contract_effective_config_hash =
-            config.metric_contract_effective_config_hash.clone();
-        assert!(matches!(
-            projection.validate_context(&context),
-            Err(MetricContractProjectionErrorV1::FamilyInvariant(
-                "clean FSC v2 status is below effective-config minimum"
-            ))
-        ));
-    }
+    let replacements = vec![(
+        MetricEffectiveConfigKeyV1::FscMinTotalBuyers,
+        MetricEffectiveConfigValueV1::WideUnsigned(CanonicalU64StringV1::new(3)),
+    )];
+    let config = effective_config_with_values(&replacements);
+    let context = projection_context(&profile, &config);
+    let mut projection = complete_projection();
+    projection.metric_contract_effective_config_hash =
+        config.metric_contract_effective_config_hash.clone();
+    assert!(matches!(
+        projection.validate_context(&context),
+        Err(MetricContractProjectionErrorV1::FamilyInvariant(
+            "clean FSC v2 status is below effective-config minimum"
+        ))
+    ));
 
     for coverage_key in [
         MetricEffectiveConfigKeyV1::FscMinKnownCoverage,
         MetricEffectiveConfigKeyV1::FscMinNonNeutralKnownCoverage,
     ] {
-        let config = effective_config_with_values(&[
-            (
-                MetricEffectiveConfigKeyV1::FscMinKnownNonNeutralBuyers,
-                MetricEffectiveConfigValueV1::WideUnsigned(CanonicalU64StringV1::new(1)),
-            ),
-            (coverage_key, MetricEffectiveConfigValueV1::Ratio(0.75)),
-        ]);
+        let config = effective_config_with_values(&[(
+            coverage_key,
+            MetricEffectiveConfigValueV1::Ratio(0.75),
+        )]);
         let context = projection_context(&profile, &config);
         let mut projection = complete_projection();
         projection.metric_contract_effective_config_hash =
             config.metric_contract_effective_config_hash.clone();
         projection.funding_source_concentration.known_buyer_count = 1;
-        projection
-            .funding_source_concentration
-            .known_non_neutral_buyer_count = 1;
+        projection.funding_source_concentration.total_buyer_count = 2;
         projection.funding_source_concentration.known_coverage.value =
             CanonicalNullableV1::Value(0.5);
         projection

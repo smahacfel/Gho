@@ -1119,6 +1119,145 @@ fn stale_fsc_computation_is_rejected_by_both_builders_after_config_is_rehashed()
 }
 
 #[test]
+fn non_neutral_buyer_count_is_full_evidence_only_and_not_compact_projection() {
+    let gatekeeper = GatekeeperV2Config::default();
+    let fsc_v2 = FscV2Config {
+        min_known_non_neutral_buyers: 1,
+        ..FscV2Config::default()
+    };
+    let (profile, resolved, funding, producer_config) =
+        fsc_runtime_contract_context(&gatekeeper, &fsc_v2);
+    let context = Pr2aEvidenceBuildContextV1 {
+        rollout_mode: MetricContractRolloutMode::Legacy,
+        profile: &profile,
+        effective_config: &resolved,
+    };
+    let mut computation = FundingSourceIndex::new()
+        .compute_for_transactions(std::iter::empty::<&PoolTransaction>(), &funding);
+    computation.funding_source_v2.total_buyers = 2;
+    computation.funding_source_v2.known_buyers = 2;
+    computation.funding_source_v2.known_non_neutral_buyers = 1;
+    computation.funding_source_v2.known_coverage = 1.0;
+    computation.funding_source_v2.non_neutral_known_coverage = 0.5;
+    computation.funding_source_v2.status =
+        ghost_core::tx_intelligence::types::FscEvidenceStatus::Clean;
+
+    let evidence =
+        build_funding_evidence_v1(&computation, &funding, &producer_config, &context).unwrap();
+    assert_eq!(evidence.known_non_neutral_buyer_count, 1);
+
+    let projection_context = MetricDecisionProjectionBuildContextV1 {
+        rollout_mode: MetricContractRolloutMode::Legacy,
+        profile: &profile,
+        effective_config: &resolved,
+        source_cutoff: MetricContractDecisionSourceCutoffV1::try_new(10_000, Some(1)).unwrap(),
+    };
+    let projection =
+        FundingDecisionProjectionV1::try_from_evidence(&evidence, &projection_context).unwrap();
+    let compact_json = serde_json::to_value(projection).unwrap();
+    assert!(!compact_json
+        .as_object()
+        .unwrap()
+        .contains_key("known_non_neutral_buyer_count"));
+
+    let mut mismatched = computation;
+    mismatched.funding_source_v2.known_non_neutral_buyers = 2;
+    assert!(matches!(
+        build_funding_evidence_v1(&mismatched, &funding, &producer_config, &context),
+        Err(Pr2aProducerErrorV1::ProducerInvariant(
+            "fsc.v2_non_neutral_known_coverage"
+        ))
+    ));
+}
+
+#[test]
+fn fsc_frozen_boundary_rejects_count_coverage_drift_and_clean_non_neutral_minimum() {
+    let gatekeeper = GatekeeperV2Config::default();
+    let fsc_v2 = FscV2Config::default();
+    let (profile, resolved, funding, producer_config) =
+        fsc_runtime_contract_context(&gatekeeper, &fsc_v2);
+    let context = Pr2aEvidenceBuildContextV1 {
+        rollout_mode: MetricContractRolloutMode::Legacy,
+        profile: &profile,
+        effective_config: &resolved,
+    };
+    let mut valid = FundingSourceIndex::new()
+        .compute_for_transactions(std::iter::empty::<&PoolTransaction>(), &funding);
+    valid.funding_source_v2.total_buyers = 2;
+    valid.funding_source_v2.known_buyers = 2;
+    valid.funding_source_v2.known_non_neutral_buyers = 2;
+    valid.funding_source_v2.known_coverage = 1.0;
+    valid.funding_source_v2.non_neutral_known_coverage = 1.0;
+    valid.funding_source_v2.status = ghost_core::tx_intelligence::types::FscEvidenceStatus::Clean;
+    build_funding_evidence_v1(&valid, &funding, &producer_config, &context).unwrap();
+
+    let mut wrong_counts = valid.clone();
+    wrong_counts.funding_source_v2.known_non_neutral_buyers = 3;
+    assert!(matches!(
+        build_funding_evidence_v1(&wrong_counts, &funding, &producer_config, &context),
+        Err(Pr2aProducerErrorV1::ProducerInvariant(
+            "fsc.v2_buyer_counts"
+        ))
+    ));
+
+    let mut known_exceeds_total = valid.clone();
+    known_exceeds_total.funding_source_v2.known_buyers = 3;
+    assert!(matches!(
+        build_funding_evidence_v1(&known_exceeds_total, &funding, &producer_config, &context),
+        Err(Pr2aProducerErrorV1::ProducerInvariant(
+            "fsc.v2_buyer_counts"
+        ))
+    ));
+
+    let mut wrong_known_coverage = valid.clone();
+    wrong_known_coverage.funding_source_v2.known_buyers = 1;
+    wrong_known_coverage
+        .funding_source_v2
+        .known_non_neutral_buyers = 1;
+    assert!(matches!(
+        build_funding_evidence_v1(&wrong_known_coverage, &funding, &producer_config, &context),
+        Err(Pr2aProducerErrorV1::ProducerInvariant(
+            "fsc.v2_known_coverage"
+        ))
+    ));
+
+    let mut wrong_non_neutral_coverage = valid.clone();
+    wrong_non_neutral_coverage
+        .funding_source_v2
+        .known_non_neutral_buyers = 1;
+    assert!(matches!(
+        build_funding_evidence_v1(
+            &wrong_non_neutral_coverage,
+            &funding,
+            &producer_config,
+            &context
+        ),
+        Err(Pr2aProducerErrorV1::ProducerInvariant(
+            "fsc.v2_non_neutral_known_coverage"
+        ))
+    ));
+
+    let mut below_clean_minimum = valid;
+    below_clean_minimum
+        .funding_source_v2
+        .known_non_neutral_buyers = 1;
+    below_clean_minimum
+        .funding_source_v2
+        .non_neutral_known_coverage = 0.5;
+    for error in [
+        build_funding_evidence_v1(&below_clean_minimum, &funding, &producer_config, &context)
+            .unwrap_err(),
+        build_fsc_status_evidence_v1(&below_clean_minimum, &funding, &producer_config, &context)
+            .unwrap_err(),
+    ] {
+        assert!(matches!(
+            error,
+            Pr2aProducerErrorV1::ProducerInvariant("fsc.v2_clean_effective_config_minimum")
+        ));
+    }
+}
+
+#[test]
 fn fsc_computation_embedded_producer_settings_are_defensively_cross_checked() {
     let gatekeeper = GatekeeperV2Config {
         neutral_funding_sources: vec!["neutral-source-a".to_string()],

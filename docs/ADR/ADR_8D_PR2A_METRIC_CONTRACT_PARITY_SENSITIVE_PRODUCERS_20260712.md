@@ -316,8 +316,28 @@ Historyczne rekordy bez nowych pól deserializują je przez `serde(default)` do
 fail-closed unavailable. `GatekeeperV3EvidenceRequirements.fsc_v2` ma default
 `false`. FSC v2 nie jest promowane do policy.
 
-Compact funding projection zachowuje teraz także
-`known_non_neutral_buyer_count`. Walidator egzekwuje exact bitwise parity:
+`FundingDecisionProjectionV1` zachowuje dokładny, normatywny field-set z §2.6.2
+planu i pozostaje celowo stratną, jednokierunkową projekcją full evidence:
+
+```text
+legacy_source
+legacy_v1
+distinct_known_source_count
+known_source_sample_count
+fsc_v2
+known_coverage
+non_neutral_known_coverage
+known_buyer_count
+total_buyer_count
+```
+
+`known_non_neutral_buyer_count` jest wyłącznie full-evidence-only producer
+detail w `FundingSourceContractEvidenceV1`; nie występuje w
+`FundingDecisionProjectionV1`, nie jest wymaganiem Type-5 i nie zmienia MFS.
+
+Frozen producer boundary, przed utworzeniem full evidence, używa dokładnego
+`FscComputation`, owner-produced config snapshotu i effective-config do
+egzekwowania:
 
 ```text
 known_buyer_count <= total_buyer_count
@@ -326,11 +346,15 @@ known_coverage = known_buyer_count / total_buyer_count
 non_neutral_known_coverage = known_non_neutral_buyer_count / total_buyer_count
 ```
 
-`total_buyer_count == 0` wymaga null status/coverage i zerowych counts. Status
-`Clean` wymaga równocześnie wszystkich czterech minimów pobranych z dokładnego
-effective-config: total buyers, known non-neutral buyers, known coverage i
-non-neutral known coverage. Lane-health nie jest rekonstruowane w compact
-validatorze; niewidoczne producer settings są związane frozen fingerprintem.
+Na tej granicy status `Clean` wymaga wszystkich czterech minimów, włącznie z
+`FscMinKnownNonNeutralBuyers`. Compact validator sprawdza wyłącznie dane, które
+reprezentuje: known/total ordering, exact known coverage, zero-total i
+unavailable fail-closed oraz minima total, known coverage i non-neutral known
+coverage. Nie rekonstruuje brakującego non-neutral countu ani lane-health.
+
+W zamkniętej klasyfikacji 56 kluczy `FscMinKnownNonNeutralBuyers` należy do
+`FrozenProducerBoundaryValidated`; `FscMinTotalBuyers`, `FscMinKnownCoverage`
+i `FscMinNonNeutralKnownCoverage` pozostają `CompactValidated`.
 
 ## 5. Effective config
 
@@ -458,6 +482,7 @@ PR2A_VALIDATED_HASH_PATH_PASS
 PR2A_EFFECTIVE_CONFIG_PROJECTION_PARITY_PASS
 PR2A_VALIDATED_HASH_CONTEXT_BINDING_PASS
 PR2A_RECENT_EXACT_ZERO_WIDTH_WINDOW_PASS
+PR2A_COMPACT_SCHEMA_EXACT_PLAN_PARITY_PASS
 PR2A_FSC_FROZEN_CONFIG_PROVENANCE_PASS
 PR2A_FSC_STATUS_THRESHOLD_PARITY_PASS
 PR2A_TIMING_EXACT_CLUSTER_CONFIG_PARITY_PASS

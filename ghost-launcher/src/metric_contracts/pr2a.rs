@@ -88,7 +88,6 @@ pub const PR2A_EFFECTIVE_CONFIG_KEY_BOUNDARIES_V1: &[(
         FscLegacyFormula,
         FscLegacyMinKnownSourceSamples,
         FscMinTotalBuyers,
-        FscMinKnownNonNeutralBuyers,
         FscMinKnownCoverage,
         FscMinNonNeutralKnownCoverage,
         FscFundingStreamUnavailableBehavior,
@@ -119,6 +118,7 @@ pub const PR2A_EFFECTIVE_CONFIG_KEY_BOUNDARIES_V1: &[(
         FscSameSlotOrderingPolicy,
         FscNeutralFunderSetVersion,
         FscNeutralFunderSetHash,
+        FscMinKnownNonNeutralBuyers,
     ]
 );
 
@@ -342,6 +342,32 @@ fn config_wide_matches(
 ) -> Result<(), Pr2aProducerErrorV1> {
     match config_value(context, key, field)? {
         MetricEffectiveConfigValueV1::WideUnsigned(expected) if expected.get() == actual => Ok(()),
+        _ => Err(Pr2aProducerErrorV1::ProducerConfigMismatch(field)),
+    }
+}
+
+fn config_wide_value(
+    context: &Pr2aEvidenceBuildContextV1<'_>,
+    key: MetricEffectiveConfigKeyV1,
+    field: &'static str,
+) -> Result<u64, Pr2aProducerErrorV1> {
+    match config_value(context, key, field)? {
+        MetricEffectiveConfigValueV1::WideUnsigned(value) => Ok(value.get()),
+        _ => Err(Pr2aProducerErrorV1::ProducerConfigMismatch(field)),
+    }
+}
+
+fn config_ratio_value(
+    context: &Pr2aEvidenceBuildContextV1<'_>,
+    key: MetricEffectiveConfigKeyV1,
+    field: &'static str,
+) -> Result<f64, Pr2aProducerErrorV1> {
+    match config_value(context, key, field)? {
+        MetricEffectiveConfigValueV1::Ratio(value)
+            if value.is_finite() && (0.0..=1.0).contains(value) =>
+        {
+            Ok(*value)
+        }
         _ => Err(Pr2aProducerErrorV1::ProducerConfigMismatch(field)),
     }
 }
@@ -1558,6 +1584,79 @@ fn validate_fsc_computation_provenance(
     Ok(())
 }
 
+fn validate_fsc_computation_semantics(
+    computation: &FscComputation,
+    context: &Pr2aEvidenceBuildContextV1<'_>,
+) -> Result<(), Pr2aProducerErrorV1> {
+    let evidence = &computation.funding_source_v2;
+    let total_buyers = u64::from(evidence.total_buyers);
+    let known_buyers = u64::from(evidence.known_buyers);
+    let known_non_neutral_buyers = u64::from(evidence.known_non_neutral_buyers);
+
+    if known_non_neutral_buyers > known_buyers || known_buyers > total_buyers {
+        return Err(Pr2aProducerErrorV1::ProducerInvariant(
+            "fsc.v2_buyer_counts",
+        ));
+    }
+    if total_buyers == 0 {
+        if known_buyers != 0
+            || known_non_neutral_buyers != 0
+            || evidence.known_coverage.to_bits() != 0.0_f64.to_bits()
+            || evidence.non_neutral_known_coverage.to_bits() != 0.0_f64.to_bits()
+            || evidence.status != FscEvidenceStatus::Unavailable
+        {
+            return Err(Pr2aProducerErrorV1::ProducerInvariant("fsc.v2_zero_total"));
+        }
+        return Ok(());
+    }
+
+    let expected_known_coverage = known_buyers as f64 / total_buyers as f64;
+    if evidence.known_coverage.to_bits() != expected_known_coverage.to_bits() {
+        return Err(Pr2aProducerErrorV1::ProducerInvariant(
+            "fsc.v2_known_coverage",
+        ));
+    }
+    let expected_non_neutral_coverage = known_non_neutral_buyers as f64 / total_buyers as f64;
+    if evidence.non_neutral_known_coverage.to_bits() != expected_non_neutral_coverage.to_bits() {
+        return Err(Pr2aProducerErrorV1::ProducerInvariant(
+            "fsc.v2_non_neutral_known_coverage",
+        ));
+    }
+
+    if evidence.status == FscEvidenceStatus::Clean {
+        let minimum_total_buyers = config_wide_value(
+            context,
+            MetricEffectiveConfigKeyV1::FscMinTotalBuyers,
+            "fsc.min_total_buyers",
+        )?;
+        let minimum_known_non_neutral_buyers = config_wide_value(
+            context,
+            MetricEffectiveConfigKeyV1::FscMinKnownNonNeutralBuyers,
+            "fsc.min_known_non_neutral_buyers",
+        )?;
+        let minimum_known_coverage = config_ratio_value(
+            context,
+            MetricEffectiveConfigKeyV1::FscMinKnownCoverage,
+            "fsc.min_known_coverage",
+        )?;
+        let minimum_non_neutral_known_coverage = config_ratio_value(
+            context,
+            MetricEffectiveConfigKeyV1::FscMinNonNeutralKnownCoverage,
+            "fsc.min_non_neutral_known_coverage",
+        )?;
+        if total_buyers < minimum_total_buyers
+            || known_non_neutral_buyers < minimum_known_non_neutral_buyers
+            || evidence.known_coverage < minimum_known_coverage
+            || evidence.non_neutral_known_coverage < minimum_non_neutral_known_coverage
+        {
+            return Err(Pr2aProducerErrorV1::ProducerInvariant(
+                "fsc.v2_clean_effective_config_minimum",
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn build_funding_evidence_v1(
     computation: &FscComputation,
     config: &FundingSourceConfig,
@@ -1566,6 +1665,7 @@ pub fn build_funding_evidence_v1(
 ) -> Result<FundingSourceContractEvidenceV1, Pr2aProducerErrorV1> {
     validate_funding_producer_config(config, producer_config, context)?;
     validate_fsc_computation_provenance(computation, config, producer_config)?;
+    validate_fsc_computation_semantics(computation, context)?;
     finite_ratio(computation.funding_source_concentration, "fsc.legacy")?;
     finite_ratio(
         Some(computation.funding_source_v2.known_coverage),
@@ -1713,6 +1813,7 @@ pub fn build_fsc_status_evidence_v1(
 ) -> Result<FscStatusEvidenceV1, Pr2aProducerErrorV1> {
     validate_funding_producer_config(config, producer_config, context)?;
     validate_fsc_computation_provenance(computation, config, producer_config)?;
+    validate_fsc_computation_semantics(computation, context)?;
     let legacy_scalar_present = computation.funding_source_concentration.is_some();
     let legacy_feature_status = if legacy_scalar_present {
         EvidenceStatus::Clean

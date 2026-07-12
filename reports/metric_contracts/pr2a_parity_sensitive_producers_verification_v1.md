@@ -32,6 +32,8 @@ Raport weryfikuje:
 11. provenance `FscComputation` względem owner-owned producer fingerprintu;
 12. exact/cluster timing config parity oraz FSC counts/coverage/Clean minima;
 13. zamkniętą klasyfikację wszystkich kluczy effective-config rodzin PR2A.
+14. exact parity `FundingDecisionProjectionV1` z normatywnym field-setem
+    §2.6.2 oraz full-evidence-only klasyfikację non-neutral buyer countu.
 
 Nie jest to burn-in, PR2B, PR2C, PR3 ani Type-5 T1 evidence.
 
@@ -40,8 +42,8 @@ Nie jest to burn-in, PR2B, PR2C, PR3 ani Type-5 T1 evidence.
 | Komenda | Wynik | Dowód |
 | --- | --- | --- |
 | `cargo test -p ghost-core --test metric_contracts_v1_1_foundation` | PASS, 15/15 | registry/profile/hash/status/effective-config foundation |
-| `cargo test -p ghost-core --test metric_contracts_v1_1_projection` | PASS, 20/20 | closed root, validated hash, exact/cluster parity, FSC counts/coverage/Clean thresholds i wcześniejsze semantic regressions |
-| `cargo test -p ghost-launcher --test metric_contracts_pr2a_producers` | PASS, 22/22 | stale FSC computation, embedded settings, neutral version, warmup/same-slot boundary, runtime defaults i wcześniejsze producer regressions |
+| `cargo test -p ghost-core --test metric_contracts_v1_1_projection` | PASS, 21/21 | exact funding compact field-set, closed root, validated hash, exact/cluster parity, reprezentowalne FSC counts/coverage/Clean thresholds i wcześniejsze semantic regressions |
+| `cargo test -p ghost-launcher --test metric_contracts_pr2a_producers` | PASS, 24/24 | full-evidence-only non-neutral count, frozen count/coverage/Clean-minimum validation, stale computation, embedded settings, neutral version, warmup/same-slot boundary i runtime defaults |
 | `cargo test -p ghost-launcher --test metric_contracts_pr2a_static_guards` | PASS, 8/8 | forbidden activation, one-owner guards i closed 56-key PR2A classification |
 | `cargo test -p ghost-launcher --lib metric_contract_producer_fingerprint_is_sensitive_to_every_owned_setting` | PASS, 1/1 | fingerprint sensitivity dla każdego pola `FundingSourceConfig`, w tym neutral-set contents/version |
 | `cargo test -p ghost-launcher --lib reversed_recent_window_remains_empty` | PASS, 1/1 | `start > end` pozostaje pustym oknem |
@@ -208,10 +210,22 @@ Core projection czyta też `SameMsExactDeltaMs` oraz
 `1` albo `49` jest odrzucany przez validate i validated hash jako
 `EffectiveConfigParity` dla dokładnego klucza.
 
-Funding compact projection ma `known_non_neutral_buyer_count` i dokładne
-count/coverage parity. `Clean` jest sprawdzany względem czterech minimów z
-contextu. Regresje odrzucają known oraz non-neutral mismatch, zero-total
-measured payload i `Clean` poniżej każdego minimum.
+`FundingDecisionProjectionV1` ma dokładnie dziewięć pól zatwierdzonych w §2.6.2
+planu. Exact-schema regression serializuje compact payload, porównuje pełny
+zbiór kluczy i jawnie potwierdza brak `known_non_neutral_buyer_count`.
+
+`known_non_neutral_buyer_count` pozostaje wyłącznie full-evidence-only producer
+detail w `FundingSourceContractEvidenceV1`. Frozen producer boundary używa go
+razem z exact `FscComputation`, owner-produced snapshotem i effective-config do
+walidacji count ordering, obu coverage formulas oraz wszystkich czterech
+minimów statusu `Clean`. Mismatch kończy się `ProducerInvariant`; count nie jest
+rekonstruowany z compact payloadu ani kopiowany do compact JSON.
+
+Compact validator sprawdza tylko reprezentowalne invarianty: known/total,
+exact known coverage, zero-total/unavailable fail-closed i minima total, known
+coverage oraz non-neutral known coverage. `FscMinKnownNonNeutralBuyers` jest
+`FrozenProducerBoundaryValidated`, podczas gdy trzy reprezentowalne minima
+pozostają `CompactValidated`.
 
 `PR2A_EFFECTIVE_CONFIG_KEY_BOUNDARIES_V1` klasyfikuje wszystkie 56 kluczy
 rodzin PR2A dokładnie raz jako `CompactValidated` albo
@@ -295,10 +309,11 @@ wymaga bit-for-bit:
 
 FSC v2 status i coverage są osobne; compatibility FSC status nie dowodzi v2
 measurement. V3 requirement `fsc_v2` domyślnie pozostaje false.
-Compact validator wiąże `known_buyer_count`,
-`known_non_neutral_buyer_count`, `total_buyer_count` i obie coverage dokładną
-formułą. `Clean` wymaga skonfigurowanych minimów total/non-neutral counts oraz
-obu coverage; zero-total pozostaje null/unavailable.
+Compact validator wiąże `known_buyer_count` z `total_buyer_count` i
+`known_coverage` dokładną formułą. Sprawdza też reprezentowane minima statusu
+`Clean` dla total buyers i obu coverage; zero-total pozostaje null/unavailable.
+Non-neutral count oraz jego minimum są sprawdzane wcześniej na frozen producer
+boundary i pozostają full-evidence-only.
 
 ## 5. Effective-config proof
 
@@ -467,6 +482,7 @@ PR2A_VALIDATED_HASH_PATH_PASS
 PR2A_EFFECTIVE_CONFIG_PROJECTION_PARITY_PASS
 PR2A_VALIDATED_HASH_CONTEXT_BINDING_PASS
 PR2A_RECENT_EXACT_ZERO_WIDTH_WINDOW_PASS
+PR2A_COMPACT_SCHEMA_EXACT_PLAN_PARITY_PASS
 PR2A_FSC_FROZEN_CONFIG_PROVENANCE_PASS
 PR2A_FSC_STATUS_THRESHOLD_PARITY_PASS
 PR2A_TIMING_EXACT_CLUSTER_CONFIG_PARITY_PASS

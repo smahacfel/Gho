@@ -1,4 +1,6 @@
-use ghost_core::metric_contracts::{MetricContractId, METRIC_EFFECTIVE_CONFIG_KEYS_V1};
+use ghost_core::metric_contracts::{
+    MetricContractId, MetricEffectiveConfigKeyV1, METRIC_EFFECTIVE_CONFIG_KEYS_V1,
+};
 use ghost_launcher::metric_contracts::{
     Pr2aEffectiveConfigValidationBoundaryV1, PR2A_EFFECTIVE_CONFIG_KEY_BOUNDARIES_V1,
 };
@@ -141,6 +143,20 @@ fn every_pr2a_effective_config_key_has_exactly_one_validation_boundary() {
     assert!(classified.values().any(|boundary| {
         *boundary == Pr2aEffectiveConfigValidationBoundaryV1::FrozenProducerBoundaryValidated
     }));
+    assert_eq!(
+        classified.get(&MetricEffectiveConfigKeyV1::FscMinKnownNonNeutralBuyers),
+        Some(&Pr2aEffectiveConfigValidationBoundaryV1::FrozenProducerBoundaryValidated)
+    );
+    for key in [
+        MetricEffectiveConfigKeyV1::FscMinTotalBuyers,
+        MetricEffectiveConfigKeyV1::FscMinKnownCoverage,
+        MetricEffectiveConfigKeyV1::FscMinNonNeutralKnownCoverage,
+    ] {
+        assert_eq!(
+            classified.get(&key),
+            Some(&Pr2aEffectiveConfigValidationBoundaryV1::CompactValidated)
+        );
+    }
 }
 
 #[test]
