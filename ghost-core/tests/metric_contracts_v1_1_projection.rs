@@ -4,6 +4,16 @@ use ghost_core::tx_intelligence::types::FscEvidenceStatus;
 use serde_json::{json, Value};
 
 fn value_for_key(key: MetricEffectiveConfigKeyV1) -> MetricEffectiveConfigValueV1 {
+    match key {
+        MetricEffectiveConfigKeyV1::FtdiLegacyCleanMinBuyTransactions
+        | MetricEffectiveConfigKeyV1::FtdiCandidateCleanMinUniqueBuyers => {
+            return MetricEffectiveConfigValueV1::WideUnsigned(CanonicalU64StringV1::new(3));
+        }
+        MetricEffectiveConfigKeyV1::FscLegacyMinKnownSourceSamples => {
+            return MetricEffectiveConfigValueV1::WideUnsigned(CanonicalU64StringV1::new(2));
+        }
+        _ => {}
+    }
     match key.value_kind() {
         MetricEffectiveConfigValueKindV1::Boolean => MetricEffectiveConfigValueV1::Boolean(true),
         MetricEffectiveConfigValueKindV1::Unsigned => MetricEffectiveConfigValueV1::Unsigned(7),
@@ -108,10 +118,12 @@ fn pr2a_evidence() -> (
         unique_buyer_sample_count: 2,
         buy_transaction_sample_count: 3,
     };
+    let mut legacy_actionability_envelope = measured(MetricSurfaceId::FtdiLegacyBuyTxActionability);
+    legacy_actionability_envelope.policy_actionable = true;
     let ftdi = FtdiEvidenceV1 {
         legacy_value: ftdi_measurement(MetricSurfaceId::TxIntelFeeTopologyDiversityLegacy),
         value_v1: ftdi_measurement(MetricSurfaceId::FtdiValueEvidenceV1),
-        legacy_actionability_envelope: measured(MetricSurfaceId::FtdiLegacyBuyTxActionability),
+        legacy_actionability_envelope,
         legacy_buy_tx_actionable: true,
         unique_buyer_actionability_v2_envelope: measured(
             MetricSurfaceId::FtdiUniqueBuyerActionabilityV2,
@@ -374,6 +386,18 @@ fn complete_projection() -> MetricContractDecisionEvidenceProjectionV1 {
     }
 }
 
+fn assert_projection_rejected(projection: &MetricContractDecisionEvidenceProjectionV1) {
+    let profile = MetricContractProfileV1::profile_a().unwrap();
+    let config = effective_config();
+    let context = MetricDecisionProjectionBuildContextV1 {
+        rollout_mode: MetricContractRolloutMode::Legacy,
+        profile: &profile,
+        effective_config: &config,
+        source_cutoff: MetricContractDecisionSourceCutoffV1::try_new(1_000, Some(42)).unwrap(),
+    };
+    assert!(projection.validate_context(&context).is_err());
+}
+
 fn mutate_leaves(value: &Value, path: &mut Vec<String>, paths: &mut Vec<Vec<String>>) {
     match value {
         Value::Object(map) => {
@@ -421,8 +445,19 @@ fn mutate_at(value: &mut Value, path: &[String]) {
 #[test]
 fn projection_hash_is_deterministic_and_sensitive_to_every_semantic_leaf() {
     let projection = complete_projection();
-    let first = projection.canonical_hash().unwrap();
-    assert_eq!(first, projection.canonical_hash().unwrap());
+    let profile = MetricContractProfileV1::profile_a().unwrap();
+    let config = effective_config();
+    let context = MetricDecisionProjectionBuildContextV1 {
+        rollout_mode: MetricContractRolloutMode::Legacy,
+        profile: &profile,
+        effective_config: &config,
+        source_cutoff: MetricContractDecisionSourceCutoffV1::try_new(1_000, Some(42)).unwrap(),
+    };
+    let first = projection.validated_canonical_hash(&context).unwrap();
+    assert_eq!(
+        first,
+        projection.validated_canonical_hash(&context).unwrap()
+    );
     let base = serde_json::to_value(&projection).unwrap();
     let mut paths = Vec::new();
     mutate_leaves(&base, &mut Vec::new(), &mut paths);
@@ -458,6 +493,136 @@ fn projection_schema_is_closed_and_partial_root_is_rejected() {
         .unwrap()
         .insert("unknown".to_string(), json!(1));
     assert!(serde_json::from_value::<FtdiDecisionProjectionV1>(family).is_err());
+}
+
+#[test]
+fn field_and_surface_value_status_incoherence_is_rejected() {
+    let mut available_null = field(1.0);
+    available_null.value = CanonicalNullableV1::Null;
+    assert!(matches!(
+        available_null.validate(),
+        Err(MetricContractProjectionErrorV1::ValueStatusInvariant(_))
+    ));
+
+    for availability in [
+        MetricAvailabilityV1::Unavailable,
+        MetricAvailabilityV1::NotConfigured,
+        MetricAvailabilityV1::NotRecordedLegacySchema,
+    ] {
+        let mut non_available_value = field(1.0);
+        non_available_value.availability = availability;
+        non_available_value.measurement_quality = MetricMeasurementQualityV1::NotApplicable;
+        assert!(matches!(
+            non_available_value.validate(),
+            Err(MetricContractProjectionErrorV1::ValueStatusInvariant(_))
+        ));
+    }
+
+    let mut available_not_applicable = field(1.0);
+    available_not_applicable.measurement_quality = MetricMeasurementQualityV1::NotApplicable;
+    assert!(matches!(
+        available_not_applicable.validate(),
+        Err(MetricContractProjectionErrorV1::ValueStatusInvariant(_))
+    ));
+
+    let mut projection = complete_projection();
+    projection.top3_signer_volume_ratio.preferred.value = CanonicalNullableV1::Null;
+    assert_projection_rejected(&projection);
+
+    projection = complete_projection();
+    projection
+        .top3_signer_volume_ratio
+        .preferred
+        .envelope
+        .availability = MetricAvailabilityV1::Unavailable;
+    projection
+        .top3_signer_volume_ratio
+        .preferred
+        .envelope
+        .measurement_quality = MetricMeasurementQualityV1::NotApplicable;
+    assert_projection_rejected(&projection);
+
+    projection = complete_projection();
+    projection
+        .top3_signer_volume_ratio
+        .preferred
+        .envelope
+        .measurement_quality = MetricMeasurementQualityV1::NotApplicable;
+    assert_projection_rejected(&projection);
+}
+
+#[test]
+fn timing_semantics_reject_count_ratio_population_and_window_drift() {
+    let mut projection = complete_projection();
+    projection.same_ms_tx_ratio.cluster_lt_50ms.numerator = 5;
+    assert_projection_rejected(&projection);
+
+    projection = complete_projection();
+    projection.same_ms_tx_ratio.cluster_lt_50ms.surface.value = CanonicalNullableV1::Value(0.5);
+    assert_projection_rejected(&projection);
+
+    projection = complete_projection();
+    projection.same_ms_tx_ratio.cluster_lt_50ms.population =
+        TxTimingPopulationV1::SuccessfulTransactions;
+    assert_projection_rejected(&projection);
+
+    projection = complete_projection();
+    projection.same_ms_tx_ratio.recent_exact.window_ms = CanonicalNullableV1::Value(9_999);
+    assert_projection_rejected(&projection);
+}
+
+#[test]
+fn ftdi_top3_and_fsc_cross_field_drift_is_rejected() {
+    let mut projection = complete_projection();
+    projection
+        .fee_topology_diversity_index
+        .unique_topology_count = 2;
+    assert_projection_rejected(&projection);
+
+    projection = complete_projection();
+    projection.top3_signer_volume_ratio.effective.value = CanonicalNullableV1::Value(0.2);
+    assert_projection_rejected(&projection);
+
+    projection = complete_projection();
+    projection.dev_buy.primary_selection_mode = DevBuySelectionModeV1::NoEligibleBuy;
+    assert_projection_rejected(&projection);
+
+    projection = complete_projection();
+    projection
+        .funding_source_concentration
+        .known_source_sample_count = 1;
+    projection
+        .funding_source_concentration
+        .distinct_known_source_count = 1;
+    projection.funding_source_concentration.legacy_source.value = CanonicalNullableV1::Value(0.0);
+    projection.funding_source_concentration.legacy_v1.value = CanonicalNullableV1::Value(0.0);
+    assert_projection_rejected(&projection);
+
+    projection = complete_projection();
+    projection.fsc_evidence_status.legacy_scalar_present = false;
+    assert_projection_rejected(&projection);
+
+    projection = complete_projection();
+    projection.fsc_evidence_status.fsc_v2_status =
+        CanonicalNullableV1::Value(FscEvidenceStatus::Unavailable);
+    projection.fsc_evidence_status.fsc_v2_coverage = CanonicalNullableV1::Null;
+    assert_projection_rejected(&projection);
+}
+
+#[test]
+fn validated_hash_rejects_semantically_invalid_projection() {
+    let profile = MetricContractProfileV1::profile_a().unwrap();
+    let config = effective_config();
+    let context = MetricDecisionProjectionBuildContextV1 {
+        rollout_mode: MetricContractRolloutMode::Legacy,
+        profile: &profile,
+        effective_config: &config,
+        source_cutoff: MetricContractDecisionSourceCutoffV1::try_new(1_000, Some(42)).unwrap(),
+    };
+    let mut projection = complete_projection();
+    projection.same_ms_tx_ratio.recent_exact.numerator =
+        projection.same_ms_tx_ratio.recent_exact.denominator + 1;
+    assert!(projection.validated_canonical_hash(&context).is_err());
 }
 
 #[test]

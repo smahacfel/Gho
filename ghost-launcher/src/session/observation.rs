@@ -1460,7 +1460,7 @@ impl PoolObservationSession {
         start_ts_ms: u64,
         end_ts_ms: u64,
     ) -> RceWindowStats {
-        if start_ts_ms >= end_ts_ms {
+        if start_ts_ms > end_ts_ms {
             return RceWindowStats::default();
         }
         let mut timestamps = Vec::new();
@@ -3077,4 +3077,17 @@ fn v3_broadening_score(features: &OrganicBroadeningFeatures) -> f64 {
 
     (0.30 * signer_growth + 0.25 * tx_growth + 0.25 * new_signers + 0.20 * hhi_score)
         .clamp(0.0, 1.0)
+}
+
+#[cfg(test)]
+mod metric_contract_recent_window_tests {
+    use super::PoolObservationSession;
+
+    #[test]
+    fn reversed_recent_window_remains_empty() {
+        let stats = PoolObservationSession::rce_window_stats(&[], 2, 1);
+        assert_eq!(stats.tx_count, 0);
+        assert_eq!(stats.same_ms_extra_count, 0);
+        assert_eq!(stats.same_ms_tx_ratio, None);
+    }
 }

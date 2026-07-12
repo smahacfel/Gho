@@ -12,8 +12,9 @@ use ghost_core::metric_contracts::{
     FundingSourceEvidenceReasonV1, FundingSourceLegacyMeasurementV1, MetricAuthorityClass,
     MetricAvailabilityV1, MetricContractEffectiveConfigErrorV1, MetricContractId,
     MetricContractProfileV1, MetricContractProjectionErrorV1, MetricContractRolloutMode,
-    MetricEffectiveConfigKeyV1, MetricEffectiveConfigValueV1, MetricEvidenceEnvelopeErrorV1,
-    MetricEvidenceReasonV1, MetricMeasurementQualityV1, MetricRolloutRoleV1, MetricSurfaceId,
+    MetricDecisionProjectionBuildContextV1, MetricEffectiveConfigKeyV1,
+    MetricEffectiveConfigValueV1, MetricEvidenceEnvelopeErrorV1, MetricEvidenceReasonV1,
+    MetricMeasurementQualityV1, MetricRolloutRoleV1, MetricSurfaceId,
     ResolvedMetricContractEffectiveConfigV1, Top3EvidenceReasonV1, Top3SignerVolumeEvidenceV1,
     TxTimingEvidenceReasonV1, TxTimingEvidenceV1, TxTimingMeasurementEvidenceV1,
     TxTimingPopulationV1, TxTimingSourceV1,
@@ -669,11 +670,6 @@ pub fn build_ftdi_evidence_v1(
                     MetricMeasurementQualityV1::Insufficient,
                 )
             }
-        } else if computation.signer_sample_count > 0 {
-            (
-                MetricAvailabilityV1::Available,
-                MetricMeasurementQualityV1::Insufficient,
-            )
         } else {
             (
                 MetricAvailabilityV1::Unavailable,
@@ -693,12 +689,10 @@ pub fn build_ftdi_evidence_v1(
     };
     let value_v1_quality = if computation.fee_topology_diversity_index.is_some() {
         MetricMeasurementQualityV1::Measured
-    } else if computation.signer_sample_count > 0 {
-        MetricMeasurementQualityV1::Insufficient
     } else {
         MetricMeasurementQualityV1::NotApplicable
     };
-    let value_v1_availability = if computation.signer_sample_count > 0 {
+    let value_v1_availability = if computation.fee_topology_diversity_index.is_some() {
         MetricAvailabilityV1::Available
     } else {
         MetricAvailabilityV1::Unavailable
@@ -1510,6 +1504,9 @@ pub fn build_fsc_status_evidence_v1(
 
 pub fn projection_hash_v1(
     projection: &ghost_core::metric_contracts::MetricContractDecisionEvidenceProjectionV1,
+    context: &MetricDecisionProjectionBuildContextV1<'_>,
 ) -> Result<CanonicalHashV1, Pr2aProducerErrorV1> {
-    projection.canonical_hash().map_err(Into::into)
+    projection
+        .validated_canonical_hash(context)
+        .map_err(Into::into)
 }

@@ -4,10 +4,11 @@ use super::{
     FtdiEvidenceV1, FundingSourceContractEvidenceV1, ManipulationComparatorV1,
     MetricAuthorityClass, MetricContractEffectiveConfigErrorV1, MetricContractId,
     MetricContractProfileIdV1, MetricContractProfileV1, MetricContractRolloutMode,
-    MetricEvidenceEnvelopeErrorV1, MetricEvidenceReasonV1, MetricMeasurementQualityV1,
-    MetricRolloutRoleV1, MetricSurfaceId, RecentBuySellEvidenceV1, ReserveVelocitySourceClockV1,
-    ReserveVelocityStatusV1, ResolvedMetricContractEffectiveConfigV1, Top3SignerVolumeEvidenceV1,
-    TxTimingEvidenceV1, TxTimingPopulationV1,
+    MetricEffectiveConfigKeyV1, MetricEffectiveConfigValueV1, MetricEvidenceEnvelopeErrorV1,
+    MetricEvidenceReasonV1, MetricMeasurementQualityV1, MetricRolloutRoleV1, MetricSurfaceId,
+    RecentBuySellEvidenceV1, ReserveVelocitySourceClockV1, ReserveVelocityStatusV1,
+    ResolvedMetricContractEffectiveConfigV1, Top3SignerVolumeEvidenceV1, TxTimingEvidenceV1,
+    TxTimingPopulationV1,
 };
 use crate::checkpoint::EvidenceStatus;
 use crate::tx_intelligence::types::FscEvidenceStatus;
@@ -18,6 +19,8 @@ use thiserror::Error;
 pub const METRIC_CONTRACT_DECISION_PROJECTION_SCHEMA_VERSION_V1: u16 = 1;
 pub const METRIC_DECISION_MAX_REASON_CODES_PER_VALUE_V1: usize = 8;
 pub const METRIC_CONTRACT_PRODUCER_SCHEMA_VERSION_V1: u16 = 1;
+pub const TX_TIMING_RECENT_EXACT_WINDOW_MS_V1: u32 = 10_000;
+const FSC_LEGACY_MIN_KNOWN_SOURCE_SAMPLES_V1: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -296,12 +299,11 @@ pub struct MetricContractDecisionEvidenceProjectionV1 {
 }
 
 impl MetricContractDecisionEvidenceProjectionV1 {
-    pub fn canonical_hash(&self) -> Result<CanonicalHashV1, MetricContractProjectionErrorV1> {
-        if self.schema_version != METRIC_CONTRACT_DECISION_PROJECTION_SCHEMA_VERSION_V1 {
-            return Err(
-                MetricContractProjectionErrorV1::UnsupportedProjectionSchema(self.schema_version),
-            );
-        }
+    pub fn validated_canonical_hash(
+        &self,
+        context: &MetricDecisionProjectionBuildContextV1<'_>,
+    ) -> Result<CanonicalHashV1, MetricContractProjectionErrorV1> {
+        self.validate_context(context)?;
         CanonicalHashV1::digest(self).map_err(MetricContractProjectionErrorV1::Hash)
     }
 
@@ -506,13 +508,58 @@ impl MetricContractDecisionEvidenceProjectionV1 {
         self.reserve_velocity.interval_ms.validate()?;
         self.recent_buy_sell.buy_to_sell_ratio.validate()?;
         self.recent_buy_sell.buy_share.validate()?;
+        self.fee_topology_diversity_index
+            .validate_semantics(context)?;
+        self.dev_buy.validate_semantics()?;
+        self.same_ms_tx_ratio.validate_semantics()?;
+        self.top3_signer_volume_ratio.validate_semantics()?;
+        self.funding_source_concentration.validate_semantics()?;
+        self.fsc_evidence_status
+            .validate_semantics(&self.funding_source_concentration)?;
         Ok(())
     }
 }
 
+fn validate_value_status_coherence<T>(
+    value: &CanonicalNullableV1<T>,
+    availability: super::MetricAvailabilityV1,
+    measurement_quality: MetricMeasurementQualityV1,
+) -> Result<(), MetricContractProjectionErrorV1> {
+    match availability {
+        super::MetricAvailabilityV1::Available => {
+            if value.is_null() {
+                return Err(MetricContractProjectionErrorV1::ValueStatusInvariant(
+                    "available evidence must contain a value",
+                ));
+            }
+            if measurement_quality == MetricMeasurementQualityV1::NotApplicable {
+                return Err(MetricContractProjectionErrorV1::ValueStatusInvariant(
+                    "available evidence cannot be not_applicable",
+                ));
+            }
+        }
+        super::MetricAvailabilityV1::Unavailable
+        | super::MetricAvailabilityV1::NotConfigured
+        | super::MetricAvailabilityV1::NotRecordedLegacySchema => {
+            if !value.is_null() {
+                return Err(MetricContractProjectionErrorV1::ValueStatusInvariant(
+                    "non-available evidence cannot contain a value",
+                ));
+            }
+            if measurement_quality != MetricMeasurementQualityV1::NotApplicable {
+                return Err(MetricContractProjectionErrorV1::ValueStatusInvariant(
+                    "non-available evidence must be not_applicable",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl<T> MetricDecisionFieldValueV1<T> {
     pub fn validate(&self) -> Result<(), MetricContractProjectionErrorV1> {
-        self.reasons.validate()
+        self.reasons.validate()?;
+        validate_value_status_coherence(&self.value, self.availability, self.measurement_quality)
     }
 }
 
@@ -539,7 +586,12 @@ impl<T> MetricDecisionSurfaceValueV1<T> {
         if self.source_cutoff != context.source_cutoff {
             return Err(MetricContractProjectionErrorV1::ProjectionContextMismatch);
         }
-        validate_compact_envelope(&self.envelope, expected_surface, context)
+        validate_compact_envelope(&self.envelope, expected_surface, context)?;
+        validate_value_status_coherence(
+            &self.value,
+            self.envelope.availability,
+            self.envelope.measurement_quality,
+        )
     }
 }
 
@@ -589,6 +641,8 @@ pub enum MetricContractProjectionErrorV1 {
     },
     #[error("projection source cutoff is missing")]
     MissingSourceCutoff,
+    #[error("projection value/status invariant failed: {0}")]
+    ValueStatusInvariant(&'static str),
     #[error("projection context does not match profile/effective config")]
     ProjectionContextMismatch,
     #[error("unsupported metric-contract decision projection schema {0}")]
@@ -679,13 +733,15 @@ fn surface_value<T: Clone>(
     if METRIC_CONTRACT_PRODUCER_SCHEMA_VERSION_V1 == 0 {
         return Err(MetricContractProjectionErrorV1::MissingProducerSchema);
     }
-    Ok(MetricDecisionSurfaceValueV1 {
+    let surface = MetricDecisionSurfaceValueV1 {
         envelope: compact_envelope(source, expected_surface, context)?,
         value: value.clone(),
         producer_id,
         producer_schema_version: METRIC_CONTRACT_PRODUCER_SCHEMA_VERSION_V1,
         source_cutoff: context.source_cutoff.clone(),
-    })
+    };
+    surface.validate(expected_surface, producer_id, context)?;
+    Ok(surface)
 }
 
 fn actionability_value(
@@ -717,7 +773,156 @@ fn nullable_f64_bits_equal(
     }
 }
 
+fn nullable_f64_value(value: &CanonicalNullableV1<f64>) -> Option<f64> {
+    match value {
+        CanonicalNullableV1::Null => None,
+        CanonicalNullableV1::Value(value) => Some(*value),
+    }
+}
+
+fn validate_optional_unit_ratio(
+    value: &CanonicalNullableV1<f64>,
+    invariant: &'static str,
+) -> Result<Option<f64>, MetricContractProjectionErrorV1> {
+    let value = nullable_f64_value(value);
+    if value.is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value)) {
+        return Err(MetricContractProjectionErrorV1::FamilyInvariant(invariant));
+    }
+    Ok(value)
+}
+
+fn validate_optional_nonnegative_finite(
+    value: &CanonicalNullableV1<f64>,
+    invariant: &'static str,
+) -> Result<(), MetricContractProjectionErrorV1> {
+    if nullable_f64_value(value).is_some_and(|value| !value.is_finite() || value < 0.0) {
+        return Err(MetricContractProjectionErrorV1::FamilyInvariant(invariant));
+    }
+    Ok(())
+}
+
+fn required_bool(
+    value: &CanonicalNullableV1<bool>,
+    invariant: &'static str,
+) -> Result<bool, MetricContractProjectionErrorV1> {
+    match value {
+        CanonicalNullableV1::Value(value) => Ok(*value),
+        CanonicalNullableV1::Null => {
+            Err(MetricContractProjectionErrorV1::FamilyInvariant(invariant))
+        }
+    }
+}
+
+fn effective_config_wide_unsigned(
+    context: &MetricDecisionProjectionBuildContextV1<'_>,
+    key: MetricEffectiveConfigKeyV1,
+    invariant: &'static str,
+) -> Result<u64, MetricContractProjectionErrorV1> {
+    match context.effective_config.value(key) {
+        Some(MetricEffectiveConfigValueV1::WideUnsigned(value)) => Ok(value.get()),
+        _ => Err(MetricContractProjectionErrorV1::FamilyInvariant(invariant)),
+    }
+}
+
 impl FtdiDecisionProjectionV1 {
+    pub fn validate_semantics(
+        &self,
+        context: &MetricDecisionProjectionBuildContextV1<'_>,
+    ) -> Result<(), MetricContractProjectionErrorV1> {
+        if !nullable_f64_bits_equal(&self.legacy_value.value, &self.value_v1.value) {
+            return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                "FTDI legacy/typed value parity",
+            ));
+        }
+        if self.unique_topology_count > self.unique_buyer_sample_count
+            || self.unique_buyer_sample_count > self.buy_transaction_sample_count
+        {
+            return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                "FTDI count ordering",
+            ));
+        }
+
+        let value_present = match validate_optional_unit_ratio(
+            &self.legacy_value.value,
+            "FTDI value must be finite ratio",
+        )? {
+            Some(value) => {
+                if self.unique_buyer_sample_count == 0 {
+                    return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                        "FTDI value requires unique-buyer denominator",
+                    ));
+                }
+                let expected =
+                    self.unique_topology_count as f64 / self.unique_buyer_sample_count as f64;
+                if value.to_bits() != expected.to_bits() {
+                    return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                        "FTDI value/count parity",
+                    ));
+                }
+                true
+            }
+            None => {
+                if self.unique_topology_count != 0 {
+                    return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                        "null FTDI value cannot claim measured topologies",
+                    ));
+                }
+                false
+            }
+        };
+
+        let legacy_gate = effective_config_wide_unsigned(
+            context,
+            MetricEffectiveConfigKeyV1::FtdiLegacyCleanMinBuyTransactions,
+            "FTDI legacy sample gate config",
+        )?;
+        let corrected_gate = effective_config_wide_unsigned(
+            context,
+            MetricEffectiveConfigKeyV1::FtdiCandidateCleanMinUniqueBuyers,
+            "FTDI corrected sample gate config",
+        )?;
+        let expected_legacy =
+            value_present && u64::from(self.buy_transaction_sample_count) >= legacy_gate;
+        let expected_corrected =
+            value_present && u64::from(self.unique_buyer_sample_count) >= corrected_gate;
+        let legacy_actionable = required_bool(
+            &self.legacy_buy_tx_actionability.value,
+            "FTDI legacy actionability value",
+        )?;
+        let corrected_actionable = required_bool(
+            &self.unique_buyer_actionability_v2.value,
+            "FTDI corrected actionability value",
+        )?;
+        if legacy_actionable != expected_legacy || corrected_actionable != expected_corrected {
+            return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                "FTDI actionability/count parity",
+            ));
+        }
+        let expected_policy_actionable = expected_legacy
+            && self.legacy_buy_tx_actionability.envelope.rollout_role
+                == MetricRolloutRoleV1::PolicyAuthoritative;
+        if self.legacy_buy_tx_actionability.envelope.policy_actionable != expected_policy_actionable
+        {
+            return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                "FTDI legacy policy actionability",
+            ));
+        }
+        if self
+            .unique_buyer_actionability_v2
+            .envelope
+            .policy_actionable
+            || self.unique_buyer_actionability_v2.envelope.authority_class
+                != MetricAuthorityClass::Counterfactual
+            || self.unique_buyer_actionability_v2.envelope.rollout_role
+                != MetricRolloutRoleV1::NonPolicy
+        {
+            return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                "corrected FTDI actionability must remain counterfactual",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn try_from_evidence(
         evidence: &FtdiEvidenceV1,
         context: &MetricDecisionProjectionBuildContextV1<'_>,
@@ -737,7 +942,7 @@ impl FtdiDecisionProjectionV1 {
                 "FTDI legacy/typed value parity",
             ));
         }
-        Ok(Self {
+        let projection = Self {
             legacy_value: surface_value(
                 &evidence.legacy_value.envelope,
                 MetricSurfaceId::TxIntelFeeTopologyDiversityLegacy,
@@ -769,11 +974,78 @@ impl FtdiDecisionProjectionV1 {
                 MetricContractProducerIdV1::FeeTopologyDiversityProducer,
                 context,
             )?,
-        })
+        };
+        projection.validate_semantics(context)?;
+        Ok(projection)
     }
 }
 
 impl DevBuyDecisionProjectionV1 {
+    pub fn validate_semantics(&self) -> Result<(), MetricContractProjectionErrorV1> {
+        if !nullable_f64_bits_equal(
+            &self.tx_intel_first_observed.value,
+            &self.mfs_first_observed.value,
+        ) || !nullable_f64_bits_equal(
+            &self.mfs_first_observed.value,
+            &self.effective_policy.value,
+        ) {
+            return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                "dev first-observed/effective-policy parity",
+            ));
+        }
+        for value in [
+            &self.tx_intel_first_observed.value,
+            &self.mfs_first_observed.value,
+            &self.mfs_primary_v1.value,
+            &self.effective_policy.value,
+        ] {
+            validate_optional_nonnegative_finite(value, "dev buy must be finite non-negative")?;
+        }
+
+        match &self.mfs_primary_v1.value {
+            CanonicalNullableV1::Value(_) => {
+                if !self.creator_known
+                    || self.primary_eligible_buy_count == 0
+                    || !matches!(
+                        self.primary_selection_mode,
+                        DevBuySelectionModeV1::CreateSignatureMatch
+                            | DevBuySelectionModeV1::EarliestEligibleCreatorBuy
+                    )
+                {
+                    return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                        "dev primary value/selection parity",
+                    ));
+                }
+            }
+            CanonicalNullableV1::Null => {
+                if self.primary_selection_mode != DevBuySelectionModeV1::NoEligibleBuy
+                    || self.primary_eligible_buy_count != 0
+                    || self.create_signature_matched
+                {
+                    return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                        "null dev primary must be no-eligible-buy",
+                    ));
+                }
+            }
+        }
+        if self.create_signature_matched
+            != (self.primary_selection_mode == DevBuySelectionModeV1::CreateSignatureMatch)
+        {
+            return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                "dev primary create-signature selection parity",
+            ));
+        }
+        if self.mfs_primary_v1.envelope.policy_actionable
+            || self.mfs_primary_v1.envelope.authority_class != MetricAuthorityClass::Counterfactual
+            || self.mfs_primary_v1.envelope.rollout_role != MetricRolloutRoleV1::NonPolicy
+        {
+            return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                "dev primary must remain counterfactual",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn try_from_evidence(
         evidence: &DevBuyContractEvidenceV1,
         context: &MetricDecisionProjectionBuildContextV1<'_>,
@@ -789,7 +1061,7 @@ impl DevBuyDecisionProjectionV1 {
                 "dev first-observed/effective-policy parity",
             ));
         }
-        Ok(Self {
+        let projection = Self {
             tx_intel_first_observed: surface_value(
                 &evidence.tx_intel_first_observed.envelope,
                 MetricSurfaceId::TxIntelDevFirstObservedBuySol,
@@ -822,7 +1094,9 @@ impl DevBuyDecisionProjectionV1 {
             create_signature_matched: evidence.mfs_primary_v1.create_signature_matched,
             primary_selection_mode: evidence.mfs_primary_v1.selection_mode,
             primary_eligible_buy_count: evidence.mfs_primary_v1.eligible_buy_count,
-        })
+        };
+        projection.validate_semantics()?;
+        Ok(projection)
     }
 }
 
@@ -847,7 +1121,86 @@ fn timing_ratio(
     })
 }
 
+impl MetricDecisionRatioV1 {
+    pub fn validate_semantics(&self) -> Result<(), MetricContractProjectionErrorV1> {
+        if self.numerator > self.denominator {
+            return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                "timing numerator cannot exceed denominator",
+            ));
+        }
+        if self.denominator == 0 {
+            if !self.surface.value.is_null() {
+                return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                    "zero timing denominator requires null ratio",
+                ));
+            }
+            return Ok(());
+        }
+        let CanonicalNullableV1::Value(value) = &self.surface.value else {
+            return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                "positive timing denominator requires ratio",
+            ));
+        };
+        let expected = self.numerator as f64 / self.denominator as f64;
+        if !value.is_finite() || value.to_bits() != expected.to_bits() {
+            return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                "timing ratio/count parity",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl TxTimingDecisionProjectionV1 {
+    pub fn validate_semantics(&self) -> Result<(), MetricContractProjectionErrorV1> {
+        for ratio in [
+            &self.legacy_exact,
+            &self.exact_v1,
+            &self.cluster_lt_50ms,
+            &self.recent_exact,
+        ] {
+            ratio.validate_semantics()?;
+        }
+        if self.legacy_exact.numerator != self.exact_v1.numerator
+            || self.legacy_exact.denominator != self.exact_v1.denominator
+            || !nullable_f64_bits_equal(
+                &self.legacy_exact.surface.value,
+                &self.exact_v1.surface.value,
+            )
+        {
+            return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                "same-ms legacy/exact typed parity",
+            ));
+        }
+        if self.legacy_exact.population != TxTimingPopulationV1::AcceptedTransactions
+            || self.exact_v1.population != TxTimingPopulationV1::AcceptedTransactions
+            || self.cluster_lt_50ms.population != TxTimingPopulationV1::AcceptedTransactions
+            || self.recent_exact.population != TxTimingPopulationV1::SuccessfulTransactions
+        {
+            return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                "timing population contract",
+            ));
+        }
+        if !self.legacy_exact.window_ms.is_null()
+            || !self.exact_v1.window_ms.is_null()
+            || !self.cluster_lt_50ms.window_ms.is_null()
+            || self.recent_exact.window_ms
+                != CanonicalNullableV1::Value(TX_TIMING_RECENT_EXACT_WINDOW_MS_V1)
+        {
+            return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                "timing window contract",
+            ));
+        }
+        if self.cluster_lt_50ms.surface.envelope.policy_actionable
+            || self.recent_exact.surface.envelope.policy_actionable
+        {
+            return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                "timing evidence-only/logging-only surfaces cannot be actionable",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn try_from_evidence(
         evidence: &TxTimingEvidenceV1,
         context: &MetricDecisionProjectionBuildContextV1<'_>,
@@ -860,7 +1213,7 @@ impl TxTimingDecisionProjectionV1 {
                 "same-ms legacy/exact typed parity",
             ));
         }
-        Ok(Self {
+        let projection = Self {
             legacy_exact: timing_ratio(
                 &evidence.legacy_exact,
                 MetricSurfaceId::TxIntelSameMsCollisionRatioExact,
@@ -885,11 +1238,44 @@ impl TxTimingDecisionProjectionV1 {
                 MetricContractProducerIdV1::RecentBuySellWindowProducer,
                 context,
             )?,
-        })
+        };
+        projection.validate_semantics()?;
+        Ok(projection)
     }
 }
 
 impl Top3DecisionProjectionV1 {
+    pub fn validate_semantics(&self) -> Result<(), MetricContractProjectionErrorV1> {
+        for value in [
+            &self.preferred.value,
+            &self.compatibility_alias.value,
+            &self.effective.value,
+        ] {
+            validate_optional_unit_ratio(value, "top3 value must be finite ratio")?;
+        }
+        let expected_equal = match (&self.preferred.value, &self.compatibility_alias.value) {
+            (CanonicalNullableV1::Value(left), CanonicalNullableV1::Value(right)) => {
+                CanonicalNullableV1::Value(left.to_bits() == right.to_bits())
+            }
+            _ => CanonicalNullableV1::Null,
+        };
+        let expected_effective = match &self.preferred.value {
+            CanonicalNullableV1::Value(_) => &self.preferred.value,
+            CanonicalNullableV1::Null => &self.compatibility_alias.value,
+        };
+        let expected_fallback =
+            self.preferred.value.is_null() && !self.compatibility_alias.value.is_null();
+        if !nullable_f64_bits_equal(&self.effective.value, expected_effective)
+            || self.used_compatibility_fallback != expected_fallback
+            || self.preferred_alias_bitwise_equal != expected_equal
+        {
+            return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                "top3 selector parity",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn try_from_evidence(
         evidence: &Top3SignerVolumeEvidenceV1,
         context: &MetricDecisionProjectionBuildContextV1<'_>,
@@ -927,7 +1313,7 @@ impl Top3DecisionProjectionV1 {
                 "top3 selector parity",
             ));
         }
-        Ok(Self {
+        let projection = Self {
             preferred: surface_value(
                 &evidence.preferred_envelope,
                 MetricSurfaceId::TxIntelTop3SignerVolumeRatioPreferred,
@@ -951,7 +1337,9 @@ impl Top3DecisionProjectionV1 {
             )?,
             preferred_alias_bitwise_equal: evidence.preferred_alias_bitwise_equal.clone(),
             used_compatibility_fallback: evidence.used_compatibility_fallback,
-        })
+        };
+        projection.validate_semantics()?;
+        Ok(projection)
     }
 }
 
@@ -959,15 +1347,94 @@ fn field_value_from_envelope<T: Clone>(
     value: &CanonicalNullableV1<T>,
     envelope: &CanonicalMetricEnvelopeV1,
 ) -> Result<MetricDecisionFieldValueV1<T>, MetricContractProjectionErrorV1> {
-    Ok(MetricDecisionFieldValueV1 {
+    let field = MetricDecisionFieldValueV1 {
         value: value.clone(),
         availability: envelope.availability,
         measurement_quality: envelope.measurement_quality,
         reasons: MetricDecisionReasonSummaryV1::try_from_codes(&envelope.reason_codes)?,
-    })
+    };
+    field.validate()?;
+    Ok(field)
 }
 
 impl FundingDecisionProjectionV1 {
+    pub fn validate_semantics(&self) -> Result<(), MetricContractProjectionErrorV1> {
+        if !nullable_f64_bits_equal(&self.legacy_source.value, &self.legacy_v1.value) {
+            return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                "legacy FSC value parity",
+            ));
+        }
+        if self.distinct_known_source_count > self.known_source_sample_count {
+            return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                "legacy FSC source counts",
+            ));
+        }
+        if self.known_source_sample_count < FSC_LEGACY_MIN_KNOWN_SOURCE_SAMPLES_V1 {
+            if !self.legacy_source.value.is_null() || !self.legacy_v1.value.is_null() {
+                return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                    "legacy FSC requires two known samples",
+                ));
+            }
+        } else {
+            let expected = 1.0
+                - self.distinct_known_source_count as f64 / self.known_source_sample_count as f64;
+            match &self.legacy_source.value {
+                CanonicalNullableV1::Value(value)
+                    if value.is_finite() && value.to_bits() == expected.to_bits() => {}
+                _ => {
+                    return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                        "legacy FSC formula parity",
+                    ));
+                }
+            }
+        }
+        validate_optional_unit_ratio(&self.legacy_source.value, "legacy FSC ratio range")?;
+        let known_coverage = validate_optional_unit_ratio(
+            &self.known_coverage.value,
+            "FSC v2 known coverage range",
+        )?;
+        let non_neutral_coverage = validate_optional_unit_ratio(
+            &self.non_neutral_known_coverage.value,
+            "FSC v2 non-neutral coverage range",
+        )?;
+        if self.known_buyer_count > self.total_buyer_count {
+            return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                "FSC v2 buyer counts",
+            ));
+        }
+        match &self.fsc_v2.value {
+            CanonicalNullableV1::Value(FscEvidenceStatus::Clean)
+            | CanonicalNullableV1::Value(FscEvidenceStatus::Degraded) => {
+                if known_coverage.is_none() || non_neutral_coverage.is_none() {
+                    return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                        "available FSC v2 status requires coverage",
+                    ));
+                }
+            }
+            CanonicalNullableV1::Value(FscEvidenceStatus::Unavailable) => {
+                return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                    "unavailable FSC v2 must use null surface value",
+                ));
+            }
+            CanonicalNullableV1::Null => {
+                if known_coverage.is_some() || non_neutral_coverage.is_some() {
+                    return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                        "unavailable FSC v2 cannot expose coverage",
+                    ));
+                }
+            }
+        }
+        if self.fsc_v2.envelope.policy_actionable
+            || self.fsc_v2.envelope.authority_class != MetricAuthorityClass::EvidenceOnly
+            || self.fsc_v2.envelope.rollout_role != MetricRolloutRoleV1::NonPolicy
+        {
+            return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                "FSC v2 must remain evidence-only",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn try_from_evidence(
         evidence: &FundingSourceContractEvidenceV1,
         context: &MetricDecisionProjectionBuildContextV1<'_>,
@@ -986,7 +1453,13 @@ impl FundingDecisionProjectionV1 {
                 "legacy FSC value parity",
             ));
         }
-        Ok(Self {
+        let fsc_v2_value = match evidence.v2_status {
+            FscEvidenceStatus::Clean | FscEvidenceStatus::Degraded => {
+                CanonicalNullableV1::Value(evidence.v2_status)
+            }
+            FscEvidenceStatus::Unavailable => CanonicalNullableV1::Null,
+        };
+        let projection = Self {
             legacy_source: surface_value(
                 &evidence.legacy_source.envelope,
                 MetricSurfaceId::TxIntelFundingSourceConcentrationLegacy,
@@ -1006,7 +1479,7 @@ impl FundingDecisionProjectionV1 {
             fsc_v2: surface_value(
                 &evidence.v2_envelope,
                 MetricSurfaceId::FundingSourceV2ReadinessEvidence,
-                &CanonicalNullableV1::Value(evidence.v2_status),
+                &fsc_v2_value,
                 MetricContractProducerIdV1::FundingSourceIndex,
                 context,
             )?,
@@ -1020,11 +1493,88 @@ impl FundingDecisionProjectionV1 {
             )?,
             known_buyer_count: evidence.known_buyer_count,
             total_buyer_count: evidence.total_buyer_count,
-        })
+        };
+        projection.validate_semantics()?;
+        Ok(projection)
     }
 }
 
 impl FscStatusDecisionProjectionV1 {
+    pub fn validate_semantics(
+        &self,
+        funding: &FundingDecisionProjectionV1,
+    ) -> Result<(), MetricContractProjectionErrorV1> {
+        let legacy_value_present = !funding.legacy_source.value.is_null();
+        if self.legacy_scalar_present != legacy_value_present
+            || self.compatibility_status.value
+                != CanonicalNullableV1::Value(self.legacy_feature_status)
+        {
+            return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                "FSC compatibility/legacy presence parity",
+            ));
+        }
+        if (self.legacy_scalar_present && self.legacy_feature_status != EvidenceStatus::Clean)
+            || (!self.legacy_scalar_present && self.legacy_feature_status == EvidenceStatus::Clean)
+        {
+            return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                "FSC legacy status/presence parity",
+            ));
+        }
+        if self.compatibility_status.envelope.policy_actionable
+            || self.compatibility_status.envelope.authority_class
+                != MetricAuthorityClass::Compatibility
+        {
+            return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                "FSC compatibility status cannot grant v2 authority",
+            ));
+        }
+
+        let status_coverage =
+            validate_optional_unit_ratio(&self.fsc_v2_coverage, "FSC status coverage range")?;
+        let funding_coverage = validate_optional_unit_ratio(
+            &funding.known_coverage.value,
+            "FSC funding coverage range",
+        )?;
+        match &self.fsc_v2_status {
+            CanonicalNullableV1::Value(FscEvidenceStatus::Clean) => {
+                if funding.fsc_v2.value != CanonicalNullableV1::Value(FscEvidenceStatus::Clean)
+                    || funding.fsc_v2.envelope.measurement_quality
+                        != MetricMeasurementQualityV1::Measured
+                    || status_coverage.is_none()
+                {
+                    return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                        "clean FSC v2 status/readiness parity",
+                    ));
+                }
+            }
+            CanonicalNullableV1::Value(FscEvidenceStatus::Degraded) => {
+                if funding.fsc_v2.value != CanonicalNullableV1::Value(FscEvidenceStatus::Degraded)
+                    || funding.fsc_v2.envelope.measurement_quality
+                        != MetricMeasurementQualityV1::Degraded
+                    || status_coverage.is_none()
+                {
+                    return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                        "degraded FSC v2 status/readiness parity",
+                    ));
+                }
+            }
+            CanonicalNullableV1::Value(FscEvidenceStatus::Unavailable)
+            | CanonicalNullableV1::Null => {
+                if !funding.fsc_v2.value.is_null() || status_coverage.is_some() {
+                    return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                        "unavailable FSC v2 cannot appear measured",
+                    ));
+                }
+            }
+        }
+        if status_coverage.map(f64::to_bits) != funding_coverage.map(f64::to_bits) {
+            return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                "FSC v2 status/funding coverage parity",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn try_from_evidence(
         evidence: &FscStatusEvidenceV1,
         context: &MetricDecisionProjectionBuildContextV1<'_>,

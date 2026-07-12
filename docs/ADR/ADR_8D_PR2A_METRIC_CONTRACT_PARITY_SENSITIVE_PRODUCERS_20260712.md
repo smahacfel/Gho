@@ -1,6 +1,6 @@
 # ADR-8D: PR2A parity-sensitive producers kontraktów metryk
 
-Status: `IMPLEMENTED / READY_FOR_REVIEW / METRIC_CONTRACTS_V1_1_PARITY_SENSITIVE_PRODUCERS_READY`
+Status: `IMPLEMENTED / READY_FOR_RE_REVIEW / METRIC_CONTRACTS_V1_1_PARITY_SENSITIVE_PRODUCERS_READY / PR2A_REVIEW_BLOCKERS_CLOSED`
 
 Typ: ADR-8D / cross-cutting producer, evidence i SSOT contract
 
@@ -93,7 +93,12 @@ powodów. Limit wynosi osiem unikalnych reason codes; nadmiar ma jawny
 `omitted_count`.
 
 Projection hash jest deterministycznym `CanonicalHashV1` pełnego semantic root.
-Nie zawiera self-hash i nie zastępuje przyszłego SHA pełnego sidecara.
+Publiczny kontrakt projection udostępnia wyłącznie
+`validated_canonical_hash(context)`: przed serializacją do canonical JSON i
+SHA-256 wykonuje pełne `validate_context()`, w tym walidację status/value oraz
+semantykę rodzin PR2A. Usunięto wcześniejszą metodę, która przed hashowaniem
+sprawdzała tylko wersję schema. Projection nie zawiera self-hash i nie
+zastępuje przyszłego SHA pełnego sidecara.
 
 ### 2.2 Frozen inputs i zakaz recompute
 
@@ -109,6 +114,34 @@ eventów ani indeksów. Builder:
 
 Test call-count buduje producer output raz i konwertuje go wielokrotnie bez
 dodatkowego wywołania producenta.
+
+### 2.3 Fail-closed validation compact projection
+
+Każdy publiczny `MetricDecisionFieldValueV1<T>` i
+`MetricDecisionSurfaceValueV1<T>` egzekwuje ten sam kontrakt koherencji:
+
+```text
+Available     => Value + quality inna niż NotApplicable
+non-Available => Null + NotApplicable
+```
+
+`non-Available` obejmuje `Unavailable`, `NotConfigured` i
+`NotRecordedLegacySchema`. Tym samym żaden deserializowany albo ręcznie
+złożony compact payload nie może przejść jako `Available + Null`,
+`Unavailable + Value` albo `Available + NotApplicable`.
+
+Root `validate_context()` uruchamia następnie jawne walidatory rodzin PR2A:
+
+- FTDI: value/count/parity oraz oddzielne legacy i corrected actionability;
+- dev-buy: first-observed/effective parity i fail-closed primary selection;
+- timing: count/ratio, population i window contracts;
+- top3: preferred/fallback/effective oraz skala ratio;
+- funding: legacy FSC formula/counts, v2 coverage i authority isolation;
+- FSC status: cross-check legacy presence oraz v2 readiness z funding family.
+
+Invarianty rodzin PR2B pozostają ich gate'em implementacyjnym, natomiast
+generic status/value coherence już obejmuje także ich publiczne field/surface
+typy.
 
 ## 3. Producer ownership i authority
 
@@ -185,6 +218,12 @@ denominator pozostaje transaction count. Dedupe, dust, source capacity,
 timestamp fallback, missing stable ordering identity i truncation mają jawne
 provenance/quality. Aktywny threshold nadal czyta exact `same_ms_tx_ratio`.
 
+Recent exact używa domkniętego przedziału czasu. `start_ts_ms == end_ts_ms`
+jest prawidłowym, ewaluowalnym oknem: jeden successful tx daje `0/1`, dwa
+`1/2`, a trzy `2/3`. Tylko `start_ts_ms > end_ts_ms` zwraca pusty wynik.
+Failed tx nie wchodzi do successful denominatora. Surface pozostaje
+`LoggingOnly` i jest objęty statycznym zakazem aktywnego policy read.
+
 ### 4.4 Top3
 
 Nie dodano drugiego helpera. Producer snapshot pobiera:
@@ -256,6 +295,26 @@ Launcher nadal failuje dla trybu innego niż Legacy. PR2A nie aktywuje
 - Brak zmian execution, Jito, sender, IWIM, post-buy i shadow/live.
 - Brak Type-5 runtime.
 
+### 6.1 Amendment zamykający blokery review
+
+Review ujawniło dwie luki, które nie zmieniały aktywnej authority, ale
+pozwalały utworzyć niepoprawny dowód compact:
+
+1. `MetricDecisionFieldValueV1<T>` sprawdzał wyłącznie reason bounds, a
+   `MetricDecisionSurfaceValueV1<T>` wyłącznie envelope/provenance. Root nie
+   weryfikował wszystkich zależności między polami rodzin, a stary hash path
+   akceptował dowolny root z poprawną `schema_version`.
+2. RCE `rce_window_stats()` traktował `start_ts_ms == end_ts_ms` jak pusty
+   przedział, mimo że domknięte okno mogło zawierać wiele successful tx w tej
+   samej milisekundzie.
+
+Poprawka wprowadza fail-closed generic coherence, sześć family semantic
+validators, validated-only projection hash oraz zmienia pusty-window guard z
+`start >= end` na `start > end`. Testy negatywne odrzucają niespójne
+availability/value/quality, count/ratio, population/window, FTDI, top3 i FSC.
+Regresje recent exact obejmują 1/2/3 successful tx w tym samym timestampie,
+failed exclusion oraz odwrócony przedział.
+
 ## 7. Odrzucone warianty
 
 1. Częściowy root MFS z placeholderami PR2B — odrzucony, bo udawałby kompletne
@@ -308,4 +367,10 @@ V3_REPLAY_V1_UNCHANGED
 DUAL_COMPUTE_NOT_ACTIVATED
 TYPE5_RUNTIME_NOT_IMPLEMENTED
 PR2B_PLUS_BLOCKED_UNTIL_SEQUENTIAL_ACCEPTANCE
+PR2A_PROJECTION_VALUE_STATUS_INVARIANTS_PASS
+PR2A_FAMILY_SEMANTIC_VALIDATION_PASS
+PR2A_VALIDATED_HASH_PATH_PASS
+PR2A_RECENT_EXACT_ZERO_WIDTH_WINDOW_PASS
+PR2A_REVIEW_BLOCKERS_CLOSED
+PR2A_READY_FOR_RE_REVIEW
 ```

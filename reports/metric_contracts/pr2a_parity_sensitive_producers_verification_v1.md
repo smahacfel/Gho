@@ -1,6 +1,6 @@
 # PR2A parity-sensitive metric-contract producers — raport weryfikacyjny V1
 
-Status: `VERIFICATION_COMPLETE / READY_FOR_REVIEW / ONE_UNRELATED_BASELINE_TEST_FAILURE`
+Status: `VERIFICATION_COMPLETE / READY_FOR_RE_REVIEW / REVIEW_BLOCKERS_CLOSED / ONE_UNRELATED_BASELINE_TEST_FAILURE`
 
 Data: 2026-07-12
 
@@ -24,7 +24,9 @@ Raport weryfikuje:
 4. rzeczywiste runtime effective-config binding;
 5. brak częściowej materializacji root MFS;
 6. brak zmian Gatekeeper policy, DecisionLogger v33 i V3 replay v1;
-7. compatibility starych konfiguracji i historycznych statusów.
+7. compatibility starych konfiguracji i historycznych statusów;
+8. fail-closed value/status i family semantic validation przed hashowaniem;
+9. ewaluowalność domkniętego recent-exact window o zerowej szerokości.
 
 Nie jest to burn-in, PR2B, PR2C, PR3 ani Type-5 T1 evidence.
 
@@ -33,9 +35,10 @@ Nie jest to burn-in, PR2B, PR2C, PR3 ani Type-5 T1 evidence.
 | Komenda | Wynik | Dowód |
 | --- | --- | --- |
 | `cargo test -p ghost-core --test metric_contracts_v1_1_foundation` | PASS, 15/15 | registry/profile/hash/status/effective-config foundation |
-| `cargo test -p ghost-core --test metric_contracts_v1_1_projection` | PASS, 8/8 | closed root, every-leaf hash sensitivity, builders, reason bounds, negative serde/config |
-| `cargo test -p ghost-launcher --test metric_contracts_pr2a_producers` | PASS, 12/12 | FTDI/dev/timing/top3/FSC producers i config binding |
+| `cargo test -p ghost-core --test metric_contracts_v1_1_projection` | PASS, 12/12 | closed root, validated hash, value/status coherence, family semantics, builders i negative serde/config |
+| `cargo test -p ghost-launcher --test metric_contracts_pr2a_producers` | PASS, 16/16 | FTDI/dev/timing/top3/FSC producers, config binding i zero-width recent exact |
 | `cargo test -p ghost-launcher --test metric_contracts_pr2a_static_guards` | PASS, 7/7 | forbidden activation i one-owner guards |
+| `cargo test -p ghost-launcher --lib reversed_recent_window_remains_empty` | PASS, 1/1 | `start > end` pozostaje pustym oknem |
 | `cargo test -p ghost-launcher --test gatekeeper_policy_tests` | PASS, 46/46 | V2 policy parity |
 | `cargo test -p ghost-launcher --test gatekeeper_v25_regression` | PASS, 42/42 | V2.5 parity |
 | `cargo test -p ghost-launcher --test refactor_invariants_tests` | PASS, 12/12 | SSOT/top3/schema guards |
@@ -52,26 +55,34 @@ Nie jest to burn-in, PR2B, PR2C, PR3 ani Type-5 T1 evidence.
 Targeted clippy:
 
 ```text
-cargo clippy -p ghost-core --test metric_contracts_v1_1_projection --no-deps
+cargo clippy -p ghost-core --test metric_contracts_v1_1_projection \
+  --no-deps --message-format=short
 cargo clippy -p ghost-launcher \
   --test metric_contracts_pr2a_producers \
-  --test metric_contracts_pr2a_static_guards --no-deps
+  --test metric_contracts_pr2a_static_guards \
+  --no-deps --message-format=short
 ```
 
-Obie komendy kończą się kodem 0. Po korekcie dwóch uwag testowych clippy nie
-raportuje ostrzeżeń w nowych PR2A plikach; pozostałe ostrzeżenia są istniejącym
-baseline’em crates.
+Obie komendy kończą się kodem 0 i nie raportują nowych ostrzeżeń w liniach
+zmienionych przez amendment; pozostałe ostrzeżenia są istniejącym baseline’em
+crates.
 
 ## 3. Projection foundation proof
 
 Pokrycie testów:
 
 - deterministic hash i mutacja każdego semantic leaf zmienia hash;
+- hash jest dostępny przez `validated_canonical_hash(context)` i nie powstaje,
+  gdy `validate_context()` odrzuca payload;
 - `deny_unknown_fields` na root i typach składowych;
 - partial root jest odrzucany;
 - missing producer/config/cutoff, wrong surface/role/profile/mode są odrzucane;
 - missing, duplicate, wrong-kind i non-finite effective config są odrzucane;
 - reasons są unikalne, bounded do 8 i mają jawny omitted count;
+- generic field/surface validation odrzuca `Available + Null`,
+  non-available + value oraz `Available + NotApplicable`;
+- jawne family validators odrzucają niespójne FTDI/dev/timing/top3/FSC
+  dependencies także po deserializacji albo ręcznej mutacji root;
 - FTDI, dev, timing, top3 i FSC builders odrzucają representation drift;
 - compact types nie zawierają owner lists, event lists, anchors, cumulative
   flows ani transport metadata;
@@ -79,6 +90,51 @@ Pokrycie testów:
   frozen evidence;
 - PR2B family types nie mają builderów;
 - `MaterializedFeatureSet` nie ma root projection field.
+
+### 3.1 Zamknięcie dwóch blokerów review
+
+Bloker 1 miał dwie przyczyny źródłowe:
+
+- compact field/surface walidowały reason/envelope/provenance, ale nie
+  koherencję `value ↔ availability ↔ measurement_quality`;
+- family builders sprawdzały część parity podczas konwersji, lecz root
+  `validate_context()` nie odtwarzał wszystkich zależności semantycznych, a
+  dawny `canonical_hash()` sprawdzał tylko `schema_version`.
+
+Naprawa:
+
+```text
+MetricDecisionFieldValueV1::validate
+MetricDecisionSurfaceValueV1::validate
+FtdiDecisionProjectionV1::validate_semantics
+DevBuyDecisionProjectionV1::validate_semantics
+TxTimingDecisionProjectionV1::validate_semantics
+Top3DecisionProjectionV1::validate_semantics
+FundingDecisionProjectionV1::validate_semantics
+FscStatusDecisionProjectionV1::validate_semantics
+MetricContractDecisionEvidenceProjectionV1::validated_canonical_hash
+```
+
+Negatywne testy obejmują: `Available + Null`, `Unavailable/NotConfigured/`
+`NotRecordedLegacySchema + Value`, `Available + NotApplicable`, timing
+`numerator > denominator`, ratio niezgodne z counts, złą population, zły recent
+window, drift FTDI value/counts, top3 effective/fallback, legacy FSC value przy
+jednej known próbce oraz hash semantycznie nieważnego root.
+
+Bloker 2 wynikał z warunku `start_ts_ms >= end_ts_ms` w
+`rce_window_stats()`. Domknięty przedział `[T,T]` może jednak zawierać wiele
+zdarzeń. Warunek zmieniono na `start_ts_ms > end_ts_ms`; testy dowodzą:
+
+```text
+1 successful @ T => numerator=0, denominator=1, ratio=0.0
+2 successful @ T => numerator=1, denominator=2, ratio=0.5
+3 successful @ T => numerator=2, denominator=3, ratio=2/3
+failed @ T       => wykluczony z successful denominatora
+start > end      => pusty wynik
+```
+
+Recent exact nadal jest `LoggingOnly`; static guard zabrania jego odczytu w
+aktywnym Gatekeeper policy.
 
 ## 4. Parity proofs per family
 
@@ -120,6 +176,8 @@ Testy rozdzielają:
 - exact same-ms extras;
 - adjacent `<50 ms` cluster;
 - recent successful 10 s window;
+- domknięte zero-width recent window z 1/2/3 successful tx;
+- failed tx w tym samym timestampie wykluczony z recent denominatora;
 - full observation denominator;
 - duplicate transaction;
 - missing timestamp fallback;
@@ -285,4 +343,10 @@ V3_REPLAY_V1_UNCHANGED
 DUAL_COMPUTE_NOT_ACTIVATED
 TYPE5_RUNTIME_NOT_IMPLEMENTED
 PR2B_PLUS_BLOCKED_UNTIL_SEQUENTIAL_ACCEPTANCE
+PR2A_PROJECTION_VALUE_STATUS_INVARIANTS_PASS
+PR2A_FAMILY_SEMANTIC_VALIDATION_PASS
+PR2A_VALIDATED_HASH_PATH_PASS
+PR2A_RECENT_EXACT_ZERO_WIDTH_WINDOW_PASS
+PR2A_REVIEW_BLOCKERS_CLOSED
+PR2A_READY_FOR_RE_REVIEW
 ```

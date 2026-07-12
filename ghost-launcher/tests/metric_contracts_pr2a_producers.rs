@@ -124,6 +124,54 @@ fn runtime_contract_context() -> (
     )
 }
 
+fn recent_exact_snapshot_for_same_timestamp(successes: &[bool]) -> TxTimingProducerSnapshotV1 {
+    let manager = SessionManager::new(SessionConfig {
+        max_sessions: 1,
+        ..SessionConfig::default()
+    });
+    let pool = Pubkey::new_unique();
+    let base_mint = Pubkey::new_unique();
+    let bonding_curve = Pubkey::new_unique();
+    let timestamp_ms = 5_000;
+    let mut candidate = EnhancedCandidate {
+        pool_amm_id: pool,
+        base_mint,
+        bonding_curve,
+        timestamp: timestamp_ms,
+        ..EnhancedCandidate::default()
+    };
+    candidate.signature = Signature::new_unique().to_string();
+    let gatekeeper = GatekeeperV2Config::default();
+    manager
+        .open_session(OpenSessionRequest {
+            pool_amm_id: pool,
+            base_mint,
+            bonding_curve,
+            dev_wallet: None,
+            candidate_snapshot: candidate,
+            created_at_wall_ms: timestamp_ms,
+            deadline_wall_ms: Some(timestamp_ms + 30_000),
+            funding_source_config: FundingSourceConfig::from_gatekeeper_config(&gatekeeper),
+            gatekeeper_config: gatekeeper,
+            fingerprint_config: EarlyFingerprintConfig::default(),
+        })
+        .unwrap();
+    let session = manager.get_session(&pool).unwrap();
+    let mut guard = session.write();
+    for success in successes {
+        let _outcome = guard.ingest_transaction(Arc::new(tx(
+            Pubkey::new_unique(),
+            Signature::new_unique(),
+            timestamp_ms,
+            1.0,
+            true,
+            *success,
+            None,
+        )));
+    }
+    guard.metric_contract_recent_exact_timing_snapshot()
+}
+
 #[test]
 fn ftdi_preserves_value_population_and_splits_legacy_from_corrected_actionability() {
     let signer_a = Pubkey::new_unique();
@@ -530,6 +578,38 @@ fn recent_exact_snapshot_uses_successful_ten_second_window_not_full_observation(
     assert_eq!(recent_snapshot.ratio, Some(0.0));
     assert_eq!(recent_snapshot.window_ms, Some(10_000));
     assert_eq!(recent_snapshot.dust_filter_sol, None);
+}
+
+#[test]
+fn recent_exact_zero_width_one_successful_tx_is_evaluable() {
+    let snapshot = recent_exact_snapshot_for_same_timestamp(&[true]);
+    assert_eq!(snapshot.denominator, 1);
+    assert_eq!(snapshot.numerator, 0);
+    assert_eq!(snapshot.ratio, Some(0.0));
+}
+
+#[test]
+fn recent_exact_zero_width_two_successful_txs_count_same_ms_extra() {
+    let snapshot = recent_exact_snapshot_for_same_timestamp(&[true, true]);
+    assert_eq!(snapshot.denominator, 2);
+    assert_eq!(snapshot.numerator, 1);
+    assert_eq!(snapshot.ratio, Some(0.5));
+}
+
+#[test]
+fn recent_exact_zero_width_three_successful_txs_count_all_extras() {
+    let snapshot = recent_exact_snapshot_for_same_timestamp(&[true, true, true]);
+    assert_eq!(snapshot.denominator, 3);
+    assert_eq!(snapshot.numerator, 2);
+    assert_eq!(snapshot.ratio, Some(2.0 / 3.0));
+}
+
+#[test]
+fn recent_exact_zero_width_excludes_failed_tx_from_successful_population() {
+    let snapshot = recent_exact_snapshot_for_same_timestamp(&[true, false, true]);
+    assert_eq!(snapshot.denominator, 2);
+    assert_eq!(snapshot.numerator, 1);
+    assert_eq!(snapshot.ratio, Some(0.5));
 }
 
 #[test]

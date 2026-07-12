@@ -20,6 +20,8 @@ fn pr2a_does_not_activate_counterfactual_or_evidence_only_policy_inputs() {
         "FtdiUniqueBuyerActionabilityV2",
         "MfsDevPrimaryBuySolV1",
         "FundingSourceV2ReadinessEvidence",
+        "RceSameMsCollisionRatioRecentExact",
+        "same_ms_tx_ratio_recent",
         "metric_contract_decision_projection_v1",
     ] {
         assert!(
@@ -80,6 +82,10 @@ fn projection_builder_is_pure_and_runtime_stays_legacy_only() {
             "projection builder reads producer/live state: {forbidden}"
         );
     }
+    assert!(projection.contains("pub fn validated_canonical_hash("));
+    assert!(!projection.contains("pub fn canonical_hash(&self)"));
+    let pr2a = read("ghost-launcher/src/metric_contracts/pr2a.rs");
+    assert!(pr2a.contains(".validated_canonical_hash(context)"));
     let main = read("ghost-launcher/src/main.rs");
     assert!(main
         .contains("foundation.metric_contract_rollout_mode != MetricContractRolloutMode::Legacy"));
