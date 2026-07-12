@@ -887,6 +887,284 @@ fn runtime_resolved_config_keeps_legacy_window_and_fsc_minimum() {
     FundingDecisionProjectionV1::try_from_evidence(&funding_evidence, &projection_context).unwrap();
 }
 
+fn compact_test_envelope(
+    surface: MetricSurfaceId,
+    profile: &MetricContractProfileV1,
+) -> MetricDecisionEnvelopeV1 {
+    let assignment = profile.entry_for(surface).unwrap();
+    MetricDecisionEnvelopeV1 {
+        contract_id: assignment.contract_id,
+        contract_version: 1,
+        surface_id: surface,
+        authority_class: assignment.authority_class,
+        rollout_role: assignment.role_for(MetricContractRolloutMode::Legacy),
+        availability: MetricAvailabilityV1::Available,
+        measurement_quality: MetricMeasurementQualityV1::Measured,
+        policy_actionable: false,
+        reasons: MetricDecisionReasonSummaryV1 {
+            codes: Vec::new(),
+            omitted_count: 0,
+        },
+    }
+}
+
+fn compact_test_surface<T>(
+    surface_id: MetricSurfaceId,
+    value: T,
+    producer_id: MetricContractProducerIdV1,
+    profile: &MetricContractProfileV1,
+) -> MetricDecisionSurfaceValueV1<T> {
+    MetricDecisionSurfaceValueV1 {
+        envelope: compact_test_envelope(surface_id, profile),
+        value: CanonicalNullableV1::Value(value),
+        producer_id,
+        producer_schema_version: 1,
+        source_cutoff: MetricContractDecisionSourceCutoffV1::try_new(1_000, Some(1)).unwrap(),
+    }
+}
+
+fn compact_test_field<T>(value: T) -> MetricDecisionFieldValueV1<T> {
+    MetricDecisionFieldValueV1 {
+        value: CanonicalNullableV1::Value(value),
+        availability: MetricAvailabilityV1::Available,
+        measurement_quality: MetricMeasurementQualityV1::Measured,
+        reasons: MetricDecisionReasonSummaryV1 {
+            codes: Vec::new(),
+            omitted_count: 0,
+        },
+    }
+}
+
+fn assert_real_unavailable_fsc_cohort_path(stream_available: bool) {
+    let (profile, resolved, _, tx_config, funding) = runtime_contract_context();
+    let index = FundingSourceIndex::new();
+    if stream_available {
+        index.set_stream_available(true);
+    }
+    let successful_buy = tx(
+        Pubkey::new_unique(),
+        Signature::new_unique(),
+        1_000,
+        1.0,
+        true,
+        true,
+        Some((1, 0)),
+    );
+    let computation = index.compute_for_transactions([&successful_buy], &funding);
+    assert_eq!(
+        computation.funding_source_v2.status,
+        ghost_core::tx_intelligence::types::FscEvidenceStatus::Unavailable
+    );
+    assert!(computation.funding_source_v2.total_buyers >= 1);
+    assert_eq!(computation.funding_source_v2.known_buyers, 0);
+    assert_eq!(computation.funding_source_v2.known_non_neutral_buyers, 0);
+    assert_eq!(
+        computation.funding_source_v2.known_coverage.to_bits(),
+        0.0_f64.to_bits()
+    );
+    assert_eq!(
+        computation
+            .funding_source_v2
+            .non_neutral_known_coverage
+            .to_bits(),
+        0.0_f64.to_bits()
+    );
+
+    let evidence_context = Pr2aEvidenceBuildContextV1 {
+        rollout_mode: MetricContractRolloutMode::Legacy,
+        profile: &profile,
+        effective_config: &resolved,
+    };
+    let producer_config = funding_producer_config(&funding);
+    let funding_evidence =
+        build_funding_evidence_v1(&computation, &funding, &producer_config, &evidence_context)
+            .unwrap();
+    let status_evidence =
+        build_fsc_status_evidence_v1(&computation, &funding, &producer_config, &evidence_context)
+            .unwrap();
+    assert_eq!(funding_evidence.known_coverage, CanonicalNullableV1::Null);
+    assert_eq!(
+        funding_evidence.non_neutral_known_coverage,
+        CanonicalNullableV1::Null
+    );
+    assert_eq!(funding_evidence.known_buyer_count, 0);
+    assert!(funding_evidence.total_buyer_count >= 1);
+
+    let projection_context = MetricDecisionProjectionBuildContextV1 {
+        rollout_mode: MetricContractRolloutMode::Legacy,
+        profile: &profile,
+        effective_config: &resolved,
+        source_cutoff: MetricContractDecisionSourceCutoffV1::try_new(1_000, Some(1)).unwrap(),
+    };
+    let funding_projection =
+        FundingDecisionProjectionV1::try_from_evidence(&funding_evidence, &projection_context)
+            .unwrap();
+    let status_projection =
+        FscStatusDecisionProjectionV1::try_from_evidence(&status_evidence, &projection_context)
+            .unwrap();
+    funding_projection
+        .validate_semantics(&projection_context)
+        .unwrap();
+    status_projection
+        .validate_semantics(&funding_projection, &projection_context)
+        .unwrap();
+    assert_eq!(funding_projection.fsc_v2.value, CanonicalNullableV1::Null);
+    assert_eq!(
+        funding_projection.known_coverage.value,
+        CanonicalNullableV1::Null
+    );
+    assert_eq!(
+        funding_projection.non_neutral_known_coverage.value,
+        CanonicalNullableV1::Null
+    );
+    assert_eq!(funding_projection.known_buyer_count, 0);
+    assert!(funding_projection.total_buyer_count >= 1);
+
+    let candidate = EnhancedCandidate::default();
+    let engine = TxIntelligenceEngine::new(tx_config, &candidate, None);
+    let features = engine.compute_features();
+    let tx_snapshot = engine.metric_contract_snapshot(&features);
+    let ftdi = compute_ftdi([&successful_buy]);
+    let compatibility = GatekeeperDevPrimaryCompatibilitySnapshotV1 {
+        amount_sol: None,
+        creator_known: false,
+        create_signature: None,
+        create_signature_matched: false,
+        selection_mode: DevBuySelectionModeV1::NoEligibleBuy,
+        selected_signature: None,
+        selected_slot: None,
+        selected_transaction_index: None,
+        eligible_buy_count: 0,
+        selected_success: None,
+    };
+    let recent = recent_exact_snapshot_for_same_timestamp(&[true]);
+    let ftdi_evidence = build_ftdi_evidence_v1(&ftdi, &evidence_context).unwrap();
+    let dev_evidence =
+        build_dev_buy_evidence_v1(&tx_snapshot, &compatibility, &evidence_context).unwrap();
+    let timing_evidence =
+        build_tx_timing_evidence_v1(&tx_snapshot, &recent, &evidence_context).unwrap();
+    let top3_evidence = build_top3_evidence_v1(&tx_snapshot, &evidence_context).unwrap();
+
+    let projection = MetricContractDecisionEvidenceProjectionV1 {
+        schema_version: METRIC_CONTRACT_DECISION_PROJECTION_SCHEMA_VERSION_V1,
+        rollout_mode: MetricContractRolloutMode::Legacy,
+        profile_id: profile.payload().profile_id,
+        profile_hash: profile.canonical_hash().unwrap(),
+        metric_contract_effective_config_hash: resolved
+            .metric_contract_effective_config_hash
+            .clone(),
+        fee_topology_diversity_index: FtdiDecisionProjectionV1::try_from_evidence(
+            &ftdi_evidence,
+            &projection_context,
+        )
+        .unwrap(),
+        dev_buy: DevBuyDecisionProjectionV1::try_from_evidence(&dev_evidence, &projection_context)
+            .unwrap(),
+        same_ms_tx_ratio: TxTimingDecisionProjectionV1::try_from_evidence(
+            &timing_evidence,
+            &projection_context,
+        )
+        .unwrap(),
+        top3_signer_volume_ratio: Top3DecisionProjectionV1::try_from_evidence(
+            &top3_evidence,
+            &projection_context,
+        )
+        .unwrap(),
+        flip_ratio: FlipDecisionProjectionV1 {
+            legacy_slot_gap_ratio: compact_test_surface(
+                MetricSurfaceId::EarlyFingerprintFlipRatioLegacySlotGap,
+                0.2,
+                MetricContractProducerIdV1::TxIntelligenceFingerprintAggregator,
+                &profile,
+            ),
+            hybrid_v2_ratio: compact_test_surface(
+                MetricSurfaceId::FlipRatioHybridEvidenceV2,
+                0.2,
+                MetricContractProducerIdV1::TxIntelligenceFingerprintAggregator,
+                &profile,
+            ),
+            eligible_buyer_count: 5,
+            flipper_count: 1,
+            wall_clock_window_ms: 10_000,
+            max_slot_gap: 20,
+            dump_ratio: 0.5,
+        },
+        funding_source_concentration: funding_projection,
+        fsc_evidence_status: status_projection,
+        manipulation_contradiction: ManipulationDecisionProjectionV1 {
+            legacy_numeric_envelope: compact_test_envelope(
+                MetricSurfaceId::MfsManipulationNumericLegacyDefaults,
+                &profile,
+            ),
+            numeric_v2_envelope: compact_test_envelope(
+                MetricSurfaceId::ManipulationNumericEvidenceV2,
+                &profile,
+            ),
+            measured_fields_mask: 0x7f,
+            same_ms_tx_ratio: compact_test_field(0.1),
+            bundle_suspicion_ratio: compact_test_field(0.2),
+            top3_signer_volume_ratio: compact_test_field(0.3),
+            hhi: compact_test_field(0.1),
+            max_tx_per_signer: compact_test_field(2.0),
+            dev_volume_ratio: compact_test_field(0.1),
+            contradiction_score: compact_test_field(0.0),
+            legacy_high_recorded_mask: 0x3f,
+            legacy_high_true_mask: 0,
+            derived_high_evaluable_mask: 0x3f,
+            derived_high_true_mask: 0,
+        },
+        reserve_velocity: ReserveVelocityDecisionProjectionV1 {
+            legacy_velocity: compact_test_surface(
+                MetricSurfaceId::AccountStateReserveVelocityScalarLegacy,
+                1.0,
+                MetricContractProducerIdV1::AccountStateCore,
+                &profile,
+            ),
+            velocity_v1: compact_test_surface(
+                MetricSurfaceId::ReserveVelocityEvidenceV1,
+                1.0,
+                MetricContractProducerIdV1::AccountStateCore,
+                &profile,
+            ),
+            previous_real_sol_reserves_lamports: compact_test_field(CanonicalU64StringV1::new(1)),
+            current_real_sol_reserves_lamports: compact_test_field(CanonicalU64StringV1::new(2)),
+            interval_ms: compact_test_field(1_000),
+            accepted_update_count: 2,
+            source_clock: ReserveVelocitySourceClockV1::ReceiveTime,
+            status: ReserveVelocityStatusV1::Measured,
+        },
+        recent_buy_sell: RecentBuySellDecisionProjectionV1 {
+            legacy_scalar: compact_test_surface(
+                MetricSurfaceId::RceBuySellRatioRecentLegacy,
+                2.0,
+                MetricContractProducerIdV1::RecentBuySellWindowProducer,
+                &profile,
+            ),
+            v1_envelope: compact_test_envelope(MetricSurfaceId::RecentBuySellEvidenceV1, &profile),
+            window_ms: 10_000,
+            buy_count: 2,
+            sell_count: 1,
+            transaction_count: 3,
+            buy_to_sell_ratio: compact_test_field(2.0),
+            buy_share: compact_test_field(2.0 / 3.0),
+        },
+    };
+    projection.validate_context(&projection_context).unwrap();
+    projection
+        .validated_canonical_hash(&projection_context)
+        .unwrap();
+}
+
+#[test]
+fn real_fsc_producer_preserves_unavailable_non_empty_buyer_cohort() {
+    assert_real_unavailable_fsc_cohort_path(false);
+}
+
+#[test]
+fn real_fsc_producer_preserves_index_cold_non_empty_buyer_cohort() {
+    assert_real_unavailable_fsc_cohort_path(true);
+}
+
 #[test]
 fn rehashed_non_compact_config_drift_is_rejected_at_frozen_producer_boundaries() {
     let (profile, resolved, gatekeeper, tx_config, funding) = runtime_contract_context();

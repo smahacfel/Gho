@@ -356,6 +356,28 @@ W zamkniętej klasyfikacji 56 kluczy `FscMinKnownNonNeutralBuyers` należy do
 `FrozenProducerBoundaryValidated`; `FscMinTotalBuyers`, `FscMinKnownCoverage`
 i `FscMinNonNeutralKnownCoverage` pozostają `CompactValidated`.
 
+Unavailable FSC value/coverage nie oznacza braku policzonego buyer cohort.
+`total_buyer_count` jest compact cohort context i może być większy od zera przy
+FSC v2 `Unavailable`. W takim stanie compact zachowuje `total_buyer_count`, ale
+wymaga null obu coverage oraz `known_buyer_count == 0`; plain cohort count nie
+jest traktowany jako measured FSC value. `Clean` i `Degraded` nadal wymagają
+dodatniego denominatora.
+
+Durable `MetricContractsEvidenceSetV1::validate_semantics()` samodzielnie
+waliduje full-evidence FSC v2 po deserializacji, bez progów effective-config:
+
+```text
+known_non_neutral_buyer_count <= known_buyer_count <= total_buyer_count
+known_coverage = known_buyer_count / total_buyer_count
+non_neutral_known_coverage = known_non_neutral_buyer_count / total_buyer_count
+```
+
+Dla `Unavailable` oba known counts i coverage pozostają null/zero, natomiast
+`total_buyer_count` może zachować non-empty cohort. Dedykowany błąd
+`FscV2Invariant` chroni transport creation i serde round-trip także wtedy, gdy
+fałszywy payload otrzymał nowy, prawidłowy canonical hash. Progi `Clean`
+pozostają wyłącznie na frozen producer boundary.
+
 ## 5. Effective config
 
 Launcher buduje `ResolvedMetricContractEffectiveConfigV1` z rzeczywistych,
@@ -482,6 +504,8 @@ PR2A_VALIDATED_HASH_PATH_PASS
 PR2A_EFFECTIVE_CONFIG_PROJECTION_PARITY_PASS
 PR2A_VALIDATED_HASH_CONTEXT_BINDING_PASS
 PR2A_RECENT_EXACT_ZERO_WIDTH_WINDOW_PASS
+PR2A_FSC_UNAVAILABLE_COHORT_PRESERVATION_PASS
+PR2A_FULL_EVIDENCE_FSC_V2_SEMANTICS_PASS
 PR2A_COMPACT_SCHEMA_EXACT_PLAN_PARITY_PASS
 PR2A_FSC_FROZEN_CONFIG_PROVENANCE_PASS
 PR2A_FSC_STATUS_THRESHOLD_PARITY_PASS

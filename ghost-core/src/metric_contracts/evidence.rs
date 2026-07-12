@@ -386,6 +386,8 @@ pub enum MetricContractEvidenceSemanticErrorV1 {
     FlipOwnerInvariant,
     #[error("legacy FSC scalar/status cross-check invariant failed")]
     FscStatusInvariant,
+    #[error("FSC v2 full-evidence invariant failed for {0}")]
+    FscV2Invariant(&'static str),
     #[error("dev-buy evidence invariant failed for {0}")]
     DevBuyInvariant(&'static str),
     #[error("derived manipulation flag invariant failed for {0:?}")]
@@ -555,6 +557,72 @@ fn validate_fsc_legacy_measurement(
         return Err(MetricContractEvidenceSemanticErrorV1::DerivedRatioMismatch(
             field,
         ));
+    }
+    Ok(())
+}
+
+fn validate_fsc_v2_evidence(
+    evidence: &FundingSourceContractEvidenceV1,
+) -> Result<(), MetricContractEvidenceSemanticErrorV1> {
+    if evidence.known_non_neutral_buyer_count > evidence.known_buyer_count {
+        return Err(MetricContractEvidenceSemanticErrorV1::FscV2Invariant(
+            "known non-neutral buyers exceed known buyers",
+        ));
+    }
+    if evidence.known_buyer_count > evidence.total_buyer_count {
+        return Err(MetricContractEvidenceSemanticErrorV1::FscV2Invariant(
+            "known buyers exceed total buyers",
+        ));
+    }
+
+    match evidence.v2_status {
+        FscEvidenceStatus::Clean | FscEvidenceStatus::Degraded => {
+            if evidence.total_buyer_count == 0 {
+                return Err(MetricContractEvidenceSemanticErrorV1::FscV2Invariant(
+                    "available status requires a non-empty buyer cohort",
+                ));
+            }
+            let CanonicalNullableV1::Value(known_coverage) = &evidence.known_coverage else {
+                return Err(MetricContractEvidenceSemanticErrorV1::FscV2Invariant(
+                    "available status requires known coverage",
+                ));
+            };
+            let CanonicalNullableV1::Value(non_neutral_known_coverage) =
+                &evidence.non_neutral_known_coverage
+            else {
+                return Err(MetricContractEvidenceSemanticErrorV1::FscV2Invariant(
+                    "available status requires non-neutral known coverage",
+                ));
+            };
+            let expected_known =
+                f64::from(evidence.known_buyer_count) / f64::from(evidence.total_buyer_count);
+            if known_coverage.to_bits() != expected_known.to_bits() {
+                return Err(MetricContractEvidenceSemanticErrorV1::FscV2Invariant(
+                    "known coverage does not match buyer counts",
+                ));
+            }
+            let expected_non_neutral = f64::from(evidence.known_non_neutral_buyer_count)
+                / f64::from(evidence.total_buyer_count);
+            if non_neutral_known_coverage.to_bits() != expected_non_neutral.to_bits() {
+                return Err(MetricContractEvidenceSemanticErrorV1::FscV2Invariant(
+                    "non-neutral known coverage does not match buyer counts",
+                ));
+            }
+        }
+        FscEvidenceStatus::Unavailable => {
+            if !matches!(&evidence.known_coverage, CanonicalNullableV1::Null)
+                || !matches!(
+                    &evidence.non_neutral_known_coverage,
+                    CanonicalNullableV1::Null
+                )
+                || evidence.known_buyer_count != 0
+                || evidence.known_non_neutral_buyer_count != 0
+            {
+                return Err(MetricContractEvidenceSemanticErrorV1::FscV2Invariant(
+                    "unavailable status cannot expose known counts or coverage",
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -835,17 +903,13 @@ impl MetricContractsEvidenceSetV1 {
         let funding = &self.funding_source_concentration;
         validate_fsc_legacy_measurement("fsc_legacy_source", &funding.legacy_source)?;
         validate_fsc_legacy_measurement("fsc_legacy_v1", &funding.legacy_v1)?;
+        validate_fsc_v2_evidence(funding)?;
         bounded_ratio("fsc_known_coverage", &funding.known_coverage)?;
         bounded_ratio(
             "fsc_non_neutral_known_coverage",
             &funding.non_neutral_known_coverage,
         )?;
         bounded_ratio("coordination_fsc_hhi", &funding.coordination_hhi)?;
-        if funding.known_buyer_count > funding.total_buyer_count {
-            return Err(MetricContractEvidenceSemanticErrorV1::CountInvariant(
-                "fsc_known_buyers",
-            ));
-        }
         let fsc_status = &self.fsc_evidence_status;
         let legacy_scalar_present =
             matches!(funding.legacy_source.ratio, CanonicalNullableV1::Value(_));

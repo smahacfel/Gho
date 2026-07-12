@@ -1701,10 +1701,9 @@ impl FundingDecisionProjectionV1 {
                 if known_coverage.is_some()
                     || non_neutral_coverage.is_some()
                     || self.known_buyer_count != 0
-                    || self.total_buyer_count != 0
                 {
                     return Err(MetricContractProjectionErrorV1::FamilyInvariant(
-                        "unavailable FSC v2 cannot expose measured counts or coverage",
+                        "unavailable FSC v2 cannot expose known counts or measured coverage",
                     ));
                 }
             }

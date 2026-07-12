@@ -811,6 +811,26 @@ fn standard_projection_uses_current_window_and_fsc_minimum_and_hashes_validly() 
     let projection = complete_projection();
     projection.validate_context(&context).unwrap();
     projection.validated_canonical_hash(&context).unwrap();
+
+    let mut known_present = projection.funding_source_concentration.clone();
+    known_present.known_buyer_count = 1;
+    assert!(known_present.validate_semantics(&context).is_err());
+
+    let mut known_exceeds_total = projection.funding_source_concentration.clone();
+    known_exceeds_total.known_buyer_count = 3;
+    assert!(known_exceeds_total.validate_semantics(&context).is_err());
+
+    let mut known_coverage_present = projection.funding_source_concentration.clone();
+    known_coverage_present.known_coverage.value = CanonicalNullableV1::Value(0.0);
+    assert!(known_coverage_present.validate_semantics(&context).is_err());
+
+    let mut non_neutral_coverage_present = projection.funding_source_concentration;
+    non_neutral_coverage_present
+        .non_neutral_known_coverage
+        .value = CanonicalNullableV1::Value(0.0);
+    assert!(non_neutral_coverage_present
+        .validate_semantics(&context)
+        .is_err());
 }
 
 #[test]
@@ -861,6 +881,33 @@ fn funding_compact_projection_has_exact_normative_field_set() {
 
     assert_eq!(actual, expected);
     assert!(!object.contains_key("known_non_neutral_buyer_count"));
+}
+
+#[test]
+fn unavailable_fsc_preserves_non_empty_buyer_cohort_through_validated_hash() {
+    let profile = MetricContractProfileV1::profile_a().unwrap();
+    let config = effective_config();
+    let context = projection_context(&profile, &config);
+    let mut projection = complete_projection();
+    let funding = &mut projection.funding_source_concentration;
+    funding.fsc_v2.value = CanonicalNullableV1::Null;
+    funding.fsc_v2.envelope.availability = MetricAvailabilityV1::Unavailable;
+    funding.fsc_v2.envelope.measurement_quality = MetricMeasurementQualityV1::NotApplicable;
+    funding.known_coverage.value = CanonicalNullableV1::Null;
+    funding.known_coverage.availability = MetricAvailabilityV1::Unavailable;
+    funding.known_coverage.measurement_quality = MetricMeasurementQualityV1::NotApplicable;
+    funding.non_neutral_known_coverage.value = CanonicalNullableV1::Null;
+    funding.non_neutral_known_coverage.availability = MetricAvailabilityV1::Unavailable;
+    funding.non_neutral_known_coverage.measurement_quality =
+        MetricMeasurementQualityV1::NotApplicable;
+    funding.known_buyer_count = 0;
+    funding.total_buyer_count = 2;
+    projection.fsc_evidence_status.fsc_v2_status =
+        CanonicalNullableV1::Value(FscEvidenceStatus::Unavailable);
+    projection.fsc_evidence_status.fsc_v2_coverage = CanonicalNullableV1::Null;
+
+    projection.validate_context(&context).unwrap();
+    projection.validated_canonical_hash(&context).unwrap();
 }
 
 #[test]

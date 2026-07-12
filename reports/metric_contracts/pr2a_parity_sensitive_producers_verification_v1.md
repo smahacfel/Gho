@@ -34,6 +34,8 @@ Raport weryfikuje:
 13. zamkniętą klasyfikację wszystkich kluczy effective-config rodzin PR2A.
 14. exact parity `FundingDecisionProjectionV1` z normatywnym field-setem
     §2.6.2 oraz full-evidence-only klasyfikację non-neutral buyer countu.
+15. zachowanie non-empty buyer cohort dla FSC v2 `Unavailable` oraz niezależną
+    durable full-evidence count/status/coverage validation po deserializacji.
 
 Nie jest to burn-in, PR2B, PR2C, PR3 ani Type-5 T1 evidence.
 
@@ -41,9 +43,9 @@ Nie jest to burn-in, PR2B, PR2C, PR3 ani Type-5 T1 evidence.
 
 | Komenda | Wynik | Dowód |
 | --- | --- | --- |
-| `cargo test -p ghost-core --test metric_contracts_v1_1_foundation` | PASS, 15/15 | registry/profile/hash/status/effective-config foundation |
-| `cargo test -p ghost-core --test metric_contracts_v1_1_projection` | PASS, 21/21 | exact funding compact field-set, closed root, validated hash, exact/cluster parity, reprezentowalne FSC counts/coverage/Clean thresholds i wcześniejsze semantic regressions |
-| `cargo test -p ghost-launcher --test metric_contracts_pr2a_producers` | PASS, 24/24 | full-evidence-only non-neutral count, frozen count/coverage/Clean-minimum validation, stale computation, embedded settings, neutral version, warmup/same-slot boundary i runtime defaults |
+| `cargo test -p ghost-core --test metric_contracts_v1_1_foundation` | PASS, 19/19 | durable FSC v2 semantics, transport creation i correctly-rehashed serde rejection oraz wcześniejsza foundation |
+| `cargo test -p ghost-core --test metric_contracts_v1_1_projection` | PASS, 22/22 | unavailable cohort validated hash, exact nine-field schema i wcześniejsze compact regressions |
+| `cargo test -p ghost-launcher --test metric_contracts_pr2a_producers` | PASS, 26/26 | real stream-unavailable/index-cold buyer cohorts oraz wcześniejsze provenance/frozen boundary/runtime regressions |
 | `cargo test -p ghost-launcher --test metric_contracts_pr2a_static_guards` | PASS, 8/8 | forbidden activation, one-owner guards i closed 56-key PR2A classification |
 | `cargo test -p ghost-launcher --lib metric_contract_producer_fingerprint_is_sensitive_to_every_owned_setting` | PASS, 1/1 | fingerprint sensitivity dla każdego pola `FundingSourceConfig`, w tym neutral-set contents/version |
 | `cargo test -p ghost-launcher --lib reversed_recent_window_remains_empty` | PASS, 1/1 | `start > end` pozostaje pustym oknem |
@@ -56,6 +58,7 @@ Nie jest to burn-in, PR2B, PR2C, PR3 ani Type-5 T1 evidence.
 | `cargo test -p ghost-launcher --lib insufficient_known_sources_returns_reason` | PASS, 1/1 | one-known = null/unavailable |
 | `cargo test -p ghost-brain --lib test_gatekeeper_buy_log_file_write` | PASS, 1/1 | v33 write compatibility |
 | `cargo test -p ghost-brain --lib replay_payload` | PASS, 5/5 | V3 replay schema v1 compatibility |
+| `cargo check -p ghost-core` | PASS | core evidence/projection build |
 | `cargo check -p ghost-launcher` | PASS | launcher build |
 | `cargo fmt --all -- --check` | PASS | format |
 | `git diff --check` | PASS | whitespace/patch integrity |
@@ -226,6 +229,22 @@ exact known coverage, zero-total/unavailable fail-closed i minima total, known
 coverage oraz non-neutral known coverage. `FscMinKnownNonNeutralBuyers` jest
 `FrozenProducerBoundaryValidated`, podczas gdy trzy reprezentowalne minima
 pozostają `CompactValidated`.
+
+Unavailable FSC value/coverage nie oznacza braku policzonego buyer cohort.
+Rzeczywiste testy `FundingSourceIndex::new()` z successful BUY potwierdzają dwa
+stany: stream unavailable oraz stream available/index cold. W obu przypadkach
+producent zwraca `Unavailable`, raw coverage `0.0`, zero known counts i dodatni
+`total_buyers`; full evidence zamienia coverage na null, a compact zachowuje
+`total_buyer_count` jako bounded cohort context. Root `validate_context()` i
+`validated_canonical_hash()` akceptują taki dziewięciopolowy payload.
+
+Durable full evidence nie ufa sidecar countom po serde. Dedykowana
+`FscV2Invariant` sprawdza count ordering, status/presence i bitwise-exact obie
+coverage formulas. Regresje mutują known albo non-neutral count bez coverage,
+tworzą dla fałszywego payloadu nowy prawidłowy canonical hash i potwierdzają
+odrzucenie zarówno przez `MetricContractEvidenceTransportV1::try_new`, jak i
+przez deserializację. `Unavailable` z `total_buyer_count = 2`, zero known counts
+i null coverage przechodzi transport hashing oraz serde round-trip.
 
 `PR2A_EFFECTIVE_CONFIG_KEY_BOUNDARIES_V1` klasyfikuje wszystkie 56 kluczy
 rodzin PR2A dokładnie raz jako `CompactValidated` albo
@@ -482,6 +501,8 @@ PR2A_VALIDATED_HASH_PATH_PASS
 PR2A_EFFECTIVE_CONFIG_PROJECTION_PARITY_PASS
 PR2A_VALIDATED_HASH_CONTEXT_BINDING_PASS
 PR2A_RECENT_EXACT_ZERO_WIDTH_WINDOW_PASS
+PR2A_FSC_UNAVAILABLE_COHORT_PRESERVATION_PASS
+PR2A_FULL_EVIDENCE_FSC_V2_SEMANTICS_PASS
 PR2A_COMPACT_SCHEMA_EXACT_PLAN_PARITY_PASS
 PR2A_FSC_FROZEN_CONFIG_PROVENANCE_PASS
 PR2A_FSC_STATUS_THRESHOLD_PARITY_PASS
