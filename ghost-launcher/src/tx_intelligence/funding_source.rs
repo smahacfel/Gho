@@ -54,6 +54,49 @@ pub struct FundingSourceConfig {
     neutral_funding_sources: HashSet<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FundingSourceSameSlotOrderingPolicyV1 {
+    RequireTxIndex,
+    RequireTxIndexElseUnavailable,
+}
+
+impl FundingSourceSameSlotOrderingPolicyV1 {
+    #[must_use]
+    pub const fn metric_contract_value(self) -> &'static str {
+        match self {
+            Self::RequireTxIndex => "require_tx_index",
+            Self::RequireTxIndexElseUnavailable => "require_tx_index_else_unavailable",
+        }
+    }
+}
+
+/// Minimal frozen settings snapshot carried from the actual FSC runtime owners
+/// to the PR2A evidence boundary. The producer fingerprint remains owned by
+/// this module; callers must not reconstruct it from ad-hoc strings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FundingSourceProducerConfigSnapshotV1 {
+    producer_config_hash: String,
+    warmup_window_ms: u64,
+    same_slot_ordering_policy: FundingSourceSameSlotOrderingPolicyV1,
+}
+
+impl FundingSourceProducerConfigSnapshotV1 {
+    #[must_use]
+    pub fn producer_config_hash(&self) -> &str {
+        &self.producer_config_hash
+    }
+
+    #[must_use]
+    pub const fn warmup_window_ms(&self) -> u64 {
+        self.warmup_window_ms
+    }
+
+    #[must_use]
+    pub const fn same_slot_ordering_policy(&self) -> FundingSourceSameSlotOrderingPolicyV1 {
+        self.same_slot_ordering_policy
+    }
+}
+
 impl FundingSourceConfig {
     #[must_use]
     pub fn from_gatekeeper_config(config: &GatekeeperV2Config) -> Self {
@@ -127,6 +170,45 @@ impl FundingSourceConfig {
             .collect::<Vec<_>>();
         sources.sort();
         CanonicalHashV1::digest(&sources).map(Some)
+    }
+
+    #[must_use]
+    pub fn metric_contract_producer_config_hash(&self) -> String {
+        funding_source_config_hash(self)
+    }
+
+    #[must_use]
+    pub fn metric_contract_neutral_funder_set_producer_hash(&self) -> Option<String> {
+        neutral_funder_set_hash(self)
+    }
+
+    pub fn metric_contract_producer_config_snapshot(
+        &self,
+        fsc_v2: Option<&FscV2Config>,
+    ) -> anyhow::Result<FundingSourceProducerConfigSnapshotV1> {
+        let (warmup_window_ms, same_slot_ordering_policy) = match fsc_v2 {
+            Some(config) => {
+                let warmup_window_ms =
+                    config.warmup_window_s.checked_mul(1_000).ok_or_else(|| {
+                        anyhow::anyhow!("fsc_v2.warmup_window_s overflows milliseconds")
+                    })?;
+                let same_slot_ordering_policy =
+                    match config.same_slot_cross_signature_policy.as_str() {
+                        "require_tx_index" => FundingSourceSameSlotOrderingPolicyV1::RequireTxIndex,
+                        _ => anyhow::bail!("unsupported fsc_v2.same_slot_cross_signature_policy"),
+                    };
+                (warmup_window_ms, same_slot_ordering_policy)
+            }
+            None => (
+                0,
+                FundingSourceSameSlotOrderingPolicyV1::RequireTxIndexElseUnavailable,
+            ),
+        };
+        Ok(FundingSourceProducerConfigSnapshotV1 {
+            producer_config_hash: self.metric_contract_producer_config_hash(),
+            warmup_window_ms,
+            same_slot_ordering_policy,
+        })
     }
 }
 
@@ -2087,6 +2169,59 @@ mod tests {
             funding_source_config_hash(&config),
             funding_source_config_hash(&changed_status_config)
         );
+    }
+
+    #[test]
+    fn metric_contract_producer_fingerprint_is_sensitive_to_every_owned_setting() {
+        let base = config();
+        let base_hash = base.metric_contract_producer_config_hash();
+        let mut variants = Vec::new();
+
+        let mut changed = base.clone();
+        changed.lookback_window_ms += 1;
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.min_abs_store_lamports += 1;
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.min_abs_attribution_lamports += 1;
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.min_rel_to_buy = 0.25;
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.min_attribution_confidence_bps += 1;
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.per_recipient_cap += 1;
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.global_recipient_cap += 1;
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.neutral_funder_set_version = Some("v2".to_string());
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.min_total_buyers += 1;
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.min_known_non_neutral_buyers += 1;
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.min_known_coverage = 0.75;
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.min_non_neutral_known_coverage = 0.75;
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed
+            .neutral_funding_sources
+            .insert("neutral-source-a".to_string());
+        variants.push(changed);
+
+        for changed in variants {
+            assert_ne!(changed.metric_contract_producer_config_hash(), base_hash);
+        }
     }
 
     fn buy_tx(signer: &str, signature: &str, timestamp_ms: u64) -> PoolTransaction {

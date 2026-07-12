@@ -1,4 +1,4 @@
-use ghost_brain::config::{GatekeeperV2Config, MetricContractFoundationConfigV1};
+use ghost_brain::config::{FscV2Config, GatekeeperV2Config, MetricContractFoundationConfigV1};
 use ghost_brain::fast_pipeline::EnhancedCandidate;
 use ghost_core::metric_contracts::*;
 use ghost_core::{CurveFinality, EventSemanticEnvelope, EventTimeMetadata};
@@ -11,8 +11,8 @@ use ghost_launcher::metric_contracts::{
 };
 use ghost_launcher::session::{OpenSessionRequest, SessionConfig, SessionManager};
 use ghost_launcher::tx_intelligence::{
-    compute_ftdi, FundingSourceConfig, FundingSourceIndex, TxIntelligenceConfig,
-    TxIntelligenceEngine, TxTimingProducerSnapshotV1,
+    compute_ftdi, FundingSourceConfig, FundingSourceIndex, FundingSourceProducerConfigSnapshotV1,
+    TxIntelligenceConfig, TxIntelligenceEngine, TxTimingProducerSnapshotV1,
 };
 use seer::early_fingerprint::EarlyFingerprintConfig;
 use seer::types::ToolchainFingerprintInput;
@@ -121,6 +121,44 @@ fn runtime_contract_context() -> (
         gatekeeper,
         tx_config,
         funding,
+    )
+}
+
+fn funding_producer_config(funding: &FundingSourceConfig) -> FundingSourceProducerConfigSnapshotV1 {
+    funding
+        .metric_contract_producer_config_snapshot(None)
+        .unwrap()
+}
+
+fn fsc_runtime_contract_context(
+    gatekeeper: &GatekeeperV2Config,
+    fsc_v2: &FscV2Config,
+) -> (
+    MetricContractProfileV1,
+    ResolvedMetricContractEffectiveConfigV1,
+    FundingSourceConfig,
+    FundingSourceProducerConfigSnapshotV1,
+) {
+    let fingerprint = EarlyFingerprintConfig::default();
+    let tx_config = TxIntelligenceConfig::from_gatekeeper_config(gatekeeper, fingerprint.clone());
+    let funding = FundingSourceConfig::from_configs(gatekeeper, Some(fsc_v2));
+    let producer_config = funding
+        .metric_contract_producer_config_snapshot(Some(fsc_v2))
+        .unwrap();
+    let resolved = resolve_metric_contract_effective_config_v1(
+        MetricContractFoundationConfigV1::default(),
+        gatekeeper,
+        &tx_config,
+        &fingerprint,
+        &funding,
+        Some(fsc_v2),
+    )
+    .unwrap();
+    (
+        MetricContractProfileV1::profile_a().unwrap(),
+        resolved,
+        funding,
+        producer_config,
     )
 }
 
@@ -672,7 +710,13 @@ fn fsc_compatibility_status_does_not_claim_v2_measurement_or_policy_authority() 
         profile: &profile,
         effective_config: &resolved,
     };
-    let status = build_fsc_status_evidence_v1(&computation, &funding, &context).unwrap();
+    let status = build_fsc_status_evidence_v1(
+        &computation,
+        &funding,
+        &funding_producer_config(&funding),
+        &context,
+    )
+    .unwrap();
     assert!(!status.legacy_scalar_present);
     assert_ne!(
         status.fsc_v2_status,
@@ -687,7 +731,13 @@ fn fsc_compatibility_status_does_not_claim_v2_measurement_or_policy_authority() 
     one_known.diagnostics.buyer_sample_count = 1;
     one_known.degraded_reasons =
         vec![ghost_core::tx_intelligence::types::FSC_INSUFFICIENT_KNOWN_SOURCES_REASON.to_string()];
-    let one_known_evidence = build_funding_evidence_v1(&one_known, &funding, &context).unwrap();
+    let one_known_evidence = build_funding_evidence_v1(
+        &one_known,
+        &funding,
+        &funding_producer_config(&funding),
+        &context,
+    )
+    .unwrap();
     assert_eq!(
         one_known_evidence.legacy_v1.ratio,
         CanonicalNullableV1::Null
@@ -705,7 +755,13 @@ fn fsc_compatibility_status_does_not_claim_v2_measurement_or_policy_authority() 
     two_known_samples.known_source_sample_count = 2;
     two_known_samples.funding_source_concentration = Some(0.5);
     two_known_samples.degraded_reasons.clear();
-    let measured = build_funding_evidence_v1(&two_known_samples, &funding, &context).unwrap();
+    let measured = build_funding_evidence_v1(
+        &two_known_samples,
+        &funding,
+        &funding_producer_config(&funding),
+        &context,
+    )
+    .unwrap();
     assert_eq!(measured.legacy_v1.ratio, CanonicalNullableV1::Value(0.5));
     assert_eq!(
         measured.legacy_v1.envelope.measurement_quality,
@@ -764,6 +820,18 @@ fn resolved_effective_config_is_deterministic_sensitive_and_rejects_producer_mis
 fn runtime_resolved_config_keeps_legacy_window_and_fsc_minimum() {
     let (profile, resolved, gatekeeper, tx_config, funding) = runtime_contract_context();
     assert_eq!(
+        resolved.value(MetricEffectiveConfigKeyV1::SameMsExactDeltaMs),
+        Some(&MetricEffectiveConfigValueV1::WideUnsigned(
+            CanonicalU64StringV1::new(0)
+        ))
+    );
+    assert_eq!(
+        resolved.value(MetricEffectiveConfigKeyV1::SameMsClusterUpperBoundExclusiveMs),
+        Some(&MetricEffectiveConfigValueV1::WideUnsigned(
+            CanonicalU64StringV1::new(50)
+        ))
+    );
+    assert_eq!(
         resolved.value(MetricEffectiveConfigKeyV1::SameMsRecentWindowMs),
         Some(&MetricEffectiveConfigValueV1::WideUnsigned(
             CanonicalU64StringV1::new(10_000)
@@ -802,7 +870,13 @@ fn runtime_resolved_config_keeps_legacy_window_and_fsc_minimum() {
     let timing = build_tx_timing_evidence_v1(&snapshot, &recent, &evidence_context).unwrap();
     let fsc = FundingSourceIndex::new()
         .compute_for_transactions(std::iter::empty::<&PoolTransaction>(), &funding);
-    let funding_evidence = build_funding_evidence_v1(&fsc, &funding, &evidence_context).unwrap();
+    let producer_config = funding_producer_config(&funding);
+    assert_eq!(
+        fsc.funding_source_v2.config_hash,
+        producer_config.producer_config_hash()
+    );
+    let funding_evidence =
+        build_funding_evidence_v1(&fsc, &funding, &producer_config, &evidence_context).unwrap();
     let projection_context = MetricDecisionProjectionBuildContextV1 {
         rollout_mode: MetricContractRolloutMode::Legacy,
         profile: &profile,
@@ -934,7 +1008,8 @@ fn rehashed_non_compact_config_drift_is_rejected_at_frozen_producer_boundaries()
     };
     assert_boundary_rejects(
         &config,
-        build_funding_evidence_v1(&fsc, &funding, &context).map(|_| ()),
+        build_funding_evidence_v1(&fsc, &funding, &funding_producer_config(&funding), &context)
+            .map(|_| ()),
     );
 }
 
@@ -989,8 +1064,191 @@ fn evidence_builders_fail_closed_when_frozen_snapshot_settings_do_not_match_conf
         .compute_for_transactions(std::iter::empty::<&PoolTransaction>(), &funding);
     let mut wrong_funding = funding;
     wrong_funding.lookback_window_ms += 1;
-    assert!(build_funding_evidence_v1(&computation, &wrong_funding, &context).is_err());
-    assert!(build_fsc_status_evidence_v1(&computation, &wrong_funding, &context).is_err());
+    let wrong_snapshot = funding_producer_config(&wrong_funding);
+    assert!(
+        build_funding_evidence_v1(&computation, &wrong_funding, &wrong_snapshot, &context).is_err()
+    );
+    assert!(
+        build_fsc_status_evidence_v1(&computation, &wrong_funding, &wrong_snapshot, &context)
+            .is_err()
+    );
+}
+
+#[test]
+fn stale_fsc_computation_is_rejected_by_both_builders_after_config_is_rehashed() {
+    let gatekeeper = GatekeeperV2Config::default();
+    let config_a = FscV2Config {
+        min_known_coverage: 0.50,
+        ..FscV2Config::default()
+    };
+    let (_, _, funding_a, _) = fsc_runtime_contract_context(&gatekeeper, &config_a);
+    let mut computation = FundingSourceIndex::new()
+        .compute_for_transactions(std::iter::empty::<&PoolTransaction>(), &funding_a);
+    computation.funding_source_v2.total_buyers = 5;
+    computation.funding_source_v2.known_buyers = 3;
+    computation.funding_source_v2.known_non_neutral_buyers = 2;
+    computation.funding_source_v2.known_coverage = 0.60;
+    computation.funding_source_v2.non_neutral_known_coverage = 0.40;
+    computation.funding_source_v2.status =
+        ghost_core::tx_intelligence::types::FscEvidenceStatus::Clean;
+
+    let mut config_b = config_a.clone();
+    config_b.min_known_coverage = 0.80;
+    let (profile, resolved_b, funding_b, producer_b) =
+        fsc_runtime_contract_context(&gatekeeper, &config_b);
+    assert_ne!(
+        funding_a.metric_contract_producer_config_hash(),
+        funding_b.metric_contract_producer_config_hash()
+    );
+    let context_b = Pr2aEvidenceBuildContextV1 {
+        rollout_mode: MetricContractRolloutMode::Legacy,
+        profile: &profile,
+        effective_config: &resolved_b,
+    };
+
+    for error in [
+        build_funding_evidence_v1(&computation, &funding_b, &producer_b, &context_b).unwrap_err(),
+        build_fsc_status_evidence_v1(&computation, &funding_b, &producer_b, &context_b)
+            .unwrap_err(),
+    ] {
+        assert!(matches!(
+            error,
+            Pr2aProducerErrorV1::ProducerConfigMismatch("fsc.computation_config_hash")
+        ));
+    }
+}
+
+#[test]
+fn fsc_computation_embedded_producer_settings_are_defensively_cross_checked() {
+    let gatekeeper = GatekeeperV2Config {
+        neutral_funding_sources: vec!["neutral-source-a".to_string()],
+        ..GatekeeperV2Config::default()
+    };
+    let fsc_v2 = FscV2Config {
+        neutral_funder_set_version: Some("v1".to_string()),
+        ..FscV2Config::default()
+    };
+    let (profile, resolved, funding, producer_config) =
+        fsc_runtime_contract_context(&gatekeeper, &fsc_v2);
+    let computation = FundingSourceIndex::new()
+        .compute_for_transactions(std::iter::empty::<&PoolTransaction>(), &funding);
+    let context = Pr2aEvidenceBuildContextV1 {
+        rollout_mode: MetricContractRolloutMode::Legacy,
+        profile: &profile,
+        effective_config: &resolved,
+    };
+    let mut variants = Vec::new();
+    let mut changed = computation.clone();
+    changed.funding_source_v2.min_abs_store_lamports += 1;
+    variants.push(changed);
+    let mut changed = computation.clone();
+    changed.funding_source_v2.min_abs_attribution_lamports += 1;
+    variants.push(changed);
+    let mut changed = computation.clone();
+    changed.funding_source_v2.min_rel_to_buy = 0.25;
+    variants.push(changed);
+    let mut changed = computation.clone();
+    changed.funding_source_v2.ttl_seconds += 1;
+    variants.push(changed);
+    let mut changed = computation.clone();
+    changed.funding_source_v2.neutral_funder_set_version = Some("v2".to_string());
+    variants.push(changed);
+    let mut changed = computation;
+    changed.funding_source_v2.neutral_funder_set_hash = Some("fnv64:bad".to_string());
+    variants.push(changed);
+
+    for changed in variants {
+        assert!(matches!(
+            build_funding_evidence_v1(&changed, &funding, &producer_config, &context),
+            Err(Pr2aProducerErrorV1::ProducerConfigMismatch(
+                "fsc.computation_embedded_settings"
+            ))
+        ));
+    }
+}
+
+#[test]
+fn neutral_set_version_is_part_of_fsc_computation_provenance() {
+    let gatekeeper = GatekeeperV2Config {
+        neutral_funding_sources: vec!["neutral-source-a".to_string()],
+        ..GatekeeperV2Config::default()
+    };
+    let config_a = FscV2Config {
+        neutral_funder_set_version: Some("v1".to_string()),
+        ..FscV2Config::default()
+    };
+    let (_, _, funding_a, _) = fsc_runtime_contract_context(&gatekeeper, &config_a);
+    let computation = FundingSourceIndex::new()
+        .compute_for_transactions(std::iter::empty::<&PoolTransaction>(), &funding_a);
+
+    let mut config_b = config_a.clone();
+    config_b.neutral_funder_set_version = Some("v2".to_string());
+    let (profile, resolved_b, funding_b, producer_b) =
+        fsc_runtime_contract_context(&gatekeeper, &config_b);
+    assert_eq!(
+        funding_a.metric_contract_neutral_funder_set_hash().unwrap(),
+        funding_b.metric_contract_neutral_funder_set_hash().unwrap()
+    );
+    assert_eq!(
+        funding_a.metric_contract_neutral_funder_set_producer_hash(),
+        funding_b.metric_contract_neutral_funder_set_producer_hash()
+    );
+    assert_ne!(
+        funding_a.metric_contract_producer_config_hash(),
+        funding_b.metric_contract_producer_config_hash()
+    );
+    let context_b = Pr2aEvidenceBuildContextV1 {
+        rollout_mode: MetricContractRolloutMode::Legacy,
+        profile: &profile,
+        effective_config: &resolved_b,
+    };
+    assert!(matches!(
+        build_funding_evidence_v1(&computation, &funding_b, &producer_b, &context_b),
+        Err(Pr2aProducerErrorV1::ProducerConfigMismatch(
+            "fsc.computation_config_hash"
+        ))
+    ));
+}
+
+#[test]
+fn warmup_and_same_slot_effective_config_drift_fail_at_frozen_fsc_boundary() {
+    let gatekeeper = GatekeeperV2Config::default();
+    let fsc_v2 = FscV2Config::default();
+    let (profile, resolved, funding, producer_config) =
+        fsc_runtime_contract_context(&gatekeeper, &fsc_v2);
+    let computation = FundingSourceIndex::new()
+        .compute_for_transactions(std::iter::empty::<&PoolTransaction>(), &funding);
+    for (key, value, expected_field) in [
+        (
+            MetricEffectiveConfigKeyV1::FscWarmupWindowMs,
+            MetricEffectiveConfigValueV1::WideUnsigned(CanonicalU64StringV1::new(
+                producer_config.warmup_window_ms() - 1,
+            )),
+            "fsc.warmup_window_ms",
+        ),
+        (
+            MetricEffectiveConfigKeyV1::FscSameSlotOrderingPolicy,
+            MetricEffectiveConfigValueV1::Enum("arrival_order".to_string()),
+            "fsc.same_slot_ordering_policy",
+        ),
+    ] {
+        let changed = rehashed_runtime_config_with_value(&resolved, key, value);
+        changed.validate_hash().unwrap();
+        let context = Pr2aEvidenceBuildContextV1 {
+            rollout_mode: MetricContractRolloutMode::Legacy,
+            profile: &profile,
+            effective_config: &changed,
+        };
+        assert!(matches!(
+            build_funding_evidence_v1(
+                &computation,
+                &funding,
+                &producer_config,
+                &context
+            ),
+            Err(Pr2aProducerErrorV1::ProducerConfigMismatch(field)) if field == expected_field
+        ));
+    }
 }
 
 #[test]

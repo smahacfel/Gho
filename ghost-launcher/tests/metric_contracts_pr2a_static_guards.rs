@@ -1,3 +1,8 @@
+use ghost_core::metric_contracts::{MetricContractId, METRIC_EFFECTIVE_CONFIG_KEYS_V1};
+use ghost_launcher::metric_contracts::{
+    Pr2aEffectiveConfigValidationBoundaryV1, PR2A_EFFECTIVE_CONFIG_KEY_BOUNDARIES_V1,
+};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -90,11 +95,52 @@ fn projection_builder_is_pure_and_runtime_stays_legacy_only() {
     assert!(projection.contains("FscLegacyMinKnownSourceSamples"));
     let pr2a = read("ghost-launcher/src/metric_contracts/pr2a.rs");
     assert!(pr2a.contains(".validated_canonical_hash(context)"));
+    assert!(!pr2a.contains("stable_fnv64_hex"));
+    assert!(!pr2a.contains("lookback_window_ms={}"));
+    let funding = read("ghost-launcher/src/tx_intelligence/funding_source.rs");
+    assert!(funding.contains("pub fn metric_contract_producer_config_hash"));
     let main = read("ghost-launcher/src/main.rs");
     assert!(main
         .contains("foundation.metric_contract_rollout_mode != MetricContractRolloutMode::Legacy"));
     assert!(!main.contains("activation = \"dual_compute\""));
     assert!(!main.contains("activation = \"v2\""));
+}
+
+#[test]
+fn every_pr2a_effective_config_key_has_exactly_one_validation_boundary() {
+    let pr2a_contracts = [
+        MetricContractId::FeeTopologyDiversityIndex,
+        MetricContractId::DevBuy,
+        MetricContractId::SameMsTxRatio,
+        MetricContractId::Top3SignerVolumeRatio,
+        MetricContractId::FundingSourceConcentration,
+        MetricContractId::FscEvidenceStatus,
+    ];
+    let expected = METRIC_EFFECTIVE_CONFIG_KEYS_V1
+        .iter()
+        .copied()
+        .filter(|key| {
+            key.contract_id()
+                .is_some_and(|id| pr2a_contracts.contains(&id))
+        })
+        .collect::<BTreeSet<_>>();
+    let mut classified = BTreeMap::new();
+    for (key, boundary) in PR2A_EFFECTIVE_CONFIG_KEY_BOUNDARIES_V1 {
+        assert!(
+            classified.insert(*key, *boundary).is_none(),
+            "duplicate PR2A effective-config boundary for {key:?}"
+        );
+    }
+    assert_eq!(
+        classified.keys().copied().collect::<BTreeSet<_>>(),
+        expected
+    );
+    assert!(classified
+        .values()
+        .any(|boundary| *boundary == Pr2aEffectiveConfigValidationBoundaryV1::CompactValidated));
+    assert!(classified.values().any(|boundary| {
+        *boundary == Pr2aEffectiveConfigValidationBoundaryV1::FrozenProducerBoundaryValidated
+    }));
 }
 
 #[test]

@@ -1,7 +1,7 @@
 use crate::components::gatekeeper::GatekeeperDevPrimaryCompatibilitySnapshotV1;
 use crate::tx_intelligence::{
-    FscComputation, FtdiComputation, FundingSourceConfig, TxIntelligenceMetricContractSnapshotV1,
-    TxTimingProducerSnapshotV1,
+    FscComputation, FtdiComputation, FundingSourceConfig, FundingSourceProducerConfigSnapshotV1,
+    TxIntelligenceMetricContractSnapshotV1, TxTimingProducerSnapshotV1,
 };
 use ghost_core::checkpoint::EvidenceStatus;
 use ghost_core::metric_contracts::{
@@ -25,6 +25,103 @@ use thiserror::Error;
 
 pub const PR2A_FAMILY_PRODUCER_SCHEMA_VERSION_V1: u16 = 1;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pr2aEffectiveConfigValidationBoundaryV1 {
+    CompactValidated,
+    FrozenProducerBoundaryValidated,
+}
+
+macro_rules! pr2a_boundary_table {
+    (
+        compact [$( $compact:ident ),* $(,)?]
+        frozen [$( $frozen:ident ),* $(,)?]
+    ) => {
+        &[
+            $(
+                (
+                    MetricEffectiveConfigKeyV1::$compact,
+                    Pr2aEffectiveConfigValidationBoundaryV1::CompactValidated,
+                ),
+            )*
+            $(
+                (
+                    MetricEffectiveConfigKeyV1::$frozen,
+                    Pr2aEffectiveConfigValidationBoundaryV1::FrozenProducerBoundaryValidated,
+                ),
+            )*
+        ]
+    };
+}
+
+/// Closed PR2A key classification. Tests compare this table against the core
+/// vocabulary by contract id, so adding a PR2A key without exactly one
+/// validation boundary fails closed.
+pub const PR2A_EFFECTIVE_CONFIG_KEY_BOUNDARIES_V1: &[(
+    MetricEffectiveConfigKeyV1,
+    Pr2aEffectiveConfigValidationBoundaryV1,
+)] = pr2a_boundary_table!(
+    compact [
+        FtdiPopulationSuccessfulBuy,
+        FtdiFirstSamplePerSigner,
+        FtdiMissingSignerBehavior,
+        FtdiMissingTopologyBehavior,
+        FtdiDiagnosticMinUniqueBuyers,
+        FtdiLegacyCleanMinBuyTransactions,
+        FtdiCandidateCleanMinUniqueBuyers,
+        FtdiDenominatorRule,
+        DevTxIntelSuccessEligibility,
+        DevFirstObservedAnchorRule,
+        DevPrimarySuccessRequired,
+        DevPrimaryAnchorRule,
+        DevMissingCreatorBehavior,
+        SameMsExactDeltaMs,
+        SameMsLegacyPopulation,
+        SameMsLegacyDenominatorRule,
+        SameMsClusterUpperBoundExclusiveMs,
+        SameMsRecentWindowMs,
+        SameMsRecentPopulation,
+        SameMsRecentDenominatorRule,
+        Top3PreferredField,
+        Top3FallbackAlias,
+        Top3Scale,
+        Top3MismatchBehavior,
+        FscLegacyFormula,
+        FscLegacyMinKnownSourceSamples,
+        FscMinTotalBuyers,
+        FscMinKnownNonNeutralBuyers,
+        FscMinKnownCoverage,
+        FscMinNonNeutralKnownCoverage,
+        FscFundingStreamUnavailableBehavior,
+        FscLegacyStatusMapping,
+        FscV2StatusMapping,
+    ]
+    frozen [
+        DevTxIntelDustThresholdSol,
+        DevTxIntelDedupeKey,
+        DevTxIntelDedupeCapacity,
+        DevPrimaryDustThresholdSol,
+        DevPrimaryDedupeKey,
+        DevPrimaryDedupeCapacity,
+        SameMsLegacyDustThresholdSol,
+        SameMsLegacyDedupeKey,
+        SameMsLegacyDedupeCapacity,
+        SameMsRecentDedupeKey,
+        SameMsRecentRetentionCapacity,
+        SameMsRecentRetentionPolicy,
+        FscFundingLookbackWindowMs,
+        FscMinAbsStoreLamports,
+        FscMinAbsAttributionLamports,
+        FscMinRelativeToBuy,
+        FscMinAttributionConfidenceBps,
+        FscPerRecipientCapacity,
+        FscGlobalRecipientCapacity,
+        FscWarmupWindowMs,
+        FscSameSlotOrderingPolicy,
+        FscNeutralFunderSetVersion,
+        FscNeutralFunderSetHash,
+    ]
+);
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Pr2aParitySensitiveEvidenceFamiliesV1 {
     pub fee_topology_diversity_index: FtdiEvidenceV1,
@@ -42,6 +139,7 @@ pub struct Pr2aFrozenProducerInputsV1<'a> {
     pub recent_exact_timing: &'a TxTimingProducerSnapshotV1,
     pub fsc: &'a FscComputation,
     pub funding_source_config: &'a FundingSourceConfig,
+    pub funding_source_producer_config: &'a FundingSourceProducerConfigSnapshotV1,
 }
 
 pub struct Pr2aEvidenceBuildContextV1<'a> {
@@ -272,6 +370,19 @@ fn config_enum_matches(
     }
 }
 
+fn config_nullable_text_matches(
+    context: &Pr2aEvidenceBuildContextV1<'_>,
+    key: MetricEffectiveConfigKeyV1,
+    actual: &Option<String>,
+    field: &'static str,
+) -> Result<(), Pr2aProducerErrorV1> {
+    let actual: CanonicalNullableV1<String> = actual.clone().into();
+    match config_value(context, key, field)? {
+        MetricEffectiveConfigValueV1::NullableText(expected) if expected == &actual => Ok(()),
+        _ => Err(Pr2aProducerErrorV1::ProducerConfigMismatch(field)),
+    }
+}
+
 fn validate_ftdi_producer_config(
     context: &Pr2aEvidenceBuildContextV1<'_>,
 ) -> Result<(), Pr2aProducerErrorV1> {
@@ -493,8 +604,14 @@ fn validate_top3_producer_config(
 
 fn validate_funding_producer_config(
     config: &FundingSourceConfig,
+    producer_config: &FundingSourceProducerConfigSnapshotV1,
     context: &Pr2aEvidenceBuildContextV1<'_>,
 ) -> Result<(), Pr2aProducerErrorV1> {
+    if producer_config.producer_config_hash() != config.metric_contract_producer_config_hash() {
+        return Err(Pr2aProducerErrorV1::ProducerConfigMismatch(
+            "fsc.producer_config_snapshot",
+        ));
+    }
     for (key, actual, field) in [
         (
             MetricEffectiveConfigKeyV1::FscFundingLookbackWindowMs,
@@ -587,6 +704,26 @@ fn validate_funding_producer_config(
             ));
         }
     }
+    config_nullable_text_matches(
+        context,
+        MetricEffectiveConfigKeyV1::FscNeutralFunderSetVersion,
+        &config.neutral_funder_set_version,
+        "fsc.neutral_funder_set_version",
+    )?;
+    config_wide_matches(
+        context,
+        MetricEffectiveConfigKeyV1::FscWarmupWindowMs,
+        producer_config.warmup_window_ms(),
+        "fsc.warmup_window_ms",
+    )?;
+    config_enum_matches(
+        context,
+        MetricEffectiveConfigKeyV1::FscSameSlotOrderingPolicy,
+        producer_config
+            .same_slot_ordering_policy()
+            .metric_contract_value(),
+        "fsc.same_slot_ordering_policy",
+    )?;
     config_enum_matches(
         context,
         MetricEffectiveConfigKeyV1::FscLegacyFormula,
@@ -682,11 +819,13 @@ pub fn build_pr2a_evidence_families_v1(
         funding_source_concentration: build_funding_evidence_v1(
             inputs.fsc,
             inputs.funding_source_config,
+            inputs.funding_source_producer_config,
             context,
         )?,
         fsc_evidence_status: build_fsc_status_evidence_v1(
             inputs.fsc,
             inputs.funding_source_config,
+            inputs.funding_source_producer_config,
             context,
         )?,
     })
@@ -1390,12 +1529,43 @@ fn fsc_legacy_status(
     }
 }
 
+fn validate_fsc_computation_provenance(
+    computation: &FscComputation,
+    config: &FundingSourceConfig,
+    producer_config: &FundingSourceProducerConfigSnapshotV1,
+) -> Result<(), Pr2aProducerErrorV1> {
+    let evidence = &computation.funding_source_v2;
+    if evidence.config_hash != producer_config.producer_config_hash() {
+        return Err(Pr2aProducerErrorV1::ProducerConfigMismatch(
+            "fsc.computation_config_hash",
+        ));
+    }
+
+    // Defensive embedded-setting checks make corruption attributable even
+    // though the owner-produced fingerprint above binds every config field.
+    if evidence.min_abs_store_lamports != config.min_abs_store_lamports
+        || evidence.min_abs_attribution_lamports != config.min_abs_attribution_lamports
+        || evidence.min_rel_to_buy.to_bits() != config.min_rel_to_buy.to_bits()
+        || evidence.ttl_seconds != config.lookback_window_ms / 1_000
+        || evidence.neutral_funder_set_version != config.neutral_funder_set_version
+        || evidence.neutral_funder_set_hash
+            != config.metric_contract_neutral_funder_set_producer_hash()
+    {
+        return Err(Pr2aProducerErrorV1::ProducerConfigMismatch(
+            "fsc.computation_embedded_settings",
+        ));
+    }
+    Ok(())
+}
+
 pub fn build_funding_evidence_v1(
     computation: &FscComputation,
     config: &FundingSourceConfig,
+    producer_config: &FundingSourceProducerConfigSnapshotV1,
     context: &Pr2aEvidenceBuildContextV1<'_>,
 ) -> Result<FundingSourceContractEvidenceV1, Pr2aProducerErrorV1> {
-    validate_funding_producer_config(config, context)?;
+    validate_funding_producer_config(config, producer_config, context)?;
+    validate_fsc_computation_provenance(computation, config, producer_config)?;
     finite_ratio(computation.funding_source_concentration, "fsc.legacy")?;
     finite_ratio(
         Some(computation.funding_source_v2.known_coverage),
@@ -1503,6 +1673,9 @@ pub fn build_funding_evidence_v1(
         known_coverage: v2_coverage,
         non_neutral_known_coverage: v2_non_neutral_coverage,
         known_buyer_count: u32::from(computation.funding_source_v2.known_buyers),
+        known_non_neutral_buyer_count: u32::from(
+            computation.funding_source_v2.known_non_neutral_buyers,
+        ),
         total_buyer_count: u32::from(computation.funding_source_v2.total_buyers),
         provider: CanonicalNullableV1::Value(computation.funding_source_v2.provider.clone()),
         config_hash: CanonicalNullableV1::Value(
@@ -1535,9 +1708,11 @@ pub fn build_funding_evidence_v1(
 pub fn build_fsc_status_evidence_v1(
     computation: &FscComputation,
     config: &FundingSourceConfig,
+    producer_config: &FundingSourceProducerConfigSnapshotV1,
     context: &Pr2aEvidenceBuildContextV1<'_>,
 ) -> Result<FscStatusEvidenceV1, Pr2aProducerErrorV1> {
-    validate_funding_producer_config(config, context)?;
+    validate_funding_producer_config(config, producer_config, context)?;
+    validate_fsc_computation_provenance(computation, config, producer_config)?;
     let legacy_scalar_present = computation.funding_source_concentration.is_some();
     let legacy_feature_status = if legacy_scalar_present {
         EvidenceStatus::Clean

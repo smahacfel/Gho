@@ -111,6 +111,13 @@ pub fn resolve_metric_contract_effective_config_v1(
     fsc_v2: Option<&FscV2Config>,
 ) -> Result<ResolvedMetricContractEffectiveConfigV1, MetricContractRuntimeConfigErrorV1> {
     validate_resolved_producer_settings(gatekeeper, tx)?;
+    let funding_producer_snapshot = funding
+        .metric_contract_producer_config_snapshot(fsc_v2)
+        .map_err(|_| {
+            MetricContractRuntimeConfigErrorV1::ProducerSettingsMismatch(
+                "fsc producer settings snapshot",
+            )
+        })?;
     let mut builder = MetricContractEffectiveConfigBuilderV1::new(foundation)?;
 
     insert(
@@ -425,10 +432,7 @@ pub fn resolve_metric_contract_effective_config_v1(
     insert(
         &mut builder,
         Key::FscWarmupWindowMs,
-        wide(match fsc_v2 {
-            Some(config) => checked_millis(config.warmup_window_s, "fsc_v2.warmup_window_s")?,
-            None => 0,
-        }),
+        wide(funding_producer_snapshot.warmup_window_ms()),
     )?;
     insert(
         &mut builder,
@@ -454,9 +458,9 @@ pub fn resolve_metric_contract_effective_config_v1(
         &mut builder,
         Key::FscSameSlotOrderingPolicy,
         enum_value(
-            fsc_v2
-                .map(|config| config.same_slot_cross_signature_policy.as_str())
-                .unwrap_or("require_tx_index_else_unavailable"),
+            funding_producer_snapshot
+                .same_slot_ordering_policy()
+                .metric_contract_value(),
         ),
     )?;
     insert(

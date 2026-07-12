@@ -117,6 +117,29 @@ eventów ani indeksów. Builder:
 Test call-count buduje producer output raz i konwertuje go wielokrotnie bez
 dodatkowego wywołania producenta.
 
+FSC ma dodatkowy, owner-owned provenance gate. Moduł
+`tx_intelligence::funding_source` jest jedynym właścicielem algorytmu
+`metric_contract_producer_config_hash()` i tworzy prywatnie konstruowany
+`FundingSourceProducerConfigSnapshotV1`. Przed oboma builderami obowiązuje:
+
+```text
+FscV2Evidence.config_hash z computation
+== hash FundingSourceConfig przekazanego builderowi
+== hash w typed frozen producer snapshot
+```
+
+Fingerprint obejmuje wszystkie pola `FundingSourceConfig`, w tym exact
+lookback, thresholds, capacities, status minima, wersję i zawartość neutral
+set. Builder dodatkowo cross-checkuje embedded store/attribution minima,
+`min_rel_to_buy`, TTL, neutral-set version i producer neutral-set hash. Starego
+computation nie można przepisać nowym effective-config hash: mismatch kończy
+się `ProducerConfigMismatch` przed utworzeniem evidence.
+
+`warmup_window_s` i deklarowana polityka same-slot pozostają własnością
+rzeczywistego `FscV2Config`; funding producer materializuje z niego minimalny
+typed snapshot. Ten sam snapshot zasila resolver i frozen evidence boundary,
+bez drugiego runtime configu i bez odczytu live state.
+
 ### 2.3 Fail-closed validation compact projection
 
 Każdy publiczny `MetricDecisionFieldValueV1<T>` i
@@ -150,6 +173,12 @@ producer-only, których wartości nie mają reprezentacji w compact payload
 (np. dust, dedupe i capacity), są bezwarunkowo sprawdzane na frozen producer
 boundary przed utworzeniem full evidence; test zmienia taki config, przebudowuje
 jego hash i dowodzi odrzucenia przez `ProducerConfigMismatch`.
+
+Pełna vocabulary PR2A ma zamkniętą tabelę przypisującą każdy klucz dokładnie
+do jednej kategorii: `CompactValidated` albo
+`FrozenProducerBoundaryValidated`. Static guard wyprowadza oczekiwany zbiór z
+core `METRIC_EFFECTIVE_CONFIG_KEYS_V1` i failuje przy brakującym, podwójnym lub
+nadmiarowym przypisaniu. Rodziny PR2B nie są częścią tej klasyfikacji.
 
 Invarianty rodzin PR2B pozostają ich gate'em implementacyjnym, natomiast
 generic status/value coherence już obejmuje także ich publiczne field/surface
@@ -239,6 +268,12 @@ Compact validator nie ma fallbacku do 10 s: pobiera
 `SameMsRecentWindowMs` z przekazanego effective-config, wykonuje checked
 conversion `u64 -> u32` i wymaga dokładnej zgodności z `recent_exact.window_ms`.
 Bieżący runtime resolver nadal materializuje 10 000 ms.
+Ponadto schema V1 wymaga z tego samego, poprawnie zahashowanego contextu
+`SameMsExactDeltaMs == 0` i
+`SameMsClusterUpperBoundExclusiveMs == 50`. Wartości `1` oraz `49` są
+odrzucane przez `validate_context()` i `validated_canonical_hash()` jako
+`EffectiveConfigParity` dla dokładnego klucza, niezależnie od frozen launcher
+boundary.
 
 ### 4.4 Top3
 
@@ -280,6 +315,22 @@ fsc_v2       actual FSC v2 readiness/coverage status
 Historyczne rekordy bez nowych pól deserializują je przez `serde(default)` do
 fail-closed unavailable. `GatekeeperV3EvidenceRequirements.fsc_v2` ma default
 `false`. FSC v2 nie jest promowane do policy.
+
+Compact funding projection zachowuje teraz także
+`known_non_neutral_buyer_count`. Walidator egzekwuje exact bitwise parity:
+
+```text
+known_buyer_count <= total_buyer_count
+known_non_neutral_buyer_count <= known_buyer_count
+known_coverage = known_buyer_count / total_buyer_count
+non_neutral_known_coverage = known_non_neutral_buyer_count / total_buyer_count
+```
+
+`total_buyer_count == 0` wymaga null status/coverage i zerowych counts. Status
+`Clean` wymaga równocześnie wszystkich czterech minimów pobranych z dokładnego
+effective-config: total buyers, known non-neutral buyers, known coverage i
+non-neutral known coverage. Lane-health nie jest rekonstruowane w compact
+validatorze; niewidoczne producer settings są związane frozen fingerprintem.
 
 ## 5. Effective config
 
@@ -330,6 +381,10 @@ pozwalały utworzyć niepoprawny dowód compact:
    lokalnych stałych. Inne semantyczne klucze population/denominator,
    anchor/selection, top3 mapping/scale i FSC formula również nie były jawnie
    cross-checkowane w compact family validators.
+4. Kolejne review wykazało brak provenance między `FscComputation` a
+   przekazanym producer configiem, brak compact parity exact/cluster timing oraz
+   brak count/coverage/Clean-threshold parity FSC i zamkniętej klasyfikacji
+   kluczy effective-config.
 
 Poprawki wprowadzają fail-closed generic coherence, context-aware family
 semantic validators, validated-only projection hash oraz zmieniają pusty-window
@@ -339,6 +394,12 @@ tego samego contextu. Testy A/B przebudowują i ponownie hashują config przed
 wykazaniem błędu family/config; test C dowodzi, że spójne `9_999/9_999`
 przechodzi. Regresje recent exact nadal obejmują 1/2/3 successful tx w tym samym
 timestampie, failed exclusion oraz odwrócony przedział.
+Najnowszy amendment dodaje owner-owned FSC fingerprint i typed runtime-settings
+snapshot, oba buildery failujące na stale computation, compact exact/cluster
+parity, non-neutral count oraz pełne FSC threshold parity. Regresje używają
+ponownie zbudowanych i zahashowanych effective-configów; neutral version drift
+jest wykrywany mimo identycznej zawartości neutral set. Static guard zamyka
+klasyfikację wszystkich 56 kluczy rodzin PR2A.
 
 ## 7. Odrzucone warianty
 
@@ -397,6 +458,10 @@ PR2A_VALIDATED_HASH_PATH_PASS
 PR2A_EFFECTIVE_CONFIG_PROJECTION_PARITY_PASS
 PR2A_VALIDATED_HASH_CONTEXT_BINDING_PASS
 PR2A_RECENT_EXACT_ZERO_WIDTH_WINDOW_PASS
+PR2A_FSC_FROZEN_CONFIG_PROVENANCE_PASS
+PR2A_FSC_STATUS_THRESHOLD_PARITY_PASS
+PR2A_TIMING_EXACT_CLUSTER_CONFIG_PARITY_PASS
+PR2A_EFFECTIVE_CONFIG_KEY_COVERAGE_CLOSED
 GATEKEEPER_POLICY_UNCHANGED
 PR2A_REVIEW_BLOCKERS_CLOSED
 PR2A_READY_FOR_RE_REVIEW

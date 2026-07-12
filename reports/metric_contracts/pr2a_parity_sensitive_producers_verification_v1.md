@@ -29,6 +29,9 @@ Raport weryfikuje:
 9. ewaluowalność domkniętego recent-exact window o zerowej szerokości.
 10. pełne związanie compact family semantics z dokładnym, poprawnie
     zahashowanym `ResolvedMetricContractEffectiveConfigV1`.
+11. provenance `FscComputation` względem owner-owned producer fingerprintu;
+12. exact/cluster timing config parity oraz FSC counts/coverage/Clean minima;
+13. zamkniętą klasyfikację wszystkich kluczy effective-config rodzin PR2A.
 
 Nie jest to burn-in, PR2B, PR2C, PR3 ani Type-5 T1 evidence.
 
@@ -37,9 +40,10 @@ Nie jest to burn-in, PR2B, PR2C, PR3 ani Type-5 T1 evidence.
 | Komenda | Wynik | Dowód |
 | --- | --- | --- |
 | `cargo test -p ghost-core --test metric_contracts_v1_1_foundation` | PASS, 15/15 | registry/profile/hash/status/effective-config foundation |
-| `cargo test -p ghost-core --test metric_contracts_v1_1_projection` | PASS, 18/18 | closed root, validated hash, value/status coherence, family/config semantics, context-driven timing/FSC i negative serde/config |
-| `cargo test -p ghost-launcher --test metric_contracts_pr2a_producers` | PASS, 18/18 | FTDI/dev/timing/top3/FSC producers, runtime config defaults, frozen-boundary config binding i zero-width recent exact |
-| `cargo test -p ghost-launcher --test metric_contracts_pr2a_static_guards` | PASS, 7/7 | forbidden activation i one-owner guards |
+| `cargo test -p ghost-core --test metric_contracts_v1_1_projection` | PASS, 20/20 | closed root, validated hash, exact/cluster parity, FSC counts/coverage/Clean thresholds i wcześniejsze semantic regressions |
+| `cargo test -p ghost-launcher --test metric_contracts_pr2a_producers` | PASS, 22/22 | stale FSC computation, embedded settings, neutral version, warmup/same-slot boundary, runtime defaults i wcześniejsze producer regressions |
+| `cargo test -p ghost-launcher --test metric_contracts_pr2a_static_guards` | PASS, 8/8 | forbidden activation, one-owner guards i closed 56-key PR2A classification |
+| `cargo test -p ghost-launcher --lib metric_contract_producer_fingerprint_is_sensitive_to_every_owned_setting` | PASS, 1/1 | fingerprint sensitivity dla każdego pola `FundingSourceConfig`, w tym neutral-set contents/version |
 | `cargo test -p ghost-launcher --lib reversed_recent_window_remains_empty` | PASS, 1/1 | `start > end` pozostaje pustym oknem |
 | `cargo test -p ghost-launcher --test gatekeeper_policy_tests` | PASS, 46/46 | V2 policy parity |
 | `cargo test -p ghost-launcher --test gatekeeper_v25_regression` | PASS, 42/42 | V2.5 parity |
@@ -177,6 +181,47 @@ source settings nie są dopisywane do compact payload: obowiązkowy frozen
 producer boundary porównuje je z effective-config. Osobny test zmienia je,
 przebudowuje config/hash i otrzymuje `ProducerConfigMismatch` dla każdej rodziny.
 
+### 3.3 FSC provenance, exact/cluster timing i closed key coverage
+
+Producer-owned `metric_contract_producer_config_hash()` jest tym samym
+fingerprintem, który znajduje się w `FscV2Evidence.config_hash`. Oba buildery
+FSC wymagają zgodności computation, przekazanego `FundingSourceConfig`, typed
+`FundingSourceProducerConfigSnapshotV1` i effective-config. Regresje dowodzą:
+
+```text
+computation A: min_known_coverage=0.50, measured coverage=0.60, Clean
+context B:     min_known_coverage=0.80, poprawny nowy effective-config hash
+wynik obu builderów: ProducerConfigMismatch(fsc.computation_config_hash)
+
+neutral contents hash A == B, version v1 != v2
+wynik: ProducerConfigMismatch(fsc.computation_config_hash)
+```
+
+Sensitivity test mutuje osobno wszystkie pola `FundingSourceConfig` oraz
+neutral-set contents; każda mutacja zmienia fingerprint. Osobny test korumpuje
+embedded store/attribution thresholds, `min_rel_to_buy`, TTL, neutral version i
+neutral producer hash przy niezmienionym fingerprintcie; każda mutacja jest
+odrzucana przez defensywny embedded-settings cross-check.
+
+Core projection czyta też `SameMsExactDeltaMs` oraz
+`SameMsClusterUpperBoundExclusiveMs`. Poprawnie rehashed config z odpowiednio
+`1` albo `49` jest odrzucany przez validate i validated hash jako
+`EffectiveConfigParity` dla dokładnego klucza.
+
+Funding compact projection ma `known_non_neutral_buyer_count` i dokładne
+count/coverage parity. `Clean` jest sprawdzany względem czterech minimów z
+contextu. Regresje odrzucają known oraz non-neutral mismatch, zero-total
+measured payload i `Clean` poniżej każdego minimum.
+
+`PR2A_EFFECTIVE_CONFIG_KEY_BOUNDARIES_V1` klasyfikuje wszystkie 56 kluczy
+rodzin PR2A dokładnie raz jako `CompactValidated` albo
+`FrozenProducerBoundaryValidated`. Static guard porównuje tabelę z zamkniętym
+core vocabulary według `contract_id`; brak, duplikat lub nowy niesklasyfikowany
+klucz powoduje failure. `FscWarmupWindowMs` i
+`FscSameSlotOrderingPolicy` są przenoszone minimalnym typed snapshotem od ich
+rzeczywistych ownerów, a ich poprawnie rehashed drift kończy się
+`ProducerConfigMismatch` na frozen boundary.
+
 ## 4. Parity proofs per family
 
 ### FTDI
@@ -250,6 +295,10 @@ wymaga bit-for-bit:
 
 FSC v2 status i coverage są osobne; compatibility FSC status nie dowodzi v2
 measurement. V3 requirement `fsc_v2` domyślnie pozostaje false.
+Compact validator wiąże `known_buyer_count`,
+`known_non_neutral_buyer_count`, `total_buyer_count` i obie coverage dokładną
+formułą. `Clean` wymaga skonfigurowanych minimów total/non-neutral counts oraz
+obu coverage; zero-total pozostaje null/unavailable.
 
 ## 5. Effective-config proof
 
@@ -261,11 +310,16 @@ fingerprint i FundingSource/FSC v2 settings. Testy wykazują:
 - niespójny Gatekeeper/TxIntel config jest odrzucany;
 - snapshot dust/capacity/window niezgodny z hash jest odrzucany;
 - FundingSourceConfig niezgodny z hash jest odrzucany;
+- stale `FscComputation` jest odrzucany przez oba buildery przed przepisaniem
+  effective-config hash;
+- warmup, same-slot, neutral version/hash i wszystkie producer thresholds są
+  związane typed frozen snapshotem lub owner-owned fingerprintem;
 - poprawnie przebudowany i ponownie zahashowany config sprzeczny z compact
   family semantics jest odrzucany przez `EffectiveConfigParity`;
 - klucze bez compact representation są fail-closed na frozen producer
   boundary, również po poprawnym rehashu configu;
 - missing/duplicate/wrong-kind/non-finite/profile mismatch failuje zamknięcie.
+- wszystkie 56 kluczy PR2A ma dokładnie jedną udowodnioną granicę walidacji.
 
 Resolved config jest przechowywany w `OracleRuntimeConfig`, ale PR2A nie
 uruchamia root buildera i nie emituje projection.
@@ -327,6 +381,25 @@ selector score, mapping, logger ani execution eligibility. Naprawa pozostaje
 poza zakresem.
 
 ## 8. Zmienione powierzchnie
+
+Najnowszy amendment review zmienia dokładnie 12 plików:
+
+```text
+docs/ADR/ADR_8D_PR2A_METRIC_CONTRACT_PARITY_SENSITIVE_PRODUCERS_20260712.md
+ghost-core/src/metric_contracts/evidence.rs
+ghost-core/src/metric_contracts/projection.rs
+ghost-core/tests/metric_contracts_v1_1_foundation.rs
+ghost-core/tests/metric_contracts_v1_1_projection.rs
+ghost-launcher/src/metric_contracts/effective_config.rs
+ghost-launcher/src/metric_contracts/pr2a.rs
+ghost-launcher/src/tx_intelligence/funding_source.rs
+ghost-launcher/src/tx_intelligence/mod.rs
+ghost-launcher/tests/metric_contracts_pr2a_producers.rs
+ghost-launcher/tests/metric_contracts_pr2a_static_guards.rs
+reports/metric_contracts/pr2a_parity_sensitive_producers_verification_v1.md
+```
+
+Poniższa lista opisuje łączną powierzchnię całego PR2A względem base.
 
 Kod/schema:
 
@@ -394,6 +467,10 @@ PR2A_VALIDATED_HASH_PATH_PASS
 PR2A_EFFECTIVE_CONFIG_PROJECTION_PARITY_PASS
 PR2A_VALIDATED_HASH_CONTEXT_BINDING_PASS
 PR2A_RECENT_EXACT_ZERO_WIDTH_WINDOW_PASS
+PR2A_FSC_FROZEN_CONFIG_PROVENANCE_PASS
+PR2A_FSC_STATUS_THRESHOLD_PARITY_PASS
+PR2A_TIMING_EXACT_CLUSTER_CONFIG_PARITY_PASS
+PR2A_EFFECTIVE_CONFIG_KEY_COVERAGE_CLOSED
 GATEKEEPER_POLICY_UNCHANGED
 PR2A_REVIEW_BLOCKERS_CLOSED
 PR2A_READY_FOR_RE_REVIEW

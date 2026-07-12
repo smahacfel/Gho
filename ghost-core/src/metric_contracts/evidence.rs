@@ -196,6 +196,7 @@ pub struct FundingSourceContractEvidenceV1 {
     pub known_coverage: CanonicalNullableV1<f64>,
     pub non_neutral_known_coverage: CanonicalNullableV1<f64>,
     pub known_buyer_count: u32,
+    pub known_non_neutral_buyer_count: u32,
     pub total_buyer_count: u32,
     pub provider: CanonicalNullableV1<String>,
     pub config_hash: CanonicalNullableV1<CanonicalHashV1>,

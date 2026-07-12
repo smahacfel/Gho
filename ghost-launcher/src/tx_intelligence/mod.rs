@@ -20,6 +20,7 @@ pub use engine::{
 pub(crate) use funding_source::FSC_LEGACY_MIN_KNOWN_SOURCE_SAMPLES_V1;
 pub use funding_source::{
     funding_lookup_wallets, FscComputation, FundingSourceConfig, FundingSourceIndex,
+    FundingSourceProducerConfigSnapshotV1, FundingSourceSameSlotOrderingPolicyV1,
 };
 pub use sybil_metrics::{
     compute_dbia, compute_des, compute_ftdi, compute_sfd, compute_sybil_resistance,

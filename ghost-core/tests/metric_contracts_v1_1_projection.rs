@@ -15,6 +15,16 @@ fn value_for_key(key: MetricEffectiveConfigKeyV1) -> MetricEffectiveConfigValueV
         MetricEffectiveConfigKeyV1::FscLegacyMinKnownSourceSamples => {
             return MetricEffectiveConfigValueV1::WideUnsigned(CanonicalU64StringV1::new(2));
         }
+        MetricEffectiveConfigKeyV1::SameMsExactDeltaMs => {
+            return MetricEffectiveConfigValueV1::WideUnsigned(CanonicalU64StringV1::new(0));
+        }
+        MetricEffectiveConfigKeyV1::SameMsClusterUpperBoundExclusiveMs => {
+            return MetricEffectiveConfigValueV1::WideUnsigned(CanonicalU64StringV1::new(50));
+        }
+        MetricEffectiveConfigKeyV1::FscMinTotalBuyers
+        | MetricEffectiveConfigKeyV1::FscMinKnownNonNeutralBuyers => {
+            return MetricEffectiveConfigValueV1::WideUnsigned(CanonicalU64StringV1::new(2));
+        }
         MetricEffectiveConfigKeyV1::FtdiPopulationSuccessfulBuy => {
             return MetricEffectiveConfigValueV1::Enum("successful_buy".to_string());
         }
@@ -151,6 +161,21 @@ fn effective_config_with_value(
         .find(|entry| entry.key == key)
         .unwrap()
         .value = value;
+    ResolvedMetricContractEffectiveConfigV1::try_from_payload(payload).unwrap()
+}
+
+fn effective_config_with_values(
+    replacements: &[(MetricEffectiveConfigKeyV1, MetricEffectiveConfigValueV1)],
+) -> ResolvedMetricContractEffectiveConfigV1 {
+    let mut payload = effective_config().payload;
+    for (key, value) in replacements {
+        payload
+            .entries
+            .iter_mut()
+            .find(|entry| entry.key == *key)
+            .unwrap()
+            .value = value.clone();
+    }
     ResolvedMetricContractEffectiveConfigV1::try_from_payload(payload).unwrap()
 }
 
@@ -321,6 +346,7 @@ fn pr2a_evidence() -> (
         known_coverage: CanonicalNullableV1::Value(1.0),
         non_neutral_known_coverage: CanonicalNullableV1::Value(1.0),
         known_buyer_count: 2,
+        known_non_neutral_buyer_count: 2,
         total_buyer_count: 2,
         provider: CanonicalNullableV1::Value("provider".to_string()),
         config_hash: CanonicalNullableV1::Value(CanonicalHashV1::parse("4".repeat(64)).unwrap()),
@@ -757,6 +783,18 @@ fn standard_projection_uses_current_window_and_fsc_minimum_and_hashes_validly() 
     let profile = MetricContractProfileV1::profile_a().unwrap();
     let config = effective_config();
     assert_eq!(
+        config.value(MetricEffectiveConfigKeyV1::SameMsExactDeltaMs),
+        Some(&MetricEffectiveConfigValueV1::WideUnsigned(
+            CanonicalU64StringV1::new(0)
+        ))
+    );
+    assert_eq!(
+        config.value(MetricEffectiveConfigKeyV1::SameMsClusterUpperBoundExclusiveMs),
+        Some(&MetricEffectiveConfigValueV1::WideUnsigned(
+            CanonicalU64StringV1::new(50)
+        ))
+    );
+    assert_eq!(
         config.value(MetricEffectiveConfigKeyV1::SameMsRecentWindowMs),
         Some(&MetricEffectiveConfigValueV1::WideUnsigned(
             CanonicalU64StringV1::new(10_000)
@@ -772,6 +810,130 @@ fn standard_projection_uses_current_window_and_fsc_minimum_and_hashes_validly() 
     let projection = complete_projection();
     projection.validate_context(&context).unwrap();
     projection.validated_canonical_hash(&context).unwrap();
+}
+
+#[test]
+fn timing_exact_and_cluster_schema_semantics_reject_rehashed_config_drift() {
+    for (key, value) in [
+        (MetricEffectiveConfigKeyV1::SameMsExactDeltaMs, 1),
+        (
+            MetricEffectiveConfigKeyV1::SameMsClusterUpperBoundExclusiveMs,
+            49,
+        ),
+    ] {
+        let profile = MetricContractProfileV1::profile_a().unwrap();
+        let config = effective_config_with_value(
+            key,
+            MetricEffectiveConfigValueV1::WideUnsigned(CanonicalU64StringV1::new(value)),
+        );
+        let context = projection_context(&profile, &config);
+        let mut projection = complete_projection();
+        projection.metric_contract_effective_config_hash =
+            config.metric_contract_effective_config_hash.clone();
+
+        assert_config_parity_error(projection.validate_context(&context).unwrap_err(), key);
+        assert_config_parity_error(
+            projection.validated_canonical_hash(&context).unwrap_err(),
+            key,
+        );
+    }
+}
+
+#[test]
+fn compact_fsc_counts_coverage_and_clean_thresholds_fail_closed() {
+    let profile = MetricContractProfileV1::profile_a().unwrap();
+    let config = effective_config();
+    let context = projection_context(&profile, &config);
+
+    let mut projection = complete_projection();
+    projection.funding_source_concentration.known_coverage.value = CanonicalNullableV1::Value(0.5);
+    assert!(matches!(
+        projection.validate_context(&context),
+        Err(MetricContractProjectionErrorV1::FamilyInvariant(
+            "FSC v2 counts/coverage parity"
+        ))
+    ));
+
+    let mut projection = complete_projection();
+    projection
+        .funding_source_concentration
+        .known_non_neutral_buyer_count = 1;
+    assert!(matches!(
+        projection.validated_canonical_hash(&context),
+        Err(MetricContractProjectionErrorV1::FamilyInvariant(
+            "FSC v2 counts/coverage parity"
+        ))
+    ));
+
+    let mut projection = complete_projection();
+    projection.funding_source_concentration.known_buyer_count = 0;
+    projection
+        .funding_source_concentration
+        .known_non_neutral_buyer_count = 0;
+    projection.funding_source_concentration.total_buyer_count = 0;
+    assert!(matches!(
+        projection.validate_context(&context),
+        Err(MetricContractProjectionErrorV1::FamilyInvariant(
+            "zero-total FSC v2 evidence must remain fail-closed"
+        ))
+    ));
+
+    for replacements in [
+        vec![(
+            MetricEffectiveConfigKeyV1::FscMinTotalBuyers,
+            MetricEffectiveConfigValueV1::WideUnsigned(CanonicalU64StringV1::new(3)),
+        )],
+        vec![(
+            MetricEffectiveConfigKeyV1::FscMinKnownNonNeutralBuyers,
+            MetricEffectiveConfigValueV1::WideUnsigned(CanonicalU64StringV1::new(3)),
+        )],
+    ] {
+        let config = effective_config_with_values(&replacements);
+        let context = projection_context(&profile, &config);
+        let mut projection = complete_projection();
+        projection.metric_contract_effective_config_hash =
+            config.metric_contract_effective_config_hash.clone();
+        assert!(matches!(
+            projection.validate_context(&context),
+            Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                "clean FSC v2 status is below effective-config minimum"
+            ))
+        ));
+    }
+
+    for coverage_key in [
+        MetricEffectiveConfigKeyV1::FscMinKnownCoverage,
+        MetricEffectiveConfigKeyV1::FscMinNonNeutralKnownCoverage,
+    ] {
+        let config = effective_config_with_values(&[
+            (
+                MetricEffectiveConfigKeyV1::FscMinKnownNonNeutralBuyers,
+                MetricEffectiveConfigValueV1::WideUnsigned(CanonicalU64StringV1::new(1)),
+            ),
+            (coverage_key, MetricEffectiveConfigValueV1::Ratio(0.75)),
+        ]);
+        let context = projection_context(&profile, &config);
+        let mut projection = complete_projection();
+        projection.metric_contract_effective_config_hash =
+            config.metric_contract_effective_config_hash.clone();
+        projection.funding_source_concentration.known_buyer_count = 1;
+        projection
+            .funding_source_concentration
+            .known_non_neutral_buyer_count = 1;
+        projection.funding_source_concentration.known_coverage.value =
+            CanonicalNullableV1::Value(0.5);
+        projection
+            .funding_source_concentration
+            .non_neutral_known_coverage
+            .value = CanonicalNullableV1::Value(0.5);
+        projection.fsc_evidence_status.fsc_v2_coverage = CanonicalNullableV1::Value(0.5);
+        assert!(matches!(
+            projection.validate_context(&context),
+            Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                "clean FSC v2 status is below effective-config minimum"
+            ))
+        ));
+    }
 }
 
 #[test]

@@ -204,6 +204,7 @@ pub struct FundingDecisionProjectionV1 {
     pub known_coverage: MetricDecisionFieldValueV1<f64>,
     pub non_neutral_known_coverage: MetricDecisionFieldValueV1<f64>,
     pub known_buyer_count: u32,
+    pub known_non_neutral_buyer_count: u32,
     pub total_buyer_count: u32,
 }
 
@@ -828,6 +829,21 @@ fn effective_config_wide_unsigned(
     }
 }
 
+fn effective_config_ratio(
+    context: &MetricDecisionProjectionBuildContextV1<'_>,
+    key: MetricEffectiveConfigKeyV1,
+    invariant: &'static str,
+) -> Result<f64, MetricContractProjectionErrorV1> {
+    match context.effective_config.value(key) {
+        Some(MetricEffectiveConfigValueV1::Ratio(value))
+            if value.is_finite() && (0.0..=1.0).contains(value) =>
+        {
+            Ok(*value)
+        }
+        _ => Err(MetricContractProjectionErrorV1::EffectiveConfigParity { key, invariant }),
+    }
+}
+
 fn effective_config_enum_matches(
     context: &MetricDecisionProjectionBuildContextV1<'_>,
     key: MetricEffectiveConfigKeyV1,
@@ -1282,6 +1298,26 @@ impl TxTimingDecisionProjectionV1 {
         ] {
             effective_config_enum_matches(context, key, expected, invariant)?;
         }
+        for (key, expected, invariant) in [
+            (
+                MetricEffectiveConfigKeyV1::SameMsExactDeltaMs,
+                0,
+                "exact same-ms delta must remain zero in projection schema V1",
+            ),
+            (
+                MetricEffectiveConfigKeyV1::SameMsClusterUpperBoundExclusiveMs,
+                50,
+                "cluster upper bound must remain exclusive 50ms in projection schema V1",
+            ),
+        ] {
+            let actual = effective_config_wide_unsigned(context, key, invariant)?;
+            if actual != expected {
+                return Err(MetricContractProjectionErrorV1::EffectiveConfigParity {
+                    key,
+                    invariant,
+                });
+            }
+        }
         let recent_window_ms = effective_config_wide_unsigned(
             context,
             MetricEffectiveConfigKeyV1::SameMsRecentWindowMs,
@@ -1596,17 +1632,78 @@ impl FundingDecisionProjectionV1 {
             &self.non_neutral_known_coverage.value,
             "FSC v2 non-neutral coverage range",
         )?;
-        if self.known_buyer_count > self.total_buyer_count {
+        let minimum_total_buyers = effective_config_wide_unsigned(
+            context,
+            MetricEffectiveConfigKeyV1::FscMinTotalBuyers,
+            "FSC minimum total buyers must be a wide unsigned value",
+        )?;
+        let minimum_known_non_neutral_buyers = effective_config_wide_unsigned(
+            context,
+            MetricEffectiveConfigKeyV1::FscMinKnownNonNeutralBuyers,
+            "FSC minimum known non-neutral buyers must be a wide unsigned value",
+        )?;
+        let minimum_known_coverage = effective_config_ratio(
+            context,
+            MetricEffectiveConfigKeyV1::FscMinKnownCoverage,
+            "FSC minimum known coverage must be a ratio",
+        )?;
+        let minimum_non_neutral_known_coverage = effective_config_ratio(
+            context,
+            MetricEffectiveConfigKeyV1::FscMinNonNeutralKnownCoverage,
+            "FSC minimum non-neutral known coverage must be a ratio",
+        )?;
+        if self.known_buyer_count > self.total_buyer_count
+            || self.known_non_neutral_buyer_count > self.known_buyer_count
+        {
             return Err(MetricContractProjectionErrorV1::FamilyInvariant(
                 "FSC v2 buyer counts",
+            ));
+        }
+        if self.total_buyer_count == 0
+            && (self.known_buyer_count != 0
+                || self.known_non_neutral_buyer_count != 0
+                || known_coverage.is_some()
+                || non_neutral_coverage.is_some()
+                || !self.fsc_v2.value.is_null())
+        {
+            return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                "zero-total FSC v2 evidence must remain fail-closed",
             ));
         }
         match &self.fsc_v2.value {
             CanonicalNullableV1::Value(FscEvidenceStatus::Clean)
             | CanonicalNullableV1::Value(FscEvidenceStatus::Degraded) => {
-                if known_coverage.is_none() || non_neutral_coverage.is_none() {
+                let (Some(known_coverage), Some(non_neutral_coverage)) =
+                    (known_coverage, non_neutral_coverage)
+                else {
                     return Err(MetricContractProjectionErrorV1::FamilyInvariant(
                         "available FSC v2 status requires coverage",
+                    ));
+                };
+                if self.total_buyer_count == 0 {
+                    return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                        "available FSC v2 status requires buyers",
+                    ));
+                }
+                let expected_known = self.known_buyer_count as f64 / self.total_buyer_count as f64;
+                let expected_non_neutral =
+                    self.known_non_neutral_buyer_count as f64 / self.total_buyer_count as f64;
+                if known_coverage.to_bits() != expected_known.to_bits()
+                    || non_neutral_coverage.to_bits() != expected_non_neutral.to_bits()
+                {
+                    return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                        "FSC v2 counts/coverage parity",
+                    ));
+                }
+                if self.fsc_v2.value == CanonicalNullableV1::Value(FscEvidenceStatus::Clean)
+                    && (u64::from(self.total_buyer_count) < minimum_total_buyers
+                        || u64::from(self.known_non_neutral_buyer_count)
+                            < minimum_known_non_neutral_buyers
+                        || known_coverage < minimum_known_coverage
+                        || non_neutral_coverage < minimum_non_neutral_known_coverage)
+                {
+                    return Err(MetricContractProjectionErrorV1::FamilyInvariant(
+                        "clean FSC v2 status is below effective-config minimum",
                     ));
                 }
             }
@@ -1616,9 +1713,14 @@ impl FundingDecisionProjectionV1 {
                 ));
             }
             CanonicalNullableV1::Null => {
-                if known_coverage.is_some() || non_neutral_coverage.is_some() {
+                if known_coverage.is_some()
+                    || non_neutral_coverage.is_some()
+                    || self.known_buyer_count != 0
+                    || self.known_non_neutral_buyer_count != 0
+                    || self.total_buyer_count != 0
+                {
                     return Err(MetricContractProjectionErrorV1::FamilyInvariant(
-                        "unavailable FSC v2 cannot expose coverage",
+                        "unavailable FSC v2 cannot expose measured counts or coverage",
                     ));
                 }
             }
@@ -1691,6 +1793,7 @@ impl FundingDecisionProjectionV1 {
                 &evidence.v2_envelope,
             )?,
             known_buyer_count: evidence.known_buyer_count,
+            known_non_neutral_buyer_count: evidence.known_non_neutral_buyer_count,
             total_buyer_count: evidence.total_buyer_count,
         };
         projection.validate_semantics(context)?;

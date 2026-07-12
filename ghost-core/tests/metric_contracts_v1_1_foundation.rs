@@ -337,6 +337,7 @@ fn complete_contract_evidence() -> MetricContractsEvidenceSetV1 {
             known_coverage: CanonicalNullableV1::Value(1.0),
             non_neutral_known_coverage: CanonicalNullableV1::Value(1.0),
             known_buyer_count: 2,
+            known_non_neutral_buyer_count: 2,
             total_buyer_count: 2,
             provider: CanonicalNullableV1::Value("yellowstone".to_string()),
             config_hash: CanonicalNullableV1::Value(
