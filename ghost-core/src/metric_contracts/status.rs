@@ -380,6 +380,8 @@ pub enum DevBuyEvidenceReasonV1 {
     DustExcluded,
     LegacyFirstObservedIncludesAcceptedFailed,
     PrimaryBuyCounterfactual,
+    CandidateHistoryTruncated,
+    CompatibilityPrimaryIncludesAcceptedFailed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -387,6 +389,8 @@ pub enum DevBuyEvidenceReasonV1 {
 pub enum TxTimingEvidenceReasonV1 {
     InsufficientTransactions,
     TimestampUnavailable,
+    OrderingIdentityUnavailable,
+    SourceWindowTruncated,
     ExactSameMillisecond,
     ClusterBelowFiftyMilliseconds,
     RecentWindow,

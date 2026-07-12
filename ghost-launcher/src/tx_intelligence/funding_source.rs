@@ -6,6 +6,7 @@ use crate::oracle_metrics::{
     record_fsc_prune_duration_ms, record_fsc_warmup_ready,
 };
 use ghost_brain::config::{FscV2Config, GatekeeperV2Config};
+use ghost_core::metric_contracts::{CanonicalHashErrorV1, CanonicalHashV1};
 use ghost_core::tx_intelligence::types::{
     FscAttributionScope, FscEvidenceStatus, FscExcludedReason, FscMissClass, FscSnapshotMode,
     FscV2Evidence, FscVersion, FundingSourceCount, FundingSourceDiagnostics, FundingSourceKey,
@@ -26,6 +27,7 @@ const FSC_V2_PROVIDER_LEGACY_ROLLING_INDEX: &str = "ghost_legacy_rolling_funding
 const FSC_V2_PROVIDER_NLN_PROGRAM_STREAMS: &str = "nln_program_streams";
 const FSC_V2_TOPIC_LEGACY_FUNDING_TRANSFERS: &str = "ghost.funding_transfers";
 const FSC_V2_TOPIC_NLN_SYSTEM_TRANSFERS: &str = "prod.rpc.solana.system.transfers";
+pub(crate) const FSC_LEGACY_MIN_KNOWN_SOURCE_SAMPLES_V1: u64 = 2;
 
 fn funding_transfer_can_feed_capture_index(transfer: &FundingTransferObserved) -> bool {
     transfer.full_chain_coverage
@@ -111,6 +113,21 @@ impl FundingSourceConfig {
     fn is_neutral_source(&self, wallet: &str) -> bool {
         self.neutral_funding_sources.contains(wallet)
     }
+
+    pub fn metric_contract_neutral_funder_set_hash(
+        &self,
+    ) -> Result<Option<CanonicalHashV1>, CanonicalHashErrorV1> {
+        if self.neutral_funding_sources.is_empty() {
+            return Ok(None);
+        }
+        let mut sources = self
+            .neutral_funding_sources
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        sources.sort();
+        CanonicalHashV1::digest(&sources).map(Some)
+    }
 }
 
 fn unit_interval_to_bps(value: f64) -> u16 {
@@ -123,6 +140,8 @@ fn unit_interval_to_bps(value: f64) -> u16 {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FscComputation {
     pub funding_source_concentration: Option<f64>,
+    pub distinct_known_source_count: u64,
+    pub known_source_sample_count: u64,
     pub funding_source_v2: FscV2Evidence,
     pub degraded_reasons: Vec<String>,
     pub diagnostics: FundingSourceDiagnostics,
@@ -1039,6 +1058,8 @@ impl FundingSourceIndex {
             );
             return FscComputation {
                 funding_source_concentration: None,
+                distinct_known_source_count: 0,
+                known_source_sample_count: 0,
                 funding_source_v2,
                 degraded_reasons: vec![FSC_FUNDING_STREAM_UNAVAILABLE_REASON.to_string()],
                 diagnostics,
@@ -1060,6 +1081,8 @@ impl FundingSourceIndex {
             );
             return FscComputation {
                 funding_source_concentration: None,
+                distinct_known_source_count: 0,
+                known_source_sample_count: 0,
                 funding_source_v2,
                 degraded_reasons: vec![FSC_ROLLING_STATE_UNAVAILABLE_REASON.to_string()],
                 diagnostics,
@@ -1150,20 +1173,27 @@ impl FundingSourceIndex {
             source_topics,
         );
 
-        if known_sources.len() < 2 {
+        let distinct_known_sources = known_sources.iter().collect::<HashSet<_>>().len();
+        let distinct_known_source_count = distinct_known_sources as u64;
+        let known_source_sample_count = known_sources.len() as u64;
+
+        if known_source_sample_count < FSC_LEGACY_MIN_KNOWN_SOURCE_SAMPLES_V1 {
             return FscComputation {
                 funding_source_concentration: None,
+                distinct_known_source_count,
+                known_source_sample_count,
                 funding_source_v2,
                 degraded_reasons: vec![FSC_INSUFFICIENT_KNOWN_SOURCES_REASON.to_string()],
                 diagnostics,
             };
         }
 
-        let distinct_known_sources = known_sources.iter().collect::<HashSet<_>>().len();
         FscComputation {
             funding_source_concentration: Some(
                 1.0 - (distinct_known_sources as f64 / known_sources.len() as f64),
             ),
+            distinct_known_source_count,
+            known_source_sample_count,
             funding_source_v2,
             degraded_reasons: Vec::new(),
             diagnostics,
@@ -2200,6 +2230,8 @@ mod tests {
                 .expect("fsc should be materialized"),
             2.0 / 3.0,
         );
+        assert_eq!(computed.distinct_known_source_count, 1);
+        assert_eq!(computed.known_source_sample_count, 3);
         assert!(computed.degraded_reasons.is_empty());
     }
 
@@ -2329,6 +2361,8 @@ mod tests {
         let computed = index.compute_for_transactions(buys.iter(), &config);
 
         assert_eq!(computed.funding_source_concentration, None);
+        assert_eq!(computed.distinct_known_source_count, 1);
+        assert_eq!(computed.known_source_sample_count, 1);
         assert_eq!(
             computed.degraded_reasons,
             vec![FSC_INSUFFICIENT_KNOWN_SOURCES_REASON.to_string()]

@@ -18,8 +18,9 @@ const DBIA_CU_PRICE_WEIGHT: f64 = 0.05;
 const DBIA_INNER_GROUP_WEIGHT: f64 = 0.25;
 const DBIA_FEE_TOPOLOGY_WEIGHT: f64 = 0.20;
 const DES_SIGN_EPSILON: f64 = 1e-12;
-const MIN_DIAGNOSTIC_SAMPLE_COUNT: usize = 2;
-const MIN_CLEAN_BUY_SAMPLE_COUNT: u64 = 3;
+pub(crate) const MIN_DIAGNOSTIC_SAMPLE_COUNT: usize = 2;
+pub(crate) const MIN_CLEAN_BUY_SAMPLE_COUNT: u64 = 3;
+pub(crate) const MIN_CLEAN_UNIQUE_BUYER_SAMPLE_COUNT_V2: u64 = 3;
 const MIN_CLEAN_DBIA_BUYER_COUNT: usize = 2;
 const MIN_DES_BUY_SAMPLE_COUNT: u64 = 3;
 const MIN_CLEAN_DES_BUY_SAMPLE_COUNT: u64 = 4;
@@ -28,6 +29,10 @@ const LAMPORTS_PER_SOL_F64: f64 = 1_000_000_000.0;
 #[derive(Debug, Clone, PartialEq)]
 pub struct FtdiComputation {
     pub fee_topology_diversity_index: Option<f64>,
+    pub unique_topology_count: u64,
+    pub coordination_hhi: Option<f64>,
+    pub legacy_buy_tx_actionable: bool,
+    pub unique_buyer_actionable_v2: bool,
     pub degraded_reasons: Vec<String>,
     pub buy_sample_count: u64,
     pub signer_sample_count: u64,
@@ -352,6 +357,10 @@ fn compute_ftdi_from_buys(buy_txs: &[&PoolTransaction]) -> FtdiComputation {
     if unique_samples.len() < MIN_DIAGNOSTIC_SAMPLE_COUNT {
         return FtdiComputation {
             fee_topology_diversity_index: None,
+            unique_topology_count: 0,
+            coordination_hhi: None,
+            legacy_buy_tx_actionable: false,
+            unique_buyer_actionable_v2: false,
             degraded_reasons: vec![FTDI_INSUFFICIENT_BUYS_REASON.to_string()],
             buy_sample_count: stats.buy_sample_count,
             signer_sample_count: stats.signer_sample_count,
@@ -363,28 +372,54 @@ fn compute_ftdi_from_buys(buy_txs: &[&PoolTransaction]) -> FtdiComputation {
         degraded_reasons.push(FTDI_INSUFFICIENT_BUYS_REASON.to_string());
     }
 
-    let mut unique_topologies = HashSet::<FeeTopology>::new();
+    let mut topology_counts = HashMap::<FeeTopology, u64>::new();
     for tx in &unique_samples {
         let Some((external_fee_count, internal_fee_count)) =
             tx.toolchain_fingerprint.fee_topology()
         else {
             return FtdiComputation {
                 fee_topology_diversity_index: None,
+                unique_topology_count: 0,
+                coordination_hhi: None,
+                legacy_buy_tx_actionable: false,
+                unique_buyer_actionable_v2: false,
                 degraded_reasons: vec![FTDI_RAW_FEE_TOPOLOGY_UNAVAILABLE_REASON.to_string()],
                 buy_sample_count: stats.buy_sample_count,
                 signer_sample_count: stats.signer_sample_count,
             };
         };
 
-        unique_topologies.insert(FeeTopology {
-            external_fee_count,
-            internal_fee_count,
-        });
+        *topology_counts
+            .entry(FeeTopology {
+                external_fee_count,
+                internal_fee_count,
+            })
+            .or_insert(0) += 1;
     }
 
+    let unique_topology_count = topology_counts.len() as u64;
+    let denominator = unique_samples.len() as f64;
+    let value = (!unique_samples.is_empty()).then(|| topology_counts.len() as f64 / denominator);
+    let coordination_hhi = (!unique_samples.is_empty()).then(|| {
+        topology_counts
+            .values()
+            .map(|count| {
+                let share = *count as f64 / denominator;
+                share * share
+            })
+            .sum()
+    });
+    let legacy_buy_tx_actionable =
+        value.is_some() && stats.buy_sample_count >= MIN_CLEAN_BUY_SAMPLE_COUNT;
+    let unique_buyer_actionable_v2 =
+        value.is_some() && stats.signer_sample_count >= MIN_CLEAN_UNIQUE_BUYER_SAMPLE_COUNT_V2;
+
     FtdiComputation {
-        fee_topology_diversity_index: (!unique_samples.is_empty())
-            .then(|| unique_topologies.len() as f64 / unique_samples.len() as f64),
+        fee_topology_diversity_index: value,
+        unique_topology_count,
+        coordination_hhi,
+        legacy_buy_tx_actionable,
+        unique_buyer_actionable_v2,
         degraded_reasons,
         buy_sample_count: stats.buy_sample_count,
         signer_sample_count: stats.signer_sample_count,

@@ -59,6 +59,8 @@ fn clean_materialized_evidence() -> MaterializedEvidenceStatus {
         sybil: clean_status(),
         cpv: clean_status(),
         fsc: clean_status(),
+        fsc_legacy: clean_status(),
+        fsc_v2: unavailable_status(EvidenceUnavailableReason::FscMetricsMissing),
         alpha: clean_status(),
         manipulation: clean_status(),
         organic_broadening: clean_status(),

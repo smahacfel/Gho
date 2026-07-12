@@ -7,7 +7,7 @@ use crate::events::PoolTransaction;
 use crate::tx_intelligence::{
     compute_sybil_resistance, compute_velocity_profile, CrossPoolVelocityConfig,
     CrossPoolVelocityIndex, FundingSourceConfig, FundingSourceIndex, TxIntelligenceConfig,
-    TxIntelligenceEngine,
+    TxIntelligenceEngine, TxTimingProducerSnapshotV1,
 };
 use ghost_brain::config::GatekeeperV2Config;
 use ghost_brain::fast_pipeline::EnhancedCandidate;
@@ -39,6 +39,7 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub type SharedSession = Arc<RwLock<PoolObservationSession>>;
+pub(crate) const RCE_RECENT_WINDOW_MS_V1: u64 = 10_000;
 
 #[derive(Debug, Clone, Copy)]
 struct TemporalCarryForwardRuntimeConfig {
@@ -79,6 +80,8 @@ struct TemporalAnchorRawValues {
 #[derive(Debug, Clone, Default)]
 struct RceWindowStats {
     same_ms_tx_ratio: Option<f64>,
+    same_ms_extra_count: u64,
+    tx_count: u64,
     burst_ratio: Option<f64>,
     unique_ratio: Option<f64>,
     top3_signer_volume_ratio: Option<f64>,
@@ -873,6 +876,23 @@ impl PoolObservationSession {
         } else {
             evidence_unavailable(vec![EvidenceUnavailableReason::FscMetricsMissing])
         };
+        let fsc_legacy = fsc.clone();
+        let fsc_v2 = match materialized.sybil_resistance.funding_source_v2.as_ref() {
+            Some(evidence)
+                if evidence.status
+                    == ghost_core::tx_intelligence::types::FscEvidenceStatus::Clean =>
+            {
+                evidence_clean()
+            }
+            Some(evidence)
+                if evidence.status
+                    == ghost_core::tx_intelligence::types::FscEvidenceStatus::Degraded =>
+            {
+                evidence_degraded(vec![EvidenceDegradedReason::FscEvidencePartial])
+            }
+            Some(_) => evidence_unavailable(vec![EvidenceUnavailableReason::FscMetricsMissing]),
+            None => evidence_unavailable(vec![EvidenceUnavailableReason::FscMetricsMissing]),
+        };
 
         let alpha_available_count = [
             materialized
@@ -954,6 +974,8 @@ impl PoolObservationSession {
             sybil,
             cpv,
             fsc,
+            fsc_legacy,
+            fsc_v2,
             alpha,
             manipulation,
             organic_broadening,
@@ -1493,6 +1515,8 @@ impl PoolObservationSession {
         let top3_sum: f64 = volumes.iter().take(3).sum();
         RceWindowStats {
             same_ms_tx_ratio: Some(same_ms_extra_count as f64 / tx_count as f64),
+            same_ms_extra_count,
+            tx_count,
             burst_ratio,
             unique_ratio: Some(unique_signers.len() as f64 / tx_count as f64),
             top3_signer_volume_ratio: (total_volume_sol > f64::EPSILON)
@@ -1529,8 +1553,12 @@ impl PoolObservationSession {
                 ..SessionRegimeSnapshotV1::default()
             };
         };
-        let recent_start = last_ts_ms.saturating_sub(10_000).max(*first_ts_ms);
-        let previous_start = recent_start.saturating_sub(10_000).max(*first_ts_ms);
+        let recent_start = last_ts_ms
+            .saturating_sub(RCE_RECENT_WINDOW_MS_V1)
+            .max(*first_ts_ms);
+        let previous_start = recent_start
+            .saturating_sub(RCE_RECENT_WINDOW_MS_V1)
+            .max(*first_ts_ms);
         let previous = Self::rce_window_stats(&sorted_txs, previous_start, recent_start);
         let recent = Self::rce_window_stats(&sorted_txs, recent_start, *last_ts_ms);
 
@@ -1555,6 +1583,66 @@ impl PoolObservationSession {
             session_followthrough_rate_10m_optional: None,
             template_reason_code: Some("rce_a0_not_evaluated_logging_only".to_string()),
             veto_reason_code: None,
+        }
+    }
+
+    #[must_use]
+    pub fn metric_contract_recent_exact_timing_snapshot(&self) -> TxTimingProducerSnapshotV1 {
+        let sorted_txs = self.temporal_sorted_transactions();
+        let (Some((_, _, first_ts_ms)), Some((_, _, last_ts_ms))) =
+            (sorted_txs.first(), sorted_txs.last())
+        else {
+            return TxTimingProducerSnapshotV1 {
+                numerator: 0,
+                denominator: 0,
+                ratio: None,
+                canonical_dedupe_applied: true,
+                dust_filter_sol: None,
+                window_ms: Some(RCE_RECENT_WINDOW_MS_V1),
+                fallback_timestamp_count: 0,
+                fallback_ordering_count: 0,
+                source_complete: self.diagnostics.total_tx_seen == 0,
+                source_state_capacity: Some(
+                    u64::try_from(self.decision_time_series_tx_capacity).unwrap_or(u64::MAX),
+                ),
+            };
+        };
+        let recent_start = last_ts_ms
+            .saturating_sub(RCE_RECENT_WINDOW_MS_V1)
+            .max(*first_ts_ms);
+        let recent = Self::rce_window_stats(&sorted_txs, recent_start, *last_ts_ms);
+        let recent_successful = self.tx_buffer.iter().filter(|tx| {
+            let event_ts_ms = Self::temporal_tx_event_ts_ms(tx.as_ref());
+            tx.success && event_ts_ms >= recent_start && event_ts_ms <= *last_ts_ms
+        });
+        let fallback_timestamp_count = u64::try_from(
+            recent_successful
+                .clone()
+                .filter(|tx| tx.compat_event_ts_ms().is_none())
+                .count(),
+        )
+        .unwrap_or(u64::MAX);
+        let fallback_ordering_count = u64::try_from(
+            recent_successful
+                .filter(|tx| !crate::tx_intelligence::tx_has_stable_timing_order_identity(tx))
+                .count(),
+        )
+        .unwrap_or(u64::MAX);
+        let source_complete = u64::try_from(self.tx_buffer.len())
+            .is_ok_and(|retained| retained == self.diagnostics.total_tx_seen);
+        TxTimingProducerSnapshotV1 {
+            numerator: recent.same_ms_extra_count,
+            denominator: recent.tx_count,
+            ratio: recent.same_ms_tx_ratio,
+            canonical_dedupe_applied: true,
+            dust_filter_sol: None,
+            window_ms: Some(RCE_RECENT_WINDOW_MS_V1),
+            fallback_timestamp_count,
+            fallback_ordering_count,
+            source_complete,
+            source_state_capacity: Some(
+                u64::try_from(self.decision_time_series_tx_capacity).unwrap_or(u64::MAX),
+            ),
         }
     }
 
@@ -2759,6 +2847,17 @@ impl PoolObservationSession {
     pub fn update_tx_intelligence_dev_wallet(&mut self, dev_wallet: Option<Pubkey>) {
         self.dev_wallet = dev_wallet;
         self.tx_intelligence.set_dev_wallet(dev_wallet);
+        self.refresh_tx_intelligence_snapshot();
+    }
+
+    pub fn update_tx_intelligence_dev_identity(
+        &mut self,
+        dev_wallet: Option<Pubkey>,
+        create_signature: Option<&str>,
+    ) {
+        self.dev_wallet = dev_wallet;
+        self.tx_intelligence
+            .set_dev_identity(dev_wallet, create_signature);
         self.refresh_tx_intelligence_snapshot();
     }
 

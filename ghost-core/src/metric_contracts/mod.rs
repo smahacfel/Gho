@@ -10,6 +10,7 @@ mod canonical_hash;
 mod effective_config;
 mod evidence;
 mod identity;
+mod projection;
 mod registry;
 mod status;
 
@@ -26,5 +27,6 @@ pub use effective_config::{
 };
 pub use evidence::*;
 pub use identity::*;
+pub use projection::*;
 pub use registry::*;
 pub use status::*;

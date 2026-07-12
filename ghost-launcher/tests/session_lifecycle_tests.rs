@@ -1168,6 +1168,23 @@ fn materialize_features_populates_fsc_from_shared_funding_source_index() {
     assert!(!features.sybil_resistance.degraded_reasons.contains(
         &ghost_core::tx_intelligence::types::FSC_ROLLING_STATE_UNAVAILABLE_REASON.to_string()
     ));
+    assert_eq!(features.evidence_status.fsc.status, EvidenceStatus::Clean);
+    assert_eq!(
+        features.evidence_status.fsc_legacy.status,
+        EvidenceStatus::Clean
+    );
+    assert_eq!(
+        features.evidence_status.fsc_v2.status,
+        match fsc_v2.status {
+            ghost_core::tx_intelligence::types::FscEvidenceStatus::Clean => EvidenceStatus::Clean,
+            ghost_core::tx_intelligence::types::FscEvidenceStatus::Degraded => {
+                EvidenceStatus::Degraded
+            }
+            ghost_core::tx_intelligence::types::FscEvidenceStatus::Unavailable => {
+                EvidenceStatus::Unavailable
+            }
+        }
+    );
 }
 
 #[test]
@@ -1260,6 +1277,18 @@ fn filtered_transfer_does_not_unlock_fsc_when_stream_is_only_health_ready() {
     assert!(features.sybil_resistance.degraded_reasons.contains(
         &ghost_core::tx_intelligence::types::FSC_ROLLING_STATE_UNAVAILABLE_REASON.to_string()
     ));
+    assert_eq!(
+        features.evidence_status.fsc.status,
+        EvidenceStatus::Degraded
+    );
+    assert_eq!(
+        features.evidence_status.fsc_legacy.status,
+        EvidenceStatus::Degraded
+    );
+    assert_ne!(
+        features.evidence_status.fsc_v2.status,
+        EvidenceStatus::Clean
+    );
 }
 
 #[test]

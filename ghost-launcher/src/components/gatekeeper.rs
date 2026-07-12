@@ -25,6 +25,7 @@ use ghost_brain::config::{GatekeeperMode, GatekeeperV2Config};
 use ghost_brain::oracle::reason_code::GatekeeperReasonCode;
 use ghost_brain::oracle::snapshot_engine::PoolMetrics;
 use ghost_core::checkpoint::MaterializedFeatureSet;
+use ghost_core::metric_contracts::DevBuySelectionModeV1;
 use ghost_core::shadow_ledger::{
     build_market_snapshots_from_trades, build_trade_snapshots_observed,
     BufferedTx as CommitBufferedTx, CommitResult, MarketSnapshot, ReconstructedState, ShadowLedger,
@@ -80,6 +81,20 @@ pub struct GatekeeperBufferedTx {
     pub tx: Arc<PoolTransaction>,
     pub metrics: PoolMetrics,
     pub tx_key: TxKey,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GatekeeperDevPrimaryCompatibilitySnapshotV1 {
+    pub amount_sol: Option<f64>,
+    pub creator_known: bool,
+    pub create_signature: Option<String>,
+    pub create_signature_matched: bool,
+    pub selection_mode: DevBuySelectionModeV1,
+    pub selected_signature: Option<String>,
+    pub selected_slot: Option<u64>,
+    pub selected_transaction_index: Option<u32>,
+    pub eligible_buy_count: u64,
+    pub selected_success: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4966,6 +4981,50 @@ impl GatekeeperBuffer {
             })
             .min_by(|lhs, rhs| lhs.1.tx_key.cmp(&rhs.1.tx_key))
             .map(|(idx, _)| idx)
+    }
+
+    #[must_use]
+    pub fn metric_contract_dev_primary_compatibility_snapshot(
+        &self,
+    ) -> GatekeeperDevPrimaryCompatibilitySnapshotV1 {
+        let creator = self.pool_creator.as_deref();
+        let selected = self
+            .find_primary_creator_buy_index()
+            .map(|index| self.buffered_txs[index].tx.as_ref());
+        let create_signature_matched = selected.is_some_and(|tx| {
+            self.pool_create_signature
+                .as_deref()
+                .is_some_and(|signature| tx.signature == signature)
+        });
+        let eligible_buy_count = creator.map_or(0, |creator| {
+            self.buffered_txs
+                .iter()
+                .filter(|buffered| {
+                    let tx = buffered.tx.as_ref();
+                    tx.is_buy && tx.signer == creator
+                })
+                .count() as u64
+        });
+        let selection_mode = if create_signature_matched {
+            DevBuySelectionModeV1::CreateSignatureMatch
+        } else if selected.is_some() {
+            DevBuySelectionModeV1::EarliestEligibleCreatorBuy
+        } else {
+            DevBuySelectionModeV1::NoEligibleBuy
+        };
+
+        GatekeeperDevPrimaryCompatibilitySnapshotV1 {
+            amount_sol: selected.map(|tx| tx.volume_sol),
+            creator_known: creator.is_some(),
+            create_signature: self.pool_create_signature.clone(),
+            create_signature_matched,
+            selection_mode,
+            selected_signature: selected.map(|tx| tx.signature.clone()),
+            selected_slot: selected.and_then(|tx| tx.slot),
+            selected_transaction_index: selected.and_then(|tx| tx.tx_index.or(tx.event_ordinal)),
+            eligible_buy_count,
+            selected_success: selected.map(|tx| tx.success),
+        }
     }
 
     fn refresh_canonical_dev_tracking(&mut self) {
