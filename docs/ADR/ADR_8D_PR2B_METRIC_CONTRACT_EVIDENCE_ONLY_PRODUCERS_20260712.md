@@ -1,6 +1,6 @@
 # ADR-8D: PR2B evidence-only producers i atomowa projekcja kontraktów metryk
 
-Status: `IMPLEMENTED / VALIDATED / READY_FOR_REVIEW`
+Status: `IMPLEMENTED / VALIDATED / READY_FOR_RE_REVIEW`
 
 Typ: ADR-8D / cross-cutting SSOT, evidence, materialization i resource contract
 
@@ -93,9 +93,17 @@ complete buildera. Test pełnego boundary dowodzi deterministycznej równości
 
 Flip V2 jest bounded automatem per owner osadzonym w istniejącym
 `TxIntelligenceEngine`. Eligible event wymaga success, non-dust, canonical
-window, resolved owner, present slot oraz stable identity/order. Signature jest
-preferowana; fallback wymaga `slot + transaction_index` albo
-`slot + event_ordinal`. Receive order nie jest canonical order.
+window, resolved owner, present slot oraz niezależnie udowodnionych stable
+identity i canonical order. `StableEventIdentityV1` wybiera signature, a
+dopiero przy jej braku fallback `slot + transaction_index` albo `slot +
+event_ordinal`. `CanonicalFlipOrderKeyV1` nigdy nie używa signature: wybiera
+`slot + transaction_index`, a przy braku indexu `slot + event_ordinal`.
+Signature bez obu order fields daje znaną identity, lecz non-evaluable record.
+Receive order, timestamp i leksykograficzna kolejność signature nie zastępują
+order proof. Duplicate identity z różnymi order keys i duplicate order key z
+różnymi identities są fail-closed conflicts. Timestamp pozostaje
+window/consistency checkiem; sprzeczność z canonical slot/order daje
+`OutOfOrderEvent`.
 
 Stany:
 
@@ -131,10 +139,21 @@ dev_volume_ratio
 contradiction_score
 ```
 
-`Null` nie jest zerem. Legacy/default zero pozostaje w oddzielnym legacy field
-set z `LegacyDefault`; explicit measured zero pozostaje `Value(0)`. Maska
-`measured_fields_mask` odpowiada wyłącznie polom o jakości `Measured` albo
-`Degraded`. Group quality jest górnym ograniczeniem jakości pola.
+Owner terminalnej materializacji zamraża jednocześnie legacy
+`ManipulationContradictionFeatures` oraz typed
+`ManipulationProducerSnapshotV2` z tych samych już policzonych źródeł. Typed
+snapshot zawiera osobne `value/availability/measurement_quality/reasons` dla
+każdego pola; evidence builder nie odzyskuje presence ze scalarów legacy ani z
+group statusu.
+
+`Null` nie jest zerem. Legacy/default zero pozostaje wyłącznie w legacy lane;
+explicit measured zero pozostaje `Value(0)`. Brak preferred/fallback top3,
+evaluable signer population, denominatora albo wymaganych składowych
+contradiction score pozostaje unavailable, nigdy measured zero. Maska
+`measured_fields_mask` odpowiada dokładnie polom o jakości `Measured` albo
+`Degraded`. Group quality jest wyłącznie górnym ograniczeniem jakości pola:
+`Degraded` dopuszcza mixed presence, natomiast `Clean` z missing required field
+jest downgradowane na owner boundary lub odrzucane fail closed.
 
 Sześć derived high flags zachowuje field ID, raw value/status, comparator,
 threshold, wynik, exact policy-stage/version i effective-config hash. Comparator
@@ -211,21 +230,88 @@ anchorów, qualifying sells, event identities, raw collections, full field
 lists ani derived provenance arrays. Wszystkie dziesięć family keys jest
 wymagane, a unknown/partial root jest odrzucany.
 
-Canonical hash nadal używa canonical JSON i jest dostępny wyłącznie przez
-`validated_canonical_hash(context)`. Resource measurement i hard gate używają
-deterministycznej binarnej reprezentacji serde/bincode tego samego typed root.
-To rozróżnienie jest jawne: pełna, opisowa postać JSON ma większy narzut nazw
-pól, natomiast limit 12/16 KiB dotyczy transportowo zwartej reprezentacji
-projection. Oversized bounded-reason payload jest odrzucany przed hashowaniem
-przez `ProjectionTooLarge`.
+Domain `MetricContractDecisionEvidenceProjectionV1` i wszystkie jego exact Rust
+field-sets pozostają bez zmian. Nie otrzymały globalnych serde aliases ani
+compact `Serialize`. Oddzielny, lossless
+`MetricContractDecisionProjectionWireV1` jest wyłącznie transportowym adapterem
+MFS:
+
+```json
+{"w":1,"d":["fixed-position domain projection payload"]}
+```
+
+Field-level serde na
+`Option<MetricContractDecisionEvidenceProjectionV1>` koduje `Some` przez Wire
+V1. Brak historycznego pola nadal daje `None`; present field oznacza wyłącznie
+Wire V1. Unsupported version, missing/extra key lub slot, wrong tuple length i
+invalid enum/reason code są odrzucane. Verbose projection object i jawne `null`
+w present field nie mają fallbacku.
+
+### 9.1. Normatywne pozycje Wire V1
+
+Indeks w każdej tablicy jest częścią wersji. Zamknięte źródło wykonywalnego
+mappingu to `metric_contract_projection_wire_v1_tuple_layouts()` w
+`ghost-core/src/metric_contracts/projection_wire.rs`; golden fixture ma BLAKE3
+`be965cdbfabffc8690a256574334ddd628414d2423a24cd5e81900ec32f4b566`.
+
+| Tuple | Pozycje 0..N mapowane na domain fields |
+| --- | --- |
+| wire object | `w=wire_schema_version`, `d=projection_root` |
+| root | `schema_version`, `rollout_mode`, `profile_id`, `profile_hash`, `metric_contract_effective_config_hash`, `fee_topology_diversity_index`, `dev_buy`, `same_ms_tx_ratio`, `top3_signer_volume_ratio`, `flip_ratio`, `funding_source_concentration`, `fsc_evidence_status`, `manipulation_contradiction`, `reserve_velocity`, `recent_buy_sell` |
+| FTDI | `legacy_value`, `value_v1`, `unique_topology_count`, `unique_buyer_sample_count`, `buy_transaction_sample_count`, `legacy_buy_tx_actionability`, `unique_buyer_actionability_v2` |
+| dev-buy | `tx_intel_first_observed`, `mfs_first_observed`, `mfs_primary_v1`, `effective_policy`, `creator_known`, `create_signature_matched`, `primary_selection_mode`, `primary_eligible_buy_count` |
+| timing | `legacy_exact`, `exact_v1`, `cluster_lt_50ms`, `recent_exact` |
+| top3 | `preferred`, `compatibility_alias`, `effective`, `preferred_alias_bitwise_equal`, `used_compatibility_fallback` |
+| flip | `legacy_slot_gap_ratio`, `hybrid_v2_ratio`, `eligible_buyer_count`, `flipper_count`, `wall_clock_window_ms`, `max_slot_gap`, `dump_ratio` |
+| funding | `legacy_source`, `legacy_v1`, `distinct_known_source_count`, `known_source_sample_count`, `fsc_v2`, `known_coverage`, `non_neutral_known_coverage`, `known_buyer_count`, `total_buyer_count` |
+| FSC status | `compatibility_status`, `legacy_scalar_present`, `legacy_feature_status`, `fsc_v2_status`, `fsc_v2_coverage` |
+| manipulation | `legacy_numeric_envelope`, `numeric_v2_envelope`, `measured_fields_mask`, seven named numeric fields in §2.6.2 order, `legacy_high_recorded_mask`, `legacy_high_true_mask`, `derived_high_evaluable_mask`, `derived_high_true_mask` |
+| reserve | `legacy_velocity`, `velocity_v1`, `previous_real_sol_reserves_lamports`, `current_real_sol_reserves_lamports`, `interval_ms`, `accepted_update_count`, `source_clock`, `status` |
+| recent | `legacy_scalar`, `v1_envelope`, `window_ms`, `buy_count`, `sell_count`, `transaction_count`, `buy_to_sell_ratio`, `buy_share` |
+| envelope | `contract_id`, `contract_version`, `surface_id`, `authority_class`, `rollout_role`, `availability`, `measurement_quality`, `policy_actionable`, `reasons` |
+| surface | `envelope`, nullable literal `value`, `producer_id`, `producer_schema_version`, `source_cutoff` |
+| field | nullable literal `value`, `availability`, `measurement_quality`, `reasons` |
+| cutoff | canonical integer-string `decision_timestamp_ms`, nullable canonical integer-string `decision_slot` |
+| reason summary | `codes`, `omitted_count` |
+| ratio | `surface`, `numerator`, `denominator`, `population`, nullable `window_ms` |
+
+### 9.2. Normatywne enum i reason codes
+
+Każdy mały integer jest indeksem w jawnej, zamrożonej tabeli. Funkcja
+`metric_contract_projection_wire_v1_mapping_tables()` publikuje dokładnie 28
+tabel: contract ID, wszystkie surface ID, rollout/profile, authority/role,
+availability/quality, producer, dev selection, timing population, evidence/FSC
+status, reserve clock/status, reason family oraz 12 family-specific reason
+detail tables. `UnmappedLegacyString` zachowuje typed contract code i pełny raw
+tekst. `MetricDecisionReasonSummaryV1` zachowuje `omitted_count`; tylko
+istniejący bounded reason omission jest dozwolony. Static guard wymaga
+unikalnych niepustych tabel, a round-trip/golden test zamraża ich interpretację.
+Zmiana pozycji, wartości lub kodu wymaga Wire V2.
+
+Canonical hash nadal używa canonical domain JSON i jest dostępny wyłącznie
+przez `validated_canonical_hash(context)`. Nie hashujemy wire bytes. Test
+wymaga identycznego `CanonicalHashV1` przed i po Wire V1 round-trip. Input-head
+`fddd4d3a…` fixture oraz bieżący domain fixture mają ten sam semantic hash
+`61cf0429a8dd042070f18cf426f37f27983d055b91d4033df3a8311a78e5a09e`.
+
+Normatywne `metric_contract_projection_serialized_bytes` to długość dokładnego,
+nieskompresowanego `serde_json::to_vec(Wire V1)`, używanego przez MFS field
+serializer, runtime hard gate, testy, telemetrykę i release harness. Bincode i
+verbose domain JSON pozostają wyłącznie osobno nazwanymi diagnostykami.
+Oversized bounded-reason payload jest odrzucany przez `ProjectionTooLarge`,
+którego `actual_bytes` raportuje exact Wire V1 JSON bytes. Budżety pozostają
+p95 `12 KiB` i hard max `16 KiB`; kompresja nie bierze udziału w gate.
 
 Family builders zachowują fail-closed public context validation, natomiast
 root builder używa prywatnej, typowo ograniczonej ścieżki dla już
 zwalidowanego immutable contextu. Eliminuje to ponowne liczenie hashy profile i
 effective-config dla każdego compact envelope bez osłabienia publicznej
-granicy. Release resource harness mierzący dokładnie full-evidence → projection
-build + semantic validation uzyskał p50 `509 us`, p95 `753 us` i p99 `874 us`.
-Standardowy payload ma `2780 B`, a duży dozwolony fixture `8932 B`.
+granicy. Release resource harness raportuje osobno build/validation, wire
+serialization i combined path. Po 32-iteracyjnym warm-upie steady-state wyniki
+p50/p95/p99 wynoszą odpowiednio: build/validation `515/619/738 us`, Wire V1
+serialization `49/66/79 us`, combined `575/674/708 us`. Standard Wire V1 ma
+`2339 B`, duży poprawny fixture `8487 B`; diagnostyczny verbose domain JSON ma
+`20332 B`, a diagnostyczny bincode `2780 B`.
 
 ## 10. Zakres wyłączony
 
@@ -265,20 +351,15 @@ Zamrożone pliki policy, V3, loggera, replayu, IWIM, sendera, post-buy, Jito i
 execution mają identyczne SHA-256 jak base. Rollout pozostaje `Legacy`.
 PR2C, PR3 oraz Type-5 T1 nie zostały rozpoczęte.
 
-Markery akceptacyjne:
+Markery akceptacyjne po pełnej walidacji amendmentu:
 
 ```text
-PR2B_FLIP_V2_STATE_MACHINE_PASS
-PR2B_MANIPULATION_PRESENCE_AWARE_EVIDENCE_PASS
-PR2B_RESERVE_VELOCITY_TYPED_EVIDENCE_PASS
-PR2B_RECENT_BUY_SELL_TYPED_EVIDENCE_PASS
-PR2B_EFFECTIVE_CONFIG_KEY_COVERAGE_CLOSED
-PR2B_ONE_PRODUCER_ONE_SNAPSHOT_TWO_REPRESENTATIONS_PASS
-PR2B_MFS_ATOMIC_PROJECTION_MATERIALIZATION_PASS
-PR2B_PROJECTION_RESOURCE_GATE_PASS
-GATEKEEPER_POLICY_UNCHANGED
-V3_V1_REPLAY_UNCHANGED
-TYPE5_NOT_STARTED
-METRIC_CONTRACTS_V1_1_EVIDENCE_PRODUCERS_READY
-PR2B_READY_FOR_REVIEW
+METRIC_CONTRACT_PROJECTION_WIRE_V1_PLAN_AMENDMENT_PASS
+PR2B_COMPACT_JSON_WIRE_V1_ROUNDTRIP_PASS
+PR2B_SEMANTIC_HASH_INDEPENDENT_OF_WIRE_PASS
+PR2B_ACTUAL_MFS_SERIALIZATION_RESOURCE_GATE_PASS
+PR2B_MANIPULATION_TRUE_PER_FIELD_PRESENCE_PASS
+PR2B_FLIP_IDENTITY_ORDER_SEPARATION_PASS
+PR2B_REVIEW_BLOCKERS_CLOSED
+PR2B_READY_FOR_RE_REVIEW
 ```

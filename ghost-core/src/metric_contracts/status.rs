@@ -414,6 +414,8 @@ pub enum FlipEvidenceReasonV1 {
     MissingStableOrder,
     MissingResolvedOwner,
     DuplicateEvent,
+    IdentityOrderConflict,
+    DuplicateOrderConflict,
     FailedTransactionExcluded,
     DustExcluded,
     WalletCapReached,

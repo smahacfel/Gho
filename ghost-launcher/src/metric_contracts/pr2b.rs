@@ -4,7 +4,9 @@ use super::{
 };
 use crate::tx_intelligence::FlipV2ProducerSnapshotV1;
 use ghost_core::account_state_core::types::AccountStateReserveVelocitySnapshotV1;
-use ghost_core::checkpoint::{EvidenceStatus, ManipulationContradictionFeatures};
+use ghost_core::checkpoint::{
+    EvidenceStatus, ManipulationContradictionFeatures, MaterializedFeatureSet,
+};
 use ghost_core::metric_contracts::{
     CanonicalMetricEnvelopeV1, CanonicalNullableV1, CanonicalU64StringV1, FlipEvidenceReasonV1,
     FlipRatioContractEvidenceV1, FlipRatioEvidenceV2, ManipulationComparatorV1,
@@ -196,11 +198,171 @@ pub struct RecentBuySellProducerSnapshotV1 {
     pub source_complete: bool,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ManipulationProducerFieldV2<T> {
+    pub value: Option<T>,
+    pub availability: MetricAvailabilityV1,
+    pub measurement_quality: MetricMeasurementQualityV1,
+    pub reasons: Vec<MetricEvidenceReasonV1>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ManipulationProducerSnapshotV2 {
+    pub same_ms_tx_ratio: ManipulationProducerFieldV2<f64>,
+    pub bundle_suspicion_ratio: ManipulationProducerFieldV2<f64>,
+    pub top3_signer_volume_ratio: ManipulationProducerFieldV2<f64>,
+    pub hhi: ManipulationProducerFieldV2<f64>,
+    pub max_tx_per_signer: ManipulationProducerFieldV2<u64>,
+    pub dev_volume_ratio: ManipulationProducerFieldV2<f64>,
+    pub contradiction_score: ManipulationProducerFieldV2<f64>,
+    pub group_status: EvidenceStatus,
+    pub group_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ManipulationFrozenSnapshotV2 {
+    pub legacy: ManipulationContradictionFeatures,
+    pub typed: ManipulationProducerSnapshotV2,
+}
+
+fn manipulation_snapshot_field<T>(
+    value: Option<T>,
+    group_status: EvidenceStatus,
+    group_reasons: &[MetricEvidenceReasonV1],
+) -> ManipulationProducerFieldV2<T> {
+    match value {
+        Some(value) => ManipulationProducerFieldV2 {
+            value: Some(value),
+            availability: MetricAvailabilityV1::Available,
+            measurement_quality: if group_status == EvidenceStatus::Clean {
+                MetricMeasurementQualityV1::Measured
+            } else {
+                MetricMeasurementQualityV1::Degraded
+            },
+            reasons: group_reasons.to_vec(),
+        },
+        None => ManipulationProducerFieldV2 {
+            value: None,
+            availability: MetricAvailabilityV1::Unavailable,
+            measurement_quality: MetricMeasurementQualityV1::NotApplicable,
+            reasons: vec![MetricEvidenceReasonV1::Manipulation(
+                ManipulationEvidenceReasonV1::RawFieldAbsent,
+            )],
+        },
+    }
+}
+
+/// Freeze legacy V3 compatibility values and true V2 per-field presence from
+/// the same already-materialized owner snapshot. Scalar defaults are retained
+/// only in `legacy`; they never establish V2 field presence.
+#[must_use]
+pub fn freeze_manipulation_producer_snapshot_v2(
+    materialized: &MaterializedFeatureSet,
+    legacy: ManipulationContradictionFeatures,
+) -> ManipulationFrozenSnapshotV2 {
+    let tx = &materialized.tx_intel_features;
+    let alpha = &materialized.alpha_fingerprint;
+    let organic = &materialized.organic_broadening;
+    let group_can_expose_values = matches!(
+        legacy.status,
+        EvidenceStatus::Clean | EvidenceStatus::Degraded
+    );
+
+    let same_ms = group_can_expose_values
+        .then_some(tx.same_ms_tx_ratio)
+        .filter(|_| tx.tx_count > 0);
+    let bundle = group_can_expose_values
+        .then_some(tx.bundle_suspicion_ratio)
+        .filter(|_| tx.tx_count > 0);
+    let top3 = group_can_expose_values
+        .then_some(tx.top3_signer_volume_ratio)
+        .flatten();
+    let signer_population_evaluable = tx.tx_count > 0 && tx.unique_signers > 0;
+    let hhi = group_can_expose_values
+        .then_some(tx.hhi)
+        .filter(|_| signer_population_evaluable);
+    let max_tx = group_can_expose_values
+        .then_some(tx.max_tx_per_signer)
+        .filter(|_| signer_population_evaluable);
+    let dev = group_can_expose_values
+        .then_some(tx.dev_volume_ratio)
+        .filter(|_| tx.tx_count > 0 && tx.total_volume_sol > 0.0 && tx.dev_wallet_known);
+    let contradiction_components_evaluable = tx.tx_count > 0
+        && tx.top3_signer_volume_ratio.is_some()
+        && organic.sequence_available
+        && materialized.tx_segment_sequence.is_some()
+        && alpha.fixed_size_buy_ratio.is_some()
+        && alpha.early_top3_buy_volume_pct_3s.is_some();
+    let contradiction = group_can_expose_values
+        .then_some(legacy.contradiction_score)
+        .filter(|_| contradiction_components_evaluable);
+
+    let all_required_present = same_ms.is_some()
+        && bundle.is_some()
+        && top3.is_some()
+        && hhi.is_some()
+        && max_tx.is_some()
+        && dev.is_some()
+        && contradiction.is_some();
+    let any_present = same_ms.is_some()
+        || bundle.is_some()
+        || top3.is_some()
+        || hhi.is_some()
+        || max_tx.is_some()
+        || dev.is_some()
+        || contradiction.is_some();
+    let group_status = match legacy.status {
+        EvidenceStatus::Clean if !all_required_present => EvidenceStatus::Degraded,
+        status if any_present => status,
+        _ => EvidenceStatus::Unavailable,
+    };
+    let mut group_reasons = legacy.reasons.clone();
+    if legacy.status == EvidenceStatus::Clean && group_status == EvidenceStatus::Degraded {
+        group_reasons.push("typed_field_presence_partial".to_string());
+    }
+    let typed_reasons = group_reasons
+        .iter()
+        .map(|reason| {
+            ghost_core::metric_contracts::adapt_legacy_metric_reason_v1(
+                MetricContractId::ManipulationContradiction,
+                reason,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    ManipulationFrozenSnapshotV2 {
+        legacy,
+        typed: ManipulationProducerSnapshotV2 {
+            same_ms_tx_ratio: manipulation_snapshot_field(same_ms, group_status, &typed_reasons),
+            bundle_suspicion_ratio: manipulation_snapshot_field(
+                bundle,
+                group_status,
+                &typed_reasons,
+            ),
+            top3_signer_volume_ratio: manipulation_snapshot_field(
+                top3,
+                group_status,
+                &typed_reasons,
+            ),
+            hhi: manipulation_snapshot_field(hhi, group_status, &typed_reasons),
+            max_tx_per_signer: manipulation_snapshot_field(max_tx, group_status, &typed_reasons),
+            dev_volume_ratio: manipulation_snapshot_field(dev, group_status, &typed_reasons),
+            contradiction_score: manipulation_snapshot_field(
+                contradiction,
+                group_status,
+                &typed_reasons,
+            ),
+            group_status,
+            group_reasons,
+        },
+    }
+}
+
 pub struct Pr2bFrozenProducerInputsV1<'a> {
     pub pr2a: Pr2aFrozenProducerInputsV1<'a>,
     pub legacy_flip_ratio: Option<f64>,
     pub flip_v2: &'a FlipV2ProducerSnapshotV1,
-    pub manipulation: &'a ManipulationContradictionFeatures,
+    pub manipulation: &'a ManipulationFrozenSnapshotV2,
     pub reserve_velocity: &'a AccountStateReserveVelocitySnapshotV1,
     pub recent_buy_sell: &'a RecentBuySellProducerSnapshotV1,
 }
@@ -559,7 +721,7 @@ fn manipulation_threshold(
 }
 
 pub fn build_manipulation_evidence_v2(
-    features: &ManipulationContradictionFeatures,
+    snapshot: &ManipulationFrozenSnapshotV2,
     context: &Pr2bBuildContextV1<'_>,
 ) -> Result<ManipulationNumericEvidenceV2, Pr2bProducerErrorV1> {
     for (key, expected, field) in [
@@ -591,7 +753,14 @@ pub fn build_manipulation_evidence_v2(
     ] {
         config_enum(context, key, expected, field)?;
     }
-    if features.max_tx_per_signer > (1_u64 << 53) {
+    let features = &snapshot.legacy;
+    let typed = &snapshot.typed;
+    if features.max_tx_per_signer > (1_u64 << 53)
+        || typed
+            .max_tx_per_signer
+            .value
+            .is_some_and(|value| value > (1_u64 << 53))
+    {
         return Err(Pr2bProducerErrorV1::ProducerInvariant(
             "manipulation signer count is not exactly representable",
         ));
@@ -607,11 +776,11 @@ pub fn build_manipulation_evidence_v2(
             ));
         }
     }
-    let available = matches!(
+    let legacy_available = matches!(
         features.status,
         EvidenceStatus::Clean | EvidenceStatus::Degraded
     );
-    let quality = if features.status == EvidenceStatus::Clean {
+    let legacy_quality = if features.status == EvidenceStatus::Clean {
         MetricMeasurementQualityV1::Measured
     } else {
         MetricMeasurementQualityV1::Degraded
@@ -632,12 +801,12 @@ pub fn build_manipulation_evidence_v2(
             field_id: id,
             value: CanonicalNullableV1::Value(manipulation_raw(features, id)),
             availability: MetricAvailabilityV1::Available,
-            measurement_quality: if available {
-                quality
+            measurement_quality: if legacy_available {
+                legacy_quality
             } else {
                 MetricMeasurementQualityV1::LegacyDefault
             },
-            reason_codes: if available {
+            reason_codes: if legacy_available {
                 numeric_reasons.clone()
             } else {
                 vec![MetricEvidenceReasonV1::Manipulation(
@@ -646,32 +815,120 @@ pub fn build_manipulation_evidence_v2(
             },
         })
         .collect::<Vec<_>>();
+    let typed_parts = |id| match id {
+        ManipulationNumericFieldIdV2::SameMsTxRatio => (
+            typed.same_ms_tx_ratio.value,
+            typed.same_ms_tx_ratio.availability,
+            typed.same_ms_tx_ratio.measurement_quality,
+            typed.same_ms_tx_ratio.reasons.as_slice(),
+        ),
+        ManipulationNumericFieldIdV2::BundleSuspicionRatio => (
+            typed.bundle_suspicion_ratio.value,
+            typed.bundle_suspicion_ratio.availability,
+            typed.bundle_suspicion_ratio.measurement_quality,
+            typed.bundle_suspicion_ratio.reasons.as_slice(),
+        ),
+        ManipulationNumericFieldIdV2::Top3SignerVolumeRatio => (
+            typed.top3_signer_volume_ratio.value,
+            typed.top3_signer_volume_ratio.availability,
+            typed.top3_signer_volume_ratio.measurement_quality,
+            typed.top3_signer_volume_ratio.reasons.as_slice(),
+        ),
+        ManipulationNumericFieldIdV2::Hhi => (
+            typed.hhi.value,
+            typed.hhi.availability,
+            typed.hhi.measurement_quality,
+            typed.hhi.reasons.as_slice(),
+        ),
+        ManipulationNumericFieldIdV2::MaxTxPerSigner => (
+            typed.max_tx_per_signer.value.map(|value| value as f64),
+            typed.max_tx_per_signer.availability,
+            typed.max_tx_per_signer.measurement_quality,
+            typed.max_tx_per_signer.reasons.as_slice(),
+        ),
+        ManipulationNumericFieldIdV2::DevVolumeRatio => (
+            typed.dev_volume_ratio.value,
+            typed.dev_volume_ratio.availability,
+            typed.dev_volume_ratio.measurement_quality,
+            typed.dev_volume_ratio.reasons.as_slice(),
+        ),
+        ManipulationNumericFieldIdV2::ContradictionScore => (
+            typed.contradiction_score.value,
+            typed.contradiction_score.availability,
+            typed.contradiction_score.measurement_quality,
+            typed.contradiction_score.reasons.as_slice(),
+        ),
+    };
     let fields = MANIPULATION_FIELDS
         .into_iter()
-        .map(|id| ManipulationNumericFieldEvidenceV2 {
-            field_id: id,
-            value: if available {
-                CanonicalNullableV1::Value(manipulation_raw(features, id))
-            } else {
-                CanonicalNullableV1::Null
-            },
-            availability: if available {
-                MetricAvailabilityV1::Available
-            } else {
-                MetricAvailabilityV1::Unavailable
-            },
-            measurement_quality: if available {
-                quality
-            } else {
-                MetricMeasurementQualityV1::NotApplicable
-            },
-            reason_codes: if available {
-                numeric_reasons.clone()
-            } else {
-                vec![MetricEvidenceReasonV1::Manipulation(
-                    ManipulationEvidenceReasonV1::RawFieldAbsent,
-                )]
-            },
+        .map(|id| {
+            let (value, availability, measurement_quality, reasons) = typed_parts(id);
+            let coherent = match (value, availability, measurement_quality) {
+                (
+                    Some(_),
+                    MetricAvailabilityV1::Available,
+                    MetricMeasurementQualityV1::Measured | MetricMeasurementQualityV1::Degraded,
+                ) => true,
+                (None, availability, MetricMeasurementQualityV1::NotApplicable)
+                    if availability != MetricAvailabilityV1::Available =>
+                {
+                    true
+                }
+                _ => false,
+            };
+            if !coherent {
+                return Err(Pr2bProducerErrorV1::ProducerInvariant(
+                    "manipulation producer field presence/status coherence",
+                ));
+            }
+            if typed.group_status == EvidenceStatus::Clean
+                && measurement_quality != MetricMeasurementQualityV1::Measured
+            {
+                return Err(Pr2bProducerErrorV1::ProducerInvariant(
+                    "clean manipulation group requires every field measured",
+                ));
+            }
+            if typed.group_status == EvidenceStatus::Degraded
+                && value.is_some()
+                && measurement_quality != MetricMeasurementQualityV1::Degraded
+            {
+                return Err(Pr2bProducerErrorV1::ProducerInvariant(
+                    "manipulation field quality exceeds group quality",
+                ));
+            }
+            Ok(ManipulationNumericFieldEvidenceV2 {
+                field_id: id,
+                value: value.into(),
+                availability,
+                measurement_quality,
+                reason_codes: reasons.to_vec(),
+            })
+        })
+        .collect::<Result<Vec<_>, Pr2bProducerErrorV1>>()?;
+    let any_typed_available = fields.iter().any(|field| !field.value.is_null());
+    if any_typed_available
+        != matches!(
+            typed.group_status,
+            EvidenceStatus::Clean | EvidenceStatus::Degraded
+        )
+    {
+        return Err(Pr2bProducerErrorV1::ProducerInvariant(
+            "manipulation group availability/presence coherence",
+        ));
+    }
+    let typed_quality = match typed.group_status {
+        EvidenceStatus::Clean => MetricMeasurementQualityV1::Measured,
+        EvidenceStatus::Degraded => MetricMeasurementQualityV1::Degraded,
+        _ => MetricMeasurementQualityV1::NotApplicable,
+    };
+    let typed_reasons = typed
+        .group_reasons
+        .iter()
+        .map(|reason| {
+            ghost_core::metric_contracts::adapt_legacy_metric_reason_v1(
+                MetricContractId::ManipulationContradiction,
+                reason,
+            )
         })
         .collect::<Vec<_>>();
     let measured_fields_mask = fields
@@ -686,7 +943,7 @@ pub fn build_manipulation_evidence_v2(
         .map(|id| ManipulationLegacyHighFlagEvidenceV1 {
             field_id: id,
             value: manipulation_legacy_high(features, id),
-            field_recorded: available,
+            field_recorded: legacy_available,
         })
         .collect::<Vec<_>>();
     let config_hash = context
@@ -724,33 +981,29 @@ pub fn build_manipulation_evidence_v2(
             MetricContractId::ManipulationContradiction,
             MetricSurfaceId::MfsManipulationNumericLegacyDefaults,
             MetricAvailabilityV1::Available,
-            if available {
-                quality
+            if legacy_available {
+                legacy_quality
             } else {
                 MetricMeasurementQualityV1::LegacyDefault
             },
             policy_authoritative(
                 context,
                 MetricSurfaceId::MfsManipulationNumericLegacyDefaults,
-            ) && available,
+            ) && legacy_available,
             numeric_reasons.clone(),
         )?,
         numeric_v2_envelope: envelope(
             context,
             MetricContractId::ManipulationContradiction,
             MetricSurfaceId::ManipulationNumericEvidenceV2,
-            if available {
+            if any_typed_available {
                 MetricAvailabilityV1::Available
             } else {
                 MetricAvailabilityV1::Unavailable
             },
-            if available {
-                quality
-            } else {
-                MetricMeasurementQualityV1::NotApplicable
-            },
+            typed_quality,
             false,
-            numeric_reasons,
+            typed_reasons,
         )?,
         measured_fields_mask,
         legacy_fields,
@@ -760,15 +1013,15 @@ pub fn build_manipulation_evidence_v2(
             MetricContractId::ManipulationContradiction,
             MetricSurfaceId::MfsManipulationHighFlagsLegacyDefaults,
             MetricAvailabilityV1::Available,
-            if available {
-                quality
+            if legacy_available {
+                legacy_quality
             } else {
                 MetricMeasurementQualityV1::LegacyDefault
             },
             policy_authoritative(
                 context,
                 MetricSurfaceId::MfsManipulationHighFlagsLegacyDefaults,
-            ) && available,
+            ) && legacy_available,
             Vec::new(),
         )?,
         legacy_high_flags,
@@ -776,16 +1029,12 @@ pub fn build_manipulation_evidence_v2(
             context,
             MetricContractId::ManipulationContradiction,
             MetricSurfaceId::PolicyDerivedManipulationHighFlagsV2,
-            if available {
+            if any_typed_available {
                 MetricAvailabilityV1::Available
             } else {
                 MetricAvailabilityV1::Unavailable
             },
-            if available {
-                quality
-            } else {
-                MetricMeasurementQualityV1::NotApplicable
-            },
+            typed_quality,
             false,
             vec![MetricEvidenceReasonV1::Manipulation(
                 ManipulationEvidenceReasonV1::DerivedInPolicy,

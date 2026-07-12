@@ -11,6 +11,7 @@ mod effective_config;
 mod evidence;
 mod identity;
 mod projection;
+mod projection_wire;
 mod registry;
 mod status;
 
@@ -28,5 +29,6 @@ pub use effective_config::{
 pub use evidence::*;
 pub use identity::*;
 pub use projection::*;
+pub use projection_wire::*;
 pub use registry::*;
 pub use status::*;

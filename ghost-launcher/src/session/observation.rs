@@ -2873,8 +2873,12 @@ impl PoolObservationSession {
         }
 
         materialized.organic_broadening = self.materialize_v3_organic_broadening(&materialized);
-        materialized.manipulation_contradictions =
-            self.materialize_v3_manipulation_contradictions(&materialized);
+        let manipulation_legacy = self.materialize_v3_manipulation_contradictions(&materialized);
+        let manipulation_frozen = crate::metric_contracts::freeze_manipulation_producer_snapshot_v2(
+            &materialized,
+            manipulation_legacy,
+        );
+        materialized.manipulation_contradictions = manipulation_frozen.legacy.clone();
         materialized.temporal_deltas = self.materialize_v3_temporal_deltas();
         materialized.decision_time_series = self.materialize_decision_time_series();
         materialized.pre_entry_path_summary_v1 =
@@ -2937,7 +2941,7 @@ impl PoolObservationSession {
                 },
                 legacy_flip_ratio,
                 flip_v2: &flip_v2,
-                manipulation: &materialized.manipulation_contradictions,
+                manipulation: &manipulation_frozen,
                 reserve_velocity: &reserve_velocity,
                 recent_buy_sell: &recent_buy_sell,
             },

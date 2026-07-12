@@ -1,11 +1,11 @@
 use crate::events::PoolTransaction;
 use ghost_core::metric_contracts::{
     CanonicalU128StringV1, CanonicalU64StringV1, FlipEvidenceReasonV1, FlipOwnerEvidenceV2,
-    FlipOwnerStatusV2, StableEventIdentityV1, StableEventKeyV1,
+    FlipOwnerStatusV2, StableEventIdentityV1,
 };
 use ghost_core::{EventTruthKind, SlotQuality};
 use seer::early_fingerprint::EarlyFingerprintConfig;
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FlipV2ProducerConfigSnapshotV1 {
@@ -33,9 +33,41 @@ pub struct FlipV2ProducerSnapshotV1 {
 #[derive(Debug, Clone)]
 struct EligibleFlipEventV1 {
     identity: StableEventIdentityV1,
+    order_key: CanonicalFlipOrderKeyV1,
     timestamp_ms: u64,
     slot: u64,
     owners: Vec<(String, i128)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CanonicalFlipOrderProofV1 {
+    TransactionIndex,
+    EventOrdinal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CanonicalFlipOrderKeyV1 {
+    pub slot: u64,
+    pub position: u32,
+    pub proof: CanonicalFlipOrderProofV1,
+}
+
+impl CanonicalFlipOrderKeyV1 {
+    fn from_transaction(tx: &PoolTransaction, slot: u64) -> Option<Self> {
+        if let Some(transaction_index) = tx.tx_index {
+            Some(Self {
+                slot,
+                position: transaction_index,
+                proof: CanonicalFlipOrderProofV1::TransactionIndex,
+            })
+        } else {
+            tx.event_ordinal.map(|event_ordinal| Self {
+                slot,
+                position: event_ordinal,
+                proof: CanonicalFlipOrderProofV1::EventOrdinal,
+            })
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -83,8 +115,9 @@ pub struct FlipV2StateMachineV1 {
     config: FlipV2ProducerConfigSnapshotV1,
     pool_t0_ms: u64,
     events: Vec<EligibleFlipEventV1>,
-    seen: HashSet<StableEventIdentityV1>,
+    seen: HashMap<StableEventIdentityV1, CanonicalFlipOrderKeyV1>,
     seen_fifo: VecDeque<StableEventIdentityV1>,
+    order_identities: HashMap<(u64, u32), StableEventIdentityV1>,
     seen_owners: HashSet<String>,
     reasons: Vec<FlipEvidenceReasonV1>,
     dedupe_eviction_count: u64,
@@ -112,8 +145,9 @@ impl FlipV2StateMachineV1 {
             },
             pool_t0_ms,
             events: Vec::new(),
-            seen: HashSet::new(),
+            seen: HashMap::new(),
             seen_fifo: VecDeque::new(),
+            order_identities: HashMap::new(),
             seen_owners: HashSet::new(),
             reasons: Vec::new(),
             dedupe_eviction_count: 0,
@@ -137,6 +171,7 @@ impl FlipV2StateMachineV1 {
         self.events.clear();
         self.seen.clear();
         self.seen_fifo.clear();
+        self.order_identities.clear();
         self.seen_owners.clear();
         self.reasons.clear();
         self.dedupe_eviction_count = 0;
@@ -193,8 +228,25 @@ impl FlipV2StateMachineV1 {
             self.record_reason(FlipEvidenceReasonV1::MissingStableIdentity);
             return;
         };
-        if self.seen.contains(&identity) {
-            self.record_reason(FlipEvidenceReasonV1::DuplicateEvent);
+        let Some(order_key) = CanonicalFlipOrderKeyV1::from_transaction(tx, slot) else {
+            self.record_reason(FlipEvidenceReasonV1::MissingStableOrder);
+            return;
+        };
+        if let Some(previous_order) = self.seen.get(&identity) {
+            let reason = if *previous_order == order_key {
+                FlipEvidenceReasonV1::DuplicateEvent
+            } else {
+                FlipEvidenceReasonV1::IdentityOrderConflict
+            };
+            self.record_reason(reason);
+            return;
+        }
+        if self
+            .order_identities
+            .get(&(order_key.slot, order_key.position))
+            .is_some_and(|previous_identity| previous_identity != &identity)
+        {
+            self.record_reason(FlipEvidenceReasonV1::DuplicateOrderConflict);
             return;
         }
         if self.config.dedupe_capacity == 0 {
@@ -203,7 +255,10 @@ impl FlipV2StateMachineV1 {
         }
         if self.seen.len() >= self.config.dedupe_capacity {
             if let Some(evicted) = self.seen_fifo.pop_front() {
-                self.seen.remove(&evicted);
+                if let Some(evicted_order) = self.seen.remove(&evicted) {
+                    self.order_identities
+                        .remove(&(evicted_order.slot, evicted_order.position));
+                }
                 self.events.retain(|event| event.identity != evicted);
                 self.dedupe_eviction_count = match self.dedupe_eviction_count.checked_add(1) {
                     Some(value) => value,
@@ -250,10 +305,13 @@ impl FlipV2StateMachineV1 {
         }
         self.seen_owners
             .extend(owners.iter().map(|(owner, _)| owner.clone()));
-        self.seen.insert(identity.clone());
+        self.seen.insert(identity.clone(), order_key);
+        self.order_identities
+            .insert((order_key.slot, order_key.position), identity.clone());
         self.seen_fifo.push_back(identity.clone());
         self.events.push(EligibleFlipEventV1 {
             identity,
+            order_key,
             timestamp_ms,
             slot,
             owners,
@@ -284,11 +342,10 @@ impl FlipV2StateMachineV1 {
             };
         };
         let mut events = self.events.clone();
-        events
-            .sort_by(|left, right| canonical_event_order(left).cmp(&canonical_event_order(right)));
-        let order_conflict = events
-            .windows(2)
-            .any(|pair| pair[1].timestamp_ms > pair[0].timestamp_ms && pair[1].slot < pair[0].slot);
+        events.sort_by_key(|event| event.order_key);
+        let order_conflict = events.windows(2).any(|pair| {
+            pair[1].order_key > pair[0].order_key && pair[1].timestamp_ms < pair[0].timestamp_ms
+        });
         if order_conflict && !reasons.contains(&FlipEvidenceReasonV1::OutOfOrderEvent) {
             reasons.push(FlipEvidenceReasonV1::OutOfOrderEvent);
         }
@@ -301,6 +358,8 @@ impl FlipV2StateMachineV1 {
                     reason,
                     FlipEvidenceReasonV1::MissingStableIdentity
                         | FlipEvidenceReasonV1::MissingStableOrder
+                        | FlipEvidenceReasonV1::IdentityOrderConflict
+                        | FlipEvidenceReasonV1::DuplicateOrderConflict
                         | FlipEvidenceReasonV1::MissingResolvedOwner
                         | FlipEvidenceReasonV1::ArithmeticOverflow
                 )
@@ -467,25 +526,11 @@ impl FlipV2StateMachineV1 {
     }
 }
 
-fn canonical_event_order(event: &EligibleFlipEventV1) -> (u64, u64, u8, u32, &str) {
-    match &event.identity.key {
-        StableEventKeyV1::Signature { signature } => {
-            (event.timestamp_ms, event.slot, 0, 0, signature.as_str())
-        }
-        StableEventKeyV1::SlotTransactionIndex {
-            transaction_index, ..
-        } => (event.timestamp_ms, event.slot, 1, *transaction_index, ""),
-        StableEventKeyV1::SlotEventOrdinal { event_ordinal, .. } => {
-            (event.timestamp_ms, event.slot, 2, *event_ordinal, "")
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::events::RawBytesMissingReason;
-    use ghost_core::metric_contracts::CanonicalNullableV1;
+    use ghost_core::metric_contracts::{CanonicalNullableV1, StableEventKeyV1};
     use ghost_core::{CurveFinality, EventSemanticEnvelope, EventTimeMetadata};
     use seer::early_fingerprint::TokenDelta;
     use seer::types::ToolchainFingerprintInput;
@@ -733,6 +778,118 @@ mod tests {
         assert!(forward
             .ratio
             .is_some_and(|ratio| (0.0..=1.0).contains(&ratio)));
+    }
+
+    #[test]
+    fn same_slot_uses_canonical_position_not_lexical_signature_order() {
+        let mut buy = tx("alice", 100, 1_000, 100, 0);
+        buy.signature = "z-signature".to_string();
+        buy.tx_index = Some(0);
+        let mut sell = tx("alice", -50, 1_000, 100, 1);
+        sell.signature = "a-signature".to_string();
+        sell.tx_index = Some(1);
+
+        let mut forward = machine(8, 32);
+        forward.on_transaction(&buy);
+        forward.on_transaction(&sell);
+        let mut reverse_delivery = machine(8, 32);
+        reverse_delivery.on_transaction(&sell);
+        reverse_delivery.on_transaction(&buy);
+
+        let forward = forward.snapshot(2_000, Some(120));
+        let reverse_delivery = reverse_delivery.snapshot(2_000, Some(120));
+        assert_eq!(forward.ratio, Some(1.0));
+        assert_eq!(forward.ratio, reverse_delivery.ratio);
+        assert_eq!(forward.owners, reverse_delivery.owners);
+    }
+
+    #[test]
+    fn signature_identity_still_requires_transaction_index_or_event_ordinal_order_proof() {
+        let mut tx_index = tx("alice", 100, 1_000, 10, 0);
+        tx_index.event_ordinal = None;
+        assert!(tx_index.tx_index.is_some());
+        let mut machine_tx = machine(8, 32);
+        machine_tx.on_transaction(&tx_index);
+        assert!(machine_tx.snapshot(2_000, Some(20)).evaluable);
+
+        let mut ordinal = tx("alice", 100, 1_000, 10, 7);
+        ordinal.tx_index = None;
+        let mut machine_ordinal = machine(8, 32);
+        machine_ordinal.on_transaction(&ordinal);
+        assert!(machine_ordinal.snapshot(2_000, Some(20)).evaluable);
+
+        let mut no_order = tx("alice", 100, 1_000, 10, 0);
+        no_order.tx_index = None;
+        no_order.event_ordinal = None;
+        let mut missing = machine(8, 32);
+        missing.on_transaction(&no_order);
+        let snapshot = missing.snapshot(2_000, Some(20));
+        assert!(!snapshot.evaluable);
+        assert!(snapshot
+            .reasons
+            .contains(&FlipEvidenceReasonV1::MissingStableOrder));
+    }
+
+    #[test]
+    fn order_key_is_also_a_proven_identity_fallback_when_signature_is_absent() {
+        let mut tx_index = tx("alice", 100, 1_000, 10, 3);
+        tx_index.signature.clear();
+        tx_index.event_ordinal = None;
+        let mut by_tx = machine(8, 32);
+        by_tx.on_transaction(&tx_index);
+        let by_tx = by_tx.snapshot(2_000, Some(20));
+        assert!(by_tx.evaluable);
+        assert!(matches!(
+            &owner(&by_tx, "alice").anchor_event_identity,
+            CanonicalNullableV1::Value(StableEventIdentityV1 {
+                key: StableEventKeyV1::SlotTransactionIndex { .. },
+                ..
+            })
+        ));
+
+        let mut ordinal = tx("alice", 100, 1_000, 10, 4);
+        ordinal.signature.clear();
+        ordinal.tx_index = None;
+        let mut by_ordinal = machine(8, 32);
+        by_ordinal.on_transaction(&ordinal);
+        let by_ordinal = by_ordinal.snapshot(2_000, Some(20));
+        assert!(by_ordinal.evaluable);
+        assert!(matches!(
+            &owner(&by_ordinal, "alice").anchor_event_identity,
+            CanonicalNullableV1::Value(StableEventIdentityV1 {
+                key: StableEventKeyV1::SlotEventOrdinal { .. },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn identity_and_order_collisions_fail_closed() {
+        let mut identity_a = tx("alice", 100, 1_000, 10, 0);
+        identity_a.signature = "same-signature".to_string();
+        let mut identity_b = tx("alice", -50, 1_100, 10, 1);
+        identity_b.signature = "same-signature".to_string();
+        let mut identity_conflict = machine(8, 32);
+        identity_conflict.on_transaction(&identity_a);
+        identity_conflict.on_transaction(&identity_b);
+        let snapshot = identity_conflict.snapshot(2_000, Some(20));
+        assert!(!snapshot.evaluable);
+        assert!(snapshot
+            .reasons
+            .contains(&FlipEvidenceReasonV1::IdentityOrderConflict));
+
+        let mut order_a = tx("alice", 100, 1_000, 10, 0);
+        order_a.signature = "signature-a".to_string();
+        let mut order_b = tx("alice", -50, 1_000, 10, 0);
+        order_b.signature = "signature-b".to_string();
+        let mut order_conflict = machine(8, 32);
+        order_conflict.on_transaction(&order_a);
+        order_conflict.on_transaction(&order_b);
+        let snapshot = order_conflict.snapshot(2_000, Some(20));
+        assert!(!snapshot.evaluable);
+        assert!(snapshot
+            .reasons
+            .contains(&FlipEvidenceReasonV1::DuplicateOrderConflict));
     }
 
     #[test]

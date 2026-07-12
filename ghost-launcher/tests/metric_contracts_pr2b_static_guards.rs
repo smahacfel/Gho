@@ -1,4 +1,7 @@
-use ghost_core::metric_contracts::{MetricContractId, MetricEffectiveConfigKeyV1};
+use ghost_core::metric_contracts::{
+    metric_contract_projection_wire_v1_mapping_tables,
+    metric_contract_projection_wire_v1_tuple_layouts, MetricContractId, MetricEffectiveConfigKeyV1,
+};
 use ghost_launcher::metric_contracts::{
     pr2b_key_boundary_set_is_closed, Pr2bEffectiveConfigValidationBoundaryV1,
     PR2B_EFFECTIVE_CONFIG_KEY_BOUNDARIES_V1,
@@ -120,4 +123,42 @@ fn terminal_snapshot_has_exactly_one_canonical_producer_call_per_family() {
             .count(),
         1
     );
+}
+
+#[test]
+fn compact_json_wire_v1_mapping_is_closed_and_mfs_field_scoped() {
+    let tuples = metric_contract_projection_wire_v1_tuple_layouts();
+    let enums = metric_contract_projection_wire_v1_mapping_tables();
+    assert_eq!(tuples.len(), 18);
+    assert_eq!(enums.len(), 28);
+    for tables in [tuples, enums] {
+        let names = tables
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(names.len(), tables.len());
+        assert!(tables.iter().all(|(_, entries)| !entries.is_empty()));
+    }
+
+    let mfs = include_str!("../../ghost-core/src/checkpoint/types.rs");
+    assert!(mfs.contains(
+        "serialize_with = \"crate::metric_contracts::serialize_optional_projection_wire_v1\""
+    ));
+    assert!(mfs.contains(
+        "deserialize_with = \"crate::metric_contracts::deserialize_optional_projection_wire_v1\""
+    ));
+
+    let domain = include_str!("../../ghost-core/src/metric_contracts/projection.rs");
+    let root_start = domain
+        .find("pub struct MetricContractDecisionEvidenceProjectionV1")
+        .unwrap();
+    let root_end = domain[root_start..].find("impl ").unwrap() + root_start;
+    let root = &domain[root_start..root_end];
+    assert!(!root.contains("serde(rename"));
+    assert!(!root.contains("serialize_with"));
+
+    let wire = include_str!("../../ghost-core/src/metric_contracts/projection_wire.rs");
+    assert!(wire.contains("pub w: u16"));
+    assert!(wire.contains("pub d: Vec<Value>"));
+    assert!(wire.contains("#[serde(deny_unknown_fields)]"));
 }

@@ -1,6 +1,6 @@
 # PR2B evidence-only producers — raport weryfikacyjny V1
 
-Status: `PASS / READY_FOR_REVIEW`
+Status: `PASS / READY_FOR_RE_REVIEW`
 
 Data: 2026-07-12
 
@@ -23,25 +23,28 @@ Data: 2026-07-12
 4. `ghost-core/src/checkpoint/types.rs`
 5. `ghost-core/src/metric_contracts/evidence.rs`
 6. `ghost-core/src/metric_contracts/projection.rs`
-7. `ghost-core/src/metric_contracts/status.rs`
-8. `ghost-core/tests/metric_contracts_v1_1_foundation.rs`
-9. `ghost-core/tests/metric_contracts_v1_1_projection.rs`
-10. `ghost-launcher/src/main.rs`
-11. `ghost-launcher/src/metric_contracts/mod.rs`
-12. `ghost-launcher/src/metric_contracts/pr2b.rs`
-13. `ghost-launcher/src/oracle_runtime.rs`
-14. `ghost-launcher/src/session/manager.rs`
-15. `ghost-launcher/src/session/observation.rs`
-16. `ghost-launcher/src/tx_intelligence/engine.rs`
-17. `ghost-launcher/src/tx_intelligence/flip_v2.rs`
-18. `ghost-launcher/src/tx_intelligence/mod.rs`
-19. `ghost-launcher/src/tx_intelligence/sybil_metrics.rs`
-20. `ghost-launcher/tests/metric_contracts_pr2a_producers.rs`
-21. `ghost-launcher/tests/metric_contracts_pr2a_static_guards.rs`
-22. `ghost-launcher/tests/metric_contracts_pr2b_producers.rs`
-23. `ghost-launcher/tests/metric_contracts_pr2b_static_guards.rs`
-24. `docs/ADR/ADR_8D_PR2B_METRIC_CONTRACT_EVIDENCE_ONLY_PRODUCERS_20260712.md`
-25. `reports/metric_contracts/pr2b_evidence_only_producers_verification_v1.md`
+7. `ghost-core/src/metric_contracts/mod.rs`
+8. `ghost-core/src/metric_contracts/projection_wire.rs`
+9. `ghost-core/src/metric_contracts/status.rs`
+10. `ghost-core/tests/metric_contracts_v1_1_foundation.rs`
+11. `ghost-core/tests/metric_contracts_v1_1_projection.rs`
+12. `ghost-launcher/src/main.rs`
+13. `ghost-launcher/src/metric_contracts/mod.rs`
+14. `ghost-launcher/src/metric_contracts/pr2b.rs`
+15. `ghost-launcher/src/oracle_runtime.rs`
+16. `ghost-launcher/src/session/manager.rs`
+17. `ghost-launcher/src/session/observation.rs`
+18. `ghost-launcher/src/tx_intelligence/engine.rs`
+19. `ghost-launcher/src/tx_intelligence/flip_v2.rs`
+20. `ghost-launcher/src/tx_intelligence/mod.rs`
+21. `ghost-launcher/src/tx_intelligence/sybil_metrics.rs`
+22. `ghost-launcher/tests/metric_contracts_pr2a_producers.rs`
+23. `ghost-launcher/tests/metric_contracts_pr2a_static_guards.rs`
+24. `ghost-launcher/tests/metric_contracts_pr2b_producers.rs`
+25. `ghost-launcher/tests/metric_contracts_pr2b_static_guards.rs`
+26. `PLANS/DO_REALIZACJI/PLAN_KOREKTY_KONTRAKTOW_INTERPRETACJI_METRYK_V1_20260710.md`
+27. `docs/ADR/ADR_8D_PR2B_METRIC_CONTRACT_EVIDENCE_ONLY_PRODUCERS_20260712.md`
+28. `reports/metric_contracts/pr2b_evidence_only_producers_verification_v1.md`
 
 ## 2. Owner map
 
@@ -53,8 +56,8 @@ Data: 2026-07-12
 | top3 | TxIntelligence feature selector | PR2A typed snapshot | `Top3DecisionProjectionV1` |
 | funding/FSC | `FundingSourceIndex` | fingerprint-bound `FscComputation` | `FundingDecisionProjectionV1` |
 | FSC status | materialization adapter z tego samego FSC computation | PR2A status evidence | `FscStatusDecisionProjectionV1` |
-| Flip V2 | `TxIntelligenceEngine::flip_v2` | bounded owner-state snapshot | `FlipDecisionProjectionV1` |
-| manipulation | frozen V3 materialization owner | 7 fields + 6 derived flags | `ManipulationDecisionProjectionV1` |
+| Flip V2 | `TxIntelligenceEngine::flip_v2` | bounded owner-state snapshot; signature identity oddzielona od tx-index/event-ordinal order proof | `FlipDecisionProjectionV1` |
+| manipulation | frozen V3 materialization owner | legacy + typed per-field snapshot zamrożone z tych samych źródeł | `ManipulationDecisionProjectionV1` |
 | reserve velocity | `AccountStateReducer` | reserves/interval/count/status | `ReserveVelocityDecisionProjectionV1` |
 | recent buy/sell | RCE recent-window owner | successful-only counts | `RecentBuySellDecisionProjectionV1` |
 
@@ -111,6 +114,27 @@ MFS source guard wymaga dokładnie jednego pola
 `Option<MetricContractDecisionEvidenceProjectionV1>` i zakazuje
 `MetricContractsEvidenceSetV1` w `MaterializedFeatureSet`.
 
+### 5.1. Compact JSON Wire V1
+
+- domain projection zachowuje niezmienione exact Rust field-sets i direct serde;
+- MFS field-level serde używa wyłącznie `{"w":1,"d":[...]}`;
+- 18 zamkniętych layout tables obejmuje wire object, root, dziesięć rodzin i
+  sześć common wrappers;
+- 28 zamkniętych enum tables obejmuje wszystkie enumy, reason families i
+  family-specific reason codes;
+- golden BLAKE3 exact wire fixture:
+  `be965cdbfabffc8690a256574334ddd628414d2423a24cd5e81900ec32f4b566`;
+- round-trip odtwarza exact domain projection i wszystkie dziesięć rodzin;
+- unsupported version, missing/extra keys lub slots, wrong tuple length,
+  invalid enum code, verbose object i present `null` są odrzucane;
+- explicit nullable values i reason `omitted_count` przechodzą bez utraty;
+- owner/event sidecar detail nie występuje w wire i nie może zostać z niego
+  odtworzony;
+- semantic `CanonicalHashV1` przed i po wire round-trip jest identyczny.
+- ten sam input-head `fddd4d3a…` fixture, uruchomiony w odseparowanym worktree,
+  oraz bieżący domain fixture mają semantic hash
+  `61cf0429a8dd042070f18cf426f37f27983d055b91d4033df3a8311a78e5a09e`.
+
 ## 6. Atomic materialization proof
 
 - historical JSON po usunięciu pola deserializuje `None`;
@@ -122,17 +146,24 @@ MFS source guard wymaga dokładnie jednego pola
 
 ## 7. Resource gate
 
-Metryka rozmiaru używa deterministycznego bincode tego samego typed compact
-root. Canonical hash pozostaje RFC8785/canonical-JSON SHA-256.
+Normatywna metryka rozmiaru używa dokładnego nieskompresowanego Compact JSON
+Wire V1, który field-level serde osadza w MFS. Runtime hard gate, testy,
+telemetryka i release harness wywołują tę samą funkcję. Bincode oraz verbose
+domain JSON są wyłącznie osobno nazwanymi diagnostykami. Canonical hash
+pozostaje RFC8785/canonical-domain-JSON SHA-256 i nie hash-uje wire bytes.
 
 | Kryterium | Wynik |
 | --- | --- |
-| deterministic serialized size | `2780 B` standard fixture |
-| duży dozwolony fixture | `8932 B` |
+| deterministic Wire V1 JSON size | `2339 B` standard fixture |
+| duży dozwolony Wire V1 fixture | `8487 B` |
+| verbose domain JSON diagnostic | `20332 B` |
+| bincode diagnostic | `2780 B` |
 | p95 target `<= 12 KiB` | PASS |
 | hard max `<= 16 KiB` | PASS — guard aktywny |
 | oversized payload | `ProjectionTooLarge` |
-| release p50/p95/p99 | `509 / 753 / 874 us` |
+| release build/validate p50/p95/p99 | `515 / 619 / 738 us` |
+| release wire serialize p50/p95/p99 | `49 / 66 / 79 us` |
+| release combined p50/p95/p99 | `575 / 674 / 708 us` |
 | build failures | 0 w pozytywnych fixtures |
 | full/projection parity failures | 0 |
 
@@ -146,9 +177,9 @@ Surowe benchmark logs nie są commitowane.
 | `cargo test -p ghost-core --test metric_contracts_v1_1_projection` | PASS — 23/23 |
 | `cargo test -p ghost-launcher --test metric_contracts_pr2a_producers` | PASS — 26/26 |
 | `cargo test -p ghost-launcher --test metric_contracts_pr2a_static_guards` | PASS — 8/8 |
-| `metric_contracts_pr2b_producers` | PASS — 10/10 |
-| `metric_contracts_pr2b_static_guards` | PASS — 5/5 |
-| Flip V2 unit state machine | PASS — 7/7 |
+| `metric_contracts_pr2b_producers` | PASS — 16/16 |
+| `metric_contracts_pr2b_static_guards` | PASS — 6/6 |
+| Flip V2 unit state machine | PASS — 11/11 |
 | AccountState reserve velocity owner | PASS — 2/2 |
 | `gatekeeper_policy_tests` | PASS — 46/46 |
 | `gatekeeper_v25_regression` | PASS — 42/42 |
@@ -168,8 +199,8 @@ Surowe benchmark logs nie są commitowane.
 | `git diff --check` | PASS |
 
 Targeted Clippy raportuje istniejący szeroki baseline warningów poza
-zmienionymi liniami. Nowy `double_must_use` i nieużywany test wrapper wykryte w
-trakcie walidacji zostały usunięte.
+zmienionymi liniami. Nowe warningi w amendment-owned liniach wykryte w trakcie
+walidacji zostały usunięte; oba targeted przebiegi kończą się kodem `0`.
 
 ### 8.1. Oddzielony baseline failure
 
@@ -203,17 +234,12 @@ aktywuje `DualCompute` ani V2.
 ## 10. Markery końcowe
 
 ```text
-PR2B_FLIP_V2_STATE_MACHINE_PASS
-PR2B_MANIPULATION_PRESENCE_AWARE_EVIDENCE_PASS
-PR2B_RESERVE_VELOCITY_TYPED_EVIDENCE_PASS
-PR2B_RECENT_BUY_SELL_TYPED_EVIDENCE_PASS
-PR2B_EFFECTIVE_CONFIG_KEY_COVERAGE_CLOSED
-PR2B_ONE_PRODUCER_ONE_SNAPSHOT_TWO_REPRESENTATIONS_PASS
-PR2B_MFS_ATOMIC_PROJECTION_MATERIALIZATION_PASS
-PR2B_PROJECTION_RESOURCE_GATE_PASS
-GATEKEEPER_POLICY_UNCHANGED
-V3_V1_REPLAY_UNCHANGED
-TYPE5_NOT_STARTED
-METRIC_CONTRACTS_V1_1_EVIDENCE_PRODUCERS_READY
-PR2B_READY_FOR_REVIEW
+METRIC_CONTRACT_PROJECTION_WIRE_V1_PLAN_AMENDMENT_PASS
+PR2B_COMPACT_JSON_WIRE_V1_ROUNDTRIP_PASS
+PR2B_SEMANTIC_HASH_INDEPENDENT_OF_WIRE_PASS
+PR2B_ACTUAL_MFS_SERIALIZATION_RESOURCE_GATE_PASS
+PR2B_MANIPULATION_TRUE_PER_FIELD_PRESENCE_PASS
+PR2B_FLIP_IDENTITY_ORDER_SEPARATION_PASS
+PR2B_REVIEW_BLOCKERS_CLOSED
+PR2B_READY_FOR_RE_REVIEW
 ```

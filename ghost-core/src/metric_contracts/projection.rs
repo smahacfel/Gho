@@ -307,7 +307,11 @@ impl MetricContractDecisionEvidenceProjectionV1 {
         context: &MetricDecisionProjectionBuildContextV1<'_>,
     ) -> Result<CanonicalHashV1, MetricContractProjectionErrorV1> {
         self.validate_context(context)?;
-        let serialized_bytes = self.deterministic_serialized_size_bytes()?;
+        let serialized_bytes = self.authoritative_serialized_size_bytes()?;
+        ::metrics::histogram!(
+            "metric_contract_projection_serialized_bytes",
+            serialized_bytes as f64
+        );
         if serialized_bytes > METRIC_CONTRACT_PROJECTION_SERIALIZED_HARD_MAX_BYTES_V1 {
             return Err(MetricContractProjectionErrorV1::ProjectionTooLarge {
                 actual_bytes: serialized_bytes,
@@ -317,9 +321,33 @@ impl MetricContractDecisionEvidenceProjectionV1 {
         CanonicalHashV1::digest(self).map_err(MetricContractProjectionErrorV1::Hash)
     }
 
-    pub fn deterministic_serialized_size_bytes(
+    /// Exact uncompressed Compact JSON Wire V1 representation embedded by the
+    /// field-level `MaterializedFeatureSet` serializer. Domain serde and the
+    /// canonical semantic hash intentionally remain independent of this wire.
+    pub fn authoritative_serialized_bytes(
+        &self,
+    ) -> Result<Vec<u8>, MetricContractProjectionErrorV1> {
+        super::MetricContractDecisionProjectionWireV1::try_from_domain(self)?
+            .json_bytes()
+            .map_err(Into::into)
+    }
+
+    pub fn authoritative_serialized_size_bytes(
         &self,
     ) -> Result<usize, MetricContractProjectionErrorV1> {
+        self.authoritative_serialized_bytes()
+            .map(|bytes| bytes.len())
+    }
+
+    pub fn verbose_domain_json_diagnostic_size_bytes(
+        &self,
+    ) -> Result<usize, MetricContractProjectionErrorV1> {
+        serde_json::to_vec(self)
+            .map(|bytes| bytes.len())
+            .map_err(|_| MetricContractProjectionErrorV1::ProjectionSerialization)
+    }
+
+    pub fn bincode_diagnostic_size_bytes(&self) -> Result<usize, MetricContractProjectionErrorV1> {
         bincode::serialize(self)
             .map(|bytes| bytes.len())
             .map_err(|_| MetricContractProjectionErrorV1::ProjectionSerialization)
@@ -678,6 +706,8 @@ pub enum MetricContractProjectionErrorV1 {
     Envelope(#[from] MetricEvidenceEnvelopeErrorV1),
     #[error(transparent)]
     EvidenceSemantics(#[from] MetricContractEvidenceSemanticErrorV1),
+    #[error(transparent)]
+    Wire(#[from] super::MetricContractProjectionWireErrorV1),
     #[error("compact projection deterministic serialization failed")]
     ProjectionSerialization,
     #[error("duplicate reason code in compact projection input")]

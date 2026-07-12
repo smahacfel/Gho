@@ -955,8 +955,9 @@ impl MetricContractsEvidenceSetV1 {
         ) {
             (MetricAvailabilityV1::Available, MetricMeasurementQualityV1::Measured)
                 if manipulation.fields.iter().all(|field| {
-                    field.value.is_null()
-                        || field.measurement_quality == MetricMeasurementQualityV1::Measured
+                    !field.value.is_null()
+                        && field.availability == MetricAvailabilityV1::Available
+                        && field.measurement_quality == MetricMeasurementQualityV1::Measured
                 }) => {}
             (MetricAvailabilityV1::Available, MetricMeasurementQualityV1::Degraded)
                 if manipulation.fields.iter().all(|field| {
