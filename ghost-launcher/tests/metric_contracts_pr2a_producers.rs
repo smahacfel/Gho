@@ -7,7 +7,7 @@ use ghost_launcher::events::{PoolTransaction, RawBytesMissingReason};
 use ghost_launcher::metric_contracts::{
     build_dev_buy_evidence_v1, build_fsc_status_evidence_v1, build_ftdi_evidence_v1,
     build_funding_evidence_v1, build_top3_evidence_v1, build_tx_timing_evidence_v1,
-    resolve_metric_contract_effective_config_v1, Pr2aEvidenceBuildContextV1,
+    resolve_metric_contract_effective_config_v1, Pr2aEvidenceBuildContextV1, Pr2aProducerErrorV1,
 };
 use ghost_launcher::session::{OpenSessionRequest, SessionConfig, SessionManager};
 use ghost_launcher::tx_intelligence::{
@@ -122,6 +122,21 @@ fn runtime_contract_context() -> (
         tx_config,
         funding,
     )
+}
+
+fn rehashed_runtime_config_with_value(
+    resolved: &ResolvedMetricContractEffectiveConfigV1,
+    key: MetricEffectiveConfigKeyV1,
+    value: MetricEffectiveConfigValueV1,
+) -> ResolvedMetricContractEffectiveConfigV1 {
+    let mut payload = resolved.payload.clone();
+    payload
+        .entries
+        .iter_mut()
+        .find(|entry| entry.key == key)
+        .unwrap()
+        .value = value;
+    ResolvedMetricContractEffectiveConfigV1::try_from_payload(payload).unwrap()
 }
 
 fn recent_exact_snapshot_for_same_timestamp(successes: &[bool]) -> TxTimingProducerSnapshotV1 {
@@ -743,6 +758,184 @@ fn resolved_effective_config_is_deterministic_sensitive_and_rejects_producer_mis
         None,
     )
     .is_err());
+}
+
+#[test]
+fn runtime_resolved_config_keeps_legacy_window_and_fsc_minimum() {
+    let (profile, resolved, gatekeeper, tx_config, funding) = runtime_contract_context();
+    assert_eq!(
+        resolved.value(MetricEffectiveConfigKeyV1::SameMsRecentWindowMs),
+        Some(&MetricEffectiveConfigValueV1::WideUnsigned(
+            CanonicalU64StringV1::new(10_000)
+        ))
+    );
+    assert_eq!(
+        resolved.value(MetricEffectiveConfigKeyV1::FscLegacyMinKnownSourceSamples),
+        Some(&MetricEffectiveConfigValueV1::WideUnsigned(
+            CanonicalU64StringV1::new(2)
+        ))
+    );
+
+    let evidence_context = Pr2aEvidenceBuildContextV1 {
+        rollout_mode: MetricContractRolloutMode::Legacy,
+        profile: &profile,
+        effective_config: &resolved,
+    };
+    let candidate = EnhancedCandidate::default();
+    let engine = TxIntelligenceEngine::new(tx_config, &candidate, None);
+    let features = engine.compute_features();
+    let snapshot = engine.metric_contract_snapshot(&features);
+    let recent = TxTimingProducerSnapshotV1 {
+        numerator: 0,
+        denominator: 0,
+        ratio: None,
+        canonical_dedupe_applied: true,
+        dust_filter_sol: None,
+        window_ms: Some(10_000),
+        fallback_timestamp_count: 0,
+        fallback_ordering_count: 0,
+        source_complete: true,
+        source_state_capacity: Some(
+            u64::try_from(gatekeeper.decision_time_series_tx_capacity.max(1)).unwrap(),
+        ),
+    };
+    let timing = build_tx_timing_evidence_v1(&snapshot, &recent, &evidence_context).unwrap();
+    let fsc = FundingSourceIndex::new()
+        .compute_for_transactions(std::iter::empty::<&PoolTransaction>(), &funding);
+    let funding_evidence = build_funding_evidence_v1(&fsc, &funding, &evidence_context).unwrap();
+    let projection_context = MetricDecisionProjectionBuildContextV1 {
+        rollout_mode: MetricContractRolloutMode::Legacy,
+        profile: &profile,
+        effective_config: &resolved,
+        source_cutoff: MetricContractDecisionSourceCutoffV1::try_new(10_000, Some(1)).unwrap(),
+    };
+    TxTimingDecisionProjectionV1::try_from_evidence(&timing, &projection_context).unwrap();
+    FundingDecisionProjectionV1::try_from_evidence(&funding_evidence, &projection_context).unwrap();
+}
+
+#[test]
+fn rehashed_non_compact_config_drift_is_rejected_at_frozen_producer_boundaries() {
+    let (profile, resolved, gatekeeper, tx_config, funding) = runtime_contract_context();
+    let candidate = EnhancedCandidate::default();
+    let engine = TxIntelligenceEngine::new(tx_config, &candidate, None);
+    let features = engine.compute_features();
+    let snapshot = engine.metric_contract_snapshot(&features);
+    let compatibility = GatekeeperDevPrimaryCompatibilitySnapshotV1 {
+        amount_sol: None,
+        creator_known: false,
+        create_signature: None,
+        create_signature_matched: false,
+        selection_mode: DevBuySelectionModeV1::NoEligibleBuy,
+        selected_signature: None,
+        selected_slot: None,
+        selected_transaction_index: None,
+        eligible_buy_count: 0,
+        selected_success: None,
+    };
+    let recent = TxTimingProducerSnapshotV1 {
+        numerator: 0,
+        denominator: 0,
+        ratio: None,
+        canonical_dedupe_applied: true,
+        dust_filter_sol: None,
+        window_ms: Some(10_000),
+        fallback_timestamp_count: 0,
+        fallback_ordering_count: 0,
+        source_complete: true,
+        source_state_capacity: Some(
+            u64::try_from(gatekeeper.decision_time_series_tx_capacity.max(1)).unwrap(),
+        ),
+    };
+    let ftdi = compute_ftdi(std::iter::empty::<&PoolTransaction>());
+    let fsc = FundingSourceIndex::new()
+        .compute_for_transactions(std::iter::empty::<&PoolTransaction>(), &funding);
+
+    let assert_boundary_rejects =
+        |config: &ResolvedMetricContractEffectiveConfigV1,
+         result: Result<(), Pr2aProducerErrorV1>| {
+            assert_ne!(
+                config.metric_contract_effective_config_hash,
+                resolved.metric_contract_effective_config_hash
+            );
+            assert!(matches!(
+                result,
+                Err(Pr2aProducerErrorV1::ProducerConfigMismatch(_))
+            ));
+        };
+
+    let config = rehashed_runtime_config_with_value(
+        &resolved,
+        MetricEffectiveConfigKeyV1::FtdiMissingSignerBehavior,
+        MetricEffectiveConfigValueV1::Enum("drop_missing_signer".to_string()),
+    );
+    let context = Pr2aEvidenceBuildContextV1 {
+        rollout_mode: MetricContractRolloutMode::Legacy,
+        profile: &profile,
+        effective_config: &config,
+    };
+    assert_boundary_rejects(&config, build_ftdi_evidence_v1(&ftdi, &context).map(|_| ()));
+
+    let config = rehashed_runtime_config_with_value(
+        &resolved,
+        MetricEffectiveConfigKeyV1::DevTxIntelDedupeKey,
+        MetricEffectiveConfigValueV1::Enum("signature_only".to_string()),
+    );
+    let context = Pr2aEvidenceBuildContextV1 {
+        rollout_mode: MetricContractRolloutMode::Legacy,
+        profile: &profile,
+        effective_config: &config,
+    };
+    assert_boundary_rejects(
+        &config,
+        build_dev_buy_evidence_v1(&snapshot, &compatibility, &context).map(|_| ()),
+    );
+
+    let config = rehashed_runtime_config_with_value(
+        &resolved,
+        MetricEffectiveConfigKeyV1::SameMsRecentDedupeKey,
+        MetricEffectiveConfigValueV1::Enum("signature_only".to_string()),
+    );
+    let context = Pr2aEvidenceBuildContextV1 {
+        rollout_mode: MetricContractRolloutMode::Legacy,
+        profile: &profile,
+        effective_config: &config,
+    };
+    assert_boundary_rejects(
+        &config,
+        build_tx_timing_evidence_v1(&snapshot, &recent, &context).map(|_| ()),
+    );
+
+    let config = rehashed_runtime_config_with_value(
+        &resolved,
+        MetricEffectiveConfigKeyV1::Top3MismatchBehavior,
+        MetricEffectiveConfigValueV1::Enum("alias_authoritative".to_string()),
+    );
+    let context = Pr2aEvidenceBuildContextV1 {
+        rollout_mode: MetricContractRolloutMode::Legacy,
+        profile: &profile,
+        effective_config: &config,
+    };
+    assert_boundary_rejects(
+        &config,
+        build_top3_evidence_v1(&snapshot, &context).map(|_| ()),
+    );
+
+    let config = rehashed_runtime_config_with_value(
+        &resolved,
+        MetricEffectiveConfigKeyV1::FscFundingLookbackWindowMs,
+        MetricEffectiveConfigValueV1::WideUnsigned(CanonicalU64StringV1::new(
+            funding.lookback_window_ms + 1,
+        )),
+    );
+    let context = Pr2aEvidenceBuildContextV1 {
+        rollout_mode: MetricContractRolloutMode::Legacy,
+        profile: &profile,
+        effective_config: &config,
+    };
+    assert_boundary_rejects(
+        &config,
+        build_funding_evidence_v1(&fsc, &funding, &context).map(|_| ()),
+    );
 }
 
 #[test]

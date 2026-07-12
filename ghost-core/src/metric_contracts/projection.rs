@@ -19,8 +19,6 @@ use thiserror::Error;
 pub const METRIC_CONTRACT_DECISION_PROJECTION_SCHEMA_VERSION_V1: u16 = 1;
 pub const METRIC_DECISION_MAX_REASON_CODES_PER_VALUE_V1: usize = 8;
 pub const METRIC_CONTRACT_PRODUCER_SCHEMA_VERSION_V1: u16 = 1;
-pub const TX_TIMING_RECENT_EXACT_WINDOW_MS_V1: u32 = 10_000;
-const FSC_LEGACY_MIN_KNOWN_SOURCE_SAMPLES_V1: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -510,12 +508,13 @@ impl MetricContractDecisionEvidenceProjectionV1 {
         self.recent_buy_sell.buy_share.validate()?;
         self.fee_topology_diversity_index
             .validate_semantics(context)?;
-        self.dev_buy.validate_semantics()?;
-        self.same_ms_tx_ratio.validate_semantics()?;
-        self.top3_signer_volume_ratio.validate_semantics()?;
-        self.funding_source_concentration.validate_semantics()?;
+        self.dev_buy.validate_semantics(context)?;
+        self.same_ms_tx_ratio.validate_semantics(context)?;
+        self.top3_signer_volume_ratio.validate_semantics(context)?;
+        self.funding_source_concentration
+            .validate_semantics(context)?;
         self.fsc_evidence_status
-            .validate_semantics(&self.funding_source_concentration)?;
+            .validate_semantics(&self.funding_source_concentration, context)?;
         Ok(())
     }
 }
@@ -649,6 +648,11 @@ pub enum MetricContractProjectionErrorV1 {
     UnsupportedProjectionSchema(u16),
     #[error("projection family invariant failed: {0}")]
     FamilyInvariant(&'static str),
+    #[error("projection/effective-config parity failed for {key:?}: {invariant}")]
+    EffectiveConfigParity {
+        key: MetricEffectiveConfigKeyV1,
+        invariant: &'static str,
+    },
 }
 
 fn compact_envelope(
@@ -820,7 +824,31 @@ fn effective_config_wide_unsigned(
 ) -> Result<u64, MetricContractProjectionErrorV1> {
     match context.effective_config.value(key) {
         Some(MetricEffectiveConfigValueV1::WideUnsigned(value)) => Ok(value.get()),
-        _ => Err(MetricContractProjectionErrorV1::FamilyInvariant(invariant)),
+        _ => Err(MetricContractProjectionErrorV1::EffectiveConfigParity { key, invariant }),
+    }
+}
+
+fn effective_config_enum_matches(
+    context: &MetricDecisionProjectionBuildContextV1<'_>,
+    key: MetricEffectiveConfigKeyV1,
+    expected: &'static str,
+    invariant: &'static str,
+) -> Result<(), MetricContractProjectionErrorV1> {
+    match context.effective_config.value(key) {
+        Some(MetricEffectiveConfigValueV1::Enum(actual)) if actual == expected => Ok(()),
+        _ => Err(MetricContractProjectionErrorV1::EffectiveConfigParity { key, invariant }),
+    }
+}
+
+fn effective_config_boolean_matches(
+    context: &MetricDecisionProjectionBuildContextV1<'_>,
+    key: MetricEffectiveConfigKeyV1,
+    expected: bool,
+    invariant: &'static str,
+) -> Result<(), MetricContractProjectionErrorV1> {
+    match context.effective_config.value(key) {
+        Some(MetricEffectiveConfigValueV1::Boolean(actual)) if *actual == expected => Ok(()),
+        _ => Err(MetricContractProjectionErrorV1::EffectiveConfigParity { key, invariant }),
     }
 }
 
@@ -829,6 +857,36 @@ impl FtdiDecisionProjectionV1 {
         &self,
         context: &MetricDecisionProjectionBuildContextV1<'_>,
     ) -> Result<(), MetricContractProjectionErrorV1> {
+        for (key, expected, invariant) in [
+            (
+                MetricEffectiveConfigKeyV1::FtdiPopulationSuccessfulBuy,
+                "successful_buy",
+                "FTDI population semantics",
+            ),
+            (
+                MetricEffectiveConfigKeyV1::FtdiDenominatorRule,
+                "unique_topologies_over_unique_first_buyer_samples",
+                "FTDI denominator semantics",
+            ),
+            (
+                MetricEffectiveConfigKeyV1::FtdiMissingSignerBehavior,
+                "legacy_empty_signer_identity",
+                "FTDI missing-signer semantics",
+            ),
+            (
+                MetricEffectiveConfigKeyV1::FtdiMissingTopologyBehavior,
+                "unavailable_entire_metric",
+                "FTDI missing-topology semantics",
+            ),
+        ] {
+            effective_config_enum_matches(context, key, expected, invariant)?;
+        }
+        effective_config_boolean_matches(
+            context,
+            MetricEffectiveConfigKeyV1::FtdiFirstSamplePerSigner,
+            true,
+            "FTDI first-sample-per-signer semantics",
+        )?;
         if !nullable_f64_bits_equal(&self.legacy_value.value, &self.value_v1.value) {
             return Err(MetricContractProjectionErrorV1::FamilyInvariant(
                 "FTDI legacy/typed value parity",
@@ -881,6 +939,17 @@ impl FtdiDecisionProjectionV1 {
             MetricEffectiveConfigKeyV1::FtdiCandidateCleanMinUniqueBuyers,
             "FTDI corrected sample gate config",
         )?;
+        let diagnostic_gate = effective_config_wide_unsigned(
+            context,
+            MetricEffectiveConfigKeyV1::FtdiDiagnosticMinUniqueBuyers,
+            "FTDI diagnostic sample gate config",
+        )?;
+        if value_present && u64::from(self.unique_buyer_sample_count) < diagnostic_gate {
+            return Err(MetricContractProjectionErrorV1::EffectiveConfigParity {
+                key: MetricEffectiveConfigKeyV1::FtdiDiagnosticMinUniqueBuyers,
+                invariant: "measured FTDI value is below configured diagnostic sample gate",
+            });
+        }
         let expected_legacy =
             value_present && u64::from(self.buy_transaction_sample_count) >= legacy_gate;
         let expected_corrected =
@@ -981,7 +1050,40 @@ impl FtdiDecisionProjectionV1 {
 }
 
 impl DevBuyDecisionProjectionV1 {
-    pub fn validate_semantics(&self) -> Result<(), MetricContractProjectionErrorV1> {
+    pub fn validate_semantics(
+        &self,
+        context: &MetricDecisionProjectionBuildContextV1<'_>,
+    ) -> Result<(), MetricContractProjectionErrorV1> {
+        for (key, expected, invariant) in [
+            (
+                MetricEffectiveConfigKeyV1::DevTxIntelSuccessEligibility,
+                "accepted_successful_or_failed",
+                "dev first-observed eligibility semantics",
+            ),
+            (
+                MetricEffectiveConfigKeyV1::DevFirstObservedAnchorRule,
+                "first_accepted_creator_buy_in_ingest_order",
+                "dev first-observed anchor semantics",
+            ),
+            (
+                MetricEffectiveConfigKeyV1::DevPrimaryAnchorRule,
+                "create_signature_then_earliest_eligible_creator_buy",
+                "dev primary selection semantics",
+            ),
+            (
+                MetricEffectiveConfigKeyV1::DevMissingCreatorBehavior,
+                "unavailable",
+                "dev missing-creator semantics",
+            ),
+        ] {
+            effective_config_enum_matches(context, key, expected, invariant)?;
+        }
+        effective_config_boolean_matches(
+            context,
+            MetricEffectiveConfigKeyV1::DevPrimarySuccessRequired,
+            true,
+            "dev primary success requirement",
+        )?;
         if !nullable_f64_bits_equal(
             &self.tx_intel_first_observed.value,
             &self.mfs_first_observed.value,
@@ -1095,7 +1197,7 @@ impl DevBuyDecisionProjectionV1 {
             primary_selection_mode: evidence.mfs_primary_v1.selection_mode,
             primary_eligible_buy_count: evidence.mfs_primary_v1.eligible_buy_count,
         };
-        projection.validate_semantics()?;
+        projection.validate_semantics(context)?;
         Ok(projection)
     }
 }
@@ -1152,7 +1254,45 @@ impl MetricDecisionRatioV1 {
 }
 
 impl TxTimingDecisionProjectionV1 {
-    pub fn validate_semantics(&self) -> Result<(), MetricContractProjectionErrorV1> {
+    pub fn validate_semantics(
+        &self,
+        context: &MetricDecisionProjectionBuildContextV1<'_>,
+    ) -> Result<(), MetricContractProjectionErrorV1> {
+        for (key, expected, invariant) in [
+            (
+                MetricEffectiveConfigKeyV1::SameMsLegacyPopulation,
+                "accepted_non_dust_successful_or_failed",
+                "legacy timing population semantics",
+            ),
+            (
+                MetricEffectiveConfigKeyV1::SameMsLegacyDenominatorRule,
+                "adjacent_exact_collisions_over_transaction_count",
+                "legacy timing denominator semantics",
+            ),
+            (
+                MetricEffectiveConfigKeyV1::SameMsRecentPopulation,
+                "successful_accepted_recent_window",
+                "recent timing population semantics",
+            ),
+            (
+                MetricEffectiveConfigKeyV1::SameMsRecentDenominatorRule,
+                "same_timestamp_extras_over_transaction_count",
+                "recent timing denominator semantics",
+            ),
+        ] {
+            effective_config_enum_matches(context, key, expected, invariant)?;
+        }
+        let recent_window_ms = effective_config_wide_unsigned(
+            context,
+            MetricEffectiveConfigKeyV1::SameMsRecentWindowMs,
+            "recent timing window must be a wide unsigned value",
+        )?;
+        let recent_window_ms = u32::try_from(recent_window_ms).map_err(|_| {
+            MetricContractProjectionErrorV1::EffectiveConfigParity {
+                key: MetricEffectiveConfigKeyV1::SameMsRecentWindowMs,
+                invariant: "recent timing window does not fit compact u32 representation",
+            }
+        })?;
         for ratio in [
             &self.legacy_exact,
             &self.exact_v1,
@@ -1184,12 +1324,12 @@ impl TxTimingDecisionProjectionV1 {
         if !self.legacy_exact.window_ms.is_null()
             || !self.exact_v1.window_ms.is_null()
             || !self.cluster_lt_50ms.window_ms.is_null()
-            || self.recent_exact.window_ms
-                != CanonicalNullableV1::Value(TX_TIMING_RECENT_EXACT_WINDOW_MS_V1)
+            || self.recent_exact.window_ms != CanonicalNullableV1::Value(recent_window_ms)
         {
-            return Err(MetricContractProjectionErrorV1::FamilyInvariant(
-                "timing window contract",
-            ));
+            return Err(MetricContractProjectionErrorV1::EffectiveConfigParity {
+                key: MetricEffectiveConfigKeyV1::SameMsRecentWindowMs,
+                invariant: "compact recent timing window disagrees with effective config",
+            });
         }
         if self.cluster_lt_50ms.surface.envelope.policy_actionable
             || self.recent_exact.surface.envelope.policy_actionable
@@ -1239,13 +1379,40 @@ impl TxTimingDecisionProjectionV1 {
                 context,
             )?,
         };
-        projection.validate_semantics()?;
+        projection.validate_semantics(context)?;
         Ok(projection)
     }
 }
 
 impl Top3DecisionProjectionV1 {
-    pub fn validate_semantics(&self) -> Result<(), MetricContractProjectionErrorV1> {
+    pub fn validate_semantics(
+        &self,
+        context: &MetricDecisionProjectionBuildContextV1<'_>,
+    ) -> Result<(), MetricContractProjectionErrorV1> {
+        for (key, expected, invariant) in [
+            (
+                MetricEffectiveConfigKeyV1::Top3PreferredField,
+                "top3_signer_volume_ratio",
+                "top3 preferred-field semantics",
+            ),
+            (
+                MetricEffectiveConfigKeyV1::Top3FallbackAlias,
+                "top3_volume_pct",
+                "top3 fallback-alias semantics",
+            ),
+            (
+                MetricEffectiveConfigKeyV1::Top3Scale,
+                "ratio_0_1",
+                "top3 scale semantics",
+            ),
+            (
+                MetricEffectiveConfigKeyV1::Top3MismatchBehavior,
+                "preferred_authoritative_emit_mismatch_telemetry",
+                "top3 mismatch semantics",
+            ),
+        ] {
+            effective_config_enum_matches(context, key, expected, invariant)?;
+        }
         for value in [
             &self.preferred.value,
             &self.compatibility_alias.value,
@@ -1338,7 +1505,7 @@ impl Top3DecisionProjectionV1 {
             preferred_alias_bitwise_equal: evidence.preferred_alias_bitwise_equal.clone(),
             used_compatibility_fallback: evidence.used_compatibility_fallback,
         };
-        projection.validate_semantics()?;
+        projection.validate_semantics(context)?;
         Ok(projection)
     }
 }
@@ -1358,7 +1525,33 @@ fn field_value_from_envelope<T: Clone>(
 }
 
 impl FundingDecisionProjectionV1 {
-    pub fn validate_semantics(&self) -> Result<(), MetricContractProjectionErrorV1> {
+    pub fn validate_semantics(
+        &self,
+        context: &MetricDecisionProjectionBuildContextV1<'_>,
+    ) -> Result<(), MetricContractProjectionErrorV1> {
+        effective_config_enum_matches(
+            context,
+            MetricEffectiveConfigKeyV1::FscLegacyFormula,
+            "one_minus_distinct_known_sources_over_known_source_samples",
+            "legacy FSC formula semantics",
+        )?;
+        effective_config_enum_matches(
+            context,
+            MetricEffectiveConfigKeyV1::FscFundingStreamUnavailableBehavior,
+            "legacy_null_and_v2_unavailable",
+            "FSC unavailable-stream semantics",
+        )?;
+        let minimum_known_samples = effective_config_wide_unsigned(
+            context,
+            MetricEffectiveConfigKeyV1::FscLegacyMinKnownSourceSamples,
+            "legacy FSC minimum must be a wide unsigned value",
+        )?;
+        if minimum_known_samples == 0 {
+            return Err(MetricContractProjectionErrorV1::EffectiveConfigParity {
+                key: MetricEffectiveConfigKeyV1::FscLegacyMinKnownSourceSamples,
+                invariant: "legacy FSC minimum must keep the denominator non-zero",
+            });
+        }
         if !nullable_f64_bits_equal(&self.legacy_source.value, &self.legacy_v1.value) {
             return Err(MetricContractProjectionErrorV1::FamilyInvariant(
                 "legacy FSC value parity",
@@ -1369,11 +1562,17 @@ impl FundingDecisionProjectionV1 {
                 "legacy FSC source counts",
             ));
         }
-        if self.known_source_sample_count < FSC_LEGACY_MIN_KNOWN_SOURCE_SAMPLES_V1 {
-            if !self.legacy_source.value.is_null() || !self.legacy_v1.value.is_null() {
-                return Err(MetricContractProjectionErrorV1::FamilyInvariant(
-                    "legacy FSC requires two known samples",
-                ));
+        if u64::from(self.known_source_sample_count) < minimum_known_samples {
+            if !self.legacy_source.value.is_null()
+                || !self.legacy_v1.value.is_null()
+                || self.legacy_source.envelope.availability
+                    == super::MetricAvailabilityV1::Available
+                || self.legacy_v1.envelope.availability == super::MetricAvailabilityV1::Available
+            {
+                return Err(MetricContractProjectionErrorV1::EffectiveConfigParity {
+                    key: MetricEffectiveConfigKeyV1::FscLegacyMinKnownSourceSamples,
+                    invariant: "legacy FSC below configured minimum must be null and non-available",
+                });
             }
         } else {
             let expected = 1.0
@@ -1494,7 +1693,7 @@ impl FundingDecisionProjectionV1 {
             known_buyer_count: evidence.known_buyer_count,
             total_buyer_count: evidence.total_buyer_count,
         };
-        projection.validate_semantics()?;
+        projection.validate_semantics(context)?;
         Ok(projection)
     }
 }
@@ -1503,7 +1702,20 @@ impl FscStatusDecisionProjectionV1 {
     pub fn validate_semantics(
         &self,
         funding: &FundingDecisionProjectionV1,
+        context: &MetricDecisionProjectionBuildContextV1<'_>,
     ) -> Result<(), MetricContractProjectionErrorV1> {
+        effective_config_enum_matches(
+            context,
+            MetricEffectiveConfigKeyV1::FscLegacyStatusMapping,
+            "legacy_scalar_presence_compatibility",
+            "FSC legacy status mapping",
+        )?;
+        effective_config_enum_matches(
+            context,
+            MetricEffectiveConfigKeyV1::FscV2StatusMapping,
+            "decision_time_status_coverage_lane_health",
+            "FSC v2 status mapping",
+        )?;
         let legacy_value_present = !funding.legacy_source.value.is_null();
         if self.legacy_scalar_present != legacy_value_present
             || self.compatibility_status.value

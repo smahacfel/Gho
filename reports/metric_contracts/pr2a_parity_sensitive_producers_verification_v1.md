@@ -4,7 +4,7 @@ Status: `VERIFICATION_COMPLETE / READY_FOR_RE_REVIEW / REVIEW_BLOCKERS_CLOSED / 
 
 Data: 2026-07-12
 
-Repo: `/root/Gho_dynamic_exit_v1`
+Repo: `smahacfel/Gho`
 
 Branch: `agent/metric-contract-pr2a-producers`
 
@@ -27,6 +27,8 @@ Raport weryfikuje:
 7. compatibility starych konfiguracji i historycznych statusów;
 8. fail-closed value/status i family semantic validation przed hashowaniem;
 9. ewaluowalność domkniętego recent-exact window o zerowej szerokości.
+10. pełne związanie compact family semantics z dokładnym, poprawnie
+    zahashowanym `ResolvedMetricContractEffectiveConfigV1`.
 
 Nie jest to burn-in, PR2B, PR2C, PR3 ani Type-5 T1 evidence.
 
@@ -35,8 +37,8 @@ Nie jest to burn-in, PR2B, PR2C, PR3 ani Type-5 T1 evidence.
 | Komenda | Wynik | Dowód |
 | --- | --- | --- |
 | `cargo test -p ghost-core --test metric_contracts_v1_1_foundation` | PASS, 15/15 | registry/profile/hash/status/effective-config foundation |
-| `cargo test -p ghost-core --test metric_contracts_v1_1_projection` | PASS, 12/12 | closed root, validated hash, value/status coherence, family semantics, builders i negative serde/config |
-| `cargo test -p ghost-launcher --test metric_contracts_pr2a_producers` | PASS, 16/16 | FTDI/dev/timing/top3/FSC producers, config binding i zero-width recent exact |
+| `cargo test -p ghost-core --test metric_contracts_v1_1_projection` | PASS, 18/18 | closed root, validated hash, value/status coherence, family/config semantics, context-driven timing/FSC i negative serde/config |
+| `cargo test -p ghost-launcher --test metric_contracts_pr2a_producers` | PASS, 18/18 | FTDI/dev/timing/top3/FSC producers, runtime config defaults, frozen-boundary config binding i zero-width recent exact |
 | `cargo test -p ghost-launcher --test metric_contracts_pr2a_static_guards` | PASS, 7/7 | forbidden activation i one-owner guards |
 | `cargo test -p ghost-launcher --lib reversed_recent_window_remains_empty` | PASS, 1/1 | `start > end` pozostaje pustym oknem |
 | `cargo test -p ghost-launcher --test gatekeeper_policy_tests` | PASS, 46/46 | V2 policy parity |
@@ -91,7 +93,7 @@ Pokrycie testów:
 - PR2B family types nie mają builderów;
 - `MaterializedFeatureSet` nie ma root projection field.
 
-### 3.1 Zamknięcie dwóch blokerów review
+### 3.1 Zamknięcie pierwszych dwóch blokerów review
 
 Bloker 1 miał dwie przyczyny źródłowe:
 
@@ -135,6 +137,45 @@ start > end      => pusty wynik
 
 Recent exact nadal jest `LoggingOnly`; static guard zabrania jego odczytu w
 aktywnym Gatekeeper policy.
+
+### 3.2 Zamknięcie effective-config/projection parity
+
+Po pierwszym amendmentcie poprawnie zahashowany config mógł nadal przeczyć
+compact projection, ponieważ family validators używały lokalnych stałych dla
+recent window i legacy FSC minimum. Naprawa:
+
+```text
+TxTimingDecisionProjectionV1::validate_semantics(context)
+FundingDecisionProjectionV1::validate_semantics(context)
+DevBuyDecisionProjectionV1::validate_semantics(context)
+Top3DecisionProjectionV1::validate_semantics(context)
+FtdiDecisionProjectionV1::validate_semantics(context)
+FscStatusDecisionProjectionV1::validate_semantics(funding, context)
+MetricContractProjectionErrorV1::EffectiveConfigParity
+```
+
+Core projection nie zawiera już
+`TX_TIMING_RECENT_EXACT_WINDOW_MS_V1` ani lokalnego
+`FSC_LEGACY_MIN_KNOWN_SOURCE_SAMPLES_V1`. `SameMsRecentWindowMs` jest czytany
+jako `WideUnsigned`, checked-konwertowany do `u32` i dokładnie porównywany z
+non-null `recent_exact.window_ms`. `FscLegacyMinKnownSourceSamples` pozostaje
+`u64` podczas porównania z `u32` count i steruje granicą null/measured.
+
+Testy z nowym poprawnym config hash dowodzą:
+
+```text
+config window=9_999, projection window=10_000 => EffectiveConfigParity
+config FSC min=3, measured legacy FSC przy 2 samples => EffectiveConfigParity
+config window=9_999, projection window=9_999 => validate + validated hash PASS
+config window > u32::MAX => checked-representation error
+```
+
+Audyt pozostałych zależności jawnie wiąże population/denominator FTDI i timing,
+dev eligibility/anchors/selection, top3 preferred/fallback/scale/mismatch oraz
+FSC formula/unavailable/status mappings. Producer-only dust/dedupe/capacity i
+source settings nie są dopisywane do compact payload: obowiązkowy frozen
+producer boundary porównuje je z effective-config. Osobny test zmienia je,
+przebudowuje config/hash i otrzymuje `ProducerConfigMismatch` dla każdej rodziny.
 
 ## 4. Parity proofs per family
 
@@ -198,9 +239,10 @@ bit-for-bit effective selector. Static guard wykazuje dokładnie jeden helper
 ### FSC
 
 Testy pokrywają zero known, one known, dwa i więcej known oraz same-funder
-concentration. Dla `known_source_sample_count < 2` value jest null i
-`Unavailable/NotApplicable`. Przy co najmniej dwóch próbkach builder wymaga
-bit-for-bit:
+concentration. Dla
+`known_source_sample_count < FscLegacyMinKnownSourceSamples` value jest null i
+`Unavailable/NotApplicable`. Od skonfigurowanego minimum builder/validator
+wymaga bit-for-bit:
 
 ```text
 1 - distinct_known_source_count / known_source_sample_count
@@ -219,6 +261,10 @@ fingerprint i FundingSource/FSC v2 settings. Testy wykazują:
 - niespójny Gatekeeper/TxIntel config jest odrzucany;
 - snapshot dust/capacity/window niezgodny z hash jest odrzucany;
 - FundingSourceConfig niezgodny z hash jest odrzucany;
+- poprawnie przebudowany i ponownie zahashowany config sprzeczny z compact
+  family semantics jest odrzucany przez `EffectiveConfigParity`;
+- klucze bez compact representation są fail-closed na frozen producer
+  boundary, również po poprawnym rehashu configu;
 - missing/duplicate/wrong-kind/non-finite/profile mismatch failuje zamknięcie.
 
 Resolved config jest przechowywany w `OracleRuntimeConfig`, ale PR2A nie
@@ -337,7 +383,6 @@ FSC_V2_EVIDENCE_ONLY
 PROJECTION_COMMON_SCHEMA_READY
 PROJECTION_PR2A_FAMILY_BUILDERS_READY
 MFS_ROOT_PROJECTION_NOT_ACTIVATED_IN_PR2A
-GATEKEEPER_POLICY_UNCHANGED
 DECISION_LOGGER_V33_UNCHANGED
 V3_REPLAY_V1_UNCHANGED
 DUAL_COMPUTE_NOT_ACTIVATED
@@ -346,7 +391,10 @@ PR2B_PLUS_BLOCKED_UNTIL_SEQUENTIAL_ACCEPTANCE
 PR2A_PROJECTION_VALUE_STATUS_INVARIANTS_PASS
 PR2A_FAMILY_SEMANTIC_VALIDATION_PASS
 PR2A_VALIDATED_HASH_PATH_PASS
+PR2A_EFFECTIVE_CONFIG_PROJECTION_PARITY_PASS
+PR2A_VALIDATED_HASH_CONTEXT_BINDING_PASS
 PR2A_RECENT_EXACT_ZERO_WIDTH_WINDOW_PASS
+GATEKEEPER_POLICY_UNCHANGED
 PR2A_REVIEW_BLOCKERS_CLOSED
 PR2A_READY_FOR_RE_REVIEW
 ```

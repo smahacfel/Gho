@@ -275,11 +275,38 @@ fn config_enum_matches(
 fn validate_ftdi_producer_config(
     context: &Pr2aEvidenceBuildContextV1<'_>,
 ) -> Result<(), Pr2aProducerErrorV1> {
-    config_enum_matches(
+    // These settings are not all reconstructable from the compact counts. They
+    // are therefore frozen and checked here, before full evidence or a compact
+    // projection can be built from the producer result.
+    for (key, expected, field) in [
+        (
+            MetricEffectiveConfigKeyV1::FtdiPopulationSuccessfulBuy,
+            "successful_buy",
+            "ftdi.population",
+        ),
+        (
+            MetricEffectiveConfigKeyV1::FtdiMissingSignerBehavior,
+            "legacy_empty_signer_identity",
+            "ftdi.missing_signer_behavior",
+        ),
+        (
+            MetricEffectiveConfigKeyV1::FtdiMissingTopologyBehavior,
+            "unavailable_entire_metric",
+            "ftdi.missing_topology_behavior",
+        ),
+        (
+            MetricEffectiveConfigKeyV1::FtdiDenominatorRule,
+            "unique_topologies_over_unique_first_buyer_samples",
+            "ftdi.denominator_rule",
+        ),
+    ] {
+        config_enum_matches(context, key, expected, field)?;
+    }
+    config_boolean_matches(
         context,
-        MetricEffectiveConfigKeyV1::FtdiPopulationSuccessfulBuy,
-        "successful_buy",
-        "ftdi.population",
+        MetricEffectiveConfigKeyV1::FtdiFirstSamplePerSigner,
+        true,
+        "ftdi.first_sample_per_signer",
     )?;
     config_wide_matches(
         context,
@@ -350,6 +377,35 @@ fn validate_tx_intelligence_snapshot_config(
         crate::tx_intelligence::BUNDLE_CLUSTER_THRESHOLD_MS,
         "timing.cluster_upper_bound_ms",
     )?;
+    for (key, expected, field) in [
+        (
+            MetricEffectiveConfigKeyV1::DevTxIntelDedupeKey,
+            "tx_key_v1",
+            "dev.tx_intel_dedupe_key",
+        ),
+        (
+            MetricEffectiveConfigKeyV1::DevPrimaryDedupeKey,
+            "tx_key_v1",
+            "dev.primary_dedupe_key",
+        ),
+        (
+            MetricEffectiveConfigKeyV1::SameMsLegacyPopulation,
+            "accepted_non_dust_successful_or_failed",
+            "timing.legacy_population",
+        ),
+        (
+            MetricEffectiveConfigKeyV1::SameMsLegacyDenominatorRule,
+            "adjacent_exact_collisions_over_transaction_count",
+            "timing.legacy_denominator_rule",
+        ),
+        (
+            MetricEffectiveConfigKeyV1::SameMsLegacyDedupeKey,
+            "tx_key_v1",
+            "timing.legacy_dedupe_key",
+        ),
+    ] {
+        config_enum_matches(context, key, expected, field)?;
+    }
 
     let expected_dust = Some(tx.producer_dust_filter_sol);
     if tx.exact_same_ms.dust_filter_sol != expected_dust
@@ -394,6 +450,12 @@ fn validate_dev_producer_config(
         MetricEffectiveConfigKeyV1::DevPrimaryAnchorRule,
         "create_signature_then_earliest_eligible_creator_buy",
         "dev.primary_anchor",
+    )?;
+    config_enum_matches(
+        context,
+        MetricEffectiveConfigKeyV1::DevMissingCreatorBehavior,
+        "unavailable",
+        "dev.missing_creator_behavior",
     )
 }
 
@@ -572,6 +634,25 @@ fn validate_recent_timing_snapshot_config(
         "truncate_with_status",
         "timing.recent_retention_policy",
     )?;
+    for (key, expected, field) in [
+        (
+            MetricEffectiveConfigKeyV1::SameMsRecentPopulation,
+            "successful_accepted_recent_window",
+            "timing.recent_population",
+        ),
+        (
+            MetricEffectiveConfigKeyV1::SameMsRecentDenominatorRule,
+            "same_timestamp_extras_over_transaction_count",
+            "timing.recent_denominator_rule",
+        ),
+        (
+            MetricEffectiveConfigKeyV1::SameMsRecentDedupeKey,
+            "gatekeeper_buffer_tx_key_v1",
+            "timing.recent_dedupe_key",
+        ),
+    ] {
+        config_enum_matches(context, key, expected, field)?;
+    }
     if snapshot.dust_filter_sol.is_some() || !snapshot.canonical_dedupe_applied {
         return Err(Pr2aProducerErrorV1::ProducerConfigMismatch(
             "timing.recent_snapshot",

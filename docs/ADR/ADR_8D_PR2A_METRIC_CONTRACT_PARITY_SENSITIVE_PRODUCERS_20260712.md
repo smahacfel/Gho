@@ -6,7 +6,7 @@ Typ: ADR-8D / cross-cutting producer, evidence i SSOT contract
 
 Data: 2026-07-12
 
-Repo: `/root/Gho_dynamic_exit_v1`
+Repo: `smahacfel/Gho`
 
 Branch: `agent/metric-contract-pr2a-producers`
 
@@ -96,9 +96,11 @@ Projection hash jest deterministycznym `CanonicalHashV1` pełnego semantic root.
 Publiczny kontrakt projection udostępnia wyłącznie
 `validated_canonical_hash(context)`: przed serializacją do canonical JSON i
 SHA-256 wykonuje pełne `validate_context()`, w tym walidację status/value oraz
-semantykę rodzin PR2A. Usunięto wcześniejszą metodę, która przed hashowaniem
-sprawdzała tylko wersję schema. Projection nie zawiera self-hash i nie
-zastępuje przyszłego SHA pełnego sidecara.
+semantykę rodzin PR2A związaną z tym samym
+`ResolvedMetricContractEffectiveConfigV1`, którego hash znajduje się w root.
+Usunięto wcześniejszą metodę, która przed hashowaniem sprawdzała tylko wersję
+schema. Projection nie zawiera self-hash i nie zastępuje przyszłego SHA pełnego
+sidecara.
 
 ### 2.2 Frozen inputs i zakaz recompute
 
@@ -132,12 +134,22 @@ złożony compact payload nie może przejść jako `Available + Null`,
 
 Root `validate_context()` uruchamia następnie jawne walidatory rodzin PR2A:
 
-- FTDI: value/count/parity oraz oddzielne legacy i corrected actionability;
-- dev-buy: first-observed/effective parity i fail-closed primary selection;
-- timing: count/ratio, population i window contracts;
-- top3: preferred/fallback/effective oraz skala ratio;
-- funding: legacy FSC formula/counts, v2 coverage i authority isolation;
-- FSC status: cross-check legacy presence oraz v2 readiness z funding family.
+- FTDI: value/count/parity, population/first-sample/denominator config oraz
+  oddzielne legacy i corrected actionability;
+- dev-buy: first-observed/effective parity oraz anchor/eligibility/selection
+  config;
+- timing: count/ratio i population/denominator/window config;
+- top3: preferred/fallback/effective oraz field/alias/scale config;
+- funding: legacy FSC formula i minimum pobrane z effective-config, counts, v2
+  coverage i authority isolation;
+- FSC status: cross-check legacy presence oraz v2 readiness z funding family i
+  status mappings z effective-config.
+
+Rozjazd tych semantyk ma dedykowany błąd `EffectiveConfigParity`. Klucze
+producer-only, których wartości nie mają reprezentacji w compact payload
+(np. dust, dedupe i capacity), są bezwarunkowo sprawdzane na frozen producer
+boundary przed utworzeniem full evidence; test zmienia taki config, przebudowuje
+jego hash i dowodzi odrzucenia przez `ProducerConfigMismatch`.
 
 Invarianty rodzin PR2B pozostają ich gate'em implementacyjnym, natomiast
 generic status/value coherence już obejmuje także ich publiczne field/surface
@@ -210,7 +222,7 @@ Zamrożono trzy różne populacje:
 ```text
 legacy/exact V1: accepted non-dust transactions, full observation
 cluster:          accepted non-dust transactions, adjacent delta < 50 ms
-recent exact:     successful transactions, recent 10 s RCE window
+recent exact:     successful transactions, recent effective-config RCE window
 ```
 
 Exact numerator pozostaje liczbą dodatkowych zdarzeń w tym samym ms, a legacy
@@ -223,6 +235,10 @@ jest prawidłowym, ewaluowalnym oknem: jeden successful tx daje `0/1`, dwa
 `1/2`, a trzy `2/3`. Tylko `start_ts_ms > end_ts_ms` zwraca pusty wynik.
 Failed tx nie wchodzi do successful denominatora. Surface pozostaje
 `LoggingOnly` i jest objęty statycznym zakazem aktywnego policy read.
+Compact validator nie ma fallbacku do 10 s: pobiera
+`SameMsRecentWindowMs` z przekazanego effective-config, wykonuje checked
+conversion `u64 -> u32` i wymaga dokładnej zgodności z `recent_exact.window_ms`.
+Bieżący runtime resolver nadal materializuje 10 000 ms.
 
 ### 4.4 Top3
 
@@ -247,9 +263,11 @@ Legacy FSC pozostaje:
 1 - distinct_known_sources / known_source_samples
 ```
 
-Minimum dwóch known samples jest częścią effective-config hash. Zero lub jedna
-znana próbka daje required null, `Unavailable/NotApplicable`, nigdy measured
-`0.0`. Counts są zachowane w typed evidence.
+Minimum known samples jest częścią effective-config hash i jest jedynym źródłem
+granicy compact validation. Poniżej `FscLegacyMinKnownSourceSamples` legacy FSC
+musi być null i non-available; od minimum wzwyż musi mieć dokładną wartość
+formuły. Porównanie wykonywane jest jako `u64`, bez truncation ani saturating
+conversion. Bieżący runtime resolver nadal materializuje minimum 2.
 
 `MaterializedEvidenceStatus` ma addytywne:
 
@@ -297,7 +315,7 @@ Launcher nadal failuje dla trybu innego niż Legacy. PR2A nie aktywuje
 
 ### 6.1 Amendment zamykający blokery review
 
-Review ujawniło dwie luki, które nie zmieniały aktywnej authority, ale
+Review ujawniło trzy luki, które nie zmieniały aktywnej authority, ale
 pozwalały utworzyć niepoprawny dowód compact:
 
 1. `MetricDecisionFieldValueV1<T>` sprawdzał wyłącznie reason bounds, a
@@ -307,13 +325,20 @@ pozwalały utworzyć niepoprawny dowód compact:
 2. RCE `rce_window_stats()` traktował `start_ts_ms == end_ts_ms` jak pusty
    przedział, mimo że domknięte okno mogło zawierać wiele successful tx w tej
    samej milisekundzie.
+3. Po pierwszym amendmentcie root wiązał się z poprawnym hashem effective-config,
+   lecz timing window i legacy FSC minimum były nadal walidowane względem
+   lokalnych stałych. Inne semantyczne klucze population/denominator,
+   anchor/selection, top3 mapping/scale i FSC formula również nie były jawnie
+   cross-checkowane w compact family validators.
 
-Poprawka wprowadza fail-closed generic coherence, sześć family semantic
-validators, validated-only projection hash oraz zmienia pusty-window guard z
-`start >= end` na `start > end`. Testy negatywne odrzucają niespójne
-availability/value/quality, count/ratio, population/window, FTDI, top3 i FSC.
-Regresje recent exact obejmują 1/2/3 successful tx w tym samym timestampie,
-failed exclusion oraz odwrócony przedział.
+Poprawki wprowadzają fail-closed generic coherence, context-aware family
+semantic validators, validated-only projection hash oraz zmieniają pusty-window
+guard z `start >= end` na `start > end`. Ostatni amendment usuwa z core
+projection lokalne `10_000` i `2`, a timing/FSC pobierają wartości wyłącznie z
+tego samego contextu. Testy A/B przebudowują i ponownie hashują config przed
+wykazaniem błędu family/config; test C dowodzi, że spójne `9_999/9_999`
+przechodzi. Regresje recent exact nadal obejmują 1/2/3 successful tx w tym samym
+timestampie, failed exclusion oraz odwrócony przedział.
 
 ## 7. Odrzucone warianty
 
@@ -361,7 +386,6 @@ FSC_V2_EVIDENCE_ONLY
 PROJECTION_COMMON_SCHEMA_READY
 PROJECTION_PR2A_FAMILY_BUILDERS_READY
 MFS_ROOT_PROJECTION_NOT_ACTIVATED_IN_PR2A
-GATEKEEPER_POLICY_UNCHANGED
 DECISION_LOGGER_V33_UNCHANGED
 V3_REPLAY_V1_UNCHANGED
 DUAL_COMPUTE_NOT_ACTIVATED
@@ -370,7 +394,10 @@ PR2B_PLUS_BLOCKED_UNTIL_SEQUENTIAL_ACCEPTANCE
 PR2A_PROJECTION_VALUE_STATUS_INVARIANTS_PASS
 PR2A_FAMILY_SEMANTIC_VALIDATION_PASS
 PR2A_VALIDATED_HASH_PATH_PASS
+PR2A_EFFECTIVE_CONFIG_PROJECTION_PARITY_PASS
+PR2A_VALIDATED_HASH_CONTEXT_BINDING_PASS
 PR2A_RECENT_EXACT_ZERO_WIDTH_WINDOW_PASS
+GATEKEEPER_POLICY_UNCHANGED
 PR2A_REVIEW_BLOCKERS_CLOSED
 PR2A_READY_FOR_RE_REVIEW
 ```

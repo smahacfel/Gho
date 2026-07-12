@@ -84,6 +84,10 @@ fn projection_builder_is_pure_and_runtime_stays_legacy_only() {
     }
     assert!(projection.contains("pub fn validated_canonical_hash("));
     assert!(!projection.contains("pub fn canonical_hash(&self)"));
+    assert!(!projection.contains("TX_TIMING_RECENT_EXACT_WINDOW_MS_V1"));
+    assert!(!projection.contains("FSC_LEGACY_MIN_KNOWN_SOURCE_SAMPLES_V1"));
+    assert!(projection.contains("SameMsRecentWindowMs"));
+    assert!(projection.contains("FscLegacyMinKnownSourceSamples"));
     let pr2a = read("ghost-launcher/src/metric_contracts/pr2a.rs");
     assert!(pr2a.contains(".validated_canonical_hash(context)"));
     let main = read("ghost-launcher/src/main.rs");

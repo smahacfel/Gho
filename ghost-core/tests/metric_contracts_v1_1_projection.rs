@@ -9,8 +9,95 @@ fn value_for_key(key: MetricEffectiveConfigKeyV1) -> MetricEffectiveConfigValueV
         | MetricEffectiveConfigKeyV1::FtdiCandidateCleanMinUniqueBuyers => {
             return MetricEffectiveConfigValueV1::WideUnsigned(CanonicalU64StringV1::new(3));
         }
+        MetricEffectiveConfigKeyV1::FtdiDiagnosticMinUniqueBuyers => {
+            return MetricEffectiveConfigValueV1::WideUnsigned(CanonicalU64StringV1::new(2));
+        }
         MetricEffectiveConfigKeyV1::FscLegacyMinKnownSourceSamples => {
             return MetricEffectiveConfigValueV1::WideUnsigned(CanonicalU64StringV1::new(2));
+        }
+        MetricEffectiveConfigKeyV1::FtdiPopulationSuccessfulBuy => {
+            return MetricEffectiveConfigValueV1::Enum("successful_buy".to_string());
+        }
+        MetricEffectiveConfigKeyV1::FtdiMissingSignerBehavior => {
+            return MetricEffectiveConfigValueV1::Enum("legacy_empty_signer_identity".to_string());
+        }
+        MetricEffectiveConfigKeyV1::FtdiMissingTopologyBehavior => {
+            return MetricEffectiveConfigValueV1::Enum("unavailable_entire_metric".to_string());
+        }
+        MetricEffectiveConfigKeyV1::FtdiDenominatorRule => {
+            return MetricEffectiveConfigValueV1::Enum(
+                "unique_topologies_over_unique_first_buyer_samples".to_string(),
+            );
+        }
+        MetricEffectiveConfigKeyV1::DevTxIntelSuccessEligibility => {
+            return MetricEffectiveConfigValueV1::Enum("accepted_successful_or_failed".to_string());
+        }
+        MetricEffectiveConfigKeyV1::DevFirstObservedAnchorRule => {
+            return MetricEffectiveConfigValueV1::Enum(
+                "first_accepted_creator_buy_in_ingest_order".to_string(),
+            );
+        }
+        MetricEffectiveConfigKeyV1::DevPrimaryAnchorRule => {
+            return MetricEffectiveConfigValueV1::Enum(
+                "create_signature_then_earliest_eligible_creator_buy".to_string(),
+            );
+        }
+        MetricEffectiveConfigKeyV1::DevMissingCreatorBehavior => {
+            return MetricEffectiveConfigValueV1::Enum("unavailable".to_string());
+        }
+        MetricEffectiveConfigKeyV1::SameMsLegacyPopulation => {
+            return MetricEffectiveConfigValueV1::Enum(
+                "accepted_non_dust_successful_or_failed".to_string(),
+            );
+        }
+        MetricEffectiveConfigKeyV1::SameMsLegacyDenominatorRule => {
+            return MetricEffectiveConfigValueV1::Enum(
+                "adjacent_exact_collisions_over_transaction_count".to_string(),
+            );
+        }
+        MetricEffectiveConfigKeyV1::SameMsRecentPopulation => {
+            return MetricEffectiveConfigValueV1::Enum(
+                "successful_accepted_recent_window".to_string(),
+            );
+        }
+        MetricEffectiveConfigKeyV1::SameMsRecentDenominatorRule => {
+            return MetricEffectiveConfigValueV1::Enum(
+                "same_timestamp_extras_over_transaction_count".to_string(),
+            );
+        }
+        MetricEffectiveConfigKeyV1::Top3PreferredField => {
+            return MetricEffectiveConfigValueV1::Enum("top3_signer_volume_ratio".to_string());
+        }
+        MetricEffectiveConfigKeyV1::Top3FallbackAlias => {
+            return MetricEffectiveConfigValueV1::Enum("top3_volume_pct".to_string());
+        }
+        MetricEffectiveConfigKeyV1::Top3Scale => {
+            return MetricEffectiveConfigValueV1::Enum("ratio_0_1".to_string());
+        }
+        MetricEffectiveConfigKeyV1::Top3MismatchBehavior => {
+            return MetricEffectiveConfigValueV1::Enum(
+                "preferred_authoritative_emit_mismatch_telemetry".to_string(),
+            );
+        }
+        MetricEffectiveConfigKeyV1::FscLegacyFormula => {
+            return MetricEffectiveConfigValueV1::Enum(
+                "one_minus_distinct_known_sources_over_known_source_samples".to_string(),
+            );
+        }
+        MetricEffectiveConfigKeyV1::FscFundingStreamUnavailableBehavior => {
+            return MetricEffectiveConfigValueV1::Enum(
+                "legacy_null_and_v2_unavailable".to_string(),
+            );
+        }
+        MetricEffectiveConfigKeyV1::FscLegacyStatusMapping => {
+            return MetricEffectiveConfigValueV1::Enum(
+                "legacy_scalar_presence_compatibility".to_string(),
+            );
+        }
+        MetricEffectiveConfigKeyV1::FscV2StatusMapping => {
+            return MetricEffectiveConfigValueV1::Enum(
+                "decision_time_status_coverage_lane_health".to_string(),
+            );
         }
         _ => {}
     }
@@ -51,6 +138,32 @@ fn effective_config() -> ResolvedMetricContractEffectiveConfigV1 {
         builder.insert(*key, value_for_key(*key)).unwrap();
     }
     builder.build().unwrap()
+}
+
+fn effective_config_with_value(
+    key: MetricEffectiveConfigKeyV1,
+    value: MetricEffectiveConfigValueV1,
+) -> ResolvedMetricContractEffectiveConfigV1 {
+    let mut payload = effective_config().payload;
+    payload
+        .entries
+        .iter_mut()
+        .find(|entry| entry.key == key)
+        .unwrap()
+        .value = value;
+    ResolvedMetricContractEffectiveConfigV1::try_from_payload(payload).unwrap()
+}
+
+fn projection_context<'a>(
+    profile: &'a MetricContractProfileV1,
+    config: &'a ResolvedMetricContractEffectiveConfigV1,
+) -> MetricDecisionProjectionBuildContextV1<'a> {
+    MetricDecisionProjectionBuildContextV1 {
+        rollout_mode: MetricContractRolloutMode::Legacy,
+        profile,
+        effective_config: config,
+        source_cutoff: MetricContractDecisionSourceCutoffV1::try_new(1_000, Some(42)).unwrap(),
+    }
 }
 
 fn measured(surface: MetricSurfaceId) -> CanonicalMetricEnvelopeV1 {
@@ -623,6 +736,212 @@ fn validated_hash_rejects_semantically_invalid_projection() {
     projection.same_ms_tx_ratio.recent_exact.numerator =
         projection.same_ms_tx_ratio.recent_exact.denominator + 1;
     assert!(projection.validated_canonical_hash(&context).is_err());
+}
+
+fn assert_config_parity_error(
+    error: MetricContractProjectionErrorV1,
+    expected_key: MetricEffectiveConfigKeyV1,
+) {
+    assert!(
+        matches!(
+            &error,
+            MetricContractProjectionErrorV1::EffectiveConfigParity { key, .. }
+                if *key == expected_key
+        ),
+        "expected effective-config parity error for {expected_key:?}, got {error:?}"
+    );
+}
+
+#[test]
+fn standard_projection_uses_current_window_and_fsc_minimum_and_hashes_validly() {
+    let profile = MetricContractProfileV1::profile_a().unwrap();
+    let config = effective_config();
+    assert_eq!(
+        config.value(MetricEffectiveConfigKeyV1::SameMsRecentWindowMs),
+        Some(&MetricEffectiveConfigValueV1::WideUnsigned(
+            CanonicalU64StringV1::new(10_000)
+        ))
+    );
+    assert_eq!(
+        config.value(MetricEffectiveConfigKeyV1::FscLegacyMinKnownSourceSamples),
+        Some(&MetricEffectiveConfigValueV1::WideUnsigned(
+            CanonicalU64StringV1::new(2)
+        ))
+    );
+    let context = projection_context(&profile, &config);
+    let projection = complete_projection();
+    projection.validate_context(&context).unwrap();
+    projection.validated_canonical_hash(&context).unwrap();
+}
+
+#[test]
+fn timing_window_mismatch_is_rejected_after_effective_config_is_rehashed() {
+    let profile = MetricContractProfileV1::profile_a().unwrap();
+    let config = effective_config_with_value(
+        MetricEffectiveConfigKeyV1::SameMsRecentWindowMs,
+        MetricEffectiveConfigValueV1::WideUnsigned(CanonicalU64StringV1::new(9_999)),
+    );
+    let context = projection_context(&profile, &config);
+    let mut projection = complete_projection();
+    projection.metric_contract_effective_config_hash =
+        config.metric_contract_effective_config_hash.clone();
+
+    let error = projection.validate_context(&context).unwrap_err();
+    assert_config_parity_error(error, MetricEffectiveConfigKeyV1::SameMsRecentWindowMs);
+    let error = projection.validated_canonical_hash(&context).unwrap_err();
+    assert_config_parity_error(error, MetricEffectiveConfigKeyV1::SameMsRecentWindowMs);
+}
+
+#[test]
+fn fsc_minimum_mismatch_is_rejected_after_effective_config_is_rehashed() {
+    let profile = MetricContractProfileV1::profile_a().unwrap();
+    let config = effective_config_with_value(
+        MetricEffectiveConfigKeyV1::FscLegacyMinKnownSourceSamples,
+        MetricEffectiveConfigValueV1::WideUnsigned(CanonicalU64StringV1::new(3)),
+    );
+    let context = projection_context(&profile, &config);
+    let mut projection = complete_projection();
+    projection.metric_contract_effective_config_hash =
+        config.metric_contract_effective_config_hash.clone();
+
+    let error = projection.validate_context(&context).unwrap_err();
+    assert_config_parity_error(
+        error,
+        MetricEffectiveConfigKeyV1::FscLegacyMinKnownSourceSamples,
+    );
+    let error = projection.validated_canonical_hash(&context).unwrap_err();
+    assert_config_parity_error(
+        error,
+        MetricEffectiveConfigKeyV1::FscLegacyMinKnownSourceSamples,
+    );
+}
+
+#[test]
+fn timing_window_validation_is_driven_by_effective_config_not_a_local_constant() {
+    let profile = MetricContractProfileV1::profile_a().unwrap();
+    let config = effective_config_with_value(
+        MetricEffectiveConfigKeyV1::SameMsRecentWindowMs,
+        MetricEffectiveConfigValueV1::WideUnsigned(CanonicalU64StringV1::new(9_999)),
+    );
+    let context = projection_context(&profile, &config);
+    let mut projection = complete_projection();
+    projection.metric_contract_effective_config_hash =
+        config.metric_contract_effective_config_hash.clone();
+    projection.same_ms_tx_ratio.recent_exact.window_ms = CanonicalNullableV1::Value(9_999);
+
+    projection.validate_context(&context).unwrap();
+    projection.validated_canonical_hash(&context).unwrap();
+}
+
+#[test]
+fn projection_rejects_other_pr2a_semantic_config_contradictions_with_valid_hashes() {
+    let replacements = [
+        (
+            MetricEffectiveConfigKeyV1::FtdiPopulationSuccessfulBuy,
+            MetricEffectiveConfigValueV1::Enum("all_transactions".to_string()),
+        ),
+        (
+            MetricEffectiveConfigKeyV1::FtdiFirstSamplePerSigner,
+            MetricEffectiveConfigValueV1::Boolean(false),
+        ),
+        (
+            MetricEffectiveConfigKeyV1::FtdiDiagnosticMinUniqueBuyers,
+            MetricEffectiveConfigValueV1::WideUnsigned(CanonicalU64StringV1::new(3)),
+        ),
+        (
+            MetricEffectiveConfigKeyV1::FtdiDenominatorRule,
+            MetricEffectiveConfigValueV1::Enum("transaction_count".to_string()),
+        ),
+        (
+            MetricEffectiveConfigKeyV1::DevFirstObservedAnchorRule,
+            MetricEffectiveConfigValueV1::Enum("last_creator_buy".to_string()),
+        ),
+        (
+            MetricEffectiveConfigKeyV1::DevPrimarySuccessRequired,
+            MetricEffectiveConfigValueV1::Boolean(false),
+        ),
+        (
+            MetricEffectiveConfigKeyV1::DevPrimaryAnchorRule,
+            MetricEffectiveConfigValueV1::Enum("earliest_only".to_string()),
+        ),
+        (
+            MetricEffectiveConfigKeyV1::SameMsLegacyPopulation,
+            MetricEffectiveConfigValueV1::Enum("successful_only".to_string()),
+        ),
+        (
+            MetricEffectiveConfigKeyV1::SameMsLegacyDenominatorRule,
+            MetricEffectiveConfigValueV1::Enum("pair_count".to_string()),
+        ),
+        (
+            MetricEffectiveConfigKeyV1::SameMsRecentPopulation,
+            MetricEffectiveConfigValueV1::Enum("accepted_all".to_string()),
+        ),
+        (
+            MetricEffectiveConfigKeyV1::SameMsRecentDenominatorRule,
+            MetricEffectiveConfigValueV1::Enum("adjacent_pairs".to_string()),
+        ),
+        (
+            MetricEffectiveConfigKeyV1::Top3PreferredField,
+            MetricEffectiveConfigValueV1::Enum("top3_volume_pct".to_string()),
+        ),
+        (
+            MetricEffectiveConfigKeyV1::Top3FallbackAlias,
+            MetricEffectiveConfigValueV1::Enum("top3_signer_volume_ratio".to_string()),
+        ),
+        (
+            MetricEffectiveConfigKeyV1::Top3Scale,
+            MetricEffectiveConfigValueV1::Enum("percent_0_100".to_string()),
+        ),
+        (
+            MetricEffectiveConfigKeyV1::Top3MismatchBehavior,
+            MetricEffectiveConfigValueV1::Enum("alias_authoritative".to_string()),
+        ),
+        (
+            MetricEffectiveConfigKeyV1::FscLegacyFormula,
+            MetricEffectiveConfigValueV1::Enum("distinct_over_samples".to_string()),
+        ),
+        (
+            MetricEffectiveConfigKeyV1::FscFundingStreamUnavailableBehavior,
+            MetricEffectiveConfigValueV1::Enum("legacy_zero".to_string()),
+        ),
+        (
+            MetricEffectiveConfigKeyV1::FscLegacyStatusMapping,
+            MetricEffectiveConfigValueV1::Enum("status_only".to_string()),
+        ),
+        (
+            MetricEffectiveConfigKeyV1::FscV2StatusMapping,
+            MetricEffectiveConfigValueV1::Enum("coverage_only".to_string()),
+        ),
+    ];
+
+    for (key, value) in replacements {
+        let profile = MetricContractProfileV1::profile_a().unwrap();
+        let config = effective_config_with_value(key, value);
+        let context = projection_context(&profile, &config);
+        let mut projection = complete_projection();
+        projection.metric_contract_effective_config_hash =
+            config.metric_contract_effective_config_hash.clone();
+        let error = projection.validate_context(&context).unwrap_err();
+        assert_config_parity_error(error, key);
+    }
+}
+
+#[test]
+fn timing_window_that_does_not_fit_compact_representation_is_rejected() {
+    let profile = MetricContractProfileV1::profile_a().unwrap();
+    let config = effective_config_with_value(
+        MetricEffectiveConfigKeyV1::SameMsRecentWindowMs,
+        MetricEffectiveConfigValueV1::WideUnsigned(CanonicalU64StringV1::new(
+            u64::from(u32::MAX) + 1,
+        )),
+    );
+    let context = projection_context(&profile, &config);
+    let mut projection = complete_projection();
+    projection.metric_contract_effective_config_hash =
+        config.metric_contract_effective_config_hash.clone();
+
+    let error = projection.validate_context(&context).unwrap_err();
+    assert_config_parity_error(error, MetricEffectiveConfigKeyV1::SameMsRecentWindowMs);
 }
 
 #[test]
