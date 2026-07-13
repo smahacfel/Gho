@@ -1,6 +1,6 @@
 # ADR-8D: PR2C — domknięcie blockerów durability, replay i audit
 
-Status: `IMPLEMENTED / FINAL VERIFICATION IN PROGRESS`
+Status: `IMPLEMENTED / PASS / READY FOR RE-REVIEW`
 
 Typ: ADR-8D / review amendment / durable evidence / replay / rollout safety
 

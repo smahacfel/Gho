@@ -1,6 +1,6 @@
 # ADR-8D: PR2C durable metric-contract evidence, replay v2 i audit
 
-Status: `AMENDED / IMPLEMENTED / FINAL VERIFICATION IN PROGRESS`
+Status: `AMENDED / IMPLEMENTED / PASS / READY FOR RE-REVIEW`
 
 Typ: ADR-8D / durability, replay, comparator, audit i rollout safety
 
