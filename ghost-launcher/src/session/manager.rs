@@ -7,6 +7,7 @@ use dashmap::DashMap;
 use ghost_brain::config::GatekeeperV2Config;
 use ghost_brain::fast_pipeline::EnhancedCandidate;
 use ghost_core::account_state_core::reducer::AccountStateReducer;
+use ghost_core::metric_contracts::ResolvedMetricContractEffectiveConfigV1;
 use ghost_core::session::types::{SessionId, VerdictOutcome};
 use parking_lot::{Mutex, RwLock};
 use seer::early_fingerprint::EarlyFingerprintConfig;
@@ -49,9 +50,10 @@ pub struct OpenSessionRequest {
     pub fingerprint_config: EarlyFingerprintConfig,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionManagerError {
     SessionLimitExceeded { max_sessions: usize },
+    MetricContractContext(String),
 }
 
 pub struct SessionManager {
@@ -61,6 +63,9 @@ pub struct SessionManager {
     account_state_core: Arc<AccountStateReducer>,
     cross_pool_velocity_index: Arc<CrossPoolVelocityIndex>,
     funding_source_index: Arc<FundingSourceIndex>,
+    metric_contract_effective_config: Option<Arc<ResolvedMetricContractEffectiveConfigV1>>,
+    metric_contract_funding_source_producer_config:
+        Option<Arc<crate::tx_intelligence::FundingSourceProducerConfigSnapshotV1>>,
     lifecycle_lock: Mutex<()>,
 }
 
@@ -75,6 +80,18 @@ impl SessionManager {
         config: SessionConfig,
         account_state_core: Arc<AccountStateReducer>,
     ) -> Self {
+        Self::new_with_metric_contract_context(config, account_state_core, None, None)
+    }
+
+    #[must_use]
+    pub fn new_with_metric_contract_context(
+        config: SessionConfig,
+        account_state_core: Arc<AccountStateReducer>,
+        metric_contract_effective_config: Option<Arc<ResolvedMetricContractEffectiveConfigV1>>,
+        metric_contract_funding_source_producer_config: Option<
+            Arc<crate::tx_intelligence::FundingSourceProducerConfigSnapshotV1>,
+        >,
+    ) -> Self {
         Self {
             sessions: DashMap::new(),
             session_counter: AtomicU64::new(1),
@@ -82,6 +99,8 @@ impl SessionManager {
             account_state_core,
             cross_pool_velocity_index: Arc::new(CrossPoolVelocityIndex::new()),
             funding_source_index: Arc::new(FundingSourceIndex::new()),
+            metric_contract_effective_config,
+            metric_contract_funding_source_producer_config,
             lifecycle_lock: Mutex::new(()),
         }
     }
@@ -118,6 +137,29 @@ impl SessionManager {
             request.fingerprint_config.clone(),
         )
         .apply_runtime_defaults(&self.config.tx_intelligence_defaults);
+        let local_metric_contract_context = if self.metric_contract_effective_config.is_none()
+            || self
+                .metric_contract_funding_source_producer_config
+                .is_none()
+        {
+            let effective_config =
+                crate::metric_contracts::resolve_metric_contract_effective_config_v1(
+                    ghost_core::metric_contracts::MetricContractFoundationConfigV1::default(),
+                    &request.gatekeeper_config,
+                    &tx_intelligence_config,
+                    &request.fingerprint_config,
+                    &request.funding_source_config,
+                    None,
+                )
+                .map_err(|error| SessionManagerError::MetricContractContext(error.to_string()))?;
+            let producer_config = request
+                .funding_source_config
+                .metric_contract_producer_config_snapshot(None)
+                .map_err(|error| SessionManagerError::MetricContractContext(error.to_string()))?;
+            Some((Arc::new(effective_config), Arc::new(producer_config)))
+        } else {
+            None
+        };
         let mut session = PoolObservationSession::new_with_account_state_core(
             session_id,
             request.pool_amm_id,
@@ -134,6 +176,17 @@ impl SessionManager {
         session.set_cross_pool_velocity_index(Arc::clone(&self.cross_pool_velocity_index));
         session.set_funding_source_index(Arc::clone(&self.funding_source_index));
         session.set_funding_source_config(request.funding_source_config);
+        if let (Some(effective_config), Some(producer_config)) = (
+            self.metric_contract_effective_config.as_ref(),
+            self.metric_contract_funding_source_producer_config.as_ref(),
+        ) {
+            session.set_metric_contract_context(
+                Arc::clone(effective_config),
+                Arc::clone(producer_config),
+            );
+        } else if let Some((effective_config, producer_config)) = local_metric_contract_context {
+            session.set_metric_contract_context(effective_config, producer_config);
+        }
         session.set_checkpoint_interval_ms(self.config.checkpoint_interval_ms);
         let session = Arc::new(RwLock::new(session));
         self.sessions.insert(request.pool_amm_id, session);
@@ -188,6 +241,12 @@ impl SessionManager {
 
     pub fn set_funding_stream_available(&self, available: bool) {
         self.funding_source_index.set_stream_available(available);
+    }
+
+    pub fn mark_metric_contract_stream_gap(&self) {
+        for session in &self.sessions {
+            session.value().write().mark_metric_contract_stream_gap();
+        }
     }
 }
 

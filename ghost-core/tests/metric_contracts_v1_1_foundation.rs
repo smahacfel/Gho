@@ -174,8 +174,8 @@ fn complete_contract_evidence() -> MetricContractsEvidenceSetV1 {
             derived_value: CanonicalNullableV1::Value(false),
             comparator: ManipulationComparatorV1::GreaterThan,
             threshold: CanonicalNullableV1::Value(0.5),
-            policy_stage: "gatekeeper_v2".to_string(),
-            policy_version: "manipulation_high_flags_v1".to_string(),
+            policy_stage: MANIPULATION_DERIVED_POLICY_STAGE_V1.to_string(),
+            policy_version: MANIPULATION_DERIVED_POLICY_VERSION_V1.to_string(),
             config_hash: CanonicalHashV1::parse("2".repeat(64)).unwrap(),
         })
         .collect();

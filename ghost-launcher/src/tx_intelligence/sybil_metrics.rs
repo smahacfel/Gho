@@ -62,6 +62,12 @@ pub struct DesComputation {
     pub signer_sample_count: u64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct SybilResistanceComputationV1 {
+    pub features: SybilResistanceFeatures,
+    pub ftdi: FtdiComputation,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BuySampleStats {
     buy_sample_count: u64,
@@ -700,6 +706,13 @@ pub fn compute_sybil_resistance<'a>(
     transactions: impl IntoIterator<Item = &'a PoolTransaction>,
     dev_wallet: Option<&'a str>,
 ) -> SybilResistanceFeatures {
+    compute_sybil_resistance_with_ftdi(transactions, dev_wallet).features
+}
+
+pub fn compute_sybil_resistance_with_ftdi<'a>(
+    transactions: impl IntoIterator<Item = &'a PoolTransaction>,
+    dev_wallet: Option<&'a str>,
+) -> SybilResistanceComputationV1 {
     let transactions: Vec<&PoolTransaction> = transactions.into_iter().collect();
     let buy_txs = successful_buy_txs(transactions.iter().copied());
     let ftdi = compute_ftdi_from_buys(&buy_txs);
@@ -720,7 +733,7 @@ pub fn compute_sybil_resistance<'a>(
         }
     }
 
-    SybilResistanceFeatures {
+    let features = SybilResistanceFeatures {
         fee_topology_diversity_index: ftdi.fee_topology_diversity_index,
         dev_buyer_infrastructure_affinity: dbia.dev_buyer_infrastructure_affinity,
         spend_fraction_divergence: sfd.spend_fraction_divergence,
@@ -729,7 +742,8 @@ pub fn compute_sybil_resistance<'a>(
         buy_sample_count: ftdi.buy_sample_count,
         signer_sample_count: ftdi.signer_sample_count,
         ..SybilResistanceFeatures::default()
-    }
+    };
+    SybilResistanceComputationV1 { features, ftdi }
 }
 
 #[cfg(test)]

@@ -1950,6 +1950,10 @@ async fn main() -> Result<()> {
         fsc_v2_runtime_config,
     )
     .context("METRIC_CONTRACT_EFFECTIVE_CONFIG_INVALID")?;
+    let metric_contract_funding_source_producer_config = oracle_runtime_config
+        .funding_source_config
+        .metric_contract_producer_config_snapshot(fsc_v2_runtime_config)
+        .context("METRIC_CONTRACT_FSC_PRODUCER_CONFIG_INVALID")?;
     info!(
         rollout_mode = ?metric_contract_effective_config.payload.rollout_mode,
         profile_id = metric_contract_effective_config.payload.profile_id.as_str(),
@@ -1959,6 +1963,8 @@ async fn main() -> Result<()> {
     );
     oracle_runtime_config.metric_contract_effective_config =
         Some(Arc::new(metric_contract_effective_config));
+    oracle_runtime_config.metric_contract_funding_source_producer_config =
+        Some(Arc::new(metric_contract_funding_source_producer_config));
     oracle_runtime_config.p37_shadow_probe = config.p37_shadow_probe.clone();
     oracle_runtime_config.selector = config.selector.clone();
     oracle_runtime_config.run_id = (!config.p37_shadow_probe.run_id.trim().is_empty())

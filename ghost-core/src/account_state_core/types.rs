@@ -1,3 +1,4 @@
+use crate::metric_contracts::ReserveVelocityStatusV1;
 use crate::CurveFinality;
 use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
@@ -142,6 +143,16 @@ pub struct CanonicalPoolState {
     pub price_change_since_t0_pct: f64,
     #[serde(default)]
     pub reserve_velocity_sol_per_sec: f64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AccountStateReserveVelocitySnapshotV1 {
+    pub legacy_velocity_sol_per_sec: f64,
+    pub previous_real_sol_reserves_lamports: Option<u64>,
+    pub current_real_sol_reserves_lamports: Option<u64>,
+    pub interval_ms: Option<u64>,
+    pub accepted_update_count: u64,
+    pub status: ReserveVelocityStatusV1,
 }
 
 /// Input event accepted by AccountStateCore.

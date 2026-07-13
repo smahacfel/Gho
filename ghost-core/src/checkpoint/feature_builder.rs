@@ -110,6 +110,7 @@ impl FeatureMaterializer for ObservationFeatureBuilder {
             decision_time_series: Default::default(),
             pre_entry_path_summary_v1: Default::default(),
             session_regime_snapshot_v1: Default::default(),
+            metric_contract_decision_projection_v1: None,
         }
     }
 }

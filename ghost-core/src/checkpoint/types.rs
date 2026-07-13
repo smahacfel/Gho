@@ -1,4 +1,5 @@
 use crate::account_state_core::types::AccountStateFeatures;
+use crate::metric_contracts::MetricContractDecisionEvidenceProjectionV1;
 use crate::session::types::SessionMetadata;
 use crate::tx_intelligence::types::{RiskFlag, SybilResistanceFeatures, TxIntelFeatures};
 use crate::{CurveFinality, CurveFreshnessState};
@@ -937,6 +938,16 @@ pub struct MaterializedFeatureSet {
     /// global/session context remains nullable rather than imputed.
     #[serde(default)]
     pub session_regime_snapshot_v1: SessionRegimeSnapshotV1,
+    /// Metric Contracts V1.1 PR2B: complete, validated ten-family compact
+    /// decision-evidence projection. Historical payloads deserialize to
+    /// `None`; current successful terminal materialization emits `Some`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::metric_contracts::serialize_optional_projection_wire_v1",
+        deserialize_with = "crate::metric_contracts::deserialize_optional_projection_wire_v1"
+    )]
+    pub metric_contract_decision_projection_v1: Option<MetricContractDecisionEvidenceProjectionV1>,
 }
 
 /// Per-segment trajectory snapshot used by Path B to compute TAS and PDD

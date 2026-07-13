@@ -1845,6 +1845,11 @@ pub struct OracleRuntimeConfig {
     /// retains this value for PR2B; it does not materialize the MFS root.
     pub metric_contract_effective_config:
         Option<Arc<ghost_core::metric_contracts::ResolvedMetricContractEffectiveConfigV1>>,
+    /// Exact FSC owner-produced settings snapshot paired with the resolved
+    /// metric-contract config. It is frozen at startup and never reconstructed
+    /// from compact evidence.
+    pub metric_contract_funding_source_producer_config:
+        Option<Arc<crate::tx_intelligence::FundingSourceProducerConfigSnapshotV1>>,
     pub p37_shadow_probe: P37ShadowProbeConfig,
     pub selector: SelectorRuntimeConfig,
     pub run_id: Option<String>,
@@ -1894,6 +1899,7 @@ impl OracleRuntimeConfig {
                 &GatekeeperV2Config::default(),
             ),
             metric_contract_effective_config: None,
+            metric_contract_funding_source_producer_config: None,
             p37_shadow_probe: P37ShadowProbeConfig::default(),
             selector: SelectorRuntimeConfig::default(),
             run_id: None,
@@ -1914,6 +1920,7 @@ impl OracleRuntimeConfig {
                 &GatekeeperV2Config::default(),
             ),
             metric_contract_effective_config: None,
+            metric_contract_funding_source_producer_config: None,
             p37_shadow_probe: P37ShadowProbeConfig::default(),
             selector: SelectorRuntimeConfig::default(),
             run_id: None,
@@ -1975,6 +1982,7 @@ impl Default for OracleRuntimeConfig {
                 &GatekeeperV2Config::default(),
             ),
             metric_contract_effective_config: None,
+            metric_contract_funding_source_producer_config: None,
             p37_shadow_probe: P37ShadowProbeConfig::default(),
             selector: SelectorRuntimeConfig::default(),
             run_id: None,
@@ -2471,9 +2479,13 @@ impl OracleRuntime {
 
         let account_state_core = Arc::new(AccountStateReducer::new());
         let execution_account_evidence_store = Arc::new(ExecutionAccountEvidenceStore::new());
-        let session_manager = Arc::new(SessionManager::new_with_account_state_core(
+        let session_manager = Arc::new(SessionManager::new_with_metric_contract_context(
             config.session_manager_config(),
             Arc::clone(&account_state_core),
+            config.metric_contract_effective_config.clone(),
+            config
+                .metric_contract_funding_source_producer_config
+                .clone(),
         ));
         let p37_shadow_probe_state = Arc::new(P37ShadowProbeRuntimeState::new(
             config.p37_shadow_probe.max_scan_concurrent,
@@ -16888,12 +16900,13 @@ fn build_timeout_assessment_from_session(
     )
 }
 
-fn materialize_terminal_features(
+fn try_materialize_terminal_features(
     session: &mut PoolObservationSession,
     gatekeeper_config: &GatekeeperV2Config,
     force_deadline: bool,
-) -> MaterializedFeatureSet {
-    let mut features = session.materialize_features();
+) -> Result<MaterializedFeatureSet, crate::session::observation::MetricContractMaterializationErrorV1>
+{
+    let mut features = session.try_materialize_features()?;
     if force_deadline {
         let forced_wait_elapsed = features
             .curve_readiness
@@ -16902,14 +16915,14 @@ fn materialize_terminal_features(
             .max(gatekeeper_config.curve_wait_ms);
         features.curve_readiness.wait_elapsed_ms = Some(forced_wait_elapsed);
     }
-    features
+    Ok(features)
 }
 
-fn evaluate_feature_driven_terminal_verdict(
+fn try_evaluate_feature_driven_terminal_verdict(
     session: &mut PoolObservationSession,
     gatekeeper_config: &GatekeeperV2Config,
     force_deadline: bool,
-) -> GatekeeperVerdict {
+) -> Result<GatekeeperVerdict, crate::session::observation::MetricContractMaterializationErrorV1> {
     session.begin_evaluation();
 
     #[cfg(test)]
@@ -16917,7 +16930,8 @@ fn evaluate_feature_driven_terminal_verdict(
         // Explicit compat/test path only. Production startup and preflight must
         // reject this mode after Phase 2 closure.
         ::metrics::counter!("legacy_terminal_verdict_total", 1u64);
-        let features = materialize_terminal_features(session, gatekeeper_config, force_deadline);
+        let features =
+            try_materialize_terminal_features(session, gatekeeper_config, force_deadline)?;
         let verdict = {
             let buffer = session.gatekeeper_buffer_mut();
             buffer.prepare_feature_evaluation();
@@ -16931,10 +16945,10 @@ fn evaluate_feature_driven_terminal_verdict(
             session.resume_accumulation();
         }
 
-        return verdict;
+        return Ok(verdict);
     }
 
-    let features = materialize_terminal_features(session, gatekeeper_config, force_deadline);
+    let features = try_materialize_terminal_features(session, gatekeeper_config, force_deadline)?;
     if force_deadline {
         let phase1_passed = features.tx_intel_features.tx_count
             >= gatekeeper_config.min_tx_count as u64
@@ -16973,7 +16987,7 @@ fn evaluate_feature_driven_terminal_verdict(
                     ),
                     Some("feature-driven deadline phase1 timeout".to_string()),
                 );
-            return GatekeeperVerdict::Timeout { assessment };
+            return Ok(GatekeeperVerdict::Timeout { assessment });
         }
     }
 
@@ -16990,7 +17004,18 @@ fn evaluate_feature_driven_terminal_verdict(
         session.resume_accumulation();
     }
 
-    verdict
+    Ok(verdict)
+}
+
+fn evaluate_feature_driven_terminal_verdict(
+    session: &mut PoolObservationSession,
+    gatekeeper_config: &GatekeeperV2Config,
+    force_deadline: bool,
+) -> GatekeeperVerdict {
+    match try_evaluate_feature_driven_terminal_verdict(session, gatekeeper_config, force_deadline) {
+        Ok(verdict) => verdict,
+        Err(error) => panic!("metric-contract materialization failed closed: {error}"),
+    }
 }
 
 fn resolve_feature_trigger_outcome(
@@ -17008,6 +17033,25 @@ fn resolve_feature_trigger_outcome(
         }
         GatekeeperIngressOutcome::DeadlineElapsed => {
             evaluate_feature_driven_terminal_verdict(session, gatekeeper_config, true)
+        }
+    }
+}
+
+fn try_resolve_feature_trigger_outcome(
+    session: &mut PoolObservationSession,
+    ingress: GatekeeperIngressOutcome,
+    gatekeeper_config: &GatekeeperV2Config,
+) -> Result<GatekeeperVerdict, crate::session::observation::MetricContractMaterializationErrorV1> {
+    match ingress {
+        GatekeeperIngressOutcome::Wait => Ok(GatekeeperVerdict::Wait),
+        GatekeeperIngressOutcome::ApprovedTx { tx, metrics } => {
+            Ok(GatekeeperVerdict::ApprovedTx { tx, metrics })
+        }
+        GatekeeperIngressOutcome::TriggerEvaluation => {
+            try_evaluate_feature_driven_terminal_verdict(session, gatekeeper_config, false)
+        }
+        GatekeeperIngressOutcome::DeadlineElapsed => {
+            try_evaluate_feature_driven_terminal_verdict(session, gatekeeper_config, true)
         }
     }
 }
@@ -23574,7 +23618,7 @@ async fn pool_observation_task(
                             if session.diagnostics.total_tx_seen > accepted_tx_before {
                                 session.try_checkpoint(normalized_ts);
                             }
-                            resolve_feature_trigger_outcome(&mut session, ingress, &ctx.gatekeeper_config)
+                            try_resolve_feature_trigger_outcome(&mut session, ingress, &ctx.gatekeeper_config)
                         };
                         verdict
                     }
@@ -23661,7 +23705,7 @@ async fn pool_observation_task(
                             maybe_emit_init_pool_event(&ctx, pool_id, Some(&pd));
                             pool_data = Some(pd);
                         }
-                        GatekeeperVerdict::Wait
+                        Ok(GatekeeperVerdict::Wait)
                     }
                     None => {
                         // Channel closed — force terminal evaluation on the collected snapshot.
@@ -23669,7 +23713,7 @@ async fn pool_observation_task(
                         session
                             .gatekeeper_buffer_mut()
                             .advance_event_clock(current_time_ms());
-                        evaluate_feature_driven_terminal_verdict(
+                        try_evaluate_feature_driven_terminal_verdict(
                             &mut session,
                             &ctx.gatekeeper_config,
                             true,
@@ -23694,7 +23738,7 @@ async fn pool_observation_task(
                             crate::components::gatekeeper::ShadowCheckpointSource::Timer,
                         );
                 }
-                GatekeeperVerdict::Wait
+                Ok(GatekeeperVerdict::Wait)
             }
             _ = &mut deadline => {
                 let now_ms = current_time_ms();
@@ -23703,11 +23747,31 @@ async fn pool_observation_task(
                 }
                 let mut session = session.write();
                 session.gatekeeper_buffer_mut().advance_event_clock(now_ms);
-                evaluate_feature_driven_terminal_verdict(
+                try_evaluate_feature_driven_terminal_verdict(
                     &mut session,
                     &ctx.gatekeeper_config,
                     true,
                 )
+            }
+        };
+
+        let verdict = match verdict {
+            Ok(verdict) => verdict,
+            Err(error) => {
+                ::metrics::counter!("metric_contract_materialization_failures_total", 1u64);
+                error!(
+                    pool = %pool_id,
+                    error = %error,
+                    "terminal metric-contract materialization failed closed"
+                );
+                ctx.session_manager.remove_session(&pool_id);
+                let _ = ctx.result_tx.send(PoolObservationResult {
+                    pool_id,
+                    base_mint: base_mint_pubkey,
+                    bought: false,
+                    retain_runtime_pool: false,
+                });
+                return;
             }
         };
 
@@ -25008,6 +25072,7 @@ pub async fn start_oracle_runtime_task_with_funding_availability(
                     Ok(e) => e,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         warn!("LAG ORACLE by {} messages", n);
+                        ctx.session_manager.mark_metric_contract_stream_gap();
                         continue;
                     }
                     Err(_) => break,

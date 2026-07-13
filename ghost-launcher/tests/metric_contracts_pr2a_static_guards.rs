@@ -55,10 +55,12 @@ fn pr2a_leaves_v33_logger_and_v3_replay_without_projection_activation() {
 }
 
 #[test]
-fn pr2a_does_not_materialize_partial_root_or_pr2b_family_builders() {
-    let mfs = read("ghost-core/src/checkpoint/types.rs");
-    assert!(!mfs.contains("metric_contract_decision_projection_v1"));
-    let projection = read("ghost-core/src/metric_contracts/projection.rs");
+fn pr2a_builder_does_not_materialize_partial_root_or_pr2b_families() {
+    // PR2B owns the complete ten-family root and its atomic MFS field. Keep
+    // the earlier PR2A builder frozen to its seven evidence families so it
+    // cannot become a second or partial materialization authority.
+    let pr2a = read("ghost-launcher/src/metric_contracts/pr2a.rs");
+    assert!(!pr2a.contains("metric_contract_decision_projection_v1"));
     for forbidden in [
         "impl FlipDecisionProjectionV1",
         "impl ManipulationDecisionProjectionV1",
@@ -66,8 +68,8 @@ fn pr2a_does_not_materialize_partial_root_or_pr2b_family_builders() {
         "impl RecentBuySellDecisionProjectionV1",
     ] {
         assert!(
-            !projection.contains(forbidden),
-            "PR2B family builder activated in PR2A: {forbidden}"
+            !pr2a.contains(forbidden),
+            "PR2B family builder leaked into PR2A: {forbidden}"
         );
     }
 }

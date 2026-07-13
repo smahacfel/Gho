@@ -400,6 +400,13 @@ wyłącznie w `metric_contract_evidence_v1.jsonl`.
 
 #### 2.6.1 Wspólny compact envelope i provenance
 
+**Amendment Compact JSON Wire V1 (2026-07-12).** Nazwy i typy wymienione w
+§2.6.1 oraz §2.6.2 są normatywnym logicznym/domain schema. Fizyczna
+serde-serializacja pola MFS używa odrębnego, bezstratnego
+`MetricContractDecisionProjectionWireV1`; krótkie wire keys i pozycje nie
+zmieniają nazw, pól ani typów domain modelu. Domain projection zachowuje własny
+verbose serde contract na potrzeby direct fixtures i semantic identity.
+
 Każda surface w projection używa zamkniętego, walidowanego kontraktu:
 
 ```rust
@@ -470,7 +477,10 @@ bieżącego mode; nie wolno wybierać pierwszej surface o pasującej authority.
 
 #### 2.6.2 Exact per-family projection fields
 
-Nazwy poniżej są normatywne. `MetricDecisionRatioV1` zawiera
+Nazwy poniżej są normatywnymi nazwami logicznymi/domain i nie muszą być
+powtarzane jako verbose keys w fizycznym MFS JSON. Wire V1 musi odwzorować je
+bezstratnie w zamrożonych pozycjach; zmiana pozycji lub kodu wymaga nowej wersji
+wire. `MetricDecisionRatioV1` zawiera
 `surface: MetricDecisionSurfaceValueV1<f64>`, `numerator: u32`,
 `denominator: u32`, source-qualified population i optional `window_ms`.
 
@@ -519,13 +529,22 @@ projection pełnego evidence setu, w szczególności:
 
 #### 2.6.4 Serde, hash i replay
 
-- projection i wszystkie family types używają `deny_unknown_fields`;
+- direct domain projection i wszystkie family types używają
+  `deny_unknown_fields` i zachowują logiczne nazwy z §2.6.1–2.6.2;
+- MFS field-level serde używa wyłącznie versioned, lossless i fail-closed
+  Compact JSON Wire V1 w postaci `{"w":1,"d":[...]}`; present field nie ma
+  permissive fallbacku do verbose domain JSON;
+- Wire V1 odrzuca unsupported version, brakujące/nadmiarowe sloty lub keys i
+  invalid enum/reason code; zamrożone pozycje i integer codes są osobnym
+  transportowym kontraktem względem direct domain schema;
 - historyczny brak root pola daje `None/NotRecordedLegacySchema`, nie syntetyczny
   projection;
 - unknown projection schema, profile/hash/effective-config mismatch, partial
   family albo invalid envelope failują replay;
-- projection ma osobny semantic `CanonicalHashV1` liczony nad pełnym root
-  payloadem bez self-hash; nie zastępuje `evidence_sha256` pełnego sidecara;
+- projection ma osobny semantic `CanonicalHashV1` liczony nad pełnym canonical
+  domain semantic payloadem bez self-hash, nigdy nad Wire V1 bytes; adapter
+  wire nie zmienia semantic identity i nie zastępuje `evidence_sha256` pełnego
+  sidecara;
 - PR2C replay buduje projection ponownie z zahashowanego full evidence snapshotu
   i wymaga exact equality z decision-time projection;
 - v33 zachowuje frozen replay bez oczekiwania pola; v34 wymaga go tylko dla
@@ -536,6 +555,15 @@ projection pełnego evidence setu, w szczególności:
 
 Projection nie zawiera nieograniczonych kolekcji poza reason vectors o stałym
 limicie. PR2B acceptance wymaga jednocześnie:
+
+`metric_contract_projection_serialized_bytes` oznacza dokładnie długość
+nieskompresowanego JSON uzyskanego przez
+`MetricContractDecisionProjectionWireV1::try_from_domain(&projection)` i
+`serde_json::to_vec(&wire)`.
+Ta sama reprezentacja obowiązuje runtime hard gate, MFS field serializer,
+testy, telemetrykę, release harness i raport. Bincode i verbose domain JSON są
+wyłącznie jawnie nazwanymi diagnostykami i nie wpływają na PASS. Kompresja nie
+jest częścią gate'u.
 
 ```text
 metric_contract_projection_build_and_validate_us p99 <= 1_000 us
